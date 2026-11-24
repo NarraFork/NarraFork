@@ -77,20 +77,17 @@ export class FeishuAdapter extends BaseAdapter {
 					"[feishu] Outbound proxy applies to REST only; the event WSClient is not proxied. In a locked-down network the bot may send but not receive events.",
 				);
 			}
-			// biome-ignore lint/suspicious/noExplicitAny: axios instance defaults are loosely typed here
-			const inst = lark.defaultHttpInstance as any;
-			inst.defaults.httpsAgent = agent;
-			inst.defaults.httpAgent = agent;
+			const httpInstance = lark.defaultHttpInstance;
+			httpInstance.defaults.httpsAgent = agent;
+			httpInstance.defaults.httpAgent = agent;
 			// Disable axios's own env-based proxy so the agent (or direct) is used exclusively.
-			inst.defaults.proxy = false;
-			const httpInstance: unknown = inst;
+			httpInstance.defaults.proxy = false;
 
 			this.client = new lark.Client({
 				appId: this.config.appId,
 				appSecret: this.config.appSecret,
 				appType: lark.AppType.SelfBuild,
-				// biome-ignore lint/suspicious/noExplicitAny: httpInstance typed as lark HttpInstance
-				...(httpInstance ? { httpInstance: httpInstance as any } : {}),
+				httpInstance,
 			}) as unknown as FeishuClientLike;
 
 			// Create WebSocket client for event subscription

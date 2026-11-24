@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { readFile, rm, writeFile } from "node:fs/promises";
 import type { Worker } from "node:worker_threads";
+import { parseHTML } from "linkedom";
 import { STARTUP_STATUS_HEADER } from "../../../../shared/startup-status";
 import * as compiled from "../../compiled-worker";
 import { logger } from "../../logger";
@@ -12,6 +13,7 @@ import {
 	showStartupProblem,
 	startStartupStatus,
 } from "../index";
+import { startupPageHtml } from "../page";
 import { isLocalViewer, type StartupProblem, snapshotForViewer } from "../protocol";
 import { StartupError, toStartupProblem } from "../startup-error";
 
@@ -56,6 +58,74 @@ async function startupBody(
 }
 
 afterEach(closeStartupStatus);
+
+test("startup polling aborts hung fetches and continues until the server is ready", async () => {
+	const { document } = parseHTML(startupPageHtml("Test"));
+	const script = document.querySelector("script")?.textContent;
+	if (!script) throw Error("Missing startup script");
+	const timers = new Map<number, { callback: () => void; ms: number }>();
+	let id = 0;
+	let calls = 0;
+	let signal: AbortSignal | undefined;
+	const reload = spyOn({ reload() {} }, "reload");
+	new Function(
+		"document",
+		"navigator",
+		"location",
+		"fetch",
+		"setTimeout",
+		"clearTimeout",
+		"setInterval",
+		script,
+	)(
+		document,
+		{ language: "en" },
+		{ reload },
+		async (_url: string, options: RequestInit) => {
+			calls++;
+			if (calls === 1) {
+				signal = options.signal ?? undefined;
+				return new Promise((_resolve, reject) =>
+					signal?.addEventListener("abort", () => reject(Error("timeout"))),
+				);
+			}
+			if (calls === 2)
+				return Response.json(
+					{ now: Date.now(), version: "1", step: { key: "starting" } },
+					{ headers: { [STARTUP_STATUS_HEADER]: "1" } },
+				);
+			return new Response("ready");
+		},
+		(callback: () => void, ms: number) => {
+			timers.set(++id, { callback, ms });
+			return id;
+		},
+		(key: number) => timers.delete(key),
+		() => 1,
+	);
+	const flush = async () => {
+		for (let i = 0; i < 12; i++) await Promise.resolve();
+	};
+	const fire = (ms: number) => {
+		const entry = [...timers].find(([, timer]) => timer.ms === ms);
+		if (!entry) throw Error(`Missing timer ${ms}`);
+		timers.delete(entry[0]);
+		entry[1].callback();
+	};
+	expect(calls).toBe(1);
+	fire(5000);
+	await flush();
+	expect(signal?.aborted).toBe(true);
+	fire(1000);
+	await flush();
+	expect(calls).toBe(2);
+	expect(document.getElementById("version")?.textContent).toBe("v1");
+	fire(1000);
+	await flush();
+	expect(calls).toBe(3);
+	expect(reload).toHaveBeenCalledTimes(1);
+	expect(timers.size).toBe(0);
+});
 
 describe("startup status page", () => {
 	test("answers navigation, health and other requests while starting", async () => {

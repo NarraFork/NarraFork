@@ -27,7 +27,6 @@ interface WireRequest {
 		model: string;
 		stream: boolean;
 		store: boolean;
-		instructions?: string;
 		input: Array<{ role?: string; content?: Array<{ type: string; text?: string }> }>;
 		tools?: Array<{
 			type: string;
@@ -61,6 +60,7 @@ mock.module("../terminal-service", () => ({
 	},
 }));
 const { terminalTool, resetCursorForTerminal } = await import("../../lib/agent/tools/terminal");
+const { watchTool } = await import("../../lib/agent/tools/watch");
 const { backgroundTaskService } = await import("../background-task-service");
 const { backgroundOccupancyStore } = await import("../background-occupancy-store");
 const { drainQueuedMessagesAfterCompact } = await import("../compact-queue-drain");
@@ -111,8 +111,8 @@ function notices() {
 		.all();
 }
 async function watch(): Promise<void> {
-	const result = await terminalTool.execute(
-		{ action: "watch", terminal_id: terminalId, pattern: "READY", timeout: 30 },
+	const result = await watchTool.execute(
+		{ type: "terminal", id: terminalId, pattern: "READY", timeout: 30_000 },
 		{
 			narratorId,
 			signal: new AbortController().signal,
@@ -222,9 +222,11 @@ async function assertAdoptedOnce(): Promise<void> {
 	).toBe(1);
 	const payloadParts = requests.flatMap(({ body }) => {
 		expect(body).toMatchObject({ model: "gpt-5.5", stream: true, store: false });
-		expect(typeof body.instructions).toBe("string");
-		expect(body.instructions?.trim().length).toBeGreaterThan(0);
-		expect(body.instructions).not.toContain(payload);
+		expect(body).not.toHaveProperty("instructions");
+		const prefix = body.input[0];
+		expect(prefix.role).toBe("developer");
+		expect(prefix.content?.[0]?.text?.trim()).toBeTruthy();
+		expect(JSON.stringify(prefix)).not.toContain(payload);
 		const read = body.tools?.find((tool) => tool.type === "function" && tool.name === "Read");
 		expect(read?.description?.length).toBeGreaterThan(0);
 		expect(read?.parameters).toMatchObject({

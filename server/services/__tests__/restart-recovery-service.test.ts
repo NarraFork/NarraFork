@@ -11,6 +11,8 @@ import {
 	narratorToolCalls,
 	runtimePublicationOutbox,
 } from "../../db/schema";
+import * as reads from "../../db/worker-read";
+import * as pool from "../../lib/db-worker/pool";
 import { getNarraforkPath } from "../../lib/narrafork-home";
 import {
 	beginRecoveryDiscovery,
@@ -18,11 +20,20 @@ import {
 	getRegisteredRecoverySource,
 	resetRecoveryHandoffForTests,
 } from "../recovery-handoff";
+import { captureWorkerRejection } from "./narrator-worker-fixture";
 
 // Use preload's isolated file DB and real manifests across simulated cold starts.
 // Only the boundaries that would launch a tool/model are replaced below.
 const { db, sqlite } = await import("../../db");
 const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
+const { backgroundOccupancyStore } = await import("../background-occupancy-store");
+const { drainCommunicationWork } = await import("../agent-runtime/async-work");
+await pool.runReadTask(sqlite.filename, {
+	kind: "selectRows",
+	sql: "SELECT 1",
+	params: [],
+	maxRows: 1,
+});
 // Initialize the service first to avoid its persistence facade's circular import.
 await import("../narrator-service");
 const recovery = await import("../restart-recovery-service");
@@ -184,6 +195,8 @@ async function tool(id: string) {
 }
 
 beforeEach(async () => {
+	await drainCommunicationWork();
+	await backgroundOccupancyStore.drain();
 	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 	recovery.resetRestartRecoveryForTests();
@@ -230,7 +243,9 @@ beforeEach(async () => {
 	spyOn(session, "resumeBufferedMessagesIfIdle").mockResolvedValue(undefined as never);
 });
 
-afterEach(() => {
+afterEach(async () => {
+	await drainCommunicationWork();
+	await backgroundOccupancyStore.drain();
 	const { listRunHolds, setRunHold } =
 		require("../agent-runtime/ownership") as typeof import("../agent-runtime/ownership");
 	for (const id of listRunHolds()) setRunHold(id, undefined);
@@ -241,9 +256,368 @@ afterEach(() => {
 });
 
 afterAll(async () => {
+	const { runtimePublication, getRuntimePublicationService } = await import(
+		"../agent-runtime/publication"
+	);
+	runtimePublication.stop();
+	getRuntimePublicationService().stop();
+	await drainCommunicationWork();
+	await backgroundOccupancyStore.drain();
 	await closePrefixSnapshotStore();
+	await pool.shutdownDbWorkerPool();
 	cleanDb(sqlite);
 	sqlite.close();
+});
+
+function interleaveActiveNarrator(mutate: () => void) {
+	const original = reads.readQuery;
+	let fired = false;
+	spyOn(reads, "readQuery").mockImplementation((async (query, options) => {
+		const result = await original(query as Parameters<typeof reads.readQuery>[0], options);
+		const compiled = query.toSQL();
+		if (
+			!fired &&
+			compiled.sql.includes('from "narrators"') &&
+			compiled.params.includes("working")
+		) {
+			fired = true;
+			mutate();
+		}
+		return result;
+	}) as typeof reads.readQuery);
+	return () => expect(fired).toBe(true);
+}
+
+function expectReadConflict(error: unknown) {
+	expect(error).toMatchObject({ statusCode: 409, code: "RUNTIME_READ_CONFLICT" });
+}
+
+describe("restart classification Worker observations", () => {
+	test.each([
+		false,
+		true,
+	])("same-epoch cold %s revalidates the observed continuation in its write", async (agent) => {
+		if (agent) await seedAgent();
+		else {
+			await seedNarrator("owner");
+			await seedTool("approval", "owner", { status: "pending" });
+		}
+		await recovery.prepareSignalRestartRecovery();
+		const manifest = JSON.parse(await readFile(getNarraforkPath("restart-recovery.json"), "utf8"));
+		const toolCallId = agent ? "agent-call" : "approval";
+		await toolContinuationService.upsert({
+			toolCallId,
+			narratorId: agent ? "parent" : "owner",
+			updateEpoch: manifest.snapshot.updateEpoch,
+			kind: agent ? "foreground_agent" : "pending_permission",
+			state: "paused",
+			payloadJson: agent ? { subagentId: "child", logicalRunId: "run-child" } : {},
+		});
+		coldReset();
+		const { narratorToolContinuations } = await import("../../db/schema");
+		let fired = false;
+		const mutate = () => {
+			fired = true;
+			db.update(narratorToolContinuations)
+				.set({ state: "resuming", claimToken: "replacement-owner" })
+				.run();
+		};
+		if (agent) {
+			const original = toolContinuationService.controlledColdReattachAgent;
+			spyOn(toolContinuationService, "controlledColdReattachAgent").mockImplementation(
+				(input, evidence) => {
+					mutate();
+					return original(input, evidence);
+				},
+			);
+		} else {
+			const original = toolContinuationService.controlledColdTakeover;
+			spyOn(toolContinuationService, "controlledColdTakeover").mockImplementation(
+				(input, evidence) => {
+					mutate();
+					return original(input, evidence);
+				},
+			);
+		}
+		expectReadConflict(
+			await captureWorkerRejection(recovery.prepareOrdinaryRestartRecovery(emptyProtection())),
+		);
+		expect(fired).toBe(true);
+		expect((await toolContinuationService.getByToolCallId(toolCallId))?.claimToken).toBe(
+			"replacement-owner",
+		);
+	});
+
+	test.each([
+		"renew",
+		"takeover",
+		"payload",
+	])("ordinary cold adoption checks the batch observation but tolerates lease-only %s", async (change) => {
+		await seedNarrator("owner");
+		await seedTool("approval", "owner", { status: "pending" });
+		await toolContinuationService.upsert({
+			toolCallId: "approval",
+			narratorId: "owner",
+			updateEpoch: "old-source",
+			kind: "pending_permission",
+			state: "waiting",
+		});
+		await toolContinuationService.claim("approval", {
+			claimToken: "old-token",
+			deadlineAt: new Date(Date.now() + 60_000).toISOString(),
+		});
+		const original = reads.readQuery;
+		let fired = false;
+		spyOn(reads, "readQuery").mockImplementation((async (query, options) => {
+			const result = await original(query as Parameters<typeof reads.readQuery>[0], options);
+			if (
+				!fired &&
+				query.toSQL().sql.includes('from "narrator_tool_continuations"') &&
+				Array.isArray(result) &&
+				result.some((row) => row && typeof row === "object" && "toolCallId" in row)
+			) {
+				fired = true;
+				if (change === "renew")
+					await toolContinuationService.renewClaim("approval", {
+						claimToken: "old-token",
+						deadlineAt: new Date(Date.now() + 120_000).toISOString(),
+					});
+				else {
+					const { narratorToolContinuations } = await import("../../db/schema");
+					db.update(narratorToolContinuations)
+						.set(
+							change === "takeover"
+								? { claimToken: "new-token" }
+								: { payloadJson: { executionAttempt: 1, replacement: true } },
+						)
+						.run();
+				}
+			}
+			return result;
+		}) as typeof reads.readQuery);
+		beginRecoveryDiscovery();
+		try {
+			if (change === "renew") {
+				const prepared = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
+				expect((await toolContinuationService.getByToolCallId("approval"))?.updateEpoch).toBe(
+					prepared.manifest?.snapshot.updateEpoch,
+				);
+			} else
+				expectReadConflict(
+					await captureWorkerRejection(recovery.prepareOrdinaryRestartRecovery(emptyProtection())),
+				);
+			expect(fired).toBe(true);
+		} finally {
+			finishRecoveryDiscovery();
+		}
+	});
+
+	test("pending tools reuse their batched execution receipts instead of probing per tool", async () => {
+		await seedNarrator("owner");
+		for (let index = 0; index < 12; index++)
+			await seedTool(`approval-${index}`, "owner", { status: "pending" });
+		const probe = spyOn(reads, "readQueryFirst");
+		const prepared = await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
+		expect(prepared.protection.toolCallIds.size).toBe(12);
+		expect(
+			probe.mock.calls.filter(([query]) =>
+				query.toSQL().sql.startsWith('select "execution_attempt"'),
+			),
+		).toHaveLength(0);
+	});
+
+	test("empty classification is Worker-required and forwards the caller budget", async () => {
+		const original = pool.runReadTask;
+		const seen: string[] = [];
+		const signal = new AbortController().signal;
+		const deadlineAt = Date.now() + 10_000;
+		spyOn(pool, "runReadTask").mockImplementation(((path, params, options) => {
+			if (
+				params.kind === "selectRows" &&
+				params.sql.includes("runtime_registration_json") &&
+				params.sql.includes("status")
+			) {
+				seen.push(params.sql);
+				expect(path).toBe(sqlite.filename);
+				expect(options).toMatchObject({ signal, deadlineAt, timeoutMs: 2_000 });
+			}
+			return original(path, params, options);
+		}) as typeof pool.runReadTask);
+		const result = await recovery.prepareOrdinaryRestartRecovery(emptyProtection(), {
+			signal,
+			deadlineAt,
+			timeoutMs: 2_000,
+		});
+		expect(result.manifest).toBeNull();
+		expect(seen.length).toBeGreaterThan(0);
+	});
+
+	test.each([
+		"status",
+		"run",
+		"registration",
+	])("pending continuation rejects changed narrator %s", async (field) => {
+		await seedNarrator("owner");
+		await seedTool("approval", "owner", { status: "pending" });
+		const fired = interleaveActiveNarrator(() => {
+			db.update(narrators)
+				.set(
+					field === "status"
+						? { status: "idle" }
+						: field === "run"
+							? { logicalRunId: "new-run" }
+							: { runtimeRegistrationJson: null },
+				)
+				.where(eq(narrators.id, "owner"))
+				.run();
+		});
+		expectReadConflict(
+			await captureWorkerRejection(recovery.prepareOrdinaryRestartRecovery(emptyProtection())),
+		);
+		fired();
+		expect(await toolContinuationService.getByToolCallId("approval")).toBeNull();
+		expect((await tool("approval"))?.status).toBe("pending");
+	});
+
+	test.each([
+		"status",
+		"attempt",
+		"execution",
+	])("unknown-result repair rejects changed tool %s", async (field) => {
+		await seedNarrator("owner");
+		await seedTool("started", "owner", { executionStartedAt: now });
+		const original = reads.readQuery;
+		let fired = false;
+		spyOn(reads, "readQuery").mockImplementation((async (query, options) => {
+			const result = await original(query as Parameters<typeof reads.readQuery>[0], options);
+			if (
+				!fired &&
+				query.toSQL().sql.includes("execution_attempt") &&
+				query.toSQL().params.includes("initializing")
+			) {
+				fired = true;
+				db.update(narratorToolCalls)
+					.set(
+						field === "status"
+							? { status: "success", outputJson: "kept" }
+							: field === "attempt"
+								? { executionAttempt: 2 }
+								: { executionStartedAt: "2026-10-08T00:00:00.000Z" },
+					)
+					.where(eq(narratorToolCalls.id, "started"))
+					.run();
+			}
+			return result;
+		}) as typeof reads.readQuery);
+		expectReadConflict(
+			await captureWorkerRejection(recovery.prepareOrdinaryRestartRecovery(emptyProtection())),
+		);
+		expect(fired).toBe(true);
+		expect((await tool("started"))?.errorMessage).not.toBe(recovery.RESTART_EXECUTION_UNKNOWN);
+	});
+
+	test.each([
+		false,
+		true,
+	])("Agent classification guards task existence and status (existing=%s)", async (existing) => {
+		await seedAgent(existing);
+		const original = reads.readQuery;
+		let fired = false;
+		spyOn(reads, "readQuery").mockImplementation((async (query, options) => {
+			const result = await original(query as Parameters<typeof reads.readQuery>[0], options);
+			if (!fired && query.toSQL().sql.includes('from "background_tasks"')) {
+				fired = true;
+				if (existing)
+					db.update(backgroundTasks)
+						.set({ status: "completed" })
+						.where(eq(backgroundTasks.id, "background-child"))
+						.run();
+				else
+					db.insert(backgroundTasks)
+						.values({
+							id: "new-task",
+							type: "agent",
+							status: "running",
+							parentNarratorId: "parent",
+							subagentNarratorId: "child",
+							logicalRunId: "run-child",
+							startedAt: now,
+							createdAt: now,
+							updatedAt: now,
+						})
+						.run();
+			}
+			return result;
+		}) as typeof reads.readQuery);
+		expectReadConflict(
+			await captureWorkerRejection(recovery.prepareOrdinaryRestartRecovery(emptyProtection())),
+		);
+		expect(fired).toBe(true);
+		expect(await toolContinuationService.getByToolCallId("agent-call")).toBeNull();
+	});
+
+	test("renewal-only narrator and task timestamps do not conflict", async () => {
+		await seedAgent(true);
+		const original = reads.readQuery;
+		spyOn(reads, "readQuery").mockImplementation((async (query, options) => {
+			const result = await original(query as Parameters<typeof reads.readQuery>[0], options);
+			db.update(narrators).set({ updatedAt: new Date().toISOString() }).run();
+			db.update(backgroundTasks).set({ updatedAt: new Date().toISOString() }).run();
+			return result;
+		}) as typeof reads.readQuery);
+		await recovery.prepareOrdinaryRestartRecovery(emptyProtection());
+		expect((await toolContinuationService.getByToolCallId("agent-call"))?.kind).toBe(
+			"background_agent",
+		);
+	});
+
+	test("settled-run repair does not overwrite a changed narrator", async () => {
+		await seedNarrator("owner");
+		const { getRuntimePublicationService } = await import("../agent-runtime/publication");
+		spyOn(getRuntimePublicationService(), "readRunPublicationStates").mockResolvedValue([
+			{ state: "settled", eventKind: "completed" },
+		]);
+		const fired = interleaveActiveNarrator(() => {
+			db.update(narrators)
+				.set({ status: "waiting", logicalRunId: "new-run" })
+				.where(eq(narrators.id, "owner"))
+				.run();
+		});
+		expectReadConflict(
+			await captureWorkerRejection(recovery.prepareOrdinaryRestartRecovery(emptyProtection())),
+		);
+		fired();
+		expect((await db.query.narrators.findFirst({ where: eq(narrators.id, "owner") }))?.status).toBe(
+			"waiting",
+		);
+	});
+
+	test("Worker failure is not empty success and a later retry is admitted", async () => {
+		const failure = new Error("injected restart read failure");
+		const original = pool.runReadTask;
+		const injected = spyOn(pool, "runReadTask").mockImplementation(((path, params, options) => {
+			if (params.kind === "selectRows" && params.sql.includes("runtime_registration_json"))
+				return Promise.reject(failure);
+			return original(path, params, options);
+		}) as typeof pool.runReadTask);
+		expect(
+			await captureWorkerRejection(recovery.prepareOrdinaryRestartRecovery(emptyProtection())),
+		).toBe(failure);
+		injected.mockRestore();
+		expect((await recovery.prepareOrdinaryRestartRecovery(emptyProtection())).manifest).toBeNull();
+	});
+
+	test.each(["abort", "deadline"])("classification fails closed on %s", async (mode) => {
+		const controller = new AbortController();
+		if (mode === "abort") controller.abort();
+		const error = await captureWorkerRejection(
+			recovery.prepareOrdinaryRestartRecovery(emptyProtection(), {
+				signal: controller.signal,
+				deadlineAt: mode === "deadline" ? Date.now() - 1 : undefined,
+			}),
+		);
+		expect(error).toBeDefined();
+	});
 });
 
 describe("ordinary restart eligibility and tool disposition", () => {
@@ -385,9 +759,16 @@ describe("ordinary restart with real persisted recovery records", () => {
 			await pub.startRun({
 				narratorId: "child",
 				resumeRunId: "run-child",
-				binding: { deliverTo: { narratorId: "parent", toolUseId: "test-tool-use" } },
+				binding: {
+					deliverTo: {
+						narratorId: "parent",
+						toolUseId: "use-agent-call",
+						toolCallId: "agent-call",
+					},
+				},
 			})
-		).publication!;
+		).publication;
+		if (!run) throw new Error("Missing recovery fixture Agent publication");
 		await pub.commitAgentTerminal({
 			run,
 			eventKind: "completed",

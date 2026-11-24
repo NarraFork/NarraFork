@@ -21,10 +21,12 @@
  */
 
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
-import { cleanDb, getTestDb } from "../../../tests/setup";
-import { narratorMessages, narrators, narratorToolCalls } from "../../db/schema";
+import { cleanDb } from "../../../tests/setup";
+import { backgroundTasks, narratorMessages, narrators, narratorToolCalls } from "../../db/schema";
+import { closeRuntimeTestDb, getRuntimeTestDb } from "./agent-runtime-test-database";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
 mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
 
 import type { ParentInboundMessage } from "../parent-inbound-queue";
@@ -130,8 +132,8 @@ beforeEach(() => {
 			.values({ id, type: "primary", variant: "primary", createdAt: TIME, updatedAt: TIME })
 			.run();
 });
-afterAll(() => {
-	sqlite.close();
+afterAll(async () => {
+	await closeRuntimeTestDb(sqlite);
 });
 
 describe("parent injection queue — order across kinds", () => {
@@ -194,6 +196,34 @@ describe("parent injection queue — order across kinds", () => {
 		await pushPendingInjection("other", other);
 		expect(ids(await drainPendingInjections(P))).toEqual(["msg:mine"]);
 		expect(ids(await drainPendingInjections("other"))).toEqual(["msg:theirs"]);
+	});
+});
+
+describe("parent injection queue — Watch results", () => {
+	test("a bash notice from a Watch observation carries the watched target type", async () => {
+		for (const [id, command] of [
+			["w1", '[watch] agent "fix-login"'],
+			["b1", "bun test"],
+		] as const)
+			db.insert(backgroundTasks)
+				.values({
+					id,
+					parentNarratorId: P,
+					type: "bash",
+					command,
+					status: "completed",
+					startedAt: TIME,
+					createdAt: TIME,
+					updatedAt: TIME,
+				})
+				.run();
+		notice("bash", "w1");
+		notice("bash", "b1");
+		const entries = await drainPendingInjections(P);
+		expect(entries.map((e) => (e.kind === "bg_bash" ? [e.task.id, e.task.watch] : null))).toEqual([
+			["w1", "agent"],
+			["b1", null],
+		]);
 	});
 });
 

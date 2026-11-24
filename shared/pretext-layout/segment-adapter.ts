@@ -40,6 +40,10 @@ import { readSubagentDelegation } from "../outline-report-note";
 import { hasUsablePlanBody } from "../plan-reference";
 import { isPreferOpenTool } from "../prefer-open-tool";
 import { type ProgressPhase, shouldShowThinkingChars } from "../progress-phase";
+import type {
+	ReasoningTranslationFields,
+	ReasoningTranslationVisibilityTarget,
+} from "../reasoning-translation";
 import {
 	escapeMarkdown,
 	rawSideCarToMarkdown,
@@ -51,6 +55,7 @@ import {
 	verbatimOutputToMarkdown,
 } from "../sidecar-body";
 import { isClearedToolOutput } from "../storage-retention";
+import { normalizeSubagentNestedSummary, type SubagentNestedAgent } from "../subagent-nested";
 import { subagentResultText } from "../subagent-result-text";
 import { type FileChangeTiming, resolveToolDisplayDurationMs } from "../tool-display-duration";
 
@@ -71,11 +76,13 @@ type ToolTimingRecord = Partial<
 
 import { dangerCopyEnglishFallbacks } from "../danger-copy";
 import { isToolQueuedBehindUpstream, type ToolUpstreamPeer } from "../tool-shimmer";
+import { watchNoticeFromTask } from "../watch-command";
 import {
 	type AuxiliaryContentProjection,
 	auxiliaryContentKey,
 	auxiliaryContentViews,
 	buildAuxiliaryContentData,
+	watchNoticeOutcomeLabel,
 } from "./auxiliary-content";
 import {
 	type CommunicationState,
@@ -101,6 +108,13 @@ import {
 	parseStreamingReasoningSegments,
 	parseStreamingReasoningTitles,
 } from "./reasoning-segments-cache";
+import {
+	appendReasoningTranslationParagraph,
+	mergedReasoningTranslationEvidence,
+	type ReasoningTranslationEvidence,
+	reasoningBlockDisplayText,
+	reasoningTranslationSources,
+} from "./reasoning-translation-sources";
 import {
 	buildReflectionNoticeData,
 	getPermissionReflectionSuggestion,
@@ -140,7 +154,7 @@ import { resolveTurnUsageLines, type TurnUsageJson, type UsageNumberFormatter } 
 // satisfy these.
 // ─────────────────────────────────────────────────────────────────────────────
 
-export interface AdapterContentBlock {
+export interface AdapterContentBlock extends ReasoningTranslationFields {
 	type: string;
 	text?: string | null;
 	/** Native system injection's exact model-facing projection. */
@@ -369,6 +383,11 @@ export interface AdapterToolItem {
 			takenOver?: boolean;
 			/** Follow/fallback decision for `__parent__` children (height-neutral badge). */
 			modelInheritance?: unknown;
+			/**
+			 * The helpers this child launched itself (its one nested level). Height-affecting
+			 * (a row list), keyed in `subagentRevision` through the card's `nestedAgents`.
+			 */
+			nested?: unknown;
 		} | null;
 		/**
 		 * The subagent this call is waiting on is TAKEN OVER by the user, so the call
@@ -867,6 +886,9 @@ export interface ElementSpec {
 	key: string;
 	/** Measure input `data` for `measureElement(kind, data, …)`. */
 	data: unknown;
+	/** Persisted source coordinates for the transcript's visibility observer. */
+	reasoningTranslationSources?: ReasoningTranslationVisibilityTarget[];
+	reasoningTranslationEvidence?: ReasoningTranslationEvidence[];
 	/** Per-kind measure extras (expand state / labels / viewportHeight). */
 	opts?: Record<string, unknown>;
 	/**
@@ -1382,17 +1404,18 @@ function joinRunText(parts: readonly string[]): string {
 	return parts.filter((value) => value.length > 0).join("\n\n");
 }
 
-/**
- * A run's translation, or null when it is not fully translated.
- *
- * All-or-nothing on purpose: a partially translated run would otherwise render some
- * steps in one language and some in another. The denominator counts only NON-EMPTY
- * blocks, matching what `joinRunText` keeps.
- */
+/** Keep untranslated source visible until its own translation is ready. */
 function canonicalReasoningRunTranslation(blocks: readonly AdapterContentBlock[]): string | null {
-	const translatedParts = blocks.map((block) => block.translatedText).filter(Boolean) as string[];
-	const nonEmpty = blocks.filter((block) => (block.thinking ?? block.text ?? "").length > 0).length;
-	return translatedParts.length === nonEmpty && nonEmpty > 0 ? joinRunText(translatedParts) : null;
+	let translated = false;
+	const parts = blocks.map((block) => {
+		const source = block.thinking ?? block.text ?? "";
+		if (!source.length) return source;
+		const replacement = reasoningBlockDisplayText(block);
+		if (!replacement) return source;
+		translated = true;
+		return replacement;
+	});
+	return translated ? joinRunText(parts) : null;
 }
 
 /**
@@ -1471,6 +1494,7 @@ function reasoningStepsData(
 	isStreaming: boolean,
 	ctx: AdapterContext,
 	unitSource?: ReasoningStepUnitSource,
+	translationSteps?: ReadonlySet<number>,
 ) {
 	return {
 		steps: segments.map((segment, index) => ({
@@ -1478,6 +1502,7 @@ function reasoningStepsData(
 			body: segment.isEmpty ? null : segment.body,
 			shimmer: isStreaming && index === segments.length - 1,
 			key: `seg${index}`,
+			...(translationSteps?.has(index) ? { sourceRanges: true } : {}),
 			// Same string the folded row of this step carries at L1/L2, so the two
 			// renderings pair across the level switch. Height-neutral passthrough.
 			...(unitSource
@@ -2299,6 +2324,16 @@ function adaptMessage(
 				if (runIndex != null) runIndices.push(runIndex);
 			}
 			const streaming = isLiveStreamingRun(streamingMessage, msg, runIndices);
+			const entries = runIndices.map((index, position) => ({
+				block: reasoningBlocks[position],
+				index,
+			}));
+			const translationSources =
+				!streamingMessage && entries.length === 1 ? reasoningTranslationSources(msg, entries) : [];
+			const translationEvidence =
+				!streamingMessage && entries.length > 1
+					? mergedReasoningTranslationEvidence(msg, entries)
+					: undefined;
 			const data = reasoningData(reasoningBlocks, streaming);
 			// A translated run displays its translation by default; the reader can flip
 			// it back to the original. Resolved HERE (not at paint time) because the two
@@ -2312,20 +2347,53 @@ function adaptMessage(
 			const displayText = data.translatedText ?? data.text;
 			const lifecycleId = contentBlockLifecycleId(block);
 			const textExpanded = adapterTextExpanded(ctx, key, undefined, lifecycleId);
+			const stepEvidence: ReasoningTranslationEvidence[] = [];
+			const parseStepsWithProvenance = (text: string, evidence: ReasoningTranslationEvidence[]) => {
+				const single = longSingleReasoningStep(key, text);
+				if (single) {
+					const body = single[0].body;
+					appendReasoningTranslationParagraph(
+						evidence,
+						stepEvidence,
+						0,
+						0,
+						text.trimEnd().length - body.length,
+						body.length,
+					);
+					return single;
+				}
+				return parseReasoningSegments(text, (step, bodyStart, runStart, length) => {
+					appendReasoningTranslationParagraph(
+						evidence,
+						stepEvidence,
+						step,
+						bodyStart,
+						runStart,
+						length,
+					);
+				});
+			};
 			const parsed =
 				!usesStructuredReasoning(msg.model) ||
 				(!textExpanded && isLongPlainReasoning(key, displayText))
 					? []
-					: (longSingleReasoningStep(key, displayText) ??
-						(streaming && !ctx.resolveReasoningSegments
-							? parseStreamingReasoningSegments(`high-lod:${key}`, displayText)
-							: parseReasoning(displayText)));
+					: translationEvidence && !ctx.resolveReasoningSegments
+						? parseStepsWithProvenance(displayText, translationEvidence)
+						: (longSingleReasoningStep(key, displayText) ??
+							(streaming && !ctx.resolveReasoningSegments
+								? parseStreamingReasoningSegments(`high-lod:${key}`, displayText)
+								: parseReasoning(displayText)));
+			const directTranslation = translationSources.length
+				? { reasoningTranslationSources: translationSources }
+				: {};
 			// A run is identified by its FIRST block, the same block the fold's
 			// `activityUnitKey` and `reasoningRowIdentity` anchor on.
 			if (hasStructuredReasoning(parsed)) {
 				specs.push({
 					kind: "reasoning-steps",
 					key,
+					...directTranslation,
+					...(stepEvidence.length ? { reasoningTranslationEvidence: stepEvidence } : {}),
 					...(lifecycleId ? { lifecycleId } : {}),
 					data: reasoningStepsData(
 						parsed,
@@ -2343,6 +2411,9 @@ function adaptMessage(
 						msg.id && msg.id !== STREAMING_MESSAGE_ID
 							? { messageId: msg.id, runStartBlockIndex: bi }
 							: undefined,
+						stepEvidence.length
+							? new Set(stepEvidence.map(({ step }) => step as number))
+							: undefined,
 					),
 					// No LOD input: a step trace has ONE shape at every level — titles
 					// visible, each step's body openable. A level that showed titles whose
@@ -2356,15 +2427,22 @@ function adaptMessage(
 					},
 				});
 			} else {
+				const bodyEvidence =
+					showOriginal && translationEvidence
+						? mergedReasoningTranslationEvidence(msg, entries, true)
+						: translationEvidence;
 				specs.push({
 					kind,
 					key,
+					...directTranslation,
+					...(bodyEvidence ? { reasoningTranslationEvidence: bodyEvidence } : {}),
 					...(lifecycleId ? { lifecycleId } : {}),
 					data,
 					opts: {
 						expanded: ctx.isExpanded?.(key),
 						textExpanded,
 						showOriginal,
+						...(bodyEvidence ? { sourceRanges: true } : {}),
 						// A live reasoning body (synthetic streaming row or checkpoint
 						// projection) must go through the incremental prepared-block path
 						// in the measure registry — the same flag markdown already carries.
@@ -2462,6 +2540,7 @@ function resolveAdapterTurnUsage(msg: AdapterMessage, ctx: AdapterContext) {
  */
 const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	status_fail: "Failed",
+	watchNoticeLabel: "Watch",
 	// Body of a background-task bubble whose task produced no output. Needs a fallback
 	// like every other composed string: without one, `sysLabel` returns the raw key and
 	// the reader would see the literal "empty" in the bubble.
@@ -2564,6 +2643,9 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	subagentRecoveryToBackground: "to background",
 	subagentRecoveryResumeAndNotify: "Resume and notify",
 	subagentRecoveryResumeAndWait: "Resume and wait",
+	subagentRecoveryResumeAndWatch: "Resume and observe",
+	subagentRecoveryResolvedWatch:
+		"Restarted {count} subagent(s) and registered observations; results will notify automatically.",
 	subagentRecoveryResolvedNotify:
 		"Restarted {count} subagent(s); the narrator was told to await them.",
 	subagentRecoveryResolvedWait: "Restarted {count} subagent(s) and waited for every result.",
@@ -2636,6 +2718,7 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	sidecarSourceOutlineTaskBrief: "Opening brief",
 	sidecarSourceSpecImport: "Dynamic Spec moved to the outline",
 	sidecarSourceOutlineAnswer: "Answers to your questions",
+	sidecarSourceTeamStatus: "Team status",
 	// An update of an outline session's views (`context_update` row of `outline.*` parts).
 	contextViewsUpdated: "Context updated: {parts}",
 	contextViewOutlineTasks: "Current tasks",
@@ -2766,6 +2849,8 @@ const INJECTION_SOURCE_LABEL_KEYS: Record<string, string> = {
 	// The session's Dynamic Spec was moved into the outline: where it went (P2 PR 12b2).
 	spec_import: "sidecarSourceSpecImport",
 	outline_answer: "sidecarSourceOutlineAnswer",
+	// A team coordinator's team status (Project Teams P2).
+	team_status: "sidecarSourceTeamStatus",
 	// Loop-control notices: written as rows so a rebuilt request says what the live one did.
 	turn_nudge: "sidecarSourceTurnNudge",
 	broken_call: "sidecarSourceBrokenCall",
@@ -3261,7 +3346,10 @@ function adaptSpokenInjection(
 		// the task id alone — no positional suffix.
 		const task = Array.isArray(body.items) ? body.items[0] : undefined;
 		if (!task) return null;
-		const preview = (task.preview ?? "").trim();
+		// A Watch observation's result arrives as a bash completion; it is labelled as the
+		// watch it is, addressed by its target, with the result header moved to the badge.
+		const watch = body.flavor === "bash" ? watchNoticeFromTask(task) : null;
+		const preview = (watch?.body ?? task.preview ?? "").trim();
 		// A bash task's preview is VERBATIM stdout/stderr, so it is fenced unconditionally
 		// (`verbatimOutputToMarkdown`) rather than handed to the Markdown parser. Linter
 		// and compiler output is preformatted text whose indentation and column rules ARE
@@ -3295,10 +3383,13 @@ function adaptSpokenInjection(
 					speaker:
 						body.flavor === "agent"
 							? task.title?.trim() || task.alias?.trim() || task.id
-							: task.alias?.trim() || task.title?.trim() || task.id,
+							: watch?.targetName || task.alias?.trim() || task.title?.trim() || task.id,
 					// A background task is addressable by id, which is what seeds its glyph.
 					speakerId: task.id ?? null,
-					speakerKind: task.status ?? null,
+					speakerKind: watch
+						? `${sysLabel(ctx, "watchNoticeLabel")} · ${watchNoticeOutcomeLabel(watch.outcome, ctx.labels)}`
+						: (task.status ?? null),
+					...(watch ? { watch: true } : {}),
 					// Only the AGENT flavour has a session: a background agent's task id IS
 					// its narrator id, whereas a bash task id addresses a shell invocation
 					// with no session to open. Gating on `flavor` rather than on the presence
@@ -3699,13 +3790,15 @@ function adaptSystemBlock(
 				subagents: rows,
 				summary: countLabel(
 					ctx,
-					block.mode === "await"
-						? "subagentRecoveryResolvedWait"
-						: "subagentRecoveryResolvedNotify",
+					block.mode === "watch"
+						? "subagentRecoveryResolvedWatch"
+						: block.mode === "await"
+							? "subagentRecoveryResolvedWait"
+							: "subagentRecoveryResolvedNotify",
 					resumedCount,
 				),
 				notifyLabel: sysLabel(ctx, "subagentRecoveryResumeAndNotify"),
-				waitLabel: sysLabel(ctx, "subagentRecoveryResumeAndWait"),
+				waitLabel: sysLabel(ctx, "subagentRecoveryResumeAndWatch"),
 				backgroundBadge: sysLabel(ctx, "subagentRecoveryToBackground"),
 				// Close button (aria-label + tooltip). Height-neutral: it sits inside
 				// the header lane the measure layer already reserves.
@@ -4387,6 +4480,16 @@ function adaptToolItemFull(
 	};
 }
 
+/** `nestedAgents` / `nestedTotal` for a card whose child launched helpers, else `{}`. */
+function nestedCardFields(value: unknown): {
+	nestedAgents?: SubagentNestedAgent[];
+	nestedTotal?: number;
+} {
+	const nested = normalizeSubagentNestedSummary(value);
+	if (!nested || nested.total === 0) return {};
+	return { nestedAgents: nested.agents, nestedTotal: nested.total };
+}
+
 /**
  * The complete `SubagentCardData` payload for ONE subagent tool call.
  *
@@ -4459,7 +4562,9 @@ function buildSubagentCardData(item: AdapterToolItem, ctx: AdapterContext) {
 		resultValue !== undefined &&
 		resultValue.trim() === readLeafText(asObject(metadata)?._streamingOutput)?.trim();
 	const resultContent =
-		resultValue === undefined || resultIsLiveCount ? undefined : subagentResultText(outputJson);
+		(resultValue === undefined && !Array.isArray(outputJson)) || resultIsLiveCount
+			? undefined
+			: subagentResultText(outputJson);
 	const resultText = resultContent || undefined;
 	// ── Fields carried by the persisted tool call (mirrors SubagentCard.tsx
 	// derivations). prompt/isBackground/agentType live on inputJson.
@@ -4545,6 +4650,9 @@ function buildSubagentCardData(item: AdapterToolItem, ctx: AdapterContext) {
 			: {}),
 		...(reasoningEffort === undefined ? {} : { reasoningEffort }),
 		...(liveOutputChars != null ? { liveOutputChars } : {}),
+		toolCallId: readNonEmptyString(item.tc, "tcId") ?? readNonEmptyString(item.tc, "id"),
+		executionAttempt:
+			typeof item.tc.executionAttempt === "number" ? item.tc.executionAttempt : undefined,
 		...(prompt === undefined ? {} : { prompt, promptBody }),
 		// The prompt block's own fold state (independent of the card's), so the
 		// measure layer reserves the body only when the reader opened it. The key is
@@ -4563,6 +4671,8 @@ function buildSubagentCardData(item: AdapterToolItem, ctx: AdapterContext) {
 		...(activity?.fileChanges && ctx.isFileChangesOpen?.(key) === true
 			? { fileChangesExpanded: true }
 			: {}),
+		// The helpers this child launched (its one nested level): one row each, bounded.
+		...nestedCardFields(activity?.nested),
 		recentCallCount: recentCallNames.length,
 		recentCallNames,
 		recentCallSummaries,
@@ -4822,6 +4932,8 @@ const DEFAULT_AWAIT_TIMEOUT_MS = 600_000;
  * will never be killed is the divergence this reproduces correctly.
  */
 function effectiveTimeoutMs(tc: AdapterToolItem["tc"], category: string): number | undefined {
+	// Watch's timeout belongs to the observation, not an active tool execution.
+	if (category === "watch") return undefined;
 	if (category !== "bash" && category !== "await") return readFiniteNumber(tc._timeoutMs);
 	const explicit =
 		readFiniteNumber(tc._timeoutMs) ?? readFiniteNumber(asObject(tc.inputJson).timeout);

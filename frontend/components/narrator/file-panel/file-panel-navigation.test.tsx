@@ -13,7 +13,10 @@ import {
 	useFilePanelSourceOpener,
 } from "./file-panel-navigation";
 
-function probeIsolatedChild(hostOpen: FilePanelOpener | undefined) {
+function probeIsolatedChild(
+	hostOpen: FilePanelOpener | undefined,
+	deviceId: string | null = "RemoteCase",
+) {
 	const observations: {
 		dock: NarratorDockContextValue | null;
 		open: FilePanelOpener | undefined;
@@ -28,6 +31,8 @@ function probeIsolatedChild(hostOpen: FilePanelOpener | undefined) {
 				narratorId: "child",
 				toolUseId: "sdk",
 				filePath: "/work/a.ts",
+				fileTarget: deviceId === null ? undefined : { deviceId, path: "/work/a.ts" },
+				fileNarratorId: "child",
 				toolDetailRef: { toolCallId: "pk", messageId: "message", executionAttempt: 2 },
 			}),
 		});
@@ -93,9 +98,22 @@ describe("isolated child file navigation", () => {
 				toolCallId: "pk",
 				messageId: "message",
 				executionAttempt: 2,
+				deviceId: "RemoteCase",
 			},
 		});
 		expect(child.edit.modal).toBeNull();
+	});
+
+	test.each([
+		null,
+		"",
+		"  ",
+	])("unknown historical device %s exposes neither a history opener nor a viewer", (deviceId) => {
+		const host = mock((..._args: Parameters<FilePanelOpener>) => {});
+		const child = probeIsolatedChild(host, deviceId);
+		expect(child.edit.open).toBeUndefined();
+		expect(child.edit.modal).toBeNull();
+		expect(host).not.toHaveBeenCalled();
 	});
 
 	test("keeps the off-dock fallback when no host can open a file", () => {

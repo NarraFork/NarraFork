@@ -387,9 +387,9 @@ describe("subagent communication guidance", () => {
 
 		// Send never waits, so there is no await flag left to forbid.
 		expect(en).not.toContain("await=true");
-		expect(en).toContain("Do not use Await(agent)");
+		expect(en).toContain("Do not use Watch(agent)");
 		expect(en).toContain("caller is waiting");
-		expect(zh).toContain("不得使用 Await(agent)");
+		expect(zh).toContain("不得使用 Watch(agent)");
 		expect(zh).toContain("调用方正在等待");
 	});
 

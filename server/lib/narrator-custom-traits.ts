@@ -1,3 +1,4 @@
+import { parseModelId } from "@shared/model-id";
 import type { ReasoningEffort } from "@shared/reasoning-effort";
 import {
 	isSubagentReasoningEffort,
@@ -11,7 +12,7 @@ import { OPTIONAL_TOOLS } from "./agent/tools/index";
 import type { ToolDefinition } from "./agent/types";
 import { parseTraits } from "./narrator-utils";
 import { getSubagentVisibleModels, resolveAllowedModelCandidateMatch, settings } from "./settings";
-import { expandAllowedPoolForDisplay } from "./settings/provider";
+import { expandAllowedPoolForDisplay, listConcreteModelsForReference } from "./settings/provider";
 
 export const SUBAGENT_MODEL_RESTRICTION_TRAIT_PREFIX = "custom-subagent-models:";
 export const DISABLED_TOOLS_TRAIT_PREFIX = "custom-disabled-tools:";
@@ -322,6 +323,12 @@ interface SubagentModelSelectionParams {
 	policy: EffectiveSubagentModelPolicy;
 	explicitModel?: string;
 	candidates: Array<string | undefined | null>;
+	/**
+	 * Provider prefix of the parent narrator. Only consulted by the pool default
+	 * (no explicit model, no candidate hit): the first pool entry that can reach
+	 * this provider wins over the plain first entry.
+	 */
+	preferredProvider?: string;
 }
 
 export interface SubagentModelSelection {
@@ -362,8 +369,29 @@ export function resolveSubagentModelSelectionFromPolicy(
 		const resolved = matchCandidate(candidate);
 		if (resolved) return resolved;
 	}
+	const preferred = selectPoolEntryForProvider(params.policy.models, params.preferredProvider);
+	if (preferred) return preferred;
 	const poolEntry = params.policy.models[0];
 	return poolEntry ? { model: poolEntry.model, poolEntry } : undefined;
+}
+
+/**
+ * First pool entry (in pool order) able to reach `provider`, resolved to that
+ * provider's concrete member so aggregations do not route elsewhere at creation.
+ * Expansion is settings-only and never advances aggregation round-robin.
+ */
+function selectPoolEntryForProvider(
+	entries: SubagentModelUse[],
+	provider: string | undefined,
+): SubagentModelSelection | undefined {
+	if (!provider) return undefined;
+	for (const poolEntry of entries) {
+		const model = listConcreteModelsForReference(poolEntry.model).find(
+			(value) => parseModelId(value).provider === provider,
+		);
+		if (model) return { model, poolEntry };
+	}
+	return undefined;
 }
 
 export function formatSubagentModelUse(entry: SubagentModelUse): string {

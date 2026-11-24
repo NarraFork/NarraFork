@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	narratorBufferedMessages,
 	narratorMessages,
@@ -9,8 +9,11 @@ import {
 } from "../../db/schema";
 import { withRuntimePolicyTrait } from "../../lib/runtime-policy-trait";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
+import { captureWorkerRejectionThrower, getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 const ws = { ...(await import("../../websocket/narrator-ws")) };
@@ -24,6 +27,7 @@ mock.module("../../websocket/narrator-ws", () => ({
 const { sendSubagentMessageDetailed } = await import("../agent-communication");
 const inbox = await import("../agent-runtime/inbox");
 const settingsModule = await import("../../lib/settings");
+const modelSwitch = await import("../subagent-model-switch");
 const { createMailboxStore } = await import("../agent-runtime/mailbox");
 const { getExecutionOwner, setRunHold, tryClaimExecution } = await import(
 	"../agent-runtime/ownership"
@@ -84,13 +88,13 @@ beforeEach(() => {
 	}
 	tryClaimExecution("parent-root", "run");
 });
-afterAll(() => {
+afterAll(async () => {
 	for (const id of ids) {
 		setRunHold(id, undefined);
 		getExecutionOwner(id)?.release();
 		activeNarrators.delete(id);
 	}
-	sqlite.close();
+	await fixture.close();
 });
 function input(
 	callerNarratorId = "sender-child",
@@ -220,8 +224,10 @@ test("parent/main/id and sibling alias/title/id deduplicate by actual recipient"
 test("whole-call selector authorization rejects foreign or missing targets before any parent enqueue", async () => {
 	for (const target of ["foreign-child", "nonexistent"]) {
 		await expect(
-			sendSubagentMessageDetailed(input("sender-child", ["parent", target])),
-		).rejects.toThrow();
+			await captureWorkerRejectionThrower(
+				sendSubagentMessageDetailed(input("sender-child", ["parent", target])),
+			),
+		).toThrow();
 		expect(rows()).toHaveLength(0);
 	}
 });
@@ -284,13 +290,19 @@ test("doInterrupt is ignored for a taken-over child: queued, user's turn untouch
 });
 
 test("child interrupt and primary foreign interrupt fail whole-call before enqueue", async () => {
-	await expect(sendSubagentMessageDetailed({ ...input(), doInterrupt: true })).rejects.toThrow();
 	await expect(
-		sendSubagentMessageDetailed({
-			...input("parent-root", ["sibling-a", "foreign-child"]),
-			doInterrupt: true,
-		}),
-	).rejects.toThrow();
+		await captureWorkerRejectionThrower(
+			sendSubagentMessageDetailed({ ...input(), doInterrupt: true }),
+		),
+	).toThrow();
+	await expect(
+		await captureWorkerRejectionThrower(
+			sendSubagentMessageDetailed({
+				...input("parent-root", ["sibling-a", "foreign-child"]),
+				doInterrupt: true,
+			}),
+		),
+	).toThrow();
 	expect(rows()).toHaveLength(0);
 });
 
@@ -421,12 +433,14 @@ test("resume and model require control of the target: a child cannot steer its s
 	stopTarget("error");
 	for (const extra of [{ resume: true }, { model: "test:other" }])
 		await expect(
-			sendSubagentMessageDetailed({ ...input("sender-child", ["sibling-a"]), ...extra }),
-		).rejects.toThrow("not a direct child");
+			await captureWorkerRejectionThrower(
+				sendSubagentMessageDetailed({ ...input("sender-child", ["sibling-a"]), ...extra }),
+			),
+		).toThrow("not a direct child");
 	expect(rows()).toHaveLength(0);
 });
 
-test("model switches a child before delivery and announces it to an idle page", async () => {
+test("an accepted Send switches the child's model and announces it to an idle page", async () => {
 	const visible = spyOn(settingsModule, "getSubagentVisibleModels").mockReturnValue([
 		"test:model",
 		"test:other",
@@ -455,6 +469,70 @@ test("model switches a child before delivery and announces it to an idle page", 
 	}
 });
 
+test("a replayed Send cannot overwrite a later accepted model selection", async () => {
+	const visible = spyOn(settingsModule, "getSubagentVisibleModels").mockReturnValue([
+		"test:model",
+		"test:other",
+	]);
+	try {
+		const earlier = { ...input("parent-root", ["sibling-a"]), model: "test:model" };
+		await sendSubagentMessageDetailed(earlier);
+		await sendSubagentMessageDetailed({
+			...input("parent-root", ["sibling-a"]),
+			model: "test:other",
+		});
+		await sendSubagentMessageDetailed(earlier);
+
+		expect(rows("sibling-a")).toHaveLength(2);
+		expect(db.select().from(narrators).where(eq(narrators.id, "sibling-a")).get()?.model).toBe(
+			"test:other",
+		);
+	} finally {
+		visible.mockRestore();
+	}
+});
+
+test("only a newly enqueued Send pins its switched model", async () => {
+	const visible = spyOn(settingsModule, "getSubagentVisibleModels").mockReturnValue([
+		"test:model",
+		"test:other",
+	]);
+	const mark = modelSwitch.markExplicitSubagentModelPin;
+	const pin = spyOn(modelSwitch, "markExplicitSubagentModelPin").mockImplementation((id, model) => {
+		expect(rows(id)).toHaveLength(1);
+		expect(db.select().from(narrators).where(eq(narrators.id, id)).get()?.model).toBe(model);
+		mark(id, model);
+	});
+	try {
+		const message = { ...input("parent-root", ["sibling-a"]), model: "test:other" };
+		await sendSubagentMessageDetailed(message);
+		await sendSubagentMessageDetailed(message);
+		expect(pin).toHaveBeenCalledTimes(1);
+		pin.mockClear();
+		const previousModel = db
+			.select()
+			.from(narrators)
+			.where(eq(narrators.id, "sibling-b"))
+			.get()?.model;
+		sqlite.exec(
+			"CREATE TEMP TRIGGER reject_model_recipient BEFORE INSERT ON narrator_buffered_messages WHEN NEW.narrator_id = 'sibling-b' BEGIN SELECT RAISE(ABORT, 'recipient disk fault'); END",
+		);
+		const result = await sendSubagentMessageDetailed({
+			...input("parent-root", ["sibling-b"]),
+			model: "test:other",
+		});
+		expect(result.targets[0]?.status).toBe("failed");
+		expect(pin).not.toHaveBeenCalled();
+		expect(db.select().from(narrators).where(eq(narrators.id, "sibling-b")).get()?.model).toBe(
+			previousModel,
+		);
+	} finally {
+		sqlite.exec("DROP TRIGGER IF EXISTS reject_model_recipient");
+		pin.mockRestore();
+		visible.mockRestore();
+	}
+});
+
 test("an unknown or out-of-pool model rejects the whole call before any write", async () => {
 	const visible = spyOn(settingsModule, "getSubagentVisibleModels").mockReturnValue([
 		"test:model",
@@ -471,22 +549,26 @@ test("an unknown or out-of-pool model rejects the whole call before any write", 
 	const before = siblingModels();
 	try {
 		await expect(
-			sendSubagentMessageDetailed({
-				...input("parent-root", ["sibling-a", "sibling-b"]),
-				model: "test:missing",
-			}),
-		).rejects.toThrow("not available to subagents");
+			await captureWorkerRejectionThrower(
+				sendSubagentMessageDetailed({
+					...input("parent-root", ["sibling-a", "sibling-b"]),
+					model: "test:missing",
+				}),
+			),
+		).toThrow("not available to subagents");
 		settingsModule.settings.agent.subagentAllowedModels = {
 			explore: [],
 			plan: [],
 			general: ["test:pooled"],
 		};
 		await expect(
-			sendSubagentMessageDetailed({
-				...input("parent-root", ["sibling-a"]),
-				model: "test:model",
-			}),
-		).rejects.toThrow('not in the allowed "general" subagent model pool');
+			await captureWorkerRejectionThrower(
+				sendSubagentMessageDetailed({
+					...input("parent-root", ["sibling-a"]),
+					model: "test:model",
+				}),
+			),
+		).toThrow('not in the allowed "general" subagent model pool');
 		expect(rows()).toHaveLength(0);
 		expect(siblingModels()).toEqual(before);
 		const allowed = await sendSubagentMessageDetailed({
@@ -503,8 +585,10 @@ test("an unknown or out-of-pool model rejects the whole call before any write", 
 test("model cannot change a child the user has taken over", async () => {
 	setRunHold("sibling-a", { released: false });
 	await expect(
-		sendSubagentMessageDetailed({ ...input("parent-root", ["sibling-a"]), model: "test:other" }),
-	).rejects.toThrow("taken over by the user");
+		await captureWorkerRejectionThrower(
+			sendSubagentMessageDetailed({ ...input("parent-root", ["sibling-a"]), model: "test:other" }),
+		),
+	).toThrow("taken over by the user");
 	expect(rows()).toHaveLength(0);
 });
 

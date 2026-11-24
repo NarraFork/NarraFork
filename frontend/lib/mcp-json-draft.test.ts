@@ -17,6 +17,8 @@ function stdioDraft(overrides: Partial<McpJsonDraft> = {}): McpJsonDraft {
 		url: "",
 		env: [],
 		headers: [],
+		oauthClientId: "",
+		oauthScope: "",
 		originalEnvKeys: [],
 		originalHeaderKeys: [],
 		mode: "auto",
@@ -324,5 +326,41 @@ describe("parseMcpDraftJson", () => {
 			errorKey: "mcpJsonInvalidField",
 			params: { field: "enabled" },
 		});
+	});
+});
+
+describe("OAuth client settings in the JSON view", () => {
+	test("round-trips oauth for http transports and omits it when empty", () => {
+		const draft = httpDraft({ oauthClientId: "client-1", oauthScope: "tools:read" });
+		const json = JSON.parse(mcpDraftToJsonText(draft));
+		expect(json.oauth).toEqual({ clientId: "client-1", scope: "tools:read" });
+		expect("oauth" in JSON.parse(mcpDraftToJsonText(httpDraft()))).toBe(false);
+
+		const parsed = parseMcpDraftJson(mcpDraftToJsonText(draft), httpDraft());
+		expect(parsed.ok && parsed.draft).toMatchObject({
+			oauthClientId: "client-1",
+			oauthScope: "tools:read",
+		});
+	});
+
+	test("an omitted oauth block clears it, and stdio never carries one", () => {
+		const current = httpDraft({ oauthClientId: "client-1" });
+		const cleared = parseMcpDraftJson(JSON.stringify({ name: "x", url: "https://a/mcp" }), current);
+		expect(cleared.ok && cleared.draft.oauthClientId).toBe("");
+		const stdio = parseMcpDraftJson(
+			JSON.stringify({ name: "x", transport: "stdio", command: "a", oauth: { clientId: "c" } }),
+			current,
+		);
+		expect(stdio.ok && stdio.draft.oauthClientId).toBe("");
+	});
+
+	test("rejects a malformed oauth block", () => {
+		for (const oauth of ["client", { clientId: 1 }]) {
+			expect(parseMcpDraftJson(JSON.stringify({ name: "x", oauth }), httpDraft())).toEqual({
+				ok: false,
+				errorKey: "mcpJsonInvalidField",
+				params: { field: "oauth" },
+			});
+		}
 	});
 });

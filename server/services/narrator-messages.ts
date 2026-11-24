@@ -1,4 +1,9 @@
-import { normalizeCompactAttempts, parseCompactMessageBlock } from "@shared/compact-message";
+import {
+	type CompactMessageDetail,
+	normalizeCompactAttempts,
+	parseCompactMessageBlock,
+} from "@shared/compact-message";
+import { isFileHistoryEnabledForDevice } from "@shared/file-change-protocol";
 import { type FileReferenceDisplay, fileReferenceDisplay } from "@shared/file-reference";
 import { GEN_UI_TOOL_NAME } from "@shared/gen-ui-tool-policy";
 import { FOLLOW_PARENT_MODEL, type SubagentModelInheritance } from "@shared/model-inheritance";
@@ -15,13 +20,8 @@ import {
 	isMetadataOnlyEmptyReasoningAssistantMessage,
 } from "@shared/reasoning-content";
 import { isClearedToolOutput } from "@shared/storage-retention";
-import {
-	MAX_SUBAGENT_SUMMARY_INPUT_BYTES,
-	MAX_SUBAGENT_SUMMARY_VALUE_CHARS,
-	normalizeSubagentToolInputSummary,
-	SUBAGENT_SUMMARY_INPUT_KEYS,
-	type SubagentToolInputSummary,
-} from "@shared/subagent-tool-summary";
+import type { SubagentNestedSummary } from "@shared/subagent-nested";
+import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
 import {
 	type AnyColumn,
 	and,
@@ -41,6 +41,7 @@ import {
 	type SQL,
 	sql,
 } from "drizzle-orm";
+import { alias } from "drizzle-orm/sqlite-core";
 import * as modelHistoryDatabase from "../db";
 import { db } from "../db";
 import {
@@ -54,13 +55,32 @@ import {
 	narratorToolCalls,
 	narratorToolContinuations,
 } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { OUTLINE_EDIT_TOOL } from "../lib/agent/tools/outline-names";
 import {
 	measureMessageCharacters,
 	measureSummaryCharacters,
 	queueContextCharacterRefresh,
 } from "../lib/context-characters";
+import {
+	COMPACT_SUMMARY_BUDGET_EXCEEDED,
+	type CompactSummaryReadResult,
+	storedCompactDetail,
+} from "../lib/db-worker/compact-summary-query";
 import { DISPLAY_PAGE_LIMITS } from "../lib/db-worker/display-page-protocol";
+import { runReadTask, WorkersUnavailableError } from "../lib/db-worker/pool";
+import {
+	projectActivityRow,
+	SUBAGENT_ACTIVITY_LIMIT,
+	SUBAGENT_ACTIVITY_SUMMARY_SQL,
+	type SubagentActivityRows,
+} from "../lib/db-worker/subagent-activity-query";
+import {
+	selectVisibleToolDetail,
+	TOOL_DETAIL_CANDIDATE_LIMIT,
+	TOOL_DETAIL_PAYLOAD_BYTE_LIMIT,
+	type ToolDetailReference,
+} from "../lib/db-worker/tool-detail-selection";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -91,6 +111,8 @@ import {
 	TAKEN_OVER_FIELD,
 } from "./await-agent-resolution";
 import { liveCompactProgress } from "./compact-live-state";
+import { resolveNarratorMessageOnlyRevert } from "./file-history-policy";
+import { blockReadsEnabled } from "./narrator-block-scans";
 import {
 	CLEARED_TOOL_OUTPUT_SQL,
 	newEnvelopeColumns,
@@ -138,6 +160,12 @@ import {
 	type ScopedRevertOptions,
 } from "./narrator-scoped-revert";
 import { withNarratorWorkAdmission } from "./narrator-session-state";
+import {
+	type NarratorSurfaceReadBudget,
+	narratorSurfaceReadOptions,
+} from "./narrator-surface-reads";
+import { toolDetailSelectionRequired, validateToolDetailReference } from "./narrator-tool-detail";
+import { shouldHidePendingPermission } from "./pending-permission-visibility";
 import { attachSendTargetDetails } from "./send-delivery-resolution";
 import {
 	assertSnapshotRevertComplete,
@@ -156,6 +184,7 @@ import {
 	type SubagentFileChanges,
 } from "./subagent-file-changes";
 import { getRecentSubagentModelInheritance } from "./subagent-model";
+import { loadNestedSubagentSummaries } from "./subagent-nested";
 import { toolEditPreviewColumns } from "./tool-edit-preview";
 
 // ── Internal helpers ───────────────────────────────────────────────────────
@@ -355,6 +384,10 @@ type HistoryToolMetadata = Pick<
 	typeof narratorToolCalls.$inferSelect,
 	keyof typeof historyToolMetadataColumns
 >;
+type FileHistoryTargetMetadata = Pick<
+	typeof narratorToolCalls.$inferSelect,
+	"executionDeviceId" | "executionTargetsJson"
+>;
 type DerivedHistorySeed = { call: HistoryToolMetadata; seq: number; shared: boolean };
 
 function createHistoryBudget(): HistoryBudget {
@@ -379,6 +412,8 @@ function loadHistoryToolsTx(tx: MessageTx, messageIds: string[], reserve: Histor
 	const rows = tx
 		.select({
 			...historyToolMetadataColumns,
+			executionDeviceId: narratorToolCalls.executionDeviceId,
+			executionTargetsJson: narratorToolCalls.executionTargetsJson,
 			bytes: storedRowBytes(Object.values(getTableColumns(narratorToolCalls))),
 		})
 		.from(narratorToolCalls)
@@ -392,12 +427,29 @@ function loadHistoryToolsTx(tx: MessageTx, messageIds: string[], reserve: Histor
 	return rows;
 }
 
+function hasEnabledFileHistoryTarget(call: FileHistoryTargetMetadata): boolean {
+	// Stored execution endpoints are server-frozen targets, not tool input hints.
+	// Preserve remote evidence even in a local-default, mixed-device selection.
+	const targets = toolCallWithExecutionTargets(call).executionTargets;
+	if (targets.length > 0)
+		return targets.some(
+			(target) => target.backendKind === "remote" && isFileHistoryEnabledForDevice(target.deviceId),
+		);
+	// Legacy calls without a frozen device are local/unknown, never evidence of
+	// the narrator's current default device after a workspace/device switch.
+	return isFileHistoryEnabledForDevice(call.executionDeviceId);
+}
+
 function checkpointGroupsTx(
 	tx: MessageTx,
 	refs: Array<{ messageId: string; seq: number }>,
 	reserve: HistoryBudget,
+	calls: Array<HistoryToolMetadata & FileHistoryTargetMetadata>,
 ): FileHistoryCheckpointGroup[] {
-	if (refs.length === 0) return [];
+	const retainedCallIds = calls
+		.filter((call) => hasEnabledFileHistoryTarget(call))
+		.map((call) => call.id);
+	if (refs.length === 0 || retainedCallIds.length === 0) return [];
 	// loadHistoryToolsTx (or the block planner) already admitted every row's bytes.
 	const rows = tx
 		.select()
@@ -410,6 +462,7 @@ function checkpointGroupsTx(
 				),
 				eq(narratorToolCalls.status, "success"),
 				checkpointWorthyToolCall(),
+				inArray(narratorToolCalls.id, retainedCallIds),
 			),
 		)
 		.orderBy(narratorToolCalls.createdAt, narratorToolCalls.id)
@@ -617,7 +670,9 @@ function planDerivedHistoryCleanup(
 				messageIds.push(row.id);
 				toolCallIds.push(...childTools.map((tool) => tool.id));
 				if (skipRevert)
-					checkpoints.push(...checkpointGroupsTx(tx, [{ messageId: row.id, seq }], reserve));
+					checkpoints.push(
+						...checkpointGroupsTx(tx, [{ messageId: row.id, seq }], reserve, childTools),
+					);
 				pending.push(
 					...childTools.map((tool) => ({ call: tool, seq, shared: false, depth: depth + 1 })),
 				);
@@ -796,7 +851,8 @@ function planBlockDeletions(
 			? toolCalls.filter(
 					(call) =>
 						(remaining.length === 0 || removedToolIds.has(call.toolUseId)) &&
-						isCheckpointWorthyCall(call),
+						isCheckpointWorthyCall(call) &&
+						hasEnabledFileHistoryTarget(call),
 				)
 			: [];
 		plans.push({
@@ -991,6 +1047,14 @@ async function deleteBlockSelection(
 	opts?: BlockDeleteOptions,
 	byBlock?: { retiredRows: readonly string[] },
 ) {
+	opts = {
+		...opts,
+		skipRevert: await resolveNarratorMessageOnlyRevert(
+			narratorId,
+			opts?.skipRevert,
+			!!opts?.revertPlan || (opts?.skipRevert !== true && opts?.scope !== undefined),
+		),
+	};
 	if (blocks.length > (byBlock ? MAX_BLOCK_DELETE_ELEMENTS : MAX_BATCH_DELETE_BLOCKS)) {
 		throw new ValidationError(`Select at most ${MAX_BATCH_DELETE_BLOCKS} blocks`);
 	}
@@ -1375,29 +1439,6 @@ function contextAskUtf8Length(value: unknown): number {
 	return contextAskTextEncoder.encode(JSON.stringify(value)).byteLength;
 }
 
-function getReflectionStatus(suggestions: unknown): string | null {
-	if (!Array.isArray(suggestions)) return null;
-	for (const suggestion of suggestions) {
-		if (!suggestion || typeof suggestion !== "object") continue;
-		const record = suggestion as { type?: unknown; status?: unknown };
-		const type = String(record.type ?? "");
-		if (
-			type === "danger_reflection" ||
-			type === "plan_reflection" ||
-			type === "task_reflection" ||
-			type === "question_reflection"
-		) {
-			return typeof record.status === "string" ? record.status : "running";
-		}
-	}
-	return null;
-}
-
-function shouldHidePendingPermission(suggestions: unknown): boolean {
-	const status = getReflectionStatus(suggestions);
-	return status !== null && status !== "awaiting_user";
-}
-
 /**
  * Delete genuinely unreferenced messages and their tool calls in the caller's
  * transaction. A retained ref aborts the whole mutation; it is never erased here.
@@ -1584,7 +1625,7 @@ function planMessageRangeDeletion(
 		...derived.toolCallIds,
 	];
 	const checkpoints = opts?.skipRevert
-		? [...checkpointGroupsTx(tx, refs, reserve), ...derived.checkpoints]
+		? [...checkpointGroupsTx(tx, refs, reserve, tools), ...derived.checkpoints]
 		: [];
 	const associations = collectHistoryDeleteAssociations(tx, orphanIds, removedTools, reserve);
 	return {
@@ -1614,6 +1655,14 @@ async function deleteMessageRange(
 	inclusive: boolean,
 	opts?: BlockDeleteOptions,
 ) {
+	opts = {
+		...opts,
+		skipRevert: await resolveNarratorMessageOnlyRevert(
+			narratorId,
+			opts?.skipRevert,
+			!!opts?.revertPlan || (opts?.skipRevert !== true && opts?.scope !== undefined),
+		),
+	};
 	const timingId = generateId();
 	const startedAt = new Date().toISOString();
 	const context = { timingId, narratorId, messageId, inclusive, skipRevert: !!opts?.skipRevert };
@@ -2022,15 +2071,10 @@ async function resolveCatchUpChildAnchors(
 }
 
 function childCatchUpCondition(anchor: ResolvedChildAnchor): SQL<unknown> {
-	const conditions = [
+	return and(
 		gt(narratorMessageRefs.seq, anchor.seq),
-		isNull(narratorMessageRefs.segmentCompactId),
 		eq(narratorMessages.parentToolUseId, anchor.parentToolUseId),
-	];
-	if (anchor.narratorId) {
-		conditions.push(eq(narratorMessageRefs.narratorId, anchor.narratorId));
-	}
-	return and(...conditions) as SQL<unknown>;
+	) as SQL<unknown>;
 }
 
 function combineOrConditions(conditions: SQL<unknown>[]): SQL<unknown> | undefined {
@@ -2420,8 +2464,6 @@ export function stripProviderMetadata(tree: any[]): any[] {
 	});
 }
 
-const SUBAGENT_ACTIVITY_LIMIT = 3;
-
 export interface SubagentActivityToolCallTiming {
 	streamStartedAt?: string | number | null;
 	permissionStartedAt?: string | number | null;
@@ -2432,6 +2474,7 @@ export interface SubagentActivityToolCallTiming {
 
 export interface SubagentActivityToolCall {
 	toolCallId: string | null;
+	executionAttempt?: number;
 	toolUseId: string;
 	toolName: string;
 	status: string;
@@ -2475,6 +2518,12 @@ export interface SubagentActivity {
 	 * the payload does not grow for every card.
 	 */
 	takenOver?: boolean;
+	/**
+	 * The helpers this subagent launched itself (its one nested level), so the card on the
+	 * primary's page shows them and which one waits for a person. Absent when it has none.
+	 * Height-AFFECTING on the client: the card lists these rows.
+	 */
+	nested?: SubagentNestedSummary;
 }
 
 export interface SubagentActivityCatchUp {
@@ -2489,66 +2538,6 @@ interface SubagentActivityOwner {
 	subagentNarratorId: string;
 	model: string | null;
 	reasoningEffort: string | null;
-}
-
-/**
- * SQL projection of the whitelisted short input keys for one activity row.
- *
- * WHY IN SQL AND NOT IN JS
- * `input_json` is deliberately NOT selected by this query: for Write/Edit it can
- * hold a whole file (observed max 180KB across 835k rows). Selecting it to read a
- * 40-char path would pull the blob into JS and re-parse it on the main thread,
- * which CLAUDE.md forbids on summary paths. `json_extract` keeps the parse inside
- * SQLite and returns only the short leaves.
- *
- * TWO GUARDS, BOTH LOAD-BEARING:
- *
- *  1. `json_valid` — NOT a nicety. A single malformed row makes `json_extract`
- *     raise "malformed JSON" and abort the ENTIRE statement, so one bad row would
- *     blank every card's activity list rather than just its own. (Measured: the
- *     unguarded query throws; the guarded one returns all rows.)
- *
- *  2. `octet_length` — bounds the parse for a pathological blob. The ceiling is
- *     256KB rather than a tighter number on purpose: a 32KB cap would have
- *     suppressed the summary for a large-file `Write`, i.e. exactly the case where
- *     `file_path` is the only useful label. Both guards sit in front of the
- *     extract so an oversized row costs a length check, not a parse.
- *
- * Each value is capped with `substr` so a multi-KB `description` cannot inflate
- * the response.
- */
-function subagentSummarySql(): SQL<string | null> {
-	const paths = SUBAGENT_SUMMARY_INPUT_KEYS.map(
-		(key) =>
-			sql`substr(json_extract(${narratorToolCalls.inputJson}, ${`$.${key}`}), 1, ${MAX_SUBAGENT_SUMMARY_VALUE_CHARS})`,
-	);
-	// json_object(k1, v1, k2, v2, ...) — one row-shaped JSON string instead of ten
-	// result columns, so adding a key later does not reshape the row type.
-	const pairs: SQL[] = [];
-	SUBAGENT_SUMMARY_INPUT_KEYS.forEach((key, index) => {
-		pairs.push(sql`${key}, ${paths[index]}`);
-	});
-	return sql<string | null>`CASE
-		WHEN NOT (${sql.raw(CLEARED_TOOL_OUTPUT_SQL)}) AND ${narratorToolCalls.inputJson} IS NOT NULL
-			AND octet_length(${narratorToolCalls.inputJson}) <= ${MAX_SUBAGENT_SUMMARY_INPUT_BYTES}
-			AND json_valid(${narratorToolCalls.inputJson})
-		THEN json_object(${sql.join(pairs, sql`, `)})
-	END`;
-}
-
-/**
- * Parse the `json_object(...)` projection back into a summary.
- *
- * The payload is bounded by construction (10 keys × 200 chars), so this parse is
- * not the big-field read the query avoids.
- */
-function parseSubagentSummary(raw: unknown): SubagentToolInputSummary | null {
-	if (typeof raw !== "string" || !raw) return null;
-	try {
-		return normalizeSubagentToolInputSummary(JSON.parse(raw));
-	} catch {
-		return null;
-	}
 }
 
 /**
@@ -2576,6 +2565,7 @@ async function loadLatestSubagentToolCalls(
 			const rows = await db
 				.select({
 					toolCallId: narratorToolCalls.id,
+					executionAttempt: narratorToolCalls.executionAttempt,
 					toolUseId: narratorToolCalls.toolUseId,
 					toolName: narratorToolCalls.toolName,
 					status: narratorToolCalls.status,
@@ -2587,7 +2577,7 @@ async function loadLatestSubagentToolCalls(
 					completedAt: narratorToolCalls.completedAt,
 					durationMs: narratorToolCalls.durationMs,
 					// Short whitelisted input keys only — never the `input_json` blob.
-					inputSummary: subagentSummarySql(),
+					inputSummary: sql<string | null>`${sql.raw(SUBAGENT_ACTIVITY_SUMMARY_SQL)}`,
 				})
 				.from(narratorToolCalls)
 				.where(
@@ -2604,35 +2594,40 @@ async function loadLatestSubagentToolCalls(
 	);
 
 	for (const { narratorId, rows } of rowsByNarrator) {
-		result.set(
-			narratorId,
-			rows.map((row) => {
-				const timing: SubagentActivityToolCallTiming = {
-					streamStartedAt: row.streamStartedAt,
-					permissionStartedAt: row.permissionStartedAt,
-					executionStartedAt: row.executionStartedAt,
-					completedAt: row.completedAt,
-					durationMs: row.durationMs,
-				};
-				const inputSummary = parseSubagentSummary(row.inputSummary);
-				return {
-					toolCallId: row.toolCallId ?? null,
-					toolUseId: row.toolUseId,
-					toolName: row.toolName,
-					status: row.status,
-					createdAt: row.createdAt ?? null,
-					timing: Object.values(timing).some((value) => value != null) ? timing : null,
-					...(inputSummary ? { inputSummary } : {}),
-				};
-			}),
-		);
+		result.set(narratorId, rows.map(projectActivityRow));
 	}
 	return result;
+}
+
+async function loadHistorySubagentToolCalls(
+	narratorIds: string[],
+	signal?: AbortSignal,
+	deadlineAt?: number,
+): Promise<Map<string, SubagentActivityToolCall[]>> {
+	if (!narratorIds.length) return new Map();
+	assertDisplayReadActive(signal, deadlineAt);
+	const { sqlite, activeDatabaseBackend } = modelHistoryDatabase;
+	if (
+		activeDatabaseBackend === "postgres" ||
+		(process.env.NODE_ENV === "test" && sqlite.filename === ":memory:")
+	)
+		return loadLatestSubagentToolCalls(narratorIds);
+	if (!sqlite.filename || sqlite.filename === ":memory:" || sqlite.inTransaction)
+		throw new WorkersUnavailableError("requires_committed_file");
+	const rows = await runReadTask<SubagentActivityRows>(
+		sqlite.filename,
+		{ kind: "subagentActivity", narratorIds },
+		{ signal, timeoutMs: deadlineAt === undefined ? 15_000 : Math.max(1, deadlineAt - Date.now()) },
+	);
+	assertDisplayReadActive(signal, deadlineAt);
+	return new Map(rows);
 }
 
 async function buildSubagentActivities(
 	owners: SubagentActivityOwner[],
 	expectedToolUseIds: string[] = [],
+	signal?: AbortSignal,
+	deadlineAt?: number,
 ): Promise<Map<string, SubagentActivity>> {
 	const activities = new Map<string, SubagentActivity>();
 	for (const toolUseId of expectedToolUseIds) {
@@ -2644,11 +2639,16 @@ async function buildSubagentActivities(
 		});
 	}
 	const narratorIds = [...new Set(owners.map((owner) => owner.subagentNarratorId))];
-	const toolCallsByNarrator = await loadLatestSubagentToolCalls(narratorIds);
-	const currentOptions = await getCurrentSubagentFileChangeOptions(narratorIds);
+	const currentOptions = await getCurrentSubagentFileChangeOptions(narratorIds, undefined, {
+		signal,
+		deadlineAt,
+	});
 	// One aggregate for EVERY card on the page. A per-card query here would turn
 	// opening a session with a dozen Agent calls into a query storm on a list path.
 	const fileChangesByNarrator = await getFileChangesBySubagent(narratorIds, currentOptions);
+	// Same one-aggregate rule for the nested level: one bounded read for every card.
+	const nestedByNarrator = await loadNestedSubagentSummaries(narratorIds);
+	const toolCallsByNarrator = await loadHistorySubagentToolCalls(narratorIds, signal, deadlineAt);
 	for (const owner of owners) {
 		const effectiveReasoningEffort =
 			owner.reasoningEffort ??
@@ -2680,6 +2680,9 @@ async function buildSubagentActivities(
 			// takeover set stays populated on purpose. Reading the raw set here re-lit
 			// the badge on every page load in that window.
 			...(isRunHeldForDisplay(owner.subagentNarratorId) ? { takenOver: true } : {}),
+			...(nestedByNarrator.has(owner.subagentNarratorId)
+				? { nested: nestedByNarrator.get(owner.subagentNarratorId) }
+				: {}),
 		});
 	}
 	return activities;
@@ -3097,16 +3100,50 @@ async function loadSubagentActivitiesForToolUseIds(
 	toolUseIds: string[],
 	initialScope?: ReturnType<typeof resolveAggregateScopeTx>,
 	scopeToolUseIds = toolUseIds,
+	signal?: AbortSignal,
+	deadlineAt?: number,
 ): Promise<Map<string, SubagentActivity>> {
 	if (toolUseIds.length === 0 && !initialScope) return new Map();
 	const scope =
 		initialScope ??
 		db.transaction((tx) => resolveAggregateScopeTx(tx, narratorId, scopeToolUseIds));
-	const activities = await buildSubagentActivities(scope.owners, toolUseIds);
+	const activities = await buildSubagentActivities(scope.owners, toolUseIds, signal, deadlineAt);
+	assertDisplayReadActive(signal, deadlineAt);
 	// Summary/file aggregation can await other services. A removed caller/child
 	// ref must revoke this response too, rather than publishing a stale owner.
-	const current = db.transaction((tx) => resolveAggregateScopeTx(tx, narratorId, scopeToolUseIds));
-	assertAggregateScopeUnchanged(scope, current);
+	db.transaction((tx) => {
+		assertAggregateScopeUnchanged(scope, resolveAggregateScopeTx(tx, narratorId, scopeToolUseIds));
+		const ownerByCall = new Map<string, string>();
+		for (const activity of activities.values()) {
+			if (!activity.subagentNarratorId) continue;
+			for (const call of activity.latestToolCalls) {
+				if (call.toolCallId) ownerByCall.set(call.toolCallId, activity.subagentNarratorId);
+			}
+		}
+		const ids = [...ownerByCall.keys()];
+		for (let offset = 0; offset < ids.length; offset += 200) {
+			const batch = ids.slice(offset, offset + 200);
+			const visible = tx
+				.select({ id: narratorToolCalls.id, owner: narratorToolCalls.narratorId })
+				.from(narratorToolCalls)
+				.where(
+					and(
+						inArray(narratorToolCalls.id, batch),
+						toolMessageRefExists(narratorToolCalls.narratorId),
+					),
+				)
+				.all();
+			if (
+				visible.length !== batch.length ||
+				visible.some(({ id, owner }) => ownerByCall.get(id) !== owner)
+			)
+				throw new AppError(
+					"History activity references changed; reload the history window.",
+					409,
+					"HISTORY_AGGREGATE_UNAVAILABLE",
+				);
+		}
+	});
 	return activities;
 }
 
@@ -3203,6 +3240,8 @@ async function buildTreeFromTopLevelRefs(
 		subagentToolUseIds,
 		scope,
 		aggregateToolUseIds,
+		signal,
+		deadlineAt,
 	);
 	assertDisplayReadActive(signal, deadlineAt);
 	const summarizedAt = performance.now();
@@ -3315,22 +3354,6 @@ export {
 	TAKEN_OVER_FIELD,
 };
 
-// Tool-use IDs come from providers and are not unique across attempts/sessions.
-// Metadata is bounded before visibility filtering, never mistaken for a full set.
-const TOOL_DETAIL_CANDIDATE_LIMIT = 200;
-const TOOL_DETAIL_METADATA_ROW_LIMIT = 1_000;
-const TOOL_DETAIL_PAYLOAD_BYTE_LIMIT = 32 * 1024 * 1024;
-
-type ToolDetailReference = { toolCallId?: string; messageId?: string };
-
-function toolDetailSelectionRequired(): AppError {
-	return new AppError(
-		"Tool detail selection is ambiguous or exceeds the metadata budget; specify toolCallId or messageId.",
-		409,
-		"TOOL_CALL_DETAIL_SELECTION_REQUIRED",
-	);
-}
-
 function toolMessageRefExists(narratorId: string | AnyColumn): SQL<boolean> {
 	// Keep the outer table qualification literal. Drizzle strips Column qualifiers
 	// in single-table projections, which would correlate message_id to detail_ref
@@ -3349,23 +3372,7 @@ function selectVisibleToolCallTx(
 	toolUseId: string,
 	reference?: ToolDetailReference,
 ) {
-	for (const value of [reference?.toolCallId, reference?.messageId]) {
-		if (
-			value !== undefined &&
-			(typeof value !== "string" || value.length === 0 || value.length > 128)
-		) {
-			throw new ValidationError(
-				"Tool detail references must be non-empty IDs of at most 128 characters",
-			);
-		}
-	}
-	let metadataRows = 0;
-	const admit = (length: number) => {
-		metadataRows += length;
-		if (length > TOOL_DETAIL_CANDIDATE_LIMIT || metadataRows > TOOL_DETAIL_METADATA_ROW_LIMIT) {
-			throw toolDetailSelectionRequired();
-		}
-	};
+	validateToolDetailReference(reference);
 	const parentColumns = {
 		...historyToolMetadataColumns,
 		executionIdentityVersion: narratorToolCalls.executionIdentityVersion,
@@ -3398,74 +3405,21 @@ function selectVisibleToolCallTx(
 		)
 		.limit(TOOL_DETAIL_CANDIDATE_LIMIT + 1)
 		.all();
-	admit(candidates.length);
-	const childVisibility = new Map<string, boolean>();
-	const visible = candidates.filter((candidate) => {
-		if (candidate.directRef) return true;
-		// A provider-supplied parentToolUseId is only a consistency check after the
-		// real subagent identity and original tool-call PK have established ancestry.
-		if (
-			candidate.authorType !== "subagent" ||
-			!isSubagentVariant(candidate.authorVariant) ||
-			!candidate.authorOriginToolCallId ||
-			!candidate.authorParentNarratorId ||
-			!candidate.parentToolUseId ||
-			!candidate.authorRef ||
-			candidate.narratorId !== candidate.messageNarratorId
-		)
-			return false;
-		const originId = candidate.authorOriginToolCallId;
-		const key = JSON.stringify([candidate.messageNarratorId, originId, candidate.parentToolUseId]);
-		const cached = childVisibility.get(key);
-		if (cached !== undefined) return cached;
-		const isAgent = (call: {
-			toolName: string;
-			executionIdentityVersion: number;
-			isFileHistoryCheckpoint: boolean;
-		}) =>
-			(call.toolName === "Agent" || call.toolName === "Task") &&
-			call.executionIdentityVersion === 1 &&
-			!call.isFileHistoryCheckpoint;
-		const original = tx
-			.select(parentColumns)
-			.from(narratorToolCalls)
-			.where(eq(narratorToolCalls.id, originId))
-			.get();
-		admit(original ? 1 : 0);
-		if (
-			original &&
-			(!isAgent(original) ||
-				original.executionOriginToolCallId !== null ||
-				original.narratorId !== candidate.authorParentNarratorId ||
-				original.toolUseId !== candidate.parentToolUseId)
-		) {
-			childVisibility.set(key, false);
-			return false;
-		}
-		if (original?.directRef) {
-			childVisibility.set(key, true);
-			return true;
-		}
-		// The original may have been removed after COW. Its immutable PK survives
-		// in the copy; neither a shared provider ID nor an author's identity alone
-		// is enough. The requesting narrator must still reference that exact copy.
-		const parentCopies = tx
-			.select(parentColumns)
-			.from(narratorToolCalls)
-			.where(eq(narratorToolCalls.toolUseId, candidate.parentToolUseId))
-			.limit(TOOL_DETAIL_CANDIDATE_LIMIT + 1)
-			.all();
-		admit(parentCopies.length);
-		const allowed = parentCopies.some(
-			(parent) =>
-				parent.directRef && isAgent(parent) && parent.executionOriginToolCallId === originId,
-		);
-		childVisibility.set(key, allowed);
-		return allowed;
-	});
-	if (visible.length === 0) throw new NotFoundError("ToolCall", toolUseId);
-	if (visible.length !== 1) throw toolDetailSelectionRequired();
-	return visible[0];
+	const selected = selectVisibleToolDetail(
+		candidates,
+		(id) =>
+			tx.select(parentColumns).from(narratorToolCalls).where(eq(narratorToolCalls.id, id)).get(),
+		(useId) =>
+			tx
+				.select(parentColumns)
+				.from(narratorToolCalls)
+				.where(eq(narratorToolCalls.toolUseId, useId))
+				.limit(TOOL_DETAIL_CANDIDATE_LIMIT + 1)
+				.all(),
+	);
+	if (selected.kind === "notFound") throw new NotFoundError("ToolCall", toolUseId);
+	if (selected.kind !== "selected") throw toolDetailSelectionRequired();
+	return selected;
 }
 
 function getToolCallDetailTx(
@@ -3514,6 +3468,27 @@ function getToolCallDetailTx(
 
 // ── narratorMessages object ────────────────────────────────────────────────
 
+function withLiveCompactDetail(
+	messageId: string,
+	detail: CompactMessageDetail,
+): CompactMessageDetail {
+	const live = detail.status === "compacting" ? liveCompactProgress.get(messageId) : undefined;
+	if (!live) return detail;
+	return {
+		...detail,
+		model: live.model || detail.model,
+		startedAt: live.startedAt,
+		finishedAt: undefined,
+		reasoningEffort: live.reasoningEffort,
+		output: live.output,
+		thinking: live.thinking,
+		outputChars: live.outputChars,
+		thinkingChars: live.thinkingChars,
+		outputTruncated: live.outputTruncated,
+		thinkingTruncated: live.thinkingTruncated,
+	};
+}
+
 const narratorMessageQueriesUnlocked = {
 	async getMessages(narratorId: string, limit = 100, offset = 0) {
 		const refRows = await db
@@ -3541,15 +3516,21 @@ const narratorMessageQueriesUnlocked = {
 		}));
 	},
 
-	async getLatestCompactSeq(narratorId: string): Promise<number | null> {
-		const lastCompactRow = await db
-			.select({ seq: narratorMessageRefs.seq })
-			.from(narratorMessageRefs)
-			.where(
-				and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessageRefs.isCompact, 1)),
-			)
-			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-			.limit(1);
+	async getLatestCompactSeq(
+		narratorId: string,
+		options: NarratorSurfaceReadBudget = {},
+	): Promise<number | null> {
+		const lastCompactRow = await readQuery(
+			db
+				.select({ seq: narratorMessageRefs.seq })
+				.from(narratorMessageRefs)
+				.where(
+					and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessageRefs.isCompact, 1)),
+				)
+				.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+				.limit(1),
+			narratorSurfaceReadOptions(options),
+		);
 		return lastCompactRow[0]?.seq ?? null;
 	},
 
@@ -3948,17 +3929,20 @@ const narratorMessageQueriesUnlocked = {
 	},
 
 	/** The session's own user/assistant turns since its last compact (`isTopLevelMessage`). */
-	async _getPostCompactTopLevelRefs(narratorId: string) {
+	async _getPostCompactTopLevelRefs(narratorId: string, options: NarratorSurfaceReadBudget = {}) {
 		const ownTurn = ownTurnSql(await this.ownTurnPlacement(narratorId));
 
-		const lastCompactRow = await db
-			.select({ seq: narratorMessageRefs.seq })
-			.from(narratorMessageRefs)
-			.where(
-				and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessageRefs.isCompact, 1)),
-			)
-			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-			.limit(1);
+		const lastCompactRow = await readQuery(
+			db
+				.select({ seq: narratorMessageRefs.seq })
+				.from(narratorMessageRefs)
+				.where(
+					and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessageRefs.isCompact, 1)),
+				)
+				.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+				.limit(1),
+			narratorSurfaceReadOptions(options),
+		);
 
 		const compactSeq = lastCompactRow[0]?.seq;
 
@@ -4669,15 +4653,34 @@ const narratorMessageQueriesUnlocked = {
 				.limit(limit + 1);
 		}
 
+		// CROSS JOIN fixes join order, not index choice: ANALYZE can turn the OR
+		// into a global message scan when parentToolUseId is mostly NULL. On SQLite,
+		// the existing index plus a message-only IN predicate keeps this a seek.
+		// Resolved anchors all use the caller's refs, never a cursor's narratorId.
+		const sqliteChildLookup = modelHistoryDatabase.activeDatabaseBackend === "sqlite";
 		const childRefRows: Array<{ messageId: string; seq: number }> = childWhere
 			? await db
 					.select({
 						messageId: narratorMessageRefs.messageId,
 						seq: narratorMessageRefs.seq,
 					})
-					.from(narratorMessageRefs)
-					.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-					.where(childWhere)
+					.from(
+						sqliteChildLookup
+							? sql`${narratorMessages} INDEXED BY idx_messages_parent_tool_use_lookup`
+							: narratorMessages,
+					)
+					.crossJoin(narratorMessageRefs)
+					.where(
+						and(
+							eq(narratorMessageRefs.messageId, narratorMessages.id),
+							eq(narratorMessageRefs.narratorId, narratorId),
+							isNull(narratorMessageRefs.segmentCompactId),
+							sqliteChildLookup
+								? inArray(narratorMessages.parentToolUseId, [...resolvedChildAnchors.keys()])
+								: undefined,
+							childWhere,
+						),
+					)
 					.orderBy(sql`${narratorMessageRefs.seq} ASC`)
 					.limit(limit + 1)
 			: [];
@@ -4806,6 +4809,31 @@ const narratorMessageQueriesUnlocked = {
 		});
 	},
 
+	async readCompactSummaryDetail(narratorId: string, messageId: string, signal: AbortSignal) {
+		signal.throwIfAborted();
+		if (modelHistoryDatabase.activeDatabaseBackend !== "sqlite") {
+			return narratorMessageQueriesUnlocked.getCompactSummary(narratorId, messageId);
+		}
+		const sqlite = modelHistoryDatabase.sqlite;
+		if (!sqlite.filename || sqlite.filename === ":memory:" || sqlite.inTransaction) {
+			throw new WorkersUnavailableError("requires_committed_file");
+		}
+
+		const result = await runReadTask<CompactSummaryReadResult>(
+			sqlite.filename,
+			{ kind: "compactSummary", narratorId, messageId, fromBlocks: blockReadsEnabled() },
+			{ timeoutMs: 10_000, signal },
+		).catch((err: unknown) => {
+			if (err instanceof Error && "code" in err && err.code === COMPACT_SUMMARY_BUDGET_EXCEEDED) {
+				throw new AppError(err.message, 413, COMPACT_SUMMARY_BUDGET_EXCEEDED);
+			}
+			throw err;
+		});
+		signal.throwIfAborted();
+		if ("notFound" in result) throw new NotFoundError(result.notFound, messageId);
+		return withLiveCompactDetail(messageId, result.detail);
+	},
+
 	async getCompactSummary(narratorId: string, messageId: string) {
 		return db.transaction((tx) => {
 			const msg = fillBody(
@@ -4849,10 +4877,6 @@ const narratorMessageQueriesUnlocked = {
 				compactBlock.status === "failed" &&
 				ref.isCompact === 0 &&
 				(latestCompactSeq == null || ref.seq > latestCompactSeq);
-			const latestAttempt = compactBlock.attempts?.at(-1);
-			const live =
-				compactBlock.status === "compacting" ? liveCompactProgress.get(messageId) : undefined;
-
 			// Display fallbacks for markers written before both ends of the occupancy pair
 			// were recorded. A marker without `before` inherits the last real occupancy its
 			// history carried; a marker without `after` inherits its own row only when that
@@ -4905,39 +4929,10 @@ const narratorMessageQueriesUnlocked = {
 				compactBlock.contextPercentAfter ??
 				(msg.tokensIn != null ? (msg.contextPercent ?? undefined) : undefined);
 
-			return {
-				status: compactBlock.status,
-				summary: typeof compactBlock.summary === "string" ? compactBlock.summary : "",
-				...(live
-					? {
-							model: live.model || latestAttempt?.model,
-							reasoningEffort: live.reasoningEffort,
-							startedAt: live.startedAt,
-							output: live.output,
-							thinking: live.thinking,
-							outputChars: live.outputChars,
-							thinkingChars: live.thinkingChars,
-							outputTruncated: live.outputTruncated,
-							thinkingTruncated: live.thinkingTruncated,
-						}
-					: {
-							model: latestAttempt?.model,
-							startedAt: latestAttempt?.startedAt,
-							finishedAt: latestAttempt?.finishedAt,
-						}),
-				error:
-					typeof compactBlock.error === "string"
-						? compactBlock.error
-						: latestAttempt?.status === "failed"
-							? latestAttempt.error
-							: undefined,
-				mode: compactBlock.mode,
-				trigger: compactBlock.trigger,
-				contextPercentBefore,
-				contextPercentAfter,
-				attempts: compactBlock.attempts ?? [],
-				canRetry,
-			};
+			return withLiveCompactDetail(
+				messageId,
+				storedCompactDetail(compactBlock, { contextPercentBefore, contextPercentAfter, canRetry }),
+			);
 		});
 	},
 
@@ -5562,25 +5557,30 @@ const narratorMessageQueriesUnlocked = {
 	},
 
 	async getPendingPermissions(narratorId: string) {
-		const visibleSubagentToolRows = await db
-			.select({ toolUseId: narratorToolCalls.toolUseId })
-			.from(narratorToolCalls)
-			.innerJoin(
-				narratorMessageRefs,
-				and(
-					eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
-					eq(narratorMessageRefs.narratorId, narratorId),
-				),
-			)
-			.where(inArray(narratorToolCalls.toolName, [...SUBAGENT_TOOL_NAMES]));
-		const visibleSubagentToolUseIds = visibleSubagentToolRows.map((row) => row.toolUseId);
-		const childVisibility =
-			visibleSubagentToolUseIds.length > 0
-				? and(
-						eq(narrators.parentNarratorId, narratorId),
-						inArray(narratorMessages.parentToolUseId, visibleSubagentToolUseIds),
+		const callerTool = alias(narratorToolCalls, "permission_caller_tool");
+		// Start at pending rows, then check the caller's actual refs for each child.
+		// Do not enumerate (or truncate) the caller's entire subagent-tool history.
+		const childVisibility = and(
+			eq(narrators.parentNarratorId, narratorId),
+			exists(
+				db
+					.select({ one: sql`1` })
+					.from(callerTool)
+					.innerJoin(
+						narratorMessageRefs,
+						and(
+							eq(narratorMessageRefs.messageId, callerTool.messageId),
+							eq(narratorMessageRefs.narratorId, narratorId),
+						),
 					)
-				: sql`0`;
+					.where(
+						and(
+							eq(callerTool.toolUseId, narratorMessages.parentToolUseId),
+							inArray(callerTool.toolName, [...SUBAGENT_TOOL_NAMES]),
+						),
+					),
+			),
+		);
 		const tcs = await db
 			.select({
 				id: narratorToolCalls.id,

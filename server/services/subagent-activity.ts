@@ -1,6 +1,7 @@
 import { desc, eq, sql } from "drizzle-orm";
 import { db } from "../db";
 import { narratorToolCalls } from "../db/schema";
+import { type ReadQueryOptions, readQuery } from "../db/worker-read";
 
 const RECENT_ACTIVITY_LIMIT = 3;
 const MAX_ACTIVITY_ROWS = 5;
@@ -167,9 +168,12 @@ function selectActivityTimestamp(row: {
 export async function getRecentSubagentToolActivity(
 	narratorId: string,
 	limit = RECENT_ACTIVITY_LIMIT,
+	options: Pick<ReadQueryOptions, "signal" | "deadlineAt" | "timeoutMs"> = {},
 ): Promise<SubagentToolActivity[]> {
-	const boundedLimit = Math.min(Math.max(Math.trunc(limit), 1), MAX_ACTIVITY_ROWS);
-	const rows = await db
+	const boundedLimit = Number.isFinite(limit)
+		? Math.min(Math.max(Math.trunc(limit), 1), MAX_ACTIVITY_ROWS)
+		: RECENT_ACTIVITY_LIMIT;
+	const query = db
 		.select({
 			toolName: narratorToolCalls.toolName,
 			status: narratorToolCalls.status,
@@ -205,6 +209,13 @@ export async function getRecentSubagentToolActivity(
 		.where(eq(narratorToolCalls.narratorId, narratorId))
 		.orderBy(desc(narratorToolCalls.createdAt))
 		.limit(boundedLimit);
+	const rows = await readQuery(query, {
+		...options,
+		executionPolicy: "worker-required",
+		diagnosticSource: "await.recent-subagent-activity",
+		maxRows: boundedLimit,
+		timeoutMs: options.timeoutMs ?? 5_000,
+	});
 
 	return rows.map((row) => ({
 		at: selectActivityTimestamp(row),

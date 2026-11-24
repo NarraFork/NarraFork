@@ -1,13 +1,13 @@
 [
 	{
-		"name": "ModelTrace fingerprint core and candidate bank",
-		"version": "6cd4a8ff0f3f4e49d6d6969dd2fbadfa1569fde2",
+		"name": "lm-detector reference data",
+		"version": "1e58ed83c1cde17f88cba89560ad4d083042ae92",
 		"license": "MIT",
-		"author": "xqy2006",
-		"repository": "https://github.com/xqy2006/ModelTrace",
-		"textFile": "modeltrace.txt",
-		"distributedVia": "TypeScript port of static/fingerprint-core.js and embedded data/unified_bank.json, compiled into the server binary for local single-sample model fingerprint analysis.",
-		"note": "The full upstream MIT license is reproduced verbatim. Numeric calibration and candidate names are upstream artifacts, not independently verified model identities."
+		"author": "Ikaleio",
+		"repository": "https://github.com/Ikaleio/lm-detector",
+		"textFile": "lm-detector.txt",
+		"distributedVia": "Vendored shared_detector.bin and minimal model metadata derived from unified_bank.json, embedded alongside the local model fingerprint worker. The lmfpd-sdk npm package is catalogued separately.",
+		"note": "The upstream MIT license is reproduced verbatim. Rankings compare answers with a finite reference set and do not verify model identity."
 	},
 	{
 		"name": "Bun runtime",
@@ -184,7 +184,7 @@
 	},
 	{
 		"name": "github.com/pion/datachannel (remote-peer)",
-		"version": "1.6.3",
+		"version": "1.6.4",
 		"license": "MIT",
 		"author": "The Pion community",
 		"repository": "https://github.com/pion/datachannel",
@@ -193,7 +193,7 @@
 	},
 	{
 		"name": "github.com/pion/dtls/v3 (remote-peer)",
-		"version": "3.1.15",
+		"version": "3.1.16",
 		"license": "MIT",
 		"author": "The Pion community",
 		"repository": "https://github.com/pion/dtls",
@@ -202,7 +202,7 @@
 	},
 	{
 		"name": "github.com/pion/ice/v4 (remote-peer)",
-		"version": "4.4.8",
+		"version": "4.4.9",
 		"license": "MIT",
 		"author": "The Pion community",
 		"repository": "https://github.com/pion/ice",
@@ -266,7 +266,7 @@
 	},
 	{
 		"name": "github.com/pion/sctp (remote-peer)",
-		"version": "1.12.0",
+		"version": "1.12.1",
 		"license": "MIT",
 		"author": "The Pion community",
 		"repository": "https://github.com/pion/sctp",
@@ -303,7 +303,7 @@
 	},
 	{
 		"name": "github.com/pion/transport/v5 (remote-peer)",
-		"version": "5.1.4",
+		"version": "5.1.5",
 		"license": "MIT AND BSD-3-Clause",
 		"author": "The Pion community; The Go Authors",
 		"repository": "https://github.com/pion/transport",
@@ -322,7 +322,7 @@
 	},
 	{
 		"name": "github.com/pion/webrtc/v4 (remote-peer)",
-		"version": "4.2.26",
+		"version": "4.2.27",
 		"license": "MIT",
 		"author": "The Pion community",
 		"repository": "https://github.com/pion/webrtc",
@@ -391,7 +391,7 @@
 		"author": "Cherry Studio",
 		"repository": "https://github.com/CherryHQ/cherry-studio/tree/4edb3b85630469e1a784577ec47540cb646d9781/packages/provider-registry",
 		"textFile": "cherry-studio-provider-registry.txt",
-		"distributedVia": "Compatible provider names and API endpoints adapted from packages/provider-registry/data/providers.json into frontend/components/providers/provider-presets.ts and bundled in the frontend.",
+		"distributedVia": "Compatible provider names and API endpoints adapted from packages/provider-registry/data/providers.json into server/lib/sourcing/presets.ts and served to the add-provider page.",
 		"note": "The fixed-commit subpackage package.json declares MIT and Cherry Studio authorship; the root is AGPL. No main src code is copied. The accompanying disclosure explains protocol/URL mapping and includes a standard MIT template copied from installed normalize-path/LICENSE, not a verbatim license file supplied by upstream."
 	}
 ]

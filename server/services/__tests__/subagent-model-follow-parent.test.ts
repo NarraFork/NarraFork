@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { FOLLOW_PARENT_MODEL } from "../../../shared/model-inheritance";
 import type { AgentConfig } from "../../lib/agent";
 import type { ExecuteLoopOptions, ExecuteLoopResult } from "../narrator-executor";
+import { captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 const CHILD_ENV = "NARRAFORK_SUBAGENT_MODEL_FOLLOW_TEST_CHILD";
 
@@ -11,12 +12,15 @@ if (process.env[CHILD_ENV] !== "1") {
 	test("subagent model inheritance: isolated real-DB execution chain", async () => {
 		const env: NodeJS.ProcessEnv = { ...process.env, [CHILD_ENV]: "1" };
 		delete env.NARRAFORK_HOME;
-		const child = Bun.spawn([process.execPath, "test", "--isolate", import.meta.path], {
-			cwd: resolve(import.meta.dir, "../../.."),
-			env,
-			stdout: "pipe",
-			stderr: "pipe",
-		});
+		const child = Bun.spawn(
+			[process.execPath, "test", "--no-env-file", "--isolate", import.meta.path],
+			{
+				cwd: resolve(import.meta.dir, "../../.."),
+				env,
+				stdout: "pipe",
+				stderr: "pipe",
+			},
+		);
 		const timer = setTimeout(() => child.kill(), 45_000);
 		const readBounded = async (stream: ReadableStream<Uint8Array>) => {
 			const reader = stream.getReader();
@@ -56,6 +60,7 @@ if (process.env[CHILD_ENV] !== "1") {
 	const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 
 	const configs: AgentConfig[] = [];
+	let beforeExecution: ((options: ExecuteLoopOptions) => Promise<void>) | undefined;
 	const executions: ExecuteLoopOptions[] = [];
 	const broadcasts: Array<{ target: string; event: Record<string, unknown> }> = [];
 	mock.module("../narrator-executor", () => ({
@@ -66,6 +71,7 @@ if (process.env[CHILD_ENV] !== "1") {
 				configs.push(options.config);
 				executions.push(options);
 			}
+			await beforeExecution?.(options);
 			return {
 				finalText: "isolated follow-parent result",
 				hasError: false,
@@ -124,6 +130,7 @@ if (process.env[CHILD_ENV] !== "1") {
 		clearAliasRegistry(PARENT);
 		agentCalls = 0;
 		configs.length = 0;
+		beforeExecution = undefined;
 		executions.length = 0;
 		broadcasts.length = 0;
 		network.mockClear();
@@ -161,7 +168,7 @@ if (process.env[CHILD_ENV] !== "1") {
 
 	/** A real persisted Agent attempt on the parent that a delegated run can deliver into. */
 	let agentCalls = 0;
-	async function agentCall() {
+	async function agentCall(parentId = PARENT) {
 		const n = ++agentCalls;
 		const now = new Date().toISOString();
 		const toolUseId = `${TOOL}-${n}`;
@@ -169,17 +176,17 @@ if (process.env[CHILD_ENV] !== "1") {
 		const toolCallId = `follow-parent-agent-row-${n}`;
 		await db.insert(narratorMessages).values({
 			id: messageId,
-			narratorId: PARENT,
+			narratorId: parentId,
 			role: "assistant",
 			contentJson: [{ type: "tool_use", id: toolUseId, name: "Agent", input: {} }],
 			createdAt: now,
 		});
 		await db
 			.insert(narratorMessageRefs)
-			.values({ id: `ref-${messageId}`, narratorId: PARENT, messageId, seq: n });
+			.values({ id: `ref-${messageId}`, narratorId: parentId, messageId, seq: n });
 		await db.insert(narratorToolCalls).values({
 			id: toolCallId,
-			narratorId: PARENT,
+			narratorId: parentId,
 			messageId,
 			toolUseId,
 			toolName: "Agent",
@@ -247,16 +254,22 @@ if (process.env[CHILD_ENV] !== "1") {
 	}
 
 	async function spawn(
-		options: { model?: string; subagentType?: string; background?: boolean } = {},
+		options: {
+			model?: string;
+			subagentType?: string;
+			background?: boolean;
+			parentNarratorId?: string;
+		} = {},
 	) {
+		const parentId = options.parentNarratorId ?? PARENT;
 		const previous = new Set(
-			(await db.query.narrators.findMany({ where: eq(narrators.parentNarratorId, PARENT) })).map(
+			(await db.query.narrators.findMany({ where: eq(narrators.parentNarratorId, parentId) })).map(
 				(row) => row.id,
 			),
 		);
-		const call = await agentCall();
+		const call = await agentCall(parentId);
 		await runSubagent({
-			parentNarratorId: PARENT,
+			parentNarratorId: parentId,
 			toolUseId: call.toolUseId,
 			toolCallBinding: call.binding,
 			subagentType: options.subagentType ?? "general",
@@ -268,7 +281,7 @@ if (process.env[CHILD_ENV] !== "1") {
 			...options,
 		});
 		const rows = await db.query.narrators.findMany({
-			where: eq(narrators.parentNarratorId, PARENT),
+			where: eq(narrators.parentNarratorId, parentId),
 			limit: 10,
 		});
 		const fresh = rows.filter((row) => !previous.has(row.id));
@@ -305,6 +318,67 @@ if (process.env[CHILD_ENV] !== "1") {
 	}
 
 	describe("live parent model through real creation, continuation and executor configuration", () => {
+		for (const mode of ["temporary", "permanent"] as const) {
+			test(`a queued ${mode} override does not pin the next ordinary run`, async () => {
+				const provider = settings.anthropicProviders?.[0];
+				if (!provider) throw new Error("Missing test provider");
+				settings.anthropicProviders?.push({
+					...provider,
+					id: "queued-override",
+					prefix: "override",
+				});
+				const override = "override:claude-sonnet-4-20250514";
+				const child = await create(A);
+				const started = Promise.withResolvers<void>();
+				const release = Promise.withResolvers<void>();
+				beforeExecution = async (options) => {
+					if (options.config.narratorId !== child.id) return;
+					beforeExecution = undefined;
+					started.resolve();
+					await release.promise;
+				};
+				try {
+					await session.acceptUserMessage(child.id, "Start the run.", { userId: null });
+					await started.promise;
+					const accepted = await session.acceptUserMessage(child.id, "Use the slash model.", {
+						userId: null,
+						executionIntent: { modelOverride: { model: override, mode } },
+					});
+					expect(accepted.buffered).toBe(true);
+					release.resolve();
+					await settled(child.id, 1);
+					expect(configs.at(-1)?.model).toBe(override);
+					await drive(child.id);
+					expect(configs.at(-1)?.model).toBe(A);
+				} finally {
+					release.resolve();
+				}
+			});
+
+			test(`an accepted ${mode} cross-provider override survives new-run selection`, async () => {
+				const provider = settings.anthropicProviders?.[0];
+				if (!provider) throw new Error("Missing test provider");
+				settings.anthropicProviders?.push({
+					...provider,
+					id: "isolated-override",
+					prefix: "override",
+				});
+				const override = "override:claude-sonnet-4-20250514";
+				const child = await create(A);
+				await session.acceptUserMessage(child.id, "Use the explicit slash model.", {
+					userId: null,
+					executionIntent: { modelOverride: { model: override, mode } },
+				});
+				await settled(child.id, 0);
+				expect(configs.at(-1)?.model).toBe(override);
+				expect((await narratorService.getById(child.id)).model).toBe(
+					mode === "temporary" ? A : override,
+				);
+				await drive(child.id);
+				expect(configs.at(-1)?.model).toBe(A);
+			});
+		}
+
 		for (const entry of ["continue", "resume"] as const) {
 			test(`${entry}: real create stores inheritance and re-reads parent A -> B`, async () => {
 				const child = await create();
@@ -442,7 +516,7 @@ if (process.env[CHILD_ENV] !== "1") {
 
 		for (const background of [false, true]) {
 			for (const poolSource of ["settings", "traits"] as const) {
-				test(`${background ? "background" : "foreground"}: ${poolSource} pool's first entry beats an allowed parent and type preference`, async () => {
+				test(`${background ? "background" : "foreground"}: ${poolSource} pool's allowed parent model beats its first entry and type preference`, async () => {
 					settings.agent.subagentModels.explore = B;
 					if (poolSource === "settings") {
 						settings.agent.subagentAllowedModels.explore = [C, A, B];
@@ -456,18 +530,21 @@ if (process.env[CHILD_ENV] !== "1") {
 						await db.update(narrators).set({ traits }).where(eq(narrators.id, PARENT));
 					}
 					const child = await spawn({ subagentType: "explore", background });
-					await assertRun(child.id, C, C);
+					await assertRun(child.id, A, A);
+					await narratorService.updateModel(PARENT, B);
+					// Same provider as the parent's new model: the pinned child keeps its model.
+					await drive(child.id, "resume");
+					await assertRun(child.id, A, A);
+					const explicit = await spawn({ subagentType: "explore", background, model: C });
+					await assertRun(explicit.id, C, C);
 					if (poolSource === "traits") {
 						expect(configs.at(-1)?.reasoningEffort).toBe("max");
 					}
-					await narratorService.updateModel(PARENT, B);
-					await drive(child.id, "resume");
-					await assertRun(child.id, C, C);
-					const explicit = await spawn({ subagentType: "explore", background, model: A });
-					await assertRun(explicit.id, A, A);
 					await expect(
-						spawn({ subagentType: "explore", model: "anthropic:not-allowed" }),
-					).rejects.toThrow("No candidate model");
+						await captureWorkerRejectionThrower(
+							spawn({ subagentType: "explore", model: "anthropic:not-allowed" }),
+						),
+					).toThrow("No candidate model");
 				});
 			}
 		}
@@ -571,8 +648,10 @@ if (process.env[CHILD_ENV] !== "1") {
 					pools: { general: [] },
 				});
 				await db.update(narrators).set({ traits }).where(eq(narrators.id, PARENT));
-				await expect(drive(child.id, entry)).rejects.toThrow("No models are allowed");
-				await expect(spawn()).rejects.toThrow("No models are allowed");
+				await expect(await captureWorkerRejectionThrower(drive(child.id, entry))).toThrow(
+					"No models are allowed",
+				);
+				await expect(await captureWorkerRejectionThrower(spawn())).toThrow("No models are allowed");
 				expect(configs).toHaveLength(1);
 				expect((await narratorService.getById(child.id)).model).toBe(FOLLOW_PARENT_MODEL);
 				expect((await narratorService.getById(child.id)).status).toBe("idle");
@@ -613,6 +692,7 @@ if (process.env[CHILD_ENV] !== "1") {
 			const { executeQueuedNewCommand } = await import("../narrator-session");
 			const active = {
 				narratorId: child.id,
+				abortController: new AbortController(),
 				cwd: process.env.HOME as string,
 			} as Parameters<typeof executeQueuedNewCommand>[0];
 			const newId = await executeQueuedNewCommand(
@@ -640,6 +720,7 @@ if (process.env[CHILD_ENV] !== "1") {
 			const { executeQueuedNewCommand } = await import("../narrator-session");
 			const active = {
 				narratorId: child.id,
+				abortController: new AbortController(),
 				cwd: process.env.HOME as string,
 			} as Parameters<typeof executeQueuedNewCommand>[0];
 			const newId = await executeQueuedNewCommand(
@@ -661,6 +742,7 @@ if (process.env[CHILD_ENV] !== "1") {
 			const { executeQueuedNewCommand } = await import("../narrator-session");
 			const active = {
 				narratorId: child.id,
+				abortController: new AbortController(),
 				cwd: process.env.HOME as string,
 			} as Parameters<typeof executeQueuedNewCommand>[0];
 			const newId = await executeQueuedNewCommand(
@@ -675,5 +757,57 @@ if (process.env[CHILD_ENV] !== "1") {
 			);
 			expect((await narratorService.getById(newId)).model).toBe(B);
 		});
+
+		for (const background of [false, true]) {
+			test(`${background ? "background" : "foreground"}: a following subagent's own following subagent runs on the root's live model`, async () => {
+				// Only a worker orchestrates; its helper is the second level.
+				const child = await spawn({ subagentType: "worker" });
+				expect(child.model).toBe(FOLLOW_PARENT_MODEL);
+				const grandchild = await spawn({ parentNarratorId: child.id, background });
+				expect(grandchild.model).toBe(FOLLOW_PARENT_MODEL);
+				expect(grandchild.status).toBe("idle");
+				expect(configs.at(-1)).toMatchObject({ narratorId: grandchild.id, model: A });
+
+				await narratorService.updateModel(PARENT, B);
+				await drive(grandchild.id);
+				expect(configs.at(-1)).toMatchObject({ narratorId: grandchild.id, model: B });
+				expect((await resolveSubagentModelForRun(grandchild)).inheritance).toMatchObject({
+					source: "parent",
+					model: B,
+					parentModel: B,
+				});
+			});
+
+			test(`${background ? "background" : "foreground"}: a call that fails before its run starts archives the subagent it created`, async () => {
+				const failure = spyOn(narratorService, "persistSubagentUserMessage").mockRejectedValue(
+					new Error("injected failure before the run"),
+				);
+				const call = await agentCall();
+				try {
+					await expect(
+						runSubagent({
+							parentNarratorId: PARENT,
+							toolUseId: call.toolUseId,
+							toolCallBinding: call.binding,
+							subagentType: "general",
+							prompt: "Never runs.",
+							cwd: process.env.HOME as string,
+							title: "never-started worker",
+							signal: new AbortController().signal,
+							locale: "en",
+							background,
+						}),
+					).rejects.toThrow("injected failure before the run");
+				} finally {
+					failure.mockRestore();
+				}
+				const rows = await db.query.narrators.findMany({
+					where: eq(narrators.parentNarratorId, PARENT),
+				});
+				expect(rows).toHaveLength(1);
+				expect(rows[0]?.status).toBe("archived");
+				expect(configs).toHaveLength(0);
+			});
+		}
 	});
 }

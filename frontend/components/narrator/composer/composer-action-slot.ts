@@ -29,3 +29,28 @@ export function resolveComposerActionSlot(input: {
 	}
 	return "primary";
 }
+
+/**
+ * Whether the composer may offer takeover instead of Stop.
+ *
+ * Takeover holds the result a run delivers to its caller, so the server refuses it
+ * for a session that delivers nowhere ("This session does not deliver a result").
+ * Painting takeover there would hide Stop and leave a running subagent with no
+ * working control. `deliversResult` is absent on older servers; treat that as unknown
+ * and keep the previous behaviour.
+ */
+export function resolveCanTakeover(input: {
+	isSubagent: boolean;
+	isActive: boolean;
+	isTakenOver: boolean;
+	retryRecoveryAllowsInterrupt: boolean;
+	deliversResult: unknown;
+}): boolean {
+	return (
+		input.isSubagent &&
+		input.isActive &&
+		!input.isTakenOver &&
+		input.retryRecoveryAllowsInterrupt &&
+		input.deliversResult !== false
+	);
+}

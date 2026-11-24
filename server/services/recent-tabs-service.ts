@@ -37,7 +37,7 @@ import {
 	type RecentTabsSection,
 	type RecentTabType,
 } from "@shared/recent-tabs";
-import { and, asc, desc, eq, gt, inArray, isNull, notInArray, or } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
 	narrators,
@@ -1624,6 +1624,9 @@ export async function getRuntimePatches(
 			viewers: tab.viewers ?? [],
 			viewerCount: tab.viewerCount ?? 0,
 			containerStatus: tab.containerStatus ?? null,
+			// M1: a team session this user can only read (no "waiting for you" alerts).
+			teamOnlooker: tab.teamOnlooker === true,
+			teamSession: tab.teamSession === true,
 		},
 	}));
 	return { revision: snapshot.revision, patches };
@@ -1707,6 +1710,61 @@ export async function getRecentTabUserIdsForNarrator(
 		if (rows.length < MIGRATION_BATCH_SIZE) break;
 	}
 	return userIds;
+}
+
+/**
+ * Who has a session of a team tree in their recent tabs (M1): the coordinator or any of its
+ * subagents (`scope.coordinatorId`), or of every team of a project (`scope.projectId`). Most
+ * recently visited first, at most `limit`. Only the output is bounded: the statement reads every tab row of
+ * those sessions to order them, so its cost grows with the number of holders. One statement: the tree's narrator ids come from
+ * `project_teams` and `narrators (acl_root_narrator_id)` in a subquery, the tabs from
+ * `idx_user_recent_tabs_narrator`, grouped per user.
+ */
+export async function getRecentTabUserIdsForTeamTrees(
+	scope: { coordinatorId: string } | { projectId: string },
+	limit: number,
+): Promise<string[]> {
+	await ensureAllRecentTabsMigrated();
+	const coordinators =
+		"coordinatorId" in scope
+			? sql`select ${scope.coordinatorId}`
+			: sql`select pt.narrator_id from project_teams pt where pt.project_id = ${scope.projectId}`;
+	const rows = await db.all<{ userId: string }>(sql`
+		select urt.user_id as userId, max(urt.last_visited_at) as lastVisited
+		from user_recent_tabs urt
+		where urt.represented_narrator_id in (${coordinators})
+			or urt.represented_narrator_id in (
+				select n.id from narrators n
+				where n.type = 'subagent' and n.acl_root_narrator_id in (${coordinators})
+			)
+		group by urt.user_id
+		order by lastVisited desc, urt.user_id
+		limit ${limit}`);
+	return rows.map((row) => row.userId);
+}
+
+/**
+ * Who has this narrator in their recent tabs, most recently visited first, at most `limit`
+ * (`idx_user_recent_tabs_narrator`, grouped per user). For bounded fan-outs that should prefer
+ * the people who looked most recently over an arbitrary id order (M1).
+ *
+ * Only the OUTPUT is bounded: to order by recency the statement reads every tab row of this
+ * narrator (one per holder, through the index) and groups them, so its cost grows with the
+ * number of people who have the narrator in their recent tabs.
+ */
+export async function getRecentTabUserIdsForNarratorByRecency(
+	narratorId: string,
+	limit: number,
+): Promise<string[]> {
+	await ensureAllRecentTabsMigrated();
+	const rows = await db.all<{ userId: string }>(sql`
+		select urt.user_id as userId, max(urt.last_visited_at) as lastVisited
+		from user_recent_tabs urt
+		where urt.represented_narrator_id = ${narratorId}
+		group by urt.user_id
+		order by lastVisited desc, urt.user_id
+		limit ${limit}`);
+	return rows.map((row) => row.userId);
 }
 
 /** Update only users indexed as members of this narrator tab. */

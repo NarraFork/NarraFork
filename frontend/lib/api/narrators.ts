@@ -16,6 +16,7 @@ import type { FileReference } from "@shared/file-reference";
 import type { GitWorkspaceSummary } from "@shared/git-workspace";
 import type { HumanAttentionPage } from "@shared/human-attention";
 import type { MediaRef } from "@shared/media-attachments";
+import type { ModelTraceOptions } from "@shared/modeltrace-result";
 import type { NarratorNavigationSummary, NarratorPanelState } from "@shared/narrator-panel-state";
 import {
 	TEXT_DOCUMENT_PACKET_BYTES,
@@ -48,6 +49,7 @@ import type {
 	ApiEntity,
 	BlacklistCmd,
 	BlacklistDir,
+	BufferedMessageEditLease,
 	BufferMessageSummary,
 	CommandBlacklistRuleInput,
 	CommandWhitelistRuleInput,
@@ -117,9 +119,20 @@ export type WorkspaceDirectoryEntry = {
 };
 export type WorkspaceDirectoryMap = Record<string, WorkspaceDirectoryEntry>;
 
-export type NarratorDetail = ApiEntity & {
-	navigationSummary?: NarratorNavigationSummary;
-};
+export type FastModeSource = "user-default" | "override" | "primary" | "unavailable";
+
+export interface FastModeResolution {
+	effectiveFastMode: boolean;
+	fastModeSource: FastModeSource;
+	fastModeSourceNarratorId: string | null;
+}
+
+export type NarratorDetail = ApiEntity &
+	Partial<FastModeResolution> & {
+		navigationSummary?: NarratorNavigationSummary;
+		/** Whether the session's run delivers its result to a caller (takeover target). */
+		deliversResult?: boolean;
+	};
 
 const sharePanelStateRead = createSharedInflight<NarratorPanelStateResponse>();
 
@@ -795,9 +808,10 @@ export const narratorsApi = {
 			`/narrators/${encodeURIComponent(narratorId)}/request-recordings/requests/${encodeURIComponent(requestId)}`,
 			{ method: "POST", signal },
 		),
-	startModelTrace: (narratorId: string) =>
+	startModelTrace: (narratorId: string, options?: ModelTraceOptions) =>
 		request<{ id: string }>(`/narrators/${encodeURIComponent(narratorId)}/modeltrace`, {
 			method: "POST",
+			...(options && { body: JSON.stringify(options) }),
 		}),
 	retryModelTrace: (narratorId: string) =>
 		request<{ id: string }>(`/narrators/${encodeURIComponent(narratorId)}/modeltrace/retry`, {
@@ -872,6 +886,7 @@ export const narratorsApi = {
 		hasContainers?: boolean;
 		hasRunningContainers?: boolean;
 		hasViewers?: boolean;
+		groupAskInPassing?: boolean;
 	}) => {
 		const params = new URLSearchParams();
 		if (opts?.projectId) params.set("projectId", opts.projectId);
@@ -884,6 +899,7 @@ export const narratorsApi = {
 		if (opts?.hasContainers) params.set("hasContainers", "true");
 		if (opts?.hasRunningContainers) params.set("hasRunningContainers", "true");
 		if (opts?.hasViewers) params.set("hasViewers", "true");
+		if (opts?.groupAskInPassing) params.set("groupAskInPassing", "true");
 		const qs = params.toString();
 		return request<PaginatedNarrators>(`/narrators${qs ? `?${qs}` : ""}`);
 	},
@@ -1264,6 +1280,14 @@ export const narratorsApi = {
 		request<{ stopped: boolean; deferred?: boolean }>(`/narrators/${id}/stop-takeover`, {
 			method: "POST",
 		}),
+	createBackgroundTask: (
+		narratorId: string,
+		data: { kind: "task" | "service"; command: string; title?: string; timeoutMs?: number },
+	) =>
+		request<{ id: string; alias: string }>(
+			`/narrators/${encodeURIComponent(narratorId)}/background-tasks`,
+			{ method: "POST", body: JSON.stringify(data) },
+		),
 	cancelBackgroundTask: (narratorId: string, taskId: string) =>
 		request<{
 			success: boolean;
@@ -1339,6 +1363,26 @@ export const narratorsApi = {
 		),
 	getBufferedMessages: (id: string, signal?: AbortSignal) =>
 		request<BufferMessageSummary[]>(`/narrators/${id}/buffer`, { signal }),
+	beginBufferedMessageEdit: (
+		narratorId: string,
+		messageId: string,
+		token: string,
+		expectedRevision?: number,
+	) =>
+		request<BufferedMessageEditLease>(
+			`/narrators/${encodeURIComponent(narratorId)}/buffer/${encodeURIComponent(messageId)}/edit`,
+			{ method: "POST", body: JSON.stringify({ token, expectedRevision }) },
+		),
+	renewBufferedMessageEdit: (narratorId: string, messageId: string, token: string) =>
+		request<BufferedMessageEditLease>(
+			`/narrators/${encodeURIComponent(narratorId)}/buffer/${encodeURIComponent(messageId)}/edit`,
+			{ method: "PATCH", body: JSON.stringify({ token }) },
+		),
+	releaseBufferedMessageEdit: (narratorId: string, messageId: string, token: string) =>
+		request<{ ok: true }>(
+			`/narrators/${encodeURIComponent(narratorId)}/buffer/${encodeURIComponent(messageId)}/edit`,
+			{ method: "DELETE", headers: { "X-Buffer-Edit-Token": token }, keepalive: true },
+		),
 	/**
 	 * Edit a queued message's text and/or its attachments.
 	 *
@@ -1360,6 +1404,7 @@ export const narratorsApi = {
 			fileReferences?: FileReference[];
 			composerDocument?: ComposerDocument;
 		},
+		editToken?: string,
 	) => {
 		const uploadError = mediaUploadError({
 			media: opts?.newMedia,
@@ -1373,9 +1418,11 @@ export const narratorsApi = {
 		});
 		if (uploadError) throw new Error(i18next.t(`narrator:${uploadError}`));
 		const path = `/narrators/${narratorId}/buffer/${messageId}`;
+		const headers = editToken ? { "X-Buffer-Edit-Token": editToken } : undefined;
 		if (!opts?.newImages?.length && !opts?.newTextFiles?.length && !opts?.newMedia?.length) {
 			return request<{ ok: boolean }>(path, {
 				method: "PATCH",
+				headers,
 				body: JSON.stringify({
 					text,
 					...(opts?.keepImageIds ? { keepImageIds: opts.keepImageIds } : {}),
@@ -1412,7 +1459,11 @@ export const narratorsApi = {
 		// Content-Type is left unset so the browser adds the multipart boundary.
 		let res: Response;
 		try {
-			res = await authorizedFetch(`${apiBase()}${path}`, { method: "PATCH", body: formData });
+			res = await authorizedFetch(`${apiBase()}${path}`, {
+				method: "PATCH",
+				headers,
+				body: formData,
+			});
 		} catch (error) {
 			discardStagedAttachments(narratorId, staged);
 			throw error;
@@ -1862,13 +1913,17 @@ export const narratorsApi = {
 			body: JSON.stringify({ reasoningEffort }),
 		}),
 	updateNarratorFastMode: (id: string, fastModeOverride: "inherit" | "on" | "off") =>
-		request<{ ok: boolean; fastModeOverride: "inherit" | "on" | "off"; fastMode: boolean }>(
-			`/narrators/${id}/fast-mode`,
-			{
-				method: "PATCH",
-				body: JSON.stringify({ fastModeOverride }),
-			},
-		),
+		request<
+			FastModeResolution & {
+				ok: boolean;
+				fastModeOverride: "inherit" | "on" | "off";
+				/** Compatibility response: the effective value, unlike the detail mirror. */
+				fastMode: boolean;
+			}
+		>(`/narrators/${id}/fast-mode`, {
+			method: "PATCH",
+			body: JSON.stringify({ fastModeOverride }),
+		}),
 	updateNarratorRelaxedPlan: (id: string, relaxedPlan: boolean) =>
 		request<{ ok: boolean; relaxedPlan: boolean }>(`/narrators/${id}/relaxed-plan`, {
 			method: "PATCH",
@@ -2051,11 +2106,11 @@ export const narratorsApi = {
 		),
 	resumeRecoverySubagents: (
 		narratorId: string,
-		body: { messageId: string; subagentIds: string[]; mode: "notify" | "await" },
+		body: { messageId: string; subagentIds: string[]; mode: "notify" | "watch" },
 	) =>
 		request<{
 			ok: boolean;
-			mode: "notify" | "await";
+			mode: "notify" | "watch";
 			resumed: number;
 			skipped: Array<{ id: string; reason: string }>;
 		}>(`/narrators/${narratorId}/subagent-recovery`, {
@@ -2525,6 +2580,11 @@ export const narratorsApi = {
 		),
 
 	// Browser sessions
+	createBrowserSession: (narratorId: string, data: { url: string; ttlMs?: number }) =>
+		request<{ id: string }>(`/narrators/${encodeURIComponent(narratorId)}/browser-sessions`, {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
 	listBrowserSessions: (narratorId: string) =>
 		request<
 			{

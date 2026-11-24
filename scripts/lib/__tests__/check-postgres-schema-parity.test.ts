@@ -523,8 +523,8 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 144 tables and 1920 columns including account appearance preferences", () => {
-		expect(target.tables.length).toBe(144);
+	test("covers 147 tables and 1960 columns", () => {
+		expect(target.tables.length).toBe(147);
 		// 1714 SQLite-derived columns include disk_outcome and the two editor recovery columns,
 		// plus the three PG-only insert_seq identity columns.
 		// The numeric context stats replace the 5-column page cache with pins (3) and stats (4).
@@ -571,7 +571,9 @@ describe("real schema parity", () => {
 		// outline_spec_loss_scans (6).
 		// Account appearance preferences add one bounded JSON text column.
 		// Per-user plugin overlay visibility adds user_preferences.hidden_plugin_overlays.
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1920);
+		// Project teams (P1) add project_teams (9), team_work_items (21) and team_work_events (8).
+		// Ask-in-passing groups add two nullable narrator links.
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1960);
 		expect(
 			target.tables
 				.find((table) => table.name === "user_preferences")
@@ -584,6 +586,18 @@ describe("real schema parity", () => {
 		});
 		expect(target.tables.find((table) => table.name === "narrators")?.columns).toEqual(
 			expect.arrayContaining([
+				expect.objectContaining({
+					property: "askInPassingGroupId",
+					name: "ask_in_passing_group_id",
+					pgType: "text",
+					notNull: false,
+				}),
+				expect.objectContaining({
+					property: "archivedWithNarratorId",
+					name: "archived_with_narrator_id",
+					pgType: "text",
+					notNull: false,
+				}),
 				expect.objectContaining({
 					property: "replyContext",
 					name: "reply_context",

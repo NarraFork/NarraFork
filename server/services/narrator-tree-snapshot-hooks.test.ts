@@ -1,7 +1,8 @@
-import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import * as fileHistoryPolicy from "@shared/file-change-protocol";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import {
@@ -20,6 +21,8 @@ import { safeSpawn } from "../lib/spawn";
 import {
 	abandonSessionTreeSnapshots,
 	abandonTreeSnapshot,
+	beginBashCaptureWindow,
+	captureSessionTree,
 	declaredWorktreePaths,
 	recordTreeSnapshotAfter,
 	recordTreeSnapshotBefore,
@@ -28,6 +31,20 @@ import {
 import { treeSnapshotPhysicalDir } from "./tree-snapshot-paths";
 import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 import { peekClaim } from "./worktree-write-claims";
+
+// Exercise retained capture/attribution algorithms under an explicitly injected
+// policy. Production local policy is tested separately below.
+const previousSetting = settings.workspace.treeSnapshotsEnabled;
+let restorePolicy = () => {};
+beforeEach(() => {
+	const policy = spyOn(fileHistoryPolicy, "isFileHistoryEnabledForDevice").mockReturnValue(true);
+	restorePolicy = () => policy.mockRestore();
+	settings.workspace.treeSnapshotsEnabled = true;
+});
+afterEach(() => {
+	restorePolicy();
+	settings.workspace.treeSnapshotsEnabled = previousSetting;
+});
 
 const createdNarrators: string[] = [];
 const tempDirs: string[] = [];
@@ -756,6 +773,42 @@ describe("workspace path change broadcast", () => {
 		return frames;
 	}
 
+	test.each([
+		"Write",
+		"Bash",
+	])("history-disabled %s invalidates listings without capturing history", async (toolName) => {
+		restorePolicy();
+		settings.workspace.treeSnapshotsEnabled = false;
+		const cwd = mkdtempSync(join(tmpdir(), "nf-hook-disabled-broadcast-"));
+		tempDirs.push(cwd);
+		const narratorId = await createNarrator(cwd);
+		const { toolUseId } = await seedToolCall(narratorId, toolName, 1);
+		const session = makeSession(cwd);
+		writeFileSync(join(cwd, "gone.txt"), "old file");
+		const hot = spyOn(worktreeTreeSnapshot, "tryCaptureHot");
+		const diff = spyOn(worktreeTreeSnapshot, "diffPathStatuses");
+		try {
+			const frames = await captureBroadcasts(async () => {
+				await recordTreeSnapshotBefore(session, narratorId, toolUseId);
+				writeFileSync(join(cwd, "new.txt"), "new file");
+				rmSync(join(cwd, "gone.txt"));
+				await recordTreeSnapshotAfter(
+					session,
+					narratorId,
+					toolUseId,
+					toolName === "Bash" ? { unavailable: true } : undefined,
+				);
+			});
+			expect(frames).toEqual([{ narratorId, changes: [], truncated: true }]);
+			expect(hot).not.toHaveBeenCalled();
+			expect(diff).not.toHaveBeenCalled();
+			expect(session._lastTreeHash).toBeUndefined();
+		} finally {
+			hot.mockRestore();
+			diff.mockRestore();
+		}
+	});
+
 	test("announces the whole workspace delta, not just the acting call's owned set", async () => {
 		const repo = await createRepo("nf-hook-broadcast-delta-");
 		const narratorId = await createNarrator(repo);
@@ -839,5 +892,144 @@ describe("workspace path change broadcast", () => {
 		});
 
 		expect(frames).toEqual([]);
+	});
+});
+
+describe("local tree history disabled", () => {
+	const previousSetting = settings.workspace.treeSnapshotsEnabled;
+	let cwd: string;
+	beforeEach(() => {
+		restorePolicy();
+		cwd = mkdtempSync(join(tmpdir(), "nf-local-tree-disabled-"));
+		settings.workspace.treeSnapshotsEnabled = true;
+	});
+	afterEach(() => {
+		settings.workspace.treeSnapshotsEnabled = previousSetting;
+		rmSync(cwd, { recursive: true, force: true });
+	});
+
+	for (const deviceId of [undefined, null, "", LOCAL_DEVICE_ID]) {
+		test(`legacy enabled setting cannot capture ${String(deviceId)} or retain old hashes`, async () => {
+			const session: TreeSnapshotSession = {
+				cwd,
+				_defaultDeviceId: deviceId,
+				_treeHashBefore: new Map([["old-tool", "a".repeat(40)]]),
+				_lastTreeHash: "a".repeat(40),
+				_lastTreeHashAt: Date.now(),
+			};
+			const hot = spyOn(worktreeTreeSnapshot, "tryCaptureHot").mockRejectedValue(
+				new Error("capture must not be entered"),
+			);
+			const capture = spyOn(worktreeTreeSnapshot, "capture");
+			try {
+				expect(await captureSessionTree(session, "local-owner")).toBeNull();
+				expect(hot).not.toHaveBeenCalled();
+				expect(capture).not.toHaveBeenCalled();
+				expect(session._treeHashBefore?.size).toBe(0);
+				expect(session._lastTreeHash).toBeUndefined();
+				expect(session._lastTreeHashAt).toBeUndefined();
+			} finally {
+				hot.mockRestore();
+				capture.mockRestore();
+			}
+		});
+	}
+
+	test("before still opens a claim and after seals unknown ownership without scanning", async () => {
+		const narratorId = generateId();
+		const messageId = generateId();
+		const toolUseId = generateId();
+		const now = new Date().toISOString();
+		await db.insert(narrators).values({ id: narratorId, cwd, createdAt: now, updatedAt: now });
+		await db.insert(narratorMessages).values({
+			id: messageId,
+			narratorId,
+			role: "assistant",
+			contentJson: [],
+			createdAt: now,
+			treeHashAfter: "b".repeat(40),
+		});
+		await db.insert(narratorToolCalls).values({
+			id: generateId(),
+			narratorId,
+			messageId,
+			toolUseId,
+			toolName: "Edit",
+			inputJson: {},
+			status: "success",
+			createdAt: now,
+			treeHashBefore: "a".repeat(40),
+			treeHashAfter: "b".repeat(40),
+			ownedPathsJson: ["mine.txt"],
+		});
+		const session: TreeSnapshotSession = { cwd };
+		const hot = spyOn(worktreeTreeSnapshot, "tryCaptureHot");
+		const diff = spyOn(worktreeTreeSnapshot, "diffPathStatuses");
+		try {
+			await recordTreeSnapshotBefore(session, narratorId, toolUseId, ["mine.txt"]);
+			expect(peekClaim(cwd, toolUseId)).toMatchObject({
+				declared: ["mine.txt"],
+				to: null,
+				resolved: null,
+			});
+			writeFileSync(join(cwd, "mine.txt"), "actual edit");
+			const result = await recordTreeSnapshotAfter(session, narratorId, toolUseId);
+			expect(result).toEqual({ before: null, after: null, changedFiles: [], workspaceDelta: [] });
+			expect(peekClaim(cwd, toolUseId)?.to).toBeNumber();
+			expect(peekClaim(cwd, toolUseId)?.declared).toEqual(["mine.txt"]);
+			expect(peekClaim(cwd, toolUseId)?.resolved).toBeNull();
+			expect(
+				await db.query.narratorToolCalls.findFirst({
+					where: eq(narratorToolCalls.toolUseId, toolUseId),
+					columns: { treeHashBefore: true, treeHashAfter: true, ownedPathsJson: true },
+				}),
+			).toEqual({ treeHashBefore: null, treeHashAfter: null, ownedPathsJson: null });
+			expect(
+				(
+					await db.query.narratorMessages.findFirst({
+						where: eq(narratorMessages.id, messageId),
+						columns: { treeHashAfter: true },
+					})
+				)?.treeHashAfter,
+			).toBeNull();
+			expect(hot).not.toHaveBeenCalled();
+			expect(diff).not.toHaveBeenCalled();
+		} finally {
+			hot.mockRestore();
+			diff.mockRestore();
+			await db.delete(narratorToolCalls).where(eq(narratorToolCalls.narratorId, narratorId));
+			await db.delete(narratorMessages).where(eq(narratorMessages.narratorId, narratorId));
+			await db.delete(narrators).where(eq(narrators.id, narratorId));
+		}
+	});
+
+	test("exception and turn cleanup seal only the owning narrator's claims", async () => {
+		const session: TreeSnapshotSession = { cwd };
+		await recordTreeSnapshotBefore(session, "owner", "failed", ["first.txt"]);
+		await recordTreeSnapshotBefore(session, "owner", "aborted", ["second.txt"]);
+		await recordTreeSnapshotBefore({ cwd }, "neighbour", "running", ["second.txt"]);
+		session._lastTreeHash = "stale";
+		session._lastTreeHashAt = Date.now();
+		abandonTreeSnapshot(session, "owner", "failed");
+		expect(peekClaim(cwd, "failed")?.to).toBeNumber();
+		expect(peekClaim(cwd, "aborted")?.to).toBeNull();
+		abandonSessionTreeSnapshots(session, "owner");
+		expect(peekClaim(cwd, "aborted")?.to).toBeNumber();
+		expect(peekClaim(cwd, "running")?.to).toBeNull();
+		expect(peekClaim(cwd, "failed")?.declared).toEqual(["first.txt"]);
+		expect(session._lastTreeHash).toBeUndefined();
+		expect(session._lastTreeHashAt).toBeUndefined();
+		abandonSessionTreeSnapshots({ cwd }, "neighbour");
+	});
+
+	test("local Bash capture windows remain inactive", () => {
+		const first = beginBashCaptureWindow(cwd, "foreground");
+		const second = beginBashCaptureWindow(cwd, "background");
+		expect(first.eligible).toBe(false);
+		expect(second.eligible).toBe(false);
+		expect(first.wasOverlapped()).toBe(false);
+		first.end();
+		first.end();
+		second.end();
 	});
 });

@@ -59,6 +59,7 @@ const CLASSIFIER_CATEGORIES = Object.keys({
 	taskOutput: 1,
 	agent: 1,
 	await: 1,
+	watch: 1,
 	stop: 1,
 	send: 1,
 	ask: 1,

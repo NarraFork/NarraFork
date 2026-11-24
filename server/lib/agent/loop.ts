@@ -17,10 +17,17 @@ import {
 	type StreamingEditOrigin,
 	validateStreamingEditOrigin,
 } from "@shared/streaming-edit-origin";
+import {
+	acceptCheckpointStopDrain,
+	isCheckpointStop,
+} from "../../services/agent-runtime/checkpoint-stop";
 import { scanToolOutputForKnowledgeDetailed } from "../../services/knowledge-injection";
 import { type ProtectedTaskMutation, SPEC_TASKS_PATH } from "../../services/spec-task-service";
 import { specVfsService } from "../../services/spec-vfs-service";
-import { beginNarratorResponseActivity } from "../../services/update-coordinator";
+import {
+	beginNarratorResponseActivity,
+	inheritCheckpointGateActor,
+} from "../../services/update-coordinator";
 import { type ApiRequestHandle, finishApiRequest, startApiRequest } from "../api-request-tracker";
 import {
 	type BooleanOverride,
@@ -31,6 +38,7 @@ import {
 import { matchContextComposition, validInputCharacters } from "../context-usage-snapshot";
 import { logger } from "../logger";
 import { withModelMetadataSnapshotIterator } from "../model-catalog";
+import { historyPreparationFailure } from "../model-history-preparation";
 import { captureReferencePricingSnapshot } from "../model-pricing";
 import { redactSecretPatterns } from "../net/diagnostic-redaction";
 import { noteOpencodeUsageActivity } from "../opencode-usage-cache";
@@ -41,6 +49,7 @@ import {
 	getToolMessage,
 	type Locale,
 } from "../prompt-i18n";
+import { streamQuotaIdentityForPrefix } from "../provider-key-subjects";
 import { resolveProviderQuotaWait } from "../provider-quota-wait";
 import { createRequestRecording } from "../request-recorder";
 import {
@@ -209,7 +218,7 @@ const TOOL_FIELD_CONFIG: Record<string, { short: string[]; large: string[] }> = 
 		large: ["prompt"],
 	},
 	Task: { short: ["description", "subagent_type", "model", "reasoning_effort"], large: ["prompt"] },
-	Await: { short: ["type", "id", "timeout", "wait_for_text"], large: [] },
+	Watch: { short: ["type", "id", "pattern", "timeout", "start_at"], large: [] },
 	Send: {
 		short: ["id", "ids", "name", "names", "doInterrupt", "await", "timeout"],
 		large: ["message"],
@@ -369,7 +378,7 @@ function isQuietFinish(kind: EmptyResponseKind, signals: EmptyResponseSignals): 
 	if (kind === "empty_response_usage_only") return true;
 	return (
 		kind === "empty_response_stop_without_content" &&
-		QUIET_STOP_REASONS.has(signals.stopReason ?? "")
+		QUIET_STOP_REASONS.has(signals.stopReason?.toLowerCase() ?? "")
 	);
 }
 
@@ -597,7 +606,7 @@ const RELAXED_PLAN_READ_ONLY_TOOLS = new Set([
 	"StructView",
 	"WebSearch",
 	"WebFetch",
-	"Await",
+	"Watch",
 	"Stop",
 	"ShareFile",
 	"ContextAsk",
@@ -1435,7 +1444,7 @@ export async function runReflectionLoop(
 			// A reflection extends the parent's request rows in memory; it writes no rows of its own.
 			rebuildRequestHistory: undefined,
 			historyEndsWithToolResults: undefined,
-			shouldIdleOnReasoningOnly: undefined,
+			hasPendingWake: undefined,
 			// A reflection is an auxiliary call inside the parent's turn. It must not deliver
 			// injections: the reminders belong to the parent conversation, and writing rows
 			// from here would put them in the transcript twice (once now, once when the parent
@@ -2975,6 +2984,7 @@ async function executeToolAfterReflections(
 						}
 					}
 				} catch (err) {
+					if (isCheckpointStop(err)) throw err;
 					if (recoveryReflection(options.recoveryGate)?.type === "task_reflection") {
 						return {
 							output: `Task reflection recovery failed: ${extractErrorMessage(err)}`,
@@ -3457,6 +3467,7 @@ async function* agentLoopInMetadataSnapshot(
 					knowledgeInjectedEntryIds,
 					{
 						projectId: config.projectId ?? undefined,
+						signal: config.signal,
 					},
 				);
 				if (scan) {
@@ -3514,7 +3525,7 @@ async function* agentLoopInMetadataSnapshot(
 	 */
 	const pendingInputParts: AgentInputPart[] = [];
 	let replayedInjectionMessageIds = new Set<string>();
-	const pendingInputConsumptions: Array<() => void> = [];
+	const pendingInputConsumptions: Array<() => void | Promise<void>> = [];
 	async function collectAfterToolsInjections(): Promise<void> {
 		if (!config.getAfterToolsInjections) return;
 		try {
@@ -3761,7 +3772,7 @@ async function* agentLoopInMetadataSnapshot(
 		if (guidanceSignal?.aborted) {
 			// FIFO guidance may intentionally enter a pass already stopped. Consume the
 			// host flag and preserve pending input without activating provider/preflight IO.
-			config.shouldYieldToInput?.();
+			await config.shouldYieldToInput?.();
 			yield { type: "turn_complete", turnIndex };
 			return;
 		}
@@ -3774,6 +3785,8 @@ async function* agentLoopInMetadataSnapshot(
 		// responses are classified afterwards. Keep the unfinished handle for that verdict,
 		// while this turn's outer finally covers consumer return and unexpected exits.
 		let activeRequestDump: ApiRequestDumpCollector | undefined;
+		let pendingGuidanceYield: Promise<boolean> | undefined;
+		let drainCheckpointTools: (() => AsyncGenerator<AgentEvent>) | undefined;
 		try {
 			// Delivery is de-duplicated only within one model turn. If persistence failed,
 			// the still-pending state may be attached again on the next turn.
@@ -3807,7 +3820,10 @@ async function* agentLoopInMetadataSnapshot(
 								replacement.systemPrompt === config.systemPrompt,
 						});
 					} catch (error) {
-						if (config.signal.aborted) {
+						if (
+							config.signal.aborted ||
+							historyPreparationFailure(error)?.outcome === "cancelled"
+						) {
 							yield { type: "error", message: "Aborted" };
 							return;
 						}
@@ -3817,7 +3833,8 @@ async function* agentLoopInMetadataSnapshot(
 						logger.warn("Request history rebuild failed; projecting the loop's transcript", {
 							narratorId: config.narratorId,
 							turnIndex,
-							error: String(error),
+							...historyPreparationFailure(error),
+							outcome: historyPreparationFailure(error)?.outcome ?? "failed",
 						});
 					}
 				}
@@ -3865,6 +3882,7 @@ async function* agentLoopInMetadataSnapshot(
 				toolAbort.signal,
 				...(config.urgentGuidanceSignal ? [config.urgentGuidanceSignal] : []),
 			]);
+			inheritCheckpointGateActor(config.signal, toolSignal, config.narratorId);
 			const toolConfig = new Proxy(config, {
 				get(target, key, receiver) {
 					return key === "signal" ? toolSignal : Reflect.get(target, key, receiver);
@@ -3964,23 +3982,38 @@ async function* agentLoopInMetadataSnapshot(
 			 * the turn the caller already agreed to end. A host stop skips the calls that
 			 * have not started yet.
 			 */
-			const observeSoftStopForTurn = (): boolean => {
-				if (!gracefulStopRequested && config.shouldStop?.()) gracefulStopRequested = true;
-				return gracefulStopRequested;
+			let softStopObservation: Promise<boolean> | undefined;
+			const observeSoftStopForTurn = (): Promise<boolean> => {
+				if (gracefulStopRequested) return Promise.resolve(true);
+				// Concurrent host observations share the same one-shot stop decision.
+				softStopObservation ??= (async () => {
+					const requested = await config.shouldStop?.();
+					if (requested) gracefulStopRequested = true;
+					return gracefulStopRequested;
+				})().finally(() => {
+					softStopObservation = undefined;
+				});
+				return softStopObservation;
 			};
 			/** Same one-shot contract for queued user input, which never skips a call. */
 			let inputStopRequested = false;
-			const observeInputStopForTurn = (): boolean => {
-				if (!inputStopRequested && guidanceSignal?.aborted) {
-					// Consume the host's one-shot flag too, so the next pass is not stopped again.
-					config.shouldYieldToInput?.();
-					inputStopRequested = true;
-				}
-				if (!inputStopRequested && config.shouldYieldToInput?.()) inputStopRequested = true;
-				return inputStopRequested;
+			let inputStopObservation: Promise<boolean> | undefined;
+			const observeInputStopForTurn = (): Promise<boolean> => {
+				if (inputStopRequested) return Promise.resolve(true);
+				// Share in-flight worker reads so the host's one-shot flag is consumed once.
+				inputStopObservation ??= (async () => {
+					const requested = await config.shouldYieldToInput?.();
+					if (requested || guidanceSignal?.aborted) inputStopRequested = true;
+					return inputStopRequested;
+				})().finally(() => {
+					inputStopObservation = undefined;
+				});
+				return inputStopObservation;
 			};
 			// Map of tool executions started during streaming (toolUseId → Promise)
 			const earlyExecMap = new Map<string, Promise<ToolExecResult>>();
+			const ownedToolExecutions = new Set<Promise<ToolExecResult>>();
+			let checkpointToolStop: unknown;
 			// Raised when a started tool settles, so the stream consumer can publish its
 			// result (and release successors) while the provider stream is idle.
 			const toolSettledWake = new WakeSignal();
@@ -3991,6 +4024,7 @@ async function* agentLoopInMetadataSnapshot(
 			const streamReadyTools = new Set<string>();
 			let streamExecutionOpen = false;
 			const startToolExecution = (tu: AgentToolUse): Promise<ToolExecResult> => {
+				if (checkpointToolStop) throw checkpointToolStop;
 				const existing = earlyExecMap.get(tu.toolUseId);
 				if (existing) return existing;
 				// Queued guidance never cancels a produced call, not even while it waits for
@@ -4013,14 +4047,18 @@ async function* agentLoopInMetadataSnapshot(
 					),
 				);
 				earlyExecMap.set(tu.toolUseId, execution);
-				void execution.then((result) => {
-					settledResults.set(tu.toolUseId, result);
-					// Successors wait for this result to be consumed, not merely settled (see
-					// pumpStreamingTools). Wake the stream consumer so it publishes the result
-					// now instead of at the provider's next event, which may be long after the
-					// model stopped producing output.
-					toolSettledWake.notify();
-				});
+				ownedToolExecutions.add(execution);
+				void execution.then(
+					(result) => {
+						settledResults.set(tu.toolUseId, result);
+						// Successors wait for consumed, rather than merely settled, results.
+						toolSettledWake.notify();
+					},
+					(error) => {
+						if (isCheckpointStop(error)) checkpointToolStop = error;
+						toolSettledWake.notify();
+					},
+				);
 				return execution;
 			};
 			async function waitForToolOrAbort<T>(
@@ -4041,14 +4079,15 @@ async function* agentLoopInMetadataSnapshot(
 					signal.removeEventListener("abort", onAbort);
 				}
 			}
-			const pumpStreamingTools = (): void => {
+			const pumpStreamingTools = async (): Promise<void> => {
 				if (
 					!streamExecutionOpen ||
 					config.signal.aborted ||
 					config.deferEagerToolsForSafeStop === true ||
-					observeSoftStopForTurn()
+					(await observeSoftStopForTurn())
 				)
 					return;
+				if (!streamExecutionOpen || config.signal.aborted || gracefulStopRequested) return;
 				const completed = new Map(toolUses.map((tu) => [tu.toolUseId, tu]));
 				const candidates = selectStreamingToolExecutions(
 					[...toolOrderIdentities.values()].sort(compareToolOrder).map((identity) => {
@@ -4231,6 +4270,14 @@ async function* agentLoopInMetadataSnapshot(
 				}
 			}
 
+			drainCheckpointTools = async function* () {
+				streamExecutionOpen = false;
+				// A paused sibling is not permission to abandon actual IO. Keep this run's
+				// completion pending until all started tools and their result persistence settle.
+				await Promise.allSettled([...ownedToolExecutions]);
+				yield* drainSettledEarlyToolResults();
+			};
+
 			const detachedToolResults = new Set<string>();
 			function detachStartedEarlyToolResults(): void {
 				const persist = config.onDetachedToolResult;
@@ -4393,6 +4440,7 @@ async function* agentLoopInMetadataSnapshot(
 			let malformedRetryCount = 0;
 			const requestUserId = config.userId ?? null;
 			let requestStarted = false;
+			let requestQuotaProviderIdentity: string | undefined;
 			let requestFinished = false;
 			let requestStartPending = false;
 			let startFirstTokenTimerForAttempt: (() => void) | undefined;
@@ -4401,6 +4449,7 @@ async function* agentLoopInMetadataSnapshot(
 				if (info?.credentialId) {
 					credentialId = info.credentialId;
 				}
+				requestQuotaProviderIdentity ??= streamQuotaIdentityForPrefix(effectiveProvider);
 				if (requestStarted) return;
 				requestStarted = true;
 				requestStartPending = true;
@@ -5022,6 +5071,7 @@ async function* agentLoopInMetadataSnapshot(
 				nextToolArrivalOrder = 0;
 				messageId = undefined;
 				credentialId = undefined;
+				requestQuotaProviderIdentity = undefined;
 				earlyExecMap.clear();
 				settledResults.clear();
 				streamReadyTools.clear();
@@ -5067,6 +5117,13 @@ async function* agentLoopInMetadataSnapshot(
 				// Every attempt still needs durable identity before dispatch. Keep this
 				// outside transport retry handling: a failed admission is not an API error.
 				await config.beforeProviderRequest?.();
+				const requestServiceTier = config.resolveServiceTier
+					? await config.resolveServiceTier({
+							provider: effectiveProvider,
+							model: effectiveModel,
+							signal: config.signal,
+						})
+					: config.serviceTier;
 
 				// Generate unique request ID for this provider attempt (reset on each retry).
 				// The actual request start time is set by markRequestStarted() after the
@@ -5120,7 +5177,9 @@ async function* agentLoopInMetadataSnapshot(
 					config.urgentGuidanceSignal?.aborted === true || !attemptStreamedContent;
 				// Calls already complete keep their eager start; the turn ends after its tools.
 				const onGuidanceAbort = () => {
-					observeInputStopForTurn();
+					pendingGuidanceYield ??= observeInputStopForTurn();
+					// Observe rejection now and propagate it at the turn's finally boundary.
+					void pendingGuidanceYield.catch(() => {});
 					if (guidanceCutsNow()) attemptAbort.abort(guidanceStop);
 				};
 				// Urgent guidance can follow live guidance whose combined signal already fired.
@@ -5321,7 +5380,7 @@ async function* agentLoopInMetadataSnapshot(
 						);
 						for (const callback of callbacks) {
 							try {
-								callback();
+								await callback();
 							} catch (error) {
 								logger.warn("Failed to acknowledge adopted model input", {
 									narratorId: config.narratorId,
@@ -5365,7 +5424,7 @@ async function* agentLoopInMetadataSnapshot(
 						signal: attemptAbort.signal,
 						stickySessionKey: config.narratorId,
 						reasoningEffort: config.reasoningEffort,
-						serviceTier: config.serviceTier,
+						serviceTier: requestServiceTier,
 						metadata: config.metadata,
 						requestDump,
 						streamProgress,
@@ -5377,6 +5436,8 @@ async function* agentLoopInMetadataSnapshot(
 									provider,
 									requestParams,
 									effectiveProvider,
+									info?.credentialId,
+									info?.validateDiagnosticCredential,
 								);
 							}
 							markRequestStarted(info);
@@ -5413,7 +5474,7 @@ async function* agentLoopInMetadataSnapshot(
 								yield { type: "error", message: fatal.output };
 								return;
 							}
-							pumpStreamingTools();
+							await pumpStreamingTools();
 							continue;
 						}
 						const parsed = streamItem;
@@ -5734,7 +5795,7 @@ async function* agentLoopInMetadataSnapshot(
 								};
 								throwIfUserAborted();
 								streamReadyTools.add(tu.toolUseId);
-								pumpStreamingTools();
+								await pumpStreamingTools();
 							}
 						}
 
@@ -5923,7 +5984,7 @@ async function* agentLoopInMetadataSnapshot(
 											yield { type: "error", message: fatal.output };
 											return;
 										}
-										pumpStreamingTools();
+										await pumpStreamingTools();
 									}
 								}
 							}
@@ -6018,6 +6079,7 @@ async function* agentLoopInMetadataSnapshot(
 								type: "quota_balance",
 								quotaBalance: parsed.quotaBalance,
 								detailedQuotaBalance: parsed.detailedQuotaBalance,
+								providerIdentity: requestQuotaProviderIdentity,
 							};
 						}
 						// Billing updates can be output-only; occupancy still requires a real prompt.
@@ -6526,6 +6588,7 @@ async function* agentLoopInMetadataSnapshot(
 					yield* flushRequestStart();
 				} catch (err) {
 					streamExecutionOpen = false;
+					if (isCheckpointStop(err)) throw err;
 					if (toolLimitState.exceeded) {
 						const message =
 							locale === "zh-CN"
@@ -6579,7 +6642,7 @@ async function* agentLoopInMetadataSnapshot(
 						continue;
 					}
 					if (guidanceSignal?.aborted) {
-						observeInputStopForTurn();
+						await observeInputStopForTurn();
 						// Guidance is not a transport fault. Finalize this partial turn below,
 						// without replay/retry or cancelling tools whose bodies already began.
 						break;
@@ -7010,7 +7073,7 @@ async function* agentLoopInMetadataSnapshot(
 				}
 
 				if (guidanceSignal?.aborted) {
-					observeInputStopForTurn();
+					await observeInputStopForTurn();
 					break;
 				}
 				if (firstTokenTimeoutTriggered) {
@@ -7228,14 +7291,23 @@ async function* agentLoopInMetadataSnapshot(
 						namelessToolUseIds: [...namelessToolUseIds],
 					};
 					const emptyKind = classifyEmptyResponse(emptySignals);
-					if (
-						quietFinishAllowed &&
+					const pendingWake =
 						requestStarted &&
 						!lastRetryErrorMessage &&
-						isQuietFinish(emptyKind, emptySignals)
+						isQuietFinish(emptyKind, emptySignals) &&
+						(await config.hasPendingWake?.());
+					if (
+						requestStarted &&
+						!lastRetryErrorMessage &&
+						isQuietFinish(emptyKind, emptySignals) &&
+						(quietFinishAllowed || pendingWake)
 					) {
 						yield* finishRequest();
-						yield { type: "done" };
+						if (config.signal.aborted) {
+							yield { type: "error", message: "Aborted" };
+							return;
+						}
+						yield pendingWake ? { type: "done", reason: "reasoning_only_idle" } : { type: "done" };
 						return;
 					}
 					const emptyEvidence = emptyResponseEvidence(emptySignals);
@@ -7473,7 +7545,7 @@ async function* agentLoopInMetadataSnapshot(
 
 					// Keep the ordinary cleanup above, but do not retry or compact a model
 					// that has nothing to say while waiting for a background result / Send.
-					if (await config.shouldIdleOnReasoningOnly?.()) {
+					if (await config.hasPendingWake?.()) {
 						if (config.signal.aborted) {
 							yield { type: "error", message: "Aborted" };
 							return;
@@ -7758,7 +7830,7 @@ async function* agentLoopInMetadataSnapshot(
 				guidanceSignal?.aborted &&
 				(toolUses.length === 0 || config.urgentGuidanceSignal?.aborted === true)
 			) {
-				observeInputStopForTurn();
+				await observeInputStopForTurn();
 				yield* drainStartedEarlyToolResults();
 				if (config.signal.aborted) {
 					yield { type: "error", message: "Aborted" };
@@ -7883,7 +7955,7 @@ async function* agentLoopInMetadataSnapshot(
 						yield* drainEarlyToolResultsAfterAbort();
 						if (config.signal.aborted) yield { type: "error", message: "Aborted" };
 						else {
-							observeInputStopForTurn();
+							await observeInputStopForTurn();
 							yield { type: "turn_complete", turnIndex };
 						}
 						return;
@@ -7978,7 +8050,7 @@ async function* agentLoopInMetadataSnapshot(
 							yield* drainEarlyToolResultsAfterAbort();
 							if (config.signal.aborted) yield { type: "error", message: "Aborted" };
 							else {
-								observeInputStopForTurn();
+								await observeInputStopForTurn();
 								yield { type: "turn_complete", turnIndex };
 							}
 							return;
@@ -8032,7 +8104,7 @@ async function* agentLoopInMetadataSnapshot(
 				// stop is observed, never start another tool: only await promises that were
 				// already registered in earlyExecMap and mark every other remaining call skipped.
 				// Queued user input is not a host stop; it waits for the step boundary below.
-				if (observeSoftStopForTurn()) {
+				if (await observeSoftStopForTurn()) {
 					const skippedOutput = getToolMessage("skippedForPassEnd", locale);
 					let fatalOutput: string | undefined;
 					for (const remainingTool of toolUses.slice(toolIndex)) {
@@ -8061,7 +8133,7 @@ async function* agentLoopInMetadataSnapshot(
 							yield* drainEarlyToolResultsAfterAbort();
 							if (config.signal.aborted) yield { type: "error", message: "Aborted" };
 							else {
-								observeInputStopForTurn();
+								await observeInputStopForTurn();
 								yield { type: "turn_complete", turnIndex };
 							}
 							return;
@@ -8120,8 +8192,8 @@ async function* agentLoopInMetadataSnapshot(
 
 			// Every call of the step has run: queued user input takes the next turn. This also
 			// closes the race with feedback arriving while after-tools injections are drained.
-			const hostStop = observeSoftStopForTurn();
-			if (observeInputStopForTurn() || hostStop) {
+			const hostStop = await observeSoftStopForTurn();
+			if ((await observeInputStopForTurn()) || hostStop) {
 				yield { type: "turn_complete", turnIndex };
 				return;
 			}
@@ -8139,17 +8211,30 @@ async function* agentLoopInMetadataSnapshot(
 			quietFinishAllowed = !!config.bot || toolUses.some(handsOffWork);
 			turnIndex++;
 		} catch (error) {
+			if (isCheckpointStop(error)) {
+				acceptCheckpointStopDrain(config.signal, config.narratorId, error);
+				try {
+					if (drainCheckpointTools) yield* drainCheckpointTools();
+				} catch (cleanupError) {
+					error.cleanupFailure ??= cleanupError;
+				}
+				throw error;
+			}
 			activeRequestDump?.finish({ status: "error", error: extractErrorMessage(error) });
 			activeRequestDump = undefined;
 			throw error;
 		} finally {
-			activeRequestDump?.finish({
-				status: config.signal.aborted ? "cancelled" : "interrupted",
-				error: config.signal.aborted
-					? String(config.signal.reason ?? "Aborted")
-					: "Attempt exited before final response classification",
-			});
-			responseActivity.release();
+			try {
+				await pendingGuidanceYield;
+			} finally {
+				activeRequestDump?.finish({
+					status: config.signal.aborted ? "cancelled" : "interrupted",
+					error: config.signal.aborted
+						? String(config.signal.reason ?? "Aborted")
+						: "Attempt exited before final response classification",
+				});
+				responseActivity.release();
+			}
 		}
 	}
 

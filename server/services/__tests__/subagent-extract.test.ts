@@ -7,19 +7,30 @@
  * - source subagent is untouched and extraction is independent of source deletion
  * - ordinary fork still refuses subagent sources
  */
-import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { narratorMessageRefs, narratorMessages, narrators } from "../../db/schema";
+import * as reads from "../../db/worker-read";
+import { drainContextCharacterRefreshes } from "../../lib/context-characters";
+import * as pool from "../../lib/db-worker/pool";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
 import { compileDelegationPolicy, resolveRuntimePolicy } from "../agent-runtime/policy";
+import {
+	captureWorkerRejection,
+	captureWorkerRejectionThrower,
+	getNarratorWorkerTestDb,
+} from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
 const { extractSubagentToPrimary } = await import("../subagent-extract");
 const { narratorService } = await import("../narrator-service");
+const { backgroundOccupancyStore } = await import("../background-occupancy-store");
 
 const now = "2026-08-01T10:00:00.000Z";
 
@@ -100,12 +111,187 @@ function seedSourceMessage(id: string, narratorId: string, seq: number, text: st
 		.run(`ref-${id}`, narratorId, id, seq);
 }
 
-beforeEach(() => cleanDb(sqlite));
+async function drain() {
+	await drainContextCharacterRefreshes({ deadlineAt: Date.now() + 30_000 });
+	await backgroundOccupancyStore.drain();
+}
+beforeEach(async () => {
+	await drain();
+	cleanDb(sqlite);
+});
+afterEach(async () => {
+	mock.restore();
+	await drain();
+});
 
-afterAll(() => {
+afterAll(async () => {
+	await drain();
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
 	cleanDb(sqlite);
+	await fixture.close();
+});
+
+describe("extract metadata Worker isolation and observation guards", () => {
+	function interleave(match: (query: string) => boolean, mutate: () => void) {
+		const original = reads.readQuery;
+		let fired = false;
+		spyOn(reads, "readQuery").mockImplementation((async (query, options) => {
+			const result = await original(query as Parameters<typeof reads.readQuery>[0], options);
+			if (!fired && match(query.toSQL().sql)) {
+				fired = true;
+				mutate();
+			}
+			return result;
+		}) as typeof reads.readQuery);
+		return () => expect(fired).toBe(true);
+	}
+	async function conflict() {
+		expect(await captureWorkerRejection(extractSubagentToPrimary("sub"))).toMatchObject({
+			statusCode: 409,
+			code: "RUNTIME_READ_CONFLICT",
+			message: "Runtime state changed while reading",
+		});
+		expect(await db.select({ id: narrators.id }).from(narrators)).toHaveLength(2);
+	}
+	test.each([
+		"status",
+		"model",
+		"owner",
+		"workspace",
+	])("source %s changes conflict without creating a primary", async (field) => {
+		seedPrimary();
+		seedSubagent();
+		const checked = interleave(
+			(sql) => sql.includes("narrator_message_refs"),
+			() => {
+				db.update(narrators)
+					.set(
+						field === "status"
+							? { status: "archived" }
+							: field === "model"
+								? { model: "changed" }
+								: field === "owner"
+									? { ownerUserId: null }
+									: { cwd: "/changed" },
+					)
+					.where(eq(narrators.id, "sub"))
+					.run();
+			},
+		);
+		await conflict();
+		checked();
+	});
+	test("parent audience changes conflict", async () => {
+		seedPrimary();
+		seedSubagent();
+		const original = reads.readQueryFirst;
+		let fired = false;
+		spyOn(reads, "readQueryFirst").mockImplementation(async (query, options) => {
+			const result = await original(query, options);
+			if (!fired && query.toSQL().sql.startsWith('select "visibility", "write_audience"')) {
+				fired = true;
+				db.update(narrators).set({ visibility: "public" }).where(eq(narrators.id, "parent")).run();
+			}
+			return result;
+		});
+		await conflict();
+		expect(fired).toBe(true);
+	});
+	test("a ref appended after the Worker snapshot conflicts", async () => {
+		seedPrimary();
+		seedSubagent();
+		const checked = interleave(
+			(sql) => sql.includes("narrator_message_refs"),
+			() => seedSourceMessage("late", "sub", 0, "late"),
+		);
+		await conflict();
+		checked();
+	});
+	test("timestamp renewal does not conflict and empty history is supported", async () => {
+		seedPrimary();
+		seedSubagent();
+		const checked = interleave(
+			(sql) => sql.includes("narrator_message_refs"),
+			() => {
+				db.update(narrators).set({ updatedAt: "2099-01-01" }).where(eq(narrators.id, "sub")).run();
+			},
+		);
+		const created = await extractSubagentToPrimary("sub");
+		checked();
+		expect(created.status).toBe("idle");
+		expect(
+			await db
+				.select()
+				.from(narratorMessageRefs)
+				.where(eq(narratorMessageRefs.narratorId, created.id)),
+		).toEqual([]);
+	});
+	test("metadata reads require Workers, preserve caller budgets and bound history at the soft cap", async () => {
+		seedPrimary();
+		seedSubagent();
+		seedSourceMessage("one", "sub", 0, "first");
+		seedSourceMessage("two", "sub", 1, "second");
+		const { narratorContext } = await import("../narrator-context");
+		spyOn(narratorContext, "generateContextSummary").mockResolvedValue("bounded summary");
+		const original = reads.readQuery;
+		const optionsSeen: reads.ReadQueryOptions[] = [];
+		spyOn(reads, "readQuery").mockImplementation((async (query, options) => {
+			optionsSeen.push(options ?? {});
+			return original(query as Parameters<typeof reads.readQuery>[0], options);
+		}) as typeof reads.readQuery);
+		const signal = new AbortController().signal,
+			deadlineAt = Date.now() + 10_000;
+		const created = await narratorService.extractSubagentToPrimary("sub", {
+			maxFullMessages: 1,
+			signal,
+			deadlineAt,
+			timeoutMs: 5_000,
+		});
+		expect(created.inheritMode).toBe("compressed");
+		expect(
+			optionsSeen.some(
+				(options) =>
+					options.maxRows === 2 &&
+					options.executionPolicy === "worker-required" &&
+					options.signal === signal &&
+					options.deadlineAt === deadlineAt &&
+					options.timeoutMs === 5_000,
+			),
+		).toBe(true);
+	});
+	test("missing source is an explicit error", async () => {
+		expect(await captureWorkerRejection(extractSubagentToPrimary("missing"))).toMatchObject({
+			message: "Subagent not found",
+		});
+	});
+	test.each([
+		"unavailable",
+		"crashed",
+		"timed out",
+		"disabled",
+	])("Worker %s fails without a primary or local fallback", async (failure) => {
+		seedPrimary();
+		seedSubagent();
+		spyOn(pool, "runReadTask").mockRejectedValue(new Error(failure));
+		const local = spyOn(sqlite, "prepare");
+		expect(await captureWorkerRejection(extractSubagentToPrimary("sub"))).toMatchObject({
+			message: failure,
+		});
+		expect(local).not.toHaveBeenCalled();
+	});
+	test("cancellation and deadline failures remain failures", async () => {
+		seedPrimary();
+		seedSubagent();
+		const controller = new AbortController();
+		controller.abort();
+		expect(
+			await captureWorkerRejection(extractSubagentToPrimary("sub", { signal: controller.signal })),
+		).toMatchObject({ code: "DB_READ_ABORTED" });
+		expect(
+			await captureWorkerRejection(extractSubagentToPrimary("sub", { deadlineAt: Date.now() - 1 })),
+		).toMatchObject({ code: "DB_READ_TASK_TIMEOUT" });
+	});
 });
 
 describe("extractSubagentToPrimary", () => {
@@ -276,14 +462,14 @@ describe("extractSubagentToPrimary", () => {
 
 	test("rejects non-subagent and archived sources", async () => {
 		seedPrimary("parent");
-		await expect(extractSubagentToPrimary("parent")).rejects.toThrow(
+		await expect(await captureWorkerRejectionThrower(extractSubagentToPrimary("parent"))).toThrow(
 			"Only subagent narrators can be extracted",
 		);
 
 		seedSubagent("sub-archived", { status: "archived" });
-		await expect(extractSubagentToPrimary("sub-archived")).rejects.toThrow(
-			"Archived subagents cannot be extracted",
-		);
+		await expect(
+			await captureWorkerRejectionThrower(extractSubagentToPrimary("sub-archived")),
+		).toThrow("Archived subagents cannot be extracted");
 	});
 
 	test("compressed inheritMode writes a compact marker instead of full copies", async () => {
@@ -325,7 +511,9 @@ describe("extractSubagentToPrimary", () => {
 		seedPrimary();
 		seedSubagent("sub");
 		await expect(
-			narratorService.forkNarrator("sub", "m0", { inheritMode: "full" }),
-		).rejects.toThrow("Cannot fork from a subagent narrator");
+			await captureWorkerRejectionThrower(
+				narratorService.forkNarrator("sub", "m0", { inheritMode: "full" }),
+			),
+		).toThrow("Cannot fork from a subagent narrator");
 	});
 });

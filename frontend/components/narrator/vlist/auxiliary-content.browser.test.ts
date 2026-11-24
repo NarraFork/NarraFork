@@ -311,4 +311,23 @@ for (const width of [320, 390]) {
 		expect(value.cards[0]?.measured).toBeLessThan(80);
 		expect(value.cards[0]?.traceTail).toBeLessThanOrEqual(4);
 	});
+
+	test(`${width}px: a Watch result reads as a watch of its target, next to a real Bash result`, async () => {
+		const folded = await render({ scene: "watch", width, lod: 2 });
+		assertGeometry(folded);
+		const rows = folded.cards[0]?.traceRows ?? [];
+		expect(rows.map((row) => row.cardKind)).toEqual(["auxiliary-content", "auxiliary-content"]);
+		expect(rows[0]?.text).toContain("frontend-build");
+		expect(rows[1]?.text).toContain("实现服务端全量回源");
+		expect(rows[1]?.text).not.toContain("watch-agent-fix-login");
+		expect(rows[1]?.text).not.toContain("Bash");
+		await screenshot(`watch-L2-${width}`);
+		const bubble = await render({ scene: "watch", width, lod: 3, compactAuxiliaryContent: false });
+		assertGeometry(bubble);
+		const watchBubble = bubble.cards[1];
+		expect(watchBubble?.kind).toBe("injection-bubble");
+		expect(watchBubble?.text).toContain("Subagent is still running.");
+		expect(watchBubble?.text).not.toContain("Watch reached its deadline");
+		await screenshot(`watch-bubble-${width}`);
+	});
 }

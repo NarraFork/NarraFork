@@ -45,7 +45,7 @@ import {
 import { onPretextSessionChange, pretextSessionEpoch } from "./pretext-session-scope";
 import { createScopedMeasureElement } from "./registry";
 import { StreamingBlockCache } from "./streaming-block-cache";
-import { projectPendingEmptyReasoning, projectStreamingDocument } from "./streaming-handoff";
+import { projectPendingReasoning, projectStreamingDocument } from "./streaming-handoff";
 import { askInPassingBlock, syncAskInPassingMessage } from "./vlist-ask-in-passing-sync";
 import { trimClockNow, trimLoadedHead } from "./vlist-head-trim";
 import { appendLoadedMessage, upsertLoadedMessage } from "./vlist-message-append";
@@ -1367,7 +1367,7 @@ export class PretextLayoutCoordinator {
 		input: PretextDocumentInput,
 		buildOptions: PretextLayoutBuildOptions,
 	): readonly TreeMessage[] {
-		return projectPendingEmptyReasoning(
+		return projectPendingReasoning(
 			projectStreamingDocument(input.messages, this.streamingMessage),
 			buildOptions.keepEmptyReasoningLive === true,
 			buildOptions.isSubagent,

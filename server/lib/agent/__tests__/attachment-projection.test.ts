@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -95,6 +95,33 @@ test("current input and history share one local image locator without mutating s
 	expect(prepared.currentInput).toBe(text);
 	expect(JSON.stringify(source)).toBe(before);
 	expect(prepared.messages[0].contentJson?.[0]).toEqual(source.contentJson?.[0]);
+});
+
+test("history attachments use the caller's remaining budget after the observation threshold", async () => {
+	const clock = spyOn(performance, "now").mockReturnValueOnce(0).mockReturnValue(11_000);
+	const wall = spyOn(Date, "now").mockReturnValue(100_000);
+	try {
+		const prepared = await projectAttachmentLocations([message()], {
+			cwd,
+			narratorId: "fork",
+			deadline: 130_000,
+		});
+		expect(prepared.messages[0]?.contentText).toContain(join(cwd, ".narrafork", "attached"));
+		expect(readdirSync(join(cwd, ".narrafork", "attached"))).toHaveLength(1);
+	} finally {
+		clock.mockRestore();
+		wall.mockRestore();
+	}
+});
+
+test("expired caller budget defers a new attachment without inventing a locator", async () => {
+	const prepared = await projectAttachmentLocations([message()], {
+		cwd,
+		narratorId: "fork",
+		deadline: 0,
+	});
+	expect(prepared.messages[0]?.contentText).not.toContain(join(cwd, ".narrafork", "attached"));
+	expect(readdirSync(join(cwd, ".narrafork", "attached"))).toEqual([]);
 });
 
 test("fork retains upload owner and recreates missing copies in another worktree", async () => {

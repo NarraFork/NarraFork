@@ -298,12 +298,17 @@ describe("PluginEventGateway", () => {
 				pluginId: "plugin.first",
 				topics: ["narrafork.narrator.lifecycle"],
 			});
-			await expect(
-				gateway.subscribe({
+			let error: unknown;
+			try {
+				await gateway.subscribe({
 					pluginId: "plugin.second",
 					topics: ["narrafork.narrator.lifecycle"],
-				}),
-			).rejects.toThrow("SUBSCRIPTION_QUOTA_EXCEEDED");
+				});
+			} catch (caught) {
+				error = caught;
+			}
+			expect(error).toBeInstanceOf(Error);
+			expect(error).toMatchObject({ message: "SUBSCRIPTION_QUOTA_EXCEEDED" });
 			expect(gateway.getDiagnostics().at(-1)).toMatchObject({
 				code: "QUOTA_EXCEEDED",
 				pluginId: "plugin.second",

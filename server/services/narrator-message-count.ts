@@ -32,6 +32,7 @@
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessageRefs, narratorMessages, narrators } from "../db/schema";
+import { type ReadQueryOptions, readQuery, readQueryFirst } from "../db/worker-read";
 
 const exactRefCounts = new Map<string, { version: number; count: number }>();
 const EXACT_COUNT_CACHE_LIMIT = 256;
@@ -40,7 +41,9 @@ const EXACT_COUNT_CACHE_LIMIT = 256;
 export async function countNarratorMessageRefs(
 	narratorId: string,
 	messageVersion?: number,
+	options: Pick<ReadQueryOptions, "deadlineAt" | "signal"> = {},
 ): Promise<number> {
+	options.signal?.throwIfAborted();
 	const cached = exactRefCounts.get(narratorId);
 	if (messageVersion !== undefined && cached?.version === messageVersion) {
 		exactRefCounts.delete(narratorId);
@@ -49,15 +52,23 @@ export async function countNarratorMessageRefs(
 	}
 	// Count and version are observed in one statement; never seed a cache under
 	// a pre-await version or use the insert-only messageCount high-water mark.
-	const row = await db
-		.select({
-			version: narrators.messageVersion,
-			count: sql<number>`(SELECT count(*) FROM narrator_message_refs exact_refs
-			WHERE exact_refs.narrator_id = ${narratorId})`,
-		})
-		.from(narrators)
-		.where(eq(narrators.id, narratorId))
-		.get();
+	const row = await readQueryFirst(
+		db
+			.select({
+				version: narrators.messageVersion,
+				count: sql<number>`(SELECT count(*) FROM narrator_message_refs exact_refs
+				WHERE exact_refs.narrator_id = ${narratorId})`,
+			})
+			.from(narrators)
+			.where(eq(narrators.id, narratorId))
+			.limit(1),
+		{
+			...options,
+			diagnosticSource: "narrators.message-count.exact",
+			executionPolicy: "worker-required",
+			maxRows: 1,
+		},
+	);
 	if (row && messageVersion !== undefined && row.version === messageVersion) {
 		exactRefCounts.delete(narratorId);
 		exactRefCounts.set(narratorId, { version: row.version, count: row.count });
@@ -76,14 +87,22 @@ export async function countNarratorMessageRefs(
  */
 export async function countNarratorMessageRefsBatch(
 	narratorIds: readonly string[],
+	options: Pick<ReadQueryOptions, "signal" | "diagnosticSource"> = {},
 ): Promise<Map<string, number>> {
 	const counts = new Map<string, number>();
 	if (narratorIds.length === 0) return counts;
-	const rows = await db
-		.select({ narratorId: narratorMessageRefs.narratorId, count: sql<number>`count(*)` })
-		.from(narratorMessageRefs)
-		.where(inArray(narratorMessageRefs.narratorId, [...narratorIds]))
-		.groupBy(narratorMessageRefs.narratorId);
+	const rows = await readQuery(
+		db
+			.select({ narratorId: narratorMessageRefs.narratorId, count: sql<number>`count(*)` })
+			.from(narratorMessageRefs)
+			.where(inArray(narratorMessageRefs.narratorId, [...narratorIds]))
+			.groupBy(narratorMessageRefs.narratorId),
+		{
+			diagnosticSource: "narrators.message-count.batch",
+			...options,
+			maxRows: narratorIds.length,
+		},
+	);
 	for (const row of rows) counts.set(row.narratorId, row.count);
 	return counts;
 }

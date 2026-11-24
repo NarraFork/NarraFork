@@ -16,11 +16,13 @@ import type { ProviderAdapter } from "../../lib/agent/provider";
 import type { AgentConfig, ToolCallBinding } from "../../lib/agent/types";
 import { narraforkDir, saveSettings, settings } from "../../lib/settings";
 import { createExecutionTargetContext } from "../execution-policy/target-context";
+import { captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
-const sqlite = new Database(":memory:");
+const databaseDirectory = mkdtempSync(join(tmpdir(), "permission-rule-request-db-"));
+const sqlite = new Database(join(databaseDirectory, "test.sqlite"));
 const dialect = new SQLiteSyncDialect();
 const tableNames: string[] = [];
-// Build a test-only in-memory schema from the typed declarations. This worktree
+// Build a test-only schema from the typed declarations. This worktree
 // intentionally has no migration directory; never generate or migrate the real DB.
 for (const table of Object.values(schema)) {
 	let config: ReturnType<typeof getTableConfig>;
@@ -734,6 +736,7 @@ afterEach(() => {
 afterAll(() => {
 	mock.restore();
 	sqlite.close();
+	rmSync(databaseDirectory, { recursive: true, force: true });
 });
 
 async function waitForManual(id: string) {
@@ -1206,7 +1209,7 @@ describe("attempt-bound permission requests", () => {
 				reason: "Cancelled during live validation",
 			}),
 		).toBe(true);
-		await expect(consuming).rejects.toThrow();
+		expect(await captureWorkerRejectionThrower(consuming)).toThrow();
 		expect(count()).toBe(0);
 		expect(
 			db
@@ -1735,9 +1738,11 @@ describe("attempt-bound permission requests", () => {
 			});
 			expect(result.behavior).toBe("deny");
 			expect(count()).toBe(0);
-			await expect(
-				service.consumePermissionRuleRequest(identity, pause.input, identity.context),
-			).rejects.toThrow("approval receipt");
+			expect(
+				await captureWorkerRejectionThrower(
+					service.consumePermissionRuleRequest(identity, pause.input, identity.context),
+				),
+			).toThrow("approval receipt");
 			expect(pendingDangerReflections.has(identity.binding.toolCallId)).toBe(false);
 		});
 	test("expired receipts cannot apply and are audited as failures", async () => {
@@ -1754,9 +1759,11 @@ describe("attempt-bound permission requests", () => {
 				createdAt: new Date(Date.now() - service.PERMISSION_RULE_REQUEST_TTL_MS - 1).toISOString(),
 			})
 			.where(eq(schema.permissionRuleRequests.id, prepared.requestId));
-		await expect(
-			service.consumePermissionRuleRequest(identity, prepared.input, identity.context),
-		).rejects.toThrow("expired");
+		expect(
+			await captureWorkerRejectionThrower(
+				service.consumePermissionRuleRequest(identity, prepared.input, identity.context),
+			),
+		).toThrow("expired");
 		expect(count()).toBe(0);
 	});
 	test("approved allow rules never override catastrophe or protected git paths", async () => {
@@ -1945,9 +1952,11 @@ describe("attempt-bound permission requests", () => {
 				await permission.confirmDangerReflection(pause.requestId, "Needed for this task"),
 			).toBe(true);
 			expect(count()).toBe(level === "off" ? 0 : 1);
-			await expect(
-				service.consumePermissionRuleRequest(identity, pause.input, identity.context),
-			).rejects.toThrow("approval receipt");
+			expect(
+				await captureWorkerRejectionThrower(
+					service.consumePermissionRuleRequest(identity, pause.input, identity.context),
+				),
+			).toThrow("approval receipt");
 			expect(
 				await permission.completePermissionRuleRequestReflection(pause.requestId, {
 					completedNormally: true,
@@ -2015,9 +2024,11 @@ describe("attempt-bound permission requests", () => {
 				.update(schema.permissionRuleRequests)
 				.set(broken)
 				.where(eq(schema.permissionRuleRequests.id, prepared.requestId));
-			await expect(
-				service.consumePermissionRuleRequest(identity, prepared.input, identity.context),
-			).rejects.toThrow();
+			expect(
+				await captureWorkerRejectionThrower(
+					service.consumePermissionRuleRequest(identity, prepared.input, identity.context),
+				),
+			).toThrow();
 			expect(count()).toBe(1);
 		});
 	test("identical concurrent commits yield at most one inserted rule and terminal status", async () => {
@@ -2040,14 +2051,36 @@ describe("attempt-bound permission requests", () => {
 	test("same request id different proposal hash conflicts", async () => {
 		const identity = await seed();
 		await service.preparePermissionRuleRequest(identity, proposal, identity.context);
-		await expect(
-			service.preparePermissionRuleRequest(
-				identity,
-				{ ...proposal, pattern: "ls" },
+		expect(
+			await captureWorkerRejectionThrower(
+				service.preparePermissionRuleRequest(
+					identity,
+					{ ...proposal, pattern: "ls" },
+					identity.context,
+				),
+			),
+		).toThrow("different proposal");
+		expect(count()).toBe(0);
+	});
+	test("a concurrent application with another narrator cannot share a pending receipt", async () => {
+		const identity = await seed();
+		const prepared = await service.preparePermissionRuleRequest(
+			identity,
+			proposal,
+			identity.context,
+		);
+		service.recordPermissionRuleRequestDecision(prepared.requestId, "allow", "user", "human");
+		const results = await Promise.allSettled([
+			service.consumePermissionRuleRequest(identity, prepared.input, identity.context),
+			service.consumePermissionRuleRequest(
+				{ ...identity, narratorId: "another-narrator" },
+				prepared.input,
 				identity.context,
 			),
-		).rejects.toThrow("different proposal");
-		expect(count()).toBe(0);
+		]);
+		expect(results[0].status).toBe("fulfilled");
+		expect(results[1].status).toBe("rejected");
+		expect(count()).toBe(1);
 	});
 	test("fully identical enabled rule returns alreadyExists; different level/disabled rule conflicts", async () => {
 		const identity = await seed();
@@ -2077,9 +2110,11 @@ describe("attempt-bound permission requests", () => {
 			other.context,
 		);
 		service.recordPermissionRuleRequestDecision(next.requestId, "allow", "user", "human");
-		await expect(
-			service.consumePermissionRuleRequest(other, next.input, other.context),
-		).rejects.toThrow("conflicts");
+		expect(
+			await captureWorkerRejectionThrower(
+				service.consumePermissionRuleRequest(other, next.input, other.context),
+			),
+		).toThrow("conflicts");
 		expect(count()).toBe(2);
 	});
 	for (const change of [
@@ -2122,9 +2157,11 @@ describe("attempt-bound permission requests", () => {
 									: { defaultDeviceId: "another" },
 					)
 					.where(eq(schema.narrators.id, identity.narratorId));
-			await expect(
-				service.consumePermissionRuleRequest(identity, prepared.input, identity.context),
-			).rejects.toThrow("changed while waiting");
+			expect(
+				await captureWorkerRejectionThrower(
+					service.consumePermissionRuleRequest(identity, prepared.input, identity.context),
+				),
+			).toThrow("changed while waiting");
 			expect(count()).toBe(0);
 		});
 	test("insert failure rolls back terminal CAS and never leaves a rule", async () => {
@@ -2139,9 +2176,11 @@ describe("attempt-bound permission requests", () => {
 			"CREATE TRIGGER reject_rule_insert BEFORE INSERT ON narrator_whitelist_cmds BEGIN SELECT RAISE(ABORT,'write failed'); END",
 		);
 		try {
-			await expect(
-				service.consumePermissionRuleRequest(identity, prepared.input, identity.context),
-			).rejects.toThrow("write failed");
+			expect(
+				await captureWorkerRejectionThrower(
+					service.consumePermissionRuleRequest(identity, prepared.input, identity.context),
+				),
+			).toThrow("write failed");
 			expect(count()).toBe(0);
 			expect(
 				db
@@ -2216,13 +2255,15 @@ describe("attempt-bound permission requests", () => {
 			compileExecutionPolicy(await executionPolicyRepository.load(identity.narratorId), remote)
 				.commandWhitelist,
 		).toHaveLength(0);
-		await expect(
-			service.preparePermissionRuleRequest(
-				await call(identity.narratorId),
-				{ ...proposal, device: "remote" },
-				identity.context,
+		expect(
+			await captureWorkerRejectionThrower(
+				service.preparePermissionRuleRequest(
+					await call(identity.narratorId),
+					{ ...proposal, device: "remote" },
+					identity.context,
+				),
 			),
-		).rejects.toThrow("Device differs");
+		).toThrow("Device differs");
 	});
 	test("a narrator indexed into a project by its cwd enforces project directory and command denies in bypass", async () => {
 		await seedDenyProject();
@@ -2335,9 +2376,11 @@ describe("attempt-bound permission requests", () => {
 				.set(update)
 				.where(eq(schema.narrators.id, identity.narratorId));
 			await materializeLegacyDelegations([identity.narratorId]);
-			await expect(
-				service.preparePermissionRuleRequest(identity, proposal, identity.context),
-			).rejects.toThrow("ceilings");
+			expect(
+				await captureWorkerRejectionThrower(
+					service.preparePermissionRuleRequest(identity, proposal, identity.context),
+				),
+			).toThrow("ceilings");
 		}
 		expect(count()).toBe(0);
 	});

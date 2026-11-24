@@ -26,6 +26,7 @@
 import { and, eq, isNotNull } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessages } from "../db/schema";
+import { type ReadQueryOptions, readQueryFirst } from "../db/worker-read";
 import { logger } from "../lib/logger";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 
@@ -35,17 +36,24 @@ import { broadcastToNarrator } from "../websocket/narrator-ws";
  * Same single-row indexed lookup the stop-takeover route already performs: a
  * subagent's first user message carries its parent tool use id.
  */
-export async function resolveSpawningToolUseId(subagentId: string): Promise<string | undefined> {
+export async function resolveSpawningToolUseId(
+	subagentId: string,
+	options: Pick<ReadQueryOptions, "signal" | "deadlineAt" | "timeoutMs"> = {},
+): Promise<string | undefined> {
 	try {
-		const first = await db.query.narratorMessages.findFirst({
-			where: and(
-				eq(narratorMessages.narratorId, subagentId),
-				eq(narratorMessages.role, "user"),
-				isNotNull(narratorMessages.parentToolUseId),
-			),
-			columns: { parentToolUseId: true },
-			orderBy: narratorMessages.createdAt,
-		});
+		const first = await readQueryFirst(
+			db.query.narratorMessages.findMany({
+				limit: 1,
+				where: and(
+					eq(narratorMessages.narratorId, subagentId),
+					eq(narratorMessages.role, "user"),
+					isNotNull(narratorMessages.parentToolUseId),
+				),
+				columns: { parentToolUseId: true },
+				orderBy: narratorMessages.createdAt,
+			}),
+			{ ...options, executionPolicy: "worker-required", maxRows: 1 },
+		);
 		return first?.parentToolUseId ?? undefined;
 	} catch {
 		return undefined;

@@ -6,7 +6,7 @@ import {
 } from "../../scripts/lib/binary-metadata";
 import type { GhRunner } from "../../scripts/lib/github-release";
 import { UpdateServerMirrorHttp } from "../../scripts/lib/update-server-bridge-http";
-import type { MirrorSnapshotV2 } from "../../shared/independent-update-mirror";
+import type { MirrorSnapshot } from "../../shared/independent-update-mirror";
 import { mergeUpdateIndex, parseUpdateIndexRelease } from "../../shared/update-index";
 export const repository = "fixture-owner/fork-product";
 export const commit = "a".repeat(40);
@@ -142,7 +142,7 @@ export function mirrorFixture(withPatch = true, withNotes = true, version = "1.2
 		throw new Error(`Unexpected GitHub fixture endpoint ${path}`);
 	};
 	const stored = new Map<string, Buffer>();
-	let committed: MirrorSnapshotV2 | undefined;
+	let committed: MirrorSnapshot | undefined;
 	const httpCalls: { path: string; method: string; headers: Headers }[] = [];
 	let failPath = "";
 	let snapshotConflicts = 0;

@@ -285,6 +285,7 @@ export function ChatMessageList({
 			<PretextExactMessageListLazy
 				narratorId={roomId}
 				dataSource={dataSource}
+				enableNarratorErrorActions={false}
 				isActive={false}
 				rowHandlers={{ customMessageActions }}
 				selectedMessageIds={selectedIds}

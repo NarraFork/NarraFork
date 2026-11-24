@@ -1,6 +1,7 @@
 import {
 	and,
 	asc,
+	type Column,
 	eq,
 	getTableColumns,
 	gt,
@@ -19,9 +20,12 @@ import {
 	narratorToolCalls,
 	narratorToolContinuations,
 } from "../db/schema";
+import { type ReadQueryOptions, readQuery, readQueryFirst } from "../db/worker-read";
 import { ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { getInstanceMaintenanceAuthority } from "../lib/instance-lock";
+import type { RuntimeTx } from "./agent-runtime/mailbox-types";
+import { RuntimeReadConflictError } from "./agent-runtime/read-conflict";
 import { runAtomicWrite } from "./agent-runtime/runtime-write";
 import { contentJsonSql, storedBodyBytesSql, toolBlockOrdinalSql } from "./narrator-body-reads";
 import {
@@ -31,6 +35,13 @@ import {
 	hasReservedRecoverySourceEpoch,
 	isRecoveryDiscoveryActive,
 } from "./recovery-handoff";
+import {
+	assertRestartRecoveryObservation,
+	type RestartRecoveryObservation,
+	type RestartTool,
+} from "./recovery-observation";
+
+type ContinuationReadOptions = Pick<ReadQueryOptions, "signal" | "deadlineAt" | "timeoutMs">;
 
 export type EpochScope = string | readonly string[];
 
@@ -40,6 +51,7 @@ export interface ColdContinuationTakeoverEvidence {
 	sourceEpoch: string;
 	executionAttempt: number;
 	authorization: ColdContinuationAuthorization;
+	observed?: ToolContinuationRecord;
 }
 
 const coldRecoveryPasses = new WeakMap<
@@ -102,6 +114,9 @@ const ordinaryColdPasses = new WeakMap<
 		narratorId: string;
 		executionAttempt: number;
 		updatedAt: string;
+		observed?: ToolContinuationRecord;
+		state: string;
+		claimToken: string | null;
 		expiresAt: number;
 	}
 >();
@@ -122,30 +137,64 @@ function ordinaryColdSource(rootEpoch: string) {
 }
 
 /** Only the fresh ordinary classification authorizes this one record, not its old manifest. */
-export async function beginOrdinaryColdAdoptionPass(input: {
-	rootEpoch: string;
-	toolCallId: string;
-}) {
+export async function beginOrdinaryColdAdoptionPass(
+	input: {
+		rootEpoch: string;
+		toolCallId: string;
+		observation?: { continuation: ToolContinuationRecord; tool: RestartTool };
+	},
+	options: ContinuationReadOptions = {},
+) {
 	ordinaryColdSource(input.rootEpoch);
-	const receipt = await db
-		.select({
-			recordId: narratorToolContinuations.id,
-			sourceEpoch: narratorToolContinuations.updateEpoch,
-			narratorId: narratorToolContinuations.narratorId,
-			executionAttempt: narratorToolCalls.executionAttempt,
-			updatedAt: narratorToolContinuations.updatedAt,
-		})
-		.from(narratorToolContinuations)
-		.innerJoin(narratorToolCalls, eq(narratorToolCalls.id, narratorToolContinuations.toolCallId))
-		.where(eq(narratorToolContinuations.toolCallId, input.toolCallId))
-		.get();
+	if (
+		input.observation &&
+		(input.observation.continuation.toolCallId !== input.toolCallId ||
+			input.observation.tool.id !== input.toolCallId)
+	)
+		throw new ValidationError("Cold adoption observation has a different tool identity");
+	const receipt = input.observation
+		? {
+				recordId: input.observation.continuation.id,
+				sourceEpoch: input.observation.continuation.updateEpoch,
+				narratorId: input.observation.continuation.narratorId,
+				executionAttempt: input.observation.tool.executionAttempt,
+				updatedAt: input.observation.continuation.updatedAt,
+				state: input.observation.continuation.state,
+				claimToken: input.observation.continuation.claimToken,
+			}
+		: await readQueryFirst(
+				db
+					.select({
+						recordId: narratorToolContinuations.id,
+						sourceEpoch: narratorToolContinuations.updateEpoch,
+						narratorId: narratorToolContinuations.narratorId,
+						executionAttempt: narratorToolCalls.executionAttempt,
+						updatedAt: narratorToolContinuations.updatedAt,
+						state: narratorToolContinuations.state,
+						claimToken: narratorToolContinuations.claimToken,
+					})
+					.from(narratorToolContinuations)
+					.innerJoin(
+						narratorToolCalls,
+						eq(narratorToolCalls.id, narratorToolContinuations.toolCallId),
+					)
+					.where(eq(narratorToolContinuations.toolCallId, input.toolCallId))
+					.limit(1),
+				{ ...options, executionPolicy: "worker-required", maxRows: 1 },
+			);
 	if (!receipt || hasReservedRecoverySourceEpoch(receipt.sourceEpoch))
 		throw new ValidationError(
 			"Ordinary cold adoption requires an actual non-reserved execution receipt",
 		);
 	ordinaryColdSource(input.rootEpoch);
 	const authorization = Object.freeze({}) as OrdinaryColdAdoptionAuthorization;
-	ordinaryColdPasses.set(authorization, { ...input, ...receipt, expiresAt: Date.now() + 300_000 });
+	ordinaryColdPasses.set(authorization, {
+		rootEpoch: input.rootEpoch,
+		toolCallId: input.toolCallId,
+		...receipt,
+		observed: input.observation?.continuation,
+		expiresAt: Date.now() + 300_000,
+	});
 	return {
 		authorization,
 		close: () => {
@@ -171,6 +220,7 @@ export type ToolContinuationRecoveryPhase =
 	| "owner_continuation_started";
 
 export interface PutToolContinuationInput {
+	recoveryObservation?: RestartRecoveryObservation;
 	toolCallId: string;
 	narratorId: string;
 	updateEpoch: string;
@@ -274,6 +324,22 @@ const MAX_RECOVERY_BYTES = 16 * 1024 * 1024;
 const METADATA_PAGE_SIZE = 100;
 const MAX_BOUNDED_READ_ATTEMPTS = 3;
 const payloadBytes = sql<number>`coalesce(length(cast(${narratorToolContinuations.payloadJson} as blob)), 0)`;
+const observedPayloads = new WeakMap<ToolContinuationRecord, string | null>();
+const continuationReadColumns = {
+	...getTableColumns(narratorToolContinuations),
+	payloadJson: sql<string | null>`${narratorToolContinuations.payloadJson}`,
+};
+
+function decodeContinuationRow(
+	row: Omit<ToolContinuationRecord, "payloadJson"> & { payloadJson: string | null },
+): ToolContinuationRecord {
+	const record = {
+		...row,
+		payloadJson: row.payloadJson === null ? null : JSON.parse(row.payloadJson),
+	};
+	observedPayloads.set(record, row.payloadJson);
+	return record;
+}
 const toolInputBytes = sql<number>`coalesce(length(cast(${narratorToolCalls.inputJson} as blob)), 0)`;
 /** Stored size of the call's message body (`body_bytes` for a block-format one). */
 const messageContentBytes = () => sql<number>`coalesce(${storedBodyBytesSql()}, 0)`;
@@ -357,15 +423,113 @@ function normalizePayload(
 
 async function withExecutionReceipt(
 	input: PutToolContinuationInput,
-): Promise<PutToolContinuationInput> {
-	const tool = await db
-		.select({ executionAttempt: narratorToolCalls.executionAttempt })
+	options: ContinuationReadOptions = {},
+): Promise<{ input: PutToolContinuationInput; attempt: number | null }> {
+	if (
+		input.recoveryObservation &&
+		(input.recoveryObservation.tool?.id !== input.toolCallId ||
+			input.recoveryObservation.tool.narratorId !== input.narratorId)
+	)
+		throw new ValidationError("Recovery observation has a different tool identity");
+	const tool =
+		input.recoveryObservation?.tool ??
+		(await readQueryFirst(
+			db
+				.select({ executionAttempt: narratorToolCalls.executionAttempt })
+				.from(narratorToolCalls)
+				.where(eq(narratorToolCalls.id, input.toolCallId))
+				.limit(1),
+			{ ...options, executionPolicy: "worker-required", maxRows: 1 },
+		));
+	return {
+		input: tool
+			? { ...input, payloadJson: { ...input.payloadJson, executionAttempt: tool.executionAttempt } }
+			: input,
+		attempt: tool?.executionAttempt ?? null,
+	};
+}
+
+function assertExecutionReceipt(tx: RuntimeTx, toolCallId: string, attempt: number | null): void {
+	const current = tx
+		.select({ attempt: narratorToolCalls.executionAttempt })
 		.from(narratorToolCalls)
-		.where(eq(narratorToolCalls.id, input.toolCallId))
+		.where(eq(narratorToolCalls.id, toolCallId))
 		.get();
-	return tool
-		? { ...input, payloadJson: { ...input.payloadJson, executionAttempt: tool.executionAttempt } }
-		: input;
+	if ((current?.attempt ?? null) !== attempt) throw new RuntimeReadConflictError();
+}
+
+function assertObservedContinuation(
+	tx: RuntimeTx,
+	toolCallId: string,
+	observed: ToolContinuationRecord | null,
+): void {
+	const row = narratorToolContinuations;
+	const rawPayload = observed
+		? observedPayloads.has(observed)
+			? (observedPayloads.get(observed) ?? null)
+			: observed.payloadJson === null
+				? null
+				: JSON.stringify(observed.payloadJson)
+		: null;
+	const nullable = <T>(column: Column, value: T | null) =>
+		value === null ? isNull(column) : eq(column, value);
+	const current = tx
+		.select({ id: row.id })
+		.from(row)
+		.where(
+			and(
+				eq(row.toolCallId, toolCallId),
+				observed
+					? and(
+							eq(row.id, observed.id),
+							eq(row.narratorId, observed.narratorId),
+							eq(row.updateEpoch, observed.updateEpoch),
+							eq(row.kind, observed.kind),
+							eq(row.state, observed.state),
+							eq(row.createdAt, observed.createdAt),
+							nullable(row.claimToken, observed.claimToken),
+							nullable(row.claimedAt, observed.claimedAt),
+							nullable(row.completedAt, observed.completedAt),
+							nullable(row.errorMessage, observed.errorMessage),
+							nullable(row.payloadJson, rawPayload === null ? null : sql`${rawPayload}`),
+						)
+					: undefined,
+			),
+		)
+		.limit(1)
+		.get();
+	if (observed ? !current : current) throw new RuntimeReadConflictError();
+}
+
+function writeObservedContinuations<T>(
+	rows: ToolContinuationRecord[],
+	write: (tx: RuntimeTx) => T,
+): T {
+	return runAtomicWrite(db, "continuation.observedWrite", (tx) => {
+		for (const row of rows) assertObservedContinuation(tx, row.toolCallId, row);
+		return write(tx);
+	});
+}
+
+function assertMessageContinuationScope(
+	tx: RuntimeTx,
+	messageId: string,
+	scope: EpochScope,
+	rows: ToolContinuationRecord[],
+): void {
+	const current = tx
+		.select({ id: narratorToolContinuations.id })
+		.from(narratorToolContinuations)
+		.innerJoin(narratorToolCalls, eq(narratorToolCalls.id, narratorToolContinuations.toolCallId))
+		.where(and(epochCondition(scope), eq(narratorToolCalls.messageId, messageId)))
+		.orderBy(asc(narratorToolContinuations.id))
+		.limit(MAX_ROWS_PER_EPOCH + 1)
+		.all();
+	if (
+		JSON.stringify(current.map((row) => row.id)) !==
+		JSON.stringify(rows.map((row) => row.id).sort())
+	)
+		throw new RuntimeReadConflictError();
 }
 
 function normalizePutInput(input: PutToolContinuationInput, timestamp: string) {
@@ -479,24 +643,28 @@ async function retryBoundedContinuationRead<T>(read: () => Promise<T>): Promise<
 async function readBoundedContinuations(
 	scope: EpochScope,
 	filter?: SQL,
+	options: ContinuationReadOptions = {},
 ): Promise<ToolContinuationRecord[]> {
 	return retryBoundedContinuationRead(async () => {
 		const metadata: { id: string; bytes: number }[] = [];
 		let cursor: string | undefined;
 		let totalBytes = 0;
 		while (true) {
-			const page = await db
-				.select({ id: narratorToolContinuations.id, bytes: payloadBytes })
-				.from(narratorToolContinuations)
-				.where(
-					and(
-						epochCondition(scope),
-						filter,
-						cursor ? gt(narratorToolContinuations.id, cursor) : undefined,
-					),
-				)
-				.orderBy(asc(narratorToolContinuations.id))
-				.limit(METADATA_PAGE_SIZE + 1);
+			const page = await readQuery(
+				db
+					.select({ id: narratorToolContinuations.id, bytes: payloadBytes })
+					.from(narratorToolContinuations)
+					.where(
+						and(
+							epochCondition(scope),
+							filter,
+							cursor ? gt(narratorToolContinuations.id, cursor) : undefined,
+						),
+					)
+					.orderBy(asc(narratorToolContinuations.id))
+					.limit(METADATA_PAGE_SIZE + 1),
+				{ ...options, executionPolicy: "worker-required", maxRows: METADATA_PAGE_SIZE + 1 },
+			);
 			assertEpochRowLimit([...metadata, ...page], scope);
 			for (const row of page.slice(0, METADATA_PAGE_SIZE)) {
 				totalBytes += row.bytes;
@@ -511,22 +679,26 @@ async function readBoundedContinuations(
 		const records: ToolContinuationRecord[] = [];
 		for (let offset = 0; offset < metadata.length; offset += METADATA_PAGE_SIZE) {
 			const page = metadata.slice(offset, offset + METADATA_PAGE_SIZE);
-			const rows = await db
-				.select()
-				.from(narratorToolContinuations)
-				.where(
-					and(
-						epochCondition(scope),
-						filter,
-						or(
-							...page.map((row) =>
-								and(eq(narratorToolContinuations.id, row.id), lte(payloadBytes, row.bytes)),
+			const rows = await readQuery(
+				db
+					.select(continuationReadColumns)
+					.from(narratorToolContinuations)
+					.where(
+						and(
+							epochCondition(scope),
+							filter,
+							or(
+								...page.map((row) =>
+									and(eq(narratorToolContinuations.id, row.id), lte(payloadBytes, row.bytes)),
+								),
 							),
 						),
-					),
-				);
+					)
+					.limit(METADATA_PAGE_SIZE),
+				{ ...options, executionPolicy: "worker-required", maxRows: METADATA_PAGE_SIZE },
+			);
 			if (rows.length !== page.length) throw new ContinuationScopeChangedError();
-			records.push(...rows);
+			records.push(...rows.map(decodeContinuationRow));
 			await new Promise<void>((resolve) => setTimeout(resolve, 0));
 		}
 		return records.sort(
@@ -538,6 +710,7 @@ async function readBoundedContinuations(
 async function listMessageContinuations(
 	messageId: string,
 	updateEpoch: EpochScope,
+	options: ContinuationReadOptions = {},
 ): Promise<ToolContinuationRecord[]> {
 	return readBoundedContinuations(
 		updateEpoch,
@@ -548,6 +721,7 @@ async function listMessageContinuations(
 				.from(narratorToolCalls)
 				.where(eq(narratorToolCalls.messageId, messageId)),
 		),
+		options,
 	);
 }
 
@@ -574,6 +748,9 @@ export const toolContinuationService = {
 		const timestamp = isoNow();
 		const normalized = normalizePutInput(input, timestamp);
 		return runAtomicWrite(db, "tool-continuation.ordinaryColdAdoption", (tx) => {
+			if (input.recoveryObservation)
+				assertRestartRecoveryObservation(tx, input.recoveryObservation);
+			if (pass.observed) assertObservedContinuation(tx, input.toolCallId, pass.observed);
 			const source = ordinaryColdSource(pass.rootEpoch);
 			const existing = tx
 				.select()
@@ -633,11 +810,20 @@ export const toolContinuationService = {
 			if (
 				!existing ||
 				!tool ||
+				(!pass.observed && existing.updatedAt !== pass.updatedAt) ||
+				existing.state !== pass.state ||
+				existing.claimToken !== pass.claimToken ||
+				tool.executionAttempt !== pass.executionAttempt
+			)
+				throw new RuntimeReadConflictError();
+			if (
+				!existing ||
+				!tool ||
 				!owner ||
 				existing.toolCallId !== input.toolCallId ||
 				existing.updateEpoch !== pass.sourceEpoch ||
 				existing.narratorId !== input.narratorId ||
-				existing.updatedAt !== pass.updatedAt ||
+				(!pass.observed && existing.updatedAt !== pass.updatedAt) ||
 				existing.state === "cancelled" ||
 				isToolContinuationOwnerMounted(existing) ||
 				severed(owner) ||
@@ -747,7 +933,7 @@ export const toolContinuationService = {
 						and(
 							eq(narratorToolContinuations.id, existing.id),
 							eq(narratorToolContinuations.updateEpoch, pass.sourceEpoch),
-							eq(narratorToolContinuations.updatedAt, pass.updatedAt),
+							pass.observed ? undefined : eq(narratorToolContinuations.updatedAt, pass.updatedAt),
 						),
 					)
 					.returning()
@@ -756,13 +942,84 @@ export const toolContinuationService = {
 			return adopted;
 		});
 	},
-	async getByToolCallId(toolCallId: string): Promise<ToolContinuationRecord | null> {
-		const row = await db
-			.select()
-			.from(narratorToolContinuations)
-			.where(eq(narratorToolContinuations.toolCallId, toolCallId))
-			.get();
-		return row ?? null;
+	async getByToolCallId(
+		toolCallId: string,
+		options: ContinuationReadOptions = {},
+	): Promise<ToolContinuationRecord | null> {
+		const size = await readQueryFirst(
+			db
+				.select({ bytes: payloadBytes })
+				.from(narratorToolContinuations)
+				.where(eq(narratorToolContinuations.toolCallId, toolCallId))
+				.limit(1),
+			{ ...options, executionPolicy: "worker-required", maxRows: 1 },
+		);
+		if (!size) return null;
+		if (size.bytes > MAX_PAYLOAD_BYTES)
+			throw new ValidationError("Continuation recovery payload budget exceeded");
+		const row = await readQueryFirst(
+			db
+				.select(continuationReadColumns)
+				.from(narratorToolContinuations)
+				.where(
+					and(
+						eq(narratorToolContinuations.toolCallId, toolCallId),
+						lte(payloadBytes, MAX_PAYLOAD_BYTES),
+					),
+				)
+				.limit(1),
+			{ ...options, executionPolicy: "worker-required", maxRows: 1 },
+		);
+		if (!row) throw new RuntimeReadConflictError();
+		return decodeContinuationRow(row);
+	},
+
+	async getByToolCallIds(toolCallIds: string[], options: ContinuationReadOptions = {}) {
+		const ids = [...new Set(toolCallIds)];
+		if (ids.length > MAX_ROWS_PER_EPOCH)
+			throw new ValidationError("Too many continuation identities");
+		const records: ToolContinuationRecord[] = [];
+		let totalBytes = 0;
+		for (let start = 0; start < ids.length; start += METADATA_PAGE_SIZE) {
+			const where = inArray(
+				narratorToolContinuations.toolCallId,
+				ids.slice(start, start + METADATA_PAGE_SIZE),
+			);
+			const metadata = await readQuery(
+				db
+					.select({ id: narratorToolContinuations.id, bytes: payloadBytes })
+					.from(narratorToolContinuations)
+					.where(where)
+					.limit(METADATA_PAGE_SIZE),
+				{ ...options, executionPolicy: "worker-required", maxRows: METADATA_PAGE_SIZE },
+			);
+			for (const row of metadata) {
+				totalBytes += row.bytes;
+				if (row.bytes > MAX_PAYLOAD_BYTES || totalBytes > MAX_RECOVERY_BYTES)
+					throw new ValidationError("Continuation recovery payload budget exceeded");
+			}
+			if (!metadata.length) continue;
+			const rows = await readQuery(
+				db
+					.select(continuationReadColumns)
+					.from(narratorToolContinuations)
+					.where(
+						and(
+							where,
+							or(
+								...metadata.map((row) =>
+									and(eq(narratorToolContinuations.id, row.id), lte(payloadBytes, row.bytes)),
+								),
+							),
+						),
+					)
+					.limit(METADATA_PAGE_SIZE),
+				{ ...options, executionPolicy: "worker-required", maxRows: METADATA_PAGE_SIZE },
+			);
+			if (rows.length !== metadata.length) throw new RuntimeReadConflictError();
+			records.push(...rows.map(decodeContinuationRow));
+		}
+		return records;
 	},
 
 	async getToolCallResult(toolCallId: string): Promise<ToolContinuationToolCallResult | null> {
@@ -780,51 +1037,71 @@ export const toolContinuationService = {
 		return row ?? null;
 	},
 
-	async create(input: PutToolContinuationInput): Promise<ToolContinuationRecord> {
-		input = await withExecutionReceipt(input);
+	async create(
+		input: PutToolContinuationInput,
+		options: ContinuationReadOptions = {},
+	): Promise<ToolContinuationRecord> {
+		const receipt = await withExecutionReceipt(input, options);
+		input = receipt.input;
 		const timestamp = isoNow();
-		const [created] = await db
-			.insert(narratorToolContinuations)
-			.values(normalizePutInput(input, timestamp))
-			.returning();
+		const created = runAtomicWrite(db, "continuation.create", (tx) => {
+			assertExecutionReceipt(tx, input.toolCallId, receipt.attempt);
+			return tx
+				.insert(narratorToolContinuations)
+				.values(normalizePutInput(input, timestamp))
+				.returning()
+				.get();
+		});
 		if (!created) throw new Error("Failed to create tool continuation");
 		return created;
 	},
 
-	async upsert(input: PutToolContinuationInput): Promise<ToolContinuationRecord> {
-		input = await withExecutionReceipt(input);
+	async upsert(
+		input: PutToolContinuationInput,
+		observed?: ToolContinuationRecord | null,
+		options: ContinuationReadOptions = {},
+	): Promise<ToolContinuationRecord> {
+		const receipt = await withExecutionReceipt(input, options);
+		input = receipt.input;
 		const timestamp = isoNow();
 		const row = normalizePutInput(input, timestamp);
-		const [upserted] = await db
-			.insert(narratorToolContinuations)
-			.values(row)
-			.onConflictDoUpdate({
-				target: narratorToolContinuations.toolCallId,
-				set: {
-					narratorId: row.narratorId,
-					updateEpoch: row.updateEpoch,
-					kind: row.kind,
-					state: row.state,
-					payloadJson: row.payloadJson,
-					deadlineAt: row.deadlineAt,
-					claimToken: null,
-					claimedAt: null,
-					errorMessage: row.errorMessage,
-					completedAt: row.completedAt,
-					updatedAt: timestamp,
-				},
-				setWhere: and(
-					eq(narratorToolContinuations.updateEpoch, input.updateEpoch),
-					eq(narratorToolContinuations.narratorId, input.narratorId),
-					isNull(narratorToolContinuations.claimToken),
-					inArray(narratorToolContinuations.state, CLAIMABLE_STATES),
-					sql`json_extract(${narratorToolContinuations.payloadJson}, '$.recoveryPhase') IS NULL`,
-				),
-			})
-			.returning();
+		const upserted = runAtomicWrite(db, "continuation.upsert", (tx) => {
+			if (input.recoveryObservation)
+				assertRestartRecoveryObservation(tx, input.recoveryObservation);
+			assertExecutionReceipt(tx, input.toolCallId, receipt.attempt);
+			if (observed !== undefined) assertObservedContinuation(tx, input.toolCallId, observed);
+			return tx
+				.insert(narratorToolContinuations)
+				.values(row)
+				.onConflictDoUpdate({
+					target: narratorToolContinuations.toolCallId,
+					set: {
+						narratorId: row.narratorId,
+						updateEpoch: row.updateEpoch,
+						kind: row.kind,
+						state: row.state,
+						payloadJson: row.payloadJson,
+						deadlineAt: row.deadlineAt,
+						claimToken: null,
+						claimedAt: null,
+						errorMessage: row.errorMessage,
+						completedAt: row.completedAt,
+						updatedAt: timestamp,
+					},
+					setWhere: and(
+						eq(narratorToolContinuations.updateEpoch, input.updateEpoch),
+						eq(narratorToolContinuations.narratorId, input.narratorId),
+						isNull(narratorToolContinuations.claimToken),
+						inArray(narratorToolContinuations.state, CLAIMABLE_STATES),
+						sql`json_extract(${narratorToolContinuations.payloadJson}, '$.recoveryPhase') IS NULL`,
+					),
+				})
+				.returning()
+				.get();
+		});
 		if (upserted) return upserted;
 
-		const existing = await this.getByToolCallId(input.toolCallId);
+		const existing = await this.getByToolCallId(input.toolCallId, options);
 		if (
 			existing?.state === "resuming" &&
 			(existing.deadlineAt === null || existing.deadlineAt > timestamp)
@@ -844,10 +1121,13 @@ export const toolContinuationService = {
 	},
 
 	/** Preserve ticket-authorized carryover verbatim, including its execution and delivery owner. */
-	async checkpoint(input: PutToolContinuationInput): Promise<ToolContinuationRecord> {
+	async checkpoint(
+		input: PutToolContinuationInput,
+		options: ContinuationReadOptions = {},
+	): Promise<ToolContinuationRecord> {
 		// This snapshot only permits a read-only carryover return, never a write after release.
 		const authorizedSources = getReservedRecoverySourceEpochs(input.updateEpoch);
-		const existing = await this.getByToolCallId(input.toolCallId);
+		const existing = await this.getByToolCallId(input.toolCallId, options);
 		if (existing && assertCarryover(existing, input, authorizedSources)) return existing;
 		if (
 			existing?.state === "resuming" ||
@@ -855,7 +1135,7 @@ export const toolContinuationService = {
 			(existing && hasPersistedToolContinuationResult(existing))
 		)
 			return existing;
-		return this.upsert(input);
+		return this.upsert(input, existing, options);
 	},
 
 	/** Never callable with a hot handoff ticket. The durable execution receipt wins over the manifest. */
@@ -882,6 +1162,9 @@ export const toolContinuationService = {
 		const timestamp = isoNow();
 		const normalized = normalizePutInput(input, timestamp);
 		return runAtomicWrite(db, "tool-continuation.controlledColdTakeover", (tx) => {
+			if (input.recoveryObservation)
+				assertRestartRecoveryObservation(tx, input.recoveryObservation);
+			if (evidence.observed) assertObservedContinuation(tx, input.toolCallId, evidence.observed);
 			const tool = tx
 				.select({
 					narratorId: narratorToolCalls.narratorId,
@@ -976,6 +1259,9 @@ export const toolContinuationService = {
 			throw new ValidationError("Cold Agent reattachment requires an Agent continuation");
 		const timestamp = isoNow();
 		return runAtomicWrite(db, "tool-continuation.controlledColdReattachAgent", (tx) => {
+			if (input.recoveryObservation)
+				assertRestartRecoveryObservation(tx, input.recoveryObservation);
+			if (evidence.observed) assertObservedContinuation(tx, input.toolCallId, evidence.observed);
 			const tool = tx
 				.select({
 					narratorId: narratorToolCalls.narratorId,
@@ -1064,12 +1350,14 @@ export const toolContinuationService = {
 
 	async checkpointSendAwait(
 		input: CheckpointSendAwaitInput,
+		observed?: ToolContinuationRecord,
 	): Promise<ToolContinuationRecord | null> {
 		validateUpdateEpoch(input.updateEpoch);
 		const timestamp = isoNow();
 		const payloadJson = normalizePayload(input.payloadJson);
 		const deadlineAt = input.deadlineAt ? normalizeTimestamp(input.deadlineAt, "deadlineAt") : null;
 		return runAtomicWrite(db, "tool-continuation.checkpointSendAwait", (tx) => {
+			if (observed) assertObservedContinuation(tx, input.toolCallId, observed);
 			const toolCall = tx
 				.select({ status: narratorToolCalls.status, completedAt: narratorToolCalls.completedAt })
 				.from(narratorToolCalls)
@@ -1210,24 +1498,29 @@ export const toolContinuationService = {
 	async reconcileSendAwaitResult(
 		toolCallId: string,
 		updateEpoch: string,
+		options: ContinuationReadOptions = {},
 	): Promise<ToolContinuationRecord | null> {
 		normalizeEpochScope(updateEpoch);
-		const current = await this.getByToolCallId(toolCallId);
+		const current = await this.getByToolCallId(toolCallId, options);
 		if (!current || current.kind !== "send_await" || current.updateEpoch !== updateEpoch)
 			return null;
-		return this.checkpointSendAwait({
-			toolCallId,
-			narratorId: current.narratorId,
-			updateEpoch,
-			payloadJson: current.payloadJson ?? {},
-			deadlineAt: current.deadlineAt,
-		});
+		return this.checkpointSendAwait(
+			{
+				toolCallId,
+				narratorId: current.narratorId,
+				updateEpoch,
+				payloadJson: current.payloadJson ?? {},
+				deadlineAt: current.deadlineAt,
+			},
+			current,
+		);
 	},
 
 	async bindRecoveryTokenForNarrator(
 		narratorId: string,
 		updateEpoch: EpochScope,
 		recoveryToken: string,
+		options: ContinuationReadOptions = {},
 	): Promise<ToolContinuationRecord[]> {
 		normalizeEpochScope(updateEpoch);
 		validateClaimToken(recoveryToken);
@@ -1235,41 +1528,51 @@ export const toolContinuationService = {
 			await readBoundedContinuations(
 				updateEpoch,
 				eq(narratorToolContinuations.narratorId, narratorId),
+				options,
 			)
 		).filter((row) => !isToolContinuationOwnerMounted(row));
-		const updated: ToolContinuationRecord[] = [];
-		for (const row of rows) {
-			const timestamp = isoNow();
-			const [next] = await db
-				.update(narratorToolContinuations)
-				.set({
-					payloadJson: normalizePayload({
-						...(row.payloadJson ?? {}),
-						recoveryToken,
-					}),
-					updatedAt: timestamp,
-				})
-				.where(
-					and(
-						eq(narratorToolContinuations.id, row.id),
-						eq(narratorToolContinuations.updateEpoch, row.updateEpoch),
-						row.claimToken
-							? eq(narratorToolContinuations.claimToken, row.claimToken)
-							: isNull(narratorToolContinuations.claimToken),
-						notInArray(narratorToolContinuations.state, ["cancelled"]),
-					),
-				)
-				.returning();
-			if (next) updated.push(next);
-		}
-		return updated;
+		return writeObservedContinuations(rows, (tx) => {
+			const updated: ToolContinuationRecord[] = [];
+			for (const row of rows) {
+				const timestamp = isoNow();
+				const [next] = tx
+					.update(narratorToolContinuations)
+					.set({
+						payloadJson: normalizePayload({
+							...(row.payloadJson ?? {}),
+							recoveryToken,
+						}),
+						updatedAt: timestamp,
+					})
+					.where(
+						and(
+							eq(narratorToolContinuations.id, row.id),
+							eq(narratorToolContinuations.updateEpoch, row.updateEpoch),
+							row.claimToken
+								? eq(narratorToolContinuations.claimToken, row.claimToken)
+								: isNull(narratorToolContinuations.claimToken),
+							notInArray(narratorToolContinuations.state, ["cancelled"]),
+						),
+					)
+					.returning()
+					.all();
+				if (next) updated.push(next);
+			}
+			return updated;
+		});
 	},
 
-	async listByEpoch(updateEpoch: EpochScope): Promise<ToolContinuationRecord[]> {
-		return readBoundedContinuations(updateEpoch);
+	async listByEpoch(
+		updateEpoch: EpochScope,
+		options: ContinuationReadOptions = {},
+	): Promise<ToolContinuationRecord[]> {
+		return readBoundedContinuations(updateEpoch, undefined, options);
 	},
 
-	async listRecoveryQueueByEpoch(updateEpoch: EpochScope): Promise<ToolContinuationRecoveryItem[]> {
+	async listRecoveryQueueByEpoch(
+		updateEpoch: EpochScope,
+		options: ContinuationReadOptions = {},
+	): Promise<ToolContinuationRecoveryItem[]> {
 		return retryBoundedContinuationRead(async () => {
 			// Validate the entire union before materializing any payload, message, or tool input.
 			const metadata: { id: string; bytes: number; inputBytes: number; contentBytes: number }[] =
@@ -1277,27 +1580,30 @@ export const toolContinuationService = {
 			let cursor: string | undefined;
 			let totalBytes = 0;
 			while (true) {
-				const page = await db
-					.select({
-						id: narratorToolContinuations.id,
-						bytes: payloadBytes,
-						inputBytes: toolInputBytes,
-						contentBytes: messageContentBytes(),
-					})
-					.from(narratorToolContinuations)
-					.innerJoin(
-						narratorToolCalls,
-						eq(narratorToolContinuations.toolCallId, narratorToolCalls.id),
-					)
-					.innerJoin(narratorMessages, eq(narratorToolCalls.messageId, narratorMessages.id))
-					.where(
-						and(
-							epochCondition(updateEpoch),
-							cursor ? gt(narratorToolContinuations.id, cursor) : undefined,
-						),
-					)
-					.orderBy(asc(narratorToolContinuations.id))
-					.limit(METADATA_PAGE_SIZE + 1);
+				const page = await readQuery(
+					db
+						.select({
+							id: narratorToolContinuations.id,
+							bytes: payloadBytes,
+							inputBytes: toolInputBytes,
+							contentBytes: messageContentBytes(),
+						})
+						.from(narratorToolContinuations)
+						.innerJoin(
+							narratorToolCalls,
+							eq(narratorToolContinuations.toolCallId, narratorToolCalls.id),
+						)
+						.innerJoin(narratorMessages, eq(narratorToolCalls.messageId, narratorMessages.id))
+						.where(
+							and(
+								epochCondition(updateEpoch),
+								cursor ? gt(narratorToolContinuations.id, cursor) : undefined,
+							),
+						)
+						.orderBy(asc(narratorToolContinuations.id))
+						.limit(METADATA_PAGE_SIZE + 1),
+					{ ...options, executionPolicy: "worker-required", maxRows: METADATA_PAGE_SIZE + 1 },
+				);
 				assertEpochRowLimit([...metadata, ...page], updateEpoch);
 				for (const row of page.slice(0, METADATA_PAGE_SIZE)) {
 					totalBytes += row.bytes + row.inputBytes + row.contentBytes;
@@ -1372,8 +1678,11 @@ export const toolContinuationService = {
 		});
 	},
 
-	async getProtectionSets(updateEpoch: EpochScope): Promise<ToolContinuationProtectionSets> {
-		const rows = await readBoundedContinuations(updateEpoch);
+	async getProtectionSets(
+		updateEpoch: EpochScope,
+		options: ContinuationReadOptions = {},
+	): Promise<ToolContinuationProtectionSets> {
+		const rows = await readBoundedContinuations(updateEpoch, undefined, options);
 
 		const protectionSets: ToolContinuationProtectionSets = {
 			toolCallIds: new Set<string>(),
@@ -1606,9 +1915,10 @@ export const toolContinuationService = {
 	async markResultWritten(
 		toolCallId: string,
 		input: MarkResultWrittenInput,
+		options: ContinuationReadOptions = {},
 	): Promise<ToolContinuationRecord | null> {
 		validateClaimToken(input.claimToken);
-		const current = await this.getByToolCallId(toolCallId);
+		const current = await this.getByToolCallId(toolCallId, options);
 		if (!current || current.state !== "resuming" || current.claimToken !== input.claimToken) {
 			return null;
 		}
@@ -1618,31 +1928,35 @@ export const toolContinuationService = {
 			...(input.payloadJson ?? {}),
 			recoveryPhase: "result_written",
 		});
-		const [updated] = await db
-			.update(narratorToolContinuations)
-			.set({ payloadJson, updatedAt: timestamp })
-			.where(
-				and(
-					eq(narratorToolContinuations.toolCallId, toolCallId),
-					eq(narratorToolContinuations.state, "resuming"),
-					eq(narratorToolContinuations.claimToken, input.claimToken),
-					input.updateEpoch
-						? eq(narratorToolContinuations.updateEpoch, input.updateEpoch)
-						: undefined,
-				),
-			)
-			.returning();
-		return updated ?? null;
+		return writeObservedContinuations([current], (tx) => {
+			const updated = tx
+				.update(narratorToolContinuations)
+				.set({ payloadJson, updatedAt: timestamp })
+				.where(
+					and(
+						eq(narratorToolContinuations.toolCallId, toolCallId),
+						eq(narratorToolContinuations.state, "resuming"),
+						eq(narratorToolContinuations.claimToken, input.claimToken),
+						input.updateEpoch
+							? eq(narratorToolContinuations.updateEpoch, input.updateEpoch)
+							: undefined,
+					),
+				)
+				.returning()
+				.get();
+			return updated ?? null;
+		});
 	},
 
 	async markOwnerContinuationPendingForMessage(
 		messageId: string,
 		updateEpoch: EpochScope,
 		recoveryToken?: string,
+		options: ContinuationReadOptions = {},
 	): Promise<ToolContinuationRecord[] | null> {
 		normalizeEpochScope(updateEpoch);
 		if (recoveryToken !== undefined) validateClaimToken(recoveryToken);
-		const rows = await listMessageContinuations(messageId, updateEpoch);
+		const rows = await listMessageContinuations(messageId, updateEpoch, options);
 		const deliverable = rows.filter((row) => row.state !== "cancelled");
 		if (
 			deliverable.some(
@@ -1655,51 +1969,56 @@ export const toolContinuationService = {
 			return null;
 		}
 		const timestamp = isoNow();
-		const updated: ToolContinuationRecord[] = [];
-		for (const row of deliverable) {
-			if (isToolContinuationOwnerMounted(row)) {
-				updated.push(row);
-				continue;
+		return writeObservedContinuations(rows, (tx) => {
+			assertMessageContinuationScope(tx, messageId, updateEpoch, rows);
+			const updated: ToolContinuationRecord[] = [];
+			for (const row of deliverable) {
+				if (isToolContinuationOwnerMounted(row)) {
+					updated.push(row);
+					continue;
+				}
+				const [next] = tx
+					.update(narratorToolContinuations)
+					.set({
+						payloadJson: normalizePayload({
+							...(row.payloadJson ?? {}),
+							recoveryPhase: "owner_continuation_pending",
+						}),
+						updatedAt: timestamp,
+					})
+					.where(
+						and(
+							eq(narratorToolContinuations.id, row.id),
+							eq(narratorToolContinuations.updateEpoch, row.updateEpoch),
+							row.claimToken
+								? eq(narratorToolContinuations.claimToken, row.claimToken)
+								: isNull(narratorToolContinuations.claimToken),
+							notInArray(narratorToolContinuations.state, ["cancelled"]),
+							...(recoveryToken
+								? [
+										sql`json_extract(${narratorToolContinuations.payloadJson}, '$.recoveryToken') = ${recoveryToken}`,
+									]
+								: []),
+						),
+					)
+					.returning()
+					.all();
+				if (!next) return null;
+				updated.push(next);
 			}
-			const [next] = await db
-				.update(narratorToolContinuations)
-				.set({
-					payloadJson: normalizePayload({
-						...(row.payloadJson ?? {}),
-						recoveryPhase: "owner_continuation_pending",
-					}),
-					updatedAt: timestamp,
-				})
-				.where(
-					and(
-						eq(narratorToolContinuations.id, row.id),
-						eq(narratorToolContinuations.updateEpoch, row.updateEpoch),
-						row.claimToken
-							? eq(narratorToolContinuations.claimToken, row.claimToken)
-							: isNull(narratorToolContinuations.claimToken),
-						notInArray(narratorToolContinuations.state, ["cancelled"]),
-						...(recoveryToken
-							? [
-									sql`json_extract(${narratorToolContinuations.payloadJson}, '$.recoveryToken') = ${recoveryToken}`,
-								]
-							: []),
-					),
-				)
-				.returning();
-			if (!next) return null;
-			updated.push(next);
-		}
-		return updated;
+			return updated;
+		});
 	},
 
 	async markOwnerContinuationStartedForMessage(
 		messageId: string,
 		updateEpoch: EpochScope,
 		recoveryToken?: string,
+		options: ContinuationReadOptions = {},
 	): Promise<ToolContinuationRecord[] | null> {
 		normalizeEpochScope(updateEpoch);
 		if (recoveryToken !== undefined) validateClaimToken(recoveryToken);
-		const rows = await listMessageContinuations(messageId, updateEpoch);
+		const rows = await listMessageContinuations(messageId, updateEpoch, options);
 		const deliverable = rows.filter((row) => row.state !== "cancelled");
 		if (
 			recoveryToken !== undefined &&
@@ -1720,52 +2039,57 @@ export const toolContinuationService = {
 			return null;
 		}
 		const timestamp = isoNow();
-		const updated: ToolContinuationRecord[] = [];
-		for (const row of deliverable) {
-			if (isToolContinuationOwnerMounted(row)) {
-				updated.push(row);
-				continue;
+		return writeObservedContinuations(rows, (tx) => {
+			assertMessageContinuationScope(tx, messageId, updateEpoch, rows);
+			const updated: ToolContinuationRecord[] = [];
+			for (const row of deliverable) {
+				if (isToolContinuationOwnerMounted(row)) {
+					updated.push(row);
+					continue;
+				}
+				const [next] = tx
+					.update(narratorToolContinuations)
+					.set({
+						state: "completed",
+						payloadJson: normalizePayload({
+							...(row.payloadJson ?? {}),
+							recoveryPhase: "owner_continuation_started",
+						}),
+						claimToken: null,
+						claimedAt: null,
+						deadlineAt: null,
+						completedAt: timestamp,
+						updatedAt: timestamp,
+					})
+					.where(
+						and(
+							eq(narratorToolContinuations.id, row.id),
+							eq(narratorToolContinuations.updateEpoch, row.updateEpoch),
+							row.claimToken
+								? eq(narratorToolContinuations.claimToken, row.claimToken)
+								: isNull(narratorToolContinuations.claimToken),
+							notInArray(narratorToolContinuations.state, ["cancelled"]),
+							sql`json_extract(${narratorToolContinuations.payloadJson}, '$.recoveryPhase') = 'owner_continuation_pending'`,
+							...(recoveryToken
+								? [
+										sql`json_extract(${narratorToolContinuations.payloadJson}, '$.recoveryToken') = ${recoveryToken}`,
+									]
+								: []),
+						),
+					)
+					.returning()
+					.all();
+				if (!next) return null;
+				updated.push(next);
 			}
-			const [next] = await db
-				.update(narratorToolContinuations)
-				.set({
-					state: "completed",
-					payloadJson: normalizePayload({
-						...(row.payloadJson ?? {}),
-						recoveryPhase: "owner_continuation_started",
-					}),
-					claimToken: null,
-					claimedAt: null,
-					deadlineAt: null,
-					completedAt: timestamp,
-					updatedAt: timestamp,
-				})
-				.where(
-					and(
-						eq(narratorToolContinuations.id, row.id),
-						eq(narratorToolContinuations.updateEpoch, row.updateEpoch),
-						row.claimToken
-							? eq(narratorToolContinuations.claimToken, row.claimToken)
-							: isNull(narratorToolContinuations.claimToken),
-						notInArray(narratorToolContinuations.state, ["cancelled"]),
-						sql`json_extract(${narratorToolContinuations.payloadJson}, '$.recoveryPhase') = 'owner_continuation_pending'`,
-						...(recoveryToken
-							? [
-									sql`json_extract(${narratorToolContinuations.payloadJson}, '$.recoveryToken') = ${recoveryToken}`,
-								]
-							: []),
-					),
-				)
-				.returning();
-			if (!next) return null;
-			updated.push(next);
-		}
-		return updated;
+			return updated;
+		});
 	},
 
 	async hasUnwrittenResultsForNarrator(
 		narratorId: string,
 		updateEpoch: EpochScope,
+		options: ContinuationReadOptions = {},
 	): Promise<boolean> {
 		const rows = await readBoundedContinuations(
 			updateEpoch,
@@ -1773,6 +2097,7 @@ export const toolContinuationService = {
 				eq(narratorToolContinuations.narratorId, narratorId),
 				notInArray(narratorToolContinuations.state, ["cancelled"]),
 			),
+			options,
 		);
 		return rows.some((record) => !hasPersistedToolContinuationResult(record));
 	},
@@ -1780,25 +2105,42 @@ export const toolContinuationService = {
 	async markOwnerContinuationStartedForNarrator(
 		narratorId: string,
 		updateEpoch: EpochScope,
+		options: ContinuationReadOptions = {},
 	): Promise<boolean> {
 		normalizeEpochScope(updateEpoch);
-		const rows = await db
-			.select({ messageId: narratorToolCalls.messageId })
-			.from(narratorToolContinuations)
-			.innerJoin(narratorToolCalls, eq(narratorToolContinuations.toolCallId, narratorToolCalls.id))
-			.where(
-				and(
-					eq(narratorToolContinuations.narratorId, narratorId),
-					epochCondition(updateEpoch),
-					notInArray(narratorToolContinuations.state, ["cancelled"]),
-				),
-			)
-			.limit(MAX_ROWS_PER_EPOCH + 1);
+		const rows = await readQuery(
+			db
+				.select({ messageId: narratorToolCalls.messageId })
+				.from(narratorToolContinuations)
+				.innerJoin(
+					narratorToolCalls,
+					eq(narratorToolContinuations.toolCallId, narratorToolCalls.id),
+				)
+				.where(
+					and(
+						eq(narratorToolContinuations.narratorId, narratorId),
+						epochCondition(updateEpoch),
+						notInArray(narratorToolContinuations.state, ["cancelled"]),
+					),
+				)
+				.limit(MAX_ROWS_PER_EPOCH + 1),
+			{ ...options, executionPolicy: "worker-required", maxRows: MAX_ROWS_PER_EPOCH + 1 },
+		);
 		assertEpochRowLimit(rows, updateEpoch);
 		for (const messageId of new Set(rows.map((row) => row.messageId))) {
-			const pending = await this.markOwnerContinuationPendingForMessage(messageId, updateEpoch);
+			const pending = await this.markOwnerContinuationPendingForMessage(
+				messageId,
+				updateEpoch,
+				undefined,
+				options,
+			);
 			if (!pending) return false;
-			const started = await this.markOwnerContinuationStartedForMessage(messageId, updateEpoch);
+			const started = await this.markOwnerContinuationStartedForMessage(
+				messageId,
+				updateEpoch,
+				undefined,
+				options,
+			);
 			if (!started) return false;
 		}
 		return true;
@@ -1808,6 +2150,7 @@ export const toolContinuationService = {
 		narratorId: string,
 		updateEpoch: EpochScope,
 		input: string | CancelInterruptibleContinuationsInput = {},
+		readOptions: ContinuationReadOptions = {},
 	): Promise<ToolContinuationRecord[]> {
 		normalizeEpochScope(updateEpoch);
 		const options = typeof input === "string" ? { errorMessage: input } : input;
@@ -1836,44 +2179,48 @@ export const toolContinuationService = {
 				? sql`json_extract(${narratorToolContinuations.payloadJson}, '$.recoveryToken') = ${options.recoveryToken}`
 				: undefined,
 		);
-		const rows = await readBoundedContinuations(updateEpoch, filter);
-		const result: ToolContinuationRecord[] = [];
-		const changes = {
-			state: "cancelled" as const,
-			claimToken: null,
-			claimedAt: null,
-			deadlineAt: null,
-			errorMessage: options.errorMessage ?? null,
-			completedAt: timestamp,
-			updatedAt: timestamp,
-		};
-		for (let offset = 0; offset < rows.length; offset += METADATA_PAGE_SIZE) {
-			const page = rows.slice(offset, offset + METADATA_PAGE_SIZE);
-			const changed = await db
-				.update(narratorToolContinuations)
-				.set(changes)
-				.where(
-					and(
-						filter,
-						or(
-							...page.map((row) =>
-								and(
-									eq(narratorToolContinuations.id, row.id),
-									eq(narratorToolContinuations.updateEpoch, row.updateEpoch),
-									row.claimToken
-										? eq(narratorToolContinuations.claimToken, row.claimToken)
-										: isNull(narratorToolContinuations.claimToken),
+		const rows = await readBoundedContinuations(updateEpoch, filter, readOptions);
+		return writeObservedContinuations(rows, (tx) => {
+			const result: ToolContinuationRecord[] = [];
+			const changes = {
+				state: "cancelled" as const,
+				claimToken: null,
+				claimedAt: null,
+				deadlineAt: null,
+				errorMessage: options.errorMessage ?? null,
+				completedAt: timestamp,
+				updatedAt: timestamp,
+			};
+			for (let offset = 0; offset < rows.length; offset += METADATA_PAGE_SIZE) {
+				const page = rows.slice(offset, offset + METADATA_PAGE_SIZE);
+				const changed = tx
+					.update(narratorToolContinuations)
+					.set(changes)
+					.where(
+						and(
+							filter,
+							or(
+								...page.map((row) =>
+									and(
+										eq(narratorToolContinuations.id, row.id),
+										eq(narratorToolContinuations.updateEpoch, row.updateEpoch),
+										row.claimToken
+											? eq(narratorToolContinuations.claimToken, row.claimToken)
+											: isNull(narratorToolContinuations.claimToken),
+									),
 								),
 							),
 						),
-					),
-				)
-				.returning({ id: narratorToolContinuations.id });
-			const ids = new Set(changed.map((row) => row.id));
-			result.push(...page.filter((row) => ids.has(row.id)).map((row) => ({ ...row, ...changes })));
-			await new Promise<void>((resolve) => setTimeout(resolve, 0));
-		}
-		return result;
+					)
+					.returning({ id: narratorToolContinuations.id })
+					.all();
+				const ids = new Set(changed.map((row) => row.id));
+				result.push(
+					...page.filter((row) => ids.has(row.id)).map((row) => ({ ...row, ...changes })),
+				);
+			}
+			return result;
+		});
 	},
 
 	/** Cleanup for an executor write that completed after its gate's cancellation cleanup. */
@@ -1943,9 +2290,13 @@ export const toolContinuationService = {
 		return updated ?? null;
 	},
 
-	async hasUnfinishedForMessage(messageId: string, updateEpoch: EpochScope): Promise<boolean> {
+	async hasUnfinishedForMessage(
+		messageId: string,
+		updateEpoch: EpochScope,
+		options: ContinuationReadOptions = {},
+	): Promise<boolean> {
 		normalizeEpochScope(updateEpoch);
-		const rows = await listMessageContinuations(messageId, updateEpoch);
+		const rows = await listMessageContinuations(messageId, updateEpoch, options);
 		return rows.some((row) => !isToolContinuationOwnerMounted(row));
 	},
 };

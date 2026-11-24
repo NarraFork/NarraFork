@@ -18,6 +18,7 @@ import { act, type ComponentProps, type ReactNode, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import { api, type BufferMessageSummary } from "../../../lib/api";
+import { ApiError } from "../../../lib/api/client";
 import type { RevertActionPreview } from "../../../lib/api/narrators";
 import {
 	getPromptOptimizeTask,
@@ -228,6 +229,13 @@ beforeEach(async () => {
 	qc = new QueryClient({
 		defaultOptions: { queries: { retry: false, staleTime: Infinity, gcTime: Infinity } },
 	});
+	for (const narratorId of ["narrator", "layout-owner", "fork-context"]) {
+		qc.setQueryData(["workspaceContext", narratorId], {
+			deviceId: "remote-history",
+			contextKey: `remote-context-${narratorId}`,
+			revision: 1,
+		});
+	}
 	// A reviewed plan that restores nothing and removes no later messages: submit
 	// tests go straight through without a rollback dialog.
 	spyOn(api, "previewRevertAction").mockImplementation(async (_narratorId, input) => ({
@@ -666,6 +674,44 @@ describe("message reference attachment editor", () => {
 		await click(button(en.editSubmit));
 		expect(save.mock.calls[0][3]?.fileReferences).toEqual([]);
 	});
+
+	for (const [language, locale] of Object.entries({ en, "zh-CN": zh })) {
+		test(`${language}: local edits confirm message deletion without loading file evidence`, async () => {
+			await i18n.changeLanguage(language);
+			qc.setQueryData(["workspaceContext", "narrator"], {
+				deviceId: "local",
+				contextKey: "local-context",
+				revision: 2,
+			});
+			const preview = spyOn(api, "previewRevertAction").mockRejectedValue(
+				new Error("history offline"),
+			);
+			const files = spyOn(api, "getRevertPlanFiles").mockRejectedValue(
+				new Error("history offline"),
+			);
+			const save = mock(
+				async (..._args: Parameters<NonNullable<MessageEditorPanelProps["onEditAndRegenerate"]>>) =>
+					false,
+			);
+			await render(editor({ initialText: "keep text", onEditAndRegenerate: save }));
+			expect(preview).not.toHaveBeenCalled();
+			expect(files).not.toHaveBeenCalled();
+			await click(button(locale.editSubmit));
+			expect(save).not.toHaveBeenCalled();
+			expect(document.body.textContent).toContain(locale.editMessagesOnlyConfirmDesc);
+			expect(document.body.textContent).toContain(locale.revertMessagesOnlyKeepFiles);
+			expect(document.body.textContent).not.toContain(locale.revertScopeUnavailableTitle);
+			await click(button(locale.cancel));
+			expect(save).not.toHaveBeenCalled();
+			await click(button(locale.editSubmit));
+			await click(button(locale.editRevertConfirmNoFiles));
+			expect(save).toHaveBeenCalledTimes(1);
+			expect(save.mock.calls[0]?.[2]).toEqual({ skipRevert: true });
+			expect(preview).not.toHaveBeenCalled();
+			expect(files).not.toHaveBeenCalled();
+			expect(document.body.textContent).toContain("keep text");
+		});
+	}
 
 	test.each([
 		["a plan that restores files", 1, 0],
@@ -1900,6 +1946,52 @@ function queuePanel(overrides: Partial<QueuedMessagesPanelProps> = {}) {
 }
 
 describe("urgent dispatch real hook and panel", () => {
+	test("another client's explicit edit conflict restores ordinary controls instead of stranding a failed urgent row", async () => {
+		const message: BufferMessageSummary = {
+			id: "remote-held",
+			text: "Ordinary payload",
+			imageCount: 0,
+			bufferedAt: "now",
+		};
+		const mode = spyOn(api, "setBufferedMessageMode").mockRejectedValue(
+			new ApiError("Another client is editing", 409, { code: "BUFFER_EDIT_CONFLICT" }),
+		);
+		const remove = spyOn(api, "removeBufferedMessage").mockResolvedValue({ ok: true });
+		spyOn(notifications, "show").mockReturnValue("notice");
+		function View() {
+			const [messages, setMessages] = useState([message]);
+			const actions = useQueuedMessageActions({
+				narratorId: "narrator",
+				queuedMessages: messages,
+				setQueuedMessages: setMessages,
+				reconcileBufferedMessages: () => {},
+				cancelBuffer: () => {},
+				composerRef: { current: null },
+				handleSendRef: { current: () => {} },
+				handleSendWithModeRef: { current: () => {} },
+				ctrlEnterQueueModeRef: { current: "tool" },
+				t: (key) => i18n.t(key),
+			});
+			return queuePanel({
+				narratorId: "narrator",
+				...actions,
+				queuedMessages: actions.visibleQueuedMessages,
+			});
+		}
+		await render(<View />);
+		await click(button(en.queuedSendUrgently));
+		expect(mode).toHaveBeenCalledTimes(1);
+		expect(host?.querySelector("[data-urgent-dispatches]")).toBeNull();
+		expect(host?.textContent).toContain(message.text);
+		expect(button(en.queuedSwitchToGuidance).disabled).toBe(false);
+		expect(button(en.queuedSendUrgently).disabled).toBe(false);
+		const row = host?.querySelector('[data-queue-message-row="remote-held"]');
+		const cancel = row?.querySelector<HTMLButtonElement>(`button[aria-label="${en.cancelBuffer}"]`);
+		if (!cancel) throw new Error("Ordinary cancel control missing");
+		expect(cancel.disabled).toBe(false);
+		await click(cancel);
+		expect(remove).toHaveBeenCalledWith("narrator", message.id);
+	});
 	for (const [language, strings] of [
 		["en", en],
 		["zh-CN", zh],
@@ -2024,6 +2116,348 @@ describe("urgent dispatch real hook and panel", () => {
 	}
 });
 
+describe("queued edit protection real hook and editor", () => {
+	test("failed first admission has explicit retry/exit even after its raw row disappears; exit clears the ghost lock", async () => {
+		const message: BufferMessageSummary = {
+			id: "lost-admission",
+			text: "Original",
+			imageCount: 0,
+			bufferedAt: "now",
+		};
+		const begin = spyOn(api, "beginBufferedMessageEdit").mockRejectedValue(
+			new Error("network lost"),
+		);
+		const release = spyOn(api, "releaseBufferedMessageEdit").mockResolvedValue({ ok: true });
+		spyOn(notifications, "show").mockReturnValue("notice");
+		let actions: ReturnType<typeof useQueuedMessageActions> | undefined;
+		let consume: (() => void) | undefined;
+		function View() {
+			const [messages, setMessages] = useState([message]);
+			consume = () => setMessages([]);
+			actions = useQueuedMessageActions({
+				narratorId: "narrator",
+				queuedMessages: messages,
+				setQueuedMessages: setMessages,
+				reconcileBufferedMessages: () => {},
+				cancelBuffer: () => {},
+				composerRef: { current: null },
+				handleSendRef: { current: () => {} },
+				handleSendWithModeRef: { current: () => {} },
+				ctrlEnterQueueModeRef: { current: "tool" },
+				t: (key) => i18n.t(key),
+			});
+			return queuePanel({
+				narratorId: "narrator",
+				...actions,
+				queuedMessages: actions.visibleQueuedMessages,
+			});
+		}
+		await render(<View />);
+		await act(async () => {
+			await actions?.handleStartEditQueued(message);
+			consume?.();
+		});
+		expect(host?.querySelector(".ProseMirror")).toBeNull();
+		expect(host?.textContent).toContain("network lost");
+		expect(button(en.queuedEditReacquire).disabled).toBe(false);
+		expect(actions?.queuedEditLockedId).toBe(message.id);
+		await click(button(en.queuedEditDismiss));
+		expect(release).toHaveBeenCalledWith("narrator", message.id, begin.mock.calls[0][2]);
+		expect(actions?.queuedEditLockedId).toBeUndefined();
+		expect(host?.textContent).not.toContain("network lost");
+	});
+	for (const [language, strings] of [
+		["en", en],
+		["zh-CN", zh],
+	] as const) {
+		test(`${language}: failed saves and lost leases retain body, files and editor across WS consumption and reacquisition`, async () => {
+			await i18n.changeLanguage(language);
+			const message: BufferMessageSummary = {
+				id: "protected",
+				text: "Original",
+				imageCount: 0,
+				bufferedAt: "now",
+			};
+			const begin = spyOn(api, "beginBufferedMessageEdit").mockImplementation(
+				async (_n, _m, token) => ({
+					ok: true,
+					token,
+					expiresAt: Date.now() + 120_000,
+					leaseMs: 120_000,
+					contentRevision: 0,
+				}),
+			);
+			const release = spyOn(api, "releaseBufferedMessageEdit").mockResolvedValue({ ok: true });
+			spyOn(api, "getBufferedMessages").mockResolvedValue([message]);
+			spyOn(api, "renewBufferedMessageEdit").mockRejectedValue(new Error("offline"));
+			spyOn(notifications, "show").mockReturnValue("notice");
+			const update = spyOn(api, "updateBufferedMessage")
+				.mockRejectedValueOnce(new Error("upload failed"))
+				.mockResolvedValue({ ok: true });
+			let renew: (() => void) | undefined;
+			const nativeInterval = globalThis.setInterval;
+			spyOn(globalThis, "setInterval").mockImplementation(((
+				handler: () => void,
+				delay?: number,
+			) => {
+				if (delay === 20_000) renew = handler;
+				return nativeInterval(handler, delay);
+			}) as typeof setInterval);
+			let actions: ReturnType<typeof useQueuedMessageActions> | undefined;
+			let consume: (() => void) | undefined;
+			function View() {
+				const [messages, setMessages] = useState([message]);
+				consume = () => setMessages([]);
+				actions = useQueuedMessageActions({
+					narratorId: "narrator",
+					queuedMessages: messages,
+					setQueuedMessages: setMessages,
+					reconcileBufferedMessages: () => {},
+					cancelBuffer: () => {},
+					composerRef: { current: null },
+					handleSendRef: { current: () => {} },
+					handleSendWithModeRef: { current: () => {} },
+					ctrlEnterQueueModeRef: { current: "tool" },
+					t: (key) => i18n.t(key),
+				});
+				return queuePanel({
+					narratorId: "narrator",
+					...actions,
+					queuedMessages: actions.visibleQueuedMessages,
+				});
+			}
+			await render(<View />);
+			await act(async () => {
+				await actions?.handleStartEditQueued(message);
+				await flush();
+			});
+			expect(host?.textContent).toContain(strings.queuedEditPaused);
+			await editRange(0, "Original".length, "Unsaved body");
+			const image = new File(["gif"], "draft.gif", { type: "image/gif" });
+			const textFile = new File(["content"], "draft.txt", { type: "text/plain" });
+			await act(async () => {
+				const { textarea, props } = textareaProps();
+				props.onPaste?.({
+					currentTarget: textarea,
+					clipboardData: {
+						items: [image, textFile].map((file) => ({
+							kind: "file",
+							type: file.type,
+							getAsFile: () => file,
+						})),
+					},
+					preventDefault() {},
+				} as unknown as Parameters<NonNullable<typeof props.onPaste>>[0]);
+				await flush();
+			});
+			const editorBefore = textareaProps().textarea;
+			await editorKey("Enter");
+			expect(update).toHaveBeenCalledTimes(1);
+			expect(actions?.editingQueuedId).toBe("protected");
+			expect(host?.textContent).toContain(strings.queuedEditPaused);
+			expect(host?.textContent).toContain("draft.txt");
+			expect(release).not.toHaveBeenCalled();
+			await act(async () => {
+				if (!renew || !consume) throw new Error("Editor not initialized");
+				renew();
+				await flush();
+				consume();
+			});
+			expect(host?.textContent).toContain(strings.queuedEditProtectionLost);
+			expect(host?.textContent).not.toContain(strings.queuedEditPaused);
+			expect(textareaProps().textarea).toBe(editorBefore);
+			expect(textareaProps().textarea.value).toBe("Unsaved body");
+			expect(host?.querySelector('img[alt="draft.gif"]')).not.toBeNull();
+			expect(host?.textContent).toContain("draft.txt");
+			await editorKey("Enter");
+			expect(update).toHaveBeenCalledTimes(1);
+			await click(button(strings.queuedEditReacquire));
+			expect(begin).toHaveBeenCalledTimes(2);
+			expect(begin.mock.calls[1][2]).toBe(begin.mock.calls[0][2]);
+			expect(textareaProps().textarea).toBe(editorBefore);
+			expect(host?.textContent).toContain(strings.queuedEditPaused);
+			await editorKey("Enter");
+			expect(update).toHaveBeenCalledTimes(2);
+			expect(update.mock.calls[1][3]?.newImages).toEqual([image]);
+			expect(update.mock.calls[1][3]?.newTextFiles).toEqual([textFile]);
+			expect(update.mock.calls[1][4]).toBe(begin.mock.calls[0][2]);
+			expect(host?.querySelector(".ProseMirror")).toBeNull();
+			expect(release).toHaveBeenCalledWith("narrator", "protected", begin.mock.calls[0][2]);
+		});
+	}
+});
+
+describe("revision-aware queued editor protection", () => {
+	for (const [language, strings] of [
+		["en", en],
+		["zh-CN", zh],
+	] as const) {
+		for (const trigger of ["reacquire", "save"] as const) {
+			test(`${language}: stale ${trigger} retains draft/files, disables all queue mutations and requires explicit reopening`, async () => {
+				await i18n.changeLanguage(language);
+				const message: BufferMessageSummary = {
+					id: "reviewed",
+					text: "Original",
+					imageCount: 0,
+					bufferedAt: "now",
+				};
+				const other: BufferMessageSummary = {
+					...message,
+					id: "other",
+					text: "Other queued message",
+					state: "failed",
+					error: "Retryable error",
+				};
+				const admission =
+					Promise.withResolvers<Awaited<ReturnType<typeof api.beginBufferedMessageEdit>>>();
+				const begin = spyOn(api, "beginBufferedMessageEdit")
+					.mockReturnValueOnce(admission.promise)
+					.mockImplementation(async (_n, _m, token) => ({
+						ok: true,
+						token,
+						expiresAt: Date.now() + 120_000,
+						leaseMs: 120_000,
+						contentRevision: 11,
+					}));
+				spyOn(api, "releaseBufferedMessageEdit").mockResolvedValue({ ok: true });
+				const latest = spyOn(api, "getBufferedMessages").mockResolvedValue([message, other]);
+				spyOn(api, "renewBufferedMessageEdit").mockRejectedValue(new Error("lease lost"));
+				const update = spyOn(api, "updateBufferedMessage").mockResolvedValue({ ok: true });
+				const mode = spyOn(api, "setBufferedMessageMode").mockResolvedValue({
+					ok: true,
+					delivered: true,
+				});
+				spyOn(notifications, "show").mockReturnValue("notice");
+				let renew: (() => void) | undefined;
+				const nativeInterval = globalThis.setInterval;
+				spyOn(globalThis, "setInterval").mockImplementation(((
+					handler: () => void,
+					delay?: number,
+				) => {
+					if (delay === 20_000) renew = handler;
+					return nativeInterval(handler, delay);
+				}) as typeof setInterval);
+				let actions: ReturnType<typeof useQueuedMessageActions> | undefined;
+				let snapshot: UseQueuedMessageActionsOptions["setQueuedMessages"] | undefined;
+				function View() {
+					const [messages, setMessages] = useState([message, other]);
+					snapshot = setMessages;
+					actions = useQueuedMessageActions({
+						narratorId: "narrator",
+						queuedMessages: messages,
+						setQueuedMessages: setMessages,
+						reconcileBufferedMessages: () => {},
+						cancelBuffer: () => {},
+						composerRef: { current: null },
+						handleSendRef: { current: () => {} },
+						handleSendWithModeRef: { current: () => {} },
+						ctrlEnterQueueModeRef: { current: "tool" },
+						t: (key) => i18n.t(key),
+					});
+					return queuePanel({
+						narratorId: "narrator",
+						...actions,
+						queuedMessages: actions.visibleQueuedMessages,
+					});
+				}
+				await render(<View />);
+				let pending: Promise<void> | undefined;
+				await act(async () => {
+					pending = actions?.handleStartEditQueued(message);
+				});
+				expect(host?.querySelector(".ProseMirror")).toBeNull();
+				const expectOtherLocked = () => {
+					const row = host?.querySelector('[data-queue-message-row="other"]');
+					if (!row) throw new Error("Other row missing");
+					for (const control of Array.from(row.querySelectorAll<HTMLButtonElement>("button"))) {
+						if (control.getAttribute("aria-label") !== strings.queuedExpandText)
+							expect(control.disabled).toBe(true);
+					}
+				};
+				expectOtherLocked();
+				await act(async () => {
+					admission.resolve({
+						ok: true,
+						token: begin.mock.calls[0][2],
+						expiresAt: Date.now() + 120_000,
+						leaseMs: 120_000,
+						contentRevision: 7,
+					});
+					await pending;
+					await flush();
+				});
+				expectOtherLocked();
+				await click(button(strings.queuedSendUrgently));
+				expect(mode).not.toHaveBeenCalled();
+				await editRange(0, "Original".length, "My unsaved draft");
+				const image = new File(["gif"], "revision-draft.gif", { type: "image/gif" });
+				const textFile = new File(["notes"], "revision-draft.txt", { type: "text/plain" });
+				await act(async () => {
+					const { textarea, props } = textareaProps();
+					props.onPaste?.({
+						currentTarget: textarea,
+						clipboardData: {
+							items: [image, textFile].map((file) => ({
+								kind: "file",
+								type: file.type,
+								getAsFile: () => file,
+							})),
+						},
+						preventDefault() {},
+					} as unknown as Parameters<NonNullable<typeof props.onPaste>>[0]);
+					await flush();
+				});
+				const editorBefore = textareaProps().textarea;
+				const newer = { ...message, text: "New content from collaborator" };
+				latest.mockResolvedValue([newer, other]);
+				const stale = new ApiError("changed", 409, { code: "BUFFER_EDIT_STALE" });
+				if (trigger === "reacquire") {
+					await act(async () => {
+						renew?.();
+						await flush();
+					});
+					begin.mockRejectedValueOnce(stale);
+					await click(button(strings.queuedEditReacquire));
+					expect(begin.mock.calls[1][3]).toBe(7);
+				} else {
+					update.mockRejectedValueOnce(stale);
+					await editorKey("Enter");
+					expect(update.mock.calls[0][3]?.newImages).toEqual([image]);
+					expect(update.mock.calls[0][3]?.newTextFiles).toEqual([textFile]);
+				}
+				await act(async () => {
+					snapshot?.([]);
+				});
+				expect(host?.textContent).toContain(strings.queuedEditStale);
+				expect(host?.textContent).not.toContain(strings.queuedEditPaused);
+				expect(textareaProps().textarea).toBe(editorBefore);
+				expect(textareaProps().textarea.value).toBe("My unsaved draft");
+				expect(host?.querySelector('img[alt="revision-draft.gif"]')).not.toBeNull();
+				expect(host?.textContent).toContain("revision-draft.txt");
+				expect(button(strings.queuedEditReacquire).disabled).toBe(true);
+				const begins = begin.mock.calls.length;
+				const saves = update.mock.calls.length;
+				await click(button(strings.queuedEditReacquire));
+				await editorKey("Enter");
+				expect(begin).toHaveBeenCalledTimes(begins);
+				expect(update).toHaveBeenCalledTimes(saves);
+				await act(async () => {
+					snapshot?.([newer, other]);
+				});
+				await click(button(strings.queuedEditDismiss));
+				expect(host?.querySelector(".ProseMirror")).toBeNull();
+				expect(host?.textContent).toContain(newer.text);
+				await act(async () => {
+					await actions?.handleStartEditQueued(newer);
+					await flush();
+				});
+				expect(begin.mock.calls.at(-1)?.[3]).toBeUndefined();
+				expect(textareaProps().textarea.value).toBe(newer.text);
+			});
+		}
+	}
+});
+
 describe("real queued panel composition", () => {
 	for (const change of [
 		"cancel head",
@@ -2092,15 +2526,14 @@ describe("real queued panel composition", () => {
 			});
 			const textareaBefore = textareaProps().textarea;
 			if (change === "cancel head" || change === "move ordinary head") {
-				const menu = document.querySelectorAll(`button[aria-label="${en.queuedActions}"]`)[1];
-				if (!menu) throw new Error("Head row menu missing");
-				await click(menu);
-				const label = change === "cancel head" ? en.cancelBuffer : en.queuedMoveDown;
-				const action = Array.from(document.querySelectorAll('[role="menuitem"]')).find(
-					(node) => node.textContent === label,
+				// Local mutations are disabled by the session-wide edit hold. A late
+				// authoritative snapshot must nevertheless preserve the keyed draft.
+				const menu = host?.querySelector<HTMLButtonElement>(
+					`[data-queue-message-row="head"] button[aria-label="${en.queuedActions}"]`,
 				);
-				if (!action) throw new Error(`Head action missing: ${label}`);
-				await click(action);
+				expect(menu?.disabled).toBe(true);
+				messages =
+					change === "cancel head" ? messages.slice(1) : [messages[1], messages[0], messages[2]];
 			} else if (collapsedSingle) {
 				messages = [
 					...messages,

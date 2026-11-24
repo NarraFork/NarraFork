@@ -103,7 +103,10 @@ const testProvider: ProviderAdapter = {
 				],
 			};
 			await bashStarted.promise;
-			await nextTick();
+			// Eager siblings must actually start while Bash is still held. Worker
+			// preflight may take more than one scheduler tick; serialization times out here.
+			if (bashInput.parallel && !bashInput.strict_serial) await readAfterStarted.promise;
+			else await nextTick();
 			executionWhileBashPending = [...executionOrder];
 			releaseBash.resolve();
 			await readAfterStarted.promise;
@@ -139,16 +142,16 @@ const testProvider: ProviderAdapter = {
 			return;
 		}
 		if (scenario === "await_send_not_eager") {
-			// Await + Send execute while the response is still streaming: the provider only
+			// Watch + Send execute while the response is still streaming: the provider only
 			// produces its trailing text (where the test aborts) once both have started, so
 			// the post-stream tool phase never runs.
 			yield {
 				toolUses: [
-					{ toolUseId: "tu_await", name: "Await", input: { type: "bash", id: "x" } },
+					{ toolUseId: "tu_await", name: "Watch", input: { type: "bash", id: "x" } },
 					{ toolUseId: "tu_send", name: "Send", input: { id: "y", message: "hi" } },
 				],
 			};
-			while (!executionOrder.includes("Await") || !executionOrder.includes("Send")) {
+			while (!executionOrder.includes("Watch") || !executionOrder.includes("Send")) {
 				if (params.signal.aborted) throw new Error("Aborted");
 				await new Promise((resolve) => setTimeout(resolve, 1));
 			}
@@ -221,11 +224,11 @@ toolRegistry.register({
 });
 
 toolRegistry.register({
-	name: "Await",
-	description: "Test Await tool (should never eager-execute)",
+	name: "Watch",
+	description: "Test Watch tool (should never eager-execute)",
 	parameters: z.object({ type: z.string(), id: z.string() }),
 	execute: async () => {
-		executionOrder.push("Await");
+		executionOrder.push("Watch");
 		return { output: "await-done" };
 	},
 });
@@ -242,7 +245,7 @@ toolRegistry.register({
 
 afterAll(() => {
 	mock.module("../provider", () => realProviderModule);
-	for (const name of [...PARALLEL_TOOL_NAMES, "Bash", "Write", "Await", "Send"]) {
+	for (const name of [...PARALLEL_TOOL_NAMES, "Bash", "Write", "Watch", "Send"]) {
 		toolRegistry.unregister(name);
 	}
 	mock.restore();
@@ -399,7 +402,7 @@ describe("agent loop tool-result settlement", () => {
 		expect(events.some((e) => e.type === "turn_complete")).toBe(true);
 	});
 
-	test("Await and Send execute mid-stream", async () => {
+	test("Watch and Send execute mid-stream", async () => {
 		scenario = "await_send_not_eager";
 		providerAttempts = 0;
 		executionOrder.length = 0;
@@ -417,7 +420,7 @@ describe("agent loop tool-result settlement", () => {
 
 		// Aborting mid-stream means the post-stream tool phase never runs: both calls ran
 		// while the provider was still streaming.
-		expect(executionOrder).toContain("Await");
+		expect(executionOrder).toContain("Watch");
 		expect(executionOrder).toContain("Send");
 		expect(events.at(-1)).toEqual({ type: "error", message: "Aborted" });
 	});

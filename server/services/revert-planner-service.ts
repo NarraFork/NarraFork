@@ -10,6 +10,7 @@ import { createHash } from "node:crypto";
 // A zero-delay timer, not setImmediate: Bun can leave a queued immediate waiting on its next
 // long poll (up to ~1s), the same stall revert-selection-service.ts avoids.
 import { setTimeout as yieldToEventLoop } from "node:timers/promises";
+import { readQueryFirst } from "@server/db/worker-read";
 import {
 	FILE_CHANGE_EVIDENCE_VERSION,
 	FILE_CHANGE_LIMITS,
@@ -22,6 +23,8 @@ import {
 	fileChangeStatesEqual,
 	type KnownFileChangeState,
 } from "@shared/file-change-protocol";
+import { and, eq } from "drizzle-orm";
+import { revertOperations } from "../db/schema";
 import { AppError } from "../lib/errors";
 import type { FileChangeBlobCatalog } from "./file-change-blob-catalog";
 import { type FileChangeBlobStore, FileChangeBlobStoreError } from "./file-change-blob-store";
@@ -113,6 +116,7 @@ export interface RevertPlannerOptions {
 	/** Separate cumulative physical read/processing cap, default 1 GiB (four 256 MiB passes). */
 	maxProcessedBytes?: number;
 	timeoutMs?: number;
+	readInspectionBody?: RevertSelectionOptions["readInspectionBody"];
 	onSlow?: (event: {
 		service: "revert-planner";
 		durationMs: number;
@@ -207,6 +211,7 @@ export class RevertPlannerService {
 		this.selection = new RevertSelectionService(database, {
 			authorize: (principal, row, need, signal) =>
 				options.access.authorizeNarrator(principal, row, need, signal),
+			readInspectionBody: options.readInspectionBody,
 		});
 		this.plans = new RevertPlanService(database, options.planOptions);
 		const context = () => {
@@ -235,7 +240,7 @@ export class RevertPlannerService {
 				const active = context();
 				await this.guard(active, active.work, input.signal);
 				const ref = await active.work.wait(options.blobStore.putBytes(bytes, input));
-				this.ready(ref);
+				await this.ready(ref, active.work.signal);
 				return ref;
 			},
 			mergeOptions: {
@@ -266,7 +271,9 @@ export class RevertPlannerService {
 			const original = await encodeJson({ version: 1, owner, request: fixed }, work);
 			work.charge(original.ref.sizeBytes);
 			const requestDigest = original.ref.digest;
-			this.checkIdempotency(owner, fixed.idempotencyKey, requestDigest);
+			await work.wait(
+				this.checkIdempotency(owner, fixed.idempotencyKey, requestDigest, work.signal),
+			);
 			const selected = await work.wait(
 				this.selection.collect({
 					...fixed,
@@ -422,7 +429,7 @@ export class RevertPlannerService {
 					for (const ref of result.outputRefs) work.addRef(ref);
 					const desiredRef = isRevertPlanFileNoOp(result) ? null : stateRef(result.desired);
 					work.addRef(desiredRef);
-					if (desiredRef) this.ready(desiredRef);
+					if (desiredRef) await this.ready(desiredRef, work.signal);
 					files.push({
 						sequence: files.length,
 						identity,
@@ -627,15 +634,30 @@ export class RevertPlannerService {
 			projectId: context.projectId,
 		});
 	}
-	private checkIdempotency(owner: RevertPlanOwner, key: string, digest: string) {
-		const row = this.database.$client
-			.query<
-				{ id: string; requestDigest: string; narratorId: string | null; projectId: string | null },
-				[string, string]
-			>(
-				"SELECT id,request_digest AS requestDigest,narrator_id AS narratorId,project_id AS projectId FROM revert_operations WHERE requested_by_subject_key=? AND idempotency_key=? LIMIT 1",
-			)
-			.get(owner.subjectKey, key);
+	private async checkIdempotency(
+		owner: RevertPlanOwner,
+		key: string,
+		digest: string,
+		signal: AbortSignal,
+	) {
+		const row = await readQueryFirst(
+			this.database
+				.select({
+					id: revertOperations.id,
+					requestDigest: revertOperations.requestDigest,
+					narratorId: revertOperations.narratorId,
+					projectId: revertOperations.projectId,
+				})
+				.from(revertOperations)
+				.where(
+					and(
+						eq(revertOperations.requestedBySubjectKey, owner.subjectKey),
+						eq(revertOperations.idempotencyKey, key),
+					),
+				)
+				.limit(1),
+			{ executionPolicy: "worker-required", maxRows: 1, signal },
+		);
 		if (!row) return;
 		if (
 			row.requestDigest !== digest ||
@@ -643,7 +665,7 @@ export class RevertPlannerService {
 			row.projectId !== owner.projectId
 		)
 			throw fail("REQUEST_CONFLICT", "Idempotency key belongs to another complete request/context");
-		const summary = this.plans.getSummary(owner, row.id);
+		const summary = await this.plans.getSummary(owner, row.id, { signal });
 		if (summary.expired)
 			throw fail("EXPIRED", "The original preview expired; use a new request key");
 		if (summary.status !== "planned" && summary.status !== "prepared")
@@ -722,15 +744,16 @@ export class RevertPlannerService {
 	) {
 		const ref = stateRef(state);
 		if (!ref || !raw || signal.aborted || ref.sizeBytes > work.remaining) return;
-		const budget = this.options.blobCatalog.getBudget();
-		if (budget?.namespaceKey !== this.options.planOptions.namespaceKey) return;
-		// Dedupe before reserving: the store reserves first, so low quota would block reuse.
-		const known = this.options.blobCatalog.getMetadata({
-			expectedGeneration: this.options.generation,
-			ref,
-		});
-		if (known?.status === "ready" && known.sizeBytes === ref.sizeBytes) return;
 		try {
+			const budget = await this.options.blobCatalog.readBudget({ signal });
+			if (budget?.namespaceKey !== this.options.planOptions.namespaceKey) return;
+			// Dedupe before reserving: the store reserves first, so low quota would block reuse.
+			const known = await this.options.blobCatalog.readMetadata({
+				expectedGeneration: this.options.generation,
+				ref,
+				signal,
+			});
+			if (known?.status === "ready" && known.sizeBytes === ref.sizeBytes) return;
 			const published = await work.wait(
 				this.options.blobStore.putBytes(raw, {
 					signal,
@@ -746,25 +769,26 @@ export class RevertPlannerService {
 			work.check();
 		}
 	}
-	private ready(ref: FileChangeBlobRef) {
-		const budget = this.options.blobCatalog.getBudget();
+	private async ready(ref: FileChangeBlobRef, signal: AbortSignal) {
+		const budget = await this.options.blobCatalog.readBudget({ signal });
 		if (!budget || budget.namespaceKey !== this.options.planOptions.namespaceKey)
 			throw fail("CATALOG_UNVERIFIED", "The physical evidence namespace changed or is not ready");
-		const row = this.options.blobCatalog.getMetadata({
+		const row = await this.options.blobCatalog.readMetadata({
 			expectedGeneration: this.options.generation,
 			ref,
+			signal,
 		});
 		if (row?.status !== "ready" || row.sizeBytes !== ref.sizeBytes)
 			throw fail("BLOB_UNAVAILABLE", "The complete raw object must be published and catalog-ready");
 	}
 	private async readBlob(ref: FileChangeBlobRef, work: Work, signal = work.signal) {
 		work.process(ref.sizeBytes);
-		this.ready(ref);
+		await this.ready(ref, signal);
 		try {
 			const bytes = await work.wait(
 				this.options.blobStore.readBytes(ref, { signal, maxBytes: FILE_CHANGE_LIMITS.blobBytes }),
 			);
-			this.ready(ref);
+			await this.ready(ref, signal);
 			return bytes;
 		} catch (error) {
 			work.check();
@@ -785,7 +809,7 @@ export class RevertPlannerService {
 				{ signal: work.signal, expectedSize: raw.ref.sizeBytes, expectedDigest: raw.ref.digest },
 			),
 		);
-		this.ready(ref);
+		await this.ready(ref, work.signal);
 		// putStream itself validates digest, fsyncs, publishes and rereads the original bytes.
 		if (ref.digest !== raw.ref.digest || ref.sizeBytes !== raw.ref.sizeBytes)
 			throw fail("BLOB_INTEGRITY", "The original manifest publication did not match");

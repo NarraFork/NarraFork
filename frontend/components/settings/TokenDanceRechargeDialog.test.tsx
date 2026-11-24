@@ -29,6 +29,7 @@ const globals = {
 	localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
 	window,
 	document: window.document,
+	Document: window.Document,
 	navigator: { userAgent: "Desktop" },
 	HTMLElement: window.HTMLElement,
 	HTMLInputElement: window.HTMLInputElement,
@@ -253,6 +254,7 @@ async function renderSection() {
 								connection={connection}
 								enabled
 								onToggleEnabled={() => {}}
+								onToolResultImagesChange={() => {}}
 								onLogin={async () => {}}
 								onChanged={async () => {}}
 								onDeleted={() => {}}

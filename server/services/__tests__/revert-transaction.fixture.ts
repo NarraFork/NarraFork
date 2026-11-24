@@ -25,9 +25,10 @@ import { editTool } from "../../lib/agent/tools/edit";
 import { structSedTool } from "../../lib/agent/tools/struct-sed/tool";
 import { writeTool } from "../../lib/agent/tools/write";
 import type { ToolContext, ToolExecutionTarget } from "../../lib/agent/types";
+import { closeReadDatabase } from "../../lib/db-worker/pool";
 import { generateId } from "../../lib/id";
 import { fileChangeLocalIo } from "../file-change-local-io";
-import { LocalFileChangeRuntime, withLocalFileChangeRuntime } from "../file-change-runtime";
+import { type LocalFileChangeRuntime, withLocalFileChangeRuntime } from "../file-change-runtime";
 import type { NarratorAclRow, NarratorPrincipal } from "../narrator-acl";
 import { RevertPlanService, type RevertPlanSummary } from "../revert-plan-service";
 import {
@@ -41,6 +42,7 @@ import {
 	type RevertTransactionOptions,
 	RevertTransactionService,
 } from "../revert-transaction-service";
+import { makeRetainedHistoryRuntimeForTests } from "./retained-file-history";
 
 export const principal: NarratorPrincipal = { userId: "alice", isAdmin: false };
 export const owner = { subjectKey: "human:alice", narratorId: "narrator", projectId: "project" };
@@ -119,7 +121,7 @@ export function own<T>(work: Promise<T>, pending = ownedWork): Promise<T> {
 	return work;
 }
 export function makeFixtureRuntime(...args: ConstructorParameters<typeof LocalFileChangeRuntime>) {
-	return new LocalFileChangeRuntime(...args);
+	return makeRetainedHistoryRuntimeForTests(...args);
 }
 export function makeFixtureTransaction(
 	...args: ConstructorParameters<typeof RevertTransactionService>
@@ -263,7 +265,7 @@ export async function seedFixture(owner: FixtureLifetime) {
 		async resolveFile({ identity, signal }) {
 			signal.throwIfAborted();
 			if (identity.deviceId !== "local") throw new Error("No remote fallback");
-			const scope = runtime.evidence.getScope(identity.scopeId);
+			const scope = await runtime.evidence.getScope(identity.scopeId, { signal });
 			if (!scope) throw new Error("No scope metadata");
 			return {
 				identity,
@@ -327,7 +329,10 @@ export async function closeFixture(closing: FixtureLifetime) {
 	for (const restore of closing.restores.splice(0).reverse()) restore();
 	// Finalize Drizzle's prepared statements instead of deferring SQLite's native
 	// connection disposal to GC, which leaves fixture files locked on Windows.
-	closing.sqlite?.close(true);
+	if (closing.sqlite) {
+		await closeReadDatabase(closing.sqlite.filename, { timeoutMs: 5000 });
+		closing.sqlite.close(true);
+	}
 	// Windows may still report EBUSY/EPERM for a moment after the last handle closes (indexer,
 	// AV, a just-settled background read). Node retries those codes with linear backoff; the
 	// directory is still removed for real, and a persistent lock still fails the hook.
@@ -491,7 +496,9 @@ export async function twoFiles() {
 		await write(path, "changed");
 	}
 	const plan = await prepare();
-	const ordered = plans.listFiles(owner, plan.id).items.sort((x, y) => x.sequence - y.sequence);
+	const ordered = (await plans.listFiles(owner, plan.id)).items.sort(
+		(x, y) => x.sequence - y.sequence,
+	);
 	return {
 		a: ordered[0].identityJson.canonicalPath,
 		b: ordered[1].identityJson.canonicalPath,

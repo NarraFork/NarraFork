@@ -117,7 +117,10 @@ mock.module("../../../server/lib/mcp/tool-bridge", () => ({
 	},
 }));
 
-const { mcpRoutes } = await import("../../../server/routes/mcp");
+const { mcpOAuthCallbackRoutes, mcpRoutes, requestedMcpOAuthRedirectUrl } = await import(
+	"../../../server/routes/mcp"
+);
+const { getMcpOAuthStatus } = await import("../../../server/lib/mcp/oauth");
 
 let role: "admin" | "user" = "user";
 const ACTOR_ID = "mcp-test-user";
@@ -805,5 +808,82 @@ describe("MCP tool-list refresh", () => {
 			"existing",
 			"second",
 		]);
+	});
+});
+
+describe("MCP OAuth routes", () => {
+	it("keeps the OAuth client secret out of settings and reports only its presence", async () => {
+		role = "admin";
+		const res = await app.request("/servers", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				name: "Remote",
+				transport: "streamable-http",
+				url: "https://mcp.example/mcp",
+				oauth: { clientId: "client-1" },
+				oauthClientSecret: "top-secret",
+				enabled: false,
+			}),
+		});
+		expect(res.status).toBe(201);
+		const created = await res.json();
+		expect(JSON.stringify(created)).not.toContain("top-secret");
+		const saved = settingsState.mcpServers.find((s) => s.id === created.id);
+		expect(saved?.oauth).toEqual({ clientId: "client-1" });
+		expect(JSON.stringify(saved)).not.toContain("top-secret");
+		expect(saved && getMcpOAuthStatus(saved).hasClientSecret).toBe(true);
+
+		const patched = await app.request(`/servers/${created.id}`, {
+			method: "PATCH",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ oauth: null, oauthClientSecret: null }),
+		});
+		expect(patched.status).toBe(200);
+		const updated = settingsState.mcpServers.find((s) => s.id === created.id);
+		expect(updated?.oauth).toBeUndefined();
+		expect(updated && getMcpOAuthStatus(updated).hasClientSecret).toBe(false);
+	});
+
+	it("authorization start is admin-only", async () => {
+		role = "user";
+		const res = await app.request("/servers/existing/oauth/start", { method: "POST" });
+		expect(res.status).toBe(403);
+	});
+
+	it("the OAuth redirect keeps the mount prefix the browser runs under, on the same origin only", async () => {
+		const probe = new Hono().post("/", async (c) =>
+			c.text(requestedMcpOAuthRedirectUrl(c, (await c.req.json()).redirectUrl)),
+		);
+		const ask = async (redirectUrl: unknown) =>
+			(
+				await probe.request("/", {
+					method: "POST",
+					headers: { Origin: "https://nf.example", "Content-Type": "application/json" },
+					body: JSON.stringify({ redirectUrl }),
+				})
+			).text();
+		const fallback = "https://nf.example/api/mcp/oauth/callback";
+		expect(await ask("https://nf.example/nf/api/mcp/oauth/callback")).toBe(
+			"https://nf.example/nf/api/mcp/oauth/callback",
+		);
+		expect(await ask(undefined)).toBe(fallback);
+		expect(await ask("https://evil.example/api/mcp/oauth/callback")).toBe(fallback);
+		expect(await ask("https://nf.example/nf/other")).toBe(fallback);
+		expect(await ask("https://nf.example/api/mcp/oauth/callback?x=1")).toBe(fallback);
+	});
+
+	it("the public callback rejects unknown state and escapes provider errors", async () => {
+		const callback = new Hono().route("/", mcpOAuthCallbackRoutes);
+		const unknown = await callback.request("/callback?state=nope&code=abc");
+		expect(unknown.status).toBe(400);
+		expect(await unknown.text()).toContain("Unknown or expired");
+		const denied = await callback.request(
+			`/callback?state=nope&error=access_denied&error_description=${encodeURIComponent("<script>x</script>")}`,
+		);
+		expect(denied.status).toBe(400);
+		const html = await denied.text();
+		expect(html).not.toContain("<script>x");
+		expect(html).toContain("&lt;script&gt;");
 	});
 });

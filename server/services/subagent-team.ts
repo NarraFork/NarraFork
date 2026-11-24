@@ -1,6 +1,7 @@
 import { and, asc, eq, like, or } from "drizzle-orm";
 import { db } from "../db";
 import { narrators } from "../db/schema";
+import { type ReadQueryOptions, readQuery, readQueryFirst } from "../db/worker-read";
 import { eventBus } from "../lib/event-bus";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { type AgentMessageDelivery, createAgentMessageDelivery } from "./agent-message-delivery";
@@ -14,6 +15,7 @@ import {
 	wakeInboxIfEligible,
 } from "./agent-runtime/inbox";
 import type { MailboxClaim } from "./agent-runtime/mailbox-types";
+import { RuntimeReadConflictError } from "./agent-runtime/read-conflict";
 import type { RuntimeMailboxRow } from "./agent-runtime/runtime-queue-port";
 import { normalizeWorkspacePath } from "./git-workspace";
 import {
@@ -40,34 +42,45 @@ function getTeamFileChangesMap() {
 }
 
 /** Record an observation. Old callers remain readable, with UNKNOWN location. */
-export function recordTeamFileChange(
+export async function recordTeamFileChange(
 	parentNarratorId: string,
 	subagentId: string,
 	filePath: string,
 	location?: { deviceId: string | null; workspacePath: string | null },
-): void {
+	options: Pick<ReadQueryOptions, "signal" | "deadlineAt" | "timeoutMs"> = {},
+): Promise<void> {
 	// parentNarratorId also records ordinary primary forks. Validate real identity
-	// with one small indexed read rather than treating provenance as team membership.
-	try {
-		const child = db
-			.select({
-				type: narrators.type,
-				variant: narrators.variant,
-				parentId: narrators.parentNarratorId,
-			})
+	// with bounded indexed reads rather than treating provenance as team membership.
+	const selection = {
+		type: narrators.type,
+		variant: narrators.variant,
+		parentId: narrators.parentNarratorId,
+	};
+	const child = await readQueryFirst(
+		db.select(selection).from(narrators).where(eq(narrators.id, subagentId)).limit(1),
+		{ ...options, executionPolicy: "worker-required", maxRows: 1 },
+	);
+	if (
+		!child ||
+		child.parentId !== parentNarratorId ||
+		(child.type !== "subagent" && !child.variant.startsWith("subagent:"))
+	)
+		return;
+	db.transaction((tx) => {
+		const current = tx
+			.select(selection)
 			.from(narrators)
 			.where(eq(narrators.id, subagentId))
+			.limit(1)
 			.get();
 		if (
-			!child ||
-			child.parentId !== parentNarratorId ||
-			(child.type !== "subagent" && !child.variant.startsWith("subagent:"))
+			!current ||
+			current.parentId !== child.parentId ||
+			current.type !== child.type ||
+			current.variant !== child.variant
 		)
-			return;
-	} catch {
-		// Tracking must not fail a successful tool operation.
-		return;
-	}
+			throw new RuntimeReadConflictError();
+	});
 	const team = getTeamFileChangesMap();
 	let members = team.get(parentNarratorId);
 	if (!members) {
@@ -119,6 +132,7 @@ export function getTeamFileChanges(parentNarratorId: string): Map<string, Set<st
 export async function getPersistedTeamFileChanges(
 	parentNarratorId: string,
 	targetNarratorId?: string,
+	readOptions: Pick<ReadQueryOptions, "signal" | "deadlineAt" | "timeoutMs"> = {},
 ): Promise<Map<string, Set<string>>> {
 	// A requested target is not a page filter: query it directly, even if it is
 	// beyond the bounded whole-team window. The synchronous observation API is
@@ -127,8 +141,8 @@ export async function getPersistedTeamFileChanges(
 	const result = targetNarratorId ? new Map<string, Set<string>>() : observations;
 	if (targetNarratorId && observations.has(targetNarratorId))
 		result.set(targetNarratorId, observations.get(targetNarratorId) as Set<string>);
-	try {
-		const children = await db
+	const children = await readQuery(
+		db
 			.select({ id: narrators.id })
 			.from(narrators)
 			.where(
@@ -139,36 +153,38 @@ export async function getPersistedTeamFileChanges(
 				),
 			)
 			.orderBy(asc(narrators.id))
-			.limit(targetNarratorId ? 1 : MAX_SUBAGENT_QUERY_IDS + 1);
-		const ids = children.slice(0, MAX_SUBAGENT_QUERY_IDS).map((child) => child.id);
-		if (!ids.length) return result;
-		const options = await getCurrentSubagentFileChangeOptions(ids, parentNarratorId);
-		const persisted = await getFileChangesBySubagent(ids, options);
-		for (const [id, changes] of persisted) {
-			const files = result.get(id) ?? new Set<string>();
-			const observations = getTeamFileChangesMap().get(parentNarratorId)?.get(id);
-			for (const file of changes.files) {
-				const observation = observations?.get(subagentFileIdentityKey(file));
-				if (observation) files.delete(formatTeamObservation(observation));
-				files.add(
-					`${subagentFileIdentityKey(file)} (${changes.attributionScope}; cumulative churn, not net contribution${observation ? "; also legacy/unscoped observation" : ""})`,
-				);
-			}
-			if (changes.bashTouchedCount)
-				files.add(`${changes.bashTouchedCount} shell file observation(s), lines not measured`);
-			if (changes.countsTruncated) files.add("File evidence truncated; totals are lower bounds");
-			result.set(id, files);
+			.limit(targetNarratorId ? 1 : MAX_SUBAGENT_QUERY_IDS + 1),
+		{
+			...readOptions,
+			executionPolicy: "worker-required",
+			maxRows: targetNarratorId ? 1 : MAX_SUBAGENT_QUERY_IDS + 1,
+		},
+	);
+	const ids = children.slice(0, MAX_SUBAGENT_QUERY_IDS).map((child) => child.id);
+	if (!ids.length) return result;
+	const options = await getCurrentSubagentFileChangeOptions(ids, parentNarratorId, readOptions);
+	const persisted = await getFileChangesBySubagent(ids, options);
+	for (const [id, changes] of persisted) {
+		const files = result.get(id) ?? new Set<string>();
+		const observations = getTeamFileChangesMap().get(parentNarratorId)?.get(id);
+		for (const file of changes.files) {
+			const observation = observations?.get(subagentFileIdentityKey(file));
+			if (observation) files.delete(formatTeamObservation(observation));
+			files.add(
+				`${subagentFileIdentityKey(file)} (${changes.attributionScope}; cumulative churn, not net contribution${observation ? "; also legacy/unscoped observation" : ""})`,
+			);
 		}
-		if (children.length > MAX_SUBAGENT_QUERY_IDS) {
-			const files = result.get(ids[0]) ?? new Set<string>();
-			files.add("Team receipt query truncated; observations are incomplete");
-			result.set(ids[0], files);
-		}
-		return result;
-	} catch {
-		// Persisted evidence unavailable: observations keep their legacy/unscoped label.
-		return result;
+		if (changes.bashTouchedCount)
+			files.add(`${changes.bashTouchedCount} shell file observation(s), lines not measured`);
+		if (changes.countsTruncated) files.add("File evidence truncated; totals are lower bounds");
+		result.set(id, files);
 	}
+	if (children.length > MAX_SUBAGENT_QUERY_IDS) {
+		const files = result.get(ids[0]) ?? new Set<string>();
+		files.add("Team receipt query truncated; observations are incomplete");
+		result.set(ids[0], files);
+	}
+	return result;
 }
 
 /** Clear file change tracking for a team. */

@@ -194,8 +194,96 @@ export function hasPendingContextCharacterRefresh(narratorId?: string): boolean 
 	);
 }
 
+let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+let refreshWork: Promise<void> | undefined;
+let refreshQuiescing = false;
+let refreshFailure: Error | undefined;
+
+export function getContextCharacterRefreshStatus() {
+	return {
+		pending:
+			pendingRefreshes.size +
+			flushingNarrators.size +
+			Number(overflowPending) +
+			Number(overflowFlushing),
+		running: refreshRunning,
+		scheduled: refreshScheduled,
+		failed: refreshFailure !== undefined,
+		quiescing: refreshQuiescing,
+	};
+}
+
+/** Retain queued invalidations for the explicit shutdown drain. */
+export function quiesceContextCharacterRefreshes(): void {
+	refreshQuiescing = true;
+	clearTimeout(refreshTimer);
+	refreshTimer = undefined;
+	refreshScheduled = false;
+}
+
+function startContextCharacterRefresh(): Promise<void> {
+	if (refreshWork) return refreshWork;
+	refreshRunning = true;
+	const ids = [...pendingRefreshes];
+	pendingRefreshes.clear();
+	pendingMessages = 0;
+	const overflow = overflowPending;
+	overflowPending = false;
+	overflowFlushing = overflow;
+	for (const [id, entry] of ids) flushingNarrators.set(id, entry);
+	let failed = false;
+	const retainFailure = (error: unknown) => {
+		failed = true;
+		// A bounded global invalidation retains every failed holder without growing an ID queue.
+		overflowPending = true;
+		overflowBlocked = true;
+		refreshFailure = Object.assign(new Error("Context character refresh failed"), {
+			code: "CONTEXT_CHARACTER_REFRESH_FAILED",
+		});
+		console.warn("Context character refresh failed", error);
+	};
+	refreshWork = import("../services/narrator-context-composition")
+		.then(async (service) => {
+			if (overflow) {
+				await service.invalidateContextCharacterOverflow();
+				overflowRetries = 0;
+			}
+			for (const [id, entry] of ids) {
+				try {
+					if (typeof service.invalidateContextCharacterBatch === "function") {
+						await service.invalidateContextCharacterBatch(
+							id,
+							entry.messages.size ? [...entry.messages] : undefined,
+							{ full: entry.full },
+						);
+					} else {
+						if (entry.full || !entry.messages.size)
+							await service.invalidateContextCharacterCache(id);
+						for (const messageId of entry.messages)
+							await service.invalidateContextCharacterCache(id, messageId);
+					}
+				} catch (error) {
+					retainFailure(error);
+				} finally {
+					flushingNarrators.delete(id);
+				}
+			}
+		})
+		.catch(retainFailure)
+		.finally(() => {
+			for (const [id] of ids) flushingNarrators.delete(id);
+			overflowFlushing = false;
+			refreshRunning = false;
+			refreshWork = undefined;
+			if (!failed) refreshFailure = undefined;
+			scheduleContextCharacterRefresh();
+		});
+	return refreshWork;
+}
+
 function scheduleContextCharacterRefresh(): void {
 	if (
+		refreshQuiescing ||
 		refreshScheduled ||
 		refreshRunning ||
 		overflowBlocked ||
@@ -203,64 +291,62 @@ function scheduleContextCharacterRefresh(): void {
 	)
 		return;
 	refreshScheduled = true;
-	setTimeout(
+	refreshTimer = setTimeout(
 		() => {
+			refreshTimer = undefined;
 			refreshScheduled = false;
-			refreshRunning = true;
-			const ids = [...pendingRefreshes];
-			pendingRefreshes.clear();
-			pendingMessages = 0;
-			const overflow = overflowPending;
-			overflowPending = false;
-			overflowFlushing = overflow;
-			for (const [id, entry] of ids) flushingNarrators.set(id, entry);
-			void import("../services/narrator-context-composition")
-				.then(async (service) => {
-					if (overflow) {
-						// Unknown shared holders must also lose freshness; never silently discard IDs.
-						await service.invalidateContextCharacterOverflow();
-						overflowRetries = 0;
-					}
-					for (const [id, entry] of ids) {
-						try {
-							// One epoch per affected holder, not one epoch for every message in the burst.
-							if (typeof service.invalidateContextCharacterBatch === "function") {
-								await service.invalidateContextCharacterBatch(
-									id,
-									entry.messages.size ? [...entry.messages] : undefined,
-									{ full: entry.full },
-								);
-							} else {
-								// Compatibility with older integrations and isolated module fixtures.
-								if (entry.full || !entry.messages.size)
-									await service.invalidateContextCharacterCache(id);
-								for (const messageId of entry.messages)
-									await service.invalidateContextCharacterCache(id, messageId);
-							}
-						} catch (error) {
-							console.warn("Context character refresh failed", id, error);
-						} finally {
-							flushingNarrators.delete(id);
-						}
-					}
-				})
-				.catch((error: unknown) => {
-					if (overflow) {
-						overflowPending = true;
-						overflowRetries++;
-						overflowBlocked = overflowRetries >= 3;
-					}
-					console.warn("Context character refresh failed", error);
-				})
-				.finally(() => {
-					for (const [id] of ids) flushingNarrators.delete(id);
-					overflowFlushing = false;
-					refreshRunning = false;
-					scheduleContextCharacterRefresh();
-				});
+			void startContextCharacterRefresh();
 		},
 		overflowRetries ? 200 : 0,
 	);
+}
+
+export async function drainContextCharacterRefreshes(options: {
+	deadlineAt: number;
+	signal?: AbortSignal;
+}): Promise<void> {
+	if (!Number.isFinite(options.deadlineAt))
+		throw new TypeError("Context character drain deadline must be finite");
+	while (refreshWork || hasPendingContextCharacterRefresh()) {
+		options.signal?.throwIfAborted();
+		if (refreshFailure && !refreshWork) throw refreshFailure;
+		const remaining = options.deadlineAt - Date.now();
+		if (remaining <= 0)
+			throw Object.assign(new Error("Context character refresh drain deadline expired"), {
+				code: "CONTEXT_CHARACTER_DRAIN_TIMEOUT",
+			});
+		clearTimeout(refreshTimer);
+		refreshTimer = undefined;
+		refreshScheduled = false;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		let onAbort: (() => void) | undefined;
+		try {
+			await Promise.race([
+				refreshWork ?? startContextCharacterRefresh(),
+				new Promise<never>((_resolve, reject) => {
+					timer = setTimeout(
+						() =>
+							reject(
+								Object.assign(new Error("Context character refresh drain deadline expired"), {
+									code: "CONTEXT_CHARACTER_DRAIN_TIMEOUT",
+								}),
+							),
+						remaining,
+					);
+					onAbort = () =>
+						reject(
+							options.signal?.reason ?? new Error("Context character refresh drain cancelled"),
+						);
+					options.signal?.addEventListener("abort", onAbort, { once: true });
+				}),
+			]);
+		} finally {
+			if (timer !== undefined) clearTimeout(timer);
+			if (onAbort) options.signal?.removeEventListener("abort", onAbort);
+		}
+		if (refreshFailure) throw refreshFailure;
+	}
+	options.signal?.throwIfAborted();
 }
 
 /** Coalesce numeric changes before the asynchronous service invalidation; never read a body. */
@@ -270,6 +356,7 @@ export function queueContextCharacterRefresh(narratorId: string, messageId?: str
 		// A later actual write can retry an unavailable service; no endless hot retry loop.
 		overflowBlocked = false;
 		overflowRetries = 0;
+		refreshFailure = undefined;
 	}
 	if (overflowPending) {
 		scheduleContextCharacterRefresh();

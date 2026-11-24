@@ -1,6 +1,7 @@
 import { and, eq, inArray, isNull } from "drizzle-orm";
 import { db } from "../db";
 import { narrators, oauthClients, remoteDevices } from "../db/schema";
+import { type ReadQueryOptions, readQuery, readQueryFirst } from "../db/worker-read";
 import { AppError, NotFoundError } from "../lib/errors";
 import {
 	intersectOAuthClientPolicies,
@@ -152,18 +153,36 @@ function resolveDangerReflectionPrompt(
 export async function resolveOAuthNarratorRuntimePolicy(
 	narratorId: string,
 	expectedUserId?: string | null,
+	readOptions?: ReadQueryOptions,
+	/** Server-loaded facts from this authorization only. */
+	loadedNarrator?: Pick<
+		typeof narrators.$inferSelect,
+		"id" | "oauthPolicySnapshotJson" | "contextProjectId" | "defaultDeviceId"
+	>,
 ): Promise<OAuthNarratorRuntimePolicy | null> {
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: {
-			id: true,
-			oauthPolicySnapshotJson: true,
-			contextProjectId: true,
-			defaultDeviceId: true,
-		},
-	});
+	readOptions?.signal?.throwIfAborted();
+	const narrator =
+		loadedNarrator?.id === narratorId
+			? loadedNarrator
+			: await readQueryFirst(
+					db.query.narrators.findMany({
+						limit: 1,
+						where: eq(narrators.id, narratorId),
+						columns: {
+							id: true,
+							oauthPolicySnapshotJson: true,
+							contextProjectId: true,
+							defaultDeviceId: true,
+						},
+					}),
+					{ ...readOptions, executionPolicy: "worker-required" },
+				);
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
-	const provenance = await integrationResourceBindingService.get("narrator", narrator.id);
+	const provenance = await integrationResourceBindingService.get(
+		"narrator",
+		narrator.id,
+		readOptions,
+	);
 	if (!provenance) {
 		if (narrator.oauthPolicySnapshotJson !== null) {
 			throw runtimeForbidden("OAuth narrator provenance is missing");
@@ -192,7 +211,11 @@ export async function resolveOAuthNarratorRuntimePolicy(
 		throw runtimeForbidden("OAuth narrator default device is outside its provision snapshot");
 	}
 
-	const authority = await integrationAuthorityService.getSnapshot(provenance.authorityId);
+	const authority = await integrationAuthorityService.getSnapshot(
+		provenance.authorityId,
+		{},
+		readOptions,
+	);
 	if (
 		!authority ||
 		authority.authority.kind !== "oauth_grant" ||
@@ -212,12 +235,17 @@ export async function resolveOAuthNarratorRuntimePolicy(
 		throw runtimeForbidden("OAuth narrator trigger user does not own the authority");
 	}
 
-	const client = await db.query.oauthClients.findFirst({
-		where: and(
-			eq(oauthClients.id, authority.authority.integrationId),
-			isNull(oauthClients.revokedAt),
-		),
-	});
+	readOptions?.signal?.throwIfAborted();
+	const client = await readQueryFirst(
+		db.query.oauthClients.findMany({
+			limit: 1,
+			where: and(
+				eq(oauthClients.id, authority.authority.integrationId),
+				isNull(oauthClients.revokedAt),
+			),
+		}),
+		{ ...readOptions, executionPolicy: "worker-required" },
+	);
 	if (!client?.publicClient) throw runtimeForbidden("OAuth client is inactive");
 	// Grant ownership is the boundary: require the send_message capability on the
 	// authority (any scope) rather than a project-scoped grant.
@@ -235,15 +263,19 @@ export async function resolveOAuthNarratorRuntimePolicy(
 	);
 	if (!policy) throw runtimeForbidden("OAuth narrator policy intersection is empty");
 
-	const deviceRows = await db.query.remoteDevices.findMany({
-		where: and(inArray(remoteDevices.id, snapshot.deviceIds), isNull(remoteDevices.revokedAt)),
-		columns: { id: true, scope: true, projectId: true },
-	});
+	readOptions?.signal?.throwIfAborted();
+	const deviceRows = await readQuery(
+		db.query.remoteDevices.findMany({
+			where: and(inArray(remoteDevices.id, snapshot.deviceIds), isNull(remoteDevices.revokedAt)),
+			columns: { id: true, scope: true, projectId: true },
+		}),
+		{ ...readOptions, executionPolicy: "worker-required" },
+	);
 	const devicesById = new Map(deviceRows.map((device) => [device.id, device]));
 	for (const deviceId of snapshot.deviceIds) {
 		const device = devicesById.get(deviceId);
 		const deviceProvenance = device
-			? await integrationResourceBindingService.get("device", device.id)
+			? await integrationResourceBindingService.get("device", device.id, readOptions)
 			: null;
 		// Device isolation is enforced by the resource binding belonging to the
 		// same grant/client, not by matching a shared project anchor. For legacy

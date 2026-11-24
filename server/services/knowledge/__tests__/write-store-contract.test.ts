@@ -30,6 +30,7 @@ import { and, eq } from "drizzle-orm";
 import { db } from "../../../db";
 import {
 	aclGrants,
+	knowledgeDrafts,
 	knowledgeEntries,
 	knowledgeInjectionEvents,
 	knowledgeLevels,
@@ -290,6 +291,7 @@ describe("knowledge write store (SQLite)", () => {
 		const submission = await store.createSubmissionGuarded({
 			submissionId: generateId(),
 			draftId: draft.id,
+			expectedDraft: draft,
 			entryId,
 			collectionId: null,
 			title: null,
@@ -309,6 +311,7 @@ describe("knowledge write store (SQLite)", () => {
 			.createSubmissionGuarded({
 				submissionId: generateId(),
 				draftId: draft.id,
+				expectedDraft: draft,
 				entryId,
 				collectionId: null,
 				title: null,
@@ -338,9 +341,16 @@ describe("knowledge write store (SQLite)", () => {
 		expect(closed?.status).toBe("superseded");
 
 		// A fresh request can be withdrawn; a second withdraw reports not-changed.
+		const savedDraft = db
+			.select()
+			.from(knowledgeDrafts)
+			.where(eq(knowledgeDrafts.id, draft.id))
+			.get();
+		if (!savedDraft) throw new Error("Draft disappeared");
 		const again = await store.createSubmissionGuarded({
 			submissionId: generateId(),
 			draftId: draft.id,
+			expectedDraft: savedDraft,
 			entryId,
 			collectionId: null,
 			title: null,
@@ -378,6 +388,7 @@ describe("knowledge write store (SQLite)", () => {
 		const submission = await store.createSubmissionGuarded({
 			submissionId: generateId(),
 			draftId: draft.id,
+			expectedDraft: draft,
 			entryId,
 			collectionId: null,
 			title: null,
@@ -395,6 +406,7 @@ describe("knowledge write store (SQLite)", () => {
 			submissionId: submission.id,
 			draftId: draft.id,
 			entryId,
+			expectedMainRevisionId: revisionId,
 			revisionId: mergedRevisionId,
 			content: "merged body",
 			contentHash: "h",
@@ -418,6 +430,7 @@ describe("knowledge write store (SQLite)", () => {
 				submissionId: submission.id,
 				draftId: draft.id,
 				entryId,
+				expectedMainRevisionId: revisionId,
 				revisionId: generateId(),
 				content: "other",
 				contentHash: "h3",

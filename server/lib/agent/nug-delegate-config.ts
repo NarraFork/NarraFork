@@ -1,7 +1,9 @@
+import type { ToolResultImagesMode } from "@shared/tool-result-images";
 import type { ResolvedNugModelMeta } from "../nug-model-cache";
 import type { NUGProviderConfig, ProxyOverride } from "../settings";
 
 export interface NugDelegateBaseConfig {
+	toolResultImages?: ToolResultImagesMode;
 	id: string;
 	name: string;
 	prefix: string;
@@ -18,6 +20,7 @@ export function buildNugDelegateBaseConfig(
 	extraHeaders: Record<string, string>,
 ): NugDelegateBaseConfig {
 	return {
+		toolResultImages: config.toolResultImages,
 		id: config.id,
 		name: config.name,
 		prefix: config.prefix,

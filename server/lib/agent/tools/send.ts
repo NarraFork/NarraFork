@@ -28,7 +28,7 @@ const RESUME_DESCRIPTION =
 	"It cannot override a stop the user made.";
 
 const MODEL_DESCRIPTION =
-	"Direct child subagents only: switch each target's model before delivering this message " +
+	"Direct child subagents only: switch each target's model when this Send is newly accepted " +
 	'(use "parent" to follow your own model again). Subject to the same allowed subagent model ' +
 	"pool as the Agent call; a running subagent switches at its next model request. Combine with " +
 	"resume=true to retry a subagent that failed on its previous model.";
@@ -60,7 +60,8 @@ function buildRawJsonSchema(): Record<string, unknown> {
 		doInterrupt: {
 			description:
 				"Interrupt an active foreground child subagent after queuing the message. Use only " +
-				"for an urgent correction that requires stopping current work, never for status polling.",
+				"for an urgent correction that requires stopping current work, never for status polling. " +
+				"Interrupting a worker subagent also cancels the helper agents it launched.",
 			type: "boolean",
 		},
 	};
@@ -88,8 +89,8 @@ export const sendTool: ToolDefinition = {
 		"something the recipient needs in order to act: new information, a changed requirement, a " +
 		'concrete correction, a finding, or a blocker. Acknowledgements, thanks, "still working" ' +
 		"updates and status checks carry none of that, so leave them unsent; to learn what another " +
-		"agent knows or is doing, use ContextAsk, and to wait for its result, use Await. An Await " +
-		"timeout is not a reason to message the agent. Put everything the recipient needs into one " +
+		"agent knows or is doing, use ContextAsk. Results notify automatically; Watch registers a " +
+		"non-blocking observation and returns immediately. An observation timeout is not a reason to message the agent. Put everything the recipient needs into one " +
 		"message rather than several short ones. " +
 		"The person watching this session skims agent messages as one-line summaries. When a " +
 		"message is one they would want to read in full (a finding, a conclusion, a decision, a " +
@@ -126,7 +127,8 @@ export const sendTool: ToolDefinition = {
 			.optional()
 			.describe(
 				"Interrupt an active foreground child subagent after queuing the message. Use only " +
-					"for an urgent correction that requires stopping current work, never for status polling.",
+					"for an urgent correction that requires stopping current work, never for status polling. " +
+					"Interrupting a worker subagent also cancels the helper agents it launched.",
 			),
 		resume: z.boolean().optional().describe(RESUME_DESCRIPTION),
 		model: z.string().optional().describe(MODEL_DESCRIPTION),

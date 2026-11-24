@@ -66,17 +66,24 @@ import { withPgRetry } from "../../db/pg-retry";
 import {
 	backgroundTasks,
 	runtimeAwaitedTerminalConsumptions as consumptions,
+	deviceTransferTasks,
 	narratorBufferedMessages as mailbox,
 	narratorMessages as messages,
 	narrators,
 	narratorToolCalls,
+	narratorToolContinuations,
 	runtimePublicationOutbox as outbox,
 	narratorMessageRefs as refs,
 } from "../../db/postgres-schema";
+import type { backgroundTasks as sqliteBackgroundTasks } from "../../db/schema";
 import { ValidationError } from "../../lib/errors";
 import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
-import { registerRun } from "../../lib/validators/runtime-registration";
+import { parseSubstatus, parseTraits } from "../../lib/narrator-utils";
+import {
+	readRuntimeRegistrationColumn,
+	registerRun,
+} from "../../lib/validators/runtime-registration";
 import type { RefMessageInput } from "../narrator-refs/port";
 import {
 	lockPgNarratorRefs,
@@ -84,9 +91,17 @@ import {
 	type PgPersistedMessageRef,
 	persistPgMessageWithRef,
 } from "../narrator-refs/postgres-store";
+import { assertRecoveryFields, assertRecoveryRunAdmission } from "../recovery-observation";
+import { TERMINAL_WATCH_COMMAND_PREFIX, WATCH_COMMAND_PREFIX } from "../terminal-watch-constants";
 import { MAILBOX_LIMITS as L } from "./limits";
-import type { PublicationTerminalCommit, StartedRun, StartRunInput } from "./publication";
 import {
+	assertAgentStartFailureIdentity,
+	type PublicationTerminalCommit,
+	type StartedRun,
+	type StartRunInput,
+} from "./publication";
+import {
+	assertPublicationTaskIdentity,
 	type LegacyCompletionAdmission,
 	type LegacyCompletionRegistration,
 	type LegacyPublicationProof,
@@ -95,6 +110,7 @@ import {
 	type PublicationEvent,
 	type PublicationIntent,
 	type PublicationRun,
+	PublicationStateError,
 	publicationDedupeKey,
 	publicationEventFromDedupeKey,
 	type RunPublicationStatus,
@@ -110,6 +126,7 @@ import {
 	decodeRunAssistantProjection,
 	parseRunSourceBoundary,
 } from "./publication-result";
+import { assertRuntimeSourceUnchanged } from "./read-conflict";
 import type { PgRuntimeTx, RuntimeQueuePort } from "./runtime-queue-port";
 import { translateWriteError } from "./runtime-write";
 
@@ -249,6 +266,7 @@ export interface PgTerminalCommitInput {
 	readonly text: string;
 	readonly summary: string;
 	readonly delivery?: "background" | "foreground";
+	readonly startupFailure?: PublicationTerminalCommit["startupFailure"];
 	readonly toolConclusion?: PublicationTerminalCommit["toolConclusion"];
 }
 
@@ -280,6 +298,20 @@ export interface PgRestartAgentTaskInput {
 	readonly now: string;
 }
 
+/** Bounded identity read before archive-only legacy compensation; never includes result bodies. */
+export interface ArchivedOrphanBackgroundClaim {
+	readonly id: string;
+	readonly parentNarratorId: string | null;
+	readonly type: string;
+	readonly status: string;
+	readonly backgroundStatus: string | null;
+	readonly backgroundCompletedAt: string | null;
+	readonly logicalRunId: string | null;
+	readonly registrationText: string | null;
+	readonly substatus: string | null;
+	readonly updatedAt: string;
+}
+
 /**
  * Update a narrator's background status + publication terminal commit, atomically.
  * Used by `finalizeBackgroundCompletion` and `finalizeTakenOverBackgroundSubagentUnlocked`.
@@ -300,13 +332,27 @@ export interface PgUpdateNarratorBackgroundInput {
  * Terminal transition for a background task: the CAS update + publication
  * commit in ONE section, eliminating the two-phase read-update gap.
  */
+export interface PgStartTransferTaskInput {
+	readonly taskRow: Omit<typeof sqliteBackgroundTasks.$inferInsert, "logicalRunId"> & {
+		type: "transfer";
+		transferTaskId: string;
+	};
+	/** The claiming runner's real generation, not a publication retry count. */
+	readonly runGeneration?: number;
+}
+
 export interface PgTerminalTransitionInput {
 	readonly taskId: string;
+	readonly expectedRun?: PublicationRun;
 	readonly setFields: Record<string, unknown>;
 	readonly fullOutput: string;
 	readonly summary: string;
 	readonly eventKind: Exclude<PublicationEvent, "started">;
 	readonly deferPublication?: boolean;
+	/** Observation-only CAS: release its own reservation without publishing or consuming the target. */
+	readonly silentObservation?: boolean;
+	/** Transfer callbacks must not settle a newer generation after resume. */
+	readonly expectedTransfer?: { id: string; generation: number };
 }
 
 /**
@@ -338,6 +384,7 @@ export interface PgCleanupInput {
  */
 export interface PgCancelTaskInput {
 	readonly taskId: string;
+	readonly expectedRun?: PublicationRun;
 	readonly capturedOutput: string | null;
 	readonly capturedOutputBytes: number;
 	readonly capturedTruncated: boolean;
@@ -377,6 +424,7 @@ export interface PgTakeoverInput {
 export interface PgCancelAgentNarratorInput {
 	readonly narratorId: string;
 	readonly now: string;
+	readonly expectedLogicalRunId?: string | null;
 }
 
 /**
@@ -544,9 +592,12 @@ export function createPostgresRuntimePublication(
 		// remains in its existing source; later semantic edits must not change this receipt.
 		const originalBytes = Buffer.byteLength(text);
 		const preview = text.slice(0, 12_001);
-		const storedText = new TextDecoder().decode(Buffer.from(preview).subarray(0, snapshotBytes), {
-			stream: true,
-		});
+		const storedText = new TextDecoder("utf-8", { ignoreBOM: true }).decode(
+			Buffer.from(preview).subarray(0, snapshotBytes),
+			{
+				stream: true,
+			},
+		);
 		const truncated = originalBytes > Buffer.byteLength(storedText);
 		const message: RefMessageInput = {
 			id: messageId,
@@ -621,14 +672,17 @@ export function createPostgresRuntimePublication(
 		return and(runIdentity(run), eq(outbox.eventKind, "terminal"), eq(outbox.state, "reserved"));
 	}
 	/** Same three-state authority as the SQLite outbox; recovery never infers it from result reads. */
-	async function readRunPublicationState(run: PublicationRun): Promise<RunPublicationStatus> {
-		const reserved = await db
+	async function readRunPublicationState(
+		run: PublicationRun,
+		reader: Pick<PgRuntimeTx, "select"> = db,
+	): Promise<RunPublicationStatus> {
+		const reserved = await reader
 			.select({ id: outbox.id })
 			.from(outbox)
 			.where(reservedTerminalSlot(run))
 			.limit(1);
 		if (reserved[0]) return { state: "reserved" };
-		const committed = await db
+		const committed = await reader
 			.select({ eventKind: outbox.eventKind })
 			.from(outbox)
 			.where(
@@ -648,7 +702,7 @@ export function createPostgresRuntimePublication(
 		const keys = (["completed", "failed", "timed_out", "cancelled"] as const).map((event) =>
 			publicationDedupeKey(run, event),
 		);
-		const delivered = await db
+		const delivered = await reader
 			.select({ dedupeKey: mailbox.dedupeKey })
 			.from(mailbox)
 			.where(and(eq(mailbox.narratorId, run.recipientId), inArray(mailbox.dedupeKey, keys)))
@@ -657,7 +711,7 @@ export function createPostgresRuntimePublication(
 			const eventKind = publicationEventFromDedupeKey(delivered[0].dedupeKey);
 			return { state: "settled", ...(eventKind ? { eventKind } : {}) };
 		}
-		const consumed = await db
+		const consumed = await reader
 			.select({ taskId: consumptions.taskId })
 			.from(consumptions)
 			.where(
@@ -803,24 +857,128 @@ export function createPostgresRuntimePublication(
 		 * process for the same actual attempt.
 		 */
 		async startRun(input: StartRunInput): Promise<StartedRun> {
+			if (input.taskRow && !input.binding.deliverTo)
+				throw new ValidationError("Background task registration requires a delivery destination");
 			return runComposite("publication.startRun", async (tx) => {
+				if (input.expectedTask || input.subagentRecovery || input.parentRecoveryTurn) {
+					await tx
+						.select({ id: narrators.id })
+						.from(narrators)
+						.where(eq(narrators.id, input.narratorId))
+						.for("update");
+				}
+				if (input.expectedTask) {
+					const [current] = await tx
+						.select({
+							id: backgroundTasks.id,
+							type: backgroundTasks.type,
+							status: backgroundTasks.status,
+							parentNarratorId: backgroundTasks.parentNarratorId,
+							subagentNarratorId: backgroundTasks.subagentNarratorId,
+							logicalRunId: backgroundTasks.logicalRunId,
+						})
+						.from(backgroundTasks)
+						.where(eq(backgroundTasks.id, input.expectedTask.id))
+						.for("update");
+					assertRecoveryFields(input.expectedTask.row, current);
+				}
+				if (input.subagentRecovery) {
+					const [current] = await tx
+						.select({
+							id: narrators.id,
+							status: narrators.status,
+							substatus: narrators.substatus,
+							logicalRunId: narrators.logicalRunId,
+							runtimeRegistrationJson: narrators.runtimeRegistrationJson,
+							policySourceNarratorId: narrators.policySourceNarratorId,
+							createdAt: narrators.createdAt,
+							backgroundStatus: narrators.backgroundStatus,
+							backgroundCompletedAt: narrators.backgroundCompletedAt,
+							isBackground: narrators.isBackground,
+							title: narrators.title,
+							subagentType: narrators.subagentType,
+							traits: narrators.traits,
+						})
+						.from(narrators)
+						.where(eq(narrators.id, input.narratorId))
+						.for("update");
+					assertRecoveryFields(input.subagentRecovery, current);
+				}
+				if (input.parentRecoveryTurn) {
+					const [current] = await tx
+						.select({ id: narrators.id, turnStartedAt: narrators.turnStartedAt })
+						.from(narrators)
+						.where(eq(narrators.id, input.parentRecoveryTurn.id))
+						.for("update");
+					assertRecoveryFields(input.parentRecoveryTurn, current);
+				}
+				if (input.recoveryObservation) {
+					const [current] = await tx
+						.select({
+							id: narrators.id,
+							logicalRunId: narrators.logicalRunId,
+							runtimeRegistrationJson: narrators.runtimeRegistrationJson,
+							status: narrators.status,
+							substatus: narrators.substatus,
+						})
+						.from(narrators)
+						.where(eq(narrators.id, input.narratorId))
+						.for("update");
+					assertRecoveryRunAdmission(input.recoveryObservation, current);
+				}
+				if (input.expectedSource) {
+					const [source] = await tx
+						.select({
+							runtimeRegistrationJson: narrators.runtimeRegistrationJson,
+							ownerUserId: narrators.ownerUserId,
+							policySourceNarratorId: narrators.policySourceNarratorId,
+						})
+						.from(narrators)
+						.where(eq(narrators.id, input.narratorId))
+						.for("update");
+					assertRuntimeSourceUnchanged(input.expectedSource, source);
+				}
 				const recipientId = input.binding.deliverTo?.narratorId;
 				let resumeRunId = input.resumeRunId;
-				if (
-					(input.taskRow || input.adoptRegisteredRun) &&
-					recipientId &&
-					resumeRunId === undefined
-				) {
+				if ((input.taskRow || input.adoptRegisteredRun) && recipientId) {
 					// Actor first: serialize with explicit run starts before adopting its identity.
 					// Do not use getAgentRun here: a missing id is a new start, not legacy admission.
 					await tx.execute(sql`SET LOCAL lock_timeout = '2000ms'`);
 					const actor = await tx
-						.select({ logicalRunId: narrators.logicalRunId })
+						.select({
+							logicalRunId: narrators.logicalRunId,
+							runtimeRegistrationJson: narrators.runtimeRegistrationJson,
+						})
 						.from(narrators)
 						.where(eq(narrators.id, input.narratorId))
 						.for("update");
 					const currentRunId = actor[0]?.logicalRunId;
-					if (currentRunId) {
+					const registered = readRuntimeRegistrationColumn(actor[0]?.runtimeRegistrationJson)?.run;
+					const current = registered?.deliverTo;
+					const expected = input.binding.deliverTo;
+					if (
+						currentRunId &&
+						registered?.logicalRunId === currentRunId &&
+						current &&
+						(current.narratorId !== expected?.narratorId ||
+							current.toolUseId !== expected?.toolUseId ||
+							current.toolCallId !== expected?.toolCallId ||
+							current.attempt !== expected?.attempt) &&
+						(resumeRunId === currentRunId ||
+							(
+								await readRunPublicationState(
+									{
+										producerKind: "agent",
+										taskId: input.narratorId,
+										logicalRunId: currentRunId,
+										recipientId: current.narratorId,
+									},
+									tx,
+								)
+							).state !== "settled")
+					)
+						throw new ValidationError("Stale task publication destination");
+					if (currentRunId && resumeRunId === undefined) {
 						// Same recipient-first protocol as consume/reserve/commit before examining
 						// the reservation: Await cannot revoke it between adoption and reserve.
 						await tx
@@ -862,6 +1020,34 @@ export function createPostgresRuntimePublication(
 					? { producerKind: "agent", taskId: input.narratorId, logicalRunId, recipientId }
 					: undefined;
 				if (publication) {
+					const [liveTask] = await tx
+						.select({
+							id: backgroundTasks.id,
+							type: backgroundTasks.type,
+							parentNarratorId: backgroundTasks.parentNarratorId,
+							subagentNarratorId: backgroundTasks.subagentNarratorId,
+							status: backgroundTasks.status,
+						})
+						.from(backgroundTasks)
+						.where(
+							and(eq(backgroundTasks.id, input.narratorId), eq(backgroundTasks.status, "running")),
+						)
+						.limit(1);
+					for (const task of [input.taskRow, liveTask]) {
+						if (
+							task &&
+							(task.id !== publication.taskId ||
+								task.type !== publication.producerKind ||
+								task.parentNarratorId !== publication.recipientId ||
+								(task.subagentNarratorId != null && task.subagentNarratorId !== input.narratorId))
+						)
+							throw new PublicationStateError("identity_mismatch", "start", publication, {
+								producerKind: task.type,
+								taskId: task.id,
+								recipientId: task.parentNarratorId,
+								state: task.status,
+							});
+					}
 					const reservation = await primitives.reserveRunSlots(tx, publication, {
 						started: input.started,
 					});
@@ -870,7 +1056,10 @@ export function createPostgresRuntimePublication(
 				const topSeq = (await readTopRefSeqPg(tx, input.narratorId)) ?? PG_REF_SEQ_EMPTY_TOP;
 				// The run's relationships commit with its id (same rule as SQLite).
 				const [source] = await tx
-					.select({ runtimeRegistrationJson: narrators.runtimeRegistrationJson })
+					.select({
+						runtimeRegistrationJson: narrators.runtimeRegistrationJson,
+						traits: narrators.traits,
+					})
 					.from(narrators)
 					.where(eq(narrators.id, input.narratorId))
 					.limit(1);
@@ -884,6 +1073,16 @@ export function createPostgresRuntimePublication(
 					.update(narrators)
 					.set({
 						runtimeRegistrationJson: registration,
+						...(input.taskRow
+							? {
+									isBackground: true,
+									backgroundStatus: "running" as const,
+									backgroundResult: null,
+									backgroundCompletedAt: null,
+									traits: [...new Set([...parseTraits(source?.traits), "background"])],
+									updatedAt: new Date().toISOString(),
+								}
+							: {}),
 					})
 					.where(eq(narrators.id, input.narratorId));
 				if (publication && !resumeRunId) {
@@ -904,17 +1103,24 @@ export function createPostgresRuntimePublication(
 						);
 				}
 				if (publication && input.taskRow) {
-					const inserted = await tx
-						.insert(backgroundTasks)
-						.values({ ...input.taskRow, logicalRunId })
-						.onConflictDoNothing({
-							target: [backgroundTasks.toolCallId, backgroundTasks.executionAttempt],
-						})
-						.returning({ id: backgroundTasks.id });
-					if (!inserted[0])
-						throw new ValidationError(
-							"Background agent task already exists for this execution attempt",
-						);
+					if (input.expectedTask?.row) {
+						await tx
+							.update(backgroundTasks)
+							.set({ ...input.taskRow, logicalRunId })
+							.where(eq(backgroundTasks.id, input.taskRow.id));
+					} else {
+						const inserted = await tx
+							.insert(backgroundTasks)
+							.values({ ...input.taskRow, logicalRunId })
+							.onConflictDoNothing({
+								target: [backgroundTasks.toolCallId, backgroundTasks.executionAttempt],
+							})
+							.returning({ id: backgroundTasks.id });
+						if (!inserted[0])
+							throw new ValidationError(
+								"Background agent task already exists for this execution attempt",
+							);
+					}
 				}
 				// Same rule as SQLite: only a live projection follows the run here.
 				await tx
@@ -923,7 +1129,21 @@ export function createPostgresRuntimePublication(
 					.where(
 						and(eq(backgroundTasks.id, input.narratorId), eq(backgroundTasks.status, "running")),
 					);
-				return { binding: registration.run, ...(publication ? { publication } : {}) };
+				return {
+					binding: registration.run,
+					...(publication ? { publication } : {}),
+					...(input.subagentRecovery
+						? {
+								recoveryObservation: {
+									id: input.narratorId,
+									logicalRunId,
+									runtimeRegistrationJson: registration,
+									status: input.subagentRecovery.status,
+									substatus: input.subagentRecovery.substatus,
+								},
+							}
+						: {}),
+				};
 			});
 		},
 
@@ -1009,6 +1229,93 @@ export function createPostgresRuntimePublication(
 			});
 		},
 
+		/** Claim/resume the existing transfer projection and reserve its result atomically. */
+		async startTransferTask(
+			input: PgStartTransferTaskInput,
+		): Promise<BackgroundTaskRecord | undefined> {
+			return runComposite("publication.startTransferTask", async (tx) => {
+				const [owner] = await tx
+					.select({
+						id: deviceTransferTasks.id,
+						parentNarratorId: deviceTransferTasks.parentNarratorId,
+						status: deviceTransferTasks.status,
+						generation: deviceTransferTasks.runGeneration,
+					})
+					.from(deviceTransferTasks)
+					.where(eq(deviceTransferTasks.id, input.taskRow.transferTaskId))
+					.limit(1)
+					.for("update");
+				if (!owner || owner.parentNarratorId !== input.taskRow.parentNarratorId) return undefined;
+				const [existing] = await tx
+					.select()
+					.from(backgroundTasks)
+					.where(
+						and(
+							eq(backgroundTasks.transferTaskId, owner.id),
+							eq(backgroundTasks.parentNarratorId, owner.parentNarratorId),
+						),
+					)
+					.limit(1)
+					.for("update");
+				if (
+					owner.status !== "running" ||
+					(input.runGeneration !== undefined && input.runGeneration !== owner.generation)
+				)
+					return existing;
+				const generationRunId = `transfer:${owner.id}:${owner.generation}`;
+				const alias = existing?.alias ?? input.taskRow.alias ?? null;
+				if (existing?.status === "running" && existing.logicalRunId) {
+					if (alias !== existing.alias) {
+						const [updated] = await tx
+							.update(backgroundTasks)
+							.set({ alias })
+							.where(eq(backgroundTasks.id, existing.id))
+							.returning();
+						return updated;
+					}
+					return existing;
+				}
+				// A repeated claim for an already settled generation cannot resurrect it.
+				if (existing && existing.status !== "paused" && existing.logicalRunId === generationRunId)
+					return existing;
+				const run: PublicationRun = {
+					producerKind: "bash",
+					taskId: existing?.id ?? input.taskRow.id,
+					recipientId: owner.parentNarratorId,
+					logicalRunId:
+						existing?.status === "paused" && existing.logicalRunId
+							? existing.logicalRunId
+							: generationRunId,
+				};
+				const reservation = await primitives.reserveRunSlots(tx, run);
+				if (reservation.status === "full") throw capacityError();
+				if (existing) {
+					const [updated] = await tx
+						.update(backgroundTasks)
+						.set({
+							status: "running",
+							logicalRunId: run.logicalRunId,
+							alias,
+							output: null,
+							outputBytes: 0,
+							outputTruncated: false,
+							exitCode: null,
+							completedAt: null,
+							notified: false,
+							updatedAt: input.taskRow.updatedAt,
+						})
+						.where(eq(backgroundTasks.id, existing.id))
+						.returning();
+					return updated;
+				}
+				const [created] = await tx
+					.insert(backgroundTasks)
+					.values({ ...input.taskRow, logicalRunId: run.logicalRunId })
+					.returning();
+				return created;
+			});
+		},
+
 		/** The result snapshot as its own section (the composite terminals embed it). */
 		async persistResult(run: PublicationRun, text: string): Promise<string> {
 			if (run.producerKind === "bash") return `background_task:${run.taskId}:${run.logicalRunId}`;
@@ -1036,6 +1343,118 @@ export function createPostgresRuntimePublication(
 			const composite = await runComposite("publication.commitAgentTerminal", async (tx) => {
 				// Narrators precede outbox/mailbox locks, in the same order as refs append.
 				await lockPgNarratorRefs(tx, [input.run.taskId, input.run.recipientId]);
+				if (input.startupFailure) {
+					const guard = input.startupFailure;
+					const [actor] = await tx
+						.select({
+							logicalRunId: narrators.logicalRunId,
+							parentNarratorId: narrators.parentNarratorId,
+							runtimeRegistrationJson: narrators.runtimeRegistrationJson,
+							backgroundStatus: narrators.backgroundStatus,
+							substatus: narrators.substatus,
+							status: narrators.status,
+						})
+						.from(narrators)
+						.where(eq(narrators.id, input.run.taskId))
+						.limit(1);
+					const [task] = await tx
+						.select({
+							type: backgroundTasks.type,
+							status: backgroundTasks.status,
+							parentNarratorId: backgroundTasks.parentNarratorId,
+							subagentNarratorId: backgroundTasks.subagentNarratorId,
+							logicalRunId: backgroundTasks.logicalRunId,
+							toolUseId: backgroundTasks.toolUseId,
+							toolCallId: backgroundTasks.toolCallId,
+							executionAttempt: backgroundTasks.executionAttempt,
+						})
+						.from(backgroundTasks)
+						.where(eq(backgroundTasks.id, input.run.taskId))
+						.for("update")
+						.limit(1);
+					const source = guard.deliverTo.toolCallId
+						? (
+								await tx
+									.select({
+										id: narratorToolCalls.id,
+										narratorId: narratorToolCalls.narratorId,
+										toolUseId: narratorToolCalls.toolUseId,
+										executionAttempt: narratorToolCalls.executionAttempt,
+									})
+									.from(narratorToolCalls)
+									.where(eq(narratorToolCalls.id, guard.deliverTo.toolCallId))
+									.for("update")
+									.limit(1)
+							)[0]
+						: undefined;
+					assertAgentStartFailureIdentity(input.run, guard, actor, task, source);
+					const now = new Date().toISOString();
+					const status =
+						input.eventKind === "cancelled" ? ("cancelled" as const) : ("failed" as const);
+					if (guard.retainHeldResult) {
+						await tx
+							.update(narrators)
+							.set({
+								status: actor?.status === "archived" ? "archived" : "idle",
+								substatus: JSON.stringify([
+									...new Set([
+										...parseSubstatus(actor?.substatus),
+										status === "cancelled" ? "interrupted" : "error",
+										`terminal_run:${input.run.logicalRunId}`,
+									]),
+								]),
+								backgroundStatus: status,
+								backgroundResult: input.text,
+								backgroundCompletedAt: now,
+								updatedAt: now,
+							})
+							.where(
+								and(
+									eq(narrators.id, input.run.taskId),
+									eq(narrators.logicalRunId, input.run.logicalRunId),
+								),
+							);
+						guard.assertOwner();
+						if (input.delivery !== "foreground")
+							return {
+								commit: { status: "committed" as const, deliveryId: null, arrivalSeq: null },
+								needsSeqFloorMark: false,
+							};
+					}
+					await tx
+						.update(backgroundTasks)
+						.set({
+							status,
+							output: input.text,
+							outputBytes: Buffer.byteLength(input.text),
+							completedAt: now,
+							updatedAt: now,
+						})
+						.where(
+							and(
+								eq(backgroundTasks.id, input.run.taskId),
+								eq(backgroundTasks.logicalRunId, input.run.logicalRunId),
+								eq(backgroundTasks.status, "running"),
+							),
+						);
+					if (!guard.retainHeldResult)
+						await tx
+							.update(narrators)
+							.set({
+								status: actor?.status === "archived" ? "archived" : "idle",
+								substatus: JSON.stringify([status === "cancelled" ? "interrupted" : "error"]),
+								backgroundStatus: status,
+								backgroundResult: input.text,
+								backgroundCompletedAt: now,
+								updatedAt: now,
+							})
+							.where(
+								and(
+									eq(narrators.id, input.run.taskId),
+									eq(narrators.logicalRunId, input.run.logicalRunId),
+								),
+							);
+				}
 				if (input.toolConclusion) {
 					const conclusion = input.toolConclusion;
 					const updated = await tx
@@ -1077,6 +1496,7 @@ export function createPostgresRuntimePublication(
 				const section = await persistResultSection(tx, input.run, input.text, input.eventKind);
 				if (input.delivery === "foreground") {
 					await primitives.consumeAwaitedTerminal(tx, input.run);
+					input.startupFailure?.assertOwner();
 					return {
 						commit: {
 							status: existing[0] ? ("duplicate" as const) : ("committed" as const),
@@ -1092,6 +1512,7 @@ export function createPostgresRuntimePublication(
 					resultRef: section.resultRef,
 					summary: summarize(input.summary),
 				});
+				input.startupFailure?.assertOwner();
 				return { commit, needsSeqFloorMark: section.needsSeqFloorMark };
 			});
 			if (composite.needsSeqFloorMark) markPgNarratorSeqFloorHealed(input.run.taskId);
@@ -1340,7 +1761,7 @@ export function createPostgresRuntimePublication(
 						...run,
 						eventKind,
 						resultRef: section.resultRef,
-						summary: `[System] Background agent (ID: ${input.narratorId}) ${input.backgroundStatus}. Use Await({ type: "agent", id: "${input.narratorId}" }) to read its stored result.`,
+						summary: `[System] Background agent (ID: ${input.narratorId}) ${input.backgroundStatus}. Use Watch({ type: "agent", id: "${input.narratorId}" }) to read its stored result.`,
 					});
 				}
 			});
@@ -1371,10 +1792,54 @@ export function createPostgresRuntimePublication(
 		> {
 			const raisedFloorNarratorIds = new Set<string>();
 			const result = await runComposite("publication.commitTerminalTransition", async (tx) => {
+				if (input.expectedTransfer) {
+					const [owner] = await tx
+						.select({ generation: deviceTransferTasks.runGeneration })
+						.from(deviceTransferTasks)
+						.where(eq(deviceTransferTasks.id, input.expectedTransfer.id))
+						.limit(1)
+						.for("update");
+					if (owner?.generation !== input.expectedTransfer.generation) return undefined;
+				}
+				if (input.expectedRun) {
+					const [current] = await tx
+						.select({
+							id: backgroundTasks.id,
+							type: backgroundTasks.type,
+							status: backgroundTasks.status,
+							logicalRunId: backgroundTasks.logicalRunId,
+							parentNarratorId: backgroundTasks.parentNarratorId,
+						})
+						.from(backgroundTasks)
+						.where(eq(backgroundTasks.id, input.taskId))
+						.limit(1)
+						.for("update");
+					assertPublicationTaskIdentity(input.expectedRun, current);
+				}
 				const [task] = await tx
 					.update(backgroundTasks)
 					.set(input.setFields)
-					.where(and(eq(backgroundTasks.id, input.taskId), eq(backgroundTasks.status, "running")))
+					.where(
+						and(
+							eq(backgroundTasks.id, input.taskId),
+							input.expectedTransfer
+								? and(
+										eq(backgroundTasks.type, "transfer"),
+										eq(backgroundTasks.transferTaskId, input.expectedTransfer.id),
+										inArray(backgroundTasks.status, ["running", "paused"]),
+									)
+								: eq(backgroundTasks.status, "running"),
+							input.silentObservation
+								? and(
+										eq(backgroundTasks.type, "bash"),
+										or(
+											like(backgroundTasks.command, `${WATCH_COMMAND_PREFIX}%`),
+											like(backgroundTasks.command, `${TERMINAL_WATCH_COMMAND_PREFIX}%`),
+										),
+									)
+								: undefined,
+						),
+					)
 					.returning({
 						id: backgroundTasks.id,
 						type: backgroundTasks.type,
@@ -1386,7 +1851,39 @@ export function createPostgresRuntimePublication(
 						toolUseId: backgroundTasks.toolUseId,
 						logicalRunId: backgroundTasks.logicalRunId,
 					});
-				if (!task || task.type === "transfer" || input.deferPublication) return task;
+				if (!task) return undefined;
+				if (input.silentObservation) {
+					if (task.logicalRunId) {
+						await tx
+							.delete(outbox)
+							.where(
+								and(
+									eq(outbox.producerKind, "bash"),
+									eq(outbox.taskId, task.id),
+									eq(outbox.logicalRunId, task.logicalRunId),
+									eq(outbox.recipientId, task.parentNarratorId),
+									eq(outbox.state, "reserved"),
+								),
+							);
+					}
+					return task;
+				}
+				if (input.deferPublication) return task;
+				if (task.type === "transfer" && !task.logicalRunId) {
+					const run: PublicationRun = {
+						producerKind: "bash",
+						taskId: task.id,
+						recipientId: task.parentNarratorId,
+						logicalRunId: generateId(),
+					};
+					const reservation = await primitives.reserveRunSlots(tx, run);
+					if (reservation.status === "full") throw capacityError();
+					await tx
+						.update(backgroundTasks)
+						.set({ logicalRunId: run.logicalRunId })
+						.where(eq(backgroundTasks.id, task.id));
+					task.logicalRunId = run.logicalRunId;
+				}
 				if (!task.logicalRunId) {
 					logger.warn("Terminal transition skipped: task has no logicalRunId", {
 						taskId: input.taskId,
@@ -1395,7 +1892,7 @@ export function createPostgresRuntimePublication(
 					return task;
 				}
 				const run: PublicationRun = {
-					producerKind: task.type as "agent" | "bash",
+					producerKind: task.type === "transfer" ? "bash" : (task.type as "agent" | "bash"),
 					taskId: input.taskId,
 					logicalRunId: task.logicalRunId,
 					recipientId: task.parentNarratorId,
@@ -1444,6 +1941,7 @@ export function createPostgresRuntimePublication(
 						logicalRunId: backgroundTasks.logicalRunId,
 						toolCallId: backgroundTasks.toolCallId,
 						executionAttempt: backgroundTasks.executionAttempt,
+						command: backgroundTasks.command,
 					});
 				if (!task) return undefined;
 				if (task.type === "agent") {
@@ -1459,6 +1957,26 @@ export function createPostgresRuntimePublication(
 						.where(eq(narrators.id, task.subagentNarratorId ?? task.id));
 				}
 				if (task.type === "transfer") return task;
+				if (
+					task.type === "bash" &&
+					!task.logicalRunId &&
+					(task.command?.startsWith(WATCH_COMMAND_PREFIX) ||
+						task.command?.startsWith(TERMINAL_WATCH_COMMAND_PREFIX))
+				) {
+					const run: PublicationRun = {
+						producerKind: "bash",
+						taskId: task.id,
+						recipientId: task.parentNarratorId,
+						logicalRunId: generateId(),
+					};
+					const reservation = await primitives.reserveRunSlots(tx, run);
+					if (reservation.status === "full") throw capacityError();
+					await tx
+						.update(backgroundTasks)
+						.set({ logicalRunId: run.logicalRunId })
+						.where(eq(backgroundTasks.id, task.id));
+					task.logicalRunId = run.logicalRunId;
+				}
 				const source = {
 					producerKind: task.type as "agent" | "bash",
 					taskId: task.id,
@@ -1489,6 +2007,13 @@ export function createPostgresRuntimePublication(
 					resultRef: section.resultRef,
 					summary: summarize(input.text),
 				});
+				if (
+					task.type === "bash" &&
+					!run.logicalRunId.startsWith("legacy:unknown:") &&
+					!task.command?.startsWith(WATCH_COMMAND_PREFIX) &&
+					!task.command?.startsWith(TERMINAL_WATCH_COMMAND_PREFIX)
+				)
+					await primitives.consumeAwaitedTerminal(tx, run);
 				return task;
 			});
 			for (const id of raisedFloorNarratorIds) markPgNarratorSeqFloorHealed(id);
@@ -1510,11 +2035,133 @@ export function createPostgresRuntimePublication(
 			});
 		},
 
-		/**
-		 * Named bounded read: read a background task row by id. Returns null
-		 * if not found. This is the PG-safe alternative to the SQLite-only
-		 * `db.select(backgroundTasks).where(eq(id, taskId)).get()`.
-		 */
+		/** Native async, one-row metadata read; result bodies never cross this boundary. */
+		async readArchivedOrphanBackgroundClaim(
+			narratorId: string,
+		): Promise<ArchivedOrphanBackgroundClaim | null> {
+			const [claim] = await db
+				.select({
+					id: narrators.id,
+					parentNarratorId: narrators.parentNarratorId,
+					type: narrators.type,
+					status: narrators.status,
+					backgroundStatus: narrators.backgroundStatus,
+					backgroundCompletedAt: narrators.backgroundCompletedAt,
+					logicalRunId: narrators.logicalRunId,
+					registrationText: sql<string | null>`cast(${narrators.runtimeRegistrationJson} as text)`,
+					substatus: narrators.substatus,
+					updatedAt: narrators.updatedAt,
+				})
+				.from(narrators)
+				.where(eq(narrators.id, narratorId))
+				.limit(1);
+			return claim ?? null;
+		},
+
+		async settleArchivedOrphanBackgroundClaim(
+			claim: ArchivedOrphanBackgroundClaim,
+			now: string,
+		): Promise<boolean> {
+			if (
+				claim.type !== "subagent" ||
+				claim.status !== "archived" ||
+				claim.backgroundStatus !== "running" ||
+				claim.logicalRunId !== null ||
+				readRuntimeRegistrationColumn(
+					claim.registrationText === null ? null : JSON.parse(claim.registrationText),
+				)?.run ||
+				parseSubstatus(claim.substatus).some(
+					(tag) => tag === "taken_over" || tag.startsWith("terminal_run:"),
+				)
+			)
+				return false;
+			return runComposite("publication.settleArchivedOrphanBackgroundClaim", async (tx) => {
+				await lockPgNarratorRefs(tx, [claim.id]);
+				// Same mounted-owner rule as tool-continuation-service. Completed results
+				// still awaiting their owner are checkpoints, not abandoned work.
+				const unmounted = and(
+					ne(narratorToolContinuations.state, "cancelled"),
+					sql`coalesce(cast(${narratorToolContinuations.payloadJson} as jsonb)->>'recoveryPhase', '') <> 'owner_continuation_started'`,
+				);
+				const [settled] = await tx
+					.update(narrators)
+					.set({
+						backgroundStatus: "cancelled",
+						backgroundCompletedAt: claim.backgroundCompletedAt ?? now,
+						updatedAt: now,
+					})
+					.where(
+						and(
+							eq(narrators.id, claim.id),
+							eq(narrators.type, "subagent"),
+							eq(narrators.status, "archived"),
+							eq(narrators.backgroundStatus, "running"),
+							isNull(narrators.logicalRunId),
+							eq(narrators.updatedAt, claim.updatedAt),
+							claim.parentNarratorId === null
+								? isNull(narrators.parentNarratorId)
+								: eq(narrators.parentNarratorId, claim.parentNarratorId),
+							claim.backgroundCompletedAt === null
+								? isNull(narrators.backgroundCompletedAt)
+								: eq(narrators.backgroundCompletedAt, claim.backgroundCompletedAt),
+							claim.substatus === null
+								? isNull(narrators.substatus)
+								: eq(narrators.substatus, claim.substatus),
+							claim.registrationText === null
+								? isNull(narrators.runtimeRegistrationJson)
+								: sql`cast(${narrators.runtimeRegistrationJson} as text) = ${claim.registrationText}`,
+							notExists(
+								tx
+									.select({ one: sql`1` })
+									.from(backgroundTasks)
+									.where(eq(backgroundTasks.id, claim.id))
+									.limit(1),
+							),
+							notExists(
+								tx
+									.select({ one: sql`1` })
+									.from(backgroundTasks)
+									.where(
+										and(
+											eq(backgroundTasks.type, "agent"),
+											eq(backgroundTasks.subagentNarratorId, claim.id),
+										),
+									)
+									.limit(1),
+							),
+							notExists(
+								tx
+									.select({ one: sql`1` })
+									.from(narratorToolContinuations)
+									.where(and(eq(narratorToolContinuations.narratorId, claim.id), unmounted))
+									.limit(1),
+							),
+							claim.parentNarratorId === null
+								? undefined
+								: notExists(
+										tx
+											.select({ one: sql`1` })
+											.from(narratorToolContinuations)
+											.where(
+												and(
+													eq(narratorToolContinuations.narratorId, claim.parentNarratorId),
+													inArray(narratorToolContinuations.kind, [
+														"foreground_agent",
+														"background_agent",
+													]),
+													unmounted,
+													sql`cast(${narratorToolContinuations.payloadJson} as jsonb)->>'subagentId' = ${claim.id}`,
+												),
+											)
+											.limit(1),
+									),
+						),
+					)
+					.returning({ id: narrators.id });
+				return settled !== undefined;
+			});
+		},
+
 		async readBackgroundTask(taskId: string): Promise<BackgroundTaskRecord | null> {
 			return runComposite("publication.readBackgroundTask", async (tx) => {
 				const rows = await tx
@@ -1574,12 +2221,12 @@ export function createPostgresRuntimePublication(
 
 				const deletable: PgCleanupTaskResult[] = [];
 				for (const row of candidates) {
-					if (!row.logicalRunId || row.type === "transfer") {
+					if (!row.logicalRunId) {
 						deletable.push(row);
 						continue;
 					}
 					const run: PublicationRun = {
-						producerKind: row.type as "agent" | "bash",
+						producerKind: row.type === "transfer" ? "bash" : (row.type as "agent" | "bash"),
 						taskId: row.id,
 						logicalRunId: row.logicalRunId,
 						recipientId: row.parentNarratorId,
@@ -1652,7 +2299,7 @@ export function createPostgresRuntimePublication(
 		async cancelTask(input: PgCancelTaskInput): Promise<PgCancelTaskResult | null> {
 			const raisedFloorNarratorIds = new Set<string>();
 			const result = await runComposite("publication.cancelTask", async (tx) => {
-				const [existing] = await tx
+				const taskQuery = tx
 					.select({
 						backgroundKind: backgroundTasks.backgroundKind,
 						id: backgroundTasks.id,
@@ -1667,6 +2314,8 @@ export function createPostgresRuntimePublication(
 					.from(backgroundTasks)
 					.where(eq(backgroundTasks.id, input.taskId))
 					.limit(1);
+				const [existing] = await (input.expectedRun ? taskQuery.for("update") : taskQuery);
+				if (input.expectedRun) assertPublicationTaskIdentity(input.expectedRun, existing);
 				if (!existing || (existing.status !== "running" && existing.status !== "paused")) {
 					return null;
 				}
@@ -1706,13 +2355,29 @@ export function createPostgresRuntimePublication(
 					});
 				if (!updated) return null;
 
-				// Commit the publication terminal intent in the same section.
-				if (existing.type !== "transfer" && existing.logicalRunId) {
+				// Transfer terminal notices reuse the existing bash publication channel.
+				if (updated.type === "transfer" && !updated.logicalRunId) {
 					const run: PublicationRun = {
-						producerKind: existing.type as "agent" | "bash",
+						producerKind: "bash",
+						taskId: updated.id,
+						recipientId: updated.parentNarratorId,
+						logicalRunId: generateId(),
+					};
+					const reservation = await primitives.reserveRunSlots(tx, run);
+					if (reservation.status === "full") throw capacityError();
+					await tx
+						.update(backgroundTasks)
+						.set({ logicalRunId: run.logicalRunId })
+						.where(eq(backgroundTasks.id, updated.id));
+					updated.logicalRunId = run.logicalRunId;
+				}
+				// Commit the publication terminal intent in the same section.
+				if (updated.logicalRunId) {
+					const run: PublicationRun = {
+						producerKind: updated.type === "transfer" ? "bash" : (updated.type as "agent" | "bash"),
 						taskId: input.taskId,
-						logicalRunId: existing.logicalRunId,
-						recipientId: existing.parentNarratorId,
+						logicalRunId: updated.logicalRunId,
+						recipientId: updated.parentNarratorId,
 					};
 					const section = await persistResultSection(
 						tx,
@@ -1733,7 +2398,7 @@ export function createPostgresRuntimePublication(
 						eventKind: "cancelled",
 						resultRef: section.resultRef,
 						summary: summarize(
-							`[System] Background ${existing.type} cancelled. Use Await({ type: "${existing.type}", id: "${existing.alias ?? existing.id}" }) to read the stored result.`,
+							`[System] Background ${existing.type} cancelled. Use TeamStatus({ action: "get_task", target_id: "${existing.alias ?? existing.id}" }) to read the stored result.`,
 						),
 					});
 				}
@@ -1750,6 +2415,14 @@ export function createPostgresRuntimePublication(
 		 */
 		async cancelAgentNarrator(input: PgCancelAgentNarratorInput): Promise<void> {
 			await runComposite("publication.cancelAgentNarrator", async (tx) => {
+				if (input.expectedLogicalRunId !== undefined) {
+					const [current] = await tx
+						.select({ logicalRunId: narrators.logicalRunId })
+						.from(narrators)
+						.where(eq(narrators.id, input.narratorId))
+						.for("update");
+					assertRecoveryFields({ logicalRunId: input.expectedLogicalRunId }, current);
+				}
 				await tx
 					.update(narrators)
 					.set({
@@ -1873,7 +2546,7 @@ export function createPostgresRuntimePublication(
 					eventKind: input.hasError ? "failed" : "completed",
 					resultRef: section.resultRef,
 					summary: summarize(
-						`[System] Background agent "${updated.title ?? updated.alias ?? updated.id}" (ID: ${updated.alias ?? updated.id}) ${terminalStatus}. Use Await({ type: "agent", id: "${updated.alias ?? updated.id}" }) to read the stored result.`,
+						`[System] Background agent "${updated.title ?? updated.alias ?? updated.id}" (ID: ${updated.alias ?? updated.id}) ${terminalStatus}. Use Watch({ type: "agent", id: "${updated.alias ?? updated.id}" }) to read the stored result.`,
 					),
 				});
 				return { id: updated.id, parentNarratorId: updated.parentNarratorId };

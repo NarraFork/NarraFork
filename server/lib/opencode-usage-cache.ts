@@ -1,10 +1,11 @@
-import { isOpencodeGoBaseUrl, parseOpencodeGoBaseUrl } from "@shared/opencode-go-endpoint";
+import { parseOpencodeGoBaseUrl } from "@shared/opencode-go-endpoint";
+import { epochOf, type QuotaSnapshot, type QuotaWindow } from "@shared/quota-snapshot";
+import { identifyService } from "@shared/sourcing/identify";
 import { outboundFetch } from "./net/outbound-fetch";
 import { resolveProxyForUrl } from "./net/proxy";
-import { createPersistedCredentialCache } from "./persisted-credential-cache";
-import { registerKeyQuotaProbe } from "./provider-key-quota";
-import { shownSubjectId, usageSubjects } from "./provider-key-subjects";
+import { shownSubjectId, type UsageSubject, usageSubjects } from "./provider-key-subjects";
 import { type CustomApiProviderConfig, settings } from "./settings";
+import { importLegacyQuotaCache, quotaStore } from "./sourcing/quota-store";
 
 /**
  * OpenCode Go subscription usage cache.
@@ -36,14 +37,12 @@ import { type CustomApiProviderConfig, settings } from "./settings";
  * carries whatever windows it recognized, so fixing that is a display-layer
  * change (in both indicators), not a data-layer one.
  *
- * Cache layout follows the DeepSeek balance cache rather than the Kimi one:
- * entries are keyed by a credential identity, because a percentage of a plan
- * belongs to one account. They are persisted across restarts, but a persisted
- * entry is only restored when the live identity matches the one it was saved
- * under (see persisted-credential-cache.ts), so a restart never resurrects an
- * allowance under a different key. `generation` is what stops a late response
- * from an account the user has since replaced from publishing into the current
- * one.
+ * The numbers live in the shared quota store (sourcing/quota-store.ts), one snapshot per
+ * key under its credential identity, because a percentage of a plan belongs to one
+ * account: a restart never resurrects an allowance under a different key. This module
+ * keeps the scheduling (staleness, failure backoff, post-request refreshes) and the
+ * `generation` that stops a late response from an account the user has since replaced
+ * from publishing into the current one.
  */
 
 export interface OpencodeUsageWindow {
@@ -100,7 +99,7 @@ const FETCH_TIMEOUT_MS = 15_000;
 
 interface Entry {
 	identity: string;
-	cache: OpencodeUsageCache;
+	generation: string;
 	inFlight?: Promise<OpencodeUsageCache | null>;
 	controller?: AbortController;
 	/** Consecutive failed refreshes, for the backoff. */
@@ -111,6 +110,9 @@ interface Entry {
 const entries = new Map<string, Entry>();
 
 type PersistedUsage = Omit<OpencodeUsageCache, "generation">;
+
+/** The file this cache used before the quota store; read once, then deleted. */
+const LEGACY_FILE = "opencode-usages.json";
 
 function parsePersistedUsage(raw: unknown): PersistedUsage | null {
 	if (!raw || typeof raw !== "object") return null;
@@ -130,13 +132,57 @@ function parsePersistedUsage(raw: unknown): PersistedUsage | null {
 	};
 }
 
-// Persisted across restarts, restored only under the same credential identity.
-const persisted = createPersistedCredentialCache("opencode-usages.json", parsePersistedUsage);
+function usedRatio(window: OpencodeUsageWindow): number | null {
+	if (window.status === "rate-limited") return 1;
+	return window.percent == null ? null : window.percent / 100;
+}
 
-function persistEntry(id: string, entry: Entry): void {
-	if (entry.cache.fetchedAt === 0) return;
-	const { generation: _generation, ...rest } = entry.cache;
-	persisted.save(id, entry.identity, rest);
+function opencodeSnapshot(usage: PersistedUsage): QuotaSnapshot {
+	const window = (kind: QuotaWindow["kind"], w: OpencodeUsageWindow | null): QuotaWindow[] =>
+		w ? [{ kind, usedRatio: usedRatio(w), resetsAt: epochOf(w.resetsAt) }] : [];
+	const { rolling, weekly, monthly, balance, fetchedAt, error } = usage;
+	return {
+		fetchedAt,
+		...(error !== null ? { error } : {}),
+		scope: "subscription",
+		windows: [...window("5h", rolling), ...window("weekly", weekly), ...window("monthly", monthly)],
+		// OpenCode meters Go, and the balance it falls back to, in dollars.
+		balances: balance != null ? [{ unit: "USD", remaining: balance }] : [],
+		detail: { rolling, weekly, monthly, ...(balance != null ? { balance } : {}) },
+	};
+}
+
+/** A snapshot read from disk, rebuilt from its validated detail. */
+function restoreSnapshot(snapshot: QuotaSnapshot): QuotaSnapshot | null {
+	const usage = parsePersistedUsage({
+		...(snapshot.detail as object),
+		fetchedAt: snapshot.fetchedAt,
+		error: snapshot.error ?? null,
+	});
+	return usage && opencodeSnapshot(usage);
+}
+
+function cacheOf(id: string, entry: Entry): OpencodeUsageCache {
+	const snapshot = quotaStore.get(id, entry.identity, restoreSnapshot);
+	const detail = snapshot?.detail as OpencodeUsagePayload | undefined;
+	return {
+		generation: entry.generation,
+		rolling: detail?.rolling ?? null,
+		weekly: detail?.weekly ?? null,
+		monthly: detail?.monthly ?? null,
+		...(detail?.balance != null ? { balance: detail.balance } : {}),
+		fetchedAt: snapshot?.fetchedAt ?? 0,
+		error: snapshot?.error ?? null,
+	};
+}
+
+/** One quota probe: fetch, then the shared snapshot shape. Throws on failure. */
+export async function probeOpencodeQuota(
+	credential: UsageSubject,
+	signal: AbortSignal,
+): Promise<QuotaSnapshot> {
+	const usage = await fetchUsage(credential.config, signal);
+	return opencodeSnapshot({ ...usage, fetchedAt: Date.now(), error: null });
 }
 
 /**
@@ -148,8 +194,7 @@ export function isOpencodeCustomApiProvider(config: {
 	baseUrl?: string;
 	disabled?: boolean;
 }): boolean {
-	if (config.disabled || !config.baseUrl) return false;
-	return isOpencodeGoBaseUrl(config.baseUrl);
+	return !config.disabled && identifyService(config).templateId === "opencode-go";
 }
 
 /**
@@ -190,38 +235,41 @@ function identity(config: CustomApiProviderConfig): string {
 	]);
 }
 
+let legacyImported = false;
+
 /** Reconcile on every read/refresh as well as settings writes. Old requests lose
  * their entry token, so even an abort-ignoring transport cannot publish a result. */
 export function syncOpencodeUsageCache(): void {
 	// One entry per key (provider-key-subjects.ts); the identity below covers each key's
 	// own secret and proxy, so editing a key drops its numbers.
-	const providers = new Map(opencodeSubjects().map((s) => [s.id, s.config]));
+	const subjects = opencodeSubjects();
+	if (!legacyImported) {
+		legacyImported = true;
+		void importLegacyQuotaCache(
+			LEGACY_FILE,
+			parsePersistedUsage,
+			subjects.map((s) => ({ legacyKey: s.id, id: s.id, identity: identity(s.config) })),
+			opencodeSnapshot,
+		);
+	}
+	const providers = new Map(subjects.map((s) => [s.id, s.config]));
 	for (const [id, entry] of entries) {
 		const config = providers.get(id);
 		if (!config || identity(config) !== entry.identity) {
 			entries.delete(id);
 			entry.controller?.abort();
 			clearTimeout(entry.activityTimer);
-			if (!config) persisted.remove(id);
+			// A different account's snapshot must stop steering the key pool at once; a
+			// removed key's snapshot goes away entirely.
+			if (config) quotaStore.forget(id);
+			else quotaStore.remove(id);
 		}
 	}
 	for (const [id, config] of providers) {
 		if (!entries.has(id)) {
-			const key = identity(config);
-			const restored = persisted.restore(id, key);
-			entries.set(id, {
-				identity: key,
-				cache: {
-					generation: crypto.randomUUID(),
-					rolling: null,
-					weekly: null,
-					monthly: null,
-					fetchedAt: 0,
-					error: null,
-					...restored,
-				},
-				failures: 0,
-			});
+			entries.set(id, { identity: identity(config), generation: crypto.randomUUID(), failures: 0 });
+			// Restore synchronously: the pool reads the snapshot before any refresh finishes.
+			quotaStore.get(id, identity(config), restoreSnapshot);
 		}
 	}
 }
@@ -321,7 +369,7 @@ export function parseOpencodeUsageResponse(body: unknown): OpencodeUsagePayload 
 }
 async function fetchUsage(
 	config: CustomApiProviderConfig,
-	controller: AbortController,
+	signal: AbortSignal,
 ): Promise<OpencodeUsagePayload> {
 	const endpoint = opencodeUsageUrl(config.baseUrl);
 	const response = await outboundFetch(
@@ -337,7 +385,7 @@ async function fetchUsage(
 				Accept: "application/json",
 			},
 			redirect: "error",
-			signal: controller.signal,
+			signal,
 		},
 		{
 			proxyUrl: resolveProxyForUrl(endpoint, config.proxy),
@@ -354,8 +402,8 @@ async function fetchUsage(
 	const cancelReader = () => {
 		void reader.cancel().catch(() => {});
 	};
-	controller.signal.addEventListener("abort", cancelReader, { once: true });
-	if (controller.signal.aborted) cancelReader();
+	signal.addEventListener("abort", cancelReader, { once: true });
+	if (signal.aborted) cancelReader();
 	let size = 0;
 	const chunks: Uint8Array[] = [];
 	try {
@@ -376,7 +424,7 @@ async function fetchUsage(
 		}
 		return parseOpencodeUsageResponse(JSON.parse(new TextDecoder().decode(bytes)));
 	} finally {
-		controller.signal.removeEventListener("abort", cancelReader);
+		signal.removeEventListener("abort", cancelReader);
 		void reader.cancel().catch(() => {});
 		reader.releaseLock();
 	}
@@ -399,10 +447,10 @@ export function refreshOpencodeUsage(providerId: string): Promise<OpencodeUsageC
 export function refreshOpencodeKeyUsage(keyId: string): Promise<OpencodeUsageCache | null> {
 	syncOpencodeUsageCache();
 	const entry = entries.get(keyId);
-	const config = opencodeSubjects().find((s) => s.id === keyId)?.config;
-	if (!entry || !config) return Promise.resolve(null);
+	const subject = opencodeSubjects().find((s) => s.id === keyId);
+	if (!entry || !subject) return Promise.resolve(null);
 	if (entry.inFlight) return entry.inFlight;
-	const snapshot = structuredClone(config);
+	const snapshot = structuredClone(subject);
 	const controller = new AbortController();
 	entry.controller = controller;
 	entry.inFlight = (async () => {
@@ -414,35 +462,36 @@ export function refreshOpencodeKeyUsage(keyId: string): Promise<OpencodeUsageCac
 			timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 		});
 		try {
-			const payload = await Promise.race([fetchUsage(snapshot, controller), cancelled]);
+			const fresh = await Promise.race([
+				probeOpencodeQuota(snapshot, controller.signal),
+				cancelled,
+			]);
 			syncOpencodeUsageCache();
 			if (entries.get(keyId) !== entry) return null;
-			entry.cache = {
-				...payload,
-				generation: entry.cache.generation,
-				fetchedAt: Date.now(),
-				error: null,
-			};
+			quotaStore.set(keyId, entry.identity, fresh);
 			entry.failures = 0;
-			persistEntry(keyId, entry);
 		} catch {
 			syncOpencodeUsageCache();
 			if (entries.get(keyId) !== entry) return null;
 			// Never copy transport exceptions, response text, or credentials to logs/API.
 			// The last good numbers stay so the UI can show them as stale.
-			entry.cache = {
-				...entry.cache,
-				fetchedAt: Date.now(),
-				error: "OpenCode usage request failed",
-			};
+			const { generation: _generation, ...previous } = cacheOf(keyId, entry);
+			quotaStore.set(
+				keyId,
+				entry.identity,
+				opencodeSnapshot({
+					...previous,
+					fetchedAt: Date.now(),
+					error: "OpenCode usage request failed",
+				}),
+			);
 			entry.failures += 1;
-			persistEntry(keyId, entry);
 		} finally {
 			clearTimeout(timer);
 			entry.inFlight = undefined;
 			entry.controller = undefined;
 		}
-		return entry.cache;
+		return cacheOf(keyId, entry);
 	})();
 	return entry.inFlight;
 }
@@ -451,35 +500,37 @@ export function refreshOpencodeKeyUsage(keyId: string): Promise<OpencodeUsageCac
 export function getOpencodeCachedUsage(providerId: string): OpencodeUsageCache | null {
 	syncOpencodeUsageCache();
 	const id = shownEntryId(providerId);
-	return (id && entries.get(id)?.cache) || null;
+	const entry = id ? entries.get(id) : undefined;
+	return id && entry ? cacheOf(id, entry) : null;
 }
 
 /** Provider id → `pick(entry)` of the key it reports. */
-function byProvider<T>(pick: (entry: Entry) => T): Record<string, T> {
+function byProvider<T>(pick: (id: string, entry: Entry) => T): Record<string, T> {
 	syncOpencodeUsageCache();
 	const result: Record<string, T> = {};
 	const subjects = opencodeSubjects();
 	for (const providerId of new Set(subjects.map((s) => s.providerId))) {
-		const entry = entries.get(shownSubjectId(subjects, providerId) ?? "");
-		if (entry) result[providerId] = pick(entry);
+		const id = shownSubjectId(subjects, providerId) ?? "";
+		const entry = entries.get(id);
+		if (entry) result[providerId] = pick(id, entry);
 	}
 	return result;
 }
 
 /** Provider id → the allowance it reports (status bar). */
 export function getAllOpencodeCachedUsages(): Record<string, OpencodeUsageCache> {
-	return byProvider((entry) => entry.cache);
+	return byProvider(cacheOf);
 }
 
 /** Key id → its allowance (key list). */
 export function getOpencodeKeyUsages(): Record<string, OpencodeUsageCache> {
 	syncOpencodeUsageCache();
-	return Object.fromEntries([...entries].map(([id, entry]) => [id, entry.cache]));
+	return Object.fromEntries([...entries].map(([id, entry]) => [id, cacheOf(id, entry)]));
 }
 
 /** Opaque, random runtime tokens only; never expose or derive them from credentials. */
 export function getOpencodeUsageGenerations(): Record<string, string> {
-	return byProvider((entry) => entry.cache.generation);
+	return byProvider((_id, entry) => entry.generation);
 }
 
 export async function refreshAllOpencodeUsages(): Promise<void> {
@@ -525,7 +576,9 @@ export async function refreshStaleOpencodeUsages(
 	const now = Date.now();
 	await Promise.allSettled(
 		[...entries]
-			.filter(([, entry]) => isOpencodeUsageDue(entry, now, maxAgeMs))
+			.filter(([id, entry]) =>
+				isOpencodeUsageDue({ cache: cacheOf(id, entry), failures: entry.failures }, now, maxAgeMs),
+			)
 			.map(([id]) => refreshOpencodeKeyUsage(id)),
 	);
 }
@@ -553,12 +606,16 @@ export function noteOpencodeUsageActivity(providerRef: string): void {
 			const id = subject.id;
 			const entry = entries.get(id);
 			if (!entry || entry.activityTimer || entry.inFlight) continue;
-			const elapsed = Date.now() - entry.cache.fetchedAt;
+			const elapsed = Date.now() - cacheOf(id, entry).fetchedAt;
 			const delay = Math.max(0, OPENCODE_ACTIVITY_REFRESH_MIN_MS - elapsed);
 			const timer = setTimeout(() => {
 				if (entry.activityTimer === timer) entry.activityTimer = undefined;
 				if (entries.get(id) !== entry) return;
-				if (entry.failures > 0 && !isOpencodeUsageDue(entry, Date.now())) return;
+				const due = isOpencodeUsageDue(
+					{ cache: cacheOf(id, entry), failures: entry.failures },
+					Date.now(),
+				);
+				if (entry.failures > 0 && !due) return;
 				void refreshOpencodeKeyUsage(id).catch(() => {});
 			}, delay);
 			// Never keep the process alive for a cosmetic refresh.
@@ -569,17 +626,3 @@ export function noteOpencodeUsageActivity(providerRef: string): void {
 		// Display-only bookkeeping; the request that triggered it must not care.
 	}
 }
-
-// The key pool skips a key whose window this cache has seen used up, until it resets.
-registerKeyQuotaProbe((keyId, now) => {
-	const cache = entries.get(keyId)?.cache;
-	if (!cache) return undefined;
-	const until = [cache.rolling, cache.weekly, cache.monthly]
-		.map((window) => {
-			const usedUp = window?.status === "rate-limited" || (window?.percent ?? 0) >= 100;
-			const reset = window?.resetsAt ? Date.parse(window.resetsAt) : Number.NaN;
-			return usedUp && Number.isFinite(reset) && reset > now ? reset : undefined;
-		})
-		.filter((value): value is number => value !== undefined);
-	return until.length ? Math.max(...until) : undefined;
-});

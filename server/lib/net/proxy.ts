@@ -19,7 +19,9 @@
  * rule list (see `no-proxy.ts`). A rule only exempts; it never enables a proxy.
  */
 
+import type { Agent } from "node:http";
 import type { NoProxyRule } from "@shared/proxy-settings";
+import type { Dispatcher } from "undici";
 import { settings } from "../settings";
 import type { ProxyOverride } from "../settings/types";
 import { matchNoProxyRules, type NoProxyRuleMatch } from "./no-proxy";
@@ -202,10 +204,13 @@ export function resolveProxyForUrl(
 	return applyProxyExemptions(resolveOverride(override), target);
 }
 
-/** A node `http.Agent`-compatible proxy agent with best-effort teardown. */
-export interface ProxyAgentLike {
-	destroy?: () => void;
-}
+/**
+ * Node HTTP agent passed to gateway clients that speak `http.Agent`
+ * (`ws`, `@slack/bolt`, axios). `HttpsProxyAgent` is one of these.
+ * Discord REST takes an undici {@link Dispatcher} from
+ * {@link createUndiciProxyDispatcher} instead; that client is not an `http.Agent`.
+ */
+export type GatewayProxyAgent = Agent;
 
 function normalizeHttpProxyUrl(proxyUrl: string): string {
 	const trimmed = proxyUrl.trim();
@@ -233,10 +238,10 @@ function normalizeHttpProxyUrl(proxyUrl: string): string {
  */
 export async function createProxyAgent(
 	proxyUrl: string | undefined,
-): Promise<ProxyAgentLike | undefined> {
+): Promise<GatewayProxyAgent | undefined> {
 	if (!proxyUrl) return undefined;
 	const { HttpsProxyAgent } = await import("https-proxy-agent");
-	return new HttpsProxyAgent(normalizeHttpProxyUrl(proxyUrl)) as unknown as ProxyAgentLike;
+	return new HttpsProxyAgent(normalizeHttpProxyUrl(proxyUrl));
 }
 
 /** A real undici dispatcher with best-effort teardown methods. */
@@ -251,14 +256,14 @@ export interface UndiciDispatcherLike {
  */
 export async function createUndiciProxyDispatcher(
 	proxyUrl: string | undefined,
-): Promise<UndiciDispatcherLike | undefined> {
+): Promise<Dispatcher | undefined> {
 	if (!proxyUrl) return undefined;
-	return createOutboundProxyDispatcher(proxyUrl) as UndiciDispatcherLike;
+	return createOutboundProxyDispatcher(proxyUrl);
 }
 
 /** Best-effort teardown of an undici dispatcher (close → destroy → noop). */
 export async function closeUndiciDispatcher(
-	dispatcher: UndiciDispatcherLike | null | undefined,
+	dispatcher: UndiciDispatcherLike | Dispatcher | null | undefined,
 ): Promise<void> {
 	if (!dispatcher) return;
 	try {

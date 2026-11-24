@@ -1,4 +1,5 @@
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
+import { readQueryFirst } from "@server/db/worker-read";
 import {
 	FILE_CHANGE_EVIDENCE_VERSION,
 	FILE_CHANGE_LIMITS,
@@ -136,7 +137,7 @@ export class RevertTransactionService {
 		if (!request.action) throw fail("ACTION_MISMATCH");
 		const signal = input.signal ?? AbortSignal.timeout(this.timeoutMs);
 		const ctx = await this.context(request, signal);
-		await this.verifyEntrypoint(request, this.journal.getOperation(ctx), signal);
+		await this.verifyEntrypoint(request, await this.journal.getOperation(ctx, { signal }), signal);
 	}
 	private async context(
 		request: Omit<RevertTransactionRequest, "signal">,
@@ -182,7 +183,7 @@ export class RevertTransactionService {
 		// the original consent before any recorded result is returned.
 		const replay = operation.status !== "prepared";
 		if (replay && !request.action && !request.expectedSelector) return;
-		const ref = this.blobRef(operation.selectorBlobDigest);
+		const ref = await this.blobRef(operation.selectorBlobDigest, signal);
 		await worker<boolean>(
 			{
 				action: "entrypoint",
@@ -232,7 +233,7 @@ export class RevertTransactionService {
 				responseTimer = setTimeout(
 					() =>
 						run.started
-							? resolve(this.outcome(run, true, "IO_PENDING"))
+							? resolve(this.snapshotOutcome(run, true, "IO_PENDING"))
 							: reject(fail("CANCELLED")),
 					this.cleanupMs,
 				);
@@ -259,7 +260,7 @@ export class RevertTransactionService {
 	}
 	private async run(run: Run): Promise<RevertTransactionOutcome> {
 		run.ctx = await this.context(run.request, run.signal);
-		run.operation = this.journal.getOperation(run.ctx);
+		run.operation = await this.journal.getOperation(run.ctx, { signal: run.signal });
 		await this.verifyEntrypoint(run.request, run.operation, run.signal);
 		run.files = await this.readFiles(run.ctx, run.signal);
 		// Queries after a lost response return recorded facts; old/pending attempts never dispatch.
@@ -268,7 +269,10 @@ export class RevertTransactionService {
 			run.operation.protocolVersion !== FILE_CHANGE_EVIDENCE_VERSION
 		)
 			return this.replay(run);
-		if (this.plans.getSummary(run.ctx.owner, run.ctx.planId).expired) throw fail("EXPIRED");
+		if (
+			(await this.plans.getSummary(run.ctx.owner, run.ctx.planId, { signal: run.signal })).expired
+		)
+			throw fail("EXPIRED");
 		const manifest = await this.manifest(run);
 		await this.freshSelection(run, manifest);
 		const admission = await this.journal.startExecution(run.ctx, manifest.proof, {
@@ -304,7 +308,7 @@ export class RevertTransactionService {
 				/* Preserve measured file results. */
 			}
 		}
-		return this.outcome(run);
+		return this.snapshotOutcome(run);
 	}
 	private async attempt(run: Run, row: RevertJournalFile, file: TransactionManifestFile) {
 		let result: RevertFileResult;
@@ -332,11 +336,14 @@ export class RevertTransactionService {
 							target.identity.scopeId !== file.identity.scopeId
 						)
 							return fileResult("conflict", "TARGET_CHANGED");
-						const scope = this.db
-							.select()
-							.from(fileChangeScopes)
-							.where(eq(fileChangeScopes.id, file.identity.scopeId))
-							.get();
+						const scope = await readQueryFirst(
+							this.db
+								.select()
+								.from(fileChangeScopes)
+								.where(eq(fileChangeScopes.id, file.identity.scopeId))
+								.limit(1),
+							{ executionPolicy: "worker-required", maxRows: 1, signal },
+						);
 						if (!scope) return fileResult("failed", "SCOPE_METADATA_MISSING");
 						run.worktreePaths.add(scope.canonicalRoot);
 						if (!this.journal.startFile(run.ctx as RevertJournalContext, row.id))
@@ -386,7 +393,16 @@ export class RevertTransactionService {
 		// Queue is released before history publication and result recording.
 		try {
 			const after = result.observedAfter;
-			if (result.status === "applied" && after?.kind === "regular") this.blobRef(after.blob.digest);
+			if (result.status === "applied" && after?.kind === "regular")
+				await this.blobRef(after.blob.digest);
+		} catch (error) {
+			result = { ...result, historyStatus: "unavailable" };
+			logger.warn("Revert file blob metadata unavailable", {
+				planId: run.request.planId,
+				reason: errorCode(error),
+			});
+		}
+		try {
 			const recorded = this.journal.recordResult(run.ctx as RevertJournalContext, row.id, result);
 			if (
 				recorded.receiptJson &&
@@ -462,10 +478,10 @@ export class RevertTransactionService {
 	}
 	private async replay(run: Run): Promise<RevertTransactionOutcome> {
 		const ctx = run.ctx as RevertJournalContext;
-		let before = this.journal.getOperation(ctx);
+		let before = await this.journal.getOperation(ctx, { signal: run.signal });
 		for (let read = 0; read < 3; read++) {
 			run.files = await this.readFiles(ctx, run.signal);
-			run.operation = this.journal.getOperation(ctx);
+			run.operation = await this.journal.getOperation(ctx, { signal: run.signal });
 			if (run.operation.updatedAt === before.updatedAt) break;
 			before = run.operation;
 		}
@@ -477,13 +493,15 @@ export class RevertTransactionService {
 			run.worktreePaths = new Set(live.worktreePaths);
 			run.historyUnavailable = live.historyUnavailable;
 		}
-		return this.outcome(run, settling);
+		// Keep the checked operation with these file/live facts; a later operation-only read
+		// could observe a history commit after the sampled file results.
+		return this.snapshotOutcome(run, settling);
 	}
 	private async readFiles(ctx: RevertJournalContext, signal: AbortSignal) {
 		const files: RevertJournalFile[] = [];
 		let cursor: string | undefined;
 		do {
-			const page = this.journal.listFiles(ctx, { cursor, limit: 32 });
+			const page = await this.journal.listFiles(ctx, { cursor, limit: 32, signal });
 			files.push(...page.items);
 			bound(files.length, FILE_CHANGE_LIMITS.revertFiles);
 			cursor = page.nextCursor ?? undefined;
@@ -500,7 +518,7 @@ export class RevertTransactionService {
 			operation.selectorBlobDigest,
 			operation.historyManifestBlobDigest,
 		]) {
-			const ref = this.blobRef(digest);
+			const ref = await this.blobRef(digest, run.signal);
 			raw.push({ ref, bytes: await this.readBlob(ref, run.signal) });
 		}
 		const manifest = await worker<ValidatedTransactionManifest>(
@@ -520,12 +538,15 @@ export class RevertTransactionService {
 		);
 		return manifest;
 	}
-	private blobRef(digest: string | null): FileChangeBlobRef {
-		const row = this.db
-			.select({ size: fileChangeBlobs.sizeBytes, status: fileChangeBlobs.status })
-			.from(fileChangeBlobs)
-			.where(eq(fileChangeBlobs.digest, digest ?? ""))
-			.get();
+	private async blobRef(digest: string | null, signal?: AbortSignal): Promise<FileChangeBlobRef> {
+		const row = await readQueryFirst(
+			this.db
+				.select({ size: fileChangeBlobs.sizeBytes, status: fileChangeBlobs.status })
+				.from(fileChangeBlobs)
+				.where(eq(fileChangeBlobs.digest, digest ?? ""))
+				.limit(1),
+			{ executionPolicy: "worker-required", maxRows: 1, signal },
+		);
 		if (!digest || row?.status !== "ready") throw fail("MANIFEST_UNAVAILABLE");
 		return { algorithm: "sha256", digest, sizeBytes: row.size };
 	}
@@ -535,14 +556,11 @@ export class RevertTransactionService {
 			maxBytes: FILE_CHANGE_LIMITS.blobBytes,
 		});
 	}
-	private outcome(run: Run, settling = false, reason?: string): RevertTransactionOutcome {
-		let operation = run.operation;
-		if (run.ctx)
-			try {
-				operation = this.journal.getOperation(run.ctx);
-			} catch {
-				run.historyUnavailable = true;
-			}
+	/** Build one response without yielding between its operation, file and live-run facts. */
+	private snapshotOutcome(run: Run, settling = false, reason?: string): RevertTransactionOutcome {
+		const operation = run.operation;
+		settling = settling && ["applying", "files_verified"].includes(operation?.status ?? "");
+		if (!settling && reason === "IO_PENDING") reason = undefined;
 		const files = run.files.map((file): FileChangeRevertFileResult => {
 			const live = run.results.get(file.id);
 			const status = live?.status ?? persistedStatus(file.status);

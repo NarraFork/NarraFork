@@ -27,12 +27,14 @@ a.reference:focus-visible {
 
 /* A copy-safe pretext line is an inline formatting context, not a flex row of
    fragments. Remove its inherited strut and center ALL peers when it contains
-   a chip, otherwise the taller chip sits below baseline-aligned prose. */
-[data-vlist-line-frags]:has(> .reference) {
+   a chip, otherwise the taller chip sits below baseline-aligned prose.
+   The renderer marks such lines; a `:has(> .reference)` here made every node
+   inserted into the list invalidate the style of the whole app shell. */
+[data-vlist-line-frags][data-vlist-line-chip] {
 	line-height: 0;
 }
 
-[data-vlist-line-frags]:has(> .reference) > * {
+[data-vlist-line-frags][data-vlist-line-chip] > * {
 	vertical-align: middle;
 }
 

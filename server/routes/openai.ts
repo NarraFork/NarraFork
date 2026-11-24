@@ -6,6 +6,7 @@ import { logger } from "../lib/logger";
 import { getNarraforkHome } from "../lib/narrafork-home";
 import { resolveProxyForUrl } from "../lib/net/proxy";
 import {
+	customApiProtocolFromOpenAI,
 	getBuiltinCodexModels,
 	type OpenAIProviderConfig,
 	openaiProviderPrefix,
@@ -13,6 +14,9 @@ import {
 	registerOpenaiModelLister,
 	settings,
 } from "../lib/settings";
+import { registerModelListReader } from "../lib/sourcing/model-list-readers";
+import { sourceGroupForConnection } from "../lib/sourcing/source-groups";
+import { listCachedTemplateModels } from "../lib/sourcing/templates";
 
 export const openaiRoutes = new Hono();
 
@@ -80,6 +84,12 @@ function saveAllCachedModels(): void {
 /** Get cached models for a specific provider. */
 export function getOpenaiCachedModelsByProvider(providerId: string): OpenAIModelInfo[] {
 	return cachedModelsByProvider.get(providerId) ?? [];
+}
+
+for (const protocol of ["openai-responses", "completions-compatible"] as const) {
+	registerModelListReader(protocol, (group) =>
+		getOpenaiCachedModelsByProvider(group.id).map((model) => model.id),
+	);
 }
 
 function activeOpenaiProviderIds(): Set<string> {
@@ -353,9 +363,21 @@ openaiRoutes.post("/models/refresh", async (c) => {
 });
 
 // Per-provider endpoints
-openaiRoutes.get("/providers/:id/models", (c) => {
+openaiRoutes.get("/providers/:id/models", async (c) => {
 	const id = c.req.param("id");
-	return c.json({ models: getOpenaiCachedModelsByProvider(id), fromCache: true });
+	const config = (settings.openaiProviders ?? []).find((provider) => provider.id === id);
+	const group = sourceGroupForConnection(
+		{ id, name: config?.name ?? id, ...config, prefix: config ? openaiProviderPrefix(config) : id },
+		config ? customApiProtocolFromOpenAI(config) : "completions-compatible",
+	);
+	return c.json({
+		models: await listCachedTemplateModels(
+			group,
+			getOpenaiCachedModelsByProvider(id),
+			c.req.raw.signal,
+		),
+		fromCache: true,
+	});
 });
 
 openaiRoutes.post("/providers/:id/models/refresh", async (c) => {

@@ -1,8 +1,8 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CodexManager } from "../codex-manager";
+import { type CallContext, CodexManager } from "../codex-manager";
 
 function createManagerWithCredentials(
 	creds: Array<{
@@ -63,6 +63,39 @@ const tempHomes: string[] = [];
 afterEach(() => {
 	for (const p of tempHomes.splice(0)) {
 		rmSync(p, { recursive: true, force: true });
+	}
+});
+
+test.each([
+	"disable",
+	"replace",
+] as const)("rejects a diagnostic credential changed by %s during acquisition", async (change) => {
+	const { manager, tmpHome } = createManagerWithCredentials([{ id: "cred-a", priority: 0 }]);
+	tempHomes.push(tmpHome);
+	const context = await manager.acquireContext();
+	const refresh = Promise.withResolvers<CallContext>();
+	const ensure = spyOn(
+		manager as unknown as { tryEnsureToken(): Promise<CallContext | null> },
+		"tryEnsureToken",
+	).mockReturnValue(refresh.promise);
+	try {
+		const pending = manager.acquireDiagnosticContext(context.id);
+		expect(ensure).toHaveBeenCalledTimes(1);
+		if (change === "disable") {
+			manager.setDisabled(context.id, true);
+		} else {
+			expect(
+				manager.importFromTransfer(
+					[{ ...context.credential, accessToken: "replacement-token" }],
+					() => "replace",
+				).replaced,
+			).toBe(1);
+		}
+		refresh.resolve(context);
+		await expect(pending).rejects.toThrow("The parent Codex credential is unavailable");
+	} finally {
+		ensure.mockRestore();
+		manager.dispose();
 	}
 });
 

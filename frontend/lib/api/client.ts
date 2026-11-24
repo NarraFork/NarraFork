@@ -1,5 +1,6 @@
 import { apiUrl } from "@frontend/lib/base-path";
 import { businessTransport } from "@frontend/lib/business-transport";
+import { clearCurrentUserCache } from "@frontend/lib/current-user-cache";
 import { isSessionInvalidResponse } from "@shared/session-auth";
 
 /**
@@ -61,9 +62,12 @@ function notifyTokenChange(token: string | null): void {
 
 export function getToken(): string | null {
 	try {
-		return typeof localStorage === "undefined" ? null : localStorage.getItem(TOKEN_KEY);
+		const token = typeof localStorage === "undefined" ? null : localStorage.getItem(TOKEN_KEY);
+		if (!token) clearCurrentUserCache();
+		return token;
 	} catch {
 		// Storage can be unavailable in embedded/private contexts and pre-rendered consumers.
+		clearCurrentUserCache();
 		return null;
 	}
 }
@@ -72,11 +76,13 @@ export function setToken(token: string): void {
 	// Compare first so a no-op write does not announce a change: hydration paths re-assert
 	// the current value, and the bridge would otherwise send a redundant message.
 	const changed = localStorage.getItem(TOKEN_KEY) !== token;
+	if (changed) clearCurrentUserCache();
 	localStorage.setItem(TOKEN_KEY, token);
 	if (changed) notifyTokenChange(token);
 }
 
 export function clearToken(): void {
+	clearCurrentUserCache();
 	const had = localStorage.getItem(TOKEN_KEY) !== null;
 	localStorage.removeItem(TOKEN_KEY);
 	if (had) notifyTokenChange(null);

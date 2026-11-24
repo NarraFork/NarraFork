@@ -17,6 +17,10 @@ import { AppError } from "../../lib/errors";
 import { hotSafe } from "../../lib/hot-safe";
 import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
+import {
+	type ModelHistoryPreparation,
+	ModelHistoryTimeoutError,
+} from "../../lib/model-history-preparation";
 import { hasRowsOnlyBodies } from "../../lib/narrator-bodies";
 import { isCompiledRuntime, RUNTIME_BUILD_ID } from "../../lib/runtime-target";
 import { settings } from "../../lib/settings";
@@ -173,6 +177,9 @@ export type ModelHistoryBackend =
 export type LoadModelHistoryOptions = {
 	limit?: number;
 	signal?: AbortSignal;
+	/** Optional admission/signature deadline; hydration and projection remain cancellable. */
+	deadline?: number;
+	preparation?: ModelHistoryPreparation;
 };
 
 /** Explicit test/development ownership probe; production source reads never walk/freeze the graph. */
@@ -404,6 +411,9 @@ async function readWorker(
 	previous?: { source: ModelHistorySource; catalogIdentity?: string },
 ): Promise<HistoryReadResult> {
 	progress.phase = "queue";
+	options.preparation?.phase("queue");
+	if (options.deadline !== undefined && Date.now() >= options.deadline)
+		throw new ModelHistoryTimeoutError();
 	const requestId = generateId();
 	state.progress.set(requestId, progress);
 	try {
@@ -424,6 +434,8 @@ async function readWorker(
 				throw options.signal.reason;
 			throw new AppError("Model history preparation cancelled");
 		}
+		if (error instanceof TaskQueueError && error.code === "TASK_QUEUE_TIMEOUT")
+			throw new ModelHistoryTimeoutError();
 		if (error instanceof TaskQueueError && error.code === "TASK_QUEUE_FULL")
 			throw new AppError(
 				"Model history worker queue is full",
@@ -446,6 +458,7 @@ async function streamHistory(
 	previous?: { source: ModelHistorySource; catalogIdentity?: string },
 ): Promise<HistoryReadResult> {
 	checkWorkerEnabled();
+	options.preparation?.phase("read");
 	options.signal?.throwIfAborted();
 	progress.phase = "worker";
 	progress.refs = 0;
@@ -485,7 +498,11 @@ async function streamHistory(
 				resolve({ source: { messages, counters, compactSeq }, signature });
 			}
 		};
-		const abort = () => finish(new AppError("Model history preparation cancelled"));
+		const abort = () =>
+			finish(
+				options.signal?.reason ??
+					new DOMException("Model history preparation cancelled", "AbortError"),
+			);
 		const send = (message: unknown) => {
 			try {
 				worker.postMessage(message);
@@ -515,18 +532,21 @@ async function streamHistory(
 				if (finished) return;
 				if (options.signal?.aborted) return abort();
 				if (event.data.type === "page") {
+					options.preparation?.count("refs", event.data.rows.length);
 					for (const row of event.data.rows as ModelSourceRowBuilder[]) {
 						messages.push(row);
 						byId.set(row.id, row);
 					}
 					send({ type: "ack" });
 				} else if (event.data.type === "tools") {
+					options.preparation?.count("toolRows", event.data.rows.length);
 					for (const { messageId, ...tool } of event.data.rows as Array<
 						ModelToolSourceRow & { messageId: string }
 					>)
 						byId.get(messageId)?.toolCalls.push(tool);
 					send({ type: "ack" });
 				} else if (event.data.type === "reuseBodies") {
+					options.preparation?.count("refs", event.data.ids.length);
 					for (const id of event.data.ids as string[]) {
 						const old = previousById.get(id);
 						if (!old) return finish(new AppError("Model history delta source unavailable"));
@@ -536,6 +556,7 @@ async function streamHistory(
 					}
 					send({ type: "ack" });
 				} else if (event.data.type === "reuseTools") {
+					options.preparation?.count("toolRows", event.data.rows.length);
 					for (const { id, messageId } of event.data.rows as Array<{
 						id: string;
 						messageId: string;
@@ -614,6 +635,7 @@ async function readModelHistorySource(
 	// A read already in flight at hot reload can finish, but only populate its retired cache.
 	const cache = state.cache;
 	const check = () => {
+		options.preparation?.check();
 		options.signal?.throwIfAborted();
 		checkLegacyHistory();
 		checkHistoryMaintenance();
@@ -622,6 +644,7 @@ async function readModelHistorySource(
 	};
 	check();
 	const signature = async () => {
+		options.preparation?.phase("signature");
 		state.signatureReads++;
 		return backend.backend === "sqlite"
 			? readSqliteModelHistorySignature(backend.sqlite, narratorId)
@@ -643,6 +666,9 @@ async function readModelHistorySource(
 			progress.refs = cached.counters.refs;
 			progress.toolRows = cached.counters.toolRows;
 			progress.sourceBytes = cached.counters.sourceBytes;
+			options.preparation?.count("cacheHits", 1);
+			options.preparation?.phase("source");
+			check();
 			return cached;
 		}
 	}
@@ -661,6 +687,7 @@ async function readModelHistorySource(
 	let after = before;
 	if (inMemory && backend.backend === "sqlite") {
 		progress.phase = "read";
+		options.preparation?.phase("read");
 		source = await queryModelHistory(sqliteHistoryQuery(backend.sqlite), {
 			narratorId,
 			limit: options.limit,
@@ -695,6 +722,20 @@ async function readModelHistorySource(
 	progress.refs = source.counters.refs;
 	progress.toolRows = source.counters.toolRows;
 	progress.sourceBytes = source.counters.sourceBytes;
+	// Worker pages already contributed rows while in flight; inline fixtures have no page IPC.
+	for (const name of [
+		"refs",
+		"toolRows",
+		"sourceBytes",
+		"preparedBytes",
+		"refQueries",
+		"bodyQueries",
+		"toolQueries",
+		"reusedBodies",
+		"reusedTools",
+	] as const)
+		if (inMemory || (name !== "refs" && name !== "toolRows"))
+			options.preparation?.count(name, source.counters[name] ?? 0);
 	check();
 	state.lastCounters = source.counters;
 	if (cacheable && after.trusted) cache.set(key, source, after, source.counters.preparedBytes);
@@ -707,12 +748,13 @@ export async function loadModelHistorySource(
 	narratorId: string,
 	options: LoadModelHistoryOptions = {},
 ): Promise<ModelHistorySource> {
+	options = { ...options, signal: options.signal ?? options.preparation?.signal };
 	const startedAt = Date.now();
 	const progress: ModelHistoryProgress = { phase: "signature", refs: 0, toolRows: 0 };
 	let warned = false;
 	const warnIfSlow = () => {
 		const elapsedMs = Date.now() - startedAt;
-		if (warned || elapsedMs < 10_000) return;
+		if (options.preparation || warned || elapsedMs < 10_000) return;
 		warned = true;
 		try {
 			logger.warn("Slow model history preparation", {

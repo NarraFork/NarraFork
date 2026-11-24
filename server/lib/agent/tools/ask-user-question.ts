@@ -89,7 +89,7 @@ export const askUserQuestionTool: ToolDefinition = {
 		"- Waiting would stall a long task for a small decision\n" +
 		"Use the normal blocking mode when the answer changes what you should do next (which architecture, whether to proceed, which file to modify) — guessing there wastes far more work than waiting does.\n" +
 		"Batch related questions into ONE async call (up to 4) rather than making several; each call becomes a separate item in the user's inbox.\n" +
-		'If you later reach a point where you genuinely cannot proceed without the answer, block on it with `Await({ type: "question", id: "<question id>" })`. That notifies the user that you are now stalled on them, so only do it when a default really will not do — and do it instead of re-asking the same question synchronously.\n' +
+		"If you later cannot proceed without the answer, end the turn and let the answer notification resume you. Use Question action=get to inspect the existing question; do not re-ask it synchronously.\n" +
 		'When an async question stops mattering (you found the answer, the plan changed), withdraw it via `withdraw: ["<id>"]` so the user is not asked something that no longer matters. Do not re-ask a question you already submitted asynchronously.',
 	rawJsonSchema: {
 		type: "object",
@@ -441,12 +441,12 @@ async function submitAsyncQuestions(
 					// re-ask — which is what an agent does when it only learns "no answer".
 					`The user chose to answer this question later (id: ${record.id}). They accepted the question; they have not declined it.`,
 					"Continue with a sensible default for now. Their answer will arrive as a message in this conversation; adjust your work then.",
-					`If you reach a point where you truly cannot proceed without it, wait with Await({ type: "question", id: "${record.id}" }).`,
+					`If the answer blocks your next step, end the turn. Use Question({ action: "get", id: "${record.id}" }) to inspect it; the answer will notify automatically.`,
 				]
 			: [
 					`Question submitted asynchronously (id: ${record.id}). Continue working with a sensible default — do NOT wait and do NOT ask this again.`,
 					"The user's answer will arrive as a message in this conversation; adjust your work then.",
-					`If you later reach a point where the answer decides your next step, wait with Await({ type: "question", id: "${record.id}" }).`,
+					`If the answer later decides your next step, end the turn. Question({ action: "get", id: "${record.id}" }) recovers its context; the answer notifies automatically.`,
 					`If it stops mattering, withdraw it: AskUserQuestion({ withdraw: ["${record.id}"] }).`,
 				];
 		if (openCount >= service.ASYNC_QUESTION_SOFT_LIMIT) {

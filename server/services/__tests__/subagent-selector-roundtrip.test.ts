@@ -15,12 +15,16 @@
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { backgroundTasks, narrators } from "../../db/schema";
 import { narratorTraitsLock } from "../../lib/async-mutex";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
+import { captureWorkerRejectionThrower, getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
+afterAll(() => fixture.close());
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 
@@ -227,8 +231,10 @@ describe("recovered subagents retain their original selectors", () => {
 			updatedAt: now,
 		});
 		await expect(
-			resolveSubagentTargets({ callerNarratorId: "other-parent", id: "normal-stage-audit" }),
-		).rejects.toThrow(/No accessible subagent found/);
+			await captureWorkerRejectionThrower(
+				resolveSubagentTargets({ callerNarratorId: "other-parent", id: "normal-stage-audit" }),
+			),
+		).toThrow(/No accessible subagent found/);
 	});
 
 	test("alias persistence waits for concurrent trait edits without losing them", async () => {
@@ -261,8 +267,10 @@ describe("ambiguity is reported, not silently mis-resolved", () => {
 		await seed("SamePrefix0000000001", { title: null });
 		await seed("SamePrefix0000000002", { title: null });
 		await expect(
-			resolveSubagentTargets({ callerNarratorId: PARENT, id: "SamePref" }),
-		).rejects.toThrow(/Ambiguous subagent target/);
+			await captureWorkerRejectionThrower(
+				resolveSubagentTargets({ callerNarratorId: PARENT, id: "SamePref" }),
+			),
+		).toThrow(/Ambiguous subagent target/);
 	});
 
 	test("the ambiguity message leads with labels and shortened ids", async () => {

@@ -88,6 +88,7 @@ const Wrapper = ({
 );
 mock.module("@mantine/core", () => ({
 	Group: Wrapper,
+	ActionIcon: Wrapper,
 	Badge: Wrapper,
 	Text: Wrapper,
 	Stack: Wrapper,

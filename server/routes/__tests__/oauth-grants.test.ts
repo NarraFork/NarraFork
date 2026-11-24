@@ -1,8 +1,8 @@
-import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { and, eq, inArray, isNull } from "drizzle-orm";
+import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import { Hono } from "hono";
-import { db } from "../../db";
+import { db, sqlite } from "../../db";
 import {
 	integrationAuthorities,
 	integrationCapabilityGrants,
@@ -14,6 +14,7 @@ import {
 	users,
 } from "../../db/schema";
 import { buildAppErrorResponse } from "../../lib/app-error-response";
+import * as workerPool from "../../lib/db-worker/pool";
 import { generateId } from "../../lib/id";
 import {
 	exchangeCodeForToken,
@@ -23,7 +24,12 @@ import {
 	validateAccessToken,
 } from "../../lib/oauth-provider";
 import { requireSessionAuth } from "../../middleware/auth";
+import {
+	captureWorkerRejection,
+	captureWorkerRejectionThrower,
+} from "../../services/__tests__/narrator-worker-fixture";
 import { integrationAuthorityService } from "../../services/integration-authority-service";
+import { getUserOAuthGrant } from "../../services/oauth-grant-service";
 import { oauthGrantRoutes } from "../oauth-grants";
 
 const app = new Hono();
@@ -276,6 +282,126 @@ describe("oauth grants Connected Apps routes", () => {
 		expect(events.filter((event) => event.eventType === "revoked")).toHaveLength(1);
 	});
 
+	test("grant detail uses a bounded Worker snapshot without exposing inactive grants", async () => {
+		const [own] = await insertGrants(userId, 1);
+		const past = "2000-01-01T00:00:00.000Z";
+		await db
+			.update(integrationAuthorities)
+			.set({ policyJson: { allowRemoteExecution: false } })
+			.where(eq(integrationAuthorities.id, own.id));
+		await db
+			.update(integrationCapabilityGrants)
+			.set({ expiresAt: past })
+			.where(
+				and(
+					eq(integrationCapabilityGrants.authorityId, own.id),
+					eq(integrationCapabilityGrants.capabilityId, "narrator.provision"),
+				),
+			);
+		await db.insert(integrationCapabilityGrants).values({
+			id: generateId(),
+			authorityId: own.id,
+			capabilityId: "narrator.provision",
+			scopeType: "project",
+			scopeId: "retired-project",
+			scopeKey: "project:retired-project",
+			revokedAt: past,
+			createdByType: "system",
+			createdAt: past,
+			updatedAt: past,
+		});
+
+		const read = spyOn(workerPool, "runReadTask");
+		try {
+			const signal = new AbortController().signal;
+			const detail = await getUserOAuthGrant(userId, own.id, { signal });
+			expect(detail).toMatchObject({
+				scopes: ["device.provision"],
+				projectIds: [],
+				policyJson: { allowRemoteExecution: false },
+			});
+			expect(read).toHaveBeenCalledWith(
+				sqlite.filename,
+				expect.objectContaining({ kind: "selectRows", maxRows: 2001 }),
+				expect.objectContaining({ diagnosticSource: "oauth-grant-detail", signal }),
+			);
+			const response = await app.request(`/api/oauth/grants/${own.id}`, {
+				headers: await sessionHeaders(userId),
+			});
+			expect(response.status).toBe(200);
+			expect(await response.json()).toMatchObject({ scopes: ["device.provision"], projectIds: [] });
+			read.mockClear();
+			const denied = await app.request(`/api/oauth/grants/${own.id}`, {
+				headers: await sessionHeaders(otherUserId),
+			});
+			expect(denied.status).toBe(404);
+			expect(
+				read.mock.calls.some(([, , options]) => options?.diagnosticSource === "oauth-grant-detail"),
+			).toBe(false);
+		} finally {
+			read.mockRestore();
+		}
+	});
+
+	test("worker failures never fall back to the ordinary grant snapshot", async () => {
+		const [own] = await insertGrants(userId, 1);
+		const inline = spyOn(integrationAuthorityService, "getSnapshot");
+		const read = spyOn(workerPool, "runReadTask");
+		try {
+			for (const error of [
+				new workerPool.WorkersUnavailableError("disabled"),
+				new workerPool.WorkersUnavailableError("worker_creation_failed"),
+				new workerPool.DbReadTaskExecutionError("worker crashed"),
+				new workerPool.DbReadTaskTimeoutError("worker timed out"),
+			]) {
+				read.mockRejectedValueOnce(error);
+				expect(await captureWorkerRejection(getUserOAuthGrant(userId, own.id, {}))).toBe(error);
+			}
+			const controller = new AbortController();
+			controller.abort();
+			expect(
+				await captureWorkerRejection(
+					getUserOAuthGrant(userId, own.id, { signal: controller.signal }),
+				),
+			).toBe(controller.signal.reason);
+			expect(read).toHaveBeenCalledTimes(4);
+			expect(inline).not.toHaveBeenCalled();
+		} finally {
+			inline.mockRestore();
+			read.mockRestore();
+		}
+	});
+
+	test("committed grant detail rejects a caller transaction", async () => {
+		const [own] = await insertGrants(userId, 1);
+		const read = spyOn(workerPool, "runReadTask");
+		try {
+			const pending = sqlite.transaction(() => getUserOAuthGrant(userId, own.id, {}))();
+			expect(await captureWorkerRejection(pending)).toBeInstanceOf(
+				workerPool.WorkersUnavailableError,
+			);
+			expect(read).not.toHaveBeenCalled();
+		} finally {
+			read.mockRestore();
+		}
+	});
+
+	test("an oversized grant snapshot fails instead of returning partial access", async () => {
+		const [own] = await insertGrants(userId, 1);
+		const now = new Date().toISOString();
+		db.run(sql`WITH RECURSIVE numbers(n) AS (
+				SELECT 1 UNION ALL SELECT n + 1 FROM numbers WHERE n < 2000
+			)
+			INSERT INTO integration_capability_grants
+				(id, authority_id, capability_id, scope_type, scope_id, scope_key, created_by_type, created_at, updated_at)
+			SELECT ${own.id} || ':' || n, ${own.id}, 'device.provision', 'project', 'p' || n,
+				'project:p' || n, 'system', ${now}, ${now}
+			FROM numbers`);
+		expect(await captureWorkerRejection(getUserOAuthGrant(userId, own.id, {}))).toMatchObject({
+			code: "INTEGRATION_GRANT_LIMIT_EXCEEDED",
+		});
+	});
+
 	test("deduplicates batch ids, enforces ownership atomically, and rejects over 100 ids", async () => {
 		const [own] = await insertGrants(userId, 1);
 		const [other] = await insertGrants(otherUserId, 1);
@@ -317,6 +443,15 @@ describe("oauth grants Connected Apps routes", () => {
 	test("revoke-all requires confirmation and processes at most 100 active grants per call", async () => {
 		await insertGrants(userId, 101);
 		const [other] = await insertGrants(otherUserId, 1);
+
+		const pageResponse = await app.request("/api/oauth/grants?limit=100", {
+			headers: await sessionHeaders(userId),
+		});
+		expect(pageResponse.status).toBe(200);
+		const page = (await pageResponse.json()) as { items: GrantResponse[]; nextCursor: string };
+		expect(page.items).toHaveLength(100);
+		expect(new Set(page.items.map((item) => item.id)).size).toBe(100);
+		expect(page.nextCursor).toBeTruthy();
 
 		const unconfirmed = await app.request("/api/oauth/grants/revoke-all", {
 			method: "POST",
@@ -389,16 +524,20 @@ describe("oauth grants Connected Apps routes", () => {
 		});
 		expect(revokeResponse.status).toBe(200);
 		expect(await validateAccessToken(tokenPair.accessToken)).toBeNull();
-		await expect(
-			refreshAccessToken({ refreshToken: tokenPair.refreshToken, clientId: grant.clientId }),
-		).rejects.toThrow(/invalid or revoked/i);
-		await expect(
-			exchangeCodeForToken({
-				code,
-				clientId: grant.clientId,
-				redirectUri: "http://127.0.0.1:9876/oauth/callback",
-				codeVerifier: verifier,
-			}),
-		).rejects.toThrow(/invalid or revoked/i);
+		expect(
+			await captureWorkerRejectionThrower(
+				refreshAccessToken({ refreshToken: tokenPair.refreshToken, clientId: grant.clientId }),
+			),
+		).toThrow(/invalid or revoked/i);
+		expect(
+			await captureWorkerRejectionThrower(
+				exchangeCodeForToken({
+					code,
+					clientId: grant.clientId,
+					redirectUri: "http://127.0.0.1:9876/oauth/callback",
+					codeVerifier: verifier,
+				}),
+			),
+		).toThrow(/invalid or revoked/i);
 	});
 });

@@ -114,18 +114,18 @@ describe("optional update server WebDAV configuration", () => {
 		const selected = resolveMirrorRelaySettings(
 			{
 				...config,
-				mirrorRelay: { ...relay, totalTimeoutMinutes: 300, transferTimeoutMinutes: 60 },
+				mirrorRelay: { ...relay, totalTimeoutMinutes: 300, transferTimeoutMinutes: 100 },
 			},
 			env,
 		);
 		expect(selected?.totalTimeoutMs).toBe(300 * 60_000);
-		expect(selected?.webdav.transferTimeoutMs).toBe(60 * 60_000);
+		expect(selected?.webdav.transferTimeoutMs).toBe(100 * 60_000);
 		for (const patch of [
 			{ totalTimeoutMinutes: 301 },
 			{ totalTimeoutMinutes: -1 },
 			{ totalTimeoutMinutes: Number.NaN },
 			{ totalTimeoutMinutes: 1.5 },
-			{ transferTimeoutMinutes: 61 },
+			{ transferTimeoutMinutes: 101 },
 			{ transferTimeoutMinutes: 0 },
 		])
 			expect(() =>

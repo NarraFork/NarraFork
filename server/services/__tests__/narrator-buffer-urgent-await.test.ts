@@ -14,6 +14,7 @@ import type { ToolResult } from "../../lib/agent/types";
 import { AppError, ValidationError } from "../../lib/errors";
 import { updateBufferedMessageModeSchema } from "../../lib/validators/narrators";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
+import { captureWorkerRejection } from "./narrator-worker-fixture";
 
 // The snapshot worker shares the preload-isolated file-backed database.
 const { db, sqlite } = await import("../../db");
@@ -42,6 +43,8 @@ const started = Promise.withResolvers<AbortSignal>();
 const returned = Promise.withResolvers<ToolResult>();
 const childStarted = Promise.withResolvers<AbortSignal>();
 const childReturned = Promise.withResolvers<ToolResult>();
+const pendingWatchFollowups = new Set<string>();
+const providerPauses = new Set<string>();
 const provider: ProviderAdapter = {
 	formatTools: (tools) => tools,
 	buildHistory: rowsAsHistory,
@@ -50,23 +53,33 @@ const provider: ProviderAdapter = {
 		const input = requestInput(params);
 		calls.push(input.replace(/^<sender kind="human" \/>\n/, ""));
 		params.onRequestStart?.();
+		const narratorId = params.stickySessionKey ?? "";
+		if (pendingWatchFollowups.delete(narratorId)) {
+			providerPauses.add(narratorId);
+			(narratorId === child ? childStarted : started).resolve(params.signal);
+			await new Promise<void>((resolve) => {
+				if (params.signal.aborted) resolve();
+				else params.signal.addEventListener("abort", () => resolve(), { once: true });
+			});
+			return;
+		}
 		if (calls.length === 1) {
 			yield {
 				toolUses: [
 					{
 						toolUseId: "urgent-await-tool",
-						name: "Await",
+						name: "Watch",
 						input: { type: "agent", id: child, timeout: 600_000 },
 						outputIndex: 0,
 					},
 				],
 			};
-		} else if (input.includes("start child real Await")) {
+		} else if (input.includes("start child real Watch")) {
 			yield {
 				toolUses: [
 					{
 						toolUseId: "child-real-await",
-						name: "Await",
+						name: "Watch",
 						input: { type: "bash", id: "child-running-bash", timeout: 600_000 },
 						outputIndex: 0,
 					},
@@ -144,14 +157,17 @@ actualRoutes.onError((error, c) =>
 	c.json({ error: error.message }, error instanceof AppError ? (error.statusCode as 400) : 500),
 );
 const { toolRegistry } = await import("../../lib/agent/tool-registry");
-const { awaitTool, listRunningAwaits } = await import("../../lib/agent/tools/await");
+const { listRunningAwaits } = await import("../../lib/agent/tools/await");
+const { watchTool } = await import("../../lib/agent/tools/watch");
+const { backgroundTaskService } = await import("../background-task-service");
 
-// Only instrument entry/exit: execute, target resolution, waiter, loop and service controls are real.
+// Watch itself remains real and immediately returns. The following model request,
+// rather than an obsolete blocking tool, supplies the active interruptible turn.
 toolRegistry.register({
-	...awaitTool,
+	...watchTool,
 	async execute(args, ctx) {
-		(ctx.narratorId === child ? childStarted : started).resolve(ctx.signal);
-		const result = await awaitTool.execute(args, ctx);
+		const result = await watchTool.execute(args, ctx);
+		pendingWatchFollowups.add(ctx.narratorId);
 		(ctx.narratorId === child ? childReturned : returned).resolve(result);
 		return result;
 	},
@@ -160,7 +176,12 @@ afterAll(async () => {
 	closeNarrator(parent);
 	await until(() => !getExecutionOwner(parent), "cleanup owner released");
 	await closePrefixSnapshotStore();
-	toolRegistry.register(awaitTool);
+	for (const row of db.select().from(backgroundTasks).all()) {
+		if (row.command?.startsWith("[watch]") && row.status === "running") {
+			await backgroundTaskService.cancel(row.id);
+		}
+	}
+	toolRegistry.register(watchTool);
 	mock.restore();
 });
 
@@ -190,7 +211,8 @@ function queued(text: string, narratorId = parent) {
 
 let evidence: {
 	aborted: boolean;
-	awaitStatus: unknown;
+	watchStatus: unknown;
+	watchStillRunning: boolean;
 	oldOwnerReleased: boolean;
 	selectedId: string;
 	selectedState: string | undefined;
@@ -237,11 +259,9 @@ beforeAll(async () => {
 		])
 		.run();
 	try {
-		await acceptUserMessage(parent, "start real Await");
-		await until(
-			() => listRunningAwaits().some((entry) => entry.targetId === child),
-			"Await started",
-		);
+		await acceptUserMessage(parent, "start real Watch");
+		await until(() => providerPauses.has(parent), "model paused after Watch registration");
+		expect(listRunningAwaits()).toEqual([]);
 		const signal = await started.promise;
 		const owner = getExecutionOwner(parent);
 		expect(owner).toBeDefined();
@@ -284,7 +304,7 @@ beforeAll(async () => {
 			"urgent Await evidence",
 			JSON.stringify({
 				aborted: signal.aborted,
-				awaitStatus: result.metadata?.status,
+				watchStatus: result.metadata?.status,
 				oldOwnerReleased: !owner?.isCurrent(),
 				calls,
 				users,
@@ -300,7 +320,7 @@ beforeAll(async () => {
 					bufferSoftStop: active?._bufferSoftStop,
 					guidancePending: active?._bufferGuidancePending,
 				},
-				pendingHead: getBufferedMessages(parent)[0]?.text ?? null,
+				pendingHead: (await getBufferedMessages(parent))[0]?.text ?? null,
 				queue: rows.map((row) => ({
 					text: row.text,
 					state: row.state,
@@ -311,23 +331,41 @@ beforeAll(async () => {
 		);
 		evidence = {
 			aborted: signal.aborted,
-			awaitStatus: result.metadata?.status,
+			watchStatus: result.metadata?.status,
+			watchStillRunning:
+				db
+					.select()
+					.from(backgroundTasks)
+					.where(eq(backgroundTasks.id, String(result.metadata?.watchId)))
+					.get()?.status === "running",
 			oldOwnerReleased: !owner?.isCurrent(),
 			selectedId: selected.id,
 			selectedState: rows.find((row) => row.id === selected.id)?.state,
-			selectedPending: getBufferedMessages(parent).some((row) => row.id === selected.id),
+			selectedPending: (await getBufferedMessages(parent)).some((row) => row.id === selected.id),
 			users,
-			queueOrder: getBufferedMessages(parent).map((row) => row.text),
+			queueOrder: (await getBufferedMessages(parent)).map((row) => row.text),
 		};
 	} finally {
 		closeNarrator(parent);
+		// The independent observation survived the interrupt. Explicit fixture cleanup
+		// prevents its later child-run notice from waking this parent in unrelated cases.
+		for (const row of db
+			.select()
+			.from(backgroundTasks)
+			.where(eq(backgroundTasks.parentNarratorId, parent))
+			.all()) {
+			if (row.command?.startsWith("[watch]") && row.status === "running")
+				await backgroundTaskService.cancel(row.id);
+		}
 	}
 }, 10_000);
 
-test("interrupt aborts the real Await context and releases its old execution owner", () => {
+test("interrupt aborts the model turn and releases its owner without cancelling the registered Watch", () => {
 	expect(evidence.aborted).toBe(true);
-	expect(evidence.awaitStatus).toBe("aborted");
+	expect(evidence.watchStatus).toBe("watching");
+	expect(evidence.watchStillRunning).toBe(true);
 	expect(evidence.oldOwnerReleased).toBe(true);
+	expect(listRunningAwaits()).toEqual([]);
 });
 
 test("selected urgent input is materialized instead of stranded in the pending list", () => {
@@ -341,7 +379,8 @@ test("selected urgent input reaches persisted user history and a new provider re
 });
 
 test("selected interrupt is ahead of other unsent tool guidance", () => {
-	const order = calls.length > 1 ? calls.slice(1) : evidence.queueOrder;
+	const meaningfulRequests = calls.filter(Boolean);
+	const order = meaningfulRequests.length > 1 ? meaningfulRequests.slice(1) : evidence.queueOrder;
 	expect(order).toEqual(["selected urgent guidance", "older tool guidance"]);
 });
 
@@ -374,7 +413,7 @@ test("POST retry promotes selected failed urgent A ahead of newer urgent B befor
 	);
 	const newer = await queued("newer urgent B", narratorId);
 	await updateBufferedMessageMode(narratorId, newer.id, "interrupt");
-	expect(getBufferedMessages(narratorId).map((row) => row.text)).toEqual([
+	expect((await getBufferedMessages(narratorId)).map((row) => row.text)).toEqual([
 		"newer urgent B",
 		"retry selected urgent A",
 	]);
@@ -395,7 +434,7 @@ test("POST retry promotes selected failed urgent A ahead of newer urgent B befor
 			"retry A and B dispatched",
 		);
 		expect(calls.slice(callStart)).toEqual(["retry selected urgent A", "newer urgent B"]);
-		expect(getBufferedMessages(narratorId)).toHaveLength(0);
+		expect(await getBufferedMessages(narratorId)).toHaveLength(0);
 	} finally {
 		closeNarrator(narratorId);
 		await until(() => !getExecutionOwner(narratorId), "retry cleanup");
@@ -419,12 +458,14 @@ test("receipt timeout retains the urgent payload and staged attachment ownership
 		.from(narratorBufferedMessages)
 		.where(eq(narratorBufferedMessages.id, input.id))
 		.get();
-	await expect(
-		waitForBufferedMessageDelivery(parent, input.id, {
-			timeoutMs: 60,
-			wake: async () => false,
-		}),
-	).rejects.toMatchObject({ statusCode: 504, code: "BUFFER_DELIVERY_TIMEOUT" });
+	expect(
+		await captureWorkerRejection(
+			waitForBufferedMessageDelivery(parent, input.id, {
+				timeoutMs: 60,
+				wake: async () => false,
+			}),
+		),
+	).toMatchObject({ statusCode: 504, code: "BUFFER_DELIVERY_TIMEOUT" });
 	const after = db
 		.select()
 		.from(narratorBufferedMessages)
@@ -434,7 +475,7 @@ test("receipt timeout retains the urgent payload and staged attachment ownership
 	expect(after?.imagesJson).toBe(before?.imagesJson);
 	expect(after?.textFilePathsJson).toBe(before?.textFilePathsJson);
 	expect(after?.metadataJson).toBe(before?.metadataJson);
-	const projected = getBufferedMessages(parent).find((row) => row.id === input.id);
+	const projected = (await getBufferedMessages(parent)).find((row) => row.id === input.id);
 	expect(projected?.textFiles?.[0] && (await projected.textFiles[0].text())).toBe("keep me");
 });
 
@@ -453,7 +494,7 @@ test("request cancellation does not cancel or retry the durable urgent input", a
 	});
 	await wakeStarted.promise;
 	controller.abort();
-	await expect(waiting).rejects.toMatchObject({
+	expect(await captureWorkerRejection(waiting)).toMatchObject({
 		statusCode: 499,
 		code: "BUFFER_DELIVERY_CANCELLED",
 	});
@@ -466,20 +507,22 @@ test("failed or cancelled receipts reject without automatic retry or wake", asyn
 		const input = await queued(`terminal ${state}`);
 		sqlite.run("UPDATE narrator_buffered_messages SET state = ? WHERE id = ?", [state, input.id]);
 		let wakes = 0;
-		await expect(
-			waitForBufferedMessageDelivery(parent, input.id, {
-				wake: async () => {
-					wakes++;
-					return false;
-				},
-			}),
-		).rejects.toMatchObject({ statusCode: 409 });
+		expect(
+			await captureWorkerRejection(
+				waitForBufferedMessageDelivery(parent, input.id, {
+					wake: async () => {
+						wakes++;
+						return false;
+					},
+				}),
+			),
+		).toMatchObject({ statusCode: 409 });
 		expect(wakes).toBe(0);
 		expect((await readBufferedMessageDeliveryReceipt(parent, input.id))?.state).toBe(state);
 	}
 });
 
-test("taken-over child Await is interrupted without ending takeover or skipping urgent's first request", async () => {
+test("taken-over child's model turn is interrupted without ending takeover or its independent Watch", async () => {
 	const now = new Date().toISOString();
 	await db
 		.update(narrators)
@@ -526,23 +569,22 @@ test("taken-over child Await is interrupted without ending takeover or skipping 
 	const handle = await startNarratorRun({
 		narratorId: child,
 		locale: "en",
-		text: "start child real Await",
+		text: "start child real Watch",
 		principal: null,
 		deliver: false,
 	});
 	expect(handle.started).toBe(true);
 	try {
-		await until(
-			() => listRunningAwaits().some((entry) => entry.narratorId === child),
-			"child Await started",
-		);
+		await until(() => providerPauses.has(child), "child model paused after Watch registration");
+		expect(listRunningAwaits()).toEqual([]);
 		const toolSignal = await childStarted.promise;
 		const active = activeNarrators.get(child);
 		const owner = getExecutionOwner(child);
 		const run = getRunControl(child);
 		expect(active).toBeDefined();
+		// Keep the older input queued: a tool-mode control now legitimately stops the
+		// active model request, because Watch no longer occupies an interruptible wait.
 		await queued("child older tool guidance", child);
-		applyBufferedQueueModeControl(child, "tool", true, true);
 		expect(toolSignal.aborted).toBe(false);
 		const selected = await queued("child selected urgent guidance", child);
 		const response = await actualRoutes.request(`/${child}/buffer/${selected.id}/mode`, {
@@ -553,7 +595,15 @@ test("taken-over child Await is interrupted without ending takeover or skipping 
 		expect(response.status).toBe(200);
 		expect(await response.json()).toMatchObject({ ok: true, delivered: true });
 		expect(toolSignal.aborted).toBe(true);
-		expect((await childReturned.promise).metadata?.status).toBe("aborted");
+		const childWatch = await childReturned.promise;
+		expect(childWatch.metadata?.status).toBe("watching");
+		expect(
+			db
+				.select()
+				.from(backgroundTasks)
+				.where(eq(backgroundTasks.id, String(childWatch.metadata?.watchId)))
+				.get()?.status,
+		).toBe("running");
 		// Interrupting a held run stops only the current turn: the hold, the run and its
 		// owner stay, and the urgent input is the next turn of the same run.
 		expect(run?.cancel.signal.aborted).toBe(false);
@@ -569,11 +619,12 @@ test("taken-over child Await is interrupted without ending takeover or skipping 
 				.slice(startCall)
 				.map((text) => text.replace(/^<sender kind="(?:human|system)" \/>\n/, "")),
 		).toEqual([
-			"start child real Await",
+			"start child real Watch",
+			"",
 			"child selected urgent guidance",
 			"child older tool guidance",
 		]);
-		expect(getBufferedMessages(child)).toHaveLength(0);
+		expect(await getBufferedMessages(child)).toHaveLength(0);
 		// Releasing the hold ends the same run normally.
 		expect(await controlRun(child, { kind: "release" })).toBe(true);
 		const result = await handle.terminal;

@@ -9,7 +9,11 @@
  * (`@all members`). Direct Send is already rejected for `status === "archived"`.
  */
 
+import { narratorTraitsLock } from "../lib/async-mutex";
+import { NotFoundError } from "../lib/errors";
 import { logger } from "../lib/logger";
+import { parseSubstatus } from "../lib/narrator-utils";
+import { readRuntimeRegistrationColumn } from "../lib/validators/runtime-registration";
 
 export interface InterruptAndArchiveResult {
 	ok: boolean;
@@ -40,31 +44,24 @@ export async function interruptAndArchiveSubagent(
 	};
 	try {
 		const { narratorService } = await import("./narrator-service");
-		const narrator = await narratorService.getById(subagentId).catch(() => null);
-		if (!narrator) {
-			return { ...base, error: "not_found" };
-		}
-		const { closeNarrator, isNarratorActive } = await import("./narrator-session");
-		const { controlRun } = await import("./agent-runtime/run");
-
-		// End the registered run (including any hold/task projection) before closing
-		// the session. This mechanism does not depend on a delegation identity.
-		let interrupted = await controlRun(narrator.id, { kind: "cancel", reason: "Retired" });
-		try {
-			if (isNarratorActive(narrator.id)) {
-				closeNarrator(narrator.id);
-				interrupted = true;
+		const { withNarratorMutationAdmission } = await import("./narrator-session-state");
+		return await withNarratorMutationAdmission(subagentId, async () => {
+			const narrator = await narratorService.getById(subagentId);
+			if (!narrator) return { ...base, error: "not_found" };
+			base.alreadyArchived = narrator.status === "archived";
+			const { closeSubagentResources } = await import("./subagent-resources");
+			try {
+				base.interrupted = await prepareNarratorArchive(narrator);
+				if (!base.alreadyArchived) {
+					await narratorService.updateStatus(narrator.id, "archived");
+					base.archived = true;
+				}
+				base.interrupted = (await repairArchivedNarrator(narrator)) || base.interrupted;
+				return { ...base, ok: true };
+			} finally {
+				await closeSubagentResources(narrator.id);
 			}
-		} catch {
-			// closeNarrator is best-effort.
-		}
-
-		if (narrator.status === "archived") {
-			return { ...base, ok: true, alreadyArchived: true, interrupted };
-		}
-		await giveBackDelegatedTask(narrator);
-		await narratorService.updateStatus(narrator.id, "archived");
-		return { ok: true, alreadyArchived: false, archived: true, interrupted, id: narrator.id };
+		});
 	} catch (err) {
 		logger.warn("interruptAndArchiveSubagent failed", {
 			subagentId,
@@ -72,9 +69,99 @@ export async function interruptAndArchiveSubagent(
 		});
 		return {
 			...base,
-			error: err instanceof Error ? err.message : String(err),
+			error:
+				err instanceof NotFoundError
+					? "not_found"
+					: err instanceof Error
+						? err.message
+						: String(err),
 		};
 	}
+}
+
+/** Cancel work before archiving under the same mutation admission as the status write. */
+export async function prepareNarratorArchive(narrator: {
+	id: string;
+	status: string;
+	runtimeRegistrationJson?: unknown;
+}) {
+	const { closeNarrator, isNarratorActive } = await import("./narrator-session");
+	const { controlRun, stopSubagentHelpers } = await import("./agent-runtime/run");
+	let interrupted = await controlRun(narrator.id, { kind: "cancel", reason: "Retired" });
+	await stopSubagentHelpers(narrator.id, "Parent subagent archived");
+	if (isNarratorActive(narrator.id)) {
+		closeNarrator(narrator.id);
+		interrupted = true;
+	}
+	if (narrator.status !== "archived") await giveBackDelegatedTask(narrator);
+	return interrupted;
+}
+
+/** Repeated archive can repair legacy claims; callers must still hold mutation admission. */
+export async function repairArchivedNarrator(narrator: {
+	id: string;
+	type: string;
+	backgroundStatus: string | null;
+}) {
+	return narrator.type === "subagent" && narrator.backgroundStatus === "running"
+		? settleArchivedOrphan(narrator.id)
+		: false;
+}
+
+/** Only a projection-less, unregistered legacy claim can be retired without a run terminal. */
+async function settleArchivedOrphan(narratorId: string): Promise<boolean> {
+	const [ownership, session, recovery, { getRuntimePublicationService }] = await Promise.all([
+		import("./agent-runtime/ownership"),
+		import("./narrator-session"),
+		import("./recovery-handoff"),
+		import("./agent-runtime/publication"),
+	]);
+	const hasDriver = () => {
+		const hold = ownership.getRunHold(narratorId);
+		// A manifest-only checkpoint need not have a logical run or continuation row.
+		// Discovery must finish before an absent registry target proves abandonment.
+		return (
+			!!ownership.getExecutionOwner(narratorId) ||
+			!!ownership.getRunControl(narratorId) ||
+			session.isNarratorActive(narratorId) ||
+			!!(hold && (!hold.released || hold.result)) ||
+			recovery.isRecoveryDiscoveryActive() ||
+			recovery.isRecoveryTargetPending(narratorId)
+		);
+	};
+	const publication = getRuntimePublicationService();
+	// Same lock order as background registration: admission -> traits -> short write.
+	const settled = await narratorTraitsLock.acquire(narratorId, async () => {
+		if (hasDriver()) return null;
+		const claim = await publication.readArchivedOrphanBackgroundClaim(narratorId);
+		if (
+			!claim ||
+			claim.type !== "subagent" ||
+			claim.status !== "archived" ||
+			claim.backgroundStatus !== "running" ||
+			claim.logicalRunId !== null ||
+			readRuntimeRegistrationColumn(
+				claim.registrationText === null ? null : JSON.parse(claim.registrationText),
+			)?.run ||
+			parseSubstatus(claim.substatus).some(
+				(tag) => tag === "taken_over" || tag.startsWith("terminal_run:"),
+			) ||
+			hasDriver()
+		)
+			return null;
+		return (await publication.settleArchivedOrphanBackgroundClaim(claim, new Date().toISOString()))
+			? claim
+			: null;
+	});
+	if (!settled) return false;
+	const { backgroundTaskService } = await import("./background-task-service");
+	if (settled.parentNarratorId) {
+		backgroundTaskService.notifyDerivedStatusChanged(settled.parentNarratorId, narratorId);
+	} else {
+		const { backgroundOccupancyStore } = await import("./background-occupancy-store");
+		backgroundOccupancyStore.refreshNarrator(narratorId);
+	}
+	return true;
 }
 
 /**

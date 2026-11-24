@@ -28,6 +28,7 @@ import {
 } from "../../db/schema";
 import type { ProviderAdapter } from "../../lib/agent/provider";
 import type { ExecuteLoopOptions, ExecuteLoopResult } from "../narrator-executor";
+import { drainRuntimeTestWork } from "./agent-runtime-test-database";
 
 // The snapshot worker shares the preload-isolated file-backed database.
 const { db, sqlite } = await import("../../db");
@@ -98,6 +99,7 @@ afterEach(async () => {
 		activeNarrators.delete(id);
 		setRunHold(id, undefined);
 	}
+	await drainRuntimeTestWork();
 	mock.restore();
 	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
@@ -339,7 +341,7 @@ for (const shape of shapes) {
 			expect(handoff.handoff).toBe(true);
 			const alias = /<background_task_id>([^<]+)<\/background_task_id>/.exec(handoff.output)?.[1];
 			expect(alias).toBeTruthy();
-			expect(handoff.output).toContain(`Await({ type: "agent", id: "${alias}" })`);
+			expect(handoff.output).toContain(`Watch({ type: "agent", id: "${alias}" })`);
 			// The caller's turn ends after the handoff: that interrupt is not the run's.
 			caller.abort("caller turn interrupted");
 			expect(run?.cancel.signal.aborted).toBe(false);

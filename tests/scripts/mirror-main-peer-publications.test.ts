@@ -258,10 +258,12 @@ describe("one successful main Release mirrors independent main and peer publicat
 		]);
 		for (let retry = 0; retry < 2; retry++) {
 			const result = await mirrorPublishedGitHubReleaseSet(f.targets(publications));
-			expect(result.map((r) => r.status)).toEqual(["MIRRORED", "MIRRORED"]);
+			expect(result.map((r) => r.status)).toEqual(["METADATA_ONLY", "MIRRORED"]);
 			expect(result.map((r) => r.publication?.commit)).toEqual([commit, "c".repeat(40)]);
 			expect(result.map((r) => r.publication?.source.runId)).toEqual([123, 123]);
 			expect(f.main.committed?.targetVersion).toBe("1.2.0");
+			expect(f.main.committed?.schemaVersion).toBe(1);
+			expect(f.main.downloaded).toHaveLength(0);
 		}
 		expect(f.peerCommits).toBe(2);
 		expect(f.calls.every((args) => args[0] === "api" && !args.includes("-X"))).toBe(true);
@@ -355,7 +357,7 @@ describe("one successful main Release mirrors independent main and peer publicat
 		expect(publications.map((r) => r.kind)).toEqual(["main"]);
 		expect(
 			(await mirrorPublishedGitHubReleaseSet(f.targets(publications))).map((r) => r.status),
-		).toEqual(["MIRRORED"]);
+		).toEqual(["METADATA_ONLY"]);
 		expect(f.peerCommits).toBe(0);
 		expect(f.calls.some((args) => args[1].includes("remote-peer"))).toBe(false);
 		expect(mirrorPublicationReceiptPath("artifacts/mirror/receipt.json", "main", false)).toBe(
@@ -541,7 +543,7 @@ describe("one successful main Release mirrors independent main and peer publicat
 		const publications = await verified(f);
 		f.assets[0].digest = `sha256:${"f".repeat(64)}`;
 		const result = await mirrorPublishedGitHubReleaseSet(f.targets(publications));
-		expect(result.map((r) => r.status)).toEqual(["MIRRORED", "FAILED"]);
+		expect(result.map((r) => r.status)).toEqual(["METADATA_ONLY", "FAILED"]);
 		expect(f.peerCommits).toBe(0);
 	});
 	test("a main mirror failure keeps peer's independent result and both can be retried", async () => {
@@ -554,7 +556,7 @@ describe("one successful main Release mirrors independent main and peer publicat
 		f.main.failPath = "";
 		expect(
 			(await mirrorPublishedGitHubReleaseSet(f.targets(publications))).map((r) => r.status),
-		).toEqual(["MIRRORED", "MIRRORED"]);
+		).toEqual(["METADATA_ONLY", "MIRRORED"]);
 		expect(f.peerCommits).toBe(2);
 	});
 	for (const budget of ["bytes", "count"])

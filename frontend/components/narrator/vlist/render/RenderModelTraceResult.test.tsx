@@ -154,6 +154,74 @@ describe("ModelTrace result adapter → measure → render", () => {
 		}
 	});
 
+	it("labels single-sample percentages as uncalibrated weights", async () => {
+		const { container, unmount } = await renderCard({
+			type: "modeltrace_result",
+			decision: "partial",
+			results: [{ model: "candidate", displayName: "Candidate", probability: 0.427 }],
+		});
+		try {
+			expect(textOnly(container)).toContain("42.7%");
+			expect(textOnly(container)).toContain(en.modelTracePartial);
+		} finally {
+			unmount();
+		}
+	});
+
+	it("distinguishes cache reads, misses, and unknown usage when calibration is incomplete", async () => {
+		const { container, measured, unmount } = await renderCard(
+			{
+				type: "modeltrace_result",
+				decision: "unscorable",
+				calibrationRequested: true,
+				cacheReadTokens: [512, 0, null],
+				results: [],
+			},
+			{ language: "zh-CN" },
+		);
+		try {
+			expect(textOnly(container)).toContain(zh.modelTraceCalibrationIncomplete);
+			expect(textOnly(container)).toContain("512 · 0 · 未知");
+			expect(measured.height).toBe(
+				modelTraceResultHeight(0) + 2 * (MODELTRACE_LAYOUT.footnote + MODELTRACE_LAYOUT.gap),
+			);
+		} finally {
+			unmount();
+		}
+	});
+
+	it("does not show a percentage when the weight is unavailable", async () => {
+		const { container, unmount } = await renderCard({
+			type: "modeltrace_result",
+			decision: "partial",
+			results: [{ model: "candidate", displayName: "Candidate", probability: null }],
+		});
+		try {
+			expect(textOnly(container)).toContain("Candidate");
+			expect(textOnly(container)).toContain(en.modelTracePartial);
+			expect(textOnly(container)).not.toContain("%");
+			expect(container.querySelector('[role="progressbar"]')).toBeNull();
+		} finally {
+			unmount();
+		}
+	});
+
+	it.each([
+		["unscorable", en.modelTraceUnscorable],
+		["not_model", en.modelTraceNotModel],
+	] as const)("explains the %s decision", async (decision, message) => {
+		const { container, unmount } = await renderCard({
+			type: "modeltrace_result",
+			decision,
+			results: [],
+		});
+		try {
+			expect(textOnly(container)).toBe(message);
+		} finally {
+			unmount();
+		}
+	});
+
 	it.each([1, 2, 3, 4, 5] as const)("keeps all five result rows at LOD %s", async (lod) => {
 		const { container, measured, unmount } = await renderCard(SUCCESS, { lod });
 		try {

@@ -1,12 +1,42 @@
 import { describe, expect, test } from "bun:test";
+import type { BusinessSocket } from "@shared/remote-access/business-transport";
 import { resetAppBaseForTest } from "./base-path";
-import { buildWsUrl } from "./ws";
+import { buildWsUrl, safeCloseWs } from "./ws";
+import { withSocketTimers } from "./ws-test-utils";
 
 interface GlobalPatch {
 	key: string;
 	had: boolean;
 	previous: unknown;
 }
+
+describe("safeCloseWs", () => {
+	for (const outcome of ["pending", "open", "closed"] as const) {
+		test(`bounds disposal when handshake is ${outcome}`, () => {
+			withSocketTimers((fire) => {
+				let closes = 0;
+				const socket = {
+					readyState: 0,
+					close: () => closes++,
+					onopen: null as (() => void) | null,
+					onclose: null as (() => void) | null,
+				};
+				safeCloseWs(socket as unknown as BusinessSocket);
+				if (outcome === "open") {
+					socket.readyState = 1;
+					socket.onopen?.();
+				} else if (outcome === "closed") {
+					socket.readyState = 3;
+					socket.onclose?.();
+				}
+				fire(1000);
+				expect(closes).toBe(outcome === "closed" ? 0 : 1);
+				expect(socket.onopen).toBeNull();
+			});
+		});
+	}
+	test("accepts a missing socket", () => safeCloseWs(null));
+});
 
 function patchGlobal(key: string, value: unknown): GlobalPatch {
 	const globals = globalThis as Record<string, unknown>;

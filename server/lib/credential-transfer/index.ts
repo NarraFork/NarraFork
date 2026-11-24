@@ -7,6 +7,7 @@
  * Exporting requires a step-up grant (password + second factor), checked by the route.
  */
 import { logger } from "../logger";
+import { normalizeLegacyBundle } from "../sourcing/legacy-transfer";
 import { type BundleItem, openBundle, sealBundle } from "./bundle";
 import { KINDS, type TransferableCredential } from "./kinds";
 
@@ -62,7 +63,8 @@ export async function previewCredentialImport(
 	text: string,
 	passphrase: string,
 ): Promise<{ exportedAt: number; items: ImportPreviewItem[] }> {
-	const bundle = await openBundle(text, passphrase);
+	const opened = await openBundle(text, passphrase);
+	const bundle = { ...opened, items: normalizeLegacyBundle(opened.items) };
 	const items: ImportPreviewItem[] = bundle.items.map((item, index) => ({
 		index,
 		kind: item.kind,
@@ -92,7 +94,8 @@ export async function applyCredentialImport(
 	choices: ReadonlyMap<number, "import" | "replace">,
 	actor: { userId: string },
 ): Promise<{ added: number; replaced: number; skipped: number }> {
-	const bundle = await openBundle(text, passphrase);
+	const opened = await openBundle(text, passphrase);
+	const bundle = { ...opened, items: normalizeLegacyBundle(opened.items) };
 	const total = { added: 0, replaced: 0, skipped: 0 };
 	for (const [kindName, group] of groupByKind(bundle.items)) {
 		const kind = kindOf(kindName);

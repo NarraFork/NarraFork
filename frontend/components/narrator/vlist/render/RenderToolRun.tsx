@@ -34,6 +34,7 @@
  * just finished never played.
  */
 
+import type { ReasoningTranslationEvidence } from "@shared/pretext-layout/reasoning-translation-sources";
 import {
 	resolveToolShimmerFlash,
 	resolveToolShimmerPhase,
@@ -77,6 +78,10 @@ import {
 } from "../measure/measure-tool-run";
 import type { MeasuredElement } from "../prepared-block";
 import { typographyMetrics } from "../pretext-fonts";
+import {
+	ReasoningTranslationIndicator,
+	useVisibleReasoningSource,
+} from "../reasoning-translation-visibility";
 import {
 	applyTraceUnknownHeights,
 	isExpandedUnknownTraceBody,
@@ -240,6 +245,8 @@ export type TraceRowLiveTails = ReadonlyMap<string, { charCount: number; tail: s
 export type TraceRowCardSlot = (row: MeasuredTraceRow) => React.ReactNode | null;
 
 interface RenderToolRunProps {
+	translationSource?: import("@shared/reasoning-translation").ReasoningTranslationVisibilityTarget;
+	translationEvidence?: ReasoningTranslationEvidence[];
 	/** Controlled correction for fully expanded unpredictable markdown, including trace chrome. */
 	onUnknownHeight?: (height: number) => void;
 	textPreviewLabels?: TextPreviewLabels;
@@ -390,6 +397,8 @@ function UnknownHeightTrace(props: RenderToolRunProps) {
 }
 
 function RenderMeasuredToolRun({
+	translationSource,
+	translationEvidence,
 	measured,
 	labels = {},
 	rowIcon,
@@ -505,6 +514,8 @@ function RenderMeasuredToolRun({
 			{/* ── Rows (+ expanded bodies) ── */}
 			{rows.map((row) => (
 				<TraceRowView
+					translationSource={translationSource}
+					translationEvidence={translationEvidence}
 					key={row.key}
 					row={row}
 					onBodyUnknownHeight={bodyHeightReporters?.get(row.key)}
@@ -533,6 +544,9 @@ function RenderMeasuredToolRun({
 					animScope={animScope}
 				/>
 			))}
+			{translationEvidence ? (
+				<ReasoningTranslationIndicator evidence={translationEvidence} />
+			) : null}
 		</div>
 	);
 }
@@ -868,6 +882,8 @@ function LiveTailText({
 }
 
 function TraceRowView({
+	translationSource,
+	translationEvidence,
 	row,
 	rowIcon,
 	onToggleRow,
@@ -888,6 +904,8 @@ function TraceRowView({
 	onToggleTextExpanded,
 	onBodyUnknownHeight,
 }: {
+	translationSource?: import("@shared/reasoning-translation").ReasoningTranslationVisibilityTarget;
+	translationEvidence?: ReasoningTranslationEvidence[];
 	onBodyUnknownHeight?: (height: number) => void;
 	textPreviewLabels?: TextPreviewLabels;
 	onToggleTextExpanded?: (bodyKey?: string) => void;
@@ -912,6 +930,13 @@ function TraceRowView({
 	animKeyBase?: string;
 	animScope?: string;
 }) {
+	const visibleRef = useVisibleReasoningSource<HTMLDivElement>(
+		translationSource,
+		translationEvidence,
+		translationEvidence ? row.body : undefined,
+		undefined,
+		row.itemIndex,
+	);
 	/**
 	 * The card node from the last render that HAD one, kept so a closing drill-down can
 	 * be animated shut around it (see `closingRowKeys`).
@@ -1175,6 +1200,7 @@ function TraceRowView({
 			{/* Expanded markdown body (left-bordered, indented). */}
 			{row.expanded && row.body ? (
 				<div
+					ref={visibleRef}
 					style={{
 						paddingBlock: rowSpacing(TRACE_BODY_PADDING_Y),
 						position: "absolute",
@@ -1186,6 +1212,7 @@ function TraceRowView({
 						opacity: 0.75,
 					}}
 				>
+					{translationSource ? <ReasoningTranslationIndicator target={translationSource} /> : null}
 					<RenderTextPreview
 						textPreviewLabels={textPreviewLabels}
 						onToggleTextExpanded={onToggleTextExpanded}

@@ -25,7 +25,7 @@ const attempts = [];
 for (const specifier of specifiers) {
 	try {
 		const started = await connectCompiledWorker([specifier], { timeoutMs: 3000 });
-		started.worker.postMessage({ action: "read", cwd: process.cwd(), paths: [] });
+		started.worker.postMessage({ action: "read", cwd: process.cwd(), paths: [], remainingBytes: 0, deadlineAt: Date.now() + 3000 });
 		const message = await new Promise((resolve, reject) => {
 			const timer = setTimeout(() => reject(new Error("no reply")), 3000);
 			started.worker.once("message", (value) => { clearTimeout(timer); resolve(value); });

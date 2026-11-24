@@ -34,6 +34,7 @@ import { beforeAll, describe, expect, test } from "bun:test";
 import { and, eq, sql } from "drizzle-orm";
 import { db, sqlite } from "../../db";
 import { aclGrants, narrators, users } from "../../db/schema";
+import { resetDbWorkerPoolForTest } from "../../lib/db-worker/pool";
 import { generateId } from "../../lib/id";
 import {
 	canManageNarratorAcl,
@@ -375,6 +376,29 @@ describe("unresolvable delegation fails closed", () => {
 		// branch rather than the audience being broken for subagents in general.
 		const healthy = await makeSubagent({ parentNarratorId: root });
 		expect(await listNarratorAudience(await rowOf(healthy))).toEqual({ everyone: true });
+	});
+
+	test("an unavailable delegation reader remains an infrastructure failure", async () => {
+		const root = await makeRoot({ visibility: "public" });
+		const sub = await makeSubagent({ parentNarratorId: root });
+		const row = await rowOf(sub);
+		const previous = process.env.NARRAFORK_DB_WORKER;
+		process.env.NARRAFORK_DB_WORKER = "off";
+		await resetDbWorkerPoolForTest();
+		try {
+			const deniedRead = await canReadNarrator(row, asUser(stranger)).catch((error) => error);
+			expect(deniedRead).toMatchObject({
+				code: "DB_READ_UNAVAILABLE",
+			});
+			const deniedAudience = await listNarratorAudience(row).catch((error) => error);
+			expect(deniedAudience).toMatchObject({
+				code: "DB_READ_UNAVAILABLE",
+			});
+		} finally {
+			if (previous === undefined) delete process.env.NARRAFORK_DB_WORKER;
+			else process.env.NARRAFORK_DB_WORKER = previous;
+			await resetDbWorkerPoolForTest();
+		}
 	});
 
 	test("a self-referential pointer does not loop or grant", async () => {

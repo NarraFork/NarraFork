@@ -17,7 +17,7 @@
  * flow, before execution — so this file asserts scope, not ACL. That distinction is the reason
  * `all_narrators` requires approval in the first place.
  */
-import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import {
 	narratorMessageRefs,
 	narratorMessages,
@@ -30,6 +30,9 @@ const { db, sqlite } = getTestDb();
 mock.module("../../../server/db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
 
 const { createSqliteSearchStore } = await import("../../../server/services/search/sqlite-store");
+const { createSqliteSearchQueryExecutor } = await import(
+	"../../../server/services/search/sqlite-worker-runner"
+);
 const searchStore = createSqliteSearchStore(async (sql, params) =>
 	sqlite.prepare<Record<string, unknown>, Array<string | number | null>>(sql).all(...params),
 );
@@ -92,12 +95,12 @@ function seedMessage(params: {
 async function recallSearch(
 	narratorId: string,
 	args: Record<string, unknown>,
+	signal = new AbortController().signal,
 ): Promise<{ ids: string[]; snippets: string[]; isError: boolean }> {
-	const result = await recallTool.execute(
-		{ action: "search", ...args },
-		// The loop supplies far more context; the search path reads only `narratorId`.
-		{ narratorId } as never,
-	);
+	const result = await recallTool.execute({ action: "search", ...args }, {
+		narratorId,
+		signal,
+	} as never);
 	const meta = result.metadata as { results?: Array<{ id: string; snippet: string }> } | undefined;
 	return {
 		ids: (meta?.results ?? []).map((r) => r.id),
@@ -126,6 +129,46 @@ afterEach(() => {
 		sqlite.run(`DELETE FROM "${table}"`);
 	}
 	sqlite.run("PRAGMA foreign_keys = ON");
+});
+
+describe("Recall search cancellation", () => {
+	it("propagates turn cancellation through the SQLite search executor and stops a batch", async () => {
+		const controller = new AbortController();
+		const runTask = mock(async (_path, _query, options: { signal?: AbortSignal }) => {
+			controller.abort();
+			options.signal?.throwIfAborted();
+			return { columns: [], rows: [] };
+		});
+		const workerStore = createSqliteSearchStore(
+			createSqliteSearchQueryExecutor("recall-test.db", { runTask }),
+		);
+		const search = spyOn(searchStore, "searchRecallMessages").mockImplementation(
+			workerStore.searchRecallMessages,
+		);
+		try {
+			await expect(
+				recallSearch("narr-self", { query: ["pomegranate", "quince"] }, controller.signal),
+			).rejects.toMatchObject({ code: "SEARCH_QUERY_CANCELLED" });
+			expect(runTask.mock.calls[0]?.[2].signal?.aborted).toBe(true);
+			expect(runTask).toHaveBeenCalledTimes(1);
+			expect(search).toHaveBeenCalledTimes(1);
+		} finally {
+			search.mockRestore();
+		}
+	});
+
+	it("does not dispatch a single query if the turn was already cancelled", async () => {
+		const reason = new Error("stopped");
+		const search = spyOn(searchStore, "searchRecallMessages");
+		try {
+			await expect(
+				recallSearch("narr-self", { query: "quince" }, AbortSignal.abort(reason)),
+			).rejects.toBe(reason);
+			expect(search).not.toHaveBeenCalled();
+		} finally {
+			search.mockRestore();
+		}
+	});
 });
 
 describe("Recall search scope", () => {

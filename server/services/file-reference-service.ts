@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { type ReadQueryOptions, readQueryFirst } from "@server/db/worker-read";
 import {
 	FILE_PANEL_PAGE_BYTES,
 	FILE_REFERENCE_READ_CONCURRENCY,
@@ -105,6 +106,7 @@ export interface FileReferenceDependencies {
 		narratorId: string,
 		userId: string,
 		need: "read" | "write",
+		options?: Pick<ReadQueryOptions, "signal" | "timeoutMs" | "deadlineAt">,
 	): Promise<FileReferenceScope>;
 	getBackend(deviceId: string): ExecutionBackend | Promise<ExecutionBackend>;
 	readDecision(
@@ -359,10 +361,14 @@ export function createFileReferenceService(
 		let truncated = false;
 		try {
 			if (!userId || !narratorId) throw new NotFoundError("Narrator", narratorId);
-			const scope = await op.wait(() => deps.loadScope(narratorId, userId, need));
+			const scope = await op.wait(() =>
+				deps.loadScope(narratorId, userId, need, { signal: op.signal, deadlineAt: op.deadline }),
+			);
 			const result = await op.wait(() => execute(scope, op, devices));
 			// Recheck ACL/device availability before releasing results. No long-lived auth cache.
-			const current = await op.wait(() => deps.loadScope(narratorId, userId, need));
+			const current = await op.wait(() =>
+				deps.loadScope(narratorId, userId, need, { signal: op.signal, deadlineAt: op.deadline }),
+			);
 			if (current.cwd !== scope.cwd)
 				throw failure(
 					"IDENTITY_CHANGED",
@@ -911,7 +917,7 @@ export function createFileReferenceService(
 
 /** Lazy production bindings: importing the factory in isolated tests never opens a DB. */
 const productionDependencies: FileReferenceDependencies = {
-	async loadScope(narratorId, userId, need) {
+	async loadScope(narratorId, userId, need, options = {}) {
 		const [
 			{ db },
 			schema,
@@ -931,23 +937,37 @@ const productionDependencies: FileReferenceDependencies = {
 			import("./narrator-cwd"),
 			import("./oauth-narrator-runtime-policy"),
 		]);
-		const user = await db.query.users.findFirst({
-			where: eq(schema.users.id, userId),
-			columns: { role: true },
-		});
-		const row = await db.query.narrators.findFirst({
-			where: eq(schema.narrators.id, narratorId),
-			columns: {
-				...acl.NARRATOR_ACL_COLUMNS,
-				cwd: true,
-				defaultDeviceId: true,
-				permissionMode: true,
-				traits: true,
-				relaxedPlan: true,
-			},
-		});
+		const user = await readQueryFirst(
+			db
+				.select({ role: schema.users.role })
+				.from(schema.users)
+				.where(eq(schema.users.id, userId))
+				.limit(1),
+			{ ...options, executionPolicy: "worker-required", maxRows: 1 },
+		);
+		const row = await readQueryFirst(
+			db
+				.select({
+					id: schema.narrators.id,
+					ownerUserId: schema.narrators.ownerUserId,
+					visibility: schema.narrators.visibility,
+					writeAudience: schema.narrators.writeAudience,
+					type: schema.narrators.type,
+					aclRootNarratorId: schema.narrators.aclRootNarratorId,
+					contextProjectId: schema.narrators.contextProjectId,
+					cwd: schema.narrators.cwd,
+					defaultDeviceId: schema.narrators.defaultDeviceId,
+					permissionMode: schema.narrators.permissionMode,
+					traits: schema.narrators.traits,
+					relaxedPlan: schema.narrators.relaxedPlan,
+				})
+				.from(schema.narrators)
+				.where(eq(schema.narrators.id, narratorId))
+				.limit(1),
+			{ ...options, executionPolicy: "worker-required", maxRows: 1 },
+		);
 		if (!user || !row) throw new NotFoundError("Narrator", narratorId);
-		await acl.assertNarratorAccess(row, { userId, isAdmin: user.role === "admin" }, need);
+		await acl.assertNarratorAccess(row, { userId, isAdmin: user.role === "admin" }, need, options);
 		if (isFormerChapterSessionWithoutDirectory(row))
 			throw new AppError(
 				"This legacy workspace has no directory. Choose a working directory to continue.",
@@ -956,13 +976,17 @@ const productionDependencies: FileReferenceDependencies = {
 			);
 		const projectId = row.contextProjectId;
 		const project = projectId
-			? await db.query.projects.findFirst({
-					where: eq(schema.projects.id, projectId),
-					columns: { gitPath: true },
-				})
+			? await readQueryFirst(
+					db
+						.select({ gitPath: schema.projects.gitPath })
+						.from(schema.projects)
+						.where(eq(schema.projects.id, projectId))
+						.limit(1),
+					{ ...options, executionPolicy: "worker-required", maxRows: 1 },
+				)
 			: undefined;
 		if (projectId && !project) throw new NotFoundError("Project", projectId);
-		const runtimePolicy = await resolveOAuthNarratorRuntimePolicy(narratorId);
+		const runtimePolicy = await resolveOAuthNarratorRuntimePolicy(narratorId, undefined, options);
 		const permissionMode = runtimePolicy?.permissionMode ?? row.permissionMode ?? "default";
 		const strictPlan =
 			!runtimePolicy &&
@@ -1020,30 +1044,16 @@ const productionDependencies: FileReferenceDependencies = {
 			context.paths.flavor === "windows" ? path.replaceAll("\\", "/").toLowerCase() : path
 		).split("/");
 		if (segments.some((part) => [".ssh", ".aws", ".gnupg", ".kube"].includes(part))) return true;
+		const { isSecretHomeRelativePath, isSecretPlatformPath, isSecretUserPath } = await import(
+			"../lib/fs-secret-paths"
+		);
 		const nf = segments.indexOf(".narrafork");
-		if (nf >= 0) {
-			const first = segments[nf + 1] ?? "";
-			if (
-				[
-					"settings.json",
-					"codex-credentials.json",
-					"provider-keys.json",
-					"secret.key",
-					"update-server.json",
-					"update-server-test.json",
-					"narrafork.lock",
-				].includes(first) ||
-				first.startsWith("narrafork.db")
-			)
-				return true;
-		}
+		if (nf >= 0 && isSecretHomeRelativePath(segments.slice(nf + 1))) return true;
 		if (context.backend.kind === "remote") return false;
-		const [{ isSecretPlatformPath, isSecretUserPath }, { getHome }, { narraforkDir }] =
-			await Promise.all([
-				import("../lib/fs-secret-paths"),
-				import("../lib/platform"),
-				import("../lib/settings"),
-			]);
+		const [{ getHome }, { narraforkDir }] = await Promise.all([
+			import("../lib/platform"),
+			import("../lib/settings"),
+		]);
 		// Canonicalize the protected roots too: a symlinked custom NARRAFORK_HOME must
 		// not make its settings/database readable through the target's physical spelling.
 		const [platformHome, userHome] = await Promise.all([

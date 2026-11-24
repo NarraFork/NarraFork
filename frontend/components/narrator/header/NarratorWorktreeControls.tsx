@@ -57,14 +57,24 @@ export function NarratorWorktreeControls({
 	onRequirement?: (text: string) => void;
 }) {
 	const { data: user } = useCurrentUser();
-	const { data: context } = useWorkspaceContext(narratorId);
-	if (!user?.id || !context?.git) return null;
-	const scope: ReceiptScope = {
-		userId: user.id,
-		narratorId,
-		deviceId: context.deviceId,
-		repositoryKey: context.git.repositoryKey,
-	};
+	const { data: context, transitioning } = useWorkspaceContext(narratorId);
+	const owner = useRef<ReceiptScope | null>(null);
+	if (user?.id && context?.git) {
+		owner.current = {
+			userId: user.id,
+			narratorId,
+			deviceId: context.deviceId,
+			repositoryKey: context.git.repositoryKey,
+		};
+	} else if (
+		!transitioning ||
+		owner.current?.userId !== user?.id ||
+		owner.current?.narratorId !== narratorId
+	) {
+		owner.current = null;
+	}
+	const scope = owner.current;
+	if (!scope) return null;
 	return (
 		<ScopedWorktreeControls
 			key={JSON.stringify(scope)}

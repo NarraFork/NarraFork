@@ -181,7 +181,10 @@ test.each([
 	const labels = language === "en" ? en : zh;
 	const i18n = await render(<StorageSection />, language);
 	expect(cached).toHaveBeenCalledTimes(1);
-	expect(document.querySelectorAll("[data-storage-category]")).toHaveLength(10);
+	expect(document.querySelectorAll("[data-storage-category]")).toHaveLength(11);
+	// A team coordinator's saved results (Project Teams P2) have their own card.
+	const coordinatorCard = document.querySelector('[data-storage-category="coordinatorOutputs"]');
+	expect(coordinatorCard?.textContent).toContain(labels.storageCoordinatorOutputs);
 	const checks = [
 		[
 			"requestRecordings",

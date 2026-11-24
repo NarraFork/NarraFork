@@ -1296,7 +1296,7 @@ function classifyByCategory(
 		case "structureEdit":
 			return classifyStructureEdit(status, inputJson, outputJson, metadata);
 		case "webSearch":
-			return classifyWebSearch(inputJson, outputJson);
+			return classifyWebSearch(status, inputJson, outputJson);
 		case "webFetch":
 			return classifyWebFetch(status, inputJson, outputJson, metadata);
 		case "taskOutput":
@@ -1316,6 +1316,8 @@ function classifyByCategory(
 		}
 		case "await":
 			return classifyAwait(inputJson, outputJson, metadata, status);
+		case "watch":
+			return classifyWatch(inputJson, outputJson, metadata, input.labels);
 		case "send":
 			return classifySend(inputJson, outputJson, metadata, input.labels, status);
 		case "ask":
@@ -1354,7 +1356,7 @@ function classifyByCategory(
 		case "workspace":
 			return classifyWorkspace(toolName, inputJson, outputJson, input.labels, metadata);
 		default:
-			return classifyGeneric(inputJson, outputJson);
+			return classifyGeneric(inputJson, outputJson, { status, metadata });
 	}
 }
 
@@ -1495,10 +1497,46 @@ function truncatedFlag(source: unknown): { textTruncated?: true } {
 	return hasTruncatedLeaf(source) ? { textTruncated: true } : {};
 }
 
-function classifyGeneric(inputJson: unknown, outputJson: unknown): ToolDetailData {
+/**
+ * A count-based bar for a generic (product / MCP) tool's determinate progress:
+ * `done/total` plus the item it is working on. Byte formatting is the transfer
+ * card's concern; a generic tool reports work units.
+ */
+function readGenericProgressRow(value: unknown): ToolRowProgress | null {
+	const payload = readToolProgressPayload(value);
+	if (!payload || !hasRenderableProgress(payload)) return null;
+	const view = deriveToolProgress(payload);
+	const done = payload.itemsDone ?? payload.completed;
+	const total = payload.itemsTotal ?? payload.total;
+	// A non-positive total is unknown, the same rule as `deriveToolProgress`.
+	// Figures then show the completed count rather than `5/0`.
+	const figures = [typeof total === "number" && total > 0 ? `${done}/${total}` : String(done)];
+	if (payload.currentItem) figures.push(payload.currentItem);
+	return {
+		ratio: view.ratio,
+		...(view.percent !== null ? { percent: view.percent } : {}),
+		figures,
+		color: "blue",
+		active: true,
+	};
+}
+
+function classifyGeneric(
+	inputJson: unknown,
+	outputJson: unknown,
+	live?: { status: string | null | undefined; metadata: Record<string, unknown> | null },
+): ToolDetailData {
 	const input = resolveDisplayBody(inputJson);
 	const output = outputJson != null ? resolveDisplayBody(outputJson) : undefined;
+	// Only while the call runs: a finished bar would sit at 100% saying nothing the
+	// result does not already say.
+	const progress =
+		live && !isTerminalToolStatus(live.status)
+			? readGenericProgressRow(live.metadata?._structuredProgress)
+			: null;
+	const progressRows = progress ? metaRows([{ text: "", progress }]) : null;
 	const list: ToolDetailSection[] = [
+		...(progressRows ? [{ key: "meta.progress", body: progressRows }] : []),
 		{
 			key: "input.arguments",
 			label: "input",
@@ -2328,11 +2366,143 @@ function countChip(
 	return { label: `${value} ${label}`, color: "gray" };
 }
 
-function classifyWebSearch(inputJson: unknown, outputJson: unknown): ToolDetailData | null {
+/** Fields a lifecycle event carries that are not the search result itself. */
+const SEARCH_EVENT_TRANSPORT_KEYS = new Set([
+	"status",
+	"id",
+	"query",
+	"queries",
+	"type",
+	"outputIndex",
+	"output_index",
+	"item_id",
+	"itemId",
+	"index",
+	"partial",
+	"final",
+	"action",
+	"name",
+]);
+
+function normalizeSearchEventStatus(value: unknown): string {
+	return typeof value === "string"
+		? value
+				.trim()
+				.toLowerCase()
+				.replace(/[\s-]+/g, "_")
+		: "";
+}
+
+function webSearchEventHasResult(obj: Record<string, unknown>): boolean {
+	if (Array.isArray(obj.results) || (Array.isArray(obj.content) && obj.content.length > 0)) {
+		return true;
+	}
+	for (const key of ["text", "output", "snippet", "answer", "_text"]) {
+		const text = readLeafText(obj[key]);
+		if (text?.trim()) return true;
+	}
+	return !!readLeafText(obj.content)?.trim();
+}
+
+function webSearchEventFailed(obj: Record<string, unknown>): boolean {
+	const status = normalizeSearchEventStatus(obj.status);
+	if (status === "failed" || status === "fail" || status === "error") return true;
+	if (typeof obj.error_code === "string" && obj.error_code.trim()) return true;
+	if (typeof obj.error === "string" && obj.error.trim()) return true;
+	const message = readLeafText(asObject(obj.error)?.message);
+	if (message?.trim()) return true;
+	const code = readLeafText(asObject(obj.content)?.error_code);
+	return !!code?.trim();
+}
+
+function isSearchStreamEventType(type: string): boolean {
+	return (
+		type === "web_search" ||
+		type === "web_search_call" ||
+		type === "server_tool_use" ||
+		type === "web_search_tool_result" ||
+		type.startsWith("response.web_search_call") ||
+		type.startsWith("content_block_")
+	);
+}
+
+/**
+ * A lifecycle frame that arrived before the result.
+ *
+ * A known search stream event counts even after its own status says `completed`:
+ * that frame often carries only the query, and the tool result text follows it.
+ * A bare status/query object is the same kind of announcement.
+ */
+function isInFlightSearchEvent(obj: Record<string, unknown>): boolean {
+	if (webSearchEventHasResult(obj) || webSearchEventFailed(obj)) return false;
+	const type = typeof obj.type === "string" ? obj.type : "";
+	if (isSearchStreamEventType(type)) return true;
+	return Object.keys(obj).every(
+		(key) => key.startsWith("_") || SEARCH_EVENT_TRANSPORT_KEYS.has(key),
+	);
+}
+
+/**
+ * What the card should do with this payload.
+ *
+ * `pending` is not a failure. A call that is still running, a tool result that
+ * has not arrived, an empty envelope, and a stream event that landed first all
+ * look like "no output" — and an empty body used to be painted as
+ * "Web search failed" until the real result replaced it.
+ */
+function webSearchPhase(
+	status: string | null | undefined,
+	output: string,
+): "pending" | "failed" | "ready" {
+	const failed = isFailStatus(status);
+	if (!output.trim()) return failed ? "failed" : "pending";
+	const parsed = tryParseJson(output.trim());
+	if (parsed === undefined || typeof parsed !== "object") return "ready";
+	if (parsed === null) {
+		if (failed) return "failed";
+		return status === "success" ? "ready" : "pending";
+	}
+	if (Array.isArray(parsed)) {
+		if (parsed.length > 0) return "ready";
+		if (failed) return "failed";
+		return status === "success" ? "ready" : "pending";
+	}
+	const record = asObject(parsed);
+	if (!record) return "ready";
+	if (webSearchEventHasResult(record)) return "ready";
+	if (failed || webSearchEventFailed(record)) return "failed";
+	if (status === "success") return "ready";
+	if ("results" in record && record.results == null) return "pending";
+	if (Object.keys(record).every((key) => key.startsWith("_"))) return "pending";
+	if (isInFlightSearchEvent(record)) return "pending";
+	return "ready";
+}
+
+function classifyWebSearch(
+	status: string | null | undefined,
+	inputJson: unknown,
+	outputJson: unknown,
+): ToolDetailData | null {
 	const query = extractField(inputJson, "query");
 	const output = resolveDisplayText(outputJson);
-	if (!output) {
+	const phase = webSearchPhase(status, output);
+	if (phase === "failed") {
 		return single("meta.error", { kind: "error", text: "Web search failed" });
+	}
+	if (phase === "pending") {
+		const event = asObject(tryParseJson(output.trim()));
+		const eventQuery = event ? readLeafText(event.query) : undefined;
+		const eventQueries =
+			event && Array.isArray(event.queries)
+				? event.queries
+						.map((item) => readLeafText(item))
+						.filter((item): item is string => !!item?.trim())
+						.join(", ")
+				: "";
+		const text = query || eventQuery || eventQueries;
+		return sections([
+			section("meta.query", undefined, metaRows([text ? { text, mono: true } : null])),
+		]);
 	}
 	const parsed = asObject(tryParseJson(output));
 	const results = parsed && Array.isArray(parsed.results) ? parsed.results : null;
@@ -2451,6 +2621,43 @@ function classifyTaskOutput(inputJson: unknown, outputJson: unknown): ToolDetail
 		textSection("output.main", outputJson, "output", {
 			contentLines: countLines(output),
 			text: output,
+		}),
+	]);
+}
+
+function classifyWatch(
+	inputJson: unknown,
+	outputJson: unknown,
+	metadata: Record<string, unknown> | null,
+	labels?: Record<string, string>,
+): ToolDetailData | null {
+	const type = extractField(inputJson, "type") || readLeafText(metadata?.type) || "task";
+	const id = extractField(inputJson, "id") || readLeafText(metadata?.targetId) || "";
+	const state = readLeafText(metadata?.status);
+	const stateLabel =
+		state === "watching"
+			? (labels?.watchRegistered ?? "Observation registered")
+			: state
+				? (labels?.watchResult ?? "Observation result")
+				: undefined;
+	const pattern = extractField(inputJson, "pattern");
+	return sections([
+		section(
+			"meta.watch",
+			undefined,
+			metaRows([
+				{
+					text: "",
+					badges: [chip(type, "indigo"), chip(stateLabel, "gray")].filter(
+						(value) => value !== null,
+					),
+				},
+				id ? { text: id, mono: true } : null,
+				pattern ? { text: `pattern: ${pattern}`, mono: true, dimmed: true } : null,
+			]),
+		),
+		textSection("output.main", outputJson, "result", {
+			cap: type === "agent" ? "code" : "term",
 		}),
 	]);
 }

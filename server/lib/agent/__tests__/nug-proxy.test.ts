@@ -25,6 +25,7 @@ describe("NUG proxy override", () => {
 			baseUrl: "https://nug.example.test",
 			defaultModel: "responses:model",
 			proxy: { mode: "custom", url: "http://proxy.example.test:8080" },
+			toolResultImages: "separate",
 		};
 		const extraHeaders = { "x-nug-model-hash": "hash" };
 
@@ -35,6 +36,7 @@ describe("NUG proxy override", () => {
 				extraHeaders,
 			);
 			expect(delegateConfig.proxy).toEqual(config.proxy);
+			expect(delegateConfig.toolResultImages).toBe("separate");
 			expect(delegateConfig.defaultModel).toBe(`${channelType}:model`);
 			expect(delegateConfig.extraHeaders).toBe(extraHeaders);
 		}

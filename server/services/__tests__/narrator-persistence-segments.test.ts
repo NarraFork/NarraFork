@@ -1,10 +1,13 @@
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { createSqliteMaintenance } from "@server/db/backend/sqlite-maintenance";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import * as schema from "../../db/schema";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const workerFixture = getNarratorWorkerTestDb();
+const { db, sqlite } = workerFixture;
+await workerFixture.ready;
 mock.module("../../db", () => ({
 	db,
 	sqlite,
@@ -25,9 +28,9 @@ beforeEach(async () => {
 	cleanDb(sqlite);
 	await db.insert(schema.narrators).values({ id: "n", createdAt: now, updatedAt: now });
 });
-afterAll(() => {
+afterAll(async () => {
 	mock.restore();
-	sqlite.close();
+	await workerFixture.close();
 });
 async function persist(narratorId = "n", parentToolUseId?: string) {
 	return narratorPersistence.persistAssistantMessage(narratorId, {

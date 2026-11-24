@@ -12,6 +12,7 @@ import type { TreeMessage } from "../../lib/api/types";
 import type { VListDataSource } from "../narrator/vlist/vlist-data-source";
 
 let source: VListDataSource | undefined;
+let enableNarratorErrorActions: boolean | undefined;
 let listener: ((event: Record<string, unknown>) => void) | undefined;
 const download = mock(async () => true);
 mock.module("./chat-attachment-download", () => ({ downloadChatAttachment: download }));
@@ -29,8 +30,12 @@ mock.module("../../lib/narrator-ws-manager", () => ({
 	},
 }));
 mock.module("../narrator/vlist/PretextExactMessageList", () => ({
-	PretextExactMessageList: (props: { dataSource: VListDataSource }) => {
+	PretextExactMessageList: (props: {
+		dataSource: VListDataSource;
+		enableNarratorErrorActions?: boolean;
+	}) => {
 		source = props.dataSource;
+		enableNarratorErrorActions = props.enableNarratorErrorActions;
 		return <div />;
 	},
 }));
@@ -117,6 +122,10 @@ afterEach(() => {
 	}
 });
 describe("chat vlist host binding", () => {
+	test("disables narrator-only error actions for the room identity", () => {
+		expect(enableNarratorErrorActions).toBe(false);
+	});
+
 	test("replacement source shares loaded rows and deletion barriers with a pending old-source fetch", async () => {
 		const old = message("old", 1);
 		old.attachments = [

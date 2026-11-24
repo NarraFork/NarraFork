@@ -1,6 +1,13 @@
 import { generateId } from "../id";
 import { WorkerCleanupError } from "./lifecycle";
-import { TaskQueue, type TaskQueueAdmission, TaskQueueError, type TaskQueueOptions } from "./queue";
+import {
+	type TaskClass,
+	TaskQueue,
+	type TaskQueueAdmission,
+	type TaskQueueClaim,
+	TaskQueueError,
+	type TaskQueueOptions,
+} from "./queue";
 
 export interface WorkerTaskContext {
 	readonly signal: AbortSignal;
@@ -9,6 +16,7 @@ export interface WorkerTaskContext {
 }
 
 export interface WorkerTaskOptions extends TaskQueueAdmission {
+	fresh?: boolean;
 	/** Reuse an existing RPC ID, never a message/connection's business identity. */
 	requestId?: string;
 }
@@ -36,6 +44,8 @@ export interface PoolWorker<Request, Result> {
 }
 
 export interface WorkerPoolOptions<Request, Result> extends TaskQueueOptions {
+	/** Fixed short-only native capacity. Omitted preserves the existing unclassified pool. */
+	reservedCapacity?: number;
 	/** Returns a ready worker; failed/cancelled startup must clean up anything it created. */
 	create(context: WorkerTaskContext): Promise<PoolWorker<Request, Result>>;
 	/** Positive idle TTL; default 60 seconds. Idle timers never keep a process alive. */
@@ -58,6 +68,38 @@ interface Slot<Request, Result> {
 	busy: boolean;
 	idleTimer?: ReturnType<typeof setTimeout>;
 	closing?: Promise<void>;
+	quarantined?: boolean;
+	cell?: CapacityCell<Request, Result>;
+}
+
+interface CapacityCell<Request, Result> {
+	readonly reserved: boolean;
+	claim?: CapacityClaim<Request, Result>;
+	starting: boolean;
+	slot?: Slot<Request, Result>;
+}
+
+interface CapacityClaim<Request, Result> extends TaskQueueClaim {
+	readonly token: symbol;
+	readonly taskClass: TaskClass;
+	readonly cell: CapacityCell<Request, Result>;
+}
+
+function diagnosticClock(): () => number {
+	let previous = 0;
+	let failed = false;
+	return () => {
+		if (failed) return previous;
+		try {
+			const now = performance.now();
+			if (Number.isFinite(now)) previous = Math.max(previous, now);
+			else failed = true;
+		} catch {
+			failed = true;
+		}
+		// Once unavailable, freeze this observation rather than inventing elapsed time.
+		return previous;
+	};
 }
 
 /** Same-type reuse over TaskQueue; no global scheduler, task replay, or inline computation. */
@@ -67,6 +109,13 @@ export class WorkerPool<Request, Result> {
 	private readonly idleTimeoutMs: number;
 	private readonly reuse: boolean;
 	private readonly concurrency: number;
+	private readonly reservedCapacity: number | undefined;
+	private readonly cells: CapacityCell<Request, Result>[] | undefined;
+	private readonly queueLimits: {
+		maxQueued: number;
+		maxQueuedBytes: number;
+		normalQueue?: { maxQueued: number; maxQueuedBytes: number };
+	};
 	private readonly onTaskComplete: WorkerPoolOptions<Request, Result>["onTaskComplete"];
 	private readonly slots = new Set<Slot<Request, Result>>();
 	private readonly scopes = new Set<AbortController>();
@@ -81,7 +130,35 @@ export class WorkerPool<Request, Result> {
 	private warming: Promise<void> | undefined;
 
 	constructor(options: WorkerPoolOptions<Request, Result>) {
-		this.queue = new TaskQueue(options);
+		this.reservedCapacity = options.reservedCapacity;
+		if (
+			this.reservedCapacity !== undefined &&
+			(!Number.isSafeInteger(this.reservedCapacity) ||
+				this.reservedCapacity < 0 ||
+				this.reservedCapacity > options.concurrency)
+		)
+			throw new RangeError("reservedCapacity must be a safe integer between 0 and concurrency");
+		this.cells =
+			this.reservedCapacity === undefined
+				? undefined
+				: Array.from({ length: options.concurrency }, (_, index) => ({
+						reserved: index < (this.reservedCapacity ?? 0),
+						starting: false,
+					}));
+		this.queue = new TaskQueue(
+			options,
+			this.cells
+				? {
+						canGrant: (taskClass) => this.availableCell(taskClass) !== undefined,
+						claim: (taskClass) => this.claimCell(taskClass),
+					}
+				: undefined,
+		);
+		this.queueLimits = {
+			maxQueued: options.maxQueued ?? 32,
+			maxQueuedBytes: options.maxQueuedBytes ?? 64 * 1024 * 1024,
+			normalQueue: options.normalQueue ? { ...options.normalQueue } : undefined,
+		};
 		this.create = options.create;
 		this.concurrency = options.concurrency;
 		this.onTaskComplete = options.onTaskComplete;
@@ -96,16 +173,29 @@ export class WorkerPool<Request, Result> {
 	}
 
 	get stats() {
-		const { active, queued, queuedBytes } = this.queue.stats;
+		const { active, queued, queuedBytes, activeByClass, queuedByClass, queuedBytesByClass } =
+			this.queue.stats;
 		return {
 			active,
 			queued,
 			queuedBytes,
+			concurrency: this.concurrency,
+			reservedCapacity: this.reservedCapacity ?? 0,
+			normalCapacity: this.concurrency - (this.reservedCapacity ?? 0),
+			...this.queueLimits,
+			normalQueue: this.queueLimits.normalQueue ? { ...this.queueLimits.normalQueue } : undefined,
+			activeByClass: activeByClass ?? { normal: active, short: 0 },
+			queuedByClass: queuedByClass ?? { normal: queued, short: 0 },
+			queuedBytesByClass: queuedBytesByClass ?? { normal: queuedBytes, short: 0 },
+			reservation: this.cells
+				? { shared: this.cellStats(false), reserved: this.cellStats(true) }
+				: undefined,
 			closed: this.closed,
 			workers: this.slots.size,
 			starting: this.starting,
 			idle: [...this.slots].filter((s) => !s.busy && !s.closing && !s.worker.closed).length,
 			retiring: [...this.slots].filter((s) => s.closing).length,
+			quarantined: [...this.slots].filter((s) => s.quarantined).length,
 			created: this.created,
 			reused: this.reused,
 			failed: this.failed,
@@ -117,10 +207,17 @@ export class WorkerPool<Request, Result> {
 	}
 
 	/** Best effort: warm one reusable worker without joining a full/busy task queue. */
-	warmup(options: Pick<TaskQueueAdmission, "signal" | "deadlineAt"> = {}): Promise<void> {
+	warmup(
+		options: Pick<TaskQueueAdmission, "signal" | "deadlineAt" | "taskClass"> = {},
+	): Promise<void> {
 		if (this.closed) return this.withWorker(async () => {}, options, "warmup");
 		if (this.warming) return this.warming;
-		if (!this.reuse || this.queue.stats.queued > 0 || this.queue.stats.active >= this.concurrency)
+		if (
+			!this.reuse ||
+			this.queue.stats.queued > 0 ||
+			this.queue.stats.active >= this.concurrency ||
+			(this.cells && !this.availableCell(options.taskClass ?? "normal"))
+		)
 			return Promise.resolve();
 		const warming = this.withWorker(async () => {}, options, "warmup");
 		this.warming = warming;
@@ -158,7 +255,8 @@ export class WorkerPool<Request, Result> {
 		options: WorkerTaskOptions,
 		kind: WorkerTaskTiming["kind"] = "task",
 	): Promise<T> {
-		const startedAt = performance.now();
+		const now = diagnosticClock();
+		const startedAt = now();
 		const timing: WorkerTaskTiming = {
 			requestId: options.requestId ?? generateId(),
 			kind,
@@ -174,9 +272,9 @@ export class WorkerPool<Request, Result> {
 		let phase: Phase | undefined = "queueMs";
 		let phaseAt = startedAt;
 		const mark = (next?: Phase) => {
-			const now = performance.now();
-			if (phase) timing[phase] += now - phaseAt;
-			phaseAt = now;
+			const observedAt = now();
+			if (phase) timing[phase] += observedAt - phaseAt;
+			phaseAt = observedAt;
 			phase = next;
 		};
 		const { signal } = options;
@@ -195,7 +293,14 @@ export class WorkerPool<Request, Result> {
 						deadlineAt: permit.deadlineAt,
 						requestId: timing.requestId,
 					};
-					const slot = await this.borrow(context, timing);
+					const slot = permit.claim
+						? await this.borrowClaimed(
+								context,
+								timing,
+								options.fresh ?? false,
+								permit.claim as CapacityClaim<Request, Result>,
+							)
+						: await this.borrow(context, timing, options.fresh ?? false);
 					let dispatched = false;
 					try {
 						this.check(context);
@@ -210,6 +315,7 @@ export class WorkerPool<Request, Result> {
 						try {
 							if (
 								!dispatched ||
+								options.fresh ||
 								!this.reuse ||
 								context.signal.aborted ||
 								this.closed ||
@@ -283,9 +389,122 @@ export class WorkerPool<Request, Result> {
 		}
 	}
 
+	private cellStats(reserved: boolean) {
+		const cells = this.cells?.filter((cell) => cell.reserved === reserved) ?? [];
+		return {
+			capacity: cells.length,
+			claimed: cells.filter((cell) => cell.claim).length,
+			starting: cells.filter((cell) => cell.starting).length,
+			running: cells.filter(
+				(cell) => cell.slot?.busy && !cell.slot.closing && !cell.slot.quarantined,
+			).length,
+			idle: cells.filter(
+				(cell) => cell.slot && !cell.slot.busy && !cell.slot.closing && !cell.slot.worker.closed,
+			).length,
+			retiring: cells.filter((cell) => cell.slot?.closing && !cell.slot.quarantined).length,
+			quarantined: cells.filter((cell) => cell.slot?.quarantined).length,
+		};
+	}
+
+	private availableCell(taskClass: TaskClass): CapacityCell<Request, Result> | undefined {
+		const eligible = (cell: CapacityCell<Request, Result>) =>
+			!cell.claim && !cell.starting && !cell.slot?.closing && !cell.slot?.quarantined;
+		if (taskClass === "short") {
+			const reserved = this.cells?.find((cell) => cell.reserved && eligible(cell));
+			if (reserved) return reserved;
+		}
+		return this.cells?.find((cell) => !cell.reserved && eligible(cell));
+	}
+
+	private claimCell(taskClass: TaskClass): CapacityClaim<Request, Result> {
+		const cell = this.availableCell(taskClass);
+		if (!cell) throw new WorkerPoolError("WORKER_POOL_UNAVAILABLE");
+		const claim: CapacityClaim<Request, Result> = {
+			token: Symbol("worker-capacity-claim"),
+			taskClass,
+			cell,
+			release: () => {
+				// A prior request's finally must never clear a successor's claim or native owner.
+				if (cell.claim?.token !== claim.token) return;
+				cell.claim = undefined;
+				const slot = cell.slot;
+				if (slot && !slot.closing) {
+					if (slot.worker.closed) void this.retire(slot).catch(() => {});
+					else if (slot.busy) this.idle(slot);
+				}
+			},
+		};
+		cell.claim = claim;
+		if (cell.slot) {
+			cell.slot.busy = true;
+			clearTimeout(cell.slot.idleTimer);
+			cell.slot.idleTimer = undefined;
+		}
+		return claim;
+	}
+
+	private async borrowClaimed(
+		context: WorkerTaskContext,
+		timing: WorkerTaskTiming,
+		fresh: boolean,
+		claim: CapacityClaim<Request, Result>,
+	): Promise<Slot<Request, Result>> {
+		this.check(context);
+		const { cell } = claim;
+		if (cell.claim?.token !== claim.token) throw new WorkerPoolError("WORKER_POOL_UNAVAILABLE");
+		if (cell.slot) {
+			if (fresh || cell.slot.worker.closed) {
+				await this.retire(cell.slot);
+				this.check(context);
+			} else {
+				this.reused++;
+				timing.reused = true;
+				return cell.slot;
+			}
+		}
+		// This exact cell remains claimed while the factory is suspended.
+		cell.starting = true;
+		this.starting++;
+		try {
+			const worker = await this.create(context);
+			const slot: Slot<Request, Result> = { worker, busy: true, cell };
+			cell.slot = slot;
+			this.slots.add(slot);
+			this.created++;
+			return slot;
+		} catch (error) {
+			if (error instanceof WorkerCleanupError) {
+				const slot: Slot<Request, Result> = {
+					busy: true,
+					quarantined: true,
+					cell,
+					worker: {
+						closed: true,
+						run: async () => {
+							throw error;
+						},
+						// Startup already attempted stop. Observe exit without calling terminate again.
+						close: async () => {
+							await error.handle.exited;
+						},
+					},
+				};
+				cell.slot = slot;
+				this.slots.add(slot);
+				void this.retire(slot).catch(() => {});
+			}
+			// The original failed task is not held hostage by a worker that may never exit.
+			throw error;
+		} finally {
+			cell.starting = false;
+			this.starting--;
+		}
+	}
+
 	private async borrow(
 		context: WorkerTaskContext,
 		timing: WorkerTaskTiming,
+		fresh: boolean,
 	): Promise<Slot<Request, Result>> {
 		for (;;) {
 			this.check(context);
@@ -293,6 +512,18 @@ export class WorkerPool<Request, Result> {
 				if (slot.busy || slot.closing) continue;
 				if (slot.worker.closed) {
 					void this.retire(slot).catch(() => {});
+					continue;
+				}
+				if (fresh) {
+					// Fresh jobs use the SAME admission permit and native capacity as reusable jobs.
+					// At capacity, reserve one idle owner before awaiting its real exit; no caller
+					// may borrow it or count a termination request as a free native slot.
+					if (this.slots.size + this.starting >= this.concurrency) {
+						slot.busy = true;
+						await this.retire(slot);
+						this.check(context);
+						break;
+					}
 					continue;
 				}
 				// Claim before the first await so concurrent callers cannot share this worker.
@@ -356,7 +587,9 @@ export class WorkerPool<Request, Result> {
 	}
 
 	private idle(slot: Slot<Request, Result>): void {
+		if (slot.closing) return;
 		slot.busy = false;
+		clearTimeout(slot.idleTimer);
 		slot.idleTimer = setTimeout(() => void this.retire(slot).catch(() => {}), this.idleTimeoutMs);
 		slot.idleTimer.unref?.();
 	}
@@ -367,9 +600,18 @@ export class WorkerPool<Request, Result> {
 			slot.idleTimer = undefined;
 			slot.closing = Promise.resolve()
 				.then(() => slot.worker.close())
-				.then(() => {
-					this.slots.delete(slot);
-				});
+				.then(
+					() => {
+						this.slots.delete(slot);
+						if (slot.cell?.slot === slot) slot.cell.slot = undefined;
+						// A fresh request may still hold this cell's claim; wake cannot take it.
+						this.queue.wake();
+					},
+					(error: unknown) => {
+						slot.quarantined = true;
+						throw error;
+					},
+				);
 			// A rejected close leaves this resource quarantined in the set: an unsuccessful
 			// stop must not be counted as freed capacity or silently replaced by a new worker.
 			void slot.closing.catch(() => {});

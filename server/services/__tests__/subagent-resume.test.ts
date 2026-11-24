@@ -28,6 +28,7 @@ import {
 	users,
 } from "../../db/schema";
 import type { ProviderAdapter } from "../../lib/agent/provider";
+import { allowRetainedFileHistoryForTests } from "./retained-file-history";
 
 // The snapshot worker shares the preload-isolated file-backed database.
 const { db, sqlite } = await import("../../db");
@@ -78,6 +79,7 @@ const passes: string[] = [];
 let script: Array<() => Promise<{ finalText: string; hasError?: boolean }>> = [];
 
 beforeEach(async () => {
+	allowRetainedFileHistoryForTests();
 	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 	seq = 0;

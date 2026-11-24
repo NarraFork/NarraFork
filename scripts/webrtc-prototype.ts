@@ -7,8 +7,31 @@ import { startFixture } from "../remote-prototype/fixture";
 
 const ROOT = resolve(import.meta.dir, "..");
 const MAX_OUTPUT = 1024 * 1024;
+const PEER_BUILD_ATTEMPTS = 3;
+
+/** Module-proxy drops are transient. A compile error is not. */
+export function isTransientPeerBuildFailure(error: unknown): boolean {
+	const message = error instanceof Error ? error.message : String(error);
+	return (
+		message.startsWith("PEER_BUILD_FAILED:") &&
+		/proxy\.golang\.org|stream error: stream ID|INTERNAL_ERROR; received from peer|connection reset by peer|i\/o timeout|TLS handshake timeout/i.test(
+			message,
+		)
+	);
+}
 
 export async function buildPeer(output: string, signal?: AbortSignal): Promise<void> {
+	for (let attempt = 1; ; attempt++) {
+		try {
+			await buildPeerOnce(output, signal);
+			return;
+		} catch (error) {
+			if (attempt >= PEER_BUILD_ATTEMPTS || !isTransientPeerBuildFailure(error)) throw error;
+		}
+	}
+}
+
+async function buildPeerOnce(output: string, signal?: AbortSignal): Promise<void> {
 	const child = Bun.spawn(["go", "build", "-o", output, "./cmd/remote-peer"], {
 		cwd: join(ROOT, "remote-peer"),
 		stdout: "pipe",

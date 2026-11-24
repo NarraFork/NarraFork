@@ -1,9 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { lstat, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { WorktreeDependent } from "@shared/narrator-worktrees";
+import { sqlite } from "../../db";
 import { LocalBackend } from "../../lib/agent/execution/local-backend";
+import { getNarraforkPath } from "../../lib/narrafork-home";
 import { safeSpawn } from "../../lib/spawn";
 import {
 	NarratorWorktreeService,
@@ -13,6 +16,7 @@ import {
 	type WorktreeServicePorts,
 	type WorktreeTarget,
 } from "../narrator-worktree-service";
+import { maintainProtectionIndex } from "../resource-protection-index";
 import { type LifecycleGuardPorts, withLifecycleGuardPorts } from "../worktree-lifecycle-guard";
 
 let temporary: string;
@@ -373,6 +377,7 @@ describe("worktree removal", () => {
 				),
 			),
 		).rejects.toMatchObject({ code: "WORKTREE_REMOVAL_FORCE_REQUIRED" });
+		const head = await git(["rev-parse", "HEAD"], worktreePath);
 		const result = await run(() =>
 			service.remove(
 				"actor",
@@ -382,6 +387,7 @@ describe("worktree removal", () => {
 					workspaceKey: "workspace",
 					path: worktreePath,
 					force: true,
+					confirmedLoss: { head, dirtyFileCount: 1, unreachableCommits: 0 },
 				},
 				signal(),
 			),
@@ -418,7 +424,7 @@ describe("worktree removal", () => {
 		expect(result.outcome).toBe("removed");
 	});
 
-	test("a deleted checkout is pruned rather than removed", async () => {
+	test("a deleted checkout only loses its Git entry, removed by path", async () => {
 		await rm(worktreePath, { recursive: true, force: true });
 		const result = await run(() =>
 			service.remove(
@@ -430,7 +436,7 @@ describe("worktree removal", () => {
 		);
 		expect(result.outcome).toBe("removed");
 		expect(result.effects.prunedRegistrations).toBe(1);
-		expect(calls).toContain("git:worktree prune");
+		expect(calls).toContain(`git:worktree remove -- ${worktreePath}`);
 		expect(await git(["worktree", "list", "--porcelain"])).not.toContain(worktreePath);
 	});
 
@@ -537,8 +543,8 @@ describe("worktree removal", () => {
 		expect(await lstat(plain).then((node) => node.isDirectory())).toBe(true);
 	});
 
-	test("a prune reports every stale registration it clears", async () => {
-		// `git worktree prune` has no path argument: the plan must say what else goes.
+	test("an unregistered deleted checkout is cleared by path; sibling stale entries stay", async () => {
+		// `git worktree prune` has no path argument, so it is never used.
 		registration = null;
 		const other = join(source, ".worktrees", "other");
 		await git(["worktree", "add", "-b", "other", other]);
@@ -551,7 +557,7 @@ describe("worktree removal", () => {
 			signal(),
 		);
 		expect(plan.worktree.mode).toBe("prune");
-		expect(plan.worktree.pruneSiblings).toBe(1);
+		expect(plan.worktree.pruneSiblings).toBe(0);
 		const result = await service.remove(
 			"actor",
 			"narrator",
@@ -564,7 +570,8 @@ describe("worktree removal", () => {
 			signal(),
 		);
 		expect(result.outcome).toBe("removed");
-		expect(result.effects.prunedRegistrations).toBe(2);
+		expect(result.effects.prunedRegistrations).toBe(1);
+		expect(await git(["worktree", "list", "--porcelain"])).toContain(other);
 	});
 
 	test("a session that had already left is not reported as relocated", async () => {
@@ -586,6 +593,358 @@ describe("worktree removal", () => {
 			expect(result.effects.relocated).toBe(0);
 		} finally {
 			retirement.relocate = original;
+		}
+	});
+});
+
+/**
+ * Holes the Teams G1 reviews found in a parallel removal design, checked against this
+ * channel. Each test fails on the channel as first merged (#493).
+ */
+describe("worktree removal hardening", () => {
+	const removeRequest = (extra: Record<string, unknown> = {}) => ({
+		expectedRevision: 4,
+		workspaceKey: "workspace",
+		path: worktreePath,
+		...extra,
+	});
+
+	test("a request cancelled after Git was dispatched still finishes; the row is not restored", async () => {
+		const controller = new AbortController();
+		const runGit = ports.runGit;
+		if (!runGit) throw new Error("fixture must wire runGit");
+		ports.runGit = async (workspace, args, abort, writing, scope) => {
+			const result = await runGit(workspace, args, abort, writing, scope);
+			// The client disconnects while Git deletes the checkout.
+			if (writing && args[0] === "worktree") controller.abort();
+			return result;
+		};
+		const result = await run(() =>
+			service.remove("actor", "narrator", removeRequest(), controller.signal),
+		);
+		expect(result.outcome).toBe("removed");
+		expect(calls).not.toContain("restoreRegistration");
+		expect(calls).toContain("releasePathRows");
+		expect(await lstat(worktreePath).catch(() => null)).toBeNull();
+	});
+
+	test("force removes exactly the loss the person confirmed; anything that grew is refused", async () => {
+		await writeFile(join(worktreePath, "dirty.txt"), "uncommitted\n");
+		const plan = await run(() =>
+			service.planRemoval(
+				"actor",
+				"narrator",
+				{ workspaceKey: "workspace", path: worktreePath },
+				signal(),
+			),
+		);
+		expect(plan.worktree).toMatchObject({ dirtyFileCount: 1, dirtyExact: true });
+		const confirmedLoss = {
+			head: plan.worktree.head,
+			dirtyFileCount: 1,
+			unreachableCommits: 0,
+		};
+		// A bare force is not a confirmation of anything in particular.
+		await expect(
+			run(() => service.remove("actor", "narrator", removeRequest({ force: true }), signal())),
+		).rejects.toThrow();
+		await writeFile(join(worktreePath, "late.txt"), "written after the confirmation\n");
+		await expect(
+			run(() =>
+				service.remove(
+					"actor",
+					"narrator",
+					removeRequest({ force: true, confirmedLoss }),
+					signal(),
+				),
+			),
+		).rejects.toMatchObject({ code: "WORKTREE_REMOVAL_CHANGED" });
+		// An inflated confirmation is not the report either.
+		await expect(
+			run(() =>
+				service.remove(
+					"actor",
+					"narrator",
+					removeRequest({ force: true, confirmedLoss: { ...confirmedLoss, dirtyFileCount: 99 } }),
+					signal(),
+				),
+			),
+		).rejects.toMatchObject({ code: "WORKTREE_REMOVAL_CHANGED" });
+		expect(calls).not.toContain("releaseRegistration");
+		expect(await lstat(join(worktreePath, "late.txt")).then(() => true)).toBe(true);
+		const result = await run(() =>
+			service.remove(
+				"actor",
+				"narrator",
+				removeRequest({ force: true, confirmedLoss: { ...confirmedLoss, dirtyFileCount: 2 } }),
+				signal(),
+			),
+		);
+		expect(result.outcome).toBe("removed");
+	});
+
+	test("a status probe that fails or is killed blocks removal instead of reading as clean", async () => {
+		await writeFile(join(worktreePath, "unsaved.txt"), "x\n");
+		const runGit = ports.runGit;
+		if (!runGit) throw new Error("fixture must wire runGit");
+		ports.runGit = async (workspace, args, abort, writing, scope) =>
+			args[0] === "status"
+				? { stdout: "", stderr: "", exitCode: 143 }
+				: runGit(workspace, args, abort, writing, scope);
+		const plan = await run(() =>
+			service.planRemoval(
+				"actor",
+				"narrator",
+				{ workspaceKey: "workspace", path: worktreePath },
+				signal(),
+			),
+		);
+		expect(plan.status).toBe("blocked");
+		expect(plan.blockers.map((item) => item.code)).toContain("WORKTREE_REMOVAL_STATUS_UNAVAILABLE");
+		await expect(
+			run(() => service.remove("actor", "narrator", removeRequest(), signal())),
+		).rejects.toMatchObject({ code: "WORKTREE_REMOVAL_STATUS_UNAVAILABLE" });
+		expect(calls).not.toContain("releaseRegistration");
+		expect(await lstat(join(worktreePath, "unsaved.txt")).then(() => true)).toBe(true);
+	});
+
+	test("commits only a detached HEAD reaches are a loss that must be confirmed", async () => {
+		await git(["checkout", "-q", "--detach"], worktreePath);
+		await writeFile(join(worktreePath, "only-here.txt"), "x\n");
+		await git(["add", "only-here.txt"], worktreePath);
+		await git(
+			["-c", "user.name=F", "-c", "user.email=f@e.test", "commit", "-qm", "detached"],
+			worktreePath,
+		);
+		const head = await git(["rev-parse", "HEAD"], worktreePath);
+		const plan = await run(() =>
+			service.planRemoval(
+				"actor",
+				"narrator",
+				{ workspaceKey: "workspace", path: worktreePath },
+				signal(),
+			),
+		);
+		expect(plan.worktree).toMatchObject({
+			detached: true,
+			dirtyFileCount: 0,
+			unreachableCommits: 1,
+		});
+		expect(plan.confirmations).toContain("force");
+		await expect(
+			run(() => service.remove("actor", "narrator", removeRequest(), signal())),
+		).rejects.toMatchObject({ code: "WORKTREE_REMOVAL_FORCE_REQUIRED" });
+		expect(await lstat(worktreePath).then(() => true)).toBe(true);
+		const result = await run(() =>
+			service.remove(
+				"actor",
+				"narrator",
+				removeRequest({
+					force: true,
+					confirmedLoss: { head, dirtyFileCount: 0, unreachableCommits: 1 },
+				}),
+				signal(),
+			),
+		);
+		expect(result.outcome).toBe("removed");
+	});
+
+	test("commits a branch still holds are not a loss", async () => {
+		await writeFile(join(worktreePath, "kept.txt"), "x\n");
+		await git(["add", "kept.txt"], worktreePath);
+		await git(
+			["-c", "user.name=F", "-c", "user.email=f@e.test", "commit", "-qm", "on branch"],
+			worktreePath,
+		);
+		const plan = await run(() =>
+			service.planRemoval(
+				"actor",
+				"narrator",
+				{ workspaceKey: "workspace", path: worktreePath },
+				signal(),
+			),
+		);
+		expect(plan.worktree.unreachableCommits).toBe(0);
+		expect(plan.confirmations).toEqual([]);
+	});
+
+	test("a deleted checkout removes only its own Git entry; other stale entries stay", async () => {
+		const other = join(source, ".worktrees", "other");
+		await git(["worktree", "add", "-b", "other", other]);
+		await rm(worktreePath, { recursive: true, force: true });
+		await rm(other, { recursive: true, force: true });
+		const plan = await run(() =>
+			service.planRemoval(
+				"actor",
+				"narrator",
+				{ workspaceKey: "workspace", path: worktreePath },
+				signal(),
+			),
+		);
+		expect(plan.worktree).toMatchObject({ mode: "prune", pruneSiblings: 0 });
+		const result = await run(() => service.remove("actor", "narrator", removeRequest(), signal()));
+		expect(result.effects.prunedRegistrations).toBe(1);
+		expect(calls).not.toContain("git:worktree prune");
+		const listing = await git(["worktree", "list", "--porcelain"]);
+		expect(listing).not.toContain(worktreePath);
+		expect(listing).toContain(other);
+	});
+
+	test("rows mode never asks Git about a directory it does not list", async () => {
+		// R1: a registered directory outside any repository. `git status` there fails, but
+		// rows mode deletes nothing on disk, so there is nothing to measure.
+		const sibling = join(temporary, "sibling");
+		await mkdir(sibling);
+		await writeFile(join(sibling, "data.txt"), "x");
+		const runGit = ports.runGit;
+		if (!runGit) throw new Error("fixture must wire runGit");
+		const probes: string[][] = [];
+		ports.runGit = async (workspace, args, abort, writing, scope) => {
+			if (scope?.kind === "directory") probes.push(args);
+			return runGit(workspace, args, abort, writing, scope);
+		};
+		const outside = await run(() =>
+			service.planRemoval(
+				"actor",
+				"narrator",
+				{ workspaceKey: "workspace", path: sibling },
+				signal(),
+			),
+		);
+		expect(outside.worktree.mode).toBe("rows");
+		expect(outside.status).toBe("ready");
+		expect(outside.blockers).toEqual([]);
+		expect(outside.confirmations).toEqual([]);
+		expect(outside.worktree).toMatchObject({ dirtyFileCount: 0, unreachableCommits: 0 });
+		// R2: a plain directory under `.worktrees/` that Git does not list. `git status`
+		// would walk up to the main checkout and report ITS changes as this path's loss.
+		registration = null;
+		const old = join(source, ".worktrees", "chapter-old");
+		await mkdir(old);
+		await writeFile(join(old, "notes.md"), "x");
+		await writeFile(join(source, "tracked.txt"), "main edit\n");
+		const legacy = await run(() =>
+			service.planRemoval("actor", "narrator", { workspaceKey: "workspace", path: old }, signal()),
+		);
+		expect(legacy.worktree.mode).toBe("rows");
+		expect(legacy.worktree).toMatchObject({ dirty: false, dirtyFileCount: 0 });
+		expect(legacy.confirmations).toEqual([]);
+		expect(probes).toEqual([]);
+	});
+
+	test("a session at the main checkout of the same repository does not block the removal", async () => {
+		// Every session in this repository carries its repository key; only a claim inside
+		// the checkout (or one that cannot be told apart from it) may protect it.
+		const sameRepository: LifecycleGuardPorts = {
+			...guardPorts,
+			readClaims: async () => ({
+				complete: true,
+				claims: [
+					{
+						kind: "narrator",
+						id: "root",
+						deviceId: "local",
+						path: source,
+						repositoryKey: "repository",
+					},
+				],
+			}),
+			probeGitRoot: async (path) => ({ root: path, common: join(source, ".git") }),
+		};
+		const result = await withLifecycleGuardPorts(sameRepository, () =>
+			service.remove("actor", "narrator", removeRequest(), signal()),
+		);
+		expect(result.outcome).toBe("removed");
+	});
+
+	test("only the worktree's own creation receipt is waived, matched by its recorded request", async () => {
+		const receipt = (requestId: string): LifecycleGuardPorts => ({
+			...guardPorts,
+			readClaims: async () => ({
+				complete: true,
+				claims: [
+					{
+						kind: "receipt",
+						id: "/journal/creation.json",
+						deviceId: "local",
+						path: worktreePath,
+						repositoryKey: "repository",
+					},
+				],
+			}),
+			receiptRequest: async () => ({ requestId, destination: worktreePath }),
+		});
+		// The fixture snapshot's createRequestId is "request".
+		await expect(
+			withLifecycleGuardPorts(receipt("someone-else"), () =>
+				service.remove("actor", "narrator", removeRequest(), signal()),
+			),
+		).rejects.toMatchObject({ code: "RESOURCE_PROTECTED" });
+		expect(calls).toContain("restoreRegistration");
+		// An unreadable receipt proves nothing and keeps protecting.
+		await expect(
+			withLifecycleGuardPorts({ ...receipt("request"), receiptRequest: async () => null }, () =>
+				service.remove("actor", "narrator", removeRequest(), signal()),
+			),
+		).rejects.toMatchObject({ code: "RESOURCE_PROTECTED" });
+		const result = await withLifecycleGuardPorts(receipt("request"), () =>
+			service.remove("actor", "narrator", removeRequest(), signal()),
+		);
+		expect(result.outcome).toBe("removed");
+	});
+
+	test("through the real protection index: its own legacy receipt is waived without an owner", async () => {
+		// The receipt is matched by the request it records, so a deleted owner session
+		// (owner_narrator_id set to null) cannot make the worktree unremovable.
+		const directory = getNarraforkPath("worktree-requests");
+		await mkdir(directory, { recursive: true });
+		const file = join(directory, `${createHash("sha256").update(worktreePath).digest("hex")}.json`);
+		const importReceipts = async () => {
+			sqlite.exec(`UPDATE resource_protection_sources SET complete = 0, cursor = NULL
+				WHERE source = 'receipt' AND source_id = ''`);
+			for (let batch = 0; batch < 8; batch++) {
+				await maintainProtectionIndex(performance.now() + 5000);
+				const state = sqlite
+					.query<{ complete: number }, []>(
+						"SELECT complete FROM resource_protection_sources WHERE source = 'receipt' AND source_id = ''",
+					)
+					.get();
+				if (state?.complete) return;
+			}
+			throw new Error("Receipt import did not complete");
+		};
+		const receipt = (requestId: string) =>
+			JSON.stringify({
+				proposalHash: "fixture",
+				request: { requestId, destinationPath: worktreePath },
+				repositoryKey: "repository",
+				deviceId: "local",
+				destination: worktreePath,
+				expectedHead: "",
+				dispatchState: "started",
+			});
+		try {
+			await writeFile(file, receipt("someone-else"));
+			await importReceipts();
+			const failure = await service.remove("actor", "narrator", removeRequest(), signal()).then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			expect(failure).toMatchObject({ code: "RESOURCE_PROTECTED" });
+			await writeFile(file, receipt("request"));
+			sqlite.exec("DELETE FROM resource_protection_paths WHERE source = 'receipt'");
+			sqlite.exec(
+				"DELETE FROM resource_protection_sources WHERE source = 'receipt' AND source_id != ''",
+			);
+			await importReceipts();
+			const result = await service.remove("actor", "narrator", removeRequest(), signal());
+			expect(result.outcome).toBe("removed");
+		} finally {
+			await rm(file, { force: true });
+			sqlite.exec("DELETE FROM resource_protection_paths WHERE source = 'receipt'");
+			sqlite.exec(
+				"DELETE FROM resource_protection_sources WHERE source = 'receipt' AND source_id != ''",
+			);
 		}
 	});
 });

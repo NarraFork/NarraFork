@@ -1,6 +1,12 @@
 import type { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import {
+	type ReadQueryOptions,
+	readDomainTask,
+	readQuery,
+	readQueryFirst,
+} from "@server/db/worker-read";
+import {
 	FILE_CHANGE_EVIDENCE_VERSION,
 	FILE_CHANGE_LIMITS,
 	type FileChangeActor,
@@ -378,131 +384,195 @@ export class FileChangeEvidenceService {
 		});
 	}
 
-	getScope(scopeId: string): FileChangeScopeRecord | null {
+	async getScope(
+		scopeId: string,
+		options: Pick<ReadQueryOptions, "signal" | "timeoutMs" | "deadlineAt"> = {},
+	): Promise<FileChangeScopeRecord | null> {
 		assertString(scopeId, "scopeId");
 		return (
-			this.database.select().from(fileChangeScopes).where(eq(fileChangeScopes.id, scopeId)).get() ??
-			null
+			(await readQueryFirst(
+				this.database
+					.select()
+					.from(fileChangeScopes)
+					.where(eq(fileChangeScopes.id, scopeId))
+					.limit(1),
+				{ ...options, executionPolicy: "worker-required", maxRows: 1 },
+			)) ?? null
 		);
 	}
-	getOperation(operationId: string): FileChangeOperationRecord | null {
+	async getOperation(
+		operationId: string,
+		options: Pick<ReadQueryOptions, "signal" | "timeoutMs" | "deadlineAt"> = {},
+	): Promise<FileChangeOperationRecord | null> {
 		assertString(operationId, "operationId");
 		return (
-			this.database
-				.select()
-				.from(fileChangeOperations)
-				.where(eq(fileChangeOperations.id, operationId))
-				.get() ?? null
+			(await readQueryFirst(
+				this.database
+					.select()
+					.from(fileChangeOperations)
+					.where(eq(fileChangeOperations.id, operationId))
+					.limit(1),
+				{ ...options, executionPolicy: "worker-required", maxRows: 1 },
+			)) ?? null
 		);
 	}
 
 	/** Unique installation/editor/request/attempt lookup; never a journal scan. */
-	getEditorOperation(sourceInstanceId: string, sourceId: string): FileChangeOperationRecord | null {
+	async getEditorOperation(
+		sourceInstanceId: string,
+		sourceId: string,
+		options: Pick<ReadQueryOptions, "signal" | "timeoutMs" | "deadlineAt"> = {},
+	): Promise<FileChangeOperationRecord | null> {
 		assertString(sourceInstanceId, "sourceInstanceId");
 		assertString(sourceId, "sourceId");
 		return (
-			this.database
-				.select()
-				.from(fileChangeOperations)
-				.where(
-					and(
-						eq(fileChangeOperations.sourceInstanceId, sourceInstanceId),
-						eq(fileChangeOperations.sourceKind, "editor"),
-						eq(fileChangeOperations.sourceId, sourceId),
-						eq(fileChangeOperations.attempt, 1),
-					),
-				)
-				.get() ?? null
+			(await readQueryFirst(
+				this.database
+					.select()
+					.from(fileChangeOperations)
+					.where(
+						and(
+							eq(fileChangeOperations.sourceInstanceId, sourceInstanceId),
+							eq(fileChangeOperations.sourceKind, "editor"),
+							eq(fileChangeOperations.sourceId, sourceId),
+							eq(fileChangeOperations.attempt, 1),
+						),
+					)
+					.limit(1),
+				{ ...options, executionPolicy: "worker-required", maxRows: 1 },
+			)) ?? null
 		);
 	}
 
-	getEffect(operationId: string, mutationId: string): FileChangeEffectRecord | null {
+	async getEffect(
+		operationId: string,
+		mutationId: string,
+		options: Pick<ReadQueryOptions, "signal" | "timeoutMs" | "deadlineAt"> = {},
+	): Promise<FileChangeEffectRecord | null> {
 		assertString(operationId, "operationId");
 		assertString(mutationId, "mutationId");
 		return (
+			(await readQueryFirst(
+				this.database
+					.select()
+					.from(fileChangeEffects)
+					.where(
+						and(
+							eq(fileChangeEffects.operationId, operationId),
+							eq(fileChangeEffects.mutationId, mutationId),
+						),
+					)
+					.limit(1),
+				{ ...options, executionPolicy: "worker-required", maxRows: 1 },
+			)) ?? null
+		);
+	}
+	async listEffects(
+		operationId: string,
+		options: { cursor?: FileChangeEffectCursor; limit?: number } & Pick<
+			ReadQueryOptions,
+			"signal" | "timeoutMs" | "deadlineAt"
+		> = {},
+	): Promise<FileChangeEvidencePage<FileChangeEffectRecord, FileChangeEffectCursor>> {
+		assertString(operationId, "operationId");
+		const limit = pageLimit(options.limit);
+		validateEffectCursor(options.cursor);
+		const cursor = options.cursor;
+		const rows = await readQuery(
 			this.database
 				.select()
 				.from(fileChangeEffects)
 				.where(
 					and(
 						eq(fileChangeEffects.operationId, operationId),
-						eq(fileChangeEffects.mutationId, mutationId),
+						cursor
+							? sql`(${fileChangeEffects.fileKey}, ${fileChangeEffects.phase}) > (${cursor.fileKey}, ${cursor.phase})`
+							: undefined,
 					),
 				)
-				.get() ?? null
+				.orderBy(asc(fileChangeEffects.fileKey), asc(fileChangeEffects.phase))
+				.limit(limit + 1),
+			{
+				signal: options.signal,
+				timeoutMs: options.timeoutMs,
+				deadlineAt: options.deadlineAt,
+				executionPolicy: "worker-required",
+				maxRows: limit + 1,
+			},
 		);
-	}
-	listEffects(
-		operationId: string,
-		options: { cursor?: FileChangeEffectCursor; limit?: number } = {},
-	): FileChangeEvidencePage<FileChangeEffectRecord, FileChangeEffectCursor> {
-		assertString(operationId, "operationId");
-		const limit = pageLimit(options.limit);
-		validateEffectCursor(options.cursor);
-		const cursor = options.cursor;
-		const rows = this.database
-			.select()
-			.from(fileChangeEffects)
-			.where(
-				and(
-					eq(fileChangeEffects.operationId, operationId),
-					cursor
-						? sql`(${fileChangeEffects.fileKey}, ${fileChangeEffects.phase}) > (${cursor.fileKey}, ${cursor.phase})`
-						: undefined,
-				),
-			)
-			.orderBy(asc(fileChangeEffects.fileKey), asc(fileChangeEffects.phase))
-			.limit(limit + 1)
-			.all();
 		return boundedPage(rows, limit, effectCursor);
 	}
 
 	/** Read-only inventory, including legacy pending rows. Never resumes an old write. */
-	listPendingOperations(options: {
-		settlement: PendingSettlement;
-		cursor?: FileChangeOperationCursor;
-		limit?: number;
-	}) {
+	async listPendingOperations(
+		options: {
+			settlement: PendingSettlement;
+			cursor?: FileChangeOperationCursor;
+			limit?: number;
+		} & Pick<ReadQueryOptions, "signal" | "timeoutMs" | "deadlineAt">,
+	) {
 		validatePendingPage(options);
 		const limit = pageLimit(options.limit);
 		const c = options.cursor;
-		const rows = this.database
-			.select({
-				id: fileChangeOperations.id,
-				sourceInstanceId: fileChangeOperations.sourceInstanceId,
-				sourceKind: fileChangeOperations.sourceKind,
-				sourceId: fileChangeOperations.sourceId,
-				attempt: fileChangeOperations.attempt,
-				requestDigest: fileChangeOperations.requestDigest,
-				projectId: fileChangeOperations.projectId,
-				narratorId: fileChangeOperations.narratorId,
-				ownerUserId: fileChangeOperations.ownerUserId,
-				expectedEffectCount: fileChangeOperations.expectedEffectCount,
-				preparedEffectCount: fileChangeOperations.preparedEffectCount,
-				settledEffectCount: fileChangeOperations.settledEffectCount,
-				unresolvedEffectCount: fileChangeOperations.unresolvedEffectCount,
-				evidenceBytes: fileChangeOperations.evidenceBytes,
-				settlement: fileChangeOperations.settlement,
-				executionOutcome: fileChangeOperations.executionOutcome,
-				effectOutcome: fileChangeOperations.effectOutcome,
-				coverage: fileChangeOperations.coverage,
-				attributionGrade: fileChangeOperations.attributionGrade,
-				reason: fileChangeOperations.reason,
-				updatedAt: fileChangeOperations.updatedAt,
-			})
-			.from(fileChangeOperations)
-			.where(
-				and(
-					eq(fileChangeOperations.settlement, options.settlement),
-					c
-						? sql`(${fileChangeOperations.updatedAt}, ${fileChangeOperations.id}) > (${c.updatedAt}, ${c.id})`
-						: undefined,
-				),
-			)
-			.orderBy(asc(fileChangeOperations.updatedAt), asc(fileChangeOperations.id))
-			.limit(limit + 1)
-			.all();
+		const rows = await readQuery(
+			this.database
+				.select({
+					id: fileChangeOperations.id,
+					sourceInstanceId: fileChangeOperations.sourceInstanceId,
+					sourceKind: fileChangeOperations.sourceKind,
+					sourceId: fileChangeOperations.sourceId,
+					attempt: fileChangeOperations.attempt,
+					requestDigest: fileChangeOperations.requestDigest,
+					projectId: fileChangeOperations.projectId,
+					narratorId: fileChangeOperations.narratorId,
+					ownerUserId: fileChangeOperations.ownerUserId,
+					expectedEffectCount: fileChangeOperations.expectedEffectCount,
+					preparedEffectCount: fileChangeOperations.preparedEffectCount,
+					settledEffectCount: fileChangeOperations.settledEffectCount,
+					unresolvedEffectCount: fileChangeOperations.unresolvedEffectCount,
+					evidenceBytes: fileChangeOperations.evidenceBytes,
+					settlement: fileChangeOperations.settlement,
+					executionOutcome: fileChangeOperations.executionOutcome,
+					effectOutcome: fileChangeOperations.effectOutcome,
+					coverage: fileChangeOperations.coverage,
+					attributionGrade: fileChangeOperations.attributionGrade,
+					reason: fileChangeOperations.reason,
+					updatedAt: fileChangeOperations.updatedAt,
+				})
+				.from(fileChangeOperations)
+				.where(
+					and(
+						eq(fileChangeOperations.settlement, options.settlement),
+						c
+							? sql`(${fileChangeOperations.updatedAt}, ${fileChangeOperations.id}) > (${c.updatedAt}, ${c.id})`
+							: undefined,
+					),
+				)
+				.orderBy(asc(fileChangeOperations.updatedAt), asc(fileChangeOperations.id))
+				.limit(limit + 1),
+			{
+				signal: options.signal,
+				timeoutMs: options.timeoutMs,
+				deadlineAt: options.deadlineAt,
+				executionPolicy: "worker-required",
+				maxRows: limit + 1,
+			},
+		);
 		return boundedPage(rows, limit, (row) => ({ updatedAt: row.updatedAt, id: row.id }));
+	}
+	async getEditorSnapshot(
+		sourceInstanceId: string,
+		sourceId: string,
+		options: Pick<ReadQueryOptions, "signal" | "timeoutMs" | "deadlineAt"> = {},
+	) {
+		assertString(sourceInstanceId, "sourceInstanceId");
+		assertString(sourceId, "sourceId");
+		return readDomainTask(
+			this.database.$client,
+			"editorOperationEvidence",
+			{ sourceInstanceId, sourceId },
+			{ ...options, executionPolicy: "worker-required" },
+		);
 	}
 }
 

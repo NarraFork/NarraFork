@@ -1,3 +1,4 @@
+import { readQuery, readQueryFirst } from "@server/db/worker-read";
 import { mailboxReplyContext } from "@shared/reply-context";
 import { and, asc, desc, eq, gt, inArray, isNull, lt, sql } from "drizzle-orm";
 import {
@@ -18,6 +19,8 @@ import {
 	recipientDeletedReceiptPatch,
 	semanticEditReceiptPatch,
 } from "./mailbox-shared";
+import { RuntimeReadConflictError } from "./read-conflict";
+import type { RuntimeReadOptions } from "./read-options";
 
 export { boundedError, boundedJson, mailboxDedupeKey };
 
@@ -183,8 +186,25 @@ function validate(input: MailboxInput) {
 	return { byteSize, metadataJson, payloadRefJson };
 }
 export function createMailboxStore(db: RuntimeDb) {
-	function getByDelivery(deliveryId: string, tx: RuntimeStoreDb = db) {
-		return tx.select().from(mailbox).where(eq(mailbox.deliveryId, deliveryId)).get();
+	function getByDelivery(deliveryId: string, tx: RuntimeTx): MailboxRow | undefined;
+	function getByDelivery(
+		deliveryId: string,
+		options?: RuntimeReadOptions,
+	): Promise<MailboxRow | undefined>;
+	function getByDelivery(
+		deliveryId: string,
+		context?: RuntimeTx | RuntimeReadOptions,
+	): MailboxRow | undefined | Promise<MailboxRow | undefined> {
+		const tx = context && "select" in context ? context : undefined;
+		const options = tx ? {} : (context as RuntimeReadOptions | undefined);
+		const query = (tx ?? db)
+			.select()
+			.from(mailbox)
+			.where(eq(mailbox.deliveryId, deliveryId))
+			.limit(1);
+		return tx
+			? query.get()
+			: readQueryFirst(query, { ...options, executionPolicy: "worker-required", maxRows: 1 });
 	}
 	function enqueue(input: MailboxInput, tx?: RuntimeTx): EnqueueResult {
 		if (!tx) return runAtomicWrite(db, "mailbox.enqueue", (inner) => enqueue(input, inner));
@@ -545,33 +565,35 @@ export function createMailboxStore(db: RuntimeDb) {
 		ackCurrentRevision,
 		ackCurrentAdopted: ackCurrentRevision,
 		/** Old Send metadata retains its reserved address even after structural COW. */
-		resolveReservedMessage(
+		async resolveReservedMessage(
 			narratorId: string,
 			recipientMessageId: string,
-			tx: RuntimeStoreDb = db,
+			options: RuntimeReadOptions = {},
 		) {
-			return tx
-				.select({
-					deliveryId: mailbox.deliveryId,
-					recipientRefId: mailbox.recipientRefId,
-					currentMessageId: mailbox.currentMessageId,
-					receiptDisposition: mailbox.receiptDisposition,
-					contentRevision: mailbox.contentRevision,
-					adoptedRevision: mailbox.adoptedRevision,
-					adoptedAt: mailbox.adoptedAt,
-					currentRevision: mailbox.currentRevision,
-					currentAdoptedRevision: mailbox.currentAdoptedRevision,
-					currentAdoptedAt: mailbox.currentAdoptedAt,
-				})
-				.from(mailbox)
-				.where(
-					and(
-						eq(mailbox.narratorId, narratorId),
-						eq(mailbox.recipientMessageId, recipientMessageId),
-					),
-				)
-				.limit(1)
-				.get();
+			return readQueryFirst(
+				db
+					.select({
+						deliveryId: mailbox.deliveryId,
+						recipientRefId: mailbox.recipientRefId,
+						currentMessageId: mailbox.currentMessageId,
+						receiptDisposition: mailbox.receiptDisposition,
+						contentRevision: mailbox.contentRevision,
+						adoptedRevision: mailbox.adoptedRevision,
+						adoptedAt: mailbox.adoptedAt,
+						currentRevision: mailbox.currentRevision,
+						currentAdoptedRevision: mailbox.currentAdoptedRevision,
+						currentAdoptedAt: mailbox.currentAdoptedAt,
+					})
+					.from(mailbox)
+					.where(
+						and(
+							eq(mailbox.narratorId, narratorId),
+							eq(mailbox.recipientMessageId, recipientMessageId),
+						),
+					)
+					.limit(1),
+				{ ...options, executionPolicy: "worker-required", maxRows: 1 },
+			);
 		},
 		initializeLegacy(narratorId: string) {
 			return runAtomicWrite(db, "mailbox.initializeLegacy", (tx) =>
@@ -579,40 +601,42 @@ export function createMailboxStore(db: RuntimeDb) {
 			);
 		},
 		/** Body/attachment columns are deliberately absent. */
-		list(
+		async list(
 			narratorId: string,
 			options: {
 				after?: number;
 				limit?: number;
 				state?: MailboxRow["state"];
 				kind?: MailboxRow["kind"];
-			} = {},
+			} & RuntimeReadOptions = {},
 		) {
-			return db
-				.select({
-					id: mailbox.id,
-					kind: mailbox.kind,
-					state: mailbox.state,
-					arrivalSeq: mailbox.arrivalSeq,
-					seq: mailbox.seq,
-					priority: mailbox.priority,
-					byteSize: mailbox.byteSize,
-					deliveryId: mailbox.deliveryId,
-					receiptDisposition: mailbox.receiptDisposition,
-					lastError: mailbox.lastError,
-				})
-				.from(mailbox)
-				.where(
-					and(
-						eq(mailbox.narratorId, narratorId),
-						options.after === undefined ? undefined : gt(mailbox.arrivalSeq, options.after),
-						options.state ? eq(mailbox.state, options.state) : undefined,
-						options.kind ? eq(mailbox.kind, options.kind) : undefined,
-					),
-				)
-				.orderBy(asc(mailbox.arrivalSeq), asc(mailbox.id))
-				.limit(Math.min(Math.max(options.limit ?? L.pageSize, 1), L.pageSize) + 1)
-				.all();
+			return readQuery(
+				db
+					.select({
+						id: mailbox.id,
+						kind: mailbox.kind,
+						state: mailbox.state,
+						arrivalSeq: mailbox.arrivalSeq,
+						seq: mailbox.seq,
+						priority: mailbox.priority,
+						byteSize: mailbox.byteSize,
+						deliveryId: mailbox.deliveryId,
+						receiptDisposition: mailbox.receiptDisposition,
+						lastError: mailbox.lastError,
+					})
+					.from(mailbox)
+					.where(
+						and(
+							eq(mailbox.narratorId, narratorId),
+							options.after === undefined ? undefined : gt(mailbox.arrivalSeq, options.after),
+							options.state ? eq(mailbox.state, options.state) : undefined,
+							options.kind ? eq(mailbox.kind, options.kind) : undefined,
+						),
+					)
+					.orderBy(asc(mailbox.arrivalSeq), asc(mailbox.id))
+					.limit(Math.min(Math.max(options.limit ?? L.pageSize, 1), L.pageSize) + 1),
+				{ ...options, executionPolicy: "worker-required", maxRows: L.pageSize + 1 },
+			);
 		},
 		claimBatch(
 			narratorId: string,
@@ -732,8 +756,12 @@ export function createMailboxStore(db: RuntimeDb) {
 			);
 		},
 		/** Never unlinks files: uploaded/history files may be shared. Claimed payload cannot be cancelled here. */
-		cancel(deliveryId: string, reason: string) {
-			return (
+		cancel(
+			deliveryId: string,
+			reason: string,
+			expected?: { state: MailboxRow["state"]; revision: number },
+		) {
+			const changed =
 				db
 					.update(mailbox)
 					.set({
@@ -754,11 +782,17 @@ export function createMailboxStore(db: RuntimeDb) {
 						updatedAt: now(),
 					})
 					.where(
-						and(eq(mailbox.deliveryId, deliveryId), inArray(mailbox.state, ["queued", "failed"])),
+						and(
+							eq(mailbox.deliveryId, deliveryId),
+							inArray(mailbox.state, ["queued", "failed"]),
+							expected ? eq(mailbox.state, expected.state) : undefined,
+							expected ? eq(mailbox.contentRevision, expected.revision) : undefined,
+						),
 					)
 					.returning({ id: mailbox.id })
-					.all().length === 1
-			);
+					.all().length === 1;
+			if (expected && !changed) throw new RuntimeReadConflictError();
+			return changed;
 		},
 		/** Revert/cancel owner uses its exact claim; arbitrary UI cancellation cannot release another owner's payload. */
 		cancelClaim(claim: MailboxClaim, reason: string) {

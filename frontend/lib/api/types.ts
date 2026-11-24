@@ -10,7 +10,9 @@ import type { LocalizedValue } from "@shared/i18n-locales";
 import type { SubagentModelInheritance } from "@shared/model-inheritance";
 import type { NarratorVisibility, NarratorWriteAudience } from "@shared/narrator-access";
 import type { RowBlock } from "@shared/narrator-blocks/message-blocks";
+import type { ReasoningTranslationFields } from "@shared/reasoning-translation";
 import type { StorageCategoryKey } from "@shared/storage-categories";
+import type { SubagentNestedSummary } from "@shared/subagent-nested";
 import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
 
 export type { TextCitation } from "@shared/citations";
@@ -434,7 +436,8 @@ export type DatabaseCleanupBlockedReasonCode =
 	| "backgroundRunning"
 	| "nonArchived"
 	| "nonStaleStatus"
-	| "recentActivity";
+	| "recentActivity"
+	| "teamLiveWork";
 
 export type DatabaseCleanupWarningCode = string;
 
@@ -606,6 +609,7 @@ export interface SubagentToolCallTiming {
 
 export interface SubagentToolCallHeader {
 	toolCallId: string | null;
+	executionAttempt?: number;
 	toolUseId: string;
 	toolName: string;
 	status: string;
@@ -629,7 +633,7 @@ export interface SubagentToolCallHeader {
 	 * feed the normal tool card rather than an activity row and need no summary.
 	 * See `SubagentActivityRow`.
 	 */
-	inputSummary?: SubagentToolInputSummary;
+	inputSummary?: SubagentToolInputSummary | null;
 }
 
 export interface SubagentFileChanges {
@@ -673,6 +677,8 @@ export interface SubagentActivitySummary {
 	 * rendering a plain "running" card.
 	 */
 	takenOver?: boolean;
+	/** The helpers this child launched itself (its one nested level); absent when none. */
+	nested?: SubagentNestedSummary;
 }
 
 export interface SubagentActivityCatchUp {
@@ -692,7 +698,7 @@ export interface ExecutionTargetIdentity {
 	selectionSource?: "explicit" | "session_default" | "local_default";
 }
 
-export interface BaseContentBlock {
+export interface BaseContentBlock extends ReasoningTranslationFields {
 	type: string;
 	text?: string;
 	thinking?: string;
@@ -1039,7 +1045,17 @@ export interface BufferedTextFileSummary {
 	size: number;
 }
 
+export interface BufferedMessageEditLease {
+	ok: true;
+	token: string;
+	expiresAt: number;
+	leaseMs: number;
+	contentRevision: number;
+}
+
 export interface BufferMessageSummary {
+	/** Content-only revision, when supplied by a revision-aware server. */
+	contentRevision?: number;
 	/** Mailbox control row id; this remains the id used by edit/remove/retry APIs. */
 	id: string;
 	/** Canonical timeline message id, when supplied by a new server. */
@@ -1071,6 +1087,7 @@ export interface TreeMessage {
 	provider?: string | null;
 	id: string;
 	narratorId: string;
+	stateRevision?: number;
 	parentToolUseId: string | null;
 	messageUuid?: string | null;
 	role: string;
@@ -1136,6 +1153,8 @@ export interface TreeMessage {
 	 * `@shared/pretext-layout/streaming-live-blocks`, never directly.
 	 */
 	liveBlockIndex?: number;
+	/** Client-only row holding a projected streaming block over a persisted checkpoint. */
+	liveContentProjection?: boolean;
 	/**
 	 * Client-only synthetic row: animation baseline of the last accepted text
 	 * snapshot. Travels with this message through the layout commit, so new

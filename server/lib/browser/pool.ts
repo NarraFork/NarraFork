@@ -6,9 +6,12 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { NoProxyRule } from "@shared/proxy-settings";
 import type { Browser, BrowserContext, Page } from "puppeteer-core";
+import { ValidationError } from "../errors";
 import { logger } from "../logger";
 import { getNoProxyRules } from "../net/proxy";
+import { ambientNoProxy } from "../net/proxy-env";
 import { getBrowserProxy, getWebFetchProxyForUrl } from "../web-fetch/proxy";
+import { managedManualProxyBypassList } from "./manual-proxy";
 import { closeTab } from "./tab-scope";
 import { attachUserBrowser } from "./user-browser";
 
@@ -524,11 +527,27 @@ export interface BrowserTab {
  * 无头会话各用一个隔离 context，cookie 互不相通。有头会话放进默认 context：一个窗口只属于一个
  * profile，隔离 context 的页面必然另开窗口，只有默认 context 能让所有标签并进同一个窗口。
  */
-export async function openTab(headless = true): Promise<BrowserTab> {
+export async function openTab(headless = true, managedManual = false): Promise<BrowserTab> {
+	let manualProxyOptions: { proxyServer: string; proxyBypassList?: string[] } | undefined;
+	if (managedManual) {
+		if (!headless)
+			throw new ValidationError("Manual browser sessions require managed headless mode.");
+		// Validate the entire context policy before acquiring a process or creating a tab.
+		const proxy = getBrowserProxy();
+		manualProxyOptions = proxy
+			? {
+					proxyServer: proxy,
+					proxyBypassList: managedManualProxyBypassList(ambientNoProxy(), getNoProxyRules()),
+				}
+			: { proxyServer: "direct://" };
+	}
 	const entry = await getEntry(headless);
 	if (headless) {
+		if (managedManual && !entry.owned) {
+			throw new ValidationError("Manual browser sessions require managed headless mode.");
+		}
 		const context = await entry.browser.createBrowserContext(
-			browserContextProxyOptions(getBrowserProxy()),
+			manualProxyOptions ?? browserContextProxyOptions(getBrowserProxy()),
 		);
 		const page = await context.newPage().catch(async (error: unknown) => {
 			await context.close().catch(() => {});

@@ -31,6 +31,7 @@ import {
 	MAX_NARRATOR_ATTACHMENT_BYTES,
 	MAX_STAGED_ATTACHMENTS_TOTAL_BYTES,
 } from "@shared/text-file-types";
+import { watchNoticeFromTask } from "@shared/watch-command";
 import { parseWorkspaceDirectoryMap, readDeviceDirectory } from "@shared/workspace-directories";
 import { and, asc, desc, eq, exists, gt, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
@@ -77,6 +78,7 @@ import {
 } from "../lib/context-characters";
 import { resolveInjectedDevices } from "../lib/device-injection-trait";
 import { AppError, catalogError, NotFoundError, ValidationError } from "../lib/errors";
+import { stallTimeBetween } from "../lib/event-loop-monitor";
 import { hotSafe } from "../lib/hot-safe";
 import { t } from "../lib/i18n";
 import { InjectionCadence } from "../lib/injection-cadence";
@@ -87,6 +89,7 @@ import {
 	saveUploadedMedia,
 	validateUploadedMedia,
 } from "../lib/media-uploads";
+import { ModelHistoryPreparation } from "../lib/model-history-preparation";
 import { getBlockedSkills, getDisabledToolSet } from "../lib/narrator-custom-traits";
 import {
 	addTrait,
@@ -143,6 +146,7 @@ import {
 	consumeMailboxDelivery,
 	type MailboxDeliveryConsumption,
 } from "./agent-message-delivery";
+import { isCheckpointStop } from "./agent-runtime/checkpoint-stop";
 import { buildRuntimeHistory } from "./agent-runtime/history";
 import {
 	claimInboxHead,
@@ -186,6 +190,7 @@ import {
 	backgroundAgentNoticePreview,
 	formatBackgroundCompletionNotifications,
 } from "./bg-completion-queue";
+import { resolveNarratorMessageOnlyRevert } from "./file-history-policy";
 import { gitService } from "./git-service";
 import { cancelModelTrace } from "./modeltrace-service";
 import { isFormerChapterSessionWithoutDirectory, resolveNarratorSessionCwd } from "./narrator-cwd";
@@ -262,9 +267,11 @@ import {
 	consumePlanModePromptRebuild,
 	hasNarratorAdmissionWork,
 	hasPendingHistoryCompact,
+	hasRevertBlockingAdmissionWork,
 	isNarratorRevertAdmissionBlocked,
 	isNarratorRuntimeBusy,
 	listNarratorAdmissionOwners,
+	loadBackgroundSubagentIds,
 	narratorCreationLocks,
 	narratorLoopAdmissions,
 	pendingFeedback,
@@ -276,6 +283,7 @@ import {
 	planModeAskedOnce,
 	reserveNarratorRevertAdmission,
 	resolveNarratorAdmissionRoot,
+	retainBackgroundSubagentWork,
 	waitForNarratorAdmissionWork,
 	withNarratorMutationAdmission,
 	withNarratorStartAdmission,
@@ -392,6 +400,7 @@ import {
 	getFileReferenceSnapshots,
 	projectFileReferenceText,
 } from "../lib/agent/file-reference-projection";
+import { bufferEditHolds, isBufferConsumptionHeld } from "./buffer-edit-hold";
 import { recoverBlockStorage } from "./narrator-block-sync";
 import {
 	lastTargetElement,
@@ -417,6 +426,7 @@ import {
 	removeBufferedMessage,
 	restoreBufferedMessage,
 	toBufferSummary,
+	withCurrentBufferedGuidance,
 } from "./narrator-buffer";
 import {
 	awaitCompactCompletion,
@@ -739,6 +749,8 @@ export async function executeQueuedNewCommand(
 					await resolveSubagentModelForRun(
 						sourceNarrator,
 						buffered.createdBy ?? sourceNarrator.ownerUserId,
+						undefined,
+						{ signal: active.abortController.signal },
 					)
 				).model
 			: (sourceNarrator.model ?? undefined);
@@ -1421,7 +1433,6 @@ async function createNarrator(
 		activeNarrators.delete(narratorId);
 		planModeAskedOnce.delete(narratorId);
 		clearStreamingSnapshot(narratorId);
-		retireSubagentOutputCharCount(narratorId);
 	}
 
 	const narrator = await narratorService.getById(narratorId);
@@ -1597,7 +1608,9 @@ async function createNarrator(
 	const stickyProvider = await lastServedProvider(narratorId);
 	const inheritedModel =
 		narrator.model === FOLLOW_PARENT_MODEL
-			? await resolveSubagentModelForRun(narrator, undefined, stickyProvider)
+			? await resolveSubagentModelForRun(narrator, undefined, stickyProvider, {
+					signal: abortController.signal,
+				})
 			: null;
 	const narratorModelRef = inheritedModel?.modelRef ?? narrator.model ?? FOLLOW_DEFAULT_MODEL;
 	const narratorModel =
@@ -2566,7 +2579,7 @@ async function deliverPendingInjectionsInOrder(
 					if (active?._questionAnswerAdoptedMessageIds?.has(questionAnswer.messageId)) {
 						// It arrived between the pre-pass drain and history read. The model
 						// already saw it; acknowledge the receipt, do not add a second copy.
-						consumeMailboxDelivery(inboxConsumption(adopted));
+						await consumeMailboxDelivery(inboxConsumption(adopted));
 						continue;
 					}
 					adoptedMailbox?.push(inboxConsumption(adopted));
@@ -2743,6 +2756,18 @@ export async function deliverPendingInjection(
 					title: bashTask.title || bashTask.id,
 					status: bashTask.status,
 					preview: bashTask.outputPreview ?? "",
+					...(bashTask.watch
+						? {
+								watch: bashTask.watch,
+								watchOutcome:
+									watchNoticeFromTask({
+										title: bashTask.title,
+										status: bashTask.status,
+										preview: bashTask.outputPreview,
+										watch: bashTask.watch,
+									})?.outcome ?? null,
+							}
+						: {}),
 				},
 			];
 			// `sideCarBodyWithText` renders the model-facing text from the SAME body in one
@@ -2870,7 +2895,7 @@ export async function drainInjectionsIntoHistory(
 	text: string;
 	parts: AgentInputPart[];
 	lastInputWasMailbox: boolean;
-	onConsumed: () => void;
+	onConsumed: () => Promise<void>;
 }> {
 	const narratorId = active.narratorId;
 	// Every part is a persisted row. Unresolved questions are listed in the pass's system
@@ -3024,6 +3049,16 @@ export async function drainInjectionsIntoHistory(
 		const activity = await writeOutlineTeamActivity(narratorId, locale, "boundary");
 		if (activity?.turnText)
 			parts.push({ text: activity.turnText, messageId: activity.messageId ?? undefined });
+		// A team coordinator's status again, at most every ten minutes and only when it changed
+		// (Project Teams P2; a map lookup for every other session).
+		const { writeTeamStatusAtBoundary } = await import("./teams/team-status");
+		const teamStatus = await writeTeamStatusAtBoundary({
+			narratorId,
+			locale,
+			contextPercent: active._contextUsagePct,
+		});
+		if (teamStatus?.turnText)
+			parts.push({ text: teamStatus.turnText, messageId: teamStatus.messageId ?? undefined });
 	}
 
 	return {
@@ -3032,9 +3067,9 @@ export async function drainInjectionsIntoHistory(
 		lastInputWasMailbox: adoptedDeliveries.some(
 			(delivery) => delivery.recipientMessageId === parts.at(-1)?.messageId,
 		),
-		onConsumed: () => {
-			for (const delivery of adoptedDeliveries) consumeAgentMessageDelivery(delivery);
-			for (const delivery of adoptedMailbox) consumeMailboxDelivery(delivery);
+		onConsumed: async () => {
+			for (const delivery of adoptedDeliveries) await consumeAgentMessageDelivery(delivery);
+			for (const delivery of adoptedMailbox) await consumeMailboxDelivery(delivery);
 		},
 	};
 }
@@ -3145,13 +3180,14 @@ export interface ContextManagementOptions {
 	buildPrefixPrompt?: (
 		identity: RequestModelIdentity,
 		replyContext: ReplyContext,
+		preparation?: ModelHistoryPreparation,
 	) => Promise<{
 		contract: string;
 		parts: import("../../shared/prefix-context").PromptPart[];
 		compactMessageId?: string | null;
 	}>;
 	/** Compatibility path for callers not yet supplying named prompt parts. */
-	rebuildSystemPrompt?: () => Promise<string | null>;
+	rebuildSystemPrompt?: (preparation?: ModelHistoryPreparation) => Promise<string | null>;
 }
 
 /**
@@ -3209,54 +3245,74 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 
 	const rebuildHistoryForCurrentContext = async (includeSystemPrompt: boolean) => {
 		const signal = opts.attachmentSignal;
-		const preparedPrefix = await preparePrefixRequest({
+		const preparation = new ModelHistoryPreparation({
 			narratorId,
-			locale,
-			getReplyContext: opts.getReplyContext,
-			ensureRequestIdentity: opts.ensureRequestIdentity,
-			getModel,
-			getProvider,
+			kind: "rebuild",
 			signal,
-			getToolLoading: opts.getToolLoading,
-			refreshToolLoading: opts.refreshToolLoading,
-			buildPrefixPrompt: opts.buildPrefixPrompt,
+			timeoutMs: null,
+			warn: (message, fields) => logger.warn(message, fields),
+			stallTimeBetween,
 		});
-		const { prompt: prefixPrompt, toolLoading, sourceMessages: rawMsgs } = preparedPrefix;
-		let systemPrompt = preparedPrefix.reconciled?.systemPrompt;
-		// The in-memory history is now rebuilt from the latest (post-compact)
-		// messages, so any pending-compact guard can be released.
-		clearActiveHistoryCompactPending(narratorId);
-		const result = await buildRuntimeHistory({
-			narratorId,
-			model: preparedPrefix.model,
-			provider: preparedPrefix.provider,
-			sourceMessages: rawMsgs,
-			attachmentCwd: opts.getAttachmentCwd?.(),
-			attachmentSignal: signal,
-			toolLoading,
-		});
-		if (result.toolLoading && !result.toolCandidates) {
-			throw new Error("A tool-loading history rebuild must include tool candidates");
+		try {
+			preparation.recordPhase("epoch");
+			const preparedPrefix = await preparePrefixRequest({
+				narratorId,
+				locale,
+				preparation,
+				getReplyContext: opts.getReplyContext,
+				ensureRequestIdentity: opts.ensureRequestIdentity,
+				getModel,
+				getProvider,
+				signal,
+				getToolLoading: opts.getToolLoading,
+				refreshToolLoading: opts.refreshToolLoading,
+				buildPrefixPrompt: opts.buildPrefixPrompt,
+			});
+			const { prompt: prefixPrompt, toolLoading, sourceMessages: rawMsgs } = preparedPrefix;
+			preparation.recordPhase("systemPrompt");
+			let systemPrompt = preparedPrefix.reconciled?.systemPrompt;
+			// The in-memory history is now rebuilt from the latest (post-compact)
+			// messages, so any pending-compact guard can be released.
+			clearActiveHistoryCompactPending(narratorId);
+			const result = await buildRuntimeHistory({
+				narratorId,
+				model: preparedPrefix.model,
+				provider: preparedPrefix.provider,
+				sourceMessages: rawMsgs,
+				attachmentCwd: opts.getAttachmentCwd?.(),
+				attachmentSignal: signal,
+				preparation,
+				toolLoading,
+			});
+			if (result.toolLoading && !result.toolCandidates) {
+				throw new Error("A tool-loading history rebuild must include tool candidates");
+			}
+			if (!prefixPrompt && includeSystemPrompt) {
+				preparation.recordPhase("systemPrompt");
+				systemPrompt = (await rebuildSystemPrompt?.(preparation)) ?? undefined;
+			}
+			signal?.throwIfAborted();
+			return {
+				history: result.history,
+				rows: result.modelMessages,
+				replayedInjectionMessageIds: result.replayedInjectionMessageIds,
+				...(result.mediaFallbackWarnings?.length
+					? { mediaFallbackWarnings: result.mediaFallbackWarnings }
+					: {}),
+				...(result.toolLoading
+					? {
+							toolLoading: result.toolLoading,
+							...(result.toolCandidates ? { toolCandidates: result.toolCandidates } : {}),
+						}
+					: {}),
+				...(systemPrompt !== undefined ? { systemPrompt } : {}),
+			};
+		} catch (error) {
+			preparation.finish(error);
+			throw error;
+		} finally {
+			preparation.finish();
 		}
-		if (!prefixPrompt && includeSystemPrompt) {
-			systemPrompt = (await rebuildSystemPrompt?.()) ?? undefined;
-		}
-		signal?.throwIfAborted();
-		return {
-			history: result.history,
-			rows: result.modelMessages,
-			replayedInjectionMessageIds: result.replayedInjectionMessageIds,
-			...(result.mediaFallbackWarnings?.length
-				? { mediaFallbackWarnings: result.mediaFallbackWarnings }
-				: {}),
-			...(result.toolLoading
-				? {
-						toolLoading: result.toolLoading,
-						...(result.toolCandidates ? { toolCandidates: result.toolCandidates } : {}),
-					}
-				: {}),
-			...(systemPrompt !== undefined ? { systemPrompt } : {}),
-		};
 	};
 
 	const onReasoningOnlyHighContext: NonNullable<
@@ -3373,7 +3429,14 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
  * the finalizer — registration rejected, or the run still working/waiting — still
  * report here.
  */
-async function reportUnsettledRunLoopError(
+function reportUnsettledRunLoopError(
+	...args: Parameters<typeof reportUnsettledRunLoopErrorUntracked>
+): Promise<void> {
+	if (isCheckpointStop(args[1])) return Promise.resolve();
+	return withTrackedNarratorSessionCleanup(() => reportUnsettledRunLoopErrorUntracked(...args));
+}
+
+async function reportUnsettledRunLoopErrorUntracked(
 	narratorId: string,
 	err: unknown,
 	diagnostics?: ReturnType<typeof diagnosticsFromError>,
@@ -3400,7 +3463,13 @@ async function reportUnsettledRunLoopError(
  * session — however it was created — runs here; relations (result destination,
  * caller cancellation, deadline, principal) come from the run registration.
  */
-export async function runAgentLoop(
+export function runAgentLoop(
+	...args: Parameters<typeof runAgentLoopUntracked>
+): ReturnType<typeof runAgentLoopUntracked> {
+	return withTrackedNarratorSessionWork(() => runAgentLoopUntracked(...args));
+}
+
+async function runAgentLoopUntracked(
 	active: ActiveNarrator,
 	text: string,
 	images?: ImageRef[],
@@ -3459,6 +3528,8 @@ export async function runAgentLoop(
 		return { started: true };
 	} catch (error) {
 		forget();
+		if (isCheckpointStop(error) && error.identity.narratorId === narratorId)
+			return { started: true };
 		if (recoveryStart?.cancelled()) return { started: false };
 		if (!narratorLoopAdmissions.has(narratorId)) {
 			active._loopRunning = false;
@@ -3468,6 +3539,87 @@ export async function runAgentLoop(
 	} finally {
 		recoveryStart?.resolveAdmission(false);
 	}
+}
+
+const pendingNarratorSessionTails = new Set<Promise<unknown>>();
+let narratorSessionFinalizerFailures = 0;
+let firstNarratorSessionFinalizerFailure: unknown;
+
+function trackNarratorSessionTail<T>(work: Promise<T>): Promise<T> {
+	pendingNarratorSessionTails.add(work);
+	const settled = () => pendingNarratorSessionTails.delete(work);
+	void work.then(settled, settled);
+	return work;
+}
+
+function withTrackedNarratorSessionWork<T>(fn: () => Promise<T>): Promise<T> {
+	let fulfill!: (value: T | PromiseLike<T>) => void;
+	let reject!: (reason?: unknown) => void;
+	const work = new Promise<T>((resolve, fail) => {
+		fulfill = resolve;
+		reject = fail;
+	});
+	trackNarratorSessionTail(work);
+	try {
+		void fn().then(fulfill, reject);
+	} catch (error) {
+		reject(error);
+	}
+	return work;
+}
+
+function withTrackedNarratorSessionCleanup<T>(fn: () => Promise<T>): Promise<T> {
+	return withTrackedNarratorSessionWork(async () => {
+		try {
+			return await fn();
+		} catch (error) {
+			if (!(error instanceof AppError && error.code === "NARRATOR_REVERT_IN_PROGRESS")) {
+				narratorSessionFinalizerFailures++;
+				firstNarratorSessionFinalizerFailure ??= error;
+			}
+			throw error;
+		}
+	});
+}
+
+export function getNarratorSessionTailStatus(): { pending: number; failed: number } {
+	return { pending: pendingNarratorSessionTails.size, failed: narratorSessionFinalizerFailures };
+}
+
+export async function drainNarratorSessionTails(options: {
+	deadlineAt: number;
+	signal?: AbortSignal;
+}): Promise<void> {
+	options.signal?.throwIfAborted();
+	while (pendingNarratorSessionTails.size > 0) {
+		options.signal?.throwIfAborted();
+		const remaining = options.deadlineAt - Date.now();
+		if (remaining <= 0) throw new Error("Narrator session tail drain deadline expired");
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		let onAbort: (() => void) | undefined;
+		try {
+			await Promise.race([
+				Promise.allSettled([...pendingNarratorSessionTails]),
+				new Promise<never>((_, reject) => {
+					onAbort = () =>
+						reject(options.signal?.reason ?? new Error("Narrator session tail drain aborted"));
+					options.signal?.addEventListener("abort", onAbort, { once: true });
+					timer = setTimeout(
+						() => reject(new Error("Narrator session tail drain deadline expired")),
+						remaining,
+					);
+				}),
+			]);
+		} finally {
+			clearTimeout(timer);
+			if (onAbort) options.signal?.removeEventListener("abort", onAbort);
+		}
+	}
+	options.signal?.throwIfAborted();
+	if (narratorSessionFinalizerFailures)
+		throw new Error("Narrator session finalization failed", {
+			cause: firstNarratorSessionFinalizerFailure,
+		});
 }
 
 // === Message feeding ===
@@ -3522,7 +3674,15 @@ async function feedMessageUnlocked(
 		/** Run relations for a recovered/continued run (see StartNarratorRunRequest). */
 		run?: Pick<
 			import("./agent-runtime/run").StartNarratorRunRequest,
-			"resumeRunId" | "recovered" | "deliver" | "cancelSignal" | "principal" | "binding"
+			| "resumeRunId"
+			| "recovered"
+			| "deliver"
+			| "cancelSignal"
+			| "principal"
+			| "binding"
+			| "recoveryObservation"
+			| "parentRecoveryTurn"
+			| "onRegistered"
 		>;
 		recoveryStart?: RecoveryContinuationStart;
 	},
@@ -3706,6 +3866,10 @@ async function feedMessageUnlocked(
 		const deliverTo = await readSessionDeliverTo(narratorId);
 		recoveryStart?.check();
 		userMsg = (await persistClaimedUserInput({
+			recoveryGuard: {
+				narrator: internalOptions?.run?.recoveryObservation,
+				parentTurn: internalOptions?.run?.parentRecoveryTurn,
+			},
 			claim: inboxClaim(claimedInput),
 			reservedMessageId: claimedInput.recipientMessageId,
 			narratorId,
@@ -3727,12 +3891,16 @@ async function feedMessageUnlocked(
 				message: fileReferenceMessageForDisplay(userMsg),
 			});
 		if (accepted.executionIntent?.modelOverride) {
-			await applyAcceptedModelOverride(narratorId, accepted.executionIntent.modelOverride);
+			await applyAcceptedModelOverride(
+				narratorId,
+				accepted.executionIntent.modelOverride,
+				!internalOptions?.prepareOnly,
+			);
 		}
 	} catch (error) {
 		if (claimedInput) await releaseInboxClaim(claimedInput, error);
 		if (
-			recoveryStart &&
+			(recoveryStart || internalOptions?.run?.recoveryObservation) &&
 			acceptedInputId &&
 			!internalOptions?.bufferedId &&
 			!internalOptions?.bufferedRow
@@ -3765,16 +3933,16 @@ async function feedMessageUnlocked(
 
 		const narrator = await narratorService.getById(narratorId);
 		recoveryStart?.check();
-		await narratorService.updateStatus(
-			narratorId,
-			"working",
-			internalOptions?.preserveTurnStart
+		await narratorService.updateStatus(narratorId, "working", {
+			recoveryObservation: internalOptions?.run?.recoveryObservation,
+			parentRecoveryTurn: internalOptions?.run?.parentRecoveryTurn,
+			...(internalOptions?.preserveTurnStart
 				? {
 						turnStartedAt: active._turnStartedAt,
 						resumeTurn: true,
 					}
-				: { setTurnStart: true },
-		);
+				: { setTurnStart: true }),
+		});
 		recoveryStart?.check();
 		// The user message above is already persisted, so "first turn" means exactly one
 		// user message exists. `messageCount` cannot answer this any more — it now counts
@@ -3825,11 +3993,17 @@ async function feedMessageUnlocked(
 					? "system"
 					: "person",
 		});
-		terminal.catch(async (err) => {
-			const diagnostics = diagnosticsFromError(err);
-			logger.error("runAgentLoop unhandled error", { narratorId, error: String(err), diagnostics });
-			await reportUnsettledRunLoopError(narratorId, err, diagnostics);
-		});
+		withTrackedNarratorSessionWork(() =>
+			terminal.catch(async (err) => {
+				const diagnostics = diagnosticsFromError(err);
+				logger.error("runAgentLoop unhandled error", {
+					narratorId,
+					error: String(err),
+					diagnostics,
+				});
+				await reportUnsettledRunLoopError(narratorId, err, diagnostics);
+			}),
+		);
 
 		return { active, userMsg, userBroadcasted: !!preBashCommand, terminal };
 	} catch (error) {
@@ -5455,10 +5629,10 @@ export async function getQuestionAnswerFallbackText(
 }
 
 /** A prebuilt history has no WeakMap registration for receipts that arrived later. */
-export function consumeQuestionAnswerModelReceipts(
+export async function consumeQuestionAnswerModelReceipts(
 	narratorId: string,
 	eventIds: ReadonlySet<string>,
-): void {
+): Promise<void> {
 	if (getNarratorMessageRefsPort()) return;
 	for (const messageId of eventIds) {
 		const row = db
@@ -5481,7 +5655,7 @@ export function consumeQuestionAnswerModelReceipts(
 			.limit(1)
 			.get();
 		if (row?.deliveryId && row.recipientRefId)
-			consumeMailboxDelivery({
+			await consumeMailboxDelivery({
 				deliveryId: row.deliveryId,
 				recipientNarratorId: narratorId,
 				recipientMessageId: messageId,
@@ -6141,12 +6315,34 @@ export async function continueNarrator(
 	humanReplyContext?: ReplyContext,
 ): ReturnType<typeof continueNarratorUnlocked> {
 	const frozenHumanReplyContext = parseReplyContext(humanReplyContext) ?? undefined;
-	return withNarratorStartAdmission(narratorId, () =>
-		continueNarratorUnlocked(narratorId, locale, replyInUserLanguage, userId, {
-			run,
+	return withNarratorStartAdmission(narratorId, async () => {
+		let registered!: () => void;
+		const admitted = new Promise<void>((resolve) => {
+			registered = resolve;
+		});
+		const result = await continueNarratorUnlocked(narratorId, locale, replyInUserLanguage, userId, {
+			run: run?.recoveryObservation
+				? {
+						...run,
+						onRegistered: () => {
+							run.onRegistered?.();
+							registered();
+						},
+					}
+				: run,
 			humanReplyContext: frozenHumanReplyContext,
-		}),
-	);
+		});
+		if (run?.recoveryObservation && result.ok) {
+			if (!result.terminal) throw new Error("Recovery run did not expose its admission");
+			await Promise.race([
+				admitted,
+				result.terminal.then(() => {
+					throw new Error("Recovery run was not registered");
+				}),
+			]);
+		}
+		return result;
+	});
 }
 
 interface RecoveryContinuationStart {
@@ -6222,7 +6418,14 @@ async function continueNarratorUnlocked(
 		/** Recovery: re-enter a persisted run (deadline kept) and whether it delivers. */
 		run?: Pick<
 			import("./agent-runtime/run").StartNarratorRunRequest,
-			"resumeRunId" | "recovered" | "deliver" | "cancelSignal" | "binding"
+			| "resumeRunId"
+			| "recovered"
+			| "deliver"
+			| "cancelSignal"
+			| "binding"
+			| "recoveryObservation"
+			| "parentRecoveryTurn"
+			| "onRegistered"
 		>;
 		recoveryStart?: RecoveryContinuationStart;
 	} = {},
@@ -6344,13 +6547,13 @@ async function continueNarratorUnlocked(
 	active._turnStartedAt = continueTiming.preserveTurnStart
 		? continueTiming.turnStartedAt
 		: new Date().toISOString();
-	await narratorService.updateStatus(
-		narratorId,
-		"working",
-		continueTiming.preserveTurnStart
+	await narratorService.updateStatus(narratorId, "working", {
+		recoveryObservation: run?.recoveryObservation,
+		parentRecoveryTurn: run?.parentRecoveryTurn,
+		...(continueTiming.preserveTurnStart
 			? { turnStartedAt: active._turnStartedAt, resumeTurn: true }
-			: { setTurnStart: true },
-	);
+			: { setTurnStart: true }),
+	});
 
 	// Pass empty text — buildHistory reconstructs the turn's content itself: the trailing
 	// tool-result packet, or (for an injection tail) the trailing `sys` run lifted into
@@ -6409,7 +6612,6 @@ function disposeInactiveNarratorSession(narratorId: string, active: ActiveNarrat
 	activeNarrators.delete(narratorId);
 	planModeAskedOnce.delete(narratorId);
 	clearStreamingSnapshot(narratorId);
-	retireSubagentOutputCharCount(narratorId);
 	active.abortController.abort();
 	active.events.emit("event", { type: "done", data: null });
 	active.events.removeAllListeners();
@@ -7132,6 +7334,14 @@ async function rollbackToBlockUnlocked(
 	blockIndex: number,
 	opts?: ScopedRevertOptions & { skipRevert?: boolean; scope?: RevertScope },
 ): Promise<{ ok: boolean; warnings?: RevertWarning[]; revertResult?: RevertResult }> {
+	opts = {
+		...opts,
+		skipRevert: await resolveNarratorMessageOnlyRevert(
+			narratorId,
+			opts?.skipRevert,
+			!!opts?.revertPlan || (opts?.skipRevert !== true && opts?.scope !== undefined),
+		),
+	};
 	const targetRef = await db.query.narratorMessageRefs.findFirst({
 		where: and(
 			eq(narratorMessageRefs.narratorId, narratorId),
@@ -7503,7 +7713,7 @@ function buildEditedUserContentJson(
  * Edit a user message and regenerate the response.
  * Updates the message content, deletes everything after it, and re-runs the agent loop.
  *
- * `opts.revertFiles` (default true) selects file recovery or history-only editing.
+ * `opts.revertFiles` selects file recovery or history-only editing (the local default).
  * File recovery requires `opts.revertPlan`: the exact plan reviewed by the user.
  * The fixed target and history version are checked before any file or history write.
  *
@@ -7551,8 +7761,8 @@ export interface EditAndRegenerateOptions {
 	userId?: string | null;
 	deferContinuation?: boolean;
 	/**
-	 * Roll back the file changes the truncated messages made. Defaults to true,
-	 * which is what every edit did before this was expressible.
+	 * Restore file changes from the truncated messages. Defaults to false locally;
+	 * remote execution retains its existing file-recovery default.
 	 */
 	revertFiles?: boolean;
 	/** How wide that rollback reaches; omitted means the server default (`narrator`). */
@@ -7567,6 +7777,13 @@ async function editAndRegenerateUnlocked(
 	replyInUserLanguage: boolean,
 	opts?: EditAndRegenerateOptions,
 ): Promise<{ ok: boolean; warnings?: RevertWarning[]; revertResult?: RevertResult }> {
+	// Resolve file intent before session creation, interruption or attachment writes.
+	const skipRevert = await resolveNarratorMessageOnlyRevert(
+		narratorId,
+		opts?.revertFiles === undefined ? undefined : !opts.revertFiles,
+		!!opts?.revertPlan || (opts?.revertFiles !== false && opts?.revertScope !== undefined),
+	);
+	opts = { ...opts, revertFiles: !skipRevert };
 	// Every admission and attachment check must finish before the first file write.
 	if (isLoopRunning(narratorId)) {
 		logger.warn("editAndRegenerate blocked: loop already running", { narratorId });
@@ -8864,6 +9081,11 @@ export function interruptNarrator(narratorId: string): boolean {
 		.set({ lastStopReason: "user_interrupt" })
 		.where(eq(narrators.id, narratorId))
 		.run();
+	// A stopped subagent's helpers stop with it, even when it is between turns while they
+	// still run in the background. A no-op for primaries and helper-less subagents.
+	void import("./agent-runtime/run")
+		.then(({ stopSubagentHelpers }) => stopSubagentHelpers(narratorId, "Parent subagent stopped"))
+		.catch(() => {});
 	if (cancelModelTrace(narratorId)) return true;
 	const active = activeNarrators.get(narratorId);
 	const recovery = interruptPlannedUpdateRecovery(narratorId);
@@ -8890,6 +9112,7 @@ export function interruptNarrator(narratorId: string): boolean {
 
 /** Gracefully close a narrator. */
 export function closeNarrator(narratorId: string): void {
+	const logicalRunId = getRunControl(narratorId)?.logicalRunId;
 	cancelModelTrace(narratorId);
 	forgetModelTraceRequest(narratorId);
 	const active = activeNarrators.get(narratorId);
@@ -8898,7 +9121,7 @@ export function closeNarrator(narratorId: string): void {
 	if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
 	active.abortController.abort();
 	clearStreamingSnapshot(narratorId);
-	retireSubagentOutputCharCount(narratorId);
+	if (logicalRunId) retireSubagentOutputCharCount(narratorId, logicalRunId);
 	cleanupOrphanedToolCalls(narratorId, active.locale).catch((err) => {
 		logger.error("Failed to clean up orphaned tool calls on close", {
 			narratorId,
@@ -8976,10 +9199,10 @@ export async function acquireNarratorRevertAdmission(
 		// A loop's one-shot finalizer may already have tried (and been refused by
 		// the waiting gate). Cancellation can also leave admitted cleanup running:
 		// wait for its real settlement, rather than losing the wakeup to busy once.
-		void (async () => {
+		withTrackedNarratorSessionWork(async () => {
 			await waitForNarratorAdmissionWork(narratorId, new AbortController().signal);
 			await resumeBufferedMessagesIfIdle(narratorId, "en");
-		})().catch((error) => {
+		}).catch((error) => {
 			if (!isNarratorRevertAdmissionBlocked(narratorId)) {
 				logger.warn("Could not resume messages after file revert", {
 					narratorId,
@@ -8994,10 +9217,21 @@ export async function acquireNarratorRevertAdmission(
 			const interrupted = new Set<AbortController>();
 			interruptPlannedUpdateRecovery(narratorId);
 			// No start mutex is held here. Starting work may not have mounted its abort
-			// controller yet, so rescan until ALL admitted work (including delivery) exits.
-			while (busy() || hasNarratorAdmissionWork(narratorId)) {
+			// controller yet, so rescan until the reverted session's own work exits.
+			// Background subagents share this admission root but are not part of the
+			// turn: cancelling them here is what stopped agents launched with
+			// run_in_background. Foreground runs on this root are still cancelled,
+			// including a held run, and so is the session being reverted.
+			for (;;) {
 				signal.throwIfAborted();
-				for (const owner of new Set([narratorId, ...listNarratorAdmissionOwners(narratorId)])) {
+				const owners = listNarratorAdmissionOwners(narratorId);
+				const background = await loadBackgroundSubagentIds(
+					owners.filter((id) => id !== narratorId),
+				);
+				retainBackgroundSubagentWork(narratorId, background);
+				if (!busy() && !hasRevertBlockingAdmissionWork(narratorId)) break;
+				for (const owner of new Set([narratorId, ...owners])) {
+					if (background.has(owner)) continue;
 					// A revert needs the real terminal boundary, including a held run: cancel
 					// the run itself, not only its current turn.
 					const run = getRunControl(owner);
@@ -9027,7 +9261,11 @@ export async function acquireNarratorRevertAdmission(
 				});
 			}
 		}
-		await reservation.acquire(signal, busy);
+		await reservation.acquire(
+			signal,
+			busy,
+			interrupt ? { retainBackgroundSubagents: true } : undefined,
+		);
 		return releaseAndResume;
 	} catch (error) {
 		releaseAndResume();
@@ -9233,22 +9471,24 @@ export async function failUnownedStartupRecovery(
  * the current tool call" messages. If the user cancels the queued message before
  * the boundary is reached, there is nothing left and the loop must keep running.
  */
-export function hasPendingBufferedWork(narratorId: string): boolean {
+export async function hasPendingBufferedWork(narratorId: string): Promise<boolean> {
+	if (isBufferConsumptionHeld(narratorId)) return false;
 	if (resolveRuntimeQueueBackend() === "postgres")
 		throw new Error(
 			"hasPendingBufferedWork is synchronous and cannot inspect the PostgreSQL mailbox; use getBufferedMessagesAsync",
 		);
-	return getBufferedMessages(narratorId).length > 0;
+	return (await getBufferedMessages(narratorId)).length > 0;
 }
 
 /** A queued next-step or failed input must never keep a guidance stop armed. */
-export function hasPendingBufferedGuidance(narratorId: string): boolean {
+export async function hasPendingBufferedGuidance(narratorId: string): Promise<boolean> {
+	if (isBufferConsumptionHeld(narratorId)) return false;
 	if (resolveRuntimeQueueBackend() === "postgres") {
 		// Updated after durable admission, queue mutations and consumption. The
 		// synchronous loop boundary must not inspect the PostgreSQL mailbox.
 		return activeNarrators.get(narratorId)?._bufferGuidancePending === true;
 	}
-	return getBufferedMessages(narratorId).some(
+	return (await getBufferedMessages(narratorId)).some(
 		(message) =>
 			message.state !== "failed" &&
 			resolveBufferQueueMode(message.queueMode, message.priority) !== "turn",
@@ -9298,6 +9538,7 @@ export function evaluateSoftStopRequest(flags: {
 }
 
 export function requestBufferedMessageSoftStop(narratorId: string): boolean {
+	if (isBufferConsumptionHeld(narratorId)) return false;
 	const active = activeNarrators.get(narratorId);
 	if (!active?.alive) return false;
 	active._bufferSoftStop = true;
@@ -9313,6 +9554,7 @@ export function requestBufferedMessageSoftStop(narratorId: string): boolean {
  * ending a run is an explicit Stop/cancel (`controlRun`).
  */
 export function requestUrgentBufferedGuidance(narratorId: string): boolean {
+	if (isBufferConsumptionHeld(narratorId)) return false;
 	const active = activeNarrators.get(narratorId);
 	if (!active?.alive) {
 		// No live turn: an in-flight planned-update recovery is the current activity.
@@ -9336,17 +9578,18 @@ export function urgentActivitySignal(active: ActiveNarrator, turnSignal: AbortSi
 	return AbortSignal.any([turnSignal, urgent.signal]);
 }
 
-export function applyBufferedQueueModeControl(
+export async function applyBufferedQueueModeControl(
 	narratorId: string,
 	mode: "turn" | "tool" | "interrupt",
 	hasPendingGuidance = true,
 	targetQueued = true,
-): void {
+): Promise<void> {
+	if (isBufferConsumptionHeld(narratorId)) hasPendingGuidance = targetQueued = false;
 	const active = activeNarrators.get(narratorId);
 	if (active) active._bufferGuidancePending = hasPendingGuidance;
 	if (!targetQueued) return;
 	if (mode === "turn") {
-		clearBufferedMessageSoftStopIfIdle(narratorId, hasPendingGuidance);
+		await clearBufferedMessageSoftStopIfIdle(narratorId, hasPendingGuidance);
 		return;
 	}
 	if (!isNarratorRuntimeBusy(narratorId) && !isLoopRunning(narratorId)) return;
@@ -9370,23 +9613,111 @@ export function applyBufferedQueueModeControl(
  * `hasPendingBufferedWork` holds), and the stepping-in producer keeps its priority:
  * its own text still rides on the turn being started here.
  */
-export function rearmCutInSoftStopBeforeContinuing(active: ActiveNarrator): void {
-	if (!active._bufferSoftStopTaken) return;
-	if (!hasPendingBufferedGuidance(active.narratorId)) return;
-	active._bufferSoftStopTaken = false;
-	active._bufferSoftStop = true;
+export async function rearmCutInSoftStopBeforeContinuing(active: ActiveNarrator): Promise<void> {
+	if (isBufferConsumptionHeld(active.narratorId) || !active._bufferSoftStopTaken) return;
+	if (resolveRuntimeQueueBackend() === "postgres") {
+		if (active._bufferGuidancePending) {
+			active._bufferSoftStopTaken = false;
+			active._bufferSoftStop = true;
+		}
+		return;
+	}
+	await withCurrentBufferedGuidance(active.narratorId, (pending) => {
+		if (!active._bufferSoftStopTaken || !pending) return undefined;
+		active._bufferSoftStopTaken = false;
+		active._bufferSoftStop = true;
+		return undefined;
+	});
 }
 
-export function clearBufferedMessageSoftStopIfIdle(
+export async function abortPendingBufferedGuidance(active: ActiveNarrator): Promise<void> {
+	if (isBufferConsumptionHeld(active.narratorId) || !active._bufferSoftStop) return;
+	const apply = (pending: boolean) => {
+		if (active._bufferSoftStop && pending)
+			active._guidanceAbortController?.abort(new Error("Immediate guidance requested"));
+		return undefined;
+	};
+	if (resolveRuntimeQueueBackend() === "postgres") {
+		apply(active._bufferGuidancePending === true);
+		return;
+	}
+	await withCurrentBufferedGuidance(active.narratorId, apply);
+}
+
+export async function consumeBufferedSoftStopRequest(active: ActiveNarrator): Promise<boolean> {
+	const apply = (hasPending: boolean) => {
+		const decision = evaluateSoftStopRequest({
+			feedbackSoftStop: active._feedbackSoftStop,
+			bufferSoftStop: active._bufferSoftStop,
+			hasPendingBufferedWork: hasPending,
+		});
+		active._feedbackSoftStop = decision.feedbackSoftStop;
+		active._bufferSoftStop = decision.bufferSoftStop;
+		if (decision.softStopTaken) active._bufferSoftStopTaken = true;
+		return decision.stop;
+	};
+	if (
+		isBufferConsumptionHeld(active.narratorId) ||
+		active._feedbackSoftStop ||
+		!active._bufferSoftStop
+	)
+		return apply(false);
+	if (resolveRuntimeQueueBackend() === "postgres")
+		return apply(active._bufferGuidancePending === true);
+	return withCurrentBufferedGuidance(active.narratorId, apply);
+}
+
+export async function clearBufferedMessageSoftStopIfIdle(
 	narratorId: string,
 	pendingGuidance?: boolean,
-): void {
+): Promise<void> {
 	const active = activeNarrators.get(narratorId);
 	if (!active) return;
-	const pending = pendingGuidance ?? hasPendingBufferedGuidance(narratorId);
-	active._bufferGuidancePending = pending;
-	if (!pending && active._bufferSoftStop) active._bufferSoftStop = false;
+	const apply = (pending: boolean) => {
+		active._bufferGuidancePending = pending;
+		if (!pending && active._bufferSoftStop) active._bufferSoftStop = false;
+	};
+	if (resolveRuntimeQueueBackend() === "postgres") {
+		apply(
+			!isBufferConsumptionHeld(narratorId) &&
+				(pendingGuidance ?? active._bufferGuidancePending === true),
+		);
+		return;
+	}
+	await withCurrentBufferedGuidance(narratorId, (pending) => {
+		apply(pending);
+		return undefined;
+	});
 }
+
+// Edit holds only defer user input; they never cancel the current model/tool activity.
+// Re-read durable modes after release (including TTL expiry), then wake outside admission.
+bufferEditHolds.setListener(async (narratorId) => {
+	if (isBufferConsumptionHeld(narratorId)) {
+		const active = activeNarrators.get(narratorId);
+		if (active) {
+			active._bufferGuidancePending = false;
+			active._bufferSoftStop = false;
+		}
+		return;
+	}
+	await withNarratorStartAdmission(narratorId, async () => {
+		if (isBufferConsumptionHeld(narratorId)) return;
+		const remaining = (await getBufferedMessagesAsync(narratorId)).filter(
+			(message) => message.state !== "failed",
+		);
+		const modes = remaining.map((message) =>
+			resolveBufferQueueMode(message.queueMode, message.priority),
+		);
+		const mode = modes.includes("interrupt")
+			? "interrupt"
+			: modes.includes("tool")
+				? "tool"
+				: "turn";
+		await applyBufferedQueueModeControl(narratorId, mode, mode !== "turn", remaining.length > 0);
+	});
+	await wakeInboxIfEligible(narratorId);
+});
 
 // === Dynamic narrator controls ===
 
@@ -9540,6 +9871,7 @@ export function updateNarratorReasoningEffort(
 async function applyAcceptedModelOverride(
 	narratorId: string,
 	override: NonNullable<BufferedMessage["executionIntent"]>["modelOverride"],
+	startsNewRun: boolean,
 ): Promise<void> {
 	if (!override?.model) return;
 	const narrator = await narratorService.getById(narratorId);
@@ -9557,6 +9889,10 @@ async function applyAcceptedModelOverride(
 		})
 		.where(eq(narrators.id, narratorId));
 	updateNarratorModel(narratorId, override.model);
+	if (narrator.type === "subagent" && startsNewRun) {
+		const { markExplicitSubagentModelPin } = await import("./subagent-model-switch");
+		markExplicitSubagentModelPin(narratorId, override.model);
+	}
 }
 
 /** Persist the original model so the loop finalizer (or startup recovery) can restore it. */

@@ -70,7 +70,8 @@ export type NarratorTrait =
 	| "knowledge-steward"
 	| "scheduled"
 	| "imported"
-	| "bot";
+	| "bot"
+	| "team";
 
 /** Trait marking a narrator whose history was imported from Claude Code or Codex. */
 export const IMPORTED_TRAIT = "imported";
@@ -86,6 +87,18 @@ export const BOT_TRAIT = "bot";
 /** Whether the given traits mark this narrator as a bot. */
 export function isBotNarrator(raw: unknown): boolean {
 	return parseTraits(raw).includes(BOT_TRAIT);
+}
+
+/**
+ * Trait marking a team coordinator: the narrator that IS a project team
+ * (docs/PROJECT_TEAMS-PLAN.md). Set at creation together with its `project_teams` row and
+ * never toggled; forks and imports do not carry it (they have no team row).
+ */
+export const TEAM_TRAIT = "team";
+
+/** Whether the given traits mark this narrator as a team coordinator. */
+export function isTeamNarrator(raw: unknown): boolean {
+	return parseTraits(raw).includes(TEAM_TRAIT);
 }
 
 /** Trait marking a Knowledge Steward narrator (a standalone knowledge-base management session). */

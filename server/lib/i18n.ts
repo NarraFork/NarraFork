@@ -479,6 +479,16 @@ You have completed {count} tool call(s) since your last visible text reply. Befo
 		en: "⚠️ Permission required\nTool: {toolName}\n{summary}\n\nReply /approve or /deny [reason]",
 		"zh-CN": "⚠️ 需要权限批准\n工具：{toolName}\n{summary}\n\n回复 /approve 或 /deny [理由]",
 	},
+	"gateway.teamSessionRefused": {
+		en: "This session belongs to a team and can only be used from NarraFork: open it there. /list, /switch and /new still work here.",
+		"zh-CN":
+			"这个会话属于一个团队，只能在 NarraFork 里使用：请在那里打开它。这里仍可以用 /list、/switch 和 /new。",
+	},
+	"gateway.teamApprovalRefused": {
+		en: "This request belongs to a team. Team requests can't be approved, denied or answered from chat: open the session in NarraFork to decide.",
+		"zh-CN":
+			"这个请求属于一个团队。团队的请求不能在聊天里批准、拒绝或回答：请在 NarraFork 里打开这个会话来决定。",
+	},
 	"gateway.permissionApproved": {
 		en: "✅ Permission approved.",
 		"zh-CN": "✅ 权限已批准。",
@@ -640,7 +650,7 @@ Retry with complete, valid JSON containing all required parameters. If a large i
 	"sidecar.bgAgentEntry": {
 		en: `[System] Background agent "{title}" (ID: {id}) {status}.
 Result preview: {preview}
-Use Await({ type: "agent", id: "{id}" }) to see the full result, or Send({ id: "{id}", message }) to continue.`,
+Use Watch({ type: "agent", id: "{id}" }) to retrieve the saved result, or Send({ id: "{id}", message }) to continue.`,
 	},
 	"sidecar.bgBashEntry": {
 		en: `[System] Background bash "{title}" (ID: {id}) {status}.

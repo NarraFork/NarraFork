@@ -7,7 +7,7 @@ const MAX_MODEL_PAGE_SIZE = 200;
 const MAX_MODEL_ID_BYTES = 256;
 const MAX_VALIDATION_ISSUES = 20;
 const LOCAL_PROVIDER_ID_PATTERN = /^[a-z][a-z0-9._-]{0,63}$/;
-const HOST_RESERVED_PREFIXES = new Set([
+export const HOST_RESERVED_PREFIXES = new Set([
 	"__agg__",
 	"auto",
 	"__default__",
@@ -942,6 +942,7 @@ export class PluginProviderRegistry {
 		this.remoteProviderAdapterFactory;
 	private readonly now: () => Date;
 	private registrationSequence = 0;
+	private listingRevision = 0;
 
 	constructor(options: ProviderRegistryOptions = {}) {
 		for (const prefix of options.reservedPrefixes ?? []) {
@@ -961,6 +962,14 @@ export class PluginProviderRegistry {
 	 * constructor. Already-registered entries pick it up too, because they resolve
 	 * the fallback factory lazily inside `createAdapter()`.
 	 */
+	/**
+	 * Bumped whenever an entry is added or removed, or its prefix, name or `disabled` flag may
+	 * have changed, so readers can cache projections of `list()`.
+	 */
+	get revision(): number {
+		return this.listingRevision;
+	}
+
 	setRemoteProviderAdapterFactory(factory: RemoteProviderAdapterFactory | undefined): void {
 		this.remoteProviderAdapterFactory = factory;
 	}
@@ -1080,6 +1089,7 @@ export class PluginProviderRegistry {
 		typeInstances.add(entry.providerInstanceId);
 		this.instancesByType.set(entry.providerTypeId, typeInstances);
 		if (entry.kind === "builtin") this.builtinReservedPrefixes.add(normalizedPrefix);
+		this.listingRevision++;
 		return publicEntry(entry, this.adapterFactoryAccessor);
 	}
 
@@ -1091,6 +1101,7 @@ export class PluginProviderRegistry {
 		const typeInstances = this.instancesByType.get(entry.providerTypeId);
 		typeInstances?.delete(entry.providerInstanceId);
 		if (typeInstances?.size === 0) this.instancesByType.delete(entry.providerTypeId);
+		this.listingRevision++;
 		return true;
 	}
 
@@ -1143,6 +1154,7 @@ export class PluginProviderRegistry {
 		this.instanceByPrefix.delete(previous);
 		this.instanceByPrefix.set(normalized, entry.providerInstanceId);
 		entry.providerPrefix = prefix;
+		this.listingRevision++;
 		return publicEntry(entry, this.adapterFactoryAccessor);
 	}
 
@@ -1187,6 +1199,7 @@ export class PluginProviderRegistry {
 			this.instancesByType.set(entry.providerTypeId, typeInstances);
 			restored += 1;
 		}
+		if (restored > 0) this.listingRevision++;
 		return restored;
 	}
 
@@ -1453,6 +1466,7 @@ export class PluginProviderRegistry {
 			}
 			changed += 1;
 		}
+		if (changed > 0) this.listingRevision++;
 		return changed;
 	}
 
@@ -1464,6 +1478,7 @@ export class PluginProviderRegistry {
 			entry.explicitUnavailableReason = reason === "plugin-disabled" ? undefined : reason;
 			changed += 1;
 		}
+		if (changed > 0) this.listingRevision++;
 		return changed;
 	}
 
@@ -1486,6 +1501,7 @@ export class PluginProviderRegistry {
 			entry.explicitUnavailableReason = undefined;
 			changed += 1;
 		}
+		if (changed > 0) this.listingRevision++;
 		return changed;
 	}
 

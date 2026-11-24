@@ -54,6 +54,7 @@ import {
 import { lstat, mkdtemp, open, realpath, rename, rmdir, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, resolve } from "node:path";
+import { isFileHistoryEnabledForDevice } from "@shared/file-change-protocol";
 import type {
 	ToolEditPreviewSide,
 	ToolEditPreviewUnavailableReason,
@@ -68,6 +69,7 @@ import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { pathsEqualForOS } from "../lib/platform-path";
 import { safeSpawn } from "../lib/spawn";
+import { GIT_STAGING_EXCLUDE_PATHSPEC, isGitStagingInternalPath } from "./git-staging-files";
 import { snapshotCaptureReceipts } from "./snapshot-capture-receipts";
 import {
 	legacyTreeSnapshotKey,
@@ -127,8 +129,8 @@ const WARMUP_GIT_TIMEOUT_MS = 10 * 60_000;
  * Without a cooldown the next tool call would immediately launch another full
  * background scan, turning a hopeless tree into a permanent scan loop that keeps
  * the disk, CPU and antivirus busy forever. During the window the hot path returns
- * null instantly; the in-memory maps reset on process restart, and the settings
- * toggle (`workspace.treeSnapshotsEnabled`) is the manual escape hatch.
+ * null instantly; the in-memory maps reset on process restart. (The old
+ * `workspace.treeSnapshotsEnabled` setting is a legacy field this module never reads.)
  */
 const WARMUP_FAILURE_COOLDOWN_MS = 15 * 60_000;
 
@@ -610,6 +612,7 @@ async function syncExcludes(
 	// silently dropped.
 	parts.push("/.git/\n");
 	parts.push(`/${WORKTREES_DIR_NAME}/\n`);
+	if (existsSync(resolve(worktreePath, ".git"))) parts.push("/.narrafork/git-staging/\n");
 	await writeShadowMetadata(dir, "exclude", parts.join("\n"), signal, beforeWrite);
 	await writeShadowAttributes(dir, signal, beforeWrite);
 }
@@ -682,8 +685,7 @@ const SHADOW_CONFIG_ENTRIES: ReadonlyArray<readonly [key: string, value: string]
 	// could be missed by one capture, so that boundary pair would not report it.
 	// git mitigates this with the same racy-clean re-validation the index stat
 	// cache uses (entries at the tick boundary are re-scanned rather than trusted),
-	// which is why this is on; the knob to disable the whole scan path on a
-	// filesystem where it misbehaves is `workspace.treeSnapshotsEnabled`.
+	// which is why this is on.
 	["core.untrackedCache", "true"],
 	// Never let `add` trigger a spontaneous `gc --auto`. Shadow repositories are
 	// repacked by gcAll() on a controlled maintenance path; an auto-gc firing in
@@ -940,6 +942,10 @@ async function ensureShadowRepo(
 	worktreePath: string,
 	signal?: AbortSignal,
 ): Promise<void> {
+	signal?.throwIfAborted();
+	// Inspect the physical leaf before canonicalization can follow a dangling link.
+	if ((await lstatIfPresent(dir))?.isSymbolicLink())
+		throw new TreeSnapshotError("shadow directory must not be a symbolic link");
 	await withLifecycleContext(
 		[worktreePath],
 		async () => {
@@ -1348,6 +1354,34 @@ async function captureUnlocked(
  * `add -A` records its removal (verified), so the force-add is only ever needed to
  * *introduce* an entry.
  */
+async function assertSnapshotStagingUntracked(worktreePath: string) {
+	const internal = await safeSpawn({
+		cmd: [
+			"git",
+			"--no-optional-locks",
+			"ls-files",
+			"-z",
+			"--",
+			":(top,literal).narrafork/git-staging",
+		],
+		cwd: worktreePath,
+		timeout: GIT_TIMEOUT_MS,
+		maxOutputBytes: 16_384,
+		env: { ...process.env, LC_ALL: "C" },
+	});
+	if (
+		internal.exitCode !== 0 ||
+		internal.stdoutTruncated ||
+		internal.stderrTruncated ||
+		internal.stderr.trim()
+	)
+		throw new TreeSnapshotError("snapshot internal staging-path coverage could not be verified");
+	if (internal.stdout)
+		throw new TreeSnapshotError(
+			"The reserved .narrafork/git-staging path contains tracked user files; resolve this explicitly without untracking them automatically",
+		);
+}
+
 async function addAllUnlocked(
 	dir: string,
 	worktreePath: string,
@@ -1355,7 +1389,35 @@ async function addAllUnlocked(
 	signal?: AbortSignal,
 ): Promise<GitResult> {
 	const addArgs = ["add", "-A", "--no-warn-embedded-repo"];
-	const added = await runGit(addArgs, dir, worktreePath, gitTimeoutMs, signal);
+	const excludeStaging = existsSync(resolve(worktreePath, ".git"));
+	if (excludeStaging) {
+		const indexKey = realIndexIdentity(worktreePath);
+		if (indexKey === null || trackedIgnoredCache.get(dir)?.indexKey !== indexKey)
+			await assertSnapshotStagingUntracked(worktreePath);
+		const removed = await runGit(
+			[
+				"rm",
+				"--cached",
+				"-r",
+				"--force",
+				"--ignore-unmatch",
+				"--",
+				":(top,literal).narrafork/git-staging",
+			],
+			dir,
+			worktreePath,
+			gitTimeoutMs,
+			signal,
+		);
+		if (removed.exitCode !== 0) return removed;
+	}
+	const added = await runGit(
+		excludeStaging ? [...addArgs, "--", ":/", GIT_STAGING_EXCLUDE_PATHSPEC] : addArgs,
+		dir,
+		worktreePath,
+		gitTimeoutMs,
+		signal,
+	);
 	// Never retry with --ignore-errors: a skipped path is unknown, not absent.
 	// Publishing that index as a tree would report the path as deleted.
 	if (added.exitCode !== 0) return added;
@@ -1367,10 +1429,16 @@ async function addAllUnlocked(
 	}
 
 	try {
-		const forced = await trackedButIgnoredPaths(dir, worktreePath);
+		const forced = await trackedButIgnoredPaths(dir, worktreePath, signal);
 		for (const batch of batchArgs(forced)) {
 			const result = await runGit(
-				[...addArgs, "--force", "--", ...batch],
+				[
+					...addArgs,
+					"--force",
+					"--",
+					...batch,
+					...(excludeStaging ? [GIT_STAGING_EXCLUDE_PATHSPEC] : []),
+				],
 				dir,
 				worktreePath,
 				gitTimeoutMs,
@@ -1414,10 +1482,17 @@ async function addAllUnlocked(
  * Any failed or truncated query leaves coverage unknown and fails the capture.
  * Only a confirmed non-repository has no tracked paths by definition.
  */
-async function trackedButIgnoredPaths(dir: string, worktreePath: string): Promise<string[]> {
+async function trackedButIgnoredPaths(
+	dir: string,
+	worktreePath: string,
+	signal?: AbortSignal,
+): Promise<string[]> {
+	signal?.throwIfAborted();
 	const indexKey = realIndexIdentity(worktreePath);
 	const cached = trackedIgnoredCache.get(dir);
 	if (indexKey !== null && cached?.indexKey === indexKey) return [];
+
+	if (existsSync(resolve(worktreePath, ".git"))) await assertSnapshotStagingUntracked(worktreePath);
 
 	const result = await safeSpawn({
 		cmd: ["git", "ls-files", "-i", "-c", "--exclude-standard", "-z"],
@@ -1425,7 +1500,9 @@ async function trackedButIgnoredPaths(dir: string, worktreePath: string): Promis
 		timeout: GIT_TIMEOUT_MS,
 		maxOutputBytes: GIT_MAX_LISTING_BYTES,
 		env: { ...process.env, LC_ALL: "C" },
+		signal,
 	});
+	signal?.throwIfAborted();
 	if (result.stdoutTruncated || result.stderrTruncated) {
 		throw new TreeSnapshotError("snapshot tracked path listing exceeded the size limit");
 	}
@@ -1438,7 +1515,10 @@ async function trackedButIgnoredPaths(dir: string, worktreePath: string): Promis
 	if (result.stderr.trim()) {
 		throw new TreeSnapshotError(`snapshot tracked path coverage is incomplete: ${result.stderr}`);
 	}
-	const paths = result.stdout.split("\0").filter(Boolean);
+	const excludeStaging = existsSync(resolve(worktreePath, ".git"));
+	const paths = result.stdout
+		.split("\0")
+		.filter((path) => path && !(excludeStaging && isGitStagingInternalPath(path)));
 	if (paths.length > MAX_TRACKED_IGNORED_PATHS) {
 		throw new TreeSnapshotError("snapshot tracked path count exceeded the size limit");
 	}
@@ -1644,14 +1724,18 @@ export const worktreeTreeSnapshot = {
 	 * index. Identical states yield the same hash, so repeated calls are cheap and
 	 * deduplicate naturally.
 	 *
-	 * Production goes through {@link tryCaptureHot}, which calls this with a signal;
-	 * the method stays separate because that is the seam the warm-up runs through.
+	 * Both this direct entry and {@link tryCaptureHot} enforce the file-history policy
+	 * before touching the shadow store. The retained algorithm is exercised only
+	 * under explicitly injected test policy.
 	 */
 	async capture(
 		worktreePath: string,
 		deviceId: string = LOCAL_DEVICE_ID,
 		opts?: { gitTimeoutMs?: number; signal?: AbortSignal },
 	): Promise<string> {
+		if (!isFileHistoryEnabledForDevice(deviceId)) {
+			throw new TreeSnapshotError("Local workspace tree snapshots are disabled.");
+		}
 		assertLocal(deviceId);
 		const dir = shadowDir(deviceId, worktreePath);
 		// A caller carrying a signal is the warm-up itself (the thing that can BE
@@ -1711,6 +1795,9 @@ export const worktreeTreeSnapshot = {
 			requireFresh?: boolean;
 		},
 	): Promise<string | null> {
+		// Check policy before disk probes, shared warmups, or background capture.
+		// The direct capture entry independently enforces the same policy.
+		if (!isFileHistoryEnabledForDevice(deviceId)) return null;
 		const budgetMs = opts?.budgetMs ?? HOT_PATH_CAPTURE_BUDGET_MS;
 		const warmupGitTimeoutMs = opts?.warmupGitTimeoutMs ?? WARMUP_GIT_TIMEOUT_MS;
 		const cooldownMs = opts?.cooldownMs ?? WARMUP_FAILURE_COOLDOWN_MS;

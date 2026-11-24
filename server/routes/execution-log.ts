@@ -72,7 +72,9 @@ export function createExecutionLogRoutes(options: ExecutionLogRouteOptions = {})
 		}
 
 		const { cursor: _cursor, limit, ...filters } = query;
-		const result = await service.listCursor(filters, limit, cursor ?? undefined);
+		const result = await service.listCursor(filters, limit, cursor ?? undefined, {
+			signal: c.req.raw.signal,
+		});
 		return c.json(result);
 	});
 
@@ -81,7 +83,7 @@ export function createExecutionLogRoutes(options: ExecutionLogRouteOptions = {})
 	 * Filter options (tool names, statuses, providers). Registered before `/:id`.
 	 */
 	routes.get("/facets", async (c) => {
-		return c.json(await service.listFacets());
+		return c.json(await service.listFacets({ signal: c.req.raw.signal }));
 	});
 
 	/**

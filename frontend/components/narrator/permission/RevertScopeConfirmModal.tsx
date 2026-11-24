@@ -36,6 +36,10 @@ export interface RevertScopeConfirmModalProps {
 	title: string;
 	/** What will be deleted, phrased by the host (blocks, messages, a regenerate). */
 	description: string;
+	/** Local history actions only mutate messages; they need no file evidence. */
+	messagesOnly?: boolean;
+	/** No action can use the previous device while its authoritative context is unresolved. */
+	confirmationDisabled?: boolean;
 	data: RevertScopePreviews | undefined;
 	/** Current target/opening token, not the token carried by a cached response. */
 	previewKey?: string;
@@ -144,6 +148,8 @@ export function RevertScopeConfirmModal({
 	opened,
 	title,
 	description,
+	messagesOnly = false,
+	confirmationDisabled = false,
 	data,
 	previewKey,
 	isLoading,
@@ -215,7 +221,8 @@ export function RevertScopeConfirmModal({
 				? "revertPlanReloadRequired"
 				: planUnavailableKey(plan, previewKey, activeFiles.length)
 			: null;
-	const revertBlocked = !opened || isLoading || !plan || !!planUnavailable || !narratorUsable;
+	const revertBlocked =
+		!opened || confirmationDisabled || isLoading || !plan || !!planUnavailable || !narratorUsable;
 	// With no files to restore, "history only" does exactly what the main button does
 	// (a partial plan keeps message history, so it still differs).
 	const noFileWork =
@@ -272,6 +279,45 @@ export function RevertScopeConfirmModal({
 				sampleFilePaths: narratorScope.subagentWarning.sampleFiles,
 			})
 		: null;
+
+	if (messagesOnly) {
+		return (
+			<Modal
+				opened={opened}
+				onClose={() => {
+					if (!submitting) onCancel();
+				}}
+				closeOnClickOutside={!submitting}
+				closeOnEscape={!submitting}
+				closeButtonProps={{ disabled: submitting }}
+				title={title}
+				centered
+				size="md"
+			>
+				<Stack gap="md">
+					<Text size="sm">
+						{description} {t("revertMessagesOnlyKeepFiles")}
+					</Text>
+					<Group justify="flex-end" gap="xs">
+						<Button size="xs" variant="subtle" onClick={onCancel} disabled={submitting}>
+							{t("cancel")}
+						</Button>
+						<Button
+							size="xs"
+							color="red"
+							loading={submitting}
+							disabled={submitting || confirmationDisabled}
+							onClick={() => {
+								if (opened && !submitting && !confirmationDisabled) onConfirm({ skipRevert: true });
+							}}
+						>
+							{confirmNoFilesLabel}
+						</Button>
+					</Group>
+				</Stack>
+			</Modal>
+		);
+	}
 
 	return (
 		<Modal
@@ -489,11 +535,11 @@ export function RevertScopeConfirmModal({
 							size="xs"
 							variant="default"
 							onClick={() => {
-								if (!opened || submitting) return;
+								if (!opened || submitting || confirmationDisabled) return;
 								onConfirm({ skipRevert: true });
 							}}
 							loading={submitting}
-							disabled={submitting}
+							disabled={submitting || confirmationDisabled}
 						>
 							{messagesOnlyLabel}
 						</Button>
@@ -566,15 +612,23 @@ export function RevertActionConfirmModal({
 		<RevertScopeConfirmModal
 			opened={!!pending}
 			title={t(isBlockDelete ? "blockDeleteConfirmTitle" : "rollbackConfirmTitle")}
+			messagesOnly={preview.messagesOnly}
+			confirmationDisabled={!preview.contextReady}
 			description={
-				!summary
-					? t("revertPlanHistoryUnknown")
-					: summary.deletedBlockCount === 0 && summary.deletedMessageCount === 0
-						? t("revertPlanHistoryNothing")
-						: t("revertPlanHistorySummary", {
-								blockCount: summary.deletedBlockCount,
-								messageCount: summary.deletedMessageCount,
-							})
+				preview.messagesOnly
+					? t(
+							isBlockDelete
+								? "blockDeleteMessagesOnlyConfirmDesc"
+								: "rollbackMessagesOnlyConfirmDesc",
+						)
+					: !summary
+						? t("revertPlanHistoryUnknown")
+						: summary.deletedBlockCount === 0 && summary.deletedMessageCount === 0
+							? t("revertPlanHistoryNothing")
+							: t("revertPlanHistorySummary", {
+									blockCount: summary.deletedBlockCount,
+									messageCount: summary.deletedMessageCount,
+								})
 			}
 			data={preview.data}
 			previewKey={preview.previewKey}
@@ -598,7 +652,7 @@ export function RevertActionConfirmModal({
 				isBlockDelete ? "blockDeleteHistoryOnly" : "rollbackConfirmMessagesOnly",
 			)}
 			onConfirm={(opts) => {
-				if (!pending || submitting) return;
+				if (!pending || submitting || !preview.contextReady) return;
 				if (!opts.skipRevert && opts.revertPlan?.action !== action) return;
 				// No background re-plan after an attempt, even when the response is lost.
 				preview.invalidate();

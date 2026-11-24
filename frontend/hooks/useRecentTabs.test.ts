@@ -13,7 +13,6 @@ import {
 	reconcileRecentTabsRuntimePatches,
 	selectRecentTabsLiveWindow,
 	shouldAddSubagentRecentTab,
-	shouldApplyRecentTabsRuntimeResponse,
 	snapshotRecentTabRuntimeVersions,
 } from "./recent-tabs-utils";
 import type { RecentTabsInfiniteData } from "./useRecentTabs";
@@ -59,10 +58,60 @@ const {
 	recentTabsDataRevision,
 	recentTabsSectionQueryKey,
 	recordRecentTabVisit,
+	refreshRecentTabsAfterReconnect,
 	refreshRecentTabsLoadedWindow,
 } = await import("./useRecentTabs");
 const { api } = await import("../lib/api");
 const { queryClient: globalQC } = await import("../lib/query-client");
+
+describe("recent tabs reconnect recovery", () => {
+	test("refetches an errored section with no data and clears the error", async () => {
+		const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		const queryKey = recentTabsSectionQueryKey("work");
+		let online = false;
+		const data: RecentTabsInfiniteData = { pages: [], pageParams: [] };
+		const queryFn = mock(async () => {
+			if (!online) throw Error("offline");
+			return data;
+		});
+		try {
+			await expect(qc.fetchQuery({ queryKey, queryFn })).rejects.toThrow("offline");
+			expect(qc.getQueryData(queryKey)).toBeUndefined();
+			expect(qc.getQueryState(queryKey)?.status).toBe("error");
+			online = true;
+			await refreshRecentTabsAfterReconnect(qc);
+			expect(queryFn).toHaveBeenCalledTimes(2);
+			expect(qc.getQueryState(queryKey)?.status).toBe("success");
+			expect(qc.getQueryState(queryKey)?.error).toBeNull();
+			expect(qc.getQueryData(queryKey)).toEqual(data);
+		} finally {
+			qc.clear();
+		}
+	});
+
+	test("does nothing when no sections have been queried", async () => {
+		const qc = new QueryClient();
+		await refreshRecentTabsAfterReconnect(qc);
+		expect(qc.getQueryCache().getAll()).toHaveLength(0);
+		qc.clear();
+	});
+
+	test("propagates failed refetches to the reconnect error notification", async () => {
+		const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		const queryFn = mock(async () => {
+			throw Error("still offline");
+		});
+		try {
+			await expect(
+				qc.fetchQuery({ queryKey: recentTabsSectionQueryKey("projects"), queryFn }),
+			).rejects.toThrow("still offline");
+			await expect(refreshRecentTabsAfterReconnect(qc)).rejects.toThrow("still offline");
+			expect(queryFn).toHaveBeenCalledTimes(2);
+		} finally {
+			qc.clear();
+		}
+	});
+});
 
 describe("isRecentTabBackgroundActive", () => {
 	const tab = (activeBackgroundTaskCount?: number): RecentTab =>
@@ -1202,23 +1251,14 @@ describe("recent tabs loaded-window refresh", () => {
 });
 
 describe("recent tabs runtime races", () => {
-	test("prunes versions outside the live window but retains in-flight snapshots", () => {
+	test("prunes versions outside the live window", () => {
 		const versions = new Map([
 			["live", new Map([["status", 1]])],
-			["in-flight", new Map([["status", 2]])],
-			["stale", new Map([["status", 3]])],
+			["stale", new Map([["status", 2]])],
 		]);
 
-		pruneRecentTabsRuntimeVersions(versions, new Set(["live"]), [new Set(["in-flight"])]);
-		expect([...versions.keys()]).toEqual(["live", "in-flight"]);
-
-		pruneRecentTabsRuntimeVersions(versions, new Set(["live"]), []);
+		pruneRecentTabsRuntimeVersions(versions, new Set(["live"]));
 		expect([...versions.keys()]).toEqual(["live"]);
-	});
-
-	test("rejects an older runtime request generation", () => {
-		expect(shouldApplyRecentTabsRuntimeResponse(4, 5)).toBeFalse();
-		expect(shouldApplyRecentTabsRuntimeResponse(5, 5)).toBeTrue();
 	});
 
 	test("bumps only the fields a WS event actually delivered", () => {

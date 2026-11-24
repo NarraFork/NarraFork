@@ -19,7 +19,7 @@ import {
 import { AnthropicProvider } from "../../lib/agent/anthropic-provider";
 import { OpenAIProvider } from "../../lib/agent/openai-provider";
 import { parseRuntimePolicyTraits } from "../../lib/runtime-policy-trait";
-import { compileDelegationPolicy } from "../agent-runtime/policy";
+import { compileDelegationPolicy, withDelegationDepth } from "../agent-runtime/policy";
 import { narratorService } from "../narrator-service";
 import { importInterchangeSession } from "./import";
 
@@ -343,7 +343,7 @@ describe("importInterchangeSession", () => {
 		// The row itself carries the compiled template ceiling and its relationships, like a
 		// live delegation — nothing relies on the legacy compile-on-read fallback.
 		expect(parseRuntimePolicyTraits(sub?.traits)).toEqual([
-			compileDelegationPolicy({ template: "explore" }),
+			withDelegationDepth(compileDelegationPolicy({ template: "explore" }), 1),
 		]);
 		expect(sub?.policySourceNarratorId).toBe(result.narratorId);
 		expect(sub?.runtimeRegistrationJson).toMatchObject({

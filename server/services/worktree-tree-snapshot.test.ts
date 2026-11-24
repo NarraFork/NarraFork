@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
 	chmodSync,
@@ -17,6 +17,7 @@ import {
 import * as fsPromises from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import * as fileHistoryPolicy from "@shared/file-change-protocol";
 import { eq } from "drizzle-orm";
 import iconv from "iconv-lite";
 import { seedSqliteTestDatabase } from "../../tests/sqlite-template";
@@ -24,11 +25,14 @@ import { db } from "../db";
 import { worktreeTreeSnapshots } from "../db/schema";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { AsyncMutex } from "../lib/async-mutex";
+import { diskSpaceMonitor } from "../lib/disk-safety";
 import { generateId } from "../lib/id";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { normalizePathForComparison } from "../lib/platform-path";
+import { settings } from "../lib/settings";
 import * as spawn from "../lib/spawn";
 import { safeSpawn } from "../lib/spawn";
+import { SnapshotCaptureReceiptService } from "./snapshot-capture-receipts";
 import {
 	legacyTreeSnapshotKey,
 	legacyTreeSnapshotPhysicalDir,
@@ -47,6 +51,15 @@ import {
 	TreeSnapshotError,
 	worktreeTreeSnapshot,
 } from "./worktree-tree-snapshot";
+
+// Keep the capture engine's low-level invariants testable independently of the
+// production local-history policy; the real disabled entry is tested below.
+let restorePolicy = () => {};
+beforeEach(() => {
+	const policy = spyOn(fileHistoryPolicy, "isFileHistoryEnabledForDevice").mockReturnValue(true);
+	restorePolicy = () => policy.mockRestore();
+});
+afterEach(() => restorePolicy());
 
 const tempDirs: string[] = [];
 const snapshotPaths: string[] = [];
@@ -277,6 +290,9 @@ describe("worktree tree snapshots", () => {
 							`
 							if (process.env.NARRAFORK_TEST !== "1" || !process.env.NARRAFORK_HOME)
 								throw new Error("isolated test home required");
+							const { spyOn } = await import("bun:test");
+							const policy = await import(${JSON.stringify(join(import.meta.dir, "../../shared/file-change-protocol.ts"))});
+							spyOn(policy, "isFileHistoryEnabledForDevice").mockReturnValue(true);
 							const { worktreeTreeSnapshot } = await import(${JSON.stringify(join(import.meta.dir, "worktree-tree-snapshot.ts"))});
 							const tree = await worktreeTreeSnapshot.capture(${JSON.stringify(repo)});
 							console.log("RECOVERED:" + tree);
@@ -1961,6 +1977,43 @@ describe("hot-path capture budget", () => {
 		expect(warmed).toMatch(/^[0-9a-f]{40}$/);
 	});
 
+	test("a direct capture cancels the warm-up's tracked-ignored listing", async () => {
+		resetHotPathCaptureStateForTests();
+		const repo = await createRepo("nf-tree-hot-preempt-listing-");
+		writeFileSync(join(repo, ".gitignore"), "tracked.txt\n");
+		writeFileSync(join(repo, "tracked.txt"), "keep this\n");
+		const added = await safeSpawn({ cmd: ["git", "add", "-f", "tracked.txt"], cwd: repo });
+		expect(added.exitCode).toBe(0);
+
+		const started = Promise.withResolvers<AbortSignal | undefined>();
+		const exited = Promise.withResolvers<void>();
+		const realSpawn = spawn.safeSpawn;
+		let listed = false;
+		const dispatch = spyOn(spawn, "safeSpawn").mockImplementation(async (opts) => {
+			if (!listed && opts.cwd === repo && opts.cmd[1] === "ls-files" && opts.cmd.includes("-i")) {
+				listed = true;
+				started.resolve(opts.signal);
+				await exited.promise;
+				opts.signal?.throwIfAborted();
+			}
+			return realSpawn(opts);
+		});
+		let direct: Promise<string> | undefined;
+		try {
+			await promoteToWarmup(repo);
+			const signal = await started.promise;
+			direct = worktreeTreeSnapshot.capture(repo);
+			expect(signal?.aborted).toBe(true);
+			exited.resolve();
+			expect(await treePaths(repo, await direct)).toContain("tracked.txt");
+		} finally {
+			exited.resolve();
+			await direct?.catch(() => {});
+			dispatch.mockRestore();
+			resetHotPathCaptureStateForTests();
+		}
+	});
+
 	test("gcAll preempts an in-flight warm-up instead of queueing behind it", async () => {
 		resetHotPathCaptureStateForTests();
 		const repo = await createRepo("nf-tree-hot-gc-");
@@ -2117,6 +2170,73 @@ describe("gcAll maintenance", () => {
 			expect(existsSync(join(empty, "HEAD"))).toBe(false);
 		} finally {
 			rmSync(empty, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("local capture policy", () => {
+	beforeEach(() => restorePolicy());
+	for (const deviceId of [undefined, LOCAL_DEVICE_ID, ""]) {
+		test(`direct capture for ${String(deviceId)} creates no repo, worker, receipt or warmup`, async () => {
+			const cwd = mkdtempSync(join(tmpdir(), "nf-tree-direct-disabled-"));
+			const previousSetting = settings.workspace.treeSnapshotsEnabled;
+			settings.workspace.treeSnapshotsEnabled = true;
+			const git = spyOn(spawn, "safeSpawn");
+			const worker = spyOn(globalThis, "Worker");
+			const disk = spyOn(diskSpaceMonitor, "assess");
+			const receipt = spyOn(SnapshotCaptureReceiptService.prototype, "begin");
+			try {
+				for (const signal of [undefined, new AbortController().signal]) {
+					await expect(worktreeTreeSnapshot.capture(cwd, deviceId, { signal })).rejects.toThrow(
+						"Local workspace tree snapshots are disabled.",
+					);
+				}
+				await new Promise<void>((done) => setImmediate(done));
+				expect(git).not.toHaveBeenCalled();
+				expect(worker).not.toHaveBeenCalled();
+				expect(disk).not.toHaveBeenCalled();
+				expect(receipt).not.toHaveBeenCalled();
+				expect(hasHotPathWarmupForTests(cwd)).toBe(false);
+				expect(existsSync(treeSnapshotPhysicalDir(LOCAL_DEVICE_ID, cwd))).toBe(false);
+				expect(
+					await db
+						.select()
+						.from(worktreeTreeSnapshots)
+						.where(eq(worktreeTreeSnapshots.worktreePath, snapshotPathIdentity(cwd))),
+				).toHaveLength(0);
+			} finally {
+				git.mockRestore();
+				worker.mockRestore();
+				disk.mockRestore();
+				receipt.mockRestore();
+				settings.workspace.treeSnapshotsEnabled = previousSetting;
+				rmSync(cwd, { recursive: true, force: true });
+			}
+		});
+	}
+	test("no local call starts a capture, warmup, or Git subprocess", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "nf-tree-hot-disabled-"));
+		const capture = spyOn(worktreeTreeSnapshot, "capture");
+		const git = spyOn(spawn, "safeSpawn");
+		try {
+			for (const budgetMs of [0, 1, 30_000]) {
+				expect(
+					await worktreeTreeSnapshot.tryCaptureHot(cwd, LOCAL_DEVICE_ID, {
+						budgetMs,
+						requireFresh: true,
+						minStartedAt: Date.now(),
+					}),
+				).toBeNull();
+			}
+			await new Promise<void>((done) => setImmediate(done));
+			expect(capture).not.toHaveBeenCalled();
+			expect(git).not.toHaveBeenCalled();
+			expect(hasHotPathWarmupForTests(cwd)).toBe(false);
+			expect(existsSync(treeSnapshotPhysicalDir(LOCAL_DEVICE_ID, cwd))).toBe(false);
+		} finally {
+			capture.mockRestore();
+			git.mockRestore();
+			rmSync(cwd, { recursive: true, force: true });
 		}
 	});
 });

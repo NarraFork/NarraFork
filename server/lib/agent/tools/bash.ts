@@ -1,11 +1,9 @@
 import { backgroundTaskService } from "@server/services/background-task-service";
-import { beginBashCaptureWindow } from "@server/services/narrator-tree-snapshot-hooks";
 import { z } from "zod/v4";
 import { AppError } from "../../errors";
 import { resolveNarratorGitIdentityEnv } from "../../git-identity";
 import { hotSafe } from "../../hot-safe";
 import { generateShortId } from "../../id";
-import { logger } from "../../logger";
 import { getHome } from "../../platform";
 import type { ExecHandle, ExecParams, ExecutionBackend } from "../execution/backend";
 import { withDeviceParam } from "../execution/device-schema";
@@ -100,6 +98,18 @@ export async function detachBashProcess(
 	return entry.detach();
 }
 
+/**
+ * How long a foreground Bash waits for its process to exit after killing it. A
+ * process that survives the kill (uninterruptible I/O, a lost exit event, a remote
+ * device that stopped answering) must not hold the turn forever.
+ */
+let killSettleGraceMs = 15_000;
+
+/** Test hook: shorten the post-kill grace period. */
+export function setBashKillSettleGraceMsForTests(ms: number | undefined): void {
+	killSettleGraceMs = ms ?? 15_000;
+}
+
 const runningBashProcesses = hotSafe(
 	"narrafork:runningBashProcesses",
 	() => new Map<string, RunningBashEntry>(),
@@ -178,13 +188,23 @@ interface BashExecution {
 	cancelUndispatched(): void;
 }
 
+type BashStartContext = Pick<
+	ToolContext,
+	| "narratorId"
+	| "signal"
+	| "executionTarget"
+	| "currentToolUseId"
+	| "toolCallBinding"
+	| "updateExecutionLease"
+>;
+
 /** Admission and lifetime are independent of the legacy attribution mutex and
  * tool/HTTP return. Even an unrecognized/read-only-looking command participates. */
 async function prepareBashExecution(
 	backend: ExecutionBackend,
 	command: string,
 	cwd: string,
-	ctx: ToolContext,
+	ctx: BashStartContext,
 	env?: Record<string, string> | null,
 ): Promise<BashExecution> {
 	const target = ctx.executionTarget;
@@ -199,53 +219,23 @@ async function prepareBashExecution(
 		throw new Error("Bash execution target does not match its frozen backend/cwd");
 	ctx.signal.throwIfAborted();
 	let started = false;
-	let ended = false;
-	let bashWindow: { end(): void } | undefined;
-	const end = () => {
-		if (ended) return;
-		ended = true;
-		try {
-			bashWindow?.end();
-		} catch (error) {
-			logger.warn("Bash snapshot observation failed", { error: String(error) });
-		}
-		bashWindow = undefined;
-	};
 	return {
 		async start(signal, options) {
 			if (started) throw new Error("Bash execution was already dispatched");
 			started = true;
-			let handle: ExecHandle;
-			try {
-				signal.throwIfAborted();
-				if (backend.kind === "local") {
-					try {
-						bashWindow = beginBashCaptureWindow(cwd, ctx.currentToolUseId ?? "__anonymous__");
-					} catch (error) {
-						logger.warn("Bash snapshot observation unavailable", { error: String(error) });
-					}
-				}
-				handle = await backend.execCommand({
-					command,
-					cwd,
-					signal,
-					env: env ?? undefined,
-					...(options?.durableService ? { durableService: options.durableService } : {}),
-				});
-			} catch (error) {
-				// LocalBackend rejects dispatch only before spawning. Asynchronous
-				// spawn/process errors always come with a handle and its real barrier.
-				end();
-				throw error;
-			}
-			void (handle.whenSettled ?? handle.exited).then(
-				() => end(),
-				() => end(),
-			);
-			return handle;
+			signal.throwIfAborted();
+			// Execution admission remains independent of file history. Local Bash,
+			// including background commands, does not open tree-capture windows.
+			return backend.execCommand({
+				command,
+				cwd,
+				signal,
+				env: env ?? undefined,
+				...(options?.durableService ? { durableService: options.durableService } : {}),
+			});
 		},
 		cancelUndispatched() {
-			if (!started) end();
+			// No observation resources are allocated before dispatch.
 		},
 	};
 }
@@ -298,7 +288,7 @@ export const bashTool: ToolDefinition = {
 			},
 			run_in_background: {
 				description:
-					'Set to true to run this command in the background. Returns immediately with a task ID. Use Await({ type: "bash", id }) to check status or get results.',
+					'Set to true to run this command in the background. Returns immediately with a task ID. Completion notifies automatically. Watch({ type: "bash", id }) registers a non-blocking observation or retrieves a saved result.',
 				type: "boolean",
 			},
 			strict_serial: {
@@ -364,7 +354,7 @@ export const bashTool: ToolDefinition = {
 					.boolean()
 					.optional()
 					.describe(
-						'Set to true to run this command in the background. Returns immediately with a task ID. Use Await({ type: "bash", id }) to check status or get results.',
+						'Set to true to run this command in the background. Returns immediately with a task ID. Completion notifies automatically. Watch({ type: "bash", id }) registers a non-blocking observation or retrieves a saved result.',
 					),
 				strict_serial: z
 					.boolean()
@@ -543,8 +533,23 @@ export const bashTool: ToolDefinition = {
 				let timedOut = false;
 				let aborted = false;
 				let exited = false;
+				let abandoned = false;
+				let abandonTimer: ReturnType<typeof setTimeout> | undefined;
+				const abandonWait = Promise.withResolvers<null>();
 
 				const kill = () => handle.kill();
+				// A kill that ends the foreground wait is bounded: stop waiting for an exit
+				// that never comes, so the turn ends with a result instead of hanging.
+				const stopAndBound = () => {
+					if (!abandonTimer && !detached) {
+						abandonTimer = setTimeout(() => {
+							if (exited || detached) return;
+							abandoned = true;
+							abandonWait.resolve(null);
+						}, killSettleGraceMs);
+					}
+					return kill();
+				};
 
 				// Collect stdout + stderr into a single buffer with size limit.
 				// Use StringDecoder to handle multi-byte UTF-8 characters split across chunks.
@@ -616,19 +621,19 @@ export const bashTool: ToolDefinition = {
 				// Abort: if already aborted, kill immediately
 				if (ctx.signal.aborted) {
 					aborted = true;
-					await kill();
+					await stopAndBound();
 				}
 
 				const abortHandler = () => {
 					aborted = true;
-					void kill();
+					void stopAndBound();
 				};
 				ctx.signal.addEventListener("abort", abortHandler, { once: true });
 
 				// Timeout
 				const timer = setTimeout(() => {
 					timedOut = true;
-					void kill();
+					void stopAndBound();
 				}, timeoutMs);
 
 				// Serialize concurrent detach requests. Output stays in this collector
@@ -637,7 +642,7 @@ export const bashTool: ToolDefinition = {
 					if (detachPending) return detachPending;
 					if (exited || handle.isExited() || timedOut || aborted || ctx.signal.aborted)
 						return Promise.reject(new AppError("Bash is no longer running in foreground", 409));
-					detachPending = (async () => {
+					detachPending = backgroundTaskService.runBashStartup(async () => {
 						const { registerTaskAlias, unregisterTaskAlias } = await import(
 							"@server/services/subagent-alias"
 						);
@@ -695,10 +700,11 @@ export const bashTool: ToolDefinition = {
 						backgroundTaskService.registerAbortController(taskId, processAbort);
 						backgroundTaskService.registerKillHandler(taskId, () => void kill());
 						if (output) backgroundTaskService.appendOutput(taskId, output);
+						backgroundTaskService.trackBashCollector(taskId, processAbort, lifecycle);
 						resolveDetached({
 							output:
 								`<background_task_id>${alias}</background_task_id>\n\n` +
-								`Bash moved to background: ${title}\nAwait({ type: "bash", id: "${alias}" })`,
+								`Bash moved to background: ${title}\nWatch({ type: "bash", id: "${alias}" })`,
 							title,
 							metadata: {
 								background_task_id: taskId,
@@ -707,7 +713,7 @@ export const bashTool: ToolDefinition = {
 							},
 						});
 						return detached;
-					})();
+					});
 					void detachPending.catch(() => {
 						detachPending = undefined;
 					});
@@ -723,7 +729,7 @@ export const bashTool: ToolDefinition = {
 						timeoutMs: timeoutMs ?? DEFAULT_TIMEOUT_MS,
 						narratorId: ctx.narratorId,
 						detach,
-						kill: () => void kill(),
+						kill: () => void stopAndBound(),
 						setTimedOut: () => {
 							timedOut = true;
 						},
@@ -762,7 +768,7 @@ export const bashTool: ToolDefinition = {
 					// Kill if process is dead and no recent output (zombie/leaked)
 					if (!pidAlive && !hadOutput && !exited) {
 						watchdogKilled = true;
-						void kill();
+						void stopAndBound();
 						return;
 					}
 
@@ -781,7 +787,7 @@ export const bashTool: ToolDefinition = {
 				// Wait for process to finish
 				let exitCodeValue: number | null = null;
 				try {
-					exitCodeValue = await handle.exited;
+					exitCodeValue = await Promise.race([handle.exited, abandonWait.promise]);
 					await detachPending?.catch(() => undefined);
 				} catch (error) {
 					await detachPending?.catch(() => undefined);
@@ -794,11 +800,14 @@ export const bashTool: ToolDefinition = {
 						await backgroundTaskService.markFailed(
 							detached.taskId,
 							`${output}\nError: ${error instanceof Error ? error.message : String(error)}`,
+							undefined,
+							processAbort,
 						);
 					}
 					throw error;
 				} finally {
 					clearTimeout(timer);
+					clearTimeout(abandonTimer);
 					if (toolUseId) clearTimeout(runningBashProcesses.get(toolUseId)?.timer);
 					clearInterval(watchdogTimer);
 					ctx.signal.removeEventListener("abort", abortHandler);
@@ -837,6 +846,13 @@ export const bashTool: ToolDefinition = {
 				if (watchdogKilled)
 					meta.push("Process was terminated by watchdog (process exited unexpectedly)");
 				if (aborted) meta.push("Command was aborted by user");
+				if (abandoned) {
+					meta.push(
+						`Process did not exit within ${killSettleGraceMs}ms after being killed` +
+							(handle.pid ? ` (pid ${handle.pid})` : "") +
+							"; stopped waiting for it, it may still be running",
+					);
+				}
 				if (!timedOut && !aborted && handle.outputIncomplete?.()) {
 					meta.push(
 						"Output is incomplete: the device reached its output limit or a background " +
@@ -847,16 +863,29 @@ export const bashTool: ToolDefinition = {
 					output += `\n\n<bash_metadata>\n${meta.join("\n")}\n</bash_metadata>`;
 				}
 
-				const exitCode = exitCodeValue ?? (timedOut || aborted || watchdogKilled ? 1 : 0);
+				const exitCode =
+					exitCodeValue ?? (timedOut || aborted || watchdogKilled || abandoned ? 1 : 0);
 				if (exitCode !== 0) output += `\n[exit code: ${exitCode}]`;
 
 				if (detached) {
-					if (timedOut) {
-						await backgroundTaskService.markTimedOut(detached.taskId, output, exitCode);
+					if (processAbort.signal.aborted) {
+						await backgroundTaskService.markCancelled(detached.taskId, processAbort);
+					} else if (timedOut) {
+						await backgroundTaskService.markTimedOut(
+							detached.taskId,
+							output,
+							exitCode,
+							processAbort,
+						);
 					} else if (exitCode === 0) {
-						await backgroundTaskService.markCompleted(detached.taskId, output, exitCode);
+						await backgroundTaskService.markCompleted(
+							detached.taskId,
+							output,
+							exitCode,
+							processAbort,
+						);
 					} else {
-						await backgroundTaskService.markFailed(detached.taskId, output, exitCode);
+						await backgroundTaskService.markFailed(detached.taskId, output, exitCode, processAbort);
 					}
 					// The foreground already received its adoption result. The service
 					// owns output spillage now; do not create a second foreground dump.
@@ -897,6 +926,80 @@ export const bashTool: ToolDefinition = {
 
 import type { ToolContext } from "../types";
 
+/**
+ * A shell that cannot be spawned (EACCES on the cwd, a missing shell) still yields a handle:
+ * the error arrives on the next tick, with no pid. Catch it before telling a caller that
+ * the task started. A handle with a pid is a running process.
+ */
+async function asyncSpawnFailure(handle: ExecHandle): Promise<{ error: unknown } | null> {
+	if (handle.pid !== undefined) return null;
+	return Promise.race([
+		handle.exited.then(
+			() => null,
+			(error: unknown) => ({ error }),
+		),
+		new Promise<null>((resolve) => setTimeout(() => resolve(null), 0)),
+	]);
+}
+
+export async function startManualBackgroundBash(input: {
+	backend: ExecutionBackend;
+	target: NonNullable<ToolContext["executionTarget"]>;
+	narratorId: string;
+	userId: string;
+	command: string;
+	title?: string;
+	timeoutMs?: number;
+	kind: "task" | "service";
+	signal: AbortSignal;
+	proxyEnv: Record<string, string>;
+	updateExecutionLease: NonNullable<ToolContext["updateExecutionLease"]>;
+	authorizeDispatch: () => Promise<void>;
+}): Promise<{ id: string; alias: string }> {
+	const { backend, target, narratorId, command, signal, updateExecutionLease } = input;
+	if (!(await isExistingDirectory(backend, target.cwd))) {
+		throw new AppError(
+			"The narrator working directory is not available",
+			409,
+			"WORKSPACE_DIRECTORY_REQUIRED",
+		);
+	}
+	const env = await resolveNarratorGitIdentityEnv({ turnUserId: input.userId, narratorId });
+	const context = { narratorId, signal, executionTarget: target, updateExecutionLease };
+	const taskId = `bash_${generateShortId()}`;
+	const execution = await prepareBashExecution(backend, command, target.cwd, context, {
+		...env,
+		...input.proxyEnv,
+	});
+	try {
+		const task = await launchBackgroundBash(
+			command,
+			resolveBashTimeoutMs(true, input.timeoutMs),
+			input.title ?? command.trim().slice(0, 80),
+			context,
+			{
+				start: async (taskSignal, options) => {
+					await input.authorizeDispatch();
+					return execution.start(taskSignal, options);
+				},
+			},
+			input.kind,
+			taskId,
+		);
+		// Hold workspace admission through dispatch, not through the process lifetime.
+		const failure = await task.dispatched;
+		if (failure) {
+			// The failed row stays in the task list; the caller still has to hear that
+			// nothing is running rather than receive a task id as if it had started.
+			if (failure.error instanceof AppError) throw failure.error;
+			const reason = failure.error instanceof Error ? failure.error.message : String(failure.error);
+			throw new AppError(`The task did not start: ${reason}`, 422, "TASK_START_FAILED");
+		}
+		return { id: task.id, alias: task.alias };
+	} finally {
+		execution.cancelUndispatched();
+	}
+}
 async function _runInBackground(
 	command: string,
 	timeoutMs: number | undefined,
@@ -905,25 +1008,77 @@ async function _runInBackground(
 	execution: BashExecution,
 	backgroundKind: "task" | "service",
 ): Promise<ToolResult> {
-	const taskId = `bash_${generateShortId()}`;
+	const { alias, conflicted } = await launchBackgroundBash(
+		command,
+		timeoutMs,
+		title,
+		ctx,
+		execution,
+		backgroundKind,
+	);
+	let output =
+		`<background_task_id>${alias}</background_task_id>\n\n` +
+		`Background bash ${backgroundKind} started: ${title}\n` +
+		`Watch({ type: "bash", id: "${alias}" })`;
+	if (conflicted) {
+		output += `\n\nNote: A similar alias was already taken. This task was assigned "${alias}" instead.`;
+	}
+	return { output, title };
+}
+
+async function launchBackgroundBash(
+	command: string,
+	timeoutMs: number | undefined,
+	title: string,
+	ctx: BashStartContext,
+	execution: Pick<BashExecution, "start">,
+	backgroundKind: "task" | "service",
+	taskId = `bash_${generateShortId()}`,
+) {
+	return backgroundTaskService.runBashStartup(() =>
+		startBackgroundBash(command, timeoutMs, title, ctx, execution, backgroundKind, taskId),
+	);
+}
+
+async function startBackgroundBash(
+	command: string,
+	timeoutMs: number | undefined,
+	title: string,
+	ctx: BashStartContext,
+	execution: Pick<BashExecution, "start">,
+	backgroundKind: "task" | "service",
+	taskId = `bash_${generateShortId()}`,
+) {
 	const bgAbort = new AbortController();
+	// Settles once the process has started (`null`) or once starting it failed (the error),
+	// so a caller that waits on dispatch can tell the two apart.
+	const { promise: dispatched, resolve: settleDispatch } = Promise.withResolvers<{
+		error: unknown;
+	} | null>();
+	let dispatchFailure: { error: unknown } | null = null;
 
 	// Register a human-readable alias for this background task
-	const { registerTaskAlias } = await import("@server/services/narrator-subagent");
+	const { registerTaskAlias, unregisterTaskAlias } = await import(
+		"@server/services/subagent-alias"
+	);
 	const { alias, conflicted } = registerTaskAlias(ctx.narratorId, taskId, title);
 
-	// Create the task record in the service (DB-backed)
-	await backgroundTaskService.createBashTask({
-		id: taskId,
-		parentNarratorId: ctx.narratorId,
-		command,
-		backgroundKind,
-		toolUseId: ctx.currentToolUseId ?? undefined,
-		toolCallBinding: ctx.toolCallBinding,
-		executionTarget: ctx.executionTarget,
-		alias,
-		title,
-	});
+	try {
+		await backgroundTaskService.createBashTask({
+			id: taskId,
+			parentNarratorId: ctx.narratorId,
+			command,
+			backgroundKind,
+			toolUseId: ctx.currentToolUseId ?? undefined,
+			toolCallBinding: ctx.toolCallBinding,
+			executionTarget: ctx.executionTarget,
+			alias,
+			title,
+		});
+	} catch (error) {
+		unregisterTaskAlias(ctx.narratorId, taskId);
+		throw error;
+	}
 	backgroundTaskService.registerAbortController(taskId, bgAbort);
 
 	// The executor owns the lease until the durable task record exists. Transfer it only
@@ -939,19 +1094,26 @@ async function _runInBackground(
 		ctx.updateExecutionLease?.release();
 	};
 
-	// Fire-and-forget: spawn the process and collect output asynchronously
-	(async () => {
+	// Register before dispatch; ownership continues through output, persistence and lease release.
+	const lifecycle = Promise.resolve().then(async () => {
+		let monitoringStarted = false;
 		try {
 			// Frozen backend/cwd/env and activity were captured before task creation.
 			// Do not resolve a second backend after the tool/HTTP request has returned.
 			ctx.signal.throwIfAborted();
+			bgAbort.signal.throwIfAborted();
 			// A service may outlive this server process (planned restart). Where the backend
 			// supports it, it writes to a log file and leaves a manifest so a restarted server
 			// can re-attach instead of reporting it failed.
-			const handle = await execution.start(
-				bgAbort.signal,
-				backgroundKind === "service" ? { durableService: { taskId, timeoutMs } } : undefined,
+			const handle = await backgroundTaskService.runBashStartup(() =>
+				execution.start(
+					bgAbort.signal,
+					backgroundKind === "service" ? { durableService: { taskId, timeoutMs } } : undefined,
+				),
 			);
+			monitoringStarted = true;
+			// Settled beside monitoring, not before it: output must not wait for the check.
+			void asyncSpawnFailure(handle).then(settleDispatch);
 			await monitorBackgroundBash({
 				taskId,
 				handle,
@@ -966,6 +1128,9 @@ async function _runInBackground(
 				callerSignal: ctx.signal,
 			});
 		} catch (err) {
+			dispatchFailure = { error: err };
+			// The shared monitor owns terminal persistence; do not retry its lifecycle failure.
+			if (monitoringStarted) throw err;
 			const output = backgroundTaskService.getOutputBuffer(taskId) ?? "";
 			const error = `${output}\nError: ${err instanceof Error ? err.message : String(err)}`;
 			if (
@@ -973,30 +1138,21 @@ async function _runInBackground(
 				ctx.signal.aborted ||
 				backgroundTaskService.isCancellationRequested(taskId)
 			) {
-				await backgroundTaskService.markCancelled(taskId);
+				await backgroundTaskService.markCancelled(taskId, bgAbort);
 			} else {
-				await backgroundTaskService.markFailed(taskId, error);
+				await backgroundTaskService.markFailed(taskId, error, undefined, bgAbort);
 			}
 			// Dispatch failed before any process existed; drop a possibly created directory
 			// without holding the lease on filesystem cleanup.
 			if (backgroundKind === "service") void removeServiceArtifacts(taskId);
 		} finally {
+			settleDispatch(dispatchFailure);
 			releaseUpdateLease();
 		}
-	})();
+	});
+	backgroundTaskService.trackBashCollector(taskId, bgAbort, lifecycle, false);
 
-	let output =
-		`<background_task_id>${alias}</background_task_id>\n\n` +
-		`Background bash ${backgroundKind} started: ${title}\n` +
-		`Await({ type: "bash", id: "${alias}" })`;
-
-	if (conflicted) {
-		output +=
-			`\n\nNote: A similar alias was already taken. ` +
-			`This task was assigned "${alias}" instead.`;
-	}
-
-	return { output, title };
+	return { id: taskId, alias, conflicted, dispatched };
 }
 
 export interface MonitorBackgroundBashOptions {
@@ -1019,6 +1175,7 @@ export interface MonitorBackgroundBashOptions {
 export async function monitorBackgroundBash(opts: MonitorBackgroundBashOptions): Promise<void> {
 	const { taskId, handle, bgAbort, backgroundKind, timeoutMs } = opts;
 	let timedOut = false;
+	let terminalStarted = false;
 	try {
 		let outputBytes = 0;
 		let outputTruncated = false;
@@ -1095,6 +1252,7 @@ export async function monitorBackgroundBash(opts: MonitorBackgroundBashOptions):
 					}, WATCHDOG_INTERVAL_MS);
 
 		opts.onMonitoring?.();
+		backgroundTaskService.markBashCollectorStarted(taskId);
 
 		let resolvedExitCode: number | null;
 		try {
@@ -1127,36 +1285,65 @@ export async function monitorBackgroundBash(opts: MonitorBackgroundBashOptions):
 		const output = backgroundTaskService.getOutputBuffer(taskId) ?? "";
 		const finalOutput = exitCode !== 0 ? `${output}\n[exit code: ${exitCode}]` : output;
 
+		terminalStarted = true;
+		let terminalCommitted: boolean;
 		if (bgAbort.signal.aborted || backgroundTaskService.isCancellationRequested(taskId)) {
-			await backgroundTaskService.markCancelled(taskId);
+			terminalCommitted = await backgroundTaskService.markCancelled(taskId, bgAbort);
 		} else if (timedOut) {
-			await backgroundTaskService.markTimedOut(taskId, finalOutput, exitCode);
+			terminalCommitted = await backgroundTaskService.markTimedOut(
+				taskId,
+				finalOutput,
+				exitCode,
+				bgAbort,
+			);
 		} else if (backgroundKind === "service") {
-			await backgroundTaskService.markFailed(
+			terminalCommitted = await backgroundTaskService.markFailed(
 				taskId,
 				`${finalOutput}\nBackground service exited unexpectedly (exit code: ${exitCode}).`,
 				exitCode,
+				bgAbort,
 			);
 		} else if (exitCode === 0) {
-			await backgroundTaskService.markCompleted(taskId, finalOutput, exitCode);
+			terminalCommitted = await backgroundTaskService.markCompleted(
+				taskId,
+				finalOutput,
+				exitCode,
+				bgAbort,
+			);
 		} else {
-			await backgroundTaskService.markFailed(taskId, finalOutput, exitCode);
+			terminalCommitted = await backgroundTaskService.markFailed(
+				taskId,
+				finalOutput,
+				exitCode,
+				bgAbort,
+			);
 		}
-		if (handle instanceof DurableServiceHandle) await removeServiceArtifacts(taskId);
+		// Preserved collectors leave their task and manifest for the next server to recover.
+		if (terminalCommitted && handle instanceof DurableServiceHandle)
+			await removeServiceArtifacts(taskId);
 	} catch (err) {
+		// Persistence failure is a lifecycle failure, not a second terminal outcome to retry.
+		if (terminalStarted) throw err;
 		const output = backgroundTaskService.getOutputBuffer(taskId) ?? "";
 		const error = `${output}\nError: ${err instanceof Error ? err.message : String(err)}`;
+		let terminalCommitted: boolean;
 		if (
 			bgAbort.signal.aborted ||
 			opts.callerSignal?.aborted ||
 			backgroundTaskService.isCancellationRequested(taskId)
 		) {
-			await backgroundTaskService.markCancelled(taskId);
+			terminalCommitted = await backgroundTaskService.markCancelled(taskId, bgAbort);
 		} else if (timedOut) {
-			await backgroundTaskService.markTimedOut(taskId, error);
+			terminalCommitted = await backgroundTaskService.markTimedOut(
+				taskId,
+				error,
+				undefined,
+				bgAbort,
+			);
 		} else {
-			await backgroundTaskService.markFailed(taskId, error);
+			terminalCommitted = await backgroundTaskService.markFailed(taskId, error, undefined, bgAbort);
 		}
-		if (handle instanceof DurableServiceHandle) await removeServiceArtifacts(taskId);
+		if (terminalCommitted && handle instanceof DurableServiceHandle)
+			await removeServiceArtifacts(taskId);
 	}
 }

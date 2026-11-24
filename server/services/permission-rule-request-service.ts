@@ -166,7 +166,7 @@ async function liveRevision(
 		backend: context.backend,
 		target: { ...context.target },
 	});
-	const policy = await executionPolicyRepository.load(identity.narratorId);
+	const policy = executionPolicyRepository.loadNow(identity.narratorId);
 	return {
 		narrator,
 		revision: hash({
@@ -546,7 +546,26 @@ export function failPermissionRuleRequest(
 	});
 }
 
+const pendingApplications = new Map<string, Promise<PermissionRuleRequestResult>>();
+
 export async function consumePermissionRuleRequest(
+	identity: PermissionRuleRequestIdentity,
+	raw: unknown,
+	context: ExecutionTargetContext,
+): Promise<PermissionRuleRequestResult> {
+	const key = hash({ identity, raw, target: executionTargetContextKey(context) });
+	const pending = pendingApplications.get(key);
+	if (pending) return pending;
+	const work = applyPermissionRuleRequest(identity, raw, context);
+	pendingApplications.set(key, work);
+	try {
+		return await work;
+	} finally {
+		pendingApplications.delete(key);
+	}
+}
+
+async function applyPermissionRuleRequest(
 	identity: PermissionRuleRequestIdentity,
 	raw: unknown,
 	context: ExecutionTargetContext,

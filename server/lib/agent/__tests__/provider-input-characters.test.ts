@@ -7,7 +7,7 @@ import { CodexProvider } from "../codex-provider";
 import { clearCodexResponsesWebSocketSessions } from "../codex-websocket";
 import { GeminiInteractionsProvider } from "../gemini-interactions-provider";
 import { GeminiProvider } from "../gemini-provider";
-import { countInputCharacters } from "../input-characters";
+import { countInputCharacters, markRuntimeSystemMessage } from "../input-characters";
 import {
 	dedupOpenAIHistoryImages,
 	imageRefForBase64,
@@ -211,24 +211,30 @@ describe("providers report their final logical inputs", () => {
 				/* Mocked upstream failure. */
 			}
 			expect(sent).toBeDefined();
+			if (item.responses) {
+				const body = sent as { input: object[] };
+				const runtime = (item.history[0] as { content: string }).content;
+				expect(body).not.toHaveProperty("instructions");
+				expect(body.input.slice(0, 3)).toEqual(
+					[runtime, "historical-system", "historical-developer"].map((text) => ({
+						role: "developer",
+						content: [{ type: "input_text", text }],
+					})),
+				);
+				markRuntimeSystemMessage(body.input[0]);
+				expect(snapshots[0]?.systemChars).toBe(runtime.length);
+				expect(snapshots[0]?.totalChars).toBe(
+					runtime.length +
+						"historical-systemhistorical-developerhistorycurrent😀".length +
+						(snapshots[0]?.toolsChars ?? 0),
+				);
+			}
 			expect(snapshots).toEqual([
 				await countInputCharacters(sent, undefined, {
 					includeComposition: true,
 					firstMessageIsRuntimeSystem: item.completions,
-					instructionsFixedChars: item.responses
-						? (item.history[0] as { content: string }).content.length
-						: undefined,
 				}),
 			]);
-			if (item.responses) {
-				const body = sent as { instructions: string };
-				const runtime = (item.history[0] as { content: string }).content;
-				expect(body.instructions).toBe(`${runtime}\n\nhistorical-system\n\nhistorical-developer`);
-				expect(snapshots[0]?.systemChars).toBe(runtime.length);
-				expect(snapshots[0]?.totalChars).toBe(
-					body.instructions.length + "historycurrent😀".length + (snapshots[0]?.toolsChars ?? 0),
-				);
-			}
 			if (item.completions) {
 				const body = sent as { messages: Array<{ role: string; content: string }> };
 				expect(body.messages[0].role).toBe("system");
@@ -666,8 +672,15 @@ describe("providers report their final logical inputs", () => {
 				history.push({ role: "user", content: "first" });
 				await drive(provider, { ...chat, content: "second" });
 				expect(frames).toHaveLength(2);
+				expect(frames[0]).not.toHaveProperty("instructions");
+				expect((frames[0].input as unknown[])[0]).toEqual({
+					role: "developer",
+					content: [{ type: "input_text", text: (history[0] as { content: string }).content }],
+				});
 				expect(frames[1].previous_response_id).toBe("response-1");
-				expect(frames[1].input).toHaveLength(1);
+				expect(frames[1].input).toEqual([
+					{ role: "user", content: [{ type: "input_text", text: "second" }] },
+				]);
 				expect(snapshots).toHaveLength(2);
 				expect(snapshots[0]).not.toBeNull();
 				expect(snapshots[1]?.totalChars).toBe((snapshots[0]?.totalChars ?? 0) + "second".length);

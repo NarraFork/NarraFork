@@ -242,10 +242,10 @@ export class PooledProvider implements ProviderAdapter {
 			try {
 				const result = await run(this.adapterFor(key));
 				clearKeyCooldown(key.id);
-				if (typeof result === "object" && result !== null && !("credentialId" in result)) {
-					return { ...result, credentialId: key.id };
-				}
-				return result;
+				// The key is the credential; an inner adapter's own id is the connection's.
+				return typeof result === "object" && result !== null
+					? { ...result, credentialId: key.id }
+					: result;
 			} catch (err) {
 				const more =
 					reportKeyFault(key, err) && !!selectProviderKey(this.providerId, undefined, tried);
@@ -266,22 +266,57 @@ export class PooledProvider implements ProviderAdapter {
 		this.current().injectSystemPrompt(history, systemPrompt, model, locale);
 	}
 
+	supportsDiagnosticFork(model: string, credentialId?: string): boolean {
+		const key = usableProviderKeys(this.providerId).find((key) => key.id === credentialId);
+		return !!key && this.adapterFor(key).supportsDiagnosticFork?.(model, credentialId) === true;
+	}
+
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
+		if (params.diagnosticFork) {
+			params.diagnosticFork.validateCredential?.();
+			const key = usableProviderKeys(this.providerId).find(
+				(key) => key.id === params.diagnosticFork?.credentialId,
+			);
+			if (!key) throw new Error("The parent diagnostic credential is unavailable");
+			const adapter = this.adapterFor(key);
+			if (!adapter.supportsDiagnosticFork?.(params.model, key.id)) {
+				throw new Error("The parent diagnostic credential cannot safely fork this request");
+			}
+			// Never bind/rebind the parent's affinity, fail over, or report key faults.
+			for await (const event of adapter.chat({
+				...params,
+				onRequestStart: () => params.onRequestStart?.({ credentialId: key.id }),
+			})) {
+				yield { ...event, credentialId: key.id };
+			}
+			return;
+		}
 		const session = params.stickySessionKey ?? params.conversationId;
 		const tried = new Set<string>();
 		for (;;) {
 			const key = selectProviderKey(this.providerId, session, tried);
 			if (!key) throw new Error("This provider has no usable API key");
 			tried.add(key.id);
+			const version = JSON.stringify([key.apiKey, key.network ?? null]);
+			const validateDiagnosticCredential = () => {
+				const live = usableProviderKeys(this.providerId).find(
+					(candidate) => candidate.id === key.id,
+				);
+				return !!live && JSON.stringify([live.apiKey, live.network ?? null]) === version;
+			};
 			let streamed = false;
 			try {
 				for await (const event of this.adapterFor(key).chat({
 					...params,
 					onRequestStart: (info) =>
-						params.onRequestStart?.({ credentialId: info?.credentialId ?? key.id }),
+						params.onRequestStart?.({
+							credentialId: key.id,
+							validateDiagnosticCredential: () =>
+								validateDiagnosticCredential() && info?.validateDiagnosticCredential?.() !== false,
+						}),
 				})) {
 					streamed ||= shouldTreatCodexStreamEventAsYielded(event);
-					yield { ...event, credentialId: event.credentialId ?? key.id };
+					yield { ...event, credentialId: key.id };
 				}
 				clearKeyCooldown(key.id);
 				return;

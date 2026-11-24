@@ -17,3 +17,75 @@
 	min-height: 280px;
 	min-width: 0;
 }
+
+.unitFallback {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	max-height: 180px;
+	overflow: auto;
+	margin-bottom: 8px;
+}
+
+.unitControls {
+	display: flex;
+	align-items: center;
+	gap: 2px;
+	min-height: 28px;
+	padding-inline: 2px;
+	box-sizing: border-box;
+	background: var(--mantine-color-body);
+	border-radius: 3px;
+	white-space: normal;
+}
+
+.unitControls[data-inline] {
+	width: 84px;
+	/* DiffContent supplies the measured code line-height, including typography scaling. */
+	height: 1lh;
+	min-height: 0;
+}
+
+.unitControls[data-inline] .unitSelect,
+.unitControls[data-inline] .unitSelectBody,
+.unitControls[data-inline] .unitSelectInner,
+.unitControls[data-inline] .unitSelectInput {
+	height: 100%;
+}
+
+.unitControls[data-inline] .unitSelectInner {
+	width: min(1lh, 20px);
+}
+
+.unitControls[data-inline] .unitSelectInput {
+	width: 100%;
+}
+
+.unitControls[data-inline] .unitAction {
+	height: 100%;
+	min-height: 0;
+}
+
+.unitControls[data-inline] :focus-visible {
+	outline-offset: -2px;
+}
+
+.previewToolbar {
+	position: sticky;
+	top: 0;
+	z-index: 3;
+	background: var(--mantine-color-body);
+	padding-block: 4px;
+}
+
+@media (hover: hover) and (pointer: fine) {
+	.unitControls[data-inline] {
+		opacity: 0.65;
+	}
+
+	:global([data-diff-row]):hover .unitControls,
+	.unitControls:focus-within,
+	.unitControls[data-selected] {
+		opacity: 1;
+	}
+}

@@ -30,7 +30,8 @@ const context: WorkspaceContext = {
 	git: { workspaceKey: "wk", repositoryKey: "rk", rootPath: "/repo" },
 	capabilities: { switchDirectory: true },
 };
-let activeContext: WorkspaceContext = context;
+let activeContext: WorkspaceContext | undefined = context;
+let transitioning = false;
 let activeUser: { id: string } | undefined = { id: "u1" };
 const storage = new Map<string, string>();
 let quotaFailure = false;
@@ -76,7 +77,7 @@ const reconcile = mock(
 		created((input as WorktreeCreateRequest).destinationPath),
 );
 mock.module("@frontend/hooks/useWorkspaceContext", () => ({
-	useWorkspaceContext: () => ({ data: activeContext }),
+	useWorkspaceContext: () => ({ data: activeContext, transitioning }),
 	useSwitchWorkspaceContext: () => ({ mutateAsync: switched, isPending: false }),
 	workspaceContextKey: (id: string) => ["workspaceContext", id],
 }));
@@ -329,6 +330,7 @@ async function submit() {
 }
 beforeEach(async () => {
 	activeContext = context;
+	transitioning = false;
 	listEntries = [];
 	extraPages = [];
 	nextPageError = null;
@@ -558,6 +560,41 @@ test("a successful switch retains the requirement as a composer prompt exactly o
 	await submit();
 	expect(retained).toHaveBeenCalledTimes(1);
 	expect(retained.mock.calls[0]?.[0]).toBe("fix login");
+});
+test("a context transition preserves the creating owner until receipt cleanup and prompt delivery", async () => {
+	const retained = mock((_text: string) => {});
+	const render = () =>
+		root.render(<NarratorWorktreeControls narratorId="n" onRequirement={retained} />);
+	let finishSwitch!: () => void;
+	switched.mockImplementationOnce(
+		() =>
+			new Promise((resolve) => {
+				finishSwitch = () => resolve({ current: context, previous: context, changed: true });
+			}),
+	);
+	await act(async () => render());
+	await openForm();
+	await input("worktree.requirement", "fix login after switching");
+	await submit();
+	expect(switched).toHaveBeenCalledTimes(1);
+	expect(JSON.parse([...storage.values()][0] ?? "[]")).toHaveLength(1);
+	await act(async () => {
+		activeContext = undefined;
+		transitioning = true;
+		render();
+		await flush();
+	});
+	await act(async () => {
+		activeContext = { ...context, cwd: "/wt/named", revision: 3, contextKey: "new" };
+		transitioning = false;
+		render();
+		await flush();
+		finishSwitch();
+		await flush();
+	});
+	expect(JSON.parse([...storage.values()][0] ?? "[]")).toEqual([]);
+	expect(retained.mock.calls).toEqual([["fix login after switching"]]);
+	expect(container.querySelector("[data-modal]")).toBeNull();
 });
 test("return to original directory freezes the original device and sends the latest revision", async () => {
 	activeContext = { ...context, cwd: "/wt/named", revision: 3, contextKey: "new" };

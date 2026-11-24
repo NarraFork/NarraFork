@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
@@ -285,24 +285,53 @@ describe("source-bound helper runtime", () => {
 	});
 	test("timeout and parent cancellation abort hanging bodies, leaving no own temps", async () => {
 		let canceled = false;
+		let bodyStarted = Promise.withResolvers<void>();
 		const fetcher = async (url: string) =>
 			url.endsWith(".json")
 				? Response.json(manifest())
 				: new Response(
-						new ReadableStream({
-							pull() {},
-							cancel() {
-								canceled = true;
+						new ReadableStream(
+							{
+								pull() {
+									bodyStarted.resolve();
+								},
+								cancel() {
+									canceled = true;
+								},
 							},
-						}),
+							{ highWaterMark: 0 },
+						),
 					);
-		expect(await downloadHelperBinary(spec(), { fetcher, timeoutMs: 20 })).toBeNull();
-		expect(canceled).toBe(true);
+		const deadlines: Array<() => void> = [];
+		const nativeSetTimeout = globalThis.setTimeout;
+		const timerSpy = spyOn(globalThis, "setTimeout").mockImplementation(((
+			...args: Parameters<typeof setTimeout>
+		) => {
+			const [callback, delay, ...callbackArgs] = args;
+			const timer = nativeSetTimeout(callback, delay, ...callbackArgs);
+			if (delay === 20 && typeof callback === "function") {
+				clearTimeout(timer);
+				deadlines.push(() => callback(...callbackArgs));
+			}
+			return timer;
+		}) as typeof setTimeout);
+		try {
+			const pending = downloadHelperBinary(spec(), { fetcher, timeoutMs: 20 });
+			await bodyStarted.promise;
+			expect(deadlines.length).toBeGreaterThan(0);
+			for (const expire of deadlines) expire();
+			expect(await pending).toBeNull();
+			expect(canceled).toBe(true);
+		} finally {
+			timerSpy.mockRestore();
+		}
 		resetHelperBinaryDownloadCache();
 		canceled = false;
+		bodyStarted = Promise.withResolvers<void>();
 		const controller = new AbortController();
 		const pending = downloadHelperBinary(spec(), { fetcher, signal: controller.signal });
-		setTimeout(() => controller.abort(new Error("parent cancel")), 20);
+		await bodyStarted.promise;
+		controller.abort(new Error("parent cancel"));
 		await expect(pending).rejects.toThrow("parent cancel");
 		expect(canceled).toBe(true);
 		expect(readdirSync(DISTRIBUTION_CACHE_DIR).some((name) => name.endsWith(".tmp"))).toBe(false);

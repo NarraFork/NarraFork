@@ -1,11 +1,20 @@
 /** Real Hono routes and isolated DB/filesystem: no mocks of rollback strategies. */
-import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import {
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	symlinkSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { db } from "@server/db";
 import {
 	fileChangeOperations,
+	narratorBlacklistDirs,
 	narratorFileSnapshots,
 	narratorMessageRefs,
 	narratorMessages,
@@ -13,13 +22,18 @@ import {
 	narratorToolCalls,
 	users,
 } from "@server/db/schema";
+import { localBackend } from "@server/lib/agent/execution/local-backend";
 import { AppError } from "@server/lib/errors";
 import { generateId } from "@server/lib/id";
+import { settings } from "@server/lib/settings";
 import { safeSpawn } from "@server/lib/spawn";
 import { narratorRoutes } from "@server/routes/narrators";
+import { executionPolicyEngine } from "@server/services/execution-policy/engine";
+import * as fileChangeRuntime from "@server/services/file-change-runtime";
+import * as fileStateRebuild from "@server/services/file-state-rebuild";
+import * as scopedRevert from "@server/services/narrator-scoped-revert";
 import { type ActiveNarrator, activeNarrators } from "@server/services/narrator-session-state";
 import { treeSnapshotPhysicalDir } from "@server/services/tree-snapshot-paths";
-import { worktreeTreeSnapshot } from "@server/services/worktree-tree-snapshot";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { ZodError } from "zod";
@@ -98,9 +112,10 @@ async function fixture(
 	});
 	await db.insert(narratorMessageRefs).values({ id: generateId(), narratorId, messageId, seq: 1 });
 	writeFileSync(file, "baseline\n");
-	const before = capture ? await worktreeTreeSnapshot.capture(repo) : null;
+	// Model existing legacy tree metadata without invoking the disabled capture service.
+	const before = capture ? "a".repeat(40) : null;
 	writeFileSync(file, "AI\n");
-	const after = capture ? await worktreeTreeSnapshot.capture(repo) : null;
+	const after = capture ? "b".repeat(40) : null;
 	const toolCallId = generateId();
 	const operationId = recordOperation ? generateId() : null;
 	if (operationId) {
@@ -147,7 +162,7 @@ async function fixture(
 		createdAt: now,
 	});
 	writeFileSync(file, "USER SAVED AFTERWARDS\n");
-	return { narratorId, messageId, previewMessageId, file, repo };
+	return { narratorId, messageId, previewMessageId, toolUseId, file, repo };
 }
 
 function request(id: string, endpoint: string, body: unknown = {}) {
@@ -160,18 +175,13 @@ function request(id: string, endpoint: string, body: unknown = {}) {
 
 async function assertUnavailable(response: Response) {
 	expect(response.status).toBe(409);
-	const body = await response.json();
-	if (body.code === "SNAPSHOT_REVERT_FAILED") {
-		expect(body.files[0]).toMatchObject({ status: "not_attempted" });
-		expect(body.historyCommitted).toBe(false);
-	} else {
-		expect(body.code).toBe("REVERT_CONFIRMATION_REQUIRED");
-	}
+	expect(await response.json()).toMatchObject({ code: "FILE_HISTORY_DISABLED" });
 }
 
 afterEach(async () => {
 	for (const id of ids.splice(0)) {
 		activeNarrators.delete(id);
+		executionPolicyEngine.invalidate(id);
 		await db.delete(narratorToolCalls).where(eq(narratorToolCalls.narratorId, id));
 		await db.delete(fileChangeOperations).where(eq(fileChangeOperations.narratorId, id));
 		await db.delete(narratorMessageRefs).where(eq(narratorMessageRefs.narratorId, id));
@@ -201,7 +211,7 @@ describe("M0 rollback route safety", () => {
 	test.each([
 		true,
 		false,
-	])("explicit workspace scope rejects historical evidence (tree exists=%s)", async (capture) => {
+	])("explicit workspace scope rejects historical evidence (legacy tree metadata=%s)", async (capture) => {
 		const f = await fixture(capture);
 		expect(
 			(await request(f.narratorId, "revert", { messageId: "__all__", scope: "workspace" })).status,
@@ -233,16 +243,12 @@ describe("M0 rollback route safety", () => {
 		expect(readFileSync(f.file, "utf8")).toBe("USER SAVED AFTERWARDS\n");
 	});
 
-	test("single-block preview remains available without advertising unsafe legacy rollback", async () => {
+	test("local single-block file preview reports disabled before reading legacy history", async () => {
 		const f = await fixture(true);
 		const response = await app.request(
 			`/api/narrators/${f.narratorId}/blocks/${await blockIdAt(f.messageId, 0)}/delete-preview`,
 		);
-		expect(response.status).toBe(200);
-		expect(await response.json()).toMatchObject({
-			available: false,
-			reason: "incomplete_coverage",
-		});
+		await assertUnavailable(response);
 		expect(readFileSync(f.file, "utf8")).toBe("USER SAVED AFTERWARDS\n");
 	});
 
@@ -255,11 +261,7 @@ describe("M0 rollback route safety", () => {
 		const response = await app.request(
 			`/api/narrators/${f.narratorId}/blocks/${await blockIdAt(f.previewMessageId, 0)}/edit-preview`,
 		);
-		expect(response.status).toBe(200);
-		expect((await response.json()).narratorScope).toMatchObject({
-			available: false,
-			reason: "incomplete_coverage",
-		});
+		await assertUnavailable(response);
 		await assertUnavailable(await request(f.narratorId, "revert", { messageId: f.messageId }));
 		expect(
 			await db.query.narratorToolCalls.findFirst({
@@ -281,11 +283,7 @@ describe("M0 rollback route safety", () => {
 		const response = await app.request(
 			`/api/narrators/${f.narratorId}/blocks/${await blockIdAt(f.previewMessageId, 0)}/edit-preview`,
 		);
-		expect(response.status).toBe(200);
-		expect((await response.json()).narratorScope).toMatchObject({
-			available: false,
-			reason: "incomplete_coverage",
-		});
+		await assertUnavailable(response);
 		await assertUnavailable(await request(f.narratorId, "revert", { messageId: f.messageId }));
 		expect(readFileSync(f.file, "utf8")).toBe("USER SAVED AFTERWARDS\n");
 	});
@@ -295,17 +293,11 @@ describe("M0 rollback route safety", () => {
 		const response = await app.request(
 			`/api/narrators/${f.narratorId}/blocks/${await blockIdAt(f.previewMessageId, 0)}/edit-preview`,
 		);
-		expect(response.status).toBe(200);
-		expect((await response.json()).narratorScope).toMatchObject({
-			available: false,
-			reason: "incomplete_coverage",
-			files: [],
-		});
+		await assertUnavailable(response);
 		const refusal = await request(f.narratorId, "revert", { messageId: f.messageId });
 		expect(refusal.status).toBe(409);
 		const body = await refusal.json();
-		expect(body.code).toBe("REVERT_CONFIRMATION_REQUIRED");
-		expect(body.error).toContain("plan ID and hash");
+		expect(body.code).toBe("FILE_HISTORY_DISABLED");
 		expect(readFileSync(f.file, "utf8")).toBe("USER SAVED AFTERWARDS\n");
 		expect(
 			await db.query.narratorMessageRefs.findFirst({
@@ -320,14 +312,471 @@ describe("M0 rollback route safety", () => {
 		const response = await app.request(
 			`/api/narrators/${f.narratorId}/blocks/${await blockIdAt(f.previewMessageId, 0)}/edit-preview`,
 		);
-		expect(response.status).toBe(200);
-		const preview = await response.json();
-		expect(preview.scope).toBe("narrator");
-		expect(preview.narratorScope).toMatchObject({
-			available: false,
-			reason: "incomplete_coverage",
+		await assertUnavailable(response);
+		expect(readFileSync(f.file, "utf8")).toBe("USER SAVED AFTERWARDS\n");
+	});
+});
+
+describe("permission previews use the actual execution device", () => {
+	async function freezeLocalTarget(
+		f: Awaited<ReturnType<typeof fixture>>,
+		lexicalPath = f.file,
+		canonicalPath = f.file,
+	) {
+		await db
+			.update(narratorToolCalls)
+			.set({
+				executionDeviceId: "local",
+				executionCwd: f.repo,
+				executionPathFlavor: "posix",
+				resolvedFilePath: lexicalPath,
+				canonicalFilePath: canonicalPath,
+				runtimeGeneration: 0,
+				deviceSelectionSource: "explicit",
+				inputJson: { file_path: lexicalPath, content: "AI\n" },
+			})
+			.where(eq(narratorToolCalls.messageId, f.messageId));
+	}
+
+	test("a secret lexical symlink cannot borrow its ordinary canonical target's Read permission", async () => {
+		const f = await fixture(false, "pending");
+		mkdirSync(join(f.repo, ".ssh"));
+		const lexical = join(f.repo, ".ssh", "id_rsa");
+		symlinkSync(f.file, lexical);
+		await freezeLocalTarget(f, lexical);
+		const read = spyOn(localBackend, "readFileBytes");
+		try {
+			const response = await app.request(
+				`/api/narrators/${f.narratorId}/permission-file-preview?toolUseId=${f.toolUseId}`,
+			);
+			expect(response.status).toBe(409);
+			const body = await response.json();
+			expect(body).toMatchObject({ code: "PERMISSION_FILE_PREVIEW_UNAVAILABLE" });
+			expect(body.currentContent).toBeUndefined();
+			expect(read).not.toHaveBeenCalled();
+		} finally {
+			read.mockRestore();
+		}
+	});
+
+	test("a cwd changed before preview cannot replace the frozen execution cwd", async () => {
+		const f = await fixture(false, "pending");
+		await freezeLocalTarget(f);
+		const next = join(f.repo, "new-cwd");
+		mkdirSync(next);
+		await db
+			.update(narrators)
+			.set({ cwd: next, permissionMode: "bypassPermissions" })
+			.where(eq(narrators.id, f.narratorId));
+		const previousWritable = settings.paths.extraWritableDirs;
+		settings.paths.extraWritableDirs = [...(previousWritable ?? []), f.repo];
+		const read = spyOn(localBackend, "readFileBytes");
+		try {
+			const response = await app.request(
+				`/api/narrators/${f.narratorId}/permission-file-preview?toolUseId=${f.toolUseId}`,
+			);
+			expect(response.status).toBe(409);
+			expect(await response.json()).toMatchObject({ code: "PERMISSION_FILE_PREVIEW_UNAVAILABLE" });
+			expect(read).not.toHaveBeenCalled();
+		} finally {
+			read.mockRestore();
+			settings.paths.extraWritableDirs = previousWritable;
+		}
+	});
+
+	test("a lexical symlink redirected after an authorized read cannot publish content", async () => {
+		const f = await fixture(false, "pending");
+		const lexical = join(f.repo, "file-link.txt");
+		const redirected = join(f.repo, "redirected.txt");
+		writeFileSync(redirected, "REDIRECTED PRIVATE BYTES\n");
+		symlinkSync(f.file, lexical);
+		await freezeLocalTarget(f, lexical);
+		const original = localBackend.readFileBytes.bind(localBackend);
+		const read = spyOn(localBackend, "readFileBytes").mockImplementation(async (...args) => {
+			const result = await original(...args);
+			unlinkSync(lexical);
+			symlinkSync(redirected, lexical);
+			return result;
 		});
-		expect(preview.workspaceScope).toMatchObject({ available: false, reason: "legacy_unverified" });
+		try {
+			const response = await app.request(
+				`/api/narrators/${f.narratorId}/permission-file-preview?toolUseId=${f.toolUseId}`,
+			);
+			expect(response.status).toBe(409);
+			const body = await response.json();
+			expect(body).toMatchObject({ code: "PERMISSION_FILE_PREVIEW_UNAVAILABLE" });
+			expect(body.currentContent).toBeUndefined();
+			expect(JSON.stringify(body)).not.toContain("PRIVATE BYTES");
+			expect(JSON.stringify(body)).not.toContain("USER SAVED AFTERWARDS");
+			expect(read).toHaveBeenCalledTimes(1);
+			expect(read.mock.calls[0]?.[0]).toBe(lexical);
+		} finally {
+			read.mockRestore();
+		}
+	});
+
+	test("a legacy local call without frozen execution identity cannot preview bytes", async () => {
+		const f = await fixture(false, "pending");
+		const read = spyOn(localBackend, "readFileBytes");
+		try {
+			const response = await app.request(
+				`/api/narrators/${f.narratorId}/permission-file-preview?toolUseId=${f.toolUseId}`,
+			);
+			expect(response.status).toBe(409);
+			expect(await response.json()).toMatchObject({ code: "PERMISSION_FILE_PREVIEW_UNAVAILABLE" });
+			expect(read).not.toHaveBeenCalled();
+		} finally {
+			read.mockRestore();
+		}
+	});
+
+	test.each([
+		"deny",
+		"ask",
+		"secret",
+	] as const)("%s cannot read or disclose local permission-preview bytes", async (scenario) => {
+		const f = await fixture(false, "pending");
+		const extra = mkdtempSync(join(tmpdir(), "nf-preview-outside-"));
+		dirs.push(extra);
+		const path =
+			scenario === "ask"
+				? join(extra, "private.txt")
+				: scenario === "secret"
+					? join(f.repo, ".ssh", "id_rsa")
+					: f.file;
+		if (scenario === "secret") mkdirSync(join(f.repo, ".ssh"));
+		writeFileSync(path, "DO NOT DISCLOSE THESE PRIVATE BYTES\n");
+		const previousWritable = settings.paths.extraWritableDirs;
+		settings.paths.extraWritableDirs = [...(previousWritable ?? []), extra];
+		await db
+			.update(narratorToolCalls)
+			.set({
+				executionDeviceId: "local",
+				executionCwd: f.repo,
+				executionPathFlavor: "posix",
+				resolvedFilePath: path,
+				canonicalFilePath: path,
+				runtimeGeneration: 0,
+				deviceSelectionSource: "explicit",
+				inputJson: { file_path: path, content: "AI\n" },
+			})
+			.where(eq(narratorToolCalls.messageId, f.messageId));
+		if (scenario === "deny")
+			await db.insert(narratorBlacklistDirs).values({
+				id: generateId(),
+				narratorId: f.narratorId,
+				path: f.repo,
+				denyLevel: "denyAll",
+				enabled: true,
+				targetKind: "host",
+				createdAt: new Date().toISOString(),
+			});
+		executionPolicyEngine.invalidate(f.narratorId);
+		const read = spyOn(localBackend, "readFileBytes");
+		try {
+			const response = await app.request(
+				`/api/narrators/${f.narratorId}/permission-file-preview?toolUseId=${f.toolUseId}`,
+			);
+			expect(response.status).toBe(409);
+			const body = await response.json();
+			expect(body).toMatchObject({ code: "PERMISSION_FILE_PREVIEW_UNAVAILABLE" });
+			expect(body.currentContent).toBeUndefined();
+			expect(body.previewContent).toBeUndefined();
+			expect(JSON.stringify(body)).not.toContain("PRIVATE BYTES");
+			expect(read).not.toHaveBeenCalled();
+		} finally {
+			read.mockRestore();
+			settings.paths.extraWritableDirs = previousWritable;
+		}
+	});
+
+	test("Read permission revoked during IO cannot publish the bytes", async () => {
+		const f = await fixture(false, "pending");
+		await freezeLocalTarget(f);
+		const original = localBackend.readFileBytes.bind(localBackend);
+		const read = spyOn(localBackend, "readFileBytes").mockImplementation(async (...args) => {
+			const result = await original(...args);
+			await db.insert(narratorBlacklistDirs).values({
+				id: generateId(),
+				narratorId: f.narratorId,
+				path: f.repo,
+				denyLevel: "denyAll",
+				enabled: true,
+				targetKind: "host",
+				createdAt: new Date().toISOString(),
+			});
+			executionPolicyEngine.invalidate(f.narratorId);
+			return result;
+		});
+		try {
+			const response = await app.request(
+				`/api/narrators/${f.narratorId}/permission-file-preview?toolUseId=${f.toolUseId}`,
+			);
+			expect(response.status).toBe(409);
+			const body = await response.json();
+			expect(body).toMatchObject({ code: "PERMISSION_FILE_PREVIEW_UNAVAILABLE" });
+			expect(body.currentContent).toBeUndefined();
+			expect(JSON.stringify(body)).not.toContain("USER SAVED AFTERWARDS");
+			expect(read).toHaveBeenCalledTimes(1);
+		} finally {
+			read.mockRestore();
+		}
+	});
+
+	test("local Write previews current bytes while file history is unavailable", async () => {
+		const f = await fixture(false, "pending");
+		await db
+			.update(narrators)
+			.set({ defaultDeviceId: "remote-test" })
+			.where(eq(narrators.id, f.narratorId));
+		await db
+			.update(narratorToolCalls)
+			.set({
+				executionDeviceId: "local",
+				executionCwd: f.repo,
+				executionPathFlavor: "posix",
+				resolvedFilePath: f.file,
+				canonicalFilePath: f.file,
+				deviceSelectionSource: "explicit",
+				runtimeGeneration: 0,
+			})
+			.where(eq(narratorToolCalls.messageId, f.messageId));
+		const history = spyOn(fileStateRebuild, "rebuildDeviceFileState").mockRejectedValue(
+			new Error("history unavailable"),
+		);
+		try {
+			const response = await app.request(
+				`/api/narrators/${f.narratorId}/permission-file-preview?toolUseId=${f.toolUseId}&device=remote-test`,
+			);
+			expect(response.status).toBe(200);
+			expect(await response.json()).toMatchObject({
+				deviceId: "local",
+				currentContent: "USER SAVED AFTERWARDS\n",
+				previewContent: "AI\n",
+			});
+			expect(history).not.toHaveBeenCalled();
+			expect(readFileSync(f.file, "utf8")).toBe("USER SAVED AFTERWARDS\n");
+		} finally {
+			history.mockRestore();
+		}
+	});
+
+	test("oversized current local files report unavailable without falling back to history", async () => {
+		const f = await fixture(false, "pending");
+		await freezeLocalTarget(f);
+		writeFileSync(f.file, "x".repeat(1024 * 1024 + 1));
+		const history = spyOn(fileStateRebuild, "rebuildDeviceFileState").mockRejectedValue(
+			new Error("history unavailable"),
+		);
+		try {
+			const response = await app.request(
+				`/api/narrators/${f.narratorId}/permission-file-preview?toolUseId=${f.toolUseId}`,
+			);
+			expect(response.status).toBe(409);
+			expect(await response.json()).toMatchObject({ code: "PERMISSION_FILE_PREVIEW_UNAVAILABLE" });
+			expect(history).not.toHaveBeenCalled();
+		} finally {
+			history.mockRestore();
+		}
+	});
+
+	test("remote permission preview retains its baseline and does not load local snapshots", async () => {
+		const f = await fixture(false, "pending");
+		await db
+			.update(narratorToolCalls)
+			.set({
+				executionDeviceId: "remote-test",
+				executionCwd: f.repo,
+				executionPathFlavor: "posix",
+				resolvedFilePath: f.file,
+				canonicalFilePath: f.file,
+				deviceSelectionSource: "explicit",
+			})
+			.where(eq(narratorToolCalls.messageId, f.messageId));
+		await db
+			.update(narratorFileSnapshots)
+			.set({ filePath: "C:ambiguous-local-history" })
+			.where(eq(narratorFileSnapshots.narratorId, f.narratorId));
+		await db.insert(narratorFileSnapshots).values({
+			id: generateId(),
+			narratorId: f.narratorId,
+			deviceId: "remote-test",
+			filePath: f.file,
+			originalContent: "remote baseline\n",
+			createdAt: new Date().toISOString(),
+		});
+		const response = await app.request(
+			`/api/narrators/${f.narratorId}/permission-file-preview?toolUseId=${f.toolUseId}`,
+		);
+		expect(response.status).toBe(200);
+		expect(await response.json()).toMatchObject({
+			deviceId: "remote-test",
+			currentContent: "remote baseline\n",
+			previewContent: "AI\n",
+		});
+		expect(readFileSync(f.file, "utf8")).toBe("USER SAVED AFTERWARDS\n");
+	});
+});
+
+describe("local message-only defaults", () => {
+	for (const action of ["range", "rollback", "single", "multi"] as const) {
+		test(`${action} keeps actual files and creates no file checkpoint without consulting a file plan`, async () => {
+			const f = await fixture(false);
+			const failHistory = async (): Promise<never> => {
+				throw new Error("file history is unavailable");
+			};
+			const spies = [
+				spyOn(fileChangeRuntime, "getDefaultLocalFileChangeRuntime").mockImplementation(
+					failHistory,
+				),
+				spyOn(scopedRevert, "revertNarratorScopedForMessages").mockImplementation(failHistory),
+				spyOn(scopedRevert, "revertNarratorScopedForToolUses").mockImplementation(failHistory),
+				spyOn(scopedRevert, "revertNarratorScopedToBlock").mockImplementation(failHistory),
+			];
+			try {
+				const boundary = await blockIdAt(f.previewMessageId, 0);
+				const tool = await blockIdAt(f.messageId, 0);
+				const response =
+					action === "range"
+						? await app.request(`/api/narrators/${f.narratorId}/messages/${f.messageId}`, {
+								method: "DELETE",
+							})
+						: action === "rollback"
+							? await request(f.narratorId, "blocks/rollback", { blockIds: [boundary] })
+							: await app.request(`/api/narrators/${f.narratorId}/blocks`, {
+									method: "DELETE",
+									headers: { "content-type": "application/json" },
+									body: JSON.stringify({
+										blockIds: action === "multi" ? [boundary, tool] : [tool],
+									}),
+								});
+				expect(response.status, await response.text()).toBe(200);
+				expect(readFileSync(f.file, "utf8")).toBe("USER SAVED AFTERWARDS\n");
+				expect(
+					await db.query.narratorMessageRefs.findFirst({
+						where: eq(narratorMessageRefs.messageId, f.messageId),
+					}),
+				).toBeUndefined();
+				expect(
+					(
+						await db.query.narratorToolCalls.findMany({
+							where: eq(narratorToolCalls.narratorId, f.narratorId),
+						})
+					).filter((call) => call.isFileHistoryCheckpoint),
+				).toHaveLength(0);
+				for (const spy of spies) expect(spy).not.toHaveBeenCalled();
+			} finally {
+				for (const spy of spies) spy.mockRestore();
+			}
+		});
+	}
+
+	test.each([
+		"explicit rollback",
+		"legacy edit",
+		"explicit edit",
+		"confirmed rollback",
+		"old prepare",
+		"old apply",
+	] as const)("%s refuses before interrupting or mutating messages and disk", async (action) => {
+		const f = await fixture(false);
+		const controller = new AbortController();
+		activeNarrators.set(f.narratorId, {
+			narratorId: f.narratorId,
+			cwd: f.repo,
+			alive: true,
+			_loopRunning: true,
+			abortController: controller,
+		} as ActiveNarrator);
+		const blockIds = [await blockIdAt(f.previewMessageId, 0)];
+		const plan = { planId: generateId(), planHash: "a".repeat(64), action: "rollback_to_block" };
+		const refsBefore = await db.query.narratorMessageRefs.findMany({
+			where: eq(narratorMessageRefs.narratorId, f.narratorId),
+		});
+		const response =
+			action === "legacy edit" || action === "explicit edit"
+				? await request(f.narratorId, `edit-and-regenerate/${f.previewMessageId}`, {
+						content: "edited",
+						...(action === "legacy edit" ? { rollback: true } : { skipRevert: false }),
+					})
+				: action === "old prepare"
+					? await request(f.narratorId, "revert-plans", {})
+					: action === "old apply"
+						? await request(f.narratorId, `revert-plans/${plan.planId}/apply`, plan)
+						: await request(f.narratorId, "blocks/rollback", {
+								blockIds,
+								...(action === "confirmed rollback" ? { revertPlan: plan } : { skipRevert: false }),
+							});
+		await assertUnavailable(response);
+		expect(controller.signal.aborted).toBe(false);
+		expect(readFileSync(f.file, "utf8")).toBe("USER SAVED AFTERWARDS\n");
+		expect(
+			await db.query.narratorMessageRefs.findMany({
+				where: eq(narratorMessageRefs.narratorId, f.narratorId),
+			}),
+		).toEqual(refsBefore);
+	});
+
+	test("remote default keeps the existing confirmation branch", async () => {
+		const f = await fixture(false);
+		await db
+			.update(narrators)
+			.set({ defaultDeviceId: "remote-test" })
+			.where(eq(narrators.id, f.narratorId));
+		const response = await request(f.narratorId, "blocks/rollback", {
+			blockIds: [await blockIdAt(f.previewMessageId, 0)],
+		});
+		expect(response.status).toBe(409);
+		expect(await response.json()).toMatchObject({ code: "REVERT_CONFIRMATION_REQUIRED" });
+		expect(readFileSync(f.file, "utf8")).toBe("USER SAVED AFTERWARDS\n");
+	});
+
+	test.each([
+		"apply",
+		"rollback",
+		"edit",
+		"skip with plan",
+	] as const)("remote default cannot %s an old local plan before interrupting", async (action) => {
+		const f = await fixture(false);
+		await db
+			.update(narrators)
+			.set({ defaultDeviceId: "remote-test" })
+			.where(eq(narrators.id, f.narratorId));
+		const controller = new AbortController();
+		activeNarrators.set(f.narratorId, {
+			narratorId: f.narratorId,
+			cwd: f.repo,
+			alive: true,
+			_loopRunning: true,
+			abortController: controller,
+		} as ActiveNarrator);
+		const plan = { planId: generateId(), planHash: "a".repeat(64), action: "rollback_to_block" };
+		const refsBefore = await db.query.narratorMessageRefs.findMany({
+			where: eq(narratorMessageRefs.narratorId, f.narratorId),
+		});
+		const response =
+			action === "apply"
+				? await request(f.narratorId, `revert-plans/${plan.planId}/apply`, {
+						planHash: plan.planHash,
+						action: plan.action,
+					})
+				: action === "edit"
+					? await request(f.narratorId, `edit-and-regenerate/${f.previewMessageId}`, {
+							content: "edited",
+							revertPlan: { ...plan, action: "edit_and_regenerate" },
+						})
+					: await request(f.narratorId, "blocks/rollback", {
+							blockIds: [await blockIdAt(f.previewMessageId, 0)],
+							revertPlan: plan,
+							...(action === "skip with plan" ? { skipRevert: true } : {}),
+						});
+		await assertUnavailable(response);
+		expect(controller.signal.aborted).toBe(false);
+		expect(
+			await db.query.narratorMessageRefs.findMany({
+				where: eq(narratorMessageRefs.narratorId, f.narratorId),
+			}),
+		).toEqual(refsBefore);
 		expect(readFileSync(f.file, "utf8")).toBe("USER SAVED AFTERWARDS\n");
 	});
 });

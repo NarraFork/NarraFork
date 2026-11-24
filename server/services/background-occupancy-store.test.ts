@@ -1,6 +1,10 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, spyOn, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import { drizzle } from "drizzle-orm/bun-sqlite";
+import { testEnvironment } from "../../tests/preload";
+import * as workerPool from "../lib/db-worker/pool";
 import {
 	BackgroundOccupancyIndex,
 	type OccupancyNarrator,
@@ -122,6 +126,93 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 }
 
 describe("background occupancy coordinator", () => {
+	test("terminal narrator invalidations do not issue one empty projection read per leaf", async () => {
+		const { source, store } = fixture();
+		for (let index = 0; index < 512; index++) {
+			const id = `terminal-${index}`;
+			source.narrators.set(id, narrator(id, "root", { backgroundStatus: "completed" }));
+			store.refreshNarrator(id);
+		}
+		source.tasks.set("live", task("live", "root"));
+		await store.start();
+		expect(store.snapshot(["root"]).counts.get("root")?.activeCount).toBe(1);
+		expect(source.calls.filter((label) => label === "getProjections")).toHaveLength(0);
+		await store.stop();
+	});
+
+	test("drain waits for unpublished startup before fixture reset", async () => {
+		const { source, store } = fixture();
+		const entered = deferred();
+		const release = deferred();
+		source.onRead = async (label) => {
+			if (label === "scanNarrators") {
+				entered.resolve();
+				await release.promise;
+			}
+		};
+		const starting = store.start();
+		await entered.promise;
+		let reset = false;
+		const cleanup = (async () => {
+			await store.drain();
+			store.resetForTests();
+			reset = true;
+		})();
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(reset).toBe(false);
+		release.resolve();
+		await starting;
+		await cleanup;
+		expect(reset).toBe(true);
+		expect(store.isReady).toBe(false);
+	});
+
+	test("a projection inserted after a negative existence read is replayed before publication", async () => {
+		const { source, store } = fixture();
+		await store.start();
+		const entered = deferred();
+		const release = deferred();
+		let blocked = false;
+		source.onRead = async (label) => {
+			if (label === "getNarrators" && !blocked) {
+				blocked = true;
+				entered.resolve();
+				await release.promise;
+			}
+		};
+		store.refreshNarrator("child");
+		await entered.promise;
+		source.tasks.set(
+			"projection",
+			task("projection", "root", {
+				type: "agent",
+				subagentNarratorId: "child",
+			}),
+		);
+		store.refreshTask("projection");
+		release.resolve();
+		await store.flush();
+		expect(store.getActiveTaskIds("root")).toEqual(["projection"]);
+		await store.stop();
+	});
+
+	test("drain does not start cold stores and propagates pending read failures", async () => {
+		const { source, store } = fixture();
+		await store.drain();
+		expect(source.calls).toHaveLength(0);
+		const failure = new Error("read unavailable");
+		source.onRead = async () => {
+			throw failure;
+		};
+		const starting = store.start().catch((error: unknown) => error);
+		const drained = await store.drain().then(
+			() => null,
+			(error: unknown) => error,
+		);
+		expect(drained).toBe(failure);
+		expect(await starting).toBe(failure);
+	});
+
 	test("cold flush and reads never trigger the explicitly scheduled initial scan", async () => {
 		const { source, store } = fixture();
 		await expect(store.flush()).rejects.toThrow("not initialized");
@@ -135,7 +226,9 @@ describe("background occupancy coordinator", () => {
 	});
 
 	test("real SQL correlates projection existence to the outer narrator, not background task itself", async () => {
-		const client = new Database(":memory:");
+		const directory = mkdtempSync(join(testEnvironment.narraforkHome, "occupancy-"));
+		const client = new Database(join(directory, "fixture.sqlite"));
+		client.run("PRAGMA journal_mode = WAL");
 		client.exec(`
 			CREATE TABLE narrators (
 				id TEXT PRIMARY KEY, parent_narrator_id TEXT, type TEXT, status TEXT,
@@ -156,6 +249,8 @@ describe("background occupancy coordinator", () => {
 		try {
 			const db = drizzle({ client });
 			const source = createDatabaseBackgroundOccupancySource(async () => db);
+			expect(await source.getNarrators(["absent"])).toEqual([]);
+			expect(await source.getTasks(["absent"])).toEqual([]);
 			const rows = await source.getNarrators(["legacy", "projected", "same-id"]);
 			expect(new Map(rows.map((row) => [row.id, row.hasProjection]))).toEqual(
 				new Map([
@@ -178,8 +273,41 @@ describe("background occupancy coordinator", () => {
 				activeWorkCount: 2,
 				activeServiceCount: 1,
 			});
+			await store.stop();
+			const failure = new Error("injected Worker failure");
+			const worker = spyOn(workerPool, "runReadTask").mockRejectedValue(failure);
+			const local = spyOn(client, "query");
+			try {
+				for (const read of [
+					() => source.scanNarrators(null, 1),
+					() => source.scanTasks(null, 1),
+					() => source.getNarrators(["root"]),
+					() => source.getTasks(["unrelated"]),
+					() => source.getProjections("projected", null, 1),
+				]) {
+					const result = await read().then(
+						() => null,
+						(error: unknown) => error,
+					);
+					expect(result).toBe(failure);
+				}
+				expect(local).not.toHaveBeenCalled();
+			} finally {
+				worker.mockRestore();
+				local.mockRestore();
+			}
+			for (const options of [{ signal: AbortSignal.abort() }, { deadlineAt: Date.now() - 1 }]) {
+				const budgeted = createDatabaseBackgroundOccupancySource(async () => db, options);
+				const result = await budgeted.scanNarrators(null, 1).then(
+					() => null,
+					(error: unknown) => error,
+				);
+				expect(result).toBeInstanceOf(Error);
+			}
 		} finally {
+			await workerPool.shutdownDbWorkerPool();
 			client.close();
+			rmSync(directory, { recursive: true, force: true });
 		}
 	});
 	test("explicit startup scans paged metadata only once; all steady reads are SQL-free", async () => {
@@ -681,6 +809,48 @@ describe("background occupancy coordinator", () => {
 		expect(source.calls.length).toBe(reads);
 		store.resetForTests();
 		expect(store.isReady).toBe(false);
+	});
+
+	test("settling a cached legacy claim publishes zero occupancy through every ancestor", async () => {
+		const { source, store } = fixture();
+		const narratorScan = spyOn(source, "scanNarrators");
+		const taskScan = spyOn(source, "scanTasks");
+		source.narrators.set("leaf", narrator("leaf", "child", { backgroundStatus: "running" }));
+		await store.start();
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(store.snapshot(["root", "child"]).childCounts).toEqual(
+			new Map([
+				["root", 1],
+				["child", 1],
+			]),
+		);
+		const delivered = deferred();
+		let notified: readonly string[] = [];
+		store.subscribe("claim-settled", (ids) => {
+			notified = ids;
+			delivered.resolve();
+		});
+		// The persisted archive/CAS commits before it queues this entity-specific refresh.
+		source.narrators.set(
+			"leaf",
+			narrator("leaf", "child", {
+				status: "archived",
+				backgroundStatus: "cancelled",
+			}),
+		);
+		store.refreshNarrator("leaf");
+		await store.flush();
+		await delivered.promise;
+		expect(notified).toEqual(expect.arrayContaining(["root", "child", "leaf"]));
+		for (const id of ["root", "child", "leaf"]) {
+			expect(store.snapshot([id]).childCounts.get(id)).toBe(0);
+			expect(store.snapshot([id]).counts.get(id)?.activeCount).toBe(0);
+		}
+		expect(narratorScan).toHaveBeenCalledTimes(1);
+		expect(taskScan).toHaveBeenCalledTimes(1);
+		narratorScan.mockRestore();
+		taskScan.mockRestore();
+		await store.stop();
 	});
 
 	test("keyed subscribers run asynchronously after publication and may flush without deadlock", async () => {

@@ -137,6 +137,18 @@ for (const language of ["en", "zh-CN"] as const) {
 			expect(message).not.toContain("/ok-");
 		});
 
+		test("disabled history is decoded without a failure advisory and preserves unknown writes", async () => {
+			const t = await translator(language);
+			const result = { ...committed, historyStatus: "disabled" as const };
+			expect(extractRevertResult({ revertResult: result })).toEqual(result);
+			expect(isRevertHistoryCommitted(result)).toBe(true);
+			expect(formatRevertSuccessWarning(t, result)).toBeNull();
+			const unknown = { ...partial, historyStatus: "disabled" as const };
+			expect(isRevertHistoryCommitted(unknown)).toBe(false);
+			expect(formatRevertFailure(t, unknown)).toContain(t("revertFileStatus.unknown"));
+			expect(extractRevertResult({ ...committed, historyStatus: "unexpected" })).toBeNull();
+		});
+
 		test("a committed recording gap is an advisory, not a failed history update", async () => {
 			const t = await translator(language);
 			expect(formatRevertSuccessWarning(t, committed)).toBeNull();

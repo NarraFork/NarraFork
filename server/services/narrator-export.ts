@@ -43,11 +43,16 @@ import {
 } from "@shared/gen-ui-public";
 import { clearedToolOutputSql } from "@shared/narrator-blocks/retention";
 import { and, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
+import {
+	type NarratorSurfaceReadBudget,
+	narratorSurfaceReadOptions,
+} from "./narrator-surface-reads";
 
 const CLEARED_EXPORT_TOOL_SQL = sql.raw(clearedToolOutputSql("narrator_tool_calls.output_json"));
 
 import { db, sqlite } from "../db";
 import { narratorMessageRefs, narratorMessages, narrators, narratorToolCalls } from "../db/schema";
+import { readQuery, readQueryFirst } from "../db/worker-read";
 import { ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { blockBodies, bodySql, readBodies } from "../lib/narrator-bodies";
@@ -329,7 +334,11 @@ interface TruncationStats {
  * so an export must not conjure them up either. The narrator's own refs follow
  * the requested scope.
  */
-async function buildRefScope(narratorId: string, scope: NarratorExportScope) {
+async function buildRefScope(
+	narratorId: string,
+	scope: NarratorExportScope,
+	readBudget: NarratorSurfaceReadBudget = {},
+) {
 	if (!NARRATOR_ID_PATTERN.test(narratorId)) {
 		throw new Error(`Invalid narrator id: ${narratorId}`);
 	}
@@ -340,7 +349,7 @@ async function buildRefScope(narratorId: string, scope: NarratorExportScope) {
 	}
 	const clauses = [and(...ownClauses)];
 
-	for (const step of await resolveLazyLineage(narratorId)) {
+	for (const step of await resolveLazyLineage(narratorId, readBudget)) {
 		if (!NARRATOR_ID_PATTERN.test(step.parentNarratorId)) continue;
 		if (!Number.isFinite(step.upperBoundSeq)) continue;
 		const bound = Math.trunc(step.upperBoundSeq);
@@ -364,15 +373,21 @@ async function buildRefScope(narratorId: string, scope: NarratorExportScope) {
  * here closes an import cycle (narrator-service imports narrator-messages at
  * module scope). One indexed `LIMIT 1` lookup is not worth that coupling.
  */
-async function loadLatestCompactSeq(narratorId: string): Promise<number | null> {
-	const rows = await db
-		.select({ seq: narratorMessageRefs.seq })
-		.from(narratorMessageRefs)
-		.where(
-			and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessageRefs.isCompact, 1)),
-		)
-		.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-		.limit(1);
+async function loadLatestCompactSeq(
+	narratorId: string,
+	readBudget: NarratorSurfaceReadBudget,
+): Promise<number | null> {
+	const rows = await readQuery(
+		db
+			.select({ seq: narratorMessageRefs.seq })
+			.from(narratorMessageRefs)
+			.where(
+				and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessageRefs.isCompact, 1)),
+			)
+			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+			.limit(1),
+		narratorSurfaceReadOptions(readBudget),
+	);
 	return rows[0]?.seq ?? null;
 }
 
@@ -396,16 +411,20 @@ async function hasHistoryBelow(
 	scopeClause: any,
 	boundarySeq: number,
 	ownPlacement: OwnTurnPlacement,
+	readBudget: NarratorSurfaceReadBudget,
 ): Promise<boolean> {
 	const conditions = [scopeClause, sql`${narratorMessageRefs.seq} < ${boundarySeq}`];
 	const own = ownTurnSql(ownPlacement);
 	if (own) conditions.push(own);
-	const rows = await db
-		.select({ seq: narratorMessageRefs.seq })
-		.from(narratorMessageRefs)
-		.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-		.where(and(...conditions))
-		.limit(1);
+	const rows = await readQuery(
+		db
+			.select({ seq: narratorMessageRefs.seq })
+			.from(narratorMessageRefs)
+			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+			.where(and(...conditions))
+			.limit(1),
+		narratorSurfaceReadOptions(readBudget),
+	);
 	return rows.length > 0;
 }
 
@@ -434,6 +453,7 @@ async function loadRefPage(
 	ownPlacement: OwnTurnPlacement,
 	/** Rows per query; callers that only need a summary may read wider pages. */
 	pageSize: number = EXPORT_PAGE_REFS,
+	readBudget: NarratorSurfaceReadBudget = {},
 ): Promise<ExportRefRow[]> {
 	const conditions = [scopeClause];
 	if (cursor) {
@@ -447,19 +467,22 @@ async function loadRefPage(
 		conditions.push(gt(narratorMessageRefs.seq, latestCompactSeq));
 	}
 
-	const rows = await db
-		.select({
-			refId: narratorMessageRefs.id,
-			messageId: narratorMessageRefs.messageId,
-			seq: narratorMessageRefs.seq,
-			isCompact: narratorMessageRefs.isCompact,
-			segmentCompactId: narratorMessageRefs.segmentCompactId,
-		})
-		.from(narratorMessageRefs)
-		.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-		.where(and(...conditions))
-		.orderBy(narratorMessageRefs.seq, narratorMessageRefs.id)
-		.limit(pageSize);
+	const rows = await readQuery(
+		db
+			.select({
+				refId: narratorMessageRefs.id,
+				messageId: narratorMessageRefs.messageId,
+				seq: narratorMessageRefs.seq,
+				isCompact: narratorMessageRefs.isCompact,
+				segmentCompactId: narratorMessageRefs.segmentCompactId,
+			})
+			.from(narratorMessageRefs)
+			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+			.where(and(...conditions))
+			.orderBy(narratorMessageRefs.seq, narratorMessageRefs.id)
+			.limit(pageSize),
+		narratorSurfaceReadOptions(readBudget),
+	);
 
 	return rows.map((row) => ({
 		refId: row.refId,
@@ -490,17 +513,24 @@ export interface TranscriptScope {
 export async function resolveTranscriptScope(
 	narratorId: string,
 	scope: NarratorExportScope,
+	options: NarratorSurfaceReadBudget = {},
 ): Promise<TranscriptScope> {
-	const row = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: RUNTIME_SOURCE_COLUMNS,
-	});
+	const readBudget = narratorSurfaceReadOptions(options);
+	const row = await readQueryFirst(
+		db.query.narrators.findMany({
+			limit: 1,
+			where: eq(narrators.id, narratorId),
+			columns: RUNTIME_SOURCE_COLUMNS,
+		}),
+		narratorSurfaceReadOptions(readBudget),
+	);
 	const ownTurnPlacement = row ? ownTurnPlacementOf(row) : null;
-	const clause = await buildRefScope(narratorId, scope);
-	const latestCompactSeq = scope === "visible" ? await loadLatestCompactSeq(narratorId) : null;
+	const clause = await buildRefScope(narratorId, scope, readBudget);
+	const latestCompactSeq =
+		scope === "visible" ? await loadLatestCompactSeq(narratorId, readBudget) : null;
 	const earlierHistoryOmitted =
 		latestCompactSeq != null
-			? await hasHistoryBelow(clause, latestCompactSeq, ownTurnPlacement)
+			? await hasHistoryBelow(clause, latestCompactSeq, ownTurnPlacement, readBudget)
 			: false;
 	return { clause, latestCompactSeq, ownTurnPlacement, earlierHistoryOmitted };
 }
@@ -531,7 +561,14 @@ export async function* iterateNarratorTranscript(
 	scope: TranscriptScope,
 	signal?: AbortSignal,
 	pageSize: number = EXPORT_PAGE_REFS,
+	options: NarratorSurfaceReadBudget = {},
 ): AsyncGenerator<TranscriptRefPage> {
+	if ((signal ?? options.signal)?.aborted) return;
+	const readBudget = narratorSurfaceReadOptions({
+		signal: signal ?? options.signal,
+		deadlineAt: options.deadlineAt,
+		timeoutMs: options.timeoutMs,
+	});
 	const seenMessageIds = new Set<string>();
 	let cursor: { seq: number; refId: string } | null = null;
 
@@ -545,6 +582,7 @@ export async function* iterateNarratorTranscript(
 			scope.latestCompactSeq,
 			scope.ownTurnPlacement,
 			pageSize,
+			readBudget,
 		);
 		if (refs.length === 0) return;
 		const lastRef = refs[refs.length - 1];
@@ -1040,22 +1078,26 @@ export function assemblePage(
 async function projectExportMessages(
 	narratorId: string,
 	rows: ExportMessageRow[],
+	readBudget: NarratorSurfaceReadBudget,
 ): Promise<ExportMessageRow[]> {
 	const privateByMessage = new Map<string, Set<string>>();
 	const ids = rows.filter((row) => row.hasPrivateUi).map((row) => row.id);
 	const maxIdentities = 4096;
 	let count = 0;
 	for (let start = 0; start < ids.length; start += 128) {
-		const identities = await db
-			.select({ messageId: narratorToolCalls.messageId, toolUseId: narratorToolCalls.toolUseId })
-			.from(narratorToolCalls)
-			.where(
-				and(
-					inArray(narratorToolCalls.messageId, ids.slice(start, start + 128)),
-					eq(narratorToolCalls.toolName, GEN_UI_TOOL_NAME),
-				),
-			)
-			.limit(maxIdentities - count + 1);
+		const identities = await readQuery(
+			db
+				.select({ messageId: narratorToolCalls.messageId, toolUseId: narratorToolCalls.toolUseId })
+				.from(narratorToolCalls)
+				.where(
+					and(
+						inArray(narratorToolCalls.messageId, ids.slice(start, start + 128)),
+						eq(narratorToolCalls.toolName, GEN_UI_TOOL_NAME),
+					),
+				)
+				.limit(maxIdentities - count + 1),
+			narratorSurfaceReadOptions(readBudget),
+		);
 		count += identities.length;
 		if (count > maxIdentities) throw new Error("Export private-tool identity limit exceeded");
 		for (const identity of identities) {
@@ -1564,20 +1606,25 @@ export interface NarratorExportHeader {
 
 async function loadHeader(
 	narratorId: string,
+	readBudget: NarratorSurfaceReadBudget = {},
 ): Promise<NarratorExportHeader & { isSubagent: boolean }> {
-	const row = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: {
-			id: true,
-			title: true,
-			status: true,
-			variant: true,
-			model: true,
-			cwd: true,
-			parentNarratorId: true,
-			createdAt: true,
-		},
-	});
+	const row = await readQueryFirst(
+		db.query.narrators.findMany({
+			limit: 1,
+			where: eq(narrators.id, narratorId),
+			columns: {
+				id: true,
+				title: true,
+				status: true,
+				variant: true,
+				model: true,
+				cwd: true,
+				parentNarratorId: true,
+				createdAt: true,
+			},
+		}),
+		narratorSurfaceReadOptions(readBudget),
+	);
 	if (!row) throw new Error(`Narrator not found: ${narratorId}`);
 	return {
 		id: row.id,
@@ -1713,16 +1760,25 @@ export async function listNarratorExportTurns(
 	narratorId: string,
 	scope: NarratorExportScope,
 	signal?: AbortSignal,
+	options: NarratorSurfaceReadBudget = {},
 ): Promise<{ turns: ExportTurnSummary[]; truncated: boolean }> {
-	const transcript = await resolveTranscriptScope(narratorId, scope);
+	const readSignal = signal ?? options.signal;
+	if (readSignal?.aborted) return { turns: [], truncated: false };
+	const readBudget = narratorSurfaceReadOptions({
+		signal: readSignal,
+		deadlineAt: options.deadlineAt,
+		timeoutMs: options.timeoutMs,
+	});
+	const transcript = await resolveTranscriptScope(narratorId, scope, readBudget);
 	const turns: ExportTurnSummary[] = [];
 	const nextTurn = createTurnCounter();
 
 	for await (const page of iterateNarratorTranscript(
 		narratorId,
 		transcript,
-		signal,
+		readSignal,
 		TURN_INDEX_PAGE_REFS,
+		readBudget,
 	)) {
 		if (page.refs.length === 0) continue;
 		const summaries = await loadTurnSummaries(page.refs.map((ref) => ref.messageId));
@@ -1792,9 +1848,15 @@ async function loadTurnSummaries(
  */
 export async function* streamNarratorExport(
 	narratorId: string,
-	options: NarratorExportOptions,
+	options: NarratorExportOptions & NarratorSurfaceReadBudget,
 	signal?: AbortSignal,
 ): AsyncGenerator<string> {
+	if ((signal ?? options.signal)?.aborted) return;
+	const readBudget = narratorSurfaceReadOptions({
+		signal: signal ?? options.signal,
+		deadlineAt: options.deadlineAt,
+		timeoutMs: options.timeoutMs,
+	});
 	const exportedAt = new Date().toISOString();
 	const stats: TruncationStats = {
 		toolFieldsTruncated: 0,
@@ -1812,7 +1874,7 @@ export async function* streamNarratorExport(
 	/** 与轮次索引共用的计数器，弹窗里的 `#N` 与这里的第 N 轮是同一轮。 */
 	const nextTurn = createTurnCounter();
 
-	const header = await loadHeader(narratorId);
+	const header = await loadHeader(narratorId, readBudget);
 
 	// Scope is resolved BEFORE the header is written, because a "this starts partway
 	// in" notice belongs at the top of the file where it will actually be read, not
@@ -1824,7 +1886,7 @@ export async function* streamNarratorExport(
 	// parseable "incomplete" document the failure contract promises.
 	let scope: TranscriptScope | null = null;
 	try {
-		scope = await resolveTranscriptScope(narratorId, options.scope);
+		scope = await resolveTranscriptScope(narratorId, options.scope, readBudget);
 		stats.earlierHistoryOmitted = scope.earlierHistoryOmitted;
 	} catch (error) {
 		failure = error instanceof Error ? error.message : String(error);
@@ -1865,7 +1927,13 @@ export async function* streamNarratorExport(
 		if (failure != null || !scope) throw new Error(failure ?? "Export scope unavailable");
 
 		let first = true;
-		for await (const page of iterateNarratorTranscript(narratorId, scope, signal)) {
+		for await (const page of iterateNarratorTranscript(
+			narratorId,
+			scope,
+			signal,
+			EXPORT_PAGE_REFS,
+			readBudget,
+		)) {
 			lastSeq = page.lastSeq;
 			const fresh = page.refs;
 			if (fresh.length === 0) continue;
@@ -1885,7 +1953,11 @@ export async function* streamNarratorExport(
 			}
 
 			const topRows = [...messages.values()];
-			const safeRows = await projectExportMessages(narratorId, [...topRows, ...childRows]);
+			const safeRows = await projectExportMessages(
+				narratorId,
+				[...topRows, ...childRows],
+				readBudget,
+			);
 			const safeMessages = new Map(safeRows.slice(0, topRows.length).map((row) => [row.id, row]));
 			const assembled = assemblePage(
 				fresh,

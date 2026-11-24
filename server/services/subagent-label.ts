@@ -27,6 +27,7 @@
 
 import { agentReferenceHref } from "@shared/agent-reference";
 import { eq } from "drizzle-orm";
+import { type ReadQueryOptions, readQueryFirst } from "../db/worker-read";
 import {
 	getPersistedSubagentAliases,
 	getTaskAlias,
@@ -118,17 +119,22 @@ export function agentLabelFromNarrator(
 	return shortAgentId(narrator.id);
 }
 
-async function loadLabelSources(subagentId: string): Promise<{
+async function loadLabelSources(
+	subagentId: string,
+	options: Pick<ReadQueryOptions, "signal" | "deadlineAt" | "timeoutMs">,
+): Promise<{
 	narrator: AgentLabelSource | null;
 	taskAlias: string | null;
 }> {
 	const [{ db }, schema] = await Promise.all([import("../db"), import("../db/schema")]);
-	const narrator = await db.query.narrators
-		.findFirst({
+	const narrator = await readQueryFirst(
+		db.query.narrators.findMany({
+			limit: 1,
 			where: eq(schema.narrators.id, subagentId),
 			columns: { id: true, title: true, traits: true },
-		})
-		.catch(() => undefined);
+		}),
+		{ ...options, executionPolicy: "worker-required", maxRows: 1 },
+	);
 	if (narrator) {
 		const fromNarrator = agentLabelFromNarrator(narrator);
 		// A trait/title alias is already authoritative; skip the second query.
@@ -137,12 +143,14 @@ async function loadLabelSources(subagentId: string): Promise<{
 		}
 	}
 	// An agent background task row shares the subagent's id (see createAgentTask).
-	const task = await db.query.backgroundTasks
-		.findFirst({
+	const task = await readQueryFirst(
+		db.query.backgroundTasks.findMany({
+			limit: 1,
 			where: eq(schema.backgroundTasks.id, subagentId),
 			columns: { alias: true },
-		})
-		.catch(() => undefined);
+		}),
+		{ ...options, executionPolicy: "worker-required", maxRows: 1 },
+	);
 	return { narrator: narrator ?? null, taskAlias: task?.alias ?? null };
 }
 
@@ -185,6 +193,7 @@ export function agentResultTag(label: string, narratorId: string, title?: string
 export async function resolveAgentLabel(
 	scopeNarratorId: string,
 	subagentId: string,
+	options: Pick<ReadQueryOptions, "signal" | "deadlineAt" | "timeoutMs"> = {},
 ): Promise<string> {
 	if (!subagentId) return "";
 	const registered = getTaskAlias(scopeNarratorId, subagentId);
@@ -200,7 +209,7 @@ export async function resolveAgentLabel(
 	// (title). Only the former may be memoized.
 	let stable = true;
 	try {
-		const { narrator, taskAlias } = await loadLabelSources(subagentId);
+		const { narrator, taskAlias } = await loadLabelSources(subagentId, options);
 		if (narrator) {
 			const persisted = getPersistedSubagentAliases(narrator.traits)[0];
 			if (persisted) {
@@ -216,6 +225,7 @@ export async function resolveAgentLabel(
 		if (label === short && taskAlias) label = taskAlias;
 	} catch {
 		// A label is cosmetic; never fail a tool result over it.
+		return short;
 	}
 	if (stable) writeMemo(key, label);
 	return label;

@@ -137,6 +137,7 @@ export {
 	asyncQuestionListQuerySchema,
 	asyncQuestionSupplementSchema,
 	browserInteractSchema,
+	bufferEditLeaseSchema,
 	bufferQueueModeSchema,
 	codexBrowserCallbackSchema,
 	codexFingerprintSchema,
@@ -198,6 +199,18 @@ export {
 	notificationMarkReadSchema,
 } from "./notifications";
 export {
+	coordinatorLimitsSchema,
+	createProjectTeamSchema,
+	listProjectTeamsQuerySchema,
+	releaseTeamLockSchema,
+	teamActivityQuerySchema,
+	teamBaseBranchSchema,
+	teamBoardQuerySchema,
+	teamBriefSchema,
+	teamSettingsSchema,
+	updateProjectTeamSchema,
+} from "./project-teams";
+export {
 	createProjectSchema,
 	projectChapterSettingsSchema,
 	projectMembersSchema,
@@ -247,6 +260,7 @@ export {
 } from "./skills";
 export { specFileQuerySchema, updateSpecFileSchema } from "./spec";
 export { createTerminalSchema, updateTerminalViewStateSchema } from "./terminals";
+export { unattendedOptionsSchema } from "./unattended";
 export { narratorWsMessageSchema, terminalWsMessageSchema } from "./websocket";
 
 export {

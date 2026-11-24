@@ -42,6 +42,7 @@ export type ToolCategory =
 	| "taskOutput"
 	| "agent"
 	| "await"
+	| "watch"
 	| "stop"
 	| "send"
 	| "ask"
@@ -160,6 +161,7 @@ export function getCategory(name: string, input?: unknown): ToolCategory {
 	if (TASK_OUTPUT_TOOLS.has(name)) return "taskOutput";
 	if (AGENT_TOOLS.has(name)) return "agent";
 	if (AWAIT_TOOLS.has(name)) return "await";
+	if (name === "Watch") return "watch";
 	if (name === "Stop") return "stop";
 	if (SEND_TOOLS.has(name)) return "send";
 	if (ASK_TOOLS.has(name)) return "ask";
@@ -243,6 +245,7 @@ export function getCategoryColor(cat: ToolCategory): ToolDisplayColor {
 			return "blue";
 		case "taskOutput":
 		case "await":
+		case "watch":
 		// Same indigo: both fetch information from another session / auxiliary model
 		// rather than mutating files or talking to the user. Send/ask's blue stays
 		// with the communication pair.
@@ -650,6 +653,18 @@ export function getSummary(
 			// A running subagent's reply length, ticking on the folded row too.
 			const live = liveOutputChars(metadata);
 			return live != null ? `${base} · ${liveOutputCharsLabel(labels, live)}` : base;
+		}
+		case "watch": {
+			const type = extractField(input, "type") || extractField(metadata, "type") || "task";
+			const id = extractField(input, "id") || extractField(metadata, "targetId") || "unknown";
+			const state = extractField(metadata, "status");
+			const label =
+				state === "watching"
+					? (labels?.watchRegistered ?? "Observation registered")
+					: state
+						? (labels?.watchResult ?? "Observation result")
+						: "";
+			return `${type}: ${short(id, 60)}${label ? ` · ${label}` : ""}`;
 		}
 		case "await": {
 			const awaitType = extractField(input, "type") || "task";

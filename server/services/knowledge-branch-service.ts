@@ -8,10 +8,12 @@ import {
 	knowledgeRevisions,
 	knowledgeSubmissions,
 } from "../db/schema";
+import { readQuery, readQueryFirst } from "../db/worker-read";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { slugify } from "../lib/slug";
+import type { KnowledgeReadOptions } from "./knowledge/read-store";
 import { knowledgeReadStore, knowledgeWriteStore } from "./knowledge/store";
 import {
 	CLAIMABLE_SUBMISSION_STATUSES,
@@ -65,14 +67,19 @@ const ACTIVE_DRAFT_STATUSES: PersonalEntryStatus[] = ["active"];
  * Promise resolves — the exactly-once boundary under whole-section replay).
  */
 
-async function loadEntryAndCollection(entryId: string) {
-	const entry = await db.query.knowledgeEntries.findFirst({
-		where: eq(knowledgeEntries.id, entryId),
-	});
+async function loadEntryAndCollection(entryId: string, readOptions: KnowledgeReadOptions = {}) {
+	const entry = await readQueryFirst(
+		db.query.knowledgeEntries.findMany({ limit: 1, where: eq(knowledgeEntries.id, entryId) }),
+		{ ...readOptions, executionPolicy: "worker-required" },
+	);
 	if (!entry) throw new NotFoundError("Knowledge entry", entryId);
-	const collection = await db.query.knowledgeCollections.findFirst({
-		where: eq(knowledgeCollections.id, entry.collectionId),
-	});
+	const collection = await readQueryFirst(
+		db.query.knowledgeCollections.findMany({
+			limit: 1,
+			where: eq(knowledgeCollections.id, entry.collectionId),
+		}),
+		{ ...readOptions, executionPolicy: "worker-required" },
+	);
 	if (!collection) throw new NotFoundError("Knowledge collection", entry.collectionId);
 	return { entry, collection };
 }
@@ -114,8 +121,12 @@ function toAclCollection(
 	};
 }
 
-async function assertCanRead(principal: Principal, entryId: string) {
-	const { entry, collection } = await loadEntryAndCollection(entryId);
+async function assertCanRead(
+	principal: Principal,
+	entryId: string,
+	readOptions: KnowledgeReadOptions = {},
+) {
+	const { entry, collection } = await loadEntryAndCollection(entryId, readOptions);
 	const caps = await resolvePrincipalCaps(principal);
 	if (!(await canRead(caps, toAclEntry(entry), toAclCollection(collection)))) {
 		// Do not leak existence — treat as not found.
@@ -144,9 +155,14 @@ export function requireSqliteKnowledgeBranchMutation(
 }
 
 /** Create (or return existing active) personal draft forked from the entry's current revision. */
-async function createDraft(principal: Principal, entryId: string, input: { name?: string }) {
+async function createDraft(
+	principal: Principal,
+	entryId: string,
+	input: { name?: string },
+	readOptions: KnowledgeReadOptions = {},
+) {
 	requireSqliteKnowledgeBranchMutation("Knowledge draft branching");
-	const { entry } = await assertCanRead(principal, entryId);
+	const { entry } = await assertCanRead(principal, entryId, readOptions);
 
 	const content = entry.currentContent ?? "";
 
@@ -165,21 +181,33 @@ async function createDraft(principal: Principal, entryId: string, input: { name?
 	});
 }
 
-async function getMyDraft(principal: Principal, entryId: string) {
-	await assertCanRead(principal, entryId);
-	const draft = await db.query.knowledgeDrafts.findFirst({
-		where: (d, { and: a, eq: e, inArray }) =>
-			a(
-				e(d.entryId, entryId),
-				e(d.authorUserId, principal.userId),
-				inArray(d.status, ACTIVE_DRAFT_STATUSES),
-			),
-	});
+async function getMyDraft(
+	principal: Principal,
+	entryId: string,
+	readOptions: KnowledgeReadOptions = {},
+) {
+	await assertCanRead(principal, entryId, readOptions);
+	const draft = await readQueryFirst(
+		db.query.knowledgeDrafts.findMany({
+			limit: 1,
+			where: (d, { and: a, eq: e, inArray }) =>
+				a(
+					e(d.entryId, entryId),
+					e(d.authorUserId, principal.userId),
+					inArray(d.status, ACTIVE_DRAFT_STATUSES),
+				),
+		}),
+		{ ...readOptions, executionPolicy: "worker-required" },
+	);
 	return draft ?? null;
 }
 
-async function loadOwnDraft(principal: Principal, draftId: string) {
-	const draft = await knowledgeReadStore.getPersonalEntryById(draftId);
+async function loadOwnDraft(
+	principal: Principal,
+	draftId: string,
+	readOptions: KnowledgeReadOptions = {},
+) {
+	const draft = await knowledgeReadStore.getPersonalEntryById(draftId, readOptions);
 	if (!draft) throw new NotFoundError("Knowledge draft", draftId);
 	if (draft.authorUserId !== principal.userId && principal.role !== "admin") {
 		throw new NotFoundError("Knowledge draft", draftId);
@@ -241,14 +269,18 @@ async function createStandalone(
 async function listMine(
 	principal: Principal,
 	opts: { status?: PersonalEntryStatus; limit?: number } = {},
+	readOptions: KnowledgeReadOptions = {},
 ) {
 	if (!principal.userId) return [];
 	const limit = Math.min(opts.limit ?? 100, 200);
-	return knowledgeReadStore.listPersonalEntries({
-		userId: principal.userId,
-		status: opts.status,
-		limit,
-	});
+	return knowledgeReadStore.listPersonalEntries(
+		{
+			userId: principal.userId,
+			status: opts.status,
+			limit,
+		},
+		readOptions,
+	);
 }
 
 /**
@@ -270,11 +302,12 @@ async function listMine(
  */
 async function findDriftedDraftIds(
 	drafts: ReadonlyArray<{ id: string; entryId: string | null; baseRevisionId: string | null }>,
+	readOptions: KnowledgeReadOptions = {},
 ): Promise<Set<string>> {
 	const linked = drafts.filter((d) => d.entryId && d.baseRevisionId);
 	if (linked.length === 0) return new Set();
 	const entryIds = [...new Set(linked.map((d) => d.entryId as string))];
-	const entries = await knowledgeReadStore.getEntryRevisionPointers(entryIds);
+	const entries = await knowledgeReadStore.getEntryRevisionPointers(entryIds, readOptions);
 	const currentByEntry = new Map(entries.map((e) => [e.id, e.currentRevisionId ?? null]));
 	const drifted = new Set<string>();
 	for (const d of linked) {
@@ -287,8 +320,12 @@ async function findDriftedDraftIds(
 }
 
 /** Read one of the caller's own personal entries by id. */
-async function getMine(principal: Principal, draftId: string) {
-	return loadOwnDraft(principal, draftId);
+async function getMine(
+	principal: Principal,
+	draftId: string,
+	readOptions: KnowledgeReadOptions = {},
+) {
+	return loadOwnDraft(principal, draftId, readOptions);
 }
 
 // ─── Personal-version page views (KNOWLEDGE_UI_REDESIGN §5.4 / §5.5) ──────
@@ -299,23 +336,33 @@ async function getMine(principal: Principal, draftId: string) {
  * caller's own list page). An entry the caller lost access to is simply absent, so its title
  * never reaches a personal-version view.
  */
-async function loadReadableEntries(caps: PrincipalCaps, entryIds: readonly string[]) {
+async function loadReadableEntries(
+	caps: PrincipalCaps,
+	entryIds: readonly string[],
+	readOptions: KnowledgeReadOptions = {},
+) {
 	const ids = [...new Set(entryIds)];
 	if (ids.length === 0) return new Map<string, ReadableEntrySummary>();
-	const entries = await db.query.knowledgeEntries.findMany({
-		where: (e, { inArray: ia }) => ia(e.id, ids),
-		columns: {
-			id: true,
-			title: true,
-			collectionId: true,
-			ownerUserId: true,
-			classificationLevel: true,
-			controlledTagsJson: true,
-			reviewTagsJson: true,
-			currentRevisionId: true,
-		},
-	});
-	const cols = await loadCollectionAclRows(entries.map((e) => e.collectionId));
+	const entries = await readQuery(
+		db.query.knowledgeEntries.findMany({
+			where: (e, { inArray: ia }) => ia(e.id, ids),
+			columns: {
+				id: true,
+				title: true,
+				collectionId: true,
+				ownerUserId: true,
+				classificationLevel: true,
+				controlledTagsJson: true,
+				reviewTagsJson: true,
+				currentRevisionId: true,
+			},
+		}),
+		{ ...readOptions, executionPolicy: "worker-required" },
+	);
+	const cols = await loadCollectionAclRows(
+		entries.map((e) => e.collectionId),
+		readOptions,
+	);
 	const out = new Map<string, ReadableEntrySummary>();
 	for (const e of entries) {
 		const col = cols.get(e.collectionId);
@@ -332,20 +379,26 @@ interface ReadableEntrySummary {
 	currentRevisionId: string | null;
 }
 
-async function loadCollectionAclRows(collectionIds: readonly string[]) {
+async function loadCollectionAclRows(
+	collectionIds: readonly string[],
+	readOptions: KnowledgeReadOptions = {},
+) {
 	const ids = [...new Set(collectionIds)];
 	if (ids.length === 0) return new Map<string, CollectionAclRow>();
-	const rows = await db.query.knowledgeCollections.findMany({
-		where: (c, { inArray: ia }) => ia(c.id, ids),
-		columns: {
-			id: true,
-			name: true,
-			defaultLevel: true,
-			classificationLevel: true,
-			controlledTagsJson: true,
-			ownerUserId: true,
-		},
-	});
+	const rows = await readQuery(
+		db.query.knowledgeCollections.findMany({
+			where: (c, { inArray: ia }) => ia(c.id, ids),
+			columns: {
+				id: true,
+				name: true,
+				defaultLevel: true,
+				classificationLevel: true,
+				controlledTagsJson: true,
+				ownerUserId: true,
+			},
+		}),
+		{ ...readOptions, executionPolicy: "worker-required" },
+	);
 	return new Map(rows.map((c) => [c.id, c]));
 }
 
@@ -355,8 +408,12 @@ type CollectionAclRow = Pick<
 >;
 
 /** Names of the collections (among `collectionIds`) the caller can read. */
-async function readableCollectionNames(caps: PrincipalCaps, collectionIds: readonly string[]) {
-	const cols = await loadCollectionAclRows(collectionIds);
+async function readableCollectionNames(
+	caps: PrincipalCaps,
+	collectionIds: readonly string[],
+	readOptions: KnowledgeReadOptions = {},
+) {
+	const cols = await loadCollectionAclRows(collectionIds, readOptions);
 	const out = new Map<string, string>();
 	for (const c of cols.values()) {
 		if (await canReadCollection(caps, toAclCollection(c))) out.set(c.id, c.name);
@@ -373,14 +430,16 @@ async function readableCollectionNames(caps: PrincipalCaps, collectionIds: reado
 async function listMineForViewer(
 	principal: Principal,
 	opts: { status?: PersonalEntryStatus; limit?: number } = {},
+	readOptions: KnowledgeReadOptions = {},
 ) {
-	const rows = await listMine(principal, opts);
+	const rows = await listMine(principal, opts, readOptions);
 	if (rows.length === 0) return [];
-	const driftedIds = await findDriftedDraftIds(rows);
+	const driftedIds = await findDriftedDraftIds(rows, readOptions);
 	const caps = await resolvePrincipalCaps(principal);
 	const entries = await loadReadableEntries(
 		caps,
 		rows.map((r) => r.entryId).filter((id): id is string => !!id),
+		readOptions,
 	);
 	const colNames = await readableCollectionNames(
 		caps,
@@ -388,6 +447,7 @@ async function listMineForViewer(
 			.filter((r) => !r.entryId)
 			.map((r) => r.targetCollectionId)
 			.filter((id): id is string => !!id),
+		readOptions,
 	);
 	return rows.map((r) => ({
 		...r,
@@ -437,8 +497,12 @@ export function personalEntryViewerCaps(
  *  - `openSubmissions`: the requests a delete would close ({@link CLOSED_ON_ENTRY_DELETE_STATUSES}
  *    — pending / conflict / changes requested), newest first, no bodies; the caller's own rows.
  */
-async function getMineForViewer(principal: Principal, draftId: string) {
-	const draft = await loadOwnDraft(principal, draftId);
+async function getMineForViewer(
+	principal: Principal,
+	draftId: string,
+	readOptions: KnowledgeReadOptions = {},
+) {
+	const draft = await loadOwnDraft(principal, draftId, readOptions);
 	const caps = await resolvePrincipalCaps(principal);
 
 	let entryTitle: string | null = null;
@@ -446,12 +510,17 @@ async function getMineForViewer(principal: Principal, draftId: string) {
 	let drift: { drifted: boolean; versionsBehind: number } | null = null;
 	let entryReadable = false;
 	if (draft.entryId) {
-		const entry = await db.query.knowledgeEntries.findFirst({
-			where: eq(knowledgeEntries.id, draft.entryId),
-		});
-		const col = entry
-			? (await loadCollectionAclRows([entry.collectionId])).get(entry.collectionId)
-			: null;
+		const snapshot = await readQueryFirst(
+			db
+				.select({ entry: knowledgeEntries, collection: knowledgeCollections })
+				.from(knowledgeEntries)
+				.innerJoin(knowledgeCollections, eq(knowledgeCollections.id, knowledgeEntries.collectionId))
+				.where(eq(knowledgeEntries.id, draft.entryId))
+				.limit(1),
+			{ ...readOptions, executionPolicy: "worker-required" },
+		);
+		const entry = snapshot?.entry;
+		const col = snapshot?.collection;
 		entryReadable =
 			!!entry && !!col && (await canRead(caps, toAclEntry(entry), toAclCollection(col)));
 		if (entry && entryReadable) {
@@ -461,7 +530,11 @@ async function getMineForViewer(principal: Principal, draftId: string) {
 			drift = {
 				drifted,
 				versionsBehind: drifted
-					? await countVersionsBehind(draft.baseRevisionId, entry.currentRevisionId ?? null)
+					? await countVersionsBehind(
+							draft.baseRevisionId,
+							entry.currentRevisionId ?? null,
+							readOptions,
+						)
 					: 0,
 			};
 		}
@@ -470,18 +543,21 @@ async function getMineForViewer(principal: Principal, draftId: string) {
 	let targetCollectionName: string | null = null;
 	if (!draft.entryId && draft.targetCollectionId) {
 		targetCollectionName =
-			(await readableCollectionNames(caps, [draft.targetCollectionId])).get(
+			(await readableCollectionNames(caps, [draft.targetCollectionId], readOptions)).get(
 				draft.targetCollectionId,
 			) ?? null;
 	}
 
-	const openSubmissions = await db.query.knowledgeSubmissions.findMany({
-		where: (s, { and: a, eq: e, inArray: ia }) =>
-			a(e(s.draftId, draftId), ia(s.status, [...CLOSED_ON_ENTRY_DELETE_STATUSES])),
-		columns: { id: true, status: true, round: true, createdAt: true },
-		orderBy: (s, { desc: d }) => [d(s.createdAt)],
-		limit: OPEN_SUBMISSION_SCAN_LIMIT,
-	});
+	const openSubmissions = await readQuery(
+		db.query.knowledgeSubmissions.findMany({
+			where: (s, { and: a, eq: e, inArray: ia }) =>
+				a(e(s.draftId, draftId), ia(s.status, [...CLOSED_ON_ENTRY_DELETE_STATUSES])),
+			columns: { id: true, status: true, round: true, createdAt: true },
+			orderBy: (s, { desc: d }) => [d(s.createdAt)],
+			limit: OPEN_SUBMISSION_SCAN_LIMIT,
+		}),
+		{ ...readOptions, executionPolicy: "worker-required" },
+	);
 
 	return {
 		...draft,
@@ -505,8 +581,9 @@ async function updateStandaloneMeta(
 	principal: Principal,
 	draftId: string,
 	input: { title?: string; targetCollectionId?: string | null; keywords?: string[] },
+	readOptions: KnowledgeReadOptions = {},
 ) {
-	const draft = await loadOwnDraft(principal, draftId);
+	const draft = await loadOwnDraft(principal, draftId, readOptions);
 	if (draft.status === "archived") {
 		throw new ValidationError("Personal entry is archived and can no longer be edited");
 	}
@@ -526,7 +603,7 @@ async function updateStandaloneMeta(
 		patch.keywordsJson = Array.isArray(input.keywords) ? input.keywords : null;
 	}
 	await knowledgeWriteStore.updatePersonalEntryMeta(draftId, patch);
-	return loadOwnDraft(principal, draftId);
+	return loadOwnDraft(principal, draftId, readOptions);
 }
 
 /**
@@ -546,8 +623,12 @@ async function updateStandaloneMeta(
  *
  * Already-archived entries are a no-op (idempotent delete).
  */
-async function deletePersonalEntry(principal: Principal, draftId: string) {
-	const draft = await loadOwnDraft(principal, draftId);
+async function deletePersonalEntry(
+	principal: Principal,
+	draftId: string,
+	readOptions: KnowledgeReadOptions = {},
+) {
+	const draft = await loadOwnDraft(principal, draftId, readOptions);
 	if (draft.status === "archived") {
 		return { ok: true as const, id: draftId, alreadyArchived: true as const };
 	}
@@ -577,8 +658,9 @@ async function updateDraft(
 	principal: Principal,
 	draftId: string,
 	input: { content: string; name?: string },
+	readOptions: KnowledgeReadOptions = {},
 ) {
-	const draft = await loadOwnDraft(principal, draftId);
+	const draft = await loadOwnDraft(principal, draftId, readOptions);
 	if (draft.status === "archived") {
 		throw new ValidationError("Personal entry is archived and can no longer be edited");
 	}
@@ -603,7 +685,7 @@ async function updateDraft(
 			reason: "draft_updated",
 		});
 	}
-	return knowledgeReadStore.getPersonalEntryById(draftId);
+	return knowledgeReadStore.getPersonalEntryById(draftId, readOptions);
 }
 
 /**
@@ -623,16 +705,17 @@ async function getDraftDiff(
 	principal: Principal,
 	draftId: string,
 	opts: { against?: "base" | "current" } = {},
+	readOptions: KnowledgeReadOptions = {},
 ) {
-	const draft = await loadOwnDraft(principal, draftId);
+	const draft = await loadOwnDraft(principal, draftId, readOptions);
 	const against = opts.against ?? "current";
 	let oldContent: string;
 	let oldLabel: string;
 	if (against === "current") {
-		oldContent = await currentMainContentOf(draft.entryId);
+		oldContent = await currentMainContentOf(draft.entryId, readOptions);
 		oldLabel = "current";
 	} else {
-		oldContent = await baseContentOf(draft.baseRevisionId);
+		oldContent = await baseContentOf(draft.baseRevisionId, readOptions);
 		oldLabel = "base";
 	}
 	const patch = structuredPatch("entry", "entry", oldContent, draft.content, oldLabel, "draft");
@@ -645,11 +728,18 @@ async function getDraftDiff(
 	};
 }
 
-async function baseContentOf(baseRevisionId: string | null): Promise<string> {
+async function baseContentOf(
+	baseRevisionId: string | null,
+	readOptions: KnowledgeReadOptions = {},
+): Promise<string> {
 	if (baseRevisionId) {
-		const rev = await db.query.knowledgeRevisions.findFirst({
-			where: eq(knowledgeRevisions.id, baseRevisionId),
-		});
+		const rev = await readQueryFirst(
+			db.query.knowledgeRevisions.findMany({
+				limit: 1,
+				where: eq(knowledgeRevisions.id, baseRevisionId),
+			}),
+			{ ...readOptions, executionPolicy: "worker-required" },
+		);
 		if (rev) return rev.content;
 	}
 	// Fall back to empty (entry created without a revision, or a standalone entry).
@@ -657,12 +747,19 @@ async function baseContentOf(baseRevisionId: string | null): Promise<string> {
 }
 
 /** Current main content of a linked entry. Empty string when entry is missing/standalone. */
-async function currentMainContentOf(entryId: string | null): Promise<string> {
+async function currentMainContentOf(
+	entryId: string | null,
+	readOptions: KnowledgeReadOptions = {},
+): Promise<string> {
 	if (!entryId) return "";
-	const entry = await db.query.knowledgeEntries.findFirst({
-		where: eq(knowledgeEntries.id, entryId),
-		columns: { currentContent: true },
-	});
+	const entry = await readQueryFirst(
+		db.query.knowledgeEntries.findMany({
+			limit: 1,
+			where: eq(knowledgeEntries.id, entryId),
+			columns: { currentContent: true },
+		}),
+		{ ...readOptions, executionPolicy: "worker-required" },
+	);
 	return entry?.currentContent ?? "";
 }
 
@@ -676,17 +773,26 @@ async function currentMainContentOf(entryId: string | null): Promise<string> {
 async function countVersionsBehind(
 	baseRevisionId: string | null,
 	currentRevisionId: string | null,
+	readOptions: KnowledgeReadOptions = {},
 ): Promise<number> {
 	if (!baseRevisionId || !currentRevisionId || baseRevisionId === currentRevisionId) return 0;
 	const [baseRev, currentRev] = await Promise.all([
-		db.query.knowledgeRevisions.findFirst({
-			where: eq(knowledgeRevisions.id, baseRevisionId),
-			columns: { version: true },
-		}),
-		db.query.knowledgeRevisions.findFirst({
-			where: eq(knowledgeRevisions.id, currentRevisionId),
-			columns: { version: true },
-		}),
+		readQueryFirst(
+			db.query.knowledgeRevisions.findMany({
+				limit: 1,
+				where: eq(knowledgeRevisions.id, baseRevisionId),
+				columns: { version: true },
+			}),
+			{ ...readOptions, executionPolicy: "worker-required" },
+		),
+		readQueryFirst(
+			db.query.knowledgeRevisions.findMany({
+				limit: 1,
+				where: eq(knowledgeRevisions.id, currentRevisionId),
+				columns: { version: true },
+			}),
+			{ ...readOptions, executionPolicy: "worker-required" },
+		),
 	]);
 	if (!baseRev || !currentRev) return 0;
 	const behind = currentRev.version - baseRev.version;
@@ -704,24 +810,32 @@ async function countVersionsBehind(
  * No active draft → { hasDraft: false }. Standalone personal entries (no entryId) are not
  * considered here — they have no main to drift against.
  */
-async function getDraftDrift(principal: Principal, entryId: string) {
+async function getDraftDrift(
+	principal: Principal,
+	entryId: string,
+	readOptions: KnowledgeReadOptions = {},
+) {
 	// assertCanRead both enforces ACL and confirms the entry exists.
-	const { entry } = await assertCanRead(principal, entryId);
-	const draft = await db.query.knowledgeDrafts.findFirst({
-		where: (d, { and: a, eq: e, inArray }) =>
-			a(
-				e(d.entryId, entryId),
-				e(d.authorUserId, principal.userId),
-				inArray(d.status, ACTIVE_DRAFT_STATUSES),
-			),
-	});
+	const { entry } = await assertCanRead(principal, entryId, readOptions);
+	const draft = await readQueryFirst(
+		db.query.knowledgeDrafts.findMany({
+			limit: 1,
+			where: (d, { and: a, eq: e, inArray }) =>
+				a(
+					e(d.entryId, entryId),
+					e(d.authorUserId, principal.userId),
+					inArray(d.status, ACTIVE_DRAFT_STATUSES),
+				),
+		}),
+		{ ...readOptions, executionPolicy: "worker-required" },
+	);
 	if (!draft) {
 		return { hasDraft: false as const };
 	}
 	const currentRevisionId = entry.currentRevisionId ?? null;
 	const drifted = !!draft.baseRevisionId && draft.baseRevisionId !== currentRevisionId;
 	const versionsBehind = drifted
-		? await countVersionsBehind(draft.baseRevisionId, currentRevisionId)
+		? await countVersionsBehind(draft.baseRevisionId, currentRevisionId, readOptions)
 		: 0;
 	return {
 		hasDraft: true as const,
@@ -732,7 +846,7 @@ async function getDraftDrift(principal: Principal, entryId: string) {
 		currentRevisionId,
 		versionsBehind,
 		// Content sides for diff rendering / shadow decisions.
-		base: await baseContentOf(draft.baseRevisionId),
+		base: await baseContentOf(draft.baseRevisionId, readOptions),
 		current: entry.currentContent ?? "",
 		draft: draft.content,
 	};
@@ -765,17 +879,18 @@ async function rebaseDraft(
 	principal: Principal,
 	draftId: string,
 	opts: { strategy?: RebaseStrategy } = {},
+	readOptions: KnowledgeReadOptions = {},
 ) {
 	requireSqliteKnowledgeBranchMutation("Knowledge draft rebasing");
 	const strategy: RebaseStrategy = opts.strategy ?? "merge";
-	const draft = await loadOwnDraft(principal, draftId);
+	const draft = await loadOwnDraft(principal, draftId, readOptions);
 	if (draft.status === "archived") {
 		throw new ValidationError("Personal entry is archived and can no longer be rebased");
 	}
 	if (!draft.entryId) {
 		throw new ValidationError("Standalone personal entry has no main version to rebase onto");
 	}
-	const { entry } = await assertCanRead(principal, draft.entryId);
+	const { entry } = await assertCanRead(principal, draft.entryId, readOptions);
 	const currentRevisionId = entry.currentRevisionId ?? null;
 
 	// Already on the latest main → nothing to do.
@@ -783,7 +898,7 @@ async function rebaseDraft(
 		return { ok: true as const, rebased: false, baseRevisionId: currentRevisionId, strategy };
 	}
 
-	const baseContent = await baseContentOf(draft.baseRevisionId);
+	const baseContent = await baseContentOf(draft.baseRevisionId, readOptions);
 	const currentMain = entry.currentContent ?? "";
 	const proposed = draft.content;
 
@@ -816,6 +931,7 @@ async function rebaseDraft(
 	// post-commit notification.
 	const invalidated = await knowledgeWriteStore.rebaseDraftContent({
 		draftId,
+		expectedDraft: draft,
 		content: merged,
 		contentHash: hashContent(merged),
 		baseRevisionId: currentRevisionId,
@@ -899,8 +1015,9 @@ async function submitForReview(
 		/** Set by {@link resubmit}: 1-based attempt number in the resubmit chain. */
 		round?: number;
 	},
+	readOptions: KnowledgeReadOptions = {},
 ) {
-	const draft = await loadOwnDraft(principal, draftId);
+	const draft = await loadOwnDraft(principal, draftId, readOptions);
 	// Content preconditions — the same pure check the personal-version page's `viewerCaps`
 	// reports as blocked reasons, so the page and this endpoint cannot disagree.
 	const blocker = personalEntrySubmitPreconditionBlocker(draft);
@@ -921,15 +1038,23 @@ async function submitForReview(
 		currentRevisionId: string;
 	} | null = null;
 	if (draft.entryId && draft.baseRevisionId) {
-		const entryRow = await db.query.knowledgeEntries.findFirst({
-			where: eq(knowledgeEntries.id, draft.entryId),
-			// Only the pointer that defines drift — never currentContent (large field).
-			columns: { currentRevisionId: true },
-		});
+		const entryRow = await readQueryFirst(
+			db.query.knowledgeEntries.findMany({
+				limit: 1,
+				where: eq(knowledgeEntries.id, draft.entryId),
+				// Only the pointer that defines drift — never currentContent (large field).
+				columns: { currentRevisionId: true },
+			}),
+			{ ...readOptions, executionPolicy: "worker-required" },
+		);
 		const currentRevisionId = entryRow?.currentRevisionId ?? null;
 		if (currentRevisionId && currentRevisionId !== draft.baseRevisionId) {
 			driftWarning = {
-				versionsBehind: await countVersionsBehind(draft.baseRevisionId, currentRevisionId),
+				versionsBehind: await countVersionsBehind(
+					draft.baseRevisionId,
+					currentRevisionId,
+					readOptions,
+				),
 				baseRevisionId: draft.baseRevisionId,
 				currentRevisionId,
 			};
@@ -943,6 +1068,7 @@ async function submitForReview(
 	const submission = await knowledgeWriteStore.createSubmissionGuarded({
 		submissionId: id,
 		draftId,
+		expectedDraft: draft,
 		entryId: draft.entryId,
 		// Standalone publish target (NULL for linked entries).
 		collectionId: draft.entryId ? null : draft.targetCollectionId,
@@ -975,10 +1101,14 @@ async function submitForReview(
 	return { ...submission, driftWarning };
 }
 
-async function loadSubmission(submissionId: string) {
-	const sub = await db.query.knowledgeSubmissions.findFirst({
-		where: eq(knowledgeSubmissions.id, submissionId),
-	});
+async function loadSubmission(submissionId: string, readOptions: KnowledgeReadOptions = {}) {
+	const sub = await readQueryFirst(
+		db.query.knowledgeSubmissions.findMany({
+			limit: 1,
+			where: eq(knowledgeSubmissions.id, submissionId),
+		}),
+		{ ...readOptions, executionPolicy: "worker-required" },
+	);
 	if (!sub) throw new NotFoundError("Knowledge submission", submissionId);
 	return sub;
 }
@@ -1009,17 +1139,23 @@ type SubmissionReviewAuthority =
 async function submissionReviewAuthority(
 	caps: ResolvedCaps,
 	sub: Pick<SubmissionRow, "id" | "entryId" | "collectionId">,
+	readOptions: KnowledgeReadOptions = {},
 ): Promise<SubmissionReviewAuthority> {
 	if (sub.entryId) {
-		const entry = await db.query.knowledgeEntries.findFirst({
-			where: eq(knowledgeEntries.id, sub.entryId),
-		});
+		const entry = await readQueryFirst(
+			db.query.knowledgeEntries.findMany({ limit: 1, where: eq(knowledgeEntries.id, sub.entryId) }),
+			{ ...readOptions, executionPolicy: "worker-required" },
+		);
 		if (!entry) {
 			return { ok: false, hidden: true, error: new NotFoundError("Knowledge entry", sub.entryId) };
 		}
-		const collection = await db.query.knowledgeCollections.findFirst({
-			where: eq(knowledgeCollections.id, entry.collectionId),
-		});
+		const collection = await readQueryFirst(
+			db.query.knowledgeCollections.findMany({
+				limit: 1,
+				where: eq(knowledgeCollections.id, entry.collectionId),
+			}),
+			{ ...readOptions, executionPolicy: "worker-required" },
+		);
 		if (!collection) {
 			return {
 				ok: false,
@@ -1046,9 +1182,13 @@ async function submissionReviewAuthority(
 			error: new ValidationError("Standalone publish has no target collection"),
 		};
 	}
-	const collection = await db.query.knowledgeCollections.findFirst({
-		where: eq(knowledgeCollections.id, sub.collectionId),
-	});
+	const collection = await readQueryFirst(
+		db.query.knowledgeCollections.findMany({
+			limit: 1,
+			where: eq(knowledgeCollections.id, sub.collectionId),
+		}),
+		{ ...readOptions, executionPolicy: "worker-required" },
+	);
 	if (!collection) {
 		return {
 			ok: false,
@@ -1073,8 +1213,9 @@ async function submissionReviewAuthority(
 async function assertSubmissionReviewAuthority(
 	caps: ResolvedCaps,
 	sub: Pick<SubmissionRow, "id" | "entryId" | "collectionId">,
+	readOptions: KnowledgeReadOptions = {},
 ) {
-	const authority = await submissionReviewAuthority(caps, sub);
+	const authority = await submissionReviewAuthority(caps, sub, readOptions);
 	if (!authority.ok) throw authority.error;
 	return authority;
 }
@@ -1164,8 +1305,9 @@ async function review(
 		verdict: "approve" | "request_changes" | "reject" | "comment_only";
 		findings?: Finding[];
 	},
+	readOptions: KnowledgeReadOptions = {},
 ) {
-	const sub = await loadSubmission(submissionId);
+	const sub = await loadSubmission(submissionId, readOptions);
 	if (sub.status !== "pending" && sub.status !== "conflict") {
 		throw new ValidationError(`Submission already ${sub.status}`);
 	}
@@ -1182,7 +1324,7 @@ async function review(
 	//  - linked (entryId set): collection-gate + canReview on the target entry.
 	//  - standalone (entryId null): the publish creates a NEW entry in sub.collectionId, so
 	//    the reviewer must be able to READ + WRITE that target collection.
-	await assertSubmissionReviewAuthority(caps, sub);
+	await assertSubmissionReviewAuthority(caps, sub, readOptions);
 	if (isSelfReviewBlocked(principal, sub)) {
 		throw new ValidationError("You cannot review your own submission");
 	}
@@ -1192,7 +1334,7 @@ async function review(
 
 	if (input.verdict === "approve") {
 		return sub.entryId
-			? approveAndMerge(sub, principal.userId, findings, now)
+			? approveAndMerge(sub, principal.userId, findings, now, readOptions)
 			: approveStandalone(sub, principal.userId, findings, now);
 	}
 
@@ -1207,6 +1349,7 @@ async function review(
 				: sub.status;
 	await knowledgeWriteStore.setSubmissionReviewVerdict({
 		submissionId,
+		expectedStatus: sub.status,
 		status: newStatus,
 		verdict: input.verdict,
 		findingsJson: findings,
@@ -1230,16 +1373,18 @@ async function approveAndMerge(
 	reviewerUserId: string,
 	findings: Finding[],
 	now: string,
+	readOptions: KnowledgeReadOptions = {},
 ) {
 	// Only called for LINKED submissions (the review dispatch routes standalone to
 	// approveStandalone), so entryId is set.
 	if (!sub.entryId) throw new ValidationError("Submission has no target entry to merge into");
-	const entry = await db.query.knowledgeEntries.findFirst({
-		where: eq(knowledgeEntries.id, sub.entryId),
-	});
+	const entry = await readQueryFirst(
+		db.query.knowledgeEntries.findMany({ limit: 1, where: eq(knowledgeEntries.id, sub.entryId) }),
+		{ ...readOptions, executionPolicy: "worker-required" },
+	);
 	if (!entry) throw new NotFoundError("Knowledge entry", sub.entryId);
 
-	const baseContent = await baseContentOf(sub.baseRevisionId);
+	const baseContent = await baseContentOf(sub.baseRevisionId, readOptions);
 	const currentMain = entry.currentContent ?? "";
 	const proposed = sub.proposedContent;
 
@@ -1278,7 +1423,13 @@ async function approveAndMerge(
 		};
 	}
 
-	const revisionId = await commitMergedRevision(sub, merged, reviewerUserId, now);
+	const revisionId = await commitMergedRevision(
+		sub,
+		merged,
+		reviewerUserId,
+		now,
+		entry.currentRevisionId,
+	);
 	return { submissionId: sub.id, status: "approved" as const, mergedRevisionId: revisionId };
 }
 
@@ -1360,8 +1511,9 @@ async function resolveConflict(
 	principal: Principal,
 	submissionId: string,
 	input: { resolvedContent: string; changeNote?: string },
+	readOptions: KnowledgeReadOptions = {},
 ) {
-	const sub = await loadSubmission(submissionId);
+	const sub = await loadSubmission(submissionId, readOptions);
 	if (sub.status !== "conflict") {
 		throw new ValidationError(`Submission is ${sub.status}, not in conflict`);
 	}
@@ -1371,12 +1523,19 @@ async function resolveConflict(
 		throw new ValidationError("Submission has no target entry to resolve against");
 	}
 	const caps = await resolvePrincipalCaps(principal);
-	await assertSubmissionReviewAuthority(caps, sub);
+	const authority = await assertSubmissionReviewAuthority(caps, sub, readOptions);
+	if (!authority.entry) throw new ValidationError("Submission has no target entry");
 	if (isSelfReviewBlocked(principal, sub)) {
 		throw new ValidationError("You cannot resolve your own submission");
 	}
 	const now = nowIso();
-	const revisionId = await commitMergedRevision(sub, input.resolvedContent, principal.userId, now);
+	const revisionId = await commitMergedRevision(
+		sub,
+		input.resolvedContent,
+		principal.userId,
+		now,
+		authority.entry.currentRevisionId,
+	);
 	return { submissionId, status: "approved" as const, mergedRevisionId: revisionId };
 }
 
@@ -1386,6 +1545,7 @@ async function commitMergedRevision(
 	content: string,
 	reviewerUserId: string,
 	now: string,
+	expectedMainRevisionId: string | null,
 ): Promise<string> {
 	// Only called for LINKED submissions (approveAndMerge / resolveConflict), so entryId is set.
 	const targetEntryId = sub.entryId;
@@ -1401,6 +1561,7 @@ async function commitMergedRevision(
 		submissionId: sub.id,
 		draftId: sub.draftId,
 		entryId: targetEntryId,
+		expectedMainRevisionId,
 		revisionId,
 		content,
 		contentHash: hashContent(content),
@@ -1446,6 +1607,7 @@ const SUBMISSION_LIST_MAX = 200;
 async function listSubmissions(
 	principal: Principal,
 	opts: { entryId?: string; status?: string; limit?: number },
+	readOptions: KnowledgeReadOptions = {},
 ) {
 	const statusFilter = opts.status as
 		| "pending"
@@ -1457,38 +1619,41 @@ async function listSubmissions(
 		| "superseded"
 		| undefined;
 	const limit = Math.min(opts.limit ?? SUBMISSION_LIST_MAX, SUBMISSION_LIST_MAX);
-	const rows = await db.query.knowledgeSubmissions.findMany({
-		where: (s, { and: a, eq: e }) => {
-			const conds = [];
-			if (opts.entryId) conds.push(e(s.entryId, opts.entryId));
-			if (statusFilter) conds.push(e(s.status, statusFilter));
-			return conds.length ? a(...conds) : undefined;
-		},
-		// Exclude the large proposedContent blob from the list view — the diff is
-		// only needed in the single-submission detail (getSubmission).
-		columns: {
-			id: true,
-			draftId: true,
-			entryId: true,
-			collectionId: true,
-			title: true,
-			submitterUserId: true,
-			baseRevisionId: true,
-			changeNote: true,
-			// Resubmit chain scalars: the reviewer list badges "round N" from these.
-			previousSubmissionId: true,
-			round: true,
-			status: true,
-			verdict: true,
-			findingsJson: true,
-			reviewerUserId: true,
-			reviewedAt: true,
-			mergedRevisionId: true,
-			createdAt: true,
-		},
-		orderBy: (s, { desc: d }) => [d(s.createdAt)],
-		limit,
-	});
+	const rows = await readQuery(
+		db.query.knowledgeSubmissions.findMany({
+			where: (s, { and: a, eq: e }) => {
+				const conds = [];
+				if (opts.entryId) conds.push(e(s.entryId, opts.entryId));
+				if (statusFilter) conds.push(e(s.status, statusFilter));
+				return conds.length ? a(...conds) : undefined;
+			},
+			// Exclude the large proposedContent blob from the list view — the diff is
+			// only needed in the single-submission detail (getSubmission).
+			columns: {
+				id: true,
+				draftId: true,
+				entryId: true,
+				collectionId: true,
+				title: true,
+				submitterUserId: true,
+				baseRevisionId: true,
+				changeNote: true,
+				// Resubmit chain scalars: the reviewer list badges "round N" from these.
+				previousSubmissionId: true,
+				round: true,
+				status: true,
+				verdict: true,
+				findingsJson: true,
+				reviewerUserId: true,
+				reviewedAt: true,
+				mergedRevisionId: true,
+				createdAt: true,
+			},
+			orderBy: (s, { desc: d }) => [d(s.createdAt)],
+			limit,
+		}),
+		{ ...readOptions, executionPolicy: "worker-required" },
+	);
 	// Filter to entries the principal can review (or admin).
 	const caps = await resolvePrincipalCaps(principal);
 	// Drop the caller's own submissions: `review` refuses self-review for non-admins, so
@@ -1509,17 +1674,20 @@ async function listSubmissions(
 	];
 	const entries =
 		entryIds.length > 0
-			? await db.query.knowledgeEntries.findMany({
-					where: (e, { inArray }) => inArray(e.id, entryIds),
-					columns: {
-						id: true,
-						collectionId: true,
-						ownerUserId: true,
-						classificationLevel: true,
-						controlledTagsJson: true,
-						reviewTagsJson: true,
-					},
-				})
+			? await readQuery(
+					db.query.knowledgeEntries.findMany({
+						where: (e, { inArray }) => inArray(e.id, entryIds),
+						columns: {
+							id: true,
+							collectionId: true,
+							ownerUserId: true,
+							classificationLevel: true,
+							controlledTagsJson: true,
+							reviewTagsJson: true,
+						},
+					}),
+					{ ...readOptions, executionPolicy: "worker-required" },
+				)
 			: [];
 	const entryById = new Map(entries.map((e) => [e.id, e]));
 	// Batch-load collections referenced by BOTH linked entries and standalone submissions so
@@ -1532,16 +1700,19 @@ async function listSubmissions(
 	];
 	const cols =
 		colIds.length > 0
-			? await db.query.knowledgeCollections.findMany({
-					where: (c, { inArray }) => inArray(c.id, colIds),
-					columns: {
-						id: true,
-						defaultLevel: true,
-						classificationLevel: true,
-						controlledTagsJson: true,
-						ownerUserId: true,
-					},
-				})
+			? await readQuery(
+					db.query.knowledgeCollections.findMany({
+						where: (c, { inArray }) => inArray(c.id, colIds),
+						columns: {
+							id: true,
+							defaultLevel: true,
+							classificationLevel: true,
+							controlledTagsJson: true,
+							ownerUserId: true,
+						},
+					}),
+					{ ...readOptions, executionPolicy: "worker-required" },
+				)
 			: [];
 	const colById = new Map(cols.map((c) => [c.id, c]));
 	const out: typeof reviewable = [];
@@ -1582,14 +1753,18 @@ const REVIEW_INBOX_COUNT_LIMIT = 100;
 
 async function countReviewInbox(
 	principal: Principal,
+	readOptions: KnowledgeReadOptions = {},
 ): Promise<{ count: number; capped: boolean; limit: number }> {
-	const rows = await db.query.knowledgeSubmissions.findMany({
-		where: (s, { inArray }) => inArray(s.status, ["pending", "conflict"]),
-		// Only the ACL routing scalars — never proposedContent.
-		columns: { id: true, entryId: true, collectionId: true, submitterUserId: true },
-		orderBy: (s, { desc: d }) => [d(s.createdAt)],
-		limit: REVIEW_INBOX_COUNT_LIMIT + 1,
-	});
+	const rows = await readQuery(
+		db.query.knowledgeSubmissions.findMany({
+			where: (s, { inArray }) => inArray(s.status, ["pending", "conflict"]),
+			// Only the ACL routing scalars — never proposedContent.
+			columns: { id: true, entryId: true, collectionId: true, submitterUserId: true },
+			orderBy: (s, { desc: d }) => [d(s.createdAt)],
+			limit: REVIEW_INBOX_COUNT_LIMIT + 1,
+		}),
+		{ ...readOptions, executionPolicy: "worker-required" },
+	);
 	if (rows.length === 0) {
 		return { count: 0, capped: false, limit: REVIEW_INBOX_COUNT_LIMIT };
 	}
@@ -1610,17 +1785,20 @@ async function countReviewInbox(
 	const entryIds = [...new Set(rows.map((s) => s.entryId).filter((id): id is string => !!id))];
 	const entries =
 		entryIds.length > 0
-			? await db.query.knowledgeEntries.findMany({
-					where: (e, { inArray }) => inArray(e.id, entryIds),
-					columns: {
-						id: true,
-						collectionId: true,
-						ownerUserId: true,
-						classificationLevel: true,
-						controlledTagsJson: true,
-						reviewTagsJson: true,
-					},
-				})
+			? await readQuery(
+					db.query.knowledgeEntries.findMany({
+						where: (e, { inArray }) => inArray(e.id, entryIds),
+						columns: {
+							id: true,
+							collectionId: true,
+							ownerUserId: true,
+							classificationLevel: true,
+							controlledTagsJson: true,
+							reviewTagsJson: true,
+						},
+					}),
+					{ ...readOptions, executionPolicy: "worker-required" },
+				)
 			: [];
 	const entryById = new Map(entries.map((e) => [e.id, e]));
 	const colIds = [
@@ -1631,16 +1809,19 @@ async function countReviewInbox(
 	];
 	const cols =
 		colIds.length > 0
-			? await db.query.knowledgeCollections.findMany({
-					where: (c, { inArray }) => inArray(c.id, colIds),
-					columns: {
-						id: true,
-						defaultLevel: true,
-						classificationLevel: true,
-						controlledTagsJson: true,
-						ownerUserId: true,
-					},
-				})
+			? await readQuery(
+					db.query.knowledgeCollections.findMany({
+						where: (c, { inArray }) => inArray(c.id, colIds),
+						columns: {
+							id: true,
+							defaultLevel: true,
+							classificationLevel: true,
+							controlledTagsJson: true,
+							ownerUserId: true,
+						},
+					}),
+					{ ...readOptions, executionPolicy: "worker-required" },
+				)
 			: [];
 	const colById = new Map(cols.map((c) => [c.id, c]));
 
@@ -1680,19 +1861,27 @@ async function countReviewInbox(
  * collection read + write). Every refusal is NotFound, so a request's existence (and its
  * title / body) never leaks to someone who could not review it.
  */
-async function loadViewableSubmission(principal: Principal, submissionId: string) {
-	const sub = await loadSubmission(submissionId);
+async function loadViewableSubmission(
+	principal: Principal,
+	submissionId: string,
+	readOptions: KnowledgeReadOptions = {},
+) {
+	const sub = await loadSubmission(submissionId, readOptions);
 	const caps = await resolvePrincipalCaps(principal);
-	const authority = await submissionReviewAuthority(caps, sub);
+	const authority = await submissionReviewAuthority(caps, sub, readOptions);
 	if (sub.submitterUserId !== principal.userId && !authority.ok) {
 		throw new NotFoundError("Knowledge submission", submissionId);
 	}
 	return { sub, caps, authority };
 }
 
-async function getSubmission(principal: Principal, submissionId: string) {
-	const { sub } = await loadViewableSubmission(principal, submissionId);
-	const baseContent = await baseContentOf(sub.baseRevisionId);
+async function getSubmission(
+	principal: Principal,
+	submissionId: string,
+	readOptions: KnowledgeReadOptions = {},
+) {
+	const { sub } = await loadViewableSubmission(principal, submissionId, readOptions);
+	const baseContent = await baseContentOf(sub.baseRevisionId, readOptions);
 	const unified = createPatch("entry", baseContent, sub.proposedContent, "base", "proposed");
 	return { ...sub, diff: unified };
 }
@@ -1701,13 +1890,19 @@ async function getSubmission(principal: Principal, submissionId: string) {
 const SUBMISSION_HISTORY_LIMIT = 20;
 
 /** Usernames for display; one `inArray` lookup bounded by the caller's row set. */
-async function usernamesById(userIds: (string | null | undefined)[]) {
+async function usernamesById(
+	userIds: (string | null | undefined)[],
+	readOptions: KnowledgeReadOptions = {},
+) {
 	const ids = [...new Set(userIds.filter((id): id is string => !!id))];
 	if (ids.length === 0) return new Map<string, string>();
-	const rows = await db.query.users.findMany({
-		where: (u, { inArray: ia }) => ia(u.id, ids),
-		columns: { id: true, username: true },
-	});
+	const rows = await readQuery(
+		db.query.users.findMany({
+			where: (u, { inArray: ia }) => ia(u.id, ids),
+			columns: { id: true, username: true },
+		}),
+		{ ...readOptions, executionPolicy: "worker-required" },
+	);
 	return new Map(rows.map((u) => [u.id, u.username]));
 }
 
@@ -1722,9 +1917,17 @@ async function usernamesById(userIds: (string | null | undefined)[]) {
  *  - `baseContent` is the fork point the proposal was diffed against — already derivable from
  *    `proposedContent` + `diff`, so it reveals nothing new.
  */
-async function getSubmissionForViewer(principal: Principal, submissionId: string) {
-	const { sub, caps, authority } = await loadViewableSubmission(principal, submissionId);
-	const baseContent = await baseContentOf(sub.baseRevisionId);
+async function getSubmissionForViewer(
+	principal: Principal,
+	submissionId: string,
+	readOptions: KnowledgeReadOptions = {},
+) {
+	const { sub, caps, authority } = await loadViewableSubmission(
+		principal,
+		submissionId,
+		readOptions,
+	);
+	const baseContent = await baseContentOf(sub.baseRevisionId, readOptions);
 	const diff = createPatch("entry", baseContent, sub.proposedContent, "base", "proposed");
 
 	// Target rows: reuse what the authority check loaded; a submitter without authority still
@@ -1734,16 +1937,24 @@ async function getSubmissionForViewer(principal: Principal, submissionId: string
 	if (!authority.ok) {
 		if (sub.entryId) {
 			entry =
-				(await db.query.knowledgeEntries.findFirst({
-					where: eq(knowledgeEntries.id, sub.entryId),
-				})) ?? null;
+				(await readQueryFirst(
+					db.query.knowledgeEntries.findMany({
+						limit: 1,
+						where: eq(knowledgeEntries.id, sub.entryId),
+					}),
+					{ ...readOptions, executionPolicy: "worker-required" },
+				)) ?? null;
 		}
 		const colId = entry?.collectionId ?? sub.collectionId;
 		if (colId) {
 			collection =
-				(await db.query.knowledgeCollections.findFirst({
-					where: eq(knowledgeCollections.id, colId),
-				})) ?? null;
+				(await readQueryFirst(
+					db.query.knowledgeCollections.findMany({
+						limit: 1,
+						where: eq(knowledgeCollections.id, colId),
+					}),
+					{ ...readOptions, executionPolicy: "worker-required" },
+				)) ?? null;
 		}
 	}
 	const aclCol = collection ? toAclCollection(collection) : null;
@@ -1756,40 +1967,42 @@ async function getSubmissionForViewer(principal: Principal, submissionId: string
 		drift = {
 			drifted,
 			versionsBehind: drifted
-				? await countVersionsBehind(sub.baseRevisionId, entry.currentRevisionId)
+				? await countVersionsBehind(sub.baseRevisionId, entry.currentRevisionId, readOptions)
 				: 0,
 		};
 	}
 
 	// Rounds of the same proposal (resubmits share the draft). Restricted to the same target so
 	// a standalone draft re-targeted elsewhere never surfaces another collection's request.
-	const history = await db.query.knowledgeSubmissions.findMany({
-		where: (s, { eq: e }) => e(s.draftId, sub.draftId),
-		columns: {
-			id: true,
-			entryId: true,
-			collectionId: true,
-			changeNote: true,
-			round: true,
-			status: true,
-			verdict: true,
-			findingsJson: true,
-			reviewerUserId: true,
-			reviewedAt: true,
-			createdAt: true,
-		},
-		// Rounds can share a millisecond timestamp; round then id keeps the order total.
-		orderBy: (s, { desc: d }) => [d(s.createdAt), d(s.round), d(s.id)],
-		limit: SUBMISSION_HISTORY_LIMIT,
-	});
+	const history = await readQuery(
+		db.query.knowledgeSubmissions.findMany({
+			where: (s, { eq: e }) => e(s.draftId, sub.draftId),
+			columns: {
+				id: true,
+				entryId: true,
+				collectionId: true,
+				changeNote: true,
+				round: true,
+				status: true,
+				verdict: true,
+				findingsJson: true,
+				reviewerUserId: true,
+				reviewedAt: true,
+				createdAt: true,
+			},
+			// Rounds can share a millisecond timestamp; round then id keeps the order total.
+			orderBy: (s, { desc: d }) => [d(s.createdAt), d(s.round), d(s.id)],
+			limit: SUBMISSION_HISTORY_LIMIT,
+		}),
+		{ ...readOptions, executionPolicy: "worker-required" },
+	);
 	const sameTarget = history.filter(
 		(h) => h.entryId === sub.entryId && h.collectionId === sub.collectionId,
 	);
-	const names = await usernamesById([
-		sub.submitterUserId,
-		sub.reviewerUserId,
-		...sameTarget.map((h) => h.reviewerUserId),
-	]);
+	const names = await usernamesById(
+		[sub.submitterUserId, sub.reviewerUserId, ...sameTarget.map((h) => h.reviewerUserId)],
+		readOptions,
+	);
 
 	return {
 		...sub,
@@ -1819,26 +2032,30 @@ async function getSubmissionForViewer(principal: Principal, submissionId: string
 async function listSubmissionsForInbox(
 	principal: Principal,
 	opts: { entryId?: string; status?: string; limit?: number },
+	readOptions: KnowledgeReadOptions = {},
 ) {
-	const rows = await listSubmissions(principal, opts);
+	const rows = await listSubmissions(principal, opts, readOptions);
 	if (rows.length === 0) return [];
 	const caps = await resolvePrincipalCaps(principal);
 	const entryIds = [...new Set(rows.map((s) => s.entryId).filter((id): id is string => !!id))];
 	const entries =
 		entryIds.length > 0
-			? await db.query.knowledgeEntries.findMany({
-					where: (e, { inArray: ia }) => ia(e.id, entryIds),
-					columns: {
-						id: true,
-						title: true,
-						collectionId: true,
-						ownerUserId: true,
-						classificationLevel: true,
-						controlledTagsJson: true,
-						reviewTagsJson: true,
-						currentRevisionId: true,
-					},
-				})
+			? await readQuery(
+					db.query.knowledgeEntries.findMany({
+						where: (e, { inArray: ia }) => ia(e.id, entryIds),
+						columns: {
+							id: true,
+							title: true,
+							collectionId: true,
+							ownerUserId: true,
+							classificationLevel: true,
+							controlledTagsJson: true,
+							reviewTagsJson: true,
+							currentRevisionId: true,
+						},
+					}),
+					{ ...readOptions, executionPolicy: "worker-required" },
+				)
 			: [];
 	const entryById = new Map(entries.map((e) => [e.id, e]));
 	const colIds = [
@@ -1849,20 +2066,26 @@ async function listSubmissionsForInbox(
 	];
 	const cols =
 		colIds.length > 0
-			? await db.query.knowledgeCollections.findMany({
-					where: (c, { inArray: ia }) => ia(c.id, colIds),
-					columns: {
-						id: true,
-						name: true,
-						defaultLevel: true,
-						classificationLevel: true,
-						controlledTagsJson: true,
-						ownerUserId: true,
-					},
-				})
+			? await readQuery(
+					db.query.knowledgeCollections.findMany({
+						where: (c, { inArray: ia }) => ia(c.id, colIds),
+						columns: {
+							id: true,
+							name: true,
+							defaultLevel: true,
+							classificationLevel: true,
+							controlledTagsJson: true,
+							ownerUserId: true,
+						},
+					}),
+					{ ...readOptions, executionPolicy: "worker-required" },
+				)
 			: [];
 	const colById = new Map(cols.map((c) => [c.id, c]));
-	const names = await usernamesById(rows.map((s) => s.submitterUserId));
+	const names = await usernamesById(
+		rows.map((s) => s.submitterUserId),
+		readOptions,
+	);
 
 	const out = [];
 	for (const s of rows) {
@@ -1915,31 +2138,38 @@ const SUBMISSION_OUTCOME_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 /** Badge ceiling for unread verdicts: `limit + 1` rows answer count and "is there more". */
 const SUBMISSION_OUTCOME_UNREAD_LIMIT = 99;
 
-async function listMySubmissionOutcomes(principal: Principal, opts: { limit?: number } = {}) {
+async function listMySubmissionOutcomes(
+	principal: Principal,
+	opts: { limit?: number } = {},
+	readOptions: KnowledgeReadOptions = {},
+) {
 	if (!principal.userId) return [];
 	const limit = Math.min(opts.limit ?? SUBMISSION_OUTCOME_LIMIT, SUBMISSION_OUTCOME_LIMIT);
 	const cutoff = new Date(Date.now() - SUBMISSION_OUTCOME_MAX_AGE_MS).toISOString();
-	return db.query.knowledgeSubmissions.findMany({
-		where: (s, { and: a, eq: e, inArray: ia, gte }) =>
-			a(
-				e(s.submitterUserId, principal.userId),
-				ia(s.status, [...SUBMISSION_OUTCOME_STATUSES]),
-				gte(s.reviewedAt, cutoff),
-			),
-		columns: {
-			id: true,
-			draftId: true,
-			entryId: true,
-			status: true,
-			verdict: true,
-			findingsJson: true,
-			reviewedAt: true,
-			authorReadAt: true,
-			createdAt: true,
-		},
-		orderBy: (s, { desc: d }) => [d(s.reviewedAt)],
-		limit,
-	});
+	return readQuery(
+		db.query.knowledgeSubmissions.findMany({
+			where: (s, { and: a, eq: e, inArray: ia, gte }) =>
+				a(
+					e(s.submitterUserId, principal.userId),
+					ia(s.status, [...SUBMISSION_OUTCOME_STATUSES]),
+					gte(s.reviewedAt, cutoff),
+				),
+			columns: {
+				id: true,
+				draftId: true,
+				entryId: true,
+				status: true,
+				verdict: true,
+				findingsJson: true,
+				reviewedAt: true,
+				authorReadAt: true,
+				createdAt: true,
+			},
+			orderBy: (s, { desc: d }) => [d(s.reviewedAt)],
+			limit,
+		}),
+		{ ...readOptions, executionPolicy: "worker-required" },
+	);
 }
 
 /**
@@ -1951,20 +2181,24 @@ async function listMySubmissionOutcomes(principal: Principal, opts: { limit?: nu
  */
 async function countUnreadSubmissionOutcomes(
 	principal: Principal,
+	readOptions: KnowledgeReadOptions = {},
 ): Promise<{ count: number; capped: boolean }> {
 	if (!principal.userId) return { count: 0, capped: false };
 	const cutoff = new Date(Date.now() - SUBMISSION_OUTCOME_MAX_AGE_MS).toISOString();
-	const rows = await db.query.knowledgeSubmissions.findMany({
-		where: (s, { and: a, eq: e, inArray: ia, gte, isNull: n }) =>
-			a(
-				e(s.submitterUserId, principal.userId),
-				ia(s.status, [...SUBMISSION_OUTCOME_STATUSES]),
-				gte(s.reviewedAt, cutoff),
-				n(s.authorReadAt),
-			),
-		columns: { id: true },
-		limit: SUBMISSION_OUTCOME_UNREAD_LIMIT + 1,
-	});
+	const rows = await readQuery(
+		db.query.knowledgeSubmissions.findMany({
+			where: (s, { and: a, eq: e, inArray: ia, gte, isNull: n }) =>
+				a(
+					e(s.submitterUserId, principal.userId),
+					ia(s.status, [...SUBMISSION_OUTCOME_STATUSES]),
+					gte(s.reviewedAt, cutoff),
+					n(s.authorReadAt),
+				),
+			columns: { id: true },
+			limit: SUBMISSION_OUTCOME_UNREAD_LIMIT + 1,
+		}),
+		{ ...readOptions, executionPolicy: "worker-required" },
+	);
 	const capped = rows.length > SUBMISSION_OUTCOME_UNREAD_LIMIT;
 	return { count: capped ? SUBMISSION_OUTCOME_UNREAD_LIMIT : rows.length, capped };
 }
@@ -1988,19 +2222,26 @@ async function markSubmissionOutcomesRead(
 	return { updated };
 }
 
-async function listMyOpenSubmissions(principal: Principal, opts: { limit?: number } = {}) {
+async function listMyOpenSubmissions(
+	principal: Principal,
+	opts: { limit?: number } = {},
+	readOptions: KnowledgeReadOptions = {},
+) {
 	if (!principal.userId) return [];
 	const limit = Math.min(opts.limit ?? SUBMISSION_LIST_MAX, SUBMISSION_LIST_MAX);
-	return db.query.knowledgeSubmissions.findMany({
-		where: (s, { and: a, eq: e, inArray: ia }) =>
-			a(
-				e(s.submitterUserId, principal.userId),
-				ia(s.status, ["pending", "conflict", "changes_requested"]),
-			),
-		columns: { id: true, draftId: true, entryId: true, status: true, createdAt: true },
-		orderBy: (s, { desc: d }) => [d(s.createdAt)],
-		limit,
-	});
+	return readQuery(
+		db.query.knowledgeSubmissions.findMany({
+			where: (s, { and: a, eq: e, inArray: ia }) =>
+				a(
+					e(s.submitterUserId, principal.userId),
+					ia(s.status, ["pending", "conflict", "changes_requested"]),
+				),
+			columns: { id: true, draftId: true, entryId: true, status: true, createdAt: true },
+			orderBy: (s, { desc: d }) => [d(s.createdAt)],
+			limit,
+		}),
+		{ ...readOptions, executionPolicy: "worker-required" },
+	);
 }
 
 /**
@@ -2018,35 +2259,39 @@ async function listSubmissionsForDraft(
 	principal: Principal,
 	draftId: string,
 	opts: { limit?: number } = {},
+	readOptions: KnowledgeReadOptions = {},
 ) {
 	// Authorization + existence: author or admin, else NotFound (no existence leak).
-	await loadOwnDraft(principal, draftId);
+	await loadOwnDraft(principal, draftId, readOptions);
 	const limit = Math.min(opts.limit ?? 50, SUBMISSION_LIST_MAX);
-	return db.query.knowledgeSubmissions.findMany({
-		where: (s, { eq: e }) => e(s.draftId, draftId),
-		columns: {
-			id: true,
-			draftId: true,
-			entryId: true,
-			collectionId: true,
-			title: true,
-			submitterUserId: true,
-			baseRevisionId: true,
-			changeNote: true,
-			// Resubmit chain scalars: the author's history shows which round each attempt was.
-			previousSubmissionId: true,
-			round: true,
-			status: true,
-			verdict: true,
-			findingsJson: true,
-			reviewerUserId: true,
-			reviewedAt: true,
-			mergedRevisionId: true,
-			createdAt: true,
-		},
-		orderBy: (s, { desc: d }) => [d(s.createdAt)],
-		limit,
-	});
+	return readQuery(
+		db.query.knowledgeSubmissions.findMany({
+			where: (s, { eq: e }) => e(s.draftId, draftId),
+			columns: {
+				id: true,
+				draftId: true,
+				entryId: true,
+				collectionId: true,
+				title: true,
+				submitterUserId: true,
+				baseRevisionId: true,
+				changeNote: true,
+				// Resubmit chain scalars: the author's history shows which round each attempt was.
+				previousSubmissionId: true,
+				round: true,
+				status: true,
+				verdict: true,
+				findingsJson: true,
+				reviewerUserId: true,
+				reviewedAt: true,
+				mergedRevisionId: true,
+				createdAt: true,
+			},
+			orderBy: (s, { desc: d }) => [d(s.createdAt)],
+			limit,
+		}),
+		{ ...readOptions, executionPolicy: "worker-required" },
+	);
 }
 
 // ─── Author-side state machine closure (withdraw / resubmit) ─────────────
@@ -2082,8 +2327,9 @@ async function withdrawSubmission(
 	principal: Principal,
 	submissionId: string,
 	input: { reason?: string } = {},
+	readOptions: KnowledgeReadOptions = {},
 ) {
-	const sub = await loadSubmission(submissionId);
+	const sub = await loadSubmission(submissionId, readOptions);
 	// Existence is only revealed to the submitter or an admin (mirrors loadOwnDraft).
 	if (!canActAsSubmitter(principal, sub)) {
 		throw new NotFoundError("Knowledge submission", submissionId);
@@ -2140,8 +2386,9 @@ async function resubmit(
 	principal: Principal,
 	submissionId: string,
 	input: { changeNote?: string } = {},
+	readOptions: KnowledgeReadOptions = {},
 ) {
-	const sub = await loadSubmission(submissionId);
+	const sub = await loadSubmission(submissionId, readOptions);
 	if (!canActAsSubmitter(principal, sub)) {
 		throw new NotFoundError("Knowledge submission", submissionId);
 	}
@@ -2153,11 +2400,17 @@ async function resubmit(
 	const round = (sub.round ?? 1) + 1;
 	// submitForReview re-validates draft ownership, archived state, standalone target/title,
 	// and refuses a second OPEN request — no duplicated guard here.
-	return submitForReview(principal, sub.draftId, {
-		changeNote: input.changeNote?.trim() || `Re-submitted after requested changes (round ${round})`,
-		previousSubmissionId: sub.id,
-		round,
-	});
+	return submitForReview(
+		principal,
+		sub.draftId,
+		{
+			changeNote:
+				input.changeNote?.trim() || `Re-submitted after requested changes (round ${round})`,
+			previousSubmissionId: sub.id,
+			round,
+		},
+		readOptions,
+	);
 }
 
 // ─── Review scope (who am I a reviewer for?) ─────────────────────────────
@@ -2185,7 +2438,10 @@ const REVIEW_SCOPE_LIMIT = 100;
  * submission-table scan. Admins are reported via `isAdmin` rather than by enumerating
  * everything they could review.
  */
-async function getMyReviewScope(principal: Principal): Promise<{
+async function getMyReviewScope(
+	principal: Principal,
+	readOptions: KnowledgeReadOptions = {},
+): Promise<{
 	isAdmin: boolean;
 	reviewTags: { id: string; name: string }[];
 	collections: { id: string; name: string; slug: string }[];
@@ -2203,11 +2459,14 @@ async function getMyReviewScope(principal: Principal): Promise<{
 	const idList = [...tagIds].slice(0, REVIEW_SCOPE_LIMIT);
 	const tagRows =
 		idList.length > 0
-			? await db.query.knowledgeTags.findMany({
-					where: (tg, { inArray: ia }) => ia(tg.id, idList),
-					columns: { id: true, name: true },
-					limit: REVIEW_SCOPE_LIMIT,
-				})
+			? await readQuery(
+					db.query.knowledgeTags.findMany({
+						where: (tg, { inArray: ia }) => ia(tg.id, idList),
+						columns: { id: true, name: true },
+						limit: REVIEW_SCOPE_LIMIT,
+					}),
+					{ ...readOptions, executionPolicy: "worker-required" },
+				)
 			: [];
 	const nameById = new Map(tagRows.map((tg) => [tg.id, tg.name]));
 	// A granted tag whose row was deleted still confers authority in canReview (it compares
@@ -2217,19 +2476,22 @@ async function getMyReviewScope(principal: Principal): Promise<{
 	// Collections the caller may write into (→ may approve standalone publishes there).
 	// Read gate first (so an unreadable collection is never named), then the write gate.
 	// LIMIT + 1 detects "more than the cap" without a COUNT(*).
-	const cols = await db.query.knowledgeCollections.findMany({
-		columns: {
-			id: true,
-			name: true,
-			slug: true,
-			defaultLevel: true,
-			classificationLevel: true,
-			controlledTagsJson: true,
-			ownerUserId: true,
-		},
-		orderBy: (c, { asc }) => [asc(c.name)],
-		limit: REVIEW_SCOPE_LIMIT + 1,
-	});
+	const cols = await readQuery(
+		db.query.knowledgeCollections.findMany({
+			columns: {
+				id: true,
+				name: true,
+				slug: true,
+				defaultLevel: true,
+				classificationLevel: true,
+				controlledTagsJson: true,
+				ownerUserId: true,
+			},
+			orderBy: (c, { asc }) => [asc(c.name)],
+			limit: REVIEW_SCOPE_LIMIT + 1,
+		}),
+		{ ...readOptions, executionPolicy: "worker-required" },
+	);
 	const writable: { id: string; name: string; slug: string }[] = [];
 	for (const c of cols.slice(0, REVIEW_SCOPE_LIMIT)) {
 		const aclCol = toAclCollection(c);
@@ -2245,11 +2507,14 @@ async function getMyReviewScope(principal: Principal): Promise<{
 	// own" instead of implying "you have no review rights" to someone who does.
 	const ownedEntryRows = caps.isAdmin
 		? []
-		: await db.query.knowledgeEntries.findMany({
-				where: (e, { eq: eqOp }) => eqOp(e.ownerUserId, principal.userId),
-				columns: { id: true },
-				limit: REVIEW_SCOPE_LIMIT + 1,
-			});
+		: await readQuery(
+				db.query.knowledgeEntries.findMany({
+					where: (e, { eq: eqOp }) => eqOp(e.ownerUserId, principal.userId),
+					columns: { id: true },
+					limit: REVIEW_SCOPE_LIMIT + 1,
+				}),
+				{ ...readOptions, executionPolicy: "worker-required" },
+			);
 	const ownedEntryCount = Math.min(ownedEntryRows.length, REVIEW_SCOPE_LIMIT);
 
 	return {

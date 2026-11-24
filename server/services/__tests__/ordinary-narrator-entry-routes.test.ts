@@ -2,7 +2,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } 
 import { decodeBlockMessage } from "@frontend/lib/block-protocol";
 import { messageBlocks, messageBody } from "@shared/narrator-blocks/message-blocks";
 import { Hono } from "hono";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	aclGrants,
 	narratorMessageRefs,
@@ -12,8 +12,12 @@ import {
 	users,
 } from "../../db/schema";
 import { AppError } from "../../lib/errors";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
+afterAll(() => fixture.close());
 const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite, activeDatabaseBackend: "sqlite" }));
 const { narratorContext } = await import("../narrator-context");
@@ -234,11 +238,15 @@ describe("ModelTrace HTTP entry", () => {
 		const service = await import("../modeltrace-service");
 		const start = spyOn(service, "startModelTrace").mockResolvedValue({ id: "trace-child" });
 		spies.push(start);
-		const response = await post(appFor(), "/narrators/source/modeltrace");
+		const response = await appFor().request("/narrators/source/modeltrace", { method: "POST" });
 		expect(response.status).toBe(201);
 		expect(await response.json()).toEqual({ id: "trace-child" });
 		expect(start).toHaveBeenCalledTimes(1);
-		expect(start.mock.calls[0]?.slice(0, 2)).toEqual(["source", "owner"]);
+		expect(start.mock.calls[0]?.slice(0, 2)).toEqual([
+			"source",
+			{ userId: "owner", isAdmin: false },
+		]);
+		expect(start.mock.calls[0]?.[3]).toEqual({});
 	});
 
 	test("retry requires write access to the diagnostic child", async () => {
@@ -259,7 +267,10 @@ describe("ModelTrace HTTP entry", () => {
 		expect(response.status).toBe(200);
 		expect(await response.json()).toEqual({ id: "source" });
 		expect(retry).toHaveBeenCalledTimes(1);
-		expect(retry.mock.calls[0]?.slice(0, 2)).toEqual(["source", "owner"]);
+		expect(retry.mock.calls[0]?.slice(0, 2)).toEqual([
+			"source",
+			{ userId: "owner", isAdmin: false },
+		]);
 	});
 });
 

@@ -7,8 +7,31 @@ import { type ListenerHandle, narratorWSManager } from "../lib/narrator-ws-manag
 export const workspaceContextKey = (id: string) => ["workspaceContext", id] as const;
 const transitionKey = (id: string) => ["workspaceContextTransition", id] as const;
 
+/** Minimum authoritative identity required before choosing any device-specific path. */
+export function isWorkspaceContextIdentity(value: unknown): value is WorkspaceContext {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const context = value as Partial<WorkspaceContext>;
+	return (
+		typeof context.deviceId === "string" &&
+		context.deviceId.trim().length > 0 &&
+		typeof context.contextKey === "string" &&
+		context.contextKey.trim().length > 0 &&
+		Number.isSafeInteger(context.revision) &&
+		(context.revision as number) >= 0
+	);
+}
+
+/** Read again at an action boundary; a callback may predate a switch's React render. */
+export function currentWorkspaceContext(qc: QueryClient, narratorId: string) {
+	if (qc.getQueryData(transitionKey(narratorId)) === true) return undefined;
+	const context = qc.getQueryData<WorkspaceContext>(workspaceContextKey(narratorId));
+	return isWorkspaceContextIdentity(context) ? context : undefined;
+}
+
 export function workspaceFileTarget(context: WorkspaceContext | undefined) {
-	return context?.deviceId && context.cwd ? { deviceId: context.deviceId, cwd: context.cwd } : null;
+	return isWorkspaceContextIdentity(context) && context.cwd
+		? { deviceId: context.deviceId, cwd: context.cwd }
+		: null;
 }
 
 /** Do not let an old read or out-of-order WS notification undo a completed switch. */
@@ -16,7 +39,10 @@ export function latestWorkspaceContext(
 	previous: WorkspaceContext | undefined,
 	incoming: WorkspaceContext,
 ): WorkspaceContext {
-	return previous && previous.revision > incoming.revision ? previous : incoming;
+	if (!isWorkspaceContextIdentity(incoming)) throw new Error("Invalid workspace context identity");
+	return isWorkspaceContextIdentity(previous) && previous.revision > incoming.revision
+		? previous
+		: incoming;
 }
 
 export function applyWorkspaceContext(qc: QueryClient, id: string, context: WorkspaceContext) {
@@ -52,11 +78,11 @@ function subscribeWorkspaceContext(qc: QueryClient, narratorId: string) {
 			{ narratorIds: [narratorId], types: ["workspace_context_changed"] },
 			(event) => {
 				const context = event.current as WorkspaceContext | undefined;
-				if (context?.contextKey && typeof context.revision === "number") {
+				if (isWorkspaceContextIdentity(context)) {
 					const previous = qc.getQueryData<WorkspaceContext>(workspaceContextKey(narratorId));
-					if (previous && context.revision < previous.revision) return;
+					if (isWorkspaceContextIdentity(previous) && context.revision < previous.revision) return;
 					applyWorkspaceContext(qc, narratorId, context);
-					if (!previous || context.revision > previous.revision)
+					if (!isWorkspaceContextIdentity(previous) || context.revision > previous.revision)
 						qc.setQueryData(transitionKey(narratorId), false);
 					void qc.invalidateQueries({ queryKey: workspaceContextKey(narratorId) });
 				}
@@ -96,9 +122,35 @@ export function useWorkspaceContext(narratorId: string) {
 	});
 	return {
 		...query,
-		data: transition.data ? undefined : query.data,
+		data: transition.data || !isWorkspaceContextIdentity(query.data) ? undefined : query.data,
 		transitioning: transition.data === true,
 	};
+}
+
+async function beginWorkspaceTransition(qc: QueryClient, narratorId: string) {
+	qc.setQueryData(transitionKey(narratorId), true);
+	await qc.cancelQueries({ queryKey: workspaceContextKey(narratorId) });
+}
+
+async function finishWorkspaceTransition(
+	qc: QueryClient,
+	narratorId: string,
+	context?: WorkspaceContext,
+) {
+	await qc.cancelQueries({ queryKey: workspaceContextKey(narratorId) });
+	const incoming = context ?? (await api.getWorkspaceContext(narratorId));
+	applyWorkspaceContext(qc, narratorId, incoming);
+	qc.setQueryData(transitionKey(narratorId), false);
+}
+
+async function recoverWorkspaceTransition(qc: QueryClient, narratorId: string) {
+	// An uncertain response may still have switched. Only an authoritative read
+	// or a valid newer context event can release the transition.
+	try {
+		await finishWorkspaceTransition(qc, narratorId);
+	} catch {
+		/* Keep the old cached device unavailable. */
+	}
 }
 
 /** HTTP device selection and model SwitchDevice share the server's revisioned context. */
@@ -107,26 +159,10 @@ export function useUpdateExecutionDevice(narratorId: string, onError?: (error: E
 	return useMutation({
 		mutationFn: (deviceId: string | null) => api.updateNarratorDefaultDevice(narratorId, deviceId),
 		retry: false,
-		onMutate: async () => {
-			qc.setQueryData(transitionKey(narratorId), true);
-			await qc.cancelQueries({ queryKey: workspaceContextKey(narratorId) });
-		},
-		onSuccess: async (result) => {
-			await qc.cancelQueries({ queryKey: workspaceContextKey(narratorId) });
-			const incoming = result.current ?? (await api.getWorkspaceContext(narratorId));
-			applyWorkspaceContext(qc, narratorId, incoming);
-			qc.setQueryData(transitionKey(narratorId), false);
-		},
+		onMutate: () => beginWorkspaceTransition(qc, narratorId),
+		onSuccess: (result) => finishWorkspaceTransition(qc, narratorId, result.current),
 		onError: async (error) => {
-			// A dropped HTTP response may still have switched. Re-enable only after
-			// an authoritative read; never infer the device/cwd from the failed request.
-			try {
-				const incoming = await api.getWorkspaceContext(narratorId);
-				applyWorkspaceContext(qc, narratorId, incoming);
-				qc.setQueryData(transitionKey(narratorId), false);
-			} catch {
-				/* Fail closed until another successful selection/context event. */
-			}
+			await recoverWorkspaceTransition(qc, narratorId);
 			onError?.(error);
 		},
 		onSettled: () => {
@@ -143,12 +179,10 @@ export function useSwitchWorkspaceContext(narratorId: string) {
 		mutationFn: (input: SwitchWorkingDirectoryRequest) =>
 			api.switchWorkspaceContext(narratorId, input),
 		retry: false,
-		onError: () => {
-			void qc.invalidateQueries({ queryKey: workspaceContextKey(narratorId) });
-		},
-		onSuccess: async ({ current }) => {
-			await qc.cancelQueries({ queryKey: workspaceContextKey(narratorId) });
-			applyWorkspaceContext(qc, narratorId, current);
+		onMutate: () => beginWorkspaceTransition(qc, narratorId),
+		onSuccess: ({ current }) => finishWorkspaceTransition(qc, narratorId, current),
+		onError: () => recoverWorkspaceTransition(qc, narratorId),
+		onSettled: () => {
 			void qc.invalidateQueries({ queryKey: workspaceContextKey(narratorId) });
 		},
 	});

@@ -2,20 +2,25 @@ import type { Dirent } from "node:fs";
 import { existsSync } from "node:fs";
 import { lstat, readdir, rm, rmdir, stat } from "node:fs/promises";
 import { resolve } from "node:path";
+import { isFileHistoryEnabledForDevice } from "@shared/file-change-protocol";
 import {
 	STORAGE_CATEGORY_KEYS,
 	STORAGE_CATEGORY_PROGRESS_MESSAGE,
 	type StorageCategoryKey,
 } from "@shared/storage-categories";
-import { eq, sql } from "drizzle-orm";
+import { and, asc, eq, gt, isNotNull, sql } from "drizzle-orm";
 import { db } from "../db";
 import { chatAttachments, chatRooms, narratorMessages, narrators, projects } from "../db/schema";
+import { readQuery } from "../db/worker-read";
+import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import {
 	CHAT_DRAFT_ATTACHMENT_TTL_MS,
 	deleteChatAttachmentFiles,
 	getChatAttachmentsDir,
 	listStoredChatAttachmentNames,
 } from "../lib/chat-attachments";
+import { coordinatorOutputsRoot } from "../lib/coordinator-outputs-path";
+import { DbReadTaskTimeoutError } from "../lib/db-worker/pool";
 import {
 	DirectoryMeasureAbortedError,
 	measureDirectoriesOffThread,
@@ -445,17 +450,69 @@ async function scanDormantIgnored(
 	};
 }
 
+/**
+ * A team coordinator's saved tool results (`~/.narrafork/coordinator-outputs/<narratorId>`,
+ * Project Teams P2): capped per session and removed with the session.
+ */
+async function scanCoordinatorOutputs(
+	options: CategoryScanOptions = {},
+): Promise<StorageCategoryResult> {
+	const dir = coordinatorOutputsRoot();
+	const measured = await measureDirSize(dir, options);
+	let narratorDirs = 0;
+	try {
+		const entries = await readdir(dir, { withFileTypes: true });
+		narratorDirs = entries.filter((entry) => entry.isDirectory()).length;
+	} catch {
+		// dir may not exist yet
+	}
+	return {
+		key: "coordinatorOutputs",
+		sizeBytes: measured.sizeBytes,
+		...(measured.truncated ? { truncated: true } : {}),
+		details: { narratorDirs },
+	};
+}
+
+async function readWorktreeProjects(signal?: AbortSignal) {
+	const pageSize = 200;
+	const deadline = performance.now() + 30_000;
+	const rows: Pick<typeof projects.$inferSelect, "id" | "name" | "gitPath">[] = [];
+	let cursor: string | undefined;
+	do {
+		throwIfAborted(signal);
+		const timeoutMs = Math.ceil(deadline - performance.now());
+		if (timeoutMs <= 0) throw new DbReadTaskTimeoutError("Worktree project lookup timed out");
+		const page = await readQuery(
+			db
+				.select({ id: projects.id, name: projects.name, gitPath: projects.gitPath })
+				.from(projects)
+				.where(
+					and(
+						isNotNull(projects.gitPath),
+						cursor === undefined ? undefined : gt(projects.id, cursor),
+					),
+				)
+				.orderBy(asc(projects.id))
+				.limit(pageSize),
+			{ signal, maxRows: pageSize, timeoutMs },
+		).catch((error) => {
+			throwIfAborted(signal);
+			throw error;
+		});
+		rows.push(...page);
+		cursor = page.length === pageSize ? page.at(-1)?.id : undefined;
+	} while (cursor !== undefined);
+	return rows;
+}
+
 async function scanWorktrees(options: CategoryScanOptions = {}): Promise<StorageCategoryResult> {
 	let totalSize = 0;
 	let worktreeCount = 0;
 	let truncated = false;
 	const projectList: Array<{ name: string; sizeBytes: number; worktreeCount: number }> = [];
 
-	throwIfAborted(options.signal);
-	const allProjects = db
-		.select({ id: projects.id, name: projects.name, gitPath: projects.gitPath })
-		.from(projects)
-		.all();
+	const allProjects = await readWorktreeProjects(options.signal);
 
 	for (const proj of allProjects) {
 		throwIfAborted(options.signal);
@@ -707,6 +764,8 @@ export async function scanStorageCategory(
 				return await scanRequestRecordings(true, options);
 			case "dormantIgnored":
 				return await scanDormantIgnored(options);
+			case "coordinatorOutputs":
+				return await scanCoordinatorOutputs(options);
 			case "containers":
 				return await scanContainers(options);
 		}
@@ -1060,6 +1119,9 @@ export async function repackTreeSnapshots(): Promise<{
 	removed: number;
 	freedBytes: number;
 }> {
+	// These repositories belong to local file history. Preserve their existing
+	// objects without scanning or repacking; other storage maintenance is separate.
+	if (!isFileHistoryEnabledForDevice(LOCAL_DEVICE_ID)) return { removed: 0, freedBytes: 0 };
 	try {
 		await worktreeTreeSnapshot.gcAll();
 	} catch (err) {

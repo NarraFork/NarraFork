@@ -55,7 +55,7 @@ export class WorktreeRemovalFlow {
 	}
 	/** Confirmations the plan demands but the user has not given yet. */
 	get outstanding(): WorktreeRemovalConfirmation[] {
-		const required = this.state.plan?.confirmations ?? [];
+		const required = requiredConfirmations(this.state.plan);
 		return required.filter((item) => !this.state.confirmed.includes(item));
 	}
 	get canSubmit(): boolean {
@@ -82,7 +82,9 @@ export class WorktreeRemovalFlow {
 			this.update({
 				plan,
 				// A confirmation only survives if the fresh plan still asks for it.
-				confirmed: this.state.confirmed.filter((item) => plan.confirmations.includes(item)),
+				confirmed: this.state.confirmed.filter((item) =>
+					requiredConfirmations(plan).includes(item),
+				),
 			});
 		} catch (error) {
 			this.update({ error: messageOf(error), errorCode: codeOf(error) });
@@ -91,7 +93,7 @@ export class WorktreeRemovalFlow {
 		}
 	}
 	toggle(kind: WorktreeRemovalConfirmation, value: boolean): void {
-		if (!this.state.plan?.confirmations.includes(kind)) return;
+		if (!requiredConfirmations(this.state.plan).includes(kind)) return;
 		const confirmed = value
 			? [...new Set([...this.state.confirmed, kind])]
 			: this.state.confirmed.filter((item) => item !== kind);
@@ -123,7 +125,17 @@ export class WorktreeRemovalFlow {
 				expectedRevision: plan.expectedRevision,
 				workspaceKey: this.scope()?.workspaceKey ?? "",
 				path: plan.worktree.path,
-				force: this.state.confirmed.includes("force") ? true : undefined,
+				...(this.state.confirmed.includes("force")
+					? {
+							force: true,
+							// Exactly what the person saw; the server refuses if reality moved on.
+							confirmedLoss: {
+								head: plan.worktree.head,
+								dirtyFileCount: plan.worktree.dirtyFileCount,
+								unreachableCommits: plan.worktree.unreachableCommits ?? 0,
+							},
+						}
+					: {}),
 				acknowledgeUnregistered: this.state.confirmed.includes("acknowledgeUnregistered")
 					? true
 					: undefined,
@@ -156,6 +168,19 @@ function codeOf(error: unknown): string | undefined {
 	if (!(error instanceof ApiError)) return undefined;
 	const code = error.data?.code;
 	return typeof code === "string" && code ? code : undefined;
+}
+
+/**
+ * Confirmations to ask the person for. `rows` mode deletes nothing on disk, so it never
+ * asks to force a loss, even if an older server listed one.
+ */
+export function requiredConfirmations(
+	plan: WorktreeRemovalPlan | undefined,
+): WorktreeRemovalConfirmation[] {
+	const confirmations = plan?.confirmations ?? [];
+	return plan?.worktree.mode === "rows"
+		? confirmations.filter((item) => item !== "force")
+		: confirmations;
 }
 
 /** Blockers rendered as one list; keeps the caller from re-deriving codes. */

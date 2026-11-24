@@ -28,6 +28,37 @@ import {
 } from "./streaming-tool-chunks";
 
 describe("Edit origin handoff", () => {
+	it("preserves the trusted Agent execution through live and synthetic tool projections", () => {
+		const store = createStreamingToolStore();
+		applyStreamingToolStarted(store, {
+			toolUseId: "agent",
+			toolName: "Agent",
+			toolCallId: "exact-agent-pk",
+			executionAttempt: 3,
+			input: { prompt: "work" },
+		});
+		expect(
+			applyStreamingToolStarted(store, {
+				toolUseId: "agent",
+				toolName: "Agent",
+				toolCallId: "exact-agent-pk",
+				executionAttempt: 2,
+				input: { prompt: "stale" },
+			}),
+		).toBe(false);
+		const chunk = store.get("agent");
+		if (!chunk) throw new Error("Missing Agent chunk");
+		expect(topLevelStreamingChunkToToolFields(chunk)).toMatchObject({
+			tcId: "exact-agent-pk",
+			executionAttempt: 3,
+		});
+		const synthetic = buildTopLevelStreamingChunksMsg([chunk], "owner", null);
+		expect(synthetic?.toolCalls?.[0]).toMatchObject({
+			tcId: "exact-agent-pk",
+			executionAttempt: 3,
+			inputJson: { prompt: "work" },
+		});
+	});
 	const input = {
 		file_path: "/a.ts",
 		old_string: `${"h".repeat(20_000)}\nold`,

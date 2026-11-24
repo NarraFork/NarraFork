@@ -37,28 +37,28 @@ bun run build:linux-arm64
 
 ## 本机稳定运行
 
-`bun run start` 和 `bun run start:dev` 先构建本机单文件运行产物，再从该产物启动后端。
-主程序、Worker、迁移及原生依赖固定在同一次构建中；启动后对源码执行 rebase，不会改变后续新建 Worker 使用的代码。
-`start` 使用已构建的 `dist/frontend`；`start:dev` 保留源码 Vite 前端及原端口（前端 41221、后端默认 7778），不要求先构建整站前端。
-显式 `dev` / `dev:all` / `dev:cold` 仍是源码开发模式，不提供这层隔离。
+`bun run start` 先构建本机单文件运行产物，再从该产物启动后端。
+主程序、Worker、迁移及原生依赖固定在同一次构建中；启动后对源码执行 rebase，不会改变后续新建 Worker 使用的代码。它要求先构建整站前端，并将 `dist/frontend` 嵌入产物。
+`bun run start:dev` 默认不构建冻结后端，而是在 production 模式运行源码后端，同时启动源码 Vite。后端默认 7778 直接读取磁盘上的 `dist/frontend`，因此执行 `bun run build` 后无需重启后端即可看到新前端；Vite 热重载入口为 41221。
+显式 `dev` / `dev:all` / `dev:cold` 仍是源码开发模式，不提供 `start` 的运行隔离。
 
-构建不会发布版本，也不会重启或接管已有服务。迁移由新后端取得实例锁后使用内嵌材料执行，不再在启动前单独运行源码迁移。
-构建失败即停止，不回退源码或某个旧版本。构建期间应避免修改源码；运行版本固定不等于构建输入自动取得了 Git 快照。
+`start` 的构建不会发布版本，也不会重启或接管已有服务。迁移由新后端取得实例锁后使用内嵌材料执行，不再在启动前单独运行源码迁移；`start:dev` 则在启动源码后端前执行源码迁移。
+`start` 构建失败即停止，不回退源码或某个旧版本。构建期间应避免修改源码；运行版本固定不等于构建输入自动取得了 Git 快照。
 
 ### 构建一次，多次启动
 
 每次构建输出独占路径以及耗时、产物大小。**日常重启建议复用该路径，代码变更后再构建**：
 
 ```sh
-# 只构建后端，用于与 Vite 搭配
-bun run build:runtime
-bun run start:dev --runtime="<构建输出的可执行文件绝对路径>"
-
-# 连同已有的静态前端一起构建
+# 构建静态前端，并将它嵌入冻结后端
 bun run build
 bun run build:runtime --frontend
+
+# 通过冻结产物提供静态前端及后端
 bun run start --runtime="<构建输出的可执行文件绝对路径>"
 ```
+
+`start:dev` 默认不使用上述冻结产物，以便 7778 能直接看到后续前端构建。显式为 `start:dev` 传入 `--runtime` 可以改用指定冻结产物，但此时前端也会冻结在该产物中。
 
 `--runtime` 明确选择已有产物，跳过编译；找不到该文件会报错，不自动换一个版本。
 后端参数可继续传递，例如 `--no-auto-resume`。不要为了测试上述命令而停止承载会话的服务器；验证请使用独立 HOME、端口和数据库。
@@ -97,6 +97,37 @@ bun scripts/build-cross-platform.ts --platform=linux
 # 仅构建某一平台（完整后缀如 linux-arm64 / darwin-arm64，或短别名 windows/linux/darwin）
 bun scripts/build-cross-platform.ts --platform=linux-arm64
 ```
+
+### 本地 alpha 服务端诊断构建
+
+在 Linux x64 上安装项目依赖后，运行：
+
+```bash
+make build-alpha
+# 可选：指定版本、私有归档目录和 Bun 路径
+make build-alpha VERSION=0.9.16-alpha.2 ARCHIVE_DIR="$HOME/private-builds" BUN=bun
+```
+
+默认自动选择下一个 alpha 版本，并将 Linux x64 baseline 可执行文件、metadata sidecar、SHA256SUMS 与校验报告验证后归档到仓库内的私有 `.build-alpha-archive/`。自动模式跳过已占用的版本；显式重建会备份同名文件。前端资源在构建锁目录内生成并嵌入诊断版，不会覆盖正常启动使用的 `dist/frontend/`。构建会暂时改写并恢复 `package.json`，不要在同一工作区并行构建或发布。此命令不发布任何产物。
+
+正式入口 [scripts/build-cross-platform.ts](../scripts/build-cross-platform.ts) 在启动时冻结一次后端编译配置，并打印配置名称、严格校验状态、编译参数和实际命令参数数组：
+
+- 合法 SemVer 的 `alpha` 预发布版本（例如 `0.9.10-alpha.9`），在本地默认使用 `diagnostic`：`--keep-names --sourcemap --minify-syntax --minify-whitespace`。
+- 非 alpha 版本，或启用了 `CI`、`GITHUB_ACTIONS`、内部 `NF_BUILD_RELEASE_CONTEXT` 的构建，使用 `release`，保持 `--minify`。这三个环境值统一忽略首尾空白和大小写；未设置、空值、`false`、`0` 视为关闭，其余非空值视为开启。
+- [scripts/release.ts](../scripts/release.ts) 为构建子进程强制设置 `NF_BUILD_RELEASE_CONTEXT=1`，覆盖继承值。该标记用于内部发布上下文，不是公开 CLI 开关。
+- `--release-ci` 只开启严格校验（固定 Bun 版本、完整 commit、平台依赖和 sidecar 等），不选择编译配置。本地 alpha 加上该参数仍使用诊断配置；CI 和发布上下文仍使用发布配置。
+
+主入口和所有显式编译的 worker 共享同一配置。前端仍按原 Vite 配置构建，不因后端诊断配置新增公开 sourcemap，也不改变二进制 metadata schema。
+
+构建和验证使用根目录 `packageManager` 固定的 Bun **1.4.3**，先运行所选 Bun 的 `--version`，并保证子进程沿用同一可执行文件。`--compile` 隐含 production 默认行为，因此诊断能力不能仅凭移除 `--minify` 推断。[tests/scripts/build-profile.test.ts](../tests/scripts/build-profile.test.ts) 用真实 compile fixture 验证函数/类名称、主入口与 worker 原始文件行号，以及 CPU profile 中命名热函数的有效采样；运行前设置独立 `HOME`、`NARRAFORK_HOME`、`TMPDIR/TMP/TEMP` 和 `NARRAFORK_ALLOW_MULTIPLE=1`，使用固定 Bun 执行 `test --isolate ./tests/scripts/build-profile.test.ts`。
+
+普通 compile 的 sourcemap 嵌入二进制，可用于异常堆栈的源码定位；测试删除相邻源文件和 `.map` 后仍验证映射。编译器另行生成的后端 `.map` 副产物只保留在私有构建目录，不放入 `dist/frontend/` 或公开分发。嵌入 map 的诊断二进制本身也可能包含源码，应按敏感构建产物保管。
+
+需要 CPU 采样时，仅在隔离数据目录、独立 loopback 端口的有界调试进程上，通过 `BUN_OPTIONS` 临时设置 `--cpu-prof --cpu-prof-dir=<私有目录> --cpu-prof-name=<名称>.cpuprofile`，正常退出后解析结果；不把采样参数嵌入交付二进制，不增加调试端口或常驻 profiler。保留名称不保证所有匿名函数都有业务名称，嵌入 map 也不保证 Linux perf 自动解析全部 JIT 原生地址。
+
+对正在运行的服务，管理员可用自己的会话 Bearer 令牌调用 `POST /api/diagnostics/cpu-profile`。发送空正文或 JSON `{"durationMs":5000}`（正文最多 1 KiB，默认 15 秒，范围 1–30000 毫秒）。请求等待采样完成并下载 `.cpuprofile`，只采样 HTTP 服务的 JS 线程，不包含独立 Worker 或子进程。每个服务进程同时只接受一次采样（忙时返回 409）；断开请求或正常关闭服务会停止本次采样。
+
+接口不开放调试端口。Bun 1.4.3 不支持与启动时的 `--cpu-prof` / `--cpu-prof-md` 或已启用的 Inspector 调试监听器并用（返回 503）；请勿同时运行其他进程内采样器。采样有开销，建议先用短窗口并在窗口内复现目标负载；空闲线程可能没有样本。文件可能包含函数名和本机源码路径，请存入私有目录，不要公开分享。
 
 ### fork 的默认更新仓库
 
@@ -233,4 +264,4 @@ chmod +x dist/narrafork-*
 - `bun run build:android-rootfs` — 构建 Android rootfs
 - `bun run build:runtime` — 构建本机冻结后端；加 `--frontend` 嵌入已有静态前端
 - `bun run start` — 构建并运行本机产物及静态前端；`--runtime=<path>` 复用已构建版本
-- `bun run start:dev` — 冻结后端搭配源码 Vite；同样支持 `--runtime=<path>`
+- `bun run start:dev` — 源码后端直接提供磁盘静态前端，额外提供源码 Vite 热重载入口；显式 `--runtime=<path>` 可改用冻结产物

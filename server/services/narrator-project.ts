@@ -14,6 +14,7 @@
 import { and, eq, sql } from "drizzle-orm";
 import { activeDatabaseBackend, db } from "../db";
 import { narratorProjectLinks, narrators } from "../db/schema";
+import { type ReadQueryOptions, readQueryFirst } from "../db/worker-read";
 
 /** The narrator columns this resolution needs — nothing else is read. */
 export interface NarratorProjectRef {
@@ -30,21 +31,25 @@ export interface NarratorProjectRef {
  */
 export async function resolveNarratorProjectId(
 	narrator: NarratorProjectRef,
+	readOptions?: ReadQueryOptions,
 ): Promise<string | null> {
+	readOptions?.signal?.throwIfAborted();
 	if (narrator.contextProjectId) return narrator.contextProjectId;
 	// The link table lives in the SQLite main database; on PostgreSQL only the explicit
 	// project is known until the index is ported there.
 	if (activeDatabaseBackend !== "sqlite") return null;
-	const link = await db
-		.select({ projectId: narratorProjectLinks.projectId })
-		.from(narratorProjectLinks)
-		.where(
-			and(
-				eq(narratorProjectLinks.narratorId, narrator.id),
-				eq(narratorProjectLinks.role, "primary"),
+	const link = await readQueryFirst(
+		db
+			.select({ projectId: narratorProjectLinks.projectId })
+			.from(narratorProjectLinks)
+			.where(
+				and(
+					eq(narratorProjectLinks.narratorId, narrator.id),
+					eq(narratorProjectLinks.role, "primary"),
+				),
 			),
-		)
-		.get();
+		{ timeoutMs: 30_000, ...readOptions, executionPolicy: "worker-required", maxRows: 1 },
+	);
 	return link?.projectId ?? null;
 }
 
@@ -55,13 +60,21 @@ export async function resolveNarratorProjectId(
  * "unknown project" contract instead of throwing: callers are gating or layering,
  * not asserting existence.
  */
-export async function resolveProjectIdForNarratorId(narratorId: string): Promise<string | null> {
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { id: true, contextProjectId: true },
-	});
+export async function resolveProjectIdForNarratorId(
+	narratorId: string,
+	readOptions?: ReadQueryOptions,
+): Promise<string | null> {
+	readOptions?.signal?.throwIfAborted();
+	const narrator = await readQueryFirst(
+		db.query.narrators.findMany({
+			limit: 1,
+			where: eq(narrators.id, narratorId),
+			columns: { id: true, contextProjectId: true },
+		}),
+		{ timeoutMs: 30_000, ...readOptions, executionPolicy: "worker-required", maxRows: 1 },
+	);
 	if (!narrator) return null;
-	return await resolveNarratorProjectId(narrator);
+	return await resolveNarratorProjectId(narrator, readOptions);
 }
 
 /**

@@ -4,6 +4,7 @@ import { api, endSession, getToken, setToken } from "../lib/api";
 import { isMfaChallenge, type LoginResult, type LoginSession } from "../lib/api/auth";
 import { appearanceStore } from "../lib/appearance-preference-store";
 import { assetUrl } from "../lib/base-path";
+import { writeCurrentUserCache } from "../lib/current-user-cache";
 import { changeAppLanguage, getNamespacesForPath } from "../lib/i18n";
 
 export { useCurrentUser } from "./useCurrentUser";
@@ -21,6 +22,7 @@ export async function applySession(qc: QueryClient, data: LoginSession): Promise
 	appearanceStore.activate(data.user.id);
 	// Seed the user cache immediately so AuthenticatedLayout won't flash.
 	qc.setQueryData(["auth", "me"], data.user);
+	writeCurrentUserCache(data.user);
 	try {
 		await changeAppLanguage(data.language, getNamespacesForPath("/"));
 	} catch (error) {

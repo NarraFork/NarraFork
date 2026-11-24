@@ -70,6 +70,8 @@ const PANEL_EXCLUDED_EVENT_TYPES = [
 	// takeover badge. The panel already learns the same fact from
 	// `subagent_status_changed`'s substatus, which drives the status chip.
 	"subagent_takeover_changed",
+	// Message-layer only: replaces a card's nested helper rows.
+	"subagent_nested_changed",
 	"tool_output",
 	"subagent_started",
 	"segment_compact_hide",

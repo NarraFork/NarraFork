@@ -76,8 +76,7 @@ import {
 	useNarratorBrowserSessionsCapability,
 	useNarratorContainerBrowserToolAutoEnableCapability,
 } from "../../../hooks/usePlatform";
-import { useNarratorTerminals } from "../../../hooks/useTerminals";
-import { useUserPreferences } from "../../../hooks/useUserPreferences";
+import { useNarratorTerminals, useTreeTerminals } from "../../../hooks/useTerminals";
 import { useSwitchWorkspaceContext, useWorkspaceContext } from "../../../hooks/useWorkspaceContext";
 import type {
 	ApiEntity,
@@ -108,6 +107,7 @@ import {
 } from "../details-panel-lifecycle";
 import { localizeNarratorError } from "../error-localization";
 import { NarratorAvatar } from "../header/NarratorAvatar";
+import { fastModeDetailLabel, isFastModeSubagent } from "../interaction/fast-mode-state";
 import { modelInheritanceLabel } from "../model/model-inheritance-label";
 import { SubagentModelPoolEditor } from "../model/SubagentModelPoolEditor";
 import { SessionExportFields } from "../session-interchange/SessionExportFields";
@@ -130,6 +130,7 @@ import {
 } from "./details-panel-sections";
 import { NarratorAccessPanel } from "./NarratorAccessPanel";
 import { NarratorGitIdentitySelect } from "./NarratorGitIdentitySelect";
+import { SubagentTerminalsList } from "./SubagentTerminalsList";
 import { TurnRangeInput } from "./TurnRangeInput";
 import { TurnRangePickerModal } from "./TurnRangePickerModal";
 import {
@@ -414,14 +415,10 @@ function NarratorDetailsContent({
 	);
 
 	const parentNarratorId = narrator?.parentNarratorId ? String(narrator.parentNarratorId) : "";
-	// Same identity rule as NarratorPanel / server `isSubagentVariant`.
-	const isSubagent = !!(narrator as { variant?: string } | undefined)?.variant?.startsWith(
-		"subagent:",
-	);
+	const isSubagent = isFastModeSubagent(narrator ?? {});
 
 	const { data: parentNarrator } = useNarrator(opened ? parentNarratorId : "");
 	const { data: usageStats } = useNarratorUsageStats(narratorId, true, opened);
-	const { data: userPrefs } = useUserPreferences();
 	const browserSessionsCapability = useNarratorBrowserSessionsCapability();
 	const browserSessionsSupported = browserSessionsCapability.supported !== false;
 	const browserSessionsDefaultOff = browserSessionsCapability.defaultEnabled === false;
@@ -434,6 +431,7 @@ function NarratorDetailsContent({
 		opened && browserSessionsSupported ? narratorId : "",
 	);
 	const { data: terminals } = useNarratorTerminals(opened ? narratorId : "");
+	const { data: treeTerminals } = useTreeTerminals(opened ? narratorId : "");
 	const { data: pendingPermissions } = usePermissions(opened ? narratorId : "");
 	const { data: whitelistDirs } = useWhitelistDirs(opened ? narratorId : "");
 	const { data: blacklistDirs } = useBlacklistDirs(opened ? narratorId : "");
@@ -622,17 +620,6 @@ function NarratorDetailsContent({
 	};
 
 	const formatBoolean = (value?: boolean | null) => (value ? t("details.on") : t("details.off"));
-
-	// Fast mode is a tri-state: "inherit" resolves against the user's default at
-	// request time, so report the effective value and note where it came from.
-	const formatFastMode = (override?: "inherit" | "on" | "off" | null) => {
-		if (override === "on") return t("details.on");
-		if (override === "off") return t("details.off");
-		const effective = userPrefs?.fastModeDefault ?? false;
-		return t("details.fastModeInherited", {
-			state: effective ? t("details.on") : t("details.off"),
-		});
-	};
 
 	const formatStatNumber = (value?: number | null) =>
 		value == null ? "—" : value.toLocaleString(i18n.language);
@@ -916,6 +903,7 @@ function NarratorDetailsContent({
 
 	const advancedRowInput: AdvancedRowInput = {
 		fastModeOverride: narrator?.fastModeOverride,
+		fastModeSource: narrator?.fastModeSource,
 		relaxedPlan: narrator?.relaxedPlan,
 		planMode,
 		backgroundStatus: narrator?.backgroundStatus,
@@ -995,7 +983,7 @@ function NarratorDetailsContent({
 		fastMode: (
 			<DetailRow
 				label={t("details.fastMode")}
-				value={<Text size="sm">{formatFastMode(narrator?.fastModeOverride)}</Text>}
+				value={<Text size="sm">{fastModeDetailLabel(narrator ?? {}, isSubagent, t)}</Text>}
 			/>
 		),
 		relaxedPlan: (
@@ -2047,6 +2035,7 @@ function NarratorDetailsContent({
 					searchableText={[
 						t("details.viewerNames"),
 						t("details.browserSessions"),
+						t("details.subagentTerminals"),
 						t("details.pendingPermissions"),
 					]}
 				>
@@ -2110,6 +2099,24 @@ function NarratorDetailsContent({
 							)
 						}
 					/>
+
+					{/* Subagents' terminals, read-only; a subagent shows its helpers' only when it has any. */}
+					{treeTerminals &&
+					(narrator?.type !== "subagent" || treeTerminals.terminals.length > 0) ? (
+						<DetailRow
+							label={t("details.subagentTerminals")}
+							value={
+								<SubagentTerminalsList
+									terminals={treeTerminals.terminals}
+									truncated={treeTerminals.truncated}
+									canOpen={treeTerminals.canOpen}
+									onOpenSession={(id) =>
+										void navigate({ to: "/narrators/$narratorId", params: { narratorId: id } })
+									}
+								/>
+							}
+						/>
+					) : null}
 
 					{browserToolAutoEnableDefaultOff && (
 						<DetailRow

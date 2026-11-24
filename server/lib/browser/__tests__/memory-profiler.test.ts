@@ -814,8 +814,11 @@ describe("memory profile supervisor", () => {
 		}
 	});
 	test("fixed artifact names, exact sizes and no symlinks are enforced", async () => {
+		// Publication rejects these artifacts immediately, then worker teardown still
+		// runs inside the response budget. On a loaded CI runner that teardown exceeded
+		// the 30ms default and the supervisor reported "timeout" instead of "bytes".
 		for (const variant of ["name", "size", "symlink"]) {
-			const f = await fixture();
+			const f = await fixture({ cleanupMs: 1_000 });
 			try {
 				const view = await f.api.startMemoryProfile(f.session);
 				const request = required(f.worker.request);

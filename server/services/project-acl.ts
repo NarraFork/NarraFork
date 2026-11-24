@@ -20,6 +20,7 @@
 import { eq, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import { projects } from "../db/schema";
+import { type ReadQueryOptions, readQueryFirst } from "../db/worker-read";
 import { NotFoundError } from "../lib/errors";
 import { type AclPrincipal, resolveCaps } from "./acl/acl-core";
 
@@ -62,8 +63,13 @@ function isOwner(row: ProjectAclRow, principal: ProjectPrincipal): boolean {
 async function ownCaps(
 	projectId: string,
 	principal: ProjectPrincipal,
+	readOptions?: ReadQueryOptions,
 ): Promise<{ read: boolean; write: boolean; manage: boolean }> {
-	const caps = await resolveCaps(toAclPrincipal(principal), { type: "project", id: projectId });
+	const caps = await resolveCaps(
+		toAclPrincipal(principal),
+		{ type: "project", id: projectId },
+		readOptions,
+	);
 	return caps.own;
 }
 
@@ -77,12 +83,44 @@ async function ownCaps(
 export async function canReadProject(
 	row: ProjectAclRow,
 	principal: ProjectPrincipal,
+	readOptions?: ReadQueryOptions,
+): Promise<boolean> {
+	readOptions?.signal?.throwIfAborted();
+	return await projectReadVerdict(row, principal, () => ownCaps(row.id, principal, readOptions));
+}
+
+/** What a principal holds on a project itself (`own` caps), read only when a rule needs it. */
+export type ProjectOwnCaps = () =>
+	| Promise<{ read: boolean; write: boolean; manage: boolean }>
+	| { read: boolean; write: boolean; manage: boolean };
+
+/**
+ * The read rule of {@link canReadProject}, with the project's own grants supplied by the
+ * caller: one principal reads them lazily, a batch (`narrator-acl.ts`
+ * `judgeNarratorAccessBatch`) from one bulk query. The single source of the rule.
+ */
+export async function projectReadVerdict(
+	row: ProjectAclRow,
+	principal: ProjectPrincipal,
+	own: ProjectOwnCaps,
 ): Promise<boolean> {
 	if (principal.isAdmin) return true;
 	if (isOwner(row, principal)) return true;
 	if (visibilityGrantsRead(row.visibility)) return true;
-	const own = await ownCaps(row.id, principal);
-	return own.read || own.write || own.manage;
+	const caps = await own();
+	return caps.read || caps.write || caps.manage;
+}
+
+/** The write rule of {@link canWriteProject}; see {@link projectReadVerdict}. */
+export async function projectWriteVerdict(
+	row: ProjectAclRow,
+	principal: ProjectPrincipal,
+	own: ProjectOwnCaps,
+): Promise<boolean> {
+	if (principal.isAdmin) return true;
+	if (isOwner(row, principal)) return true;
+	const caps = await own();
+	return caps.write || caps.manage;
 }
 
 /**
@@ -95,11 +133,10 @@ export async function canReadProject(
 export async function canWriteProject(
 	row: ProjectAclRow,
 	principal: ProjectPrincipal,
+	readOptions?: ReadQueryOptions,
 ): Promise<boolean> {
-	if (principal.isAdmin) return true;
-	if (isOwner(row, principal)) return true;
-	const own = await ownCaps(row.id, principal);
-	return own.write || own.manage;
+	readOptions?.signal?.throwIfAborted();
+	return await projectWriteVerdict(row, principal, () => ownCaps(row.id, principal, readOptions));
 }
 
 /**
@@ -113,20 +150,24 @@ export async function canWriteProject(
 export async function canManageProject(
 	row: ProjectAclRow,
 	principal: ProjectPrincipal,
+	readOptions?: ReadQueryOptions,
 ): Promise<boolean> {
+	readOptions?.signal?.throwIfAborted();
 	if (principal.isAdmin) return true;
 	if (isOwner(row, principal)) return true;
-	return (await ownCaps(row.id, principal)).manage;
+	return (await ownCaps(row.id, principal, readOptions)).manage;
 }
 
 export async function hasProjectAccess(
 	row: ProjectAclRow,
 	principal: ProjectPrincipal,
 	need: ProjectAccessNeed,
+	readOptions?: ReadQueryOptions,
 ): Promise<boolean> {
-	if (need === "manage") return await canManageProject(row, principal);
-	if (need === "write") return await canWriteProject(row, principal);
-	return await canReadProject(row, principal);
+	readOptions?.signal?.throwIfAborted();
+	if (need === "manage") return await canManageProject(row, principal, readOptions);
+	if (need === "write") return await canWriteProject(row, principal, readOptions);
+	return await canReadProject(row, principal, readOptions);
 }
 
 /**
@@ -139,8 +180,9 @@ export async function assertProjectAccess(
 	row: ProjectAclRow,
 	principal: ProjectPrincipal,
 	need: ProjectAccessNeed,
+	readOptions?: ReadQueryOptions,
 ): Promise<void> {
-	if (await hasProjectAccess(row, principal, need)) return;
+	if (await hasProjectAccess(row, principal, need, readOptions)) return;
 	throw new NotFoundError("Project", row.id);
 }
 
@@ -149,10 +191,18 @@ export async function loadProjectForAccess(
 	projectId: string,
 	principal: ProjectPrincipal,
 	need: ProjectAccessNeed,
+	readOptions?: ReadQueryOptions,
 ) {
-	const row = await db.query.projects.findFirst({ where: eq(projects.id, projectId) });
+	readOptions?.signal?.throwIfAborted();
+	const row = await readQueryFirst(
+		db.query.projects.findMany({ limit: 1, where: eq(projects.id, projectId) }),
+		{
+			...readOptions,
+			executionPolicy: "worker-required",
+		},
+	);
 	if (!row) throw new NotFoundError("Project", projectId);
-	await assertProjectAccess(row, principal, need);
+	await assertProjectAccess(row, principal, need, readOptions);
 	return row;
 }
 
@@ -170,19 +220,25 @@ export async function loadProjectForAccess(
 export async function resolveProjectGate(
 	projectId: string | null | undefined,
 	principal: ProjectPrincipal,
+	readOptions?: ReadQueryOptions,
 ): Promise<{ read: boolean; write: boolean }> {
+	readOptions?.signal?.throwIfAborted();
 	if (!projectId) return { read: true, write: true };
 	if (principal.isAdmin) return { read: true, write: true };
-	const row = await db.query.projects.findFirst({
-		where: eq(projects.id, projectId),
-		columns: { id: true, ownerUserId: true, visibility: true },
-	});
+	const row = await readQueryFirst(
+		db.query.projects.findMany({
+			limit: 1,
+			where: eq(projects.id, projectId),
+			columns: { id: true, ownerUserId: true, visibility: true },
+		}),
+		{ ...readOptions, executionPolicy: "worker-required" },
+	);
 	// A dangling project reference fails closed: the chain claimed a gate exists, and
 	// we cannot show it was passed.
 	if (!row) return { read: false, write: false };
 	return {
-		read: await canReadProject(row, principal),
-		write: await canWriteProject(row, principal),
+		read: await canReadProject(row, principal, readOptions),
+		write: await canWriteProject(row, principal, readOptions),
 	};
 }
 

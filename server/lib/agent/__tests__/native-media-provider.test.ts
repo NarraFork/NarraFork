@@ -1742,7 +1742,9 @@ describe("parallel Responses tool image identity", () => {
 		const request = builder.buildCodexWebSocketRequest(
 			params({ history: calls, toolResults: results }),
 		);
-		expectParallelImages(request.input);
+		const [prefix, ...toolInput] = request.input;
+		expect(prefix).toMatchObject({ role: "developer" });
+		expectParallelImages(toolInput);
 	});
 });
 

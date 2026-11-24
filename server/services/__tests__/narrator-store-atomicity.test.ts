@@ -8,9 +8,12 @@
  */
 
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
-import { cleanDb, getTestDb, readTestMessageContent } from "../../../tests/setup";
+import { cleanDb, readTestMessageContent } from "../../../tests/setup";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
@@ -24,9 +27,9 @@ beforeEach(() => {
 	cleanDb(sqlite);
 	sqlite.run("INSERT INTO narrators (id, created_at, updated_at) VALUES ('n1', ?, ?)", [NOW, NOW]);
 });
-afterAll(() => {
+afterAll(async () => {
 	mock.module("../../db", () => realDbModule);
-	sqlite.close();
+	await fixture.close();
 });
 
 function failInserts(table: string, when: string) {

@@ -7,6 +7,7 @@ const actualRegistry = { ...(await import("../../../server/lib/agent/tool-regist
 const registry = new actualRegistry.ToolRegistry();
 const connected = new Set<string>();
 const calls: Array<{ serverId: string; name: string; args: Record<string, unknown> }> = [];
+let nextContent: Array<Record<string, unknown>> | undefined;
 const actualManager = { ...(await import("../../../server/lib/mcp/manager")) };
 mock.module("../../../server/lib/agent/tool-registry", () => ({
 	...actualRegistry,
@@ -18,7 +19,9 @@ mock.module("../../../server/lib/mcp/manager", () => ({
 		isServerConnected: (id: string) => connected.has(id),
 		callTool: async (serverId: string, name: string, args: Record<string, unknown>) => {
 			calls.push({ serverId, name, args });
-			return { content: [{ type: "text", text: `${serverId}/${name}` }] };
+			const content = nextContent ?? [{ type: "text", text: `${serverId}/${name}` }];
+			nextContent = undefined;
+			return { content };
 		},
 	},
 }));
@@ -230,6 +233,36 @@ describe("MCP directory preparation and atomic delta commit", () => {
 		expect(calls).toEqual([{ serverId: "server-1", name: "read", args: { value: "input" } }]);
 		connected.clear();
 		expect(definition?.isAvailable?.()).toBe(false);
+	});
+
+	test("MCP 2025-11-25 content blocks are rendered for the model", async () => {
+		await publish([entry("read")]);
+		nextContent = [
+			{ type: "audio", data: "AAAA", mimeType: "audio/mpeg" },
+			{
+				type: "resource_link",
+				uri: "file:///notes.md",
+				name: "notes.md",
+				title: "Notes",
+				mimeType: "text/markdown",
+			},
+			{ type: "resource_link", uri: "https://example.com/x" },
+			{
+				type: "resource",
+				resource: { uri: "fixture://bin", blob: "AAAAAA==", mimeType: "image/png" },
+			},
+		];
+		const output = await registry
+			.get("mcp__fixture__read")
+			?.execute({}, { signal: new AbortController().signal } as ToolContext);
+		expect(output?.output).toBe(
+			[
+				"[audio: audio/mpeg, 4 bytes base64]",
+				"[resource link: Notes <file:///notes.md>, text/markdown]",
+				"[resource link: https://example.com/x]",
+				"[resource: fixture://bin, image/png, 8 bytes base64]",
+			].join("\n\n"),
+		);
 	});
 
 	test("large directory preparation yields without publishing partial tools", async () => {

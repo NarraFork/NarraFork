@@ -15,7 +15,7 @@ export const stopTool: ToolDefinition = {
 		"Cancel a running background Bash task or agent owned by this narrator. " +
 		'Provide both type ("bash" or "agent") and id (task ID or alias). ' +
 		"This only cancels tracked background work; it cannot stop the NarraFork server or arbitrary PIDs. " +
-		"Use Bash to launch commands, Agent to launch/archive/unarchive agents, and Await to wait for results.",
+		"Use Bash to launch commands, Agent to launch/archive/unarchive agents, and Watch to register non-blocking observations.",
 	parameters,
 	rawJsonSchema: {
 		type: "object",
@@ -93,13 +93,27 @@ export const stopTool: ToolDefinition = {
 				if (narrator instanceof Error) {
 					return { output: `Stop error: ${narrator.message}`, isError: true };
 				}
-				assertAuthorized();
 				// The task row is the run's cancellation handle; a run with no live task
 				// handle is cancelled through the run service directly.
-				const { controlRun } = await import("@server/services/agent-runtime/run");
+				const { controlRun, stopSubagentHelpers } = await import(
+					"@server/services/agent-runtime/run"
+				);
+				// Re-asserted after the last await and before the first side effect.
+				assertAuthorized();
 				cancelled =
 					(await backgroundTaskService.cancel(task.id, { assertAuthorized }).catch(() => false)) ||
 					(await controlRun(narrator.id, { kind: "cancel", reason: "Cancelled by controller" }));
+				// A worker may sit idle between turns while its helpers still run in the
+				// background: stopping it stops them too (control on it is authorized above).
+				// No-op for an agent without helpers; a cancelled run would cascade anyway. The
+				// fence is re-asserted before each helper is cancelled, never after.
+				const helpers = await stopSubagentHelpers(narrator.id, "Parent subagent stopped", {
+					assertAuthorized,
+				});
+				if (!cancelled && helpers > 0)
+					return {
+						output: `Background agent task ${id} is not running; its ${helpers} running helper agent(s) were stopped.`,
+					};
 			} else {
 				const assertAuthorized = await authorizeCancellation();
 				assertAuthorized();

@@ -43,9 +43,10 @@ import { generateId } from "../lib/id";
 import { getNarraforkHome } from "../lib/narrafork-home";
 import { safeSpawn } from "../lib/spawn";
 import { narratorGitRoutes } from "../routes/git";
+import { makeRetainedHistoryRuntimeForTests } from "./__tests__/retained-file-history";
 import { recordAttribution } from "./file-attribution-service";
 import { fileChangeLocalIo } from "./file-change-local-io";
-import { LocalFileChangeRuntime, withLocalFileChangeRuntime } from "./file-change-runtime";
+import { type LocalFileChangeRuntime, withLocalFileChangeRuntime } from "./file-change-runtime";
 import { gitCurrentBaselineReader } from "./git-current-baseline";
 import { getGitCurrentDiffView } from "./git-current-diff-view";
 import { getWorkspaceModificationView } from "./workspace-modification-view";
@@ -60,7 +61,7 @@ const originalSnapshot = gitCurrentBaselineReader.snapshot;
 
 beforeAll(() => {
 	expect(process.env.NARRAFORK_TEST).toBe("1");
-	runtime = new LocalFileChangeRuntime({
+	runtime = makeRetainedHistoryRuntimeForTests({
 		db,
 		privateRoot: getNarraforkHome(),
 		blobStoreOptions: { minimumFreeBytes: 0 },
@@ -533,7 +534,7 @@ describe("current Git targets matched against recorded writes", () => {
 		const entered = new Promise<void>((resolve) => {
 			applying = resolve;
 		});
-		const pendingRuntime = new LocalFileChangeRuntime({
+		const pendingRuntime = makeRetainedHistoryRuntimeForTests({
 			db,
 			privateRoot: getNarraforkHome(),
 			blobStoreOptions: { minimumFreeBytes: 0 },

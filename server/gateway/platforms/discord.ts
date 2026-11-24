@@ -5,12 +5,12 @@
  * Supports message editing for progressive streaming.
  */
 
+import type { Dispatcher } from "undici";
 import { logger } from "../../lib/logger";
 import {
 	closeUndiciDispatcher,
 	createUndiciProxyDispatcher,
 	resolveProxyForUrl,
-	type UndiciDispatcherLike,
 } from "../../lib/net/proxy";
 import { BaseAdapter } from "../base-adapter";
 import type { DiscordConfig, GatewayPlatform, InboundMessage, SendResult } from "../types";
@@ -61,7 +61,7 @@ export class DiscordAdapter extends BaseAdapter {
 
 	private client: DiscordClientLike | null = null;
 	/** undici ProxyAgent (dispatcher) for REST; closed on disconnect to avoid leaks. */
-	private restAgent: UndiciDispatcherLike | null = null;
+	private restAgent: Dispatcher | null = null;
 	private config: DiscordConfig;
 
 	constructor(config: DiscordConfig) {
@@ -95,8 +95,7 @@ export class DiscordAdapter extends BaseAdapter {
 					GatewayIntentBits.DirectMessages,
 					GatewayIntentBits.MessageContent,
 				],
-				// biome-ignore lint/suspicious/noExplicitAny: rest.agent typed as undici Dispatcher
-				...(this.restAgent ? { rest: { agent: this.restAgent as any } } : {}),
+				...(this.restAgent ? { rest: { agent: this.restAgent } } : {}),
 			}) as DiscordClientLike;
 
 			this.client.on("messageCreate", (msg) => this.handleDiscordMessage(msg));

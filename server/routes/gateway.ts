@@ -23,6 +23,7 @@ import { resolveInitialRelaxedPlan } from "../lib/permission-modes";
 import { FOLLOW_DEFAULT_MODEL, settings } from "../lib/settings";
 import { sendMessage } from "../services/narrator-session";
 import { defaultTaskBackendForNewSession } from "../services/task-source";
+import { teamIdOfNarrator } from "../services/teams/team-membership";
 
 export const gatewayRoutes = new Hono();
 
@@ -134,6 +135,16 @@ export async function handleWebhookRequest(c: Context): Promise<Response> {
 
 	if (mapping) {
 		narratorId = mapping.narratorId;
+		// A team session (coordinator or subagent) is only used from NarraFork (M1): the
+		// webhook sender has no proven NarraFork identity to speak in a shared conversation as.
+		if (teamIdOfNarrator(narratorId))
+			return c.json(
+				{
+					error: "This session belongs to a team and can only be used from NarraFork",
+					code: "TEAM_SESSION_NOT_FROM_IM",
+				},
+				409,
+			);
 	} else {
 		narratorId = generateId();
 		const mappingId = generateId();

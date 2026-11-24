@@ -65,6 +65,7 @@ test("real canonical CAS conflict makes producer refresh GitHub once and retry w
 		const http = new UpdateServerMirrorHttp(config, { fetchImpl });
 		const receipt = await mirrorPublishedMainRelease({
 			kind: "main",
+			patchOnly: false,
 			repository,
 			tag: fixture.release.tag,
 			config,
@@ -127,6 +128,7 @@ for (const withPatch of [true, false]) {
 			const http = new UpdateServerMirrorHttp(config, { fetchImpl });
 			const receipt = await mirrorPublishedMainRelease({
 				kind: "main",
+				patchOnly: false,
 				repository,
 				tag: fixture.release.tag,
 				config,
@@ -181,11 +183,17 @@ test("actual upload acknowledgement identity failure prevents snapshot publicati
 		const storage = new LocalStorage(join(directory, "data"));
 		const app = createApp(storage);
 		const fixture = mirrorFixture(false, false);
+		const metadata = fixture.release.files[0].metadata;
 		const config = { serverUrl: "https://only-in-process.invalid", token: adminToken as string };
 		const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
 			const path = new URL(String(input)).pathname;
 			const response = await app.request(path, init);
-			if (init?.method === "PUT" && response.status === 200) {
+			// Fail the specific object whose privacy we check, regardless of which upload finishes first.
+			if (
+				init?.method === "PUT" &&
+				path.endsWith(`/${metadata.sha256}`) &&
+				response.status === 200
+			) {
 				const ack = await response.json();
 				return Response.json({ ...ack, sha256: "f".repeat(64) });
 			}
@@ -196,6 +204,7 @@ test("actual upload acknowledgement identity failure prevents snapshot publicati
 		try {
 			await mirrorPublishedMainRelease({
 				kind: "main",
+				patchOnly: false,
 				repository,
 				tag: fixture.release.tag,
 				config,
@@ -208,14 +217,14 @@ test("actual upload acknowledgement identity failure prevents snapshot publicati
 			failure = error;
 		}
 		expect(failure?.receipt.status).toBe("FAILED");
+		expect(failure?.receipt.failureCode).toBe("SERVER_RECEIPT_REQUIRED");
 		expect(failure?.receipt.snapshotCommitted).toBe(false);
-		expect(failure?.receipt.uploaded).toEqual([]);
+		expect(failure?.receipt.uploaded).not.toContain(metadata.name);
 		expect(failure?.receipt.verified).toEqual([]);
 		expect(await storage.fileExists("mirror-snapshots/narrafork.json")).toBe(false);
-		const metadataSha = fixture.release.files[0].metadata.sha256;
-		expect(await storage.fileExists(`mirror-objects/${metadataSha}`)).toBe(true);
+		expect(await storage.fileExists(`mirror-objects/${metadata.sha256}`)).toBe(true);
 		expect(
-			(await app.request(`/api/v3/products/narrafork/mirror/assets/${metadataSha}`)).status,
+			(await app.request(`/api/v3/products/narrafork/mirror/assets/${metadata.sha256}`)).status,
 		).toBe(404);
 	} finally {
 		await rm(directory, { recursive: true, force: true });

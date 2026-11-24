@@ -231,6 +231,8 @@ export function applyStreamingToolChunk(store: StreamingToolStore, event: ToolCh
 }
 
 export interface ToolStartedEvent {
+	toolCallId?: string | null;
+	executionAttempt?: number;
 	streamingEditOrigin?: StreamingEditOrigin;
 	toolUseId: string;
 	toolName: string;
@@ -289,6 +291,14 @@ export function applyStreamingToolStarted(
 	const existing = document
 		? switchStreamingDocument(store, event.toolUseId, document)
 		: store.get(event.toolUseId);
+	if (
+		existing?.toolCallId &&
+		existing.toolCallId === event.toolCallId &&
+		existing.executionAttempt !== undefined &&
+		event.executionAttempt !== undefined &&
+		event.executionAttempt < existing.executionAttempt
+	)
+		return false;
 	store.set(event.toolUseId, {
 		inputCharsTotal: existing?.inputCharsTotal ?? 0,
 		...existing,
@@ -297,6 +307,8 @@ export function applyStreamingToolStarted(
 		// entry with a placeholder name (it gets no name of its own), and `...existing`
 		// would otherwise let that placeholder shadow the real one this event carries.
 		toolName: event.toolName || existing?.toolName || UNKNOWN_TOOL_NAME,
+		...(event.toolCallId ? { toolCallId: event.toolCallId } : {}),
+		...(event.executionAttempt !== undefined ? { executionAttempt: event.executionAttempt } : {}),
 		_started: true,
 		// Field-scoped guard: everything else in this object still merges normally.
 		_status: resolveLiveToolStatus(existing?._status, "initializing"),

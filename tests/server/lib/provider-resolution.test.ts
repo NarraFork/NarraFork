@@ -14,6 +14,7 @@ import { deleteNugCachedModels, setNugCachedModels } from "../../../server/lib/n
 import { isProviderUnavailableError } from "../../../server/lib/provider-availability-error";
 import {
 	expandAllowedPoolForDisplay,
+	getBuiltinCodexModels,
 	getContextThresholds,
 	getModelContextWindow,
 	LARGE_CONTEXT_BOUNDARY,
@@ -158,6 +159,13 @@ describe("resolveProvider fallback order", () => {
 		expect(resolveProvider("gpt-6.1-sol")).toBe("codex");
 		expect(resolveProvider("gpt-6-sol")).toBe("codex");
 		expect(resolveProvider("gpt-6-luna")).toBe("codex");
+	});
+
+	test("catalog 的 Codex 变体动态进入内置列表，无需维护静态模型名", () => {
+		// gpt-5.4-mini 只存在于 catalog，不在兼容用的静态清单中。
+		expect(getBuiltinCodexModels()).toContain("gpt-5.4-mini");
+		expect(resolveProvider("gpt-5.4-mini")).toBe("codex");
+		expect(getBuiltinCodexModels()).not.toContain("gpt-5.4");
 	});
 
 	test("已退役的内置 Codex 模型不再强制解析为 Codex", () => {

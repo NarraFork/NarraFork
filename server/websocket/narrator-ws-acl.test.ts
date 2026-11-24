@@ -18,10 +18,16 @@
  *    approve it, because the id was all the handler asked for.
  */
 import { afterAll, afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
-import { cleanDb, getTestDb } from "../../tests/setup";
+import { cleanDb } from "../../tests/setup";
 import { aclGrants, narratorMessages, narrators, narratorToolCalls, users } from "../db/schema";
+import {
+	closeRuntimeTestDb,
+	drainRuntimeTestWork,
+	getRuntimeTestDb,
+} from "../services/__tests__/agent-runtime-test-database";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
 const realDbModule = { ...(await import("../db")) };
 mock.module("../db", () => ({ db, sqlite }));
 
@@ -144,15 +150,16 @@ beforeEach(() => {
 	seedUsers();
 });
 
-afterEach(() => {
+afterEach(async () => {
 	for (const ws of openedConnections.splice(0)) handleNarratorWS.close(ws);
 	getNarratorConnections().clear();
+	await drainRuntimeTestWork();
 	cleanDb(sqlite);
 });
 
-afterAll(() => {
+afterAll(async () => {
+	await closeRuntimeTestDb(sqlite);
 	mock.module("../db", () => realDbModule);
-	sqlite.close();
 });
 
 describe("subscribe authorization", () => {

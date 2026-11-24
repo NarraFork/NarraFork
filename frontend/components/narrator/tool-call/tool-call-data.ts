@@ -11,6 +11,7 @@ import type { SubagentActivitySummary } from "../../../lib/api";
 import type { ExecutionTargetIdentity } from "../../../lib/api/types";
 
 export interface ToolCallData {
+	executionAttempt?: number;
 	/** Message owner, independent from the panel receiving file navigation. */
 	fileNarratorId?: string;
 	id?: string;

@@ -19,6 +19,25 @@ afterEach(() => {
 });
 
 describe("operator shutdown admission", () => {
+	test("a deferred unattended shutdown releases the operator slot", async () => {
+		const deferred = Promise.withResolvers<null>();
+		const invoked = Promise.withResolvers<void>();
+		registerOperatorShutdownHandler(() => {
+			invoked.resolve();
+			return deferred.promise;
+		});
+		const keepAlive = setTimeout(() => {}, 1_000);
+		try {
+			expect(scheduleOperatorShutdown({ reason: "unattended_idle" })).toBe(true);
+			await invoked.promise;
+			expect(canOperatorShutdown()).toBe(false);
+			deferred.resolve(null);
+			await deferred.promise;
+			expect(canOperatorShutdown()).toBe(true);
+		} finally {
+			clearTimeout(keepAlive);
+		}
+	});
 	test("a queued legacy shutdown owns its grace window and blocks system preparation", async () => {
 		const handler = mock(async ({ reason }: { reason: string }) => ({
 			success: true,

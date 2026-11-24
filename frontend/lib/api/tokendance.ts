@@ -9,6 +9,7 @@ import type {
 	TokenDancePaymentSession,
 	TokenDancePublicConnection,
 } from "@shared/tokendance";
+import type { ToolResultImagesMode } from "@shared/tool-result-images";
 import {
 	apiBase,
 	authorizedFetch,
@@ -59,10 +60,14 @@ export const tokendanceApi = {
 		request<TokenDancePublicConnection>("/tokendance/connection", transport(options)),
 	tokenDanceRefreshModels: (options?: RequestOptions) =>
 		post<{ models: TokenDanceCatalogModel[] }>("models/refresh", {}, options),
-	tokenDanceUpdateConnection: (disabled: boolean, options?: RequestOptions) =>
+	tokenDanceUpdateConnection: (
+		disabled: boolean,
+		options?: RequestOptions,
+		toolResultImages?: ToolResultImagesMode,
+	) =>
 		request<TokenDancePublicConnection>("/tokendance/connection", {
 			method: "PATCH",
-			body: JSON.stringify({ disabled }),
+			body: JSON.stringify({ disabled, toolResultImages }),
 			...transport(options),
 		}),
 	tokenDanceDeleteConnection: async (options?: RequestOptions) => {

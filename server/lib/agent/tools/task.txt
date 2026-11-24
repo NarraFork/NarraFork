@@ -7,7 +7,8 @@ Available agent types:
 - plan: Software architect agent for designing implementation plans. Tools: Read, Glob, Grep, WebSearch, Bash
 - search: Focused read-only web research agent. Tools: provider-native WebSearch and WebFetch; it does not inspect or modify local files.
 - general: General-purpose agent with write access. It can use the standard coding and coordination tools exposed to subagents (including Bash, Read, Write, Edit, Glob, Grep, Send, and TeamStatus), but cannot launch another Agent.
-- review: Read-only review follow-up agent. Tools: Read, Glob, Grep, WebSearch, WebFetch, and necessary coordination tools; it must not modify files or require ConcludeReview.
+- worker: Like general (write access and the same tools), and it may also launch and Await its own helper agents with Agent. It starts with Terminal (interactive terminals for dev servers and REPLs, at most 3 running) and Browser (at most 2 sessions; a team holds at most 6) loaded; both keep their usual permission prompts. Its helpers are the last level: they can never launch agents themselves. Only a narrator that may launch agents can create a worker, and a subagent's helpers are capped by that subagent's own limits (a read-only subagent cannot create a writable helper).
+- review: Read-only review follow-up agent. Tools: Read, Glob, Grep, WebSearch, WebFetch, Browser for looking at pages (no clicking, typing or scripts), and necessary coordination tools; it must not modify files or require ConcludeReview.
 - Custom types: Users can define custom subagent types with specialized prompts and tool access. Use the custom type name as the subagent_type value. Custom types have their own system prompts and tool permissions configured by the user.
 
 When to use each type:
@@ -21,6 +22,8 @@ explore — ONLY for these situations:
 plan — ONLY when you are in plan mode (EnterPlanMode). Do not spawn a plan subagent outside of plan mode. Use it to delegate architectural analysis of a specific subsystem while you focus on the broader design.
 
 general — For delegating self-contained subtasks that require file modifications, multi-step operations, or complex research that would clutter your main context. The subtask should be well-defined and independent enough to complete without back-and-forth.
+
+worker — For a larger, self-contained piece of work that itself splits into parts worth delegating (for example implementing a change and having a fresh helper review it). Prefer general when the subtask does not need helpers.
 
 search — For a focused web research question with a clear purpose. Keep the assignment limited to web sources; do not ask this type to inspect or modify local files.
 
@@ -40,7 +43,7 @@ User takeover at creation:
 - Use takeover_by_user: true when creating a subagent specifically for the user to continue discussing or interacting with it.
 - The subagent enters user takeover mode immediately and still executes its initial prompt. The Agent call returns immediately, even without run_in_background: true.
 - Completing a turn does NOT notify or wake the parent. The subagent remains taken over, waiting for further user interaction, until the user explicitly ends takeover.
-- Do NOT automatically Await a user-taken-over agent or treat its turn completion as a delegated task result.
+- Do NOT automatically Watch a user-taken-over agent or treat its turn completion as a delegated task result.
 
 Delegating an outline task:
 - In a session whose tasks live in the outline, pass `task` (the task's address) to hand that task to the agent. Its instructions are written from the task's tree (its goal, notes, steps, questions and prerequisites), so `prompt` may be left out; what you write in `prompt` is added as further instructions.
@@ -54,18 +57,19 @@ Working directory:
 - Once created, the subagent's permission checks (path boundaries, etc.) are scoped to its own workdir
 
 Usage notes:
+- A permission a person denied stays denied: never have another agent (or a helper) do the same thing another way. Report the denial instead.
 - Launch multiple agents concurrently whenever possible by using a single message with multiple tool uses
 - When the agent is run in foreground, it will return a single message back to you with its findings/results
-- When the agent is run in background, use `Await({ type: "agent", id })` to get results and `Send({ id, message })` to send follow-up instructions
+- Background results notify automatically. Use `Watch({ type: "agent", id })` to register a non-blocking observation or retrieve a saved result; use `Send({ id, message })` to send follow-up instructions
 - Each agent invocation starts with a fresh context. Provide a highly detailed task description so the agent can work autonomously
 - Use `reasoning_effort` to request subagent thinking intensity (`none`, `low`, `medium`, `high`, `xhigh`); models/providers without a configurable thinking option will ignore it
 - The agent's outputs should generally be trusted
 - Clearly tell the agent whether you expect it to write code or just to do research
 
 Coordination discipline:
-- Give subagents uninterrupted time to work. Non-trivial investigation, implementation, and testing often take longer than 30 seconds; an Await timeout only means that wait ended, not that the subagent is stuck. If Await reports recent tool activity, treat that as evidence of progress and keep waiting with Await.
-- Use Await when you need task completion. Send never waits for a reply: the recipient answers with its own Send, which arrives as a message and wakes you when idle, so after sending either continue other work or end your turn.
+- Give subagents uninterrupted time to work. Non-trivial investigation, implementation, and testing often take longer than 30 seconds. A Watch timeout ends only the observation, not the agent run; it is not evidence that the agent is stuck.
+- Watch registers immediately and does not wait for task completion. When a result blocks the next step, end the turn and let completion notify you. Send never waits for a reply: the recipient answers with its own Send, which arrives as a message and wakes you when idle, so after sending either continue other work or end your turn.
 - When you only need a targeted answer from a subagent's existing persisted context, use ContextAsk instead of Send. ContextAsk reads through the summary model without messaging, waking, interrupting, or modifying the target; use Send only to deliver new information, requirements, or corrections.
 - Do not Send status-check or hurry-up messages after a short wait. Send only when you have new information, changed requirements, or a concrete correction that the subagent needs.
-- Never ask a working subagent to "stop immediately and summarize" merely because an Await timed out or you are impatient. That discards completed context and wastes resources.
+- Never ask a working subagent to "stop immediately and summarize" merely because an observation timed out or you are impatient. That discards completed context and wastes resources.
 - `doInterrupt` is exceptional: use it only when the current work must stop immediately because it is clearly wrong/unsafe, conflicts with new user instructions, or the user explicitly requested interruption. Never use it as routine progress polling.

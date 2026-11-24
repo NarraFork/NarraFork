@@ -487,7 +487,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/db/schema.ts": ["drizzleDialect", "json1"],
 	// Recall's FTS5/rowid statements moved to `services/search/sqlite-store.ts`; what remains is
 	// the raw-handle access path for its non-search reads.
-	"server/lib/agent/tools/recall.ts": ["driver", "handle"],
+	"server/lib/agent/tools/recall.ts": ["handle"],
+	"server/lib/db-worker/recall-conversation-query.ts": ["driver"],
 	"server/lib/db-resilience.ts": ["driver", "sqliteCli", "pragma", "sqliteCatalog", "errorCode"],
 	// Finite diagnostic categories still depend on the engine's error identity, never driver text.
 	"server/lib/db-worker/failure.ts": ["errorCode"],
@@ -496,7 +497,16 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/lib/sql-trace.ts": ["driver"],
 	"server/lib/db-worker/select-rows.ts": ["driver"],
 	"server/db/worker-read.ts": ["driver", "drizzleDialect"],
+	"server/db/worker-read-adapter.ts": ["driver", "nativeClient", "drizzleDialect"],
+	"server/lib/db-worker/database-identity.ts": ["driver"],
+	"server/lib/db-worker/domain-task-registry.ts": ["driver"],
+	"server/lib/db-worker/file-read-snapshots.ts": ["driver"],
+	"server/services/tool-edit-preview-reader.ts": ["json1"],
+	"server/lib/db-worker/integration-authority-read-task.ts": ["driver"],
+	"server/lib/db-worker/select-digest-batch.ts": ["driver"],
+	"server/lib/db-worker/select-extended.ts": ["driver"],
 	"server/services/search/sqlite-worker-runner.ts": ["connectionModule"],
+	"server/lib/db-worker/recall-tool-call-query.ts": ["driver"],
 	"server/lib/runtime-source.ts": ["json1"],
 	"server/routes/storage.ts": ["vacuum"],
 	// 固定表清单的导入/导出走的是 SQLite 专属路径：快照由 snapshot-builder-worker 子进程生成
@@ -536,20 +546,29 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/db/snapshot-builder-worker.ts": ["driver", "pragma", "vacuum"],
 	"server/services/narrator-display-page-reader.ts": ["driver"],
 	"server/lib/db-worker/display-page-query.ts": ["driver"],
+	"server/lib/db-worker/compact-summary-query.ts": ["driver"],
 	"server/services/agent-runtime/publication-outbox.ts": ["nativeClient", "rowid"],
+	"server/services/agent-runtime/publication.ts": ["json1", "nativeClient"],
+	"server/services/agent-runtime/publication-reader.ts": ["driver"],
 	// The injected occupancy source currently uses the SQLite builder; the maintained
 	// graph is backend-neutral, so this is not a permanently SQLite-only module.
 	"server/services/background-occupancy-store.ts": ["drizzleDialect"],
+	"server/services/benchmark-read.ts": ["driver"],
 	"server/services/benchmark-service.ts": ["handle", "timeFn"],
 	"server/services/chat-service.ts": ["drizzleDialect"],
 	// `pragma` and `errorCode` left this file for `backend/sqlite-maintenance.ts`. `vacuum` stays
 	// because the admin operation is still exposed from here (through the port), and the chain-
 	// end test below depends on that remaining true.
 	"server/services/database-cleanup-service.ts": ["handle", "connectionModule", "vacuum"],
+	"server/lib/db-worker/storage-cleanup-context-query.ts": ["driver"],
+	"server/lib/db-worker/file-revert-selection-body-query.ts": ["driver"],
 	"server/services/execution-log-service.ts": ["json1"],
+	"server/lib/db-worker/execution-policy-query.ts": ["driver", "json1"],
+	"server/services/execution-policy/repository.ts": ["handle"],
 	"server/services/external-resource-service.ts": ["json1", "errorCode"],
 	"server/services/file-change-blob-catalog.ts": ["drizzleDialect", "pragma"],
 	"server/services/file-change-evidence.ts": ["driver", "nativeClient", "drizzleDialect"],
+	"server/services/file-change-history-diagnostics.ts": ["errorCode"],
 	"server/services/file-change-physical-audit-worker.ts": [
 		"driver",
 		"pragma",
@@ -569,11 +588,17 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"glob",
 		"collate",
 	],
+	"server/services/git-changelist-store.ts": ["driver", "pragma", "sqliteCatalog", "errorCode"],
 	"server/services/git-current-diff-view.ts": ["rowid"],
-	"server/services/integration-authority-service.ts": ["errorCode"],
-	"server/services/narrator-messages.ts": ["handle", "json1", "glob"],
+	"server/services/git-staging-kernel.ts": ["json1"],
+	"server/services/git-staging-worker.ts": ["driver", "pragma"],
+	"server/services/integration-authority-service.ts": ["errorCode", "handle"],
+	"server/services/narrator-messages.ts": ["handle", "glob", "indexHint", "drizzleDialect"],
 	"server/services/narrator-panel-state.ts": ["json1"],
+	"server/services/subagent-nested.ts": ["json1"],
 	"server/services/narrator-persistence.ts": ["handle", "rowid", "indexHint"],
+	// Visible translation reads format-2 block history; PG envelopes are still legacy-format.
+	"server/services/reasoning-translation-runtime.ts": ["handle", "glob"],
 	// Block storage is SQLite-only in P1 (PG envelopes stay legacy-format).
 	// The broken-call flag of a tool result is read in SQL so the result itself is not.
 	"server/services/narrator-block-sync.ts": [
@@ -621,6 +646,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/narrator-body-reads.ts": ["handle", "json1"],
 	// Retention fences consult the SQLite body projection before accepting late writes.
 	"server/services/narrator-body-writes.ts": ["handle"],
+	"server/services/narrator-composer-document.ts": ["handle"],
+	"server/lib/db-worker/composer-document-query.ts": ["driver"],
 	// The central body reader: selects block-format bodies and assembles them from rows.
 	"server/lib/narrator-bodies.ts": ["driver", "pragmaFn", "sqliteCatalog"],
 	// Readers that assemble block-format bodies from their rows (SQLite-only, like block
@@ -633,7 +660,6 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/narrator-refs-backfill.ts": ["nativeClient", "blobFn"],
 	"server/services/narrator-service.ts": ["blobFn"],
 	"server/services/narrator-session.ts": ["handle", "rowid"],
-	"server/services/narrator-subagent-recovery.ts": ["handle"],
 	// The dependent scan reads a narrator's committed directory out of the JSON context column.
 	"server/services/narrator-worktree-retirement.ts": ["json1"],
 	"server/services/notification-center-maintenance.ts": ["sessionFn"],
@@ -668,7 +694,6 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"pragma",
 		"json1",
 	],
-	"server/services/revert-planner-service.ts": ["nativeClient"],
 	"server/services/revert-selection-service.ts": [
 		"driver",
 		"nativeClient",
@@ -694,11 +719,18 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	],
 	"server/services/narrator-timeline.ts": ["json1"],
 	"server/services/subagent-activity.ts": ["json1"],
-	"server/services/subagent-file-changes.ts": ["drizzleDialect"],
+	// Only the SQLite branch pins the operation-id seek; PostgreSQL still uses Drizzle's table.
+	"server/services/subagent-file-changes.ts": ["drizzleDialect", "indexHint"],
 	"server/services/token-recalculation-sqlite.ts": ["driver"],
+	"server/lib/db-worker/knowledge-entry-query.ts": ["driver"],
+	"server/lib/db-worker/knowledge-entry-reader.ts": ["driver"],
+	"server/lib/db-worker/recall-reader.ts": ["driver"],
+	"server/services/knowledge/sqlite-read-store.ts": ["handle", "json1"],
+	"server/services/search/recall-store.ts": ["handle"],
 	"server/services/token-recalculation-worker.ts": ["connectionModule", "pragma"],
 	"server/services/tool-continuation-service.ts": ["json1"],
-	"server/services/tool-edit-preview.ts": ["json1"],
+	"server/services/tool-edit-preview.ts": ["handle"],
+	"server/lib/db-worker/tool-edit-preview-query.ts": ["driver"],
 	"server/services/workspace-modification-view.ts": ["json1", "rowid"],
 	// New main-database read/write surfaces remain migration inventory, NOT permanent
 	// SQLite-only exemptions.
@@ -715,6 +747,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	],
 	"server/services/narrator-question-service.ts": ["rowid", "json1"],
 	"server/services/tool-input-stream-source.ts": ["handle"],
+	"server/lib/db-worker/tool-detail-query.ts": ["driver"],
+	"server/services/narrator-tool-detail.ts": ["handle"],
 	// The trusted read-only eval program now belongs to the worker adapter, not the source owner.
 	"server/services/tool-input-stream-source-worker.ts": ["driver", "pragma"],
 	// 用量分桶：SQLite 用 strftime + 按 DST 分段应用的偏移，PostgreSQL 用 date_trunc/AT TIME ZONE。
@@ -724,6 +758,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// History retention has an explicit SQLite capability boundary; a PG implementation
 	// needs its own async candidate/read/write adapter, rather than opening a second DB.
 	"server/lib/db-worker/storage-history-query.ts": ["driver", "rowid", "json1", "timeFn"],
+	"server/lib/db-worker/subagent-activity-query.ts": ["driver"],
 	"server/services/storage-history-runtime.ts": ["connectionModule"],
 	"server/services/storage-history-mutations.ts": [
 		"handle",

@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { createSqliteMaintenance } from "@server/db/backend/sqlite-maintenance";
 import type { FileReferenceSnapshot } from "@shared/file-reference";
-import { getTestDb } from "../../../tests/setup";
+import { getWorkerTestDb } from "../../../tests/worker-test-db";
 import * as schema from "../../db/schema";
 import {
 	getFileReferenceSnapshots,
@@ -29,7 +29,7 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 } else {
 	// A serialization fixture, not the application DB. Mock persistence writes the
 	// exact text/blocks the REAL send/edit/queue services supply, then reads JSON back.
-	const { sqlite, db: fixtureDb } = getTestDb();
+	const { sqlite, db: fixtureDb, disposeWorkerDb } = getWorkerTestDb();
 	sqlite.exec("CREATE TABLE saved_messages (id TEXT PRIMARY KEY, row_json TEXT NOT NULL)");
 	for (const id of ["n", "child", "resume-official", "resume-child", "resume-followup"]) {
 		fixtureDb
@@ -281,10 +281,10 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 		return active;
 	}
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		sqlite.exec("DELETE FROM saved_messages");
 		state.activeNarrators.clear();
-		buffer.clearBufferedMessages("child");
+		await buffer.clearBufferedMessages("child");
 		frames.length = 0;
 		failPersist = false;
 		suppressLoop = false;
@@ -302,10 +302,10 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 			},
 		];
 	});
-	afterAll(() => {
+	afterAll(async () => {
 		state.activeNarrators.clear();
-		buffer.clearBufferedMessages("child");
-		sqlite.close();
+		await buffer.clearBufferedMessages("child");
+		await disposeWorkerDb();
 	});
 
 	describe("send/save/edit fixed file references", () => {

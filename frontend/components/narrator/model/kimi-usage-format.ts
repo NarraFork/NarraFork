@@ -1,3 +1,4 @@
+import { identifyService } from "@shared/sourcing/identify";
 import type { KimiUsageCache, KimiUsageWindow } from "../../../lib/api/types";
 import {
 	parseQuotaReset,
@@ -24,18 +25,7 @@ export function kimiUsageFailed(usage: KimiUsageCache): boolean {
 
 /** True when the baseUrl points at a kimi.com / kimi.ai host (mirrors the server check). */
 export function isKimiProviderBaseUrl(baseUrl?: string): boolean {
-	if (!baseUrl) return false;
-	try {
-		const host = new URL(baseUrl).hostname.toLowerCase();
-		return (
-			host === "kimi.com" ||
-			host === "kimi.ai" ||
-			host.endsWith(".kimi.com") ||
-			host.endsWith(".kimi.ai")
-		);
-	} catch {
-		return false;
-	}
+	return identifyService({ baseUrl }).templateId === "kimi-code";
 }
 
 /**

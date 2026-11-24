@@ -1,5 +1,5 @@
 /**
- * settings.json ↔ provider-keys.json.
+ * settings.json ↔ the provider key store (provider-keys.ts).
  *
  * On disk, provider entries carry no API key; the keys live in the provider key store.
  * In memory each entry's `apiKey` is its first stored key, so every reader of a single
@@ -13,17 +13,26 @@
  * each, under a namespaced owner id. Site tokens and OAuth secrets never join that pool.
  * Search headers live separately in search-header-secrets.ts.
  */
-import { getProviderKeyStore } from "../provider-keys";
+import {
+	COMMAND_CODE_KEY_OWNER,
+	getProviderKeyStore,
+	nugKeyOwner,
+	nugOAuthKeyOwner,
+	quotaKeyOwner,
+	searchKeyOwner,
+	TOKENDANCE_KEY_OWNER,
+} from "../provider-keys";
 import { normalizeCustomApiProviderSettings } from "./custom-api-providers";
 import type { NarraForkSettings } from "./types";
 
-// Custom API provider ids are nanoids, which never contain ":", so these cannot collide.
-export const TOKENDANCE_KEY_OWNER = "builtin:tokendance";
-export const COMMAND_CODE_KEY_OWNER = "builtin:CommandCode";
-export const nugKeyOwner = (providerId: string) => `nug:${providerId}`;
-export const nugOAuthKeyOwner = (providerId: string) => `nug-oauth:${providerId}`;
-export const searchKeyOwner = (providerId: string) => `search:${providerId}`;
-export const quotaKeyOwner = (providerId: string) => `quota:${providerId}`;
+export {
+	COMMAND_CODE_KEY_OWNER,
+	nugKeyOwner,
+	nugOAuthKeyOwner,
+	quotaKeyOwner,
+	searchKeyOwner,
+	TOKENDANCE_KEY_OWNER,
+};
 
 /** One settings field whose secret lives in the key store. */
 interface KeySlot {

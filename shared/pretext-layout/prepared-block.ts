@@ -45,6 +45,8 @@ export const DEFAULT_RENDER_LOD: RenderLod = 4;
 
 /** Common fields shared by every prepared block. */
 export interface PreparedBlockBase {
+	/** Original Markdown coordinates when source provenance was requested. */
+	sourceRange?: { start: number; end: number };
 	/** Top margin (px) applied before this block within its element. First
 	 * block in an element typically uses 0. */
 	marginTop: number;
@@ -681,7 +683,13 @@ export function accumulateFrame(
 				// Same rationale as the unknown branch below: a block whose painted
 				// width is known from data (aspect-fitted image) must report it, or a
 				// shrink-wrap container clips it.
-				blockUsedWidth = block.contentLeft + (block.displayWidth ?? 0);
+				// Markdown previews fill their content column, regardless of source
+				// dimensions. Include that width so injection/user shrink-wrap boxes
+				// cannot collapse an image-only body to its indent lane.
+				blockUsedWidth =
+					block.tag === "markdown-image"
+						? block.contentLeft + Math.max(1, contentWidth - block.contentLeft)
+						: block.contentLeft + (block.displayWidth ?? 0);
 				break;
 			case "unknown":
 				height = block.placeholderHeight;

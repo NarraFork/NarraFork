@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { afterAll, afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	narrators,
 	outlineBlocks,
@@ -14,8 +14,12 @@ import {
 	workspacePanels,
 	workspaces,
 } from "../../db/schema";
+import { captureWorkerRejectionThrower, getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
+afterAll(() => fixture.close());
 const realDb = { ...(await import("../../db")) };
 const realWs = { ...(await import("../../websocket/narrator-ws")) };
 const realAgent = { ...(await import("../../lib/agent")) };
@@ -308,9 +312,11 @@ describe("bounded, authorized title inputs", () => {
 			.set({ tree: JSON.stringify({ title: "Secret layout text" }) })
 			.where(eq(workspaces.id, workspaceId))
 			.run();
-		await expect(titleService.generateWorkspaceTitle("owner", workspaceId)).rejects.toThrow(
-			"meaningful title",
-		);
+		await expect(
+			await captureWorkerRejectionThrower(
+				titleService.generateWorkspaceTitle("owner", workspaceId),
+			),
+		).toThrow("meaningful title");
 		expect(model).not.toHaveBeenCalled();
 	});
 	it("uses nested webview metadata and standalone terminal basename, without URL parameters or full paths", async () => {
@@ -343,9 +349,11 @@ describe("bounded, authorized title inputs", () => {
 				config: { title: "中文".repeat(150) },
 			});
 		generate = async () => "x".repeat(2000);
-		await expect(titleService.generateWorkspaceTitle("owner", workspaceId)).rejects.toThrow(
-			"budget",
-		);
+		await expect(
+			await captureWorkerRejectionThrower(
+				titleService.generateWorkspaceTitle("owner", workspaceId),
+			),
+		).toThrow("budget");
 		const input = model.mock.calls[0][1] as string;
 		expect(Buffer.byteLength(input)).toBeLessThanOrEqual(titleService.WORKSPACE_TITLE_INPUT_BYTES);
 		expect(JSON.parse(input).length).toBeLessThanOrEqual(titleService.WORKSPACE_TITLE_PANEL_LIMIT);
@@ -400,9 +408,11 @@ describe("title input invalidation broadcasts and outline commits", () => {
 			kind: "outline",
 			config: { spaceId: "outline-space" },
 		});
-		await expect(titleService.generateWorkspaceTitle("owner", workspaceId)).rejects.toThrow(
-			"meaningful title",
-		);
+		await expect(
+			await captureWorkerRejectionThrower(
+				titleService.generateWorkspaceTitle("owner", workspaceId),
+			),
+		).toThrow("meaningful title");
 		block("root-page", "# Authentication roadmap\nPrivate page body");
 		eventBus.emit({
 			type: "outline:committed",
@@ -461,13 +471,15 @@ describe("title input invalidation broadcasts and outline commits", () => {
 		expect(readWorkspace(unrelatedId).titleRevision).toBe(unrelatedRevision);
 		expect(broadcasts).toHaveLength(2);
 		await expect(
-			titleService.updateWorkspaceTitle(
-				"owner",
-				focusedId,
-				candidate.title,
-				candidate.expectedTitleRevision,
+			await captureWorkerRejectionThrower(
+				titleService.updateWorkspaceTitle(
+					"owner",
+					focusedId,
+					candidate.title,
+					candidate.expectedTitleRevision,
+				),
 			),
-		).rejects.toThrow("changed");
+		).toThrow("changed");
 	});
 	function commit(pageIds = ["root-page"]) {
 		eventBus.emit({
@@ -674,9 +686,11 @@ describe("concurrency and automatic generation", () => {
 			}, originalSetTimeout),
 		);
 		try {
-			await expect(titleService.generateWorkspaceTitle("owner", workspaceId)).rejects.toThrow(
-				"timed out",
-			);
+			await expect(
+				await captureWorkerRejectionThrower(
+					titleService.generateWorkspaceTitle("owner", workspaceId),
+				),
+			).toThrow("timed out");
 			expect((model.mock.calls[0][4] as { signal: AbortSignal }).signal.aborted).toBe(true);
 			expect(timer).toHaveBeenCalled();
 			generate = async () => "Recovered";
@@ -700,7 +714,7 @@ describe("concurrency and automatic generation", () => {
 		while (!model.mock.calls.length) await Promise.resolve();
 		await updateWorkspacePanelConfig("owner", workspaceId, panel.id, { title: "Changed" });
 		pending.resolve("Old candidate");
-		await expect(first).rejects.toThrow("changed");
+		await expect(await captureWorkerRejectionThrower(first)).toThrow("changed");
 		expect(model).toHaveBeenCalledTimes(1);
 		expect(readWorkspace().title).toBe("Existing title");
 	});
@@ -714,13 +728,15 @@ describe("concurrency and automatic generation", () => {
 		const candidate = await titleService.generateWorkspaceTitle("owner", workspaceId);
 		await removeWorkspacePanel("owner", workspaceId, panel.id);
 		await expect(
-			titleService.updateWorkspaceTitle(
-				"owner",
-				workspaceId,
-				candidate.title,
-				candidate.expectedTitleRevision,
+			await captureWorkerRejectionThrower(
+				titleService.updateWorkspaceTitle(
+					"owner",
+					workspaceId,
+					candidate.title,
+					candidate.expectedTitleRevision,
+				),
 			),
-		).rejects.toThrow("changed");
+		).toThrow("changed");
 	});
 	it("debounces consecutive additions and generates only once for a default workspace", async () => {
 		workspace("default");
@@ -765,7 +781,7 @@ describe("concurrency and automatic generation", () => {
 		while (!model.mock.calls.length) await Promise.resolve();
 		await titleService.updateWorkspaceTitle("owner", workspaceId, "My name");
 		pending.resolve("Generated");
-		await expect(first).rejects.toThrow("changed");
+		await expect(await captureWorkerRejectionThrower(first)).toThrow("changed");
 		expect(readWorkspace().title).toBe("My name");
 	});
 	it("model failure leaves the default name unchanged", async () => {
@@ -774,9 +790,11 @@ describe("concurrency and automatic generation", () => {
 		generate = async () => {
 			throw new Error("Provider unavailable");
 		};
-		await expect(titleService.generateWorkspaceTitle("owner", workspaceId)).rejects.toThrow(
-			"Provider unavailable",
-		);
+		await expect(
+			await captureWorkerRejectionThrower(
+				titleService.generateWorkspaceTitle("owner", workspaceId),
+			),
+		).toThrow("Provider unavailable");
 		expect(readWorkspace().titleSource).toBe("default");
 		expect(readWorkspace().title).toBe("Existing title");
 	});

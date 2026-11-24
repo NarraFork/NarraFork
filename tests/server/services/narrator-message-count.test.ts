@@ -15,9 +15,9 @@ import {
 	narrators,
 	projects,
 } from "../../../server/db/schema";
-import { cleanDb, getTestDb } from "../../setup";
+import { cleanDb, getFileTestDb } from "../../setup";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, dispose } = getFileTestDb();
 
 const realDbModule = { ...(await import("../../../server/db")) };
 mock.module("../../../server/db", () => ({ db, sqlite }));
@@ -124,7 +124,10 @@ beforeEach(() => {
 	seed();
 });
 afterEach(() => cleanDb(sqlite));
-afterAll(() => mock.module("../../../server/db", () => realDbModule));
+afterAll(() => {
+	mock.module("../../../server/db", () => realDbModule);
+	dispose();
+});
 
 describe("countNarratorMessageRefs", () => {
 	it("counts every message ref, not turns", async () => {

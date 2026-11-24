@@ -6,9 +6,22 @@ import {
 	isValidGitStartPoint,
 } from "@shared/git-branches";
 import { GIT_COMMIT_SHA_PATTERN } from "@shared/git-commit-preview";
+import { GIT_STAGING_LIMITS } from "@shared/git-staging-lists";
+import {
+	GIT_STATUS_FILTER_CHARS,
+	GIT_STATUS_PAGE_MAX_BYTES,
+	GIT_STATUS_PAGE_MAX_LIMIT,
+	isGitStatusFilterChar,
+} from "@shared/git-status-page";
 import { z } from "zod";
 
 const filePathArray = z.array(z.string().min(1)).min(1);
+const snapshotScopeSchema = z.object({
+	snapshotId: z.string().min(1).max(128),
+	filter: z.array(z.enum(GIT_STATUS_FILTER_CHARS)).max(GIT_STATUS_FILTER_CHARS.length),
+	section: z.enum(["staged", "unstaged"]),
+	directory: z.string().min(1).max(4096).optional(),
+});
 
 /**
  * Defense-in-depth: git ref/SHA validator.
@@ -36,18 +49,26 @@ export const gitStageSchema = z
 	.object({
 		files: filePathArray.optional(),
 		all: z.boolean().optional(),
+		snapshotScope: snapshotScopeSchema.optional(),
 	})
 	.refine((d) => (d.files && d.files.length > 0) || d.all, {
 		message: "Provide files array or set all=true",
+	})
+	.refine((d) => !d.snapshotScope || (!!d.files && !d.all), {
+		message: "Snapshot scope requires explicit files and cannot be combined with all=true",
 	});
 
 export const gitUnstageSchema = z
 	.object({
 		files: filePathArray.optional(),
 		all: z.boolean().optional(),
+		snapshotScope: snapshotScopeSchema.optional(),
 	})
 	.refine((d) => (d.files && d.files.length > 0) || d.all, {
 		message: "Provide files array or set all=true",
+	})
+	.refine((d) => !d.snapshotScope || (!!d.files && !d.all), {
+		message: "Snapshot scope requires explicit files and cannot be combined with all=true",
 	});
 
 export const gitCommitSchema = z.object({
@@ -58,9 +79,13 @@ export const gitDiscardSchema = z
 	.object({
 		files: filePathArray.optional(),
 		all: z.boolean().optional(),
+		snapshotScope: snapshotScopeSchema.optional(),
 	})
 	.refine((d) => (d.files && d.files.length > 0) || d.all, {
 		message: "Provide files array or set all=true",
+	})
+	.refine((d) => !d.snapshotScope || (!!d.files && !d.all), {
+		message: "Snapshot scope requires explicit files and cannot be combined with all=true",
 	});
 
 export const gitStashSchema = z.object({
@@ -151,6 +176,169 @@ export const gitPushSchema = z.object({
 export const gitFetchSchema = z.object({
 	remote: gitRemoteNameSchema.optional(),
 	prune: z.boolean().optional(),
+});
+
+/** Statistics reuse the existing status-page row and byte budgets. */
+export const gitStatusPageStatsQuerySchema = z.object({
+	snapshotId: snapshotScopeSchema.shape.snapshotId,
+	filter: z
+		.string()
+		.max(32)
+		.optional()
+		.transform((value) => (value ? value.split(",") : []))
+		.refine((values) => values.every(isGitStatusFilterChar), "Invalid Git status filter")
+		.transform((values) => values.filter(isGitStatusFilterChar)),
+	rows: z
+		.string()
+		.refine(
+			(value) => Buffer.byteLength(value, "utf8") <= GIT_STATUS_PAGE_MAX_BYTES,
+			"Git status statistics exceed the page byte budget",
+		)
+		.transform((value, context): unknown => {
+			try {
+				return JSON.parse(value);
+			} catch {
+				context.addIssue({ code: "custom", message: "Invalid Git status statistics rows" });
+				return z.NEVER;
+			}
+		})
+		.pipe(
+			z
+				.array(
+					z.object({
+						type: z.enum(["file", "directory"]),
+						section: snapshotScopeSchema.shape.section,
+						path: gitCommitDiffQuerySchema.shape.file,
+					}),
+				)
+				.min(1)
+				.max(GIT_STATUS_PAGE_MAX_LIMIT),
+		),
+});
+
+// === independent staging lists ===
+export const gitStagingListIdSchema = z
+	.string()
+	.regex(/^[A-Za-z0-9_-]{1,128}$/, "Invalid staging identifier");
+const stagingId = gitStagingListIdSchema;
+const stagingName = z.string().refine(
+	(value) =>
+		[...value].length > 0 &&
+		[...value].length <= GIT_STAGING_LIMITS.maxNameChars &&
+		value.trim().length > 0 &&
+		![...value].some((character) => {
+			const code = character.codePointAt(0) ?? 0;
+			return code < 32 || code === 127 || (code >= 0xd800 && code <= 0xdfff);
+		}),
+	"Invalid staging list name",
+);
+const stagingPath = z
+	.string()
+	.min(1)
+	.max(GIT_STAGING_LIMITS.maxPathChars)
+	.refine(
+		(value) =>
+			!value.includes("\0") &&
+			!/^[\\/]|^[a-z]:[\\/]/i.test(value) &&
+			!value.split(/[\\/]/).some((part) => part === ".." || part === ".") &&
+			!/(^|[\\/])\.git([\\/]|$)/i.test(value) &&
+			!/^\.narrafork[\\/]git-staging([\\/]|$)/i.test(value),
+		"A Git-root-relative staging path is required",
+	);
+const stagingPaths = z
+	.array(stagingPath)
+	.min(1)
+	.max(GIT_STAGING_LIMITS.maxFilesPerOperation)
+	.refine(
+		(values) => new Set(values).size === values.length,
+		"Duplicate staging paths are not allowed",
+	);
+const stagingActionBase = { workspaceKey: z.string().min(1).max(128) };
+const stagingExpectedVersion = {
+	expectedGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+	observationId: stagingId,
+};
+const stagingVersionedAction = { ...stagingActionBase, ...stagingExpectedVersion };
+const stagingFilter = z.array(z.enum(GIT_STATUS_FILTER_CHARS)).max(6);
+export const gitStagingActionSchema = z.discriminatedUnion("action", [
+	z.object({ ...stagingActionBase, action: z.literal("init") }).strict(),
+	z.object({ ...stagingActionBase, action: z.literal("sync") }).strict(),
+	z.object({ ...stagingVersionedAction, action: z.literal("create"), name: stagingName }).strict(),
+	z
+		.object({
+			...stagingVersionedAction,
+			action: z.literal("rename"),
+			listId: stagingId,
+			name: stagingName,
+		})
+		.strict(),
+	z
+		.object({ ...stagingVersionedAction, action: z.literal("activate"), listId: stagingId })
+		.strict(),
+	z.object({ ...stagingVersionedAction, action: z.literal("delete"), listId: stagingId }).strict(),
+	z
+		.object({
+			...stagingVersionedAction,
+			action: z.literal("move"),
+			fromListId: stagingId,
+			toListId: stagingId,
+			unitIds: z
+				.array(
+					z
+						.string()
+						.min(1)
+						.max(256)
+						.refine((id) => !/[\0\r\n]/.test(id), "Invalid unit identifier"),
+				)
+				.min(1)
+				.max(GIT_STAGING_LIMITS.maxUnitsPerOperation)
+				.refine((ids) => new Set(ids).size === ids.length, "Duplicate unit IDs")
+				.optional(),
+			paths: stagingPaths.optional(),
+			all: z.literal(true).optional(),
+			scope: z
+				.object({ filter: stagingFilter.optional(), directory: stagingPath.optional() })
+				.strict()
+				.refine(
+					(scope) => scope.directory !== undefined || !!scope.filter?.length,
+					"An empty scope is not an explicit all-files selection",
+				)
+				.optional(),
+		})
+		.strict()
+		.refine(
+			(value) =>
+				[value.unitIds, value.paths, value.all, value.scope].filter((v) => v !== undefined)
+					.length === 1,
+			"Choose exactly one move selection: unitIds, paths, all or scope",
+		),
+	// Identity is resolved for the authenticated user at the route boundary.
+	z
+		.object({
+			...stagingVersionedAction,
+			action: z.literal("commit"),
+			listId: stagingId,
+			message: z.string().trim().min(1).max(500),
+		})
+		.strict(),
+	z
+		.object({ ...stagingVersionedAction, action: z.literal("recover"), operationId: stagingId })
+		.strict(),
+]);
+export const gitStagingFilesQuerySchema = z.object({
+	workspaceKey: z.string().min(1).max(128),
+	cursor: z.string().min(1).max(4096).optional(),
+	limit: z.coerce.number().int().min(1).max(GIT_STAGING_LIMITS.maxPageRows).optional(),
+	filter: z
+		.string()
+		.regex(/^[AMDRCU]*$/)
+		.transform((value) => [...new Set(value)] as Array<(typeof GIT_STATUS_FILTER_CHARS)[number]>)
+		.optional(),
+});
+export const gitStagingDiffQuerySchema = z.object({
+	workspaceKey: z.string().min(1).max(128),
+	path: stagingPath,
+	oldPath: stagingPath.optional(),
 });
 
 // === modification view ===

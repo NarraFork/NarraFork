@@ -15,11 +15,13 @@ import {
 	narratorToolCalls,
 	users,
 } from "../db/schema";
+import { resetDbWorkerPoolForTest } from "../lib/db-worker/pool";
 import { AppError } from "../lib/errors";
 import { generateId } from "../lib/id";
 
-// Import no runtime DB: all route/auth/persistence reads use this isolated in-memory fixture.
-const { db, sqlite } = getTestDb();
+// The detail route's real Worker must see the same committed, isolated fixture as auth.
+const directory = await mkdtemp(join(tmpdir(), "nf-tool-source-transport-"));
+const { db, sqlite } = getTestDb(join(directory, "isolated-route-fixture.sqlite"));
 const dbStub = {
 	db,
 	sqlite,
@@ -32,7 +34,6 @@ const dbStub = {
 mock.module("../db", () => dbStub);
 mock.module("@server/db", () => dbStub);
 const sourceModule = await import("./tool-input-stream-source");
-const directory = await mkdtemp(join(tmpdir(), "nf-tool-source-transport-"));
 const historyPath = join(directory, "isolated-history-fixture.sqlite");
 const historyDatabase = new Database(historyPath);
 historyDatabase.run(
@@ -114,6 +115,8 @@ app.onError((error, c) =>
 const refs: string[] = [];
 afterAll(async () => {
 	for (const ref of refs) await service.discard(ref);
+	await resetDbWorkerPoolForTest();
+	sqlite.close();
 	historyDatabase.close();
 	await rm(directory, { recursive: true, force: true });
 	mock.restore();

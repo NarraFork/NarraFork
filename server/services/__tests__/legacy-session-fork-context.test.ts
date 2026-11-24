@@ -1,5 +1,4 @@
-import { Database } from "bun:sqlite";
-import { beforeAll, describe, expect, mock, spyOn, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, mock, spyOn, test } from "bun:test";
 import { createSqliteMaintenance } from "@server/db/backend/sqlite-maintenance";
 import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
@@ -21,10 +20,12 @@ import {
 	users,
 } from "../../db/schema";
 import { generateId } from "../../lib/id";
+import { closeFileWorkerDatabase, openFileWorkerDatabase } from "./file-worker-database";
+import { captureWorkerRejection, captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
-// This worktree intentionally has no migration directory. Build only a disposable
-// in-memory fixture from typed declarations; never bootstrap a real database here.
-const sqlite = new Database(":memory:");
+// Build only a disposable fixture from typed declarations, not the live database.
+const sqlite = openFileWorkerDatabase();
+afterAll(() => closeFileWorkerDatabase(sqlite));
 const dialect = new SQLiteSyncDialect();
 for (const table of Object.values(schema)) {
 	let config: ReturnType<typeof getTableConfig>;
@@ -334,9 +335,11 @@ describe("ordinary session fork context and constraints", () => {
 		// No `standalone` trait and no directory: a session created inside a chapter whose
 		// directory came from the chapter that no longer exists.
 		const id = await parent({ traits: [], cwd: null, contextProjectId: projectId });
-		await expect(
-			narratorService.forkNarrator(id, null, { inheritMode: "fresh" }),
-		).rejects.toMatchObject({ code: "WORKSPACE_DIRECTORY_REQUIRED" });
+		expect(
+			await captureWorkerRejection(
+				narratorService.forkNarrator(id, null, { inheritMode: "fresh" }),
+			),
+		).toMatchObject({ code: "WORKSPACE_DIRECTORY_REQUIRED" });
 		// Its own directory, once chosen, is forked like any other.
 		await db.update(narrators).set({ cwd: "/chosen" }).where(eq(narrators.id, id));
 		const child = await narratorService.forkNarrator(id, null, { inheritMode: "fresh" });
@@ -355,9 +358,9 @@ describe("ordinary session fork context and constraints", () => {
 				contextProjectId: projectId,
 			});
 			const before = sqlite.query("SELECT COUNT(*) AS n FROM narrators").get();
-			await expect(narratorService.forkStandaloneFromTool(id, "fresh")).rejects.toThrow(
-				"Cannot fork from a subagent",
-			);
+			expect(
+				await captureWorkerRejectionThrower(narratorService.forkStandaloneFromTool(id, "fresh")),
+			).toThrow("Cannot fork from a subagent");
 			expect(sqlite.query("SELECT COUNT(*) AS n FROM narrators").get()).toEqual(before);
 		}
 	});
@@ -397,9 +400,9 @@ describe("ordinary session fork context and constraints", () => {
 			defaultDeviceId: "device-original",
 			cwd: null,
 		});
-		await expect(narratorService.forkStandaloneFromTool(id, "fresh")).rejects.toThrow(
-			"Remote workspace is unresolved",
-		);
+		expect(
+			await captureWorkerRejectionThrower(narratorService.forkStandaloneFromTool(id, "fresh")),
+		).toThrow("Remote workspace is unresolved");
 	});
 	test.each([
 		"fresh",

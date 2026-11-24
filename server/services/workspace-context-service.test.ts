@@ -59,9 +59,12 @@ mock.module("../lib/i18n", () => ({
 const { executionPolicyEngine } = await import("./execution-policy/engine");
 const { localBackend, setRemoteBackendResolver } = await import("../lib/agent/execution/registry");
 const { windowsPathSemantics } = await import("../lib/agent/execution/path-semantics");
-const { activeNarrators, pendingPermissions, reserveNarratorRevertAdmission } = await import(
-	"./narrator-session-state"
-);
+const {
+	activeNarrators,
+	pendingPermissions,
+	reserveNarratorRevertAdmission,
+	hasNarratorAdmissionWork,
+} = await import("./narrator-session-state");
 const { AppError } = await import("../lib/errors");
 const {
 	workspaceContextService,
@@ -120,6 +123,184 @@ function app() {
 	router.route("/api/narrators", narratorWorkspaceContextRoutes);
 	return router;
 }
+
+function barrier() {
+	let release = () => {};
+	const promise = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	return { promise, release };
+}
+
+describe("parallel workspace revision admission", () => {
+	test("different private writes overlap while switches and ordinary exclusive writes remain protected", async () => {
+		const a = barrier();
+		const b = barrier();
+		const enteredA = barrier();
+		const enteredB = barrier();
+		const first = workspaceContextService.withParallelRevision(
+			"narrator",
+			0,
+			undefined,
+			async () => {
+				enteredA.release();
+				await a.promise;
+			},
+		);
+		await enteredA.promise;
+		const second = workspaceContextService.withParallelRevision(
+			"narrator",
+			0,
+			undefined,
+			async () => {
+				enteredB.release();
+				await b.promise;
+			},
+		);
+		try {
+			await enteredB.promise;
+			expect(hasNarratorAdmissionWork("narrator")).toBe(true);
+			await expect(change()).rejects.toMatchObject({ code: "WORKSPACE_CONTEXT_BUSY" });
+			await expect(
+				workspaceContextService.switchDevice("narrator", null, { origin: "http" }),
+			).rejects.toMatchObject({ code: "WORKSPACE_CONTEXT_BUSY" });
+			await expect(
+				workspaceContextService.withRevision("narrator", 0, undefined, async () => {}),
+			).rejects.toMatchObject({ code: "WORKSPACE_CONTEXT_BUSY" });
+			a.release();
+			await first;
+			await expect(change()).rejects.toMatchObject({ code: "WORKSPACE_CONTEXT_BUSY" });
+			expect(row.workspaceRevision).toBe(0);
+		} finally {
+			a.release();
+			b.release();
+			await Promise.all([first, second]);
+		}
+		expect(hasNarratorAdmissionWork("narrator")).toBe(false);
+		await workspaceContextService.withRevision("narrator", 0, undefined, async () => {});
+		expect((await change()).current.revision).toBe(1);
+	});
+
+	test("stale revisions and mismatched worktree identities never enter a parallel action", async () => {
+		const action = mock(async () => {});
+		await expect(
+			workspaceContextService.withParallelRevision("narrator", 1, undefined, action),
+		).rejects.toMatchObject({ code: "WORKSPACE_CONTEXT_CONFLICT" });
+		await expect(
+			workspaceContextService.withParallelRevision("narrator", 0, "wrong-worktree", action),
+		).rejects.toMatchObject({ code: "WORKSPACE_CONTEXT_CONFLICT" });
+		expect(action).not.toHaveBeenCalled();
+		expect(hasNarratorAdmissionWork("narrator")).toBe(false);
+		await workspaceContextService.withRevision("narrator", 0, undefined, async () => {});
+	});
+
+	test("cancellation and action failures release both activity counts and the shared work lease", async () => {
+		const controller = new AbortController();
+		const entered = barrier();
+		const pending = workspaceContextService.withParallelRevision(
+			"narrator",
+			0,
+			undefined,
+			async () => {
+				entered.release();
+				await new Promise<void>((_resolve, reject) =>
+					controller.signal.addEventListener("abort", () => reject(controller.signal.reason), {
+						once: true,
+					}),
+				);
+			},
+			controller.signal,
+		);
+		await entered.promise;
+		controller.abort(new Error("cancelled private write"));
+		await expect(pending).rejects.toThrow("cancelled private write");
+		expect(hasNarratorAdmissionWork("narrator")).toBe(false);
+		await expect(
+			workspaceContextService.withParallelRevision("narrator", 0, undefined, async () => {
+				throw new Error("write failed");
+			}),
+		).rejects.toThrow("write failed");
+		expect(hasNarratorAdmissionWork("narrator")).toBe(false);
+		const action = mock(async () => {});
+		await expect(
+			workspaceContextService.withParallelRevision(
+				"narrator",
+				0,
+				undefined,
+				action,
+				AbortSignal.abort(),
+			),
+		).rejects.toThrow();
+		expect(action).not.toHaveBeenCalled();
+		expect(hasNarratorAdmissionWork("narrator")).toBe(false);
+		expect((await change()).current.revision).toBe(1);
+	});
+
+	test("a switch prepared before a private write rechecks active counts inside mutation admission", async () => {
+		const preparing = barrier();
+		const prepared = barrier();
+		let firstPolicy = true;
+		policySpy.mockImplementation(async () => {
+			if (firstPolicy) {
+				firstPolicy = false;
+				preparing.release();
+				await prepared.promise;
+			}
+			return { evaluatePath: () => ({ decision: "allow" }) } as never;
+		});
+		const switching = change();
+		await preparing.promise;
+		const held = barrier();
+		const entered = barrier();
+		const writing = workspaceContextService.withParallelRevision(
+			"narrator",
+			0,
+			undefined,
+			async () => {
+				entered.release();
+				await held.promise;
+			},
+		);
+		try {
+			await entered.promise;
+			prepared.release();
+			await expect(switching).rejects.toMatchObject({ code: "WORKSPACE_CONTEXT_BUSY" });
+			expect(row.workspaceRevision).toBe(0);
+		} finally {
+			prepared.release();
+			held.release();
+			await writing;
+		}
+	});
+
+	test("a private write waiting behind a committed switch rejects its stale revision", async () => {
+		const committing = barrier();
+		const commit = barrier();
+		const switching = workspaceContextService.switch(
+			"narrator",
+			{
+				expectedRevision: 0,
+				requestId: "parallel-race",
+				target: { deviceId: "local", cwd: join(root, "new") },
+			},
+			{
+				origin: "http",
+				validateDevice: async () => {
+					committing.release();
+					await commit.promise;
+				},
+			},
+		);
+		await committing.promise;
+		const action = mock(async () => {});
+		const writing = workspaceContextService.withParallelRevision("narrator", 0, undefined, action);
+		commit.release();
+		await switching;
+		await expect(writing).rejects.toMatchObject({ code: "WORKSPACE_CONTEXT_CONFLICT" });
+		expect(action).not.toHaveBeenCalled();
+		expect(hasNarratorAdmissionWork("narrator")).toBe(false);
+	});
+});
 
 describe("local authoritative workspace context", () => {
 	test("a held workspace revision admission rejects a new switch instead of waiting behind its mutation", async () => {

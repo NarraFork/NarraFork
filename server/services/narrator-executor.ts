@@ -3,6 +3,10 @@ import { type AgentConfig, type AgentLoopHistory, agentLoop } from "../lib/agent
 import type { AgentEvent, ApiRequestDiagnostics } from "../lib/agent/types";
 import { logger } from "../lib/logger";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import {
+	clearAcceptedCheckpointStopDrain,
+	getAcceptedCheckpointStopDrain,
+} from "./agent-runtime/checkpoint-stop";
 import { getAgentFileReferenceContext } from "./file-reference-context";
 import {
 	CriticalEventPersistenceError,
@@ -328,7 +332,15 @@ export async function executeAgentLoop(
 				break;
 			}
 		}
+	} catch (error) {
+		const pause = getAcceptedCheckpointStopDrain(config.signal);
+		if (pause && !config.signal.aborted && pause.identity.narratorId === config.narratorId) {
+			if (error !== pause) pause.cleanupFailure ??= error;
+			throw pause;
+		}
+		throw error;
 	} finally {
+		clearAcceptedCheckpointStopDrain(config.signal);
 		// Raw prefixes are only useful within this pass. Keep the reconnect snapshot
 		// itself on persistence failure, but do not retain already committed bodies.
 		eventContext.committedContentSnapshots?.clear();

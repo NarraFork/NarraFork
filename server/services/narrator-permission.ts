@@ -9,6 +9,7 @@ import type { ProgressSnapshot } from "@shared/progress-phase";
 import { and, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
+	backgroundTasks,
 	fileChangeExecutionSegments,
 	integrationAuthorities,
 	integrationCapabilityGrants,
@@ -19,6 +20,7 @@ import {
 	oauthClients,
 	remoteDevices,
 } from "../db/schema";
+import { readQuery, readQueryFirst } from "../db/worker-read";
 import type {
 	DangerInfo,
 	DangerSeverity,
@@ -75,6 +77,7 @@ import {
 	readDeclaredExitPlanMode,
 } from "../lib/agent/tools/plan-mode";
 import { isScheduledTaskReadAction } from "../lib/agent/tools/scheduled-task-actions";
+import { isTeamCleanupCall, isTeamReadAction, TEAM_TOOL_NAME } from "../lib/agent/tools/team";
 import { OUTPUT_DIR as TRUNCATE_OUTPUT_DIR } from "../lib/agent/truncate";
 import type {
 	ToolCallBinding,
@@ -93,7 +96,8 @@ import {
 	measureSerializedCharacters,
 	queueContextCharacterRefresh,
 } from "../lib/context-characters";
-import { AppError } from "../lib/errors";
+import { isOwnCoordinatorOutputPath } from "../lib/coordinator-outputs-path";
+import { AppError, NotFoundError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { isSecretPlatformPath } from "../lib/fs-secret-paths";
 import { logger } from "../lib/logger";
@@ -117,8 +121,18 @@ import { isTeamMember, type RuntimeSourceRow, teamRootOf } from "../lib/runtime-
 import { narraforkDir, settings } from "../lib/settings";
 import { assertToolSpecPaths, toolSpecPathError } from "../lib/spec-uri";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
-import type { RuntimePolicy } from "./agent-runtime/policy";
+import { isBrowserReadAction, type RuntimePolicy } from "./agent-runtime/policy";
+import {
+	type NarratorSurfaceReadBudget,
+	narratorSurfaceReadOptions,
+} from "./narrator-surface-reads";
 import { isRuntimeToolNameAllowed } from "./subagent-tools";
+import {
+	describeTeamCleanup,
+	isGitControlRelativePath,
+	isInsideControlDir,
+	teamWorktreePathsForNarrator,
+} from "./teams/team-membership";
 import { resolveNarratorRuntimePolicy } from "./trait-layer-service";
 
 export {
@@ -127,7 +141,6 @@ export {
 } from "../lib/boolean-override";
 
 import { coerceAskQuestions, generateAskUserQuestionAnswers } from "./ask-user-question-reflection";
-import { backgroundTaskService } from "./background-task-service";
 import { commandPatternMatches } from "./execution-policy/command-policy";
 import type { CompiledExecutionPolicy } from "./execution-policy/compiler";
 import { compileExecutionPolicy } from "./execution-policy/compiler";
@@ -177,6 +190,7 @@ import {
 	pendingPlanDiff,
 	planModeAskedOnce,
 } from "./narrator-session-state";
+import { broadcastPermissionFrame, rememberNestedSubagentRoot } from "./nested-subagent-routing";
 import {
 	completePermissionRuleRequestReflection as completeRuleReflection,
 	failPermissionRuleRequest,
@@ -211,19 +225,40 @@ const pendingPermissionContexts = new WeakMap<
 
 // === Permission handling ===
 
+function rethrowPermissionReadFailure(error: unknown): void {
+	if (
+		error &&
+		typeof error === "object" &&
+		"code" in error &&
+		typeof error.code === "string" &&
+		error.code.startsWith("DB_READ_")
+	)
+		throw error;
+}
+
+function missingNarrator(error: unknown): null {
+	if (error instanceof NotFoundError) return null;
+	throw error;
+}
+
 async function refreshPermissionContextCharacters(
 	narratorId: string,
 	toolCallId: string,
 ): Promise<void> {
-	const row = await db.query.narratorToolCalls
-		.findFirst({ where: eq(narratorToolCalls.id, toolCallId), columns: { messageId: true } })
-		.catch((error: unknown) => {
-			logger.warn("Character refresh message identity unavailable", {
-				toolCallId,
-				error: String(error),
-			});
-			return undefined;
+	const row = await readQueryFirst(
+		db.query.narratorToolCalls.findMany({
+			limit: 1,
+			where: eq(narratorToolCalls.id, toolCallId),
+			columns: { messageId: true },
+		}),
+		{ ...narratorSurfaceReadOptions({ timeoutMs: 30_000 }), maxRows: 1 },
+	).catch((error: unknown) => {
+		logger.warn("Character refresh message identity unavailable", {
+			toolCallId,
+			error: String(error),
 		});
+		throw error;
+	});
 	queueContextCharacterRefresh(narratorId, row?.messageId);
 }
 
@@ -350,6 +385,35 @@ function isInsideDecisionTruncateDir(
 	if (context && (context.backend.kind !== "local" || context.paths.flavor === "spec"))
 		return false;
 	return isInsideTruncateDir(cwd, path);
+}
+
+/**
+ * A team coordinator's own saved tool results (Project Teams P2): reading them needs no approval,
+ * for that narrator only. Another narrator's saved results get no such rule.
+ */
+function isInsideDecisionOwnSavedOutputs(
+	narratorId: string | undefined,
+	cwd: string,
+	path: string,
+	context?: ExecutionTargetContext | null,
+): boolean {
+	if (!narratorId) return false;
+	if (context && (context.backend.kind !== "local" || context.paths.flavor === "spec"))
+		return false;
+	return isOwnCoordinatorOutputPath(narratorId, resolvePath(cwd, path));
+}
+
+/** Paths a read-only call may reach without approval outside its worktree. */
+function isAutoReadablePath(
+	narratorId: string | undefined,
+	cwd: string,
+	path: string,
+	context?: ExecutionTargetContext | null,
+): boolean {
+	return (
+		isInsideDecisionTruncateDir(cwd, path, context) ||
+		isInsideDecisionOwnSavedOutputs(narratorId, cwd, path, context)
+	);
 }
 
 function getShellScopePaths(
@@ -780,6 +844,7 @@ export function resolvePermissionDecision(
 		executionTarget,
 		executionContext,
 		reviewReadOnlyBash = false,
+		narratorId,
 	} = opts;
 	const specError = toolSpecPathError(toolName, input);
 	if (specError) {
@@ -801,8 +866,21 @@ export function resolvePermissionDecision(
 			return "deny";
 		}
 	}
+	if (reviewReadOnlyBash && toolName === TEAM_TOOL_NAME && !isTeamReadAction(input)) {
+		if (meta) meta.blacklistReason = "Review mode: Team changes team work items.";
+		return "deny";
+	}
+	if (reviewReadOnlyBash && toolName === "Agent" && input.isolation !== undefined) {
+		if (meta) meta.blacklistReason = "Review mode: Agent isolation creates a worktree.";
+		return "deny";
+	}
 	if (reviewReadOnlyBash && (toolName === "CreateWorktree" || toolName === "AttachWorktree")) {
 		if (meta) meta.blacklistReason = `Review mode: ${toolName} modifies worktree resources.`;
+		return "deny";
+	}
+	// A reviewer may look at pages, never act on them (see `isBrowserReadAction`).
+	if (reviewReadOnlyBash && toolName === "Browser" && !isBrowserReadAction(input)) {
+		if (meta) meta.blacklistReason = REVIEW_BROWSER_READ_ONLY_REASON;
 		return "deny";
 	}
 	const compiledPolicy = compiledPolicyForDecision(opts);
@@ -1028,6 +1106,50 @@ export function resolvePermissionDecision(
 		return "deny";
 	}
 
+	// Team (P3): per action, above allowlists and the bypassPermissions/dontAsk shortcuts.
+	// `cleanup` deletes a worktree: a person's decision every time, so a confirmed loss in the
+	// input is always something a person approved; in read-only, dontAsk and plan mode there is
+	// nobody to approve it, and the reason makes the deny hard (no soft plan-mode prompt, no
+	// reflection). Bookkeeping, the team's own worktree creation and a base sync write only the
+	// team's records and resources: allowed outside read-only.
+	if (toolName === TEAM_TOOL_NAME) {
+		if (isTeamCleanupCall(toolName, input)) {
+			if (effectiveMode === "readOnly" || effectiveMode === "dontAsk" || planMode) {
+				if (meta)
+					meta.blacklistReason = planMode
+						? "Plan mode: Team cleanup deletes a worktree and is not available while planning."
+						: `${effectiveMode} mode: Team cleanup needs a person's approval and cannot run here.`;
+				return "deny";
+			}
+			return "ask";
+		}
+		if (isTeamReadAction(input)) return "allow";
+		if (effectiveMode === "readOnly") {
+			if (meta) meta.blacklistReason = "Read-only mode: Team changes team work items.";
+			return "deny";
+		}
+		return "allow";
+	}
+	if (toolName === "Agent" && input.isolation !== undefined && effectiveMode === "readOnly") {
+		if (meta) meta.blacklistReason = "Read-only mode: Agent isolation creates a worktree.";
+		return "deny";
+	}
+	// A team's own work item worktrees (plan §二.3, decision T6): delegating into one and file
+	// writes inside one need no person. Blacklists, protected paths and `.git` review ran above.
+	if (
+		effectiveMode !== "readOnly" &&
+		!reviewReadOnlyBash &&
+		isTeamWorktreeScopedCall(
+			toolName,
+			input,
+			cwd,
+			opts.teamWorktrees,
+			context,
+			opts.teamWorktreeGuards,
+		)
+	)
+		return "allow";
+
 	const whitelistDecision = resolveWhitelistDecision(
 		toolName,
 		input,
@@ -1139,7 +1261,7 @@ export function resolvePermissionDecision(
 			if (
 				!hasExternalPath ||
 				(toolPaths.length > 0 &&
-					toolPaths.every((path) => isInsideDecisionTruncateDir(cwd, path, context)))
+					toolPaths.every((path) => isAutoReadablePath(narratorId, cwd, path, context)))
 			) {
 				return "allow";
 			}
@@ -1206,7 +1328,7 @@ export function resolvePermissionDecision(
 	if (
 		hasExternalPath &&
 		isReadOnlyCall(toolName, input) &&
-		toolPaths.every((path) => isInsideDecisionTruncateDir(cwd, path, context))
+		toolPaths.every((path) => isAutoReadablePath(narratorId, cwd, path, context))
 	) {
 		return "allow";
 	}
@@ -1270,7 +1392,7 @@ function resolveBlacklistDecision(
 const ALWAYS_ALLOW_TOOLS = [
 	"EnterPlanMode",
 	"WebSearch",
-	"Await",
+	"Watch",
 	"Stop",
 	"Question",
 	"Skill",
@@ -1312,7 +1434,7 @@ const READ_ONLY_TOOLS = [
 	"StructView",
 	"ShareFile",
 	"ContextAsk",
-	"Await",
+	"Watch",
 	"KnowledgeSearch",
 	"KnowledgeRead",
 	"KnowledgeLibrary",
@@ -1344,7 +1466,82 @@ function isReadOnlyCall(toolName: string, input: Record<string, unknown>): boole
 	if (toolName === "Notification") return input.action === "list_channels";
 	if (toolName === "GenUI") return isGenUiReadAction(input.action);
 	if (toolName === "Worktree") return input.action === "list";
+	if (toolName === TEAM_TOOL_NAME) return isTeamReadAction(input);
 	return toolName === "StructSed" && input.dry_run !== false;
+}
+
+/** Why a reviewer's Browser call that does more than read a page is refused. */
+export const REVIEW_BROWSER_READ_ONLY_REASON =
+	"Review mode: Browser may only read pages (launch headless, navigate, screenshot without " +
+	"file_path, get_text, dom, scroll, close, ...). Clicking, typing, filling forms, running " +
+	"scripts and profiling are not available to a read-only reviewer.";
+
+/** File tools whose writes inside a team work item's worktree need no person (P3). */
+const TEAM_WORKTREE_FILE_TOOLS = new Set(["Write", "Edit", "NotebookEdit", "StructSed"]);
+
+/**
+ * Whether a call stays inside the team's recorded work item worktrees: an `Agent` whose workdir
+ * is one of them (or below one), or a file write whose every target is inside one.
+ */
+export function isTeamWorktreeScopedCall(
+	toolName: string,
+	input: Record<string, unknown>,
+	cwd: string,
+	worktrees: readonly string[] | undefined,
+	context?: ExecutionTargetContext | null,
+	/** Directories never auto-allowed for writes (each worktree's configured hooks directory). */
+	guards: readonly string[] = [],
+): boolean {
+	if (!worktrees || worktrees.length === 0) return false;
+	if (context && context.target.deviceId !== LOCAL_DEVICE_ID) return false;
+	const paths = decisionPaths(context);
+	const inside = (path: string) => worktrees.some((root) => paths.contains(root, path));
+	if (toolName === "Agent") {
+		if (typeof input.workdir !== "string" || !input.workdir) return false;
+		return inside(resolveDecisionPath(cwd, input.workdir, context));
+	}
+	if (!TEAM_WORKTREE_FILE_TOOLS.has(toolName)) return false;
+	const targets = getToolPolicyPaths(toolName, input, cwd, undefined, context);
+	// Git control data (hooks, attributes, modules, config) changes what git runs: a person
+	// decides, never the team allowance.
+	const ordinaryFile = (path: string) =>
+		worktrees.some(
+			(root) => paths.contains(root, path) && !isGitControlRelativePath(paths.relative(root, path)),
+		) && !guards.some((guard) => isInsideControlDir(guard, path));
+	return targets.length > 0 && targets.every(ordinaryFile);
+}
+
+/**
+ * The team allowance inputs of one call: the worktrees this narrator may treat as its own and,
+ * for a file write into one of them, that worktree's configured hooks directory. An unreadable
+ * hooks configuration withdraws the allowance (the call asks a person).
+ */
+async function teamWorktreeAllowance(
+	narratorId: string,
+	toolName: string,
+	input: Record<string, unknown>,
+	cwd: string,
+	context: ExecutionTargetContext | null | undefined,
+	constrained: boolean,
+): Promise<{ teamWorktrees?: string[]; teamWorktreeGuards?: string[] }> {
+	if (constrained) return {};
+	const roots = teamWorktreePathsForNarrator(narratorId);
+	if (roots.length === 0 || !TEAM_WORKTREE_FILE_TOOLS.has(toolName))
+		return { teamWorktrees: roots };
+	const paths = decisionPaths(context);
+	const targets = getToolPolicyPaths(toolName, input, cwd, undefined, context);
+	const touched = roots.filter((root) => targets.some((target) => paths.contains(root, target)));
+	if (touched.length === 0) return { teamWorktrees: roots };
+	try {
+		const { configuredHooksDir } = await import("./teams/team-git");
+		const guards = await Promise.all(touched.map((root) => configuredHooksDir(root)));
+		return {
+			teamWorktrees: roots,
+			teamWorktreeGuards: guards.filter((guard): guard is string => guard !== null),
+		};
+	} catch {
+		return { teamWorktrees: [] };
+	}
 }
 
 /** Tools that always require user approval regardless of permission mode. */
@@ -1455,6 +1652,8 @@ function resolveMcpToolPermission(
 
 export interface PermissionDecisionOpts {
 	toolName: string;
+	/** The deciding narrator: its own saved tool results are readable without approval. */
+	narratorId?: string;
 	input: Record<string, unknown>;
 	permMode: string;
 	cwd: string;
@@ -1496,6 +1695,14 @@ export interface PermissionDecisionOpts {
 		whitelist?: Array<{ pattern: string; enabled?: boolean }>;
 		blacklist?: Array<{ pattern: string; enabled?: boolean }>;
 	};
+	/**
+	 * Recorded worktrees of the live work items of the team this narrator works for (P3), from
+	 * `teamWorktreePathsForNarrator`. Delegating into one, and file writes inside one, are the
+	 * team's own resources: allowed without a person outside read-only, plan and review modes.
+	 */
+	teamWorktrees?: readonly string[];
+	/** Directories inside those worktrees that are never auto-allowed (configured hooks). */
+	teamWorktreeGuards?: readonly string[];
 }
 
 // ── Command policy helpers ────────────────────────────────
@@ -2192,16 +2399,20 @@ function scheduleQuestionReflection(
 async function currentPermissionModeAllowsAutomaticQuestionReflection(
 	pending: PendingPermission,
 ): Promise<boolean> {
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, pending.narratorId),
-		columns: {
-			permissionMode: true,
-			relaxedPlan: true,
-			previousPermissionMode: true,
-			traits: true,
-			questionReflectionOverride: true,
-		},
-	});
+	const narrator = await readQueryFirst(
+		db.query.narrators.findMany({
+			limit: 1,
+			where: eq(narrators.id, pending.narratorId),
+			columns: {
+				permissionMode: true,
+				relaxedPlan: true,
+				previousPermissionMode: true,
+				traits: true,
+				questionReflectionOverride: true,
+			},
+		}),
+		{ ...narratorSurfaceReadOptions({ timeoutMs: 30_000 }), maxRows: 1 },
+	);
 	if (!narrator) return false;
 	const effectiveMode = getEffectivePermissionMode(
 		narrator.permissionMode ?? "default",
@@ -2252,7 +2463,7 @@ export async function reflectPendingAskUserQuestion(
 			"running",
 			"Question reflection is answering AskUserQuestion",
 		);
-		const narrator = await narratorService.getById(pending.narratorId).catch(() => null);
+		const narrator = await narratorService.getById(pending.narratorId).catch(missingNarrator);
 		const answers = await generateAskUserQuestionAnswers(pending.narratorId, questions, {
 			locale: pending.locale,
 			model: narrator?.model,
@@ -3433,21 +3644,6 @@ function sendSelectors(input: Record<string, unknown>): string[] {
 	});
 }
 
-async function resolveSendAliasCandidate(
-	selector: string,
-	callerId: string,
-	teamParentId: string,
-): Promise<string> {
-	for (const ownerId of [callerId, teamParentId]) {
-		const inMemory = resolveTaskAlias(ownerId, selector);
-		if (inMemory !== selector) return inMemory;
-		const task = await backgroundTaskService.getByAlias(selector, ownerId);
-		if (task?.subagentNarratorId) return task.subagentNarratorId;
-		if (task?.type === "agent") return task.id;
-	}
-	return selector;
-}
-
 /**
  * Resolve Send destinations for permission auto-allow rank checks.
  *
@@ -3462,59 +3658,108 @@ async function resolveSendTargetsForPermission(
 	callerId: string,
 	caller: PermissionScopeNarrator,
 	input: Record<string, unknown>,
+	options: NarratorSurfaceReadBudget = {},
 ): Promise<PermissionScopeNarrator[]> {
 	const selectors = sendSelectors(input);
 	if (selectors.length === 0) return [];
 	const parentId = teamRootOf({ ...caller, id: callerId });
 	const callerIsSubagent = parentId !== callerId;
 
-	const resolved: PermissionScopeNarrator[] = [];
-	const seen = new Set<string>();
-	for (const selector of selectors) {
-		const aliasCandidate = await resolveSendAliasCandidate(selector, callerId, parentId);
-		const addressesParent =
+	if (selectors.length > 100)
+		throw new AppError("Send target lookup exceeds budget", 413, "DB_READ_BUDGET");
+	const readBudget = narratorSurfaceReadOptions(options);
+	const ranked = db
+		.select({
+			id: backgroundTasks.id,
+			alias: backgroundTasks.alias,
+			parentNarratorId: backgroundTasks.parentNarratorId,
+			type: backgroundTasks.type,
+			subagentNarratorId: backgroundTasks.subagentNarratorId,
+			rank: sql<number>`row_number() over (partition by ${backgroundTasks.parentNarratorId}, ${backgroundTasks.alias} order by ${backgroundTasks.createdAt} desc)`.as(
+				"alias_rank",
+			),
+		})
+		.from(backgroundTasks)
+		.where(
+			and(
+				inArray(backgroundTasks.parentNarratorId, [callerId, parentId]),
+				inArray(backgroundTasks.alias, selectors),
+			),
+		)
+		.as("permission_aliases");
+	const tasks = await readQuery(
+		db.select().from(ranked).where(eq(ranked.rank, 1)).limit(201),
+		narratorSurfaceReadOptions(readBudget),
+	);
+	const aliases = selectors.map((selector) => {
+		for (const owner of [callerId, parentId]) {
+			const memory = resolveTaskAlias(owner, selector);
+			if (memory !== selector) return memory;
+			const task = tasks.find((row) => row.parentNarratorId === owner && row.alias === selector);
+			if (task?.subagentNarratorId) return task.subagentNarratorId;
+			if (task?.type === "agent") return task.id;
+		}
+		return selector;
+	});
+	const load = (ids: string[]) =>
+		readQuery(
+			db.query.narrators.findMany({
+				where: inArray(narrators.id, ids),
+				limit: ids.length,
+				columns: {
+					id: true,
+					type: true,
+					variant: true,
+					parentNarratorId: true,
+					policySourceNarratorId: true,
+					runtimeRegistrationJson: true,
+					permissionMode: true,
+					relaxedPlan: true,
+					previousPermissionMode: true,
+					traits: true,
+				},
+			}),
+			narratorSurfaceReadOptions(readBudget),
+		);
+	const direct = await load([...new Set([...aliases, parentId])]);
+	const byId = new Map(direct.map((row) => [row.id, row]));
+	let siblings: Awaited<ReturnType<typeof narratorService.listTeamMembers>> | undefined;
+	const selected: string[] = [];
+	for (let index = 0; index < selectors.length; index++) {
+		const selector = selectors[index];
+		const alias = aliases[index];
+		if (
 			callerIsSubagent &&
-			(isParentSelector(aliasCandidate) ||
+			(isParentSelector(alias) ||
 				isParentSelector(selector) ||
-				aliasCandidate === parentId ||
-				selector === parentId);
-		// "parent"/"main" are reserved aliases, not narrator primary keys. Resolve the
-		// launching narrator by teamParentId so mixed target lists still work.
-		if (addressesParent) {
-			const parent = await narratorService.getById(parentId).catch(() => null);
-			if (!parent?.id || parent.id !== parentId || teamRootOf(parent) !== parent.id) {
-				return [];
-			}
-			if (!seen.has(parent.id)) {
-				seen.add(parent.id);
-				resolved.push(parent);
-			}
+				alias === parentId ||
+				selector === parentId)
+		) {
+			const parent = byId.get(parentId);
+			if (!parent || teamRootOf(parent) !== parent.id) return [];
+			selected.push(parent.id);
 			continue;
 		}
-		const direct = await narratorService.getById(aliasCandidate).catch(() => null);
-		if (direct) {
-			if (!direct.id || !isTeamMember(direct, parentId) || direct.id === callerId) {
-				return [];
-			}
-			if (!seen.has(direct.id)) {
-				seen.add(direct.id);
-				resolved.push(direct);
-			}
+		const target = byId.get(alias);
+		if (target) {
+			if (!isTeamMember(target, parentId) || target.id === callerId) return [];
+			selected.push(target.id);
 			continue;
 		}
-
-		const siblings = await narratorService.listTeamMembers(parentId);
-		const candidates = siblings.filter((s) => {
-			if (callerIsSubagent && s.id === callerId) return false;
-			return subagentMatchesSelector(s, selector);
-		});
-		if (candidates.length !== 1) return [];
-		const target = await narratorService.getById(candidates[0].id).catch(() => null);
-		if (!target?.id || !isTeamMember(target, parentId)) return [];
-		if (!seen.has(target.id)) {
-			seen.add(target.id);
-			resolved.push(target);
-		}
+		siblings ??= await narratorService.listTeamMembers(parentId, readBudget);
+		const matches = siblings.filter(
+			(row) => !(callerIsSubagent && row.id === callerId) && subagentMatchesSelector(row, selector),
+		);
+		if (matches.length !== 1) return [];
+		selected.push(matches[0].id);
+	}
+	const missing = [...new Set(selected.filter((id) => !byId.has(id)))];
+	if (missing.length) for (const row of await load(missing)) byId.set(row.id, row);
+	const resolved: PermissionScopeNarrator[] = [];
+	for (const id of new Set(selected)) {
+		const target = byId.get(id);
+		if (!target || (id !== parentId && !isTeamMember(target, parentId))) return [];
+		resolved.push(target);
 	}
 	return resolved;
 }
@@ -3531,6 +3776,7 @@ export async function shouldAutoAllowSendWithinScope(
 	narratorId: string,
 	caller: PermissionScopeNarrator | null | undefined,
 	input: Record<string, unknown>,
+	options: NarratorSurfaceReadBudget = {},
 ): Promise<boolean> {
 	try {
 		if (!caller) return false;
@@ -3541,7 +3787,7 @@ export async function shouldAutoAllowSendWithinScope(
 		const root = teamRootOf({ ...caller, id: narratorId });
 		const callerIsSubagent = root !== narratorId;
 		const teamParentId = callerIsSubagent ? root : null;
-		const targets = await resolveSendTargetsForPermission(narratorId, caller, input);
+		const targets = await resolveSendTargetsForPermission(narratorId, caller, input, options);
 		const selectors = sendSelectors(input);
 		const onlyAddressesParent =
 			callerIsSubagent &&
@@ -3563,7 +3809,9 @@ export async function shouldAutoAllowSendWithinScope(
 
 		const callerRank = permissionModeRank(caller);
 		return nonParentTargets.every((target) => permissionModeRank(target) <= callerRank);
-	} catch {
+	} catch (error) {
+		options.signal?.throwIfAborted();
+		rethrowPermissionReadFailure(error);
 		return false;
 	}
 }
@@ -4952,6 +5200,11 @@ function finalPermissionSnapshot(check: FinalToolPermissionCheck) {
 	) {
 		finalPermissionDeny("the exact tool attempt has no persisted approval");
 	}
+	// Whatever path produced the approval (rules, cache, reflection), a Team cleanup runs only
+	// on a person's decision for this exact attempt.
+	if (isTeamCleanupCall(check.toolName, check.input) && call.decidedBy !== "user") {
+		finalPermissionDeny("Team cleanup requires a person's approval");
+	}
 	const internalReadAuthority = captureFinalInternalReadAuthority(call);
 	const policy = executionPolicyRepository.loadNow(check.narratorId);
 	const policyRevision = executionPolicyRevision(policy);
@@ -5144,8 +5397,7 @@ export async function recheckFinalToolExecutionPermission(
 			finalPermissionDeny("OAuth device capability ceiling");
 		}
 	}
-	executionPolicyEngine.invalidate(check.narratorId);
-	const policy = await executionPolicyEngine.compile(
+	const policy = await executionPolicyEngine.compileCurrent(
 		check.narratorId,
 		context,
 		constraint?.useRobotDiagnosticPreset ? ["robotDiagnostic"] : [],
@@ -5228,13 +5480,18 @@ export async function recheckFinalToolExecutionPermission(
 					analysis.nonWhitelisted.length > 0 ||
 					analysis.dangerousPatterns.length > 0 ||
 					analysis.hasEnvInjection)) ||
-			(["GenUI", "Notification", "ScheduledTask", "Worktree"].includes(check.toolName) &&
-				!isReadOnlyCall(check.toolName, check.input)))
+			(["GenUI", "Notification", "ScheduledTask", "Worktree", TEAM_TOOL_NAME].includes(
+				check.toolName,
+			) &&
+				!isReadOnlyCall(check.toolName, check.input)) ||
+			(check.toolName === "Browser" && !isBrowserReadAction(check.input)))
 	)
 		finalPermissionDeny("read-only capability ceiling");
 	const sendInScope =
 		check.toolName === "Send" &&
-		(await shouldAutoAllowSendWithinScope(check.narratorId, before.narrator, check.input));
+		(await shouldAutoAllowSendWithinScope(check.narratorId, before.narrator, check.input, {
+			signal: check.signal,
+		}));
 	let dedicatedRuleApproval = false;
 	if (check.toolName === "RequestPermissionRule") {
 		if (!context) finalPermissionDeny("missing dedicated rule request execution context");
@@ -5257,6 +5514,7 @@ export async function recheckFinalToolExecutionPermission(
 			? "allow"
 			: resolvePermissionDecision({
 					toolName: decisionTool,
+					narratorId: check.narratorId,
 					input: decisionInput,
 					permMode: mode,
 					cwd,
@@ -5273,6 +5531,14 @@ export async function recheckFinalToolExecutionPermission(
 					reviewReadOnlyBash: readOnlyGitShell,
 					notificationPolicy: settings.agent.notificationPolicy,
 					webFetchPolicy: settings.agent.webFetchPolicy,
+					...(await teamWorktreeAllowance(
+						check.narratorId,
+						decisionTool,
+						decisionInput,
+						cwd,
+						context,
+						!!constraint,
+					)),
 				});
 	if (
 		decision === "deny" ||
@@ -5318,10 +5584,14 @@ export async function classifyDeviceAccessGroup(
 	ctx: { oauthClientId: string; grantId: string },
 ): Promise<DeviceAccessGroup> {
 	if (deviceId === LOCAL_DEVICE_ID) return "host";
-	const device = await db.query.remoteDevices.findFirst({
-		where: eq(remoteDevices.id, deviceId),
-		columns: { scope: true },
-	});
+	const device = await readQueryFirst(
+		db.query.remoteDevices.findMany({
+			limit: 1,
+			where: eq(remoteDevices.id, deviceId),
+			columns: { scope: true },
+		}),
+		{ ...narratorSurfaceReadOptions({ timeoutMs: 30_000 }), maxRows: 1 },
+	);
 	if (!device) return "global"; // fail closed toward the more restrictive default level below
 	const binding = await integrationResourceBindingService.get("device", deviceId);
 	const isSelfRegistered =
@@ -5382,20 +5652,24 @@ export async function handlePermission(
 	if (binding) {
 		try {
 			await narratorPersistence.validateToolCallBinding(narratorId, toolUseId, binding);
-		} catch {
+		} catch (error) {
+			rethrowPermissionReadFailure(error);
 			return { behavior: "deny", message: "Invalid persisted tool execution binding" };
 		}
 	}
 	// Legacy callers may omit the binding only when the provider id is unambiguous.
-	const candidates = await db.query.narratorToolCalls.findMany({
-		where: and(
-			binding ? eq(narratorToolCalls.id, binding.toolCallId) : undefined,
-			eq(narratorToolCalls.narratorId, narratorId),
-			eq(narratorToolCalls.toolUseId, toolUseId),
-		),
-		columns: { id: true, executionAttempt: true },
-		limit: 2,
-	});
+	const candidates = await readQuery(
+		db.query.narratorToolCalls.findMany({
+			where: and(
+				binding ? eq(narratorToolCalls.id, binding.toolCallId) : undefined,
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.toolUseId, toolUseId),
+			),
+			columns: { id: true, executionAttempt: true },
+			limit: 2,
+		}),
+		{ ...narratorSurfaceReadOptions({ timeoutMs: 30_000, signal }), maxRows: 2 },
+	);
 	if (candidates.length > 1 || (binding && candidates.length !== 1)) {
 		return { behavior: "deny", message: "Ambiguous or missing persisted tool execution record" };
 	}
@@ -5427,22 +5701,29 @@ export async function handlePermission(
 	let initialExecutionTarget = executionContext?.target;
 	const wsTarget = broadcastTargetId ?? narratorId;
 	const routingIdentity = permissionRoutingIdentity(narratorId, wsTarget, parentToolUseId);
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: {
-			permissionMode: true,
-			relaxedPlan: true,
-			previousPermissionMode: true,
-			planFileId: true,
-			dangerReflectionOverride: true,
-			questionReflectionOverride: true,
-			variant: true,
-			type: true,
-			parentNarratorId: true,
-			runtimeRegistrationJson: true,
-			traits: true,
-		},
-	});
+	const narrator = await readQueryFirst(
+		db.query.narrators.findMany({
+			limit: 1,
+			where: eq(narrators.id, narratorId),
+			columns: {
+				permissionMode: true,
+				relaxedPlan: true,
+				previousPermissionMode: true,
+				planFileId: true,
+				dangerReflectionOverride: true,
+				questionReflectionOverride: true,
+				variant: true,
+				type: true,
+				parentNarratorId: true,
+				aclRootNarratorId: true,
+				runtimeRegistrationJson: true,
+				traits: true,
+			},
+		}),
+		{ ...narratorSurfaceReadOptions({ timeoutMs: 30_000, signal }), maxRows: 1 },
+	);
+	// A nested subagent's requests also reach its ACL root's page (see nested-subagent-routing).
+	if (narrator) rememberNestedSubagentRoot({ id: narratorId, ...narrator });
 	const permMode = runtimeConstraint?.permissionMode ?? narrator?.permissionMode ?? "default";
 	// OAuth runtime constraints are hard ceilings and never inherit relaxed-plan expansion.
 	const isRelaxedPlan = runtimeConstraint
@@ -5497,6 +5778,7 @@ export async function handlePermission(
 			// Freeze an alias to the checked task, so approval cannot cancel a retargeted alias.
 			effectiveInput = { type: task.type, id: task.id };
 		} catch (error) {
+			rethrowPermissionReadFailure(error);
 			return { behavior: "deny", message: error instanceof Error ? error.message : String(error) };
 		}
 	}
@@ -5652,6 +5934,7 @@ export async function handlePermission(
 			const { assertNarratorCanAskQuestion } = await import("./narrator-question-service");
 			await assertNarratorCanAskQuestion(narratorId);
 		} catch (error) {
+			rethrowPermissionReadFailure(error);
 			return { behavior: "deny", message: error instanceof Error ? error.message : String(error) };
 		}
 		const askResult = await validateOrRepairAskUserQuestionInput(
@@ -5721,6 +6004,7 @@ export async function handlePermission(
 			signal,
 		);
 	} catch (error) {
+		rethrowPermissionReadFailure(error);
 		return {
 			behavior: "deny",
 			message: `Execution policy compilation failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -5788,12 +6072,30 @@ export async function handlePermission(
 		isPlanMode &&
 		(toolName === "Write" || toolName === "Edit") &&
 		(await (await import("./outline-plan-mode")).outlinePlanCycle(narratorId))?.kind === "outline";
+	// An external (OAuth) session never gets the team's worktree allowance.
+	const teamAllowance = await teamWorktreeAllowance(
+		narratorId,
+		toolName,
+		effectiveInput,
+		cwd,
+		executionContext,
+		!!runtimeConstraint,
+	);
+	const teamWorktreeScoped = isTeamWorktreeScopedCall(
+		toolName,
+		effectiveInput,
+		cwd,
+		teamAllowance.teamWorktrees,
+		executionContext,
+		teamAllowance.teamWorktreeGuards,
+	);
 	let decision =
 		toolName === "Send" &&
-		(await shouldAutoAllowSendWithinScope(narratorId, narrator, effectiveInput))
+		(await shouldAutoAllowSendWithinScope(narratorId, narrator, effectiveInput, { signal }))
 			? "allow"
 			: resolvePermissionDecision({
 					toolName,
+					narratorId,
 					input: effectiveInput,
 					permMode: decisionPermMode,
 					cwd,
@@ -5813,6 +6115,7 @@ export async function handlePermission(
 					executionTarget: initialExecutionTarget,
 					notificationPolicy: settings.agent.notificationPolicy,
 					webFetchPolicy: settings.agent.webFetchPolicy,
+					...teamAllowance,
 				});
 	logger.debug("Permission decision", {
 		narratorId,
@@ -5855,6 +6158,12 @@ export async function handlePermission(
 	// fail-closed shortcuts must not pre-empt it.
 	const oauthReflectsInsteadOfDenying =
 		!!runtimeConstraint && runtimeConstraint.permissionMode === "bypassPermissions";
+	// Only a person may approve a Team cleanup. An external session has nobody to ask, and its
+	// reflection loop is the agent reviewing itself, so this is denied outright.
+	if (runtimeConstraint && isTeamCleanupCall(toolName, effectiveInput) && decision !== "deny") {
+		permMeta.blacklistReason = `OAuth runtime policy cannot obtain a person's approval for Team cleanup`;
+		decision = "deny";
+	}
 	if (runtimeConstraint && !oauthReflectsInsteadOfDenying && decision === "ask") {
 		permMeta.blacklistReason =
 			"OAuth runtime policy denies operations that require interactive approval";
@@ -5896,9 +6205,14 @@ export async function handlePermission(
 		if (!opts.skipConfirmationCache && consumeDangerConfirmation(narratorId, fingerprint)) {
 			return null;
 		}
-		const toolCallRecord = await db.query.narratorToolCalls.findFirst({
-			where: and(eq(narratorToolCalls.id, permissionToolCallId)),
-		});
+		const toolCallRecord = await readQueryFirst(
+			db.query.narratorToolCalls.findMany({
+				limit: 1,
+				where: and(eq(narratorToolCalls.id, permissionToolCallId)),
+				columns: { id: true },
+			}),
+			{ ...narratorSurfaceReadOptions({ timeoutMs: 30_000, signal }), maxRows: 1 },
+		);
 		if (!toolCallRecord) {
 			logger.error("Tool call record not found for danger reflection", {
 				narratorId,
@@ -6059,7 +6373,11 @@ export async function handlePermission(
 		decision === "allow" || (decision === "ask" && !!permMeta.gitInternalReviewReason);
 	if (
 		(oauthDangerReflectionCandidate ||
-			(!runtimeConstraint && bypassReviewCandidate && effectiveMode === "bypassPermissions")) &&
+			(!runtimeConstraint &&
+				bypassReviewCandidate &&
+				effectiveMode === "bypassPermissions" &&
+				// The team's own worktree is no custom directory to reflect on (plan §二.3).
+				!teamWorktreeScoped)) &&
 		dangerReflectionLevel !== "off"
 	) {
 		const danger =
@@ -6257,9 +6575,14 @@ export async function handlePermission(
 		};
 	}
 
-	const toolCallRecord = await db.query.narratorToolCalls.findFirst({
-		where: and(eq(narratorToolCalls.id, permissionToolCallId)),
-	});
+	const toolCallRecord = await readQueryFirst(
+		db.query.narratorToolCalls.findMany({
+			limit: 1,
+			where: and(eq(narratorToolCalls.id, permissionToolCallId)),
+			columns: { id: true },
+		}),
+		{ ...narratorSurfaceReadOptions({ timeoutMs: 30_000, signal }), maxRows: 1 },
+	);
 
 	if (!toolCallRecord) {
 		logger.error("Tool call record not found for permission request", { narratorId, toolUseId });
@@ -6295,6 +6618,7 @@ export async function handlePermission(
 		const resolvedWorkdir = resolvePath(cwd, input.workdir);
 		decisionReason = `Subagent requests custom working directory: ${resolvedWorkdir} (parent cwd: ${cwd})`;
 	}
+	if (isTeamCleanupCall(toolName, input)) decisionReason = describeTeamCleanup(narratorId, input);
 
 	if (permMeta.gitInternalReviewReason) {
 		decisionReason = decisionReason
@@ -6334,7 +6658,7 @@ export async function handlePermission(
 			? Date.now() + getQuestionReflectionTimeoutMs()
 			: undefined;
 
-	broadcastToNarrator(wsTarget, {
+	broadcastPermissionFrame(narratorId, wsTarget, {
 		type: "permission_request",
 		narratorId: wsTarget,
 		request: {
@@ -6377,7 +6701,7 @@ export async function handlePermission(
 	await mirrorPermissionStatusToTarget(narratorId, broadcastTargetId, "waiting");
 
 	if (signal.aborted) {
-		broadcastToNarrator(wsTarget, {
+		broadcastPermissionFrame(narratorId, wsTarget, {
 			type: "permission_resolved",
 			narratorId: wsTarget,
 			requestId: toolCallId,
@@ -6415,7 +6739,7 @@ export async function handlePermission(
 				toolName,
 			});
 			cleanup();
-			broadcastToNarrator(wsTarget, {
+			broadcastPermissionFrame(narratorId, wsTarget, {
 				type: "permission_resolved",
 				narratorId: wsTarget,
 				requestId: toolCallId,
@@ -6528,6 +6852,7 @@ async function handlePermissionRuleRequest(args: {
 		}
 		await options.onInputResolved?.(prepared.input);
 	} catch (error) {
+		rethrowPermissionReadFailure(error);
 		return { behavior: "deny", message: error instanceof Error ? error.message : String(error) };
 	}
 	const id = binding.toolCallId;
@@ -6677,7 +7002,7 @@ async function handlePermissionRuleRequest(args: {
 			decision,
 		};
 	}
-	broadcastToNarrator(wsTarget, {
+	broadcastPermissionFrame(narratorId, wsTarget, {
 		type: "permission_request",
 		narratorId: wsTarget,
 		request: {
@@ -6768,6 +7093,12 @@ export interface ResolvePermissionOpts {
 	 */
 	decidedBy?: "user" | "auto" | "reflection" | `narrator:${string}`;
 	exitPlanCancelled?: boolean;
+	/**
+	 * A person's decision: re-check that they may still decide, right before the decision is
+	 * dispatched (after any wait to resume a paused restart recovery). Throws to refuse; nothing
+	 * is decided then. Access revoked while the decision was on its way must not let it through.
+	 */
+	assertStillAllowed?: () => Promise<void>;
 	/**
 	 * ExitPlanMode of an outline session returned on the card (`outline-plan-mode.ts`): the tool
 	 * result the agent gets, as is.
@@ -6888,7 +7219,7 @@ export async function resolvePermission(
 			} catch {}
 		} finally {
 			pending.cleanup();
-			broadcastToNarrator(pending.broadcastTargetId, {
+			broadcastPermissionFrame(pending.narratorId, pending.broadcastTargetId, {
 				type: "permission_resolved",
 				narratorId: pending.broadcastTargetId,
 				requestId,
@@ -6948,11 +7279,11 @@ export async function resolvePermission(
 	let decidedByNarrator: { id: string; handle: string | null } | undefined;
 	if (decidedBy.startsWith("narrator:")) {
 		const proxyId = decidedBy.slice("narrator:".length);
-		const proxy = await narratorService.getById(proxyId).catch(() => null);
+		const proxy = await narratorService.getById(proxyId).catch(missingNarrator);
 		decidedByNarrator = { id: proxyId, handle: proxy?.handle ?? null };
 	}
 
-	broadcastToNarrator(pending.broadcastTargetId, {
+	broadcastPermissionFrame(pending.narratorId, pending.broadcastTargetId, {
 		type: "permission_resolved",
 		narratorId: pending.broadcastTargetId,
 		requestId,
@@ -7107,7 +7438,10 @@ export async function resolvePermission(
  * never resolves through the tool-call row, which is why the registry lookups must
  * all run before that fallback.)
  */
-export async function resolveDecisionNarratorId(requestId: string): Promise<string | null> {
+export async function resolveDecisionNarratorId(
+	requestId: string,
+	options: NarratorSurfaceReadBudget = {},
+): Promise<string | null> {
 	const pending = pendingPermissions.get(requestId);
 	if (pending?.narratorId) return pending.narratorId;
 	const reflection = pendingDangerReflections.get(requestId);
@@ -7120,10 +7454,14 @@ export async function resolveDecisionNarratorId(requestId: string): Promise<stri
 	);
 	const planReflectionNarratorId = getExitPlanReflectionNarratorId(requestId);
 	if (planReflectionNarratorId) return planReflectionNarratorId;
-	const row = await db.query.narratorToolCalls.findFirst({
-		where: eq(narratorToolCalls.id, requestId),
-		columns: { narratorId: true },
-	});
+	const row = await readQueryFirst(
+		db.query.narratorToolCalls.findMany({
+			limit: 1,
+			where: eq(narratorToolCalls.id, requestId),
+			columns: { narratorId: true },
+		}),
+		{ ...narratorSurfaceReadOptions(options), maxRows: 1 },
+	);
 	return row?.narratorId ?? null;
 }
 
@@ -7167,15 +7505,19 @@ export async function resolvePermissionOrDangerReflection(
 		const { manuallyResumeRestartRecovery, pausedRestartToolCallForRequest } = await import(
 			"./restart-recovery-service"
 		);
-		const stored = await db.query.narratorToolCalls.findFirst({
-			where: eq(narratorToolCalls.id, pausedRestartToolCallForRequest(requestId)),
-			columns: {
-				narratorId: true,
-				status: true,
-				executionStartedAt: true,
-				fileChangeOperationId: true,
-			},
-		});
+		const stored = await readQueryFirst(
+			db.query.narratorToolCalls.findMany({
+				limit: 1,
+				where: eq(narratorToolCalls.id, pausedRestartToolCallForRequest(requestId)),
+				columns: {
+					narratorId: true,
+					status: true,
+					executionStartedAt: true,
+					fileChangeOperationId: true,
+				},
+			}),
+			{ ...narratorSurfaceReadOptions({ timeoutMs: 30_000 }), maxRows: 1 },
+		);
 		if (
 			stored?.status === "pending" &&
 			stored.executionStartedAt == null &&
@@ -7195,6 +7537,8 @@ export async function resolvePermissionOrDangerReflection(
 			}
 		}
 	}
+	// The last await before the decision is dispatched: whoever decides must still be allowed to.
+	await opts.assertStillAllowed?.();
 	if (pendingPermissions.has(requestId)) {
 		return resolvePermission(requestId, decision, opts);
 	}
@@ -7413,34 +7757,48 @@ async function abortPersistedDangerReflectionWithoutRuntime(
 	requestId: string,
 	reason?: string,
 ): Promise<boolean> {
-	const toolCall = await db.query.narratorToolCalls.findFirst({
-		where: eq(narratorToolCalls.id, requestId),
-		columns: {
-			id: true,
-			narratorId: true,
-			messageId: true,
-			toolUseId: true,
-			status: true,
-			permissionSuggestions: true,
-		},
-	});
+	const toolCall = await readQueryFirst(
+		db.query.narratorToolCalls.findMany({
+			limit: 1,
+			where: eq(narratorToolCalls.id, requestId),
+			columns: {
+				id: true,
+				narratorId: true,
+				messageId: true,
+				toolUseId: true,
+				status: true,
+				permissionSuggestions: true,
+			},
+		}),
+		{ ...narratorSurfaceReadOptions({ timeoutMs: 30_000 }), maxRows: 1 },
+	);
 	if (!toolCall) return false;
 
 	const existingReflection = getPersistedDangerReflectionSuggestion(toolCall.permissionSuggestions);
 	if (!existingReflection) return false;
 	const [narrator, ownerMessage] = await Promise.all([
-		db.query.narrators.findFirst({
-			where: eq(narrators.id, toolCall.narratorId),
-			columns: { parentNarratorId: true },
-		}),
-		db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, toolCall.messageId),
-			columns: { parentToolUseId: true },
-		}),
+		readQueryFirst(
+			db.query.narrators.findMany({
+				limit: 1,
+				where: eq(narrators.id, toolCall.narratorId),
+				columns: { id: true, type: true, parentNarratorId: true, aclRootNarratorId: true },
+			}),
+			{ ...narratorSurfaceReadOptions({ timeoutMs: 30_000 }), maxRows: 1 },
+		),
+		readQueryFirst(
+			db.query.narratorMessages.findMany({
+				limit: 1,
+				where: eq(narratorMessages.id, toolCall.messageId),
+				columns: { parentToolUseId: true },
+			}),
+			{ ...narratorSurfaceReadOptions({ timeoutMs: 30_000 }), maxRows: 1 },
+		),
 	]);
 	// No runtime pause exists, so the route is rebuilt from persistence: the owner
 	// plus its parent (if it is a subagent) are exactly the pages that can be
-	// rendering this gate. `broadcastReflectionFrame` applies the same fan-out.
+	// rendering this gate, plus the ACL root's page for a nested subagent.
+	// `broadcastReflectionFrame` applies the same fan-out.
+	if (narrator) rememberNestedSubagentRoot(narrator);
 	const route = {
 		narratorId: toolCall.narratorId,
 		broadcastTargetId: narrator?.parentNarratorId ?? toolCall.narratorId,
@@ -7773,7 +8131,7 @@ function broadcastReprocessedPermissionDecision(
 	result: PermissionResult,
 ): void {
 	if (result.behavior === "dangerReflection") return;
-	broadcastToNarrator(pending.broadcastTargetId, {
+	broadcastPermissionFrame(pending.narratorId, pending.broadcastTargetId, {
 		type: "permission_resolved",
 		narratorId: pending.broadcastTargetId,
 		requestId,
@@ -7814,7 +8172,7 @@ async function failReprocessedPendingPermission(
 			error: dbError instanceof Error ? dbError.message : String(dbError),
 		});
 	}
-	broadcastToNarrator(pending.broadcastTargetId, {
+	broadcastPermissionFrame(pending.narratorId, pending.broadcastTargetId, {
 		type: "permission_resolved",
 		narratorId: pending.broadcastTargetId,
 		requestId,
@@ -7850,7 +8208,7 @@ export function reprocessAllPendingPermissions(narratorId: string): number {
 		}
 
 		pending.cleanup();
-		broadcastToNarrator(pending.broadcastTargetId, {
+		broadcastPermissionFrame(pending.narratorId, pending.broadcastTargetId, {
 			type: "permission_resolved",
 			narratorId: pending.broadcastTargetId,
 			requestId,

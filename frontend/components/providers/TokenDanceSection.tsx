@@ -1,9 +1,10 @@
-import { Alert, Button, Group, Stack, Switch, Text } from "@mantine/core";
+import { Alert, Button, Group, Select, Stack, Switch, Text } from "@mantine/core";
 import {
 	parseTokenDanceRecoveryAction,
 	type TokenDancePublicConnection,
 	type TokenDanceRecoveryAction,
 } from "@shared/tokendance";
+import type { ToolResultImagesMode } from "@shared/tool-result-images";
 import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -18,6 +19,8 @@ export function TokenDanceSection({
 	/** 启用开关的草稿值（保存条统一提交，避免一拨就落库）。 */
 	enabled,
 	onToggleEnabled,
+	toolResultImages,
+	onToolResultImagesChange,
 	onLogin,
 	onChanged,
 	onDeleted,
@@ -25,6 +28,8 @@ export function TokenDanceSection({
 }: Omit<ModelListProps, "models"> & {
 	connection: TokenDancePublicConnection;
 	enabled: boolean;
+	toolResultImages?: ToolResultImagesMode;
+	onToolResultImagesChange: (value: ToolResultImagesMode) => void;
 	onToggleEnabled: () => void;
 	onLogin: () => Promise<void>;
 	onChanged: () => Promise<void>;
@@ -140,6 +145,18 @@ export function TokenDanceSection({
 				generation={connection.generation}
 				disabled={connection.disabled}
 				onClose={() => setRechargeOpened(false)}
+			/>
+			<Select
+				label={t("toolResultImages")}
+				description={t("toolResultImagesDesc")}
+				data={[
+					{ value: "off", label: t("toolResultImagesOff") },
+					{ value: "inline", label: t("toolResultImagesInline") },
+					{ value: "separate", label: t("toolResultImagesSeparate") },
+				]}
+				value={toolResultImages ?? "off"}
+				disabled={busy || !isAdmin}
+				onChange={(value) => onToolResultImagesChange((value ?? "off") as ToolResultImagesMode)}
 			/>
 			{error && <Alert color="red">{t("tokendance.operationFailed")}</Alert>}
 			{recoveryAction && <Alert color="yellow">{t(`tokendance.${recoveryAction}`)}</Alert>}

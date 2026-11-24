@@ -429,8 +429,8 @@ describe("main.ts wiring (source-level; main.ts binds ports and cannot be import
 	});
 
 	test("the SQLite-only integrity probe is gated off the PostgreSQL backend", () => {
-		expect(mainSource).toContain(
-			'if (activeDatabaseBackend === "sqlite") {\n\tscheduleBackgroundIntegrityCheck(startupShutdownState);',
+		expect(mainSource).toMatch(
+			/if \(activeDatabaseBackend === "sqlite"\) \{\s*scheduleBackgroundIntegrityCheck\(startupShutdownState\);/,
 		);
 	});
 

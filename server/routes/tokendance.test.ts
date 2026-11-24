@@ -18,6 +18,7 @@ const connection = {
 	name: "TokenDance",
 	billingInstance: "a".repeat(32),
 };
+const updateConnection = mock((_disabled: boolean, _mode?: string) => connection);
 mock.module("../services/tokendance-service", () => ({
 	getTokenDanceConnection: () => connection,
 	getTokenDanceBalance: () => ({
@@ -52,7 +53,7 @@ mock.module("../services/tokendance-service", () => ({
 	completeTokenDanceOAuth: () => ({ connected: true, modelsRefreshed: true }),
 	cancelTokenDanceOAuth: () => {},
 	restoreTokenDanceDraft: () => ({ status: "pending" }),
-	setTokenDanceDisabled: () => connection,
+	setTokenDanceDisabled: updateConnection,
 	deleteTokenDanceConnection: () => {},
 	refreshTokenDanceModels: () => {
 		throw Object.assign(new AppError("TokenDance model refresh failed", 502, "TOKENDANCE_ERROR"), {
@@ -258,6 +259,15 @@ describe("TokenDance first-party admin boundary", () => {
 			body: JSON.stringify({ disabled: false, apiKey: "must-not-save" }),
 		});
 		expect(response.status).toBe(400);
+		for (const mode of ["off", "inline", "separate", "invalid", null]) {
+			const result = await instance.request("/api/tokendance/connection", {
+				method: "PATCH",
+				body: JSON.stringify({ disabled: false, toolResultImages: mode }),
+			});
+			expect(result.status).toBe(mode === "invalid" || mode === null ? 400 : 200);
+			if (mode === "off" || mode === "inline" || mode === "separate")
+				expect(updateConnection).toHaveBeenLastCalledWith(false, mode);
+		}
 		const tooLarge = await instance.request("/api/tokendance/oauth/start", {
 			method: "POST",
 			body: "x".repeat(1024 * 1024 + 8193),

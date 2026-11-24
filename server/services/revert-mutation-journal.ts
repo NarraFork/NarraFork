@@ -1,11 +1,12 @@
 import type { Database } from "bun:sqlite";
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
+import { readDomainTask } from "@server/db/worker-read";
 import {
 	FILE_CHANGE_EVIDENCE_VERSION,
 	FILE_CHANGE_LIMITS,
 	type FileChangeState,
 } from "@shared/file-change-protocol";
-import { and, asc, eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import type { BunSQLiteDatabase } from "drizzle-orm/bun-sqlite";
 import {
 	fileChangeBlobs,
@@ -95,27 +96,42 @@ export class RevertMutationJournal {
 			.returning()
 			.get();
 	}
-	getOperation(ctx: RevertJournalContext): RevertJournalOperation {
-		return requireOperation(this.db, ctx);
-	}
-	listFiles(
+	private async readSnapshot(
 		ctx: RevertJournalContext,
-		options: { cursor?: string; limit?: number } = {},
-	): RevertJournalPage<RevertJournalFile, string> {
-		const operation = this.getOperation(ctx);
+		cursor: string | null = null,
+		limit = 0,
+		signal?: AbortSignal,
+	) {
+		this.assertRoot();
+		const snapshot = await readDomainTask(
+			this.db.$client,
+			"revertPlanSnapshot",
+			{ owner: ctx.owner, planId: ctx.planId, cursor, limit },
+			{ executionPolicy: "worker-required", signal },
+		);
+		signal?.throwIfAborted();
+		if (!snapshot.operation) throw fail("NOT_FOUND", "Plan not found in the authorized context");
+		if (snapshot.operation.planHash !== ctx.planHash)
+			throw fail("REQUEST_CONFLICT", "Confirmed plan changed");
+		return { ...snapshot, operation: snapshot.operation };
+	}
+	async getOperation(
+		ctx: RevertJournalContext,
+		options: { signal?: AbortSignal } = {},
+	): Promise<RevertJournalOperation> {
+		return (await this.readSnapshot(ctx, null, 0, options.signal)).operation;
+	}
+	async listFiles(
+		ctx: RevertJournalContext,
+		options: { cursor?: string; limit?: number; signal?: AbortSignal } = {},
+	): Promise<RevertJournalPage<RevertJournalFile, string>> {
 		const limit = pageLimit(options.limit);
-		const rows = this.db
-			.select()
-			.from(files)
-			.where(
-				and(
-					eq(files.revertOperationId, operation.id),
-					options.cursor ? sql`${files.fileKey} > ${options.cursor}` : undefined,
-				),
-			)
-			.orderBy(asc(files.fileKey))
-			.limit(limit + 1)
-			.all();
+		const { files: rows } = await this.readSnapshot(
+			ctx,
+			options.cursor ?? null,
+			limit + 1,
+			options.signal,
+		);
 		const items = rows.slice(0, limit);
 		return {
 			items,
@@ -218,14 +234,14 @@ export class RevertMutationJournal {
 		ctx: RevertJournalContext,
 		options: { cancelled?: boolean; reason?: string | null } = {},
 	): Promise<RevertJournalOperation> {
-		const original = this.getOperation(ctx);
+		const original = await this.getOperation(ctx);
 		if (original.status !== "applying") return original;
 		let cursor: string | undefined;
 		let count = 0;
 		let successful = 0;
 		let touched = false;
 		do {
-			const page = this.listFiles(ctx, { cursor, limit: REVERT_JOURNAL_BATCH_ITEMS });
+			const page = await this.listFiles(ctx, { cursor, limit: REVERT_JOURNAL_BATCH_ITEMS });
 			for (const file of page.items) {
 				count++;
 				if (file.status === "applied" || file.status === "unchanged") successful++;
@@ -257,7 +273,11 @@ export class RevertMutationJournal {
 	failHistory(ctx: RevertJournalContext, reason: string): RevertJournalOperation {
 		return this.transaction((tx) => {
 			const operation = requireOperation(tx, ctx);
-			if (operation.status !== "files_verified" || !operation.coverageComplete) return operation;
+			if (
+				operation.status !== "applying" &&
+				(operation.status !== "files_verified" || !operation.coverageComplete)
+			)
+				return operation;
 			return this.update(tx, operation, {
 				status: operation.fileCount ? "partial" : "failed",
 				reason: reason.slice(0, 256),

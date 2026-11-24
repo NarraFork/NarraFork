@@ -15,10 +15,57 @@
 import { describe, expect, test } from "bun:test";
 import {
 	type GitFolderPrefs,
+	normalizeExpandedPaths,
 	parseFolderPrefs,
 	readExpanded,
 	toggleExpanded,
+	toggleExpandedPath,
 } from "./git-folder-prefs";
+
+describe("normalizeExpandedPaths", () => {
+	test("adds ancestor intent to historical compact rows without changing the input", () => {
+		const paths = ["src/a/deep", "src/a", "src2/b"];
+		expect(normalizeExpandedPaths(paths)).toEqual(
+			new Set(["src", "src/a", "src/a/deep", "src2", "src2/b"]),
+		);
+		expect(paths).toEqual(["src/a/deep", "src/a", "src2/b"]);
+	});
+
+	test("preserves literal backslashes, whitespace, Unicode and dot names", () => {
+		const literal = "中文 空格/line\n\\name/.hidden";
+		expect(normalizeExpandedPaths([literal])).toEqual(
+			new Set(["中文 空格", "中文 空格/line\n\\name", literal]),
+		);
+		expect(normalizeExpandedPaths(["src\\a"])).toEqual(new Set(["src\\a"]));
+	});
+
+	test("is idempotent for an already normalized set", () => {
+		const normalized = normalizeExpandedPaths(["src/a", "src/b"]);
+		expect(normalizeExpandedPaths(normalized)).toEqual(normalized);
+		expect(normalizeExpandedPaths([])).toEqual(new Set());
+	});
+});
+
+describe("toggleExpandedPath", () => {
+	test("opening a compact row retains every ancestor when its label later splits", () => {
+		const opened = toggleExpandedPath([], "src/a/deep");
+		expect(opened).toEqual(new Set(["src", "src/a", "src/a/deep"]));
+		const closed = toggleExpandedPath(opened, "src/a");
+		expect(closed).toEqual(new Set(["src"]));
+		expect(toggleExpandedPath(closed, "src/a")).toEqual(new Set(["src", "src/a"]));
+	});
+
+	test("closing a parent removes historical descendants and keeps sibling prefixes", () => {
+		const paths = ["src/a/deep", "src/a2/deep", "src2/a", "src\\a/deep"];
+		expect(toggleExpandedPath(paths, "src/a")).toEqual(
+			new Set(["src", "src/a2", "src/a2/deep", "src2", "src2/a", "src\\a", "src\\a/deep"]),
+		);
+		expect(toggleExpandedPath(paths, "src")).toEqual(
+			new Set(["src2", "src2/a", "src\\a", "src\\a/deep"]),
+		);
+		expect(paths).toEqual(["src/a/deep", "src/a2/deep", "src2/a", "src\\a/deep"]);
+	});
+});
 
 describe("readExpanded", () => {
 	test("an unknown chapter has nothing expanded", () => {
@@ -32,6 +79,12 @@ describe("readExpanded", () => {
 		};
 		expect(readExpanded(prefs, "ch-1", "staged")).toEqual(new Set(["src"]));
 		expect(readExpanded(prefs, "ch-1", "unstaged")).toEqual(new Set(["docs"]));
+	});
+
+	test("reads historical leaf-only records with their real ancestors", () => {
+		const prefs: GitFolderPrefs = { "ch-1": { staged: ["src/a"], unstaged: [] } };
+		expect(readExpanded(prefs, "ch-1", "staged")).toEqual(new Set(["src", "src/a"]));
+		expect(prefs["ch-1"].staged).toEqual(["src/a"]);
 	});
 
 	test("does not read one chapter's folders for another", () => {
@@ -69,6 +122,21 @@ describe("toggleExpanded", () => {
 		expect(JSON.stringify(before)).toBe(frozen);
 	});
 
+	test("persists compact ancestors and subtree collapse through a session refresh", () => {
+		const opened = toggleExpanded({}, "ch-1", "staged", "src/a/deep");
+		expect(opened["ch-1"].staged).toEqual(["src/a/deep", "src/a", "src"]);
+		const refreshed = parseFolderPrefs(JSON.stringify(opened));
+		const closed = toggleExpanded(refreshed, "ch-1", "staged", "src/a");
+		expect(readExpanded(closed, "ch-1", "staged")).toEqual(new Set(["src"]));
+		const reopened = toggleExpanded(
+			parseFolderPrefs(JSON.stringify(closed)),
+			"ch-1",
+			"staged",
+			"src/a",
+		);
+		expect(readExpanded(reopened, "ch-1", "staged")).toEqual(new Set(["src", "src/a"]));
+	});
+
 	test("toggling another chapter preserves existing ones", () => {
 		const prefs = toggleExpanded({}, "ch-1", "staged", "src");
 		const next = toggleExpanded(prefs, "ch-2", "staged", "docs");
@@ -81,7 +149,7 @@ describe("parseFolderPrefs", () => {
 	test("round-trips a real document", () => {
 		const prefs = toggleExpanded({}, "ch-1", "staged", "src/components");
 		const parsed = parseFolderPrefs(JSON.stringify(prefs));
-		expect(readExpanded(parsed, "ch-1", "staged")).toEqual(new Set(["src/components"]));
+		expect(readExpanded(parsed, "ch-1", "staged")).toEqual(new Set(["src", "src/components"]));
 	});
 
 	test.each([

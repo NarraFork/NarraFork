@@ -1,25 +1,11 @@
+import { identifyService } from "@shared/sourcing/identify";
 import type { DeepSeekBalanceCache } from "../../../lib/api/types";
 
 type Translate = (key: string, options?: Record<string, unknown>) => string;
 
 /** Match only the official platform, not relays offering DeepSeek models. */
 export function isDeepSeekProviderBaseUrl(baseUrl?: string): boolean {
-	if (!baseUrl) return false;
-	try {
-		const url = new URL(baseUrl);
-		return (
-			url.protocol === "https:" &&
-			url.hostname.toLowerCase() === "api.deepseek.com" &&
-			!url.port &&
-			!url.username &&
-			!url.password &&
-			!url.search &&
-			!url.hash &&
-			["/", "/v1", "/anthropic"].includes(url.pathname.replace(/\/$/, "") || "/")
-		);
-	} catch {
-		return false;
-	}
+	return identifyService({ baseUrl }).templateId === "deepseek";
 }
 
 export function formatDeepSeekBalance(

@@ -2,9 +2,10 @@ import { existsSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
-import { streamSSE } from "hono/streaming";
+import { type SSEStreamingApi, streamSSE } from "hono/streaming";
 import { activeDatabaseBackend, db } from "../db";
 import { narrators, projects, remoteDevices } from "../db/schema";
+import { trackStreamingRequestWork } from "../http-request-lifecycle";
 import { AppError, GitAuthError, NotFoundError, ValidationError } from "../lib/errors";
 import { resolveUserGitIdentityEnv } from "../lib/git-identity";
 import { generateId } from "../lib/id";
@@ -18,6 +19,7 @@ import {
 	projectVisibilitySchema,
 	updateProjectSchema,
 } from "../lib/validators";
+import { executionPolicyEngine } from "../services/execution-policy/engine";
 import { gitService } from "../services/git-service";
 import { propagateOAuthProjectRemoval } from "../services/oauth-runtime-revocation";
 import { canWriteProject, type ProjectAclRow } from "../services/project-acl";
@@ -31,6 +33,7 @@ import {
 } from "../services/project-membership";
 import { projectReadAdapter } from "../services/read";
 import { collectAllPages, parseLimitQuery, singlePage } from "../services/read/read-collect";
+import { projectHasTeams } from "../services/teams/team-records";
 import { removeTabFromAllUsers } from "../services/user-preferences-service";
 import { withProjectRetirement } from "../services/worktree-lifecycle-guard";
 
@@ -164,7 +167,7 @@ projectRoutes.post("/", async (c) => {
 				? { username: body.cloneUsername, password: body.clonePassword }
 				: undefined;
 
-		return streamSSE(c, async (stream) => {
+		const cloneAndCreate = async (stream: SSEStreamingApi) => {
 			let sseId = 0;
 			try {
 				await gitService.cloneRepoStreaming(
@@ -235,7 +238,8 @@ projectRoutes.post("/", async (c) => {
 						.catch(() => {});
 				}
 			}
-		});
+		};
+		return streamSSE(c, trackStreamingRequestWork(cloneAndCreate));
 	}
 
 	// Associating an existing directory is metadata-only. Git is consulted only for
@@ -377,6 +381,9 @@ projectRoutes.patch("/:id", async (c) => {
 		.where(eq(projects.id, id))
 		.returning();
 	if (!updated) throw new NotFoundError("Project", id);
+	if (mergedSettings !== undefined || rest.gitPath !== undefined) {
+		executionPolicyEngine.invalidateProject(id);
+	}
 	if (rest.gitPath !== undefined) await indexNewProjectRoot(id);
 
 	return c.json(updated);
@@ -392,23 +399,38 @@ projectRoutes.delete("/:id", async (c) => {
 	return withProjectRetirement(
 		id,
 		async () => {
+			// Teams record the worktrees and branches they made; deleting the project would orphan
+			// them. Checked before anything is propagated, and again in the transaction below:
+			// retirement does not hold off team creation, so one may appear in between.
+			const hasTeams = () =>
+				new AppError(
+					"This project has teams. Delete their coordinator sessions before deleting the project.",
+					409,
+					"PROJECT_HAS_TEAMS",
+				);
+			if (projectHasTeams(id)) throw hasTeams();
 			await propagateOAuthProjectRemoval(id);
 
 			const deviceRevokedAt = new Date().toISOString();
-			await db
-				.update(narrators)
-				.set({ contextProjectId: null, updatedAt: deviceRevokedAt })
-				.where(eq(narrators.contextProjectId, id));
-			await db
-				.update(remoteDevices)
-				.set({
-					projectId: null,
-					status: "offline",
-					revokedAt: deviceRevokedAt,
-					updatedAt: deviceRevokedAt,
-				})
-				.where(eq(remoteDevices.projectId, id));
-			await db.delete(projects).where(eq(projects.id, id));
+			// One synchronous transaction: a team created after the check above makes this a clean
+			// 409 with nothing detached or revoked, instead of a RESTRICT failure halfway through.
+			db.transaction((tx) => {
+				if (projectHasTeams(id, tx)) throw hasTeams();
+				tx.update(narrators)
+					.set({ contextProjectId: null, updatedAt: deviceRevokedAt })
+					.where(eq(narrators.contextProjectId, id))
+					.run();
+				tx.update(remoteDevices)
+					.set({
+						projectId: null,
+						status: "offline",
+						revokedAt: deviceRevokedAt,
+						updatedAt: deviceRevokedAt,
+					})
+					.where(eq(remoteDevices.projectId, id))
+					.run();
+				tx.delete(projects).where(eq(projects.id, id)).run();
+			});
 			removeTabFromAllUsers("project", id).catch((err) => {
 				logger.warn("Failed to remove project tab from users", {
 					projectId: id,

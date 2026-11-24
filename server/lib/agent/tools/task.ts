@@ -1,6 +1,7 @@
 import { REASONING_EFFORT_VALUES, type ReasoningEffort } from "@shared/reasoning-effort";
 import { isSubagentReasoningEffort, SUBAGENT_POOL_TYPES } from "@shared/subagent-model-policy";
 import { z } from "zod/v4";
+import { isCheckpointStop } from "../../../services/agent-runtime/checkpoint-stop";
 import { resolvePath } from "../../platform-path";
 import { expandAllowedPoolForDisplay, getSubagentVisibleModels, settings } from "../../settings";
 import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
@@ -10,7 +11,7 @@ const TAKEOVER_BY_USER_DESCRIPTION =
 	"Set to true to create this subagent directly in user takeover mode for further human interaction. " +
 	"The Agent call returns immediately without requiring run_in_background. The initial prompt still runs, " +
 	"but completion does not notify or wake the parent; the subagent stays taken over until the user explicitly ends takeover. " +
-	"Do not automatically Await this agent.";
+	"Do not automatically Watch this agent.";
 
 const REASONING_EFFORT_DESCRIPTION =
 	'Reasoning/thinking effort for this subagent. Use "none" to disable thinking where supported. ' +
@@ -23,6 +24,13 @@ const TASK_DESCRIPTION =
 	"The agent's instructions are written from the task's tree, so prompt may be left out; when given, it is added as further instructions. " +
 	"While the agent works the task is its own; its report is attached under the task when it finishes, and the task comes back to you, still in progress. " +
 	"Not available in other sessions.";
+
+const ISOLATION_DESCRIPTION =
+	'Team coordinators only: "worktree" creates a team work item (its own branch from the team\'s base and its own worktree) and starts the agent there (default subagent_type "worker"). ' +
+	"When that run ends with no commit and no uncommitted change, the worktree is removed and the item cancelled; otherwise the item stays in progress. Not combinable with workdir.";
+
+const TITLE_DESCRIPTION =
+	'With isolation "worktree": the work item\'s title (also names its branch). Defaults to description.';
 
 // Use text import so the bundler inlines the file content at build time
 import baseDescription from "./task.txt" with { type: "text" };
@@ -119,7 +127,7 @@ function buildParameters() {
 				.string()
 				.optional()
 				.describe(
-					'The type of specialized agent to use for this task. Built-in types: "explore" (read-only codebase exploration), "plan" (architecture planning, only in plan mode), "general" (full write access). You can also use any custom subagent type name defined by the user.',
+					'The type of specialized agent to use for this task. Built-in types: "explore" (read-only codebase exploration), "plan" (architecture planning, only in plan mode), "general" (full write access), "worker" (general plus Terminal, Browser and its own helper agents, which cannot launch further agents). You can also use any custom subagent type name defined by the user.',
 				),
 			run_in_background: z
 				.boolean()
@@ -129,7 +137,7 @@ function buildParameters() {
 				),
 			takeover_by_user: z.boolean().optional().describe(TAKEOVER_BY_USER_DESCRIPTION),
 			timeout: looseNumber(
-				"Optional execution timeout for this subagent in milliseconds. Background runs default to 5 hours when omitted; use 0 for no wall-clock limit or provide any positive safe integer. This controls the Agent run itself, not Await waiting.",
+				"Optional execution timeout for this subagent in milliseconds. Background runs default to 5 hours when omitted; use 0 for no wall-clock limit or provide any positive safe integer. This controls the Agent run itself, not Watch waiting.",
 			),
 			model: z.string().optional().describe(MODEL_PARAM_BASE),
 			reasoning_effort: z
@@ -147,13 +155,15 @@ function buildParameters() {
 				.optional()
 				.describe("The task for the agent to perform (required when launching a new agent)"),
 			task: z.string().optional().describe(TASK_DESCRIPTION),
+			isolation: z.enum(["worktree"]).optional().describe(ISOLATION_DESCRIPTION),
+			title: z.string().max(200).optional().describe(TITLE_DESCRIPTION),
 			alias: z
 				.string()
 				.optional()
 				.describe(
 					'A short human-readable alias for this background task (e.g. "run-tests", "build-frontend"). ' +
 						"Must be unique within the current session. If omitted, an alias is auto-generated from the description. " +
-						"Use this alias with Await or Send to reference the task later.",
+						"Use this alias with Watch or Send to reference the task later.",
 				),
 
 			archive: z
@@ -186,7 +196,7 @@ function buildRawJsonSchema(): Record<string, unknown> {
 			},
 			subagent_type: {
 				description:
-					'The type of specialized agent to use for this task. Built-in types: "explore", "plan", "search", "general". Custom types are also supported.',
+					'The type of specialized agent to use for this task. Built-in types: "explore", "plan", "search", "general", "worker". Custom types are also supported.',
 				type: "string",
 			},
 			run_in_background: {
@@ -200,7 +210,7 @@ function buildRawJsonSchema(): Record<string, unknown> {
 			},
 			timeout: {
 				description:
-					"Optional execution timeout in milliseconds. Background runs default to 5 hours when omitted; use 0 for no wall-clock limit or provide any positive safe integer. This controls the Agent run, not Await waiting.",
+					"Optional execution timeout in milliseconds. Background runs default to 5 hours when omitted; use 0 for no wall-clock limit or provide any positive safe integer. This controls the Agent run, not Watch waiting.",
 				type: "number",
 			},
 			model: {
@@ -221,7 +231,7 @@ function buildRawJsonSchema(): Record<string, unknown> {
 				description:
 					'A short human-readable alias for this background task (e.g. "run-tests", "build-frontend"). ' +
 					"Must be unique within the current session. If omitted, an alias is auto-generated from the description. " +
-					"Use this alias with Await or Send to reference the task later.",
+					"Use this alias with Watch or Send to reference the task later.",
 				type: "string",
 			},
 
@@ -246,6 +256,15 @@ function buildRawJsonSchema(): Record<string, unknown> {
 				description: TASK_DESCRIPTION,
 				type: "string",
 			},
+			isolation: {
+				description: ISOLATION_DESCRIPTION,
+				type: "string",
+				enum: ["worktree"],
+			},
+			title: {
+				description: TITLE_DESCRIPTION,
+				type: "string",
+			},
 		},
 		required: [] as string[],
 		additionalProperties: false,
@@ -255,7 +274,7 @@ function buildRawJsonSchema(): Record<string, unknown> {
 /**
  * Resolve an Agent archive/unarchive selector to a narrator id.
  *
- * Resolve a scoped task alias, then fall through to the shared Send/Await selector
+ * Resolve a scoped task alias, then fall through to the shared Send/Watch selector
  * grammar so a title or slug printed by TeamStatus can be archived directly.
  */
 async function resolveArchiveTargetId(callerNarratorId: string, selector: string): Promise<string> {
@@ -298,6 +317,8 @@ export const agentTool: ToolDefinition = {
 			archive?: string;
 			unarchive?: string;
 			task?: string;
+			isolation?: "worktree";
+			title?: string;
 			// Legacy parameter name (pre-rename compat)
 			background?: boolean;
 		};
@@ -348,7 +369,11 @@ export const agentTool: ToolDefinition = {
 				}
 				const label = agentLabelFromNarrator(narrator, ctx.narratorId);
 				const { interruptAndArchiveSubagent } = await import("@server/services/subagent-lifecycle");
-				const archived = await interruptAndArchiveSubagent(narrator.id);
+				// Agent control: a team coordinator's archive event names this agent.
+				const { runAsTeamStatusActor } = await import("@server/services/teams/team-records");
+				const archived = await runAsTeamStatusActor({ kind: "agent", id: ctx.narratorId }, () =>
+					interruptAndArchiveSubagent(narrator.id),
+				);
 				if (!archived.ok) {
 					return {
 						output: `Agent archive error: failed to archive "${raw.archive}" (${archived.error ?? "unknown"}).`,
@@ -409,7 +434,10 @@ export const agentTool: ToolDefinition = {
 						output: `Agent ${label} (${narrator.id}) is not archived (current status: ${narrator.status}).`,
 					};
 				}
-				await narratorService.updateStatus(narrator.id, "idle");
+				const { runAsTeamStatusActor } = await import("@server/services/teams/team-records");
+				await runAsTeamStatusActor({ kind: "agent", id: ctx.narratorId }, () =>
+					narratorService.updateStatus(narrator.id, "idle"),
+				);
 				return {
 					output:
 						`Agent ${label} (${narrator.id}) has been unarchived. ` +
@@ -435,7 +463,7 @@ export const agentTool: ToolDefinition = {
 		const run_in_background = ctx.bot ? true : (raw.run_in_background ?? raw.background);
 
 		// Resolve effective cwd: use workdir if provided, otherwise parent's cwd
-		const resolvedWorkdir = workdir ? resolvePath(ctx.cwd, workdir) : ctx.cwd;
+		let resolvedWorkdir = workdir ? resolvePath(ctx.cwd, workdir) : ctx.cwd;
 
 		const toolUseId = ctx.currentToolUseId;
 		if (!toolUseId) {
@@ -494,6 +522,73 @@ export const agentTool: ToolDefinition = {
 			};
 		}
 
+		// A team coordinator's work item (P3): `isolation: "worktree"` makes one; a workdir that is
+		// an item's own worktree delegates into it. Either way the subagent becomes its worker.
+		let workItem: { teamId: string; id: string; branch: string | null; created: boolean } | null =
+			null;
+		if (raw.isolation !== undefined || workdir) {
+			const { coordinatedTeamId } = await import("@server/services/teams/team-membership");
+			const teamId = coordinatedTeamId(ctx.narratorId);
+			if (raw.isolation !== undefined) {
+				if (raw.isolation !== "worktree")
+					return { output: 'Agent error: isolation only accepts "worktree".', isError: true };
+				if (workdir)
+					return {
+						output: 'Agent error: isolation "worktree" creates its own directory; omit workdir.',
+						isError: true,
+					};
+				if (!teamId)
+					return {
+						output:
+							'Agent error: isolation "worktree" is for team coordinators; use CreateWorktree and workdir instead.',
+						isError: true,
+					};
+				const title = (raw.title || description || "").trim();
+				if (!title)
+					return {
+						output: 'Agent error: isolation "worktree" needs a title (or description).',
+						isError: true,
+					};
+				try {
+					const items = await import("@server/services/teams/work-items");
+					const { narratorWorktreePrincipalForTool } = await import(
+						"@server/services/narrator-worktree-runtime"
+					);
+					const { TEAM_ISOLATED_WORK_KIND } = await import("@shared/project-teams");
+					const item = await items.createWorkItem({
+						coordinatorId: ctx.narratorId,
+						title,
+						kind: TEAM_ISOLATED_WORK_KIND,
+						actor: { kind: "agent", id: ctx.narratorId },
+						principal: await narratorWorktreePrincipalForTool(ctx),
+						signal: ctx.signal,
+					});
+					const path = items.worktreePathOf(item);
+					if (!path) throw new Error("the work item's worktree is not recorded");
+					resolvedWorkdir = path;
+					description ||= title;
+					workItem = { teamId, id: item.id, branch: item.branchName, created: true };
+				} catch (err) {
+					return {
+						output: `Agent error: the work item could not be created: ${err instanceof Error ? err.message : String(err)}`,
+						isError: true,
+					};
+				}
+			} else if (teamId) {
+				const { workItemAtWorktree } = await import("@server/services/teams/work-items");
+				const item = workItemAtWorktree(teamId, resolvedWorkdir);
+				if (item && !item.workerNarratorId)
+					workItem = { teamId, id: item.id, branch: item.branchName, created: false };
+			}
+		}
+		// Imported before the run so the creation hook below stays synchronous.
+		const workItemsModule = workItem ? await import("@server/services/teams/work-items") : null;
+		/** The subagent the call created for the work item, once it exists. */
+		let workItemWorker: string | null = null;
+		const workItemNote = workItem
+			? `\n\nTeam work item ${workItem.id}${workItem.branch ? ` (branch ${workItem.branch})` : ""} in ${resolvedWorkdir}; this agent is its worker.`
+			: "";
+
 		// What the call carries for its card (outline P2 PR 9b): the task, and the head of the note
 		// its result was delivered with, as data no projection of the text can cut.
 		let delivered: import("@shared/outline-report-note").OutlineReportNote | null = null;
@@ -502,7 +597,7 @@ export const agentTool: ToolDefinition = {
 				parentNarratorId: ctx.narratorId,
 				toolUseId,
 				toolCallBinding,
-				subagentType: subagent_type || "general",
+				subagentType: subagent_type || (workItem?.created ? "worker" : "general"),
 				prompt,
 				title: description || undefined,
 				cwd: resolvedWorkdir,
@@ -518,6 +613,18 @@ export const agentTool: ToolDefinition = {
 				// The subagent acts on behalf of whoever triggered this parent turn:
 				// knowledge ACL and fast-mode "inherit" both resolve against them.
 				userId: ctx.userId ?? null,
+				...(workItem && workItemsModule
+					? {
+							onCreated: (subagentId: string) => {
+								if (!workItem) return;
+								workItemWorker = subagentId;
+								workItemsModule.attachWorker(workItem.teamId, workItem.id, subagentId, {
+									kind: "agent",
+									id: ctx.narratorId,
+								});
+							},
+						}
+					: {}),
 				...(delegation
 					? {
 							delegation,
@@ -531,7 +638,7 @@ export const agentTool: ToolDefinition = {
 			// The runner already writes the alias into the `<subagent_id>` /
 			// `<background_task_id>` tag and registers it, so no string surgery is
 			// needed here. Conflicts are reported by the runner too.
-			if (!delegation) return { output: result };
+			if (!delegation) return { output: result + workItemNote };
 			const { OUTLINE_DELEGATION_METADATA_KEY, outlineDelegationMetadata } = await import(
 				"@shared/outline-report-note"
 			);
@@ -542,6 +649,16 @@ export const agentTool: ToolDefinition = {
 				},
 			};
 		} catch (err) {
+			if (isCheckpointStop(err)) throw err;
+			// The work item of a call whose agent never ran is settled (see `settleFailedStart`):
+			// an untouched isolated worktree is removed, an attached item goes back to the queue.
+			if (workItem && workItemsModule)
+				await workItemsModule
+					.settleFailedStart(workItem.teamId, workItem.id, workItemWorker, {
+						kind: "agent",
+						id: ctx.narratorId,
+					})
+					.catch(() => "kept");
 			// A delegation refused once the agent existed (the task changed hands) says so itself.
 			if (delegation && err instanceof Error && err.name === "OutlineDelegationError")
 				return { output: err.message, isError: true };

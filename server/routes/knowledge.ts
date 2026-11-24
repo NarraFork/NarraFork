@@ -222,7 +222,9 @@ knowledgeRoutes.post("/entries", async (c) => {
 // Returns the entry plus `viewerCaps` — the caller's capability bits, each computed by the same
 // predicate its write endpoint enforces — so the UI shows actions without re-deriving the ACL.
 knowledgeRoutes.get("/entries/:id", async (c) => {
-	return c.json(await knowledgeService.getEntryForViewer(c.req.param("id"), principalOf(c)));
+	return c.json(
+		await knowledgeService.getEntryForViewer(c.req.param("id"), principalOf(c), c.req.raw.signal),
+	);
 });
 
 knowledgeRoutes.patch("/entries/:id", async (c) => {

@@ -34,6 +34,8 @@ const blockedPlan = (): WorktreeRemovalPlan => ({
 		state: "ready",
 		dirty: false,
 		dirtyFileCount: 0,
+		dirtyExact: true,
+		unreachableCommits: 0,
 	},
 	dependents: [
 		{ id: "other", title: "Other task", status: "idle", kind: "primary", running: false },
@@ -254,6 +256,7 @@ test("archiving the blocker re-reads the plan, then a confirmation unlocks the r
 		workspaceKey: "workspace",
 		path: "/repo/.worktrees/feature",
 		force: true,
+		confirmedLoss: { head: null, dirtyFileCount: 0, unreachableCommits: 0 },
 	});
 	expect(removedResults).toHaveLength(1);
 	expect(removedResults[0]?.outcome).toBe("removed");
@@ -263,4 +266,39 @@ test("a closed dialog loads nothing", async () => {
 	await render(false);
 	expect(plans).not.toHaveBeenCalled();
 	expect(container.querySelector("[data-modal]")).toBeNull();
+});
+
+test("a present checkout says ignored files go with it, and shows loss a branch does not keep", async () => {
+	plans.mockImplementation(async () => {
+		const plan = readyPlan();
+		plan.worktree = {
+			...plan.worktree,
+			mode: "remove",
+			present: true,
+			dirty: true,
+			dirtyFileCount: 3,
+			dirtyExact: false,
+			unreachableCommits: 2,
+		};
+		return plan;
+	});
+	await render();
+	const text = container.textContent ?? "";
+	expect(text).toContain("worktree.removeIgnoredNote");
+	expect(text).toContain("worktree.removeDirtyAtLeast");
+	expect(text).toContain("worktree.removeUnreachable");
+});
+
+test("rows mode never offers a force confirmation, whatever an older server sends", async () => {
+	plans.mockImplementation(async () => {
+		const plan = readyPlan();
+		plan.worktree = { ...plan.worktree, mode: "rows", present: true };
+		plan.confirmations = ["force"];
+		return plan;
+	});
+	await render();
+	expect(container.querySelector("input[type=checkbox]")).toBeNull();
+	const confirm = buttons().find((node) => node.textContent === "worktree.removeConfirm");
+	expect(confirm?.disabled).toBe(false);
+	expect(container.textContent ?? "").not.toContain("worktree.removeIgnoredNote");
 });

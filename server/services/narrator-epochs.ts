@@ -35,6 +35,7 @@ import { getBuiltinToolNames, getBuiltinToolRoutines } from "../lib/builtin-rout
 import { sqliteErrorCode } from "../lib/db-resilience";
 import type { Locale } from "../lib/i18n";
 import { logger } from "../lib/logger";
+import type { ModelHistoryPreparation } from "../lib/model-history-preparation";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { baselineContextDisplays, refineContextDisplay } from "./context-display-refiners";
 import { blockReadsEnabled, storedElementsSql } from "./narrator-block-scans";
@@ -241,6 +242,7 @@ export interface ReconcileEpochInput {
 	};
 	refreshTools?: () => Promise<PrefixToolInput>;
 	signal?: AbortSignal;
+	preparation?: ModelHistoryPreparation;
 	noticeText: (kind: "tool_loaded" | "tool_unloaded", toolName: string) => string;
 	/** Compatibility for callers/tests; cache age never opens an epoch. */
 	now?: number;
@@ -322,9 +324,10 @@ async function reconcilePrefix(input: ReconcileEpochInput): Promise<ReconciledEp
 		? await (await import("./narrator-service")).narratorService.getModelHistorySinceLastCompact(
 				narratorId,
 				undefined,
-				{ signal },
+				{ signal, preparation: input.preparation },
 			)
 		: undefined;
+	input.preparation?.recordPhase("epoch");
 	const messages = sourceMessages ?? input.messages;
 	const compactMessageId = await currentCompactMessageId(narratorId);
 	if (

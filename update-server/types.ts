@@ -41,7 +41,7 @@ export interface MirrorRelayConfig {
 	pollIntervalSeconds?: number;
 	/** Overall relay job (1–300 minutes); default main 25, auxiliary 120. */
 	totalTimeoutMinutes?: number;
-	/** Single streamed DAV object (1–60 minutes), default 15. */
+	/** Single streamed DAV object (1–100 minutes), default 15. */
 	transferTimeoutMinutes?: number;
 	/** Optional HTTPS download CDN hosts. Never applies to writes or discovery. */
 	downloadRedirectHosts?: string[];

@@ -59,6 +59,14 @@ import type {
 	StorageScanResult,
 } from "./types";
 
+/** OAuth state of a remote MCP server; `required` means it refused us until an admin authorizes. */
+export interface McpServerAuthStatus {
+	supported: boolean;
+	authorized: boolean;
+	hasClientSecret: boolean;
+	required?: boolean;
+}
+
 /**
  * One workspace with its membership and arrangement.
  *
@@ -460,6 +468,8 @@ export const miscApi = {
 				url?: string;
 				envKeys: string[];
 				headerKeys: string[];
+				oauth?: { clientId?: string; scope?: string };
+				auth?: McpServerAuthStatus;
 				mode?: McpLoadingMode;
 				enabled: boolean;
 				defaultBehavior?: string;
@@ -483,6 +493,17 @@ export const miscApi = {
 			method: "PATCH",
 			body: JSON.stringify(data),
 		}),
+	// Returns the URL to open, or `authorized` when stored credentials were refreshed.
+	mcpStartOAuth: (id: string) =>
+		request<{ authorizationUrl: string } | { authorized: true }>(`/mcp/servers/${id}/oauth/start`, {
+			method: "POST",
+			// Built from the mount prefix the app runs under, so the provider returns behind the proxy.
+			body: JSON.stringify({
+				redirectUrl: new URL(`${apiBase()}/mcp/oauth/callback`, window.location.href).href,
+			}),
+		}),
+	mcpSignOutOAuth: (id: string) =>
+		request<{ ok: boolean }>(`/mcp/servers/${id}/oauth`, { method: "DELETE" }),
 	mcpDeleteServer: (id: string) =>
 		request<{ ok: boolean }>(`/mcp/servers/${id}`, { method: "DELETE" }),
 	mcpConnectServer: (id: string) =>
@@ -1176,6 +1197,43 @@ export const miscApi = {
 		request<{ path: string }>("/fs/mkdir", {
 			method: "POST",
 			body: JSON.stringify({ parent, name }),
+		}),
+	/**
+	 * Rename one file-tree entry in place.
+	 *
+	 * `name` is a NAME, not a path: the server derives the parent directory from `path`, so
+	 * a rename can never become a move. 409 `ALREADY_EXISTS` and 403 `WRITE_REFUSED` (the
+	 * path is outside the narrator's writable roots) are the two refusals worth showing as
+	 * they are.
+	 */
+	fsRename: (input: { narratorId: string; path: string; name: string }) =>
+		request<{ ok: true; path: string }>("/fs/rename", {
+			method: "POST",
+			body: JSON.stringify(input),
+		}),
+	/**
+	 * Copy or move one file into a directory — the file tree's paste.
+	 *
+	 * The destination name is always the source's own; a paste never renames. A taken name
+	 * answers 409 `ALREADY_EXISTS`; repeat the request with `overwrite` once the user has
+	 * confirmed which file is being replaced.
+	 */
+	fsTransferFile: (input: {
+		narratorId: string;
+		path: string;
+		targetDir: string;
+		mode: "copy" | "move";
+		overwrite?: boolean;
+	}) =>
+		request<{ ok: true; path: string }>("/fs/transfer", {
+			method: "POST",
+			body: JSON.stringify(input),
+		}),
+	/** Delete one file entry. The server refuses directories and symlinks. */
+	fsDeleteFile: (input: { narratorId: string; path: string }) =>
+		request<{ ok: true }>("/fs/delete", {
+			method: "POST",
+			body: JSON.stringify(input),
 		}),
 	/**
 	 * Open a directory, or select a file, in the server host's file manager.

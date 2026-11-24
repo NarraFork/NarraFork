@@ -10,7 +10,47 @@
  * releases the instance lock (so an update-handoff replacement can start), it just skips the
  * clean marker.
  */
+import { hotSafe } from "./hot-safe";
+
 export type ShutdownStepOutcome = "ok" | "timeout" | "failed";
+
+const admission = hotSafe("narrafork.unattendedShutdownAdmission", () => ({ fenced: false }));
+
+export function isUnattendedShutdownFenced(): boolean {
+	return admission.fenced;
+}
+
+export async function fenceUnattendedShutdown(
+	hasInFlightWork: () => boolean,
+	revalidateIdle: () => Promise<boolean>,
+	timeoutMs = 2_000,
+): Promise<boolean> {
+	if (admission.fenced) return false;
+	admission.fenced = true;
+	let committed = false;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		if (hasInFlightWork()) return false;
+		const idle = await Promise.race([
+			revalidateIdle(),
+			new Promise<false>((resolve) => {
+				timer = setTimeout(() => resolve(false), timeoutMs);
+			}),
+		]);
+		committed = idle && !hasInFlightWork();
+		return committed;
+	} finally {
+		clearTimeout(timer);
+		if (!committed) admission.fenced = false;
+	}
+}
+
+export function canRunCleanShutdownHooks(
+	requestedReason: string,
+	result: { reason: string; clean: boolean },
+): boolean {
+	return result.clean && requestedReason === result.reason;
+}
 
 /** Only checkpoint-backed exits may leave recoverable processes/browser sessions alive. */
 export function preservesRecoveryOnShutdown(reason: string): boolean {

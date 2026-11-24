@@ -230,6 +230,13 @@ export const narrators = pgTable(
 		title: text("title"),
 		inheritMode: text("inherit_mode").notNull().default("fresh"),
 		parentNarratorId: text("parent_narrator_id").references((): PgColumn => narrators.id, {}),
+		askInPassingGroupId: text("ask_in_passing_group_id").references((): PgColumn => narrators.id, {
+			onDelete: "set null",
+		}),
+		archivedWithNarratorId: text("archived_with_narrator_id").references(
+			(): PgColumn => narrators.id,
+			{ onDelete: "set null" },
+		),
 		originToolCallId: text("origin_tool_call_id"),
 		subagentOriginKind: text("subagent_origin_kind"),
 		contextSummary: text("context_summary"),
@@ -327,6 +334,8 @@ export const narrators = pgTable(
 			table.id,
 		),
 		index("idx_narrators_parent").on(table.parentNarratorId),
+		index("idx_narrators_ask_in_passing_group").on(table.askInPassingGroupId),
+		index("idx_narrators_archived_with").on(table.archivedWithNarratorId),
 		index("idx_narrators_origin_tool_call").on(table.originToolCallId),
 		index("idx_narrators_status").on(table.status),
 		index("idx_narrators_owner").on(table.ownerUserId),
@@ -2550,6 +2559,9 @@ export const backgroundTasks = pgTable(
 	},
 	(table) => [
 		index("idx_bg_tasks_parent").on(table.parentNarratorId, table.status),
+		index("idx_bg_tasks_active")
+			.on(table.status)
+			.where(sql.raw("\"status\" IN ('running','paused')")),
 		index("idx_bg_tasks_subagent").on(table.subagentNarratorId),
 		uniqueIndex("idx_bg_tasks_tool_attempt").on(table.toolCallId, table.executionAttempt),
 		index("idx_bg_tasks_transfer").on(table.transferTaskId),
@@ -4464,10 +4476,130 @@ export const notifications = pgTable(
 		),
 	],
 );
+
+export const projectTeams = pgTable(
+	"project_teams",
+	{
+		narratorId: text("narrator_id")
+			.primaryKey()
+			.notNull()
+			.references((): PgColumn => narrators.id, { onDelete: "restrict" }),
+		projectId: text("project_id")
+			.notNull()
+			.references((): PgColumn => projects.id, { onDelete: "restrict" }),
+		baseBranch: text("base_branch").notNull(),
+		brief: text("brief").notNull().default(""),
+		settingsJson: jsonText("settings_json").notNull().default(sql.raw("'{}'::text")),
+		status: text("status").notNull().default("active"),
+		createdBy: text("created_by").references((): PgColumn => users.id, { onDelete: "set null" }),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		index("idx_project_teams_project_status").on(table.projectId, table.status, table.narratorId),
+		index("idx_project_teams_created_by").on(table.createdBy),
+		check("ck_project_teams_status", sql.raw("\"status\" in ('active', 'archived')")),
+		check("ck_project_teams_brief_bytes", sql.raw('octet_length("brief") <= 4096')),
+		check("ck_project_teams_settings_bytes", sql.raw('octet_length("settings_json") <= 16384')),
+	],
+);
+
+export const teamWorkItems = pgTable(
+	"team_work_items",
+	{
+		id: text("id").primaryKey().notNull(),
+		teamId: text("team_id")
+			.notNull()
+			.references((): PgColumn => projectTeams.narratorId, { onDelete: "cascade" }),
+		projectId: text("project_id")
+			.notNull()
+			.references((): PgColumn => projects.id, { onDelete: "restrict" }),
+		title: text("title").notNull(),
+		kind: text("kind").notNull().default("change"),
+		state: text("state").notNull().default("queued"),
+		branchName: text("branch_name"),
+		baseRef: text("base_ref"),
+		worktreeResourceId: text("worktree_resource_id"),
+		headSha: text("head_sha"),
+		workerNarratorId: text("worker_narrator_id").references((): PgColumn => narrators.id, {
+			onDelete: "set null",
+		}),
+		reviewRounds: integer("review_rounds").notNull().default(0),
+		lastReview: text("last_review"),
+		changedPathsJson: jsonText("changed_paths_json"),
+		changedPathsAtSha: text("changed_paths_at_sha"),
+		exclusiveKey: text("exclusive_key"),
+		outlineSpaceId: text("outline_space_id"),
+		outlineBlockId: text("outline_block_id"),
+		createdBy: text("created_by").references((): PgColumn => users.id, { onDelete: "set null" }),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		index("idx_team_work_items_team_state").on(table.teamId, table.state, table.id),
+		index("idx_team_work_items_project_state").on(table.projectId, table.state, table.id),
+		uniqueIndex("uq_team_work_items_exclusive")
+			.on(table.projectId, table.exclusiveKey)
+			.where(sql.raw('"exclusive_key" IS NOT NULL')),
+		index("idx_team_work_items_worktree").on(table.worktreeResourceId),
+		index("idx_team_work_items_worker").on(table.workerNarratorId),
+		index("idx_team_work_items_created_by").on(table.createdBy),
+		check(
+			"ck_team_work_items_state",
+			sql.raw(
+				"\"state\" in ('queued', 'in_progress', 'in_review', 'ready', 'merged', 'cancelled')",
+			),
+		),
+		check(
+			"ck_team_work_items_last_review",
+			sql.raw("\"last_review\" is null or \"last_review\" in ('blocker', 'clear')"),
+		),
+		check("ck_team_work_items_review_rounds", sql.raw('"review_rounds" >= 0')),
+		check(
+			"ck_team_work_items_changed_paths_bytes",
+			sql.raw('"changed_paths_json" is null or octet_length("changed_paths_json") <= 131072'),
+		),
+		foreignKey({
+			name: "team_work_items_worktree_resource_id_narrator_wor_27df0f6fdd_fk",
+			columns: [table.worktreeResourceId],
+			foreignColumns: [narratorWorktreeResources.id],
+		}).onDelete("set null"),
+	],
+);
+
+export const teamWorkEvents = pgTable(
+	"team_work_events",
+	{
+		id: text("id").primaryKey().notNull(),
+		workItemId: text("work_item_id").references((): PgColumn => teamWorkItems.id, {
+			onDelete: "cascade",
+		}),
+		teamId: text("team_id")
+			.notNull()
+			.references((): PgColumn => projectTeams.narratorId, { onDelete: "cascade" }),
+		kind: text("kind").notNull(),
+		actorKind: text("actor_kind").notNull(),
+		actorId: text("actor_id"),
+		detailJson: jsonText("detail_json"),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		index("idx_team_work_events_team_created").on(table.teamId, table.createdAt, table.id),
+		index("idx_team_work_events_item_created").on(table.workItemId, table.createdAt, table.id),
+		check(
+			"ck_team_work_events_actor_kind",
+			sql.raw("\"actor_kind\" in ('person', 'agent', 'system')"),
+		),
+		check(
+			"ck_team_work_events_detail_bytes",
+			sql.raw('"detail_json" is null or octet_length("detail_json") <= 8192'),
+		),
+	],
+);
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 144,
-  "columnCount": 1920,
+  "tableCount": 147,
+  "columnCount": 1960,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -5601,6 +5733,38 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "emitAsTableConstraint": false
         },
         {
+          "property": "askInPassingGroupId",
+          "name": "ask_in_passing_group_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narrators",
+            "column": "id",
+            "onDelete": "set null",
+            "constraintName": "narrators_ask_in_passing_group_id_narrators_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "archivedWithNarratorId",
+          "name": "archived_with_narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narrators",
+            "column": "id",
+            "onDelete": "set null",
+            "constraintName": "narrators_archived_with_narrator_id_narrators_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
           "property": "originToolCallId",
           "name": "origin_tool_call_id",
           "kind": "text",
@@ -6384,6 +6548,20 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "idx_narrators_parent",
           "columns": [
             "parentNarratorId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_narrators_ask_in_passing_group",
+          "columns": [
+            "askInPassingGroupId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_narrators_archived_with",
+          "columns": [
+            "archivedWithNarratorId"
           ],
           "unique": false
         },
@@ -19276,6 +19454,14 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "name": "idx_bg_tasks_active",
+          "columns": [
+            "status"
+          ],
+          "unique": false,
+          "predicate": "\"status\" IN ('running','paused')"
+        },
+        {
           "name": "idx_bg_tasks_subagent",
           "columns": [
             "subagentNarratorId"
@@ -30247,6 +30433,605 @@ export const POSTGRES_SCHEMA_COVERAGE = {
       ],
       "checks": [],
       "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "projectTeams",
+      "name": "project_teams",
+      "columns": [
+        {
+          "property": "narratorId",
+          "name": "narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false,
+          "references": {
+            "table": "narrators",
+            "column": "id",
+            "onDelete": "restrict",
+            "constraintName": "project_teams_narrator_id_narrators_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "projectId",
+          "name": "project_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "projects",
+            "column": "id",
+            "onDelete": "restrict",
+            "constraintName": "project_teams_project_id_projects_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "baseBranch",
+          "name": "base_branch",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "brief",
+          "name": "brief",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"\"",
+          "defaultExpression": "\"\""
+        },
+        {
+          "property": "settingsJson",
+          "name": "settings_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "{}",
+          "defaultExpression": "sql.raw(\"'{}'::text\")"
+        },
+        {
+          "property": "status",
+          "name": "status",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"active\"",
+          "defaultExpression": "\"active\""
+        },
+        {
+          "property": "createdBy",
+          "name": "created_by",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "users",
+            "column": "id",
+            "onDelete": "set null",
+            "constraintName": "project_teams_created_by_users_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "updatedAt",
+          "name": "updated_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_project_teams_project_status",
+          "columns": [
+            "projectId",
+            "status",
+            "narratorId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_project_teams_created_by",
+          "columns": [
+            "createdBy"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [
+        "ck_project_teams_status",
+        "ck_project_teams_brief_bytes",
+        "ck_project_teams_settings_bytes"
+      ],
+      "checkDefinitions": [
+        {
+          "name": "ck_project_teams_status",
+          "expression": "\"status\" in ('active', 'archived')"
+        },
+        {
+          "name": "ck_project_teams_brief_bytes",
+          "expression": "octet_length(\"brief\") <= 4096"
+        },
+        {
+          "name": "ck_project_teams_settings_bytes",
+          "expression": "octet_length(\"settings_json\") <= 16384"
+        }
+      ],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "teamWorkItems",
+      "name": "team_work_items",
+      "columns": [
+        {
+          "property": "id",
+          "name": "id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "teamId",
+          "name": "team_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "projectTeams",
+            "column": "narratorId",
+            "onDelete": "cascade",
+            "constraintName": "team_work_items_team_id_project_teams_narrator_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "projectId",
+          "name": "project_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "projects",
+            "column": "id",
+            "onDelete": "restrict",
+            "constraintName": "team_work_items_project_id_projects_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "title",
+          "name": "title",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "kind",
+          "name": "kind",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"change\"",
+          "defaultExpression": "\"change\""
+        },
+        {
+          "property": "state",
+          "name": "state",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"queued\"",
+          "defaultExpression": "\"queued\""
+        },
+        {
+          "property": "branchName",
+          "name": "branch_name",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "baseRef",
+          "name": "base_ref",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "worktreeResourceId",
+          "name": "worktree_resource_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narratorWorktreeResources",
+            "column": "id",
+            "onDelete": "set null",
+            "constraintName": "team_work_items_worktree_resource_id_narrator_wor_27df0f6fdd_fk"
+          },
+          "emitAsTableConstraint": true
+        },
+        {
+          "property": "headSha",
+          "name": "head_sha",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "workerNarratorId",
+          "name": "worker_narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narrators",
+            "column": "id",
+            "onDelete": "set null",
+            "constraintName": "team_work_items_worker_narrator_id_narrators_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "reviewRounds",
+          "name": "review_rounds",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "lastReview",
+          "name": "last_review",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "changedPathsJson",
+          "name": "changed_paths_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "changedPathsAtSha",
+          "name": "changed_paths_at_sha",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "exclusiveKey",
+          "name": "exclusive_key",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "outlineSpaceId",
+          "name": "outline_space_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "outlineBlockId",
+          "name": "outline_block_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdBy",
+          "name": "created_by",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "users",
+            "column": "id",
+            "onDelete": "set null",
+            "constraintName": "team_work_items_created_by_users_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "updatedAt",
+          "name": "updated_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_team_work_items_team_state",
+          "columns": [
+            "teamId",
+            "state",
+            "id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_team_work_items_project_state",
+          "columns": [
+            "projectId",
+            "state",
+            "id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "uq_team_work_items_exclusive",
+          "columns": [
+            "projectId",
+            "exclusiveKey"
+          ],
+          "unique": true,
+          "predicate": "\"exclusive_key\" IS NOT NULL"
+        },
+        {
+          "name": "idx_team_work_items_worktree",
+          "columns": [
+            "worktreeResourceId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_team_work_items_worker",
+          "columns": [
+            "workerNarratorId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_team_work_items_created_by",
+          "columns": [
+            "createdBy"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [
+        "ck_team_work_items_state",
+        "ck_team_work_items_last_review",
+        "ck_team_work_items_review_rounds",
+        "ck_team_work_items_changed_paths_bytes"
+      ],
+      "checkDefinitions": [
+        {
+          "name": "ck_team_work_items_state",
+          "expression": "\"state\" in ('queued', 'in_progress', 'in_review', 'ready', 'merged', 'cancelled')"
+        },
+        {
+          "name": "ck_team_work_items_last_review",
+          "expression": "\"last_review\" is null or \"last_review\" in ('blocker', 'clear')"
+        },
+        {
+          "name": "ck_team_work_items_review_rounds",
+          "expression": "\"review_rounds\" >= 0"
+        },
+        {
+          "name": "ck_team_work_items_changed_paths_bytes",
+          "expression": "\"changed_paths_json\" is null or octet_length(\"changed_paths_json\") <= 131072"
+        }
+      ],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "teamWorkEvents",
+      "name": "team_work_events",
+      "columns": [
+        {
+          "property": "id",
+          "name": "id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "workItemId",
+          "name": "work_item_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "teamWorkItems",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "team_work_events_work_item_id_team_work_items_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "teamId",
+          "name": "team_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "projectTeams",
+            "column": "narratorId",
+            "onDelete": "cascade",
+            "constraintName": "team_work_events_team_id_project_teams_narrator_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "kind",
+          "name": "kind",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "actorKind",
+          "name": "actor_kind",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "actorId",
+          "name": "actor_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "detailJson",
+          "name": "detail_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_team_work_events_team_created",
+          "columns": [
+            "teamId",
+            "createdAt",
+            "id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_team_work_events_item_created",
+          "columns": [
+            "workItemId",
+            "createdAt",
+            "id"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [
+        "ck_team_work_events_actor_kind",
+        "ck_team_work_events_detail_bytes"
+      ],
+      "checkDefinitions": [
+        {
+          "name": "ck_team_work_events_actor_kind",
+          "expression": "\"actor_kind\" in ('person', 'agent', 'system')"
+        },
+        {
+          "name": "ck_team_work_events_detail_bytes",
+          "expression": "\"detail_json\" is null or octet_length(\"detail_json\") <= 8192"
+        }
+      ],
       "foreignKeys": [],
       "uniqueConstraints": [],
       "primaryKeys": []

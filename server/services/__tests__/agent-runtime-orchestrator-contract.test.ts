@@ -17,12 +17,16 @@ import {
 	users,
 } from "../../db/schema";
 import type { ProviderAdapter } from "../../lib/agent/provider";
+import { logger } from "../../lib/logger";
 import { saveUploadedMedia } from "../../lib/media-uploads";
+import { ModelHistoryPreparation } from "../../lib/model-history-preparation";
 import { setUploadsDirForTests } from "../../lib/uploads";
 import { createAgentMessageDelivery } from "../agent-message-delivery";
+import * as historyRevision from "../agent-runtime/model-history-revision";
 import { readSqliteModelHistorySignature } from "../agent-runtime/model-history-revision";
 import { MODEL_HISTORY_REVISION_CONTRACT } from "../agent-runtime/model-history-revision-sql";
 import type { ExecuteLoopOptions, ExecuteLoopResult } from "../narrator-executor";
+import { narratorService } from "../narrator-service";
 import type { ActiveNarrator } from "../narrator-session-state";
 
 /**
@@ -248,6 +252,96 @@ function fixture(
 }
 
 describe("context overflow recovery cancellation", () => {
+	test("a stop during pre-prompt Bash runs interruption handling before history preparation", async () => {
+		const f = fixture({ kind: "primary" }, [finished]);
+		const phases = spyOn(ModelHistoryPreparation.prototype, "recordPhase");
+		const service = await import("../narrator-service");
+		const bash = spyOn(service, "handleBashCommand").mockImplementation(async () => {
+			expect(phases).not.toHaveBeenCalled();
+			f.session.abortController.abort(new Error("stop pre-prompt Bash"));
+			return { type: "bash", id: "stopped-bash", output: "stopped", isError: false };
+		});
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		const result = await f.run("", undefined, "printf stopped");
+		expect(bash).toHaveBeenCalledTimes(1);
+		expect(f.calls).toHaveLength(0);
+		expect(phases).not.toHaveBeenCalled();
+		expect(result.hasError).toBe(false);
+		expect(
+			warn.mock.calls.some(([message]) => message === "Model history preparation finished"),
+		).toBe(false);
+	});
+	test("initial preparation records source and projection counts beyond 30s without cancelling", async () => {
+		const f = fixture({ kind: "primary" }, [finished]);
+		let now = Date.now();
+		spyOn(Date, "now").mockImplementation(() => now);
+		const realSignature = historyRevision.readSqliteModelHistorySignature;
+		spyOn(historyRevision, "readSqliteModelHistorySignature").mockImplementation((...args) => {
+			const result = realSignature(...args);
+			now += 31_000;
+			return result;
+		});
+		const read = spyOn(narratorService, "getModelHistorySinceLastCompact");
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		await f.run();
+		const preparation = read.mock.calls.find(([, , opts]) => opts?.preparation)?.[2]?.preparation;
+		expect(preparation).toBeInstanceOf(ModelHistoryPreparation);
+		expect(preparation?.deadline).toBe(Infinity);
+		expect(preparation?.signal.aborted).toBe(false);
+		expect(f.calls).toHaveLength(1);
+		expect(warn).toHaveBeenCalledWith(
+			"Model history preparation finished",
+			expect.objectContaining({
+				preparationId: preparation?.preparationId,
+				kind: "initial",
+				outcome: "success",
+				counts: expect.objectContaining({
+					sourceBytes: expect.any(Number),
+					messages: expect.any(Number),
+					tools: expect.any(Number),
+				}),
+			}),
+		);
+	});
+	for (const cancelled of [false, true]) {
+		test(`initial preparation source ${cancelled ? "cancellation" : "failure"} is observed`, async () => {
+			const f = fixture({ kind: "primary" }, [finished]);
+			const error = new Error("history source failure");
+			const read = spyOn(narratorService, "getModelHistorySinceLastCompact");
+			spyOn(historyRevision, "readSqliteModelHistorySignature").mockImplementation(() => {
+				if (cancelled) f.session.abortController.abort(error);
+				throw error;
+			});
+			const warn = spyOn(logger, "warn").mockImplementation(() => {});
+			const logError = spyOn(logger, "error").mockImplementation(() => {});
+			await f.run();
+			const preparation = read.mock.calls.find(([, , opts]) => opts?.preparation)?.[2]?.preparation;
+			expect(preparation).toBeInstanceOf(ModelHistoryPreparation);
+			expect(preparation?.deadline).toBe(Infinity);
+			expect(f.calls).toHaveLength(0);
+			expect(warn).toHaveBeenCalledWith(
+				"Model history preparation finished",
+				expect.objectContaining({
+					preparationId: preparation?.preparationId,
+					kind: "initial",
+					outcome: cancelled ? "cancelled" : "failed",
+					phaseDurationsMs: expect.objectContaining({
+						tools: expect.any(Number),
+						signature: expect.any(Number),
+					}),
+				}),
+			);
+			if (!cancelled)
+				expect(logError).toHaveBeenCalledWith(
+					"Narrator loop error",
+					expect.objectContaining({
+						error: "Could not prepare tool and context state. See server logs for details.",
+						preparationId: preparation?.preparationId,
+						outcome: "failed",
+					}),
+				);
+		});
+	}
 	for (const profile of profiles) {
 		test(`${profile.kind}: abort during compact remains an interruption, not a compact failure`, async () => {
 			const service = await import("../narrator-service");
@@ -355,7 +449,43 @@ describe("Bash Git command detection for status refresh", () => {
 });
 
 describe("tool Git status refresh", () => {
-	test("invalidates at the write boundary and shares cached status in the trailing broadcast", async () => {
+	test("100 read completions do no Git work; unobserved writes only mark lazy facts dirty", async () => {
+		const statusCache = await import("../git-status-cache");
+		const ws = await import("../../websocket/narrator-ws");
+		const invalidate = spyOn(statusCache, "invalidateStatus");
+		const markDirty = spyOn(statusCache, "markStatusDirty");
+		const read = spyOn(statusCache, "getStatusSummaryCached");
+		spyOn(ws, "getNarratorConnections").mockReturnValue(new Set());
+		let verified = false;
+		const h = fixture(profiles[0], [
+			async (options) => {
+				h.session.cwd = "/git-track-read-fixture";
+				h.session._isInGitRepo = true;
+				const spawn = spyOn(Bun, "spawn");
+				for (let index = 0; index < 100; index++)
+					await options.hooks?.onGitTrack?.("Bash", `read-${index}`, {
+						command: "git status && git diff && git log -1",
+					});
+				expect(markDirty).not.toHaveBeenCalled();
+				expect(read).not.toHaveBeenCalled();
+				expect(spawn).not.toHaveBeenCalled();
+				for (let index = 0; index < 100; index++)
+					await options.hooks?.onGitTrack?.("Write", `write-${index}`, { file_path: "changed" });
+				expect(markDirty).toHaveBeenCalledTimes(100);
+				expect(invalidate).not.toHaveBeenCalled();
+				expect(read).not.toHaveBeenCalled();
+				expect(spawn).not.toHaveBeenCalled();
+				expect(h.session._gitTrackTimer).toBeUndefined();
+				spawn.mockRestore();
+				verified = true;
+				return { ...finished };
+			},
+		]);
+		await h.run();
+		expect(verified).toBe(true);
+	});
+
+	test("marks writes lazily and shares one delayed status read for the subscribed header", async () => {
 		const statusCache = await import("../git-status-cache");
 		const { gitService } = await import("../git-service");
 		const ws = await import("../../websocket/narrator-ws");
@@ -379,6 +509,12 @@ describe("tool Git status refresh", () => {
 			coordinateGitStatusQuery(getLocalGitStatusQueryKey(path), query, options),
 		);
 		const invalidate = spyOn(statusCache, "invalidateStatus");
+		const markDirty = spyOn(statusCache, "markStatusDirty");
+		spyOn(ws, "getNarratorConnections").mockReturnValue(
+			new Set([{ data: { subscribedNarrators: new Set(["contract-primary"]) } }]) as ReturnType<
+				typeof ws.getNarratorConnections
+			>,
+		);
 		const cachedRead = spyOn(statusCache, "getStatusSummaryCached");
 		const broadcast = spyOn(ws, "broadcastToNarrator").mockImplementation(() => {});
 		let verified = false;
@@ -396,13 +532,14 @@ describe("tool Git status refresh", () => {
 				}) as typeof setTimeout);
 				const clear = spyOn(globalThis, "clearTimeout").mockImplementation(() => {});
 				try {
-					options.hooks?.onGitTrack?.("Write", "write-1", { file_path: "changed.txt" });
-					expect(invalidate).toHaveBeenCalledTimes(1);
-					options.hooks?.onGitTrack?.("Edit", "write-2", { file_path: "changed.txt" });
-					expect(invalidate).toHaveBeenCalledTimes(2);
+					await options.hooks?.onGitTrack?.("Write", "write-1", { file_path: "changed.txt" });
+					expect(markDirty).toHaveBeenCalledTimes(1);
+					await options.hooks?.onGitTrack?.("Edit", "write-2", { file_path: "changed.txt" });
+					expect(markDirty).toHaveBeenCalledTimes(2);
+					expect(invalidate).not.toHaveBeenCalled();
 					expect(query).not.toHaveBeenCalled();
-					expect(clear).toHaveBeenCalledTimes(1);
-					expect(scheduled).toHaveLength(2);
+					expect(clear).not.toHaveBeenCalled();
+					expect(scheduled).toHaveLength(1);
 				} finally {
 					timer.mockRestore();
 					clear.mockRestore();
@@ -412,9 +549,9 @@ describe("tool Git status refresh", () => {
 				await statusCache.getStatusSummaryCached(repo);
 				expect(query).toHaveBeenCalledTimes(1);
 				cachedRead.mockClear();
-				scheduled[1]();
+				scheduled[0]();
 				await new Promise<void>((resolve) => setImmediate(resolve));
-				expect(invalidate).toHaveBeenCalledTimes(2);
+				expect(invalidate).not.toHaveBeenCalled();
 				expect(query).toHaveBeenCalledTimes(1);
 				expect(cachedRead).toHaveBeenCalledWith(repo);
 				expect(
@@ -635,12 +772,7 @@ describe("outline task leases", () => {
 		});
 
 		test("a system run that ends while something still works for the session in the background: not natural", async () => {
-			const { backgroundTaskService } = await import("../background-task-service");
-			const busy = spyOn(backgroundTaskService, "countActiveKindsByParent").mockResolvedValue({
-				activeCount: 1,
-				activeWorkCount: 1,
-				activeServiceCount: 0,
-			});
+			const busy = spyOn(backgroundOccupancyStore, "countActiveWakeWork").mockReturnValue(1);
 			try {
 				expect(await endOf([finished], { by: "system" })).toMatchObject({
 					natural: false,
@@ -1033,8 +1165,8 @@ describe("native media input transitions follow the unified run control", () => 
 			await resumeNextBufferedMessage(source, "en");
 			const id = await completed.promise;
 			await getRunControl(id)?.terminal;
-			expect(getBufferedMessages("contract-primary")).toHaveLength(0);
-			expect(getBufferedMessages(id)).toHaveLength(0);
+			expect(await getBufferedMessages("contract-primary")).toHaveLength(0);
+			expect(await getBufferedMessages(id)).toHaveLength(0);
 			activeNarrators.delete(id);
 			getExecutionOwner(id)?.release();
 			setUploadsDirForTests(null);
@@ -1664,7 +1796,7 @@ describe("real shared orchestrator profile contract", () => {
 					const before = db.select().from(narratorBufferedMessages).get();
 					expect(before).toMatchObject({ state: "materialized", adoptedAt: null });
 					expect(injection.onConsumed).toBeFunction();
-					injection.onConsumed?.();
+					await injection.onConsumed?.();
 					await new Promise<void>((resolve) => setImmediate(resolve));
 					expect(db.select().from(narratorBufferedMessages).get()?.adoptedAt).toBeString();
 					return finished;
@@ -1692,7 +1824,7 @@ describe("real shared orchestrator profile contract", () => {
 					});
 					if (!accepted.buffered) throw new Error("expected queued input");
 					order.push("queued");
-					if (scenario.softStop) expect(options.config.shouldYieldToInput?.()).toBe(true);
+					if (scenario.softStop) expect(await options.config.shouldYieldToInput?.()).toBe(true);
 					const injection = await options.config.getAfterToolsInjections?.();
 					const text = typeof injection === "string" ? injection : injection?.text;
 					expect(text ?? "").not.toContain(feedback);
@@ -1775,7 +1907,7 @@ describe("real shared orchestrator profile contract", () => {
 				);
 				const accepted = (await enqueueInboxAgent(delivery, text, { createdBy: "principal-a" }))
 					.delivery;
-				expect(options.config.shouldYieldToInput?.()).toBe(false);
+				expect(await options.config.shouldYieldToInput?.()).toBe(false);
 				const packet = await options.config.getAfterToolsInjections?.();
 				if (!packet || typeof packet === "string") throw new Error("Missing after-tools packet");
 				expect(packet.text).toContain(text);
@@ -1804,7 +1936,7 @@ describe("real shared orchestrator profile contract", () => {
 						event.message.id === message?.id,
 				);
 				expect(projected.map(([id]) => id)).toEqual(["contract-parent", "contract-child"]);
-				packet.onConsumed?.();
+				await packet.onConsumed?.();
 				await new Promise<void>((resolve) => setImmediate(resolve));
 				expect(
 					db

@@ -11,6 +11,7 @@ import { drizzle } from "drizzle-orm/bun-sqlite";
 import { sqlite as isolatedTemplate } from "../../db";
 import * as relations from "../../db/relations";
 import * as schema from "../../db/schema";
+import type { ExecutionBackend } from "../../lib/agent/execution/backend";
 import { localBackend } from "../../lib/agent/execution/local-backend";
 import type { GenUiInput } from "../../lib/agent/tools/gen-ui";
 import type { ToolContext } from "../../lib/agent/types";
@@ -258,7 +259,21 @@ describe("GenUI ordinary file history", () => {
 	test.each([
 		"messages",
 		"tool_calls",
-	] as const)("create can be selected by %s and reverted through the real journal", async (kind) => {
+	] as const)("retained journal selects GenUI by %s and reverts its recorded creation", async (kind) => {
+		// Test-only history injection exercises old recorded data, not local production admission.
+		const internal = runtime as unknown as {
+			executeBound(request: { backend: ExecutionBackend }): Promise<unknown>;
+		};
+		const executeBound = internal.executeBound.bind(runtime);
+		internal.executeBound = (request) =>
+			executeBound({
+				...request,
+				backend: new Proxy(request.backend, {
+					get(target, property) {
+						return property === "kind" ? "remote" : Reflect.get(target, property);
+					},
+				}),
+			});
 		const created = await call({ action: "create", prefix: "demo" });
 		const write = localBackend.writeFileBytes.bind(localBackend);
 		const dispatch = spyOn(localBackend, "writeFileBytes").mockImplementation(
@@ -389,16 +404,30 @@ describe("GenUI ordinary file history", () => {
 		expect(db.select().from(schema.fileChangeOperations).all()).toEqual([]);
 	});
 
-	test("unavailable local history preserves exclusive App.tsx creation", async () => {
+	test("disabled local history preserves exclusive App.tsx creation and attribution despite corrupt legacy storage", async () => {
 		await mkdir(join(root, "private"), { mode: 0o700 });
 		await writeFile(join(root, "private/file-change-blobs"), "not a blob directory");
 		const created = await call({ action: "create", prefix: "demo" });
 		const result = await created.execute();
-		expect(result.metadata).toMatchObject({ diskOutcome: "applied", historyStatus: "unavailable" });
+		expect(result.metadata).toMatchObject({ diskOutcome: "applied", historyStatus: "disabled" });
 		expect(
 			await readFile(join(workspace, ".narrafork/gen_ui/demo-unique/App.tsx"), "utf8"),
 		).toContain("export default function App");
-		expect(db.select().from(schema.fileChangeEffects).all()).toEqual([]);
+		expect(db.select().from(schema.fileChangeEffects).all()).toMatchObject([
+			{
+				diskOutcome: "applied",
+				attributionGrade: "unknown",
+				beforeBlobDigest: null,
+				intendedAfterBlobDigest: null,
+				observedAfterBlobDigest: null,
+			},
+		]);
+		expect(db.select().from(schema.fileAttributions).all()).toMatchObject([
+			{ toolName: "GenUI", linesRemoved: 0, attributionGrade: "unknown" },
+		]);
+		expect(db.select().from(schema.fileChangeBlobs).all()).toEqual([]);
+		expect(db.select().from(schema.fileChangeStorageBudgets).all()).toEqual([]);
+		expect(db.select().from(schema.narratorFileSnapshots).all()).toEqual([]);
 	});
 
 	test("rejects a different execution segment before any workspace mutation", async () => {

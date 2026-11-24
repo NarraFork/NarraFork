@@ -12,22 +12,24 @@ import type { ToolCallBinding, ToolUpdateExecutionLease } from "../lib/agent/typ
 import { ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
-import {
-	resolveEffectiveSubagentModelPolicy,
-	resolveSubagentModelSelectionFromPolicy,
-} from "../lib/narrator-custom-traits";
+import { resolveEffectiveSubagentModelPolicy } from "../lib/narrator-custom-traits";
 import type { Locale } from "../lib/prompt-i18n";
 import { policySourceIdOf } from "../lib/runtime-source";
 import {
 	expandAllowedPoolForDisplay,
-	FOLLOW_DEFAULT_MODEL,
 	normalizeAutoModelValueForSave,
 	settings,
 } from "../lib/settings";
 import { type RunBindingInput, runDeadlineAt } from "../lib/validators/runtime-registration";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
-import { BUILTIN_DELEGATION_TEMPLATES, compileDelegationPolicy } from "./agent-runtime/policy";
-import { controlRun, startNarratorRun } from "./agent-runtime/run";
+import { isCheckpointStop } from "./agent-runtime/checkpoint-stop";
+import { compileDelegationPolicy } from "./agent-runtime/policy";
+import {
+	controlRun,
+	type RegisteredAgentStart,
+	settleRegisteredAgentStartFailure,
+	startNarratorRun,
+} from "./agent-runtime/run";
 import { backgroundTaskService } from "./background-task-service";
 import { customSubagentService } from "./custom-subagent-service";
 import { narratorService } from "./narrator-service";
@@ -37,7 +39,7 @@ import { agentMarkdownReference } from "./subagent-label";
 import {
 	formatSubagentModelFallbackNote,
 	resolveSubagentModelForRun,
-	subagentStoredModelReference,
+	selectSubagentModel,
 } from "./subagent-model";
 import { broadcastSubagentTakeoverChanged } from "./subagent-takeover-broadcast";
 import { buildDelegationBasePrompt } from "./subagent-tools";
@@ -56,7 +58,7 @@ export function buildBackgroundAgentStartOutput(
 	return (
 		`<background_task_id>${taskIdOrAlias}</background_task_id>\n\n` +
 		`${agentMarkdownReference(narratorId, title || taskIdOrAlias)}\n\n` +
-		`Background task started. Await({ type: "agent", id: "${taskIdOrAlias}" })`
+		`Background task started. Completion notifies automatically. Watch({ type: "agent", id: "${taskIdOrAlias}" }) registers an observation or retrieves the saved result.`
 	);
 }
 
@@ -167,6 +169,11 @@ export interface RunSubagentInput {
 	onDelegatedResult?: (
 		note: import("@shared/outline-report-note").OutlineReportNote | null,
 	) => void;
+	/**
+	 * Told the subagent's id as soon as it exists, before its run starts (a team work item records
+	 * its worker here, so the run's end can find the item). A failure is logged, never fatal.
+	 */
+	onCreated?: (subagentId: string) => void;
 }
 
 /**
@@ -182,7 +189,6 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 	const {
 		parentNarratorId,
 		toolUseId,
-		subagentType,
 		prompt,
 		cwd,
 		title,
@@ -193,6 +199,8 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 	} = input;
 	// The child stores this value; `auto:<alias>` is written the catalog's way, and an `auto:`
 	// id the catalog does not know fails here instead of at the child's first request.
+	// "Worker" or "GENERAL" means that built-in, never the read-only unknown-type fallback.
+	const subagentType = customSubagentService.canonicalTemplateName(input.subagentType);
 	const explicitModel = input.model ? normalizeAutoModelValueForSave(input.model) : input.model;
 	const background = input.background === true || input.takeoverByUser === true;
 	const timeoutMs = background
@@ -203,9 +211,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 
 	// The template compiles into ordinary data on the created narrator: a capability
 	// ceiling trait and a base prompt. Neither is read from the template again.
-	const customDef = BUILTIN_DELEGATION_TEMPLATES.has(subagentType)
-		? null
-		: await customSubagentService.loadByName(subagentType);
+	const customDef = await customSubagentService.resolveTemplateDefinition(subagentType);
 	const systemPrompt = await buildDelegationBasePrompt(
 		subagentType,
 		locale as Locale,
@@ -239,29 +245,16 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		policySourceId: policySourceIdOf(parent),
 	});
 	const modelPolicy = resolveEffectiveSubagentModelPolicy(parentTraits.traits, subagentType);
-	const candidateModels =
-		modelPolicy.source === "none" ? [subagentPref, parent.model || FOLLOW_DEFAULT_MODEL] : [];
-	const modelSelection = resolveSubagentModelSelectionFromPolicy({
+	const choice = selectSubagentModel({
 		policy: modelPolicy,
 		explicitModel,
-		candidates: candidateModels,
+		parentId: parentNarratorId,
+		parentModel: parent.model,
+		typePreference: subagentPref,
 	});
-	const resolvedModelInput = modelSelection?.model;
-	const preferenceSelection =
-		modelPolicy.source === "none" && !explicitModel && subagentPref
-			? resolveSubagentModelSelectionFromPolicy({
-					policy: modelPolicy,
-					explicitModel: subagentPref,
-					candidates: [],
-				})
-			: undefined;
-	const storedModelInput = subagentStoredModelReference({
-		explicitModel: modelPolicy.source !== "none" ? resolvedModelInput : explicitModel,
-		preferenceSelection,
-		selection: modelSelection,
-	});
+	const modelSelection = choice?.selection;
 	const configuredReasoningEffort = modelSelection?.poolEntry?.reasoningEffort ?? reasoningEffort;
-	if (modelPolicy.source !== "none" && !resolvedModelInput) {
+	if (!choice) {
 		const allowedModels = expandAllowedPoolForDisplay(
 			modelPolicy.models.map((entry) => entry.model),
 		);
@@ -273,6 +266,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		);
 	}
 
+	const storedModelInput = choice.storedModel;
 	const updateLease = claimSubagentUpdateExecutionLease(
 		input.updateExecutionLease,
 		"resumable",
@@ -288,6 +282,10 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		subagentId: string;
 		delegated: import("./outline/delegation").DelegatedOutlineTask;
 	} | null = null;
+	/** Created but not yet registered as a run: a failure archives it. */
+	let unstartedSubagentId: string | null = null;
+	let registeredStart: RegisteredAgentStart | undefined;
+	let registeredStartFailureEvent: "failed" | "cancelled" = "failed";
 	try {
 		if (input.toolCallBinding) {
 			const { narratorPersistence } = await import("./narrator-persistence");
@@ -309,15 +307,29 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 			runtimePolicy: templatePolicy,
 		});
 		const subagentId = subagent.id;
+		unstartedSubagentId = subagentId;
 		updateLease.setNarratorId(subagentId);
+		if (input.onCreated) {
+			try {
+				input.onCreated(subagentId);
+			} catch (error) {
+				logger.warn("Subagent creation hook failed", {
+					subagentId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
 		// Validates the pool now (a refused model fails the call before any run starts).
-		const { inheritance } = await resolveSubagentModelForRun(subagent, userId);
+		const { inheritance } = await resolveSubagentModelForRun(subagent, userId, undefined, {
+			signal: input.signal,
+		});
 		let aliasRegistration: { alias: string; conflicted: boolean };
 		try {
 			aliasRegistration = await registerAndPersistSubagentAlias(
 				parentNarratorId,
 				subagentId,
 				alias || title,
+				{ signal: input.signal },
 			);
 		} catch (err) {
 			aliasRegistration = registerTaskAlias(parentNarratorId, subagentId, alias || title);
@@ -381,7 +393,6 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 			: "";
 
 		if (background) {
-			await backgroundTaskService.markNarratorRunning(subagentId);
 			// The task projection registers this run (and its relations) in one start.
 			const task = await backgroundTaskService.createAgentTask({
 				id: subagentId,
@@ -391,6 +402,12 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 				title,
 				binding,
 			});
+			if (!task.logicalRunId) throw new Error("Background agent registration has no logical run");
+			registeredStart = {
+				narratorId: subagentId,
+				logicalRunId: task.logicalRunId,
+				deliverTo: { ...binding.deliverTo, viaTask: true },
+			};
 			eventBus.emit({
 				type: "narrator:background_task_started",
 				narratorId: parentNarratorId,
@@ -412,8 +429,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 				try {
 					await controlRun(subagentId, { kind: "hold" });
 				} catch (error) {
-					// The task never mounted a run: settle it so nothing waits on it.
-					await backgroundTaskService.cancel(subagentId).catch(() => false);
+					registeredStartFailureEvent = "cancelled";
 					throw error;
 				}
 				await broadcastSubagentTakeoverChanged({
@@ -426,21 +442,32 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 			// The task projection already registered the run; the run service adopts it.
 			const handle = await startNarratorRun({
 				narratorId: subagentId,
+				skipModelReselect: true,
 				locale: locale as Locale,
 				text: "",
-				resumeRunId: task.logicalRunId ?? undefined,
+				resumeRunId: task.logicalRunId,
+				registeredStart,
 			});
+			unstartedSubagentId = null;
+			if (!handle.started && handle.notStartedReason === "admission_closed")
+				throw new ValidationError("Background agent run did not start: admission is closed");
+			// A claimed execution owns all subsequent preparation/finish failures.
+			// An existing owner also owns the registration; never clean up over it.
+			registeredStart = undefined;
 			if (delegatedBeforeRun && !handle.started) throw new ValidationError(NOT_STARTED);
 			if (delegatedBeforeRun) await delegationRunStarted(subagentId);
 			delegatedBeforeRun = null;
-			void handle.terminal.finally(() => updateLease.release());
+			void handle.terminal.then(
+				() => updateLease.release(),
+				() => updateLease.release(),
+			);
 			return (
 				(input.takeoverByUser
 					? `<background_task_id>${aliasRegistration.alias}</background_task_id>\n\n` +
 						`${agentMarkdownReference(subagentId, title || aliasRegistration.alias)}\n\n` +
 						"Background task started. User takeover is already active. The initial prompt runs independently; " +
 						"turn completion will not notify or wake the parent. " +
-						"The user can continue interacting until they explicitly end takeover. Do not automatically Await this agent."
+						"The user can continue interacting until they explicitly end takeover. Do not automatically Watch this agent."
 					: buildBackgroundAgentStartOutput(aliasRegistration.alias, subagentId, title)) +
 				delegationNote +
 				formatSubagentModelFallbackNote(inheritance) +
@@ -451,16 +478,21 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		const { getSearchExecutionScope } = await import("../lib/search/execution-scope");
 		const handle = await startNarratorRun({
 			narratorId: subagentId,
+			skipModelReselect: true,
 			locale: locale as Locale,
 			text: "",
 			binding,
 			cancelSignal: input.signal,
 			foreground: true,
 		});
+		unstartedSubagentId = null;
 		if (delegatedBeforeRun && !handle.started) throw new ValidationError(NOT_STARTED);
 		if (delegatedBeforeRun) await delegationRunStarted(subagentId);
 		delegatedBeforeRun = null;
-		void handle.terminal.finally(() => updateLease.release());
+		void handle.terminal.then(
+			() => updateLease.release(),
+			() => updateLease.release(),
+		);
 		if (getSearchExecutionScope()) {
 			// A channel failure must reach the search router so the next channel can run.
 			const terminal = await handle.terminal;
@@ -472,6 +504,13 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		input.onDelegatedResult?.(result.outlineReport ?? null);
 		return result.output + formatSubagentModelFallbackNote(inheritance) + conflictNote;
 	} catch (error) {
+		if (registeredStart && !isCheckpointStop(error))
+			await settleRegisteredAgentStartFailure(
+				registeredStart,
+				error,
+				undefined,
+				registeredStartFailureEvent,
+			);
 		updateLease.release();
 		if (delegatedBeforeRun && input.delegation)
 			await giveBackDelegatedTask({
@@ -479,6 +518,8 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 				delegation: input.delegation,
 				userId: userId ?? null,
 			});
+		else if (unstartedSubagentId && !registeredStart && !isCheckpointStop(error))
+			await archiveUnstartedSubagent(unstartedSubagentId);
 		throw error;
 	}
 }
@@ -495,8 +536,24 @@ export function aliasConflictNote(
 	return (
 		`\n\nNote: The requested alias "${requested}" was already taken. ` +
 		`This agent was assigned "${assigned}" instead.` +
-		(background ? "" : " Use this alias with Await or Send to reference this agent.")
+		(background ? "" : " Use this alias with Watch or Send to reference this agent.")
 	);
+}
+
+/**
+ * A subagent created by a call that failed before its run started (e.g. its model could
+ * not be resolved): left as is it would stay "working" forever with no run behind it, and
+ * its caller would keep showing background work as running.
+ */
+async function archiveUnstartedSubagent(subagentId: string): Promise<void> {
+	await backgroundTaskService.cancel(subagentId).catch(() => false);
+	const { interruptAndArchiveSubagent } = await import("./subagent-lifecycle");
+	const archived = await interruptAndArchiveSubagent(subagentId);
+	if (!archived.ok)
+		logger.warn("Unstarted subagent could not be archived", {
+			subagentId,
+			error: archived.error,
+		});
 }
 
 const NOT_STARTED = "The delegated agent's run did not start; its task was given back";

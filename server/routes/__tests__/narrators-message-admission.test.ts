@@ -8,6 +8,7 @@ import {
 	MAX_STAGED_ATTACHMENTS_TOTAL_BYTES,
 } from "@shared/text-file-types";
 import { Hono } from "hono";
+import { buildAppErrorResponse } from "../../lib/app-error-response";
 import {
 	bindComposerDocumentReferences,
 	bindComposerMediaProjection,
@@ -16,9 +17,11 @@ import {
 	validateComposerAssets,
 	validateComposerProjection,
 } from "../../lib/composer-document";
+import { DbReadTaskOverloadedError } from "../../lib/db-worker/pool";
 import { AppError, catalogError, ValidationError } from "../../lib/errors";
 import { parseFileReferenceInput } from "../../lib/file-reference-input";
 import { bufferQueueModeSchema, sendMessageSchema } from "../../lib/validators/narrators";
+import { narratorSurfaceReadOptions } from "../../services/narrator-surface-reads";
 
 // Run the real parser/HTTP handler with injected service boundaries, without
 // initializing the database or mocking process-global agent modules.
@@ -52,6 +55,8 @@ function fixture(
 		expandedCommand?: boolean;
 		control?: "bash" | "load" | "unload" | "block" | "unblock" | "save";
 		reject?: boolean;
+		languageReadError?: Error;
+		replyInUserLanguage?: boolean;
 		canonicalPrefix?: string;
 		/** The session's task backend (outline P2). */
 		taskBackend?: "spec" | "outline";
@@ -59,6 +64,10 @@ function fixture(
 ) {
 	let status = options.status ?? "idle";
 	const deletedImages: string[] = [];
+	const readMessageLanguagePreferences = mock(async (_userId: string, _signal: AbortSignal) => {
+		if (options.languageReadError) throw options.languageReadError;
+		return { locale: "zh-CN", replyInUserLanguage: options.replyInUserLanguage ?? true };
+	});
 	const userMsg = {
 		id: "user-message",
 		role: "user",
@@ -184,6 +193,9 @@ function fixture(
 							: { resolved: false },
 		getUserLanguage: async () => "zh-CN",
 		getUserReplyInLanguage: async () => true,
+		readMessageLanguagePreferences,
+		narratorSurfaceReadOptions,
+		readQueryFirst: async (query: Promise<unknown[]>) => (await query)[0],
 		acceptUserMessage: accept,
 		sendMessage: legacySend,
 		pushBufferedMessage: legacyPush,
@@ -194,6 +206,9 @@ function fixture(
 		db: {
 			query: {
 				users: {
+					findMany: async () => [
+						{ id: "owner", username: "Alice", avatarColor: "blue", avatarImageId: null },
+					],
 					findFirst: async () => ({
 						id: "owner",
 						username: "Alice",
@@ -219,13 +234,15 @@ function fixture(
 		await next();
 	});
 	app.onError(
-		(error) =>
+		(error, c) =>
+			buildAppErrorResponse(error, c) ??
 			new Response(JSON.stringify({ error: error.message }), {
 				status: error instanceof AppError ? error.statusCode : 500,
 			}),
 	);
 	app.route("/narrators", routes);
 	return {
+		readMessageLanguagePreferences,
 		saveRecording,
 		accept,
 		legacySend,
@@ -235,15 +252,40 @@ function fixture(
 		modelBroadcast,
 		restoreModel,
 		broadcast,
-		post: (body: FormData | Record<string, unknown>) =>
+		post: (body: FormData | Record<string, unknown>, signal?: AbortSignal) =>
 			app.request("http://localhost/narrators/session/messages", {
 				method: "POST",
+				signal,
 				...(body instanceof FormData
 					? { body }
 					: { body: JSON.stringify(body), headers: { "content-type": "application/json" } }),
 			}),
 	};
 }
+
+test("message language uses the caller and passes the request signal before message admission", async () => {
+	const f = fixture({ replyInUserLanguage: false });
+	const request = new AbortController();
+	expect((await f.post({ message: "hello" }, request.signal)).status).toBe(201);
+	expect(f.readMessageLanguagePreferences).toHaveBeenCalledTimes(1);
+	const [userId, signal] = f.readMessageLanguagePreferences.mock.calls[0] ?? [];
+	expect(userId).toBe("owner");
+	request.abort();
+	expect(signal?.aborted).toBe(true);
+	expect(f.accept.mock.calls[0]?.[2]?.humanReplyContext).toEqual({
+		locale: "zh-CN",
+		replyInUserLanguage: false,
+	});
+});
+
+test("language admission failure returns 503 without accepting the message or retaining uploads", async () => {
+	const f = fixture({ languageReadError: new DbReadTaskOverloadedError() });
+	const response = await f.post(multipart());
+	expect(response.status).toBe(503);
+	expect(await response.json()).toMatchObject({ code: "DATABASE_READ_UNAVAILABLE" });
+	expect(f.accept).not.toHaveBeenCalled();
+	expect(f.deletedImages).toEqual(["saved-image"]);
+});
 
 test.each([
 	false,

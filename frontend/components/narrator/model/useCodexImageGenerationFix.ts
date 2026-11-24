@@ -48,10 +48,13 @@ export interface CodexImageGenerationFix {
  * selection, then the global default — the same precedence the model-test action
  * uses, because "which provider served this turn" has one answer.
  */
-export function useCodexImageGenerationFix(narratorId: string): CodexImageGenerationFix {
+export function useCodexImageGenerationFix(
+	narratorId: string,
+	enabled = true,
+): CodexImageGenerationFix {
 	const { t } = useTranslation("narrator");
 	const { data: currentUser } = useCurrentUser();
-	const { data: narrator } = useNarrator(narratorId);
+	const { data: narrator } = useNarrator(enabled ? narratorId : "");
 	const { defaultModelValue } = useAllModels();
 	const [busy, setBusy] = useState(false);
 	// The re-entrancy guard is a ref, not the state value: the vlist shell shares ONE
@@ -66,7 +69,7 @@ export function useCodexImageGenerationFix(narratorId: string): CodexImageGenera
 	);
 	// A prefix is required: without one the server cannot tell which of the
 	// possible flags to write, and guessing would hit the wrong provider.
-	const addressable = currentUser?.role === "admin" && modelValue.includes(":");
+	const addressable = enabled && currentUser?.role === "admin" && modelValue.includes(":");
 
 	const canFix = useMemo(
 		() => (errorText: string) => addressable && isCodexImageGenerationDisabledError(errorText),

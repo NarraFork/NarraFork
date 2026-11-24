@@ -1,22 +1,22 @@
-import { existsSync, readFileSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { unlink } from "node:fs/promises";
+import { epochOf, type QuotaSnapshot, type QuotaWindow } from "@shared/quota-snapshot";
+import { identifyService } from "@shared/sourcing/identify";
 import { logger } from "./logger";
-import { getNarraforkHome } from "./narrafork-home";
+import { getNarraforkPath } from "./narrafork-home";
 import { outboundFetch } from "./net/outbound-fetch";
 import { resolveProxyForUrl } from "./net/proxy";
-import { registerKeyQuotaProbe } from "./provider-key-quota";
 import { shownSubjectId, type UsageSubject, usageSubjects } from "./provider-key-subjects";
 import type { CustomApiProviderConfig } from "./settings";
+import { quotaStore } from "./sourcing/quota-store";
 
 /**
  * Kimi (kimi.com / kimi.ai coding plan) usage quota cache.
  *
- * Mirrors the NUG quota pattern: one global cache entry per provider, persisted
- * to ~/.narrafork/kimi-usages.json. Refresh is demand-driven — on startup, when
- * provider settings change, and stale-while-revalidate when the frontend reads
- * it — so nothing polls while no Kimi provider is in use. The status bar shows
- * the 5-hour window; the popover lists the weekly/monthly limits.
+ * One quota snapshot per key in the shared quota store (sourcing/quota-store.ts), under
+ * the key's (baseUrl, apiKey) identity. Refresh is demand-driven — on startup, when
+ * provider settings change, and stale-while-revalidate when the frontend reads it — so
+ * nothing polls while no Kimi provider is in use. The status bar shows the 5-hour
+ * window; the popover lists the weekly/monthly limits.
  *
  * The upstream endpoint `GET {origin}/coding/v1/usages` answers in two shapes
  * (both are parsed here):
@@ -51,7 +51,6 @@ export interface KimiUsageCache extends KimiUsagePayload {
 const KIMI_USAGES_PATH = "/coding/v1/usages";
 const KIMI_CLI_USER_AGENT = "KimiCLI/1.6";
 const FETCH_TIMEOUT_MS = 15_000;
-const SAVE_DEBOUNCE_MS = 250;
 
 /**
  * Age at which a cached entry counts as stale, in ms.
@@ -64,10 +63,6 @@ const SAVE_DEBOUNCE_MS = 250;
  */
 export const KIMI_USAGES_STALE_MS = 60_000;
 
-const cacheDir = getNarraforkHome();
-const cachePath = resolve(cacheDir, "kimi-usages.json");
-
-const cachedUsageByProvider = new Map<string, KimiUsageCache>();
 /**
  * Refreshes currently in flight, keyed by provider id.
  *
@@ -83,28 +78,20 @@ const cachedUsageByProvider = new Map<string, KimiUsageCache>();
  * result rather than racing to overwrite the cache in arrival order.
  */
 const refreshInFlightByProvider = new Map<string, Promise<KimiUsageCache | null>>();
-let saveTimer: ReturnType<typeof setTimeout> | null = null;
-let saveInFlight = false;
-let saveRequested = false;
+/** Keys this module has read or written a snapshot for, so a purge can find dead ones. */
+const knownIds = new Set<string>();
+
+// The plaintext cache this module kept before the quota store; its numbers carried no
+// credential identity, so they are dropped and probed again rather than imported.
+void unlink(getNarraforkPath("kimi-usages.json")).catch(() => {});
 
 // ---------------------------------------------------------------------------
 // Detection
 // ---------------------------------------------------------------------------
 
-/** True when the provider's baseUrl points at a kimi.com / kimi.ai host. */
+/** True when an enabled provider's baseUrl points at a kimi.com / kimi.ai host. */
 export function isKimiCustomApiProvider(config: { baseUrl?: string; disabled?: boolean }): boolean {
-	if (config.disabled || !config.baseUrl) return false;
-	try {
-		const host = new URL(config.baseUrl).hostname.toLowerCase();
-		return (
-			host === "kimi.com" ||
-			host === "kimi.ai" ||
-			host.endsWith(".kimi.com") ||
-			host.endsWith(".kimi.ai")
-		);
-	} catch {
-		return false;
-	}
+	return !config.disabled && identifyService(config).templateId === "kimi-code";
 }
 
 // ---------------------------------------------------------------------------
@@ -284,7 +271,10 @@ export function parseKimiUsagesResponse(body: unknown): KimiUsagePayload {
 // ---------------------------------------------------------------------------
 
 /** Fetch and parse usages for one Kimi provider. Throws on transport/HTTP errors. */
-export async function fetchKimiUsage(config: CustomApiProviderConfig): Promise<KimiUsagePayload> {
+export async function fetchKimiUsage(
+	config: CustomApiProviderConfig,
+	signal?: AbortSignal,
+): Promise<KimiUsagePayload> {
 	const url = new URL(KIMI_USAGES_PATH, config.baseUrl);
 	const response = await outboundFetch(
 		url,
@@ -294,7 +284,9 @@ export async function fetchKimiUsage(config: CustomApiProviderConfig): Promise<K
 				"User-Agent": KIMI_CLI_USER_AGENT,
 				Accept: "application/json",
 			},
-			signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+			signal: signal
+				? AbortSignal.any([signal, AbortSignal.timeout(FETCH_TIMEOUT_MS)])
+				: AbortSignal.timeout(FETCH_TIMEOUT_MS),
 		},
 		{
 			proxyUrl: resolveProxyForUrl(url, config.proxy),
@@ -309,80 +301,113 @@ export async function fetchKimiUsage(config: CustomApiProviderConfig): Promise<K
 }
 
 // ---------------------------------------------------------------------------
-// Cache persistence (same debounce pattern as custom-api-quota-cache)
+// Quota snapshots
 // ---------------------------------------------------------------------------
 
-function loadAllCachedUsages(): void {
-	try {
-		if (!existsSync(cachePath)) return;
-		const data = JSON.parse(readFileSync(cachePath, "utf-8")) as Record<
-			string,
-			Partial<KimiUsageCache>
-		>;
-		for (const [providerId, cache] of Object.entries(data)) {
-			cachedUsageByProvider.set(providerId, {
-				fiveHour: cache.fiveHour ?? null,
-				weekly: cache.weekly ?? null,
-				monthly: cache.monthly ?? null,
-				extraWindows: Array.isArray(cache.extraWindows) ? cache.extraWindows : [],
-				fetchedAt: typeof cache.fetchedAt === "number" ? cache.fetchedAt : 0,
-				error: typeof cache.error === "string" ? cache.error : null,
-			});
-		}
-	} catch {
-		// Corrupt or unreadable cache — ignore; the next refresh rebuilds it.
-	}
+/** Share used; a window reporting nothing left counts as used up whatever its other fields. */
+function usedRatio(window: KimiUsageWindow): number | null {
+	if (window.remaining === 0) return 1;
+	if (window.limit == null || window.limit <= 0) return null;
+	if (window.used != null) return window.used / window.limit;
+	return window.remaining == null ? null : 1 - window.remaining / window.limit;
 }
 
-function serializeCachedUsages(): string {
-	const data: Record<string, KimiUsageCache> = {};
-	for (const [providerId, cache] of cachedUsageByProvider) {
-		data[providerId] = cache;
-	}
-	return JSON.stringify(data);
+function kimiSnapshot(
+	payload: KimiUsagePayload,
+	fetchedAt: number,
+	error: string | null,
+): QuotaSnapshot {
+	const window = (
+		kind: QuotaWindow["kind"],
+		w: KimiUsageWindow | null,
+		label?: string,
+	): QuotaWindow[] =>
+		w
+			? [
+					{
+						kind,
+						...(label !== undefined ? { label } : {}),
+						usedRatio: usedRatio(w),
+						resetsAt: epochOf(w.resetTime),
+					},
+				]
+			: [];
+	const { fiveHour, weekly, monthly, extraWindows } = payload;
+	return {
+		fetchedAt,
+		...(error !== null ? { error } : {}),
+		scope: "subscription",
+		windows: [
+			...window("5h", fiveHour),
+			...window("weekly", weekly),
+			...window("monthly", monthly),
+			...extraWindows.flatMap((w) => window("other", w, w.label)),
+		],
+		balances: [],
+		detail: { fiveHour, weekly, monthly, extraWindows } satisfies KimiUsagePayload,
+	};
 }
 
-async function flushCachedUsages(): Promise<void> {
-	if (saveInFlight) return;
-	saveInFlight = true;
-	try {
-		while (saveRequested) {
-			saveRequested = false;
-			try {
-				await mkdir(cacheDir, { recursive: true });
-				await writeFile(cachePath, serializeCachedUsages());
-			} catch {
-				// Non-critical: failing to persist usage must not break anything.
-			}
-		}
-	} finally {
-		saveInFlight = false;
-	}
+/** A snapshot read from disk, rebuilt from its validated detail. */
+function restoreSnapshot(snapshot: QuotaSnapshot): QuotaSnapshot {
+	const detail = (snapshot.detail ?? {}) as Record<string, unknown>;
+	const extraWindows = Array.isArray(detail.extraWindows)
+		? detail.extraWindows.flatMap((entry) => {
+				const window = normalizeWindow(entry);
+				const label = (entry as { label?: unknown }).label;
+				return window && typeof label === "string" ? [{ label, ...window }] : [];
+			})
+		: [];
+	return kimiSnapshot(
+		{
+			fiveHour: normalizeWindow(detail.fiveHour),
+			weekly: normalizeWindow(detail.weekly),
+			monthly: normalizeWindow(detail.monthly),
+			extraWindows,
+		},
+		snapshot.fetchedAt,
+		snapshot.error ?? null,
+	);
 }
 
-function scheduleSaveAllCachedUsages(): void {
-	saveRequested = true;
-	if (saveTimer || saveInFlight) return;
-	saveTimer = setTimeout(() => {
-		saveTimer = null;
-		void flushCachedUsages();
-	}, SAVE_DEBOUNCE_MS);
-	saveTimer.unref?.();
+/** The usage endpoint answers for (baseUrl, apiKey) and nothing else. */
+const identity = (config: CustomApiProviderConfig) =>
+	JSON.stringify([config.baseUrl, config.apiKey]);
+
+/** One quota probe: fetch, then the shared snapshot shape. Throws on failure. */
+export async function probeKimiQuota(
+	credential: UsageSubject,
+	signal?: AbortSignal,
+): Promise<QuotaSnapshot> {
+	return kimiSnapshot(await fetchKimiUsage(credential.config, signal), Date.now(), null);
 }
 
-loadAllCachedUsages();
+function usageOf(subject: UsageSubject): KimiUsageCache | undefined {
+	const snapshot = quotaStore.get(subject.id, identity(subject.config), restoreSnapshot);
+	if (!snapshot) return undefined;
+	knownIds.add(subject.id);
+	const { fiveHour, weekly, monthly, extraWindows } = snapshot.detail as KimiUsagePayload;
+	return {
+		fiveHour,
+		weekly,
+		monthly,
+		extraWindows,
+		fetchedAt: snapshot.fetchedAt,
+		error: snapshot.error ?? null,
+	};
+}
 
-function setKimiCachedUsage(providerId: string, cache: KimiUsageCache): void {
-	cachedUsageByProvider.set(providerId, cache);
-	scheduleSaveAllCachedUsages();
+function setUsage(subject: UsageSubject, snapshot: QuotaSnapshot): void {
+	knownIds.add(subject.id);
+	quotaStore.set(subject.id, identity(subject.config), snapshot);
 }
 
 // ---------------------------------------------------------------------------
 // Public API
 //
 // Entries are per key (see provider-key-subjects.ts): a provider with several keys has
-// one entry each, and a migrated first key keeps the provider's id, so older cache
-// files still line up. Provider-level reads report the provider's first usable key.
+// one entry each, and a migrated first key keeps the provider's id. Provider-level reads
+// report the provider's first usable key.
 // ---------------------------------------------------------------------------
 
 const kimiSubjects = () => usageSubjects(isKimiCustomApiProvider);
@@ -391,36 +416,45 @@ function refreshSubject(subject: UsageSubject): Promise<KimiUsageCache | null> {
 	const id = subject.id;
 	const inFlight = refreshInFlightByProvider.get(id);
 	if (inFlight) return inFlight;
-	const config = subject.config;
 	const run = (async (): Promise<KimiUsageCache | null> => {
-		const existing = cachedUsageByProvider.get(id);
+		const existing = usageOf(subject);
+		// A provider can be edited or re-purposed while the request is out; its late answer
+		// must not publish into the snapshot another source now reads for this credential.
+		const current = () =>
+			kimiSubjects().some(
+				(s) => s.id === subject.id && identity(s.config) === identity(subject.config),
+			);
 		try {
-			const payload = await fetchKimiUsage(config);
-			const cache: KimiUsageCache = { ...payload, fetchedAt: Date.now(), error: null };
-			setKimiCachedUsage(id, cache);
-			return cache;
+			const fresh = await probeKimiQuota(subject);
+			if (current()) setUsage(subject, fresh);
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
+			if (!current()) return null;
 			// Keep stale window data visible; only the error field advances.
 			//
 			// `fetchedAt` advances too when there was no previous entry, so a provider
 			// that fails every time is not treated as permanently stale — otherwise the
 			// staleness check would re-fetch it on every single request.
-			setKimiCachedUsage(id, {
-				fiveHour: existing?.fiveHour ?? null,
-				weekly: existing?.weekly ?? null,
-				monthly: existing?.monthly ?? null,
-				extraWindows: existing?.extraWindows ?? [],
-				fetchedAt: existing?.fetchedAt ?? Date.now(),
-				error: message,
-			});
-			logger.debug("Kimi usage refresh failed", { provider: config.name, error: message });
-			return cachedUsageByProvider.get(id) ?? null;
+			setUsage(
+				subject,
+				kimiSnapshot(
+					{
+						fiveHour: existing?.fiveHour ?? null,
+						weekly: existing?.weekly ?? null,
+						monthly: existing?.monthly ?? null,
+						extraWindows: existing?.extraWindows ?? [],
+					},
+					existing?.fetchedAt ?? Date.now(),
+					message,
+				),
+			);
+			logger.debug("Kimi usage refresh failed", { provider: subject.config.name, error: message });
 		} finally {
 			// Cleared in `finally` so a thrown/rejected refresh cannot wedge the slot
 			// shut and block every later attempt.
 			refreshInFlightByProvider.delete(id);
 		}
+		return usageOf(subject) ?? null;
 	})();
 	refreshInFlightByProvider.set(id, run);
 	return run;
@@ -452,25 +486,28 @@ export async function refreshStaleKimiUsages(maxAgeMs: number): Promise<void> {
 	const now = Date.now();
 	await Promise.allSettled(
 		kimiSubjects()
-			.filter((s) => now - (cachedUsageByProvider.get(s.id)?.fetchedAt ?? 0) > maxAgeMs)
+			.filter((s) => now - (usageOf(s)?.fetchedAt ?? 0) > maxAgeMs)
 			.map(refreshSubject),
 	);
 }
 
 /** The usage a provider reports: that of its first usable key. */
 export function getKimiCachedUsage(providerId: string): KimiUsageCache | undefined {
-	const id = shownSubjectId(kimiSubjects(), providerId);
-	return id ? cachedUsageByProvider.get(id) : undefined;
+	const subjects = kimiSubjects();
+	const subject = subjects.find((s) => s.id === shownSubjectId(subjects, providerId));
+	return subject ? usageOf(subject) : undefined;
 }
 
 /** Provider id → the usage it reports (status bar). */
 export function getAllKimiCachedUsages(): Record<string, KimiUsageCache> {
 	const result: Record<string, KimiUsageCache> = {};
-	const subjects = kimiSubjects();
-	for (const providerId of new Set(subjects.map((s) => s.providerId))) {
-		const id = shownSubjectId(subjects, providerId);
-		const cache = id ? cachedUsageByProvider.get(id) : undefined;
-		if (cache) result[providerId] = cache;
+	const seen = new Set<string>();
+	for (const subject of kimiSubjects()) {
+		// A provider reports its first subject, cached or not.
+		if (seen.has(subject.providerId)) continue;
+		seen.add(subject.providerId);
+		const cache = usageOf(subject);
+		if (cache) result[subject.providerId] = cache;
 	}
 	return result;
 }
@@ -479,7 +516,7 @@ export function getAllKimiCachedUsages(): Record<string, KimiUsageCache> {
 export function getKimiKeyUsages(): Record<string, KimiUsageCache> {
 	const result: Record<string, KimiUsageCache> = {};
 	for (const subject of kimiSubjects()) {
-		const cache = cachedUsageByProvider.get(subject.id);
+		const cache = usageOf(subject);
 		if (cache) result[subject.id] = cache;
 	}
 	return result;
@@ -492,35 +529,11 @@ export function getKimiKeyUsages(): Record<string, KimiUsageCache> {
 export function purgeKimiUsageCache(providerIds: string[]): void {
 	const purge = new Set(providerIds);
 	const live = new Map(kimiSubjects().map((s) => [s.id, s.providerId]));
-	let changed = false;
-	for (const id of [...cachedUsageByProvider.keys()]) {
+	for (const id of [...knownIds, ...live.keys()]) {
 		const providerId = live.get(id);
 		if (providerId === undefined || purge.has(providerId) || purge.has(id)) {
-			cachedUsageByProvider.delete(id);
-			changed = true;
+			quotaStore.remove(id);
+			knownIds.delete(id);
 		}
 	}
-	if (changed) scheduleSaveAllCachedUsages();
 }
-
-function exhaustedUntil(window: KimiUsageWindow | null, now: number): number | undefined {
-	if (!window?.resetTime) return undefined;
-	const usedUp =
-		window.remaining === 0 ||
-		(window.limit != null &&
-			window.used != null &&
-			window.limit > 0 &&
-			window.used >= window.limit);
-	const reset = Date.parse(window.resetTime);
-	return usedUp && Number.isFinite(reset) && reset > now ? reset : undefined;
-}
-
-// The key pool skips a key whose window this cache has seen used up, until it resets.
-registerKeyQuotaProbe((keyId, now) => {
-	const cache = cachedUsageByProvider.get(keyId);
-	if (!cache) return undefined;
-	const until = [cache.fiveHour, cache.weekly, cache.monthly, ...cache.extraWindows]
-		.map((window) => exhaustedUntil(window, now))
-		.filter((value): value is number => value !== undefined);
-	return until.length ? Math.max(...until) : undefined;
-});

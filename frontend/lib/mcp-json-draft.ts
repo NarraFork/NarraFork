@@ -38,14 +38,16 @@ export interface McpJsonDraft {
 	url: string;
 	env: McpSecretDraftEntry[];
 	headers: McpSecretDraftEntry[];
+	oauthClientId: string;
+	oauthScope: string;
 	originalEnvKeys: string[];
 	originalHeaderKeys: string[];
 	mode: McpLoadingMode;
 	defaultBehavior: McpJsonBehavior;
 }
 
-export type McpJsonParseResult =
-	| { ok: true; draft: McpJsonDraft }
+export type McpJsonParseResult<T extends McpJsonDraft = McpJsonDraft> =
+	| { ok: true; draft: T }
 	| { ok: false; errorKey: McpJsonParseErrorKey; params?: Record<string, string> };
 
 /**
@@ -95,6 +97,13 @@ function secretEntriesToJson(entries: ReadonlyArray<McpSecretDraftEntry>): Recor
 	return result;
 }
 
+function oauthToJson(draft: McpJsonDraft): { clientId?: string; scope?: string } | undefined {
+	const clientId = draft.oauthClientId.trim();
+	const scope = draft.oauthScope.trim();
+	if (!clientId && !scope) return undefined;
+	return { ...(clientId && { clientId }), ...(scope && { scope }) };
+}
+
 /** Serialize a draft into the JSON document shown in the editor. */
 export function mcpDraftToJsonText(draft: McpJsonDraft): string {
 	const doc: Record<string, unknown> = {
@@ -113,6 +122,8 @@ export function mcpDraftToJsonText(draft: McpJsonDraft): string {
 		doc.url = draft.url;
 		const headers = secretEntriesToJson(draft.headers);
 		if (Object.keys(headers).length > 0) doc.headers = headers;
+		const oauth = oauthToJson(draft);
+		if (oauth) doc.oauth = oauth;
 	}
 
 	const env = secretEntriesToJson(draft.env);
@@ -171,7 +182,10 @@ function readOptionalString(value: unknown): string | null | undefined {
  * carry: they decide whether a placeholder means "keep this" or refers to a key
  * that does not exist, and which omitted keys count as deletions.
  */
-export function parseMcpDraftJson(text: string, current: McpJsonDraft): McpJsonParseResult {
+export function parseMcpDraftJson<T extends McpJsonDraft>(
+	text: string,
+	current: T,
+): McpJsonParseResult<T> {
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(text);
@@ -233,6 +247,19 @@ export function parseMcpDraftJson(text: string, current: McpJsonDraft): McpJsonP
 		return { ok: false, errorKey: "mcpJsonInvalidField", params: { field: "headers" } };
 	}
 
+	let oauthClientId: string | null | undefined;
+	let oauthScope: string | null | undefined;
+	if (parsed.oauth !== undefined && parsed.oauth !== null) {
+		if (!isObjectRecord(parsed.oauth)) {
+			return { ok: false, errorKey: "mcpJsonInvalidField", params: { field: "oauth" } };
+		}
+		oauthClientId = readOptionalString(parsed.oauth.clientId);
+		oauthScope = readOptionalString(parsed.oauth.scope);
+		if (oauthClientId === null || oauthScope === null) {
+			return { ok: false, errorKey: "mcpJsonInvalidField", params: { field: "oauth" } };
+		}
+	}
+
 	if (parsed.enabled !== undefined && typeof parsed.enabled !== "boolean") {
 		return { ok: false, errorKey: "mcpJsonInvalidField", params: { field: "enabled" } };
 	}
@@ -278,6 +305,8 @@ export function parseMcpDraftJson(text: string, current: McpJsonDraft): McpJsonP
 			// existing preserved entries would silently resurrect them on save,
 			// so drop headers entirely when the document describes stdio.
 			headers: transport === "stdio" ? [] : headers,
+			oauthClientId: transport === "stdio" ? "" : (oauthClientId ?? ""),
+			oauthScope: transport === "stdio" ? "" : (oauthScope ?? ""),
 			mode,
 			defaultBehavior,
 		},

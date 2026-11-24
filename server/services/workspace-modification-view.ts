@@ -334,6 +334,7 @@ async function selectPerPathRows(
 	baseConditions: SQL[],
 	workspaceKeys: string[],
 	scopes: ReadonlyMap<string, WorkspaceAttributionScope>,
+	signal?: AbortSignal,
 ): Promise<{ rows: EventRow[]; truncatedPaths: Set<string> }> {
 	const targets: HistoryTarget[] = [];
 	filePaths.forEach((filePath, ord) => {
@@ -344,6 +345,7 @@ async function selectPerPathRows(
 	});
 	const candidates = new Map<number, { rowId: number; changedAt: string }[]>();
 	for (const batch of batchTargets(targets)) {
+		signal?.throwIfAborted();
 		const fetched = await db.all<{ ord: number; rowId: number; changedAt: string }>(sql`
 			with "targets"("ord", "workspacePath", "filePath") as (
 				select json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]')
@@ -382,6 +384,7 @@ async function selectPerPathRows(
 	const rows: EventRow[] = [];
 	const rowIds = [...kept.keys()];
 	for (let offset = 0; offset < rowIds.length; offset += DETAIL_ROWS_PER_QUERY) {
+		signal?.throwIfAborted();
 		const ids = rowIds.slice(offset, offset + DETAIL_ROWS_PER_QUERY);
 		const details = await db.all<EventRow>(sql`
 			select
@@ -424,6 +427,8 @@ export async function getWorkspaceModificationView(
 	workspacePath: string,
 	options: WorkspaceModificationViewOptions = {},
 ): Promise<WorkspaceModificationView> {
+	const { signal } = options;
+	signal?.throwIfAborted();
 	const deviceId = options.deviceId ?? LOCAL_DEVICE_ID;
 	const key = deviceId === LOCAL_DEVICE_ID ? normalizeWorkspacePath(workspacePath) : workspacePath;
 	const workspaceKeys = new Set([key]);
@@ -432,9 +437,9 @@ export async function getWorkspaceModificationView(
 	);
 	if (deviceId === LOCAL_DEVICE_ID) {
 		try {
-			const canonical = (
-				await localBackend.resolvePathIdentity(workspacePath, { signal: options.signal })
-			).canonicalPath;
+			const { canonicalPath: canonical } = await localBackend.resolvePathIdentity(workspacePath, {
+				signal,
+			});
 			// v2 stores backend-native canonical roots; legacy uses normalized comparison keys.
 			workspaceKeys.add(canonical);
 			workspaceKeys.add(normalizeWorkspacePath(canonical));
@@ -442,6 +447,7 @@ export async function getWorkspaceModificationView(
 			/* Historic rows remain readable after a workspace disappears. */
 		}
 	}
+	signal?.throwIfAborted();
 	const limit = Math.min(Math.max(options.limit ?? DEFAULT_EVENT_LIMIT, 1), MAX_EVENT_LIMIT);
 	const conditions = [eq(fileAttributions.deviceId, deviceId)];
 	addTimeConditions(conditions, options);
@@ -463,20 +469,23 @@ export async function getWorkspaceModificationView(
 		);
 	}
 	const wantTimeline = (options.projection ?? "all") === "all";
-	const current = async () =>
-		options.currentDiff
-			? getGitCurrentDiffView(workspacePath, {
-					deviceId,
-					filePaths: options.filePaths
-						? [
-								...new Set(
-									options.filePaths.map((path) => resolveDisplayPath(path, options.pathAliases)),
-								),
-							]
-						: undefined,
-					signal: options.signal,
-				})
-			: undefined;
+	const current = async () => {
+		signal?.throwIfAborted();
+		if (!options.currentDiff) return undefined;
+		const diff = await getGitCurrentDiffView(workspacePath, {
+			deviceId,
+			filePaths: options.filePaths
+				? [
+						...new Set(
+							options.filePaths.map((path) => resolveDisplayPath(path, options.pathAliases)),
+						),
+					]
+				: undefined,
+			signal,
+		});
+		signal?.throwIfAborted();
+		return diff;
+	};
 	if (options.filePaths?.length === 0) {
 		return {
 			source: "history",
@@ -501,6 +510,7 @@ export async function getWorkspaceModificationView(
 	const stored = await workspaceKeysWithHistory(deviceId, [
 		...new Set([...workspaceKeys, ...candidateScopes.keys()]),
 	]);
+	signal?.throwIfAborted();
 	const scopes = new Map<string, WorkspaceAttributionScope>();
 	let scopesTruncated = options.additionalScopesTruncated === true;
 	for (const [scopeKey, scope] of candidateScopes) {
@@ -525,7 +535,9 @@ export async function getWorkspaceModificationView(
 			conditions,
 			queryKeys,
 			scopes,
+			signal,
 		);
+		signal?.throwIfAborted();
 		rows = selected.rows;
 		rows.sort((a, b) => b.changedAt.localeCompare(a.changedAt) || b.rowId - a.rowId);
 		for (const path of [...selected.truncatedPaths, ...paths.slice(MAX_QUERY_PATHS)]) {
@@ -553,6 +565,7 @@ export async function getWorkspaceModificationView(
 				}),
 			)
 		).flat();
+		signal?.throwIfAborted();
 		fetched.sort((a, b) => b.changedAt.localeCompare(a.changedAt) || b.rowId - a.rowId);
 		hasMore = fetched.length > limit || scopesTruncated;
 		rows = fetched.slice(0, limit);
@@ -593,6 +606,7 @@ export async function getWorkspaceModificationView(
 				])
 			: Promise.resolve(new Map<string, string | null>()),
 	]);
+	signal?.throwIfAborted();
 
 	const timeline: ModificationEvent[] = [];
 	const byFile = new Map<string, FileModificationGroup>();

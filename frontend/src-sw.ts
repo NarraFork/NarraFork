@@ -9,16 +9,41 @@ import {
 import { NavigationRoute, registerRoute } from "workbox-routing";
 import { CacheFirst, StaleWhileRevalidate } from "workbox-strategies";
 import { setBaseHref } from "../server/lib/spa-base-href";
+import { STARTUP_STATUS_HEADER } from "../shared/startup-status";
 import { API_WS_PREFIXES, isApiOrWsRelativePath } from "./lib/app-path-classify";
 import { appVersionsMatch } from "./lib/version-match";
 
 declare let self: ServiceWorkerGlobalScope;
+const RELOAD_NAVIGATION_TIMEOUT_MS = 8000;
 
-// Update recovery must bypass even the precached shell while an unregistered
-// worker still controls a tab (or unregister failed). Register BEFORE precaching.
+// Try fresh HTML before the cached shell. Register BEFORE precaching.
 registerRoute(
 	({ request, url }) => request.mode === "navigate" && url.searchParams.has("_nf_reload"),
-	({ request }) => fetch(new Request(request, { cache: "no-store" })),
+	async (options) => {
+		const controller = new AbortController();
+		let timeout: ReturnType<typeof setTimeout> | undefined;
+		try {
+			const response = await Promise.race([
+				fetch(new Request(options.request, { cache: "no-store", signal: controller.signal })),
+				new Promise<never>((_, reject) => {
+					timeout = setTimeout(() => {
+						controller.abort();
+						reject(new Error("Navigation timeout"));
+					}, RELOAD_NAVIGATION_TIMEOUT_MS);
+				}),
+			]);
+			// The startup page polls itself back; a proxy 502/504 page runs no app code.
+			if (response.status < 500 || response.headers.has(STARTUP_STATUS_HEADER)) {
+				return response;
+			}
+			void response.body?.cancel();
+		} catch {
+			// Keep the installed shell available while the server is unreachable.
+		} finally {
+			clearTimeout(timeout);
+		}
+		return serveSpaShell(options);
+	},
 );
 
 // Injected by vite-plugin-pwa at build time
@@ -156,40 +181,37 @@ registerRoute(
  */
 const spaShellHandler = createHandlerBoundToURL("index.html");
 
-registerRoute(
-	new NavigationRoute(
-		async (options) => {
-			const response = await spaShellHandler(options);
-			if (!response) return response;
-			// Only rewrite what is actually the app shell. A non-HTML or error response is
-			// passed through untouched rather than parsed as a document.
-			if (!response.ok) return response;
-			const contentType = response.headers.get("content-type") ?? "";
-			if (!contentType.includes("text/html")) return response;
+async function serveSpaShell(options: Parameters<typeof spaShellHandler>[0]) {
+	const response = await spaShellHandler(options);
+	if (!response?.ok) return response;
+	const contentType = response.headers.get("content-type") ?? "";
+	if (!contentType.includes("text/html")) return response;
+	const html = setBaseHref(await response.text(), SW_BASE);
+	return new Response(html, {
+		status: response.status,
+		statusText: response.statusText,
+		headers: response.headers,
+	});
+}
 
-			const html = setBaseHref(await response.text(), SW_BASE);
-			// Headers are copied so `Content-Type` and anything Workbox set survive; only
-			// the body changed.
-			return new Response(html, {
-				status: response.status,
-				statusText: response.statusText,
-				headers: response.headers,
-			});
-		},
-		{
-			// Anchored at the mount base, so the denylist keeps working under a prefix —
-			// a rooted `/^\/api\//` would not match `/proxy/7778/api/…` and the worker
-			// would answer API navigations with the app shell.
-			denylist: API_WS_PREFIXES.map(
-				(prefix) => new RegExp(`^${escapeRegExp(SW_BASE)}${prefix}(?:/|$)`),
-			),
-		},
-	),
+registerRoute(
+	new NavigationRoute(serveSpaShell, {
+		// Anchored at the mount base, so the denylist keeps working under a prefix —
+		// a rooted `/^\/api\//` would not match `/proxy/7778/api/…` and the worker
+		// would answer API navigations with the app shell.
+		denylist: API_WS_PREFIXES.map(
+			(prefix) => new RegExp(`^${escapeRegExp(SW_BASE)}${prefix}(?:/|$)`),
+		),
+	}),
 );
 
 // ── Version check on activate ──────────────────────────────────────────────
 const APP_VERSION = __APP_VERSION__;
 const VERSION_CHECK_TIMEOUT_MS = 2500;
+
+self.addEventListener("message", (event) => {
+	if (event.data?.type === "GET_VERSION") event.ports[0]?.postMessage({ version: APP_VERSION });
+});
 
 async function fetchServerVersion(): Promise<string | undefined> {
 	const controller = new AbortController();
@@ -229,32 +251,23 @@ async function notifyVersionMismatch(serverVersion: string) {
 	}
 }
 
-async function checkVersionAndMaybeUnregister(): Promise<boolean> {
+async function checkVersion(): Promise<void> {
 	const serverVersion = await fetchServerVersion();
-	if (!serverVersion) return false;
+	if (!serverVersion) return;
 
 	// Prefix-tolerant: release-CI server binaries embed the full commit while
 	// this bundle carries the short one (see lib/version-match.ts).
 	if (!appVersionsMatch(serverVersion, APP_VERSION)) {
 		await notifyVersionMismatch(serverVersion);
-		await self.registration.unregister();
-		return true;
 	}
-
-	return false;
 }
 
 self.addEventListener("activate", (event) => {
-	event.waitUntil(
-		(async () => {
-			// Check before claiming clients. A stale SW should notify and unregister,
-			// but must not take over current pages and start handling their fetches.
-			const unregistered = await checkVersionAndMaybeUnregister();
-			if (!unregistered) {
-				await self.clients.claim();
-			}
-		})(),
-	);
+	// Claim without waiting on the network: fetches queue until activation finishes,
+	// so a slow health check here would stall every controlled page. The version
+	// check is only a hint; pages confirm with the live server themselves.
+	event.waitUntil(self.clients.claim());
+	void checkVersion().catch(() => {});
 });
 
 self.skipWaiting();

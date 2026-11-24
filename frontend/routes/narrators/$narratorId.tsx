@@ -56,7 +56,11 @@ import {
 	recordRecentTabVisit,
 	shouldAddSubagentRecentTab,
 } from "../../hooks/useRecentTabs";
-import { useCreateNarratorTerminal, useNarratorTerminals } from "../../hooks/useTerminals";
+import {
+	useCanOpenTerminals,
+	useCreateNarratorTerminal,
+	useNarratorTerminals,
+} from "../../hooks/useTerminals";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
 import { APP_HISTORY_SENTINEL, pushHistorySentinel } from "../../lib/history-state";
@@ -278,7 +282,10 @@ function NarratorDetailPage() {
 	const runningCount = (existingTerminals ?? []).filter((t: any) => t.status === "running").length;
 	const { mutate: createTerminal } = useCreateNarratorTerminal(narratorId);
 	const terminalCapability = useTerminalCapability();
-	const terminalSupported = terminalCapability.supported;
+	// Only a viewer known to have write access gets an auto-created terminal: not a read-only
+	// one (the server would refuse it), and not before the answer has arrived.
+	const canOpenTerminals = useCanOpenTerminals(narratorId);
+	const terminalSupported = terminalCapability.supported && canOpenTerminals === true;
 
 	// Terminal drawer for mobile
 	const [drawerOpened, { open: openDrawer, close: closeDrawer }] = useDisclosure(false);
@@ -305,22 +312,11 @@ function NarratorDetailPage() {
 		createTerminal,
 		openDrawer,
 	});
-	const writeToTerminalRef = useRef<((text: string) => void) | null>(null);
 	const appendInputRef = useRef<((text: string) => void) | null>(null);
 
 	// Terminal → Chat: append selected text to chat input (mobile drawer)
 	const handleSendToChat = useCallback((text: string) => {
 		appendInputRef.current?.(text);
-	}, []);
-
-	// Chat → Terminal: write selected text to terminal (mobile drawer)
-	const handleSendToTerminal = useCallback((text: string) => {
-		writeToTerminalRef.current?.(text);
-	}, []);
-
-	// Receive write function from NarratorTerminal (mobile drawer)
-	const handleWriteRef = useCallback((fn: ((text: string) => void) | null) => {
-		writeToTerminalRef.current = fn;
 	}, []);
 
 	const { t: tn } = useTranslation("narrator");
@@ -570,7 +566,6 @@ function NarratorDetailPage() {
 								onViewSubagentSession={onViewSubagentSession}
 								highlightMessageId={highlightMessageId}
 								highlightNeedle={highlightNeedle}
-								onSendToTerminal={isMobile && !isSubagent ? handleSendToTerminal : undefined}
 								appendInputRef={isMobile && !isSubagent ? appendInputRef : undefined}
 								terminalOpen={isMobile && !isSubagent ? drawerOpened : undefined}
 								onToggleTerminal={
@@ -616,7 +611,6 @@ function NarratorDetailPage() {
 									<NarratorTerminal
 										narratorId={narratorId}
 										onSendToChat={handleSendToChat}
-										onWriteRef={handleWriteRef}
 										onExit={handleTerminalExit}
 									/>
 								</Suspense>

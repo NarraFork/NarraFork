@@ -3,6 +3,7 @@ import { hotSafe } from "@server/lib/hot-safe";
 import { logger } from "@server/lib/logger";
 import { and, asc, eq, gt, inArray, or, sql } from "drizzle-orm";
 import type { BunSQLiteDatabase } from "drizzle-orm/bun-sqlite";
+import { type ReadQueryOptions, readQuery } from "../db/worker-read";
 import {
 	BackgroundOccupancyIndex,
 	isOccupancyNarratorSeed,
@@ -57,69 +58,80 @@ const taskColumns = {
 	subagentNarratorId: backgroundTasks.subagentNarratorId,
 };
 
-/** Injectable DB handle also exercises the real SQL against an isolated in-memory DB. */
+/** Injectable DB handle exercises real SQL against a committed file/WAL database. */
 export function createDatabaseBackgroundOccupancySource(
 	readDatabase: () => Promise<Pick<BunSQLiteDatabase, "select">>,
+	options: Pick<ReadQueryOptions, "signal" | "deadlineAt" | "timeoutMs"> = {},
 ): BackgroundOccupancySource {
 	return {
 		async scanNarrators(after, limit) {
 			const db = await readDatabase();
-			return db
-				.select(narratorColumns)
-				.from(narrators)
-				.where(after === null ? undefined : gt(narrators.id, after))
-				.orderBy(asc(narrators.id))
-				.limit(limit)
-				.all();
+			return readQuery(
+				db
+					.select(narratorColumns)
+					.from(narrators)
+					.where(after === null ? undefined : gt(narrators.id, after))
+					.orderBy(asc(narrators.id))
+					.limit(limit),
+				{ ...options, executionPolicy: "worker-required", maxRows: limit },
+			);
 		},
 		async scanTasks(after, limit) {
 			const db = await readDatabase();
-			return db
-				.select(taskColumns)
-				.from(backgroundTasks)
-				.where(after === null ? undefined : gt(backgroundTasks.id, after))
-				.orderBy(asc(backgroundTasks.id))
-				.limit(limit)
-				.all();
+			return readQuery(
+				db
+					.select(taskColumns)
+					.from(backgroundTasks)
+					.where(after === null ? undefined : gt(backgroundTasks.id, after))
+					.orderBy(asc(backgroundTasks.id))
+					.limit(limit),
+				{ ...options, executionPolicy: "worker-required", maxRows: limit },
+			);
 		},
 		async getNarrators(ids) {
 			const db = await readDatabase();
-			return db
-				.select(narratorColumns)
-				.from(narrators)
-				.where(inArray(narrators.id, ids))
-				.limit(PAGE_SIZE)
-				.all();
+			return readQuery(
+				db
+					.select(narratorColumns)
+					.from(narrators)
+					.where(inArray(narrators.id, ids))
+					.limit(PAGE_SIZE),
+				{ ...options, executionPolicy: "worker-required", maxRows: PAGE_SIZE },
+			);
 		},
 		async getTasks(ids) {
 			const db = await readDatabase();
-			return db
-				.select(taskColumns)
-				.from(backgroundTasks)
-				.where(inArray(backgroundTasks.id, ids))
-				.limit(PAGE_SIZE)
-				.all();
+			return readQuery(
+				db
+					.select(taskColumns)
+					.from(backgroundTasks)
+					.where(inArray(backgroundTasks.id, ids))
+					.limit(PAGE_SIZE),
+				{ ...options, executionPolicy: "worker-required", maxRows: PAGE_SIZE },
+			);
 		},
 		async getProjections(childId, after, limit) {
 			const db = await readDatabase();
-			return db
-				.select(taskColumns)
-				.from(backgroundTasks)
-				.where(
-					and(
-						or(
-							eq(backgroundTasks.id, childId),
-							and(
-								eq(backgroundTasks.type, "agent"),
-								eq(backgroundTasks.subagentNarratorId, childId),
+			return readQuery(
+				db
+					.select(taskColumns)
+					.from(backgroundTasks)
+					.where(
+						and(
+							or(
+								eq(backgroundTasks.id, childId),
+								and(
+									eq(backgroundTasks.type, "agent"),
+									eq(backgroundTasks.subagentNarratorId, childId),
+								),
 							),
+							after === null ? undefined : gt(backgroundTasks.id, after),
 						),
-						after === null ? undefined : gt(backgroundTasks.id, after),
-					),
-				)
-				.orderBy(asc(backgroundTasks.id))
-				.limit(limit)
-				.all();
+					)
+					.orderBy(asc(backgroundTasks.id))
+					.limit(limit),
+				{ ...options, executionPolicy: "worker-required", maxRows: limit },
+			);
 		},
 	};
 }
@@ -139,6 +151,7 @@ class OccupancyGenerationCancelled extends Error {}
 export class BackgroundOccupancyStore {
 	private index = new BackgroundOccupancyIndex();
 	private ready = false;
+	private stopped = false;
 	private generation = 0;
 	private worker: Promise<void> | null = null;
 	private failure: unknown = null;
@@ -164,6 +177,7 @@ export class BackgroundOccupancyStore {
 	}
 
 	ensureReady(): Promise<void> {
+		if (this.stopped) return Promise.reject(new Error("Background occupancy store stopped"));
 		if (this.worker) return this.worker;
 		if (this.ready && !this.failure) return Promise.resolve();
 		return this.launch(!this.ready);
@@ -177,6 +191,10 @@ export class BackgroundOccupancyStore {
 			await (this.worker ?? this.launch(false));
 		}
 		if (this.failure) throw this.failure;
+	}
+
+	async drain(): Promise<void> {
+		while (this.worker) await this.worker;
 	}
 
 	refreshTask(id: string): void {
@@ -212,7 +230,18 @@ export class BackgroundOccupancyStore {
 		this.schedule();
 	}
 
+	async stop(): Promise<void> {
+		this.stopped = true;
+		this.generation++;
+		try {
+			await this.worker;
+		} catch (error) {
+			if (!(error instanceof OccupancyGenerationCancelled)) throw error;
+		}
+	}
+
 	resetForTests(): void {
+		this.stopped = false;
 		this.generation++;
 		this.index = new BackgroundOccupancyIndex();
 		this.ready = false;
@@ -232,6 +261,11 @@ export class BackgroundOccupancyStore {
 
 	get isReady(): boolean {
 		return this.ready && !this.failure;
+	}
+
+	/** Stopped for shutdown: its counts are no longer read, not zero. */
+	get isStopped(): boolean {
+		return this.stopped;
 	}
 
 	getActiveTaskIds(parentId: string, opts?: OccupancyActiveTaskOptions): string[] {
@@ -276,7 +310,7 @@ export class BackgroundOccupancyStore {
 
 	private schedule(): void {
 		// Startup is explicit. Pre-start events stay queued for shadow replay.
-		if (this.ready && !this.worker) this.launch(false);
+		if (!this.stopped && this.ready && !this.worker) this.launch(false);
 	}
 
 	private launch(initial: boolean): Promise<void> {
@@ -308,7 +342,7 @@ export class BackgroundOccupancyStore {
 			.finally(() => {
 				if (this.worker === work) {
 					this.worker = null;
-					if (!this.failure && this.ready && this.hasDirty()) this.launch(false);
+					if (!this.stopped && !this.failure && this.ready && this.hasDirty()) this.launch(false);
 				}
 			});
 		return work;
@@ -522,6 +556,7 @@ export class BackgroundOccupancyStore {
 			const next = new Set<string>();
 			const checked: string[] = [];
 			const missing = new Set<string>();
+			const withoutProjection = new Set<string>();
 			for (let offset = 0; offset < frontier.length; offset += PAGE_SIZE) {
 				const batch = frontier.slice(offset, offset + PAGE_SIZE).filter((id) => !visited.has(id));
 				if (batch.length === 0) continue;
@@ -536,6 +571,7 @@ export class BackgroundOccupancyStore {
 				const found = new Set(rows.map((row) => row.id));
 				for (const id of batch) if (!found.has(id) && !removed.has(id)) missing.add(id);
 				for (const row of rows) {
+					if (!row.hasProjection) withoutProjection.add(row.id);
 					remember(row.id);
 					target.upsertNarrator(row);
 					if (row.type === "subagent" && row.parentNarratorId && !visited.has(row.parentNarratorId))
@@ -567,6 +603,7 @@ export class BackgroundOccupancyStore {
 					if (old) remember(old.parentNarratorId);
 					target.deleteTask(taskId);
 				}
+				if (withoutProjection.has(id)) continue;
 				await this.scan(
 					`projections:${id}`,
 					generation,
@@ -586,6 +623,10 @@ export class BackgroundOccupancyStore {
 			frontier = [...next];
 		}
 	}
+}
+
+export async function stopBackgroundOccupancy(): Promise<void> {
+	await backgroundOccupancyStore.stop();
 }
 
 export const backgroundOccupancyStore = hotSafe(

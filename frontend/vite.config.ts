@@ -6,7 +6,9 @@ import react from "@vitejs/plugin-react";
 import { bundledLanguagesAlias, bundledLanguagesInfo } from "shiki";
 import { defineConfig, type Plugin } from "vite";
 import { VitePWA } from "vite-plugin-pwa";
+import { frontendBuildDirectory } from "../scripts/lib/build-profile";
 import { resolveBuildGitHubRepository } from "../scripts/lib/build-repository";
+import { DEFAULT_DEV_FRONTEND_PORT, DEV_ALL_BACKEND_PORT } from "../server/lib/dev-app-url";
 import { injectSpaBaseHref } from "../server/lib/spa-base-href";
 import {
 	assertAppShellJavaScriptIsPrecached,
@@ -26,9 +28,12 @@ import {
 import { nativeModuleBoundary } from "./build/remote-boundaries";
 import { createShikiLanguageAliasMap } from "./build/shiki-language-aliases";
 
-const vitePort = Number(process.env.VITE_PORT) || 7778;
-const backendPort = Number(process.env.BACKEND_PORT) || 7779;
-const frontendOutDir = resolve(__dirname, "..", "dist", "frontend");
+const vitePort = Number(process.env.VITE_PORT) || Number(DEFAULT_DEV_FRONTEND_PORT);
+const backendPort = Number(process.env.BACKEND_PORT) || Number(DEV_ALL_BACKEND_PORT);
+const frontendOutDir = frontendBuildDirectory(
+	resolve(__dirname, ".."),
+	process.env.NF_BUILD_ALPHA_FRONTEND === "1",
+);
 /**
  * Path of the module `shikiLanguageAliases()` substitutes, normalized to forward
  * slashes. Vite hands `load()` ids with `/` separators even on Windows, while

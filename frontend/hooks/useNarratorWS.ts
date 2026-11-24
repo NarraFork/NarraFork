@@ -7,7 +7,18 @@ import {
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
 import type { TextDocumentStreamUpdate } from "@shared/pretext-layout/text-document";
 import { coerceProgressSnapshot, type ProgressSnapshot } from "@shared/progress-phase";
+import {
+	type ReasoningTranslationPatch,
+	type ReasoningTranslationStatusFrame,
+	readReasoningTranslationPatch,
+	readReasoningTranslationStatus,
+} from "@shared/reasoning-translation";
 import { readStreamingEditOrigin, type StreamingEditOrigin } from "@shared/streaming-edit-origin";
+import {
+	normalizeSubagentNestedSummary,
+	type SubagentNestedSummary,
+} from "@shared/subagent-nested";
+import { parseSubagentOutputCount, type SubagentOutputCount } from "@shared/subagent-output-counts";
 import {
 	normalizeSubagentToolInputSummary,
 	type SubagentToolInputSummary,
@@ -74,6 +85,11 @@ export function subagentToolEventMeta(data: Record<string, unknown>): SubagentTo
 	};
 	return {
 		toolCallId: typeof data.toolCallId === "string" ? data.toolCallId : null,
+		...(typeof data.executionAttempt === "number" &&
+		Number.isSafeInteger(data.executionAttempt) &&
+		data.executionAttempt >= 0
+			? { executionAttempt: data.executionAttempt }
+			: {}),
 		...(typeof data.blockId === "string" ? { blockId: data.blockId } : {}),
 		toolName: typeof data.toolName === "string" ? data.toolName : null,
 		createdAt:
@@ -86,7 +102,9 @@ export function subagentToolEventMeta(data: Record<string, unknown>): SubagentTo
 		model: nonEmptyString(data.model),
 		// Re-normalized rather than trusted: the same cap and key whitelist the server
 		// applied, so a hand-crafted frame cannot widen the payload the row renders.
-		inputSummary: normalizeSubagentToolInputSummary(data.inputSummary),
+		...(data.inputSummary !== undefined
+			? { inputSummary: normalizeSubagentToolInputSummary(data.inputSummary) }
+			: {}),
 	};
 }
 
@@ -97,6 +115,7 @@ function normalizeSubagentActivityHeader(value: unknown): SubagentToolCallHeader
 	const eventMeta = subagentToolEventMeta(record);
 	return {
 		toolCallId: typeof record.toolCallId === "string" ? record.toolCallId : null,
+		...(eventMeta.executionAttempt != null ? { executionAttempt: eventMeta.executionAttempt } : {}),
 		toolUseId: record.toolUseId,
 		toolName: record.toolName,
 		status: typeof record.status === "string" ? record.status : "initializing",
@@ -108,7 +127,9 @@ function normalizeSubagentActivityHeader(value: unknown): SubagentToolCallHeader
 		// Reconnect catch-up ships the SAME server-side projection the REST fetch does
 		// (`loadLatestSubagentToolCalls`). Dropping it here re-blanked every row the
 		// moment a reconnect snapshot replaced the fetched activity.
-		...(eventMeta.inputSummary ? { inputSummary: eventMeta.inputSummary } : {}),
+		...(eventMeta.inputSummary != null || record.inputSummary === null
+			? { inputSummary: eventMeta.inputSummary }
+			: {}),
 	};
 }
 
@@ -217,6 +238,7 @@ function normalizeSubagentActivitySummary(value: unknown): SubagentActivitySumma
 		: [];
 	const reasoningEffort = nonEmptyString(record.reasoningEffort);
 	const fileChanges = normalizeSubagentFileChanges(record.fileChanges);
+	const nested = normalizeSubagentNestedSummary(record.nested);
 	return {
 		subagentNarratorId:
 			typeof record.subagentNarratorId === "string" ? record.subagentNarratorId : null,
@@ -224,6 +246,7 @@ function normalizeSubagentActivitySummary(value: unknown): SubagentActivitySumma
 		...(reasoningEffort ? { reasoningEffort } : {}),
 		...(fileChanges ? { fileChanges } : {}),
 		...(record.takenOver === true ? { takenOver: true } : {}),
+		...(nested && nested.total > 0 ? { nested } : {}),
 		latestToolCalls,
 	};
 }
@@ -353,6 +376,7 @@ export function coerceReflectionProgressEvent(
 
 export interface SubagentToolEventMeta {
 	toolCallId?: string | null;
+	executionAttempt?: number;
 	/** The tool block the event is about, in the block-keyed protocol (§8.2). */
 	blockId?: string | null;
 	toolName?: string | null;
@@ -587,7 +611,12 @@ export interface NarratorWSCallbacks {
 	) => void;
 	onToolLongRunning?: (toolUseId: string, elapsed: number, parentToolUseId?: string) => void;
 	onTimeoutUpdated?: (toolUseId: string, timeoutMs: number) => void;
-	onToolOutput?: (toolUseId: string, output: string, parentToolUseId?: string) => void;
+	onToolOutput?: (
+		toolUseId: string,
+		output: string,
+		parentToolUseId?: string,
+		meta?: { subagentOutputCount?: SubagentOutputCount },
+	) => void;
 	/**
 	 * A determinate "N of M done" measurement from a running tool (TransferFile),
 	 * rendered as an actual progress bar rather than parsed out of its text output.
@@ -811,6 +840,15 @@ export interface NarratorWSCallbacks {
 		toolUseId?: string;
 		takenOver: boolean;
 	}) => void;
+	/**
+	 * The helpers a first-level subagent launched changed (ACL root's page only). Replaces
+	 * the card's nested rows; `toolUseId` names the card, best-effort.
+	 */
+	onSubagentNestedChanged?: (info: {
+		subagentNarratorId: string;
+		toolUseId?: string;
+		nested: SubagentNestedSummary;
+	}) => void;
 	onSubagentWarning?: (subagentNarratorId: string, info: NarratorWarningInfo) => void;
 	onSubagentConclusionUpdated?: (
 		subagentNarratorId: string,
@@ -840,6 +878,8 @@ export interface NarratorWSCallbacks {
 		replacement?: MessageReplacementAliases,
 	) => void;
 	onMessageUpdated?: (message: TreeMessage, replacement?: MessageReplacementAliases) => void;
+	onReasoningTranslationPatch?: (patch: ReasoningTranslationPatch) => void;
+	onReasoningTranslationStatus?: (frame: ReasoningTranslationStatusFrame) => void;
 	onPresenceUpdate?: (
 		viewers: Array<{
 			userId: string;
@@ -854,6 +894,7 @@ export interface NarratorWSCallbacks {
 		parentToolUseId?: string;
 	}) => void;
 	onStreamingSnapshot?: (snapshot: {
+		subagentOutputCounts?: SubagentOutputCount[];
 		model?: string;
 		provider?: string;
 		streamingBlocks: Array<
@@ -885,6 +926,7 @@ export interface NarratorWSCallbacks {
 		>;
 		toolChunks: Array<{
 			toolUseId: string;
+			executionAttempt?: number;
 			toolName: string;
 			inputCharsTotal: number;
 			parentToolUseId?: string;
@@ -921,7 +963,11 @@ export interface NarratorWSCallbacks {
 	 * persisted, so nothing else will retire them — drop them or they stay
 	 * "running" forever with a live elapsed timer.
 	 */
-	onToolUseDiscarded?: (toolUseIds: string[], parentToolUseId?: string) => void;
+	onToolUseDiscarded?: (
+		toolUseIds: string[],
+		parentToolUseId?: string,
+		subagentNarratorId?: string,
+	) => void;
 }
 
 export function useNarratorWS(
@@ -1003,6 +1049,16 @@ export function useNarratorWS(
 				// Guard: discard messages targeting a different narrator
 				if (data.narratorId && data.narratorId !== subscribedId) return;
 				switch (data.type) {
+					case "reasoning_translation_status": {
+						const frame = readReasoningTranslationStatus(data);
+						if (frame) callbackOwner.callbacks.onReasoningTranslationStatus?.(frame);
+						break;
+					}
+					case "reasoning_translation_patch": {
+						const patch = readReasoningTranslationPatch(data);
+						if (patch) callbackOwner.callbacks.onReasoningTranslationPatch?.(patch);
+						break;
+					}
 					case "message":
 						callbackOwner.callbacks.onMessage?.(
 							data as { message?: TreeMessage; [key: string]: unknown },
@@ -1263,13 +1319,21 @@ export function useNarratorWS(
 							data.timeoutMs as number,
 						);
 						break;
-					case "tool_output":
+					case "tool_output": {
+						const count = parseSubagentOutputCount(data.subagentOutputCount);
+						if (
+							data.subagentOutputCount !== undefined &&
+							(!count || count.toolUseId !== data.toolUseId)
+						)
+							break;
 						callbackOwner.callbacks.onToolOutput?.(
 							data.toolUseId as string,
 							data.output as string,
 							data.parentToolUseId as string | undefined,
+							count ? { subagentOutputCount: count } : undefined,
 						);
 						break;
+					}
 					case "tool_structured_progress": {
 						// Validated rather than cast: a malformed frame must degrade to a
 						// barless card, not to a bar reading `NaN%`.
@@ -1711,6 +1775,16 @@ export function useNarratorWS(
 							takenOver: data.takenOver === true,
 						});
 						break;
+					case "subagent_nested_changed": {
+						const nested = normalizeSubagentNestedSummary(data.nested);
+						if (nested && typeof data.subagentNarratorId === "string")
+							callbackOwner.callbacks.onSubagentNestedChanged?.({
+								subagentNarratorId: data.subagentNarratorId,
+								toolUseId: nonEmptyString(data.toolUseId) ?? undefined,
+								nested,
+							});
+						break;
+					}
 					case "subagent_warning":
 						callbackOwner.callbacks.onSubagentWarning?.(data.subagentNarratorId as string, {
 							message: data.message as string,
@@ -1791,6 +1865,14 @@ export function useNarratorWS(
 						break;
 					case "streaming_snapshot":
 						callbackOwner.callbacks.onStreamingSnapshot?.({
+							...(Array.isArray(data.subagentOutputCounts)
+								? {
+										subagentOutputCounts: data.subagentOutputCounts.flatMap((value) => {
+											const count = parseSubagentOutputCount(value);
+											return count ? [count] : [];
+										}),
+									}
+								: {}),
 							model: nonEmptyString(data.model) ?? undefined,
 							provider: nonEmptyString(data.provider) ?? undefined,
 							streamingBlocks: (data.streamingBlocks ?? []) as Array<
@@ -1877,6 +1959,7 @@ export function useNarratorWS(
 						callbackOwner.callbacks.onToolUseDiscarded?.(
 							(data.toolUseIds ?? []) as string[],
 							data.parentToolUseId as string | undefined,
+							nonEmptyString(data.subagentNarratorId) ?? undefined,
 						);
 						break;
 				}

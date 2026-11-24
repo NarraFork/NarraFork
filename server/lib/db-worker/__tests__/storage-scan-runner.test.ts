@@ -253,7 +253,7 @@ describe("object scan deadlines and fallback", () => {
 	let sqlite: Database;
 	beforeEach(async () => {
 		sqlite = new Database(":memory:");
-		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "2";
+		process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "3";
 	});
 	afterEach(async () => {
 		mock.restore();

@@ -16,7 +16,11 @@ neutralizeAmbientProxyEnv();
 // 管理器令牌只留在本进程内存里。放在拉起任何子进程之前，终端和 Bash 就复制不到它。
 captureManagerTokenFromEnv();
 
-if (parseRevealActivation(process.argv)) {
+if (process.argv[2] === "changelists") {
+	// Offline commands never initialize the application database, manager or HTTP service.
+	const { runGitChangelistCli } = await import("./services/git-changelist-cli");
+	process.exitCode = await runGitChangelistCli(process.argv);
+} else if (parseRevealActivation(process.argv)) {
 	// `narrafork://` activation (Windows "reveal in Explorer"): a short-lived client of the running
 	// server, so it never touches settings, the database or the port. See lib/reveal-protocol.ts.
 	const { runRevealProtocolClient } = await import("./lib/reveal-protocol-client");

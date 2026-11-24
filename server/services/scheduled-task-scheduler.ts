@@ -1,5 +1,6 @@
 import { hotTimer, hotTimerClear } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
+import { isUnattendedShutdownFenced } from "../lib/shutdown-activity";
 import { scheduledTaskService } from "./scheduled-task-service";
 
 const TIMER_KEY = "scheduled-task-scheduler";
@@ -7,9 +8,13 @@ const TICK_INTERVAL_MS = 30_000;
 
 let ticking = false;
 
+export function isScheduledTaskTickActive(): boolean {
+	return ticking;
+}
+
 /** Poll for due tasks and fire them. Guards against overlapping ticks. */
 async function tick(): Promise<void> {
-	if (ticking) return;
+	if (ticking || isUnattendedShutdownFenced()) return;
 	ticking = true;
 	try {
 		const due = await scheduledTaskService.listDue();

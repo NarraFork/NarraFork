@@ -13,6 +13,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import * as fileHistoryPolicy from "@shared/file-change-protocol";
 import { eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
 import { db, sqlite } from "../db";
@@ -31,6 +32,7 @@ import { generateId } from "../lib/id";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import * as spawn from "../lib/spawn";
 import { projectRoutes } from "../routes/projects";
+import { captureWorkerRejection } from "./__tests__/narrator-worker-fixture";
 import { narratorCreationWorkspaceTarget, narratorService } from "./narrator-service";
 import * as narratorSession from "./narrator-session";
 import { FileWorktreeJournal, worktreeReceiptHasResourceEffect } from "./narrator-worktree-journal";
@@ -474,7 +476,7 @@ for (const kind of ["create", "subagent", "fork", "forkFromMessages"] as const) 
 		expect((await narratorService.getById(narratorId)).replyContext).toBeNull();
 		await withProjectRetirement(projectId, async () => {
 			const before = changes();
-			await expect(action()).rejects.toBeInstanceOf(ResourceProtectionError);
+			expect(await captureWorkerRejection(action())).toBeInstanceOf(ResourceProtectionError);
 			expect(changes()).toBe(before);
 			expect((await narratorService.getById(narratorId)).replyContext).toBeNull();
 		});
@@ -524,7 +526,7 @@ for (const kind of ["create", "subagent", "extract"] as const) {
 					})
 					.where(eq(narrators.id, narratorId));
 			const before = changes();
-			await expect(action()).rejects.toBeInstanceOf(ResourceProtectionError);
+			expect(await captureWorkerRejection(action())).toBeInstanceOf(ResourceProtectionError);
 			expect(changes()).toBe(before);
 			expect((await narratorService.getById(narratorId)).replyContext).toBeNull();
 		});
@@ -746,8 +748,16 @@ async function shadowBirthFixture() {
 	// Keep that separate observer inert so total_changes measures the actual sink.
 	spyOn(observations, "begin").mockResolvedValue(null);
 	spyOn(observations, "finish").mockResolvedValue(undefined);
-	const capture = () =>
-		withSnapshotCaptureReceipts(observations, () => worktreeTreeSnapshot.capture(path));
+	const capture = async () => {
+		const policy = spyOn(fileHistoryPolicy, "isFileHistoryEnabledForDevice").mockReturnValue(true);
+		try {
+			return await withSnapshotCaptureReceipts(observations, () =>
+				worktreeTreeSnapshot.capture(path),
+			);
+		} finally {
+			policy.mockRestore();
+		}
+	};
 	const assertRetained = (before: number | undefined, capturedHash?: string) => {
 		if (capturedHash) expect(changes()).toBeGreaterThan(before ?? 0);
 		else expect(changes()).toBe(before);
@@ -776,6 +786,125 @@ async function shadowBirthFixture() {
 	};
 	return { dir, capture, assertRetained, stageFromInit };
 }
+
+function expectOnlyLifecycleGitProbes(commands: readonly (readonly string[])[]) {
+	for (const command of commands)
+		expect(command).toEqual([
+			"git",
+			"--no-optional-locks",
+			"-C",
+			expect.any(String),
+			"rev-parse",
+			"--path-format=absolute",
+			"--show-toplevel",
+			"--git-common-dir",
+		]);
+}
+
+async function shadowAncestorNarrator() {
+	const id = generateId();
+	otherNarrators.push(id);
+	const now = new Date().toISOString();
+	await db.insert(narrators).values({
+		id,
+		title: "isolated shadow ancestor cwd",
+		cwd: getNarraforkPath(),
+		workspaceContext: {
+			revision: 1,
+			deviceId: "local",
+			cwd: getNarraforkPath("tree-snapshots"),
+			pathFlavor: "posix",
+			contextKey: "shadow-ancestor-fixture",
+			capabilities: { switchDirectory: true },
+		},
+		createdAt: now,
+		updatedAt: now,
+	});
+	return id;
+}
+
+test("actual cold capture permits path-only raw and workspace ancestors in the isolated home", async () => {
+	const { dir, capture } = await shadowBirthFixture();
+	const ancestorId = await shadowAncestorNarrator();
+	expect(await capture()).toMatch(/^[0-9a-f]{40}$/);
+	expect(fs.existsSync(join(dir, "HEAD"))).toBe(true);
+	expect(fs.existsSync(join(dir, "nf-shadow-init"))).toBe(false);
+	const deletion = mock(async () => undefined);
+	await expect(
+		withProtectionReservation([{ path: dir }], "shadow destroy", deletion),
+	).rejects.toMatchObject({
+		code: "RESOURCE_PROTECTED",
+		inspection: { claims: [{ kind: "narrator", id: ancestorId }] },
+	});
+	expect(deletion).not.toHaveBeenCalled();
+});
+
+for (const suffix of ["", "/nested-cwd"]) {
+	test(`a published shadow retains ${suffix ? "descendant" : "exact"} narrator retirement protection`, async () => {
+		const { dir, capture, assertRetained } = await shadowBirthFixture();
+		const id = await shadowAncestorNarrator();
+		await db
+			.update(narrators)
+			.set({
+				workspaceContext: {
+					revision: 2,
+					deviceId: "local",
+					cwd: `${dir}${suffix}`,
+					pathFlavor: "posix",
+					contextKey: "shadow-exact-fixture",
+					capabilities: { switchDirectory: true },
+				},
+			})
+			.where(eq(narrators.id, id));
+		const before = changes();
+		const hash = await capture();
+		expect(hash).toMatch(/^[a-f0-9]{40,64}$/);
+		const git = spyOn(spawn, "safeSpawn");
+		const deletion = mock(async () => undefined);
+		await expect(
+			withProtectionReservation([{ path: dir }], "shadow destroy", deletion),
+		).rejects.toMatchObject({ code: "RESOURCE_PROTECTED" });
+		expectOnlyLifecycleGitProbes(git.mock.calls.map(([opts]) => opts.cmd));
+		expect(deletion).not.toHaveBeenCalled();
+		expect(fs.existsSync(join(dir, "HEAD"))).toBe(true);
+		assertRetained(before, hash);
+	});
+}
+
+test("a repository-bearing workspace ancestor protects the published shadow from retirement", async () => {
+	const { dir, capture, assertRetained } = await shadowBirthFixture();
+	const id = await shadowAncestorNarrator();
+	await db
+		.update(narrators)
+		.set({
+			workspaceContext: {
+				revision: 2,
+				deviceId: "local",
+				cwd: getNarraforkPath("tree-snapshots"),
+				pathFlavor: "posix",
+				contextKey: "shadow-resource-fixture",
+				capabilities: { switchDirectory: true },
+				git: {
+					workspaceKey: "shadow-resource-fixture",
+					repositoryKey: "fixture-repository",
+					rootPath: getNarraforkPath(),
+				},
+			},
+		})
+		.where(eq(narrators.id, id));
+	const before = changes();
+	const hash = await capture();
+	expect(hash).toMatch(/^[a-f0-9]{40,64}$/);
+	const git = spyOn(spawn, "safeSpawn");
+	const deletion = mock(async () => undefined);
+	await expect(
+		withProtectionReservation([{ path: dir }], "shadow destroy", deletion),
+	).rejects.toMatchObject({ code: "RESOURCE_PROTECTED" });
+	expectOnlyLifecycleGitProbes(git.mock.calls.map(([opts]) => opts.cmd));
+	expect(deletion).not.toHaveBeenCalled();
+	expect(fs.existsSync(join(dir, "HEAD"))).toBe(true);
+	assertRetained(before, hash);
+});
 
 for (const kind of ["cwd", "registry"] as const) {
 	test(`cold initialization accepts an independent ${kind} reference to a missing cache while destruction stays protected`, async () => {
@@ -930,6 +1059,78 @@ for (const headOnly of [false, true]) {
 		expect(deletion).toHaveBeenCalledTimes(0);
 		assertRetained(before);
 		expect(await readFile(join(dir, "marker.bin"))).toEqual(marker);
+	});
+}
+
+test("capture retains an unknown shadow below ordinary cwd ancestors before git", async () => {
+	const { dir, capture, assertRetained } = await shadowBirthFixture();
+	await mkdir(dir, { recursive: true });
+	await writeFile(join(dir, "unknown.bin"), "retained unknown directory");
+	await shadowAncestorNarrator();
+	const git = spyOn(spawn, "safeSpawn");
+	const before = changes();
+	await expect(capture()).rejects.toBeInstanceOf(TreeSnapshotError);
+	expect(git).not.toHaveBeenCalled();
+	expect(await readFile(join(dir, "unknown.bin"), "utf8")).toBe("retained unknown directory");
+	assertRetained(before);
+});
+
+test("a fresh retry below cwd ancestors preserves the failed private stage", async () => {
+	const { dir, capture, assertRetained, stageFromInit } = await shadowBirthFixture();
+	let failedStage = "";
+	const init = spyOn(spawn, "safeSpawn").mockImplementation(async (opts) => {
+		failedStage = stageFromInit(opts.cmd);
+		return failedShadowInit;
+	});
+	await expect(capture()).rejects.toThrow("fixture shadow init failure");
+	const birth = fs.lstatSync(failedStage);
+	const marker = await readFile(join(failedStage, "nf-shadow-init"));
+	expect(fs.existsSync(dir)).toBe(false);
+	init.mockRestore();
+	await shadowAncestorNarrator();
+	const before = changes();
+	const hash = await capture();
+	expect(hash).toMatch(/^[a-f0-9]{40,64}$/);
+	expect(fs.lstatSync(failedStage).ino).toBe(birth.ino);
+	expect(await readFile(join(failedStage, "nf-shadow-init"))).toEqual(marker);
+	assertRetained(before, hash);
+});
+
+test("a dangling physical shadow leaf is refused before it can create its missing destination", async () => {
+	const { dir, capture, assertRetained } = await shadowBirthFixture();
+	const destination = join(temporary, "missing-symlink-destination");
+	await mkdir(getNarraforkPath("tree-snapshots"), { recursive: true });
+	await symlink(destination, dir);
+	await shadowAncestorNarrator();
+	const git = spyOn(spawn, "safeSpawn");
+	const before = changes();
+	await expect(capture()).rejects.toThrow("shadow directory must not be a symbolic link");
+	expect(git).not.toHaveBeenCalled();
+	expect(fs.lstatSync(dir).isSymbolicLink()).toBe(true);
+	expect(fs.existsSync(destination)).toBe(false);
+	assertRetained(before);
+});
+
+for (const replacement of ["inode", "symlink"]) {
+	test(`private staging rejects a ${replacement} replacement below cwd ancestors`, async () => {
+		const { dir, capture, assertRetained, stageFromInit } = await shadowBirthFixture();
+		await shadowAncestorNarrator();
+		const backup = join(temporary, "original-shadow-birth");
+		let stage = "";
+		const init = spyOn(spawn, "safeSpawn").mockImplementation(async (opts) => {
+			stage = stageFromInit(opts.cmd);
+			await rename(stage, backup);
+			if (replacement === "inode") await mkdir(stage);
+			else await symlink(backup, stage);
+			return { exitCode: 0, stdout: "", stderr: "" };
+		});
+		const before = changes();
+		await expect(capture()).rejects.toBeInstanceOf(TreeSnapshotError);
+		expect(init).toHaveBeenCalledTimes(1);
+		expect(fs.existsSync(join(backup, "nf-shadow-init"))).toBe(true);
+		expect(fs.lstatSync(stage).isSymbolicLink()).toBe(replacement === "symlink");
+		expect(fs.existsSync(dir)).toBe(false);
+		assertRetained(before);
 	});
 }
 
@@ -1166,6 +1367,8 @@ test("reserving one checkout does not block a sibling session using the same rep
 });
 
 test("actual cold snapshot initialization allows shared subagents and unrelated local/remote admissions", async () => {
+	// Exercise the retained capture algorithm independently of local production policy.
+	spyOn(fileHistoryPolicy, "isFileHistoryEnabledForDevice").mockReturnValue(true);
 	const initialized = await spawn.safeSpawn({
 		cmd: ["git", "init", path],
 		timeout: 5000,

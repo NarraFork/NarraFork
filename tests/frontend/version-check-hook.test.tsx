@@ -62,6 +62,10 @@ test("mount, reconnect, foreground, online and SW hints probe live health; unmou
 			sw.dispatchEvent(new MessageEvent("message", { data: { type: "VERSION_MISMATCH" } })),
 		);
 		expect(requests).toBe(5);
+		await act(async () =>
+			sw.dispatchEvent(new MessageEvent("message", { data: { type: "GET_VERSION" } })),
+		);
+		expect(requests).toBe(5);
 	} finally {
 		await act(async () => root.unmount());
 	}

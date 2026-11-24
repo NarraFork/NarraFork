@@ -213,8 +213,8 @@ describe("a user-continued run delivers its own result once", () => {
 				if (status === "cancelled")
 					await controlRun("notice-child", { kind: "cancel", reason: "Stopped by user" });
 				await handle.terminal;
-				runtimePublication.flushRecipient("notice-parent");
-				runtimePublication.flushRecipient("notice-parent");
+				await runtimePublication.flushRecipient("notice-parent");
+				await runtimePublication.flushRecipient("notice-parent");
 				const rows = db
 					.select()
 					.from(narratorBufferedMessages)
@@ -238,7 +238,7 @@ describe("a user-continued run delivers its own result once", () => {
 				expect(formatted).not.toContain("OLD RESULT");
 				if (result.length > 12000) {
 					expect(formatted).toContain("truncated");
-					expect(formatted).toContain("Await(");
+					expect(formatted).toContain("Watch(");
 				}
 				// The destination's conclusion is this run's, not the superseded one.
 				const call = db

@@ -1,6 +1,6 @@
 import { publishAskInPassingEvent } from "@frontend/lib/ask-in-passing-events";
 import { notifications } from "@mantine/notifications";
-import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
+import { FILE_CHANGE_LIMITS, isFileHistoryEnabledForDevice } from "@shared/file-change-protocol";
 import type { SubagentModelPools } from "@shared/subagent-model-policy";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -16,6 +16,7 @@ import {
 } from "../lib/api";
 import {
 	type BlockTarget,
+	type NarratorDetail,
 	type RevertAction,
 	type RevertActionConfirmOptions,
 	type RevertActionPreview,
@@ -44,6 +45,11 @@ import {
 	isRevertHistoryCommitted,
 } from "../lib/revert-result";
 import { recentTabsSectionQueryKey, removeRecentTabCascade } from "./useRecentTabs";
+import {
+	currentWorkspaceContext,
+	isWorkspaceContextIdentity,
+	useWorkspaceContext,
+} from "./useWorkspaceContext";
 
 const FILE_PREVIEW_QUERY_GC_TIME_MS = 30_000;
 const NARRATORS_LIST_GC_TIME_MS = 60_000;
@@ -76,6 +82,7 @@ export function useNarratorsPaginated(opts?: {
 	hasContainers?: boolean;
 	hasRunningContainers?: boolean;
 	hasViewers?: boolean;
+	groupAskInPassing?: boolean;
 }) {
 	return useInfiniteQuery<PaginatedNarrators>({
 		queryKey: ["narrators", "paginated", { ...opts }],
@@ -137,6 +144,7 @@ interface RevertPreviewRequest {
 	action: RevertAction;
 	target: RevertActionTarget;
 	key: string;
+	workspaceContextKey: string;
 	recoveryMode?: "snapshot";
 }
 
@@ -184,32 +192,49 @@ export function useRevertActionPreview(
 	action: RevertAction,
 	target: RevertActionTarget | null,
 ) {
+	// Only a resolved, revisioned workspace identifies the current execution device.
+	// Missing context and device-switch transitions must not look like local sessions.
+	const workspace = useWorkspaceContext(narratorId);
+	const historyEnabled = isWorkspaceContextIdentity(workspace.data)
+		? isFileHistoryEnabledForDevice(workspace.data.deviceId)
+		: undefined;
 	const [revision, setRevision] = useState(0);
 	const [snapshotTarget, setSnapshotTarget] = useState<{
 		narratorId: string;
 		action: RevertAction;
 		target: RevertActionTarget;
+		contextKey: string;
 	} | null>(null);
 	const snapshotRequested =
 		!!target &&
 		snapshotTarget?.target === target &&
 		snapshotTarget.narratorId === narratorId &&
-		snapshotTarget.action === action;
+		snapshotTarget.action === action &&
+		snapshotTarget.contextKey === workspace.data?.contextKey;
 	useEffect(() => {
 		if (!snapshotRequested) setSnapshotTarget(null);
 	}, [snapshotRequested]);
 	const request = useMemo<RevertPreviewRequest | null>(
 		() =>
-			target && narratorId
+			target && narratorId && historyEnabled === true
 				? {
 						narratorId,
 						action,
 						target: { ...target },
 						key: newRevertPreviewKey(revision),
+						workspaceContextKey: workspace.data?.contextKey ?? "",
 						...(snapshotRequested ? { recoveryMode: "snapshot" as const } : {}),
 					}
 				: null,
-		[narratorId, action, target, revision, snapshotRequested],
+		[
+			narratorId,
+			action,
+			target,
+			revision,
+			snapshotRequested,
+			historyEnabled,
+			workspace.data?.contextKey,
+		],
 	);
 	const [state, setState] = useState<RevertPreviewState | null>(null);
 	const [invalidated, setInvalidated] = useState<RevertPreviewRequest | null>(null);
@@ -433,10 +458,10 @@ export function useRevertActionPreview(
 		setRevision((value) => value + 1);
 	}, []);
 	const requestSnapshotRestore = useCallback(() => {
-		if (!target || !narratorId) return;
-		setSnapshotTarget({ narratorId, action, target });
+		if (!target || !narratorId || historyEnabled !== true || !workspace.data?.contextKey) return;
+		setSnapshotTarget({ narratorId, action, target, contextKey: workspace.data.contextKey });
 		setRevision((value) => value + 1);
-	}, [narratorId, action, target]);
+	}, [narratorId, action, target, historyEnabled, workspace.data?.contextKey]);
 	const invalidate = useCallback(() => {
 		setInvalidated(request);
 		if (active.current?.request === request) active.current?.controller.abort();
@@ -445,7 +470,11 @@ export function useRevertActionPreview(
 		data,
 		previewKey: request?.key,
 		historySummary: current?.response?.historySummary ?? null,
-		isLoading: !!request && !revoked && (!current || current.loading),
+		contextReady: historyEnabled !== undefined,
+		messagesOnly: historyEnabled === false,
+		isLoading:
+			(!!target && historyEnabled === undefined && !workspace.isError) ||
+			(!!request && !revoked && (!current || current.loading)),
 		reload,
 		requestSnapshotRestore,
 		invalidate,
@@ -454,6 +483,7 @@ export function useRevertActionPreview(
 
 /** File+history apply is already one transaction. Never follow it with a legacy delete. */
 export function useRevertHistoryAction(narratorId: string) {
+	useWorkspaceContext(narratorId);
 	const qc = useQueryClient();
 	const { t } = useTranslation("narrator");
 	return useMutation({
@@ -467,6 +497,10 @@ export function useRevertHistoryAction(narratorId: string) {
 			target: BlockTarget;
 			opts: RevertActionConfirmOptions;
 		}) => {
+			const workspace = currentWorkspaceContext(qc, narratorId);
+			if (!workspace) throw new Error(t("revertPlanReloadRequired"));
+			const messagesOnly = !isFileHistoryEnabledForDevice(workspace.deviceId);
+			if (messagesOnly && !opts.skipRevert) throw new Error(t("revertPlanReloadRequired"));
 			if (opts.skipRevert) {
 				const result =
 					action === "rollback_to_block"
@@ -655,7 +689,7 @@ export function useResumeRecoverySubagents() {
 			narratorId: string;
 			messageId: string;
 			subagentIds: string[];
-			mode: "notify" | "await";
+			mode: "notify" | "watch";
 		}) => api.resumeRecoverySubagents(narratorId, { messageId, subagentIds, mode }),
 		onSuccess: (data, { narratorId }) => {
 			qc.invalidateQueries({ queryKey: ["narrators", narratorId, "messages"] });
@@ -853,8 +887,23 @@ export function useUpdateSubagentConclusion() {
 export function useTakeoverSubagent() {
 	const qc = useQueryClient();
 	return useMutation({
-		mutationFn: (id: string) => api.takeoverSubagent(id),
-		onSuccess: (_data, id) => {
+		mutationFn: async (id: string) => {
+			// 409 means the run is between passes; it settles within moments.
+			const MAX_ATTEMPTS = 4;
+			const RETRY_DELAY_MS = 400;
+			for (let attempt = 0; ; attempt++) {
+				try {
+					return await api.takeoverSubagent(id);
+				} catch (err) {
+					const isSettling = err instanceof ApiError && err.status === 409;
+					if (!isSettling || attempt >= MAX_ATTEMPTS - 1) throw err;
+					await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+				}
+			}
+		},
+		// A refusal (e.g. the session delivers no result) also refetches, so the composer
+		// learns what the server knows and offers Stop instead of a takeover that fails.
+		onSettled: (_data, _error, id) => {
 			qc.invalidateQueries({ queryKey: ["narrators", id] });
 		},
 	});
@@ -1190,6 +1239,19 @@ export function useUpdateModel() {
 		mutationFn: ({ id, model }: { id: string; model: string }) =>
 			api.updateNarratorModel(id, model),
 		onSuccess: (_data, vars) => {
+			// The PATCH has succeeded; do not wait for a second round-trip to show the selection.
+			qc.setQueryData<NarratorDetail>(
+				["narrators", vars.id],
+				(current: NarratorDetail | undefined) =>
+					current && current.model !== vars.model
+						? {
+								...current,
+								model: vars.model,
+								runtimeModel: undefined,
+								modelInheritance: undefined,
+							}
+						: current,
+			);
 			// Changing the model abandons the unavailable model's wait condition, so
 			// dismiss its persistent notification even if the server does not emit a
 			// recovery event for the old model.

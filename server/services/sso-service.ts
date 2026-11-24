@@ -20,6 +20,7 @@ import { LDAP_PROVIDER_PREFIX } from "@server/lib/ldap/protocol";
 import type { OidcClaims } from "@server/lib/oidc";
 import type { OidcProviderConfig } from "@server/lib/settings/types";
 import { and, eq } from "drizzle-orm";
+import { readQuery, readQueryFirst } from "../db/worker-read";
 
 /** Derive a valid, available username from a raw candidate. */
 async function deriveUniqueUsername(rawCandidate: string): Promise<string> {
@@ -36,10 +37,14 @@ async function deriveUniqueUsername(rawCandidate: string): Promise<string> {
 	// Probe for availability, appending a short suffix on collision.
 	for (let attempt = 0; attempt < 8; attempt++) {
 		const candidate = attempt === 0 ? base : `${base}-${generateId(4).toLowerCase()}`.slice(0, 50);
-		const existing = await db.query.users.findFirst({
-			where: eq(users.username, candidate),
-			columns: { id: true },
-		});
+		const existing = await readQueryFirst(
+			db.query.users.findMany({
+				limit: 1,
+				where: eq(users.username, candidate),
+				columns: { id: true },
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		if (!existing) return candidate;
 	}
 	// Extremely unlikely fallback.
@@ -105,9 +110,13 @@ async function resolveExternalLogin(
 	const subject = (input.subject ?? "").trim();
 	if (!subject) throw new AppError("Identity subject is missing", 400, "SSO_SUBJECT_MISSING");
 
-	const identity = await db.query.userIdentities.findFirst({
-		where: and(eq(userIdentities.provider, input.provider), eq(userIdentities.subject, subject)),
-	});
+	const identity = await readQueryFirst(
+		db.query.userIdentities.findMany({
+			limit: 1,
+			where: and(eq(userIdentities.provider, input.provider), eq(userIdentities.subject, subject)),
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 
 	if (identity) {
 		await db
@@ -210,9 +219,12 @@ async function resolveExternalLogin(
 export const ssoService = {
 	/** List a user's linked SSO identities. */
 	async listIdentities(userId: string): Promise<SsoIdentitySummary[]> {
-		const rows = await db.query.userIdentities.findMany({
-			where: eq(userIdentities.userId, userId),
-		});
+		const rows = await readQuery(
+			db.query.userIdentities.findMany({
+				where: eq(userIdentities.userId, userId),
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		return rows.map((r) => ({
 			id: r.id,
 			provider: r.provider,
@@ -253,9 +265,16 @@ export const ssoService = {
 		provider: OidcProviderConfig,
 		claims: OidcClaims,
 	): Promise<{ ok: boolean; reason?: "already_linked_other" }> {
-		const existing = await db.query.userIdentities.findFirst({
-			where: and(eq(userIdentities.provider, provider.id), eq(userIdentities.subject, claims.sub)),
-		});
+		const existing = await readQueryFirst(
+			db.query.userIdentities.findMany({
+				limit: 1,
+				where: and(
+					eq(userIdentities.provider, provider.id),
+					eq(userIdentities.subject, claims.sub),
+				),
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		if (existing) {
 			if (existing.userId !== userId) return { ok: false, reason: "already_linked_other" };
 			// Idempotent: refresh informational claims.

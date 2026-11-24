@@ -1,3 +1,5 @@
+import type { ToolResultImagesMode } from "./tool-result-images";
+
 /** TokenDance's fixed identity is attribution, not this installation's callback origin. */
 export const TOKENDANCE_APP_URL = "https://tokendanceconnect.narrafork.dev/";
 export const TOKENDANCE_ORIGIN = "https://tokendance.space";
@@ -49,6 +51,7 @@ export function selectTokenDanceProtocol(
 
 /** Never include an API Key in this public connection DTO. */
 export interface TokenDancePublicConnection {
+	toolResultImages?: ToolResultImagesMode;
 	connected: boolean;
 	name: string;
 	disabled: boolean;

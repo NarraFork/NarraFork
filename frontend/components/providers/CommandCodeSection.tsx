@@ -24,12 +24,14 @@ import {
 	Group,
 	Loader,
 	Progress,
+	Select,
 	Stack,
 	Switch,
 	Text,
 	TextInput,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
+import type { ToolResultImagesMode } from "@shared/tool-result-images";
 import { IconRefresh } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
 import { useCallback, useState } from "react";
@@ -251,6 +253,22 @@ export function CommandCodeSection({
 						extraHeaders: value.extraHeaders,
 					}}
 					onChange={(next) => onChange({ ...value, ...next })}
+				/>
+
+				<Select
+					label={t("commandcode.toolResultImages")}
+					description={t("commandcode.toolResultImagesDesc")}
+					size="xs"
+					data={[
+						{ value: "off", label: t("commandcode.toolResultImagesOff") },
+						{ value: "inline", label: t("commandcode.toolResultImagesInline") },
+						{ value: "separate", label: t("commandcode.toolResultImagesSeparate") },
+					]}
+					value={value.toolResultImages ?? "off"}
+					allowDeselect={false}
+					onChange={(next) =>
+						onChange({ ...value, toolResultImages: (next ?? "off") as ToolResultImagesMode })
+					}
 				/>
 
 				{!isLoading && !data?.loggedIn && commandCodeReasonText(t, data?.reason) && (

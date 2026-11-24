@@ -100,7 +100,7 @@ html[data-nf-wco] .nf-nav-brand-row :is(button, a, input, [role="button"], .mant
 		-webkit-app-region: drag;
 	}
 
-	html[data-nf-wco] .nf-app-shell:has([data-nf-wco-titlebar]) .nf-wco-top-gap {
+	html[data-nf-wco][data-nf-wco-titlebar-page] .nf-wco-top-gap {
 		display: none;
 	}
 
@@ -124,11 +124,13 @@ html[data-nf-wco] .nf-nav-brand-row :is(button, a, input, [role="button"], .mant
  * Pages whose top edge is already a row of headers (the session page) are the title bar
  * themselves instead of sitting under the empty strip: `data-nf-wco-titlebar` on the
  * page root pulls it up over the strip, and `useWcoTitlebarRows` (lib/wco-titlebar.ts)
- * marks the headers that touch the top edge. Those headers grow to the overlay height,
+ * mirrors it as `data-nf-wco-titlebar-page` on <html> (no `:has()`: it made every DOM
+ * insertion in the shell restyle the whole page) and marks the headers that touch the top
+ * edge. Those headers grow to the overlay height,
  * drag the window from their blank area, and the one at the right edge stays clear of
  * the window buttons (the left edge too, for buttons on the left over a collapsed rail).
  */
-html[data-nf-wco] .nf-app-shell-main:has([data-nf-wco-titlebar]) .nf-wco-main-strip {
+html[data-nf-wco][data-nf-wco-titlebar-page] .nf-wco-main-strip {
 	display: none;
 }
 

@@ -155,6 +155,41 @@ describe("maintained background occupancy graph", () => {
 		expect(index.snapshot(["root"]).occupied).toEqual(new Set(["root"]));
 	});
 
+	test("archiving a legacy subagent clears occupancy and wake work despite a stale running flag", () => {
+		const index = new BackgroundOccupancyIndex();
+		const child = narrator("child", "root", { backgroundStatus: "running" });
+		index.upsertNarrator(child);
+		index.rebuild();
+		expect(index.getActiveWakeWorkCount("root")).toBe(1);
+
+		index.upsertNarrator({ ...child, status: "archived" });
+		index.rebuild();
+		expect(index.snapshot(["root"]).counts.get("root")?.activeCount).toBe(0);
+		expect(index.getActiveWakeWorkCount("root")).toBe(0);
+		expect(index.getActiveLegacyIds("root")).toEqual([]);
+	});
+
+	test("archival does not hide real runtime work, active descendants or a running projection", () => {
+		const index = new BackgroundOccupancyIndex();
+		const child = narrator("child", "root", { status: "archived", backgroundStatus: "running" });
+		index.upsertNarrator(child);
+		index.setRuntimeLive(child.id, true);
+		index.rebuild();
+		expect(index.getActiveWakeWorkCount("root")).toBe(1);
+
+		index.setRuntimeLive(child.id, false);
+		index.upsertNarrator(narrator("leaf", child.id, { status: "working" }));
+		index.rebuild();
+		expect(index.getOccupiedChildIds("root")).toEqual([child.id]);
+		expect(index.getAncestorIds("leaf")).toEqual([child.id, "root"]);
+
+		index.upsertNarrator(narrator("leaf", child.id));
+		index.upsertNarrator({ ...child, hasProjection: true });
+		index.upsertTask(task("projection", "root", { type: "agent", subagentNarratorId: child.id }));
+		index.rebuild();
+		expect(index.getActiveTaskIds("root")).toEqual(["projection"]);
+	});
+
 	test("terminal unified projection excludes stale legacy running; live descendants revive it", () => {
 		const index = new BackgroundOccupancyIndex();
 		index.upsertNarrator(

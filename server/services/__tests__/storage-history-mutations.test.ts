@@ -47,8 +47,9 @@ const { toTurns } = await import("../../lib/agent/projection/turns");
 (await import("../../db/fts")).ensureFts(sqlite, { wasClean: true });
 const { withIdleNarratorCleanupAdmission } = await import("../narrator-session-state");
 let afterBodyRead: (() => unknown) | null = null;
+const runReadTask = pool.runReadTask;
 const read = spyOn(pool, "runReadTask").mockImplementation(async (_path, params) => {
-	if (params.kind !== "storageHistoryBody") throw new Error("unexpected worker task");
+	if (params.kind !== "storageHistoryBody") return runReadTask(_path, params);
 	const result = runStorageHistoryBody(sqlite, params);
 	await afterBodyRead?.();
 	return result as never;
@@ -67,10 +68,11 @@ beforeEach(() => {
 			[id, OLD, OLD],
 		);
 });
-afterAll(() => {
+afterAll(async () => {
 	read.mockRestore();
 	sync.stopBlockSyncSweep();
 	mock.module("../../db", () => realDbModule);
+	await pool.shutdownDbWorkerPool();
 	sqlite.close();
 	rmSync(directory, { recursive: true, force: true });
 });

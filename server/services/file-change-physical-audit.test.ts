@@ -436,13 +436,13 @@ if (process.argv.includes(flag)) {
 						build.onResolve(
 							{
 								filter:
-									/^\.\/(?:serve|manager\/main|db\/integrity-probe-worker|db\/snapshot-builder-worker|lib\/watcher\/parcel-watcher-worker|lib\/reveal-protocol-client)$/,
+									/^\.\/(?:serve|manager\/main|db\/integrity-probe-worker|db\/snapshot-builder-worker|lib\/watcher\/parcel-watcher-worker|lib\/reveal-protocol-client|services\/git-changelist-cli)$/,
 							},
 							(args) => ({ path: args.path, namespace: "forbidden-app" }),
 						);
 						build.onLoad({ filter: /.*/, namespace: "forbidden-app" }, () => ({
 							contents:
-								'throw new Error("application imported by audit"); export const serve = () => {}; export const exitWithStartupProblem = () => {}; export const runManager = () => {}; export const runRevealProtocolClient = () => {};',
+								'throw new Error("application imported by audit"); export const serve = () => {}; export const exitWithStartupProblem = () => {}; export const runManager = () => {}; export const runRevealProtocolClient = () => {}; export const runGitChangelistCli = () => {};',
 							loader: "ts",
 						}));
 					},

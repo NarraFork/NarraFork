@@ -26,6 +26,7 @@ import {
 	usesToolLoading,
 } from "../../lib/agent/tool-loading";
 import type { ToolDefinition } from "../../lib/agent/types";
+import type { ModelHistoryPreparation } from "../../lib/model-history-preparation";
 import { isTopLevelMessage, type OwnTurnPlacement } from "../../lib/runtime-source";
 import { trackAgentMessageHistory } from "../agent-message-delivery";
 
@@ -64,6 +65,8 @@ export interface RuntimeHistoryOptions {
 	/** Explicit server-local cwd only; never a remote workspace path. */
 	attachmentCwd?: string;
 	attachmentSignal?: AbortSignal;
+	deadline?: number;
+	preparation?: ModelHistoryPreparation;
 	/**
 	 * Optional tools whose presence follows session loading, and the currently loaded
 	 * ones. When set, loads inside the history keep the request's tool array fixed.
@@ -216,8 +219,11 @@ export async function buildRuntimeHistory(
 			await import("../narrator-service")
 		).narratorService.getModelHistorySinceLastCompact(options.narratorId, undefined, {
 			signal: options.attachmentSignal,
+			deadline: options.deadline,
+			preparation: options.preparation,
 		}));
 	checkBudget();
+	options.preparation?.recordPhase("placement");
 	const ownPlacement =
 		options.ownTurnPlacement !== undefined
 			? options.ownTurnPlacement
@@ -225,6 +231,7 @@ export async function buildRuntimeHistory(
 	checkBudget();
 	// Detach mutable row arrays and block metadata, not huge text payloads,
 	// so shared/COW source rows remain unchanged during provider projection.
+	options.preparation?.recordPhase("mapping");
 	let modelMessages = sourceMessages
 		.filter((message) => message.role !== "disp")
 		.map((message) => ({
@@ -240,11 +247,13 @@ export async function buildRuntimeHistory(
 		}));
 	let currentInput = options.currentInput;
 	if (options.attachmentCwd) {
+		options.preparation?.recordPhase("attachments");
 		const prepared = await projectAttachmentLocations(modelMessages, {
 			cwd: options.attachmentCwd,
 			narratorId: options.narratorId,
 			currentInput,
 			signal: options.attachmentSignal,
+			preparation: options.preparation,
 		});
 		modelMessages = prepared.messages;
 		currentInput = prepared.currentInput;
@@ -296,6 +305,7 @@ export async function buildRuntimeHistory(
 		};
 	}
 	checkBudget();
+	options.preparation?.recordPhase("toolState");
 	const toolLoadingState = loading
 		? deriveToolLoadingState(
 				// Prefix epochs also track built-ins becoming available (e.g. devices).
@@ -332,6 +342,9 @@ export async function buildRuntimeHistory(
 	// Full Await outputs remain intact until the actual provider-input boundary.
 	// A builder may omit/move a user receipt (or a prebuilt child may replace
 	// this history), so row presence alone is not a safe deduplication decision.
+	options.preparation?.recordPhase("projection");
+	options.preparation?.count("messages", modelMessages.length);
+	options.preparation?.count("tools", loading?.candidates?.length ?? 0);
 	const built = await buildHistory(
 		modelMessages,
 		options.model,
@@ -354,6 +367,7 @@ export async function buildRuntimeHistory(
 		// Receipt guards must compare the same bytes the model receives, especially
 		// grouped agent messages whose markers are inserted between item bodies.
 		modelMessages.map(projectMessageSenderForModel),
+		{ signal: options.attachmentSignal, deadlineAt: options.deadline },
 	);
 	// The history carries every persisted row, the current input included; only text no
 	// row holds is still sent as the request's current content.

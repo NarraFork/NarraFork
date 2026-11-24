@@ -27,6 +27,7 @@ import {
 	listAwaitedAsyncQuestionIds,
 } from "./narrator-question-service";
 import { pendingDangerReflections, pendingPermissions } from "./narrator-session-state";
+import { teamIdOfNarrator } from "./teams/team-membership";
 
 const SUMMARY_CHARS = 240;
 const TITLE_CHARS = 160;
@@ -157,7 +158,11 @@ function requestContext(principal: NarratorPrincipal, signal?: AbortSignal) {
 				cached = (async () => {
 					const row = await loadNarrator(id, principal);
 					if (!row) return null;
-					return { row, canAct: await canWriteNarrator(row, principal) };
+					const canAct = await canWriteNarrator(row, principal);
+					// A call of a team tree waits for a member (M1): an onlooker of the team, who
+					// cannot act on it, does not get it in their attention list (or its count).
+					if (!canAct && teamIdOfNarrator(row.id)) return null;
+					return { row, canAct };
 				})();
 				narratorsById.set(id, cached);
 			}

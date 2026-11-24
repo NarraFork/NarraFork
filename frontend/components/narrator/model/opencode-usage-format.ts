@@ -1,4 +1,4 @@
-import { isOpencodeGoBaseUrl } from "@shared/opencode-go-endpoint";
+import { identifyService } from "@shared/sourcing/identify";
 import type { OpencodeUsageCache, OpencodeUsageWindow } from "../../../lib/api/types";
 import { formatLocaleDateTime } from "../../../lib/intl-format";
 
@@ -30,7 +30,7 @@ export function opencodeUsageFailed(usage: OpencodeUsageCache): boolean {
  * key on a third party.
  */
 export function isOpencodeProviderBaseUrl(baseUrl?: string): boolean {
-	return isOpencodeGoBaseUrl(baseUrl);
+	return identifyService({ baseUrl }).templateId === "opencode-go";
 }
 
 function formatResetTime(resetsAt: string | null): string | null {

@@ -1,4 +1,16 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { isUnattendedShutdownFenced } from "./lib/shutdown-activity";
+
+const requestWork = new AsyncLocalStorage<Promise<unknown>[]>();
+
+/** Keep a streaming operation tracked even if the client cancels its response. */
+export function trackStreamingRequestWork<T>(run: (stream: T) => Promise<void>) {
+	return (stream: T) => {
+		const work = run(stream);
+		requestWork.getStore()?.push(work);
+		return work;
+	};
+}
 
 /** Completion is the end/cancellation of the body, not the creation of Response. */
 export function createServerRequestLifecycle() {
@@ -9,7 +21,7 @@ export function createServerRequestLifecycle() {
 	return {
 		context,
 		get accepting() {
-			return accepting;
+			return accepting && !isUnattendedShutdownFenced();
 		},
 		get activeCount() {
 			return active.size;
@@ -30,21 +42,36 @@ export function createServerRequestLifecycle() {
 				await Promise.allSettled(pending);
 			}
 		},
+		run(
+			id: number,
+			request: Request,
+			execute: () => Promise<Response | undefined>,
+			trackBody: boolean,
+		) {
+			const work: Promise<unknown>[] = [];
+			const execution = context.run(id, () => requestWork.run(work, execute));
+			return this.track(id, request, execution, trackBody, work);
+		},
 		track(
 			id: number,
 			request: Request,
 			execution: Promise<Response | undefined>,
 			trackBody = false,
+			work: Promise<unknown>[] = [],
 		) {
 			let finish!: () => void;
 			let abort = () => {};
 			const completion = new Promise<void>((resolve) => {
 				finish = resolve;
 			});
-			const done = () => {
+			const finishRequest = () => {
 				request.signal.removeEventListener("abort", onAbort);
 				active.delete(id);
 				finish();
+			};
+			const done = () => {
+				if (work.length) void Promise.allSettled(work).then(finishRequest);
+				else finishRequest();
 			};
 			const onAbort = () => abort();
 			active.set(id, { completion, abort: () => abort() });

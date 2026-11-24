@@ -215,6 +215,11 @@ export const ERROR_CATALOG = {
 		code: "GIT_AUTH_REQUIRED",
 		en: "Git authentication required",
 	},
+	GIT_REQUEST_CANCELLED: {
+		status: 499,
+		code: "GIT_REQUEST_CANCELLED",
+		en: "Git request was cancelled",
+	},
 
 	// --- auth / session --------------------------------------------------------
 	AUTH_REQUIRED: {
@@ -231,6 +236,11 @@ export const ERROR_CATALOG = {
 		status: 401,
 		code: "TOKEN_EXPIRED",
 		en: "Session revoked",
+	},
+	DATABASE_READ_UNAVAILABLE: {
+		status: 503,
+		code: "DATABASE_READ_UNAVAILABLE",
+		en: "The database is busy. Try again in a few seconds.",
 	},
 	TOKEN_INVALID: {
 		status: 401,

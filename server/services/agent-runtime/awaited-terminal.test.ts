@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, expect, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	runtimeAwaitedTerminalConsumptions as consumptions,
 	narratorBufferedMessages as mailboxRows,
@@ -9,10 +9,15 @@ import {
 	narrators,
 	runtimePublicationOutbox as outboxRows,
 } from "../../db/schema";
+import {
+	closeRuntimeTestDb,
+	getRuntimeTestDb as getTestDb,
+} from "../__tests__/agent-runtime-test-database";
 import { createMailboxStore } from "./mailbox";
 import { createPublicationOutbox, type PublicationRun } from "./publication-outbox";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, ready } = getTestDb();
+await ready;
 const mailbox = createMailboxStore(db);
 let publisher = createPublicationOutbox(db);
 const time = "2026-10-02T00:00:00.000Z";
@@ -40,7 +45,7 @@ beforeEach(() => {
 		.run();
 	publisher = createPublicationOutbox(db);
 });
-afterAll(() => sqlite.close());
+afterAll(async () => await closeRuntimeTestDb(sqlite));
 
 test("Await before deferred commit is durable across store recreation, reservation retry and mailbox GC", () => {
 	publisher.reserveRunSlots(run);

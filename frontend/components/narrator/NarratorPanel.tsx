@@ -22,6 +22,7 @@ import { notifications } from "@mantine/notifications";
 import { parseProviderWaitInfo } from "@shared/agent-protocol/quota-exhausted";
 import { DEFAULT_CONTEXT_THRESHOLDS } from "@shared/context-thresholds";
 import { tailRoleAllowsContinue } from "@shared/continue-tail";
+import { isFileHistoryEnabledForDevice } from "@shared/file-change-protocol";
 import type {
 	FileReference,
 	FileReferenceContext,
@@ -87,10 +88,11 @@ import {
 } from "../../hooks/usePlatform";
 import { useProviderBalance } from "../../hooks/useProviderBalance";
 import { useNarratorCurrentTask } from "../../hooks/useTaskBoard";
-import { useNarratorTerminals } from "../../hooks/useTerminals";
+import { useCanOpenTerminals, useNarratorTerminals } from "../../hooks/useTerminals";
 import { useTokenDanceBalance } from "../../hooks/useTokenDanceBalance";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 import {
+	currentWorkspaceContext,
 	useUpdateExecutionDevice,
 	useWorkspaceContext,
 	workspaceDirectoryRequiredDeviceId,
@@ -131,7 +133,6 @@ import {
 import { openTokenDanceRecharge } from "../../lib/tokendance-recovery";
 import { Z } from "../../lib/z-index";
 import { useConfirmDialog } from "../common/confirm-dialog-context";
-import { SelectionPopover } from "../common/SelectionPopover";
 import { TruncatedPath } from "../common/TruncatedPath";
 import { MobileNavButton } from "../nav/MobileNavButton";
 import { buildPluginDockPanelOpenRequest } from "../plugins/PluginContributionPicker";
@@ -143,6 +144,7 @@ import {
 } from "./background/BackgroundTasksDrawer";
 import { COMPACTING_MARKER_ATTR, CompactSummaryModalCtx } from "./compact/compact-summary-modal";
 import { useCompactSummaryModal } from "./compact/use-compact-summary-modal";
+import { resolveCanTakeover } from "./composer/composer-action-slot";
 import type { FileReferenceScopeValue } from "./composer/FileReferenceScope";
 import type { NarratorComposerHandle, NarratorRemoteDraft } from "./composer/NarratorComposer";
 import { ContentViewerEnvironmentProvider } from "./content/ContentViewer";
@@ -168,6 +170,7 @@ import type { NarratorToolbarBadgeCounts } from "./header/narrator-toolbar-badge
 import type { NarratorToolbarHost } from "./header/narrator-toolbar-items";
 import { useHeaderToolbar } from "./header/use-header-toolbar";
 import { DropOverlay } from "./interaction/DropOverlay";
+import { isFastModeSubagent } from "./interaction/fast-mode-state";
 import { buildMobileToolbarActions } from "./interaction/mobile-toolbar-actions";
 import { returnFromModelTrace } from "./interaction/model-trace-return";
 import {
@@ -297,7 +300,6 @@ function NarratorPanelBody({
 	highlightMessageId,
 	highlightRequestId,
 	highlightNeedle,
-	onSendToTerminal,
 	appendInputRef,
 	terminalOpen,
 	onToggleTerminal,
@@ -823,6 +825,7 @@ function NarratorPanelBody({
 
 	// Active terminal count for badge indicator
 	const { data: narratorTerminals } = useNarratorTerminals(narratorId);
+	const canOpenTerminals = useCanOpenTerminals(narratorId);
 	const activeTerminalCount = useMemo(
 		() => narratorTerminals?.filter((t) => t.status === "running").length ?? 0,
 		[narratorTerminals],
@@ -855,8 +858,15 @@ function NarratorPanelBody({
 				return false;
 			}
 			try {
+				const currentWorkspace = currentWorkspaceContext(qc, narratorId);
+				if (!currentWorkspace) throw new Error(t("revertPlanReloadRequired"));
+				if (!isFileHistoryEnabledForDevice(currentWorkspace.deviceId) && !revertOpts.skipRevert)
+					throw new Error(t("revertPlanReloadRequired"));
+				const confirmedOpts = !isFileHistoryEnabledForDevice(currentWorkspace.deviceId)
+					? { skipRevert: true }
+					: revertOpts;
 				const result = await api.editAndRegenerate(narratorId, messageId, newContent, {
-					...revertOpts,
+					...confirmedOpts,
 					...opts,
 					inputBlockId: inputBlockIdOf(chunkListRef.current, messageId),
 				});
@@ -1210,8 +1220,7 @@ function NarratorPanelBody({
 	}, [isWorkspacePreview, scrollToBottom, suppressAutoFocusOnPromote]);
 
 	// --- WebSocket + real-time state ---
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	const isSubagent = !!(fetchedNarrator as any)?.variant?.startsWith("subagent:");
+	const isSubagent = isFastModeSubagent(narrator ?? {});
 
 	// Parse persisted substatus from narrator data to seed the WS hook's reducer
 	const narratorSubstatus = useMemo(() => {
@@ -1600,21 +1609,14 @@ function NarratorPanelBody({
 		[currentTaskData],
 	);
 	// Terminal toggle: dock context takes precedence over onToggleTerminal.
-	const terminalToolAvailable = !REMOTE_BUILD && (!!dock || !!onToggleTerminal);
+	// Hidden from read-only viewers: opening a terminal needs write access.
+	const terminalToolAvailable =
+		!REMOTE_BUILD && (!!dock || !!onToggleTerminal) && canOpenTerminals !== false;
 	const terminalToolOpened = dock ? dock.openToolTypes.has("terminal") : (terminalOpen ?? false);
 	const toggleTerminalTool = useCallback(() => {
 		if (dock) dock.toggleToolPanel("terminal");
 		else onToggleTerminal?.();
 	}, [dock, onToggleTerminal]);
-	// Chat → terminal "send selection": prefer the explicit prop, else bridge
-	// through the dock context (writes to the terminal panel if one is open).
-	const dockWriteTerminalStdin = dock?.writeTerminalStdin;
-	const effSendToTerminal = useMemo<((text: string) => void) | undefined>(() => {
-		if (REMOTE_BUILD) return undefined;
-		if (onSendToTerminal) return onSendToTerminal;
-		if (dock && terminalToolOpened && dockWriteTerminalStdin) return dockWriteTerminalStdin;
-		return undefined;
-	}, [onSendToTerminal, dock, terminalToolOpened, dockWriteTerminalStdin]);
 
 	// ── Plugin panel picker (dock surfaces only) ──
 	// Opens a plugin UI contribution as a dockview sibling panel. Params are
@@ -1711,7 +1713,13 @@ function NarratorPanelBody({
 	// tool call stays blocked. canTakeover is shown only while the subagent is
 	// running and not already taken over.
 	const isTakenOver = isSubagent && substatus.includes("taken_over");
-	const canTakeover = isSubagent && isActive && !isTakenOver && retryRecoveryAllowsInterrupt;
+	const canTakeover = resolveCanTakeover({
+		isSubagent,
+		isActive,
+		isTakenOver,
+		retryRecoveryAllowsInterrupt,
+		deliversResult: narrator?.deliversResult,
+	});
 	/**
 	 * Whether the composer may offer the cut-in (priority queue) action.
 	 *
@@ -3590,14 +3598,6 @@ function NarratorPanelBody({
 							</Box>
 						)}
 
-						{effSendToTerminal && (
-							<SelectionPopover
-								containerRef={contentRef}
-								onAction={effSendToTerminal}
-								label={tt("sendToTerminal")}
-							/>
-						)}
-
 						{/* Scroll to bottom button */}
 						{!isWorkspacePreview && (
 							<Box
@@ -3809,6 +3809,9 @@ function NarratorPanelBody({
 							reasoningEffortMutation,
 							updateSettingsMutation,
 							narratorFastModeOverride: narrator.fastModeOverride,
+							effectiveFastMode: narrator.effectiveFastMode,
+							fastModeSource: narrator.fastModeSource,
+							isSubagent,
 							fastModeDefault,
 							fastModeUsesTapSettings,
 							fastModeMutation,

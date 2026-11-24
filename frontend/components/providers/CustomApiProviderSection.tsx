@@ -8,12 +8,14 @@ import {
 	Paper,
 	PasswordInput,
 	SegmentedControl,
+	Select,
 	Stack,
 	Switch,
 	Text,
 	TextInput,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
+import type { ToolResultImagesMode } from "@shared/tool-result-images";
 import { IconRefresh, IconTrash } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -643,6 +645,22 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 						onChange={(e) => updateProvider("nativeSearch", e.currentTarget.checked)}
 					/>
 				)}
+
+				<Select
+					label={t("toolResultImages")}
+					description={t("toolResultImagesDesc")}
+					size="xs"
+					data={[
+						{ value: "off", label: t("toolResultImagesOff") },
+						{ value: "inline", label: t("toolResultImagesInline") },
+						{ value: "separate", label: t("toolResultImagesSeparate") },
+					]}
+					value={provider.toolResultImages ?? "off"}
+					allowDeselect={false}
+					onChange={(value) =>
+						updateProvider("toolResultImages", (value ?? "off") as ToolResultImagesMode)
+					}
+				/>
 
 				<Divider />
 				<Group gap="xs">

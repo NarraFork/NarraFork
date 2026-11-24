@@ -8,6 +8,7 @@ import {
 	NarratorWSManager,
 	shouldDeliverToListener,
 } from "./narrator-ws-manager";
+import { withSocketTimers } from "./ws-test-utils";
 
 describe("complete input document lane ordering", () => {
 	test("snapshot and seal descriptors are not overtaken by immediate live input deltas", async () => {
@@ -1261,6 +1262,85 @@ function withSilencedWarn(fn: () => void): void {
 }
 
 describe("reconnect resilience", () => {
+	test("times out a silent handshake and reconnects through backoff", () => {
+		withMockBrowserGlobals(() =>
+			withSocketTimers((fire) => {
+				const manager = new NarratorWSManager();
+				try {
+					manager.connect();
+					const socket = MockWebSocket.instances[0];
+					fire(10_000);
+					expect(manager.disconnected).toBe(true);
+					expect(reconnectInternals(manager).reconnectAttempts).toBe(1);
+					fire(1000);
+					expect(socket?.readyState).toBe(MockWebSocket.CLOSED);
+					expect(MockWebSocket.instances).toHaveLength(2);
+				} finally {
+					manager.disconnect();
+				}
+			}),
+		);
+	});
+	test("opening cancels the handshake deadline", () => {
+		withMockBrowserGlobals(() =>
+			withSocketTimers((fire) => {
+				const manager = new NarratorWSManager();
+				try {
+					manager.connect();
+					const socket = MockWebSocket.instances[0];
+					if (!socket) throw new Error("Missing socket");
+					socket.readyState = MockWebSocket.OPEN;
+					socket.onopen?.();
+					fire(10_000);
+					expect(manager.connected).toBe(true);
+					expect(MockWebSocket.instances).toHaveLength(1);
+				} finally {
+					manager.disconnect();
+				}
+			}),
+		);
+	});
+	test("credential generations identify the token used by the live socket, not a later cache update", () => {
+		withMockBrowserGlobals(() => {
+			let token = "account-A-token";
+			const storage = patchGlobal("localStorage", {
+				getItem: (key: string) => (key === "narrafork_token" ? token : null),
+			});
+			const manager = new NarratorWSManager();
+			try {
+				manager.connect();
+				const oldSocket = MockWebSocket.instances.at(-1);
+				if (!oldSocket) throw new Error("Missing first socket");
+				oldSocket.readyState = MockWebSocket.OPEN;
+				oldSocket.onopen?.();
+				const first = manager.getCredentialIdentity();
+				expect(typeof first).toBe("number");
+				expect(manager.getConnectionCredentialIdentity()).toBe(first);
+				token = "account-B-token";
+				const next = manager.getCredentialIdentity();
+				expect(next).not.toBe(first);
+				expect(manager.getConnectionCredentialIdentity()).toBe(first);
+				token = "account-A-token";
+				expect(manager.getCredentialIdentity()).toBe(first);
+				token = "account-B-token";
+				expect(manager.getCredentialIdentity()).toBe(next);
+				manager.reconnect();
+				expect(manager.getConnectionCredentialIdentity()).toBeUndefined();
+				oldSocket.onopen?.();
+				expect(manager.connected).toBe(false);
+				const newSocket = MockWebSocket.instances.at(-1);
+				if (!newSocket || newSocket === oldSocket) throw new Error("Missing replacement socket");
+				expect(newSocket.url).toContain("account-B-token");
+				newSocket.readyState = MockWebSocket.OPEN;
+				newSocket.onopen?.();
+				expect(manager.getConnectionCredentialIdentity()).toBe(next);
+				expect(manager.getCredentialIdentity()).toBe(next);
+			} finally {
+				manager.disconnect();
+				restoreGlobal(storage);
+			}
+		});
+	});
 	test("reconnects after a graceful server shutdown (1001) instead of never retrying", () => {
 		withMockBrowserGlobals(() => {
 			const manager = new NarratorWSManager();

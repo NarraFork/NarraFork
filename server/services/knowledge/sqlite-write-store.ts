@@ -51,9 +51,10 @@ import {
 	specProtectedTasks,
 } from "../../db/schema";
 import { withDbRetry } from "../../lib/db-resilience";
-import { ValidationError } from "../../lib/errors";
+import { AppError, ValidationError } from "../../lib/errors";
 import { generateId } from "../../lib/id";
 import { claimNextRevisionVersion, type KnowledgeWriteTx } from "./revision-version";
+import { assertDraftVersion } from "./write-guards";
 import type {
 	AclAuditEventWrite,
 	AclGrantRowWrite,
@@ -102,6 +103,26 @@ import {
 
 /** Transaction handle as produced by `db.transaction((tx) => …`. SQLite-side only. */
 type Tx = KnowledgeWriteTx;
+
+function assertCurrentDraftVersion(
+	tx: Tx,
+	input: RebaseDraftContentWrite | CreateSubmissionWrite,
+): void {
+	const current = tx
+		.select({
+			contentHash: knowledgeDrafts.contentHash,
+			baseRevisionId: knowledgeDrafts.baseRevisionId,
+			updatedAt: knowledgeDrafts.updatedAt,
+			status: knowledgeDrafts.status,
+			title: knowledgeDrafts.title,
+			targetCollectionId: knowledgeDrafts.targetCollectionId,
+			keywordsJson: knowledgeDrafts.keywordsJson,
+		})
+		.from(knowledgeDrafts)
+		.where(eq(knowledgeDrafts.id, input.draftId))
+		.get();
+	assertDraftVersion(current, input.expectedDraft);
+}
 
 /**
  * Extended result codes the driver puts on `errno` for a uniqueness conflict (the
@@ -359,6 +380,14 @@ function commitMergedRevisionSection(tx: Tx, input: CommitMergedRevisionWrite): 
 		throw new ValidationError("Submission was already reviewed by someone else");
 	}
 
+	const entry = tx
+		.select({ currentRevisionId: knowledgeEntries.currentRevisionId })
+		.from(knowledgeEntries)
+		.where(eq(knowledgeEntries.id, input.entryId))
+		.get();
+	if (!entry || entry.currentRevisionId !== input.expectedMainRevisionId) {
+		throw new AppError("Main revision changed; reload and retry", 409, "KNOWLEDGE_MAIN_CONFLICT");
+	}
 	const nextVersion = claimNextRevisionVersion(tx, input.entryId);
 	tx.insert(knowledgeRevisions)
 		.values({
@@ -648,6 +677,7 @@ export const sqliteKnowledgeWriteStore: KnowledgeWriteStore = {
 
 	async rebaseDraftContent(input: RebaseDraftContentWrite): Promise<InvalidatedSubmissionRef[]> {
 		return db.transaction((tx) => {
+			assertCurrentDraftVersion(tx, input);
 			tx.update(knowledgeDrafts)
 				.set({
 					content: input.content,
@@ -663,6 +693,7 @@ export const sqliteKnowledgeWriteStore: KnowledgeWriteStore = {
 
 	async createSubmissionGuarded(input: CreateSubmissionWrite): Promise<KnowledgeSubmissionRow> {
 		return db.transaction((tx) => {
+			assertCurrentDraftVersion(tx, input);
 			// Guard against duplicate/concurrent submissions: refuse if this draft already
 			// has an open (pending/conflict) request awaiting review. Checked inside the
 			// section so two concurrent submits can't both pass.
@@ -715,6 +746,22 @@ export const sqliteKnowledgeWriteStore: KnowledgeWriteStore = {
 
 	async setSubmissionReviewVerdict(input: SetSubmissionVerdictWrite): Promise<void> {
 		db.transaction((tx) => {
+			const fresh = tx
+				.select({ status: knowledgeSubmissions.status })
+				.from(knowledgeSubmissions)
+				.where(eq(knowledgeSubmissions.id, input.submissionId))
+				.get();
+			if (
+				!fresh ||
+				fresh.status !== input.expectedStatus ||
+				!(CLAIMABLE_SUBMISSION_STATUSES as readonly string[]).includes(fresh.status)
+			) {
+				throw new AppError(
+					"Submission changed; reload and retry",
+					409,
+					"KNOWLEDGE_SUBMISSION_CONFLICT",
+				);
+			}
 			tx.update(knowledgeSubmissions)
 				.set({
 					status: input.status as "changes_requested",

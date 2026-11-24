@@ -25,6 +25,7 @@ import { generateId } from "../../lib/id";
 import { knowledgeRoutes } from "../../routes/knowledge";
 import { knowledgeBranchService } from "../knowledge-branch-service";
 import { knowledgeService } from "../knowledge-service";
+import { captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 const TAG = Date.now();
 
@@ -212,8 +213,14 @@ describe("reject verdict", () => {
 		await knowledgeBranchService.review(admin, submissionId, { verdict: "reject" });
 
 		// This is the whole point of reject vs request_changes.
-		expect(knowledgeBranchService.resubmit(owner, submissionId, {})).rejects.toThrow();
-		expect(knowledgeBranchService.withdrawSubmission(owner, submissionId)).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(knowledgeBranchService.resubmit(owner, submissionId, {})),
+		).toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				knowledgeBranchService.withdrawSubmission(owner, submissionId),
+			),
+		).toThrow();
 
 		const row = await db.query.knowledgeSubmissions.findFirst({
 			where: eq(knowledgeSubmissions.id, submissionId),
@@ -225,8 +232,10 @@ describe("reject verdict", () => {
 		const { submissionId } = await pendingSubmission("RejectOnce");
 		await knowledgeBranchService.review(admin, submissionId, { verdict: "reject" });
 		expect(
-			knowledgeBranchService.review(admin, submissionId, { verdict: "approve" }),
-		).rejects.toThrow();
+			await captureWorkerRejectionThrower(
+				knowledgeBranchService.review(admin, submissionId, { verdict: "approve" }),
+			),
+		).toThrow();
 	});
 
 	test("HTTP: POST /submissions/:id/review accepts verdict=reject", async () => {

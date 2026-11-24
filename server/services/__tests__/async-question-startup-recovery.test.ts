@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	narratorBufferedMessages,
 	narratorMessageRefs,
@@ -9,8 +9,11 @@ import {
 	narratorToolCalls,
 } from "../../db/schema";
 import type { ActiveNarrator } from "../narrator-session-state";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const fixture = getNarratorWorkerTestDb();
+await fixture.ready;
+const { db, sqlite } = fixture;
 const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const { recoverPendingQuestionAnswerDeliveries } = await import("../narrator-session");
@@ -120,10 +123,10 @@ afterEach(() => {
 	for (const id of activeIds) activeNarrators.delete(id);
 	activeIds.clear();
 });
-afterAll(() => {
+afterAll(async () => {
 	mock.module("../../db", () => realDb);
 	mock.restore();
-	sqlite.close();
+	await fixture.close();
 });
 
 describe("pending question startup recovery", () => {

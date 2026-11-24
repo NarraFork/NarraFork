@@ -1,11 +1,11 @@
 {
+	"readOnlyNotice": "Terminals open only for people who can write to this session.",
 	"noTerminals": "No terminals",
 	"newTerminal": "New terminal",
 	"terminal": "Terminal",
 	"processExited": "[Process exited with code {{code}}]",
 	"error": "[Error: {{message}}]",
 	"sendToChat": "Send to chat",
-	"sendToTerminal": "Send to terminal",
 	"openTerminal": "Open terminal",
 	"closeTerminal": "Close terminal",
 	"restartTerminal": "Restart terminal",

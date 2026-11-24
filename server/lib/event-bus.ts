@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import type { BackgroundTaskType } from "@shared/background-task-list";
 import type { ChatRoomKind } from "@shared/chat-room-kinds";
+import type { GitStagingListsChanged } from "@shared/git-workspace-events";
 import type { NOTIFICATION_CENTER_CHANGED_WS_TYPE } from "@shared/notification-center";
 import type { PublicationRun } from "../services/agent-runtime/publication-outbox";
 import type { NarratorServerMessage } from "../websocket/narrator-ws-types";
@@ -17,7 +18,9 @@ export type NarraForkEvent =
 	| { type: "auth:session_extended"; sessionId: string; userId: string; expiresAt: number }
 	// Invalidation only: lifecycle details are fetched through the authorized status API.
 	| { type: "system:lifecycle_changed" }
+	| { type: "system:unattended_changed" }
 	| { type: "git:workspace_invalidated"; queryKey: string }
+	| ({ type: "git:staging_lists_changed" } & GitStagingListsChanged)
 	// OAuth authorization transport invalidation (fixed identifiers only; no bearer material)
 	| {
 			type: "oauth:token_invalidated";
@@ -82,6 +85,11 @@ export type NarraForkEvent =
 			/** Optional kind hints only; never titles/previews/ids of rows. */
 			kinds?: Array<"chat_message" | "permission_request">;
 	  }
+	// Fast-mode facts changed after commit; listeners synchronously discard cached facts.
+	| { type: "narrator:fast_mode_changed"; narratorId: string }
+	| { type: "user:fast_mode_default_changed"; userId: string }
+	| { type: "narrator:execution_principal_changed"; narratorId: string }
+	| { type: "narrator:imported" }
 	// Narrator lifecycle
 	| { type: "narrator:message"; narratorId: string; role: string }
 	| { type: "narrator:status_changed"; narratorId: string; status: string; substatus?: string[] }

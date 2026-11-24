@@ -532,10 +532,11 @@ export async function createSession(
 	ttlMs?: number,
 	captureNetwork = false,
 	viewport?: Partial<BrowserViewport>,
+	options?: { managedManual?: boolean },
 ): Promise<BrowserSession> {
 	const normalizedTtlMs = normalizeSessionTtlMs(ttlMs);
 	const normalizedViewport = normalizeViewport({ ...DEFAULT_VIEWPORT, ...definedOnly(viewport) });
-	const { context, page, inUserBrowser } = await openTab(headless);
+	const { context, page, inUserBrowser } = await openTab(headless, options?.managedManual);
 	const sessionId = generateShortId();
 	const session: BrowserSession = {
 		id: sessionId,

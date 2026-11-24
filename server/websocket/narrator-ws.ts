@@ -6,12 +6,14 @@ import {
 	TEXT_DOCUMENT_PACKET_BYTES,
 	TEXT_DOCUMENT_PAGE_CHARS,
 } from "@shared/pretext-layout/text-document";
+import type { ReasoningTranslationVisibilityReport } from "@shared/reasoning-translation";
 import {
 	NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION,
 	NARRATOR_WS_SUBSCRIPTION_LIMIT_ERROR_CODE,
 	type NarratorWsSubscriptionLimitError,
 	RECENT_TABS_WS_BATCH_SIZE,
 } from "@shared/recent-tabs";
+import { UNATTENDED_CHANGED_WS_TYPE } from "@shared/unattended";
 import type { ServerWebSocket } from "bun";
 import {
 	measureSerializedCharacters,
@@ -25,8 +27,7 @@ export const MAX_NARRATOR_SUBSCRIPTIONS_PER_CONNECTION =
 import type { GitWorkspaceClientMessage } from "@shared/git-workspace-events";
 import { and, count as countFn, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
-import { narrators, narratorToolCalls, terminals } from "../db/schema";
-import { updateAwaitTimeout } from "../lib/agent/tools/await";
+import { narrators, narratorToolCalls, terminals, users } from "../db/schema";
 import { updateBashTimeout } from "../lib/agent/tools/bash";
 import { listSessions as listBrowserSessions } from "../lib/browser/session";
 import { eventBus } from "../lib/event-bus";
@@ -49,7 +50,7 @@ import type {
 import { resolveCommand } from "../services/command-service";
 import { editorFileSubscriptions } from "../services/editor-file-subscription";
 import { canReadNarrator, canWriteNarrator, NARRATOR_ACL_COLUMNS } from "../services/narrator-acl";
-import { getStreamingSnapshot } from "../services/narrator-event-handler";
+import { getStreamingSnapshot, getSubagentOutputCounts } from "../services/narrator-event-handler";
 import {
 	handleBlockAllSkillsCommand,
 	handleBlockSkillCommand,
@@ -84,6 +85,8 @@ import {
 	revalidatePublicShare,
 	type VerifiedPublicShare,
 } from "../services/public-narrator-share-service";
+import { reasoningTranslationScheduler } from "../services/reasoning-translation-runtime";
+import { readDecisionTarget, recordTeamPersonDecision } from "../services/teams/team-decisions";
 import {
 	bufferRealtimeMessage,
 	type CatchUpBuffer,
@@ -166,6 +169,7 @@ type NarratorSubscriptionKind = "list" | "panel" | "messages" | "activity";
 // Client → Server messages
 export type NarratorClientMessage =
 	| GitWorkspaceClientMessage
+	| ReasoningTranslationVisibilityReport
 	| import("@shared/editor-file-events").EditorFileClientMessage
 	| import("@shared/outline-page-events").OutlinePageClientMessage
 	| { type: "pong" }
@@ -214,6 +218,88 @@ export type NarratorClientMessage =
 
 type NarratorWS = ServerWebSocket<WSData & { channel: "narrator" }>;
 
+const translationHolders = new WeakMap<NarratorWS, Map<string, { narratorId: string }>>();
+
+function releaseTranslationDemand(ws: NarratorWS, narratorId?: string): void {
+	const holders = translationHolders.get(ws);
+	for (const [id, holder] of holders ?? []) {
+		if (narratorId && holder.narratorId !== narratorId) continue;
+		reasoningTranslationScheduler.replace(holder, []);
+		holders?.delete(id);
+	}
+}
+
+function setTranslationDemand(ws: NarratorWS, report: ReasoningTranslationVisibilityReport): void {
+	const { narratorId, visibilityId, targets } = report;
+	const userId = ws.data.userId;
+	if (
+		!userId ||
+		!connections.has(ws) ||
+		!ws.data.subscribedNarrators.has(narratorId) ||
+		ws.data.activityOnlyNarrators?.has(narratorId)
+	)
+		return;
+	const holders = translationHolders.get(ws) ?? new Map<string, { narratorId: string }>();
+	const previous = holders.get(visibilityId);
+	if (previous && previous.narratorId !== narratorId) return;
+	if (!targets.length) {
+		if (previous) reasoningTranslationScheduler.replace(previous, []);
+		holders.delete(visibilityId);
+		return;
+	}
+	if (!previous && holders.size >= 8) return;
+	const holder = previous ?? { narratorId };
+	holders.set(visibilityId, holder);
+	translationHolders.set(ws, holders);
+	const viewer = {
+		narratorId,
+		userId,
+		authorize: async (owner: string) => {
+			const user = await db.query.users.findFirst({
+				where: eq(users.id, userId),
+				columns: { role: true },
+			});
+			if (!user) return false;
+			const principal = { userId, isAdmin: user.role === "admin" };
+			return (
+				(await authorizeNarratorId(narratorId, principal, "write")) &&
+				(owner === narratorId || (await authorizeNarratorId(owner, principal, "write")))
+			);
+		},
+	};
+	reasoningTranslationScheduler.replace(
+		holder,
+		targets.map((target) => ({
+			viewer,
+			target,
+			publish: (patch) => {
+				broadcastToNarrator(narratorId, patch);
+				if (patch.ownerNarratorId !== narratorId)
+					broadcastToNarrator(patch.ownerNarratorId, {
+						...patch,
+						narratorId: patch.ownerNarratorId,
+					});
+			},
+		})),
+		({ target }, status) =>
+			queueMicrotask(() => {
+				if (
+					!connections.has(ws) ||
+					!ws.data.subscribedNarrators.has(narratorId) ||
+					ws.data.activityOnlyNarrators?.has(narratorId)
+				)
+					return;
+				safeSend(ws, {
+					type: "reasoning_translation_status",
+					narratorId,
+					visibilityId,
+					target,
+					status,
+				});
+			}),
+	);
+}
+
 type ViewerInfo = {
 	userId: string;
 	username: string;
@@ -255,6 +341,7 @@ function addConnection(ws: NarratorWS): void {
 }
 
 function removeConnection(ws: NarratorWS): void {
+	releaseTranslationDemand(ws);
 	toolInputLaneSender.close(ws);
 	ws.data.publicShareConnectionLease?.release();
 	removeAllChatSubscriptions(ws);
@@ -1295,10 +1382,6 @@ function sendRuntimeSnapshot(ws: NarratorWS, narratorIds: string[], requestId?: 
 function sendStreamingSnapshot(ws: NarratorWS, narratorIds: string[], requestId?: string): void {
 	for (const id of narratorIds) {
 		const snap = getStreamingSnapshot(id);
-		if (!snap) continue;
-		const hasStreaming =
-			snap.streamingBlocks.length > 0 || snap.toolChunks.size > 0 || snap.model !== undefined;
-		if (!hasStreaming) continue;
 		if (
 			!safeSend(
 				ws,
@@ -1306,10 +1389,11 @@ function sendStreamingSnapshot(ws: NarratorWS, narratorIds: string[], requestId?
 					{
 						type: "streaming_snapshot",
 						narratorId: id,
-						model: snap.model,
-						provider: snap.provider,
-						streamingBlocks: snap.streamingBlocks,
-						toolChunks: [...snap.toolChunks.values()],
+						model: snap?.model,
+						provider: snap?.provider,
+						streamingBlocks: snap?.streamingBlocks ?? [],
+						toolChunks: [...(snap?.toolChunks.values() ?? [])],
+						subagentOutputCounts: getSubagentOutputCounts(id),
 					},
 					requestId,
 				),
@@ -1376,7 +1460,65 @@ function markCatchUpOverflow(ws: NarratorWS, narratorId: string): void {
 	if (buffer) buffer.overflowed = true;
 }
 
-async function sendCatchUpForAnchor(
+const narratorWsReads = new Set<Promise<unknown>>();
+let narratorWsReadsStopped = false;
+let narratorWsReadsFailed = false;
+export function quiesceNarratorWsReadTasks(): void {
+	narratorWsReadsStopped = true;
+	for (const timer of pendingTerminalBroadcasts.values()) clearTimeout(timer);
+	pendingTerminalBroadcasts.clear();
+}
+export function hasPendingNarratorWsReadTasks(): boolean {
+	return narratorWsReads.size > 0;
+}
+function trackNarratorWsRead<T>(work: () => Promise<T>): Promise<T> {
+	if (narratorWsReadsStopped) return Promise.reject(new Error("WebSocket reads are stopped"));
+	const promise = Promise.resolve().then(work);
+	narratorWsReads.add(promise);
+	void promise.then(
+		() => narratorWsReads.delete(promise),
+		() => {
+			if (narratorWsReadsStopped) narratorWsReadsFailed = true;
+			narratorWsReads.delete(promise);
+		},
+	);
+	return promise;
+}
+export async function drainNarratorWsReadTasks(options: {
+	deadlineAt: number;
+	signal?: AbortSignal;
+}): Promise<void> {
+	while (narratorWsReads.size) {
+		options.signal?.throwIfAborted();
+		const remaining = options.deadlineAt - Date.now();
+		if (remaining <= 0) throw new Error("WebSocket reads did not drain");
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		let onAbort: (() => void) | undefined;
+		try {
+			await Promise.race([
+				Promise.allSettled([...narratorWsReads]),
+				new Promise<never>((_, reject) => {
+					onAbort = () =>
+						reject(options.signal?.reason ?? new Error("WebSocket read drain aborted"));
+					options.signal?.addEventListener("abort", onAbort, { once: true });
+					timer = setTimeout(() => reject(new Error("WebSocket reads did not drain")), remaining);
+				}),
+			]);
+		} finally {
+			clearTimeout(timer);
+			if (onAbort) options.signal?.removeEventListener("abort", onAbort);
+		}
+	}
+	if (narratorWsReadsFailed) throw new Error("WebSocket read work failed");
+}
+
+function sendCatchUpForAnchor(
+	...args: Parameters<typeof sendCatchUpForAnchorUntracked>
+): ReturnType<typeof sendCatchUpForAnchorUntracked> {
+	return trackNarratorWsRead(() => sendCatchUpForAnchorUntracked(...args));
+}
+
+async function sendCatchUpForAnchorUntracked(
 	ws: NarratorWS,
 	narratorId: string,
 	anchor: CatchUpCursor,
@@ -1521,6 +1663,7 @@ export async function dropNarratorSubscriptionsForUnauthorizedUsers(
 			verdicts.set(cacheKey, allowed);
 		}
 		if (allowed) continue;
+		releaseTranslationDemand(ws, narratorId);
 		ws.data.subscribedNarrators.delete(narratorId);
 		toolInputLaneSender.clearNarrator(ws, narratorId);
 		safeSend(ws, { type: "subscribe_denied", narratorId });
@@ -1682,6 +1825,23 @@ export function broadcastToAll(message: Record<string, unknown>): void {
 	}
 }
 
+// A separate hot-reload key activates this bridge in already-running development modules.
+if (hotOnce("narrafork.fastModeWs.listenersRegistered")) {
+	eventBus.on("narrator:imported", () => {
+		broadcastToAll({ type: "fast_mode_changed" });
+	});
+	eventBus.on("narrator:fast_mode_changed", () => {
+		broadcastToAll({ type: "fast_mode_changed" });
+	});
+	eventBus.on("narrator:execution_principal_changed", () => {
+		broadcastToAll({ type: "fast_mode_changed" });
+	});
+	eventBus.on("user:fast_mode_default_changed", ({ userId }) => {
+		broadcastToAll({ type: "fast_mode_changed" });
+		broadcastToUser(userId, { type: "fast_mode_changed", refreshPreferences: true });
+	});
+}
+
 /**
  * Broadcast only to admin connections. For frames that only an admin can act on
  * (plugin permission prompts): sending them to everyone leaks which plugins ask
@@ -1721,6 +1881,7 @@ async function broadcastTerminalCount(narratorId: string | null) {
 }
 
 function debouncedTerminalCount(narratorId: string | null) {
+	if (narratorWsReadsStopped) return;
 	if (!narratorId) return;
 	const existing = pendingTerminalBroadcasts.get(narratorId);
 	if (existing) clearTimeout(existing);
@@ -1728,7 +1889,7 @@ function debouncedTerminalCount(narratorId: string | null) {
 		narratorId,
 		setTimeout(() => {
 			pendingTerminalBroadcasts.delete(narratorId);
-			broadcastTerminalCount(narratorId).catch(() => {});
+			trackNarratorWsRead(() => broadcastTerminalCount(narratorId)).catch(() => {});
 		}, 100),
 	);
 }
@@ -1818,6 +1979,9 @@ if (hotOnce("narrafork.narratorWs.listenersRegistered")) {
 	// No coordinator diagnostics cross the global channel; HTTP retains role checks.
 	eventBus.on("system:lifecycle_changed", () => {
 		broadcastToAll({ type: "system_lifecycle_changed" });
+	});
+	eventBus.on("system:unattended_changed", () => {
+		broadcastToAll({ type: UNATTENDED_CHANGED_WS_TYPE });
 	});
 
 	// Plugin lifecycle is global host state. Broadcast only an invalidation marker;
@@ -1936,6 +2100,9 @@ export const handleNarratorWS = {
 		if (!(await authorizeNarratorFrame(ws, msg))) return;
 
 		switch (msg.type) {
+			case "reasoning_translation_visibility":
+				setTranslationDemand(ws, msg);
+				break;
 			case "editor_file_subscribe":
 			case "editor_file_unsubscribe":
 				await handleEditorFileMessage(ws, msg);
@@ -1986,7 +2153,10 @@ export const handleNarratorWS = {
 				for (const id of allowedIds) ws.data.subscribedNarrators.add(id);
 				if (kind === "activity") {
 					ws.data.activityOnlyNarrators ??= new Set();
-					for (const id of activityLevelIds) ws.data.activityOnlyNarrators.add(id);
+					for (const id of activityLevelIds) {
+						releaseTranslationDemand(ws, id);
+						ws.data.activityOnlyNarrators.add(id);
+					}
 				} else {
 					for (const id of allowedIds) ws.data.activityOnlyNarrators?.delete(id);
 				}
@@ -2046,6 +2216,7 @@ export const handleNarratorWS = {
 			}
 			case "unsubscribe": {
 				for (const id of msg.narratorIds) {
+					releaseTranslationDemand(ws, id);
 					ws.data.subscribedNarrators.delete(id);
 					ws.data.activityOnlyNarrators?.delete(id);
 					toolInputLaneSender.clearNarrator(ws, id);
@@ -2059,15 +2230,39 @@ export const handleNarratorWS = {
 					hasFeedback: !!msg.feedbackText,
 					hasAnswers: !!msg.answers,
 				});
-				resolvePermissionOrDangerReflection(msg.requestId, msg.decision, {
-					denyMessage: msg.message,
-					answers: msg.answers,
-					feedbackText: msg.feedbackText,
-					compactAfter: msg.compactAfter,
-					updatedPlan: msg.updatedPlan,
-					userId: ws.data.userId,
-					decidedBy: "user",
-				})
+				// Read before deciding: the team's record of who decided (M1) needs the call,
+				// which deciding takes out of the live registries.
+				await readDecisionTarget(msg.requestId)
+					.then(async (target) => {
+						const resolved = await resolvePermissionOrDangerReflection(
+							msg.requestId,
+							msg.decision,
+							{
+								// Checked again inside the decision (after any restart-recovery wait):
+								// access revoked since the frame was authorized refuses it.
+								assertStillAllowed: async () => {
+									if (!(await authorizeNarratorFrame(ws, msg)))
+										throw new Error("Permission request not found");
+								},
+								denyMessage: msg.message,
+								answers: msg.answers,
+								feedbackText: msg.feedbackText,
+								compactAfter: msg.compactAfter,
+								updatedPlan: msg.updatedPlan,
+								userId: ws.data.userId,
+								decidedBy: "user",
+							},
+						);
+						if (resolved && target)
+							recordTeamPersonDecision({
+								requestId: msg.requestId,
+								target,
+								userId: ws.data.userId,
+								decision: msg.decision,
+								answered: !!msg.answers,
+							});
+						return resolved;
+					})
 					.then((resolved) => {
 						if (resolved) return;
 						logger.warn("Permission request not found", {
@@ -2229,7 +2424,7 @@ export const handleNarratorWS = {
 				// Cancelling queued input must also drop a pending post-tool soft stop,
 				// otherwise the running turn ends at the next tool boundary with nothing
 				// to resume.
-				clearBufferedMessageSoftStopIfIdle(msg.narratorId);
+				await clearBufferedMessageSoftStopIfIdle(msg.narratorId);
 				broadcastToNarrator(msg.narratorId, {
 					type: "buffer_cleared",
 					narratorId: msg.narratorId,
@@ -2249,7 +2444,7 @@ export const handleNarratorWS = {
 			case "remove_buffer": {
 				const ok = await removeBufferedMessage(msg.narratorId, msg.messageId);
 				if (ok) {
-					clearBufferedMessageSoftStopIfIdle(msg.narratorId);
+					await clearBufferedMessageSoftStopIfIdle(msg.narratorId);
 					await broadcastBufferQueueForNarrator(msg.narratorId);
 				}
 				break;
@@ -2361,11 +2556,8 @@ export const handleNarratorWS = {
 				break;
 			}
 			case "update_timeout": {
-				// Bash and Await both maintain live-timeout registries keyed by toolUseId;
-				// only one will match a given running tool.
-				const newMs =
-					updateBashTimeout(msg.toolUseId, msg.timeoutMs) ??
-					updateAwaitTimeout(msg.toolUseId, msg.timeoutMs);
+				// Only Bash execution has an editable live timeout. Watch already returned.
+				const newMs = updateBashTimeout(msg.toolUseId, msg.timeoutMs);
 				if (newMs != null) {
 					broadcastToNarrator(msg.narratorId, {
 						type: "timeout_updated",

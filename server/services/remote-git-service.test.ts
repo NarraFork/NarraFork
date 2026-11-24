@@ -1,4 +1,4 @@
-import { afterEach, expect, spyOn, test } from "bun:test";
+import { afterEach, expect, mock, spyOn, test } from "bun:test";
 import {
 	GIT_COMMIT_PREVIEW_PATCH_MAX_BYTES,
 	GIT_COMMIT_PREVIEW_UNSUPPORTED,
@@ -762,4 +762,15 @@ test("branch sync failures stay git errors, including auth, without the uncertai
 	await expect(checkoutGit.checkoutBranch("/repo", { branch: "side" })).rejects.not.toThrow(
 		"uncertain",
 	);
+});
+
+test("remote ordinary writes require only their normal Git capability and live authorization", async () => {
+	const fixture = backendFixture();
+	const beforeWrite = mock(async () => {});
+	const git = createRemoteGitService(fixture.backend, undefined, beforeWrite);
+	await git.stageAll("/repo");
+	expect(beforeWrite).toHaveBeenCalledTimes(1);
+	expect(fixture.calls).toHaveLength(1);
+	await git.getFileDiff("/repo", "f");
+	expect(fixture.calls).toHaveLength(2);
 });

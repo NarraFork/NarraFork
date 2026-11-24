@@ -194,6 +194,10 @@ export interface StreamCodexResponsesWebSocketOptions {
 	signal: AbortSignal;
 	/** Close and clear cached WebSocket response-chain state before dispatching this request. */
 	resetSessionBeforeRequest?: boolean;
+	/** Use a private socket without admitting or evicting entries in the shared cache. */
+	ephemeralSession?: boolean;
+	/** A diagnostics credential can be revoked while the request is being built. */
+	validateBeforeDispatch?: () => void;
 	turnMetadata?: string;
 	/** Override the User-Agent handshake header. Defaults to the narrafork UA. */
 	userAgent?: string;
@@ -616,7 +620,7 @@ export function buildHandshakeHeaders(
 	options: StreamCodexResponsesWebSocketOptions,
 ): Record<string, string> {
 	// No x-openai-internal-codex-responses-lite here: the lite opt-in is a body
-	// contract (no top-level instructions/tools, additional_tools spliced into
+	// contract (no top-level tools, additional_tools spliced into
 	// input, parallel_tool_calls off) that this transport does not implement, and
 	// upstream rejects the header outright when `tools` carries hosted tools.
 	const headers: Record<string, string> = {
@@ -1166,6 +1170,7 @@ async function ensureConnection(
 	if (options.signal.aborted) {
 		throw createCodexWebSocketAbortError();
 	}
+	options.validateBeforeDispatch?.();
 	if (
 		session.connection?.isOpen() &&
 		!session.connection.isExpiring() &&
@@ -1234,8 +1239,8 @@ export async function* streamCodexResponsesWebSocket(
 	options: StreamCodexResponsesWebSocketOptions,
 ): AsyncGenerator<ParsedStreamEvent> {
 	const cacheKey = buildSessionCacheKey(options);
-	const cachedSession = getOrCreateSession(cacheKey);
-	if (cachedSession.disabled) {
+	const cachedSession = options.ephemeralSession ? undefined : getOrCreateSession(cacheKey);
+	if (cachedSession?.disabled) {
 		throw new CodexWebSocketFallbackError("Codex Responses WebSocket is disabled for this session");
 	}
 	// A nested request under the same sticky key (a danger/plan/task reflection runs while
@@ -1244,9 +1249,10 @@ export async function* streamCodexResponsesWebSocket(
 	// socket carries one in-flight response, and touching the parent's response chain would
 	// corrupt its `previous_response_id` continuation. Run it on a private, uncached session
 	// instead: a fresh socket, full request, closed when this call ends.
-	const ephemeral = cachedSession.busy;
-	const session = ephemeral ? createSessionState() : cachedSession;
-	if (ephemeral) {
+	const reusableSession = cachedSession && !cachedSession.busy ? cachedSession : undefined;
+	const ephemeral = !reusableSession;
+	const session = reusableSession ?? createSessionState();
+	if (cachedSession?.busy) {
 		logger.info("Codex Responses WebSocket session busy; using an ephemeral connection", {
 			sessionKey: options.sessionKey,
 			credentialId: options.credentialId,
@@ -1321,6 +1327,7 @@ export async function* streamCodexResponsesWebSocket(
 		const dispatchRequest = async (): Promise<void> => {
 			const frame = await buildRequestFrame();
 			options.signal.throwIfAborted();
+			options.validateBeforeDispatch?.();
 			options.requestDump?.setRequest(
 				{
 					transport: "websocket",

@@ -29,7 +29,7 @@ import {
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import { IconCopy, IconPaperclip, IconSend, IconSparkles, IconX } from "@tabler/icons-react";
-import { type InfiniteData, useQuery } from "@tanstack/react-query";
+import { type InfiniteData, skipToken, useQuery } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../hooks/useAuth";
@@ -120,6 +120,7 @@ export function ChatRoomView({
 	// for the selection/forward/delete actions — no fetch ever starts here.
 	const messagesQuery = useQuery<InfiniteData<ChatMessagePage>>({
 		queryKey: chatKeys.messages(roomId ?? ""),
+		queryFn: skipToken,
 		enabled: false,
 	});
 	const messages = useFlatChatMessages(messagesQuery.data);

@@ -1,10 +1,7 @@
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
 import { FILE_CHANGE_LIMITS, type FileChangeState } from "@shared/file-change-protocol";
 import { and, eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
-import { testEnvironment } from "../../../tests/preload";
 import { db, sqlite } from "../../db";
 import {
 	fileChangeEffects,
@@ -15,22 +12,17 @@ import {
 	narrators,
 	narratorToolCalls,
 	users,
-	worktreeTreeSnapshots,
 } from "../../db/schema";
+import * as pool from "../../lib/db-worker/pool";
 import { AppError } from "../../lib/errors";
 import { generateId } from "../../lib/id";
-import { normalizePathForComparison } from "../../lib/platform-path";
-import { safeSpawn } from "../../lib/spawn";
 import { narratorRoutes } from "../../routes/narrators";
 import { FileChangeBlobStore } from "../file-change-blob-store";
+import { FileChangeEvidenceService } from "../file-change-evidence";
 import { createFileChangeIdentity, fileChangeIdentityKey } from "../file-change-identity";
 import { narratorService } from "../narrator-service";
 import { getToolEditPreview, readToolEditPreviewState } from "../tool-edit-preview";
-import {
-	legacyTreeSnapshotPhysicalDir,
-	snapshotPathIdentity,
-	treeSnapshotPhysicalDir,
-} from "../tree-snapshot-paths";
+import { toolInputStreamSource } from "../tool-input-stream-source";
 import { worktreeTreeSnapshot } from "../worktree-tree-snapshot";
 
 const now = "2026-09-08T00:00:00.000Z";
@@ -64,7 +56,12 @@ function narrator(ownerUserId?: string) {
 	return { id, ownerUserId };
 }
 
-function tool(narratorId: string, toolUseId = generateId(), parentToolUseId?: string) {
+function tool(
+	narratorId: string,
+	toolUseId = generateId(),
+	parentToolUseId?: string,
+	deviceId: string | null = "preview-remote-device",
+) {
 	const id = generateId();
 	const messageId = generateId();
 	db.insert(narratorMessages)
@@ -91,7 +88,7 @@ function tool(narratorId: string, toolUseId = generateId(), parentToolUseId?: st
 			executionIdentityVersion: 1,
 			executionAttempt: 1,
 			runtimeGeneration: 1,
-			executionDeviceId: "local",
+			executionDeviceId: deviceId,
 			executionCwd: "/repo",
 			executionPathFlavor: "posix",
 			resolvedFilePath: "/repo/preview.ts",
@@ -122,6 +119,12 @@ function evidence(
 	after = absent,
 	intended = after,
 ) {
+	const deviceId = db
+		.select({ deviceId: narratorToolCalls.executionDeviceId })
+		.from(narratorToolCalls)
+		.where(eq(narratorToolCalls.id, call.id))
+		.get()?.deviceId;
+	if (!deviceId) throw new Error("fixture requires a frozen device");
 	const sourceInstanceId = generateId();
 	const scopeId = generateId();
 	const workspaceInstanceId = generateId();
@@ -130,7 +133,7 @@ function evidence(
 			id: scopeId,
 			sourceInstanceId,
 			workspaceInstanceId,
-			deviceId: "local",
+			deviceId,
 			canonicalRoot: "/repo",
 			displayRoot: "/repo",
 			pathFlavor: "posix",
@@ -162,7 +165,7 @@ function evidence(
 				parentSubjectKey: null,
 			},
 			executionBindingJson: {
-				deviceId: "local",
+				deviceId,
 				runtimeGeneration: 1,
 				runtimeEpoch: "preview-tests",
 				fencingToken: 0,
@@ -183,7 +186,7 @@ function evidence(
 			id: scopeId,
 			sourceInstanceId,
 			workspaceInstanceId,
-			deviceId: "local",
+			deviceId,
 			pathFlavor: "posix",
 			canonicalRoot: "/repo",
 		},
@@ -191,7 +194,7 @@ function evidence(
 			canonicalPath: "/repo/preview.ts",
 			lexicalPath: "/repo/preview.ts",
 			objectRole: "referent",
-			deviceId: "local",
+			deviceId,
 			pathFlavor: "posix",
 		},
 	);
@@ -300,7 +303,7 @@ describe("exact tool file edit preview", () => {
 			toolCallId: call.id,
 			toolUseId: call.toolUseId,
 			filePath: "/repo/preview.ts",
-			deviceId: "local",
+			deviceId: "preview-remote-device",
 			before: { status: "available", content: "actual before\n" },
 			after: { status: "available", content: "observed after\n" },
 			location: { startLine: 3, endLine: 4, newEndLine: 5 },
@@ -423,6 +426,98 @@ describe("exact tool file edit preview", () => {
 });
 
 describe("preview authorization and exact attempt binding", () => {
+	test("reads committed evidence in the Worker only after the tool is visible", async () => {
+		const owner = narrator();
+		const call = tool(owner.id);
+		evidence(call, absent, await stored("committed after"));
+		const dispatch = spyOn(pool, "runReadTask");
+		expect((await appFor(narrator().ownerUserId).request(url(owner.id, call))).status).toBe(404);
+		expect(dispatch.mock.calls.some(([, params]) => params.kind === "toolEditPreview")).toBe(false);
+		expect((await preview(owner.id, call)).after).toEqual({
+			status: "available",
+			content: "committed after",
+		});
+		expect(dispatch).toHaveBeenCalledWith(
+			sqlite.filename,
+			{ kind: "toolEditPreview", toolCallId: call.id },
+			{ signal: expect.any(AbortSignal), timeoutMs: 5_000 },
+		);
+	});
+
+	test("rejects oversized ledger metadata before reading file bytes", async () => {
+		const owner = narrator();
+		const call = tool(owner.id);
+		const { effectId, identity } = evidence(call, absent, await stored("not returned"));
+		db.update(fileChangeEffects)
+			.set({
+				identityJson: { ...identity, displayPath: "x".repeat(FILE_CHANGE_LIMITS.summaryBytes) },
+			})
+			.where(eq(fileChangeEffects.id, effectId))
+			.run();
+		const read = spyOn(FileChangeBlobStore.prototype, "readBytes");
+		expect((await preview(owner.id, call)).after).toEqual({
+			status: "unavailable",
+			reason: "too_large",
+		});
+		expect(read).not.toHaveBeenCalled();
+	});
+
+	test("rejects a different execution binding in the Worker snapshot", async () => {
+		const owner = narrator();
+		const call = tool(owner.id);
+		evidence(call, absent, await stored("other execution"));
+		const row = await narratorService.getToolCallPreviewMetadata(owner.id, call.toolUseId, {
+			toolCallId: call.id,
+		});
+		db.update(narratorToolCalls)
+			.set({ executionAttempt: 2 })
+			.where(eq(narratorToolCalls.id, call.id))
+			.run();
+		const read = spyOn(FileChangeBlobStore.prototype, "readBytes");
+		expect((await getToolEditPreview(row)).after).toEqual({
+			status: "unavailable",
+			reason: "identity_unverified",
+		});
+		expect(read).not.toHaveBeenCalled();
+	});
+
+	test("does not read evidence or blobs inline when the Worker fails", async () => {
+		const owner = narrator();
+		const call = tool(owner.id);
+		evidence(call, absent, await stored("not a fallback"));
+		const row = await narratorService.getToolCallPreviewMetadata(owner.id, call.toolUseId, {
+			toolCallId: call.id,
+		});
+		const previous = process.env.NARRAFORK_DB_WORKER;
+		const read = spyOn(FileChangeBlobStore.prototype, "readBytes");
+		const inline = spyOn(FileChangeEvidenceService.prototype, "getOperation");
+		const dispatch = spyOn(pool, "runReadTask");
+		try {
+			process.env.NARRAFORK_DB_WORKER = "off";
+			await expect(getToolEditPreview(row)).rejects.toBeInstanceOf(pool.WorkersUnavailableError);
+			await expect(sqlite.transaction(() => getToolEditPreview(row))()).rejects.toBeInstanceOf(
+				pool.WorkersUnavailableError,
+			);
+			expect((await getToolEditPreview(row, AbortSignal.abort())).after).toEqual({
+				status: "unavailable",
+				reason: "cancelled",
+			});
+			for (const error of [
+				new pool.WorkersUnavailableError("worker_create_failed"),
+				new pool.DbReadTaskExecutionError("worker exited"),
+				new pool.DbReadTaskTimeoutError("timed out"),
+			]) {
+				dispatch.mockRejectedValueOnce(error);
+				await expect(getToolEditPreview(row)).rejects.toBe(error);
+			}
+			expect(read).not.toHaveBeenCalled();
+			expect(inline).not.toHaveBeenCalled();
+		} finally {
+			if (previous === undefined) delete process.env.NARRAFORK_DB_WORKER;
+			else process.env.NARRAFORK_DB_WORKER = previous;
+		}
+	});
+
 	test("real route denies private narrator ACL and foreign tool PKs before blob reads", async () => {
 		const own = narrator();
 		const foreign = narrator();
@@ -612,326 +707,96 @@ describe("preview authorization and exact attempt binding", () => {
 	});
 });
 
-describe("local historical tree fallback", () => {
-	async function legacyBackslashTrees() {
-		const root = await mkdtemp(join(testEnvironment.isolatedHome, "preview-v1-tree-"));
-		const cwd = join(root, "a\\b");
-		await mkdir(cwd);
-		const initialized = await safeSpawn({
-			cmd: ["git", "init", cwd],
-			timeout: 10_000,
-			maxOutputBytes: 4096,
-		});
-		expect(initialized.exitCode).toBe(0);
-		const filePath = join(cwd, "preview.ts");
-		await writeFile(filePath, "v1 before\n");
-		const before = await worktreeTreeSnapshot.capture(cwd);
-		await writeFile(filePath, "v1 after\n");
-		const after = await worktreeTreeSnapshot.capture(cwd);
-		const current = treeSnapshotPhysicalDir("local", cwd);
-		const legacy = legacyTreeSnapshotPhysicalDir("local", cwd);
-		const legacyPath = normalizePathForComparison(cwd);
-		expect(current).not.toBe(legacy);
-		// Simulate untouched v1 storage and rows, not a new capture under the fixed identity.
-		await rename(current, legacy);
-		db.update(worktreeTreeSnapshots)
-			.set({ worktreePath: legacyPath })
-			.where(eq(worktreeTreeSnapshots.worktreePath, snapshotPathIdentity(cwd)))
-			.run();
-		const rows = db
-			.select()
-			.from(worktreeTreeSnapshots)
-			.where(eq(worktreeTreeSnapshots.worktreePath, legacyPath))
-			.orderBy(worktreeTreeSnapshots.id)
-			.limit(3)
-			.all();
-		expect(rows).toHaveLength(2);
-		await writeFile(filePath, "CURRENT_BYTES_MUST_NOT_FILL_V1_HISTORY");
-		const owner = narrator();
-		const call = tool(owner.id);
-		db.update(narratorToolCalls)
-			.set({
-				executionCwd: cwd,
-				resolvedFilePath: filePath,
-				canonicalFilePath: filePath,
-				treeHashBefore: before,
-				treeHashAfter: after,
-			})
-			.where(eq(narratorToolCalls.id, call.id))
-			.run();
-		return {
-			cwd,
-			filePath,
-			before,
-			after,
-			current,
-			legacy,
-			legacyPath,
-			rows,
-			owner,
-			call,
-			async cleanup() {
-				db.delete(worktreeTreeSnapshots)
-					.where(
-						inArray(
-							worktreeTreeSnapshots.id,
-							rows.map((row) => row.id),
-						),
-					)
-					.run();
-				await rm(current, { recursive: true, force: true });
-				await rm(legacy, { recursive: true, force: true });
-				await rm(root, { recursive: true, force: true });
-			},
-		};
-	}
-
-	test.skipIf(process.platform === "win32")(
-		"the real preview service and route read v1 backslash hashes without rewriting legacy evidence",
-		async () => {
-			const fixture = await legacyBackslashTrees();
-			const retained = await Promise.all(
-				["HEAD", "config", "index"].map((name) => readFile(join(fixture.legacy, name))),
-			);
-			let snapshotQueries = 0;
-			const prepare = sqlite.prepare.bind(sqlite);
-			const queries = spyOn(sqlite, "prepare").mockImplementation(
-				(...args: Parameters<typeof sqlite.prepare>) => {
-					if (args[0].includes('"worktree_tree_snapshots"')) snapshotQueries++;
-					return prepare(...args);
+describe("local history preview policy", () => {
+	for (const withOperation of [false, true]) {
+		test(`local ${withOperation ? "evidence" : "tree"} preview does not read retained history`, async () => {
+			const owner = narrator();
+			const call = tool(owner.id, undefined, undefined, "local");
+			if (withOperation)
+				evidence(call, await stored("retained before\n"), await stored("retained after\n"));
+			db.update(narratorToolCalls)
+				.set({ treeHashBefore: "a".repeat(40), treeHashAfter: "b".repeat(40) })
+				.where(eq(narratorToolCalls.id, call.id))
+				.run();
+			const blobRead = spyOn(FileChangeBlobStore.prototype, "readBytes").mockImplementation(
+				async () => {
+					throw new Error("local historical blob read");
 				},
 			);
-			try {
-				const direct = await preview(fixture.owner.id, fixture.call);
-				expect(direct.source).toBe("tree");
-				expect(direct.before).toEqual({ status: "available", content: "v1 before\n" });
-				expect(direct.after).toEqual({ status: "available", content: "v1 after\n" });
-				expect(snapshotQueries).toBe(1);
-				const response = await appFor(fixture.owner.ownerUserId).request(
-					url(fixture.owner.id, fixture.call),
-				);
-				expect(response.status).toBe(200);
-				expect(await response.json()).toEqual(direct);
-				expect(snapshotQueries).toBe(2);
-				queries.mockRestore();
-				expect(
-					db
-						.select()
-						.from(worktreeTreeSnapshots)
-						.where(
-							inArray(
-								worktreeTreeSnapshots.id,
-								fixture.rows.map((row) => row.id),
-							),
-						)
-						.orderBy(worktreeTreeSnapshots.id)
-						.all(),
-				).toEqual(fixture.rows);
-				expect(
-					await Promise.all(
-						["HEAD", "config", "index"].map((name) => readFile(join(fixture.legacy, name))),
-					),
-				).toEqual(retained);
-				expect(await readFile(fixture.filePath, "utf8")).toBe(
-					"CURRENT_BYTES_MUST_NOT_FILL_V1_HISTORY",
-				);
-			} finally {
-				queries.mockRestore();
-				await fixture.cleanup();
-			}
-		},
-	);
-
-	test.skipIf(process.platform === "win32")(
-		"v1 aliases cannot bypass wrong cwd, hash/device evidence, exact tool PK, or operation attempt",
-		async () => {
-			const fixture = await legacyBackslashTrees();
-			const { call, owner, rows, cwd, before, after, legacyPath, filePath } = fixture;
-			const read = spyOn(worktreeTreeSnapshot, "readFilePreviewAtTree");
-			try {
-				db.update(narratorToolCalls)
-					.set({ executionCwd: legacyPath })
-					.where(eq(narratorToolCalls.id, call.id))
-					.run();
-				expect((await preview(owner.id, call)).source).toBe("unavailable");
-				db.update(narratorToolCalls)
-					.set({ executionCwd: cwd, treeHashAfter: null })
-					.where(eq(narratorToolCalls.id, call.id))
-					.run();
-				const beforeRow = rows.find((row) => row.treeHash === before);
-				if (!beforeRow) throw new Error("missing before fixture");
-				for (const foreign of [
-					{ worktreePath: join(cwd, "foreign") },
-					{ deviceId: "foreign-device" },
-				]) {
-					db.update(worktreeTreeSnapshots)
-						.set(foreign)
-						.where(eq(worktreeTreeSnapshots.id, beforeRow.id))
-						.run();
-					expect((await preview(owner.id, call)).before).toEqual({
-						status: "unavailable",
-						reason: "missing_evidence",
-					});
-					db.update(worktreeTreeSnapshots)
-						.set({ worktreePath: legacyPath, deviceId: "local" })
-						.where(eq(worktreeTreeSnapshots.id, beforeRow.id))
-						.run();
-				}
-				expect(read).not.toHaveBeenCalled();
-				const foreignCall = tool(narrator(owner.ownerUserId).id, call.toolUseId);
-				expect((await appFor(owner.ownerUserId).request(url(owner.id, foreignCall))).status).toBe(
-					404,
-				);
-				db.update(narratorToolCalls)
-					.set({ treeHashAfter: after })
-					.where(eq(narratorToolCalls.id, call.id))
-					.run();
-				const e = evidence(call);
-				db.update(fileChangeScopes)
-					.set({ canonicalRoot: cwd, displayRoot: cwd })
-					.where(eq(fileChangeScopes.id, e.identity.scopeId))
-					.run();
-				const identity = { ...e.identity, canonicalPath: filePath, lexicalPath: filePath };
-				db.update(fileChangeEffects)
-					.set({ identityJson: identity, fileKey: fileChangeIdentityKey(identity) })
-					.where(eq(fileChangeEffects.id, e.effectId))
-					.run();
-				expect((await preview(owner.id, call)).source).toBe("evidence");
-				db.update(narratorToolCalls)
-					.set({ executionAttempt: 2 })
-					.where(eq(narratorToolCalls.id, call.id))
-					.run();
-				expect((await preview(owner.id, call)).before).toEqual({
-					status: "unavailable",
-					reason: "identity_unverified",
-				});
-				expect(read).not.toHaveBeenCalled();
-			} finally {
-				read.mockRestore();
-				await fixture.cleanup();
-			}
-		},
-	);
-
-	test("an ignored file omitted from both trees is missing evidence, not an absent file", async () => {
-		const root = await mkdtemp(join(testEnvironment.isolatedHome, "preview-ignored-tree-"));
-		const initialized = await safeSpawn({
-			cmd: ["git", "init", root],
-			timeout: 10_000,
-			maxOutputBytes: 4096,
-		});
-		expect(initialized.exitCode).toBe(0);
-		const path = join(root, ".env");
-		await writeFile(join(root, ".gitignore"), ".env\n");
-		await writeFile(path, "EXISTING_IGNORED_BEFORE\n");
-		const before = await worktreeTreeSnapshot.capture(root, "local");
-		await writeFile(path, "EXISTING_IGNORED_AFTER\n");
-		const after = await worktreeTreeSnapshot.capture(root, "local");
-		// The real file changed, but filtering omitted it from both observations.
-		expect(before).toBe(after);
-		// A later ignore-policy change and live contents cannot fill the history gap.
-		await writeFile(join(root, ".gitignore"), "");
-		await writeFile(path, "CURRENT_CONTENT_IS_NOT_HISTORICAL_EVIDENCE\n");
-		const owner = narrator();
-		const call = tool(owner.id);
-		db.update(narratorToolCalls)
-			.set({
-				executionCwd: root,
-				resolvedFilePath: path,
-				canonicalFilePath: path,
-				executionPathFlavor: process.platform === "win32" ? "windows" : "posix",
-				treeHashBefore: before,
-				treeHashAfter: after,
-			})
-			.where(eq(narratorToolCalls.id, call.id))
-			.run();
-		try {
-			const response = await appFor(owner.ownerUserId).request(url(owner.id, call));
+			const treeRead = spyOn(worktreeTreeSnapshot, "readFilePreviewAtTree").mockImplementation(
+				async () => {
+					throw new Error("local historical tree read");
+				},
+			);
+			const dispatch = spyOn(pool, "runReadTask");
+			const response = await appFor(owner.ownerUserId).request(
+				`${url(owner.id, call)}&deviceId=forged-remote-device`,
+			);
 			expect(response.status).toBe(200);
-			const result = await response.json();
-			expect(result.source).toBe("unavailable");
-			expect(result.before).toEqual({ status: "unavailable", reason: "missing_evidence" });
-			expect(result.after).toEqual({ status: "unavailable", reason: "missing_evidence" });
-		} finally {
-			await rm(treeSnapshotPhysicalDir("local", root), { recursive: true, force: true });
-		}
+			expect(await response.json()).toMatchObject({
+				deviceId: "local",
+				source: "unavailable",
+				before: { status: "unavailable", reason: "missing_evidence" },
+				after: { status: "unavailable", reason: "missing_evidence" },
+				location: { startLine: 3, endLine: 4, newEndLine: 5 },
+			});
+			expect(blobRead).not.toHaveBeenCalled();
+			expect(treeRead).not.toHaveBeenCalled();
+			expect(dispatch.mock.calls.some(([, params]) => params.kind === "toolEditPreview")).toBe(
+				false,
+			);
+		});
+	}
+
+	for (const deviceId of [null, ""]) {
+		test(`legacy device ${JSON.stringify(deviceId)} cannot open local history`, async () => {
+			const owner = narrator();
+			const call = tool(owner.id, undefined, undefined, "local");
+			evidence(call);
+			db.update(narratorToolCalls)
+				.set({ executionDeviceId: deviceId, treeHashBefore: "a".repeat(40) })
+				.where(eq(narratorToolCalls.id, call.id))
+				.run();
+			const reads = spyOn(pool, "runReadTask");
+			expect((await preview(owner.id, call)).source).toBe("unavailable");
+			expect(reads.mock.calls.some(([, params]) => params.kind === "toolEditPreview")).toBe(false);
+		});
+	}
+
+	test("local unavailable previews still enforce narrator ACL and visible message references", async () => {
+		const owner = narrator();
+		const outsider = narrator();
+		const call = tool(owner.id, undefined, undefined, "local");
+		expect([403, 404]).toContain(
+			(await appFor(outsider.ownerUserId).request(url(owner.id, call))).status,
+		);
+		removeRef(owner.id, call.messageId);
+		expect((await appFor(owner.ownerUserId).request(url(owner.id, call))).status).toBe(404);
 	});
 
-	test("uses frozen workspace snapshots, never current file bytes; keeps missing evidence and binary distinct", async () => {
-		expect(process.env.NARRAFORK_HOME).toBe(testEnvironment.narraforkHome);
-		const root = await mkdtemp(join(testEnvironment.isolatedHome, "preview-tree-"));
-		const initialized = await safeSpawn({
-			cmd: ["git", "init", root],
-			timeout: 10_000,
-			maxOutputBytes: 4096,
-		});
-		expect(initialized.exitCode).toBe(0);
-		const path = join(root, "preview.ts");
-		await writeFile(path, "tree before\n");
-		const before = await worktreeTreeSnapshot.capture(root, "local");
-		await writeFile(path, "tree after\n");
-		const after = await worktreeTreeSnapshot.capture(root, "local");
-		await writeFile(path, "CURRENT_BYTES_MUST_NOT_APPEAR");
+	test("local Write input documents retain the original message input", async () => {
 		const owner = narrator();
-		const call = tool(owner.id);
+		const call = tool(owner.id, undefined, undefined, "local");
+		const content = "Original Write input\n";
 		db.update(narratorToolCalls)
-			.set({
-				executionCwd: root,
-				resolvedFilePath: path,
-				canonicalFilePath: path,
-				executionPathFlavor: process.platform === "win32" ? "windows" : "posix",
-				treeHashBefore: before,
-				treeHashAfter: after,
-			})
+			.set({ toolName: "Write", inputJson: { file_path: "/repo/preview.ts", content } })
 			.where(eq(narratorToolCalls.id, call.id))
 			.run();
-		const result = await preview(owner.id, call);
-		expect(result.source).toBe("tree");
-		expect(result.before).toEqual({ status: "available", content: "tree before\n" });
-		expect(result.after).toEqual({ status: "available", content: "tree after\n" });
-		const options = { signal: new AbortController().signal, timeoutMs: 5000 };
-		expect(
-			await worktreeTreeSnapshot.readFilePreviewAtTree(
-				root,
-				after,
-				"absent.ts",
-				"local",
-				100,
-				options,
-			),
-		).toEqual({ status: "unavailable", reason: "missing_evidence" });
-		expect(
-			await worktreeTreeSnapshot.readFilePreviewAtTree(
-				root,
-				"0".repeat(40),
-				"absent.ts",
-				"local",
-				100,
-				options,
-			),
-		).toEqual({ status: "unavailable", reason: "missing_evidence" });
-		expect(
-			await worktreeTreeSnapshot.readFilePreviewAtTree(
-				root,
-				after,
-				"preview.ts",
-				"local",
-				2,
-				options,
-			),
-		).toEqual({ status: "unavailable", reason: "too_large" });
-		await writeFile(path, new Uint8Array([97, 0, 98]));
-		const binary = await worktreeTreeSnapshot.capture(root, "local");
-		expect(
-			await worktreeTreeSnapshot.readFilePreviewAtTree(
-				root,
-				binary,
-				"preview.ts",
-				"local",
-				100,
-				options,
-			),
-		).toEqual({ status: "unavailable", reason: "binary" });
-		await rm(treeSnapshotPhysicalDir("local", root), { recursive: true, force: true });
+		const app = appFor(owner.ownerUserId);
+		expect((await (await app.request(url(owner.id, call))).json()).source).toBe("unavailable");
+		const response = await app.request(
+			`/api/narrators/${owner.id}/tool-calls/${call.toolUseId}/input-document?toolCallId=${call.id}&messageId=${call.messageId}&executionAttempt=1`,
+		);
+		expect(response.status).toBe(200);
+		const ref = await response.json();
+		try {
+			const range = await app.request(
+				`/api/narrators/${owner.id}/text-documents/${ref.id}?offset=0&limit=100`,
+			);
+			expect(range.status).toBe(200);
+			expect((await range.json()).text).toBe(content);
+		} finally {
+			await toolInputStreamSource.discard(ref.id);
+		}
 	});
 });

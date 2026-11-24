@@ -1,6 +1,6 @@
 {
 	"executor": {
-		"version": "0.9.6",
+		"version": "0.9.7",
 		"protocolVersion": 1
 	},
 	"remotePeer": {

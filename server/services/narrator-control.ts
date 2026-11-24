@@ -16,6 +16,11 @@ import { ForbiddenError } from "../lib/errors";
 import { controllerOf } from "../lib/runtime-source";
 import type { ControllerAction } from "../lib/validators/runtime-registration";
 import { getRunHold } from "./agent-runtime/ownership";
+import {
+	DELEGATION_DEPTH_LIMIT_MESSAGE,
+	delegationDepthOf,
+	MAX_DELEGATION_DEPTH,
+} from "./delegation-depth";
 import { canWriteNarrator } from "./narrator-acl";
 import { narratorService } from "./narrator-service";
 import { resolveNarratorRuntimePolicy } from "./trait-layer-service";
@@ -38,7 +43,8 @@ export class AgentControlDeniedError extends ForbiddenError {}
  * Throws {@link AgentControlDeniedError} unless the caller holds `action` on the target:
  *
  * 1. the target registers the caller as its controller for that action (direct only);
- * 2. the caller's current capability ceiling still allows orchestration;
+ * 2. the caller's current capability ceiling still allows orchestration, and the caller
+ *    is not at the deepest delegation level;
  * 3. the caller's execution principal, if any, may currently write the target;
  * 4. while the user has taken the target over, the controller may not cut into the
  *    user's work: `stop` and `archive` are refused. A Send `doInterrupt` (`steer`) is
@@ -62,6 +68,13 @@ export async function authorizeAgentControl(
 	if (grant?.narratorId !== request.callerNarratorId || !grant.actions.includes(request.action))
 		notControlled();
 	const ceiling = await resolveNarratorRuntimePolicy(request.callerNarratorId, request.userId);
+	// Control backstop for nesting: a narrator at the deepest level controls nobody, whether
+	// its ceiling was stamped with its level or not (the parent chain is the second source).
+	if (
+		Math.max(ceiling.delegationDepth, await delegationDepthOf(request.callerNarratorId)) >=
+		MAX_DELEGATION_DEPTH
+	)
+		deny(DELEGATION_DEPTH_LIMIT_MESSAGE);
 	if (!ceiling.capabilities.spawnAgent)
 		deny("This narrator's capability ceiling does not allow controlling other agents.");
 	if (request.userId) {

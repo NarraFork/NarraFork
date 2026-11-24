@@ -176,12 +176,12 @@ describe("publication commit → flush → mailbox delivery", () => {
 });
 
 describe("formatBackgroundCompletionNotifications", () => {
-	it("started and running notices do not imply a missing result or request Await", () => {
+	it("started and running notices do not imply a missing result or request Watch", () => {
 		for (const status of ["started", "running"]) {
 			const task = notification({ status, result: undefined });
 			const text = formatBackgroundCompletionNotifications([task]);
 			expect(text).toContain("Agent has started.");
-			expect(text).not.toContain("Await(");
+			expect(text).not.toContain("Watch(");
 			expect(text).not.toContain("unavailable");
 			expect(backgroundAgentNoticePreview(task, "zh-CN")).toContain("已开始执行");
 		}
@@ -191,7 +191,7 @@ describe("formatBackgroundCompletionNotifications", () => {
 		const task = notification({ result: "本轮复核结果" });
 		const text = formatBackgroundCompletionNotifications([task]);
 		expect(text).toContain("本轮复核结果");
-		expect(text).not.toContain("Await(");
+		expect(text).not.toContain("Watch(");
 		expect(backgroundAgentNoticePreview(task, "zh-CN")).toBe("本轮复核结果");
 	});
 
@@ -204,19 +204,19 @@ describe("formatBackgroundCompletionNotifications", () => {
 		);
 	});
 
-	it("includes the result by default without requiring another Await", () => {
+	it("includes the result by default without requiring another Watch", () => {
 		const text = formatBackgroundCompletionNotifications([notification()]);
 		expect(text).toContain("listed with line numbers");
-		expect(text).not.toContain("Await(");
+		expect(text).not.toContain("Watch(");
 	});
 
 	it("does not mistake the completion summary for a missing result", () => {
 		const text = formatBackgroundCompletionNotifications([
-			notification({ result: undefined, resultPreview: "completed. Use Await" }),
+			notification({ result: undefined, resultPreview: "completed. Use Watch" }),
 		]);
 		expect(text).toContain("This notice could not load the result.");
 		expect(text).not.toContain("Result:\ncompleted");
-		expect(text).toContain("Await(");
+		expect(text).toContain("Watch(");
 	});
 
 	it("bounds long results even when the producer omitted the truncation flag", () => {
@@ -226,15 +226,15 @@ describe("formatBackgroundCompletionNotifications", () => {
 		expect(text).toContain("x".repeat(12000));
 		expect(text).not.toContain("x".repeat(12001));
 		expect(text).toContain("truncated");
-		expect(text).toContain("Await(");
+		expect(text).toContain("Watch(");
 	});
-	it("busy: a preview, because the full output is one Await away", () => {
+	it("busy: a preview, because the full output is one Watch away", () => {
 		const text = formatBackgroundCompletionNotifications([notification()], {
 			includeResult: false,
 		});
 		expect(text).toContain("Result preview: found 7 buildHistory sites");
 		expect(text).not.toContain("listed with line numbers");
-		expect(text).toContain('Await({ type: "agent", id: "map-the-providers" })');
+		expect(text).toContain('Watch({ type: "agent", id: "map-the-providers" })');
 	});
 
 	it("names the agent by alias and never by its raw narrator id", () => {
@@ -267,7 +267,7 @@ describe("formatBackgroundCompletionNotifications", () => {
 			{ includeResult: true },
 		);
 		expect(text).toContain("truncated");
-		expect(text).toContain('Await({ type: "agent", id: "map-the-providers" })');
+		expect(text).toContain('Watch({ type: "agent", id: "map-the-providers" })');
 	});
 
 	it("an empty result is stated rather than left blank", () => {

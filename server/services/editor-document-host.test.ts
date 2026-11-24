@@ -31,6 +31,7 @@ import { logger } from "../lib/logger";
 import { getNarraforkHome } from "../lib/narrafork-home";
 import { editorOperationMetadataSchema } from "../lib/validators/editor-documents";
 import { denyHostEditorHelpers } from "../routes/editor-native-fixture";
+import { settleWorkerRead } from "./__tests__/file-worker-database";
 import {
 	executeEditorDocumentFileChange,
 	getEditorDocumentService,
@@ -267,7 +268,9 @@ for (const scenario of [
 						code: "STALE_WRITE",
 					});
 				}
-				await expect(queryEditorOperation(actor, randomUUID())).rejects.toMatchObject({
+				await expect(
+					(await settleWorkerRead(queryEditorOperation(actor, randomUUID()))).result(),
+				).rejects.toMatchObject({
 					code: "EDITOR_OPERATION_UNKNOWN",
 				});
 				if (large) {
@@ -281,17 +284,7 @@ for (const scenario of [
 						queryOperation: queryEditorOperation,
 					});
 					await writeFile(scenarioTarget, "unrelated-current-disk");
-					// History is optional work under HISTORY_BUDGET_MS (file-change-runtime.ts).
-					// On a slow disk (macOS Intel runners) publishing the 20 MiB before/after blobs
-					// can overrun it: the save still applies, and its history is reported
-					// unavailable. Only that cause is accepted; other missing history still fails.
-					const budgetExceeded = warnings.mock.calls.some(
-						([message, data]) =>
-							message === "File history unavailable for this request" &&
-							(data as { sourceId?: string } | undefined)?.sourceId === large?.result.operationId &&
-							String((data as { error?: unknown } | undefined)?.error).includes("budget exceeded"),
-					);
-					const historyStatus = budgetExceeded ? "unavailable" : "complete";
+					const historyStatus = "disabled";
 					expect(await cold.operation(actor, large.result.operationId)).toMatchObject({
 						status: "saved",
 						result: { hash: hash(large.next), snapshotRevision: 17, historyStatus },
@@ -308,18 +301,13 @@ for (const scenario of [
 							),
 						),
 					);
-					// A mismatched raw digest can only be caught against a recorded after-state;
-					// without history the applied save keeps its recovery metadata, unverified.
+					// Local applied proof uses the owned recovery description; content evidence is disabled.
 					expect(
 						await queryEditorOperation(actor, large.result.operationId, {
 							...recovery,
 							rawDigest: "f".repeat(64),
 						}),
-					).toMatchObject(
-						budgetExceeded
-							? { status: "saved", result: { historyStatus: "unavailable" } }
-							: { status: "uncertain" },
-					);
+					).toMatchObject({ status: "saved", result: { historyStatus: "disabled" } });
 					const row = db
 						.select({ id: fileChangeOperations.id })
 						.from(fileChangeOperations)
@@ -346,10 +334,16 @@ for (const scenario of [
 						.where(eq(fileChangeOperations.id, row.id))
 						.run();
 					await expect(
-						queryEditorOperation({ ...actor, userId: "other" }, large.result.operationId),
+						(
+							await settleWorkerRead(
+								queryEditorOperation({ ...actor, userId: "other" }, large.result.operationId),
+							)
+						).result(),
 					).rejects.toMatchObject({ code: "EDITOR_OPERATION_UNKNOWN" });
 					revoked = true;
-					await expect(cold.operation(actor, large.result.operationId)).rejects.toThrow("revoked");
+					await expect(
+						(await settleWorkerRead(cold.operation(actor, large.result.operationId))).result(),
+					).rejects.toThrow("revoked");
 				}
 				await expect(
 					lstat(join(getNarraforkHome(), "editor-native-operations")),

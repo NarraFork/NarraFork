@@ -1,8 +1,45 @@
 import { Database } from "bun:sqlite";
-import { describe, expect, test } from "bun:test";
+import { describe, expect, mock, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { consumeCleanShutdownState, markCleanShutdown, readCleanShutdownState } from "../../db/fts";
-import { preservesRecoveryOnShutdown, ShutdownActivityTracker } from "../shutdown-activity";
+import { createServerRequestLifecycle } from "../../http-request-lifecycle";
+import { createDatabaseReaderStartup } from "../db-reader-startup";
+import {
+	canRunCleanShutdownHooks,
+	fenceUnattendedShutdown,
+	preservesRecoveryOnShutdown,
+	ShutdownActivityTracker,
+} from "../shutdown-activity";
+
+test("work arriving at the final idle boundary defers shutdown and reopens admission", async () => {
+	const lifecycle = createServerRequestLifecycle();
+	const work = Promise.withResolvers<Response>();
+	let request: Promise<Response | undefined> | undefined;
+	const ready = await fenceUnattendedShutdown(
+		() => lifecycle.activeCount > 0,
+		async () => {
+			expect(lifecycle.accepting).toBe(false);
+			request = lifecycle.track(1, new Request("http://localhost"), work.promise);
+			return true;
+		},
+	);
+	expect(ready).toBe(false);
+	expect(lifecycle.accepting).toBe(true);
+	work.resolve(new Response());
+	await request;
+});
+
+test("post-shutdown hooks require a clean result from the requested teardown", () => {
+	const tracker = new ShutdownActivityTracker();
+	tracker.markDrainComplete();
+	const reason = "unattended_idle";
+	expect(canRunCleanShutdownHooks(reason, { reason, clean: tracker.isCleanShutdown() })).toBe(true);
+	expect(canRunCleanShutdownHooks(reason, { reason: "signal", clean: true })).toBe(false);
+	tracker.recordStep("workspace.persist", "timeout");
+	expect(canRunCleanShutdownHooks(reason, { reason, clean: tracker.isCleanShutdown() })).toBe(
+		false,
+	);
+});
 
 describe("ShutdownActivityTracker", () => {
 	test("is not clean until drain completes even when every step succeeds", () => {
@@ -91,6 +128,70 @@ describe("clean shutdown marker lifecycle", () => {
 
 describe("main shutdown wiring without booting the server", () => {
 	const main = readFileSync(new URL("../../main.ts", import.meta.url), "utf8");
+	test.each([
+		["sqlite", true],
+		["postgres", true],
+		["sqlite", false],
+		["postgres", false],
+	] as const)("%s startup with reader admission=%s schedules maintenance only once on SQLite", async (backend, admitted) => {
+		const maintenanceStart = main.lastIndexOf(
+			'if (activeDatabaseBackend === "sqlite") {',
+			main.indexOf('startTeamDatabaseMaintenance("status"'),
+		);
+		const maintenanceEnd = main.indexOf("\n}\n\nconst databaseStartup =", maintenanceStart);
+		expect(maintenanceStart).toBeGreaterThanOrEqual(0);
+		expect(maintenanceEnd).toBeGreaterThan(maintenanceStart);
+		const code = new Bun.Transpiler({ loader: "ts" }).transformSync(
+			`async function start() { ${main.slice(maintenanceStart, maintenanceEnd)} }`,
+		);
+		const cleanup = mock(async () => {});
+		const rebuild = mock(async () => {});
+		const migrate = mock(async () => {});
+		const initialize = new Function(
+			"activeDatabaseBackend",
+			"startTeamDatabaseMaintenance",
+			"retireLegacyChapterResources",
+			"scheduleProjectIndexRebuild",
+			"migrateAggregationsOnStartup",
+			"logger",
+			"narratorRecovery",
+			`${code}\nreturn start;`,
+		)(
+			backend,
+			() => {},
+			cleanup,
+			rebuild,
+			migrate,
+			{ warn() {} },
+			Promise.resolve(),
+		) as () => Promise<void>;
+		const startup = createDatabaseReaderStartup({
+			readiness: {
+				state: admitted
+					? { status: "ready" }
+					: { status: "failed", code: "DB_READERS_UNAVAILABLE" },
+				wait: async () => (admitted ? { ok: true } : { ok: false, code: "DB_READERS_UNAVAILABLE" }),
+			},
+			initialize,
+			onUnavailable: () => {},
+			onError: (error) => {
+				throw error;
+			},
+		});
+		await startup.start();
+		startup.stop();
+		for (const operation of [cleanup, rebuild, migrate])
+			expect(operation).toHaveBeenCalledTimes(backend === "sqlite" && admitted ? 1 : 0);
+	});
+	test("shutdown cancels reader startup before stopping its producers", () => {
+		const stop = main.indexOf(
+			"databaseStartup.stop();",
+			main.indexOf("async function performGracefulShutdown("),
+		);
+		expect(stop).toBeGreaterThanOrEqual(0);
+		expect(stop).toBeLessThan(main.indexOf("backgroundOccupancyInitializer.stop();", stop));
+		expect(stop).toBeLessThan(main.indexOf("stopHeartbeat();", stop));
+	});
 	const start = main.indexOf("async function performGracefulShutdown(");
 	const shutdown = main.slice(start, main.indexOf("registerGracefulShutdownHandler(", start));
 	const position = (label: string) => {
@@ -99,58 +200,74 @@ describe("main shutdown wiring without booting the server", () => {
 		return at;
 	};
 
-	test.each([
-		"ok",
-		"failed",
-		"timeout",
-	] as const)("signal cleanup preserves Agent runs only after checkpoint preparation returns %s", async (outcome) => {
-		const prepareStart = shutdown.indexOf("let preserveAgentRuns = false;");
-		const prepareEnd = shutdown.indexOf("const shutdownRequestId", prepareStart);
-		const cleanupStart = shutdown.indexOf("if (!options.skipBashProcessKill)");
-		const cleanupEnd = shutdown.indexOf(
-			'await shutdownStep(tracker, "vnetUdpRendezvous.stop"',
-			cleanupStart,
-		);
-		expect(prepareStart).toBeGreaterThanOrEqual(0);
-		expect(prepareEnd).toBeGreaterThan(prepareStart);
-		expect(cleanupStart).toBeGreaterThan(prepareEnd);
-		expect(cleanupEnd).toBeGreaterThan(cleanupStart);
-		const code = new Bun.Transpiler({ loader: "ts" }).transformSync(
-			`async function close() { ${shutdown.slice(prepareStart, prepareEnd)}\n${shutdown.slice(cleanupStart, cleanupEnd)} }`,
-		);
-		const calls: unknown[] = [];
-		const close = new Function(
-			"options",
-			"tracker",
-			"shutdownStep",
-			"prepareSignalRestartRecovery",
-			"markUpdateRestarting",
-			"killAllBashProcesses",
-			`${code}\nreturn close();`,
-		);
-		await close(
-			{ reason: "signal" },
-			new ShutdownActivityTracker(),
-			async (_tracker: unknown, label: string, action: () => Promise<unknown>) => {
-				await action();
-				return label === "restartRecovery.prepare" ? outcome : "ok";
-			},
-			async () => {
-				calls.push("checkpoint");
-			},
-			() => {
-				calls.push("restarting");
-			},
-			async (options: unknown) => {
-				calls.push(options);
-			},
-		);
-		expect(calls).toEqual([
-			"checkpoint",
-			...(outcome === "ok" ? ["restarting"] : []),
-			{ preserveAgents: outcome === "ok" },
-		]);
-	});
+	for (const reason of ["signal", "replacement_started", "system_prepared_shutdown"] as const) {
+		for (const producerOutcome of ["ok", "failed"] as const) {
+			const outcomes =
+				reason === "signal" ? (["ok", "failed", "timeout"] as const) : (["ok"] as const);
+			test.each(
+				outcomes,
+			)(`${reason} cleanup with producer outcome ${producerOutcome} handles recovery preparation %s`, async (outcome) => {
+				const prepareStart = shutdown.indexOf("httpLifecycle.abortAll();");
+				const prepareEnd = shutdown.indexOf("const shutdownRequestId", prepareStart);
+				const cleanupStart = shutdown.indexOf("if (!options.skipBashProcessKill)");
+				const cleanupEnd = shutdown.indexOf('await step("integrityProbe.cancel"', cleanupStart);
+				expect(prepareStart).toBeGreaterThanOrEqual(0);
+				expect(prepareEnd).toBeGreaterThan(prepareStart);
+				expect(cleanupStart).toBeGreaterThan(prepareEnd);
+				expect(cleanupEnd).toBeGreaterThan(cleanupStart);
+				const code = new Bun.Transpiler({ loader: "ts" }).transformSync(
+					`async function close() { ${shutdown.slice(prepareStart, prepareEnd)}\n${shutdown.slice(cleanupStart, cleanupEnd)} }`,
+				);
+				const calls: unknown[] = [];
+				let phase = reason === "signal" ? "quiescing_tools" : "restarting";
+				const close = new Function(
+					"options",
+					"tracker",
+					"step",
+					"prepareSignalRestartRecovery",
+					"markUpdateRestarting",
+					"killAllBashProcesses",
+					"httpLifecycle",
+					"producerOutcome",
+					"stopCheckpointedNarratorRuns",
+					`${code}\nreturn close();`,
+				);
+				await close(
+					{ reason },
+					new ShutdownActivityTracker(),
+					async (label: string, action: () => unknown) => {
+						await action();
+						return label === "restartRecovery.prepare" ? outcome : "ok";
+					},
+					async () => {
+						calls.push("prepare");
+					},
+					() => {
+						phase = "restarting";
+						calls.push("restarting");
+					},
+					async (options: unknown) => {
+						calls.push(options);
+					},
+					{ abortAll: () => calls.push("abort") },
+					producerOutcome,
+					() => {
+						calls.push(`pause:${phase}`);
+						return phase === "restarting" ? 1 : 0;
+					},
+				);
+				const prepared = reason === "signal" && outcome === "ok";
+				expect(calls).toEqual([
+					"abort",
+					...(reason === "signal" ? ["prepare", ...(prepared ? ["restarting"] : [])] : []),
+					...(producerOutcome === "ok"
+						? [`pause:${reason !== "signal" || prepared ? "restarting" : "quiescing_tools"}`]
+						: []),
+					{ preserveAgents: prepared },
+				]);
+			});
+		}
+	}
 	test("owners and compute threads drain before database closure and the clean marker", () => {
 		const db = position("dbWorkerPool.shutdown");
 		const pg = position("postgresRuntime.close");
@@ -235,6 +352,25 @@ describe("main shutdown wiring without booting the server", () => {
 		expect(step).toContain("owner.closeMemoryDiagnosticWorkers()");
 		expect(step).toContain("35_000");
 		expect(step).not.toContain("closeAllSessions()");
+	});
+	test.each([
+		"if (storageHistory.pending)",
+		"if (outlineLiveDatabaseWork.size)",
+		"if (getTeamDatabaseMaintenanceStatus().pending)",
+	])("%s retains ownership without authorizing clean-shutdown hooks", (condition) => {
+		const boundary = shutdown.indexOf(condition);
+		expect(boundary).toBeGreaterThanOrEqual(0);
+		const start = shutdown.indexOf("return {", boundary);
+		const end = shutdown.indexOf("\n\t\t\t};", start);
+		expect(end).toBeGreaterThan(start);
+		const reason = "unattended_idle";
+		const result = new Function("options", "process", "startedAt", shutdown.slice(start, end + 6))(
+			{ reason },
+			{ pid: 1 },
+			Date.now(),
+		);
+		expect(result).toMatchObject({ success: false, clean: false, reason });
+		expect(canRunCleanShutdownHooks(reason, result)).toBe(false);
 	});
 	test("real compute close promises are awaited together and failures degrade shutdown", () => {
 		for (const close of [
@@ -326,7 +462,11 @@ describe("main shutdown wiring without booting the server", () => {
 		const diagnostics: unknown[] = [];
 		const options: unknown[] = [];
 		const delays: number[] = [];
-		const result = { success: true };
+		const hookReasons: string[] = [];
+		const result = { success: true, reason: "", clean: true };
+		const shutdownReason = "unattended_idle";
+		let idle = false;
+		let deferred = 0;
 		new Function(
 			"registerGracefulShutdownHandler",
 			"registerOperatorShutdownHandler",
@@ -335,6 +475,15 @@ describe("main shutdown wiring without booting the server", () => {
 			"preservesRecoveryOnShutdown",
 			"setTimeout",
 			"process",
+			"runPostShutdownHooks",
+			"UNATTENDED_SHUTDOWN_REASON",
+			"canRunCleanShutdownHooks",
+			"fenceUnattendedShutdown",
+			"unattendedMode",
+			"shutdownState",
+			"httpLifecycle",
+			"hasActiveWebSocketHandlers",
+			"isScheduledTaskTickActive",
 			code,
 		)(
 			(handler: Handler) => handlers.push(handler),
@@ -345,8 +494,9 @@ describe("main shutdown wiring without booting the server", () => {
 					if (throws) throw new Error("PRIVATE_SINK_FAILURE");
 				},
 			},
-			async (requested: unknown) => {
+			async (requested: { reason: string }) => {
 				options.push(requested);
+				result.reason = requested.reason;
 				return result;
 			},
 			preservesRecoveryOnShutdown,
@@ -359,6 +509,23 @@ describe("main shutdown wiring without booting the server", () => {
 					throw new Error("must not exit a real process");
 				},
 			},
+			// Post-shutdown hooks are the seam unattended mode's power-off uses; the operator
+			// path must reach them for clean shutdowns.
+			async (reason: string) => {
+				hookReasons.push(reason);
+			},
+			shutdownReason,
+			canRunCleanShutdownHooks,
+			(...args: Parameters<typeof fenceUnattendedShutdown>) =>
+				idle ? Promise.resolve(true) : fenceUnattendedShutdown(...args),
+			{
+				revalidateIdle: async () => idle,
+				deferShutdown: () => deferred++,
+			},
+			{ promise: null },
+			{ activeCount: 1 },
+			() => false,
+			() => false,
 		);
 		expect(handlers).toHaveLength(2);
 		expect(await handlers[0]({ pid: 12345, version: "/private/HANDOFF_VERSION_CANARY" })).toBe(
@@ -367,6 +534,8 @@ describe("main shutdown wiring without booting the server", () => {
 		for (const reason of ["operator_shutdown", "system_prepared_shutdown"]) {
 			expect(await handlers[1]({ reason })).toBe(result);
 		}
+		expect(await handlers[1]({ reason: shutdownReason })).toBeNull();
+		expect(deferred).toBe(1);
 		expect(options).toEqual([
 			{
 				reason: "replacement_started",
@@ -385,9 +554,16 @@ describe("main shutdown wiring without booting the server", () => {
 			},
 		]);
 		expect(delays).toEqual([250, 250, 250]);
+		expect(hookReasons).toEqual(["operator_shutdown", "system_prepared_shutdown"]);
 		expect(diagnostics).toHaveLength(3);
 		for (const canary of ["/private/", "HANDOFF_VERSION_CANARY", "PRIVATE_SINK_FAILURE", "12345"])
 			expect(JSON.stringify(diagnostics)).not.toContain(canary);
+
+		idle = true;
+		result.clean = false;
+		expect(await handlers[1]({ reason: shutdownReason })).toBe(result);
+		expect(hookReasons).not.toContain(shutdownReason);
+		expect(delays).toEqual([250, 250, 250, 250]);
 	});
 	test("HMR pins shutdown ownership and registers delegating process hooks only once", () => {
 		expect(main).toContain('"narrafork.mainShutdown"');

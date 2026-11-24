@@ -39,6 +39,7 @@ export interface RunResult {
  * live half.
  */
 export interface RunControl {
+	checkpointStop?: import("./checkpoint-stop").CheckpointStop;
 	readonly startedAt: number;
 	/** The final persisted registration; the run never reconstructs its merge rules. */
 	binding?: RuntimeRunBinding;

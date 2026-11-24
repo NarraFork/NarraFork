@@ -1,4 +1,4 @@
-import { db } from "@server/db";
+import { db, sqlite } from "@server/db";
 import {
 	narratorBlacklistCmds,
 	narratorBlacklistDirs,
@@ -7,6 +7,12 @@ import {
 	narratorWhitelistDirs,
 	projects,
 } from "@server/db/schema";
+import type { ReadQueryOptions } from "@server/db/worker-read";
+import {
+	EXECUTION_POLICY_RULE_LIMIT,
+	type ExecutionPolicyFacts,
+} from "@server/lib/db-worker/execution-policy-query";
+import { runReadTask, WorkersUnavailableError } from "@server/lib/db-worker/pool";
 import { MAX_POLICY_SOURCE_DEPTH, policySourceIdOf } from "@server/lib/runtime-source";
 import { getSettingsRevision, settings } from "@server/lib/settings";
 import { eq, inArray } from "drizzle-orm";
@@ -24,14 +30,40 @@ export interface LoadedExecutionPolicy extends ExecutionPolicyRuleSet {
 	ownerNarratorId: string;
 	/** This narrator and its registered policy-source chain, never siblings. */
 	inheritedNarratorIds?: string[];
+	projectIds?: readonly string[];
 	projectId: string | null;
 	projectGitPath: string | null;
 	settingsRevision: number;
 }
 
 export class ExecutionPolicyRepository {
-	async load(narratorId: string): Promise<LoadedExecutionPolicy> {
-		return this.loadNow(narratorId);
+	async load(narratorId: string, signal?: AbortSignal): Promise<LoadedExecutionPolicy>;
+	async load(narratorId: string, readOptions?: ReadQueryOptions): Promise<LoadedExecutionPolicy>;
+	async load(
+		narratorId: string,
+		readOptionsOrSignal?: ReadQueryOptions | AbortSignal,
+	): Promise<LoadedExecutionPolicy> {
+		const readOptions =
+			readOptionsOrSignal instanceof AbortSignal
+				? { signal: readOptionsOrSignal }
+				: readOptionsOrSignal;
+		const signal = readOptions?.signal;
+		signal?.throwIfAborted();
+		if (!sqlite.filename || sqlite.filename === ":memory:" || sqlite.inTransaction) {
+			throw new WorkersUnavailableError("requires_committed_file");
+		}
+		const facts = await runReadTask<ExecutionPolicyFacts>(
+			sqlite.filename,
+			{ kind: "executionPolicyFacts", narratorId },
+			{
+				...readOptions,
+				diagnosticSource: "execution-policy-facts",
+				timeoutMs: Math.min(readOptions?.timeoutMs ?? 5_000, 5_000),
+				signal,
+			},
+		);
+		signal?.throwIfAborted();
+		return materializeExecutionPolicy(narratorId, facts);
 	}
 
 	/**
@@ -74,9 +106,8 @@ export class ExecutionPolicyRepository {
 			if (effectiveProjectId) contextProjects.add(effectiveProjectId);
 			next = policySourceIdOf(narrator);
 		}
-		const ownerNarratorId = inheritedNarratorIds.at(-1) ?? narratorId;
 		let projectGitPath: string | null = null;
-		const projectRuleSets: ExecutionPolicyRuleSet[] = [];
+		const projectRuleSets: (LegacyExecutionPolicyRuleSet | null)[] = [];
 		for (const contextProjectId of contextProjects) {
 			const project = store
 				.select({ chapterSettings: projects.chapterSettings, gitPath: projects.gitPath })
@@ -86,82 +117,94 @@ export class ExecutionPolicyRepository {
 			if (!project) throw new Error("Permission project context no longer exists");
 			if (contextProjectId === projectId) projectGitPath = project.gitPath;
 			// Switching a child's context cannot erase the parent's project deny layer.
-			projectRuleSets.push(
-				normalizeExecutionPolicyRuleSet(
-					project.chapterSettings as LegacyExecutionPolicyRuleSet,
-					"project",
-				),
-			);
+			projectRuleSets.push(project.chapterSettings as LegacyExecutionPolicyRuleSet | null);
 		}
 		const [whitelistDirs, blacklistDirs, commandWhitelist, commandBlacklist] = [
 			store
 				.select()
 				.from(narratorWhitelistDirs)
 				.where(inArray(narratorWhitelistDirs.narratorId, inheritedNarratorIds))
-				.limit(2001)
+				.limit(EXECUTION_POLICY_RULE_LIMIT + 1)
 				.all(),
 			store
 				.select()
 				.from(narratorBlacklistDirs)
 				.where(inArray(narratorBlacklistDirs.narratorId, inheritedNarratorIds))
-				.limit(2001)
+				.limit(EXECUTION_POLICY_RULE_LIMIT + 1)
 				.all(),
 			store
 				.select()
 				.from(narratorWhitelistCmds)
 				.where(inArray(narratorWhitelistCmds.narratorId, inheritedNarratorIds))
-				.limit(2001)
+				.limit(EXECUTION_POLICY_RULE_LIMIT + 1)
 				.all(),
 			store
 				.select()
 				.from(narratorBlacklistCmds)
 				.where(inArray(narratorBlacklistCmds.narratorId, inheritedNarratorIds))
-				.limit(2001)
+				.limit(EXECUTION_POLICY_RULE_LIMIT + 1)
 				.all(),
 		] as const;
 		if (
 			[whitelistDirs, blacklistDirs, commandWhitelist, commandBlacklist].some(
-				(rows) => rows.length > 2000,
+				(rows) => rows.length > EXECUTION_POLICY_RULE_LIMIT,
 			)
 		) {
 			throw new Error("Permission rule budget exceeded");
 		}
-		return {
-			narratorId,
-			ownerNarratorId,
+		return materializeExecutionPolicy(narratorId, {
 			inheritedNarratorIds,
 			projectId,
+			projectIds: [...contextProjects],
 			projectGitPath,
-			settingsRevision: getSettingsRevision(),
-			...mergeExecutionPolicyRuleSets(
-				normalizeExecutionPolicyRuleSet(settings.agent, "global"),
-				...projectRuleSets,
-				normalizeExecutionPolicyRuleSet(
-					{
-						whitelistDirs,
-						blacklistDirs: [],
-						commandWhitelist,
-						commandBlacklist,
-					},
-					"narrator",
-				),
-				{
-					directoryWhitelist: [],
-					directoryBlacklist: [
-						...blacklistDirs.map((row) => {
-							const normalized = normalizeDirectoryBlacklistRule(row, "narrator");
-							// Only persisted instance-signed rows confer the additional hard fence.
-							// Unsigned legacy/global/project IDs remain ordinary deny rules.
-							return isSignedReviewBoundaryRow(row)
-								? markTrustedReviewBoundary({ ...normalized, enabled: true })
-								: normalized;
-						}),
-					],
-					commandWhitelist: [],
-					commandBlacklist: [],
-				},
-			),
-		};
+			projectRuleSets,
+			whitelistDirs,
+			blacklistDirs,
+			commandWhitelist,
+			commandBlacklist,
+		});
 	}
+}
+
+function materializeExecutionPolicy(
+	narratorId: string,
+	facts: ExecutionPolicyFacts,
+): LoadedExecutionPolicy {
+	const {
+		inheritedNarratorIds,
+		projectId,
+		projectIds,
+		projectGitPath,
+		projectRuleSets,
+		whitelistDirs,
+		blacklistDirs,
+		commandWhitelist,
+		commandBlacklist,
+	} = facts;
+	const narratorRules = normalizeExecutionPolicyRuleSet(
+		{ whitelistDirs, commandWhitelist, commandBlacklist },
+		"narrator",
+	);
+	// Verify instance signatures in-process; the read Worker does not have the secret.
+	narratorRules.directoryBlacklist = blacklistDirs.map((row) => {
+		const normalized = normalizeDirectoryBlacklistRule(row, "narrator");
+		return isSignedReviewBoundaryRow(row)
+			? markTrustedReviewBoundary({ ...normalized, enabled: true })
+			: normalized;
+	});
+	return {
+		narratorId,
+		ownerNarratorId: inheritedNarratorIds.at(-1) ?? narratorId,
+		inheritedNarratorIds,
+		projectId,
+		projectIds,
+		projectGitPath,
+		settingsRevision: getSettingsRevision(),
+		...mergeExecutionPolicyRuleSets(
+			normalizeExecutionPolicyRuleSet(settings.agent, "global"),
+			...projectRuleSets.map((rules) => normalizeExecutionPolicyRuleSet(rules, "project")),
+			narratorRules,
+		),
+	};
 }
 export const executionPolicyRepository = new ExecutionPolicyRepository();

@@ -20,6 +20,7 @@ import {
 	resolveNarratorCapabilities,
 	resolveNarratorRuntimePolicy,
 } from "../trait-layer-service";
+import { captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 const created: string[] = [];
 
@@ -94,11 +95,11 @@ describe("policy source layer", () => {
 		const a = await narrator();
 		const b = await narrator();
 		await setPolicySource(b, a);
-		await expect(setPolicySource(a, b)).rejects.toThrow("cycle");
-		await expect(setPolicySource(a, a)).rejects.toThrow("cycle");
+		expect(await captureWorkerRejectionThrower(setPolicySource(a, b))).toThrow("cycle");
+		expect(await captureWorkerRejectionThrower(setPolicySource(a, a))).toThrow("cycle");
 		// A cycle written behind the service's back still fails closed.
 		await db.update(narrators).set({ policySourceNarratorId: b }).where(eq(narrators.id, a));
-		await expect(resolveNarratorRuntimePolicy(a)).rejects.toThrow("cycle");
+		expect(await captureWorkerRejectionThrower(resolveNarratorRuntimePolicy(a))).toThrow("cycle");
 
 		// The column's FK refuses a missing source outright.
 		expect(() =>
@@ -119,18 +120,20 @@ describe("policy source layer", () => {
 				.set({ policySourceNarratorId: ids[i - 1] })
 				.where(eq(narrators.id, ids[i]));
 		}
-		await expect(resolveNarratorRuntimePolicy(ids.at(-1) as string)).rejects.toThrow("too deep");
+		expect(
+			await captureWorkerRejectionThrower(resolveNarratorRuntimePolicy(ids.at(-1) as string)),
+		).toThrow("too deep");
 	});
 
 	test("an unreadable registration or ceiling never resolves as unrestricted", async () => {
 		const id = await narrator(["custom-runtime-policy:not-json"]);
-		await expect(resolveNarratorRuntimePolicy(id)).rejects.toThrow();
+		expect(await captureWorkerRejectionThrower(resolveNarratorRuntimePolicy(id))).toThrow();
 		await setTraits(id, []);
 		await db
 			.update(narrators)
 			.set({ runtimeRegistrationJson: { version: 2 } as never })
 			.where(eq(narrators.id, id));
-		await expect(resolveNarratorRuntimePolicy(id)).rejects.toThrow();
+		expect(await captureWorkerRejectionThrower(resolveNarratorRuntimePolicy(id))).toThrow();
 	});
 });
 

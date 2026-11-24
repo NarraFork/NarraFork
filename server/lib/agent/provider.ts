@@ -18,6 +18,7 @@ import { getCodexManager } from "../codex-manager";
 import { resolveCommandCodeToken } from "../commandcode-manager";
 import { catalogError } from "../errors";
 import { logger } from "../logger";
+import { getProviderKeyStore } from "../provider-keys";
 import {
 	FOLLOW_DEFAULT_MODEL,
 	getAnthropicProviderConfig,
@@ -35,6 +36,7 @@ import type { UsageData } from "../usage-tracking";
 import { AnthropicProvider } from "./anthropic-provider";
 import { CodexProvider } from "./codex-provider";
 import { buildCommandCodeProvider } from "./commandcode-provider";
+import { reportCredentialId } from "./credential-report";
 import { GeminiInteractionsProvider } from "./gemini-interactions-provider";
 import { GeminiProvider } from "./gemini-provider";
 import type { ImageGenerationRequest, ImageGenerationResponse } from "./image-generation-api";
@@ -90,6 +92,10 @@ export interface ChatParams extends ProtocolChatParams {
 	stickySessionKey?: string;
 	/** Local transport isolation only; does not change wire session IDs or credential affinity. */
 	transportSessionKey?: string;
+	/** Diagnostic calls are never allowed to run upstream-hosted tools. */
+	diagnostic?: boolean;
+	/** Opt-in adapters append this after projecting the unchanged anchor request. */
+	diagnosticFork?: { suffix: string; credentialId?: string; validateCredential?: () => boolean };
 	/** Reasoning effort level — maps to thinking config (Anthropic), reasoning config (Codex), or provider-specific effort ("max" may be provider-specific) */
 	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max";
 	/** Optional output ceiling; effective model metadata may lower, never raise it. */
@@ -119,7 +125,10 @@ export interface ChatParams extends ProtocolChatParams {
 	 * to distinguish a real empty upstream response from local request preparation
 	 * paths that completed without ever contacting the API.
 	 */
-	onRequestStart?: (info?: { credentialId?: string }) => void;
+	onRequestStart?: (info?: {
+		credentialId?: string;
+		validateDiagnosticCredential?: () => boolean;
+	}) => void;
 	/** Complete final input counts; await bounded numeric preparation before sending/consuming output. */
 	onInputCharacters?: (counts: ContextInputCharacters | null) => void | Promise<void>;
 }
@@ -235,6 +244,10 @@ export interface GenerateMetaResult {
 // === The adapter interface ===
 
 export interface ProviderAdapter {
+	/** This adapter can append the diagnostic suffix without replacing the request prefix. */
+	supportsDiagnosticFork?(model: string, credentialId?: string): boolean;
+	/** Production configured adapters carry a read-only check against live settings. */
+	isDiagnosticConnectionCurrent?(): boolean;
 	/** Native wire capability, intersected with effective model input metadata. */
 	supportsNativeMediaInput?(
 		media: Pick<NativeMediaInput, "type" | "mediaType" | "filename">,
@@ -357,7 +370,7 @@ builtinProviderSources.register("tokendance", {
 				"TokenDance prefix conflicts with an existing API provider. Rename the existing provider prefix before using TokenDance.",
 			);
 		}
-		return new TokenDanceProvider();
+		return reportCredentialId(new TokenDanceProvider(), "tokendance");
 	},
 	listReadiness: () => {
 		const config = getTokenDanceRuntimeConfig();
@@ -392,8 +405,11 @@ builtinProviderSources.register("codex", {
 });
 
 builtinProviderSources.register("CommandCode", {
-	resolve: (provider, model) =>
-		provider === "CommandCode" ? buildCommandCodeProvider(model, settings.commandCode) : null,
+	resolve: (provider, model) => {
+		if (provider !== "CommandCode") return null;
+		const adapter = buildCommandCodeProvider(model, settings.commandCode);
+		return adapter ? reportCredentialId(adapter, "CommandCode") : null;
+	},
 	listReadiness: () => [
 		{
 			id: "builtin:CommandCode",
@@ -455,10 +471,31 @@ function registerCredentialProviderSource<
 			const plain =
 				keys.length === 0 ||
 				(keys.length === 1 && keys[0]?.apiKey === config.apiKey && !keys[0]?.network);
-			if (plain) return adapterFor(prefix, model, config);
-			return new PooledProvider(config.id, (key) =>
-				adapterFor(prefix, model, withProviderKey(config, key)),
-			);
+			const configVersion = JSON.stringify(config);
+			const protocolVersion = resolveModelProtocol(prefix, model);
+			// A single-credential connection is billed to the connection itself.
+			const adapter: ProviderAdapter = plain
+				? reportCredentialId(adapterFor(prefix, model, config), config.id)
+				: new PooledProvider(config.id, (key) =>
+						adapterFor(prefix, model, withProviderKey(config, key)),
+					);
+			if (adapter.supportsDiagnosticFork) {
+				adapter.isDiagnosticConnectionCurrent = () => {
+					const live = getConfig(prefix);
+					if (
+						!live ||
+						JSON.stringify(live) !== configVersion ||
+						resolveModelProtocol(prefix, model) !== protocolVersion
+					)
+						return false;
+					if (!plain || kind === "nug") return true;
+					const stored = getProviderKeyStore().list(config.id);
+					return stored.length === 0
+						? keys.length === 0
+						: stored.some((key) => !key.disabled && key.apiKey === live.apiKey && !key.network);
+				};
+			}
+			return adapter;
 		},
 		listReadiness: () =>
 			listConfigs().map((config) => ({

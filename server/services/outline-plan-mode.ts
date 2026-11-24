@@ -722,6 +722,8 @@ export async function decideOutlinePlanRequest(args: {
 	requestId: string;
 	principal: OutlinePrincipal;
 	body: OutlinePlanDecisionRequest;
+	/** Re-checks the person may still decide, just before the plan is written (Teams M1). */
+	assertStillAllowed?: () => Promise<void>;
 }): Promise<{ commit: { id: string; seq: number } | null }> {
 	const { pendingPermissions } = await import("./narrator-session-state");
 	const pending = pendingPermissions.get(args.requestId);
@@ -751,6 +753,7 @@ export async function decideOutlinePlanRequest(args: {
 	}
 	const { resolvePermission } = await import("./narrator-permission");
 	const feedback = body.feedback?.trim() || null;
+	await args.assertStillAllowed?.();
 	let decision: Awaited<ReturnType<typeof decideOutlinePlan>>;
 	try {
 		decision = await decideOutlinePlan({

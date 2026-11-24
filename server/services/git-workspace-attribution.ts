@@ -220,7 +220,9 @@ export function redactGitActors(
 export async function redactGitModificationView(
 	view: WorkspaceModificationView,
 	principal: NarratorPrincipal,
+	signal?: AbortSignal,
 ): Promise<WorkspaceModificationView> {
+	signal?.throwIfAborted();
 	const ids = new Set<string>();
 	const add = (actor: AttributionActor | null) => {
 		if (actor?.narratorId) ids.add(actor.narratorId);
@@ -240,12 +242,17 @@ export async function redactGitModificationView(
 	// Bounded pages, with no messages, titles or snapshot contents loaded for ACL checks.
 	const all = [...ids];
 	for (let start = 0; start < all.length; start += 200) {
+		signal?.throwIfAborted();
 		const rows = await db.query.narrators.findMany({
 			where: inArray(narrators.id, all.slice(start, start + 200)),
 			columns: NARRATOR_ACL_COLUMNS,
 			limit: 200,
 		});
-		for (const row of rows) if (await canReadNarrator(row, principal)) readable.add(row.id);
+		for (const row of rows) {
+			signal?.throwIfAborted();
+			if (await canReadNarrator(row, principal)) readable.add(row.id);
+		}
 	}
+	signal?.throwIfAborted();
 	return redactGitActors(view, readable);
 }

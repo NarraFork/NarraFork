@@ -327,6 +327,8 @@ export interface ExecutionBackend {
 	/** Executor advertises the `push`/`fetch` write operations. */
 	readonly supportsGitRemoteSync?: boolean;
 	gitWorkspace?(request: GitWorkspaceRequest, signal?: AbortSignal): Promise<GitWorkspaceResult>;
+	/** Canonical fs.stat path identity capability. */
+	readonly supportsFsStatResolvedPath?: boolean;
 	readonly deviceId: string;
 	readonly kind: "local" | "remote";
 	/** Pure lexical path operations for this target. */
