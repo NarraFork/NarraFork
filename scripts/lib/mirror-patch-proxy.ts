@@ -5,6 +5,7 @@ import { isValidGitHubRepository } from "../../shared/github-repository";
 import { MAX_RELEASE_PATCH_BYTES } from "../../shared/release-patch";
 import { isValidReleaseVersion } from "../../shared/release-version";
 import { byteLimit, hashReleaseFile, type ReleaseAssetDownloader } from "./ci-release-io";
+
 type PatchFetch = (url: string, init: RequestInit) => Promise<Response>;
 
 export function resolveMirrorPatchProxyOrigin(value?: string): string | undefined {
@@ -48,7 +49,7 @@ export async function downloadMirrorPatchFromSource(
 			!isValidGitHubRepository(repository) ||
 			!tag.startsWith("v") ||
 			!isValidReleaseVersion(tag.slice(1)) ||
-			!(/^[a-zA-Z0-9._+-]+\.zstd-patch$/.test(name)) ||
+			!/^[a-zA-Z0-9._+-]+\.zstd-patch$/.test(name) ||
 			!Number.isSafeInteger(size) ||
 			size <= 0 ||
 			size > MAX_RELEASE_PATCH_BYTES ||
