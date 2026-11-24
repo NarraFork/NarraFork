@@ -1,4 +1,5 @@
-import { beforeAll, describe, expect, it } from "bun:test";
+import { beforeAll, describe, expect, it, spyOn } from "bun:test";
+import { narratorsApi } from "@frontend/lib/api/narrators";
 import { MantineProvider } from "@mantine/core";
 import type { ModelTraceResultBlock } from "@shared/modeltrace-result";
 import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
@@ -10,11 +11,25 @@ import { createRoot } from "react-dom/client";
 import { I18nextProvider } from "react-i18next";
 import en from "../../../../locales/en/narrator.json";
 import zh from "../../../../locales/zh-CN/narrator.json";
+import { ExactRow } from "../ExactRow";
 import { MODELTRACE_LAYOUT, modelTraceResultHeight } from "../measure/measure-modeltrace-result";
 import { installCanvasStub } from "../measure/test-canvas-stub";
 import type { RenderLod } from "../prepared-block";
-import { VLIST_REGISTRY } from "../registry";
-import { renderElement, resolveRenderExtra } from "../render-registry";
+import { measureElementCached } from "../registry";
+
+const noop = () => {};
+const toggles = {
+	onToggle: noop,
+	onToggleItems: noop,
+	onToggleEarlier: noop,
+	onToggleRow: noop,
+	onToggleTranslation: noop,
+	onTogglePrompt: noop,
+	onToggleFileChanges: noop,
+	onPlanTree: noop,
+	onToggleTextExpanded: noop,
+};
+const renderLabels = {} as never;
 
 beforeAll(() => {
 	installCanvasStub();
@@ -50,7 +65,13 @@ const SUCCESS: ModelTraceResultBlock = {
 
 async function renderCard(
 	block: ModelTraceResultBlock,
-	{ width = 240, language = "en", lod = 5 as RenderLod, theme = "dark" as "dark" | "light" } = {},
+	{
+		width = 240,
+		language = "en",
+		lod = 5 as RenderLod,
+		theme = "dark" as "dark" | "light",
+		calibrationNarratorId = undefined as string | undefined,
+	} = {},
 ) {
 	const i18n = createInstance();
 	await i18n.init({
@@ -58,32 +79,49 @@ async function renderCard(
 		fallbackLng: "en",
 		resources: { en: { narrator: en }, "zh-CN": { narrator: zh } },
 	});
-	const segment: AdapterSegment = {
-		kind: "message",
-		msg: rowWithElements({ id: "modeltrace-result-message", role: "disp" }, [block as never]),
-	};
-	const specs = adaptSegment(segment, { lod });
-	expect(specs).toHaveLength(1);
-	const spec = specs[0];
-	if (!spec) throw new Error("Missing ModelTrace element");
-	expect(spec.kind).toBe("modeltrace-result");
-	const measured = VLIST_REGISTRY[spec.kind].measure(spec.data, width, lod, spec.opts);
 	const container = document.createElement("div");
 	container.style.width = `${width}px`;
 	document.body.appendChild(container);
 	const root = createRoot(container);
-	act(() => {
-		root.render(
-			<I18nextProvider i18n={i18n}>
-				<MantineProvider forceColorScheme={theme}>
-					{renderElement(spec.kind, measured, resolveRenderExtra(spec))}
-				</MantineProvider>
-			</I18nextProvider>,
-		);
-	});
+	function rerender(next: ModelTraceResultBlock) {
+		const segment: AdapterSegment = {
+			kind: "message",
+			msg: rowWithElements({ id: "modeltrace-result-message", role: "disp" }, [next as never]),
+		};
+		const specs = adaptSegment(segment, { lod });
+		expect(specs).toHaveLength(1);
+		const spec = specs[0];
+		if (!spec) throw new Error("Missing ModelTrace element");
+		expect(spec.kind).toBe("modeltrace-result");
+		const measured = measureElementCached(spec.kind, spec.data, width, lod, spec.opts, spec.key);
+		act(() => {
+			root.render(
+				<I18nextProvider i18n={i18n}>
+					<MantineProvider forceColorScheme={theme}>
+						<ExactRow
+							item={{ spec, measured }}
+							top={0}
+							height={measured.height}
+							hitHeight={measured.height}
+							contentWidth={width}
+							itemId={undefined}
+							sourceIds={[]}
+							interactionSig=""
+							toggles={toggles}
+							renderLabels={renderLabels}
+							narratorId={calibrationNarratorId ?? "read-only-narrator"}
+							canCalibrateModelTrace={calibrationNarratorId !== undefined}
+						/>
+					</MantineProvider>
+				</I18nextProvider>,
+			);
+		});
+		return measured;
+	}
 	return {
 		container,
-		measured,
+		measured: rerender(block),
+		rerender,
 		unmount() {
 			act(() => root.unmount());
 			container.remove();
@@ -154,15 +192,172 @@ describe("ModelTrace result adapter → measure → render", () => {
 		}
 	});
 
-	it("labels single-sample percentages as uncalibrated weights", async () => {
+	it("normalizes historical partial weights over the displayed top five, but not scored results", async () => {
+		const results = [0.3, 0.1, 0.05, 0.05, null, 0.02].map((probability, index) => ({
+			model: `candidate-${index}`,
+			displayName: `Candidate ${index}`,
+			probability,
+		}));
+		const { container, rerender, unmount } = await renderCard(
+			{ ...SUCCESS, decision: "partial", results },
+			{ language: "zh-CN" },
+		);
+		const bars = () =>
+			Array.from(container.querySelectorAll('[role="progressbar"]'), (bar) =>
+				Number(bar.getAttribute("aria-valuenow")),
+			);
+		try {
+			expect(textOnly(container)).toContain(zh.modelTracePartial);
+			expect(textOnly(container)).not.toContain("Candidate 5");
+			expect(bars()).toEqual([60, 20, 10, 10]);
+			expect(results[0]?.probability).toBe(0.3);
+			rerender({ ...SUCCESS, decision: "scored", results });
+			expect(bars()).toEqual([30, 10, 5, 5]);
+		} finally {
+			unmount();
+		}
+	});
+
+	it("preserves zero weights without dividing by zero", async () => {
 		const { container, unmount } = await renderCard({
-			type: "modeltrace_result",
+			...SUCCESS,
 			decision: "partial",
-			results: [{ model: "candidate", displayName: "Candidate", probability: 0.427 }],
+			results: [{ model: "candidate", displayName: "Candidate", probability: 0 }],
 		});
 		try {
-			expect(textOnly(container)).toContain("42.7%");
+			expect(textOnly(container)).toContain("0.0%");
 			expect(textOnly(container)).toContain(en.modelTracePartial);
+		} finally {
+			unmount();
+		}
+	});
+
+	it("repaints same-key sample progress and updates geometry for the final result", async () => {
+		const progress: ModelTraceResultBlock = {
+			type: "modeltrace_result",
+			results: [],
+			calibrationRequested: true,
+			progressOnly: true,
+			sampleProgress: [
+				{ state: "complete" },
+				{ state: "running", attempt: 1 },
+				{ state: "pending" },
+			],
+		};
+		const { container, measured, rerender, unmount } = await renderCard(progress);
+		const states = () =>
+			Array.from(container.querySelectorAll("[data-modeltrace-sample-state]"), (slot) =>
+				slot.getAttribute("data-modeltrace-sample-state"),
+			);
+		const slotHeight = MODELTRACE_LAYOUT.footnote + MODELTRACE_LAYOUT.gap;
+		try {
+			expect(textOnly(container)).toContain(en.modelTraceSampling);
+			expect(textOnly(container)).not.toContain(en.modelTraceCalibrationIncomplete);
+			expect(states()).toEqual(["complete", "running", "pending"]);
+			expect(measured.height).toBe(modelTraceResultHeight(0) + 3 * slotHeight);
+			const updated = rerender({
+				...progress,
+				sampleProgress: [
+					{ state: "failed" },
+					{ state: "retrying", attempt: 2, text: "Transient failure" },
+					{ state: "cancelled" },
+				],
+			});
+			expect(states()).toEqual(["failed", "retrying", "cancelled"]);
+			expect(textOnly(container)).toContain("Sample 2: Retrying · Attempt 2 · Transient failure");
+			expect(updated.height).toBe(measured.height);
+			const final = rerender({
+				...SUCCESS,
+				decision: "scored",
+				calibrationRequested: true,
+				sampleProgress: [{ state: "complete" }, { state: "complete" }, { state: "complete" }],
+			});
+			expect(final.height).toBe(modelTraceResultHeight(5) + 3 * slotHeight);
+			expect(textOnly(container)).toContain("62.1%");
+			expect(textOnly(container)).not.toContain(en.modelTraceSampling);
+		} finally {
+			unmount();
+		}
+	});
+
+	it("submits calibration with the active narrator and result ID, and retries after a POST error", async () => {
+		const source: ModelTraceResultBlock = { ...SUCCESS, decision: "partial", calibrationId: "r1" };
+		const { container, measured, rerender, unmount } = await renderCard(source, {
+			calibrationNarratorId: "trace-child",
+		});
+		const { promise, resolve } = Promise.withResolvers<{ id: string }>();
+		const request = spyOn(narratorsApi, "calibrateModelTrace")
+			.mockRejectedValueOnce(new Error("Calibration request failed"))
+			.mockImplementationOnce(() => promise);
+		const button = container.querySelector("button");
+		const click = () => button?.dispatchEvent(new window.Event("click", { bubbles: true }));
+		try {
+			expect(button?.textContent).toBe(en.modelTraceCalibrate);
+			expect(measured.height).toBe(
+				modelTraceResultHeight(5) + MODELTRACE_LAYOUT.calibration + MODELTRACE_LAYOUT.gap,
+			);
+			await act(async () => {
+				click();
+			});
+			expect(container.querySelector('[role="alert"]')?.textContent).toBe(
+				"Calibration request failed",
+			);
+			expect(button?.hasAttribute("disabled")).toBe(false);
+			act(() => {
+				click();
+				click();
+			});
+			expect(button?.hasAttribute("data-loading")).toBe(true);
+			expect(button?.hasAttribute("disabled")).toBe(true);
+			expect(request.mock.calls).toEqual([
+				["trace-child", "r1"],
+				["trace-child", "r1"],
+			]);
+			await act(async () => resolve({ id: "trace-child" }));
+			expect(button?.textContent).toBe(en.modelTraceCalibrationRequested);
+			expect(button?.hasAttribute("data-loading")).toBe(false);
+			rerender({ ...SUCCESS, decision: "scored" });
+			expect(container.querySelector("button")).toBeNull();
+		} finally {
+			request.mockRestore();
+			unmount();
+		}
+	});
+
+	it("offers continued calibration only on a final card with a fresh token", async () => {
+		const source: ModelTraceResultBlock = {
+			type: "modeltrace_result",
+			decision: "unscorable",
+			calibrationRequested: true,
+			calibrationId: "next-round",
+			results: [],
+			sampleProgress: [{ state: "complete" }, { state: "failed" }, { state: "cancelled" }],
+		};
+		const { container, measured, rerender, unmount } = await renderCard(source, {
+			calibrationNarratorId: "trace-child",
+			language: "zh-CN",
+		});
+		try {
+			expect(container.querySelector("button")?.textContent).toBe(zh.modelTraceContinueCalibration);
+			expect(textOnly(container)).toContain(zh.modelTraceCalibrationIncomplete);
+			const inProgress = rerender({ ...source, progressOnly: true, decision: undefined });
+			expect(container.querySelector("button")).toBeNull();
+			expect(measured.height - inProgress.height).toBe(
+				MODELTRACE_LAYOUT.calibration + MODELTRACE_LAYOUT.footnote + 2 * MODELTRACE_LAYOUT.gap,
+			);
+		} finally {
+			unmount();
+		}
+	});
+
+	it("never shows a calibration button on an external transcript", async () => {
+		const { container, unmount } = await renderCard({
+			...SUCCESS,
+			decision: "partial",
+			calibrationId: "r1",
+		});
+		try {
+			expect(container.querySelector("button")).toBeNull();
 		} finally {
 			unmount();
 		}
