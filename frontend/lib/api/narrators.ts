@@ -49,6 +49,7 @@ import type {
 	ApiEntity,
 	BlacklistCmd,
 	BlacklistDir,
+	BufferedMessageEditLease,
 	BufferMessageSummary,
 	CommandBlacklistRuleInput,
 	CommandWhitelistRuleInput,
@@ -1362,13 +1363,18 @@ export const narratorsApi = {
 		),
 	getBufferedMessages: (id: string, signal?: AbortSignal) =>
 		request<BufferMessageSummary[]>(`/narrators/${id}/buffer`, { signal }),
-	beginBufferedMessageEdit: (narratorId: string, messageId: string, token: string) =>
-		request<{ ok: true; token: string; expiresAt: number; leaseMs: number }>(
+	beginBufferedMessageEdit: (
+		narratorId: string,
+		messageId: string,
+		token: string,
+		expectedRevision?: number,
+	) =>
+		request<BufferedMessageEditLease>(
 			`/narrators/${encodeURIComponent(narratorId)}/buffer/${encodeURIComponent(messageId)}/edit`,
-			{ method: "POST", body: JSON.stringify({ token }) },
+			{ method: "POST", body: JSON.stringify({ token, expectedRevision }) },
 		),
 	renewBufferedMessageEdit: (narratorId: string, messageId: string, token: string) =>
-		request<{ ok: true; token: string; expiresAt: number; leaseMs: number }>(
+		request<BufferedMessageEditLease>(
 			`/narrators/${encodeURIComponent(narratorId)}/buffer/${encodeURIComponent(messageId)}/edit`,
 			{ method: "PATCH", body: JSON.stringify({ token }) },
 		),

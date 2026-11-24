@@ -1,6 +1,7 @@
 import { notifications } from "@mantine/notifications";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, type BufferMessageSummary } from "../../../lib/api";
+import { ApiError } from "../../../lib/api/client";
 import type {
 	QueuedEditPayload,
 	UseQueuedMessageActionsOptions,
@@ -13,6 +14,8 @@ interface EditLease {
 	status: "acquiring" | "active" | "lost";
 	opened: boolean;
 	expiresAt: number;
+	contentRevision?: number;
+	stale?: boolean;
 	error?: string;
 	attempted?: boolean;
 	retired?: boolean;
@@ -32,6 +35,16 @@ interface EditScope {
 	disposed: boolean;
 	edit: EditLease | null;
 	releasingEdit?: EditLease;
+}
+
+/** Secure UUID v4, including non-secure LAN HTTP origins without randomUUID. */
+function editToken() {
+	if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+	const bytes = crypto.getRandomValues(new Uint8Array(16));
+	bytes[6] = ((bytes[6] ?? 0) & 0x0f) | 0x40;
+	bytes[8] = ((bytes[8] ?? 0) & 0x3f) | 0x80;
+	const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+	return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
 function stopTimers(edit: EditLease) {
@@ -97,11 +110,21 @@ export function useQueuedMessageEdit(options: UseQueuedMessageActionsOptions) {
 			if (!live(edit) || edit.retired) return;
 			stopTimers(edit);
 			edit.status = "lost";
-			edit.error = `${t("queuedEditProtectionLost")} ${error instanceof Error ? error.message : String(error)}`;
+			edit.stale =
+				error instanceof ApiError &&
+				error.status === 409 &&
+				error.data?.code === "BUFFER_EDIT_STALE";
+			edit.error = edit.stale
+				? t("queuedEditStale")
+				: `${t("queuedEditProtectionLost")} ${error instanceof Error ? error.message : String(error)}`;
 			refresh();
 			notifications.show({ color: "red", title: t("editQueuedFailed"), message: edit.error });
+			if (edit.stale) {
+				reconcileBufferedMessages();
+				void releaseLease(edit);
+			}
 		},
-		[live, refresh, t],
+		[live, refresh, reconcileBufferedMessages, t],
 	);
 	const startTimers = useCallback(
 		(edit: EditLease) => {
@@ -132,6 +155,9 @@ export function useQueuedMessageEdit(options: UseQueuedMessageActionsOptions) {
 						if (result.token !== edit.token || result.expiresAt <= Date.now()) {
 							throw new Error(t("queuedEditExpired"));
 						}
+						if (result.contentRevision !== edit.contentRevision) {
+							throw new ApiError(t("queuedEditStale"), 409, { code: "BUFFER_EDIT_STALE" });
+						}
 						edit.expiresAt = result.expiresAt;
 						armExpiry();
 					} catch (error) {
@@ -151,6 +177,7 @@ export function useQueuedMessageEdit(options: UseQueuedMessageActionsOptions) {
 			const previous = scope.edit;
 			if (previous?.saving) return Promise.resolve();
 			if (previous?.message.id === message.id) {
+				if (previous.stale) return Promise.resolve();
 				if (previous.acquiring) return previous.acquiring;
 				if (previous.status === "active" && previous.expiresAt > Date.now())
 					return Promise.resolve();
@@ -160,7 +187,7 @@ export function useQueuedMessageEdit(options: UseQueuedMessageActionsOptions) {
 					? previous
 					: {
 							message,
-							token: crypto.randomUUID(),
+							token: editToken(),
 							narratorId,
 							status: "acquiring",
 							opened: false,
@@ -182,12 +209,23 @@ export function useQueuedMessageEdit(options: UseQueuedMessageActionsOptions) {
 					if (edit.renewing) await edit.renewing;
 					if (!live(edit) || edit.retired) return;
 					edit.attempted = true;
-					const admission = api.beginBufferedMessageEdit(narratorId, message.id, edit.token);
+					const admission = api.beginBufferedMessageEdit(
+						narratorId,
+						message.id,
+						edit.token,
+						edit.opened ? edit.contentRevision : undefined,
+					);
 					edit.admitting = admission;
 					const result = await admission;
 					if (!live(edit) || edit.retired) return;
 					if (result.token !== edit.token || result.expiresAt <= Date.now()) {
 						throw new Error(t("queuedEditExpired"));
+					}
+					if (!Number.isSafeInteger(result.contentRevision) || result.contentRevision < 0) {
+						throw new Error(t("queuedEditExpired"));
+					}
+					if (edit.opened && result.contentRevision !== edit.contentRevision) {
+						throw new ApiError(t("queuedEditStale"), 409, { code: "BUFFER_EDIT_STALE" });
 					}
 					edit.expiresAt = result.expiresAt;
 					// On first open, do not seed the draft from a potentially stale WS snapshot.
@@ -200,6 +238,13 @@ export function useQueuedMessageEdit(options: UseQueuedMessageActionsOptions) {
 						if (!live(edit) || edit.retired) return;
 						const latest = messages.find((row) => row.id === message.id);
 						if (!latest || edit.expiresAt <= Date.now()) throw new Error(t("queuedEditExpired"));
+						if (
+							latest.contentRevision !== undefined &&
+							latest.contentRevision !== result.contentRevision
+						) {
+							throw new ApiError(t("queuedEditStale"), 409, { code: "BUFFER_EDIT_STALE" });
+						}
+						edit.contentRevision = result.contentRevision;
 						edit.message = latest;
 						setQueuedMessages((rows) => rows.map((row) => (row.id === message.id ? latest : row)));
 					}
@@ -231,6 +276,7 @@ export function useQueuedMessageEdit(options: UseQueuedMessageActionsOptions) {
 		refresh();
 		void releaseLease(target).then((ok) => {
 			if (ok && scope.releasingEdit === target) scope.releasingEdit = undefined;
+			refresh();
 			if (!ok && !scope.disposed && scopeRef.current === scope) {
 				notifications.show({ color: "red", message: t("queuedEditReleaseFailed") });
 			}
@@ -271,6 +317,14 @@ export function useQueuedMessageEdit(options: UseQueuedMessageActionsOptions) {
 					return true;
 				} catch (error) {
 					if (!live(edit)) return false;
+					if (
+						error instanceof ApiError &&
+						error.status === 409 &&
+						error.data?.code === "BUFFER_EDIT_STALE"
+					) {
+						loseProtection(edit, error);
+						return false;
+					}
 					reconcileBufferedMessages();
 					notifications.show({
 						color: "red",
@@ -293,8 +347,13 @@ export function useQueuedMessageEdit(options: UseQueuedMessageActionsOptions) {
 		queuedEditLockedId: edit?.message.id,
 		queuedEditProtected: edit?.status === "active" && edit.expiresAt > Date.now(),
 		queuedEditError: edit?.error,
-		isQueuedEditLocked: (id?: string) =>
-			!!scope.edit && (id === undefined || scope.edit.message.id === id),
+		queuedEditStale: edit?.stale === true,
+		queueMutationsDisabled: !!scope.edit || !!scope.releasingEdit?.releasing,
+		isQueuedEditLocked: () =>
+			scope.disposed ||
+			scopeRef.current !== scope ||
+			!!scope.edit ||
+			!!scope.releasingEdit?.releasing,
 		handleStartEditQueued,
 		handleCancelEditQueued,
 		handleSaveEditQueued,

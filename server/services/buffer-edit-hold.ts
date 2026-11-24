@@ -11,14 +11,18 @@ export interface BufferEditIdentity {
 }
 interface Lease extends BufferEditIdentity {
 	expiresAt: number;
+	contentRevision: number;
 }
 interface MutationScope {
 	narratorId: string;
 	messageId?: string;
 	active: boolean;
 	signal?: AbortSignal;
+	contentRevision?: number;
 }
 const conflict = () => new AppError("Buffered input is being edited", 409, "BUFFER_EDIT_CONFLICT");
+export const staleBufferEdit = () =>
+	new AppError("Buffered message changed since this edit started", 409, "BUFFER_EDIT_STALE");
 
 /** Single-process admission only: never retains a database transaction or execution owner. */
 export function createBufferEditHolds(now = Date.now, leaseMs = BUFFER_EDIT_LEASE_MS) {
@@ -79,12 +83,22 @@ export function createBufferEditHolds(now = Date.now, leaseMs = BUFFER_EDIT_LEAS
 		token: lease.token,
 		expiresAt: lease.expiresAt,
 		leaseMs,
+		contentRevision: lease.contentRevision,
 	});
 	return {
 		held,
 		expire,
 		exclusive,
 		mutationSignal: () => scope.getStore()?.signal,
+		assertMutationRevision(contentRevision: number) {
+			const current = scope.getStore();
+			if (
+				current?.active &&
+				current.contentRevision !== undefined &&
+				current.contentRevision !== contentRevision
+			)
+				throw staleBufferEdit();
+		},
 		/** Internal authorization-loss cleanup only; no release event may wake a revoked runtime. */
 		quiesceForAuthorizationLoss(
 			id: string,
@@ -131,28 +145,42 @@ export function createBufferEditHolds(now = Date.now, leaseMs = BUFFER_EDIT_LEAS
 			listener = next;
 			return previous;
 		},
-		async begin(id: string, identity: BufferEditIdentity, validate: () => Promise<boolean>) {
+		async begin(
+			id: string,
+			identity: BufferEditIdentity,
+			readRevision: () => Promise<number | undefined>,
+			expectedRevision?: number,
+		) {
 			return exclusive(id, async () => {
 				expire();
 				if (authorizationBarriers.has(id)) throw conflict();
 				const existing = leases.get(id);
+				if (existing ? !matches(existing, identity) : mutations.has(id)) throw conflict();
+				const contentRevision = await readRevision();
+				if (contentRevision === undefined) throw conflict();
+				// A retried begin is not permission to replace an editor's original snapshot.
+				if (
+					(expectedRevision !== undefined && expectedRevision !== contentRevision) ||
+					(existing && existing.contentRevision !== contentRevision)
+				)
+					throw staleBufferEdit();
 				if (existing) {
-					if (!matches(existing, identity)) throw conflict();
 					existing.expiresAt = now() + leaseMs;
 					return response(existing);
 				}
-				if (mutations.has(id) || !(await validate())) throw conflict();
-				const lease = { ...identity, expiresAt: now() + leaseMs };
+				const lease = { ...identity, expiresAt: now() + leaseMs, contentRevision };
 				leases.set(id, lease);
 				changed(id);
 				return response(lease);
 			});
 		},
-		async renew(id: string, identity: BufferEditIdentity) {
+		async renew(id: string, identity: BufferEditIdentity, expectedRevision?: number) {
 			return exclusive(id, () => {
 				expire();
 				const lease = leases.get(id);
 				if (!lease || !matches(lease, identity)) throw conflict();
+				if (expectedRevision !== undefined && expectedRevision !== lease.contentRevision)
+					throw staleBufferEdit();
 				lease.expiresAt = now() + leaseMs;
 				return response(lease);
 			});
@@ -205,7 +233,13 @@ export function createBufferEditHolds(now = Date.now, leaseMs = BUFFER_EDIT_LEAS
 				mutations.add(id);
 				operations.set(id, operation);
 			});
-			const current = { narratorId: id, messageId, active: true, signal: operation.abort.signal };
+			const current = {
+				narratorId: id,
+				messageId,
+				active: true,
+				signal: operation.abort.signal,
+				contentRevision: lease?.contentRevision,
+			};
 			try {
 				return await scope.run(current, work);
 			} finally {

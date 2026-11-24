@@ -685,7 +685,11 @@ describe("narrators API", () => {
 		]);
 	});
 
-	test("buffer edit begin/renew/release use the encoded lease endpoint and original token", async () => {
+	test.each([
+		undefined,
+		0,
+		7,
+	])("buffer edit lease transports optional expected revision %s and original token", async (expectedRevision) => {
 		Object.defineProperty(g, "localStorage", {
 			value: { getItem: () => null },
 			configurable: true,
@@ -696,6 +700,7 @@ describe("narrators API", () => {
 			token: "client-token",
 			expiresAt: 123_456,
 			leaseMs: 120_000,
+			contentRevision: 0,
 		};
 		Object.defineProperty(g, "fetch", {
 			configurable: true,
@@ -704,7 +709,9 @@ describe("narrators API", () => {
 				return Response.json(init.method === "DELETE" ? { ok: true } : lease);
 			},
 		});
-		expect(await api.beginBufferedMessageEdit("n/a?", "m/b#", "client-token")).toEqual(lease);
+		expect(
+			await api.beginBufferedMessageEdit("n/a?", "m/b#", "client-token", expectedRevision),
+		).toEqual(lease);
 		expect(await api.renewBufferedMessageEdit("n/a?", "m/b#", "client-token")).toEqual(lease);
 		expect(await api.releaseBufferedMessageEdit("n/a?", "m/b#", "client-token")).toEqual({
 			ok: true,
@@ -713,8 +720,11 @@ describe("narrators API", () => {
 			Array(3).fill("/api/narrators/n%2Fa%3F/buffer/m%2Fb%23/edit"),
 		);
 		expect(requests.map(({ init }) => init.method)).toEqual(["POST", "PATCH", "DELETE"]);
-		for (const { init } of requests.slice(0, 2))
-			expect(JSON.parse(String(init.body))).toEqual({ token: "client-token" });
+		expect(JSON.parse(String(requests[0].init.body))).toEqual({
+			token: "client-token",
+			...(expectedRevision !== undefined ? { expectedRevision } : {}),
+		});
+		expect(JSON.parse(String(requests[1].init.body))).toEqual({ token: "client-token" });
 		expect(new Headers(requests[2].init.headers).get("X-Buffer-Edit-Token")).toBe("client-token");
 		expect(requests[2].init.keepalive).toBe(true);
 	});

@@ -18,7 +18,7 @@ test("begin is serialized with the complete async claim/validation section", asy
 		await claiming.promise;
 		claimed = true;
 	});
-	const begin = holds.begin("n", identity, async () => !claimed);
+	const begin = holds.begin("n", identity, async () => (claimed ? undefined : 0));
 	claiming.release();
 	await claim;
 	await expect(begin).rejects.toThrow("being edited");
@@ -27,7 +27,7 @@ test("begin is serialized with the complete async claim/validation section", asy
 	const validation = gate();
 	const first = holds.begin("n", identity, async () => {
 		await validation.promise;
-		return true;
+		return 0;
 	});
 	const followingClaim = holds.exclusive("n", () => !holds.held("n"));
 	validation.release();
@@ -42,13 +42,13 @@ test("same token renews idempotently; users and replacement tokens cannot steal 
 	holds.setListener((id) => {
 		changes.push(id);
 	});
-	expect(await holds.begin("n", identity, async () => true)).toMatchObject({
+	expect(await holds.begin("n", identity, async () => 0)).toMatchObject({
 		token: "token",
 		expiresAt: 100,
 		leaseMs: 100,
 	});
 	now = 50;
-	expect((await holds.begin("n", identity, async () => false)).expiresAt).toBe(150);
+	expect((await holds.begin("n", identity, async () => 0)).expiresAt).toBe(150);
 	await expect(holds.renew("n", { ...identity, userId: "other" })).rejects.toThrow();
 	await holds.release("n", { ...identity, userId: "other" });
 	expect(holds.held("n")).toBe(true);
@@ -57,7 +57,7 @@ test("same token renews idempotently; users and replacement tokens cannot steal 
 	expect(holds.held("n")).toBe(false);
 	expect(changes).toEqual(["n", "n"]);
 	const replacement = { ...identity, token: "replacement" };
-	await holds.begin("n", replacement, async () => true);
+	await holds.begin("n", replacement, async () => 0);
 	await holds.release("n", identity);
 	expect(holds.held("n")).toBe(true);
 	await expect(holds.mutate("n", "message", async () => {}, identity)).rejects.toThrow();
@@ -65,10 +65,81 @@ test("same token renews idempotently; users and replacement tokens cannot steal 
 	expect(holds.held("n")).toBe(false);
 });
 
+test("expired drafts can reacquire only their original revision and cannot overwrite a newer editor", async () => {
+	let now = 0;
+	let revision = 4;
+	let text = "original";
+	const holds = createBufferEditHolds(() => now, 100);
+	const first = await holds.begin("n", identity, async () => revision);
+	expect(first.contentRevision).toBe(4);
+	await expect(holds.begin("n", identity, async () => revision, 3)).rejects.toMatchObject({
+		code: "BUFFER_EDIT_STALE",
+	});
+	expect((await holds.renew("n", identity)).contentRevision).toBe(4);
+	now = 101;
+	holds.expire();
+	expect(
+		(await holds.begin("n", identity, async () => revision, first.contentRevision)).contentRevision,
+	).toBe(4);
+	now = 202;
+	holds.expire();
+	const second = { ...identity, token: "other-editor" };
+	await holds.begin("n", second, async () => revision);
+	await holds.mutate(
+		"n",
+		"message",
+		async () => {
+			holds.assertMutationRevision(revision);
+			text = "other editor saved";
+			revision++;
+		},
+		second,
+	);
+	await holds.release("n", second);
+	await expect(
+		holds.begin("n", identity, async () => revision, first.contentRevision),
+	).rejects.toMatchObject({ statusCode: 409, code: "BUFFER_EDIT_STALE" });
+	expect(holds.held("n")).toBe(false);
+	await expect(
+		holds.mutate(
+			"n",
+			"message",
+			async () => {
+				text = "stale draft";
+			},
+			identity,
+		),
+	).rejects.toThrow();
+	expect(text).toBe("other editor saved");
+});
+
+test("leased saves retain their immutable revision baseline, while legacy saves remain compatible", async () => {
+	const holds = createBufferEditHolds();
+	await holds.begin("n", identity, async () => 7);
+	await expect(
+		holds.mutate(
+			"n",
+			"message",
+			async () => {
+				holds.assertMutationRevision(8);
+			},
+			identity,
+		),
+	).rejects.toMatchObject({ statusCode: 409, code: "BUFFER_EDIT_STALE" });
+	await expect(holds.begin("n", identity, async () => 8)).rejects.toMatchObject({
+		code: "BUFFER_EDIT_STALE",
+	});
+	expect((await holds.renew("n", identity)).contentRevision).toBe(7);
+	await holds.release("n", identity);
+	await holds.mutate("n", "message", async () => {
+		holds.assertMutationRevision(8);
+	});
+});
+
 test("slow attachment saves pin TTL; failures retain a full retry window and reject bypass mutations", async () => {
 	let now = 0;
 	const holds = createBufferEditHolds(() => now, 100);
-	await holds.begin("n", identity, async () => true);
+	await holds.begin("n", identity, async () => 0);
 	await expect(holds.mutate("n", "message", async () => {})).rejects.toThrow();
 	await expect(holds.mutate("n", undefined, async () => {})).rejects.toThrow();
 	const uploading = gate();
@@ -112,7 +183,7 @@ test("legacy saves block begin/claim only while saving and wake a deferred consu
 		await saving.promise;
 	});
 	await started.promise;
-	await expect(holds.begin("n", identity, async () => true)).rejects.toThrow();
+	await expect(holds.begin("n", identity, async () => 0)).rejects.toThrow();
 	expect(holds.held("n")).toBe(true);
 	saving.release();
 	await save;

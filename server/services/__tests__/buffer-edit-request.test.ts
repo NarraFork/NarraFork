@@ -14,7 +14,7 @@ for (const leased of [false, true])
 	test(`slow input is cancelled at an absolute deadline; ${leased ? "leased" : "legacy"} pin waits for work cleanup`, async () => {
 		const holds = createBufferEditHolds();
 		const identity = { messageId: "m", userId: "u", token: "t" };
-		if (leased) await holds.begin("n", identity, async () => true);
+		if (leased) await holds.begin("n", identity, async () => 0);
 		const cancelled = gate();
 		const unwinding = gate();
 		const cleanup = gate();
@@ -71,7 +71,7 @@ test("authorization loss aborts a saved body, waits for unwinding, clears last a
 	const holds = createBufferEditHolds();
 	const identity = { messageId: "m", userId: "u", token: "t" };
 	const events: string[] = [];
-	await holds.begin("n", identity, async () => true);
+	await holds.begin("n", identity, async () => 0);
 	holds.setListener(() => {
 		events.push("wake");
 	});
@@ -117,7 +117,7 @@ test("authorization loss aborts a saved body, waits for unwinding, clears last a
 	await unwinding.promise;
 	expect(events).toEqual(["stop"]);
 	expect(holds.held("n")).toBe(true);
-	await expect(holds.begin("n", identity, async () => true)).rejects.toThrow();
+	await expect(holds.begin("n", identity, async () => 0)).rejects.toThrow();
 	cleanup.release();
 	await expect(save).rejects.toMatchObject({ statusCode: 403 });
 	await revoked;

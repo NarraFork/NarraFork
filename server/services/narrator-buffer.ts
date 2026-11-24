@@ -1148,22 +1148,37 @@ export async function beginBufferedMessageEdit(
 	messageId: string,
 	userId: string,
 	token: string,
+	expectedRevision?: number,
 ) {
-	return bufferEditHolds.begin(narratorId, { messageId, userId, token }, () =>
-		canEditBufferedMessage(narratorId, messageId),
+	return bufferEditHolds.begin(
+		narratorId,
+		{ messageId, userId, token },
+		() => readBufferedMessageEditRevision(narratorId, messageId),
+		expectedRevision,
 	);
+}
+async function readBufferedMessageEditRevision(
+	narratorId: string,
+	messageId: string,
+): Promise<number | undefined> {
+	const row = await rowByIdRuntime(messageId);
+	if (
+		!row ||
+		row.narratorId !== narratorId ||
+		row.kind !== "user_input" ||
+		!pending.includes(row.state as "queued" | "failed")
+	)
+		return undefined;
+	return row.contentRevision;
 }
 export async function canEditBufferedMessage(
 	narratorId: string,
 	messageId: string,
 ): Promise<boolean> {
-	const row = await rowByIdRuntime(messageId);
-	return (
-		!!row &&
-		row.narratorId === narratorId &&
-		row.kind === "user_input" &&
-		pending.includes(row.state as "queued" | "failed")
-	);
+	const revision = await readBufferedMessageEditRevision(narratorId, messageId);
+	if (revision === undefined) return false;
+	bufferEditHolds.assertMutationRevision(revision);
+	return true;
 }
 
 export function updateBufferedMessage(
@@ -1191,6 +1206,7 @@ async function updateBufferedMessageUnlocked(
 		!pending.includes(row.state as "queued" | "failed")
 	)
 		return false;
+	bufferEditHolds.assertMutationRevision(row.contentRevision);
 	const current = projectMailboxUserMessage(row);
 	opts.composerDocument = parseOptionalComposerDocument(opts.composerDocument);
 	validateComposerProjection(

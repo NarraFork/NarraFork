@@ -8,6 +8,7 @@ import { afterAll, beforeAll, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { AppError } from "../../lib/errors";
 
@@ -19,7 +20,7 @@ process.env.NARRAFORK_ALLOW_MULTIPLE = "1";
 // Imported after NARRAFORK_HOME is redirected so the DB never touches a real instance.
 const { narratorRoutes } = await import("../narrators");
 const { db } = await import("../../db");
-const { narrators, users } = await import("../../db/schema");
+const { narratorBufferedMessages, narrators, users } = await import("../../db/schema");
 const { enqueueBufferedMessage, getBufferedMessagesAsync } = await import(
 	"../../services/narrator-buffer"
 );
@@ -74,7 +75,13 @@ function app(userId = OWNER) {
 	});
 	instance.onError((error) => {
 		const status = error instanceof AppError ? error.statusCode : 500;
-		return new Response(JSON.stringify({ error: error.message }), { status });
+		return new Response(
+			JSON.stringify({
+				error: error.message,
+				...(error instanceof AppError ? { code: error.code } : {}),
+			}),
+			{ status },
+		);
 	});
 	instance.route("/narrators", narratorRoutes);
 	return instance;
@@ -222,6 +229,76 @@ test("edit leases protect the whole queue, authenticate renew/release, reject by
 			token: "replacement",
 		});
 		bufferEditHolds.setListener(previousListener);
+	}
+});
+
+test("lease reacquisition and saving reject stale revisions without changing newer durable content", async () => {
+	const { bufferEditHolds } = await import("../../services/buffer-edit-hold");
+	const previous = bufferEditHolds.setListener(undefined);
+	const entry = await enqueueBufferedMessage(ORDINARY, "original baseline");
+	if (!entry.ok) throw new Error("enqueue failed");
+	const path = `http://localhost/narrators/${ORDINARY}/buffer/${entry.id}`;
+	const request = (method: string, suffix: string, body?: unknown, token?: string) =>
+		app().request(`${path}${suffix}`, {
+			method,
+			headers: {
+				"content-type": "application/json",
+				...(token ? { "X-Buffer-Edit-Token": token } : {}),
+			},
+			...(body === undefined ? {} : { body: JSON.stringify(body) }),
+		});
+	try {
+		expect((await request("POST", "/edit", { token: "a", expectedRevision: -1 })).status).toBe(400);
+		const initial = await request("POST", "/edit", { token: "a" });
+		expect(initial.status).toBe(200);
+		const baseline = (await initial.json()).contentRevision;
+		expect(typeof baseline).toBe("number");
+		expect((await (await request("PATCH", "/edit", { token: "a" })).json()).contentRevision).toBe(
+			baseline,
+		);
+		const wrongBaseline = await request("POST", "/edit", {
+			token: "a",
+			expectedRevision: baseline + 1,
+		});
+		expect(wrongBaseline.status).toBe(409);
+		expect(await wrongBaseline.json()).toMatchObject({ code: "BUFFER_EDIT_STALE" });
+		// The editor can recover a lost lease while its authoritative version is unchanged.
+		await request("DELETE", "/edit", undefined, "a");
+		expect(
+			(await request("POST", "/edit", { token: "a", expectedRevision: baseline })).status,
+		).toBe(200);
+		await request("DELETE", "/edit", undefined, "a");
+		expect((await request("POST", "/edit", { token: "b" })).status).toBe(200);
+		expect((await request("PATCH", "", { text: "newer editor saved" }, "b")).status).toBe(200);
+		const stale = await request("POST", "/edit", { token: "a", expectedRevision: baseline });
+		expect(stale.status).toBe(409);
+		expect(await stale.json()).toMatchObject({ code: "BUFFER_EDIT_STALE" });
+		expect(bufferEditHolds.held(ORDINARY)).toBe(false);
+		expect((await request("PATCH", "", { text: "stale draft" }, "a")).status).toBe(409);
+		expect(
+			(await getBufferedMessagesAsync(ORDINARY)).find((message) => message.id === entry.id)?.text,
+		).toBe("newer editor saved");
+		const fresh = await request("POST", "/edit", { token: "fresh" });
+		const revision = (await fresh.json()).contentRevision;
+		expect(revision).toBe(baseline + 1);
+		// Simulate a mutation outside this single-process lease and verify the commit guard too.
+		db.update(narratorBufferedMessages)
+			.set({ text: "external newer edit", contentRevision: revision + 1 })
+			.where(eq(narratorBufferedMessages.id, entry.id))
+			.run();
+		const staleSave = await request("PATCH", "", { text: "stale draft" }, "fresh");
+		expect(staleSave.status).toBe(409);
+		expect(await staleSave.json()).toMatchObject({ code: "BUFFER_EDIT_STALE" });
+		expect(
+			(await getBufferedMessagesAsync(ORDINARY)).find((message) => message.id === entry.id)?.text,
+		).toBe("external newer edit");
+		expect(bufferEditHolds.held(ORDINARY)).toBe(true);
+		await request("DELETE", "/edit", undefined, "fresh");
+		expect((await request("PATCH", "", { text: "legacy accepted" })).status).toBe(200);
+	} finally {
+		for (const token of ["a", "b", "fresh"])
+			await bufferEditHolds.release(ORDINARY, { messageId: entry.id, userId: OWNER, token });
+		bufferEditHolds.setListener(previous);
 	}
 });
 

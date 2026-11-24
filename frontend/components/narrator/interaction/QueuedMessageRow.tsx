@@ -68,6 +68,8 @@ export interface QueuedMessageRowProps {
 	isEditing: boolean;
 	isStartingEdit?: boolean;
 	isEditLocked?: boolean;
+	queueMutationsDisabled?: boolean;
+	editStale?: boolean;
 	editProtected?: boolean;
 	editError?: string;
 	onStartEdit: (msg: BufferMessageSummary) => void;
@@ -165,6 +167,8 @@ export function QueuedMessageRow({
 	isEditing,
 	isStartingEdit = false,
 	isEditLocked = false,
+	queueMutationsDisabled = false,
+	editStale = false,
 	editProtected = true,
 	editError,
 	onStartEdit,
@@ -183,6 +187,7 @@ export function QueuedMessageRow({
 	urgentError,
 }: QueuedMessageRowProps) {
 	const { t } = useTranslation("narrator");
+	const mutationsLocked = isEditLocked || queueMutationsDisabled;
 	const mode = urgentStatus ? "interrupt" : queuedMessageMode(msg);
 	const [textExpanded, setTextExpanded] = useState(false);
 	const borderColor =
@@ -194,7 +199,11 @@ export function QueuedMessageRow({
 	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
 		id: msg.id,
 		disabled:
-			mode !== "turn" || isEditing || isStartingEdit || isEditLocked || urgentStatus !== undefined,
+			mode !== "turn" ||
+			isEditing ||
+			isStartingEdit ||
+			mutationsLocked ||
+			urgentStatus !== undefined,
 	});
 	const style = {
 		transform: CSS.Transform.toString(transform),
@@ -229,7 +238,7 @@ export function QueuedMessageRow({
 			(urgentOnly && next !== "interrupt") ||
 			isEditing ||
 			isStartingEdit ||
-			isEditLocked ||
+			mutationsLocked ||
 			(next === "interrupt" && failed && !urgentOnly)
 		)
 			return;
@@ -255,6 +264,8 @@ export function QueuedMessageRow({
 		}
 	};
 	const canEdit =
+		(!queueMutationsDisabled || isEditLocked) &&
+		!editStale &&
 		!isEditing &&
 		!isStartingEdit &&
 		!retrying &&
@@ -263,6 +274,8 @@ export function QueuedMessageRow({
 		!urgentOnly;
 	const startEditing = () => {
 		if (
+			(queueMutationsDisabled && !isEditLocked) ||
+			editStale ||
 			isEditing ||
 			isStartingEdit ||
 			retryingRef.current ||
@@ -292,7 +305,13 @@ export function QueuedMessageRow({
 	);
 	const [retryError, setRetryError] = useState<string | null>(null);
 	const retry = async () => {
-		if (retryingRef.current || changingModeRef.current || isStartingEdit || isEditLocked || !failed)
+		if (
+			retryingRef.current ||
+			changingModeRef.current ||
+			isStartingEdit ||
+			mutationsLocked ||
+			!failed
+		)
 			return;
 		retryingRef.current = true;
 		setRetrying(true);
@@ -471,7 +490,12 @@ export function QueuedMessageRow({
 								{editError}
 							</Text>
 							<Group gap="xs">
-								<Button size="compact-xs" variant="light" onClick={startEditing}>
+								<Button
+									size="compact-xs"
+									variant="light"
+									disabled={editStale}
+									onClick={startEditing}
+								>
 									{t("queuedEditReacquire")}
 								</Button>
 								<Button size="compact-xs" variant="subtle" onClick={onCancelEdit}>
@@ -488,7 +512,7 @@ export function QueuedMessageRow({
 						color="red"
 						variant="light"
 						loading={retrying}
-						disabled={isStartingEdit || isEditLocked || retrying || changingMode !== null}
+						disabled={isStartingEdit || mutationsLocked || retrying || changingMode !== null}
 						onClick={() => void retry()}
 					>
 						{t("queuedRetry")}
@@ -501,7 +525,7 @@ export function QueuedMessageRow({
 							variant="subtle"
 							color={mode === "turn" ? "indigo" : "gray"}
 							aria-label={toggleLabel}
-							disabled={isStartingEdit || isEditLocked || retrying || changingMode !== null}
+							disabled={isStartingEdit || mutationsLocked || retrying || changingMode !== null}
 							loading={changingMode !== null && changingMode !== "interrupt"}
 							onClick={() => void changeMode(nextMode)}
 						>
@@ -522,7 +546,7 @@ export function QueuedMessageRow({
 						aria-label={urgentLabel}
 						disabled={
 							isStartingEdit ||
-							isEditLocked ||
+							mutationsLocked ||
 							(failed && !urgentOnly) ||
 							retrying ||
 							changingMode !== null ||
@@ -540,7 +564,7 @@ export function QueuedMessageRow({
 							size="sm"
 							variant="subtle"
 							color="gray"
-							disabled={isStartingEdit || isEditLocked || retrying || changingMode !== null}
+							disabled={isStartingEdit || mutationsLocked || retrying || changingMode !== null}
 							aria-label={t("queuedActions")}
 						>
 							<IconDotsVertical size={14} />
@@ -558,10 +582,16 @@ export function QueuedMessageRow({
 						{mode === "turn" && (
 							<>
 								<Menu.Divider />
-								<Menu.Item disabled={!canMoveUp} onClick={() => onMove(msg.id, -1)}>
+								<Menu.Item
+									disabled={mutationsLocked || !canMoveUp}
+									onClick={() => onMove(msg.id, -1)}
+								>
 									{t("queuedMoveUp")}
 								</Menu.Item>
-								<Menu.Item disabled={!canMoveDown} onClick={() => onMove(msg.id, 1)}>
+								<Menu.Item
+									disabled={mutationsLocked || !canMoveDown}
+									onClick={() => onMove(msg.id, 1)}
+								>
 									{t("queuedMoveDown")}
 								</Menu.Item>
 							</>
@@ -569,13 +599,13 @@ export function QueuedMessageRow({
 						<Menu.Divider />
 						<Menu.Item
 							color="red"
-							disabled={isStartingEdit || isEditLocked}
+							disabled={isStartingEdit || mutationsLocked}
 							onClick={() => onRemove(msg.id)}
 						>
 							{cancelBufferLabel}
 						</Menu.Item>
 						{onClearAll && (
-							<Menu.Item color="red" onClick={onClearAll}>
+							<Menu.Item color="red" disabled={mutationsLocked} onClick={onClearAll}>
 								{t("clearAllQueued")}
 							</Menu.Item>
 						)}
@@ -587,7 +617,7 @@ export function QueuedMessageRow({
 						variant="subtle"
 						aria-label={cancelBufferLabel}
 						title={cancelBufferLabel}
-						disabled={isStartingEdit || isEditLocked || retrying || changingMode !== null}
+						disabled={isStartingEdit || mutationsLocked || retrying || changingMode !== null}
 						onClick={(event) => {
 							event.stopPropagation();
 							if (!retryingRef.current && !changingModeRef.current) onRemove(msg.id);
@@ -630,7 +660,7 @@ export function QueuedMessageRow({
 							size="compact-xs"
 							variant="light"
 							loading={isStartingEdit}
-							disabled={submitting}
+							disabled={submitting || editStale}
 							onClick={() => onStartEdit(msgRef.current)}
 						>
 							{t("queuedEditReacquire")}
@@ -700,6 +730,7 @@ export function QueuedMessageRow({
 				size="xs"
 				variant="subtle"
 				color="gray"
+				aria-label={t("queuedEditDismiss")}
 				disabled={submitting}
 				onClick={onCancelEdit}
 			>

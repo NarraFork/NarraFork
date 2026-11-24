@@ -3848,6 +3848,7 @@ narratorRoutes.post("/:id/buffer/:mid/edit", async (c) => {
 			c.req.param("mid"),
 			c.get("user").sub,
 			parsed.data.token,
+			parsed.data.expectedRevision,
 		),
 	);
 });
@@ -3856,11 +3857,15 @@ narratorRoutes.patch("/:id/buffer/:mid/edit", async (c) => {
 	const parsed = bufferEditLeaseSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	return c.json(
-		await bufferEditHolds.renew(c.req.param("id"), {
-			messageId: c.req.param("mid"),
-			userId: c.get("user").sub,
-			token: parsed.data.token,
-		}),
+		await bufferEditHolds.renew(
+			c.req.param("id"),
+			{
+				messageId: c.req.param("mid"),
+				userId: c.get("user").sub,
+				token: parsed.data.token,
+			},
+			parsed.data.expectedRevision,
+		),
 	);
 });
 
