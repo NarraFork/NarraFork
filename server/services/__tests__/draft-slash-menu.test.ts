@@ -1,11 +1,14 @@
-import { afterEach, describe, expect, it, mock } from "bun:test";
+import { afterAll, afterEach, describe, expect, it, mock } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getTestDb } from "../../../tests/setup";
+import { closeRuntimeTestDb, getRuntimeTestDb } from "./agent-runtime-test-database";
 
-const { db, sqlite } = getTestDb();
+// Skill listings read on the database Worker (file-backed WAL database).
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
+afterAll(() => closeRuntimeTestDb(sqlite));
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 

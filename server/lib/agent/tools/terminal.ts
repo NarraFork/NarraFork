@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 import type { IMarker } from "@xterm/headless";
 import { and, eq } from "drizzle-orm";
 import { z } from "zod/v4";
@@ -140,10 +141,13 @@ async function assertTerminalAccess(
 	| { allowed: true; terminal: { id: string; name: string; status: string | null } }
 	| { allowed: false; error: string }
 > {
-	const terminal = await db.query.terminals.findFirst({
-		where: eq(terminals.id, terminalId),
-		columns: { id: true, name: true, status: true, narratorId: true },
-	});
+	const terminal = await readQuery(
+		db.query.terminals.findFirst({
+			where: eq(terminals.id, terminalId),
+			columns: { id: true, name: true, status: true, narratorId: true },
+		}),
+		{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000 },
+	);
 	if (!terminal) {
 		return { allowed: false, error: `Terminal not found: ${terminalId}` };
 	}
@@ -172,22 +176,32 @@ async function resolveTerminalId(
 	narratorId: string,
 ): Promise<{ id: string } | { error: string }> {
 	// 1. Try exact ID match
-	const byId = await db.query.terminals.findFirst({
-		where: eq(terminals.id, idOrName),
-		columns: { id: true },
-	});
+	const byId = await readQuery(
+		db.query.terminals.findFirst({
+			where: eq(terminals.id, idOrName),
+			columns: { id: true },
+		}),
+		{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000 },
+	);
 	if (byId) return { id: byId.id };
 
 	// 2. Fallback: by name (case-insensitive) among this narrator's terminals, running ones
 	// first (only they take input; an exited one may share the name), then the newest exited.
 	const nameLower = idOrName.toLowerCase();
 	for (const status of ["running", "exited"] as const) {
-		const candidates = await db.query.terminals.findMany({
-			where: and(eq(terminals.narratorId, narratorId), eq(terminals.status, status)),
-			columns: { id: true, name: true },
-			orderBy: (t, { desc }) => [desc(t.createdAt)],
-			limit: TERMINAL_NAME_LOOKUP_LIMIT,
-		});
+		const candidates = await readQuery(
+			db.query.terminals.findMany({
+				where: and(eq(terminals.narratorId, narratorId), eq(terminals.status, status)),
+				columns: { id: true, name: true },
+				orderBy: (t, { desc }) => [desc(t.createdAt)],
+				limit: TERMINAL_NAME_LOOKUP_LIMIT,
+			}),
+			{
+				executionPolicy: "worker-required",
+				maxRows: TERMINAL_NAME_LOOKUP_LIMIT,
+				timeoutMs: 30_000,
+			},
+		);
 		const match = candidates.find((t) => t.name.toLowerCase() === nameLower);
 		if (match) return { id: match.id };
 	}
@@ -345,10 +359,13 @@ export const terminalTool: ToolDefinition = {
 
 async function listTerminals(narratorId: string): Promise<ToolResult> {
 	// Find terminals associated with this narrator
-	const narratorTerminals = await db.query.terminals.findMany({
-		where: eq(terminals.narratorId, narratorId),
-		columns: { id: true, name: true, status: true, cwd: true, createdAt: true },
-	});
+	const narratorTerminals = await readQuery(
+		db.query.terminals.findMany({
+			where: eq(terminals.narratorId, narratorId),
+			columns: { id: true, name: true, status: true, cwd: true, createdAt: true },
+		}),
+		{ executionPolicy: "worker-required", maxRows: 10_000, timeoutMs: 30_000 },
+	);
 
 	// Exclude exited terminals
 	const all = narratorTerminals.filter((t) => t.status !== "exited");
@@ -525,10 +542,13 @@ async function startWatch(
 		readLifecycleState:
 			pattern === undefined
 				? async () => {
-						const current = await db.query.terminals.findFirst({
-							where: eq(terminals.id, terminalId),
-							columns: { status: true },
-						});
+						const current = await readQuery(
+							db.query.terminals.findFirst({
+								where: eq(terminals.id, terminalId),
+								columns: { status: true },
+							}),
+							{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000 },
+						);
 						if (current?.status === "exited") return "exited";
 						if (
 							!current ||
@@ -623,10 +643,13 @@ export async function watchTerminal(
 		// reattachment fail. Do not mislabel that lifecycle boundary as a detach.
 		const current =
 			pattern === undefined
-				? await db.query.terminals.findFirst({
-						where: eq(terminals.id, terminalId),
-						columns: { status: true },
-					})
+				? await readQuery(
+						db.query.terminals.findFirst({
+							where: eq(terminals.id, terminalId),
+							columns: { status: true },
+						}),
+						{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000 },
+					)
 				: undefined;
 		if (current?.status === "exited") {
 			return {
