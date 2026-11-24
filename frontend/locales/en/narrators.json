@@ -213,5 +213,28 @@
 	"promptLibraryPickPlaceholder": "Pick a prompt",
 	"promptLibraryEmpty": "Library is empty — create one under Routines → Prompt library",
 	"promptLibraryInsert": "Insert",
-	"promptLibraryReplace": "Replace all"
+	"promptLibraryReplace": "Replace all",
+	"createMode": {
+		"session": "Session",
+		"team": "Start as a team",
+		"teamHint": "A team is a coordinator session that sends agents to work on branches of this project. It opens on the team page.",
+		"teamAvailable": "Or start a team here: a coordinator and its agents in this directory's project.",
+		"teamUnavailable": "Starting a team is off: {{reason}}"
+	},
+	"teamStart": {
+		"inProject": "The team will be in the project {{name}}.",
+		"newProject": "No project covers {{root}} yet; one will be created for this repository.",
+		"reason": {
+			"remoteDevice": "teams run on this server; choose this server as the execution device.",
+			"chooseDirectory": "choose a directory in a git repository first.",
+			"checking": "checking the directory…",
+			"postgres": "teams are not supported on PostgreSQL.",
+			"lookupFailed": "the directory could not be checked.",
+			"notDirectory": "this is not an existing directory on this server.",
+			"notGit": "this directory is not in a git repository.",
+			"noAccess": "you do not have access to the project of this directory.",
+			"archived": "the project of this directory is archived.",
+			"readOnly": "you can only read the project of this directory."
+		}
+	}
 }
