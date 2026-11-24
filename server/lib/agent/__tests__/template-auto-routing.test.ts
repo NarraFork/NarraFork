@@ -201,6 +201,24 @@ describe("template auto routing", () => {
 		}
 	});
 
+	for (const [entry, projectedKey] of [
+		[walletSources[0]!, () => settings.tokendance?.apiKey],
+		[walletSources[1]!, () => settings.commandCode?.apiKey],
+		[nugSource, () => settings.nugProviders?.[0]?.apiKey],
+	] as const) {
+		test(`${entry.prefix}: all-disabled multi-key storage never revives projected settings or CLI`, () => {
+			const first = entry.add("first");
+			const second = entry.add("second");
+			store.update(first.id, { disabled: true });
+			expect(autoSourceFacts(entry.prefix, now).available).toBe(true);
+			store.update(second.id, { disabled: true });
+			expect(store.listGroup(entry.id)).toHaveLength(2);
+			expect(projectedKey()).toBe(first.apiKey);
+			expect(autoSourceFacts(entry.prefix, now).available).toBe(false);
+			expect(autoSourcePreview(entry.prefix, now)?.label).toBeUndefined();
+		});
+	}
+
 	test("config-only credentials remain usable; unconfigured TD is false and CC CLI is unknown/usable", () => {
 		expect(autoSourceFacts("tokendance", now).available).toBe(false);
 		expect(autoSourceFacts("CommandCode", now).available).toBe(true);
