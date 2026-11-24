@@ -26,6 +26,7 @@ dashboardRoutes.get("/summary", async (c) => {
 	const readOptions = {
 		signal: c.req.raw.signal,
 		diagnosticSource: "dashboard.summary",
+		executionPolicy: "worker-required" as const,
 		maxRows: 1,
 	};
 	// ── Projects ──────────────────────────────────────────────────────────

@@ -349,37 +349,42 @@ projectRoutes.patch("/:id", async (c) => {
 
 	const now = new Date().toISOString();
 
-	const existingProject = await db.query.projects.findFirst({
-		where: eq(projects.id, id),
-		columns: { chapterSettings: true },
-	});
-	if (!existingProject) throw new NotFoundError("Project", id);
-
-	// Merge chapterSettings with existing values instead of overwriting
-	let mergedSettings: Record<string, unknown> | undefined;
-	if (incomingSettings) {
-		let current: Record<string, unknown> = {};
-		try {
-			current =
-				typeof existingProject.chapterSettings === "string"
-					? JSON.parse(existingProject.chapterSettings)
-					: (existingProject.chapterSettings ?? {});
-		} catch {
-			// corrupted JSON — start fresh
+	const gitPath = rest.gitPath !== undefined ? resolveProjectDirectory(rest.gitPath) : undefined;
+	// Merge chapterSettings with existing values instead of overwriting. The settings are
+	// read in the same transaction as the update, so a concurrent PATCH is never lost.
+	const { updated, mergedSettings } = db.transaction((tx) => {
+		const existingProject = tx
+			.select({ chapterSettings: projects.chapterSettings })
+			.from(projects)
+			.where(eq(projects.id, id))
+			.get();
+		if (!existingProject) throw new NotFoundError("Project", id);
+		let merged: Record<string, unknown> | undefined;
+		if (incomingSettings) {
+			let current: Record<string, unknown> = {};
+			try {
+				current =
+					typeof existingProject.chapterSettings === "string"
+						? JSON.parse(existingProject.chapterSettings)
+						: ((existingProject.chapterSettings as Record<string, unknown> | null) ?? {});
+			} catch {
+				// corrupted JSON — start fresh
+			}
+			merged = { ...current, ...incomingSettings };
 		}
-		mergedSettings = { ...current, ...incomingSettings };
-	}
-
-	const [updated] = await db
-		.update(projects)
-		.set({
-			...rest,
-			...(rest.gitPath !== undefined ? { gitPath: resolveProjectDirectory(rest.gitPath) } : {}),
-			...(mergedSettings !== undefined ? { chapterSettings: mergedSettings } : {}),
-			updatedAt: now,
-		})
-		.where(eq(projects.id, id))
-		.returning();
+		const row = tx
+			.update(projects)
+			.set({
+				...rest,
+				...(gitPath !== undefined ? { gitPath } : {}),
+				...(merged !== undefined ? { chapterSettings: merged } : {}),
+				updatedAt: now,
+			})
+			.where(eq(projects.id, id))
+			.returning()
+			.get();
+		return { updated: row, mergedSettings: merged };
+	});
 	if (!updated) throw new NotFoundError("Project", id);
 	if (mergedSettings !== undefined || rest.gitPath !== undefined) {
 		executionPolicyEngine.invalidateProject(id);
