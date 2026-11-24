@@ -2067,7 +2067,6 @@ async function performGracefulShutdown(
 			void Promise.resolve(stopping).catch(() => {});
 		await step("remoteAccess.stop", stopRemoteAccess, 5_000);
 		httpLifecycle.abortAll();
-		if (producerOutcome === "ok") await step("checkpointRuns.pause", stopCheckpointedNarratorRuns);
 		let preserveAgentRuns = false;
 		if (options.reason === "signal") {
 			const prepared = await step("restartRecovery.prepare", prepareSignalRestartRecovery, 5_000);
@@ -2077,6 +2076,9 @@ async function performGracefulShutdown(
 				markUpdateRestarting();
 			}
 		}
+		// Prepared maintenance runs stay parked until the gate enters restarting. Signal
+		// recovery must make that transition before checkpoint stop can unwind their tails.
+		if (producerOutcome === "ok") await step("checkpointRuns.pause", stopCheckpointedNarratorRuns);
 		const shutdownRequestId = httpRequestContext.getStore();
 		// Outline pages being edited live: log what arrived and acknowledge it while the sockets
 		// are still open, so the editors forget it instead of replaying it after the restart.
