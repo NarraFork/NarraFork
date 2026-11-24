@@ -107,3 +107,207 @@ test("predicate runs against publication-eligible head, never claims a different
 	expect(exact?.id).toBe(early.delivery.id);
 	expect(state(user.delivery.id)?.state).toBe("queued");
 });
+
+test("a held user queue still delivers preceding non-user work and leaves other narrators alone", async () => {
+	const { beginBufferedMessageEdit } = await import("../narrator-buffer");
+	const { bufferEditHolds } = await import("../buffer-edit-hold");
+	const previous = bufferEditHolds.setListener(undefined);
+	for (const id of ["edit-agent-head", "edit-unrelated"])
+		db.insert(narrators).values({ id, createdAt: time, updatedAt: time }).run();
+	const agent = store.enqueue({
+		kind: "agent_message",
+		narratorId: "edit-agent-head",
+		sourceNarratorId: "sender",
+		sourceToolCallId: "edit-call",
+		sourceAttempt: 1,
+		sourceKey: "edit-agent",
+		text: "report",
+		projectedByteSize: 6,
+	});
+	if (!("delivery" in agent)) throw new Error("full");
+	const user = enqueue("edit-agent-head");
+	const unrelated = enqueue("edit-unrelated");
+	const owner = tryClaimExecution("edit-agent-head", "run");
+	const otherOwner = tryClaimExecution("edit-unrelated", "run");
+	try {
+		await beginBufferedMessageEdit("edit-agent-head", user.id, "user", "edit");
+		expect(await inbox.hasInboxKind("edit-agent-head", ["user_input", "agent_message"])).toBe(true);
+		expect((await inbox.claimInboxHead("edit-agent-head", () => true))?.id).toBe(agent.delivery.id);
+		expect((await inbox.claimInboxHead("edit-unrelated", () => true))?.id).toBe(unrelated.id);
+		expect(await inbox.claimInboxHead("edit-agent-head", () => true)).toBeUndefined();
+	} finally {
+		owner?.release();
+		otherOwner?.release();
+		await bufferEditHolds.release("edit-agent-head", {
+			messageId: user.id,
+			userId: "user",
+			token: "edit",
+		});
+		bufferEditHolds.setListener(previous);
+	}
+});
+
+test("held failed input allows broadcast→direct prefix wake, but a queued user barrier still blocks it", async () => {
+	const { beginBufferedMessageEdit } = await import("../narrator-buffer");
+	const { bufferEditHolds } = await import("../buffer-edit-hold");
+	const previous = bufferEditHolds.setListener(undefined);
+	const id = "edit-broadcast-prefix";
+	db.insert(narrators).values({ id, createdAt: time, updatedAt: time }).run();
+	for (const isBroadcast of [true, false]) {
+		store.enqueue({
+			kind: "agent_message",
+			narratorId: id,
+			sourceNarratorId: "sender",
+			sourceToolCallId: `prefix-${isBroadcast}`,
+			sourceAttempt: 1,
+			sourceKey: `prefix-${isBroadcast}`,
+			text: "report",
+			projectedByteSize: 6,
+			metadata: { isBroadcast },
+		});
+	}
+	const failed = enqueue(id);
+	db.update(narratorBufferedMessages)
+		.set({ state: "failed" })
+		.where(eq(narratorBufferedMessages.id, failed.id))
+		.run();
+	try {
+		await beginBufferedMessageEdit(id, failed.id, "user", "edit");
+		expect(await inbox.hasWakeEligibleInboxInput(id)).toBe(true);
+		const barrier = enqueue(id);
+		db.update(narratorBufferedMessages)
+			.set({ priority: true, seq: -100 })
+			.where(eq(narratorBufferedMessages.id, barrier.id))
+			.run();
+		expect(await inbox.hasWakeEligibleInboxInput(id)).toBe(false);
+	} finally {
+		await bufferEditHolds.release(id, { messageId: failed.id, userId: "user", token: "edit" });
+		bufferEditHolds.setListener(previous);
+	}
+});
+
+test("edit begin and asynchronous PostgreSQL claim are mutually exclusive in both race orders", async () => {
+	const { bufferEditHolds } = await import("../buffer-edit-hold");
+	const { beginBufferedMessageEdit } = await import("../narrator-buffer");
+	const { bindRuntimeQueue } = await import("../agent-runtime/runtime-queue-port");
+	type Port = import("../agent-runtime/postgres-runtime-queue").PostgresRuntimeQueue;
+	const id = "pg-edit-race";
+	db.insert(narrators).values({ id, createdAt: time, updatedAt: time }).run();
+	const user = enqueue(id);
+	const row = state(user.id);
+	if (!row) throw new Error("row missing");
+	const owner = tryClaimExecution(id, "run");
+	if (!owner) throw new Error("owner missing");
+	const previous = bufferEditHolds.setListener(undefined);
+	let claimed = false;
+	let release!: () => void;
+	let started!: () => void;
+	const blocked = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const entered = new Promise<void>((resolve) => {
+		started = resolve;
+	});
+	bindRuntimeQueue({
+		backend: "postgres",
+		queue: {
+			mailbox: {
+				getById: async () => ({ ...row, state: claimed ? "claimed" : "queued" }),
+				claimEligibleHead: async (
+					_id: string,
+					_owner: unknown,
+					accepts: (row: typeof user) => boolean,
+				) => {
+					started();
+					await blocked;
+					if (!accepts(row)) return undefined;
+					claimed = true;
+					return { ...row, state: "claimed" };
+				},
+			},
+		} as unknown as Port,
+	});
+	try {
+		const claiming = inbox.claimInboxHead(id, () => true);
+		await entered;
+		const editing = beginBufferedMessageEdit(id, user.id, "user", "token");
+		release();
+		expect((await claiming)?.id).toBe(user.id);
+		await expect(editing).rejects.toThrow("being edited");
+		claimed = false;
+		await beginBufferedMessageEdit(id, user.id, "user", "token");
+		expect(await inbox.claimInboxHead(id, () => true)).toBeUndefined();
+		expect(claimed).toBe(false);
+		await bufferEditHolds.release(id, { messageId: user.id, userId: "user", token: "token" });
+		expect((await inbox.claimInboxHead(id, () => true))?.id).toBe(user.id);
+	} finally {
+		bindRuntimeQueue(undefined);
+		owner.release();
+		await bufferEditHolds.release(id, { messageId: user.id, userId: "user", token: "token" });
+		bufferEditHolds.setListener(previous);
+	}
+});
+
+test("startup re-probes each recipient of a queued actionable task notice once, across pages", async () => {
+	const ids = ["notice-a", "notice-b", "notice-started", "notice-claimed"];
+	for (const id of ids) db.insert(narrators).values({ id, createdAt: time, updatedAt: time }).run();
+	const notice = (narratorId: string, sourceKey: string, eventKind: string) => {
+		const result = store.enqueue({
+			kind: "task_notice",
+			noticeKind: "bash",
+			narratorId,
+			sourceKey,
+			text: `${eventKind} notice`,
+			projectedByteSize: 16,
+			metadata: { producerKind: "bash", taskId: sourceKey, logicalRunId: "run", eventKind },
+		});
+		if (!("delivery" in result)) throw new Error("full");
+		return result.delivery;
+	};
+	// Two notices for one recipient: one wake. Started/cancelled notices never spend a turn,
+	// and a claimed notice already has an owner.
+	notice("notice-a", "a-1", "completed");
+	notice("notice-a", "a-2", "failed");
+	notice("notice-b", "b-1", "timed_out");
+	notice("notice-started", "s-1", "started");
+	notice("notice-started", "s-2", "cancelled");
+	notice("notice-claimed", "c-1", "completed");
+	store.claimBatch("notice-claimed", { token: "process:live:token", epoch: "live-epoch" });
+	const woken: string[] = [];
+	const count = await inbox.wakeQueuedTaskNoticeRecipientsOnStartup({
+		pageSize: 1,
+		wake: async (id) => {
+			woken.push(id);
+			return id !== "notice-b";
+		},
+	});
+	expect(woken.filter((id) => ids.includes(id)).sort()).toEqual(["notice-a", "notice-b"]);
+	expect(woken.filter((id) => id === "notice-a")).toHaveLength(1);
+	expect(count).toBe(woken.filter((id) => id !== "notice-b").length);
+});
+
+test("a failing startup wake does not stop the reconciliation of later recipients", async () => {
+	for (const id of ["throws-first", "after-throw"])
+		db.insert(narrators).values({ id, createdAt: time, updatedAt: time }).run();
+	for (const id of ["throws-first", "after-throw"]) {
+		const result = store.enqueue({
+			kind: "task_notice",
+			noticeKind: "agent",
+			narratorId: id,
+			sourceKey: `${id}-notice`,
+			text: "completed",
+			projectedByteSize: 9,
+			metadata: { producerKind: "agent", taskId: id, logicalRunId: "run", eventKind: "completed" },
+		});
+		if (!("delivery" in result)) throw new Error("full");
+	}
+	const woken: string[] = [];
+	await inbox.wakeQueuedTaskNoticeRecipientsOnStartup({
+		wake: async (id) => {
+			if (id === "throws-first") throw new Error("wake failed");
+			woken.push(id);
+			return true;
+		},
+	});
+	expect(woken).toContain("after-throw");
+});

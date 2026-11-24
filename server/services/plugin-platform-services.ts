@@ -5,6 +5,7 @@ import type { JsonValue } from "@server/lib/plugins/protocol";
 import { registerExtraSearchChannelSource } from "@server/lib/search/plugin-source";
 import { registerExtraModelSource } from "@server/lib/settings";
 import type { ProxyOverride } from "@server/lib/settings/types";
+import { registerModelListReader } from "@server/lib/sourcing/model-list-readers";
 import { PluginAgentToolBridge } from "./plugin-agent-tool-bridge";
 import {
 	type CapabilityBroker,
@@ -32,7 +33,10 @@ import {
 import type { ProviderCatalogRefreshResult } from "./plugin-provider-catalog-refresh";
 import { PluginProviderCatalogRefresher } from "./plugin-provider-catalog-refresh";
 import { PluginProviderClientPool, type ProviderRuntimeLike } from "./plugin-provider-client";
-import { PluginProviderConfigService } from "./plugin-provider-config-service";
+import {
+	declaredProviderSecretFields,
+	PluginProviderConfigService,
+} from "./plugin-provider-config-service";
 import { PluginProviderCredentialResolver } from "./plugin-provider-credential-resolver";
 import {
 	findPluginProviderForModel,
@@ -489,6 +493,11 @@ export function createPluginPlatformServices(
 			adapters: options.publicApiAdapters,
 		});
 	const secretVault = options.secretVault ?? pluginSecretVault;
+	// A vault key alone cannot be split into contribution id and field (both may contain
+	// dots), so provider secrets are routed to `credentials.json` by what the plugin
+	// declares. Read lazily: the registry is constructed further down.
+	secretVault.providerSecretFields = (pluginId) =>
+		declaredProviderSecretFields(providerRegistry, pluginId);
 	const hostServices =
 		options.hostServices ??
 		createPluginHostServices({
@@ -834,6 +843,13 @@ export function createPluginPlatformServices(
 		listModels: () => listPluginProviderModelValues(providerRegistry),
 		resolveProvider: (bareModel) => findPluginProviderForModel(providerRegistry, bareModel),
 	});
+	// The template reads the injected registry's full cached management catalog, including
+	// disabled providers; the agent's availability-filtered extras above stay unchanged.
+	registerModelListReader("plugin", (group) => {
+		const entry = providerRegistry.get(group.id);
+		// Registry.get also accepts aliases and type ids; a group names an exact instance.
+		return entry?.providerInstanceId === group.id ? entry.getModels().map((model) => model.id) : [];
+	});
 	// Plugin-contributed web search sources. Credentials and config come from the provider
 	// each source binds to, which is why this reuses the provider registry, credential
 	// resolver and client pool rather than owning any of them.
@@ -867,6 +883,9 @@ export function createPluginPlatformServices(
 			providerConfigSource: (pluginId) => stateStore.getCachedState(pluginId)?.providerConfigs,
 			providerPrefixSource: (pluginId) => stateStore.getCachedState(pluginId)?.providerPrefixes,
 			providerConfigPruner: async (pluginId, keep) => {
+				// Providers are registered by now, so their secrets can be told apart and moved
+				// into credentials.json (idempotent; a no-op on a legacy instance).
+				await secretVault.migrateProviderSecrets(pluginId);
 				// The credential for a provider lives in the vault, not in state.json, so both
 				// have to be pruned or a removed provider would leave a live secret behind that
 				// only an uninstall could clear.

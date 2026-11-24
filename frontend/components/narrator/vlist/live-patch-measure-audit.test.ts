@@ -383,14 +383,18 @@ describe("live-patch audit: EXHAUSTIVE — a height change always changes the ke
 		cacheKey: string;
 	}
 
-	async function probe(messages: readonly Msg[]): Promise<Map<string, Probe>> {
+	/** `ctx` adds adapter options (e.g. the shell's real category resolver) to the default LOD. */
+	async function probe(
+		messages: readonly Msg[],
+		ctx: Record<string, unknown> = {},
+	): Promise<Map<string, Probe>> {
 		const { segmentMessages } = await import("../message/message-segments");
 		const { adaptSegments } = await import("./segment-adapter");
 		const { VLIST_REGISTRY } = await import("./registry");
 		const { buildCacheKey, extractDataRevision } = await cacheMod();
 		type Seg = import("./segment-adapter").AdapterSegment;
 		const segments = segmentMessages(messages as never) as unknown as Seg[];
-		const specs = adaptSegments(segments, { lod: LOD });
+		const specs = adaptSegments(segments, { lod: LOD, ...ctx });
 		const out = new Map<string, Probe>();
 		for (const spec of specs) {
 			const measured = VLIST_REGISTRY[spec.kind].measure(spec.data, WIDTH, LOD, spec.opts);
@@ -509,6 +513,67 @@ describe("live-patch audit: EXHAUSTIVE — a height change always changes the ke
 		];
 	}
 
+	/** A running TransferFile download: its bar row is the only thing a progress frame moves. */
+	function transferDoc(): Msg[] {
+		const input = { direction: "download", remotePath: "/srv/big.bin", localPath: "big.bin" };
+		const shared = {
+			type: "tool_use",
+			id: "tu-xfer",
+			name: "TransferFile",
+			input,
+			inputJson: input,
+			status: "running",
+		};
+		return [
+			rowWithElements(
+				{
+					id: "m1",
+					narratorId: "n1",
+					parentToolUseId: null,
+					role: "assistant",
+					contentText: null,
+					toolCalls: [
+						{
+							id: "tc-xfer",
+							narratorId: "n1",
+							messageId: "m1",
+							toolUseId: "tu-xfer",
+							toolName: "TransferFile",
+							inputJson: input,
+							status: "running",
+							createdAt: "2026-01-01T00:00:00.000Z",
+						},
+					],
+					createdAt: "2026-01-01T00:00:00.000Z",
+				},
+				[shared],
+			) as unknown as Msg,
+		];
+	}
+
+	it("consecutive progress frames on a committed transfer card re-key it even at equal height", async () => {
+		// Same status, document version and LOD; only the bar figures move. Without the
+		// progress fields in the meta-row revision the second frame hit the first entry
+		// and the card kept painting 10% while the server reported 40%.
+		const { patchToolLiveOutput } = await import("./vlist-live-patch");
+		const MB = 1024 * 1024;
+		const at = (completed: number) => (messages: readonly Msg[]) =>
+			patchToolLiveOutput(messages, "tu-xfer", {
+				progress: { completed: completed * MB, total: 10 * MB, elapsedMs: 1000 },
+			});
+		const first = at(1)(transferDoc());
+		const second = at(4)(first.messages);
+		expect(first.changed && second.changed).toBe(true);
+		// The shell resolves the category with getCategory; without it every tool is generic.
+		const { getCategory } = await import("../tool-call/tool-display");
+		const ctx = { resolveToolCategory: getCategory };
+		const before = (await probe(first.messages, ctx)).get("tool-tu-xfer");
+		const after = (await probe(second.messages, ctx)).get("tool-tu-xfer");
+		expect(before && after).toBeTruthy();
+		expect(after?.height).toBe(before?.height);
+		expect(after?.cacheKey).not.toBe(before?.cacheKey);
+	});
+
 	const childHeader = (toolUseId: string, toolName: string) => ({
 		toolCallId: null,
 		toolUseId,
@@ -587,6 +652,15 @@ describe("live-patch audit: EXHAUSTIVE — a height change always changes the ke
 				output: "1\n2\n3\n4\n5\n6\n7\n8",
 				durationMs: 1234,
 			}),
+		);
+	});
+
+	it("live output on a persisted running card must re-key the card", async () => {
+		// The message persists just before execution; from then on this patch is the
+		// only carrier of the running tool's output (vlist-persisted-tool-live.ts).
+		const { patchToolLiveOutput } = await import("./vlist-live-patch");
+		await auditPatch(toolDoc(), (messages) =>
+			patchToolLiveOutput(messages, "tu-bash", { output: "line 1\nline 2\nline 3\nline 4" }),
 		);
 	});
 

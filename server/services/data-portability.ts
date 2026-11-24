@@ -36,36 +36,29 @@ import { join } from "node:path";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { createInflateRaw, inflateRawSync } from "node:zlib";
+import { getCredentialStore } from "@server/lib/credential-store";
 import { BundleError, bundleCatalogError } from "@server/lib/credential-transfer/bundle";
+import type { CredentialTransferData } from "@server/lib/credential-transfer/kinds";
 import { AppError, catalogError } from "@server/lib/errors";
 import { invalidateGitIdentityCache } from "@server/lib/git-identity";
-import { generateShortId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
 import { exportModelCatalogSettings, importModelCatalogSettings } from "@server/lib/model-catalog";
 import { getProviderKeyStore } from "@server/lib/provider-keys";
 import { saveSettings, settings } from "@server/lib/settings";
-import {
-	COMMAND_CODE_KEY_OWNER,
-	nugKeyOwner,
-	nugOAuthKeyOwner,
-	TOKENDANCE_KEY_OWNER,
-} from "@server/lib/settings/provider-keys-projection";
 import type { NarraForkSettings } from "@server/lib/settings/types";
+import { createGroupAllocator } from "@server/lib/sourcing/allocate-group";
+import type { ServiceTemplateId } from "@server/lib/sourcing/templates";
 import {
-	collectProviderKeys,
-	countSingleKeys,
-	type ExportedKeys,
-	openProviderKeys,
-	restoreExtraKeys,
+	openProviderTransferItems,
 	SEALED_KEYS_ENTRY,
-	sealProviderKeys,
-	withFirstKeys,
+	sealProviderTransferItems,
 	withoutKeys,
 } from "@server/services/data-portability-keys";
 import { resetSpecImportStateCache } from "@server/services/outline/spec-import/state";
 import { invalidateTaskBackend } from "@server/services/task-source/backend";
 import { forgetTeamSessions } from "@server/services/teams/team-session-memo";
 import { addImportedRequestsToUsageDaily } from "@server/services/usage-daily";
+import { identifyService } from "@shared/sourcing/identify";
 import {
 	MAX_IMPORT_BYTES,
 	MAX_IMPORT_LABEL,
@@ -81,8 +74,8 @@ import { eventBus } from "../lib/event-bus";
 
 /** Archives without sealed provider keys; every version of this importer reads them. */
 const PLAIN_EXPORT_VERSION = 1;
-/** Archives whose provider keys are sealed in `provider-keys.sealed.json`. */
-const SEALED_KEYS_EXPORT_VERSION = 2;
+/** Archives whose unified credentials are sealed in `provider-keys.sealed.json`. */
+const SEALED_KEYS_EXPORT_VERSION = 3;
 /** The newest version this importer reads. */
 const EXPORT_VERSION = SEALED_KEYS_EXPORT_VERSION;
 const PREVIEW_TTL_MS = 30 * 60 * 1000;
@@ -117,6 +110,8 @@ const AGENT_PROVIDER_KEYS = [
 ] as const;
 
 type ProviderKey = (typeof PROVIDER_KEYS)[number] | (typeof AGENT_PROVIDER_KEYS)[number];
+const transferGroupKey = (templateId: ServiceTemplateId, groupId: string) =>
+	`${templateId}:${groupId}`;
 type ClearTarget = "requests" | "sessions" | "providers" | "all";
 
 interface ImportPreview {
@@ -432,7 +427,12 @@ export async function exportData(
 		// archiving starts, so a failure leaves no half-written ZIP.
 		const sealedKeys =
 			selection.providers && options.passphrase
-				? await sealProviderKeys(collectProviderKeys(collected), options.passphrase)
+				? await sealProviderTransferItems(
+						(await import("@server/lib/credential-transfer/kinds")).collectProviderTransferItems(
+							collected,
+						),
+						options.passphrase,
+					)
 				: null;
 		const providers = selection.providers ? withoutKeys(collected) : collected;
 		// 计数从快照读，与实际导出的内容一致；没有快照时这两类必然是 0。
@@ -1079,28 +1079,31 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 		throw catalogError("IMPORT_SNAPSHOT_EXPIRED");
 	});
 
-	// Sealed provider keys are opened before the transaction: scrypt is async and the import
-	// transaction is synchronous. A wrong passphrase stops here, before anything is written.
+	// Sealed credentials are opened before the transaction: scrypt is async and a wrong
+	// passphrase must stop here, before any database, settings or credential write.
 	const importProviders = options.include?.providers ?? true;
-	let sealedKeys: ExportedKeys | null = null;
+	let transferItems: CredentialTransferData[] = [];
+	if (importProviders && (preview.version ?? PLAIN_EXPORT_VERSION) === PLAIN_EXPORT_VERSION) {
+		transferItems = (
+			await import("@server/lib/sourcing/legacy-transfer")
+		).legacyProviderTransferItems(preview.providers);
+	}
 	if (preview.sealedKeys && importProviders) {
 		if (!options.passphrase) throw catalogError("IMPORT_PASSPHRASE_REQUIRED");
 		try {
-			sealedKeys = await openProviderKeys(preview.sealedKeys, options.passphrase);
+			transferItems = await openProviderTransferItems(
+				preview.sealedKeys,
+				options.passphrase,
+				preview.providers,
+			);
 		} catch (error) {
 			if (error instanceof BundleError) bundleCatalogError(error);
 			throw error;
 		}
 	}
-	// providers.json has no keys; the merge's same-endpoint check and the settings save need
-	// each provider's first key in place, as an old plain export had it.
-	const incomingProviders = sealedKeys
-		? (withFirstKeys(preview.providers, sealedKeys) as Partial<Record<ProviderKey, unknown>>)
-		: preview.providers;
-	/** Incoming custom API provider id → the local id it was added under. */
-	let addedProviders: ReadonlyMap<string, string> = new Map();
-	/** Single-key providers that were added; their key came in with the settings save. */
-	let addedSingleKeyOwners: ReadonlySet<string> = new Set();
+	const incomingProviders = withoutKeys(preview.providers) as Partial<Record<ProviderKey, unknown>>;
+	/** Exporting template/id → the local group created by this import. */
+	let addedGroups: ReadonlyMap<string, { id: string }> = new Map();
 
 	const attachName = `imp_${randomBytes(4).toString("hex")}`;
 	sqlite.run(`ATTACH DATABASE ? AS ${attachName}`, [preview.snapshotPath]);
@@ -1284,10 +1287,9 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 			// 5) 供应商合并：`saveSettings` 是原子写（临时文件 + rename），放在事务末尾，
 			// 失败时数据整批回滚，不会留下「数据进了、供应商没进」的半成品。
 			if (include.providers) {
-				const merge = mergeProviders(incomingProviders);
+				const merge = mergeProviders(incomingProviders, transferItems);
 				// Read after the transaction commits; a retried transaction recomputes them.
-				addedProviders = merge.addedCustomApiProviders;
-				addedSingleKeyOwners = merge.addedSingleKeyOwners;
+				addedGroups = merge.addedGroups;
 				// 改名的供应商：本次写入的会话跟着指向新前缀，不留在本地同名的另一个服务上。
 				if (include.sessions) {
 					remapImportedNarratorModels(
@@ -1356,15 +1358,16 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 		forgetTeamSessions();
 	}
 
-	// The key store is a file outside the SQLite transaction, so the remaining keys are
-	// written only once the transaction committed. The first key of each provider (and the
-	// single key of NUG / TokenDance / Command Code) was stored by the settings save above.
-	if (sealedKeys) {
-		const restored = restoreExtraKeys(sealedKeys, addedProviders);
-		result.keysImported = restored.imported + countSingleKeys(sealedKeys, addedSingleKeyOwners);
+	// Credential files live outside the SQLite transaction. Restore them only after the
+	// configuration and sessions committed, under the ids chosen by the shared allocator.
+	if (transferItems.length) {
+		const restored = (
+			await import("@server/lib/credential-transfer/kinds")
+		).restoreProviderTransferItems(transferItems, addedGroups);
+		result.keysImported = restored.imported;
 		result.keysFailed = restored.failed;
 		if (restored.failed > 0) {
-			logger.warn("Import could not restore some provider keys", restored);
+			logger.warn("Import could not restore some provider credentials", restored);
 		}
 	}
 
@@ -1376,23 +1379,18 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 // ── 供应商合并 ───────────────────────────────────────────────────────────
 
 /** 同一端点判定：同 apiKey + 同 baseUrl 即视为同一供应商（忽略结尾斜杠）。 */
-function sameProvider(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
-	const keyA = String(a.apiKey ?? "").trim();
-	const keyB = String(b.apiKey ?? "").trim();
+function sameProvider(
+	a: Record<string, unknown>,
+	b: Record<string, unknown>,
+	keyA: string | undefined,
+	keyB: string | undefined,
+): boolean {
 	if (!keyA || keyA !== keyB) return false;
 	const url = (value: unknown) =>
 		String(value ?? "")
 			.trim()
 			.replace(/\/+$/, "");
 	return url(a.baseUrl) === url(b.baseUrl);
-}
-
-/** 列表内不重复的供应商 id：id 重复会让前端按 id 的编辑/删除串行到别的条目。 */
-function uniqueProviderId(taken: Set<string>): string {
-	for (;;) {
-		const id = generateShortId();
-		if (!taken.has(id)) return id;
-	}
 }
 
 /**
@@ -1542,7 +1540,10 @@ function mergeAgentModelSettings(
 	return changed;
 }
 
-function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
+function mergeProviders(
+	incoming: Partial<Record<ProviderKey, unknown>>,
+	transferItems: readonly CredentialTransferData[],
+): {
 	merged: Partial<Record<ProviderKey, unknown>>;
 	changed: boolean;
 	added: number;
@@ -1550,13 +1551,8 @@ function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 	skipped: number;
 	/** Incoming prefix → the prefix it was imported under, for providers that were renamed. */
 	prefixRemaps: Map<string, string>;
-	/**
-	 * Incoming custom API provider id → the local id it was added under. Providers merged
-	 * into a local one (same key and base URL) are absent: they keep their local keys.
-	 */
-	addedCustomApiProviders: Map<string, string>;
-	/** Exporting-instance owner ids of single-key providers that were added (NUG, TokenDance, Command Code). */
-	addedSingleKeyOwners: Set<string>;
+	/** Only newly added groups receive credentials; merged local groups keep their own. */
+	addedGroups: Map<string, { id: string }>;
 } {
 	const current = structuredClone(settings) as NarraForkSettings;
 	const merged: Partial<Record<ProviderKey, unknown>> = {};
@@ -1565,8 +1561,15 @@ function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 	let renamed = 0;
 	let skipped = 0;
 	const prefixRemaps = new Map<string, string>();
-	const addedCustomApiProviders = new Map<string, string>();
-	const addedSingleKeyOwners = new Set<string>();
+	const addedGroups = new Map<string, { id: string }>();
+	const allocator = createGroupAllocator();
+	const store = getProviderKeyStore();
+	const firstIncomingKeys = new Map<string, string>();
+	for (const item of transferItems) {
+		if (item.credential?.auth.kind !== "api_key") continue;
+		const key = transferGroupKey(item.templateId, item.group.id);
+		if (!firstIncomingKeys.has(key)) firstIncomingKeys.set(key, item.credential.auth.apiKey);
+	}
 
 	const listKeys = ["customApiProviders", "nugProviders"] as const;
 	for (const key of listKeys) {
@@ -1578,17 +1581,17 @@ function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 			>),
 		];
 		const existingNames = new Set(currentList.map((item) => String(item.name ?? "")));
-		// `auto` is reserved for auto:<model> values; an older export may still use it.
-		const existingPrefixes = new Set([
-			"auto",
-			...currentList.map((item) => String(item.prefix ?? "")),
-		]);
-		const existingIds = new Set(currentList.map((item) => String(item.id ?? "")));
 		for (const item of incomingList as Array<Record<string, unknown>>) {
 			const copy = { ...item };
+			const templateId: ServiceTemplateId =
+				key === "nugProviders" ? "nug" : identifyService(copy as never).templateId;
+			const sourceKey = transferGroupKey(templateId, String(copy.id ?? ""));
+			const incomingKey = firstIncomingKeys.get(sourceKey);
 			// 同一端点（同 apiKey + 同 baseUrl）已在本地：默认不导入，避免出现一堆
 			// 内容相同、id 也相同的副本——那会让整个供应商列表无法编辑。
-			const sameEndpoint = currentList.find((existing) => sameProvider(existing, copy));
+			const sameEndpoint = currentList.find((existing) =>
+				sameProvider(existing, copy, store.firstGroupKey(String(existing.id ?? "")), incomingKey),
+			);
 			if (sameEndpoint) {
 				// 同一端点留在本地供应商上。两边前缀不同时，模型设置要改挂到本地前缀。
 				rememberPrefixRemap(
@@ -1599,19 +1602,15 @@ function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 				skipped += 1;
 				continue;
 			}
-			const incomingId = typeof item.id === "string" ? item.id : "";
-			if (!copy.id || existingIds.has(String(copy.id))) {
-				copy.id = uniqueProviderId(existingIds);
-			}
-			existingIds.add(String(copy.id));
-			if (key === "customApiProviders" && incomingId) {
-				addedCustomApiProviders.set(incomingId, String(copy.id));
-			}
-			// NUG credentials were filled before the merge, so settings saves both under the new id.
-			if (key === "nugProviders" && incomingId) {
-				addedSingleKeyOwners.add(nugKeyOwner(incomingId));
-				addedSingleKeyOwners.add(nugOAuthKeyOwner(incomingId));
-			}
+			const incomingPrefix = String(copy.prefix ?? "");
+			const allocated = allocator.allocate({
+				id: String(copy.id ?? ""),
+				prefix: incomingPrefix,
+			});
+			copy.id = allocated.id;
+			copy.prefix = allocated.prefix;
+			addedGroups.set(sourceKey, { id: allocated.id });
+			rememberPrefixRemap(prefixRemaps, incomingPrefix, allocated.prefix);
 			// 重名 → 自动追加「-副本」（多次重复时继续加编号）
 			const name = String(copy.name ?? "导入的供应商");
 			if (existingNames.has(name)) {
@@ -1627,21 +1626,6 @@ function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 			} else {
 				existingNames.add(name);
 			}
-			// prefix 冲突 → 自动编号（prefix 是内部标识，必须唯一）
-			const prefix = String(copy.prefix ?? "");
-			if (prefix && existingPrefixes.has(prefix)) {
-				let n = 2;
-				let candidate = `${prefix}-${n}`;
-				while (existingPrefixes.has(candidate)) {
-					n += 1;
-					candidate = `${prefix}-${n}`;
-				}
-				copy.prefix = candidate;
-				existingPrefixes.add(candidate);
-				rememberPrefixRemap(prefixRemaps, prefix, candidate);
-			} else if (prefix) {
-				existingPrefixes.add(prefix);
-			}
 			currentList.push(copy);
 			added += 1;
 		}
@@ -1655,12 +1639,6 @@ function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 	if (Array.isArray(incomingInstances) && incomingInstances.length > 0) {
 		const agent = (current.agent ?? {}) as unknown as Record<string, unknown>;
 		const currentList = [...((agent.platformInstances ?? []) as Array<Record<string, unknown>>)];
-		const existingIds = new Set(currentList.map((entry) => String(entry.id ?? "")));
-		// `auto` is reserved for auto:<model> values, like the provider lists above.
-		const existingPrefixes = new Set([
-			"auto",
-			...currentList.map((entry) => String(entry.prefix ?? "")),
-		]);
 		for (const item of incomingInstances as Array<Record<string, unknown>>) {
 			const copy = { ...item };
 			const platform = String(copy.platform ?? "");
@@ -1675,22 +1653,11 @@ function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 				skipped += 1;
 				continue;
 			}
-			if (!copy.id || existingIds.has(String(copy.id))) copy.id = uniqueProviderId(existingIds);
-			existingIds.add(String(copy.id));
-			if (prefix && existingPrefixes.has(prefix)) {
-				let n = 2;
-				let candidate = `${prefix}-${n}`;
-				while (existingPrefixes.has(candidate)) {
-					n += 1;
-					candidate = `${prefix}-${n}`;
-				}
-				copy.prefix = candidate;
-				existingPrefixes.add(candidate);
-				rememberPrefixRemap(prefixRemaps, prefix, candidate);
-				renamed += 1;
-			} else if (prefix) {
-				existingPrefixes.add(prefix);
-			}
+			const allocated = allocator.allocate({ id: String(copy.id ?? ""), prefix });
+			copy.id = allocated.id;
+			copy.prefix = allocated.prefix;
+			rememberPrefixRemap(prefixRemaps, prefix, allocated.prefix);
+			if (prefix !== allocated.prefix) renamed += 1;
 			currentList.push(copy);
 			added += 1;
 		}
@@ -1710,14 +1677,22 @@ function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 	for (const key of ["codex", "tokendance", "commandCode"] as const) {
 		const value = incoming[key];
 		if (value === undefined) continue;
-		if ((current as unknown as Record<string, unknown>)[key] !== undefined) {
+		const configured =
+			key === "tokendance"
+				? !!store.firstGroupKey("tokendance")
+				: (current as unknown as Record<string, unknown>)[key] !== undefined;
+		if (configured) {
 			skipped += 1;
 			continue;
 		}
 		added += 1;
 		(merged as Record<string, unknown>)[key] = value;
-		if (key === "tokendance") addedSingleKeyOwners.add(TOKENDANCE_KEY_OWNER);
-		if (key === "commandCode") addedSingleKeyOwners.add(COMMAND_CODE_KEY_OWNER);
+		if (key === "tokendance") {
+			addedGroups.set(transferGroupKey("tokendance", "tokendance"), { id: "tokendance" });
+		}
+		if (key === "commandCode") {
+			addedGroups.set(transferGroupKey("command-code", "CommandCode"), { id: "CommandCode" });
+		}
 		changed = true;
 	}
 
@@ -1728,8 +1703,7 @@ function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 		renamed,
 		skipped,
 		prefixRemaps,
-		addedCustomApiProviders,
-		addedSingleKeyOwners,
+		addedGroups,
 	};
 }
 
@@ -1781,6 +1755,11 @@ export async function clearData(target: ClearTarget): Promise<ClearResult> {
 	const clearRequests = target === "requests" || target === "all";
 	const clearSessions = target === "sessions" || target === "all";
 	const clearProviders = target === "providers" || target === "all";
+	// Loaded on demand: data-portability is also used by lightweight import/export entrypoints,
+	// where eagerly loading CodexManager would cycle through settings and credential migration.
+	const codex = clearProviders
+		? (await import("@server/lib/codex-manager")).getCodexManager()
+		: null;
 
 	if (clearRequests || clearSessions || clearProviders) {
 		const transaction = sqlite.transaction(() => {
@@ -1854,10 +1833,21 @@ export async function clearData(target: ClearTarget): Promise<ClearResult> {
 						agent[key] = {};
 					}
 				}
-				const customIds = (settings.customApiProviders ?? []).map((provider) => provider.id);
+				const groupIds = [
+					...(settings.customApiProviders ?? []).map((provider) => provider.id),
+					...(settings.nugProviders ?? []).map((provider) => provider.id),
+					...(settings.tokendance ? ["tokendance"] : []),
+					...(settings.commandCode ? ["CommandCode"] : []),
+				];
+				const snapshot = codex?.snapshot();
+				const codexIds = [...(snapshot?.entries ?? []), ...(snapshot?.archivedEntries ?? [])].map(
+					(entry) => entry.id,
+				);
 				saveSettings(next);
-				// Every key of the cleared providers, not only the first one settings held.
-				for (const id of customIds) getProviderKeyStore().removeProvider(id);
+				for (const id of groupIds) getProviderKeyStore().removeGroup(id);
+				if (codexIds.length) codex?.removeCredentials(codexIds);
+				const credentials = getCredentialStore();
+				if (credentials.unified) credentials.savePlugins([]);
 				deleted.providers = removed;
 			}
 		});

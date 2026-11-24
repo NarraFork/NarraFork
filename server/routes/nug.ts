@@ -1,10 +1,6 @@
-import { existsSync, readFileSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
-import { resolve } from "node:path";
 import { Hono } from "hono";
 import { NugProvider } from "../lib/agent/nug-provider";
 import { logger } from "../lib/logger";
-import { getNarraforkHome } from "../lib/narrafork-home";
 import {
 	deleteNugCachedModels,
 	getNugCachedModelsByProvider,
@@ -16,6 +12,16 @@ import {
 	nugModelRefreshCoordinator,
 } from "../lib/nug-model-refresh-coordinator";
 import { applyNugModelCatalogUpdate } from "../lib/nug-model-sync";
+import {
+	buildNugQuotaCache,
+	fetchNugQuota,
+	getAllNugCachedQuotas,
+	getNugCachedQuota,
+	normalizeNugQuotaResponse,
+	purgeNugQuotaCache,
+	setNugCachedQuota,
+	updateNugQuotaByPrefix,
+} from "../lib/nug-quota-cache";
 import { getNugRelayStatus } from "../lib/nug-relay/manager";
 import {
 	type NUGProviderConfig,
@@ -25,180 +31,23 @@ import {
 	saveSettings,
 	settings,
 } from "../lib/settings";
+import { registerModelListReader } from "../lib/sourcing/model-list-readers";
+import { sourceGroupForConnection } from "../lib/sourcing/source-groups";
+import { listCachedTemplateModels } from "../lib/sourcing/templates";
 import { spaRedirectLocation } from "../lib/spa-base-href";
 
 export const nugRoutes = new Hono();
+export { getAllNugCachedQuotas, getNugCachedQuota, updateNugQuotaByPrefix };
 
-// === In-memory NUG quota cache (key = provider id) ===
-
-interface NugQuotaCache {
-	balance: number | null;
-	totalGranted: number | null;
-	detailedQuotaBalance: string | null;
-	extra?: unknown;
-	fetchedAt: number;
-}
-
-const cachedQuotaByProvider = new Map<string, NugQuotaCache>();
-const cacheDir = getNarraforkHome();
-const quotaCachePath = resolve(cacheDir, "nug-quotas.json");
-const SAVE_DEBOUNCE_MS = 250;
-let saveTimer: ReturnType<typeof setTimeout> | null = null;
-let saveInFlight = false;
-let saveRequested = false;
-
-loadAllCachedQuotas();
-
-function normalizeNullableNumber(value: unknown): number | null {
-	if (value == null) return null;
-	const numericValue = typeof value === "number" ? value : Number(value);
-	return Number.isFinite(numericValue) ? numericValue : null;
-}
-
-function normalizeNullableString(value: unknown): string | null {
-	if (value == null) return null;
-	const text = String(value).trim();
-	return text ? text : null;
-}
-
-function formatQuotaDetails(value: unknown): string | null {
-	if (value == null) return null;
-	if (typeof value === "string") return normalizeNullableString(value);
-	if (typeof value === "number" || typeof value === "boolean") return String(value);
-	if (value && typeof value === "object" && !Array.isArray(value)) {
-		const lines = Object.entries(value as Record<string, unknown>)
-			.filter(([, entryValue]) => entryValue != null)
-			.map(([key, entryValue]) => {
-				const formatted =
-					typeof entryValue === "string" ||
-					typeof entryValue === "number" ||
-					typeof entryValue === "boolean"
-						? String(entryValue)
-						: JSON.stringify(entryValue);
-				return `${key}: ${formatted}`;
-			});
-		return lines.length > 0 ? lines.join("\n") : null;
-	}
-	try {
-		return JSON.stringify(value);
-	} catch {
-		return null;
-	}
-}
-
-function nugQuotaDetailsFrom(value: unknown): string | null {
-	const record = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
-	return formatQuotaDetails(record.detailedQuotaBalance) ?? formatQuotaDetails(record.extra);
-}
+registerModelListReader("nug", (group) =>
+	getNugCachedModelsByProvider(group.id).map((model) => String(model.id ?? "")),
+);
 
 function normalizeNugBaseUrl(baseUrl: string | undefined): string {
 	return (baseUrl ?? "")
 		.trim()
 		.replace(/\/+$/, "")
 		.replace(/\/(?:api\/v1|api|v1)$/i, "");
-}
-
-function normalizeNugQuotaResponse<T extends Record<string, unknown>>(
-	data: T,
-): T & {
-	balance: number;
-	totalGranted: number;
-	detailedQuotaBalance: string | null;
-} {
-	return {
-		...data,
-		balance: normalizeNullableNumber(data.balance ?? data.quotaBalance ?? data.remaining) ?? 0,
-		totalGranted:
-			normalizeNullableNumber(
-				data.totalGranted ?? data.quotaTotalGranted ?? data.total_granted ?? data.total,
-			) ?? 0,
-		detailedQuotaBalance: nugQuotaDetailsFrom(data),
-	};
-}
-
-function loadAllCachedQuotas(): void {
-	try {
-		if (!existsSync(quotaCachePath)) return;
-		const data = JSON.parse(readFileSync(quotaCachePath, "utf-8")) as Record<
-			string,
-			Partial<NugQuotaCache>
-		>;
-		for (const [providerId, cache] of Object.entries(data)) {
-			cachedQuotaByProvider.set(providerId, {
-				balance: normalizeNullableNumber(cache.balance),
-				totalGranted: normalizeNullableNumber(cache.totalGranted),
-				detailedQuotaBalance: normalizeNullableString(cache.detailedQuotaBalance),
-				...(cache.extra !== undefined ? { extra: cache.extra } : {}),
-				fetchedAt: typeof cache.fetchedAt === "number" ? cache.fetchedAt : 0,
-			});
-		}
-	} catch {
-		// Corrupt or unreadable cache — ignore; quota will refresh on the next NUG event/request.
-	}
-}
-
-function serializeCachedQuotas(): string {
-	const data: Record<string, NugQuotaCache> = {};
-	for (const [providerId, cache] of cachedQuotaByProvider) {
-		data[providerId] = cache;
-	}
-	return JSON.stringify(data);
-}
-
-async function flushCachedQuotas(): Promise<void> {
-	if (saveInFlight) return;
-	saveInFlight = true;
-	try {
-		while (saveRequested) {
-			saveRequested = false;
-			try {
-				await mkdir(cacheDir, { recursive: true });
-				await writeFile(quotaCachePath, serializeCachedQuotas());
-			} catch {
-				// Non-critical: failing to persist quota must not break active narrator runs.
-			}
-		}
-	} finally {
-		saveInFlight = false;
-	}
-}
-
-function scheduleSaveAllCachedQuotas(): void {
-	saveRequested = true;
-	if (saveTimer || saveInFlight) return;
-	saveTimer = setTimeout(() => {
-		saveTimer = null;
-		void flushCachedQuotas();
-	}, SAVE_DEBOUNCE_MS);
-	saveTimer.unref?.();
-}
-
-function buildNugQuotaCache(
-	data: {
-		balance?: unknown;
-		totalGranted?: unknown;
-		detailedQuotaBalance?: unknown;
-		extra?: unknown;
-	},
-	existing?: NugQuotaCache,
-): NugQuotaCache {
-	const detailedQuotaBalance = nugQuotaDetailsFrom(data) ?? existing?.detailedQuotaBalance ?? null;
-	return {
-		balance: normalizeNullableNumber(data.balance) ?? existing?.balance ?? null,
-		totalGranted: normalizeNullableNumber(data.totalGranted) ?? existing?.totalGranted ?? null,
-		detailedQuotaBalance,
-		...(data.extra !== undefined
-			? { extra: data.extra }
-			: existing?.extra !== undefined
-				? { extra: existing.extra }
-				: {}),
-		fetchedAt: Date.now(),
-	};
-}
-
-function setNugCachedQuota(providerId: string, cache: NugQuotaCache): void {
-	cachedQuotaByProvider.set(providerId, cache);
-	scheduleSaveAllCachedQuotas();
 }
 
 function getNugProvider(id: string): { config: NUGProviderConfig; provider: NugProvider } | null {
@@ -490,23 +339,6 @@ function normalizeNugUsageResponse(value: unknown): NugUsageRecord {
 	};
 }
 
-/** Fetch quota from a single NUG provider. */
-async function fetchNugQuota(config: NUGProviderConfig): Promise<{
-	balance: number;
-	totalGranted: number;
-	detailedQuotaBalance?: string | null;
-	extra?: unknown;
-} | null> {
-	const baseUrl = normalizeNugBaseUrl(config.baseUrl);
-	if (!baseUrl || !config.apiKey) return null;
-	try {
-		const provider = new NugProvider(config);
-		return await provider.getQuota();
-	} catch {
-		return null;
-	}
-}
-
 /** Fetch quota for all configured NUG providers (called on startup). */
 export async function fetchAllNugQuotas(): Promise<void> {
 	const providers = settings.nugProviders ?? [];
@@ -514,7 +346,7 @@ export async function fetchAllNugQuotas(): Promise<void> {
 		providers.map(async (p) => {
 			const data = await fetchNugQuota(p);
 			if (data) {
-				setNugCachedQuota(p.id, buildNugQuotaCache(data, cachedQuotaByProvider.get(p.id)));
+				setNugCachedQuota(p.id, buildNugQuotaCache(data, getNugCachedQuota(p.id)), p);
 				logger.debug("NUG quota fetched on startup", {
 					provider: p.name,
 					balance: data.balance,
@@ -524,76 +356,14 @@ export async function fetchAllNugQuotas(): Promise<void> {
 	);
 }
 
-/** Update cached quota balance for a provider identified by prefix. */
-export function updateNugQuotaByPrefix(
-	prefix: string,
-	quotaBalance: number | null,
-	detailedQuotaBalance?: string | null,
-	extra?: unknown,
-): void {
-	const providers = settings.nugProviders ?? [];
-	const config = providers.find((p) => p.prefix === prefix || p.id === prefix);
-	if (!config) return;
-	const existing = cachedQuotaByProvider.get(config.id);
-	setNugCachedQuota(
-		config.id,
-		buildNugQuotaCache(
-			{
-				balance: quotaBalance,
-				detailedQuotaBalance,
-				...(extra !== undefined ? { extra } : {}),
-			},
-			existing,
-		),
-	);
-}
-
-/** Get cached quota for a provider by ID. */
-export function getNugCachedQuota(providerId: string): NugQuotaCache | undefined {
-	return cachedQuotaByProvider.get(providerId);
-}
-
-/** Get all cached quotas keyed by provider ID. */
-export function getAllNugCachedQuotas(): Record<
-	string,
-	{
-		balance: number | null;
-		totalGranted: number | null;
-		detailedQuotaBalance: string | null;
-		extra?: unknown;
-	}
-> {
-	const result: Record<
-		string,
-		{
-			balance: number | null;
-			totalGranted: number | null;
-			detailedQuotaBalance: string | null;
-			extra?: unknown;
-		}
-	> = {};
-	for (const [id, cache] of cachedQuotaByProvider) {
-		result[id] = {
-			balance: cache.balance,
-			totalGranted: cache.totalGranted,
-			detailedQuotaBalance: cache.detailedQuotaBalance,
-			...(cache.extra !== undefined ? { extra: cache.extra } : {}),
-		};
-	}
-	return result;
-}
-
 /** Remove cached models and quotas for providers that no longer exist in settings. */
 export function purgeNugProviderCache(removedIds: string[]): void {
 	let changed = false;
 	for (const id of removedIds) {
 		if (deleteNugCachedModels(id)) changed = true;
-		if (cachedQuotaByProvider.delete(id)) changed = true;
 	}
-	if (changed) {
-		saveAllCachedNugModels();
-		scheduleSaveAllCachedQuotas();
-	}
+	purgeNugQuotaCache(removedIds);
+	if (changed) saveAllCachedNugModels();
 }
 
 function getActiveNugCachedModels(): NugModelInfo[] {
@@ -757,9 +527,21 @@ nugRoutes.post("/models/refresh-if-stale", async (c) => {
 	});
 });
 
-nugRoutes.get("/providers/:id/models", (c) => {
+nugRoutes.get("/providers/:id/models", async (c) => {
 	const id = c.req.param("id");
-	return c.json({ models: getNugCachedModelsByProvider(id), fromCache: true });
+	const config = (settings.nugProviders ?? []).find((provider) => provider.id === id);
+	const group = sourceGroupForConnection(
+		{ id, name: config?.name ?? id, ...config, prefix: config ? nugProviderPrefix(config) : id },
+		"nug",
+	);
+	return c.json({
+		models: await listCachedTemplateModels(
+			group,
+			getNugCachedModelsByProvider(id),
+			c.req.raw.signal,
+		),
+		fromCache: true,
+	});
 });
 
 nugRoutes.post("/providers/:id/models/refresh", async (c) => {
@@ -806,7 +588,7 @@ nugRoutes.get("/providers/:id/quota", async (c) => {
 	try {
 		const data = (await entry.provider.getQuota()) as unknown as Record<string, unknown>;
 		const responseData = normalizeNugQuotaResponse(data);
-		setNugCachedQuota(id, buildNugQuotaCache(responseData, cachedQuotaByProvider.get(id)));
+		setNugCachedQuota(id, buildNugQuotaCache(responseData, getNugCachedQuota(id)), entry.config);
 		return c.json(responseData);
 	} catch (err: unknown) {
 		const msg = err instanceof Error ? err.message : "Unknown error";
@@ -823,7 +605,7 @@ nugRoutes.get("/providers/:id/billing/config", async (c) => {
 	try {
 		const data = (await entry.provider.getBillingConfig()) as unknown as Record<string, unknown>;
 		const responseData = normalizeNugQuotaResponse(data);
-		setNugCachedQuota(id, buildNugQuotaCache(responseData, cachedQuotaByProvider.get(id)));
+		setNugCachedQuota(id, buildNugQuotaCache(responseData, getNugCachedQuota(id)), entry.config);
 		return c.json(responseData);
 	} catch (err: unknown) {
 		const msg = err instanceof Error ? err.message : "Unknown error";

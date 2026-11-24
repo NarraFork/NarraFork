@@ -3419,6 +3419,7 @@ export async function processEvent(
 					ctx.providerPrefix,
 					event.quotaBalance,
 					event.detailedQuotaBalance,
+					event.providerIdentity,
 				);
 				try {
 					const { updateNugQuotaByPrefix } = await import("../routes/nug");
@@ -3429,6 +3430,8 @@ export async function processEvent(
 								ctx.providerPrefix,
 								numericBalance,
 								event.detailedQuotaBalance ?? null,
+								undefined,
+								event.providerIdentity,
 							);
 						}
 					}

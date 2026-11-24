@@ -207,6 +207,7 @@ import {
 	asyncQuestionListQuerySchema,
 	asyncQuestionSupplementSchema,
 	browserInteractSchema,
+	bufferEditLeaseSchema,
 	bufferQueueModeSchema,
 	createBlacklistCmdSchema,
 	createBlacklistDirSchema,
@@ -276,6 +277,11 @@ import {
 	scanBrokenModelNarrators,
 	undoLastBrokenModelMigration,
 } from "../services/broken-model-migration-service";
+import { bufferEditHolds } from "../services/buffer-edit-hold";
+import {
+	readBufferEditLeaseBody,
+	withBufferEditRequestDeadline,
+} from "../services/buffer-edit-request";
 import type {
 	BashCommandResult,
 	BlockAllSkillsResult,
@@ -337,6 +343,7 @@ import {
 import {
 	canWriteNarrator,
 	filterReadableNarrators,
+	loadNarratorForAccess,
 	NARRATOR_ACL_COLUMNS,
 	type NarratorPrincipal,
 	narratorReadableWhere,
@@ -353,6 +360,8 @@ import {
 import { bodyColumns, fillBody } from "../services/narrator-body-reads";
 import { insertEnvelope, writeEnvelopeBody } from "../services/narrator-body-writes";
 import {
+	beginBufferedMessageEdit,
+	canEditBufferedMessage,
 	deleteBufferedTextFile,
 	persistAdditionalBufferedTextFiles,
 	releaseStagedFiles,
@@ -386,8 +395,11 @@ import {
 	deferPendingQuestion,
 	disarmQuestionReflection,
 	getQuestionReflectionDeadline,
+	isPendingPlanReflectionAvailable,
 	reflectPendingAskUserQuestion,
+	reflectPendingExitPlanMode,
 	resolveDecisionNarratorId,
+	startAutomaticPlanReflectionForNarrator,
 	stopDangerReflectionLoop,
 	takeOverQuestionReflection,
 } from "../services/narrator-permission";
@@ -848,6 +860,53 @@ function unarchiveAsCaller(c: Context, id: string) {
 		narratorService.updateStatus(id, "idle"),
 	);
 }
+
+narratorRoutes.use("/:id/buffer/:mid/edit", async (c, next) => {
+	await requireNarratorAccess(c, c.req.param("id"), "write");
+	if (c.req.method === "DELETE") return next();
+	return withBufferEditRequestDeadline(
+		c.req.raw,
+		async (request) => {
+			c.req.raw = await readBufferEditLeaseBody(request);
+			await next();
+		},
+		10_000,
+	);
+});
+
+// Pin before either body-limit middleware reads the streamed body: even a slow
+// multipart upload must not outlive its edit lease and get dispatched half-edited.
+narratorRoutes.use("/:id/buffer/:mid", async (c, next) => {
+	if (c.req.method !== "PATCH") return next();
+	const id = c.req.param("id");
+	const messageId = c.req.param("mid");
+	await requireNarratorAccess(c, id, "write");
+	const rawToken = c.req.header("X-Buffer-Edit-Token");
+	const parsed =
+		rawToken === undefined ? undefined : bufferEditLeaseSchema.safeParse({ token: rawToken });
+	if (parsed && !parsed.success) throw new ValidationError(parsed.error.message);
+	const identity = parsed?.success
+		? { messageId, userId: c.get("user").sub, token: parsed.data.token }
+		: undefined;
+	await bufferEditHolds.mutate(
+		id,
+		messageId,
+		() =>
+			withBufferEditRequestDeadline(
+				c.req.raw,
+				async (request) => {
+					c.req.raw = request;
+					if (!(await canEditBufferedMessage(id, messageId)))
+						throw new NotFoundError("Buffered message", messageId);
+					await next();
+				},
+				undefined,
+				bufferEditHolds.mutationSignal(),
+			),
+		identity,
+	);
+	if (identity && c.res.ok) await bufferEditHolds.release(id, identity);
+});
 
 // JSON composer requests never inherit the much larger multipart attachment budget.
 // The middleware bounds streamed bodies before req.json(), including absent/lying Content-Length.
@@ -3784,6 +3843,47 @@ narratorRoutes.get("/:id/buffer", async (c) => {
 	return c.json(await resolveBufferQueue(id));
 });
 
+narratorRoutes.post("/:id/buffer/:mid/edit", async (c) => {
+	const parsed = bufferEditLeaseSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return c.json(
+		await beginBufferedMessageEdit(
+			c.req.param("id"),
+			c.req.param("mid"),
+			c.get("user").sub,
+			parsed.data.token,
+			parsed.data.expectedRevision,
+		),
+	);
+});
+
+narratorRoutes.patch("/:id/buffer/:mid/edit", async (c) => {
+	const parsed = bufferEditLeaseSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return c.json(
+		await bufferEditHolds.renew(
+			c.req.param("id"),
+			{
+				messageId: c.req.param("mid"),
+				userId: c.get("user").sub,
+				token: parsed.data.token,
+			},
+			parsed.data.expectedRevision,
+		),
+	);
+});
+
+narratorRoutes.delete("/:id/buffer/:mid/edit", async (c) => {
+	const parsed = bufferEditLeaseSchema.safeParse({ token: c.req.header("X-Buffer-Edit-Token") });
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	await bufferEditHolds.release(c.req.param("id"), {
+		messageId: c.req.param("mid"),
+		userId: c.get("user").sub,
+		token: parsed.data.token,
+	});
+	return c.json({ ok: true });
+});
+
 interface LocatedBufferedMessage {
 	message: BufferedMessage;
 }
@@ -4092,7 +4192,9 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 				)
 			: [];
 		const savedFiles = [...keptSavedFiles, ...createdSavedFiles];
+		c.req.raw.signal.throwIfAborted();
 		const ok = await updateBufferedMessage(id, mid, text, {
+			signal: c.req.raw.signal,
 			images: [...keptImages, ...newImages],
 			media: [...keptMedia, ...createdMedia],
 			savedFiles,
@@ -4206,6 +4308,7 @@ narratorRoutes.post("/:id/buffer/:mid/retry", async (c) => {
 		try {
 			retried = await retryBufferedMessage(id, mid);
 		} catch (error) {
+			if (error instanceof AppError) throw error;
 			throw new ValidationError(
 				error instanceof Error ? error.message : "Buffered payload unavailable",
 			);
@@ -6093,6 +6196,19 @@ narratorRoutes.patch("/:id/reflection-overrides", async (c) => {
 	await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	await narratorService.updateReflectionOverrides(id, updates);
 	broadcastToNarrator(id, { type: "reflection_overrides_changed", narratorId: id, ...updates });
+	// A plan that blocked earlier did so because this switch was off, and only a review can
+	// release it without a click: turning it on is this session asking for exactly that.
+	// Fire-and-forget — a review takes minutes and must not hold the settings write open.
+	if (updates.planReflectionAutoApproveOverride === "on") {
+		// Whoever turned the switch on must still be allowed to drive this session when a review's
+		// verdict lands, minutes later.
+		const principal = narratorPrincipalOf(c);
+		startAutomaticPlanReflectionForNarrator(id, {
+			assertStillAllowed: async () => {
+				await loadNarratorForAccess(id, principal, "write");
+			},
+		});
+	}
 	return c.json({ ok: true });
 });
 
@@ -6669,7 +6785,12 @@ narratorRoutes.get("/:id/permissions", async (c) => {
 	return c.json(
 		permissions.map((p) => {
 			const reflectionDeadline = getQuestionReflectionDeadline(p.id);
-			return reflectionDeadline !== null ? { ...p, reflectionDeadline } : p;
+			const withDeadline = reflectionDeadline !== null ? { ...p, reflectionDeadline } : p;
+			// Only a plan approval carries 计划反思, and only while the loop that raised it still
+			// holds a reflection runner (in-memory, so it does not survive a restart by itself).
+			return p.toolName === "ExitPlanMode"
+				? { ...withDeadline, planReflectionAvailable: isPendingPlanReflectionAvailable(p.id) }
+				: withDeadline;
 		}),
 	);
 });
@@ -7070,6 +7191,37 @@ narratorRoutes.post("/permissions/:requestId/reflect-question", async (c) => {
 			kind: "question.answered_by_ai",
 		});
 	return c.json({ ok: true, answers: result.answers ?? {} });
+});
+
+/**
+ * Run one plan reflection for a plan that is ALREADY waiting for approval, then apply its
+ * decision to that request: confirm approves it (skipping the person), revise sends the feedback
+ * back to the model, an undecidable review leaves the card with the person.
+ *
+ * Answers as soon as the review is STARTED. A review takes minutes and must not hold an HTTP
+ * request open; the card follows it through the ordinary `plan_reflection_*` frames.
+ */
+narratorRoutes.post("/permissions/:requestId/reflect-plan", async (c) => {
+	const requestId = c.req.param("requestId");
+	if (!isPendingPlanReflectionAvailable(requestId)) {
+		return c.json({ error: "Plan reflection is not available for this request" }, 409);
+	}
+	// The middleware above checked write access when the review STARTED; its verdict lands
+	// minutes later, so the same check runs again right before it is applied. The principal is
+	// captured now: this request has long been answered by then.
+	const principal = narratorPrincipalOf(c);
+	const assertStillAllowed = async () => {
+		const narratorId = await resolveDecisionNarratorId(requestId);
+		if (!narratorId) throw new NotFoundError("Narrator", "unknown");
+		await loadNarratorForAccess(narratorId, principal, "write");
+	};
+	void reflectPendingExitPlanMode(requestId, { assertStillAllowed }).catch((err) => {
+		logger.warn("Plan reflection request failed", {
+			requestId,
+			error: err instanceof Error ? err.message : String(err),
+		});
+	});
+	return c.json({ ok: true, started: true });
 });
 
 // Silently cancel the automatic AskUserQuestion reflection countdown (e.g. the

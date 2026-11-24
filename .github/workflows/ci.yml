@@ -62,6 +62,8 @@ jobs:
         run: bun run check:tokens
       - name: Check translations
         run: bun run i18n:check
+      - name: Check repository knowledge tree
+        run: bun scripts/knowledge.ts check
 
   build:
     name: Build and typecheck

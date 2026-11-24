@@ -139,7 +139,7 @@ function keyToCredential(key: ProviderKey, groupId = key.providerId): Credential
 function keysFromPart(part: KeyPart): ProviderKey[] {
 	const keys: ProviderKey[] = [];
 	for (const c of part.credentials) {
-		if (c.auth.kind !== "api_key") continue;
+		if (c.auth.kind !== "api_key" || !c.target.groupId) continue;
 		keys.push({
 			id: c.id,
 			providerId: c.target.groupId,
@@ -251,6 +251,70 @@ export class ProviderKeyStore {
 
 	all(): readonly ProviderKey[] {
 		return this.keys;
+	}
+
+	/** Inference keys of a source group, independent of the storage mode's owner spelling. */
+	listGroup(groupId: string): ProviderKey[] {
+		return this.keys
+			.filter(
+				(key) => !isSearchKeyOwner(key.providerId) && keyOwnerGroup(key.providerId) === groupId,
+			)
+			.sort(byPriority);
+	}
+
+	firstGroupKey(groupId: string): string | undefined {
+		return this.listGroup(groupId)[0]?.apiKey;
+	}
+
+	/** Add an inference key by source group; the facade maps legacy singleton/NUG owners. */
+	addGroupCredential(
+		groupId: string,
+		templateId: "nug" | "tokendance" | "command-code" | undefined,
+		input: { apiKey: string; label?: string; network?: CredentialNetwork },
+	): ProviderKey {
+		const owner =
+			templateId === "nug"
+				? nugKeyOwner(groupId)
+				: templateId === "tokendance"
+					? TOKENDANCE_KEY_OWNER
+					: templateId === "command-code"
+						? COMMAND_CODE_KEY_OWNER
+						: groupId;
+		return this.add(owner, input);
+	}
+
+	/** Non-inference secrets of one group (site token, NUG OAuth client secret). */
+	groupSecrets(groupId: string): GroupSecrets {
+		const secrets: GroupSecrets = {};
+		for (const [prefix, field] of SECRET_OWNERS) {
+			const value = this.firstKey(`${prefix}${groupId}`);
+			if (value) secrets[field] = value;
+		}
+		return secrets;
+	}
+
+	setGroupSecrets(groupId: string, secrets: GroupSecrets): void {
+		this.assertWritable();
+		const owners = new Map(SECRET_OWNERS.map(([prefix, field]) => [`${prefix}${groupId}`, field]));
+		const next = this.keys.filter((key) => !owners.has(key.providerId));
+		for (const [owner, field] of owners) {
+			const apiKey = secrets[field]?.trim();
+			if (apiKey) next.push({ id: owner, providerId: owner, apiKey, priority: 0, createdAt: 0 });
+		}
+		this.keys = next;
+		this.commit();
+	}
+
+	/** Remove inference keys and group secrets, never search-provider keys. */
+	removeGroup(groupId: string): void {
+		this.assertWritable();
+		const before = this.keys.length;
+		this.keys = this.keys.filter((key) => {
+			if (isSearchKeyOwner(key.providerId)) return true;
+			if (keyOwnerGroup(key.providerId) === groupId) return false;
+			return !SECRET_OWNERS.some(([prefix]) => key.providerId === `${prefix}${groupId}`);
+		});
+		if (this.keys.length !== before) this.commit();
 	}
 
 	get(id: string): ProviderKey | undefined {

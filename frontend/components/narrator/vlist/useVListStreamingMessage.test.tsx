@@ -14,6 +14,7 @@ import { measureCache } from "./measure-cache";
 import { PretextLayoutCoordinator } from "./pretext-layout-coordinator";
 import { renderElement, resolveRenderExtra } from "./render-registry";
 import { useVListStreamingMessage } from "./useVListStreamingMessage";
+import { usePersistedToolLive } from "./vlist-persisted-tool-live";
 import { resolveStreamAnimExtra } from "./vlist-stream-anim-extra";
 
 let nextMountEpoch = 0;
@@ -76,10 +77,13 @@ async function withStream(
 		animateStreaming = false,
 		textExpanded = false,
 		keepEmptyReasoningLive = false,
+		persistedToolLive = false,
 	}: {
 		animateStreaming?: boolean;
 		textExpanded?: boolean;
 		keepEmptyReasoningLive?: boolean;
+		/** Wire the committed-card live channel the shell installs (PretextExactMessageList). */
+		persistedToolLive?: boolean;
 	} = {},
 ) {
 	const build = { ...BUILD, keepEmptyReasoningLive, isTextExpanded: () => textExpanded };
@@ -161,10 +165,16 @@ async function withStream(
 	function Harness() {
 		const snapshot = useSyncExternalStore(coordinator.subscribe, coordinator.getSnapshot);
 		const committed = snapshot.input?.messages ?? [];
+		const onPersistedToolLive = usePersistedToolLive(
+			narratorId,
+			(patch) => coordinator.applyLivePatch(patch, VIEW),
+			committed,
+		);
 		const streaming = useVListStreamingMessage(narratorId, {
 			enabled: true,
 			isSubagent,
 			committedMessages: committed,
+			...(persistedToolLive ? { onPersistedToolLive } : {}),
 		});
 		latestLive = streaming;
 		useEffect(() => {
@@ -654,6 +664,107 @@ describe("real streaming hook / local WS / coordinator / DOM handoff", () => {
 			expect(h.live()?.toolCalls?.some((call) => call.toolUseId === chunk.toolUseId)).toBe(true);
 			expect(h.text()).toContain("Write");
 		});
+	});
+
+	for (const wired of [false, true]) {
+		it(`a tool still running after its message persisted ${wired ? "shows" : "drops"} live output`, async () => {
+			await withStream(
+				async (h) => {
+					await h.frame({
+						type: "tool_use_chunk",
+						toolUseId: "slow-bash",
+						toolName: "Bash",
+						inputCharsTotal: 1,
+					});
+					await h.raf();
+					// The assistant message persists right before execution: the synthetic
+					// card retires and the committed card is the only one left.
+					await h.commit([{ ...tool("slow-bash"), status: "running" }]);
+					await h.raf();
+					await h.frame({ type: "tool_output", toolUseId: "slow-bash", output: "LIVE-LINE-1" });
+					await h.raf();
+					expect(h.text().includes("LIVE-LINE-1")).toBe(wired);
+					expect(h.live()?.toolCalls?.some((call) => call.toolUseId === "slow-bash") ?? false).toBe(
+						false,
+					);
+				},
+				{ persistedToolLive: wired },
+			);
+		});
+	}
+
+	for (const snapshotFirst of [false, true]) {
+		it(`opening a session restores a quiet running tool's buffered output (${snapshotFirst ? "snapshot → document" : "document → snapshot"})`, async () => {
+			await withStream(
+				async (h) => {
+					const chunk = {
+						toolUseId: "quiet-bash",
+						toolName: "Bash",
+						inputCharsTotal: 1,
+						started: true,
+						executing: true,
+						streamingOutput: "Waiting for build",
+					};
+					const snapshot = { type: "streaming_snapshot", streamingBlocks: [], toolChunks: [chunk] };
+					const commit = () => h.commit([{ ...tool("quiet-bash"), status: "running" }]);
+					if (snapshotFirst) {
+						// Snapshot lands before the page: the output sits on a synthetic card that
+						// then retires and must hand it to the committed card.
+						await h.frame(snapshot);
+						await h.raf();
+						await commit();
+					} else {
+						await commit();
+						await h.raf();
+						await h.frame(snapshot);
+					}
+					await h.raf();
+					// No further tool_output frame: the command is silent from here on.
+					expect(h.text()).toContain("Waiting for build");
+					expect(
+						h.live()?.toolCalls?.some((call) => call.toolUseId === "quiet-bash") ?? false,
+					).toBe(false);
+				},
+				{ persistedToolLive: true },
+			);
+		});
+	}
+
+	it("a canonical row replacement keeps a running tool's live body, but not once it finished", async () => {
+		await withStream(
+			async (h) => {
+				await h.commit([{ ...tool("quiet-bash"), status: "running" }]);
+				await h.raf();
+				await h.frame({
+					type: "streaming_snapshot",
+					streamingBlocks: [],
+					toolChunks: [
+						{
+							toolUseId: "quiet-bash",
+							toolName: "Bash",
+							inputCharsTotal: 1,
+							started: true,
+							executing: true,
+							streamingOutput: "Waiting for build",
+						},
+					],
+				});
+				await h.raf();
+				expect(h.text()).toContain("Waiting for build");
+				// Revalidation swaps in fresh page rows that never carry live fields; the
+				// tool is still running and sends nothing more.
+				await h.commit([{ ...tool("quiet-bash"), status: "running" }]);
+				await h.raf();
+				await h.raf();
+				expect(h.text()).toContain("Waiting for build");
+				// A finished occurrence must not get the stale live body back.
+				await h.commit([{ ...tool("quiet-bash"), status: "success", outputJson: "BUILD-DONE" }]);
+				await h.raf();
+				await h.raf();
+				expect(h.text()).not.toContain("Waiting for build");
+			},
+			{ persistedToolLive: true },
+		);
 	});
 
 	it("ignores child and persisted tools in snapshots but restores tools on their own page", async () => {

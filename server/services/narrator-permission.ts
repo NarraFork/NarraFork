@@ -4,6 +4,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, resolve } from "node:path";
 import { isParentSelector } from "@shared/communication-tool";
 import { isGenUiReadAction } from "@shared/gen-ui-tool-policy";
+import { outlinePlanSubmissionOf } from "@shared/outline-plan-submission";
 import type { ProgressSnapshot } from "@shared/progress-phase";
 import { and, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import { db } from "../db";
@@ -46,6 +47,10 @@ import {
 	FS_STAT_RESOLVED_PATH_FEATURE,
 } from "../lib/agent/execution/rpc-types";
 import {
+	getPendingPlanReflectionRunner,
+	type PendingPlanReflectionRunner,
+} from "../lib/agent/pending-plan-reflection";
+import {
 	getPermissionRecovery,
 	isRecoveredHumanPermission,
 	recoveryReflection,
@@ -82,6 +87,7 @@ import type {
 } from "../lib/agent/types";
 import {
 	type DangerReflectionLevel,
+	normalizeBooleanOverride,
 	normalizeDangerReflectionLevel,
 	resolveBooleanOverride,
 	resolveDangerReflectionLevel,
@@ -2509,6 +2515,226 @@ export async function reflectPendingAskUserQuestion(
 			notifyHumanAttentionChanged();
 		}
 	}
+}
+
+/**
+ * Whether this request can be reflected on demand.
+ *
+ * Only an ExitPlanMode blocked on a person qualifies: an outline plan's submission is reviewed
+ * into comments and never auto-approved, and no other tool has a plan to review at all.
+ */
+function canReflectPendingPlan(
+	toolName: string,
+	input: Record<string, unknown>,
+	runner: PendingPlanReflectionRunner | undefined,
+): boolean {
+	return (
+		toolName === "ExitPlanMode" && runner !== undefined && outlinePlanSubmissionOf(input) === null
+	);
+}
+
+/** Whether `requestId` is a waiting plan approval that could be reflected on right now. */
+export function isPendingPlanReflectionAvailable(requestId: string): boolean {
+	const pending = pendingPermissions.get(requestId);
+	if (!pending || pending.planReflectionRunning) return false;
+	return canReflectPendingPlan(pending.toolName, pending.input, pending.planReflection);
+}
+
+/**
+ * Same condition as the loop's own reflection gate, read from the narrator row because the
+ * pending request's AgentConfig belongs to a suspended stack frame.
+ *
+ * Only an EXPLICIT session-level override triggers here: inheriting the instance default is a
+ * standing preference, not this session asking for the plan it just blocked to be approved now.
+ */
+async function currentPermissionModeAllowsAutomaticPlanReflection(
+	pending: PendingPermission,
+): Promise<boolean> {
+	const narrator = await db.query.narrators.findFirst({
+		where: eq(narrators.id, pending.narratorId),
+		columns: { permissionMode: true, planReflectionAutoApproveOverride: true },
+	});
+	if (!narrator) return false;
+	if (normalizeBooleanOverride(narrator.planReflectionAutoApproveOverride) !== "on") return false;
+	const { shouldRunExitPlanModeReflection } = await import("../lib/agent/loop");
+	return shouldRunExitPlanModeReflection({
+		permissionMode: narrator.permissionMode ?? "default",
+		planReflectionAutoApproveOverride: "on",
+	});
+}
+
+export type PendingPlanReflectionOutcome =
+	| { status: "approved"; decision: "confirm" | "confirm_compact" }
+	| { status: "revising" }
+	| { status: "awaiting_user"; reason?: string }
+	| { status: "unavailable"; reason: string };
+
+/**
+ * Run the plan reflection for an ExitPlanMode that is ALREADY waiting for a person, then write
+ * its decision back onto that pending permission.
+ *
+ * Reached two ways: the manual 计划反思 button on the card, and turning the 计划反思 switch on
+ * while the plan waits. The review is the ordinary nested agent loop, so its card state, WS
+ * frames, takeover (`stop-plan-reflection`) and persisted suggestions all behave as before; only
+ * the decision's destination differs — it resolves the waiting permission instead of returning a
+ * tool result, because the tool call that asked for approval is already in flight.
+ */
+export async function reflectPendingExitPlanMode(
+	requestId: string,
+	opts: {
+		automatic?: boolean;
+		/**
+		 * Re-checks that whoever started this review may still decide the request. It runs once
+		 * more right before the verdict is applied: a review takes minutes, and access revoked
+		 * meanwhile (a member removed from a team) must not let its verdict through — the same
+		 * rule a person's own approval follows (`resolvePermissionOrDangerReflection`).
+		 */
+		assertStillAllowed?: () => Promise<void>;
+	} = {},
+): Promise<PendingPlanReflectionOutcome> {
+	const pending = pendingPermissions.get(requestId);
+	if (!pending) return { status: "unavailable", reason: "Permission request not found" };
+	if (pending.toolName !== "ExitPlanMode") {
+		return { status: "unavailable", reason: "Permission request is not ExitPlanMode" };
+	}
+	if (pending.signal.aborted) return { status: "unavailable", reason: "Narrator aborted" };
+	const runner = pending.planReflection;
+	if (!canReflectPendingPlan(pending.toolName, pending.input, runner) || !runner) {
+		return {
+			status: "unavailable",
+			reason: "Plan reflection is not available for this request",
+		};
+	}
+	if (pending.planReflectionRunning) {
+		return { status: "awaiting_user", reason: "Plan reflection is already running" };
+	}
+
+	// Claimed BEFORE the first await: the automatic path's permission-mode check reads the DB, and
+	// a manual click or a repeated switch-on landing in that gap must see this review as running
+	// instead of starting a second one against the same request.
+	const abort = new AbortController();
+	pending.planReflectionRunning = true;
+	pending.planReflectionAbort = abort;
+	notifyHumanAttentionChanged();
+	try {
+		if (opts.automatic && !(await currentPermissionModeAllowsAutomaticPlanReflection(pending))) {
+			return {
+				status: "unavailable",
+				reason: "Plan reflection is not enabled for this permission",
+			};
+		}
+		// Identity, not the id: reprocessing (e.g. a switch to Bypass) re-registers the SAME tool-call
+		// id with a freshly resolved input, which this review never read.
+		if (abort.signal.aborted || pendingPermissions.get(requestId) !== pending) {
+			// Decided or replaced while the permission-mode check ran: nothing is left to review.
+			return { status: "awaiting_user", reason: "Already resolved" };
+		}
+		// The card's own resolved input: the reviewer must read the plan the person is looking at.
+		const reviewed = await runner(pending.input, { signal: abort.signal });
+		// Load what the verdict needs BEFORE the identity check, so no await separates the check
+		// from `resolvePermission` (which reads the entry synchronously).
+		const { pendingPlanApproverSource } = await import("./narrator-session-state");
+		const { buildExitPlanReflectionDeniedToolResult } = await import("../lib/agent/loop");
+		const decides =
+			reviewed.decision.action === "confirm" ||
+			reviewed.decision.action === "confirm_compact" ||
+			reviewed.decision.action === "revise";
+		if (decides && opts.assertStillAllowed) {
+			try {
+				await opts.assertStillAllowed();
+			} catch (err) {
+				// The verdict is dropped, not the request: the plan stays with whoever may decide it.
+				logger.warn("Plan reflection verdict dropped: its initiator may no longer decide", {
+					requestId,
+					narratorId: pending.narratorId,
+					error: err instanceof Error ? err.message : String(err),
+				});
+				return {
+					status: "awaiting_user",
+					reason: "The person who started this reflection may no longer decide it",
+				};
+			}
+		}
+		if (pendingPermissions.get(requestId) !== pending) {
+			// The person decided, or the request was reprocessed into a new wait under the same id
+			// (possibly with a re-read plan), while the review ran: its verdict describes a wait
+			// that is over and must not settle the replacement.
+			return { status: "awaiting_user", reason: "Already resolved" };
+		}
+		if (reviewed.decision.action === "confirm" || reviewed.decision.action === "confirm_compact") {
+			// Attribute the restart's "plan approved, begin execution" turn to the reflection.
+			pendingPlanApproverSource.set(pending.narratorId, "reflection");
+			const resolved = await resolvePermission(requestId, "allow", {
+				decidedBy: "reflection",
+				compactAfter: reviewed.decision.action === "confirm_compact",
+			});
+			if (!resolved) {
+				// Nothing was approved, so the marker is stale: left behind it would attribute the
+				// NEXT approval in this session — possibly a real person's — to the reflection.
+				pendingPlanApproverSource.delete(pending.narratorId);
+				return { status: "awaiting_user", reason: "Already resolved" };
+			}
+			return { status: "approved", decision: reviewed.decision.action };
+		}
+		if (reviewed.decision.action === "revise") {
+			const denied = buildExitPlanReflectionDeniedToolResult(
+				reviewed.decision,
+				pending.locale ?? "en",
+				reviewed.checkFailed,
+			);
+			await resolvePermission(requestId, "deny", {
+				decidedBy: "reflection",
+				denyMessage: denied.output,
+				exitPlanCancelled: true,
+			});
+			return { status: "revising" };
+		}
+		// `manual` (the person took the review over) and `human` (it could not decide) both leave
+		// the approval with the person, whose card the takeover already restored.
+		return { status: "awaiting_user", reason: reviewed.decision.reason };
+	} catch (err) {
+		const reason = err instanceof Error ? err.message : String(err);
+		logger.warn("Pending plan reflection failed", {
+			requestId,
+			narratorId: pending.narratorId,
+			reason,
+		});
+		return { status: "awaiting_user", reason };
+	} finally {
+		if (pending.planReflectionAbort === abort) pending.planReflectionAbort = undefined;
+		pending.planReflectionRunning = false;
+		notifyHumanAttentionChanged();
+	}
+}
+
+/**
+ * Reflect on every plan this narrator currently has blocked.
+ *
+ * Called after its 计划反思 switch is turned on: the plans that blocked earlier did so because
+ * that switch was off, and only a live review can release them without a person's click. Each
+ * review runs in the background — it takes minutes, and the settings write must not wait for it.
+ */
+export function startAutomaticPlanReflectionForNarrator(
+	narratorId: string,
+	opts: { assertStillAllowed?: () => Promise<void> } = {},
+): number {
+	let started = 0;
+	for (const [requestId, pending] of [...pendingPermissions.entries()]) {
+		if (pending.narratorId !== narratorId || pending.toolName !== "ExitPlanMode") continue;
+		if (!isPendingPlanReflectionAvailable(requestId)) continue;
+		started += 1;
+		void reflectPendingExitPlanMode(requestId, {
+			automatic: true,
+			assertStillAllowed: opts.assertStillAllowed,
+		}).catch((err) => {
+			logger.warn("Automatic plan reflection failed", {
+				requestId,
+				narratorId,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		});
+	}
+	return started;
 }
 
 /**
@@ -6501,6 +6727,12 @@ export async function handlePermission(
 			...(questionReflectionDeadline !== undefined
 				? { reflectionDeadline: questionReflectionDeadline }
 				: {}),
+			// Lets the card render 计划反思 only where a live reflection runner exists.
+			planReflectionAvailable: canReflectPendingPlan(
+				toolName,
+				effectiveInput,
+				getPendingPlanReflectionRunner(narratorId, toolUseId),
+			),
 		},
 	});
 	eventBus.emit({ type: "narrator:permission_request", narratorId, requestId: toolCallId });
@@ -6543,6 +6775,9 @@ export async function handlePermission(
 				clearTimeout(pendingEntry.questionReflectionTimer);
 				pendingEntry.questionReflectionTimer = undefined;
 			}
+			// Every way this wait ends (decided, reprocessed into a new wait, aborted) retires an
+			// on-demand plan review still running against it; the review then persists nothing.
+			pendingEntry?.planReflectionAbort?.abort(new Error("Permission request ended"));
 			signal.removeEventListener("abort", onAbort);
 			if (pendingPermissions.delete(toolCallId)) notifyHumanAttentionChanged();
 		};
@@ -6594,6 +6829,12 @@ export async function handlePermission(
 			planModeSoftDeny: promotedPlanSoftDeny || undefined,
 			planSubmittedFromFile:
 				toolName === "ExitPlanMode" && exitPlanResolvedFromFile ? true : undefined,
+			// Published by the loop for the length of its approval wait: a plan blocked here can
+			// still be reflected on demand (the 计划反思 button, or the switch turned on).
+			planReflection:
+				toolName === "ExitPlanMode"
+					? getPendingPlanReflectionRunner(narratorId, toolUseId)
+					: undefined,
 			attentionEmitted,
 		};
 		if (toolName === "AskUserQuestion" && questionReflectionDeadline !== undefined) {
@@ -6982,6 +7223,10 @@ export async function resolvePermission(
 		});
 		return false;
 	}
+	// Whoever decided first ends any review still running against this request: its verdict
+	// would describe a wait that no longer exists, and the nested loop would keep a provider
+	// call open for nobody.
+	pending.planReflectionAbort?.abort(new Error("Permission request decided"));
 	// A person decides inside the run: it counts as a person's run (outline P2 PR 10c-2), for the
 	// session asking and for the one its request shows on (a subagent's parent).
 	if (decidedBy === "user")

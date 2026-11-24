@@ -120,7 +120,7 @@ server/
 
 **关键模式：**
 - **事件总线**（`lib/event-bus.ts`）解耦服务 → WebSocket 广播，所有跨服务通信通过类型化事件流转。
-- **叙述者会话**使用自定义 Agent Loop（`server/lib/agent/loop.ts`），HTTP SSE 流式 + 并行 WebSocket 广播；权限请求暂停会话（Promise 挂起）由用户决策解除（5 分钟超时）。
+- **叙述者会话**使用自定义 Agent Loop（`server/lib/agent/loop.ts`），HTTP SSE 流式 + 并行 WebSocket 广播；权限请求暂停会话（Promise 挂起），直到用户决定、策略重新判定或会话中止才解除，没有整体超时（5 分钟的只有危险确认令牌、规则申请的有效期，以及 AskUserQuestion 自动反思的默认倒计时 `agent.questionReflectionTimeoutMs`，后者只在全部允许模式且开启时生效）。
 - **可选工具三段式模式**（`shared/routine-modes.ts`）：`manual`（会话内 `/load` 临时加载）、`auto`（不预装，经 ToolSearch 按需成组加载）、`resident`（新会话默认加载）。模式存于 `settings.routines.toolModes` 与项目 `chapterSettings.routines.toolModes`（项目层优先），`enabledRoutines`/`disabledRoutines` 作为兼容投射双向同步；`narrators.enabledTools` 是正交的会话级临时装载。`isPreloadedMode` 只对 `resident` 为真；`auto` 故意不进旧的启用/禁用名单。
 - **子代理**：通过 `narrator_messages.parentToolUseId` 关联消息树，子代理有独立叙述者记录（`type="subagent"`）。
 - **Fork 上下文继承**：`full`（延迟会话 fork）/ `compressed`（摘要注入 system prompt）/ `fresh`（无上下文）。
@@ -130,7 +130,7 @@ server/
 - **容器**：Podman 只用于插件与基准测试；设置页“工作区与容器”提供检测与安装。
 - **终端管理**：Unix 用 `Bun.Terminal`，Windows 用 `bun-pty`，统一 `TerminalRuntime` 接口；可选 dtach；生命周期绑定服务器进程。
 - **项目页**：`/projects/$projectId` 列出目录与会话（按链接表过滤，任何角色的链接都算）。
-- **文件写入与回退**：受控文件 IO 使用 [server/services/file-write-queue.ts](server/services/file-write-queue.ts) 的进程内单文件队列；[server/services/file-change-runtime.ts](server/services/file-change-runtime.ts) 分别报告实际写入结果与历史可用性。文件恢复由 [server/services/revert-transaction-service.ts](server/services/revert-transaction-service.ts) 逐项执行，部分成功保留，消息 COW 在文件恢复完整成功后单独提交。旧持久屏障、管理员解锁及补偿链已退役。Tree 快照服务 Bash 观测与编辑预览，热捕获保留 4s 预算及后台暖捕获；`workspace.treeSnapshotsEnabled` 可关闭。
+- **文件写入与回退**：受控文件 IO 使用 [server/services/file-write-queue.ts](server/services/file-write-queue.ts) 的进程内单文件队列；[server/services/file-change-runtime.ts](server/services/file-change-runtime.ts) 分别报告实际写入结果与历史可用性。文件恢复由 [server/services/revert-transaction-service.ts](server/services/revert-transaction-service.ts) 逐项执行，部分成功保留，消息 COW 在文件恢复完整成功后单独提交。旧持久屏障、管理员解锁及补偿链已退役。本地会话不保留文件历史，也不能恢复文件：`isFileHistoryEnabledForDevice`（`shared/file-change-protocol.ts`）只对远程设备为真，本地请求恢复返回 409 `FILE_HISTORY_DISABLED`。整树快照已不再抓取（本地被文件历史关闭挡住，远程设备未实现）；`workspace.treeSnapshotsEnabled` 是不起作用的兼容字段。
 - **叙述者服务拆分**：narrator-service / -session / -executor / -subagent / -context / -prompt / -title / -recovery / -event-handler。
 - 其余服务：技能、例程、通知、输出统计、更新检查等，均在 `server/services/` 下。
 
@@ -177,6 +177,15 @@ frontend/
 - 错误处理：抛出 `@server/lib/errors` 中的 `AppError` 子类 — 全局处理器负责序列化
 - 校验：Zod schema 定义在 `server/lib/validators/`（按资源拆分的目录），在路由处理器中解析
 - 配置文件位于 `~/.narrafork/settings.json` — 通过 `@server/lib/settings` 的 `settings` 单例访问
+
+## 仓库知识树（`knowledge/`）
+
+`knowledge/` 按主题描述当前代码实际怎么工作，每个节点用锚点指向它依据的代码；约定见 [knowledge/README.md](knowledge/README.md)。工具 `bun scripts/knowledge.ts`：
+
+- **动手前**：`find <词…|路径>` 定位要读的节点（界面叫法、标识符、错误码、文件路径都可以），先读它的「改它时」；跨几块的改动先看 `knowledge/flows/`。标「过期」的节点以代码为准。
+- **合并前**：`affected [基线]`（默认 `origin/main`）列出这次改动碰到锚点的节点，在同一个 PR 里按代码核对并更新它们（含 `verified_at`）；它列出的「没有节点覆盖的改动文件」要给合适的节点加锚点或新建节点。
+- **提交前**：`check` 必须通过（CI 的 Static checks 也会跑）。
+- 知识只以代码为准：`docs/` 和代码注释可能过时，不能照抄进节点。
 
 ## 深入文档（按需阅读）
 

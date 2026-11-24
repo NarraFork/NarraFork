@@ -685,6 +685,84 @@ describe("narrators API", () => {
 		]);
 	});
 
+	test.each([
+		undefined,
+		0,
+		7,
+	])("buffer edit lease transports optional expected revision %s and original token", async (expectedRevision) => {
+		Object.defineProperty(g, "localStorage", {
+			value: { getItem: () => null },
+			configurable: true,
+		});
+		const requests: Array<{ url: string; init: RequestInit }> = [];
+		const lease = {
+			ok: true as const,
+			token: "client-token",
+			expiresAt: 123_456,
+			leaseMs: 120_000,
+			contentRevision: 0,
+		};
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async (url: unknown, init: RequestInit) => {
+				requests.push({ url: String(url), init });
+				return Response.json(init.method === "DELETE" ? { ok: true } : lease);
+			},
+		});
+		expect(
+			await api.beginBufferedMessageEdit("n/a?", "m/b#", "client-token", expectedRevision),
+		).toEqual(lease);
+		expect(await api.renewBufferedMessageEdit("n/a?", "m/b#", "client-token")).toEqual(lease);
+		expect(await api.releaseBufferedMessageEdit("n/a?", "m/b#", "client-token")).toEqual({
+			ok: true,
+		});
+		expect(requests.map(({ url }) => url)).toEqual(
+			Array(3).fill("/api/narrators/n%2Fa%3F/buffer/m%2Fb%23/edit"),
+		);
+		expect(requests.map(({ init }) => init.method)).toEqual(["POST", "PATCH", "DELETE"]);
+		expect(JSON.parse(String(requests[0].init.body))).toEqual({
+			token: "client-token",
+			...(expectedRevision !== undefined ? { expectedRevision } : {}),
+		});
+		expect(JSON.parse(String(requests[1].init.body))).toEqual({ token: "client-token" });
+		expect(new Headers(requests[2].init.headers).get("X-Buffer-Edit-Token")).toBe("client-token");
+		expect(requests[2].init.keepalive).toBe(true);
+	});
+
+	test.each([
+		false,
+		true,
+	])("buffer save forwards edit token for JSON and binary uploads (multipart=%s)", async (multipart) => {
+		Object.defineProperty(g, "localStorage", {
+			value: { getItem: () => null },
+			configurable: true,
+		});
+		let saved: RequestInit | undefined;
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async (_url: unknown, init: RequestInit) => {
+				saved = init;
+				return Response.json({ ok: true });
+			},
+		});
+		const image = new File(["png"], "image.png", { type: "image/png" });
+		await api.updateBufferedMessage(
+			"n",
+			"m",
+			"draft",
+			{ newImages: multipart ? [image] : [] },
+			"edit-token",
+		);
+		expect(saved?.method).toBe("PATCH");
+		expect(new Headers(saved?.headers).get("X-Buffer-Edit-Token")).toBe("edit-token");
+		if (multipart) {
+			expect(saved?.body).toBeInstanceOf(FormData);
+			expect(new Headers(saved?.headers).has("Content-Type")).toBe(false);
+		} else {
+			expect(JSON.parse(String(saved?.body)).text).toBe("draft");
+		}
+	});
+
 	test("keeps the edit draft unless the request explicitly succeeds", () => {
 		expect(shouldClearEditDraft(true)).toBe(true);
 		expect(shouldClearEditDraft(false)).toBe(false);

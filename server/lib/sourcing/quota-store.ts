@@ -21,6 +21,9 @@ import {
 import { registerKeyQuotaProbe } from "../provider-key-quota";
 
 export const QUOTA_SNAPSHOTS_FILE = "quota-snapshots.json";
+/** Stream-reported balances coexist with the same credential's direct quota probe. */
+export const STREAM_QUOTA_SOURCE = "quota_balance";
+const DEFAULT_QUOTA_SOURCE = "probe";
 
 const SCOPES = new Set(["key", "account", "wallet", "subscription"]);
 const WINDOW_KINDS = new Set(["5h", "weekly", "monthly", "other"]);
@@ -59,6 +62,14 @@ export class QuotaStore {
 
 	constructor(private persisted?: PersistedCredentialCache<QuotaSnapshot>) {}
 
+	private heldKey(id: string, source: string): string {
+		return `${source}\0${id}`;
+	}
+
+	private persistedKey(id: string, source: string): string {
+		return source === DEFAULT_QUOTA_SOURCE ? id : `${source}:${id}`;
+	}
+
 	/**
 	 * The snapshot saved under this identity, from memory or else from disk.
 	 *
@@ -69,40 +80,48 @@ export class QuotaStore {
 		id: string,
 		identity: string,
 		restore?: (snapshot: QuotaSnapshot) => QuotaSnapshot | null,
+		source = DEFAULT_QUOTA_SOURCE,
 	): QuotaSnapshot | undefined {
-		const held = this.held.get(id);
+		const heldKey = this.heldKey(id, source);
+		const held = this.held.get(heldKey);
 		if (held?.identity === identity) return held.snapshot;
-		if (held) this.held.delete(id);
-		const stored = this.persisted?.restore(id, identity);
+		if (held) this.held.delete(heldKey);
+		const stored = this.persisted?.restore(this.persistedKey(id, source), identity);
 		const snapshot = stored && (restore ? (restore(stored) ?? undefined) : stored);
-		if (snapshot) this.held.set(id, { identity, snapshot });
+		if (snapshot) this.held.set(heldKey, { identity, snapshot });
 		return snapshot;
 	}
 
 	/** Forget the in-memory copy only (an identity that changed, but may come back). */
-	forget(id: string): void {
-		this.held.delete(id);
+	forget(id: string, source = DEFAULT_QUOTA_SOURCE): void {
+		this.held.delete(this.heldKey(id, source));
 	}
 
 	/** The snapshot in memory, whatever identity it was saved under (key pool). */
-	peek(id: string): QuotaSnapshot | undefined {
-		return this.held.get(id)?.snapshot;
+	peek(id: string, source = DEFAULT_QUOTA_SOURCE): QuotaSnapshot | undefined {
+		return this.held.get(this.heldKey(id, source))?.snapshot;
 	}
 
 	/** `persist: false` keeps the disk copy as it is (in-progress or never-fetched states). */
-	set(id: string, identity: string, snapshot: QuotaSnapshot, persist = true): void {
-		this.held.set(id, { identity, snapshot });
-		if (persist) this.persisted?.save(id, identity, snapshot);
+	set(
+		id: string,
+		identity: string,
+		snapshot: QuotaSnapshot,
+		persist = true,
+		source = DEFAULT_QUOTA_SOURCE,
+	): void {
+		this.held.set(this.heldKey(id, source), { identity, snapshot });
+		if (persist) this.persisted?.save(this.persistedKey(id, source), identity, snapshot);
 	}
 
 	/** Drop the disk copy only, so a restart cannot bring the value back. */
-	unpersist(id: string): void {
-		this.persisted?.remove(id);
+	unpersist(id: string, source = DEFAULT_QUOTA_SOURCE): void {
+		this.persisted?.remove(this.persistedKey(id, source));
 	}
 
-	remove(id: string): void {
-		this.held.delete(id);
-		this.persisted?.remove(id);
+	remove(id: string, source = DEFAULT_QUOTA_SOURCE): void {
+		this.held.delete(this.heldKey(id, source));
+		this.persisted?.remove(this.persistedKey(id, source));
 	}
 
 	flush(): Promise<void> {

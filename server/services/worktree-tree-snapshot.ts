@@ -129,8 +129,8 @@ const WARMUP_GIT_TIMEOUT_MS = 10 * 60_000;
  * Without a cooldown the next tool call would immediately launch another full
  * background scan, turning a hopeless tree into a permanent scan loop that keeps
  * the disk, CPU and antivirus busy forever. During the window the hot path returns
- * null instantly; the in-memory maps reset on process restart, and the settings
- * toggle (`workspace.treeSnapshotsEnabled`) is the manual escape hatch.
+ * null instantly; the in-memory maps reset on process restart. (The old
+ * `workspace.treeSnapshotsEnabled` setting is a legacy field this module never reads.)
  */
 const WARMUP_FAILURE_COOLDOWN_MS = 15 * 60_000;
 
@@ -685,8 +685,7 @@ const SHADOW_CONFIG_ENTRIES: ReadonlyArray<readonly [key: string, value: string]
 	// could be missed by one capture, so that boundary pair would not report it.
 	// git mitigates this with the same racy-clean re-validation the index stat
 	// cache uses (entries at the tick boundary are re-scanned rather than trusted),
-	// which is why this is on; the knob to disable the whole scan path on a
-	// filesystem where it misbehaves is `workspace.treeSnapshotsEnabled`.
+	// which is why this is on.
 	["core.untrackedCache", "true"],
 	// Never let `add` trigger a spontaneous `gc --auto`. Shadow repositories are
 	// repacked by gcAll() on a controlled maintenance path; an auto-gc firing in

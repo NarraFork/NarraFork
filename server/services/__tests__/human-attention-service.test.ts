@@ -453,6 +453,26 @@ describe("human attention discovery", () => {
 });
 
 describe("bounded paging and detail", () => {
+	test("a plan approval carries 计划反思 availability only while its runner is live", async () => {
+		await narrator("n");
+		const plan = await permission("n", {
+			toolName: "ExitPlanMode",
+			input: { plan: "real approvable plan" },
+			live: {
+				planReflection: async (input) => ({ decision: { action: "manual" }, input }),
+			},
+		});
+		const available = await detail(owner, `permission:${plan.row.id}`);
+		expect(available.permission?.planReflectionAvailable).toBe(true);
+		plan.pending.planReflectionRunning = true;
+		const running = await detail(owner, `permission:${plan.row.id}`);
+		expect(running.permission?.planReflectionAvailable).toBe(false);
+		const bash = await permission("n");
+		const other = await detail(owner, `permission:${bash.row.id}`);
+		expect(other.permission).toBeDefined();
+		expect(other.permission && "planReflectionAvailable" in other.permission).toBe(false);
+	});
+
 	test("more than 200 unreadable async rows cannot hide a readable question", async () => {
 		await narrator("a-hidden", { ownerUserId: outsider.userId });
 		await narrator("z-visible");

@@ -1,7 +1,7 @@
 import { readQuery, readQueryFirst } from "@server/db/worker-read";
 import type { AgentInboxBlockedReason, PendingAgentMessageSummary } from "@shared/agent-inbox";
 import { formatOriginLabel, type MessageOriginOptions } from "@shared/message-origin";
-import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
 import { db } from "../../db";
 import {
 	narratorBufferedMessages as mailbox,
@@ -22,10 +22,12 @@ import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
 import type { Locale } from "../../lib/prompt-i18n";
 import type { AgentMessageDelivery } from "../agent-message-delivery";
+import { bufferEditHolds, isBufferConsumptionHeld } from "../buffer-edit-hold";
 import type { MessagePlacementOptions } from "../narrator-persistence";
 import { getNarratorMessageRefsPort } from "../narrator-refs/store";
 import { ensureReplyContext, syncActiveReplyContext } from "../narrator-reply-context";
 import { trackCommunicationWork } from "./async-work";
+import { MAILBOX_LIMITS } from "./limits";
 import { createMailboxStore, mailboxDedupeKey } from "./mailbox";
 import { isAwaitedTerminalConsumption } from "./mailbox-shared";
 import type { MailboxClaim, MailboxInput, MailboxKind } from "./mailbox-types";
@@ -498,20 +500,24 @@ export async function peekInbox(
 ): Promise<RuntimeMailboxRow | undefined> {
 	options.signal?.throwIfAborted();
 	const port = getRuntimeQueuePort();
-	if (port) return port.mailbox.peekQueued(narratorId);
+	const visible = (row: RuntimeMailboxRow | undefined) =>
+		row?.kind === "user_input" && isBufferConsumptionHeld(narratorId) ? undefined : row;
+	if (port) return visible(await port.mailbox.peekQueued(narratorId));
 	runtimeInbox.initializeLegacy(narratorId);
-	return readQueryFirst(
-		db
-			.select()
-			.from(mailbox)
-			.where(and(eq(mailbox.narratorId, narratorId), eq(mailbox.state, "queued")))
-			.orderBy(
-				desc(mailbox.priority),
-				sql`CASE WHEN ${mailbox.kind} = 'user_input' THEN ${mailbox.seq} ELSE ${mailbox.arrivalSeq} END`,
-				asc(mailbox.arrivalSeq),
-			)
-			.limit(1),
-		{ ...options, executionPolicy: "worker-required", maxRows: 1 },
+	return visible(
+		await readQueryFirst(
+			db
+				.select()
+				.from(mailbox)
+				.where(and(eq(mailbox.narratorId, narratorId), eq(mailbox.state, "queued")))
+				.orderBy(
+					desc(mailbox.priority),
+					sql`CASE WHEN ${mailbox.kind} = 'user_input' THEN ${mailbox.seq} ELSE ${mailbox.arrivalSeq} END`,
+					asc(mailbox.arrivalSeq),
+				)
+				.limit(1),
+			{ ...options, executionPolicy: "worker-required", maxRows: 1 },
+		),
 	);
 }
 export async function hasInboxKind(
@@ -520,6 +526,11 @@ export async function hasInboxKind(
 	options: InboxReadOptions = {},
 ): Promise<boolean> {
 	options.signal?.throwIfAborted();
+	if (isBufferConsumptionHeld(narratorId)) {
+		kinds = kinds.filter((kind) => kind !== "user_input");
+		// Do not advertise work behind the blocked global head to boundary/held-run loops.
+		if (!kinds.length || !(await peekInbox(narratorId, options))) return false;
+	}
 	const port = getRuntimeQueuePort();
 	if (port) return port.mailbox.hasQueuedKind(narratorId, kinds);
 	return !!(await readQueryFirst(
@@ -544,6 +555,33 @@ export async function hasWakeEligibleInboxInput(
 ): Promise<boolean> {
 	options.signal?.throwIfAborted();
 	const port = getRuntimeQueuePort();
+	if (isBufferConsumptionHeld(narratorId)) {
+		if (port) return port.mailbox.hasWakeEligibleInput(narratorId, true);
+		// Broadcasts/notices ahead of a direct report are not a user barrier. Inspect
+		// only the bounded, lightweight prefix before the first queued user input.
+		const limit = MAILBOX_LIMITS.agentPending + MAILBOX_LIMITS.noticePending + 1;
+		const rows = await readQuery(
+			db
+				.select({
+					kind: mailbox.kind,
+					direct: sql<boolean>`(${mailbox.kind} = 'agent_message' AND COALESCE(json_extract(${mailbox.metadataJson}, '$.isBroadcast'), 0) != 1)`,
+				})
+				.from(mailbox)
+				.where(and(eq(mailbox.narratorId, narratorId), eq(mailbox.state, "queued")))
+				.orderBy(
+					desc(mailbox.priority),
+					sql`CASE WHEN ${mailbox.kind} = 'user_input' THEN ${mailbox.seq} ELSE ${mailbox.arrivalSeq} END`,
+					asc(mailbox.arrivalSeq),
+				)
+				.limit(limit),
+			{ ...options, executionPolicy: "worker-required", maxRows: limit },
+		);
+		for (const row of rows) {
+			if (row.kind === "user_input") return false;
+			if (row.direct) return true;
+		}
+		return false;
+	}
 	if (port) return port.mailbox.hasWakeEligibleInput(narratorId);
 	return !!(await readQueryFirst(
 		db
@@ -595,12 +633,16 @@ export async function claimInboxHead(
 	narratorId: string,
 	accepts: (row: InboxEligibleHead) => boolean,
 ): Promise<RuntimeMailboxRow | undefined> {
-	const owner = getExecutionOwner(narratorId);
-	if (!owner) throw new Error("Mailbox claim requires shared execution owner");
-	const claimOwner = { token: `${inboxProcessTokenPrefix}${generateId()}`, epoch: owner.epoch };
-	const port = getRuntimeQueuePort();
-	if (port) return port.mailbox.claimEligibleHead(narratorId, claimOwner, accepts);
-	return runtimeInbox.claimEligibleHead(narratorId, claimOwner, accepts);
+	return bufferEditHolds.exclusive(narratorId, async () => {
+		const owner = getExecutionOwner(narratorId);
+		if (!owner) throw new Error("Mailbox claim requires shared execution owner");
+		const claimOwner = { token: `${inboxProcessTokenPrefix}${generateId()}`, epoch: owner.epoch };
+		const eligible = (row: InboxEligibleHead) =>
+			!(row.kind === "user_input" && isBufferConsumptionHeld(narratorId)) && accepts(row);
+		const port = getRuntimeQueuePort();
+		if (port) return port.mailbox.claimEligibleHead(narratorId, claimOwner, eligible);
+		return runtimeInbox.claimEligibleHead(narratorId, claimOwner, eligible);
+	});
 }
 /**
  * The publication barrier ahead of mailbox work. The facade keeps its synchronous API, but
@@ -1268,6 +1310,68 @@ export function recoverInboxClaimsOnColdStartup(): Promise<number> {
 	return run;
 }
 
+/**
+ * Re-probe recipients that hold a queued actionable task notice after a cold start.
+ *
+ * A publication transfer commits the notice into the mailbox first and wakes the
+ * recipient afterwards as a best-effort side effect. A crash between the two left a
+ * durable notice that nothing would ever wake: the claim recovery above only covers
+ * `claimed` rows. Each recipient goes through the ordinary `wakeInboxIfEligible`
+ * admission, so stopped, archived, busy or owned sessions are left alone exactly as
+ * for a live wake. Reads are id-paged and return recipient ids only.
+ */
+export async function wakeQueuedTaskNoticeRecipientsOnStartup(
+	options: { pageSize?: number; wake?: (narratorId: string) => Promise<boolean> } = {},
+): Promise<number> {
+	const pageSize = options.pageSize ?? 100;
+	const wake = options.wake ?? ((narratorId: string) => wakeInboxIfEligible(narratorId));
+	const seen = new Set<string>();
+	let afterId: string | undefined;
+	let woken = 0;
+	do {
+		const port = getRuntimeQueuePort();
+		let recipientIds: string[];
+		if (port) {
+			const page = await port.mailbox.listQueuedTaskNoticeRecipients({ afterId, limit: pageSize });
+			recipientIds = page.recipientIds;
+			afterId = page.nextAfterId;
+		} else {
+			const rows = await readQuery(
+				db
+					.select({ id: mailbox.id, narratorId: mailbox.narratorId })
+					.from(mailbox)
+					.where(
+						and(
+							eq(mailbox.state, "queued"),
+							eq(mailbox.kind, "task_notice"),
+							afterId ? gt(mailbox.id, afterId) : undefined,
+							sql`json_extract(${mailbox.metadataJson}, '$.eventKind') NOT IN ('started', 'cancelled')`,
+						),
+					)
+					.orderBy(asc(mailbox.id))
+					.limit(pageSize + 1),
+				{ executionPolicy: "worker-required", maxRows: pageSize + 1 },
+			);
+			const page = rows.slice(0, pageSize);
+			recipientIds = page.map((row) => row.narratorId);
+			afterId = rows.length > pageSize ? page.at(-1)?.id : undefined;
+		}
+		for (const narratorId of recipientIds) {
+			if (wakeControl.stopped) return woken;
+			if (seen.has(narratorId)) continue;
+			seen.add(narratorId);
+			try {
+				if (await wake(narratorId)) woken++;
+			} catch (error) {
+				logger.warn("Startup task-notice wake deferred", { narratorId, error: String(error) });
+			}
+		}
+		if (afterId) await new Promise<void>((resolve) => setImmediate(resolve));
+	} while (afterId && !wakeControl.stopped);
+	if (woken) logger.info("Woke recipients with queued task notices after startup", { woken });
+	return woken;
+}
+
 const pendingWakes = hotSafe(
 	"narrafork.runtime-inbox-wakes",
 	() => new Map<string, Promise<boolean>>(),
@@ -1333,6 +1437,8 @@ export function wakeInboxIfEligible(
 		if (!canProbe()) return false;
 		await flushInboxPublicationBarrier(narratorId);
 		if (!canProbe()) return false;
+		if (isBufferConsumptionHeld(narratorId) && !(await peekInbox(narratorId, readOptions())))
+			return false;
 		// A held run keeps its owner while parked: queued input wakes that same run.
 		const { wakeHeldRun } = await import("./run");
 		if (!canProbe()) return false;

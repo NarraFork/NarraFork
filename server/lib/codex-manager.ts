@@ -2739,6 +2739,11 @@ export class CodexManager {
 
 	// ==================== Accessors ====================
 
+	/** The live usage projection's source; no forecast, network request or write. */
+	usageOf(id: string): CodexUsageResult | undefined {
+		return this.entries.find((entry) => entry.id === id)?.usage;
+	}
+
 	/** Lightweight availability check without building account snapshots or quota forecasts. */
 	get hasAvailableCredentials(): boolean {
 		this.reviveQuotaResetCredentials();

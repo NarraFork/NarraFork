@@ -3454,6 +3454,12 @@ test.each([
 			await page.focus('[data-git-staging-unit="block-0"] button[data-git-staging-unit-menu]');
 			await page.keyboard.press("Enter");
 			await page.waitForSelector("[data-git-staging-unit-targets]", { visible: true });
+			// Mantine focuses the dropdown asynchronously. Wait for its focus and
+			// opening transition before explicitly testing Escape on the trigger.
+			await page.waitForFunction(() => {
+				const menu = document.querySelector("[data-git-staging-unit-targets]");
+				return menu?.contains(document.activeElement) && getComputedStyle(menu).opacity === "1";
+			});
 			await page.focus('[data-git-staging-unit="block-0"] button[data-git-staging-unit-menu]');
 			expect(
 				await page.evaluate(() => document.activeElement?.matches("[data-git-staging-unit-menu]")),

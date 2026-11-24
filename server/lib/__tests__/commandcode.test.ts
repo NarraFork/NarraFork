@@ -8,10 +8,14 @@ import {
 	selectCommandCodeEndpoint,
 } from "../commandcode-protocol";
 import {
+	commandCodeUsageSnapshot,
 	parseCommandCodeCredits,
 	parseCommandCodeSummary,
+	probeCommandCodeQuota,
 	readResponseJsonLimited,
 } from "../commandcode-usage";
+import { keyQuotaBlockedUntil } from "../provider-key-quota";
+import { quotaStore } from "../sourcing/quota-store";
 
 describe("Command Code 端点选择（规则与实测 supported_endpoints 一致）", () => {
 	test("claude 系只支持 /messages", () => {
@@ -157,5 +161,82 @@ describe("Command Code 额度解析（结构取自实测响应）", () => {
 		expect(summary?.totalCount).toBe(9705);
 		expect(summary?.successRate).toBe(100);
 		expect(parseCommandCodeSummary(null)).toBeUndefined();
+	});
+
+	test("快照保留原响应，并派生窗口、月额度与统一额度跳过", () => {
+		const usage = {
+			credits: {
+				monthlyCredits: 4,
+				purchasedCredits: 2,
+				freeCredits: 1,
+				creditThreshold: 0.5,
+				belowThreshold: false,
+			},
+			windowLimits: {
+				limited: true,
+				fiveHour: { used: 14, cap: 14, exceeded: true, resetAt: Date.now() + 60_000 },
+				weekly: { used: 3, cap: 10, exceeded: false },
+			},
+			sandboxAccess: true,
+			summary: {
+				totalCount: 8,
+				totalTokens: 100,
+				totalTokensIn: 60,
+				totalTokensOut: 40,
+				successRate: 100,
+				completedCount: 8,
+				failedCount: 0,
+				totalMonthlyCredits: 6,
+				periodStart: "2026-11-01T00:00:00.000Z",
+			},
+		};
+		const snapshot = commandCodeUsageSnapshot(usage, 1234);
+		expect(snapshot.scope).toBe("subscription");
+		expect(snapshot.fetchedAt).toBe(1234);
+		expect(snapshot.windows).toEqual([
+			{ kind: "5h", usedRatio: 1, resetsAt: usage.windowLimits.fiveHour.resetAt },
+			{ kind: "weekly", usedRatio: 0.3, resetsAt: null },
+		]);
+		expect(snapshot.balances).toEqual([{ unit: "credits", remaining: 4, total: 10 }]);
+		expect(snapshot.detail).toEqual(usage);
+		quotaStore.set("CommandCode", "test", snapshot);
+		expect(keyQuotaBlockedUntil("CommandCode")).toBe(usage.windowLimits.fiveHour.resetAt);
+		quotaStore.remove("CommandCode");
+	});
+
+	test("零 cap 不猜测用量，summary 缺失时月额度没有 total", () => {
+		const { credits, windowLimits } = parseCommandCodeCredits({
+			credits: { monthlyCredits: 2 },
+			windowLimits: { fiveHour: { used: 1, cap: 0, exceeded: false } },
+		});
+		const snapshot = commandCodeUsageSnapshot({ credits, windowLimits });
+		expect(snapshot.windows[0]).toEqual({ kind: "5h", usedRatio: null, resetsAt: null });
+		expect(snapshot.balances).toEqual([{ unit: "credits", remaining: 2 }]);
+	});
+
+	test("summary 阶段的取消不会被降级成一次成功探测", async () => {
+		const originalFetch = globalThis.fetch;
+		const controller = new AbortController();
+		let calls = 0;
+		globalThis.fetch = (async () => {
+			calls++;
+			if (calls === 1) return Response.json({ credits: { monthlyCredits: 1 } });
+			controller.abort();
+			throw new Error("summary abort");
+		}) as unknown as typeof fetch;
+		try {
+			await expect(
+				probeCommandCodeQuota(
+					{
+						id: "CommandCode",
+						providerId: "CommandCode",
+						config: { apiKey: "key" },
+					},
+					controller.signal,
+				),
+			).rejects.toThrow("summary abort");
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
 	});
 });

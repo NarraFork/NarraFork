@@ -3048,6 +3048,7 @@
 		"none": "There are no credentials to export.",
 		"archived": "Archived",
 		"kinds": {
+			"credential": "Credential",
 			"codex": "Codex",
 			"api-key": "API key"
 		},

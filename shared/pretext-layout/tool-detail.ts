@@ -1356,7 +1356,7 @@ function classifyByCategory(
 		case "workspace":
 			return classifyWorkspace(toolName, inputJson, outputJson, input.labels, metadata);
 		default:
-			return classifyGeneric(inputJson, outputJson);
+			return classifyGeneric(inputJson, outputJson, { status, metadata });
 	}
 }
 
@@ -1497,10 +1497,46 @@ function truncatedFlag(source: unknown): { textTruncated?: true } {
 	return hasTruncatedLeaf(source) ? { textTruncated: true } : {};
 }
 
-function classifyGeneric(inputJson: unknown, outputJson: unknown): ToolDetailData {
+/**
+ * A count-based bar for a generic (product / MCP) tool's determinate progress:
+ * `done/total` plus the item it is working on. Byte formatting is the transfer
+ * card's concern; a generic tool reports work units.
+ */
+function readGenericProgressRow(value: unknown): ToolRowProgress | null {
+	const payload = readToolProgressPayload(value);
+	if (!payload || !hasRenderableProgress(payload)) return null;
+	const view = deriveToolProgress(payload);
+	const done = payload.itemsDone ?? payload.completed;
+	const total = payload.itemsTotal ?? payload.total;
+	// A non-positive total is unknown, the same rule as `deriveToolProgress`.
+	// Figures then show the completed count rather than `5/0`.
+	const figures = [typeof total === "number" && total > 0 ? `${done}/${total}` : String(done)];
+	if (payload.currentItem) figures.push(payload.currentItem);
+	return {
+		ratio: view.ratio,
+		...(view.percent !== null ? { percent: view.percent } : {}),
+		figures,
+		color: "blue",
+		active: true,
+	};
+}
+
+function classifyGeneric(
+	inputJson: unknown,
+	outputJson: unknown,
+	live?: { status: string | null | undefined; metadata: Record<string, unknown> | null },
+): ToolDetailData {
 	const input = resolveDisplayBody(inputJson);
 	const output = outputJson != null ? resolveDisplayBody(outputJson) : undefined;
+	// Only while the call runs: a finished bar would sit at 100% saying nothing the
+	// result does not already say.
+	const progress =
+		live && !isTerminalToolStatus(live.status)
+			? readGenericProgressRow(live.metadata?._structuredProgress)
+			: null;
+	const progressRows = progress ? metaRows([{ text: "", progress }]) : null;
 	const list: ToolDetailSection[] = [
+		...(progressRows ? [{ key: "meta.progress", body: progressRows }] : []),
 		{
 			key: "input.arguments",
 			label: "input",

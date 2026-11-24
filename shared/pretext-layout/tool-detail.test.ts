@@ -915,6 +915,75 @@ describe("classifyToolDetail — agent/generic", () => {
 		});
 		expect(asSections(d).kind).toBe("sections");
 	});
+	it("draws a count-based bar for a running generic tool and drops it once terminal", () => {
+		const metadata = {
+			_streamingOutput: "[2/3] indexing batch-2…",
+			_structuredProgress: { completed: 1, total: 3, currentItem: "batch-2" },
+		};
+		const running = asSections(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "mcp__docs__reindex",
+				category: "generic",
+				status: "running",
+				inputJson: { action: "start" },
+				metadata,
+			}),
+		);
+		expect(running.sections.map((part) => part.key)).toEqual([
+			"meta.progress",
+			"input.arguments",
+			"output.main",
+		]);
+		const bar = running.sections[0]?.body;
+		expect(bar?.kind).toBe("meta-rows");
+		const row = bar?.kind === "meta-rows" ? bar.rows[0] : undefined;
+		expect(row?.progress?.figures).toEqual(["1/3", "batch-2"]);
+		expect(row?.progress?.ratio).toBeCloseTo(1 / 3);
+		const done = asSections(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "mcp__docs__reindex",
+				category: "generic",
+				status: "success",
+				inputJson: { action: "start" },
+				outputJson: "{}",
+				metadata,
+			}),
+		);
+		expect(done.sections.map((part) => part.key)).not.toContain("meta.progress");
+	});
+	it("draws no bar for a running generic tool without renderable progress", () => {
+		const d = asSections(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "mcp__docs__reindex",
+				category: "generic",
+				status: "running",
+				inputJson: { action: "start" },
+				metadata: { _structuredProgress: { completed: 0 } },
+			}),
+		);
+		expect(d.sections.map((part) => part.key)).not.toContain("meta.progress");
+	});
+	it("draws the completed count when a running generic tool has a non-positive total", () => {
+		const d = asSections(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "mcp__docs__reindex",
+				category: "generic",
+				status: "running",
+				inputJson: { action: "start" },
+				metadata: { _structuredProgress: { completed: 5, total: 0 } },
+			}),
+		);
+		expect(d.sections.map((part) => part.key)).toContain("meta.progress");
+		const bar = d.sections.find((part) => part.key === "meta.progress")?.body;
+		expect(bar?.kind).toBe("meta-rows");
+		const row = bar?.kind === "meta-rows" ? bar.rows[0] : undefined;
+		expect(row?.progress?.figures).toEqual(["5"]);
+		expect(row?.progress?.ratio).toBeNull();
+	});
 });
 
 describe("Watch registration display", () => {

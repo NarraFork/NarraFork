@@ -11,7 +11,8 @@
  * an id, stop the migration before anything is written: the old files stay in use and
  * the next start tries again. Settings are not read: every owner id names its connection.
  */
-import { chmodSync, copyFileSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
+
+import { existsSync, unlinkSync } from "node:fs";
 import { resolve } from "node:path";
 import {
 	CODEX_CREDENTIALS_FILE,
@@ -19,6 +20,7 @@ import {
 	legacyCodexRuntimeState,
 	parseStoredCodexCredentials,
 } from "./codex-manager";
+import { backUpCredentialFiles } from "./credential-backup";
 import { CREDENTIAL_STATE_FILE, CredentialStateStore } from "./credential-state";
 import { CODEX_GROUP, getCredentialStore } from "./credential-store";
 import { logger } from "./logger";
@@ -33,7 +35,8 @@ import {
 } from "./provider-keys";
 import { readSecretJSON, writeSecretJSON } from "./secret-store";
 
-export const CREDENTIAL_BACKUPS_DIR = "credential-backups";
+export { CREDENTIAL_BACKUPS_DIR } from "./credential-backup";
+
 const BACKED_UP_FILES = [
 	"settings.json",
 	CODEX_CREDENTIALS_FILE,
@@ -133,34 +136,6 @@ function findConflicts(sources: ReadonlyArray<CredentialSource & { id: string }>
 
 const sourceKind = (owner: string): CredentialSourceKind =>
 	owner.startsWith("nug:") ? "nug" : owner.startsWith("builtin:") ? "builtin" : "api";
-
-/** Copy the files the migration reads or changes; owner-only, like the originals. */
-function backUp(home: string): string {
-	const root = resolve(home, CREDENTIAL_BACKUPS_DIR);
-	mkdirSync(root, { recursive: true, mode: 0o700 });
-	const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-	// A retry after a failed attempt never writes into an earlier backup.
-	let dir = resolve(root, `pre-sourcing-${stamp}`);
-	for (let n = 2; existsSync(dir); n++) dir = resolve(root, `pre-sourcing-${stamp}-${n}`);
-	mkdirSync(dir, { mode: 0o700 });
-	for (const path of [root, dir]) chmodPrivate(path, 0o700);
-	for (const name of BACKED_UP_FILES) {
-		const source = resolve(home, name);
-		if (!existsSync(source)) continue;
-		copyFileSync(source, resolve(dir, name));
-		chmodPrivate(resolve(dir, name), 0o600);
-	}
-	return dir;
-}
-
-function chmodPrivate(path: string, mode: number): void {
-	if (process.platform === "win32") return;
-	try {
-		chmodSync(path, mode);
-	} catch {
-		/* Network filesystems can reject chmod. */
-	}
-}
 
 /** Usage and blocks an older Codex file still keeps inside credentials; credentials.json has no room. */
 function moveCodexRuntimeState(
@@ -262,7 +237,7 @@ export function migrateCredentialFiles(home = getNarraforkHome()): CredentialMig
 			...accounts.map((account) => codexToCredential(account, now)),
 			...part.credentials,
 		];
-		const backup = backUp(home);
+		const backup = backUpCredentialFiles(home, "pre-sourcing", BACKED_UP_FILES);
 		moveCodexRuntimeState(home, accounts);
 		store.create({ version: 1, credentials, groupSecrets: part.groupSecrets });
 		cleanUp(home);

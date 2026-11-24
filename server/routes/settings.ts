@@ -1251,8 +1251,6 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 			logger.info("Purged provider model cache", { type, removedIds: ids });
 		}
 	}
-	// A deleted provider takes all of its keys with it, not just the one settings showed.
-	for (const id of removedCustomApiIds) getProviderKeyStore().removeProvider(id);
 	const staleCustomApiQuotaIds = uniqueIds([
 		...removedCustomApiIds,
 		...getCustomApiProviderIdsWithQuotaIdentityChanges(
@@ -1264,6 +1262,8 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 		purgeCustomApiQuotaCache(staleCustomApiQuotaIds);
 		logger.info("Purged custom API quota cache", { providerIds: staleCustomApiQuotaIds });
 	}
+	// Quota purge resolves the first credential id before a deleted provider loses its keys.
+	for (const id of removedCustomApiIds) getProviderKeyStore().removeProvider(id);
 	// Kimi usage keys off (baseUrl, apiKey) only, so it uses its OWN staleness test
 	// rather than the quota one: that set also fires on `protocol`,
 	// `geminiTransport` and `codexAccountId`, none of which changes what the usage

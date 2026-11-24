@@ -1,5 +1,8 @@
 import { createHash } from "node:crypto";
-import { parseMirrorSnapshot } from "../../shared/independent-update-mirror";
+import {
+	type MirrorAssetDescriptor,
+	parseMirrorSnapshot,
+} from "../../shared/independent-update-mirror";
 import {
 	MAX_RELAY_PAYLOAD_BYTES,
 	MAX_RELAY_READY_BYTES,
@@ -14,6 +17,7 @@ import {
 	relayScanDates,
 	validateMirrorJobTimeoutMs,
 } from "../../shared/mirror-relay";
+import { groupMirrorUploads, MirrorTransferPool } from "../../shared/mirror-transfer-pool";
 import { WebDavClient } from "../../shared/webdav-transport";
 import type { MirrorRelaySettings } from "../lib/mirror-relay-config";
 import type { StorageBackend } from "../storage/types";
@@ -337,6 +341,33 @@ export class MirrorRelayPuller {
 		return result;
 	}
 
+	async #downloadAssets(
+		manifest: RelayReadyManifest,
+		assets: MirrorAssetDescriptor[],
+		signal: AbortSignal,
+	): Promise<void> {
+		// Validate every same-hash size before dispatch; commit still receives the original descriptors.
+		const groups = groupMirrorUploads(assets);
+		const pool = new MirrorTransferPool(this.settings.downloadConcurrency, signal);
+		await pool.run(groups, async ({ asset }) => {
+			const stream = await this.#client.getStream(
+				relayObjectPath(manifest, asset.sha256),
+				asset.size,
+				pool.signal,
+			);
+			if (!stream) throw new Error("Relay asset unavailable");
+			try {
+				await this.ingest.ingestAsset(manifest.product, asset, stream, pool.signal, "relay");
+			} catch (error) {
+				// Cancel siblings before joining this stream's cleanup.
+				pool.fail(error);
+				throw error;
+			} finally {
+				if (!stream.locked) await stream.cancel().catch(() => {});
+			}
+		});
+	}
+
 	async #import(manifest: RelayReadyManifest, signal: AbortSignal): Promise<number> {
 		const raw = await this.#client.getBytes(
 			relayObjectPath(manifest, manifest.payload.sha256),
@@ -353,20 +384,7 @@ export class MirrorRelayPuller {
 			const bytes = binaries.reduce((sum, a) => sum + a.size, raw.byteLength);
 			if (!Number.isSafeInteger(bytes) || bytes > MAX_JOB_BYTES)
 				throw new Error("Relay component import byte budget exceeded");
-			for (const asset of binaries) {
-				signal.throwIfAborted();
-				const stream = await this.#client.getStream(
-					relayObjectPath(manifest, asset.sha256),
-					asset.size,
-					signal,
-				);
-				if (!stream) throw new Error("Relay component binary unavailable");
-				try {
-					await this.ingest.ingestAsset(manifest.product, asset, stream, signal, "relay");
-				} finally {
-					if (!stream.locked) await stream.cancel().catch(() => {});
-				}
-			}
+			await this.#downloadAssets(manifest, binaries, signal);
 			await this.ingest.commitTools(manifest.product, manifest.kind, manifest.tag, payload, signal);
 			return bytes;
 		}
@@ -375,20 +393,7 @@ export class MirrorRelayPuller {
 		const bytes = snapshot.assets.reduce((sum, asset) => sum + asset.size, raw.byteLength);
 		if (!Number.isSafeInteger(bytes) || bytes > MAX_JOB_BYTES)
 			throw new Error("Relay import byte budget exceeded");
-		for (const asset of snapshot.assets) {
-			signal.throwIfAborted();
-			const stream = await this.#client.getStream(
-				relayObjectPath(manifest, asset.sha256),
-				asset.size,
-				signal,
-			);
-			if (!stream) throw new Error("Relay asset unavailable");
-			try {
-				await this.ingest.ingestAsset(manifest.product, asset, stream, signal, "relay");
-			} finally {
-				if (!stream.locked) await stream.cancel().catch(() => {});
-			}
-		}
+		await this.#downloadAssets(manifest, snapshot.assets, signal);
 		await this.ingest.commitMain(manifest.product, snapshot, signal);
 		return bytes;
 	}

@@ -109,6 +109,7 @@ export function useTracePermissionSlots({
 	const onQuestionReflect = permCb?.onQuestionReflect;
 	const onQuestionDeny = permCb?.onQuestionDeny;
 	const onQuestionDefer = permCb?.onQuestionDefer;
+	const onPlanReflect = permCb?.onPlanReflect;
 	return useMemo(() => {
 		const byTrace = new Map<string, Map<string, ReactNode>>();
 		if (!pendingPermissions || pendingPermissions.length === 0) return byTrace;
@@ -134,6 +135,7 @@ export function useTracePermissionSlots({
 						onQuestionReflect,
 						onQuestionDeny,
 						onQuestionDefer,
+						onPlanReflect,
 					}),
 				);
 			}
@@ -147,6 +149,7 @@ export function useTracePermissionSlots({
 		onQuestionReflect,
 		onQuestionDeny,
 		onQuestionDefer,
+		onPlanReflect,
 	]);
 }
 
@@ -163,6 +166,7 @@ export function usePermissionSlots({
 	const onQuestionReflect = permCb?.onQuestionReflect;
 	const onQuestionDeny = permCb?.onQuestionDeny;
 	const onQuestionDefer = permCb?.onQuestionDefer;
+	const onPlanReflect = permCb?.onPlanReflect;
 
 	return useMemo(() => {
 		const map = new Map<string, ReactNode>();
@@ -205,6 +209,7 @@ export function usePermissionSlots({
 						onQuestionReflect,
 						onQuestionDeny,
 						onQuestionDefer,
+						onPlanReflect,
 					}),
 				);
 				continue;
@@ -231,6 +236,7 @@ export function usePermissionSlots({
 		onQuestionReflect,
 		onQuestionDeny,
 		onQuestionDefer,
+		onPlanReflect,
 	]);
 }
 
@@ -299,6 +305,7 @@ interface PermissionNodeHandlers {
 	onQuestionReflect?: PermissionCallbacks["onQuestionReflect"];
 	onQuestionDeny?: PermissionCallbacks["onQuestionDeny"];
 	onQuestionDefer?: PermissionCallbacks["onQuestionDefer"];
+	onPlanReflect?: PermissionCallbacks["onPlanReflect"];
 }
 
 /**
@@ -351,6 +358,7 @@ function permissionNode(
 			onQuestionReflect={handlers.onQuestionReflect}
 			onQuestionDeny={handlers.onQuestionDeny}
 			onQuestionDefer={handlers.onQuestionDefer}
+			onPlanReflect={handlers.onPlanReflect}
 		/>
 	);
 }
