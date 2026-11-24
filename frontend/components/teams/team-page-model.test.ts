@@ -113,7 +113,8 @@ describe("board mapping", () => {
 		expect(teamWorkspaceLayout(TEAM_CONVERSATION_MIN_WIDTH + 380)).toBe("split");
 		// 1280 px window, 250 px sidebar.
 		expect(teamWorkspaceLayout(1030)).toBe("split");
-		expect(teamWorkspaceLayout(232 + TEAM_CONVERSATION_MIN_WIDTH + 380)).toBe("columns");
+		// No third column: the page is about one team, never a list of the project's teams.
+		expect(teamWorkspaceLayout(1600)).toBe("split");
 		expect(TEAM_CONVERSATION_MIN_WIDTH).toBeGreaterThanOrEqual(480);
 	});
 

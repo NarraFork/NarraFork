@@ -475,6 +475,46 @@ describe("top bar", () => {
 		expect(html).toContain("1 个待批");
 		expect(html).toContain("1 个运行中");
 		expect(html).toContain("全部暂停");
+		expect(html).not.toContain("已归档");
+	});
+
+	test("an archived team says so and offers no pause all, in English and Chinese", async () => {
+		const archived = summary({ coordinatorStatus: "archived", pendingApprovalCount: 0 });
+		const en = await render(
+			<TeamTopBar projectId="p" teamId="lead" title="Release crew" summary={archived} />,
+		);
+		expect(en).toContain('data-testid="team-archived"');
+		expect(en).toContain(">Archived<");
+		expect(en).not.toContain("team-pause-all");
+		// The people list stays: the owner still manages access on an archived coordinator.
+		expect(en).toContain('data-testid="team-members-button"');
+
+		const zh = await render(
+			<TeamTopBar projectId="p" teamId="lead" title="发布小组" summary={archived} />,
+			new QueryClient(),
+			"zh-CN",
+		);
+		expect(zh).toContain("已归档");
+		expect(zh).not.toContain("全部暂停");
+
+		const live = await render(
+			<TeamTopBar projectId="p" teamId="lead" title="Release crew" summary={summary()} />,
+		);
+		expect(live).not.toContain("team-archived");
+	});
+
+	test("an archived team with workers still running keeps pause all", async () => {
+		// Archiving the coordinator does not stop background workers it started.
+		const stillRunning = summary({
+			coordinatorStatus: "archived",
+			pendingApprovalCount: 0,
+			runningCount: 2,
+		});
+		const html = await render(
+			<TeamTopBar projectId="p" teamId="lead" title="Release crew" summary={stillRunning} />,
+		);
+		expect(html).toContain('data-testid="team-archived"');
+		expect(html).toContain("team-pause-all");
 	});
 	test("pin to sidebar sits beside the title and reads the sidebar's pin", async () => {
 		const bar = (client: QueryClient) =>
