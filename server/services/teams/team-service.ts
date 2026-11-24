@@ -44,6 +44,7 @@ import {
 	narratorReadableWhere,
 } from "../narrator-acl";
 import { type NarratorCreationTransaction, narratorService } from "../narrator-service";
+import { isGitWorkTree, teamGit } from "./team-git";
 import {
 	currentTeamStatusActor,
 	personActor,
@@ -226,6 +227,14 @@ export async function createTeam(
 		throw new AppError("An archived project cannot get a new team", 409, "PROJECT_ARCHIVED");
 	if (!project.gitPath)
 		throw new ValidationError("A team needs a project with a git repository directory");
+	// A project may be associated with any existing folder; a team's work items need a git
+	// work tree to branch from. Checked before anything is written, on every creation path.
+	if (!(await isGitWorkTree(project.gitPath)))
+		throw new AppError(
+			"A team needs a project whose directory is a local git work tree",
+			409,
+			"TEAM_PROJECT_NOT_GIT",
+		);
 
 	const audiences = resolveNarratorAudiences(
 		input.visibility,
@@ -235,6 +244,21 @@ export async function createTeam(
 		settings.agent.defaultNarratorWriteAudience,
 	);
 	const baseBranch = input.baseBranch ?? project.defaultBranch ?? "main";
+	// A base that names no commit (a repository with only `master` and the schema default
+	// `main`, a typo) would leave every work item unable to create its worktree.
+	// A project default git could not read as one revision is answered the same way.
+	const baseCommit = await teamGit(project.gitPath)
+		.resolveCommit(baseBranch)
+		.catch((error: unknown) => {
+			if (error instanceof ValidationError) return null;
+			throw error;
+		});
+	if (!baseCommit)
+		throw new AppError(
+			`The base branch "${baseBranch}" does not resolve to a commit in the project's repository`,
+			409,
+			"TEAM_BASE_BRANCH_UNRESOLVED",
+		);
 	const brief = input.brief ?? "";
 	const teamSettings = input.settings ?? {};
 

@@ -5,9 +5,10 @@
  * member speaking alone never writes another status row.
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { initTeamRepo } from "./team-repo.fixture";
 
 const previousHome = process.env.NARRAFORK_HOME;
 const testHome = mkdtempSync(join(tmpdir(), "narrafork-team-status-members-"));
@@ -102,7 +103,7 @@ async function speak(userId: string, createdAt: string, extra: Record<string, un
 }
 
 beforeAll(async () => {
-	mkdirSync(repo, { recursive: true });
+	initTeamRepo(repo);
 	await user(OWNER);
 	projectId = generateId();
 	const now = new Date().toISOString();
@@ -403,7 +404,7 @@ describe("the status section", () => {
 				.insert(users)
 				.values({ id, username: id, passwordHash: "x", role: "user", createdAt: now });
 		const freshRepo = join(testHome, "public-repo");
-		mkdirSync(freshRepo, { recursive: true });
+		initTeamRepo(freshRepo);
 		const freshProject = generateId();
 		await db.insert(projects).values({
 			id: freshProject,

@@ -276,12 +276,19 @@ jobs:
       - name: Run repository tests
         env:
           NF_REMOTE_PRODUCTION_TEST: '1'
+          NF_CI_STAGE_DIR: ${{ github.workspace }}/artifacts
         run: >-
           bun scripts/run-ci-tests.ts --isolate --only-failures --shard=${{ matrix.shard }}/4
           --parallel=2 --timings=artifacts/ci-test-timings.json --update-timings
           --reporter=junit --reporter-outfile=artifacts/ci-tests.xml
       - name: Verify test report
         run: test -s artifacts/ci-tests.xml
+      - name: Summarize test shard failure
+        if: ${{ failure() || cancelled() }}
+        run: |
+          if ! python3 -I scripts/summarize-ci-tests.py --artifacts artifacts --shard '${{ matrix.shard }}/4' >> "$GITHUB_STEP_SUMMARY"; then
+            printf '\nTest diagnostics summary unavailable; check the shard logs and artifacts.\n' >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Upload test report
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -291,6 +298,8 @@ jobs:
             artifacts/ci-tests.xml
             artifacts/ci-test-timings.json
             artifacts/native-tests*.log
+            artifacts/native-tests*-diagnostics.jsonl
+            artifacts/ci-stage*.jsonl
           if-no-files-found: error
           retention-days: 7
 

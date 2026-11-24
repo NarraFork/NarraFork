@@ -158,10 +158,13 @@
 			"namePlaceholder": "例如：发布小组",
 			"nameDescription": "即协调者会话的名称；改会话名就是改团队名。",
 			"nameRequired": "团队需要一个名称",
+			"nameInvalid": "团队名称最多 {{max}} 个字符",
 			"baseBranch": "基线分支",
 			"baseBranchDescription": "工作最终合回的分支。留空使用项目的默认分支。",
+			"baseBranchInvalid": "不是有效的分支名：只能用字母、数字和 . _ - /（不能有空格，不能以 - 或 / 开头，不能含 ..）",
 			"brief": "简报",
 			"briefDescription": "协调者和它派出的每个代理共同遵守的规则（最多 4 KB）。",
+			"briefTooLong": "简报最多 4 KB",
 			"submit": "创建团队",
 			"cancel": "取消",
 			"failed": "无法创建团队"

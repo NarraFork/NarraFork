@@ -751,7 +751,7 @@ describe("the background pass", () => {
 		for (const forbidden of ["safeSpawn", "Bun.spawn", "child_process", "gitService", "execRead"])
 			expect(text).not.toContain(forbidden);
 		expect(text).toContain("const git = teamGit(worktree);");
-		expect(text).toContain("changed: (baseRef) => git.changedPaths(baseRef)");
+		expect(text).toContain("changed: (baseRef, at) => git.changedPaths(baseRef, at)");
 		const gitText = readFileSync(join(import.meta.dir, "..", "team-git.ts"), "utf8");
 		expect(gitText).toContain('["diff", "--name-only", "--no-renames", "-z", fork, head]');
 	});

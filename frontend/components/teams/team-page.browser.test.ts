@@ -38,6 +38,7 @@ import { projectTeamRoutes } from "../../../server/routes/project-teams";
 import { projectRoutes } from "../../../server/routes/projects";
 import { narratorService } from "../../../server/services/narrator-service";
 import { pendingPermissions } from "../../../server/services/narrator-session-state";
+import { initTeamRepo } from "../../../server/services/teams/__tests__/team-repo.fixture";
 import { createTeam } from "../../../server/services/teams/team-service";
 import type * as Fixture from "./team-page.browser-fixture";
 
@@ -153,8 +154,7 @@ beforeAll(async () => {
 
 	alice = await person(`alice${Date.now()}`);
 	bob = await person(`bob${Date.now()}`);
-	const repo = mkdtempSync(join(tmpdir(), "nf-team-page-"));
-	mkdirSync(repo, { recursive: true });
+	const repo = initTeamRepo(mkdtempSync(join(tmpdir(), "nf-team-page-")));
 	projectId = generateId();
 	const now = new Date().toISOString();
 	await db.insert(projects).values({

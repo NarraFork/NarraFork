@@ -49,7 +49,7 @@ keywords:
   - QueuedMessagesPanel
   - PendingAgentMessagesPanel
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: a5b512406
 ---
 # 输入框与交互
 
@@ -80,7 +80,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - `composer/NarratorComposer.tsx`（约 2000 行）：草稿同步、附件、发送入口；`composer/InlineComposerEditor.tsx`：编辑器。
 - `interaction/use-narrator-send.ts`：发送/排队/控制命令；`use-queued-message-actions.ts`：队列增删改与重排。
 - `interaction/use-status-bar-props.tsx`、`use-permission-mode-control.ts`、`use-fast-mode-control.tsx`、`use-model-selection.ts`：状态栏各控件。
-- `NarratorInteractionArea.tsx`：区域装配；`CreateNarratorModal.tsx`：新建叙述者表单（预加载见 `CreateNarratorLazyModal.tsx`）。
+- `NarratorInteractionArea.tsx`：区域装配；`CreateNarratorModal.tsx`：新建叙述者表单（预加载见 `CreateNarratorLazyModal.tsx`），顶部「会话 / 以团队开始」切换，团队一侧见[团队与成员](../../collaboration/teams/records.md)。
 
 ## 改它时
 - 改草稿格式要同步 `INPUT_DRAFT_STORAGE_VERSION` 与旧 key 清理（`cleanupLegacyNarratorInputStorage`）。

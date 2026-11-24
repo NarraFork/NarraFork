@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import puppeteer, { type Browser, type Page } from "puppeteer-core";
 import type { PrototypeClient } from "../../remote-prototype/client";
+import { withCiStage } from "../../scripts/ci-stage";
 import { startPrototype } from "../../scripts/webrtc-prototype";
 
 interface PageState {
@@ -45,51 +46,60 @@ describe("M1 real Chromium / Pion / isolated Bun bridge", () => {
 	const network: string[] = [];
 	beforeAll(async () => {
 		runtime = await startPrototype({ leaseSeconds: 2 });
-		browser = await puppeteer.launch({
-			executablePath: browserExecutable(),
-			headless: true,
-			args: ["--no-sandbox", "--disable-dev-shm-usage"],
-		});
-		page = await browser.newPage();
-		page.on("request", (request) => {
-			network.push(request.url());
-		});
-		await page.goto(runtime.origin, { waitUntil: "networkidle0" });
-		await page.evaluate(async (invitation) => {
-			const path = "/client.js";
-			const module = (await import(path)) as typeof import("../../remote-prototype/client");
-			const state = window as unknown as PageState;
-			state.signalMessages = [];
-			state.rtc = await module.PrototypeClient.connect(invitation, {
-				allowLocalhost: true,
-				mode: "prototype",
-				expectedInstanceId: invitation.instanceId,
-				persistGrant: true,
-				onGrant: (grant) => {
-					state.grantId = grant.grantId;
-				},
-				signalFactory(url) {
-					const socket = new WebSocket(url);
-					const send = socket.send.bind(socket);
-					socket.send = (data) => {
-						state.signalMessages.push(String(data));
-						send(data);
-					};
-					return socket;
-				},
+		await withCiStage("chromium", async () => {
+			browser = await puppeteer.launch({
+				executablePath: browserExecutable(),
+				headless: true,
+				args: ["--no-sandbox", "--disable-dev-shm-usage"],
 			});
-			const login = await state.rtc.request("/api/auth/login", {
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ username: "admin", password: "prototype-admin" }),
+			page = await browser.newPage();
+			page.on("request", (request) => {
+				network.push(request.url());
 			});
-			const body = (await login.json()) as { token: string };
-			state.jwt = body.token;
-			await state.rtc.authenticate(body.token);
-		}, runtime.invitation);
+			await page.goto(runtime.origin, { waitUntil: "networkidle0" });
+		});
+		await withCiStage("webrtc-connect", () =>
+			page.evaluate(async (invitation) => {
+				const path = "/client.js";
+				const module = (await import(path)) as typeof import("../../remote-prototype/client");
+				const state = window as unknown as PageState;
+				state.signalMessages = [];
+				state.rtc = await module.PrototypeClient.connect(invitation, {
+					allowLocalhost: true,
+					mode: "prototype",
+					expectedInstanceId: invitation.instanceId,
+					persistGrant: true,
+					onGrant: (grant) => {
+						state.grantId = grant.grantId;
+					},
+					signalFactory(url) {
+						const socket = new WebSocket(url);
+						const send = socket.send.bind(socket);
+						socket.send = (data) => {
+							state.signalMessages.push(String(data));
+							send(data);
+						};
+						return socket;
+					},
+				});
+			}, runtime.invitation),
+		);
+		await withCiStage("login-auth", () =>
+			page.evaluate(async () => {
+				const state = window as unknown as PageState;
+				const login = await state.rtc.request("/api/auth/login", {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ username: "admin", password: "prototype-admin" }),
+				});
+				const body = (await login.json()) as { token: string };
+				state.jwt = body.token;
+				await state.rtc.authenticate(body.token);
+			}),
+		);
 	}, 90000);
 	afterAll(async () => {
-		await browser?.close();
+		if (browser) await withCiStage("browser-cleanup", () => browser.close());
 		await runtime?.stop();
 	});
 
