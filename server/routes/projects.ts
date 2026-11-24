@@ -40,6 +40,7 @@ import {
 } from "../services/project-membership";
 import { projectReadAdapter } from "../services/read";
 import { collectAllPages, parseLimitQuery, singlePage } from "../services/read/read-collect";
+import { isGitWorkTree } from "../services/teams/team-git";
 import { projectHasTeams } from "../services/teams/team-records";
 import { removeTabFromAllUsers } from "../services/user-preferences-service";
 import { withProjectRetirement } from "../services/worktree-lifecycle-guard";
@@ -154,8 +155,11 @@ projectRoutes.get("/hidden-existence", async (c) => {
  * start a local session anywhere, and the session would put the directory into a project
  * through the project index (`resolveProjectForDirectory`), creating the project of a git
  * repository that has none, owned by the caller. `create: false` only looks; `create: true`
- * makes that project. A non-git directory never gets one. A project the caller cannot read
- * is reported as `no_access` without its id or name. Shape: `shared/project-directory.ts`.
+ * makes that project. A non-git directory never gets one. A directory covered by a project
+ * the caller cannot read is answered exactly like a non-git directory (`not_git`), so the
+ * lookup cannot be used to find where private projects live. `gitWorkTree` says whether a
+ * readable project's directory is a local git work tree (a project may be associated with any
+ * existing folder, and a team needs git). Shape: `shared/project-directory.ts`.
  *
  * SQLite only, like the project index and the team routes it leads to: 503 on PostgreSQL
  * before anything else.
@@ -181,12 +185,14 @@ projectRoutes.post("/resolve-directory", async (c) => {
 	const found = await resolveProjectForDirectory(directory, principal.userId, {
 		create: parsed.data.create,
 	});
-	if (found.kind === "none") return reply({ status: "not_git" });
+	// One answer for "no git repository" and "a project you cannot see": nothing in the
+	// response may tell the two apart.
+	const notGit = () => reply({ status: "not_git" });
+	if (found.kind === "none") return notGit();
 	if (found.kind === "repository") return reply({ status: "repository", root: found.root });
 
 	const row = await db.query.projects.findFirst({ where: eq(projects.id, found.projectId) });
-	if (!row || !(await canReadProject(row as ProjectAclRow, principal)))
-		return reply({ status: "no_access" });
+	if (!row || !(await canReadProject(row as ProjectAclRow, principal))) return notGit();
 	return reply({
 		status: "project",
 		project: {
@@ -195,6 +201,7 @@ projectRoutes.post("/resolve-directory", async (c) => {
 			gitPath: row.gitPath ?? null,
 			archived: row.status === "archived",
 			canWrite: await canWriteProject(row as ProjectAclRow, principal),
+			gitWorkTree: row.gitPath ? await isGitWorkTree(row.gitPath) : false,
 		},
 	});
 });

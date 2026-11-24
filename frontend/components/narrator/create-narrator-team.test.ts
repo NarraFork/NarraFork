@@ -1,6 +1,7 @@
 /**
  * The "start as a team" option's state: on only for a directory that resolves to a git project
- * the user may write in; otherwise off with a reason, never hidden.
+ * the user may write in; otherwise off with a reason, never hidden. A directory in a project the
+ * user cannot read comes back as `not_git` (the server does not say a project is there).
  *
  * Run: bun test --isolate frontend/components/narrator/create-narrator-team.test.ts
  */
@@ -9,7 +10,7 @@ import type { ResolveProjectDirectoryResponse } from "@shared/project-directory"
 import { type TeamStartLookup, teamStartEligibility } from "./create-narrator-team";
 
 const project = (
-	overrides: Partial<{ archived: boolean; canWrite: boolean }> = {},
+	overrides: Partial<{ archived: boolean; canWrite: boolean; gitWorkTree: boolean }> = {},
 ): ResolveProjectDirectoryResponse => ({
 	status: "project",
 	project: {
@@ -18,6 +19,7 @@ const project = (
 		gitPath: "/work/repo",
 		archived: false,
 		canWrite: true,
+		gitWorkTree: true,
 		...overrides,
 	},
 });
@@ -64,7 +66,11 @@ describe("team option off, with the reason", () => {
 		],
 		["not a git repository", { data: { status: "not_git" } }, "notGit"],
 		["not a directory", { data: { status: "not_directory" } }, "notDirectory"],
-		["a project the user cannot read", { data: { status: "no_access" } }, "noAccess"],
+		[
+			"a project whose folder is not a git checkout",
+			{ data: project({ gitWorkTree: false }) },
+			"projectNotGit",
+		],
 		["an archived project", { data: project({ archived: true }) }, "archived"],
 		["a read-only project", { data: project({ canWrite: false }) }, "readOnly"],
 	])("%s", (_name, overrides, reason) => {
@@ -73,6 +79,12 @@ describe("team option off, with the reason", () => {
 
 	test("a remote device wins over a stale answer saying yes", () => {
 		expect(teamStartEligibility(lookup({ isRemoteDevice: true })).ok).toBe(false);
+	});
+
+	test("a project answer without `gitWorkTree` is not read as a git checkout", () => {
+		const data = project();
+		if (data.status === "project") delete (data.project as { gitWorkTree?: boolean }).gitWorkTree;
+		expect(teamStartEligibility(lookup({ data }))).toEqual({ ok: false, reason: "projectNotGit" });
 	});
 
 	test("a mocked or malformed answer is not read as a yes", () => {

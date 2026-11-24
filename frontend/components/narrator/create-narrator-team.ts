@@ -27,7 +27,7 @@ export type TeamStartBlock =
 	| "lookupFailed"
 	| "notDirectory"
 	| "notGit"
-	| "noAccess"
+	| "projectNotGit"
 	| "archived"
 	| "readOnly";
 
@@ -66,16 +66,17 @@ export function teamStartEligibility(input: TeamStartLookup): TeamStartEligibili
 	switch (data.status) {
 		case "project":
 			if (data.project.archived) return { ok: false, reason: "archived" };
+			// A project may sit on a folder that is not a git checkout; a team cannot.
+			if (data.project.gitWorkTree !== true) return { ok: false, reason: "projectNotGit" };
 			if (!data.project.canWrite) return { ok: false, reason: "readOnly" };
 			return { ok: true, project: { id: data.project.id, name: data.project.name } };
 		case "repository":
 			return { ok: true, repositoryRoot: data.root };
+		// Also the answer for a directory in a project the user cannot read (indistinguishable).
 		case "not_git":
 			return { ok: false, reason: "notGit" };
 		case "not_directory":
 			return { ok: false, reason: "notDirectory" };
-		case "no_access":
-			return { ok: false, reason: "noAccess" };
 		default:
 			return { ok: false, reason: "checking" };
 	}

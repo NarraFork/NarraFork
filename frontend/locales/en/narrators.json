@@ -232,7 +232,7 @@
 			"lookupFailed": "the directory could not be checked.",
 			"notDirectory": "this is not an existing directory on this server.",
 			"notGit": "this directory is not in a git repository.",
-			"noAccess": "you do not have access to the project of this directory.",
+			"projectNotGit": "the folder of this directory's project is not a git checkout.",
 			"archived": "the project of this directory is archived.",
 			"readOnly": "you can only read the project of this directory."
 		}

@@ -27,7 +27,7 @@ keywords:
   - /teams/:teamId/approvals
   - permission_decided_by
 status: draft
-verified_at: 56f264c49
+verified_at: a5b512406
 ---
 # 团队页与审批
 
@@ -48,7 +48,7 @@ verified_at: 56f264c49
 - 团队页路由 `frontend/routes/projects/$projectId_.teams.$teamId.tsx`（不嵌在项目页下，占满外壳内容区）→ `components/teams/TeamPageView.tsx`。
 - `TeamWorkspace.tsx` 按自身宽度选三栏（团队列表 / 协调者对话 / 看板与动态）、两栏或标签页；对话用普通叙述者面板。
 - `TeamTopBar.tsx` 含待批抽屉和「全部暂停」：协调者排在最前，先于工作者停下（`pauseOrder`），一次最多读 500 个运行中会话，结果分 paused / pausedSomeIdle / pausePartial / pauseNothing / pauseMore（`team-page-model.ts`）。
-- `TeamCreateFields.tsx`：新团队的名称/基线分支/说明字段与 `useTeamDraft`，被项目页「新建团队」弹窗和新建会话弹窗的「以团队开始」共用（见[团队与成员](records.md)）；不含查询与路由导入。
+- `TeamCreateFields.tsx`：新团队的名称/基线分支/说明字段与 `useTeamDraft`，被项目页「新建团队」弹窗和新建会话弹窗的「以团队开始」共用（见[团队与成员](records.md)）；不含查询与路由导入。`submit()` 先用 `team-draft.ts:checkTeamDraft`（规则来自 `shared/project-team-draft.ts`，与路由同一份）检查，不合规返回 null 并在名称/基线分支/说明字段上显示错误。
 - `ProjectTeamsList.tsx` 在 PG 上（列表查询 503）整块不渲染。
 - `team-page-model.ts` 是纯规则：状态图标、轮询退避、套接字推送合并（400ms 去抖、最长 2s）、暂停顺序。
 - `hooks/useTeams.ts`：摘要在叙述者 socket 的相关帧上合并重取，同时带退避轮询（变化后 4s，翻倍到 60s，标签页隐藏时暂停）；看板、动态、审批各自按变化重取。`lib/api/teams.ts` 是客户端。

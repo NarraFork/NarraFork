@@ -219,7 +219,7 @@
 			"lookupFailed": "无法检查这个目录。",
 			"notDirectory": "这不是本服务器上已存在的目录。",
 			"notGit": "这个目录不在 git 仓库中。",
-			"noAccess": "你没有这个目录所属项目的访问权限。",
+			"projectNotGit": "这个目录所属项目的文件夹不是 git 工作区。",
 			"archived": "这个目录所属的项目已归档。",
 			"readOnly": "你对这个目录所属的项目只有读权限。"
 		}

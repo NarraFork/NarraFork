@@ -10,6 +10,7 @@ import { Stack, Textarea, TextInput } from "@mantine/core";
 import { TEAM_BRANCH_MAX_LENGTH, TEAM_NAME_MAX_LENGTH } from "@shared/project-teams";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
+import { checkTeamDraft } from "./team-draft";
 
 export interface TeamDraft {
 	name: string;
@@ -18,9 +19,14 @@ export interface TeamDraft {
 	setName: (value: string) => void;
 	setBaseBranch: (value: string) => void;
 	setBrief: (value: string) => void;
-	/** Shown once a submit was attempted with no name. */
+	/** Shown once a submit was attempted with a draft the team route would refuse. */
 	nameError: string | null;
-	/** Marks the draft as submitted and returns the route body, or null while the name is empty. */
+	baseBranchError: string | null;
+	briefError: string | null;
+	/**
+	 * Marks the draft as submitted and returns the route body, or null while a field breaks the
+	 * route's own rules (`checkTeamDraft`): then nothing may be sent.
+	 */
 	submit: () => CreateTeamPayload | null;
 	reset: () => void;
 }
@@ -31,6 +37,8 @@ export function useTeamDraft(): TeamDraft {
 	const [baseBranch, setBaseBranch] = useState("");
 	const [brief, setBrief] = useState("");
 	const [touched, setTouched] = useState(false);
+	const check = checkTeamDraft({ name, baseBranch, brief });
+	const errors = touched && !check.ok ? check.errors : {};
 	return {
 		name,
 		baseBranch,
@@ -38,15 +46,17 @@ export function useTeamDraft(): TeamDraft {
 		setName,
 		setBaseBranch,
 		setBrief,
-		nameError: touched && !name.trim() ? t("teams.create.nameRequired") : null,
+		nameError:
+			errors.name === "required"
+				? t("teams.create.nameRequired")
+				: errors.name
+					? t("teams.create.nameInvalid", { max: TEAM_NAME_MAX_LENGTH })
+					: null,
+		baseBranchError: errors.baseBranch ? t("teams.create.baseBranchInvalid") : null,
+		briefError: errors.brief ? t("teams.create.briefTooLong") : null,
 		submit: () => {
 			setTouched(true);
-			if (!name.trim()) return null;
-			return {
-				name: name.trim(),
-				...(baseBranch.trim() ? { baseBranch: baseBranch.trim() } : {}),
-				...(brief.trim() ? { brief } : {}),
-			};
+			return check.ok ? check.payload : null;
 		},
 		reset: () => {
 			setName("");
@@ -84,6 +94,7 @@ export function TeamCreateFields({
 				value={draft.baseBranch}
 				maxLength={TEAM_BRANCH_MAX_LENGTH}
 				onChange={(event) => draft.setBaseBranch(event.currentTarget.value)}
+				error={draft.baseBranchError}
 				styles={{ input: { fontFamily: "var(--mantine-font-family-monospace)" } }}
 				data-testid="create-team-base-branch"
 			/>
@@ -95,6 +106,7 @@ export function TeamCreateFields({
 				minRows={3}
 				maxRows={8}
 				onChange={(event) => draft.setBrief(event.currentTarget.value)}
+				error={draft.briefError}
 				data-testid="create-team-brief"
 			/>
 		</Stack>

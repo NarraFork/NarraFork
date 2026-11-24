@@ -5,7 +5,12 @@
  *   - a directory in a git repository without a project: the option is on; choosing it shows
  *     the team fields, refuses an empty name, and creating makes the repository's project
  *     (owned by the user) and the team through the team route, then hands over the team;
+ *   - a base branch the team route would refuse is stopped in the form, before any request
+ *     (the directory's project is made before the team route runs, so it must not be made for a
+ *     draft that cannot become a team);
  *   - a directory outside any git repository: the option stays visible but off, with why;
+ *   - a project on a folder that is not a git checkout: off, with why;
+ *   - a project the user cannot read: the same "not in a git repository" as a plain folder;
  *   - a project the user can only read: off, with why;
  *   - PostgreSQL (the lookup answers 503): off, with why — never silently missing.
  *
@@ -212,7 +217,26 @@ test("a git repository without a project: start a team there", async () => {
 		);
 		expect(await call(page, (f) => f.createdTeams())).toEqual([]);
 
+		// A base branch the route would refuse: stopped in the form, nothing sent, nothing made.
+		const writes: string[] = [];
+		const onRequest = (request: { method: () => string; url: () => string }) => {
+			const path = new URL(request.url()).pathname;
+			if (request.method() === "POST" && path.startsWith("/api/projects")) writes.push(path);
+		};
+		page.on("request", onRequest);
 		await call(page, (f) => f.type("[data-testid=create-team-name]", "Fresh crew"));
+		await call(page, (f) => f.type("[data-testid=create-team-base-branch]", "release target"));
+		await call(page, (f) => f.click("[data-testid=team-start-submit]"));
+		await until(page, "branch refused", (f) =>
+			(f.text("body") ?? "").includes("Not a valid branch name"),
+		);
+		await shot(page, "invalid-branch");
+		await new Promise((done) => setTimeout(done, 300));
+		page.off("request", onRequest);
+		expect(writes).toEqual([]);
+		expect(await call(page, (f) => f.createdTeams())).toEqual([]);
+		expect(await db.select().from(projects).where(eq(projects.gitPath, repo))).toHaveLength(0);
+
 		await call(page, (f) => f.type("[data-testid=create-team-base-branch]", "main"));
 		await call(page, (f) => f.type("[data-testid=create-team-brief]", "Keep main green."));
 		await call(page, (f) => f.click("[data-testid=team-start-submit]"));
@@ -254,6 +278,61 @@ test("a directory outside any git repository: the option is off and says why", a
 		await shot(page, "not-git");
 		expect(await call(page, (f) => f.count("[data-testid=create-team-name]"))).toBe(0);
 		expect(await db.select().from(projects).where(eq(projects.gitPath, plain))).toHaveLength(0);
+		expect(errors).toEqual([]);
+	} finally {
+		await page.close();
+	}
+}, 60_000);
+
+test("a project on a folder that is not a git checkout: the option is off and says why", async () => {
+	const folder = join(root, "associated-folder");
+	mkdirSync(folder, { recursive: true });
+	const now = new Date().toISOString();
+	await db.insert(projects).values({
+		id: generateId(),
+		name: "Associated folder",
+		gitPath: folder,
+		ownerUserId: alice,
+		visibility: "public",
+		rootKey: folder,
+		createdAt: now,
+		updatedAt: now,
+	});
+	const { page, errors } = await openPage(alice);
+	try {
+		await call(page, (f, cwd: string) => f.openDialog(cwd), folder);
+		await until(page, "reason", (f) =>
+			(f.text("[data-testid=create-mode-hint]") ?? "").includes("not a git checkout"),
+		);
+		expect(await call(page, (f) => f.teamOptionEnabled())).toBe(false);
+		await shot(page, "project-not-git");
+		expect(errors).toEqual([]);
+	} finally {
+		await page.close();
+	}
+}, 60_000);
+
+test("a project the user cannot read: told the same as a folder outside git", async () => {
+	const repo = makeRepo("hidden");
+	const now = new Date().toISOString();
+	await db.insert(projects).values({
+		id: generateId(),
+		name: "Hidden",
+		gitPath: repo,
+		ownerUserId: alice,
+		visibility: "private",
+		rootKey: repo,
+		createdAt: now,
+		updatedAt: now,
+	});
+	const { page, errors } = await openPage(bob);
+	try {
+		await call(page, (f, cwd: string) => f.openDialog(cwd), repo);
+		await until(page, "reason", (f) =>
+			(f.text("[data-testid=create-mode-hint]") ?? "").includes("not in a git repository"),
+		);
+		expect(await call(page, (f) => f.teamOptionEnabled())).toBe(false);
+		expect(await hint(page)).not.toContain("Hidden");
 		expect(errors).toEqual([]);
 	} finally {
 		await page.close();

@@ -261,6 +261,36 @@ function cachedRepositoryRoot(dir: string, key: string): Promise<string | null> 
 	return root;
 }
 
+/** A branch name as `symbolic-ref --short` prints it: one line, no whitespace or control bytes. */
+// biome-ignore lint/suspicious/noControlCharactersInRegex: control characters are the point.
+const PROBED_BRANCH = /^[^\s\u0000-\u001f\u007f]{1,200}$/;
+
+/**
+ * The branch the main checkout at `root` has checked out (its symbolic HEAD, also for a
+ * repository with no commits yet), or null for a detached HEAD or any failure. A new project
+ * takes it as its default branch, so a repository with only `master` does not get the schema
+ * default `main`. Same bounds as the root probe; reading HEAD runs no repository program.
+ */
+async function probeDefaultBranch(root: string): Promise<string | null> {
+	const result = await safeSpawn({
+		cmd: ["git", "--no-optional-locks", "-C", root, "symbolic-ref", "--quiet", "--short", "HEAD"],
+		env: {
+			...process.env,
+			GIT_DIR: undefined,
+			GIT_COMMON_DIR: undefined,
+			GIT_WORK_TREE: undefined,
+			GIT_TERMINAL_PROMPT: "0",
+		},
+		timeout: GIT_PROBE_TIMEOUT_MS,
+		maxOutputBytes: GIT_PROBE_MAX_OUTPUT_BYTES,
+		maxStderrBytes: 1024,
+	}).catch(() => null);
+	if (!result || result.exitCode !== 0 || result.terminationReason || result.stdoutTruncated)
+		return null;
+	const branch = result.stdout.split("\n")[0]?.trim() ?? "";
+	return PROBED_BRANCH.test(branch) ? branch : null;
+}
+
 /** In-process single flight per root, so concurrent sessions in one repository create one project. */
 const creationsInFlight = new Map<string, Promise<string | null>>();
 
@@ -269,6 +299,7 @@ async function createProjectForRoot(
 	rootKey: string,
 	ownerUserId: string | null,
 ): Promise<string | null> {
+	const defaultBranch = await probeDefaultBranch(root);
 	const now = new Date().toISOString();
 	// The unique root-key index is the cross-process guard: a losing insert does nothing
 	// and the winner's row is read back.
@@ -278,6 +309,8 @@ async function createProjectForRoot(
 			id: generateId(),
 			name: basename(root) || root,
 			gitPath: root,
+			// Nothing resolved (detached HEAD, a failed probe): the schema default stays.
+			...(defaultBranch ? { defaultBranch } : {}),
 			ownerUserId,
 			visibility: "public",
 			rootKey,
