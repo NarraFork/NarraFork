@@ -114,7 +114,7 @@ const TERMINAL_TOOL_STATUSES = new Set([
 	"timeout",
 ]);
 
-function isTerminalToolStatus(status: unknown): boolean {
+export function isTerminalToolStatus(status: unknown): boolean {
 	return typeof status === "string" && TERMINAL_TOOL_STATUSES.has(status.toLowerCase());
 }
 
@@ -348,6 +348,39 @@ export function patchToolCallFields(
 		if (exact) return exact.changed ? exact : unchanged(messages);
 	}
 	const result = mergeToolCallFieldsInRows(messages as TreeMessage[], toolUseId, safeFields);
+	return result.changed ? result : unchanged(messages);
+}
+
+/**
+ * Live stdout / determinate progress of a tool that is STILL EXECUTING on an
+ * already-persisted card.
+ *
+ * The assistant message carrying a `tool_use` is persisted just before the tool
+ * starts executing, which retires the synthetic streaming card; from then on the
+ * committed card is the only place this tool is drawn. These are the same fields
+ * the streaming tail writes (`_streamingOutput` / `_structuredProgress`, lifted
+ * into the classifier's metadata by the adapter), so the committed card measures
+ * and paints them through the identical path, and the detail body's text
+ * signature already re-keys the cache (CONTRACT.md §4.5 约束 3).
+ *
+ * Refused once the newest occurrence is terminal (or absent): a frame that lands
+ * after `tool_completed` must not paint a stale live body over the final output.
+ * Callers coalesce; this is a pure merge.
+ */
+export function patchToolLiveOutput(
+	messages: readonly TreeMessage[],
+	toolUseId: string,
+	live: { output?: string; progress?: unknown },
+): LivePatchResult {
+	if (!toolUseId || !Array.isArray(messages) || messages.length === 0) return unchanged(messages);
+	const status = newestToolStatus(messages, toolUseId);
+	if (status === undefined || isTerminalToolStatus(status)) return unchanged(messages);
+	const fields: Record<string, unknown> = {
+		...(live.output !== undefined ? { _streamingOutput: live.output } : {}),
+		...(live.progress !== undefined ? { _structuredProgress: live.progress } : {}),
+	};
+	if (Object.keys(fields).length === 0) return unchanged(messages);
+	const result = mergeToolCallFieldsInRows(messages as TreeMessage[], toolUseId, fields);
 	return result.changed ? result : unchanged(messages);
 }
 

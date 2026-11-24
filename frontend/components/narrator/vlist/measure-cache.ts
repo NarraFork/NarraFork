@@ -1026,9 +1026,22 @@ function leafTextRevision(d: Record<string, unknown>): string {
 				if (!row) return "-";
 				const text = typeof row.text === "string" ? textSignature(row.text) : "";
 				const identity = typeof row.identity === "string" ? textSignature(row.identity) : "";
+				// A live bar row is height-fixed but PAINTED from the cached payload: a
+				// progress patch on a committed card moves only these figures.
+				const progress = row.progress as
+					| { ratio?: unknown; percent?: unknown; figures?: unknown }
+					| null
+					| undefined;
+				const bar = progress
+					? `:p${String(progress.ratio)}/${String(progress.percent)}/${
+							Array.isArray(progress.figures)
+								? textSignature(progress.figures.map(String).join("|"))
+								: ""
+						}`
+					: "";
 				return `${text}:${identity}:${Array.isArray(row.badges) ? row.badges.length : 0}:${
 					Array.isArray(row.actions) ? row.actions.length : 0
-				}`;
+				}${bar}`;
 			})
 			.join(";")}`;
 	}
