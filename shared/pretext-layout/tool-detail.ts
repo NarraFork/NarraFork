@@ -1508,7 +1508,9 @@ function readGenericProgressRow(value: unknown): ToolRowProgress | null {
 	const view = deriveToolProgress(payload);
 	const done = payload.itemsDone ?? payload.completed;
 	const total = payload.itemsTotal ?? payload.total;
-	const figures = [total != null ? `${done}/${total}` : String(done)];
+	// A non-positive total is unknown, the same rule as `deriveToolProgress`.
+	// Figures then show the completed count rather than `5/0`.
+	const figures = [typeof total === "number" && total > 0 ? `${done}/${total}` : String(done)];
 	if (payload.currentItem) figures.push(payload.currentItem);
 	return {
 		ratio: view.ratio,

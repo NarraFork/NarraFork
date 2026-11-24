@@ -1,7 +1,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import type { Tool } from "@modelcontextprotocol/sdk/types.js";
+import type { Progress, Tool } from "@modelcontextprotocol/sdk/types.js";
 import {
 	CallToolResultSchema,
 	ListToolsResultSchema,
@@ -497,12 +497,19 @@ class McpManager {
 		return result;
 	}
 
-	/** Call a tool on a specific MCP server. */
+	/**
+	 * Call a tool on a specific MCP server.
+	 *
+	 * `onProgress` is optional. Only a caller that passes it gets SDK
+	 * `notifications/progress` (the SDK then sets `progressToken`). The default
+	 * 60s request timeout is unchanged: a progress notice does not extend the call.
+	 */
 	async callTool(
 		serverId: string,
 		toolName: string,
 		args: Record<string, unknown>,
 		signal?: AbortSignal,
+		onProgress?: (progress: Progress) => void,
 	): Promise<{
 		content: Array<{
 			type: string;
@@ -529,10 +536,18 @@ class McpManager {
 		}
 		// NarraFork consumes the content envelope, not structured fields as typed business data.
 		// Validate that envelope without the SDK's outputSchema precompilation/validation cache.
+		// Keep `client.request`: the high-level `callTool` compiles `outputSchema`.
+		const requestOptions =
+			signal || onProgress
+				? {
+						...(signal ? { signal } : {}),
+						...(onProgress ? { onprogress: onProgress } : {}),
+					}
+				: undefined;
 		const result = await entry.client.request(
 			{ method: "tools/call", params: { name: toolName, arguments: args } },
 			CallToolResultSchema,
-			signal ? { signal } : undefined,
+			requestOptions,
 		);
 		return {
 			content:

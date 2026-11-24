@@ -966,6 +966,24 @@ describe("classifyToolDetail — agent/generic", () => {
 		);
 		expect(d.sections.map((part) => part.key)).not.toContain("meta.progress");
 	});
+	it("draws the completed count when a running generic tool has a non-positive total", () => {
+		const d = asSections(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "mcp__docs__reindex",
+				category: "generic",
+				status: "running",
+				inputJson: { action: "start" },
+				metadata: { _structuredProgress: { completed: 5, total: 0 } },
+			}),
+		);
+		expect(d.sections.map((part) => part.key)).toContain("meta.progress");
+		const bar = d.sections.find((part) => part.key === "meta.progress")?.body;
+		expect(bar?.kind).toBe("meta-rows");
+		const row = bar?.kind === "meta-rows" ? bar.rows[0] : undefined;
+		expect(row?.progress?.figures).toEqual(["5"]);
+		expect(row?.progress?.ratio).toBeNull();
+	});
 });
 
 describe("Watch registration display", () => {
