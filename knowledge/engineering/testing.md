@@ -29,7 +29,7 @@ keywords:
   - narrafork-test-
   - HTMLElement.prototype
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 2e6441ad0
 ---
 # 测试
 
@@ -38,7 +38,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ## 关键规则
 - `bun run test` = `bun test --isolate`（`package.json`）；`test:fast` 不隔离。CI 一律带 `--isolate`。`bunfig.toml` 里只有 `[test].preload = ["./tests/preload.ts"]`，隔离只能走命令行。单文件通过、混跑失败时先加 `--isolate` 复跑（`docs/TESTING.md` 称原因是共享模块级原型被测试改写；这一因果未核实，仓库内确有多处测试改 `HTMLElement.prototype`）。
 - `tests/preload.ts` 在每个测试进程里：创建临时 HOME/`NARRAFORK_HOME`（`narrafork-test-*`），拒绝指向真实 `~/.narrafork`，设置 `NARRAFORK_TEST=1`，从预迁移的 SQLite 模板播种数据库（`tests/sqlite-template.ts`），并在 `beforeEach/afterEach` 里把 `settings` 单例恢复到预载快照。`tests/preload-isolation.test.ts` 校验这件事，CI 先单独跑它。
-- CI（`.github/workflows/ci.yml`）：static-checks、build（前端构建 + tsgo + 远程前端构建，产物上传）、tests 四分片（`matrix.shard: [1..4]`）、最后 CI Gate。分片入口 `bun scripts/run-ci-tests.ts --isolate --only-failures --shard=N/4 --parallel=2 --timings=… --update-timings --reporter=junit`；`run-ci-tests.ts:buildNativeTestCommand` 只接受这组固定参数；计时文件 `.github/test-timings.json` 仅作调度提示，bun 仍自行发现全部测试文件。
+- CI（`.github/workflows/ci.yml`）：static-checks（含知识树检查 `bun scripts/knowledge.ts check`）、build（前端构建 + tsgo + 远程前端构建，产物上传）、tests 四分片（`matrix.shard: [1..4]`）、最后 CI Gate。分片入口 `bun scripts/run-ci-tests.ts --isolate --only-failures --shard=N/4 --parallel=2 --timings=… --update-timings --reporter=junit`；`run-ci-tests.ts:buildNativeTestCommand` 只接受这组固定参数；计时文件 `.github/test-timings.json` 仅作调度提示，bun 仍自行发现全部测试文件。
 - 测试作业会装 zstd/podman/git/ripgrep，拉 `postgres:17-alpine` 镜像，并安装固定版本 Chrome（146.0.7680.31）到 `NF_TEST_CHROMIUM_PATH`；`tests/scripts/ci-workflow.test.ts` 本身断言工作流的权限、动作 pin、各步骤顺序。
 - 浏览器测试：`*.browser.test.ts(x)` 用 `puppeteer-core` + `Bun.build` 打包 `*.browser-fixture.tsx`，在真实 Chrome 中跑（当前约 70 个，例如 `frontend/components/narrator/composer/NarratorComposer.browser.test.ts`）；Chrome 路径取 `NF_TEST_CHROMIUM_PATH`，不存在则 `beforeAll` 抛错。
 - 守卫测试：用 `readFileSync` 读源码文本或枚举目录来保证“某个结构不变量”，命名多为 `*.guard.test.ts`（当前约 30 个，如 `vlist-isolation.guard.test.ts`、`zero-dom-measure.guard.test.ts`、`server/lib/compiled-worker.guard.test.ts`）。它们以字符串引用文件路径，移动/重命名被引用的源文件后类型检查与构建都不会报错，必须全仓搜索旧路径。

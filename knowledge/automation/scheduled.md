@@ -31,7 +31,7 @@ keywords:
   - runContext
   - 定时
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 2e6441ad0
 ---
 # 定时任务
 

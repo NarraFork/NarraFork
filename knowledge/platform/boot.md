@@ -44,7 +44,7 @@ keywords:
   - netsh excluded port
   - IS_WINDOWS
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 2e6441ad0
 ---
 # 启动与进程
 
@@ -70,6 +70,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 日志（`lib/logger.ts`）：写 `NARRAFORK_HOME/server.log`，JSON 行；`NARRAFORK_LOG_LEVEL` 选级别（默认 info），`NARRAFORK_LOG_MAX_BYTES`（默认 50 MiB）、`NARRAFORK_LOG_MAX_FILES`（默认 5）控制轮转。
 - 平台标志集中在 `lib/platform.ts`（`IS_WINDOWS/IS_MACOS/IS_LINUX`、`IS_ANDROID`、`IS_PROOT`、`DEV_NULL`、`supportsDtach/supportsContainers`、`--wsl=` 标志），业务代码不要自己写 `process.platform` 判断。
 - 依赖检测 `GET /api/dependencies` 刻意挂在会话认证之前（缺 git 时登录前也要能看到状态）；`POST /api/dependencies/:name/install` 仅管理员，名称只允许 `git`、`rg`、`dtach`；检测与按包管理器安装在 `services/dependency-service.ts`，缺 sudo 密码不算服务端故障（`routes/dependencies.ts`）。
+- 数据库启动后段（`main.ts:initializeDatabaseStartup`）：恢复发现结束后，仅在 `automaticResumeEnabled()` 时先挂载叙述者续接恢复，再后台调用 `wakeQueuedTaskNoticeRecipientsOnStartup` 补唤醒收件箱里已入队、但唤醒丢失的任务通知（见 [收件箱与唤醒](../narrator/runtime/mailbox.md)）；失败只记警告。
 - 数据库完整性检查在端口绑定后后台执行，细节见 [实例锁、完整性与重启恢复](instance-recovery.md)。
 - 关闭：SIGINT/SIGTERM/SIGHUP 与 `exit` 钩子在 `main.ts` 末尾注册，`hotOnce` 防热重载重复注册；`performGracefulShutdown` 先 `httpLifecycle.stopAccepting()`，再逐步停各生产者。干净关闭标记与锁释放见 [实例锁、完整性与重启恢复](instance-recovery.md)。
 

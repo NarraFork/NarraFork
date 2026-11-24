@@ -24,7 +24,7 @@ keywords:
   - 发布槽位
   - source_after
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 2e6441ad0
 ---
 # 输出发布
 
@@ -42,6 +42,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 原子写：SQLite 段必须同步，返回 Promise 会回滚并抛错；唯一约束冲突统一成 `WriteConflictError`，PG 的 40001/40P01/55P03 原样抛出由整段重试处理（`runtime-write.ts`）。
 - 门面：`getRuntimePublicationService()` 按绑定的后端返回 PG 门面或 SQLite 异步包装；PG 未绑定队列时抛错，不回退 SQLite。`isRuntimePublicationUnavailableError` 仅把"未接线"视为可忽略。
 - 读冲突：运行时注册、属主、策略来源任一变了抛 409 `RUNTIME_READ_CONFLICT`（`read-conflict.ts`）。
+- 重启回收的身份校验：`recoverStaleTask` 可带 `expected`（重启扫描时看到的行）；PostgreSQL 的终态 CAS 此时还要求 type、父叙述者、子代理、逻辑运行、工具调用、执行尝试号（及给出时的 backgroundKind、command）与扫描时一致，否则不动该行（`postgres-runtime-publication.ts:staleTaskIdentityMatches`，对应 SQLite 的 `assertRestartTask`）。不带 `expected` 时只校验 `status=running`。
 - 旧版兼容：legacy 准入用 SQLite `rowid`（PG 用 `insert_seq`）与启动时捕获的边界判断"先于协议"的任务。
 
 ## 从哪读起

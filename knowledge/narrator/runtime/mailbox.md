@@ -37,7 +37,7 @@ keywords:
   - 收件箱
   - 排队消息
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 2e6441ad0
 ---
 # 收件箱与唤醒
 
@@ -62,6 +62,10 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
   - 无可唤醒输入时，只有 `eventKind` 不是 started/cancelled 的任务通知才唤醒。
   - 队里有用户输入走 `resumeBufferedMessagesIfIdle`，否则走父级入站续跑。
 - 冷启动：`recoverInboxClaimsOnColdStartup` 把其他进程遗留的 claimed 行放回 queued；无进程标识的旧 token 须该叙述者当前无 owner 才恢复。
+- 冷启动补唤醒：`wakeQueuedTaskNoticeRecipientsOnStartup` 按 id 分页（默认每页 100）找 `state=queued`、`kind=task_notice` 且 `eventKind` 不是 started/cancelled 的行，对每个接收方各探测一次 `wakeInboxIfEligible`（已停止、归档、忙、被占的照常不唤醒）；单个失败只记警告。原因：通知已入收件箱但提交后的唤醒随上个进程丢了。
+  - PostgreSQL：走 `port.mailbox.listQueuedTaskNoticeRecipients`（`postgres-runtime-queue.ts`，只返回接收方 id）。
+  - SQLite（无队列端口）：直接查 mailbox 表。
+  - 仅 `main.ts` 在 `automaticResumeEnabled()` 为真、恢复句柄挂好之后后台调用；关闭自动续接则不跑。
 - `pending-wake.ts:hasPendingWork`：运行中的 bash/agent 后台任务或未答的异步问题；`hasQueuedWake` 看 user_input/agent_message/task_notice。
 - `async-work.ts`：分离的通信尾部任务集合，失败只置标志与计数；`drainCommunicationWork` 默认 4 秒内排空，否则抛错。
 - 后端选择：`runtime-queue-port.ts` 无绑定即 SQLite；显式 PostgreSQL 而未绑定队列时抛错，绝不回退 SQLite。
@@ -72,7 +76,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 
 ## 改它时
 - `mailbox-shared.ts` 必须保持无数据库导入：PostgreSQL 路径靠它避免加载 SQLite 的 `mailbox.ts`。
-- 加一个队列操作要在 `mailbox.ts` 与 `postgres-runtime-queue.ts` 两处同名实现，并更新 `RuntimeQueuePort` 形状；两种行类型都须满足 `RuntimeMailboxRow`（`runtime-queue-port.test.ts` 编译期断言）。
+- 加一个队列操作（如 `listQueuedTaskNoticeRecipients`）要在 `mailbox.ts` 与 `postgres-runtime-queue.ts` 两处同名实现，并更新 `RuntimeQueuePort` 形状；两种行类型都须满足 `RuntimeMailboxRow`（`runtime-queue-port.test.ts` 编译期断言）。
 - `inbox.ts` 登记在 `server/db/sqlite-dialect-inventory.guard.test.ts`（json1），新增 SQLite 方言用法要同步登记。
 
 ## 相关

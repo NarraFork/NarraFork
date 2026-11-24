@@ -32,7 +32,7 @@ keywords:
   - DatabaseStorageUnsupportedError
   - bun-sql
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 2e6441ad0
 ---
 # PostgreSQL 后端
 

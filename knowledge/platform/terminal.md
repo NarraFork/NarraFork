@@ -32,7 +32,7 @@ keywords:
   - 孤儿终端
   - /api/admin/terminals
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 2e6441ad0
 ---
 # 终端运行时
 
@@ -42,7 +42,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 统一接口 `TerminalRuntime`（`write/resize/close/kill/pid/exited/ready?`），`terminal-service` 不直接碰平台 PTY API（`server/terminal/runtime.ts`）。
 - 创建时的后端选择顺序（`services/terminal-service.ts` 创建函数）：带 `deviceId` 走远程设备 PTY（`runtime-remote.ts`，需设备支持 `pty.ready-stream.v1`，先完成全部授权/能力检查再产生副作用）；否则本机装有 dtach 就走 dtach；否则直连——win32 用 `bun-pty`（`runtime-pty.ts:spawnPortablePty`），Unix 用 `Bun.Terminal`（`runtime-bun.ts`），`Bun.Terminal` 创建失败时回退到 `bun-pty`。
 - dtach 仅限非 Windows：`dtachService.isAvailable()` 在 win32 恒为 false，其余平台用 `which dtach` 检测并缓存（`terminal/dtach-service.ts`）。dtach 会话以 `terminal-<id>.sock` 存放；服务端只持有 attach 进程。
-- 关闭服务时（`shutdownAll`）：dtach 终端保存缓冲、关闭 attach 进程但不杀会话，数据库状态保持 `running`；直连终端被杀并标记已退出（退出码 -1）。启动时 `recoverOnStartup` 对 `running` 的 dtach 终端探测 socket 并重新 attach，探测失败则保留状态而不是删除（`terminal-service.ts`、`dtach-recovery-probe.ts`）。
+- 关闭服务时（`shutdownAll`）：dtach 终端保存缓冲、关闭 attach 进程但不杀会话，数据库状态保持 `running`；直连终端被杀并标记已退出（退出码 -1）。启动时 `recoverOnStartup` 对 `running` 的 dtach 终端探测 socket 并重新 attach，探测失败则保留状态而不是删除（`terminal-service.ts`、`dtach-recovery-probe.ts`）。`terminalService.whenStartupRecoverySettled()` 在最近一次启动恢复结束（成败皆算，无恢复则立即）后 resolve；`watch-service.ts` 靠它在 dtach 恢复完成后再重新挂接终端 Watch。
 - 因此「生命周期绑定服务器进程」只对直连/远程终端成立；dtach 终端可存活于重启。
 - 滚动缓冲由 `BufferManager` 维护（默认 80x24、scrollback 5000 行），周期性落盘，订阅时以 `scrollback` 消息回放，并有读取游标/布局快照的数量与字节上限（`terminal/buffer-manager.ts` 顶部常量如 `MAX_BUFFER_READ_CURSORS`、`MAX_LAYOUT_SNAPSHOT_BYTES`）。
 - WebSocket 协议：客户端 `subscribe/unsubscribe/input/resize/create/kill/rename`，服务端 `output/exit/error/scrollback/bufferState/created/killed/renamed`，消息体经 `terminalWsMessageSchema` 校验，订阅和创建都要通过 `terminal-access` 的权限判断（`websocket/terminal-ws.ts`）。
