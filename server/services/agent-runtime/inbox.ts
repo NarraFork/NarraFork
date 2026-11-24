@@ -1,7 +1,7 @@
 import { readQuery, readQueryFirst } from "@server/db/worker-read";
 import type { AgentInboxBlockedReason, PendingAgentMessageSummary } from "@shared/agent-inbox";
 import { formatOriginLabel, type MessageOriginOptions } from "@shared/message-origin";
-import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
 import { db } from "../../db";
 import {
 	narratorBufferedMessages as mailbox,
@@ -1308,6 +1308,68 @@ export function recoverInboxClaimsOnColdStartup(): Promise<number> {
 	});
 	startupRecovery.running = run;
 	return run;
+}
+
+/**
+ * Re-probe recipients that hold a queued actionable task notice after a cold start.
+ *
+ * A publication transfer commits the notice into the mailbox first and wakes the
+ * recipient afterwards as a best-effort side effect. A crash between the two left a
+ * durable notice that nothing would ever wake: the claim recovery above only covers
+ * `claimed` rows. Each recipient goes through the ordinary `wakeInboxIfEligible`
+ * admission, so stopped, archived, busy or owned sessions are left alone exactly as
+ * for a live wake. Reads are id-paged and return recipient ids only.
+ */
+export async function wakeQueuedTaskNoticeRecipientsOnStartup(
+	options: { pageSize?: number; wake?: (narratorId: string) => Promise<boolean> } = {},
+): Promise<number> {
+	const pageSize = options.pageSize ?? 100;
+	const wake = options.wake ?? ((narratorId: string) => wakeInboxIfEligible(narratorId));
+	const seen = new Set<string>();
+	let afterId: string | undefined;
+	let woken = 0;
+	do {
+		const port = getRuntimeQueuePort();
+		let recipientIds: string[];
+		if (port) {
+			const page = await port.mailbox.listQueuedTaskNoticeRecipients({ afterId, limit: pageSize });
+			recipientIds = page.recipientIds;
+			afterId = page.nextAfterId;
+		} else {
+			const rows = await readQuery(
+				db
+					.select({ id: mailbox.id, narratorId: mailbox.narratorId })
+					.from(mailbox)
+					.where(
+						and(
+							eq(mailbox.state, "queued"),
+							eq(mailbox.kind, "task_notice"),
+							afterId ? gt(mailbox.id, afterId) : undefined,
+							sql`json_extract(${mailbox.metadataJson}, '$.eventKind') NOT IN ('started', 'cancelled')`,
+						),
+					)
+					.orderBy(asc(mailbox.id))
+					.limit(pageSize + 1),
+				{ executionPolicy: "worker-required", maxRows: pageSize + 1 },
+			);
+			const page = rows.slice(0, pageSize);
+			recipientIds = page.map((row) => row.narratorId);
+			afterId = rows.length > pageSize ? page.at(-1)?.id : undefined;
+		}
+		for (const narratorId of recipientIds) {
+			if (wakeControl.stopped) return woken;
+			if (seen.has(narratorId)) continue;
+			seen.add(narratorId);
+			try {
+				if (await wake(narratorId)) woken++;
+			} catch (error) {
+				logger.warn("Startup task-notice wake deferred", { narratorId, error: String(error) });
+			}
+		}
+		if (afterId) await new Promise<void>((resolve) => setImmediate(resolve));
+	} while (afterId && !wakeControl.stopped);
+	if (woken) logger.info("Woke recipients with queued task notices after startup", { woken });
+	return woken;
 }
 
 const pendingWakes = hotSafe(
