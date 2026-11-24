@@ -4259,6 +4259,12 @@ export const backgroundTasks = sqliteTable(
 		executionAttempt: integer("execution_attempt"),
 		alias: text("alias"),
 		title: text("title"),
+		/**
+		 * Watch rows: the execution principal that registered the observation. Restart
+		 * re-attachment re-authorizes as this identity; NULL (legacy or unknown) never
+		 * re-attaches.
+		 */
+		principalJson: text("principal_json", { mode: "json" }).$type<{ userId: string | null }>(),
 		output: text("output"),
 		outputBytes: integer("output_bytes").notNull().default(0),
 		outputTruncated: integer("output_truncated", { mode: "boolean" }).notNull().default(false),

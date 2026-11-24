@@ -450,6 +450,27 @@ export function registerTaskAlias(
 }
 
 /**
+ * Re-register a task's persisted alias exactly, as it was printed to the session.
+ *
+ * Unlike {@link registerTaskAlias}, the alias is not treated as a title: slugifying
+ * would truncate a long alias and could drop its `-2` suffix, handing this task
+ * another task's handle. Only if another id already holds the alias in this process
+ * is a suffixed variant minted, so a handle never resolves to the wrong task.
+ */
+export function restoreTaskAlias(
+	narratorId: string,
+	realId: string,
+	alias: string,
+): { alias: string; conflicted: boolean } {
+	const reg = getOrCreateRegistry(narratorId);
+	const existing = reg.idToAlias.get(realId);
+	if (existing) return { alias: existing, conflicted: existing !== alias };
+	const result = uniqueAliasFrom(alias, (candidate) => reg.aliasToId.has(candidate), realId);
+	setRegistryAlias(reg, realId, result.alias);
+	return result;
+}
+
+/**
  * Resolve an alias or real ID to the actual task/subagent ID.
  * Checks alias registry first, then returns the input as-is (assumed to be a real ID).
  */

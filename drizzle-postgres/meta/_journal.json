@@ -554,6 +554,13 @@
 			"when": 1795283628623,
 			"tag": "0078_ask_in_passing_group_archive",
 			"breakpoints": true
+		},
+		{
+			"idx": 79,
+			"version": "7",
+			"when": 1795511646791,
+			"tag": "0079_watch_principal",
+			"breakpoints": true
 		}
   ]
 }
