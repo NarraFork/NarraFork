@@ -178,6 +178,15 @@ frontend/
 - 校验：Zod schema 定义在 `server/lib/validators/`（按资源拆分的目录），在路由处理器中解析
 - 配置文件位于 `~/.narrafork/settings.json` — 通过 `@server/lib/settings` 的 `settings` 单例访问
 
+## 仓库知识树（`knowledge/`）
+
+`knowledge/` 按主题描述当前代码实际怎么工作，每个节点用锚点指向它依据的代码；约定见 [knowledge/README.md](knowledge/README.md)。工具 `bun scripts/knowledge.ts`：
+
+- **动手前**：`find <词…|路径>` 定位要读的节点（界面叫法、标识符、错误码、文件路径都可以），先读它的「改它时」；跨几块的改动先看 `knowledge/flows/`。标「过期」的节点以代码为准。
+- **合并前**：`affected [基线]`（默认 `origin/main`）列出这次改动碰到锚点的节点，在同一个 PR 里按代码核对并更新它们（含 `verified_at`）；它列出的「没有节点覆盖的改动文件」要给合适的节点加锚点或新建节点。
+- **提交前**：`check` 必须通过（CI 的 Static checks 也会跑）。
+- 知识只以代码为准：`docs/` 和代码注释可能过时，不能照抄进节点。
+
 ## 深入文档（按需阅读）
 
 涉及对应领域改动时先读：
