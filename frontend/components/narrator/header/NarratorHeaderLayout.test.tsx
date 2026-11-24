@@ -167,11 +167,12 @@ function expected(
 	width: number,
 	input: Omit<HeaderAfterTitleInput, "rowWidth"> = DEFAULT_INPUT,
 ): NarratorHeaderLayoutSnapshot {
-	const { titleWidth, visibleToolCount, unmeasured } = resolveHeaderLayoutAfterTitle({
-		...input,
-		rowWidth: width,
-	});
-	return { titleWidth, visibleToolCount, unmeasured };
+	const { titleWidth, visibleToolCount, showTitleBadge, unmeasured } =
+		resolveHeaderLayoutAfterTitle({
+			...input,
+			rowWidth: width,
+		});
+	return { titleWidth, visibleToolCount, showTitleBadge, unmeasured };
 }
 
 describe("NarratorHeaderLayout resize isolation", () => {
@@ -262,6 +263,25 @@ describe("NarratorHeaderLayout resize isolation", () => {
 			harness.update(input);
 			expect(harness.layout()).toEqual(expected(600, input));
 		}
+	});
+
+	it("budgets a title badge and recomputes when it appears, changes or disappears", async () => {
+		const harness = await mount();
+		harness.resize(400);
+		const plain = harness.layout();
+		expect(plain?.showTitleBadge).toBe(false);
+		const badged = { ...DEFAULT_INPUT, titleBadgeWidth: 62 };
+		harness.update(badged);
+		expect(harness.layout()).toEqual(expected(400, badged));
+		expect(harness.layout()?.showTitleBadge).toBe(true);
+		expect(harness.layout()?.visibleToolCount).toBeLessThan(plain?.visibleToolCount ?? 0);
+		// Too narrow for the badge beside the floored title: it gives way, close stays.
+		harness.resize(250);
+		expect(harness.layout()).toEqual(expected(250, badged));
+		expect(harness.layout()?.showTitleBadge).toBe(false);
+		harness.resize(400);
+		harness.update(DEFAULT_INPUT);
+		expect(harness.layout()).toEqual(plain);
 	});
 
 	it("budgets host pin from context and recomputes when it appears or disappears", async () => {

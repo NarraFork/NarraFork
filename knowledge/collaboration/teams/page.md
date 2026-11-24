@@ -27,7 +27,7 @@ keywords:
   - /teams/:teamId/approvals
   - permission_decided_by
 status: draft
-verified_at: 220942230
+verified_at: 69715f280
 ---
 # 团队页与审批
 
@@ -56,6 +56,7 @@ verified_at: 220942230
 - `team-page-model.ts` 是纯规则：状态图标、轮询退避、套接字推送合并（400ms 去抖、最长 2s）、暂停顺序。
 - `hooks/useTeams.ts`：摘要在叙述者 socket 的相关帧上合并重取，同时带退避轮询（变化后 4s，翻倍到 60s，标签页隐藏时暂停）；看板、动态、审批各自按变化重取。`lib/api/teams.ts` 是客户端。
 - `hooks/team-onlooker-refresh.ts`：访问权限变化（`narrator_access_changed`、`project_access_changed`）时刷新最近标签页的 `teamOnlooker` 标记，该标记让只读旁观者不收「等待」提醒（见[通知与注意力](../notifications.md)、[最近标签页](../recent-tabs.md)）。
+- 活动标题（`team-page-model.ts:eventLabelKey`）：已知种类由 shared 的事件种类列表拼成，每一种在 en / zh-CN 的 `teams.event.*` 都有文案（`team-page-model.test.ts` 核对，含 `work.merged` 与重叠、独占路径事件）；未知种类（更新的服务端）显示通用的 `teams.event.other`（「其他团队动态」），原始种类名只放在 tooltip 里（`TeamActivity.tsx`）。
 
 ## 从哪读起
 - `team-board.ts`：看板、动态、审批的读模型；`team-decisions.ts`：决定记录。

@@ -45,7 +45,7 @@ keywords:
   - X-Next-Cursor
   - 章节
 status: draft
-verified_at: 0bb5312c7
+verified_at: 69715f280
 ---
 # 项目
 
@@ -82,6 +82,7 @@ verified_at: 0bb5312c7
 - 侧栏「项目」入口（`nav-items.tsx` 的 `projects` → `/projects`）是进入项目页和团队的唯一导航入口，见[应用框架与路由](../frontend/shell-routing.md)。
 - `frontend/routes/projects/index.tsx`（项目列表，卡片没有菜单）、`$projectId.tsx`（项目页：目录与会话列表，`components/project/ProjectSessionList.tsx`；标题旁的 `PinToSidebarButton` 把项目固定到侧栏，见[最近标签页](recent-tabs.md)）；设置/权限在 `ProjectSettingsPanel`、`ProjectAccessPanel`、`ProjectSkillsManager`、`ProjectRoutinesModal`、`ProjectCommandsModal`。
 - `frontend/hooks/useProjects.ts` + `lib/api/projects.ts`：React Query 与客户端；团队页路由 `$projectId_.teams.$teamId.tsx` 属于[团队](teams/index.md)。
+- 新建项目对话框（`routes/projects/index.tsx`）的项目目录建议向上展开（`dropdownPosition="top"`），不盖住紧挨在下面的「创建」按钮。项目设置面板（`ProjectSettingsPanel`）用到的文案键（含 skills / routines / commands）在 en 与 zh-CN 的 `projects` 命名空间里都要有，`ProjectSettingsPanel.test.tsx` 逐个核对。
 
 ## 从哪读起
 - `server/services/project-index.ts`：目录到项目的推导、链接同步与重建。

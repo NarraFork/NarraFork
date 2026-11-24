@@ -50,7 +50,7 @@ keywords:
   - ThemeSwitcher
   - colorScheme
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 69715f280
 ---
 # 通用组件与主题
 
@@ -72,6 +72,7 @@ UI 基于 Mantine v9，颜色统一从设计令牌派生。`components/common/` 
 - 插件主题：服务端 `server/lib/plugins/theme-compiler.ts:compileThemeContribution` 把白名单令牌编译成 `[data-plugin-theme="<pluginId>__<themeId>"]` 下的 CSS，单个主题超过 `MAX_COMPILED_THEME_CSS_LENGTH`（196608）整个丢弃而不是截断；前端 `usePluginThemes` 管可用列表与启用，所选键存在 `lib/plugin-theme-pref-store.ts`（独立小模块，让 `main.tsx` 首帧读取时不拖入整个 `lib/api`）。
 - `useSharedComputedColorScheme` 让所有订阅者共用一个 `prefers-color-scheme` 的 `matchMedia`；`lib/theme-color-sync.ts` 让 `<meta name="theme-color">` 跟随外壳头部的实际背景色（WCO 窗口按钮、移动端状态栏用它着色）。
 - 外观设置页 `routes/settings/appearance.tsx` + `AppearanceSection`：每个偏好行由 `AppearanceSyncControl.tsx:AppearancePreferenceRow` 包装，决定该项只存本机还是随账号同步；偏好清单、默认值与范围见 `shared/appearance-preferences.ts:APPEARANCE_PREFERENCES`（`local(...)` 项 `defaultSync:false`，`account(...)` 项 `defaultSync:true`，`customizable:false` 的项同步策略固定为各自的 `defaultSync`，`appearanceStore.setSynced` 对它直接返回，如全屏、屏幕常亮）。排版滑块的取值范围来自排版引擎，见[前端排版引擎](layout-engine.md)。
+- `PathInput`（`DirectoryPicker` 的输入框）：建议下拉只在输入框有焦点时打开，失焦后才返回的浏览结果不会再弹出来；下面紧挨操作按钮的表单用 `dropdownPosition="top"`；没在编辑时长路径滚到末尾显示（失焦后也恢复），完整路径放在输入框的 `title`。Chromium 测试在 `path-input.browser.test.ts`。
 
 ## 从哪读起
 - `frontend/components/common/`：`DirectoryPicker`/`PathInput`（目录选择）、`ConfirmDialogProvider`、`ImageViewer`、`TruncatedText`、`CopyButton`、`error-toast.tsx`。
