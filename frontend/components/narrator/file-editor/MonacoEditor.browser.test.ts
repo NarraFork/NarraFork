@@ -340,6 +340,79 @@ test("native range widget follows long selection scrolling/folding and is remove
 	});
 }, 30_000);
 
+for (const readOnly of [false, true]) {
+	test(`native long-line Show more expands text and synchronizes protection (readOnly=${readOnly})`, async () => {
+		await withPage(async (page) => {
+			const text = `${"x".repeat(20_000)}TAIL_END`;
+			const toggle = '[data-editor="0"] [data-monaco-long-line-toggle]';
+			const overflow = '[data-editor="0"] .mtkoverflow';
+			await page.evaluate(
+				(options) => (window as unknown as FixtureWindow).monacoQuoteFixture.configure(options),
+				{ text, readOnly },
+			);
+			await page.waitForSelector(toggle);
+			if (!readOnly) {
+				await page.evaluate(() => (window as unknown as FixtureWindow).monacoQuoteFixture.focus(0));
+				await page.keyboard.down("Control");
+				await page.keyboard.press("End");
+				await page.keyboard.up("Control");
+				await page.keyboard.type("EDIT");
+			}
+			await frames(page);
+			const before = await snapshot(page);
+			expect(before.renderingLimit).toBe(10_000);
+			expect(before.renderedText).not.toContain("TAIL_END");
+			expect(before.canUndo).toBe(!readOnly);
+			const unchangedDocument = {
+				modelId: before.modelId,
+				value: before.value,
+				version: before.version,
+				alternativeVersion: before.alternativeVersion,
+				canUndo: before.canUndo,
+			};
+			for (let attempt = 0; attempt < 2; attempt++) {
+				await page.evaluate(() =>
+					(window as unknown as FixtureWindow).monacoQuoteFixture.scrollToOverflow(0),
+				);
+				await frames(page);
+				await page.click(overflow);
+				await frames(page);
+				const expanded = await snapshot(page);
+				expect(expanded.renderingLimit).toBe(-1);
+				expect(expanded.renderedText).toContain("TAIL_END");
+				expect(expanded).toMatchObject(unchangedDocument);
+				expect(await page.$(overflow)).toBeNull();
+				expect(await page.$eval(toggle, (node) => node.getAttribute("aria-pressed"))).toBe("true");
+				expect((await snapshot(page, 1)).renderingLimit).toBe(10_000);
+				// A parent render must not undo the native expansion.
+				await page.evaluate(
+					(options) => (window as unknown as FixtureWindow).monacoQuoteFixture.configure(options),
+					{ text, readOnly, reason: "rerender" },
+				);
+				await frames(page);
+				expect((await snapshot(page)).renderingLimit).toBe(-1);
+				await page.click(toggle);
+				await frames(page);
+				expect((await snapshot(page)).renderingLimit).toBe(10_000);
+				expect((await snapshot(page)).renderedText).not.toContain("TAIL_END");
+				expect(await page.$eval(toggle, (node) => node.getAttribute("aria-pressed"))).toBe("false");
+			}
+			expect(await snapshot(page)).toMatchObject(unchangedDocument);
+			await page.evaluate(
+				(options) => (window as unknown as FixtureWindow).monacoQuoteFixture.configure(options),
+				{ text, readOnly, owner: "another-long-file" },
+			);
+			await page.waitForFunction(() =>
+				(
+					document.querySelector('[data-editor="0"] .nf-monaco-host') as HTMLElement
+				)?.dataset.monacoDocumentKey?.endsWith("another-long-file"),
+			);
+			await frames(page);
+			expect((await snapshot(page)).renderingLimit).toBe(10_000);
+		});
+	}, 30_000);
+}
+
 for (const deployment of ["development", "production"] as const) {
 	for (const path of ["service", "standalone"] as const) {
 		for (const mode of ["healthy", "construct", "disabled", "handshake", "crash"] as const) {

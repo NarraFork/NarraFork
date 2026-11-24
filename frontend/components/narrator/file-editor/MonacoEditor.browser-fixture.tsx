@@ -20,6 +20,7 @@ const source = Array.from(
 ).join("\n");
 let configure: (options: Options) => void;
 interface Options {
+	text?: string;
 	readOnly?: boolean;
 	reason?: string | null;
 	callback?: boolean;
@@ -39,7 +40,9 @@ function App() {
 					<div key={index} data-editor={index} style={{ width: 480, height: 320 }}>
 						{(index === 1 || options.mounted !== false) && (
 							<MonacoEditor
-								initialValue={index === 0 ? source : "second editor\nno selection"}
+								initialValue={
+									options.text ?? (index === 0 ? source : "second editor\nno selection")
+								}
 								documentKey={`${index}/${options.owner ?? "a"}`}
 								filePath={`${index}.txt`}
 								onReady={(handle) => {
@@ -85,6 +88,11 @@ export const fixture = {
 	scroll(index: number, top: number) {
 		handles[index]?.getEditor()?.setScrollTop(top);
 	},
+	scrollToOverflow(index: number) {
+		const view = handles[index]?.getEditor();
+		view?.setScrollLeft(view.getScrollWidth());
+		view?.setScrollTop(0);
+	},
 	async fold(index: number, start: number, end: number) {
 		const view = handles[index]?.getEditor();
 		if (!view) throw new Error("Missing editor for folding");
@@ -122,6 +130,8 @@ export const fixture = {
 			version: model?.getVersionId(),
 			alternativeVersion: model?.getAlternativeVersionId(),
 			canUndo: model?.canUndo(),
+			renderingLimit: view?.getRawOptions().stopRenderingLineAfter,
+			renderedText: host.querySelector(".view-lines")?.textContent ?? "",
 			value: model?.getValue(),
 			selection: selection
 				? {
