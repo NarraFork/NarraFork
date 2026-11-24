@@ -38,6 +38,29 @@ import { usePermissionTextareaStyle } from "./permission-textarea-typography";
 
 const noop = () => {};
 
+/**
+ * Whether this approval card offers 计划反思.
+ *
+ * Only a plan approval that is still backed by a live reflection runner qualifies: an outline
+ * session's plan is decided through `OutlinePlanApproval` (its review writes comments and never
+ * approves, so there is nothing to auto-approve), a request restored without a runner has nothing
+ * to run, and while the person edits the plan locally they are mid-decision. Once they have
+ * edited it, the card shows their draft but the reviewer would read (and approve) the original
+ * submission, so the entry stays off until the edit is discarded.
+ */
+export function shouldShowPlanReflectButton(args: {
+	permission: PendingPermission;
+	hasHandler: boolean;
+	editing: boolean;
+	planEdited?: boolean;
+}): boolean {
+	const { permission, hasHandler, editing, planEdited } = args;
+	if (editing || planEdited || !hasHandler) return false;
+	if (permission.toolName !== "ExitPlanMode") return false;
+	if (permission.planReflectionAvailable !== true) return false;
+	return !isOutlinePlanApproval(permission);
+}
+
 // --- StructSed change preview ---
 
 /**
@@ -165,6 +188,7 @@ export function InlinePermission({
 	onQuestionReflect,
 	onQuestionDeny,
 	onQuestionDefer,
+	onPlanReflect,
 	onPlanPreviewChange,
 }: {
 	permission: PendingPermission;
@@ -181,6 +205,11 @@ export function InlinePermission({
 	onQuestionDeny?: (requestId: string) => void;
 	/** Release the blocked loop and move the question to the async inbox. */
 	onQuestionDefer?: (requestId: string) => Promise<void> | void;
+	/**
+	 * Run one plan reflection for this waiting plan approval. Only offered where the backend
+	 * still holds a reflection runner for the request (`planReflectionAvailable`).
+	 */
+	onPlanReflect?: (requestId: string) => Promise<void> | void;
 	onPlanPreviewChange?: (requestId: string, previewPlan: string | null) => void;
 }) {
 	const { t } = useTranslation("narrator");
@@ -499,6 +528,24 @@ export function InlinePermission({
 								onClick: () => {
 									setEditedPlan(null);
 									setEditing(false);
+								},
+							});
+						}
+						if (
+							onPlanReflect &&
+							shouldShowPlanReflectButton({
+								permission,
+								hasHandler: true,
+								editing,
+								planEdited,
+							})
+						) {
+							btns.push({
+								label: t("planReflect"),
+								color: "indigo",
+								variant: "light",
+								onClick: () => {
+									void onPlanReflect(permission.id);
 								},
 							});
 						}
