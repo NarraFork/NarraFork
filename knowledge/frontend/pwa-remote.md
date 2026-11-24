@@ -15,6 +15,27 @@ anchors:
   - frontend/lib/remote-resource-policy.ts
   - server/lib/branding/
   - server/lib/spa-base-href.ts
+keywords:
+  - service worker
+  - src-sw.ts
+  - injectManifest
+  - manifest.webmanifest
+  - VERSION_MISMATCH
+  - _nf_reload
+  - REMOTE_SERVICE_WORKER_CONTROLLED
+  - remote/catalog.json
+  - selectRemoteBuild
+  - bootstrapRemote
+  - RecoveringTransport
+  - RemoteClient
+  - REMOTE_BUILD
+  - __NF_REMOTE_BUILD__
+  - vite.remote.config
+  - dist/frontend-remote
+  - 远程访问
+  - 安装为应用
+  - injectSpaBaseHref
+  - base href
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -32,12 +53,22 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 引导流程（`remote/bootstrap.ts:bootstrapRemote`）：若页面已被 SW 控制则直接失败（`REMOTE_SERVICE_WORKER_CONTROLLED`）；邀请取自 URL 片段或已存 grant；`RemoteClient.connect` 建 RTC；`selectRemoteBuild` 按后端身份精确选版本：读同源 `/remote/catalog.json`，校验 manifest 的 sha256、身份兼容键与 buildId，选不到就报错，**不回退到最新版**；样式与入口脚本用 SRI（`integrity`）加载，再 `import()` 并调用 `mount`。
 - 传输：`remote/business-transport.ts` 只放行 `resolveRemoteRequestRule` 允许的请求，路径必须是 `/api/` 且拒绝编码绕过，`openSocket` 只支持 `/ws/narrator`（终端 WS 不支持）；`recovering-transport.ts:RecoveringTransport` 在连接关闭时用已存 grant 重连，若后端身份变了就关闭并失败。
 
+- 构建开关：`lib/build-target.ts:REMOTE_BUILD` 来自编译期常量 `__NF_REMOTE_BUILD__`（`vite.config.ts` 定义为 `false`，`vite.remote.config.ts` 定义为 `true`），业务代码用它决定是否走原生功能。远程构建里图片只允许 `blob:` 或不超过约 12 MiB 的 `data:image/(png|jpeg|jpg|gif|webp|avif);base64`（`lib/remote-resource-policy.ts:isRemoteInlineImage`，`ImageViewer` 与 `MarkdownImage` 用它，不满足就只显示 alt 文本）。
+- 子路径部署：构建产物里的资源引用是相对路径，深链由同一份 `index.html` 应答，所以服务端 `server/lib/spa-base-href.ts:injectSpaBaseHref` 按请求路径深度往 `index.html` 注入 `<base href="../">`（深度不依赖前缀，前缀在浏览器 URL 和服务端看到的路径上增删的段数相同）；这一步不能放到客户端，因为入口脚本本身就会 404。
+
 ## 从哪读起
 - `frontend/src-sw.ts`、`frontend/lib/pwa.ts`（更新后等待新服务端就绪再重载）。
 - `frontend/remote/bootstrap.ts`、`selection.ts`、`runtime.ts`；测试 `bootstrap.test.ts`、`production.browser.test.ts`。
 - `scripts/build-remote-frontend.ts`：远程产物的清单与目录构建（内容未核实）。
 
+## 改它时
+- 改 SW 的缓存或导航逻辑：`tests/frontend/pwa-cache-reload.test.ts`、`pwa-offline-shell.test.ts`、`pwa-refresh-navigation.test.ts`、`pwa-reload-readiness.test.ts`、`app-shell-precache.test.ts` 覆盖；新增品牌资源路径要同步 `src-sw.ts:BRAND_ASSET_PATHS`，否则会被运行时缓存。
+- 新增 API 或 WS 路径前缀：SW 与应用共用 `lib/app-path-classify.ts`，改它要两边一起验证（应用侧 `base-path.ts`，SW 侧用自己的 scope 作前缀）。
+- 加被远程构建替换的模块：改 `frontend/build/remote-boundaries.ts` 的映射，并保证远程版实现满足同样的接口；远程只放行 `shared/remote-access/request-policy.ts` 允许的请求。引导与版本选择行为由 `frontend/remote/bootstrap.test.ts`、`selection.test.ts`、`recovering-transport.test.ts`、`socket.test.ts`、`runtime.test.ts` 覆盖，选不到精确版本必须报错而不是回退最新。
+- 改 manifest：默认值在 `vite.config.ts:webManifestAsset`，运行期改写在 `server/lib/branding/manifest.ts`；`tests/frontend/branding-build-output.test.ts` 断言构建出的 SW 没有预缓存品牌资源（未构建 `dist/frontend` 时跳过）。
+
 ## 相关
 - [数据获取与实时同步](data-flow.md)：`businessTransport` 抽象与原生实现。
+- [前端通用工具](utils.md)：品牌（`/api/branding`、实例名与图标色）的前端与公开路由一侧。
 - [远程访问](../remote/remote-access.md)：配对、信令、托管侧。
 - [应用框架与路由](shell-routing.md)

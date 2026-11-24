@@ -15,6 +15,27 @@ anchors:
   - frontend/lib/panel-drag.ts
   - frontend/routes/windows/panel.tsx
   - shared/narrator-panel-state.ts
+keywords:
+  - dockview
+  - DockviewSurface
+  - NarratorDock
+  - DockviewWorkspace
+  - narrafork_ndock_
+  - WORKSPACE_LAYOUT_VERSION
+  - director
+  - 导演布局
+  - reconcileLayoutWithPanels
+  - workspace-membership-wiring
+  - TerminalPanel
+  - NarratorTerminal
+  - TerminalWSManager
+  - /ws/terminal
+  - OSC 52
+  - /windows/panel
+  - 独立窗口
+  - panel-drag
+  - 拖放分区
+  - swapPanels
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -33,11 +54,20 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - `TerminalPanel` 的输出先攒进缓冲，同时挂 rAF 与 250ms 定时器两路冲刷（先到先执行），待写缓冲超过 1,000,000 字符就丢最旧部分；scrollback 2000 行；`terminal-reply.ts:isHeadlessTerminalReply` 把服务端无头缓冲已回写的设备报告（CPR、DA 等）在浏览器侧丢弃，避免重复应答；`osc52-handler.ts` 拦截 OSC 52，读请求与写请求都只吞掉，不写剪贴板。
 - 终端 WebSocket 是 `useTerminalWS.ts:TerminalWSManager` 单例，订阅/退订多个终端；重连指数退避 1s→30s，连续失败 3 次起标记断开，50 次后放弃；收到 1001 不再重连；60s 内没收到服务端 ping 就断开重连；页面隐藏 ≥30s 回来强制重连。
 
+- 拖拽状态：`lib/panel-drag.ts` 是与框架无关的指针拖拽单例（侧栏最近标签、面板头都经它拖到 dockview 表面上），拖拽对象分 `narrator`（只有它能新建工作区或实体化成叙述者面板）与 `tool`（只在表面内重排，永不新建工作区）；另有 @dnd-kit 路径 `startDragManual/moveDrag/endDrag`（此时指针归 @dnd-kit 管）。
+- 独立窗口：任一 dock 面板可经 `window/panel-window.ts` 把规范化后的参数序列化进 `/windows/panel` 的 `d` 查询参数，`StandalonePanelWindow` 直接渲染面板内容组件而不是 dockview 适配器；描述符丢弃面板行 ID、一次性高亮请求和未知字段，新旧版本互相降级到共同字段，调试用 `mock` 面板不可打开（`panel-window.ts` 里对 `mock` 直接返回 null）。窗口是独立的 JS 环境，自带叙述者 WS 连接（`StandaloneWindowLayout` 自己不连）；它在没有令牌或会话丢失时跳 `/login`，临时的鉴权查询失败不会清掉会话。依赖 dock 的跨面板桥（聊天↔终端推送、详情上下文、文件引用发布）在窗口里缺席。
+- 手机端终端抽屉：`useMobileTerminalDrawerOpen` 打开抽屉前，若终端受支持且没有运行中的终端，先建一个名为 `Terminal 1` 的终端。
+
 ## 从哪读起
 - `frontend/components/dockview/DockviewSurface.tsx`、`useDockviewDnd.ts`：通用表面与拖放接线。
 - `frontend/components/narrator/dock/`：`panels.tsx` 是组件表（chat、terminal、git、file、knowledge、outline、plugin 等，见 `dock-panel-types.ts`），`NarratorDockContext.tsx` 管打开/关闭工具面板。
 - `frontend/components/narrator/workspace/`：`DockviewWorkspace.tsx`（保存与成员同步）、`dockview-layout.ts`（信封解析）、`DirectorLayout.tsx`。
 - `frontend/components/terminal/TerminalPanel.tsx`。
+
+## 改它时
+- 加一种 dock 面板：在 `narrator/dock/dock-panel-types.ts` 登记类型，`dock/panels.tsx`（单会话）与 `workspace/panels.tsx`（工作区）各补组件表；要能弹出独立窗口还要让 `window/panel-window.ts` 的描述符与 `StandalonePanelWindow` 认得它。工作区里新增、关闭、拖入面板必须写成员行，`workspace/workspace-membership-wiring.guard.test.ts` 扫源码，漏写会失败。
+- 改拖放分区或关闭规则：`dockview/drop-intent.test.ts`、`panel-swap.test.ts`、`tab-close.test.ts`、`useDockviewDnd.test.ts`；改布局信封：`narrator-dock-layout.test.ts`、`workspace/dockview-layout.test.ts`，并先读服务端的版本与 409 规则（[工作区布局](../narrator/workspaces.md)），`WORKSPACE_LAYOUT_VERSION` 变了要处理旧信封。
+- 终端 WS 的退避与超时常量写在 `useTerminalWS.ts` 里，对应终端输出缓冲上限在 `TerminalPanel.tsx`；这些是协议行为，改前对照服务端 `/ws/terminal`（[终端运行时](../platform/terminal.md)）。
 
 ## 相关
 - [会话界面](narrator-ui/index.md)：面板内部的消息列表与输入框。

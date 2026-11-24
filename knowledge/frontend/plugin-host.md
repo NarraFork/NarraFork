@@ -9,6 +9,25 @@ anchors:
   - frontend/App.tsx
   - frontend/hooks/usePluginContributions.ts
   - frontend/hooks/usePluginOverlayVisibility.ts
+keywords:
+  - narrafork.ui/1
+  - PluginDockPanel
+  - PluginOverlayHost
+  - pluginContributionStore
+  - plugin_contributions_changed
+  - /plugins/ui/sessions
+  - /plugins/ui/contributions
+  - host-react
+  - __nfPluginRuntime
+  - PLUGIN_UI_RUNTIME_VERSION
+  - MessageChannel
+  - asset-shell
+  - createPluginAssetShell
+  - PluginThemeInjector
+  - usePluginOverlayVisibility
+  - hidden_plugin_overlays
+  - 插件面板
+  - 插件浮层
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -32,6 +51,12 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - `frontend/components/plugins/runtime.ts`、`session-client.ts`、`protocol.ts`：会话、后端请求、协议。
 - `frontend/components/plugins/PluginUiRuntimeProvider.tsx`：把宿主能力（导航、通知、上下文）接给会话。
 - `frontend/components/plugins/asset-shell.ts`：外壳 HTML 与 CSP。
+
+## 改它时
+- 加一个宿主方法（iframe 可调）：在 `protocol.ts` 的方法表里登记并给 zod schema，宿主本地的在 `runtime.ts` 处理，后端转发的走 `session-client.ts`；不在两张表里的方法不被接受。`protocol.test.ts`、`runtime.test.ts`、`session-client.test.ts` 覆盖负载上限与握手。
+- 改共享运行时暴露的模块（React、Mantine）：同时改 `plugin-runtime/contract.ts:PLUGIN_UI_SHARED_MODULES` 与 `vendor.ts`，不兼容变化要递增 `PLUGIN_UI_RUNTIME_VERSION`——`build/plugin-ui-bun.ts` 生成的插件产物在版本不符时直接抛错；`tests/frontend/build/plugin-ui-runtime.test.ts`、`plugin-ui-bun.test.ts` 覆盖构建。
+- 改 iframe 外壳或 CSP：`asset-shell.test.ts`、`asset-shell-presentation.test.ts`；`sandbox` 不得加 `allow-same-origin`。
+- 新增贡献槽位（`host-surface`）：改 `protocol.ts:HOST_SURFACE_VALUES`，`window/panel-window.ts` 也引用它，窗口描述符会随之接受或拒绝。
 
 ## 相关
 - [插件运行时](../automation/plugins/runtime.md)、[插件贡献](../automation/plugins/contributions.md)：服务端一侧。

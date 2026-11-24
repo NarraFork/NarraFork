@@ -3,6 +3,15 @@ id: frontend
 title: 前端
 summary: React 19 + Mantine 单页应用：框架与路由、数据流、国际化、会话界面、组件与主题。
 anchors:
+keywords:
+  - 前端
+  - frontend
+  - React 19
+  - Mantine
+  - Vite
+  - dist/frontend
+  - 远程访问构建
+  - "@frontend/*"
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

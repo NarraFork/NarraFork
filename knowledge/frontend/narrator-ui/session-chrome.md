@@ -33,6 +33,7 @@ anchors:
   - frontend/lib/narrator-loading-metrics.ts
   - frontend/lib/narrator-panel-state.ts
   - shared/narrator-toolbar.ts
+  - shared/identicon.ts
 keywords:
   - NarratorDock
   - dockview
