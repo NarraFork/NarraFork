@@ -7,6 +7,7 @@ anchors:
   - server/lib/agent/tools/task-reflection.ts
   - server/lib/agent/tools/reflection-description.ts
   - server/lib/agent/pending-plan-reflection.ts
+  - server/lib/agent/tools/exit-plan-reflection.ts
   - server/lib/boolean-override.ts
   - server/services/reflection-broadcast.ts
   - server/services/pending-permission-visibility.ts
