@@ -3,6 +3,19 @@ id: git
 title: 代码仓库
 summary: git 服务、状态与暂存、会话 worktree、分支与引用查询。
 anchors: []
+keywords:
+  - git
+  - 工作区
+  - /api/narrators/:id/git
+  - gitService
+  - git status
+  - git worktree
+  - 提交
+  - 分支
+  - 暂存
+  - 变更列表
+  - GitPanel
+  - Git 面板
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -15,7 +28,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - [分支与引用查询](refs.md)是一组共享的只读引用函数和身份解析，被 `gitService` 与 worktree 服务共用，也决定提交署名。
 - [会话 worktree](worktrees.md)管理 linked worktree 的资源登记、创建与受保护的删除，删除前用引用查询判断是否会丢历史。
 
-共同约束：子进程都有超时和输出上限；服务端在不受信的检出里跑 git 时用 [外部进程加固](../security/hardening.md) 里的配置；不允许在 Worker 失败时回退到主线程。
+共同约束：子进程都有超时和输出上限；worktree 服务与团队 worktree 在不受信的检出里跑 git 时用 [外部进程加固](../security/hardening.md) 里的配置（暂存子进程自带一组 `-c` 覆盖，不用那份配置，见 [暂存与变更列表](staging.md)）；不允许在 Worker 失败时回退到主线程。
 
 ## 下面有什么
 

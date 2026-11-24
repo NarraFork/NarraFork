@@ -20,6 +20,22 @@ anchors:
   - server/services/narrator-git-summary.ts
   - shared/git-workspace-events.ts
   - shared/git-workspace.ts
+keywords:
+  - GIT_WORKSPACE_CHANGED
+  - GIT_WORKSPACE_ACCESS_CHECK_UNAVAILABLE
+  - git_workspace_subscribe
+  - git_workspace_snapshot
+  - git_workspace_changed
+  - git_workspace_refresh
+  - /api/narrators/:id/git/workspace
+  - /api/narrators/:id/git/summary
+  - /api/narrators/:id/git/modifications
+  - workspaceKey
+  - repositoryKey
+  - access_denied
+  - git:staging_lists_changed
+  - 改动归属
+  - file_attributions
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -39,10 +55,20 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 推送走叙述者 WebSocket 的 git 订阅（`git-workspace-ws.ts`）：每个订阅先过上面的授权；socket 发送缓冲超过 256KB 就关闭连接（1013）要求重连，不静默丢消息。
 - `git-management-service.ts`：`gitManagementService(target)` 本地返回 `gitService`、远程设备返回远程 git 服务；状态分页读取以授权后的 workspaceKey 为界，每页独立授权。
 
+- WebSocket 帧（`shared/git-workspace-events.ts`）：客户端发 `git_workspace_subscribe`/`git_workspace_unsubscribe`/`git_workspace_refresh`；服务端回 `git_workspace_subscribed`、`git_workspace_snapshot`、`git_workspace_changed`、`git_workspace_staging_observation`、`git_workspace_staging_lists_changed`、`git_workspace_error`。视图分 summary 与 details，只有 details 才带文件列表与逐文件行统计。
+- 叙述者头部的 Git 摘要走 `GET /:id/git/summary`（`narrator-git-summary.ts:getNarratorGitSummary`）：只做授权后的发现（15 秒上限），不扫状态与 diff；拒绝时返回 `access_denied` 的占位工作区，其他异常返回 null 让前端重试；若发现期间 `workspaceRevision` 已变则返回 null，避免用新事实标注旧详情。
+- 前端 `lib/git-workspace-subscription.ts:GitWorkspaceSubscriptions`：每个 QueryClient 一个观察者，同一工作区的事实共享、授权不共享；授权状态 waiting/authorized/paused/refresh_required/denied/workspace_changed；事实缓存键由 `gitFactKey`/`gitSnapshotKey` 生成，summary 与 details 分开；`lib/api/git.ts` 是 HTTP 客户端与 `gitTargetKey`。
+
 ## 从哪读起
 - `git-workspace.ts:resolveNarratorGitTarget`；`git-workspace-access.ts:authorizeGitTargetWithinBudget`。
 - `git-workspace-watch.ts:GitWorkspaceWatchPool.tick`、`probeGitWatch`。
 - `git-workspace-attribution.ts:collectGitAttributionScopes`。
+
+## 改它时
+- 加一个读取 git 状态的新接口或订阅：必须经 `git-workspace-access.ts:authorizeGitTargetForPrincipal`（内部带预算的 `authorizeGitTargetWithinBudget` 未导出），不得信任客户端路径，写操作还要查 `capabilities.write`；新增路径策略改 `git-workspace-path-policy.ts`（整树操作不能跳过被禁子目录）。测试 `git-workspace.test.ts`、`git-workspace-metadata-access.test.ts`、`git-workspace-access-scan.test.ts`。
+- 加一种指纹类别或推送字段：`shared/git-workspace-events.ts` 的类型、`git-workspace-watch.ts` 的探测与 `git-workspace-ws.ts` 的发送、前端 `git-workspace-subscription.ts` 的处理要一起改；测试 `git-workspace-watch.test.ts`、`git-workspace-watch-local.test.ts`、`git-workspace-watch-integration.test.ts`。
+- 改归属视图：`git-workspace-attribution.ts` 的候选与范围上限，被读者读不了的叙述者必须脱敏而不是丢弃（`git-workspace-attribution.test.ts`）。
+- 不变量：访问检查超时按失败关闭（503）；WebSocket 缓冲超限就断开重连，不静默丢消息；`workspaceKey` 不一致报 409。
 
 ## 相关
 - [git 服务与状态](service-status.md)

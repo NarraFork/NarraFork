@@ -13,6 +13,26 @@ anchors:
   - frontend/lib/api/storage-transfer.ts
   - server/db/snapshot-builder-worker.ts
   - shared/export-turn-range.ts
+  - shared/storage-transfer.ts
+keywords:
+  - 导入导出
+  - 数据导入
+  - 数据导出
+  - 清空数据
+  - /api/storage/export
+  - /api/storage/import
+  - /api/storage/clear
+  - SNAPSHOT_TABLES
+  - applyImport
+  - copyTable
+  - clearData
+  - TransferSelection
+  - IMPORT_VERSION_TOO_NEW
+  - snapshot.db
+  - providers.json
+  - manifest.json
+  - MAX_IMPORT_BYTES
+  - 4 GB
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -29,13 +49,24 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 版本：manifest `version` 1=无密钥、3=带 sealed 密钥；高于导入端支持版本抛 `IMPORT_VERSION_TOO_NEW`（`assertVersion`）。供应商密钥不进 `providers.json`，用口令封进 `provider-keys.sealed.json`（`data-portability-keys.ts`）。
 - `clearData`（requests / sessions / providers / all）在一个事务内执行；清 sessions 要先断开 terminals、benchmark 结果等对会话的引用，并先删 team 三表（它们不导出）。清空前由路由校验当前用户密码（`storage-transfer.ts` 的 `/clear`）。
 - 不导出的会话附属表：`outline_spec_imports`、`outline_spec_loss_*`、team 三表；导入后 `reconcileImportedTeamTraits` 按本机有无 team 行修正 `team` trait。
+- 导入大小上限 `MAX_IMPORT_BYTES`=4GB（预览与执行都按它流式累计校验），快照解压后上限 `MAX_SNAPSHOT_UNCOMPRESSED_BYTES`=16GB，常量在 `shared/storage-transfer.ts`；前端用同一常量本地预检。
+- 路由全部 `requireAdmin`（导出含供应商时 `GET` 直接拒绝 `STEP_UP_REQUIRED`，要走 `POST` 带 `stepUpToken` 和封存口令）：`GET/POST /api/storage/export`、`POST /export/ticket`、`POST /import/preview`、`POST /import`、`POST /clear`；票据下载 `GET /api/storage/export/download` 不走 `requireAdmin`（凭票据）。
 - 无 File System Access API 的浏览器走短期导出票据：2 分钟 TTL、一次有效、最多 32 张（`EXPORT_TICKET_TTL_MS`、`consumeExportTicket`）。
 
 ## 从哪读起
 - `server/services/data-portability.ts`：导出、预览、`applyImport`、`clearData`。
 - `server/db/snapshot-protocol.ts`：`SNAPSHOT_TABLES`。
 - `server/routes/storage-transfer.ts`：admin 路由 export / import / clear。
+- `frontend/components/settings/DataPortabilityCard.tsx`（设置·存储页的导出/导入/清空 UI：导入先预检再选覆盖/跳过，清空要输入密码）与 `frontend/lib/api/storage-transfer.ts`。
+- `server/db/snapshot-builder-worker.ts`：快照子进程入口，只读打开主库、不复制索引与触发器（避免导入时重复写 FTS）。
 - 改 schema 后跑 `bun test --isolate server/services/__tests__/data-portability*.test.ts`。
+
+## 改它时
+- 新增需要迁移的表：加进 `snapshot-protocol.ts:SNAPSHOT_TABLES`，并在 `applyImport` 补 `copyTable`；要清空的在 `clearData` 处理；子进程 `snapshot-builder-worker.ts` 按 `SNAPSHOT_TABLES` 复制，不用另改。
+- 新增 NOT NULL 且无默认值的列：旧快照缺列，导入会失败；给默认值或拒绝旧版本（`copyTable` 只拷两库列交集）。
+- 会拦你的测试：`server/services/__tests__/data-portability*.test.ts`（含 teams / spec-import / staging / keys / prefix 等分支）、`server/db/snapshot-build.test.ts`（断言子进程把 `SNAPSHOT_TABLES` 里每张表的行都拷进快照；`data-portability.test.ts` 还断言 `workspaces` 不在 sessions 里、`folder_git_identity_bindings` 在）。
+- 改导入体积上限只改 `shared/storage-transfer.ts`：前端预检、`data-portability.ts` 流式累计、`server/main.ts` 的 `maxRequestBodySize` 读同一个常量；其它请求仍按 `MAX_ORDINARY_BODY_BYTES`（128MB）在 `http-dispatcher.ts` 被拒。
+- 不能破：快照构建留在子进程（只读源库）；不为导出/导入加主线程回退。
 
 ## 相关
 - [表结构与 Drizzle](schema.md)

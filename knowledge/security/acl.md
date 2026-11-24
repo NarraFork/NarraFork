@@ -17,6 +17,22 @@ anchors:
   - server/lib/narrator-audiences.ts
   - server/lib/project-access.ts
   - server/routes/admin.ts
+keywords:
+  - acl_grants
+  - acl_events
+  - 共享设置
+  - 可见性
+  - 写受众
+  - visibility
+  - writeAudience
+  - narrator_access_changed
+  - /api/narrators/:id/grants
+  - /api/narrators/:id/visibility
+  - /api/narrators/:id/write-audience
+  - /api/narrators/:id/transfer-owner
+  - agent.defaultNarratorVisibility
+  - agent.defaultNarratorWriteAudience
+  - terminalAccessAllowed
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -38,6 +54,9 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 只有 owner 和管理员能改共享（`canManageNarratorAcl`）：write 授权不含再分享权。每次改动后通知客户端并断开已失去权限的 WebSocket 订阅（`narrator-sharing.ts` 文件头 `announceAccessChange`）。
 - 列表过滤下推到 SQL（`narratorReadableWhere`/`narratorReadableSqlFragment`），不在取出的页上过滤，以保持 `LIMIT n+1` 与总数正确。
 - 授权变更审计只写 id、布尔、角色名和计数，不写标题与内容；写入失败只记日志、不使被审计操作失败，并在事务提交之后调用（`acl/acl-audit.ts`）。
+- 路由层桥接：`lib/narrator-access.ts`（`requireNarratorAccess`、`getAuthorizedNarrator` 等）与 `lib/project-access.ts`（`requireProjectAccess`）把 Hono 上下文转成主体再调 ACL，新端点用它们表达「需要 read/write」，不要自己拼主体。
+- 创建时的受众解析（`lib/narrator-audiences.ts:resolveNarratorAudiences`）：显式值优先；`agent.defaultNarratorVisibility`/`defaultNarratorWriteAudience` 为 `auto` 时，从项目页打开的会话取 project，其余取 private，写受众取该可见性允许的最宽值；只有全局写默认会被收窄，显式的越界组合报校验错。`narrator-service.ts` 创建根叙述者时传入的项目页参数为 null。
+- 前端：`useNarratorAccess`/`useProjectAccess` 读 `/access` 并按 WebSocket 帧 `narrator_access_changed` 失效（该帧按用户而非按订阅广播，不带授权细节，收到只能重读，同时刷新叙述者列表）。
 - 单主体与批量判断共用 `readVerdict`/`writeVerdict`，有一致性测试 `services/__tests__/narrator-acl-batch-parity.test.ts`。
 - 终端权限（`services/terminal-access.ts`）：叙述者的终端跟随该叙述者 ACL，子代理用其根叙述者；`read` 只看元数据，`write` 覆盖开启、看输出和滚动缓冲、输入、改名、关闭、读进程列表，因为终端等同于在会话工作区的 shell。
 - 无叙述者的独立终端只属于创建者加管理员；创建者只记在内存里（上限 1000 条，超出丢最旧），重启后只有管理员可用。未知 id 与被拒绝给同样答案，防止探测 id。
@@ -48,6 +67,15 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - `server/services/narrator-acl.ts:canReadNarrator`、`canWriteNarrator`。
 - `server/services/narrator-sharing.ts`：可见性、受众、授权、转让 owner。
 - `server/services/terminal-access.ts:terminalAccessAllowed`：终端访问判断。
+- `server/routes/narrators.ts`（`/:id/access`、`/visibility`、`/write-audience`、`/grants`、`/transfer-owner`）与 `routes/projects.ts`（`/:id/access`、`/visibility`、`/transfer-owner`）：共享设置的 HTTP 入口。
+- `server/routes/admin.ts`：删除用户时调 `purgeNarratorGrantsForUser` 清掉其叙述者授权。
+
+## 改它时
+- 加一种授权范围或能力：改 `acl/acl-scope.ts`/`acl-core.ts` 的枚举，审计类型进 `acl/acl-audit.ts:ACL_EVENT_TYPES`；`acl_grants`/`acl_events` 是表，改结构走 schema 与迁移；这两张表目前不在 `db/snapshot-protocol.ts:SNAPSHOT_TABLES` 里（导入导出不带授权）。
+- 改叙述者读/写规则只动 `readVerdict`/`writeVerdict`，让单主体与 SQL 批量路径共用；会失败的测试：`services/__tests__/narrator-acl-batch-parity.test.ts`、`narrator-acl.test.ts`、`narrator-access-nesting.test.ts`、`project-acl.test.ts`。
+- 新增改共享的入口：要经 `narrator-sharing.ts`（写审计、`announceAccessChange`、断开失权订阅），否则客户端不会刷新；改 `visibility` 要保持 `writeAudience` 嵌套合法（`WRITE_AUDIENCE_BY_VISIBILITY`）。
+- 不变量：未知情形无权限；没有 deny 规则；项目门必要不充分；列表过滤在 SQL 侧做。
+- 终端新增入口必须调 `terminalAccessAllowed`，REST 与 WebSocket 两处都要有。
 
 ## 相关
 - [登录与会话令牌](auth/index.md)

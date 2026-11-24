@@ -3,6 +3,22 @@ id: security
 title: 权限与安全
 summary: 谁能做什么：工具调用审批、访问控制、登录、开放接口、外部进程加固。
 anchors: []
+keywords:
+  - 权限
+  - 安全
+  - 鉴权
+  - 认证
+  - 授权
+  - requireAuth
+  - requireAdmin
+  - requireSessionAuth
+  - bypassPermissions
+  - readOnly
+  - dontAsk
+  - 会话令牌
+  - OAuth
+  - ACL
+  - safeSpawn
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

@@ -18,6 +18,25 @@ anchors:
   - frontend/routes/settings/search.tsx
   - server/lib/sql-like.ts
   - server/lib/validators/search.ts
+keywords:
+  - 搜索
+  - 全局搜索
+  - /api/search
+  - /search
+  - /api/narrators/:id/search
+  - SearchStore
+  - narrators_fts
+  - narrator_blocks_fts
+  - knowledge_entries_fts
+  - trigram
+  - pg_trgm
+  - FTS5
+  - ensureFts
+  - SEARCH_QUERY_BUSY
+  - SEARCH_QUERY_TIMEOUT
+  - NARRAFORK_FTS_FULL_REBUILD
+  - SEARCH_INCLUDES
+  - Recall
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -41,12 +60,24 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
   - worker 其他故障：503 `SEARCH_QUERY_UNAVAILABLE`。
 - 后端按主数据库选择；没有注册实现会抛错而不是回退 SQLite（`search/backend.ts`）。PG 的影子表与触发器由 `pg-fts.ts:ensurePgFts` 幂等创建，漂移可用 `probePgFtsDrift` / `repairPgFts` 检测修复。
 - 系统内部叙述者（`hidden_from_lists`、modeltrace）不参与搜索（`search/scope.ts`）。
+- 同一个端口还服务 Agent 的 Recall 工具（`port.ts:searchRecallMessages`，端口注释称它不做查看者闸门，因为 Recall 以叙述者身份运行）；`search/recall-store.ts` / `recall-reader.ts` 是它的读实现，不属于全局搜索页。
+- 前端：全局搜索页 `/search`（`frontend/routes/search.tsx`）有 `all` 与分段标签，概览每段 5 条、分段页每页 20 条（`hooks/useSearch.ts`）；`include` 可选 `subagents/system/tools/archived`，排序 `relevance`（默认）或 `time`（`lib/search-utils.tsx`）；⌘K / Ctrl+K 与侧栏入口经 `lib/search-page-focus.ts` 聚焦搜索框。
+- 单个会话内搜索走 `GET /api/narrators/:id/search`（`hooks/useNarratorMessageSearch.ts`，300ms 防抖，至少 2 字符才发请求）。
 
 ## 从哪读起
 - `server/routes/search.ts`：`GET /api/search`（分段 sessions/knowledge，分页或 cursor）与 `/sessions/:narratorId/hits`；`limit` 上限分别 100 / 50（`validators/search.ts`）。
 - `server/services/search-service.ts`：产品层搜索逻辑与排序。
 - `server/services/search/port.ts`：端口；`sqlite-store.ts` / `postgres-store.ts` 两个实现。
 - `server/db/fts.ts`：建表、触发器、重建。
+- `frontend/routes/search.tsx`、`frontend/components/search/`：搜索页与结果卡片；`frontend/hooks/useSearch.ts`：分段查询。
+- `server/lib/validators/search.ts`：查询参数 schema。
+
+## 改它时
+- 加一个可搜索的实体（新 FTS 表）：`fts.ts` 的建表与触发器 + `FTS_INDEX_TABLES`，PG 侧同步 `pg-fts.ts` 的影子表；`search/port.ts` 加方法后，`sqlite-store.ts` 与 `postgres-store.ts` 两边都要实现。
+- `search/__tests__/search-backend-contract.test.ts` 会拦：端口方法没有生产调用点、业务层出现 FTS5 查询文本、业务层直接引入 `bun:sqlite`、端口方法不返回 Promise、默认后端不是 SQLite、postgres 后端在客户端未绑定时没有 fail-closed。
+- 新增 SQLite 专有 SQL 要登记到 `server/db/sqlite-dialect-inventory.guard.test.ts` 的 `DIALECT_INVENTORY`；FTS 行为分别由 `server/db/fts*.test.ts`、`db/__tests__/pg-fts.test.ts`、`search/sqlite-worker-runner.test.ts` 覆盖。
+- 改请求参数：`server/lib/validators/search.ts`（`limit` 上限、`include`、`sections`）与前端 `frontend/lib/search-utils.tsx`、`hooks/useSearch.ts` 的常量/参数要一起看；错误码变化要同步前端展示。
+- 不能破：端口方法全是异步且在 worker 里执行、权限闸门在查询内部、搜索路径不做同步全表扫描（CLAUDE.md 主线程规则）。
 
 ## 相关
 - [PostgreSQL 后端](postgres.md)

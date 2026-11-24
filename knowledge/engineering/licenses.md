@@ -10,6 +10,24 @@ anchors:
   - scripts/lib/build-materials.ts
   - frontend/routes/licenses.tsx
   - frontend/hooks/use-licenses.ts
+keywords:
+  - 第三方许可
+  - 开源许可
+  - 许可证
+  - /licenses
+  - /api/licenses
+  - licenses/extra
+  - entries.json
+  - embedded-licenses.ts
+  - buildLicenseManifestFromDisk
+  - renderLicenses
+  - bundled
+  - distributedVia
+  - textFile
+  - noticeFile
+  - remote-peer-LICENSES.txt
+  - bun.txt
+  - useLicenses
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -29,6 +47,13 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - `server/lib/licenses/types.ts`：`LicenseEntryKind`、问题严重度。
 - `licenses/extra/entries.json`：手工声明的样例。
 - `frontend/routes/licenses.tsx`：展示页。
+- `frontend/hooks/use-licenses.ts`：`useLicenses`（摘要列表）与 `useLicenseText`（按 id 取许可文本）。
+
+## 改它时
+- 新增打进发行物但不在 `node_modules` 里的组件：`licenses/extra/` 放逐字许可文本 + `entries.json` 加条目（`textFile`、`distributedVia`，Bun 条目要 `versionSource: "bun-runtime"`）；`server/lib/licenses/__tests__/manifest-extra.test.ts` 会校验加载、分发方式、可取回文本、版本一致、「当前树无阻断问题」。
+- 升级 Bun：同步 `entries.json` 的版本与 `licenses/extra/bun.txt`；升级 remote-peer 的 Go 依赖：同步 `remote-peer-LICENSES.txt` 与 `entries.json`（`.github/workflows/remote-peer.yml` 会失败）。
+- 清单形状（`server/lib/licenses/types.ts`）变化要同时改前端 `frontend/hooks/use-licenses.ts` 与 `frontend/routes/licenses.tsx`；`GET /api/licenses` 保持公开且只返回摘要，许可文本留在 `/text/:id`。
+- 不能破：运行时依赖缺许可信息会让构建失败（`renderLicenses`）；编译产物不依赖 `node_modules`，清单走 `embedded-licenses.ts`。
 
 ## 相关
 - [构建与打包](build.md)：清单随二进制嵌入。

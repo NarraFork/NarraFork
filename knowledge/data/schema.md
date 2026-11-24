@@ -10,6 +10,22 @@ anchors:
   - server/db/connection.ts
   - server/lib/id.ts
   - server/db/type-level-claims.probe.ts
+keywords:
+  - schema.ts
+  - sqliteTable
+  - relations.ts
+  - generateId
+  - generateShortId
+  - nanoid
+  - ensureColumns
+  - openDatabase
+  - busy_timeout
+  - WAL
+  - foreign_keys
+  - postgres-schema.ts
+  - tablesFilter
+  - db 句柄
+  - bun:sqlite
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -25,6 +41,7 @@ SQLite 表结构的唯一来源是 `server/db/schema.ts`（Drizzle `sqliteTable`
 - 改 schema 必须同步 `data-portability`（`SNAPSHOT_TABLES` / `copyTable` / `clearData`），见 [数据导入导出](portability.md)。
 - PG 的 `server/db/postgres-schema.ts` 是由 `scripts/generate-postgres-schema.ts` 从本文件转译出的生成物，文件头写明不可手改；`scripts/check-postgres-schema-parity.ts` 检查两边一致。
 - 迁移文件不手写，流程见 [迁移](migrations.md)。
+- `type-level-claims.probe.ts` 是一份纯类型层面的反例（异步回调能通过 `=> T` / `=> void` 的包装签名），配合 `transaction-atomicity-contract.test.ts` 说明类型系统挡不住事务回调里的 async，该约束靠 `transaction-atomicity-contract.test.ts` 守。
 
 ## 加一个字段的步骤
 1. 改 `server/db/schema.ts`（SQLite 是唯一来源，见上文；关系变化再改 `relations.ts`）。不要手改 `drizzle/`，见 [迁移](migrations.md)。
@@ -40,6 +57,15 @@ SQLite 表结构的唯一来源是 `server/db/schema.ts`（Drizzle `sqliteTable`
 - `server/db/schema.ts`：全部表。文件头注释列了改 schema 时的导入导出检查项。
 - `server/db/relations.ts`：Drizzle relations（只覆盖部分表）。
 - `server/db/index.ts`：启动序列与后端选择（SQLite 或 PG）。
+- `server/db/connection.ts`、`ensure-columns.ts`：连接参数与补列。
+
+## 改它时
+- 加表或加列：只改 `schema.ts`，其余按上面「加一个字段的步骤」；迁移文件、`postgres-schema.ts` 都是生成物，不手改。
+- 加表还要同步导入导出：`SNAPSHOT_TABLES`、`applyImport` 的 `copyTable`、`clearData`（`data-portability.test.ts` 等会拦住缺漏的一部分，不是全部）。
+- `server/db/__tests__/sqlite-backend-baseline.test.ts` 要求 schema 模块导出的表都是 SQLite 方言、迁移 journal 的 dialect 是 sqlite；schema 里混进别的方言的表定义会失败。
+- 新写 SQLite 专有 SQL（`json_extract`、`MATCH`、`INSERT OR REPLACE`、PRAGMA 等）时，`server/db/sqlite-dialect-inventory.guard.test.ts` 会报出未登记的文件和能力；要么移植，要么在其 `DIALECT_INVENTORY` 登记。
+- `tests/sqlite-template.ts:sqliteTemplateKey` 对 `drizzle/*.sql`、journal 和 `server/db/`、`server/db/backend/` 下非测试 `.ts` 取哈希来缓存测试库模板：改这些文件会自动重建模板，不需要手动清理。
+- 不能破：SQLite 事务回调必须同步——`bun:sqlite` 的 `transaction(fn)` 在 `fn` 返回（即第一个 `await`）时就提交，async 回调会让后续写入落在事务外（`transaction-atomicity-contract.test.ts` 的契约，类型检查拦不住，见上）；`openDatabase` 的 `busy_timeout=250`（见 CLAUDE.md 主线程规则），以及测试进程拒绝打开真实 `~/.narrafork` 库。
 
 ## 相关
 - [迁移](migrations.md)

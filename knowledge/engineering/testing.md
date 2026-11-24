@@ -9,6 +9,25 @@ anchors:
   - scripts/run-ci-tests.ts
   - .github/workflows/ci.yml
   - tests/scripts/ci-workflow.test.ts
+keywords:
+  - bun test
+  - --isolate
+  - test:fast
+  - bunfig.toml
+  - preload.ts
+  - NARRAFORK_TEST
+  - NF_TEST_CHROMIUM_PATH
+  - run-ci-tests
+  - test-timings.json
+  - shard
+  - CI Gate
+  - junit
+  - puppeteer-core
+  - *.browser.test.ts
+  - *.guard.test.ts
+  - sqlite-template
+  - narrafork-test-
+  - HTMLElement.prototype
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -30,6 +49,13 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - `scripts/run-ci-tests.ts`：CI 如何调用 bun test、输出/超时上限（30 分钟、64MB）。
 - `tests/scripts/ci-workflow.test.ts`：CI 契约。
 - `docs/TESTING.md`：补充背景（仅线索，以代码为准）。
+
+## 改它时
+- 移动或改名被守卫测试用 `readFileSync` / 目录枚举引用的源文件后，必须全仓搜索旧路径字符串：类型检查和构建都不会报错，只有对应 `*.guard.test.ts` 失败。
+- 改 CI 工作流（作业、权限、动作 pin、分片、Chrome 版本、步骤顺序）要同步 `tests/scripts/ci-workflow.test.ts`，它按字符串/结构断言这些；CI 的测试命令参数只允许 `run-ci-tests.ts:buildNativeTestCommand` 认的那一组，加 `--timeout`、重试或改 reporter 路径会被 `ci-workflow.test.ts` / `run-ci-tests` 相关测试拒绝。
+- 改测试环境隔离（HOME、`NARRAFORK_HOME`、settings 快照恢复）动 `tests/preload.ts`，由 `tests/preload-isolation.test.ts` 校验；改库结构时测试库模板会按 `tests/sqlite-template.ts:sqliteTemplateKey` 自动失效重建。
+- 新增浏览器测试：文件名 `*.browser.test.ts(x)` + `*.browser-fixture.tsx`，需要 `NF_TEST_CHROMIUM_PATH` 指向 Chrome，没有则 `beforeAll` 抛错。
+- 本地只跑与改动相关的文件并带 `--isolate`，不要本地跑全量（CLAUDE.md）；全量以 CI 为准。
 
 ## 相关
 - [开发命令与代码规范](commands-style.md)

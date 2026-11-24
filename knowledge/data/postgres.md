@@ -14,6 +14,23 @@ anchors:
   - server/db/pg-errors.ts
   - server/db/pg-retry.ts
   - server/db/postgres-schema.ts
+keywords:
+  - PostgreSQL
+  - Postgres
+  - PG
+  - NF_DATABASE_BACKEND
+  - NF_DATABASE_URL
+  - DATABASE_URL
+  - database.backend
+  - PostgresStartupError
+  - composePostgresStores
+  - pg_trgm
+  - withPgRetry
+  - classifyPgError
+  - SQLSTATE
+  - notApplicable
+  - DatabaseStorageUnsupportedError
+  - bun-sql
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -36,6 +53,14 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - `server/db/postgres-runtime.ts`：配置解析、启动、关闭。
 - `server/services/postgres-composition.ts`：哪些存储接了 PG。
 - `server/db/postgres-schema.ts`：生成物，勿手改。
+- `server/db/postgres-client.ts`：用 Bun 的 `SQL` + drizzle `bun-sql` 创建惰性连接的客户端（目前只支持 `driver: "bun-sql"`，URL 不能为空）；`server/db/backend/` 放后端无关的端口与能力声明（`capability.ts`、`maintenance-port.ts`、读写选择器）。
+
+## 改它时
+- 给某个存储加 PG 实现：在 `postgres-composition.ts:composePostgresStores` 里注入（缺口会在这一个函数里可见）；SQLite 句柄在 PG 下是访问即抛错的代理，新代码不要再直接 `import { sqlite }` 走老路径。
+- 改 PG 错误处理走 `pg-errors.ts:classifyPgError`（按 SQLSTATE，不看 message；Bun SQL 的 SQLSTATE 在 `errno` 字段）与 `pg-retry.ts:withPgRetry`；测试 `server/db/pg-errors.test.ts`、`pg-retry.test.ts`、`postgres-client.test.ts`、`postgres-runtime.test.ts`。
+- `server/db/__tests__/sqlite-backend-baseline.test.ts` 是防「第二种方言被悄悄启用」的绊线：默认必须是 SQLite，环境里的 `DATABASE_URL` 不能改变任何行为；`sqlite-dialect-inventory.guard.test.ts` 盘点 SQLite 专有用法，新用法要登记。
+- 新增 PG 迁移/schema 变更见 [迁移](migrations.md)、[表结构](schema.md)；`postgres-schema.ts` 是生成物。
+- 不能破：PG 模式启动失败即终止，不回退 SQLite；不返回「假零值」（统计、VACUUM 都明确拒绝）。
 
 ## 相关
 - [迁移](migrations.md)

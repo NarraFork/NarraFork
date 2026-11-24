@@ -9,6 +9,30 @@ anchors:
   - server/dev-all.ts
   - server/lib/dev-app-url.ts
   - .github/workflows/ci.yml
+keywords:
+  - bun run dev
+  - dev:all
+  - dev:cold
+  - dev:frontend
+  - bun run start
+  - start:dev
+  - typecheck
+  - bun run check
+  - check:tokens
+  - i18n:check
+  - biome.json
+  - tsgo
+  - bunx
+  - npx
+  - 路径别名
+  - @server
+  - @frontend
+  - @shared
+  - DEV_ALL_BACKEND_PORT
+  - VITE_PORT
+  - 7778
+  - 41221
+  - static-checks
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -29,6 +53,13 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - `package.json:scripts`：全部入口命令。
 - `server/dev-all.ts`：`--production`、`--frontend-dev`、`--cold`、`--runtime` 的组合与子进程管理。
 - `.github/workflows/ci.yml`：CI 实际执行的检查顺序。
+
+## 改它时
+- 新增 package.json 脚本：想让 CI 跑它，要改 `.github/workflows/ci.yml`，并同步 `tests/scripts/ci-workflow.test.ts`（它逐步断言 static-checks 含迁移资产检查、biome、check:tokens、i18n:check，类型检查在前端构建之后）。
+- 新增颜色：前端颜色字面量只能来自 `frontend/styles/tokens.css`（第三方色板另有登记的白名单模块），否则 `bun run check:tokens`（`scripts/check-style-tokens.ts`）失败；新增文案要 `en` 与 `zh-CN` 同时加，`bun run i18n:check`（`server/scripts/check-i18n.ts`）会拦。
+- 新增路径别名：`tsconfig.json`、`frontend/vite.config.ts` 都要配。
+- 改开发端口：`server/lib/dev-app-url.ts` 的常量与 `package.json` 的 `dev` 脚本（`PORT=7778`）是两处独立的写法，要一起改；`tests/server/lib/dev-app-url.test.ts` 守着前者。
+- 不能破：`bun run start` 跑的是冻结的本地运行时（`build-runtime.ts`），不是源码热重载；`start:dev` 才是源码后端 + Vite。
 
 ## 相关
 - [测试](testing.md)

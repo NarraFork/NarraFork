@@ -9,6 +9,24 @@ anchors:
   - server/http-dispatcher.ts
   - server/routes/settings.ts
   - tests/server/lib/vnet-relay.test.ts
+keywords:
+  - vnet
+  - 虚拟网络
+  - /ws/vnet
+  - /api/vnet/status
+  - VNetRelayHub
+  - VNetNode
+  - vnet.enabled
+  - vnet.relayToken
+  - vnet.allowAnonymousRelay
+  - vnet.maxPeersPerNetwork
+  - vnet.maxMessageBytes
+  - PEER_REPLACED
+  - VIRTUAL_IP_IN_USE
+  - NETWORK_FULL
+  - relay_packet
+  - punch_probe
+  - UDP 会合
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -30,6 +48,13 @@ vnet 让一组对端（peer）加入同一个"网络"，按虚拟 IP 互相发�
 - `server/lib/vnet/relay.ts`：hub 与消息处理。
 - `server/lib/vnet/udp-rendezvous.ts`：UDP 服务与签名。
 - `server/websocket/vnet-ws.ts`：连接集合与关闭。
+- `server/routes/vnet.ts`：只有 `GET /api/vnet/status`（hub 统计 + UDP 会合状态），挂在 `/api/vnet`；`server/lib/vnet/index.ts` 统一导出。
+
+## 改它时
+- 加一种 relay 消息：`server/lib/vnet/protocol.ts`（类型与解析）、`relay.ts:handleClientMessage`、必要时 `types.ts`；密文规范相关改动在 `crypto.ts`（`canonicalJson` 参与 AAD，改它会让两端互不相认）。
+- 加设置项：`server/lib/settings/defaults.ts` 与 `types.ts` 的 `vnet.*`，并在 `routes/settings.ts` 里决定变更后是否需要关连接/重启 UDP 会合；`relayToken` 的读取脱敏逻辑也在那里。
+- 测试：`tests/server/lib/vnet-relay.test.ts`、`vnet-crypto.test.ts`、`vnet-protocol.test.ts`。没有 `*.guard.test.ts` 专门守这块。
+- 不能破：中继只转发密文、不解密；`/ws/vnet` 在 `vnet.enabled` 为假时必须拒绝升级；匿名放行只能由 `allowAnonymousRelay` 显式打开。
 
 ## 相关
 - [远程访问](remote-access.md)

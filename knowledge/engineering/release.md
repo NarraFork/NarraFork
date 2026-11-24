@@ -36,7 +36,6 @@ anchors:
   - server/services/github-release-patch-apply.ts
   - server/services/github-release-patch-planner.ts
   - server/services/update-mirror-client.ts
-  - shared/helper-distribution.ts
   - shared/independent-update-mirror.ts
   - shared/mirror-relay.ts
   - shared/release-patch.ts
@@ -46,6 +45,38 @@ anchors:
   - shared/update-server-child-env.ts
   - shared/update-settings.ts
   - shared/webdav-transport.ts
+keywords:
+  - release.ts
+  - scripts/release.ts
+  - 发布
+  - 更新
+  - 检查更新
+  - 更新源
+  - update-server
+  - --target=github
+  - --include-full
+  - --preview
+  - --dry-run
+  - --overwrite-release
+  - changelogs/
+  - release.yml
+  - workflow_dispatch
+  - Release Gate
+  - stable
+  - update-index-v1.json
+  - narrafork-updates
+  - zstd
+  - 补丁
+  - /api/update
+  - /api/v2/products
+  - /api/v3/products
+  - UPDATE_SOURCE_CHANGED
+  - settings.update.source
+  - settings.update.channel
+  - UpdateBadge
+  - UpdateModal
+  - /changelog
+  - embedded-changelog.ts
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -60,12 +91,24 @@ GitHub Release 是发布的权威来源；更新服务器（`update-server/`）�
 - changelog 在构建时被嵌入（`scripts/lib/build-materials.ts:renderChangelogs` 生成 `server/generated/embedded-changelog.ts`，缺 `version`/`date`/`en` 或解析失败的文件被静默跳过，按版本倒序）；`/changelog` 页展示它。
 - 补丁：更新用 zstd 差分补丁（`server/lib/zstd-patch.ts`，`vendor/zstd`）。`scripts/lib/stable-baseline-patch.ts` 为某版本成为稳定版时，额外生成以“上一个稳定版”为基线的补丁，免得稳定通道用户重放整条 beta 链。`release.ts` 明确声明补丁只由 GitHub Release CI 生成，镜像不生成。
 - 客户端更新源：`settings.update.source` 为 `github`（默认）或 `update-server`，`channel` 默认 `stable`；`update-service.ts:getCurrentUpdateSourceIdentity` 把当前来源固化成身份，下载/应用前用 `isUpdateSourceCurrent` 核对，来源中途变了就报 `UPDATE_SOURCE_CHANGED`。
+- 客户端 API `/api/update/*`（`server/routes/update.ts`）：`check`、`download`、`apply` 需管理员或本机 manager 令牌（`localPeerUpdateRoutes`）；`notes`、`version`、`cleanup`、`directory`、`status`、`cancel`、`shutdown` 需登录并管理员（`version` 仅需登录）。`apply` 会先排空运行中的 Bash/子代理再重启；`shutdown` 是不等排空的对应入口。
+- GitHub 源的数据面：客户端读仓库 `narrafork-updates` 分支上的 `update-index-v1.json`（上限 256KB、最多 32 个 Release，`shared/update-index-types.ts`），`github-release-patch-planner.ts` 规划补丁链（最多 16 步，`MAX_RELEASE_PATCH_STEPS`），`github-release-patch-apply.ts` 应用（总时限 15 分钟）；镜像源走 `update-mirror-client.ts`、`shared/independent-update-mirror.ts`、`mirror-relay.ts`、`webdav-transport.ts`。
+- 前端：`UpdateBadge` / `UpdateModal` / `VersionUpdateBanner` 展示更新；`useUpdateSchedule` 轮询已准备更新的状态；`lib/version-match.ts` 比较前后端构建版本（前端用短哈希、发布服务端二进制用完整 40 位提交，所以基础版本相同且提交哈希互为前缀就算匹配，一方缺提交哈希时只与同样缺的匹配）；`lib/version-refresh.ts` 对同一对版本每个标签页只自动刷新一次，避免陈旧代理造成刷新循环；设置页 `routes/settings/about.tsx` 与 `useUpdateSourcePrompt` 处理更新源。
 - 更新服务器（`update-server/index.ts`，Hono + Bun.serve，默认端口参数 `--port=7780`）：公开路由 `GET /api/v2/products/:product/releases/latest?channel=&platform=&version=`（`routes/check.ts`）、下载与补丁下载、`/api/v3/products` 镜像写入（`routes/mirror.ts`，需 `requireAuth` 令牌）、`/api/v2/tokens`、`/health`；存储是本地文件系统（`storage/local.ts`）。契约测试在 `tests/update-server-*.test.ts`。
 
 ## 从哪读起
 - `scripts/release.ts`：按 “Step 1…5” 注释读；CLI 参数校验在文件前 150 行。
 - `.github/workflows/release.yml` 与 `tests/scripts/release-ci-*.test.ts`、`release.test.ts`：发布契约。
 - `update-server/app.ts`：路由装配；`server/services/update-service.ts`：客户端。
+- 前端 `frontend/components/UpdateModal.tsx`、`hooks/useUpdateCheck.ts`、`lib/update-state.ts`（协调阶段 `idle/draining/draining_background_bash/quiescing_tools/restarting`）。
+
+## 改它时
+- 改发布物格式（更新索引、补丁命名、更新身份）：`shared/update-index.ts`、`update-index-types.ts`、`release-patch.ts`、`update-identity.ts` 同时约束 `scripts/`、`server/services/github-release-*.ts`、`update-mirror-client.ts` 与 `update-server/`，要一起改；测试 `shared/update-index.test.ts`、`release-patch.test.ts`、`update-identity.test.ts`、`tests/scripts/update-index.test.ts`、`tests/update-server-*.test.ts`（生产者/消费者契约）。
+- 新增目标平台或改资产命名：`github-release-update.ts:PLATFORM_SUFFIXES`、`update-service.ts:getPlatform()`、`build-cross-platform.ts:PLATFORMS` 三处 id 必须一致。
+- 改发布脚本或 `release.yml` 的作业：`tests/scripts/release.test.ts`、`release-ci-*.test.ts`、`release-ci-workflow.test.ts`、`main-release-dispatch.test.ts` 会拦；补丁生成只在 GitHub Release CI，不要让镜像脚本生成补丁。
+- 改客户端更新流程（下载/应用/来源切换）：`server/routes/update.ts`、`update-service.ts`、前端 `useUpdateCheck.ts` / `useUpdateSchedule.ts` / `lib/update-state.ts`；测试 `server/services/__tests__/update-*.test.ts`、`github-release-*.test.ts`、`frontend/hooks/useUpdateCheck.test.ts`、`useUpdateSchedule.test.ts`、`lib/update-state.test.ts`。
+- 新增 changelog：`changelogs/v<version>.json` 必须有 `version`、`date`、`en`，缺字段的文件在构建时被静默跳过；不要靠提交说明补，发布提交只允许含 `package.json` 与该 changelog。
+- 不能破：已发布 Release 身份不可变（不覆盖，只发新版）；下载/应用前核对更新来源身份，来源变了报 `UPDATE_SOURCE_CHANGED`。
 
 ## 相关
 - [构建与打包](build.md)

@@ -25,6 +25,30 @@ anchors:
   - server/lib/webauthn-rp.ts
   - server/lib/webauthn.ts
   - shared/identity-providers.ts
+keywords:
+  - /api/auth/login
+  - /api/auth/register
+  - /api/auth/mfa/verify
+  - /api/auth/step-up
+  - /api/auth/passkey/login/options
+  - /api/admin/auth-config
+  - /api/admin/registration-codes
+  - mfaToken
+  - mfaRequired
+  - LDAP_UNAVAILABLE
+  - LDAP_ADMIN_LINK_REFUSED
+  - LDAP_ACCOUNT_REQUIRED
+  - CODE_INVALID
+  - WEBAUTHN_NO_RP
+  - auth.registrationOpen
+  - auth.webauthn
+  - sso_code
+  - 邀请码
+  - 通行密钥
+  - 备份码
+  - 两步验证
+  - webauthn_challenges
+  - user_identities
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -45,9 +69,23 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 邀请码（`registration-code-service.ts`、`registration/invitation-rules.ts`）：`nfrc_` 加 24 位随机，库里存 SHA-256；默认 7 天过期，可绑定用户名与角色，由管理员接口创建/吊销；校验失败顺序为已吊销、已使用、已过期、用户名不符，查无此码与格式错误同为 `CODE_INVALID`。
 - Step-up（`step-up-service.ts`）：导出凭据与含提供商的数据导出前，需再次验证密码（先试本地，不通过再试 LDAP 绑定身份）加第二因子，得到 5 分钟、单次、绑定用户/会话/用途的内存授权 `nfsu_…`，用途 `credentials.export`、`storage.export.providers`；失败共用 MFA 限流桶，无任何因子的账号不能 step up。
 
+- WebAuthn 的 RP 由请求的 `Origin` 头推出（`lib/webauthn-rp.ts:resolveRp`）：`settings.auth.webauthn` 的 `rpID`/`origins` 优先，验证时接受配置的源加当前请求源；既无 Origin 又无配置源报 `WEBAUTHN_NO_ORIGIN`，无法定 rpID 报 `WEBAUTHN_NO_RP`（均 400）。
+- OIDC 发现文档与 JWKS 按 issuer 缓存（`lib/oidc.ts:discover`），授权 URL 带 state、nonce、PKCE，id_token 经 JWKS 验签（`exchangeAndVerify`）。
+- 身份来源标识：LDAP 绑定的 `user_identities.provider` 以 `ldap:` 开头（`shared/identity-providers.ts`），前端据此不给解绑按钮，服务端也拒绝解绑，错误码 `LDAP_IDENTITY_MANAGED`（两处必须一致）。
+- 管理员配置：`GET/PATCH /api/admin/auth-config` 返回前经 `lib/auth-settings.ts:maskAuthSettings` 去掉 `jwtSecret`、遮蔽 OIDC `clientSecret` 与 LDAP `bindPassword`；写入时以 `*` 开头或为空的值视为「保持原值」（`isMaskedSecret`），所以不能把真实以 `*` 开头的密钥存进去。
+- 前端：`frontend/lib/api/auth.ts` 封装全部登录/MFA/Passkey/SSO/step-up 调用（含 `@simplewebauthn/browser`）；`routes/login.tsx` 登录页；`routes/settings/security.tsx` 个人 TOTP、Passkey、绑定身份；`routes/settings/authentication.tsx` 管理员配 LDAP/OIDC/WebAuthn；`components/settings/RegistrationCodesSection.tsx` 邀请码管理；`StepUpFields.tsx` 导出凭据时的密码加第二因子表单。
+
 ## 从哪读起
 - `server/lib/auth.ts:loginUser`、`registerUser`；`server/routes/auth.ts`：全部 `/api/auth/*`。
 - 测试：`lib/__tests__/auth-attempt-limiter.test.ts`、`register-with-code.test.ts`，`services/__tests__/ldap-auth-service.test.ts`、`step-up-service.test.ts`
+
+## 改它时
+- 加一种登录方式：出口必须走 `buildSessionResult`，并决定是否经过 MFA 步骤（Passkey 无用户名登录与 SSO 直接发会话）；新增的失败路径要计入 `auth-attempt-limiter` 的桶，否则暴力尝试不受限。
+- 改限流额度：`lib/auth-attempt-limiter.ts`，测试 `lib/__tests__/auth-attempt-limiter.test.ts`、`registration-attempt-limiter.test.ts`；改注册行为看 `register-with-code.test.ts`、`register-closes-registration.test.ts`。
+- 改 LDAP：`services/__tests__/ldap-auth-service.test.ts`、`routes/__tests__/auth-ldap-login.test.ts`、`admin-ldap-auth-config.test.ts`；账号归属规则不要放宽到「同名管理员自动绑定」。
+- 改 step-up 用途：用途字符串在后端 `step-up-service.ts` 与前端 `lib/api/auth.ts:StepUpPurpose` 各有一份，要一起改；测试 `step-up-service.test.ts`。
+- 改认证设置的字段：同步 `maskAuthSettings`（新增的密钥字段要遮蔽），测试 `lib/__tests__/auth-settings.test.ts`、`admin-auth-config-schema.test.ts`。
+- 新增面向用户的文案同时改 `frontend/locales/{en,zh-CN}/` 的 `common`/`settings` 命名空间。
 
 ## 相关
 - [会话令牌](sessions.md)

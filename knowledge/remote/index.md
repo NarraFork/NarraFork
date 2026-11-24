@@ -6,6 +6,18 @@ anchors:
   - server/services/device-service.ts
   - server/services/remote-access-runtime.ts
   - vscode-extension/
+keywords:
+  - 远程设备
+  - 远程执行
+  - 远程访问
+  - WebRTC
+  - VS Code
+  - remote-executor
+  - remote-peer
+  - /ws/device
+  - /ws/vnet
+  - narrafork-vscode
+  - rdev_
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

@@ -6,6 +6,23 @@ anchors:
   - package.json
   - scripts/
   - .github/workflows/
+keywords:
+  - package.json
+  - scripts/
+  - CI
+  - ci.yml
+  - release.yml
+  - bun test
+  - bun build --compile
+  - vite build
+  - biome
+  - tsgo
+  - GitHub Release
+  - update-server
+  - 发布
+  - 构建
+  - 测试
+  - 许可
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

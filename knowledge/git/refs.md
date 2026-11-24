@@ -18,6 +18,23 @@ anchors:
   - frontend/hooks/git-identity-query-keys.ts
   - frontend/hooks/useGitIdentities.ts
   - frontend/hooks/useGitIdentityVisibility.ts
+keywords:
+  - user_git_identities
+  - narrator_git_identity_bindings
+  - folder_git_identity_bindings
+  - /api/auth/git-identities
+  - /api/narrators/:id/git-identity
+  - /api/user-preferences/git-identity/folders/:folderId
+  - /api/narrators/:id/git/branches
+  - GIT_BRANCH_LIST_LIMIT
+  - resolveCommit
+  - aheadBehind
+  - mergeBase
+  - GIT_AUTHOR_NAME
+  - 提交身份
+  - 署名
+  - 分支列表
+  - git 身份
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -37,10 +54,19 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 工作树快照提交是 NarraFork 自己的记账，不使用用户身份，用固定的合成身份（`lib/git-identity.ts` 文件头）。
 - 对外接口：`/api/auth/git-identities` 增删改查（`routes/auth.ts`）；提交与暂存提交调用 `resolveUserGitIdentityEnv`（`routes/git.ts`）。
 
+- 身份入口的其他 HTTP 面：叙述者的选择 `GET/PUT /api/narrators/:id/git-identity`（`routes/narrators.ts`），侧栏文件夹的选择 `GET/PUT /api/user-preferences/git-identity/folders/:folderId`（`routes/user-preferences.ts`）；分支列表与切换是 `GET .../git/branches`、`POST .../git/checkout`（`routes/git.ts`）。
+- 前端：`GitBranchBar`（分支条：HEAD 位置、领先落后、推送/拉取）、`GitBranchModal`（切换/新建/检出远程分支）、`git-branch-list.ts`（按名称、上游、提交号搜索，行不可点的原因）；身份在设置里的管理是 `GitIdentitiesSection`，菜单入口是 `TabGitIdentityMenu`（叙述者标签）与 `FolderGitIdentityMenu`（侧栏文件夹），共用 `GitIdentityMenuList`；`hooks/useGitIdentities.ts` 只返回调用者自己的身份与选择，`git-identity-query-keys.ts` 让布局代码不必引入钩子就能失效缓存，`useGitIdentityVisibility.ts` 把「哪些界面显示身份入口」存进 `user_preferences`（跟账号走，不是浏览器）。
+
 ## 从哪读起
 - `server/services/git-ref-queries.ts`：全部查询函数，短小。
 - `server/lib/git-identity.ts:resolveGitIdentityForTurn`：署名决策。
 - 测试：`server/services/__tests__/git-branch-listing.test.ts`、`git-identities.test.ts`。
+
+## 改它时
+- 新增一个只读引用查询：加在 `git-ref-queries.ts`，参数先 `assertQueryRef`/`assertSha`，输出必须是常量大小，由调用方注入 runner；测试 `git-service-ref-queries.test.ts`、`git-service-branches.test.ts`。
+- 改分支列表字段：`shared/git-branches.ts` 的解析器是本地与远程后端共用的唯一入口，`for-each-ref` 的格式串与解析要一起改；测试 `git-branch-listing.test.ts`；前端 `git-branch-list.ts` 随之同步。
+- 改署名规则：只动 `lib/git-identity.ts:resolveGitIdentityForTurn`，不要让它回退到叙述者 owner 的身份（触发用户没配置就继承宿主配置）；测试 `git-identity.test.ts`、`git-identity-commit.test.ts`、`git-identity-folder-follow.test.ts`、`git-identities.test.ts`、`user-preferences-git-identity.test.ts`。
+- 新增身份字段：三张表的 schema、`git-identities.ts` 的长度校验（姓名 100、邮箱 254）与 `/api/auth/git-identities` 校验、前端设置表单一起改；写入后要使缓存失效。
 
 ## 相关
 - [git 服务与状态](service-status.md)

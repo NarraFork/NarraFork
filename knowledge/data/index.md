@@ -5,6 +5,21 @@ summary: 数据库表、迁移、两种数据库后端、全文搜索、导入�
 anchors:
   - drizzle/
   - drizzle-postgres/
+  - server/db/index.ts
+keywords:
+  - 数据库
+  - SQLite
+  - PostgreSQL
+  - drizzle
+  - bun:sqlite
+  - ~/.narrafork/narrafork.db
+  - schema.ts
+  - 迁移
+  - 全文搜索
+  - 导入导出
+  - 存储清理
+  - server/db/index.ts
+  - db 句柄
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---

@@ -14,6 +14,23 @@ anchors:
   - server/lib/auth-read-admission.ts
   - server/lib/client-ip.ts
   - server/lib/public-origin.ts
+keywords:
+  - auth_sessions
+  - token_version
+  - nfs_
+  - SESSION_REQUIRED
+  - TOKEN_EXPIRED
+  - TOKEN_INVALID
+  - ADMIN_REQUIRES_SESSION
+  - requireSessionAuth
+  - requireAdmin
+  - Authorization Bearer
+  - auth:changed
+  - 滑动续期
+  - 登出
+  - 吊销会话
+  - /api/auth/logout
+  - manager-token
 status: draft
 verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ---
@@ -33,10 +50,20 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 前端只在响应码属于 `TOKEN_EXPIRED`/`UNAUTHORIZED`/`SESSION_REQUIRED`（或无码的 401）时丢弃本地令牌，第二因子失败等 401 不会登出（`shared/session-auth.ts:isSessionInvalidResponse`）。
 - 会话与 MFA 存储有 SQLite 与 PostgreSQL 两套实现，经 `services/auth/store.ts` 一起选择：只有 `NF_WRITE_BACKEND=postgres` 且注入了 PG 适配器才用 PG，读写后端不一致启动即报错。契约测试在 `services/auth/__tests__/*-contract.test.ts`。
 
+- 认证读走 SQLite 短读池前的有界 FIFO 准入（`lib/auth-read-admission.ts`）：并发 2、排队最多 64、默认 30 秒总期限，超出排队上限抛 `DbReadTaskOverloadedError`；每个准入的调用方仍各自读库，不缓存、不共享结果。会话存储与认证读（`services/auth/sqlite-session-store.ts`、`sqlite-auth-read.ts`）经它读；WebSocket 复核（`websocket/session-revalidation.ts`）沿用同一组读选项（signal、deadline）。
+- 客户端 IP（`lib/client-ip.ts:resolveClientIp`）：只有直接对端在受信代理 CIDR 内才采信 `X-Forwarded-For`/`X-Real-IP`；转发链超过 20 跳、头超 2048 字符或含非法 IP 时回退为对端 IP；登录限流的 IP 桶用它。`lib/public-origin.ts` 同理，只在对端受信时采信转发头来还原浏览器实际访问的源（被设备、OAuth、MCP 等路由用来生成自引用 URL）。
+
 ## 从哪读起
 - `server/middleware/auth.ts:authenticateRequest`：一次请求的认证入口。
 - `server/lib/auth.ts`：令牌签发、校验、续期、吊销。
 - 测试：`middleware/__tests__/session-gate.integration.test.ts`、`auth-oauth-boundary.test.ts`
+
+## 改它时
+- 新增路由要选门：全局已有 `requireSessionAuth`（`app.ts` 挂在 `/api/*`）；要让 OAuth 令牌进入必须显式用 `requireAuth`/`requireExternalAuth`/`requireOAuthAuth`，管理员接口用 `requireAdmin`。守卫测试：`middleware/__tests__/session-gate.integration.test.ts`、`auth-oauth-boundary.test.ts`。
+- 改会话有效期或续期阈值：`shared/session-auth.ts` 与 `lib/auth.ts:slidExpiry` 要一起看；前端靠 `isSessionInvalidResponse` 判断何时清令牌，新增 401 错误码要想清楚是否该登出。
+- 改会话存储：SQLite、PostgreSQL 两个实现与 `services/auth/store.ts` 同步，契约测试 `services/auth/__tests__/session-store-contract.test.ts`、`mfa-store-contract.test.ts` 会拦。
+- 任何会改角色、吊销会话的操作要发 `auth:changed`，否则已建立的 WebSocket 不会复核。
+- 不变量：令牌库里只存哈希；角色取实时值；OAuth 主体过不了管理员判断。
 
 ## 相关
 - [登录方式与第二因子](login-methods.md)
