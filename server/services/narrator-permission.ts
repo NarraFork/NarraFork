@@ -2599,18 +2599,25 @@ export async function reflectPendingExitPlanMode(
 	if (pending.planReflectionRunning) {
 		return { status: "awaiting_user", reason: "Plan reflection is already running" };
 	}
-	if (opts.automatic && !(await currentPermissionModeAllowsAutomaticPlanReflection(pending))) {
-		return {
-			status: "unavailable",
-			reason: "Plan reflection is not enabled for this permission",
-		};
-	}
 
+	// Claimed BEFORE the first await: the automatic path's permission-mode check reads the DB, and
+	// a manual click or a repeated switch-on landing in that gap must see this review as running
+	// instead of starting a second one against the same request.
 	const abort = new AbortController();
 	pending.planReflectionRunning = true;
 	pending.planReflectionAbort = abort;
 	notifyHumanAttentionChanged();
 	try {
+		if (opts.automatic && !(await currentPermissionModeAllowsAutomaticPlanReflection(pending))) {
+			return {
+				status: "unavailable",
+				reason: "Plan reflection is not enabled for this permission",
+			};
+		}
+		if (abort.signal.aborted || !pendingPermissions.has(requestId)) {
+			// Decided while the permission-mode check ran: nothing is left to review.
+			return { status: "awaiting_user", reason: "Already resolved" };
+		}
 		// The card's own resolved input: the reviewer must read the plan the person is looking at.
 		const reviewed = await runner(pending.input, { signal: abort.signal });
 		if (!pendingPermissions.has(requestId)) {

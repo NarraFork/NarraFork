@@ -390,6 +390,37 @@ export async function takeOverExitPlanReflection(
 	return true;
 }
 
+/**
+ * Drop a gate whose wait ended elsewhere, WITHOUT persisting anything.
+ *
+ * For a review started against an ExitPlanMode permission that is ALREADY pending
+ * (`runPendingExitPlanReflection` in loop.ts): the tool-call row belongs to whoever ended that
+ * wait — the person's approve/deny, or the pass's own abort. Writing this gate's
+ * `cancelled`/`awaiting_user` status over the row would overwrite that decision (status, error,
+ * input and suggestions). Live clients still get a terminal frame so the review's progress clears.
+ */
+export function discardExitPlanReflection(requestId: string, reason: string): boolean {
+	const pending = pendingExitPlanReflections.get(requestId);
+	if (!pending || pending.resolved) return false;
+	pending.resolved = true;
+	pending.abortController?.abort(new Error(reason));
+	if (pendingExitPlanReflections.delete(requestId)) notifyHumanAttentionChanged();
+	void import("@server/services/reflection-broadcast")
+		.then(({ broadcastReflectionFrame }) => {
+			broadcastReflectionFrame(pending, {
+				type: "plan_reflection_resolved",
+				requestId: pending.requestId,
+				toolUseId: pending.toolUseId,
+				decision: "aborted",
+				reason,
+			});
+		})
+		.catch(() => {
+			// Broadcast is best-effort; the real permission's own resolution follows.
+		});
+	return true;
+}
+
 export function isExitPlanReflectionWaitingForUser(requestId: string): boolean {
 	return pendingExitPlanReflections.get(requestId)?.reflectionStoppedByUser === true;
 }

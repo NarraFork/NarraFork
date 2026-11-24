@@ -141,6 +141,7 @@ import {
 	cancelExitPlanReflection,
 	cleanupExitPlanReflection,
 	createExitPlanReflectionDecision,
+	discardExitPlanReflection,
 	EXIT_PLAN_CONFIRM_COMPACT_TOOL_NAME,
 	EXIT_PLAN_REFLECTION_TOOLS,
 	type ExitPlanReflectionDecision,
@@ -2169,7 +2170,9 @@ export async function resolveExitPlanModeReflection(
  *  - a review that cannot decide HANDS THE PLAN BACK (handover) instead of failing closed. The
  *    approver is already in front of the card, so a provider failure must never deny a plan they
  *    were about to read. `cancelExitPlanReflection` would additionally mark the row `fail` and
- *    drop the card from the pending list while the loop stays blocked.
+ *    drop the card from the pending list while the loop stays blocked;
+ *  - when the wait ends under the review (decided first, or the pass aborted), the gate is
+ *    discarded without persisting: the real row then belongs to whoever ended the wait.
  */
 async function runPendingExitPlanReflection(args: {
 	config: AgentConfig;
@@ -2197,12 +2200,16 @@ async function runPendingExitPlanReflection(args: {
 		toolCallId: toolCallId ?? undefined,
 		abortController: reflectionAbort,
 	});
-	const onPreparationAbort = () => {
+	// The wait this review answers can end under it: the person decides first (`args.signal`) or
+	// the pass is aborted. The real tool-call row then belongs to whoever ended the wait, so the
+	// gate is discarded WITHOUT persisting a status over that decision — unlike the pre-permission
+	// gate, which owns the row while it runs (`cancelExitPlanReflection` would write `fail`).
+	const onWaitEnded = () => {
+		discardExitPlanReflection(requestId, "Plan approval ended before the reflection finished");
 		reflectionAbort.abort(config.signal.reason);
-		void cancelExitPlanReflection(requestId, "Tool preparation cancelled");
 	};
-	if (config.signal.aborted) onPreparationAbort();
-	else config.signal.addEventListener("abort", onPreparationAbort, { once: true });
+	if (config.signal.aborted) onWaitEnded();
+	else config.signal.addEventListener("abort", onWaitEnded, { once: true });
 	await markExitPlanReflectionStarted(requestId);
 	let reflectionDone = false;
 	const reflectionPromise = runExitPlanModeReflectionLoop(
@@ -2248,7 +2255,7 @@ async function runPendingExitPlanReflection(args: {
 			logger.warn("Pending ExitPlanMode reflection loop cleanup failed", { err: String(err) });
 		});
 	}
-	config.signal.removeEventListener("abort", onPreparationAbort);
+	config.signal.removeEventListener("abort", onWaitEnded);
 	cleanupExitPlanReflection(requestId);
 	return { decision, input };
 }

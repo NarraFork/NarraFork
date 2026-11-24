@@ -4,11 +4,18 @@ import type { AgentConfig } from "../types";
 
 const realProviderModule = { ...(await import("../provider")) };
 const realPermissionModule = { ...(await import("@server/services/narrator-permission")) };
+const realReflectionBroadcastModule = {
+	...(await import("@server/services/reflection-broadcast")),
+};
 
 /** Plan input re-resolutions: the pending runner must review the input it was given. */
 let planInputResolutions = 0;
-let providerMode: "confirm" | "rejected-tool" = "confirm";
+let providerMode: "confirm" | "rejected-tool" | "hang" = "confirm";
 let chatCalls = 0;
+/** Plan reflection lifecycle frames, in order. */
+const reflectionFrames: Array<Record<string, unknown>> = [];
+/** Resolves once a hanging provider call has started. */
+let chatStarted: (() => void) | undefined;
 
 const provider: ProviderAdapter = {
 	formatTools: (tools) => tools,
@@ -20,6 +27,14 @@ const provider: ProviderAdapter = {
 		params.onRequestStart?.();
 		chatCalls += 1;
 		if (chatCalls > 2) throw new Error("Reflection exceeded its two-turn budget");
+		if (providerMode === "hang") {
+			chatStarted?.();
+			await new Promise<void>((resolve) => {
+				if (params.signal.aborted) resolve();
+				else params.signal.addEventListener("abort", () => resolve(), { once: true });
+			});
+			throw new Error("Reflection request aborted");
+		}
 		yield {
 			toolUses:
 				providerMode === "confirm"
@@ -65,6 +80,12 @@ mock.module("@server/services/narrator-permission", () => ({
 		return { ok: true, input: { plan: "a plan re-read from disk" }, resolvedFromFile: false };
 	},
 }));
+mock.module("@server/services/reflection-broadcast", () => ({
+	...realReflectionBroadcastModule,
+	broadcastReflectionFrame: (_route: unknown, frame: Record<string, unknown>) => {
+		reflectionFrames.push(frame);
+	},
+}));
 
 const { createPendingPlanReflectionRunner } = await import("../loop");
 const { getPendingPlanReflectionRunner, registerPendingPlanReflectionRunner } = await import(
@@ -74,6 +95,7 @@ const { getPendingPlanReflectionRunner, registerPendingPlanReflectionRunner } = 
 afterAll(() => {
 	mock.module("../provider", () => realProviderModule);
 	mock.module("@server/services/narrator-permission", () => realPermissionModule);
+	mock.module("@server/services/reflection-broadcast", () => realReflectionBroadcastModule);
 	mock.restore();
 });
 
@@ -81,6 +103,8 @@ beforeEach(() => {
 	planInputResolutions = 0;
 	providerMode = "confirm";
 	chatCalls = 0;
+	reflectionFrames.length = 0;
+	chatStarted = undefined;
 });
 
 function makeConfig(): AgentConfig {
@@ -146,5 +170,32 @@ describe("pending plan reflection runner", () => {
 		if (result.decision.action !== "human") throw new Error("Expected a handover decision");
 		expect(result.decision.reason).toContain("could not finish");
 		expect(planInputResolutions).toBe(0);
+	});
+
+	test("a wait decided under the review discards its gate instead of writing a cancellation", async () => {
+		providerMode = "hang";
+		const started = new Promise<void>((resolve) => {
+			chatStarted = resolve;
+		});
+		const decided = new AbortController();
+		const runner = createPendingPlanReflectionRunner(makeConfig(), [], toolUse);
+		const result = runner(
+			{ plan: "Add the regression test, then run it." },
+			{
+				signal: decided.signal,
+			},
+		);
+		await started;
+		decided.abort(new Error("Permission request decided"));
+		const outcome = await result;
+		// The person's own decision owns the row: no `cancelled` (deny) or `awaiting_user` status
+		// is written over it, and live clients only learn the review was dropped.
+		expect(outcome.decision.action).toBe("human");
+		const terminal = reflectionFrames.filter((frame) => frame.type !== "reflection_progress");
+		expect(terminal.map((frame) => frame.type)).toEqual([
+			"plan_reflection_started",
+			"plan_reflection_resolved",
+		]);
+		expect(terminal[1]?.decision).toBe("aborted");
 	});
 });

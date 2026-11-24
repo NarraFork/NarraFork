@@ -103,7 +103,7 @@ interface PendingFixture {
 	) => void;
 }
 
-function registerPending(overrides: { permissionMode?: string } = {}): PendingFixture {
+function registerPending(): PendingFixture {
 	const resolved: PermissionResult[] = [];
 	const controller = new AbortController();
 	let runner: (input: Record<string, unknown>) => Promise<PendingPlanReflectionGateResult> =
@@ -242,6 +242,32 @@ describe("reflecting on a pending plan approval", () => {
 		const blocked = await reflectPendingExitPlanMode(TOOL_CALL_ID, { automatic: true });
 		expect(blocked.status).toBe("unavailable");
 		expect(calls).toBe(0);
+		expect(isPendingPlanReflectionAvailable(TOOL_CALL_ID)).toBe(true);
+	});
+
+	test("a manual start during the automatic path's mode check does not run a second review", async () => {
+		const fixture = registerPending();
+		let calls = 0;
+		let release: (() => void) | undefined;
+		fixture.setRunner(async () => {
+			calls += 1;
+			await new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			return { decision: { action: "human", reason: "handed back" }, input: PLAN_INPUT };
+		});
+		// The automatic path awaits a DB read before its review; the click lands in that gap.
+		const automatic = reflectPendingExitPlanMode(TOOL_CALL_ID, { automatic: true });
+		expect(isPendingPlanReflectionAvailable(TOOL_CALL_ID)).toBe(false);
+		const manual = await reflectPendingExitPlanMode(TOOL_CALL_ID);
+		expect(manual).toEqual({
+			status: "awaiting_user",
+			reason: "Plan reflection is already running",
+		});
+		while (!release) await new Promise((resolve) => setTimeout(resolve, 0));
+		release();
+		expect(await automatic).toEqual({ status: "awaiting_user", reason: "handed back" });
+		expect(calls).toBe(1);
 		expect(isPendingPlanReflectionAvailable(TOOL_CALL_ID)).toBe(true);
 	});
 
