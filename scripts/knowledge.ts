@@ -14,27 +14,27 @@
  */
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join, posix, relative, sep } from "node:path";
+import {
+	anchorMatches,
+	anchorPath,
+	isNodeFile,
+	isSourceFile,
+	isTestOrGenerated,
+	KNOWLEDGE_DIR,
+	KNOWLEDGE_INDEX,
+	type KnowledgeNode,
+	parseNode,
+	SOURCE_ROOTS,
+	underSourceRoot,
+} from "../shared/knowledge-tree";
 
-export interface KnowledgeNode {
-	/** Path relative to the repository root. */
-	file: string;
-	id: string;
-	title: string;
-	summary: string;
-	status: string;
-	anchors: string[];
-	keywords: string[];
-	body: string;
-}
+// Header parsing, anchor matching and the source-file rules live in `shared/knowledge-tree.ts`,
+// shared with the server's `work.ready` check; re-exported for callers of this tool.
+export { anchorMatches, anchorPath, type KnowledgeNode, parseNode };
 
-const KNOWLEDGE_DIR = "knowledge";
 const STATUSES = new Set(["stub", "draft", "verified"]);
-const SOURCE_ROOTS = ["server", "frontend", "shared"];
-const SOURCE_FILE = /\.(ts|tsx|go)$/;
 /** An anchor matching more source files than this is too broad to locate or date anything. */
 export const BROAD_ANCHOR_FILES = 40;
-const NOT_SOURCE =
-	/(__tests__|\.test\.|\.browser\.|\.fixture\.|\/fixtures?\/|\.d\.ts$|routeTree\.gen\.ts$)/;
 
 // ── git ──────────────────────────────────────────────────────────────────────
 
@@ -48,49 +48,7 @@ function lines(s: string): string[] {
 	return s.split("\n").filter((l) => l.length > 0);
 }
 
-// ── parsing ──────────────────────────────────────────────────────────────────
-
-/** Parses the small YAML subset the headers use: `key: value`, `key: []`, `key:` + `  - item`. */
-export function parseNode(file: string, raw: string): KnowledgeNode | null {
-	// Checkouts with core.autocrlf have CRLF line endings.
-	const text = raw.replace(/\r\n/g, "\n");
-	const m = /^---\n([\s\S]*?)\n---\n/.exec(text);
-	if (!m) return null;
-	const fields: Record<string, string | string[]> = {};
-	let list: string[] | null = null;
-	for (const raw of m[1].split("\n")) {
-		const item = /^ {2}- (.*)$/.exec(raw);
-		if (item && list) {
-			list.push(item[1].replace(/\s+#.*$/, "").trim());
-			continue;
-		}
-		const kv = /^([a-z_]+):\s*(.*)$/.exec(raw);
-		if (!kv) continue;
-		const value = kv[2].replace(/\s+#.*$/, "").trim();
-		if (value === "") {
-			list = [];
-			fields[kv[1]] = list;
-		} else if (value === "[]") {
-			list = null;
-			fields[kv[1]] = [];
-		} else {
-			list = null;
-			fields[kv[1]] = value;
-		}
-	}
-	const str = (k: string) => (typeof fields[k] === "string" ? (fields[k] as string) : "");
-	const arr = (k: string) => (Array.isArray(fields[k]) ? (fields[k] as string[]) : []);
-	return {
-		file,
-		id: str("id"),
-		title: str("title"),
-		summary: str("summary"),
-		status: str("status"),
-		anchors: arr("anchors"),
-		keywords: arr("keywords"),
-		body: text.slice(m[0].length),
-	};
-}
+// ── loading ──────────────────────────────────────────────────────────────────
 
 function walk(dir: string, out: string[] = []): string[] {
 	for (const name of readdirSync(dir)) {
@@ -116,26 +74,12 @@ export function loadNodes(root: string, invalid: string[] = []): KnowledgeNode[]
 	const nodes: KnowledgeNode[] = [];
 	for (const abs of walk(dir).sort()) {
 		const file = repoPath(relative(root, abs));
-		if (file === `${KNOWLEDGE_DIR}/README.md`) continue;
+		if (!isNodeFile(file)) continue;
 		const node = parseNode(file, readFileSync(abs, "utf8"));
 		if (node) nodes.push(node);
 		else invalid.push(file);
 	}
 	return nodes;
-}
-
-// ── anchors ──────────────────────────────────────────────────────────────────
-
-/** An anchor is a file, a directory (trailing `/`) or a glob; `path#Symbol` narrows to a symbol. */
-export function anchorPath(anchor: string): string {
-	return anchor.replace(/#.*$/, "");
-}
-
-export function anchorMatches(anchor: string, path: string): boolean {
-	const a = anchorPath(anchor);
-	if (a.endsWith("/")) return path.startsWith(a);
-	if (/[*?[{]/.test(a)) return new Bun.Glob(a).match(path);
-	return path === a;
 }
 
 // ── commands ─────────────────────────────────────────────────────────────────
@@ -285,9 +229,7 @@ export function affected(
 			!covered.has(f) &&
 			// The old side of a rename is kept to match nodes, but nothing can anchor a gone file.
 			(exists === undefined || exists(f)) &&
-			SOURCE_ROOTS.some((r) => f.startsWith(`${r}/`)) &&
-			SOURCE_FILE.test(f) &&
-			!NOT_SOURCE.test(f),
+			isSourceFile(f),
 	);
 	return result;
 }
@@ -315,17 +257,13 @@ export function coverage(
 }
 
 export function sourceFiles(root: string): string[] {
-	return lines(git(root, ["ls-files", "--", ...SOURCE_ROOTS])).filter(
-		(f) => SOURCE_FILE.test(f) && !NOT_SOURCE.test(f),
-	);
+	return lines(git(root, ["ls-files", "--", ...SOURCE_ROOTS])).filter(isSourceFile);
 }
 
 /** Anchors that match more than {@link BROAD_ANCHOR_FILES} source files. */
 function otherFiles(): string[] {
 	const root = git(process.cwd(), ["rev-parse", "--show-toplevel"]).trim();
-	return lines(git(root, ["ls-files"])).filter(
-		(f) => !SOURCE_ROOTS.some((r) => f.startsWith(`${r}/`)) && !NOT_SOURCE.test(f),
-	);
+	return lines(git(root, ["ls-files"])).filter((f) => !underSourceRoot(f) && !isTestOrGenerated(f));
 }
 
 export function broadAnchors(
@@ -338,7 +276,7 @@ export function broadAnchors(
 		for (const anchor of node.anchors) {
 			// Outside the source roots (scripts/, .github/, …) every tracked non-test file counts.
 			let pool = source;
-			if (!SOURCE_ROOTS.some((r) => anchorPath(anchor).startsWith(`${r}/`))) {
+			if (!underSourceRoot(anchorPath(anchor))) {
 				others ??= otherFiles();
 				pool = others;
 			}
@@ -377,7 +315,7 @@ export function check(root: string, nodes: KnowledgeNode[], invalid: string[] = 
 	}
 	// Every node directory has an index.md that lists each child.
 	for (const n of nodes) {
-		if (n.file === `${KNOWLEDGE_DIR}/index.md`) continue;
+		if (n.file === KNOWLEDGE_INDEX) continue;
 		const isIndex = n.file.endsWith("/index.md");
 		const parentDir = isIndex ? posix.dirname(posix.dirname(n.file)) : posix.dirname(n.file);
 		const parentIndex = posix.join(parentDir, "index.md");
