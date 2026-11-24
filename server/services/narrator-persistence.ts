@@ -3746,12 +3746,19 @@ const sqliteNarratorPersistence = {
 			skipErrorMessage?: boolean;
 			/** Run finalization must not unarchive a concurrently archived session. */
 			unlessArchived?: boolean;
+			/**
+			 * Leave an idle session that already records an error untouched. Decided on the
+			 * observed row, which a transaction re-asserts, so a concurrent transition
+			 * conflicts instead of being overwritten. Requires `substatus`.
+			 */
+			keepIdleError?: boolean;
 			recoveryObservation?: RestartNarrator;
 			parentRecoveryTurn?: import("./recovery-observation").ParentRecoveryTurn;
 			expectedLogicalRunId?: string | null;
 		},
 	) {
 		let wroteStatus = false;
+		let keptIdleError = false;
 		const errorMessage = options?.errorMessage;
 		const errorCode = options?.errorCode;
 		const diagnostics = normalizeApiRequestDiagnostics(options?.diagnostics);
@@ -3806,6 +3813,16 @@ const sqliteNarratorPersistence = {
 					broadcastTurnStartedAt = row?.turnStartedAt ?? undefined;
 				}
 				const currentSubstatus = parseSubstatus(row?.substatus);
+				if (
+					options?.keepIdleError &&
+					row?.status === "idle" &&
+					currentSubstatus.includes("error")
+				) {
+					// Skipping is itself a decision on the observation: confirm it under the lock.
+					db.transaction((tx) => assertNarratorRead(tx, narratorId, observed));
+					keptIdleError = true;
+					return;
+				}
 				actualSubstatus = preserveBackgroundCompactingSubstatus(
 					currentSubstatus,
 					requestedSubstatus,
@@ -3883,6 +3900,7 @@ const sqliteNarratorPersistence = {
 			await writeStatus();
 		}
 
+		if (keptIdleError) return false;
 		if (options?.unlessArchived && !wroteStatus) return false;
 
 		backgroundOccupancyStore.refreshNarrator(narratorId);
