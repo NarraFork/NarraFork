@@ -1,22 +1,9 @@
 import { logger } from "../logger";
 
-/**
- * Endpoints that reject individual request fields outright.
- *
- * Observed on NUG's Responses-compatible gateway (and still relevant for other
- * optional fields that a relay may reject even when Codex endpoints no longer
- * attach `max_output_tokens`):
- *
- *   upstream status 400: {"detail":"Unsupported parameter: max_output_tokens"}
- *
- * Without a strip-and-retry the whole turn dies even though the model is fine —
- * the same class of failure as `reasoning-mandatory-fallback`, for a different
- * parameter.
- *
- * The learned set is per-process and in-memory on purpose. Losing it on restart
- * costs one extra rejected attempt; persisting it would keep suppressing a
- * parameter long after the gateway (or its upstream) started accepting it.
- */
+/** Optional field rejections (for example prompt_cache_key) are learned per model,
+ * in memory only. Never learn to discard an output budget: that turns a bounded
+ * request into an unbounded retry, and can affect unrelated later requests. */
+const outputBudgetFields = new Set(["max_tokens", "max_completion_tokens", "max_output_tokens"]);
 const unsupportedParametersByModel = new Map<string, Set<string>>();
 
 /**
@@ -71,7 +58,8 @@ export function stripUnsupportedParameter(
 	err: unknown,
 ): boolean {
 	const parameter = unsupportedParameterFromError(err);
-	if (!parameter || !(parameter in body)) return false;
+	if (!parameter || outputBudgetFields.has(parameter) || !Object.hasOwn(body, parameter))
+		return false;
 	delete body[parameter];
 	rememberUnsupportedParameter(model, parameter);
 	logger.warn("Endpoint rejected a request parameter; stripping it for retry", {
@@ -90,7 +78,7 @@ export function omitUnsupportedParameters(body: Record<string, unknown>, model: 
 	const set = unsupportedParametersByModel.get(model);
 	if (!set) return;
 	for (const parameter of set) {
-		if (parameter in body) delete body[parameter];
+		if (!outputBudgetFields.has(parameter)) delete body[parameter];
 	}
 }
 
@@ -120,6 +108,11 @@ function errorTextCandidates(err: unknown): string[] {
 
 /** The parameter this error rejected, if any. */
 export function unsupportedParameterFromError(err: unknown): string | undefined {
+	// A model can quote a parameter error in its refusal. Neither retry this
+	// request nor teach later requests to omit the quoted field.
+	if (err && typeof err === "object" && "reason" in err && err.reason === "refusal") {
+		return undefined;
+	}
 	for (const text of errorTextCandidates(err)) {
 		const parameter = parseUnsupportedParameter(text);
 		if (parameter) return parameter;
@@ -132,13 +125,8 @@ export function isUnsupportedParameterError(err: unknown): boolean {
 }
 
 /**
- * Run a request, transparently recovering from an endpoint that rejects an
- * optional request field (today: `max_output_tokens` on Responses-compatible
- * relays).
- *
- * Only fields present on the body can be stripped. A field the caller never
- * sent is not this failure mode. After a successful recovery the field is
- * remembered for `model` so subsequent requests omit it entirely.
+ * Retry once only when the pre-dispatch fallback can safely omit the rejected
+ * field. Preserve the original upstream error when the field is a token ceiling.
  */
 export async function withUnsupportedParameterFallback<T>(
 	model: string,
@@ -149,15 +137,7 @@ export async function withUnsupportedParameterFallback<T>(
 	try {
 		return await run(body);
 	} catch (err) {
-		const parameter = unsupportedParameterFromError(err);
-		if (!parameter || !(parameter in body)) throw err;
-		delete body[parameter];
-		rememberUnsupportedParameter(model, parameter);
-		logger.warn("Endpoint rejected a request parameter; retrying without it", {
-			model,
-			parameter,
-			error: err instanceof Error ? err.message : String(err),
-		});
+		if (!stripUnsupportedParameter(body, model, err)) throw err;
 		return run(body);
 	}
 }

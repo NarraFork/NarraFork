@@ -227,6 +227,61 @@ describe("actual provider request bodies", () => {
 			}
 		});
 	}
+	for (const [name, baseUrl, wireModel, field] of [
+		["public", "https://api.openai.com/v1/", "opaque", "max_completion_tokens"],
+		["default URL", "", "opaque", "max_completion_tokens"],
+		["regional public", "https://eu.api.openai.com/v1", "opaque", "max_completion_tokens"],
+		["o-series relay", config.baseUrl, "o4-mini", "max_completion_tokens"],
+		["GPT-5 relay", config.baseUrl, "gpt-5.4-mini", "max_completion_tokens"],
+		["legacy relay", config.baseUrl, "deepseek-chat", "max_tokens"],
+		["open weights", config.baseUrl, "gpt-oss-120b", "max_tokens"],
+		["lookalike host", "https://api.openai.com.relay.invalid/v1", "opaque", "max_tokens"],
+	] as const) {
+		test(`${name}: Chat carries the same single ceiling in chat and utility requests`, async () => {
+			const provider = new OpenAIProvider({ ...config, baseUrl, apiMode: "completions" });
+			const target = `${config.prefix}:${wireModel}`;
+			const options = { maxOutputTokens: 33 };
+			const start = requests.length;
+			await captureChat(provider, { model: target, ...options });
+			await expect(
+				provider.generateWithMeta("hello", target, undefined, options),
+			).rejects.toThrow();
+			await expect(
+				provider.generateWithHistoryWithMeta("system", "hello", target, "en", options),
+			).rejects.toThrow();
+			const sent = requests.slice(start);
+			expect(sent).toHaveLength(3);
+			for (const body of sent) {
+				expect(body[field]).toBe(33);
+				expect(body).not.toHaveProperty(
+					field === "max_tokens" ? "max_completion_tokens" : "max_tokens",
+				);
+				expect(body).not.toHaveProperty("max_output_tokens");
+			}
+		});
+	}
+
+	test("public Responses rejects an effective cap below 16 without increasing it or dispatching", async () => {
+		const provider = new OpenAIProvider({
+			...config,
+			baseUrl: "https://api.openai.com/v1",
+			apiMode: "responses",
+		});
+		const maxOutputTokens = 15;
+		const tooSmall = /max_output_tokens >= 16/;
+		await expect(provider.chat(params({ maxOutputTokens })).next()).rejects.toThrow(tooSmall);
+		await expect(
+			provider.generateWithMeta("hello", model, undefined, { maxOutputTokens }),
+		).rejects.toThrow(tooSmall);
+		await expect(
+			provider.generateWithHistoryWithMeta("system", "hi", model, "en", { maxOutputTokens }),
+		).rejects.toThrow(tooSmall);
+		expect(requests).toHaveLength(0);
+		expect((await captureChat(provider, { maxOutputTokens: 16 })).max_output_tokens).toBe(16);
+		const relay = new OpenAIProvider({ ...config, apiMode: "responses" });
+		expect((await captureGenerate(relay, 5)).max_output_tokens).toBe(5);
+	});
+
 	test("both Codex WebSocket request constructors omit max_output_tokens but enforce reasoning", () => {
 		for (const provider of [
 			new OpenAIProvider({ ...config, apiMode: "codex" }),

@@ -40,19 +40,14 @@ export interface InputCharacterOptions extends InputCharacterBudget {
 // Runtime provenance is object identity, not a text/role heuristic. This survives delegate
 // replacement while remaining absent from serialized wire/history data and user JSON.
 const runtimeSystemMessages = new WeakSet<object>();
-const runtimeInstructionRoots = new WeakSet<object>();
 const runtimeInstructionInputs = new WeakMap<object, { type: "input_text"; text: string }>();
 /** Preserve instruction provenance when Codex moves root instructions into input. */
 export function markInstructionsInput(
 	body: object,
-	textPart: { type: "input_text"; text: string },
+	textPart: { type: "input_text"; text: string } | undefined,
 ): void {
-	runtimeInstructionInputs.set(body, textPart);
-}
-/** The builder generated root instructions itself rather than lifting history text. */
-export function markRuntimeInstructions<T extends object>(body: T): T {
-	runtimeInstructionRoots.add(body);
-	return body;
+	if (textPart) runtimeInstructionInputs.set(body, textPart);
+	else runtimeInstructionInputs.delete(body);
 }
 export function markRuntimeSystemMessage<T extends object>(message: T): T {
 	runtimeSystemMessages.add(message);
@@ -502,9 +497,8 @@ export async function reportInputCharacters(
 		options.instructionsFixedChars === undefined
 	) {
 		const runtimeContent = object(first).content;
-		options.instructionsFixedChars = runtimeInstructionRoots.has(request)
-			? instructions.length
-			: synthetic && typeof runtimeContent === "string"
+		options.instructionsFixedChars =
+			synthetic && typeof runtimeContent === "string"
 				? runtimeContent.length > (options.maxChars ?? 32 * 1024 * 1024) ||
 					instructions === runtimeContent ||
 					(!params.signal.aborted && instructions.startsWith(runtimeContent))

@@ -35,6 +35,7 @@ type FetchOpenaiModels = (config: {
 	userAgentMode?: "custom" | "narrafork" | "codex" | "claude-code";
 	customUserAgent?: string;
 	extraHeaders?: Record<string, string>;
+	dynamicHeaders?: () => Record<string, string>;
 }) => Promise<{ models: Array<{ id: string }> }>;
 
 let buildModelsUrls: BuildModelsUrls;
@@ -264,6 +265,129 @@ describe("model catalog identity reaches a real HTTP endpoint", () => {
 				expect(captured[1]?.get("authorization")).toBe("Bearer operator");
 				expect(captured[1]?.get("originator")).toBe("custom-originator");
 				expect(captured[1]?.get("anthropic-version")).toBe("operator-version");
+			} finally {
+				await server.stop(true);
+			}
+		});
+	}
+});
+
+describe("model catalog dynamic UA respects explicit selection", () => {
+	for (const apiMode of ["responses", "codex", "completions"]) {
+		test(`${apiMode}: only explicit UA overrides dynamic headers`, async () => {
+			globalThis.fetch = originalFetch;
+			const captured: Headers[] = [];
+			const server = Bun.serve({
+				hostname: "127.0.0.1",
+				port: 0,
+				fetch(request) {
+					captured.push(request.headers);
+					return Response.json({ data: [{ id: "test-model" }] });
+				},
+			});
+			try {
+				let channel = 0;
+				const config = {
+					id: "catalog-ua",
+					name: "Catalog UA probe",
+					apiKey: "default-key",
+					baseUrl: `${server.url.origin}/v1`,
+					apiMode,
+					userAgentMode: "custom" as const,
+					customUserAgent: "selected/1",
+					extraHeaders: { authorization: "Bearer static" },
+					dynamicHeaders: () => ({
+						"USER-AGENT": "dynamic/3",
+						Authorization: "Bearer dynamic",
+						"X-Channel": `live-${++channel}`,
+					}),
+				};
+				await fetchOpenaiModels(config);
+				await fetchOpenaiModels({
+					...config,
+					extraHeaders: { "uSeR-aGeNt": " operator/2 ", authorization: "Bearer static" },
+				});
+				await fetchOpenaiModels({
+					...config,
+					userAgentMode: undefined,
+					customUserAgent: undefined,
+				});
+				expect(captured.map((headers) => headers.get("user-agent"))).toEqual([
+					"selected/1",
+					"operator/2",
+					"dynamic/3",
+				]);
+				expect(captured.map((headers) => headers.get("authorization"))).toEqual([
+					"Bearer dynamic",
+					"Bearer dynamic",
+					"Bearer dynamic",
+				]);
+				expect(captured.map((headers) => headers.get("x-channel"))).toEqual([
+					"live-1",
+					"live-2",
+					"live-3",
+				]);
+			} finally {
+				await server.stop(true);
+			}
+		});
+	}
+});
+
+describe("model catalog fallback keeps its final wire identity", () => {
+	for (const protocol of ["anthropic", "responses", "codex", "completions"] as const) {
+		test(`${protocol}: configured 404 then /v1 discovery retains one UA and the authentication owner`, async () => {
+			globalThis.fetch = originalFetch;
+			const requests: Array<{ path: string; method: string; headers: Headers; raw: string }> = [];
+			const server = Bun.serve({
+				hostname: "127.0.0.1",
+				port: 0,
+				async fetch(request) {
+					requests.push({
+						path: new URL(request.url).pathname,
+						method: request.method,
+						headers: request.headers,
+						raw: await request.text(),
+					});
+					if (requests.length === 1)
+						return Response.json({ error: { message: "Use /v1/models" } }, { status: 404 });
+					return Response.json({ data: [{ id: "wire-model" }] });
+				},
+			});
+			try {
+				const config = {
+					id: `catalog-fallback-${protocol}`,
+					name: "Local catalog fallback",
+					apiKey: "fake-catalog-key",
+					baseUrl: server.url.origin,
+					apiMode: protocol === "anthropic" ? "responses" : protocol,
+					officialApi: true,
+					userAgentMode: "custom" as const,
+					customUserAgent: "selected/1",
+					extraHeaders: { "uSeR-aGeNt": " operator/2 ", Authorization: "Bearer operator" },
+					dynamicHeaders: () => ({
+						"USER-AGENT": "dynamic/default",
+						authorization: "Bearer dynamic-owner",
+						"X-Channel": "current",
+					}),
+				};
+				const result = await (protocol === "anthropic"
+					? fetchAnthropicModels(config)
+					: fetchOpenaiModels(config));
+				expect(result.models.map((model) => model.id)).toEqual(["wire-model"]);
+				expect(requests.map((request) => request.path)).toEqual(["/models", "/v1/models"]);
+				for (const request of requests) {
+					expect(request.method).toBe("GET");
+					expect(request.raw).toBe("");
+					expect(request.headers.get("user-agent")).toBe("operator/2");
+					expect(
+						Array.from(request.headers.keys()).filter((key) => key === "user-agent"),
+					).toHaveLength(1);
+					expect(request.headers.get("authorization")).toBe(
+						protocol === "anthropic" ? "Bearer operator" : "Bearer dynamic-owner",
+					);
+					if (protocol !== "anthropic") expect(request.headers.get("x-channel")).toBe("current");
+				}
 			} finally {
 				await server.stop(true);
 			}

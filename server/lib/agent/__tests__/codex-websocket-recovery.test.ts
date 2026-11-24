@@ -1094,11 +1094,8 @@ for (const { code, frame } of recoverableErrors) {
 		expect(server.connectionCount()).toBe(2);
 		expect(server.requests[1]?.connectionIndex).toBe(1);
 		expect(server.requests[1]?.body.previous_response_id).toBeUndefined();
-		expect(server.requests[1]?.body.input).toEqual([
-			expect.objectContaining({ role: "developer", type: "message" }),
-			...history,
-			userMessage("continue"),
-		]);
+		// Missing base instructions must not invent a developer prefix on replay.
+		expect(server.requests[1]?.body.input).toEqual([...history, userMessage("continue")]);
 		expect(requestTurnState(server, 0)).toBeUndefined();
 		expect(requestTurnState(server, 1)).toBe("sticky-1");
 		// WS routing state rides response.create.client_metadata, NOT handshake
@@ -1414,11 +1411,8 @@ test.each([
 			expect(collectText(next.events)).toBe("ok");
 			expect(server.requests).toHaveLength(3);
 			expect(server.requests[2]?.body.previous_response_id).toBeUndefined();
-			expect(server.requests[2]?.body.input).toEqual([
-				expect.objectContaining({ role: "developer", type: "message" }),
-				...history,
-				userMessage("next"),
-			]);
+			// A cleared response chain replays the real history, not default instructions.
+			expect(server.requests[2]?.body.input).toEqual([...history, userMessage("next")]);
 			expect(server.requests[2]?.connectionIndex).toBe(1);
 			expect(server.connectionCount()).toBe(2);
 			expect(clientClosedAtInvalidState).toBe(true);
@@ -1492,4 +1486,66 @@ test("a nested request on a busy session runs on an ephemeral socket without tou
 	expect(server.requests[2]?.connectionIndex).toBe(0);
 	expect(server.requests[2]?.body.previous_response_id).toBe("resp-0");
 	expect(server.connectionCount()).toBe(2);
+});
+
+test("explicit provider UA governs WS reuse without replacing dynamic auth or the logical turn lock", async () => {
+	const server = startServer(({ requestIndex, send }) => {
+		send(turnStateFrame(`sticky-${requestIndex}`));
+		for (const frame of completedFrames(`resp-${requestIndex}`)) send(frame);
+	});
+	activeServer = server;
+	let dynamicRead = 0;
+	const config = {
+		id: "codex-ws-recovery",
+		name: "Final UA WS probe",
+		prefix: "codex-ws-recovery",
+		apiKey: "sk-local-test-only",
+		baseUrl: server.baseUrl,
+		defaultModel: "gpt-5.3-codex",
+		apiMode: "codex" as const,
+		codexWebSocket: true,
+		codexWebSearch: false,
+		codexImageGeneration: false,
+		userAgentMode: "custom" as const,
+		customUserAgent: "selected/1",
+		extraHeaders: { authorization: "Bearer static", "x-channel": "stale" } as Record<
+			string,
+			string
+		>,
+		dynamicHeaders: () => ({
+			"USER-AGENT": `dynamic/${++dynamicRead}`,
+			Authorization: "Bearer dynamic",
+			"X-Channel": "latest",
+		}),
+	};
+	const provider = new OpenAIProvider(config);
+	const turnContext = createProviderTurnContext();
+	for (let i = 0; i < 4; i++) {
+		if (i === 2) config.customUserAgent = "selected/2";
+		if (i === 3) config.extraHeaders["uSeR-aGeNt"] = " operator/3 ";
+		const result = await runChat(provider, {
+			turnContext,
+			content: `input-${i}`,
+			history: Array.from({ length: i }, (_, j) => ({ role: "user", content: `input-${j}` })),
+		});
+		expect(result.error).toBeUndefined();
+		expect(result.events.some((event) => event.invalidState)).toBe(false);
+	}
+	// Changing only a dynamic default UA does not alter the actual handshake.
+	expect(server.handshakes.map((headers) => headers.get("user-agent"))).toEqual([
+		"selected/1",
+		"selected/2",
+		"operator/3",
+	]);
+	expect(server.connectionCount()).toBe(3);
+	expect(server.requests[1]?.body.previous_response_id).toBe("resp-0");
+	expect(server.requests[2]?.body.previous_response_id).toBeUndefined();
+	expect(server.requests[3]?.body.previous_response_id).toBeUndefined();
+	for (const headers of server.handshakes) {
+		expect(headers.get("authorization")).toBe("Bearer dynamic");
+		expect(headers.get("x-channel")).toBe("latest");
+	}
+	// UA changes reopen the socket, but must not replace the authentication-owned token.
+	expect(requestTurnState(server, 0)).toBeUndefined();
+	for (let i = 1; i < 4; i++) expect(requestTurnState(server, i)).toBe("sticky-0");
 });

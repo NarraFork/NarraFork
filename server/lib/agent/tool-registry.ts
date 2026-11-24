@@ -210,6 +210,33 @@ function convertNode(schema: z.ZodType): Record<string, unknown> {
 	return result;
 }
 
+// Describe declared inputs, not the result of probing a missing argument: parsing
+// undefined here would run a tool author's preprocess, refinement or transform.
+// Keep defaults distinct: a later pipe receives their value, not undefined.
+type MissingInput = "required" | "optional" | "defaulted";
+function missingToolInput(schema: z.core.$ZodType): MissingInput {
+	if (schema instanceof z.ZodDefault) return "defaulted";
+	if (schema instanceof z.ZodOptional) return "optional";
+	if (schema instanceof z.ZodNullable) return missingToolInput(schema.unwrap());
+	if (schema instanceof z.ZodUnion) {
+		// Zod selects the first accepting branch.
+		for (const option of schema.options) {
+			const missing = missingToolInput(option);
+			if (missing !== "required") return missing;
+		}
+	}
+	if (schema instanceof z.ZodPipe) {
+		// A preprocess has no declarative input of its own; use its validator,
+		// just as convertNode does for the property's type.
+		if (schema.in instanceof z.ZodTransform) return missingToolInput(schema.out);
+		const input = missingToolInput(schema.in);
+		if (input === "required") return "required";
+		if (schema.out instanceof z.ZodTransform) return "optional";
+		return input === "defaulted" ? "defaulted" : missingToolInput(schema.out);
+	}
+	return "required";
+}
+
 function convertObject(schema: z.ZodObject): Record<string, unknown> {
 	const shape = schema.shape;
 	const properties: Record<string, unknown> = {};
@@ -219,10 +246,7 @@ function convertObject(schema: z.ZodObject): Record<string, unknown> {
 		const fieldSchema = value as z.ZodType;
 		properties[key] = convertNode(fieldSchema);
 
-		// Field is required unless it's optional
-		if (!(fieldSchema instanceof z.ZodOptional)) {
-			required.push(key);
-		}
+		if (missingToolInput(fieldSchema) === "required") required.push(key);
 	}
 
 	const result: Record<string, unknown> = {

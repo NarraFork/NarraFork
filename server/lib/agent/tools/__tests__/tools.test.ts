@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
@@ -42,6 +42,13 @@ const TEST_DIR = join(tmpdir(), `narrafork-tool-test-${TEST_RUN_ID}`);
 const SAMPLE_FILE = join(TEST_DIR, "sample.txt");
 const NESTED_DIR = join(TEST_DIR, "sub", "dir");
 const NESTED_FILE = join(NESTED_DIR, "nested.ts");
+
+// Git Bash reports an MSYS path on Windows. Ask for the native spelling, then
+// compare filesystem identity so slash styles and 8.3 aliases do not weaken cwd checks.
+const CWD_COMMAND = process.platform === "win32" ? "pwd -W" : "pwd";
+function expectShellCwd(output: string, expected: string): void {
+	expect(realpathSync(output.trim())).toBe(realpathSync(expected));
+}
 
 function makeCtx(cwd = TEST_DIR): ToolContext {
 	return {
@@ -915,8 +922,9 @@ describe("Bash", () => {
 	});
 
 	test("uses cwd", async () => {
-		const result = await bashTool.execute({ command: "pwd" }, makeCtx());
-		expect(result.output.trim()).toBe(TEST_DIR);
+		const result = await bashTool.execute({ command: CWD_COMMAND }, makeCtx());
+		expect(result.isError).toBeFalsy();
+		expectShellCwd(result.output, TEST_DIR);
 	});
 
 	test("respects timeout", async () => {
@@ -1016,15 +1024,15 @@ describe("Bash", () => {
 	});
 
 	test("workdir changes the working directory", async () => {
-		const result = await bashTool.execute({ command: "pwd", workdir: NESTED_DIR }, makeCtx());
+		const result = await bashTool.execute({ command: CWD_COMMAND, workdir: NESTED_DIR }, makeCtx());
 		expect(result.isError).toBeFalsy();
-		expect(result.output.trim()).toBe(NESTED_DIR);
+		expectShellCwd(result.output, NESTED_DIR);
 	});
 
 	test("workdir resolves relative paths against cwd", async () => {
-		const result = await bashTool.execute({ command: "pwd", workdir: "sub/dir" }, makeCtx());
+		const result = await bashTool.execute({ command: CWD_COMMAND, workdir: "sub/dir" }, makeCtx());
 		expect(result.isError).toBeFalsy();
-		expect(result.output.trim()).toBe(NESTED_DIR);
+		expectShellCwd(result.output, NESTED_DIR);
 	});
 
 	test("description is used as title", async () => {
@@ -1047,16 +1055,13 @@ describe("Bash", () => {
 	});
 
 	test("a bad workdir argument is retryable, not a fatal session stop", async () => {
-		// The session cwd is fine, so only this call is wrong. Killing the narrator here
-		// would throw away a whole conversation over a model-supplied path typo.
-		const result = await bashTool.execute(
-			{ command: "pwd", workdir: "/no/such/directory" },
-			makeCtx(),
-		);
+		// The session cwd exists; only this portable, call-specific target is absent.
+		const badWorkdir = join(TEST_DIR, "missing-workdir");
+		const result = await bashTool.execute({ command: "pwd", workdir: badWorkdir }, makeCtx());
 		expect(result.isError).toBe(true);
 		expect(result.fatal).toBeFalsy();
 		expect(result.metadata?.cwdRecovery).toBeUndefined();
-		expect(result.output).toContain("/no/such/directory");
+		expect(result.output).toContain(badWorkdir);
 		expect(result.output).toContain("workdir");
 		expect(result.output).toContain(TEST_DIR);
 	});
@@ -1093,11 +1098,10 @@ describe("Bash", () => {
 	});
 
 	test("workdir allows path traversal but resolves against cwd", async () => {
-		// ../  from TEST_DIR should resolve to its parent
-		const result = await bashTool.execute({ command: "pwd", workdir: ".." }, makeCtx());
+		const result = await bashTool.execute({ command: CWD_COMMAND, workdir: ".." }, makeCtx());
 		expect(result.isError).toBeFalsy();
 		const { dirname } = await import("node:path");
-		expect(result.output.trim()).toBe(dirname(TEST_DIR));
+		expectShellCwd(result.output, dirname(TEST_DIR));
 	});
 });
 
@@ -1141,6 +1145,61 @@ describe("zodToJsonSchema", () => {
 			},
 			required: ["name"],
 		});
+	});
+
+	test("preserves missing vs nullable fields inside nested tool inputs", () => {
+		const parameters = z.object({
+			options: z.object({
+				label: z.string().nullable(),
+				limit: z.number().default(3).describe("Result limit"),
+				note: z.preprocess((v) => v, z.string().optional()).nullable(),
+				fallback: z.preprocess((v) => v, z.string().default("auto")),
+			}),
+		});
+		expect(parameters.parse({ options: { label: null } })).toEqual({
+			options: { label: null, limit: 3, fallback: "auto" },
+		});
+		expect(parameters.safeParse({ options: {} }).success).toBe(false);
+		expect(zodToJsonSchema(parameters)).toMatchObject({
+			required: ["options"],
+			properties: {
+				options: {
+					required: ["label"],
+					properties: {
+						label: { anyOf: [{ type: "string" }, { type: "null" }] },
+						limit: { type: "number", default: 3, description: "Result limit" },
+						note: { anyOf: [{ type: "string" }, { type: "null" }] },
+						fallback: { type: "string", default: "auto" },
+					},
+				},
+			},
+		});
+	});
+
+	test("derives pipe presence from declarations without running tool callbacks", () => {
+		const unexpected = (): never => {
+			throw new Error("Schema conversion ran a tool callback");
+		};
+		const parameters = z.object({
+			optional: z.preprocess(unexpected, z.string().optional()),
+			required: z.preprocess(unexpected, z.string()),
+			transformed: z.string().optional().transform(unexpected),
+			checked: z.string().refine(unexpected),
+			// An output transform can return undefined; the caller still owes a string.
+			inputRequired: z.string().transform(() => undefined),
+			// This pipe forwards the missing value to a required validator.
+			checkedAgain: z.string().optional().pipe(z.string()),
+			defaultThroughPipe: z.string().default("auto").pipe(z.string()),
+			optionalChoice: z.union([z.number(), z.preprocess(unexpected, z.string().optional())]),
+			requiredChoice: z.union([z.number(), z.string().nullable()]),
+		});
+		expect(zodToJsonSchema(parameters).required).toEqual([
+			"required",
+			"checked",
+			"inputRequired",
+			"checkedAgain",
+			"requiredChoice",
+		]);
 	});
 
 	test("keeps any and unknown values permissive", () => {
@@ -1375,13 +1434,11 @@ describe("Skill tool rawJsonSchema", () => {
 	});
 });
 
-// WebFetch keeps mode optional at the raw provider-schema layer so callers may rely on the
-// runtime default even though zod-to-json-schema treats `.default("readability")` as required.
 // ExitPlanMode intentionally hides the canonical `plan` field from the model-facing schema:
 // the model only sees `inline_plan`, which the resolution layer normalizes into `plan` before
 // tool-executor's safeParse runs (so Zod must still accept `plan`). This is a deliberate
 // divergence, not a parity bug.
-const KNOWN_SCHEMA_MISMATCHES = new Set(["WebFetch", "ExitPlanMode"]);
+const KNOWN_SCHEMA_MISMATCHES = new Set(["ExitPlanMode"]);
 
 const toolsWithRawJsonSchema = [
 	agentTool,

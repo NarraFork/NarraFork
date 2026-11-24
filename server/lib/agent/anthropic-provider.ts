@@ -23,9 +23,15 @@ import { extractAnthropicUsage } from "../usage-tracking";
 import {
 	CLAUDE_CLI_VERSION,
 	getHttpClaudeCliUserAgent,
-	mergeExtraHeaders,
+	resolveExplicitUserAgent,
 	resolveHttpUserAgent,
 } from "../user-agent";
+import {
+	ANTHROPIC_PUBLIC_BASE_URL,
+	ANTHROPIC_PUBLIC_VERSION,
+	finishAnthropicHeaders,
+	projectAnthropicPublicBlock,
+} from "./anthropic-api-version";
 import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
 import { parseErrorDiagnostics } from "./error-diagnostics";
 import { isCompletionLimitReason, ProviderInvalidStateError } from "./error-handling";
@@ -88,9 +94,9 @@ const WEB_SEARCH_MAX_TOKENS = 8192;
  * request-level set, and per-attempt pushes inside the retry closure), not from
  * a single capture: the CLI decides each flag PER MODEL, so a fixed string
  * necessarily claims betas the real client would not send for the model in hand.
- * The model predicates below retain that audited 2.1.251 baseline; they have
- * not all been re-audited against 2.1.325. Its bundle does explicitly mark
- * mid-conversation-system as GA, so that obsolete header is no longer emitted.
+ * The model predicates retain the audited 2.1.251 baseline and have not all
+ * been re-audited against 2.1.330. The previously inspected 2.1.325 bundle marked
+ * mid-conversation-system as GA, so that obsolete header remains omitted.
  *
  * Flags the CLI can also send but NarraFork never earns are omitted, because a
  * beta declares a capability the client must actually implement:
@@ -149,9 +155,6 @@ const ANTHROPIC_EFFORT_BETA_FLAGS = "adaptive-thinking-2026-01-28,effort-2025-11
 
 /** Cache control marker for ephemeral prompt caching. */
 const CACHE_CONTROL = { cache_control: { type: "ephemeral" as const } };
-
-/** Default Anthropic API base URL (includes /v1 path). */
-const DEFAULT_BASE_URL = "https://api.anthropic.com/v1";
 
 /**
  * Process-wide cache of base URLs that have been resolved to need a `/v1`
@@ -327,20 +330,31 @@ const STAINLESS_ARCH =
 				? "x86"
 				: `other:${process.arch}`;
 
-function clearLegacyCacheMarkers(
+// Only visit wire content, after role normalization (also covers fresh tool results).
+// Clone changed blocks, not media, schemas or the caller's whole history.
+function prepareWireBlocks(
 	messages: AnthropicMessage[],
 	tools: Array<Record<string, unknown>> | undefined,
+	publicBody: boolean,
 ): void {
-	for (const tool of tools ?? []) {
-		delete tool.cache_control;
-	}
+	for (const tool of tools ?? []) delete tool.cache_control;
 	for (const message of messages) {
 		if (!Array.isArray(message.content)) continue;
-		for (const block of message.content) {
-			if (block && typeof block === "object") {
-				delete (block as Record<string, unknown>).cache_control;
+		const parts = message.content;
+		let changed: AnthropicContentPart[] | undefined;
+		for (const [index, original] of parts.entries()) {
+			if (!original || typeof original !== "object") continue;
+			let part = publicBody ? projectAnthropicPublicBlock(message.role, original) : original;
+			if ("cache_control" in part) {
+				const { cache_control: _old, ...rest } = part;
+				part = rest;
+			}
+			if (part !== original) {
+				changed ??= parts.slice();
+				changed[index] = part;
 			}
 		}
+		if (changed) message.content = changed;
 	}
 }
 
@@ -380,7 +394,8 @@ function applyFinalCacheBreakpoint(messages: AnthropicMessage[]): void {
 			block.type === "tool_result" ||
 			isToolChangePart(block)
 		) {
-			Object.assign(block, CACHE_CONTROL);
+			message.content = message.content.slice();
+			message.content[blockIndex] = { ...block, ...CACHE_CONTROL };
 			return;
 		}
 	}
@@ -1307,11 +1322,20 @@ export class AnthropicProvider implements ProviderAdapter {
 	private pfetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
 		const target = input instanceof Request ? input.url : input;
 		const proxy = resolveProxyForUrl(target, this.config.proxy);
-		return runProviderTransport(this.transport, input, init, (target, options) =>
-			fetchWithNetworkDiagnostics(target, options, {
-				proxy,
-				redactText: this.transport?.redactText,
-				tls: this.tlsRejectUnauthorized === false ? { rejectUnauthorized: false } : undefined,
+		return runProviderTransport(
+			this.transport,
+			input,
+			init,
+			(target, options) =>
+				fetchWithNetworkDiagnostics(target, options, {
+					proxy,
+					redactText: this.transport?.redactText,
+					tls: this.tlsRejectUnauthorized === false ? { rejectUnauthorized: false } : undefined,
+				}),
+			resolveExplicitUserAgent({
+				mode: this.config.userAgentMode,
+				custom: this.config.customUserAgent,
+				extraHeaders: this.config.extraHeaders,
 			}),
 		);
 	}
@@ -1344,7 +1368,6 @@ export class AnthropicProvider implements ProviderAdapter {
 		const headers: Record<string, string> = {
 			Accept: accept,
 			"Content-Type": "application/json",
-			"anthropic-version": "2023-06-01",
 		};
 		if (isOfficial) {
 			headers.Authorization = `Bearer ${apiKey}`;
@@ -1396,7 +1419,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		if (isOfficial && !headers["x-api-key"] && isOpencodeEndpoint(this.config.baseUrl)) {
 			headers["x-api-key"] = apiKey;
 		}
-		return this.applyExtraHeaders(headers);
+		return finishAnthropicHeaders(headers, this.config, "user-agent");
 	}
 
 	/**
@@ -1461,14 +1484,6 @@ export class AnthropicProvider implements ProviderAdapter {
 		};
 	}
 
-	private applyExtraHeaders(headers: Record<string, string>): Record<string, string> {
-		// `"user-agent"` is the casing buildRequestHeaders writes above; passing it
-		// keeps an operator override on that one key instead of leaving a second
-		// differently-cased key that fetch would comma-join onto it.
-		mergeExtraHeaders(headers, this.config.extraHeaders, "user-agent");
-		return headers;
-	}
-
 	/**
 	 * Resolve the User-Agent for this provider.
 	 *
@@ -1488,7 +1503,7 @@ export class AnthropicProvider implements ProviderAdapter {
 
 	private getBaseUrl(): string {
 		if (this.resolvedBaseUrl) return this.resolvedBaseUrl;
-		const normalized = (this.config.baseUrl || DEFAULT_BASE_URL).replace(/\/+$/, "");
+		const normalized = (this.config.baseUrl || ANTHROPIC_PUBLIC_BASE_URL).replace(/\/+$/, "");
 		// Honor a prior process-wide /v1 resolution for this base URL (unless the
 		// user changed settings since, which bumps the revision).
 		if (!AnthropicProvider.hasV1Suffix(normalized)) {
@@ -1716,6 +1731,14 @@ export class AnthropicProvider implements ProviderAdapter {
 
 		const isOfficial = !!this.config.officialApi;
 		const model = parseModelId(params.model).model;
+		const reqHeaders = this.buildRequestHeaders(
+			apiKey,
+			isOfficial,
+			model,
+			"application/json",
+			params.conversationId,
+		);
+		const publicBody = reqHeaders["anthropic-version"] === ANTHROPIC_PUBLIC_VERSION;
 		// Strict models (Claude families, gpt/o-series) mint server-bound reasoning
 		// credentials; an uncredentialed thinking block must be dropped for them.
 		// Every relay model keeps its plain-text reasoning instead — with an empty
@@ -1727,11 +1750,15 @@ export class AnthropicProvider implements ProviderAdapter {
 		// Tool changes are exempt: they exist only because the selected tool loading
 		// strategy targets mid-conversation system messages, and as user content they
 		// would be rejected outright.
-		const history = (params.history as AnthropicMessage[]).map((message) =>
-			!midConversationSystem && message.role === "system" && !hasToolChangeParts(message)
-				? { ...message, role: "user" as const }
-				: message,
-		);
+		// A request may rewrite a message's content during reasoning/role normalization;
+		// the caller can reuse the same history with a different API version.
+		const history = (params.history as AnthropicMessage[]).map((message) => ({
+			...message,
+			role:
+				!midConversationSystem && message.role === "system" && !hasToolChangeParts(message)
+					? ("user" as const)
+					: message.role,
+		}));
 		const tools = params.tools as AnthropicTool[];
 
 		// Extract system prompt from the marker message
@@ -1894,7 +1921,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		// final cacheable block of the final message, whatever its role (see
 		// applyFinalCacheBreakpoint — trailing system and tool_result-only turns
 		// are marked too).
-		clearLegacyCacheMarkers(messages, cachedTools);
+		prepareWireBlocks(messages, cachedTools, publicBody);
 		if (isOfficial) {
 			applyFinalCacheBreakpoint(messages);
 		}
@@ -1919,12 +1946,9 @@ export class AnthropicProvider implements ProviderAdapter {
 			body.thinking = thinkingConfig;
 		}
 
-		// Temperature: upstream sends it only when thinking is off AND the model
-		// still accepts the parameter (`!Za && wHo(d)`). Every Claude in the
-		// supported range rejects it, so the previous unconditional
-		// `temperature: 1` was a 400 on exactly the newest models. Only third-party
-		// relay ids, which `wHo` says nothing about, still receive it.
-		if (!thinkingEnabled && acceptsTemperature(model)) {
+		// No sampling parameters are legal on 2026-10-21, even for an opaque model id.
+		// An explicitly older API or gateway retains its existing model-specific behavior.
+		if (!publicBody && !thinkingEnabled && acceptsTemperature(model)) {
 			body.temperature = 1;
 		}
 
@@ -1974,13 +1998,6 @@ export class AnthropicProvider implements ProviderAdapter {
 		assertModelInputModalities(params.model, body);
 		const reqPath = isOfficial ? "/messages?beta=true" : "/messages";
 
-		const reqHeaders = this.buildRequestHeaders(
-			apiKey,
-			isOfficial,
-			model,
-			"application/json",
-			params.conversationId,
-		);
 		const toolBeta = toolLoadingBetaFlag(params.toolLoadingStrategy);
 		if (toolBeta) {
 			const declared = reqHeaders["anthropic-beta"];
@@ -2237,7 +2254,7 @@ export class AnthropicProvider implements ProviderAdapter {
 	 * `web_search_20250305`: the main conversation request never carries it, so
 	 * the cached prefix is byte-identical whether or not search is used.
 	 *
-	 * Current compatibility shape, not a complete 2.1.325 wire transcription:
+	 * Current compatibility shape, not a complete 2.1.330 wire transcription:
 	 *   - no function tools — only the server search tool
 	 *   - forced `tool_choice: {type:"tool", name:"web_search"}`
 	 *   - omit `thinking`; the newer internal mechanical/disabled config's wire

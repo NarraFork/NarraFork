@@ -225,7 +225,7 @@ describe("native Responses message phase continuation", () => {
 			],
 			"gpt-5",
 		);
-		const expected = [
+		const expected: OAIMessage[] = [
 			{
 				role: "assistant",
 				id: "msg_a",
@@ -297,7 +297,9 @@ describe("native Responses message phase continuation", () => {
 			[makeAssistantMessage({ messageUuid: "legacy-msg", contentJson: blocks })],
 			"gpt-5",
 		);
-		const expected = [{ role: "assistant", content: [{ type: "output_text", text: "one\ntwo" }] }];
+		const expected: OAIMessage[] = [
+			{ role: "assistant", content: [{ type: "output_text", text: "one\ntwo" }] },
+		];
 		expect(live).toEqual(expected);
 		expect(stored.history).toEqual(expected);
 		expect(convertHistoryToResponsesApi(stored.history as OAIMessage[])).toEqual(expected);

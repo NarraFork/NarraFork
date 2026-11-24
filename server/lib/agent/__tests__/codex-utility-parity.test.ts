@@ -176,6 +176,19 @@ describe.each([
 	});
 });
 
+test("both Codex utility paths omit a developer prefix without base instructions", async () => {
+	const model = "codex:gpt-5.3-codex";
+	const withoutSystem = await capture((provider) => provider.generateWithMeta("hello", model));
+	const emptySystem = await capture((provider) =>
+		provider.generateWithHistoryWithMeta("", "hello", model),
+	);
+	for (const { body } of [withoutSystem, emptySystem]) {
+		expect(body).not.toHaveProperty("instructions");
+		expect(body.input).toHaveLength(1);
+		expect((body.input as Array<{ role: string }>)[0].role).toBe("user");
+	}
+});
+
 describe("Codex structured-output compatibility", () => {
 	test("format rejection replaces the input instruction prefix without changing turn identity", async () => {
 		const provider = new OpenAIProvider({

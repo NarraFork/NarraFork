@@ -14,7 +14,7 @@ import type { OpenAIProviderConfig } from "../../settings";
 import { ORIGINATOR, ORIGINATOR_CODEX } from "../../user-agent";
 import { createProviderTurnContext } from "../codex-turn-state";
 import type { CodexResponsesRequestBody } from "../codex-websocket";
-import { CODEX_DEFAULT_INSTRUCTIONS, type OAIMessage, OpenAIProvider } from "../openai-provider";
+import { type OAIMessage, OpenAIProvider } from "../openai-provider";
 import type { ChatParams } from "../provider";
 import { ApiRequestDumpCollector } from "../request-dump";
 import { StreamProgress } from "../stream-progress";
@@ -120,7 +120,7 @@ describe("codex HTTP chat request parity", () => {
 	});
 
 	/**
-	 * Codex 0.169.0 puts instructions in the input prefix for both contracts.
+	 * Codex 0.171.0 puts nonempty instructions in the input prefix for both contracts.
 	 * Non-lite retains top-level tools and parallel calls; the lite header must
 	 * not be paired with this body.
 	 */
@@ -130,11 +130,9 @@ describe("codex HTTP chat request parity", () => {
 		expect(req.headers["x-openai-internal-codex-responses-lite"]).toBeUndefined();
 		expect(req.body.tools).toBeDefined();
 		expect(req.body.instructions).toBeUndefined();
-		expect((req.body.input as unknown[])[0]).toMatchObject({
-			type: "message",
-			role: "developer",
-			content: [{ type: "input_text", text: CODEX_DEFAULT_INSTRUCTIONS }],
-		});
+		expect(req.body.input).toEqual([
+			{ role: "user", content: [{ type: "input_text", text: "hello" }] },
+		]);
 	});
 
 	test("HTTP and WS share the same stable instruction prefix without losing tools", async () => {
@@ -350,6 +348,32 @@ describe("codex HTTP chat request parity", () => {
 		}
 	});
 
+	test("native developer content and additional_tools stay in input without a synthetic prefix", async () => {
+		const developerItem = {
+			type: "message",
+			role: "developer",
+			id: "msg_supplied",
+			content: [{ type: "input_text", text: "supplied in position" }],
+		};
+		const toolsItem = {
+			type: "additional_tools",
+			role: "developer",
+			tools: [{ type: "function", name: "Read", parameters: { type: "object" } }],
+		};
+		for (const apiMode of ["responses", "codex"] as const) {
+			const { body } = await captureChat({
+				config: { apiMode },
+				chat: { history: [developerItem, toolsItem] },
+			});
+			expect(body).not.toHaveProperty("instructions");
+			expect(body.input).toEqual([
+				developerItem,
+				toolsItem,
+				{ role: "user", content: [{ type: "input_text", text: "hello" }] },
+			]);
+		}
+	});
+
 	test("ordinary Responses keeps root instructions", async () => {
 		const req = await captureChat({
 			config: { apiMode: "responses" },
@@ -375,7 +399,7 @@ describe("codex HTTP chat request parity", () => {
 				}),
 			},
 		});
-		expect(req.headers["user-agent"]).toBe("dynamic-client");
+		expect(req.headers["user-agent"]).toBe("static-client");
 		expect(req.headers["content-type"]).toBe("dynamic/type");
 		expect(req.headers.authorization).toBe("Bearer dynamic");
 		expect(req.headers["x-openai-internal-codex-responses-lite"]).toBeUndefined();

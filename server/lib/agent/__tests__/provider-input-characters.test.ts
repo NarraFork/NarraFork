@@ -13,7 +13,7 @@ import {
 	imageRefForBase64,
 	restoreOpenAIHistoryImages,
 } from "../nug-image-dedup";
-import { CODEX_DEFAULT_INSTRUCTIONS, OpenAIProvider } from "../openai-provider";
+import { OpenAIProvider } from "../openai-provider";
 import type { ChatParams, ProviderAdapter } from "../provider";
 import { resetUnsupportedParameterMemory } from "../unsupported-parameter-fallback";
 
@@ -346,7 +346,7 @@ describe("providers report their final logical inputs", () => {
 		}
 	});
 
-	test("Codex HTTP generated default instructions are fixed, identical historical text is not", async () => {
+	test("Codex HTTP counts only supplied instructions, and historical text is not a fixed prefix", async () => {
 		const provider = new OpenAIProvider({
 			id: "input",
 			name: "input",
@@ -361,6 +361,7 @@ describe("providers report their final logical inputs", () => {
 		});
 		globalThis.fetch = (async () =>
 			new Response("test failure", { status: 500 })) as unknown as typeof fetch;
+		const historyText = "explicit historical context";
 		for (const historical of [false, true]) {
 			const snapshots: Array<ContextInputCharacters | null> = [];
 			try {
@@ -368,7 +369,7 @@ describe("providers report their final logical inputs", () => {
 					provider,
 					params({
 						model: "codex:gpt-5.5",
-						history: historical ? [{ role: "developer", content: CODEX_DEFAULT_INSTRUCTIONS }] : [],
+						history: historical ? [{ role: "developer", content: historyText }] : [],
 						onInputCharacters: (value) => {
 							snapshots.push(value);
 						},
@@ -377,9 +378,9 @@ describe("providers report their final logical inputs", () => {
 			} catch {
 				/* Mocked failure. */
 			}
-			expect(snapshots[0]?.systemChars).toBe(historical ? 0 : CODEX_DEFAULT_INSTRUCTIONS.length);
+			expect(snapshots[0]?.systemChars).toBe(0);
 			expect((snapshots[0]?.totalChars ?? 0) - (snapshots[0]?.toolsChars ?? 0)).toBe(
-				CODEX_DEFAULT_INSTRUCTIONS.length + "current😀".length,
+				(historical ? historyText.length : 0) + "current😀".length,
 			);
 		}
 	});
@@ -554,10 +555,10 @@ describe("providers report their final logical inputs", () => {
 		globalThis.fetch = (async () => {
 			requests++;
 			if (requests === 1)
-				return new Response(
-					JSON.stringify({ detail: "Unsupported parameter: max_output_tokens" }),
-					{ status: 400, headers: { "content-type": "application/json" } },
-				);
+				return new Response(JSON.stringify({ detail: "Unsupported parameter: prompt_cache_key" }), {
+					status: 400,
+					headers: { "content-type": "application/json" },
+				});
 			return new Response('data: {"type":"response.completed","response":{"output":[]}}\n\n', {
 				headers: { "content-type": "text/event-stream" },
 			});
@@ -681,9 +682,13 @@ describe("providers report their final logical inputs", () => {
 					conversationId: `input-ws-default-${managed}`,
 					resetUpstreamSession: true,
 				});
-				expect(snapshots[2]?.systemChars).toBe(CODEX_DEFAULT_INSTRUCTIONS.length);
+				expect(frames[2].input).toEqual([
+					{ role: "user", content: [{ type: "input_text", text: "default turn" }] },
+				]);
+				expect(frames[2]).not.toHaveProperty("instructions");
+				expect(snapshots[2]?.systemChars).toBe(0);
 				expect((snapshots[2]?.totalChars ?? 0) - (snapshots[2]?.toolsChars ?? 0)).toBe(
-					CODEX_DEFAULT_INSTRUCTIONS.length + "default turn".length,
+					"default turn".length,
 				);
 			} finally {
 				restore();

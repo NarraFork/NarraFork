@@ -66,12 +66,8 @@ export function createCodexRequestIdentity(
 	};
 }
 
-/**
- * Codex 0.169.0 puts base instructions first in input in BOTH lite and non-lite
- * requests (codex-rs/core/src/client.rs, d32063f96c2dff1dc96af839b3952abb6acfeda4).
- * Tools remain top-level in our non-lite contract. IDs survive retries/restores,
- * while a changed instruction invalidates the WebSocket input-prefix match.
- */
+/** Codex 0.171.0 prepends base instructions only when nonempty (core/src/client.rs,
+ * ccf9be8cc458bd6b8336fe84d68d8893f2691a5e). Keep NF's stable ids on retries. */
 export function applyCodexInstructionsInput(
 	body: Record<string, unknown>,
 	identity: CodexRequestIdentity,
@@ -80,33 +76,38 @@ export function applyCodexInstructionsInput(
 	const instructions = body.instructions;
 	const sessionHash = createHash("sha256").update(identity.conversationId).digest("hex");
 	const prefix = `msg_nf_instructions_${sessionHash.slice(0, 12)}_`;
-	const instructionHash = createHash("sha256").update(instructions).digest("hex");
-	const textPart = { type: "input_text" as const, text: instructions };
-	const message = {
-		type: "message",
-		id: `${prefix}${instructionHash.slice(0, 24)}`,
-		role: "developer",
-		content: [textPart],
-	};
 	const input = Array.isArray(body.input)
-		? body.input
+		? body.input.filter((item: unknown) => {
+				if (!item || typeof item !== "object") return true;
+				const previous = item as Record<string, unknown>;
+				return !(
+					previous.type === "message" &&
+					previous.role === "developer" &&
+					typeof previous.id === "string" &&
+					previous.id.startsWith(prefix)
+				);
+			})
 		: typeof body.input === "string"
 			? [{ role: "user", content: body.input }]
 			: [];
+	delete body.instructions;
+	if (instructions.length === 0) {
+		body.input = input;
+		markInstructionsInput(body, undefined);
+		return;
+	}
+	const instructionHash = createHash("sha256").update(instructions).digest("hex");
+	const textPart = { type: "input_text" as const, text: instructions };
 	body.input = [
-		message,
-		...input.filter((item: unknown) => {
-			if (!item || typeof item !== "object") return true;
-			const previous = item as Record<string, unknown>;
-			return !(
-				previous.role === "developer" &&
-				typeof previous.id === "string" &&
-				previous.id.startsWith(prefix)
-			);
-		}),
+		{
+			type: "message",
+			id: `${prefix}${instructionHash.slice(0, 24)}`,
+			role: "developer",
+			content: [textPart],
+		},
+		...input,
 	];
 	markInstructionsInput(body, textPart);
-	delete body.instructions;
 }
 
 /**

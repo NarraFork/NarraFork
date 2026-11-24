@@ -1,5 +1,5 @@
 import type { NativeMediaInput } from "@shared/media-attachments";
-import { markRuntimeInstructions, reportInputCharacters } from "./input-characters";
+import { reportInputCharacters } from "./input-characters";
 import { rejectNativeMedia, storedMessageMedia } from "./native-media";
 import type { ToolLoadingTarget } from "./tool-loading";
 
@@ -30,14 +30,14 @@ import {
 	shouldTreatCodexStreamEventAsYielded,
 	streamCodexResponsesWebSocket,
 } from "./codex-websocket";
+import { ProviderInvalidStateError } from "./error-handling";
 import {
 	applyOpenAIModelMetadata,
-	CODEX_DEFAULT_INSTRUCTIONS,
 	convertHistoryToResponsesApi,
-	isResponsesInputItem,
 	type OAIContentPart,
 	type OAIMessage,
 	OpenAIProvider,
+	partitionResponsesMessages,
 	resolveCodexRequestReasoningEffort,
 	stampReasoningSource,
 	withCodexNativeTools,
@@ -74,6 +74,16 @@ function getCodexProviderErrorMessage(err: unknown): string {
 
 export function isCodexProviderExpected101WebSocketFailure(err: unknown): boolean {
 	return /Expected\s+101\s+status\s+code/i.test(getCodexProviderErrorMessage(err));
+}
+
+function isExplicitRefusalError(err: unknown): boolean {
+	return err instanceof ProviderInvalidStateError && err.reason === "refusal";
+}
+
+/** Content verdicts say nothing about the credential's health. */
+function isContentVerdict(event: ParsedStreamEvent): boolean {
+	const reason = event.invalidState?.reason;
+	return reason === "refusal" || isPolicyViolationCode(reason);
 }
 
 function classifyCodexError(
@@ -365,6 +375,7 @@ export class CodexProvider implements ProviderAdapter {
 		maxAttempts: number,
 		operation: string,
 	): Promise<boolean> {
+		if (isExplicitRefusalError(err)) return false;
 		const { classified, hasMore } = await this.reportCallError(ctx, err);
 		const shouldRetry =
 			classified.type === "quota_exhausted" &&
@@ -405,6 +416,7 @@ export class CodexProvider implements ProviderAdapter {
 				this.manager.reportSuccess(ctx.id);
 				return result;
 			} catch (err) {
+				if (isExplicitRefusalError(err)) throw err;
 				lastError = err;
 				attempt++;
 				if (attempt < maxAttempts && (await this.tryRecoverAgentIdentityTask(ctx, err))) {
@@ -517,25 +529,21 @@ export class CodexProvider implements ProviderAdapter {
 					params.onRequestStart?.({ credentialId: info?.credentialId ?? ctx.id }),
 			};
 			let hasStreamedEvents = false;
-			let sawPolicyViolation = false;
+			let sawContentVerdict = false;
 
 			try {
 				for await (const event of provider.chat(chatParams)) {
 					hasStreamedEvents ||= shouldTreatCodexStreamEventAsYielded(event);
-					// A policy-violation terminal event says nothing about credential
-					// health — count it as neither success nor failure.
-					sawPolicyViolation ||= isPolicyViolationCode(event.invalidState?.reason);
+					sawContentVerdict ||= isContentVerdict(event);
 					// Inject credentialId into the event
 					yield { ...event, credentialId: ctx.id };
 				}
-				if (!sawPolicyViolation) {
+				if (!sawContentVerdict) {
 					this.manager.reportSuccess(ctx.id);
 				}
 				return;
 			} catch (err) {
-				if (params.signal.aborted) {
-					throw err;
-				}
+				if (params.signal.aborted || isExplicitRefusalError(err)) throw err;
 				lastError = err;
 				attempt++;
 
@@ -591,7 +599,7 @@ export class CodexProvider implements ProviderAdapter {
 					params.onRequestStart?.({ credentialId: info?.credentialId ?? ctx.id }),
 			};
 			let hasStreamedEvents = false;
-			let sawPolicyViolation = false;
+			let sawContentVerdict = false;
 
 			try {
 				const request = this.buildResponsesWebSocketRequest(params, ctx.credential);
@@ -620,23 +628,19 @@ export class CodexProvider implements ProviderAdapter {
 					requestDump: params.requestDump,
 				})) {
 					hasStreamedEvents ||= shouldTreatCodexStreamEventAsYielded(event);
-					// Same neutrality rule as the SSE path: a policy violation is a
-					// content verdict, not a credential-health signal.
-					sawPolicyViolation ||= isPolicyViolationCode(event.invalidState?.reason);
+					sawContentVerdict ||= isContentVerdict(event);
 					// The WebSocket path bypasses OpenAIProvider.chat(), so tag encrypted
 					// reasoning credentials with the "codex" identity here — without it,
 					// the strict replay check on the next turn cannot prove ownership
 					// and would drop the credential.
 					yield { ...stampReasoningSource(event, "codex"), credentialId: ctx.id };
 				}
-				if (!sawPolicyViolation) {
+				if (!sawContentVerdict) {
 					this.manager.reportSuccess(ctx.id);
 				}
 				return;
 			} catch (err) {
-				if (params.signal.aborted) {
-					throw err;
-				}
+				if (params.signal.aborted || isExplicitRefusalError(err)) throw err;
 
 				// The transport already exhausted its own reconnect budget for this error and
 				// classified it as retryable. Surface it unchanged: routing it through the
@@ -660,10 +664,10 @@ export class CodexProvider implements ProviderAdapter {
 					try {
 						for await (const event of provider.chat(chatParams)) {
 							hasStreamedEvents ||= shouldTreatCodexStreamEventAsYielded(event);
-							sawPolicyViolation ||= isPolicyViolationCode(event.invalidState?.reason);
+							sawContentVerdict ||= isContentVerdict(event);
 							yield { ...event, credentialId: ctx.id };
 						}
-						if (!sawPolicyViolation) {
+						if (!sawContentVerdict) {
 							this.manager.reportSuccess(ctx.id);
 						}
 						return;
@@ -711,10 +715,10 @@ export class CodexProvider implements ProviderAdapter {
 					try {
 						for await (const event of provider.chat(chatParams)) {
 							hasStreamedEvents ||= shouldTreatCodexStreamEventAsYielded(event);
-							sawPolicyViolation ||= isPolicyViolationCode(event.invalidState?.reason);
+							sawContentVerdict ||= isContentVerdict(event);
 							yield { ...event, credentialId: ctx.id };
 						}
-						if (!sawPolicyViolation) {
+						if (!sawContentVerdict) {
 							this.manager.reportSuccess(ctx.id);
 						}
 						return;
@@ -824,32 +828,11 @@ export class CodexProvider implements ProviderAdapter {
 			messages.push({ role: "user", content: params.content });
 		}
 
-		let instructions = "";
-		const inputMessages: OAIMessage[] = [];
-		for (const msg of messages) {
-			// biome-ignore lint/suspicious/noExplicitAny: Responses API uses "developer" role
-			const role = (msg as any).role;
-			if (!isResponsesInputItem(msg) && (role === "system" || role === "developer")) {
-				if (typeof msg.content === "string") {
-					instructions += (instructions ? "\n\n" : "") + msg.content;
-				}
-				continue;
-			}
-			inputMessages.push(msg);
-		}
-
-		const sanitizedInputMessages = inputMessages.filter((msg) => {
-			if (msg.role !== "assistant") return true;
-			const hasToolCalls = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
-			if (hasToolCalls) return true;
-			if (typeof msg.content === "string") return msg.content.length > 0;
-			if (Array.isArray(msg.content)) return msg.content.length > 0;
-			return false;
-		});
+		const { instructions, input } = partitionResponsesMessages(messages);
 
 		const request: CodexResponsesRequestBody = {
 			model,
-			input: convertHistoryToResponsesApi(sanitizedInputMessages, {
+			input: convertHistoryToResponsesApi(input, {
 				// Codex runs official gpt/codex ids → credential-strict replay. The
 				// reasoning source identity is the "codex" prefix shared by every
 				// provider instance this class creates.
@@ -859,8 +842,7 @@ export class CodexProvider implements ProviderAdapter {
 			stream: true,
 			store: false,
 		};
-		request.instructions = instructions || CODEX_DEFAULT_INSTRUCTIONS;
-		if (!instructions) markRuntimeInstructions(request);
+		if (instructions) request.instructions = instructions;
 		const tools = withCodexNativeTools(params.tools, params.model, {
 			webSearch:
 				this.useWebSearch && isNativeSearchChannelFirstEnabled(undefined, "codex", params.model),
@@ -876,7 +858,13 @@ export class CodexProvider implements ProviderAdapter {
 			request.service_tier = params.serviceTier;
 		}
 
-		applyOpenAIModelMetadata(request, params.model, "codex", params.maxOutputTokens);
+		applyOpenAIModelMetadata(
+			request,
+			params.model,
+			"codex",
+			params.maxOutputTokens,
+			CODEX_BASE_URL,
+		);
 		return request;
 	}
 

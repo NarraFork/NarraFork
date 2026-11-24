@@ -1,7 +1,11 @@
-import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { z } from "zod/v4";
+import * as quotaWait from "../../provider-quota-wait";
 import type { AnthropicProviderConfig } from "../../settings";
 import { AnthropicProvider } from "../anthropic-provider";
+import { ProviderInvalidStateError } from "../error-handling";
 import type { ProviderAdapter } from "../provider";
+import { toolRegistry } from "../tool-registry";
 import type { AgentConfig, AgentEvent } from "../types";
 
 const provider = new AnthropicProvider({
@@ -230,6 +234,102 @@ describe("agentLoop provider invalidState classification", () => {
 		if (!end.diagnostics) throw new Error("missing diagnostics");
 		end.diagnostics.apiRequestId = "refusal-durable-row";
 		expect(terminal.diagnostics?.apiRequestId).toBe("refusal-durable-row");
+	});
+
+	test.each([
+		"stream",
+		"throw",
+	] as const)("explicit refusal boundary: %s skips malformed replay and quota lookup", async (source) => {
+		const message =
+			'Improperly formed request. Weekly usage limit reached. Unsupported parameter: "prompt_cache_key".';
+		const fetchCalls = installResponses([responseFailed(message, { code: "refusal" })]);
+		const quota = spyOn(quotaWait, "resolveProviderQuotaWait").mockResolvedValue({ kind: "none" });
+		const chat = spyOn(provider, "chat");
+		try {
+			if (source === "throw") {
+				chat.mockImplementation(async function* (params) {
+					params.onRequestStart?.();
+					yield {};
+					throw new ProviderInvalidStateError("refusal", message);
+				});
+			}
+			const events = await runLoop();
+			expect(chat).toHaveBeenCalledTimes(1);
+			expect(fetchCalls()).toBe(source === "stream" ? 1 : 0);
+			expect(quota).not.toHaveBeenCalled();
+			expect(events.filter((event) => event.type === "api_request_end")).toHaveLength(1);
+			expect(
+				events.some((event) => event.type === "retrying" || event.type === "stream_text"),
+			).toBe(false);
+			expect(events.at(-1)).toMatchObject({
+				type: "invalid_state",
+				reason: "refusal",
+				message,
+				diagnostics: { reason: "refusal" },
+			});
+		} finally {
+			chat.mockRestore();
+			quota.mockRestore();
+		}
+	});
+
+	test("explicit refusal boundary: an in-flight tool keeps its one real result", async () => {
+		const name = "RefusalResultProbe";
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let effects = 0;
+		toolRegistry.register({
+			name,
+			description: "In-process side effect probe",
+			parameters: z.object({}),
+			execute: async () => {
+				effects++;
+				started.resolve();
+				await release.promise;
+				return { output: "effect recorded" };
+			},
+		});
+		const message = "Improperly formed request.";
+		const chat = spyOn(provider, "chat").mockImplementation(async function* (params) {
+			params.onRequestStart?.();
+			yield { toolUses: [{ name, toolUseId: "probe", input: {} }] };
+			await started.promise;
+			yield { text: "prefix", invalidState: { reason: "refusal", message } };
+		});
+		try {
+			const events: AgentEvent[] = [];
+			const config = makeConfig(new AbortController().signal, {
+				toolFilter: (tool) => tool.name === name,
+			});
+			for await (const event of agentLoop(config, "answer", { rows: [] })) {
+				events.push(event);
+				// Release only once the terminal provider event is in the host.
+				if (event.type === "stream_text" && event.text === "prefix") release.resolve();
+			}
+			expect(effects).toBe(1);
+			expect(chat).toHaveBeenCalledTimes(1);
+			expect(events.filter((event) => event.type === "tool_result")).toMatchObject([
+				{ toolUseId: "probe", isError: false, output: "effect recorded" },
+			]);
+			expect(events.at(-1)).toMatchObject({ type: "invalid_state", reason: "refusal", message });
+		} finally {
+			release.resolve();
+			chat.mockRestore();
+			toolRegistry.unregister(name);
+		}
+	});
+
+	test("explicit refusal boundary: real malformed requests still replay, quoted errors in ordinary answers do not", async () => {
+		const message = "Improperly formed request. Weekly usage limit reached.";
+		const fetchCalls = installResponses([
+			responseFailed(message, { code: "api_error" }),
+			successfulResponse(message),
+		]);
+		const events = await runLoop();
+		expect(fetchCalls()).toBe(2);
+		expect(events.filter((event) => event.type === "retrying")).toHaveLength(1);
+		expect(events.find((event) => event.type === "stream_text")).toMatchObject({ text: message });
+		expect(events.at(-1)).toEqual({ type: "done" });
 	});
 
 	test("max_tokens 含部分文本时保留截断终态并继续消费 usage", async () => {

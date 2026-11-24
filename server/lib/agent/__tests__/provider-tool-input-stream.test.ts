@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { setOutboundFetchOverrideForTest } from "../../net/outbound-fetch";
 import { parseAnthropicEvent, parseAnthropicSSEStream } from "../anthropic-provider";
 import {
@@ -431,6 +431,234 @@ describe("provider incremental tool arguments", () => {
 			},
 		]);
 		expect(emptyEof.at(-1)?.toolUses?.[0].input).toEqual({ _raw: "" });
+	});
+
+	function chatDelta(calls: unknown[], text?: string) {
+		return {
+			choices: [{ index: 0, delta: { ...(text ? { content: text } : {}), tool_calls: calls } }],
+		};
+	}
+	const chatFinish = { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] };
+
+	test("Chat identity: arguments survive arriving before id and name", async () => {
+		const raw = '{"file_path":"x","content":"late identity"}';
+		const events = await chat([
+			chatDelta([{ index: 0, function: { arguments: raw } }], "preamble"),
+			chatDelta([{ index: 0, id: "late" }]),
+			chatDelta([{ index: 0, function: { name: "Write" } }]),
+			chatFinish,
+		]);
+		const chunks = events.flatMap((event) => (event.toolUseChunk ? [event.toolUseChunk] : []));
+		expect(chunks.every((chunk) => chunk.toolUseId === "late" && chunk.name === "Write")).toBe(
+			true,
+		);
+		expect(chunks.filter((chunk) => chunk.stop)).toHaveLength(1);
+		const input = new ToolInputStream();
+		for (const chunk of chunks) if (chunk.input) input.feed(chunk.input);
+		expect(input.finish()).toEqual(JSON.parse(raw));
+		expect(events[0].text).toBe("preamble");
+	});
+
+	test("Chat identity: a name-first call is independent of interleaved call indices", async () => {
+		const events = await chat([
+			chatDelta([{ index: 1, function: { name: "Read", arguments: '{"path":"one"}' } }]),
+			chatDelta([{ index: 0, id: "zero", function: { arguments: '{"path":"' } }]),
+			chatDelta([{ index: 1, id: "one" }]),
+			chatDelta([{ index: 0, function: { name: "Read", arguments: 'zero"}' } }]),
+			chatFinish,
+		]);
+		const calls = new Map<string, ToolInputStream>();
+		for (const event of events) {
+			const chunk = event.toolUseChunk;
+			if (!chunk) continue;
+			const input = calls.get(chunk.toolUseId) ?? new ToolInputStream();
+			calls.set(chunk.toolUseId, input);
+			if (chunk.input) input.feed(chunk.input);
+		}
+		expect(events.filter((event) => event.toolUseChunk?.stop)).toHaveLength(2);
+		expect(calls.get("zero")?.finish()).toEqual({ path: "zero" });
+		expect(calls.get("one")?.finish()).toEqual({ path: "one" });
+	});
+
+	test.each([
+		"id",
+		"name",
+	] as const)("Chat identity: missing %s is a terminal diagnostic, never an executable call", async (missing) => {
+		const events = await chat([
+			chatDelta([
+				{
+					index: 0,
+					...(missing === "id" ? {} : { id: "call" }),
+					function: { ...(missing === "name" ? {} : { name: "Write" }), arguments: '{"x":1}' },
+				},
+			]),
+			chatFinish,
+		]);
+		expect(events.some((event) => event.toolUses?.length || event.toolUseChunk)).toBe(false);
+		expect(events.at(-1)?.invalidState?.reason).toBe("invalid_tool_call");
+	});
+
+	test("Chat identity: repeated name snapshots, argument deltas and finish events complete once", async () => {
+		const call = { index: 0, id: "call", function: { name: "Write", arguments: '{"x":' } };
+		const events = await chat([
+			chatDelta([call]),
+			chatDelta([{ index: 0, id: "call", function: { name: "Write", arguments: "1}" } }]),
+			chatFinish,
+			chatFinish,
+			chatDelta([{ index: 0, id: "call", function: { name: "Write", arguments: '{"x":1}' } }]),
+			chatFinish,
+		]);
+		expect(events.filter((event) => event.toolUseChunk?.stop)).toHaveLength(1);
+		expect(
+			events.some((event) => event.invalidState || event.toolUseChunk?.name === "WriteWrite"),
+		).toBe(false);
+	});
+
+	test("Chat identity: changing an announced name cannot retarget buffered arguments", async () => {
+		const events = await chat([
+			chatDelta([
+				{ index: 0, id: "call", function: { name: "Read", arguments: '{"file_path":"' } },
+			]),
+			chatDelta([{ index: 0, function: { name: "Write", arguments: 'x"}' } }]),
+			chatFinish,
+		]);
+		expect(events.some((event) => event.toolUseChunk?.stop)).toBe(false);
+		expect(events.at(-1)?.invalidState?.reason).toBe("invalid_tool_call");
+	});
+
+	test.each([
+		-1,
+		128,
+		0.5,
+		"0",
+	])("Chat identity: an invalid index %s is not an executable call", async (index) => {
+		const events = await chat([
+			chatDelta([{ index, id: "call", function: { name: "Write", arguments: "{}" } }]),
+			chatFinish,
+		]);
+		expect(events.some((event) => event.toolUseChunk || event.toolUses?.length)).toBe(false);
+		expect(events.at(-1)?.invalidState?.reason).toBe("invalid_tool_call");
+	});
+
+	test.each([
+		false,
+		true,
+	])("Chat identity: changing an established ID is rejected, published=%s", async (published) => {
+		const events = await chat([
+			chatDelta([
+				{
+					index: 0,
+					id: "original",
+					function: { ...(published ? { name: "Read" } : {}), arguments: '{"path":"' },
+				},
+			]),
+			chatDelta([{ index: 0, id: "replacement", function: { name: "Read", arguments: 'x"}' } }]),
+			chatFinish,
+		]);
+		expect(events.some((event) => event.toolUseChunk?.stop)).toBe(false);
+		expect(events.at(-1)?.invalidState?.reason).toBe("invalid_tool_call");
+	});
+
+	test("Chat identity: an ID duplicated at another index does not create another execution", async () => {
+		const events = await chat([
+			chatDelta([{ index: 0, id: "same", function: { arguments: '{"path":"' } }]),
+			chatDelta([{ index: 1, id: "same", function: { name: "Read", arguments: '{"path":"x"}' } }]),
+		]);
+		expect(events.some((event) => event.toolUseChunk?.stop || event.toolUses?.length)).toBe(false);
+		expect(events.at(-1)?.invalidState?.reason).toBe("invalid_tool_call");
+	});
+
+	test.each([
+		"id",
+		"name",
+	] as const)("Chat identity: oversized %s is rejected, never truncated into another identity", async (field) => {
+		const events = await chat([
+			chatDelta([
+				{
+					index: 0,
+					id: field === "id" ? "x".repeat(1025) : "call",
+					function: { name: field === "name" ? "x".repeat(65) : "Read", arguments: "{}" },
+				},
+			]),
+		]);
+		expect(events.some((event) => event.toolUseChunk || event.toolUses?.length)).toBe(false);
+		expect(events.at(-1)?.invalidState?.reason).toBe("invalid_tool_call");
+	});
+
+	test("Chat identity: a compatible final snapshot can finish a name-less Chat buffer", async () => {
+		const raw = '{"file_path":"x","content":"final snapshot"}';
+		const events = await chat([
+			chatDelta([{ index: 0, id: "late-name", function: { arguments: '{"file_path":"draft' } }]),
+			{ item: { call_id: "late-name", name: "Write", status: "completed", arguments: raw } },
+			chatFinish,
+		]);
+		expect(events.filter((event) => event.toolUseChunk?.stop)).toHaveLength(1);
+		expect(events.find((event) => event.toolUseChunk?.stop)?.toolUseChunk).toMatchObject({
+			toolUseId: "late-name",
+			name: "Write",
+			finalInput: raw,
+		});
+		expect(events.some((event) => event.invalidState)).toBe(false);
+	});
+
+	test.each([
+		"length",
+		"content_filter",
+	])("Chat identity: %s does not turn metadata-only input into an empty executable call", async (finishReason) => {
+		const events = await chat([
+			chatDelta([{ index: 0, id: "not-finished", function: { name: "Write" } }]),
+			{ choices: [{ delta: {}, finish_reason: finishReason }] },
+		]);
+		expect(events.some((event) => event.toolUseChunk?.stop || event.toolUses?.length)).toBe(false);
+		expect(events.at(-1)?.invalidState?.reason).toBe(
+			finishReason === "length" ? "max_tokens" : "content_filter",
+		);
+	});
+
+	test("Chat identity: EOF without identity is an explicit failure, not a silent empty answer", async () => {
+		const events = await chat([chatDelta([{ index: 0, function: { arguments: "{}" } }])]);
+		expect(events.some((event) => event.toolUses?.length || event.toolUseChunk)).toBe(false);
+		expect(events.at(-1)?.invalidState?.reason).toBe("invalid_tool_call");
+	});
+
+	test.each([
+		"id",
+		"name",
+	] as const)("Chat identity: compatible response completion cannot supply a missing %s", async (missing) => {
+		const events = await chat([
+			chatDelta([
+				{
+					index: 0,
+					...(missing === "id" ? {} : { id: "call" }),
+					function: { ...(missing === "name" ? {} : { name: "Write" }), arguments: "{}" },
+				},
+			]),
+			{ response: { status: "completed", output: [] } },
+		]);
+		expect(events.some((event) => event.toolUseChunk || event.toolUses?.length)).toBe(false);
+		expect(events.at(-1)?.invalidState?.reason).toBe("invalid_tool_call");
+	});
+
+	test("Chat identity: a pending argument budget fails closed before publishing identity", async () => {
+		const originalFeed = ToolInputStream.prototype.feed;
+		const feed = spyOn(ToolInputStream.prototype, "feed").mockImplementation(function (
+			this: ToolInputStream,
+			text: string,
+		) {
+			originalFeed.call(this, text);
+			// Fault-inject the bookkeeping budget instead of allocating a 32 MiB fixture.
+			this.totalChars = 32 * 1024 * 1024;
+		});
+		try {
+			const events = await chat([
+				chatDelta([{ index: 0, function: { arguments: "{" } }]),
+				chatDelta([{ index: 0, function: { arguments: "}" } }]),
+			]);
+			expect(events.some((event) => event.toolUseChunk || event.toolUses?.length)).toBe(false);
+			expect(events.at(-1)?.invalidState?.reason).toBe("invalid_tool_call");
+		} finally {
+			feed.mockRestore();
+		}
 	});
 
 	test("compatibility Responses forwards initial and done-only snapshots without appending", async () => {

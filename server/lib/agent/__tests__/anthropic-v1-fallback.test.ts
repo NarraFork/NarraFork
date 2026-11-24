@@ -1,7 +1,4 @@
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 
 /**
  * Regression tests for AnthropicProvider's `/v1` base-URL fallback (exercised
@@ -40,22 +37,16 @@ interface TestProvider {
 }
 
 let AnthropicProvider: new (config: Record<string, unknown>) => TestProvider;
-let testHome = "";
-let originalNarraforkHome: string | undefined;
 let setOutboundFetchOverrideForTest: (
 	override: ((input: string | URL | Request, init?: RequestInit) => Promise<Response>) | null,
 ) => void;
 
 beforeAll(async () => {
-	// Importing anthropic-provider transitively initialises the DB layer, which
-	// resolves its data dir from NARRAFORK_HOME (NOT process.env.HOME — node's
-	// os.homedir() reads the system passwd entry, so overriding HOME would not
-	// isolate it). Point it at a fresh temp dir so the test uses its own empty
-	// SQLite file instead of contending for the real ~/.narrafork instance lock
-	// (which also skips the multi-second startup integrity check on a real DB).
-	originalNarraforkHome = process.env.NARRAFORK_HOME;
-	testHome = mkdtempSync(join(tmpdir(), "narrafork-anthropic-v1fallback-"));
-	process.env.NARRAFORK_HOME = testHome;
+	// The standard Bun preload owns and validates the isolated HOME. Do not
+	// create a second data directory with watchers that outlive this test file.
+	if (process.env.NARRAFORK_TEST !== "1" || !process.env.NARRAFORK_HOME) {
+		throw new Error("Anthropic fallback tests require the isolated tests/preload.ts environment");
+	}
 	const [mod, outboundFetchMod] = await Promise.all([
 		import("../anthropic-provider"),
 		import("../../net/outbound-fetch"),
@@ -72,9 +63,6 @@ afterEach(() => {
 
 afterAll(() => {
 	setOutboundFetchOverrideForTest(null);
-	if (originalNarraforkHome === undefined) delete process.env.NARRAFORK_HOME;
-	else process.env.NARRAFORK_HOME = originalNarraforkHome;
-	if (testHome) rmSync(testHome, { recursive: true, force: true });
 });
 
 /** Unique base URL per test to avoid the process-wide v1FallbackCache leaking. */

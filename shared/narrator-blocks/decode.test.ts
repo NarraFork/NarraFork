@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { encodeToolOutput } from "../agent-protocol/tool-output";
+import type { TextProviderMetadata } from "../agent-protocol/types";
 import { historyClearedText } from "../storage-retention";
 import { type DecodableMessage, decodeLegacyContent, splitToolInput } from "./decode";
 import { isModelVisible } from "./types";
@@ -591,7 +592,7 @@ describe("splitToolInput", () => {
 });
 
 test("assistant text keeps per-item and per-part continuation metadata independently of lifecycle", () => {
-	const metadata = [
+	const metadata: TextProviderMetadata[] = [
 		{ openai: { itemId: "msg-comment", contentIndex: 0, phase: "commentary" } },
 		{ openai: { itemId: "msg-partial", contentIndex: 0, phase: "partial_answer" } },
 		{ openai: { itemId: "msg-final", contentIndex: 0, phase: "final_answer" } },

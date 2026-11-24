@@ -3,24 +3,32 @@ import { logger } from "../../logger";
 import { applyCodexInstructionsInput, createCodexRequestIdentity } from "../codex-request";
 import {
 	countInputCharacters,
-	markRuntimeInstructions,
 	markRuntimeSystemMessage,
 	reportInputCharacters,
 } from "../input-characters";
 
 describe("complete logical input characters", () => {
-	for (const source of ["runtime-prefix", "generated-default", "historical-only"] as const) {
+	for (const source of ["runtime-prefix", "empty", "historical-only"] as const) {
 		test(`Codex instruction migration preserves ${source} counts and composition`, async () => {
 			const runtime = markRuntimeSystemMessage({ role: "developer", content: "fixed" });
 			const historical = { role: "system", content: "historical" };
-			const history = source === "runtime-prefix" ? [runtime, historical] : [historical];
-			const instructions = source === "runtime-prefix" ? "fixed\n\nhistorical" : "historical";
+			const history =
+				source === "runtime-prefix"
+					? [runtime, historical]
+					: source === "empty"
+						? []
+						: [historical];
+			const instructions =
+				source === "runtime-prefix"
+					? "fixed\n\nhistorical"
+					: source === "empty"
+						? ""
+						: "historical";
 			const body: Record<string, unknown> = {
 				instructions,
 				input: [{ role: "user", content: "question" }],
 				tools: [{ type: "function", name: "Read" }],
 			};
-			if (source === "generated-default") markRuntimeInstructions(body);
 			const counts: unknown[] = [];
 			const params = {
 				history,
@@ -34,12 +42,7 @@ describe("complete logical input characters", () => {
 			await reportInputCharacters(params, body);
 			expect(counts[1]).toEqual(counts[0]);
 			expect(counts[1]).toMatchObject({
-				systemChars:
-					source === "runtime-prefix"
-						? 5
-						: source === "generated-default"
-							? instructions.length
-							: 0,
+				systemChars: source === "runtime-prefix" ? 5 : 0,
 			});
 			expect(
 				(

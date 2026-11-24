@@ -68,6 +68,7 @@ import {
 	isModelUnavailableError,
 	isResumableError,
 	isRetryableError,
+	ProviderInvalidStateError,
 } from "./error-handling";
 import { localPathSemantics } from "./execution/path-semantics";
 import { buildAdapterHistory, historyTail } from "./history-build";
@@ -4489,6 +4490,19 @@ async function* agentLoopInMetadataSnapshot(
 				};
 			}
 
+			async function* finishInvalidState(
+				reason: string,
+				message: string,
+			): AsyncGenerator<AgentEvent> {
+				// Preserve already-started tool results and partial output, but do not start
+				// queued tools or let the empty-response guard replay a terminal verdict.
+				yield* drainStartedEarlyToolResults();
+				sawErrorEvent = true;
+				yield* outputContent.flush();
+				yield* finishRequest(message);
+				yield { type: "invalid_state", reason, message, diagnostics: requestDiagnostics };
+			}
+
 			// ── Transient-error retry loop ──
 			// For stateless providers (anthropic, openai-completions)
 			// we can safely retry the exact same provider.chat() call with identical
@@ -6131,6 +6145,11 @@ async function* agentLoopInMetadataSnapshot(
 								provider: parsed.invalidState.diagnostics?.provider ?? effectiveProvider,
 								model: parsed.invalidState.diagnostics?.model ?? effectiveModel,
 							});
+							// A structured refusal carries model output, not gateway error text.
+							if (reason === "refusal") {
+								yield* finishInvalidState(reason, message);
+								return;
+							}
 							// Opaque upstream "malformed request body" rejection delivered as a stream
 							// error event (NUG relays the upstream ValidationException this way). Capture
 							// the exact request before any classification path consumes the error.
@@ -6376,21 +6395,7 @@ async function* agentLoopInMetadataSnapshot(
 								yield { type: "retryable_error", message, diagnostics: requestDiagnostics };
 								return;
 							}
-							// Non-retryable invalidState — treat as a terminal error.
-							// Flush any partial content and return immediately so the original
-							// error surfaces to the user instead of being masked by the
-							// downstream empty-response check (which would retry and eventually
-							// report a misleading "Provider returned an empty response" message).
-							yield* drainStartedEarlyToolResults();
-							sawErrorEvent = true;
-							yield* outputContent.flush();
-							yield* finishRequest(message);
-							yield {
-								type: "invalid_state",
-								reason,
-								message,
-								diagnostics: requestDiagnostics,
-							};
+							yield* finishInvalidState(reason, message);
 							return;
 						}
 					}
@@ -6601,6 +6606,21 @@ async function* agentLoopInMetadataSnapshot(
 						return;
 					}
 					const msg = extractErrorMessage(err);
+					const explicitRefusal =
+						err instanceof ProviderInvalidStateError && err.reason === "refusal";
+					requestDiagnostics = normalizeApiRequestDiagnostics({
+						...diagnosticsFromError(err),
+						...(explicitRefusal ? { reason: err.reason } : {}),
+						recordingRequestId: undefined,
+						apiRequestId: undefined,
+						message: msg,
+						provider: effectiveProvider,
+						model: effectiveModel,
+					});
+					if (explicitRefusal) {
+						yield* finishInvalidState(err.reason, msg);
+						return;
+					}
 					// An upstream that goes quiet mid-stream used to leave no trace at all:
 					// the turn simply stalled until some hop on the path dropped the
 					// connection, and the only surviving record was a generic transport
@@ -6627,14 +6647,6 @@ async function* agentLoopInMetadataSnapshot(
 							settledToolCount: settledResults.size,
 						});
 					}
-					requestDiagnostics = normalizeApiRequestDiagnostics({
-						...diagnosticsFromError(err),
-						recordingRequestId: undefined,
-						apiRequestId: undefined,
-						message: msg,
-						provider: effectiveProvider,
-						model: effectiveModel,
-					});
 					// TokenDance recovery requires human action: no automatic repair, replay or failover.
 					if (requestDiagnostics?.tokendanceRecoveryAction) {
 						yield* outputContent.flush();

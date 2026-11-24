@@ -36,6 +36,7 @@ import {
 	type ResponsesReasoningAccum,
 	type ResponsesToolAccum,
 } from "./openai-provider";
+import { openAIRefusalFor } from "./openai-refusal";
 import type { ParsedStreamEvent } from "./provider";
 import { type ApiRequestDumpCollector, sanitizeHeaders } from "./request-dump";
 import { createRequestBodyEncoder } from "./request-json";
@@ -1320,6 +1321,11 @@ export async function* streamCodexResponsesWebSocket(
 	let toolAccum = new Map<number, ResponsesToolAccum>();
 	let reasoningAccum = new Map<number, ResponsesReasoningAccum>();
 	let requestDispatched = false;
+	async function* finishRefusal(): AsyncGenerator<ParsedStreamEvent> {
+		await discardResponseChain(session);
+		connection = null;
+		yield openAIRefusalFor(toolAccum).event();
+	}
 	const resetAbortedSessionIfNeeded = async () => {
 		if (!completed && options.signal.aborted && (requestDispatched || connection)) {
 			await resetSession(session, false);
@@ -1580,6 +1586,10 @@ export async function* streamCodexResponsesWebSocket(
 					options.signal,
 				);
 			} catch (error) {
+				if (!options.signal.aborted && openAIRefusalFor(toolAccum).seen) {
+					yield* finishRefusal();
+					return;
+				}
 				if (!isCodexWebSocketIdleTimeoutError(error)) {
 					throw error;
 				}
@@ -1624,6 +1634,10 @@ export async function* streamCodexResponsesWebSocket(
 				return;
 			}
 			if (frame.type === "error") {
+				if (!options.signal.aborted && openAIRefusalFor(toolAccum).seen) {
+					yield* finishRefusal();
+					return;
+				}
 				throw frame.error;
 			}
 			if (frame.type === "close") {
@@ -1639,6 +1653,15 @@ export async function* streamCodexResponsesWebSocket(
 					const errorCode = closeWrappedError.error?.code ?? closeWrappedError.error?.type;
 					const error = formatWrappedError(closeWrappedError);
 					const closeViolation = wrappedPolicyViolationCode(closeWrappedError);
+					if (
+						!closeViolation &&
+						openAIRefusalFor(toolAccum).seen &&
+						(isCodexWebSocketConnectionLimitError(closeWrappedError) ||
+							isCodexWebSocketPreviousResponseMissingError(closeWrappedError))
+					) {
+						yield* finishRefusal();
+						return;
+					}
 					if (closeViolation) {
 						// A policy verdict delivered on the close frame is a content refusal,
 						// not a transport failure. Emit it as a terminal invalidState (the
@@ -1712,6 +1735,10 @@ export async function* streamCodexResponsesWebSocket(
 				// it at 123 bytes. Salvage the error code before treating this as an
 				// anonymous disconnect; see findCodexRecoverableCloseCode.
 				const truncatedCode = findCodexRecoverableCloseCode(frame.reason);
+				if (truncatedCode && openAIRefusalFor(toolAccum).seen) {
+					yield* finishRefusal();
+					return;
+				}
 				if (truncatedCode === CONNECTION_LIMIT_REACHED_CODE) {
 					const outcome = await handleConnectionLimitReached({
 						message: frame.reason.trim() || CONNECTION_LIMIT_REACHED_CODE,
@@ -1751,6 +1778,10 @@ export async function* streamCodexResponsesWebSocket(
 					return;
 				}
 
+				if (openAIRefusalFor(toolAccum).seen) {
+					yield* finishRefusal();
+					return;
+				}
 				const latestMessageCreatedAt = await getLatestNarratorMessageCreatedAt(options.narratorId);
 				const decision = decidePrematureCodexReconnect(
 					latestMessageCreatedAt,
@@ -1799,6 +1830,15 @@ export async function* streamCodexResponsesWebSocket(
 				const status = wrappedError.status ?? wrappedError.status_code;
 				const error = formatWrappedError(wrappedError);
 				const frameViolation = wrappedPolicyViolationCode(wrappedError);
+				if (
+					!frameViolation &&
+					openAIRefusalFor(toolAccum).seen &&
+					(isCodexWebSocketConnectionLimitError(wrappedError) ||
+						isCodexWebSocketPreviousResponseMissingError(wrappedError))
+				) {
+					yield* finishRefusal();
+					return;
+				}
 				if (frameViolation) {
 					// Same rule as the close-frame path: a policy verdict rides out as a
 					// terminal invalidState, never as a thrown error that retry
@@ -1872,11 +1912,9 @@ export async function* streamCodexResponsesWebSocket(
 			if (chunk.type === "response.created" && chunk.response?.id) {
 				responseId = String(chunk.response.id);
 			}
-			if (chunk.type === "response.output_item.done" && chunk.item) {
-				itemsAdded.push(await itemSignature(chunk.item, options.signal));
-			}
-
 			const parsedEvents = parseResponsesAPIEvent(chunk, toolAccum, reasoningAccum);
+			const refusal = openAIRefusalFor(toolAccum);
+			hasYieldedEvents ||= refusal.seen;
 			if (parsedEvents.some((event) => event.invalidState)) {
 				// A relay may label an errored response "completed". The parsed failure
 				// outranks that label: never cache it as a successful continuation chain.
@@ -1887,6 +1925,9 @@ export async function* streamCodexResponsesWebSocket(
 				return;
 			}
 
+			if (!refusal.seen && chunk.type === "response.output_item.done" && chunk.item) {
+				itemsAdded.push(await itemSignature(chunk.item, options.signal));
+			}
 			for (const event of parsedEvents) {
 				hasYieldedEvents ||= shouldTreatCodexStreamEventAsYielded(event);
 				yield event;

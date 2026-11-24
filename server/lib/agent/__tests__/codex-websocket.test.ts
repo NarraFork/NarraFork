@@ -186,10 +186,8 @@ describe("Codex Responses WebSocket helpers", () => {
 		);
 		const first = { ...makeUserMessage("hello"), wide };
 		const lastRequest = makeRequest([first]);
-		const nextRequest = makeRequest([
-			{ ...first, wide: { ...wide, field_512: "changed" } },
-			makeUserMessage("next"),
-		]);
+		const changed = { ...first, wide: { ...wide, field_512: "changed" } };
+		const nextRequest = makeRequest([changed, makeUserMessage("next")]);
 		const full = await buildCodexResponsesWebSocketRequest(
 			nextRequest,
 			lastRequest,

@@ -88,6 +88,27 @@ describe("applyCodexInstructionsInput", () => {
 		});
 	});
 
+	test("empty base instructions do not invent a message or discard other input", () => {
+		const body = request("");
+		const items = [
+			{ type: "additional_tools", role: "developer", tools: [] },
+			{ role: "user", content: "hi" },
+		];
+		body.input = items;
+		applyCodexInstructionsInput(body, identity);
+		expect(body).not.toHaveProperty("instructions");
+		expect(body.input).toEqual(items);
+		body.instructions = "actual base instructions";
+		applyCodexInstructionsInput(body, identity);
+		expect(body.input).toHaveLength(3);
+		// An explicit empty replacement removes only our previously generated prefix.
+		body.instructions = "";
+		applyCodexInstructionsInput(body, identity);
+		expect(body.input).toEqual(items);
+		applyCodexInstructionsInput(body, identity);
+		expect(body.input).toEqual(items);
+	});
+
 	test("rebuilds stable IDs across retry/restoration and replaces an existing prefix", () => {
 		const body = request();
 		const rebuilt = request();

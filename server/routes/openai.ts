@@ -14,6 +14,7 @@ import {
 	settings,
 } from "../lib/settings";
 import {
+	applyExplicitUserAgent,
 	getHttpCodexUserAgent,
 	getHttpUserAgent,
 	mergeExtraHeaders,
@@ -274,6 +275,16 @@ export async function fetchOpenaiModels(
 	// Catalog and inference must honor the same explicit identity overrides.
 	mergeExtraHeaders(headers, fingerprint.headers, "User-Agent");
 	mergeExtraHeaders(headers, config.dynamicHeaders?.(), "User-Agent");
+	applyExplicitUserAgent(
+		headers,
+		{
+			mode: config.userAgentMode,
+			custom: config.customUserAgent,
+			extraHeaders: config.extraHeaders,
+		},
+		"User-Agent",
+		fingerprint.userAgent,
+	);
 	stripResponsesLiteHeader(headers);
 	const candidates = buildModelsUrls(baseUrl);
 	const errors: string[] = [];

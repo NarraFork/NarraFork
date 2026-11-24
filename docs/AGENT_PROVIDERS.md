@@ -104,3 +104,46 @@
 - 尾部提示行直接保留在统一历史投影中；工具变更跟随同一条记录，避免实时路径和重建路径各放一次。
 - `custom_injection` 在共享历史构建阶段把冻结 schema 追加到提示文本；原生方式由 `toolLoadingChangeOf(row)` 进入 neutral item，再由适配器放置。
 - plan mode 或配置变化可以刷新执行状态，但不换代、不重写描述；工具定义的首次发布字节保持固定。同名不兼容定义不能靠 registry generation 自动换代掩盖，应按实际不可用/参数错误处理，下一合法边界再吸收新定义。
+
+## 公开契约与 CLI 对照基线（2026-11-23）
+
+本轮核验时，以下均为官方最新稳定发行；这是可复查的固定基线，不是自动跟随 latest 的承诺。发布日期按 UTC 记录。CLI 身份版本集中在 [user-agent.ts](../server/lib/user-agent.ts)，显式非空 `extraHeaders` UA 优先于用户选择的模式/custom UA，再优先于动态或协议默认 UA；空白不清默认，头名大小写无关。只有 UA 取得这层最终优先级，动态认证、通道头及传输钩子的其他字段仍按原规则更新。
+
+在 [UA 选择](../server/lib/user-agent.ts#L402-L432) 和 [HTTP 最终发送](../server/lib/agent/provider-transport.ts#L14-L41) 两处可以追到同一规则；[WS 握手、重连和路由状态](codex-websocket.md#L57-L71)另有说明。
+
+| 对照对象 | 固定版本与发行证据 | 使用边界 |
+| --- | --- | --- |
+| Codex CLI | [rust-v0.171.0](https://github.com/openai/codex/releases/tag/rust-v0.171.0)，2026-11-20；签注标签 `295eca93394bb83a6ec8e0841033f3997f97fcbd` 指向源码提交 `ccf9be8cc458bd6b8336fe84d68d8893f2691a5e` | Codex 后端的请求构造与最小身份对照，不等于公开 Responses 的通用契约 |
+| Claude Code CLI | [v2.1.330](https://github.com/anthropics/claude-code/releases/tag/v2.1.330)，2026-11-20；公开仓库标签提交 `e791a1c41eee7504672a109fd6eb66b11566b8a1` | 公开仓库是发行/变更记录，不是完整 CLI 实现源码；静态实现对照来自此前已校验的原生分发物，构建提交为 `8c664bec500172ded713624f9ecac0eb7e714829` |
+| 公开 OpenAI SDK | [openai-node v7.62.0](https://github.com/openai/openai-node/releases/tag/v7.62.0)，2026-11-20 | Responses 与 Chat Completions 的公开字段/事件类型，不推断 Codex 私有方言 |
+| 公开 Anthropic SDK | [anthropic-sdk-typescript sdk-v1.12.0](https://github.com/anthropics/anthropic-sdk-typescript/releases/tag/sdk-v1.12.0)，2026-11-20 | Messages 的公开契约；不把该版本填成 Claude Code 捆绑 SDK 版本 |
+
+Claude Code 的 [主包元数据](https://registry.npmjs.org/@anthropic-ai%2Fclaude-code/2.1.330) 与 [linux-x64 原生包元数据](https://registry.npmjs.org/@anthropic-ai%2Fclaude-code-linux-x64/2.1.330) 明确分开。后者的 registry `dist.integrity` 如下，复查分发物时应校验压缩包完整字节，而不是把公开仓库标签 SHA 当作二进制摘要：
+
+```text
+@anthropic-ai/claude-code-linux-x64@2.1.330
+sha512-9Gn+V7DtJ8M1nztP9CeDVl9g3RtrepI7rOFTyPRRnZe8D6zebIHKmC7OvBauucuAP0X0k85SDN/LPVZyjsGezQ==
+```
+
+公开字段以 [Anthropic Messages 版本迁移说明](https://platform.claude.com/docs/zh-CN/api/migration-2026-10-21)、[OpenAI Chat Completions 创建参数](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create) 和 [OpenAI Responses 创建参数](https://developers.openai.com/api/reference/resources/responses/methods/create) 为依据。CLI 行为另以表中固定标签和分发物为据；Claude Code 安装页在审计环境返回地区限制页，未用作实现证据。
+
+### 有意保留的差异
+
+- **三种公开契约与 Codex 方言分开。** 普通 Responses 保留顶层基础 `instructions`；[Codex 0.171.0 的非空判断](https://github.com/openai/codex/blob/ccf9be8cc458bd6b8336fe84d68d8893f2691a5e/codex-rs/core/src/client.rs#L1240-L1251)才产生稳定 ID 的 developer 前缀。空指令不造前缀，也不补默认 CLI 文本。`context_update` 仍留在原有 user 载体，不借版本更新改宿主或缓存纪元。
+- **非 lite 声明与正文一致。** Codex 保留顶层工具及并行工具调用，不声明或接受额外头中的 `x-openai-internal-codex-responses-lite`；这不是删除工具后重试的理由，也不保证每个模型都支持非 lite。
+- **`partial_answer` 不是误拼。** [Codex 的 MessagePhase](https://github.com/openai/codex/blob/ccf9be8cc458bd6b8336fe84d68d8893f2691a5e/codex-rs/protocol/src/models.rs#L1051-L1065)确有 `commentary`、`partial_answer`、`final_answer`；[公开 SDK 的 phase 类型](https://github.com/openai/openai-node/blob/v7.62.0/src/resources/responses/responses.ts#L979)只列两种。不能因 SDK 少列而删除已证实的 Codex 值，也不能把 CLI 的三值枚举宣告为所有公开 Responses 端点的能力。NF 保留真实 item/part 身份及明确的同轮续写信号；缺字段不臆造 phase 或继续标记。
+- **输出上限。** [预算字段选择](../server/lib/agent/openai-provider.ts#L154-L180)按协议和端点区分：公开 Chat 使用 `max_completion_tokens`，需要旧字段的网关使用 `max_tokens`；普通 Responses 使用 `max_output_tokens`，公开端点的有效上限小于 16 时在发送前报错，不擅自调高。Codex 后端不发送该字段。[参数回退](../server/lib/agent/unsupported-parameter-fallback.ts#L3-L7)不会把这三个预算字段当作可删除选项。
+- **Anthropic 版本与正文配对。** [公开 SDK 的默认版本](https://github.com/anthropics/anthropic-sdk-typescript/blob/sdk-v1.12.0/src/client.ts#L2135)为 `2026-10-21`。NF 的[版本选择](../server/lib/agent/anthropic-api-version.ts#L7-L39)只对标准公开直连、非 Claude Code 方言且无显式覆盖的配置自动选新版；CLI 方言和兼容网关默认 `2023-06-01`。新版不发 `temperature`/`top_p`/`top_k`。[消息块转换](../server/lib/agent/anthropic-api-version.ts#L72-L97)作用于出站内容，不改存储历史。
+- **拒绝与工具调用。** [拒绝解析器](../server/lib/agent/openai-refusal.ts#L3-L41)按协议字段识别拒绝，在保留已收到的用量后交付一次不可重试的结果，不触发空回答恢复；文本收集有长度和分段上限。Chat [工具分片](../server/lib/agent/openai-provider.ts#L3531-L3636)须有完整 ID 和名称才发布；先到参数可缓存，重复完成不能二次执行。[工具参数必填性](../server/lib/agent/tool-registry.ts#L213-L249)按声明结构判断，不执行预处理函数探测。
+- **不是整套 CLI 仿冒。** 不新增私有计费/签名/证明算法、凭证、遥测或内部调度，也不复制尚未实现的 beta 能力。既有 Anthropic CLI 方言的捆绑 SDK 兼容头与早期模型 beta 门控保留其已审计边界，不宣称全部重新复刻了 2.1.330。认证归属、工具权限、Worker 隔离、取消、缓存纪元与同轮路由锁不因身份版本号改变。
+
+本地正负向回归、真实 loopback HTTP/WS 捕获和发行包静态核验，不能证明真实上游接受每个字段、命中缓存或把请求可信地识别为官方客户端。UA/版本自报不是签名或身份凭据；要求真正由官方 CLI 发出时，应走官方 CLI 及授权路径。官方 SDK 接入不等同于 CLI 请求，也不提供额外的客户端身份证明。
+
+### 本地验收记录
+
+以下结果来自基线 `499a21f9e` 上本次修改后的工作区；使用 `bun test --isolate`，不代表全仓 CI 或线上服务商验收。
+
+- **协议行为：25 个不同文件，892 通过、0 失败、2 项既有跳过。** [显式拒绝](../server/lib/agent/__tests__/openai-refusal.test.ts) 33 项、[工具调用分片](../server/lib/agent/__tests__/provider-tool-input-stream.test.ts) 41 项、预算/请求构造 150 项、错误/凭据/计量 264 项、schema/版本/旧会话等 404 项。两项跳过是 [ExitPlanMode 已知的声明差异](../server/lib/agent/tools/__tests__/tools.test.ts#L1441-L1479)，不计通过。
+- **最终请求：3 文件，170 通过、0 失败，单独报告。** [HTTP、搜索与降级](../server/lib/agent/__tests__/user-agent-egress.test.ts#L853)、[WS 复用和认证切换](../server/lib/agent/__tests__/codex-websocket-recovery.test.ts#L888-L933)、[模型目录回退](../server/routes/__tests__/models-fallback.test.ts#L337)使用本地接收端和测试凭据核对请求头及正文。仅改 UA 会重新握手但保留同轮路由；换认证不沿用旧凭据的 token。
+- **整仓类型检查通过。** 本机按根 `tsconfig.json` 运行 `bunx tsgo --noEmit --checkers 1 -p tsconfig.json`，没有排除文件或放宽 `strict`；编译器检查 10,956 个文件，报告总耗时 348.04 秒，退出码 0。修正类型诊断的 8 个测试文件另行隔离复跑：338 通过、0 失败（与上面的测试有重合，不累加）。
+- **其他检查：**Biome 无错误，仍有 12 个警告；`git diff --check` 和 `bun run i18n:check` 成功。i18n 有目录和额外键警告；Windows 有测试临时目录 `EBUSY` 清理警告，不影响上述用例结果。

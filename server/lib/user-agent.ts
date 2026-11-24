@@ -4,23 +4,19 @@ import { APP_VERSION } from "./version";
 
 export const ORIGINATOR = "narrafork";
 /**
- * Claude Code CLI version mimicked by the "claude-code" User-Agent mode.
+ * Managed Claude Code identity, pinned by the 2026-11-23 audit to 2.1.330
+ * (released 2026-11-20 UTC). Native build: 8c664bec500172ded713624f9ecac0eb7e714829.
+ * The previously verified native distribution, not the public SDK's latest
+ * version, is the CLI reference. See docs/AGENT_PROVIDERS.md for provenance.
  *
- * Must stay in sync with the `cc_version` reported in the Anthropic billing
- * block (see CC_CLI_VERSION in agent/anthropic-provider.ts): a request whose
- * User-Agent and billing block disagree does not match any real CLI release.
- *
- * Verified against the official 2.1.325 native distribution (2026-11-13),
- * build a360e7297ecfcddeae9ec99fb3c93153ed86aca4. Its embedded readable bundle
- * reports this VERSION; the npm tarball integrity and binary SHA-256 were
- * checked against the registry and official manifest. This version pin does
- * not imply support for every optional capability of that release.
+ * The existing CLI-dialect cc_version uses this same pin. Neither the version
+ * nor UA proves official-client origin, and this is not a complete wire clone.
  */
-export const CLAUDE_CLI_VERSION = "2.1.325";
-// Managed Codex client version used only for outbound protocol emulation.
-// Keep the User-Agent prefix/suffix and originator aligned when updating it.
-// openai/codex rust-v0.169.0, d32063f96c2dff1dc96af839b3952abb6acfeda4.
-export const CODEX_CLI_VERSION = "0.169.0";
+export const CLAUDE_CLI_VERSION = "2.1.330";
+// Managed Codex identity only; prefix/suffix and originator must stay aligned.
+// openai/codex rust-v0.171.0 (2026-11-20 UTC),
+// ccf9be8cc458bd6b8336fe84d68d8893f2691a5e.
+export const CODEX_CLI_VERSION = "0.171.0";
 export const ORIGINATOR_CODEX = "codex-tui";
 
 /**
@@ -286,9 +282,9 @@ export function getHttpCodexUserAgent(): string {
  * driven by the per-model `ModelInfo.use_responses_lite` flag, which upstream
  * publishes in its model catalog. When that flag is set, codex-rs/core/src/client.rs
  * sends the header, moves `tools` into an `additional_tools` input item, and
- * forces `parallel_tool_calls: false`. As of 0.169.0, base instructions are a
- * developer input prefix in BOTH lite and non-lite requests. Upstream validates
- * the tools/header pairing and rejects the
+ * forces `parallel_tool_calls: false`. In 0.171.0, NONEMPTY base instructions
+ * are a developer input prefix in BOTH lite and non-lite requests; empty
+ * instructions produce no prefix. Upstream validates the tools/header pairing and rejects the
  * header whenever `tools` carries anything but function/custom/client-executed
  * search tools:
  *
@@ -296,7 +292,7 @@ export function getHttpCodexUserAgent(): string {
  *    custom tools, and client-executed tool search."
  *
  * NarraFork implements the non-lite branch with top-level tools, including
- * hosted `web_search`/`image_generation`, and a developer instruction prefix.
+ * hosted `web_search`/`image_generation`, and a nonempty developer instruction prefix.
  * Claiming lite would violate that pairing. Upstream still supports non-lite;
  * this does not guarantee every model supports it. The opt-in is dropped rather
  * than silently deleting tools. {@link stripResponsesLiteHeader} enforces this
@@ -393,6 +389,47 @@ export function resolveHttpUserAgent(options: {
 		default:
 			return fallback;
 	}
+}
+
+interface UserAgentSelection {
+	mode?: UserAgentMode;
+	custom?: string;
+	extraHeaders?: Record<string, string>;
+}
+
+/** Only a real operator choice pins UA. Blank custom/header values keep defaults.
+ * selected is the already-resolved fingerprint value, avoiding duplicate OS lookup. */
+export function resolveExplicitUserAgent(
+	options: UserAgentSelection,
+	selected?: string,
+): string | undefined {
+	let extra: string | undefined;
+	for (const [name, value] of Object.entries(options.extraHeaders ?? {})) {
+		if (name.toLowerCase() === "user-agent" && typeof value === "string" && value.trim())
+			extra = value.trim();
+	}
+	if (extra !== undefined) return sanitizeUserAgent(extra);
+	if (!options.mode || (options.mode === "custom" && !options.custom?.trim())) return undefined;
+	if (
+		options.mode !== "custom" &&
+		options.mode !== "narrafork" &&
+		options.mode !== "codex" &&
+		options.mode !== "claude-code"
+	)
+		return undefined;
+	return sanitizeUserAgent(selected ?? resolveHttpUserAgent({ ...options, fallback: "" }));
+}
+
+/** Apply after dynamic defaults; all other headers retain their existing priority. */
+export function applyExplicitUserAgent(
+	headers: Record<string, string>,
+	selection: UserAgentSelection,
+	userAgentKey: string,
+	selected?: string,
+): void {
+	const explicit = resolveExplicitUserAgent(selection, selected);
+	if (explicit !== undefined)
+		mergeExtraHeaders(headers, { [userAgentKey]: explicit }, userAgentKey);
 }
 
 /**

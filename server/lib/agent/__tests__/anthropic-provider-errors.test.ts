@@ -1,4 +1,5 @@
 import { beforeAll, describe, expect, mock, test } from "bun:test";
+import type { ParsedStreamEvent as ParsedEvent } from "../provider";
 
 // anthropic-provider → usage-tracking → @server/db opens the runtime database and
 // runs migrations on import. This suite only exercises pure SSE/JSON parsers; stub
@@ -13,13 +14,6 @@ mock.module("../../db", () => ({
 	sqlite: {},
 	activeDatabaseBackend: "sqlite" as const,
 }));
-
-type ParsedEvent = {
-	invalidState?: { reason: string; message: string };
-	text?: string;
-	messageId?: string;
-	usage?: unknown;
-};
 
 type ParseAnthropicEventFn = (
 	event: unknown,

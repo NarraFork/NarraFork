@@ -1,6 +1,7 @@
 import { describe, expect, it, test } from "bun:test";
 import { deriveCodexWindowId } from "../agent/codex-request";
 import {
+	applyExplicitUserAgent,
 	buildCodexEmulationHeaders,
 	CLAUDE_CLI_VERSION,
 	CODEX_CLI_VERSION,
@@ -290,11 +291,11 @@ describe("resolveClientFingerprint UA override", () => {
 
 describe("latest managed CLI fingerprints", () => {
 	test("pins the verified release versions, including both Codex UA positions", () => {
-		expect(CLAUDE_CLI_VERSION).toBe("2.1.325");
-		expect(CODEX_CLI_VERSION).toBe("0.169.0");
-		expect(getHttpClaudeCliUserAgent()).toBe("claude-cli/2.1.325 (external, cli)");
+		expect(CLAUDE_CLI_VERSION).toBe("2.1.330");
+		expect(CODEX_CLI_VERSION).toBe("0.171.0");
+		expect(getHttpClaudeCliUserAgent()).toBe("claude-cli/2.1.330 (external, cli)");
 		expect(getHttpCodexUserAgent()).toMatch(
-			/^codex-tui\/0\.169\.0 \(.+\) unknown \(codex-tui; 0\.169\.0\)$/,
+			/^codex-tui\/0\.171\.0 \(.+\) unknown \(codex-tui; 0\.171\.0\)$/,
 		);
 	});
 });
@@ -368,4 +369,52 @@ describe("case-insensitive header layers", () => {
 		expect(fingerprint.userAgent).toBe("final/2");
 		expect(fingerprint.headers["User-Agent"]).toBe(fingerprint.userAgent);
 	});
+});
+
+describe("explicit UA priority", () => {
+	for (const [name, selection, expected] of [
+		["custom", { mode: "custom", custom: "selected/1" }, "selected/1"],
+		[
+			"extra beats mode",
+			{ mode: "custom", custom: "selected/1", extraHeaders: { "uSeR-aGeNt": " operator/2 " } },
+			"operator/2",
+		],
+		[
+			"last nonblank extra",
+			{ extraHeaders: { "User-Agent": "first/1", "USER-AGENT": "last/2", "user-agent": "  " } },
+			"last/2",
+		],
+		["unset", {}, "dynamic/3"],
+		["blank custom", { mode: "custom", custom: " " }, "dynamic/3"],
+		["blank extra", { extraHeaders: { "User-Agent": " " } }, "dynamic/3"],
+	] as const) {
+		test(`${name}: only UA gets the operator priority`, () => {
+			const fingerprint = resolveClientFingerprint({ ...selection, fallback: "default/1" });
+			const headers = {
+				"User-Agent": fingerprint.userAgent,
+				Authorization: "Bearer static",
+				"X-Channel": "old",
+			};
+			mergeExtraHeaders(
+				headers,
+				{ "USER-AGENT": "dynamic/3", authorization: "Bearer dynamic", "x-channel": "latest" },
+				"User-Agent",
+			);
+			applyExplicitUserAgent(headers, selection, "User-Agent", fingerprint.userAgent);
+			expect(new Headers(headers).get("user-agent")).toBe(expected);
+			expect(new Headers(headers).get("authorization")).toBe("Bearer dynamic");
+			expect(new Headers(headers).get("x-channel")).toBe("latest");
+			expect(Object.keys(headers).filter((key) => key.toLowerCase() === "user-agent")).toHaveLength(
+				1,
+			);
+		});
+	}
+	for (const mode of ["narrafork", "codex", "claude-code"] as const) {
+		test(`${mode}: explicit mode beats a protocol/dynamic UA`, () => {
+			const fingerprint = resolveClientFingerprint({ mode, fallback: "default/1" });
+			const headers = { "user-agent": "dynamic/3" };
+			applyExplicitUserAgent(headers, { mode }, "user-agent", fingerprint.userAgent);
+			expect(headers["user-agent"]).toBe(fingerprint.userAgent);
+		});
+	}
 });

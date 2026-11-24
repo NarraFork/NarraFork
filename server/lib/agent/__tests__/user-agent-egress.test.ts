@@ -49,14 +49,17 @@ import {
 	getHttpUserAgent,
 	ORIGINATOR,
 	ORIGINATOR_CODEX,
+	type UserAgentMode,
 } from "../../user-agent";
 import { AnthropicProvider } from "../anthropic-provider";
+import { createProviderTurnContext } from "../codex-turn-state";
 import {
 	buildHandshakeHeaders,
 	type CodexResponsesRequestBody,
 	type StreamCodexResponsesWebSocketOptions,
 } from "../codex-websocket";
 import { OpenAIProvider } from "../openai-provider";
+import { resetUnsupportedParameterMemory } from "../unsupported-parameter-fallback";
 
 const CUSTOM_UA = "NarraFork-Custom/7.7";
 const OVERRIDE_UA = "override/2.0";
@@ -410,8 +413,8 @@ describe("provider defaults are overridden at the real HTTP egress", () => {
 					defaultModel: protocol === "anthropic" ? "claude-sonnet-5" : "gpt-5.5",
 					userAgentMode: "custom" as const,
 					customUserAgent: "configured/1",
-					proxy: "direct",
-					apiMode: protocol === "responses" ? "codex" : "completions",
+					proxy: { mode: "direct" as const },
+					apiMode: protocol === "responses" ? ("codex" as const) : ("completions" as const),
 					codexWebSocket: false,
 					codexWebSearch: false,
 					codexImageGeneration: false,
@@ -429,8 +432,8 @@ describe("provider defaults are overridden at the real HTTP egress", () => {
 				]) {
 					const provider =
 						protocol === "anthropic"
-							? new AnthropicProvider({ ...config, extraHeaders } as never)
-							: new OpenAIProvider({ ...config, extraHeaders } as never);
+							? new AnthropicProvider({ ...config, extraHeaders })
+							: new OpenAIProvider({ ...config, extraHeaders });
 					for await (const _event of provider.chat({
 						conversationId: "wire-probe",
 						model: `wire:${config.defaultModel}`,
@@ -455,5 +458,831 @@ describe("provider defaults are overridden at the real HTTP egress", () => {
 				await server.stop(true);
 			}
 		});
+	}
+});
+
+describe("explicit UA survives the final HTTP transport", () => {
+	for (const protocol of ["anthropic", "responses", "codex", "completions"] as const) {
+		test(`${protocol}: operator UA wins, transport authentication stays current`, async () => {
+			const captured: Headers[] = [];
+			const observed: Array<string | null> = [];
+			const frames =
+				protocol === "anthropic"
+					? [
+							{
+								type: "message_start",
+								message: { id: "msg_ua", usage: { input_tokens: 1, output_tokens: 0 } },
+							},
+							{
+								type: "content_block_start",
+								index: 0,
+								content_block: { type: "text", text: "ok" },
+							},
+							{ type: "content_block_stop", index: 0 },
+							{ type: "message_stop" },
+						]
+					: protocol === "completions"
+						? [{ choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] }]
+						: [
+								{ type: "response.output_text.delta", delta: "ok", output_index: 0 },
+								{
+									type: "response.completed",
+									response: { id: "resp_ua", status: "completed", output: [] },
+								},
+							];
+			const server = Bun.serve({
+				hostname: "127.0.0.1",
+				port: 0,
+				fetch(request) {
+					captured.push(request.headers);
+					return new Response(
+						frames.map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join(""),
+						{ headers: { "content-type": "text/event-stream" } },
+					);
+				},
+			});
+			try {
+				let channel = 0;
+				const config = {
+					id: `final-${protocol}`,
+					prefix: "wire",
+					name: "Final UA probe",
+					apiKey: "default-key",
+					baseUrl: `${server.url.origin}/v1`,
+					defaultModel: protocol === "anthropic" ? "claude-sonnet-5" : "gpt-5.5",
+					userAgentMode: "custom" as const,
+					customUserAgent: "selected/1",
+					proxy: { mode: "direct" as const },
+					apiMode: protocol === "anthropic" ? ("completions" as const) : protocol,
+					codexWebSocket: false,
+					codexWebSearch: false,
+					codexImageGeneration: false,
+					officialApi: true,
+					extraHeaders: { authorization: "Bearer static" } as Record<string, string>,
+					dynamicHeaders: () => ({
+						"USER-AGENT": "dynamic/default",
+						"X-Dynamic": "latest",
+						Authorization: "Bearer dynamic",
+					}),
+				};
+				const transport: import("../provider-transport").ProviderTransport = {
+					transportHeaders(headers) {
+						headers.set("User-Agent", "transport/default");
+						headers.set("Authorization", "Bearer transport");
+						headers.set("X-Channel", `channel-${++channel}`);
+					},
+					fetch(input, init, next) {
+						const headers = new Headers(init?.headers);
+						observed.push(headers.get("user-agent"));
+						// Relay retries may replace their whole header map before next().
+						headers.set("USER-AGENT", "retry/default");
+						headers.set("Authorization", "Bearer refreshed-transport");
+						return next(input, { ...init, headers });
+					},
+				};
+				const provider =
+					protocol === "anthropic"
+						? new AnthropicProvider(config, transport)
+						: new OpenAIProvider(config, undefined, transport);
+				for (let i = 0; i < 2; i++) {
+					if (i === 1) config.extraHeaders["uSeR-aGeNt"] = " operator/2 ";
+					for await (const _event of provider.chat({
+						conversationId: "final-ua-probe",
+						model: `wire:${config.defaultModel}`,
+						content: "hello",
+						cwd: process.cwd(),
+						history: [],
+						tools: [],
+						toolResults: [],
+						signal: AbortSignal.timeout(8000),
+					})) {
+						/* Drain the real HTTP request. */
+					}
+				}
+				expect(observed).toEqual(["selected/1", "operator/2"]);
+				expect(captured.map((headers) => headers.get("user-agent"))).toEqual([
+					"selected/1",
+					"operator/2",
+				]);
+				expect(captured.map((headers) => headers.get("authorization"))).toEqual([
+					"Bearer refreshed-transport",
+					"Bearer refreshed-transport",
+				]);
+				expect(captured.map((headers) => headers.get("x-channel"))).toEqual([
+					"channel-1",
+					"channel-2",
+				]);
+				if (protocol !== "anthropic")
+					expect(captured.every((headers) => headers.get("x-dynamic") === "latest")).toBe(true);
+			} finally {
+				await server.stop(true);
+			}
+		});
+	}
+});
+
+type WireProtocol = "anthropic" | "responses" | "codex" | "completions";
+interface CapturedWireRequest {
+	url: URL;
+	method: string;
+	headers: Headers;
+	raw: string;
+	body: Record<string, unknown>;
+}
+interface WireSelection {
+	userAgentMode?: UserAgentMode;
+	customUserAgent?: string;
+	extraHeaders?: Record<string, string>;
+}
+
+function wireReply(protocol: WireProtocol, body: Record<string, unknown>, text = "ok"): Response {
+	const usage = { input_tokens: 1, output_tokens: 1, total_tokens: 2 };
+	const message = {
+		id: "msg_wire",
+		type: "message",
+		role: "assistant",
+		status: "completed",
+		content: [{ type: "output_text", text, annotations: [] }],
+	};
+	const response = { id: "resp_wire", status: "completed", output: [message], usage };
+	if (!body.stream) {
+		return Response.json(
+			protocol === "anthropic"
+				? {
+						id: "msg_wire",
+						type: "message",
+						role: "assistant",
+						content: [{ type: "text", text }],
+						stop_reason: "end_turn",
+						usage,
+					}
+				: protocol === "completions"
+					? {
+							id: "chat_wire",
+							choices: [
+								{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" },
+							],
+							usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+						}
+					: response,
+		);
+	}
+	const frames =
+		protocol === "anthropic"
+			? [
+					{
+						type: "message_start",
+						message: {
+							id: "msg_wire",
+							role: "assistant",
+							content: [],
+							usage: { input_tokens: 1, output_tokens: 0 },
+						},
+					},
+					{ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+					{ type: "content_block_delta", index: 0, delta: { type: "text_delta", text } },
+					{ type: "content_block_stop", index: 0 },
+					...(Array.isArray(body.tools) && body.tools.some((tool) => tool?.name === "web_search")
+						? [
+								{
+									type: "content_block_start",
+									index: 1,
+									content_block: {
+										type: "server_tool_use",
+										id: "srvtool_wire",
+										name: "web_search",
+										input: { query: "local fixture query" },
+									},
+								},
+								{ type: "content_block_stop", index: 1 },
+								{
+									type: "content_block_start",
+									index: 2,
+									content_block: {
+										type: "web_search_tool_result",
+										tool_use_id: "srvtool_wire",
+										content: [
+											{
+												type: "web_search_result",
+												title: "Local fixture source",
+												url: "https://example.invalid/fixture",
+												encrypted_content: "fixture-only-opaque-content",
+											},
+										],
+									},
+								},
+								{ type: "content_block_stop", index: 2 },
+							]
+						: []),
+					{
+						type: "message_delta",
+						delta: { stop_reason: "end_turn" },
+						usage: { output_tokens: 1 },
+					},
+					{ type: "message_stop" },
+				]
+			: protocol === "completions"
+				? [
+						{
+							choices: [
+								{ index: 0, delta: { role: "assistant", content: text }, finish_reason: null },
+							],
+						},
+						{
+							choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+							usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+						},
+					]
+				: [
+						{
+							type: "response.created",
+							response: { id: "resp_wire", status: "in_progress", output: [] },
+						},
+						{
+							type: "response.output_item.added",
+							output_index: 0,
+							item: { ...message, status: "in_progress", content: [] },
+						},
+						{
+							type: "response.content_part.added",
+							output_index: 0,
+							item_id: message.id,
+							content_index: 0,
+							part: { type: "output_text", text: "" },
+						},
+						{
+							type: "response.output_text.delta",
+							output_index: 0,
+							item_id: message.id,
+							content_index: 0,
+							delta: text,
+						},
+						{
+							type: "response.output_text.done",
+							output_index: 0,
+							item_id: message.id,
+							content_index: 0,
+							text,
+						},
+						{
+							type: "response.content_part.done",
+							output_index: 0,
+							item_id: message.id,
+							content_index: 0,
+							part: message.content[0],
+						},
+						{ type: "response.output_item.done", output_index: 0, item: message },
+						{ type: "response.completed", response },
+					];
+	return new Response(frames.map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join(""), {
+		headers: { "content-type": "text/event-stream" },
+	});
+}
+
+function startWireCapture(
+	protocol: WireProtocol,
+	reply?: (request: CapturedWireRequest, index: number) => Response,
+) {
+	const requests: CapturedWireRequest[] = [];
+	const server = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		async fetch(request) {
+			const raw = await request.text();
+			if (raw.length > 64 * 1024)
+				return new Response("Fixture request budget exceeded", { status: 413 });
+			const captured = {
+				url: new URL(request.url),
+				method: request.method,
+				headers: request.headers,
+				raw,
+				body: raw ? (JSON.parse(raw) as Record<string, unknown>) : {},
+			};
+			requests.push(captured);
+			return reply?.(captured, requests.length - 1) ?? wireReply(protocol, captured.body);
+		},
+	});
+	return { server, requests, baseUrl: `${server.url.origin}/v1` };
+}
+
+function wireProvider(protocol: WireProtocol, baseUrl: string, selection: WireSelection = {}) {
+	let channel = 0;
+	const dynamicHeaders = () => ({
+		"USER-AGENT": "dynamic/default",
+		Authorization: "Bearer dynamic",
+		"X-Channel": `live-${++channel}`,
+	});
+	const config = {
+		id: `wire-${protocol}`,
+		name: "Local wire fixture",
+		prefix: "wire",
+		apiKey: "fake-wire-key",
+		baseUrl,
+		defaultModel: protocol === "anthropic" ? "claude-sonnet-5" : "gpt-5.5",
+		apiMode: protocol === "anthropic" ? ("responses" as const) : protocol,
+		proxy: { mode: "direct" as const },
+		officialApi: false,
+		codexWebSocket: false,
+		codexWebSearch: false,
+		codexImageGeneration: false,
+		...selection,
+		extraHeaders: {
+			Authorization: "Bearer static",
+			"x-channel": "stale",
+			...selection.extraHeaders,
+		},
+		dynamicHeaders,
+	};
+	const provider =
+		protocol === "anthropic"
+			? new AnthropicProvider(config, {
+					transportHeaders(headers) {
+						for (const [key, value] of Object.entries(dynamicHeaders())) headers.set(key, value);
+					},
+				})
+			: new OpenAIProvider(config);
+	return { config, provider, model: `wire:${config.defaultModel}` };
+}
+
+function assertWireIdentity(request: CapturedWireRequest, expected: string) {
+	expect(request.headers.get("user-agent")).toBe(expected);
+	expect(
+		Array.from(request.headers.keys()).filter((key) => key.toLowerCase() === "user-agent"),
+	).toHaveLength(1);
+	expect(request.headers.get("authorization")).toBe("Bearer dynamic");
+	expect(request.headers.get("content-type")).toBe("application/json");
+	expect(request.method).toBe("POST");
+	expect(request.raw).not.toBe("");
+	expect(request.body.model).toBeTruthy();
+}
+
+const WIRE_SELECTIONS: Array<{ name: string; selection: WireSelection; expected: string }> = [
+	{ name: "narrafork", selection: { userAgentMode: "narrafork" }, expected: getHttpUserAgent() },
+	{ name: "codex", selection: { userAgentMode: "codex" }, expected: getHttpCodexUserAgent() },
+	{
+		name: "claude-code",
+		selection: { userAgentMode: "claude-code" },
+		expected: getHttpClaudeCliUserAgent(),
+	},
+	{
+		name: "custom",
+		selection: { userAgentMode: "custom", customUserAgent: CUSTOM_UA },
+		expected: CUSTOM_UA,
+	},
+	{
+		name: "mixed-case extra",
+		selection: {
+			userAgentMode: "custom",
+			customUserAgent: CUSTOM_UA,
+			extraHeaders: { "USER-AGENT": "earlier/1", "uSeR-aGeNt": ` ${OVERRIDE_UA} ` },
+		},
+		expected: OVERRIDE_UA,
+	},
+	{
+		name: "blank",
+		selection: {
+			userAgentMode: "custom",
+			customUserAgent: " \t ",
+			extraHeaders: { "USER-AGENT": " \t " },
+		},
+		expected: "dynamic/default",
+	},
+	{ name: "unset", selection: {}, expected: "dynamic/default" },
+];
+
+describe("complete local wire captures", () => {
+	for (const protocol of ["anthropic", "responses", "codex", "completions"] as const) {
+		for (const { name, selection, expected } of WIRE_SELECTIONS) {
+			test(`${protocol} ${name}: chat, generate and history utility reach the final wire`, async () => {
+				const wire = startWireCapture(protocol);
+				try {
+					const { provider, model } = wireProvider(protocol, wire.baseUrl, selection);
+					for await (const _event of provider.chat({
+						conversationId: "wire-chat",
+						model,
+						content: "chat message",
+						cwd: process.cwd(),
+						history: [],
+						tools: [],
+						toolResults: [],
+						maxOutputTokens: 2048,
+						signal: AbortSignal.timeout(8000),
+					})) {
+						/* Drain the actual streamed request. */
+					}
+					expect(await provider.generate("one-shot input", model)).toBe("ok");
+					expect(
+						await provider.generateWithHistory(
+							"root instruction",
+							"past conversation",
+							model,
+							"en",
+							{ maxOutputTokens: 2048, signal: AbortSignal.timeout(8000) },
+						),
+					).toBe("ok");
+					expect(wire.requests).toHaveLength(3);
+					for (const request of wire.requests) {
+						assertWireIdentity(request, expected);
+						expect(request.headers.get("x-channel")).toMatch(/^live-[1-3]$/);
+						expect(request.url.pathname).toBe(
+							protocol === "anthropic"
+								? "/v1/messages"
+								: protocol === "completions"
+									? "/v1/chat/completions"
+									: "/v1/responses",
+						);
+						if (protocol === "anthropic" || protocol === "completions")
+							expect(Array.isArray(request.body.messages)).toBe(true);
+						else expect(Array.isArray(request.body.input)).toBe(true);
+					}
+					expect(wire.requests.map((request) => request.headers.get("x-channel"))).toEqual([
+						"live-1",
+						"live-2",
+						"live-3",
+					]);
+					const historyBody = wire.requests[2].body;
+					if (protocol === "responses") expect(historyBody.instructions).toBe("root instruction");
+					if (protocol === "codex") {
+						expect(historyBody.instructions).toBeUndefined();
+						expect(historyBody.max_output_tokens).toBeUndefined();
+						expect(historyBody.input).toEqual(
+							expect.arrayContaining([
+								expect.objectContaining({
+									role: "developer",
+									content: [expect.objectContaining({ text: "root instruction" })],
+								}),
+							]),
+						);
+					}
+				} finally {
+					await wire.server.stop(true);
+				}
+			});
+		}
+	}
+	for (const { name, selection, expected } of WIRE_SELECTIONS) {
+		test(`Anthropic search ${name}: native-search request keeps final UA and native declaration`, async () => {
+			const wire = startWireCapture("anthropic");
+			try {
+				const { config } = wireProvider("anthropic", wire.baseUrl, selection);
+				const provider = new AnthropicProvider(config, {
+					transportHeaders(headers) {
+						headers.set("User-Agent", "dynamic/default");
+						headers.set("Authorization", "Bearer dynamic");
+						headers.set("X-Channel", "search-live");
+					},
+				});
+				const result = await provider.performWebSearch({
+					query: "local fixture query",
+					model: "wire:claude-sonnet-5",
+					allowedDomains: ["example.invalid"],
+					signal: AbortSignal.timeout(8000),
+				});
+				expect(result.text).toBe("ok");
+				expect(wire.requests).toHaveLength(1);
+				assertWireIdentity(wire.requests[0], expected);
+				expect(wire.requests[0].body.tools).toEqual([
+					expect.objectContaining({
+						type: "web_search_20250305",
+						name: "web_search",
+						allowed_domains: ["example.invalid"],
+					}),
+				]);
+				expect(wire.requests[0].body.tool_choice).toEqual({ type: "tool", name: "web_search" });
+			} finally {
+				await wire.server.stop(true);
+			}
+		});
+	}
+});
+
+test("real WS rejection falls back to HTTP with current authentication, operator UA and same-turn state", async () => {
+	const wire = startWireCapture("codex", (request) => {
+		if (request.method === "GET")
+			return new Response("WebSocket unsupported here", { status: 426 });
+		const response = wireReply("codex", request.body);
+		response.headers.set("x-codex-turn-state", "http-turn-route");
+		return response;
+	});
+	try {
+		let headersRead = 0;
+		const { config, model } = wireProvider("codex", wire.baseUrl, {
+			userAgentMode: "custom",
+			customUserAgent: CUSTOM_UA,
+			extraHeaders: { "uSeR-aGeNt": OVERRIDE_UA },
+		});
+		const provider = new OpenAIProvider({
+			...config,
+			codexWebSocket: true,
+			dynamicHeaders: () => ({
+				"USER-AGENT": "dynamic/default",
+				Authorization: ++headersRead === 1 ? "Bearer handshake-a" : "Bearer http-b",
+				"X-Channel": `phase-${headersRead}`,
+			}),
+		});
+		const turnContext = createProviderTurnContext();
+		for (let i = 0; i < 2; i++) {
+			for await (const _event of provider.chat({
+				conversationId: "wire-ws-http",
+				turnContext,
+				model,
+				content: "hello",
+				cwd: process.cwd(),
+				history: [],
+				tools: [],
+				toolResults: [],
+				signal: AbortSignal.timeout(8000),
+			})) {
+				/* Drain WS rejection and HTTP fallback. */
+			}
+		}
+		expect(wire.requests.map((request) => request.method)).toEqual(["GET", "POST", "POST"]);
+		expect(wire.requests.map((request) => request.headers.get("user-agent"))).toEqual([
+			OVERRIDE_UA,
+			OVERRIDE_UA,
+			OVERRIDE_UA,
+		]);
+		expect(wire.requests.map((request) => request.headers.get("authorization"))).toEqual([
+			"Bearer handshake-a",
+			"Bearer http-b",
+			"Bearer http-b",
+		]);
+		expect(wire.requests[1].headers.get("x-codex-turn-state")).toBeNull();
+		expect(wire.requests[2].headers.get("x-codex-turn-state")).toBe("http-turn-route");
+		expect(wire.requests[1].body.client_metadata).toEqual(wire.requests[2].body.client_metadata);
+		for (const request of wire.requests)
+			expect(request.headers.get("session-id")).toBe("wire-ws-http");
+		for (const request of wire.requests.slice(1)) {
+			expect(Array.isArray(request.body.input)).toBe(true);
+			expect(request.body.instructions).toBeUndefined();
+			expect(request.body.max_output_tokens).toBeUndefined();
+		}
+	} finally {
+		await wire.server.stop(true);
+	}
+});
+
+test("real Codex format degradation keeps operator UA, authentication and turn identity on the retry", async () => {
+	resetUnsupportedParameterMemory();
+	const wire = startWireCapture("codex", (request, index) =>
+		index === 0
+			? Response.json(
+					{
+						error: { message: "Unsupported parameter: text.format", type: "invalid_request_error" },
+					},
+					{ status: 400, headers: { "x-codex-turn-state": "schema-route" } },
+				)
+			: wireReply("codex", request.body, '{"value":"ok"}'),
+	);
+	try {
+		const { provider, model } = wireProvider("codex", wire.baseUrl, {
+			userAgentMode: "custom",
+			customUserAgent: CUSTOM_UA,
+			extraHeaders: { "USER-AGENT": OVERRIDE_UA },
+		});
+		const result = await provider.generateWithMeta("hello", model, "Base instructions.", {
+			signal: AbortSignal.timeout(8000),
+			responseFormat: {
+				type: "json_schema",
+				name: "wire_value",
+				schema: {
+					type: "object",
+					properties: { value: { type: "string" } },
+					required: ["value"],
+					additionalProperties: false,
+				},
+				strict: true,
+			},
+		});
+		expect(result.structured).toEqual({ value: "ok" });
+		expect(wire.requests).toHaveLength(2);
+		for (const request of wire.requests) assertWireIdentity(request, OVERRIDE_UA);
+		expect(wire.requests[1].headers.get("x-codex-turn-state")).toBe("schema-route");
+		const bodies = wire.requests.map((request) => request.body);
+		expect((bodies[0].text as Record<string, unknown>).format).toBeDefined();
+		expect((bodies[1].text as Record<string, unknown>).format).toBeUndefined();
+		expect(bodies[1].client_metadata).toEqual(bodies[0].client_metadata);
+		expect(bodies[1].prompt_cache_key).toBe(bodies[0].prompt_cache_key);
+		const prefixes = bodies.map(
+			(body) => (body.input as Array<{ id: string; content: Array<{ text: string }> }>)[0],
+		);
+		expect(prefixes[0].content[0].text).toBe("Base instructions.");
+		expect(prefixes[1].content[0].text).toContain('"value"');
+		expect(prefixes[0].id).not.toBe(prefixes[1].id);
+	} finally {
+		resetUnsupportedParameterMemory();
+		await wire.server.stop(true);
+	}
+});
+
+test("Anthropic /v1 discovery reuses the real body and keeps final identity across every utility surface", async () => {
+	const wire = startWireCapture("anthropic", (request, index) =>
+		index === 0
+			? Response.json(
+					{ error: { type: "not_found_error", message: "Use /v1/messages" } },
+					{ status: 404 },
+				)
+			: wireReply("anthropic", request.body),
+	);
+	try {
+		const { provider, model } = wireProvider("anthropic", wire.server.url.origin, {
+			userAgentMode: "custom",
+			customUserAgent: CUSTOM_UA,
+			extraHeaders: { "uSeR-aGeNt": OVERRIDE_UA },
+		});
+		if (!(provider instanceof AnthropicProvider))
+			throw new Error("Expected Anthropic wire fixture");
+		for await (const _event of provider.chat({
+			conversationId: "wire-v1",
+			model,
+			content: "hello",
+			cwd: process.cwd(),
+			history: [],
+			tools: [],
+			toolResults: [],
+			signal: AbortSignal.timeout(8000),
+		})) {
+			/* Drain initial attempt and /v1 retry. */
+		}
+		expect(await provider.generate("one-shot", model)).toBe("ok");
+		expect(
+			await provider.generateWithHistory("root", "history", model, "en", {
+				signal: AbortSignal.timeout(8000),
+			}),
+		).toBe("ok");
+		expect(
+			(
+				await provider.performWebSearch({
+					model,
+					query: "local search",
+					signal: AbortSignal.timeout(8000),
+				})
+			).text,
+		).toBe("ok");
+		expect(wire.requests).toHaveLength(5);
+		expect(wire.requests.map((request) => request.url.pathname)).toEqual([
+			"/messages",
+			"/v1/messages",
+			"/v1/messages",
+			"/v1/messages",
+			"/v1/messages",
+		]);
+		expect(wire.requests[0].raw).toBe(wire.requests[1].raw);
+		for (const request of wire.requests) {
+			assertWireIdentity(request, OVERRIDE_UA);
+			expect(request.headers.get("x-api-key")).toBe("fake-wire-key");
+			expect(typeof request.body.max_tokens).toBe("number");
+			expect(Array.isArray(request.body.messages)).toBe(true);
+		}
+		expect(wire.requests.map((request) => request.headers.get("x-channel"))).toEqual([
+			"live-1",
+			"live-2",
+			"live-3",
+			"live-4",
+			"live-5",
+		]);
+	} finally {
+		await wire.server.stop(true);
+	}
+});
+
+for (const protocol of ["responses", "completions"] as const) {
+	test(`${protocol}: permitted parameter retry preserves the actual output ceiling, identity and input bytes`, async () => {
+		resetUnsupportedParameterMemory();
+		const wire = startWireCapture(protocol, (request, index) =>
+			index === 0
+				? Response.json(
+						{
+							error: {
+								message: "Unsupported parameter: prompt_cache_key",
+								type: "invalid_request_error",
+							},
+						},
+						{ status: 400 },
+					)
+				: wireReply(protocol, request.body),
+		);
+		try {
+			const { provider, model } = wireProvider(protocol, wire.baseUrl, {
+				userAgentMode: "custom",
+				customUserAgent: CUSTOM_UA,
+				extraHeaders: { "USER-AGENT": OVERRIDE_UA },
+			});
+			for await (const _event of provider.chat({
+				conversationId: "wire-parameter-retry",
+				model,
+				content: "hello",
+				cwd: process.cwd(),
+				history: [],
+				tools: [],
+				toolResults: [],
+				maxOutputTokens: 123,
+				signal: AbortSignal.timeout(8000),
+			})) {
+				/* Drain parameter retry. */
+			}
+			expect(wire.requests).toHaveLength(2);
+			for (const request of wire.requests) assertWireIdentity(request, OVERRIDE_UA);
+			const [first, second] = wire.requests.map((request) => request.body);
+			expect(first.prompt_cache_key).toBe("wire-parameter-retry");
+			expect(second.prompt_cache_key).toBeUndefined();
+			for (const body of [first, second])
+				expect(body.max_output_tokens ?? body.max_completion_tokens ?? body.max_tokens).toBe(123);
+			expect(second.input ?? second.messages).toEqual(first.input ?? first.messages);
+			expect(second.tools).toEqual(first.tools);
+		} finally {
+			resetUnsupportedParameterMemory();
+			await wire.server.stop(true);
+		}
+	});
+	test(`${protocol}: unsupported output-budget error produces no uncapped wire retry`, async () => {
+		resetUnsupportedParameterMemory();
+		const wire = startWireCapture(protocol, (request) => {
+			const parameter =
+				request.body.max_output_tokens !== undefined
+					? "max_output_tokens"
+					: request.body.max_completion_tokens !== undefined
+						? "max_completion_tokens"
+						: "max_tokens";
+			return Response.json(
+				{
+					error: { message: `Unsupported parameter: ${parameter}`, type: "invalid_request_error" },
+				},
+				{ status: 400 },
+			);
+		});
+		try {
+			const { provider, model } = wireProvider(protocol, wire.baseUrl, {
+				userAgentMode: "custom",
+				customUserAgent: CUSTOM_UA,
+				extraHeaders: { "USER-AGENT": OVERRIDE_UA },
+			});
+			await expect(
+				provider.generateWithMeta("hello", model, "root", {
+					maxOutputTokens: 123,
+					signal: AbortSignal.timeout(8000),
+				}),
+			).rejects.toThrow("Unsupported parameter");
+			expect(wire.requests).toHaveLength(1);
+			assertWireIdentity(wire.requests[0], OVERRIDE_UA);
+			const body = wire.requests[0].body;
+			expect(body.max_output_tokens ?? body.max_completion_tokens ?? body.max_tokens).toBe(123);
+		} finally {
+			resetUnsupportedParameterMemory();
+			await wire.server.stop(true);
+		}
+	});
+}
+
+test("Anthropic explicit public API version pairs final headers with every actual request body", async () => {
+	const wire = startWireCapture("anthropic");
+	try {
+		const { provider, model } = wireProvider("anthropic", wire.baseUrl, {
+			userAgentMode: "custom",
+			customUserAgent: CUSTOM_UA,
+			extraHeaders: { "uSeR-aGeNt": OVERRIDE_UA, "Anthropic-Version": "2026-10-21" },
+		});
+		if (!(provider instanceof AnthropicProvider))
+			throw new Error("Expected Anthropic wire fixture");
+		for await (const _event of provider.chat({
+			conversationId: "wire-public-anthropic",
+			model,
+			content: "hello",
+			cwd: process.cwd(),
+			history: [],
+			tools: [],
+			toolResults: [],
+			maxOutputTokens: 2048,
+			signal: AbortSignal.timeout(8000),
+		})) {
+			/* Drain the version-paired request. */
+		}
+		expect(await provider.generate("one-shot", model)).toBe("ok");
+		expect(
+			await provider.generateWithHistory("root", "history", model, "en", {
+				signal: AbortSignal.timeout(8000),
+			}),
+		).toBe("ok");
+		expect(
+			(
+				await provider.performWebSearch({
+					model,
+					query: "local search",
+					signal: AbortSignal.timeout(8000),
+				})
+			).text,
+		).toBe("ok");
+		expect(wire.requests).toHaveLength(4);
+		for (const request of wire.requests) {
+			assertWireIdentity(request, OVERRIDE_UA);
+			expect(request.headers.get("anthropic-version")).toBe("2026-10-21");
+			expect(request.body).not.toHaveProperty("temperature");
+			expect(request.body).not.toHaveProperty("top_p");
+			expect(request.body).not.toHaveProperty("top_k");
+			expect(Array.isArray(request.body.messages)).toBe(true);
+			expect(typeof request.body.max_tokens).toBe("number");
+		}
+	} finally {
+		await wire.server.stop(true);
 	}
 });
