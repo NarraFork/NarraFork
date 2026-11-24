@@ -335,7 +335,7 @@ test("a team tab follows its coordinator: title and status only, no promotion", 
 		onListEvent({ type: "status_change", narratorId: "coord", status: "working" });
 		frame?.(0);
 	});
-	const live = cachedTab("coord");
+	const live = cachedTab("coord") as RecentTab | undefined;
 	expect(live).toMatchObject({ title: "Renamed crew", status: "working" });
 	expect(live?.hasDraft).toBeUndefined();
 	// A session tab of the coordinator would be promoted; a pinned team is not a session.

@@ -61,7 +61,7 @@ describe("sections", () => {
 	test("a delta's project and team upserts land in the loaded work window", () => {
 		const qc = new QueryClient();
 		qc.setQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("work"), {
-			pages: [{ items: [session], revision: 1, hasMore: false, nextCursor: null }],
+			pages: [{ items: [session], revision: 1, hasMore: false, nextCursor: undefined }],
 			pageParams: [undefined],
 		});
 		applyRecentTabsDelta(qc, {
