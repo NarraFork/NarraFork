@@ -38,10 +38,27 @@ export function parseQuotaSnapshot(raw: unknown): QuotaSnapshot | null {
 	if (typeof value.fetchedAt !== "number" || !Number.isFinite(value.fetchedAt)) return null;
 	if (!SCOPES.has(value.scope as string)) return null;
 	if (!Array.isArray(value.windows) || !Array.isArray(value.balances)) return null;
-	const windows = value.windows.filter(
-		(w): w is QuotaSnapshot["windows"][number] =>
-			!!w && WINDOW_KINDS.has(w.kind) && finiteOrNull(w.usedRatio) && finiteOrNull(w.resetsAt),
-	);
+	const windows = value.windows
+		.filter(
+			(w): w is QuotaSnapshot["windows"][number] =>
+				!!w && WINDOW_KINDS.has(w.kind) && finiteOrNull(w.usedRatio) && finiteOrNull(w.resetsAt),
+		)
+		.map((window) => ({
+			kind: window.kind,
+			...(typeof window.label === "string" ? { label: window.label } : {}),
+			usedRatio: window.usedRatio,
+			resetsAt: window.resetsAt,
+			...(typeof window.used === "number" && Number.isFinite(window.used)
+				? { used: window.used }
+				: {}),
+			...(typeof window.total === "number" && Number.isFinite(window.total)
+				? { total: window.total }
+				: {}),
+			...(typeof window.remaining === "number" && Number.isFinite(window.remaining)
+				? { remaining: window.remaining }
+				: {}),
+			...(typeof window.unit === "string" ? { unit: window.unit } : {}),
+		}));
 	const balances = value.balances.filter(
 		(b): b is QuotaSnapshot["balances"][number] =>
 			!!b && typeof b.unit === "string" && finiteOrNull(b.remaining),

@@ -196,9 +196,36 @@ describe("provider balance discovery lifecycle", () => {
 			expiresAt: Date.parse("2026-11-19T00:00:00Z"),
 			balances: [],
 			windows: [
-				{ kind: "other", label: "daily", usedRatio: 0.2, resetsAt: null },
-				{ kind: "weekly", label: "weekly", usedRatio: 0.08, resetsAt: null },
-				{ kind: "monthly", label: "monthly", usedRatio: null, resetsAt: null },
+				{
+					kind: "other",
+					label: "daily",
+					usedRatio: 0.2,
+					resetsAt: null,
+					used: 2,
+					total: 10,
+					remaining: 8,
+					unit: "USD",
+				},
+				{
+					kind: "weekly",
+					label: "weekly",
+					usedRatio: 0.08,
+					resetsAt: null,
+					used: 4,
+					total: 50,
+					remaining: 46,
+					unit: "USD",
+				},
+				{
+					kind: "monthly",
+					label: "monthly",
+					usedRatio: null,
+					resetsAt: null,
+					used: 0,
+					total: 0,
+					remaining: 0,
+					unit: "USD",
+				},
 			],
 		};
 		expect(f.cache.quotaSnapshot("relay-test")?.snapshot).toMatchObject(expected);
@@ -232,8 +259,23 @@ describe("provider balance discovery lifecycle", () => {
 		});
 		await f.request("relay-test");
 		expect(f.quotaSnapshot("relay-test")?.snapshot?.windows).toEqual([
-			{ kind: "weekly", label: "weekly", usedRatio: 0.4, resetsAt: null },
-			{ kind: "monthly", label: "monthly", usedRatio: null, resetsAt: null },
+			{
+				kind: "weekly",
+				label: "weekly",
+				usedRatio: 0.4,
+				resetsAt: null,
+				total: 10,
+				remaining: 6,
+				unit: "USD",
+			},
+			{
+				kind: "monthly",
+				label: "monthly",
+				usedRatio: null,
+				resetsAt: null,
+				remaining: 6,
+				unit: "USD",
+			},
 		]);
 		expect(f.quotaSnapshot("relay-test")?.snapshot).not.toHaveProperty("expiresAt");
 		expect(f.quotaSnapshot("relay-test")?.snapshot?.balances).toEqual([]);

@@ -3077,6 +3077,7 @@
 		"resetsAt": "重置于 {{time}}",
 		"expired": "订阅已过期",
 		"expiresAt": "到期时间",
+		"remainingAmount": "剩余 {{amount}}",
 		"window": { "5h": "5小时", "daily": "日", "weekly": "周", "monthly": "月", "other": "额度" }
 	},
 	"quotaPanel": {

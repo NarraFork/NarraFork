@@ -15,6 +15,11 @@ export interface QuotaWindow {
 	usedRatio: number | null;
 	/** Epoch ms when the window refills, if known. */
 	resetsAt: number | null;
+	/** Absolute period allowance, when upstream reports it; omitted rather than invented. */
+	used?: number;
+	total?: number;
+	remaining?: number;
+	unit?: string;
 }
 
 export interface QuotaBalance {

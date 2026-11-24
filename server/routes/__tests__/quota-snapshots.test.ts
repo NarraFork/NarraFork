@@ -10,7 +10,11 @@ import { providerBalanceCache } from "../../lib/provider-balance-cache";
 import { streamQuotaIdentity } from "../../lib/provider-key-subjects";
 import { getProviderKeyStore, TOKENDANCE_KEY_OWNER } from "../../lib/provider-keys";
 import { type CustomApiProviderConfig, saveSettings, settings } from "../../lib/settings";
-import { readQuotaSnapshots, refreshCommandCodeCliQuota } from "../../lib/sourcing/quota-snapshots";
+import {
+	publicQuotaSnapshot,
+	readQuotaSnapshots,
+	refreshCommandCodeCliQuota,
+} from "../../lib/sourcing/quota-snapshots";
 import { quotaStore, STREAM_QUOTA_SOURCE } from "../../lib/sourcing/quota-store";
 import * as templates from "../../lib/sourcing/templates";
 import type { AuthSessionStore } from "../../services/auth/session-store";
@@ -89,6 +93,48 @@ afterEach(() => {
 });
 
 describe("unified quota API", () => {
+	test("public period amounts retain finite values and currency without private data", () => {
+		const window = {
+			kind: "other" as const,
+			label: "daily",
+			usedRatio: 1,
+			resetsAt: null,
+			used: 12,
+			total: 10,
+			remaining: -2,
+			unit: "USD",
+		};
+		const raw = {
+			...snap(),
+			windows: [
+				{
+					...window,
+					detail: { secret: "private-window" },
+					headers: { Authorization: "secret-token" },
+				},
+			],
+		};
+		expect(publicQuotaSnapshot(raw)?.windows).toEqual([window]);
+		const invalid = {
+			...raw,
+			windows: [
+				{
+					...window,
+					used: NaN,
+					total: Infinity,
+					remaining: -Infinity,
+					unit: { secret: "private-unit" },
+				},
+			],
+		} as unknown as QuotaSnapshot;
+		const projected = publicQuotaSnapshot(invalid);
+		expect(projected?.windows).toEqual([
+			{ kind: "other", label: "daily", usedRatio: 1, resetsAt: null },
+		]);
+		expect(JSON.stringify(publicQuotaSnapshot(raw))).not.toMatch(
+			/private-window|secret-token|detail|headers|Authorization/,
+		);
+	});
 	test("anonymous callers cannot read or refresh", async () => {
 		expect((await app().request("/api/quota-snapshots")).status).toBe(401);
 		expect(
@@ -312,6 +358,59 @@ describe("unified quota API", () => {
 		});
 		expect(text).not.toMatch(/private-plus|private-team|"plan"|detail|accountId/);
 	});
+	test.each([
+		false,
+		true,
+	])("unclassified Codex duration leaves known five-hour coverage unknown (also monthly: %s)", async (hasMonthly) => {
+		const manager = getCodexManager();
+		Object.defineProperty(manager, "quotaCredentialIds", {
+			configurable: true,
+			value: ["known-five-hour", "unknown-duration"],
+		});
+		spyOn(manager, "usageOf").mockImplementation((id) => ({
+			plan_type: "team",
+			queriedAt: new Date().toISOString(),
+			primary_window:
+				id === "known-five-hour"
+					? {
+							window_type: "5h",
+							limit_window_seconds: 18000,
+							used_percent: 20,
+							remaining_percent: 80,
+							reset_at: 1800000000,
+							reset_after_seconds: 100,
+						}
+					: {
+							window_type: "unknown",
+							limit_window_seconds: 12345,
+							used_percent: 60,
+							remaining_percent: 40,
+							reset_at: 1800000000,
+							reset_after_seconds: 100,
+						},
+			...(id === "unknown-duration" && hasMonthly
+				? {
+						secondary_window: {
+							window_type: "monthly" as const,
+							limit_window_seconds: 30 * 86400,
+							used_percent: 70,
+							remaining_percent: 30,
+							reset_at: 1800000000,
+							reset_after_seconds: 100,
+						},
+					}
+				: {}),
+		}));
+		const response = await app("user").request("/api/quota-snapshots");
+		expect(response.status).toBe(200);
+		const entry = byGroup(await response.json(), "codex")[0];
+		expect(entry.snapshot?.windows.find((window) => window.kind === "5h")?.usedRatio).toBeNull();
+		expect(entry.snapshot?.windows.find((window) => window.kind === "other")?.usedRatio).toBeNull();
+		if (hasMonthly)
+			expect(entry.snapshot?.windows.find((window) => window.kind === "monthly")?.usedRatio).toBe(
+				0.7,
+			);
+	});
 	test("Codex custom windows aggregate by label, with unnamed and null-ratio coverage kept unknown", () => {
 		const manager = getCodexManager();
 		Object.defineProperty(manager, "quotaCredentialIds", { configurable: true, value: ["a", "b"] });
@@ -344,11 +443,11 @@ describe("unified quota API", () => {
 		);
 		const entry = byGroup(readQuotaSnapshots(false, false), "codex")[0];
 		expect(entry.snapshot?.windows).toEqual([
-			{ kind: "5h", usedRatio: 0.2, resetsAt: null },
+			{ kind: "5h", usedRatio: null, resetsAt: null },
 			{ kind: "other", label: "review", usedRatio: 0.2, resetsAt: null },
 			{ kind: "other", label: "special", usedRatio: null, resetsAt: null },
 			{ kind: "other", usedRatio: null, resetsAt: null },
-			{ kind: "monthly", usedRatio: 0.7, resetsAt: null },
+			{ kind: "monthly", usedRatio: null, resetsAt: null },
 		]);
 	});
 	test.each([

@@ -47,6 +47,30 @@ test("renders unknown instead of zero and supports balance-only unlimited snapsh
 	expect(html).not.toContain("data-quota-bar=");
 });
 
+test("period percentages keep the spending, dollar limit and remaining amount accessible", () => {
+	const html = render({
+		scope: "subscription",
+		fetchedAt: 1,
+		windows: [
+			{
+				kind: "other",
+				label: "daily",
+				usedRatio: 0.2,
+				resetsAt: null,
+				used: 2,
+				total: 10,
+				remaining: 8,
+				unit: "USD",
+			},
+		],
+		balances: [],
+	});
+	expect(html).toContain("Daily");
+	expect(html).toContain("80% left");
+	expect(html).toContain("Used 2 USD / 10 USD");
+	expect(html).toContain("Remaining 8 USD");
+});
+
 test("expired plans render unavailable instead of positive quota bars or spendable amounts", () => {
 	const html = render({
 		scope: "subscription",

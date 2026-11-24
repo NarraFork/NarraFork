@@ -113,6 +113,54 @@ test("expired allowances hide spendable numbers without fabricating zero or a re
 	}
 });
 
+test("period amounts remain attached to their named window with currency and micro-unit precision", () => {
+	const value: PublicQuotaSnapshot = {
+		...snapshot,
+		balances: [],
+		windows: [
+			{
+				kind: "other",
+				label: "daily",
+				usedRatio: 0.2,
+				resetsAt: null,
+				used: 2,
+				total: 10,
+				remaining: 8,
+				unit: "USD",
+			},
+			{
+				kind: "weekly",
+				usedRatio: 0.08,
+				resetsAt: null,
+				used: 4,
+				total: 50,
+				remaining: 46,
+				unit: "USD",
+			},
+			{ kind: "monthly", usedRatio: null, resetsAt: null },
+			{
+				kind: "other",
+				label: "Micro",
+				usedRatio: 0.0000001,
+				resetsAt: null,
+				total: 10,
+				remaining: 9.999999,
+				unit: "CNY",
+			},
+		],
+	};
+	const view = quotaSnapshotView(value, "Provider", t, 1_000);
+	expect(view.windows[0]).toMatchObject({ used: 2, limit: 10, remainingAmount: 8, unit: "USD" });
+	expect(view.windows[1]).toMatchObject({ used: 4, limit: 50, remainingAmount: 46 });
+	expect(view.windows[2]).toMatchObject({ used: null, limit: null, remainingAmount: null });
+	expect(view.windows[3]?.used).toBe(0.000001);
+	const text = quotaSnapshotText(value, t, 1_000).detailsText;
+	expect(text).toContain("Daily: 80% left · Used 2 USD / 10 USD · Remaining 8 USD");
+	expect(text).toContain("Weekly: 92% left · Used 4 USD / 50 USD · Remaining 46 USD");
+	expect(text).toContain("0.000001 CNY");
+	expect(view.rows.some((row) => row.label === "USD")).toBe(false);
+});
+
 test("named periods stay distinct and do not invent reset times", () => {
 	const view = quotaSnapshotView(
 		{

@@ -2,6 +2,7 @@ import { afterEach, expect, spyOn, test } from "bun:test";
 import type { QuotaSnapshotEntry, QuotaSnapshotsResponse } from "@shared/quota-snapshot";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { renderToStaticMarkup } from "react-dom/server";
+import { quotaSnapshotText } from "../components/narrator/model/quota-snapshot-view";
 import { api } from "../lib/api";
 import {
 	quotaSnapshotsKey,
@@ -93,15 +94,62 @@ test("probe wins only with data, including when source is omitted", () => {
 	expect(selectQuotaEntries([legacy, stream])).toEqual([legacy]);
 });
 
-test("known probe expiry cannot be hidden by a positive stream balance without validity metadata", () => {
+test("known period amounts are probe data even when the ratio is unknown", () => {
+	const stream = entry("group", "key", "quota_balance");
+	const probe: QuotaSnapshotEntry = {
+		...entry(),
+		snapshot: {
+			fetchedAt: 1,
+			scope: "subscription",
+			balances: [],
+			windows: [
+				{
+					kind: "other",
+					label: "daily",
+					usedRatio: null,
+					resetsAt: null,
+					remaining: 0,
+					total: 0,
+					used: 0,
+					unit: "USD",
+				},
+			],
+		},
+	};
+	expect(selectQuotaEntries([probe, stream])).toEqual([probe]);
+	expect(selectQuotaEntries([stream, probe])).toEqual([probe]);
+});
+
+test("same-credential stream amounts retain the probe deadline on both sides of expiry", () => {
 	const stream = entry("group", "key", "quota_balance");
 	for (const windows of [[], [{ kind: "weekly" as const, usedRatio: null, resetsAt: null }]]) {
 		const probe: QuotaSnapshotEntry = {
 			...entry(),
-			snapshot: { fetchedAt: 1, scope: "subscription", windows, balances: [], expiresAt: 10 },
+			snapshot: {
+				fetchedAt: 1,
+				scope: "subscription",
+				windows,
+				balances: [],
+				expiresAt: 10,
+				plan: "Pro",
+			},
 		};
-		expect(selectQuotaEntries([probe, stream])).toEqual([probe]);
-		expect(selectQuotaEntries([stream, probe])).toEqual([probe]);
+		for (const entries of [
+			[probe, stream],
+			[stream, probe],
+		]) {
+			const selected = selectQuotaEntries(entries)[0];
+			expect(selected?.source).toBe("quota_balance");
+			expect(selected?.snapshot).toMatchObject({
+				expiresAt: 10,
+				plan: "Pro",
+				windows,
+				balances: [{ unit: "USD", remaining: 4 }],
+			});
+			const t = (key: string) => key;
+			expect(quotaSnapshotText(selected?.snapshot, t, 9).balance).toBe("4 USD");
+			expect(quotaSnapshotText(selected?.snapshot, t, 10).balance).toBe("quotaSnapshot.expired");
+		}
 	}
 });
 

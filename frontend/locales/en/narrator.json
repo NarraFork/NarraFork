@@ -3080,6 +3080,7 @@
 		"resetsAt": "Resets at {{time}}",
 		"expired": "Subscription expired",
 		"expiresAt": "Expires at",
+		"remainingAmount": "Remaining {{amount}}",
 		"window": {
 			"5h": "5h",
 			"daily": "Daily",

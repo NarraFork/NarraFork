@@ -62,12 +62,18 @@ export function publicQuotaSnapshot(
 	return {
 		fetchedAt: snapshot.fetchedAt,
 		scope: snapshot.scope,
-		windows: snapshot.windows.map(({ kind, label, usedRatio, resetsAt }) => ({
-			kind,
-			...(label ? { label } : {}),
-			usedRatio,
-			resetsAt,
-		})),
+		windows: snapshot.windows.map(
+			({ kind, label, usedRatio, resetsAt, used, total, remaining, unit }) => ({
+				kind,
+				...(label ? { label } : {}),
+				usedRatio,
+				resetsAt,
+				...(typeof used === "number" && Number.isFinite(used) ? { used } : {}),
+				...(typeof total === "number" && Number.isFinite(total) ? { total } : {}),
+				...(typeof remaining === "number" && Number.isFinite(remaining) ? { remaining } : {}),
+				...(typeof unit === "string" ? { unit } : {}),
+			}),
+		),
 		balances: snapshot.balances.map(({ unit, remaining, total, unlimited }) => ({
 			unit,
 			remaining,
@@ -179,10 +185,17 @@ function codexOverview(): PublicQuotaSnapshot | null {
 		// Known plans without this window do not participate. An entirely missing account
 		// or an account with no known windows still leaves coverage unknown, as does an
 		// unknown ratio in an applicable window.
-		// Unnamed `other` periods cannot safely be assumed to represent the same allowance.
+		// An unnamed `other` on an account missing this window might be that window, so it
+		// cannot prove non-applicability. Nor can unnamed periods safely be merged together.
 		const complete =
 			snapshots.length === ids.length &&
 			snapshots.every((snapshot) => snapshot.windows.length > 0) &&
+			snapshots.every(
+				(snapshot) =>
+					snapshot.windows.some(
+						(window) => window.kind === kind && (window.label ?? null) === (label ?? null),
+					) || !snapshot.windows.some((window) => window.kind === "other" && !window.label),
+			) &&
 			ratios.length === matched.length &&
 			(kind !== "other" || !!label);
 		const resets = matched.flatMap((window) => (window.resetsAt === null ? [] : [window.resetsAt]));

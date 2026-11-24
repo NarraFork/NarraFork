@@ -69,18 +69,19 @@ export async function invalidateQuotaSnapshots(client: QueryClient): Promise<voi
 	await client.invalidateQueries({ queryKey: quotaSnapshotsKey });
 }
 
-/** A probe's known validity deadline is authoritative even without numbers; otherwise use data. */
+/** Select numerical data per credential, retaining the direct probe's validity and window metadata. */
 export function selectQuotaEntries(entries: QuotaSnapshotEntry[]): QuotaSnapshotEntry[] {
 	const selected = new Map<string, QuotaSnapshotEntry>();
+	const probes = new Map<string, QuotaSnapshotEntry>();
 	for (const entry of entries) {
 		const key = JSON.stringify([entry.groupId, entry.credentialId]);
+		if ((entry.source ?? "probe") === "probe") probes.set(key, entry);
 		const previous = selected.get(key);
 		const hasData = (value: QuotaSnapshotEntry) =>
 			!!value.snapshot &&
-			(Number.isFinite(value.snapshot.expiresAt) ||
-				value.snapshot.windows.some(
-					(window) => window.usedRatio != null && Number.isFinite(window.usedRatio),
-				) ||
+			(value.snapshot.windows.some((window) =>
+				[window.usedRatio, window.used, window.total, window.remaining].some(Number.isFinite),
+			) ||
 				value.snapshot.balances.some(
 					(balance) =>
 						balance.unlimited || (balance.remaining != null && Number.isFinite(balance.remaining)),
@@ -93,7 +94,24 @@ export function selectQuotaEntries(entries: QuotaSnapshotEntry[]): QuotaSnapshot
 			selected.set(key, entry);
 		}
 	}
-	return [...selected.values()];
+	return [...selected].map(([key, entry]) => {
+		const probe = probes.get(key);
+		if (entry.source !== "quota_balance" || !entry.snapshot || !probe?.snapshot) return entry;
+		const metadata = probe.snapshot;
+		return {
+			...entry,
+			...(probe.primary !== undefined ? { primary: probe.primary } : {}),
+			snapshot: {
+				...entry.snapshot,
+				scope: metadata.scope,
+				...(Number.isFinite(metadata.expiresAt) ? { expiresAt: metadata.expiresAt } : {}),
+				...(metadata.plan ? { plan: metadata.plan } : {}),
+				...(metadata.windows.length ? { windows: metadata.windows } : {}),
+				...(metadata.error ? { error: metadata.error } : {}),
+				...(metadata.hasError ? { hasError: true } : {}),
+			},
+		};
+	});
 }
 
 /** Keep only an authenticated CLI identity's ephemeral value, never deleted credentials. */

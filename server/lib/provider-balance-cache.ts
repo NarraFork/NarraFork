@@ -212,6 +212,16 @@ function relayPeriod(amount: ProviderBalanceAmount): QuotaWindow {
 						: "other",
 		label: amount.window,
 		usedRatio,
+		...(typeof amount.used === "number" && Number.isFinite(amount.used)
+			? { used: amount.used }
+			: {}),
+		...(typeof amount.total === "number" && Number.isFinite(amount.total)
+			? { total: amount.total }
+			: {}),
+		...(typeof amount.remaining === "number" && Number.isFinite(amount.remaining)
+			? { remaining: amount.remaining }
+			: {}),
+		...(typeof amount.unit === "string" ? { unit: amount.unit } : {}),
 		// windowStart is not a promise of when a quota refills, nor is plan expiry.
 		resetsAt: null,
 	};

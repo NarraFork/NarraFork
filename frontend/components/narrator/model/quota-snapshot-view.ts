@@ -3,6 +3,7 @@ import { formatFullLocaleDateTime } from "../../../lib/format";
 import { formatLocaleNumber } from "../../../lib/intl-format";
 import {
 	formatQuotaBadgeText,
+	formatQuotaWindowAmount,
 	pickLimitingWindow,
 	type QuotaPanelT,
 	type QuotaPanelView,
@@ -50,6 +51,17 @@ export function quotaSnapshotView(
 					? Math.max(0, Math.min(100, window.usedRatio * 100))
 					: null;
 			const remainingPercent = usedPercent == null ? null : Math.round(100 - usedPercent);
+			const limit = window.total != null && Number.isFinite(window.total) ? window.total : null;
+			const reportedRemaining =
+				window.remaining != null && Number.isFinite(window.remaining) ? window.remaining : null;
+			const used =
+				window.used != null && Number.isFinite(window.used)
+					? window.used
+					: limit != null && reportedRemaining != null
+						? balanceUsed(limit, reportedRemaining)
+						: null;
+			const remainingAmount =
+				reportedRemaining ?? (limit != null && used != null ? balanceUsed(limit, used) : null);
 			const standardPeriod = window.label && ["daily", "weekly", "monthly"].includes(window.label);
 			const label = standardPeriod
 				? t(`quotaSnapshot.window.${window.label}`)
@@ -60,8 +72,10 @@ export function quotaSnapshotView(
 				shortLabel: label,
 				usedPercent,
 				remainingPercent,
-				used: null,
-				limit: null,
+				used,
+				limit,
+				remainingAmount,
+				...(window.unit ? { unit: window.unit } : {}),
 				resetAt: window.resetsAt,
 				level: quotaLevelForRemaining(remainingPercent),
 			};
@@ -139,7 +153,15 @@ export function quotaSnapshotText(
 			window.resetAt != null && Number.isFinite(window.resetAt)
 				? ` · ${t("quotaSnapshot.resetsAt", { time: new Date(window.resetAt).toISOString() })}`
 				: "";
-		return `${window.label}: ${remaining}${reset}`;
+		const amounts =
+			window.used != null && window.limit != null
+				? ` · ${t("quotaPanel.usedOfLimit", { used: formatQuotaWindowAmount(window.used, window.unit), limit: formatQuotaWindowAmount(window.limit, window.unit) })}`
+				: "";
+		const amountLeft =
+			window.remainingAmount != null
+				? ` · ${t("quotaSnapshot.remainingAmount", { amount: formatQuotaWindowAmount(window.remainingAmount, window.unit) })}`
+				: "";
+		return `${window.label}: ${remaining}${amounts}${amountLeft}${reset}`;
 	});
 	lines.push(...view.rows.map((row) => `${row.label}: ${row.value}`));
 	if (view.failureDetail) lines.push(t("quotaPanel.fetchError", { error: view.failureDetail }));

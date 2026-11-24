@@ -13,10 +13,10 @@ import { useTranslation } from "react-i18next";
 import { formatFullLocaleDateTime } from "../../../lib/format";
 import { QuotaWindowBars } from "./QuotaWindowBars";
 import {
-	formatQuotaAmount,
 	formatQuotaBadgeText,
 	formatQuotaCountdown,
 	formatQuotaSummaryLines,
+	formatQuotaWindowAmount,
 	QUOTA_LEVEL_COLORS,
 	type QuotaLevel,
 	type QuotaPanelView,
@@ -57,8 +57,8 @@ function WindowRow({
 	const amounts =
 		window.used != null && window.limit != null
 			? t("quotaPanel.usedOfLimit", {
-					used: formatQuotaAmount(window.used),
-					limit: formatQuotaAmount(window.limit),
+					used: formatQuotaWindowAmount(window.used, window.unit),
+					limit: formatQuotaWindowAmount(window.limit, window.unit),
 				})
 			: null;
 	return (
@@ -99,6 +99,13 @@ function WindowRow({
 					</Tooltip>
 				)}
 			</Group>
+			{window.remainingAmount != null && (
+				<Text size="xs" c="dimmed">
+					{t("quotaSnapshot.remainingAmount", {
+						amount: formatQuotaWindowAmount(window.remainingAmount, window.unit),
+					})}
+				</Text>
+			)}
 		</Stack>
 	);
 }
