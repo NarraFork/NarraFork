@@ -26,6 +26,7 @@ import {
 	IconPin,
 	IconPinnedOff,
 	IconServer,
+	IconShieldQuestion,
 	IconSubtask,
 	IconTerminal2,
 	IconWindowMaximize,
@@ -103,9 +104,12 @@ export function RecentTabDetails({ tab, compact = false }: { tab: RecentTab; com
 	const { t } = useTranslation("common");
 	const tt = t as T;
 	const isSession = tab.type === "narrator" || tab.type === "subagent";
-	const display = isSession
-		? getEffectiveNarratorDisplay(tab.status ?? "idle", tab.substatus)
-		: null;
+	// A team tab shows its coordinator's state, as its icon does.
+	const display =
+		isSession || tab.type === "team"
+			? getEffectiveNarratorDisplay(tab.status ?? "idle", tab.substatus)
+			: null;
+	const pendingApprovals = tab.type === "team" ? (tab.pendingApprovalCount ?? 0) : 0;
 	const viewerCount = tab.viewerCount ?? tab.viewers?.length ?? 0;
 	const terminals = tab.activeTerminalCount ?? 0;
 	const work = tab.activeBackgroundWorkCount ?? tab.activeBackgroundTaskCount ?? 0;
@@ -142,6 +146,11 @@ export function RecentTabDetails({ tab, compact = false }: { tab: RecentTab; com
 				>
 					{tab.subtitle}
 				</Text>
+			)}
+			{pendingApprovals > 0 && (
+				<DetailLine icon={<IconShieldQuestion size={12} />}>
+					{tt("recentTabTeamPendingApprovals", { count: pendingApprovals })}
+				</DetailLine>
 			)}
 			{terminals > 0 && (
 				<DetailLine icon={<IconTerminal2 size={12} />}>

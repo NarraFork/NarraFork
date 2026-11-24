@@ -805,5 +805,6 @@
 	"imageViewer_copyFailed": "复制图片失败",
 	"imageViewer_downloadFailed": "下载图片失败",
 	"botBadge": "Bot",
-	"swipeMenu": "菜单"
+	"swipeMenu": "菜单",
+	"recentTabTeamPendingApprovals": "{{count}} 项待批"
 }

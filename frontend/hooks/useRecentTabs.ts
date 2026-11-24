@@ -187,12 +187,17 @@ function tabKey(tab: Pick<RecentTab, "type" | "id">): string {
 	return `${tab.type}:${tab.id}`;
 }
 
-export function recentTabSection(tab: Pick<RecentTab, "type">): RecentTabsSection {
-	return tab.type === "project" ? "projects" : "work";
+/**
+ * Every tab lives in the sidebar's one list, `work`: sessions, folders, and pinned projects and
+ * teams alike (the server converts what the retired `projects` section held). The `projects`
+ * window is still read, and stays empty.
+ */
+export function recentTabSection(_tab: Pick<RecentTab, "type">): RecentTabsSection {
+	return "work";
 }
 
-function sectionFromKey(key: string): RecentTabsSection {
-	return key.startsWith("project:") ? "projects" : "work";
+function sectionFromKey(_key: string): RecentTabsSection {
+	return "work";
 }
 
 function flattenPages(data: RecentTabsInfiniteData | undefined): RecentTab[] {
@@ -558,6 +563,7 @@ function toPersistedRecentTab(tab: RecentTab): PersistedRecentTab {
 	if (tab.folderIcon !== undefined) persisted.folderIcon = tab.folderIcon;
 	if (tab.folderColor !== undefined) persisted.folderColor = tab.folderColor;
 	if (tab.folderPreviewCount !== undefined) persisted.folderPreviewCount = tab.folderPreviewCount;
+	if (tab.projectId !== undefined) persisted.projectId = tab.projectId;
 	return persisted;
 }
 
@@ -588,7 +594,10 @@ export function clearLoadedTabs(
 		!!tab.folderId;
 	if (scope === "all") return tabs.filter(isKept);
 	if (scope === "projects") return tabs.filter((tab) => tab.type !== "project" || isKept(tab));
-	return tabs.filter((tab) => isKept(tab) || tab.type === "project" || isAttentionTab(tab));
+	// Projects and teams are not sessions: never "inactive".
+	return tabs.filter(
+		(tab) => isKept(tab) || tab.type === "project" || tab.type === "team" || isAttentionTab(tab),
+	);
 }
 
 function snapshotSections(
@@ -631,10 +640,10 @@ export async function removeRecentTabCascade(
 	id: string,
 	options: { keepEmptyFolder?: boolean } = {},
 ): Promise<void> {
-	const section = recentTabsSectionQueryKey(type === "project" ? "projects" : "work");
+	const section = recentTabsSectionQueryKey(recentTabSection({ type }));
 	await qc.cancelQueries({ queryKey: section });
 	const snapshots = snapshotSections(qc);
-	updateSectionData(qc, type === "project" ? "projects" : "work", (current) =>
+	updateSectionData(qc, recentTabSection({ type }), (current) =>
 		applyOperation(current, { type: "remove", key: `${type}:${id}` }),
 	);
 	syncCompatibilityCache(qc);
@@ -994,8 +1003,9 @@ export function useRecentTabs() {
 		onMutate: async ({ type, id }) => {
 			await qc.cancelQueries({ queryKey: RECENT_TABS_QUERY_KEY });
 			const snapshots = snapshotSections(qc);
-			const section = type === "project" ? "projects" : "work";
-			updateSectionData(qc, section, (current) => applyRecentTabRemove(current, `${type}:${id}`));
+			updateSectionData(qc, recentTabSection({ type }), (current) =>
+				applyRecentTabRemove(current, `${type}:${id}`),
+			);
 			syncCompatibilityCache(qc);
 			return { snapshots };
 		},
@@ -1309,6 +1319,26 @@ export function addRecentTabsBatch(tabs: AddRecentTabInput[]): Promise<void> {
 	});
 }
 
+/**
+ * "Pin to sidebar" / "Unpin from sidebar" on a project or team page.
+ *
+ * Pinning creates the tab and pins it in one revision (`pin` rides along with the upsert, so the
+ * tab never shows unpinned first). Unpinning keeps the tab, unpinned, like the row menu's
+ * unpin. The server sets a team tab's title and project from the team itself and refuses a team
+ * the user cannot read. Rejects on failure, so the caller can say so.
+ */
+export function setRecentTabPinnedFromPage(
+	tab: { type: "project" | "team"; id: string; title: string },
+	pinned: boolean,
+): Promise<void> {
+	if (!pinned) {
+		return applyGlobalRecentTabsMutation(api.pinRecentTab(`${tab.type}:${tab.id}`, false));
+	}
+	return applyGlobalRecentTabsMutation(
+		api.upsertRecentTab({ ...buildRecentTabUpsert(tab), pin: true }),
+	);
+}
+
 export function addSubagentRecentTab(input: SubagentRecentTabInput): void {
 	void recordRecentTabVisit(buildSubagentRecentTab(input)).catch(() => {});
 }
@@ -1321,7 +1351,7 @@ export function updateRecentTabLocal(
 	const normalizedPatch = { ...patch };
 	if ("title" in patch) normalizedPatch.title = clampRecentTabText(patch.title);
 	if ("subtitle" in patch) normalizedPatch.subtitle = clampRecentTabText(patch.subtitle);
-	updateSectionData(globalQC, type === "project" ? "projects" : "work", (tabs) => {
+	updateSectionData(globalQC, recentTabSection({ type }), (tabs) => {
 		let changed = false;
 		const next = tabs.map((tab) => {
 			if (tab.type !== type || tab.id !== id) return tab;

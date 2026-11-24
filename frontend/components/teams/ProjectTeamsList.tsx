@@ -4,6 +4,7 @@
  * creating its coordinator session (P1's route).
  */
 import { NarratorStatusIcon } from "@frontend/components/nav/NarratorStatusIcon";
+import { PinToSidebarButton } from "@frontend/components/nav/PinToSidebarButton";
 import { teamsUnavailable, useCreateTeam, useProjectTeams } from "@frontend/hooks/useTeams";
 import { describeApiError } from "@frontend/lib/api-error";
 import {
@@ -171,32 +172,42 @@ export function ProjectTeamsList({
 			{rows.map((team) => {
 				const current = team.id === currentTeamId;
 				return (
-					<UnstyledButton
+					// The pin is a sibling of the row's button, not inside it (no nested buttons).
+					<Group
 						key={team.id}
-						onClick={() => onOpenTeam(team.id)}
-						aria-current={current ? "page" : undefined}
+						gap={4}
+						wrap="nowrap"
+						pr={nav ? 2 : 4}
 						data-testid="project-team-row"
 						data-team-id={team.id}
-						px={nav ? 6 : "sm"}
-						py={nav ? 4 : "xs"}
 						style={{
 							borderRadius: "var(--mantine-radius-sm)",
 							border: nav ? undefined : "1px solid var(--mantine-color-default-border)",
 							background: current ? "var(--mantine-primary-color-light)" : undefined,
 						}}
 					>
-						<Group gap={8} wrap="nowrap">
-							<NarratorStatusIcon size={nav ? 14 : 16} status={team.coordinatorStatus} />
-							<Text size="sm" fw={current ? 600 : 500} truncate style={{ flex: 1 }}>
-								{team.name || team.id}
-							</Text>
-							{team.access === "read" && (
-								<Badge size="xs" variant="light" color="gray" tt="none">
-									{t("teams.onlooker")}
-								</Badge>
-							)}
-						</Group>
-					</UnstyledButton>
+						<UnstyledButton
+							onClick={() => onOpenTeam(team.id)}
+							aria-current={current ? "page" : undefined}
+							data-testid="project-team-open"
+							px={nav ? 6 : "sm"}
+							py={nav ? 4 : "xs"}
+							style={{ flex: 1, minWidth: 0 }}
+						>
+							<Group gap={8} wrap="nowrap">
+								<NarratorStatusIcon size={nav ? 14 : 16} status={team.coordinatorStatus} />
+								<Text size="sm" fw={current ? 600 : 500} truncate style={{ flex: 1 }}>
+									{team.name || team.id}
+								</Text>
+								{team.access === "read" && (
+									<Badge size="xs" variant="light" color="gray" tt="none">
+										{t("teams.onlooker")}
+									</Badge>
+								)}
+							</Group>
+						</UnstyledButton>
+						<PinToSidebarButton type="team" id={team.id} title={team.name || team.id} size="sm" />
+					</Group>
 				);
 			})}
 			{teams.hasNextPage && (

@@ -3,6 +3,8 @@ import type { RecentTabRow } from "@frontend/hooks/recent-tab-folders";
 import {
 	hasDirectorySubtitle,
 	isTeamOnlookerTab,
+	recentTabHref,
+	recentTabLiveNarratorId,
 	statusAttention,
 } from "@frontend/hooks/recent-tabs-utils";
 import { canRevealFromBrowser } from "@frontend/lib/local-origin";
@@ -24,7 +26,14 @@ import {
 	RECENT_TAB_FOLDER_DEFAULT_PREVIEW,
 	type RecentTabsDelta as RecentTabsDeltaFrame,
 } from "@shared/recent-tabs";
-import { IconBrain, IconClock, IconFolder, IconPencil, IconRobot } from "@tabler/icons-react";
+import {
+	IconBrain,
+	IconClock,
+	IconFolder,
+	IconPencil,
+	IconRobot,
+	IconUsersGroup,
+} from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
 import React, { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
@@ -118,6 +127,7 @@ import { SwipeMenuHint, useRowSwipe } from "./useRowSwipe";
 const QUERY_KEY = ["user-preferences", "recent-tabs"];
 
 const PREFETCH_QUERY_GC_TIME_MS = 5 * 60_000;
+const TEAM_RUNTIME_REFRESH_DELAY_MS = 2_000;
 
 function getRecentTabNarratorId(tab: RecentTab): string | null {
 	if (tab.type === "narrator" || tab.type === "subagent") return tab.id;
@@ -146,6 +156,15 @@ interface RecentTabsWSProviderProps {
 	onNavigate?: () => void;
 }
 
+/** The part of a coordinator's socket patch a team tab shows. */
+function teamTabPatch(patch: Partial<RecentTab>): Partial<RecentTab> {
+	const picked: Partial<RecentTab> = {};
+	if (patch.title !== undefined) picked.title = patch.title;
+	if (patch.status !== undefined) picked.status = patch.status;
+	if (patch.substatus !== undefined) picked.substatus = patch.substatus;
+	return picked;
+}
+
 /** Invisible root component that maintains the bounded RecentTabs live window. */
 export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 	const { tabs } = useRecentTabs();
@@ -163,15 +182,16 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 	const deltaBatchesRef = useRef<Parameters<typeof collectRecentTabsDeltaFrame>[0]>(new Map());
 
 	const liveTabs = useMemo(() => selectRecentTabsLiveWindow(tabs, pathname), [tabs, pathname]);
+	// A team tab follows its coordinator, so the socket subscribes to it as well.
 	const narratorIds = useMemo(
-		() => liveTabs.map(getRecentTabNarratorId).filter((id): id is string => !!id),
+		() => [...new Set(liveTabs.map(recentTabLiveNarratorId).filter((id): id is string => !!id))],
 		[liveTabs],
 	);
 	// Snapshot membership is independent of display and subscription order.
 	const runtimeTargetsKey = useMemo(
 		() =>
 			JSON.stringify(
-				liveTabs.map((tab) => [tabSortId(tab), getRecentTabNarratorId(tab)] as const).sort(),
+				liveTabs.map((tab) => [tabSortId(tab), recentTabLiveNarratorId(tab)] as const).sort(),
 			),
 		[liveTabs],
 	);
@@ -269,6 +289,25 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 		[refreshRuntime],
 	);
 
+	/**
+	 * A team tab's pending-approval count is runtime state with no socket frame of its own: read
+	 * the runtime again a moment after its coordinator's status moves (coalesced).
+	 */
+	const teamRuntimeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+	const scheduleTeamRuntimeRefresh = useCallback(() => {
+		if (teamRuntimeTimerRef.current) return;
+		teamRuntimeTimerRef.current = setTimeout(() => {
+			teamRuntimeTimerRef.current = null;
+			void refreshRuntime().catch(() => {});
+		}, TEAM_RUNTIME_REFRESH_DELAY_MS);
+	}, [refreshRuntime]);
+	useEffect(
+		() => () => {
+			if (teamRuntimeTimerRef.current) clearTimeout(teamRuntimeTimerRef.current);
+		},
+		[],
+	);
+
 	const pendingTabPatchesRef = useRef(new Map<string, Partial<RecentTab>>());
 	const tabPatchRafRef = useRef(0);
 	const tabPatchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -286,9 +325,12 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 		if (pending.size === 0) return;
 		pendingTabPatchesRef.current = new Map();
 		const patches = tabsRef.current.flatMap((tab) => {
-			const narratorId = getRecentTabNarratorId(tab);
+			const narratorId = recentTabLiveNarratorId(tab);
 			const patch = narratorId ? pending.get(narratorId) : undefined;
-			return patch ? [{ key: tabSortId(tab), patch }] : [];
+			if (!patch) return [];
+			// A team tab shows its coordinator's name and state, not the session's own terminals,
+			// viewers or draft.
+			return [{ key: tabSortId(tab), patch: tab.type === "team" ? teamTabPatch(patch) : patch }];
 		});
 		applyRecentTabsRuntimePatches(qc, patches);
 	}, [qc]);
@@ -333,6 +375,8 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 				// The subscription reconciles caches for ALL changes before this callback.
 				// Attention is separate: no synthetic status patch or urgency-gated refetch.
 				const tab = tabsRef.current.find((item) => getRecentTabNarratorId(item) === narratorId);
+				// Only a session tab alerts; a pinned team's coordinator does not (see below).
+				if (!tab) return;
 				updateAsyncQuestionAttention(
 					narratorId,
 					event.questionId,
@@ -348,7 +392,21 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 			// response must not roll them back (icon colour / filled state lag).
 			bumpRecentTabRuntimeVersions(runtimeVersionsRef.current, narratorId, Object.keys(patch));
 
-			if (event.type === "status") {
+			// The socket also follows the coordinators of pinned teams. Their status reaches the
+			// team tab below, but alerts belong to session tabs: pinning a team is not a request
+			// to be told each time its coordinator waits.
+			const hasSessionTab = tabsRef.current.some(
+				(tab) => getRecentTabNarratorId(tab) === narratorId,
+			);
+			if (
+				event.type === "status" &&
+				tabsRef.current.some((tab) => tab.type === "team" && tab.id === narratorId)
+			) {
+				// The tree's pending approvals may have moved with it; read them again.
+				scheduleTeamRuntimeRefresh();
+			}
+
+			if (event.type === "status" && hasSessionTab) {
 				const isReflecting = event.substatus?.includes("reflecting");
 				/*
 				 * A narrator parked until an unavailable model recovers is also
@@ -416,7 +474,7 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 			pendingTabPatchesRef.current.set(narratorId, existing ? { ...existing, ...patch } : patch);
 			scheduleTabPatchFlush();
 		},
-		[qc, scheduleTabPatchFlush],
+		[qc, scheduleTabPatchFlush, scheduleTeamRuntimeRefresh],
 	);
 
 	const handleGlobalEvent = useCallback(
@@ -631,6 +689,7 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 	const hasClearableTabs = tabs.some(
 		(tab) =>
 			tab.type !== "project" &&
+			tab.type !== "team" &&
 			tab.type !== "folder" &&
 			!tab.folderId &&
 			!tab.pinned &&
@@ -1332,7 +1391,12 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 								pinScope={ctxInFolder ? "folder" : "list"}
 								onRemove={handleCtxClose}
 								onReveal={handleReveal}
-								canReveal={revealAvailable && ctxTab.type !== "project" && !ctxIsFolder}
+								canReveal={
+									revealAvailable &&
+									ctxTab.type !== "project" &&
+									ctxTab.type !== "team" &&
+									!ctxIsFolder
+								}
 								onNewNarratorHere={handleNewNarratorHere}
 								canNewNarratorHere={newSessionTargetFor(ctxTab) !== null}
 								newNarratorHereLabel={ctxIsFolder ? t("newNarratorInFolder") : t("newNarratorHere")}
@@ -1466,6 +1530,8 @@ function TabIcon({ tab, size, iconColor }: { tab: RecentTab; size: number; iconC
 		);
 	}
 
+	if (tab.type === "team") return <TeamTabIcon tab={tab} size={size} />;
+
 	let icon: React.ReactNode;
 	if (tab.type === "project") icon = <IconFolder size={size} />;
 	else icon = <IconRobot size={size} color={iconColor} />;
@@ -1547,6 +1613,68 @@ function TabIcon({ tab, size, iconColor }: { tab: RecentTab; size: number; iconC
 					}}
 				>
 					<IconPencil size={7} stroke={2.5} />
+				</Box>
+			)}
+		</Box>
+	);
+}
+
+/**
+ * A pinned team: its coordinator's status bubble (the team list and the team page's top bar
+ * show the same), a group marker so it does not read as a session, and the tree's pending
+ * approvals for members.
+ */
+function TeamTabIcon({ tab, size }: { tab: RecentTab; size: number }) {
+	const { t } = useTranslation("nav");
+	const pending = tab.pendingApprovalCount ?? 0;
+	return (
+		<Box component="span" pos="relative" style={{ display: "inline-flex", lineHeight: 0 }}>
+			<NarratorStatusIcon size={size} status={tab.status} substatus={tab.substatus} />
+			<Box
+				component="span"
+				style={{
+					position: "absolute",
+					left: -4,
+					bottom: -4,
+					width: 11,
+					height: 11,
+					borderRadius: "50%",
+					background: "var(--mantine-color-indigo-6)",
+					border: "1px solid var(--mantine-color-body)",
+					display: "inline-flex",
+					alignItems: "center",
+					justifyContent: "center",
+					color: "var(--mantine-color-white)",
+					pointerEvents: "none",
+				}}
+			>
+				<IconUsersGroup size={7} stroke={2.5} />
+			</Box>
+			{pending > 0 && (
+				<Box
+					component="span"
+					role="img"
+					aria-label={t("teamTabPendingApprovals", { count: pending })}
+					data-testid="team-tab-pending"
+					style={{
+						position: "absolute",
+						right: -6,
+						top: -5,
+						minWidth: 12,
+						height: 12,
+						padding: "0 2px",
+						borderRadius: 6,
+						background: "var(--mantine-color-orange-6)",
+						border: "1px solid var(--mantine-color-body)",
+						color: "var(--mantine-color-white)",
+						fontSize: 8,
+						fontWeight: 700,
+						lineHeight: "10px",
+						textAlign: "center",
+						pointerEvents: "none",
+					}}
+				>
+					{pending > 9 ? "9+" : pending}
 				</Box>
 			)}
 		</Box>
@@ -1644,7 +1772,8 @@ function TabItemBody({
 	const drag = useContext(RecentTabsDragContext);
 	const hover = useContext(RecentTabHoverContext);
 	const { t } = useTranslation("common");
-	const to = tab.type === "project" ? `/projects/${tab.id}` : `/narrators/${tab.id}`;
+	// A team tab without a project yet (never the case for a stored one) stays put.
+	const href = recentTabHref(tab);
 	const iconColor = getNarratorStatusIconColor(tab);
 	const rowKey = tabSortId(tab);
 
@@ -1654,10 +1783,11 @@ function TabItemBody({
 	const handleClick = useCallback(() => {
 		if (drag.consumeClick()) return;
 		hover?.hide();
+		if (!href) return;
 		handlePrefetch();
-		navigate({ to });
+		navigate({ to: href });
 		onNavigate?.();
-	}, [drag.consumeClick, hover, handlePrefetch, navigate, to, onNavigate]);
+	}, [drag.consumeClick, hover, handlePrefetch, navigate, href, onNavigate]);
 
 	// Mouse only: touch has no hover, its details live at the top of the row menu.
 	const handlePointerEnter = useCallback(
@@ -1734,6 +1864,8 @@ function TabItemBody({
 				position: "relative",
 			}}
 			data-tab-sort-id={tabSortId(tab)}
+			// Where Enter leads from the keyboard: a team page's path needs its project.
+			data-tab-href={href ?? undefined}
 		>
 			<SwipeMenuHint swipeX={swipe.swipeX} label={t("swipeMenu")} />
 			<div style={swipe.style}>

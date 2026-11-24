@@ -66,6 +66,7 @@ export function TeamPageView({
 						projectId={projectId}
 						teamId={teamId}
 						title={team.data?.name ?? <Skeleton height={18} width={140} />}
+						teamName={team.data ? team.data.name || team.data.id : undefined}
 						summary={summary.data}
 						onOpenSession={openSession}
 						leading={

@@ -28,6 +28,11 @@ export interface RecentTab extends PersistedRecentTab {
 	teamOnlooker?: boolean;
 	/** Runtime-enriched marker: a team session (coordinator or one of its subagents). M1. */
 	teamSession?: boolean;
+	/**
+	 * Team tabs only, runtime-enriched: the team tree's visible pending approvals, for members
+	 * (null for an onlooker, who cannot decide them).
+	 */
+	pendingApprovalCount?: number | null;
 	/** Persisted marker (see `PersistedRecentTab`): this narrator was spawned by a scheduled task. */
 	isScheduled?: boolean;
 }
@@ -64,7 +69,7 @@ export function accessChangeNeedsRuntimeRefresh(
 			tab.teamOnlooker === true ||
 			(tab.type === "subagent" && tab.teamSession === true) ||
 			subagentOfUnknownTeam(tab) ||
-			(tab.type === "narrator" && tab.id === narratorId),
+			((tab.type === "narrator" || tab.type === "team") && tab.id === narratorId),
 	);
 }
 
@@ -75,7 +80,11 @@ export function accessChangeNeedsRuntimeRefresh(
  */
 export function projectAccessChangeNeedsRuntimeRefresh(tabs: readonly RecentTab[]): boolean {
 	return tabs.some(
-		(tab) => tab.teamSession === true || tab.teamOnlooker === true || subagentOfUnknownTeam(tab),
+		(tab) =>
+			tab.type === "team" ||
+			tab.teamSession === true ||
+			tab.teamOnlooker === true ||
+			subagentOfUnknownTeam(tab),
 	);
 }
 
@@ -194,6 +203,7 @@ const RECENT_TAB_RUNTIME_KEYS = [
 	"viewers",
 	"viewerCount",
 	"hasDraft",
+	"pendingApprovalCount",
 ] as const satisfies ReadonlyArray<keyof RecentTab>;
 
 function asFields(tab: RecentTab): Record<string, unknown> {
@@ -272,8 +282,27 @@ export function mergeRecentTabRuntime(tab: PersistedRecentTab, previous?: Recent
 	return isSameRecentTab(merged, previous) ? previous : merged;
 }
 
-function recentTabNarratorId(tab: RecentTab): string | null {
-	if (tab.type === "narrator" || tab.type === "subagent") return tab.id;
+/**
+ * The narrator whose live state a tab shows: its own session, or a team tab's coordinator (the
+ * team id is the coordinator's id). The narrator socket and the runtime endpoint follow this id.
+ * Attention (sounds, favicon, PWA notifications) stays with session tabs: a pinned team is not
+ * a subscription to its coordinator's alerts.
+ */
+export function recentTabLiveNarratorId(tab: Pick<RecentTab, "type" | "id">): string | null {
+	if (tab.type === "narrator" || tab.type === "subagent" || tab.type === "team") return tab.id;
+	return null;
+}
+
+/**
+ * Where a tab leads: a session page, a project page or a team page. Null for a folder (not a
+ * page), and for a team tab whose project is not known yet.
+ */
+export function recentTabHref(tab: Pick<RecentTab, "type" | "id" | "projectId">): string | null {
+	if (tab.type === "narrator" || tab.type === "subagent") return `/narrators/${tab.id}`;
+	if (tab.type === "project") return `/projects/${tab.id}`;
+	if (tab.type === "team") {
+		return tab.projectId ? `/projects/${tab.projectId}/teams/${tab.id}` : null;
+	}
 	return null;
 }
 
@@ -353,9 +382,8 @@ export function reconcileRecentTabsRuntimePatches(
 }
 
 function recentTabMatchesPath(tab: RecentTab, pathname: string): boolean {
-	if (tab.type === "project") return pathname === `/projects/${tab.id}`;
-	if (tab.type === "folder") return false;
-	return pathname === `/narrators/${tab.id}`;
+	const href = recentTabHref(tab);
+	return href !== null && pathname === href;
 }
 
 export function selectRecentTabsLiveWindow(
@@ -366,9 +394,12 @@ export function selectRecentTabsLiveWindow(
 	const selected: RecentTab[] = [];
 	const narratorIds = new Set<string>();
 	const add = (tab: RecentTab) => {
-		const narratorId = recentTabNarratorId(tab);
-		if (!narratorId || narratorIds.has(narratorId) || selected.length >= limit) return;
-		narratorIds.add(narratorId);
+		const narratorId = recentTabLiveNarratorId(tab);
+		// A team tab shares its coordinator's id with the coordinator's own session tab; both
+		// are live, each under its own key.
+		const slot = tab.type === "team" ? `team:${narratorId}` : narratorId;
+		if (!narratorId || !slot || narratorIds.has(slot) || selected.length >= limit) return;
+		narratorIds.add(slot);
 		selected.push(tab);
 	};
 	for (const tab of tabs) {

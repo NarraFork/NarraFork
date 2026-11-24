@@ -58,6 +58,8 @@ export interface RecentTabsPageResponse {
 export type RecentTabsMutationResponse = RecentTabsMutationResult;
 export type RecentTabUpsertInput = PersistedRecentTab & {
 	updateOnly?: boolean;
+	/** Pin (or unpin) in the same revision as the upsert; omitted keeps the stored pin. */
+	pin?: boolean;
 	/**
 	 * Place the tab relative to an existing one in the SAME revision that creates it.
 	 * Mutually exclusive. Only the single-tab endpoint is used with these; the batch

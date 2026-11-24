@@ -805,5 +805,6 @@
 	"imageViewer_copyFailed": "Failed to copy image",
 	"imageViewer_downloadFailed": "Failed to download image",
 	"botBadge": "Bot",
-	"swipeMenu": "Menu"
+	"swipeMenu": "Menu",
+	"recentTabTeamPendingApprovals": "{{count}} pending approval(s)"
 }
