@@ -1,7 +1,7 @@
 ---
 id: security.tool-permissions.reflection
 title: 反思门
-summary: 危险反思、任务反思、问题反思（AskUserQuestion）、反思门的广播与可见性、评审边界。
+summary: 危险反思、任务反思、问题反思（AskUserQuestion）、按需计划反思（审批卡上的「计划反思」）、反思门的广播与可见性、评审边界。
 anchors:
   - server/lib/agent/tools/danger-reflection.ts
   - server/lib/agent/tools/task-reflection.ts
