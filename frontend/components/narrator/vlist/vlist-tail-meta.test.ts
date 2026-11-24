@@ -57,6 +57,31 @@ describe("buildTailMeta", () => {
 		expect(meta.lastRealMessage).toEqual({ id: "compact", role: "system" });
 	});
 
+	for (const source of ["team_upgrade", "team_disband"]) {
+		it(`a trailing ${source} note does not become the tail (no Continue after it)`, () => {
+			const note = rowWithElements({ id: "note", role: "sys" }, [
+				{ type: "system_injection", source, modelText: "Team upgrade: ..." },
+			]);
+			// The note is the only row (a fresh session upgraded): no tail, so Send, not Continue.
+			expect(buildTailMeta([note], OPTS).lastRealMessage).toBeNull();
+			// After a person's message the tail stays theirs (Retry's case, as before the note).
+			expect(buildTailMeta([{ id: "u1", role: "user" }, note], OPTS).lastRealMessage).toEqual({
+				id: "u1",
+				role: "user",
+			});
+		});
+	}
+
+	it("any other trailing injection stays the tail (Continue)", () => {
+		const note = rowWithElements({ id: "bg", role: "sys" }, [
+			{ type: "system_injection", source: "bg_agent", modelText: "done" },
+		]);
+		expect(buildTailMeta([{ id: "u1", role: "user" }, note], OPTS).lastRealMessage).toEqual({
+			id: "bg",
+			role: "sys",
+		});
+	});
+
 	it("finds the last user message id, skipping optimistic ids", () => {
 		const messages: TailMetaMessage[] = [
 			{ id: "u1", role: "user" },

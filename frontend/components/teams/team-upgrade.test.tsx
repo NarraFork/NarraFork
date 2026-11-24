@@ -15,6 +15,7 @@ import { api } from "../../lib/api";
 import { ApiError } from "../../lib/api/client";
 import en from "../../locales/en/projects.json";
 import zh from "../../locales/zh-CN/projects.json";
+import { type TeamDraft, useTeamDraft } from "./TeamCreateFields";
 import { canOfferTeamUpgrade, TEAM_UPGRADE_EXCLUDED_TRAITS } from "./team-upgrade-eligibility";
 import { buildUpgradePayload, teamErrorMessage } from "./UpgradeToTeamModal";
 
@@ -76,6 +77,48 @@ describe("the upgrade request", () => {
 		expect(
 			buildUpgradePayload("n1", { name: " Crew ", baseBranch: " trunk ", brief: "Rules" }),
 		).toEqual({ fromNarratorId: "n1", name: "Crew", baseBranch: "trunk", brief: "Rules" });
+		// The prefilled title, untouched, is not sent: the server keeps the title as it is then.
+		expect(
+			buildUpgradePayload(
+				"n1",
+				{ name: " Feature work ", baseBranch: "", brief: "" },
+				"Feature work",
+			),
+		).toEqual({ fromNarratorId: "n1" });
+		expect(
+			buildUpgradePayload("n1", { name: "Crew", baseBranch: "", brief: "" }, "Feature work"),
+		).toEqual({ fromNarratorId: "n1", name: "Crew" });
+	});
+
+	test("the dialog's draft starts with the title as its value and is checked like a new team", () => {
+		const client = new QueryClient();
+		const prefilled = mountHook(() => useTeamDraft({ initialName: "Feature work" }), client);
+		expect(prefilled.current.name).toBe("Feature work");
+		let payload = null as ReturnType<TeamDraft["submit"]>;
+		act(() => {
+			payload = prefilled.current.submit();
+		});
+		expect(payload).toEqual({ name: "Feature work" });
+		prefilled.unmount();
+
+		// A base branch git would read as an option is caught before anything is sent.
+		const badBase = mountHook(() => useTeamDraft({ initialName: "Feature work" }), client);
+		act(() => badBase.current.setBaseBranch("-x"));
+		act(() => {
+			payload = badBase.current.submit();
+		});
+		expect(payload).toBeNull();
+		expect(badBase.current.baseBranchError).toBeTruthy();
+		badBase.unmount();
+
+		// An untitled session: the name is required, as when creating a team.
+		const untitled = mountHook(() => useTeamDraft({ initialName: "" }), client);
+		act(() => {
+			payload = untitled.current.submit();
+		});
+		expect(payload).toBeNull();
+		expect(untitled.current.nameError).toBeTruthy();
+		untitled.unmount();
 	});
 
 	test("refusals are worded per code in both locales; others fall back", async () => {

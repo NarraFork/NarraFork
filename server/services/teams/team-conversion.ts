@@ -11,6 +11,9 @@
  * - what: an idle, non-archived ordinary primary session of this project whose working directory
  *   is a local Git checkout (any checkout of the project, linked worktrees included), and whose
  *   capability ceiling lets it start subagents;
+ * - the project: the same git checks as `createTeam` (`assertTeamProjectUsable`: the directory is
+ *   a git work tree, the base branch resolves), run before anything is written; the transaction
+ *   refuses with `TEAM_PROJECT_CHANGED` if the directory or default branch changed meanwhile;
  * - keeps: id, messages, audiences and grants; the name defaults to the title;
  * - pins `contextProjectId` to the project so a later directory switch cannot move the team;
  * - after commit: tells the session (a `team_upgrade` note, no wake), and on a `replace_tools`
@@ -31,7 +34,11 @@
 import { createHash } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import type { TeamDetail, TeamSettings } from "@shared/project-teams";
-import { TEAM_NAME_MAX_LENGTH } from "@shared/project-teams";
+import {
+	TEAM_DISBAND_NOTE_SOURCE,
+	TEAM_NAME_MAX_LENGTH,
+	TEAM_UPGRADE_NOTE_SOURCE,
+} from "@shared/project-teams";
 import { and, eq } from "drizzle-orm";
 import { db } from "../../db";
 import { narratorProjectLinks, narrators, projects, projectTeams, users } from "../../db/schema";
@@ -65,14 +72,21 @@ import { announceTeamChange } from "../narrator-sharing";
 import { forgetCoordinatorRun } from "./coordinator-limits";
 import { removeCoordinatorOutputs } from "./coordinator-outputs";
 import { assertTeamRemovable, deleteTeamOfNarratorInTransaction } from "./team-records";
-import { getTeam, loadTeamForAccess, recordTeamEvent } from "./team-service";
+import {
+	assertTeamProjectUsable,
+	getTeam,
+	loadTeamForAccess,
+	recordTeamEvent,
+} from "./team-service";
 import { forgetTeamSessions } from "./team-session-memo";
 import { forgetTeamStatus } from "./team-status";
 import { cancelCheckin } from "./work-items";
 
-/** Injection sources of the two notes (labelled in `segment-adapter.ts`). */
-export const TEAM_UPGRADE_NOTE_SOURCE = "team_upgrade";
-export const TEAM_DISBAND_NOTE_SOURCE = "team_disband";
+/**
+ * Injection sources of the two notes (labelled in `segment-adapter.ts`; never a Continue tail,
+ * `shared/continue-tail.ts:isNonTurnInjectionRow`).
+ */
+export { TEAM_DISBAND_NOTE_SOURCE, TEAM_UPGRADE_NOTE_SOURCE };
 
 /** Traits of sessions that are never turned into a coordinator (each its own kind of session). */
 const EXCLUDED_KIND_TRAITS = [
@@ -200,6 +214,15 @@ function workingDirectoryElsewhere(tx: Tx, narratorId: string, projectId: string
 		.limit(8)
 		.all()
 		.some((link) => link.projectId !== projectId);
+}
+
+/** The project's directory or default branch changed after the git checks ran. */
+function projectChangedError(): AppError {
+	return new AppError(
+		"The project's repository settings changed while the session was being turned into a team; try again",
+		409,
+		"TEAM_PROJECT_CHANGED",
+	);
 }
 
 function otherProjectError(): AppError {
@@ -417,8 +440,12 @@ export async function upgradeSessionToTeam(
 			"TEAM_NAME_INVALID",
 		);
 
-	const workspace = await prepareUpgrade(narratorId, actingUserId);
+	// The same git checks as `createTeam`, before anything is written and outside the
+	// transaction (async git); the transaction re-reads the project row they were made against.
 	const baseBranch = input.baseBranch ?? project.defaultBranch ?? "main";
+	await assertTeamProjectUsable({ gitPath }, baseBranch);
+
+	const workspace = await prepareUpgrade(narratorId, actingUserId);
 	const brief = input.brief ?? "";
 	const teamSettings = input.settings ?? {};
 
@@ -427,13 +454,23 @@ export async function upgradeSessionToTeam(
 			const fresh = readSession(tx, narratorId);
 			if (!fresh) throw new NotFoundError("Narrator", narratorId);
 			const currentProject = tx
-				.select({ status: projects.status })
+				.select({
+					status: projects.status,
+					gitPath: projects.gitPath,
+					defaultBranch: projects.defaultBranch,
+				})
 				.from(projects)
 				.where(eq(projects.id, project.id))
 				.get();
 			if (!currentProject) throw new NotFoundError("Project", project.id);
 			if (currentProject.status === "archived")
 				throw new AppError("An archived project cannot get a new team", 409, "PROJECT_ARCHIVED");
+			// The git checks ran against this directory and, without a given base, this default.
+			if (
+				currentProject.gitPath !== gitPath ||
+				(input.baseBranch === undefined && currentProject.defaultBranch !== project.defaultBranch)
+			)
+				throw projectChangedError();
 			if (resolvedProjectIn(tx, fresh) !== project.id) throw otherProjectError();
 			if (workingDirectoryElsewhere(tx, narratorId, project.id)) throw otherProjectError();
 			const again = upgradeRefusal(fresh, hasTeamRow(tx, narratorId));

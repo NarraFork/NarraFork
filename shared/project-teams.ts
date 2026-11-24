@@ -21,6 +21,14 @@ export const TEAM_BRIEF_MAX_BYTES = 4 * 1024;
 export const TEAM_SETTINGS_MAX_BYTES = 16 * 1024;
 /** Longest team name accepted at creation (the narrator title). */
 export const TEAM_NAME_MAX_LENGTH = 120;
+
+/**
+ * Injection sources of the notes a session gets when it is upgraded to a team or its team is
+ * disbanded (`server/services/teams/team-conversion.ts`). Written with `schedule: "none"`: they
+ * inform the session and never hand it the next turn (`shared/continue-tail.ts`).
+ */
+export const TEAM_UPGRADE_NOTE_SOURCE = "team_upgrade";
+export const TEAM_DISBAND_NOTE_SOURCE = "team_disband";
 /** Longest base branch name accepted. */
 export const TEAM_BRANCH_MAX_LENGTH = 200;
 

@@ -1,3 +1,4 @@
+import { isNonTurnInjectionRow } from "@shared/continue-tail";
 import { type MessageWithBody, messageBody } from "@shared/narrator-blocks/message-blocks";
 import { isNestedRow } from "../message/nested-rows";
 /**
@@ -39,8 +40,12 @@ export interface TailMetaOptions {
 	findSpecTasksToolUseId: (messages: TailMetaMessage[]) => string | null;
 }
 
-/** Error cards and hidden epoch bookkeeping do not replace the conversation tail. */
+/**
+ * Error cards, hidden epoch bookkeeping and informational injections (the team conversion
+ * notes, `isNonTurnInjectionRow`) do not replace the conversation tail.
+ */
 function isNonTurnSystemMessage(msg: TailMetaMessage): boolean {
+	if (msg.role === "sys") return isNonTurnInjectionRow(msg.role, messageBody(msg));
 	if (msg.role !== "system") return false;
 	const blocks = messageBody(msg);
 	// Match message-segments' hidden epoch rule; do not skip compact boundaries.

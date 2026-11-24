@@ -13,7 +13,11 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { isInjectionTailRole, tailRoleAllowsContinue } from "../continue-tail";
+import {
+	isInjectionTailRole,
+	isNonTurnInjectionRow,
+	tailRoleAllowsContinue,
+} from "../continue-tail";
 
 describe("tailRoleAllowsContinue", () => {
 	test("a stalled assistant turn is continuable", () => {
@@ -47,5 +51,26 @@ describe("isInjectionTailRole", () => {
 		expect(isInjectionTailRole("user")).toBe(false);
 		expect(isInjectionTailRole("system")).toBe(false);
 		expect(isInjectionTailRole(null)).toBe(false);
+	});
+});
+
+describe("isNonTurnInjectionRow", () => {
+	const note = (source: string) => ({ type: "system_injection", source, modelText: "note" });
+
+	test("the team conversion notes are informational, not a turn", () => {
+		expect(isNonTurnInjectionRow("sys", [note("team_upgrade")])).toBe(true);
+		expect(isNonTurnInjectionRow("sys", [note("team_disband")])).toBe(true);
+	});
+
+	test("other injections still hand the narrator the next turn", () => {
+		expect(isNonTurnInjectionRow("sys", [note("bg_agent")])).toBe(false);
+		expect(isNonTurnInjectionRow("sys", [note("team_upgrade"), note("bg_agent")])).toBe(false);
+		expect(isNonTurnInjectionRow("sys", [{ type: "text", text: "x" }])).toBe(false);
+		expect(isNonTurnInjectionRow("sys", [])).toBe(false);
+	});
+
+	test("only sys rows qualify", () => {
+		expect(isNonTurnInjectionRow("user", [note("team_upgrade")])).toBe(false);
+		expect(isNonTurnInjectionRow("assistant", [note("team_upgrade")])).toBe(false);
 	});
 });

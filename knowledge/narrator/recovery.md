@@ -31,8 +31,9 @@ keywords:
   - retryBackoffCeilMs
   - CatchUpCursor
   - tailRoleAllowsContinue
+  - isNonTurnInjectionRow
 status: draft
-verified_at: 878917e97
+verified_at: cb1094caa
 ---
 # 中断与恢复
 
@@ -48,6 +49,7 @@ verified_at: 878917e97
 
 - 废弃的未启动工具行：非终态（initializing / pending / running）且 `execution_started_at` 为空、创建超过 30 分钟（`ABANDONED_TOOL_CALL_TTL_MS`）的 `narrator_tool_calls` 行被置为 fail（`Tool call abandoned: execution never started…`）；本进程里仍有待决权限的行跳过，一次最多处理 5000 行；只在启动后台跑一次（`main.ts` 调 `cleanupAbandonedToolCalls`，`abandoned-tool-cleanup.ts`）。已开始执行的 running 行不碰。
 - “继续”按钮与接口共用判定：末尾一行角色为 `assistant` 或 `sys`（服务端注入）时才允许继续（`shared/continue-tail.ts:tailRoleAllowsContinue`，前端 `NarratorPanel` 与服务端都用它）。
+  - 例外：只含信息性注入的 `sys` 行（团队升级/解散说明 `team_upgrade`/`team_disband`，不唤醒）不算末尾，前端尾部摘要跳过它，由它前面那一行决定按钮（`continue-tail.ts:isNonTurnInjectionRow`，`vlist/vlist-tail-meta.ts`；测试 `shared/__tests__/continue-tail.test.ts`、`vlist-tail-meta.test.ts`）。新增不唤醒的说明类注入，若不该让人点“继续”，把来源加进 `NON_TURN_INJECTION_SOURCES`。
 - 重试规则关键词：错误卡片显示的是带 `Error: ` / `[Error] ` 前缀的装饰串，而规则匹配用原始 provider 消息，所以“标记为可重试”预填的关键词先经 `stripErrorDisplayPrefix` 去前缀（`shared/retry-rule-keyword.ts`，设置路由、`RetryRuleModal`、`lib/agent/error-handling.ts` 共用）。
 - 权限闸恢复：重启后重新执行工具前先快照持久化的权限行（`PersistedRecoveryGate`），`isRecoveredHumanPermission` 判断这条是否还在等真人决定（已开始执行或已决定则否；有反思记录时只有 `plan_reflection` 且 `awaiting_user` 才算），快照经 `WeakMap` 绑定到权限选项，不进入工具输入或公开配置（`lib/agent/recovery-gate.ts`）。
 - 工具续接记录 `narrator_tool_continuations`：每个工具调用最多一条，`kind` 为 deferred_tool / pending_permission / foreground_agent / background_agent / await_agent / send_await，`state` 为 paused / waiting / resuming / completed / failed / cancelled；恢复阶段记在 `payloadJson.recoveryPhase`（result_written / owner_continuation_pending / owner_continuation_started）（`schema.ts`、`tool-continuation-service.ts`）。冷启动接管的维护权检查与整体重启恢复流程属于 [实例锁、完整性与重启恢复](../platform/instance-recovery.md)；`recovery-handoff.ts`（恢复源清单，≤64 个源、≤10000 个目标、≤4 MiB）与 `recovery-observation.ts`（恢复前后的状态比对）是它的数据通道，本节只引用，未逐行核对。

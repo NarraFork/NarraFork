@@ -173,8 +173,6 @@
 			"menu": "升级为团队",
 			"title": "把这个会话升级为团队",
 			"intro": "这个会话会成为团队的协调者。对话、工作目录和分享设置都保留；从下一条消息起，它把工作派给代理去做，并在团队页上跟踪。",
-			"name": "团队名称",
-			"nameDescription": "留空则沿用会话标题。之后重命名会话也会重命名团队。",
 			"submit": "升级为团队",
 			"failed": "无法升级这个会话",
 			"errors": {
@@ -185,7 +183,10 @@
 				"TEAM_SESSION_OTHER_PROJECT": "这个会话属于另一个项目。",
 				"TEAM_SESSION_KIND_UNSUPPORTED": "这类会话不能成为团队协调者。",
 				"TEAM_NAME_INVALID": "请给团队起一个不超过 120 个字符的名称。",
-				"PROJECT_ARCHIVED": "项目已归档。"
+				"PROJECT_ARCHIVED": "项目已归档。",
+				"TEAM_PROJECT_NOT_GIT": "项目目录不是本地 Git 工作树。",
+				"TEAM_BASE_BRANCH_UNRESOLVED": "基线分支在项目仓库中找不到对应的提交，请填写已有的分支。",
+				"TEAM_PROJECT_CHANGED": "项目目录或默认分支刚刚被修改，请重试。"
 			}
 		},
 		"disband": {

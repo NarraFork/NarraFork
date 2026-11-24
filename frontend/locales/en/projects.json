@@ -173,8 +173,6 @@
 			"menu": "Upgrade to a team",
 			"title": "Upgrade this session to a team",
 			"intro": "This session becomes the team's coordinator. Its conversation, working directory and sharing are kept; from the next message on it delegates the work to agents and tracks it on the team page.",
-			"name": "Team name",
-			"nameDescription": "Empty keeps the session's title. Renaming the session later renames the team.",
 			"submit": "Upgrade to a team",
 			"failed": "Could not upgrade the session",
 			"errors": {
@@ -185,7 +183,10 @@
 				"TEAM_SESSION_OTHER_PROJECT": "The session belongs to another project.",
 				"TEAM_SESSION_KIND_UNSUPPORTED": "This kind of session cannot become a team coordinator.",
 				"TEAM_NAME_INVALID": "Give the team a name of up to 120 characters.",
-				"PROJECT_ARCHIVED": "The project is archived."
+				"PROJECT_ARCHIVED": "The project is archived.",
+				"TEAM_PROJECT_NOT_GIT": "The project's directory is not a local Git work tree.",
+				"TEAM_BASE_BRANCH_UNRESOLVED": "The base branch does not resolve to a commit in the project's repository. Enter an existing branch.",
+				"TEAM_PROJECT_CHANGED": "The project's directory or default branch changed meanwhile. Try again."
 			}
 		},
 		"disband": {

@@ -29,7 +29,7 @@ keywords:
   - /teams/:teamId/approvals
   - permission_decided_by
 status: draft
-verified_at: 9400a828b
+verified_at: cb1094caa
 ---
 # 团队页与审批
 
@@ -50,9 +50,9 @@ verified_at: 9400a828b
 - 团队页路由 `frontend/routes/projects/$projectId_.teams.$teamId.tsx`（不嵌在项目页下，占满外壳内容区）→ `components/teams/TeamPageView.tsx`。
 - `TeamWorkspace.tsx` 按自身宽度选三栏（团队列表 / 协调者对话 / 看板与动态）、两栏或标签页；对话用普通叙述者面板。
 - 成员在顶栏还有一个菜单（`TeamDisbandMenu.tsx`），里面只有「解散团队」：确认框说明工作项和动态会被删除、会话和对话保留；成功后路由打开该会话（`onDisbanded`），拒绝码在框里按码显示中英文（`UpgradeToTeamModal.tsx:teamErrorMessage`）。
-- 「升级为团队」不在团队页上：入口是会话溢出菜单（见[会话外框](../../frontend/narrator-ui/session-chrome.md)），对话框 `UpgradeToTeamModal.tsx`，成功后跳到团队页；菜单项只给 `team-upgrade-eligibility.ts:canOfferTeamUpgrade` 为真的会话（primary、未归档、有项目、不是 team/bot/knowledge-steward/setup/modeltrace/ask-in-passing/scheduled、无定时任务、非 OAuth），其余由服务端判定。
+- 「升级为团队」不在团队页上：入口是会话溢出菜单（见[会话外框](../../frontend/narrator-ui/session-chrome.md)），对话框 `UpgradeToTeamModal.tsx` 用与新建团队相同的 `TeamCreateFields`/`useTeamDraft`（提交前 `checkTeamDraft`，基线分支按同一规则校验；名称以会话标题预填为真实值，`useTeamDraft({ initialName })`，未改动时请求不带 `name`，由服务端沿用当时的标题，`buildUpgradePayload`），成功后跳到团队页；菜单项只给 `team-upgrade-eligibility.ts:canOfferTeamUpgrade` 为真的会话（primary、未归档、有项目、不是 team/bot/knowledge-steward/setup/modeltrace/ask-in-passing/scheduled、无定时任务、非 OAuth），其余由服务端判定。
 - `TeamTopBar.tsx` 含待批抽屉和「全部暂停」：协调者排在最前，先于工作者停下（`pauseOrder`），一次最多读 500 个运行中会话，结果分 paused / pausedSomeIdle / pausePartial / pauseNothing / pauseMore（`team-page-model.ts`）。
-- `TeamCreateFields.tsx`：新团队的名称/基线分支/说明字段与 `useTeamDraft`，被项目页「新建团队」弹窗和新建会话弹窗的「以团队开始」共用（见[团队与成员](records.md)）；不含查询与路由导入。`submit()` 先用 `team-draft.ts:checkTeamDraft`（规则来自 `shared/project-team-draft.ts`，与路由同一份）检查，不合规返回 null 并在名称/基线分支/说明字段上显示错误。
+- `TeamCreateFields.tsx`：新团队的名称/基线分支/说明字段与 `useTeamDraft`，被项目页「新建团队」弹窗、新建会话弹窗的「以团队开始」和「升级为团队」对话框共用（见[团队与成员](records.md)）；不含查询与路由导入。`submit()` 先用 `team-draft.ts:checkTeamDraft`（规则来自 `shared/project-team-draft.ts`，与路由同一份）检查，不合规返回 null 并在名称/基线分支/说明字段上显示错误。
 - `ProjectTeamsList.tsx` 在 PG 上（列表查询 503）整块不渲染。
 - `team-page-model.ts` 是纯规则：状态图标、轮询退避、套接字推送合并（400ms 去抖、最长 2s）、暂停顺序。
 - `hooks/useTeams.ts`：`useUpgradeToTeam`/`useDisbandTeam` 两个变更（解散后移除该团队的页面缓存）；摘要在叙述者 socket 的相关帧上合并重取，同时带退避轮询（变化后 4s，翻倍到 60s，标签页隐藏时暂停）；看板、动态、审批各自按变化重取。`lib/api/teams.ts` 是客户端。

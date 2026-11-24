@@ -444,6 +444,85 @@ describe("turning a session into a team", () => {
 	});
 });
 
+describe("the project's git checks (the same as creating a team)", () => {
+	async function expectNothingWritten(id: string) {
+		expect(parseTraitsOf(await row(id))).not.toContain("team");
+		expect(
+			await db.query.projectTeams.findFirst({ where: eq(projectTeams.narratorId, id) }),
+		).toBeUndefined();
+		expect(
+			await db.query.teamWorkEvents.findMany({ where: eq(teamWorkEvents.teamId, id) }),
+		).toEqual([]);
+		expect(await notes(id, TEAM_UPGRADE_NOTE_SOURCE)).toHaveLength(0);
+	}
+
+	async function setProject(patch: Partial<typeof projects.$inferInsert>) {
+		await db.update(projects).set(patch).where(eq(projects.id, projectId));
+	}
+
+	test("a project whose directory is not a git work tree: TEAM_PROJECT_NOT_GIT", async () => {
+		const dir = join(testHome, "plain-project");
+		mkdirSync(dir, { recursive: true });
+		const plainProjectId = generateId();
+		const now = new Date().toISOString();
+		await db.insert(projects).values({
+			id: plainProjectId,
+			name: "plain folder",
+			gitPath: dir,
+			defaultBranch: "main",
+			ownerUserId: OWNER,
+			visibility: "private",
+			createdAt: now,
+			updatedAt: now,
+		});
+		const id = await session("Plain folder", { cwd: dir, contextProjectId: plainProjectId });
+		const response = await upgrade(OWNER, { fromNarratorId: id }, plainProjectId);
+		expect(response.status).toBe(409);
+		expect(response.body.code).toBe("TEAM_PROJECT_NOT_GIT");
+		await expectNothingWritten(id);
+	});
+
+	test("a base branch that names no commit: TEAM_BASE_BRANCH_UNRESOLVED", async () => {
+		const given = await session("Missing given base");
+		const response = await upgrade(OWNER, { fromNarratorId: given, baseBranch: "no-such-branch" });
+		expect(response.status).toBe(409);
+		expect(response.body.code).toBe("TEAM_BASE_BRANCH_UNRESOLVED");
+		await expectNothingWritten(given);
+
+		// Without a base in the body, the project's default is checked.
+		const byDefault = await session("Missing default base");
+		await setProject({ defaultBranch: "missing-default" });
+		try {
+			const refused = await upgrade(OWNER, { fromNarratorId: byDefault });
+			expect(refused.status).toBe(409);
+			expect(refused.body.code).toBe("TEAM_BASE_BRANCH_UNRESOLVED");
+		} finally {
+			await setProject({ defaultBranch: "trunk" });
+		}
+		await expectNothingWritten(byDefault);
+		// A base that resolves is accepted.
+		expect((await upgrade(OWNER, { fromNarratorId: byDefault, baseBranch: "trunk" })).status).toBe(
+			201,
+		);
+	});
+
+	test("a project changed after the checks is refused inside the transaction", async () => {
+		const principal = { userId: OWNER, isAdmin: false };
+		for (const patch of [{ defaultBranch: "feature/linked" }, { gitPath: plainDir }]) {
+			const id = await session(`Changed ${Object.keys(patch)[0]}`);
+			// The project row is read before the first await; change it right after.
+			const upgrading = upgradeSessionToTeam({ projectId, fromNarratorId: id }, principal);
+			db.update(projects).set(patch).where(eq(projects.id, projectId)).run();
+			try {
+				await expect(upgrading).rejects.toMatchObject({ code: "TEAM_PROJECT_CHANGED" });
+			} finally {
+				await setProject({ defaultBranch: "trunk", gitPath: repo });
+			}
+			await expectNothingWritten(id);
+		}
+	});
+});
+
 describe("disbanding a team and keeping its session", () => {
 	async function workItem(teamId: string, state: string) {
 		const now = new Date().toISOString();

@@ -10,14 +10,10 @@
 import { useUpgradeToTeam } from "@frontend/hooks/useTeams";
 import type { UpgradeToTeamPayload } from "@frontend/lib/api/teams";
 import { describeApiError } from "@frontend/lib/api-error";
-import { Alert, Button, Group, Modal, Stack, Text, Textarea, TextInput } from "@mantine/core";
-import {
-	TEAM_BRANCH_MAX_LENGTH,
-	TEAM_NAME_MAX_LENGTH,
-	type TeamDetail,
-} from "@shared/project-teams";
-import { useState } from "react";
+import { Alert, Button, Group, Modal, Stack, Text } from "@mantine/core";
+import type { TeamDetail } from "@shared/project-teams";
 import { useTranslation } from "react-i18next";
+import { TeamCreateFields, useTeamDraft } from "./TeamCreateFields";
 
 type Translate = ReturnType<typeof useTranslation>["t"];
 
@@ -35,14 +31,20 @@ export function teamErrorMessage(
 	return describeApiError(error, t).message;
 }
 
-/** The request body: the session, plus only the fields the person filled in. */
+/**
+ * The request body: the session, plus the fields that change something. The name is sent only
+ * when it differs from the session's title, so an untouched (prefilled) name keeps the title even
+ * if the session is renamed meanwhile.
+ */
 export function buildUpgradePayload(
 	narratorId: string,
 	fields: { name: string; baseBranch: string; brief: string },
+	title: string | null = null,
 ): UpgradeToTeamPayload {
+	const name = fields.name.trim();
 	return {
 		fromNarratorId: narratorId,
-		...(fields.name.trim() ? { name: fields.name.trim() } : {}),
+		...(name && name !== (title ?? "").trim() ? { name } : {}),
 		...(fields.baseBranch.trim() ? { baseBranch: fields.baseBranch.trim() } : {}),
 		...(fields.brief.trim() ? { brief: fields.brief } : {}),
 	};
@@ -58,7 +60,7 @@ export function UpgradeToTeamModal({
 }: {
 	projectId: string;
 	narratorId: string;
-	/** The session's title, the default team name. */
+	/** The session's title, prefilled as the team name. */
 	title: string | null;
 	opened: boolean;
 	onClose: () => void;
@@ -66,11 +68,12 @@ export function UpgradeToTeamModal({
 }) {
 	const { t } = useTranslation("projects");
 	const upgrade = useUpgradeToTeam(projectId);
-	const [name, setName] = useState("");
-	const [baseBranch, setBaseBranch] = useState("");
-	const [brief, setBrief] = useState("");
+	// The same fields and client checks as creating a team (`checkTeamDraft`); the name starts as
+	// the session's title, a real value rather than a placeholder.
+	const draft = useTeamDraft({ initialName: title ?? "" });
 	const submit = () => {
-		upgrade.mutate(buildUpgradePayload(narratorId, { name, baseBranch, brief }), {
+		if (!draft.submit()) return;
+		upgrade.mutate(buildUpgradePayload(narratorId, draft, title), {
 			onSuccess: (team) => onUpgraded(team),
 		});
 	};
@@ -84,33 +87,7 @@ export function UpgradeToTeamModal({
 			>
 				<Stack>
 					<Text size="sm">{t("teams.upgrade.intro")}</Text>
-					<TextInput
-						label={t("teams.upgrade.name")}
-						description={t("teams.upgrade.nameDescription")}
-						placeholder={title ?? undefined}
-						value={name}
-						maxLength={TEAM_NAME_MAX_LENGTH}
-						onChange={(event) => setName(event.currentTarget.value)}
-						data-autofocus
-						data-testid="upgrade-team-name"
-					/>
-					<TextInput
-						label={t("teams.create.baseBranch")}
-						description={t("teams.create.baseBranchDescription")}
-						value={baseBranch}
-						maxLength={TEAM_BRANCH_MAX_LENGTH}
-						onChange={(event) => setBaseBranch(event.currentTarget.value)}
-						styles={{ input: { fontFamily: "var(--mantine-font-family-monospace)" } }}
-					/>
-					<Textarea
-						label={t("teams.create.brief")}
-						description={t("teams.create.briefDescription")}
-						value={brief}
-						autosize
-						minRows={3}
-						maxRows={8}
-						onChange={(event) => setBrief(event.currentTarget.value)}
-					/>
+					<TeamCreateFields draft={draft} />
 					{upgrade.isError && (
 						<Alert color="red" title={t("teams.upgrade.failed")} data-testid="upgrade-team-error">
 							{teamErrorMessage(upgrade.error, t, "upgrade")}

@@ -25,6 +25,8 @@
  * about whether there was anything to continue — a mismatch with no error to surface it.
  */
 
+import { TEAM_DISBAND_NOTE_SOURCE, TEAM_UPGRADE_NOTE_SOURCE } from "./project-teams";
+
 /** True when a row of this role leaves the next turn to the narrator. */
 export function tailRoleAllowsContinue(role: string | null | undefined): boolean {
 	return role === "assistant" || role === "sys";
@@ -33,4 +35,36 @@ export function tailRoleAllowsContinue(role: string | null | undefined): boolean
 /** True when this role is a server-authored injection row. */
 export function isInjectionTailRole(role: string | null | undefined): boolean {
 	return role === "sys";
+}
+
+/**
+ * Injection sources that only inform the narrator and leave the next turn to the person: the
+ * team conversion notes, written without a wake. A trailing row of these is not the
+ * conversation's tail, so it never turns the send button into Continue; the row before it
+ * decides, as it did before the note landed.
+ */
+const NON_TURN_INJECTION_SOURCES: ReadonlySet<string> = new Set([
+	TEAM_UPGRADE_NOTE_SOURCE,
+	TEAM_DISBAND_NOTE_SOURCE,
+]);
+
+/** True when a `sys` row holds only informational injections (`NON_TURN_INJECTION_SOURCES`). */
+export function isNonTurnInjectionRow(
+	role: string | null | undefined,
+	elements: readonly unknown[],
+): boolean {
+	if (role !== "sys") return false;
+	const injections = elements.filter(
+		(element): element is { type: "system_injection"; source?: unknown } =>
+			!!element &&
+			typeof element === "object" &&
+			(element as { type?: unknown }).type === "system_injection",
+	);
+	return (
+		injections.length > 0 &&
+		injections.every(
+			(element) =>
+				typeof element.source === "string" && NON_TURN_INJECTION_SOURCES.has(element.source),
+		)
+	);
 }
