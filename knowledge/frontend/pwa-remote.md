@@ -37,7 +37,7 @@ keywords:
   - injectSpaBaseHref
   - base href
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 ---
 # PWA 与远程前端
 
@@ -48,6 +48,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 只缓存静态资源：同源 script/style/worker 用 StaleWhileRevalidate（120 条、7 天），font/image 用 CacheFirst（80 条、30 天）；API 与 WS 路径交还浏览器网络栈（`app-path-classify.ts:isApiOrWsRelativePath`，SW 用自己的 registration scope 当挂载前缀 `SW_BASE`，所以反代子路径下判断仍成立）。
 - 导航：`NavigationRoute` 返回缓存的 `index.html`，但先用 `setBaseHref` 把 `<base href>` 改写成 `SW_BASE`（构建产物不含 base，直接返回会让嵌套路由的相对资源 404）；API/WS 前缀在 denylist 里。带 `_nf_reload` 参数的导航先 `no-store` 取新 HTML（8s 超时），5xx 且不是启动页（`STARTUP_STATUS_HEADER`）或失败时回退缓存外壳。
 - 版本提示：SW 激活时请求 `<SW_BASE>api/health`（2.5s 超时），与内置 `__APP_VERSION__` 用 `appVersionsMatch` 比较，不一致就向所有窗口客户端 `postMessage({type:"VERSION_MISMATCH"})`；`hooks/useVersionCheck.ts` 收到后自行再核对。SW 自身 `skipWaiting` + `clients.claim`。
+- 页面版本检测只针对静态构建：`hooks/useVersionCheck.ts` 在 Vite 的 serve-only 常量 `__DEV_VITE_PORT__` 已定义时不创建监视器、不监听重连/前台/SW 提示，也不显示更新条。不能用 `import.meta.env.DEV` 或浏览器端口判断：`start:dev` 以 production mode 启动 Vite，且入口可能走自定义端口或反代。静态构建仍核对服务端版本、自动重载并保留手动刷新提示。
 - manifest 默认值（`display: standalone`、`display_override: window-controls-overlay`、相对 `scope/start_url`）在 `vite.config.ts:webManifestAsset`；`frontend/public/` 仅放 favicon、PWA 图标、apple-touch-icon、robots.txt。“安装为应用”的页内提示（`beforeinstallprompt`）在前端代码里没有找到。
 - 远程构建 `vite.remote.config.ts` 单独打包，入口 `remote/bootstrap.ts`（引导）与 `remote/mount.tsx`（挂载），产物在 `dist/frontend-remote`；刻意不引入原生配置、路由插件、PWA、插件宿主。`build/remote-boundaries.ts` 按解析后的源文件替换模块：传输与 base-path 换成 `remote/` 版本，插件、Monaco、目录选择器、部分叙述者面板换成空实现或 `RemoteUnsupported`。路由是精简的 `remote/route-tree.tsx`（登录、项目、叙述者）。
 - 引导流程（`remote/bootstrap.ts:bootstrapRemote`）：若页面已被 SW 控制则直接失败（`REMOTE_SERVICE_WORKER_CONTROLLED`）；邀请取自 URL 片段或已存 grant；`RemoteClient.connect` 建 RTC；`selectRemoteBuild` 按后端身份精确选版本：读同源 `/remote/catalog.json`，校验 manifest 的 sha256、身份兼容键与 buildId，选不到就报错，**不回退到最新版**；样式与入口脚本用 SRI（`integrity`）加载，再 `import()` 并调用 `mount`。
@@ -63,6 +64,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 
 ## 改它时
 - 改 SW 的缓存或导航逻辑：`tests/frontend/pwa-cache-reload.test.ts`、`pwa-offline-shell.test.ts`、`pwa-refresh-navigation.test.ts`、`pwa-reload-readiness.test.ts`、`app-shell-precache.test.ts` 覆盖；新增品牌资源路径要同步 `src-sw.ts:BRAND_ASSET_PATHS`，否则会被运行时缓存。
+- 改页面版本检测：`tests/frontend/version-check-hook.test.tsx` 验证 Vite 不探测/重载/提示、静态构建仍检测并只自动重载一次；`vite-hmr-config.test.ts` 验证 development/production 两种 mode 下 serve 与 build 的边界。
 - 新增 API 或 WS 路径前缀：SW 与应用共用 `lib/app-path-classify.ts`，改它要两边一起验证（应用侧 `base-path.ts`，SW 侧用自己的 scope 作前缀）。
 - 加被远程构建替换的模块：改 `frontend/build/remote-boundaries.ts` 的映射，并保证远程版实现满足同样的接口；远程只放行 `shared/remote-access/request-policy.ts` 允许的请求。引导与版本选择行为由 `frontend/remote/bootstrap.test.ts`、`selection.test.ts`、`recovering-transport.test.ts`、`socket.test.ts`、`runtime.test.ts` 覆盖，选不到精确版本必须报错而不是回退最新。
 - 改 manifest：默认值在 `vite.config.ts:webManifestAsset`，运行期改写在 `server/lib/branding/manifest.ts`；`tests/frontend/branding-build-output.test.ts` 断言构建出的 SW 没有预缓存品牌资源（未构建 `dist/frontend` 时跳过）。
