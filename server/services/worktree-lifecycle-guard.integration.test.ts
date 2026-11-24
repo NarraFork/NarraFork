@@ -667,7 +667,9 @@ for (const deviceId of [undefined, "local", "remote-fixture"] as const) {
 					admitted = true;
 				});
 			if (deviceId === "remote-fixture") await run();
-			else await expect(run()).rejects.toMatchObject({ code: "RESOURCE_PROTECTED" });
+			// Settle natively first: Bun's `.rejects` matcher stalls on a reused read Worker.
+			else
+				expect(await captureWorkerRejection(run())).toMatchObject({ code: "RESOURCE_PROTECTED" });
 			expect(admitted).toBe(deviceId === "remote-fixture");
 			for (const effect of effects) expect(effect).toHaveBeenCalledTimes(0);
 			expect(changes()).toBe(before);
