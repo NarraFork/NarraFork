@@ -9,16 +9,7 @@
  * taken and that it reproduces the column.
  */
 
-import {
-	afterAll,
-	afterEach,
-	beforeEach,
-	describe,
-	expect,
-	mock,
-	setSystemTime,
-	test,
-} from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { cleanDb } from "../../../tests/setup";
 import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
@@ -54,7 +45,6 @@ beforeEach(() => {
 afterEach(() => {
 	settings.narratorBlocks.read = true;
 	settings.narratorBlocks.compactJson = compactJson;
-	setSystemTime();
 });
 afterAll(async () => {
 	blockSync.stopBlockSyncSweep();
@@ -184,7 +174,6 @@ function messageIds(): string[] {
 }
 
 async function exportText(narratorId: string, format: "markdown" | "json"): Promise<string> {
-	setSystemTime(new Date(NOW));
 	let out = "";
 	for await (const chunk of streamNarratorExport(narratorId, {
 		...NARRATOR_EXPORT_DEFAULTS,
@@ -192,7 +181,9 @@ async function exportText(narratorId: string, format: "markdown" | "json"): Prom
 		scope: "full",
 	}))
 		out += chunk;
-	return out;
+	return out
+		.replace(/("exportedAt":\s*)"[^"]*"/, `$1"${NOW}"`)
+		.replace(/(- (?:Exported|导出于): )\d{4}-\d{2}-\d{2} \d{2}:\d{2}/, "$12026-10-01 00:00");
 }
 
 async function scanReasoning(ids: string[]) {

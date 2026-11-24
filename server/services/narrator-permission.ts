@@ -8,6 +8,7 @@ import type { ProgressSnapshot } from "@shared/progress-phase";
 import { and, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
+	backgroundTasks,
 	fileChangeExecutionSegments,
 	integrationAuthorities,
 	integrationCapabilityGrants,
@@ -18,6 +19,7 @@ import {
 	oauthClients,
 	remoteDevices,
 } from "../db/schema";
+import { readQuery, readQueryFirst } from "../db/worker-read";
 import type {
 	DangerInfo,
 	DangerSeverity,
@@ -89,7 +91,7 @@ import {
 	queueContextCharacterRefresh,
 } from "../lib/context-characters";
 import { isOwnCoordinatorOutputPath } from "../lib/coordinator-outputs-path";
-import { AppError } from "../lib/errors";
+import { AppError, NotFoundError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { isSecretPlatformPath } from "../lib/fs-secret-paths";
 import { logger } from "../lib/logger";
@@ -114,6 +116,10 @@ import { narraforkDir, settings } from "../lib/settings";
 import { assertToolSpecPaths, toolSpecPathError } from "../lib/spec-uri";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { isBrowserReadAction, type RuntimePolicy } from "./agent-runtime/policy";
+import {
+	type NarratorSurfaceReadBudget,
+	narratorSurfaceReadOptions,
+} from "./narrator-surface-reads";
 import { isRuntimeToolNameAllowed } from "./subagent-tools";
 import {
 	describeTeamCleanup,
@@ -129,7 +135,6 @@ export {
 } from "../lib/boolean-override";
 
 import { coerceAskQuestions, generateAskUserQuestionAnswers } from "./ask-user-question-reflection";
-import { backgroundTaskService } from "./background-task-service";
 import { commandPatternMatches } from "./execution-policy/command-policy";
 import type { CompiledExecutionPolicy } from "./execution-policy/compiler";
 import { compileExecutionPolicy } from "./execution-policy/compiler";
@@ -214,19 +219,40 @@ const pendingPermissionContexts = new WeakMap<
 
 // === Permission handling ===
 
+function rethrowPermissionReadFailure(error: unknown): void {
+	if (
+		error &&
+		typeof error === "object" &&
+		"code" in error &&
+		typeof error.code === "string" &&
+		error.code.startsWith("DB_READ_")
+	)
+		throw error;
+}
+
+function missingNarrator(error: unknown): null {
+	if (error instanceof NotFoundError) return null;
+	throw error;
+}
+
 async function refreshPermissionContextCharacters(
 	narratorId: string,
 	toolCallId: string,
 ): Promise<void> {
-	const row = await db.query.narratorToolCalls
-		.findFirst({ where: eq(narratorToolCalls.id, toolCallId), columns: { messageId: true } })
-		.catch((error: unknown) => {
-			logger.warn("Character refresh message identity unavailable", {
-				toolCallId,
-				error: String(error),
-			});
-			return undefined;
+	const row = await readQueryFirst(
+		db.query.narratorToolCalls.findMany({
+			limit: 1,
+			where: eq(narratorToolCalls.id, toolCallId),
+			columns: { messageId: true },
+		}),
+		{ ...narratorSurfaceReadOptions({ timeoutMs: 30_000 }), maxRows: 1 },
+	).catch((error: unknown) => {
+		logger.warn("Character refresh message identity unavailable", {
+			toolCallId,
+			error: String(error),
 		});
+		throw error;
+	});
 	queueContextCharacterRefresh(narratorId, row?.messageId);
 }
 
@@ -2367,16 +2393,20 @@ function scheduleQuestionReflection(
 async function currentPermissionModeAllowsAutomaticQuestionReflection(
 	pending: PendingPermission,
 ): Promise<boolean> {
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, pending.narratorId),
-		columns: {
-			permissionMode: true,
-			relaxedPlan: true,
-			previousPermissionMode: true,
-			traits: true,
-			questionReflectionOverride: true,
-		},
-	});
+	const narrator = await readQueryFirst(
+		db.query.narrators.findMany({
+			limit: 1,
+			where: eq(narrators.id, pending.narratorId),
+			columns: {
+				permissionMode: true,
+				relaxedPlan: true,
+				previousPermissionMode: true,
+				traits: true,
+				questionReflectionOverride: true,
+			},
+		}),
+		{ ...narratorSurfaceReadOptions({ timeoutMs: 30_000 }), maxRows: 1 },
+	);
 	if (!narrator) return false;
 	const effectiveMode = getEffectivePermissionMode(
 		narrator.permissionMode ?? "default",
@@ -2427,7 +2457,7 @@ export async function reflectPendingAskUserQuestion(
 			"running",
 			"Question reflection is answering AskUserQuestion",
 		);
-		const narrator = await narratorService.getById(pending.narratorId).catch(() => null);
+		const narrator = await narratorService.getById(pending.narratorId).catch(missingNarrator);
 		const answers = await generateAskUserQuestionAnswers(pending.narratorId, questions, {
 			locale: pending.locale,
 			model: narrator?.model,
@@ -3436,21 +3466,6 @@ function sendSelectors(input: Record<string, unknown>): string[] {
 	});
 }
 
-async function resolveSendAliasCandidate(
-	selector: string,
-	callerId: string,
-	teamParentId: string,
-): Promise<string> {
-	for (const ownerId of [callerId, teamParentId]) {
-		const inMemory = resolveTaskAlias(ownerId, selector);
-		if (inMemory !== selector) return inMemory;
-		const task = await backgroundTaskService.getByAlias(selector, ownerId);
-		if (task?.subagentNarratorId) return task.subagentNarratorId;
-		if (task?.type === "agent") return task.id;
-	}
-	return selector;
-}
-
 /**
  * Resolve Send destinations for permission auto-allow rank checks.
  *
@@ -3465,59 +3480,108 @@ async function resolveSendTargetsForPermission(
 	callerId: string,
 	caller: PermissionScopeNarrator,
 	input: Record<string, unknown>,
+	options: NarratorSurfaceReadBudget = {},
 ): Promise<PermissionScopeNarrator[]> {
 	const selectors = sendSelectors(input);
 	if (selectors.length === 0) return [];
 	const parentId = teamRootOf({ ...caller, id: callerId });
 	const callerIsSubagent = parentId !== callerId;
 
-	const resolved: PermissionScopeNarrator[] = [];
-	const seen = new Set<string>();
-	for (const selector of selectors) {
-		const aliasCandidate = await resolveSendAliasCandidate(selector, callerId, parentId);
-		const addressesParent =
+	if (selectors.length > 100)
+		throw new AppError("Send target lookup exceeds budget", 413, "DB_READ_BUDGET");
+	const readBudget = narratorSurfaceReadOptions(options);
+	const ranked = db
+		.select({
+			id: backgroundTasks.id,
+			alias: backgroundTasks.alias,
+			parentNarratorId: backgroundTasks.parentNarratorId,
+			type: backgroundTasks.type,
+			subagentNarratorId: backgroundTasks.subagentNarratorId,
+			rank: sql<number>`row_number() over (partition by ${backgroundTasks.parentNarratorId}, ${backgroundTasks.alias} order by ${backgroundTasks.createdAt} desc)`.as(
+				"alias_rank",
+			),
+		})
+		.from(backgroundTasks)
+		.where(
+			and(
+				inArray(backgroundTasks.parentNarratorId, [callerId, parentId]),
+				inArray(backgroundTasks.alias, selectors),
+			),
+		)
+		.as("permission_aliases");
+	const tasks = await readQuery(
+		db.select().from(ranked).where(eq(ranked.rank, 1)).limit(201),
+		narratorSurfaceReadOptions(readBudget),
+	);
+	const aliases = selectors.map((selector) => {
+		for (const owner of [callerId, parentId]) {
+			const memory = resolveTaskAlias(owner, selector);
+			if (memory !== selector) return memory;
+			const task = tasks.find((row) => row.parentNarratorId === owner && row.alias === selector);
+			if (task?.subagentNarratorId) return task.subagentNarratorId;
+			if (task?.type === "agent") return task.id;
+		}
+		return selector;
+	});
+	const load = (ids: string[]) =>
+		readQuery(
+			db.query.narrators.findMany({
+				where: inArray(narrators.id, ids),
+				limit: ids.length,
+				columns: {
+					id: true,
+					type: true,
+					variant: true,
+					parentNarratorId: true,
+					policySourceNarratorId: true,
+					runtimeRegistrationJson: true,
+					permissionMode: true,
+					relaxedPlan: true,
+					previousPermissionMode: true,
+					traits: true,
+				},
+			}),
+			narratorSurfaceReadOptions(readBudget),
+		);
+	const direct = await load([...new Set([...aliases, parentId])]);
+	const byId = new Map(direct.map((row) => [row.id, row]));
+	let siblings: Awaited<ReturnType<typeof narratorService.listTeamMembers>> | undefined;
+	const selected: string[] = [];
+	for (let index = 0; index < selectors.length; index++) {
+		const selector = selectors[index];
+		const alias = aliases[index];
+		if (
 			callerIsSubagent &&
-			(isParentSelector(aliasCandidate) ||
+			(isParentSelector(alias) ||
 				isParentSelector(selector) ||
-				aliasCandidate === parentId ||
-				selector === parentId);
-		// "parent"/"main" are reserved aliases, not narrator primary keys. Resolve the
-		// launching narrator by teamParentId so mixed target lists still work.
-		if (addressesParent) {
-			const parent = await narratorService.getById(parentId).catch(() => null);
-			if (!parent?.id || parent.id !== parentId || teamRootOf(parent) !== parent.id) {
-				return [];
-			}
-			if (!seen.has(parent.id)) {
-				seen.add(parent.id);
-				resolved.push(parent);
-			}
+				alias === parentId ||
+				selector === parentId)
+		) {
+			const parent = byId.get(parentId);
+			if (!parent || teamRootOf(parent) !== parent.id) return [];
+			selected.push(parent.id);
 			continue;
 		}
-		const direct = await narratorService.getById(aliasCandidate).catch(() => null);
-		if (direct) {
-			if (!direct.id || !isTeamMember(direct, parentId) || direct.id === callerId) {
-				return [];
-			}
-			if (!seen.has(direct.id)) {
-				seen.add(direct.id);
-				resolved.push(direct);
-			}
+		const target = byId.get(alias);
+		if (target) {
+			if (!isTeamMember(target, parentId) || target.id === callerId) return [];
+			selected.push(target.id);
 			continue;
 		}
-
-		const siblings = await narratorService.listTeamMembers(parentId);
-		const candidates = siblings.filter((s) => {
-			if (callerIsSubagent && s.id === callerId) return false;
-			return subagentMatchesSelector(s, selector);
-		});
-		if (candidates.length !== 1) return [];
-		const target = await narratorService.getById(candidates[0].id).catch(() => null);
-		if (!target?.id || !isTeamMember(target, parentId)) return [];
-		if (!seen.has(target.id)) {
-			seen.add(target.id);
-			resolved.push(target);
-		}
+		siblings ??= await narratorService.listTeamMembers(parentId, readBudget);
+		const matches = siblings.filter(
+			(row) => !(callerIsSubagent && row.id === callerId) && subagentMatchesSelector(row, selector),
+		);
+		if (matches.length !== 1) return [];
+		selected.push(matches[0].id);
+	}
+	const missing = [...new Set(selected.filter((id) => !byId.has(id)))];
+	if (missing.length) for (const row of await load(missing)) byId.set(row.id, row);
+	const resolved: PermissionScopeNarrator[] = [];
+	for (const id of new Set(selected)) {
+		const target = byId.get(id);
+		if (!target || (id !== parentId && !isTeamMember(target, parentId))) return [];
+		resolved.push(target);
 	}
 	return resolved;
 }
@@ -3534,6 +3598,7 @@ export async function shouldAutoAllowSendWithinScope(
 	narratorId: string,
 	caller: PermissionScopeNarrator | null | undefined,
 	input: Record<string, unknown>,
+	options: NarratorSurfaceReadBudget = {},
 ): Promise<boolean> {
 	try {
 		if (!caller) return false;
@@ -3544,7 +3609,7 @@ export async function shouldAutoAllowSendWithinScope(
 		const root = teamRootOf({ ...caller, id: narratorId });
 		const callerIsSubagent = root !== narratorId;
 		const teamParentId = callerIsSubagent ? root : null;
-		const targets = await resolveSendTargetsForPermission(narratorId, caller, input);
+		const targets = await resolveSendTargetsForPermission(narratorId, caller, input, options);
 		const selectors = sendSelectors(input);
 		const onlyAddressesParent =
 			callerIsSubagent &&
@@ -3566,7 +3631,9 @@ export async function shouldAutoAllowSendWithinScope(
 
 		const callerRank = permissionModeRank(caller);
 		return nonParentTargets.every((target) => permissionModeRank(target) <= callerRank);
-	} catch {
+	} catch (error) {
+		options.signal?.throwIfAborted();
+		rethrowPermissionReadFailure(error);
 		return false;
 	}
 }
@@ -5244,7 +5311,9 @@ export async function recheckFinalToolExecutionPermission(
 		finalPermissionDeny("read-only capability ceiling");
 	const sendInScope =
 		check.toolName === "Send" &&
-		(await shouldAutoAllowSendWithinScope(check.narratorId, before.narrator, check.input));
+		(await shouldAutoAllowSendWithinScope(check.narratorId, before.narrator, check.input, {
+			signal: check.signal,
+		}));
 	let dedicatedRuleApproval = false;
 	if (check.toolName === "RequestPermissionRule") {
 		if (!context) finalPermissionDeny("missing dedicated rule request execution context");
@@ -5337,10 +5406,14 @@ export async function classifyDeviceAccessGroup(
 	ctx: { oauthClientId: string; grantId: string },
 ): Promise<DeviceAccessGroup> {
 	if (deviceId === LOCAL_DEVICE_ID) return "host";
-	const device = await db.query.remoteDevices.findFirst({
-		where: eq(remoteDevices.id, deviceId),
-		columns: { scope: true },
-	});
+	const device = await readQueryFirst(
+		db.query.remoteDevices.findMany({
+			limit: 1,
+			where: eq(remoteDevices.id, deviceId),
+			columns: { scope: true },
+		}),
+		{ ...narratorSurfaceReadOptions({ timeoutMs: 30_000 }), maxRows: 1 },
+	);
 	if (!device) return "global"; // fail closed toward the more restrictive default level below
 	const binding = await integrationResourceBindingService.get("device", deviceId);
 	const isSelfRegistered =
@@ -5401,20 +5474,24 @@ export async function handlePermission(
 	if (binding) {
 		try {
 			await narratorPersistence.validateToolCallBinding(narratorId, toolUseId, binding);
-		} catch {
+		} catch (error) {
+			rethrowPermissionReadFailure(error);
 			return { behavior: "deny", message: "Invalid persisted tool execution binding" };
 		}
 	}
 	// Legacy callers may omit the binding only when the provider id is unambiguous.
-	const candidates = await db.query.narratorToolCalls.findMany({
-		where: and(
-			binding ? eq(narratorToolCalls.id, binding.toolCallId) : undefined,
-			eq(narratorToolCalls.narratorId, narratorId),
-			eq(narratorToolCalls.toolUseId, toolUseId),
-		),
-		columns: { id: true, executionAttempt: true },
-		limit: 2,
-	});
+	const candidates = await readQuery(
+		db.query.narratorToolCalls.findMany({
+			where: and(
+				binding ? eq(narratorToolCalls.id, binding.toolCallId) : undefined,
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.toolUseId, toolUseId),
+			),
+			columns: { id: true, executionAttempt: true },
+			limit: 2,
+		}),
+		{ ...narratorSurfaceReadOptions({ timeoutMs: 30_000, signal }), maxRows: 2 },
+	);
 	if (candidates.length > 1 || (binding && candidates.length !== 1)) {
 		return { behavior: "deny", message: "Ambiguous or missing persisted tool execution record" };
 	}
@@ -5446,23 +5523,27 @@ export async function handlePermission(
 	let initialExecutionTarget = executionContext?.target;
 	const wsTarget = broadcastTargetId ?? narratorId;
 	const routingIdentity = permissionRoutingIdentity(narratorId, wsTarget, parentToolUseId);
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: {
-			permissionMode: true,
-			relaxedPlan: true,
-			previousPermissionMode: true,
-			planFileId: true,
-			dangerReflectionOverride: true,
-			questionReflectionOverride: true,
-			variant: true,
-			type: true,
-			parentNarratorId: true,
-			aclRootNarratorId: true,
-			runtimeRegistrationJson: true,
-			traits: true,
-		},
-	});
+	const narrator = await readQueryFirst(
+		db.query.narrators.findMany({
+			limit: 1,
+			where: eq(narrators.id, narratorId),
+			columns: {
+				permissionMode: true,
+				relaxedPlan: true,
+				previousPermissionMode: true,
+				planFileId: true,
+				dangerReflectionOverride: true,
+				questionReflectionOverride: true,
+				variant: true,
+				type: true,
+				parentNarratorId: true,
+				aclRootNarratorId: true,
+				runtimeRegistrationJson: true,
+				traits: true,
+			},
+		}),
+		{ ...narratorSurfaceReadOptions({ timeoutMs: 30_000, signal }), maxRows: 1 },
+	);
 	// A nested subagent's requests also reach its ACL root's page (see nested-subagent-routing).
 	if (narrator) rememberNestedSubagentRoot({ id: narratorId, ...narrator });
 	const permMode = runtimeConstraint?.permissionMode ?? narrator?.permissionMode ?? "default";
@@ -5519,6 +5600,7 @@ export async function handlePermission(
 			// Freeze an alias to the checked task, so approval cannot cancel a retargeted alias.
 			effectiveInput = { type: task.type, id: task.id };
 		} catch (error) {
+			rethrowPermissionReadFailure(error);
 			return { behavior: "deny", message: error instanceof Error ? error.message : String(error) };
 		}
 	}
@@ -5674,6 +5756,7 @@ export async function handlePermission(
 			const { assertNarratorCanAskQuestion } = await import("./narrator-question-service");
 			await assertNarratorCanAskQuestion(narratorId);
 		} catch (error) {
+			rethrowPermissionReadFailure(error);
 			return { behavior: "deny", message: error instanceof Error ? error.message : String(error) };
 		}
 		const askResult = await validateOrRepairAskUserQuestionInput(
@@ -5743,6 +5826,7 @@ export async function handlePermission(
 			signal,
 		);
 	} catch (error) {
+		rethrowPermissionReadFailure(error);
 		return {
 			behavior: "deny",
 			message: `Execution policy compilation failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -5829,7 +5913,7 @@ export async function handlePermission(
 	);
 	let decision =
 		toolName === "Send" &&
-		(await shouldAutoAllowSendWithinScope(narratorId, narrator, effectiveInput))
+		(await shouldAutoAllowSendWithinScope(narratorId, narrator, effectiveInput, { signal }))
 			? "allow"
 			: resolvePermissionDecision({
 					toolName,
@@ -5943,9 +6027,14 @@ export async function handlePermission(
 		if (!opts.skipConfirmationCache && consumeDangerConfirmation(narratorId, fingerprint)) {
 			return null;
 		}
-		const toolCallRecord = await db.query.narratorToolCalls.findFirst({
-			where: and(eq(narratorToolCalls.id, permissionToolCallId)),
-		});
+		const toolCallRecord = await readQueryFirst(
+			db.query.narratorToolCalls.findMany({
+				limit: 1,
+				where: and(eq(narratorToolCalls.id, permissionToolCallId)),
+				columns: { id: true },
+			}),
+			{ ...narratorSurfaceReadOptions({ timeoutMs: 30_000, signal }), maxRows: 1 },
+		);
 		if (!toolCallRecord) {
 			logger.error("Tool call record not found for danger reflection", {
 				narratorId,
@@ -6308,9 +6397,14 @@ export async function handlePermission(
 		};
 	}
 
-	const toolCallRecord = await db.query.narratorToolCalls.findFirst({
-		where: and(eq(narratorToolCalls.id, permissionToolCallId)),
-	});
+	const toolCallRecord = await readQueryFirst(
+		db.query.narratorToolCalls.findMany({
+			limit: 1,
+			where: and(eq(narratorToolCalls.id, permissionToolCallId)),
+			columns: { id: true },
+		}),
+		{ ...narratorSurfaceReadOptions({ timeoutMs: 30_000, signal }), maxRows: 1 },
+	);
 
 	if (!toolCallRecord) {
 		logger.error("Tool call record not found for permission request", { narratorId, toolUseId });
@@ -6568,6 +6662,7 @@ async function handlePermissionRuleRequest(args: {
 		}
 		await options.onInputResolved?.(prepared.input);
 	} catch (error) {
+		rethrowPermissionReadFailure(error);
 		return { behavior: "deny", message: error instanceof Error ? error.message : String(error) };
 	}
 	const id = binding.toolCallId;
@@ -6990,7 +7085,7 @@ export async function resolvePermission(
 	let decidedByNarrator: { id: string; handle: string | null } | undefined;
 	if (decidedBy.startsWith("narrator:")) {
 		const proxyId = decidedBy.slice("narrator:".length);
-		const proxy = await narratorService.getById(proxyId).catch(() => null);
+		const proxy = await narratorService.getById(proxyId).catch(missingNarrator);
 		decidedByNarrator = { id: proxyId, handle: proxy?.handle ?? null };
 	}
 
@@ -7149,7 +7244,10 @@ export async function resolvePermission(
  * never resolves through the tool-call row, which is why the registry lookups must
  * all run before that fallback.)
  */
-export async function resolveDecisionNarratorId(requestId: string): Promise<string | null> {
+export async function resolveDecisionNarratorId(
+	requestId: string,
+	options: NarratorSurfaceReadBudget = {},
+): Promise<string | null> {
 	const pending = pendingPermissions.get(requestId);
 	if (pending?.narratorId) return pending.narratorId;
 	const reflection = pendingDangerReflections.get(requestId);
@@ -7162,10 +7260,14 @@ export async function resolveDecisionNarratorId(requestId: string): Promise<stri
 	);
 	const planReflectionNarratorId = getExitPlanReflectionNarratorId(requestId);
 	if (planReflectionNarratorId) return planReflectionNarratorId;
-	const row = await db.query.narratorToolCalls.findFirst({
-		where: eq(narratorToolCalls.id, requestId),
-		columns: { narratorId: true },
-	});
+	const row = await readQueryFirst(
+		db.query.narratorToolCalls.findMany({
+			limit: 1,
+			where: eq(narratorToolCalls.id, requestId),
+			columns: { narratorId: true },
+		}),
+		{ ...narratorSurfaceReadOptions(options), maxRows: 1 },
+	);
 	return row?.narratorId ?? null;
 }
 
@@ -7209,15 +7311,19 @@ export async function resolvePermissionOrDangerReflection(
 		const { manuallyResumeRestartRecovery, pausedRestartToolCallForRequest } = await import(
 			"./restart-recovery-service"
 		);
-		const stored = await db.query.narratorToolCalls.findFirst({
-			where: eq(narratorToolCalls.id, pausedRestartToolCallForRequest(requestId)),
-			columns: {
-				narratorId: true,
-				status: true,
-				executionStartedAt: true,
-				fileChangeOperationId: true,
-			},
-		});
+		const stored = await readQueryFirst(
+			db.query.narratorToolCalls.findMany({
+				limit: 1,
+				where: eq(narratorToolCalls.id, pausedRestartToolCallForRequest(requestId)),
+				columns: {
+					narratorId: true,
+					status: true,
+					executionStartedAt: true,
+					fileChangeOperationId: true,
+				},
+			}),
+			{ ...narratorSurfaceReadOptions({ timeoutMs: 30_000 }), maxRows: 1 },
+		);
 		if (
 			stored?.status === "pending" &&
 			stored.executionStartedAt == null &&
@@ -7457,30 +7563,42 @@ async function abortPersistedDangerReflectionWithoutRuntime(
 	requestId: string,
 	reason?: string,
 ): Promise<boolean> {
-	const toolCall = await db.query.narratorToolCalls.findFirst({
-		where: eq(narratorToolCalls.id, requestId),
-		columns: {
-			id: true,
-			narratorId: true,
-			messageId: true,
-			toolUseId: true,
-			status: true,
-			permissionSuggestions: true,
-		},
-	});
+	const toolCall = await readQueryFirst(
+		db.query.narratorToolCalls.findMany({
+			limit: 1,
+			where: eq(narratorToolCalls.id, requestId),
+			columns: {
+				id: true,
+				narratorId: true,
+				messageId: true,
+				toolUseId: true,
+				status: true,
+				permissionSuggestions: true,
+			},
+		}),
+		{ ...narratorSurfaceReadOptions({ timeoutMs: 30_000 }), maxRows: 1 },
+	);
 	if (!toolCall) return false;
 
 	const existingReflection = getPersistedDangerReflectionSuggestion(toolCall.permissionSuggestions);
 	if (!existingReflection) return false;
 	const [narrator, ownerMessage] = await Promise.all([
-		db.query.narrators.findFirst({
-			where: eq(narrators.id, toolCall.narratorId),
-			columns: { id: true, type: true, parentNarratorId: true, aclRootNarratorId: true },
-		}),
-		db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, toolCall.messageId),
-			columns: { parentToolUseId: true },
-		}),
+		readQueryFirst(
+			db.query.narrators.findMany({
+				limit: 1,
+				where: eq(narrators.id, toolCall.narratorId),
+				columns: { id: true, type: true, parentNarratorId: true, aclRootNarratorId: true },
+			}),
+			{ ...narratorSurfaceReadOptions({ timeoutMs: 30_000 }), maxRows: 1 },
+		),
+		readQueryFirst(
+			db.query.narratorMessages.findMany({
+				limit: 1,
+				where: eq(narratorMessages.id, toolCall.messageId),
+				columns: { parentToolUseId: true },
+			}),
+			{ ...narratorSurfaceReadOptions({ timeoutMs: 30_000 }), maxRows: 1 },
+		),
 	]);
 	// No runtime pause exists, so the route is rebuilt from persistence: the owner
 	// plus its parent (if it is a subagent) are exactly the pages that can be

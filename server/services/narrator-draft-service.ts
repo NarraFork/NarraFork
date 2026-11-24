@@ -3,6 +3,7 @@ import type { FileReference } from "@shared/file-reference";
 import { and, eq, inArray, isNotNull, ne, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import { narratorDrafts } from "../db/schema";
+import { readQueryFirst } from "../db/worker-read";
 import { copyFileReference } from "../lib/agent/file-reference-projection";
 import { narratorDraftLock } from "../lib/async-mutex";
 import {
@@ -10,6 +11,10 @@ import {
 	validateComposerProjection,
 } from "../lib/composer-document";
 import { generateId } from "../lib/id";
+import {
+	type NarratorSurfaceReadBudget,
+	narratorSurfaceReadOptions,
+} from "./narrator-surface-reads";
 
 export interface NarratorDraftState {
 	hasDraft: boolean;
@@ -176,17 +181,21 @@ export async function getNarratorDraft(
 export async function getNarratorDraftMetadata(
 	userId: string,
 	narratorId: string,
+	readBudget: NarratorSurfaceReadBudget = {},
 ): Promise<Pick<NarratorDraftState, "hasDraft" | "revision" | "updatedAt">> {
-	const row = await db
-		.select({
-			hasDraft: sql<number>`CASE WHEN length(trim(${narratorDrafts.text})) > 0 OR
+	const row = await readQueryFirst(
+		db
+			.select({
+				hasDraft: sql<number>`CASE WHEN length(trim(${narratorDrafts.text})) > 0 OR
 			(${narratorDrafts.fileReferencesJson} IS NOT NULL AND ${narratorDrafts.fileReferencesJson} <> '[]') OR ${narratorDrafts.composerDocument} IS NOT NULL THEN 1 ELSE 0 END`,
-			revision: narratorDrafts.revision,
-			updatedAt: narratorDrafts.updatedAt,
-		})
-		.from(narratorDrafts)
-		.where(and(eq(narratorDrafts.userId, userId), eq(narratorDrafts.narratorId, narratorId)))
-		.get();
+				revision: narratorDrafts.revision,
+				updatedAt: narratorDrafts.updatedAt,
+			})
+			.from(narratorDrafts)
+			.where(and(eq(narratorDrafts.userId, userId), eq(narratorDrafts.narratorId, narratorId)))
+			.limit(1),
+		{ ...narratorSurfaceReadOptions(readBudget), maxRows: 1 },
+	);
 	return {
 		hasDraft: !!row?.hasDraft,
 		revision: row?.revision ?? 0,
