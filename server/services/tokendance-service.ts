@@ -26,6 +26,7 @@ import type { UsageSubject } from "../lib/provider-key-subjects";
 import { getProviderKeyStore, TOKENDANCE_KEY_OWNER, withProviderKey } from "../lib/provider-keys";
 import { saveSettings, settings, type TokenDanceSettings } from "../lib/settings";
 import { settingsUpdateLock } from "../lib/settings/write-lock";
+import { quotaNetworkIdentity } from "../lib/sourcing/quota-identity";
 import { importLegacyQuotaCache, quotaStore } from "../lib/sourcing/quota-store";
 import { registerTokenDanceRuntime } from "../lib/tokendance-runtime";
 
@@ -92,8 +93,12 @@ function balanceSubject(config = getTokenDanceRuntimeConfig()): TokenDanceSubjec
 		: { id: TOKENDANCE_PREFIX, providerId: TOKENDANCE_PREFIX, config };
 }
 
-function balanceIdentity(config: TokenDanceSettings): string {
-	return JSON.stringify([config.apiKey, config.generation]);
+export function tokenDanceQuotaIdentity(config: TokenDanceSettings): string {
+	return JSON.stringify([
+		config.apiKey,
+		config.generation,
+		quotaNetworkIdentity(config, settings.proxy),
+	]);
 }
 
 function tokenDanceSnapshot(
@@ -143,7 +148,7 @@ let legacyImported = false;
 function importLegacyBalance(subject: TokenDanceSubject): void {
 	if (legacyImported) return;
 	legacyImported = true;
-	const identity = balanceIdentity(subject.config);
+	const identity = tokenDanceQuotaIdentity(subject.config);
 	void importLegacyQuotaCache(
 		"tokendance-balance.json",
 		parsePersistedBalance,
@@ -806,10 +811,10 @@ function currentBalanceCache(): BalanceCache {
 	if (
 		!balanceCache ||
 		balanceCache.generation !== generation() ||
-		(subject && balanceIdentity(subject.config) !== balanceCacheIdentity)
+		(subject && tokenDanceQuotaIdentity(subject.config) !== balanceCacheIdentity)
 	) {
 		balanceCache = { generation: generation(), attemptedAt: -Infinity };
-		balanceCacheIdentity = subject ? balanceIdentity(subject.config) : undefined;
+		balanceCacheIdentity = subject ? tokenDanceQuotaIdentity(subject.config) : undefined;
 	}
 	if (subject) importLegacyBalance(subject);
 	return balanceCache;
@@ -818,7 +823,7 @@ let balanceCacheIdentity: string | undefined;
 function balanceSummary(cache: BalanceCache): TokenDanceBalance {
 	const subject = balanceSubject();
 	const snapshot = subject
-		? quotaStore.get(subject.id, balanceIdentity(subject.config), restoreSnapshot)
+		? quotaStore.get(subject.id, tokenDanceQuotaIdentity(subject.config), restoreSnapshot)
 		: undefined;
 	const { recoveryAction: _storedAction, ...stored } = (snapshot?.detail ??
 		{}) as Partial<TokenDanceBalance>;
@@ -887,7 +892,7 @@ export async function refreshTokenDanceBalance(force = true): Promise<TokenDance
 	cache.attemptedAt = Date.now();
 	const subject = balanceSubject(config);
 	if (!subject) throw fail("TokenDance is not connected", 409);
-	const identity = balanceIdentity(config);
+	const identity = tokenDanceQuotaIdentity(subject.config);
 	let task: Promise<TokenDanceBalance> | undefined;
 	task = (async () => {
 		try {

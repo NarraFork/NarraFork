@@ -3,6 +3,7 @@ import type { QuotaSnapshot } from "@shared/quota-snapshot";
 import { getNarraforkPath } from "./narrafork-home";
 import { firstCredential, streamQuotaIdentity } from "./provider-key-subjects";
 import { type CustomApiProviderConfig, settings } from "./settings";
+import { quotaNetworkIdentity } from "./sourcing/quota-identity";
 import { quotaStore, STREAM_QUOTA_SOURCE } from "./sourcing/quota-store";
 
 export interface CustomApiQuotaCache {
@@ -24,8 +25,9 @@ function normalizeDetailedQuotaBalance(value: unknown): string | null {
 	return normalizeQuotaBalance(value);
 }
 
-const identity = (config: CustomApiProviderConfig) =>
-	JSON.stringify([config.baseUrl, config.apiKey]);
+/** Store identity for stream snapshots, distinct from the request-time stale-event guard. */
+export const customApiStreamQuotaIdentity = (config: CustomApiProviderConfig): string =>
+	JSON.stringify([config.baseUrl, config.apiKey, quotaNetworkIdentity(config, settings.proxy)]);
 const knownCredentialIds = new Map<string, string>();
 
 function customApiQuotaSnapshot(cache: CustomApiQuotaCache): QuotaSnapshot {
@@ -76,7 +78,7 @@ export function updateCustomApiQuotaByPrefix(
 	knownCredentialIds.set(config.id, credential.id);
 	quotaStore.set(
 		credential.id,
-		identity(credential.config),
+		customApiStreamQuotaIdentity(credential.config),
 		customApiQuotaSnapshot({
 			quotaBalance: normalizeQuotaBalance(quotaBalance),
 			detailedQuotaBalance: normalizeDetailedQuotaBalance(detailedQuotaBalance),
@@ -94,7 +96,7 @@ export function getCustomApiCachedQuota(providerId: string): CustomApiQuotaCache
 	knownCredentialIds.set(providerId, credential.id);
 	const snapshot = quotaStore.get(
 		credential.id,
-		identity(credential.config),
+		customApiStreamQuotaIdentity(credential.config),
 		restoreSnapshot,
 		STREAM_QUOTA_SOURCE,
 	);

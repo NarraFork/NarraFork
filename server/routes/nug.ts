@@ -569,7 +569,7 @@ nugRoutes.get("/providers/:id/quota", async (c) => {
 	try {
 		const data = (await entry.provider.getQuota()) as unknown as Record<string, unknown>;
 		const responseData = normalizeNugQuotaResponse(data);
-		setNugCachedQuota(id, buildNugQuotaCache(responseData, getNugCachedQuota(id)), entry.config);
+		setNugCachedQuota(id, buildNugQuotaCache(data, getNugCachedQuota(id)), entry.config);
 		return c.json(responseData);
 	} catch (err: unknown) {
 		const msg = err instanceof Error ? err.message : "Unknown error";
@@ -586,7 +586,7 @@ nugRoutes.get("/providers/:id/billing/config", async (c) => {
 	try {
 		const data = (await entry.provider.getBillingConfig()) as unknown as Record<string, unknown>;
 		const responseData = normalizeNugQuotaResponse(data);
-		setNugCachedQuota(id, buildNugQuotaCache(responseData, getNugCachedQuota(id)), entry.config);
+		setNugCachedQuota(id, buildNugQuotaCache(data, getNugCachedQuota(id)), entry.config);
 		return c.json(responseData);
 	} catch (err: unknown) {
 		const msg = err instanceof Error ? err.message : "Unknown error";

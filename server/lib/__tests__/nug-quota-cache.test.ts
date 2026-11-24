@@ -1,15 +1,17 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
+import type { CredentialNetwork } from "@shared/credential-network";
 import { getNarraforkPath } from "../narrafork-home";
 import {
 	buildNugQuotaCache,
 	getAllNugCachedQuotas,
 	getNugCachedQuota,
+	nugQuotaIdentity,
 	setNugCachedQuota,
 	updateNugQuotaByPrefix,
 } from "../nug-quota-cache";
 import { streamQuotaIdentity, streamQuotaIdentityForPrefix } from "../provider-key-subjects";
-import { getProviderKeyStore, nugKeyOwner } from "../provider-keys";
+import { getProviderKeyStore, nugKeyOwner, withProviderKey } from "../provider-keys";
 import { saveSettings, settings } from "../settings";
 import { quotaStore } from "../sourcing/quota-store";
 import { getServiceTemplate } from "../sourcing/templates";
@@ -45,6 +47,22 @@ function reportNugQuota(
 	identity = streamQuotaIdentityForPrefix(prefix),
 ): void {
 	updateNugQuotaByPrefix(prefix, balance, detail, extra, identity);
+}
+
+function expectLateNugQuotaRejected(expectedIdentity: string): void {
+	const config = settings.nugProviders?.[0];
+	if (!config) throw new Error("NUG quota test provider missing");
+	const key = getProviderKeyStore().listGroup(config.id)[0];
+	const effectiveConfig = key ? withProviderKey(config, key) : config;
+	expect(streamQuotaIdentity(config)).not.toBe(expectedIdentity);
+	reportNugQuota("nug-quota", 99, null, undefined, expectedIdentity);
+	expect(
+		quotaStore.peekForIdentity(key?.id ?? config.id, nugQuotaIdentity(effectiveConfig)),
+	).toBeUndefined();
+	expect(getNugCachedQuota(providerId)).toBeUndefined();
+	// A newly captured request is still allowed to publish under the new identity.
+	reportNugQuota("nug-quota", 7);
+	expect(getNugCachedQuota(providerId)?.balance).toBe(7);
 }
 
 afterEach(() => {
@@ -106,6 +124,55 @@ describe("NUG quota snapshots", () => {
 		getProviderKeyStore().update(second.id, { apiKey: "key-other" });
 		expect(getNugCachedQuota(providerId)).toBeUndefined();
 		quotaStore.remove(second.id);
+	});
+
+	const networkChanges: Array<[string, CredentialNetwork]> = [
+		["proxy", { proxy: { mode: "custom", url: "http://new-proxy.example:8080" } }],
+		["UA", { userAgentMode: "custom", customUserAgent: "new-stream-agent" }],
+		["headers", { extraHeaders: { "X-Account": "new-stream-network" } }],
+	];
+	for (const [name, network] of networkChanges) {
+		test(`a late event after the first key's ${name} changes cannot publish a new-network snapshot`, () => {
+			useProvider();
+			const key = getProviderKeyStore().listGroup(providerId)[0];
+			if (!key) throw new Error("NUG quota test key missing");
+			reportNugQuota("nug-quota", 12);
+			const expectedIdentity = streamQuotaIdentityForPrefix("nug-quota");
+			if (!expectedIdentity) throw new Error("NUG stream identity missing");
+			getProviderKeyStore().update(key.id, { network });
+			expectLateNugQuotaRejected(expectedIdentity);
+		});
+	}
+
+	test("a late event after a global proxy change cannot publish a new-network snapshot", () => {
+		useProvider();
+		settings.proxy = { mode: "direct" };
+		reportNugQuota("nug-quota", 12);
+		const expectedIdentity = streamQuotaIdentityForPrefix("nug-quota");
+		if (!expectedIdentity) throw new Error("NUG stream identity missing");
+		settings.proxy = { mode: "custom", url: "http://new-global-proxy.example:8080" };
+		expectLateNugQuotaRejected(expectedIdentity);
+	});
+
+	test("a late event cannot follow a same-secret replacement of the first credential", () => {
+		useProvider();
+		reportNugQuota("nug-quota", 12);
+		const expectedIdentity = streamQuotaIdentityForPrefix("nug-quota");
+		if (!expectedIdentity) throw new Error("NUG stream identity missing");
+		const replacement = getProviderKeyStore().add(nugKeyOwner(providerId), { apiKey: "key-one" });
+		getProviderKeyStore().reorder(nugKeyOwner(providerId), [replacement.id]);
+		expectLateNugQuotaRejected(expectedIdentity);
+	});
+
+	test("a late event cannot follow a first-key secret edit hidden by the settings projection", () => {
+		useProvider();
+		const key = getProviderKeyStore().listGroup(providerId)[0];
+		if (!key) throw new Error("NUG quota test key missing");
+		reportNugQuota("nug-quota", 12);
+		const expectedIdentity = streamQuotaIdentityForPrefix("nug-quota");
+		if (!expectedIdentity) throw new Error("NUG stream identity missing");
+		getProviderKeyStore().update(key.id, { apiKey: "key-secret-edited" });
+		expectLateNugQuotaRejected(expectedIdentity);
 	});
 
 	test("a stream event from before a provider identity change is discarded", () => {

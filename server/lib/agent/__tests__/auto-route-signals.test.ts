@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { setNugCachedModels } from "../../nug-model-cache";
 import { getProviderKeyStore } from "../../provider-keys";
-import { settings } from "../../settings";
+import { saveSettings, settings } from "../../settings";
 import { autoSourceFacts } from "../auto-route-signals";
 import { reportKeyFault, resetProviderKeyRuntimeForTests } from "../pooled-provider";
 import { ApiError } from "../types";
@@ -23,6 +23,7 @@ const provider = (id: string, prefix: string, baseUrl: string) => ({
 afterEach(() => {
 	settings.customApiProviders = saved;
 	settings.nugProviders = savedNug;
+	saveSettings(settings);
 	setNugCachedModels("sigNug", []);
 	for (const id of ["sigRelay", "sigKimi"]) getProviderKeyStore().removeProvider(id);
 	resetProviderKeyRuntimeForTests();
@@ -38,6 +39,7 @@ describe("auto route signals", () => {
 			provider("sigRelay", "sigrelay", "https://relay.example/v1"),
 			provider("sigKimi", "sigkimi", "https://api.kimi.com/coding/v1"),
 		];
+		saveSettings(settings);
 		getProviderKeyStore().add("sigRelay", { apiKey: "sk-relay" });
 		getProviderKeyStore().add("sigKimi", { apiKey: "sk-kimi" });
 		expect(autoSourceFacts("sigkimi")).toEqual({ available: true, subscription: true });
@@ -46,6 +48,7 @@ describe("auto route signals", () => {
 
 	test("a short 429 rest does not count; a used-up allowance or a 403 does, until it ends", () => {
 		settings.customApiProviders = [provider("sigRelay", "sigrelay", "https://relay.example/v1")];
+		saveSettings(settings);
 		const [first, second] = [
 			getProviderKeyStore().add("sigRelay", { apiKey: "sk-1" }),
 			getProviderKeyStore().add("sigRelay", { apiKey: "sk-2" }),
@@ -73,6 +76,7 @@ describe("auto route signals", () => {
 				defaultModel: "kiro:claude-opus-4.6",
 			},
 		];
+		saveSettings(settings);
 		setNugCachedModels("sigNug", [
 			{ id: "kiro:claude-opus-4.6", available: false },
 			{ id: "antigravity:claude-opus-4.6", available: true },
@@ -89,6 +93,7 @@ describe("auto route signals", () => {
 
 	test("a key the upstream rejected (401) leaves the pool", () => {
 		settings.customApiProviders = [provider("sigRelay", "sigrelay", "https://relay.example/v1")];
+		saveSettings(settings);
 		const only = getProviderKeyStore().add("sigRelay", { apiKey: "sk-only" });
 		reportKeyFault(only, new ApiError(401, "Unauthorized"));
 		expect(autoSourceFacts("sigrelay").available).toBe(false);

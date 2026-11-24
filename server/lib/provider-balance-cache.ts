@@ -79,7 +79,10 @@ export function isProviderBalanceCandidate(config: CustomApiProviderConfig): boo
  * the site root must not leave the previous allowance on screen, because the cached value then
  * describes a different account.
  */
-function connectionIdentity(config: CustomApiProviderConfig, globalProxy: unknown): string {
+export function providerBalanceQuotaIdentity(
+	config: CustomApiProviderConfig,
+	globalProxy: unknown,
+): string {
 	return JSON.stringify([
 		config.baseUrl,
 		config.apiKey,
@@ -307,7 +310,7 @@ export class ProviderBalanceCache {
 				.filter((credential) => isProviderBalanceCandidate(credential.config))
 				.map((credential) => [
 					credential.providerId,
-					{ ...credential, identity: connectionIdentity(credential.config, globalProxy) },
+					{ ...credential, identity: providerBalanceQuotaIdentity(credential.config, globalProxy) },
 				]),
 		);
 		if (this.options.legacyFile && !this.legacyImported) {

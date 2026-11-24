@@ -5,6 +5,7 @@ import { getNarraforkPath } from "./narrafork-home";
 import { streamQuotaIdentity, type UsageSubject } from "./provider-key-subjects";
 import { getProviderKeyStore, nugKeyOwner, withProviderKey } from "./provider-keys";
 import { type NUGProviderConfig, settings } from "./settings";
+import { quotaNetworkIdentity } from "./sourcing/quota-identity";
 import { quotaStore } from "./sourcing/quota-store";
 
 export interface NugQuotaCache {
@@ -21,7 +22,7 @@ export type NugQuotaSubject = UsageSubject<NUGProviderConfig>;
 void unlink(getNarraforkPath("nug-quotas.json")).catch(() => {});
 
 function normalizeNullableNumber(value: unknown): number | null {
-	if (value == null) return null;
+	if (typeof value !== "number" && (typeof value !== "string" || !value.trim())) return null;
 	const numericValue = typeof value === "number" ? value : Number(value);
 	return Number.isFinite(numericValue) ? numericValue : null;
 }
@@ -83,7 +84,12 @@ export function normalizeNugQuotaResponse<T extends Record<string, unknown>>(
 export function buildNugQuotaCache(
 	data: {
 		balance?: unknown;
+		quotaBalance?: unknown;
+		remaining?: unknown;
 		totalGranted?: unknown;
+		quotaTotalGranted?: unknown;
+		total_granted?: unknown;
+		total?: unknown;
 		detailedQuotaBalance?: unknown;
 		extra?: unknown;
 	},
@@ -91,8 +97,16 @@ export function buildNugQuotaCache(
 ): NugQuotaCache {
 	const detailedQuotaBalance = nugQuotaDetailsFrom(data) ?? existing?.detailedQuotaBalance ?? null;
 	return {
-		balance: normalizeNullableNumber(data.balance) ?? existing?.balance ?? null,
-		totalGranted: normalizeNullableNumber(data.totalGranted) ?? existing?.totalGranted ?? null,
+		balance:
+			normalizeNullableNumber(data.balance ?? data.quotaBalance ?? data.remaining) ??
+			existing?.balance ??
+			null,
+		totalGranted:
+			normalizeNullableNumber(
+				data.totalGranted ?? data.quotaTotalGranted ?? data.total_granted ?? data.total,
+			) ??
+			existing?.totalGranted ??
+			null,
 		detailedQuotaBalance,
 		...(data.extra !== undefined
 			? { extra: data.extra }
@@ -139,13 +153,14 @@ function subject(config: NUGProviderConfig): NugQuotaSubject {
 		: { id: config.id, providerId: config.id, config };
 }
 
-const identity = (config: NUGProviderConfig) => JSON.stringify([config.baseUrl, config.apiKey]);
+export const nugQuotaIdentity = (config: NUGProviderConfig): string =>
+	JSON.stringify([config.baseUrl, config.apiKey, quotaNetworkIdentity(config, settings.proxy)]);
 const knownCredentialIds = new Map<string, string>();
 
 function snapshotOf(config: NUGProviderConfig): QuotaSnapshot | undefined {
 	const credential = subject(config);
 	knownCredentialIds.set(config.id, credential.id);
-	return quotaStore.get(credential.id, identity(credential.config), restoreSnapshot);
+	return quotaStore.get(credential.id, nugQuotaIdentity(credential.config), restoreSnapshot);
 }
 
 export function setNugCachedQuota(
@@ -159,12 +174,15 @@ export function setNugCachedQuota(
 	if (expectedConfig) {
 		const expectedId =
 			getProviderKeyStore().list(nugKeyOwner(expectedConfig.id))[0]?.id ?? expectedConfig.id;
-		if (credential.id !== expectedId || identity(credential.config) !== identity(expectedConfig)) {
+		if (
+			credential.id !== expectedId ||
+			nugQuotaIdentity(credential.config) !== nugQuotaIdentity(expectedConfig)
+		) {
 			return;
 		}
 	}
 	knownCredentialIds.set(providerId, credential.id);
-	quotaStore.set(credential.id, identity(credential.config), nugQuotaSnapshot(cache));
+	quotaStore.set(credential.id, nugQuotaIdentity(credential.config), nugQuotaSnapshot(cache));
 }
 
 /** Fetch quota from a single NUG provider. */
@@ -192,9 +210,8 @@ export async function probeNugQuota(
 	signal: AbortSignal,
 ): Promise<QuotaSnapshot> {
 	const data = await new NugProvider(credential.config).getQuota(signal);
-	return nugQuotaSnapshot(
-		buildNugQuotaCache(normalizeNugQuotaResponse(data as unknown as Record<string, unknown>)),
-	);
+	// Unlike the legacy HTTP response, a routing snapshot must not turn unknown into zero.
+	return nugQuotaSnapshot(buildNugQuotaCache(data));
 }
 
 /** Update cached quota balance for a provider identified by prefix. */

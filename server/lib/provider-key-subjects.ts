@@ -3,8 +3,9 @@
  * config with that key's secret and network identity. Usage caches (Kimi, OpenCode Go)
  * keep one entry per subject; a provider without stored keys is its own subject.
  */
-import { getProviderKeyStore, withProviderKey } from "./provider-keys";
+import { getProviderKeyStore, peekProviderKeyStore, withProviderKey } from "./provider-keys";
 import { type CustomApiProviderConfig, settings } from "./settings";
+import { quotaNetworkIdentity } from "./sourcing/quota-identity";
 
 export interface UsageSubject<TConfig = CustomApiProviderConfig> {
 	/** The key's id (a migrated first key carries the provider's id). */
@@ -19,7 +20,17 @@ export function streamQuotaIdentity(config: {
 	baseUrl: string;
 	apiKey: string;
 }): string {
-	return JSON.stringify([config.id, config.baseUrl, config.apiKey]);
+	// Match the stream caches' first-key attribution without initializing the key store.
+	const key = peekProviderKeyStore()?.listGroup(config.id)[0];
+	const effectiveConfig = key ? withProviderKey(config, key) : config;
+	return JSON.stringify([
+		config.id,
+		config.baseUrl,
+		config.apiKey,
+		key?.id ?? config.id,
+		effectiveConfig.apiKey,
+		quotaNetworkIdentity(effectiveConfig, settings.proxy),
+	]);
 }
 
 export function streamQuotaIdentityForPrefix(prefix: string): string | undefined {

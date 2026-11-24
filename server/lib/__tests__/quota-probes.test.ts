@@ -37,12 +37,17 @@ const {
 const {
 	getAllOpencodeCachedUsages,
 	getOpencodeKeyUsages,
+	opencodeQuotaIdentity,
 	parseOpencodeUsageResponse,
 	refreshOpencodeKeyUsage,
 	syncOpencodeUsageCache,
 } = await import("../opencode-usage-cache");
-const { getAllDeepSeekCachedBalances, refreshDeepSeekBalance, syncDeepSeekBalanceCache } =
-	await import("../deepseek-balance-cache");
+const {
+	deepSeekQuotaIdentity,
+	getAllDeepSeekCachedBalances,
+	refreshDeepSeekBalance,
+	syncDeepSeekBalanceCache,
+} = await import("../deepseek-balance-cache");
 const { probeRelayQuota } = await import("../provider-balance-cache");
 const { firstCredential } = await import("../provider-key-subjects");
 
@@ -100,13 +105,7 @@ describe("legacy cache files", () => {
 	test("an OpenCode legacy file moves into the snapshot store and is deleted", async () => {
 		useProvider(provider("oc-legacy", "https://opencode.ai/zen/go/v1"));
 		const config = saved("oc-legacy");
-		const identity = JSON.stringify([
-			config.baseUrl,
-			config.apiKey,
-			config.proxy,
-			config.tlsRejectUnauthorized,
-			settings.proxy,
-		]);
+		const identity = opencodeQuotaIdentity(config);
 		const legacy = createPersistedCredentialCache<unknown>("opencode-usages.json", (raw) => raw);
 		const usage = {
 			rolling: { status: "ok" as const, percent: 37, resetsAt: RESET_5H },
@@ -127,14 +126,7 @@ describe("legacy cache files", () => {
 	test("a DeepSeek legacy file moves to the first credential and is deleted", async () => {
 		useProvider(provider("ds-legacy", "https://api.deepseek.com/v1"));
 		const config = saved("ds-legacy");
-		const identity = JSON.stringify([
-			config.baseUrl,
-			config.protocol,
-			config.apiKey,
-			config.proxy,
-			config.tlsRejectUnauthorized,
-			settings.proxy,
-		]);
+		const identity = deepSeekQuotaIdentity(config);
 		const legacy = createPersistedCredentialCache<unknown>("deepseek-balances.json", (raw) => raw);
 		legacy.save(config.id, identity, {
 			isAvailable: true,
@@ -236,6 +228,34 @@ describe("Kimi Code quota probe", () => {
 			});
 		const refresh = refreshKimiKeyUsage(config.id);
 		getProviderKeyStore().update(config.id, { apiKey: "sk-replacement" });
+		settle(Response.json(body));
+		await refresh;
+		expect(getKimiCachedUsage(config.id)).toBeUndefined();
+		expect(quotaStore.peek(config.id)).toBeUndefined();
+	});
+
+	test("a network-only key edit withdraws the cached allowance", async () => {
+		useProvider(provider("kimi-network", "https://api.kimi.com/coding/v1"));
+		const config = saved("kimi-network");
+		respond = async () => Response.json(body);
+		await refreshKimiKeyUsage(config.id);
+		expect(getKimiCachedUsage(config.id)).toBeDefined();
+		getProviderKeyStore().update(config.id, {
+			network: { extraHeaders: { "X-Account": "network-two" } },
+		});
+		expect(getKimiCachedUsage(config.id)).toBeUndefined();
+	});
+
+	test("a late answer from the old global proxy is not relabeled as the new network", async () => {
+		useProvider(provider("kimi-late-network", "https://api.kimi.com/coding/v1"));
+		const config = saved("kimi-late-network");
+		let settle!: (response: Response) => void;
+		respond = () =>
+			new Promise<Response>((done) => {
+				settle = done;
+			});
+		const refresh = refreshKimiKeyUsage(config.id);
+		settings.proxy = { mode: "custom", url: "http://replacement-proxy.example:8080" };
 		settle(Response.json(body));
 		await refresh;
 		expect(getKimiCachedUsage(config.id)).toBeUndefined();

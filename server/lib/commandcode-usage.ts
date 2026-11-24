@@ -10,10 +10,15 @@
 
 import type { QuotaSnapshot, QuotaWindow } from "@shared/quota-snapshot";
 import type { CommandCodeProviderSettings } from "./agent/commandcode-provider";
-import { COMMAND_CODE_PREFIX, commandCodeApiOrigin } from "./commandcode-protocol";
+import {
+	COMMAND_CODE_PREFIX,
+	commandCodeApiOrigin,
+	commandCodeProviderBase,
+} from "./commandcode-protocol";
 import type { UsageSubject } from "./provider-key-subjects";
 import { COMMAND_CODE_KEY_OWNER, getProviderKeyStore, withProviderKey } from "./provider-keys";
 import { settings } from "./settings";
+import { quotaNetworkIdentity } from "./sourcing/quota-identity";
 import { quotaStore } from "./sourcing/quota-store";
 
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -230,9 +235,16 @@ export async function fetchCommandCodeUsage(
 	signal?: AbortSignal,
 ): Promise<CommandCodeUsage> {
 	const origin = commandCodeApiOrigin(baseUrl);
-	const { credits, windowLimits, sandboxAccess } = parseCommandCodeCredits(
-		await getJson("/alpha/billing/credits", token, origin, signal),
-	);
+	const response = await getJson("/alpha/billing/credits", token, origin, signal);
+	// The display parser's legacy zero fallback is not evidence of an exhausted balance.
+	if (
+		!isRecord(response) ||
+		!isRecord(response.credits) ||
+		optionalNum(response.credits.monthlyCredits) === undefined
+	) {
+		throw new CommandCodeUsageError(502, "invalid_response");
+	}
+	const { credits, windowLimits, sandboxAccess } = parseCommandCodeCredits(response);
 	let summary: CommandCodeUsageSummary | undefined;
 	try {
 		summary = parseCommandCodeSummary(await getJson("/alpha/usage/summary", token, origin, signal));
@@ -298,8 +310,13 @@ export async function probeCommandCodeQuota(
 	);
 }
 
-const identity = (config: CommandCodeUsageSubject["config"]) =>
-	JSON.stringify([commandCodeApiOrigin(config.baseUrl), config.apiKey]);
+export const commandCodeQuotaIdentity = (config: CommandCodeUsageSubject["config"]): string =>
+	JSON.stringify([
+		commandCodeApiOrigin(config.baseUrl),
+		commandCodeProviderBase(config.baseUrl),
+		config.apiKey,
+		quotaNetworkIdentity(config, settings.proxy),
+	]);
 
 function settingsSubject(): CommandCodeUsageSubject | undefined {
 	const configured = settings.commandCode;
@@ -321,19 +338,19 @@ function restoreSnapshot(snapshot: QuotaSnapshot): QuotaSnapshot {
 }
 
 function cachedSnapshot(subject: CommandCodeUsageSubject): QuotaSnapshot | undefined {
-	return quotaStore.get(subject.id, identity(subject.config), restoreSnapshot);
+	return quotaStore.get(subject.id, commandCodeQuotaIdentity(subject.config), restoreSnapshot);
 }
 
 const refreshes = new Map<string, Promise<CommandCodeUsage>>();
 
 async function refreshUsage(subject: CommandCodeUsageSubject): Promise<CommandCodeUsage> {
-	const key = identity(subject.config);
+	const key = commandCodeQuotaIdentity(subject.config);
 	const existing = refreshes.get(key);
 	if (existing) return existing;
 	const task = probeCommandCodeQuota(subject, new AbortController().signal)
 		.then((snapshot) => {
 			const current = settingsSubject();
-			if (current?.id === subject.id && identity(current.config) === key) {
+			if (current?.id === subject.id && commandCodeQuotaIdentity(current.config) === key) {
 				quotaStore.set(subject.id, key, snapshot);
 			}
 			return snapshot.detail as CommandCodeUsage;

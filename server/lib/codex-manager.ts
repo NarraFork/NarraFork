@@ -2809,6 +2809,11 @@ export class CodexManager {
 
 let _instance: CodexManager | undefined;
 
+/** Routing reads only an already-loaded manager, never credentials from disk. */
+export function peekCodexManager(): CodexManager | undefined {
+	return _instance;
+}
+
 export function getCodexManager(): CodexManager {
 	if (!_instance) {
 		_instance = new CodexManager();

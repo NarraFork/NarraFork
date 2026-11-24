@@ -7,23 +7,36 @@
  */
 import type { QuotaSnapshot } from "@shared/quota-snapshot";
 import type { ServiceTemplateId, SourceProtocol, SourceRegion } from "@shared/sourcing/identify";
-import { probeTokenDanceQuota, type TokenDanceSubject } from "../../services/tokendance-service";
+import { pluginProviderRegistry } from "../../services/plugin-provider-registry";
+import {
+	probeTokenDanceQuota,
+	type TokenDanceSubject,
+	tokenDanceQuotaIdentity,
+} from "../../services/tokendance-service";
 import type { CommandCodeProviderSettings } from "../agent/commandcode-provider";
-import { getCodexManager } from "../codex-manager";
+import { getCodexManager, peekCodexManager } from "../codex-manager";
 import { projectCodexUsageSnapshot } from "../codex-usage";
-import { type CommandCodeUsageSubject, probeCommandCodeQuota } from "../commandcode-usage";
+import {
+	type CommandCodeUsageSubject,
+	commandCodeQuotaIdentity,
+	probeCommandCodeQuota,
+} from "../commandcode-usage";
 import type { CredentialAuth } from "../credential-store";
-import { probeDeepSeekQuota } from "../deepseek-balance-cache";
-import { probeKimiQuota } from "../kimi-usage-cache";
-import { type NugQuotaSubject, probeNugQuota } from "../nug-quota-cache";
-import { probeOpencodeQuota } from "../opencode-usage-cache";
-import { probeRelayQuota } from "../provider-balance-cache";
+import { customApiStreamQuotaIdentity } from "../custom-api-quota-cache";
+import { deepSeekQuotaIdentity, probeDeepSeekQuota } from "../deepseek-balance-cache";
+import { kimiQuotaIdentity, probeKimiQuota } from "../kimi-usage-cache";
+import { resolveKnownUnavailableNugModel } from "../nug-model-availability";
+import { type NugQuotaSubject, nugQuotaIdentity, probeNugQuota } from "../nug-quota-cache";
+import { opencodeQuotaIdentity, probeOpencodeQuota } from "../opencode-usage-cache";
+import { probeRelayQuota, providerBalanceQuotaIdentity } from "../provider-balance-cache";
 import type { UsageSubject } from "../provider-key-subjects";
+import { settings } from "../settings";
 import type {
 	CustomApiProviderConfig,
 	NUGProviderConfig,
 	TokenDanceSettings,
 } from "../settings/types";
+import { type CredentialRouting, keyRouting, type RoutingPreview } from "./routing";
 import type { SourceGroupView } from "./source-groups";
 
 export type { ServiceTemplateId } from "@shared/sourcing/identify";
@@ -72,6 +85,11 @@ export interface ServiceTemplate {
 	) => Promise<QuotaSnapshot>;
 	/** A read-only projection when another canonical store owns the usage (Codex). */
 	projectQuota?: (credentialId: string) => QuotaSnapshot | undefined;
+	/** Pure memory only: an explicit false rules out this model, unknown does not. */
+	isModelAvailable?: (group: SourceGroupView, value?: string) => boolean;
+	/** Whether any credential can serve; specialised pools retain their own policies. */
+	hasAvailableCredentials?: CredentialRouting["hasAvailableCredentials"];
+	routingPreview?: (group: SourceGroupView, now: number) => RoutingPreview | null;
 }
 
 type ProbeQuota = NonNullable<ServiceTemplate["probeQuota"]>;
@@ -100,6 +118,58 @@ const QUOTA_PROBES: Partial<Record<ServiceTemplateId, ProbeQuota>> = {
 	"openai-compatible": relay,
 	"anthropic-compatible": relay,
 	"gemini-compatible": relay,
+};
+
+type RoutingBehavior = Pick<
+	ServiceTemplate,
+	"isModelAvailable" | "hasAvailableCredentials" | "routingPreview"
+>;
+const customConfig = (group: SourceGroupView) =>
+	settings.customApiProviders?.find((provider) => provider.id === group.id);
+const relayRouting = keyRouting(
+	customConfig,
+	(config) => providerBalanceQuotaIdentity(config, settings.proxy),
+	{ streamIdentity: customApiStreamQuotaIdentity },
+);
+const ROUTING: Partial<Record<ServiceTemplateId, RoutingBehavior>> = {
+	// Codex's manager owns credits continuation and window policy, not the generic quota filter.
+	codex: {
+		hasAvailableCredentials: () => (peekCodexManager()?.availableCount ?? 0) > 0,
+		routingPreview: () => peekCodexManager()?.routingPreview ?? null,
+	},
+	"kimi-code": keyRouting(customConfig, kimiQuotaIdentity, {
+		streamIdentity: customApiStreamQuotaIdentity,
+	}),
+	"opencode-go": keyRouting(customConfig, opencodeQuotaIdentity, {
+		streamIdentity: customApiStreamQuotaIdentity,
+	}),
+	deepseek: keyRouting(customConfig, deepSeekQuotaIdentity, {
+		streamIdentity: customApiStreamQuotaIdentity,
+	}),
+	tokendance: keyRouting(() => settings.tokendance, tokenDanceQuotaIdentity),
+	"command-code": keyRouting(
+		() => ({ ...settings.commandCode, apiKey: settings.commandCode?.apiKey ?? "" }),
+		commandCodeQuotaIdentity,
+		{ allowUnconfigured: true },
+	),
+	nug: {
+		...keyRouting(
+			(group) => settings.nugProviders?.find((provider) => provider.id === group.id),
+			nugQuotaIdentity,
+			{ streamIdentity: nugQuotaIdentity },
+		),
+		isModelAvailable: (group, value) => !resolveKnownUnavailableNugModel(value, group.prefix),
+	},
+	plugin: {
+		hasAvailableCredentials: (group) =>
+			pluginProviderRegistry.get(group.id)?.status === "available",
+	},
+	openai: relayRouting,
+	anthropic: relayRouting,
+	gemini: relayRouting,
+	"openai-compatible": relayRouting,
+	"anthropic-compatible": relayRouting,
+	"gemini-compatible": relayRouting,
 };
 
 const KIMI_CODE = (host: string): ProtocolEndpoints => ({
@@ -273,7 +343,10 @@ function deepFreeze<T>(value: T): T {
 const byId = new Map<ServiceTemplateId, ServiceTemplate>(
 	TEMPLATES.map((template) => {
 		const probeQuota = QUOTA_PROBES[template.id];
-		return [template.id, deepFreeze(probeQuota ? { ...template, probeQuota } : template)];
+		return [
+			template.id,
+			deepFreeze({ ...template, ...(probeQuota && { probeQuota }), ...ROUTING[template.id] }),
+		];
 	}),
 );
 

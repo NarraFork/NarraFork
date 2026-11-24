@@ -59,10 +59,15 @@ const sticky = new SessionAffinity<string>({ maxEntries: STICKY_LIMIT });
  * Why a key is resting, if it is: a recent failure, or a usage window the quota cache
  * has seen used up (until it resets). For selection and the key list.
  */
-export function keyCooldown(keyId: string, now = Date.now()): PoolCooldown | undefined {
+export function keyCooldown(
+	keyId: string,
+	now = Date.now(),
+	includeQuota = true,
+): PoolCooldown | undefined {
 	const cooldown = cooldowns.get(keyId);
 	const failed = isPoolCooldownActive(cooldown?.until, now) ? cooldown : undefined;
-	const exhausted = keyQuotaBlockedUntil(keyId, now);
+	// Routing validates the quota identity itself; the legacy pool probe cannot do so.
+	const exhausted = includeQuota ? keyQuotaBlockedUntil(keyId, now) : undefined;
 	if (exhausted !== undefined && exhausted > (failed?.until ?? 0)) {
 		return { until: exhausted, reason: "quota" };
 	}

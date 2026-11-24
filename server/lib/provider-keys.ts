@@ -524,6 +524,11 @@ export class ProviderKeyStore {
 let store: ProviderKeyStore | undefined;
 let stopRewrite: (() => void) | undefined;
 
+/** Routing never initializes a store (which would synchronously read credentials). */
+export function peekProviderKeyStore(): ProviderKeyStore | undefined {
+	return store;
+}
+
 export function getProviderKeyStore(): ProviderKeyStore {
 	if (!store) {
 		store = new ProviderKeyStore();

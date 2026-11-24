@@ -4,6 +4,7 @@ import { outboundFetch } from "./net/outbound-fetch";
 import { resolveProxyForUrl } from "./net/proxy";
 import { firstCredential, type UsageSubject } from "./provider-key-subjects";
 import { type CustomApiProviderConfig, settings } from "./settings";
+import { quotaNetworkIdentity } from "./sourcing/quota-identity";
 import { importLegacyQuotaCache, quotaStore } from "./sourcing/quota-store";
 
 /**
@@ -137,14 +138,12 @@ export function isDeepSeekCustomApiProvider(config: {
 	return !config.disabled && identifyService(config).templateId === "deepseek";
 }
 
-function identity(config: CustomApiProviderConfig): string {
+export function deepSeekQuotaIdentity(config: CustomApiProviderConfig): string {
 	return JSON.stringify([
 		config.baseUrl,
 		config.protocol,
 		config.apiKey,
-		config.proxy,
-		config.tlsRejectUnauthorized,
-		settings.proxy,
+		quotaNetworkIdentity(config, settings.proxy),
 	]);
 }
 
@@ -172,8 +171,10 @@ export function syncDeepSeekBalanceCache(): void {
 				legacyKey: id,
 				id: p.credentialId,
 				// Legacy files were keyed by the provider config, before per-key networks applied.
-				identity: identity(settings.customApiProviders?.find((c) => c.id === id) ?? p.config),
-				storeIdentity: identity(p.config),
+				identity: deepSeekQuotaIdentity(
+					settings.customApiProviders?.find((c) => c.id === id) ?? p.config,
+				),
+				storeIdentity: deepSeekQuotaIdentity(p.config),
 			})),
 			(balance) => (balance.isAvailable === null ? null : deepseekSnapshot(balance)),
 		);
@@ -182,7 +183,7 @@ export function syncDeepSeekBalanceCache(): void {
 		const provider = providers.get(id);
 		if (
 			!provider ||
-			identity(provider.config) !== entry.identity ||
+			deepSeekQuotaIdentity(provider.config) !== entry.identity ||
 			provider.credentialId !== entry.credentialId
 		) {
 			entries.delete(id);
@@ -194,12 +195,12 @@ export function syncDeepSeekBalanceCache(): void {
 	for (const [id, { config, credentialId }] of providers) {
 		if (!entries.has(id)) {
 			entries.set(id, {
-				identity: identity(config),
+				identity: deepSeekQuotaIdentity(config),
 				credentialId,
 				generation: crypto.randomUUID(),
 			});
 			// Restore synchronously, as the old entry-creation did.
-			quotaStore.get(credentialId, identity(config), restoreSnapshot);
+			quotaStore.get(credentialId, deepSeekQuotaIdentity(config), restoreSnapshot);
 		}
 	}
 }
