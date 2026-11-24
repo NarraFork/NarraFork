@@ -491,7 +491,13 @@ static void setLoginItem(BOOL enabled) {
 	if (self.popover) return;
 	const CGFloat w = 560, h = 680, barH = 40;
 
-	NSView *root = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, w, h)];
+	// Frosted-glass panel: system vibrancy behind the toolbar + slight alpha
+	// on the embedded frontend so the desktop bleeds through like a HUD.
+	NSVisualEffectView *root =
+		[[NSVisualEffectView alloc] initWithFrame:NSMakeRect(0, 0, w, h)];
+	root.material = NSVisualEffectMaterialPopover;
+	root.blendingMode = NSVisualEffectBlendingModeBehindWindow;
+	root.state = NSVisualEffectStateActive;
 
 	self.popoverStatus = [NSTextField labelWithString:@""];
 	self.popoverStatus.font = [NSFont systemFontOfSize:12 weight:NSFontWeightMedium];
@@ -515,6 +521,7 @@ static void setLoginItem(BOOL enabled) {
 	button(w - 86, L(@"Quit", @"退出"), @selector(quit:));
 
 	self.webView = [[WKWebView alloc] initWithFrame:NSMakeRect(0, 0, w, h - barH)];
+	self.webView.alphaValue = 0.8; // translucent — tune for readability
 	self.webView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
 	[root addSubview:self.webView];
 
