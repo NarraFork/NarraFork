@@ -12,6 +12,7 @@
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { users } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { ForbiddenError } from "../lib/errors";
 import { controllerOf } from "../lib/runtime-source";
 import type { ControllerAction } from "../lib/validators/runtime-registration";
@@ -78,10 +79,13 @@ export async function authorizeAgentControl(
 	if (!ceiling.capabilities.spawnAgent)
 		deny("This narrator's capability ceiling does not allow controlling other agents.");
 	if (request.userId) {
-		const user = await db.query.users.findFirst({
-			where: eq(users.id, request.userId),
-			columns: { id: true, role: true },
-		});
+		const user = await readQuery(
+			db.query.users.findFirst({
+				where: eq(users.id, request.userId),
+				columns: { id: true, role: true },
+			}),
+			{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000 },
+		);
 		if (
 			!user ||
 			!(await canWriteNarrator(target, { userId: user.id, isAdmin: user.role === "admin" }))
