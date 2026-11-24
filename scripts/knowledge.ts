@@ -122,7 +122,7 @@ export function anchorPath(anchor: string): string {
 export function anchorMatches(anchor: string, path: string): boolean {
 	const a = anchorPath(anchor);
 	if (a.endsWith("/")) return path.startsWith(a);
-	if (/[*?[]/.test(a)) return new Bun.Glob(a).match(path);
+	if (/[*?[{]/.test(a)) return new Bun.Glob(a).match(path);
 	return path === a;
 }
 
@@ -135,7 +135,7 @@ function toPathspecs(anchors: string[], tracked: () => string[]): string[] {
 	for (const anchor of anchors) {
 		const a = anchorPath(anchor);
 		if (a.includes("{")) out.push(...tracked().filter((f) => anchorMatches(a, f)));
-		else out.push(/[*?[]/.test(a) ? `:(glob)${a}` : a);
+		else out.push(/[*?[{]/.test(a) ? `:(glob)${a}` : a);
 	}
 	return out;
 }
