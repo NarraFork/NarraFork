@@ -49,9 +49,9 @@ verified_at: 8d4bc063
 - 执行器会话终端：会话 ID 固定为 `nf-term-<终端id>`（`remote-session.ts:terminalSessionId`），存进 `terminals.executor_session_id`（旧 `pty.open` 远程终端和本地终端为 NULL）。shell 属于执行器进程，不随连接或 NarraFork 进程结束：
   - 设备断线（`DeviceOfflineError` / `DeviceConnectionChangedError`）时运行时等 `device:status` 上线事件，再以已消费的字节数 `session.attach { since }` 续读；其他错误（会话不存在、执行器缺特性、序号越界）和 `device:revoked` 结束终端。
   - 输入按顺序逐条发送，每条带固定 `writeId`，断线重发由执行器去重；设备不在时排队，上限 1 MiB，超出的输入丢弃并记警告。
-  - 停止和释放执行器会话不是运行时的事（运行时的 `kill()` 只停止读取），由 `terminal-service` 从持久记录做：在终端关闭（`kill`）或 shell 退出且最终缓冲和退出码已落盘（`monitorShellExit`）之后，先往 `executor_session_cleanups`（`device_id`+`session_id`）写一行，再发 `session.kill { release: true }`；执行器确认或回复 "session not found" 才删这行，其他错误（离线、断线、缺特性）保留。每次 `device:status` 上线按设备分页（每页 100）重试。这张表与终端行无关，删终端行、重启、设备离线都不会丢掉停止。
+  - 停止和释放执行器会话不是运行时的事（运行时的 `kill()` 只停止读取），由 `terminal-service` 从持久记录做：终端关闭（`kill`）时在拆除缓冲、标记已退出之前，shell 自然退出（`monitorShellExit`）时在最终缓冲和退出码落盘之后，往 `executor_session_cleanups`（`device_id`+`session_id`）写一行，再发 `session.kill { release: true }`；执行器确认或回复 "session not found" 才删这行，其他错误（离线、断线、缺特性）保留。每次 `device:status` 上线按设备分页（每页 100）重试。这张表与终端行无关，删终端行、重启、设备离线都不会丢掉停止。
   - 新建时 `session.open` 的回复因断线丢失：等设备回来（最多 15 秒）重发，执行器回 "already exists" 就接管；仍不确定时创建失败并写清理记录（`RemoteSessionOpenUnknownError`）。
-  - 执行器报告的缺口（`session.gap`）：先调 `interruptTextWatchesForGap`，期间这个终端后续输出（含缺口提示）暂存在 `heldOutput`，所以提示和缺口后的输出不会参与缺口前的匹配；然后在终端里显示一行"N bytes of output were not retained"，不静默跳过。
+  - 执行器报告的缺口（`session.gap`）：先调 `interruptTextWatchesForGap`，期间这个终端后续输出（含缺口提示）暂存在 `heldOutput`，所以提示和缺口后的输出不会参与缺口前的匹配；然后在终端里显示一行"N bytes of output were not retained"，不静默跳过。暂存期间 shell 退出时，`monitorShellExit` 先等暂存输出写回缓冲（`drainHeldOutput`）再落盘；`kill` 删除缓冲时丢弃暂存。
 - `BufferManager.append(data, streamSeq?)`：带编号的来源（执行器会话）在 xterm 解析完一批后记下位置，落盘快照写 `streamSeq`，`loadFromDisk` 读回为 `restoredStreamSeq`；不带编号的来源不写这个字段（`buffer-manager.ts`）。
 - dtach 仅限非 Windows：`dtachService.isAvailable()` 在 win32 恒为 false，其余平台用 `which dtach` 检测并缓存（`terminal/dtach-service.ts`）。dtach 会话以 `terminal-<id>.sock` 存放；服务端只持有 attach 进程。
 - 关闭服务时（`shutdownAll`）：dtach 终端保存缓冲、关闭 attach 进程但不杀会话，数据库状态保持 `running`；执行器会话终端保存带 `streamSeq` 的缓冲、停止读取但不杀会话，状态同样保持 `running`；直连终端和旧 `pty.open` 远程终端被杀并标记已退出（退出码 -1）。启动时 `recoverOnStartup`：
@@ -76,7 +76,7 @@ verified_at: 8d4bc063
 - 新增 PTY 后端：实现 `TerminalRuntime`，并在 `terminal-service.ts` 的创建顺序里决定位置；远程设备要先过授权/能力检查再有副作用（`runtime-remote.test.ts`）。
 - 改 dtach 恢复或关闭语义：`dtach-recovery-probe.test.ts`、`services/__tests__/terminal-startup-recovery.test.ts`；不变量：dtach 终端关闭服务时不杀会话、DB 状态保持 `running`，恢复探测失败保留状态而不是删除。
 - 改缓冲：`buffer-manager.test.ts`；订阅回放的读取游标和布局快照有数量/字节上限，别去掉。`streamSeq` 只能记 xterm 已解析的位置，否则重启续读会重复或漏掉输出。
-- 改执行器会话终端：`remote-session.test.ts`（断线续读、输入只执行一次、缺口先于提示、打开回复丢失后接管）、`terminal-executor-session.test.ts`（启动续读、关闭只脱离、离线停止的持久化与重试、退出先落盘再释放、创建分支）；不变量：执行器会话只在本地最终状态落盘后才释放，清理记录只在执行器确认后删除。协议两端要和 `remote-executor/internal/session/` 一致，见 [设备与远程执行](../remote/devices.md)。
+- 改执行器会话终端：`remote-session.test.ts`（断线续读、输入只执行一次、缺口先于提示、打开回复丢失后接管）、`terminal-executor-session.test.ts`（启动续读、关闭只脱离、离线停止的持久化与重试、退出先落盘再释放、缺口暂存输出在退出前写回、关闭先记停止再标记退出、创建分支）；不变量：执行器会话只在本地最终状态落盘后才释放，清理记录只在执行器确认后删除。协议两端要和 `remote-executor/internal/session/` 一致，见 [设备与远程执行](../remote/devices.md)。
 - 新增终端 REST 路由要经 `terminal-access.ts` 判断权限，不要只看登录。
 
 ## 相关

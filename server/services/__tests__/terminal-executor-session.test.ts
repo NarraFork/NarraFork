@@ -10,11 +10,13 @@ import type { SendRpcOptions } from "../device-connection-service";
 import * as deviceConnections from "../device-connection-service";
 import * as deviceService from "../device-service";
 import { terminalService } from "../terminal-service";
+import * as terminalWatches from "../terminal-watch-service";
 
 const now = "2026-01-01T00:00:00.000Z";
 const calls: { method: string; params: Record<string, unknown>; options?: SendRpcOptions }[] = [];
 
 let endAttach: ((result: unknown) => void) | undefined;
+let attachStream: SendRpcOptions["onStream"];
 /** Terminal row status at the moment each session.kill was sent. */
 const killSeenStatus: (string | undefined)[] = [];
 const defaultRpc: typeof deviceConnections.sendRpc = (_deviceId, method, params, options) => {
@@ -22,6 +24,7 @@ const defaultRpc: typeof deviceConnections.sendRpc = (_deviceId, method, params,
 	// attach stays open like a live session; everything else succeeds.
 	if (method === "session.attach")
 		return new Promise((resolve) => {
+			attachStream = options?.onStream;
 			endAttach = resolve;
 		});
 	if (method === "session.kill") {
@@ -77,6 +80,7 @@ beforeEach(() => {
 	killSeenStatus.length = 0;
 	deviceOnline = true;
 	endAttach = undefined;
+	attachStream = undefined;
 	features = ["pty.ready-stream.v1", "session.durable.v1"];
 	sendRpc.mockImplementation(defaultRpc);
 });
@@ -222,6 +226,55 @@ describe("remote terminals backed by executor sessions", () => {
 		expect(row("t-durable")?.exitCode).toBe(7);
 		expect(calls.some((call) => call.method === "session.release")).toBe(false);
 		await until(() => cleanups().length === 0);
+	});
+
+	test("output held behind a gap is persisted before the exit disposes the buffer", async () => {
+		let resumeGap: (() => void) | undefined;
+		const gapHandling = spyOn(terminalWatches, "interruptTextWatchesForGap").mockImplementation(
+			() =>
+				new Promise<void>((resolve) => {
+					resumeGap = resolve;
+				}),
+		);
+		try {
+			insertTerminal("t-durable", { deviceId: "dev-1", executorSessionId: "nf-term-t-durable" });
+			await terminalService.recoverOnStartup();
+			await until(() => attachStream !== undefined);
+			const encode = (text: string) => new TextEncoder().encode(text);
+			attachStream?.("session.gap", encode(JSON.stringify({ from: 0, to: 40 })));
+			attachStream?.("session.data", encode("AFTER_THE_GAP\r\n"));
+			endAttach?.({ exitCode: 0, endSeq: 55 });
+			// The exit waits for gap handling instead of dropping the held output.
+			await Bun.sleep(30);
+			expect(row("t-durable")?.status).toBe("running");
+			resumeGap?.();
+			await until(() => row("t-durable")?.status === "exited");
+			const saved = new BufferManager("t-durable");
+			expect(await saved.loadFromDisk()).toBe(true);
+			expect(await saved.getContents()).toContain("AFTER_THE_GAP");
+			expect(saved.restoredStreamSeq).toBe(55);
+			await saved.dispose();
+		} finally {
+			gapHandling.mockRestore();
+		}
+	});
+
+	test("a closing terminal records its stop before the row is marked exited", async () => {
+		insertTerminal("t-durable", { deviceId: "dev-1", executorSessionId: "nf-term-t-durable" });
+		await terminalService.recoverOnStartup();
+		deviceOnline = false;
+		const pendingAtExit: number[] = [];
+		const onExited = () => {
+			pendingAtExit.push(cleanups().length);
+		};
+		eventBus.on("terminal:exited", onExited);
+		try {
+			await terminalService.kill("t-durable");
+		} finally {
+			eventBus.off("terminal:exited", onExited);
+		}
+		// An interruption right after the row turned exited still leaves the stop behind.
+		expect(pendingAtExit).toEqual([1]);
 	});
 
 	test("a legacy remote terminal (pty.open) is still marked exited on startup", async () => {

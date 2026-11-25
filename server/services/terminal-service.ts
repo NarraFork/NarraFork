@@ -209,19 +209,28 @@ async function markTerminalExited(
  * being matched against output before it.
  */
 const heldOutput = new Map<string, Array<[string, number | undefined]>>();
+/** Settles once a gap's held output has been written back to the buffer. */
+const gapDrains = new Map<string, Promise<void>>();
 
 function onGap(id: string, buffer: BufferManager, missingBytes: number) {
 	if (heldOutput.has(id)) return;
 	const held: Array<[string, number | undefined]> = [];
 	heldOutput.set(id, held);
-	void interruptTextWatchesForGap(id, buffer, missingBytes)
+	const drained = interruptTextWatchesForGap(id, buffer, missingBytes)
 		.catch((error) =>
 			logger.warn("Terminal watch gap handling failed", { terminalId: id, error: String(error) }),
 		)
 		.finally(() => {
 			heldOutput.delete(id);
+			if (gapDrains.get(id) === drained) gapDrains.delete(id);
 			for (const [text, streamSeq] of held) onData(id, buffer, text, streamSeq);
 		});
+	gapDrains.set(id, drained);
+}
+
+/** Wait until no output is held for a gap, so the buffer holds everything received. */
+async function drainHeldOutput(id: string): Promise<void> {
+	for (let drained = gapDrains.get(id); drained; drained = gapDrains.get(id)) await drained;
 }
 
 /**
@@ -323,6 +332,9 @@ function monitorShellExit(terminalId: string, runtime: TerminalRuntime, narrator
 	runtime.exited.then(async (code) => {
 		const active = activeTerminals.get(terminalId);
 		if (!active || active.runtime !== runtime) return;
+		// Output held behind a gap arrived before the exit; persist it with the buffer.
+		await drainHeldOutput(terminalId);
+		if (activeTerminals.get(terminalId) !== active) return;
 		await active.buffer.dispose();
 		activeTerminals.delete(terminalId);
 		runtime.close();
@@ -883,7 +895,13 @@ export const terminalService = {
 
 	async kill(terminalId: string) {
 		const terminal = await this.getById(terminalId);
+		// The stop intent is durable before anything is torn down or marked exited, so an
+		// interrupted close can never leave an exited row whose shell nobody will stop.
+		if (terminal.deviceId && terminal.executorSessionId)
+			await recordExecutorCleanup(terminal.deviceId, terminal.executorSessionId);
 		const active = activeTerminals.get(terminalId);
+		// The buffer is being deleted; output held behind a gap has nowhere to go.
+		heldOutput.get(terminalId)?.splice(0);
 		if (active) {
 			await active.buffer.dispose(true);
 			if (active.useDtach) {
@@ -905,7 +923,6 @@ export const terminalService = {
 		}
 
 		await markTerminalExited(terminalId, -1, terminal.narratorId);
-		// Persisted before returning, so the stop survives an offline device and a restart.
 		if (terminal.deviceId && terminal.executorSessionId)
 			await stopExecutorSession(terminal.deviceId, terminal.executorSessionId);
 
