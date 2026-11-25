@@ -206,6 +206,17 @@ describe("remote background Bash on durable executor sessions", () => {
 		await until(() => cleanups().length === 0);
 	});
 
+	test("a held narrator's protected command is still re-attached", async () => {
+		await runningTask("bash_held");
+		expect(await backgroundTaskService.recoverStaleTasksAfterRestart(new Set(["bash_held"]))).toBe(
+			1,
+		);
+		await until(() => attach !== undefined);
+		expect(row("bash_held")?.status).toBe("running");
+		attach?.end({ exitCode: 0, endSeq: 0 });
+		await until(() => row("bash_held")?.status === "completed");
+	});
+
 	test("a session the executor no longer has fails the task with the reason", async () => {
 		await runningTask("bash_lost", "service");
 		attachFailure = new Error("session not found");

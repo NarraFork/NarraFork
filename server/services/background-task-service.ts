@@ -4547,9 +4547,10 @@ class BackgroundTaskService {
 		// file instead of the generic "outcome unknown".
 		const settledServices = new Set<string>();
 		// A remote command in a durable executor session is still the executor's: re-attach
-		// to it (whatever its kind) instead of reporting its outcome unknown.
+		// to it (whatever its kind) instead of reporting its outcome unknown. A held narrator's
+		// protection does not apply: re-attaching observes a started command, it never runs it.
 		for (const task of scanned) {
-			if (task.type !== "bash" || protectedTaskIds.has(task.id)) continue;
+			if (task.type !== "bash") continue;
 			const row = await this.getById(task.id);
 			if (row?.status !== "running" || !row.executorSessionJson) continue;
 			await this.recoverExecutorSessionTask(task, row.executorSessionJson);
