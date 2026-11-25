@@ -11,8 +11,11 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useMemo } from "react";
 import { api } from "../lib/api";
 
-import { getToken } from "../lib/api/client";
-import { useUserPreferences } from "./useUserPreferences";
+import {
+	isUserPreferencesScopeCurrent,
+	userPreferencesQueryKey,
+	useUserPreferences,
+} from "./useUserPreferences";
 
 type Preferences = Awaited<ReturnType<typeof api.getUIPreferences>>;
 const EMPTY: ReadonlySet<string> = new Set();
@@ -30,12 +33,23 @@ export function usePluginOverlayVisibility(options: { enabled?: boolean } = {}) 
 	);
 
 	const mutation = useMutation({
-		mutationFn: ({ pluginId, hidden: nextHidden }: { pluginId: string; hidden: boolean }) =>
-			api.setPluginOverlayHidden(pluginId, nextHidden),
-		onMutate: async ({ pluginId, hidden: nextHidden }) => {
-			const token = getToken();
+		mutationFn: ({
+			pluginId,
+			hidden: nextHidden,
+			queryKey,
+		}: {
+			pluginId: string;
+			hidden: boolean;
+			queryKey: ReturnType<typeof userPreferencesQueryKey>;
+		}) => {
+			if (!isUserPreferencesScopeCurrent(queryKey))
+				throw new DOMException("Session changed", "AbortError");
+			return api.setPluginOverlayHidden(pluginId, nextHidden);
+		},
+		onMutate: async ({ pluginId, hidden: nextHidden, queryKey }) => {
 			await queryClient.cancelQueries({ queryKey });
-			if (getToken() !== token) throw new Error("Session changed");
+			if (!isUserPreferencesScopeCurrent(queryKey))
+				throw new DOMException("Session changed", "AbortError");
 			const previous = queryClient.getQueryData<Preferences>(queryKey);
 			// Optimistic: hiding must take effect on click, not after a round trip, or a
 			// covering overlay keeps blocking the app while the request is in flight.
@@ -47,16 +61,20 @@ export function usePluginOverlayVisibility(options: { enabled?: boolean } = {}) 
 					hiddenPluginOverlays: nextHidden ? [pluginId, ...others] : others,
 				});
 			}
-			return { previous, queryKey, token };
+			return { previous };
 		},
-		onError: (_error, _variables, context) => {
-			if (context?.previous && getToken() === context.token)
-				queryClient.setQueryData(context.queryKey, context.previous);
+		onError: (_error, { queryKey }, context) => {
+			if (context?.previous && isUserPreferencesScopeCurrent(queryKey))
+				queryClient.setQueryData(queryKey, context.previous);
 		},
-		onSuccess: (result, _variables, context) => {
-			if (!context || getToken() !== context.token) return;
-			const queryKey = context.queryKey;
-			void queryClient.invalidateQueries({ queryKey: ["user-preferences", "detail"] });
+		onSuccess: (result, { queryKey }) => {
+			if (!isUserPreferencesScopeCurrent(queryKey)) return;
+			void queryClient.invalidateQueries({
+				queryKey: userPreferencesQueryKey("detail", {
+					userId: queryKey[2],
+					generation: queryKey[3],
+				}),
+			});
 			const latest = queryClient.getQueryData<Preferences>(queryKey);
 			if (latest) {
 				queryClient.setQueryData<Preferences>(queryKey, {
@@ -69,8 +87,8 @@ export function usePluginOverlayVisibility(options: { enabled?: boolean } = {}) 
 
 	const { mutate } = mutation;
 	const setHidden = useCallback(
-		(pluginId: string, nextHidden: boolean) => mutate({ pluginId, hidden: nextHidden }),
-		[mutate],
+		(pluginId: string, nextHidden: boolean) => mutate({ pluginId, hidden: nextHidden, queryKey }),
+		[mutate, queryKey],
 	);
 
 	return {

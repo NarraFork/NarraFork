@@ -8,7 +8,9 @@ import {
 	moveDrag,
 	onPanelDragEnd,
 	onPanelDragMove,
+	PANEL_DROP_PRIORITY,
 	type PanelDragState,
+	registerPanelDropTarget,
 	startDetachedPanelDrag,
 	startDragManual,
 	startPanelDrag,
@@ -85,6 +87,181 @@ describe("isNarratorSubject", () => {
 	});
 });
 
+describe("single-consumer drop arbitration", () => {
+	const subscriptions: (() => void)[] = [];
+	afterEach(() => {
+		for (const off of subscriptions.splice(0)) off();
+		cancelDrag();
+	});
+
+	test("exports the shared priority contract", () => {
+		expect(PANEL_DROP_PRIORITY).toEqual({
+			sidebar: 400,
+			composer: 300,
+			topology: 200,
+			dock: 100,
+			page: 0,
+		});
+	});
+
+	test.each([
+		"sidebar",
+		"composer",
+		"topology",
+		"dock",
+		"page",
+	] as const)("%s wins independently of listener registration order, with typed final hit data", (winner) => {
+		const drops: string[] = [];
+		const tested: string[] = [];
+		for (const [id, priority] of Object.entries(PANEL_DROP_PRIORITY).reverse()) {
+			subscriptions.push(
+				registerPanelDropTarget({
+					id,
+					priority,
+					hitTest: (state) => {
+						expect(getPanelDrag()).toBeNull();
+						tested.push(id);
+						return priority <= PANEL_DROP_PRIORITY[winner] ? { x: state.x, id } : null;
+					},
+					onDrop: (state, hit) => drops.push(`${hit.id}:${state.id}:${hit.x}`),
+				}),
+			);
+		}
+		subscriptions.push(onPanelDragEnd(() => drops.push("cleanup")));
+		startDragManual("narrator", "Title", 10, 20);
+		moveDrag(80, 90);
+		endDrag();
+		endDrag();
+		expect(drops).toEqual([`${winner}:narrator:80`, "cleanup"]);
+		expect(tested.at(-1)).toBe(winner);
+	});
+
+	test.each([false, 0, ""])("a non-null falsy hit (%j) still consumes the drop", (hit) => {
+		const received: unknown[] = [];
+		subscriptions.push(
+			registerPanelDropTarget({
+				id: "primary",
+				priority: 1,
+				hitTest: () => hit,
+				onDrop: (_state, resolved) => received.push(resolved),
+			}),
+			registerPanelDropTarget({
+				id: "fallback",
+				priority: 0,
+				hitTest: () => true,
+				onDrop: () => received.push("wrong"),
+			}),
+		);
+		startDragManual("n", "N", 0, 0);
+		endDrag();
+		expect(received).toEqual([hit]);
+	});
+
+	test.each([false, true])("same-priority ids are stable, reverse registration=%s", (reverse) => {
+		const drops: string[] = [];
+		for (const id of reverse ? ["z", "a"] : ["a", "z"]) {
+			subscriptions.push(
+				registerPanelDropTarget({
+					id,
+					priority: PANEL_DROP_PRIORITY.dock,
+					hitTest: () => true,
+					onDrop: () => drops.push(id),
+				}),
+			);
+		}
+		startDragManual("n", "N", 0, 0);
+		endDrag();
+		expect(drops).toEqual(["a"]);
+	});
+
+	test.each([
+		"refused",
+		"drop throws",
+		"hit-test throws",
+	])("%s never falls through and always cleans up", (mode) => {
+		const calls: string[] = [];
+		subscriptions.push(
+			registerPanelDropTarget({
+				id: "composer",
+				priority: PANEL_DROP_PRIORITY.composer,
+				hitTest: () => {
+					if (mode === "hit-test throws") throw new Error("hit-test failed");
+					return { allowed: false };
+				},
+				onDrop: (_state, hit) => {
+					expect(hit.allowed).toBe(false);
+					calls.push("refused");
+					if (mode === "drop throws") throw new Error("drop failed");
+				},
+			}),
+			registerPanelDropTarget({
+				id: "page",
+				priority: PANEL_DROP_PRIORITY.page,
+				hitTest: () => {
+					calls.push("fallback hit-test");
+					return true;
+				},
+				onDrop: () => calls.push("workspace created"),
+			}),
+			onPanelDragEnd(() => calls.push("cleanup")),
+		);
+		startDragManual("n", "N", 0, 0);
+		if (mode === "refused") endDrag();
+		else expect(endDrag).toThrow(mode === "drop throws" ? "drop failed" : "hit-test failed");
+		expect(calls).toEqual(mode === "hit-test throws" ? ["cleanup"] : ["refused", "cleanup"]);
+		expect(getPanelDrag()).toBeNull();
+	});
+
+	test("unsubscription and replacement cleanup do not remove the current target", () => {
+		const calls: string[] = [];
+		const offOld = registerPanelDropTarget({
+			id: "stable",
+			priority: 1,
+			hitTest: () => true,
+			onDrop: () => calls.push("old"),
+		});
+		const offNew = registerPanelDropTarget({
+			id: "stable",
+			priority: 1,
+			hitTest: () => true,
+			onDrop: () => calls.push("new"),
+		});
+		subscriptions.push(offOld, offNew);
+		offOld();
+		startDragManual("n", "N", 0, 0);
+		endDrag();
+		offNew();
+		startDragManual("n", "N", 0, 0);
+		endDrag();
+		expect(calls).toEqual(["new"]);
+	});
+
+	test("cancellation does not hit-test or drop; recursive/repeated releases cannot double-drop", () => {
+		const calls: string[] = [];
+		subscriptions.push(
+			registerPanelDropTarget({
+				id: "only",
+				priority: 1,
+				hitTest: () => {
+					calls.push("hit");
+					return true;
+				},
+				onDrop: () => {
+					calls.push("drop");
+					endDrag();
+				},
+			}),
+		);
+		startDragManual("n", "N", 0, 0);
+		cancelDrag();
+		expect(calls).toEqual([]);
+		startDragManual("n", "N", 0, 0);
+		endDrag();
+		endDrag();
+		expect(calls).toEqual(["hit", "drop"]);
+	});
+});
+
 describe("manual drag completion", () => {
 	const ends: Array<PanelDragState | null> = [];
 	let offEnd: () => void;
@@ -100,6 +277,31 @@ describe("manual drag completion", () => {
 	afterEach(() => {
 		offEnd();
 		cancelDrag();
+	});
+
+	test.each([
+		undefined,
+		"narrator",
+		"tool",
+	] as const)("manual classification %j survives moves and reaches the release consumer", (subjectKind) => {
+		const received: PanelDragState[] = [];
+		const off = registerPanelDropTarget({
+			id: "typed-consumer",
+			priority: PANEL_DROP_PRIORITY.composer,
+			hitTest: (state) => state,
+			onDrop: (_state, hit) => received.push(hit),
+		});
+		try {
+			startDragManual("subject", "Subject", 10, 20, subjectKind);
+			expect(getPanelDrag()?.subjectKind).toBe(subjectKind);
+			moveDrag(30, 40);
+			endDrag();
+			expect(received).toEqual([
+				{ id: "subject", title: "Subject", x: 30, y: 40, ...(subjectKind ? { subjectKind } : {}) },
+			]);
+		} finally {
+			off();
+		}
 	});
 
 	test("cancellation sends null rather than committing the final state", () => {
@@ -177,6 +379,36 @@ describe("startPanelDrag subject classification", () => {
 			expect(getPanelDrag()).toBeNull();
 		} finally {
 			offEnd();
+			cancelDrag();
+		}
+	});
+
+	test("pointer release uses the same arbiter and final coordinates without a final move", () => {
+		const calls: string[] = [];
+		const offComposer = registerPanelDropTarget({
+			id: "composer",
+			priority: PANEL_DROP_PRIORITY.composer,
+			hitTest: (state) => (state.x > 500 ? { x: state.x } : null),
+			onDrop: (_state, hit) => calls.push(`reference:${hit.x}`),
+		});
+		const offDock = registerPanelDropTarget({
+			id: "dock",
+			priority: PANEL_DROP_PRIORITY.dock,
+			hitTest: () => true,
+			onDrop: () => calls.push("split"),
+		});
+		try {
+			startPanelDrag({ panelId: "p1", id: "narr_1", title: "T", x: 0, y: 0 });
+			dispatch("pointermove", 40, 20);
+			dispatch("pointerup", 900, 700);
+			dispatch("pointerup", 900, 700);
+			expect(calls).toEqual(["reference:900"]);
+			expect(getPanelDrag()).toBeNull();
+			expect(document.body.style.cursor).toBe("");
+			for (const listeners of handlers.values()) expect(listeners.size).toBe(0);
+		} finally {
+			offComposer();
+			offDock();
 			cancelDrag();
 		}
 	});

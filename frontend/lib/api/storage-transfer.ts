@@ -6,8 +6,9 @@
  * 用户确认冲突策略后再按预览 token 执行；清空需要携带当前登录用户密码。
  */
 
+import type { CommunicationImportReport } from "@shared/narrator-communication";
 import { MAX_IMPORT_BYTES, MAX_IMPORT_LABEL } from "@shared/storage-transfer";
-import { ApiError, apiBase, getToken, readFetchError } from "./client";
+import { ApiError, apiBase, getAuthSnapshot, getToken, readFetchError } from "./client";
 
 /** 鉴权头（与其他 API 模块一致：Bearer + localStorage 令牌）。 */
 function authHeaders(): Record<string, string> {
@@ -51,6 +52,8 @@ export interface ImportResult {
 	/** Provider keys restored from the sealed file; absent from older servers. */
 	keysImported?: number;
 	keysFailed?: number;
+	/** Absent on older servers; skipped links must be made visible to the importer. */
+	communication?: CommunicationImportReport;
 }
 
 /**
@@ -91,8 +94,12 @@ async function errorText(response: Response): Promise<string> {
 	}
 }
 
-async function throwApiError(response: Response, fallback: string): Promise<never> {
-	const { message, data } = await readFetchError(response, fallback);
+async function throwApiError(
+	response: Response,
+	fallback: string,
+	generation: number,
+): Promise<never> {
+	const { message, data } = await readFetchError(response, fallback, generation);
 	throw new ApiError(message, response.status, data);
 }
 
@@ -177,6 +184,7 @@ async function streamAuthorizedExport(
 	fetchImpl: (input: string, init?: RequestInit) => Promise<Response>,
 	auth?: ProvidersExportAuth,
 ): Promise<void> {
+	const { generation } = getAuthSnapshot();
 	let response: Response;
 	try {
 		// With providers the grant and passphrase go in a POST body, never in the URL.
@@ -195,7 +203,7 @@ async function streamAuthorizedExport(
 	}
 	if (!response.ok) {
 		await writable.abort().catch(() => {});
-		await throwApiError(response, "Export failed");
+		await throwApiError(response, "Export failed", generation);
 	}
 	if (!response.body) {
 		await writable.abort().catch(() => {});
@@ -211,12 +219,13 @@ async function saveExportWithTicket(
 	open: (url: string, filename: string) => void,
 	auth?: ProvidersExportAuth,
 ): Promise<void> {
+	const { generation } = getAuthSnapshot();
 	const response = await fetchImpl(`${apiBase()}/storage/export/ticket`, {
 		method: "POST",
 		headers: { ...authHeaders(), "Content-Type": "application/json" },
 		body: JSON.stringify({ ...selection, ...(auth ?? {}) }),
 	});
-	if (!response.ok) await throwApiError(response, "Export failed");
+	if (!response.ok) await throwApiError(response, "Export failed", generation);
 	const body = (await response.json()) as { ticket?: unknown };
 	if (typeof body.ticket !== "string" || body.ticket.length === 0) {
 		throw new ApiError("Export failed", 500);
@@ -303,6 +312,7 @@ export const storageTransferApi = {
 		/** Opens sealed provider keys; needed when the preview reported them and providers are imported. */
 		passphrase?: string,
 	): Promise<ImportResult> {
+		const { generation } = getAuthSnapshot();
 		const response = await fetch(`${apiBase()}/storage/import`, {
 			method: "POST",
 			headers: { ...authHeaders(), "Content-Type": "application/json" },
@@ -315,7 +325,7 @@ export const storageTransferApi = {
 			}),
 		});
 		// Keep the error code: a wrong passphrase must be told apart from other failures.
-		if (!response.ok) await throwApiError(response, "Import failed");
+		if (!response.ok) await throwApiError(response, "Import failed", generation);
 		return (await response.json()) as ImportResult;
 	},
 

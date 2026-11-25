@@ -30,7 +30,9 @@ const { act } = await import("react");
 const { createRoot } = await import("react-dom/client");
 const { QueryClient, QueryClientProvider } = await import("@tanstack/react-query");
 const { api } = await import("../../../lib/api");
-const { setToken, clearToken } = await import("../../../lib/api/client");
+const { setToken, clearToken, confirmAuthUser, getAuthSnapshot } = await import(
+	"../../../lib/api/client"
+);
 const { useSpecTabLayout } = await import("./useSpecTabLayout");
 
 let client: InstanceType<typeof QueryClient>;
@@ -59,16 +61,18 @@ async function render() {
 }
 function deferred<T>() {
 	let resolve!: (value: T) => void;
-	const promise = new Promise<T>((yes) => {
+	let reject!: (error: Error) => void;
+	const promise = new Promise<T>((yes, no) => {
 		resolve = yes;
+		reject = no;
 	});
-	return { promise, resolve };
+	return { promise, resolve, reject };
 }
 beforeEach(() => {
 	setToken("spec-user-a");
 	narratorId = "n-a";
 	client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-	client.setQueryData(["auth", "me"], { id: "user-a" });
+	spyOn(api, "me").mockRejectedValue(new Error("No profile needed for layout"));
 	root = createRoot(document.createElement("div"));
 	spyOn(api, "getUserPreferences").mockRejectedValue(new Error("No full preferences"));
 	spyOn(api, "getUIPreferences").mockRejectedValue(new Error("No UI preferences for layout"));
@@ -101,6 +105,17 @@ test("reads only the current narrator and reuses its fresh point cache", async (
 	narratorId = "n-a";
 	await render();
 	expect(api.getSpecTabLayout).toHaveBeenCalledTimes(2);
+	const authGeneration = getAuthSnapshot().generation;
+	expect(
+		client.getQueryData(["user-preferences", "spec-tab-layout", authGeneration, "n-a"]),
+	).toEqual({
+		order: ["n-a.md"],
+		pinned: [],
+	});
+	await act(async () => confirmAuthUser(authGeneration, "user-a"));
+	await settle();
+	expect(api.getSpecTabLayout).toHaveBeenCalledTimes(2);
+	expect(api.me).not.toHaveBeenCalled();
 	expect(api.getUserPreferences).not.toHaveBeenCalled();
 	expect(api.getUIPreferences).not.toHaveBeenCalled();
 });
@@ -120,17 +135,27 @@ test("does not let an event GET overwrite a newer local gesture", async () => {
 	expect(view.layout.order).toEqual(["local.md"]);
 });
 
-test("isolates current layout after an account token changes", async () => {
+test("isolates current layout and drops old rollback after A→B→A", async () => {
 	await render();
+	const generation = getAuthSnapshot().generation;
+	const oldKey = ["user-preferences", "spec-tab-layout", generation, narratorId];
+	const saving = deferred<{ ok: boolean }>();
+	const saveApi = spyOn(api, "saveSpecTabLayout").mockReturnValue(saving.promise);
+	await act(async () => view.save(() => ({ order: ["old-local.md"], pinned: [] })));
+	const signal = saveApi.mock.calls.at(-1)?.[2]?.signal;
 	const next = deferred<{ order: string[]; pinned: string[] }>();
 	spyOn(api, "getSpecTabLayout").mockReturnValue(next.promise);
 	await act(async () => {
 		setToken("spec-user-b");
-		client.setQueryData(["auth", "me"], { id: "user-b" });
+		setToken("spec-user-a");
 	});
-	await render();
-	expect(view.layout.order).toEqual([]);
-	next.resolve({ order: ["user-b.md"], pinned: [] });
 	await settle();
-	expect(view.layout.order).toEqual(["user-b.md"]);
+	expect(getAuthSnapshot().generation).toBeGreaterThan(generation);
+	expect(signal?.aborted).toBe(true);
+	expect(view.layout.order).toEqual([]);
+	next.resolve({ order: ["current.md"], pinned: [] });
+	saving.reject(new Error("Old write failed"));
+	await settle();
+	expect(view.layout.order).toEqual(["current.md"]);
+	expect(client.getQueryData(oldKey)).toEqual({ order: ["old-local.md"], pinned: [] });
 });

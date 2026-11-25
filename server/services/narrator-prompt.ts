@@ -91,6 +91,10 @@ export interface BuildPromptOptions {
 	modeContext?: string;
 	/** Current tool availability and ongoing-run hints, not persistent history events. */
 	runtimeHints?: string;
+	/** Re-read current Send reachability at each model-request preparation boundary. */
+	communicationSourceNarratorId?: string;
+	/** The request's cancellation budget, also passed to the bounded communication reader. */
+	communicationSignal?: AbortSignal;
 	/**
 	 * The task instructions to carry (`taskSectionFor`); default `spec`, so a caller that does not
 	 * know the session's task backend builds exactly the prompt it always did.
@@ -153,6 +157,68 @@ async function statPlanFileBytes(cwd: string, planFilePath?: string): Promise<nu
 		const code = (error as NodeJS.ErrnoException).code;
 		if (code === "ENOENT" || code === "ENOTDIR") return undefined;
 		throw error;
+	}
+}
+
+const COMMUNICATION_CONTEXT_LIMIT = 50;
+const COMMUNICATION_CONTEXT_BYTES = 24 * 1024;
+
+/** A fresh, bounded hint — never an ACL grant or a complete target resolver. */
+async function buildCommunicationContext(
+	sourceNarratorId: string,
+	locale: Locale,
+	signal?: AbortSignal,
+): Promise<string> {
+	const isZh = locale === "zh-CN";
+	const heading = "## Communication Targets";
+	const rules = isZh
+		? "普通 Send 可发给当前同通讯组的所有层级会话，或与你精确连接的 peer；联系不传递，也不授予控制或读取历史权限。parent/main 仍指委派者，断开后不能用普通消息绕过。下面只是本次请求的有界快照，发送时重新鉴权；名称或 alias 有歧义时必须使用完整 ID。ContextAsk、Stop、TeamStatus 与中断/恢复/换模型仍按各自原有授权。连接或断开本身不唤醒对端、不转发用户消息；来信不会改变收件会话的执行身份。"
+		: "Ordinary Send reaches every delegation level in your current communication group, plus your exact connected peers. Peers are not transitive and grant no control or history access. parent/main still name your delegator and cannot bypass a disconnection. This is a bounded snapshot for this request, not authorization; Send rechecks current access. Use full IDs when a title or alias is ambiguous. ContextAsk, Stop, TeamStatus and interrupt/resume/model retain their separate existing authorization. Connecting or disconnecting alone neither wakes the other session nor forwards a user message. Incoming messages never change the recipient's execution identity.";
+	try {
+		signal?.throwIfAborted();
+		const { listCommunicationTargets } = await import("./narrator-communication");
+		const targets = await listCommunicationTargets(sourceNarratorId, {
+			limit: COMMUNICATION_CONTEXT_LIMIT + 1,
+			signal,
+		});
+		signal?.throwIfAborted();
+		const lines: string[] = [];
+		let bytes = 0;
+		let truncated = targets.length > COMMUNICATION_CONTEXT_LIMIT;
+		for (const target of targets.slice(0, COMMUNICATION_CONTEXT_LIMIT)) {
+			// JSON strings keep mutable names/statuses as metadata, not prompt markup.
+			const line = JSON.stringify({
+				id: target.id,
+				title: target.title?.slice(0, 160) ?? null,
+				handle: target.handle?.slice(0, 64) ?? null,
+				status: target.status.slice(0, 64),
+			});
+			const size = Buffer.byteLength(line, "utf8") + 1;
+			if (bytes + size > COMMUNICATION_CONTEXT_BYTES) {
+				truncated = true;
+				break;
+			}
+			bytes += size;
+			lines.push(line);
+		}
+		const tail = truncated
+			? isZh
+				? "名单已截断；未显示不代表不可达。已知目标请使用完整 narrator ID，不能从截断名单推断名称唯一。"
+				: "List truncated; an omitted target may still be reachable. Use its full narrator ID; a truncated list cannot prove a name unique."
+			: lines.length === 0
+				? isZh
+					? "当前没有可列出的通讯目标。"
+					: "No communication targets are currently listed."
+				: "";
+		return [heading, rules, ...lines, tail].filter(Boolean).join("\n\n");
+	} catch {
+		signal?.throwIfAborted();
+		// Replace, rather than preserve, a stale list after an ACL/read failure.
+		return `${heading}\n\n${rules}\n\n${
+			isZh
+				? "当前通讯名单读取失败；不要依赖先前快照，已知完整 ID 的发送仍会独立复核授权。"
+				: "Current communication targets are unavailable. Do not rely on an earlier snapshot; a known full ID is independently authorized when sending."
+		}`;
 	}
 }
 
@@ -405,6 +471,16 @@ export async function buildEffectiveSystemPrompt(
 	if (options.skillsContext !== undefined) appendPart("skills", options.skillsContext);
 	if (options.modelsContext !== undefined) appendPart("models", options.modelsContext);
 	if (options.runtimeHints !== undefined) appendPart("runtime", options.runtimeHints);
+	if (options.communicationSourceNarratorId) {
+		appendPart(
+			"communication",
+			await buildCommunicationContext(
+				options.communicationSourceNarratorId,
+				locale,
+				options.communicationSignal,
+			),
+		);
+	}
 	const keepParts: string[] = [];
 	const displays: Record<string, unknown> = {};
 	for (const part of options.contextParts ?? []) {

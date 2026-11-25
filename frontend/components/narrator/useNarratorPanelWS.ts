@@ -21,7 +21,7 @@ import { invalidateGitStatusPushQueries } from "../../hooks/useGit";
 import { type NarratorWarningInfo, useNarratorWS } from "../../hooks/useNarratorWS";
 import { useNarratorPermissionsCapability } from "../../hooks/usePlatform";
 import { ApiError, api, type BufferMessageSummary } from "../../lib/api";
-import { getToken, onTokenChange } from "../../lib/api/client";
+import { getAuthSnapshot, subscribeAuth } from "../../lib/api/client";
 import { createNarratorPanelReadScope, type NarratorPanelReadScope } from "../../lib/api/narrators";
 import { formatFullLocaleDateTime } from "../../lib/format";
 import {
@@ -381,8 +381,12 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	const { t, i18n } = useTranslation("narrator");
 	const qc = useQueryClient();
 	const { data: currentUser } = useCurrentUser();
-	const token = useSyncExternalStore(onTokenChange, getToken, () => null);
-	const panelScope = JSON.stringify([token, currentUser?.id ?? null, narratorId]);
+	const { generation: authGeneration } = useSyncExternalStore(
+		subscribeAuth,
+		getAuthSnapshot,
+		getAuthSnapshot,
+	);
+	const panelScope = JSON.stringify([authGeneration, currentUser?.id ?? null, narratorId]);
 	// Each mount owns its own pool, even when another panel reads the same narrator.
 	// biome-ignore lint/correctness/useExhaustiveDependencies: identity changes retire the scope.
 	const readScope = useMemo(() => createNarratorPanelReadScope(), [panelScope]);
@@ -675,7 +679,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		narratorId,
 		quotaProviderKey,
 		nugProviderGeneration,
-		token,
+		authGeneration,
 		initialQuotaBalance,
 		initialDetailedQuotaBalance,
 	]);
@@ -1386,9 +1390,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				});
 			},
 			onQuotaBalance: (balance, detailedBalance) => {
-				// The callback owns its render/subscription identity, not whichever token
-				// happens to be current when an old socket frame finally arrives.
-				if (getToken() !== token) return;
+				// The callback owns its render/subscription generation, not whichever
+				// generation is current when an old socket frame finally arrives.
+				if (getAuthSnapshot().generation !== authGeneration) return;
 				const connectionIdentity = narratorWSManager.getConnectionCredentialIdentity();
 				if (
 					connectionIdentity !== undefined &&
@@ -1399,7 +1403,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					void invalidateNugQuotaForIdentity(qc, {
 						providerId: nugProviderId,
 						generation: nugProviderGeneration,
-						token,
+						authGeneration,
 					});
 				setQuotaBalance(balance);
 				setDetailedQuotaBalance(detailedBalance ?? null);
@@ -1771,7 +1775,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		(fresh = false) => {
 			// Principal hydration owns this boundary; do not read once anonymously and
 			// repeat the entire snapshot when auth/me supplies the actual owner.
-			if (!currentUser?.id || getToken() !== token) return Promise.resolve();
+			if (!currentUser?.id || getAuthSnapshot().generation !== authGeneration)
+				return Promise.resolve();
 			if (!fresh && activeReconcileRef.current) return activeReconcileRef.current.promise;
 			reconcileRestartSchedulerRef.current?.cancel();
 			if (fresh) activeReconcileRef.current?.controller.abort();
@@ -1784,7 +1789,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			const lifecycle = permissionLifecycleRef.current;
 			const bufferEpoch = bufferEpochRef.current;
 			const isCurrent = () =>
-				getToken() === token &&
+				getAuthSnapshot().generation === authGeneration &&
 				permissionLifecycleRef.current === lifecycle &&
 				(qc.getQueryData<{ id?: string }>(["auth", "me"])?.id ?? null) ===
 					(currentUser?.id ?? null);
@@ -1857,7 +1862,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			activeReconcileRef.current = { controller, promise, generation, lifecycle, bufferEpoch };
 			return promise;
 		},
-		[narratorId, replacePendingPermissions, qc, currentUser?.id, token, readScope],
+		[narratorId, replacePendingPermissions, qc, currentUser?.id, authGeneration, readScope],
 	);
 	reconcilePanelStateRef.current = reconcilePanelState;
 	requestPanelReconcileRef.current = () => {

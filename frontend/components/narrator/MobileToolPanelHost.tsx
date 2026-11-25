@@ -20,6 +20,7 @@
  */
 
 import { Box, Center, Drawer, Loader, Text } from "@mantine/core";
+import { useNavigate } from "@tanstack/react-router";
 import { lazy, Suspense } from "react";
 import { useTranslation } from "react-i18next";
 import { useMobileDrawerHistory } from "../../hooks/useMobileDrawerHistory";
@@ -47,6 +48,11 @@ const FileTreePanel = lazy(() =>
 const NarratorTimelinePanel = lazy(() =>
 	import("./timeline/NarratorTimelinePanel").then((m) => ({ default: m.NarratorTimelinePanel })),
 );
+const CommunicationTopologyPanel = lazy(() =>
+	import("./communication/CommunicationTopologyPanel").then((m) => ({
+		default: m.CommunicationTopologyPanel,
+	})),
+);
 
 /**
  * Tool panels this host can present. A subset of the dock's panel kinds on
@@ -59,7 +65,8 @@ export type MobileToolPanelKind =
 	| "browser"
 	| "userchat"
 	| "filetree"
-	| "timeline";
+	| "timeline"
+	| "communication";
 
 const MOBILE_DRAWER_HEADER_HEIGHT = 45;
 
@@ -95,6 +102,26 @@ function PanelBoundary({ children }: { children: React.ReactNode }) {
 		>
 			{children}
 		</Suspense>
+	);
+}
+
+function CommunicationMobilePanel({
+	narratorId,
+	onClose,
+}: {
+	narratorId: string;
+	onClose: () => void;
+}) {
+	const navigate = useNavigate();
+	return (
+		<CommunicationTopologyPanel
+			key={narratorId}
+			scope={{ kind: "narrator", narratorId }}
+			onOpenNarrator={(id) => {
+				onClose();
+				void navigate({ to: "/narrators/$narratorId", params: { narratorId: id } });
+			}}
+		/>
 	);
 }
 
@@ -150,7 +177,9 @@ export function MobileToolPanelHost({
 							? t("fileTree.title")
 							: kind === "timeline"
 								? t("timeline.title")
-								: "";
+								: kind === "communication"
+									? t("communicationTitle")
+									: "";
 
 	return (
 		<Drawer
@@ -215,6 +244,13 @@ export function MobileToolPanelHost({
 				<Box style={{ height: "100%" }}>
 					<PanelBoundary>
 						<NarratorTimelinePanel narratorId={narratorId} />
+					</PanelBoundary>
+				</Box>
+			) : null}
+			{kind === "communication" ? (
+				<Box style={{ height: "100%", minHeight: 0 }}>
+					<PanelBoundary>
+						<CommunicationMobilePanel narratorId={narratorId} onClose={onClose} />
 					</PanelBoundary>
 				</Box>
 			) : null}

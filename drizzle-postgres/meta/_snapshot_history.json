@@ -648,6 +648,22 @@
 			"prevId": "c9d8eed4-015f-4e6c-9274-610534f33c08",
 			"version": "7",
 			"snapshotDigest": "8748e2df5e280195b6f16925413c3586a2bc211ff10e4797aff075cf9f80ab87"
+		},
+		{
+			"idx": 81,
+			"tag": "0081_subagent-alias-addressable-scope",
+			"id": "ff0d57da-e8d7-48db-88a7-1e3066eaae33",
+			"prevId": "c07b4921-245c-4e69-b29f-01132e3f6156",
+			"version": "7",
+			"snapshotDigest": "e83c4ffd33b7c9b6347b41369135b22413c697523ec468a84144e96005a0a95b"
+		},
+		{
+			"idx": 82,
+			"tag": "0082_communication_topology",
+			"id": "abeafedc-f054-41e8-b9a0-edc89be12b9b",
+			"prevId": "ff0d57da-e8d7-48db-88a7-1e3066eaae33",
+			"version": "7",
+			"snapshotDigest": "5988cdbd02f574a70bd00e258f910cd54341bd2480df10735d1b513262a7f12e"
 		}
 	]
 }

@@ -7,7 +7,9 @@ import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider } from "react-i18next";
+import { userPreferencesQueryKey } from "../../../hooks/useUserPreferences";
 import { api } from "../../../lib/api";
+import { confirmAuthUser, getAuthSnapshot } from "../../../lib/api/client";
 import { editorDocumentApi } from "../../../lib/api/editor-documents";
 import { fileReferenceApi } from "../../../lib/api/file-references";
 import { appearanceStore } from "../../../lib/appearance-preference-store";
@@ -17,7 +19,7 @@ import { filePanelLoadPolicy, filePanelSizeLabel, LargeFileGate } from "./LargeF
 
 const fixtureUser = "large-file-fixture-user";
 const fixtureToken = "large-file-fixture-token";
-const preferencesKey = ["user-preferences", "ui", fixtureUser, fixtureToken] as const;
+const preferencesKey = () => userPreferencesQueryKey("ui");
 const i18n = i18next.createInstance();
 const globals = new Map<string, PropertyDescriptor | undefined>();
 let root: Root;
@@ -71,8 +73,9 @@ beforeEach(async () => {
 	storage.set("narrafork_token", fixtureToken);
 	appearanceStore.activate(null, true);
 	client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
+	confirmAuthUser(getAuthSnapshot().generation, fixtureUser);
 	client.setQueryData(["auth", "me"], { id: fixtureUser });
-	client.setQueryData(preferencesKey, {});
+	client.setQueryData(preferencesKey(), {});
 	readMode = spyOn(editorDocumentApi, "readMode").mockResolvedValue("raw-v2");
 	info = spyOn(fileReferenceApi, "info").mockImplementation(async (_narrator, target) => ({
 		target,
@@ -281,7 +284,7 @@ test("the size prompt copies the path and reveals local files only when access i
 	const reveal = spyOn(api, "fsReveal").mockResolvedValue({ ok: true });
 	try {
 		client.setQueryData(["health"], { platform: "linux" });
-		client.setQueryData(preferencesKey, { treatAsLocalAccess: false });
+		client.setQueryData(preferencesKey(), { treatAsLocalAccess: false });
 		await render({ filePath: "/data/build/app.apk" });
 		expect(host.textContent).not.toContain("Show in File Manager");
 		await click("Copy file path");
@@ -289,7 +292,7 @@ test("the size prompt copies the path and reveals local files only when access i
 
 		await act(async () => root.unmount());
 		root = createRoot(host);
-		client.setQueryData(preferencesKey, { treatAsLocalAccess: true });
+		client.setQueryData(preferencesKey(), { treatAsLocalAccess: true });
 		await render({ filePath: "/data/build/app.apk" });
 		await click("Show in File Manager");
 		expect(reveal).toHaveBeenCalledWith("/data/build");

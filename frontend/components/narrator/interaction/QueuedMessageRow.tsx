@@ -55,6 +55,7 @@ import { composerPreviewText } from "../composer/composer-quotes";
 import { QueuedImageThumb } from "../composer/EditAttachmentChips";
 import { fileReferenceToken } from "../composer/file-reference-input";
 import type { QueueMode } from "../composer/SendOptionsSplitButton";
+import { ComposerNarratorReferences } from "../message/ComposerNarratorReferences";
 import { EditableComposerDocument } from "../message/EditableComposerDocument";
 import { MediaAttachment } from "../message/MediaAttachment";
 import { queuedMessageMode } from "./queue-message-mode";
@@ -461,6 +462,15 @@ export function QueuedMessageRow({
 							files: (msg.textFiles ?? []).map((file) => file.filename),
 						})}
 					</Text>
+					{msg.hasComposerDocument && narratorId && (
+						<ComposerNarratorReferences
+							narratorId={narratorId}
+							messageId={msg.id}
+							hasComposerDocument
+							revision={msg.contentRevision}
+							queued
+						/>
+					)}
 					<QueuedAttachmentPreview
 						narratorId={narratorId}
 						images={msg.images ?? []}

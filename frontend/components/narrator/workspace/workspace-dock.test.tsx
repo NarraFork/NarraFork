@@ -1311,6 +1311,7 @@ describe("real workspace Dockview resource lifecycle", () => {
 			// separately mounts the real ToolPanelShell/header/drag implementation.
 			ToolPanelShell: ({ children }: { children: ReactNode }) => <>{children}</>,
 			BrowserDockPanel: ResourceWrapper,
+			CommunicationDockPanel: ResourceWrapper,
 			DetailsDockPanel: ResourceWrapper,
 			FileTreeDockPanel: ResourceWrapper,
 			FileDockPanel: ResourceWrapper,
@@ -1331,13 +1332,14 @@ describe("real workspace Dockview resource lifecycle", () => {
 		await mountWorkspace(2, { ...workspacePanelComponents, narrator: ResourceWrapper });
 		await change(() => {
 			store.openToolPanel("n0", "terminal");
+			store.openToolPanel("n0", "communication");
 			store.openFilePanel("n0", "/repo/a.ts");
 			store.openSubagentPanel("n0", "child");
 			store.openKnowledgePanel("n0", "entry");
 			openPlugin("n0");
 		});
 		const resources = api.panels.filter((panel) => store.isTemporary(panel.id));
-		expect(resources).toHaveLength(5);
+		expect(resources).toHaveLength(6);
 		const nodes = new Map(resources.map((panel) => [panel.id, content(panel.id)]));
 		await change(() => store.setDirectorActive(true));
 		for (const panel of resources) {

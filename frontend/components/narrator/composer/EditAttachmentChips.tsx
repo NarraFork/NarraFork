@@ -48,7 +48,7 @@ function useUploadedImageBlobUrl(
 		authorizedFetch(getUploadedImageUrl(uploadNarratorId, imageId, contextNarratorId), { signal })
 			.then(async (res) => {
 				if (!res.ok) {
-					await clearTokenOnSessionFailure(res.clone());
+					await clearTokenOnSessionFailure(res);
 					return null;
 				}
 				return readBoundedBlob(

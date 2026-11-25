@@ -169,6 +169,27 @@ function seed(shape: Shape) {
 	callerCall(OTHER, "other-origin", "other-origin-row");
 }
 
+async function seedSendContact(shape: Shape) {
+	const { ensureCommunicationNodeTx, grantFixtureNarratorWrite, seedFixtureCommunicationPeer } =
+		await import("./runtime-communication-fixtures");
+	const { users } = await import("../../db/schema");
+	const userId = "sender-user";
+	db.transaction((tx) => {
+		tx.insert(users)
+			.values({ id: userId, username: userId, passwordHash: "test", createdAt: NOW })
+			.run();
+		tx.update(narrators).set({ ownerUserId: userId }).where(eq(narrators.id, OTHER)).run();
+		const delegated = shape.row(CALLER).type === "subagent";
+		if (delegated)
+			tx.update(narrators).set({ aclRootNarratorId: CALLER }).where(eq(narrators.id, RUN)).run();
+		grantFixtureNarratorWrite(tx, delegated ? CALLER : RUN, userId);
+		ensureCommunicationNodeTx(tx, OTHER, null);
+		ensureCommunicationNodeTx(tx, CALLER, null);
+		ensureCommunicationNodeTx(tx, RUN, delegated ? CALLER : null);
+		seedFixtureCommunicationPeer(tx, OTHER, RUN, userId);
+	});
+}
+
 const binding = (
 	deliverTo: { narratorId: string; toolUseId: string; toolCallId: string },
 	extra: Record<string, unknown> = {},
@@ -544,6 +565,7 @@ for (const shape of shapes) {
 
 		test("6. a Send is visible at consecutive tool boundaries and never changes who executes", async () => {
 			seed(shape);
+			await seedSendContact(shape);
 			const seen: Array<string | undefined> = [];
 			let principal: string | null | undefined = "unset";
 			const send = async (text: string) => {
@@ -618,6 +640,7 @@ for (const shape of shapes) {
 
 		test("6b. several Sends queued before one boundary are adopted together, in FIFO order", async () => {
 			seed(shape);
+			await seedSendContact(shape);
 			let seen: string | undefined;
 			const send = async (text: string) => {
 				const id = `send-${seq++}`;

@@ -54,7 +54,12 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 		logger: { logQuery: (query) => queries.push(query) },
 	});
 	// No real DB module or session runtime is imported by this fixture.
-	mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
+	mock.module("../../db", () => ({
+		db,
+		sqlite,
+		activeDatabaseBackend: "sqlite",
+		postgresRuntime: null,
+	}));
 	mock.module("../narrator-session", () => ({
 		isNarratorActive: () => false,
 		isLoopRunning: () => false,
@@ -85,6 +90,8 @@ if (process.env.NARRAFORK_BG_BASH_BINDING_FIXTURE !== "1") {
 	const { teamStatusTool } = await import("../../lib/agent/tools/team-status");
 	const { drainPendingInjections } = await import("../parent-injection-queue");
 	const { runtimePublication } = await import("../agent-runtime/publication");
+	// Exercise durable publication without waking the unmodeled narrator session runtime.
+	runtimePublication.setWake(undefined);
 	const PARENT = "binding-parent";
 	const OTHER = "binding-other";
 	const TOOL_USE_ID = "reused-provider-id";

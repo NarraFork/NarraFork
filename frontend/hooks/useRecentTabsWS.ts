@@ -4,6 +4,7 @@ import {
 	narratorWSManager,
 	type SubscriptionHandle,
 } from "../lib/narrator-ws-manager";
+import { isRecentTabsScopeCurrent, type RecentTabsScope } from "../lib/recent-tabs-owner";
 import { useAsyncQuestionListChange } from "./useAsyncQuestions";
 import type { NarratorListWSEvent } from "./useNarratorWS";
 
@@ -165,6 +166,7 @@ export function dispatchRecentTabsListStateSnapshot(
 
 /** Persistent shared-WS subscription for the bounded RecentTabs live window. */
 export function useRecentTabsWS(
+	scope: RecentTabsScope,
 	narratorIds: string[],
 	onUpdate: RecentTabsWSUpdate,
 	onGlobalEvent?: (event: { type: string; [key: string]: unknown }) => void,
@@ -185,6 +187,9 @@ export function useRecentTabsWS(
 	const idsKey = useMemo(() => narratorIds.join(","), [narratorIds]);
 
 	useEffect(() => {
+		const acceptsFrame = () =>
+			isRecentTabsScopeCurrent(scope) &&
+			narratorWSManager.getConnectionAuthGeneration() === scope.authGeneration;
 		const rememberStatus = (narratorId: string, data: Record<string, unknown>) => {
 			const substatus = Array.isArray(data.substatus)
 				? data.substatus.filter((value): value is string => typeof value === "string")
@@ -217,6 +222,7 @@ export function useRecentTabsWS(
 				types: [...RECENT_TABS_LIST_EVENT_TYPES],
 			},
 			(data) => {
+				if (!acceptsFrame()) return;
 				if (data.type === "list_state_snapshot") {
 					dispatchRecentTabsListStateSnapshot(
 						data,
@@ -304,14 +310,16 @@ export function useRecentTabsWS(
 
 		const globalListenerHandle: ListenerHandle = narratorWSManager.addListener(
 			{ typePrefixes: ["user:", "group:"] },
-			(data) => onGlobalEventRef.current?.(data as { type: string; [key: string]: unknown }),
+			(data) => {
+				if (acceptsFrame())
+					onGlobalEventRef.current?.(data as { type: string; [key: string]: unknown });
+			},
 		);
 		const unsubscribeConnection = narratorWSManager.onConnectionChange((connected, isReconnect) => {
-			if (connected) {
-				statusVersionsRef.current.clear();
-				acceptedStatusesRef.current.clear();
-			}
-			if (connected && isReconnect) onReconnectRef.current?.();
+			if (!connected || !acceptsFrame()) return;
+			statusVersionsRef.current.clear();
+			acceptedStatusesRef.current.clear();
+			if (isReconnect) onReconnectRef.current?.();
 		});
 
 		return () => {
@@ -323,7 +331,7 @@ export function useRecentTabsWS(
 				subHandleRef.current = null;
 			}
 		};
-	}, [applyQuestionChange]);
+	}, [applyQuestionChange, scope]);
 
 	// biome-ignore lint/correctness/useExhaustiveDependencies: idsKey is the stable serialization
 	useEffect(() => {
@@ -340,5 +348,5 @@ export function useRecentTabsWS(
 		} else {
 			narratorWSManager.updateSubscription(subHandleRef.current, narratorIds);
 		}
-	}, [idsKey]);
+	}, [idsKey, scope]);
 }
