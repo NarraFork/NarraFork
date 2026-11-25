@@ -57,8 +57,8 @@ export function publicQuotaSnapshot(
 	snapshot: QuotaSnapshot | undefined,
 ): PublicQuotaSnapshot | null {
 	if (!snapshot) return null;
-	const observedAt = (value: unknown) =>
-		typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+	const isObservationTime = (value: unknown): value is number | null =>
+		value === null || (typeof value === "number" && Number.isFinite(value) && value >= 0);
 	return {
 		fetchedAt: snapshot.fetchedAt,
 		scope: snapshot.scope,
@@ -80,10 +80,8 @@ export function publicQuotaSnapshot(
 				remaining,
 				...(total !== undefined ? { total } : {}),
 				...(unlimited !== undefined ? { unlimited } : {}),
-				...(remainingObservedAt !== undefined
-					? { remainingObservedAt: observedAt(remainingObservedAt) }
-					: {}),
-				...(totalObservedAt !== undefined ? { totalObservedAt: observedAt(totalObservedAt) } : {}),
+				...(isObservationTime(remainingObservedAt) ? { remainingObservedAt } : {}),
+				...(isObservationTime(totalObservedAt) ? { totalObservedAt } : {}),
 			}),
 		),
 		...(snapshot.plan ? { plan: snapshot.plan } : {}),

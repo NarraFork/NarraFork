@@ -1,5 +1,10 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
-import type { QuotaSnapshot, QuotaSnapshotsResponse } from "@shared/quota-snapshot";
+import { selectQuotaEntries } from "@frontend/hooks/useQuotaSnapshots";
+import type {
+	QuotaSnapshot,
+	QuotaSnapshotEntry,
+	QuotaSnapshotsResponse,
+} from "@shared/quota-snapshot";
 import { Hono } from "hono";
 import { getCodexManager } from "../../lib/codex-manager";
 import * as commandAuth from "../../lib/commandcode-manager";
@@ -173,6 +178,12 @@ describe("unified quota API", () => {
 			],
 		};
 		expect(publicQuotaSnapshot(partial)?.balances[0]?.remainingObservedAt).toBeNull();
+		expect(
+			publicQuotaSnapshot({
+				...raw,
+				balances: [{ unit: "", remaining: null, remainingObservedAt: 0, totalObservedAt: null }],
+			})?.balances[0],
+		).toEqual({ unit: "", remaining: null, remainingObservedAt: 0, totalObservedAt: null });
 		const legacy = publicQuotaSnapshot({ ...raw, balances: [{ unit: "", remaining: 11 }] });
 		expect(Object.hasOwn(legacy?.balances[0] ?? {}, "remainingObservedAt")).toBe(false);
 		expect(Object.hasOwn(legacy?.balances[0] ?? {}, "totalObservedAt")).toBe(false);
@@ -180,19 +191,61 @@ describe("unified quota API", () => {
 			/private-identity|private-balance|identity|extra|detail/,
 		);
 	});
-	test("invalid observation times become explicit no-observation, never a legacy fetchedAt fallback", () => {
+	test("invalid observation times are omitted, not converted into never-observed null markers", () => {
 		for (const value of [NaN, Infinity, -1, "private-token", { identity: "private-identity" }]) {
 			const projected = publicQuotaSnapshot({
 				...snap(),
 				balances: [{ unit: "", remaining: 11, remainingObservedAt: value, totalObservedAt: value }],
 			} as unknown as QuotaSnapshot);
-			expect(projected?.balances[0]).toEqual({
-				unit: "",
-				remaining: 11,
-				remainingObservedAt: null,
-				totalObservedAt: null,
-			});
+			expect(projected?.balances[0]).toEqual({ unit: "", remaining: 11 });
+			expect(Object.hasOwn(projected?.balances[0] ?? {}, "remainingObservedAt")).toBe(false);
+			expect(Object.hasOwn(projected?.balances[0] ?? {}, "totalObservedAt")).toBe(false);
 			expect(JSON.stringify(projected)).not.toMatch(/private-token|private-identity|identity/);
+		}
+	});
+	test("invalid observed times cannot revive authoritative unknown through public projection and selector", () => {
+		const base = { groupId: "nug", prefix: "nug", templateId: "nug", credentialId: "key" };
+		const stream: QuotaSnapshotEntry = {
+			...base,
+			source: "quota_balance",
+			snapshot: {
+				scope: "wallet",
+				fetchedAt: 200,
+				windows: [],
+				balances: [{ unit: "", remaining: 9, remainingObservedAt: 200 }],
+			},
+		};
+		for (const value of [NaN, Infinity, -1, "private-token", { identity: "private-identity" }]) {
+			const probe: QuotaSnapshotEntry = {
+				...base,
+				source: "probe",
+				snapshot: publicQuotaSnapshot({
+					scope: "wallet",
+					fetchedAt: 300,
+					windows: [],
+					balances: [
+						{
+							unit: "",
+							remaining: null,
+							total: 111,
+							remainingObservedAt: value,
+							totalObservedAt: value,
+						},
+					],
+				} as unknown as QuotaSnapshot),
+			};
+			for (const entries of [
+				[probe, stream],
+				[stream, probe],
+			]) {
+				const selected = selectQuotaEntries(entries)[0];
+				expect(selected).toBe(probe);
+				expect(selected?.snapshot?.balances[0]?.remaining).toBeNull();
+				expect(Object.hasOwn(selected?.snapshot?.balances[0] ?? {}, "remainingObservedAt")).toBe(
+					false,
+				);
+				expect(JSON.stringify(selected)).not.toMatch(/private-token|private-identity|identity/);
+			}
 		}
 	});
 	test("anonymous callers cannot read or refresh", async () => {
