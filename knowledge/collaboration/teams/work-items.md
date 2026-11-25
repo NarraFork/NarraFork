@@ -61,7 +61,7 @@ keywords:
   - team_unblocked
   - 依赖
 status: draft
-verified_at: 6f73805a43fba25c5ee36fc0c483f8f0e49d75ec
+verified_at: 3586b5dd803f5035f610fc36d2c7d0245a2cd8e9
 ---
 # 工作项
 
@@ -123,7 +123,8 @@ verified_at: 6f73805a43fba25c5ee36fc0c483f8f0e49d75ec
 - 更新是乐观并发：按「状态 + `updated_at`」条件更新，对不上就 409 `TEAM_WORK_ITEM_CHANGED`。
 - 进入 merged/cancelled 时同事务释放独占锁并记 `work.exclusive_released`。
 - `merged` 有两个来源，都经同一个写入者 `markMerged`（事务内核对 ready、head、`updated_at`、团队活跃，同事务释放独占锁并解锁依赖，之后不可逆）：祖先检测（`markMergedByAncestry`，`detectedBy: "ancestry"`，system；`ready` 项的记录 head 已在基线分支内，squash/rebase 合并检测不到）与成员的本地合并（`markMergedByLocalMerge`，`detectedBy: "local_merge"`，actor 为那个人，见[合并](merge.md)）。
-- 合并任务持有一项时（`team-merge-guard.ts`），`work.review`、`work.ready`、`work.sync`、`work.cancel` 与人的退回都 409 `TEAM_WORK_ITEM_MERGING`。
+- 合并任务持有一项时（`team-merge-guard.ts`），`work.review`、`work.ready`、`work.sync`、`work.cancel` 与人的退回都 409 `TEAM_WORK_ITEM_MERGING`；review、ready、sync 在最后一次 await 之后、写入或交给工人之前再查一次。
+- 起点为 `origin/<基线>` 的项（`work.created` 的 `startFrom`）在 ready 的知识检查、评审后提交数与改动路径、以及隔离项结束时的提交计数里按 `refs/remotes/origin/<基线>` 比较（`team-work-start.ts:compareRefFor`），免得把本地基线落后的 origin 提交算成这一项的。
 
 事件与 check-in：
 - 每次状态变更、评审、同步、清理、check-in、决策都追加一行 `team_work_events`（`recordWorkEvent`）。actor 为 person / agent / system，详情上限 8KB。

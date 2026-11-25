@@ -55,7 +55,7 @@ keywords:
   - MergeButton
   - MergeOutcome
 status: draft
-verified_at: 6f73805a43fba25c5ee36fc0c483f8f0e49d75ec
+verified_at: 3586b5dd803f5035f610fc36d2c7d0245a2cd8e9
 ---
 # 团队页与审批
 
@@ -100,7 +100,7 @@ verified_at: 6f73805a43fba25c5ee36fc0c483f8f0e49d75ec
 - `TeamWorkList.tsx`「工作」（`workGroups`）：需要你（等人决定或可合并；旁观者看不到调用，用工作者的 waiting 状态代替，标题叫「等成员处理」）、进行中（先 in_progress 后排队）、评审 · 就绪，已完成和已取消折叠成数量，展开才读那一列；每行状态点、标题、标记（`itemMarks`：持有独占路径锁、已结束但仍保留 worktree）、一行在做什么（`rowLine`，活动取摘要里的 `liveActivity`，工具名经 `teams.page.row.tools.*` 译成动词；旁观者看到等待中的工作者时，按其最近一次工具调用写「等批准 X / 等回答」，不知道时写「等人处理」）、+/-。没有工作项时是虚线说明；全部结束时（`teamPageMode.wrapUp`）顶部建议归档或解散，已完成默认展开；还有已结束项保留 worktree 时不提供解散（服务端会以 `TEAM_HAS_LIVE_WORK` 拒绝），改为说明让协调者清理（每次清理都要人批准）或先归档。
 - 依赖（D）：排队的行按 `team-page-model.ts:queuedLine` 写——等一两项时点名「排队 · 等「A」合并」/「排队 · 等「A」「B」合并」，更多时「排队 · 等 N 项合并」，有已取消的依赖时「排队 · 依赖「A」已取消」（只算未合并的依赖，`dependencyBlockers`）。抽屉在字段下面有「依赖」（每项状态徽标，标题点开那一项，排队且有已取消依赖时一条黄色警告，否则一行「都合并到 <基线> 后才能开始」）与「被依赖」（`TeamWorkDrawer.tsx:DependencySections`，`onOpenItem` 由 `TeamPageView` 传入）。人不能在这里改依赖。动态里 `work.dependencies_changed`（「依赖 N 项」/「不再依赖其他工作项」：事件只记 id，不知道当时哪些已合并，所以不说「等 N 项合并」）与 `work.unblocked`（「依赖的工作项都已合并」）有自己的文案。
 - `TeamActivity.tsx`「动态」：安静的按时间列表（时间、谁、什么、哪一项、说明），标题与说明用 `eventLabelKey`/`eventNote`，未知种类显示 `teams.event.other`，种类名只在 tooltip 里；`work.returned` 的说明是理由原文。
-- `TeamWorkDrawer.tsx`：标题与结论徽标、分支 → 基线与领先提交数、工作者会话链接、改动文件（展开某个文件才读它的 diff）、评审记录（人退回的那轮带理由；评审者的轮次带意见原文 `ReviewFindings`：灰字、保留换行、截成 3 行，实际溢出时才给「展开 / 收起」，先按 `findingsNeedToggle` 估、渲染后按 `scrollHeight` 改正；被总量截断时加一行说明）、这一项的时间线；底栏（`canReturn` 时）退回 / 合并到基线（ready 时 `MergeButton`，上方 `MergeOutcome` 显示冲突列表与「退回给工作者」、失败原因、或已准备的说明与「在该目录中快进」及可复制命令），退回就地展开成必填理由（最新结果是冲突时预填冲突文件，`conflictReasonFiles`），拒绝码 `TEAM_WORK_ITEM_NOT_RETURNABLE` / `TEAM_WORK_ITEM_CHANGED` / `TEAM_ARCHIVED` 有自己的中英文（`returnErrorKey`）。时间线与评审记录里协调者签作「协调者」（`isCoordinator`），不用团队名。
+- `TeamWorkDrawer.tsx`：标题与结论徽标、分支 → 基线与领先提交数、工作者会话链接、改动文件（展开某个文件才读它的 diff）、评审记录（人退回的那轮带理由；评审者的轮次带意见原文 `ReviewFindings`：灰字、保留换行、截成 3 行，实际溢出时才给「展开 / 收起」，先按 `findingsNeedToggle` 估、渲染后按 `scrollHeight` 改正；被总量截断时加一行说明）、这一项的时间线；底栏（`canReturn` 时）退回 / 合并到基线（ready 时 `MergeButton`，上方 `MergeOutcome` 显示冲突列表与「退回给工作者」、失败原因、或已准备的说明与「在该目录中快进」及可复制命令；快进失败时 prepared 仍在，下面写出失败原因与 git 列出的文件），退回就地展开成必填理由（最新结果是冲突时预填冲突文件，`conflictReasonFiles`），拒绝码 `TEAM_WORK_ITEM_NOT_RETURNABLE` / `TEAM_WORK_ITEM_CHANGED` / `TEAM_ARCHIVED` 有自己的中英文（`returnErrorKey`）。时间线与评审记录里协调者签作「协调者」（`isCoordinator`），不用团队名。
 - `TeamStart.tsx` 起步状态（没有工作项且协调者还没有消息、未归档；只给成员，只读成员看到一行 `TeamReadOnlyStart`）：盖在对话的消息区上（协调者那一行在面板外、上方；不挡输入框），一句话、一行说明、3 个示例，点击经 `lib/composer-append-queue.ts` 填入协调者的输入框。
 - 固定到侧栏：页头有 `PinToSidebarButton`（`team-page-model.ts:teamPinTitle`：团队未载入、非 active 或协调者已归档就不给）；侧栏团队标签显示协调者状态和成员的待批数加可合并数（`team-board.ts:teamPendingApprovalCount`、`teamReadyItemCount`），见[最近标签页](../recent-tabs.md)。
 - 项目页（R2，见[项目页](../project-pages.md)）复用这里的读模型和组件：待决调用的扫描是 `team-board.ts:scanPendingCalls`（团队树用 `visiblePendingCalls`，项目用根会话链接范围加每页一次的 `acceptPage`），预览用 `pendingApprovalsOf`，团队卡片的数字用 `readTeamCards`（经读 worker，已结束项每种数到 1000）（经读 worker；已结束项每种数到 1000）；「等你处理」用同一个 `TeamAttention`，条目可带 `source`（团队名或会话与所有者），`onOpenTeam`、`onDecided(entry)`、`flush`、`inPage`、`beyondKeys` 只给项目页用。工具调用卡片和行的文案按工具（`team-page-model.ts:toolVerb`：Edit/Write/MultiEdit/NotebookEdit 编辑文件、Bash 运行命令、Read 读取文件、WebFetch 访问网页，其余「使用 X」），键在 `teams.page.attention.toolVerbs.*`、`workerAsksAction` 与 `teams.page.row.waitingTools.*`。

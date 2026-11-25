@@ -66,7 +66,7 @@ keywords:
   - team_upgrade
   - team_disband
 status: draft
-verified_at: 6f73805a43fba25c5ee36fc0c483f8f0e49d75ec
+verified_at: 3586b5dd803f5035f610fc36d2c7d0245a2cd8e9
 ---
 # 团队与成员
 
@@ -86,7 +86,7 @@ verified_at: 6f73805a43fba25c5ee36fc0c483f8f0e49d75ec
 - 协调者的 cwd 永远是项目的 `gitPath`，不是用户选的子目录（`createTeam`）。
 - 团队列表 `GET /api/projects/:projectId/teams`（`listProjectTeamsQuerySchema`：`status`、`limit` ≤100、`cursor`）；带 `counts=true` 时每页最多 24 个团队，每个团队多一个 `card`（项目页团队卡片的数字，`team-board.ts:readTeamCards`，见[项目页](../project-pages.md)）。
 - 改基线分支（`PATCH …/teams/:teamId`，`updateTeam`）同样先过 `assertTeamProjectUsable`（事务外的异步 git，`team-git` 的超时），解析不到 → 409 `TEAM_BASE_BRANCH_UNRESOLVED`，原基线不变；事务内项目 `gitPath` 变了 → 409 `TEAM_PROJECT_CHANGED`。只改简报或设置不跑 git。团队页设置对话框把拒绝写在基线分支字段上（`TeamSettingsModal.tsx:settingsErrorKey`，中英文）。
-- 设置（`TeamSettings`，`validators/project-teams.ts:teamSettingsSchema`，严格、≤16KB）可带 `workStart`（`remote` / `local`）：新工作项从 `origin/<基线>` 还是本地基线开始；整份替换，对话框只换这个键。团队详情另带 `workStartDefault`（团队不设时的值：项目默认，否则按 origin 是否在 GitHub；还没读出时 null），见[合并工作项与基线配置](merge.md)。
+- 设置（`TeamSettings`，`validators/project-teams.ts:teamSettingsSchema`，严格、≤16KB）可带 `workStart`（`remote` / `local`）：新工作项从 `origin/<基线>` 还是本地基线开始。创建时整份给；`PATCH` 只给要改的键（`teamSettingsPatchSchema`，`null` 删掉一个键），事务里与已存的合并（`team-service.ts:applySettingsPatch`），两个人同时改不同的键不会互相覆盖；设置对话框只发 `workStart`（`workStartPatch`）。团队详情另带 `workStartDefault`（团队不设时的值：项目默认，否则按 origin 是否在 GitHub；还没读出时 null），见[合并工作项与基线配置](merge.md)。
 
 两个创建入口，都调同一条 `POST /api/projects/:projectId/teams`，字段都来自 `components/teams/TeamCreateFields.tsx`（名称、基线分支、说明；「升级为团队」的对话框也用它，见[团队页](page.md)）：
 - 名称、基线分支、说明的 Zod 规则只有一份，在 `shared/project-team-draft.ts`（`teamNameSchema`、`teamBaseBranchSchema`、`teamBriefSchema`，`gitBranchName` 也在这里，`validators/common.ts` 转出）；路由校验器 `validators/project-teams.ts` 与前端 `teams/team-draft.ts:checkTeamDraft` 都用它。`useTeamDraft().submit()` 在草稿不合规时返回 null 并在对应字段显示错误，两个入口都因此不发请求。
