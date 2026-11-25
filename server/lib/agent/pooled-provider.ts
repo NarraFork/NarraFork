@@ -141,6 +141,9 @@ export function classifyKeyFault(err: unknown): KeyFault | null {
 export function reportKeyFault(key: ProviderKey, err: unknown, now = Date.now()): boolean {
 	const fault = classifyKeyFault(err);
 	if (!fault) return false;
+	// A concurrent attempt may already have disabled this same identity. The fault
+	// still permits failover, but must not rewrite disabled state or its cooldown.
+	if (getProviderKeyStore().get(key.id)?.disabled) return true;
 	const failure = poolFailureState(fault, 0, 1, now);
 	if (failure.disabledReason === "invalid") {
 		try {
@@ -169,7 +172,7 @@ function keyFingerprint(key: ProviderKey): string {
 	return JSON.stringify([key.apiKey, key.network ?? null]);
 }
 
-/** Store keys mutate in place; snapshot the attempt before async requests can outlive an edit. */
+/** Snapshot mutable key identity; concurrent disabling changes write eligibility, not identity. */
 function captureKeyAttempt(
 	key: ProviderKey,
 	connection: Pick<ProviderAdapter, "isDiagnosticConnectionCurrent">,
@@ -180,7 +183,6 @@ function captureKeyAttempt(
 		const live = getProviderKeyStore().get(id);
 		return (
 			!!live &&
-			!live.disabled &&
 			live.providerId === providerId &&
 			keyFingerprint(live) === version &&
 			connection.isDiagnosticConnectionCurrent?.() !== false
@@ -287,7 +289,8 @@ export class PooledProvider implements ProviderAdapter {
 			try {
 				const adapter = this.adapterFor(key, model);
 				const result = await run(adapter);
-				if (isAttemptCurrent()) clearKeyCooldown(key.id);
+				if (isAttemptCurrent() && !getProviderKeyStore().get(key.id)?.disabled)
+					clearKeyCooldown(key.id);
 				// The key is the credential; an inner adapter's own id is the connection's.
 				return typeof result === "object" && result !== null
 					? { ...result, credentialId: key.id }
@@ -362,13 +365,16 @@ export class PooledProvider implements ProviderAdapter {
 						params.onRequestStart?.({
 							credentialId: key.id,
 							validateDiagnosticCredential: () =>
-								isAttemptCurrent() && info?.validateDiagnosticCredential?.() !== false,
+								isAttemptCurrent() &&
+								!getProviderKeyStore().get(key.id)?.disabled &&
+								info?.validateDiagnosticCredential?.() !== false,
 						}),
 				})) {
 					streamed ||= shouldTreatCodexStreamEventAsYielded(event);
 					yield { ...event, credentialId: key.id };
 				}
-				if (isAttemptCurrent()) clearKeyCooldown(key.id);
+				if (isAttemptCurrent() && !getProviderKeyStore().get(key.id)?.disabled)
+					clearKeyCooldown(key.id);
 				return;
 			} catch (err) {
 				if (params.signal.aborted) throw err;
