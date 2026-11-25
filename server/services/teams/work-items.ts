@@ -19,6 +19,7 @@
 import { createHash } from "node:crypto";
 import type { WorktreeRemovalPlan, WorktreeRemovalResult } from "@shared/narrator-worktrees";
 import {
+	dependencyBlockers,
 	TEAM_BRIEF_MAX_BYTES,
 	TEAM_CHECKIN_MAX_MINUTES,
 	TEAM_CHECKIN_MIN_MINUTES,
@@ -385,9 +386,7 @@ export function viewWorkItem(
 		reviewRounds: item.reviewRounds,
 		lastReview: item.lastReview,
 		dependsOn: dependencies.map((dependency) => dependency.id),
-		blockedBy: dependencies
-			.filter((dependency) => dependency.state !== "merged")
-			.map((dependency) => dependency.id),
+		blockedBy: dependencyBlockers(dependencies).map((dependency) => dependency.id),
 	};
 }
 

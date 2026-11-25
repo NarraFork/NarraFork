@@ -80,11 +80,15 @@ export function readDependencies(
 	return byItem;
 }
 
-/** The items of a team that depend on `itemId`, oldest first, at most `limit` (+ `more`). */
+/**
+ * The items of a team that depend on `itemId`, oldest first, at most `limit` (+ `more`); only
+ * those in `state` when it is given.
+ */
 export function readDependents(
 	teamId: string,
 	itemId: string,
 	limit = TEAM_WORK_DEPENDENTS_LIMIT,
+	state?: TeamWorkItemState,
 ): { items: TeamWorkDependencyRef[]; more: boolean } {
 	const rows = db
 		.select({ id: teamWorkItems.id, title: teamWorkItems.title, state: teamWorkItems.state })
@@ -94,6 +98,7 @@ export function readDependents(
 			and(
 				eq(teamWorkItemDependencies.dependsOnItemId, itemId),
 				eq(teamWorkItemDependencies.teamId, teamId),
+				state === undefined ? undefined : eq(teamWorkItems.state, state),
 			),
 		)
 		.orderBy(asc(teamWorkItems.createdAt), asc(teamWorkItems.id))
@@ -444,9 +449,10 @@ export async function deliverUnblockedNotes(items: readonly UnblockedItem[]): Pr
 	return delivered;
 }
 
-/** The queued items that depend on `itemId` (for `work.cancel`'s next action), at most 20. */
+/**
+ * The queued items that depend on `itemId` (for `work.cancel`'s next action), at most 20. The
+ * state is filtered in the query, so started or finished dependents never crowd them out.
+ */
 export function queuedDependentsOf(teamId: string, itemId: string): TeamWorkDependencyRef[] {
-	return readDependents(teamId, itemId, TEAM_WORK_DEPENDENCIES_MAX).items.filter(
-		(item) => (item.state as TeamWorkItemState) === "queued",
-	);
+	return readDependents(teamId, itemId, TEAM_WORK_DEPENDENCIES_MAX, "queued").items;
 }

@@ -329,7 +329,10 @@ describe("work item dependencies", () => {
 
 	test("a cancelled dependency blocks until it is replaced; work.cancel names the waiting items", async () => {
 		const a = await create("Schema");
+		const started = await create("Started", [a.id]);
 		const b = await create("API", [a.id]);
+		// A dependent that already started is not waiting: only queued ones are named.
+		sqlite.run("UPDATE team_work_items SET state = 'in_progress' WHERE id = ?", [started.id]);
 		const ctx = { narratorId: LEAD, locale: "en" } as ToolContext;
 		const cancelled = JSON.parse(
 			(await teamTool.execute({ action: "work.cancel", item: a.id }, ctx)).output,
