@@ -436,7 +436,7 @@ export function teamRepoGit(repo: string): TeamRepoGit {
 					"--no-tags",
 					"--no-recurse-submodules",
 					"--no-auto-maintenance",
-					"--quiet",
+					// Not quiet: a refusal says why (checked out, non-fast-forward) only on stderr.
 					".",
 					`${commit}:refs/heads/${base}`,
 				],

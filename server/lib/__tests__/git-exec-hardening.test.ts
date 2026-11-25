@@ -7,6 +7,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import {
 	ensureConfigOverridesHonored,
 	gitConfigEnv,
+	PROGRAM_CONFIG_QUERY,
 	parseProgramConfig,
 	setGitHardeningProbeForTests,
 	untrustedProgramOverrides,
@@ -29,6 +30,19 @@ describe("git exec hardening", () => {
 			GIT_CONFIG_KEY_0: "a.b",
 			GIT_CONFIG_VALUE_0: "1",
 		});
+	});
+
+	test("custom merge drivers are named by the query and emptied", () => {
+		expect(PROGRAM_CONFIG_QUERY.at(-1)).toContain("merge\\..+\\.driver");
+		const programs = parseProgramConfig(
+			"merge.evil.driver\ntouch /tmp/x\0merge.Ours.Name.driver\ncat\0merge.renormalize\ntrue\0hook.lint.command\nx\0",
+		);
+		expect(programs).toEqual({ filters: [], hooks: ["lint"], drivers: ["evil", "Ours.Name"] });
+		expect(untrustedProgramOverrides(programs)).toEqual([
+			["hook.lint.enabled", "false"],
+			["merge.evil.driver", ""],
+			["merge.Ours.Name.driver", ""],
+		]);
 	});
 
 	test("this git honors the overrides; a git that does not is refused, and asked again", async () => {
