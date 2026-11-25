@@ -15,7 +15,7 @@ import {
 } from "../lib/settings";
 import { registerModelListReader } from "../lib/sourcing/model-list-readers";
 import { sourceGroupForConnection } from "../lib/sourcing/source-groups";
-import { listCachedTemplateModels } from "../lib/sourcing/templates";
+import { getServiceTemplate } from "../lib/sourcing/templates";
 import { requireAdmin, requireAuth } from "../middleware/auth";
 
 export const geminiRoutes = new Hono();
@@ -133,9 +133,7 @@ export function getGeminiCachedModelsByProvider(providerId: string): GeminiModel
 	return provider ? matchingCachedModels(provider, cachedModelsByProvider) : [];
 }
 
-registerModelListReader("gemini-compatible", (group) =>
-	getGeminiCachedModelsByProvider(group.id).map((model) => model.id),
-);
+registerModelListReader("gemini-compatible", (group) => getGeminiCachedModelsByProvider(group.id));
 
 /** Get all cached models across active providers with matching transports. */
 export function getGeminiCachedModels(): GeminiModelInfo[] {
@@ -437,9 +435,9 @@ geminiRoutes.get("/providers/:id/models", async (c) => {
 		"gemini-compatible",
 	);
 	return c.json({
-		models: await listCachedTemplateModels(
+		models: await getServiceTemplate(group.templateId).listModels(
 			group,
-			getGeminiCachedModelsByProvider(id),
+			undefined,
 			c.req.raw.signal,
 		),
 		fromCache: true,

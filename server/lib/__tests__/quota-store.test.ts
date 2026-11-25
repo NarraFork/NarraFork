@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { getNarraforkPath } from "../narrafork-home";
 import { createPersistedCredentialCache } from "../persisted-credential-cache";
 import { keyQuotaBlockedUntil } from "../provider-key-quota";
@@ -118,9 +118,10 @@ describe("quota store", () => {
 		expect(existsSync(getNarraforkPath(file))).toBe(false);
 	});
 
-	test("an unreadable legacy file is discarded rather than blocking startup", () => {
+	test("an unreadable legacy file is discarded rather than blocking startup", async () => {
 		const file = `legacy-broken-${crypto.randomUUID()}.json`;
-		importLegacyQuotaCache(
+		writeFileSync(getNarraforkPath(file), "{broken-json");
+		await importLegacyQuotaCache(
 			file,
 			(raw) => raw as never,
 			[],

@@ -17,7 +17,7 @@ import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { selectTokenDanceProtocol } from "@shared/tokendance";
 import { getCodexManager } from "../codex-manager";
 import { resolveCommandCodeToken } from "../commandcode-manager";
-import { peekCommandCodeModels } from "../commandcode-models";
+import { getCachedCommandCodeModel, peekCommandCodeModels } from "../commandcode-models";
 import { COMMAND_CODE_PREFIX } from "../commandcode-protocol";
 import { AppError, ValidationError } from "../errors";
 import {
@@ -162,12 +162,14 @@ registerExtraModelSource("tokendance", {
 registerCodexModelChecker((model) => getBuiltinCodexModels().includes(model));
 registerCodexModelLister(() => getBuiltinCodexModels().map((m) => `codex:${m}`));
 
-registerModelListReader("codex", () => getBuiltinCodexModels());
-registerModelListReader("tokendance", () => getTokenDanceCatalogModels().map((model) => model.id));
+registerModelListReader("codex", () => getBuiltinCodexModels().map((id) => ({ id })));
+registerModelListReader("tokendance", () => getTokenDanceCatalogModels());
 // Keep Command Code's existing stale-while-revalidate semantics in its catalog owner.
 registerModelListReader("command-code", () => {
 	const config = s().commandCode;
-	return peekCommandCodeModels(config?.apiKey, config?.baseUrl).models;
+	return peekCommandCodeModels(config?.apiKey, config?.baseUrl).models.map(
+		(id) => getCachedCommandCodeModel(id) ?? { id },
+	);
 });
 
 export function registerOpenaiModelChecker(checker: (model: string) => boolean): void {
