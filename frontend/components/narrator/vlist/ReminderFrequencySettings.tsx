@@ -1,9 +1,9 @@
 import { useCurrentUser } from "@frontend/hooks/useAuth";
 import { useNarrator, useUpdateReflectionOverrides } from "@frontend/hooks/useNarrator";
-import { api } from "@frontend/lib/api";
+import { useRuntimeSettings } from "@frontend/hooks/useRuntimeSettings";
+import { useUpdateRuntimeSettings } from "@frontend/hooks/useUpdateRuntimeSettings";
 import { ActionIcon, Button, Group, NumberInput, Popover, Stack, Text } from "@mantine/core";
 import { IconSettings } from "@tabler/icons-react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -72,16 +72,12 @@ function ReminderFrequencyForm({
 }) {
 	const { t } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
-	const qc = useQueryClient();
 	const isTasks = source === "living_work_spec";
 	const { data: user } = useCurrentUser();
-	const settings = useQuery({ queryKey: ["settings"], queryFn: api.getSettings });
+	const settings = useRuntimeSettings();
 	const narrator = useNarrator(isTasks ? narratorId : "");
 	const reflection = useUpdateReflectionOverrides();
-	const globalSettings = useMutation({
-		mutationFn: api.updateSettings,
-		onSuccess: (data) => qc.setQueryData(["settings"], data),
-	});
+	const globalSettings = useUpdateRuntimeSettings();
 	const [draft, setDraft] = useState<number | string | null>(null);
 	const field = isTasks ? "tasksReminderInterval" : "silentToolCallThreshold";
 	const globalValue = settings.data?.agent?.[field];

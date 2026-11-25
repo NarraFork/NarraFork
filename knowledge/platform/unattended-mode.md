@@ -6,6 +6,7 @@ anchors:
   - frontend/components/UnattendedModeBanner.tsx
   - frontend/components/settings/UnattendedModeCard.tsx
   - frontend/lib/api/unattended.ts
+  - frontend/hooks/useUnattendedStatus.ts
   - server/lib/validators/unattended.ts
   - server/routes/unattended.ts
   - server/services/unattended-mode.ts
@@ -28,7 +29,7 @@ keywords:
   - 取消关机
   - fenceUnattendedShutdown
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 ---
 
 # 无人值守模式
@@ -55,7 +56,8 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
   - `GET /`：管理员得到完整状态，其他用户得到脱敏视图（阶段、阻塞摘要计数，不含叙述者 id、命令、错误文本）；`no-store`。
   - `POST /`（仅管理员）：`unattendedOptionsSchema`（`.strict()`，越界拒绝而非夹取）；`enabled: true` 布防，若已在 `shutting_down` 返回 409；`enabled: false` 撤防。
   - `POST /cancel`：任何已登录用户都能撤防（安全阀），无参数；已开始关闭则 409；响应按调用者角色决定完整或脱敏。
-- 状态变化经事件总线 `system:unattended_changed` → `narrator-ws.ts` 广播 `unattended_mode_changed`；前端横幅收到后重新拉取，并按 5 秒（布防时）/ 60 秒轮询兜底。
+- 状态变化经事件总线 `system:unattended_changed` → `narrator-ws.ts` 广播 `unattended_mode_changed`。每次服务端探测比较 UI 语义摘要：阶段、安静起点、关机期限、阻塞/错误状态，以及叙述者数、压缩/队列/后台任务/到期定时任务/维护/unknown 阻塞摘要；即使阶段和期限没变，阻塞摘要变化也通知。仅 `checkedAt`、内部诊断或叙述者 id 变化不发提示（`unattended-mode.ts:uiSummary`）。
+- `hooks/useUnattendedStatus.ts` 供横幅与设置卡共用缓存和每个 QueryClient 唯一的引用计数订阅。在线仅首读、变化提示、连接边界与控制面恢复读取，不做 5 秒/60 秒轮询；真实 `online → offline` 边缘立即合并 GET，再按新状态排定安全 timer（布防 5 秒、关闭 60 秒），不能在已耗时 60 秒的客户端心跳判离线后再等关闭态的 60 秒，否则会错过最短 70 秒撤销窗。重复相同连接状态不读也不推迟已有 timer；初始离线复用首读，查询成功或失败后重排 timer，不受标签隐藏影响。提示/操作成功先取消旧读，避免旧快照覆盖；横幅每秒只更新本地倒计时，不发请求。70 秒最短布防窗口不变。
 - 前端：`UnattendedModeBanner` 在 `AuthenticatedAppLayout` 与 `StandaloneWindowLayout` 里常驻，布防时显示倒计时或第一个阻塞原因，任何用户可点取消；`UnattendedModeCard` 在设置页服务器系统分区，只对管理员渲染。
 
 ## 从哪读起

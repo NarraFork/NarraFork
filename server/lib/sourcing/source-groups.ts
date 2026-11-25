@@ -101,7 +101,7 @@ function buildSourceGroups(): readonly SourceGroupView[] {
 			}),
 		);
 	}
-	for (const entry of pluginProviderRegistry.list()) {
+	for (const entry of pluginProviderRegistry.listModelOptionsOwners()) {
 		if (entry.kind !== "executable-plugin") continue;
 		groups.push(
 			group("plugin", {

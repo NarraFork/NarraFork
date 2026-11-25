@@ -10,6 +10,7 @@ import {
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
+	narratorToolCalls,
 	projects,
 } from "../db/schema";
 import { getNarratorWorkerTestDb } from "../services/__tests__/narrator-worker-fixture";
@@ -81,7 +82,9 @@ function openFakeWs(
 	const connection = createFakeWs(options);
 	handleNarratorWS.open(connection.ws);
 	openedConnections.push(connection.ws);
-	return connection;
+	// Business-event assertions start after the independent authenticated handshake.
+	const initialFrames = connection.sent.splice(0);
+	return { ...connection, initialFrames };
 }
 
 async function seedNarrators() {
@@ -442,6 +445,8 @@ describe("narrator WebSocket RecentTabs scaling", () => {
 					narratorId: "narrator-idle",
 					status: "idle",
 					substatus: [],
+					statusEpoch: expect.any(String),
+					statusRevision: expect.any(Number),
 					activeBackgroundTaskCount: 0,
 					activeBackgroundWorkCount: 0,
 					activeBackgroundServiceCount: 0,
@@ -451,6 +456,8 @@ describe("narrator WebSocket RecentTabs scaling", () => {
 					status: "working",
 					substatus: ["reasoning"],
 					turnStartedAt: "2026-07-19T00:00:00.000Z",
+					statusEpoch: expect.any(String),
+					statusRevision: expect.any(Number),
 					activeBackgroundTaskCount: 0,
 					activeBackgroundWorkCount: 0,
 					activeBackgroundServiceCount: 0,
@@ -947,6 +954,108 @@ describe("narrator WebSocket backgroundWorkActive snapshot flag", () => {
 });
 
 describe("narrator WebSocket activity subscription", () => {
+	it.each([
+		{ name: "slash Bash", skipUserMessage: false, reuseStart: false, throws: false },
+		{ name: "pre-prompt Bash", skipUserMessage: true, reuseStart: false, throws: false },
+		{
+			name: "existing execution timestamp",
+			skipUserMessage: true,
+			reuseStart: true,
+			throws: false,
+		},
+		{ name: "throwing Bash", skipUserMessage: true, reuseStart: false, throws: true },
+	])("publishes started → executing → completed for $name", async (scenario) => {
+		await seedNarrators();
+		const { handleBashCommand } = await import("../services/narrator-service");
+		const { narratorStore } = await import("../services/narrator-store");
+		const { bashTool } = await import("../lib/agent/tools/bash");
+		const { ws, sent } = openFakeWs();
+		await handleNarratorWS.message(ws, {
+			type: "subscribe",
+			kind: "activity",
+			narratorIds: ["narrator-idle"],
+		});
+		sent.length = 0;
+		const existingStartedAt = new Date(Date.now() - 2000).toISOString();
+		let executionBoundary = 0;
+		const callManualTool = narratorStore.callManualTool;
+		const persist = spyOn(narratorStore, "callManualTool").mockImplementation(async (...args) => {
+			const message = await callManualTool(...args);
+			if (scenario.reuseStart) {
+				await db
+					.update(narratorToolCalls)
+					.set({ executionStartedAt: existingStartedAt })
+					.where(eq(narratorToolCalls.id, args[1].toolCallId));
+			}
+			executionBoundary = Date.now();
+			return message;
+		});
+		const execute = spyOn(bashTool, "execute").mockImplementation(async (_input, context) => {
+			expect(sent.map((event) => event.type)).toEqual(["tool_started", "tool_executing"]);
+			const executing = sent[1];
+			expect(executing).toMatchObject({
+				narratorId: "narrator-idle",
+				toolUseId: context.currentToolUseId,
+			});
+			const row = await db.query.narratorToolCalls.findFirst({
+				where: eq(narratorToolCalls.toolUseId, context.currentToolUseId as string),
+			});
+			expect(row?.status).toBe("running");
+			expect(row?.executionStartedAt).toBe(
+				new Date(executing.executionStartedAt as number).toISOString(),
+			);
+			if (scenario.reuseStart) {
+				expect(row?.executionStartedAt).toBe(existingStartedAt);
+			} else {
+				expect(executing.executionStartedAt as number).toBeGreaterThanOrEqual(executionBoundary);
+				expect(executing.executionStartedAt as number).toBeLessThanOrEqual(Date.now());
+			}
+			if (scenario.throws) throw new Error("direct Bash failed");
+			return { output: "done" };
+		});
+		try {
+			const result = await handleBashCommand(
+				"narrator-idle",
+				"bun test",
+				"/bash bun test",
+				undefined,
+				{
+					skipUserMessage: scenario.skipUserMessage,
+				},
+			);
+			expect(execute).toHaveBeenCalledTimes(1);
+			expect(result.isError).toBe(scenario.throws);
+			expect(result.output).toBe(scenario.throws ? "Tool error: direct Bash failed" : "done");
+			expect(sent.map((event) => event.type)).toEqual([
+				"tool_started",
+				"tool_executing",
+				"tool_completed",
+			]);
+			const [started, executing, completed] = sent;
+			expect(executing.toolUseId).toBe(started.toolUseId);
+			expect(completed).toMatchObject({
+				narratorId: started.narratorId,
+				toolUseId: started.toolUseId,
+				toolCallId: started.toolCallId,
+				status: scenario.throws ? "fail" : "success",
+			});
+			const settled = await db.query.narratorToolCalls.findFirst({
+				where: eq(narratorToolCalls.id, started.toolCallId as string),
+			});
+			expect(settled?.executionStartedAt).toBe(
+				new Date(executing.executionStartedAt as number).toISOString(),
+			);
+			expect(settled?.status).toBe(scenario.throws ? "fail" : "success");
+			expect(settled?.durationMs).toBe(completed.durationMs as number);
+			expect(settled?.durationMs).toBe(
+				Date.parse(settled?.completedAt as string) - (executing.executionStartedAt as number),
+			);
+		} finally {
+			execute.mockRestore();
+			persist.mockRestore();
+		}
+	});
+
 	it("sends a snapshot and only the activity projection of the stream", async () => {
 		await seedNarrators();
 		const { ws, sent } = openFakeWs();
@@ -987,6 +1096,19 @@ describe("narrator WebSocket activity subscription", () => {
 			parentToolUseId: "use-agent",
 		});
 		broadcastToNarrator("narrator-idle", {
+			type: "tool_executing",
+			narratorId: "narrator-idle",
+			toolUseId: "use-1",
+			executionStartedAt: 1_800_000_000_000,
+		});
+		broadcastToNarrator("narrator-idle", {
+			type: "tool_executing",
+			narratorId: "narrator-idle",
+			toolUseId: "use-child",
+			executionStartedAt: 1_800_000_000_001,
+			parentToolUseId: "use-agent",
+		});
+		broadcastToNarrator("narrator-idle", {
 			type: "tool_completed",
 			narratorId: "narrator-idle",
 			toolCallId: "call-1",
@@ -1003,6 +1125,12 @@ describe("narrator WebSocket activity subscription", () => {
 				toolUseId: "use-1",
 				toolName: "Bash",
 				inputSummary: { command: "bun test" },
+			},
+			{
+				type: "tool_executing",
+				narratorId: "narrator-idle",
+				toolUseId: "use-1",
+				executionStartedAt: 1_800_000_000_000,
 			},
 			{
 				type: "tool_completed",
@@ -1044,5 +1172,25 @@ describe("narrator WebSocket activity subscription", () => {
 			downgrade: true,
 		});
 		expect(ws.data.activityOnlyNarrators?.has("narrator-idle")).toBe(true);
+	});
+});
+
+describe("initial runtime settings revision handshake", () => {
+	it("sends only a bounded revision hint before any narrator subscription", () => {
+		const { initialFrames, sent, ws } = openFakeWs({ userId: "handshake-user" });
+		expect(initialFrames).toEqual([
+			{ type: "settings_runtime_changed", revision: expect.any(Number), initial: true },
+		]);
+		expect(JSON.stringify(initialFrames).length).toBeLessThan(192);
+		expect(ws.data.subscribedNarrators.size).toBe(0);
+		expect(sent).toEqual([]);
+	});
+
+	it("does not reveal host revision state to an unidentified connection", () => {
+		const anonymous = createFakeWs();
+		delete anonymous.ws.data.userId;
+		handleNarratorWS.open(anonymous.ws);
+		openedConnections.push(anonymous.ws);
+		expect(anonymous.sent).toEqual([]);
 	});
 });

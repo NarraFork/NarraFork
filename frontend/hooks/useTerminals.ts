@@ -1,18 +1,17 @@
 import { REMOTE_BUILD } from "@frontend/lib/build-target";
+import { useDocumentVisibility } from "@mantine/hooks";
 import { type QueryClient, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect } from "react";
 import { api } from "../lib/api";
+import { request } from "../lib/api/client";
 import type { ApiEntity } from "../lib/api/types";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
+import { useNarratorUiScope, useNarratorUiSummary } from "./useNarratorUiSummary";
 import { useTerminalCapability } from "./usePlatform";
 
 const TERMINALS_QUERY_GC_TIME_MS = 60_000;
 
-function appendTerminalToCache(
-	qc: QueryClient,
-	queryKey: readonly ["terminals", { narratorId: string }],
-	terminal: ApiEntity,
-) {
+function appendTerminalToCache(qc: QueryClient, queryKey: readonly unknown[], terminal: ApiEntity) {
 	if (!terminal?.id) return;
 	qc.setQueryData<ApiEntity[]>(queryKey, (old) => {
 		if (!old) return [terminal];
@@ -21,12 +20,36 @@ function appendTerminalToCache(
 	});
 }
 
-export function useNarratorTerminals(narratorId: string) {
+export function useNarratorTerminals(narratorId: string, visible = true) {
 	const qc = useQueryClient();
+	const { userId, token } = useNarratorUiScope();
+	const canOpen = useCanOpenTerminals(narratorId);
+	const documentVisibility = useDocumentVisibility();
+	const documentVisible =
+		documentVisibility === "visible" &&
+		typeof document !== "undefined" &&
+		document.visibilityState === "visible";
+	const enabled =
+		!REMOTE_BUILD &&
+		visible &&
+		documentVisible &&
+		!!narratorId &&
+		!!token &&
+		!!userId &&
+		canOpen === true;
+	const queryKey = ["terminals", { narratorId }, userId, token] as const;
 
-	// Invalidate when this narrator's terminal count changes
+	// Invalidate only an actually visible list; do not keep hidden entity reads alive.
 	useEffect(() => {
-		if (REMOTE_BUILD || !narratorId) return;
+		if (!enabled) {
+			const key = ["terminals", { narratorId }, userId, token] as const;
+			// QueryObserver applies enabled in its own effect, after this hook's effect.
+			queueMicrotask(() => {
+				if (!qc.getQueryCache().find({ queryKey: key, exact: true })?.isActive())
+					void qc.cancelQueries({ queryKey: key, exact: true });
+			});
+			return;
+		}
 		const handle = narratorWSManager.addListener(
 			{ narratorIds: [narratorId], types: ["terminal_count_changed"] },
 			() => {
@@ -34,13 +57,18 @@ export function useNarratorTerminals(narratorId: string) {
 			},
 		);
 		return () => narratorWSManager.removeListener(handle);
-	}, [narratorId, qc]);
+	}, [narratorId, qc, enabled, userId, token]);
 
 	return useQuery({
-		queryKey: ["terminals", { narratorId }],
-		queryFn: () => api.listTerminalsByNarrator(narratorId),
-		enabled: !REMOTE_BUILD && !!narratorId,
+		queryKey,
+		queryFn: ({ signal }) =>
+			request<ApiEntity[]>(`/terminals?${new URLSearchParams({ narratorId })}`, {
+				signal,
+				maxResponseBytes: 512 * 1024,
+			}),
+		enabled,
 		gcTime: TERMINALS_QUERY_GC_TIME_MS,
+		staleTime: 30_000,
 	});
 }
 
@@ -50,14 +78,8 @@ export function useNarratorTerminals(narratorId: string) {
  * anyway). `undefined` while loading.
  */
 export function useCanOpenTerminals(narratorId: string): boolean | undefined {
-	const { data } = useQuery({
-		queryKey: ["terminals", "access", { narratorId }],
-		queryFn: () => api.getTerminalAccess(narratorId),
-		enabled: !REMOTE_BUILD && !!narratorId,
-		gcTime: TERMINALS_QUERY_GC_TIME_MS,
-		staleTime: 30_000,
-	});
-	return data?.canOpen;
+	const query = useNarratorUiSummary(narratorId);
+	return REMOTE_BUILD || query.isError ? undefined : query.data?.canWrite;
 }
 
 /** How often an open details panel re-reads the subagents' terminals (they live on other pages). */
@@ -81,7 +103,8 @@ export function useTreeTerminals(narratorId: string) {
 export function useCreateNarratorTerminal(narratorId: string) {
 	const qc = useQueryClient();
 	const terminalCapability = useTerminalCapability();
-	const queryKey = ["terminals", { narratorId }] as const;
+	const { userId, token } = useNarratorUiScope();
+	const queryKey = ["terminals", { narratorId }, userId, token] as const;
 	return useMutation({
 		mutationFn: (data?: { name?: string; cols?: number; rows?: number; deviceId?: string }) => {
 			if (!terminalCapability.supported) {
@@ -94,6 +117,7 @@ export function useCreateNarratorTerminal(narratorId: string) {
 		onSuccess: (terminal) => {
 			appendTerminalToCache(qc, queryKey, terminal);
 			qc.invalidateQueries({ queryKey });
+			qc.invalidateQueries({ queryKey: ["narrator-ui-summary", narratorId] });
 		},
 	});
 }
@@ -107,6 +131,7 @@ export function useDeleteNarratorTerminal(narratorId: string) {
 				: api.deleteTerminal(id),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["terminals", { narratorId }] });
+			qc.invalidateQueries({ queryKey: ["narrator-ui-summary", narratorId] });
 		},
 	});
 }

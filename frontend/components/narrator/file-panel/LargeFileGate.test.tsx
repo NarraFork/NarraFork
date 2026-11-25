@@ -10,10 +10,14 @@ import { I18nextProvider } from "react-i18next";
 import { api } from "../../../lib/api";
 import { editorDocumentApi } from "../../../lib/api/editor-documents";
 import { fileReferenceApi } from "../../../lib/api/file-references";
+import { appearanceStore } from "../../../lib/appearance-preference-store";
 import en from "../../../locales/en/narrator.json";
 import { EditorRecoveryBoundary } from "../file-editor/EditorRecoveryBoundary";
 import { filePanelLoadPolicy, filePanelSizeLabel, LargeFileGate } from "./LargeFileGate";
 
+const fixtureUser = "large-file-fixture-user";
+const fixtureToken = "large-file-fixture-token";
+const preferencesKey = ["user-preferences", "ui", fixtureUser, fixtureToken] as const;
 const i18n = i18next.createInstance();
 const globals = new Map<string, PropertyDescriptor | undefined>();
 let root: Root;
@@ -48,6 +52,7 @@ beforeEach(async () => {
 		localStorage: {
 			getItem: (key: string) => storage.get(key) ?? null,
 			setItem: (key: string, value: string) => storage.set(key, value),
+			removeItem: (key: string) => storage.delete(key),
 		},
 		IS_REACT_ACT_ENVIRONMENT: true,
 	};
@@ -63,7 +68,11 @@ beforeEach(async () => {
 		});
 	confirm.mockClear();
 	storage.clear();
+	storage.set("narrafork_token", fixtureToken);
+	appearanceStore.activate(null, true);
 	client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
+	client.setQueryData(["auth", "me"], { id: fixtureUser });
+	client.setQueryData(preferencesKey, {});
 	readMode = spyOn(editorDocumentApi, "readMode").mockResolvedValue("raw-v2");
 	info = spyOn(fileReferenceApi, "info").mockImplementation(async (_narrator, target) => ({
 		target,
@@ -89,6 +98,9 @@ afterEach(async () => {
 	info.mockRestore();
 	readMode.mockRestore();
 	page.mockRestore();
+	client.clear();
+	appearanceStore.activate(null, true);
+	storage.clear();
 	for (const [key, value] of globals) {
 		if (value) Object.defineProperty(globalThis, key, value);
 		else Reflect.deleteProperty(globalThis, key);
@@ -269,7 +281,7 @@ test("the size prompt copies the path and reveals local files only when access i
 	const reveal = spyOn(api, "fsReveal").mockResolvedValue({ ok: true });
 	try {
 		client.setQueryData(["health"], { platform: "linux" });
-		client.setQueryData(["user-preferences"], { treatAsLocalAccess: false });
+		client.setQueryData(preferencesKey, { treatAsLocalAccess: false });
 		await render({ filePath: "/data/build/app.apk" });
 		expect(host.textContent).not.toContain("Show in File Manager");
 		await click("Copy file path");
@@ -277,7 +289,7 @@ test("the size prompt copies the path and reveals local files only when access i
 
 		await act(async () => root.unmount());
 		root = createRoot(host);
-		client.setQueryData(["user-preferences"], { treatAsLocalAccess: true });
+		client.setQueryData(preferencesKey, { treatAsLocalAccess: true });
 		await render({ filePath: "/data/build/app.apk" });
 		await click("Show in File Manager");
 		expect(reveal).toHaveBeenCalledWith("/data/build");

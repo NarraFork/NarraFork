@@ -1,5 +1,5 @@
-import { usePermissions } from "@frontend/hooks/usePermissions";
 import { narratorWSManager } from "@frontend/lib/narrator-ws-manager";
+import type { PendingPermission } from "@frontend/types/narrator";
 import { Badge, Group, Stack, Text } from "@mantine/core";
 import type { PermissionPolicyChangedEvent } from "@shared/permission-policy-events";
 import type { PermissionRuleRequestResult } from "@shared/permission-rule-request";
@@ -103,16 +103,23 @@ export function PermissionRuleReceiptDetails({
 }
 
 /** Refresh the existing permission lists without adding a persistent notice above the composer. */
-export function PermissionRulePolicySync({ narratorId }: { narratorId: string }) {
+export function PermissionRulePolicySync({
+	narratorId,
+	pendingPermissions,
+}: {
+	narratorId: string;
+	pendingPermissions: readonly PendingPermission[];
+}) {
 	const qc = useQueryClient();
-	const { data: pending } = usePermissions(narratorId);
 	const requestedRef = useRef(new Set<string>());
 	useEffect(() => {
-		for (const request of pending ?? []) {
+		// Keep observed tool IDs until completion, even if permission_resolved
+		// removes the parent pending row before the successful receipt arrives.
+		for (const request of pendingPermissions) {
 			if (request.toolName === "RequestPermissionRule" && typeof request.toolUseId === "string")
 				requestedRef.current.add(request.toolUseId);
 		}
-	}, [pending]);
+	}, [pendingPermissions]);
 	useEffect(() => {
 		const requested = requestedRef.current;
 		const refresh = (ownerId: string) => {

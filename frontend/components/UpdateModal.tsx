@@ -27,6 +27,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { usePlatform, useUpdateCapability } from "../hooks/usePlatform";
+import { runtimeSettingsQueryOptions } from "../hooks/useRuntimeSettings";
 import {
 	type UpdateDownloadResult,
 	useUpdateApply,
@@ -171,8 +172,7 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 	} = data;
 	// Subscribe to saved settings without starting an extra admin-only request.
 	const { data: savedSettings } = useQuery({
-		queryKey: ["settings"],
-		queryFn: api.getSettings,
+		...runtimeSettingsQueryOptions(),
 		enabled: false,
 	});
 	const recommendationState = useRef({ data, invalidated: false });

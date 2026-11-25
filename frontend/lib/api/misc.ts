@@ -819,7 +819,30 @@ export const miscApi = {
 			method: "POST",
 			body: JSON.stringify(body),
 		}),
-	nugGetQuota: (providerId: string) =>
+	nugGetCachedQuota: (
+		providerId: string,
+		options?: { signal?: AbortSignal; expectedGeneration?: number | string },
+	) => {
+		const query = new URLSearchParams({ providerId });
+		if (options?.expectedGeneration !== undefined)
+			query.set("expectedGeneration", String(options.expectedGeneration));
+		return request<{
+			generation: number;
+			quota: {
+				balance: number | null;
+				totalGranted: number | null;
+				detailedQuotaBalance: string | null;
+				fetchedAt: number;
+			} | null;
+		}>(`/nug/quotas?${query}`, {
+			...pickRequestOptions(options),
+			maxResponseBytes: 64 * 1024,
+			signal: options?.signal
+				? AbortSignal.any([options.signal, AbortSignal.timeout(15_000)])
+				: AbortSignal.timeout(15_000),
+		});
+	},
+	nugGetQuota: (providerId: string, options?: object) =>
 		request<{
 			balance: number;
 			totalGranted: number;
@@ -827,7 +850,7 @@ export const miscApi = {
 			extra?: unknown;
 			username?: string;
 			role?: string;
-		}>(`/nug/providers/${providerId}/quota`),
+		}>(`/nug/providers/${providerId}/quota`, pickRequestOptions(options)),
 	nugGetQuotas: () =>
 		request<
 			Record<

@@ -7,7 +7,7 @@ import {
 	useQuery,
 	useQueryClient,
 } from "@tanstack/react-query";
-import { useCallback, useEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from "react";
 import { api } from "../lib/api";
 import type {
 	ChatAttachment,
@@ -16,7 +16,10 @@ import type {
 	ChatRoomSummary,
 	ChatUnreadSummary,
 } from "../lib/api/chat";
+import { getToken, onTokenChange } from "../lib/api/client";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
+
+const activeRoomResolvers = new WeakMap<object, Map<string, number>>();
 
 const CHAT_GC_TIME_MS = 60_000;
 const CHAT_PAGE_SIZE = 50;
@@ -84,12 +87,37 @@ export function useChatUnread(enabled = true) {
 
 /** Resolve (lazily creating) the discussion room bound to a narrator. */
 export function useNarratorChatRoom(narratorId: string | undefined, enabled = true) {
+	const token = useSyncExternalStore(onTokenChange, getToken, () => null);
+	const queryClient = useQueryClient();
+	const queryKey = useMemo(
+		() => [...chatKeys.narratorRoom(narratorId ?? ""), token],
+		[narratorId, token],
+	);
+	const active = !REMOTE_BUILD && enabled && !!narratorId;
+	useEffect(() => {
+		if (!active) return;
+		let refs = activeRoomResolvers.get(queryClient);
+		if (!refs) {
+			refs = new Map();
+			activeRoomResolvers.set(queryClient, refs);
+		}
+		const key = JSON.stringify(queryKey);
+		refs.set(key, (refs.get(key) ?? 0) + 1);
+		return () => {
+			const remaining = (refs.get(key) ?? 1) - 1;
+			if (remaining) refs.set(key, remaining);
+			else {
+				refs.delete(key);
+				void queryClient.cancelQueries({ queryKey, exact: true });
+			}
+		};
+	}, [active, queryClient, queryKey]);
 	return useQuery({
-		queryKey: chatKeys.narratorRoom(narratorId ?? ""),
-		queryFn: () => api.getNarratorChatRoom(narratorId as string),
-		enabled: !REMOTE_BUILD && enabled && !!narratorId,
+		queryKey,
+		queryFn: ({ signal }) => api.getNarratorChatRoom(narratorId as string, signal),
+		enabled: active,
 		gcTime: CHAT_GC_TIME_MS,
-		staleTime: Number.POSITIVE_INFINITY,
+		staleTime: CHAT_SUMMARY_STALE_TIME_MS,
 	});
 }
 
@@ -132,10 +160,11 @@ export function useOpenChatDm() {
 export function useChatMessages(roomId: string | undefined) {
 	return useInfiniteQuery({
 		queryKey: chatKeys.messages(roomId ?? ""),
-		queryFn: ({ pageParam }) =>
+		queryFn: ({ pageParam, signal }) =>
 			api.listChatMessages(roomId as string, {
 				beforeSeq: pageParam ?? undefined,
 				limit: CHAT_PAGE_SIZE,
+				signal,
 			}),
 		initialPageParam: undefined as number | undefined,
 		getNextPageParam: (lastPage: ChatMessagePage) => lastPage.nextBeforeSeq ?? undefined,
@@ -168,7 +197,7 @@ export function useFlatChatMessages(
 	}, [data]);
 }
 
-export function useSendChatMessage(roomId: string | undefined) {
+export function useSendChatMessage(roomId: string | undefined, mirrorMessages = true) {
 	const qc = useQueryClient();
 	return useMutation({
 		mutationFn: (input: {
@@ -178,7 +207,7 @@ export function useSendChatMessage(roomId: string | undefined) {
 		}) => api.postChatMessage(roomId as string, input),
 		onSuccess: (message) => {
 			if (!roomId) return;
-			appendChatMessageToCache(qc, roomId, message);
+			if (mirrorMessages) appendChatMessageToCache(qc, roomId, message);
 			// Same patch-not-invalidate rule as the live path. Posting also advances
 			// the sender's own watermark server-side (`postMessage`), so the local
 			// unread is zeroed here instead of waiting for a read frame.
@@ -199,28 +228,44 @@ export function useDeleteChatMessage(roomId: string | undefined) {
 	});
 }
 
-export function useMarkChatRead(roomId: string | undefined) {
+export function useMarkChatRead(roomId: string | undefined, active = true) {
 	const qc = useQueryClient();
 	const lastSentRef = useRef(0);
+	const token = useSyncExternalStore(onTokenChange, getToken, () => null);
+	const readController = useMemo(
+		() => ({ roomId, active, token, controller: new AbortController() }),
+		[roomId, active, token],
+	);
+	useEffect(() => {
+		if (readController.controller.signal.aborted) readController.controller = new AbortController();
+		return () => {
+			readController.controller.abort();
+			lastSentRef.current = 0;
+		};
+	}, [readController]);
 	return useCallback(
 		(seq: number) => {
-			if (!roomId || seq <= lastSentRef.current) return;
+			if (!active || document.visibilityState === "hidden" || !roomId || seq <= lastSentRef.current)
+				return;
 			lastSentRef.current = seq;
+			const signal = readController.controller.signal;
 			api
-				.markChatRead(roomId, seq)
+				.markChatRead(roomId, seq, signal)
 				.then((result) => {
+					if (signal.aborted) return;
 					// Reading a room only zeroes ONE room's counters, so patch them in
 					// place. Invalidating instead would refetch `/chat/rooms`, whose
 					// unread probe is one query per membership — a per-scroll N+1.
 					clearChatRoomUnreadInCache(qc, roomId, result.lastReadSeq);
 				})
 				.catch(() => {
+					if (signal.aborted) return;
 					// A failed watermark is recoverable: the next read attempt re-sends a
 					// higher seq. Rewind so that retry is not suppressed.
 					lastSentRef.current = 0;
 				});
 		},
-		[qc, roomId],
+		[qc, roomId, active, readController],
 	);
 }
 
@@ -591,14 +636,13 @@ export function markChatMessageDeletedInCache(
  * down are gone (the server replays subscriptions, not history), so the history
  * query is invalidated once per reconnect to close the gap.
  */
-export function useChatRoomLive(roomId: string | undefined): void {
+export function useChatRoomLive(roomId: string | undefined, active = true, ownsJoin = true): void {
 	const qc = useQueryClient();
 
 	useEffect(() => {
-		if (REMOTE_BUILD) return;
-		if (!roomId) return;
+		if (REMOTE_BUILD || !active || !roomId) return;
 		const handleId = narratorWSManager.allocateId();
-		narratorWSManager.joinChatRoom(roomId, handleId);
+		if (ownsJoin) narratorWSManager.joinChatRoom(roomId, handleId);
 		const listener = narratorWSManager.addListener(
 			{
 				narratorIds: "*",
@@ -608,7 +652,8 @@ export function useChatRoomLive(roomId: string | undefined): void {
 				if (data.roomId !== roomId) return;
 				if (data.type === "chat:message") {
 					const message = data.message as ChatMessage;
-					appendChatMessageToCache(qc, roomId, message);
+					// A vlist owner mirrors only its committed window; it owns body writes.
+					if (ownsJoin) appendChatMessageToCache(qc, roomId, message);
 					applyChatMessageToRoomsCache(qc, roomId, message);
 					return;
 				}
@@ -635,16 +680,16 @@ export function useChatRoomLive(roomId: string | undefined): void {
 		// That is bounded (pages are capped at CHAT_PAGE_SIZE) and happens once per
 		// reconnect, not per message — unlike the per-frame invalidate this replaced.
 		const unsubscribeConnection = narratorWSManager.onConnectionChange((connected, isReconnect) => {
-			if (!connected || !isReconnect) return;
+			if (!ownsJoin || !connected || !isReconnect) return;
 			qc.invalidateQueries({ queryKey: chatKeys.messages(roomId) });
 		});
 
 		return () => {
 			unsubscribeConnection();
 			narratorWSManager.removeListener(listener);
-			narratorWSManager.leaveChatRoom(roomId, handleId);
+			if (ownsJoin) narratorWSManager.leaveChatRoom(roomId, handleId);
 		};
-	}, [qc, roomId]);
+	}, [qc, roomId, active, ownsJoin]);
 }
 
 /**

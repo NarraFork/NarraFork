@@ -43,6 +43,7 @@ export const COMPILED_WORKER_ENTRIES = [
 	"lib/agent/image-generation-response-worker.ts",
 	"lib/document-preview/worker.ts",
 	"lib/modeltrace/worker.ts",
+	"lib/model-options-worker.ts",
 	"services/editor-document-worker.ts",
 	"services/editor-document-stream-worker.ts",
 	"services/outline/edit-text-worker.ts",

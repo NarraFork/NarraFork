@@ -36,7 +36,8 @@ import { createRoot, type Root } from "react-dom/client";
 import { bumpFontRevisionForTest } from "./katex-runtime";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 import { measureCache } from "./measure-cache";
-import type { PretextDocumentFetchPage } from "./pretext-document-loader";
+import { invalidateCachedPretextDocument } from "./pretext-document-cache";
+import type { PretextDocumentLoadOptions } from "./pretext-document-loader";
 import { captureCoordinatorAnchor } from "./pretext-layout-coordinator";
 import type { PretextDocumentView, UsePretextDocumentResult } from "./usePretextDocument";
 import { usePretextDocument } from "./usePretextDocument";
@@ -144,7 +145,8 @@ function page(): PretextDocumentPageResult {
 const LOAD_OPTIONS = { fetchPage: async () => page() };
 let harnessWidth = 860;
 let harnessEpoch = 0;
-let harnessLoadOptions: { fetchPage: PretextDocumentFetchPage } = LOAD_OPTIONS;
+let harnessLoadOptions: PretextDocumentLoadOptions = LOAD_OPTIONS;
+let harnessSuspended = false;
 let harnessOverrides = new Map<string, number>();
 let harnessView: PretextDocumentView = { scrollTop: 0, viewportHeight: 720, pinnedToBottom: true };
 const readHeightOverrides = () => harnessOverrides;
@@ -161,6 +163,7 @@ let renders: UsePretextDocumentResult[] = [];
 function Harness() {
 	renders.push(
 		usePretextDocument("n1", {
+			suspended: harnessSuspended,
 			lod: 5,
 			widthBucket: String(harnessWidth),
 			contentWidth: harnessWidth,
@@ -204,6 +207,7 @@ beforeEach(() => {
 	harnessWidth = 860;
 	harnessEpoch = 0;
 	harnessLoadOptions = LOAD_OPTIONS;
+	harnessSuspended = false;
 	harnessOverrides = new Map();
 	harnessView = { scrollTop: 0, viewportHeight: 720, pinnedToBottom: true };
 	restoreDom = installDom();
@@ -224,6 +228,91 @@ afterEach(async () => {
 	restoreCanvas = null;
 	restoreDom?.();
 	restoreDom = null;
+});
+
+describe("usePretextDocument suspension", () => {
+	test("initial suspension fetches nothing and resume retains the loaded coordinator/window", async () => {
+		invalidateCachedPretextDocument("n1");
+		let pages = 0;
+		let refreshes = 0;
+		harnessLoadOptions = {
+			fetchPage: async () => {
+				pages++;
+				return page();
+			},
+			refreshWindow: async ({ window }) => {
+				refreshes++;
+				return { ...window, messageVersion: 12 };
+			},
+			refreshFailurePolicy: "retain",
+		};
+		harnessSuspended = true;
+		const root = await mount();
+		expect(pages).toBe(0);
+		expect(latest().status).toBe("idle");
+		harnessSuspended = false;
+		root.render(createElement(Harness));
+		await settle();
+		expect(pages).toBe(1);
+		const before = latest();
+		harnessSuspended = true;
+		root.render(createElement(Harness));
+		await settle();
+		expect(latest().document).toBe(before.document);
+		expect(latest().index).toBe(before.index);
+		expect(latest().readWindow).toBe(before.readWindow);
+		await latest().loadOlderAsync();
+		latest().reload();
+		await settle();
+		expect({ pages, refreshes }).toEqual({ pages: 1, refreshes: 0 });
+		harnessWidth = 640;
+		harnessSuspended = false;
+		root.render(createElement(Harness));
+		await settle();
+		expect(latest().readWindow).toBe(before.readWindow);
+		expect(latest().messageVersion).toBe(12);
+		expect(latest().manifest?.widthBucket).toBe("640");
+		expect({ pages, refreshes }).toEqual({ pages: 1, refreshes: 1 });
+		// Reconnect/explicit reload also uses host recovery, never a tail replacement.
+		latest().reload();
+		await settle();
+		expect({ pages, refreshes }).toEqual({ pages: 1, refreshes: 2 });
+	});
+
+	test("suspending a pending host refresh aborts it and rejects a late result", async () => {
+		invalidateCachedPretextDocument("n1");
+		let signal: AbortSignal | undefined;
+		let release = () => {};
+		let recovering = true;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		harnessLoadOptions = {
+			fetchPage: async () => page(),
+			refreshWindow: async ({ window, signal: s }) => {
+				signal = s;
+				if (recovering) await gate;
+				return { ...window, messageVersion: recovering ? 99 : 13 };
+			},
+		};
+		const root = await mount();
+		latest().reload();
+		await settle();
+		expect(signal?.aborted).toBe(false);
+		const retained = latest().document;
+		harnessSuspended = true;
+		root.render(createElement(Harness));
+		await settle();
+		expect(signal?.aborted).toBe(true);
+		release();
+		await settle();
+		expect(latest().document).toBe(retained);
+		recovering = false;
+		harnessSuspended = false;
+		root.render(createElement(Harness));
+		await settle();
+		expect(latest().messageVersion).toBe(13);
+	});
 });
 
 describe("usePretextDocument font-generation subscription", () => {

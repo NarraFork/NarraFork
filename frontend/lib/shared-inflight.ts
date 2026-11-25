@@ -27,7 +27,11 @@ export function createSharedInflight<T>() {
 			const controller = new AbortController();
 			const created: ReadEntry<T> = {
 				controller,
-				promise: Promise.resolve().then(() => read(controller.signal)),
+				promise: Promise.resolve().then(() => {
+					// StrictMode can detach every reader before this microtask starts.
+					controller.signal.throwIfAborted();
+					return read(controller.signal);
+				}),
 				readers: 0,
 				settled: false,
 			};

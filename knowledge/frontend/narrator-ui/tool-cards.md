@@ -40,7 +40,7 @@ keywords:
   - LeakedToolCallModal
   - DiffView
 status: draft
-verified_at: 878917e97
+verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 ---
 # 工具卡片
 
@@ -67,6 +67,7 @@ verified_at: 878917e97
   - 表单交互性强，vlist 不做零 DOM 副本，而是经 `vlist-permission-bridge` 挂真实组件。
 - 按钮条键盘规则（`PermButtonBar.tsx`）：⏎ 高亮与浏览器焦点保持在同一个按钮上；Enter 在活动条上执行高亮决策；焦点在别处自己拥有 Enter 的控件或有模态框时隐藏提示。
 - 权限规则回执只认输出里 `status` 为 `applied`/`alreadyExists`、`scope` 为 `narrator` 且带 requestId/ruleId/deviceId 的结果，字符串输出超 32000 字符直接忽略（`PermissionRuleResultNotice.tsx:readPermissionRuleReceipt`）；规则请求视图只做展示，权限以服务端冻结的提案为准（`permission-rule-request-view.ts`）。
+- `PermissionRulePolicySync` 直接消费 PanelWS 的 `pendingPermissions`，不为规则回执再调 `usePermissions`；已见 RequestPermissionRule 的 toolUseId 保留到完成回执处理，不能因 `permission_resolved` 先移除待审批行就丢失关联。仍按 receipt/requestId、实际子代理 owner 和策略变更事件失效相关规则列表（`PermissionRuleResultNotice.tsx`、`PermissionRulePolicySync.test.tsx`）。
 - 待决权限集合更新用结构共享的深比较（`pending-permissions-reconcile.ts`），整份 JSON 都参与比较，不用字段白名单。
 - 提问：`AskUserQuestionBanner`（同步提问）、`AsyncQuestionDetail`/`GlobalQuestionInbox`（异步提问与统一人工决策中心；列表只带摘要，展开行才持有表单）、`AskInPassingCard`（顺便提问）；历史回执只读（`AsyncQuestionHistoricalSnapshot`）。
 - 顺便提问的答案是独立的只读子叙述者：有 dock 时在聊天旁开面板，没有 dock（移动页、工作区预览）才导航（`ask-in-passing-open-target.ts`）。

@@ -20,7 +20,9 @@ export const createDmRoomSchema = z.object({
 
 export const chatMessagesQuerySchema = z.object({
 	/** Exclusive upper bound cursor; omit for the newest page. */
-	beforeSeq: z.coerce.number().int().positive().optional(),
+	beforeSeq: z.coerce.number().int().safe().positive().optional(),
+	/** Exclusive lower bound for fixed-range forward recovery. */
+	afterSeq: z.coerce.number().int().safe().min(0).optional(),
 	limit: z.coerce.number().int().min(1).max(100).optional(),
 });
 
