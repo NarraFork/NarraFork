@@ -14,7 +14,7 @@
  *  - the board names what a running worker did last, and the summary says whether anyone spoke
  *    to the coordinator yet.
  */
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -48,9 +48,12 @@ const work = await import("../../services/teams/work-items");
 const { capReviewSummaries, resetWorkStatCacheForTests } = await import(
 	"../../services/teams/team-work-view"
 );
-const { TEAM_EVENT_DETAIL_PREVIEW_CHARS, TEAM_WORK_DIFF_MAX_BYTES } = await import(
-	"@shared/project-teams"
-);
+const board = await import("../../services/teams/team-board");
+const {
+	TEAM_EVENT_DETAIL_PREVIEW_CHARS,
+	TEAM_REVIEW_SUMMARIES_TOTAL_CHARS,
+	TEAM_WORK_DIFF_MAX_BYTES,
+} = await import("@shared/project-teams");
 
 const OWNER = "work-owner";
 const MEMBER = "work-member";
@@ -782,6 +785,81 @@ describe("review findings in the drawer", () => {
 				actor,
 			}),
 		).rejects.toThrow("summary must be at most 1000 characters");
+	});
+
+	test("long findings are read row by row, newest first, only until the drawer has enough", async () => {
+		resetWorkStatCacheForTests();
+		const item = await newItem("Many findings item");
+		commitIn(work.worktreePathOf(item) ?? "", { "src/many.ts": "m\n" }, "many findings work");
+		const actor = { kind: "agent" as const, id: teamId };
+		// Each findings text is the longest allowed and escapes past the event preview.
+		const findings = (round: number) => `${round}`.padEnd(2, "-") + "\u0001".repeat(998);
+		const rounds = 15;
+		for (let round = 1; round <= rounds; round++)
+			await work.recordReview({
+				coordinatorId: teamId,
+				itemId: item.id,
+				verdict: round % 2 ? "blocker" : "clear",
+				findings: round,
+				summary: findings(round),
+				reviewer: null,
+				actor,
+			});
+		const reads = spyOn(board, "readReviewDetailText");
+		try {
+			for (const user of [OWNER, READER]) {
+				reads.mockClear();
+				const detail = await call(user, teamPath(`work/${item.id}`));
+				expect(detail.status).toBe(200);
+				// 6000 characters of findings is six rounds: the older nine are never read.
+				const kept = TEAM_REVIEW_SUMMARIES_TOTAL_CHARS / 1000;
+				expect(reads).toHaveBeenCalledTimes(kept);
+				const reviews = detail.body.reviews as {
+					round: number;
+					verdict: string;
+					findings: number | null;
+					summary: string | null;
+					summaryClipped?: boolean;
+				}[];
+				expect(reviews).toHaveLength(rounds);
+				reviews.forEach((review, index) => {
+					const round = index + 1;
+					// Every round keeps its verdict and count, read or not.
+					expect([review.round, review.verdict, review.findings]).toEqual([
+						round,
+						round % 2 ? "blocker" : "clear",
+						round,
+					]);
+					if (round > rounds - kept) {
+						expect(review.summary).toBe(findings(round));
+						expect(review.summaryClipped ?? false).toBe(false);
+					} else {
+						expect(review.summary).toBeNull();
+						expect(review.summaryClipped).toBe(true);
+					}
+				});
+				const timeline = detail.body.events.filter(
+					(event: { kind: string }) => event.kind === "work.review",
+				);
+				for (const event of timeline) expect(event.detailOmitted).toBe(false);
+			}
+		} finally {
+			reads.mockRestore();
+		}
+		expect((await call(OUTSIDER, teamPath(`work/${item.id}`))).status).toBe(404);
+	});
+
+	test("a long review's head gives its round, verdict and count", () => {
+		expect(
+			board.reviewHeadDetail('{"round":3,"verdict":"clear","findings":0,"summary":"\\u0001'),
+		).toEqual({ round: 3, verdict: "clear", findings: 0 });
+		expect(board.reviewHeadDetail('{"round":2,"verdict":"blocker","findings":4}')).toEqual({
+			round: 2,
+			verdict: "blocker",
+			findings: 4,
+		});
+		for (const head of [null, undefined, "", '{"verdict":"clear"}', '{"round":1,"verdict":"maybe"'])
+			expect(board.reviewHeadDetail(head)).toBeNull();
 	});
 
 	test("the findings one drawer sends are capped in all, newest rounds first", () => {
