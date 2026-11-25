@@ -5,6 +5,7 @@ import {
 	TEAM_EVENTS_PAGE_LIMIT,
 	TEAM_RETURN_REASON_MAX_LENGTH,
 	TEAM_SETTINGS_MAX_BYTES,
+	TEAM_WORK_START_MODES,
 	TEAM_WORK_STATS_IDS_MAX,
 } from "@shared/project-teams";
 import { z } from "zod";
@@ -34,6 +35,8 @@ export const teamSettingsSchema = z
 	.object({
 		coordinatorLimits: coordinatorLimitsSchema.optional(),
 		mergeNeedsPerson: z.boolean().optional(),
+		/** Where new work items start: `origin/<base>` or the local base (absent: the default). */
+		workStart: z.enum(TEAM_WORK_START_MODES).optional(),
 	})
 	.strict()
 	.refine((value) => utf8Bytes(JSON.stringify(value)) <= TEAM_SETTINGS_MAX_BYTES, {

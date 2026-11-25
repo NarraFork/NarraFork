@@ -1,0 +1,367 @@
+/**
+ * Base branch configuration (W): what counts as GitHub from origin's push URL, the cached hosting,
+ * where a team's new work items start (the team's setting, else the project's default, else
+ * `origin/<base>` on GitHub and the local base otherwise), and that `work.create` and `work.sync`
+ * follow it — fetching origin into the remote-tracking ref only, never the local base.
+ */
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { eq } from "drizzle-orm";
+import { db, sqlite } from "../../../db";
+import { narratorWorktreeResources, teamWorkEvents } from "../../../db/schema";
+import { generateId } from "../../../lib/id";
+import { safeSpawn } from "../../../lib/spawn";
+import { teamSettingsSchema } from "../../../lib/validators/project-teams";
+import { teamProjectSettingsSchema } from "../../../lib/validators/projects";
+import {
+	defaultWorkStart,
+	hostingOf,
+	hostingOfUrl,
+	parseRemoteUrl,
+	peekHosting,
+	setHostingSourceForTests,
+} from "../team-hosting";
+import { peekWorkStartDefault, projectWorkStartOf, resolveWorkStart } from "../team-work-start";
+import {
+	attachWorker,
+	createWorkItem,
+	setWorkItemPortsForTests,
+	syncWorkItem,
+	worktreePathOf,
+} from "../work-items";
+
+describe("origin's hosting", () => {
+	test("push URLs: scp, ssh, https with userinfo; owner/repo exactly", () => {
+		const table: [string, ReturnType<typeof parseRemoteUrl>][] = [
+			["git@github.com:acme/app.git", { host: "github.com", owner: "acme", repo: "app" }],
+			["github.com:acme/app", { host: "github.com", owner: "acme", repo: "app" }],
+			["ssh://git@GitHub.com/acme/app.git/", { host: "github.com", owner: "acme", repo: "app" }],
+			[
+				"ssh://git@ssh.github.com:443/acme/app.git",
+				{ host: "ssh.github.com", owner: "acme", repo: "app" },
+			],
+			[
+				"https://user:token@github.com/acme/app.git",
+				{ host: "github.com", owner: "acme", repo: "app" },
+			],
+			[
+				"https://gitlab.example.com/acme/app",
+				{ host: "gitlab.example.com", owner: "acme", repo: "app" },
+			],
+			["https://github.com/acme/app/extra", null],
+			["https://github.com/acme", null],
+			["/srv/git/app.git", null],
+			["file:///srv/git/app.git", null],
+			["C:\\repos\\app", null],
+			["", null],
+		];
+		for (const [url, expected] of table) expect(parseRemoteUrl(url)).toEqual(expected);
+		expect(hostingOfUrl("git@github.com:acme/app.git")).toEqual({
+			kind: "github",
+			host: "github.com",
+			owner: "acme",
+			repo: "app",
+		});
+		expect(hostingOfUrl("ssh://git@ssh.github.com:443/acme/app.git").kind).toBe("github");
+		// GitHub Enterprise counts as GitHub only once the PR flow's gh probe says so.
+		expect(hostingOfUrl("git@github.acme.corp:acme/app.git")).toEqual({
+			kind: "other",
+			host: "github.acme.corp",
+		});
+		expect(hostingOfUrl("/srv/git/app.git")).toEqual({ kind: "other", host: null });
+		expect(hostingOfUrl(null)).toEqual({ kind: "none" });
+		expect(defaultWorkStart({ kind: "github", host: "github.com", owner: "a", repo: "b" })).toBe(
+			"remote",
+		);
+		expect(defaultWorkStart({ kind: "other", host: null })).toBe("local");
+		expect(defaultWorkStart({ kind: "none" })).toBe("local");
+	});
+
+	test("the cache: one read at a time, kept 5 minutes (60 seconds after a failure)", async () => {
+		let now = 1_000_000;
+		let reads = 0;
+		let fail = false;
+		setHostingSourceForTests(
+			async () => {
+				reads++;
+				await Bun.sleep(5);
+				if (fail) throw new Error("git failed");
+				return "git@github.com:acme/app.git";
+			},
+			() => now,
+		);
+		try {
+			expect(peekHosting("/repo")).toBeNull();
+			expect(peekHosting("/repo")).toBeNull();
+			const read = await hostingOf("/repo");
+			expect(read.kind).toBe("github");
+			expect(reads).toBe(1);
+			expect(peekHosting("/repo")?.kind).toBe("github");
+			now += 4 * 60_000;
+			expect(peekHosting("/repo")?.kind).toBe("github");
+			expect(reads).toBe(1);
+			now += 2 * 60_000;
+			fail = true;
+			// Stale: still answered while read again; the failed read counts as no GitHub.
+			expect(peekHosting("/repo")?.kind).toBe("github");
+			await Bun.sleep(20);
+			expect(reads).toBe(2);
+			expect(peekHosting("/repo")).toEqual({ kind: "other", host: null });
+			fail = false;
+			now += 61_000;
+			expect((await hostingOf("/repo")).kind).toBe("github");
+			expect(reads).toBe(3);
+		} finally {
+			setHostingSourceForTests(null);
+		}
+	});
+
+	test("the settings accept a work start and refuse anything else", () => {
+		expect(teamSettingsSchema.safeParse({ workStart: "remote" }).success).toBe(true);
+		expect(teamSettingsSchema.safeParse({ workStart: "local" }).success).toBe(true);
+		expect(teamSettingsSchema.safeParse({ workStart: "origin" }).success).toBe(false);
+		expect(teamProjectSettingsSchema.safeParse({ workStart: "local" }).success).toBe(true);
+		expect(teamProjectSettingsSchema.safeParse({ workStart: "x" }).success).toBe(false);
+		expect(projectWorkStartOf('{"teams":{"workStart":"remote"}}')).toBe("remote");
+		expect(projectWorkStartOf({ teams: { workStart: "nope" } })).toBeNull();
+		expect(projectWorkStartOf("not json")).toBeNull();
+	});
+});
+
+// ── Work items start from the configured base ───────────────────────────────
+
+const LEAD = "ws-lead";
+const PROJECT = "ws-project";
+const USER = "ws-user";
+const NOW = "2026-11-25T00:00:00.000Z";
+const principal = { userId: USER, isAdmin: false };
+const agent = { kind: "agent" as const, id: LEAD };
+
+let temporary: string;
+let repo: string;
+let origin: string;
+let upstream: string;
+const savedGlobal = process.env.GIT_CONFIG_GLOBAL;
+
+async function git(args: string[], cwd = repo) {
+	const result = await safeSpawn({
+		cmd: ["git", "-C", cwd, ...args],
+		env: { ...process.env },
+		timeout: 20_000,
+		maxOutputBytes: 1024 * 1024,
+	});
+	if (result.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr}`);
+	return result.stdout.trim();
+}
+
+async function commitFile(cwd: string, file: string, text: string, message: string) {
+	await writeFile(join(cwd, file), text);
+	await git(["add", "--", file], cwd);
+	await git(["commit", "-qm", message], cwd);
+	return git(["rev-parse", "HEAD"], cwd);
+}
+
+function setTeamSettings(settings: Record<string, unknown>) {
+	sqlite.run("UPDATE project_teams SET settings_json = ? WHERE narrator_id = ?", [
+		JSON.stringify(settings),
+		LEAD,
+	]);
+}
+
+function setProjectSettings(settings: Record<string, unknown> | null) {
+	sqlite.run("UPDATE projects SET chapter_settings = ? WHERE id = ?", [
+		settings ? JSON.stringify(settings) : null,
+		PROJECT,
+	]);
+}
+
+const create = (title: string) =>
+	createWorkItem({
+		coordinatorId: LEAD,
+		title,
+		actor: agent,
+		principal,
+		signal: new AbortController().signal,
+	});
+
+function createdDetail(itemId: string) {
+	return db
+		.select({ detail: teamWorkEvents.detailJson })
+		.from(teamWorkEvents)
+		.where(eq(teamWorkEvents.workItemId, itemId))
+		.all()
+		.map((row) => row.detail)
+		.find((detail) => detail && "startFrom" in detail);
+}
+
+describe("where work starts", () => {
+	beforeAll(async () => {
+		temporary = await realpath(await mkdtemp(join(tmpdir(), "nf-team-start-")));
+		const config = join(temporary, "gitconfig");
+		await writeFile(
+			config,
+			"[user]\n\tname = T\n\temail = t@e.test\n[commit]\n\tgpgsign = false\n",
+		);
+		process.env.GIT_CONFIG_GLOBAL = config;
+	});
+
+	afterAll(async () => {
+		setWorkItemPortsForTests(null);
+		setHostingSourceForTests(null);
+		if (savedGlobal === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+		else process.env.GIT_CONFIG_GLOBAL = savedGlobal;
+		await rm(temporary, { recursive: true, force: true });
+	});
+
+	beforeEach(async () => {
+		setHostingSourceForTests(async () => null);
+		const root = await mkdtemp(join(temporary, "case-"));
+		repo = join(root, "repo");
+		origin = join(root, "origin.git");
+		await mkdir(repo);
+		await git(["init", "-q", "-b", "main"]);
+		await writeFile(join(repo, ".gitignore"), ".worktrees/\n");
+		await git(["add", ".gitignore"]);
+		await commitFile(repo, "a.txt", "a\n", "initial");
+		await mkdir(join(repo, ".worktrees"));
+		await git(["init", "-q", "--bare", "-b", "main", origin], root);
+		await git(["remote", "add", "origin", origin]);
+		await git(["push", "-q", "origin", "main"]);
+		// Someone else pushed to origin: origin/main is ahead of the local main.
+		const other = join(root, "other");
+		await git(["clone", "-q", origin, other], root);
+		upstream = await commitFile(other, "b.txt", "b\n", "upstream work");
+		await git(["push", "-q", "origin", "main"], other);
+		sqlite.run(
+			"INSERT INTO users (id, username, password_hash, role, created_at) VALUES (?, 'u', 'x', 'user', ?)",
+			[USER, NOW],
+		);
+		sqlite.run(
+			"INSERT INTO projects (id, name, git_path, created_at, updated_at) VALUES (?, 'p', ?, ?, ?)",
+			[PROJECT, repo, NOW, NOW],
+		);
+		sqlite.run(
+			`INSERT INTO narrators (id, type, title, traits, cwd, created_at, updated_at)
+			VALUES (?, 'primary', 'Lead', '["team"]', ?, ?, ?)`,
+			[LEAD, repo, NOW, NOW],
+		);
+		sqlite.run(
+			`INSERT INTO project_teams (narrator_id, project_id, base_branch, created_at, updated_at)
+			VALUES (?, ?, 'main', ?, ?)`,
+			[LEAD, PROJECT, NOW, NOW],
+		);
+		setWorkItemPortsForTests({
+			async createWorktree({ requestId, branchName, baseRef }) {
+				const path = join(repo, ".worktrees", requestId);
+				await git(["worktree", "add", "-q", "-b", branchName, "--", path, baseRef]);
+				db.insert(narratorWorktreeResources)
+					.values({
+						id: generateId(),
+						ownerNarratorId: LEAD,
+						deviceId: "local",
+						repositoryKey: "repository",
+						worktreePath: path,
+						state: "ready",
+						createRequestId: requestId,
+					})
+					.run();
+				return { path };
+			},
+			planRemoval: async () => {
+				throw new Error("not used");
+			},
+			removeWorktree: async () => {
+				throw new Error("not used");
+			},
+			principalOf: async (userId) => ({ userId, isAdmin: false }),
+		});
+	});
+
+	afterEach(() => {
+		for (const table of [
+			"team_work_events",
+			"team_work_items",
+			"project_teams",
+			"narrator_worktree_resources",
+		])
+			sqlite.run(`DELETE FROM ${table}`);
+		sqlite.run("DELETE FROM narrators WHERE id LIKE 'ws-%'");
+		sqlite.run("DELETE FROM projects WHERE id = ?", [PROJECT]);
+		sqlite.run("DELETE FROM users WHERE id = ?", [USER]);
+	});
+
+	test("the team's setting wins over the project's default, which wins over the hosting", async () => {
+		const local = await git(["rev-parse", "main"]);
+		expect(await resolveWorkStart({ projectId: PROJECT, settings: {} })).toBe("local");
+		expect(peekWorkStartDefault(PROJECT)).toBe("local");
+		setHostingSourceForTests(async () => "git@github.com:acme/app.git");
+		expect(peekWorkStartDefault(PROJECT)).toBeNull();
+		expect(await resolveWorkStart({ projectId: PROJECT, settings: {} })).toBe("remote");
+		expect(peekWorkStartDefault(PROJECT)).toBe("remote");
+		setProjectSettings({ teams: { workStart: "local" } });
+		expect(await resolveWorkStart({ projectId: PROJECT, settings: {} })).toBe("local");
+		expect(peekWorkStartDefault(PROJECT)).toBe("local");
+		expect(await resolveWorkStart({ projectId: PROJECT, settings: { workStart: "remote" } })).toBe(
+			"remote",
+		);
+
+		// GitHub, nothing configured on the project: new work starts from origin/main.
+		setProjectSettings(null);
+		const item = await create("From origin");
+		const path = worktreePathOf(item) ?? "";
+		expect(await git(["rev-parse", "HEAD"], path)).toBe(upstream);
+		expect(item.baseRef).toBe("main");
+		expect(createdDetail(item.id)).toMatchObject({ startFrom: "origin/main", baseRef: "main" });
+		// Fetched into the remote-tracking ref only: the local main and its checkout stay.
+		expect(await git(["rev-parse", "main"])).toBe(local);
+		expect(await git(["rev-parse", "refs/remotes/origin/main"])).toBe(upstream);
+		expect(await git(["status", "--porcelain"])).toBe("");
+		// No upstream tracking set on the item's branch.
+		await expect(git(["config", `branch.${item.branchName}.merge`])).rejects.toThrow();
+	});
+
+	test("local: new work starts from the local base, never fetching", async () => {
+		const local = await git(["rev-parse", "main"]);
+		setTeamSettings({ workStart: "local" });
+		const item = await create("From local");
+		expect(await git(["rev-parse", "HEAD"], worktreePathOf(item) ?? "")).toBe(local);
+		expect(createdDetail(item.id)).toMatchObject({ startFrom: "main" });
+		await expect(git(["rev-parse", "--verify", "refs/remotes/origin/main^{commit}"])).resolves.toBe(
+			local,
+		);
+	});
+
+	test("an unreachable origin starts from the remote-tracking ref as it is, or refuses", async () => {
+		setTeamSettings({ workStart: "remote" });
+		await git(["remote", "set-url", "origin", join(temporary, "missing.git")]);
+		const known = await git(["rev-parse", "refs/remotes/origin/main"]);
+		const item = await create("Offline");
+		expect(await git(["rev-parse", "HEAD"], worktreePathOf(item) ?? "")).toBe(known);
+		expect(createdDetail(item.id)).toMatchObject({ startFrom: "origin/main", fetched: false });
+		await git(["update-ref", "-d", "refs/remotes/origin/main"]);
+		await expect(create("Nothing to start from")).rejects.toMatchObject({
+			code: "TEAM_WORK_START_UNAVAILABLE",
+		});
+	});
+
+	test("work.sync brings in origin/<base> when the team starts from origin", async () => {
+		setTeamSettings({ workStart: "local" });
+		const item = await create("Sync me");
+		sqlite.run(
+			`INSERT INTO narrators (id, type, title, status, parent_narrator_id, acl_root_narrator_id, created_at, updated_at)
+			VALUES ('ws-worker', 'subagent', 'w', 'idle', ?, ?, ?, ?)`,
+			[LEAD, LEAD, NOW, NOW],
+		);
+		attachWorker(LEAD, item.id, "ws-worker", agent);
+		const local = await syncWorkItem({ coordinatorId: LEAD, itemId: item.id, actor: agent });
+		expect(local.outcome).toBe("up_to_date");
+		setTeamSettings({ workStart: "remote" });
+		const remote = await syncWorkItem({ coordinatorId: LEAD, itemId: item.id, actor: agent });
+		expect(remote).toMatchObject({ outcome: "handed_off", baseSha: upstream });
+		if (remote.outcome !== "handed_off") return;
+		expect(remote.instruction).toContain(`the base origin/main (commit ${upstream})`);
+		expect(remote.instruction).toContain(`git merge --no-ff ${upstream}`);
+	});
+});

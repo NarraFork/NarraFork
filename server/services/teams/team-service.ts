@@ -51,6 +51,7 @@ import {
 	runAsTeamStatusActor,
 	type TeamStatusActor,
 } from "./team-records";
+import { peekWorkStartDefault } from "./team-work-start";
 
 type TeamRow = typeof projectTeams.$inferSelect;
 type CoordinatorRow = {
@@ -110,6 +111,8 @@ function toDetail(team: TeamRow, coordinator: CoordinatorRow, access: TeamAccess
 		...toSummary(team, coordinator, utf8Bytes(team.brief), access),
 		brief: team.brief,
 		settings: team.settingsJson ?? {},
+		// W: what applies when the team sets no work start (cached hosting; null while checking).
+		workStartDefault: peekWorkStartDefault(team.projectId),
 	};
 }
 
