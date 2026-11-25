@@ -95,6 +95,57 @@ describe("applyActivityEvent", () => {
 		});
 	});
 
+	it("distinguishes parsed input from execution and ignores late starts", () => {
+		const start = { type: "tool_started", narratorId: "n", toolUseId: "t", toolName: "Read" };
+		const parsed = run([start]);
+		expect(parsed.get("n")?.tools[0]?.status).toBe("initializing");
+		const executing = run([{ type: "tool_executing", narratorId: "n", toolUseId: "t" }], parsed);
+		expect(executing.get("n")?.tools[0]?.status).toBe("running");
+		expect(run([start], executing).get("n")?.tools[0]?.status).toBe("running");
+		for (const status of ["pending", "success", "fail", "cancelled"]) {
+			const snapshot = run([
+				{
+					type: "activity_snapshot",
+					narratorId: "n",
+					toolCalls: [{ toolUseId: "t", toolName: "Read", status }],
+				},
+			]);
+			expect(run([start], snapshot).get("n")?.tools[0]?.status).toBe(status);
+		}
+	});
+
+	it("keeps an execution that arrives before the tool name, even if it finishes first", () => {
+		const executing = { type: "tool_executing", narratorId: "n", toolUseId: "t" };
+		const started = {
+			type: "tool_started",
+			narratorId: "n",
+			toolUseId: "t",
+			toolName: "Read",
+			inputSummary: { file_path: "a.ts" },
+		};
+		const eager = run([executing]);
+		expect(eager.get("n")?.tools).toEqual([
+			{ toolUseId: "t", toolName: "Tool", status: "running" },
+		]);
+		expect(run([started], eager).get("n")?.tools).toEqual([
+			{ toolUseId: "t", toolName: "Read", status: "running", inputSummary: { file_path: "a.ts" } },
+		]);
+		const completed = {
+			type: "tool_completed",
+			narratorId: "n",
+			toolUseId: "t",
+			status: "success",
+		};
+		expect(run([completed, started], eager).get("n")?.tools[0]?.status).toBe("success");
+		const bounded = run(
+			Array.from({ length: ACTIVITY_TOOL_ROWS + 3 }, (_, i) => ({
+				...executing,
+				toolUseId: `t${i}`,
+			})),
+		);
+		expect(bounded.get("n")?.tools).toHaveLength(ACTIVITY_TOOL_ROWS);
+	});
+
 	it("returns the same state for frames that change nothing", () => {
 		const state: ActivityState = new Map();
 		expect(applyActivityEvent(state, { type: "text", narratorId: "n" })).toBe(state);

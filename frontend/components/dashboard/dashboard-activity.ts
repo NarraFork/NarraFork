@@ -111,8 +111,12 @@ export function applyActivityEvent(
 				tools: upsertTool(current.tools, {
 					toolUseId,
 					toolName,
-					// A late `tool_started` must not pull a finished row back to running.
-					status: existing && existing.status !== "running" ? existing.status : "running",
+					// Parsed arguments are not execution: only `tool_executing` turns blue.
+					// Late starts must not rewind an executing or settled row.
+					status:
+						existing && isLiveToolStatusRegression(existing.status, "initializing")
+							? existing.status
+							: "initializing",
 					...(inputSummary ? { inputSummary } : {}),
 				}),
 			};
@@ -122,7 +126,18 @@ export function applyActivityEvent(
 		case "tool_completed": {
 			const toolUseId = str(data.toolUseId);
 			const existing = current.tools.find((tool) => tool.toolUseId === toolUseId);
-			if (!toolUseId || !existing) return state;
+			if (!toolUseId) return state;
+			if (!existing) {
+				if (data.type !== "tool_executing") return state;
+				// Eager execution may arrive before `tool_started` supplies the name.
+				// Keep that fact in the same bounded row list; the later start fills
+				// the label/input without demoting this row back to initializing.
+				next = {
+					...current,
+					tools: upsertTool(current.tools, { toolUseId, toolName: "Tool", status: "running" }),
+				};
+				break;
+			}
 			const status = data.type === "tool_executing" ? "running" : (str(data.status) ?? "");
 			if (status === existing.status || isLiveToolStatusRegression(existing.status, status))
 				return state;
