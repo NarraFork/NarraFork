@@ -166,7 +166,7 @@ export function createCommunicationReader(execute: SearchQueryExecutor) {
 				: (representatives.get(String(row.root_id)) ?? String(row.id)),
 			version: Number(row.version),
 			canManage: Number(row.can_manage) === 1,
-			canConnect: Number(row.can_manage) === 1,
+			canConnect: Number(row.can_manage) === 1 && row.status !== "archived",
 			restoreParentId:
 				row.original_parent_narrator_id &&
 				ids.has(String(row.original_parent_narrator_id)) &&

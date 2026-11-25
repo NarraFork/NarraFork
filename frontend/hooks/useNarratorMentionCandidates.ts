@@ -9,6 +9,7 @@ import {
 	useSyncExternalStore,
 } from "react";
 import { api } from "../lib/api";
+import type { CommunicationCandidatePurpose } from "../lib/api/narrator-communication";
 import {
 	isRecentTabsScopeCurrent,
 	recentTabsFlatQueryKey,
@@ -22,6 +23,7 @@ import {
 	type MentionSearchState,
 	mergeNarratorMentionCandidates,
 	NarratorMentionSearch,
+	narratorMentionSearchKey,
 } from "./narrator-mention-candidates";
 import type { RecentTab, RecentTabsInfiniteData } from "./useRecentTabs";
 
@@ -33,12 +35,13 @@ export function useNarratorMentionCandidates(
 	query: string | null,
 	enabled = true,
 	allowExact = enabled,
+	purpose?: CommunicationCandidatePurpose,
 ) {
 	const qc = useQueryClient();
 	const scope = useRecentTabsScope();
 	const owner = scope ? JSON.stringify(recentTabsScopeKey(scope)) : undefined;
 	const activeQuery = enabled ? query : null;
-	const key = JSON.stringify([owner, narratorId, activeQuery]);
+	const key = narratorMentionSearchKey(owner, narratorId, activeQuery, purpose);
 	const [remote, setRemote] = useState<MentionSearchState>();
 	const [verification, setVerification] = useState<{
 		targetId: string;
@@ -72,12 +75,12 @@ export function useNarratorMentionCandidates(
 	}, [scope, cancelVerification]);
 	useLayoutEffect(() => {
 		cancelVerification();
-		searchRef.current?.update(owner, narratorId, activeQuery);
+		searchRef.current?.update(owner, narratorId, activeQuery, purpose);
 		return () => {
 			searchRef.current?.cancel();
 			abortVerification();
 		};
-	}, [owner, narratorId, activeQuery, cancelVerification, abortVerification]);
+	}, [owner, narratorId, activeQuery, purpose, cancelVerification, abortVerification]);
 	useLayoutEffect(() => {
 		if (!allowExact) cancelVerification();
 	}, [allowExact, cancelVerification]);
@@ -134,7 +137,11 @@ export function useNarratorMentionCandidates(
 			}, COMMUNICATION_LIMITS.searchTimeoutMs);
 			controller.signal.addEventListener("abort", () => clearTimeout(timeout), { once: true });
 			void api
-				.searchCommunicationCandidates(narratorId, "", { targetId, signal: controller.signal })
+				.searchCommunicationCandidates(narratorId, "", {
+					targetId,
+					signal: controller.signal,
+					...(purpose !== undefined && { purpose }),
+				})
 				.then(
 					(result) => {
 						if (!isCurrent()) return;
@@ -154,7 +161,7 @@ export function useNarratorMentionCandidates(
 				.finally(() => clearTimeout(timeout));
 			return controller.signal;
 		},
-		[narratorId, allowExact, scope, abortVerification],
+		[narratorId, allowExact, purpose, scope, abortVerification],
 	);
 	const verifyCandidate = useCallback(
 		(targetId: string, onEligible: (candidate: CommunicationCandidate) => void) => {

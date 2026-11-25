@@ -16,7 +16,12 @@ import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
 const { db, sqlite, ready, close } = getNarratorWorkerTestDb();
 await ready;
-mock.module("../../db", () => ({ db, sqlite }));
+mock.module("../../db", () => ({
+	db,
+	sqlite,
+	activeDatabaseBackend: "sqlite",
+	postgresRuntime: null,
+}));
 mock.module("../../websocket/narrator-ws", () => ({
 	broadcastToUser: () => {},
 	getNarratorPresenceBatch: () => new Map(),

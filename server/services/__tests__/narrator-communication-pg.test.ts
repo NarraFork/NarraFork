@@ -207,17 +207,56 @@ test.each([
 });
 
 test.each([
-	"source",
-	"target",
-] as const)("PG exact candidate guard rereads persisted status of %s", async (endpoint) => {
+	["source", undefined],
+	["target", undefined],
+	["source", "manual-connect"],
+	["target", "manual-connect"],
+] as const)("PG exact candidate guard rereads persisted status of %s (%s)", async (endpoint, purpose) => {
 	grant("target");
 	const tx = adapter(sqlite);
+	const options = { liveTargetId: "target", purpose };
 	await expect(
-		communicationCandidateSearchGuardPg(tx, "source", "writer", "target"),
+		communicationCandidateSearchGuardPg(tx, "source", "writer", options),
 	).resolves.toMatchObject({ backend: "postgres" });
 	sqlite.run("UPDATE narrators SET status='archived' WHERE id=?", [endpoint]);
 	await expect(
-		communicationCandidateSearchGuardPg(tx, "source", "writer", "target"),
+		communicationCandidateSearchGuardPg(tx, "source", "writer", options),
+	).rejects.toMatchObject({ code: "COMMUNICATION_DENIED" });
+});
+
+test("PG manual candidate SQL uses the viewer, without widening the default or Send authority", async () => {
+	// Writer already has a grant to the other user's source and owns a private target.
+	sqlite.run("UPDATE narrators SET runtime_registration_json=NULL WHERE id='source'");
+	sqlite.run("UPDATE narrators SET owner_user_id='writer' WHERE id='target'");
+	sqlite.run(
+		"UPDATE narrator_communication_nodes SET parent_narrator_id=NULL WHERE narrator_id='target'",
+	);
+	const tx = adapter(sqlite);
+	const [execution, manual] = await Promise.all([
+		communicationCandidateSearchGuardPg(tx, "source", "writer"),
+		communicationCandidateSearchGuardPg(tx, "source", "writer", {
+			liveTargetId: "target",
+			purpose: "manual-connect",
+		}),
+	]);
+	const matches = ({ sql, params }: typeof manual) =>
+		sqlite.query(`SELECT n.id FROM narrators n WHERE n.id='target' AND (${sql})`).all(...params);
+	expect(matches(execution)).toEqual([]);
+	expect(matches(manual)).toEqual([{ id: "target" }]);
+	expect(execution.authorizationKey).not.toBe(manual.authorizationKey);
+	await commitUserCommunicationAdmissionPg(
+		tx,
+		{ sourceNarratorId: "source", userId: "writer", targetNarratorIds: ["target"] },
+		{ admissionId: "viewer" },
+	);
+	await expect(assertCommunicationSendAuthorizedPg(tx, "source", "target")).rejects.toMatchObject({
+		code: "COMMUNICATION_DENIED",
+	});
+	sqlite.run("UPDATE narrators SET owner_user_id='other' WHERE id='target'");
+	expect(matches(manual)).toEqual([]);
+	sqlite.run("UPDATE acl_grants SET capability='read' WHERE scope_id='source'");
+	await expect(
+		communicationCandidateSearchGuardPg(tx, "source", "writer", { purpose: "manual-connect" }),
 	).rejects.toMatchObject({ code: "COMMUNICATION_DENIED" });
 });
 

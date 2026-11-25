@@ -308,6 +308,35 @@ describe("communication forest and admission", () => {
 });
 
 describe("authorized real-schema topology projection", () => {
+	test.each([
+		"a",
+		"b",
+	])("archived endpoint %s stays manageable but cannot reconnect", async (archived) => {
+		seed("a");
+		seed("b");
+		await core.mutateCommunication("a", actor, { kind: "connect", targetNarratorId: "b" });
+		db.update(narrators).set({ status: "archived" }).where(eq(narrators.id, archived)).run();
+		const graph = await core.getCommunicationTopology({ kind: "narrator", narratorId: "a" }, actor);
+		for (const id of ["a", "b"]) {
+			expect(graph.nodes.find((entry) => entry.id === id)).toMatchObject({
+				canManage: true,
+				canConnect: id !== archived,
+			});
+		}
+		expect(graph.peers).toHaveLength(1);
+		expect(
+			await core.mutateCommunication("a", actor, {
+				kind: "disconnect",
+				peerId: graph.peers[0].id,
+			}),
+		).toEqual({ changed: true });
+		await expect(
+			core.mutateCommunication("a", actor, { kind: "connect", targetNarratorId: "b" }),
+		).rejects.toMatchObject({ code: "COMMUNICATION_DENIED" });
+		expect(sqlite.query("SELECT count(*) AS n FROM narrator_communication_peers").get()).toEqual({
+			n: 0,
+		});
+	});
 	test("hidden root and parent identities are replaced by a visible representative", async () => {
 		seed("secret", null, { ownerUserId: "other", visibility: "private" });
 		seed("visible", "secret", { type: "primary", ownerUserId: "writer", aclRootNarratorId: null });

@@ -7,6 +7,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { api } from "../lib/api";
 import { clearToken, confirmAuthUser, getAuthSnapshot, setToken } from "../lib/api/client";
+import type { CommunicationCandidatePurpose } from "../lib/api/narrator-communication";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
 import {
 	getRecentTabsScope,
@@ -22,8 +23,16 @@ let search: ReturnType<typeof spyOn<typeof api, "searchCommunicationCandidates">
 let result: ReturnType<typeof useNarratorMentionCandidates>;
 let onAccess: (event: Record<string, unknown>) => void;
 const originals = new Map<string, PropertyDescriptor | undefined>();
-function Probe({ query = "", source = "source" }: { query?: string; source?: string }) {
-	result = useNarratorMentionCandidates(source, query);
+function Probe({
+	query = "",
+	source = "source",
+	purpose,
+}: {
+	query?: string;
+	source?: string;
+	purpose?: CommunicationCandidatePurpose;
+}) {
+	result = useNarratorMentionCandidates(source, query, true, true, purpose);
 	return null;
 }
 function recent(id: string): PersistedRecentTab {
@@ -101,11 +110,11 @@ afterEach(async () => {
 	}
 	originals.clear();
 });
-async function render(query = "", source = "source") {
+async function render(query = "", source = "source", purpose?: CommunicationCandidatePurpose) {
 	await act(async () =>
 		root.render(
 			<QueryClientProvider client={client}>
-				<Probe query={query} source={source} />
+				<Probe query={query} source={source} purpose={purpose} />
 			</QueryClientProvider>,
 		),
 	);
@@ -251,6 +260,59 @@ test("only a selection checks an unknown candidate, and an eligible search hit i
 	expect(activate).toHaveBeenLastCalledWith(
 		expect.objectContaining({ id: "local", title: "local", canConnect: true }),
 	);
+});
+
+test("manual ranked eligibility must not be reused for a default @ selection", async () => {
+	seed(recent("target"));
+	search.mockImplementation(async (_source, _query, options) =>
+		options?.purpose === "manual-connect" ? eligible("target") : { items: [], hasMore: false },
+	);
+	await render("", "source", "manual-connect");
+	expect(search.mock.calls[0][2]?.purpose).toBe("manual-connect");
+	expect(result.candidates[0]?.canConnect).toBe(true);
+	const connect = mock();
+	await act(async () => result.verifyCandidate("target", connect));
+	expect(connect).toHaveBeenCalledTimes(1);
+	expect(search).toHaveBeenCalledTimes(1); // This ranked result is reusable only in its purpose.
+
+	await render();
+	expect(search.mock.calls[1][2]?.purpose).toBeUndefined();
+	expect(result.candidates[0]?.canConnect).toBeUndefined();
+	const insertReference = mock();
+	await act(async () => result.verifyCandidate("target", insertReference));
+	expect(search.mock.calls[2][2]).toEqual({ targetId: "target", signal: expect.any(AbortSignal) });
+	expect(result.verification).toEqual({ targetId: "target", status: "denied" });
+	expect(insertReference).not.toHaveBeenCalled();
+});
+
+test.each([
+	"ranked",
+	"exact",
+] as const)("a late manual %s result is aborted when the same source and query switch to @", async (kind) => {
+	seed(recent("target"));
+	const pending = Promise.withResolvers<CommunicationCandidates>();
+	search.mockImplementation(async (_source, _query, options) =>
+		options?.purpose === "manual-connect" && (kind === "exact") === !!options.targetId
+			? pending.promise
+			: { items: [], hasMore: false },
+	);
+	await render("", "source", "manual-connect");
+	const activate = mock();
+	if (kind === "exact") {
+		await act(async () => result.verifyCandidate("target", activate));
+		expect(search.mock.calls[1][2]).toEqual({
+			targetId: "target",
+			purpose: "manual-connect",
+			signal: expect.any(AbortSignal),
+		});
+	}
+	const signal = search.mock.calls.at(-1)?.[2]?.signal;
+	await render();
+	expect(signal?.aborted).toBe(true);
+	await act(async () => pending.resolve(eligible("target")));
+	expect(result.candidates[0]?.canConnect).toBeUndefined();
+	expect(result.verification).toBeUndefined();
+	expect(activate).not.toHaveBeenCalled();
 });
 
 test.each([

@@ -50,6 +50,8 @@ interface UndoEntry {
 	sourceId: string;
 	kind: "connect" | "disconnect" | "split" | "restore";
 	targetId?: string;
+	/** Last visible eligibility for the inverse; disconnected neighbors leave the projection. */
+	canReconnect?: boolean;
 }
 
 export interface CommunicationTopologyPanelProps {
@@ -161,6 +163,12 @@ export function CommunicationTopologyView({
 			const priorPeer = topologyRef.current?.peers.find(
 				(peer) => action.mutation.kind === "disconnect" && peer.id === action.mutation.peerId,
 			);
+			const canReconnect =
+				!!priorPeer &&
+				[priorPeer.endpointLo, priorPeer.endpointHi].every((id) => {
+					const endpoint = topologyRef.current?.nodes.find((entry) => entry.id === id);
+					return endpoint?.canConnect && endpoint.status !== "archived";
+				});
 			try {
 				const result = await api.mutateCommunication(action.sourceId, action.mutation, {
 					signal: AbortSignal.timeout(10_000),
@@ -175,6 +183,7 @@ export function CommunicationTopologyView({
 					setUndo({
 						sourceId: action.sourceId,
 						kind: action.mutation.kind,
+						canReconnect,
 						targetId:
 							action.mutation.kind === "connect"
 								? action.mutation.targetNarratorId
@@ -212,8 +221,18 @@ export function CommunicationTopologyView({
 			);
 			return peer ? disconnectAction(peer, topology.nodes) : null;
 		}
-		if (undo.kind === "disconnect" && node?.canConnect && undo.targetId)
-			return { sourceId: node.id, mutation: { kind: "connect", targetNarratorId: undo.targetId } };
+		if (undo.kind === "disconnect" && undo.canReconnect && undo.targetId) {
+			const target = topology.nodes.find((candidate) => candidate.id === undo.targetId);
+			if (
+				(node && (!node.canConnect || node.status === "archived")) ||
+				(target && (!target.canConnect || target.status === "archived"))
+			)
+				return null;
+			return {
+				sourceId: undo.sourceId,
+				mutation: { kind: "connect", targetNarratorId: undo.targetId },
+			};
+		}
 		if (!node?.canManage) return null;
 		if (undo.kind === "split" && node.restoreParentId && !node.parentNarratorId)
 			return { sourceId: node.id, mutation: { kind: "restore", version: node.version } };
@@ -1030,7 +1049,7 @@ function ConnectDialog({
 	const [composing, setComposing] = useState(false);
 	const [alreadyRelated, setAlreadyRelated] = useState<"sameGroup" | "connected">();
 	const { candidates, loading, error, hasMore, verification, verifyCandidate, cancelVerification } =
-		useNarratorMentionCandidates(sourceId, query, live);
+		useNarratorMentionCandidates(sourceId, query, live, live, "manual-connect");
 	const checking = verification?.status === "checking";
 	const connectionRejection = (candidate: (typeof candidates)[number]) =>
 		candidate.sameGroup

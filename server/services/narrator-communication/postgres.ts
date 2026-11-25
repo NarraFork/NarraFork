@@ -10,6 +10,7 @@ import { resolveRuntimePolicy } from "../agent-runtime/policy";
 import type { PgRuntimeTx } from "../agent-runtime/postgres-runtime-queue";
 import type { NarratorPrincipal } from "../narrator-acl";
 import { bindPlaceholders, narratorProjectIdText } from "../read/acl-sql";
+import type { CommunicationCandidateSearchOptions } from "../search/communication-candidates";
 import {
 	communicationAuthorityText,
 	communicationWritableText,
@@ -157,11 +158,15 @@ export async function communicationCandidateSearchGuardPg(
 	tx: CommunicationPgTx,
 	source: string,
 	userId: string,
-	liveTargetId?: string,
+	{
+		liveTargetId,
+		purpose,
+	}: { liveTargetId?: string; purpose?: CommunicationCandidateSearchOptions["purpose"] } = {},
 ) {
 	const viewer = await principal(tx, userId);
-	await write(tx, source, viewer);
-	const actor = await executionActor(tx, source); // Also locks and checks the source is live.
+	const manual = purpose === "manual-connect";
+	await write(tx, source, viewer, manual);
+	const actor = manual ? viewer : await executionActor(tx, source); // Also checks the source is live.
 	if (
 		liveTargetId !== undefined &&
 		!(
@@ -178,10 +183,12 @@ export async function communicationCandidateSearchGuardPg(
 			? { sql: "1=1", params: [] as string[] }
 			: communicationWritePredicate("n", viewer);
 	return {
-		sql: `(${viewerWrite.sql}) AND (${predicate.sql}) AND ${communicationAuthorityText("n")}`,
+		sql: manual
+			? predicate.sql
+			: `(${viewerWrite.sql}) AND (${predicate.sql}) AND ${communicationAuthorityText("n")}`,
 		params: [...viewerWrite.params, ...predicate.params],
 		viewerIsAdmin: viewer.isAdmin,
-		authorizationKey: JSON.stringify([viewer, actor]),
+		authorizationKey: JSON.stringify(manual ? [purpose, viewer] : [viewer, actor]),
 		backend: "postgres" as const,
 	};
 }

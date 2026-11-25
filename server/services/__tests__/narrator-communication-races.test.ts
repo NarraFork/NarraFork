@@ -170,12 +170,84 @@ test("canConnect candidates require both the submitting viewer and persistent ac
 		hasMore: false,
 	});
 });
+test("manual ranked and exact search let Alice connect writable sessions without granting Bob's execution account Send", async () => {
+	const alice = actor;
+	const bob = { userId: "other", isAdmin: false };
+	seed("bob-source", null, { ownerUserId: bob.userId });
+	seed("alice-private", null, { ownerUserId: alice.userId });
+	sqlite.run(
+		"INSERT INTO acl_grants(id,scope_type,scope_id,principal_type,principal_id,capability,created_at) VALUES ('alice-source','narrator','bob-source','user',?,'write',?)",
+		[alice.userId, now],
+	);
+	const targetId = "alice-private";
+	for (const selector of [{ query: "alice-private" }, { targetId }]) {
+		expect((await searchCommunicationCandidates("bob-source", alice, selector)).items).toEqual([]);
+		expect(
+			(
+				await searchCommunicationCandidates("bob-source", alice, {
+					...selector,
+					purpose: "manual-connect",
+				})
+			).items,
+		).toMatchObject([{ id: targetId, canConnect: true }]);
+	}
+	await expect(
+		core.mutateCommunication("bob-source", alice, { kind: "connect", targetNarratorId: targetId }),
+	).resolves.toEqual({ changed: true });
+	expect(core.communicationReachableTx(db, "bob-source", targetId)).toBe(true);
+	expect((await searchCommunicationCandidates("bob-source", alice, { targetId })).items).toEqual(
+		[],
+	);
+	await expect(
+		core.assertCommunicationSendAuthorized("bob-source", targetId),
+	).rejects.toMatchObject({ statusCode: 404 });
+});
+
+test("manual candidates require viewer write on both source and target", async () => {
+	seed("source", null, { ownerUserId: "other" });
+	seed("target", null, { ownerUserId: "other" });
+	for (const id of ["source", "target"])
+		sqlite.run(
+			"INSERT INTO acl_grants(id,scope_type,scope_id,principal_type,principal_id,capability,created_at) VALUES (?, 'narrator',?,'user','writer','read',?)",
+			[`manual-read-${id}`, id, now],
+		);
+	const options = { purpose: "manual-connect", targetId: "target" } as const;
+	await expect(searchCommunicationCandidates("source", actor, options)).rejects.toMatchObject({
+		statusCode: 404,
+	});
+	sqlite.run("UPDATE acl_grants SET capability='write' WHERE id='manual-read-source'");
+	expect((await searchCommunicationCandidates("source", actor, options)).items).toEqual([]);
+	expect(
+		(
+			await searchCommunicationCandidates("source", actor, {
+				purpose: "manual-connect",
+				query: "target",
+			})
+		).items,
+	).toEqual([]);
+	expect(
+		(await searchCommunicationCandidates("source", actor, { targetId: "target" })).items,
+	).toEqual([]);
+	await expect(
+		core.mutateCommunication("source", actor, { kind: "connect", targetNarratorId: "target" }),
+	).rejects.toMatchObject({ statusCode: 404 });
+	expect(sqlite.query("SELECT id FROM narrator_communication_peers").all()).toEqual([]);
+});
+
 test("exact candidate lookup still enforces the source runtime ceiling", async () => {
 	seed("source", null, { traits: withRuntimePolicyTrait([], { version: 1, tools: ["Read"] }) });
 	seed("target");
 	await expect(
 		searchCommunicationCandidates("source", actor, { targetId: "target" }),
 	).rejects.toMatchObject({ code: "COMMUNICATION_DENIED" });
+	expect(
+		(
+			await searchCommunicationCandidates("source", actor, {
+				targetId: "target",
+				purpose: "manual-connect",
+			})
+		).items,
+	).toMatchObject([{ id: "target", canConnect: true }]);
 });
 test("candidate SQL applies ACL before LIMIT and short Chinese matches beyond any recent-N preselection", async () => {
 	seed("source");

@@ -6,6 +6,7 @@ import { readRuntimeRegistrationColumn } from "../../lib/validators/runtime-regi
 import { resolveRuntimePolicy } from "../agent-runtime/policy";
 import type { NarratorPrincipal } from "../narrator-acl";
 import { bindPlaceholders, narratorProjectIdText } from "../read/acl-sql";
+import type { CommunicationCandidateSearchOptions } from "../search/communication-candidates";
 import {
 	communicationAuthorityText,
 	communicationReadableText,
@@ -141,6 +142,7 @@ export async function communicationCandidateSearchGuard(
 		deadlineAt: number;
 		backend?: "sqlite" | "postgres";
 		liveTargetId?: string;
+		purpose?: CommunicationCandidateSearchOptions["purpose"];
 	},
 ): Promise<{
 	sql: string;
@@ -160,20 +162,26 @@ export async function communicationCandidateSearchGuard(
 			"./postgres"
 		);
 		return withCommunicationPgTransaction(postgresRuntime.client.db, (tx) =>
-			communicationCandidateSearchGuardPg(
-				tx,
-				sourceNarratorId,
-				principal.userId,
-				options.liveTargetId,
-			),
+			communicationCandidateSearchGuardPg(tx, sourceNarratorId, principal.userId, options),
 		);
 	}
 	return db.transaction((tx) => {
 		const viewer = currentCommunicationPrincipalTx(tx, principal.userId);
 		assertCommunicationAccessTx(tx, sourceNarratorId, viewer, "write");
-		if (options.liveTargetId !== undefined) {
+		const manual = options.purpose === "manual-connect";
+		if (manual || options.liveTargetId !== undefined)
 			assertLiveCommunicationEndpointTx(tx, sourceNarratorId);
+		if (options.liveTargetId !== undefined)
 			assertLiveCommunicationEndpointTx(tx, options.liveTargetId);
+		if (manual) {
+			// Match the manual mutation: the viewer must write both endpoints. The
+			// connection does not grant Send permission to either execution account.
+			return {
+				...communicationWritePredicate("n", viewer),
+				viewerIsAdmin: viewer.isAdmin,
+				authorizationKey: JSON.stringify(["manual-connect", viewer]),
+				backend: "sqlite" as const,
+			};
 		}
 		const [row] = tx.all<{ ownerUserId: string | null; registration: unknown }>(
 			sql`SELECT owner_user_id AS ownerUserId, runtime_registration_json AS registration FROM narrators WHERE id = ${sourceNarratorId} LIMIT 1`,

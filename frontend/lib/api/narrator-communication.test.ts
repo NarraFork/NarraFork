@@ -53,6 +53,23 @@ test("exact candidate lookup sends targetId separately from the query", async ()
 	});
 });
 
+test.each([
+	undefined,
+	"old-narrator_1",
+] as const)("manual candidate requests serialize purpose (%s)", async (targetId) => {
+	let requested: URL | undefined;
+	globalThis.fetch = (async (url: string | URL | Request) => {
+		requested = new URL(String(url), "http://test");
+		return Response.json({ items: [], hasMore: false });
+	}) as unknown as typeof fetch;
+	await narratorCommunicationApi.searchCommunicationCandidates("source", "", {
+		targetId,
+		purpose: "manual-connect",
+	});
+	expect(requested?.searchParams.get("purpose")).toBe("manual-connect");
+	expect(requested?.searchParams.get("targetId")).toBe(targetId ?? null);
+});
+
 test("management preserves the exact relation identity without adding an inbox send", async () => {
 	const requests: Array<{ path: string; method?: string; body: unknown }> = [];
 	globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {

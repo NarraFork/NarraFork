@@ -5,6 +5,7 @@ import {
 } from "@shared/narrator-communication";
 import { foldHandle } from "@shared/narrator-handle";
 import type { PersistedRecentTab } from "@shared/recent-tabs";
+import type { CommunicationCandidatePurpose } from "../lib/api/narrator-communication";
 import { recentTabLiveNarratorId } from "./recent-tabs-utils";
 
 // A loaded recent tab proves visibility, not write eligibility for this source. A missing
@@ -105,8 +106,17 @@ export interface MentionSearchState {
 type Search = (
 	sourceId: string,
 	query: string,
-	options: { signal: AbortSignal; limit?: number },
+	options: { signal: AbortSignal; limit?: number; purpose?: CommunicationCandidatePurpose },
 ) => Promise<CommunicationCandidates>;
+
+export function narratorMentionSearchKey(
+	ownerId: string | undefined,
+	sourceId: string | undefined,
+	query: string | null,
+	purpose?: CommunicationCandidatePurpose,
+): string {
+	return JSON.stringify([ownerId, sourceId, purpose, query]);
+}
 
 /** Leading + latest trailing throttle. Cancellation invalidates immediately, before the next window. */
 export class NarratorMentionSearch {
@@ -122,15 +132,20 @@ export class NarratorMentionSearch {
 		private emit: (value: MentionSearchState) => void,
 	) {}
 
-	update(ownerId: string | undefined, sourceId: string | undefined, query: string | null): void {
+	update(
+		ownerId: string | undefined,
+		sourceId: string | undefined,
+		query: string | null,
+		purpose?: CommunicationCandidatePurpose,
+	): void {
 		this.cancel();
-		const scope = JSON.stringify([ownerId, sourceId]);
+		const scope = narratorMentionSearchKey(ownerId, sourceId, null, purpose);
 		if (scope !== this.scope) {
 			this.cache.clear();
 			this.lastStarted = Number.NEGATIVE_INFINITY;
 			this.scope = scope;
 		}
-		const key = JSON.stringify([ownerId, sourceId, query]);
+		const key = narratorMentionSearchKey(ownerId, sourceId, query, purpose);
 		this.key = key;
 		if (!ownerId || !sourceId || query === null) {
 			this.emit({ key, items: [], loading: false, error: false, hasMore: false });
@@ -153,6 +168,7 @@ export class NarratorMentionSearch {
 			void this.search(sourceId, query.slice(0, COMMUNICATION_LIMITS.searchQueryChars), {
 				signal: controller.signal,
 				limit: COMMUNICATION_LIMITS.searchMaxLimit,
+				...(purpose !== undefined && { purpose }),
 			})
 				.then((result) => {
 					if (generation !== this.generation || controller.signal.aborted) return;

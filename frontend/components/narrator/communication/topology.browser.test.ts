@@ -503,6 +503,100 @@ test.each([
 	}
 }, 30_000);
 
+test.each([
+	"source-archived",
+	"target-archived",
+	"target-readonly",
+	"late-archive",
+	"active-pruned",
+	"active-source-pruned",
+])("disconnect Undo respects both endpoints: %s", async (scenario) => {
+	const { page, errors, close } = await open();
+	try {
+		const peer = topology.peers[0];
+		const sourceId = scenario === "active-source-pruned" ? peer.endpointLo : peer.endpointHi;
+		const targetId = sourceId === peer.endpointLo ? peer.endpointHi : peer.endpointLo;
+		const source = topology.nodes.find((node) => node.id === sourceId);
+		const target = topology.nodes.find((node) => node.id === targetId);
+		if (!source || !target) throw new Error("Missing disconnect endpoints");
+		if (scenario === "active-source-pruned") {
+			topology.nodes.sort((a, b) => Number(b.id === sourceId) - Number(a.id === sourceId));
+			// Ordering is snapshot data; an empty delta deliberately does not reorder nodes.
+			await call(page, (fixture) => fixture.setPanelVisible(false));
+			await page.waitForFunction(
+				() => document.querySelectorAll("[data-topology-node]").length === 0,
+			);
+			await call(page, (fixture) => fixture.setPanelVisible(true));
+			await page.waitForSelector('[data-topology-node="reviewer"]');
+		}
+		if (scenario === "source-archived") {
+			source.status = "archived";
+			source.canConnect = false;
+		} else if (scenario === "target-archived") {
+			// Even a stale affirmative capability cannot override a known archived status.
+			target.status = "archived";
+		} else if (scenario === "target-readonly") target.canConnect = false;
+		publish();
+		const edge = await point(page, 'svg path[role="button"]');
+		await page.mouse.click(edge.x, edge.y);
+		await page.waitForSelector('[data-testid="topology-details"]');
+		await page.$$eval('[data-testid="topology-details"] button', (buttons) => {
+			const disconnect = buttons.find((button) => button.textContent?.includes("Disconnect link"));
+			if (!disconnect) throw new Error("Missing disconnect action");
+			(disconnect as HTMLButtonElement).click();
+		});
+		await page.waitForSelector('[role="dialog"]');
+		await page.click('[role="dialog"] button:last-child');
+		await waitMutation(page, 1);
+		expect(mutations[0]).toEqual({
+			sourceId: source.id,
+			mutation: { kind: "disconnect", peerId: peer.id },
+		});
+		if (scenario === "late-archive") {
+			target.status = "archived";
+			target.canConnect = false;
+			publish();
+		} else if (scenario.startsWith("active-")) {
+			// A disconnected neighboring group leaves the projection, not the backing store.
+			const pruned = scenario === "active-source-pruned" ? source : target;
+			const persisted = topology.nodes;
+			topology.nodes = persisted.filter((node) => node.groupId !== pruned.groupId);
+			publish();
+			topology.nodes = persisted;
+			await page.waitForFunction(
+				(id) => !document.querySelector(`[data-topology-node="${id}"]`),
+				{},
+				pruned.id,
+			);
+		}
+		const disabled = !scenario.startsWith("active-");
+		await page.waitForFunction(
+			(expected) => {
+				const undo = [...document.querySelectorAll<HTMLButtonElement>("button")].find(
+					(button) => button.textContent?.trim() === "Undo",
+				);
+				return !!undo && undo.disabled === expected;
+			},
+			{},
+			disabled,
+		);
+		await page.$$eval("button", (buttons) => {
+			buttons.find((button) => button.textContent?.trim() === "Undo")?.click();
+		});
+		if (disabled) expect(mutations).toHaveLength(1);
+		else {
+			await waitMutation(page, 2);
+			expect(mutations.at(-1)).toEqual({
+				sourceId: source.id,
+				mutation: { kind: "connect", targetNarratorId: target.id },
+			});
+		}
+		expect(errors).toEqual([]);
+	} finally {
+		await close();
+	}
+}, 30_000);
+
 test("dock visibility unsubscribes and reopens a fresh snapshot without unmounting the sibling composer", async () => {
 	const { page, errors, close } = await open(720, { withComposer: true });
 	await page.type('[data-testid="persistent-composer"]', " · keep while hidden");

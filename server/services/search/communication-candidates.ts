@@ -45,6 +45,7 @@ export interface CommunicationCandidateSearchOptions {
 	limit?: number;
 	signal?: AbortSignal;
 	targetId?: string;
+	purpose?: "manual-connect";
 }
 
 /** Trusted SQL only: aliases n (candidate) and source, with bound ? parameters. */
@@ -65,6 +66,7 @@ export type CommunicationCandidateSearchGuard = (
 		deadlineAt: number;
 		backend: "sqlite" | "postgres";
 		liveTargetId?: string;
+		purpose?: CommunicationCandidateSearchOptions["purpose"];
 	},
 ) => Promise<CommunicationCandidateSearchPredicate>;
 
@@ -193,10 +195,11 @@ export function createCommunicationCandidateSearcher(dependencies: {
 		principal: CommunicationCandidatePrincipal,
 		options: CommunicationCandidateSearchOptions = {},
 	): Promise<CommunicationCandidates> => {
-		const { targetId } = options;
+		const { targetId, purpose } = options;
 		if (
 			!validId(sourceNarratorId) ||
 			(targetId !== undefined && !validId(targetId)) ||
+			(purpose !== undefined && purpose !== "manual-connect") ||
 			!validId(principal?.userId) ||
 			typeof principal.isAdmin !== "boolean" ||
 			(options.query !== undefined &&
@@ -236,13 +239,14 @@ export function createCommunicationCandidateSearcher(dependencies: {
 		try {
 			return await Promise.race([
 				(async () => {
-					// This guard resolves persistent source authority and runtime ceiling BEFORE
-					// selection. Its candidate predicate is part of SQL, never a post-limit filter.
+					// Resolve the selected policy before SQL so unauthorized rows never consume LIMIT.
+					// Only manual connect uses the viewer alone; the default includes execution authority.
 					const accessEpoch = (dependencies.getAccessEpoch ?? getCommunicationAccessEpoch)();
 					const guard = await dependencies.authorize(sourceNarratorId, principal, {
 						signal: controller.signal,
 						deadlineAt: startedAt + timeoutMs,
 						backend: dependencies.backend ?? "sqlite",
+						purpose,
 					});
 					controller.signal.throwIfAborted();
 					if (!guard?.sql || !Array.isArray(guard.params)) throw unavailable();
@@ -262,6 +266,7 @@ export function createCommunicationCandidateSearcher(dependencies: {
 						signal: controller.signal,
 						deadlineAt: startedAt + timeoutMs,
 						backend: dependencies.backend ?? "sqlite",
+						purpose,
 						// A cascade can commit the target's archive before its status event is emitted.
 						liveTargetId: rows.length ? targetId : undefined,
 					});

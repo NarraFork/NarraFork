@@ -50,12 +50,36 @@ test("candidate route forwards the authenticated principal, query, limit and abo
 	]);
 });
 test.each([
+	false,
+	true,
+])("candidate route forwards manual purpose for ranked or exact requests (%j)", async (exact) => {
+	const { app, calls, userId } = fixture();
+	const response = await app.request(
+		`/source/communication/candidates?purpose=manual-connect${exact ? "&targetId=target" : "&q=term"}`,
+	);
+	expect(response.status).toBe(200);
+	expect(calls[0]?.args).toEqual([
+		"source",
+		{ userId, isAdmin: false },
+		{
+			query: exact ? undefined : "term",
+			limit: undefined,
+			purpose: "manual-connect",
+			signal: expect.any(AbortSignal),
+			...(exact && { targetId: "target" }),
+		},
+	]);
+});
+test.each([
 	"limit=0",
 	"limit=51",
 	"limit=NaN",
 	`q=${"a".repeat(129)}`,
 	"q=test&limit=50&cursor=opaque",
 	"cursor=",
+	"purpose=execution",
+	"purpose=",
+	"purpose=manual-connect&viewer=someone-else",
 	"unknown=1",
 ])("rejects invalid query before search: %s", async (query) => {
 	const { app, calls } = fixture();
