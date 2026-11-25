@@ -2417,6 +2417,7 @@
 			"team_upgrade": "Became a team coordinator",
 			"team_disband": "Team disbanded",
 			"team_return": "Work item returned",
+			"team_unblocked": "Work item can start",
 			"outline_team": "Task events for this session",
 			"outline_task_brief": "Opening brief",
 			"spec_import": "Dynamic Spec moved to the outline",

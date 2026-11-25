@@ -37,6 +37,7 @@ import {
 	type TeamEventKind,
 	type TeamOverlapEventKind,
 	type TeamReviewVerdict,
+	type TeamWorkDependencyRef,
 	type TeamWorkDiffStat,
 	type TeamWorkEventKind,
 	type TeamWorkItemState,
@@ -66,6 +67,16 @@ import {
 	readChangedPaths,
 	storeChangedPaths,
 } from "./team-overlap";
+import {
+	assertWorkItemStartable,
+	checkDependencies,
+	deliverUnblockedNotes,
+	normalizeDependencyIds,
+	readDependencies,
+	recordUnblocked,
+	type UnblockedItem,
+	writeDependencies,
+} from "./work-item-dependencies";
 
 type WorkItemRow = typeof teamWorkItems.$inferSelect;
 type Executor = Pick<typeof db, "insert" | "select" | "update">;
@@ -346,9 +357,20 @@ export interface WorkItemView {
 	worker: string | null;
 	reviewRounds: number;
 	lastReview: TeamReviewVerdict | null;
+	/** D: the items this one waits for to merge (ids, oldest first). */
+	dependsOn: string[];
+	/** D: those of them not merged yet; the item cannot start while any is left. */
+	blockedBy: string[];
 }
 
-export function viewWorkItem(item: WorkItemRow): WorkItemView {
+/**
+ * The item as the tool returns it. `dependencies` is its dependency list when the caller read it
+ * for a whole page ({@link readDependencies}); otherwise it is read here (one indexed query).
+ */
+export function viewWorkItem(
+	item: WorkItemRow,
+	dependencies: readonly TeamWorkDependencyRef[] = readDependencies([item.id]).get(item.id) ?? [],
+): WorkItemView {
 	return {
 		id: item.id,
 		title: item.title,
@@ -361,6 +383,10 @@ export function viewWorkItem(item: WorkItemRow): WorkItemView {
 		worker: item.workerNarratorId,
 		reviewRounds: item.reviewRounds,
 		lastReview: item.lastReview,
+		dependsOn: dependencies.map((dependency) => dependency.id),
+		blockedBy: dependencies
+			.filter((dependency) => dependency.state !== "merged")
+			.map((dependency) => dependency.id),
 	};
 }
 
@@ -390,8 +416,9 @@ export function listWorkItems(coordinatorId: string): {
 					.all()
 			: [];
 	const rows = [...open.slice(0, TEAM_WORK_LIST_LIMIT), ...done.slice(0, room)];
+	const dependencies = readDependencies(rows.map((row) => row.id));
 	return {
-		items: rows.map(viewWorkItem),
+		items: rows.map((row) => viewWorkItem(row, dependencies.get(row.id) ?? [])),
 		more: open.length > TEAM_WORK_LIST_LIMIT || done.length > room,
 	};
 }
@@ -440,6 +467,8 @@ export interface CreateWorkItemInput {
 	branchHint?: string;
 	/** `isolated` for `Agent({ isolation: "worktree" })`; default kind otherwise. */
 	kind?: string;
+	/** D: ids of items of the same team this one waits for to merge before it may start. */
+	dependsOn?: readonly string[];
 	/** Who asked: the coordinator agent (its id) — the person behind its turn is `principal`. */
 	actor: WorkActor;
 	principal: NarratorPrincipal;
@@ -462,6 +491,11 @@ export async function createWorkItem(input: CreateWorkItemInput): Promise<WorkIt
 	const id = generateId();
 	const branchName = workItemBranchName(id, title, input.branchHint);
 	const kind = input.kind ?? TEAM_DEFAULT_WORK_KIND;
+	// D: checked before anything is made, so a refused set leaves no worktree behind.
+	const dependsOn = normalizeDependencyIds(input.dependsOn ?? []);
+	if (dependsOn.length > 0 && kind === TEAM_ISOLATED_WORK_KIND)
+		throw new ValidationError("An isolated work item starts at once; it cannot wait for others");
+	checkDependencies(db, team.teamId, null, dependsOn);
 	const port = await ports();
 	const created = await port.createWorktree({
 		coordinatorId: team.teamId,
@@ -525,6 +559,15 @@ export async function createWorkItem(input: CreateWorkItemInput): Promise<WorkIt
 			},
 			at: now,
 		});
+		if (dependsOn.length > 0)
+			writeDependencies(tx, {
+				teamId: team.teamId,
+				itemId: id,
+				// Again inside the transaction: a target may have been cancelled meanwhile.
+				refs: checkDependencies(tx, team.teamId, null, dependsOn),
+				actor: input.actor,
+				at: now,
+			});
 	});
 	logger.info("Team work item created", { teamId: team.teamId, workItemId: id, branchName });
 	return requireWorkItem(team.teamId, id);
@@ -532,7 +575,9 @@ export async function createWorkItem(input: CreateWorkItemInput): Promise<WorkIt
 
 /**
  * Record the first-level subagent working on an item (the one an `Agent` call just created in
- * its worktree). An item already worked on keeps its worker; a queued one starts.
+ * its worktree). An item already worked on keeps its worker; a queued one starts — unless one of
+ * its dependencies has not merged (D: 409 `TEAM_WORK_ITEM_BLOCKED`, checked in the transaction;
+ * the `Agent` tool checks it before creating the subagent as well).
  */
 export function attachWorker(
 	teamId: string,
@@ -545,6 +590,7 @@ export function attachWorker(
 	if (item.workerNarratorId) return;
 	const now = new Date().toISOString();
 	db.transaction((tx) => {
+		if (item.state === "queued") assertWorkItemStartable(item.id, tx);
 		updateItem(
 			tx,
 			item,
@@ -992,6 +1038,44 @@ export function cancelWorkItem(input: {
 }
 
 /**
+ * Replace a queued item's dependencies (D, `Team` `work.update`; `[]` clears them). Only while
+ * it has not started (409 `TEAM_WORK_ITEM_NOT_QUEUED`): a started item already passed the gate.
+ * The set is checked (same team, not cancelled, no cycle, at most 20) and written with its
+ * `work.dependencies_changed` event in one transaction that also bumps the item's `updated_at`
+ * under the usual state + `updated_at` condition.
+ */
+export function setWorkItemDependencies(input: {
+	coordinatorId: string;
+	itemId: string;
+	dependsOn: readonly string[];
+	actor: WorkActor;
+}): { item: WorkItemRow; changed: boolean } {
+	const team = requireActiveTeam(input.coordinatorId);
+	const item = requireWorkItem(team.teamId, input.itemId);
+	if (item.state !== "queued" || item.workerNarratorId !== null)
+		throw new AppError(
+			`Work item ${item.id} is ${item.state}${item.workerNarratorId ? " with a worker" : ""}; dependencies change only while an item is queued and not started`,
+			409,
+			"TEAM_WORK_ITEM_NOT_QUEUED",
+		);
+	const ids = normalizeDependencyIds(input.dependsOn);
+	const now = new Date().toISOString();
+	let changed = false;
+	db.transaction((tx) => {
+		const refs = checkDependencies(tx, team.teamId, item.id, ids);
+		changed = writeDependencies(tx, {
+			teamId: team.teamId,
+			itemId: item.id,
+			refs,
+			actor: input.actor,
+			at: now,
+		});
+		if (changed) updateItem(tx, item, {}, now);
+	});
+	return { item: requireWorkItem(team.teamId, item.id), changed };
+}
+
+/**
  * The background pass found an item's head inside its base branch (X): the work landed, so the
  * item is merged — its exclusive lock is released (in `updateItem`), its stored changed paths
  * cleared, and `work.merged` recorded as the system's with `detectedBy: "ancestry"`. The caller
@@ -1009,6 +1093,7 @@ export function markMergedByAncestry(input: {
 }): boolean {
 	const now = new Date().toISOString();
 	let merged = false;
+	let unblocked: UnblockedItem[] = [];
 	try {
 		db.transaction((tx) => {
 			const item = tx
@@ -1046,6 +1131,8 @@ export function markMergedByAncestry(input: {
 				detail: { head: input.head, base: input.base, detectedBy: "ancestry", from: item.state },
 				at: now,
 			});
+			// D: the queued items that waited for this one and now wait for nothing.
+			unblocked = recordUnblocked(tx, item.id, now);
 		});
 	} catch (error) {
 		if (error instanceof AppError && error.code === "TEAM_WORK_ITEM_CHANGED") return false;
@@ -1053,6 +1140,10 @@ export function markMergedByAncestry(input: {
 	}
 	if (merged)
 		logger.info("Team work item merged (its head is in the base)", { workItemId: input.itemId });
+	if (unblocked.length > 0)
+		void trackTeamLifecycleWork(deliverUnblockedNotes(unblocked)).catch((error) =>
+			logger.warn("Team unblock notes failed", { error: String(error) }),
+		);
 	return merged;
 }
 

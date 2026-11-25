@@ -60,6 +60,7 @@ import { canManageNarratorAcl, type NarratorPrincipal } from "../narrator-acl";
 import { shouldHidePendingPermission } from "../pending-permission-visibility";
 import { readTeamMembers } from "./team-members";
 import { loadTeamForAccess } from "./team-service";
+import { readDependencies } from "./work-item-dependencies";
 
 const RUNNING_STATUSES: ("working" | "waiting")[] = ["working", "waiting"];
 
@@ -434,6 +435,15 @@ function boardItemOf(row: BoardItemRow): TeamBoardItem {
 	};
 }
 
+/**
+ * D: the cards with their dependencies, read for the whole page in one query (never per card).
+ * A card without dependencies carries an empty list.
+ */
+function withDependencies<T extends TeamBoardItem>(items: T[]): T[] {
+	const dependencies = readDependencies(items.map((item) => item.id));
+	return items.map((item) => ({ ...item, dependsOn: dependencies.get(item.id) ?? [] }));
+}
+
 /** One work item of a team as its card shows it (primary key), or null when it is not there. */
 export function readBoardItem(teamId: string, itemId: string): TeamBoardItem | null {
 	const row = db
@@ -443,7 +453,7 @@ export function readBoardItem(teamId: string, itemId: string): TeamBoardItem | n
 		.where(and(eq(teamWorkItems.id, itemId), eq(teamWorkItems.teamId, teamId)))
 		.limit(1)
 		.get();
-	return row ? boardItemOf(row) : null;
+	return row ? (withDependencies([boardItemOf(row)])[0] ?? null) : null;
 }
 
 /**
@@ -472,7 +482,9 @@ export function readReadyItems(
 		.limit(limit + 1)
 		.all();
 	return {
-		items: rows.slice(0, limit).map(({ teamId, ...row }) => ({ ...boardItemOf(row), teamId })),
+		items: withDependencies(
+			rows.slice(0, limit).map(({ teamId, ...row }) => ({ ...boardItemOf(row), teamId })),
+		),
 		more: rows.length > limit,
 	};
 }
@@ -585,7 +597,7 @@ export async function readTeamBoardColumn(
 		.limit(options.limit + 1)
 		.all();
 	const page = rows.slice(0, options.limit);
-	const items: TeamBoardItem[] = page.map(boardItemOf);
+	const items: TeamBoardItem[] = withDependencies(page.map(boardItemOf));
 	const last = page.at(-1);
 	return {
 		column: options.column,

@@ -1,6 +1,6 @@
 {
-  "id": "c07b4921-245c-4e69-b29f-01132e3f6156",
-  "prevId": "c9d8eed4-015f-4e6c-9274-610534f33c08",
+  "id": "4c2a67db-0b4b-41c8-b8f9-2f9d1f232663",
+  "prevId": "c07b4921-245c-4e69-b29f-01132e3f6156",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -24259,6 +24259,133 @@
         "ck_team_work_events_detail_bytes": {
           "name": "ck_team_work_events_detail_bytes",
           "value": "\"detail_json\" is null or octet_length(\"detail_json\") <= 8192"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.team_work_item_dependencies": {
+      "name": "team_work_item_dependencies",
+      "schema": "",
+      "columns": {
+        "item_id": {
+          "name": "item_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "depends_on_item_id": {
+          "name": "depends_on_item_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "team_id": {
+          "name": "team_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {
+        "idx_team_work_item_dependencies_target": {
+          "name": "idx_team_work_item_dependencies_target",
+          "columns": [
+            {
+              "expression": "depends_on_item_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "item_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_team_work_item_dependencies_team": {
+          "name": "idx_team_work_item_dependencies_team",
+          "columns": [
+            {
+              "expression": "team_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "team_work_item_dependencies_item_id_team_work_items_id_fk": {
+          "name": "team_work_item_dependencies_item_id_team_work_items_id_fk",
+          "tableFrom": "team_work_item_dependencies",
+          "tableTo": "team_work_items",
+          "columnsFrom": [
+            "item_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "team_work_item_dependencies_depends_on_item_id_te_69b44cd09b_fk": {
+          "name": "team_work_item_dependencies_depends_on_item_id_te_69b44cd09b_fk",
+          "tableFrom": "team_work_item_dependencies",
+          "tableTo": "team_work_items",
+          "columnsFrom": [
+            "depends_on_item_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "team_work_item_dependencies_team_id_project_teams_94291c95ba_fk": {
+          "name": "team_work_item_dependencies_team_id_project_teams_94291c95ba_fk",
+          "tableFrom": "team_work_item_dependencies",
+          "tableTo": "project_teams",
+          "columnsFrom": [
+            "team_id"
+          ],
+          "columnsTo": [
+            "narrator_id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "team_work_item_dependencies_item_id_depends_on_item_id_pk": {
+          "name": "team_work_item_dependencies_item_id_depends_on_item_id_pk",
+          "columns": [
+            "item_id",
+            "depends_on_item_id"
+          ]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "ck_team_work_item_dependencies_self": {
+          "name": "ck_team_work_item_dependencies_self",
+          "value": "\"item_id\" <> \"depends_on_item_id\""
         }
       },
       "isRLSEnabled": false

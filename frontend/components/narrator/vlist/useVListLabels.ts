@@ -610,6 +610,7 @@ export function useVListLabels(): VListLabels {
 			sidecarSourceTeamUpgrade: t("sidecar.sources.team_upgrade"),
 			sidecarSourceTeamDisband: t("sidecar.sources.team_disband"),
 			sidecarSourceTeamReturn: t("sidecar.sources.team_return"),
+			sidecarSourceTeamUnblocked: t("sidecar.sources.team_unblocked"),
 			sidecarSourceOutlineTeam: t("sidecar.sources.outline_team"),
 			sidecarSourceOutlineTaskBrief: t("sidecar.sources.outline_task_brief"),
 			sidecarSourceSpecImport: t("sidecar.sources.spec_import"),

@@ -42,6 +42,7 @@ import type { NarratorPrincipal } from "../narrator-acl";
 import { eventDetail, readBoardItem, returnedReasonColumns } from "./team-board";
 import { teamGit } from "./team-git";
 import { loadTeamForAccess } from "./team-service";
+import { readDependents } from "./work-item-dependencies";
 import { diffStatOf, returnWorkItem, worktreePathOf } from "./work-items";
 
 type WorkItemRow = typeof teamWorkItems.$inferSelect;
@@ -367,6 +368,7 @@ export async function readWorkItemDetail(
 	}
 	const { events, more } = itemEvents(itemId);
 	const files = stat.files;
+	const dependents = readDependents(teamId, itemId);
 	return {
 		item,
 		base,
@@ -383,6 +385,8 @@ export async function readWorkItemDetail(
 			team.status === "active" &&
 			coordinator.status !== "archived" &&
 			TEAM_RETURNABLE_STATES.includes(row.state),
+		dependents: dependents.items,
+		dependentsMore: dependents.more,
 	};
 }
 

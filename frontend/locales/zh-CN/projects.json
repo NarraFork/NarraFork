@@ -226,7 +226,9 @@
 			"work_exclusive_taken": "占用独占路径",
 			"work_exclusive_refused": "独占路径被拒",
 			"work_exclusive_released": "释放独占路径",
-			"work_returned": "退回给工作者"
+			"work_returned": "退回给工作者",
+			"work_dependencies_changed": "修改依赖",
+			"work_unblocked": "可以开始了"
 		},
 		"eventNote": {
 			"text": "{{text}}",
@@ -244,7 +246,11 @@
 			"decisionCoordinator": "{{tool}} · 协调者",
 			"decisionPlan": "计划 · {{agent}}",
 			"decisionPlanCoordinator": "计划 · 协调者",
-			"decisionPlanAgent": "计划 · 某个代理"
+			"decisionPlanAgent": "计划 · 某个代理",
+			"dependencies_one": "等 {{count}} 项合并",
+			"dependencies_other": "等 {{count}} 项合并",
+			"dependenciesCleared": "不再依赖其他工作项",
+			"unblocked": "依赖的工作项都已合并"
 		},
 		"top": {
 			"pauseAll": "全部暂停",
@@ -408,7 +414,11 @@
 					"readFile": "等批准读取文件",
 					"fetchWeb": "等批准访问网页",
 					"useTool": "等批准使用 {{tool}}"
-				}
+				},
+				"queuedWaitingOne": "排队 · 等「{{first}}」合并",
+				"queuedWaitingTwo": "排队 · 等「{{first}}」「{{second}}」合并",
+				"queuedWaitingMany": "排队 · 等 {{count}} 项合并",
+				"queuedBlockedCancelled": "排队 · 依赖「{{title}}」已取消"
 			},
 			"empty": {
 				"title": "工作项会出现在这里",
@@ -484,6 +494,19 @@
 					"TEAM_WORK_ITEM_NOT_RETURNABLE": "只有评审中或可以合并的工作项能退回；它已经变了。",
 					"TEAM_WORK_ITEM_CHANGED": "这一项刚刚有变化，重新看一下，还需要的话再退回。",
 					"TEAM_ARCHIVED": "团队已归档，不能再改动。先恢复团队。"
+				},
+				"dependenciesTitle": "依赖",
+				"dependentsTitle": "被依赖",
+				"dependentsMore": "依赖它的工作项比这里列出的多",
+				"dependencyCancelled": "「{{title}}」已取消，永远不会合并，这一项因此无法开始。需要协调者去掉或换掉这个依赖。",
+				"dependencyNote": "这里的工作项都合并到 {{base}} 后才能开始。",
+				"dependencyState": {
+					"queued": "排队",
+					"in_progress": "进行中",
+					"in_review": "评审中",
+					"ready": "可以合并",
+					"merged": "已合并",
+					"cancelled": "已取消"
 				}
 			},
 			"settings": {

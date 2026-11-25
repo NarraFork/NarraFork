@@ -226,7 +226,9 @@
 			"work_exclusive_taken": "Took an exclusive path",
 			"work_exclusive_refused": "Exclusive path refused",
 			"work_exclusive_released": "Released an exclusive path",
-			"work_returned": "Returned to the worker"
+			"work_returned": "Returned to the worker",
+			"work_dependencies_changed": "Dependencies changed",
+			"work_unblocked": "Can start now"
 		},
 		"eventNote": {
 			"text": "{{text}}",
@@ -244,7 +246,11 @@
 			"decisionCoordinator": "{{tool}} · coordinator",
 			"decisionPlan": "A plan · {{agent}}",
 			"decisionPlanCoordinator": "A plan · coordinator",
-			"decisionPlanAgent": "A plan · an agent"
+			"decisionPlanAgent": "A plan · an agent",
+			"dependencies_one": "Waits for {{count}} item to merge",
+			"dependencies_other": "Waits for {{count}} items to merge",
+			"dependenciesCleared": "No dependencies left",
+			"unblocked": "Every item it waits for is merged"
 		},
 		"top": {
 			"pauseAll": "Pause all",
@@ -408,7 +414,11 @@
 					"readFile": "Waiting for approval · read a file",
 					"fetchWeb": "Waiting for approval · open a web page",
 					"useTool": "Waiting for approval · {{tool}}"
-				}
+				},
+				"queuedWaitingOne": "Queued · waiting for “{{first}}” to merge",
+				"queuedWaitingTwo": "Queued · waiting for “{{first}}” and “{{second}}” to merge",
+				"queuedWaitingMany": "Queued · waiting for {{count}} items to merge",
+				"queuedBlockedCancelled": "Queued · its dependency “{{title}}” was cancelled"
 			},
 			"empty": {
 				"title": "Work items show up here",
@@ -484,6 +494,19 @@
 					"TEAM_WORK_ITEM_NOT_RETURNABLE": "Only an item in review or ready to merge can be returned; it has moved on meanwhile.",
 					"TEAM_WORK_ITEM_CHANGED": "The item changed meanwhile; look again and return it if it still needs it.",
 					"TEAM_ARCHIVED": "The team is archived; nothing can change. Restore it first."
+				},
+				"dependenciesTitle": "Depends on",
+				"dependentsTitle": "Needed by",
+				"dependentsMore": "More items depend on it than listed here",
+				"dependencyCancelled": "“{{title}}” was cancelled and will never merge, so this item cannot start. The coordinator has to remove or replace this dependency.",
+				"dependencyNote": "Starts once every item here is merged into {{base}}.",
+				"dependencyState": {
+					"queued": "Queued",
+					"in_progress": "In progress",
+					"in_review": "In review",
+					"ready": "Ready to merge",
+					"merged": "Merged",
+					"cancelled": "Cancelled"
 				}
 			},
 			"settings": {

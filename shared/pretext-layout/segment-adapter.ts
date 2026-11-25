@@ -2722,6 +2722,7 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	sidecarSourceTeamUpgrade: "Became a team coordinator",
 	sidecarSourceTeamDisband: "Team disbanded",
 	sidecarSourceTeamReturn: "Work item returned",
+	sidecarSourceTeamUnblocked: "Work item can start",
 	// An update of an outline session's views (`context_update` row of `outline.*` parts).
 	contextViewsUpdated: "Context updated: {parts}",
 	contextViewOutlineTasks: "Current tasks",
@@ -2859,6 +2860,8 @@ const INJECTION_SOURCE_LABEL_KEYS: Record<string, string> = {
 	team_disband: "sidecarSourceTeamDisband",
 	// A person returned a work item from the team page, with the reason to relay (R).
 	team_return: "sidecarSourceTeamReturn",
+	// The last dependency of a queued work item merged: it can start now (D).
+	team_unblocked: "sidecarSourceTeamUnblocked",
 	// Loop-control notices: written as rows so a rebuilt request says what the live one did.
 	turn_nudge: "sidecarSourceTurnNudge",
 	broken_call: "sidecarSourceBrokenCall",

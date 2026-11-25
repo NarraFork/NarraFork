@@ -192,6 +192,8 @@ export const TEAM_TOOL_ACTIONS = [
 	"work.ready",
 	"work.sync",
 	"work.cancel",
+	/** D: replace a queued item's dependencies (`dependsOn`). */
+	"work.update",
 	"brief",
 	"checkin",
 	"cleanup",
@@ -238,6 +240,10 @@ export const TEAM_WORK_EVENT_KINDS = [
 	TEAM_DECISION_EVENT_KIND,
 	/** R: a person sent the item back with a reason (`TEAM_WORK_RETURNED_EVENT_KIND`). */
 	"work.returned",
+	/** D: the coordinator set or replaced an item's dependencies. */
+	"work.dependencies_changed",
+	/** D: the last dependency of a queued item merged; the coordinator was told it can start. */
+	"work.unblocked",
 ] as const;
 export type TeamWorkEventKind = (typeof TEAM_WORK_EVENT_KINDS)[number];
 
@@ -321,6 +327,8 @@ export interface TeamBoardItem {
 	updatedAt: string;
 	/** R: what a working or waiting worker did last; absent or null otherwise. */
 	activity?: TeamWorkerActivity | null;
+	/** D: the items this one waits for (at most {@link TEAM_WORK_DEPENDENCIES_MAX}), in id order. */
+	dependsOn?: TeamWorkDependencyRef[];
 }
 
 export interface TeamBoardColumnPage {
@@ -741,6 +749,9 @@ export interface TeamWorkItemDetail {
 	eventsMore: boolean;
 	/** The caller may return it now (member, active team, a returnable state). */
 	canReturn: boolean;
+	/** D: items of this team that depend on this one, at most {@link TEAM_WORK_DEPENDENTS_LIMIT}. */
+	dependents?: TeamWorkDependencyRef[];
+	dependentsMore?: boolean;
 }
 
 /** `GET …/teams/:teamId/work/:itemId/diff?path=`: one file's diff, cut at the byte cap. */
@@ -755,4 +766,40 @@ export interface TeamWorkReturnResponse {
 	item: TeamBoardItem;
 	/** Whether the note reached the coordinator (it relays the reason to the worker). */
 	delivered: boolean;
+}
+
+// ── D: dependencies between work items ───────────────────────────────────────
+
+/** Most dependencies one work item may have. */
+export const TEAM_WORK_DEPENDENCIES_MAX = 20;
+/** Most items that depend on one item the drawer lists. */
+export const TEAM_WORK_DEPENDENTS_LIMIT = 50;
+
+/**
+ * Injection source of the note a coordinator gets when the last dependency of a queued item
+ * merged (woken when idle, like `team_return`).
+ */
+export const TEAM_UNBLOCKED_NOTE_SOURCE = "team_unblocked";
+
+/**
+ * Whether a dependency in this state lets its dependent start: only `merged` does. `ready` does
+ * not (the dependent's branch would start from a base without it); `cancelled` blocks until the
+ * coordinator removes or replaces it.
+ */
+export function dependencySatisfied(state: TeamWorkItemState): boolean {
+	return state === "merged";
+}
+
+/** Another work item of the same team, as a dependency or a dependent. */
+export interface TeamWorkDependencyRef {
+	id: string;
+	title: string;
+	state: TeamWorkItemState;
+}
+
+/** The dependencies an item still waits for (not merged), in the given order. */
+export function dependencyBlockers<T extends { state: TeamWorkItemState }>(
+	dependsOn: readonly T[] | undefined,
+): T[] {
+	return (dependsOn ?? []).filter((dependency) => !dependencySatisfied(dependency.state));
 }
