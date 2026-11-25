@@ -738,6 +738,106 @@ test("get_task prefers a restored owner over a newer archived task with the same
 	expect(byExactId?.output).toBe("archived output");
 });
 
+test("get_task returns a newer bash or transfer instead of the addressable agent", async () => {
+	seedMember({
+		id: "live-audit",
+		title: "Audit",
+		titleSlug: "audit",
+		aliasSelector: "audit",
+		traits: ["subagent-alias:audit"],
+	});
+	seedMember({
+		id: "archived-audit",
+		status: "archived",
+		aliasSelector: "audit",
+		traits: ["subagent-alias:audit"],
+		createdAt: "2026-05-01T00:00:00.000Z",
+	});
+	db.insert(backgroundTasks)
+		.values([
+			{
+				id: "live-audit-task",
+				parentNarratorId: PARENT,
+				type: "agent",
+				status: "completed",
+				alias: "audit",
+				output: "agent output",
+				subagentNarratorId: "live-audit",
+				startedAt: "2026-03-01T00:00:00.000Z",
+				createdAt: "2026-03-01T00:00:00.000Z",
+				updatedAt: "2026-03-01T00:00:00.000Z",
+			},
+			{
+				id: "newer-bash",
+				parentNarratorId: PARENT,
+				type: "bash",
+				status: "completed",
+				alias: "audit",
+				output: "bash output",
+				startedAt: "2026-04-01T00:00:00.000Z",
+				createdAt: "2026-04-01T00:00:00.000Z",
+				updatedAt: "2026-04-01T00:00:00.000Z",
+			},
+			{
+				id: "newer-archived-agent",
+				parentNarratorId: PARENT,
+				type: "agent",
+				status: "completed",
+				alias: "audit",
+				output: "archived output",
+				subagentNarratorId: "archived-audit",
+				startedAt: "2026-05-02T00:00:00.000Z",
+				createdAt: "2026-05-02T00:00:00.000Z",
+				updatedAt: "2026-05-02T00:00:00.000Z",
+			},
+			{
+				id: "live-ship-task",
+				parentNarratorId: PARENT,
+				type: "agent",
+				status: "completed",
+				alias: "ship",
+				output: "agent output",
+				subagentNarratorId: "live-audit",
+				startedAt: "2026-03-01T00:00:00.000Z",
+				createdAt: "2026-03-01T00:00:00.000Z",
+				updatedAt: "2026-03-01T00:00:00.000Z",
+			},
+			{
+				id: "newer-transfer",
+				parentNarratorId: PARENT,
+				type: "transfer",
+				status: "completed",
+				alias: "ship",
+				output: "transfer output",
+				startedAt: "2026-04-01T00:00:00.000Z",
+				createdAt: "2026-04-01T00:00:00.000Z",
+				updatedAt: "2026-04-01T00:00:00.000Z",
+			},
+		])
+		.run();
+	db.update(narrators)
+		.set({ aliasSelector: "ship", traits: ["subagent-alias:ship"] })
+		.where(eq(narrators.id, "live-audit"))
+		.run();
+
+	const { backgroundTaskService } = await import("../background-task-service");
+	// The ship lookup uses the updated selector. Recreate the audit owner for the bash case.
+	db.update(narrators)
+		.set({ aliasSelector: "audit", traits: ["subagent-alias:audit"] })
+		.where(eq(narrators.id, "live-audit"))
+		.run();
+	const bash = await backgroundTaskService.readTaskSnapshot(PARENT, "audit");
+	expect(bash?.id).toBe("newer-bash");
+	expect(bash?.output).toBe("bash output");
+	db.update(narrators)
+		.set({ aliasSelector: "ship", traits: ["subagent-alias:ship"] })
+		.where(eq(narrators.id, "live-audit"))
+		.run();
+	const transfer = await backgroundTaskService.readTaskSnapshot(PARENT, "ship");
+	expect(transfer?.id).toBe("newer-transfer");
+	expect(transfer?.type).toBe("transfer");
+});
+
 test("restoring a primary fork does not persist a subagent alias", async () => {
 	db.insert(narrators)
 		.values({

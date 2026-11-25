@@ -1383,6 +1383,7 @@ export async function sendSubagentMessageDetailed(
 	const deliverable = targets.filter(
 		(target) => target.status !== "archived" || target.id === scope.teamParentId,
 	);
+	const deliverableIds = new Set(deliverable.map((target) => target.id));
 	const modelRequest = input.model?.trim() ? input.model : undefined;
 	if (input.doInterrupt || input.resume || modelRequest !== undefined) {
 		for (const target of deliverable)
@@ -1441,6 +1442,28 @@ export async function sendSubagentMessageDetailed(
 			const asParent = !scope.callerIsSubagent || isOwnChild(fresh, scope);
 			if (fresh.status === "archived") {
 				throw new Error("Target subagent is archived");
+			}
+			// Preflight skipped this target because it was archived. Delivery now sees
+			// an addressable teammate, so interrupt, resume, and model change still
+			// need the steer grant before anything is written or a run is controlled.
+			const wantsControl = !!(input.doInterrupt || input.resume || modelRequest);
+			if (wantsControl && !deliverableIds.has(fresh.id)) {
+				await authorizeAgentControl({
+					callerNarratorId: scope.caller.id,
+					targetNarratorId: fresh.id,
+					action: "steer",
+					userId: input.userId ?? null,
+				});
+				if (modelRequest !== undefined && !modelPlans.has(fresh.id)) {
+					if (isTakenOver(fresh.id))
+						throw new Error(
+							`Agent ${label} is taken over by the user; its model cannot be changed now.`,
+						);
+					modelPlans.set(
+						fresh.id,
+						await planSubagentModelSwitch(fresh, modelRequest, input.userId ?? null),
+					);
+				}
 			}
 
 			// A taken-over subagent is driven by the user like an independent narrator, and

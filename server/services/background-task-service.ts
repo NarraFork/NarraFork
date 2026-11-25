@@ -2238,9 +2238,9 @@ class BackgroundTaskService {
 				.limit(1);
 		const readOne = (where: ReturnType<typeof and>) =>
 			readQueryFirst(snapshotOf(where), taskReadOptions(options, 1));
-		// An exact task id is that row, even when a newer task still stores the same
-		// alias. An alias names the current addressable owner before any archived
-		// history, so a restored agent is not hidden by a later archived task.
+		// An exact task id is that row. An alias drops other archived agent tasks
+		// when the current addressable owner has one, then keeps creation-time
+		// order, so a newer Bash or transfer still wins over that agent.
 		let row = await readOne(
 			and(eq(backgroundTasks.parentNarratorId, parentNarratorId), eq(backgroundTasks.id, target)),
 		);
@@ -2255,23 +2255,34 @@ class BackgroundTaskService {
 					.limit(1),
 				taskReadOptions(options, 1),
 			);
-			if (owner) {
-				row = await readOne(
-					and(
-						eq(backgroundTasks.parentNarratorId, parentNarratorId),
-						eq(backgroundTasks.type, "agent"),
-						or(eq(backgroundTasks.subagentNarratorId, owner.id), eq(backgroundTasks.id, owner.id)),
-					),
-				);
-			}
-		}
-		if (!row) {
-			row = await readOne(
-				and(
-					eq(backgroundTasks.parentNarratorId, parentNarratorId),
-					or(eq(backgroundTasks.alias, target), eq(backgroundTasks.transferTaskId, target)),
-				),
+			const ownerId = owner?.id;
+			const ownerTask = ownerId
+				? await readOne(
+						and(
+							eq(backgroundTasks.parentNarratorId, parentNarratorId),
+							eq(backgroundTasks.type, "agent"),
+							or(eq(backgroundTasks.subagentNarratorId, ownerId), eq(backgroundTasks.id, ownerId)),
+						),
+					)
+				: null;
+			const aliasMatch = and(
+				eq(backgroundTasks.parentNarratorId, parentNarratorId),
+				or(eq(backgroundTasks.alias, target), eq(backgroundTasks.transferTaskId, target)),
 			);
+			row =
+				ownerId && ownerTask
+					? await readOne(
+							and(
+								aliasMatch,
+								or(
+									ne(backgroundTasks.type, "agent"),
+									eq(backgroundTasks.subagentNarratorId, ownerId),
+									and(isNull(backgroundTasks.subagentNarratorId), eq(backgroundTasks.id, ownerId)),
+								),
+							),
+						)
+					: await readOne(aliasMatch);
+			if (!row && ownerTask) row = ownerTask;
 		}
 
 		if (row && row.type !== "transfer") {

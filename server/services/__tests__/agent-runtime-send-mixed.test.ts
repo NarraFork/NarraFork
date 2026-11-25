@@ -582,6 +582,35 @@ test("an unknown or out-of-pool model rejects the whole call before any write", 
 	}
 });
 
+test("restoring an archived target before delivery still requires steer", async () => {
+	db.update(narrators).set({ status: "archived" }).where(eq(narrators.id, "sibling-b")).run();
+	const turn = new AbortController();
+	liveTurn("sibling-b", turn);
+	tryClaimExecution("sibling-b", "run");
+	const restore = () => {
+		db.update(narrators).set({ status: "working" }).where(eq(narrators.id, "sibling-b")).run();
+	};
+	const denied = await sendSubagentMessageDetailed({
+		...input("sender-child", ["sibling-b"]),
+		doInterrupt: true,
+		onTargetsResolved: restore,
+	});
+	expect(denied.targets.map((target) => target.status)).toEqual(["failed"]);
+	expect(denied.targets[0]?.error).toContain("not a direct child");
+	expect(turn.signal.aborted).toBe(false);
+	expect(rows("sibling-b")).toHaveLength(0);
+
+	db.update(narrators).set({ status: "archived" }).where(eq(narrators.id, "sibling-b")).run();
+	const allowed = await sendSubagentMessageDetailed({
+		...input("parent-root", ["sibling-b"]),
+		doInterrupt: true,
+		onTargetsResolved: restore,
+	});
+	expect(allowed.targets[0]?.status).toBe("queued");
+	expect(turn.signal.aborted).toBe(true);
+	expect(rows("sibling-b")).toHaveLength(1);
+});
+
 test("an archived child's rejected model does not drop the live recipient", async () => {
 	db.update(narrators)
 		.set({
