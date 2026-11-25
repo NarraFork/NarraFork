@@ -135,6 +135,13 @@ async function readyItem(title: string, files: Record<string, string>) {
 	const path = work.worktreePathOf(item) ?? "";
 	commitIn(path, files, title);
 	const actor = { kind: "agent" as const, id: teamId };
+	// Only a started item is reviewed: a worker of its own, as an Agent call attaches.
+	const worker = await narratorService.create({ title: `${title} worker`, cwd: repo });
+	await db
+		.update(narrators)
+		.set({ type: "subagent", aclRootNarratorId: teamId, parentNarratorId: teamId })
+		.where(eq(narrators.id, worker.id));
+	work.attachWorker(teamId, item.id, worker.id, actor);
 	await work.recordReview({
 		coordinatorId: teamId,
 		itemId: item.id,
@@ -316,6 +323,7 @@ describe("the drawer", () => {
 		expect(detail.body.reviews[0]).toMatchObject({ round: 1, verdict: "clear", by: "agent" });
 		expect(detail.body.events.map((event: { kind: string }) => event.kind)).toEqual([
 			"work.created",
+			"work.started",
 			"work.review",
 			"work.ready",
 		]);

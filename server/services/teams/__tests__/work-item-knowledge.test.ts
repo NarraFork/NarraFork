@@ -22,6 +22,7 @@ import { teamGit } from "../team-git";
 import { setKnowledgeCheckLimitsForTests } from "../team-knowledge";
 import { setChangedPathsSourceForTests } from "../team-overlap";
 import {
+	attachWorker,
 	createWorkItem,
 	markReady,
 	recordReview,
@@ -108,6 +109,14 @@ async function item(title = "Change") {
 		principal,
 		signal: new AbortController().signal,
 	});
+	// Started, as an Agent call into its worktree does: only a started item is reviewed.
+	const worker = `pk-worker-${created.id}`;
+	sqlite.run(
+		`INSERT INTO narrators (id, type, title, parent_narrator_id, acl_root_narrator_id, created_at, updated_at)
+		VALUES (?, 'subagent', ?, ?, ?, ?, ?)`,
+		[worker, worker, LEAD, LEAD, NOW, NOW],
+	);
+	attachWorker(LEAD, created.id, worker, agent);
 	return { id: created.id, path: worktreePathOf(created) ?? "" };
 }
 

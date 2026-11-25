@@ -31,6 +31,8 @@ import {
 	createWorkItem,
 	listWorkItems,
 	markMergedByAncestry,
+	markReady,
+	recordReview,
 	setWorkItemDependencies,
 	setWorkItemPortsForTests,
 	type WorkActor,
@@ -277,6 +279,57 @@ describe("work item dependencies", () => {
 		);
 		sqlite.run("UPDATE team_work_items SET state = 'merged' WHERE id = ?", [a.id]);
 		expect(() => assertWorkItemStartable(b.id)).not.toThrow();
+	});
+
+	test("a queued item cannot be reviewed or marked ready, so a review never skips the start", async () => {
+		const a = await create("Schema");
+		const b = await create("API", [a.id]);
+		for (const verdict of ["blocker", "clear"] as const) {
+			const refused = await refusal(() =>
+				recordReview({
+					coordinatorId: LEAD,
+					itemId: b.id,
+					verdict,
+					findings: 0,
+					reviewer: null,
+					actor: agent,
+				}),
+			);
+			expect(refused.statusCode).toBe(409);
+			expect(refused.code).toBe("TEAM_WORK_ITEM_NOT_STARTED");
+		}
+		const ready = await refusal(() =>
+			markReady({ coordinatorId: LEAD, itemId: b.id, actor: agent }),
+		);
+		expect(ready.code).toBe("TEAM_WORK_ITEM_NOT_STARTED");
+		expect(row(b.id)).toMatchObject({ state: "queued", workerNarratorId: null, reviewRounds: 0 });
+		expect(kinds(b.id).map((event) => event.kind)).toEqual([
+			"work.created",
+			"work.dependencies_changed",
+		]);
+	});
+
+	test("an item with no worker is checked at start whatever its state", async () => {
+		const a = await create("Schema");
+		const b = await create("API", [a.id]);
+		// Out of the queue with no worker (as a review of a queued item used to move it).
+		for (const state of ["in_progress", "in_review"]) {
+			sqlite.run("UPDATE team_work_items SET state = ? WHERE id = ?", [state, b.id]);
+			const blocked = await refusal(() => attachWorker(LEAD, b.id, "d-worker", agent));
+			expect(blocked.code).toBe("TEAM_WORK_ITEM_BLOCKED");
+			expect(row(b.id)).toMatchObject({ state, workerNarratorId: null });
+			const review = await refusal(() =>
+				recordReview({
+					coordinatorId: LEAD,
+					itemId: b.id,
+					verdict: "clear",
+					findings: 0,
+					reviewer: null,
+					actor: agent,
+				}),
+			);
+			expect(review.code).toBe("TEAM_WORK_ITEM_NOT_STARTED");
+		}
 	});
 
 	test("the last dependency merging records work.unblocked and tells the coordinator once", async () => {

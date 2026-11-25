@@ -573,21 +573,20 @@ export const agentTool: ToolDefinition = {
 				const { workItemAtWorktree } = await import("@server/services/teams/work-items");
 				const item = workItemAtWorktree(teamId, resolvedWorkdir);
 				if (item && !item.workerNarratorId) {
-					// D: a queued item starts only once every dependency merged; nothing is created
-					// when it cannot (409 TEAM_WORK_ITEM_BLOCKED, naming the blockers).
-					if (item.state === "queued") {
-						const { assertWorkItemStartable } = await import(
-							"@server/services/teams/work-item-dependencies"
-						);
-						try {
-							assertWorkItemStartable(item.id);
-						} catch (err) {
-							const code = (err as { code?: unknown }).code;
-							return {
-								output: `Agent error (${typeof code === "string" ? code : "TEAM_REQUEST_FAILED"}): ${err instanceof Error ? err.message : String(err)}`,
-								isError: true,
-							};
-						}
+					// D: an item with no worker starts only once every dependency merged, whatever its
+					// state; nothing is created when it cannot (409 TEAM_WORK_ITEM_BLOCKED, naming the
+					// blockers). `attachWorker` checks it again when the subagent exists.
+					const { assertWorkItemStartable } = await import(
+						"@server/services/teams/work-item-dependencies"
+					);
+					try {
+						assertWorkItemStartable(item.id);
+					} catch (err) {
+						const code = (err as { code?: unknown }).code;
+						return {
+							output: `Agent error (${typeof code === "string" ? code : "TEAM_REQUEST_FAILED"}): ${err instanceof Error ? err.message : String(err)}`,
+							isError: true,
+						};
 					}
 					workItem = { teamId, id: item.id, branch: item.branchName, created: false };
 				}

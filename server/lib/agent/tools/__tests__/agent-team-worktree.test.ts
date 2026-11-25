@@ -308,6 +308,15 @@ describe("Agent with a team work item", () => {
 			status = (error as { statusCode?: number }).statusCode;
 		}
 		expect(status).toBe(409);
+		// Out of the queue with no worker, it is checked all the same.
+		sqlite.run("UPDATE team_work_items SET state = 'in_review' WHERE id = ?", [second.item.id]);
+		const unqueued = await agentTool.execute(
+			{ workdir: second.item.worktree, prompt: "go", subagent_type: "worker" },
+			ctx(),
+		);
+		expect(unqueued.output).toContain("TEAM_WORK_ITEM_BLOCKED");
+		expect(runCalls).toHaveLength(0);
+		sqlite.run("UPDATE team_work_items SET state = 'queued' WHERE id = ?", [second.item.id]);
 
 		// Once the dependency is merged, the same call starts it.
 		sqlite.run("UPDATE team_work_items SET state = 'merged' WHERE id = ?", [first.item.id]);

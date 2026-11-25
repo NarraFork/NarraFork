@@ -268,6 +268,21 @@ function requireLive(item: WorkItemRow): void {
 		);
 }
 
+/**
+ * A review round or readiness needs an item a worker started: a queued item, or one with no
+ * worker, never went through the start (`attachWorker`, which checks its dependencies, D), and a
+ * review would otherwise move it out of the queue past that check (409 `TEAM_WORK_ITEM_NOT_STARTED`).
+ */
+function requireStarted(item: WorkItemRow, action: "review" | "ready"): void {
+	if (item.state !== "queued" && item.workerNarratorId) return;
+	throw new AppError(
+		`Work item ${item.id} has not started (${item.state === "queued" ? "it is queued" : "no worker is attached"}); ` +
+			`start it with Agent({ workdir }) before ${action === "review" ? "recording a review" : "marking it ready"}`,
+		409,
+		"TEAM_WORK_ITEM_NOT_STARTED",
+	);
+}
+
 /** The recorded worktree path of an item, or null when none is recorded. */
 export function worktreePathOf(item: Pick<WorkItemRow, "worktreeResourceId">): string | null {
 	if (!item.worktreeResourceId) return null;
@@ -576,9 +591,10 @@ export async function createWorkItem(input: CreateWorkItemInput): Promise<WorkIt
 
 /**
  * Record the first-level subagent working on an item (the one an `Agent` call just created in
- * its worktree). An item already worked on keeps its worker; a queued one starts — unless one of
- * its dependencies has not merged (D: 409 `TEAM_WORK_ITEM_BLOCKED`, checked in the transaction;
- * the `Agent` tool checks it before creating the subagent as well).
+ * its worktree); a queued item starts. An item already worked on keeps its worker. Refused when a
+ * dependency of the item has not merged (D: 409 `TEAM_WORK_ITEM_BLOCKED`, checked in the
+ * transaction whenever the item has no worker yet, whatever its state; the `Agent` tool checks it
+ * before creating the subagent as well).
  */
 export function attachWorker(
 	teamId: string,
@@ -591,7 +607,7 @@ export function attachWorker(
 	if (item.workerNarratorId) return;
 	const now = new Date().toISOString();
 	db.transaction((tx) => {
-		if (item.state === "queued") assertWorkItemStartable(item.id, tx);
+		assertWorkItemStartable(item.id, tx);
 		updateItem(
 			tx,
 			item,
@@ -659,6 +675,7 @@ export async function recordReview(
 	const team = requireActiveTeam(input.coordinatorId);
 	const item = requireWorkItem(team.teamId, input.itemId);
 	requireLive(item);
+	requireStarted(item, "review");
 	if (!Number.isSafeInteger(input.findings) || input.findings < 0)
 		throw new ValidationError("findings must be a non-negative integer");
 	const path = worktreePathOf(item);
@@ -733,6 +750,7 @@ export async function markReady(input: {
 	const team = requireActiveTeam(input.coordinatorId);
 	const item = requireWorkItem(team.teamId, input.itemId);
 	requireLive(item);
+	requireStarted(item, "ready");
 	if (item.lastReview !== "clear")
 		throw new AppError(
 			item.reviewRounds === 0
