@@ -34,7 +34,20 @@ import {
 } from "@shared/text-file-types";
 import { watchNoticeFromTask } from "@shared/watch-command";
 import { parseWorkspaceDirectoryMap, readDeviceDirectory } from "@shared/workspace-directories";
-import { and, asc, desc, eq, exists, gt, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
+import {
+	and,
+	asc,
+	desc,
+	eq,
+	exists,
+	gt,
+	inArray,
+	isNotNull,
+	isNull,
+	or,
+	type SQL,
+	sql,
+} from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
 	narratorBufferedMessages,
@@ -45,6 +58,7 @@ import {
 	narratorToolCalls,
 	projects,
 } from "../db/schema";
+import { readNativeRows, readQuery, readQueryFirst } from "../db/worker-read";
 import type { ReasoningEffort } from "../lib/agent";
 import { diagnosticsFromError } from "../lib/agent/error-diagnostics";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
@@ -98,7 +112,6 @@ import {
 	isPlanModeTrait,
 	isSubagentVariant,
 	parseSubstatus,
-	parseTraits,
 	redactDraftTraits,
 } from "../lib/narrator-utils";
 import { normalizeLegacyPlanPreviousPermissionMode } from "../lib/permission-modes";
@@ -180,6 +193,7 @@ import {
 	preparePrefixRequest,
 	type RequestModelIdentity,
 } from "./agent-runtime/prepare-prefix-request";
+import { RuntimeReadConflictError } from "./agent-runtime/read-conflict";
 import {
 	type RuntimeMailboxRow,
 	resolveRuntimeQueueBackend,
@@ -215,6 +229,11 @@ import {
 	syncActiveReplyContext,
 } from "./narrator-reply-context";
 import { enrichToolUseBlocks, narratorService, truncateToolIO } from "./narrator-service";
+import type { NarratorSurfaceReadBudget as SessionReadBudget } from "./narrator-surface-reads";
+import {
+	assertNarratorSurfaceObservation,
+	narratorSurfaceReadOptions as sessionReadOptions,
+} from "./narrator-surface-reads";
 import { generateQuickTitle, setProvisionalTitleFromUserMessage } from "./narrator-title";
 import { resolveContinueTurnTiming } from "./narrator-turn-timing";
 import {
@@ -228,6 +247,7 @@ import {
 	projectPendingInjection,
 } from "./parent-injection-queue";
 import { syncNarratorProjectLinksSafely } from "./project-index";
+import { RESTART_NARRATOR_COLUMNS, RESTART_TOOL_COLUMNS } from "./recovery-observation";
 import { broadcastSpecChanged } from "./spec-broadcast";
 import { drainSpecUpdatesForNarrator } from "./spec-update-queue";
 import { specVfsService } from "./spec-vfs-service";
@@ -660,16 +680,27 @@ export async function applySessionDefaultDevice(
  * the shared resolver reports an unknown project as null. The resolution itself
  * lives in `narrator-project.ts` (single source of truth).
  */
-async function resolveNarratorProjectId(narratorId: string): Promise<string | null> {
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { id: true, contextProjectId: true },
-	});
+async function resolveNarratorProjectId(
+	narratorId: string,
+	readBudget: SessionReadBudget = {},
+): Promise<string | null> {
+	readBudget = sessionReadOptions(readBudget);
+	const narrator = await readQueryFirst(
+		db.query.narrators.findMany({
+			limit: 1,
+			where: eq(narrators.id, narratorId),
+			columns: { id: true, contextProjectId: true },
+		}),
+		sessionReadOptions(readBudget),
+	);
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
-	return await resolveSharedNarratorProjectId(narrator);
+	return await resolveSharedNarratorProjectId(narrator, sessionReadOptions(readBudget));
 }
 
-export async function getNarratorExecutionDeviceState(narratorId: string): Promise<{
+export async function getNarratorExecutionDeviceState(
+	narratorId: string,
+	readBudget: SessionReadBudget = {},
+): Promise<{
 	defaultDeviceId: string | null;
 	devices: NonNullable<import("../lib/agent").AgentConfig["availableDevices"]>;
 	/**
@@ -679,12 +710,17 @@ export async function getNarratorExecutionDeviceState(narratorId: string): Promi
 	 */
 	directories: import("@shared/workspace-directories").WorkspaceDirectoryMap;
 }> {
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { defaultDeviceId: true },
-	});
+	readBudget = sessionReadOptions(readBudget);
+	const narrator = await readQueryFirst(
+		db.query.narrators.findMany({
+			limit: 1,
+			where: eq(narrators.id, narratorId),
+			columns: { defaultDeviceId: true },
+		}),
+		sessionReadOptions(readBudget),
+	);
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
-	const projectId = await resolveNarratorProjectId(narratorId);
+	const projectId = await resolveNarratorProjectId(narratorId, readBudget);
 	const runtime = await assertOAuthNarratorRuntimeActive(narratorId);
 	const devices = (await resolveSessionDevices(projectId)) ?? [];
 	const { getWorkspaceDirectories } = await import("./workspace-context-service");
@@ -1492,9 +1528,14 @@ async function createNarrator(
 	await syncNarratorProjectLinksSafely(narrator.id);
 	const resolvedProjectId = await resolveSharedNarratorProjectId(narrator);
 	if (resolvedProjectId) {
-		const project = await db.query.projects.findFirst({
-			where: eq(projects.id, resolvedProjectId),
-		});
+		const project = await readQueryFirst(
+			db.query.projects.findMany({
+				limit: 1,
+				where: eq(projects.id, resolvedProjectId),
+				columns: { id: true, gitPath: true, chapterSettings: true },
+			}),
+			sessionReadOptions(),
+		);
 		if (!project) throw new NotFoundError("Project", resolvedProjectId);
 		narratorProjectId = project.id;
 		projectGitPath = project.gitPath;
@@ -1749,13 +1790,17 @@ async function broadcastInterruptedPartialMessage(
 		);
 		if (!fullMessage) return;
 
-		const ref = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, partialId),
-			),
-			columns: { seq: true },
-		});
+		const ref = await readQueryFirst(
+			db.query.narratorMessageRefs.findMany({
+				limit: 1,
+				where: and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, partialId),
+				),
+				columns: { seq: true },
+			}),
+			sessionReadOptions(),
+		);
 
 		const processed = enrichToolUseBlocks(truncateToolIO([{ ...fullMessage, seq: ref?.seq }]))[0];
 
@@ -1767,10 +1812,14 @@ async function broadcastInterruptedPartialMessage(
 				deliverTo?.toolUseId === fullMessage.parentToolUseId
 					? deliverTo.narratorId
 					: (
-							await db.query.narrators.findFirst({
-								where: eq(narrators.id, narratorId),
-								columns: { parentNarratorId: true },
-							})
+							await readQueryFirst(
+								db.query.narrators.findMany({
+									limit: 1,
+									where: eq(narrators.id, narratorId),
+									columns: { parentNarratorId: true },
+								}),
+								sessionReadOptions(),
+							)
 						)?.parentNarratorId;
 			if (recipientId && recipientId !== narratorId) {
 				broadcastToNarrator(recipientId, {
@@ -1848,15 +1897,21 @@ export async function finalizeInterruptedRun(
 	}
 
 	try {
-		const current = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { status: true, substatus: true },
-		});
+		const current = await readQueryFirst(
+			db.query.narrators.findMany({
+				limit: 1,
+				where: eq(narrators.id, narratorId),
+				columns: RESTART_NARRATOR_COLUMNS,
+			}),
+			sessionReadOptions(),
+		);
 		const currentSubstatus = parseSubstatus(current?.substatus);
+		if (!current) throw new RuntimeReadConflictError();
 		if (!(current?.status === "idle" && currentSubstatus.includes("error"))) {
 			await narratorService.updateStatus(narratorId, "idle", {
 				substatus: ["interrupted"],
 				unlessArchived: true,
+				recoveryObservation: current,
 			});
 		}
 	} catch (err) {
@@ -2562,21 +2617,34 @@ async function deliverPendingInjectionsInOrder(
 					// A person's answer: the run that takes it up is theirs too (outline P2 PR 10c-2).
 					if (active) active._runPersonActed = true;
 					// Adopt the already persisted user receipt, never create a second message.
-					const ref = db
-						.select({ id: narratorMessageRefs.id })
-						.from(narratorMessageRefs)
-						.where(
-							and(
-								eq(narratorMessageRefs.narratorId, narratorId),
-								eq(narratorMessageRefs.messageId, questionAnswer.messageId),
-							),
-						)
-						.get();
+					const ref = await readQueryFirst(
+						db
+							.select({ id: narratorMessageRefs.id })
+							.from(narratorMessageRefs)
+							.where(
+								and(
+									eq(narratorMessageRefs.narratorId, narratorId),
+									eq(narratorMessageRefs.messageId, questionAnswer.messageId),
+								),
+							)
+							.limit(1),
+						sessionReadOptions(),
+					);
 					if (!ref) throw new Error("Question answer history reference no longer exists");
-					const adopted = runtimeInbox.materialize(inboxClaim(row), () => ({
-						messageId: questionAnswer.messageId,
-						refId: ref.id,
-					}));
+					const adopted = runtimeInbox.materialize(inboxClaim(row), (tx) => {
+						const current = tx
+							.select({ id: narratorMessageRefs.id })
+							.from(narratorMessageRefs)
+							.where(
+								and(
+									eq(narratorMessageRefs.narratorId, narratorId),
+									eq(narratorMessageRefs.messageId, questionAnswer.messageId),
+								),
+							)
+							.get();
+						assertNarratorSurfaceObservation(ref, current, ["id"]);
+						return { messageId: questionAnswer.messageId, refId: ref.id };
+					});
 					if (active?._questionAnswerAdoptedMessageIds?.has(questionAnswer.messageId)) {
 						// It arrived between the pre-pass drain and history read. The model
 						// already saw it; acknowledge the receipt, do not add a second copy.
@@ -3641,11 +3709,16 @@ export async function drainNarratorSessionTails(options: {
 /** Where a session's current (or last) run delivers its result, if anywhere. */
 export async function readSessionDeliverTo(
 	narratorId: string,
+	readBudget: SessionReadBudget = {},
 ): Promise<import("../lib/validators/runtime-registration").RunDeliverTo | undefined> {
-	const row = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { runtimeRegistrationJson: true },
-	});
+	const row = await readQueryFirst(
+		db.query.narrators.findMany({
+			limit: 1,
+			where: eq(narrators.id, narratorId),
+			columns: { runtimeRegistrationJson: true },
+		}),
+		sessionReadOptions(readBudget),
+	);
 	return row ? runDeliverToOf(row) : undefined;
 }
 
@@ -4292,12 +4365,14 @@ async function updateToolCallConclusionUnlocked(opts: {
 		refreshTiming = false,
 	} = opts;
 	// Scope metadata only: do not load the child's transcript or file-tool payloads.
-	const attributionTurn = await db.query.narrators
-		.findFirst({
+	const attributionTurn = await readQueryFirst(
+		db.query.narrators.findMany({
+			limit: 1,
 			where: eq(narrators.id, subagentId),
 			columns: { turnStartedAt: true, title: true },
-		})
-		.catch(() => undefined);
+		}),
+		sessionReadOptions(),
+	);
 	const resultPrefix = agentResultTag(
 		await resolveAgentLabel(parentNarratorId, subagentId),
 		subagentId,
@@ -4316,23 +4391,26 @@ async function updateToolCallConclusionUnlocked(opts: {
 		},
 		resultPrefix + (finalText || "(no output)"),
 	);
-	const resultRows = await db.query.narratorToolCalls.findMany({
-		where: and(
-			eq(narratorToolCalls.narratorId, parentNarratorId),
-			eq(narratorToolCalls.toolUseId, toolUseId),
-			messageId ? eq(narratorToolCalls.messageId, messageId) : undefined,
-			opts.toolCallId ? eq(narratorToolCalls.id, opts.toolCallId) : undefined,
-		),
-		columns: {
-			id: true,
-			createdAt: true,
-			streamStartedAt: true,
-			permissionStartedAt: true,
-			executionStartedAt: true,
-			status: true,
-		},
-		limit: 2,
-	});
+	const resultRows = await readQuery(
+		db.query.narratorToolCalls.findMany({
+			where: and(
+				eq(narratorToolCalls.narratorId, parentNarratorId),
+				eq(narratorToolCalls.toolUseId, toolUseId),
+				messageId ? eq(narratorToolCalls.messageId, messageId) : undefined,
+				opts.toolCallId ? eq(narratorToolCalls.id, opts.toolCallId) : undefined,
+			),
+			columns: {
+				id: true,
+				createdAt: true,
+				streamStartedAt: true,
+				permissionStartedAt: true,
+				executionStartedAt: true,
+				status: true,
+			},
+			limit: 2,
+		}),
+		sessionReadOptions(),
+	);
 	if (resultRows.length !== 1) {
 		if (opts.onlyIfActive) return;
 		throw new ValidationError("Subagent conclusion requires an exact parent tool-call row");
@@ -4349,6 +4427,39 @@ async function updateToolCallConclusionUnlocked(opts: {
 			errorMessage: hasError ? finalText : undefined,
 			resultMessageId,
 			onPersist: opts.onPersist,
+			beforePersist: (tx) => {
+				const current = tx.query.narratorToolCalls
+					.findFirst({
+						where: eq(narratorToolCalls.id, resultRow.id),
+						columns: {
+							id: true,
+							createdAt: true,
+							streamStartedAt: true,
+							permissionStartedAt: true,
+							executionStartedAt: true,
+							status: true,
+						},
+					})
+					.sync();
+				if (opts.onlyIfActive && current && ["success", "fail"].includes(current.status)) return;
+				assertNarratorSurfaceObservation(resultRow, current, [
+					"id",
+					"status",
+					...(refreshTiming
+						? ([
+								"createdAt",
+								"streamStartedAt",
+								"permissionStartedAt",
+								"executionStartedAt",
+							] as const)
+						: []),
+				]);
+				const child = tx.query.narrators
+					.findFirst({ where: eq(narrators.id, subagentId), columns: { turnStartedAt: true } })
+					.sync();
+				if ((child?.turnStartedAt ?? null) !== (attributionTurn?.turnStartedAt ?? null))
+					throw new RuntimeReadConflictError();
+			},
 			onlyIfActive: opts.onlyIfActive,
 			...(timing ?? { preserveTiming: true }),
 		},
@@ -5491,26 +5602,31 @@ async function canWakeQuestionAnswer(
 
 export async function recoverPendingQuestionAnswerDeliveries(
 	locale: Locale = "en",
-	options: { signal?: AbortSignal } = {},
+	options: SessionReadBudget = {},
 ): Promise<number> {
 	if (getNarratorMessageRefsPort()) return 0;
+	options = sessionReadOptions(options);
 	const { getAsyncQuestionExecutionPrincipal, getBoundedQuestionReceipt } = await import(
 		"./narrator-question-service"
 	);
 	const narratorRowid = sql<number>`${narrators}.rowid`;
 	const questionRowid = sql<number>`${narratorQuestions}.rowid`;
-	const narratorEnd = db
-		.select({ cursor: narratorRowid })
-		.from(narrators)
-		.orderBy(desc(narratorRowid))
-		.limit(1)
-		.get()?.cursor;
-	const questionEnd = db
-		.select({ cursor: questionRowid })
-		.from(narratorQuestions)
-		.orderBy(desc(questionRowid))
-		.limit(1)
-		.get()?.cursor;
+	const narratorEnd = (
+		await readQueryFirst(
+			db.select({ cursor: narratorRowid }).from(narrators).orderBy(desc(narratorRowid)).limit(1),
+			sessionReadOptions(options),
+		)
+	)?.cursor;
+	const questionEnd = (
+		await readQueryFirst(
+			db
+				.select({ cursor: questionRowid })
+				.from(narratorQuestions)
+				.orderBy(desc(questionRowid))
+				.limit(1),
+			sessionReadOptions(options),
+		)
+	)?.cursor;
 	if (!narratorEnd || !questionEnd) return 0;
 	let cursor = 0;
 	let scheduled = 0;
@@ -5518,19 +5634,21 @@ export async function recoverPendingQuestionAnswerDeliveries(
 	// page is small and yields before continuing, including a single busy narrator.
 	while (cursor < narratorEnd) {
 		options.signal?.throwIfAborted();
-		const recipients = db
-			.select({
-				cursor: narratorRowid,
-				id: narrators.id,
-				status: narrators.status,
-				lastStopReason: narrators.lastStopReason,
-				substatus: narrators.substatus,
-			})
-			.from(narrators)
-			.where(and(gt(narratorRowid, cursor), sql`${narratorRowid} <= ${narratorEnd}`))
-			.orderBy(asc(narratorRowid))
-			.limit(32)
-			.all();
+		const recipients = await readQuery(
+			db
+				.select({
+					cursor: narratorRowid,
+					id: narrators.id,
+					status: narrators.status,
+					lastStopReason: narrators.lastStopReason,
+					substatus: narrators.substatus,
+				})
+				.from(narrators)
+				.where(and(gt(narratorRowid, cursor), sql`${narratorRowid} <= ${narratorEnd}`))
+				.orderBy(asc(narratorRowid))
+				.limit(32),
+			sessionReadOptions(options),
+		);
 		if (!recipients.length) break;
 		for (const recipient of recipients) {
 			options.signal?.throwIfAborted();
@@ -5540,25 +5658,30 @@ export async function recoverPendingQuestionAnswerDeliveries(
 				options.signal?.throwIfAborted();
 				// idx_narrator_questions_narrator_status also carries SQLite rowid,
 				// so equality on its two columns supports ordered cursor pagination.
-				const pending = db
-					.select({
-						cursor: questionRowid,
-						id: narratorQuestions.id,
-						messageId: narratorQuestions.answerMessageId,
-					})
-					.from(narratorQuestions)
-					.where(
-						and(
-							eq(narratorQuestions.narratorId, recipient.id),
-							eq(narratorQuestions.status, "answered"),
-							isNull(narratorQuestions.resolutionJson),
-							gt(questionRowid, answerCursor),
-							sql`${questionRowid} <= ${questionEnd}`,
-						),
-					)
-					.orderBy(asc(questionRowid))
-					.limit(32)
-					.all();
+				const pending = await readQuery(
+					db
+						.select({
+							cursor: questionRowid,
+							id: narratorQuestions.id,
+							messageId: narratorQuestions.answerMessageId,
+							answerSeq: sql<
+								number | null
+							>`(SELECT r.seq FROM narrator_message_refs r WHERE r.narrator_id = ${recipient.id} AND r.message_id = ${narratorQuestions.answerMessageId} LIMIT 1)`,
+						})
+						.from(narratorQuestions)
+						.where(
+							and(
+								eq(narratorQuestions.narratorId, recipient.id),
+								eq(narratorQuestions.status, "answered"),
+								isNull(narratorQuestions.resolutionJson),
+								gt(questionRowid, answerCursor),
+								sql`${questionRowid} <= ${questionEnd}`,
+							),
+						)
+						.orderBy(asc(questionRowid))
+						.limit(32),
+					sessionReadOptions(options),
+				);
 				if (!pending.length) break;
 				for (const question of pending) {
 					options.signal?.throwIfAborted();
@@ -5568,21 +5691,22 @@ export async function recoverPendingQuestionAnswerDeliveries(
 						// refs 里、并且后面有一次真正的 assistant 回复，才说明会话继续过。
 						// 没有 ref 时仍交给下面的 schedule：它会抛出并记
 						// "Pending question recovery deferred"，下一次启动再试。
-						const answerRef = db
-							.select({ seq: narratorMessageRefs.seq })
-							.from(narratorMessageRefs)
-							.where(
-								and(
-									eq(narratorMessageRefs.narratorId, recipient.id),
-									eq(narratorMessageRefs.messageId, question.messageId),
-								),
-							)
-							.limit(1)
-							.get();
-						if (answerRef && assistantReplyFollowsAnswer(recipient.id, answerRef.seq)) continue;
-						const principal = await getAsyncQuestionExecutionPrincipal(question.id, recipient.id);
+						if (
+							question.answerSeq != null &&
+							assistantReplyFollowsAnswer(recipient.id, question.answerSeq)
+						)
+							continue;
+						const principal = await getAsyncQuestionExecutionPrincipal(
+							question.id,
+							recipient.id,
+							options,
+						);
 						if (!principal) continue;
-						const receipt = await getBoundedQuestionReceipt(question.messageId, recipient.id);
+						const receipt = await getBoundedQuestionReceipt(
+							question.messageId,
+							recipient.id,
+							options,
+						);
 						if (!receipt) continue;
 						const delivery = await scheduleQuestionAnswerDelivery(
 							recipient.id,
@@ -5618,16 +5742,19 @@ export async function getQuestionAnswerFallbackText(
 	const { getBoundedQuestionReceipt } = await import("./narrator-question-service");
 	const text = await getBoundedQuestionReceipt(messageId, narratorId);
 	if (!text) return null;
-	const source = db
-		.select({
-			id: narratorMessages.id,
-			narratorId: narratorMessages.narratorId,
-			createdBy: narratorMessages.createdBy,
-			origin: narratorMessages.origin,
-		})
-		.from(narratorMessages)
-		.where(eq(narratorMessages.id, messageId))
-		.get();
+	const source = await readQueryFirst(
+		db
+			.select({
+				id: narratorMessages.id,
+				narratorId: narratorMessages.narratorId,
+				createdBy: narratorMessages.createdBy,
+				origin: narratorMessages.origin,
+			})
+			.from(narratorMessages)
+			.where(eq(narratorMessages.id, messageId))
+			.limit(1),
+		sessionReadOptions(),
+	);
 	if (!source) return null;
 	return projectMessageSenderText(
 		{
@@ -5648,34 +5775,39 @@ export async function consumeQuestionAnswerModelReceipts(
 	eventIds: ReadonlySet<string>,
 ): Promise<void> {
 	if (getNarratorMessageRefsPort()) return;
-	for (const messageId of eventIds) {
-		const row = db
-			.select({
-				deliveryId: narratorBufferedMessages.deliveryId,
-				recipientRefId: narratorBufferedMessages.recipientRefId,
-				revision: narratorBufferedMessages.contentRevision,
-			})
-			.from(narratorBufferedMessages)
-			.where(
-				and(
-					eq(narratorBufferedMessages.narratorId, narratorId),
-					eq(narratorBufferedMessages.sourceKey, `question-answer:${messageId}`),
-					eq(narratorBufferedMessages.recipientMessageId, messageId),
-					eq(narratorBufferedMessages.state, "materialized"),
-					eq(narratorBufferedMessages.receiptDisposition, "active"),
-					isNull(narratorBufferedMessages.currentAdoptedAt),
-				),
-			)
-			.limit(1)
-			.get();
-		if (row?.deliveryId && row.recipientRefId)
-			await consumeMailboxDelivery({
-				deliveryId: row.deliveryId,
-				recipientNarratorId: narratorId,
-				recipientMessageId: messageId,
-				recipientRefId: row.recipientRefId,
-				revision: row.revision,
-			});
+	const ids = [...eventIds];
+	for (let offset = 0; offset < ids.length; offset += 128) {
+		const rows = await readQuery(
+			db
+				.select({
+					messageId: narratorBufferedMessages.recipientMessageId,
+					deliveryId: narratorBufferedMessages.deliveryId,
+					recipientRefId: narratorBufferedMessages.recipientRefId,
+					revision: narratorBufferedMessages.contentRevision,
+				})
+				.from(narratorBufferedMessages)
+				.where(
+					and(
+						eq(narratorBufferedMessages.narratorId, narratorId),
+						sql`${narratorBufferedMessages.sourceKey} = 'question-answer:' || ${narratorBufferedMessages.recipientMessageId}`,
+						inArray(narratorBufferedMessages.recipientMessageId, ids.slice(offset, offset + 128)),
+						eq(narratorBufferedMessages.state, "materialized"),
+						eq(narratorBufferedMessages.receiptDisposition, "active"),
+						isNull(narratorBufferedMessages.currentAdoptedAt),
+					),
+				)
+				.limit(128),
+			sessionReadOptions(),
+		);
+		for (const row of rows)
+			if (row.deliveryId && row.recipientRefId && row.messageId)
+				await consumeMailboxDelivery({
+					deliveryId: row.deliveryId,
+					recipientNarratorId: narratorId,
+					recipientMessageId: row.messageId,
+					recipientRefId: row.recipientRefId,
+					revision: row.revision,
+				});
 	}
 }
 
@@ -5696,20 +5828,22 @@ export async function retryDeferredQuestionAnswerDeliveries(
 	const { getAsyncQuestionExecutionPrincipal, getBoundedQuestionReceipt } = await import(
 		"./narrator-question-service"
 	);
-	const pending = db
-		.select({ id: narratorQuestions.id, messageId: narratorQuestions.answerMessageId })
-		.from(narratorQuestions)
-		.where(
-			and(
-				eq(narratorQuestions.narratorId, narratorId),
-				eq(narratorQuestions.status, "answered"),
-				isNull(narratorQuestions.resolutionJson),
-				isNotNull(narratorQuestions.answerMessageId),
-				sql`NOT EXISTS (SELECT 1 FROM ${narratorBufferedMessages} WHERE ${narratorBufferedMessages.narratorId} = ${narratorQuestions.narratorId} AND ${narratorBufferedMessages.recipientMessageId} = ${narratorQuestions.answerMessageId})`,
-			),
-		)
-		.limit(16)
-		.all();
+	const pending = await readQuery(
+		db
+			.select({ id: narratorQuestions.id, messageId: narratorQuestions.answerMessageId })
+			.from(narratorQuestions)
+			.where(
+				and(
+					eq(narratorQuestions.narratorId, narratorId),
+					eq(narratorQuestions.status, "answered"),
+					isNull(narratorQuestions.resolutionJson),
+					isNotNull(narratorQuestions.answerMessageId),
+					sql`NOT EXISTS (SELECT 1 FROM ${narratorBufferedMessages} WHERE ${narratorBufferedMessages.narratorId} = ${narratorQuestions.narratorId} AND ${narratorBufferedMessages.recipientMessageId} = ${narratorQuestions.answerMessageId})`,
+				),
+			)
+			.limit(16),
+		sessionReadOptions(),
+	);
 	let accepted = 0;
 	for (const question of pending) {
 		if (!question.messageId) continue;
@@ -5740,24 +5874,29 @@ export async function retryDeferredQuestionAnswerDeliveries(
 	return accepted;
 }
 
-export function isQuestionAnswerDeliveryReady(narratorId: string, messageId: string): boolean {
+export async function isQuestionAnswerDeliveryReady(
+	narratorId: string,
+	messageId: string,
+): Promise<boolean> {
 	if (getNarratorMessageRefsPort()) return false;
-	return !!db
-		.select({ id: narratorBufferedMessages.id })
-		.from(narratorBufferedMessages)
-		.where(
-			and(
-				eq(narratorBufferedMessages.narratorId, narratorId),
-				eq(narratorBufferedMessages.sourceKey, `question-answer:${messageId}`),
-				eq(narratorBufferedMessages.recipientMessageId, messageId),
-				inArray(narratorBufferedMessages.state, ["queued", "claimed", "materialized"]),
-				eq(narratorBufferedMessages.receiptDisposition, "active"),
-				isNull(narratorBufferedMessages.adoptedAt),
-				isNull(narratorBufferedMessages.currentAdoptedAt),
-			),
-		)
-		.limit(1)
-		.get();
+	return !!(await readQueryFirst(
+		db
+			.select({ id: narratorBufferedMessages.id })
+			.from(narratorBufferedMessages)
+			.where(
+				and(
+					eq(narratorBufferedMessages.narratorId, narratorId),
+					eq(narratorBufferedMessages.sourceKey, `question-answer:${messageId}`),
+					eq(narratorBufferedMessages.recipientMessageId, messageId),
+					inArray(narratorBufferedMessages.state, ["queued", "claimed", "materialized"]),
+					eq(narratorBufferedMessages.receiptDisposition, "active"),
+					isNull(narratorBufferedMessages.adoptedAt),
+					isNull(narratorBufferedMessages.currentAdoptedAt),
+				),
+			)
+			.limit(1),
+		sessionReadOptions(),
+	));
 }
 
 /** task_notice 的通知预算里给 metadata 预留的额度。 */
@@ -5894,15 +6033,26 @@ export async function startInjectionContinuationIfPossible(
 
 		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 		if (active._loopRunning || getExecutionOwner(narratorId)) return { started: false };
+		const wakeObservation = await readQueryFirst(
+			db.query.narrators.findMany({
+				where: eq(narrators.id, narratorId),
+				columns: { status: true, substatus: true, lastStopReason: true, traits: true },
+				limit: 1,
+			}),
+			sessionReadOptions(),
+		);
 		if (
-			executionPrincipal &&
-			db
-				.select({ reason: narrators.lastStopReason })
-				.from(narrators)
-				.where(eq(narrators.id, narratorId))
-				.get()?.reason !== "normal"
+			!wakeObservation ||
+			wakeObservation.status !== "idle" ||
+			isPlanModeTrait(wakeObservation.traits) ||
+			(executionPrincipal && !isQuestionAnswerWakeEligible(wakeObservation))
 		)
 			return { started: false };
+
+		await narratorService.updateStatus(narratorId, "working", {
+			setTurnStart: true,
+			expectedWakeObservation: wakeObservation,
+		});
 
 		if (executionPrincipal) active._currentUserId = executionPrincipal.userId;
 		active._continuationSuppressed = false;
@@ -5912,7 +6062,6 @@ export async function startInjectionContinuationIfPossible(
 		active._ttftMs = undefined;
 		active._turnStartedAt = new Date().toISOString();
 
-		await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
 		runAgentLoop(active, "", undefined, {
 			principal: executionPrincipal?.userId,
 			// A person's answer (an asynchronous question) wakes the session on their behalf.
@@ -7357,13 +7506,17 @@ async function executePersistedToolCallUnlocked(input: {
 	userId?: string | null;
 	permissionMode?: "normal" | "preGranted";
 }): Promise<ToolCallReexecutionLaunch> {
-	const toolCall = await db.query.narratorToolCalls.findFirst({
-		where: and(
-			eq(narratorToolCalls.id, input.toolCallId),
-			eq(narratorToolCalls.narratorId, input.narratorId),
-		),
-		columns: { toolUseId: true },
-	});
+	const toolCall = await readQueryFirst(
+		db.query.narratorToolCalls.findMany({
+			where: and(
+				eq(narratorToolCalls.id, input.toolCallId),
+				eq(narratorToolCalls.narratorId, input.narratorId),
+			),
+			columns: { toolUseId: true },
+			limit: 1,
+		}),
+		sessionReadOptions(),
+	);
 	if (!toolCall) return { ok: false, reason: "not_found" };
 	// Preserve the short-lock handoff: calling the public wrapper here would
 	// await its completion while this outer recovery transaction still held the lock.
@@ -7421,12 +7574,16 @@ async function rollbackToBlockUnlocked(
 			!!opts?.revertPlan || (opts?.skipRevert !== true && opts?.scope !== undefined),
 		),
 	};
-	const targetRef = await db.query.narratorMessageRefs.findFirst({
-		where: and(
-			eq(narratorMessageRefs.narratorId, narratorId),
-			eq(narratorMessageRefs.messageId, messageId),
-		),
-	});
+	const targetRef = await readQueryFirst(
+		db.query.narratorMessageRefs.findMany({
+			limit: 1,
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, messageId),
+			),
+		}),
+		sessionReadOptions(),
+	);
 	if (!targetRef) throw new NotFoundError("Message", messageId);
 
 	const targetMsg = fillBody(
@@ -7869,12 +8026,16 @@ async function editAndRegenerateUnlocked(
 		await reconcileRunningStatus(narratorId);
 		return { ok: false };
 	}
-	const targetRef = await db.query.narratorMessageRefs.findFirst({
-		where: and(
-			eq(narratorMessageRefs.narratorId, narratorId),
-			eq(narratorMessageRefs.messageId, messageId),
-		),
-	});
+	const targetRef = await readQueryFirst(
+		db.query.narratorMessageRefs.findMany({
+			limit: 1,
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, messageId),
+			),
+		}),
+		sessionReadOptions(),
+	);
 	if (!targetRef) throw new NotFoundError("Message", messageId);
 
 	const targetMsg = fillBody(
@@ -8395,12 +8556,16 @@ async function editAssistantMessageUnlocked(
 	newContent: string,
 	editedBy?: string | null,
 ): Promise<{ ok: boolean }> {
-	const targetRef = await db.query.narratorMessageRefs.findFirst({
-		where: and(
-			eq(narratorMessageRefs.narratorId, narratorId),
-			eq(narratorMessageRefs.messageId, messageId),
-		),
-	});
+	const targetRef = await readQueryFirst(
+		db.query.narratorMessageRefs.findMany({
+			limit: 1,
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, messageId),
+			),
+		}),
+		sessionReadOptions(),
+	);
 	if (!targetRef) throw new NotFoundError("Message", messageId);
 
 	const targetMsg = fillBody(
@@ -8476,12 +8641,16 @@ async function restoreAssistantMessageUnlocked(
 	narratorId: string,
 	messageId: string,
 ): Promise<{ ok: boolean }> {
-	const targetRef = await db.query.narratorMessageRefs.findFirst({
-		where: and(
-			eq(narratorMessageRefs.narratorId, narratorId),
-			eq(narratorMessageRefs.messageId, messageId),
-		),
-	});
+	const targetRef = await readQueryFirst(
+		db.query.narratorMessageRefs.findMany({
+			limit: 1,
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, messageId),
+			),
+		}),
+		sessionReadOptions(),
+	);
 	if (!targetRef) throw new NotFoundError("Message", messageId);
 
 	const targetMsg = fillBody(
@@ -8849,9 +9018,14 @@ export async function cleanupPartialMessage(partialId: string, narratorId: strin
 	);
 }
 
-async function cleanupPartialMessageUnlocked(partialId: string, narratorId: string): Promise<void> {
+async function cleanupPartialMessageUnlocked(
+	partialId: string,
+	narratorId: string,
+	beforeWrite?: (tx: import("./agent-runtime/mailbox-types").RuntimeTx) => void,
+): Promise<void> {
 	try {
 		db.transaction((tx) => {
+			beforeWrite?.(tx);
 			tx.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, partialId)).run();
 			tx.delete(narratorMessageRefs).where(eq(narratorMessageRefs.messageId, partialId)).run();
 			tx.delete(narratorMessages).where(eq(narratorMessages.id, partialId)).run();
@@ -8865,6 +9039,7 @@ async function cleanupPartialMessageUnlocked(partialId: string, narratorId: stri
 				.run();
 		});
 	} catch (err) {
+		if (err instanceof RuntimeReadConflictError) throw err;
 		logger.warn("Failed to clean up partial message on error", {
 			narratorId,
 			partialId,
@@ -8901,12 +9076,26 @@ async function finalizeOrCleanupPartialMessageUnlocked(
 	partialId: string,
 	narratorId: string,
 ): Promise<boolean> {
-	try {
-		const toolCalls = await db.query.narratorToolCalls.findMany({
+	const query = () =>
+		db.query.narratorToolCalls.findMany({
 			where: eq(narratorToolCalls.messageId, partialId),
 			columns: { id: true, toolUseId: true, status: true },
+			orderBy: asc(narratorToolCalls.id),
+			limit: 1001,
 		});
-
+	const toolCalls = await readQuery(query(), { ...sessionReadOptions(), maxRows: 1000 });
+	const assertToolCalls = (tx: import("./agent-runtime/mailbox-types").RuntimeTx) => {
+		const current = tx.query.narratorToolCalls
+			.findMany({
+				where: eq(narratorToolCalls.messageId, partialId),
+				columns: { id: true, toolUseId: true, status: true },
+				orderBy: asc(narratorToolCalls.id),
+				limit: 1001,
+			})
+			.sync();
+		assertNarratorSurfaceObservation({ toolCalls }, { toolCalls: current }, ["toolCalls"]);
+	};
+	try {
 		// Statuses that indicate the tool was actually executed (side effects occurred)
 		const executedStatuses = new Set(["success", "fail", "running"]);
 		const executed = toolCalls.filter((tc) => executedStatuses.has(tc.status));
@@ -8916,6 +9105,7 @@ async function finalizeOrCleanupPartialMessageUnlocked(
 			// meaningful text/reasoning content that should be preserved
 			// (e.g. user interrupted while the model was streaming a long text block).
 			const hasContent = db.transaction((tx) => {
+				assertToolCalls(tx);
 				const msg = fillBody(
 					tx.query.narratorMessages
 						.findFirst({
@@ -8975,7 +9165,7 @@ async function finalizeOrCleanupPartialMessageUnlocked(
 			}
 			if (!hasContent) {
 				// Truly empty — safe to delete
-				await cleanupPartialMessage(partialId, narratorId);
+				await cleanupPartialMessageUnlocked(partialId, narratorId, assertToolCalls);
 				return false;
 			}
 			return true;
@@ -8986,6 +9176,7 @@ async function finalizeOrCleanupPartialMessageUnlocked(
 		const unexecutedToolUseIds = new Set(unexecuted.map((tc) => tc.toolUseId));
 
 		db.transaction((tx) => {
+			assertToolCalls(tx);
 			// The body is read before the ledger writes, which queue the envelope for a sync.
 			const body = unexecutedToolUseIds.size > 0 ? readEnvelopeBody(tx, partialId) : undefined;
 			// Delete unexecuted tool_call records
@@ -9038,12 +9229,13 @@ async function finalizeOrCleanupPartialMessageUnlocked(
 		});
 		return true;
 	} catch (err) {
+		if (err instanceof RuntimeReadConflictError) throw err;
 		logger.warn("Failed to finalize partial message, falling back to cleanup", {
 			narratorId,
 			partialId,
 			error: String(err),
 		});
-		await cleanupPartialMessage(partialId, narratorId);
+		await cleanupPartialMessageUnlocked(partialId, narratorId, assertToolCalls);
 		return false;
 	}
 }
@@ -9253,10 +9445,14 @@ export async function acquireNarratorRevertAdmission(
 ): Promise<() => void> {
 	const { signal, interrupt } = options;
 	signal.throwIfAborted();
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { id: true, variant: true, parentNarratorId: true },
-	});
+	const narrator = await readQueryFirst(
+		db.query.narrators.findMany({
+			limit: 1,
+			where: eq(narrators.id, narratorId),
+			columns: { id: true, variant: true, parentNarratorId: true },
+		}),
+		sessionReadOptions({ signal }),
+	);
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
 	signal.throwIfAborted();
 	// Users drive subagents directly, so a subagent is a valid revert root. It
@@ -9469,17 +9665,21 @@ export async function reconcileRunningStatus(narratorId: string): Promise<boolea
 
 	if (isNarratorRuntimeBusy(narratorId)) return false;
 
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { status: true, substatus: true },
-	});
+	const narrator = await readQueryFirst(
+		db.query.narrators.findMany({
+			limit: 1,
+			where: eq(narrators.id, narratorId),
+			columns: { status: true, substatus: true, logicalRunId: true },
+		}),
+		sessionReadOptions(),
+	);
 	if (narrator?.status !== "working" && narrator?.status !== "waiting") return false;
 
 	const changed = await narratorService.compareAndSetStatus(
 		narratorId,
 		["working", "waiting"],
 		"idle",
-		{ substatus: parseSubstatus(narrator.substatus) },
+		{ substatus: parseSubstatus(narrator.substatus), expectedObservation: narrator },
 	);
 	if (changed) {
 		logger.warn("Reconciled zombie narrator status → idle (no runtime owner)", {
@@ -9812,10 +10012,14 @@ export const inheritedModelRuntime = createInheritedModelRuntime({
 	getActive: (id) => activeNarrators.get(id),
 	activeValues: () => activeNarrators.values(),
 	readNarrator: (id) =>
-		db.query.narrators.findFirst({
-			where: eq(narrators.id, id),
-			columns: { ...RUNTIME_SOURCE_COLUMNS, model: true, reasoningEffort: true },
-		}),
+		readQueryFirst(
+			db.query.narrators.findMany({
+				limit: 1,
+				where: eq(narrators.id, id),
+				columns: { ...RUNTIME_SOURCE_COLUMNS, model: true, reasoningEffort: true },
+			}),
+			sessionReadOptions(),
+		),
 	resolve: async (narrator, actingUserId, stickyProvider) => {
 		const settingsRevision = getSettingsRevision();
 		return {
@@ -9986,31 +10190,130 @@ export async function setTemporaryModelRestore(
 		.where(eq(narrators.id, narratorId));
 }
 
+const SESSION_NARRATOR_COLUMNS = {
+	...RESTART_NARRATOR_COLUMNS,
+	traits: true,
+	permissionMode: true,
+	previousPermissionMode: true,
+	model: true,
+	pendingModelRestore: true,
+} as const;
+type SessionNarratorObservation = Pick<
+	typeof narrators.$inferSelect,
+	keyof typeof SESSION_NARRATOR_COLUMNS
+>;
+
+async function* sessionNarratorPages(where?: SQL, readBudget: SessionReadBudget = {}) {
+	const options = sessionReadOptions(readBudget);
+	const end = await readQueryFirst(
+		db
+			.select({ id: narrators.id })
+			.from(narrators)
+			.where(where)
+			.orderBy(desc(narrators.id))
+			.limit(1),
+		options,
+	);
+	if (!end) return;
+	let after: string | undefined;
+	while (true) {
+		const rows = await readQuery(
+			db.query.narrators.findMany({
+				where: and(
+					where,
+					after ? gt(narrators.id, after) : undefined,
+					sql`${narrators.id} <= ${end.id}`,
+				),
+				columns: SESSION_NARRATOR_COLUMNS,
+				orderBy: asc(narrators.id),
+				limit: 128,
+			}),
+			sessionReadOptions(options),
+		);
+		if (!rows.length) return;
+		yield rows;
+		after = rows[rows.length - 1].id;
+	}
+}
+
+function assertSessionNarrator(
+	tx: import("./agent-runtime/mailbox-types").RuntimeTx,
+	expected: SessionNarratorObservation,
+	fields: readonly (keyof SessionNarratorObservation)[],
+) {
+	const current = tx.query.narrators
+		.findFirst({ where: eq(narrators.id, expected.id), columns: SESSION_NARRATOR_COLUMNS })
+		.sync();
+	assertNarratorSurfaceObservation(expected, current, fields);
+}
+
+async function* sessionToolPages(
+	status: typeof narratorToolCalls.$inferSelect.status,
+	readBudget: SessionReadBudget = {},
+) {
+	const options = sessionReadOptions(readBudget);
+	const end = await readQueryFirst(
+		db
+			.select({ id: narratorToolCalls.id })
+			.from(narratorToolCalls)
+			.where(eq(narratorToolCalls.status, status))
+			.orderBy(desc(narratorToolCalls.id))
+			.limit(1),
+		options,
+	);
+	if (!end) return;
+	let after: string | undefined;
+	while (true) {
+		const rows = await readQuery(
+			db
+				.select(RESTART_TOOL_COLUMNS)
+				.from(narratorToolCalls)
+				.where(
+					and(
+						eq(narratorToolCalls.status, status),
+						after ? gt(narratorToolCalls.id, after) : undefined,
+						sql`${narratorToolCalls.id} <= ${end.id}`,
+					),
+				)
+				.orderBy(asc(narratorToolCalls.id))
+				.limit(128),
+			sessionReadOptions(options),
+		);
+		if (!rows.length) return;
+		yield rows;
+		after = rows[rows.length - 1].id;
+	}
+}
+
 /**
  * Restore models for all narrators that have a pending temporary model override.
  * Called once at server startup to recover from unclean shutdowns.
  */
-export async function restorePendingModelOverrides(): Promise<void> {
-	const pending = await db.query.narrators.findMany({
-		where: isNotNull(narrators.pendingModelRestore),
-		columns: { id: true, pendingModelRestore: true },
-	});
-	if (pending.length === 0) return;
-
+export async function restorePendingModelOverrides(
+	readBudget: SessionReadBudget = {},
+): Promise<void> {
 	const now = new Date().toISOString();
-	for (const n of pending) {
-		await db
-			.update(narrators)
-			.set({
-				model: n.pendingModelRestore,
-				pendingModelRestore: null,
-				updatedAt: now,
-			})
-			.where(eq(narrators.id, n.id));
-		logger.info("Restored model from pending temporary override on startup", {
-			narratorId: n.id,
-			restoreModel: n.pendingModelRestore,
-		});
+	for await (const pending of sessionNarratorPages(
+		isNotNull(narrators.pendingModelRestore),
+		readBudget,
+	)) {
+		for (const n of pending) {
+			db.transaction((tx) => {
+				assertSessionNarrator(tx, n, ["model", "pendingModelRestore"]);
+				tx.update(narrators)
+					.set({
+						model: n.pendingModelRestore,
+						pendingModelRestore: null,
+						updatedAt: sql`case when ${narrators.updatedAt} > ${now} then ${narrators.updatedAt} else ${now} end`,
+					})
+					.where(eq(narrators.id, n.id))
+					.run();
+			});
+			logger.info("Restored model from pending temporary override on startup", {
+				narratorId: n.id,
+				restoreModel: n.pendingModelRestore,
+			});
+		}
 	}
 }
 
@@ -10073,11 +10376,11 @@ function abortActiveReflectionSuggestions(
 	return changed ? next : undefined;
 }
 
-function logNarratorIntegrityDiagnostics(): void {
+async function logNarratorIntegrityDiagnostics(): Promise<void> {
 	try {
-		const fullForkEmptyRefs = sqlite
-			.prepare(
-				`SELECT n.id, n.parent_narrator_id AS parentNarratorId,
+		const fullForkEmptyRefs = await readNativeRows(
+			sqlite,
+			`SELECT n.id, n.parent_narrator_id AS parentNarratorId,
 					(SELECT count(*) FROM narrator_message_refs pr WHERE pr.narrator_id = n.parent_narrator_id) AS parentRefCount
 				 FROM narrators n
 				 WHERE n.inherit_mode = 'full'
@@ -10085,8 +10388,9 @@ function logNarratorIntegrityDiagnostics(): void {
 				   AND NOT EXISTS (SELECT 1 FROM narrator_message_refs r WHERE r.narrator_id = n.id)
 				   AND EXISTS (SELECT 1 FROM narrator_message_refs pr WHERE pr.narrator_id = n.parent_narrator_id)
 				 LIMIT 20`,
-			)
-			.all();
+			[],
+			{ ...sessionReadOptions(), maxRows: 20 },
+		);
 		if (fullForkEmptyRefs.length > 0) {
 			logger.warn("Narrator integrity diagnostic: full forks with empty local refs", {
 				count: fullForkEmptyRefs.length,
@@ -10094,9 +10398,9 @@ function logNarratorIntegrityDiagnostics(): void {
 			});
 		}
 
-		const missingForkRefs = sqlite
-			.prepare(
-				`SELECT n.id, n.parent_narrator_id AS parentNarratorId, n.fork_message_id AS forkMessageId, n.inherit_mode AS inheritMode
+		const missingForkRefs = await readNativeRows(
+			sqlite,
+			`SELECT n.id, n.parent_narrator_id AS parentNarratorId, n.fork_message_id AS forkMessageId, n.inherit_mode AS inheritMode
 				 FROM narrators n
 				 WHERE n.fork_message_id IS NOT NULL
 				   AND n.parent_narrator_id IS NOT NULL
@@ -10106,8 +10410,9 @@ function logNarratorIntegrityDiagnostics(): void {
 				       AND r.message_id = n.fork_message_id
 				   )
 				 LIMIT 20`,
-			)
-			.all();
+			[],
+			{ ...sessionReadOptions(), maxRows: 20 },
+		);
 		if (missingForkRefs.length > 0) {
 			logger.warn("Narrator integrity diagnostic: fork messages missing from parent refs", {
 				count: missingForkRefs.length,
@@ -10177,24 +10482,32 @@ export async function recoverOnStartup(
 	}
 
 	// Legacy plan permission mode migration: plan is now a narrator trait.
-	const legacyPlanRows = sqlite
-		.prepare(
-			"SELECT id, traits, previous_permission_mode FROM narrators WHERE permission_mode = 'plan'",
-		)
-		.all() as Array<{ id: string; traits: string | null; previous_permission_mode: string | null }>;
-	for (const row of legacyPlanRows) {
-		const traits = addTrait(parseTraits(row.traits), "plan");
-		const permissionMode = normalizeLegacyPlanPreviousPermissionMode(row.previous_permission_mode);
-		sqlite
-			.prepare(
-				"UPDATE narrators SET permission_mode = ?, traits = ?, plan_mode = 1, previous_permission_mode = ?, plan_file_id = ?, updated_at = ? WHERE id = ?",
-			)
-			.run(permissionMode, JSON.stringify(traits), permissionMode, generateWordSlug(), now, row.id);
-	}
-	if (legacyPlanRows.length > 0) {
-		logger.info("Legacy plan permission mode migrated to narrator trait", {
-			count: legacyPlanRows.length,
-		});
+	for await (const legacyPlanRows of sessionNarratorPages(
+		sql`${narrators.permissionMode} = 'plan'`,
+	)) {
+		for (const row of legacyPlanRows) {
+			const traits = addTrait(row.traits, "plan");
+			const permissionMode = normalizeLegacyPlanPreviousPermissionMode(row.previousPermissionMode);
+			db.transaction((tx) => {
+				assertSessionNarrator(tx, row, ["permissionMode", "previousPermissionMode", "traits"]);
+				tx.update(narrators)
+					.set({
+						permissionMode,
+						traits,
+						planMode: true,
+						previousPermissionMode: permissionMode,
+						planFileId: generateWordSlug(),
+						updatedAt: now,
+					})
+					.where(eq(narrators.id, row.id))
+					.run();
+			});
+		}
+		if (legacyPlanRows.length > 0) {
+			logger.info("Legacy plan permission mode migrated to narrator trait", {
+				count: legacyPlanRows.length,
+			});
+		}
 	}
 
 	// A user's hold on a run survives the restart: it is restored from its durable
@@ -10215,30 +10528,40 @@ export async function recoverOnStartup(
 	// Active narrators interrupted by an ordinary restart are marked interrupted. Narrators
 	// covered by the planned-update manifest stay active until their continuations reattach.
 	for (const activeStatus of ["working", "waiting"] as const) {
-		const activeRows = await db.query.narrators.findMany({
-			where: eq(narrators.status, activeStatus),
-			columns: { id: true },
-		});
-		const interruptedIds = activeRows
-			.map((row) => row.id)
-			.filter((id) => !protection.narratorIds?.has(id));
-		const heldIds = interruptedIds.filter((id) => held.has(id));
-		const plainIds = interruptedIds.filter((id) => !held.has(id));
-		if (heldIds.length > 0)
-			await db
-				.update(narrators)
-				.set({ status: "idle", substatus: '["interrupted","taken_over"]', updatedAt: now })
-				.where(inArray(narrators.id, heldIds));
-		if (interruptedIds.length > 0) {
-			if (plainIds.length > 0)
-				await db
-					.update(narrators)
-					.set({ status: "idle", substatus: '["interrupted"]', updatedAt: now })
-					.where(inArray(narrators.id, plainIds));
-			backgroundOccupancyStore.refreshNarrators(interruptedIds);
-			logger.info(`Narrator status migrated: ${activeStatus} → idle [interrupted]`, {
-				count: interruptedIds.length,
+		for await (const activeRows of sessionNarratorPages(eq(narrators.status, activeStatus))) {
+			const interruptedIds = activeRows
+				.map((row) => row.id)
+				.filter((id) => !protection.narratorIds?.has(id));
+			const heldIds = interruptedIds.filter((id) => held.has(id));
+			const plainIds = interruptedIds.filter((id) => !held.has(id));
+			db.transaction((tx) => {
+				for (const row of activeRows)
+					if (interruptedIds.includes(row.id))
+						assertSessionNarrator(tx, row, [
+							"status",
+							"substatus",
+							"logicalRunId",
+							"runtimeRegistrationJson",
+						]);
+				if (heldIds.length > 0)
+					tx.update(narrators)
+						.set({ status: "idle", substatus: '["interrupted","taken_over"]', updatedAt: now })
+						.where(inArray(narrators.id, heldIds))
+						.run();
+				if (interruptedIds.length > 0) {
+					if (plainIds.length > 0)
+						tx.update(narrators)
+							.set({ status: "idle", substatus: '["interrupted"]', updatedAt: now })
+							.where(inArray(narrators.id, plainIds))
+							.run();
+				}
 			});
+			if (interruptedIds.length > 0) {
+				backgroundOccupancyStore.refreshNarrators(interruptedIds);
+				logger.info(`Narrator status migrated: ${activeStatus} → idle [interrupted]`, {
+					count: interruptedIds.length,
+				});
+			}
 		}
 	}
 	await backgroundTaskService.recoverStaleTasksAfterRestart(protection.backgroundTaskIds);
@@ -10254,21 +10577,23 @@ export async function recoverOnStartup(
 	// loop; a swallowed clear (DB lock) or a status-drift CAS no-op could otherwise
 	// pin the sidebar tab icon purple across restarts. The interrupt migration above
 	// already reset working/waiting narrators, so only idle/archived rows remain.
-	const staleTransientRows = sqlite
-		.prepare(
-			"SELECT id, substatus FROM narrators WHERE substatus LIKE '%reflecting%' OR substatus LIKE '%reasoning%'",
-		)
-		.all() as Array<{ id: string; substatus: string | null }>;
 	let clearedTransient = 0;
-	const clearTransientStmt = sqlite.prepare(
-		"UPDATE narrators SET substatus = ?, updated_at = ? WHERE id = ?",
-	);
-	for (const row of staleTransientRows) {
-		const tags = parseSubstatus(row.substatus);
-		const kept = tags.filter((t) => t !== "reflecting" && t !== "reasoning");
-		if (kept.length !== tags.length) {
-			clearTransientStmt.run(JSON.stringify(kept), now, row.id);
-			clearedTransient++;
+	for await (const staleTransientRows of sessionNarratorPages(
+		sql`${narrators.substatus} LIKE '%reflecting%' OR ${narrators.substatus} LIKE '%reasoning%'`,
+	)) {
+		for (const row of staleTransientRows) {
+			const tags = parseSubstatus(row.substatus);
+			const kept = tags.filter((t) => t !== "reflecting" && t !== "reasoning");
+			if (kept.length !== tags.length) {
+				db.transaction((tx) => {
+					assertSessionNarrator(tx, row, ["substatus"]);
+					tx.update(narrators)
+						.set({ substatus: JSON.stringify(kept), updatedAt: now })
+						.where(eq(narrators.id, row.id))
+						.run();
+				});
+				clearedTransient++;
+			}
 		}
 	}
 	if (clearedTransient > 0) {
@@ -10277,99 +10602,57 @@ export async function recoverOnStartup(
 		});
 	}
 
-	logNarratorIntegrityDiagnostics();
+	await logNarratorIntegrityDiagnostics();
 
-	const stalePermissions = await db.query.narratorToolCalls.findMany({
-		where: eq(narratorToolCalls.status, "pending"),
-	});
-	if (stalePermissions.length > 0) {
-		let staleReflectionCount = 0;
-		const restartMessage = "Interrupted by server restart";
-		for (const toolCall of stalePermissions) {
-			if (protection.toolCallIds?.has(toolCall.id)) continue;
-			const abortedSuggestions = abortActiveReflectionSuggestions(
-				toolCall.permissionSuggestions,
-				restartMessage,
-				now,
-			);
-			if (abortedSuggestions) staleReflectionCount++;
-			await db
-				.update(narratorToolCalls)
-				.set({
-					status: "fail",
-					errorMessage: restartMessage,
-					permissionDecidedBy: "server_restart",
-					permissionDecidedAt: now,
-					...(abortedSuggestions
-						? {
-								permissionDecisionReason: restartMessage,
-								permissionSuggestions: abortedSuggestions,
-							}
-						: {}),
-				})
-				.where(eq(narratorToolCalls.id, toolCall.id));
+	for (const status of ["pending", "running", "initializing"] as const) {
+		for await (const page of sessionToolPages(status)) {
+			const rows = page.filter((row) => !protection.toolCallIds?.has(row.id));
+			db.transaction((tx) => {
+				for (const row of rows) {
+					const current = tx
+						.select(RESTART_TOOL_COLUMNS)
+						.from(narratorToolCalls)
+						.where(eq(narratorToolCalls.id, row.id))
+						.get();
+					assertNarratorSurfaceObservation(
+						row,
+						current,
+						Object.keys(RESTART_TOOL_COLUMNS) as (keyof typeof row)[],
+					);
+					const reason = "Interrupted by server restart";
+					const suggestions =
+						status === "pending"
+							? abortActiveReflectionSuggestions(row.permissionSuggestions, reason, now)
+							: undefined;
+					tx.update(narratorToolCalls)
+						.set({
+							status: "fail",
+							errorMessage: reason,
+							...(status === "pending"
+								? {
+										permissionDecidedBy: "server_restart",
+										permissionDecidedAt: now,
+										...(suggestions
+											? { permissionDecisionReason: reason, permissionSuggestions: suggestions }
+											: {}),
+									}
+								: {
+										outputJson: getToolMessage("interruptedByServerRestart"),
+										outputChars: measureSerializedCharacters(
+											getToolMessage("interruptedByServerRestart"),
+										),
+									}),
+						})
+						.where(eq(narratorToolCalls.id, row.id))
+						.run();
+				}
+			});
+			if (status !== "pending")
+				for (const row of rows) queueContextCharacterRefresh(row.narratorId, row.messageId);
+			if (rows.length)
+				logger.info("Stale tool calls recovered on startup", { status, count: rows.length });
 		}
-		logger.info("Stale pending tool calls auto-denied on startup", {
-			count: stalePermissions.length,
-			staleReflectionCount,
-		});
 	}
-
-	const staleToolCalls = (
-		await db.query.narratorToolCalls.findMany({
-			where: eq(narratorToolCalls.status, "running"),
-		})
-	).filter((toolCall) => !protection.toolCallIds?.has(toolCall.id));
-	if (staleToolCalls.length > 0) {
-		await db
-			.update(narratorToolCalls)
-			.set({
-				status: "fail",
-				errorMessage: "Interrupted by server restart",
-				outputJson: getToolMessage("interruptedByServerRestart"),
-				outputChars: measureSerializedCharacters(getToolMessage("interruptedByServerRestart")),
-			})
-			.where(
-				inArray(
-					narratorToolCalls.id,
-					staleToolCalls.map((toolCall) => toolCall.id),
-				),
-			);
-		for (const call of staleToolCalls)
-			queueContextCharacterRefresh(call.narratorId, call.messageId);
-		logger.info("Stale running tool calls marked as failed on startup", {
-			count: staleToolCalls.length,
-		});
-	}
-
-	// Also recover tool calls stuck in "initializing" (permission check never started)
-	const staleInitializing = (
-		await db.query.narratorToolCalls.findMany({
-			where: eq(narratorToolCalls.status, "initializing"),
-		})
-	).filter((toolCall) => !protection.toolCallIds?.has(toolCall.id));
-	if (staleInitializing.length > 0) {
-		await db
-			.update(narratorToolCalls)
-			.set({
-				status: "fail",
-				errorMessage: "Interrupted by server restart",
-				outputJson: getToolMessage("interruptedByServerRestart"),
-				outputChars: measureSerializedCharacters(getToolMessage("interruptedByServerRestart")),
-			})
-			.where(
-				inArray(
-					narratorToolCalls.id,
-					staleInitializing.map((toolCall) => toolCall.id),
-				),
-			);
-		for (const call of staleInitializing)
-			queueContextCharacterRefresh(call.narratorId, call.messageId);
-		logger.info("Stale initializing tool calls marked as failed on startup", {
-			count: staleInitializing.length,
-		});
-	}
-
 	// Preserve modern compact lifecycle records across restarts. Running attempts
 	// become failed audit entries; only legacy placeholders with no attempt/retry
 	// history are removed.
@@ -10385,19 +10668,13 @@ export async function recoverOnStartup(
 			count: interruptedTurns,
 		});
 
-	const transientCompactRows = await db.query.narrators.findMany({
-		columns: { id: true, substatus: true },
-	});
-	for (const row of transientCompactRows) {
-		const current = parseSubstatus(row.substatus);
-		const next = current.filter((tag) => tag !== "compacting" && tag !== "background_compacting");
-		if (next.length !== current.length) {
-			await narratorService.updateSubstatus(row.id, next).catch((err) => {
-				logger.warn("Failed to clear stale compact substatus on startup", {
-					narratorId: row.id,
-					error: String(err),
-				});
-			});
+	for await (const transientCompactRows of sessionNarratorPages()) {
+		for (const row of transientCompactRows) {
+			const current = parseSubstatus(row.substatus);
+			const next = current.filter((tag) => tag !== "compacting" && tag !== "background_compacting");
+			if (next.length !== current.length) {
+				await narratorService.updateSubstatus(row.id, next, { expectedSubstatus: row.substatus });
+			}
 		}
 	}
 
@@ -10444,6 +10721,7 @@ export async function resolveOptionalToolState(
 	toolName: string,
 	/** Acting user, so the user trait layer applies. Optional for legacy callers. */
 	actingUserId?: string | null,
+	readBudget: SessionReadBudget = {},
 ): Promise<{
 	state: "loaded" | "not_loaded" | "disabled_by_trait" | "unknown_tool";
 	/**
@@ -10457,20 +10735,25 @@ export async function resolveOptionalToolState(
 	/** The effective routine mode, when the tool belongs to a tool routine. */
 	mode?: ToolRoutineMode;
 }> {
+	readBudget = sessionReadOptions(readBudget);
 	if (!OPTIONAL_TOOLS.has(toolName)) {
 		return { state: "unknown_tool", globallyEnabled: false };
 	}
 
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: {
-			id: true,
-			enabledTools: true,
-			traits: true,
-			contextProjectId: true,
-			...RUNTIME_SOURCE_COLUMNS,
-		},
-	});
+	const narrator = await readQueryFirst(
+		db.query.narrators.findMany({
+			limit: 1,
+			where: eq(narrators.id, narratorId),
+			columns: {
+				id: true,
+				enabledTools: true,
+				traits: true,
+				contextProjectId: true,
+				...RUNTIME_SOURCE_COLUMNS,
+			},
+		}),
+		sessionReadOptions(readBudget),
+	);
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
 
 	// Layered, so the UI reports a project/user-level deny as disabled_by_trait
@@ -10478,16 +10761,23 @@ export async function resolveOptionalToolState(
 	const { resolveEffectiveTraits, resolveNarratorProjectId } = await import(
 		"./trait-layer-service"
 	);
-	const narratorProjectId = await resolveNarratorProjectId(narrator);
+	const narratorProjectId = await resolveNarratorProjectId(
+		narrator,
+		sessionReadOptions(readBudget),
+	);
 
 	// Same project layer the session build uses, so this never reports a state the
 	// next turn would contradict.
 	let projectRoutineConfig: RoutineModeConfig | undefined;
 	if (narratorProjectId) {
-		const project = await db.query.projects.findFirst({
-			where: eq(projects.id, narratorProjectId),
-			columns: { chapterSettings: true },
-		});
+		const project = await readQueryFirst(
+			db.query.projects.findMany({
+				limit: 1,
+				where: eq(projects.id, narratorProjectId),
+				columns: { chapterSettings: true },
+			}),
+			sessionReadOptions(readBudget),
+		);
 		projectRoutineConfig = parseProjectRoutineConfig(project?.chapterSettings);
 	}
 

@@ -465,12 +465,12 @@ describe("async question receipt runtime adoption", () => {
 			answers: { choice: "sensitive answer" },
 			answerMessageId: "answer",
 		};
-		expect(isQuestionAnswerDeliveryReady(narratorId, "answer")).toBe(false);
+		expect(await isQuestionAnswerDeliveryReady(narratorId, "answer")).toBe(false);
 		expect(formatQuestionResult("question", "answered", record, false)).toContain(
 			"sensitive answer",
 		);
 		await scheduleQuestionAnswerDelivery(narratorId, "answer", text, undefined);
-		expect(isQuestionAnswerDeliveryReady(narratorId, "answer")).toBe(true);
+		expect(await isQuestionAnswerDeliveryReady(narratorId, "answer")).toBe(true);
 		expect(formatQuestionResult("question", "answered", record, false)).toContain(
 			"Question action=get",
 		);
@@ -485,7 +485,7 @@ describe("async question receipt runtime adoption", () => {
 			.set({ state: "materialized", adoptedAt: time, currentAdoptedAt: time })
 			.where(eq(narratorBufferedMessages.recipientMessageId, "answer"))
 			.run();
-		expect(isQuestionAnswerDeliveryReady(narratorId, "answer")).toBe(false);
+		expect(await isQuestionAnswerDeliveryReady(narratorId, "answer")).toBe(false);
 	});
 	test("deleting an answer through ordinary history mutation reopens its question and cancels delivery", async () => {
 		const question = await seedQuestion();
@@ -503,7 +503,9 @@ describe("async question receipt runtime adoption", () => {
 			.get();
 		expect(restored?.status).toBe("open");
 		expect(restored?.answerMessageId).toBeNull();
-		expect(isQuestionAnswerDeliveryReady(narratorId, answer.record.answerMessageId)).toBe(false);
+		expect(await isQuestionAnswerDeliveryReady(narratorId, answer.record.answerMessageId)).toBe(
+			false,
+		);
 	});
 	test("unlinking the original shared request withdraws it while a fork retains its background row", async () => {
 		const question = await seedQuestion();
@@ -570,7 +572,7 @@ describe("async question receipt runtime adoption", () => {
 			locale: "en",
 		} as import("../../lib/agent/types").ToolContext;
 		const query = () => questionTool.execute({ action: "get", id: question.id }, context);
-		expect(isQuestionAnswerDeliveryReady(narratorId, answerId)).toBe(false);
+		expect(await isQuestionAnswerDeliveryReady(narratorId, answerId)).toBe(false);
 		expect(delivery()).toEqual([]);
 		const [first, parallel] = await Promise.all([query(), query()]);
 		expect(first.isError).not.toBe(true);
@@ -594,7 +596,7 @@ describe("async question receipt runtime adoption", () => {
 		const freed = await drainInjectionsIntoHistory(running, "en");
 		expect(freed.text).not.toContain("All except Redis");
 		await freed.onConsumed();
-		expect(isQuestionAnswerDeliveryReady(narratorId, answerId)).toBe(true);
+		expect(await isQuestionAnswerDeliveryReady(narratorId, answerId)).toBe(true);
 		const accepted = delivery();
 		expect(accepted).toHaveLength(1);
 		expect(accepted[0]).toMatchObject({ state: "queued", currentAdoptedAt: null });
@@ -650,7 +652,7 @@ describe("async question receipt runtime adoption", () => {
 		});
 		if (!answer.ok || !answer.record.answerMessageId) throw new Error("answer failed");
 		const answerId = answer.record.answerMessageId;
-		expect(isQuestionAnswerDeliveryReady(narratorId, answerId)).toBe(false);
+		expect(await isQuestionAnswerDeliveryReady(narratorId, answerId)).toBe(false);
 		let queriedAfterAdoption = false;
 		const evidence = await captureQuestionRequests(running, question.id, (turn) => {
 			if (turn > MAILBOX_LIMITS.noticePending + 2)

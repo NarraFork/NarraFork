@@ -66,7 +66,10 @@ spyOn(runModule, "startNarratorRun").mockImplementation(async (request) => {
 });
 const { getExecutionOwner, tryClaimExecution } = await import("../agent-runtime/ownership");
 
-const { startInjectionContinuationIfPossible } = await import("../narrator-session");
+const { startInjectionContinuationIfPossible, interruptNarrator } = await import(
+	"../narrator-session"
+);
+const { narratorService } = await import("../narrator-service");
 // Preserve collaborator initialization order without unused/shadowed local bindings.
 await import("../parent-inbound-queue");
 await import("../bg-completion-queue");
@@ -136,6 +139,51 @@ function seedNarrator(
 			now,
 		);
 }
+
+test("an interrupt after the Worker wake observation cannot start a turn", async () => {
+	seedNarrator(PARENT_ID);
+	const observed = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const update = narratorService.updateStatus.bind(narratorService);
+	let intercepted = false;
+	const probe = spyOn(narratorService, "updateStatus").mockImplementation(async (...args) => {
+		if (args[2]?.expectedWakeObservation) {
+			intercepted = true;
+			expect(args[2].expectedWakeObservation).toMatchObject({
+				status: "idle",
+				lastStopReason: "normal",
+			});
+			observed.resolve();
+			await release.promise;
+		}
+		return update(...args);
+	});
+	const pending = startInjectionContinuationIfPossible(PARENT_ID).then(
+		(value) => ({ value }),
+		(error: unknown) => ({ error }),
+	);
+	try {
+		await Promise.race([
+			observed.promise,
+			pending.then(() => {
+				if (!intercepted) throw new Error("Wake settled without an observation");
+			}),
+		]);
+		interruptNarrator(PARENT_ID);
+		release.resolve();
+		expect(await pending).toMatchObject({
+			error: { code: "RUNTIME_READ_CONFLICT", statusCode: 409 },
+		});
+		expect(
+			sqlite.query("SELECT status, last_stop_reason FROM narrators WHERE id = ?").get(PARENT_ID),
+		).toEqual({ status: "idle", last_stop_reason: "user_interrupt" });
+		expect(runCalls).toHaveLength(0);
+	} finally {
+		release.resolve();
+		await pending;
+		probe.mockRestore();
+	}
+});
 
 describe("parent injection initiating user", () => {
 	test("pending injection userId comes from the producing pass metadata", async () => {

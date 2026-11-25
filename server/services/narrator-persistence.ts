@@ -70,7 +70,7 @@ import { eventBus } from "../lib/event-bus";
 import { legacyFastModeMirror } from "../lib/fast-mode";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
-import { parseSubstatus } from "../lib/narrator-utils";
+import { isPlanModeTrait, parseSubstatus } from "../lib/narrator-utils";
 import { forcesRelaxedPlan, type PermissionMode } from "../lib/permission-modes";
 import { policyDependentsWhere, runDeliverToOf } from "../lib/runtime-source";
 import { settings } from "../lib/settings";
@@ -3736,6 +3736,10 @@ const sqliteNarratorPersistence = {
 		narratorId: string,
 		status: "idle" | "working" | "waiting" | "archived",
 		options?: PersistenceReadOptions & {
+			expectedWakeObservation?: Pick<
+				typeof narrators.$inferSelect,
+				"status" | "substatus" | "lastStopReason" | "traits"
+			>;
 			substatus?: string[];
 			errorMessage?: string;
 			errorCode?: string;
@@ -3828,6 +3832,23 @@ const sqliteNarratorPersistence = {
 				async () =>
 					db.transaction((tx) => {
 						if (requestedSubstatus !== undefined) assertNarratorRead(tx, narratorId, observed);
+						if (options?.expectedWakeObservation) {
+							const current = tx.query.narrators
+								.findFirst({
+									where: eq(narrators.id, narratorId),
+									columns: { status: true, substatus: true, lastStopReason: true, traits: true },
+								})
+								.sync();
+							const expected = options.expectedWakeObservation;
+							if (
+								!current ||
+								current.status !== expected.status ||
+								current.substatus !== expected.substatus ||
+								current.lastStopReason !== expected.lastStopReason ||
+								isPlanModeTrait(current.traits) !== isPlanModeTrait(expected.traits)
+							)
+								throw new RuntimeReadConflictError();
+						}
 						const recoveryObservation = options?.recoveryObservation;
 						if (recoveryObservation) {
 							if (recoveryObservation.id !== narratorId) throw new RuntimeReadConflictError();
@@ -4039,6 +4060,10 @@ const sqliteNarratorPersistence = {
 		expectedStatus: string | string[],
 		newStatus: "idle" | "working" | "waiting" | "archived",
 		options?: PersistenceReadOptions & {
+			expectedObservation?: Pick<
+				typeof narrators.$inferSelect,
+				"status" | "substatus" | "logicalRunId"
+			>;
 			substatus?: string[];
 			errorMessage?: string;
 			diagnostics?: ApiRequestDiagnostics;
@@ -4092,6 +4117,16 @@ const sqliteNarratorPersistence = {
 				async () =>
 					db.transaction((tx) => {
 						if (requestedSubstatus !== undefined) assertNarratorRead(tx, narratorId, observed);
+						if (options?.expectedObservation) {
+							const current = tx.query.narrators
+								.findFirst({
+									where: eq(narrators.id, narratorId),
+									columns: { status: true, substatus: true, logicalRunId: true },
+								})
+								.sync();
+							if (!isDeepStrictEqual(current, options.expectedObservation))
+								throw new RuntimeReadConflictError();
+						}
 						const statement = sqlite.prepare(
 							substatusJson !== undefined
 								? `UPDATE narrators SET status = ?, archived_with_narrator_id = NULL, error_message = ?, substatus = ?, updated_at = ? WHERE id = ? AND status IN (${placeholders})`
@@ -4171,7 +4206,10 @@ const sqliteNarratorPersistence = {
 	async updateSubstatus(
 		narratorId: string,
 		substatus: string[],
-		options?: PersistenceReadOptions & { preserveTiming?: boolean },
+		options?: PersistenceReadOptions & {
+			preserveTiming?: boolean;
+			expectedSubstatus?: string | null;
+		},
 	) {
 		await narratorSubstatusLock.acquire(narratorId, async () => {
 			const row = await readQueryFirst(
@@ -4182,6 +4220,8 @@ const sqliteNarratorPersistence = {
 				}),
 				persistenceReadOptions(options),
 			);
+			if (options?.expectedSubstatus !== undefined && row?.substatus !== options.expectedSubstatus)
+				throw new RuntimeReadConflictError();
 			const actualSubstatus =
 				options?.preserveTiming === false
 					? substatus
@@ -4849,6 +4889,7 @@ const sqliteNarratorPersistence = {
 			input?: Record<string, unknown>;
 			/** Commit publication intent with the exact tool result, synchronously. */
 			onPersist?: (tx: DbTx) => void;
+			beforePersist?: (tx: DbTx) => void;
 			/** Recovery explanations may update only an active row, never a terminal result. */
 			onlyIfActive?: boolean;
 		},
@@ -4901,6 +4942,7 @@ const sqliteNarratorPersistence = {
 								.get(exactId)
 						)
 							return [];
+						result.beforePersist?.(tx);
 						const updated = tx
 							.update(narratorToolCalls)
 							.set({
