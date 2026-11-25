@@ -291,10 +291,10 @@ export function setNugCachedQuota(
 ): void {
 	const config = (settings.nugProviders ?? []).find((provider) => provider.id === providerId);
 	if (!config) return;
-	const credential = subject(config);
+	const captured = expectedConfig !== undefined && "config" in expectedConfig;
+	const credential = subject(config, captured ? expectedConfig.id : undefined);
 	if (!credential) return;
 	if (expectedConfig) {
-		const captured = "config" in expectedConfig;
 		const expectedId = captured ? expectedConfig.id : subject(expectedConfig).id;
 		const expectedIdentity = captured ? expectedConfig.identity : nugQuotaIdentity(expectedConfig);
 		if (credential.id !== expectedId || nugQuotaIdentity(credential.config) !== expectedIdentity) {

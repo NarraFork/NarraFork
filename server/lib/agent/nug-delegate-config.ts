@@ -1,10 +1,27 @@
 import type { CredentialNetwork } from "@shared/credential-network";
 import type { ToolResultImagesMode } from "@shared/tool-result-images";
-import type { ResolvedNugModelMeta } from "../nug-model-cache";
+import { type ResolvedNugModelMeta, resolveNugModelMeta } from "../nug-model-cache";
+import { getNugRelayChannelIdForCredential, usesLocalEgress } from "../nug-relay/manager";
 import type { NUGProviderConfig, ProxyOverride } from "../settings";
+import { resolveModelProtocol } from "../settings/provider";
 
 export type NugInferenceConfig = NUGProviderConfig &
 	Pick<CredentialNetwork, "userAgentMode" | "customUserAgent" | "extraHeaders">;
+
+/** Shared Auto/pool candidate check; never starts a relay, reads a file, or guesses a channel. */
+export function isNugRelayEligible(config: NUGProviderConfig, model?: string): boolean {
+	if (!model || !usesLocalEgress(config) || config.egressAllowDirectFallback === true) return true;
+	// Explicit protocol switching builds a non-NUG delegate, so it does not use the Codex relay.
+	if (resolveModelProtocol(config.prefix, model)) return true;
+	let meta: ResolvedNugModelMeta;
+	try {
+		meta = resolveNugModelMeta(config.id, config.prefix, model);
+	} catch {
+		// Missing catalog metadata still fails in the adapter's existing model resolver.
+		return true;
+	}
+	return meta.channelType !== "codex" || !!getNugRelayChannelIdForCredential(config);
+}
 
 export interface NugDelegateBaseConfig {
 	toolResultImages?: ToolResultImagesMode;

@@ -183,6 +183,7 @@ import { scheduleProjectIndexRebuild, stopProjectIndexRebuild } from "./services
 import "./services/attention-hook-bridge"; // Bridge attention events into the hook system
 import { installAutoRouteSignals } from "./lib/agent/auto-route-signals";
 import { killAllBashProcesses } from "./lib/agent/tools/bash";
+import { startCommandCodeModelCatalog } from "./lib/commandcode-models";
 import { migrateAggregationsOnStartup } from "./services/aggregation-migration-service";
 import { initChatNotify } from "./services/chat-notify";
 import { initDeviceConnectionService } from "./services/device-connection-service";
@@ -257,6 +258,8 @@ await recoverProviderPrefixMigrationOnStartup().catch((error) => {
 });
 // auto:<model> routing reads live source availability (Codex accounts, key cooldowns).
 installAutoRouteSignals();
+// Publish the real Command Code directory before unattended/recovered Auto work can run.
+const stopCommandCodeModelCatalog = await startCommandCodeModelCatalog();
 // `auto` is reserved for auto:<model>; an older provider using it is renamed. A failure is
 // logged and leaves it working as an ordinary prefix, so startup never depends on it.
 // Runs on both backends (services/migration-db.ts picks the active handle).
@@ -2191,6 +2194,7 @@ async function performGracefulShutdown(
 			),
 		);
 		await step("pluginManager.shutdown", () => pluginManager.shutdown(), 125_000);
+		await step("commandCode.models.stop", stopCommandCodeModelCatalog);
 		unregisterExternalProviderResolver();
 		await step("mcpManager.shutdown", () => mcpManager.shutdown());
 		// Checkpoint-backed update/system shutdown: persist active browser sessions and flip the

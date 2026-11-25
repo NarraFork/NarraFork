@@ -47,6 +47,7 @@ import { reportCredentialId } from "./credential-report";
 import { GeminiInteractionsProvider } from "./gemini-interactions-provider";
 import { GeminiProvider } from "./gemini-provider";
 import type { ImageGenerationRequest, ImageGenerationResponse } from "./image-generation-api";
+import { isNugRelayEligible } from "./nug-delegate-config";
 import { NugProvider } from "./nug-provider";
 import { OpenAIProvider } from "./openai-provider";
 import { PooledProvider, usableProviderKeys, withProviderKey } from "./pooled-provider";
@@ -488,6 +489,7 @@ function registerCredentialProviderSource<
 	getConfig: (prefix: string) => T | undefined,
 	create: (config: T) => ProviderAdapter,
 	isComplete: (config: T) => boolean = (config) => !!config.apiKey.trim(),
+	isEligible?: (config: T, model: string) => boolean,
 ): void {
 	const adapterFor = (prefix: string, model: string, config: T): ProviderAdapter => {
 		// 逐模型协议覆盖：协议和这条连接本来的适配器不同时，换一族适配器，但留下代理和指纹。
@@ -542,8 +544,12 @@ function registerCredentialProviderSource<
 			// A single-credential connection is billed to the connection itself.
 			const adapter: ProviderAdapter = plain
 				? reportCredentialId(adapterFor(prefix, model, selectedConfig), config.id)
-				: new PooledProvider(owner, (key) =>
-						adapterFor(prefix, model, withProviderKey(config, key)),
+				: new PooledProvider(
+						owner,
+						(key) => adapterFor(prefix, model, withProviderKey(config, key)),
+						isEligible
+							? (key, value) => isEligible(withProviderKey(config, key), value)
+							: undefined,
 					);
 			// Also protects stream quota publication for families without diagnostic forks.
 			adapter.isDiagnosticConnectionCurrent = () => {
@@ -589,6 +595,7 @@ registerCredentialProviderSource(
 			settings.nugProviders?.find((entry) => entry.id === config.id) ?? config,
 		),
 	(config) => !!config.apiKey.trim() && !!config.baseUrl.trim(),
+	isNugRelayEligible,
 );
 registerCredentialProviderSource(
 	"openai",

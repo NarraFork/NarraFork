@@ -19,7 +19,7 @@ export function autoSourceFacts(
 		available:
 			!group.disabled &&
 			template.isModelAvailable?.(group, value) !== false &&
-			template.hasAvailableCredentials?.(group, now) !== false,
+			template.hasAvailableCredentials?.(group, now, value) !== false,
 		subscription: template.subscription,
 	};
 }
