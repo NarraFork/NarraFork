@@ -131,8 +131,9 @@ export const BUILTIN_ROUTINES: BuiltinRoutine[] = [
 		category: "tools",
 		tool: {
 			toolName: "Recall",
-			descriptionEn: "Search and browse all narrator conversations",
-			descriptionZh: "搜索和浏览所有叙述者对话",
+			descriptionEn:
+				"Recall saved messages with role/origin filters, paged context and original/tool evidence (current conversation by default)",
+			descriptionZh: "按角色/来源检索历史对话，分页浏览并读取原文或工具证据（默认当前会话）",
 		},
 	},
 	{

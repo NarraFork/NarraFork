@@ -1,201 +1,66 @@
-import { z } from "zod/v4";
-import { sqlite } from "../../../db";
 import { searchStore } from "../../../services/search/backend";
 import { globalStrategy, sanitizeQuery } from "../../../services/search/query";
+import {
+	recallConversation,
+	recallMessage,
+	recallToolCallPage,
+} from "../../../services/search/recall-store";
 import type { RecallMessageRow } from "../../../services/search/types";
-import { runReadTask, WorkersUnavailableError } from "../../db-worker/pool";
-import type { RecallConversationSnapshot } from "../../db-worker/recall-conversation-query";
+import { RECALL_LIMITS } from "../../recall-contract";
 import type { ToolDefinition, ToolResult } from "../types";
-
-/**
- * Recall — optional agent tool for full-text search and browsing of the
- * current narrator conversation stored in NarraFork.
- *
- * The message SEARCH runs through the search port (`services/search/`), so its FTS5
- * expression, snippet markup and time filtering live with the other search statements rather
- * than in a second copy here. Conversation browsing and tool-call payloads use committed SQLite Worker snapshots.
- */
-
-const MAX_SEARCH_LIMIT = 50;
-const DEFAULT_SEARCH_LIMIT = 20;
-const MAX_BATCH_QUERIES = 10;
-const MAX_READ_LIMIT = 50;
-const DEFAULT_READ_LIMIT = 20;
-const SNIPPET_CHARS = 300;
+import { type RecallArguments, recallParameters } from "./recall-schema";
 
 export const recallTool: ToolDefinition = {
 	name: "Recall",
-	description:
-		"Search and browse narrator conversations stored in NarraFork. " +
-		"By default this tool is self-scoped: search, conversation reads, and tool-call reads " +
-		"can only access the narrator that is currently running this tool.\n\n" +
-		"Set `all_narrators: true` to search and read across ALL narrators in NarraFork " +
-		"instead of just the current one. This wider access requires user approval unless " +
-		'the narrator is in "allow all" (bypass) permission mode, where it is granted automatically.\n\n' +
-		"Three actions are available:\n" +
-		'- "search": Full-text search across narrator messages. Returns matching snippets with metadata. ' +
-		"Pass an array of strings to `query` to run multiple searches in one call. " +
-		"Optionally restrict by absolute time (`from`, `to`) or relative time (`time_range`, e.g. 24h, 7d).\n" +
-		'- "read_conversation": Read messages from a narrator session. ' +
-		"Each assistant message includes a summary of its tool calls (tool name + key params). " +
-		"Optionally center around a specific message ID (e.g. from a search result).\n" +
-		'- "read_tool_call": Read the full input/output of a tool call by its toolUseId ' +
-		"(obtained from read_conversation results).",
-	parameters: z.object({
-		action: z
-			.enum(["search", "read_conversation", "read_tool_call"])
-			.describe('The action to perform: "search", "read_conversation", or "read_tool_call"'),
-		query: z
-			.union([z.string(), z.array(z.string())])
-			.optional()
-			.describe(
-				'Search query (required for action "search"). ' +
-					"Pass an array to run multiple searches in one call.",
-			),
-		narrator_id: z
-			.string()
-			.optional()
-			.describe(
-				'Optional narrator ID for action "read_conversation". When `all_narrators` is false ' +
-					"it must match the current narrator; when `all_narrators` is true it may be any narrator.",
-			),
-		all_narrators: z
-			.boolean()
-			.optional()
-			.describe(
-				"When true, search and read across ALL narrators instead of only the current one. " +
-					'Requires user approval unless the narrator is in "allow all" (bypass) permission mode. ' +
-					"Defaults to false (self-scoped).",
-			),
-		message_id: z
-			.string()
-			.optional()
-			.describe(
-				"Optional message ID to center the read around. " +
-					"If omitted, returns the most recent messages.",
-			),
-		tool_call_id: z
-			.string()
-			.optional()
-			.describe('The toolUseId of the tool call to read (required for action "read_tool_call")'),
-		limit: z
-			.number()
-			.optional()
-			.describe(
-				`Number of results to return. Default ${DEFAULT_SEARCH_LIMIT}, max ${MAX_SEARCH_LIMIT}.`,
-			),
-		from: z
-			.string()
-			.optional()
-			.describe(
-				'Optional absolute start time for search results, inclusive. Supports ISO strings, "YYYY-MM-DD", and "YYYY-MM-DD HH:mm".',
-			),
-		to: z
-			.string()
-			.optional()
-			.describe(
-				'Optional absolute end time for search results, inclusive. Supports ISO strings, "YYYY-MM-DD", and "YYYY-MM-DD HH:mm".',
-			),
-		time_range: z
-			.string()
-			.optional()
-			.describe(
-				'Optional relative time window for search results, such as "24h", "7d", "2w", "1mo", or "1y". Ignored when from/to is provided.',
-			),
-	}),
+	description: `Find saved conversation evidence, then read the original source. Do not mistake a search snippet, a preview, an assistant paraphrase, or an automatic approval for the user's own words.
 
+Choose the smallest action:
+- search: locate messages with plain keywords. Filters are applied before limit. Query arrays are alternatives, merged into ONE deduplicated result list; limit is the total, default 20/max 50. Use sort:oldest for early requirements, newest for recent statements.
+- read_conversation: browse chronological previews without keywords. By default reads the latest page without tool logs. direction:newer starts at the earliest page. Follow returned sequence cursors with direction:older/newer. message_id reads around a known anchor; do not combine anchors with cursors.
+- read_message: read one saved message body by message_id, including block-backed bodies. Previews are not complete bodies. offset/max_chars and nextOffset use Unicode code points, not bytes or UTF-16 units. Attachments and tool outputs are not fabricated as message text.
+- read_tool_call: inspect saved input/output by toolUseId (tool_call_id). Use part:input for questions/arguments and part:output for results; continue each field with its own nextOffset. Question answers retain their decision provenance; reflection/auto is not a human decision.
+
+Recipes (omit placeholder IDs until you have real results):
+Find explicit human requirements: {action:"search",query:"requirements",roles:["user"],origins:["user"],sort:"oldest"}.
+Browse the user's original statements: {action:"read_conversation",direction:"newer",roles:["user"],origins:["user"]}.
+Read a located source: {action:"read_message",message_id:"<returned message ID>"}.
+Find tool evidence: {action:"read_conversation",message_id:"<returned message ID>",include_tool_calls:true}, then read_tool_call using its returned toolUseId.
+
+Scope: defaults to this conversation, including inherited fork history. narrator_id can narrow any action to one conversation. Access to another conversation ALWAYS requires all_narrators:true and may need approval. With that flag and no narrator_id, search and tool lookup span all conversations; transcript/message reads still default to this conversation. A hit's narratorId is a real history/ref scope for follow-up; ownerNarratorId is provenance and may no longer have that message in its own history.
+
+roles are protocol roles, not authorship. origins are stored provenance: user/assistant/system/unknown. unknown means legacy NULL, not verified human; include it explicitly if investigating older records. Agent reports can be sys/system. Use roles:["user"] AND origins:["user"] for explicitly recorded human input. Search does not promise exhaustive tool-output indexing; read_tool_call is the evidence source. Copy IDs and continuation parameters from results; do not invent them.`,
+	parameters: recallParameters,
 	async execute(args, ctx): Promise<ToolResult> {
-		const currentNarratorId = ctx.narratorId;
-		const {
-			action,
-			query,
-			narrator_id,
-			message_id,
-			tool_call_id,
-			limit,
-			from,
-			to,
-			time_range,
-			all_narrators,
-		} = args as {
-			action: "search" | "read_conversation" | "read_tool_call";
-			query?: string | string[];
-			narrator_id?: string;
-			message_id?: string;
-			tool_call_id?: string;
-			limit?: number;
-			from?: string;
-			to?: string;
-			time_range?: string;
-			all_narrators?: boolean;
-		};
-
-		const allNarrators = all_narrators === true;
-
-		if (action === "search") {
-			const timeFilterResult = buildTimeFilter({ from, to, timeRange: time_range });
-			if (timeFilterResult.isError) return timeFilterResult;
-			const timeFilter = timeFilterResult.filter;
-			const queries = Array.isArray(query) ? query : [query];
-			if (queries.length === 1) {
-				return handleSearch(
-					queries[0],
-					limit,
-					timeFilter,
-					currentNarratorId,
-					allNarrators,
-					ctx.signal,
-				);
-			}
-			if (queries.length > MAX_BATCH_QUERIES) {
-				return {
-					output: `Too many queries (${queries.length}). Maximum is ${MAX_BATCH_QUERIES}.`,
-					isError: true,
-				};
-			}
-			// Batch: run each query independently and merge results
-			const sections: string[] = [];
-			const allResults: SearchResultItem[] = [];
-			const queryList: string[] = [];
-			let errorCount = 0;
-			for (const q of queries) {
-				const result = await handleSearch(
-					q,
-					limit,
-					timeFilter,
-					currentNarratorId,
-					allNarrators,
-					ctx.signal,
-				);
-				if (result.isError) errorCount++;
-				sections.push(result.output);
-				// Collect structured results from each sub-search
-				const meta = result.metadata as SearchMetadata | undefined;
-				if (meta?.results) allResults.push(...meta.results);
-				if (q) queryList.push(q);
-			}
+		ctx.signal.throwIfAborted();
+		const parsed = recallParameters.safeParse(args);
+		if (!parsed.success) {
 			return {
-				output: sections.join("\n\n---\n\n"),
-				isError: errorCount === queries.length,
-				title: `Recall: ${queries.length} queries`,
-				metadata: {
-					action: "search",
-					queries: queryList,
-					results: allResults,
-					...(timeFilter ? { timeFilter } : {}),
-				} satisfies BatchSearchMetadata,
+				isError: true,
+				output: `Invalid Recall arguments:\n${parsed.error.issues
+					.slice(0, 5)
+					.map((issue) => `- ${issue.path.join(".") || "arguments"}: ${issue.message}`)
+					.join(
+						"\n",
+					)}\nChoose search, read_conversation, read_message, or read_tool_call; only supply fields for that action.`,
 			};
 		}
-		if (action === "read_tool_call") {
-			return handleReadToolCall(tool_call_id, currentNarratorId, allNarrators, ctx.signal);
+		const input = parsed.data;
+		if (input.narrator_id && input.narrator_id !== ctx.narratorId && input.all_narrators !== true) {
+			return {
+				isError: true,
+				output: `Recall is scoped to the current narrator (${ctx.narratorId}). To access narrator ${input.narrator_id}, explicitly pass all_narrators:true (may require approval). An ID alone never grants access.`,
+			};
 		}
-		return handleReadConversation(
-			narrator_id,
-			message_id,
-			limit,
-			currentNarratorId,
-			allNarrators,
-			ctx.signal,
+		if (input.action === "read_tool_call")
+			return boundedResult(await handleReadToolCall(input, ctx.narratorId, ctx.signal));
+		if (input.action === "read_message")
+			return boundedResult(await handleReadMessage(input, ctx.narratorId, ctx.signal));
+		const times = buildTimeFilter({ from: input.from, to: input.to, timeRange: input.time_range });
+		if (times.isError) return times;
+		return boundedResult(
+			await (input.action === "search"
+				? handleSearch(input, ctx.narratorId, times.filter, ctx.signal)
+				: handleReadConversation(input, ctx.narratorId, times.filter, ctx.signal)),
 		);
 	},
 };
@@ -208,29 +73,18 @@ interface SearchResultItem {
 	id: string;
 	narratorId: string;
 	narratorTitle: string | null;
+	ownerNarratorId?: string;
 	role: string;
+	origin: string;
 	createdAt: string;
 	snippet: string;
+	matchedQueries: string[];
 }
 
 interface TimeFilter {
 	from?: string;
 	to?: string;
 	timeRange?: string;
-}
-
-interface SearchMetadata {
-	action: "search";
-	query: string;
-	results: SearchResultItem[];
-	timeFilter?: TimeFilter;
-}
-
-interface BatchSearchMetadata {
-	action: "search";
-	queries: string[];
-	results: SearchResultItem[];
-	timeFilter?: TimeFilter;
 }
 
 interface ConversationToolCall {
@@ -244,7 +98,9 @@ interface ConversationMessage {
 	id: string;
 	seq: number;
 	role: string;
+	origin: string;
 	text: string;
+	truncated: boolean;
 	createdAt: string;
 	toolCalls?: ConversationToolCall[];
 }
@@ -263,11 +119,14 @@ function normalizeDateLike(value: string): string {
 }
 
 function parseAbsoluteTime(value: string, boundary: "from" | "to"): string | null {
-	const normalized = isDateOnly(value)
-		? `${value.trim()}T${boundary === "to" ? "23:59:59.999" : "00:00:00.000"}`
+	const dateOnly = isDateOnly(value);
+	const normalized = dateOnly
+		? `${value.trim()}T${boundary === "to" ? "23:59:59.999" : "00:00:00.000"}Z`
 		: normalizeDateLike(value);
-	const date = new Date(normalized);
+	const explicitZone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(normalized);
+	const date = new Date(explicitZone ? normalized : `${normalized}Z`);
 	if (Number.isNaN(date.getTime())) return null;
+	if (dateOnly && date.toISOString().slice(0, 10) !== value.trim()) return null;
 	return date.toISOString();
 }
 
@@ -300,8 +159,10 @@ function parseRelativeTimeRange(value: string): { from: string; to: string } | n
 	const amount = Number(match[1]);
 	if (!Number.isFinite(amount) || amount <= 0) return null;
 	const now = new Date();
+	const from = applyRelativeTimeRange(now, amount, match[2]);
+	if (!Number.isFinite(from.getTime())) return null;
 	return {
-		from: applyRelativeTimeRange(now, amount, match[2]).toISOString(),
+		from: from.toISOString(),
 		to: now.toISOString(),
 	};
 }
@@ -346,84 +207,122 @@ function describeTimeFilter(filter: TimeFilter | undefined): string {
 }
 
 async function handleSearch(
-	query: string | undefined,
-	limit: number | undefined,
-	timeFilter: TimeFilter | undefined,
+	input: RecallArguments,
 	currentNarratorId: string,
-	allNarrators: boolean,
+	timeFilter: TimeFilter | undefined,
 	signal: AbortSignal,
 ): Promise<ToolResult> {
-	signal.throwIfAborted();
-	if (!query) {
-		return { output: 'Parameter "query" is required for action "search".', isError: true };
-	}
-
-	const safeQuery = sanitizeQuery(query);
-	if (!safeQuery) {
-		return { output: "Query is empty after sanitization.", isError: true };
-	}
-
-	const cap = Math.min(Math.max(limit ?? DEFAULT_SEARCH_LIMIT, 1), MAX_SEARCH_LIMIT);
-	const filter = timeFilter ?? {};
-
-	const rows: RecallMessageRow[] = await searchStore.searchRecallMessages({
-		text: safeQuery,
-		strategy: globalStrategy(safeQuery),
-		limit: cap,
-		// `null` widens the search to every narrator. The tool's permission flow has already
-		// approved that before this point; scoped mode resolves through the narrator's own
-		// refs so fork-shared history stays visible to it.
-		narratorId: allNarrators ? null : currentNarratorId,
-		...(filter.from ? { createdFrom: filter.from } : {}),
-		...(filter.to ? { createdTo: filter.to } : {}),
-		previewChars: SNIPPET_CHARS,
-		signal,
-	});
-	signal.throwIfAborted();
-
-	if (rows.length === 0) {
-		return {
-			output: `No results found for "${query}"${describeTimeFilter(timeFilter)}.`,
-			metadata: {
-				action: "search",
-				query,
-				results: [],
-				...(timeFilter ? { timeFilter } : {}),
-			} satisfies SearchMetadata,
-		};
-	}
-
-	const results: SearchResultItem[] = rows.map((row) => ({
-		id: row.messageId,
-		narratorId: row.narratorId,
-		narratorTitle: row.narratorTitle,
-		role: row.role,
-		createdAt: row.createdAt,
-		snippet: row.snippet.replace(/\n/g, " ").slice(0, SNIPPET_CHARS),
-	}));
-
-	const lines: string[] = [
-		`Found ${rows.length} result(s) for "${query}"${describeTimeFilter(timeFilter)}:\n`,
+	const queries = [
+		...new Set(
+			(Array.isArray(input.query) ? input.query : [input.query ?? ""]).map((query) => query.trim()),
+		),
 	];
-	for (const r of results) {
-		lines.push(
-			`- [${r.role}] message ${r.id}` +
-				`  narrator=${r.narratorId}` +
-				(r.narratorTitle ? ` ("${r.narratorTitle}")` : "") +
-				`  at ${r.createdAt}` +
-				`\n  ${r.snippet}`,
+	const limit = input.limit ?? RECALL_LIMITS.defaultResults;
+	const narratorId = input.narrator_id ?? (input.all_narrators ? null : currentNarratorId);
+	const lists: RecallMessageRow[][] = [];
+	for (const query of queries) {
+		signal.throwIfAborted();
+		const text = sanitizeQuery(query);
+		if (!text)
+			return {
+				isError: true,
+				output:
+					"A search query has no keywords after sanitization. Use plain keywords; to browse without keywords, use read_conversation.",
+			};
+		lists.push(
+			await searchStore.searchRecallMessages({
+				text,
+				strategy: globalStrategy(text),
+				limit: limit + 1,
+				narratorId,
+				roles: input.roles,
+				origins: input.origins,
+				sort: input.sort,
+				...(timeFilter?.from ? { createdFrom: timeFilter.from } : {}),
+				...(timeFilter?.to ? { createdTo: timeFilter.to } : {}),
+				previewChars: 300,
+				signal,
+			}),
 		);
 	}
-
+	signal.throwIfAborted();
+	// Interleave query ranks instead of letting the first alternative consume the budget.
+	const unique = new Map<string, SearchResultItem>();
+	for (let rank = 0; rank <= limit; rank++) {
+		for (let index = 0; index < lists.length; index++) {
+			const row = lists[index][rank];
+			if (!row) continue;
+			const previous = unique.get(row.messageId);
+			if (previous) {
+				if (!previous.matchedQueries.includes(queries[index]))
+					previous.matchedQueries.push(queries[index]);
+				continue;
+			}
+			unique.set(row.messageId, {
+				id: row.messageId,
+				narratorId: row.narratorId,
+				narratorTitle: row.narratorTitle,
+				...(row.ownerNarratorId ? { ownerNarratorId: row.ownerNarratorId } : {}),
+				role: row.role,
+				origin: row.origin ?? "unknown",
+				createdAt: row.createdAt,
+				snippet: row.snippet.replace(/\n/g, " ").slice(0, 300),
+				matchedQueries: [queries[index]],
+			});
+		}
+	}
+	const candidates = [...unique.values()];
+	if (input.sort === "oldest" || input.sort === "newest") {
+		const ascending = input.sort === "oldest";
+		candidates.sort(
+			(a, b) =>
+				(ascending
+					? a.createdAt.localeCompare(b.createdAt)
+					: b.createdAt.localeCompare(a.createdAt)) || a.id.localeCompare(b.id),
+		);
+	}
+	const results = candidates.slice(0, limit);
+	const hasMore = candidates.length > limit || lists.some((rows) => rows.length > limit);
+	const filters = {
+		roles: input.roles,
+		origins: input.origins,
+		...(timeFilter ? { timeFilter } : {}),
+	};
+	const scope =
+		narratorId === null
+			? "all conversations (explicit cross-narrator scope)"
+			: `conversation ${narratorId}`;
+	const lines = [
+		results.length
+			? `Showing ${results.length} matching message(s) in ${scope}${describeTimeFilter(timeFilter)}.`
+			: `No matching messages in ${scope}${describeTimeFilter(timeFilter)}. This does not mean the conversation has no history.`,
+		`Queries: ${JSON.stringify(queries)}. Total result limit: ${limit}. Roles: ${input.roles?.join(", ") ?? "all"}; origins: ${input.origins?.join(", ") ?? "all (including unknown legacy provenance)"}.`,
+	];
+	for (const result of results) {
+		lines.push(
+			`\n- [${result.role}; origin=${result.origin}] message ${result.id}  narrator=${result.narratorId}${result.narratorTitle ? ` (${JSON.stringify(result.narratorTitle)})` : ""}${result.ownerNarratorId && result.ownerNarratorId !== result.narratorId ? `  owner=${result.ownerNarratorId}` : ""}  at ${result.createdAt}\n  ${result.snippet}`,
+		);
+	}
+	if (results[0])
+		lines.push(
+			`\nSnippets are previews, not the complete source. Read the first hit: ${JSON.stringify({ action: "read_message", message_id: results[0].id, ...continuationScope(results[0].narratorId, currentNarratorId) })}. Use each hit's IDs to read another.`,
+		);
+	if (hasMore)
+		lines.push(
+			"More matches exist. Narrow query/roles/origins/time, or browse a matching conversation with read_conversation.",
+		);
 	return {
 		output: lines.join("\n"),
-		title: `Recall: ${query}`,
+		title: `Recall: ${queries.length === 1 ? queries[0] : `${queries.length} alternatives`}`,
 		metadata: {
 			action: "search",
-			query,
+			...(queries.length === 1 ? { query: queries[0] } : { queries }),
 			results,
-			...(timeFilter ? { timeFilter } : {}),
-		} satisfies SearchMetadata,
+			hasMore,
+			limit,
+			narratorId,
+			...filters,
+		},
 	};
 }
 
@@ -432,98 +331,104 @@ async function handleSearch(
 // ---------------------------------------------------------------------------
 
 async function handleReadConversation(
-	narratorId: string | undefined,
-	messageId: string | undefined,
-	limit: number | undefined,
+	input: RecallArguments,
 	currentNarratorId: string,
-	allNarrators: boolean,
+	timeFilter: TimeFilter | undefined,
 	signal: AbortSignal,
 ): Promise<ToolResult> {
-	const targetNarratorId = narratorId ?? currentNarratorId;
-	if (!allNarrators && targetNarratorId !== currentNarratorId) {
-		return {
-			output:
-				`Recall is scoped to the current narrator (${currentNarratorId}); narrator "${targetNarratorId}" is not accessible. ` +
-				"Pass `all_narrators: true` to read other narrators (may require user approval).",
-			isError: true,
-		};
-	}
-
-	const cap = Math.min(Math.max(limit ?? DEFAULT_READ_LIMIT, 1), MAX_READ_LIMIT);
-
-	signal.throwIfAborted();
-	if (!sqlite.filename || sqlite.filename === ":memory:" || sqlite.inTransaction) {
-		throw new WorkersUnavailableError("requires_committed_file");
-	}
-	const snapshot = await runReadTask<RecallConversationSnapshot>(
-		sqlite.filename,
-		{ kind: "recallConversation", narratorId: targetNarratorId, messageId, limit: cap },
-		{ timeoutMs: 15_000, signal },
+	const narratorId = input.narrator_id ?? currentNarratorId;
+	const snapshot = await recallConversation(
+		{
+			narratorId,
+			messageId: input.message_id ?? null,
+			limit: input.limit ?? RECALL_LIMITS.defaultResults,
+			direction: input.direction ?? (input.message_id ? "around" : "older"),
+			cursor: input.cursor,
+			roles: input.roles,
+			origins: input.origins,
+			includeToolCalls: input.include_tool_calls ?? false,
+			...(timeFilter?.from ? { createdFrom: timeFilter.from } : {}),
+			...(timeFilter?.to ? { createdTo: timeFilter.to } : {}),
+		},
+		signal,
 	);
 	signal.throwIfAborted();
-	if (snapshot.kind === "narratorMissing") {
-		return { output: `Narrator "${targetNarratorId}" not found.`, isError: true };
-	}
-	if (snapshot.kind === "messageMissing") {
-		return { output: `Message "${messageId}" not found in the current narrator.`, isError: true };
-	}
-	const { narrator, rows } = snapshot;
-	if (!rows.length) {
-		return { output: `No messages found for the current narrator (${targetNarratorId}).` };
-	}
-
-	// Group tool calls by message ID
-	const tcByMessage = new Map<string, ConversationToolCall[]>();
-	for (const tc of snapshot.tools) {
-		const entry: ConversationToolCall = {
-			toolUseId: tc.tool_use_id,
-			toolName: tc.tool_name,
-			status: tc.status,
-			summary: tc.summary,
-		};
-		const list = tcByMessage.get(tc.message_id);
-		if (list) list.push(entry);
-		else tcByMessage.set(tc.message_id, [entry]);
-	}
-
-	const messages: ConversationMessage[] = rows.map((row) => {
-		const tcs = tcByMessage.get(row.id);
+	if (!snapshot.narrator) return { isError: true, output: `Narrator ${narratorId} was not found.` };
+	if (snapshot.messageMissing)
 		return {
-			id: row.id,
-			seq: row.seq,
-			role: row.role,
-			text: row.text,
-			createdAt: row.created_at,
-			...(tcs && tcs.length > 0 ? { toolCalls: tcs } : {}),
+			isError: true,
+			output: `Message ${input.message_id} is not in conversation ${narratorId}. Use a message ID returned for this conversation; an owner ID and a fork's history scope can differ.`,
 		};
-	});
-
-	const header =
-		`Narrator: ${narrator.title ?? targetNarratorId}` +
-		(narrator.model ? ` [${narrator.model}]` : "") +
-		`\nShowing ${rows.length} message(s):\n`;
-
-	const lines: string[] = [header];
-	for (const msg of messages) {
-		const text = msg.text.replace(/\n/g, "\n  ");
-		lines.push(`[seq=${msg.seq}] ${msg.role} (${msg.id}) at ${msg.createdAt}:\n  ${text}`);
-		if (msg.toolCalls && msg.toolCalls.length > 0) {
-			for (const tc of msg.toolCalls) {
-				lines.push(`    [${tc.status}] ${tc.toolName}: ${tc.summary}  (toolUseId=${tc.toolUseId})`);
-			}
-		}
-		lines.push("");
+	const toolsByMessage = new Map<string, ConversationToolCall[]>();
+	for (const tool of snapshot.tools) {
+		const list = toolsByMessage.get(tool.message_id) ?? [];
+		list.push({
+			toolUseId: tool.tool_use_id,
+			toolName: tool.tool_name,
+			status: tool.status,
+			summary: tool.summary,
+		});
+		toolsByMessage.set(tool.message_id, list);
 	}
-
+	const messages: ConversationMessage[] = snapshot.rows.map((row) => ({
+		id: row.id,
+		seq: row.seq,
+		role: row.role,
+		origin: row.origin ?? "unknown",
+		text: row.content_text ?? "",
+		truncated: row.truncated,
+		createdAt: row.created_at,
+		...(toolsByMessage.has(row.id) ? { toolCalls: toolsByMessage.get(row.id) } : {}),
+	}));
+	const lines = [
+		`Narrator: ${snapshot.narrator.title ?? narratorId} [${narratorId}]`,
+		`Showing ${messages.length} message preview(s), in chronological order. Roles: ${input.roles?.join(", ") ?? "all"}; origins: ${input.origins?.join(", ") ?? "all"}.${describeTimeFilter(timeFilter)}`,
+		`Tool summaries: ${input.include_tool_calls ? "included (target conversation only)" : "omitted; set include_tool_calls:true to investigate tool evidence"}.`,
+	];
+	for (const message of messages) {
+		lines.push(
+			`\n[seq=${message.seq}] ${message.role}; origin=${message.origin} (${message.id}) at ${message.createdAt}:\n  ${message.text.replace(/\n/g, "\n  ")}${message.truncated ? "\n  [Preview truncated; use read_message for the complete source.]" : ""}`,
+		);
+		for (const tool of message.toolCalls ?? [])
+			lines.push(
+				`  [${tool.status}] ${tool.toolName}: ${tool.summary} (toolUseId=${tool.toolUseId})`,
+			);
+	}
+	const scope = continuationScope(narratorId, currentNarratorId);
+	const filterArguments = {
+		...(input.roles ? { roles: input.roles } : {}),
+		...(input.origins ? { origins: input.origins } : {}),
+		...(timeFilter?.from ? { from: timeFilter.from } : {}),
+		...(timeFilter?.to ? { to: timeFilter.to } : {}),
+		...(input.include_tool_calls ? { include_tool_calls: true } : {}),
+	};
+	const pagination = snapshot.pagination;
+	if (pagination.hasOlder && pagination.olderCursor !== null)
+		lines.push(
+			`\nOlder page: ${JSON.stringify({ action: "read_conversation", ...scope, ...filterArguments, direction: "older", cursor: pagination.olderCursor, limit: input.limit ?? RECALL_LIMITS.defaultResults })}`,
+		);
+	if (pagination.hasNewer && pagination.newerCursor !== null)
+		lines.push(
+			`\nNewer page: ${JSON.stringify({ action: "read_conversation", ...scope, ...filterArguments, direction: "newer", cursor: pagination.newerCursor, limit: input.limit ?? RECALL_LIMITS.defaultResults })}`,
+		);
+	if (messages[0])
+		lines.push(
+			`\nComplete message body: ${JSON.stringify({ action: "read_message", ...scope, message_id: messages[0].id })}`,
+		);
+	else
+		lines.push(
+			"No messages match this page and these filters. Do not infer that the conversation has no history.",
+		);
 	return {
 		output: lines.join("\n"),
-		title: `Conversation: ${narrator.title ?? targetNarratorId}`,
+		title: `Conversation: ${snapshot.narrator.title ?? narratorId}`,
 		metadata: {
 			action: "read_conversation",
-			narratorId: targetNarratorId,
-			narratorTitle: narrator.title,
-			model: narrator.model,
+			narratorId,
+			narratorTitle: snapshot.narrator.title,
+			model: snapshot.narrator.model,
 			messages,
+			pagination,
 		},
 	};
 }
@@ -533,34 +438,114 @@ async function handleReadConversation(
 // ---------------------------------------------------------------------------
 
 async function handleReadToolCall(
-	toolUseId: string | undefined,
+	input: RecallArguments,
 	currentNarratorId: string,
-	allNarrators: boolean,
 	signal: AbortSignal,
 ): Promise<ToolResult> {
-	signal.throwIfAborted();
-	if (!toolUseId) {
+	const result = await recallToolCallPage(
+		{
+			toolCallId: input.tool_call_id ?? "",
+			narratorId: input.narrator_id ?? (input.all_narrators ? null : currentNarratorId),
+			part: input.part ?? "both",
+			offset: input.offset ?? 0,
+			maxChars: input.max_chars ?? RECALL_LIMITS.defaultPageChars,
+		},
+		signal,
+	);
+	if (!result)
 		return {
-			output: 'Parameter "tool_call_id" is required for action "read_tool_call".',
 			isError: true,
+			output: `Tool call ${input.tool_call_id} was not found in the requested scope. Use a toolUseId from include_tool_calls:true, not a message ID or ledger row ID. Other conversations require explicit all_narrators:true approval.`,
+		};
+	type PageCursor = { hasMore: boolean; nextOffset: number | null };
+	const metadata = result.metadata as
+		| {
+				narratorId?: string;
+				pages?: Partial<Record<"input" | "output", PageCursor | null>>;
+				question?: { questions?: PageCursor | null; answers?: PageCursor | null } | null;
+		  }
+		| undefined;
+	const next: string[] = [];
+	const continuations = new Set<string>();
+	const addContinuation = (label: string, part: "input" | "output", page?: PageCursor | null) => {
+		if (!page?.hasMore || page.nextOffset === null) return;
+		const key = `${part}:${page.nextOffset}`;
+		if (continuations.has(key)) return;
+		continuations.add(key);
+		next.push(
+			`${label}: ${JSON.stringify({ action: "read_tool_call", ...continuationScope(metadata?.narratorId ?? input.narrator_id ?? currentNarratorId, currentNarratorId), tool_call_id: input.tool_call_id, part, offset: page.nextOffset, max_chars: input.max_chars ?? RECALL_LIMITS.defaultPageChars })}`,
+		);
+	};
+	addContinuation("Continue input", "input", metadata?.pages?.input);
+	addContinuation("Continue output", "output", metadata?.pages?.output);
+	// Async answers may outlive the short launch input. They must have their own way forward.
+	addContinuation("Continue saved questions", "input", metadata?.question?.questions);
+	addContinuation("Continue saved answers", "input", metadata?.question?.answers);
+	return { ...result, output: [result.output, ...next].join("\n") };
+}
+
+/** Like outline's bounded results: the executor must not cut the head of an exact page. */
+function boundedResult(result: ToolResult): ToolResult {
+	if (result.isError) return result;
+	if (Buffer.byteLength(result.output, "utf8") > 512 * 1024) {
+		return {
+			isError: true,
+			output:
+				"This Recall response exceeds its bounded output budget. Use a smaller limit/max_chars, narrower roles/origins, or omit include_tool_calls, then retry. No partial page was returned.",
 		};
 	}
-	if (sqlite.filename === ":memory:" || sqlite.inTransaction) {
-		throw new WorkersUnavailableError("requires_committed_file");
-	}
-	const result = await runReadTask<ToolResult | null>(
-		sqlite.filename,
-		{ kind: "recallToolCall", toolUseId, narratorId: allNarrators ? null : currentNarratorId },
-		{ signal, timeoutMs: 15_000 },
+	// This flag means the tool owns truncation/pagination, not that this page lost text.
+	return { ...result, truncated: true };
+}
+
+function continuationScope(narratorId: string, currentNarratorId: string) {
+	return {
+		narrator_id: narratorId,
+		...(narratorId !== currentNarratorId ? { all_narrators: true } : {}),
+	};
+}
+
+async function handleReadMessage(
+	input: RecallArguments,
+	currentNarratorId: string,
+	signal: AbortSignal,
+): Promise<ToolResult> {
+	const narratorId = input.narrator_id ?? currentNarratorId;
+	const page = await recallMessage(
+		{
+			narratorId,
+			messageId: input.message_id ?? "",
+			offset: input.offset ?? 0,
+			maxChars: input.max_chars ?? RECALL_LIMITS.defaultPageChars,
+		},
+		signal,
 	);
-	signal.throwIfAborted();
-	return (
-		result ?? {
-			output: allNarrators
-				? `Tool call "${toolUseId}" not found.`
-				: `Tool call "${toolUseId}" not found in the current narrator. ` +
-					"Pass `all_narrators: true` to look it up across all narrators (may require user approval).",
+	if (!page)
+		return {
 			isError: true,
-		}
-	);
+			output: `Message ${input.message_id} is not in conversation ${narratorId}. Use the narrator_id and message ID from a Recall result; IDs do not grant access to another conversation.`,
+		};
+	const length = Array.from(page.text).length;
+	const lines = [
+		`Message ${page.messageId} in ${page.narratorTitle ?? narratorId} [${narratorId}], seq=${page.seq}, bodyRevision=${page.bodyRevision}.`,
+		`Role: ${page.role}; stored origin: ${page.origin ?? "unknown (legacy provenance, not verified human)"}${page.originLabel ? ` (${page.originLabel})` : ""}. Created: ${page.createdAt}.`,
+		`Stored message text, Unicode code points [${page.offset}, ${page.offset + length}) of ${page.totalChars}. Tool outputs and attachment bytes are not part of this text.`,
+		"\n--- Stored message text ---\n",
+		page.text,
+	];
+	if (page.omittedBlocks?.length)
+		lines.push(`\nNon-text blocks: ${page.omittedBlocks.join(", ")}.`);
+	for (const tool of page.toolCalls ?? [])
+		lines.push(
+			`Tool evidence: ${tool.toolName} [${tool.status}] ${tool.summary} (toolUseId=${tool.toolUseId}).`,
+		);
+	if (page.hasMore && page.nextOffset !== null)
+		lines.push(
+			`\nContinue this message: ${JSON.stringify({ action: "read_message", ...continuationScope(narratorId, currentNarratorId), message_id: page.messageId, offset: page.nextOffset, max_chars: input.max_chars ?? RECALL_LIMITS.defaultPageChars })}`,
+		);
+	return {
+		output: lines.join("\n"),
+		title: `Message: ${page.messageId}`,
+		metadata: { action: "read_message", ...page, truncated: page.offset > 0 || page.hasMore },
+	};
 }

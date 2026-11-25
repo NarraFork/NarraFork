@@ -27,6 +27,8 @@
  * porting decision.
  */
 
+import type { RecallOrigin, RecallRole, RecallSort } from "../../lib/recall-contract";
+
 /** The user a search runs on behalf of. Never optional: an absent viewer used to mean
  *  "see everything", and a caller that simply forgot would silently reopen a leak. */
 export interface SearchViewer {
@@ -268,6 +270,11 @@ export interface TimelineSearchQuery {
  */
 export interface RecallSearchQuery {
 	signal?: AbortSignal;
+	roles?: readonly RecallRole[];
+	origins?: readonly RecallOrigin[];
+	/** Defaults to relevance; without index ranks, relevance falls back to newest.
+	 * All modes break ties by message id ascending, index relevance first by newest. */
+	sort?: RecallSort;
 	text: string;
 	strategy: SearchStrategy;
 	limit: number;
@@ -441,9 +448,13 @@ export interface TimelineSearchRow {
 
 export interface RecallMessageRow {
 	messageId: string;
+	/** A history narrator that actually references this message, suitable for read_message. */
 	narratorId: string;
 	narratorTitle: string | null;
+	/** The immutable message owner, which need not retain its own history ref after rollback. */
+	ownerNarratorId?: string;
 	role: string;
+	origin: string | null;
 	createdAt: string;
 	snippet: string;
 }

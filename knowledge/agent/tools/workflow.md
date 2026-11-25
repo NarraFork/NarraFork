@@ -12,6 +12,11 @@ anchors:
   - server/lib/agent/tools/worktree.ts
   - server/lib/agent/tools/switch-device.ts
   - server/lib/agent/tools/recall.ts
+  - server/lib/agent/tools/recall-schema.ts
+  - server/lib/recall-contract.ts
+  - server/services/search/recall-store.ts
+  - server/lib/db-worker/recall-reader.ts
+  - server/lib/db-worker/recall-tool-page.ts
   - server/lib/agent/tools/image-gen.ts
   - server/services/narrator-permission.ts
   - server/lib/agent/image-generation-api.ts
@@ -43,7 +48,7 @@ keywords:
   - expectedRevision
   - missing_working_directory
 status: draft
-verified_at: 878917e97
+verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 ---
 # 流程与协作工具
 
@@ -58,7 +63,11 @@ verified_at: 878917e97
 - `Team`：仅团队协调者会话可见（`agent-runtime/orchestrator.ts` 过滤）。actions 为 work.list/create/review/ready/sync/cancel、brief、checkin、cleanup、decision。权限逐动作判定，位于绕过与 dontAsk 快捷路径之上：读动作放行；`cleanup` 删除目录，永远要人批准，readOnly、dontAsk、计划模式下直接拒绝；其余写动作在 readOnly 下拒绝，其他模式放行（审查只读会话另有拦截，未逐项核实）。
 - worktree：当前面向模型的是 `ListWorktrees`、`CreateWorktree`（新分支）、`AttachWorktree`（已有分支）、`GetWorktreeOperation`；旧的 `Worktree` 工具 `isAvailable` 恒为 false，只保留历史执行与恢复。创建返回 operationId，结果未知时只能用 `GetWorktreeOperation` 对账，不可重建或清理；`switchToWorktree` 可顺带切换工作目录，成功切换会结束当前这一轮。
 - `SwitchDevice`：改变文件与命令工具的默认执行设备，未知设备或离线设备报错；运行策略禁止本机执行时拒绝切到 `local`；设备还没有工作目录时拒绝，并指向 `SwitchWorkingDirectory`。
-- `Recall`：默认只搜索与读取当前叙述者；`all_narrators: true` 跨全部叙述者，权限层要求批准（bypass 模式直接放行）。search 默认 20 条、上限 50，单次最多 10 个查询；读取默认 20 条、上限 50；搜索走搜索端口，会话读取走 SQLite Worker 快照。
+- `Recall`：`search` 定位、`read_conversation` 浏览预览、`read_message` 读取消息原文、`read_tool_call` 查看工具证据。schema 保持 provider 兼容的根 object，同时在执行前检查 action 必填项、不适用字段、整数预算和互斥参数；description 提供四种最小调用示例。
+- Recall 默认只读当前会话及其 fork 继承历史；`narrator_id` 可精确限定各动作，访问其他会话仍须 `all_narrators:true` 并按既有权限审批，ID 本身不授权。search 与工具查找只有在此标记为真且未给目标时才全局；会话/消息正文读取仍默认当前会话。
+- 回查明确记录的真人输入用 `roles:["user"],origins:["user"]`；role 与来源相互独立，unknown 明确表示 NULL 的旧记录，不自动认作真人。搜索过滤在 SQL LIMIT 前执行，支持时间排序；关键词数组是替代查询，合并去重后共享总 limit（默认 20，上限 50；最多 10 个关键词查询）。
+- 会话浏览支持 older/newer/around，cursor 为排他的 seq 边界；默认最近页，newer 从最早页开始，around 使用 message_id，页内按时间顺序展示且严格 limit。预览明确标截断，并附继续读页/原文的参数；默认不加载工具执行摘要，调查工具时显式 include_tool_calls:true。消息与工具字段使用从 0 开始的 Unicode 码点 offset/max_chars（默认 8000，上限 20000）及 nextOffset 续读，不把预览或半段 JSON 称完整原文。成功结果在自有 512KiB 输出预算内使用既有 bounded-result 标记（顶层 truncated:true），避免通用执行器再次按 2000 行/50KiB 截尾而跳过已计入 nextOffset 的正文；实际页是否还有内容由 hasMore/nextOffset 表示，超自有预算明确失败。
+- Recall 读取复用 SQLite Worker／PG 异步端口；消息原文从持久正文重建而不是 content_text 摘要，不读取附件字节。问题答案按原工具及既有问题记录取证，并区分用户、auto、reflection 等决定来源；代理 resolve.note 不是真人答案，不新增决策索引或伪造用户消息。
 - `SwitchWorkingDirectory`：切换普通主叙述者的工作目录，参数必须带当前工作区修订号 `expectedRevision`、唯一 `requestId` 和目标 `{deviceId, cwd}`（严格对象，多余字段被拒，`validators/workspace-context.ts`）；运行时不支持切换时报错。会话自己的目录不存在时由 `working-directory-recovery.ts` 生成 `missing_working_directory` 致命结果并带建议目录，而工具入参里错误的 `workdir` 只是模型的错，会话继续、让模型重试。
 - `ImageGen`：必须显式给出生图模型 ID，不会用对话模型替代；提供商需实现 `generateImage`。已付费的响应在本地处理失败时，仅传 `response_id` 恢复，不会再发起生成请求。
 

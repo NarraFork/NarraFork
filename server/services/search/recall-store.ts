@@ -1,16 +1,22 @@
 import { activeDatabaseBackend, postgresRuntime, sqlite } from "../../db";
 import type { PgExecutor } from "../../db/pg-fts";
 import { type ReadQueryOptions, readDomainTask } from "../../db/worker-read";
+import type { ToolResult } from "../../lib/agent/types";
 import { createDomainReadParams } from "../../lib/db-worker/domain-protocol";
 import { DbReadError } from "../../lib/db-worker/errors";
+import { readRecallToolCallPagePg } from "../../lib/db-worker/recall-tool-page";
+import type {
+	RecallMessageInput,
+	RecallMessagePage,
+	RecallToolCallPageInput,
+} from "../../lib/recall-contract";
 import {
-	getToolCallSummary,
-	RECALL_CONVERSATION_INPUT_BYTES,
 	RECALL_DETAIL_BYTES,
 	type RecallConversationInput,
 	type RecallConversationSnapshot,
 	type RecallToolCallDetailInput,
 	type RecallToolCallRow,
+	recallConversationQueries,
 } from "./recall-reader";
 
 function executor(): PgExecutor {
@@ -26,6 +32,9 @@ function check(signal: AbortSignal | undefined, options: RecallReadOptions) {
 	signal?.throwIfAborted();
 	if (options.deadlineAt !== undefined && Date.now() >= options.deadlineAt)
 		throw new DbReadError("DB_READ_TASK_TIMEOUT", "Recall read deadline expired");
+}
+function deadline(options: RecallReadOptions) {
+	return Math.min(options.deadlineAt ?? Infinity, Date.now() + (options.timeoutMs ?? 30000));
 }
 export async function recallToolCallDetail(
 	input: RecallToolCallDetailInput,
@@ -73,90 +82,116 @@ export async function recallConversation(
 	signal ??= options.signal;
 	createDomainReadParams("recallConversation", input);
 	check(signal, options);
-	if (activeDatabaseBackend !== "postgres")
-		return readDomainTask(sqlite, "recallConversation", input, {
+	if (activeDatabaseBackend !== "postgres") {
+		const result = await readDomainTask(sqlite, "recallConversation", input, {
 			...options,
 			executionPolicy: "worker-required",
 			signal,
 		});
-	const pg = executor();
-	const narrator = await pg.unsafe("SELECT id, title, model FROM narrators WHERE id = $1 LIMIT 1", [
-		input.narratorId,
-	]);
-	check(signal, options);
-	const result: RecallConversationSnapshot = {
-		narrator: (narrator[0] as RecallConversationSnapshot["narrator"]) ?? null,
-		messageMissing: false,
-		rows: [],
-		tools: [],
-	};
-	if (!result.narrator) return result;
-	const columns =
-		"m.id, m.role, substr(m.content_text, 1, 500) AS content_text, m.created_at, r.seq";
-	if (input.messageId) {
-		const refs = await pg.unsafe(
-			"SELECT seq FROM narrator_message_refs WHERE narrator_id = $1 AND message_id = $2 LIMIT 1",
-			[input.narratorId, input.messageId],
-		);
 		check(signal, options);
-		if (!refs[0]) return { ...result, messageMissing: true };
-		const half = Math.floor(input.limit / 2),
-			seq = Number(refs[0].seq);
-		result.rows = (await pg.unsafe(
-			`SELECT ${columns} FROM narrator_message_refs r JOIN narrator_messages m ON m.id = r.message_id WHERE r.narrator_id = $1 AND r.seq >= $2 AND r.seq <= $3 ORDER BY r.seq LIMIT 51`,
-			[input.narratorId, seq - half, seq + input.limit - half],
-		)) as unknown as typeof result.rows;
-	} else {
-		result.rows = (
-			(await pg.unsafe(
-				`SELECT ${columns} FROM narrator_message_refs r JOIN narrator_messages m ON m.id = r.message_id WHERE r.narrator_id = $1 ORDER BY r.seq DESC LIMIT $2`,
-				[input.narratorId, input.limit],
-			)) as unknown as typeof result.rows
-		).reverse();
+		return result;
 	}
+	const pg = executor(),
+		deadlineAt = deadline(options);
+	const plan = recallConversationQueries(input, true);
+	let step = plan.next();
+	while (!step.done) {
+		check(signal, { deadlineAt });
+		const rows = await pg.unsafe(step.value.sql, step.value.params);
+		check(signal, { deadlineAt });
+		step = plan.next(rows as Record<string, unknown>[]);
+	}
+	return step.value;
+}
+export async function recallToolCallPage(
+	input: RecallToolCallPageInput,
+	signal?: AbortSignal,
+	options: RecallReadOptions = {},
+): Promise<ToolResult | null> {
+	signal ??= options.signal;
+	createDomainReadParams("recallToolCallPage", input);
 	check(signal, options);
-	result.rows = result.rows.map((row) => ({ ...row, seq: Number(row.seq) }));
-	const ids = result.rows.map((row) => row.id);
-	if (!ids.length) return result;
-	let time = "",
-		id = "",
-		bytes = 0;
-	while (true) {
-		const tools = await pg.unsafe(
-			`SELECT id, tool_use_id, tool_name, status, message_id, created_at, octet_length(input_json::text) AS bytes FROM narrator_tool_calls WHERE message_id = ANY($1::text[]) AND narrator_id = $2 AND (created_at, id) > ($3, $4) ORDER BY created_at, id LIMIT 128`,
-			[ids, input.narratorId, time, id],
-		);
+	if (activeDatabaseBackend !== "postgres") {
+		const result = await readDomainTask(sqlite, "recallToolCallPage", input, {
+			...options,
+			executionPolicy: "worker-required",
+			signal,
+		});
 		check(signal, options);
-		for (const tool of tools) {
-			const size = Number(tool.bytes ?? 0);
-			if (bytes + size > RECALL_CONVERSATION_INPUT_BYTES || result.tools.length >= 10_000)
-				throw new DbReadError("DB_READ_BUDGET", "Recall conversation exceeds its source budget");
-			const values = await pg.unsafe(
-				"SELECT input_json FROM narrator_tool_calls WHERE id = $1 AND coalesce(octet_length(input_json::text),0) <= $2 LIMIT 1",
-				[tool.id, RECALL_CONVERSATION_INPUT_BYTES - bytes],
-			);
-			check(signal, options);
-			if (!values[0])
-				throw new DbReadError("DB_READ_BUDGET", "Recall input changed beyond its source budget");
-			const raw = jsonText(values[0].input_json);
-			bytes += Buffer.byteLength(raw ?? "");
-			let parsed: unknown = null;
-			try {
-				parsed = raw ? JSON.parse(raw) : null;
-			} catch {
-				/* Invalid JSON retains the tool-name summary. */
-			}
-			result.tools.push({
-				tool_use_id: String(tool.tool_use_id),
-				tool_name: String(tool.tool_name),
-				status: String(tool.status),
-				message_id: String(tool.message_id),
-				summary: getToolCallSummary(String(tool.tool_name), parsed),
-			});
-		}
-		if (tools.length < 128) break;
-		time = String(tools[tools.length - 1].created_at);
-		id = String(tools[tools.length - 1].id);
+		return result;
 	}
+	return readRecallToolCallPagePg(executor(), input, signal, deadline(options));
+}
+export async function recallMessage(
+	input: RecallMessageInput,
+	signal?: AbortSignal,
+	options: RecallReadOptions = {},
+): Promise<RecallMessagePage | null> {
+	signal ??= options.signal;
+	createDomainReadParams("recallMessage", input);
+	check(signal, options);
+	if (activeDatabaseBackend !== "postgres") {
+		const result = await readDomainTask(sqlite, "recallMessage", input, {
+			...options,
+			executionPolicy: "worker-required",
+			signal,
+		});
+		check(signal, options);
+		return result;
+	}
+	// PG body readers use the persisted content_json projection (block-row reads are SQLite-only).
+	// All JSON decoding, joining and code-point slicing stays in PostgreSQL, not this thread.
+	const pg = executor(),
+		deadlineAt = deadline(options);
+	const params = [input.narratorId, input.messageId];
+	const scope =
+		"FROM narrator_message_refs r JOIN narrator_messages m ON m.id=r.message_id JOIN narrators n ON n.id=r.narrator_id WHERE r.narrator_id=$1 AND r.message_id=$2";
+	const sizes = await pg.unsafe(
+		`SELECT octet_length(m.content_json::text) AS bytes, coalesce(octet_length(n.title),0) + coalesce(octet_length(m.origin_label),0) AS metadata_bytes ${scope} LIMIT 1`,
+		params,
+	);
+	check(signal, { deadlineAt });
+	if (!sizes[0]) return null;
+	if (
+		Number(sizes[0].bytes) > RECALL_DETAIL_BYTES ||
+		Number(sizes[0].metadata_bytes ?? 0) > 128 * 1024
+	)
+		throw new DbReadError("DB_READ_BUDGET", "Recall body or metadata exceeds its source budget");
+	const native =
+		"'system_injection','spec_continuation','spec_blocked_continuation','knowledge_hint','container_ready','browser_session_lost','merge_summary'";
+	const text = `CASE WHEN b.value->>'type'='text' AND jsonb_typeof(b.value->'text')='string' THEN b.value->>'text' WHEN b.value->>'type' IN (${native}) AND jsonb_typeof(b.value->'modelText')='string' THEN b.value->>'modelText' END`;
+	const rows = await pg.unsafe(
+		`WITH body AS (SELECT m.id AS "messageId",r.narrator_id AS "narratorId",n.title AS "narratorTitle",m.role,m.origin,m.origin_label AS "originLabel",m.created_at AS "createdAt",r.seq,m.body_revision AS "bodyRevision",m.content_json::jsonb AS content ${scope} AND octet_length(m.content_json::text) <= $3 AND coalesce(octet_length(n.title),0) + coalesce(octet_length(m.origin_label),0) <= 131072 LIMIT 1), projected AS (SELECT body.*, coalesce((SELECT string_agg(${text}, E'\\n' ORDER BY b.ordinal) FROM jsonb_array_elements(body.content) WITH ORDINALITY b(value,ordinal) WHERE ${text} IS NOT NULL),'') AS text, ARRAY(SELECT coalesce(b.value->>'type','unknown') FROM jsonb_array_elements(body.content) b(value) WHERE ${text} IS NULL) AS "omittedBlocks" FROM body) SELECT "messageId","narratorId","narratorTitle",role,origin,"originLabel","createdAt",seq,"bodyRevision",CASE WHEN octet_length(array_to_json("omittedBlocks")::text) <= 131072 THEN "omittedBlocks" END AS "omittedBlocks",octet_length(array_to_json("omittedBlocks")::text) > 131072 AS "omissionsOversized",substr(text,$4+1,$5) AS text,length(text) AS "totalChars" FROM projected`,
+		// Source UTF-8 bytes bound its code-point count too. Clamp only the SQL offset,
+		// so substr's int4 start ($4 + 1) cannot overflow for a valid safe-integer request.
+		[...params, RECALL_DETAIL_BYTES, Math.min(input.offset, RECALL_DETAIL_BYTES), input.maxChars],
+	);
+	check(signal, { deadlineAt });
+	if (!rows[0])
+		throw new DbReadError("DB_READ_BUDGET", "Recall body changed beyond its source budget");
+	const tools = await pg.unsafe(
+		'SELECT tool_use_id AS "toolUseId",tool_name AS "toolName",status,tool_name AS summary FROM narrator_tool_calls WHERE narrator_id=$1 AND message_id=$2 ORDER BY created_at,id LIMIT 10001',
+		params,
+	);
+	check(signal, { deadlineAt });
+	if (tools.length > 10000)
+		throw new DbReadError("DB_READ_BUDGET", "Recall tool count exceeds budget");
+	if (rows[0].omissionsOversized)
+		throw new DbReadError("DB_READ_BUDGET", "Recall omitted-block metadata exceeds result budget");
+	const { omissionsOversized: _omissionsOversized, ...row } = rows[0];
+	const totalChars = Number(row.totalChars),
+		next = Math.min(totalChars, input.offset + input.maxChars);
+	const result = {
+		...row,
+		seq: Number(row.seq),
+		bodyRevision: Number(row.bodyRevision),
+		totalChars,
+		offset: input.offset,
+		hasMore: next < totalChars,
+		nextOffset: next < totalChars ? next : null,
+		toolCalls: tools,
+	} as unknown as RecallMessagePage;
+	if (Buffer.byteLength(JSON.stringify(result)) > 512 * 1024)
+		throw new DbReadError("DB_READ_BUDGET", "Recall message result exceeds budget");
 	return result;
 }
