@@ -331,7 +331,23 @@ describe("execution policy engine cache eviction on failure", () => {
 		}
 	});
 
-	test("a policy invalidated while the Worker is reading cannot repopulate the cache", async () => {
+	test("fails closed if the one retry is also invalidated", async () => {
+		const narratorId = "pending-narrator";
+		const load = spyOn(executionPolicyRepository, "load").mockImplementation(async () => {
+			// Yield so the engine registers the pending entry before it is invalidated.
+			await Promise.resolve();
+			engine.invalidate(narratorId);
+			return makeMinimalPolicy({ narratorId });
+		});
+		try {
+			await expect(engine.compile(narratorId, null)).rejects.toThrow("changed while loading");
+			expect(load).toHaveBeenCalledTimes(2);
+		} finally {
+			load.mockRestore();
+		}
+	});
+
+	test("an invalidated load joins the fresh snapshot without using stale policy", async () => {
 		const narratorId = "pending-narrator";
 		const pending = Promise.withResolvers<LoadedExecutionPolicy>();
 		const load = spyOn(executionPolicyRepository, "load")
@@ -340,9 +356,10 @@ describe("execution policy engine cache eviction on failure", () => {
 		try {
 			const first = engine.compile(narratorId, null);
 			engine.invalidate("parent");
+			const current = engine.compile(narratorId, null);
 			pending.resolve(makeMinimalPolicy({ narratorId, ownerNarratorId: "old-parent" }));
-			await expect(first).rejects.toThrow("changed while loading");
-			expect((await engine.compile(narratorId, null)).ownerNarratorId).toBe("parent");
+			await expect(first).resolves.toMatchObject({ ownerNarratorId: "parent" });
+			await expect(current).resolves.toMatchObject({ ownerNarratorId: "parent" });
 			expect(load).toHaveBeenCalledTimes(2);
 		} finally {
 			load.mockRestore();

@@ -147,11 +147,11 @@ describeWithGrammar("object literal members", () => {
 	});
 
 	test("regression: the provider object's own methods are now visible", async () => {
-		const text = await Bun.file("server/lib/agent/structural/tree-sitter-provider.ts").text();
+		const text = await Bun.file("server/lib/agent/structural/tree-sitter-core.ts").text();
 		clearOutlineCache();
 		const nodes = flatten(
 			(await treeSitterProvider.outline({
-				filePath: "server/lib/agent/structural/tree-sitter-provider.ts",
+				filePath: "server/lib/agent/structural/tree-sitter-core.ts",
 				languageId: "typescript",
 				text,
 			})) as OutlineNode[],

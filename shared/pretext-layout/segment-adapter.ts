@@ -2719,6 +2719,9 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	sidecarSourceSpecImport: "Dynamic Spec moved to the outline",
 	sidecarSourceOutlineAnswer: "Answers to your questions",
 	sidecarSourceTeamStatus: "Team status",
+	sidecarSourceTeamUpgrade: "Became a team coordinator",
+	sidecarSourceTeamDisband: "Team disbanded",
+	sidecarSourceTeamReturn: "Work item returned",
 	// An update of an outline session's views (`context_update` row of `outline.*` parts).
 	contextViewsUpdated: "Context updated: {parts}",
 	contextViewOutlineTasks: "Current tasks",
@@ -2851,6 +2854,11 @@ const INJECTION_SOURCE_LABEL_KEYS: Record<string, string> = {
 	outline_answer: "sidecarSourceOutlineAnswer",
 	// A team coordinator's team status (Project Teams P2).
 	team_status: "sidecarSourceTeamStatus",
+	// A session turned into a team coordinator, or its team disbanded and the session kept.
+	team_upgrade: "sidecarSourceTeamUpgrade",
+	team_disband: "sidecarSourceTeamDisband",
+	// A person returned a work item from the team page, with the reason to relay (R).
+	team_return: "sidecarSourceTeamReturn",
 	// Loop-control notices: written as rows so a rebuilt request says what the live one did.
 	turn_nudge: "sidecarSourceTurnNudge",
 	broken_call: "sidecarSourceBrokenCall",

@@ -167,6 +167,8 @@ export interface ExactRowProps {
 	closingRowKeys?: ReadonlySet<string>;
 	/** Panel narrator id — injected into extra so media/tool details load images. */
 	narratorId: string;
+	/** Do not enable ModelTrace writes on external/read-only transcript sources. */
+	canCalibrateModelTrace?: boolean;
 	/**
 	 * Open a text-file attachment in a read-only file panel. Injected into the
 	 * render extra (the pure render layer owns no dock knowledge); absent → user
@@ -370,6 +372,7 @@ export const ExactRow = memo(
 		interaction,
 		rowInteraction,
 		closingRowKeys,
+		canCalibrateModelTrace,
 		onOpenFilePanel,
 		onFetchAttachment,
 		openAttachmentLabel,
@@ -729,6 +732,9 @@ export const ExactRow = memo(
 		if (onOpenAskInPassingTarget) extra.onOpenAskInPassingTarget = onOpenAskInPassingTarget;
 		// Media / tool-call details resolve images against the panel narrator.
 		extra.narratorId = narratorId;
+		if (kind === "modeltrace-result" && canCalibrateModelTrace) {
+			extra.modelTraceCalibrationNarratorId = narratorId;
+		}
 		// Per-grapheme fade-in for freshly appended text, for the LIVE row only.
 		//
 		// The streaming row is an ordinary document row now, so this is gated on the
@@ -1102,6 +1108,7 @@ export const ExactRow = memo(
 		prev.interaction === next.interaction &&
 		prev.rowInteraction === next.rowInteraction &&
 		prev.narratorId === next.narratorId &&
+		prev.canCalibrateModelTrace === next.canCalibrateModelTrace &&
 		prev.onOpenFilePanel === next.onOpenFilePanel &&
 		prev.onFetchAttachment === next.onFetchAttachment &&
 		prev.openAttachmentLabel === next.openAttachmentLabel &&

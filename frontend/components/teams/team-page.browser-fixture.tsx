@@ -1,32 +1,42 @@
 /**
- * Browser fixture of the team page (P4): the real `TeamPageView` (top bar, teams list, board,
- * activity, approvals) against the test server's team and narrator routes
- * (`team-page.browser.test.ts`). The coordinator's conversation is a stand-in: the narrator
- * panel has its own browser suites. Live refresh rides the app's own narrator socket.
+ * Browser fixture of the team page (the redesign R): the real `TeamPageView` (header, 等你处理,
+ * work list, activity, work item drawer) against the test server's team and narrator routes
+ * (`team-page.browser.test.ts`), and the project page's teams section. The coordinator's
+ * conversation is a stand-in whose composer takes the text the page asks to add (as the real
+ * composer does): the narrator panel has its own browser suites. Live refresh rides the app's
+ * own narrator socket. The shell carries the phone's menu buttons (inline and floating fallback)
+ * as the app does.
  */
 import "@mantine/core/styles.css";
 import "@mantine/notifications/styles.css";
+import "../../styles/nav-collapsed.css";
 import { AppShell, MantineProvider } from "@mantine/core";
 import { Notifications } from "@mantine/notifications";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import i18next from "i18next";
+import { useEffect, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
+import { listenComposerAppend } from "../../lib/composer-append-queue";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import narratorEn from "../../locales/en/narrator.json";
+import navEn from "../../locales/en/nav.json";
 import projectsEn from "../../locales/en/projects.json";
 import narratorZh from "../../locales/zh-CN/narrator.json";
+import navZh from "../../locales/zh-CN/nav.json";
 import projectsZh from "../../locales/zh-CN/projects.json";
+import { MobileNavFallback } from "../nav/MobileNavButton";
+import { MobileNavContext } from "../nav/nav-render-context";
 import { ProjectTeamsList } from "./ProjectTeamsList";
 import { TeamPageView } from "./TeamPageView";
 
 const instance = i18next.createInstance();
 await instance.use(initReactI18next).init({
 	lng: "en",
-	// `narrator`: the coordinator's sharing panel in the members drawer (M1).
+	// `narrator`: the coordinator's sharing panel in the members drawer (M1); `nav`: the menu button.
 	resources: {
-		en: { projects: projectsEn, narrator: narratorEn },
-		"zh-CN": { projects: projectsZh, narrator: narratorZh },
+		en: { projects: projectsEn, narrator: narratorEn, nav: navEn },
+		"zh-CN": { projects: projectsZh, narrator: narratorZh, nav: navZh },
 	},
 	interpolation: { escapeValue: false },
 	react: { useSuspense: false },
@@ -39,6 +49,8 @@ let scheme: "light" | "dark" = "light";
 /** The app sidebar's width (the real shell's navbar: 250–480 px, hidden on phones). */
 let navWidth = 250;
 const opened: string[] = [];
+/** The phone drawer's toggle, as the app shell hands it to the menu buttons. */
+const mobileNav = { opened: false, toggle: () => opened.push("menu") };
 
 function render(): void {
 	if (!root || !queryClient) return;
@@ -57,9 +69,12 @@ function render(): void {
 						<AppShell.Navbar data-testid="app-sidebar">
 							<div style={{ padding: 12 }}>Sidebar</div>
 						</AppShell.Navbar>
-						<AppShell.Main data-testid="page-frame" style={{ height: "100dvh" }}>
-							{mounted}
-						</AppShell.Main>
+						<MobileNavContext.Provider value={mobileNav}>
+							<AppShell.Main data-testid="page-frame" style={{ height: "100dvh" }}>
+								{mounted}
+							</AppShell.Main>
+							<MobileNavFallback />
+						</MobileNavContext.Provider>
 					</AppShell>
 				</MantineProvider>
 			</QueryClientProvider>
@@ -88,33 +103,50 @@ export function idle(): boolean {
 	);
 }
 
+/** The coordinator's conversation stand-in: its composer takes appended text like the real one. */
+function StandInConversation({ teamId }: { teamId: string }) {
+	const [draft, setDraft] = useState("");
+	useEffect(
+		() => listenComposerAppend(teamId, (text) => setDraft((value) => value + text)),
+		[teamId],
+	);
+	return (
+		// Laid out like the narrator panel: the composer at the bottom.
+		<div
+			data-testid="conversation-stand-in"
+			style={{
+				padding: 16,
+				height: "100%",
+				boxSizing: "border-box",
+				display: "flex",
+				flexDirection: "column",
+			}}
+		>
+			Coordinator conversation
+			<textarea
+				data-testid="composer-stand-in"
+				aria-label="Message"
+				value={draft}
+				onChange={(event) => setDraft(event.currentTarget.value)}
+				style={{ display: "block", marginTop: "auto", width: "100%", maxWidth: 360 }}
+			/>
+		</div>
+	);
+}
+
 /** Mount the team page as a member or onlooker sees it (the token says who). */
-export function openTeam(
-	projectId: string,
-	teamId: string,
-	canCreateTeam: boolean,
-	sidebarWidth = 250,
-): void {
+export function openTeam(projectId: string, teamId: string, sidebarWidth = 250): void {
 	narratorWSManager.connect();
 	navWidth = sidebarWidth;
 	mount(
 		<TeamPageView
 			projectId={projectId}
 			teamId={teamId}
-			canCreateTeam={canCreateTeam}
-			conversation={
-				<div data-testid="conversation-stand-in" style={{ padding: 16, height: "100%" }}>
-					Coordinator conversation
-					<textarea
-						data-testid="composer-stand-in"
-						aria-label="Message"
-						style={{ display: "block", marginTop: 8, width: "100%", maxWidth: 360 }}
-					/>
-				</div>
-			}
+			conversation={<StandInConversation teamId={teamId} />}
 			onOpenSession={(id) => opened.push(`session:${id}`)}
-			onOpenTeam={(id) => opened.push(`team:${id}`)}
+			onOpenCoordinatorSession={() => opened.push(`full:${teamId}`)}
 			onBack={() => opened.push("back")}
+			onDisbanded={(id) => opened.push(`disbanded:${id}`)}
 		/>,
 	);
 }
@@ -161,10 +193,16 @@ export function text(selector: string): string | null {
 	return document.querySelector(selector)?.textContent ?? null;
 }
 
-/** The column a card is in, or null when the card is not shown. */
-export function columnOf(itemId: string): string | null {
-	const card = document.querySelector(`[data-testid=team-card][data-item-id="${itemId}"]`);
-	return card?.closest<HTMLElement>("[data-testid=team-column]")?.dataset.column ?? null;
+/** The value of a text field. */
+export function value(selector: string): string | null {
+	return document.querySelector<HTMLInputElement | HTMLTextAreaElement>(selector)?.value ?? null;
+}
+
+/** The work list group a row is in (`needsYou`, `inProgress`, `review`), or null. */
+export function groupOf(itemId: string): string | null {
+	const row = document.querySelector(`[data-testid=team-work-row][data-item-id="${itemId}"]`);
+	const group = row?.closest<HTMLElement>("[data-testid^=team-group-]");
+	return group?.dataset.testid?.replace("team-group-", "") ?? null;
 }
 
 /** Whether a visible element lies inside the viewport's width and the page does not scroll sideways. */
@@ -190,6 +228,20 @@ export function colors(): { scheme: string | null; background: string; color: st
 	};
 }
 
+/**
+ * Whether a tap at the centre of the (first visible) element would reach it, i.e. nothing such
+ * as a floating button lies on top of it.
+ */
+export function tappable(selector: string): boolean {
+	const element = [...document.querySelectorAll<HTMLElement>(selector)].find(
+		(candidate) => candidate.getBoundingClientRect().width > 0,
+	);
+	if (!element) return false;
+	const rect = element.getBoundingClientRect();
+	const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+	return !!hit && element.contains(hit);
+}
+
 export function click(selector: string): boolean {
 	const element = document.querySelector<HTMLElement>(selector);
 	element?.click();
@@ -197,9 +249,13 @@ export function click(selector: string): boolean {
 }
 
 export function type(selector: string, value: string): void {
-	const input = document.querySelector<HTMLInputElement>(selector);
+	const input = document.querySelector<HTMLInputElement | HTMLTextAreaElement>(selector);
 	if (!input) throw new Error(`no ${selector}`);
-	const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+	const prototype =
+		input instanceof HTMLTextAreaElement
+			? HTMLTextAreaElement.prototype
+			: HTMLInputElement.prototype;
+	const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
 	setter?.call(input, value);
 	input.dispatchEvent(new Event("input", { bubbles: true }));
 }

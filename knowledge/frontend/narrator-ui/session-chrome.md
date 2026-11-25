@@ -57,7 +57,7 @@ keywords:
   - 导入会话
   - 访问权限
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 412d79d6a
 ---
 # 会话外框
 
@@ -75,7 +75,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
   - 宽面板（目前只有 `timeline`）且有 chat：在 chat 上方分栏，初始高度 380，最多占表面高度 55%。
   - 无 chat：独立添加。
 - 没有 dock 的宿主（手机页、分离窗口）：`MobileToolPanelHost` 用抽屉承载工具面板，`OutlineDrawerHost` 用抽屉承载大纲；`REMOTE_BUILD` 下详情/Spec/文件面板/保存转储等替换为 `RemoteUnsupported`（`remote-ui-panels.tsx` 别名）。
-- 头部工具栏容量（`header/narrator-header-toolbar-capacity.ts`）：预算来自头部整行宽度而非工具栏自身宽度（避免级联收缩）；条目宽度是常量 22px、间距 10px；标题至少保留 140px；折叠的条目要多出 12px 才恢复（迟滞）；溢出的进入 `NarratorToolbarOverflowMenu`。条目注册表 `narrator-toolbar-items.tsx` 用 `hosts` 声明哪些宿主能呈现，手机走抽屉。
+- 头部工具栏容量（`header/narrator-header-toolbar-capacity.ts`）：预算来自头部整行宽度而非工具栏自身宽度（避免级联收缩）；条目宽度是常量 22px、间距 10px；标题至少保留 140px；折叠的条目要多出 12px 才恢复（迟滞）；溢出的进入 `NarratorToolbarOverflowMenu`。该菜单在可拖动列表下面还有固定项（兼容性、大纲、保存的录制、「升级为团队」，最后是归档）；「升级为团队」只在 `onUpgradeToTeam` 传入时出现，对话框由 `NarratorPanel` 在菜单外渲染（见[团队页与审批](../../collaboration/teams/page.md)）。条目注册表 `narrator-toolbar-items.tsx` 用 `hosts` 声明哪些宿主能呈现，手机走抽屉。
 - 创建 worktree 是步骤机（`header/worktree-flow.ts`：idle→prepare→create→reconcile→switch→done），失败结果未知时保留冻结的原请求供对账，不改写 requestId；移除流程 `worktree-removal-flow.ts` 的确认项必须是用户真正勾选的，不从计划推断。
 - 额度/余额指示器按提供商分别实现（`model/`：Codex、OpenCode、Sub2Api 订阅、NUG、Kimi、DeepSeek、CommandCode、TokenDance、自定义 API 用量）；`use-narrator-quota.ts` 读取持久化的 `payment_required` 信息，`resumeAction` 只有 `continue` 否则为 `retry`。
 - 子代理模型池编辑（`SubagentModelPoolEditor.tsx`）：只有用户的选择编辑会移除某类型的声明，未触碰的显式空数组保留（`subagent-model-pool-state.ts:selectPoolModels`）。
@@ -86,6 +86,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - Spec 面板展示模式 `source | split | rich`（`spec/spec-editor-mode.ts`）；`rich` 是 Tiptap 所见即所得，会重新序列化整份文档，因此只对能无损载入的 markdown 提供；标签排布保存串行，一次只发一个请求且总发最新排布（`spec-tab-save.ts`）。
 - 会话导入（`session-interchange/ImportSessionModal.tsx`）三种来源：浏览器上传（任何人）、服务器 `~/.claude`/`~/.codex` 扫描（仅管理员，否则隐藏）、在线设备扫描；UI 只隐藏服务端会拒绝的选项，服务端会重复校验。
 - 访问面板（`details/NarratorAccessPanel.tsx`）：可见范围（private/project/everyone）与可写范围（始终是可见范围的子集）两级，被限制的选项置灰而不是隐藏，另有逐人读/写授权。
+- 团队标记（`header/NarratorTeamBadge.tsx`）：带 `team` trait 且有项目（`NarratorPanel` 的 `compatibilityProjectId`）的会话在标题后显示「团队」徽标，点开 `/projects/$projectId/teams/$teamId`（团队 id 就是协调者的叙述者 id）。`useNarratorTeamBadge` 决定显示与否并给出固定宽度：Remote Access 构建（`REMOTE_BUILD`，其路由没有团队页）、工作区预览、没有路由上下文时不显示；是否在团队页本身按路由状态的 pathname（已去掉 basepath）比较；原生 `href` 用 `router.buildLocation` + `history.createHref`，反代子路径下带前缀。宽度由 `header-title-width.ts:headerBadgeLayoutWidth`（canvas 量完整文字 + sm 徽标固定外框）给出，徽标按该 px 宽度绘制，并作为 `titleBadgeWidth` 计入 `resolveHeaderLayoutAfterTitle` 预算：工具先收进溢出菜单，标题再缩；连最小标题宽度旁都放不下时 `showTitleBadge` 为 false，不显示徽标，溢出与关闭按钮不会被挤出标题行（`header-team-badge.browser.test.ts` 在 en / zh-CN 窄宽度下验证）。模型菜单触发器（`model/ModelPickerMenu.tsx`）的「默认（模型）」经 `followDefaultLabel`。
 
 ## 从哪读起
 - `dock/NarratorDockContext.tsx`：聊天面板与工具面板之间的发布/订阅与跨面板命令（页面级，无 Provider 时发布 hook 为空操作）。

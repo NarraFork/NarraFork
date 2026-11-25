@@ -49,7 +49,7 @@ keywords:
   - QueuedMessagesPanel
   - PendingAgentMessagesPanel
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 7d5423c07
 ---
 # 输入框与交互
 
@@ -75,12 +75,13 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 停止按钮长按 600ms 才触发打断，提前松开只提示（`use-interrupt-long-press.ts`）。
 - Enter 归属（`interaction/enter-ownership.ts`）：输入框、按钮、链接、菜单、对话框、终端等自己的 Enter 不被面板级快捷键（等待中的权限、Enter 回到输入框）抢走；权限按钮条例外（`data-perm-button-bar`）。
 - `PendingAgentMessagesPanel`：显示其他 Agent 发给本会话、尚未被任何一轮读取的消息，用户选择恢复或丢弃（失败/被停止的会话不会被 Agent 消息自动重启）。
+- 没有会话写权限的查看者（`NarratorPanel` 经 `useCanOpenTerminals` 读到的叙述者写权限为 false）看不到可编辑的输入框：`NarratorInteractionArea` 的 `readOnly` 把输入行换成一条只读提示（`composerReadOnly`；`NarratorPanel` 的 `readOnlyNotice` 可换掉这句，团队页传「你是只读成员」）。服务端 `POST /narrators/:id/messages` 本来就要求写权限；团队页中间栏嵌的是同一个面板。状态栏模型选择器的「默认（模型）」经 `lib/follow-model-label.ts:followDefaultLabel`，没配置默认模型时显示未配置文案。
 
 ## 从哪读起
 - `composer/NarratorComposer.tsx`（约 2000 行）：草稿同步、附件、发送入口；`composer/InlineComposerEditor.tsx`：编辑器。
 - `interaction/use-narrator-send.ts`：发送/排队/控制命令；`use-queued-message-actions.ts`：队列增删改与重排。
 - `interaction/use-status-bar-props.tsx`、`use-permission-mode-control.ts`、`use-fast-mode-control.tsx`、`use-model-selection.ts`：状态栏各控件。
-- `NarratorInteractionArea.tsx`：区域装配；`CreateNarratorModal.tsx`：新建叙述者表单（预加载见 `CreateNarratorLazyModal.tsx`）。
+- `NarratorInteractionArea.tsx`：区域装配；`CreateNarratorModal.tsx`：新建叙述者表单（预加载见 `CreateNarratorLazyModal.tsx`），顶部「会话 / 以团队开始」切换，团队一侧见[团队与成员](../../collaboration/teams/records.md)。
 
 ## 改它时
 - 改草稿格式要同步 `INPUT_DRAFT_STORAGE_VERSION` 与旧 key 清理（`cleanupLegacyNarratorInputStorage`）。

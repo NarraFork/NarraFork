@@ -2247,6 +2247,9 @@ async function performGracefulShutdown(
 				),
 				import("./lib/share-preview-html").then((owner) => owner.closeSharePreviewHtmlWorkers()),
 				import("./lib/agent/request-json").then((owner) => owner.closeRequestJsonWorkers()),
+				import("./lib/agent/structural/worker-client").then((owner) =>
+					owner.closeStructuralWorkers(),
+				),
 				import("./services/gen-ui/compiler").then((owner) => owner.closeGenUiCompilerWorkers()),
 				import("./lib/agent/execution/local-backend").then((owner) =>
 					owner.closeLocalGlobWorkers(),

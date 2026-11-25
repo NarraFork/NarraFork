@@ -1,12 +1,14 @@
 /**
  * Whether a narrator is a session of a team tree (a coordinator, or a subagent whose ACL root is
  * one), remembered per narrator id (M1). The IM gateway asks this before sending anything to a
- * chat; team-ness is fixed when a session is created, so the answer is cached, at most
+ * chat; team-ness changes only through a few explicit paths, so the answer is cached, at most
  * {@link TEAM_SESSION_MEMO_LIMIT} ids, oldest dropped first.
  *
- * Forgotten when a narrator is deleted (`narrator:deleted`), and wholesale after a data import or
- * a clear (`data-portability.ts` calls {@link forgetTeamSessions}): those replace rows wholesale,
- * and an id could come back as a different kind of session.
+ * Forgotten when a narrator is deleted (`narrator:deleted`); wholesale after a session is turned
+ * into a team or its team is disbanded (`team-conversion.ts`: the change reaches the session's
+ * subagents too, whose ids are not listed anywhere cheap), and after a data import or a clear
+ * (`data-portability.ts`): those replace rows wholesale, and an id could come back as a different
+ * kind of session. Every path calls {@link forgetTeamSessions} after its commit.
  */
 import { eventBus } from "../../lib/event-bus";
 import { hotOnce, hotSafe } from "../../lib/hot-safe";

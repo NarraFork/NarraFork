@@ -1,3 +1,4 @@
+import { PinToSidebarButton } from "@frontend/components/nav/PinToSidebarButton";
 import { ProjectSessionList } from "@frontend/components/project/ProjectSessionList";
 import { ProjectTeamsList } from "@frontend/components/teams/ProjectTeamsList";
 import {
@@ -82,7 +83,10 @@ function ProjectPage() {
 		<Stack>
 			<Group justify="space-between">
 				{project.data ? (
-					<Title order={3}>{project.data.name}</Title>
+					<Group gap="xs" wrap="nowrap" style={{ minWidth: 0 }}>
+						<Title order={3}>{project.data.name}</Title>
+						<PinToSidebarButton type="project" id={projectId} title={project.data.name} />
+					</Group>
 				) : (
 					<Skeleton height={28} width={220} />
 				)}

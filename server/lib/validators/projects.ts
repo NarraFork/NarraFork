@@ -26,6 +26,14 @@ export const createProjectSchema = z.object({
 	clonePassword: z.string().max(200).optional(),
 });
 
+/** `POST /api/projects/resolve-directory` (see `shared/project-directory.ts`). */
+export const resolveProjectDirectorySchema = z
+	.object({
+		cwd: z.string().trim().min(1).max(4096),
+		create: z.boolean().default(false),
+	})
+	.strict();
+
 /**
  * One exclusive path glob: relative to the repository root, `/` separators, no `..` segment and
  * no leading `/` (e.g. `drizzle/**`, `server/db/schema.ts`).

@@ -267,6 +267,7 @@ function sandbox(options: {
 			closeRevertBodyWorkers: settled,
 			closeRevertRewriteWorkers: settled,
 			closeSharePreviewHtmlWorkers: settled,
+			closeStructuralWorkers: settled,
 			closeSnapshotBuilds: settled,
 			closeTokenRecalculationWorkers: settled,
 			closeToolInputHistoricalWorkers: settled,
@@ -726,6 +727,10 @@ test("late teardown buffered writes and communication reads finish before reader
 		expect(trace).not.toContain("reader.close.begin");
 		releaseRead.resolve();
 		expect((await operation).success).toBe(true);
+		expect(runtime.tracker?.summary().steps).toContainEqual({
+			label: "computeWorkers.close",
+			outcome: "ok",
+		});
 		expect(runtime.tracker?.summary().clean).toBe(true);
 		expect(runtime.cleanMarkers).toBe(1);
 		const closed = trace.indexOf("reader.close.begin");

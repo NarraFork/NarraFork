@@ -64,12 +64,13 @@ function createAdapter(sent: Array<{ chatId: string; text: string }>): PlatformA
 function seedRecentTab(input: {
 	id: string;
 	tabKey: string;
-	type: "workspace" | "narrator" | "project";
+	type: "workspace" | "narrator" | "project" | "team";
 	entityId: string;
 	title: string;
 	sortOrder: number;
 	workspaceId?: string;
 	representedNarratorId?: string;
+	pinned?: boolean;
 }): void {
 	db.insert(userRecentTabs)
 		.values({
@@ -83,6 +84,7 @@ function seedRecentTab(input: {
 			workspaceId: input.workspaceId ?? null,
 			title: input.title,
 			lastVisitedAt: 100 - input.sortOrder,
+			pinned: input.pinned ?? false,
 			sortOrder: input.sortOrder,
 			createdAt: NOW,
 			updatedAt: NOW,
@@ -167,6 +169,8 @@ function seedFixture(): void {
 		workspaceId: "workspace-1",
 		representedNarratorId: "gateway-target",
 	});
+	// A pinned project row of the retired `projects` section: it joins the list (an unpinned
+	// one would be dropped by the one-time conversion).
 	seedRecentTab({
 		id: "tab-project",
 		tabKey: "project:project-1",
@@ -174,7 +178,31 @@ function seedFixture(): void {
 		entityId: "project-1",
 		title: "Project One",
 		sortOrder: 2,
+		pinned: true,
 	});
+}
+
+/** A pinned team tab: what a team tab looks like in the store (no represented narrator). */
+function seedTeamTab(): void {
+	seedRecentTab({
+		id: "tab-team",
+		tabKey: "team:team-coordinator",
+		type: "team",
+		entityId: "team-coordinator",
+		title: "Secret team",
+		sortOrder: 3,
+		pinned: true,
+	});
+}
+
+function listMessage(): InboundMessage {
+	return {
+		platform: "webhook",
+		chatId: "chat-1",
+		userId: "im-user",
+		username: "IM User",
+		text: "/list",
+	};
 }
 
 async function drainGatewayWork(): Promise<void> {
@@ -227,8 +255,42 @@ describe("gateway normalized recent-tabs consumers", () => {
 		expect(output).toContain("Workspace One");
 		expect(output).toContain("Target narrator (working)");
 		expect(output).toContain("Project One");
+		// Pinned, the project leads the list (the folder conversion regroups pinned units first).
+		expect(output.indexOf("Project One")).toBeLessThan(output.indexOf("Workspace One"));
 		expect(output.indexOf("Workspace One")).toBeLessThan(output.indexOf("Target narrator"));
-		expect(output.indexOf("Target narrator")).toBeLessThan(output.indexOf("Project One"));
+	});
+
+	it("never lists a team tab in /list, not even by name", async () => {
+		seedFixture();
+		seedTeamTab();
+		const sent: Array<{ chatId: string; text: string }> = [];
+		const adapter = createAdapter(sent);
+		const instance = gateway as unknown as GatewayTestAccess;
+		instance.adapters.set("webhook", adapter);
+
+		await instance.handleListCommand(listMessage(), adapter, "en");
+		expect(sent).toHaveLength(1);
+		const output = sent[0]?.text ?? "";
+		expect(output).toContain("Target narrator (working)");
+		expect(output).toContain("Project One");
+		expect(output).not.toContain("Secret team");
+		expect(output).not.toContain("team-coordinator");
+		expect(output).not.toContain("👥");
+	});
+
+	it("answers 'no recent tabs' when the only tab is a team", async () => {
+		seedFixture();
+		db.delete(userRecentTabs).run();
+		seedTeamTab();
+		const sent: Array<{ chatId: string; text: string }> = [];
+		const adapter = createAdapter(sent);
+		const instance = gateway as unknown as GatewayTestAccess;
+		instance.adapters.set("webhook", adapter);
+
+		await instance.handleListCommand(listMessage(), adapter, "en");
+		expect(sent).toHaveLength(1);
+		expect(sent[0]?.text).not.toContain("Secret team");
+		expect(sent[0]?.text).not.toContain("[1]");
 	});
 
 	it("suppresses the recent-tab IM ping when the done event carries backgroundWorkActive", async () => {
