@@ -59,8 +59,10 @@ test("unlimited balances do not become zero or exhausted", () => {
 test("preserves stale values and safe errors without looking at template-private detail", () => {
 	const value = { ...snapshot, error: "Quota refresh failed", detail: { secret: "NEVER RENDER" } };
 	const text = quotaSnapshotText(value, t);
-	expect(text.detailsText).toContain("Quota refresh failed");
+	expect(text.detailsText).not.toContain("Quota refresh failed");
+	expect(text.detailsText).toContain("Last refresh failed");
 	expect(text.detailsText).toContain("figures may be out of date");
+	expect(text.detailsText).toContain("9.999999 USD");
 	expect(text.detailsText).not.toContain("NEVER RENDER");
 	expect(text.detailsText).toContain("1970-01-01T00:30:00.000Z");
 	expect(quotaSnapshotView({ ...snapshot, hasError: true }, "", t).failed).toBe(true);

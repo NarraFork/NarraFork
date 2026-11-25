@@ -58,6 +58,51 @@ describe("unified model-menu quota badges", () => {
 		}
 	});
 
+	test("NUG menu balance follows newer stream spending and then a newer paid probe", () => {
+		const probe = entry(
+			"nug",
+			snapshot({ scope: "wallet", fetchedAt: 100, balances: [{ unit: "", remaining: 10 }] }),
+			{ source: "probe" },
+		);
+		const stream = entry(
+			"nug",
+			snapshot({ scope: "wallet", fetchedAt: 200, balances: [{ unit: "", remaining: 9 }] }),
+			{ source: "quota_balance" },
+		);
+		for (const values of [
+			[probe, stream],
+			[stream, probe],
+		])
+			expect(buildModelMenuProviderBadges(values, 1_000, t).providerBalances?.nug.text).toBe("9");
+		const paid = entry(
+			"nug",
+			snapshot({ scope: "wallet", fetchedAt: 300, balances: [{ unit: "", remaining: 11 }] }),
+			{ source: "probe" },
+		);
+		expect(buildModelMenuProviderBadges([stream, paid], 1_000, t).providerBalances?.nug.text).toBe(
+			"11",
+		);
+		expect(probe.snapshot?.balances[0]?.remaining).toBe(10);
+		expect(stream.snapshot?.balances[0]?.remaining).toBe(9);
+	});
+
+	test("an observed unknown relay never gains a positive menu balance from stream text", () => {
+		const probe = entry(
+			"relay",
+			snapshot({ fetchedAt: 100, windows: [{ kind: "weekly", usedRatio: null, resetsAt: null }] }),
+			{ source: "probe" },
+		);
+		const stream = entry(
+			"relay",
+			snapshot({ fetchedAt: 200, balances: [{ unit: "USD", remaining: 9 }] }),
+			{ source: "quota_balance" },
+		);
+		const result = buildModelMenuProviderBadges([probe, stream], 1_000, t);
+		expect(result.providerBalances).toBeUndefined();
+		expect(result.providerBadges?.relay.bars?.[0]?.remainingPercent).toBeNull();
+		expect(result.providerBadges?.relay.text).not.toContain("9 USD");
+	});
+
 	test("stream never replaces valid probe windows, regardless of entry order", () => {
 		const probe = entry(
 			"kimi-code",

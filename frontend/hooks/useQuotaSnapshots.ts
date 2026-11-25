@@ -76,46 +76,61 @@ export async function invalidateQuotaSnapshots(client: QueryClient): Promise<voi
 	await client.invalidateQueries({ queryKey: cliQuotaKey });
 }
 
-/** Select numerical data per credential, retaining the direct probe's validity and window metadata. */
+/** Only comparable NUG wallet observations may update a probe's authoritative display. */
 export function selectQuotaEntries(entries: QuotaSnapshotEntry[]): QuotaSnapshotEntry[] {
 	const selected = new Map<string, QuotaSnapshotEntry>();
 	const probes = new Map<string, QuotaSnapshotEntry>();
+	const streams = new Map<string, QuotaSnapshotEntry>();
 	for (const entry of entries) {
 		const key = JSON.stringify([entry.groupId, entry.credentialId]);
 		if ((entry.source ?? "probe") === "probe") probes.set(key, entry);
-		const previous = selected.get(key);
-		const hasData = (value: QuotaSnapshotEntry) =>
-			!!value.snapshot &&
-			(value.snapshot.windows.some((window) =>
-				[window.usedRatio, window.used, window.total, window.remaining].some(Number.isFinite),
-			) ||
-				value.snapshot.balances.some(
-					(balance) =>
-						balance.unlimited || (balance.remaining != null && Number.isFinite(balance.remaining)),
-				));
-		if (
-			!previous ||
-			((entry.source ?? "probe") === "probe" && hasData(entry)) ||
-			(!((previous.source ?? "probe") === "probe" && hasData(previous)) && hasData(entry))
-		) {
-			selected.set(key, entry);
-		}
+		else streams.set(key, entry);
+		if (!selected.has(key)) selected.set(key, entry);
 	}
-	return [...selected].map(([key, entry]) => {
+	return [...selected].map<QuotaSnapshotEntry>(([key, entry]) => {
 		const probe = probes.get(key);
-		if (entry.source !== "quota_balance" || !entry.snapshot || !probe?.snapshot) return entry;
+		const stream = streams.get(key);
+		if (probe?.supported === false) return probe;
+		// A missing probe may use the stream; an observed unknown/error is not missing.
+		if (!probe?.snapshot) return stream?.snapshot ? stream : (probe ?? entry);
+		if (!stream?.snapshot) return probe;
 		const metadata = probe.snapshot;
+		const observed = stream.snapshot;
+		const balance = metadata.balances[0];
+		const reported = observed.balances[0];
+		if (
+			probe.templateId !== "nug" ||
+			stream.templateId !== "nug" ||
+			metadata.scope !== "wallet" ||
+			observed.scope !== "wallet" ||
+			metadata.error ||
+			metadata.hasError ||
+			observed.error ||
+			observed.hasError ||
+			!Number.isFinite(metadata.fetchedAt) ||
+			metadata.fetchedAt <= 0 ||
+			!Number.isFinite(observed.fetchedAt) ||
+			observed.fetchedAt <= metadata.fetchedAt ||
+			metadata.balances.length !== 1 ||
+			observed.balances.length !== 1 ||
+			!balance ||
+			!reported ||
+			balance.unit !== reported.unit ||
+			balance.unlimited ||
+			reported.unlimited ||
+			balance.remaining == null ||
+			reported.remaining == null ||
+			!Number.isFinite(balance.remaining) ||
+			!Number.isFinite(reported.remaining)
+		)
+			return probe;
 		return {
-			...entry,
-			...(probe.primary !== undefined ? { primary: probe.primary } : {}),
+			...probe,
+			source: "quota_balance",
 			snapshot: {
-				...entry.snapshot,
-				scope: metadata.scope,
-				...(Number.isFinite(metadata.expiresAt) ? { expiresAt: metadata.expiresAt } : {}),
-				...(metadata.plan ? { plan: metadata.plan } : {}),
-				...(metadata.windows.length ? { windows: metadata.windows } : {}),
-				...(metadata.error ? { error: metadata.error } : {}),
-				...(metadata.hasError ? { hasError: true } : {}),
+				...metadata,
+				fetchedAt: observed.fetchedAt,
+				balances: [{ ...balance, ...reported }],
 			},
 		};
 	});
