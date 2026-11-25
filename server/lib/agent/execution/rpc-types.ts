@@ -446,6 +446,8 @@ export interface SessionInfo {
 	exitCode?: number;
 	startedAt: string;
 	exitedAt?: string;
+	/** exec sessions: the executor's own deadline stopped the command. */
+	timedOut?: boolean;
 	/** Oldest retained output byte. */
 	firstSeq: number;
 	/** Next output byte to be written. */
@@ -460,6 +462,8 @@ export interface SessionAttachParams {
 export interface SessionAttachResult {
 	exitCode: number;
 	endSeq: number;
+	/** exec sessions: the executor's own deadline stopped the command. */
+	timedOut?: boolean;
 }
 
 export interface SessionWriteParams {

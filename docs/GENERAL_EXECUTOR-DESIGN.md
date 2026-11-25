@@ -164,7 +164,10 @@ NarraFork 侧对应展示：缺口在终端里显示为一行提示（"有 N 字
 - 设备同时声明 `session.durable.v1` 与 `session.exec.v1` 时，后台 Bash（`task` 与 `service`）改用 `session.open { kind:"exec" }`；前台 Bash 仍走 `exec.start`。旧路径的超时是 RPC 超时（默认 120 秒），会话路径用后台任务自己的超时，执行器端同时强制。
 - 会话 ID 固定为 `nf-bash-<taskId>`；打开前把 `{deviceId, sessionId, timeoutMs, startedAt}` 写进 `background_tasks.executor_session_json`（SQLite 0267、PG 0084）。
 - 输出只在内存里，所以重启接管时从序号 0 重放执行器仍保留的部分（最多 4 MiB，更早的以缺口提示标明）；剩余超时按 `startedAt + timeoutMs` 计算。
-- 停止与释放复用终端的持久清理记录（`executor_session_cleanups`）：取消/超时先写记录再停止读取，不等设备；自然结束在任务终态写入后才释放。
+- 停止与释放复用终端的持久清理记录（`executor_session_cleanups`）：取消/超时先写记录再停止读取，不等设备，`session.kill` 等 open 有结果后才发；自然结束在任务终态写入后才释放。执行器对还在启动的会话收到 kill 时记下、进程一起来就停。
+- `session.open` 回复丢失时不重发（执行器若已重启会把命令再跑一遍），用 `session.info` 对账：在就接管，不在就记清理意图并报启动未确认。
+- 超时以执行器为准：退出结果带 `timedOut`；NarraFork 自己的计时延后 30 秒兜底，所以重启时已过期限但按时完成的命令仍算完成。
+- NarraFork 关机（含 SIGTERM）只脱离，不停止命令，行保持 running，下次启动重新附着；与远端终端一致。
 - 执行器已没有该会话（执行器重启）时任务以失败结束，并在输出里说明原因。
 
 **本地终端**（第二期）

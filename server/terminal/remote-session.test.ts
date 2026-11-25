@@ -121,6 +121,9 @@ function fakeExecutor(retain = 1 << 20) {
 						pump(a);
 					});
 				}
+				case "session.info":
+					if (!state.opened) return Promise.reject(new Error("session not found"));
+					return Promise.resolve({ sessionId: params.sessionId, state: "running" });
 				case "session.write": {
 					const id = params.writeId as string;
 					if (!state.seen.has(id)) {
@@ -421,6 +424,69 @@ describe("spawnRemoteSession", () => {
 		expect(text).toBe("\n[NarraFork: 6 bytes of output were not retained by the device]\n6789");
 		expect(chunks.at(-1)?.seq).toBe(12);
 		expect(lost).toEqual([]);
+	});
+
+	test("a command whose open reply was lost is confirmed, never sent twice", async () => {
+		const exec = fakeExecutor();
+		exec.state.loseNextOpenAck = true;
+		const runtime = spawnRemoteSession(
+			DEVICE,
+			"nf-bash-2",
+			{ open: { kind: "exec", command: "deploy", cwd: "/w" }, since: 0, onBytes: () => {} },
+			{ ...exec, openTimeoutMs: 2_000 },
+		);
+		await Bun.sleep(20);
+		exec.reconnect();
+		await runtime.ready;
+		const methods = exec.state.calls.map((call) => call.method);
+		expect(methods.filter((method) => method === "session.open")).toHaveLength(1);
+		expect(methods).toContain("session.info");
+		runtime.detach();
+	});
+
+	test("an executor that lost the command after a lost open reply leaves the start unknown", async () => {
+		const exec = fakeExecutor();
+		exec.state.loseNextOpenAck = true;
+		const runtime = spawnRemoteSession(
+			DEVICE,
+			"nf-bash-3",
+			{ open: { kind: "exec", command: "deploy", cwd: "/w" }, since: 0, onBytes: () => {} },
+			{ ...exec, openTimeoutMs: 2_000 },
+		);
+		await Bun.sleep(20);
+		// The executor restarted: it no longer knows the session.
+		exec.state.opened = false;
+		exec.reconnect();
+		const error = await (runtime.ready ?? Promise.resolve()).then(
+			() => null,
+			(e: unknown) => e,
+		);
+		expect(error).toBeInstanceOf(RemoteSessionOpenUnknownError);
+		expect(exec.state.calls.filter((call) => call.method === "session.open")).toHaveLength(1);
+	});
+
+	test("the executor's own deadline is reported with the exit", async () => {
+		const exec = fakeExecutor();
+		const exits: unknown[] = [];
+		const runtime = spawnRemoteSession(
+			DEVICE,
+			"nf-bash-4",
+			{
+				open: { kind: "exec", command: "sleep 9", cwd: "/w", timeoutMs: 10 },
+				since: 0,
+				onBytes: () => {},
+				onExit: (exit) => exits.push(exit),
+			},
+			{
+				...exec,
+				sendRpc: (deviceId, method, params, options) =>
+					method === "session.attach"
+						? Promise.resolve({ exitCode: 137, endSeq: 0, timedOut: true })
+						: exec.sendRpc(deviceId, method, params, options),
+			},
+		);
+		expect(await runtime.exited).toBe(137);
+		expect(exits).toEqual([{ exitCode: 137, timedOut: true }]);
 	});
 
 	test("a session the executor no longer has is reported as lost", async () => {

@@ -78,8 +78,9 @@ type execProcess struct {
 	closeOnce sync.Once
 	deadline  *time.Timer
 
-	mu     sync.Mutex
-	reaped bool
+	mu       sync.Mutex
+	reaped   bool
+	timedOut bool
 }
 
 // startExecProcess starts cmdArgs with stdin from /dev/null. A positive timeout
@@ -105,7 +106,14 @@ func startExecProcess(cmdArgs []string, cwd string, env []string, timeout time.D
 	_ = w.Close()
 	p := &execProcess{cmd: cmd, out: r}
 	if timeout > 0 {
-		p.deadline = time.AfterFunc(timeout, func() { _ = p.Kill() })
+		p.deadline = time.AfterFunc(timeout, func() {
+			p.mu.Lock()
+			if !p.reaped {
+				p.timedOut = true
+			}
+			p.mu.Unlock()
+			_ = p.Kill()
+		})
 	}
 	return p, nil
 }
@@ -140,6 +148,13 @@ func (p *execProcess) Wait() int {
 		p.deadline.Stop()
 	}
 	return exitCodeFromError(err, p.cmd)
+}
+
+// TimedOut reports whether the deadline stopped the command (session.DeadlineReporter).
+func (p *execProcess) TimedOut() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.timedOut
 }
 
 func (p *execProcess) Close() error {

@@ -16,7 +16,7 @@ import {
 	type RemoteSessionRuntime,
 	spawnRemoteSession,
 } from "../terminal/remote-session";
-import { stopExecutorSession } from "./executor-session-cleanup";
+import { recordExecutorCleanup, stopExecutorSession } from "./executor-session-cleanup";
 
 /** Executor session id for a background task: deterministic, so a restart finds it. */
 export function backgroundSessionId(taskId: string): string {
@@ -41,6 +41,8 @@ export class RemoteSessionExecHandle implements ExecHandle {
 	private incomplete = false;
 	private exitedFlag = false;
 	private stopRequested = false;
+	private detached = false;
+	private executorTimedOut = false;
 
 	constructor(
 		readonly binding: ExecutorSessionBinding,
@@ -58,6 +60,9 @@ export class RemoteSessionExecHandle implements ExecHandle {
 				onBytes: (chunk) => this.deliver(chunk),
 				onGap: () => {
 					this.incomplete = true;
+				},
+				onExit: ({ timedOut }) => {
+					this.executorTimedOut = timedOut;
 				},
 				onLost: (reason) => {
 					this.incomplete = true;
@@ -111,19 +116,28 @@ export class RemoteSessionExecHandle implements ExecHandle {
 		return this.incomplete;
 	}
 
+	/** The executor's own deadline stopped the command (it enforces the task's timeout). */
+	timedOut(): boolean {
+		return this.executorTimedOut;
+	}
+
 	/**
 	 * Stop the command. The intent is durable before anything else happens, so a
-	 * device that is away (or a restart) cannot leave it running; reading stops at
-	 * once instead of waiting for the device to confirm.
+	 * device that is away (or a restart) cannot leave it running, and reading stops
+	 * at once instead of waiting for the device. The stop itself is sent only once
+	 * the open has an answer: an executor that has not seen the open yet would
+	 * report the session unknown and the stop would be dropped.
 	 */
 	async kill(): Promise<void> {
-		if (this.stopRequested) return;
+		if (this.stopRequested || this.detached) return;
 		this.stopRequested = true;
 		try {
-			await stopExecutorSession(this.binding.deviceId, this.binding.sessionId);
+			await recordExecutorCleanup(this.binding.deviceId, this.binding.sessionId);
 		} finally {
 			this.runtime.kill();
 		}
+		await this.ready.catch(() => {});
+		await stopExecutorSession(this.binding.deviceId, this.binding.sessionId);
 	}
 
 	/** The task's result is persisted: the executor may forget the session now. */
@@ -134,8 +148,13 @@ export class RemoteSessionExecHandle implements ExecHandle {
 		await stopExecutorSession(this.binding.deviceId, this.binding.sessionId);
 	}
 
-	/** Stop reading without touching the command (handover to a later process). */
-	detach(): void {
+	/**
+	 * This server is shutting down; the command belongs to the executor and keeps
+	 * running. Stop reading without stopping it, and ignore any later kill from the
+	 * shutdown, so the next server process re-attaches to it.
+	 */
+	detachForShutdown(): void {
+		this.detached = true;
 		this.runtime.detach();
 	}
 }

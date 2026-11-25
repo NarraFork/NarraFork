@@ -582,6 +582,8 @@ class BackgroundTaskService {
 	private abortControllers: Map<string, AbortController>;
 	/** Kill handlers for bash processes (sends SIGTERM/SIGKILL) */
 	private killHandlers: Map<string, () => void>;
+	/** Collectors whose process outlives this server: detached, not killed, on shutdown. */
+	private shutdownDetaches = new Map<string, () => void>();
 	/** In-memory output chunk buffers for streaming bash output (joined on read) */
 	private outputChunks: Map<string, string[]>;
 	/** Accumulated byte length per task (for enforcing MAX_MEMORY_OUTPUT_BYTES) */
@@ -3620,6 +3622,17 @@ class BackgroundTaskService {
 	}
 
 	private stopBashProcess(taskId: string, controller?: AbortController): void {
+		const detach = this.shutdownDetaches.get(taskId);
+		if (detach) {
+			// The executor keeps running it; the next server process re-attaches.
+			this.bashLifecycle.preserveTask(taskId);
+			try {
+				detach();
+			} catch (error) {
+				logger.warn("Detach error during Bash shutdown", { taskId, error: String(error) });
+			}
+			return;
+		}
 		controller?.abort();
 		try {
 			this.killHandlers.get(taskId)?.();
@@ -3860,6 +3873,15 @@ class BackgroundTaskService {
 		const updated = await pub.finalizeTakeover({ taskId, hasError, output, now });
 		this.cleanupRuntime(taskId);
 		if (updated) this.queueTaskUpsert(updated.parentNarratorId, taskId);
+	}
+
+	/**
+	 * Register how to stop observing a collector whose process outlives this server (an
+	 * executor session). Shutdown then detaches it instead of killing it, and leaves its
+	 * row running for the next server process.
+	 */
+	registerShutdownDetach(taskId: string, detach: () => void): void {
+		this.shutdownDetaches.set(taskId, detach);
 	}
 
 	registerKillHandler(taskId: string, handler: () => void): void {
@@ -5282,6 +5304,7 @@ class BackgroundTaskService {
 		if (!this.ownsAbortController(taskId, expectedAbortController)) return;
 		this.abortControllers.delete(taskId);
 		this.killHandlers.delete(taskId);
+		this.shutdownDetaches.delete(taskId);
 		this.outputChunks.delete(taskId);
 		this.outputByteCounts.delete(taskId);
 		this.parentNarratorCache.delete(taskId);

@@ -1184,7 +1184,13 @@ export interface MonitorBackgroundBashOptions {
  * Shared by fresh launches and by services a restarted server re-attached to.
  */
 export async function monitorBackgroundBash(opts: MonitorBackgroundBashOptions): Promise<void> {
-	const { taskId, handle, bgAbort, backgroundKind, timeoutMs } = opts;
+	const { taskId, handle, bgAbort, backgroundKind } = opts;
+	// A process that enforces the deadline itself (an executor session) reports whether it
+	// hit it; this side only steps in after a grace period, e.g. when the device is away.
+	const timeoutMs =
+		opts.timeoutMs !== undefined && handle.timedOut
+			? Math.max(opts.timeoutMs, 0) + EXECUTOR_DEADLINE_GRACE_MS
+			: opts.timeoutMs;
 	let timedOut = false;
 	let terminalStarted = false;
 	try {
@@ -1192,6 +1198,10 @@ export async function monitorBackgroundBash(opts: MonitorBackgroundBashOptions):
 		let outputTruncated = false;
 		const killFn = () => handle.kill();
 		backgroundTaskService.registerKillHandler(taskId, () => void killFn());
+		if (handle.detachForShutdown) {
+			const detach = handle.detachForShutdown.bind(handle);
+			backgroundTaskService.registerShutdownDetach(taskId, detach);
+		}
 
 		const bgDecoder = createStreamDecoder();
 		const appendOutput = (raw: Uint8Array) => {
@@ -1281,6 +1291,13 @@ export async function monitorBackgroundBash(opts: MonitorBackgroundBashOptions):
 		}
 
 		const exitCode = resolvedExitCode ?? 1;
+		if (!timedOut && (handle as ExecHandle).timedOut?.()) {
+			timedOut = true;
+			backgroundTaskService.appendOutput(
+				taskId,
+				"\n\n<bash_metadata>\nBackground command timed out\n</bash_metadata>",
+			);
+		}
 		if (watchdogKilled) {
 			backgroundTaskService.appendOutput(
 				taskId,
@@ -1360,6 +1377,9 @@ export async function monitorBackgroundBash(opts: MonitorBackgroundBashOptions):
 		if (terminalCommitted) await releaseAfterTerminal(taskId, handle);
 	}
 }
+
+/** How long past the deadline this server waits for an executor's own timeout verdict. */
+export const EXECUTOR_DEADLINE_GRACE_MS = 30_000;
 
 /** Let a handle that keeps output outside this process release it; never fails the task. */
 async function releaseAfterTerminal(taskId: string, handle: ExecHandle): Promise<void> {

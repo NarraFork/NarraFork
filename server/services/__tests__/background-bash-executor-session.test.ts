@@ -29,10 +29,16 @@ let attach:
 	  }
 	| undefined;
 let attachFailure: Error | undefined;
+let heldOpen: ((value: unknown) => void) | undefined;
+let holdOpen = false;
 
 const defaultRpc: typeof deviceConnections.sendRpc = (_deviceId, method, params, options) => {
 	calls.push({ method, params, options });
 	order.push(method);
+	if (method === "session.open" && holdOpen)
+		return new Promise((resolve) => {
+			heldOpen = resolve;
+		});
 	if (method === "session.attach") {
 		if (attachFailure) return Promise.reject(attachFailure);
 		return new Promise((resolve, reject) => {
@@ -69,7 +75,14 @@ function cleanups() {
 	return db.select().from(executorSessionCleanups).all();
 }
 
-async function runningTask(id: string, backgroundKind: "task" | "service" = "task") {
+async function runningTask(
+	id: string,
+	backgroundKind: "task" | "service" = "task",
+	timing: { timeoutMs: number; startedAt: string } = {
+		timeoutMs: 600_000,
+		startedAt: new Date().toISOString(),
+	},
+) {
 	await backgroundTaskService.createBashTask({
 		id,
 		parentNarratorId: PARENT,
@@ -79,8 +92,7 @@ async function runningTask(id: string, backgroundKind: "task" | "service" = "tas
 	await backgroundTaskService.bindExecutorSession(id, {
 		deviceId: DEVICE,
 		sessionId: backgroundSessionId(id),
-		timeoutMs: 600_000,
-		startedAt: new Date().toISOString(),
+		...timing,
 	});
 }
 
@@ -89,6 +101,8 @@ beforeEach(() => {
 	order.length = 0;
 	attach = undefined;
 	attachFailure = undefined;
+	heldOpen = undefined;
+	holdOpen = false;
 	online = true;
 	features = ["session.durable.v1", "session.exec.v1"];
 	sendRpc.mockImplementation(defaultRpc);
@@ -216,5 +230,65 @@ describe("remote background Bash on durable executor sessions", () => {
 		expect(
 			calls.filter((call) => call.method === "session.kill").map((call) => call.params),
 		).toEqual([{ sessionId: "nf-bash-bash_away", release: true }]);
+	});
+
+	test("a command that finished on time is completed even when the restart comes after its deadline", async () => {
+		await runningTask("bash_late", "task", {
+			timeoutMs: 60_000,
+			startedAt: new Date(Date.now() - 90_000).toISOString(),
+		});
+		await backgroundTaskService.recoverStaleTasksAfterRestart();
+		await until(() => attach !== undefined);
+		attach?.stream("session.data", encode("build ok\n"));
+		attach?.end({ exitCode: 0, endSeq: 9 });
+		await until(() => row("bash_late")?.status === "completed");
+		expect(row("bash_late")?.output).toContain("build ok");
+		expect(calls.filter((call) => call.method === "session.kill")).toEqual([
+			expect.objectContaining({ params: { sessionId: "nf-bash-bash_late", release: true } }),
+		]);
+	});
+
+	test("the executor's deadline verdict times the task out with its output", async () => {
+		await runningTask("bash_deadline");
+		await backgroundTaskService.recoverStaleTasksAfterRestart();
+		await until(() => attach !== undefined);
+		attach?.stream("session.data", encode("still going\n"));
+		attach?.end({ exitCode: 137, endSeq: 12, timedOut: true });
+		await until(() => row("bash_deadline")?.status === "timeout");
+		expect(row("bash_deadline")?.output).toContain("still going");
+		expect(row("bash_deadline")?.output).toContain("Background command timed out");
+	});
+
+	test("a stop is sent only once the open has an answer", async () => {
+		holdOpen = true;
+		const { RemoteSessionExecHandle } = await import("../remote-session-exec");
+		const handle = new RemoteSessionExecHandle(
+			{ deviceId: DEVICE, sessionId: "nf-bash-bash_race", startedAt: now },
+			{ open: { kind: "exec", command: "make build", cwd: "/work" } },
+		);
+		await until(() => heldOpen !== undefined);
+		const killed = handle.kill();
+		await until(() => cleanups().length === 1);
+		// The open is still in flight: an executor that has not seen it would answer
+		// "not found" and the stop would be dropped.
+		await Bun.sleep(20);
+		expect(calls.some((call) => call.method === "session.kill")).toBe(false);
+		heldOpen?.({});
+		await killed;
+		await until(() => calls.some((call) => call.method === "session.kill"));
+		await until(() => cleanups().length === 0);
+	});
+
+	// Last: shutting down stops Bash admission for the rest of this process.
+	test("shutting this server down detaches the command instead of stopping it", async () => {
+		await runningTask("bash_shutdown", "service");
+		await backgroundTaskService.recoverStaleTasksAfterRestart();
+		await until(() => attach !== undefined);
+		backgroundTaskService.stopBashCollectors();
+		await Bun.sleep(30);
+		expect(calls.some((call) => call.method === "session.kill")).toBe(false);
+		expect(cleanups()).toEqual([]);
+		expect(row("bash_shutdown")?.status).toBe("running");
+		await backgroundTaskService.drainBashCollectors({ deadlineAt: Date.now() + 1_000 });
 	});
 });

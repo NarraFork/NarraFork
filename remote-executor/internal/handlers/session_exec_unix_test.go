@@ -62,7 +62,7 @@ func TestExecSessionCapturesBothStreamsAndExitCode(t *testing.T) {
 		t.Fatal(err)
 	}
 	out, result := attachAll(t, h, "exec-1", 0)
-	if result.ExitCode != 3 {
+	if result.ExitCode != 3 || result.TimedOut {
 		t.Fatalf("exit = %+v", result)
 	}
 	resolved, _ := filepath.EvalSymlinks(root)
@@ -120,8 +120,8 @@ func TestExecSessionDeadlineStopsTheCommandAndItsChildren(t *testing.T) {
 	child := readPID(t, childPath)
 	waitUntil(t, func() bool { return syscall.Kill(child, 0) != nil })
 	_, result := attachAll(t, h, "exec-3", 0)
-	if result.ExitCode == 0 {
-		t.Fatalf("a command stopped at its deadline must not report success: %+v", result)
+	if result.ExitCode == 0 || !result.TimedOut {
+		t.Fatalf("a command stopped at its deadline must report the timeout: %+v", result)
 	}
 }
 

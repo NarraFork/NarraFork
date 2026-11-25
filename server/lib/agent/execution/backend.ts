@@ -318,6 +318,17 @@ export interface ExecHandle {
 	 * keeps output elsewhere (an executor session) releases it here, not before.
 	 */
 	afterTerminalCommitted?(): Promise<void>;
+	/**
+	 * Present when the process enforces the timeout itself (an executor session): after
+	 * `exited`, true when that deadline stopped it. The owner then waits a grace period
+	 * past its own deadline so the process's verdict, and its final output, wins.
+	 */
+	timedOut?(): boolean;
+	/**
+	 * Present when the process outlives this server (an executor session): stop
+	 * observing on shutdown without stopping it, so a restarted server re-attaches.
+	 */
+	detachForShutdown?(): void;
 }
 
 /** Parameters for git diff. */

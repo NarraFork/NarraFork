@@ -105,6 +105,8 @@ export interface RemoteSessionOptions {
 	 * revoked device, failed open). Not called for detach or kill.
 	 */
 	onLost?: (reason: string) => void;
+	/** The executor reported the exit; `timedOut` when its own deadline stopped an exec session. */
+	onExit?: (exit: { exitCode: number | null; timedOut: boolean }) => void;
 }
 
 export interface RemoteSessionRuntime extends TerminalRuntime {
@@ -274,12 +276,14 @@ export function spawnRemoteSession(
 					"session.attach",
 					{ sessionId, since: consumed },
 					{ ...rpcOpts, signal: attach.signal, longLived: true, onStream },
-				)) as { exitCode?: number };
+				)) as { exitCode?: number; timedOut?: boolean };
 				if (stopped) return;
 				const tail = decoder.decode();
 				if (tail) opts.onData?.(tail, consumed);
 				// Not released here: the owner releases after persisting the final state.
-				finish(typeof result?.exitCode === "number" ? result.exitCode : null);
+				const exitCode = typeof result?.exitCode === "number" ? result.exitCode : null;
+				opts.onExit?.({ exitCode, timedOut: result?.timedOut === true });
+				finish(exitCode);
 				return;
 			} catch (error) {
 				if (stopped) return;
@@ -364,8 +368,36 @@ export function spawnRemoteSession(
 	}
 
 	/**
+	 * A command's lost open reply is reconciled, never resent: an executor that
+	 * restarted meanwhile no longer knows the session, and opening it again would
+	 * run the command a second time. Present: adopted. Absent: the start stays
+	 * unknown (the caller keeps a stop intent).
+	 */
+	async function confirmExecOpen(cause: string) {
+		const deadline = Date.now() + openTimeoutMs;
+		let reason = cause;
+		for (;;) {
+			const remaining = deadline - Date.now();
+			if (remaining <= 0 || !(await waitOnlineWithin(remaining)))
+				throw new RemoteSessionOpenUnknownError(sessionId, reason);
+			try {
+				await sendRpc(deviceId, "session.info", { sessionId }, rpcOpts);
+				return;
+			} catch (error) {
+				reason = error instanceof Error ? error.message : String(error);
+				if (!isConnectionLoss(error))
+					throw new RemoteSessionOpenUnknownError(
+						sessionId,
+						`${cause}; the device does not report the session (${reason}), and the command is not sent again`,
+					);
+			}
+		}
+	}
+
+	/**
 	 * A lost reply does not mean the shell did not start. Retry once the device is
 	 * back: "already exists" then proves the earlier open landed and is adopted.
+	 * (A command without a terminal is reconciled instead, see confirmExecOpen.)
 	 */
 	async function openSession(open: NonNullable<RemoteSessionOptions["open"]>) {
 		const deadline = Date.now() + openTimeoutMs;
@@ -385,6 +417,7 @@ export function spawnRemoteSession(
 				const message = error instanceof Error ? error.message : String(error);
 				if (sent && message.includes("already exists")) return;
 				if (!isConnectionLoss(error)) throw error;
+				if (open.kind === "exec") return confirmExecOpen(message);
 				sent = true;
 				const remaining = deadline - Date.now();
 				if (remaining <= 0 || !(await waitOnlineWithin(remaining)))

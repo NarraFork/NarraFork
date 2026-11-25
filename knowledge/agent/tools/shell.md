@@ -61,7 +61,7 @@ verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 - 并行：同一轮里 Bash 默认串行，仅 `parallel: true` 且未设 `strict_serial` 才能与同组并发（`shared/tool-parallel-groups.ts:isBashParallelOptIn`）。
 - 后台：`run_in_background: true`；`background_kind` 为 `task`（默认，构建/测试）或 `service`（dev/preview/watch 服务，必须配合后台运行；service 不关闭超时，非请求的退出——即使退出码 0——算失败）。取消用 `Stop({type:"bash", id})`，Bash 只负责启动。运行中可更新超时（`updateBashTimeout`，钳到 1000ms 以上）。
 - 后台 Bash 在远程设备上：执行器支持 `session.exec.v1` 时命令跑在执行器的持久会话里，断线和 NarraFork 重启都不会停止它，重启后按 `background_tasks.executor_session_json` 重新附着（task 和 service 都是）；细节见 [设备与远程执行](../../remote/devices.md)。本地只有 `service` 能跨重启（`durable-service.ts`）。
-- `BackgroundBashLifecycle` 管后台 Bash 的收集器与终态写入：`stop()` 后拒绝新准入；`preserveProcesses` 时已启动进程被保留，尚在准备阶段的任务仍需把任务行结算（`services/background-bash-lifecycle.ts`）。
+- `BackgroundBashLifecycle` 管后台 Bash 的收集器与终态写入：`stop()` 后拒绝新准入；`preserveProcesses` 时已启动进程被保留，尚在准备阶段的任务仍需把任务行结算；`preserveTask` 让单个任务（执行器会话里的远端命令）不论关机方式都只脱离、不写终态（`services/background-bash-lifecycle.ts`）。
 - Await：工具已退役，执行器（`tool-executor.ts`）与 `tools/await.ts` 都只返回「Await is retired」错误，提示改用 Watch；它不在 `tools/index.ts` 的注册清单中，`listRunningAwaits` 恒返回空。`services/await-agent-resolution.ts` 仍被 `narrator-messages.ts` 引用，用于解析历史里仍在运行的 `Await({type:"agent"})` 调用的目标（只服务旧数据，不要给新功能用）。解析时跳过已归档叙述者，其别名不再链到那次调用。
 - Watch：对 terminal / 后台 bash / agent 注册非阻塞观察，立即返回句柄；匹配文本、完成或超时通过邮箱送达。默认超时 600000ms，最大 86,400,000ms（`watch-observation.ts`）。超时只结束观察，不停止目标；已结束的目标立即返回保存的结果；agent 观察不支持 `pattern`；`start_at` 只用于 terminal。
 - Stop：只取消本叙述者拥有的后台 bash 或 agent，不能停服务器或任意 PID；取消前重新校验 OAuth 工具能力。
