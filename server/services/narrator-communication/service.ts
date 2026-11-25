@@ -106,9 +106,15 @@ async function assertCommunicationEndpointAuthorized(
 		);
 		return;
 	}
-	db.transaction((tx) =>
-		assertCommunicationSendAuthorizedTx(tx, source, target, allowArchivedForFailure),
-	);
+	db.transaction((tx) => {
+		const authorized = assertCommunicationSendAuthorizedTx(
+			tx,
+			source,
+			target,
+			allowArchivedForFailure,
+		);
+		return authorized;
+	});
 }
 
 export function assertCommunicationSendAuthorized(source: string, target: string): Promise<void> {
