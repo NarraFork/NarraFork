@@ -296,24 +296,26 @@ export function ProjectRuleList({
 		if (local && !saving.current && storedText !== local.base) setLocal(null);
 	}, [storedText, local]);
 	const rules = local?.rules ?? normalizeRules(stored);
+	// The queue drains from the mutation's promise, not a per-call observer callback: TanStack
+	// Query drops those once the page unmounts, so leaving settings mid-save would lose the
+	// queued list. The promise settles whatever the page's lifetime.
 	const send = (next: Rule[]) => {
 		saving.current = true;
-		update.mutate(
-			{ id: String(project.id), data: { chapterSettings: { [ruleKey]: next } } },
-			{
-				onSuccess: () => {
+		update
+			.mutateAsync({ id: String(project.id), data: { chapterSettings: { [ruleKey]: next } } })
+			.then(
+				() => {
 					const after = queued.current;
 					queued.current = null;
 					if (after) send(after);
 					else saving.current = false;
 				},
-				onError: () => {
+				() => {
 					saving.current = false;
 					queued.current = null;
 					setLocal(null);
 				},
-			},
-		);
+			);
 	};
 	const commit = (next: Rule[]) => {
 		setLocal((current) => ({ rules: next, base: current?.base ?? storedText }));
