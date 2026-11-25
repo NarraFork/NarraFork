@@ -190,9 +190,11 @@ describe("recent-tabs indexed side paths", () => {
 	});
 
 	it("uses narrator/entity membership indexes for title sync and all-user removal", async () => {
+		// Legacy project tabs survive the migration only when pinned (an unpinned one was an
+		// automatic page visit and is dropped), so the project membership is seeded pinned.
 		seedLegacyTabs([
 			makeTab("n-title", { title: "Old title" }),
-			makeTab("project-1", { type: "project" }),
+			makeTab("project-1", { type: "project", pinned: true }),
 		]);
 		seedLegacyTabs(
 			[
@@ -204,7 +206,8 @@ describe("recent-tabs indexed side paths", () => {
 					title: "Old chapter title",
 				}),
 				makeTab("n-title", { title: "Old title" }),
-				makeTab("project-1", { type: "project" }),
+				makeTab("project-1", { type: "project", pinned: true }),
+				makeTab("project-visit", { type: "project" }),
 			],
 			"user-2",
 		);
@@ -212,7 +215,9 @@ describe("recent-tabs indexed side paths", () => {
 			"user-1",
 			"user-2",
 		]);
-		expect(storedKeys("user-2")).toEqual(["narrator:n-title", "project:project-1"]);
+		// One list: the pinned project leads it, the unpinned old visit is gone.
+		expect(storedKeys("user-2")).toEqual(["project:project-1", "narrator:n-title"]);
+		expect(await recentTabs.getRecentTabUserIds("project", "project-visit")).toEqual([]);
 		expect(await recentTabs.getRecentTabUserIdsForNarrator("n-title", 1)).toEqual(["user-1"]);
 		expect(await recentTabs.getRecentTabUserIdsForNarrator("n-title", 0)).toEqual([]);
 		await recentTabs.syncNarratorTitleToRecentTabs("n-title", "New title");
@@ -331,7 +336,7 @@ describe("recent-tabs revisions and deltas", () => {
 		]);
 	});
 
-	it("replays server deltas to the persisted order across mixed-section folder permutations", async () => {
+	it("replays server deltas to the persisted order across project and folder permutations", async () => {
 		const blocks = [
 			[makeTab("p-1", { type: "project" })],
 			[makeTab("n-1")],
@@ -354,13 +359,13 @@ describe("recent-tabs revisions and deltas", () => {
 			const before = await recentTabs.listAllRecentTabs("user-1");
 			const result = await recentTabs.restoreRecentTabs("user-1", { tabs: order.flat() });
 			const persisted = await recentTabs.listAllRecentTabs("user-1");
-			for (const section of ["projects", "work"] as const) {
-				const belongs = (tab: PersistedRecentTab) =>
-					(tab.type === "project") === (section === "projects");
-				expect(
-					reduceRecentTabsOperations(before.filter(belongs), section, result.operations),
-				).toEqual(persisted.filter(belongs));
-			}
+			// Project tabs share the sidebar's one list: every operation replays in `work`, and
+			// the retired `projects` section receives none.
+			expect(reduceRecentTabsOperations(before, "work", result.operations)).toEqual(persisted);
+			expect(reduceRecentTabsOperations([], "projects", result.operations)).toEqual([]);
+			expect(persisted.map((tab) => `${tab.type}:${tab.id}`)).toEqual(
+				order.flat().map((tab) => `${tab.type}:${tab.id}`),
+			);
 		}
 	});
 
@@ -439,28 +444,41 @@ describe("recent-tabs row-level persistence", () => {
 });
 
 describe("recent-tabs pagination and folders", () => {
-	it("places narrator tabs in work and only project tabs in projects", async () => {
+	it("migrates pinned project tabs into work beside narrators; projects stays empty", async () => {
 		seedLegacyTabs([
-			makeTab("project-1", { type: "project" }),
+			makeTab("project-1", { type: "project", pinned: true }),
+			makeTab("project-visit", { type: "project" }),
 			makeTab("narrator-1", { type: "narrator" }),
 		]);
 
 		const projects = await recentTabs.listPage("user-1", "projects");
 		const work = await recentTabs.listPage("user-1", "work");
-		expect(projects.items.map((tab) => `${tab.type}:${tab.id}`)).toEqual(["project:project-1"]);
-		expect(work.items.map((tab) => `${tab.type}:${tab.id}`)).toEqual(["narrator:narrator-1"]);
+		expect(projects.items).toEqual([]);
+		expect(work.items.map((tab) => `${tab.type}:${tab.id}`)).toEqual([
+			"project:project-1",
+			"narrator:narrator-1",
+		]);
+		expect(storedKeys()).toEqual(["project:project-1", "narrator:narrator-1"]);
+		expect(
+			db
+				.select({ section: userRecentTabs.section })
+				.from(userRecentTabs)
+				.all()
+				.every((row) => row.section === "work"),
+		).toBe(true);
 	});
 
 	it("drops legacy chat-group tabs (the feature was removed)", async () => {
 		seedLegacyTabs([
-			makeTab("project-1", { type: "project" }),
+			makeTab("project-1", { type: "project", pinned: true }),
 			makeTab("group-1", { type: "group" }),
 		]);
 
 		const projects = await recentTabs.listPage("user-1", "projects");
 		const work = await recentTabs.listPage("user-1", "work");
-		expect(projects.items.map((tab) => `${tab.type}:${tab.id}`)).toEqual(["project:project-1"]);
-		expect(work.items).toEqual([]);
+		expect(projects.items).toEqual([]);
+		expect(work.items.map((tab) => `${tab.type}:${tab.id}`)).toEqual(["project:project-1"]);
+		expect(storedKeys()).toEqual(["project:project-1"]);
 	});
 
 	it("rejects cursors from another section or stale revision", async () => {

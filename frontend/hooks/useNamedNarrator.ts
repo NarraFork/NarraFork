@@ -22,6 +22,7 @@ export function useUpdateNarratorHandle() {
 			api.updateNarratorHandle(id, handle),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["named-narrators"] });
+			qc.resetQueries({ queryKey: ["named-narrator-suggestions"] });
 			qc.invalidateQueries({ queryKey: ["narrators"] });
 		},
 	});

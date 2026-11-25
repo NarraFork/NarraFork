@@ -9,6 +9,14 @@ anchors:
   - scripts/run-ci-tests.ts
   - .github/workflows/ci.yml
   - tests/scripts/ci-workflow.test.ts
+  - scripts/ci-native-diagnostics.ts
+  - scripts/ci-stage.ts
+  - scripts/summarize-ci-tests.py
+  - tests/scripts/ci-summary.test.ts
+  - server/services/__tests__/run-registration-identity.test.ts
+  - server/db/sqlite-dialect-inventory.guard.test.ts
+  - frontend/components/narrator/spec/SpecImportBanner.test.tsx
+  - frontend/components/plugins/plugin-overlay.browser.test.ts
 keywords:
   - bun test
   - --isolate
@@ -22,6 +30,9 @@ keywords:
   - shard
   - CI Gate
   - junit
+  - NF_CI_STAGE_DIR
+  - ci-stage
+  - GITHUB_STEP_SUMMARY
   - puppeteer-core
   - *.browser.test.ts
   - *.guard.test.ts
@@ -29,7 +40,7 @@ keywords:
   - narrafork-test-
   - HTMLElement.prototype
 status: draft
-verified_at: 2e6441ad0
+verified_at: 9bba5f6cdfe1f1a3602e12806eb8129c34d61716
 ---
 # 测试
 
@@ -42,11 +53,15 @@ verified_at: 2e6441ad0
 - 测试作业会装 zstd/podman/git/ripgrep，拉 `postgres:17-alpine` 镜像，并安装固定版本 Chrome（146.0.7680.31）到 `NF_TEST_CHROMIUM_PATH`；`tests/scripts/ci-workflow.test.ts` 本身断言工作流的权限、动作 pin、各步骤顺序。
 - 浏览器测试：`*.browser.test.ts(x)` 用 `puppeteer-core` + `Bun.build` 打包 `*.browser-fixture.tsx`，在真实 Chrome 中跑（当前约 70 个，例如 `frontend/components/narrator/composer/NarratorComposer.browser.test.ts`）；Chrome 路径取 `NF_TEST_CHROMIUM_PATH`，不存在则 `beforeAll` 抛错。
 - 守卫测试：用 `readFileSync` 读源码文本或枚举目录来保证“某个结构不变量”，命名多为 `*.guard.test.ts`（当前约 30 个，如 `vlist-isolation.guard.test.ts`、`zero-dom-measure.guard.test.ts`、`server/lib/compiled-worker.guard.test.ts`）。它们以字符串引用文件路径，移动/重命名被引用的源文件后类型检查与构建都不会报错，必须全仓搜索旧路径。
+- 轻量 UI 的夹具要 mock 实际新出口：runtime 读取用 `api.getRuntimeSettings` 或播种 `runtimeSettingsQueryOptions().queryKey`（含当前 token 的 `settings-runtime` key），不是旧 `[settings]`；UI prefs 用 `/user-preferences/ui`/`getUIPreferences` 与 `[user-preferences, ui, userId, token]`。先建立测试 token 与 auth/me 身份再播种，typed RuntimeSettings 包括 revision、outline、requestEvidence 和三态 readiness；不要靠旧完整缓存或匿名身份让开关/授权测试假绿（Spec/outline/插件浮层夹具共用该契约）。
+- absolute deadline 测试不能等一个合法地不会出现的 model pass：`run-registration-identity.test.ts` 的 200ms deadline 可能在 Worker 准备阶段已到期，deadline 分支等 terminal 后断言持久 binding 与 timedOut；只有 caller cancellation 分支才等 fake executor 开始。fake executor 等 abort 前先检查 `signal.aborted`，已发生的事件不会向迟注册 listener 重放。保持原 200ms 与测试 5 秒上限，不以延长 deadline/超时掩盖竞态。
+- SQLite 方言守卫按具体源登记，而非放宽整个模块：单会话 Spec 的 JSON1 `json_extract/json_set` 已在 `sqlite-dialect-inventory.guard.test.ts` 为 `server/routes/user-preferences.ts` 精确登记 `handle/json1`。PG 的等价 JSON 点读/原位写仍待 port，不能为过测试退回拉取全部历史 layout map。
 - 数据库相关测试默认走 SQLite；PG 迁移基线有专门测试（`tests/db/pg-*.test.ts`）。
 
 ## 从哪读起
 - `tests/preload.ts`、`tests/sqlite-template.ts`：测试环境隔离。
 - `scripts/run-ci-tests.ts`：CI 如何调用 bun test、输出/超时上限（30 分钟、64MB）。
+- 分片诊断：`run-ci-tests.ts` 经 `scripts/ci-native-diagnostics.ts` 把子进程启动/退出、静默与心跳（静默 60s、心跳 120s）和进程资源采样写进 `artifacts/native-tests*-diagnostics.jsonl`（单文件 256KB 上限）；远程访问浏览器集成测试经 `scripts/ci-stage.ts` 把各阶段（Go peer 构建、Chromium、WebRTC 连接、登录等）的起止写进 `NF_CI_STAGE_DIR` 下的 `ci-stage*.jsonl`（32KB 上限）。分片失败或被取消时，`scripts/summarize-ci-tests.py` 读 JUnit（8MB 上限、拒绝 DTD）和这些 JSONL，把最多 12 条失败（标出超时）写进 GitHub 步骤摘要，不复制测试输出；这些文件随测试报告一起上传（`tests/scripts/ci-summary.test.ts`、`tests/remote-access/ci-stage.test.ts`）。
 - `tests/scripts/ci-workflow.test.ts`：CI 契约。
 - `docs/TESTING.md`：补充背景（仅线索，以代码为准）。
 

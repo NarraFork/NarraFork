@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
+import { MantineProvider } from "@mantine/core";
 import { notifyManager, QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
 	createMemoryHistory,
@@ -18,9 +19,18 @@ import {
 	recentTabsSectionQueryKey,
 } from "../../hooks/useRecentTabs";
 import { api } from "../../lib/api";
+import { appearanceStore } from "../../lib/appearance-preference-store";
+import * as favicon from "../../lib/favicon";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
+import { clearNotifiedAttention } from "../../lib/notification";
+import * as sound from "../../lib/notification-sound";
+import commonEn from "../../locales/en/common.json";
+import { RecentTabDetails } from "./RecentTabDetailCard";
 import { RecentTabsWSProvider } from "./RecentTabs";
 
+const fixtureUser = "recent-tabs-fixture-user";
+const fixtureToken = "recent-tabs-fixture-token";
+const preferencesKey = ["user-preferences", "ui", fixtureUser, fixtureToken] as const;
 const i18n = i18next.createInstance();
 await i18n.init({ lng: "en", resources: { en: { nav: {} } } });
 
@@ -53,6 +63,7 @@ let onListEvent: (event: Record<string, unknown>) => void;
 let onConnection: (connected: boolean, isReconnect: boolean) => void;
 let runtimeRequests: RuntimeRequest[];
 let workTabs: RecentTab[];
+let browserNotifications = 0;
 
 function setTabs(tabs: RecentTab[]) {
 	workTabs = tabs;
@@ -94,7 +105,23 @@ async function resolveRuntime(index: number, patches: RuntimeResult["patches"] =
 beforeEach(() => {
 	const { window } = parseHTML("<!doctype html><html><head></head><body><div></div></body></html>");
 	Object.defineProperty(window.document, "visibilityState", { value: "visible" });
+	Object.defineProperty(window.document, "hasFocus", { value: () => false });
+	browserNotifications = 0;
+	clearNotifiedAttention();
+	class NotificationStub {
+		static permission = "granted";
+		constructor() {
+			browserNotifications++;
+		}
+	}
+	const storage = new Map([["narrafork_token", fixtureToken]]);
 	const globals = {
+		localStorage: {
+			getItem: (key: string) => storage.get(key) ?? null,
+			setItem: (key: string, value: string) => storage.set(key, value),
+			removeItem: (key: string) => storage.delete(key),
+		},
+		Notification: NotificationStub,
 		window,
 		document: window.document,
 		navigator: window.navigator,
@@ -110,8 +137,11 @@ beforeEach(() => {
 	const originals = Object.keys(globals).map(
 		(key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)] as const,
 	);
-	Object.assign(globalThis, globals);
+	for (const [key, value] of Object.entries(globals))
+		Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
+	appearanceStore.activate(null, true);
 	restoreDom = () => {
+		appearanceStore.activate(null, true);
 		for (const [key, descriptor] of originals) {
 			if (descriptor) Object.defineProperty(globalThis, key, descriptor);
 			else Reflect.deleteProperty(globalThis, key);
@@ -147,6 +177,8 @@ beforeEach(() => {
 		return () => {};
 	});
 	client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: Infinity } } });
+	client.setQueryData(["auth", "me"], { id: fixtureUser });
+	client.setQueryData(preferencesKey, {});
 	client.setQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("projects"), {
 		pages: [page([])],
 		pageParams: [undefined],
@@ -160,6 +192,96 @@ afterEach(async () => {
 	notifyManager.setScheduler((callback) => setTimeout(callback, 0));
 	mock.restore();
 	restoreDom();
+});
+
+const statusFrame = (revision: number, extra: Record<string, unknown> = {}) => ({
+	type: "status_change",
+	narratorId: "a",
+	status: "idle",
+	substatus: ["unread"],
+	turnStartedAt: "turn-1",
+	statusEpoch: "server-a",
+	statusRevision: revision,
+	...extra,
+});
+function notificationObservers() {
+	client.setQueryData(preferencesKey, {
+		notifyOnDone: true,
+		notifyOnWaiting: true,
+		notifyPwaEnabled: true,
+		notifySoundEnabled: true,
+	});
+	const plays = spyOn(sound, "playNotificationSound").mockImplementation(() => {});
+	const alerts = spyOn(favicon, "setFaviconAlert").mockImplementation(() => {});
+	spyOn(favicon, "clearFaviconAlert").mockImplementation(() => {});
+	return { plays, alerts };
+}
+
+test.each([
+	"status_change",
+	"status_notification",
+])("state-only rev2 then late %s rev1 notifies once without rolling cache or favicon back", async (type) => {
+	const { plays, alerts } = notificationObservers();
+	await mount([tab("a")]);
+	await act(async () => {
+		onListEvent(statusFrame(2, { type: "substatus_change", substatus: ["unread", "rev2"] }));
+		frame?.(0);
+	});
+	expect(cachedTab("a")).toMatchObject({ status: "idle", substatus: ["unread", "rev2"] });
+	expect(plays).not.toHaveBeenCalled();
+	expect(browserNotifications).toBe(0);
+	expect(alerts).toHaveBeenCalledTimes(1);
+	const before = client.getQueryData(workKey);
+	await act(async () => {
+		onListEvent(statusFrame(1, { type, substatus: ["unread", "rev1"] }));
+		onListEvent(statusFrame(1, { type, substatus: ["unread", "rev1"] }));
+	});
+	expect(plays).toHaveBeenCalledTimes(1);
+	expect(browserNotifications).toBe(1);
+	expect(alerts).toHaveBeenCalledTimes(1);
+	expect(client.getQueryData(workKey)).toBe(before);
+	expect(cachedTab("a")).toMatchObject({ substatus: ["unread", "rev2"] });
+});
+
+test("late notification uses the original done's background-work flag, not newer state-only hints", async () => {
+	const { plays } = notificationObservers();
+	await mount([tab("a")]);
+	await act(async () => {
+		onListEvent(statusFrame(2, { type: "substatus_change", backgroundWorkActive: true }));
+		onListEvent(statusFrame(1, { type: "status_notification", backgroundWorkActive: true }));
+	});
+	expect(plays).not.toHaveBeenCalled();
+	expect(browserNotifications).toBe(0);
+	await act(async () =>
+		onListEvent(statusFrame(1, { type: "status_notification", backgroundWorkActive: false })),
+	);
+	expect(plays).toHaveBeenCalledTimes(1);
+	expect(browserNotifications).toBe(1);
+});
+
+test.each([
+	{ status: "working", substatus: [] },
+	{ status: "idle", substatus: ["unread"], turnStartedAt: "turn-2" },
+	{ status: "idle", substatus: [] },
+])("new accepted state %j rejects a prior done intent", async (latest) => {
+	const { plays } = notificationObservers();
+	spyOn(api, "moveRecentTab").mockResolvedValue({
+		changed: false,
+		baseRevision: 0,
+		revision: 0,
+		operations: [],
+	});
+	await mount([tab("a")]);
+	await act(async () => {
+		onListEvent(statusFrame(2, { type: "substatus_change" }));
+		onListEvent(statusFrame(3, { type: "substatus_change", ...latest }));
+		frame?.(0);
+	});
+	const before = client.getQueryData(workKey);
+	await act(async () => onListEvent(statusFrame(1, { type: "status_notification" })));
+	expect(plays).not.toHaveBeenCalled();
+	expect(browserNotifications).toBe(0);
+	expect(client.getQueryData(workKey)).toBe(before);
 });
 
 test("display reorder keeps the in-flight runtime read and the new WS subscription order", async () => {
@@ -303,4 +425,105 @@ test("a failed runtime read releases the shared slot without retrying until a ne
 	await resolveRuntime(1, [{ key: "narrator:a", patch: { title: "recovered" } }]);
 	expect(cachedTab("a")?.title).toBe("recovered");
 	expect(runtimeRequests).toHaveLength(2);
+});
+
+test("a team tab follows its coordinator: title and status only, no promotion", async () => {
+	const move = spyOn(api, "moveRecentTab").mockResolvedValue({
+		changed: false,
+		baseRevision: 0,
+		revision: 0,
+		operations: [],
+	});
+	const team: RecentTab = {
+		type: "team",
+		id: "coord",
+		projectId: "p1",
+		title: "Crew",
+		pinned: true,
+		lastVisitedAt: 1,
+	};
+	await mount([team, tab("a")]);
+	// The coordinator is subscribed and its runtime is read under the team's own key.
+	expect(narratorWSManager.subscribe).toHaveBeenLastCalledWith(["coord", "a"], { kind: "list" });
+	expect(runtimeRequests[0]?.keys).toEqual(["narrator:a", "team:coord"]);
+	await resolveRuntime(0, [
+		{ key: "team:coord", patch: { status: "waiting", pendingApprovalCount: 2 } },
+	]);
+	expect(cachedTab("coord")).toMatchObject({ status: "waiting", pendingApprovalCount: 2 });
+
+	await act(async () => {
+		onListEvent({ type: "title_updated", narratorId: "coord", title: "Renamed crew" });
+		onListEvent({ type: "draft_changed", narratorId: "coord", hasDraft: true });
+		onListEvent({ type: "status_change", narratorId: "coord", status: "working" });
+		frame?.(0);
+	});
+	const live = cachedTab("coord") as RecentTab | undefined;
+	expect(live).toMatchObject({ title: "Renamed crew", status: "working" });
+	expect(live?.hasDraft).toBeUndefined();
+	// A session tab of the coordinator would be promoted; a pinned team is not a session.
+	expect(move).not.toHaveBeenCalled();
+});
+
+test("a persisted project row gets its card details: runtime key, then a read when the card opens", async () => {
+	const project: RecentTab = {
+		type: "project",
+		id: "p1",
+		title: "Acme App",
+		pinned: true,
+		lastVisitedAt: 1,
+	};
+	await mount([project, tab("a")]);
+	// No socket for a project, but its key is in the runtime request.
+	expect(narratorWSManager.subscribe).toHaveBeenLastCalledWith(["a"], { kind: "list" });
+	expect(runtimeRequests[0]?.keys).toEqual(["narrator:a", "project:p1"]);
+	await resolveRuntime(0, [
+		{
+			key: "project:p1",
+			patch: {
+				projectPath: "/repos/acme-app",
+				activeSessionCount: 3,
+				waitingSessionCount: 1,
+				teamCount: 2,
+				projectCountsCapped: false,
+			},
+		},
+	]);
+	expect(cachedTab("p1")).toMatchObject({ projectPath: "/repos/acme-app", activeSessionCount: 3 });
+
+	// Open the card on the cached row: it renders the details and reads that one key again.
+	const cardI18n = i18next.createInstance();
+	await cardI18n.init({ lng: "en", resources: { en: { common: commonEn } } });
+	const host = document.createElement("div");
+	const cardRoot = createRoot(host);
+	const Card = () => {
+		const row = cachedTab("p1") as RecentTab;
+		return <RecentTabDetails tab={row} />;
+	};
+	const render = () =>
+		cardRoot.render(
+			<QueryClientProvider client={client}>
+				<I18nextProvider i18n={cardI18n}>
+					<MantineProvider>
+						<Card />
+					</MantineProvider>
+				</I18nextProvider>
+			</QueryClientProvider>,
+		);
+	await act(async () => render());
+	expect(host.textContent).toContain("/repos/acme-app");
+	expect(host.textContent).toContain("3 session(s) running");
+	expect(host.textContent).toContain("1 waiting for input or approval");
+	expect(host.textContent).toContain("2 team(s)");
+	const opened = runtimeRequests.at(-1);
+	expect(opened?.keys).toEqual(["project:p1"]);
+	await act(async () =>
+		opened?.resolve({
+			revision: 0,
+			patches: [{ key: "project:p1", patch: { activeSessionCount: 4, teamCount: 2 } }],
+		}),
+	);
+	await act(async () => render());
+	expect((cachedTab("p1") as RecentTab | undefined)?.activeSessionCount).toBe(4);
+	expect(host.textContent).toContain("4 session(s) running");
+	await act(async () => cardRoot.unmount());
 });

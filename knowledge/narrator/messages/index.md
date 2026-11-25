@@ -14,7 +14,7 @@ keywords:
   - narratorStore
   - 消息存储
 status: draft
-verified_at: 2e6441ad0
+verified_at: 4d59774711a51a9ac966794090c8b3a04d549048
 ---
 # 消息存储
 
@@ -29,6 +29,7 @@ verified_at: 2e6441ad0
 - 写：生产者只经 `narratorStore`（`narrator-store.ts`）写模型可见的历史，每个操作一个事务，转调 `narrator-persistence`；引用的 `seq` 由 `claimNextRefSeq` 分配，块格式信封的块行与 `content_json` 由块同步保持一致。直接写历史表的模块由 `narrator-history-writers.guard.test.ts` 冻结。
 - 读：展示页走 worker 的 `readNarratorDisplayMessages`；模型历史按最近压缩点之后加载；正文统一经 `narrator-body-reads.ts`，不要直接读 `content_json`。
 - 工具调用行通过 `messageId`/`blockId` 与信封、块关联，详情接口另读。
+- 截断：`deleteMessagesAfter` / 范围删除（`narrator-messages.ts:deleteMessageRange`）删某条之后的全部引用；`keepMessageIds` 让范围里指定的行留下（重试用它保留宿主写的非回合行，见[中断与恢复](../recovery.md)），调用方负责给有界的 id 集合。
 - 压缩点：`isCompact=1` 的最大 `seq`，后续上下文只从该点之后加载，见 [上下文与压缩](../context.md)。
 
 ## 读哪个子节点

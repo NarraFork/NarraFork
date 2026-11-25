@@ -12,7 +12,7 @@ keywords:
   - 执行所有权
   - 运行时队列
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: a3d23ae00610fc55ec1709dbd0aaf21c8279397c
 ---
 # 会话运行时
 

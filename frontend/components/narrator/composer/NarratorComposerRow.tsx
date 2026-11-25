@@ -1,3 +1,4 @@
+import type { NarratorPanelReadScope } from "@frontend/lib/api/narrators";
 import { ActionIcon, Box, Button, Group, Tooltip } from "@mantine/core";
 import { IconPaperclip } from "@tabler/icons-react";
 import type { RefObject } from "react";
@@ -20,6 +21,7 @@ export interface NarratorComposerRowProps {
 
 	// Narrator state
 	narratorId: string;
+	readScope?: NarratorPanelReadScope;
 	isActive: boolean;
 
 	// Composer state
@@ -353,6 +355,7 @@ export function NarratorComposerRow(props: NarratorComposerRowProps) {
 			<NarratorComposer
 				ref={props.composerRef}
 				narratorId={props.narratorId}
+				readScope={props.readScope}
 				sendingRef={props.sendingRef}
 				sending={props.isSending}
 				appendInputRef={props.appendInputRef}

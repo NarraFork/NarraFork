@@ -43,14 +43,13 @@ import {
 	IconTrash,
 	IconUpload,
 } from "@tabler/icons-react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import React, { createContext, useContext, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invalidateAvatarCache } from "../../../hooks/useAvatarBlobUrl";
 import { useBrowserSessions } from "../../../hooks/useBrowserSessions";
 import { useMobileDrawerHistory } from "../../../hooks/useMobileDrawerHistory";
-import { useAllModels } from "../../../hooks/useModels";
 import {
 	useBlacklistDirs,
 	useClearBlockedSkills,
@@ -70,6 +69,7 @@ import {
 	useUpdateSubagentModelRestriction,
 	useWhitelistDirs,
 } from "../../../hooks/useNarrator";
+import { useNarratorExecutionDevices } from "../../../hooks/useNarratorExecutionDevices";
 import { usePermissions } from "../../../hooks/usePermissions";
 import { usePersistedState } from "../../../hooks/usePersistedState";
 import {
@@ -77,6 +77,7 @@ import {
 	useNarratorContainerBrowserToolAutoEnableCapability,
 } from "../../../hooks/usePlatform";
 import { useNarratorTerminals, useTreeTerminals } from "../../../hooks/useTerminals";
+import { useUpdateRuntimeSettings } from "../../../hooks/useUpdateRuntimeSettings";
 import { useSwitchWorkspaceContext, useWorkspaceContext } from "../../../hooks/useWorkspaceContext";
 import type {
 	ApiEntity,
@@ -91,6 +92,7 @@ import {
 	FOLLOW_PARENT_MODEL,
 	NARRATOR_STATUS_COLORS,
 } from "../../../lib/constants";
+import { defaultModelOptionsFilter } from "../../../lib/model-search";
 import {
 	SAFE_AREA_DRAWER_BODY_STYLE,
 	safeAreaDrawerBodyHeight,
@@ -489,12 +491,7 @@ function NarratorDetailsContent({
 	// Working directories are per execution device: display and edit the one that
 	// belongs to the device being shown, never a path borrowed from another machine.
 	const { data: workspace } = useWorkspaceContext(narratorId);
-	const { data: executionDevices } = useQuery({
-		queryKey: ["narratorExecutionDevices", narratorId],
-		queryFn: () => api.getNarratorExecutionDevices(narratorId),
-		enabled: opened,
-		staleTime: 30_000,
-	});
+	const { data: executionDevices } = useNarratorExecutionDevices(narratorId, opened);
 	const currentDeviceId = workspace?.deviceId ?? narrator?.defaultDeviceId ?? "local";
 	const [editingDeviceId, setEditingDeviceId] = useState<string | null>(null);
 	const editDeviceId = editingDeviceId ?? currentDeviceId;
@@ -520,9 +517,8 @@ function NarratorDetailsContent({
 	const modelPoolDraft = useDetailsDraft(
 		customTraits?.subagentModelRestriction?.pools ?? EMPTY_POOLS,
 	);
-	// Shares the ["settings"] cache the hosting panel already loaded; the pool
-	// editor only needs it so provider display names are searchable.
-	const { modelOptionsFilter } = useAllModels();
+	// Searching an already supplied pool does not require loading the full catalog.
+	const modelOptionsFilter = defaultModelOptionsFilter;
 	const updateSubagentModelsMutation = useUpdateSubagentModelRestriction();
 	const clearSubagentModelsMutation = useClearSubagentModelRestriction();
 	const updateDisabledToolsMutation = useUpdateDisabledTools();
@@ -531,12 +527,7 @@ function NarratorDetailsContent({
 	const clearBlockedSkillsMutation = useClearBlockedSkills();
 	const updateReflectionOverridesMutation = useUpdateReflectionOverrides();
 	const qc = useQueryClient();
-	const updateSettingsMutation = useMutation({
-		mutationFn: api.updateSettings,
-		onSuccess: (data) => {
-			qc.setQueryData(["settings"], data);
-		},
-	});
+	const updateSettingsMutation = useUpdateRuntimeSettings();
 	// Custom narrator avatar. Without one the UI falls back to the identicon derived
 	// from the narrator id, so deleting is a real "revert to procedural" action rather
 	// than leaving the narrator with no visual identity.

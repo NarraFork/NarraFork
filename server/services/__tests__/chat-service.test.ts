@@ -46,6 +46,7 @@ import {
 	users,
 } from "../../db/schema";
 import { ForbiddenError } from "../../lib/errors";
+import { eventBus } from "../../lib/event-bus";
 import { generateId } from "../../lib/id";
 import {
 	assertCanRead,
@@ -58,6 +59,7 @@ import {
 	chatSummarizeRateLimitTesting,
 	createChatAttachment,
 	discardChatAttachment,
+	ensureNarratorDiscussionRoomForShare,
 	getUnreadSummary,
 	hydrateMessageForBroadcast,
 	listConversationRooms,
@@ -155,6 +157,37 @@ describe("DM room resolution", () => {
 		expect(fromAlice.peer?.id).toBe(bob);
 		expect(fromBob.peer?.id).toBe(alice);
 	});
+});
+
+test("discussion creation notifies once for resolver and share creation, never repeat opens", async () => {
+	type RoomCreated = { type: "chat:room_created"; narratorId: string; roomId: string };
+	const created: RoomCreated[] = [];
+	const capture = (event: RoomCreated) => {
+		created.push(event);
+	};
+	eventBus.on("chat:room_created", capture);
+	try {
+		for (const viaShare of [false, true]) {
+			const id = generateId();
+			await db.insert(narrators).values({
+				id,
+				ownerUserId: alice,
+				visibility: "public",
+				createdAt: new Date().toISOString(),
+				updatedAt: new Date().toISOString(),
+			});
+			const roomId = viaShare
+				? await ensureNarratorDiscussionRoomForShare(id)
+				: (await resolveNarratorRoom(id, alice)).id;
+			await resolveNarratorRoom(id, bob);
+			await ensureNarratorDiscussionRoomForShare(id);
+			expect(created.filter((event) => event.narratorId === id)).toEqual([
+				{ type: "chat:room_created", narratorId: id, roomId },
+			]);
+		}
+	} finally {
+		eventBus.off("chat:room_created", capture);
+	}
 });
 
 // ─── 2. seq allocation ───────────────────────────────────────────────────
@@ -257,7 +290,12 @@ describe("assertCanRead", () => {
 		});
 
 		const room = await resolveNarratorRoom(privateNarratorId, alice);
-		expect(await captureWorkerRejectionThrower(assertCanRead(room.id, carol))).toThrow();
+		// Settle the Worker-backed ACL before invoking Bun's synchronous matcher.
+		const error = await assertCanRead(room.id, carol).then(
+			() => null,
+			(error) => error,
+		);
+		expect(error).toMatchObject({ statusCode: 404 });
 	});
 
 	test("opening a private narrator's room does not create it for an outsider", async () => {
@@ -323,6 +361,87 @@ describe("assertCanRead", () => {
 // ─── 4. Pagination ───────────────────────────────────────────────────────
 
 describe("pagination", () => {
+	test("forward pages stay inside both fixed bounds and include deletion tombstones", async () => {
+		const a = await makeUser("range-a");
+		const b = await makeUser("range-b");
+		const room = await resolveDmRoom(a, b);
+		const rows = [];
+		for (let i = 0; i < 7; i++) {
+			rows.push(await postMessage({ roomId: room.id, senderUserId: a, text: `r${i}` }));
+		}
+		await softDeleteMessage(room.id, rows[2].id, a, false);
+		const input = { roomId: room.id, userId: a, beforeSeq: 7, limit: 2 };
+		const first = await listMessages({ ...input, afterSeq: 1 });
+		expect(first.messages.map((m) => m.seq)).toEqual([2, 3]);
+		expect(first.messages[1]).toMatchObject({
+			deletedAt: expect.any(String),
+			contentText: "",
+			attachments: [],
+		});
+		expect(first).toMatchObject({ hasNext: true, nextAfterSeq: 3, nextBeforeSeq: null });
+		const second = await listMessages({ ...input, afterSeq: first.nextAfterSeq ?? undefined });
+		expect(second.messages.map((m) => m.seq)).toEqual([4, 5]);
+		expect(second.hasNext).toBe(true);
+		const last = await listMessages({ ...input, afterSeq: second.nextAfterSeq ?? undefined });
+		expect(last.messages.map((m) => m.seq)).toEqual([6]);
+		expect(last).toMatchObject({ hasNext: false, nextAfterSeq: 6 });
+		const empty = await listMessages({ ...input, afterSeq: 6 });
+		expect(empty).toMatchObject({ messages: [], hasNext: false, nextAfterSeq: null });
+	});
+
+	test("forward pages reauthorize and reject an already-aborted read", async () => {
+		const a = await makeUser("range-auth-a");
+		const b = await makeUser("range-auth-b");
+		const room = await resolveDmRoom(a, b);
+		await postMessage({ roomId: room.id, senderUserId: a, text: "one" });
+		await listMessages({ roomId: room.id, userId: b, afterSeq: 0 });
+		await db
+			.delete(chatRoomMembers)
+			.where(and(eq(chatRoomMembers.roomId, room.id), eq(chatRoomMembers.userId, b)));
+		const denied = await listMessages({ roomId: room.id, userId: b, afterSeq: 0 }).then(
+			() => null,
+			(error) => error,
+		);
+		expect(denied).toMatchObject({ statusCode: 404 });
+		await expect(
+			listMessages({ roomId: room.id, userId: a, afterSeq: 0, signal: AbortSignal.abort() }),
+		).rejects.toThrow();
+	});
+
+	test("forward reads retain the 100-message page cap with a limit-plus-one sentinel", async () => {
+		const a = await makeUser("range-cap-a");
+		const b = await makeUser("range-cap-b");
+		const room = await resolveDmRoom(a, b);
+		await db.insert(chatMessages).values(
+			Array.from({ length: 101 }, (_, index) => ({
+				id: generateId(),
+				roomId: room.id,
+				seq: index + 1,
+				senderUserId: a,
+				contentText: `range-${index}`,
+				createdAt: new Date().toISOString(),
+			})),
+		);
+		const page = await listMessages({
+			roomId: room.id,
+			userId: a,
+			afterSeq: 0,
+			beforeSeq: 102,
+			limit: 1000,
+		});
+		expect(page.messages).toHaveLength(100);
+		expect(page).toMatchObject({ hasNext: true, nextAfterSeq: 100 });
+		const last = await listMessages({
+			roomId: room.id,
+			userId: a,
+			afterSeq: 100,
+			beforeSeq: 102,
+			limit: 1000,
+		});
+		expect(last.messages.map((row) => row.seq)).toEqual([101]);
+		expect(last.hasNext).toBe(false);
+	});
+
 	test("walking pages covers every message exactly once", async () => {
 		const a = await makeUser("page-a");
 		const b = await makeUser("page-b");

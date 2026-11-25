@@ -7,7 +7,12 @@ import {
 	UnstyledButton,
 	useComputedColorScheme,
 } from "@mantine/core";
-import { foldHandle, HANDLE_CHAR_RE, HANDLE_START_RE } from "@shared/narrator-handle";
+import {
+	foldHandle,
+	HANDLE_CHAR_RE,
+	HANDLE_START_RE,
+	MAX_HANDLE_LENGTH,
+} from "@shared/narrator-handle";
 import { type RefObject, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Z } from "../../../lib/z-index";
@@ -57,7 +62,8 @@ export function getMentionQuery(value: string, caret: number): string | null {
 	// Empty right after @ is allowed (popover shows all candidates).
 	if (partial === "") return "";
 	// Token must start with a letter/digit, then allow letters/digits/_/- .
-	const chars = [...partial];
+	const chars = [...partial.normalize("NFC")];
+	if (chars.length > MAX_HANDLE_LENGTH) return null;
 	if (!HANDLE_START_RE.test(chars[0])) return null;
 	for (const ch of chars) {
 		if (!HANDLE_CHAR_RE.test(ch)) return null;
@@ -79,13 +85,9 @@ export function MentionPopover({
 	const [selectedIndex, setSelectedIndex] = useState(0);
 	const listRef = useRef<HTMLDivElement>(null);
 
-	const filtered = useMemo(() => {
-		const q = query ?? "";
-		const matches = candidates.filter(
-			(c) => foldHandle(c.handle).startsWith(q) || foldHandle(c.title ?? "").includes(q),
-		);
-		return matches.slice(0, MAX_MENTION_ITEMS);
-	}, [candidates, query]);
+	// Search and ACL filtering happen before pagination on the server. Never
+	// reinterpret a bounded page as a complete directory and filter it again.
+	const filtered = useMemo(() => candidates.slice(0, MAX_MENTION_ITEMS), [candidates]);
 
 	// biome-ignore lint/correctness/useExhaustiveDependencies: reset on query change
 	useEffect(() => {

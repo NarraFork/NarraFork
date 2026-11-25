@@ -18,7 +18,13 @@ Object.assign(globalThis, {
 	navigator: window.navigator,
 	IS_REACT_ACT_ENVIRONMENT: true,
 });
-let gitWorkspace: { data?: GitWorkspace; isPending?: boolean; isError?: boolean } = {};
+let gitWorkspace: {
+	data?: GitWorkspace;
+	isPending?: boolean;
+	isError?: boolean;
+	authorizationState?: string;
+} = {};
+let createAvailability: boolean | undefined;
 let gitStatus:
 	| {
 			branch: string;
@@ -53,17 +59,20 @@ mock.module("react-i18next", () => ({
 	}),
 }));
 mock.module("./NarratorWorktreeControls", () => ({
-	NarratorWorktreeControls: () => (
-		<>
-			<span>quick-worktree</span>
-			{createPortal(
-				<button type="button" data-worktree-dialog>
-					dialog
-				</button>,
-				document.body,
-			)}
-		</>
-	),
+	NarratorWorktreeControls: ({ canCreateWorktree }: { canCreateWorktree?: boolean }) => {
+		createAvailability = canCreateWorktree;
+		return (
+			<>
+				<span>quick-worktree</span>
+				{createPortal(
+					<button type="button" data-worktree-dialog>
+						dialog
+					</button>,
+					document.body,
+				)}
+			</>
+		);
+	},
 }));
 type WrapperProps = { children?: ReactNode };
 const Wrapper = ({
@@ -104,6 +113,7 @@ async function flush() {
 	for (let i = 0; i < 5; i++) await new Promise((resolve) => setTimeout(resolve, 0));
 }
 beforeEach(() => {
+	createAvailability = undefined;
 	gitWorkspace = {};
 	gitStatus = undefined;
 	lineStats = { isFetching: true, error: null };
@@ -316,4 +326,30 @@ test("Git row ignores worktree portal clicks and activation keys", async () => {
 		container.querySelector<HTMLElement>('[role="button"]')?.click();
 	});
 	expect(openGit).toHaveBeenCalledTimes(1);
+});
+
+test("cold create availability uses the existing authorized Git probe without opening the worktree list", async () => {
+	const writable: GitWorkspace = {
+		workspaceKey: "workspace",
+		repositoryKey: "repository",
+		deviceId: "local",
+		cwd: currentCwd,
+		rootPath: "/repo",
+		state: "ready",
+		capabilities: { read: true, write: true },
+	};
+	for (const [data, authorizationState, expected] of [
+		[undefined, "waiting", false],
+		[writable, "waiting", false],
+		[writable, "authorized", true],
+		[{ ...writable, capabilities: { read: true, write: false } }, "authorized", false],
+		[{ ...writable, state: "access_denied" }, "authorized", false],
+	] as const) {
+		gitWorkspace = { data, authorizationState };
+		await act(async () => {
+			root.render(<NarratorGitBar narratorId="n" onOpenGitPanel={() => {}} />);
+			await flush();
+		});
+		expect(createAvailability).toBe(expected);
+	}
 });

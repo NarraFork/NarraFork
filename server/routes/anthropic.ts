@@ -2,6 +2,12 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { Hono } from "hono";
 import { logger } from "../lib/logger";
+import {
+	captureModelOptionsArray,
+	ModelOptionsCacheMap,
+	optionInput,
+	registerModelOptionsCapture,
+} from "../lib/model-options-contract";
 import { getNarraforkHome } from "../lib/narrafork-home";
 import { resolveProxyForUrl } from "../lib/net/proxy";
 import {
@@ -13,7 +19,7 @@ import {
 } from "../lib/settings";
 import { registerModelListReader } from "../lib/sourcing/model-list-readers";
 import { sourceGroupForConnection } from "../lib/sourcing/source-groups";
-import { listCachedTemplateModels } from "../lib/sourcing/templates";
+import { getServiceTemplate } from "../lib/sourcing/templates";
 
 export const anthropicRoutes = new Hono();
 
@@ -26,7 +32,7 @@ export interface AnthropicModelInfo {
 }
 
 /** Per-provider cached model lists. Key = provider id. */
-const cachedModelsByProvider = new Map<string, AnthropicModelInfo[]>();
+const cachedModelsByProvider = new ModelOptionsCacheMap<string, AnthropicModelInfo[]>();
 
 // Load cache on startup
 loadAllCachedModels();
@@ -66,8 +72,15 @@ export function getAnthropicCachedModelsByProvider(providerId: string): Anthropi
 	return cachedModelsByProvider.get(providerId) ?? [];
 }
 
+registerModelOptionsCapture("anthropic-messages", (group) =>
+	captureModelOptionsArray(
+		cachedModelsByProvider.get(group.id),
+		(model) => optionInput(group, model.id, model.display_name ?? model.id),
+		cachedModelsByProvider.generation,
+	),
+);
 registerModelListReader("anthropic-messages", (group) =>
-	getAnthropicCachedModelsByProvider(group.id).map((model) => model.id),
+	getAnthropicCachedModelsByProvider(group.id),
 );
 
 function activeAnthropicProviderIds(): Set<string> {
@@ -315,9 +328,9 @@ anthropicRoutes.get("/providers/:id/models", async (c) => {
 		"anthropic-messages",
 	);
 	return c.json({
-		models: await listCachedTemplateModels(
+		models: await getServiceTemplate(group.templateId).listModels(
 			group,
-			getAnthropicCachedModelsByProvider(id),
+			undefined,
 			c.req.raw.signal,
 		),
 		fromCache: true,

@@ -2119,6 +2119,7 @@ describe("registered startup failure ownership", () => {
 
 	test("checkpoint stop during preparation retains the registered task", async () => {
 		const registered = await register();
+		const notify = spyOn(inbox, "notifyAgentInboxChanged").mockImplementation(() => {});
 		const { CheckpointStop } = await import("../agent-runtime/checkpoint-stop");
 		let stop: InstanceType<typeof CheckpointStop> | undefined;
 		spyOn(session, "ensureNarrator").mockImplementation(async () => {
@@ -2141,6 +2142,7 @@ describe("registered startup failure ownership", () => {
 		expect(stop).toBeDefined();
 		expect(taskRow()?.status).toBe("running");
 		expect(getExecutionOwner(RUN)).toBeUndefined();
+		expect(notify).not.toHaveBeenCalled();
 	});
 });
 

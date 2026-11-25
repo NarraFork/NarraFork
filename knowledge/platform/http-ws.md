@@ -8,6 +8,13 @@ anchors:
   - server/middleware/
   - server/app.ts
   - server/websocket/ws-handler.ts
+  - server/services/narrator-persistence.ts#updateStatus
+  - server/services/narrator-status-version.ts
+  - server/services/narrator-message-count.ts#readNarratorMessageRefCountSnapshot
+  - server/services/__tests__/narrator-persistence-background-attention.test.ts
+  - server/services/narrator-archive.ts#transitionAdmittedGroup
+  - server/services/narrator-messages.ts#dismissErrorMessage
+  - server/services/agent-runtime/finalization-reads.ts#clearTransientStatusPatch
   - server/http-request-lifecycle.ts
   - server/lib/validators/websocket.ts
   - server/middleware/__tests__/auth-oauth-boundary.test.ts
@@ -33,7 +40,7 @@ keywords:
   - /api/health
   - 503 Retry-After
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 4d59774711a51a9ac966794090c8b3a04d549048
 ---
 # HTTP 路由与 WebSocket
 
@@ -51,6 +58,11 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 分发入口还有三道门：关闭中返回 503（`Retry-After: 1`）；需要数据库读池的路径（`requiresDatabaseReaders`）在读池不可用时 503，详见 [Worker 隔离](workers.md)；同一批路径在读池就绪后还要等 `startupReadiness.barrier`（叙述者续接恢复到达终态，失败也放行，让修复路由可达）。`/api/health` 例外：永远直接答，并把恢复状态和读池状态并入负载（`http-dispatcher.ts`）。
 - 其他 WebSocket 能力复用叙述者通道：`narrator-ws.ts` 里分派 `editor-file-ws`、`git-workspace-ws`、`outline-page-ws`、`outline-live-ws` 的消息和订阅释放，不是各自独立的路径；外部 OAuth 叙述者通道 `/ws/external/v1/narrators` 用一次性 ticket 升级，并复核令牌的 `narrator.read`、`event.subscribe` 范围与来源 Origin（`http-dispatcher.ts`）。
 - 升级后 `wsHandlers` 按 `channel` 分派到 `narrator-ws.ts`、`terminal-ws.ts` 等；叙述者通道是订阅模型（`subscribe`/`unsubscribe`，拒绝时回 `subscribe_denied`）。
+- 状态投影：`narrator-status-version.ts` 定义固定小列（状态/子状态、回合开始/更新时间、错误与可重试标记、联动归档 id），不广播完整叙述者。SQLite `updateStatus/compareAndSetStatus/writeSubstatus` 在同步 `UPDATE RETURNING` 成功点分配版本，保留其已提交投影再广播；`substatus_change` 同样带完整主状态，避免新子状态压掉旧主状态后丢失最终主状态。归档、错误通知 dismiss、循环终态清理也复用该小列投影，不在异步副作用结束后回读最新状态冒充原事务。
+- 状态版本：一个进程级、热重载保留的 `statusEpoch` + 单调 `statusRevision`，无按会话增长的后端版本缓存；事务回滚留下 revision 空隙允许。panel 与 list 快照在同步读状态之前分配版本，不能等占用索引等异步读取完成后才编号，否则旧快照会冒充新状态；panel 取详情小列，list 仍只取轻量列。
+- 完整状态帧与 panel 快照经 `committedNarratorStatusPatch` 异步附可选精确 `messageCount`：用提交时内部 `messageVersion` 与 worker 单 SQL 计数快照版本对齐，同会话/同版本在途共享，错配或失败省略计数，不回退主线程或上界列。list 快照不加此计数；错误提示另行落库导致消息版本变化时，为该后续提交重新分配状态版本，不能提升原旧状态补丁。
+- 公开分享的 `status_change/substatus_change`（含快照）只保留 `type/narratorId/status/substatus/turnStartedAt/updatedAt/messageCount/statusEpoch/statusRevision/backgroundWorkActive`；精确计数与状态版本可见，但内部 `messageVersion`、错误详情和联动归档信息不可见（`narrator-ws.ts:projectPublicNarratorEvent`）。
+- 执行设备提示：`execution-device-events.ts` 将设备元数据/在线状态/撤销，以及 OAuth grant/client、项目/会话访问、执行主体变化合并为 100ms 一帧的 `execution_devices_changed`，全局发送但仅带 `type`，不携带设备或授权数据；`broadcastToAll` 排除匿名公开分享。提示只使客户端重读会话设备 HTTP 接口，不作为设备授权来源。
 - 心跳：30 秒 ping，90 秒无 pong 视为超时；会话过期用关闭码 4001；关闭中用 1012 拒绝新连接和消息（`ws-handler.ts`）。会话变化由 `session-revalidation.ts` 复核。
 
 ## 从哪读起

@@ -11,10 +11,11 @@ import {
 	TextInput,
 } from "@mantine/core";
 import { MIN_UNATTENDED_ARM_DELAY_SECONDS } from "@shared/unattended";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../hooks/useAuth";
+import { useUnattendedStatus } from "../../hooks/useUnattendedStatus";
 import { api } from "../../lib/api";
 import { unattendedStatusQueryKey } from "../../lib/api/unattended";
 import { formatLocaleTime } from "../../lib/intl-format";
@@ -53,13 +54,7 @@ function AdminUnattendedModeCard() {
 	const queryClient = useQueryClient();
 	const [draft, setDraft] = useState<Draft | null>(null);
 	const [confirming, setConfirming] = useState(false);
-	// Polling belongs to the global banner, which shares this query key.
-	const statusQuery = useQuery({
-		queryKey: unattendedStatusQueryKey,
-		queryFn: ({ signal }) => api.getUnattendedStatus(signal),
-		staleTime: 0,
-		retry: false,
-	});
+	const statusQuery = useUnattendedStatus();
 	const status = statusQuery.data;
 	const server: Draft = {
 		powerOff: status?.options.powerOff ?? true,
@@ -84,7 +79,8 @@ function AdminUnattendedModeCard() {
 						}
 					: {}),
 			}),
-		onSuccess: ({ status: next }) => {
+		onSuccess: async ({ status: next }) => {
+			await queryClient.cancelQueries({ queryKey: unattendedStatusQueryKey, exact: true });
 			queryClient.setQueryData(unattendedStatusQueryKey, next);
 			setDraft(null);
 		},

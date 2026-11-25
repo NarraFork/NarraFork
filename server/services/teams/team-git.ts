@@ -18,6 +18,7 @@
  * All of them read commits and objects only, never the working tree, and fail rather than return
  * a partial result. `work.ready` pins one head commit and passes it to every one of them.
  */
+import { stat } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import {
 	TEAM_CHANGED_DIR_SUFFIX,
@@ -46,6 +47,8 @@ import {
 } from "../git-ref-queries";
 
 const READ_TIMEOUT_MS = 60_000;
+/** The work-tree probe answers a dialog's lookup: a stuck filesystem must not hold it a minute. */
+const WORK_TREE_PROBE_TIMEOUT_MS = 10_000;
 const READ_MAX_OUTPUT_BYTES = 1024 * 1024;
 /** Name-only listing cap: well past {@link TEAM_CHANGED_PATHS_MAX} typical paths. */
 const CHANGED_LISTING_MAX_BYTES = 512 * 1024;
@@ -66,6 +69,7 @@ async function spawnGit(
 	args: readonly string[],
 	config: ReadonlyArray<readonly [string, string]>,
 	maxOutputBytes: number,
+	timeout = READ_TIMEOUT_MS,
 	stdoutStream?: { maxBytes: number; onChunk: (chunk: Uint8Array) => boolean | undefined },
 ) {
 	await ensureConfigOverridesHonored();
@@ -83,7 +87,7 @@ async function spawnGit(
 			LC_ALL: "C",
 			...gitConfigEnv(config),
 		},
-		timeout: READ_TIMEOUT_MS,
+		timeout,
 		maxOutputBytes,
 		...(stdoutStream ? { stdoutStream, maxStderrBytes: BLOB_STDERR_MAX_BYTES } : {}),
 		killProcessTree: true,
@@ -104,6 +108,27 @@ export async function configuredPrograms(cwd: string): Promise<GitConfiguredProg
 	if (result.exitCode !== 0 || result.truncated)
 		throw new GitError("git config could not list the configured filters and hooks");
 	return parseProgramConfig(result.stdout);
+}
+
+/**
+ * Whether `dir` is an existing directory inside a local git work tree: what a team needs from its
+ * project's directory (a project may be associated with any existing folder). A bare repository,
+ * a `.git` directory, a missing path, a timeout or any other failure all answer false. Asking
+ * runs no program of the repository's configuration.
+ */
+export async function isGitWorkTree(dir: string): Promise<boolean> {
+	const info = await stat(dir).catch(() => null);
+	if (!info?.isDirectory()) return false;
+	const result = await spawnGit(
+		dir,
+		["rev-parse", "--is-inside-work-tree"],
+		GIT_NO_EXEC_CONFIG,
+		1024,
+		WORK_TREE_PROBE_TIMEOUT_MS,
+	).catch(() => null);
+	return (
+		result !== null && result.exitCode === 0 && !result.truncated && result.stdout.trim() === "true"
+	);
 }
 
 /** What a branch changed since its merge base with the base (committed changes only). */
@@ -180,6 +205,33 @@ export interface TeamGit {
 	 * the blob's size from a listing: reading stops past it, and any other length throws.
 	 */
 	readBlob(oid: string, size: number): Promise<string>;
+	/** The best common ancestor of two full commit SHAs, or null when they share no history. */
+	mergeBase(a: string, b: string): Promise<string | null>;
+	/**
+	 * Lines added and removed per file between two full commit SHAs (`diff --numstat
+	 * --no-renames`), in git's order. The listing is capped: past it `truncated` is set and the
+	 * counts cover the files read. Throws when git fails.
+	 */
+	numstat(from: string, to: string): Promise<BranchNumstat>;
+	/**
+	 * The unified diff of one repository-relative path between two full commit SHAs, cut off at
+	 * `maxBytes` (reading stops there). Throws when git fails.
+	 */
+	fileDiff(
+		from: string,
+		to: string,
+		path: string,
+		maxBytes: number,
+	): Promise<{ text: string; truncated: boolean }>;
+}
+
+/** {@link TeamGit.numstat}: per-file counts (null for a binary file) and the totals. */
+export interface BranchNumstat {
+	files: { path: string; added: number | null; removed: number | null }[];
+	added: number;
+	removed: number;
+	binaryFiles: number;
+	truncated: boolean;
 }
 
 const utf8Bytes = (value: string) => Buffer.byteLength(value, "utf8");
@@ -344,7 +396,7 @@ async function readBlobOf(
 	if (!Number.isSafeInteger(size) || size < 0) throw new GitError("Expected a blob size");
 	const chunks: Buffer[] = [];
 	// Raw bytes, at most one past the size: a longer blob is cut off and refused.
-	const result = await spawnGit(cwd, ["cat-file", "blob", oid], config, 0, {
+	const result = await spawnGit(cwd, ["cat-file", "blob", oid], config, 0, READ_TIMEOUT_MS, {
 		maxBytes: size + 1,
 		onChunk: (chunk) => {
 			chunks.push(Buffer.from(chunk));
@@ -355,6 +407,97 @@ async function readBlobOf(
 	if (result.exitCode !== 0 || result.truncated || bytes.byteLength !== size)
 		throw new GitError(`git cat-file could not read blob ${oid}`);
 	return bytes.toString("utf8");
+}
+
+/** Numstat listing cap: some thousands of files; past it the counts are a lower bound. */
+const NUMSTAT_MAX_BYTES = 512 * 1024;
+
+async function numstatOf(run: GitQueryRunner, from: string, to: string): Promise<BranchNumstat> {
+	if (!SHA.test(from) || !SHA.test(to)) throw new GitError("Expected full commit SHAs");
+	// Paths relative to the repository root wherever git runs (a coordinator may work in a
+	// subdirectory), whatever `diff.relative` says.
+	const listing = await run(
+		["diff", "--numstat", "--no-renames", "--no-relative", "-z", from, to],
+		{
+			maxOutputBytes: NUMSTAT_MAX_BYTES,
+		},
+	);
+	const truncated = listing.truncated === true;
+	if (listing.exitCode !== 0 && !truncated)
+		throw new GitError("git diff could not count the changed lines");
+	// `-z --numstat --no-renames`: `<added>\t<removed>\t<path>` records, NUL-terminated.
+	const files: BranchNumstat["files"] = [];
+	let added = 0;
+	let removed = 0;
+	let binaryFiles = 0;
+	for (const record of nulRecords(listing.stdout, truncated)) {
+		const first = record.indexOf("\t");
+		const second = first < 0 ? -1 : record.indexOf("\t", first + 1);
+		if (second < 0) continue;
+		const plus = record.slice(0, first);
+		const minus = record.slice(first + 1, second);
+		const path = record.slice(second + 1);
+		if (!path) continue;
+		if (plus === "-" || minus === "-") {
+			binaryFiles++;
+			files.push({ path, added: null, removed: null });
+			continue;
+		}
+		const a = Number(plus);
+		const r = Number(minus);
+		if (!Number.isSafeInteger(a) || !Number.isSafeInteger(r)) continue;
+		added += a;
+		removed += r;
+		files.push({ path, added: a, removed: r });
+	}
+	return { files, added, removed, binaryFiles, truncated };
+}
+
+async function fileDiffOf(
+	cwd: string,
+	config: ReadonlyArray<readonly [string, string]>,
+	from: string,
+	to: string,
+	path: string,
+	maxBytes: number,
+): Promise<{ text: string; truncated: boolean }> {
+	if (!SHA.test(from) || !SHA.test(to)) throw new GitError("Expected full commit SHAs");
+	assertRelativePath(path);
+	const chunks: Buffer[] = [];
+	let size = 0;
+	// Raw bytes, at most one past the budget: reading stops there and the text is cut off.
+	const result = await spawnGit(
+		cwd,
+		// `:(top,literal)`: a file name from the repository root (as numstat lists it, whatever
+		// directory git runs in), never a pattern (`*.txt` is that file only).
+		[
+			"diff",
+			"--no-renames",
+			"--no-relative",
+			"--no-color",
+			"-U3",
+			from,
+			to,
+			"--",
+			`:(top,literal)${path}`,
+		],
+		config,
+		0,
+		READ_TIMEOUT_MS,
+		{
+			maxBytes: maxBytes + 1,
+			onChunk: (chunk) => {
+				chunks.push(Buffer.from(chunk));
+				size += chunk.byteLength;
+				return true;
+			},
+		},
+	);
+	const truncated = size > maxBytes || result.truncated;
+	if (result.exitCode !== 0 && !truncated) throw new GitError(`git diff could not read ${path}`);
+	const bytes = Buffer.concat(chunks).subarray(0, maxBytes);
+	// A cut may split a UTF-8 sequence: the decoder replaces the broken tail.
+	return { text: bytes.toString("utf8"), truncated };
 }
 
 export function teamGit(cwd: string): TeamGit {
@@ -383,6 +526,10 @@ export function teamGit(cwd: string): TeamGit {
 		treeEntry: (commit, path) => treeEntryAt(run, commit, path),
 		treeBlobs: (commit, dir) => treeBlobsOf(run, commit, dir),
 		readBlob: async (oid, size) => readBlobOf(cwd, await config(), oid, size),
+		mergeBase: (a, b) => mergeBase(run, a, b),
+		numstat: (from, to) => numstatOf(run, from, to),
+		fileDiff: async (from, to, path, maxBytes) =>
+			fileDiffOf(cwd, await config(), from, to, path, maxBytes),
 	};
 }
 

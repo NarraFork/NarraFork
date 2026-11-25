@@ -25,7 +25,7 @@ keywords:
   - POST /api/narrators/:id/messages
   - 流式输出
 status: draft
-verified_at: 878917e97
+verified_at: a3d23ae00610fc55ec1709dbd0aaf21c8279397c
 ---
 # 一轮对话
 
@@ -38,7 +38,7 @@ verified_at: 878917e97
    - `queueMode = interrupt` → `requestUrgentBufferedGuidance`；
    - `queueMode = tool` → `requestBufferedMessageSoftStop`；
    - `queueMode = turn`（默认）→ 只排队；
-   - 三者都广播 `buffer_set`，HTTP 返回 202 `{ buffered: true }`；本轮结束后由 `run.ts:afterRunRelease` → `wakeInboxIfEligible` 唤醒消费。
+   - 三者都广播 `buffer_set`，HTTP 返回 202 `{ buffered: true }`；正常收尾后由 `run.ts:afterRunRelease` → `wakeInboxIfEligible` 唤醒消费；错误收尾保留队列，不自动重试。
 4. 分支，空闲且未被 `queueOnly` 压住：`tryClaimExecution` → `ensureNarrator` → `claimInboxHead` 认领刚入队的那条 → `feedMessageUnlocked`；HTTP 返回 201 带用户消息。
 5. 落库用户消息：`feedMessageUnlocked` 经 `persistClaimedUserInput` 写 `narrator_messages` 与引用行，广播 `user_message`，把状态置 `working`，首轮设临时标题。见 [消息存储](../narrator/messages/index.md)。
 6. 起运行：`runAgentLoop` → `agent-runtime/run.ts:startNarratorRun` 取得执行所有权（`tryClaimExecution(id, "run")`，已有所有者则 `started: false`），建 `RunControl`，进入 `executeRun`。见 [调度与执行](../narrator/runtime/orchestrator.md)。
@@ -51,7 +51,9 @@ verified_at: 878917e97
 13. 分支，模型本轮带 tool_use：转 [一次工具调用](tool-call.md)，工具结果回到步骤 9 的下一轮；无 tool_use 则 `done`。
 14. 分支，上下文占用超阈值：转 [一次上下文压缩](compaction.md)。
 15. 分支，请求出错：`executeAgentLoop` 把结果归类（上下文超长、可重试错误、余额不足、模型不可用、中断、最大轮数），orchestrator 据此调 `handleContextOverflow` / `handleTransientError` 或收尾。见 [中断与恢复](../narrator/recovery.md)。
-16. 收尾：`run.ts:finishRun` 汇总终态、（子代理）提交交付结果、`settleStatus` 把叙述者置回 `idle`（`substatus` 为 `unread` / `error` / `interrupted` / `timeout`），`afterRunRelease` 检查收件箱里排队的输入并唤醒下一轮。
+   - 已被既有规则准入的新 pass（例如工作区重放、held 运行接收明确输入）才会在模型调用前清旧 `hadError`、`terminalStatus` 与 `finalText`；须仍存活、持有当前 owner、未取消，并成功写回 `working`（`unlessArchived`）。后续成功不继承旧错误；后续再失败则保留这一次的错误。
+   - 轮后 `injection-drain` 仅在 `hadError` 为 false 时消费注入并续跑；失败前排队的 Watch/agent 通知不是恢复授权。没有获准的新 pass 时保留失败终态；取消与 held 的停止规则不因错误清理而改变。
+16. 收尾：`run.ts:finishRun` 汇总终态、（子代理）提交交付结果、`settleStatus` 把叙述者置回 `idle`（`substatus` 为 `unread` / `error` / `interrupted` / `timeout`），释放所有权后 `afterRunRelease` 仅在允许时检查排队输入并唤醒下一轮；真实失败不自动唤醒。
 
 ## 改它时
 - 加一种新的输入来源（像 IM、定时任务）：要走步骤 2 的缓冲邮箱与步骤 4 的认领，不要绕过 `acceptUserMessage` 直接起 `runAgentLoop`；同时看 `sendMessage` 的 `origin` 归属参数。

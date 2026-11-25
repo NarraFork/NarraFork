@@ -38,6 +38,14 @@ export async function enrichTabs(
 
 	migrateTabTypes(tabs);
 
+	// Team tabs (a pinned team page): the coordinator's state for those the user can read.
+	try {
+		const { enrichTeamTabs } = await import("./recent-tab-teams");
+		await enrichTeamTabs(tabs, userId);
+	} catch (err) {
+		logger.warn("Failed to enrich team tabs", { error: String(err) });
+	}
+
 	const narratorIds = tabs.map(getTabNarratorId).filter((id): id is string => !!id);
 
 	if (narratorIds.length > 0) {

@@ -81,6 +81,16 @@ export function navRowUrl(key: string): string | null {
 	return null;
 }
 
+/**
+ * Where stop `key` leads, reading the row when the key alone cannot say: a team page's path
+ * needs the team's project, which the row carries as `data-tab-href`.
+ */
+export function navRowHref(list: ParentNode | null, key: string): string | null {
+	const url = navRowUrl(key);
+	if (url || !list) return url;
+	return navRowElement(list, key)?.getAttribute("data-tab-href") || null;
+}
+
 /** The element of stop `key` in `list`, null when it is not rendered. */
 export function navRowElement(list: ParentNode, key: string): Element | null {
 	for (const el of list.querySelectorAll(ROW_SELECTOR)) {

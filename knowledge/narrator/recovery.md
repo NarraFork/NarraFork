@@ -31,8 +31,12 @@ keywords:
   - retryBackoffCeilMs
   - CatchUpCursor
   - tailRoleAllowsContinue
+  - isNonTurnInjectionRow
+  - isNonTurnHostRow
+  - rewindHistoryForRetry
+  - keepMessageIds
 status: draft
-verified_at: 878917e97
+verified_at: 4ab684e28
 ---
 # 中断与恢复
 
@@ -48,6 +52,12 @@ verified_at: 878917e97
 
 - 废弃的未启动工具行：非终态（initializing / pending / running）且 `execution_started_at` 为空、创建超过 30 分钟（`ABANDONED_TOOL_CALL_TTL_MS`）的 `narrator_tool_calls` 行被置为 fail（`Tool call abandoned: execution never started…`）；本进程里仍有待决权限的行跳过，一次最多处理 5000 行；只在启动后台跑一次（`main.ts` 调 `cleanupAbandonedToolCalls`，`abandoned-tool-cleanup.ts`）。已开始执行的 running 行不碰。
 - “继续”按钮与接口共用判定：末尾一行角色为 `assistant` 或 `sys`（服务端注入）时才允许继续（`shared/continue-tail.ts:tailRoleAllowsContinue`，前端 `NarratorPanel` 与服务端都用它）。
+  - 例外：宿主写的、不是任何人回合的行（`continue-tail.ts:isNonTurnHostRow`）——只含团队升级/解散说明的 `sys` 行（`team_upgrade`/`team_disband`，不唤醒，`isNonTurnInjectionRow`），以及重建工具声明的通知（`user` 角色、`tool_loaded` 带 `rebaseline: true`、origin `system`，`requestToolDeclarationRebaseline` 写，`isRebaselineNoticeRow`）。两边用同一个判定：
+    - 前端尾部摘要（`vlist/vlist-tail-meta.ts`）跳过它们，重试/继续都看它们前面那一行；`lastUserMessageId` 也跳过通知。
+    - 服务端 `resolveRetryTarget`、`resolveContinuationTail`、`hasTrailingInjectionRow` 都跳过它们：重试不会把通知当成人写的消息重跑；「继续」不会去回答说明，而是接着下面的回复；真正的注入（如 `bg_agent`）仍按末尾输入直接起循环。
+    - 当前输入的选取（`findCurrentSenderMessage`）也跳过通知，所以重试后被保留的通知不会让原提示被当成未持久化的输入再发一次（见[提示词与注入](prompts.md)）。
+    - 重试删除目标之后的行时保留它们（`narrator-session.ts:retryKeptHostRowIds` 读目标之后最多 200 行 `sys`/`user`，`deleteMessagesAfter` 的 `keepMessageIds` 让范围删除跳过这些 ref），被丢弃的输出照删；团队变更和工具声明仍然成立，`rebaselineRequests` 仍能读到通知。
+    - 测试：`shared/__tests__/continue-tail.test.ts`、`vlist-tail-meta.test.ts`、`project-teams-upgrade.test.ts`（`rewindHistoryForRetry` 是重试的历史步骤，导出给测试）。新增不唤醒的说明类注入，若不该让人点“继续”，把来源加进 `NON_TURN_INJECTION_SOURCES`。
 - 重试规则关键词：错误卡片显示的是带 `Error: ` / `[Error] ` 前缀的装饰串，而规则匹配用原始 provider 消息，所以“标记为可重试”预填的关键词先经 `stripErrorDisplayPrefix` 去前缀（`shared/retry-rule-keyword.ts`，设置路由、`RetryRuleModal`、`lib/agent/error-handling.ts` 共用）。
 - 权限闸恢复：重启后重新执行工具前先快照持久化的权限行（`PersistedRecoveryGate`），`isRecoveredHumanPermission` 判断这条是否还在等真人决定（已开始执行或已决定则否；有反思记录时只有 `plan_reflection` 且 `awaiting_user` 才算），快照经 `WeakMap` 绑定到权限选项，不进入工具输入或公开配置（`lib/agent/recovery-gate.ts`）。
 - 工具续接记录 `narrator_tool_continuations`：每个工具调用最多一条，`kind` 为 deferred_tool / pending_permission / foreground_agent / background_agent / await_agent / send_await，`state` 为 paused / waiting / resuming / completed / failed / cancelled；恢复阶段记在 `payloadJson.recoveryPhase`（result_written / owner_continuation_pending / owner_continuation_started）（`schema.ts`、`tool-continuation-service.ts`）。冷启动接管的维护权检查与整体重启恢复流程属于 [实例锁、完整性与重启恢复](../platform/instance-recovery.md)；`recovery-handoff.ts`（恢复源清单，≤64 个源、≤10000 个目标、≤4 MiB）与 `recovery-observation.ts`（恢复前后的状态比对）是它的数据通道，本节只引用，未逐行核对。

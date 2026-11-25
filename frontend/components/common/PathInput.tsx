@@ -2,7 +2,7 @@ import { Combobox, Group, Loader, Text, TextInput, useCombobox } from "@mantine/
 import { useDebouncedValue } from "@mantine/hooks";
 import { IconFolder, IconFolderPlus, IconFolderSymlink } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useFileSystemCapability } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
@@ -150,16 +150,28 @@ export function PathInput(props: PathInputProps) {
 	// Determine if dropdown should show (has options or can create)
 	const hasDropdownContent = options.length > 0 || canCreate;
 
-	// Open dropdown when we have content (only after user interaction)
+	// Open dropdown when we have content (only after user interaction, and only while the
+	// field has focus: suggestions that arrive after the user left the field — the browse
+	// query settles ~150ms+ after the last keystroke — must not pop back over whatever the
+	// user moved on to, such as the dialog's submit button below).
 	// biome-ignore lint/correctness/useExhaustiveDependencies: combobox methods are unstable refs — depend only on data triggers
 	useEffect(() => {
 		if (!interactedRef.current) return;
-		if (hasDropdownContent && value.length > 0) {
+		if (hasDropdownContent && value.length > 0 && isFocused(inputRef.current)) {
 			combobox.openDropdown();
 		} else {
 			combobox.closeDropdown();
 		}
 	}, [hasDropdownContent, value.length]);
+
+	// A long path shows its end, where folders differ, while the field is not being edited
+	// (inputs otherwise show the start, so sibling folders under one long prefix look the same).
+	// The full path is the field's tooltip.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: re-run for each new value (prefill, browse pick)
+	useLayoutEffect(() => {
+		const input = inputRef.current;
+		if (input && !isFocused(input)) showPathEnd(input);
+	}, [value]);
 
 	useEffect(() => {
 		if (autoFocus) inputRef.current?.focus();
@@ -261,11 +273,17 @@ export function PathInput(props: PathInputProps) {
 					onFocus={() => {
 						interactedRef.current = true;
 					}}
-					onBlur={() => {
+					onBlur={(event) => {
 						combobox.closeDropdown();
+						// Chromium scrolls a blurred input back to its start; show the end again.
+						const input = event.currentTarget;
+						requestAnimationFrame(() => {
+							if (!isFocused(input)) showPathEnd(input);
+						});
 						onBlur?.();
 					}}
 					onKeyDown={handleKeyDown}
+					title={value || undefined}
 					leftSection={leftSection}
 					rightSection={rightSectionProp ?? (isFetching ? <Loader size={14} /> : undefined)}
 					rightSectionWidth={rightSectionWidth}
@@ -326,6 +344,15 @@ export function PathInput(props: PathInputProps) {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+function isFocused(input: HTMLInputElement | null): boolean {
+	return !!input && input.ownerDocument.activeElement === input;
+}
+
+/** Scroll a one-line input so its last characters are visible (no-op when it all fits). */
+export function showPathEnd(input: Pick<HTMLInputElement, "scrollLeft" | "scrollWidth">): void {
+	input.scrollLeft = input.scrollWidth;
+}
 
 function parsePath(raw: string): { dir: string; filter: string } {
 	const trimmed = raw.trim();

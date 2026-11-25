@@ -25,9 +25,16 @@ import { narrators, users } from "../../db/schema";
 import { generateId } from "../../lib/id";
 import type { NarratorServerMessage } from "../../websocket/narrator-ws-types";
 import { chatNotifyTesting, setChatNotifyChannel } from "../chat-notify";
-import { markRead, postBotMessage, postMessage, resolveDmRoom } from "../chat-service";
+import {
+	markRead,
+	postBotMessage,
+	postMessage,
+	resolveDmRoom,
+	resolveNarratorRoom,
+} from "../chat-service";
 
 interface Recorded {
+	narratorBroadcasts: Array<{ narratorId: string; message: NarratorServerMessage }>;
 	roomBroadcasts: Array<{ roomId: string; message: NarratorServerMessage }>;
 	userBroadcasts: Array<{ userId: string; message: NarratorServerMessage }>;
 }
@@ -37,8 +44,11 @@ interface Recorded {
  * the room open, which the real implementation reads off live WS subscriptions.
  */
 function record(viewing: string[] = []): Recorded {
-	const recorded: Recorded = { roomBroadcasts: [], userBroadcasts: [] };
+	const recorded: Recorded = { narratorBroadcasts: [], roomBroadcasts: [], userBroadcasts: [] };
 	setChatNotifyChannel({
+		broadcastToNarrator: (narratorId, message) => {
+			recorded.narratorBroadcasts.push({ narratorId, message });
+		},
 		broadcastToChatRoom: (roomId, message) => {
 			recorded.roomBroadcasts.push({ roomId, message });
 		},
@@ -74,6 +84,61 @@ afterEach(() => {
 	setChatNotifyChannel(null);
 });
 
+test("new discussion notification targets narrator subscribers without any room members", async () => {
+	const recorded = record();
+	await chatNotifyTesting.onRoomCreated({ narratorId: "target-narrator", roomId: "new-room" });
+	expect(recorded.narratorBroadcasts).toEqual([
+		{
+			narratorId: "target-narrator",
+			message: { type: "chat:room_created", narratorId: "target-narrator", roomId: "new-room" },
+		},
+	]);
+	expect(recorded.roomBroadcasts).toEqual([]);
+	expect(recorded.userBroadcasts).toEqual([]);
+});
+
+test("discussion unread notifications carry their narrator without a room-list scan", async () => {
+	const id = generateId();
+	await db.insert(narrators).values({
+		id,
+		ownerUserId: alice,
+		visibility: "public",
+		createdAt: new Date().toISOString(),
+		updatedAt: new Date().toISOString(),
+	});
+	const room = await resolveNarratorRoom(id, alice);
+	await resolveNarratorRoom(id, bob);
+	const message = await postMessage({ roomId: room.id, senderUserId: alice, text: "scoped" });
+	const recorded = record();
+	await chatNotifyTesting.onMessageCreated({
+		roomId: room.id,
+		messageId: message.id,
+		seq: message.seq,
+		senderUserId: alice,
+		roomKind: "narrator",
+		narratorId: id,
+	});
+	expect(recorded.userBroadcasts[0]?.message).toEqual({
+		type: "chat:unread_changed",
+		roomId: room.id,
+		unread: 1,
+		narratorId: id,
+	});
+	await markRead(room.id, bob, message.seq);
+	await chatNotifyTesting.onRoomRead({
+		roomId: room.id,
+		userId: bob,
+		lastReadSeq: message.seq,
+		narratorId: id,
+	});
+	expect(recorded.userBroadcasts.at(-1)?.message).toEqual({
+		type: "chat:unread_changed",
+		roomId: room.id,
+		unread: 0,
+		narratorId: id,
+	});
+});
+
 describe("message fan-out", () => {
 	test("subscribers get the row, absent members get a count", async () => {
 		const room = await resolveDmRoom(alice, bob);
@@ -105,6 +170,7 @@ describe("message fan-out", () => {
 		if (badge.type === "chat:unread_changed") {
 			expect(badge.roomId).toBe(room.id);
 			expect(badge.unread).toBe(1);
+			expect(badge).not.toHaveProperty("narratorId");
 			expect(badge).not.toHaveProperty("message");
 		}
 	});

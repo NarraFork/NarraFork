@@ -4,15 +4,22 @@ import { appVersionsMatch } from "../lib/version-match";
 import { createVersionRefreshMonitor } from "../lib/version-refresh";
 import { hasDisconnected, onWSStatusChange } from "../lib/ws-status";
 
-/** Confirm the live server version before automatically replacing a stale frontend. */
+declare const __DEV_VITE_PORT__: number | undefined;
+
+/** Confirm the live server version before automatically replacing a stale built frontend. */
 export function useVersionCheck(intervalMs = 60_000) {
 	const [dismissed, setDismissed] = useState(false);
 	const [serverVersion, setServerVersion] = useState<string>();
 	const appVersion = __APP_VERSION__.replace(/^v/, "");
+	// Vite serves live source, not the backend's static build. Reloading cannot fix
+	// build skew here. This serve-only define also covers start:dev's production
+	// mode (where import.meta.env.DEV is false) and reverse-proxied/custom ports.
+	const enabled = typeof __DEV_VITE_PORT__ === "undefined";
 	const updateAvailable =
-		!dismissed && !!serverVersion && !appVersionsMatch(serverVersion, appVersion);
+		enabled && !dismissed && !!serverVersion && !appVersionsMatch(serverVersion, appVersion);
 
 	useEffect(() => {
+		if (!enabled) return;
 		const monitor = createVersionRefreshMonitor(appVersion, setServerVersion);
 		const check = () => void monitor.check();
 		const onVisible = () => {
@@ -43,7 +50,7 @@ export function useVersionCheck(intervalMs = 60_000) {
 			document.removeEventListener("visibilitychange", onVisible);
 			navigator.serviceWorker?.removeEventListener("message", onMessage);
 		};
-	}, [appVersion, intervalMs]);
+	}, [appVersion, enabled, intervalMs]);
 
 	// biome-ignore lint/correctness/useExhaustiveDependencies: reset dismissal for each server build
 	useEffect(() => setDismissed(false), [serverVersion]);

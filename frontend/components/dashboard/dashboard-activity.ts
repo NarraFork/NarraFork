@@ -7,6 +7,8 @@ import { isLiveToolStatusRegression } from "@shared/tool-row-status";
 
 /** Tool rows a dashboard card keeps; matches the server's activity snapshot size. */
 export const ACTIVITY_TOOL_ROWS = 4;
+/** Bounded out-of-order lifecycle facts, never rendered as anonymous recent rows. */
+export const ACTIVITY_UNMATCHED_TOOL_LIMIT = 32;
 
 export interface ActivityToolRow {
 	toolUseId: string;
@@ -18,6 +20,8 @@ export interface ActivityToolRow {
 /** Live overlay on top of the REST list row; absent fields mean "no news yet". */
 export interface NarratorActivity {
 	tools: ActivityToolRow[];
+	/** Execution may precede a start or follow eviction from the four visible rows. */
+	unmatchedToolStatuses?: ReadonlyMap<string, string>;
 	status?: string;
 	substatus?: string[];
 	title?: string;
@@ -76,6 +80,7 @@ export function applyActivityEvent(
 	switch (data.type) {
 		case "activity_snapshot": {
 			const rows = Array.isArray(data.toolCalls) ? data.toolCalls : [];
+			const unmatched = new Map(current.unmatchedToolStatuses);
 			next = {
 				...current,
 				tools: rows
@@ -85,16 +90,23 @@ export function applyActivityEvent(
 						const toolName = str(row.toolName);
 						if (!toolUseId || !toolName) return [];
 						const inputSummary = normalizeSubagentToolInputSummary(row.inputSummary);
+						const status = str(row.status) ?? "";
+						const observedStatus = unmatched.get(toolUseId);
+						unmatched.delete(toolUseId);
 						return [
 							{
 								toolUseId,
 								toolName,
-								status: str(row.status) ?? "",
+								status:
+									observedStatus && isLiveToolStatusRegression(observedStatus, status)
+										? observedStatus
+										: status,
 								...(inputSummary ? { inputSummary } : {}),
 							},
 						];
 					})
 					.slice(-ACTIVITY_TOOL_ROWS),
+				unmatchedToolStatuses: unmatched.size ? unmatched : undefined,
 			};
 			break;
 		}
@@ -106,13 +118,21 @@ export function applyActivityEvent(
 				normalizeSubagentToolInputSummary(data.inputSummary) ??
 				projectSubagentToolInputSummary(data.input);
 			const existing = current.tools.find((tool) => tool.toolUseId === toolUseId);
+			const observedStatus = existing?.status ?? current.unmatchedToolStatuses?.get(toolUseId);
+			const unmatched = new Map(current.unmatchedToolStatuses);
+			unmatched.delete(toolUseId);
 			next = {
 				...current,
+				unmatchedToolStatuses: unmatched.size ? unmatched : undefined,
 				tools: upsertTool(current.tools, {
 					toolUseId,
 					toolName,
-					// A late `tool_started` must not pull a finished row back to running.
-					status: existing && existing.status !== "running" ? existing.status : "running",
+					// Parsed arguments are not execution: only `tool_executing` turns blue.
+					// Late starts must not rewind an executing or settled row.
+					status:
+						observedStatus && isLiveToolStatusRegression(observedStatus, "initializing")
+							? observedStatus
+							: "initializing",
 					...(inputSummary ? { inputSummary } : {}),
 				}),
 			};
@@ -122,8 +142,28 @@ export function applyActivityEvent(
 		case "tool_completed": {
 			const toolUseId = str(data.toolUseId);
 			const existing = current.tools.find((tool) => tool.toolUseId === toolUseId);
-			if (!toolUseId || !existing) return state;
+			if (!toolUseId) return state;
 			const status = data.type === "tool_executing" ? "running" : (str(data.status) ?? "");
+			if (!existing) {
+				const observedStatus = current.unmatchedToolStatuses?.get(toolUseId);
+				if (data.type !== "tool_executing" && !observedStatus) return state;
+				if (
+					observedStatus &&
+					(observedStatus === status || isLiveToolStatusRegression(observedStatus, status))
+				)
+					return state;
+				// An unmatched execution might be an early event OR an evicted older
+				// call. Neither may append to the visible list or displace newer starts.
+				const unmatched = new Map(current.unmatchedToolStatuses);
+				unmatched.set(toolUseId, status);
+				while (unmatched.size > ACTIVITY_UNMATCHED_TOOL_LIMIT) {
+					const oldest = unmatched.keys().next().value;
+					if (oldest === undefined) break;
+					unmatched.delete(oldest);
+				}
+				next = { ...current, unmatchedToolStatuses: unmatched };
+				break;
+			}
 			if (status === existing.status || isLiveToolStatusRegression(existing.status, status))
 				return state;
 			next = { ...current, tools: upsertTool(current.tools, { ...existing, status }) };
@@ -132,8 +172,14 @@ export function applyActivityEvent(
 		case "tool_use_discarded": {
 			const ids = new Set(strings(data.toolUseIds) ?? []);
 			const tools = current.tools.filter((tool) => !ids.has(tool.toolUseId));
-			if (tools.length === current.tools.length) return state;
-			next = { ...current, tools };
+			const unmatched = new Map(current.unmatchedToolStatuses);
+			for (const id of ids) unmatched.delete(id);
+			if (
+				tools.length === current.tools.length &&
+				unmatched.size === (current.unmatchedToolStatuses?.size ?? 0)
+			)
+				return state;
+			next = { ...current, tools, unmatchedToolStatuses: unmatched.size ? unmatched : undefined };
 			break;
 		}
 		case "status_change":

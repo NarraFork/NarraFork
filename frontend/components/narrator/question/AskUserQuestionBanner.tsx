@@ -15,9 +15,10 @@ import {
 	Tooltip,
 } from "@mantine/core";
 import { IconClockHour4, IconSettings } from "@tabler/icons-react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useRuntimeSettings } from "../../../hooks/useRuntimeSettings";
+import { useUpdateRuntimeSettings } from "../../../hooks/useUpdateRuntimeSettings";
 import { api } from "../../../lib/api";
 import { readSession, removeSession, writeSession } from "../../../lib/session-store";
 import { usePermissionTextareaStyle } from "../permission/permission-textarea-typography";
@@ -185,19 +186,9 @@ export function AskUserQuestionBanner({
 	const { t: tc } = useTranslation("common");
 	// In the transcript the answer box paints the rows its height model counts (D49).
 	const textareaStyle = usePermissionTextareaStyle();
-	const qc = useQueryClient();
 	const [settingsOpen, setSettingsOpen] = useState(false);
-	const { data: settingsData, isLoading: settingsLoading } = useQuery({
-		queryKey: ["settings"],
-		queryFn: api.getSettings,
-	});
-	const updateSettingsMutation = useMutation({
-		mutationFn: api.updateSettings,
-		onSuccess: (data) => {
-			qc.setQueryData(["settings"], data);
-			qc.invalidateQueries({ queryKey: ["settings"] });
-		},
-	});
+	const { data: settingsData, isLoading: settingsLoading } = useRuntimeSettings();
+	const updateSettingsMutation = useUpdateRuntimeSettings();
 	const questionReflectionEnabled = settingsData?.agent?.questionReflectionEnabled ?? false;
 	const questionReflectionTimeoutMs = settingsData?.agent?.questionReflectionTimeoutMs ?? 300000;
 	const settingsDisabled = settingsLoading || updateSettingsMutation.isPending;

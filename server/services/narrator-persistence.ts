@@ -115,6 +115,12 @@ import {
 	raiseSeqFloorForClaim,
 } from "./narrator-refs/seq-store";
 import { assertSqliteNarratorOperation, getNarratorMessageRefsPort } from "./narrator-refs/store";
+import {
+	type CommittedNarratorStatus as CommittedStatus,
+	committedNarratorStatusPatch as committedStatusPatch,
+	narratorStatusPatchColumns as statusPatchColumns,
+	versionNarratorStatusCommit,
+} from "./narrator-status-version";
 import { preserveTurnTimingSubstatus, transitionTurnTimingSubstatus } from "./narrator-turn-timing";
 import {
 	assertRecoveryFields,
@@ -1349,18 +1355,26 @@ async function writeSubstatus(
 ) {
 	// Retry on transient SQLite locks so a busy DB never leaves a stale substatus
 	// tag (e.g. "reflecting"/"reasoning") stuck on the narrator forever.
-	await withDbRetry(
+	const committed = await withDbRetry(
 		async () =>
 			db.transaction((tx) => {
 				assertNarratorRead(tx, narratorId, observed);
-				tx.update(narrators)
-					.set({ substatus: JSON.stringify(substatus), updatedAt: now })
-					.where(eq(narrators.id, narratorId))
-					.run();
+				return versionNarratorStatusCommit(
+					tx
+						.update(narrators)
+						.set({
+							substatus: JSON.stringify(substatus),
+							updatedAt: sql`case when ${narrators.updatedAt} > ${now} then ${narrators.updatedAt} else ${now} end`,
+						})
+						.where(eq(narrators.id, narratorId))
+						.returning(statusPatchColumns)
+						.get(),
+				);
 			}),
 		{ label: "writeSubstatus", maxRetries: 5 },
 	);
-	backgroundOccupancyStore.refreshNarrator(narratorId);
+	if (committed) backgroundOccupancyStore.refreshNarrator(narratorId);
+	return committed;
 }
 
 /**
@@ -3757,8 +3771,7 @@ const sqliteNarratorPersistence = {
 			expectedLogicalRunId?: string | null;
 		},
 	) {
-		let wroteStatus = false;
-		let keptIdleError = false;
+		let committedStatus: CommittedStatus | undefined;
 		const errorMessage = options?.errorMessage;
 		const errorCode = options?.errorCode;
 		const diagnostics = normalizeApiRequestDiagnostics(options?.diagnostics);
@@ -3786,13 +3799,6 @@ const sqliteNarratorPersistence = {
 			typeof diagnostics?.retryable === "boolean" ? diagnostics.retryable : null;
 		const turnStartedAt = setTurnStart ? now : options?.turnStartedAt;
 		let actualSubstatus = requestedSubstatus;
-		// The generation broadcast to clients: the fresh turn start when this call
-		// begins a turn, otherwise the narrator's existing turnStartedAt read from
-		// the DB. Broadcasting it on terminal (done/unread) transitions lets the
-		// notification layer key dedup on the specific execution generation, so a
-		// resubscribe snapshot for the same turn is suppressed while a new turn's
-		// completion (e.g. during a disconnect) still notifies.
-		let broadcastTurnStartedAt: string | undefined = turnStartedAt;
 		const writeStatus = async () => {
 			let observed: NarratorRead | undefined;
 			if (requestedSubstatus !== undefined) {
@@ -3809,9 +3815,6 @@ const sqliteNarratorPersistence = {
 					substatus: row.substatus,
 					turnStartedAt: row.turnStartedAt,
 				};
-				if (broadcastTurnStartedAt === undefined) {
-					broadcastTurnStartedAt = row?.turnStartedAt ?? undefined;
-				}
 				const currentSubstatus = parseSubstatus(row?.substatus);
 				if (
 					options?.keepIdleError &&
@@ -3819,8 +3822,8 @@ const sqliteNarratorPersistence = {
 					currentSubstatus.includes("error")
 				) {
 					// Skipping is itself a decision on the observation: confirm it under the lock.
+					// No commit: the caller sees `false`, as for an archived session.
 					db.transaction((tx) => assertNarratorRead(tx, narratorId, observed));
-					keptIdleError = true;
 					return;
 				}
 				actualSubstatus = preserveBackgroundCompactingSubstatus(
@@ -3841,7 +3844,7 @@ const sqliteNarratorPersistence = {
 			// Retry on transient SQLite locks so a status/substatus transition
 			// (e.g. clearing "reflecting" after a danger reflection ends) is never
 			// silently dropped when the DB is momentarily busy.
-			wroteStatus = await withDbRetry(
+			committedStatus = await withDbRetry(
 				async () =>
 					db.transaction((tx) => {
 						if (requestedSubstatus !== undefined) assertNarratorRead(tx, narratorId, observed);
@@ -3868,7 +3871,7 @@ const sqliteNarratorPersistence = {
 							if (!parent || parent.turnStartedAt !== options.parentRecoveryTurn.turnStartedAt)
 								throw new RuntimeReadConflictError();
 						}
-						const changed = tx
+						const committed = tx
 							.update(narrators)
 							.set({
 								status,
@@ -3887,9 +3890,9 @@ const sqliteNarratorPersistence = {
 									options?.unlessArchived ? ne(narrators.status, "archived") : undefined,
 								),
 							)
-							.returning({ id: narrators.id })
-							.all();
-						return options?.unlessArchived ? changed.length > 0 : true;
+							.returning(statusPatchColumns)
+							.get();
+						return versionNarratorStatusCommit(committed);
 					}),
 				{ label: "updateStatus.write", maxRetries: 5 },
 			);
@@ -3900,8 +3903,7 @@ const sqliteNarratorPersistence = {
 			await writeStatus();
 		}
 
-		if (keptIdleError) return false;
-		if (options?.unlessArchived && !wroteStatus) return false;
+		if (!committedStatus) return false;
 
 		backgroundOccupancyStore.refreshNarrator(narratorId);
 		// Always emit status_changed so downstream listeners (gateway, notifications)
@@ -3977,7 +3979,7 @@ const sqliteNarratorPersistence = {
 					// `db.transaction((tx) => …)` IS the same native synchronous
 					// transaction, and going through it lets the seq claim share the
 					// single authority in narrator-refs/seq-store.ts.)
-					await withDbRetry(
+					const afterErrorStatus = await withDbRetry(
 						async () =>
 							dbTransactionWithSeqFloor(narratorId, (tx) => {
 								insertEnvelope(tx, {
@@ -3999,10 +4001,14 @@ const sqliteNarratorPersistence = {
 										isCompact: 0,
 									})
 									.run();
-								tx.update(narrators)
-									.set({ messageVersion: sql`${narrators.messageVersion} + 1` })
-									.where(eq(narrators.id, narratorId))
-									.run();
+								return versionNarratorStatusCommit(
+									tx
+										.update(narrators)
+										.set({ messageVersion: sql`${narrators.messageVersion} + 1` })
+										.where(eq(narrators.id, narratorId))
+										.returning(statusPatchColumns)
+										.get(),
+								);
 							}),
 						{ label: "persistErrorSystemMessage", maxRetries: 5 },
 					);
@@ -4022,6 +4028,14 @@ const sqliteNarratorPersistence = {
 							children: [],
 						},
 					});
+					// The error card increments messageCount after the original status commit.
+					// Publish this transaction's actual state; never promote the older patch.
+					if (afterErrorStatus)
+						broadcastToNarrator(narratorId, {
+							type: "status_change",
+							narratorId,
+							...(await committedStatusPatch(narratorId, afterErrorStatus)),
+						});
 				} catch (e) {
 					logger.warn("Failed to persist error system message", {
 						narratorId,
@@ -4045,9 +4059,7 @@ const sqliteNarratorPersistence = {
 		broadcastToNarrator(narratorId, {
 			type: "status_change",
 			narratorId,
-			status,
-			substatus: actualSubstatus,
-			turnStartedAt: broadcastTurnStartedAt,
+			...(await committedStatusPatch(narratorId, committedStatus)),
 			...(backgroundWorkActive ? { backgroundWorkActive } : {}),
 		});
 	},
@@ -4074,10 +4086,6 @@ const sqliteNarratorPersistence = {
 		const normalizedErrorMessage = isError ? (errorMessage ?? null) : null;
 		const expected = Array.isArray(expectedStatus) ? expectedStatus : [expectedStatus];
 		let actualSubstatus = requestedSubstatus;
-		// The execution generation to broadcast on the terminal (done/unread)
-		// transition so clients can dedup notifications per turn (see updateStatus).
-		let broadcastTurnStartedAt: string | undefined;
-		const placeholders = expected.map(() => "?").join(",");
 		const runCompareAndSet = async () => {
 			let observed: NarratorRead | undefined;
 			if (requestedSubstatus !== undefined) {
@@ -4090,7 +4098,6 @@ const sqliteNarratorPersistence = {
 					persistenceReadOptions(options),
 				);
 				observed = row;
-				broadcastTurnStartedAt = row?.turnStartedAt ?? undefined;
 				const currentSubstatus = parseSubstatus(row?.substatus);
 				actualSubstatus = preserveBackgroundCompactingSubstatus(
 					currentSubstatus,
@@ -4110,20 +4117,20 @@ const sqliteNarratorPersistence = {
 				async () =>
 					db.transaction((tx) => {
 						if (requestedSubstatus !== undefined) assertNarratorRead(tx, narratorId, observed);
-						const statement = sqlite.prepare(
-							substatusJson !== undefined
-								? `UPDATE narrators SET status = ?, archived_with_narrator_id = NULL, error_message = ?, substatus = ?, updated_at = ? WHERE id = ? AND status IN (${placeholders})`
-								: `UPDATE narrators SET status = ?, archived_with_narrator_id = NULL, error_message = ?, updated_at = ? WHERE id = ? AND status IN (${placeholders})`,
-						);
-						try {
-							return statement.run(
-								...(substatusJson !== undefined
-									? [newStatus, normalizedErrorMessage, substatusJson, now, narratorId, ...expected]
-									: [newStatus, normalizedErrorMessage, now, narratorId, ...expected]),
-							);
-						} finally {
-							statement.finalize();
-						}
+						const committed = tx
+							.update(narrators)
+							.set({
+								status: newStatus,
+								archivedWithNarratorId: null,
+								errorMessage: normalizedErrorMessage,
+								errorRetryable: normalizedErrorMessage ? (diagnostics?.retryable ?? null) : null,
+								updatedAt: sql`case when ${narrators.updatedAt} > ${now} then ${narrators.updatedAt} else ${now} end`,
+								...(substatusJson !== undefined && { substatus: substatusJson }),
+							})
+							.where(and(eq(narrators.id, narratorId), inArray(sql`${narrators.status}`, expected)))
+							.returning(statusPatchColumns)
+							.get();
+						return versionNarratorStatusCommit(committed);
 					}),
 				{ label: "compareAndSetStatus.write", maxRetries: 5 },
 			);
@@ -4133,7 +4140,7 @@ const sqliteNarratorPersistence = {
 				? await narratorSubstatusLock.acquire(narratorId, runCompareAndSet)
 				: await runCompareAndSet();
 
-		if (result.changes === 0) return false;
+		if (!result) return false;
 		backgroundOccupancyStore.refreshNarrator(narratorId);
 
 		// Always emit status_changed; for errors also emit narrator:error.
@@ -4174,9 +4181,7 @@ const sqliteNarratorPersistence = {
 		broadcastToNarrator(narratorId, {
 			type: "status_change",
 			narratorId,
-			status: newStatus,
-			substatus: actualSubstatus,
-			turnStartedAt: broadcastTurnStartedAt,
+			...(await committedStatusPatch(narratorId, result)),
 			...(backgroundWorkActive ? { backgroundWorkActive } : {}),
 		});
 		return true;
@@ -4204,12 +4209,13 @@ const sqliteNarratorPersistence = {
 				options?.preserveTiming === false
 					? substatus
 					: preserveTurnTimingSubstatus(parseSubstatus(row?.substatus), substatus);
-			await writeSubstatus(narratorId, actualSubstatus, undefined, row);
-			broadcastToNarrator(narratorId, {
-				type: "substatus_change",
-				narratorId,
-				substatus: actualSubstatus,
-			});
+			const committed = await writeSubstatus(narratorId, actualSubstatus, undefined, row);
+			if (committed)
+				broadcastToNarrator(narratorId, {
+					type: "substatus_change",
+					narratorId,
+					...(await committedStatusPatch(narratorId, committed)),
+				});
 		});
 	},
 
@@ -4237,12 +4243,13 @@ const sqliteNarratorPersistence = {
 			const current = parseSubstatus(row?.substatus);
 			if (current.includes(tag)) return current;
 			const updated = [...current, tag];
-			await writeSubstatus(narratorId, updated, undefined, row);
-			broadcastToNarrator(narratorId, {
-				type: "substatus_change",
-				narratorId,
-				substatus: updated,
-			});
+			const committed = await writeSubstatus(narratorId, updated, undefined, row);
+			if (committed)
+				broadcastToNarrator(narratorId, {
+					type: "substatus_change",
+					narratorId,
+					...(await committedStatusPatch(narratorId, committed)),
+				});
 			return updated;
 		});
 	},
@@ -4271,12 +4278,13 @@ const sqliteNarratorPersistence = {
 			const current = parseSubstatus(row?.substatus);
 			if (!current.includes(tag)) return current;
 			const updated = current.filter((t) => t !== tag);
-			await writeSubstatus(narratorId, updated, undefined, row);
-			broadcastToNarrator(narratorId, {
-				type: "substatus_change",
-				narratorId,
-				substatus: updated,
-			});
+			const committed = await writeSubstatus(narratorId, updated, undefined, row);
+			if (committed)
+				broadcastToNarrator(narratorId, {
+					type: "substatus_change",
+					narratorId,
+					...(await committedStatusPatch(narratorId, committed)),
+				});
 			return updated;
 		});
 	},

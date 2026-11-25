@@ -41,6 +41,8 @@ export interface NarratorListStateSnapshotItem {
 	status: string;
 	substatus?: string[];
 	turnStartedAt?: string;
+	statusEpoch?: string;
+	statusRevision?: number;
 	activeBackgroundTaskCount?: number;
 	activeBackgroundWorkCount?: number;
 	activeBackgroundServiceCount?: number;
@@ -308,7 +310,15 @@ export type NarratorServerMessage =
 			narratorId: string;
 			status: string;
 			substatus?: string[];
-			turnStartedAt?: string;
+			/** Omitted fields are unchanged; null explicitly clears a persisted value. */
+			turnStartedAt?: string | null;
+			updatedAt?: string;
+			messageCount?: number;
+			errorMessage?: string | null;
+			errorRetryable?: boolean | null;
+			archivedWithNarratorId?: string | null;
+			statusEpoch?: string;
+			statusRevision?: number;
 			/**
 			 * Present on the done-transition (idle + unread) when background work
 			 * whose completion wakes the narrator (bash tasks / subagents — never
@@ -318,7 +328,22 @@ export type NarratorServerMessage =
 			 */
 			backgroundWorkActive?: boolean;
 	  }
-	| { type: "substatus_change"; narratorId: string; substatus: string[] }
+	| {
+			type: "substatus_change";
+			narratorId: string;
+			substatus: string[];
+			/** Versioned producers carry the same complete committed patch as status_change. */
+			status?: string;
+			turnStartedAt?: string | null;
+			updatedAt?: string;
+			messageCount?: number;
+			errorMessage?: string | null;
+			errorRetryable?: boolean | null;
+			archivedWithNarratorId?: string | null;
+			statusEpoch?: string;
+			statusRevision?: number;
+			backgroundWorkActive?: boolean;
+	  }
 	/** Initial state of an `activity` subscription: the narrator's latest tool calls. */
 	| {
 			type: "activity_snapshot";
@@ -1060,6 +1085,8 @@ export type NarratorServerMessage =
 			}>;
 	  }
 	| { type: "model_changed"; narratorId: string; model: string }
+	/** Observed execution source changed; refetch only the authorized small model summary. */
+	| { type: "runtime_model_changed"; narratorId: string }
 	| { type: "streaming_reset"; narratorId: string; parentToolUseId?: string }
 	/**
 	 * Live tool cards that will never complete, because the attempt that streamed
@@ -1260,7 +1287,9 @@ export type NarratorServerMessage =
 				| "shared"
 				| "unshared"
 				| "grant_changed"
-				| "owner_changed";
+				| "owner_changed"
+				/** The session became a team coordinator or its team was disbanded. */
+				| "team_changed";
 	  }
 	| {
 			type: "team_message";
@@ -1403,4 +1432,9 @@ export type NarratorServerMessage =
 	 * Per-user badge refresh for a room this user is NOT currently viewing.
 	 * Id + count only; the client refetches the summary if it needs more.
 	 */
-	| { type: "chat:unread_changed"; roomId: string; unread: number };
+	| { type: "chat:unread_changed"; roomId: string; unread: number; narratorId?: string }
+	/** Existing authorized narrator subscribers can discover a lazily created discussion. */
+	| { type: "chat:room_created"; roomId: string; narratorId: string }
+	/** A request-correlated ceiling read only after an authorized room join. */
+	| { type: "chat:subscribed"; roomId: string; requestId: string; tailSeq: number }
+	| { type: "chat:subscription_denied"; roomId: string; requestId: string; status: 403 };

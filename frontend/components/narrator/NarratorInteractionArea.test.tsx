@@ -195,6 +195,44 @@ test("passes image/file resources into the composer without an external attachme
 	);
 });
 
+test("a viewer without write access gets a read-only notice instead of the composer", () => {
+	const props = {
+		common: { narratorId: "n", isWorkspacePreview: false },
+		attachedImages: [],
+		attachedTextFiles: [],
+		queueDeps: { queuedMessages: [] },
+		statusBarInputs: {},
+		composerRowProps: {},
+		sendingState: null,
+	} as unknown as NarratorInteractionAreaProps;
+	const readOnly = renderToStaticMarkup(<NarratorInteractionArea {...props} readOnly />);
+	expect(readOnly).toContain('data-region="composer-read-only"');
+	expect(readOnly).toContain("composerReadOnly");
+	expect(readOnly).not.toContain('data-region="composer"');
+	expect(readOnly).not.toContain("contenteditable");
+	for (const writable of [undefined, false]) {
+		const html = renderToStaticMarkup(<NarratorInteractionArea {...props} readOnly={writable} />);
+		expect(html).toContain('data-region="composer"');
+		expect(html).not.toContain("composer-read-only");
+	}
+});
+
+test("the panel turns the composer read-only exactly when write access is refused", async () => {
+	const panel = await Bun.file(new URL("./NarratorPanel.tsx", import.meta.url)).text();
+	// The bounded summary carries the same authorized canWrite fact as the old
+	// standalone terminal-access read; a failed summary remains unknown, not denied.
+	expect(panel.match(/const canOpenTerminals =[^;]+;/)?.[0]).toBe(
+		"const canOpenTerminals = uiSummaryQuery.isError ? undefined : uiSummaryQuery.data?.canWrite;",
+	);
+	expect(panel.includes("readOnly={canOpenTerminals === false}")).toBe(true);
+	for (const locale of ["en", "zh-CN"]) {
+		const resources = await Bun.file(
+			new URL(`../../locales/${locale}/narrator.json`, import.meta.url),
+		).json();
+		expect(resources.composerReadOnly).toBeString();
+	}
+});
+
 let root: Root | undefined;
 const globals = ["window", "document", "navigator", "IS_REACT_ACT_ENVIRONMENT"] as const;
 const savedGlobals = new Map<string, PropertyDescriptor | undefined>();

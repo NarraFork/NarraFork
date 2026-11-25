@@ -9,6 +9,7 @@ anchors:
   - server/services/teams/team-knowledge.ts
   - server/lib/agent/tools/team.ts
   - server/services/teams/__tests__/work-item-lifecycle.test.ts
+  - server/services/teams/__tests__/work-item-branch-name.test.ts
   - server/services/teams/__tests__/work-item-knowledge.test.ts
   - server/services/teams/__tests__/team-checkin-brief.test.ts
 keywords:
@@ -34,10 +35,13 @@ keywords:
   - recordWorkEvent
   - confirmedLoss
   - team.checkin
+  - work.returned
+  - returnWorkItem
+  - TEAM_WORK_ITEM_NOT_RETURNABLE
   - Team 工具
   - Agent isolation worktree
 status: draft
-verified_at: 12e8a02d8
+verified_at: 7d5423c07
 ---
 # 工作项
 
@@ -48,7 +52,8 @@ verified_at: 12e8a02d8
 - 状态：queued / in_progress / in_review / ready / merged / cancelled（`shared/project-teams.ts:TEAM_WORK_ITEM_STATES`）。
 - 看板五列：queued、in_progress、review（含 in_review 与 ready）、done（merged）、cancelled。
 - `work.create`：
-  - 先经现有 narrator worktree 创建通道建分支 `team/<标题 slug>-<id 哈希 8 位>` 与 worktree；
+  - 先经现有 narrator worktree 创建通道建分支 `team/<slug>-<id 哈希 8 位>` 与 worktree；
+  - slug 只取 ASCII 单词（`workBranchSlug`：NFKD 去重音、全角折半，其余文字不音译，最多 40 字符），先取协调者给的 `branchHint`，再取标题，都没有就是 `work`；全 ASCII 是为了过 `gitBranchName`、worktree 服务的 ref 检查和 `git check-ref-format`，哈希保证唯一。`Agent({ isolation })` 的标题没有 ASCII 单词时用 description 当 hint。已有分支不改名；
   - 再写行与 `work.created` 事件，初始 `queued`。
 - `Agent({ isolation: "worktree" })` 建的是 kind=`isolated` 的项，初始 `in_progress`。子代理结束时若没有提交也没有未提交改动，就清理 worktree 并取消该项（`settleIsolatedWorkItem`）。
 - 第一层子代理经 `attachWorker` 记为工作者，queued 的项随之开始。
@@ -57,6 +62,8 @@ verified_at: 12e8a02d8
 - `work.review`：blocker 把项退回 `in_progress`，clear 留在 `in_review`。
 - `work.ready` 需要最新一轮评审为 clear，否则 409 `TEAM_WORK_ITEM_NOT_REVIEWED`。
 - `work.ready` 还要 worktree 无未提交改动，否则 409 `TEAM_WORK_ITEM_DIRTY`。
+- `work.ready` 事件除 `head`、`changedPathCount` 外还记 `mergeBase` 与 `diffStat`（钉住 head 时的 `+/-` 与文件数，best-effort，读不出为 null），已合并的项（head 已在基线里）靠它们在团队页显示大小和改动文件。
+- 人从团队页退回（`returnWorkItem`，见[团队页与审批](page.md)）：只能从 in_review / ready（否则 409 `TEAM_WORK_ITEM_NOT_RETURNABLE`），记 `work.returned`（actor 为那个人，带理由），回 in_progress、`reviewRounds+1`、`lastReview = blocker`，所以再 ready 前要重新评审；持有的独占锁同事务释放。服务端只把理由作为 `team_return` 注入给协调者，由它转给工作者。
 - 评审之后的新提交不拦，只在结果里计数。
 - DIRTY 之后钉住一个 head 提交（读不出：409 `TEAM_WORK_ITEM_HEAD_UNAVAILABLE`）。知识检查、改动路径、独占路径判定、评审后提交计数都按它读，记录的 `headSha` 与 `work.ready` 事件的 `head` 也是它。按别的提交读出的改动路径算读不出。
 - 知识检查排在钉住 head 之后、独占路径之前（`teams/team-knowledge.ts:assertKnowledgeFresh`），见下一节。
@@ -90,7 +97,7 @@ verified_at: 12e8a02d8
 事件与 check-in：
 - 每次状态变更、评审、同步、清理、check-in、决策都追加一行 `team_work_events`（`recordWorkEvent`）。actor 为 person / agent / system，详情上限 8KB。
 - check-in 是一个团队只保留一个的定时唤醒（5 分钟到 1 天），记为 `team.checkin` 事件，重启与取消归档时重新装填。
-- 服务端读 git 只经 `teams/team-git.ts`：禁用 hook、fsmonitor、外部 diff/textconv、写 index，读上限沿用 `gitService`（60s、1MB；`readBlob` 按 blob 大小限输出）。`changedPaths`、`branchFileChanges`、`treeEntry`、`treeBlobs`、`readBlob` 只读提交与对象，不读工作区；前两者可传入钉住的提交。
+- 服务端读 git 只经 `teams/team-git.ts`：禁用 hook、fsmonitor、外部 diff/textconv、写 index，读上限沿用 `gitService`（60s、1MB；`readBlob` 按 blob 大小限输出）。`changedPaths`、`branchFileChanges`、`treeEntry`、`treeBlobs`、`readBlob`、`mergeBase`、`numstat`（`diff --numstat --no-relative -z`，路径总是相对仓库根，512KB 上限，超出标 `truncated`）、`fileDiff`（单个从仓库根算起的字面路径 `:(top,literal)` 的 `diff -U3 --no-relative`，git 在子目录里跑也一样，经 `stdoutStream` 读到上限 +1 字节即停）只读提交与对象，不读工作区；前两者可传入钉住的提交。团队页的大小、抽屉与 diff 都经它们（`team-work-view.ts`）。同一文件的 `isGitWorkTree`（10s 超时）供建团队和 `resolve-directory` 判断项目目录是否 git 工作树。
 
 `Team` 工具（`server/lib/agent/tools/team.ts`，仅 team trait 会话提供）：
 - 动作：work.list/create/review/ready/sync/cancel、brief、checkin、cleanup、decision；`work.list` 最多 30 项。
