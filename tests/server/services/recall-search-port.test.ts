@@ -27,7 +27,12 @@ import {
 import { getTestDb } from "../../setup";
 
 const { db, sqlite } = getTestDb();
-mock.module("../../../server/db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
+mock.module("../../../server/db", () => ({
+	db,
+	sqlite,
+	activeDatabaseBackend: "sqlite",
+	postgresRuntime: null,
+}));
 
 const { createSqliteSearchStore } = await import("../../../server/services/search/sqlite-store");
 const { createSqliteSearchQueryExecutor } = await import(
@@ -68,12 +73,15 @@ function seedMessage(params: {
 	text: string;
 	createdAt: string;
 	seq?: number;
+	role?: "user" | "assistant" | "system" | "sys" | "disp";
+	origin?: "user" | "assistant" | "system" | null;
 }) {
 	db.insert(narratorMessages)
 		.values({
 			id: params.id,
 			narratorId: params.ownerId,
-			role: "assistant",
+			role: params.role ?? "assistant",
+			origin: params.origin ?? null,
 			contentJson: [{ type: "text", text: params.text }],
 			contentText: params.text,
 			createdAt: params.createdAt,
@@ -349,5 +357,90 @@ describe("Recall result presentation", () => {
 		const { ids, isError } = await recallSearch("narr-self", { query: "***" });
 		expect(ids).toEqual([]);
 		expect(isError).toBe(true);
+	});
+});
+
+describe("Recall agent-facing filtering and total budgets", () => {
+	for (const query of ["constraints", "要求"]) {
+		it(`filters protocol role and explicit human origin before limit for ${query}`, async () => {
+			for (const [index, origin] of ["assistant", "system", null, "user"].entries()) {
+				seedMessage({
+					id: `authorship-${index}`,
+					ownerId: "narr-self",
+					refFor: ["narr-self"],
+					text: `${query} from author ${index}`,
+					role: "user",
+					origin: origin as "assistant" | "system" | "user" | null,
+					createdAt: index === 3 ? EARLY : LATE,
+					seq: index,
+				});
+			}
+			seedMessage({
+				id: "assistant-repeats",
+				ownerId: "narr-self",
+				refFor: ["narr-self"],
+				text: `${query} repeated by assistant`,
+				role: "assistant",
+				origin: "user",
+				createdAt: LATE,
+				seq: 5,
+			});
+			expect(
+				(await recallSearch("narr-self", { query, roles: ["user"], origins: ["user"], limit: 1 }))
+					.ids,
+			).toEqual(["authorship-3"]);
+			expect(
+				(
+					await recallSearch("narr-self", {
+						query,
+						roles: ["user"],
+						origins: ["unknown"],
+						limit: 1,
+					})
+				).ids,
+			).toEqual(["authorship-2"]);
+		});
+	}
+
+	it("keeps a global permission grant narrowed to the explicit requested conversation", async () => {
+		for (const ownerId of ["narr-self", "narr-other"])
+			seedMessage({
+				id: ownerId,
+				ownerId,
+				refFor: [ownerId],
+				text: "scope request",
+				createdAt: EARLY,
+			});
+		expect(
+			(
+				await recallSearch("narr-self", {
+					query: "scope",
+					narrator_id: "narr-other",
+					all_narrators: true,
+				})
+			).ids,
+		).toEqual(["narr-other"]);
+		expect(
+			(await recallSearch("narr-self", { query: "scope", narrator_id: "narr-other" })).isError,
+		).toBe(true);
+	});
+
+	it("deduplicates alternatives under one total result limit and honours requested time order", async () => {
+		for (let seq = 0; seq < 4; seq++)
+			seedMessage({
+				id: `union-${seq}`,
+				ownerId: "narr-self",
+				refFor: ["narr-self"],
+				text: `alpha bravo requirements ${seq}`,
+				createdAt: seq < 2 ? EARLY : LATE,
+				seq,
+			});
+		const result = await recallSearch("narr-self", {
+			query: ["alpha", "bravo"],
+			limit: 2,
+			sort: "oldest",
+		});
+		expect(result.ids).toEqual(["union-0", "union-1"]);
+		expect(new Set(result.ids).size).toBe(2);
 	});
 });

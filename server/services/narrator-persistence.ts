@@ -116,6 +116,12 @@ import {
 } from "./narrator-refs/seq-store";
 import { assertSqliteNarratorOperation, getNarratorMessageRefsPort } from "./narrator-refs/store";
 import {
+	assertNoLazyChildrenForHistoryRewriteTx,
+	ensureRefsCoverMessage,
+	prepareLazyChildrenForHistoryRewrite,
+} from "./narrator-refs-backfill";
+import { assertNarratorNotReverting, withNarratorWorkAdmission } from "./narrator-session-state";
+import {
 	type CommittedNarratorStatus as CommittedStatus,
 	committedNarratorStatusPatch as committedStatusPatch,
 	narratorStatusPatchColumns as statusPatchColumns,
@@ -2747,54 +2753,99 @@ const sqliteNarratorPersistence = {
 	 * the marker at a specific message instead of appending at the end.
 	 */
 	async clearContextBefore(narratorId: string, beforeMessageId: string) {
-		const id = generateId();
-		const now = new Date().toISOString();
+		return withNarratorWorkAdmission(narratorId, async () => {
+			const deadlineAt = Date.now() + 10_000;
+			// A lazy target must be local before shifting; descendants must keep their
+			// original seqs instead of following the parent's newly shifted history.
+			await ensureRefsCoverMessage(narratorId, beforeMessageId, { deadlineAt });
+			const preparedTarget = await readQueryFirst(
+				db
+					.select({ seq: narratorMessageRefs.seq })
+					.from(narratorMessageRefs)
+					.where(
+						and(
+							eq(narratorMessageRefs.narratorId, narratorId),
+							eq(narratorMessageRefs.messageId, beforeMessageId),
+						),
+					)
+					.limit(1),
+				persistenceReadOptions({ deadlineAt }),
+			);
+			if (!preparedTarget) throw new NotFoundError("Message", beforeMessageId);
+			await prepareLazyChildrenForHistoryRewrite(narratorId, preparedTarget.seq, { deadlineAt });
+			const id = generateId();
+			const now = new Date().toISOString();
 
-		const { msg, seq } = dbTransactionWithSeqFloor(narratorId, (tx) => {
-			const targetRef = tx.query.narratorMessageRefs
-				.findFirst({
-					where: and(
-						eq(narratorMessageRefs.narratorId, narratorId),
-						eq(narratorMessageRefs.messageId, beforeMessageId),
-					),
-				})
-				.sync();
-			if (!targetRef) throw new NotFoundError("Message", beforeMessageId);
+			const { msg, seq } = dbTransactionWithSeqFloor(narratorId, (tx) => {
+				assertNarratorNotReverting(narratorId);
+				const targetRef = tx.query.narratorMessageRefs
+					.findFirst({
+						where: and(
+							eq(narratorMessageRefs.narratorId, narratorId),
+							eq(narratorMessageRefs.messageId, beforeMessageId),
+						),
+					})
+					.sync();
+				if (!targetRef) throw new NotFoundError("Message", beforeMessageId);
+				const state = tx.query.narrators
+					.findFirst({
+						where: eq(narrators.id, narratorId),
+						columns: { refsInheritedFrom: true, refsBackfillCursor: true },
+					})
+					.sync();
+				const localBoundary =
+					state &&
+					((state.refsInheritedFrom === null && state.refsBackfillCursor === null) ||
+						(state.refsInheritedFrom !== null &&
+							Number.isSafeInteger(state.refsBackfillCursor) &&
+							state.refsBackfillCursor !== null &&
+							state.refsBackfillCursor >= 0 &&
+							state.refsBackfillCursor <= targetRef.seq));
+				// Shared admissions allow a fork or another rewrite during preparation.
+				// Fail closed before any insertion/shift if our prepared boundary changed.
+				if (!localBoundary || targetRef.seq !== preparedTarget.seq)
+					throw new AppError(
+						"History changed; prepare context clearing again",
+						409,
+						"HISTORY_LAZY_DEPENDENCY_CHANGED",
+					);
+				assertNoLazyChildrenForHistoryRewriteTx(tx, narratorId, targetRef.seq);
 
-			const msg = insertEnvelope(tx, {
-				id,
-				...newEnvelopeColumns(narratorId),
-				narratorId,
-				role: "system",
-				contentJson: [{ type: "compact", status: "compacted", summary: "" }],
-				contextCharsJson: { segments: [] },
-				contentText: "[Context cleared]",
-				createdAt: now,
+				const msg = insertEnvelope(tx, {
+					id,
+					...newEnvelopeColumns(narratorId),
+					narratorId,
+					role: "system",
+					contentJson: [{ type: "compact", status: "compacted", summary: "" }],
+					contextCharsJson: { segments: [] },
+					contentText: "[Context cleared]",
+					createdAt: now,
+				});
+
+				claimShiftInsertSlot(tx, narratorId, targetRef.seq);
+				tx.insert(narratorMessageRefs)
+					.values({
+						id: generateId(),
+						narratorId,
+						messageId: id,
+						seq: targetRef.seq,
+						isCompact: 1,
+					})
+					.run();
+				tx.update(narrators)
+					.set({
+						apiConversationId: null,
+						contextUsageSnapshotJson: null,
+						messageVersion: sql`${narrators.messageVersion} + 1`,
+						updatedAt: now,
+					})
+					.where(eq(narrators.id, narratorId))
+					.run();
+				return { msg, seq: targetRef.seq };
 			});
 
-			claimShiftInsertSlot(tx, narratorId, targetRef.seq);
-			tx.insert(narratorMessageRefs)
-				.values({
-					id: generateId(),
-					narratorId,
-					messageId: id,
-					seq: targetRef.seq,
-					isCompact: 1,
-				})
-				.run();
-			tx.update(narrators)
-				.set({
-					apiConversationId: null,
-					contextUsageSnapshotJson: null,
-					messageVersion: sql`${narrators.messageVersion} + 1`,
-					updatedAt: now,
-				})
-				.where(eq(narrators.id, narratorId))
-				.run();
-			return { msg, seq: targetRef.seq };
+			return { ...msg, seq };
 		});
-
-		return { ...msg, seq };
 	},
 
 	async finalizeCompactingMessage(
