@@ -63,7 +63,6 @@ export { heuristicProvider } from "./heuristic-provider";
 export type { Landmark, LandmarkKind } from "./landmarks";
 export { countByTag, scanLandmarks } from "./landmarks";
 export { parsePosition, parseSymbolSelector } from "./locate";
-export { invalidateParser } from "./parser-pool";
 export type {
 	ElementNode,
 	FileStatistics,
@@ -102,6 +101,7 @@ export {
 } from "./stash";
 export {
 	clearOutlineCache,
+	invalidateStructureParser as invalidateParser,
 	referenceCounts,
 	referenceLines,
 	treeSitterProvider,
