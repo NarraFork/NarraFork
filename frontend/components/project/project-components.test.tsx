@@ -56,6 +56,15 @@ mock.module("../../hooks/useProjects", () => ({
 	}),
 	useUpdateProject: () => ({ mutate: () => {}, isPending: false, error: null }),
 }));
+// The live activity subscription (a socket) is replaced by what it would have delivered.
+const activityRequests: string[][] = [];
+let liveActivity = new Map<string, unknown>();
+mock.module("../dashboard/useNarratorActivity", () => ({
+	useNarratorActivity: (ids: readonly string[]) => {
+		activityRequests.push([...ids]);
+		return liveActivity;
+	},
+}));
 mock.module("./ProjectAccessPanel", () => ({
 	ProjectAccessPanel: () => <div data-access-panel />,
 }));
@@ -175,7 +184,7 @@ describe("team cards", () => {
 });
 
 describe("sessions", () => {
-	test("tab counts, running rows first and 「最近 7 天」", async () => {
+	test("进行中: running sessions are the home page's cards with their recent tool calls", async () => {
 		const page: ProjectSessionPage = {
 			items: [
 				{
@@ -186,6 +195,8 @@ describe("sessions", () => {
 					updatedAt: new Date().toISOString(),
 					owner: { userId: "u", username: "zhouning", avatarColor: null, avatarImageId: null },
 					activity: { toolName: "Edit", preview: "docs/adr.md", at: "" },
+					cwd: "/home/me/code/acme-app",
+					substatus: [],
 				},
 				{
 					id: "s2",
@@ -195,6 +206,8 @@ describe("sessions", () => {
 					updatedAt: new Date().toISOString(),
 					owner: null,
 					activity: null,
+					cwd: null,
+					substatus: [],
 				},
 			],
 			nextCursor: null,
@@ -205,8 +218,36 @@ describe("sessions", () => {
 			pages: [page],
 			pageParams: [undefined],
 		});
+		activityRequests.length = 0;
+		liveActivity = new Map([
+			[
+				"s1",
+				{
+					status: "waiting",
+					tools: [
+						{
+							toolUseId: "t1",
+							toolName: "Bash",
+							status: "running",
+							inputSummary: { command: "pnpm typecheck" },
+						},
+					],
+				},
+			],
+		]);
 		const html = await render(<ProjectSessions projectId="p" phone={false} />, client);
+		liveActivity = new Map();
 		expect(html).toContain("进行中");
+		// The running session is a dashboard card (its directory row, its tool calls) inside the
+		// card grid, subscribed for activity; the recent one is a compact row after it.
+		const cards = html.indexOf('data-testid="project-running-cards"');
+		expect(cards).toBeGreaterThan(-1);
+		expect(html.indexOf('href="/narrators/s1"')).toBeGreaterThan(cards);
+		expect(html).toContain("acme-app");
+		expect(html).toContain("pnpm typecheck");
+		expect(activityRequests.at(-1)).toEqual(["s1"]);
+		// The card shows the activity: no second, hand-built "what it is doing" line for it.
+		expect(html).not.toContain("等批准编辑文件");
 		expect(html).toContain(">41<");
 		expect(html).toContain("999+");
 		const first = html.indexOf('href="/narrators/s1"');
@@ -214,8 +255,42 @@ describe("sessions", () => {
 		expect(first).toBeGreaterThan(-1);
 		expect(recent).toBeGreaterThan(first);
 		expect(html.indexOf('href="/narrators/s2"')).toBeGreaterThan(recent);
-		expect(html).toContain("等批准编辑文件");
-		expect(html).toContain("zhouning");
+	});
+
+	test("at most 12 cards (and subscriptions) before 「显示全部」", async () => {
+		const running = Array.from({ length: 15 }, (_, index) => ({
+			id: `r${index}`,
+			title: `running ${index}`,
+			status: "working",
+			group: "running" as const,
+			updatedAt: new Date().toISOString(),
+			owner: null,
+			activity: null,
+			cwd: null,
+			substatus: [],
+		}));
+		const client = new QueryClient();
+		client.setQueryData(projectOverviewKeys.sessions("p", "active"), {
+			pages: [{ items: running, nextCursor: null, counts: { active: 15, all: 15, mine: 0 } }],
+			pageParams: [undefined],
+		});
+		activityRequests.length = 0;
+		const html = await render(<ProjectSessions projectId="p" phone={false} />, client);
+		expect(html.match(/href="\/narrators\/r\d+"/g)).toHaveLength(12);
+		expect(activityRequests.at(-1)).toHaveLength(12);
+		expect(html).toContain('data-testid="project-running-show-all"');
+		expect(html).toContain("显示全部 15 个");
+	});
+
+	test("nothing running: no card grid, one line", async () => {
+		const client = new QueryClient();
+		client.setQueryData(projectOverviewKeys.sessions("p", "active"), {
+			pages: [{ items: [], nextCursor: null, counts: { active: 0, all: 1, mine: 0 } }],
+			pageParams: [undefined],
+		});
+		const html = await render(<ProjectSessions projectId="p" phone={false} />, client);
+		expect(html).not.toContain("project-running-cards");
+		expect(html).toContain("没有运行中的会话");
 	});
 });
 

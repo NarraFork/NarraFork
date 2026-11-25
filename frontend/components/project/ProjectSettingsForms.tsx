@@ -23,7 +23,7 @@ import {
 	TextInput,
 } from "@mantine/core";
 import { useQuery } from "@tanstack/react-query";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { usePlatform } from "../../hooks/usePlatform";
 import { useUpdateProject } from "../../hooks/useProjects";
@@ -94,24 +94,37 @@ export function ProjectBasicsForm({
 	// A field follows the stored value until it is edited (its draft), and again once its change
 	// is saved: the server stores the resolved form, which the page then shows.
 	const [drafts, setDrafts] = useState<Partial<Record<BasicsField | "gitPath", string>>>({});
+	// Each edit bumps its field's revision; a save settles the field only if nothing was typed
+	// after it was sent, so a late success never discards a newer edit.
+	const revisions = useRef<Record<string, number>>({});
 	const [failed, setFailed] = useState<Partial<Record<BasicsField | "gitPath", string>>>({});
 	const [confirming, setConfirming] = useState(false);
 	const shown = (field: BasicsField | "gitPath") => drafts[field] ?? stored[field];
-	const edit = (field: BasicsField | "gitPath", value: string) =>
+	const edit = (field: BasicsField | "gitPath", value: string) => {
+		revisions.current[field] = (revisions.current[field] ?? 0) + 1;
 		setDrafts((current) => ({ ...current, [field]: value }));
+	};
 	const settle = (field: BasicsField | "gitPath") => {
 		setDrafts(({ [field]: _done, ...rest }) => rest);
 		setFailed(({ [field]: _done, ...rest }) => rest);
 	};
-	const send = (field: BasicsField | "gitPath", value: string) =>
+	const send = (field: BasicsField | "gitPath", value: string) => {
+		const revision = revisions.current[field] ?? 0;
+		const current = () => (revisions.current[field] ?? 0) === revision;
 		update.mutate(
 			{ id: projectId, data: { [field]: value } },
 			{
-				onSuccess: () => settle(field),
+				// Typed more since: that newer draft stays, to be saved when the field is left.
+				onSuccess: () => {
+					if (current()) settle(field);
+				},
 				// The draft stays, marked unsaved, so a failed save never looks saved.
-				onError: (error: Error) => setFailed((current) => ({ ...current, [field]: error.message })),
+				onError: (error: Error) => {
+					if (current()) setFailed((failedNow) => ({ ...failedNow, [field]: error.message }));
+				},
 			},
 		);
+	};
 	/** Name and description save when the field is left, if they changed and are valid. */
 	const saveOnLeave = (field: BasicsField) => {
 		const draft = drafts[field];
@@ -269,17 +282,43 @@ export function ProjectRuleList({
 		enabled: canManage,
 	});
 	const stored = projectChapterSettings(project)[ruleKey];
-	// The list shown is the stored one, or the change being saved. On success it follows the
-	// stored list again (re-read after the save); on failure the change is dropped, so an
-	// unsaved list never looks saved, and the error says so.
-	const [pending, setPending] = useState<Rule[] | null>(null);
-	const rules = pending ?? normalizeRules(stored);
-	const commit = (next: Rule[]) => {
-		setPending(next);
+	const storedText = JSON.stringify(stored ?? []);
+	// The list shown is the stored one, or the person's latest list while it is being saved and
+	// until the stored list moves past what it was when they first changed it (the saved row is
+	// written to the cache; a refetch follows). Every edit builds on the list shown, so a second
+	// deletion right after a first one never brings the first back. Saves are serialized: an
+	// edit made while one is in flight is sent after it (only the latest). A failed save puts the
+	// stored list back, and the error says so.
+	const [local, setLocal] = useState<{ rules: Rule[]; base: string } | null>(null);
+	const saving = useRef(false);
+	const queued = useRef<Rule[] | null>(null);
+	useEffect(() => {
+		if (local && !saving.current && storedText !== local.base) setLocal(null);
+	}, [storedText, local]);
+	const rules = local?.rules ?? normalizeRules(stored);
+	const send = (next: Rule[]) => {
+		saving.current = true;
 		update.mutate(
 			{ id: String(project.id), data: { chapterSettings: { [ruleKey]: next } } },
-			{ onSettled: () => setPending(null) },
+			{
+				onSuccess: () => {
+					const after = queued.current;
+					queued.current = null;
+					if (after) send(after);
+					else saving.current = false;
+				},
+				onError: () => {
+					saving.current = false;
+					queued.current = null;
+					setLocal(null);
+				},
+			},
 		);
+	};
+	const commit = (next: Rule[]) => {
+		setLocal((current) => ({ rules: next, base: current?.base ?? storedText }));
+		if (saving.current) queued.current = next;
+		else send(next);
 	};
 	const directory = ruleKey === "whitelistDirs" || ruleKey === "blacklistDirs";
 	const [title, description] = RULE_TEXT[ruleKey];

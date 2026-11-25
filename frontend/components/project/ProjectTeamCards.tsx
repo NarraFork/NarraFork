@@ -21,10 +21,11 @@ import {
 	Text,
 	UnstyledButton,
 } from "@mantine/core";
-import type { TeamCard } from "@shared/project-overview";
+import { TEAM_CARD_FINISHED_COUNT_CAP, type TeamCard } from "@shared/project-overview";
 import { IconPlus, IconUsersGroup } from "@tabler/icons-react";
 import { Fragment } from "react";
 import { useTranslation } from "react-i18next";
+import { cappedCount } from "../teams/team-page-model";
 import {
 	ATTENTION_COLOR,
 	ATTENTION_TEXT,
@@ -57,7 +58,10 @@ function Numbers({ team }: { team: TeamCard }) {
 			{(["inProgress", "ready", "done"] as const).map((key) => (
 				<Stack key={key} gap={0}>
 					<Text fw={700} size="lg" style={TABULAR} data-testid={`team-card-${key}`}>
-						{numbers[key]}
+						{/* Finished items are counted up to 1,000 on the server: past it, 「999+」. */}
+						{key === "done"
+							? cappedCount(numbers.done, TEAM_CARD_FINISHED_COUNT_CAP)
+							: numbers[key]}
 					</Text>
 					<Text size="xs" c="dimmed">
 						{t(`page.teams.numbers.${key}`)}

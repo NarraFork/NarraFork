@@ -97,6 +97,9 @@ export interface ProjectAttentionResponse {
 /** Teams per page when the list carries card numbers (`counts=true`). */
 export const PROJECT_TEAM_CARDS_LIMIT = 24;
 
+/** Finished items (merged, cancelled) a team card counts per team and state; one more is "999+". */
+export const TEAM_CARD_FINISHED_COUNT_CAP = 999;
+
 /** A team card's numbers (the team list with `counts=true`). */
 export interface TeamCardCounts {
 	columnCounts: Record<TeamBoardColumn, number>;
@@ -121,6 +124,9 @@ export interface TeamCard extends TeamSummary {
 export const PROJECT_SESSION_VIEWS = ["active", "all", "mine"] as const;
 export type ProjectSessionView = (typeof PROJECT_SESSION_VIEWS)[number];
 
+/** Running session cards 进行中 shows before 「显示全部」 (each subscribes to live activity). */
+export const PROJECT_RUNNING_CARDS_SHOWN = 12;
+
 /** Rows per page of the session list. */
 export const PROJECT_SESSIONS_PAGE_LIMIT = 30;
 /** Each tab's count is counted up to this (then "999+"). */
@@ -133,6 +139,9 @@ export interface ProjectSessionRow {
 	id: string;
 	title: string | null;
 	status: string;
+	/** The working directory (clipped to 512 characters) and the substatus, for the session card. */
+	cwd: string | null;
+	substatus: string[];
 	/** `running`: working or waiting now; `recent`: the rest (「最近 7 天」 in the active view). */
 	group: "running" | "recent";
 	updatedAt: string;

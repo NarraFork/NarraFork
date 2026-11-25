@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useRef, useState } from "react";
 import { api } from "../lib/api";
+import type { ApiEntity } from "../lib/api/types";
 
 const PROJECT_QUERY_GC_TIME_MS = 60_000;
 
@@ -166,7 +167,14 @@ export function useUpdateProject() {
 	return useMutation({
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		mutationFn: ({ id, data }: { id: string; data: any }) => api.updateProject(id, data),
-		onSuccess: (_, { id }) => {
+		onSuccess: (saved, { id }) => {
+			// The response is the saved row: put it in the cache at once, so an editor that
+			// returns to the stored value sees what was just saved, not the row from before it
+			// while the refetch runs. The row carries no `canWrite`: the cached one is kept.
+			if (saved && typeof saved === "object")
+				qc.setQueryData<ApiEntity>(["projects", id], (old: ApiEntity | undefined) =>
+					old ? { ...old, ...saved } : old,
+				);
 			qc.invalidateQueries({ queryKey: ["projects"] });
 			qc.invalidateQueries({ queryKey: ["projects", id] });
 		},
