@@ -273,8 +273,13 @@ function quotaView(
 		_totalObservedAt: _total,
 		...base
 	} = cacheFromSnapshot(latest);
+	const fallback = cacheFromSnapshot(latest === probe ? stream : probe);
 	const projected = nugQuotaSnapshot({
 		...base,
+		detailedQuotaBalance:
+			normalizeNullableString(base.detailedQuotaBalance) ??
+			normalizeNullableString(fallback.detailedQuotaBalance),
+		...(base.extra === undefined && fallback.extra !== undefined ? { extra: fallback.extra } : {}),
 		balance: normalizeNullableNumber(remaining.balances[0]?.remaining),
 		totalGranted: normalizeNullableNumber(total.balances[0]?.total),
 		...amountFields(
