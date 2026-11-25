@@ -14,6 +14,7 @@ import {
 	narratorMessages,
 	narrators,
 	narratorToolCalls,
+	users,
 } from "../../db/schema";
 import { stopTool } from "../../lib/agent/tools/stop";
 import { agentTool } from "../../lib/agent/tools/task";
@@ -81,8 +82,8 @@ afterEach(async () => {
 	await db.delete(narrators).where(inArray(narrators.id, ids));
 });
 
-async function team() {
-	const parent = (await narratorService.create({ locale: "en" })).id;
+async function team(ownerUserId?: string) {
+	const parent = (await narratorService.create({ locale: "en", ownerUserId })).id;
 	created.push(parent);
 	const child = async () => {
 		const row = await narratorService.createSubagent({
@@ -203,23 +204,43 @@ describe("Stop(agent)", () => {
 });
 
 describe("Send(doInterrupt)", () => {
-	test("the controller interrupts; a sibling is refused before delivery", async () => {
-		const { parent, child, sibling } = await team();
+	const userId = "control-send-owner";
+	beforeAll(() => {
+		db.insert(users)
+			.values({
+				id: userId,
+				username: userId,
+				passwordHash: "test",
+				createdAt: new Date().toISOString(),
+			})
+			.run();
+	});
+	test("the controller interrupts; a communicable sibling is refused before delivery", async () => {
+		const { parent, child, sibling } = await team(userId);
 		const turn = liveTurn(child);
+		const input = { ...sendInput(sibling, child), userId };
 		expect(
-			await captureWorkerRejectionThrower(sendSubagentMessageDetailed(sendInput(sibling, child))),
-		).toThrow();
+			(await communication.resolveCommunicationSendTargets(input)).map(({ id }) => id),
+		).toEqual([child]);
+		expect(await captureWorkerRejectionThrower(sendSubagentMessageDetailed(input))).toThrow(
+			"not a direct child",
+		);
 		expect(turn.signal.aborted).toBe(false);
-		const result = await sendSubagentMessageDetailed(sendInput(parent, child));
+		expect(
+			await db.query.narratorBufferedMessages.findMany({
+				where: eq(narratorBufferedMessages.narratorId, child),
+			}),
+		).toHaveLength(0);
+		const result = await sendSubagentMessageDetailed({ ...sendInput(parent, child), userId });
 		expect(result.targets.map((target) => target.status)).toEqual(["queued"]);
 		expect(turn.signal.aborted).toBe(true);
 	});
 
 	test("during takeover the message is delivered but the user's turn is not interrupted", async () => {
-		const { parent, child } = await team();
+		const { parent, child } = await team(userId);
 		const turn = liveTurn(child);
 		markTakenOver(child);
-		const result = await sendSubagentMessageDetailed(sendInput(parent, child));
+		const result = await sendSubagentMessageDetailed({ ...sendInput(parent, child), userId });
 		expect(result.targets.map((target) => target.status)).toEqual(["queued"]);
 		expect(result.output).toContain("doInterrupt was ignored");
 		expect(turn.signal.aborted).toBe(false);

@@ -19,7 +19,7 @@ import {
 	FILE_REFERENCE_IMAGE_MIME_TYPES,
 	MAX_FILE_REFERENCE_IMAGE_BYTES,
 } from "@shared/file-reference-image";
-import { ApiError, authorizedFetch, readFetchError } from "./client";
+import { ApiError, authorizedFetch, getAuthSnapshot, readFetchError } from "./client";
 
 function basePath(narratorId: string): string {
 	return `/api/narrators/${encodeURIComponent(narratorId)}/file-references`;
@@ -57,6 +57,7 @@ async function boundedRequest<T>(
 	const timer = setTimeout(() => controller.abort(new Error("File request timed out")), timeoutMs);
 	let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
 	try {
+		const { generation } = getAuthSnapshot();
 		const response = await authorizedFetch(path, { ...options, signal: controller.signal });
 		const responseLimit = response.ok ? maxBytes : MAX_FILE_REFERENCE_METADATA_BYTES;
 		reader = response.body?.getReader();
@@ -93,6 +94,8 @@ async function boundedRequest<T>(
 						statusText: response.statusText,
 						headers: response.headers,
 					}),
+					undefined,
+					generation,
 				);
 				throw new ApiError(error.message, response.status, error.data);
 			}

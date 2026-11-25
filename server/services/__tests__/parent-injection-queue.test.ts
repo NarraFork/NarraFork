@@ -22,12 +22,24 @@
 
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { cleanDb } from "../../../tests/setup";
-import { backgroundTasks, narratorMessages, narrators, narratorToolCalls } from "../../db/schema";
+import {
+	backgroundTasks,
+	narratorMessages,
+	narrators,
+	narratorToolCalls,
+	users,
+} from "../../db/schema";
 import { closeRuntimeTestDb, getRuntimeTestDb } from "./agent-runtime-test-database";
+import { ensureCommunicationNodeTx } from "./runtime-communication-fixtures";
 
 const { db, sqlite, ready } = getRuntimeTestDb();
 await ready;
-mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
+mock.module("../../db", () => ({
+	db,
+	sqlite,
+	activeDatabaseBackend: "sqlite",
+	postgresRuntime: null,
+}));
 
 import type { ParentInboundMessage } from "../parent-inbound-queue";
 import type { PendingInjection } from "../parent-injection-queue";
@@ -42,6 +54,7 @@ const { drainPendingInjections, hasPendingInjections, pushPendingInjection } = a
 );
 
 const P = "parent-1";
+const SEND_OWNER = "parent-injection-owner";
 const TIME = "2026-09-09T00:00:00.000Z";
 const mailboxStore = createMailboxStore(db);
 let serial = 0;
@@ -50,18 +63,24 @@ let serial = 0;
 function msg(
 	text: string,
 	toolUseId?: string,
+	recipient = P,
 ): Extract<PendingInjection, { kind: "subagent_message" }> {
 	const sender = `sender-${++serial}`;
-	db.insert(narrators)
-		.values({
-			id: sender,
-			type: "subagent",
-			variant: "subagent:general",
-			parentNarratorId: P,
-			createdAt: TIME,
-			updatedAt: TIME,
-		})
-		.run();
+	db.transaction((tx) => {
+		tx.insert(narrators)
+			.values({
+				id: sender,
+				type: "subagent",
+				variant: "subagent:general",
+				parentNarratorId: recipient,
+				aclRootNarratorId: recipient,
+				ownerUserId: SEND_OWNER,
+				createdAt: TIME,
+				updatedAt: TIME,
+			})
+			.run();
+		ensureCommunicationNodeTx(tx, sender, recipient);
+	});
 	db.insert(narratorMessages)
 		.values({
 			id: `${sender}-msg`,
@@ -85,7 +104,7 @@ function msg(
 		})
 		.run();
 	const delivery = createAgentMessageDelivery(
-		P,
+		recipient,
 		{ id: sender, title: text, label: sender, type: "general", isParent: false },
 		toolUseId ?? `${sender}-use`,
 		text,
@@ -125,13 +144,22 @@ function ids(entries: readonly PendingInjection[]): string[] {
 	);
 }
 
-beforeEach(() => {
+function resetMailboxes() {
 	cleanDb(sqlite);
-	for (const id of [P, "other"])
-		db.insert(narrators)
-			.values({ id, type: "primary", variant: "primary", createdAt: TIME, updatedAt: TIME })
+	db.transaction((tx) => {
+		tx.insert(users)
+			.values({ id: SEND_OWNER, username: SEND_OWNER, passwordHash: "test", createdAt: TIME })
 			.run();
-});
+		for (const id of [P, "other"]) {
+			tx.insert(narrators)
+				.values({ id, ownerUserId: SEND_OWNER, createdAt: TIME, updatedAt: TIME })
+				.run();
+			ensureCommunicationNodeTx(tx, id, null);
+		}
+	});
+}
+
+beforeEach(resetMailboxes);
 afterAll(async () => {
 	await closeRuntimeTestDb(sqlite);
 });
@@ -175,10 +203,7 @@ describe("parent injection queue — order across kinds", () => {
 		await pushPendingInjection(P, msg("m"));
 		const completionFirst = ids(await drainPendingInjections(P));
 
-		cleanDb(sqlite);
-		db.insert(narrators)
-			.values({ id: P, type: "primary", variant: "primary", createdAt: TIME, updatedAt: TIME })
-			.run();
+		resetMailboxes();
 
 		await pushPendingInjection(P, msg("m"));
 		notice("agent", "a");
@@ -190,10 +215,7 @@ describe("parent injection queue — order across kinds", () => {
 
 	test("keeps buckets separate per parent narrator", async () => {
 		await pushPendingInjection(P, msg("mine"));
-		const other = msg("theirs");
-		if (!other.message.delivery) throw new Error("missing fixture delivery");
-		other.message.delivery.recipientNarratorId = "other";
-		await pushPendingInjection("other", other);
+		await pushPendingInjection("other", msg("theirs", undefined, "other"));
 		expect(ids(await drainPendingInjections(P))).toEqual(["msg:mine"]);
 		expect(ids(await drainPendingInjections("other"))).toEqual(["msg:theirs"]);
 	});

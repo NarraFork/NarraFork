@@ -37,6 +37,7 @@ export const COMPILED_WORKER_ENTRIES = [
 	"lib/browser/memory-snapshot-worker.ts",
 	"lib/browser/memory-profile-worker.ts",
 	"lib/share-preview-worker.ts",
+	"lib/attachment-digest-worker.ts",
 	"lib/request-recorder-worker.ts",
 	"lib/startup-status/worker.ts",
 	"lib/agent/request-json-worker.ts",

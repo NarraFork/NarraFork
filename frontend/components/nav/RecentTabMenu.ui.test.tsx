@@ -1,3 +1,5 @@
+import { userPreferencesQueryKey } from "../../hooks/useUserPreferences";
+import { confirmAuthUser, getAuthSnapshot } from "../../lib/api/client";
 /**
  * Rows are one line and their details are a hover card, which touch cannot reach. These
  * tests hold the touch fallbacks: the row menu (left swipe) starts with the details, and
@@ -33,7 +35,7 @@ import { createRecentTabHoverStore, RECENT_TAB_HOVER_SHOW_DELAY_MS } from "./rec
 
 const fixtureUser = "recent-tab-menu-fixture-user";
 const fixtureToken = "recent-tab-menu-fixture-token";
-const preferencesKey = ["user-preferences", "ui", fixtureUser, fixtureToken] as const;
+const preferencesKey = () => userPreferencesQueryKey("ui");
 const i18n = createInstance();
 await i18n.init({
 	lng: "en",
@@ -150,8 +152,9 @@ beforeEach(() => {
 		notificationTimers.set(timer, callback);
 	});
 	client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+	confirmAuthUser(getAuthSnapshot().generation, fixtureUser);
 	client.setQueryData(["auth", "me"], { id: fixtureUser });
-	client.setQueryData(preferencesKey, {});
+	client.setQueryData(preferencesKey(), {});
 	container = window.document.createElement("div");
 	window.document.body.append(container);
 	root = createRoot(container);

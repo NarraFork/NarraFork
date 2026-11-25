@@ -37,25 +37,27 @@ function buildRawJsonSchema(): Record<string, unknown> {
 	const properties: Record<string, unknown> = {
 		id: {
 			description:
-				'Target subagent ID or alias. Subagents may use "parent" to reach their parent narrator.',
+				'Target session ID or unambiguous alias. Subagents may use "parent" for their currently reachable delegator.',
 			type: "string",
 		},
 		ids: {
 			description:
-				"Target IDs or aliases. Subagents may mix parent/main with sibling targets for ordinary asynchronous messages.",
+				"Target session IDs or unambiguous aliases. May mix reachable parent/main, group members and exact peers for ordinary messages.",
 			type: "array",
 			items: { type: "string" },
 		},
 		name: {
-			description: "Target subagent title, alias, or unique ID prefix.",
+			description:
+				"Target session title, alias, handle, or unique ID prefix. Use a full ID to disambiguate.",
 			type: "string",
 		},
 		names: {
-			description: "Target subagent titles, aliases, or unique ID prefixes.",
+			description:
+				"Target session titles, aliases, handles, or unique ID prefixes. Ambiguous names are rejected.",
 			type: "array",
 			items: { type: "string" },
 		},
-		message: { description: "Message to send to the target subagent(s).", type: "string" },
+		message: { description: "Message to send to the target session(s).", type: "string" },
 		show_to_user: { description: SHOW_TO_USER_DESCRIPTION, type: "boolean" },
 		doInterrupt: {
 			description:
@@ -81,9 +83,16 @@ function buildRawJsonSchema(): Record<string, unknown> {
 export const sendTool: ToolDefinition = {
 	name: "Send",
 	description:
-		"Send a message to one or more accessible subagents. " +
-		"Primary narrators may send to their child subagents; subagents may send to sibling subagents. " +
-		'Subagents may also report progress to the narrator that launched them via "parent" (or "main"). Ordinary asynchronous messages may mix parent and sibling targets in one call; aliases for the same recipient are deduplicated. ' +
+		"Send a message to one or more currently reachable sessions: all delegation levels in your " +
+		"communication group, or your exact explicitly connected peers. Connections are not transitive " +
+		"and grant no control or history access. Use full narrator IDs when titles or aliases are " +
+		"ambiguous or the bounded communication list is truncated; an omitted ID is checked directly. " +
+		'Subagents may report progress to the narrator that launched them via "parent" (or "main"), ' +
+		"but ordinary Send to parent/main also requires current communication reachability. " +
+		"Ordinary asynchronous messages may mix parent and sibling targets, other group members and " +
+		"exact peers in one call; aliases for the same recipient are deduplicated. " +
+		"Interrupt/resume/model still require the target's existing controller grant; communication " +
+		"reachability does not expand ContextAsk, Stop or TeamStatus. " +
 		"Foreground reports are durably queued until the parent's safe input boundary; they do not start a second parent loop or guarantee immediate reading. Each target is accepted independently after whole-call authorization; partial failures preserve successful deliveries. " +
 		"Every message wakes its recipient and costs it a turn, so send one only when it carries " +
 		"something the recipient needs in order to act: new information, a changed requirement, a " +
@@ -106,20 +115,27 @@ export const sendTool: ToolDefinition = {
 			.string()
 			.optional()
 			.describe(
-				'Target subagent ID or alias. Subagents may use "parent" to reach their parent narrator.',
+				'Target session ID or unambiguous alias. Subagents may use "parent" for their currently reachable delegator.',
 			),
 		ids: z
 			.array(z.string())
 			.optional()
 			.describe(
-				"Target IDs or aliases. Subagents may mix parent/main with sibling targets for ordinary asynchronous messages.",
+				"Target session IDs or unambiguous aliases. May mix reachable parent/main, group members and exact peers for ordinary messages.",
 			),
-		name: z.string().optional().describe("Target subagent title, alias, or unique ID prefix."),
+		name: z
+			.string()
+			.optional()
+			.describe(
+				"Target session title, alias, handle, or unique ID prefix. Use a full ID to disambiguate.",
+			),
 		names: z
 			.array(z.string())
 			.optional()
-			.describe("Target subagent titles, aliases, or unique ID prefixes."),
-		message: z.string().describe("Message to send to the target subagent(s)."),
+			.describe(
+				"Target session titles, aliases, handles, or unique ID prefixes. Ambiguous names are rejected.",
+			),
+		message: z.string().describe("Message to send to the target session(s)."),
 		show_to_user: z.boolean().optional().describe(SHOW_TO_USER_DESCRIPTION),
 		user: z.string().optional().describe(USER_TARGET_DESCRIPTION),
 		doInterrupt: z

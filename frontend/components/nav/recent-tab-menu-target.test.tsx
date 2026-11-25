@@ -20,11 +20,13 @@ import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider } from "react-i18next";
 import type { RecentTab } from "../../hooks/recent-tabs-utils";
 import {
-	RECENT_TABS_QUERY_KEY,
 	type RecentTabsInfiniteData,
+	recentTabsFlatQueryKey,
 	recentTabsSectionQueryKey,
 } from "../../hooks/useRecentTabs";
 import { api } from "../../lib/api";
+import { clearToken, confirmAuthUser, setToken } from "../../lib/api/client";
+import { getRecentTabsScope } from "../../lib/recent-tabs-owner";
 import commonEn from "../../locales/en/common.json";
 import { RecentTabDetails } from "./RecentTabDetailCard";
 import { recentTabMenuKey, useRecentTabMenuTarget } from "./recent-tab-menu-target";
@@ -40,19 +42,24 @@ let client: QueryClient;
 let restoreDom: () => void;
 let requests: Array<{ keys: string[]; resolve: (result: RuntimeResult) => void }>;
 let open: (tab: RecentTab) => void = () => {};
+function scope() {
+	const current = getRecentTabsScope();
+	if (!current) throw new Error("Missing test scope");
+	return current;
+}
 
 function setTabs(tabs: RecentTab[]) {
-	client.setQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("work"), {
+	client.setQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey(scope(), "work"), {
 		pages: [{ items: tabs, revision: 0, hasMore: false, nextCursor: undefined }],
 		pageParams: [undefined],
-	} as unknown as RecentTabsInfiniteData);
-	client.setQueryData(RECENT_TABS_QUERY_KEY, tabs);
+	});
+	client.setQueryData(recentTabsFlatQueryKey(scope()), tabs);
 }
 
 /** The list's menu state, rendering what the touch menu shows at its top: the row's details. */
 function MenuHarness() {
 	const { data: tabs = [] } = useQuery<RecentTab[]>({
-		queryKey: RECENT_TABS_QUERY_KEY,
+		queryKey: recentTabsFlatQueryKey(scope()),
 		queryFn: skipToken,
 	});
 	const [menu, tab, setMenu] = useRecentTabMenuTarget(tabs);
@@ -66,7 +73,13 @@ function MenuHarness() {
 
 beforeEach(async () => {
 	const { window } = parseHTML("<!doctype html><html><body></body></html>");
+	const storage = new Map<string, string>();
 	const globals = {
+		localStorage: {
+			getItem: (key: string) => storage.get(key) ?? null,
+			setItem: (key: string, value: string) => storage.set(key, value),
+			removeItem: (key: string) => storage.delete(key),
+		},
 		window,
 		document: window.document,
 		navigator: window.navigator,
@@ -82,6 +95,7 @@ beforeEach(async () => {
 			else Reflect.deleteProperty(globalThis, key);
 		}
 	};
+	confirmAuthUser(setToken("test-menu-token"), "test-menu-user");
 	notifyManager.setScheduler(queueMicrotask);
 	requests = [];
 	spyOn(api, "getRecentTabsRuntime").mockImplementation(
@@ -111,6 +125,7 @@ afterEach(async () => {
 	client.clear();
 	notifyManager.setScheduler((callback) => setTimeout(callback, 0));
 	mock.restore();
+	clearToken();
 	restoreDom();
 });
 

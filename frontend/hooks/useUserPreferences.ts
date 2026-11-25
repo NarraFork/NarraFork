@@ -3,10 +3,21 @@ import {
 	type AppearancePreferenceKey,
 	appearanceDefinition,
 } from "@shared/appearance-preferences";
-import { type QueryClient, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useSyncExternalStore } from "react";
+import {
+	type MutateOptions,
+	type QueryClient,
+	useMutation,
+	useQuery,
+	useQueryClient,
+} from "@tanstack/react-query";
+import { useCallback, useEffect, useMemo, useSyncExternalStore } from "react";
 import { api } from "../lib/api";
-import { getToken, onTokenChange } from "../lib/api/client";
+import {
+	type AuthSnapshot,
+	getAuthSnapshot,
+	onTokenChange,
+	subscribeAuth,
+} from "../lib/api/client";
 import type { UIPreferencesPatch } from "../lib/api/settings";
 import {
 	appearanceStore,
@@ -15,29 +26,59 @@ import {
 import { useCurrentUser } from "./useCurrentUser";
 import { invalidateFastModeDetails } from "./useFastModeUpdates";
 
+export const userPreferencesQueryKey = (
+	view: "ui" | "detail",
+	{ userId, generation }: Pick<AuthSnapshot, "userId" | "generation"> = getAuthSnapshot(),
+) => ["user-preferences", view, userId, generation] as const;
+
+function matchesSession(userId: string | null, generation: number): boolean {
+	const current = getAuthSnapshot();
+	return (
+		current.hasToken && !!userId && current.userId === userId && current.generation === generation
+	);
+}
+
+export function isUserPreferencesScopeCurrent(
+	key: ReturnType<typeof userPreferencesQueryKey>,
+): boolean {
+	return matchesSession(key[2], key[3]);
+}
+
+function requireSession(userId: string | null, generation: number): void {
+	if (!matchesSession(userId, generation)) throw new DOMException("Session changed", "AbortError");
+}
+
+async function readPreferences<T>(
+	userId: string | null,
+	generation: number,
+	signal: AbortSignal,
+	read: (options: { signal: AbortSignal }) => Promise<T>,
+): Promise<T> {
+	requireSession(userId, generation);
+	const result = await read({ signal });
+	signal.throwIfAborted();
+	requireSession(userId, generation);
+	return result;
+}
+
+function preferenceProjections(auth: Pick<AuthSnapshot, "userId" | "generation">) {
+	return (["ui", "detail"] as const).map((view) => ({
+		queryKey: userPreferencesQueryKey(view, auth),
+		exact: true,
+	}));
+}
+
 const sessionObservers = new WeakMap<QueryClient, { count: number; stop: () => void }>();
 function observeSession(qc: QueryClient) {
 	let observer = sessionObservers.get(qc);
 	if (!observer) {
-		const reset = () => {
+		const stop = onTokenChange(() => {
 			void qc.cancelQueries({ queryKey: ["user-preferences"] });
 			qc.removeQueries({ queryKey: ["user-preferences"] });
-			void qc.cancelQueries({ queryKey: ["auth", "me"], exact: true });
-			qc.removeQueries({ queryKey: ["auth", "me"], exact: true });
+			// useCurrentUser owns the active me observer and its generation reset.
 			appearanceStore.activate(null, true);
-		};
-		const offToken = onTokenChange(reset);
-		const onStorage = (event: StorageEvent) => {
-			if (event.key === "narrafork_token" || event.key === null) reset();
-		};
-		if (typeof window !== "undefined") window.addEventListener("storage", onStorage);
-		observer = {
-			count: 0,
-			stop: () => {
-				offToken();
-				if (typeof window !== "undefined") window.removeEventListener("storage", onStorage);
-			},
-		};
+		});
+		observer = { count: 0, stop };
 		sessionObservers.set(qc, observer);
 	}
 	observer.count++;
@@ -48,24 +89,13 @@ function observeSession(qc: QueryClient) {
 	};
 }
 
-function subscribeSession(listener: () => void) {
-	const off = onTokenChange(listener);
-	const onStorage = (event: StorageEvent) => {
-		if (event.key === "narrafork_token" || event.key === null) listener();
-	};
-	if (typeof window !== "undefined") window.addEventListener("storage", onStorage);
-	return () => {
-		off();
-		if (typeof window !== "undefined") window.removeEventListener("storage", onStorage);
-	};
-}
-
 /** Shared by all lightweight observers, including plugin overlays. */
 export function useUserPreferences(options: { enabled?: boolean } = {}) {
 	const qc = useQueryClient();
-	const token = useSyncExternalStore(subscribeSession, getToken, () => null);
-	const { data: user } = useCurrentUser();
-	const queryKey = ["user-preferences", "ui", user?.id ?? null, token] as const;
+	useCurrentUser();
+	const auth = useSyncExternalStore(subscribeAuth, getAuthSnapshot, getAuthSnapshot);
+	const { userId, generation } = auth;
+	const queryKey = userPreferencesQueryKey("ui", auth);
 	const revision = useSyncExternalStore(
 		subscribeAppearancePreferences,
 		appearanceStore.getSnapshot,
@@ -73,38 +103,34 @@ export function useUserPreferences(options: { enabled?: boolean } = {}) {
 	);
 	const query = useQuery({
 		queryKey,
-		queryFn: ({ signal }) => api.getUIPreferences({ signal }),
-		enabled: options.enabled !== false && !!token && !!user?.id,
+		queryFn: ({ signal }) => readPreferences(userId, generation, signal, api.getUIPreferences),
+		enabled: options.enabled !== false && auth.hasToken && !!userId,
 		staleTime: 30_000,
 		placeholderData: undefined,
 	});
 	useEffect(() => observeSession(qc), [qc]);
 	useEffect(() => {
-		if (!user?.id || !token || getToken() !== token) return;
-		appearanceStore.activate(user.id);
+		if (!userId || !matchesSession(userId, generation)) return;
+		appearanceStore.activate(userId);
 		if (!query.data) return;
-		appearanceStore.hydrate(user.id, { ...query.data }, async (patch, signal) => {
-			if (getToken() !== token || appearanceStore.getUserId() !== user.id)
-				throw new Error("Session changed");
-			await qc.cancelQueries({ queryKey: ["user-preferences"] });
-			if (getToken() !== token || appearanceStore.getUserId() !== user.id)
-				throw new Error("Session changed");
-			const result = await api.updateUIPreferences(patch, { signal });
-			if (getToken() === token && appearanceStore.getUserId() === user.id) {
-				void qc.invalidateQueries({ queryKey: ["user-preferences"] });
+		const projections = preferenceProjections(auth);
+		appearanceStore.hydrate(userId, { ...query.data }, async (patch, signal) => {
+			requireSession(userId, generation);
+			await Promise.all(projections.map((filter) => qc.cancelQueries(filter)));
+			requireSession(userId, generation);
+			const result = await api.updateUIPreferences(patch, {
+				signal: AbortSignal.any([signal, AbortSignal.timeout(10_000)]),
+			});
+			if (matchesSession(userId, generation) && appearanceStore.getUserId() === userId) {
+				for (const filter of projections) void qc.invalidateQueries(filter);
 			}
 			return result;
 		});
-	}, [qc, user?.id, query.data, token]);
+	}, [qc, auth, userId, generation, query.data]);
 	// biome-ignore lint/correctness/useExhaustiveDependencies: revision tracks the external appearance values.
 	const data = useMemo(() => {
-		if (!token || getToken() !== token) return undefined;
-		if (
-			!query.data ||
-			!user?.id ||
-			appearanceStore.getUserId() !== user.id ||
-			!appearanceStore.ready
-		)
+		if (!matchesSession(userId, generation)) return undefined;
+		if (!query.data || appearanceStore.getUserId() !== userId || !appearanceStore.ready)
 			return query.data;
 		const effective = { ...query.data };
 		for (const key of APPEARANCE_KEYS) {
@@ -114,25 +140,23 @@ export function useUserPreferences(options: { enabled?: boolean } = {}) {
 			}
 		}
 		return effective;
-	}, [query.data, user?.id, revision, token]);
+	}, [query.data, userId, generation, revision]);
 	return { ...query, data, queryKey };
 }
 
 /** Settings editors must load the complete DTO before saving fields absent from the UI view. */
 export function useUserPreferencesDetail() {
 	const ui = useUserPreferences();
-	const [, , principal, token] = ui.queryKey;
+	const [, , userId, generation] = ui.queryKey;
 	const query = useQuery({
-		queryKey: ["user-preferences", "detail", principal, token],
-		queryFn: ({ signal }) => api.getUserPreferences({ signal }),
-		enabled: !!principal && !!token,
+		queryKey: userPreferencesQueryKey("detail", { userId, generation }),
+		queryFn: ({ signal }) => readPreferences(userId, generation, signal, api.getUserPreferences),
+		enabled: !!userId,
 		staleTime: 30_000,
 		placeholderData: undefined,
 	});
-	// UI hydration is authoritative for account/local appearance scopes. Never merge
-	// lightweight responses into the complete query cache.
 	const data = useMemo(() => {
-		if (!token || getToken() !== token || !query.data) return undefined;
+		if (!matchesSession(userId, generation) || !query.data) return undefined;
 		const effective = { ...query.data };
 		if (ui.data) {
 			for (const key of APPEARANCE_KEYS) {
@@ -143,7 +167,7 @@ export function useUserPreferencesDetail() {
 			}
 		}
 		return effective;
-	}, [query.data, ui.data, token]);
+	}, [query.data, ui.data, userId, generation]);
 	return { ...query, data };
 }
 
@@ -152,13 +176,15 @@ function useUpdatePreferences<Patch extends Parameters<typeof api.updateUserPref
 ) {
 	const qc = useQueryClient();
 	useEffect(() => observeSession(qc), [qc]);
-	return useMutation({
-		onMutate: () => ({ token: getToken() }),
-		mutationFn: async (patch: Patch) => {
-			const token = getToken();
+	const mutation = useMutation({
+		mutationFn: async ({ patch, auth }: { patch: Patch; auth: AuthSnapshot }) => {
+			const { userId, generation } = auth;
+			requireSession(userId, generation);
 			const controller = new AbortController();
-			const off = subscribeSession(() => {
-				if (getToken() !== token) controller.abort(new Error("Session changed"));
+			const off = subscribeAuth(() => {
+				if (!matchesSession(userId, generation)) {
+					controller.abort(new DOMException("Session changed", "AbortError"));
+				}
 			});
 			try {
 				let writesSyncedAppearance = false;
@@ -176,9 +202,10 @@ function useUpdatePreferences<Patch extends Parameters<typeof api.updateUserPref
 					? await write(remaining, { signal: controller.signal })
 					: undefined;
 				controller.signal.throwIfAborted();
-				if (getToken() !== token) throw new Error("Session changed");
+				requireSession(userId, generation);
 				if (writesSyncedAppearance) {
 					await appearanceStore.flush();
+					requireSession(userId, generation);
 					if (appearanceStore.error) throw appearanceStore.error;
 				}
 				return result;
@@ -186,14 +213,48 @@ function useUpdatePreferences<Patch extends Parameters<typeof api.updateUserPref
 				off();
 			}
 		},
-		onSuccess: (result, variables, context) => {
-			if (getToken() !== context?.token) return;
-			if (result !== undefined) void qc.invalidateQueries({ queryKey: ["user-preferences"] });
-			if (typeof variables.fastModeDefault === "boolean") {
-				void invalidateFastModeDetails(qc);
+		onSuccess: (result, { patch, auth }) => {
+			if (!matchesSession(auth.userId, auth.generation)) return;
+			if (result !== undefined) {
+				for (const filter of preferenceProjections(auth)) void qc.invalidateQueries(filter);
 			}
+			if (typeof patch.fastModeDefault === "boolean") void invalidateFastModeDetails(qc);
 		},
 	});
+	const { mutate, mutateAsync } = mutation;
+	const withScope = useCallback(
+		(patch: Patch, options?: MutateOptions<unknown, Error, Patch>) =>
+			mutate({ patch, auth: getAuthSnapshot() }, scopedMutationCallbacks(options)),
+		[mutate],
+	);
+	const withScopeAsync = useCallback(
+		(patch: Patch, options?: MutateOptions<unknown, Error, Patch>) =>
+			mutateAsync({ patch, auth: getAuthSnapshot() }, scopedMutationCallbacks(options)),
+		[mutateAsync],
+	);
+	const callbacks = { mutate: withScope, mutateAsync: withScopeAsync };
+	return mutation.status === "idle"
+		? { ...mutation, ...callbacks, variables: undefined }
+		: { ...mutation, ...callbacks, variables: mutation.variables.patch };
+}
+
+function scopedMutationCallbacks<Patch>(options?: MutateOptions<unknown, Error, Patch>) {
+	if (!options) return undefined;
+	const scoped: MutateOptions<unknown, Error, { patch: Patch; auth: AuthSnapshot }> = {
+		onSuccess: (data, { patch, auth }, value, context) => {
+			if (matchesSession(auth.userId, auth.generation))
+				options.onSuccess?.(data, patch, value, context);
+		},
+		onError: (error, { patch, auth }, value, context) => {
+			if (matchesSession(auth.userId, auth.generation))
+				options.onError?.(error, patch, value, context);
+		},
+		onSettled: (data, error, { patch, auth }, value, context) => {
+			if (matchesSession(auth.userId, auth.generation))
+				options.onSettled?.(data, error, patch, value, context);
+		},
+	};
+	return scoped;
 }
 
 export function useUpdateUserPreferences() {

@@ -40,12 +40,14 @@ import {
 } from "./narrator-block-sync";
 import { bodyColumns, fillBodies } from "./narrator-body-reads";
 import { insertEnvelope, insertEnvelopeQueued } from "./narrator-body-writes";
+import { ensureCommunicationNodeTx } from "./narrator-communication/store";
 import {
 	claimNextRefSeq,
 	initializeRefSeqFloor,
 	withSeqFloorRaiseScope,
 } from "./narrator-refs/seq-store";
 import { narratorCreationWorkspaceTarget } from "./narrator-service";
+import { storedTitleSlug } from "./subagent-alias";
 import { resolveSubagentModelForRun } from "./subagent-model";
 import { withWorkspaceAdmission } from "./worktree-lifecycle-guard";
 
@@ -329,6 +331,7 @@ export async function extractSubagentToPrimary(
 							contextToolsChars: 0,
 							status: "idle",
 							title,
+							titleSlug: storedTitleSlug(title),
 							cwd: workspace.cwd,
 							defaultDeviceId: source.defaultDeviceId ?? null,
 							createdAt: now,
@@ -336,6 +339,7 @@ export async function extractSubagentToPrimary(
 						})
 						.returning()
 						.get();
+					ensureCommunicationNodeTx(tx, id, null);
 
 					if (inheritMode === "full") {
 						for (const msg of orderedSourceMessages) {

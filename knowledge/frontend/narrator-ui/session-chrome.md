@@ -59,14 +59,14 @@ keywords:
   - 导入会话
   - 访问权限
 status: draft
-verified_at: 4d59774711a51a9ac966794090c8b3a04d549048
+verified_at: fac3988333435e3fc3b5a4a6ace226c72ce14745
 ---
 # 会话外框
 
 围绕聊天区的一切：头部/工具栏、状态与模型控件、侧面板（文件、详情、Spec、终端、Git、浏览器、时间线、任务、搜索、外观…）如何在 dock 或工作区里摆放，以及压缩、上下文占用、会话导入导出等对话框。聊天区本身见[消息列表](message-list.md)，输入区见[输入框与交互](composer.md)。
 
 ## 关键规则
-- 面板种类统一在 `panels/panel-kind.ts:PanelKind`：chat、terminal、details、spec、git、browser、tasks、search、userchat、appearance、timeline、filetree、subagent、file、knowledge、outline、webview、plugin、mock。`ResourcePanelKind` 是工具栏控制的单例资源面板，排除 chat/subagent/file/knowledge/outline/webview/plugin（file、subagent 多实例，每路径/每子会话一个）。
+- 面板种类统一在 `panels/panel-kind.ts:PanelKind`：chat、terminal、details、spec、git、browser、tasks、communication、search、userchat、appearance、timeline、filetree、subagent、file、knowledge、outline、webview、plugin、mock。`ResourcePanelKind` 是工具栏控制的单例资源面板，排除 chat/subagent/file/knowledge/outline/webview/plugin（file、subagent 多实例，每路径/每子会话一个）。
 - 单叙述者 dock 布局存 localStorage（`dock/narrator-dock-layout.ts`），key 为 `narrafork_ndock_<narratorId>_<desktop|mobile>`，桌面与手机各一份；启动时清理 30 天未打开或格式损坏的布局（`narrator-dock-storage-cleanup.ts`，时间未知的保留）。恢复时分支：
   - 没有 chat 面板，或 chat 面板的 narratorId 与当前不符：丢弃并重建默认布局（只含不可关闭的 chat）。
   - `fromJSON` 抛错：同样回落默认布局。
@@ -77,6 +77,7 @@ verified_at: 4d59774711a51a9ac966794090c8b3a04d549048
   - 宽面板（目前只有 `timeline`）且有 chat：在 chat 上方分栏，初始高度 380，最多占表面高度 55%。
   - 无 chat：独立添加。
 - 没有 dock 的宿主（手机页、分离窗口）：`MobileToolPanelHost` 用抽屉承载工具面板，`OutlineDrawerHost` 用抽屉承载大纲；`REMOTE_BUILD` 下详情/Spec/文件面板/保存转储等替换为 `RemoteUnsupported`（`remote-ui-panels.tsx` 别名）。
+- `communication` 工具栏项同时声明 dock/drawer 宿主，旧自定义布局会追加新入口而不移动已有区位；团队页也打开同一通讯组件。dock/workspace 隐藏标签经现有可见性 Provider 释放图订阅、取消拖动；重新显示取新快照，不卸载旁侧会话或草稿。
 - 头部工具栏容量（`header/narrator-header-toolbar-capacity.ts`）：预算来自头部整行宽度而非工具栏自身宽度（避免级联收缩）；条目宽度是常量 22px、间距 10px；标题至少保留 140px；折叠的条目要多出 12px 才恢复（迟滞）；溢出的进入 `NarratorToolbarOverflowMenu`。该菜单在可拖动列表下面还有固定项（兼容性、大纲、保存的录制、「升级为团队」，最后是归档）；「升级为团队」只在 `onUpgradeToTeam` 传入时出现，对话框由 `NarratorPanel` 在菜单外渲染（见[团队页与审批](../../collaboration/teams/page.md)）。条目注册表 `narrator-toolbar-items.tsx` 用 `hosts` 声明哪些宿主能呈现，手机走抽屉。
 - 创建 worktree 是步骤机（`header/worktree-flow.ts`：idle→prepare→create→reconcile→switch→done），失败结果未知时保留冻结的原请求供对账，不改写 requestId；移除流程 `worktree-removal-flow.ts` 的确认项必须是用户真正勾选的，不从计划推断。
 - 工作树列表只在面板真实可见、菜单打开、权限允许且搜索防抖完成时读；稳定 key 包含 principal、opaque credential identity、narrator/device/repository/workspace 与搜索排序，不用随机 generation。30 秒 stale/60 秒 GC；关闭、换条件或卸载先取消再只保留首页，保留原 `dataUpdatedAt/isInvalidated`，新鲜重开不读、过期只读首页，不复活旧 cursor 链；另一个可见 observer 仍拥有列表时不裁它。关闭不恢复过期游标；创建未知结果/成功对账只标 stale，删除后先裁页再失效。创建能力来自 GitBar 已有权威 workspace probe，不能为未打开列表预读（`header/worktree-query-cache.ts`、`NarratorWorktreeControls.tsx`）。

@@ -1,4 +1,8 @@
-import { authorizedFetch, clearTokenOnSessionFailure } from "@frontend/lib/api/client";
+import {
+	authorizedFetch,
+	clearTokenOnSessionFailure,
+	getAuthSnapshot,
+} from "@frontend/lib/api/client";
 import {
 	GEN_UI_FILE_LIMITS,
 	type GenUiFileReference,
@@ -18,6 +22,7 @@ export async function loadGenUiPreview(
 	file: Pick<GenUiFileReference, "toolUseId" | "toolCallId">,
 	signal: AbortSignal,
 ): Promise<PreviewBundle> {
+	const { generation } = getAuthSnapshot();
 	const response = await authorizedFetch(
 		`/api/narrators/${encodeURIComponent(narratorId)}/gen-ui/preview/${encodeURIComponent(file.toolUseId)}?toolCallId=${encodeURIComponent(file.toolCallId)}`,
 		{ signal, cache: "no-store", redirect: "error" },
@@ -26,6 +31,7 @@ export async function loadGenUiPreview(
 	if (response.status === 401) {
 		await clearTokenOnSessionFailure(
 			new Response(text, { status: 401, headers: response.headers }),
+			generation,
 		);
 	}
 	if (!response.ok) {

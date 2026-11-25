@@ -3670,7 +3670,11 @@ const sqliteNarratorPersistence = {
 
 	async updateTitle(narratorId: string, title: string) {
 		const now = new Date().toISOString();
-		await db.update(narrators).set({ title, updatedAt: now }).where(eq(narrators.id, narratorId));
+		const { storedTitleSlug } = await import("./subagent-alias");
+		await db
+			.update(narrators)
+			.set({ title, titleSlug: storedTitleSlug(title), updatedAt: now })
+			.where(eq(narrators.id, narratorId));
 	},
 
 	async updateCwd(narratorId: string, cwd: string) {

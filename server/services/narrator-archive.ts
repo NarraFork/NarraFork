@@ -183,6 +183,8 @@ async function transitionAdmittedGroup(
 			await restoreArchivedTabPlacement(userId, id, title ?? id).catch((error) =>
 				logger.warn("Could not restore archived tab placement", { narratorId: id, error }),
 			);
+			const { reconcileRestoredSubagentAlias } = await import("./subagent-alias");
+			await reconcileRestoredSubagentAlias(id);
 		}
 	}
 	return changes.filter(({ id }) => id !== parentId).map(({ id }) => id);

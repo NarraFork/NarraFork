@@ -18,6 +18,8 @@ import {
 } from "./remote-access-registry";
 
 const REMOTE_SOCKET_MESSAGES = new Set([
+	"communication_subscribe",
+	"communication_unsubscribe",
 	"pong",
 	"subscribe",
 	"unsubscribe",

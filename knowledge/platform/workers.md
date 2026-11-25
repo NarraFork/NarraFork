@@ -14,6 +14,8 @@ anchors:
   - server/lib/fs-scan-worker/__tests__/client-failures.test.ts
   - server/db/worker-read-adapter.ts
   - server/lib/compiled-worker.ts
+  - server/lib/attachment-digest.ts
+  - server/lib/attachment-digest-worker.ts
   - server/lib/db-reader-readiness.ts
   - server/lib/db-reader-startup.ts
   - server/lib/compiled-worker.guard.test.ts
@@ -38,7 +40,7 @@ keywords:
   - inlineFallback
   - Worker 隔离不可降级
 status: draft
-verified_at: 4d59774711a51a9ac966794090c8b3a04d549048
+verified_at: fac3988333435e3fc3b5a4a6ace226c72ce14745
 ---
 # Worker 隔离
 
@@ -58,6 +60,7 @@ verified_at: 4d59774711a51a9ac966794090c8b3a04d549048
 - Recall 的 PG 原始 TEXT 正文/工具 JSON 使用 `db-worker/recall-pg-projection-client.ts` 隔离投影，不在服务线程解析大 JSON，也不通过 jsonb 转换丢失 codec 可保存的转义字符。准入限制并发 2、排队 0，先准入再读有界源；取消/超时若 SQL 尚未结束，配额持续保留到 SQL settle 与 Worker exit 都确认，故障不在主线程重算。该读路径不改变现有 PG 写入/生成列表达式的字符约束。
 - 其他使用 `WorkerPool` 的地方：gen-ui 编译、git 行统计、大纲文本编辑、编辑器文档任务、前缀快照、历史重写、token 重算等（`grep WorkerPool server`）。
 - 其他隔离形态：只读完整性探测与快照构建用独立子进程，在 `server/index.ts` 中于 `./main` 之前分流；启动状态页用 Worker 线程。
+- 发送附件的稳定 SHA256 由 `attachment-digest-worker.ts` 计算，客户端限制并发、排队、字节、超时和取消；上传 stage 保存摘要以便已消费后的提交对账。Worker 创建、就绪、执行、退出、禁用或超时失败均明确失败，不在 HTTP 主线程重算；入口也登记到编译清单并有真实编译产物测试。
 
 ## 从哪读起
 - `server/lib/worker-runtime/pool.ts`、`queue.ts`、`lifecycle.ts`：通用运行时。

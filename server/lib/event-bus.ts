@@ -89,6 +89,9 @@ export type NarraForkEvent =
 	| { type: "narrator:fast_mode_changed"; narratorId: string }
 	| { type: "user:fast_mode_default_changed"; userId: string }
 	| { type: "narrator:execution_principal_changed"; narratorId: string }
+	/** Post-commit ids-only invalidation of the communication projection. */
+	| { type: "narrator:communication_changed"; narratorIds: string[]; teamId?: string }
+	| { type: "team:communication_changed"; teamId: string }
 	| { type: "narrator:imported" }
 	// Narrator lifecycle
 	| { type: "narrator:message"; narratorId: string; role: string }

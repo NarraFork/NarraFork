@@ -1177,6 +1177,11 @@ describe("hold protocol regressions", () => {
 				updatedAt: NOW,
 			})
 			.run();
+		const { ensureCommunicationNodeTx } = await import("./runtime-communication-fixtures");
+		db.transaction((tx) => {
+			ensureCommunicationNodeTx(tx, CALLER, null);
+			ensureCommunicationNodeTx(tx, RUN, CALLER);
+		});
 		const calls = scriptPasses([
 			async () => ({ finalText: "first" }),
 			async () => ({ finalText: "Send answer" }),
