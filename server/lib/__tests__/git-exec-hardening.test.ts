@@ -27,6 +27,7 @@ describe("git exec hardening", () => {
 		expect(gitConfigEnv([["a.b", "1"]])).toEqual({
 			GIT_CONFIG_COUNT: "1",
 			GIT_OPTIONAL_LOCKS: "0",
+			GIT_NO_LAZY_FETCH: "1",
 			GIT_CONFIG_KEY_0: "a.b",
 			GIT_CONFIG_VALUE_0: "1",
 		});

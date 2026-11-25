@@ -7,10 +7,11 @@
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TEAM_MERGE_CONFLICTS_MAX } from "@shared/project-teams";
+import { GIT_NO_EXEC_CONFIG, setNoLazyFetchSupportForTests } from "../../../lib/git-exec-hardening";
 import { safeSpawn } from "../../../lib/spawn";
 import { configuredPrograms, teamGit } from "../team-git";
 import {
@@ -333,13 +334,42 @@ describe("team git writes", () => {
 		await rm(origin, { recursive: true, force: true });
 	});
 
-	test("the copyable command quotes the checkout path", () => {
-		expect(fastForwardCommand("/repo/main", "abc")).toBe(
-			"git -C /repo/main merge --ff-only refs/narrafork/team-merges/abc",
+	test("the copyable command asserts the branch and names the prepared commit (Devin 2, 4)", async () => {
+		const sha = "a".repeat(40);
+		expect(fastForwardCommand("/repo/main", "main", sha)).toBe(
+			`[ "$(git -C /repo/main symbolic-ref --quiet --short HEAD)" = main ] && git -C /repo/main merge --ff-only --no-autostash --no-overwrite-ignore ${sha}`,
 		);
-		expect(fastForwardCommand("/my repo/it's", "abc")).toBe(
-			"git -C '/my repo/it'\\''s' merge --ff-only refs/narrafork/team-merges/abc",
+		expect(fastForwardCommand("/my repo/it's", "main", sha)).toContain(
+			"git -C '/my repo/it'\\''s' symbolic-ref",
 		);
+		// Run for real: off the base it does nothing; on it, it fast-forwards to the commit.
+		const { head, base } = await forkedRepo();
+		const write = teamRepoGit(repo);
+		const merged = await write.mergeTree(base, head);
+		if (!merged.clean) throw new Error("expected a clean merge");
+		const commit = await write.commitTree({
+			tree: merged.tree,
+			parents: [base, head],
+			message: "m",
+			identity: null,
+		});
+		const command = fastForwardCommand(repo, "main", commit);
+		await git(["checkout", "-q", "-b", "elsewhere"]);
+		const off = await safeSpawn({
+			cmd: ["sh", "-c", command],
+			timeout: 20_000,
+			maxOutputBytes: 4096,
+		});
+		expect(off.exitCode).not.toBe(0);
+		expect(await git(["rev-parse", "elsewhere"])).toBe(base);
+		await git(["checkout", "-q", "main"]);
+		const on = await safeSpawn({
+			cmd: ["sh", "-c", command],
+			timeout: 20_000,
+			maxOutputBytes: 4096,
+		});
+		expect(on.exitCode).toBe(0);
+		expect(await git(["rev-parse", "main"])).toBe(commit);
 	});
 });
 
@@ -473,7 +503,9 @@ describe("the work-start fetch (review 1, 4)", () => {
 		expect(overrides).toContainEqual(["credential.username", ""]);
 		expect(overrides).toContainEqual(["http.sslverify", "true"]);
 		expect(overrides).toContainEqual(["http.proxy", "http://host-proxy:3128"]);
-		expect(overrides).toContainEqual(["http.https://example.com.extraheader", ""]);
+		// Extra headers: the list reset (no host header to add back).
+		expect(overrides).toContainEqual(["http.extraHeader", ""]);
+		expect(overrides.some(([key]) => key === "http.https://example.com.extraheader")).toBe(false);
 		expect(overrides).toContainEqual(["protocol.ext.allow", "never"]);
 		expect(overrides).toContainEqual(["protocol.allow", "never"]);
 		expect(env).toEqual({ GIT_SSH_COMMAND: "ssh -o BatchMode=yes" });
@@ -641,5 +673,218 @@ describe("the fast-forward of a person's checkout (review 2, 3, 7)", () => {
 		const otherBase = await git(["rev-parse", "HEAD"], other);
 		expect(await inspectCheckout(other, "main", otherBase, { repo })).toBe("other_repository");
 		expect(await inspectCheckout(repo, "main", base, { repo })).toBeNull();
+	});
+});
+
+// ── Devin review and security re-check ─────────────────────────────────────────
+
+/** A prepared merge of `feature` into `main` (checked out), parked at the private ref. */
+async function preparedMerge() {
+	const { head, base } = await forkedRepo();
+	const write = teamRepoGit(repo);
+	const merged = await write.mergeTree(base, head);
+	if (!merged.clean) throw new Error("expected a clean merge");
+	const commit = await write.commitTree({
+		tree: merged.tree,
+		parents: [base, head],
+		message: "m",
+		identity: null,
+	});
+	await write.setPrivateRef("item1", commit, null);
+	return { commit, base, head, ref: "refs/narrafork/team-merges/item1" };
+}
+
+describe("the fast-forward re-checks right before it runs (Devin 1, 4; security 4, 5)", () => {
+	test("a filter added after the inspection refuses the merge; it never runs", async () => {
+		const { commit, base, ref } = await preparedMerge();
+		expect(await inspectCheckout(repo, "main", base, { repo })).toBeNull();
+		// Between the inspection and the merge, a repository writer plants a filter.
+		const ran = marker("late-filter");
+		await git(["config", "filter.evil.smudge", `touch ${ran}; cat`]);
+		await writeFile(join(repo, ".git", "info", "attributes"), "* filter=evil\n");
+		const result = await fastForwardCheckout(repo, ref, { base: "main", mergeCommit: commit });
+		expect(result).toMatchObject({ ok: false, kind: "unsafe" });
+		expect(existsSync(ran)).toBe(false);
+		expect(await git(["rev-parse", "main"])).toBe(base);
+	});
+
+	test("an ignored local file is never overwritten by a tracked one", async () => {
+		await writeFile(join(repo, ".gitignore"), "local.env\n");
+		await commitFile("a.txt", "a\n", "base");
+		await git(["add", ".gitignore"]);
+		await git(["commit", "-qm", "ignore local.env"]);
+		await git(["checkout", "-qb", "feature"]);
+		await git(["rm", "-q", "--cached", ".gitignore"]);
+		await writeFile(join(repo, ".gitignore"), "");
+		await writeFile(join(repo, "local.env"), "TRACKED=1\n");
+		await git(["add", "-f", "local.env", ".gitignore"]);
+		await git(["commit", "-qm", "track local.env"]);
+		const head = await git(["rev-parse", "HEAD"]);
+		await git(["checkout", "-q", "main"]);
+		const base = await git(["rev-parse", "HEAD"]);
+		await writeFile(join(repo, "local.env"), "SECRET=mine\n");
+		const write = teamRepoGit(repo);
+		const merged = await write.mergeTree(base, head);
+		if (!merged.clean) throw new Error("expected a clean merge");
+		const commit = await write.commitTree({
+			tree: merged.tree,
+			parents: [base, head],
+			message: "m",
+			identity: null,
+		});
+		await write.setPrivateRef("item1", commit, null);
+		const result = await fastForwardCheckout(repo, "refs/narrafork/team-merges/item1", {
+			base: "main",
+			mergeCommit: commit,
+		});
+		expect(result).toMatchObject({ ok: false, kind: "refused" });
+		expect(await readFile(join(repo, "local.env"), "utf8")).toBe("SECRET=mine\n");
+		expect(await git(["rev-parse", "main"])).toBe(base);
+	});
+
+	test("a working tree of its own (core.worktree) is refused; nothing lands elsewhere", async () => {
+		const { commit, base, ref } = await preparedMerge();
+		const elsewhere = await mkdtemp(join(temporary, "elsewhere-"));
+		await git(["config", "core.worktree", elsewhere]);
+		expect(await inspectCheckout(repo, "main", base, { repo })).toBe("local_config");
+		expect(
+			await fastForwardCheckout(repo, ref, { base: "main", mergeCommit: commit }),
+		).toMatchObject({ ok: false, kind: "unsafe" });
+		expect(await git(["rev-parse", "main"])).toBe(base);
+		expect(existsSync(join(elsewhere, "feature.txt"))).toBe(false);
+	});
+
+	test("no automatic maintenance runs after the fast-forward", async () => {
+		const { commit, ref } = await preparedMerge();
+		await git(["config", "gc.auto", "1"]);
+		await git(["config", "gc.autoDetach", "false"]);
+		await git(["config", "maintenance.auto", "true"]);
+		const loose = async () => (await git(["count-objects"])).split(" ")[0];
+		const before = await loose();
+		expect(Number(before)).toBeGreaterThan(1);
+		expect(await fastForwardCheckout(repo, ref, { base: "main", mergeCommit: commit })).toEqual({
+			ok: true,
+		});
+		expect(await loose()).toBe(before);
+		expect(GIT_NO_EXEC_CONFIG).toContainEqual(["maintenance.auto", "false"]);
+		expect(GIT_NO_EXEC_CONFIG).toContainEqual(["gc.auto", "0"]);
+	});
+});
+
+describe("programs a repository can name (security 1, 2)", () => {
+	test("a promisor remote never runs: missing objects are not fetched lazily", async () => {
+		await commitFile("a.txt", "base\n", "base");
+		await git(["checkout", "-qb", "feature"]);
+		const head = await commitFile("a.txt", "feature\n", "feature");
+		const blob = await git(["rev-parse", `${head}:a.txt`]);
+		await git(["checkout", "-q", "main"]);
+		const base = await commitFile("a.txt", "main\n", "main");
+		await rm(join(repo, ".git", "objects", blob.slice(0, 2), blob.slice(2)));
+		const ran = marker("promisor");
+		const uploadpack = await script("uploadpack", `touch ${ran}; exit 1`);
+		await git(["config", "core.repositoryformatversion", "1"]);
+		await git(["config", "extensions.partialClone", "evil"]);
+		await git(["config", "remote.evil.url", repo]);
+		await git(["config", "remote.evil.promisor", "true"]);
+		await git(["config", "remote.evil.uploadpack", uploadpack]);
+		await expect(teamRepoGit(repo).mergeTree(base, head)).rejects.toThrow();
+		await expect(teamGit(repo).readBlob(blob, 8)).rejects.toThrow();
+		expect(existsSync(ran)).toBe(false);
+		// A git that cannot be told so refuses the repository outright.
+		setNoLazyFetchSupportForTests(false);
+		try {
+			await expect(teamRepoGit(repo).mergeTree(base, head)).rejects.toMatchObject({
+				code: "GIT_TOO_OLD_FOR_PARTIAL_CLONE",
+			});
+		} finally {
+			setNoLazyFetchSupportForTests(null);
+		}
+		expect(existsSync(ran)).toBe(false);
+	});
+
+	test("core.alternateRefsCommand never runs on a fetch", async () => {
+		const { base } = await forkedRepo();
+		const head = await git(["commit-tree", `${base}^{tree}`, "-p", base, "-m", "next"]);
+		const other = await mkdtemp(join(temporary, "alternate-"));
+		await git(["init", "-q", "--bare", other], temporary);
+		await writeFile(
+			join(repo, ".git", "objects", "info", "alternates"),
+			`${join(other, "objects")}\n`,
+		);
+		const ran = marker("alternate-refs");
+		await git(["config", "core.alternateRefsCommand", await script("alt", `touch ${ran}`)]);
+		await git(["checkout", "-q", "--detach"]);
+		expect(await teamRepoGit(repo).fastForwardBase(head, "main")).toEqual({ outcome: "updated" });
+		expect(existsSync(ran)).toBe(false);
+	});
+});
+
+describe("the work-start fetch, second round (Devin 3; security 3, 5)", () => {
+	async function originWithUpstream() {
+		await commitFile("a.txt", "a\n", "base");
+		const origin = join(temporary, `origin-${Math.random().toString(36).slice(2)}.git`);
+		await git(["init", "-q", "--bare", "-b", "main", origin], temporary);
+		await git(["push", "-q", origin, "main"]);
+		const other = await mkdtemp(join(temporary, "clone-"));
+		await git(["clone", "-q", origin, other], temporary);
+		const upstream = await commitFile("b.txt", "b\n", "upstream", other);
+		await git(["push", "-q", "origin", "main"], other);
+		await git(["remote", "add", "origin", origin]);
+		return { origin, upstream };
+	}
+
+	test("only the given refspec moves: a configured forced mapping onto a local branch does not", async () => {
+		const { upstream } = await originWithUpstream();
+		const local = await git(["rev-parse", "main"]);
+		await git(["branch", "victim", local]);
+		await git(["config", "--add", "remote.origin.fetch", "+refs/heads/main:refs/heads/victim"]);
+		expect(await teamRepoGit(repo).fetchBaseFromOrigin("main")).toEqual({ ok: true });
+		expect(await git(["rev-parse", "refs/remotes/origin/main"])).toBe(upstream);
+		expect(await git(["rev-parse", "victim"])).toBe(local);
+	});
+
+	test("a repository upload-pack never runs; a repository git proxy refuses the fetch", async () => {
+		await originWithUpstream();
+		const ran = marker("uploadpack");
+		await git(["config", "remote.origin.uploadpack", await script("up", `touch ${ran}; exit 1`)]);
+		expect(await teamRepoGit(repo).fetchBaseFromOrigin("main")).toEqual({ ok: true });
+		expect(existsSync(ran)).toBe(false);
+		await git(["config", "--unset", "remote.origin.uploadpack"]);
+		await git(["config", "core.gitProxy", await script("proxy", `touch ${ran}; exit 1`)]);
+		const refused = await teamRepoGit(repo).fetchBaseFromOrigin("main");
+		expect(refused.ok).toBe(false);
+		if (!refused.ok) expect(refused.message).toContain("core.gitproxy");
+		expect(existsSync(ran)).toBe(false);
+	});
+
+	test("GIT_SSH alone, extra headers and credential safety defaults", () => {
+		const entry = (scope: string, key: string, value: string): ScopedConfigEntry => ({
+			scope,
+			key,
+			value,
+		});
+		expect(sshSettings([], { GIT_SSH: "/opt/my ssh" })).toEqual({
+			overrides: [["core.sshCommand", ""]],
+			env: { GIT_SSH_COMMAND: "'/opt/my ssh'" },
+		});
+		const { overrides } = networkOverrides(
+			[
+				entry("global", "http.extraheader", "X-Host: 1"),
+				entry("local", "http.extraheader", "Authorization: evil"),
+				entry("local", "credential.protectprotocol", "false"),
+				entry("local", "credential.sanitizeprompt", "false"),
+			],
+			{},
+		);
+		const headers = overrides.filter(([key]) => key.toLowerCase().endsWith(".extraheader"));
+		expect(headers).toEqual([
+			["http.extraHeader", ""],
+			["http.extraheader", "X-Host: 1"],
+		]);
+		expect(overrides).toContainEqual(["credential.protectprotocol", "true"]);
+		expect(overrides).toContainEqual(["credential.sanitizeprompt", "true"]);
+		expect(() => networkOverrides([entry("local", "core.gitproxy", "evil")], {})).toThrow(
+			UnsafeRemoteConfigError,
+		);
 	});
 });

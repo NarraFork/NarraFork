@@ -385,8 +385,14 @@ export function sshSettings(
 	env: Record<string, string | undefined>,
 ): { overrides: Array<readonly [string, string]>; env: Record<string, string> } {
 	const host = hostValue(entries, "core.sshcommand");
-	if (env.GIT_SSH_COMMAND || env.GIT_SSH)
-		return { overrides: [["core.sshCommand", host ?? ""]], env: {} };
+	if (env.GIT_SSH_COMMAND) return { overrides: [["core.sshCommand", host ?? ""]], env: {} };
+	// `GIT_SSH` alone ranks below any core.sshCommand (even the empty override): passed on as
+	// the command it names, quoted.
+	if (env.GIT_SSH)
+		return {
+			overrides: [["core.sshCommand", ""]],
+			env: { GIT_SSH_COMMAND: shellWord(env.GIT_SSH) },
+		};
 	if (host) return { overrides: [["core.sshCommand", host]], env: {} };
 	return {
 		overrides: [["core.sshCommand", ""]],
@@ -413,9 +419,11 @@ export function networkOverrides(
 	for (const key of repositoryKeys(entries)) {
 		const lower = key.toLowerCase();
 		if (lower === "remote.origin.url" || lower === "core.sshcommand") continue;
+		// `--upload-pack` on the command line replaces a repository `remote.origin.uploadpack`.
 		if (lower.startsWith("protocol.") || lower === "remote.origin.uploadpack") continue;
-		if (lower === "core.gitproxy") continue;
-		if (lower === "remote.origin.vcs") throw new UnsafeRemoteConfigError(key);
+		// First match wins and command scope comes last: a repository value cannot be overridden.
+		if (lower === "core.gitproxy" || lower === "remote.origin.vcs")
+			throw new UnsafeRemoteConfigError(key);
 		if (lower.startsWith("url.") && lower.endsWith(".insteadof")) {
 			const prefixes = entries
 				.filter((entry) => entry.key === key && isRepositoryScope(entry.scope))
@@ -424,7 +432,12 @@ export function networkOverrides(
 				throw new UnsafeRemoteConfigError(key);
 			continue;
 		}
-		if (isHelperKey(lower)) continue;
+		if (isHelperKey(lower) || isExtraHeaderKey(lower)) continue;
+		// Security defaults (true) never become false through an empty override.
+		if (lower.endsWith(".protectprotocol") || lower.endsWith(".sanitizeprompt")) {
+			overrides.push([key, hostValue(entries, key) ?? "true"]);
+			continue;
+		}
 		const host = hostValue(entries, key);
 		if (host !== undefined) {
 			overrides.push([key, host]);
@@ -438,11 +451,7 @@ export function networkOverrides(
 			overrides.push([key, ambientProxy(env, originUrl)]);
 		else if (lower.startsWith("http.") && lower.endsWith(".sslverify"))
 			overrides.push([key, "true"]);
-		else if (
-			lower.startsWith("http.") &&
-			(lower.endsWith(".extraheader") || lower.endsWith(".cookiefile"))
-		)
-			overrides.push([key, ""]);
+		else if (lower.startsWith("http.") && lower.endsWith(".cookiefile")) overrides.push([key, ""]);
 		else if (lower.startsWith("http.") && lower.endsWith(".savecookies"))
 			overrides.push([key, "false"]);
 		else throw new UnsafeRemoteConfigError(key);
@@ -455,6 +464,16 @@ export function networkOverrides(
 			["credential.helper", ""],
 			...entries
 				.filter((entry) => HOST_SCOPES.has(entry.scope) && isHelperKey(entry.key.toLowerCase()))
+				.map((entry) => [entry.key, entry.value] as const),
+		);
+	// Extra headers accumulate the same way: reset, then the host's again, in order.
+	if (repositoryKeys(entries).some((key) => isExtraHeaderKey(key.toLowerCase())))
+		helpers.push(
+			["http.extraHeader", ""],
+			...entries
+				.filter(
+					(entry) => HOST_SCOPES.has(entry.scope) && isExtraHeaderKey(entry.key.toLowerCase()),
+				)
 				.map((entry) => [entry.key, entry.value] as const),
 		);
 	const ssh = sshSettings(entries, env);
@@ -478,6 +497,8 @@ export function networkOverrides(
 }
 
 const isHelperKey = (lower: string) => lower.startsWith("credential.") && lower.endsWith(".helper");
+const isExtraHeaderKey = (lower: string) =>
+	lower.startsWith("http.") && lower.endsWith(".extraheader");
 
 /** Only the local transport, for `fetch .` (an `insteadOf` on `.` cannot reach anything else). */
 const LOCAL_ONLY_PROTOCOLS: ConfigEntries = [
@@ -804,12 +825,26 @@ export function teamRepoGit(repo: string, options: { signal?: AbortSignal } = {}
 					"--no-tags",
 					"--no-recurse-submodules",
 					"--no-auto-maintenance",
+					// Only the refspec given moves a ref: no configured `remote.origin.fetch` mapping
+					// (which could force-update a local branch) and no pruning.
+					"--refmap=",
+					"--no-prune",
+					"--no-prune-tags",
+					// First value wins for upload-pack: only the command line beats the repository's.
+					"--upload-pack=git-upload-pack",
 					"--quiet",
 					"origin",
 					`+refs/heads/${base}:refs/remotes/origin/${base}`,
 				],
 				{
-					config: [...hardened, ...network.overrides],
+					config: [
+						...hardened,
+						...network.overrides,
+						["fetch.prune", "false"],
+						["fetch.pruneTags", "false"],
+						["remote.origin.prune", "false"],
+						["remote.origin.pruneTags", "false"],
+					],
 					network: true,
 					timeout: FETCH_TIMEOUT_MS,
 					env: network.env,
@@ -843,11 +878,32 @@ export type CheckoutBlocker =
 	| "other_repository"
 	| "unreadable";
 
-/** Whether the checkout's own (local / worktree) configuration names a filter or hooks directory. */
+/**
+ * Whether git's working tree for `dir` is `dir` itself (`rev-parse --show-toplevel`, resolved):
+ * a `core.worktree` elsewhere would make a merge write files somewhere else.
+ */
+async function worksInPlace(dir: string, signal?: AbortSignal): Promise<boolean> {
+	const top = await run(dir, ["rev-parse", "--show-toplevel"], {
+		config: GIT_NO_EXEC_CONFIG,
+		signal,
+	});
+	const path = top.stdout.trim();
+	if (top.exitCode !== 0 || !path) return false;
+	const [mine, theirs] = await Promise.all([
+		realpath(path).catch(() => path),
+		realpath(dir).catch(() => dir),
+	]);
+	return mine === theirs;
+}
+
+/**
+ * Whether the checkout's own (local / worktree) configuration names a filter, a hooks directory or
+ * a working tree of its own (`core.worktree`).
+ */
 async function localProgramsOf(dir: string, signal?: AbortSignal): Promise<boolean> {
 	const entries = await scopedConfig(
 		dir,
-		"^(filter\\..+\\.(clean|smudge|process)|core\\.hookspath)$",
+		"^(filter\\..+\\.(clean|smudge|process)|core\\.hookspath|core\\.worktree)$",
 		signal,
 	);
 	return entries.some((entry) => isRepositoryScope(entry.scope));
@@ -890,6 +946,7 @@ export async function inspectCheckout(
 		const gitDir = await run(dir, ["rev-parse", "--absolute-git-dir"], { config, signal });
 		const path = gitDir.stdout.trim();
 		if (gitDir.exitCode !== 0 || !path) return "unreadable";
+		if (!(await worksInPlace(dir, signal))) return "local_config";
 		const exists = async (name: string) =>
 			(await stat(join(path, name)).catch(() => null)) !== null;
 		for (const marker of IN_PROGRESS_MARKERS)
@@ -912,8 +969,12 @@ export type FastForwardCheckoutResult =
 	| { ok: true }
 	| {
 			ok: false;
-			/** `refused`: git changed nothing; `incomplete`: something is off afterwards. */
-			kind: "refused" | "incomplete" | "moved";
+			/**
+			 * `refused`: git changed nothing; `incomplete`: something is off afterwards; `moved`: HEAD
+			 * left the base; `unsafe`: the checkout's own configuration names a program the merge
+			 * could run (read right before it), so only the command is offered.
+			 */
+			kind: "refused" | "incomplete" | "moved" | "unsafe";
 			files: string[];
 			message: string;
 	  };
@@ -952,6 +1013,35 @@ export async function fastForwardCheckout(
 			files: [],
 			message: `HEAD is no longer on ${expect.base}`,
 		};
+	// Right before the merge, whatever the earlier inspection saw: a filter (clean, smudge,
+	// process) or a hooks directory of the checkout's own configuration refuses it. Filters are not
+	// emptied instead: that would check files out wrong (Git LFS). Its own diff drivers (an
+	// attribute can name one) are emptied below; fsmonitor and `diff.external` are off in the
+	// hardening, and `--no-stat` runs no diff at all.
+	const own = await scopedConfig(
+		dir,
+		"^(filter\\..+\\.(clean|smudge|process)|core\\.hookspath|core\\.worktree|diff\\..+\\.(command|textconv))$",
+		signal,
+	);
+	const ownKeys = repositoryKeys(own);
+	const unsafe = ownKeys.filter((key) => !key.toLowerCase().startsWith("diff."));
+	if (unsafe.length > 0)
+		return {
+			ok: false,
+			kind: "unsafe",
+			files: [],
+			message: `The checkout's own configuration sets ${unsafe.slice(0, 5).join(", ")}; run the command yourself`,
+		};
+	if (!(await worksInPlace(dir, signal)))
+		return {
+			ok: false,
+			kind: "unsafe",
+			files: [],
+			message: `git's working tree for ${dir} is somewhere else; run the command yourself`,
+		};
+	const diffDrivers = ownKeys
+		.filter((key) => key.toLowerCase().startsWith("diff."))
+		.map((key) => [key, ""] as const);
 	const stashBefore = await stashTip();
 	const programs = await configuredPrograms(dir);
 	const signing = await signingConfig(dir, signal);
@@ -963,11 +1053,23 @@ export async function fastForwardCheckout(
 		["merge.autoStash", "false"],
 		["merge.verifySignatures", "false"],
 		["submodule.recurse", "false"],
+		...diffDrivers,
 		...signing.overrides,
 	];
 	const result = await run(
 		dir,
-		["merge", "--ff-only", "--no-edit", "--no-autostash", "--no-verify-signatures", "--quiet", ref],
+		[
+			"merge",
+			"--ff-only",
+			"--no-edit",
+			"--no-autostash",
+			"--no-verify-signatures",
+			// An ignored local file is the person's: never overwritten by a tracked one.
+			"--no-overwrite-ignore",
+			"--no-stat",
+			"--quiet",
+			ref,
+		],
 		{ config, timeout: MERGE_TIMEOUT_MS, maxOutputBytes: SMALL_OUTPUT_BYTES, signal },
 	);
 	// Whatever git said, check what the checkout looks like now.
@@ -1014,9 +1116,18 @@ export async function fastForwardCheckout(
 	return { ok: false, kind: "refused", files, message: complaint(result) };
 }
 
-/** The command a person runs instead of 「在该目录中快进」. */
-export function fastForwardCommand(dir: string, itemId: string): string {
-	const quote = (value: string) =>
-		/^[A-Za-z0-9_./:@%+=,-]+$/.test(value) ? value : `'${value.replaceAll("'", `'\\''`)}'`;
-	return `git -C ${quote(dir)} merge --ff-only ${privateRef(itemId)}`;
+/** A value as one POSIX shell word. */
+const shellWord = (value: string) =>
+	/^[A-Za-z0-9_./:@%+=,-]+$/.test(value) ? value : `'${value.replaceAll("'", `'\\''`)}'`;
+
+/**
+ * The command a person runs instead of 「在该目录中快进」 (POSIX shell): it does nothing unless
+ * that checkout is on `base`, then fast-forwards to exactly the prepared merge commit, never
+ * stashing and never overwriting an ignored file. Offered only while the checkout is on the base.
+ */
+export function fastForwardCommand(dir: string, base: string, mergeCommit: string): string {
+	assertBranch(base);
+	assertSha(mergeCommit);
+	const at = `git -C ${shellWord(dir)}`;
+	return `[ "$(${at} symbolic-ref --quiet --short HEAD)" = ${shellWord(base)} ] && ${at} merge --ff-only --no-autostash --no-overwrite-ignore ${mergeCommit}`;
 }

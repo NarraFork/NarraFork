@@ -41,6 +41,11 @@ export const GIT_NO_EXEC_CONFIG: ReadonlyArray<readonly [string, string]> = [
 	["core.sshCommand", ""],
 	["credential.helper", ""],
 	["core.askPass", ""],
+	// Runs when an object store has alternates (`objects/info/alternates`), on fetches.
+	["core.alternateRefsCommand", ""],
+	// No detached `git maintenance` / `gc --auto` after a writing command.
+	["maintenance.auto", "false"],
+	["gc.auto", "0"],
 ];
 
 /**
@@ -51,7 +56,7 @@ export const PROGRAM_CONFIG_QUERY = [
 	"config",
 	"-z",
 	"--get-regexp",
-	"^(filter\\..+\\.(clean|smudge|process)|hook\\..+\\.(command|event)|merge\\..+\\.driver)$",
+	"^(filter\\..+\\.(clean|smudge|process)|hook\\..+\\.(command|event)|merge\\..+\\.driver|extensions\\.partialclone)$",
 ] as const;
 
 export interface GitConfiguredPrograms {
@@ -59,6 +64,12 @@ export interface GitConfiguredPrograms {
 	hooks: string[];
 	/** Custom merge drivers (`merge.<name>.driver`); absent when none was read. */
 	drivers?: string[];
+	/**
+	 * The repository is a partial clone (`extensions.partialClone`): a missing object would be
+	 * fetched lazily, running the promisor remote's upload-pack, which `GIT_NO_LAZY_FETCH`
+	 * forbids (git ≥ 2.44; older git is refused).
+	 */
+	partialClone?: true;
 }
 
 /** Parse {@link PROGRAM_CONFIG_QUERY} output (exit 1 with no output means none). */
@@ -66,6 +77,7 @@ export function parseProgramConfig(stdout: string): GitConfiguredPrograms {
 	const filters = new Set<string>();
 	const hooks = new Set<string>();
 	const drivers = new Set<string>();
+	let partialClone = false;
 	for (const record of stdout.split("\0")) {
 		const key = record.split("\n", 1)[0] ?? "";
 		const last = key.lastIndexOf(".");
@@ -74,6 +86,7 @@ export function parseProgramConfig(stdout: string): GitConfiguredPrograms {
 		else if (key.startsWith("hook.")) hooks.add(key.slice("hook.".length, last));
 		else if (key.startsWith("merge.") && key.slice(last + 1).toLowerCase() === "driver")
 			drivers.add(key.slice("merge.".length, last));
+		else if (key.toLowerCase() === "extensions.partialclone") partialClone = true;
 	}
 	const programs: GitConfiguredPrograms = {
 		filters: [...filters].filter(Boolean),
@@ -81,6 +94,7 @@ export function parseProgramConfig(stdout: string): GitConfiguredPrograms {
 	};
 	const named = [...drivers].filter(Boolean);
 	if (named.length > 0) programs.drivers = named;
+	if (partialClone) programs.partialClone = true;
 	return programs;
 }
 
@@ -88,6 +102,12 @@ export function parseProgramConfig(stdout: string): GitConfiguredPrograms {
 export function untrustedProgramOverrides(
 	programs: GitConfiguredPrograms,
 ): Array<readonly [string, string]> {
+	if (programs.partialClone && !noLazyFetchSupported)
+		throw new AppError(
+			"This repository is a partial clone and this git (older than 2.44) cannot be kept from fetching missing objects through its promisor remote; update git to use it with teams",
+			409,
+			"GIT_TOO_OLD_FOR_PARTIAL_CLONE",
+		);
 	return [
 		...programs.filters.flatMap((name) => [
 			[`filter.${name}.clean`, ""] as const,
@@ -109,6 +129,8 @@ export function gitConfigEnv(
 		GIT_CONFIG_COUNT: String(entries.length),
 		// A status never refreshes the index on disk (no index write, no post-index-change).
 		GIT_OPTIONAL_LOCKS: "0",
+		// A missing object is never fetched lazily from a (repository-configured) promisor remote.
+		GIT_NO_LAZY_FETCH: "1",
 	};
 	entries.forEach(([key, value], index) => {
 		env[`GIT_CONFIG_KEY_${index}`] = key;
@@ -140,6 +162,35 @@ async function defaultProbe(): Promise<boolean> {
 let probe: HardeningProbe = defaultProbe;
 let verdict: Promise<boolean> | null = null;
 
+/** `GIT_NO_LAZY_FETCH` arrived in git 2.44 (known once the version was read; false until then). */
+let noLazyFetchSupported = false;
+let lazyFetchProbe: Promise<void> | null = null;
+
+async function probeLazyFetchSupport(): Promise<void> {
+	const result = await safeSpawn({
+		cmd: ["git", "--version"],
+		cwd: tmpdir(),
+		env: { ...process.env, LC_ALL: "C" },
+		timeout: 10_000,
+		maxOutputBytes: 1024,
+	}).catch(() => null);
+	const match = /git version (\d+)\.(\d+)/.exec(result?.stdout ?? "");
+	const major = Number(match?.[1] ?? 0);
+	const minor = Number(match?.[2] ?? 0);
+	noLazyFetchSupported = major > 2 || (major === 2 && minor >= 44);
+}
+
+/** Force the `GIT_NO_LAZY_FETCH` support verdict (tests); null reads git again. */
+export function setNoLazyFetchSupportForTests(supported: boolean | null): void {
+	if (supported === null) {
+		lazyFetchProbe = null;
+		noLazyFetchSupported = false;
+		return;
+	}
+	lazyFetchProbe = Promise.resolve();
+	noLazyFetchSupported = supported;
+}
+
 /** Replace the probe (tests); null restores git. Clears the cached verdict. */
 export function setGitHardeningProbeForTests(next: HardeningProbe | null): void {
 	probe = next ?? defaultProbe;
@@ -151,6 +202,8 @@ export function setGitHardeningProbeForTests(next: HardeningProbe | null): void 
  * none of the overrides above would apply. Checked once per process (a failed check is retried).
  */
 export async function ensureConfigOverridesHonored(): Promise<void> {
+	lazyFetchProbe ??= probeLazyFetchSupport();
+	await lazyFetchProbe;
 	verdict ??= probe().catch(() => false);
 	const honored = await verdict;
 	if (!honored) {
