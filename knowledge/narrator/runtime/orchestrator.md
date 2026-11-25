@@ -22,6 +22,7 @@ anchors:
   - server/services/turn-continuation-registry.ts
   - server/services/__tests__/agent-runtime-orchestrator-contract.test.ts
   - server/services/__tests__/terminal-watch-real-wake.integration.test.ts
+  - server/services/__tests__/run-registration-identity.test.ts
 keywords:
   - startNarratorRun
   - runAgentLoopUnlocked
@@ -37,7 +38,7 @@ keywords:
   - 跟随父会话模型
   - RuntimePolicy
 status: draft
-verified_at: 76675714460e80e3a2d4ca0a0ca7e55b76731ed1
+verified_at: 764b2c34fd3dcca78458ef3ce054a98314276256
 ---
 # 调度与执行
 
@@ -77,6 +78,7 @@ verified_at: 76675714460e80e3a2d4ca0a0ca7e55b76731ed1
 ## 改它时
 - 新增一种失败恢复：先在 `transition.ts` 的 `RuntimeRecoveryTransition` 与 `settleRuntimeRecovery` 加分支，再在 orchestrator 对应的 `[continuation-source: …]` 处理，并同步 `turn-continuation-registry.ts` 的来源。
 - 改失败后的 pass 边界：同时看 `agent-runtime-orchestrator-contract.test.ts` 的合法重放、空成功输出、二次失败、归档竞争与 held 明确输入用例，以及 `terminal-watch-real-wake.integration.test.ts` 的 Watch/agent 通知在失败前排队与失败后送达用例；不能靠清错误锁存让异步通知变成恢复授权。
+- 改绝对期限或运行绑定：`run-registration-identity.test.ts` 的 A2 等模型 pass 真正开始后触发运行实际调度的 deadline 回调，不以准备阶段必须在短墙钟预算内结束为前提；M3 另外覆盖启动时已经到期、不执行模型的路径。
 - 新增控制动作：改 `RunControlAction` 与 `controlRunUnlocked`，注意 `finalizing` 与 `detaching` 的竞争约定。
 - `ownership.ts` 末尾会改写旧热重载遗留的 Map/Set；改字段名前先看 `adoptLegacyMap`。
 
