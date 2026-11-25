@@ -86,6 +86,8 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 					return {
 						...target.query,
 						narrators: {
+							// Worker-read lookups (`findMany({ limit: 1 })`) read the real fixture row.
+							findMany: target.query.narrators.findMany.bind(target.query.narrators),
 							findFirst: async () => ({
 								id: "n",
 								variant: "primary",

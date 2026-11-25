@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { narrators, userPreferences, users } from "../../db/schema";
 import {
 	ensureNonEmptySchema,
@@ -9,8 +9,13 @@ import {
 } from "../../lib/agent/tool-registry";
 import type { AgentConfig, ToolContext } from "../../lib/agent/types";
 import { settings } from "../../lib/settings";
+import { closeRuntimeTestDb, getRuntimeTestDb } from "./agent-runtime-test-database";
+// Rejections settle natively before matching: Bun's `.rejects` stalls on a reused read Worker.
+import { captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+// Reads run on the database Worker, which needs a file-backed WAL database.
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 const { listNotificationChannels, sendUserNotification } = await import("../notification-service");
@@ -72,7 +77,8 @@ afterEach(() => {
 	globalThis.fetch = originalFetch;
 	cleanDb(sqlite);
 });
-afterAll(() => {
+afterAll(async () => {
+	await closeRuntimeTestDb(sqlite);
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
 });
@@ -122,10 +128,12 @@ describe("Notification service and tool", () => {
 			expect(notificationParameters.safeParse({ action: "list_channels", ...target }).success).toBe(
 				false,
 			);
-			await expect(listNotificationChannels(target)).rejects.toThrow();
+			expect(await captureWorkerRejectionThrower(listNotificationChannels(target))).toThrow();
 		}
 		for (const username of ["Ali", "alice", "%", "Alice%", "nonexistent"]) {
-			await expect(listNotificationChannels({ username })).rejects.toThrow("User not found");
+			expect(await captureWorkerRejectionThrower(listNotificationChannels({ username }))).toThrow(
+				"User not found",
+			);
 		}
 		expect((await listNotificationChannels({ username: "Alice" })).user_id).toBe("u1");
 		expect((await listNotificationChannels({ user_id: "u1" })).username).toBe("Alice");
@@ -383,7 +391,7 @@ describe("Notification retry permission ceiling", () => {
 		expect(
 			(await notificationTool.execute({ action: "list_channels", user_id: "u1" }, context)).isError,
 		).not.toBe(true);
-		await expect(sendUserNotification(sendInput, context)).rejects.toThrow(
+		expect(await captureWorkerRejectionThrower(sendUserNotification(sendInput, context))).toThrow(
 			"read-only or strict plan mode",
 		);
 		db.delete(narrators).where(eq(narrators.id, context.narratorId)).run();

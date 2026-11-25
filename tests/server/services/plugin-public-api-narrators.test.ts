@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { NotFoundError, ValidationError } from "@server/lib/errors";
 import {
 	type CapabilityAuthorizationDecision,
@@ -19,7 +19,13 @@ import {
 	narrators,
 	projects,
 } from "../../../server/db/schema";
-import { cleanDb, getTestDb } from "../../setup";
+import {
+	closeRuntimeTestDb,
+	getRuntimeTestDb,
+} from "../../../server/services/__tests__/agent-runtime-test-database";
+// Rejections settle natively before matching: Bun's `.rejects` stalls on a reused read Worker.
+import { captureWorkerRejection } from "../../../server/services/__tests__/narrator-worker-fixture";
+import { cleanDb } from "../../setup";
 
 const CURSOR_SECRET = "public-api-narrator-test-cursor-secret-32-bytes";
 let requestSequence = 0;
@@ -538,8 +544,13 @@ describe("narrafork.narrator.interrupt (public API surface)", () => {
 	});
 });
 
+// Core adapters read on the database Worker, which needs a file-backed WAL database.
+const coreFixture = getRuntimeTestDb();
+await coreFixture.ready;
+afterAll(() => closeRuntimeTestDb(coreFixture.sqlite));
+
 describe("createCorePluginPublicApiAdapters (core integration)", () => {
-	const { db, sqlite } = getTestDb();
+	const { db, sqlite } = coreFixture;
 	afterEach(() => cleanDb(sqlite));
 
 	const now = "2026-07-16T12:00:00.000Z";
@@ -846,15 +857,19 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 			narratorSession: fakeSession,
 		});
 
-		await expect(
-			adapters.narratorCommands?.sendMessage({
-				narratorId: "n-worker",
-				message: "hi",
-				pluginId: "com.example.team",
-				context: context(),
-				signal: new AbortController().signal,
-			}),
-		).rejects.toMatchObject({
+		expect(
+			await captureWorkerRejection(
+				Promise.resolve(
+					adapters.narratorCommands?.sendMessage({
+						narratorId: "n-worker",
+						message: "hi",
+						pluginId: "com.example.team",
+						context: context(),
+						signal: new AbortController().signal,
+					}),
+				),
+			),
+		).toMatchObject({
 			code: "CONFLICT",
 			retryable: true,
 		});
@@ -915,15 +930,19 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 			narratorSession: fakeSession,
 		});
 
-		await expect(
-			adapters.narratorCommands?.sendMessage({
-				narratorId: "n-sub",
-				message: "hi",
-				pluginId: "com.example.team",
-				context: context(),
-				signal: new AbortController().signal,
-			}),
-		).rejects.toMatchObject({
+		expect(
+			await captureWorkerRejection(
+				Promise.resolve(
+					adapters.narratorCommands?.sendMessage({
+						narratorId: "n-sub",
+						message: "hi",
+						pluginId: "com.example.team",
+						context: context(),
+						signal: new AbortController().signal,
+					}),
+				),
+			),
+		).toMatchObject({
 			code: "INVALID_PARAMS",
 		});
 	});
@@ -1049,13 +1068,17 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 			narratorSession: fakeSession,
 		});
 
-		await expect(
-			adapters.narratorCommands?.interrupt({
-				narratorId: "n-missing",
-				context: context(),
-				signal: new AbortController().signal,
-			}),
-		).rejects.toMatchObject({
+		expect(
+			await captureWorkerRejection(
+				Promise.resolve(
+					adapters.narratorCommands?.interrupt({
+						narratorId: "n-missing",
+						context: context(),
+						signal: new AbortController().signal,
+					}),
+				),
+			),
+		).toMatchObject({
 			code: "NOT_FOUND",
 		});
 	});

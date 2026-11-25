@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { and, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { specFileRevisions, specProtectedTasks } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { AppError } from "../lib/errors";
 import { generateId } from "../lib/id";
 
@@ -148,9 +149,12 @@ export function compileSpecTasks(document: SpecTasksDocument): CompiledSpecTasks
 }
 
 async function listProtectedLocks(namespaceId: string): Promise<ProtectedTaskLock[]> {
-	const locks = await db.query.specProtectedTasks.findMany({
-		where: eq(specProtectedTasks.namespaceId, namespaceId),
-	});
+	const locks = await readQuery(
+		db.query.specProtectedTasks.findMany({
+			where: eq(specProtectedTasks.namespaceId, namespaceId),
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	const firstRevisionIds = [
 		...new Set(
 			locks
@@ -161,10 +165,13 @@ async function listProtectedLocks(namespaceId: string): Promise<ProtectedTaskLoc
 	if (firstRevisionIds.length === 0) {
 		return locks.map((lock) => ({ ...lock, createdBy: "unknown" }));
 	}
-	const revisions = await db.query.specFileRevisions.findMany({
-		where: inArray(specFileRevisions.id, firstRevisionIds),
-		columns: { id: true, createdBy: true },
-	});
+	const revisions = await readQuery(
+		db.query.specFileRevisions.findMany({
+			where: inArray(specFileRevisions.id, firstRevisionIds),
+			columns: { id: true, createdBy: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	const createdByRevision = new Map<string, ProtectedTaskCreatedBy>(
 		revisions.map((revision) => [revision.id, revision.createdBy]),
 	);
@@ -243,6 +250,8 @@ async function syncProtectedLocks(
 	const protectedTasksInDoc = document.tasks.filter((task) => task.protected);
 	for (const task of protectedTasksInDoc) {
 		const hash = taskTextHash(task.text);
+		// Each lock row is decided and written in one turn (no Worker hop): the unique
+		// (namespace, hash) insert must not race another sync of the same document.
 		const existing = await db.query.specProtectedTasks.findFirst({
 			where: and(
 				eq(specProtectedTasks.namespaceId, namespaceId),

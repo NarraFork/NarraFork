@@ -5,6 +5,7 @@ import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { db } from "../db";
 import { workspaces } from "../db/schema";
+import { readQuery, readQueryFirst } from "../db/worker-read";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import {
@@ -120,21 +121,24 @@ async function readWorkspaceJson(c: Context): Promise<unknown> {
 // full layout is read only by `GET /workspaces/:id`.
 workspaceRoutes.get("/", async (c) => {
 	const userId = c.get("user").sub;
-	const rows = await db
-		.select({
-			id: workspaces.id,
-			userId: workspaces.userId,
-			title: workspaces.title,
-			titleSource: workspaces.titleSource,
-			titleRevision: workspaces.titleRevision,
-			treeBytes: sql<number>`length(cast(${workspaces.tree} as blob))`,
-			createdAt: workspaces.createdAt,
-			updatedAt: workspaces.updatedAt,
-		})
-		.from(workspaces)
-		.where(eq(workspaces.userId, userId))
-		.orderBy(desc(workspaces.updatedAt))
-		.limit(WORKSPACE_LIST_LIMIT);
+	const rows = await readQuery(
+		db
+			.select({
+				id: workspaces.id,
+				userId: workspaces.userId,
+				title: workspaces.title,
+				titleSource: workspaces.titleSource,
+				titleRevision: workspaces.titleRevision,
+				treeBytes: sql<number>`length(cast(${workspaces.tree} as blob))`,
+				createdAt: workspaces.createdAt,
+				updatedAt: workspaces.updatedAt,
+			})
+			.from(workspaces)
+			.where(eq(workspaces.userId, userId))
+			.orderBy(desc(workspaces.updatedAt))
+			.limit(WORKSPACE_LIST_LIMIT),
+		{ executionPolicy: "worker-required", signal: c.req.raw.signal, maxRows: WORKSPACE_LIST_LIMIT },
+	);
 	return c.json(rows);
 });
 
@@ -152,9 +156,14 @@ workspaceRoutes.get("/", async (c) => {
 workspaceRoutes.get("/:id", async (c) => {
 	const userId = c.get("user").sub;
 	const id = c.req.param("id");
-	const ws = await db.query.workspaces.findFirst({
-		where: and(eq(workspaces.id, id), eq(workspaces.userId, userId)),
-	});
+	// The 2 MiB-bounded layout is serialized on the Worker, not the request thread.
+	const ws = await readQueryFirst(
+		db.query.workspaces.findMany({
+			where: and(eq(workspaces.id, id), eq(workspaces.userId, userId)),
+			limit: 1,
+		}),
+		{ executionPolicy: "worker-required", signal: c.req.raw.signal, maxRows: 1 },
+	);
 	if (!ws) throw new NotFoundError("Workspace", id);
 	// Materialises membership on first read for a workspace that predates the table.
 	const panels = await listWorkspacePanels(userId, id);
@@ -288,10 +297,14 @@ workspaceRoutes.patch("/:id", workspaceWriteBodyLimit, async (c) => {
 		);
 		return c.json({ ok: true, ...result });
 	}
-	const ws = await db.query.workspaces.findFirst({
-		where: and(eq(workspaces.id, id), eq(workspaces.userId, userId)),
-		columns: { id: true },
-	});
+	const ws = await readQueryFirst(
+		db.query.workspaces.findMany({
+			where: and(eq(workspaces.id, id), eq(workspaces.userId, userId)),
+			columns: { id: true },
+			limit: 1,
+		}),
+		{ executionPolicy: "worker-required", signal: c.req.raw.signal, maxRows: 1 },
+	);
 	if (!ws) throw new NotFoundError("Workspace", id);
 	return c.json({ ok: true });
 });
@@ -301,14 +314,14 @@ workspaceRoutes.delete("/:id", async (c) => {
 	const userId = c.get("user").sub;
 	const id = c.req.param("id");
 
-	const ws = await db.query.workspaces.findFirst({
-		where: and(eq(workspaces.id, id), eq(workspaces.userId, userId)),
-	});
-	if (!ws) throw new NotFoundError("Workspace", id);
-
 	// The sidebar no longer lists workspaces (its folders are an independent structure),
-	// so deleting one touches only the workspace and its panels (FK cascade).
-	await db.delete(workspaces).where(eq(workspaces.id, id));
+	// so deleting one touches only the workspace and its panels (FK cascade). Ownership is
+	// part of the delete itself; no layout blob is read just to check it.
+	const deleted = await db
+		.delete(workspaces)
+		.where(and(eq(workspaces.id, id), eq(workspaces.userId, userId)))
+		.returning({ id: workspaces.id });
+	if (!deleted.length) throw new NotFoundError("Workspace", id);
 	// A device with this workspace still open navigates away on this signal; its re-fetch
 	// would 404 now.
 	broadcastToUser(userId, { type: "workspace_changed", workspaceId: id, reason: "deleted" });

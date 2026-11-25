@@ -2,7 +2,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, it, mock } from "bun
 import type { PersistedRecentTab } from "@shared/recent-tabs";
 import { RECENT_TABS_STORAGE_LIMIT } from "@shared/recent-tabs";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	narrators,
 	userPreferences,
@@ -10,8 +10,13 @@ import {
 	userRecentTabsMeta,
 	users,
 } from "../../db/schema";
+import { closeRuntimeTestDb, getRuntimeTestDb } from "./agent-runtime-test-database";
+// Rejections settle natively before matching: Bun's `.rejects` stalls on a reused read Worker.
+import { captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+// Reads run on the database Worker, which needs a file-backed WAL database.
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
 const realDbModule = { ...(await import("../../db")) };
 const realNarratorWsModule = { ...(await import("../../websocket/narrator-ws")) };
 mock.module("../../db", () => ({ db, sqlite }));
@@ -92,7 +97,8 @@ beforeEach(() => {
 
 afterEach(() => cleanDb(sqlite));
 
-afterAll(() => {
+afterAll(async () => {
+	await closeRuntimeTestDb(sqlite);
 	mock.module("../../db", () => realDbModule);
 	mock.module("../../websocket/narrator-ws", () => realNarratorWsModule);
 	mock.restore();
@@ -116,9 +122,15 @@ describe("creating a folder", () => {
 	it("refuses a target that is already in a folder", async () => {
 		await addNarratorTabs("a", "b", "c");
 		await makeFolder("a", "b");
-		await expect(
-			createRecentTabFolder(USER, { targetKey: "narrator:a", sourceKey: "narrator:c", title: "X" }),
-		).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				createRecentTabFolder(USER, {
+					targetKey: "narrator:a",
+					sourceKey: "narrator:c",
+					title: "X",
+				}),
+			),
+		).toThrow();
 	});
 
 	it("a generic upsert can neither create a folder nor change membership", async () => {

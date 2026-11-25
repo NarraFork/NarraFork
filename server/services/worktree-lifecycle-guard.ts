@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { lstat } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
+import { readQueryFirst } from "@server/db/worker-read";
 import { eq } from "drizzle-orm";
 import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { AppError } from "../lib/errors";
@@ -599,6 +600,7 @@ export function createLifecycleGuard(ports: LifecycleGuardPorts) {
 						!localPathSemantics.contains(targetPath, claimPath) &&
 						!(target.repositoryKey && target.repositoryKey === canonical.repositoryKey) &&
 						!(target.shadowKey && target.shadowKey === canonical.shadowKey);
+
 					if (
 						pathOnlyAncestor &&
 						claim.kind === "narrator" &&
@@ -790,18 +792,25 @@ export async function withProjectRetirement<T>(
 			async () => {
 				const { db } = await import("../db");
 				const { narratorWorktreeResources } = await import("../db/schema");
-				const scopedResource = db
-					.select({
-						id: narratorWorktreeResources.id,
-						path: narratorWorktreeResources.worktreePath,
-						deviceId: narratorWorktreeResources.deviceId,
-						state: narratorWorktreeResources.state,
-						scopeProjectId: narratorWorktreeResources.scopeProjectId,
-					})
-					.from(narratorWorktreeResources)
-					.where(eq(narratorWorktreeResources.scopeProjectId, projectId))
-					.limit(1)
-					.get();
+				const scopedResource = await readQueryFirst(
+					db
+						.select({
+							id: narratorWorktreeResources.id,
+							path: narratorWorktreeResources.worktreePath,
+							deviceId: narratorWorktreeResources.deviceId,
+							state: narratorWorktreeResources.state,
+							scopeProjectId: narratorWorktreeResources.scopeProjectId,
+						})
+						.from(narratorWorktreeResources)
+						.where(eq(narratorWorktreeResources.scopeProjectId, projectId))
+						.limit(1),
+					{
+						executionPolicy: "worker-required",
+						maxRows: 1,
+						signal,
+						timeoutMs: Math.max(1, deadline - performance.now()),
+					},
+				);
 				if (scopedResource)
 					reject("project delete", {
 						status: "protected",
