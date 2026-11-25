@@ -789,15 +789,16 @@ nugRoutes.get("/providers/:id/quota", async (c) => {
 				createHash("sha256").update(primary.identity).digest("hex") === bound.binding.identityHash;
 			// Route through the source owner with A's captured CID even when B is now primary.
 			// Never merge B's previous balance or legacy-normalized zeroes into A's probe.
+			const quotaSubject = {
+				id: bound.binding.credentialId,
+				providerId: id,
+				config: subject.config,
+				identity: nugQuotaIdentity(subject.config),
+			};
 			setNugCachedQuota(
 				id,
-				buildNugQuotaCache(data, paymentCredentialIsPrimary ? getNugCachedQuota(id) : undefined),
-				{
-					id: bound.binding.credentialId,
-					providerId: id,
-					config: subject.config,
-					identity: nugQuotaIdentity(subject.config),
-				},
+				buildNugQuotaCache(data, getNugCachedQuota(id, quotaSubject)),
+				quotaSubject,
 			);
 			return c.json({ ...normalizeNugQuotaResponse(data), paymentCredentialIsPrimary });
 		} catch (err) {
@@ -846,17 +847,17 @@ nugRoutes.get("/providers/:id/billing/config", async (c) => {
 		const provider = new NugProvider(subject.config, subject.connection);
 		const data = (await provider.getBillingConfig()) as unknown as Record<string, unknown>;
 		await recheckPaymentIntent(c, id, intent);
-		const primary = captureNugQuotaSubject(subject.connection);
-		const existing =
-			primary.id === subject.credentialId && primary.identity === identity
-				? getNugCachedQuota(id)
-				: undefined;
-		setNugCachedQuota(id, buildNugQuotaCache(data, existing), {
+		const quotaSubject = {
 			id: subject.credentialId,
 			providerId: id,
 			config: subject.config,
 			identity,
-		});
+		};
+		setNugCachedQuota(
+			id,
+			buildNugQuotaCache(data, getNugCachedQuota(id, quotaSubject)),
+			quotaSubject,
+		);
 		return c.json(normalizeNugQuotaResponse(data));
 	} catch (err: unknown) {
 		if (err instanceof AppError) throw err;

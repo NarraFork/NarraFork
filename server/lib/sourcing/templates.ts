@@ -32,7 +32,12 @@ import {
 } from "../deepseek-balance-cache";
 import { getKimiQuotaSnapshot, kimiQuotaIdentity, refreshKimiKeyUsage } from "../kimi-usage-cache";
 import { resolveKnownUnavailableNugModel } from "../nug-model-availability";
-import { getNugQuotaSnapshot, nugQuotaIdentity, refreshNugQuota } from "../nug-quota-cache";
+import {
+	getNugQuotaSnapshot,
+	nugQuotaBalanceSources,
+	nugQuotaIdentity,
+	refreshNugQuota,
+} from "../nug-quota-cache";
 import {
 	getOpencodeQuotaSnapshot,
 	opencodeQuotaIdentity,
@@ -176,7 +181,11 @@ const ROUTING: Partial<Record<ServiceTemplateId, RoutingBehavior>> = {
 		...keyRouting(
 			(group) => settings.nugProviders?.find((provider) => provider.id === group.id),
 			nugQuotaIdentity,
-			{ streamIdentity: nugQuotaIdentity, isEligible: isNugRelayEligible },
+			{
+				streamIdentity: nugQuotaIdentity,
+				isEligible: isNugRelayEligible,
+				balanceSources: nugQuotaBalanceSources,
+			},
 		),
 		isModelAvailable: (group, value) => !resolveKnownUnavailableNugModel(value, group.prefix),
 	},
