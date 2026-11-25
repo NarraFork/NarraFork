@@ -96,7 +96,7 @@ const RUNNING = new Set(["working", "waiting"]);
 /** Escape LIKE metacharacters for a prefix bound with `ESCAPE '\'`. */
 const escapeLike = (value: string) => value.replace(/[\\%_]/g, (match) => `\\${match}`);
 /** Outcome events read at once (fast-forward requests in between are skipped). */
-const OUTCOME_SCAN = 8;
+const OUTCOME_SCAN = 20;
 /** Events after which an earlier merge outcome no longer applies. */
 const OUTCOME_KINDS = [
 	"work.ready",
@@ -180,35 +180,63 @@ export function readMergeOutcome(itemId: string): TeamWorkMergeOutcome | null {
 		.orderBy(desc(teamWorkEvents.createdAt), desc(teamWorkEvents.id))
 		.limit(OUTCOME_SCAN)
 		.all();
-	// A fast-forward request keeps the prepared merge it acts on.
-	const row = rows.find(
-		(candidate) =>
-			candidate.kind !== "work.merge_requested" || candidate.detail?.job !== "fast_forward",
-	);
-	if (!row) return null;
-	const detail = row.detail ?? {};
-	if (row.kind === "work.merge_failed") {
-		const conflicts = Array.isArray(detail.conflicts)
-			? detail.conflicts.filter((file): file is string => typeof file === "string")
-			: undefined;
-		return {
-			kind: "failed",
-			code: str(detail.code) ?? "TEAM_MERGE_FAILED",
-			message: str(detail.message),
-			...(conflicts ? { conflicts: conflicts.slice(0, TEAM_MERGE_CONFLICTS_MAX) } : {}),
-			...(detail.more === true ? { more: true } : {}),
-			at: row.at,
-		};
-	}
-	if (row.kind === "work.merge_prepared") {
-		const mergeCommit = str(detail.mergeCommit);
-		const baseSha = str(detail.baseSha);
-		const checkedOutAt = str(detail.checkedOutAt);
-		if (!mergeCommit || !baseSha || !checkedOutAt) return null;
-		return { kind: "prepared", mergeCommit, baseSha, checkedOutAt, at: row.at };
+	// A fast-forward's request and failure keep the prepared merge they acted on: the newest
+	// failure is carried on it (its files, the reason), and the merge can be tried again.
+	let fastForwardFailure: (typeof rows)[number] | null = null;
+	for (const row of rows) {
+		const detail = row.detail ?? {};
+		const fromFastForward = detail.job === "fast_forward";
+		if (row.kind === "work.merge_requested" && fromFastForward) continue;
+		if (row.kind === "work.merge_failed" && fromFastForward) {
+			fastForwardFailure ??= row;
+			continue;
+		}
+		if (row.kind === "work.merge_failed") {
+			const conflicts = stringList(detail.conflicts);
+			return {
+				kind: "failed",
+				code: str(detail.code) ?? "TEAM_MERGE_FAILED",
+				message: str(detail.message),
+				...(conflicts ? { conflicts: conflicts.slice(0, TEAM_MERGE_CONFLICTS_MAX) } : {}),
+				...(detail.more === true ? { more: true } : {}),
+				at: row.at,
+			};
+		}
+		if (row.kind === "work.merge_prepared") {
+			const mergeCommit = str(detail.mergeCommit);
+			const baseSha = str(detail.baseSha);
+			const checkedOutAt = str(detail.checkedOutAt);
+			if (!mergeCommit || !baseSha || !checkedOutAt) return null;
+			const failed = fastForwardFailure?.detail ?? null;
+			const files = stringList(failed?.files);
+			return {
+				kind: "prepared",
+				mergeCommit,
+				baseSha,
+				checkedOutAt,
+				at: row.at,
+				...(failed && fastForwardFailure
+					? {
+							fastForwardFailure: {
+								code: str(failed.code) ?? "TEAM_MERGE_FAILED",
+								message: str(failed.message),
+								...(files ? { files: files.slice(0, TEAM_MERGE_CONFLICTS_MAX) } : {}),
+								...(str(failed.blocker) ? { blocker: str(failed.blocker) ?? undefined } : {}),
+								at: fastForwardFailure.at,
+							},
+						}
+					: {}),
+			};
+		}
+		return null;
 	}
 	return null;
 }
+
+const stringList = (value: unknown): string[] | undefined =>
+	Array.isArray(value)
+		? value.filter((entry): entry is string => typeof entry === "string")
+		: undefined;
 
 /** The repository a project's merges run in: the project's directory. */
 function repositoryOf(projectId: string): string | null {
@@ -227,7 +255,8 @@ export function mergeModeOf(projectId: string): TeamMergeMode {
 	const repo = repositoryOf(projectId);
 	if (!repo) return "local";
 	const hosting = peekHosting(repo);
-	if (!hosting) return "checking";
+	// Not read yet, or the read failed: never assumed to be "not GitHub".
+	if (!hosting || hosting.kind === "unknown") return "checking";
 	return hosting.kind === "github" ? "github" : "local";
 }
 
@@ -339,11 +368,14 @@ async function inspectPrepared(
 	itemId: string,
 	base: string,
 	prepared: Extract<TeamWorkMergeOutcome, { kind: "prepared" }>,
+	repo: string | null,
 ): Promise<{ blocker: TeamFastForwardBlocker | null; running: number; terminals: number }> {
 	const key = `${prepared.mergeCommit}:${prepared.baseSha}:${prepared.checkedOutAt}`;
 	const cached = state.inspections.get(itemId);
 	if (cached && cached.key === key && Date.now() - cached.at < INSPECTION_TTL_MS) return cached;
-	const blocker = await inspectCheckout(prepared.checkedOutAt, base, prepared.baseSha);
+	const blocker = repo
+		? await inspectCheckout(prepared.checkedOutAt, base, prepared.baseSha, { repo })
+		: ("unreadable" as const);
 	const activity = await checkoutActivity(prepared.checkedOutAt, { backgroundTasks: false }).catch(
 		() => ({ running: 0, terminals: 0 }),
 	);
@@ -375,7 +407,8 @@ export async function mergeViewOf(input: {
 	const view: TeamWorkMergeView = { ...summary, detail: outcome };
 	if (outcome?.kind === "prepared") {
 		const base = input.item.baseRef ?? input.baseBranch;
-		const inspected = await inspectPrepared(input.item.id, base, outcome).catch(() => ({
+		const repo = repositoryOf(input.item.projectId);
+		const inspected = await inspectPrepared(input.item.id, base, outcome, repo).catch(() => ({
 			blocker: "unreadable" as const,
 			running: 0,
 			terminals: 0,
@@ -403,6 +436,15 @@ interface JobContext extends Requester {
 	projectId: string;
 	/** When `work.merge_requested` was recorded (ms): outcomes are recorded strictly after it. */
 	requestedAt?: number;
+	/** What the job does (kept on its failure, so a failed fast-forward keeps the prepared merge). */
+	job?: MergeJob["job"];
+}
+
+let jobDeadlineMs = JOB_DEADLINE_MS;
+
+/** Shorten the job deadline (tests); null restores it. */
+export function setMergeDeadlineForTests(ms: number | null): void {
+	jobDeadlineMs = ms ?? JOB_DEADLINE_MS;
 }
 
 /** An outcome's timestamp: never in the same millisecond as its request, so it reads as newer. */
@@ -479,8 +521,9 @@ function requireMergeable(teamId: string, itemId: string) {
 function startJob(
 	context: JobContext,
 	job: MergeJob["job"],
-	run: (context: JobContext) => Promise<void>,
+	run: (context: JobContext, signal: AbortSignal) => Promise<void>,
 ): TeamWorkMergeResponse {
+	context.job = job;
 	if (!claimMerging(context.itemId))
 		throw new AppError(
 			`Work item ${context.itemId} is being merged right now`,
@@ -513,12 +556,27 @@ function startJob(
 	}
 	eventBus.emit({ type: "team:communication_changed", teamId: context.teamId });
 	const work = (async () => {
+		const controller = new AbortController();
 		try {
-			await projectLocks.acquire(context.projectId, () =>
-				withDeadline(run(context), JOB_DEADLINE_MS),
-			);
+			await projectLocks.acquire(context.projectId, async () => {
+				// Past the deadline the job is aborted, and the guard and the mutex are given back
+				// only once it has actually stopped: every git command is killed on abort and the job
+				// checks the signal between steps, before any ref moves.
+				const timer = setTimeout(
+					() =>
+						controller.abort(
+							new MergeFailure("TEAM_MERGE_TIMEOUT", "The merge took too long and was stopped"),
+						),
+					jobDeadlineMs,
+				);
+				try {
+					await run(context, controller.signal);
+				} finally {
+					clearTimeout(timer);
+				}
+			});
 		} catch (error) {
-			recordFailure(context, error);
+			recordFailure(context, controller.signal.aborted ? controller.signal.reason : error);
 		} finally {
 			state.jobs.delete(context.itemId);
 			state.inspections.delete(context.itemId);
@@ -532,23 +590,6 @@ function startJob(
 	state.running.add(work);
 	void work.finally(() => state.running.delete(work));
 	return { itemId: context.itemId, job, phase: "queued" };
-}
-
-async function withDeadline<T>(work: Promise<T>, ms: number): Promise<T> {
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	try {
-		return await Promise.race([
-			work,
-			new Promise<never>((_, reject) => {
-				timer = setTimeout(
-					() => reject(new MergeFailure("TEAM_MERGE_TIMEOUT", "The merge took too long")),
-					ms,
-				);
-			}),
-		]);
-	} finally {
-		clearTimeout(timer);
-	}
 }
 
 function setPhase(itemId: string, phase: TeamMergePhase): void {
@@ -578,7 +619,12 @@ function recordFailure(context: JobContext, error: unknown): void {
 			workItemId: context.itemId,
 			kind: "work.merge_failed",
 			actor: { kind: "person", id: context.userId },
-			detail: { code: failure.code, message: failure.message.slice(0, 500), ...failure.extra },
+			detail: {
+				code: failure.code,
+				message: failure.message.slice(0, 500),
+				...(context.job ? { job: context.job } : {}),
+				...failure.extra,
+			},
 			at: outcomeAt(context),
 		});
 	} catch (recordError) {
@@ -641,7 +687,7 @@ export function requestFastForward(input: {
 // ── The jobs ────────────────────────────────────────────────────────────────
 
 /** Re-read everything a job relies on, under the project's mutex. */
-async function jobFacts(context: JobContext) {
+async function jobFacts(context: JobContext, signal: AbortSignal) {
 	const team = teamRow(context.teamId);
 	if (!team || team.status !== "active" || team.coordinator === "archived")
 		throw new MergeFailure("TEAM_ARCHIVED", "The team was archived");
@@ -665,18 +711,26 @@ async function jobFacts(context: JobContext) {
 	const repo = repositoryOf(context.projectId);
 	if (!repo) throw new MergeFailure("TEAM_PROJECT_NOT_GIT", "The project has no repository");
 	const hosting = await hostingOf(repo);
+	signal.throwIfAborted();
+	if (hosting.kind === "unknown")
+		throw new MergeFailure(
+			"TEAM_MERGE_HOSTING_UNKNOWN",
+			"Where origin is hosted could not be read; try again once it can (a GitHub origin is never merged locally)",
+		);
 	if (hosting.kind === "github")
 		throw new MergeFailure(
 			"TEAM_MERGE_GITHUB_PENDING",
 			"Origin is on GitHub: this item merges through a pull request, not offered yet",
 		);
-	if (!supportsMergeTree(await gitVersion()))
+	const version = await gitVersion();
+	signal.throwIfAborted();
+	if (!supportsMergeTree(version))
 		throw new MergeFailure(
 			"TEAM_MERGE_GIT_TOO_OLD",
 			"git 2.38 or newer is needed to merge without touching a working tree",
 		);
 	const base = item.baseRef ?? team.baseBranch;
-	const git = teamRepoGit(repo);
+	const git = teamRepoGit(repo, { signal });
 	if (isRemoteTrackingBase(base) || !(await git.resolve(`refs/heads/${base}`)))
 		throw new MergeFailure(
 			isRemoteTrackingBase(base) ? "TEAM_MERGE_BASE_REMOTE" : "TEAM_BASE_UNRESOLVED",
@@ -750,9 +804,9 @@ async function landed(
 	);
 }
 
-async function runMerge(context: JobContext): Promise<void> {
+async function runMerge(context: JobContext, signal: AbortSignal): Promise<void> {
 	setPhase(context.itemId, "checking");
-	const facts = await jobFacts(context);
+	const facts = await jobFacts(context, signal);
 	const { item, head, branch, base, git } = facts;
 	const title = item.title;
 	for (let attempt = 0; attempt < 2; attempt++) {
@@ -788,6 +842,7 @@ async function runMerge(context: JobContext): Promise<void> {
 			return;
 		}
 		const identity = await resolveUserGitIdentityEnv(context.userId).catch(() => null);
+		signal.throwIfAborted();
 		const mergeCommit = await git.commitTree({
 			tree: merged.tree,
 			parents: [old, head],
@@ -795,8 +850,12 @@ async function runMerge(context: JobContext): Promise<void> {
 			identity,
 		});
 		const existing = await git.resolve(`${TEAM_MERGE_REF_PREFIX}${item.id}`);
+		signal.throwIfAborted();
 		await git.setPrivateRef(item.id, mergeCommit, existing);
 		setPhase(context.itemId, "updating");
+		// The last safe point: past it the base may move, and the merge is recorded whatever the
+		// deadline says.
+		signal.throwIfAborted();
 		const moved = await git.fastForwardBase(mergeCommit, base);
 		if (moved.outcome === "updated") {
 			const now = await git.resolve(`refs/heads/${base}`);
@@ -831,10 +890,10 @@ async function runMerge(context: JobContext): Promise<void> {
 	);
 }
 
-async function runFastForward(context: JobContext): Promise<void> {
+async function runFastForward(context: JobContext, signal: AbortSignal): Promise<void> {
 	setPhase(context.itemId, "checking");
-	const facts = await jobFacts(context);
-	const { item, head, branch, base, git } = facts;
+	const facts = await jobFacts(context, signal);
+	const { item, head, branch, base, git, repo } = facts;
 	const outcome = readMergeOutcome(item.id);
 	if (outcome?.kind !== "prepared")
 		throw new MergeFailure("TEAM_MERGE_NOT_PREPARED", "There is no prepared merge any more");
@@ -860,26 +919,37 @@ async function runFastForward(context: JobContext): Promise<void> {
 		await git.deletePrivateRef(item.id, outcome.mergeCommit);
 		return;
 	}
-	const blocker = await inspectCheckout(outcome.checkedOutAt, base, outcome.baseSha);
-	if (blocker)
-		throw new MergeFailure(
-			blocker === "stale" ? "TEAM_MERGE_STALE" : "TEAM_MERGE_CHECKOUT_BLOCKED",
-			blocker === "stale"
-				? `${base} moved since the merge was prepared; prepare it again`
-				: `The checkout at ${outcome.checkedOutAt} cannot be fast-forwarded here (${blocker}); run the command yourself`,
-			{ blocker },
-		);
-	const activity = await checkoutActivity(outcome.checkedOutAt, { backgroundTasks: true });
-	if (activity.running > 0)
-		throw new MergeFailure(
-			"TEAM_MERGE_CHECKOUT_BUSY",
-			`${activity.running} session(s) or background task(s) are running in ${outcome.checkedOutAt}`,
-			{ blocker: "sessions_running", runningSessions: activity.running },
-		);
-	setPhase(context.itemId, "fast_forwarding");
+	const dir = outcome.checkedOutAt;
+	signal.throwIfAborted();
+	// Everything about that checkout is checked under its worktree lock, right before the merge.
 	const locked = await worktreeLock.tryAcquire(
-		outcome.checkedOutAt,
-		() => fastForwardCheckout(outcome.checkedOutAt, privateRef),
+		dir,
+		async () => {
+			const blocker = await inspectCheckout(dir, base, outcome.baseSha, { repo, signal });
+			if (blocker)
+				throw new MergeFailure(
+					blocker === "stale" ? "TEAM_MERGE_STALE" : "TEAM_MERGE_CHECKOUT_BLOCKED",
+					blocker === "stale"
+						? `${base} moved since the merge was prepared; prepare it again`
+						: `The checkout at ${dir} cannot be fast-forwarded here (${blocker}); run the command yourself`,
+					{ blocker },
+				);
+			const activity = await checkoutActivity(dir, { backgroundTasks: true });
+			if (activity.running > 0)
+				throw new MergeFailure(
+					"TEAM_MERGE_CHECKOUT_BUSY",
+					`${activity.running} session(s) or background task(s) are running in ${dir}`,
+					{ blocker: "sessions_running", runningSessions: activity.running },
+				);
+			signal.throwIfAborted();
+			setPhase(context.itemId, "fast_forwarding");
+			return fastForwardCheckout(
+				dir,
+				privateRef,
+				{ base, mergeCommit: outcome.mergeCommit },
+				signal,
+			);
+		},
 		500,
 	);
 	if (!locked.acquired)
@@ -887,12 +957,21 @@ async function runFastForward(context: JobContext): Promise<void> {
 			"GIT_WORKSPACE_BUSY",
 			"Git is busy in that checkout; retry after the current operation completes",
 		);
-	if (!locked.value.ok)
-		throw new MergeFailure(
-			"TEAM_MERGE_FAST_FORWARD_REFUSED",
-			`git refused to fast-forward ${outcome.checkedOutAt}; nothing changed: ${locked.value.message}`,
-			{ files: locked.value.files },
-		);
+	const result = locked.value;
+	if (!result.ok)
+		throw result.kind === "moved"
+			? new MergeFailure("TEAM_MERGE_CHECKOUT_BLOCKED", result.message, {
+					blocker: "not_on_base",
+				})
+			: result.kind === "incomplete"
+				? new MergeFailure("TEAM_MERGE_FAST_FORWARD_INCOMPLETE", result.message, {
+						files: result.files,
+					})
+				: new MergeFailure(
+						"TEAM_MERGE_FAST_FORWARD_REFUSED",
+						`git refused to fast-forward ${dir}; nothing changed: ${result.message}`,
+						{ files: result.files },
+					);
 	const after = await git.resolve(`refs/heads/${base}`);
 	if (after !== outcome.mergeCommit)
 		throw new MergeFailure("TEAM_MERGE_BASE_MOVED", `${base} did not take the merge`);
@@ -901,7 +980,7 @@ async function runFastForward(context: JobContext): Promise<void> {
 		{ item, head, base, title: item.title, branch },
 		outcome.mergeCommit,
 		outcome.mergeCommit,
-		{ fastForwarded: "checkout", checkedOutAt: outcome.checkedOutAt },
+		{ fastForwarded: "checkout", checkedOutAt: dir },
 	);
 	await git.deletePrivateRef(item.id, outcome.mergeCommit);
 }
@@ -910,6 +989,8 @@ async function runFastForward(context: JobContext): Promise<void> {
 
 const PRUNE_PROJECTS_MAX = 200;
 const PRUNE_ITEMS_CHUNK = 200;
+/** Pages of private refs one prune looks at. */
+const PRUNE_ROUNDS_MAX = 20;
 
 /**
  * Delete the private merge refs of one project's items that are no longer ready (merged,
@@ -919,23 +1000,28 @@ export async function pruneProjectMergeRefs(projectId: string): Promise<number> 
 	const repo = repositoryOf(projectId);
 	if (!repo) return 0;
 	const git = teamRepoGit(repo);
-	const refs = await git.listPrivateRefs();
-	if (refs.length === 0) return 0;
-	const ready = new Set<string>();
-	for (let index = 0; index < refs.length; index += PRUNE_ITEMS_CHUNK) {
-		const ids = refs.slice(index, index + PRUNE_ITEMS_CHUNK).map((ref) => ref.itemId);
-		for (const row of db
-			.select({ id: teamWorkItems.id })
-			.from(teamWorkItems)
-			.where(and(inArray(teamWorkItems.id, ids), eq(teamWorkItems.state, "ready")))
-			.limit(PRUNE_ITEMS_CHUNK)
-			.all())
-			ready.add(row.id);
-	}
 	let pruned = 0;
-	for (const ref of refs) {
-		if (ready.has(ref.itemId) || isMerging(ref.itemId)) continue;
-		if (await git.deletePrivateRef(ref.itemId, ref.commit)) pruned++;
+	// One page at a time: a page whose refs all belong to ready items ends it (refs are listed in
+	// name order, so a later round would only see the same page again).
+	for (let round = 0; round < PRUNE_ROUNDS_MAX; round++) {
+		const { refs, more } = await git.listPrivateRefs();
+		if (refs.length === 0) break;
+		const ready = new Set<string>();
+		for (let index = 0; index < refs.length; index += PRUNE_ITEMS_CHUNK) {
+			const ids = refs.slice(index, index + PRUNE_ITEMS_CHUNK).map((ref) => ref.itemId);
+			for (const row of db
+				.select({ id: teamWorkItems.id })
+				.from(teamWorkItems)
+				.where(and(inArray(teamWorkItems.id, ids), eq(teamWorkItems.state, "ready")))
+				.limit(PRUNE_ITEMS_CHUNK)
+				.all())
+				ready.add(row.id);
+		}
+		const prunedNow = await git.deletePrivateRefs(
+			refs.filter((ref) => !ready.has(ref.itemId) && !isMerging(ref.itemId)),
+		);
+		pruned += prunedNow;
+		if (!more || prunedNow === 0) break;
 	}
 	return pruned;
 }

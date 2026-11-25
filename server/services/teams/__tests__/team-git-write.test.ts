@@ -14,11 +14,18 @@ import { TEAM_MERGE_CONFLICTS_MAX } from "@shared/project-teams";
 import { safeSpawn } from "../../../lib/spawn";
 import { configuredPrograms, teamGit } from "../team-git";
 import {
+	fastForwardCheckout,
 	fastForwardCommand,
 	gitVersion,
+	inspectCheckout,
+	networkOverrides,
+	PRIVATE_REFS_PAGE,
+	type ScopedConfigEntry,
 	signingConfig,
+	sshSettings,
 	supportsMergeTree,
 	teamRepoGit,
+	UnsafeRemoteConfigError,
 } from "../team-git-write";
 
 let temporary: string;
@@ -205,10 +212,13 @@ describe("team git writes", () => {
 		await expect(write.setPrivateRef("item-a", base, null)).rejects.toThrow("update-ref");
 		await write.setPrivateRef("item-a", base, head);
 		await write.setPrivateRef("item-b", head, null);
-		expect(await write.listPrivateRefs()).toEqual([
-			{ itemId: "item-a", commit: base },
-			{ itemId: "item-b", commit: head },
-		]);
+		expect(await write.listPrivateRefs()).toEqual({
+			refs: [
+				{ itemId: "item-a", commit: base },
+				{ itemId: "item-b", commit: head },
+			],
+			more: false,
+		});
 		expect(await write.deletePrivateRef("item-a", head)).toBe(false);
 		expect(await write.deletePrivateRef("item-a", base)).toBe(true);
 		expect(await git(["branch", "--list"])).not.toContain("team-merges");
@@ -272,7 +282,7 @@ describe("team git writes", () => {
 		);
 		await git(["config", "gpg.program", repoSigner]);
 		const write = teamRepoGit(repo);
-		const config = await signingConfig(repo, []);
+		const config = await signingConfig(repo);
 		expect(config.sign).toBe(true);
 		expect(config.overrides).toEqual([["gpg.program", hostSigner]]);
 		const merged = await write.mergeTree(base, head);
@@ -330,5 +340,306 @@ describe("team git writes", () => {
 		expect(fastForwardCommand("/my repo/it's", "abc")).toBe(
 			"git -C '/my repo/it'\\''s' merge --ff-only refs/narrafork/team-merges/abc",
 		);
+	});
+});
+
+// ── Review fixes: nothing from the repository's own configuration runs or chooses ──────────
+
+/** A marker file a program would create if it ran. */
+const marker = (name: string) => join(temporary, `${name}-${Math.random().toString(36).slice(2)}`);
+async function script(name: string, body: string) {
+	const path = join(temporary, `${name}-${Math.random().toString(36).slice(2)}.sh`);
+	await writeFile(path, `#!/bin/sh\n${body}\n`);
+	await chmod(path, 0o755);
+	return path;
+}
+
+describe("the work-start fetch (review 1, 4)", () => {
+	test("credential helpers and askpass of the repository never run; the host's helper does", async () => {
+		// The reviewer's 401 server (scratchpad/merge-review/srv.ts): every request asks for a login.
+		const server = Bun.serve({
+			port: 0,
+			hostname: "127.0.0.1",
+			fetch: () =>
+				new Response("no", { status: 401, headers: { "WWW-Authenticate": 'Basic realm="x"' } }),
+		});
+		try {
+			await commitFile("a.txt", "a\n", "base");
+			const origin = `http://127.0.0.1:${server.port}/o/r.git`;
+			await git(["remote", "add", "origin", origin]);
+			const repoHelper = marker("repo-helper");
+			const repoUrlHelper = marker("repo-url-helper");
+			const repoAskpass = marker("repo-askpass");
+			const hostHelper = marker("host-helper");
+			await git(["config", "credential.helper", `!f() { touch ${repoHelper}; }; f`]);
+			await git([
+				"config",
+				`credential.http://127.0.0.1:${server.port}.helper`,
+				`!f() { touch ${repoUrlHelper}; }; f`,
+			]);
+			await git([
+				"config",
+				"core.askPass",
+				await script("askpass", `touch ${repoAskpass}; echo x`),
+			]);
+			await writeFile(
+				globalConfig,
+				`${HOST_USER}[credential]\n\thelper = "!f() { touch ${hostHelper}; }; f"\n`,
+			);
+			const result = await teamRepoGit(repo).fetchBaseFromOrigin("main");
+			expect(result.ok).toBe(false);
+			expect(existsSync(repoHelper)).toBe(false);
+			expect(existsSync(repoUrlHelper)).toBe(false);
+			expect(existsSync(repoAskpass)).toBe(false);
+			expect(existsSync(hostHelper)).toBe(true);
+		} finally {
+			server.stop(true);
+		}
+	});
+
+	test("a repository insteadOf that rewrites origin, or a transport helper, refuses the fetch", async () => {
+		await commitFile("a.txt", "a\n", "base");
+		const ran = marker("ext");
+		await git(["remote", "add", "origin", "mine:o/r.git"]);
+		await git(["config", `url.ext::sh -c touch% ${ran}.insteadOf`, "mine:"]);
+		const refused = await teamRepoGit(repo).fetchBaseFromOrigin("main");
+		expect(refused).toMatchObject({ ok: false });
+		if (!refused.ok) expect(refused.message).toContain(".insteadof");
+		expect(existsSync(ran)).toBe(false);
+		await git(["config", "--remove-section", `url.ext::sh -c touch% ${ran}`]);
+		await git(["config", "remote.origin.vcs", "ext"]);
+		const helper = await teamRepoGit(repo).fetchBaseFromOrigin("main");
+		expect(helper).toMatchObject({ ok: false });
+		if (!helper.ok) expect(helper.message).toContain("remote.origin.vcs");
+		// Even without a rewrite, ext:: is never a transport.
+		await git(["config", "--unset", "remote.origin.vcs"]);
+		await git(["config", "protocol.ext.allow", "always"]);
+		await git(["remote", "set-url", "origin", `ext::sh -c touch% ${ran}`]);
+		expect((await teamRepoGit(repo).fetchBaseFromOrigin("main")).ok).toBe(false);
+		expect(existsSync(ran)).toBe(false);
+	});
+
+	test("ssh: the host's core.sshCommand is used, the repository's never", async () => {
+		const saved = { command: process.env.GIT_SSH_COMMAND, ssh: process.env.GIT_SSH };
+		delete process.env.GIT_SSH_COMMAND;
+		delete process.env.GIT_SSH;
+		try {
+			await commitFile("a.txt", "a\n", "base");
+			const hostRan = marker("host-ssh");
+			const repoRan = marker("repo-ssh");
+			await writeFile(
+				globalConfig,
+				`${HOST_USER}[core]\n\tsshCommand = ${await script("host-ssh", `touch ${hostRan}; exit 1`)}\n`,
+			);
+			await git([
+				"config",
+				"core.sshCommand",
+				await script("repo-ssh", `touch ${repoRan}; exit 1`),
+			]);
+			await git(["remote", "add", "origin", "ssh://git@127.0.0.1:1/o/r.git"]);
+			expect((await teamRepoGit(repo).fetchBaseFromOrigin("main")).ok).toBe(false);
+			expect(existsSync(hostRan)).toBe(true);
+			expect(existsSync(repoRan)).toBe(false);
+		} finally {
+			if (saved.command !== undefined) process.env.GIT_SSH_COMMAND = saved.command;
+			if (saved.ssh !== undefined) process.env.GIT_SSH = saved.ssh;
+		}
+	});
+
+	test("the overrides: host values kept, repository values neutralised or refused", () => {
+		const entry = (scope: string, key: string, value: string): ScopedConfigEntry => ({
+			scope,
+			key,
+			value,
+		});
+		const { overrides, env } = networkOverrides(
+			[
+				entry("local", "remote.origin.url", "https://example.com/o/r.git"),
+				entry("global", "credential.helper", "store"),
+				entry("local", "credential.helper", "!evil"),
+				entry("local", "credential.username", "mallory"),
+				entry("local", "http.sslverify", "false"),
+				entry("global", "http.proxy", "http://host-proxy:3128"),
+				entry("local", "http.proxy", "http://evil:1"),
+				entry("local", "http.https://example.com.extraheader", "Authorization: x"),
+			],
+			{ HTTPS_PROXY: "http://ambient:8080" },
+		);
+		expect(overrides).toContainEqual(["credential.helper", ""]);
+		expect(overrides).toContainEqual(["credential.helper", "store"]);
+		expect(overrides.findIndex(([k, v]) => k === "credential.helper" && v === "")).toBeLessThan(
+			overrides.findIndex(([k, v]) => k === "credential.helper" && v === "store"),
+		);
+		expect(overrides).toContainEqual(["credential.username", ""]);
+		expect(overrides).toContainEqual(["http.sslverify", "true"]);
+		expect(overrides).toContainEqual(["http.proxy", "http://host-proxy:3128"]);
+		expect(overrides).toContainEqual(["http.https://example.com.extraheader", ""]);
+		expect(overrides).toContainEqual(["protocol.ext.allow", "never"]);
+		expect(overrides).toContainEqual(["protocol.allow", "never"]);
+		expect(env).toEqual({ GIT_SSH_COMMAND: "ssh -o BatchMode=yes" });
+		// A proxy only the repository names becomes the server's own.
+		expect(
+			networkOverrides([entry("local", "http.proxy", "http://evil:1")], {
+				HTTPS_PROXY: "http://ambient:8080",
+			}).overrides,
+		).toContainEqual(["http.proxy", "http://ambient:8080"]);
+		// A repository CA file has no neutral value: refused.
+		expect(() => networkOverrides([entry("local", "http.sslcainfo", "/tmp/evil.pem")], {})).toThrow(
+			UnsafeRemoteConfigError,
+		);
+		// ssh: an operator's environment wins, then the host's config, then batch mode.
+		expect(sshSettings([entry("local", "core.sshcommand", "evil")], {})).toEqual({
+			overrides: [["core.sshCommand", ""]],
+			env: { GIT_SSH_COMMAND: "ssh -o BatchMode=yes" },
+		});
+		expect(
+			sshSettings(
+				[entry("global", "core.sshcommand", "ssh -i k"), entry("local", "core.sshcommand", "evil")],
+				{},
+			),
+		).toEqual({ overrides: [["core.sshCommand", "ssh -i k"]], env: {} });
+		expect(sshSettings([], { GIT_SSH_COMMAND: "ssh -F op" }).env).toEqual({});
+	});
+});
+
+describe("identity, signing and the local fetch (review nits, 12)", () => {
+	test("without a NarraFork identity the host's global one commits, never the repository's", async () => {
+		const { head, base } = await forkedRepo();
+		await git(["config", "user.name", "Mallory"]);
+		await git(["config", "user.email", "mallory@e.test"]);
+		// Signing turned on by the repository alone is not the host's choice.
+		await git(["config", "commit.gpgsign", "true"]);
+		const write = teamRepoGit(repo);
+		const merged = await write.mergeTree(base, head);
+		if (!merged.clean) throw new Error("expected a clean merge");
+		const commit = await write.commitTree({
+			tree: merged.tree,
+			parents: [base, head],
+			message: "m",
+			identity: null,
+		});
+		expect(await git(["log", "-1", "--format=%an <%ae>|%cn <%ce>", commit])).toBe(
+			"Host <host@e.test>|Host <host@e.test>",
+		);
+		expect(await git(["cat-file", "-p", commit])).not.toContain("gpgsig");
+		await writeFile(globalConfig, "[commit]\n\tgpgsign = false\n");
+		await expect(
+			write.commitTree({ tree: merged.tree, parents: [base, head], message: "m", identity: null }),
+		).rejects.toMatchObject({ code: "TEAM_MERGE_IDENTITY_UNKNOWN" });
+	});
+
+	test("fetch . never takes a transport: an ext:: insteadOf on . runs nothing", async () => {
+		const { head } = await forkedRepo();
+		await git(["checkout", "-q", "--detach"]);
+		const ran = marker("ext-dot");
+		await git(["config", `url.ext::sh -c touch% ${ran}.insteadOf`, "."]);
+		await git(["config", "protocol.ext.allow", "always"]);
+		await expect(teamRepoGit(repo).fastForwardBase(head, "main")).rejects.toThrow();
+		expect(existsSync(ran)).toBe(false);
+	});
+
+	test("a filter configured after the program list was first read still never runs", async () => {
+		const { head, base } = await forkedRepo();
+		const write = teamRepoGit(repo);
+		expect((await write.mergeTree(base, head)).clean).toBe(true);
+		// Configuration changes between two commands of one job: the second reads it again.
+		const ran = marker("driver-later");
+		await writeFile(join(repo, ".gitattributes"), "*.txt merge=later\n");
+		await git(["config", "merge.later.driver", `touch ${ran}; cp %B %A`]);
+		await git(["add", ".gitattributes"]);
+		await git(["commit", "-qm", "attributes"]);
+		await git(["checkout", "-q", "feature"]);
+		await writeFile(join(repo, "main.txt"), "feature side\n");
+		await git(["add", "main.txt"]);
+		await git(["commit", "-qm", "feature edits main.txt"]);
+		const theirs = await git(["rev-parse", "HEAD"]);
+		await git(["checkout", "-q", "main"]);
+		const ours = await commitFile("main.txt", "main side\n", "main edits main.txt");
+		const result = await write.mergeTree(ours, theirs);
+		expect(result.clean).toBe(false);
+		expect(existsSync(ran)).toBe(false);
+	});
+
+	test("more private refs than one page: listed a page at a time, never refused", async () => {
+		const { head } = await forkedRepo();
+		const lines = Array.from(
+			{ length: PRIVATE_REFS_PAGE * 3 },
+			(_, index) =>
+				`create refs/narrafork/team-merges/item-${String(index).padStart(5, "0")} ${head}\n`,
+		).join("");
+		const stdin = join(temporary, "refs.txt");
+		await writeFile(stdin, lines);
+		await safeSpawn({
+			cmd: ["sh", "-c", `git -C '${repo}' update-ref --stdin < '${stdin}'`],
+			timeout: 30_000,
+			maxOutputBytes: 4096,
+		});
+		const page = await teamRepoGit(repo).listPrivateRefs();
+		expect(page.refs).toHaveLength(PRIVATE_REFS_PAGE);
+		expect(page.more).toBe(true);
+		expect(page.refs[0]?.itemId).toBe("item-00000");
+	});
+});
+
+describe("the fast-forward of a person's checkout (review 2, 3, 7)", () => {
+	/** main checked out, a prepared merge of feature at the private ref. */
+	async function prepared() {
+		const { head, base } = await forkedRepo();
+		const write = teamRepoGit(repo);
+		const merged = await write.mergeTree(base, head);
+		if (!merged.clean) throw new Error("expected a clean merge");
+		const commit = await write.commitTree({
+			tree: merged.tree,
+			parents: [base, head],
+			message: "m",
+			identity: null,
+		});
+		await write.setPrivateRef("item1", commit, null);
+		return { commit, base, ref: "refs/narrafork/team-merges/item1" };
+	}
+
+	test("autostash never kicks in: a local edit in the way is a clean refusal, no stash, no markers", async () => {
+		const { commit, ref } = await prepared();
+		await git(["config", "merge.autostash", "true"]);
+		await writeFile(join(repo, "feature.txt"), "my own edit\n");
+		const result = await fastForwardCheckout(repo, ref, { base: "main", mergeCommit: commit });
+		expect(result).toMatchObject({ ok: false, kind: "refused" });
+		expect(await git(["stash", "list"])).toBe("");
+		expect(await git(["ls-files", "-u"])).toBe("");
+		expect(await git(["status", "--porcelain"])).toBe("?? feature.txt");
+	});
+
+	test("no signing program, fsmonitor or hook of the checkout runs; the merge is checked after", async () => {
+		const { commit, ref } = await prepared();
+		const gpg = marker("evil-gpg");
+		const fsmonitor = marker("evil-fsmonitor");
+		const hook = marker("evil-hook");
+		await git(["config", "merge.verifySignatures", "true"]);
+		await git(["config", "gpg.program", await script("gpg", `touch ${gpg}; exit 1`)]);
+		await git(["config", "core.fsmonitor", await script("fsmonitor", `touch ${fsmonitor}`)]);
+		await git(["config", "hook.audit.event", "post-merge"]);
+		await git(["config", "hook.audit.command", `touch ${hook}`]);
+		const result = await fastForwardCheckout(repo, ref, { base: "main", mergeCommit: commit });
+		expect(result).toEqual({ ok: true });
+		expect(existsSync(gpg)).toBe(false);
+		expect(existsSync(fsmonitor)).toBe(false);
+		expect(existsSync(hook)).toBe(false);
+		expect(await git(["rev-parse", "HEAD"])).toBe(commit);
+	});
+
+	test("HEAD off the base right before is refused; a checkout of another repository is not offered", async () => {
+		const { commit, ref, base } = await prepared();
+		await git(["checkout", "-q", "-b", "elsewhere"]);
+		expect(
+			await fastForwardCheckout(repo, ref, { base: "main", mergeCommit: commit }),
+		).toMatchObject({ ok: false, kind: "moved" });
+		expect(await git(["rev-parse", "main"])).toBe(base);
+		await git(["checkout", "-q", "main"]);
+		const other = await mkdtemp(join(temporary, "other-"));
+		await git(["init", "-q", "-b", "main"], other);
+		await git(["commit", "-q", "--allow-empty", "-m", "x"], other);
+		const otherBase = await git(["rev-parse", "HEAD"], other);
+		expect(await inspectCheckout(other, "main", otherBase, { repo })).toBe("other_repository");
+		expect(await inspectCheckout(repo, "main", base, { repo })).toBeNull();
 	});
 });

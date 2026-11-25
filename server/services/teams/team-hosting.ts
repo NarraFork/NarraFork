@@ -31,7 +31,9 @@ export interface RemoteLocation {
 export type ProjectHosting =
 	| { kind: "github"; host: string; owner: string; repo: string }
 	| { kind: "other"; host: string | null }
-	| { kind: "none" };
+	| { kind: "none" }
+	/** The push URL could not be read: neither GitHub nor not (merging waits; never local). */
+	| { kind: "unknown" };
 
 const GITHUB_HOSTS = new Map([
 	["github.com", "github.com"],
@@ -98,7 +100,10 @@ export function hostingOfUrl(url: string | null): ProjectHosting {
 		: { kind: "other", host: location.host };
 }
 
-/** The default work start: `origin/<base>` when origin is on GitHub, else the local base. */
+/**
+ * The default work start: `origin/<base>` when origin is on GitHub, else the local base (an
+ * unreadable origin starts locally: nothing is merged from it, and the item's start is recorded).
+ */
 export function defaultWorkStart(hosting: ProjectHosting): TeamWorkStart {
 	return hosting.kind === "github" ? "remote" : "local";
 }
@@ -150,8 +155,9 @@ function refresh(repo: string): Promise<ProjectHosting> {
 			logger.debug("Team hosting could not be read", {
 				error: error instanceof Error ? error.message : String(error),
 			});
-			// Unreadable counts as no GitHub (the local flow), and is asked again soon.
-			const value: ProjectHosting = { kind: "other", host: null };
+			// Unreadable is unknown, never "not GitHub": a merge waits (it never falls back to the
+			// local flow), and the read is tried again soon.
+			const value: ProjectHosting = { kind: "unknown" };
 			store(repo, { value, at: state.now(), ttl: FAILURE_TTL_MS, pending: null });
 			return value;
 		});

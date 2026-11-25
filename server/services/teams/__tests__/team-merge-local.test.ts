@@ -15,7 +15,7 @@ import { db, sqlite } from "../../../db";
 import { narratorWorktreeResources, teamWorkEvents, teamWorkItems } from "../../../db/schema";
 import { generateId } from "../../../lib/id";
 import { safeSpawn } from "../../../lib/spawn";
-import { setGitVersionForTests } from "../team-git-write";
+import { PRIVATE_REFS_PAGE, setGitVersionForTests } from "../team-git-write";
 import { hostingOf, setHostingSourceForTests } from "../team-hosting";
 import {
 	mergeJobOf,
@@ -26,6 +26,7 @@ import {
 	requestFastForward,
 	requestMerge,
 	resetMergeJobsForTests,
+	setMergeDeadlineForTests,
 	settleMergeJobs,
 } from "../team-merge";
 import { isMerging, resetMergingForTests } from "../team-merge-guard";
@@ -338,34 +339,41 @@ describe("local merge", () => {
 		await settleMergeJobs();
 		const prepared = readMergeOutcome(a.id);
 		if (prepared?.kind !== "prepared") throw new Error("expected a prepared merge");
+		// A failed fast-forward keeps the prepared merge, carrying its failure (review 11).
 		const fastForward = async () => {
 			requestFastForward({ teamId: LEAD, itemId: a.id, userId: USER });
 			await settleMergeJobs();
-			return readMergeOutcome(a.id);
+			const outcome = readMergeOutcome(a.id);
+			expect(outcome?.kind).toBe("prepared");
+			return outcome?.kind === "prepared" ? outcome.fastForwardFailure : undefined;
 		};
 		const old = await git(["rev-parse", "main"]);
 
 		// A merge in progress in that checkout.
 		await writeFile(join(repo, ".git", "MERGE_HEAD"), `${a.head}\n`);
 		expect(await fastForward()).toMatchObject({
-			kind: "failed",
 			code: "TEAM_MERGE_CHECKOUT_BLOCKED",
-		});
-		expect(events(a.id, "work.merge_failed").at(-1)?.detail).toMatchObject({
 			blocker: "operation_in_progress",
 		});
 		await rm(join(repo, ".git", "MERGE_HEAD"));
-		// No prepared merge any more (the outcome is a failure now): refused at once.
-		expect(() => requestFastForward({ teamId: LEAD, itemId: a.id, userId: USER })).toThrow(
-			"no prepared merge",
+		// Still prepared: it can be tried again at once.
+		expect(requestFastForward({ teamId: LEAD, itemId: a.id, userId: USER }).job).toBe(
+			"fast_forward",
 		);
+		await settleMergeJobs();
+		expect(item(a.id)?.state).toBe("merged");
+		sqlite.run("UPDATE team_work_items SET state = 'ready', head_sha = ? WHERE id = ?", [
+			a.head,
+			a.id,
+		]);
+		await git(["reset", "-q", "--hard", old]);
 
 		// Prepare again; a filter of the checkout's own configuration.
 		merge(a.id);
 		await settleMergeJobs();
 		await git(["config", "filter.local.smudge", "cat"]);
-		expect(await fastForward()).toMatchObject({ code: "TEAM_MERGE_CHECKOUT_BLOCKED" });
-		expect(events(a.id, "work.merge_failed").at(-1)?.detail).toMatchObject({
+		expect(await fastForward()).toMatchObject({
+			code: "TEAM_MERGE_CHECKOUT_BLOCKED",
 			blocker: "local_config",
 		});
 		await git(["config", "--unset", "filter.local.smudge"]);
@@ -396,8 +404,8 @@ describe("local merge", () => {
 
 		// HEAD on another branch.
 		await git(["checkout", "-q", "-b", "elsewhere"]);
-		expect(await fastForward()).toMatchObject({ code: "TEAM_MERGE_CHECKOUT_BLOCKED" });
-		expect(events(a.id, "work.merge_failed").at(-1)?.detail).toMatchObject({
+		expect(await fastForward()).toMatchObject({
+			code: "TEAM_MERGE_CHECKOUT_BLOCKED",
 			blocker: "not_on_base",
 		});
 		await git(["checkout", "-q", "main"]);
@@ -415,7 +423,22 @@ describe("local merge", () => {
 		await settleMergeJobs();
 		await writeFile(join(repo, "delta.txt"), "mine\n");
 		const before = await git(["rev-parse", "main"]);
-		expect(await fastForward()).toMatchObject({ code: "TEAM_MERGE_FAST_FORWARD_REFUSED" });
+		// The files git named stay on the prepared merge, with its command (review 11).
+		expect(await fastForward()).toMatchObject({
+			code: "TEAM_MERGE_FAST_FORWARD_REFUSED",
+			files: ["delta.txt"],
+		});
+		const refusedRow = item(a.id);
+		if (!refusedRow) throw new Error("missing item");
+		const refusedView = await mergeViewOf({
+			item: refusedRow,
+			baseBranch: "main",
+			teamActive: true,
+			workerRunning: false,
+			member: true,
+		});
+		expect(refusedView.outcome).toBe("prepared");
+		expect(refusedView.fastForward?.command).toContain("merge --ff-only");
 		expect(await git(["rev-parse", "main"])).toBe(before);
 		expect(await readFile(join(repo, "delta.txt"), "utf8")).toBe("mine\n");
 	});
@@ -619,5 +642,74 @@ describe("local merge", () => {
 		);
 		sqlite.run("UPDATE team_work_items SET state = 'in_progress' WHERE id = ?", [a.id]);
 		expect(await pruneProjectMergeRefs(PROJECT)).toBe(1);
+	});
+
+	test("past its deadline a job stops at a safe point and only then gives the item back (review 10)", async () => {
+		const a = await readyItem("omicron");
+		await git(["checkout", "-q", "--detach"]);
+		const old = await git(["rev-parse", "main"]);
+		// Reading origin's hosting takes longer than the whole deadline.
+		setHostingSourceForTests(async () => {
+			await Bun.sleep(300);
+			return null;
+		});
+		setMergeDeadlineForTests(30);
+		try {
+			merge(a.id);
+			await Bun.sleep(120);
+			// Past the deadline, but the job has not stopped yet: the item is still held.
+			expect(isMerging(a.id)).toBe(true);
+			await settleMergeJobs();
+		} finally {
+			setMergeDeadlineForTests(null);
+		}
+		expect(isMerging(a.id)).toBe(false);
+		expect(readMergeOutcome(a.id)).toMatchObject({ kind: "failed", code: "TEAM_MERGE_TIMEOUT" });
+		expect(await git(["rev-parse", "main"])).toBe(old);
+		expect(await git(["for-each-ref", "refs/narrafork/"])).toBe("");
+		expect(item(a.id)?.state).toBe("ready");
+	});
+
+	test("an unreadable origin disables merging and never falls back to a local merge (review 8)", async () => {
+		const a = await readyItem("pi");
+		await git(["checkout", "-q", "--detach"]);
+		const old = await git(["rev-parse", "main"]);
+		setHostingSourceForTests(async () => {
+			throw new Error("git could not read origin");
+		});
+		await hostingOf(repo);
+		const summary = mergeSummaryOf({
+			item: { id: a.id, state: "ready", baseRef: "main", projectId: PROJECT },
+			baseBranch: "main",
+			teamActive: true,
+			workerRunning: false,
+			member: true,
+		});
+		expect(summary).toMatchObject({
+			mode: "checking",
+			canMerge: false,
+			disabledReason: "checking",
+		});
+		merge(a.id);
+		await settleMergeJobs();
+		expect(readMergeOutcome(a.id)).toMatchObject({ code: "TEAM_MERGE_HOSTING_UNKNOWN" });
+		expect(await git(["rev-parse", "main"])).toBe(old);
+	});
+
+	test("pruning goes through more private refs than one listing holds", async () => {
+		const head = await git(["rev-parse", "main"]);
+		const lines = Array.from(
+			{ length: PRIVATE_REFS_PAGE * 2 + 5 },
+			(_, index) => `create refs/narrafork/team-merges/gone-${index} ${head}\n`,
+		).join("");
+		const stdin = join(temporary, `refs-${Date.now()}.txt`);
+		await writeFile(stdin, lines);
+		await safeSpawn({
+			cmd: ["sh", "-c", `git -C '${repo}' update-ref --stdin < '${stdin}'`],
+			timeout: 30_000,
+			maxOutputBytes: 4096,
+		});
+		expect(await pruneProjectMergeRefs(PROJECT)).toBe(PRIVATE_REFS_PAGE * 2 + 5);
+		expect(await git(["for-each-ref", "refs/narrafork/"])).toBe("");
 	});
 });

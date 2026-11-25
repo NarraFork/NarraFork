@@ -104,11 +104,11 @@ describe("origin's hosting", () => {
 			expect(reads).toBe(1);
 			now += 2 * 60_000;
 			fail = true;
-			// Stale: still answered while read again; the failed read counts as no GitHub.
+			// Stale: still answered while read again; a failed read is unknown, never "not GitHub".
 			expect(peekHosting("/repo")?.kind).toBe("github");
 			await Bun.sleep(20);
 			expect(reads).toBe(2);
-			expect(peekHosting("/repo")).toEqual({ kind: "other", host: null });
+			expect(peekHosting("/repo")).toEqual({ kind: "unknown" });
 			fail = false;
 			now += 61_000;
 			expect((await hostingOf("/repo")).kind).toBe("github");

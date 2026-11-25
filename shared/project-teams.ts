@@ -920,6 +920,7 @@ export const TEAM_FAST_FORWARD_BLOCKERS = [
 	"index_locked",
 	"sessions_running",
 	"local_config",
+	"other_repository",
 	"unreadable",
 ] as const;
 export type TeamFastForwardBlocker = (typeof TEAM_FAST_FORWARD_BLOCKERS)[number];
@@ -952,6 +953,17 @@ export type TeamWorkMergeOutcome =
 			/** The checkout the base branch is checked out in. */
 			checkedOutAt: string;
 			at: string;
+			/**
+			 * The newest 「在该目录中快进」 that failed since: the prepared merge stays, so it can be tried
+			 * again (or the command run by hand); the files git named, when it refused.
+			 */
+			fastForwardFailure?: {
+				code: string;
+				message: string | null;
+				files?: string[];
+				blocker?: string;
+				at: string;
+			};
 	  };
 
 /** A ready item's merge state as a card shows it. */

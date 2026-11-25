@@ -4,8 +4,8 @@
  *
  * - `mergeTree` / `commitTree`: the merge is computed in the object store (`merge-tree
  *   --write-tree`, git ≥ 2.38) and committed with `commit-tree` (always a merge commit; the
- *   clicking person's identity; `-S` when `commit.gpgsign` is on). No working tree, no index, no
- *   merge state anywhere.
+ *   clicking person's identity, else the host's global identity; `-S` when the host's
+ *   `commit.gpgsign` is on). No working tree, no index, no merge state anywhere.
  * - `setPrivateRef` / `deletePrivateRef` / `listPrivateRefs`: the merge commit is parked at
  *   `refs/narrafork/team-merges/<itemId>` (out of `git branch`, safe from gc), created only if
  *   absent or moved only from the value read.
@@ -14,12 +14,18 @@
  *   a checked-out base: that person's `git status` would show the merge reversed).
  * - `fetchBaseFromOrigin`: `origin/<base>` into the remote-tracking ref only.
  * - `inspectCheckout` / `fastForwardCheckout`: the explicit fast-forward of a person's checkout
- *   (`merge --ff-only`), refused unless the checkout is exactly where the merge was prepared.
+ *   (`merge --ff-only`), refused unless the checkout is exactly where the merge was prepared, and
+ *   checked afterwards (no unmerged entry, no new stash, HEAD still on the base at the merge).
  *
- * Every command runs with the hardening of `git-exec-hardening.ts` (no hook of any kind, no
- * fsmonitor, external diff, filters, configuration-defined hooks or custom merge drivers from the
- * repository; signing programs only from the host's own configuration), with a timeout and an
- * output cap. Network commands keep the host's credentials and proxy and never prompt.
+ * The rule for every command here: nothing from the repository's own configuration (local or
+ * worktree scope, which agents can write — `.git/config` is shared by every worktree) may run a
+ * program or choose credentials, transport or identity. Sensitive keys are read with
+ * `--show-scope` (`scopedConfig`); only system and global values are honoured, and a repository
+ * value is overridden at command scope with the host's value or a neutral one — or, where no
+ * neutral value exists, the command is refused. On top of that every command carries the
+ * hardening of `git-exec-hardening.ts` (no hook of any kind, no fsmonitor, external diff, filters,
+ * configuration-defined hooks or custom merge drivers), re-read right before each command that
+ * can run a program, plus a timeout, an output cap and the job's abort signal.
  */
 import { realpath, stat } from "node:fs/promises";
 import { join } from "node:path";
@@ -45,8 +51,10 @@ const MERGE_TIMEOUT_MS = 120_000;
 const MERGE_OUTPUT_BYTES = 1024 * 1024;
 /** Network fetch from origin. */
 const FETCH_TIMEOUT_MS = 120_000;
-/** Private refs listed at once (one line each). */
-const PRIVATE_REFS_OUTPUT_BYTES = 256 * 1024;
+/** Private refs one listing returns (the rest on the next call). */
+export const PRIVATE_REFS_PAGE = 1000;
+/** Private refs deleted in one `update-ref --stdin` transaction. */
+const DELETE_BATCH = 200;
 /** `merge-tree --write-tree` arrived in git 2.38. */
 export const MERGE_TREE_MIN_GIT: readonly [number, number] = [2, 38];
 
@@ -72,8 +80,12 @@ async function run(
 		maxOutputBytes?: number;
 		env?: Record<string, string | undefined>;
 		network?: boolean;
+		signal?: AbortSignal;
+		stdoutStream?: { maxBytes: number; onChunk: (chunk: Uint8Array) => boolean | undefined };
+		stdin?: Uint8Array;
 	},
 ): Promise<RunResult> {
+	options.signal?.throwIfAborted();
 	await ensureConfigOverridesHonored();
 	const base = options.network ? envWithAmbientProxy() : { ...process.env };
 	const result = await safeSpawn({
@@ -95,8 +107,14 @@ async function run(
 		},
 		timeout: options.timeout ?? SHORT_TIMEOUT_MS,
 		maxOutputBytes: options.maxOutputBytes ?? SMALL_OUTPUT_BYTES,
+		...(options.stdoutStream
+			? { stdoutStream: options.stdoutStream, maxStderrBytes: SMALL_OUTPUT_BYTES }
+			: {}),
+		signal: options.signal,
+		...(options.stdin ? { stdin: options.stdin } : {}),
 		killProcessTree: true,
 	});
+	options.signal?.throwIfAborted();
 	return {
 		stdout: result.stdout,
 		stderr: result.stderr,
@@ -189,58 +207,284 @@ export function setGitVersionForTests(version: [number, number, number] | null |
 	knownVersion = version;
 }
 
-// ── Signing ─────────────────────────────────────────────────────────────────
+// ── Configuration by scope ──────────────────────────────────────────────────
 
-/** Signing programs and the value git falls back to when a key is unset. */
-const SIGNING_PROGRAMS: Readonly<Record<string, string>> = {
-	"gpg.program": "gpg",
-	"gpg.openpgp.program": "gpg",
-	"gpg.x509.program": "gpgsm",
-	"gpg.ssh.program": "ssh-keygen",
-	"gpg.ssh.defaultkeycommand": "",
-};
+/** One configuration value with the scope it came from (`system`, `global`, `local`, …). */
+export interface ScopedConfigEntry {
+	scope: string;
+	/** As `--get-regexp` prints it: section and name lowercased, a subsection as written. */
+	key: string;
+	value: string;
+}
+
 const HOST_SCOPES = new Set(["system", "global"]);
 
+/** A value the repository's own configuration set (anything but system, global or command). */
+const isRepositoryScope = (scope: string) => !HOST_SCOPES.has(scope) && scope !== "command";
+
 /**
- * Whether commits are signed (`commit.gpgsign`), and overrides that keep any signing program
- * named by the repository's own configuration (local or worktree scope, which agents can write)
- * from running: such a key is set back to the host's value, or to git's default.
+ * The configured values matching `pattern` with their scopes, in git's order (system, global,
+ * local, worktree). Command-scope values (NarraFork's own overrides) are left out. Reading
+ * configuration runs nothing.
  */
-export async function signingConfig(
-	repo: string,
-	config: ConfigEntries,
-): Promise<{ sign: boolean; overrides: Array<readonly [string, string]> }> {
-	const result = await run(
-		repo,
-		["config", "-z", "--show-scope", "--get-regexp", "^(commit\\.gpgsign|gpg\\..*)$"],
-		{ config },
-	);
-	if (result.exitCode === 1 && !result.stdout) return { sign: false, overrides: [] };
+export async function scopedConfig(
+	cwd: string,
+	pattern: string,
+	signal?: AbortSignal,
+): Promise<ScopedConfigEntry[]> {
+	const result = await run(cwd, ["config", "-z", "--show-scope", "--get-regexp", pattern], {
+		config: GIT_NO_EXEC_CONFIG,
+		signal,
+	});
+	if (result.exitCode === 1 && !result.stdout) return [];
 	if (result.exitCode !== 0 || result.truncated)
-		throw new GitError("git config could not read the signing configuration");
-	let sign = false;
-	const host = new Map<string, string>();
-	const repository = new Set<string>();
+		throw new GitError(`git config could not read ${pattern}`);
+	const entries: ScopedConfigEntry[] = [];
 	const records = result.stdout.split("\0");
 	for (let index = 0; index + 1 < records.length; index += 2) {
 		const scope = records[index] ?? "";
 		const record = records[index + 1] ?? "";
 		const newline = record.indexOf("\n");
-		const key = (newline < 0 ? record : record.slice(0, newline)).toLowerCase();
+		const key = newline < 0 ? record : record.slice(0, newline);
+		// A bare `[section] key` (no `=`) is a boolean true.
 		const value = newline < 0 ? "true" : record.slice(newline + 1);
-		if (key === "commit.gpgsign") sign = /^(true|yes|on|1)$/i.test(value.trim());
-		else if (key in SIGNING_PROGRAMS) {
-			if (HOST_SCOPES.has(scope)) {
-				host.set(key, value);
-				repository.delete(key);
-			} else repository.add(key);
-		}
+		if (scope !== "command") entries.push({ scope, key, value });
 	}
-	const overrides = [...repository].map(
-		(key) => [key, host.get(key) ?? SIGNING_PROGRAMS[key] ?? ""] as const,
-	);
-	return { sign, overrides };
+	return entries;
 }
+
+/** Every host (system/global) value of a key, in order. */
+export function hostValues(entries: readonly ScopedConfigEntry[], key: string): string[] {
+	return entries
+		.filter((entry) => entry.key === key && HOST_SCOPES.has(entry.scope))
+		.map((entry) => entry.value);
+}
+
+/** The effective host value of a key (the last system/global one). */
+export function hostValue(entries: readonly ScopedConfigEntry[], key: string): string | undefined {
+	return hostValues(entries, key).at(-1);
+}
+
+/** The keys the repository's own configuration sets, in first-seen order. */
+export function repositoryKeys(entries: readonly ScopedConfigEntry[]): string[] {
+	return [...new Set(entries.filter((entry) => isRepositoryScope(entry.scope)).map((e) => e.key))];
+}
+
+const truthy = (value: string | undefined) =>
+	value !== undefined && /^(true|yes|on|1)$/i.test(value.trim());
+
+// ── Signing and identity ────────────────────────────────────────────────────
+
+/** Signing keys and the value git uses when a key is unset. */
+const SIGNING_DEFAULTS: Readonly<Record<string, string>> = {
+	"gpg.program": "gpg",
+	"gpg.openpgp.program": "gpg",
+	"gpg.x509.program": "gpgsm",
+	"gpg.ssh.program": "ssh-keygen",
+	"gpg.ssh.defaultkeycommand": "",
+	"gpg.format": "openpgp",
+	"user.signingkey": "",
+};
+
+/**
+ * Whether commits are signed (the host's `commit.gpgsign` only), and overrides that set every
+ * signing key the repository's own configuration names (`gpg.*program`, `gpg.format`,
+ * `gpg.ssh.defaultKeyCommand`, `user.signingKey`) back to the host's value, or git's default.
+ */
+export async function signingConfig(
+	repo: string,
+	signal?: AbortSignal,
+): Promise<{ sign: boolean; overrides: Array<readonly [string, string]> }> {
+	const entries = await scopedConfig(
+		repo,
+		"^(commit\\.gpgsign|gpg\\..*|user\\.signingkey)$",
+		signal,
+	);
+	const overrides: Array<readonly [string, string]> = [];
+	for (const key of repositoryKeys(entries)) {
+		const lower = key.toLowerCase();
+		if (lower === "commit.gpgsign") continue;
+		if (lower in SIGNING_DEFAULTS || /^gpg\..*program$/.test(lower))
+			overrides.push([key, hostValue(entries, key) ?? SIGNING_DEFAULTS[lower] ?? ""]);
+	}
+	return { sign: truthy(hostValue(entries, "commit.gpgsign")), overrides };
+}
+
+/**
+ * The host's own git identity (system/global `user.*`, with `author.*` / `committer.*` over it),
+ * never the repository's. Null when the host has none.
+ */
+export async function hostIdentity(
+	repo: string,
+	signal?: AbortSignal,
+): Promise<GitIdentityEnv | null> {
+	const entries = await scopedConfig(repo, "^(user|author|committer)\\.(name|email)$", signal);
+	const name = hostValue(entries, "user.name");
+	const email = hostValue(entries, "user.email");
+	const authorName = hostValue(entries, "author.name") ?? name;
+	const authorEmail = hostValue(entries, "author.email") ?? email;
+	const committerName = hostValue(entries, "committer.name") ?? name;
+	const committerEmail = hostValue(entries, "committer.email") ?? email;
+	if (
+		!authorName?.trim() ||
+		!authorEmail?.trim() ||
+		!committerName?.trim() ||
+		!committerEmail?.trim()
+	)
+		return null;
+	return {
+		GIT_AUTHOR_NAME: authorName,
+		GIT_AUTHOR_EMAIL: authorEmail,
+		GIT_COMMITTER_NAME: committerName,
+		GIT_COMMITTER_EMAIL: committerEmail,
+	};
+}
+
+function identityUnknown(): AppError {
+	return new AppError(
+		"No git identity to commit the merge with: set yours in NarraFork (Settings, Git identities) or the host's global git user.name and user.email",
+		409,
+		"TEAM_MERGE_IDENTITY_UNKNOWN",
+	);
+}
+
+// ── Network ─────────────────────────────────────────────────────────────────
+
+const NETWORK_PATTERN =
+	"^(credential\\..*|core\\.askpass|core\\.sshcommand|core\\.gitproxy|http\\..*|remote\\.origin\\.(url|proxy|vcs|uploadpack)|url\\..*\\.insteadof|protocol\\..*)$";
+
+/** A network fetch the repository's configuration makes unsafe: the key that does. */
+export class UnsafeRemoteConfigError extends AppError {
+	constructor(readonly key: string) {
+		super(
+			`The repository's own configuration sets ${key}, which could run a program or choose the credentials or transport of a fetch; NarraFork does not fetch with it (set it in the global configuration instead)`,
+			409,
+			"TEAM_REMOTE_CONFIG_UNSAFE",
+		);
+	}
+}
+
+/** The proxy the server's own environment names for a URL (what an unset `http.proxy` means). */
+function ambientProxy(env: Record<string, string | undefined>, url: string | undefined): string {
+	const https = url?.startsWith("https:") ?? true;
+	return (
+		(https ? (env.HTTPS_PROXY ?? env.https_proxy) : (env.HTTP_PROXY ?? env.http_proxy)) ??
+		env.ALL_PROXY ??
+		env.all_proxy ??
+		""
+	);
+}
+
+/**
+ * How ssh is chosen for a fetch: an operator's `GIT_SSH_COMMAND` / `GIT_SSH` in the server's
+ * environment wins; else the host's (system/global) `core.sshCommand`, passed explicitly; else
+ * `ssh -o BatchMode=yes`. A repository's `core.sshCommand` never applies.
+ */
+export function sshSettings(
+	entries: readonly ScopedConfigEntry[],
+	env: Record<string, string | undefined>,
+): { overrides: Array<readonly [string, string]>; env: Record<string, string> } {
+	const host = hostValue(entries, "core.sshcommand");
+	if (env.GIT_SSH_COMMAND || env.GIT_SSH)
+		return { overrides: [["core.sshCommand", host ?? ""]], env: {} };
+	if (host) return { overrides: [["core.sshCommand", host]], env: {} };
+	return {
+		overrides: [["core.sshCommand", ""]],
+		env: { GIT_SSH_COMMAND: "ssh -o BatchMode=yes" },
+	};
+}
+
+/**
+ * Command-scope overrides for a fetch from origin that keep the repository's configuration from
+ * choosing credentials, programs or transport: credential helpers back to the host's list (reset,
+ * then the host's re-added), every other repository `credential.*`, `core.askPass` and `http.*`
+ * key to the host's value or a neutral one (`sslVerify` true, a proxy the server's own, extra
+ * headers and cookie files none); a repository `http.*` key with neither, a repository
+ * `remote.origin.vcs`, or a repository `url.*.insteadOf` that rewrites origin's URL refuses the
+ * fetch (`UnsafeRemoteConfigError`). Transports are limited to https, http, ssh, git and local
+ * paths; `ext::` never.
+ */
+export function networkOverrides(
+	entries: readonly ScopedConfigEntry[],
+	env: Record<string, string | undefined>,
+): { overrides: Array<readonly [string, string]>; env: Record<string, string> } {
+	const originUrl = entries.filter((entry) => entry.key === "remote.origin.url").at(-1)?.value;
+	const overrides: Array<readonly [string, string]> = [];
+	for (const key of repositoryKeys(entries)) {
+		const lower = key.toLowerCase();
+		if (lower === "remote.origin.url" || lower === "core.sshcommand") continue;
+		if (lower.startsWith("protocol.") || lower === "remote.origin.uploadpack") continue;
+		if (lower === "core.gitproxy") continue;
+		if (lower === "remote.origin.vcs") throw new UnsafeRemoteConfigError(key);
+		if (lower.startsWith("url.") && lower.endsWith(".insteadof")) {
+			const prefixes = entries
+				.filter((entry) => entry.key === key && isRepositoryScope(entry.scope))
+				.map((entry) => entry.value);
+			if (originUrl && prefixes.some((prefix) => prefix && originUrl.startsWith(prefix)))
+				throw new UnsafeRemoteConfigError(key);
+			continue;
+		}
+		if (isHelperKey(lower)) continue;
+		const host = hostValue(entries, key);
+		if (host !== undefined) {
+			overrides.push([key, host]);
+			continue;
+		}
+		if (lower.startsWith("credential.") || lower === "core.askpass") {
+			overrides.push([key, ""]);
+			continue;
+		}
+		if (lower === "remote.origin.proxy" || (lower.startsWith("http.") && lower.endsWith(".proxy")))
+			overrides.push([key, ambientProxy(env, originUrl)]);
+		else if (lower.startsWith("http.") && lower.endsWith(".sslverify"))
+			overrides.push([key, "true"]);
+		else if (
+			lower.startsWith("http.") &&
+			(lower.endsWith(".extraheader") || lower.endsWith(".cookiefile"))
+		)
+			overrides.push([key, ""]);
+		else if (lower.startsWith("http.") && lower.endsWith(".savecookies"))
+			overrides.push([key, "false"]);
+		else throw new UnsafeRemoteConfigError(key);
+	}
+	// Credential helpers: one empty value resets the whole list (every `credential.*.helper` key
+	// shares it), then the host's helpers are added back in the order git read them.
+	const helpers: Array<readonly [string, string]> = [];
+	if (repositoryKeys(entries).some((key) => isHelperKey(key.toLowerCase())))
+		helpers.push(
+			["credential.helper", ""],
+			...entries
+				.filter((entry) => HOST_SCOPES.has(entry.scope) && isHelperKey(entry.key.toLowerCase()))
+				.map((entry) => [entry.key, entry.value] as const),
+		);
+	const ssh = sshSettings(entries, env);
+	return {
+		overrides: [
+			...helpers,
+			...overrides,
+			...ssh.overrides,
+			["core.gitProxy", ""],
+			["remote.origin.uploadpack", "git-upload-pack"],
+			["protocol.allow", "never"],
+			["protocol.https.allow", "always"],
+			["protocol.http.allow", "always"],
+			["protocol.ssh.allow", "always"],
+			["protocol.git.allow", "always"],
+			["protocol.file.allow", "always"],
+			["protocol.ext.allow", "never"],
+		],
+		env: ssh.env,
+	};
+}
+
+const isHelperKey = (lower: string) => lower.startsWith("credential.") && lower.endsWith(".helper");
+
+/** Only the local transport, for `fetch .` (an `insteadOf` on `.` cannot reach anything else). */
+const LOCAL_ONLY_PROTOCOLS: ConfigEntries = [
+	["protocol.allow", "never"],
+	["protocol.file.allow", "always"],
+	["protocol.ext.allow", "never"],
+];
 
 // ── The repository's git ────────────────────────────────────────────────────
 
@@ -260,6 +504,10 @@ export interface TeamRepoGit {
 	resolve(ref: string): Promise<string | null>;
 	isAncestor(ancestor: string, descendant: string): Promise<boolean>;
 	mergeTree(ours: string, theirs: string): Promise<MergeTreeResult>;
+	/**
+	 * A commit of `tree`; `identity` is the person's NarraFork identity, else the host's global
+	 * one is used (never the repository's), and with neither 409 `TEAM_MERGE_IDENTITY_UNKNOWN`.
+	 */
 	commitTree(input: {
 		tree: string;
 		parents: readonly string[];
@@ -270,31 +518,60 @@ export interface TeamRepoGit {
 	setPrivateRef(itemId: string, commit: string, expected: string | null): Promise<void>;
 	/** Delete the private ref if it still holds `expected` (false when it did not). */
 	deletePrivateRef(itemId: string, expected: string): Promise<boolean>;
-	listPrivateRefs(): Promise<{ itemId: string; commit: string }[]>;
+	/**
+	 * Delete many private refs, each only if it still holds its commit: a batch at a time in one
+	 * `update-ref --stdin` transaction, one by one when a batch is refused. Returns how many went.
+	 */
+	deletePrivateRefs(refs: readonly { itemId: string; commit: string }[]): Promise<number>;
+	/** Up to `limit` private refs (streamed, never cut by a byte cap); `more` when there are more. */
+	listPrivateRefs(
+		limit?: number,
+	): Promise<{ refs: { itemId: string; commit: string }[]; more: boolean }>;
 	fastForwardBase(commit: string, base: string): Promise<FastForwardBaseResult>;
 	/** The checkout `refs/heads/<branch>` is checked out in, or null. */
 	checkedOutAt(branch: string): Promise<string | null>;
+	/** The repository's common git directory (absolute, resolved). */
+	commonDir(): Promise<string>;
 	/** `origin/<base>` into `refs/remotes/origin/<base>` only; the error text when it failed. */
 	fetchBaseFromOrigin(base: string): Promise<{ ok: true } | { ok: false; message: string }>;
 }
 
-export function teamRepoGit(repo: string): TeamRepoGit {
-	let overrides: Promise<ConfigEntries> | null = null;
-	const config = () => {
-		overrides ??= configuredPrograms(repo).then((programs) => [
-			...GIT_NO_EXEC_CONFIG,
-			...untrustedProgramOverrides(programs),
-		]);
-		return overrides;
-	};
-	const git = async (
+/** The absolute, resolved common git directory of a checkout. */
+export async function commonGitDir(dir: string, signal?: AbortSignal): Promise<string> {
+	const result = await run(dir, ["rev-parse", "--path-format=absolute", "--git-common-dir"], {
+		config: GIT_NO_EXEC_CONFIG,
+		signal,
+	});
+	const path = result.stdout.trim();
+	if (result.exitCode !== 0 || !path)
+		throw new GitError(`git rev-parse failed: ${complaint(result)}`);
+	return realpath(path).catch(() => path);
+}
+
+export function teamRepoGit(repo: string, options: { signal?: AbortSignal } = {}): TeamRepoGit {
+	const { signal } = options;
+	/**
+	 * The hardening plus the repository's filters, hooks and merge drivers by name, read again
+	 * right before every command that could run one (the configuration can change in between).
+	 */
+	const programConfig = async (): Promise<ConfigEntries> => [
+		...GIT_NO_EXEC_CONFIG,
+		...untrustedProgramOverrides(await configuredPrograms(repo)),
+	];
+	/** Reads that run no program (rev-parse, merge-base, for-each-ref, worktree list, config). */
+	const read = (args: readonly string[], extra: Omit<Parameters<typeof run>[2], "config"> = {}) =>
+		run(repo, args, { config: GIT_NO_EXEC_CONFIG, signal, ...extra });
+	const write = async (
 		args: readonly string[],
-		options: Omit<Parameters<typeof run>[2], "config"> = {},
-	) => run(repo, args, { ...options, config: await config() });
+		extra: Omit<Parameters<typeof run>[2], "config"> & { config?: ConfigEntries } = {},
+	) => {
+		const { config: more = [], ...rest } = extra;
+		return run(repo, args, { config: [...(await programConfig()), ...more], signal, ...rest });
+	};
 
 	const resolve = async (ref: string): Promise<string | null> => {
 		if (!ref || ref.startsWith("-")) throw new GitError("Expected a ref");
-		const result = await git([
+		const result = await read([
 			"rev-parse",
 			"--verify",
 			"--quiet",
@@ -310,8 +587,8 @@ export function teamRepoGit(repo: string): TeamRepoGit {
 
 	const checkedOutAt = async (branch: string): Promise<string | null> => {
 		assertBranch(branch);
-		const result = await git(["worktree", "list", "--porcelain", "-z"], {
-			maxOutputBytes: PRIVATE_REFS_OUTPUT_BYTES,
+		const result = await read(["worktree", "list", "--porcelain", "-z"], {
+			maxOutputBytes: 1024 * 1024,
 		});
 		if (result.exitCode !== 0 || result.truncated)
 			throw new GitError(`git worktree list failed: ${complaint(result)}`);
@@ -326,7 +603,7 @@ export function teamRepoGit(repo: string): TeamRepoGit {
 
 	return {
 		async originPushUrl() {
-			const result = await git(["remote", "get-url", "--push", "origin"], {
+			const result = await read(["remote", "get-url", "--push", "origin"], {
 				maxOutputBytes: 16 * 1024,
 			});
 			// Exit 2: no such remote.
@@ -339,7 +616,7 @@ export function teamRepoGit(repo: string): TeamRepoGit {
 		async isAncestor(ancestor, descendant) {
 			assertSha(ancestor);
 			assertSha(descendant);
-			const result = await git(["merge-base", "--is-ancestor", ancestor, descendant]);
+			const result = await read(["merge-base", "--is-ancestor", ancestor, descendant]);
 			if (result.exitCode === 0) return true;
 			if (result.exitCode === 1 && !result.stderr.trim()) return false;
 			throw new GitError(`git merge-base failed: ${complaint(result)}`);
@@ -347,7 +624,7 @@ export function teamRepoGit(repo: string): TeamRepoGit {
 		async mergeTree(ours, theirs) {
 			assertSha(ours);
 			assertSha(theirs);
-			const result = await git(
+			const result = await write(
 				["merge-tree", "--write-tree", "-z", "--name-only", "--no-messages", ours, theirs],
 				{ timeout: MERGE_TIMEOUT_MS, maxOutputBytes: MERGE_OUTPUT_BYTES },
 			);
@@ -372,10 +649,10 @@ export function teamRepoGit(repo: string): TeamRepoGit {
 		async commitTree({ tree, parents, message, identity }) {
 			assertSha(tree);
 			for (const parent of parents) assertSha(parent);
-			const base = await config();
-			const signing = await signingConfig(repo, base);
-			const result = await run(
-				repo,
+			const who = identity ?? (await hostIdentity(repo, signal));
+			if (!who) throw identityUnknown();
+			const signing = await signingConfig(repo, signal);
+			const result = await write(
 				[
 					"commit-tree",
 					...(signing.sign ? ["-S"] : []),
@@ -384,18 +661,14 @@ export function teamRepoGit(repo: string): TeamRepoGit {
 					message,
 					tree,
 				],
-				{ config: [...base, ...signing.overrides], env: identity ?? undefined },
+				{ config: signing.overrides, env: who },
 			);
 			const commit = result.stdout.trim();
 			if (
 				result.exitCode !== 0 &&
 				/identity unknown|tell me who you are|empty ident/i.test(result.stderr)
 			)
-				throw new AppError(
-					"No git identity to commit the merge with: set yours in NarraFork (Settings, Git identities) or the host's git user.name and user.email",
-					409,
-					"TEAM_MERGE_IDENTITY_UNKNOWN",
-				);
+				throw identityUnknown();
 			if (result.exitCode !== 0 || !SHA.test(commit))
 				throw new GitError(`git commit-tree failed: ${complaint(result)}`);
 			return commit;
@@ -403,7 +676,7 @@ export function teamRepoGit(repo: string): TeamRepoGit {
 		async setPrivateRef(itemId, commit, expected) {
 			assertSha(commit);
 			if (expected !== null) assertSha(expected);
-			const result = await git([
+			const result = await write([
 				"update-ref",
 				"-m",
 				"narrafork: team merge",
@@ -416,29 +689,72 @@ export function teamRepoGit(repo: string): TeamRepoGit {
 		},
 		async deletePrivateRef(itemId, expected) {
 			assertSha(expected);
-			const result = await git(["update-ref", "-d", privateRef(itemId), expected]);
+			const result = await write(["update-ref", "-d", privateRef(itemId), expected]);
 			return result.exitCode === 0;
 		},
-		async listPrivateRefs() {
-			const result = await git(
-				["for-each-ref", "--format=%(objectname) %(refname)", TEAM_MERGE_REF_PREFIX],
-				{ maxOutputBytes: PRIVATE_REFS_OUTPUT_BYTES },
-			);
-			if (result.exitCode !== 0 || result.truncated)
-				throw new GitError(`git for-each-ref failed: ${complaint(result)}`);
-			const refs: { itemId: string; commit: string }[] = [];
-			for (const line of result.stdout.split("\n")) {
-				const [commit, name] = line.trim().split(" ");
-				if (!commit || !name?.startsWith(TEAM_MERGE_REF_PREFIX) || !SHA.test(commit)) continue;
-				const itemId = name.slice(TEAM_MERGE_REF_PREFIX.length);
-				if (ITEM_ID.test(itemId)) refs.push({ itemId, commit });
+		async deletePrivateRefs(refs) {
+			let deleted = 0;
+			for (let index = 0; index < refs.length; index += DELETE_BATCH) {
+				const batch = refs.slice(index, index + DELETE_BATCH);
+				for (const ref of batch) assertSha(ref.commit);
+				const input = batch
+					.map((ref) => `delete ${privateRef(ref.itemId)}\0${ref.commit}\0`)
+					.join("");
+				const result = await write(["update-ref", "--stdin", "-z"], {
+					stdin: new TextEncoder().encode(input),
+				});
+				if (result.exitCode === 0) {
+					deleted += batch.length;
+					continue;
+				}
+				// One of them moved meanwhile: the transaction refused them all.
+				for (const ref of batch) {
+					const one = await write(["update-ref", "-d", privateRef(ref.itemId), ref.commit]);
+					if (one.exitCode === 0) deleted++;
+				}
 			}
-			return refs;
+			return deleted;
+		},
+		async listPrivateRefs(limit = PRIVATE_REFS_PAGE) {
+			const refs: { itemId: string; commit: string }[] = [];
+			let more = false;
+			let pending = "";
+			const decoder = new TextDecoder();
+			const take = (line: string) => {
+				const [commit, name] = line.trim().split(" ");
+				if (!commit || !name?.startsWith(TEAM_MERGE_REF_PREFIX) || !SHA.test(commit)) return;
+				const itemId = name.slice(TEAM_MERGE_REF_PREFIX.length);
+				if (!ITEM_ID.test(itemId)) return;
+				if (refs.length >= limit) more = true;
+				else refs.push({ itemId, commit });
+			};
+			// Streamed line by line: however many refs there are, at most `limit` are kept and the
+			// listing stops right after the first one past it.
+			const result = await read(
+				["for-each-ref", "--format=%(objectname) %(refname)", TEAM_MERGE_REF_PREFIX],
+				{
+					maxOutputBytes: 0,
+					stdoutStream: {
+						maxBytes: Number.MAX_SAFE_INTEGER,
+						onChunk: (chunk) => {
+							pending += decoder.decode(chunk, { stream: true });
+							const lines = pending.split("\n");
+							pending = lines.pop() ?? "";
+							for (const line of lines) take(line);
+							return !more;
+						},
+					},
+				},
+			);
+			if (!more && pending) take(pending);
+			if (result.exitCode !== 0 && !more)
+				throw new GitError(`git for-each-ref failed: ${complaint(result)}`);
+			return { refs, more };
 		},
 		async fastForwardBase(commit, base) {
 			assertSha(commit);
 			assertBranch(base);
-			const result = await git(
+			const result = await write(
 				[
 					"fetch",
 					"--no-write-fetch-head",
@@ -449,7 +765,7 @@ export function teamRepoGit(repo: string): TeamRepoGit {
 					".",
 					`${commit}:refs/heads/${base}`,
 				],
-				{ timeout: MERGE_TIMEOUT_MS },
+				{ timeout: MERGE_TIMEOUT_MS, config: LOCAL_ONLY_PROTOCOLS },
 			);
 			if (result.exitCode === 0) return { outcome: "updated" };
 			const text = `${result.stderr}\n${result.stdout}`;
@@ -462,17 +778,24 @@ export function teamRepoGit(repo: string): TeamRepoGit {
 			throw new GitError(`git fetch could not update ${base}: ${complaint(result)}`);
 		},
 		checkedOutAt,
+		commonDir: () => commonGitDir(repo, signal),
 		async fetchBaseFromOrigin(base) {
 			assertBranch(base);
-			const hardened = await config();
-			// The host's own credentials and proxy drive a fetch (as the git panel's): the credential
-			// helper and ssh command are not emptied, nothing prompts, and nothing from the
-			// repository runs as a transport (`ext::`, a local upload-pack, a git proxy).
-			const network = hardened.filter(
+			const entries = await scopedConfig(repo, NETWORK_PATTERN, signal);
+			const env = envWithAmbientProxy();
+			let network: ReturnType<typeof networkOverrides>;
+			try {
+				network = networkOverrides(entries, env);
+			} catch (error) {
+				if (error instanceof UnsafeRemoteConfigError) return { ok: false, message: error.message };
+				throw error;
+			}
+			// The host's credentials drive a fetch, so the hardening's emptied credential helper,
+			// askpass and ssh command are replaced by `networkOverrides`' host-only values.
+			const hardened = (await programConfig()).filter(
 				([key]) =>
 					key !== "credential.helper" && key !== "core.sshCommand" && key !== "core.askPass",
 			);
-			const sshConfigured = await git(["config", "--get", "core.sshCommand"]);
 			const result = await run(
 				repo,
 				[
@@ -486,18 +809,11 @@ export function teamRepoGit(repo: string): TeamRepoGit {
 					`+refs/heads/${base}:refs/remotes/origin/${base}`,
 				],
 				{
-					config: [
-						...network,
-						["protocol.ext.allow", "never"],
-						["remote.origin.uploadpack", "git-upload-pack"],
-						["core.gitProxy", ""],
-					],
+					config: [...hardened, ...network.overrides],
 					network: true,
 					timeout: FETCH_TIMEOUT_MS,
-					env:
-						sshConfigured.exitCode === 0 && sshConfigured.stdout.trim()
-							? undefined
-							: { GIT_SSH_COMMAND: "ssh -o BatchMode=yes" },
+					env: network.env,
+					signal,
 				},
 			);
 			return result.exitCode === 0 ? { ok: true } : { ok: false, message: complaint(result) };
@@ -524,33 +840,23 @@ export type CheckoutBlocker =
 	| "operation_in_progress"
 	| "index_locked"
 	| "local_config"
+	| "other_repository"
 	| "unreadable";
 
-/** Configuration of the checkout's own scope (local / worktree) that rules out a fast-forward. */
-async function localProgramsOf(dir: string): Promise<boolean> {
-	const result = await run(
+/** Whether the checkout's own (local / worktree) configuration names a filter or hooks directory. */
+async function localProgramsOf(dir: string, signal?: AbortSignal): Promise<boolean> {
+	const entries = await scopedConfig(
 		dir,
-		[
-			"config",
-			"-z",
-			"--show-scope",
-			"--get-regexp",
-			"^(filter\\..+\\.(clean|smudge|process)|core\\.hookspath)$",
-		],
-		{ config: GIT_NO_EXEC_CONFIG.filter(([key]) => key !== "core.hooksPath") },
+		"^(filter\\..+\\.(clean|smudge|process)|core\\.hookspath)$",
+		signal,
 	);
-	if (result.exitCode === 1 && !result.stdout) return false;
-	if (result.exitCode !== 0 || result.truncated)
-		throw new GitError("git config could not read the checkout's filters and hooks");
-	const records = result.stdout.split("\0");
-	for (let index = 0; index + 1 < records.length; index += 2)
-		if (!HOST_SCOPES.has(records[index] ?? "")) return true;
-	return false;
+	return entries.some((entry) => isRepositoryScope(entry.scope));
 }
 
 /**
- * Whether a person's checkout is exactly where a prepared merge can be fast-forwarded: HEAD is on
- * the base and the base still holds the commit the merge was computed on, no merge, rebase,
+ * Whether a person's checkout is exactly where a prepared merge can be fast-forwarded: it belongs
+ * to the project's repository (same common git directory, when `repo` is given), HEAD is on the
+ * base and the base still holds the commit the merge was computed on, no merge, rebase,
  * cherry-pick, revert or bisect is in progress, the index is not locked, and the checkout's own
  * configuration names no filter and no hooks directory (those would run, or be skipped, inside a
  * person's working tree: only the copyable command is offered then). Reads only.
@@ -559,19 +865,29 @@ export async function inspectCheckout(
 	dir: string,
 	base: string,
 	baseSha: string,
+	options: { repo?: string; signal?: AbortSignal } = {},
 ): Promise<CheckoutBlocker | null> {
 	assertBranch(base);
 	assertSha(baseSha);
+	const { signal } = options;
 	try {
 		const config = [...GIT_NO_EXEC_CONFIG];
-		const head = await run(dir, ["symbolic-ref", "--quiet", "HEAD"], { config });
+		if (options.repo) {
+			const [mine, theirs] = await Promise.all([
+				commonGitDir(dir, signal),
+				commonGitDir(options.repo, signal),
+			]);
+			if (mine !== theirs) return "other_repository";
+		}
+		const head = await run(dir, ["symbolic-ref", "--quiet", "HEAD"], { config, signal });
 		if (head.exitCode !== 0 || head.stdout.trim() !== `refs/heads/${base}`) return "not_on_base";
 		const at = await run(dir, ["rev-parse", "--verify", "--quiet", `refs/heads/${base}^{commit}`], {
 			config,
+			signal,
 		});
 		if (at.exitCode !== 0) return "unreadable";
 		if (at.stdout.trim() !== baseSha) return "stale";
-		const gitDir = await run(dir, ["rev-parse", "--absolute-git-dir"], { config });
+		const gitDir = await run(dir, ["rev-parse", "--absolute-git-dir"], { config, signal });
 		const path = gitDir.stdout.trim();
 		if (gitDir.exitCode !== 0 || !path) return "unreadable";
 		const exists = async (name: string) =>
@@ -579,9 +895,10 @@ export async function inspectCheckout(
 		for (const marker of IN_PROGRESS_MARKERS)
 			if (await exists(marker)) return "operation_in_progress";
 		if (await exists("index.lock")) return "index_locked";
-		if (await localProgramsOf(dir)) return "local_config";
+		if (await localProgramsOf(dir, signal)) return "local_config";
 		return null;
-	} catch {
+	} catch (error) {
+		if (signal?.aborted) throw error;
 		return "unreadable";
 	}
 }
@@ -591,29 +908,102 @@ export async function canonicalCheckout(path: string): Promise<string> {
 	return realpath(path).catch(() => path);
 }
 
+export type FastForwardCheckoutResult =
+	| { ok: true }
+	| {
+			ok: false;
+			/** `refused`: git changed nothing; `incomplete`: something is off afterwards. */
+			kind: "refused" | "incomplete" | "moved";
+			files: string[];
+			message: string;
+	  };
+
 /**
- * `git merge --ff-only <ref>` in a person's checkout, every hook off (`core.hooksPath` and the
- * configuration-defined ones by name). The host's own filters still run, as they would for the
- * person (the checkout's own were ruled out by {@link inspectCheckout}). When git refuses
- * (local changes that the merge would overwrite), nothing changed: the files git named are
- * returned.
+ * `git merge --ff-only <ref>` in a person's checkout, after HEAD is checked to be on `base` right
+ * before. Nothing of the checkout's own configuration runs: every hook off (`core.hooksPath` and
+ * the configuration-defined ones by name, read right before), no fsmonitor or external diff, no
+ * autostash (`--no-autostash`, `merge.autoStash=false`), no submodule recursion, no signature
+ * check (`--no-verify-signatures`, signing programs only from the host); the host's own filters
+ * still run, as they would for the person (the checkout's own were ruled out by
+ * {@link inspectCheckout}). When git refuses (local changes the merge would overwrite) nothing
+ * changed and the files git named are returned. Afterwards the checkout must have no unmerged
+ * entry, no new stash, and HEAD still on `base` at `mergeCommit`; otherwise it is reported.
  */
 export async function fastForwardCheckout(
 	dir: string,
 	ref: string,
-): Promise<{ ok: true } | { ok: false; files: string[]; message: string }> {
+	expect: { base: string; mergeCommit: string },
+	signal?: AbortSignal,
+): Promise<FastForwardCheckoutResult> {
 	if (!ref.startsWith(TEAM_MERGE_REF_PREFIX)) throw new GitError("Unexpected merge ref");
+	assertBranch(expect.base);
+	assertSha(expect.mergeCommit);
+	const plain = [...GIT_NO_EXEC_CONFIG];
+	const headRef = async () =>
+		(await run(dir, ["symbolic-ref", "--quiet", "HEAD"], { config: plain, signal })).stdout.trim();
+	const stashTip = async () =>
+		(
+			await run(dir, ["rev-parse", "--verify", "--quiet", "refs/stash"], { config: plain, signal })
+		).stdout.trim();
+	if ((await headRef()) !== `refs/heads/${expect.base}`)
+		return {
+			ok: false,
+			kind: "moved",
+			files: [],
+			message: `HEAD is no longer on ${expect.base}`,
+		};
+	const stashBefore = await stashTip();
 	const programs = await configuredPrograms(dir);
-	const config = [
+	const signing = await signingConfig(dir, signal);
+	const config: ConfigEntries = [
 		...GIT_NO_EXEC_CONFIG,
-		["core.hooksPath", DEV_NULL] as const,
+		["core.hooksPath", DEV_NULL],
 		...programs.hooks.map((name) => [`hook.${name}.enabled`, "false"] as const),
+		...(programs.drivers ?? []).map((name) => [`merge.${name}.driver`, ""] as const),
+		["merge.autoStash", "false"],
+		["merge.verifySignatures", "false"],
+		["submodule.recurse", "false"],
+		...signing.overrides,
 	];
-	const result = await run(dir, ["merge", "--ff-only", "--no-edit", "--quiet", ref], {
-		config,
-		timeout: MERGE_TIMEOUT_MS,
+	const result = await run(
+		dir,
+		["merge", "--ff-only", "--no-edit", "--no-autostash", "--no-verify-signatures", "--quiet", ref],
+		{ config, timeout: MERGE_TIMEOUT_MS, maxOutputBytes: SMALL_OUTPUT_BYTES, signal },
+	);
+	// Whatever git said, check what the checkout looks like now.
+	const unmerged = await run(dir, ["ls-files", "-u", "-z"], {
+		config: plain,
 		maxOutputBytes: SMALL_OUTPUT_BYTES,
+		signal,
 	});
+	const unmergedFiles = [
+		...new Set(
+			unmerged.stdout
+				.split("\0")
+				.map((record) => record.slice(record.indexOf("\t") + 1))
+				.filter(Boolean),
+		),
+	].slice(0, TEAM_MERGE_CONFLICTS_MAX);
+	const stashAfter = await stashTip();
+	const problems: string[] = [];
+	if (unmerged.exitCode !== 0) problems.push("its index could not be read");
+	if (unmergedFiles.length > 0) problems.push("it has unmerged files");
+	if (stashAfter !== stashBefore) problems.push("a new stash appeared");
+	if (result.exitCode === 0) {
+		if ((await headRef()) !== `refs/heads/${expect.base}`) problems.push("HEAD left the base");
+		const at = await run(dir, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"], {
+			config: plain,
+			signal,
+		});
+		if (at.stdout.trim() !== expect.mergeCommit) problems.push("HEAD is not the merge");
+	}
+	if (problems.length > 0)
+		return {
+			ok: false,
+			kind: "incomplete",
+			files: unmergedFiles,
+			message: `The fast-forward of ${dir} needs a look: ${problems.join(", ")}`,
+		};
 	if (result.exitCode === 0) return { ok: true };
 	const files = `${result.stderr}\n${result.stdout}`
 		.split("\n")
@@ -621,7 +1011,7 @@ export async function fastForwardCheckout(
 		.map((line) => line.trim())
 		.filter(Boolean)
 		.slice(0, TEAM_MERGE_CONFLICTS_MAX);
-	return { ok: false, files, message: complaint(result) };
+	return { ok: false, kind: "refused", files, message: complaint(result) };
 }
 
 /** The command a person runs instead of 「在该目录中快进」. */
