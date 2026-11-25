@@ -5,9 +5,17 @@ import {
 	enterPlanModeTool,
 	shouldDisablePlanReflectionReview,
 } from "../../../server/lib/agent/tools/plan-mode";
-import { cleanDb, getTestDb } from "../../setup";
+import {
+	closeRuntimeTestDb,
+	getRuntimeTestDb,
+} from "../../../server/services/__tests__/agent-runtime-test-database";
+// Rejections settle natively before matching: Bun's `.rejects` stalls on a reused read Worker.
+import { captureWorkerRejectionThrower } from "../../../server/services/__tests__/narrator-worker-fixture";
+import { cleanDb } from "../../setup";
 
-const { db, sqlite } = getTestDb();
+// Reads run on the database Worker, which needs a file-backed WAL database.
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
 
 // Snapshot real db before mocking; afterAll re-points it back (Bun mock.module is global and leaks; mock.restore() does not undo it).
 const realDbModule = { ...(await import("../../../server/db")) };
@@ -27,7 +35,8 @@ afterEach(() => {
 	cleanDb(sqlite);
 });
 
-afterAll(() => {
+afterAll(async () => {
+	await closeRuntimeTestDb(sqlite);
 	mock.module("../../../server/db", () => realDbModule);
 	mock.restore();
 });
@@ -370,9 +379,11 @@ describe("commitPreparedEnterPlanModeResult", () => {
 			END;
 		`);
 
-		await expect(
-			commitPreparedEnterPlanModeResult("n1", prepared, { output: "must roll back" }),
-		).rejects.toThrow("forced plan update failure");
+		expect(
+			await captureWorkerRejectionThrower(
+				commitPreparedEnterPlanModeResult("n1", prepared, { output: "must roll back" }),
+			),
+		).toThrow("forced plan update failure");
 
 		const narrator = await db.query.narrators.findFirst({ where: eq(narrators.id, "n1") });
 		const toolCall = await db.query.narratorToolCalls.findFirst({

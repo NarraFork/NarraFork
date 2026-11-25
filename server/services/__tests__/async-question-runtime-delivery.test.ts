@@ -358,7 +358,9 @@ describe("async question receipt runtime adoption", () => {
 		let injected = false;
 		const probe = spyOn(reads, "readQueryFirst").mockImplementation(async (query, options) => {
 			const row = await original(query, options);
-			if (!injected && row && typeof row === "object" && "deliveryId" in row) {
+			// The consumption bookkeeping read (it carries currentRevision), not the receipt
+			// lookup that precedes it: the race under test is between that read and its write.
+			if (!injected && row && typeof row === "object" && "currentRevision" in row) {
 				injected = true;
 				db.update(narratorBufferedMessages).set({ currentRevision: 2 }).run();
 			}
