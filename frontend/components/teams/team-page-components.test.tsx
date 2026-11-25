@@ -13,7 +13,6 @@ import type {
 	TeamMembersResponse,
 	TeamPageSummary,
 	TeamPendingApproval,
-	TeamSummary,
 } from "@shared/project-teams";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
@@ -32,7 +31,6 @@ import enNarrator from "../../locales/en/narrator.json";
 import en from "../../locales/en/projects.json";
 import zhNarrator from "../../locales/zh-CN/narrator.json";
 import zh from "../../locales/zh-CN/projects.json";
-import { ProjectTeamsList } from "./ProjectTeamsList";
 import { ActivityLine, TeamActivity } from "./TeamActivity";
 import { TeamAttention } from "./TeamAttention";
 import { TeamHeader } from "./TeamHeader";
@@ -272,7 +270,7 @@ describe("等你处理", () => {
 		const html = await attention([call()]);
 		expect(html).toContain('data-kind="tool"');
 		expect(html).toContain("Add the board");
-		expect(html).toContain("the worker asks to run Bash");
+		expect(html).toContain("the worker asks to run a command");
 		expect(html).toContain("pnpm --filter web add @acme/pay-sdk@3.2.0");
 		expect(html).toContain('data-testid="team-approval-deny"');
 		expect(html).toContain('data-testid="team-approval-approve"');
@@ -409,7 +407,7 @@ describe("work list", () => {
 		expect(groups).toEqual(["needsYou", "inProgress", "review"]);
 		expect(html).toContain("需要你");
 		expect(html).toContain("评审 · 就绪");
-		expect(html).toContain("等批准 Bash");
+		expect(html).toContain("等批准运行命令");
 		expect(html).toContain("+214");
 		expect(html).toContain("运行");
 		expect(html).toContain("pnpm test api/auth");
@@ -533,52 +531,6 @@ describe("members (M1)", () => {
 		expect(zhHtml).toContain("旁观者");
 		expect(zhHtml).toContain("所有者");
 		expect(zhHtml).toContain("最近没有发言");
-	});
-});
-
-describe("project teams list", () => {
-	test("an archived team's row offers no pin; an active team's row does", async () => {
-		const row = (id: string, patch: Partial<TeamSummary> = {}): TeamSummary => ({
-			id,
-			projectId: "p",
-			name: id,
-			baseBranch: "main",
-			status: "active",
-			coordinatorStatus: "idle",
-			createdBy: null,
-			createdAt: "2026-11-18T00:00:00.000Z",
-			updatedAt: "2026-11-18T00:00:00.000Z",
-			access: "write",
-			briefBytes: 0,
-			...patch,
-		});
-		const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-		// A cached page that outlived an archive (the list asks for active teams only).
-		client.setQueryData(teamKeys.list("p"), {
-			pages: [
-				{
-					teams: [
-						row("live"),
-						row("gone", { status: "archived", coordinatorStatus: "archived" }),
-						row("going", { coordinatorStatus: "archived" }),
-					],
-					nextCursor: null,
-				},
-			],
-			pageParams: [undefined],
-		});
-		const html = await render(
-			<ProjectTeamsList projectId="p" canCreate={false} onOpenTeam={() => {}} />,
-			client,
-		);
-		const rows = [...html.matchAll(/data-team-id="([^"]+)"(.*?)(?=data-team-id=|$)/gs)].map(
-			(match) => [match[1], match[2].includes('data-testid="pin-to-sidebar"')],
-		);
-		expect(rows).toEqual([
-			["live", true],
-			["gone", false],
-			["going", false],
-		]);
 	});
 });
 

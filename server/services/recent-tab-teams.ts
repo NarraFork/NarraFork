@@ -130,7 +130,8 @@ export async function authorizeTeamTabs<
 /**
  * Runtime state of team tabs, in place: the coordinator's `status`/`substatus`, `teamOnlooker`
  * for a reader who is not a member, and `pendingApprovalCount` (members only, like the team
- * page's top bar). A team the user can no longer read, or that is gone, gets no state.
+ * page's top bar) with `readyItemCount` (R2: items to accept, so the tab's badge sums what the
+ * team page's 「等你处理」 lists). A team the user can no longer read, or that is gone, gets no state.
  */
 export async function enrichTeamTabs(
 	tabs: Record<string, unknown>[],
@@ -143,6 +144,7 @@ export async function enrichTeamTabs(
 		delete tab.substatus;
 		delete tab.teamOnlooker;
 		delete tab.pendingApprovalCount;
+		delete tab.readyItemCount;
 	}
 	const principal = await principalOf(userId);
 	if (!principal) return;
@@ -162,8 +164,9 @@ export async function enrichTeamTabs(
 		if (counted >= TEAM_TAB_PENDING_COUNT_LIMIT) continue;
 		counted++;
 		try {
-			const { teamPendingApprovalCount } = await import("./teams/team-board");
+			const { teamPendingApprovalCount, teamReadyItemCount } = await import("./teams/team-board");
 			tab.pendingApprovalCount = teamPendingApprovalCount(target.teamId);
+			tab.readyItemCount = teamReadyItemCount(target.teamId);
 		} catch (err) {
 			logger.warn("Failed to count a team tab's pending approvals", {
 				teamId: target.teamId,

@@ -219,6 +219,7 @@ export {
 	createProjectSchema,
 	projectChapterSettingsSchema,
 	projectMembersSchema,
+	projectSessionsQuerySchema,
 	projectTransferOwnerSchema,
 	projectVisibilitySchema,
 	resolveProjectDirectorySchema,

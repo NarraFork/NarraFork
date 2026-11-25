@@ -810,7 +810,7 @@ test("the page is about one team: no teams list, no new team, at desktop and pho
 			const seen = {
 				width: viewport.width,
 				lists: await call(page, (f) => f.count("[data-testid=project-teams]")),
-				rows: await call(page, (f) => f.count("[data-testid=project-team-row]")),
+				rows: await call(page, (f) => f.count("[data-testid=project-team-card]")),
 				newTeam: await call(page, (f) => f.count("[data-testid=new-team]")),
 				newTeamText: await call(page, () => document.body.innerText.includes("New team")),
 			};
@@ -1060,14 +1060,14 @@ test("the project page's teams section creates a team", async () => {
 	const { page, errors } = await openPage(alice, { width: 360, height: 780 });
 	try {
 		await call(page, (f, p: string) => f.openProjectTeams(p, true), projectId);
-		await until(page, "list", (f) => f.count("[data-testid=project-team-row]") === 1);
+		await until(page, "list", (f) => f.count("[data-testid=project-team-card]") === 1);
 		await call(page, (f) => f.click("[data-testid=new-team]"));
 		await until(page, "dialog", (f) => f.count("[data-testid=create-team-name]") === 1);
 		await call(page, (f) => f.type("[data-testid=create-team-name]", "Docs crew"));
 		await shot(page, "phone-light-new-team");
 		await call(page, (f) => f.click("[data-testid=create-team-submit]"));
 		await until(page, "created", (f) => f.openedTargets().some((x) => x.startsWith("team:")));
-		await until(page, "listed", (f) => f.count("[data-testid=project-team-row]") === 2);
+		await until(page, "listed", (f) => f.count("[data-testid=project-team-card]") === 2);
 		const created = await db.query.narrators.findFirst({
 			where: eq(narrators.title, "Docs crew"),
 			columns: { id: true, traits: true, contextProjectId: true },
@@ -1083,7 +1083,7 @@ test("the project page's teams section creates a team", async () => {
 	const reader = await openPage(bob, { width: 360, height: 780 });
 	try {
 		await call(reader.page, (f, p: string) => f.openProjectTeams(p, false), projectId);
-		await until(reader.page, "list", (f) => f.count("[data-testid=project-team-row]") === 2);
+		await until(reader.page, "list", (f) => f.count("[data-testid=project-team-card]") === 2);
 		expect(await call(reader.page, (f) => f.count("[data-testid=new-team]"))).toBe(0);
 	} finally {
 		await reader.page.close();
