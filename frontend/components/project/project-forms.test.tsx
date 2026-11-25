@@ -251,7 +251,13 @@ mock.module("../common/DirectoryPicker", () => ({
 	}) => input({ label, value, onChange: (event) => onChange(event.currentTarget.value) }),
 }));
 const { CreateNarratorModal } = await import("../narrator/CreateNarratorModal");
-const { ProjectBasicsForm, ProjectRuleList } = await import("./ProjectSettingsForms");
+const {
+	ProjectBasicsForm,
+	ProjectRuleList,
+	ProjectTeamDefaults,
+	projectWorkStartDefault,
+	teamsWithWorkStart,
+} = await import("./ProjectSettingsForms");
 const { Route } = await import("../../routes/projects/index");
 const ProjectListPage = Route.options.component as ComponentType;
 let root: Root;
@@ -593,4 +599,34 @@ test("existing-directory project create sends no deprecated flow selector or git
 	});
 	expect(container.textContent).not.toContain("flowMode");
 	expect(container.textContent).not.toContain("notGitRepoInitAndCreate");
+});
+
+test("team defaults: the base branch saves when left; the work start keeps the other team settings", async () => {
+	const project = {
+		...settingsProject,
+		defaultBranch: "main",
+		chapterSettings: { teams: { exclusivePaths: ["drizzle/**"], workStart: "local" } },
+	};
+	await act(async () => root.render(<ProjectTeamDefaults project={project} canManage />));
+	expect(field("settingsPage.teamDefaults.baseBranch")?.getAttribute("data-value")).toBe("main");
+	edits = { "settingsPage.teamDefaults.baseBranch": "develop" };
+	await click("settingsPage.teamDefaults.baseBranch");
+	await click("leave:settingsPage.teamDefaults.baseBranch");
+	expect(update.mock.calls[0]?.[0]).toEqual({
+		id: "original-id",
+		data: { defaultBranch: "develop" },
+	});
+	// An invalid name is not sent.
+	edits = { "settingsPage.teamDefaults.baseBranch": "bad name" };
+	await click("settingsPage.teamDefaults.baseBranch");
+	await click("leave:settingsPage.teamDefaults.baseBranch");
+	expect(update).toHaveBeenCalledTimes(1);
+	expect(projectWorkStartDefault(project)).toBe("local");
+	expect(projectWorkStartDefault(settingsProject)).toBe("auto");
+	expect(teamsWithWorkStart(project, "remote")).toEqual({
+		exclusivePaths: ["drizzle/**"],
+		workStart: "remote",
+	});
+	expect(teamsWithWorkStart(project, "auto")).toEqual({ exclusivePaths: ["drizzle/**"] });
+	expect(teamsWithWorkStart(settingsProject, "local")).toEqual({ workStart: "local" });
 });

@@ -415,6 +415,20 @@ export function projectWorkStartDefault(project: ApiEntity | undefined): WorkSta
 }
 
 /**
+ * The project's `chapterSettings.teams` with a new default work start, its other team settings
+ * (exclusive paths) kept: the server merges `chapterSettings` one key deep.
+ */
+export function teamsWithWorkStart(
+	project: ApiEntity | undefined,
+	value: WorkStartDefault,
+): Record<string, unknown> {
+	const teams = projectChapterSettings(project).teams;
+	const { workStart: _previous, ...rest } =
+		teams && typeof teams === "object" ? (teams as Record<string, unknown>) : {};
+	return value === "auto" ? rest : { ...rest, workStart: value };
+}
+
+/**
  * The defaults new teams of this project start from (W): the base branch (`defaultBranch`, saved
  * when the field is left) and where their work items start (`chapterSettings.teams.workStart`:
  * from `origin/<base>`, the local base, or by hosting — origin on GitHub starts from origin).
@@ -447,13 +461,11 @@ export function ProjectTeamDefaults({
 		);
 	};
 	const workStart = projectWorkStartDefault(project);
-	const saveWorkStart = (value: WorkStartDefault) => {
-		const teams = { ...((projectChapterSettings(project).teams as object | undefined) ?? {}) };
-		const next: Record<string, unknown> = { ...teams };
-		if (value === "auto") delete next.workStart;
-		else next.workStart = value;
-		update.mutate({ id: projectId, data: { chapterSettings: { teams: next } } });
-	};
+	const saveWorkStart = (value: WorkStartDefault) =>
+		update.mutate({
+			id: projectId,
+			data: { chapterSettings: { teams: teamsWithWorkStart(project, value) } },
+		});
 	const base = shownBranch.trim() || "main";
 	return (
 		<Stack gap="sm" data-testid="project-team-defaults">
