@@ -1328,11 +1328,18 @@ async function resolveSendName(
 			`No accessible communication target found for "${selector}"; use a full narrator ID`,
 		);
 	}
-	// Rows are ranked before the limit. The first two prove whether the strongest
-	// match is unique, regardless of how many other sessions share the forest.
-	if (matches.length > 1 && matches[1].selectorRank === best.selectorRank) {
-		const lines = matches
-			.filter((candidate) => candidate.selectorRank === best.selectorRank)
+	// The reader reserves the first slot for a matching bare handle, then ranks
+	// the remaining rows. A different active (0) or persisted (1) alias conflicts
+	// with that handle; without a handle, the existing alias priorities apply.
+	const alternatives = matches
+		.slice(1)
+		.filter(
+			({ selectorRank }) =>
+				selectorRank === best.selectorRank ||
+				(best.matchesBareHandle && (selectorRank === 0 || selectorRank === 1)),
+		);
+	if (alternatives.length) {
+		const lines = [best, ...alternatives]
 			.map((candidate) => `- ${candidate.title ?? "(untitled)"} (id: ${candidate.id})`)
 			.join("\n");
 		throw new Error(

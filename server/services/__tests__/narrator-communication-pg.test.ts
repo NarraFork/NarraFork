@@ -13,6 +13,8 @@ import {
 	communicationCandidateSearchGuardPg,
 	withCommunicationPgTransaction,
 } from "../narrator-communication/postgres";
+import { createCommunicationTargetReader } from "../narrator-communication/reader";
+import { createPostgresCommunicationCandidateExecutor } from "../search/communication-candidates";
 
 // No live PostgreSQL is accessed. This executable adapter tests the production SQL against
 // the real SQLite schema with explicit frozen-vs-live snapshots, and asserts the PG isolation config.
@@ -288,6 +290,59 @@ test("PG source persistent principal and all narrow predicates use compatible pr
 		assertCommunicationSendAuthorizedPg(adapter(sqlite), "source", "target"),
 	).rejects.toMatchObject({ code: "COMMUNICATION_DENIED" });
 });
+test("PG Send selector keeps a bare handle and strongest other match within its limit", async () => {
+	grant("target");
+	sqlite.run("UPDATE narrators SET alias_selector='release' WHERE id='target'");
+	sqlite.run(
+		"INSERT INTO narrators(id,owner_user_id,handle,handle_fold,created_at,updated_at) VALUES ('peer','writer','Release','release',?,?)",
+		[now, now],
+	);
+	sqlite.run("INSERT INTO narrator_communication_nodes(narrator_id,version) VALUES ('peer',1)");
+	sqlite.run(
+		"INSERT INTO narrator_communication_peers(id,endpoint_lo,endpoint_hi,created_by,source,created_at) VALUES ('contact','peer','source','writer','manual',?)",
+		[now],
+	);
+	for (const id of ["a-title-1", "a-title-2", "a-title-3"]) {
+		sqlite.run(
+			"INSERT INTO narrators(id,owner_user_id,title,created_at,updated_at) VALUES (?,'writer','release',?,?)",
+			[id, now, now],
+		);
+		sqlite.run(
+			"INSERT INTO narrator_communication_nodes(narrator_id,parent_narrator_id,version) VALUES (?,'source',1)",
+			[id],
+		);
+	}
+	let graphQueries = 0;
+	const execute = createPostgresCommunicationCandidateExecutor({
+		async unsafe(text, params = []) {
+			if (text.startsWith("WITH RECURSIVE")) {
+				graphQueries++;
+				expect(text).toContain("jsonb_array_elements_text(n.traits::jsonb) AS value");
+			}
+			// Translate only PostgreSQL bindings and the JSON table function in this fixture.
+			const compatible = text
+				.replace(/\$\d+/g, "?")
+				.replaceAll("jsonb_array_elements_text(n.traits::jsonb) AS value", "json_each(n.traits)");
+			return sqlite.query(compatible).all(...(params as Array<string | number | null>)) as Record<
+				string,
+				unknown
+			>[];
+		},
+	});
+	const list = createCommunicationTargetReader(execute, (source, viewer) =>
+		communicationCandidateSearchGuardPg(adapter(sqlite), source, viewer.userId),
+	);
+	const matches = await list("source", {
+		limit: 2,
+		selector: { name: "release", activeAliasIds: [] },
+	});
+	expect(matches).toMatchObject([
+		{ id: "peer", matchesBareHandle: true, selectorRank: 2 },
+		{ id: "target", selectorRank: 1 },
+	]);
+	expect(graphQueries).toBe(1);
+});
+
 test("all three runtime mailbox entrance paths select serializable and whole-section retry", () => {
 	const source = readFileSync(
 		new URL("../agent-runtime/postgres-runtime-queue.ts", import.meta.url),

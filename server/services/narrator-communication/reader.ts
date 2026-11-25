@@ -273,6 +273,7 @@ export interface CommunicationTarget {
 	status: string;
 	aliases?: string[];
 	selectorRank?: number;
+	matchesBareHandle?: boolean;
 }
 interface CommunicationTargetReadOptions {
 	limit?: number;
@@ -306,27 +307,27 @@ export function createCommunicationTargetReader(
 			{ ...options, deadlineAt: Date.now() + 5000 },
 		);
 		const limit = Math.max(1, Math.min(options.limit ?? 50, 200));
-		const alias =
-			activeDatabaseBackend === "sqlite"
-				? `(SELECT substr(value,16,128) FROM json_each(n.traits) WHERE value LIKE 'subagent-alias:%' LIMIT 1)`
-				: `(SELECT substr(value,16,128) FROM jsonb_array_elements_text(n.traits::jsonb) AS value WHERE value LIKE 'subagent-alias:%' LIMIT 1)`;
+		const aliasTraits =
+			guard.backend === "sqlite"
+				? "json_each(n.traits)"
+				: "jsonb_array_elements_text(n.traits::jsonb) AS value";
+		const alias = `(SELECT substr(value,16,128) FROM ${aliasTraits} WHERE value LIKE 'subagent-alias:%' LIMIT 1)`;
 		const { selector } = options;
 		const activeAliasIds = selector?.activeAliasIds ?? [];
 		const explicitHandle = selector?.name.startsWith("@");
+		const bareHandle = selector && !explicitHandle;
 		const handle = selector ? foldHandle(selector.name.replace(/^@/, "")) : "";
-		const legacyAliasMatch =
-			guard.backend === "sqlite"
-				? "EXISTS (SELECT 1 FROM json_each(n.traits) WHERE value = ?)"
-				: "EXISTS (SELECT 1 FROM jsonb_array_elements_text(n.traits::jsonb) AS value WHERE value = ?)";
-		// Only @handle explicitly chooses the handle namespace. A bare handle is
-		// another ordinary match, so it cannot silently outrank someone else's title.
 		const rank = selector
 			? `CASE ${explicitHandle ? "WHEN n.handle_fold = ? THEN -1" : ""}
       ${activeAliasIds.length ? `WHEN n.id IN (${placeholders(activeAliasIds)}) THEN 0` : ""}
-      WHEN n.alias_selector = ? OR ${legacyAliasMatch} THEN 1
+      WHEN n.alias_selector = ? OR EXISTS (SELECT 1 FROM ${aliasTraits} WHERE value = ?) THEN 1
       WHEN n.title_slug = ? OR n.title = ? OR substr(n.id,1,length(?)) = ?
-      ${explicitHandle ? "" : "OR n.handle_fold = ?"} THEN 2 ELSE NULL END`
+      ${bareHandle ? "OR n.handle_fold = ?" : ""} THEN 2 ELSE NULL END`
 			: "0";
+		// Preserve the unique bare-handle row ahead of LIMIT even when stronger
+		// alias matches exist. Keep its rank so titles alone cannot outrank an alias.
+		const bareHandleMatch = bareHandle ? "CASE WHEN n.handle_fold = ? THEN 1 ELSE 0 END" : "0";
+		const order = bareHandle ? "bare_handle DESC,selector_rank,id" : "selector_rank,id";
 		const selectorParams = selector
 			? [
 					...(explicitHandle ? [handle] : []),
@@ -337,7 +338,7 @@ export function createCommunicationTargetReader(
 					selector.name,
 					selector.name,
 					selector.name,
-					...(explicitHandle ? [] : [handle]),
+					...(bareHandle ? [handle, handle] : []),
 				]
 			: [];
 		const rows = await execute(
@@ -348,10 +349,11 @@ export function createCommunicationTargetReader(
  ), targets(id) AS (
  SELECT id FROM members UNION SELECT endpoint_hi FROM narrator_communication_peers WHERE endpoint_lo=? UNION SELECT endpoint_lo FROM narrator_communication_peers WHERE endpoint_hi=?
  ), candidates AS (
- SELECT n.id,substr(n.title,1,512) AS title,substr(n.handle,1,128) AS handle,n.status,${alias} AS alias,${rank} AS selector_rank
+ SELECT n.id,substr(n.title,1,512) AS title,substr(n.handle,1,128) AS handle,n.status,${alias} AS alias,
+ ${rank} AS selector_rank,${bareHandleMatch} AS bare_handle
  FROM narrators n JOIN targets t ON t.id=n.id JOIN narrator_communication_nodes c ON c.narrator_id=n.id
  WHERE n.id<>? AND n.status<>'archived' AND NOT n.hidden_from_lists AND (${guard.sql})
- ) SELECT * FROM candidates WHERE selector_rank IS NOT NULL ORDER BY selector_rank,id LIMIT ?`,
+ ) SELECT * FROM candidates WHERE selector_rank IS NOT NULL ORDER BY ${order} LIMIT ?`,
 			[source, source, source, ...selectorParams, source, ...guard.params, limit],
 			options,
 		);
@@ -372,6 +374,7 @@ export function createCommunicationTargetReader(
 			status: String(row.status),
 			...(row.alias ? { aliases: [String(row.alias)] } : {}),
 			...(selector ? { selectorRank: Number(row.selector_rank) } : {}),
+			...(Number(row.bare_handle) === 1 ? { matchesBareHandle: true } : {}),
 		}));
 	};
 }

@@ -21,7 +21,7 @@ import {
 import * as inbox from "../agent-runtime/inbox";
 import * as communication from "../narrator-communication";
 import { authorizeAgentControl } from "../narrator-control";
-import { registerTaskAlias, unregisterTaskAlias } from "../subagent-alias";
+import { registerTaskAlias, resolveTaskAlias, unregisterTaskAlias } from "../subagent-alias";
 import { captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 async function expectRejected(work: PromiseLike<unknown>, message?: string) {
@@ -247,14 +247,22 @@ function seedPastDisplayLimit() {
 		.run();
 }
 
-test("a bare handle and title conflict before any delivery even beyond the prompt listing", async () => {
+test.each([
+	"title",
+	"persisted nested alias",
+] as const)("a bare handle and %s conflict before any delivery even beyond the prompt listing", async (match) => {
 	seedPastDisplayLimit();
-	const titled = "grandchild-a";
+	const nested = "grandchild-a"; // Belongs to branch-a, not root's task alias registry.
 	const named = "peer"; // Different execution user; exactly connected and publicly writable.
 	db.update(narrators)
-		.set({ title: "release", titleSlug: "release" })
-		.where(eq(narrators.id, titled))
+		.set(
+			match === "title"
+				? { title: "release", titleSlug: "release" }
+				: { aliasSelector: "release", traits: ["subagent-alias:release"] },
+		)
+		.where(eq(narrators.id, nested))
 		.run();
+	expect(resolveTaskAlias("root", "release")).toBe("release");
 	db.update(narrators)
 		.set({ handle: "Release", handleFold: "release" })
 		.where(eq(narrators.id, named))
@@ -262,13 +270,13 @@ test("a bare handle and title conflict before any delivery even beyond the promp
 	db.update(narrators).set({ title: "@release" }).where(eq(narrators.id, "grandchild-b")).run();
 	const display = await communication.listCommunicationTargets("root", { limit: 200 });
 	expect(display).toHaveLength(200);
-	expect(display.some(({ id }) => id === titled || id === named)).toBe(false);
+	expect(display.some(({ id }) => id === nested || id === named)).toBe(false);
 
 	const state = () =>
 		db
 			.select({ id: narrators.id, inboxSequence: narrators.inboxSequence, model: narrators.model })
 			.from(narrators)
-			.where(inArray(narrators.id, [titled, named]))
+			.where(inArray(narrators.id, [nested, named]))
 			.orderBy(narrators.id)
 			.all();
 	const before = state();
@@ -279,7 +287,7 @@ test("a bare handle and title conflict before any delivery even beyond the promp
 	);
 	expect(state()).toEqual(before);
 	expect(queued()).toHaveLength(0);
-	for (const id of [titled, named])
+	for (const id of [nested, named])
 		expect(await inbox.listInboxRows(id, ["agent_message"])).toEqual([]);
 	expect(onDeliveryResolved).not.toHaveBeenCalled();
 	expect(wake).not.toHaveBeenCalled();
@@ -287,13 +295,40 @@ test("a bare handle and title conflict before any delivery even beyond the promp
 	const explicit = await sendSubagentMessageDetailed({ ...request("root", []), name: "@release" });
 	expect(explicit.targets.map(({ id, status }) => [id, status])).toEqual([[named, "queued"]]);
 	expect(queued().map(({ narratorId }) => narratorId)).toEqual([named]);
-	const byId = await sendSubagentMessageDetailed(request("root", [titled]));
-	expect(byId.targets.map(({ id, status }) => [id, status])).toEqual([[titled, "queued"]]);
+	const byId = await sendSubagentMessageDetailed(request("root", [nested]));
+	expect(byId.targets.map(({ id, status }) => [id, status])).toEqual([[nested, "queued"]]);
 	expect(
 		queued()
 			.map(({ narratorId }) => narratorId)
 			.sort(),
-	).toEqual([titled, named]);
+	).toEqual([nested, named]);
+
+	// A distinct active alias also conflicts with a bare handle. Without the
+	// handle, active aliases still outrank other aliases or title-only matches.
+	const active = "branch-a";
+	expect(registerTaskAlias("root", active, "release").alias).toBe("release");
+	try {
+		const beforeActive = queued();
+		const wakesBeforeActive = wake.mock.calls.length;
+		await expectRejected(
+			sendSubagentMessageDetailed({ ...request("root", []), name: "release" }),
+			"Ambiguous communication target",
+		);
+		expect(queued()).toEqual(beforeActive);
+		expect(wake).toHaveBeenCalledTimes(wakesBeforeActive);
+
+		db.update(narrators)
+			.set({ handle: null, handleFold: null })
+			.where(eq(narrators.id, named))
+			.run();
+		const activeSend = await sendSubagentMessageDetailed({
+			...request("root", []),
+			name: "release",
+		});
+		expect(activeSend.targets.map(({ id, status }) => [id, status])).toEqual([[active, "queued"]]);
+	} finally {
+		unregisterTaskAlias("root", active);
+	}
 });
 
 test("names match before the display limit and a current alias outranks title-only matches", async () => {
@@ -319,6 +354,21 @@ test("names match before the display limit and a current alias outranks title-on
 	}
 	expect(await resolve("shared")).toBe("grandchild-b");
 	expect(await resolve("Previously shared")).toBe("grandchild-a");
+
+	// A handle and alias on one row are one recipient, not two matches. Its
+	// persisted alias still outranks the other session's title-only match.
+	db.update(narrators)
+		.set({ handle: "Shared", handleFold: "shared" })
+		.where(eq(narrators.id, "grandchild-b"))
+		.run();
+	const sameRecipient = await sendSubagentMessageDetailed({
+		...request("root", []),
+		name: "shared",
+	});
+	expect(sameRecipient.targets.map(({ id, status }) => [id, status])).toEqual([
+		["grandchild-b", "queued"],
+	]);
+	expect(queued().map(({ narratorId }) => narratorId)).toEqual(["grandchild-b"]);
 
 	db.update(narrators).set({ status: "archived" }).where(eq(narrators.id, "grandchild-b")).run();
 	expect(await resolve("shared")).toBe("grandchild-a");
