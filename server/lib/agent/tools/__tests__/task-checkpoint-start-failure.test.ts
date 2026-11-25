@@ -30,9 +30,12 @@ mock.module("@server/services/teams/work-items", () => ({
 	attachWorker,
 	settleFailedStart,
 }));
-// The item has no worker, so the Agent call checks its dependencies first (none here).
+// The item has no worker, so the Agent call checks its dependencies first (none here): both
+// checks `task.ts` runs before creating the worker — that every dependency merged, and that each
+// is inside the ref the item's work starts from (git, async).
 mock.module("@server/services/teams/work-item-dependencies", () => ({
 	assertWorkItemStartable: () => {},
+	assertDependenciesReachStart: async () => {},
 }));
 
 const { agentTool } = await import("../task");

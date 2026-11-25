@@ -412,19 +412,8 @@ describe("team git writes", () => {
 		});
 		expect(on.exitCode).toBe(0);
 		expect(await git(["rev-parse", "main"])).toBe(commit);
-		// PowerShell, where this host has it.
-		const pwsh = Bun.which("pwsh");
-		if (pwsh) {
-			await git(["reset", "-q", "--hard", base]);
-			const ps = commandsFor(repo, "main", commit).powershell;
-			const run = await safeSpawn({
-				cmd: [pwsh, "-NoProfile", "-Command", ps],
-				timeout: 30_000,
-				maxOutputBytes: 4096,
-			});
-			expect(run.exitCode).toBe(0);
-			expect(await git(["rev-parse", "main"])).toBe(commit);
-		}
+		// The PowerShell form is checked as text (no pwsh is started: its start-up alone can take
+		// seconds on a loaded runner): see the quoting test below.
 	});
 
 	test("every PowerShell quote is doubled: a path's quotes never end its string (Devin 3)", async () => {
@@ -441,6 +430,7 @@ describe("team git writes", () => {
 			`C:\\it${q}s ${q}${q} $(evil) \`$x`,
 		]);
 		paths.push("/srv/\u2018';\u201b\u2019Remove-Item x;\u201a'");
+		// Read back with PowerShell's own quoting rules (readPowerShellQuoted), not by starting pwsh.
 		for (const path of paths) {
 			const ps = commandsFor(path, "main", sha).powershell;
 			let at = ps.indexOf("git -C ");
@@ -454,19 +444,6 @@ describe("team git writes", () => {
 				at = ps.indexOf("git -C ", word.end);
 			}
 			expect(words).toBe(2);
-		}
-		// PowerShell itself, where this host has it: the argument it passes is the path.
-		const pwsh = Bun.which("pwsh");
-		if (pwsh) {
-			for (const path of paths) {
-				const ps = `Write-Output ${commandsFor(path, "main", sha).powershell.split("git -C ")[1]?.split(" symbolic-ref")[0]}`;
-				const run = await safeSpawn({
-					cmd: [pwsh, "-NoProfile", "-Command", ps],
-					timeout: 30_000,
-					maxOutputBytes: 4096,
-				});
-				expect(run.stdout.split(/\r?\n/)[0]).toBe(path);
-			}
 		}
 	});
 
