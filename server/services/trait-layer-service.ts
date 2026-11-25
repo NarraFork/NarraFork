@@ -14,6 +14,7 @@
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { narrators, projects, userPreferences } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { AsyncMutex } from "../lib/async-mutex";
 import { NotFoundError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
@@ -32,7 +33,7 @@ import {
 	resolveLayeredTraits,
 } from "../lib/trait-resolution";
 import { type RuntimePolicy, resolveRuntimePolicy } from "./agent-runtime/policy";
-import { resolveNarratorProjectId } from "./narrator-project";
+import { narratorProjectIdColumn, resolveNarratorProjectId } from "./narrator-project";
 
 /**
  * Per-layer locks. Separate instances because the layers are different rows with
@@ -50,6 +51,8 @@ interface CachedLayer {
 
 const projectLayerCache = new Map<string, CachedLayer>();
 const userLayerCache = new Map<string, CachedLayer>();
+let projectLayerGeneration = 0;
+let userLayerGeneration = 0;
 
 /** Bound the caches so a long-lived process cannot accumulate entries forever. */
 const MAX_CACHE_ENTRIES = 500;
@@ -82,16 +85,20 @@ function writeCache(cache: Map<string, CachedLayer>, key: string, traits: string
 
 /** Invalidate a project's cached trait layer. Call after any write. */
 export function invalidateProjectTraitLayer(projectId: string): void {
+	projectLayerGeneration++;
 	projectLayerCache.delete(projectId);
 }
 
 /** Invalidate a user's cached trait layer. Call after any write. */
 export function invalidateUserTraitLayer(userId: string): void {
+	userLayerGeneration++;
 	userLayerCache.delete(userId);
 }
 
 /** Clear all cached layers. Test-only seam. */
 export function resetTraitLayerCaches(): void {
+	projectLayerGeneration++;
+	userLayerGeneration++;
 	projectLayerCache.clear();
 	userLayerCache.clear();
 }
@@ -107,13 +114,17 @@ async function loadProjectTraits(
 	if (!projectId) return [];
 	const cached = readCache(projectLayerCache, projectId);
 	if (cached) return cached;
+	const generation = projectLayerGeneration;
 	try {
-		const row = await db.query.projects.findFirst({
-			where: eq(projects.id, projectId),
-			columns: { traits: true },
-		});
+		const row = await readQuery(
+			db.query.projects.findFirst({
+				where: eq(projects.id, projectId),
+				columns: { traits: true },
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		const traits = Array.isArray(row?.traits) ? row.traits : [];
-		writeCache(projectLayerCache, projectId, traits);
+		if (generation === projectLayerGeneration) writeCache(projectLayerCache, projectId, traits);
 		return traits;
 	} catch (error) {
 		if (strict) throw error;
@@ -131,13 +142,17 @@ async function loadUserTraits(
 	if (!userId) return [];
 	const cached = readCache(userLayerCache, userId);
 	if (cached) return cached;
+	const generation = userLayerGeneration;
 	try {
-		const row = await db.query.userPreferences.findFirst({
-			where: eq(userPreferences.userId, userId),
-			columns: { traits: true },
-		});
+		const row = await readQuery(
+			db.query.userPreferences.findFirst({
+				where: eq(userPreferences.userId, userId),
+				columns: { traits: true },
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		const traits = Array.isArray(row?.traits) ? row.traits : [];
-		writeCache(userLayerCache, userId, traits);
+		if (generation === userLayerGeneration) writeCache(userLayerCache, userId, traits);
 		return traits;
 	} catch (error) {
 		if (strict) throw error;
@@ -191,11 +206,20 @@ async function resolveLayers(
 			? resolveNarratorTraitsInChain(input.policySourceId, input.actingUserId ?? null, chain)
 			: null,
 	]);
+	return mergeLoadedLayers(input.narratorTraits, userTraits, projectTraits, source);
+}
+
+function mergeLoadedLayers(
+	narratorTraits: unknown,
+	userTraits: string[],
+	projectTraits: string[],
+	source: ResolvedTraitsResult | null,
+): ResolvedTraitsResult {
 	return resolveLayeredTraits({
 		user: userTraits.length > 0 ? { traits: userTraits } : null,
 		project: projectTraits.length > 0 ? { traits: projectTraits } : null,
 		source: source ? { traits: source.traits } : null,
-		narrator: { traits: input.narratorTraits },
+		narrator: { traits: narratorTraits },
 	});
 }
 
@@ -206,15 +230,18 @@ async function resolveNarratorTraitsInChain(
 ): Promise<ResolvedTraitsResult> {
 	if (chain.includes(narratorId)) throw new Error("Policy source cycle detected");
 	if (chain.length >= MAX_POLICY_SOURCE_DEPTH) throw new Error("Policy source chain is too deep");
-	const row = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: {
-			...RUNTIME_SOURCE_COLUMNS,
-			id: true,
-			traits: true,
-			contextProjectId: true,
-		},
-	});
+	const row = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: {
+				...RUNTIME_SOURCE_COLUMNS,
+				id: true,
+				traits: true,
+				contextProjectId: true,
+			},
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!row) throw new NotFoundError("Narrator", narratorId);
 	return resolveLayers(
 		{
@@ -262,6 +289,56 @@ export async function resolveNarratorCapabilities(
 	return { traits, policy: resolveRuntimePolicy(parseRuntimePolicyTraits(traits.traits)) };
 }
 
+/** Commit-time ceiling: bounded source chain, explicit transaction, no Worker or TTL cache. */
+export function resolveNarratorRuntimePolicyNow(
+	narratorId: string,
+	actingUserId: string | null,
+	store: Pick<typeof db, "select">,
+): RuntimePolicy {
+	const resolveChain = (id: string, chain: readonly string[]): ResolvedTraitsResult => {
+		if (chain.includes(id)) throw new Error("Policy source cycle detected");
+		if (chain.length >= MAX_POLICY_SOURCE_DEPTH) throw new Error("Policy source chain is too deep");
+		const row = store
+			.select({
+				id: narrators.id,
+				traits: narrators.traits,
+				projectId: narratorProjectIdColumn,
+				policySourceNarratorId: narrators.policySourceNarratorId,
+				runtimeRegistrationJson: narrators.runtimeRegistrationJson,
+			})
+			.from(narrators)
+			.where(eq(narrators.id, id))
+			.limit(1)
+			.get();
+		if (!row) throw new NotFoundError("Narrator", id);
+		const project = row.projectId
+			? store
+					.select({ traits: projects.traits })
+					.from(projects)
+					.where(eq(projects.id, row.projectId))
+					.limit(1)
+					.get()
+			: null;
+		const user = actingUserId
+			? store
+					.select({ traits: userPreferences.traits })
+					.from(userPreferences)
+					.where(eq(userPreferences.userId, actingUserId))
+					.limit(1)
+					.get()
+			: null;
+		const sourceId = policySourceIdOf(row);
+		const source = sourceId ? resolveChain(sourceId, [...chain, id]) : null;
+		return mergeLoadedLayers(
+			row.traits,
+			Array.isArray(user?.traits) ? user.traits : [],
+			Array.isArray(project?.traits) ? project.traits : [],
+			source,
+		);
+	};
+	return resolveRuntimePolicy(parseRuntimePolicyTraits(resolveChain(narratorId, []).traits));
+}
+
 // === Layer trait editing ===
 
 export type EditableTraitLayer = "user" | "project";
@@ -276,17 +353,23 @@ export interface LayerTraitsView {
 
 async function readLayerTraits(layer: EditableTraitLayer, ownerId: string): Promise<string[]> {
 	if (layer === "project") {
-		const row = await db.query.projects.findFirst({
-			where: eq(projects.id, ownerId),
-			columns: { traits: true },
-		});
+		const row = await readQuery(
+			db.query.projects.findFirst({
+				where: eq(projects.id, ownerId),
+				columns: { traits: true },
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		if (!row) throw new NotFoundError("Project", ownerId);
 		return Array.isArray(row.traits) ? row.traits : [];
 	}
-	const row = await db.query.userPreferences.findFirst({
-		where: eq(userPreferences.userId, ownerId),
-		columns: { traits: true },
-	});
+	const row = await readQuery(
+		db.query.userPreferences.findFirst({
+			where: eq(userPreferences.userId, ownerId),
+			columns: { traits: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	// A user with no preferences row yet simply has no traits.
 	return Array.isArray(row?.traits) ? row.traits : [];
 }
@@ -324,25 +407,16 @@ export async function updateLayerTraits(
 				.set({ traits: next, updatedAt: now })
 				.where(eq(projects.id, ownerId));
 		} else {
-			// The preferences row may not exist yet for a user who never changed one.
-			const existing = await db.query.userPreferences.findFirst({
-				where: eq(userPreferences.userId, ownerId),
-				columns: { id: true },
-			});
-			if (existing) {
-				await db
-					.update(userPreferences)
-					.set({ traits: next, updatedAt: now })
-					.where(eq(userPreferences.userId, ownerId));
-			} else {
-				await db.insert(userPreferences).values({
-					id: generateId(),
-					userId: ownerId,
-					traits: next,
-					createdAt: now,
-					updatedAt: now,
+			// The preferences row may not exist yet for a user who never changed one. One upsert
+			// on the unique user id: a row created concurrently by another preferences writer
+			// is updated, never duplicated or rejected.
+			await db
+				.insert(userPreferences)
+				.values({ id: generateId(), userId: ownerId, traits: next, createdAt: now, updatedAt: now })
+				.onConflictDoUpdate({
+					target: userPreferences.userId,
+					set: { traits: next, updatedAt: now },
 				});
-			}
 		}
 		return next;
 	});

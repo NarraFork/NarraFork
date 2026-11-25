@@ -1,3 +1,4 @@
+import { readDbAll } from "../db/worker-read";
 /**
  * chat-service.ts — Chat rooms and their messages, disjoint from narrator context.
  *
@@ -48,6 +49,7 @@ import {
 	CHAT_DRAFT_ATTACHMENTS_MAX,
 	copyChatAttachmentToWorktree,
 	deleteChatAttachmentFiles,
+	finishChatAttachmentPublication,
 	getChatAttachmentFileInfo,
 	saveChatAttachment,
 } from "@server/lib/chat-attachments";
@@ -396,10 +398,13 @@ export async function resolveDmRoom(userId: string, peerUserId: string): Promise
 	if (userId === peerUserId) {
 		throw new ValidationError("Cannot open a direct message with yourself");
 	}
-	const peer = await db.query.users.findFirst({
-		where: eq(users.id, peerUserId),
-		columns: USER_COLUMNS,
-	});
+	const peer = await readQuery(
+		db.query.users.findFirst({
+			where: eq(users.id, peerUserId),
+			columns: USER_COLUMNS,
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!peer) throw new NotFoundError("User", peerUserId);
 
 	const dmKey = buildDmKey(userId, peerUserId);
@@ -410,7 +415,10 @@ export async function resolveDmRoom(userId: string, peerUserId: string): Promise
 		.values({ id: generateId(), kind: "dm", dmKey, nextSeq: 1, createdAt: timestamp })
 		.onConflictDoNothing({ target: chatRooms.dmKey });
 
-	const room = await db.query.chatRooms.findFirst({ where: eq(chatRooms.dmKey, dmKey) });
+	const room = await readQuery(
+		db.query.chatRooms.findFirst({ where: eq(chatRooms.dmKey, dmKey) }),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!room) throw new NotFoundError("Chat room", dmKey);
 
 	// Both sides get a member row: for a DM this is the ACL, so it must exist for
@@ -449,10 +457,13 @@ export async function resolveNarratorRoom(
 	narratorId: string,
 	userId: string,
 ): Promise<ChatRoomSummary> {
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: NARRATOR_ACL_COLUMNS,
-	});
+	const narrator = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: NARRATOR_ACL_COLUMNS,
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
 	if (!(await canReadNarrator(narrator, await resolvePrincipal(userId)))) {
 		throw new NotFoundError("Narrator", narratorId);
@@ -468,9 +479,12 @@ export async function resolveNarratorRoom(
 		.onConflictDoNothing()
 		.returning({ id: chatRooms.id });
 
-	const room = await db.query.chatRooms.findFirst({
-		where: and(eq(chatRooms.narratorId, narratorId), eq(chatRooms.kind, "narrator")),
-	});
+	const room = await readQuery(
+		db.query.chatRooms.findFirst({
+			where: and(eq(chatRooms.narratorId, narratorId), eq(chatRooms.kind, "narrator")),
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!room) throw new NotFoundError("Chat room for narrator", narratorId);
 	if (inserted.length > 0) {
 		eventBus.emit({ type: "chat:room_created", roomId: room.id, narratorId });
@@ -539,10 +553,13 @@ export async function ensureNarratorDiscussionRoomForShare(narratorId: string): 
  * before the room exists, for the phantom-room reason given on `resolveNarratorRoom`.
  */
 export async function resolveBotRoom(narratorId: string, userId: string): Promise<ChatRoomSummary> {
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { ...NARRATOR_ACL_COLUMNS, ...BOT_COLUMNS, traits: true },
-	});
+	const narrator = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { ...NARRATOR_ACL_COLUMNS, ...BOT_COLUMNS, traits: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!narrator || !isBotNarrator(narrator.traits)) throw new NotFoundError("Bot", narratorId);
 	const principal = await resolvePrincipal(userId);
 	if (!(await canReadNarrator(narrator, principal))) throw new NotFoundError("Bot", narratorId);
@@ -581,7 +598,10 @@ async function ensureBotRoom(
 		.insert(chatRooms)
 		.values({ id: generateId(), kind: "bot", dmKey, narratorId, nextSeq: 1, createdAt: nowIso() })
 		.onConflictDoNothing({ target: chatRooms.dmKey });
-	const room = await db.query.chatRooms.findFirst({ where: eq(chatRooms.dmKey, dmKey) });
+	const room = await readQuery(
+		db.query.chatRooms.findFirst({ where: eq(chatRooms.dmKey, dmKey) }),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!room) throw new NotFoundError("Chat room", dmKey);
 	await ensureMembers(room.id, [userId]);
 	return room;
@@ -594,10 +614,13 @@ async function ensureBotRoom(
  */
 async function assertCanPostToBot(narratorId: string | null, userId: string): Promise<void> {
 	const narrator = narratorId
-		? await db.query.narrators.findFirst({
-				where: eq(narrators.id, narratorId),
-				columns: NARRATOR_ACL_COLUMNS,
-			})
+		? await readQuery(
+				db.query.narrators.findFirst({
+					where: eq(narrators.id, narratorId),
+					columns: NARRATOR_ACL_COLUMNS,
+				}),
+				{ executionPolicy: "worker-required" },
+			)
 		: undefined;
 	if (!narrator || !(await canWriteNarrator(narrator, await resolvePrincipal(userId)))) {
 		throw new ForbiddenError("You cannot message this bot");
@@ -870,21 +893,24 @@ async function appendPost(
 		replyToPreview: null,
 	};
 	if (input.replyToMessageId) {
-		const target = await db.query.chatMessages.findFirst({
-			where: and(
-				eq(chatMessages.id, input.replyToMessageId),
-				eq(chatMessages.roomId, input.roomId),
-			),
-			columns: {
-				id: true,
-				seq: true,
-				senderUserId: true,
-				senderGuestName: true,
-				senderNarratorId: true,
-				contentText: true,
-				deletedAt: true,
-			},
-		});
+		const target = await readQuery(
+			db.query.chatMessages.findFirst({
+				where: and(
+					eq(chatMessages.id, input.replyToMessageId),
+					eq(chatMessages.roomId, input.roomId),
+				),
+				columns: {
+					id: true,
+					seq: true,
+					senderUserId: true,
+					senderGuestName: true,
+					senderNarratorId: true,
+					contentText: true,
+					deletedAt: true,
+				},
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		if (!target) throw new ValidationError("Replied-to message is not in this room");
 		replySnapshot = {
 			replyToSeq: target.seq,
@@ -903,14 +929,17 @@ async function appendPost(
 	// transaction, so nothing here is trusted as a permission decision.
 	const pendingAttachments =
 		attachmentIds.length > 0
-			? await db.query.chatAttachments.findMany({
-					where: and(
-						inArray(chatAttachments.id, attachmentIds),
-						eq(chatAttachments.roomId, input.roomId),
-						eq(chatAttachments.uploaderUserId, input.senderUserId),
-						isNull(chatAttachments.messageId),
-					),
-				})
+			? await readQuery(
+					db.query.chatAttachments.findMany({
+						where: and(
+							inArray(chatAttachments.id, attachmentIds),
+							eq(chatAttachments.roomId, input.roomId),
+							eq(chatAttachments.uploaderUserId, input.senderUserId),
+							isNull(chatAttachments.messageId),
+						),
+					}),
+					{ executionPolicy: "worker-required" },
+				)
 			: [];
 	if (pendingAttachments.length !== attachmentIds.length) {
 		// Deliberately one message for every failure mode (unknown id, another room's
@@ -1013,10 +1042,13 @@ async function appendPost(
 		return claimed;
 	});
 
-	const sender = await db.query.users.findFirst({
-		where: eq(users.id, input.senderUserId),
-		columns: USER_COLUMNS,
-	});
+	const sender = await readQuery(
+		db.query.users.findFirst({
+			where: eq(users.id, input.senderUserId),
+			columns: USER_COLUMNS,
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 
 	const row: ChatMessageRow = {
 		id: messageId,
@@ -1084,10 +1116,13 @@ export async function postBotMessage(input: PostBotMessageInput): Promise<ChatMe
 	if (text.length > CHAT_BOT_MESSAGE_MAX_CHARS) {
 		throw new ValidationError(`Message exceeds ${CHAT_BOT_MESSAGE_MAX_CHARS} characters`);
 	}
-	const bot = await db.query.narrators.findFirst({
-		where: eq(narrators.id, input.narratorId),
-		columns: { ...NARRATOR_ACL_COLUMNS, ...BOT_COLUMNS },
-	});
+	const bot = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, input.narratorId),
+			columns: { ...NARRATOR_ACL_COLUMNS, ...BOT_COLUMNS },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!bot) throw new NotFoundError("Narrator", input.narratorId);
 	// A bot writes only within its audience: the room it opens is one this person could
 	// have opened (`resolveBotRoom`'s bar). Past it, a message would come from a name any
@@ -1163,11 +1198,11 @@ function unavailablePublicDiscussion(): AppError {
 }
 
 /** One indexed join; no room creation, user lookup or membership write. */
-function requirePublicDiscussion(
+function publicDiscussionAccessQuery(
 	input: PublicDiscussionAccessInput,
 	connection: typeof db | ChatTransaction = db,
 ) {
-	const access = connection
+	return connection
 		.select({
 			shareId: narratorPublicShares.id,
 			guestName: narratorPublicShares.guestName,
@@ -1190,7 +1225,22 @@ function requirePublicDiscussion(
 				isNull(narratorPublicShares.revokedAt),
 			),
 		)
-		.get();
+		.limit(1);
+}
+
+function requirePublicDiscussion(
+	input: PublicDiscussionAccessInput,
+	connection: typeof db | ChatTransaction,
+) {
+	const access = publicDiscussionAccessQuery(input, connection).get();
+	if (!access) throw unavailablePublicDiscussion();
+	return access;
+}
+
+async function readPublicDiscussionAccess(input: PublicDiscussionAccessInput) {
+	const access = await readQueryFirst(publicDiscussionAccessQuery(input), {
+		executionPolicy: "worker-required",
+	});
 	if (!access) throw unavailablePublicDiscussion();
 	return access;
 }
@@ -1250,7 +1300,7 @@ export async function listPublicDiscussion(
 		limit?: number;
 	},
 ): Promise<PublicDiscussionPage> {
-	const access = requirePublicDiscussion(input);
+	const access = await readPublicDiscussionAccess(input);
 	if (
 		input.beforeSeq !== undefined &&
 		(!Number.isSafeInteger(input.beforeSeq) || input.beforeSeq < 1)
@@ -1264,17 +1314,19 @@ export async function listPublicDiscussion(
 		input.limit ?? PUBLIC_SHARE_LIMITS.defaultPage,
 		PUBLIC_SHARE_LIMITS.maxPage,
 	);
-	const rows = publicDiscussionQuery(access.roomId, access.shareId)
-		.$dynamic()
-		.where(
-			and(
-				eq(chatMessages.roomId, access.roomId),
-				input.beforeSeq !== undefined ? lt(chatMessages.seq, input.beforeSeq) : undefined,
-			),
-		)
-		.orderBy(desc(chatMessages.seq))
-		.limit(limit + 1)
-		.all();
+	const rows = await readQuery(
+		publicDiscussionQuery(access.roomId, access.shareId)
+			.$dynamic()
+			.where(
+				and(
+					eq(chatMessages.roomId, access.roomId),
+					input.beforeSeq !== undefined ? lt(chatMessages.seq, input.beforeSeq) : undefined,
+				),
+			)
+			.orderBy(desc(chatMessages.seq))
+			.limit(limit + 1),
+		{ executionPolicy: "worker-required" },
+	);
 	const messages: PublicDiscussionMessage[] = [];
 	// Reserve the envelope/cursor and commas. Each row is <= ~200 KiB even with JSON escapes.
 	let bytes = 256;
@@ -1286,6 +1338,9 @@ export async function listPublicDiscussion(
 		messages.push(message);
 	}
 	const hasMore = rows.length > messages.length;
+	const live = await readPublicDiscussionAccess(input);
+	if (live.roomId !== access.roomId || live.narratorId !== access.narratorId)
+		throw unavailablePublicDiscussion();
 	messages.reverse();
 	return {
 		messages,
@@ -1300,7 +1355,7 @@ export async function postPublicDiscussion(
 		replyToMessageId?: string | null;
 	},
 ): Promise<PublicDiscussionMessage> {
-	const access = requirePublicDiscussion(input);
+	const access = await readPublicDiscussionAccess(input);
 	if (
 		typeof input.text !== "string" ||
 		input.text.length > PUBLIC_DISCUSSION_MAX_CHARS ||
@@ -1364,10 +1419,13 @@ export async function postPublicDiscussion(
 			.run();
 		return { seq, roomId: live.roomId, narratorId: live.narratorId };
 	});
-	const stored = publicDiscussionQuery(result.roomId, access.shareId)
-		.$dynamic()
-		.where(and(eq(chatMessages.id, messageId), eq(chatMessages.roomId, result.roomId)))
-		.get();
+	const stored = await readQueryFirst(
+		publicDiscussionQuery(result.roomId, access.shareId)
+			.$dynamic()
+			.where(and(eq(chatMessages.id, messageId), eq(chatMessages.roomId, result.roomId)))
+			.limit(1),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!stored) throw unavailablePublicDiscussion();
 	const message = toPublicDiscussionMessage(stored);
 	eventBus.emit({
@@ -1409,10 +1467,13 @@ export async function hydrateMessageForBroadcast(
 		loadReplyAuthor(row, row.id),
 		row.deletedAt
 			? Promise.resolve([])
-			: db.query.chatAttachments.findMany({
-					where: eq(chatAttachments.messageId, row.id),
-					orderBy: [asc(chatAttachments.createdAt)],
-				}),
+			: readQuery(
+					db.query.chatAttachments.findMany({
+						where: eq(chatAttachments.messageId, row.id),
+						orderBy: [asc(chatAttachments.createdAt)],
+					}),
+					{ executionPolicy: "worker-required" },
+				),
 	]);
 
 	return {
@@ -1447,15 +1508,21 @@ async function loadAuthor(
 	if (guest) return guest;
 	if (author.narratorId) {
 		return toBotSnapshot(
-			await db.query.narrators.findFirst({
-				where: eq(narrators.id, author.narratorId),
-				columns: BOT_COLUMNS,
-			}),
+			await readQuery(
+				db.query.narrators.findFirst({
+					where: eq(narrators.id, author.narratorId),
+					columns: BOT_COLUMNS,
+				}),
+				{ executionPolicy: "worker-required" },
+			),
 		);
 	}
 	if (author.userId) {
 		return toUserSnapshot(
-			await db.query.users.findFirst({ where: eq(users.id, author.userId), columns: USER_COLUMNS }),
+			await readQuery(
+				db.query.users.findFirst({ where: eq(users.id, author.userId), columns: USER_COLUMNS }),
+				{ executionPolicy: "worker-required" },
+			),
 		);
 	}
 	return null;
@@ -1525,10 +1592,13 @@ export async function getChatMessageLocation(input: {
 	userId: string;
 }): Promise<{ messageId: string; seq: number }> {
 	await assertCanRead(input.roomId, input.userId);
-	const row = await db.query.chatMessages.findFirst({
-		where: and(eq(chatMessages.roomId, input.roomId), eq(chatMessages.id, input.messageId)),
-		columns: { id: true, seq: true },
-	});
+	const row = await readQuery(
+		db.query.chatMessages.findFirst({
+			where: and(eq(chatMessages.roomId, input.roomId), eq(chatMessages.id, input.messageId)),
+			columns: { id: true, seq: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!row) throw new NotFoundError("ChatMessage", input.messageId);
 	return { messageId: row.id, seq: row.seq };
 }
@@ -1768,7 +1838,11 @@ async function probeUnreadBatch(
 					limit ${CHAT_UNREAD_PROBE_LIMIT + 1}
 				)`,
 		);
-		const rows = await db.all<{ roomId: string; seq: number }>(sql.join(parts, sql` union all `));
+		const rows = await readDbAll<{ roomId: string; seq: number }>(
+			db,
+			sql.join(parts, sql` union all `),
+			{ executionPolicy: "worker-required" },
+		);
 		for (const row of rows) {
 			seqsByRoom.set(row.roomId, (seqsByRoom.get(row.roomId) ?? 0) + 1);
 		}
@@ -1824,23 +1898,26 @@ export async function listConversationRooms(userId: string): Promise<ChatRoomSum
 	// could not do this: `chat_room_members` has no activity column to order by.
 	// `NULL last_message_at` (a room opened but never written in) sorts last under
 	// DESC in SQLite, which is also where it belongs in the list.
-	const rows = await db
-		.select({
-			id: chatRooms.id,
-			kind: chatRooms.kind,
-			dmKey: chatRooms.dmKey,
-			narratorId: chatRooms.narratorId,
-			lastMessageAt: chatRooms.lastMessageAt,
-			lastMessagePreview: chatRooms.lastMessagePreview,
-			lastMessageSenderId: chatRooms.lastMessageSenderId,
-			lastReadSeq: chatRoomMembers.lastReadSeq,
-			muted: chatRoomMembers.muted,
-		})
-		.from(chatRooms)
-		.innerJoin(chatRoomMembers, eq(chatRoomMembers.roomId, chatRooms.id))
-		.where(and(eq(chatRoomMembers.userId, userId), inArray(chatRooms.kind, ["dm", "bot"])))
-		.orderBy(desc(chatRooms.lastMessageAt))
-		.limit(CHAT_ROOM_SCAN_LIMIT);
+	const rows = await readQuery(
+		db
+			.select({
+				id: chatRooms.id,
+				kind: chatRooms.kind,
+				dmKey: chatRooms.dmKey,
+				narratorId: chatRooms.narratorId,
+				lastMessageAt: chatRooms.lastMessageAt,
+				lastMessagePreview: chatRooms.lastMessagePreview,
+				lastMessageSenderId: chatRooms.lastMessageSenderId,
+				lastReadSeq: chatRoomMembers.lastReadSeq,
+				muted: chatRoomMembers.muted,
+			})
+			.from(chatRooms)
+			.innerJoin(chatRoomMembers, eq(chatRoomMembers.roomId, chatRooms.id))
+			.where(and(eq(chatRoomMembers.userId, userId), inArray(chatRooms.kind, ["dm", "bot"])))
+			.orderBy(desc(chatRooms.lastMessageAt))
+			.limit(CHAT_ROOM_SCAN_LIMIT),
+		{ executionPolicy: "worker-required" },
+	);
 	if (rows.length === 0) return [];
 
 	// DM peers come from the dmKey rather than a second members join: the key already
@@ -1859,16 +1936,22 @@ export async function listConversationRooms(userId: string): Promise<ChatRoomSum
 	}
 	const [peerRows, botRows] = await Promise.all([
 		peerIds.size > 0
-			? db.query.users.findMany({
-					where: inArray(users.id, [...peerIds]),
-					columns: USER_COLUMNS,
-				})
+			? readQuery(
+					db.query.users.findMany({
+						where: inArray(users.id, [...peerIds]),
+						columns: USER_COLUMNS,
+					}),
+					{ executionPolicy: "worker-required" },
+				)
 			: Promise.resolve([]),
 		botIds.size > 0
-			? db.query.narrators.findMany({
-					where: inArray(narrators.id, [...botIds]),
-					columns: BOT_COLUMNS,
-				})
+			? readQuery(
+					db.query.narrators.findMany({
+						where: inArray(narrators.id, [...botIds]),
+						columns: BOT_COLUMNS,
+					}),
+					{ executionPolicy: "worker-required" },
+				)
 			: Promise.resolve([]),
 	]);
 	const peerById = new Map(peerRows.map((row) => [row.id, row]));
@@ -1935,18 +2018,21 @@ export interface ChatUnreadSummary {
  * this and reading a single key out of `byRoom` probes every room for nothing.
  */
 export async function getUnreadSummary(userId: string): Promise<ChatUnreadSummary> {
-	const memberships = await db
-		.select({
-			roomId: chatRooms.id,
-			kind: chatRooms.kind,
-			lastReadSeq: chatRoomMembers.lastReadSeq,
-			muted: chatRoomMembers.muted,
-		})
-		.from(chatRooms)
-		.innerJoin(chatRoomMembers, eq(chatRoomMembers.roomId, chatRooms.id))
-		.where(eq(chatRoomMembers.userId, userId))
-		.orderBy(desc(chatRooms.lastMessageAt))
-		.limit(CHAT_ROOM_SCAN_LIMIT);
+	const memberships = await readQuery(
+		db
+			.select({
+				roomId: chatRooms.id,
+				kind: chatRooms.kind,
+				lastReadSeq: chatRoomMembers.lastReadSeq,
+				muted: chatRoomMembers.muted,
+			})
+			.from(chatRooms)
+			.innerJoin(chatRoomMembers, eq(chatRoomMembers.roomId, chatRooms.id))
+			.where(eq(chatRoomMembers.userId, userId))
+			.orderBy(desc(chatRooms.lastMessageAt))
+			.limit(CHAT_ROOM_SCAN_LIMIT),
+		{ executionPolicy: "worker-required" },
+	);
 	if (memberships.length === 0) return { dmTotal: 0, dmTotalCapped: false, byRoom: {} };
 
 	const unreadByRoom = await probeUnreadBatch(
@@ -2032,10 +2118,13 @@ export async function softDeleteMessage(
 	isAdmin: boolean,
 ): Promise<void> {
 	const access = await assertCanRead(roomId, userId);
-	const message = await db.query.chatMessages.findFirst({
-		where: and(eq(chatMessages.id, messageId), eq(chatMessages.roomId, roomId)),
-		columns: { id: true, senderUserId: true, deletedAt: true },
-	});
+	const message = await readQuery(
+		db.query.chatMessages.findFirst({
+			where: and(eq(chatMessages.id, messageId), eq(chatMessages.roomId, roomId)),
+			columns: { id: true, senderUserId: true, deletedAt: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!message) throw new NotFoundError("Chat message", messageId);
 	if (message.deletedAt) return;
 	if (!isAdmin && message.senderUserId !== userId) {
@@ -2051,10 +2140,13 @@ export async function softDeleteMessage(
 	// Like the body itself, this is NOT recoverable — which is the existing contract
 	// for a chat delete, not a new one introduced here. The rows are read before the
 	// delete so the file removal knows which paths to unlink.
-	const attached = await db.query.chatAttachments.findMany({
-		where: eq(chatAttachments.messageId, messageId),
-		columns: { id: true, roomId: true, storedName: true },
-	});
+	const attached = await readQuery(
+		db.query.chatAttachments.findMany({
+			where: eq(chatAttachments.messageId, messageId),
+			columns: { id: true, roomId: true, storedName: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	const deleted = await db
 		.update(chatMessages)
 		.set({ contentText: "", deletedAt: nowIso() })
@@ -2068,10 +2160,11 @@ export async function softDeleteMessage(
 		narratorId: access.room.narratorId,
 	});
 	if (attached.length > 0) {
-		await db.delete(chatAttachments).where(eq(chatAttachments.messageId, messageId));
-		// After the DB rows are gone: an orphaned file is reclaimable by the cleanup
-		// sweep, whereas a row pointing at a missing file is a broken thumbnail.
-		deleteChatAttachmentFiles(attached);
+		const removed = await db
+			.delete(chatAttachments)
+			.where(eq(chatAttachments.messageId, messageId))
+			.returning({ roomId: chatAttachments.roomId, storedName: chatAttachments.storedName });
+		deleteChatAttachmentFiles(removed);
 	}
 }
 
@@ -2090,24 +2183,29 @@ export async function createChatAttachment(
 	roomId: string,
 	userId: string,
 	file: File,
+	options: { signal?: AbortSignal } = {},
 ): Promise<ChatAttachmentRow> {
+	options.signal?.throwIfAborted();
 	await assertCanPost(roomId, userId);
 
 	// Bound the drafts one user can accumulate in a room. An upload is persisted
 	// before its message exists, so "upload and never send" is reachable; the
 	// cleanup sweep reclaims those eventually, but a write-time bound is what stops
 	// a loop from filling the disk between sweeps.
-	const drafts = await db
-		.select({ id: chatAttachments.id })
-		.from(chatAttachments)
-		.where(
-			and(
-				eq(chatAttachments.roomId, roomId),
-				eq(chatAttachments.uploaderUserId, userId),
-				isNull(chatAttachments.messageId),
-			),
-		)
-		.limit(CHAT_DRAFT_ATTACHMENTS_MAX);
+	const drafts = await readQuery(
+		db
+			.select({ id: chatAttachments.id })
+			.from(chatAttachments)
+			.where(
+				and(
+					eq(chatAttachments.roomId, roomId),
+					eq(chatAttachments.uploaderUserId, userId),
+					isNull(chatAttachments.messageId),
+				),
+			)
+			.limit(CHAT_DRAFT_ATTACHMENTS_MAX),
+		{ executionPolicy: "worker-required", signal: options.signal },
+	);
 	if (drafts.length >= CHAT_DRAFT_ATTACHMENTS_MAX) {
 		throw new ValidationError(
 			"Too many pending attachments. Send or remove some before uploading more.",
@@ -2117,26 +2215,65 @@ export async function createChatAttachment(
 	const saved = await saveChatAttachment(roomId, file);
 	const id = generateId();
 	try {
-		await db.insert(chatAttachments).values({
-			id,
-			roomId,
-			messageId: null,
-			uploaderUserId: userId,
-			kind: saved.kind,
-			filename: saved.filename,
-			mediaType: saved.mediaType,
-			sizeBytes: saved.sizeBytes,
-			width: saved.width ?? null,
-			height: saved.height ?? null,
-			storedName: saved.storedName,
-			createdAt: nowIso(),
-			claimedAt: null,
-		});
-	} catch (error) {
-		// The file is already on disk; without this it would be unreferenced from the
-		// moment the insert failed, and only the periodic sweep would notice.
-		deleteChatAttachmentFiles([{ roomId, storedName: saved.storedName }]);
-		throw error;
+		let publicationAttempted = false;
+		try {
+			options.signal?.throwIfAborted();
+			await assertCanPost(roomId, userId);
+			options.signal?.throwIfAborted();
+			publicationAttempted = true;
+			await db.insert(chatAttachments).values({
+				id,
+				roomId,
+				messageId: null,
+				uploaderUserId: userId,
+				kind: saved.kind,
+				filename: saved.filename,
+				mediaType: saved.mediaType,
+				sizeBytes: saved.sizeBytes,
+				width: saved.width ?? null,
+				height: saved.height ?? null,
+				storedName: saved.storedName,
+				createdAt: nowIso(),
+				claimedAt: null,
+			});
+		} catch (error) {
+			let safeToRemove = !publicationAttempted;
+			if (publicationAttempted) {
+				try {
+					const current = await readQuery(
+						db.query.chatAttachments.findFirst({
+							where: and(
+								eq(chatAttachments.roomId, roomId),
+								eq(chatAttachments.storedName, saved.storedName),
+							),
+							columns: { id: true },
+						}),
+						{ executionPolicy: "worker-required", signal: options.signal },
+					);
+					safeToRemove = !current;
+				} catch (verificationError) {
+					logger.warn("Failed to verify attachment publication during rollback", {
+						roomId,
+						attachmentId: id,
+						error: String(verificationError),
+					});
+				}
+			}
+			if (safeToRemove) {
+				try {
+					deleteChatAttachmentFiles([{ roomId, storedName: saved.storedName }]);
+				} catch (cleanupError) {
+					logger.warn("Failed to clean up unpublished chat attachment", {
+						roomId,
+						attachmentId: id,
+						error: String(cleanupError),
+					});
+				}
+			}
+			throw error;
+		}
+	} finally {
+		finishChatAttachmentPublication(roomId, saved.storedName);
 	}
 
 	return {
@@ -2172,9 +2309,12 @@ export async function loadChatAttachmentForRead(
 	attachmentId: string,
 	userId: string,
 ): Promise<ChatAttachmentReadTarget> {
-	const row = await db.query.chatAttachments.findFirst({
-		where: eq(chatAttachments.id, attachmentId),
-	});
+	const row = await readQuery(
+		db.query.chatAttachments.findFirst({
+			where: eq(chatAttachments.id, attachmentId),
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!row) throw new NotFoundError("Chat attachment", attachmentId);
 	await assertCanRead(row.roomId, userId);
 
@@ -2196,9 +2336,12 @@ export async function loadChatAttachmentForRead(
  * the message's soft delete, not a separate operation.
  */
 export async function discardChatAttachment(attachmentId: string, userId: string): Promise<void> {
-	const row = await db.query.chatAttachments.findFirst({
-		where: eq(chatAttachments.id, attachmentId),
-	});
+	const row = await readQuery(
+		db.query.chatAttachments.findFirst({
+			where: eq(chatAttachments.id, attachmentId),
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!row) throw new NotFoundError("Chat attachment", attachmentId);
 	await assertCanRead(row.roomId, userId);
 	if (row.uploaderUserId !== userId) {
@@ -2207,8 +2350,19 @@ export async function discardChatAttachment(attachmentId: string, userId: string
 	if (row.messageId) {
 		throw new ValidationError("This attachment already belongs to a sent message");
 	}
-	await db.delete(chatAttachments).where(eq(chatAttachments.id, attachmentId));
-	deleteChatAttachmentFiles([{ roomId: row.roomId, storedName: row.storedName }]);
+	const removed = await db
+		.delete(chatAttachments)
+		.where(
+			and(
+				eq(chatAttachments.id, attachmentId),
+				eq(chatAttachments.roomId, row.roomId),
+				eq(chatAttachments.uploaderUserId, userId),
+				eq(chatAttachments.storedName, row.storedName),
+				isNull(chatAttachments.messageId),
+			),
+		)
+		.returning({ roomId: chatAttachments.roomId, storedName: chatAttachments.storedName });
+	deleteChatAttachmentFiles(removed);
 }
 
 export interface MaterializeAttachmentsInput {
@@ -2251,15 +2405,21 @@ export async function materializeAttachmentsForNarrator(
 		);
 	}
 
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, input.narratorId),
-		columns: { ...NARRATOR_ACL_COLUMNS, cwd: true },
-	});
+	const narrator = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, input.narratorId),
+			columns: { ...NARRATOR_ACL_COLUMNS, cwd: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!narrator) throw new NotFoundError("Narrator", input.narratorId);
-	const user = await db.query.users.findFirst({
-		where: eq(users.id, input.userId),
-		columns: { role: true },
-	});
+	const user = await readQuery(
+		db.query.users.findFirst({
+			where: eq(users.id, input.userId),
+			columns: { role: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (
 		!(await canWriteNarrator(narrator, {
 			userId: input.userId,
@@ -2272,17 +2432,20 @@ export async function materializeAttachmentsForNarrator(
 		throw new ValidationError("This narrator has no working directory to attach files to");
 	}
 
-	const rows = await db.query.chatAttachments.findMany({
-		where: and(
-			inArray(chatAttachments.id, attachmentIds),
-			eq(chatAttachments.roomId, input.roomId),
-			// Only attachments belonging to a POSTED message may be forwarded: a draft
-			// is not yet part of the conversation, so forwarding one would leak content
-			// the room has never seen.
-			isNotNull(chatAttachments.messageId),
-		),
-		orderBy: [asc(chatAttachments.createdAt)],
-	});
+	const rows = await readQuery(
+		db.query.chatAttachments.findMany({
+			where: and(
+				inArray(chatAttachments.id, attachmentIds),
+				eq(chatAttachments.roomId, input.roomId),
+				// Only attachments belonging to a POSTED message may be forwarded: a draft
+				// is not yet part of the conversation, so forwarding one would leak content
+				// the room has never seen.
+				isNotNull(chatAttachments.messageId),
+			),
+			orderBy: [asc(chatAttachments.createdAt)],
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (rows.length === 0) return { files: [], hint: "" };
 
 	const files: TextFileRef[] = [];
@@ -2329,14 +2492,17 @@ export async function listDirectory(
 	query?: string,
 ): Promise<ChatUserSnapshot[]> {
 	const trimmed = query?.trim();
-	const rows = await db.query.users.findMany({
-		where: trimmed
-			? sql`${users.username} LIKE ${`%${escapeLikePattern(trimmed)}%`} ESCAPE '\\'`
-			: undefined,
-		columns: USER_COLUMNS,
-		orderBy: [asc(users.username)],
-		limit: CHAT_DIRECTORY_LIMIT,
-	});
+	const rows = await readQuery(
+		db.query.users.findMany({
+			where: trimmed
+				? sql`${users.username} LIKE ${`%${escapeLikePattern(trimmed)}%`} ESCAPE '\\'`
+				: undefined,
+			columns: USER_COLUMNS,
+			orderBy: [asc(users.username)],
+			limit: CHAT_DIRECTORY_LIMIT,
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	return rows
 		.filter((row) => row.id !== currentUserId)
 		.map((row) => toUserSnapshot(row))
@@ -2438,11 +2604,14 @@ export async function summarizeMessages(input: SummarizeInput): Promise<{ summar
 	const ids = input.messageIds.slice(0, CHAT_SUMMARIZE_MAX_MESSAGES);
 	if (ids.length === 0) throw new ValidationError("No messages selected");
 
-	const rows = await db.query.chatMessages.findMany({
-		where: and(eq(chatMessages.roomId, input.roomId), inArray(chatMessages.id, ids)),
-		orderBy: [asc(chatMessages.seq)],
-		with: { sender: { columns: { username: true } }, senderNarrator: { columns: BOT_COLUMNS } },
-	});
+	const rows = await readQuery(
+		db.query.chatMessages.findMany({
+			where: and(eq(chatMessages.roomId, input.roomId), inArray(chatMessages.id, ids)),
+			orderBy: [asc(chatMessages.seq)],
+			with: { sender: { columns: { username: true } }, senderNarrator: { columns: BOT_COLUMNS } },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (rows.length === 0) throw new ValidationError("Selected messages are not in this room");
 
 	// Reply authors for the selection, one bounded query (the selection is capped at
@@ -2527,17 +2696,20 @@ export async function listRoomUnreadForFanout(
 	roomId: string,
 	exclude: ReadonlySet<string>,
 ): Promise<Array<{ userId: string; unread: number }>> {
-	const members = await db
-		.select({
-			userId: chatRoomMembers.userId,
-			lastReadSeq: chatRoomMembers.lastReadSeq,
-			muted: chatRoomMembers.muted,
-		})
-		.from(chatRoomMembers)
-		.where(eq(chatRoomMembers.roomId, roomId))
-		// Least-caught-up first, so the cap drops the members with the least to be told.
-		.orderBy(asc(chatRoomMembers.lastReadSeq))
-		.limit(CHAT_MEMBER_FANOUT_LIMIT);
+	const members = await readQuery(
+		db
+			.select({
+				userId: chatRoomMembers.userId,
+				lastReadSeq: chatRoomMembers.lastReadSeq,
+				muted: chatRoomMembers.muted,
+			})
+			.from(chatRoomMembers)
+			.where(eq(chatRoomMembers.roomId, roomId))
+			// Least-caught-up first, so the cap drops the members with the least to be told.
+			.orderBy(asc(chatRoomMembers.lastReadSeq))
+			.limit(CHAT_MEMBER_FANOUT_LIMIT),
+		{ executionPolicy: "worker-required" },
+	);
 
 	const recipients = members.filter((member) => !member.muted && !exclude.has(member.userId));
 	if (recipients.length === 0) return [];
@@ -2566,7 +2738,11 @@ export async function listRoomUnreadForFanout(
 					) as "unread"`,
 		);
 		counts.push(
-			...(await db.all<{ userId: string; unread: number }>(sql.join(parts, sql` union all `))),
+			...(await readDbAll<{ userId: string; unread: number }>(
+				db,
+				sql.join(parts, sql` union all `),
+				{ executionPolicy: "worker-required" },
+			)),
 		);
 	}
 	return counts;

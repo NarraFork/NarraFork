@@ -1,7 +1,8 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, max } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../db";
 import { userFavoriteDirectories } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import {
@@ -15,10 +16,13 @@ export const favoriteRoutes = new Hono();
 // List current user's favorite directories
 favoriteRoutes.get("/", async (c) => {
 	const userId = c.get("user").sub;
-	const favorites = await db.query.userFavoriteDirectories.findMany({
-		where: eq(userFavoriteDirectories.userId, userId),
-		orderBy: (f, { asc }) => [asc(f.sortOrder), asc(f.createdAt)],
-	});
+	const favorites = await readQuery(
+		db.query.userFavoriteDirectories.findMany({
+			where: eq(userFavoriteDirectories.userId, userId),
+			orderBy: (f, { asc }) => [asc(f.sortOrder), asc(f.createdAt)],
+		}),
+		{ executionPolicy: "worker-required", signal: c.req.raw.signal },
+	);
 	return c.json(favorites);
 });
 
@@ -28,32 +32,42 @@ favoriteRoutes.post("/", async (c) => {
 	const parsed = createFavoriteDirectorySchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 
-	const existing = await db.query.userFavoriteDirectories.findFirst({
-		where: and(
-			eq(userFavoriteDirectories.userId, userId),
-			eq(userFavoriteDirectories.path, parsed.data.path),
-		),
-	});
-	if (existing) throw new ValidationError("Directory already in favorites");
-
-	const all = await db.query.userFavoriteDirectories.findMany({
-		where: eq(userFavoriteDirectories.userId, userId),
-	});
-	const maxOrder = all.reduce((max, f) => Math.max(max, f.sortOrder), -1);
-
 	const id = generateId();
 	const now = new Date().toISOString();
-	const [fav] = await db
-		.insert(userFavoriteDirectories)
-		.values({
-			id,
-			userId,
-			path: parsed.data.path,
-			label: parsed.data.label ?? null,
-			sortOrder: maxOrder + 1,
-			createdAt: now,
-		})
-		.returning();
+	// Duplicate check, next position and insert decide together: two concurrent adds of
+	// the same path must not both pass the check.
+	const fav = db.transaction((tx) => {
+		const existing = tx
+			.select({ id: userFavoriteDirectories.id })
+			.from(userFavoriteDirectories)
+			.where(
+				and(
+					eq(userFavoriteDirectories.userId, userId),
+					eq(userFavoriteDirectories.path, parsed.data.path),
+				),
+			)
+			.limit(1)
+			.get();
+		if (existing) throw new ValidationError("Directory already in favorites");
+		const maxOrder =
+			tx
+				.select({ value: max(userFavoriteDirectories.sortOrder) })
+				.from(userFavoriteDirectories)
+				.where(eq(userFavoriteDirectories.userId, userId))
+				.get()?.value ?? -1;
+		return tx
+			.insert(userFavoriteDirectories)
+			.values({
+				id,
+				userId,
+				path: parsed.data.path,
+				label: parsed.data.label ?? null,
+				sortOrder: maxOrder + 1,
+				createdAt: now,
+			})
+			.returning()
+			.get();
+	});
 
 	return c.json(fav, 201);
 });
@@ -65,15 +79,13 @@ favoriteRoutes.patch("/:id", async (c) => {
 	const parsed = updateFavoriteDirectorySchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 
-	const fav = await db.query.userFavoriteDirectories.findFirst({
-		where: and(eq(userFavoriteDirectories.id, id), eq(userFavoriteDirectories.userId, userId)),
-	});
-	if (!fav) throw new NotFoundError("Favorite directory", id);
-
-	await db
+	// Ownership is part of the write predicate, so no separate read is needed.
+	const updated = await db
 		.update(userFavoriteDirectories)
 		.set(parsed.data)
-		.where(eq(userFavoriteDirectories.id, id));
+		.where(and(eq(userFavoriteDirectories.id, id), eq(userFavoriteDirectories.userId, userId)))
+		.returning({ id: userFavoriteDirectories.id });
+	if (!updated.length) throw new NotFoundError("Favorite directory", id);
 
 	return c.json({ ok: true });
 });
@@ -83,12 +95,11 @@ favoriteRoutes.delete("/:id", async (c) => {
 	const userId = c.get("user").sub;
 	const id = c.req.param("id");
 
-	const fav = await db.query.userFavoriteDirectories.findFirst({
-		where: and(eq(userFavoriteDirectories.id, id), eq(userFavoriteDirectories.userId, userId)),
-	});
-	if (!fav) throw new NotFoundError("Favorite directory", id);
-
-	await db.delete(userFavoriteDirectories).where(eq(userFavoriteDirectories.id, id));
+	const deleted = await db
+		.delete(userFavoriteDirectories)
+		.where(and(eq(userFavoriteDirectories.id, id), eq(userFavoriteDirectories.userId, userId)))
+		.returning({ id: userFavoriteDirectories.id });
+	if (!deleted.length) throw new NotFoundError("Favorite directory", id);
 
 	return c.json({ ok: true });
 });

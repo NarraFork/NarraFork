@@ -116,6 +116,7 @@ async function createIdentityQueryDependencies() {
 	const [
 		{ and, asc, desc, eq, isNotNull },
 		{ db },
+		{ readQuery },
 		{
 			folderGitIdentityBindings,
 			narratorGitIdentityBindings,
@@ -123,9 +124,15 @@ async function createIdentityQueryDependencies() {
 			userGitIdentities,
 			userRecentTabs,
 		},
-	] = await Promise.all([import("drizzle-orm"), import("../db"), import("../db/schema")]);
+	] = await Promise.all([
+		import("drizzle-orm"),
+		import("../db"),
+		import("../db/worker-read"),
+		import("../db/schema"),
+	]);
 	return {
 		db,
+		readQuery,
 		eq,
 		and,
 		asc,
@@ -333,17 +340,20 @@ async function cachedNarratorFolder(narratorId: string, userId: string): Promise
 
 /** The default row (see {@link resolveGitIdentityForUser} for what "default" means). */
 async function fetchDefaultIdentity(userId: string): Promise<GitIdentity | null> {
-	const { asc, db, desc, eq, userGitIdentities } = await loadIdentityQueryDependencies();
-	const rows = await db
-		.select({ name: userGitIdentities.name, email: userGitIdentities.email })
-		.from(userGitIdentities)
-		.where(eq(userGitIdentities.userId, userId))
-		.orderBy(
-			desc(userGitIdentities.isDefault),
-			asc(userGitIdentities.createdAt),
-			asc(userGitIdentities.id),
-		)
-		.limit(1);
+	const { asc, db, readQuery, desc, eq, userGitIdentities } = await loadIdentityQueryDependencies();
+	const rows = await readQuery(
+		db
+			.select({ name: userGitIdentities.name, email: userGitIdentities.email })
+			.from(userGitIdentities)
+			.where(eq(userGitIdentities.userId, userId))
+			.orderBy(
+				desc(userGitIdentities.isDefault),
+				asc(userGitIdentities.createdAt),
+				asc(userGitIdentities.id),
+			)
+			.limit(1),
+		{ executionPolicy: "worker-required", maxRows: 1 },
+	);
 	return toIdentity(rows[0]);
 }
 
@@ -352,43 +362,52 @@ async function fetchPickedIdentity(
 	narratorId: string,
 	userId: string,
 ): Promise<GitIdentity | null> {
-	const { and, db, eq, narratorGitIdentityBindings, userGitIdentities } =
+	const { and, db, readQuery, eq, narratorGitIdentityBindings, userGitIdentities } =
 		await loadIdentityQueryDependencies();
-	const rows = await db
-		.select({ name: userGitIdentities.name, email: userGitIdentities.email })
-		.from(narratorGitIdentityBindings)
-		.innerJoin(userGitIdentities, eq(userGitIdentities.id, narratorGitIdentityBindings.identityId))
-		.where(
-			and(
-				eq(narratorGitIdentityBindings.narratorId, narratorId),
-				eq(narratorGitIdentityBindings.userId, userId),
-			),
-		)
-		.limit(1);
+	const rows = await readQuery(
+		db
+			.select({ name: userGitIdentities.name, email: userGitIdentities.email })
+			.from(narratorGitIdentityBindings)
+			.innerJoin(
+				userGitIdentities,
+				eq(userGitIdentities.id, narratorGitIdentityBindings.identityId),
+			)
+			.where(
+				and(
+					eq(narratorGitIdentityBindings.narratorId, narratorId),
+					eq(narratorGitIdentityBindings.userId, userId),
+				),
+			)
+			.limit(1),
+		{ executionPolicy: "worker-required", maxRows: 1 },
+	);
 	return toIdentity(rows[0]);
 }
 
 /** The identity one user picked for one sidebar folder, or null when they made no pick. */
 async function fetchFolderPick(folderId: string, userId: string): Promise<GitIdentity | null> {
-	const { and, db, eq, folderGitIdentityBindings, userGitIdentities } =
+	const { and, db, readQuery, eq, folderGitIdentityBindings, userGitIdentities } =
 		await loadIdentityQueryDependencies();
-	const rows = await db
-		.select({ name: userGitIdentities.name, email: userGitIdentities.email })
-		.from(folderGitIdentityBindings)
-		.innerJoin(
-			userGitIdentities,
-			and(
-				eq(userGitIdentities.id, folderGitIdentityBindings.identityId),
-				eq(userGitIdentities.userId, userId),
-			),
-		)
-		.where(
-			and(
-				eq(folderGitIdentityBindings.folderId, folderId),
-				eq(folderGitIdentityBindings.userId, userId),
-			),
-		)
-		.limit(1);
+	const rows = await readQuery(
+		db
+			.select({ name: userGitIdentities.name, email: userGitIdentities.email })
+			.from(folderGitIdentityBindings)
+			.innerJoin(
+				userGitIdentities,
+				and(
+					eq(userGitIdentities.id, folderGitIdentityBindings.identityId),
+					eq(userGitIdentities.userId, userId),
+				),
+			)
+			.where(
+				and(
+					eq(folderGitIdentityBindings.folderId, folderId),
+					eq(folderGitIdentityBindings.userId, userId),
+				),
+			)
+			.limit(1),
+		{ executionPolicy: "worker-required", maxRows: 1 },
+	);
 	return toIdentity(rows[0]);
 }
 
@@ -399,19 +418,23 @@ async function fetchFolderPick(folderId: string, userId: string): Promise<GitIde
  * inherited identity matches the folder the reader sees first.
  */
 async function fetchNarratorFolderId(narratorId: string, userId: string): Promise<string | null> {
-	const { and, asc, db, eq, isNotNull, userRecentTabs } = await loadIdentityQueryDependencies();
-	const rows = await db
-		.select({ folderId: userRecentTabs.folderId })
-		.from(userRecentTabs)
-		.where(
-			and(
-				eq(userRecentTabs.userId, userId),
-				eq(userRecentTabs.representedNarratorId, narratorId),
-				isNotNull(userRecentTabs.folderId),
-			),
-		)
-		.orderBy(asc(userRecentTabs.sortOrder))
-		.limit(1);
+	const { and, asc, db, readQuery, eq, isNotNull, userRecentTabs } =
+		await loadIdentityQueryDependencies();
+	const rows = await readQuery(
+		db
+			.select({ folderId: userRecentTabs.folderId })
+			.from(userRecentTabs)
+			.where(
+				and(
+					eq(userRecentTabs.userId, userId),
+					eq(userRecentTabs.representedNarratorId, narratorId),
+					isNotNull(userRecentTabs.folderId),
+				),
+			)
+			.orderBy(asc(userRecentTabs.sortOrder))
+			.limit(1),
+		{ executionPolicy: "worker-required", maxRows: 1 },
+	);
 	return rows[0]?.folderId ?? null;
 }
 
@@ -457,11 +480,14 @@ export async function resolveNarratorGitIdentityEnv(input: {
 /** The owner of a narrator, used only as the no-triggering-user fallback. */
 async function resolveNarratorOwnerUserId(narratorId: string): Promise<string | null> {
 	try {
-		const { db, eq, narrators } = await loadIdentityQueryDependencies();
-		const row = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { ownerUserId: true },
-		});
+		const { db, readQuery, eq, narrators } = await loadIdentityQueryDependencies();
+		const row = await readQuery(
+			db.query.narrators.findFirst({
+				where: eq(narrators.id, narratorId),
+				columns: { ownerUserId: true },
+			}),
+			{ executionPolicy: "worker-required", maxRows: 1 },
+		);
 		return row?.ownerUserId ?? null;
 	} catch {
 		return null;

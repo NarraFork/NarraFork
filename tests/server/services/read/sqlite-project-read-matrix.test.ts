@@ -20,11 +20,15 @@
 import { afterAll, beforeAll, describe, expect, it, mock } from "bun:test";
 import type { BunSQLiteDatabase } from "drizzle-orm/bun-sqlite";
 import * as schema from "../../../../server/db/schema";
+import {
+	closeRuntimeTestDb,
+	getRuntimeTestDb,
+} from "../../../../server/services/__tests__/agent-runtime-test-database";
 import type { ProjectPrincipal } from "../../../../server/services/project-acl";
 // Constants and pure helpers only; this module does not import `server/db`, so it needs no
 // deferral behind the mock below.
 import { READ_LIMITS } from "../../../../server/services/read/project-read-adapter";
-import { cleanDb, getTestDb } from "../../../setup";
+import { cleanDb } from "../../../setup";
 import { type FixtureTable, seedFixtures } from "./read-fixture-seed";
 import {
 	BULK_PROJECT_COUNT,
@@ -37,7 +41,9 @@ import {
 	USER,
 } from "./read-fixtures";
 
-const { db, sqlite } = getTestDb();
+// Project reads run on the database Worker (file-backed WAL database).
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
 const realDbModule = { ...(await import("../../../../server/db")) };
 mock.module("../../../../server/db", () => ({ db, sqlite }));
 
@@ -62,11 +68,11 @@ beforeAll(async () => {
 	});
 });
 
-afterAll(() => {
+afterAll(async () => {
 	mock.module("../../../../server/db", () => realDbModule);
 	mock.restore();
 	cleanDb(sqlite);
-	sqlite.close();
+	await closeRuntimeTestDb(sqlite);
 });
 
 function principal(userId: string, isAdmin = false): ProjectPrincipal {

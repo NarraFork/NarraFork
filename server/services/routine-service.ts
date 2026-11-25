@@ -1,3 +1,4 @@
+import { readQuery } from "../db/worker-read";
 /**
  * Routine service — manages enabling/disabling built-in routines.
  *
@@ -25,6 +26,7 @@ import {
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { projects, userPreferences } from "../db/schema";
+import { userPreferencesLock } from "../lib/async-mutex";
 import {
 	type BuiltinRoutine,
 	getAllBuiltinRoutines,
@@ -288,6 +290,8 @@ export async function setToolRoutineModeForProject(
 ): Promise<void> {
 	requireToolRoutine(routineId);
 
+	// chapterSettings is read-merge-written below: keep the read and the write in one
+	// turn (no Worker hop) so a concurrent project settings save is never overwritten.
 	const project = await db.query.projects.findFirst({
 		where: eq(projects.id, projectId),
 		columns: { id: true, chapterSettings: true },
@@ -319,6 +323,8 @@ export async function enableRoutineForProject(routineId: string, projectId: stri
 		return;
 	}
 
+	// chapterSettings is read-merge-written below: keep the read and the write in one
+	// turn (no Worker hop) so a concurrent project settings save is never overwritten.
 	const project = await db.query.projects.findFirst({
 		where: eq(projects.id, projectId),
 		columns: { id: true, gitPath: true, chapterSettings: true },
@@ -362,6 +368,8 @@ export async function disableRoutineForProject(
 		return;
 	}
 
+	// chapterSettings is read-merge-written below: keep the read and the write in one
+	// turn (no Worker hop) so a concurrent project settings save is never overwritten.
 	const project = await db.query.projects.findFirst({
 		where: eq(projects.id, projectId),
 		columns: { id: true, gitPath: true, chapterSettings: true },
@@ -404,6 +412,8 @@ export async function resetRoutineForProject(routineId: string, projectId: strin
 		return;
 	}
 
+	// chapterSettings is read-merge-written below: keep the read and the write in one
+	// turn (no Worker hop) so a concurrent project settings save is never overwritten.
 	const project = await db.query.projects.findFirst({
 		where: eq(projects.id, projectId),
 		columns: { id: true, gitPath: true, chapterSettings: true },
@@ -501,11 +511,23 @@ function buildCommandFromRoutine(routine: BuiltinRoutine): Command {
 	};
 }
 
+/**
+ * Read-modify-write of the user's command list. It shares the preferences lock with every
+ * other preferences writer, so a concurrent settings save cannot be overwritten by the
+ * list read on the Worker before it.
+ */
 async function addGlobalCommand(routine: BuiltinRoutine, userId: string): Promise<void> {
-	const pref = await db.query.userPreferences.findFirst({
-		where: eq(userPreferences.userId, userId),
-		columns: { commands: true },
-	});
+	await userPreferencesLock.acquire(userId, () => addGlobalCommandLocked(routine, userId));
+}
+
+async function addGlobalCommandLocked(routine: BuiltinRoutine, userId: string): Promise<void> {
+	const pref = await readQuery(
+		db.query.userPreferences.findFirst({
+			where: eq(userPreferences.userId, userId),
+			columns: { commands: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 
 	let cmds: Command[] = [];
 	if (pref?.commands) {
@@ -533,10 +555,17 @@ async function addGlobalCommand(routine: BuiltinRoutine, userId: string): Promis
 }
 
 async function removeGlobalCommand(routine: BuiltinRoutine, userId: string): Promise<void> {
-	const pref = await db.query.userPreferences.findFirst({
-		where: eq(userPreferences.userId, userId),
-		columns: { commands: true },
-	});
+	await userPreferencesLock.acquire(userId, () => removeGlobalCommandLocked(routine, userId));
+}
+
+async function removeGlobalCommandLocked(routine: BuiltinRoutine, userId: string): Promise<void> {
+	const pref = await readQuery(
+		db.query.userPreferences.findFirst({
+			where: eq(userPreferences.userId, userId),
+			columns: { commands: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!pref?.commands) return;
 
 	let cmds: Command[] = [];

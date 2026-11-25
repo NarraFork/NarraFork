@@ -1777,11 +1777,14 @@ export interface PlannedUpdateCheckpointHooks {
 async function listActiveToolCallIds(
 	snapshot: Pick<PlannedUpdateRecoverySnapshot, "narrators">,
 ): Promise<string[]> {
-	const rows = await db
-		.select({ id: narratorToolCalls.id, narratorId: narratorToolCalls.narratorId })
-		.from(narratorToolCalls)
-		.where(inArray(narratorToolCalls.status, ["initializing", "pending", "running"]))
-		.limit(CHECKPOINT_ACTIVE_TOOL_LIMIT);
+	const rows = await readQuery(
+		db
+			.select({ id: narratorToolCalls.id, narratorId: narratorToolCalls.narratorId })
+			.from(narratorToolCalls)
+			.where(inArray(narratorToolCalls.status, ["initializing", "pending", "running"]))
+			.limit(CHECKPOINT_ACTIVE_TOOL_LIMIT),
+		{ executionPolicy: "worker-required" },
+	);
 	if (rows.length >= CHECKPOINT_ACTIVE_TOOL_LIMIT) {
 		throw new Error(
 			`Planned-update checkpoint exceeds the ${CHECKPOINT_ACTIVE_TOOL_LIMIT - 1}-row safety limit`,
@@ -1862,7 +1865,7 @@ export async function checkpointPreparedUpdateFence(
 									targets.slice(offset, offset + 100).map((target) => target.narratorId),
 								),
 							),
-						{ maxRows: 100 },
+						{ executionPolicy: "worker-required", maxRows: 100 },
 					);
 					for (const row of rows)
 						if (row.status === "working" || row.status === "waiting")

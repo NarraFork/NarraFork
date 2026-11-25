@@ -46,6 +46,8 @@ import {
 	setNarratorVisibility,
 	setNarratorWriteAudience,
 } from "../narrator-sharing";
+// Rejections settle natively before matching: Bun's `.rejects` stalls on a reused read Worker.
+import { captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 const TAG = Date.now();
 
@@ -247,12 +249,12 @@ describe("the nesting rule at the API boundary", () => {
 			writeAudience: "owner",
 			indexedProjectId: projectId,
 		});
-		await expect(setNarratorWriteAudience(priv, "project", asUser(owner))).rejects.toThrow(
-			/visible/i,
-		);
-		await expect(setNarratorWriteAudience(priv, "public", asUser(owner))).rejects.toThrow(
-			/visible/i,
-		);
+		expect(
+			await captureWorkerRejectionThrower(setNarratorWriteAudience(priv, "project", asUser(owner))),
+		).toThrow(/visible/i);
+		expect(
+			await captureWorkerRejectionThrower(setNarratorWriteAudience(priv, "public", asUser(owner))),
+		).toThrow(/visible/i);
 		// And nothing moved.
 		const after = await getNarratorAccess(priv, asUser(owner));
 		expect({ v: after.visibility, w: after.writeAudience }).toEqual({ v: "private", w: "owner" });
@@ -262,9 +264,9 @@ describe("the nesting rule at the API boundary", () => {
 			writeAudience: "owner",
 			indexedProjectId: projectId,
 		});
-		await expect(setNarratorWriteAudience(proj, "public", asUser(owner))).rejects.toThrow(
-			/visible/i,
-		);
+		expect(
+			await captureWorkerRejectionThrower(setNarratorWriteAudience(proj, "public", asUser(owner))),
+		).toThrow(/visible/i);
 	});
 
 	test("the refusal names the control that has to change first", async () => {
@@ -273,9 +275,9 @@ describe("the nesting rule at the API boundary", () => {
 			writeAudience: "owner",
 			indexedProjectId: projectId,
 		});
-		await expect(setNarratorWriteAudience(id, "public", asUser(owner))).rejects.toThrow(
-			/set visibility to everyone/i,
-		);
+		expect(
+			await captureWorkerRejectionThrower(setNarratorWriteAudience(id, "public", asUser(owner))),
+		).toThrow(/set visibility to everyone/i);
 	});
 });
 

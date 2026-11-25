@@ -1,11 +1,17 @@
 import { afterAll, afterEach, describe, expect, it, mock } from "bun:test";
 import { Hono } from "hono";
 import { narrators } from "../../../server/db/schema";
+import {
+	closeRuntimeTestDb,
+	getRuntimeTestDb,
+} from "../../../server/services/__tests__/agent-runtime-test-database";
 import type { AuthSessionStore } from "../../../server/services/auth/session-store";
 import { authMfaStore, authSessionStore, setAuthStores } from "../../../server/services/auth/store";
-import { cleanDb, getTestDb } from "../../setup";
+import { cleanDb } from "../../setup";
 
-const { db, sqlite } = getTestDb();
+// Diagnostics read on the database Worker, which needs a file-backed WAL database.
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
 
 // Snapshot real modules before mocking so afterAll can re-point each specifier
 // back. Bun's mock.module is process-wide and mock.restore() does NOT undo it.
@@ -60,7 +66,8 @@ const NOW = "2025-01-01T00:00:00.000Z";
 
 afterEach(() => cleanDb(sqlite));
 
-afterAll(() => {
+afterAll(async () => {
+	await closeRuntimeTestDb(sqlite);
 	setAuthStores(undefined);
 	for (const [specifier, factory] of Object.entries(realAdminModules)) {
 		mock.module(specifier, factory);

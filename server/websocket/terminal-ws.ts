@@ -126,6 +126,11 @@ function subscribeToTerminal(ws: TerminalWS, terminalId: string) {
 					// noop
 				}
 			}
+		})
+		.catch((error: unknown) => {
+			// Fire-and-forget replay: a refused attach, a vanished terminal or a closed read
+			// must not become an unhandled rejection. The client just gets no scrollback.
+			logger.debug("Terminal scrollback replay skipped", { terminalId, error: String(error) });
 		});
 }
 
