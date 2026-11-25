@@ -330,9 +330,7 @@ describe("the drawer", () => {
 		expect(diff.body.truncated).toBe(false);
 		expect(diff.body.text).toContain("+export const tz = user.timezone;");
 		// Nothing the branch did not change, and nothing outside the repository.
-		expect((await call(READER, teamPath(`work/${item.id}/diff?path=README.md`))).status).toBe(
-			404,
-		);
+		expect((await call(READER, teamPath(`work/${item.id}/diff?path=README.md`))).status).toBe(404);
 		expect(
 			(await call(READER, teamPath(`work/${item.id}/diff?path=../../etc/passwd`))).status,
 		).toBe(404);
@@ -360,9 +358,7 @@ describe("return with a reason", () => {
 		resetWorkStatCacheForTests();
 		const { item } = await readyItem("Return me", { "src/r.ts": "r\n" });
 		const path = teamPath(`work/${item.id}/return`);
-		expect((await call(READER, path, { method: "POST", body: { reason: "no" } })).status).toBe(
-			403,
-		);
+		expect((await call(READER, path, { method: "POST", body: { reason: "no" } })).status).toBe(403);
 		expect((await call(OUTSIDER, path, { method: "POST", body: { reason: "no" } })).status).toBe(
 			404,
 		);
@@ -418,7 +414,11 @@ describe("return with a reason", () => {
 		expect(again.status).toBe(409);
 		expect(again.body.code).toBe("TEAM_WORK_ITEM_NOT_RETURNABLE");
 		await expect(
-			work.markReady({ coordinatorId: teamId, itemId: item.id, actor: { kind: "agent", id: teamId } }),
+			work.markReady({
+				coordinatorId: teamId,
+				itemId: item.id,
+				actor: { kind: "agent", id: teamId },
+			}),
 		).rejects.toMatchObject({ code: "TEAM_WORK_ITEM_NOT_REVIEWED" });
 	});
 
@@ -479,8 +479,8 @@ describe("board and summary", () => {
 		const summary = await call(READER, teamPath("summary"));
 		expect(summary.body.coordinatorMessageCount).toBe(0);
 		expect(summary.body.coordinatorStopReason).toBeNull();
-		expect(
-			db.select().from(teamWorkItems).where(eq(teamWorkItems.id, item.id)).get()?.state,
-		).toBe("in_progress");
+		expect(db.select().from(teamWorkItems).where(eq(teamWorkItems.id, item.id)).get()?.state).toBe(
+			"in_progress",
+		);
 	});
 });
