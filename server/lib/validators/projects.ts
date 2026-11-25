@@ -1,3 +1,4 @@
+import { teamBaseBranchSchema } from "@shared/project-team-draft";
 import {
 	TEAM_EXCLUSIVE_PATH_MAX_LENGTH,
 	TEAM_EXCLUSIVE_PATHS_MAX,
@@ -101,7 +102,8 @@ export const updateProjectSchema = z.object({
 	description: z.string().max(2000).optional(),
 	gitPath: z.string().trim().min(1).max(4096).optional(),
 	status: z.enum(["active", "archived"]).optional(),
-	defaultBranch: gitBranchName.optional(),
+	/** New teams' base branch: the same rules as a team's own (`teamBaseBranchSchema`). */
+	defaultBranch: teamBaseBranchSchema.optional(),
 	chapterSettings: projectChapterSettingsSchema.optional(),
 });
 

@@ -14,7 +14,7 @@ import { narratorWorktreeResources, teamWorkEvents, teamWorkItems } from "../../
 import { generateId } from "../../../lib/id";
 import { safeSpawn } from "../../../lib/spawn";
 import { teamSettingsSchema } from "../../../lib/validators/project-teams";
-import { teamProjectSettingsSchema } from "../../../lib/validators/projects";
+import { teamProjectSettingsSchema, updateProjectSchema } from "../../../lib/validators/projects";
 import {
 	defaultWorkStart,
 	hostingOf,
@@ -136,6 +136,18 @@ describe("origin's hosting", () => {
 		expect(projectWorkStartOf('{"teams":{"workStart":"remote"}}')).toBe("remote");
 		expect(projectWorkStartOf({ teams: { workStart: "nope" } })).toBeNull();
 		expect(projectWorkStartOf("not json")).toBeNull();
+		// The project's default branch follows the rules of a team's base branch.
+		for (const [name, ok] of [
+			["main", true],
+			["release/2026", true],
+			["-upload-pack=evil", false],
+			["topic.lock", false],
+			["trailing/", false],
+		] as const)
+			expect({ name, ok: updateProjectSchema.safeParse({ defaultBranch: name }).success }).toEqual({
+				name,
+				ok,
+			});
 	});
 });
 

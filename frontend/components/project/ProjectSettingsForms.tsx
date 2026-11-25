@@ -24,6 +24,7 @@ import {
 	Textarea,
 	TextInput,
 } from "@mantine/core";
+import { teamBaseBranchSchema } from "@shared/project-team-draft";
 import { useQuery } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -447,7 +448,9 @@ export function ProjectTeamDefaults({
 	const storedBranch = String(project.defaultBranch ?? "main");
 	const [branch, setBranch] = useState<string | null>(null);
 	const shownBranch = branch ?? storedBranch;
-	const branchInvalid = !!shownBranch.trim() && !/^[^\s~^:?*[\\]+$/.test(shownBranch.trim());
+	// The server's rule for a base branch (`teamBaseBranchSchema`), so a refused name is never sent.
+	const branchInvalid =
+		!!shownBranch.trim() && !teamBaseBranchSchema.safeParse(shownBranch.trim()).success;
 	const saveBranch = () => {
 		if (branch === null) return;
 		const next = branch.trim();
