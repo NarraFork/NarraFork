@@ -3,6 +3,7 @@ import type { AutoRouteSignals } from "@shared/auto-route-strategy";
 import { parseModelId } from "@shared/model-id";
 import { pluginProviderRegistry } from "../services/plugin-provider-registry";
 import { autoSourceFacts } from "./agent/auto-route-signals";
+import { getCodexManager } from "./codex-manager";
 import {
 	type ConnectedWorker,
 	compiledWorkerSpecifiers,
@@ -24,6 +25,7 @@ import {
 	type ModelOptionsQuery,
 	modelOptionPrice,
 	OPTIONS_BUDGET,
+	optionInput,
 } from "./model-options-contract";
 import { getSettingsRevision, settings } from "./settings";
 import { listSourceGroups } from "./sourcing/source-groups";
@@ -65,18 +67,80 @@ export function captureModelOptionsSnapshot(): ModelOptionsSnapshot {
 	boundedStrings(settings.agent.disabledProviders ?? []);
 	const disabled = new Set(settings.agent.disabledProviders ?? []);
 	for (const group of groups) if (group.disabled) disabled.add(group.prefix);
+	// availableCount is a pure enabled-credential count, not quota/cooldown availability.
+	const codexConfigured = getCodexManager().availableCount > 0;
+	if (!codexConfigured) disabled.add("codex");
+	const fallbackConfig = new Map<string, { defaultModel?: string }>();
+	for (const [providers, requireBaseUrl] of [
+		[settings.customApiProviders ?? [], false],
+		[settings.nugProviders ?? [], true],
+	] as const) {
+		for (const provider of providers) {
+			if (
+				!provider.prefix?.trim() ||
+				provider.disabled ||
+				disabled.has(provider.prefix) ||
+				!provider.apiKey?.trim() ||
+				(requireBaseUrl && !provider.baseUrl?.trim()) ||
+				fallbackConfig.has(provider.prefix)
+			)
+				continue;
+			fallbackConfig.set(provider.prefix, { defaultModel: provider.defaultModel });
+		}
+	}
+	if (codexConfigured) fallbackConfig.set("codex", {});
+	if (settings.tokendance?.apiKey?.trim() && !settings.tokendance.disabled)
+		fallbackConfig.set("tokendance", {});
+	if (settings.commandCode?.apiKey?.trim() && !settings.commandCode.disabled)
+		fallbackConfig.set("CommandCode", {});
 	const captures: ModelOptionsCapture[] = [];
+	const fallbackCaptures: ModelOptionsCapture[] = [];
 	let codex = false;
 	const prefixes = new Set<string>();
 	for (const group of groups) {
-		if (group.disabled || disabled.has(group.prefix) || prefixes.has(group.prefix)) continue;
+		if (
+			!group.prefix?.trim() ||
+			group.disabled ||
+			disabled.has(group.prefix) ||
+			prefixes.has(group.prefix)
+		)
+			continue;
 		prefixes.add(group.prefix);
 		if (group.templateId === "codex") codex = true;
-		captures.push(
+		const capture =
 			group.templateId === "plugin"
 				? pluginProviderRegistry.captureModelOptions(group)
-				: captureTemplateModelOptions(group),
-		);
+				: captureTemplateModelOptions(group);
+		captures.push(capture);
+		// A populated discovery cache is authoritative: never revive a known-delisted pin.
+		const configured = fallbackConfig.get(group.prefix);
+		if (capture.count !== 0 || !configured) continue;
+		const models: string[] = [];
+		const add = (model: string | undefined) => {
+			const raw = model?.trim();
+			if (
+				!raw ||
+				["__default__", "__summary__", "__parent__"].includes(raw) ||
+				raw.startsWith("__agg__:")
+			)
+				return;
+			const upstream = raw.startsWith(`${group.prefix}:`)
+				? raw.slice(group.prefix.length + 1)
+				: raw;
+			if (upstream.trim()) models.push(upstream);
+		};
+		add(configured.defaultModel);
+		for (const pin of [settings.agent.defaultModel, settings.agent.summaryModel]) {
+			if (pin?.startsWith(`${group.prefix}:`)) add(pin);
+		}
+		if (models.length)
+			fallbackCaptures.push(
+				captureModelOptionsArray(
+					models,
+					(model) => ({ ...optionInput(group, model), auto: false }),
+					getSettingsRevision(),
+				),
+			);
 	}
 	const customCapture = captureModelOptionsArray(settings.agent.customModels, (row) => {
 		const value = row.value.includes(":") ? row.value : `${row.provider ?? "openai"}:${row.value}`;
@@ -100,8 +164,11 @@ export function captureModelOptionsSnapshot(): ModelOptionsSnapshot {
 			provider: "__agg__",
 			upstreamModelId: row.id,
 			auto: false,
+			aggregationMembers: row.models,
 		})),
 	);
+	// First-wins worker deduplication must prefer explicit/discovered declarations.
+	captures.push(...fallbackCaptures);
 	const hidden = settings.agent.hiddenModels ?? [];
 	const excluded = settings.agent.autoExcludedProviders ?? [];
 	boundedStrings(hidden);
@@ -113,6 +180,7 @@ export function captureModelOptionsSnapshot(): ModelOptionsSnapshot {
 		getSettingsRevision(),
 		pluginProviderRegistry.revision,
 		catalog.version,
+		codexConfigured,
 		...captures.map((capture) => `${capture.generation}:${capture.count}`),
 	].join("|");
 	return {
@@ -294,6 +362,17 @@ export class ModelOptionsClient {
 						let batch: ModelOptionInput[] = [];
 						let bytes = 2;
 						for (const row of rows) {
+							if (
+								row.aggregationMembers !== undefined &&
+								(row.aggregationMembers.length > 20 ||
+									row.aggregationMembers.some(
+										(member) => typeof member !== "string" || !member || member.length > 1024,
+									))
+							)
+								throw new ModelOptionsError(
+									"MODEL_OPTIONS_INPUT_LIMIT",
+									"Aggregation members exceed budget",
+								);
 							if (
 								[
 									row.value,

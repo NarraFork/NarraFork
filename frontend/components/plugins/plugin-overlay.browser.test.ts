@@ -43,6 +43,7 @@ const generations = new Map<string, number>();
 // The per-user "hidden overlays" preference, as the real server stores it.
 const hiddenOverlays = new Set<string>();
 const preferenceWrites: { pluginId: string; hidden: boolean }[] = [];
+const preferenceReads: { path: string; authorization: string | null }[] = [];
 
 function pluginEntry(pluginId: string, generation: number) {
 	return `(() => {
@@ -101,6 +102,16 @@ beforeAll(async () => {
 		maxRequestBodySize: 4096,
 		async fetch(request) {
 			const path = new URL(request.url).pathname;
+			if (path === "/api/auth/me" || path.startsWith("/api/user-preferences")) {
+				const authorization = request.headers.get("Authorization");
+				if (request.method === "GET") preferenceReads.push({ path, authorization });
+				if (authorization !== "Bearer fixture-user-token") {
+					return new Response(null, { status: 401 });
+				}
+			}
+			if (path === "/api/auth/me" && request.method === "GET") {
+				return Response.json({ id: "fixture-user", username: "overlay-test", role: "user" });
+			}
 			if (path === "/api/plugins/ui/sessions" && request.method === "POST") {
 				const body = (await request.json()) as { pluginId: string; surface: string };
 				if (body.surface !== "overlay") return new Response(null, { status: 400 });
@@ -121,8 +132,11 @@ beforeAll(async () => {
 				else hiddenOverlays.delete(body.pluginId);
 				return Response.json({ hiddenPluginOverlays: [...hiddenOverlays] });
 			}
-			if (path === "/api/user-preferences" && request.method === "GET") {
-				return Response.json({ hiddenPluginOverlays: [...hiddenOverlays] });
+			if (path === "/api/user-preferences/ui" && request.method === "GET") {
+				return Response.json({
+					appearancePreferences: {},
+					hiddenPluginOverlays: [...hiddenOverlays],
+				});
 			}
 			if (path.startsWith("/api/plugins/ui/sessions/") && request.method === "DELETE") {
 				revoked.add(path.split("/").at(-1) ?? "");
@@ -176,6 +190,7 @@ afterAll(async () => {
 async function open(scenario: string, hits = 1, noOverlay = false) {
 	if (!browser || !server) throw new Error("Browser fixture was not initialized");
 	page = await browser.newPage();
+	const readOffset = preferenceReads.length;
 	const errors: string[] = [];
 	page.on("pageerror", (error) => {
 		if (errors.length < 8) errors.push(String(error).slice(0, 1_000));
@@ -201,6 +216,12 @@ async function open(scenario: string, hits = 1, noOverlay = false) {
 	} catch (error) {
 		throw new Error(`Fixture failed to mount: ${errors.join("; ")}`, { cause: error });
 	}
+	// Exercise real identity and lightweight UI reads, never a seeded legacy cache
+	// or the complete preference DTO. This also guards zero-overlay assertions.
+	expect(preferenceReads.slice(readOffset).sort((a, b) => a.path.localeCompare(b.path))).toEqual([
+		{ path: "/api/auth/me", authorization: "Bearer fixture-user-token" },
+		{ path: "/api/user-preferences/ui", authorization: "Bearer fixture-user-token" },
+	]);
 	if (hits) {
 		try {
 			await page.waitForFunction(

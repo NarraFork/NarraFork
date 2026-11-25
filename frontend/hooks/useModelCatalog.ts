@@ -23,6 +23,7 @@ export const modelCatalogKeys = {
 			input.scope ?? "all",
 			input.q ?? "",
 			input.sourceModelId ?? "",
+			input.aggregationId ?? "",
 			input.cursor ?? "",
 			input.limit ?? 40,
 		] as const,

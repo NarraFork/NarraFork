@@ -19,6 +19,8 @@ export interface ModelOptionInput {
 	upstreamModelId: string;
 	providerKey?: string;
 	auto?: boolean;
+	/** Only aggregation rows carry their configured, bounded member references. */
+	aggregationMembers?: string[];
 	inputPrice?: number | null;
 	outputPrice?: number | null;
 }
@@ -42,6 +44,8 @@ export interface ModelOptionRow {
 	provider?: string;
 	modelId?: string;
 	sourceCount?: number;
+	aggregationId?: string;
+	memberCount?: number;
 	available?: boolean;
 	subscription?: boolean;
 	referencePrice?: number;
@@ -52,6 +56,7 @@ export interface ModelOptionsQuery {
 	limit: number;
 	cursor?: string;
 	sourceModelId?: string;
+	aggregationId?: string;
 }
 export interface ModelOptionsPage {
 	revision: string;
@@ -76,6 +81,9 @@ export function parseModelOptionsQuery(raw: Record<string, string | undefined>):
 		q.length > 100 ||
 		(raw.cursor?.length ?? 0) > 2048 ||
 		(raw.sourceModelId?.length ?? 0) > 256 ||
+		(raw.aggregationId?.length ?? 0) > 20 ||
+		(raw.aggregationId !== undefined && !raw.aggregationId.trim()) ||
+		(raw.aggregationId !== undefined && raw.sourceModelId !== undefined) ||
 		!["all", "auto", "concrete"].includes(scope) ||
 		!Number.isSafeInteger(limit) ||
 		limit < 1 ||
@@ -90,6 +98,7 @@ export function parseModelOptionsQuery(raw: Record<string, string | undefined>):
 		limit,
 		...(raw.cursor !== undefined && { cursor: raw.cursor }),
 		...(raw.sourceModelId !== undefined && { sourceModelId: raw.sourceModelId }),
+		...(raw.aggregationId !== undefined && { aggregationId: raw.aggregationId }),
 	};
 }
 

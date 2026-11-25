@@ -77,6 +77,76 @@ describe("bounded model options index", () => {
 		expect(source.items[0]?.value).toBe("a:alpha");
 		expect(source.hasMore).toBe(true);
 	});
+	test("aggregation members load only on expansion, preserve pins and bind their cursor", () => {
+		const index = build([
+			input("a", "p", "Member A"),
+			input("b", "p", "Member B"),
+			{
+				value: "__agg__:group",
+				label: "Group",
+				provider: "__agg__",
+				upstreamModelId: "group",
+				auto: false,
+				aggregationMembers: ["p:a", "p:b"],
+			},
+			{
+				value: "__agg__:other",
+				label: "Other",
+				provider: "__agg__",
+				upstreamModelId: "other",
+				auto: false,
+				aggregationMembers: ["p:b"],
+			},
+		]);
+		const group = index.query("r1", query).items.find((row) => row.value === "__agg__:group");
+		expect(group).toEqual({
+			value: "__agg__:group",
+			label: "Group",
+			provider: "__agg__",
+			aggregationId: "group",
+			memberCount: 2,
+		});
+		expect(JSON.stringify(group)).not.toContain("p:a");
+		const first = index.query("r1", { ...query, aggregationId: "group", limit: 1 });
+		expect(first.items).toEqual([{ value: "__agg__:group:p:a", label: "Member A", provider: "p" }]);
+		expect(first.hasMore).toBe(true);
+		const next = index.query("r1", {
+			...query,
+			aggregationId: "group",
+			cursor: first.nextCursor ?? undefined,
+		});
+		expect(next.items[0]?.value).toBe("__agg__:group:p:b");
+		expect(next.hasMore).toBe(false);
+		expect(index.query("r1", { ...query, aggregationId: "group", q: "p:b" }).items[0]?.value).toBe(
+			"__agg__:group:p:b",
+		);
+		for (const changed of [{ aggregationId: "other" }, { sourceModelId: "alpha" }, {}])
+			expect(() =>
+				index.query("r1", { ...query, ...changed, cursor: first.nextCursor ?? undefined }),
+			).toThrow("cursor expired");
+		expect(() => index.query("r1", { ...query, aggregationId: "deleted" })).toThrow(
+			"no longer available",
+		);
+		expect(parseModelOptionsQuery({ aggregationId: "group" }).aggregationId).toBe("group");
+		for (const invalid of [
+			{ aggregationId: "a".repeat(21) },
+			{ aggregationId: " " },
+			{ aggregationId: "group", sourceModelId: "alpha" },
+		])
+			expect(() => parseModelOptionsQuery(invalid)).toThrow("Invalid model options query");
+		expect(() =>
+			build([
+				{
+					value: "__agg__:large",
+					label: "Large",
+					provider: "__agg__",
+					upstreamModelId: "large",
+					aggregationMembers: Array(21).fill("p:a"),
+				},
+			]),
+		).toThrow("members exceed budget");
+	});
+
 	test("hidden and scope filters apply before pagination", () => {
 		const index = build([input("alpha"), input("hidden")], ["test:hidden"]);
 		expect(index.query("r1", { ...query, scope: "concrete", limit: 1 }).items[0]?.value).toBe(

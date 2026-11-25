@@ -18,6 +18,7 @@ const previousHome = process.env.NARRAFORK_HOME;
 process.env.NARRAFORK_HOME = home;
 const { ModelOptionsClient, captureModelOptionsSnapshot } = await import("./model-options");
 const { decodeBundledCatalog } = await import("./model-catalog/source");
+const { getCodexManager } = await import("./codex-manager");
 const clients: InstanceType<typeof ModelOptionsClient>[] = [];
 afterEach(async () => {
 	await Promise.all(clients.splice(0).map((client) => client.close()));
@@ -117,43 +118,51 @@ test("no startup/capture before actual demand; real worker builds 10k rows once 
 }, 20_000);
 
 test("production cache captures are stable and Codex catalog variants load inside the real Worker", async () => {
-	const before = captureModelOptionsSnapshot();
-	const again = captureModelOptionsSnapshot();
-	expect(before.revision).toBe(again.revision);
-	const instance = client(captureModelOptionsSnapshot);
-	const page = await instance.query({ ...query, limit: 100 });
-	expect(page.items.some((row) => row.provider === "codex")).toBe(true);
-	const auto = await instance.query({ ...query, scope: "auto", limit: 1 });
-	expect(auto.items[0]?.sourceCount).toBeGreaterThan(0);
-	const sources = await instance.query({
-		...query,
-		sourceModelId: auto.items[0]?.modelId,
-		limit: 1,
-	});
-	expect(sources.items[0]?.provider).toBe("codex");
-	expect(sources.items[0]).not.toHaveProperty("credentialLabel");
-	expect(sources.items[0]).toHaveProperty("subscription", true);
-	const value = sources.items[0]?.value;
-	if (!value) throw new Error("Missing source fixture");
-	const catalogModule = await import("./model-catalog");
-	const restore = catalogModule.replaceModelOverridesForTests({
-		connections: { [value]: { prices: { input: "3", output: "4" } } },
-	});
-	const card = spyOn(catalogModule, "getEffectiveModelCard");
-	const profile = spyOn(catalogModule, "getEffectiveModelProfile");
+	const manager = getCodexManager();
+	const previous = Object.getOwnPropertyDescriptor(manager, "availableCount");
+	Object.defineProperty(manager, "availableCount", { configurable: true, get: () => 1 });
 	try {
-		const repriced = await instance.query({
+		const before = captureModelOptionsSnapshot();
+		const again = captureModelOptionsSnapshot();
+		expect(before.revision).toBe(again.revision);
+		const instance = client(captureModelOptionsSnapshot);
+		const page = await instance.query({ ...query, limit: 100 });
+		expect(page.items.some((row) => row.provider === "codex")).toBe(true);
+		const auto = await instance.query({ ...query, scope: "auto", limit: 1 });
+		expect(auto.items[0]?.sourceCount).toBeGreaterThan(0);
+		const sources = await instance.query({
 			...query,
 			sourceModelId: auto.items[0]?.modelId,
 			limit: 1,
 		});
-		expect(repriced.items[0]?.referencePrice).toBe(7);
-		expect(card).not.toHaveBeenCalled();
-		expect(profile).not.toHaveBeenCalled();
+		expect(sources.items[0]?.provider).toBe("codex");
+		expect(sources.items[0]).not.toHaveProperty("credentialLabel");
+		expect(sources.items[0]).toHaveProperty("subscription", true);
+		const value = sources.items[0]?.value;
+		if (!value) throw new Error("Missing source fixture");
+		const catalogModule = await import("./model-catalog");
+		const restore = catalogModule.replaceModelOverridesForTests({
+			connections: { [value]: { prices: { input: "3", output: "4" } } },
+		});
+		const card = spyOn(catalogModule, "getEffectiveModelCard");
+		const profile = spyOn(catalogModule, "getEffectiveModelProfile");
+		try {
+			const repriced = await instance.query({
+				...query,
+				sourceModelId: auto.items[0]?.modelId,
+				limit: 1,
+			});
+			expect(repriced.items[0]?.referencePrice).toBe(7);
+			expect(card).not.toHaveBeenCalled();
+			expect(profile).not.toHaveBeenCalled();
+		} finally {
+			card.mockRestore();
+			profile.mockRestore();
+			restore();
+		}
 	} finally {
-		card.mockRestore();
-		profile.mockRestore();
-		restore();
+		if (previous) Object.defineProperty(manager, "availableCount", previous);
+		else Reflect.deleteProperty(manager, "availableCount");
 	}
 });
 
@@ -273,4 +282,23 @@ test("main capture enforces 20k rows, per-field and total 8MiB input; no publish
 	);
 	await expect(huge.query(query)).rejects.toThrow("input exceeds budget");
 	expect(fixture.posted.some((message) => message.type === "publish")).toBe(false);
+	const aggregationFixture = fakeConnection((message, worker) =>
+		worker.emit("message", { id: message.id, ok: true }),
+	);
+	const malformed = client(
+		() =>
+			snapshot([
+				{
+					value: "__agg__:large",
+					label: "Large",
+					provider: "__agg__",
+					upstreamModelId: "large",
+					aggregationMembers: Array(21).fill("provider:member"),
+				},
+			]),
+		async () => aggregationFixture.connection,
+	);
+	await expect(malformed.query(query)).rejects.toThrow("Aggregation members exceed budget");
+	expect(aggregationFixture.posted.some((message) => message.type === "batch")).toBe(false);
+	expect(aggregationFixture.posted.some((message) => message.type === "publish")).toBe(false);
 });

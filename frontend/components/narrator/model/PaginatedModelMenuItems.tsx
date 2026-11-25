@@ -52,6 +52,7 @@ export function PaginatedModelMenuItems({
 	const [q, setQ] = useState("");
 	const [cursor, setCursor] = useState<string>();
 	const [sourceModelId, setSourceModelId] = useState<string>();
+	const [aggregationId, setAggregationId] = useState<string>();
 	const [actions, setActions] = useState<string>();
 	const composing = useRef(false);
 	const [composition, setComposition] = useState(false);
@@ -67,11 +68,19 @@ export function PaginatedModelMenuItems({
 		if (opened) return;
 		setCursor(undefined);
 		setSourceModelId(undefined);
+		setAggregationId(undefined);
 		setActions(undefined);
 	}, [opened]);
 	const pendingSearch = input !== q || composition;
 	const query = useModelOptions(
-		{ q, cursor, sourceModelId, limit: 40, scope: sourceModelId ? "concrete" : "all" },
+		{
+			q,
+			cursor,
+			sourceModelId,
+			aggregationId,
+			limit: 40,
+			scope: sourceModelId || aggregationId ? "concrete" : "all",
+		},
 		opened && !pendingSearch,
 	);
 	const rows = pendingSearch ? [] : (query.data?.items ?? []);
@@ -99,7 +108,7 @@ export function PaginatedModelMenuItems({
 					if (composing.current || event.nativeEvent.isComposing) event.stopPropagation();
 				}}
 			/>
-			{!sourceModelId && !q && (
+			{!sourceModelId && !aggregationId && !q && (
 				<>
 					<Menu.Item
 						leftSection={
@@ -129,13 +138,15 @@ export function PaginatedModelMenuItems({
 					<Menu.Divider />
 				</>
 			)}
-			{sourceModelId && (
+			{(sourceModelId || aggregationId) && (
 				<Button
 					size="xs"
 					variant="subtle"
 					onClick={() => {
 						setSourceModelId(undefined);
+						setAggregationId(undefined);
 						setCursor(undefined);
+						setActions(undefined);
 					}}
 				>
 					{tc("back")}
@@ -147,6 +158,7 @@ export function PaginatedModelMenuItems({
 						<Menu.Item
 							style={{ flex: 1, minWidth: 0 }}
 							leftSection={currentModel === row.value ? <IconCheck size={14} /> : undefined}
+							disabled={!!aggregationId && row.available === false}
 							onClick={() => select(row.value)}
 						>
 							<Text size="sm" truncate>
@@ -164,12 +176,30 @@ export function PaginatedModelMenuItems({
 								size="compact-xs"
 								onClick={() => {
 									setSourceModelId(row.modelId);
+									setAggregationId(undefined);
+									setActions(undefined);
 									setCursor(undefined);
 									setInput("");
 									setQ("");
 								}}
 							>
 								{row.sourceCount}
+							</Button>
+						)}
+						{row.memberCount != null && row.aggregationId && (
+							<Button
+								variant="subtle"
+								size="compact-xs"
+								onClick={() => {
+									setAggregationId(row.aggregationId);
+									setSourceModelId(undefined);
+									setActions(undefined);
+									setCursor(undefined);
+									setInput("");
+									setQ("");
+								}}
+							>
+								{row.memberCount}
 							</Button>
 						)}
 						{(onShowPrice || onSetAsDefaultModel || onSetAsSummaryModel) && (
@@ -193,6 +223,7 @@ export function PaginatedModelMenuItems({
 								<Button
 									size="compact-xs"
 									variant="subtle"
+									disabled={!!aggregationId && row.available === false}
 									onClick={() => onSetAsDefaultModel(row.value)}
 								>
 									{t("setAsDefaultModel")}
@@ -202,6 +233,7 @@ export function PaginatedModelMenuItems({
 								<Button
 									size="compact-xs"
 									variant="subtle"
+									disabled={!!aggregationId && row.available === false}
 									onClick={() => onSetAsSummaryModel(row.value)}
 								>
 									{t("setAsSummaryModel")}

@@ -16,6 +16,9 @@ export interface ModelCatalogOption {
 	provider?: string;
 	modelId?: string;
 	sourceCount?: number;
+	aggregationId?: string;
+	memberCount?: number;
+	available?: boolean;
 }
 export interface ModelCatalogOptionsPage {
 	revision: string;
@@ -29,6 +32,7 @@ export interface ModelCatalogOptionsInput {
 	limit?: number;
 	scope?: "all" | "auto" | "concrete";
 	sourceModelId?: string;
+	aggregationId?: string;
 }
 
 function boundedOptions(options: RequestOptions | undefined, bytes: number): RequestOptions {
@@ -58,6 +62,7 @@ export const modelCatalogApi = {
 		if (input.scope) query.set("scope", input.scope);
 		if (input.limit != null) query.set("limit", String(input.limit));
 		if (input.sourceModelId) query.set("sourceModelId", input.sourceModelId);
+		if (input.aggregationId) query.set("aggregationId", input.aggregationId);
 		return request<ModelCatalogOptionsPage>(
 			`${root}/options?${query}`,
 			boundedOptions(options, 64 * 1024),

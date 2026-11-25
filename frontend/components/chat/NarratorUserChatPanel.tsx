@@ -18,9 +18,9 @@ import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { chatKeys, useNarratorChatRoom } from "../../hooks/useChat";
 import { ApiError, getToken } from "../../lib/api/client";
+import { invalidateCachedPretextDocument } from "../../lib/pretext-document-cache-invalidation";
 import { useNarratorDockContext } from "../narrator/dock/NarratorDockContext";
 import { useEditorPanelVisible } from "../narrator/narrator-panel-visibility";
-import { invalidateCachedPretextDocument } from "../narrator/vlist/pretext-document-cache";
 import { ChatRoomView } from "./ChatRoomView";
 
 export interface NarratorUserChatPanelProps {

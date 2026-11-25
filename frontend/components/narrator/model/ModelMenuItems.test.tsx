@@ -344,6 +344,157 @@ test("paginated menu gates reads, pages by gesture, and waits for Chinese compos
 	}
 });
 
+test("paginated aggregation members preserve pins and never mix their cursors with auto sources", async () => {
+	const originalFetch = globalThis.fetch;
+	const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+	const calls: URL[] = [];
+	const choices: string[] = [];
+	const promoted: string[] = [];
+	localStorage.getItem = (key: string) => (key === "narrafork_token" ? "menu-actor" : null);
+	globalThis.fetch = (async (url: unknown) => {
+		const parsed = new URL(String(url), "http://test");
+		calls.push(parsed);
+		const agg = parsed.searchParams.get("aggregationId");
+		const source = parsed.searchParams.get("sourceModelId");
+		const next = parsed.searchParams.get("cursor") === "group-next";
+		return Response.json({
+			revision: "one",
+			items: agg
+				? [
+						{
+							value: `__agg__:${agg}:${next ? "b:two" : "a:one"}`,
+							label: next ? "Two" : "One",
+							provider: next ? "b" : "a",
+						},
+						...(!next
+							? [
+									{
+										value: `__agg__:${agg}:codex:locked`,
+										label: "Locked",
+										provider: "codex",
+										available: false,
+									},
+								]
+							: []),
+					]
+				: source
+					? [{ value: "c:x", label: "Source X", provider: "c", available: false }]
+					: [
+							{
+								value: "__agg__:group",
+								label: "Group",
+								provider: "__agg__",
+								aggregationId: "group",
+								memberCount: 2,
+							},
+							{ value: "auto:x", label: "X", modelId: "x", sourceCount: 1 },
+						],
+			nextCursor: agg && !next ? "group-next" : null,
+			hasMore: !!agg && !next,
+		});
+	}) as unknown as typeof fetch;
+	const flush = async () => {
+		for (let i = 0; i < 4; i++)
+			await act(async () => {
+				await new Promise((resolve) => setTimeout(resolve, 0));
+			});
+	};
+	const mount = async (opened: boolean) => {
+		await act(async () =>
+			root.render(
+				<QueryClientProvider client={qc}>
+					<MantineProvider env="test">
+						<I18nextProvider i18n={instance}>
+							<Menu opened>
+								<PaginatedModelMenuItems
+									opened={opened}
+									currentModel="__agg__:group:hidden:pin"
+									onSelect={(value) => choices.push(value)}
+									onSetAsDefaultModel={(value) => promoted.push(value)}
+									onSetAsSummaryModel={(value) => promoted.push(value)}
+								/>
+							</Menu>
+						</I18nextProvider>
+					</MantineProvider>
+				</QueryClientProvider>,
+			),
+		);
+		await flush();
+	};
+	const click = async (text: string) => {
+		const target = Array.from(host.querySelectorAll("button")).find(
+			(row) => row.textContent === text,
+		);
+		if (!target) throw new Error(`Missing paginated choice: ${text}`);
+		await act(async () => target.click());
+		await flush();
+	};
+	try {
+		await mount(false);
+		expect(calls).toHaveLength(0);
+		await mount(true);
+		expect(calls).toHaveLength(1);
+		await click("Group__agg__");
+		expect(choices).toEqual(["__agg__:group"]);
+		await click("2");
+		expect(calls).toHaveLength(2);
+		expect(calls[1].searchParams.get("aggregationId")).toBe("group");
+		expect(calls[1].searchParams.has("sourceModelId")).toBe(false);
+		await flush();
+		expect(calls).toHaveLength(2);
+		const blocked = Array.from(host.querySelectorAll<HTMLButtonElement>("button")).find(
+			(row) => row.textContent === "Lockedcodex",
+		);
+		if (!blocked) throw new Error("missing explicitly unavailable aggregation member");
+		expect(blocked.disabled).toBe(true);
+		await act(async () => blocked.click());
+		expect(choices).toEqual(["__agg__:group"]);
+		const actions = blocked.parentElement?.parentElement?.querySelector<HTMLButtonElement>(
+			`[aria-label="${narratorLocale.modelActions}"]`,
+		);
+		if (!actions) throw new Error("missing unavailable member actions");
+		await act(async () => actions.click());
+		await flush();
+		for (const label of [narratorLocale.setAsDefaultModel, narratorLocale.setAsSummaryModel]) {
+			const promote = Array.from(host.querySelectorAll<HTMLButtonElement>("button")).find(
+				(row) => row.textContent === label,
+			);
+			if (!promote) throw new Error("missing promotion action");
+			expect(promote.disabled).toBe(true);
+			await act(async () => promote.click());
+		}
+		expect(promoted).toEqual([]);
+		await click("Onea");
+		expect(choices.at(-1)).toBe("__agg__:group:a:one");
+		await click(narratorLocale.contextComposition.loadMore);
+		expect(calls).toHaveLength(3);
+		expect(calls[2].searchParams.get("aggregationId")).toBe("group");
+		expect(calls[2].searchParams.get("cursor")).toBe("group-next");
+		await click("Twob");
+		expect(choices.at(-1)).toBe("__agg__:group:b:two");
+		await click("back");
+		await click("1");
+		expect(calls).toHaveLength(4);
+		expect(calls[3].searchParams.get("sourceModelId")).toBe("x");
+		expect(calls[3].searchParams.has("aggregationId")).toBe(false);
+		expect(calls[3].searchParams.has("cursor")).toBe(false);
+		await click("Source Xc");
+		expect(choices.at(-1)).toBe("c:x");
+		await click("back");
+		await click("2");
+		expect(calls).toHaveLength(4); // independently cached first aggregation page
+		await mount(false);
+		await qc.invalidateQueries({ queryKey: ["model-catalog", "options"] });
+		await flush();
+		expect(calls).toHaveLength(4);
+		expect(calls.every((url) => url.pathname === "/api/model-catalog/options")).toBe(true);
+	} finally {
+		await act(async () => root.render(null));
+		qc.clear();
+		globalThis.fetch = originalFetch;
+	}
+});
+
 describe("follow parent selection", () => {
 	test.each([
 		["en", narratorLocale.followParent],

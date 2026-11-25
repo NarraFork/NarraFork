@@ -39,6 +39,7 @@ anchors:
   - frontend/components/narrator/model/PaginatedModelMenuItems.tsx
   - server/lib/model-options.test.ts
   - server/lib/model-options-index.test.ts
+  - server/lib/model-options-fallback.test.ts
   - frontend/routes/settings/models.tsx
   - frontend/components/providers/AutoParticipationSwitch.tsx
   - frontend/components/providers/InlineCustomModels.tsx
@@ -76,7 +77,7 @@ keywords:
   - auto 参与
   - settings.agent.modelProtocols
 status: draft
-verified_at: 4d59774711a51a9ac966794090c8b3a04d549048
+verified_at: 9bba5f6cdfe1f1a3602e12806eb8129c34d61716
 ---
 # 来源组与模型列表
 
@@ -97,6 +98,9 @@ verified_at: 4d59774711a51a9ac966794090c8b3a04d549048
 - `model-sourcing/auto-models.ts:listAutoModels` 为兼容管理接口 `GET /api/model-catalog/auto` 列出 `auto:` 模型及按当前路由顺序排列的来源，最多 500 个逻辑模型。
 - 选择菜单用 `GET /api/model-catalog/options`，只有实际请求才启动单个专用 Worker；`scope=all|auto|concrete`、q 最多 100 字符、limit 默认 40/最大 100、cursor 最多 2KiB，返回 `revision/items/nextCursor/hasMore`。静态索引最多当前与在建两代；来源组只读插件 registry 的小型 owner 投影，不克隆 configSchema。缓存 owner 的 capture 固定数组引用，先 slice 再仅投影 value/label/provider/identity 小字段，逐批最多 128 行/64KiB 且等待 ACK；筛选配置也按相同批预算传输。总输入最多 20,000 模型行/8MiB，队列合计最多 8 请求，构建 10s、查询 2s、含排队冷请求 12s；未就绪、崩溃、预算超限明确可重试错误，无主线程计算兜底。
 - options Worker 自行加载与核对当前 catalog 版本，构建 identity/去重与 modelId→provider 最佳候选反向索引并排序，不调用全量 legacy auto/readAll/card 函数。每个 auto 行仅给 sourceCount；展开用同接口 `sourceModelId` 只处理该模型最多 256 个候选，动态 available/subscription/referencePrice 排序先于分页，不携带账号 label/email。游标绑定 revision/搜索/scope/来源模型及来源排序事实；变化返回 409。settings/plugin/catalog/cache publication 的代际只在需求时检查，关闭菜单不主动扫描或预构建；额度与 availability 不主动重建静态索引。
+- 配置 fallback 只补冷目录：某来源发现缓存为空、来源启用且凭据已配置时，加入其 provider default 与属于该前缀的全局 default/summary 两个 pin，标 `auto:false`，不合成 auto 来源。NUG 还要求 baseUrl；发现缓存非空时它是权威，不能把已下架的缺失 default/pin 补回来。显式/发现声明优先于 fallback 去重（`captureModelOptionsSnapshot`、`model-options-fallback.test.ts`）。
+- Codex 目录看纯启用凭据 presence（`availableCount > 0`），无凭据不 seed Codex 目录，聚合中显式 Codex pin 标不可用；这个 boolean 进入索引代际，不能用额度/cooldown 瞬态或正数凭据个数波动制造代际抖动。
+- 聚合成员按需展开：主 options 页只有 `aggregationId/memberCount`，不带成员明细；点击后用互斥于 sourceModelId 的 `aggregationId` 查询，仅物化该组 ≤20 个配置成员，保留 `__agg__:id:member` 的 pin 值。cursor 绑定组 id、revision、搜索/scope，跨组/代际失效返回 409，不能把聚合展开做成全目录加载（`model-options-index.ts:query`）。
 - 「跟随默认 / 跟随摘要」选项（`hooks/useModels.ts:useAllModels` 的 `buildFollowOption`）的标签是目标模型的标签，再退到目标值；目标为空（还没配置默认或摘要模型）时显示 `followDefaultUnset` / `followSummaryUnset`（「默认模型（未配置）」），从不显示 `__default__` 这类哨兵值（`lib/follow-model-label.ts`）。Default / Summary / Aggregations 分组标题走 `narrator` 命名空间翻译。状态栏、模型菜单触发器与列表卡片的「默认（模型）」都经 `followDefaultLabel`，未配置时同样显示未配置文案。
 
 ## 从哪读起

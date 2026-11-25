@@ -18,10 +18,13 @@ interface IndexedRow extends ModelOptionRow {
 	outputPrice?: number | null;
 	search: string;
 	match?: string;
+	aggregationMembers?: string[];
 }
 interface Generation {
 	revision: string;
 	rows: IndexedRow[];
+	byValue: Map<string, IndexedRow>;
+	codexConfigured: boolean;
 	byModel: Map<string, Map<string, IndexedRow>>;
 }
 /** Only the current generation and one building generation; no per-user index/cache. */
@@ -39,7 +42,13 @@ export class ModelOptionsIndex {
 		this.discard();
 		this.catalog = catalog;
 		this.catalogModels = new Map(catalog.models.map((model) => [model.id, model]));
-		this.building = { revision, rows: [], byModel: new Map() };
+		this.building = {
+			revision,
+			rows: [],
+			byValue: new Map(),
+			codexConfigured: false,
+			byModel: new Map(),
+		};
 		this.hidden = new Set(hidden);
 		this.excluded = new Set(excluded);
 		this.bytes = Buffer.byteLength(JSON.stringify([hidden, excluded]));
@@ -50,7 +59,8 @@ export class ModelOptionsIndex {
 			);
 	}
 	seedCodex(): void {
-		if (!this.catalog) throw new Error("No build in progress");
+		if (!this.catalog || !this.building) throw new Error("No build in progress");
+		this.building.codexConfigured = true;
 		let batch: ModelOptionInput[] = [];
 		for (const variant of this.catalog.variants) {
 			if (variant.providerKey !== "codex" || variant.status === "deprecated") continue;
@@ -102,6 +112,19 @@ export class ModelOptionsIndex {
 			);
 		}
 		for (const input of rows) {
+			if (
+				input.aggregationMembers !== undefined &&
+				(!input.value.startsWith("__agg__:") ||
+					input.value.slice(8).length > 20 ||
+					input.aggregationMembers.length > 20 ||
+					input.aggregationMembers.some(
+						(member) => typeof member !== "string" || !member || member.length > 1024,
+					))
+			)
+				throw new ModelOptionsError(
+					"MODEL_OPTIONS_INPUT_LIMIT",
+					"Aggregation members exceed budget",
+				);
 			if (this.seen.has(input.value) || this.hidden.has(input.value)) continue;
 			this.seen.add(input.value);
 			const identity = identifyModel(this.catalog, {
@@ -125,11 +148,17 @@ export class ModelOptionsIndex {
 				value: input.value,
 				label: input.label,
 				provider: input.provider,
+				...(input.aggregationMembers && {
+					aggregationId: input.value.slice(8),
+					memberCount: input.aggregationMembers.length,
+					aggregationMembers: input.aggregationMembers,
+				}),
 				...(identity.modelId && { modelId: identity.modelId }),
 				search: `${input.label}\n${input.value}\n${identity.modelId ?? ""}`.toLowerCase(),
 				match: identity.matchedVia,
 			};
 			this.building.rows.push(row);
+			this.building.byValue.set(row.value, row);
 			if (
 				!identity.modelId ||
 				identity.weak ||
@@ -164,13 +193,15 @@ export class ModelOptionsIndex {
 			const value = `auto:${modelId}`;
 			if (this.hidden.has(value)) continue;
 			const label = models.get(modelId)?.name ?? modelId;
-			this.building.rows.push({
+			const row = {
 				value,
 				label,
 				modelId,
 				sourceCount: providers.size,
 				search: `${label}\n${value}`.toLowerCase(),
-			});
+			};
+			this.building.rows.push(row);
+			this.building.byValue.set(value, row);
 		}
 		this.building.rows.sort(
 			(a, b) => a.label.localeCompare(b.label) || a.value.localeCompare(b.value),
@@ -222,6 +253,7 @@ export class ModelOptionsIndex {
 					query.scope,
 					query.q,
 					query.sourceModelId ?? null,
+					query.aggregationId ?? null,
 					query.sourceModelId ? (facts ?? null) : null,
 				]),
 			)
@@ -244,6 +276,30 @@ export class ModelOptionsIndex {
 		let rows = query.sourceModelId
 			? [...(current.byModel.get(query.sourceModelId)?.values() ?? [])]
 			: current.rows;
+		if (query.aggregationId) {
+			const group = current.byValue.get(`__agg__:${query.aggregationId}`);
+			if (!group?.aggregationMembers)
+				throw new ModelOptionsError(
+					"MODEL_OPTIONS_AGGREGATION_MISSING",
+					"Aggregation is no longer available",
+					409,
+				);
+			// Only this configured <=20 member set is materialized, never the directory.
+			rows = group.aggregationMembers.map((member) => {
+				const known = current.byValue.get(member);
+				const colon = member.indexOf(":");
+				const provider = colon > 0 ? member.slice(0, colon) : undefined;
+				const label = known?.label ?? member;
+				return {
+					value: `__agg__:${query.aggregationId}:${member}`,
+					label,
+					provider: known?.provider ?? provider,
+					...(provider === "codex" && !current.codexConfigured && { available: false }),
+					...(known?.modelId && { modelId: known.modelId }),
+					search: `${label}\n${member}`.toLowerCase(),
+				};
+			});
+		}
 		if (query.sourceModelId && facts) {
 			if (facts.length > 256)
 				throw new ModelOptionsError("MODEL_OPTIONS_SOURCE_LIMIT", "Auto sources exceed budget");
@@ -263,6 +319,7 @@ export class ModelOptionsIndex {
 			const auto = row.sourceCount !== undefined;
 			if (
 				!query.sourceModelId &&
+				!query.aggregationId &&
 				((query.scope === "auto" && !auto) || (query.scope === "concrete" && auto))
 			)
 				continue;
@@ -274,6 +331,7 @@ export class ModelOptionsIndex {
 			}
 			const {
 				search: _search,
+				aggregationMembers: _members,
 				match: _match,
 				inputPrice: _inputPrice,
 				outputPrice: _outputPrice,

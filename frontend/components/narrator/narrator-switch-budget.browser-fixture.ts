@@ -11,6 +11,10 @@ import { createToken } from "../../../server/lib/auth";
 import { settings } from "../../../server/lib/settings";
 import { injectSpaBaseHref, spaIndexHeaders } from "../../../server/lib/spa-base-href";
 import { createStartupReadinessGate } from "../../../server/lib/startup-readiness";
+import {
+	seedSwitchBudgetMessages,
+	switchBudgetMessageCount,
+} from "../../../server/services/__tests__/narrator-switch-budget-seed.fixture";
 import { backgroundOccupancyStore } from "../../../server/services/background-occupancy-store";
 import { type WSData, wsHandlers } from "../../../server/websocket/ws-handler";
 import { testEnvironment } from "../../../tests/preload";
@@ -126,7 +130,7 @@ export async function createSwitchBudgetFixture() {
 				writeAudience: "owner",
 				model,
 				cwd: repo,
-				messageCount: 60,
+				messageCount: switchBudgetMessageCount,
 				lastMessageAt: now,
 				status: "idle",
 				permissionMode: "bypassPermissions",
@@ -151,26 +155,7 @@ export async function createSwitchBudgetFixture() {
 				updatedAt: now,
 			})
 			.run();
-		for (let seq = 1; seq <= 60; seq++) {
-			const messageId = `${id}-message-${seq}`;
-			const text =
-				seq === 60
-					? `BUDGET_BODY_${index ? "B" : "A"}_TAIL`
-					: `Necessary body ${seq}: ${"body content ".repeat(100)}`;
-			db.insert(schema.narratorMessages)
-				.values({
-					id: messageId,
-					narratorId: id,
-					role: seq % 2 ? "user" : "assistant",
-					contentJson: [{ type: "text", text }],
-					contentText: text,
-					createdAt: now,
-				})
-				.run();
-			db.insert(schema.narratorMessageRefs)
-				.values({ id: `ref-${messageId}`, narratorId: id, messageId, seq })
-				.run();
-		}
+		seedSwitchBudgetMessages(id, index ? "B" : "A", now);
 	}
 	await backgroundOccupancyStore.start();
 	backgroundOccupancyStore.refreshNarrators(ids);

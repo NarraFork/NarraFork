@@ -37,6 +37,8 @@ anchors:
   - frontend/lib/file-link-target.ts
   - frontend/lib/markdown-anchor-scroll.ts
   - frontend/lib/narrator-content-column.ts
+  - frontend/lib/pretext-document-cache-invalidation.ts
+  - frontend/lib/pretext-document-cache-invalidation.test.ts
   - frontend/lib/shiki-lang.ts
   - frontend/lib/shiki-language-aliases.ts
   - frontend/lib/shiki-language-loader.ts
@@ -68,7 +70,7 @@ keywords:
   - 历史加载
   - MarkdownContent
 status: draft
-verified_at: 4d59774711a51a9ac966794090c8b3a04d549048
+verified_at: 9bba5f6cdfe1f1a3602e12806eb8129c34d61716
 ---
 # 消息列表
 
@@ -76,6 +78,7 @@ verified_at: 4d59774711a51a9ac966794090c8b3a04d549048
 
 ## 关键规则
 - 懒加载边界：`NarratorPanel.tsx` 用 `lazy(() => import("./vlist/PretextExactMessageList"))`；`vlist/vlist-isolation.guard.test.ts` 扫描 `frontend/`，vlist 之外任何文件静态 import vlist 即失败（动态 `import()`、`*.test.*`、`*.browser-fixture.*` 放行）。`PretextExactMessageList.tsx` 文件头自称“experimental/opt-in”，已与此不符（以懒加载与守卫测试为准）。
+- 列表外的缓存失效只能经零依赖 `lib/pretext-document-cache-invalidation.ts` facade，不为清缓存静态 import vlist。未加载 lazy cache 时同步 no-op；cache 真正加载后安装唯一 owner，聊天撤权仍同步失效。HMR dispose 注销 owner/会话监听并清旧缓存；旧 cleanup 只能移除自己的 registration，不能卸掉新 owner（`pretext-document-cache-invalidation.test.ts`），OFF/未加载路径不因此拉取 vlist chunk。
 - 尾部摘要（`vlist/vlist-tail-meta.ts:buildTailMeta`，供重试/继续按钮与状态栏）从末尾往前找最后一条真实消息，跳过流式占位、错误卡、隐藏 epoch 标记，以及宿主写的非回合行（团队升级/解散说明、重建工具声明通知，`continue-tail.ts:isNonTurnHostRow`，见[中断与恢复](../../narrator/recovery.md)）。
 - 零 DOM 测量：`vlist/zero-dom-measure.guard.test.ts` 扫 `measure/*`、`registry.ts`、`vlist-pipeline.ts`、`vlist-tail-meta.ts`、`vlist-live-patch.ts` 等纯路径文件，禁止 `getBoundingClientRect`/`offsetHeight`/`ResizeObserver`/`getComputedStyle`；布局内核在 `shared/pretext-layout/`，由其 `shared-core.guard.test.ts` 枚举扫描。例外：渲染层对 mermaid/katex/未知尺寸图片的一次性局部修正（`PreparedUnknownBlock`）、滚动容器外壳、`VListHarness.tsx`（开发期校准）。
 - 已提交行的高度只在用户操作后才变：`vlist-stable-height.guard.test.ts`（截断详情按完整上限预留高度、详情抓取要显式请求；反思通知不得渲染后再测量）。

@@ -2,6 +2,8 @@ import { expect, test } from "bun:test";
 import { existsSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 import puppeteer, { type HTTPRequest, type Page } from "puppeteer-core";
+import { APP_VERSION, GIT_COMMIT } from "../../../server/lib/version";
+import { appVersionsMatch } from "../../lib/version-match";
 import {
 	bulkySentinel,
 	createSwitchBudgetFixture,
@@ -114,9 +116,28 @@ function peak(rows: Array<{ startedAt: number; endedAt: number }>, from: number,
 	}
 	return maximum;
 }
+async function assertMatchingFrontendBuild() {
+	const index = await Bun.file(join(frontendDist, "index.html")).text();
+	const entry = index.match(/<script\b[^>]*\bsrc="\.\/([^"?]+\.js)"/)?.[1];
+	if (!entry) throw new Error("Frontend build has no module entry");
+	const entryPath = resolve(frontendDist, entry);
+	if (!entryPath.startsWith(`${resolve(frontendDist)}/`))
+		throw new Error("Invalid frontend entry path");
+	const file = Bun.file(entryPath);
+	if (file.size > 8 * 1024 * 1024) throw new Error("Frontend entry exceeds bounded identity probe");
+	const versions = [
+		...new Set((await file.text()).match(/\b\d+\.\d+\.\d+\+[a-f0-9]{7,40}\b/g) ?? []),
+	];
+	const serverVersion = GIT_COMMIT ? `${APP_VERSION}+${GIT_COMMIT}` : APP_VERSION;
+	if (!versions.some((version) => appVersionsMatch(version, serverVersion)))
+		throw new Error(
+			`Frontend/server build identity mismatch: entry=${entry}; embedded=${JSON.stringify(versions)}; server=${serverVersion}. Rebuild this worktree at its current HEAD; do not bypass the production version refresh.`,
+		);
+	return { entry, versions, serverVersion };
+}
 async function waitForPanel(page: Page, marker: string) {
 	await page.waitForFunction(
-		(tail) => document.body.innerText.includes(tail),
+		(tail) => document.body?.innerText.includes(tail) === true,
 		{ timeout: 30_000 },
 		marker,
 	);
@@ -135,6 +156,7 @@ test("real Chromium full SPA cold A → sidebar B → warm A has bounded request
 	if (!existsSync(join(frontendDist, "index.html")))
 		throw new Error("Run bun run build in this worktree first");
 	expect(realpathSync(frontendDist)).toBe(resolve(frontendDist));
+	const buildIdentity = await assertMatchingFrontendBuild();
 	const fixture = await createSwitchBudgetFixture();
 	const browser = await puppeteer.launch({
 		executablePath,
@@ -156,11 +178,14 @@ test("real Chromium full SPA cold A → sidebar B → warm A has bounded request
 	});
 	const outside: string[] = [];
 	const starts: BrowserStart[] = [];
+	const documentNavigations: string[] = [];
 	const tracked = new Map<HTTPRequest, BrowserStart>();
 	page.on("pageerror", (error) => errors.push(String(error)));
 	await page.setRequestInterception(true);
 	page.on("request", (request) => {
 		const url = new URL(request.url());
+		if (request.isNavigationRequest() && request.frame() === page.mainFrame())
+			documentNavigations.push(url.pathname);
 		if (url.origin !== fixture.url && ["http:", "https:"].includes(url.protocol)) {
 			outside.push(url.origin + url.pathname);
 			void request.abort();
@@ -422,6 +447,7 @@ test("real Chromium full SPA cold A → sidebar B → warm A has bounded request
 		expect(wsSent.filter((frame) => frame.type === "chat_subscribe")).toEqual([]);
 		expect(wsFrames.some((frame) => frame.data.includes("status_change"))).toBe(true);
 		expect(errors).toEqual([]);
+		expect(documentNavigations).toEqual([`/narrators/${fixture.ids[0]}`]);
 		expect(outside).toEqual([]);
 		expect(fixture.blockedOutbound).toEqual([]);
 		expect(budgetFailures).toEqual([]);
@@ -431,6 +457,8 @@ test("real Chromium full SPA cold A → sidebar B → warm A has bounded request
 		);
 	} catch (error) {
 		console.error("switch-budget failure diagnostics", {
+			buildIdentity,
+			documentNavigations,
 			consoleErrors,
 			resourceFailures,
 			errors,
@@ -442,7 +470,9 @@ test("real Chromium full SPA cold A → sidebar B → warm A has bounded request
 				status,
 				bytes,
 			})),
-			body: await page.evaluate(() => document.body.innerText.slice(0, 3500)),
+			body: await page.evaluate(
+				() => document.body?.innerText.slice(0, 3500) ?? "<document body not ready>",
+			),
 		});
 		throw error;
 	} finally {

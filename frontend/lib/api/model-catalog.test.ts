@@ -57,6 +57,19 @@ describe("model catalog wire contract", () => {
 		expect(options.searchParams.get("sourceModelId")).toBe("model:1");
 		expect(options.searchParams.get("scope")).toBe("concrete");
 	});
+	test("aggregation member options carry only the group identifier and bounded cursor", async () => {
+		await modelCatalogApi.options({
+			aggregationId: "group-123",
+			cursor: "members-next",
+			scope: "concrete",
+			limit: 40,
+		});
+		const options = new URL(calls[0].url, "http://test");
+		expect(options.pathname).toBe("/api/model-catalog/options");
+		expect(options.searchParams.get("aggregationId")).toBe("group-123");
+		expect(options.searchParams.get("cursor")).toBe("members-next");
+		expect(options.searchParams.has("sourceModelId")).toBe(false);
+	});
 	test("runtime and option responses enforce their independent byte budgets", async () => {
 		globalThis.fetch = (async () =>
 			Response.json({ payload: "x".repeat(5000) })) as unknown as typeof fetch;
