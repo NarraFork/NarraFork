@@ -49,7 +49,7 @@ keywords:
   - QueuedMessagesPanel
   - PendingAgentMessagesPanel
 status: draft
-verified_at: 3a43303a2
+verified_at: 7d5423c07
 ---
 # 输入框与交互
 
