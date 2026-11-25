@@ -6,6 +6,8 @@ import { narratorWSManager } from "../lib/narrator-ws-manager";
 export function useUserPreferencesChangeSync() {
 	const qc = useQueryClient();
 	useEffect(() => {
+		// Prefix invalidation covers both scoped UI and full-detail views, without
+		// putting either response shape into the other cache.
 		const invalidate = () => {
 			void qc.invalidateQueries({ queryKey: ["user-preferences"] });
 		};

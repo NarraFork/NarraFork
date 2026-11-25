@@ -14,6 +14,11 @@ anchors:
   - shared/narrator-handle.ts
   - shared/narrator-limits.ts
   - frontend/hooks/useNamedNarrator.ts
+  - server/services/named-narrator-suggestions.ts
+  - server/services/__tests__/named-narrator-suggestions.test.ts
+  - server/routes/__tests__/named-narrator-suggestions.test.ts
+  - shared/named-narrator-suggestions.ts
+  - frontend/hooks/useNamedNarratorSuggestions.ts
   - server/routes/narrator-manual-resources.ts
 keywords:
   - /api/narrators/:id/panel-state
@@ -38,7 +43,7 @@ keywords:
   - MAX_NARRATOR_DRAFT_CHARS
   - getNarratorNavigationSummary
 status: draft
-verified_at: 878917e97
+verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 ---
 # 会话外观与状态
 
@@ -47,6 +52,7 @@ verified_at: 878917e97
 ## 关键规则
 - 标题：首条用户消息先 `setProvisionalTitleFromUserMessage`（首句，超过 50 字符截成 49 加 `…`）写占位标题；再由摘要模型 `generateQuickTitle`（输入截 500 字符）或 `generateTitle`（首 1 条加末 6 条消息）生成，各 30 秒超时，引号去掉、超 80 字符截 50；均经 `persistTitle` 写库并发 WS `title_updated` 和事件 `narrator:title_updated`。生成失败只记日志不抛（`narrator-title.ts`）。
 - 命名叙述者 handle：2–32 个码点，Unicode 字母/数字/`_`/`-`，首字符须是字母或数字；保留输入大小写，唯一性与匹配用 `foldHandle`（NFC + 小写）（`shared/narrator-handle.ts`、`validators/narrators.ts:narratorHandleSchema`）。路由 `GET /api/narrators/named`、`GET /by-handle/:handle`、`PATCH /:id/handle`；前端 `useNamedNarrators`、`useUpdateNarratorHandle`。
+- `GET /api/narrators/named?view=suggestions` 专供输入框：worker-required SQL 只投影 id/handle/截到 160 字符的 title/status，限定 primary、named trait 与有效 handle，先应用当前 ACL 再按 `handleFold` 游标取 `limit+1`（默认 20、最多 50）。q 原输入有界，NFC+小写后最多 32 码点；游标 ≤1024 字符并绑定 q，响应 ≤48 KiB。不读取完整 narrator DTO/草稿，不先取 1000 行再裁；原完整 named API 保留，远程策略仍不开放 named。
 - 快速模式：`narrators.fastModeOverride` 三态 inherit / on / off；`inherit` 时子代理跟随根 primary，primary 取当前执行主体或持久化主体的 `userPreferences.fastModeDefault`；结果带 `fastModeSource`（override / primary / user-default / unavailable）。解析器带有界缓存，依赖变化即作废重算，超时 30 秒（`narrator-fast-mode.ts:createNarratorFastModeResolver`；`PATCH /api/narrators/:id/fast-mode`）。
 - 面板状态：`GET /:id/panel-state` 返回待决权限、缓冲邮箱与草稿元数据，权限页/缓冲页用 cursor，整体 4 MiB 字节预算，ExitPlanMode 的待决权限项带 `planReflectionAvailable`（`isPendingPlanReflectionAvailable`，内存态，重启后不存在），超过 250ms 记慢日志（`narrator-panel-state.ts:getNarratorPanelState`）。
 - 草稿：按（用户, 叙述者）一行存 `narrator_drafts`，后写者胜；被覆盖的上一版放进单个撤销槽，`restoreNarratorDraftPrevious` 与当前版对调（`narrator-draft-service.ts`；`GET/PUT /:id/draft`、`POST /:id/draft/restore`；文本上限 `shared/narrator-limits.ts:MAX_NARRATOR_DRAFT_CHARS` = 200000）。

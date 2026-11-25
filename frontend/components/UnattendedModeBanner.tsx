@@ -1,14 +1,13 @@
 import { Alert, Button, Group, Stack, Text } from "@mantine/core";
-import { UNATTENDED_CHANGED_WS_TYPE, UNATTENDED_IDLE_POLL_INTERVAL_MS } from "@shared/unattended";
 import { IconPower } from "@tabler/icons-react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useReducer } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../hooks/useAuth";
+import { useUnattendedStatus } from "../hooks/useUnattendedStatus";
 import { ApiError, api } from "../lib/api";
 import { type UnattendedStatus, unattendedStatusQueryKey } from "../lib/api/unattended";
 import { formatLocaleTime } from "../lib/intl-format";
-import { narratorWSManager } from "../lib/narrator-ws-manager";
 import { TOP_BANNER_SECOND_ROW_STYLE } from "../lib/safe-area";
 import { Z } from "../lib/z-index";
 
@@ -21,15 +20,7 @@ import { Z } from "../lib/z-index";
  * to every signed-in user (see `routes/unattended.ts`) and why the banner is mounted by the
  * authenticated shell rather than by one route.
  *
- * It is also the single owner of the 5 s status poll: the settings card reads the same query
- * key without an interval, so two surfaces never poll independently.
- */
-
-const POLL_INTERVAL_MS = 5_000;
-/**
- * A slow poll while the mode is off is what lets a *different* browser notice that
- * somebody armed it — the banner is the only surface that user may be able to reach before
- * the machine goes down, so it must appear without a page reload.
+ * The shared status hook owns WS recovery and the offline-only safety poll for both surfaces.
  */
 const URGENT_WINDOW_MS = 60_000;
 
@@ -66,45 +57,17 @@ export function UnattendedModeBanner() {
 	const { t } = useTranslation("settings");
 	const { data: user } = useCurrentUser();
 	const client = useQueryClient();
-	const statusQuery = useQuery({
-		queryKey: unattendedStatusQueryKey,
-		queryFn: ({ signal }) => api.getUnattendedStatus(signal),
-		enabled: !!user,
-		refetchInterval: (query) =>
-			query.state.data?.enabled ? POLL_INTERVAL_MS : UNATTENDED_IDLE_POLL_INTERVAL_MS,
-		refetchIntervalInBackground: true,
-		retry: false,
-	});
-	const signedIn = !!user;
-	useEffect(() => {
-		if (!signedIn) return;
-		let disposed = false;
-		const refresh = async () => {
-			await client.cancelQueries({ queryKey: unattendedStatusQueryKey });
-			if (!disposed) await client.invalidateQueries({ queryKey: unattendedStatusQueryKey });
-		};
-		const listener = narratorWSManager.addListener(
-			{ types: [UNATTENDED_CHANGED_WS_TYPE] },
-			refresh,
-		);
-		const disconnect = narratorWSManager.onConnectionChange((connected) => {
-			if (connected) void refresh();
-		});
-		return () => {
-			disposed = true;
-			disconnect();
-			narratorWSManager.removeListener(listener);
-		};
-	}, [client, signedIn]);
+	const statusQuery = useUnattendedStatus(!!user);
 	const cancel = useMutation({
 		mutationFn: () => api.cancelUnattendedMode(),
-		onSuccess: ({ status }) => {
+		onSuccess: async ({ status }) => {
+			await client.cancelQueries({ queryKey: unattendedStatusQueryKey, exact: true });
 			client.setQueryData(unattendedStatusQueryKey, status);
 		},
 	});
 	const status = statusQuery.data;
 	const enabled = status?.enabled === true;
-	// One local ticker for the countdown text; status itself still comes from the 5 s poll.
+	// Local countdown only: ticking never fetches status.
 	const [, tick] = useReducer((ticks: number) => ticks + 1, 0);
 	useEffect(() => {
 		if (!enabled) return;

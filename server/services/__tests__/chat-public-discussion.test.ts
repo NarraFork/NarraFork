@@ -299,6 +299,7 @@ describe("public projection and live identity", () => {
 		const broadcasts: unknown[] = [];
 		const badges: string[] = [];
 		setChatNotifyChannel({
+			broadcastToNarrator: () => {},
 			broadcastToChatRoom: (_room, message) => broadcasts.push(message),
 			broadcastToUser: (user) => badges.push(user),
 			getChatRoomSubscriberUserIds: () => new Set(),
@@ -423,6 +424,7 @@ describe("public projection and live identity", () => {
 		});
 		const broadcasts: unknown[] = [];
 		setChatNotifyChannel({
+			broadcastToNarrator: () => {},
 			broadcastToChatRoom: (_room, message) => broadcasts.push(message),
 			broadcastToUser: () => {},
 			getChatRoomSubscriberUserIds: () => new Set(),

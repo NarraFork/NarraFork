@@ -182,7 +182,19 @@ describe.skipIf(!enabled)("production remote frontend native-network boundary", 
 				await page.waitForSelector('[data-inline-composer] [contenteditable="true"]', {
 					timeout: 30_000,
 				});
-				await page.waitForSelector('[data-remote-unsupported="true"]', { timeout: 30_000 });
+				// Other unsupported resources (including the historical markdown image)
+				// can paint before the async virtual list publishes the ShareFile row.
+				// Wait for this record's actual tool row and its own resource guard, not
+				// an unrelated page-level marker. No scrolling or synthetic data bypass.
+				await page.waitForFunction(
+					() =>
+						[...document.querySelectorAll('[data-message-id="history"][data-nf-row-kind]')].some(
+							(row) =>
+								row.textContent?.includes("ShareFile") &&
+								row.querySelector('[data-remote-unsupported="true"]'),
+						),
+					{ timeout: 30_000 },
+				);
 				expect(await page.evaluate(() => document.body.textContent?.includes("ShareFile"))).toBe(
 					true,
 				);

@@ -17,6 +17,7 @@ import { parseHTML } from "linkedom";
 import { act, type ComponentProps, type ReactNode, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
+import { runtimeSettingsQueryOptions } from "../../../hooks/useRuntimeSettings";
 import { api, type BufferMessageSummary } from "../../../lib/api";
 import { ApiError } from "../../../lib/api/client";
 import type { RevertActionPreview } from "../../../lib/api/narrators";
@@ -1281,7 +1282,6 @@ describe("native media queued rows and manifest editing", () => {
 });
 
 describe("editable native media chip previews", () => {
-	beforeEach(() => qc.setQueryData(["settings"], {}));
 	async function activateMediaChip(element: Element) {
 		const event = new Event("click", { bubbles: true });
 		Object.defineProperty(event, "detail", { value: 0 });
@@ -1298,6 +1298,16 @@ describe("editable native media chip previews", () => {
 		Object.defineProperty(globalThis, "localStorage", {
 			configurable: true,
 			value: { getItem: (key: string) => (key === "narrafork_token" ? "preview-session" : null) },
+		});
+		// Prompt optimization reads the independent identity-scoped runtime projection.
+		// Seed that dependency without weakening the media lane's zero-before-open
+		// and exactly-one-authorized-blob-fetch assertions below.
+		qc.setQueryData(runtimeSettingsQueryOptions().queryKey, {
+			revision: 1,
+			agent: { defaultModel: "", summaryModel: "" },
+			outline: { enabled: false },
+			requestEvidence: { autoPin: "off" },
+			summaryModelAvailable: false,
 		});
 	});
 	for (const kind of ["audio", "video"] as const) {

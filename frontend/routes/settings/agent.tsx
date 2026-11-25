@@ -6,7 +6,10 @@ import { AgentSection } from "../../components/settings/AgentSection";
 import { TraitLayerEditor } from "../../components/settings/TraitLayerEditor";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { useInstanceSettingsContext } from "../../hooks/useInstanceSettings";
-import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
+import {
+	useUpdateUserPreferencesDetail as useUpdateUserPreferences,
+	useUserPreferencesDetail as useUserPreferences,
+} from "../../hooks/useUserPreferences";
 
 export const Route = createFileRoute("/settings/agent")({
 	component: SettingsAgentPage,

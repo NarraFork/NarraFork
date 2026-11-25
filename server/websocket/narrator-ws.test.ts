@@ -81,7 +81,9 @@ function openFakeWs(
 	const connection = createFakeWs(options);
 	handleNarratorWS.open(connection.ws);
 	openedConnections.push(connection.ws);
-	return connection;
+	// Business-event assertions start after the independent authenticated handshake.
+	const initialFrames = connection.sent.splice(0);
+	return { ...connection, initialFrames };
 }
 
 async function seedNarrators() {
@@ -442,6 +444,8 @@ describe("narrator WebSocket RecentTabs scaling", () => {
 					narratorId: "narrator-idle",
 					status: "idle",
 					substatus: [],
+					statusEpoch: expect.any(String),
+					statusRevision: expect.any(Number),
 					activeBackgroundTaskCount: 0,
 					activeBackgroundWorkCount: 0,
 					activeBackgroundServiceCount: 0,
@@ -451,6 +455,8 @@ describe("narrator WebSocket RecentTabs scaling", () => {
 					status: "working",
 					substatus: ["reasoning"],
 					turnStartedAt: "2026-07-19T00:00:00.000Z",
+					statusEpoch: expect.any(String),
+					statusRevision: expect.any(Number),
 					activeBackgroundTaskCount: 0,
 					activeBackgroundWorkCount: 0,
 					activeBackgroundServiceCount: 0,
@@ -1044,5 +1050,25 @@ describe("narrator WebSocket activity subscription", () => {
 			downgrade: true,
 		});
 		expect(ws.data.activityOnlyNarrators?.has("narrator-idle")).toBe(true);
+	});
+});
+
+describe("initial runtime settings revision handshake", () => {
+	it("sends only a bounded revision hint before any narrator subscription", () => {
+		const { initialFrames, sent, ws } = openFakeWs({ userId: "handshake-user" });
+		expect(initialFrames).toEqual([
+			{ type: "settings_runtime_changed", revision: expect.any(Number), initial: true },
+		]);
+		expect(JSON.stringify(initialFrames).length).toBeLessThan(192);
+		expect(ws.data.subscribedNarrators.size).toBe(0);
+		expect(sent).toEqual([]);
+	});
+
+	it("does not reveal host revision state to an unidentified connection", () => {
+		const anonymous = createFakeWs();
+		delete anonymous.ws.data.userId;
+		handleNarratorWS.open(anonymous.ws);
+		openedConnections.push(anonymous.ws);
+		expect(anonymous.sent).toEqual([]);
 	});
 });

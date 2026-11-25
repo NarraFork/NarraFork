@@ -191,6 +191,8 @@ export class PretextLayoutCoordinator {
 	private narratorId: string | undefined;
 	private loadOptions: PretextDocumentLoadOptions = {};
 	private loadingOlder = false;
+	private suspended = false;
+	private olderController: AbortController | undefined;
 	/**
 	 * The in-flight upward page, so a second caller can AWAIT it instead of being
 	 * told "0 prepended" and looping against a window that is about to grow.
@@ -242,6 +244,7 @@ export class PretextLayoutCoordinator {
 	 * second fetch — it only updates the params the single fetch commits with.
 	 */
 	private pendingLoad: {
+		controller: AbortController;
 		narratorId: string;
 		generation: number;
 		buildOptions: PretextLayoutBuildOptions;
@@ -266,8 +269,8 @@ export class PretextLayoutCoordinator {
 		viewportHeight = 0,
 		opts: { forceReload?: boolean; restoreOverrides?: ReadonlyMap<string, number> } = {},
 	): Promise<PretextLayoutCoordinatorSnapshot> {
-		if (this.sessionEpoch !== pretextSessionEpoch())
-			throw new DOMException("Coordinator session retired", "AbortError");
+		if (this.suspended || this.sessionEpoch !== pretextSessionEpoch())
+			throw new DOMException("Coordinator suspended or session retired", "AbortError");
 		// Coalesce: reuse an in-flight tail fetch for the same narrator instead of
 		// issuing a duplicate request. Re-target it to the latest build options so
 		// it commits once at the final width/LOD. forceReload always restarts.
@@ -283,6 +286,8 @@ export class PretextLayoutCoordinator {
 			return pending.promise;
 		}
 
+		pending?.controller.abort();
+		this.olderController?.abort();
 		const generation = this.advanceGeneration();
 		if (this.narratorId !== narratorId) {
 			this.mathScanCursor = createMathScanCursor();
@@ -292,7 +297,9 @@ export class PretextLayoutCoordinator {
 		this.loadOptions = loadOptions;
 		this.current = { ...this.current, status: "loading", error: undefined };
 		this.emit();
+		const controller = new AbortController();
 		const entry: NonNullable<PretextLayoutCoordinator["pendingLoad"]> = {
+			controller,
 			narratorId,
 			generation,
 			buildOptions,
@@ -307,6 +314,9 @@ export class PretextLayoutCoordinator {
 		// number of rows fetched, so it never triggers a second request.
 		const tailLoadOptions: PretextDocumentLoadOptions = {
 			...loadOptions,
+			signal: loadOptions.signal
+				? AbortSignal.any([loadOptions.signal, controller.signal])
+				: controller.signal,
 			firstScreenPageSize:
 				loadOptions.firstScreenPageSize ?? firstScreenPageSizeForLod(buildOptions.lod),
 		};
@@ -381,11 +391,14 @@ export class PretextLayoutCoordinator {
 		getHeightOverrides?: () => ReadonlyMap<string, number> | undefined,
 	): Promise<number> {
 		const previous = this.input;
-		if (!previous?.hasPrev || this.narratorId == null) return 0;
+		if (this.suspended || !previous?.hasPrev || this.narratorId == null) return 0;
 		// Join the in-flight page rather than reporting "nothing prepended": the
 		// awaitable jump path uses the resolved count to decide whether to page
 		// again, and a premature 0 would end the jump one page short of its target.
 		if (this.loadingOlder) return this.pendingOlder ?? 0;
+		// Paging changes the canonical window, unlike a geometry rebuild.
+		this.pendingWindowRefresh?.controller.abort();
+		this.pendingWindowRefresh = undefined;
 		this.loadingOlder = true;
 		const promise = this.runLoadOlder(previous, buildOptions, getView, getHeightOverrides);
 		this.pendingOlder = promise;
@@ -402,10 +415,18 @@ export class PretextLayoutCoordinator {
 		const generation = this.generation;
 		const previousTotalHeight = this.current.index?.totalHeight ?? 0;
 		const resizeEpoch = this.resizeEpoch;
+		const controller = new AbortController();
+		this.olderController = controller;
+		const signal = this.loadOptions.signal
+			? AbortSignal.any([this.loadOptions.signal, controller.signal])
+			: controller.signal;
 		this.current = { ...this.current, loadingOlder: true };
 		this.emit();
 		try {
-			const next = await loadPretextDocumentOlder(this.narratorId, previous, this.loadOptions);
+			const next = await loadPretextDocumentOlder(this.narratorId, previous, {
+				...this.loadOptions,
+				signal,
+			});
 			if (generation !== this.generation) return 0;
 			// An older page may introduce the document's first formula; resolved before
 			// the prepend commits so the newly prepended rows are never re-measured.
@@ -466,14 +487,15 @@ export class PretextLayoutCoordinator {
 			this.emit();
 			throw error;
 		} finally {
-			this.loadingOlder = false;
-			this.pendingOlder = null;
-			// Repair a stale spinner flag even if a concurrent rebuild/reload bumped
-			// the generation while this fetch was in flight (that commit captured
-			// loadingOlder=true). Never resurrect a snapshot from an older generation.
-			if (this.current.loadingOlder) {
-				this.current = { ...this.current, loadingOlder: false };
-				this.emit();
+			if (this.olderController === controller) {
+				this.olderController = undefined;
+				this.loadingOlder = false;
+				this.pendingOlder = null;
+				// Never let a retired page clear a newer page's spinner.
+				if (this.current.loadingOlder) {
+					this.current = { ...this.current, loadingOlder: false };
+					this.emit();
+				}
 			}
 		}
 	}
@@ -484,7 +506,7 @@ export class PretextLayoutCoordinator {
 		viewportHeight = 0,
 	): PretextLayoutCoordinatorSnapshot {
 		if (!this.input) throw new Error("cannot rebuild layout before document input is loaded");
-		const generation = this.advanceGeneration();
+		const generation = this.advanceGeneration(true);
 		this.current = { ...this.current, status: "computing", error: undefined };
 		this.emit();
 		return this.commitLayout(this.input, buildOptions, anchor, viewportHeight, generation);
@@ -777,15 +799,19 @@ export class PretextLayoutCoordinator {
 			this.pendingWindowRefresh?.controller.abort();
 			this.pendingWindowRefresh = undefined;
 		}
-		return ++this.generation;
+		const generation = ++this.generation;
+		// Geometry is not canonical invalidation: retarget the pending read's commit
+		// fence while keeping its transport and live getView anchor intact.
+		if (preserveWindowRefresh && this.pendingWindowRefresh)
+			this.pendingWindowRefresh.generation = generation;
+		return generation;
 	}
 
 	private denyCachedWindow(narratorId: string, error: unknown): void {
 		// Never leave unauthorized cached text visible, nor reuse its tail handoff.
 		invalidateCachedPretextDocument(narratorId);
 		invalidatePretextDocumentTail(narratorId);
-		this.advanceGeneration();
-		this.pendingLoad = null;
+		this.cancel();
 		this.input = undefined;
 		this.structureVersion = undefined;
 		this.streamingMessage = null;
@@ -802,10 +828,12 @@ export class PretextLayoutCoordinator {
 		return this.refreshCurrentWindow(getView);
 	}
 
-	/** Revalidate the loaded window by stable head ID; cached input is never freshness evidence. */
+	/** Revalidate canonical data independently of geometry-only commits. */
 	refreshCurrentWindow(getView: () => PrependView, windowTimeoutMs = 10_000): Promise<boolean> {
-		if (this.sessionEpoch !== pretextSessionEpoch())
-			return Promise.reject(new DOMException("Coordinator session retired", "AbortError"));
+		if (this.suspended || this.sessionEpoch !== pretextSessionEpoch())
+			return Promise.reject(
+				new DOMException("Coordinator suspended or session retired", "AbortError"),
+			);
 		const input = this.input;
 		const narratorId = this.narratorId;
 		const generation = this.generation;
@@ -823,7 +851,8 @@ export class PretextLayoutCoordinator {
 			return previous.promise;
 		previous?.controller.abort();
 		const controller = new AbortController();
-		const parentSignal = this.loadOptions.signal;
+		const loadOptions = this.loadOptions;
+		const parentSignal = loadOptions.signal;
 		const parentAbort = () => controller.abort(parentSignal?.reason);
 		const unsubscribeSession = onPretextSessionChange(() => controller.abort());
 		if (parentSignal?.aborted) parentAbort();
@@ -839,22 +868,36 @@ export class PretextLayoutCoordinator {
 		const current = () =>
 			this.pendingWindowRefresh === entry &&
 			!controller.signal.aborted &&
+			!this.suspended &&
 			this.narratorId === narratorId &&
-			this.generation === generation &&
+			this.generation === entry.generation &&
 			pretextSessionEpoch() === sessionEpoch;
 		const superseded = () => new DOMException("Window refresh superseded", "AbortError");
 		entry.promise = (async () => {
 			let committing = false;
 			try {
-				const next = await refreshPretextDocumentWindow(narratorId, input, {
-					...this.loadOptions,
-					signal: controller.signal,
-					windowTimeoutMs,
-				});
+				let next = loadOptions.refreshWindow
+					? await loadOptions.refreshWindow({
+							narratorId,
+							window: input,
+							signal: controller.signal,
+						})
+					: await refreshPretextDocumentWindow(narratorId, input, {
+							...loadOptions,
+							signal: controller.signal,
+							windowTimeoutMs,
+						});
 				if (!current()) throw superseded();
 				if (askMutationEpoch !== this.askMutationEpoch) return false;
+				if (!next && loadOptions.refreshFailurePolicy === "retain")
+					throw new Error("Canonical window could not be recovered");
 				if (!next || !this.current.index || !this.lastBuildOptions) return false;
 				await this.prepareKatex(next);
+				if (!current()) throw superseded();
+				if (askMutationEpoch !== this.askMutationEpoch) return false;
+				// A delete may arrive while preparation is awaiting. Overlay the host's
+				// latest barriers synchronously, leaving no await between projection and commit.
+				next = loadOptions.finalizeRefreshWindow?.(next) ?? next;
 				if (!current()) throw superseded();
 				if (askMutationEpoch !== this.askMutationEpoch) return false;
 				const view = getView();
@@ -872,15 +915,7 @@ export class PretextLayoutCoordinator {
 					view.viewportHeight,
 					commitGeneration,
 				);
-				if (
-					this.pendingWindowRefresh !== entry ||
-					controller.signal.aborted ||
-					this.narratorId !== narratorId ||
-					this.generation !== commitGeneration ||
-					this.askMutationEpoch !== askMutationEpoch ||
-					pretextSessionEpoch() !== sessionEpoch
-				)
-					throw superseded();
+				if (!current() || this.askMutationEpoch !== askMutationEpoch) throw superseded();
 				return true;
 			} catch (error) {
 				if (committing) throw error;
@@ -891,7 +926,17 @@ export class PretextLayoutCoordinator {
 					throw error;
 				}
 				if ((error as { name?: string })?.name === "AbortError") throw error;
-				// A bad boundary/409/temporary failure may recover through ONE canonical tail.
+				if (loadOptions.refreshFailurePolicy === "retain" || loadOptions.refreshWindow) {
+					this.current = {
+						...this.current,
+						status: "ready",
+						error: error instanceof Error ? error : new Error(String(error)),
+					};
+					this.emit();
+					loadOptions.onRefreshError?.(error);
+					throw error;
+				}
+				// Narrator default: a bad boundary/409 may recover through one canonical tail.
 				return false;
 			} finally {
 				unsubscribeSession();
@@ -1206,10 +1251,32 @@ export class PretextLayoutCoordinator {
 		this.segmentationCache.clear();
 	}
 
+	/** Suspend transport without retiring the loaded document or its scroll anchor. */
+	setSuspended(suspended: boolean): void {
+		if (this.suspended === suspended) return;
+		this.suspended = suspended;
+		if (!suspended) return;
+		this.cancel();
+		this.current = {
+			...this.current,
+			status: this.input ? "ready" : "idle",
+			loadingOlder: false,
+		};
+		this.emit();
+	}
+
+	setLoadOptions(options: PretextDocumentLoadOptions = {}): void {
+		this.loadOptions = options;
+	}
+
 	cancel(): void {
 		this.advanceGeneration();
-		// Abandon any in-flight tail load so a later same-narrator load() does not
-		// coalesce onto a superseded fetch.
+		this.pendingLoad?.controller.abort();
+		this.olderController?.abort();
+		this.olderController = undefined;
+		this.loadingOlder = false;
+		this.pendingOlder = null;
+		// A later same-narrator load must not join a superseded transport.
 		this.pendingLoad = null;
 	}
 
@@ -1346,7 +1413,7 @@ export class PretextLayoutCoordinator {
 		const view = getView?.();
 		const anchor =
 			view && this.current.index ? captureCoordinatorAnchor(this.current.index, view) : undefined;
-		const generation = this.advanceGeneration();
+		const generation = this.advanceGeneration(true);
 		this.commitLayout(
 			this.input,
 			this.lastBuildOptions,
@@ -1515,7 +1582,7 @@ export class PretextLayoutCoordinator {
 					view && this.current.index
 						? captureCoordinatorAnchor(this.current.index, view)
 						: undefined;
-				const nextGeneration = this.advanceGeneration();
+				const nextGeneration = this.advanceGeneration(true);
 				this.commitLayout(
 					this.input,
 					this.lastBuildOptions,

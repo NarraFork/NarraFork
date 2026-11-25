@@ -23,6 +23,7 @@ import { db } from "@server/db";
 import { chatMessages } from "@server/db/schema";
 import { eventBus } from "@server/lib/event-bus";
 import { logger } from "@server/lib/logger";
+import type { ChatRoomKind } from "@shared/chat-room-kinds";
 import { eq } from "drizzle-orm";
 import type { NarratorServerMessage } from "../websocket/narrator-ws-types";
 import {
@@ -33,6 +34,7 @@ import {
 
 /** Injectable so tests can assert routing without a live WebSocket server. */
 interface ChatNotifyChannel {
+	broadcastToNarrator: (narratorId: string, message: NarratorServerMessage) => void;
 	broadcastToChatRoom: (roomId: string, message: NarratorServerMessage) => void;
 	broadcastToUser: (userId: string, message: NarratorServerMessage) => void;
 	getChatRoomSubscriberUserIds: (roomId: string) => Set<string>;
@@ -51,6 +53,7 @@ async function resolveChannel(): Promise<ChatNotifyChannel> {
 	// module is also loaded by tests that only care about the routing decisions.
 	const ws = await import("../websocket/narrator-ws");
 	return {
+		broadcastToNarrator: ws.broadcastToNarrator,
 		broadcastToChatRoom: ws.broadcastToChatRoom,
 		broadcastToUser: ws.broadcastToUser,
 		getChatRoomSubscriberUserIds: ws.getChatRoomSubscriberUserIds,
@@ -72,6 +75,8 @@ async function onMessageCreated(
 		messageId: string;
 		seq: number;
 		senderUserId: string | null;
+		roomKind?: ChatRoomKind;
+		narratorId?: string | null;
 	},
 	deps: ChatNotifyDeps = { listRoomUnread: listRoomUnreadForFanout },
 ): Promise<void> {
@@ -112,6 +117,9 @@ async function onMessageCreated(
 			type: "chat:unread_changed",
 			roomId: event.roomId,
 			unread,
+			...(event.roomKind === "narrator" && event.narratorId
+				? { narratorId: event.narratorId }
+				: {}),
 		});
 	}
 }
@@ -125,10 +133,22 @@ async function onMessageDeleted(event: { roomId: string; messageId: string }): P
 	});
 }
 
+async function onRoomCreated(event: { roomId: string; narratorId: string }): Promise<void> {
+	const target = await resolveChannel();
+	// Reuse the existing authorized narrator subscription audience. There need not
+	// be any chat members yet, and no global user/room enumeration is necessary.
+	target.broadcastToNarrator(event.narratorId, {
+		type: "chat:room_created",
+		roomId: event.roomId,
+		narratorId: event.narratorId,
+	});
+}
+
 async function onRoomRead(event: {
 	roomId: string;
 	userId: string;
 	lastReadSeq: number;
+	narratorId?: string;
 }): Promise<void> {
 	const target = await resolveChannel();
 	target.broadcastToChatRoom(event.roomId, {
@@ -144,6 +164,7 @@ async function onRoomRead(event: {
 		type: "chat:unread_changed",
 		roomId: event.roomId,
 		unread: unread.count,
+		...(event.narratorId ? { narratorId: event.narratorId } : {}),
 	});
 }
 
@@ -169,6 +190,9 @@ export function initChatNotify(): void {
 	eventBus.on("chat:message_deleted", (event) => {
 		guard("chat:message_deleted", () => onMessageDeleted(event));
 	});
+	eventBus.on("chat:room_created", (event) => {
+		guard("chat:room_created", () => onRoomCreated(event));
+	});
 	eventBus.on("chat:room_read", (event) => {
 		guard("chat:room_read", () => onRoomRead(event));
 	});
@@ -181,4 +205,4 @@ export function initChatNotify(): void {
  * fire-and-forget (`guard` swallows the promise): a test that emitted would have
  * to race the handler instead of awaiting it.
  */
-export const chatNotifyTesting = { onMessageCreated, onMessageDeleted, onRoomRead };
+export const chatNotifyTesting = { onMessageCreated, onMessageDeleted, onRoomCreated, onRoomRead };

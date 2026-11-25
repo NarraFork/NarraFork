@@ -17,6 +17,18 @@ import {
 import { followOptionLabel } from "../lib/follow-model-label";
 import { createModelOptionsFilter } from "../lib/model-search";
 import type { ProviderCapabilityKey } from "./usePlatform";
+import { useRuntimeSettings } from "./useRuntimeSettings";
+
+/** Current/default references for mounted session UI, without provider/catalog configuration. */
+export function useModelRuntimeSettings(enabled = true) {
+	const query = useRuntimeSettings(enabled);
+	return {
+		...query,
+		settingsData: query.data,
+		defaultModelValue: query.data?.agent.defaultModel ?? "",
+		summaryModelValue: query.data?.agent.summaryModel ?? "",
+	};
+}
 
 const MODELS_SETTINGS_QUERY_GC_TIME_MS = 60_000;
 const MODELS_SETTINGS_QUERY_STALE_TIME_MS = 30_000;
@@ -212,13 +224,14 @@ export function classifyFallbackModelPresence(args: {
  * Replaces duplicated model-building logic across NarratorPanel,
  * sessions/index and settings pages.
  */
-export function useAllModels() {
+export function useAllModels(enabled = true) {
 	const qc = useQueryClient();
 	// The follow-default/summary rows and their groups are shown to people: never the sentinel.
 	const { t } = useTranslation("narrator");
-	const { data: settingsData } = useQuery({
+	const { data: settingsData, dataUpdatedAt: settingsUpdatedAt } = useQuery({
 		queryKey: ["settings"],
 		queryFn: api.getSettings,
+		enabled,
 		staleTime: MODELS_SETTINGS_QUERY_STALE_TIME_MS,
 		gcTime: MODELS_SETTINGS_QUERY_GC_TIME_MS,
 	});
@@ -227,13 +240,14 @@ export function useAllModels() {
 	// settings (which carry the NUG model list + `available` flags) so the picker
 	// reflects recovery/outage live.
 	useEffect(() => {
-		if (settingsData?.commandcodeModelsPending !== true) return;
+		if (!enabled || settingsData?.commandcodeModelsPending !== true) return;
 		const timer = setTimeout(() => {
 			void qc.invalidateQueries({ queryKey: ["settings"] });
 		}, 1_500);
 		return () => clearTimeout(timer);
-	}, [settingsData?.commandcodeModelsPending, qc]);
+	}, [enabled, settingsData?.commandcodeModelsPending, qc]);
 	useEffect(() => {
+		if (!enabled) return;
 		const onAvailabilityChanged = () => {
 			qc.invalidateQueries({ queryKey: ["settings"] });
 		};
@@ -247,27 +261,14 @@ export function useAllModels() {
 				onAvailabilityChanged as EventListener,
 			);
 		};
-	}, [qc]);
+	}, [enabled, qc]);
 
-	// auto:<model> rows and their sources. Keyed under ["settings"] so every settings
-	// invalidation refreshes them. Settings pages that write the cache with setQueryData do
-	// not invalidate, so the fields that decide auto candidates are part of the key too.
-	const autoInputs = settingsData
-		? JSON.stringify([
-				settingsData.agent?.hiddenModels,
-				settingsData.agent?.disabledProviders,
-				settingsData.agent?.autoExcludedProviders,
-				settingsData.agent?.customModels?.length,
-				...[settingsData.customApiProviders, settingsData.nugProviders].map(
-					(list?: Array<{ prefix?: string; disabled?: boolean }>) =>
-						list?.map((p) => [p.prefix, p.disabled]),
-				),
-			])
-		: "";
+	// Legacy management views still need complete rows. A small cache generation replaces
+	// the former configuration-JSON key; session UI uses runtime/options instead.
 	const { data: autoModelsData } = useQuery({
-		queryKey: ["settings", "auto-models", autoInputs],
+		queryKey: ["settings", "auto-models", settingsUpdatedAt],
 		queryFn: modelCatalogApi.autoModels,
-		enabled: !!settingsData,
+		enabled: enabled && !!settingsData,
 		staleTime: MODELS_SETTINGS_QUERY_STALE_TIME_MS,
 		gcTime: MODELS_SETTINGS_QUERY_GC_TIME_MS,
 		placeholderData: (previous) => previous,

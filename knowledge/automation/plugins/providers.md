@@ -33,7 +33,7 @@ keywords:
   - apikey-quota
   - 模型提供商插件
 status: draft
-verified_at: 2e6441ad0
+verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 ---
 # 提供商插件
 
@@ -45,6 +45,7 @@ verified_at: 2e6441ad0
 - 接入模型解析：`main.ts` 用 `registerExternalProviderResolver` 把 `pluginProviderRegistry.resolveExternalProvider` 挂到解析链上。
 - 适配器懒激活：解析时同步造出 `RemoteProviderAdapter`，首次 `chat/generate` 才激活运行时并做一次 `provider.describe` 握手，客户端池由适配器工厂与目录刷新器共用，同一插件只激活一次（`plugin-provider-adapter-factory.ts`、`plugin-provider-client.ts`）。
 - 模型目录：清单只给粗目录，真正的目录靠 `provider.listModels` 拉取，最多翻 10 页、每页 ≤200；失败只把目录标成 stale，保留旧目录；插件成功激活后宿主会顺带刷新仍 stale 的目录，失败仅记日志（`plugin-provider-catalog-refresh.ts`、`plugin-manager.ts:refreshProviderCatalogs`）。
+- 选择菜单的 source-group 发现仅用 registry 的 `listModelOptionsOwners` 小投影，不克隆 configSchema/完整模型描述。每次目录发布替换冻结的 `modelOptionsArray` 并推进 listingRevision，capture 固定该数组、先 slice 再投影；不为读取菜单激活插件或调用 provider RPC（`plugin-provider-registry.ts`，预算见[模型列表](../../agent/model-catalog/sourcing.md)）。
 - 配置与凭证：普通字段进注册表和 `state.json`，schema 里标 `format: "password"`、`writeOnly` 或 `x-narrafork-secret` 的字段是密钥，存到密钥库，读接口只返回占位符 `__narrafork_secret_set__` 和“已设置”列表。每次请求由 `PluginProviderCredentialResolver.resolve` 把该提供商自己声明的密钥字段合并进 `config` 发给插件：不缓存，未设置的字段整个省略而不是空串，不记日志，读密钥失败退化为“无凭证”。
 - 出站代理是宿主策略，不属于插件 config：解析后的代理 URL 通过 `hostHints` 下发；目标为私网/回环地址时需要插件持有 `network.egress.allowlist` 授权才下发（`plugin-provider-proxy-policy.ts`）。
 - 就绪检查 `listPluginProviderReadiness`：只看注册状态、是否有适配器工厂、配置是否齐备，不拉模型、不激活插件；并发 4、总预算 1.5s（超时保留已得结果）、最多 1000 个。

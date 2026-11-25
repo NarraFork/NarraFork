@@ -162,6 +162,11 @@ import {
 } from "./narrator-scoped-revert";
 import { withNarratorWorkAdmission } from "./narrator-session-state";
 import {
+	committedNarratorStatusPatch,
+	narratorStatusPatchColumns,
+	versionNarratorStatusCommit,
+} from "./narrator-status-version";
+import {
 	type NarratorSurfaceReadBudget,
 	narratorSurfaceReadOptions,
 } from "./narrator-surface-reads";
@@ -5314,23 +5319,25 @@ const narratorMessageQueriesUnlocked = {
 		// idempotent success: just clear the narrator-level error and notify, so the
 		// user never sees a spurious "Message not found" when clicking dismiss.
 		if (!msg) {
-			await db
-				.update(narrators)
-				.set({
-					errorMessage: null,
-					messageVersion: sql`${narrators.messageVersion} + 1`,
-					contextUsageSnapshotJson: null,
-				})
-				.where(eq(narrators.id, narratorId));
-			const narrator = await db.query.narrators.findFirst({
-				where: eq(narrators.id, narratorId),
-				columns: { status: true },
-			});
-			broadcastToNarrator(narratorId, {
-				type: "status_change",
-				narratorId,
-				status: narrator?.status ?? "idle",
-			});
+			const committed = versionNarratorStatusCommit(
+				db
+					.update(narrators)
+					.set({
+						errorMessage: null,
+						errorRetryable: null,
+						messageVersion: sql`${narrators.messageVersion} + 1`,
+						contextUsageSnapshotJson: null,
+					})
+					.where(eq(narrators.id, narratorId))
+					.returning(narratorStatusPatchColumns)
+					.get(),
+			);
+			if (committed)
+				broadcastToNarrator(narratorId, {
+					type: "status_change",
+					narratorId,
+					...(await committedNarratorStatusPatch(narratorId, committed)),
+				});
 			return;
 		}
 
@@ -5346,7 +5353,7 @@ const narratorMessageQueriesUnlocked = {
 		// Delete the ref (if any) and the orphaned message idempotently. A missing
 		// ref is NOT an error here: a non-atomic-write orphan still needs cleanup,
 		// and the user-facing dismiss must always succeed for a real error notice.
-		db.transaction((tx) => {
+		const committed = db.transaction((tx) => {
 			deleteRecipientMessageRefs(tx)
 				.where(
 					and(
@@ -5363,25 +5370,27 @@ const narratorMessageQueriesUnlocked = {
 			if (!otherRef) {
 				tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId)).run();
 			}
-			tx.update(narrators)
-				.set({
-					errorMessage: null,
-					messageVersion: sql`${narrators.messageVersion} + 1`,
-					contextUsageSnapshotJson: null,
-				})
-				.where(eq(narrators.id, narratorId))
-				.run();
+			return versionNarratorStatusCommit(
+				tx
+					.update(narrators)
+					.set({
+						errorMessage: null,
+						errorRetryable: null,
+						messageVersion: sql`${narrators.messageVersion} + 1`,
+						contextUsageSnapshotJson: null,
+					})
+					.where(eq(narrators.id, narratorId))
+					.returning(narratorStatusPatchColumns)
+					.get(),
+			);
 		});
 
-		const narrator = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { status: true },
-		});
-		broadcastToNarrator(narratorId, {
-			type: "status_change",
-			narratorId,
-			status: narrator?.status ?? "idle",
-		});
+		if (committed)
+			broadcastToNarrator(narratorId, {
+				type: "status_change",
+				narratorId,
+				...(await committedNarratorStatusPatch(narratorId, committed)),
+			});
 	},
 
 	async deleteMessagesAfter(narratorId: string, messageId: string, opts?: BlockDeleteOptions) {

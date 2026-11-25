@@ -478,6 +478,19 @@ export class ProviderBalanceCache {
 		}
 	}
 
+	/** Read one published identity without a full provider synchronization. */
+	peekGeneration(id: string): string | undefined {
+		const entry = this.entries.get(id);
+		const config = this.options.providers().find((provider) => provider.id === id);
+		if (!entry || !config || !isProviderBalanceCandidate(config)) return undefined;
+		const key = getProviderKeyStore().get(entry.credentialId);
+		if (key && (key.providerId !== id || key.disabled)) return undefined;
+		const effective = key ? withProviderKey(config, key) : config;
+		return entry.identity === connectionIdentity(effective, this.options.globalProxy())
+			? entry.generation
+			: undefined;
+	}
+
 	generations(): Record<string, string> {
 		this.sync();
 		return Object.fromEntries([...this.entries].map(([id, e]) => [id, e.generation]));
