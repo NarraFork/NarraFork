@@ -5,10 +5,13 @@ summary: 各供应商（Codex、Kimi、DeepSeek、OpenCode Go、NUG、TokenDance
 anchors:
   - frontend/components/providers/CodexQuotaOverview.tsx
   - frontend/components/providers/CodexQuotaTrendChart.tsx
-  - frontend/hooks/useDeepSeekBalance.ts
-  - frontend/hooks/useProviderBalance.ts
-  - frontend/hooks/useTokenDanceBalance.ts
-  - frontend/lib/provider-balance-format.ts
+  - frontend/hooks/useQuotaSnapshots.ts
+  - frontend/lib/api/quota-snapshots.ts
+  - frontend/components/narrator/model/QuotaSnapshotIndicator.tsx
+  - frontend/components/narrator/model/quota-snapshot-view.ts
+  - frontend/components/narrator/model/quota-panel-view.ts
+  - frontend/components/narrator/model/use-narrator-quota.ts
+  - frontend/components/narrator/model/use-nug-quota.ts
   - server/lib/custom-api-quota-cache.ts
   - server/lib/deepseek-balance-cache.ts
   - server/lib/kimi-quota-wait.ts
@@ -27,6 +30,12 @@ anchors:
   - shared/provider-balance.ts
   - shared/quota-snapshot.ts
   - server/lib/sourcing/quota-store.ts
+  - server/lib/sourcing/quota-snapshots.ts
+  - server/lib/sourcing/templates.ts
+  - server/lib/sourcing/source-groups.ts
+  - server/routes/quota-snapshots.ts
+  - server/routes/__tests__/quota-snapshots.test.ts
+  - server/lib/codex-manager.ts
   - server/lib/codex-usage.ts
   - server/lib/codex-usage-queue.ts
   - server/lib/codex-usage-summary.ts
@@ -34,15 +43,12 @@ anchors:
   - server/lib/kimi-usage-cache.ts
   - server/lib/opencode-usage-cache.ts
   - server/lib/persisted-credential-cache.ts
-  - server/routes/deepseek.ts
-  - server/routes/kimi.ts
-  - server/routes/opencode.ts
   - shared/agent-protocol/quota-exhausted.ts
   - server/lib/provider-key-subjects.ts
   - server/services/tokendance-service.ts
+  - server/services/narrator-event-handler.ts
   - frontend/components/providers/CodexUsageDisplay.tsx
   - frontend/components/providers/ProviderBalanceStatus.tsx
-  - frontend/hooks/useOpencodeUsage.ts
   - frontend/lib/codex-credits.ts
   - frontend/lib/codex-tiers.ts
   - frontend/lib/codex-usage-windows.ts
@@ -67,52 +73,59 @@ keywords:
   - model_unavailable
   - quota_balance
   - codex-usage-queue
-  - /api/kimi/usages
-  - /api/opencode/usages
-  - /api/deepseek/balances
+  - /api/quota-snapshots
+  - /api/quota-snapshots/refresh
+  - groupId
+  - cachedOnly
+  - expectedGeneration
 status: draft
 verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 ---
 
 # 供应商余额与额度
 
-各供应商的余额（钱包/点数）与套餐额度窗口（5 小时、每周、每月）怎么查、缓存在哪、怎么展示，以及额度墙到来时循环怎么等。凭证怎么选与降级不在这里，见 [凭证池与存储](credentials.md)。
+余额（钱包/点数）、套餐额度窗口及额度墙等待。普通展示统一读取公开快照，探测调度仍归各源 owner；凭证选择与降级见 [凭证池与存储](credentials.md)。
 
 ## 关键规则
-- 统一形状 `QuotaSnapshot`（`shared/quota-snapshot.ts`）：`scope`（key / account / wallet / subscription）、`windows`（kind 为 5h / weekly / monthly / other，`usedRatio` 0..1、`resetsAt` 毫秒）、`balances`、`plan`、模板私有的 `detail`。`quotaExhaustedUntil` 只认 `usedRatio >= 1` 且重置时间在未来的窗口，取最晚者。
-- 快照仓库 `sourcing/quota-store.ts:QuotaStore`：按凭证 id（加来源名）存放，每条快照带凭证身份；读时传入现身份，不一致返回空，换了密钥或端点就看不到上一个账号的数字。落盘到 `quota-snapshots.json`，身份只存带盐 HMAC 指纹（`persisted-credential-cache.ts`：文件 ≤1MB、≤256 条、防抖 250ms 异步写；读回的值由调用方重新校验）。各来源自己管调度（TTL、退避、刷新），仓库只读写。`STREAM_QUOTA_SOURCE = "quota_balance"` 让流内余额与同一凭证的主动探测并存。模块加载时 `registerKeyQuotaProbe` 把 `quotaExhaustedUntil` 接到密钥池，用于跳过额度用尽的密钥（`provider-key-quota.ts`）。
-- 中转站余额（自定义 API，非下面三家专用来源）：`provider-balance-cache.ts:ProviderBalanceCache`。候选条件：启用、有 `apiKey` 和 `baseUrl`，且不是 DeepSeek / Kimi / OpenCode Go（`isProviderBalanceCandidate`）；查询的是新请求实际会用的那把密钥（`withSelectedCredential`）。先探测适配器再刷新：`sub2api`（`/v1/usage`）、`new-api`（`/api/usage/token/`）、`new-api-user`（站点账号 `/api/user/self`，需站点令牌与用户 id，500000 单位折 1 美元）。配了站点账号任一字段就走 `new-api-user`，失败不回退推理密钥端点。
-- 缓存参数：新鲜期 60s，手动探测/刷新间隔 10s（过密返回 `PROVIDER_BALANCE_THROTTLED` 与 `Retry-After`），单轮 20s，并发 4、排队 ≤128。传输层（`provider-balance-transport.ts`）单次请求 8s、响应 ≤64KB，沿用连接的代理、UA 与额外头，上游文本和异常不进快照，只给固定错误码。
-- 失败分类：`request_failed` 为瞬时，可在最近一次成功后 10 分钟内继续显示旧值，之后撤回；`invalid_configuration` / `auth_failed` / `invalid_response` / `plugin_not_enabled` 为确定性错误，立即暴露并丢弃缓存（`shared/provider-balance.ts`、`provider-balance-adapters.ts:balanceErrorCode`）。
-- 查询引擎可替换（`provider-balance-engine.ts`）：`server/app.ts` 装入 `apikey-quota` 插件引擎（`apikey-quota-plugin-engine.ts`）：插件答 ok/unsupported 即为准；插件失败走瞬时/不支持错误；插件被管理员禁用则返回 `plugin_not_enabled`，不回退内置适配器；插件缺失、崩溃或输出不合法才回退内置适配器。
-- 路由 `/api/provider-balances`：`GET /` 登录即可，只返回无凭证投影；`POST /:id/probe`、`/:id/refresh` 要管理员，起一个合并的后台任务立即返回，不等上游。
-- 专用来源各有自己的缓存与路由，读路由先触发过期刷新（不 await）再返回缓存，非管理员拿到的错误文本被替换为 `hasError`：
-  - Kimi Code（`kimi-usage-cache.ts`，`GET /api/kimi/usages`、`POST /api/kimi/usages/refresh`）：`/coding/v1/usages`，新鲜期 60s，超时 15s，按 `kimi-code` 模板识别。
-  - OpenCode Go（`opencode-usage-cache.ts`，`/api/opencode/usages`）：新鲜期 60s，失败退避 60s 起翻倍到 10 分钟，请求后刷新最短间隔 20s，响应 ≤64KB；各家族端点都映射到 `/inference/go/v1/usage`。
-  - DeepSeek（`deepseek-balance-cache.ts`，`/api/deepseek/balances`）：`api.deepseek.com/user/balance`，新鲜期 60s，响应 ≤64KB。
-  - NUG（`nug-quota-cache.ts`，`/api/nug/providers/:id/quota`、`/api/nug/quotas`）与自定义 API 流内余额（`custom-api-quota-cache.ts`）：余额来自请求流里的 `quota_balance` 事件（`narrator-event-handler.ts` 调 `updateCustomApiQuotaByPrefix` / `updateNugQuotaByPrefix`），NUG 另可主动拉取网关。
-  - TokenDance（`tokendance-service.ts:getTokenDanceBalance`，`/api/tokendance/balance`）：缓存 30s，快照为 CNY 钱包。
-  - Command Code（`commandcode-usage.ts`，`/api/commandcode/usage`）：`/alpha/billing/credits`，5 小时与每周窗口加月度点数；CLI 登录没有对应凭证，不缓存。
-  - Codex（`codex-usage.ts`）：`chatgpt.com/backend-api/wham/usage`，超时 20s、响应 ≤256KB；窗口按 `limit_window_seconds` 判定（18000 → 5h，604800 → weekly，28–31 天 → monthly，其余 unknown）；`projectCodexUsageSnapshot` 转成统一快照；`consumeCodexResetCredit` 消耗一次重置额度。用量由 `codex-manager` 调度（TTL 5 分钟，重置时刻后补刷），批量排队走 `codex-usage-queue.ts`（串行，任务间隔 500ms）；套餐档位汇总与预测在 `codex-usage-summary.ts`。公开概览 `GET /api/codex/quota-overview` 登录即可，其余 Codex 路由要管理员。
-- 会话首屏只从当前 `modelSummary.provider` 取必要 quotaKind/generation；provider/DeepSeek/OpenCode 的 peekGeneration 只读对应已发布项并核对当前配置/credential identity，不匹配就不返回 generation，外改凭据不能复活旧账户；不为了一个会话构造所有 provider 身份/额度图，NUG 只请求当前显示 provider。`useProviderBalanceCapability` 只读已有完整设置缓存，不额外 GET 完整 settings；额度路由仍独立授权，未知来源不伪造额度提供商。
-- NUG 标题栏的 `GET /api/nug/quotas?providerId=&expectedGeneration=` 仅取该 provider 的已有身份保护缓存，返回 `{generation,quota|null}`，去除 `extra`、≤64 KiB，不发上游 RPC；可选 expectedGeneration 与设置 revision 不符返回 409 `MODEL_RUNTIME_STALE`。前端只在 provider generation 已知时读并核对返回 generation，409 只使 runtime 设置/模型摘要失效，不调用原 `/providers/:id/quota` 的显式刷新 RPC；无 providerId 的原管理全量视图仍保留（`nug-runtime.test.ts`）。
-- 额度墙等待（`provider-quota-wait.ts`）：Kimi 与 OpenCode Go 的额度拒绝按已知重置时刻等待，其余错误返回 `none`。决定三种：`wait`（重置在预算内，挂起到 `resumeAt`）、`refuse`（等不起或重置未知，报告并附 `resetAt`）、`none`。`loop.ts:tryQuotaSuspension` 产出 `model_unavailable` 事件，orchestrator 负责等待。Kimi：重置后加 5s 偏差，单次最长 24h，每次运行最多等 3 次（`MAX_QUOTA_WAITS_PER_RUN`）；OpenCode Go 的额度墙按 retry-after 头、`/usage` 窗口、文本、文档窗口规则顺序取重置时刻，短于下限的限速不挂起，计费类拒绝（402、余额不足）不等待。共享标识在 `shared/agent-protocol/quota-exhausted.ts`。
-- 模板上的 `probeQuota`（`probeKimiQuota`、`probeDeepSeekQuota` 等）在运行时没有调用方，只有测试用到（未核实是否仍在接入）。
+- 统一形状见 [shared/quota-snapshot.ts](../../shared/quota-snapshot.ts)：`scope` 为 key / account / wallet / subscription；`windows` 含周期、`usedRatio`、毫秒 `resetsAt` 及可选绝对用量；另有 `balances`、`plan`、额度有效期 `expiresAt` 和服务端私有 `detail`。未知不是零，uncapped 不制造 0 限额；有效期不是窗口补充时间。`quotaExhaustedUntil` 只取已用尽且重置时间在未来的窗口中的最晚时刻。
+- [QuotaStore](../../server/lib/sourcing/quota-store.ts) 按凭证 id 与来源名存放，读取必须匹配当前密钥、端点、网络等身份；换身份不继承旧数字。`quota-snapshots.json` 只存带盐 HMAC 身份指纹；[持久缓存](../../server/lib/persisted-credential-cache.ts) 限 1 MiB / 256 条、防抖 250ms 异步写，恢复值由来源校验。probe 与 `STREAM_QUOTA_SOURCE = "quota_balance"` 独立保存、失效和恢复，流内余额不能覆盖独立窗口；来源自己管 TTL / 退避，仓库不调度探测。
+- 普通入口是 [GET /api/quota-snapshots](../../server/routes/quota-snapshots.ts)：登录后返回按组 / 凭据 / source 区分的公开投影，不输出 `detail`、私密身份或原始上游错误；非管理员不拿凭据 id，Codex 只给匿名概览。`plugin_not_enabled` / `quota_unavailable` 是安全码，不是直接展示的错误全文。
+- `POST /api/quota-snapshots/refresh` 接受 `{ groupId?, credentialId? }`，主动刷新通常要管理员；仅无配置 Key 的 Command Code CLI 单组临时读取保留普通会话权限，不缓存结果。TD 等待本次真实刷新有 15s / 取消预算；其它普通刷新提交源 owner 工作后返回当前快照。显式管理员 `POST /api/provider-balances/:id/probe` 端点诊断仍保留。
+- [refreshQuotaSnapshots](../../server/lib/sourcing/quota-snapshots.ts) 已在生产调用模板 `probeQuota(group, credentialId)`，跳过停用组 / Key；[模板](../../server/lib/sourcing/templates.ts) 委托原 owner，不另建 pending 表。TD 调 `refreshTokenDanceBalance(true, credentialId)`，CC 调 `refreshCommandCodeQuota(true, credentialId)`，NUG 调 `refreshNugQuota(group.id, credentialId)`；不是只有测试调用。Codex 只用 `projectQuota` 投影 canonical usage，不经统一入口重发探测。
+- root GET 沿用各 owner 的 SWR / 并发 / TTL 预算，不等上游；`cachedOnly` scoped 读只取已有快照。[useQuotaSnapshots](../../frontend/hooks/useQuotaSnapshots.ts) 用 React Query 管共享缓存、取消、失效与 GC：staleTime 30s，普通读取在 refreshing 时 3s、否则 30s 重取，后台不轮询，cachedOnly 不周期轮询；[API 包装](../../frontend/lib/api/quota-snapshots.ts) 不加第二请求缓存。
+- root / scoped Query 都按认证 `authGeneration` 隔离并在异步返回前复核，旧会话响应不能写入新会话；scoped 读取还以 `expectedGeneration` 核对模型运行时设置代际。
+- [QuotaSnapshotIndicator](../../frontend/components/narrator/model/QuotaSnapshotIndicator.tsx) 与 [quota-snapshot-view](../../frontend/components/narrator/model/quota-snapshot-view.ts) 统一徽标、窗口绝对用量、未知 / 过期 / 无限额和本地化错误展示；[quota-panel-view](../../frontend/components/narrator/model/quota-panel-view.ts) 负责额度条与文本格式。`plugin_not_enabled` 显示本地化停用提示，不显示原始 error。
+- 中转站 [ProviderBalanceCache](../../server/lib/provider-balance-cache.ts) 只处理启用、有 Key / baseUrl 且非 Kimi / OpenCode / DeepSeek 的来源；查询源 owner 实际选中的凭据。适配器顺序为 sub2api（`/v1/usage`）、new-api（`/api/usage/token/`）、new-api-user（`/api/user/self`，500000 单位折 1 美元）；站点账号任一字段已配置就走 new-api-user，失败不回退推理 Key 端点。
+- 中转 owner 预算保留：新鲜期 60s、手动间隔 10s（`PROVIDER_BALANCE_THROTTLED` / `Retry-After`）、单轮 20s、并发 4、排队 ≤128；[传输层](../../server/lib/provider-balance-transport.ts) 单次 8s / 64 KiB，保留代理、UA、额外头，不把上游文本或异常原文放进公开快照。
+- 中转 `request_failed` 是瞬时失败，最近成功值可保留 10 分钟，之后撤回。
+- 中转 `invalid_configuration` / `auth_failed` / `invalid_response` / `plugin_not_enabled` 是确定性错误，立即暴露并撤回旧值。
+- [插件引擎](../../server/services/apikey-quota-plugin-engine.ts) 的 ok / unsupported 为权威结果；failed 按瞬时 / 不支持分类；管理员停用返回 `plugin_not_enabled` 且不回退。只有缺失、崩溃或输出非法才回退内置适配器，授权、启停契约不变。
+- 专用来源仍保留自己的 owner / 预算，普通展示不再调用各家旧 GET / hooks：
+  - [Kimi Code](../../server/lib/kimi-usage-cache.ts)：上游 `/coding/v1/usages`，新鲜期 60s、请求超时 15s，按 kimi-code 模板识别，按 Key 探测。
+  - [OpenCode Go](../../server/lib/opencode-usage-cache.ts)：新鲜期 60s，失败退避 60s 起翻倍至 10 分钟，请求后刷新最短 20s，15s / 64 KiB；家族端点映射到 `/inference/go/v1/usage`。
+  - [DeepSeek](../../server/lib/deepseek-balance-cache.ts)：上游 `api.deepseek.com/user/balance`，新鲜期 60s，15s / 64 KiB，结果与具体凭据身份绑定。
+  - [NUG](../../server/lib/nug-quota-cache.ts) 与 [自定义 API STREAM](../../server/lib/custom-api-quota-cache.ts)：流内 `quota_balance` 事件和主动 probe 分槽；NUG owner 可按 CID 主动取网关额度，晚到响应不能改写新身份。
+  - [TokenDance](../../server/services/tokendance-service.ts)：余额 TTL 30s，CNY 钱包；逐 Key 额度 owner 与门户登录身份分开，门户不随池排序切换。
+  - [Command Code](../../server/lib/commandcode-usage.ts)：上游 `/alpha/billing/credits`，5 小时 / 每周窗口与月度点数，已接逐 Key owner；CLI 额度没有统一凭据，只共用运行中的请求、不保留结果。
+  - [Codex](../../server/lib/codex-usage.ts)：`chatgpt.com/backend-api/wham/usage`，20s / 256 KiB；`limit_window_seconds` 的 18000 为 5h、604800 为 weekly、28–31 天为 monthly，其余 unknown。`projectCodexUsageSnapshot` 只投影；[CodexManager](../../server/lib/codex-manager.ts) 保留 5 分钟 TTL / 重置后补刷，[usage queue](../../server/lib/codex-usage-queue.ts) 串行且间隔 500ms，[usage summary](../../server/lib/codex-usage-summary.ts) 保留套餐档位、趋势与预测。credits 续用、`useCreditQuota`、`consumeCodexResetCredit` 与专属展示仍读原 canonical 结构；兼容公开概览 `GET /api/codex/quota-overview` 登录可读，其余 Codex 路由仍要管理员。
+- [NUG 标题栏](../../frontend/components/narrator/model/use-nug-quota.ts) 走同一 `GET /api/quota-snapshots?groupId=…&cachedOnly=true&expectedGeneration=…`，只读当前组身份保护缓存，15s / 64 KiB；无 token / provider generation、隐藏或禁用时停发，不轮询后台。409 `MODEL_RUNTIME_STALE` 只使当前会话的 runtime / 模型摘要失效，不回退旧 NUG 全量 GET 或显式付款 RPC。
+- [NUG 付款确认](../../server/routes/nug.ts) 保留 payment-only `GET /api/nug/providers/:id/quota` 例外：订单请求携 `orderId` / 不透明 `binding` 复核原 CID 与用户 / 连接身份，按该 CID 更新 per-Key 快照；重排后不能把 A 的付款余额写成 B 的首 Key 摘要。普通额度展示不用此 RPC。
+- [额度墙等待](../../server/lib/provider-quota-wait.ts) 仅 Kimi / OpenCode 的额度拒绝按已知重置时刻处理，其余返回 none：wait 在预算内挂起到 `resumeAt`；refuse 等不起 / 重置未知，报告并附 `resetAt`；none 不等待。`loop.ts:tryQuotaSuspension` 发 `model_unavailable`，orchestrator 等待。Kimi 重置后加 5s 偏差、最长 24h、每次运行最多 3 次；OpenCode 依 retry-after、usage 窗口、文本、文档窗口取重置，短限速不挂起，402 / 余额不足不等待。共享标识在 `shared/agent-protocol/quota-exhausted.ts`。
 
 ## 从哪读起
-- `server/lib/sourcing/quota-store.ts`、`shared/quota-snapshot.ts`：统一快照与存放。
-- `server/lib/provider-balance-cache.ts`、`provider-balance-adapters.ts`：中转站余额。
-- `server/lib/provider-quota-wait.ts`、`kimi-quota-wait.ts`、`opencode-quota-wait.ts`：额度墙等待。
-- 前端：`useProviderBalance.ts`（轮询：pending/probing 2s，supported 60s，`plugin_not_enabled` 30s，其余不轮询）、`useDeepSeekBalance.ts`、`useOpencodeUsage.ts`（60s）、`useTokenDanceBalance.ts`；`provider-balance-format.ts` 把快照格式化成徽标与悬浮提示（超过 120s 标「过期」）；`ProviderBalanceStatus.tsx` 是设置页的余额徽标。
-- Codex 展示：`CodexQuotaOverview.tsx`、`CodexQuotaTrendChart.tsx`（趋势与预测）、`CodexUsageDisplay.tsx`、`codex-usage-windows.ts`、`codex-tiers.ts`、`codex-credits.ts`。
-- 测试：`server/lib/__tests__/quota-store.test.ts`、`provider-balance-*.test.ts`、`opencode-quota-wait.test.ts`、`codex-usage*.test.ts`、`persisted-credential-cache.test.ts`。
+- 服务端：[quota-snapshots 路由](../../server/routes/quota-snapshots.ts) → [sourcing owner 汇总](../../server/lib/sourcing/quota-snapshots.ts) → [模板](../../server/lib/sourcing/templates.ts) / 各来源 owner；[QuotaStore](../../server/lib/sourcing/quota-store.ts) 与 [共享 DTO](../../shared/quota-snapshot.ts) 定义存取边界。
+- 前端：[useQuotaSnapshots](../../frontend/hooks/useQuotaSnapshots.ts) / [API](../../frontend/lib/api/quota-snapshots.ts) → [QuotaSnapshotIndicator](../../frontend/components/narrator/model/QuotaSnapshotIndicator.tsx) / [统一 formatter](../../frontend/components/narrator/model/quota-snapshot-view.ts)；[useNugQuota](../../frontend/components/narrator/model/use-nug-quota.ts) 是轻量头部，[useNarratorQuota](../../frontend/components/narrator/model/use-narrator-quota.ts) 负责充值提示派生。
+- 中转站：[缓存](../../server/lib/provider-balance-cache.ts)、[适配器](../../server/lib/provider-balance-adapters.ts)、[插件引擎](../../server/services/apikey-quota-plugin-engine.ts)。
+- 额度墙：[provider-quota-wait](../../server/lib/provider-quota-wait.ts)、[kimi-quota-wait](../../server/lib/kimi-quota-wait.ts)、[opencode-quota-wait](../../server/lib/opencode-quota-wait.ts)。
+- Codex 专属展示仍在 `CodexQuotaOverview.tsx`、`CodexQuotaTrendChart.tsx`、`CodexUsageDisplay.tsx`、`codex-usage-windows.ts`、`codex-tiers.ts`、`codex-credits.ts`，不以通用快照替换其档位 / credits / 重置业务。
+- 回归入口：[统一 API 测试](../../server/routes/__tests__/quota-snapshots.test.ts)，另有 quota-store、provider-balance、额度墙与 Codex usage / 持久缓存测试。
 
 ## 改它时
-- 新增一个额度来源：产出 `QuotaSnapshot` 写入 `quotaStore`（传入凭证身份），自己管 TTL 与退避；需要被密钥池跳过时只需有 `windows` 且 `usedRatio`/`resetsAt` 正确，不必改 `credential-pool.ts`。
-- 新增中转站适配器：加 `ProviderBalanceAdapter` 取值（`shared/provider-balance.ts`）、解析函数与探测顺序（`provider-balance-adapters.ts`），错误必须归入 `BalanceFailureKind`，确定性错误不能当瞬时处理；插件引擎输出的校验在 `shared/apikey-quota-plugin.ts`。
-- 改任何缓存的身份串（`connectionIdentity` 等）会让已落盘快照读不回，这是预期；身份必须包含密钥、端点与代理，否则会显示别的账号的数字。
-- 新增额度墙等待的供应商：在 `provider-quota-wait.ts` 增加分支，并同步 `QuotaProviderKind`；等待预算与次数上限在 `kimi-quota-wait.ts`。
-- 改接口形状要同步 `frontend/lib/api` 类型与 `provider-balance-format.ts`；列表类路由不得返回上游错误全文给非管理员。
+- 新额度来源产出 `QuotaSnapshot`，按 CID / 身份写源 owner 和 quotaStore，接模板 `probeQuota`；TTL、退避及晚到响应校验仍归 owner，不能加第二份探测队列或把未知当零。
+- 新中转适配器同步 `shared/provider-balance.ts`、`provider-balance-adapters.ts`、`shared/apikey-quota-plugin.ts`；确定性错误不能当瞬时失败，停用插件不能回退绕过授权。
+- 改身份串必须覆盖密钥、端点、代理及实际生效的网络 / 站点凭据；指纹改变后旧快照读不回是预期，不能为了恢复数字跨身份复用。
+- 改接口同步共享 DTO、`frontend/lib/api/quota-snapshots.ts`、`useQuotaSnapshots.ts` 与 `quota-snapshot-view.ts`；保留 root / scoped 的认证代际屏障、NUG scoped 预算和付款原 CID 绑定例外。
+- 新增额度墙供应商同步 `provider-quota-wait.ts` / `QuotaProviderKind`，不能改变已有等待预算与次数上限。
 
 ## 相关
 - [凭证池与存储](credentials.md)

@@ -331,7 +331,7 @@ describe("status bar layout contract (NarratorInteractionStatusBar)", () => {
 
 	test("only an active CommandCode narrator explicitly requests CLI-only quota", async () => {
 		const source = await Bun.file(new URL("../NarratorPanel.tsx", import.meta.url)).text();
-		expect(source).toContain("useQuotaSnapshots(firstScreenActivity)");
+		// General reads are scoped by runtime provider; this guard covers only explicit CLI work.
 		expect(source).toContain(
 			'useCommandCodeCliQuota(firstScreenActivity && resolvedModel?.split(":")[0] === "CommandCode")',
 		);
