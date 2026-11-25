@@ -13,6 +13,8 @@ import {
 } from "./commandcode-protocol";
 import { readResponseJsonLimited } from "./commandcode-usage";
 import { captureModelOptionsArray, optionInput } from "./model-options-contract";
+import { getProviderKeyStore } from "./provider-keys";
+import { settings, subscribeSettingsChanges } from "./settings";
 import type { SourceGroupView } from "./sourcing/source-groups";
 
 const CACHE_TTL_MS = 10 * 60 * 1000;
@@ -88,6 +90,52 @@ export function getCachedCommandCodeModels(
 	const token = apiKey?.trim();
 	// A cleared settings key must not turn its old directory into a CLI publication.
 	return (token ? cache.token === token : cache.source === "cli") ? cache.models : [];
+}
+
+/** Prime before startup recovery; later connection edits refresh through the same owner. */
+export async function startCommandCodeModelCatalog(): Promise<() => void> {
+	let connection: string | undefined;
+	let stopped = false;
+	let queued = false;
+	const refresh = async () => {
+		if (stopped) return;
+		const config = settings.commandCode;
+		const next = JSON.stringify([
+			config?.apiKey?.trim() ?? "",
+			commandCodeProviderBase(config?.baseUrl),
+			!!config?.disabled,
+		]);
+		if (next === connection) return;
+		if (connection === undefined) {
+			// Preserve the owner's same-slot stale fallback if startup refresh fails.
+			generation++;
+			inflight = undefined;
+		} else {
+			// A changed connection must not inherit a late response or old directory.
+			invalidateCommandCodeModelsCache();
+		}
+		connection = next;
+		if (!config?.disabled) await listCommandCodeModels(config?.apiKey, config?.baseUrl);
+	};
+	const changed = () => {
+		if (stopped || queued) return;
+		queued = true;
+		// saveSettings can update keys before publishing its new endpoint. Read the
+		// committed projection once, not a key/endpoint pair from the middle of a save.
+		queueMicrotask(() => {
+			queued = false;
+			void refresh().catch(() => {});
+		});
+	};
+	const stopSettings = subscribeSettingsChanges(changed);
+	const stopKeys = getProviderKeyStore().onChange(changed);
+	await refresh().catch(() => {});
+	return () => {
+		stopped = true;
+		stopSettings();
+		stopKeys();
+		invalidateCommandCodeModelsCache();
+	};
 }
 
 /**

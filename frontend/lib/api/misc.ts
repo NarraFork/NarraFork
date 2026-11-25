@@ -59,6 +59,31 @@ import type {
 	StorageScanResult,
 } from "./types";
 
+function nugPaymentBinding(binding: unknown): string {
+	if (typeof binding !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(binding)) {
+		throw new Error(
+			"NUG payment context is unavailable; update the backend and create a new order",
+		);
+	}
+	return binding;
+}
+
+function requireNugPaymentOrder<T extends { order: { id: string; binding: string } }>(
+	data: T,
+	orderId?: string,
+	binding?: string,
+): T {
+	const received = nugPaymentBinding(data?.order?.binding);
+	if (
+		typeof data.order.id !== "string" ||
+		(orderId !== undefined && data.order.id !== orderId) ||
+		(binding !== undefined && received !== binding)
+	) {
+		throw new Error("NUG payment response does not match this order");
+	}
+	return data;
+}
+
 /** OAuth state of a remote MCP server; `required` means it refused us until an admin authorizes. */
 export interface McpServerAuthStatus {
 	supported: boolean;
@@ -842,7 +867,11 @@ export const miscApi = {
 				: AbortSignal.timeout(15_000),
 		});
 	},
-	nugGetQuota: (providerId: string, options?: object) =>
+	nugGetQuota: (
+		providerId: string,
+		options?: object,
+		payment?: { orderId: string; binding: string },
+	) =>
 		request<{
 			balance: number;
 			totalGranted: number;
@@ -850,7 +879,16 @@ export const miscApi = {
 			extra?: unknown;
 			username?: string;
 			role?: string;
-		}>(`/nug/providers/${providerId}/quota`, pickRequestOptions(options)),
+			paymentCredentialIsPrimary?: boolean;
+		}>(
+			`/nug/providers/${providerId}/quota${payment ? `?orderId=${encodeURIComponent(payment.orderId)}&binding=${encodeURIComponent(nugPaymentBinding(payment.binding))}` : ""}`,
+			pickRequestOptions(options),
+		).then((data) => {
+			if (payment && typeof data.paymentCredentialIsPrimary !== "boolean") {
+				throw new Error("NUG payment balance context is unavailable; update the backend");
+			}
+			return data;
+		}),
 	nugGetQuotas: () =>
 		request<
 			Record<
@@ -929,6 +967,7 @@ export const miscApi = {
 		request<{
 			order: {
 				id: string;
+				binding: string;
 				amount: string;
 				quota_amount: string;
 				provider: string;
@@ -941,11 +980,12 @@ export const miscApi = {
 		}>(`/nug/providers/${providerId}/billing/orders`, {
 			method: "POST",
 			body: JSON.stringify(body),
-		}),
-	nugGetBillingOrder: (providerId: string, orderId: string) =>
+		}).then((data) => requireNugPaymentOrder(data)),
+	nugGetBillingOrder: (providerId: string, orderId: string, binding: string) =>
 		request<{
 			order: {
 				id: string;
+				binding: string;
 				amount: string;
 				quota_amount: string;
 				provider: string;
@@ -956,11 +996,14 @@ export const miscApi = {
 				created_at: string;
 			};
 			pollIntervalMs?: number;
-		}>(`/nug/providers/${providerId}/billing/orders/${encodeURIComponent(orderId)}`),
-	nugRepayBillingOrder: (providerId: string, orderId: string) =>
+		}>(
+			`/nug/providers/${providerId}/billing/orders/${encodeURIComponent(orderId)}?binding=${encodeURIComponent(nugPaymentBinding(binding))}`,
+		).then((data) => requireNugPaymentOrder(data, orderId, binding)),
+	nugRepayBillingOrder: (providerId: string, orderId: string, binding: string) =>
 		request<{
 			order: {
 				id: string;
+				binding: string;
 				amount: string;
 				quota_amount: string;
 				provider: string;
@@ -970,9 +1013,12 @@ export const miscApi = {
 				created_at: string;
 			};
 			pollIntervalMs?: number;
-		}>(`/nug/providers/${providerId}/billing/orders/${encodeURIComponent(orderId)}/repay`, {
-			method: "POST",
-		}),
+		}>(
+			`/nug/providers/${providerId}/billing/orders/${encodeURIComponent(orderId)}/repay?binding=${encodeURIComponent(nugPaymentBinding(binding))}`,
+			{
+				method: "POST",
+			},
+		).then((data) => requireNugPaymentOrder(data, orderId, binding)),
 	nugGetChannelsHealth: (providerId: string) =>
 		request<{
 			channels: Array<{

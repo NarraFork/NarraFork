@@ -90,9 +90,11 @@ export function selectProviderKey(
 	session?: string,
 	exclude?: ReadonlySet<string>,
 	now = Date.now(),
+	isEligible?: (key: ProviderKey) => boolean,
 ): ProviderKey | undefined {
 	const stickyKey = session ? `${providerId}\0${session}` : undefined;
-	const chosen = selectPoolEntry(getProviderKeyStore().list(providerId), {
+	const keys = getProviderKeyStore().list(providerId);
+	const chosen = selectPoolEntry(isEligible ? keys.filter(isEligible) : keys, {
 		now,
 		exclude,
 		stickyId: stickyKey ? sticky.get(stickyKey, now) : undefined,
@@ -212,6 +214,7 @@ export class PooledProvider implements ProviderAdapter {
 	constructor(
 		private readonly providerId: string,
 		private readonly build: (key: ProviderKey) => ProviderAdapter,
+		private readonly isEligible?: (key: ProviderKey, model: string) => boolean,
 	) {
 		const probe = this.current();
 		this.mayLeakXmlToolCalls = probe.mayLeakXmlToolCalls;
@@ -227,8 +230,8 @@ export class PooledProvider implements ProviderAdapter {
 		}
 		if (probe.generateImage) {
 			this.generateImage = async (params) => {
-				const key = selectProviderKey(this.providerId, params.conversationId);
-				if (!key) throw new Error("This provider has no usable API key");
+				const key = this.selectForModel(params.chatModel ?? params.model, params.conversationId);
+				if (!key) throw new Error("This provider has no usable API key or eligible transport");
 				const adapter = this.adapterFor(key, params.chatModel ?? params.model);
 				const generateImage = adapter.generateImage;
 				if (!generateImage) throw new Error("This provider does not support image generation");
@@ -269,7 +272,18 @@ export class PooledProvider implements ProviderAdapter {
 		this.current();
 	}
 
-	/** The selected adapter must also be prepared before model-dependent formatting. */
+	private selectForModel(model: string, session?: string, exclude?: ReadonlySet<string>) {
+		const eligible = this.isEligible;
+		return selectProviderKey(
+			this.providerId,
+			session,
+			exclude,
+			Date.now(),
+			eligible ? (key) => eligible(key, model) : undefined,
+		);
+	}
+
+	/** Formatting can initialize a delegate; transport eligibility gates actual attempts below. */
 	private current(model = this.preparedModel): ProviderAdapter {
 		const key = selectProviderKey(this.providerId);
 		if (!key) throw new Error("This provider has no usable API key");
@@ -282,8 +296,8 @@ export class PooledProvider implements ProviderAdapter {
 	): Promise<T> {
 		const tried = new Set<string>();
 		for (;;) {
-			const key = selectProviderKey(this.providerId, undefined, tried);
-			if (!key) throw new Error("This provider has no usable API key");
+			const key = this.selectForModel(model, undefined, tried);
+			if (!key) throw new Error("This provider has no usable API key or eligible transport");
 			tried.add(key.id);
 			const isAttemptCurrent = captureKeyAttempt(key, this);
 			try {
@@ -299,7 +313,7 @@ export class PooledProvider implements ProviderAdapter {
 				const more =
 					isAttemptCurrent() &&
 					reportKeyFault(key, err) &&
-					!!selectProviderKey(this.providerId, undefined, tried);
+					!!this.selectForModel(model, undefined, tried);
 				if (!more) throw err;
 			}
 		}
@@ -325,7 +339,9 @@ export class PooledProvider implements ProviderAdapter {
 	supportsDiagnosticFork(model: string, credentialId?: string): boolean {
 		const key = usableProviderKeys(this.providerId).find((key) => key.id === credentialId);
 		return (
-			!!key && this.adapterFor(key, model).supportsDiagnosticFork?.(model, credentialId) === true
+			!!key &&
+			this.isEligible?.(key, model) !== false &&
+			this.adapterFor(key, model).supportsDiagnosticFork?.(model, credentialId) === true
 		);
 	}
 
@@ -335,7 +351,8 @@ export class PooledProvider implements ProviderAdapter {
 			const key = usableProviderKeys(this.providerId).find(
 				(key) => key.id === params.diagnosticFork?.credentialId,
 			);
-			if (!key) throw new Error("The parent diagnostic credential is unavailable");
+			if (!key || this.isEligible?.(key, params.model) === false)
+				throw new Error("The parent diagnostic credential is unavailable");
 			const adapter = this.adapterFor(key, params.model);
 			if (!adapter.supportsDiagnosticFork?.(params.model, key.id)) {
 				throw new Error("The parent diagnostic credential cannot safely fork this request");
@@ -352,8 +369,8 @@ export class PooledProvider implements ProviderAdapter {
 		const session = params.stickySessionKey ?? params.conversationId;
 		const tried = new Set<string>();
 		for (;;) {
-			const key = selectProviderKey(this.providerId, session, tried);
-			if (!key) throw new Error("This provider has no usable API key");
+			const key = this.selectForModel(params.model, session, tried);
+			if (!key) throw new Error("This provider has no usable API key or eligible transport");
 			tried.add(key.id);
 			const isAttemptCurrent = captureKeyAttempt(key, this);
 			let streamed = false;
@@ -379,7 +396,7 @@ export class PooledProvider implements ProviderAdapter {
 			} catch (err) {
 				if (params.signal.aborted) throw err;
 				const faulted = isAttemptCurrent() && reportKeyFault(key, err);
-				const next = faulted && !streamed && selectProviderKey(this.providerId, session, tried);
+				const next = faulted && !streamed && this.selectForModel(params.model, session, tried);
 				if (!next) throw err;
 				logger.info("Retrying with the provider's next key", {
 					providerId: this.providerId,

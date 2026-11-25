@@ -12,7 +12,7 @@ export interface RoutingPreview {
 }
 
 export interface CredentialRouting {
-	hasAvailableCredentials: (group: SourceGroupView, now: number) => boolean;
+	hasAvailableCredentials: (group: SourceGroupView, now: number, model?: string) => boolean;
 	routingPreview: (group: SourceGroupView, now: number) => RoutingPreview | null;
 }
 
@@ -75,9 +75,11 @@ export function keyRouting<T extends KeyConfig>(
 		/** OpenCode's optional wallet is a fallback, not a prerequisite for its plan. */
 		probeBalanceIsFallback?: boolean;
 		streamIdentity?: (config: T) => string;
+		/** Model-specific transport constraints are checked on the same credential as quota. */
+		isEligible?: (config: T, model?: string) => boolean;
 	} = {},
 ): CredentialRouting {
-	function state(group: SourceGroupView, now: number) {
+	function state(group: SourceGroupView, now: number, model?: string) {
 		const config = configOf(group);
 		const stored = peekProviderKeyStore()?.listGroup(group.id) ?? [];
 		const keys = stored.length
@@ -93,6 +95,7 @@ export function keyRouting<T extends KeyConfig>(
 					? quotaStore.peekForIdentity(key.id, options.streamIdentity(current), STREAM_QUOTA_SOURCE)
 					: undefined;
 			const block = combine([
+				{ blocked: !!current && options.isEligible?.(current, model) === false },
 				{
 					blocked: !!failure && failure.reason !== "rate_limited",
 					until: failure?.until,
@@ -113,8 +116,8 @@ export function keyRouting<T extends KeyConfig>(
 		};
 	}
 	return {
-		hasAvailableCredentials(group, now) {
-			const { candidates, cli } = state(group, now);
+		hasAvailableCredentials(group, now, model) {
+			const { candidates, cli } = state(group, now, model);
 			return cli || candidates.some(({ block }) => !block.blocked);
 		},
 		routingPreview(group, now) {
