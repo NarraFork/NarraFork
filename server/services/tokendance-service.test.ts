@@ -6,6 +6,7 @@ import {
 	getProviderKeyStore,
 	TOKENDANCE_KEY_OWNER,
 	tokenDanceLoginAccount,
+	withProviderKey,
 } from "../lib/provider-keys";
 import { isLegacyTokenDancePrefixAllowed } from "../lib/settings/tokendance-prefix";
 import type { NarraForkSettings } from "../lib/settings/types";
@@ -109,7 +110,8 @@ describe("TokenDance billing", () => {
 		const generation = connectBilling();
 		const updatedAt = Date.now() - 1000;
 		const legacy = createPersistedCredentialCache("tokendance-balance.json", (raw) => raw);
-		legacy.save("tokendance", JSON.stringify(["billing-secret-key", generation]), {
+		if (!fakeSettings.tokendance) throw new Error("billing fixture is not connected");
+		legacy.save("tokendance", JSON.stringify([fakeSettings.tokendance.apiKey, generation]), {
 			credits: 8_000_000,
 			creditsUsed: 3_000_000,
 			balance: 5_000_000,
@@ -335,7 +337,12 @@ describe("TokenDance billing", () => {
 		});
 		await service.refreshTokenDanceBalance();
 		expect(
-			quotaStore.get(login.id, JSON.stringify([login.apiKey, generation]))?.detail,
+			quotaStore.get(
+				login.id,
+				service.tokenDanceQuotaIdentity(
+					withProviderKey({ apiKey: login.apiKey, generation, disabled: false }, login),
+				),
+			)?.detail,
 		).toMatchObject({
 			balance: 7,
 		});
@@ -663,11 +670,12 @@ describe("TokenDance billing", () => {
 		"payment_status",
 	] as const)("slow %s logs only fixed operation, duration and generation", async (operation) => {
 		const generation = connectBilling();
-		const now = Date.now();
 		const input = { amount: 10, generation, requestId: "w".repeat(43) };
 		if (operation === "payment_status") {
 			fetchMock(() => json(paymentFixture()));
 			await createPayment(`slow-${generation}`, input);
+			// Start after creation: sampling before it races the 3s polling throttle.
+			const now = Date.now();
 			Date.now = () => now + 3001;
 		}
 		let clock = 0;
@@ -799,6 +807,36 @@ describe("TokenDance billing", () => {
 		await task;
 		expect(service.getTokenDanceBalance()).toMatchObject({ balance: null, loading: false });
 	});
+	test("balance publication and reads share the selected credential's effective network identity", async () => {
+		connectBilling();
+		const config = fakeSettings.tokendance;
+		if (!config) throw new Error("billing fixture is not connected");
+		const keys = getProviderKeyStore();
+		const key = bindLogin(config.apiKey);
+		keys.update(key.id, {
+			network: { proxy: { mode: "custom", url: "http://billing-proxy.example:8080" } },
+		});
+		try {
+			fetchMock(() => json({ balance: { credits: 10, credits_used: 4, balance: 6 } }));
+			const balance = await service.refreshTokenDanceBalance();
+			expect(balance.balance).toBe(6);
+			expect(
+				quotaStore.peekForIdentity(
+					key.id,
+					service.tokenDanceQuotaIdentity(withProviderKey(config, key)),
+				)?.balances[0]?.remaining,
+			).toBe(0.000006);
+			keys.update(key.id, { network: { userAgentMode: "codex" } });
+			// A failed SWR refresh must not make the previous network's balance visible again.
+			fetchMock(() => json(null, 503));
+			expect(service.getTokenDanceBalance().balance).toBeNull();
+		} finally {
+			await service.deleteTokenDanceConnection();
+			quotaStore.remove(key.id);
+			keys.remove(key.id);
+		}
+	});
+
 	test("replacing only the key withdraws the old balance and rejects its late answer", async () => {
 		connectBilling();
 		let finishOld!: (value: Response) => void;

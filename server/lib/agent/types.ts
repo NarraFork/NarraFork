@@ -792,7 +792,7 @@ export type AgentEvent =
 			type: "quota_balance";
 			quotaBalance: string | null;
 			detailedQuotaBalance?: string | null;
-			/** Request-start provider identity; stale events must not write a replacement's cache. */
+			/** Request-start credential identity; stale events cannot update a replacement key/network. */
 			providerIdentity?: string;
 	  }
 	| {

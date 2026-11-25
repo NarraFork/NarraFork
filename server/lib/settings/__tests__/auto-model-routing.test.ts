@@ -1,9 +1,24 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { replaceModelOverridesForTests } from "../../model-catalog";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import fs from "node:fs";
+import * as os from "node:os";
+import { dirname, join } from "node:path";
+import "../../../services/tokendance-service";
+import { autoSourceFacts } from "../../agent/auto-route-signals";
+import { commandCodeAuthPath, invalidateCommandCodeAuthCache } from "../../commandcode-manager";
+import {
+	captureCommandCodeModelOptions,
+	invalidateCommandCodeModelsCache,
+	listCommandCodeModels,
+} from "../../commandcode-models";
+import { queryForModel, replaceModelOverridesForTests } from "../../model-catalog";
+import { getNarraforkHome } from "../../narrafork-home";
+import { getProviderKeyStore } from "../../provider-keys";
+import { getSourceGroup } from "../../sourcing/source-groups";
 import {
 	AutoModelUnavailableError,
 	expandAllowedPoolForDisplay,
 	getSubagentVisibleModels,
+	getVisibleModels,
 	listAutoModelCandidates,
 	listAutoModelIds,
 	normalizeAutoModelValueForSave,
@@ -12,6 +27,7 @@ import {
 	resolveAllowedModelCandidateMatch,
 	resolveEffectiveModel,
 	resolveProvider,
+	saveSettings,
 	settings,
 } from "../index";
 import type { ModelOption } from "../types";
@@ -211,5 +227,193 @@ describe("auto model routing", () => {
 		];
 		expect(resolveEffectiveModel("auto:claude-opus-4-6")).toBe("auto:claude-opus-4-6");
 		expect(resolveProvider("auto:claude-opus-4-6")).toBe("auto");
+	});
+});
+
+describe("builtin catalog identities in Auto routing", () => {
+	const modelId = "claude-opus-4-6";
+	const fallback = "catalog-fallback";
+	const baseUrl = "https://cc-catalog.example/provider/v1";
+	const cliPath = join(getNarraforkHome(), ".commandcode", "auth.json");
+	let saved: typeof settings;
+	let restoreHome: () => void;
+
+	beforeEach(() => {
+		saved = structuredClone(settings);
+		const home = spyOn(os, "homedir").mockReturnValue(getNarraforkHome());
+		restoreHome = () => home.mockRestore();
+		// Never let CLI discovery inspect the real home, even in the negative case.
+		expect(commandCodeAuthPath()).toBe(cliPath);
+		invalidateCommandCodeAuthCache();
+		invalidateCommandCodeModelsCache();
+		saveSettings({
+			...settings,
+			agent: {
+				...settings.agent,
+				customModels: models(`${fallback}:${modelId}`),
+				hiddenModels: [],
+				disabledProviders: [],
+				autoExcludedProviders: [],
+			},
+			customApiProviders: [
+				{
+					id: fallback,
+					prefix: fallback,
+					name: "Fallback",
+					baseUrl: "https://fallback.example/v1",
+					apiKey: "sk-fallback",
+					defaultModel: modelId,
+					protocol: "completions-compatible",
+				},
+			],
+			nugProviders: [],
+			tokendance: {
+				apiKey: "",
+				generation: 0,
+				disabled: false,
+				modelCollectionInitialized: true,
+				models: [
+					{
+						id: modelId,
+						name: modelId,
+						context_length: 200_000,
+						supported_protocols: ["anthropic:messages"],
+					},
+				],
+			},
+			commandCode: { apiKey: "", baseUrl, disabled: false },
+		});
+		registerAutoSourceProbe((provider, value) => autoSourceFacts(provider, Date.now(), value));
+	});
+
+	afterEach(() => {
+		registerAutoSourceProbe(null);
+		for (const id of [fallback, "tokendance", "CommandCode"]) getProviderKeyStore().removeGroup(id);
+		saveSettings(saved);
+		fs.rmSync(cliPath, { force: true });
+		invalidateCommandCodeAuthCache();
+		invalidateCommandCodeModelsCache();
+		restoreHome();
+	});
+
+	async function publishCommandCodeCatalog(apiKey?: string) {
+		const network = spyOn(globalThis, "fetch").mockResolvedValue(
+			Response.json({
+				data: [{ id: modelId, supported_endpoints: ["/messages"] }],
+			}),
+		);
+		try {
+			expect(await listCommandCodeModels(apiKey, baseUrl)).toEqual({ models: [modelId], ok: true });
+		} finally {
+			network.mockRestore();
+		}
+	}
+
+	for (const [prefix, template] of [
+		["tokendance", "tokendance"],
+		["CommandCode", "command-code"],
+	] as const) {
+		test(`${prefix}: a healthy sticky source stays; an all-disabled pool moves to a real fallback`, async () => {
+			const store = getProviderKeyStore();
+			const first = store.addGroupCredential(prefix, template, { apiKey: `sk-${prefix}-first` });
+			const second = store.addGroupCredential(prefix, template, { apiKey: `sk-${prefix}-second` });
+			if (prefix === "CommandCode") await publishCommandCodeCatalog(first.apiKey);
+			const value = `${prefix}:${modelId}`;
+			expect(listAutoModelCandidates(modelId)).toContain(value);
+			const read = spyOn(fs, "readFileSync").mockImplementation(() => {
+				throw new Error("routing read a file");
+			});
+			const network = spyOn(globalThis, "fetch").mockRejectedValue(
+				new Error("routing fetched a directory"),
+			);
+			try {
+				expect(queryForModel(value).query).toEqual({
+					providerKey: prefix,
+					upstreamModelId: modelId,
+				});
+				expect(resolveEffectiveModel(`auto:${modelId}`, prefix)).toBe(value);
+				expect(read).not.toHaveBeenCalled();
+				expect(network).not.toHaveBeenCalled();
+			} finally {
+				read.mockRestore();
+				network.mockRestore();
+			}
+			store.update(first.id, { disabled: true });
+			expect(resolveEffectiveModel(`auto:${modelId}`, prefix)).toBe(value);
+			store.update(second.id, { disabled: true });
+			expect(resolveEffectiveModel(`auto:${modelId}`, prefix)).toBe(`${fallback}:${modelId}`);
+		});
+	}
+
+	test("unconfigured Command Code static models cannot enter Auto or inherit a settings-key directory", async () => {
+		settings.agent.customModels.push(...models(`CommandCode:${modelId}`));
+		expect(listAutoModelCandidates(modelId)).not.toContain(`CommandCode:${modelId}`);
+		await publishCommandCodeCatalog("previous-settings-key");
+		expect(listAutoModelCandidates(modelId)).not.toContain(`CommandCode:${modelId}`);
+		expect(resolveEffectiveModel(`auto:${modelId}`, "CommandCode")).toBe(`${fallback}:${modelId}`);
+	});
+
+	test("CLI directory stays memory-only after auth and model TTLs expire, without admitting static ids", async () => {
+		fs.mkdirSync(dirname(cliPath), { recursive: true });
+		fs.writeFileSync(cliPath, JSON.stringify({ apiKey: "cli-catalog-key" }));
+		const publishedAt = Date.now();
+		const clock = spyOn(Date, "now").mockReturnValue(publishedAt);
+		try {
+			await publishCommandCodeCatalog();
+			// Beyond the 5s auth TTL and 10min model TTL: no wall-clock grace period.
+			clock.mockReturnValue(publishedAt + 11 * 60_000);
+			settings.agent.customModels.push(...models("CommandCode:gpt-5.5"));
+			const read = spyOn(fs, "readFileSync").mockImplementation(() => {
+				throw new Error("catalog read CLI auth");
+			});
+			const network = spyOn(globalThis, "fetch").mockRejectedValue(
+				new Error("catalog refreshed models"),
+			);
+			try {
+				expect(queryForModel(`CommandCode:${modelId}`).query).toEqual({
+					providerKey: "CommandCode",
+					upstreamModelId: modelId,
+				});
+				expect(getVisibleModels()).toContain(`CommandCode:${modelId}`);
+				expect(resolveEffectiveModel(`auto:${modelId}`, "CommandCode")).toBe(
+					`CommandCode:${modelId}`,
+				);
+				expect(listAutoModelCandidates("gpt-5.5")).not.toContain("CommandCode:gpt-5.5");
+				const group = getSourceGroup("CommandCode");
+				if (!group) throw new Error("missing Command Code group");
+				expect(
+					captureCommandCodeModelOptions(group, undefined, baseUrl).readSlice(0, 10),
+				).toMatchObject([{ value: `CommandCode:${modelId}` }]);
+				expect(read).not.toHaveBeenCalled();
+				expect(network).not.toHaveBeenCalled();
+			} finally {
+				read.mockRestore();
+				network.mockRestore();
+			}
+			// Explicit refresh still re-reads expired CLI auth and publishes the new owner result.
+			fs.writeFileSync(cliPath, JSON.stringify({ apiKey: "cli-rotated-key" }));
+			const refresh = spyOn(globalThis, "fetch").mockResolvedValue(
+				Response.json({
+					data: [{ id: "gpt-5.5", supported_endpoints: ["/chat/completions"] }],
+				}),
+			);
+			try {
+				expect(await listCommandCodeModels(undefined, baseUrl)).toEqual({
+					models: ["gpt-5.5"],
+					ok: true,
+				});
+				expect(
+					refresh.mock.calls.some(
+						([, init]) =>
+							new Headers(init?.headers).get("Authorization") === "Bearer cli-rotated-key",
+					),
+				).toBe(true);
+				expect(getVisibleModels()).not.toContain(`CommandCode:${modelId}`);
+			} finally {
+				refresh.mockRestore();
+			}
+		} finally {
+			clock.mockRestore();
+		}
 	});
 });

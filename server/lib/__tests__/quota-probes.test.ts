@@ -242,6 +242,34 @@ describe("Kimi Code quota probe", () => {
 		expect(quotaStore.peek(config.id)).toBeUndefined();
 	});
 
+	test("a network-only key edit withdraws the cached allowance", async () => {
+		useProvider(provider("kimi-network", "https://api.kimi.com/coding/v1"));
+		const config = saved("kimi-network");
+		respond = async () => Response.json(body);
+		await refreshKimiKeyUsage(config.id);
+		expect(getKimiCachedUsage(config.id)).toBeDefined();
+		getProviderKeyStore().update(config.id, {
+			network: { extraHeaders: { "X-Account": "network-two" } },
+		});
+		expect(getKimiCachedUsage(config.id)).toBeUndefined();
+	});
+
+	test("a late answer from the old global proxy is not relabeled as the new network", async () => {
+		useProvider(provider("kimi-late-network", "https://api.kimi.com/coding/v1"));
+		const config = saved("kimi-late-network");
+		let settle!: (response: Response) => void;
+		respond = () =>
+			new Promise<Response>((done) => {
+				settle = done;
+			});
+		const refresh = refreshKimiKeyUsage(config.id);
+		settings.proxy = { mode: "custom", url: "http://replacement-proxy.example:8080" };
+		settle(Response.json(body));
+		await refresh;
+		expect(getKimiCachedUsage(config.id)).toBeUndefined();
+		expect(quotaStore.peek(config.id)).toBeUndefined();
+	});
+
 	test("the probe itself is what the kimi-code template exposes", async () => {
 		const config = useProvider(provider("kimi-template", "https://api.kimi.com/coding/v1"));
 		respond = async () => Response.json(body);

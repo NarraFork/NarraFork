@@ -4,6 +4,8 @@ import { outboundFetch } from "./net/outbound-fetch";
 import { resolveProxyForUrl } from "./net/proxy";
 import { firstCredential, type UsageSubject } from "./provider-key-subjects";
 import { type CustomApiProviderConfig, settings } from "./settings";
+import { defaultUserAgentModeForProtocol } from "./settings/custom-api-providers";
+import { legacyQuotaNetworkCompatible, quotaNetworkIdentity } from "./sourcing/quota-identity";
 import { importLegacyQuotaCache, quotaStore } from "./sourcing/quota-store";
 
 /**
@@ -137,7 +139,17 @@ export function isDeepSeekCustomApiProvider(config: {
 	return !config.disabled && identifyService(config).templateId === "deepseek";
 }
 
-function identity(config: CustomApiProviderConfig): string {
+export function deepSeekQuotaIdentity(config: CustomApiProviderConfig): string {
+	return JSON.stringify([
+		config.baseUrl,
+		config.protocol,
+		config.apiKey,
+		quotaNetworkIdentity(config, settings.proxy),
+	]);
+}
+
+/** Byte-for-byte serializer used to fingerprint deepseek-balances.json before the quota store. */
+function legacyDeepSeekQuotaIdentity(config: CustomApiProviderConfig): string {
 	return JSON.stringify([
 		config.baseUrl,
 		config.protocol,
@@ -168,13 +180,28 @@ export function syncDeepSeekBalanceCache(): void {
 		void importLegacyQuotaCache(
 			LEGACY_FILE,
 			parsePersistedBalance,
-			[...providers].map(([id, p]) => ({
-				legacyKey: id,
-				id: p.credentialId,
-				// Legacy files were keyed by the provider config, before per-key networks applied.
-				identity: identity(settings.customApiProviders?.find((c) => c.id === id) ?? p.config),
-				storeIdentity: identity(p.config),
-			})),
+			[...providers].flatMap(([id, p]) => {
+				// Legacy files described the provider, not a key's overriding network. Both
+				// the old covered fields and the newly tracked fields must be compatible.
+				const configured = settings.customApiProviders?.find((c) => c.id === id) ?? p.config;
+				const identity = legacyDeepSeekQuotaIdentity(configured);
+				if (
+					!legacyQuotaNetworkCompatible(p.config, {
+						defaultUserAgentMode: defaultUserAgentModeForProtocol(p.config.protocol),
+					}) ||
+					identity !== legacyDeepSeekQuotaIdentity(p.config)
+				) {
+					return [];
+				}
+				return [
+					{
+						legacyKey: id,
+						id: p.credentialId,
+						identity,
+						storeIdentity: deepSeekQuotaIdentity(p.config),
+					},
+				];
+			}),
 			(balance) => (balance.isAvailable === null ? null : deepseekSnapshot(balance)),
 		);
 	}
@@ -182,7 +209,7 @@ export function syncDeepSeekBalanceCache(): void {
 		const provider = providers.get(id);
 		if (
 			!provider ||
-			identity(provider.config) !== entry.identity ||
+			deepSeekQuotaIdentity(provider.config) !== entry.identity ||
 			provider.credentialId !== entry.credentialId
 		) {
 			entries.delete(id);
@@ -194,12 +221,12 @@ export function syncDeepSeekBalanceCache(): void {
 	for (const [id, { config, credentialId }] of providers) {
 		if (!entries.has(id)) {
 			entries.set(id, {
-				identity: identity(config),
+				identity: deepSeekQuotaIdentity(config),
 				credentialId,
 				generation: crypto.randomUUID(),
 			});
 			// Restore synchronously, as the old entry-creation did.
-			quotaStore.get(credentialId, identity(config), restoreSnapshot);
+			quotaStore.get(credentialId, deepSeekQuotaIdentity(config), restoreSnapshot);
 		}
 	}
 }
@@ -347,7 +374,8 @@ export function peekDeepSeekBalanceGeneration(providerId: string): string | unde
 	const config = settings.customApiProviders?.find((provider) => provider.id === providerId);
 	if (!entry || !config || !isDeepSeekCustomApiProvider(config)) return undefined;
 	const credential = firstCredential(config);
-	return entry.credentialId === credential.id && entry.identity === identity(credential.config)
+	return entry.credentialId === credential.id &&
+		entry.identity === deepSeekQuotaIdentity(credential.config)
 		? entry.generation
 		: undefined;
 }

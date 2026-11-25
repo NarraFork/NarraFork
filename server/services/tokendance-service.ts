@@ -35,6 +35,7 @@ import {
 } from "../lib/provider-keys";
 import { saveSettings, settings, type TokenDanceSettings } from "../lib/settings";
 import { settingsUpdateLock } from "../lib/settings/write-lock";
+import { legacyQuotaNetworkCompatible, quotaNetworkIdentity } from "../lib/sourcing/quota-identity";
 import {
 	importLegacyQuotaCache,
 	quotaStore,
@@ -114,8 +115,12 @@ function balanceSubject(credentialId?: string): TokenDanceSubject | undefined {
 		: undefined;
 }
 
-function balanceIdentity(config: TokenDanceSettings): string {
-	return JSON.stringify([config.apiKey, config.generation]);
+export function tokenDanceQuotaIdentity(config: TokenDanceSettings): string {
+	return JSON.stringify([
+		config.apiKey,
+		config.generation,
+		quotaNetworkIdentity(config, settings.proxy),
+	]);
 }
 
 function tokenDanceSnapshot(
@@ -162,18 +167,39 @@ function restoreSnapshot(snapshot: QuotaSnapshot): QuotaSnapshot | null {
 }
 
 let legacyImported = false;
-function importLegacyBalance(subject: TokenDanceSubject): void {
+function importLegacyBalance(): void {
 	if (legacyImported) return;
+	const config = getTokenDanceRuntimeConfig();
+	if (!config) return;
+	const subjects = getProviderKeyStore()
+		.list(TOKENDANCE_KEY_OWNER)
+		.map((key) => ({
+			id: key.id,
+			config: withProviderKey(config, key),
+		}));
+	if (!subjects.length) return;
 	legacyImported = true;
-	const identity = balanceIdentity(subject.config);
+	// The old file names one balance, not a portal login. Check all actual secrets
+	// before consuming it so a different/manual key's first read cannot discard it.
+	const compatible = subjects.filter((subject) =>
+		legacyQuotaNetworkCompatible(subject.config, {
+			proxyAndTlsCovered: false,
+			globalProxy: settings.proxy,
+		}),
+	);
 	void importLegacyQuotaCache(
 		"tokendance-balance.json",
 		parsePersistedBalance,
-		[{ legacyKey: TOKENDANCE_PREFIX, id: subject.id, identity }],
+		compatible.map((subject) => ({
+			legacyKey: TOKENDANCE_PREFIX,
+			id: subject.id,
+			identity: JSON.stringify([subject.config.apiKey, subject.config.generation]),
+			storeIdentity: tokenDanceQuotaIdentity(subject.config),
+		})),
 		(value) =>
 			tokenDanceSnapshot(
 				{
-					generation: subject.config.generation,
+					generation: config.generation,
 					...value,
 					loading: false,
 					hasError: false,
@@ -964,13 +990,13 @@ async function billingRequest(
 	}
 }
 function currentBalanceCache(subject: TokenDanceSubject): BalanceCache {
-	const identity = balanceIdentity(subject.config);
+	const identity = tokenDanceQuotaIdentity(subject.config);
 	let cache = balanceCaches.get(subject.id);
 	if (!cache || cache.generation !== generation() || cache.identity !== identity) {
 		cache = { generation: generation(), identity, attemptedAt: -Infinity };
 		balanceCaches.set(subject.id, cache);
 	}
-	if (subject.config.apiKey === loginConfig()?.apiKey) importLegacyBalance(subject);
+	importLegacyBalance();
 	return cache;
 }
 
@@ -979,21 +1005,22 @@ export function getTokenDanceQuotaSnapshot(
 ): { credentialId: string; snapshot: QuotaSnapshot | undefined } | undefined {
 	const subject = balanceSubject(credentialId);
 	if (!subject) return undefined;
+	importLegacyBalance();
 	return {
 		credentialId: subject.id,
-		snapshot: quotaStore.get(subject.id, balanceIdentity(subject.config), restoreSnapshot),
+		snapshot: quotaStore.get(subject.id, tokenDanceQuotaIdentity(subject.config), restoreSnapshot),
 	};
 }
 
 export function isTokenDanceQuotaRefreshing(credentialId?: string): boolean {
 	const subject = balanceSubject(credentialId);
 	const cache = subject ? balanceCaches.get(subject.id) : undefined;
-	return !!(cache?.task && subject && cache.identity === balanceIdentity(subject.config));
+	return !!(cache?.task && subject && cache.identity === tokenDanceQuotaIdentity(subject.config));
 }
 
 function balanceSummary(cache?: BalanceCache, subject = balanceSubject()): TokenDanceBalance {
 	const snapshot = subject
-		? quotaStore.get(subject.id, balanceIdentity(subject.config), restoreSnapshot)
+		? quotaStore.get(subject.id, tokenDanceQuotaIdentity(subject.config), restoreSnapshot)
 		: undefined;
 	const { recoveryAction: _storedAction, ...stored } = (snapshot?.detail ??
 		{}) as Partial<TokenDanceBalance>;
@@ -1066,13 +1093,13 @@ export async function refreshTokenDanceBalance(
 	if (cache.task) return cache.task;
 	if (!force && Date.now() - cache.attemptedAt < BALANCE_TTL) return balanceSummary(cache, subject);
 	cache.attemptedAt = Date.now();
-	const identity = balanceIdentity(subject.config);
+	const identity = tokenDanceQuotaIdentity(subject.config);
 	const current = () => {
 		const live = balanceSubject(credentialId);
 		return (
 			balanceCaches.get(subject.id) === cache &&
 			live?.id === subject.id &&
-			balanceIdentity(live.config) === identity &&
+			tokenDanceQuotaIdentity(live.config) === identity &&
 			!live.config.disabled
 		);
 	};

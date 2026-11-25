@@ -29,6 +29,9 @@ import {
 } from "@shared/model-catalog/resolve";
 import type { CatalogStatus } from "@shared/model-catalog/schema/api";
 import type { RawCatalog } from "@shared/model-catalog/schema/catalog";
+import { TOKENDANCE_PREFIX } from "@shared/tokendance";
+import { getCachedCommandCodeModels } from "../commandcode-models";
+import { COMMAND_CODE_PREFIX } from "../commandcode-protocol";
 import { logger } from "../logger";
 import { getNarraforkHome } from "../narrafork-home";
 import { resolveNugModelMeta } from "../nug-model-cache";
@@ -61,7 +64,14 @@ export interface ModelCatalogSettings {
 export type { CatalogQuery } from "@shared/model-catalog/resolve";
 
 /** Built-in providers whose prefix is also the catalog's channel key. */
-const PUBLIC_PROVIDER_KEYS = ["codex", "anthropic", "openai", "gemini"];
+const PUBLIC_PROVIDER_KEYS = [
+	"codex",
+	"anthropic",
+	"openai",
+	"gemini",
+	TOKENDANCE_PREFIX,
+	COMMAND_CODE_PREFIX,
+];
 
 export type { CatalogStatus } from "@shared/model-catalog/schema/api";
 
@@ -469,6 +479,12 @@ function providerConfigs() {
 		...(settingsRef?.anthropicProviders ?? []),
 		...(settingsRef?.geminiProviders ?? []),
 		...(settingsRef?.nugProviders ?? []),
+		...(settingsRef?.tokendance?.apiKey?.trim()
+			? [{ id: TOKENDANCE_PREFIX, prefix: TOKENDANCE_PREFIX }]
+			: []),
+		...(settingsRef?.commandCode?.apiKey?.trim()
+			? [{ id: COMMAND_CODE_PREFIX, prefix: COMMAND_CODE_PREFIX }]
+			: []),
 	];
 }
 
@@ -487,7 +503,21 @@ export function registerListingWindows(lookup: ListingWindows): void {
 export function queryForModel(model: string): { query: CatalogQuery; discovered?: RawMetadata } {
 	const value = model.trim();
 	const config = providerConfigs().find((c) => c.prefix && value.startsWith(`${c.prefix}:`));
-	const prefix = config?.prefix ?? PUBLIC_PROVIDER_KEYS.find((p) => value.startsWith(`${p}:`));
+	// Unlike the public API prefixes, these services need a configured connection.
+	// CLI-only Command Code can also identify a model its owner already published;
+	// never probe auth.json or refresh a directory from metadata/routing reads.
+	const prefix =
+		config?.prefix ??
+		PUBLIC_PROVIDER_KEYS.find(
+			(p) =>
+				value.startsWith(`${p}:`) &&
+				p !== TOKENDANCE_PREFIX &&
+				(p !== COMMAND_CODE_PREFIX ||
+					getCachedCommandCodeModels(
+						settingsRef?.commandCode?.apiKey,
+						settingsRef?.commandCode?.baseUrl,
+					).some((model) => model.id === value.slice(p.length + 1))),
+		);
 	const query: CatalogQuery = {
 		upstreamModelId: prefix ? value.slice(prefix.length + 1) : value,
 		...(prefix && PUBLIC_PROVIDER_KEYS.includes(prefix) ? { providerKey: prefix } : {}),
