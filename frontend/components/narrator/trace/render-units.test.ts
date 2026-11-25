@@ -696,7 +696,7 @@ describe("groupRenderUnits (L1/L2 unified activity fold)", () => {
 					createdAt: "2026-07-19T00:00:00.000Z",
 				},
 				[{ type: "reasoning", text: "weighing the options" }],
-			) as NarratorMsg;
+		) as unknown as NarratorMsg;
 
 		const liveUnits = groupRenderUnits(segmentMessages([reasoningMessage("__streaming__")]), true);
 		const persistedUnits = groupRenderUnits(segmentMessages([reasoningMessage("real-id")]), true);
@@ -942,5 +942,59 @@ describe("groupRenderUnits (L1/L2 unified activity fold)", () => {
 		expect(groupRenderUnits(segments, true).map((unit) => unit.kind)).toEqual(
 			groupRenderUnits(segments, true, { keepToolUseIds: new Set() }).map((unit) => unit.kind),
 		);
+	});
+});
+
+// ── 整轮折叠：轮首不能被吸进 activity 单元 ──────────────────────────────────
+
+describe("轮首保持独立 segment（整轮折叠前提）", () => {
+	/**
+	 * 子代理派发任务的那条 user 消息带一个结构化 `system_injection` 块。
+	 * `compactAuxiliaryContent` 会把它视作 auxiliary 内容 —— 于是一条**用户消息**
+	 * 被拆成 activity 的一部分，顶层 spec 序列里再也没有轮首，整轮折叠与导航轨
+	 * 同时失效（实测：LOD ≤2 的子代理会话里连气泡都消失了）。
+	 */
+	const taskRow = (): NarratorMsg =>
+		rowWithElements(
+			{
+				id: "task",
+				narratorId: "narrator-1",
+				parentToolUseId: null,
+				role: "user",
+				contentText: "只读代码调查",
+				origin: "assistant",
+				originLabel: "agentMessage:explore",
+				createdAt: "2026-07-19T00:00:00.000Z",
+			},
+			[
+				{ type: "text", text: "只读代码调查" },
+				{
+					type: "system_injection",
+					source: "subagent_message",
+					modelText: "只读代码调查",
+					body: { kind: "prose", text: "只读代码调查" },
+				},
+			],
+		) as unknown as NarratorMsg;
+
+	test("user 消息在 compactAuxiliaryContent 下仍是独立 segment", () => {
+		const units = groupRenderUnits(segmentMessages([taskRow()], { compactAuxiliaryContent: true }), true, {
+			compactAuxiliaryContent: true,
+		});
+		expect(units.map((unit) => unit.kind)).toEqual(["segment"]);
+	});
+
+	test("它夹在两条 assistant 消息之间也不会被合并", () => {
+		const messages = [
+			toolMessage("before", "first", "reason"),
+			taskRow(),
+			toolMessage("after", "second", "reason"),
+		];
+		const units = groupRenderUnits(
+			segmentMessages(messages, { compactAuxiliaryContent: true }),
+			true,
+			{ compactAuxiliaryContent: true },
+		);
+		expect(units.map((unit) => unit.kind)).toEqual(["activity", "segment", "activity"]);
 	});
 });

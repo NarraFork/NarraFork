@@ -51,6 +51,16 @@ export interface VListLayoutResult {
 export interface ComputeLayoutOptions {
 	/** Account display preference; absent keeps compatibility for pure/preview callers. */
 	compactAuxiliaryContent?: boolean;
+	/**
+	 * 本会话是子代理 —— 让 adapter 给「父代理派发任务」的 user 消息打上
+	 * `roundStart` 标记（切轮判据，见 round-group.ts）。
+	 */
+	isSubagent?: boolean;
+	/**
+	 * 保持每张工具卡独立（不折成计数行）—— 整轮折叠开启时置真。
+	 * 见 `AdapterContext.keepToolCards`。
+	 */
+	keepToolCards?: boolean;
 	/** Available content width (px) for each element. */
 	contentWidth: number;
 	/** Render LOD (height master switch). */
@@ -178,6 +188,8 @@ export function computePretextVListLayout(
 ): VListLayoutResult {
 	const ctx: AdapterContext = {
 		compactAuxiliaryContent: opts.compactAuxiliaryContent,
+		isSubagent: opts.isSubagent,
+		keepToolCards: opts.keepToolCards,
 		lod: opts.lod,
 		isExpanded: opts.isExpanded,
 		isTextExpanded: opts.isTextExpanded,

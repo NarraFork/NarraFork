@@ -86,6 +86,7 @@ describe("resolveLodStepTarget", () => {
 
 describe("scale", () => {
 	it("offers every level as a target, in ascending order", () => {
+		// 1..5，与上游完全一致：整轮折叠是独立开关，不再占用档位。
 		expect(LOD_LEVELS).toEqual([1, 2, 3, 4, 5]);
 		expect(LOD_LEVELS[0]).toBe(MIN_RENDER_LOD);
 		expect(LOD_LEVELS[LOD_LEVELS.length - 1]).toBe(MAX_RENDER_LOD);

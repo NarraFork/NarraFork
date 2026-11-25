@@ -1,4 +1,4 @@
-import { ActionIcon, Box, Group, Stack, Text, UnstyledButton } from "@mantine/core";
+import { ActionIcon, Box, Group, Stack, Switch, Text, UnstyledButton } from "@mantine/core";
 import {
 	IconBaselineDensityLarge,
 	IconBaselineDensityMedium,
@@ -48,6 +48,8 @@ export const LodSwitchToast = memo(function LodSwitchToast({
 	onSetAsDefault,
 	onSelectLod,
 	pinned = false,
+	roundFolding,
+	onToggleRoundFolding,
 }: {
 	lod: RenderLod;
 	/** Whether `lod` is already the saved default — hides the action when true. */
@@ -58,6 +60,16 @@ export const LodSwitchToast = memo(function LodSwitchToast({
 	onSelectLod?: (next: RenderLod) => void;
 	/** Keep the indicator on screen instead of letting it fade (Alt held). */
 	pinned?: boolean;
+	/**
+	 * 整轮折叠开关的当前值。
+	 *
+	 * 折叠**不是**档位的一步（那样 L5 想折没得折、L1 想展开又得切档位），而是
+	 * 与档位正交的独立开关。放进这个浮层是因为两者总是同时在调：读者想看更多
+	 * 细节时，要么扩一格档位，要么把整轮折叠关掉 —— 入口分开会让人来回找。
+	 */
+	roundFolding?: boolean;
+	/** 点折叠开关。不传则不显示这一行（只读预览页）。 */
+	onToggleRoundFolding?: (next: boolean) => void;
 }) {
 	const { t } = useTranslation("narrator");
 	// Counts level changes and is null until the first actual CHANGE, so mounting
@@ -255,6 +267,30 @@ export const LodSwitchToast = memo(function LodSwitchToast({
 				    the notches it grew the row sideways, which moved the steppers away
 				    from where the pointer already was and made the gauge — the row the
 				    eye actually tracks — no longer centered on the indicator. */}
+				{/* 折叠开关与档位放在同一层：两者总是同时在调。分隔线让「上面是档位、
+				    下面是一个正交的开关」这件事一眼可见，不会被误读成第六档。 */}
+				{onToggleRoundFolding ? (
+					<Box
+						style={{
+							width: "100%",
+							borderTop: "1px solid var(--mantine-color-dark-5)",
+							paddingTop: 8,
+						}}
+					>
+						<Switch
+							data-testid="lod-round-folding"
+							size="xs"
+							checked={roundFolding !== false}
+							onChange={(event) => onToggleRoundFolding(event.currentTarget.checked)}
+							label={
+								<Text size="xs" c="dimmed" style={{ whiteSpace: "nowrap" }}>
+									{t("roundFoldingShort")}
+								</Text>
+							}
+							styles={{ label: { cursor: "pointer" } }}
+						/>
+					</Box>
+				) : null}
 				{canSetDefault ? (
 					<UnstyledButton
 						data-testid="lod-set-default"

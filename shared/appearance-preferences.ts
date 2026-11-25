@@ -43,6 +43,8 @@ export const APPEARANCE_PREFERENCES = {
 		"narrafork_narrator_bottom_spacing_resize",
 	),
 	narrafork_lod_alt_gesture: local(true, "narrafork_lod_alt_gesture"),
+	// 整轮折叠默认开启：它是「长会话不再冗余」的主要来源。
+	narrafork_round_folding: local(true, "narrafork_round_folding"),
 	narrafork_blur_in_ms: { ...local(400, "narrafork_blur_in_ms"), min: 0, max: 2000 },
 	narrafork_stream_token_ms: {
 		...local(DEFAULT_STREAM_ANIM_DURATION_MS, "narrafork_stream_token_ms"),

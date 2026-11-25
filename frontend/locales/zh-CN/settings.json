@@ -1361,6 +1361,8 @@
 	"auxiliaryContentDisplayLegacy": "保留原有展示",
 	"lodAltGesture": "Alt+滚轮调节详细程度",
 	"lodAltGestureDesc": "按住 Alt 滚动（触屏双指捏合）可调节叙述者消息的渲染详细程度，按住 Alt 也会显示级别指示器。关闭后 Alt 不再参与调节，可改用叙述者工具栏中的「详细程度」入口。",
+	"roundFolding": "折叠已完成的轮次",
+	"roundFoldingDesc": "一轮拿到最终回复后，把中间的过程折成一条「已处理 2m 14s」，于是一轮读起来是你的提问、这条折叠条、然后是结论。仍在运行的轮永远不会被折叠。这个开关与详细程度无关：任何档位下都能开或关；想临时看某一轮的全部过程，点开那条折叠条即可。",
 	"mockStreamPanel": "模拟流式输出面板（调试）",
 	"mockStreamPanelDesc": "在叙述者 dock 中显示一个临时面板，可回放脚本化的思考 / 文本 / 工具输出，用于调优列表动画。不会写入任何数据。",
 	"expandReasoning": "默认展开推理内容",

@@ -5159,3 +5159,56 @@ describe("adaptSegment — subagent file-change fold", () => {
 		expect("fileChangesExpanded" in other).toBe(false);
 	});
 });
+
+// ── 整轮折叠：子代理轮首标记 ────────────────────────────────────────────────
+
+describe("roundStart labelling (整轮折叠)", () => {
+	/**
+	 * 子代理的「用户」消息是父代理派发的任务。它的呈现形态不固定：结构化注入
+	 * 走 `injection-bubble`，只有 originLabel 的老式 Send 行走 `system-text` 来源卡，
+	 * 投影策略还可能让它回落成普通用户气泡。切轮判据不能靠形态反推，所以
+	 * adapter 在产生 spec 时统一打 `roundStart`。
+	 */
+	const subagentTask = (blocks: Array<{ type: string; [key: string]: unknown }>) =>
+		({
+			kind: "message" as const,
+			msg: rowWithElements(
+				{ id: "task-msg", role: "user", origin: "assistant", originLabel: "agentMessage:探索" },
+				blocks as never,
+			),
+		}) as unknown as AdapterSegment;
+
+	it("子代理的 user 消息带上 roundStart", () => {
+		const specs = adaptSegment(subagentTask([{ type: "text", text: "只读代码调查" }]), {
+			lod: 5,
+			isSubagent: true,
+		});
+		expect(specs.length).toBeGreaterThan(0);
+		for (const spec of specs) {
+			expect((spec.data as { roundStart?: boolean }).roundStart).toBe(true);
+		}
+	});
+
+	it("主会话的同类消息不打标记（ForkNarrator / 群聊注入不单独成轮）", () => {
+		const specs = adaptSegment(subagentTask([{ type: "text", text: "forked" }]), { lod: 5 });
+		for (const spec of specs) {
+			expect((spec.data as { roundStart?: boolean }).roundStart).toBeUndefined();
+		}
+	});
+
+	it("子代理的 assistant 消息不打标记（只有轮首需要）", () => {
+		const specs = adaptSegment(
+			{
+				kind: "message",
+				msg: rowWithElements(
+					{ id: "reply", role: "assistant" },
+					[{ type: "text", text: "调查完成" }] as never,
+				),
+			},
+			{ lod: 5, isSubagent: true },
+		);
+		for (const spec of specs) {
+			expect((spec.data as { roundStart?: boolean }).roundStart).toBeUndefined();
+		}
+	});
+});

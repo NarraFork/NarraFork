@@ -53,6 +53,11 @@ export interface AppearanceSectionProps {
 	setCenteredColumn: (v: boolean) => void;
 	lodAltGesture: boolean;
 	setLodAltGesture: (v: boolean) => void;
+	/**
+	 * 整轮折叠（已完成的轮折成一条「已处理 Xm Ys」）。开启时 LOD 6 仍可临时全展开。
+	 */
+	roundFolding: boolean;
+	setRoundFolding: (v: boolean) => void;
 }
 
 /**
@@ -143,6 +148,8 @@ export function AppearanceSection({
 	setCenteredColumn,
 	lodAltGesture,
 	setLodAltGesture,
+	roundFolding,
+	setRoundFolding,
 }: AppearanceSectionProps) {
 	const { t } = useTranslation("settings");
 	const [bottomSpacingResize, setBottomSpacingResize] = useLocalPref(
@@ -338,6 +345,13 @@ export function AppearanceSection({
 				description={t("lodAltGestureDesc")}
 				checked={lodAltGesture}
 				onChange={(e) => setLodAltGesture(e.currentTarget.checked)}
+			/>
+			<Switch
+				preferenceKey="narrafork_round_folding"
+				label={t("roundFolding")}
+				description={t("roundFoldingDesc")}
+				checked={roundFolding}
+				onChange={(e) => setRoundFolding(e.currentTarget.checked)}
 			/>
 			<Select
 				preferenceKey="compactAuxiliaryContent"

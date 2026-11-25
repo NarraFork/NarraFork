@@ -230,6 +230,8 @@ function section() {
 			setCenteredColumn={setBoolean}
 			lodAltGesture={true}
 			setLodAltGesture={setBoolean}
+			roundFolding={true}
+			setRoundFolding={setBoolean}
 		/>
 	);
 }

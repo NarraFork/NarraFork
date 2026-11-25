@@ -27,6 +27,7 @@ import { formatLocaleNumber } from "@frontend/lib/intl-format";
 import { registerIOSScrollToTopTarget } from "@frontend/lib/ios-scroll-to-top";
 import {
 	NARRATOR_COLUMN_GUTTER_PX,
+	NARRATOR_MOBILE_GUTTER_PX,
 	narratorColumnPlaceholderStyle,
 	resolveNarratorColumnWidth,
 } from "@frontend/lib/narrator-content-column";
@@ -39,10 +40,14 @@ import {
 import { Anchor, Box, Group, Loader, Text } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import { messageBody } from "@shared/narrator-blocks/message-blocks";
+import type { NarratorRound } from "@shared/narrator-rounds";
 import { resolveVisibleWindow } from "@shared/pretext-layout";
+import type { MeasuredElement } from "@shared/pretext-layout/prepared-block";
 import { liveTailSignature } from "@shared/pretext-layout/reasoning-live-tail";
+import type { ElementSpec } from "@shared/pretext-layout/segment-adapter";
 import type { ToolCappedDetail } from "@shared/pretext-layout/tool-detail";
 import { normalizeSubagentToolInputSummary } from "@shared/subagent-tool-summary";
+import { useQueryClient } from "@tanstack/react-query";
 import {
 	forwardRef,
 	lazy,
@@ -112,7 +117,19 @@ import {
 	ReasoningTranslationVisibilityContext,
 	useReasoningTranslationVisibility,
 } from "./reasoning-translation-visibility";
+import { measureElement } from "./registry";
 import { resolveRenderExtra } from "./render-registry";
+import { formatRoundFoldTitle } from "./round-group-compose";
+import { roundHeadMessageId } from "./round-head-key";
+import type { RoundRailLabels } from "./round-rail/RoundRail";
+import { RoundRail } from "./round-rail/RoundRail";
+import {
+	readRoundFavorites,
+	toggleRoundFavorite as toggleRoundFavoriteSeq,
+	writeRoundFavorites,
+} from "./round-rail/round-rail-favorites";
+import { resolveActiveRoundIndex } from "./round-rail/round-rail-geometry";
+import { narratorRoundsQueryKey, useNarratorRounds } from "./round-rail/useNarratorRounds";
 import { resolveTextExpansionPreference } from "./segment-adapter";
 import { type UsePretextDocumentResult, usePretextDocument } from "./usePretextDocument";
 import { useReasoningTranslationLivePatches } from "./useReasoningTranslationLivePatches";
@@ -129,7 +146,6 @@ import {
 import { useVListTraceBindings } from "./useVListTraceBindings";
 import { useVListWindowRows } from "./useVListWindowRows";
 import { VListContentViewModal } from "./VListContentViewModal";
-import { VListUserMarkers } from "./VListUserMarkers";
 import { useVListAskInPassing } from "./vlist-ask-in-passing-bridge";
 import { askInPassingBlock } from "./vlist-ask-in-passing-sync";
 import { resolveVListBlockTarget, toolUseIdFromBlockId } from "./vlist-block-target";
@@ -171,6 +187,7 @@ import {
 	sourceIdsForItem,
 } from "./vlist-exact-layout";
 import {
+	foldedChildInteractionSig,
 	ownerRequestKey,
 	type RowInteraction,
 	type RowToggles,
@@ -181,6 +198,8 @@ import {
 	rowInteractionSig,
 	rowSelectionBlockIds,
 	sameRowInteraction,
+	TOGGLEABLE_CARD_KINDS,
+	TRACE_KINDS,
 	TRACE_ROW_INTERACTION_KINDS,
 } from "./vlist-exact-row-state";
 import {
@@ -338,15 +357,6 @@ import { buildTailMeta, type TailMetaMessage } from "./vlist-tail-meta";
 import { installVListTextDragGuard } from "./vlist-text-drag";
 import { buildToolMetaIndex } from "./vlist-tool-meta";
 import { hostsUnpredictableBlock } from "./vlist-unpredictable-blocks";
-import {
-	collectVListCompactMarkerSemantics,
-	collectVListUserMarkerSemantics,
-	projectVListCompactMarkers,
-	projectVListUserMarkers,
-	resolveVListUserMarkerScrollTop,
-	type VListCompactMarker,
-	type VListUserMarker,
-} from "./vlist-user-markers";
 import { mergePinnedRowIndices, resolvePinnedRowIndices } from "./vlist-virtualization";
 import { createVListVisibleViewport } from "./vlist-visible-viewport";
 import { createVisualStateStore } from "./vlist-visual-state";
@@ -385,7 +395,6 @@ const SEGMENT_GAP = 12;
  * index. Matches the canvas top padding, so the turn reads as the top of a page
  * rather than being flush against the viewport edge.
  */
-const VLIST_USER_MARKER_JUMP_LEAD = PAGE_PADDING;
 const BOTTOM_DISTANCE_EPSILON = 1;
 const STREAMING_PLACEHOLDER_ID = "__streaming__";
 /** Scroll distance from the top within which an upward gesture may auto-load older history. */
@@ -401,6 +410,9 @@ const OLDER_HEADER_HEIGHT = 40;
  */
 const TOOL_RUN_FRAME_BG = "color-mix(in srgb, var(--mantine-color-body) 50%, transparent)";
 const TOOL_RUN_FRAME_BORDER = "1px solid var(--mantine-color-default-border)";
+
+/** 稳定的空轮次表（同 EMPTY_ROUNDS 的理由：不能每帧造新引用）。 */
+const EMPTY_ROUND_RAIL_ROUNDS: readonly NarratorRound[] = [];
 
 type ScrollRef = RefObject<HTMLElement | null> | ((node: HTMLDivElement | null) => void);
 
@@ -465,6 +477,13 @@ type PretextExactMessageListProps = {
 	 * source message id + seq whenever it changes.
 	 */
 	onVisibleMessagesChange?: (last: { id: string; seq: number | null } | null) => void;
+	/**
+	 * 视口顶部那条消息的 seq（导航轨「当前轮」高亮用）。
+	 *
+	 * 与 `onVisibleMessagesChange` 分开：那个报的是**最后**可见的一条，用于未读
+	 * 计数；高亮要的是**最上面**一条。两者同时变化会让人以为是一件事。
+	 */
+	onTopVisibleSeqChange?: (seq: number | null) => void;
 };
 
 /**
@@ -564,12 +583,114 @@ export const PretextExactMessageList = memo(
 				selectedMessageIds: messageSelectedIds,
 				onToggleMessageSelect,
 				onVisibleMessagesChange,
+				onTopVisibleSeqChange,
 			} = props;
+			const { t, i18n } = useTranslation("narrator");
 			const lod = useRenderLod() as RenderLod;
 			// Advanced-animation preference (same key AppRootLayout writes to <html>);
 			// gates the streaming tail's per-grapheme fade-in. Reactive so toggling the
 			// setting takes effect without a reload.
 			const [advancedAnim] = useLocalPref("narrafork_advanced_anim");
+			// 整轮折叠开关（外观设置里的「折叠已完成的轮次」，默认开）。Reactive：
+			// 切换后立刻重建文档，不需要刷新。
+			const [roundFoldingEnabled] = useLocalPref("narrafork_round_folding");
+			/**
+			 * 后端轮次索引：折叠条的**时长唯一来源**。
+			 *
+			 * 不从被折叠元素上取时间 —— 实测那条路走不通：折叠区间里只有用户气泡带
+			 * `createdAt`，工具卡的 data 不带时间戳，最终回复是 markdown（data 就是一个
+			 * 纯字符串）。于是「轮首 → 收尾」两端永远取不齐，折叠条只剩光秃秃的「已处理」。
+			 *
+			 * 后端已经算好了每一轮的 `startedAt / repliedAt`（一条聚合 SQL），直接用它。
+			 */
+			const { rounds: indexedRounds } = useNarratorRounds(narratorId);
+			/** 轮首消息 id → 本轮用量（时长 + token）。按 messageId 对：spec 上没有 seq。 */
+			const roundUsageByMessageId = useMemo(() => {
+				const map = new Map<string, { durationMs?: number; tokens?: number }>();
+				for (const round of indexedRounds) {
+					const durationMs =
+						typeof round.startedAt === "number" && typeof round.repliedAt === "number"
+							? round.repliedAt - round.startedAt
+							: undefined;
+					const entry: { durationMs?: number; tokens?: number } = {};
+					if (typeof durationMs === "number" && durationMs > 0) entry.durationMs = durationMs;
+					if (typeof round.tokens === "number" && round.tokens > 0) entry.tokens = round.tokens;
+					if (entry.durationMs !== undefined || entry.tokens !== undefined) {
+						map.set(round.messageId, entry);
+					}
+				}
+				return map;
+			}, [indexedRounds]);
+			/**
+			 * 导航轨的「当前轮」—— 视口顶部那条消息属于哪一轮。
+			 *
+			 * 判据（`resolveActiveRoundIndex`）：`round.seq <= 顶部 seq` 的最后一轮。
+			 * 顶部 seq 由列表在上报 effect 里给（`onTopVisibleSeqChange`），所以这里
+			 * 只需要把「顶部在哪」与「轮次表」合成一个下标。
+			 *
+			 * 判不出时给 -1（轨道一根都不亮），不猜第一轮：猜了会让读者以为自己在
+			 * 第一轮，即使他其实停在别处。
+			 */
+			const [activeRoundSeq, setActiveRoundSeq] = useState<number | null>(null);
+			// 视口顶部 seq 的来源有两个：宿主显式给的（只读分享页会传），以及本组件
+			// 自己从 manifest 量的。后者覆盖前者，因为它是本列表真实的可视窗口。
+			const onTopVisibleSeqChangeRef = useRef(onTopVisibleSeqChange);
+			onTopVisibleSeqChangeRef.current = onTopVisibleSeqChange;
+			const reportTopSeq = useCallback((seq: number | null) => {
+				setActiveRoundSeq((current) => (current === seq ? current : seq));
+				onTopVisibleSeqChangeRef.current?.(seq);
+			}, []);
+			const activeRoundIndex = useMemo(
+				() => resolveActiveRoundIndex(indexedRounds, activeRoundSeq ?? undefined),
+				[indexedRounds, activeRoundSeq],
+			);
+			/**
+			 * 轨道用的轮次表：后端索引 + 本地已发但还不进索引的轮。
+			 *
+			 * 不合并的话，导航轨会一直少最后那一根 —— 而那一根正是读者刚发的、最想
+			 * 看到的那一轮。
+			 */
+			const roundRailRounds = useMemo(
+				() => (indexedRounds.length > 0 ? indexedRounds : EMPTY_ROUND_RAIL_ROUNDS),
+				[indexedRounds],
+			);
+			// 收藏：按 narratorId 隔离，读一次即可（同一标签页里只有这条轨道会写）。
+			const [roundFavorites, setRoundFavorites] = useState<Set<number>>(() =>
+				readRoundFavorites(narratorId),
+			);
+			// 换会话要换一整套收藏 —— 上一条会话的收藏绝不能漏到新的上。
+			// biome-ignore lint/correctness/useExhaustiveDependencies: narratorId is the switch signal
+			useEffect(() => {
+				setRoundFavorites(readRoundFavorites(narratorId));
+			}, [narratorId]);
+			const toggleRoundFavorite = useCallback(
+				(seq: number) => {
+					setRoundFavorites((current) => {
+						const next = toggleRoundFavoriteSeq(current, seq);
+						writeRoundFavorites(narratorId, next);
+						return next;
+					});
+				},
+				[narratorId],
+			);
+			/**
+			 * 导航轨的文案。
+			 *
+			 * 必须在组件里拼（`RoundRail` 的默认标签是英文硬编码）：中文界面下轨道
+			 * 的无障碍名与 tooltip 曾整条是英文 "Round timeline / 30 rounds"，
+			 * 读屏和悬停都看不出这是轮次导航。
+			 */
+			const roundRailLabels = useMemo<RoundRailLabels>(
+				() => ({
+					rail: t("roundRailLabel"),
+					railTitle: (count: number) => t("roundRailTitle", { count }),
+					pendingReply: t("roundRailPendingReply"),
+					favorite: t("roundRailFavorite"),
+					unfavorite: t("roundRailUnfavorite"),
+					emptyRound: t("roundRailEmptyRound"),
+				}),
+				[t],
+			);
 			/**
 			 * Unified morph driver instead of the keyframe planners. Default OFF — see the key's
 			 * note in `useLocalPref.ts` on why this needs a real browser comparison before it
@@ -928,6 +1049,92 @@ export const PretextExactMessageList = memo(
 			const [heightOverrides, setHeightOverrides] = useState<ReadonlyMap<string, number>>(
 				() => new Map(),
 			);
+			/**
+			 * 整轮折叠条的**盒内预览**集合（轮首 spec 的 key）。
+			 *
+			 * 两级展开的第一级：内容在折叠条盒子里渲染，高度靠实测覆盖。
+			 * 第二级（pinned）见 `roundPinnedOpen`。
+			 */
+			const [roundPreviewOpen, setRoundPreviewOpen] = useState<ReadonlySet<string>>(
+				() => new Set(),
+			);
+			/**
+			 * 已「提升为完整行」的轮（轮首 spec 的 key）。
+			 *
+			 * 这些轮不合成折叠条，整轮回到内联 —— 每个元素都是正常行，拿到完整
+			 * 交互与虚拟化。它是 buildOptions 的输入（会重建文档）。
+			 */
+			const [roundPinnedOpen, setRoundPinnedOpen] = useState<ReadonlySet<string>>(() => new Set());
+			const onToggleRoundPreview = useCallback((roundKey: string) => {
+				if (!roundKey) return;
+				setRoundPreviewOpen((prev) => {
+					const next = new Set(prev);
+					if (next.has(roundKey)) next.delete(roundKey);
+					else next.add(roundKey);
+					return next;
+				});
+			}, []);
+			const onPromoteRound = useCallback((roundKey: string) => {
+				if (!roundKey) return;
+				// 提升时顺带退出预览：否则重建后这一轮虽然内联了，残留的预览记录会
+				// 让它在将来又被折回去时直接以预览态出现。
+				setRoundPreviewOpen((prev) => {
+					if (!prev.has(roundKey)) return prev;
+					const next = new Set(prev);
+					next.delete(roundKey);
+					return next;
+				});
+				setRoundPinnedOpen((prev) => new Set(prev).add(roundKey));
+			}, []);
+			/**
+			 * 折叠配置的**稳定引用**。
+			 *
+			 * 它的每一项都是重建文档的输入，而 `usePretextDocument` 把整个对象放进
+			 * `useMemo` 依赖 —— 每次渲染造一个新字面量会让它判定「变了」→ 重建 →
+			 * 再渲染 → 又是新对象，直接撞上 React #185（Maximum update depth）。
+			 * 三个谓词也一并固定，理由相同。
+			 */
+			const roundFoldOptions = useMemo(
+				() => ({
+					enabled: roundFoldingEnabled,
+					// 子代理的切轮判据不同（它的「用户」消息是父代理派发的任务）。
+					isSubagent,
+					expandedRoundKeys: roundPinnedOpen,
+					previewRoundKeys: roundPreviewOpen,
+					isLiveSpec: (spec: { data?: unknown }) => {
+						const data = spec.data as { isStreaming?: unknown; status?: unknown } | null;
+						if (!data || typeof data !== "object") return false;
+						if (data.isStreaming === true) return true;
+						const status = data.status;
+						return status === "running" || status === "pending" || status === "queued";
+					},
+					readDuration: (spec: { key?: string }) => {
+						const messageId = roundHeadMessageId(spec.key);
+						if (messageId === null) return undefined;
+						return roundUsageByMessageId.get(messageId)?.durationMs;
+					},
+					readTokens: (spec: { key?: string }) => {
+						const messageId = roundHeadMessageId(spec.key);
+						if (messageId === null) return undefined;
+						return roundUsageByMessageId.get(messageId)?.tokens;
+					},
+					buildTitle: ({
+						durationMs,
+						tokens,
+					}: {
+						durationMs: number | undefined;
+						tokens: number | undefined;
+					}) => formatRoundFoldTitle(t("roundFoldDone"), durationMs, tokens),
+				}),
+				[
+					roundFoldingEnabled,
+					isSubagent,
+					roundPinnedOpen,
+					roundPreviewOpen,
+					roundUsageByMessageId,
+					t,
+				],
+			);
 			// Keys whose row currently hosts a dynamic body (assigned during render from
 			// `dynamicRowKeys` below). Read at report time so a reporter that fires after
 			// its row already reverted to the pure-arithmetic form cannot re-introduce a
@@ -987,6 +1194,65 @@ export const PretextExactMessageList = memo(
 				(key: string) => activeInteraction.expanded.get(key),
 				[activeInteraction],
 			);
+			/**
+			 * 按**当前**交互态重测一个被折进来的元素（整轮折叠的盒内预览）。
+			 *
+			 * 为什么需要：`spec.data.folded` 存的是折叠那一刻的 `measured`，那时读者
+			 * 还没打开卡片，快照是收起态。渲染层形态完全取自 `measured.expanded`，
+			 * 于是点击只翻转 `aria-expanded`、高度纹丝不动。
+			 *
+			 * 顶层元素没这个问题 —— 它们每次交互变化都走「重建 → 重测」。折叠内的
+			 * 元素已从顶层序列移走，那条链路覆盖不到，只能在这里补。
+			 *
+			 * 做法是把 adapter 当初用于**这个 key** 的展开判据重新算一遍，并进
+			 * `opts` 再测：`opened`（读者显式选择）与 `lodUserOverride`（显式覆盖档位
+			 * 默认）正是 measure 层读取的两个输入（见 measure-tool-call 的
+			 * `resolveToolCallOpened`）。
+			 *
+			 * 引用必须稳定（ExactRow 的 memo 逐项比较），所以读 ref 而不是列依赖。
+			 */
+			const remeasureFoldedChild = useCallback(
+				(spec: ElementSpec, measured: MeasuredElement): MeasuredElement | undefined => {
+					const state = activeInteractionRef.current;
+					const key = spec.key;
+					if (!key) return undefined;
+					// 只重测「展开态会改变几何」的种类；其余原样返回，避免无谓重算。
+					if (!TOGGLEABLE_CARD_KINDS.has(spec.kind) && !TRACE_KINDS.has(spec.kind)) {
+						return undefined;
+					}
+					const opened = state.expanded.get(key);
+					const lodUserOverride = state.lodUserOverrides.has(key);
+					// 宽度必须用**内容列宽**——`measured` 上没有它（它在 item 层），传 0
+					// 会让换行计算全部退化，测出来的高度是错的。
+					const width = committedContentWidthRef.current;
+					if (!(width > 0)) return undefined;
+					const opts = {
+						...(spec.opts ?? {}),
+						...(opened === undefined ? {} : { opened }),
+						lodUserOverride,
+					};
+					try {
+						const result = measureElement(spec.kind, spec.data, width, lod, opts);
+						return result;
+					} catch {
+						// 测量失败就退回快照：宁可画收起态，也不要让整行渲染崩掉。
+						return undefined;
+					}
+				},
+				[lod],
+			);
+			/**
+			 * 登记一个被折元素。折叠条每次渲染都会走过它的子元素，这里把 measured 与
+			 * collapsesByLod 记下来，补上顶层序列缺失的那份元数据。
+			 *
+			 * 引用必须稳定（ExactRow 的 memo 逐项比较）。
+			 */
+			const registerFoldedChild = useCallback(
+				(key: string, measured: MeasuredElement, collapsesByLod: boolean) => {
+					foldedChildMetaRef.current.set(key, { measured, collapsesByLod });
+				},
+				[],
+			);
 			const resolveLodUserOverride = useCallback(
 				(key: string) => activeInteraction.lodUserOverrides.has(key),
 				[activeInteraction],
@@ -1037,7 +1303,6 @@ export const PretextExactMessageList = memo(
 			// `{_truncated, preview, _hints}` produced an EMPTY header summary — the reason
 			// Edit/Read rows showed just the tool name while their expanded detail (which
 			// fetches the full payload) looked fine.
-			const { t, i18n } = useTranslation("narrator");
 			// Every localized string the vlist paints comes from one place (the vlist
 			// layers themselves import no i18n — see CONTRACT.md §0). `adapterLabels` feeds
 			// the pure adapter's measured card / trace text and exact tool summaries;
@@ -1139,6 +1404,25 @@ export const PretextExactMessageList = memo(
 				new Map(),
 			);
 			const collapsesByLodByKeyRef = useRef<Map<string, boolean>>(new Map());
+			/**
+			 * 折叠内元素的元数据：`key → { measured, collapsesByLod }`。
+			 *
+			 * ⚠️ 为什么需要这张表：整轮折叠把轮中的元素从**顶层序列**移走后，它们同时
+			 * 失去了三样东西，而这三样都按顶层 items 建立 ——
+			 *   - `collapsesByLodByKeyRef`（决定点击写 expanded 还是 lodUserOverrides）
+			 *   - `measuredByKeyRef`（`onToggle` 用它算「现在是什么状态」）
+			 *   - `index.itemByKey`（上面两者共同的查找入口）
+			 *
+			 * 于是点了折进去的卡片会写进一个**重建后读不到**的 key：`aria-expanded`
+			 * 翻了，几何却不变（实测 405 次重测里 `opened` 恒为 undefined）。
+			 *
+			 * 这条通道把它们补回来：折叠条渲染时登记自己的子元素，读写都走这里。
+			 * 用 ref 而非 state —— 它只是查找表，登记本身不该触发重渲染；真正的
+			 * 重渲染由交互状态变化（`setInteraction`）驱动。
+			 */
+			const foldedChildMetaRef = useRef<
+				Map<string, { measured: MeasuredElement; collapsesByLod: boolean }>
+			>(new Map());
 			/**
 			 * Fold transition (see vlist-fold-animation.ts).
 			 *
@@ -1451,11 +1735,11 @@ export const PretextExactMessageList = memo(
 					if (cached) return cached;
 					const toggles: RowToggles = {
 						onToggle: () => {
-							const current = resolveRowOpenState(
-								measuredByKeyRef.current.get(key),
-								activeInteractionRef.current,
-								key,
-							);
+							// 折叠内元素的 measured 只存在于 `foldedChildMetaRef`（它们不在
+							// 顶层索引里），所以先查那边再看顶层。
+							const measuredNow =
+								foldedChildMetaRef.current.get(key)?.measured ?? measuredByKeyRef.current.get(key);
+							const current = resolveRowOpenState(measuredNow, activeInteractionRef.current, key);
 							captureFoldBefore(key);
 							// A per-key OVERRIDE of the level's default fold — NOT an LOD step, and the
 							// distinction is load-bearing.
@@ -1483,7 +1767,12 @@ export const PretextExactMessageList = memo(
 							// Which means this branch must NOT be turned into a real level step (nor
 							// gain one alongside the override) without giving the two controllers a
 							// shared cancel boundary. Pinned by vlist-fold-wiring.test.ts.
-							if (collapsesByLodByKeyRef.current.get(key) === true) {
+							// 折叠内元素不在顶层 map 里，它们的 collapsesByLod 由折叠条登记到
+							// `foldedChildMetaRef`。查不到再退回顶层那张表。
+							const collapsesByLod =
+								foldedChildMetaRef.current.get(key)?.collapsesByLod ??
+								collapsesByLodByKeyRef.current.get(key);
+							if (collapsesByLod === true) {
 								setInteraction((prev) => toggleVListLodUserOverride(prev, key));
 							} else {
 								setInteraction((prev) => setVListExpanded(prev, key, !current));
@@ -2200,6 +2489,12 @@ export const PretextExactMessageList = memo(
 				lod,
 				keepEmptyReasoningLive: isActive,
 				pinLatestSpecTasks: taskBackend !== "outline",
+				// 整轮折叠：已完成的轮折成一条「已处理」。
+				//
+				// ⚠️ 必须是稳定引用（`roundFoldOptions`），不能在 buildOptions 里写字面量：
+				// usePretextDocument 把 roundFold 放进 useMemo 依赖，新对象会每帧都判定
+				// 「配置变了」→ 重建文档 → 再次渲染 → 新对象……即 React #185（无限更新）。
+				roundFold: roundFoldOptions,
 				labels: vlistLabels,
 				labelsRevision,
 				widthBucket: String(Math.round(contentWidth)),
@@ -2401,6 +2696,7 @@ export const PretextExactMessageList = memo(
 			// bubble, while a later delivery-state or edit event still replaces the loaded row.
 			// New mid-window rows fall back to the structural reload; compact markers keep
 			// their existing exact insert fast path.
+			const queryClient = useQueryClient();
 			const upsertOrReload = useCallback(
 				(message: TreeMessage | undefined) => {
 					// A subagent's row is dual-broadcast here too, but it is never a row of
@@ -2409,6 +2705,10 @@ export const PretextExactMessageList = memo(
 					// inflated the "new messages" badge of a parent panel that nothing was
 					// arriving in. Its card is maintained by the live-patch channel instead.
 					if (isForeignSubagentRow(message, !!isSubagent)) return;
+					// 轮次索引随消息追加而变：user 开头一轮、assistant 收尾一轮、compact 标记
+					// 会切走轮首判据。索引查询是 staleTime: Infinity 的缓存快照，全靠这里
+					// 显式失效 —— 查询本身有索引 + 上限，代价可控。
+					queryClient.invalidateQueries({ queryKey: narratorRoundsQueryKey(narratorId ?? "") });
 					if (message && upsertMessageRef.current(message)) {
 						appliedMessageRevisionRef.current += 1;
 					} else if (message && askInPassingBlock(message)) {
@@ -2423,7 +2723,7 @@ export const PretextExactMessageList = memo(
 					}
 					bumpMessageRevision();
 				},
-				[bumpMessageRevision, refreshAskInPassingWindow, isSubagent],
+				[bumpMessageRevision, refreshAskInPassingWindow, isSubagent, narratorId, queryClient],
 			);
 
 			// A deletion is applied to the loaded window IN PLACE for the same reason an
@@ -3084,6 +3384,12 @@ export const PretextExactMessageList = memo(
 				const keys = new Set<string>();
 				for (const item of semanticItems) {
 					if (!item) continue;
+					// 整轮折叠条处于盒内预览态：它的算术高度只是「头部 + 占位」，真实高度
+					// 只有渲染层量得出来。不进这个集合，预览体就会被算术高度裁掉 —— 那正是
+					// 「点了折叠条打不开」的症状。
+					if (item.spec.kind === "round-group" && item.spec.opts?.open === true) {
+						keys.add(item.spec.key);
+					}
 					// Outline forms are only present while expanded. Removing the slot also
 					// prunes its height override in the same render as the fold.
 					if (outlineAskSlotByKey.has(item.spec.key)) keys.add(item.spec.key);
@@ -3249,8 +3555,24 @@ export const PretextExactMessageList = memo(
 			}, [suspended, seenWindow.end, pretextDocument.manifest]);
 
 			/**
-			 * Identity of the currently committed DOCUMENT (not its geometry).
+			 * 视口**顶部**那条消息的 seq —— 导航轨「当前轮」高亮的数据源。
 			 *
+			 * 用顶部而不是底部/中心：读者正在读的那一轮就是屏幕最上面这一轮，
+			 * 这与 Vantaloom 的 `activeFlowEventId` 判据一致。用底部会让高亮永远
+			 * 停在最后一行，滚动时整条轨道像没反应。
+			 *
+			 * `seenWindow.start` 是虚拟窗口的起点，`manifest.items[start].firstSeq`
+			 * 是这一行的最小 seq —— 合成行（折叠条）也带 `firstSeq`，所以折叠态下
+			 * 依然能判出所属轮，不需要额外的兜底判据。
+			 */
+			useEffect(() => {
+				const manifestItems = pretextDocument.manifest?.items ?? [];
+				const firstItem = manifestItems[seenWindow.start];
+				const seq = firstItem?.firstSeq;
+				reportTopSeq(typeof seq === "number" ? seq : null);
+			}, [seenWindow.start, pretextDocument.manifest, reportTopSeq]);
+
+			/**
 			 * `manifest.documentRevision` advances on every structural change — a new message,
 			 * an edit, a live patch, an older page — but NOT on a fold, which only changes
 			 * build options. That is exactly the discriminator the FLIP needs: a capture taken
@@ -4134,12 +4456,15 @@ export const PretextExactMessageList = memo(
 				// native-drag slot that dragend will never clear.
 				const stopTextDrag = installVListTextDragGuard(node);
 				const pointerTracker = createPointerDragTracker(() => controller.release());
+				// 窄屏把左右槽加宽到 30px：轮轨的触控带（28px）在 16px 槽里会压到正文。
+				const horizontalGutterPx = () =>
+					mobileViewportRef.current ? NARRATOR_MOBILE_GUTTER_PX : PAGE_PADDING;
 				const canMeasure = () => {
 					return (
 						panelVisible &&
 						visibleViewportRef.current.isVisible(node) &&
 						Number.isFinite(node.clientWidth) &&
-						node.clientWidth > PAGE_PADDING * 2
+						node.clientWidth > horizontalGutterPx() * 2
 					);
 				};
 				const controller = createVListResizeController({
@@ -4148,7 +4473,7 @@ export const PretextExactMessageList = memo(
 						const ready = canMeasure();
 						return {
 							width: ready
-								? resolveNarratorColumnWidth(node.clientWidth, PAGE_PADDING, centeredColumn)
+								? resolveNarratorColumnWidth(node.clientWidth, horizontalGutterPx(), centeredColumn)
 								: 0,
 							boxWidth: ready ? node.offsetWidth : 0,
 							height: ready ? node.clientHeight : 0,
@@ -4584,78 +4909,6 @@ export const PretextExactMessageList = memo(
 						viewportRef.current !== viewportNode || viewportNode.scrollTop !== scrollTopRef.current,
 				);
 			}, [viewportNode, handleIOSScrollToTop]);
-
-			// Quick index of user turns beside the scrollbar (parity with the chunked
-			// path's ScrollbarUserMarkers). Positions come from the exact layout's real
-			// document offsets rather than a seq ordinal, so a mark lands on the turn it
-			// points at regardless of how much output surrounds it.
-			//
-			// The fractions are taken against the FULL scrollable height (canvas + tail
-			// footer) so the track shares the scrollbar's coordinate system.
-			const scrollableHeight = (exactLayout?.totalHeight ?? 0) + footerHeight;
-			const userMarkerSemantics = useMemo(
-				() => collectVListUserMarkerSemantics(semanticItems),
-				[semanticItems],
-			);
-			const userMarkers = useMemo(
-				() =>
-					projectVListUserMarkers(userMarkerSemantics, exactLayout?.items ?? [], scrollableHeight),
-				[userMarkerSemantics, exactLayout?.items, scrollableHeight],
-			);
-			// Compact indicators ride the same track: a failed compact stays visible
-			// (red) even when the reader has scrolled far away from the marker row.
-			const compactMarkerSemantics = useMemo(
-				() => collectVListCompactMarkerSemantics(semanticItems),
-				[semanticItems],
-			);
-			const compactMarkers = useMemo(
-				() =>
-					projectVListCompactMarkers(
-						compactMarkerSemantics,
-						exactLayout?.items ?? [],
-						scrollableHeight,
-					),
-				[compactMarkerSemantics, exactLayout?.items, scrollableHeight],
-			);
-			const handleUserMarkerJump = useCallback(
-				(marker: VListUserMarker) => {
-					loadedTopNarratorRef.current = null;
-					// A jump is an explicit reading action: unpin so streaming output cannot
-					// immediately pull the reader back to the tail.
-					getSmoothFollower().cancel();
-					interactionAdmissionRef.current?.markHistoryIntent();
-					pinnedToBottomRef.current = false;
-					visibleViewportRef.current.setPinned(false);
-					setPinnedToBottom(false);
-					writeScrollTop(resolveVListUserMarkerScrollTop(marker.top, VLIST_USER_MARKER_JUMP_LEAD));
-				},
-				[getSmoothFollower, writeScrollTop],
-			);
-			const handleCompactMarkerJump = useCallback(
-				(marker: VListCompactMarker) => {
-					loadedTopNarratorRef.current = null;
-					getSmoothFollower().cancel();
-					interactionAdmissionRef.current?.markHistoryIntent();
-					pinnedToBottomRef.current = false;
-					visibleViewportRef.current.setPinned(false);
-					setPinnedToBottom(false);
-					writeScrollTop(resolveVListUserMarkerScrollTop(marker.top, VLIST_USER_MARKER_JUMP_LEAD));
-				},
-				[getSmoothFollower, writeScrollTop],
-			);
-			const resolveUserMarkerLabel = useCallback(
-				(ordinal: number) =>
-					t("jumpToUserMessage", { ordinal, defaultValue: `Jump to message #${ordinal}` }),
-				[t],
-			);
-			const resolveCompactMarkerLabel = useCallback(
-				(marker: VListCompactMarker) =>
-					t("jumpToCompactMarker", {
-						status: marker.tooltip,
-						defaultValue: "Jump to compact marker",
-					}),
-				[t],
-			);
 
 			const onLodStepRef = useRef(onLodStep);
 			onLodStepRef.current = onLodStep;
@@ -5501,8 +5754,14 @@ export const PretextExactMessageList = memo(
 						sourceIds,
 						// Height-neutral live tails and closing cards still advance this
 						// signature, even when the measured object is a cache hit.
-						interactionSig: `${rowInteractionSig(activeInteraction, item.spec.key)}|${contentView.rowSig(item.spec.key)}|${liveTailSignature(item.spec.data)}|${closingRowSig(closingRows, item.spec.key)}`,
+						interactionSig: `${rowInteractionSig(activeInteraction, item.spec.key)}|${contentView.rowSig(item.spec.key)}|${liveTailSignature(item.spec.data)}|${closingRowSig(closingRows, item.spec.key)}${foldedChildInteractionSig(item.spec, activeInteraction)}`,
 						toggles: getRowToggles(item.spec.key),
+						// 整轮折叠里被折进去的元素要各自的 toggles，否则它们点不开。
+						getTogglesForKey: getRowToggles,
+						// 并且要按各自当前的展开态重测几何，否则点开了也不长高。
+						remeasureFoldedChild,
+						// 折子元素不在顶层序列里，元数据要由折叠条登记回来。
+						registerFoldedChild,
 						resolveToolDetailStatus:
 							item.spec.kind === "communication-bubble" ? resolveToolDetailStatus : undefined,
 						renderLabels,
@@ -5536,6 +5795,10 @@ export const PretextExactMessageList = memo(
 						onUnknownHeight: isDynamicRow
 							? getUnknownHeightReporter(item.spec.key, item.contentWidth ?? contentWidth)
 							: undefined,
+						// 整轮折叠条的两级展开（见 ExactRowProps 的对应说明）。
+						roundPreviewOpen,
+						onToggleRoundPreview,
+						onPromoteRound,
 						onResumeSubagentRecovery: handleResumeSubagentRecovery,
 						onDismissSubagentRecovery: dismissSubagentRecovery,
 						specCarryoverActions: resolveSpecCarryoverActions(item, sourceIds, resolveSpecActions),
@@ -5606,20 +5869,6 @@ export const PretextExactMessageList = memo(
 					data-vlist-resize-measured={pretextDocument.resizeMeasuredCount || undefined}
 					data-vlist-resize-revision={pretextDocument.resizeRevision}
 				>
-					{/* User-turn quick index, pinned to the viewport's right edge. A zero-height
-			    sticky box, so it indexes the document without adding to it. Placed
-			    BEFORE the canvas so its marks paint above the rows. */}
-					<VListUserMarkers
-						markers={userMarkers}
-						compactMarkers={compactMarkers}
-						documentHeight={scrollableHeight}
-						trackHeight={viewportHeight}
-						onJump={handleUserMarkerJump}
-						onJumpCompact={handleCompactMarkerJump}
-						viewportRef={viewportRef}
-						resolveLabel={resolveUserMarkerLabel}
-						resolveCompactLabel={resolveCompactMarkerLabel}
-					/>
 					{/* Full width on purpose: each row centers its own `contentWidth` column
 			    instead of relying on a narrow, centered parent. A centered parent
 			    left the space beside it as bare scroll container with no in-flow
@@ -5627,6 +5876,59 @@ export const PretextExactMessageList = memo(
 			    focus back to the top of the history (same root cause as the
 			    inter-row gaps — see resolveRowHitHeight). */}
 					<div ref={assignContent} style={{ position: "relative", width: "100%" }}>
+						{/* 轮次导航轨：内置在对话列左槽里（与 Vantaloom 同形态），不浮在
+						    视口右侧。放在滚动容器内用 `sticky`，于是它跟着阅读位置走而不
+						    是钉死在屏幕上 —— 轨道是「在这段对话的哪里」，属于内容而不是
+						    悬浮控件。
+						    ⚠️ 不能用 `height: 100%`（滚动容器里百分比高度塌成 0，轨道完全
+						    不显示），也不能 `float`（整页布局卡死，实测浏览器脚本超时）。
+						    `sticky` + 固定像素高度两者都避开；宽度只占 gutter 的一段，
+						    正文列自身有 padding，不会压到文字。
+						    垂直默认居中：宿钉在视口中线（top:50%，宿主本身 0 高），轨体再
+						    用 translateY(-50%) 上移半高。轮数超容量时轨道窗口跟随当前轮，
+						    两端渐隐表示上下还有更多轮（见 RoundRail 的 railCapacity）。 */}
+						<div
+							data-nf-round-rail-host=""
+							data-nf-round-count={roundRailRounds.length}
+							style={{ display: "none" }}
+						/>
+						{roundRailRounds.length >= 2 ? (
+							<div
+								data-nf-round-rail=""
+								style={{
+									position: "sticky",
+									top: "50%",
+									left: 0,
+									float: "left",
+									marginLeft: -16,
+									width: 16,
+									height: 0,
+									overflow: "visible",
+									zIndex: 30,
+									pointerEvents: "auto",
+								}}
+							>
+								<div style={{ transform: "translateY(-50%)" }}>
+									<RoundRail
+										rounds={roundRailRounds}
+										activeIndex={activeRoundIndex}
+										onJumpToRound={(round) => {
+											// 跳到该轮首条消息。domId 规则见 domIdForItem（`msg-<id>`）；
+											// targetIds 让跳转在「那一段还没加载」时向前补页。
+											void scrollToMessageTarget({
+												domIds: [`msg-${round.messageId}`],
+												targetIds: [round.messageId],
+												highlightId: round.messageId,
+											});
+										}}
+										favorites={roundFavorites}
+										onToggleFavorite={toggleRoundFavorite}
+										labels={roundRailLabels}
+										tapToOpen={isMobileViewport}
+									/>
+								</div>
+							</div>
+						) : null}
 						{hasRenderableLayout && exactLayout ? (
 							<div
 								style={{

@@ -33,6 +33,18 @@ export const NARRATOR_CENTERED_COLUMN_MAX_WIDTH = 860;
 export const NARRATOR_COLUMN_GUTTER_PX = 16;
 
 /**
+ * Horizontal gutter (px) per side on narrow/mobile viewports (width < 48em).
+ *
+ * Bigger than the desktop gutter on purpose: the round rail's touch strip is
+ * 28px wide (tick visuals ≤14px + tap padding), so the 16px desktop gutter
+ * leaves the last ~12px of the strip sitting on top of message text. At 30px
+ * the whole strip fits inside the gutter and the text column still keeps a
+ * couple of pixels of air. Only the WIDTH measurement uses this — vertical
+ * spacing stays on NARRATOR_COLUMN_GUTTER_PX.
+ */
+export const NARRATOR_MOBILE_GUTTER_PX = 30;
+
+/**
  * Width (px) of the content column drawn inside a message viewport.
  *
  * `viewportWidth` is the scroll container's client width and `padding` the

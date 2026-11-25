@@ -28,6 +28,8 @@ function SettingsAppearancePage() {
 	const [expandReasoning, setExpandReasoning] = useLocalPref("narrafork_expand_reasoning");
 	const [centeredColumn, setCenteredColumn] = useLocalPref("narrafork_narrator_centered_column");
 	const [lodAltGesture, setLodAltGesture] = useLocalPref("narrafork_lod_alt_gesture");
+	// 整轮折叠（已完成的轮折成一条「已处理」）。默认值由 appearance 偏好表给出（开启）。
+	const [roundFolding, setRoundFolding] = useLocalPref("narrafork_round_folding");
 	// TEMPORARY debug toggle — see components/narrator/mock/README-REMOVAL.md.
 	// Kept here rather than inside AppearanceSection so removal touches one file.
 	const [mockStream, setMockStream] = useLocalPref("narrafork_mock_stream");
@@ -63,6 +65,8 @@ function SettingsAppearancePage() {
 				setCenteredColumn={setCenteredColumn}
 				lodAltGesture={lodAltGesture}
 				setLodAltGesture={setLodAltGesture}
+				roundFolding={roundFolding}
+				setRoundFolding={setRoundFolding}
 			/>
 			<PluginOverlaySettings />
 			{/* TEMPORARY debug toggle (mock stream harness). Delete with ../mock/. */}

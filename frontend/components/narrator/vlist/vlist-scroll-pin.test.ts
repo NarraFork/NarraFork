@@ -716,9 +716,9 @@ describe("loaded-history scroll-to-top action", () => {
 		}
 	});
 
-	it("releases the loaded-top intent for marker and bottom navigation", async () => {
+	it("releases the loaded-top intent for bottom navigation", async () => {
 		const { getScrollBottomTarget } = await import("./vlist-exact-scroll");
-		for (const name of ["handleUserMarkerJump", "handleCompactMarkerJump", "scrollToBottom"]) {
+		for (const name of ["scrollToBottom"]) {
 			const harness = await loadedTopHarness();
 			harness.toTop();
 			const navigate = shellScrollCallback<(target: { top: number } | boolean) => void>(
@@ -727,11 +727,9 @@ describe("loaded-history scroll-to-top action", () => {
 				{
 					...harness.bindings,
 					getScrollBottomTarget,
-					resolveVListUserMarkerScrollTop: (top: number) => top,
-					VLIST_USER_MARKER_JUMP_LEAD: 0,
 				},
 			);
-			navigate(name === "scrollToBottom" ? true : { top: 12 });
+			navigate(true);
 			expect(harness.bindings.loadedTopNarratorRef.current).toBeNull();
 			harness.correction(24, "item");
 			expect(harness.node.scrollTop).toBe(24);

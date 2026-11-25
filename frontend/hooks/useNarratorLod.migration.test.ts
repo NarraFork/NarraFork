@@ -78,6 +78,8 @@ describe("stored LOD migration (v1 1..6 → v2 1..5)", () => {
 		});
 		const { readOpeningLod } = await import("./useNarratorLod");
 
+		// A store with no schema marker is v1: its 6 means "all expanded", which the
+		// v1 mapping shifts to 5. v1's 5 becomes 4.
 		expect(readOpeningLod("n-a")).toBe(4);
 
 		expect(store.get(DEFAULT_KEY)).toBe("5");
@@ -85,7 +87,47 @@ describe("stored LOD migration (v1 1..6 → v2 1..5)", () => {
 		expect(store.get(narratorKey("n-b"))).toBe("3");
 		expect(store.get(narratorKey("n-c"))).toBe("1");
 		expect(store.get("narrafork_oled")).toBe("true");
-		expect(store.get(SCHEMA_KEY)).toBe("2");
+		expect(store.get(SCHEMA_KEY)).toBe("4");
+	});
+
+	it("v3 → v4 brings the removed top step down to 5", async () => {
+		// v3 appended a 6th level for "all rounds expanded". Folding is now an
+		// independent switch, so that step is gone and a stored 6 becomes 5.
+		const store = installStorage({
+			[SCHEMA_KEY]: "3",
+			[DEFAULT_KEY]: "6",
+			[narratorKey("n-a")]: "6",
+			[narratorKey("n-b")]: "4",
+			[narratorKey("n-c")]: "2",
+		});
+		const { readOpeningLod } = await import("./useNarratorLod");
+
+		expect(readOpeningLod("n-a")).toBe(5);
+		expect(store.get(DEFAULT_KEY)).toBe("5");
+		expect(store.get(narratorKey("n-a"))).toBe("5");
+		// Levels below the removed top step keep their meaning.
+		expect(store.get(narratorKey("n-b"))).toBe("4");
+		expect(store.get(narratorKey("n-c"))).toBe("2");
+		expect(store.get(SCHEMA_KEY)).toBe("4");
+	});
+
+	it("v2 → v4 keeps the value on the same scale (no second v1 shift)", async () => {
+		// A store written under schema 2 is already on the 1..5 scale — its 5 means
+		// "recent expanded", not v1's 5. Applying the v1 mapping again would demote
+		// 5→4 and 4→3 a second time; it must take the v3 path instead.
+		const store = installStorage({
+			[SCHEMA_KEY]: "2",
+			[DEFAULT_KEY]: "5",
+			[narratorKey("n-a")]: "4",
+			[narratorKey("n-b")]: "3",
+		});
+		const { readOpeningLod } = await import("./useNarratorLod");
+
+		expect(readOpeningLod("n-a")).toBe(4);
+		expect(store.get(DEFAULT_KEY)).toBe("5");
+		expect(store.get(narratorKey("n-a"))).toBe("4");
+		expect(store.get(narratorKey("n-b"))).toBe("3");
+		expect(store.get(SCHEMA_KEY)).toBe("4");
 	});
 
 	it("does not migrate twice (a second read must not shift the values again)", async () => {
@@ -98,7 +140,8 @@ describe("stored LOD migration (v1 1..6 → v2 1..5)", () => {
 
 	it("leaves an already-migrated store untouched", async () => {
 		const store = installStorage({
-			[SCHEMA_KEY]: "2",
+			// Already at the CURRENT schema version: no rewrite may happen.
+			[SCHEMA_KEY]: "4",
 			[narratorKey("n-a")]: "5",
 			[DEFAULT_KEY]: "3",
 		});
@@ -121,12 +164,13 @@ describe("stored LOD migration (v1 1..6 → v2 1..5)", () => {
 		expect(readOpeningLod("unknown")).toBe(DEFAULT_RENDER_LOD);
 
 		// Unparseable values are ignored rather than clamped to a level.
-		installStorage({ [SCHEMA_KEY]: "2", [narratorKey("n-x")]: "not-a-level" });
+		installStorage({ [SCHEMA_KEY]: "3", [narratorKey("n-x")]: "not-a-level" });
 		expect(readOpeningLod("n-x")).toBe(DEFAULT_RENDER_LOD);
 	});
 
-	it("clamps a stored value that lies outside the new scale", async () => {
-		installStorage({ [SCHEMA_KEY]: "2", [narratorKey("n-a")]: "9" });
+	it("clamps a stored value that lies outside the current scale", async () => {
+		// 9 is past the top of the 1..5 scale, so it clamps to 5 (MAX_RENDER_LOD).
+		installStorage({ [SCHEMA_KEY]: "4", [narratorKey("n-a")]: "9" });
 		const { readOpeningLod } = await import("./useNarratorLod");
 		expect(readOpeningLod("n-a")).toBe(5);
 	});

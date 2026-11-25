@@ -30,7 +30,6 @@ import { usePermissionSlots, useTracePermissionSlots } from "./vlist-permission-
 import type { VListItem } from "./vlist-pipeline";
 import { resolveSpecTaskLiveGate } from "./vlist-spec-task-live";
 import { hostsUnpredictableBlock } from "./vlist-unpredictable-blocks";
-import * as markerRuntime from "./vlist-user-markers";
 
 const source = shellModule("PretextExactMessageList.tsx");
 
@@ -404,131 +403,6 @@ describe("width previews retain production semantic metadata", () => {
 			previous = current;
 		}
 	});
-});
-
-const markerStart = source.indexOf("const scrollableHeight =");
-const markerEnd = source.indexOf("const handleUserMarkerJump", markerStart);
-if (markerStart < 0 || markerEnd < markerStart) throw new Error("Missing marker declarations");
-const executeMarkers = new Function(
-	"runtime",
-	transpiler.transformSync(`
-		const { useMemo, ${Object.keys(markerRuntime).join(", ")} } = runtime;
-		return function markers(renderItems, semanticItems, exactLayout, footerHeight) {
-			${source.slice(markerStart, markerEnd)}
-			return { userMarkers, compactMarkers };
-		};
-	`),
-)({ useMemo, ...markerRuntime }) as (
-	items: readonly VListItem[],
-	semanticItems: readonly VListItem[],
-	layout: { items: readonly { top: number }[]; totalHeight: number },
-	footer: number,
-) => {
-	userMarkers: markerRuntime.VListUserMarker[];
-	compactMarkers: markerRuntime.VListCompactMarker[];
-};
-
-it("projects production markers across width/footer frames without reading offscreen bodies", async () => {
-	const { coordinator, messages } = await fixture();
-	const last = messages.at(-1);
-	if (!last) throw new Error("Missing last message");
-	const previous = messages.at(-2);
-	if (!previous) throw new Error("Missing compact message");
-	coordinator.upsertMessage(
-		rowWithElements(
-			{
-				...previous,
-				role: "user",
-			},
-			[{ type: "segment_compact", status: "failed", error: "Historical failure" }],
-		),
-		false,
-		view,
-	);
-	coordinator.upsertMessage({ ...last, role: "user" }, false, view);
-	const baseline = complete(coordinator);
-	const item = baseline.items.at(-1);
-	if (!item) throw new Error("Missing last item");
-	const data = item.spec.data as { text: string; createdAt: string };
-	let reads = 0;
-	Object.defineProperty(data, "text", {
-		configurable: true,
-		get() {
-			reads++;
-			return "A giant human turn. ".repeat(100_000);
-		},
-	});
-	const compactItem = baseline.items.find((row) => row.spec.kind === "system-text");
-	if (!compactItem) throw new Error("Missing failed compact card");
-	const compactData = compactItem.spec.data as { title: string; text: string };
-	const compactTitle = compactData.title;
-	let compactReads = 0;
-	Object.defineProperty(compactData, "title", {
-		configurable: true,
-		get() {
-			compactReads++;
-			return compactTitle;
-		},
-	});
-	Object.defineProperty(compactData, "text", {
-		configurable: true,
-		get() {
-			throw new Error("Compact marker must not read the error body");
-		},
-	});
-	let markers: ReturnType<typeof executeMarkers> | undefined;
-	function Markers({ snapshot, footer }: { snapshot: typeof baseline; footer: number }) {
-		const index = snapshot.index;
-		const layout = useMemo(
-			() => ({
-				items: snapshot.items.map((_, i) => ({ top: index.itemStart(i) })),
-				totalHeight: index.totalHeight,
-			}),
-			[index, snapshot.items],
-		);
-		markers = executeMarkers(snapshot.items, snapshot.semanticItems ?? [], layout, footer);
-		return null;
-	}
-	host = document.createElement("div");
-	document.body.appendChild(host);
-	root = createRoot(host);
-	act(() => root?.render(<Markers snapshot={baseline} footer={100} />));
-	const first = markers?.userMarkers[0];
-	if (!first) throw new Error("Missing human marker");
-	expect(first.key).toBe(item.spec.key);
-	expect(first.ordinal).toBe(1);
-	expect(first.createdAt).toBe(last.createdAt);
-	expect(first.preview).toStartWith("A giant human turn.");
-	const firstCompact = markers?.compactMarkers[0];
-	if (!firstCompact) throw new Error("Missing compact marker");
-	expect(firstCompact.key).toBe(compactItem.spec.key);
-	expect(firstCompact.tooltip).toBe(compactTitle);
-	expect(firstCompact.status).toBe("failed");
-	const baselineReads = reads;
-	const baselineCompactReads = compactReads;
-	for (const [frame, width] of [420, 480, 520, 420].entries()) {
-		coordinator.previewWidth(width, view);
-		const snapshot = complete(coordinator);
-		const footer = 150 + frame;
-		act(() => root?.render(<Markers snapshot={snapshot} footer={footer} />));
-		const current = markers?.userMarkers[0];
-		expect(reads).toBe(baselineReads);
-		expect(compactReads).toBe(baselineCompactReads);
-		const compact = markers?.compactMarkers[0];
-		expect(compact?.tooltip).toBe(compactTitle);
-		expect(compact?.status).toBe("failed");
-		expect(compact?.top).toBe(snapshot.index.itemStart(firstCompact.itemIndex));
-		expect(compact?.fraction).toBe(
-			snapshot.index.itemStart(firstCompact.itemIndex) / (snapshot.index.totalHeight + footer),
-		);
-		expect(current?.key).toBe(first.key);
-		expect(current?.preview).toBe(first.preview);
-		expect(current?.createdAt).toBe(first.createdAt);
-		expect(current?.top).toBe(snapshot.index.itemStart(first.itemIndex));
-		expect(current?.fraction).toBe(
-			snapshot.index.itemStart(first.itemIndex) / (snapshot.index.totalHeight + footer),
-		);
-	}
 });
 
 function productionEffectBefore(marker: string): string {

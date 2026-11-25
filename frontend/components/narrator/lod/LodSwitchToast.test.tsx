@@ -159,6 +159,8 @@ async function render(props: {
 	isDefault?: boolean;
 	onSelectLod?: (next: RenderLod) => void;
 	onSetAsDefault?: () => void;
+	roundFolding?: boolean;
+	onToggleRoundFolding?: (next: boolean) => void;
 }) {
 	await act(async () => {
 		root.render(
@@ -180,6 +182,8 @@ describe("LodSwitchToast", () => {
 
 	test("pinned mode shows one clickable target per level", async () => {
 		const onSelectLod = mock((_next: RenderLod) => {});
+		// L5 is the top of the scale (1..5, same as upstream), so the gauge must
+		// render five notches and mark the last one as current.
 		await render({ lod: 5, pinned: true, onSelectLod });
 
 		const notches = notchButtons();
@@ -206,6 +210,7 @@ describe("LodSwitchToast", () => {
 	});
 
 	test("steppers are disabled at the ends of the scale", async () => {
+		// The top of the scale is L5.
 		await render({ lod: 5, pinned: true, onSelectLod: () => {} });
 		expect(byTestId("lod-step-up")?.hasAttribute("disabled")).toBe(true);
 		expect(byTestId("lod-step-down")?.hasAttribute("disabled")).toBe(false);
@@ -235,6 +240,35 @@ describe("LodSwitchToast", () => {
 	test("pinning is reported on the indicator so it can be told apart in the DOM", async () => {
 		await render({ lod: 4, pinned: true, onSelectLod: () => {} });
 		expect(byTestId("lod-indicator")?.getAttribute("data-lod-pinned")).toBe("true");
+	});
+
+	test("整轮折叠开关就在浮层里，且不是第六档", async () => {
+		// 折叠与档位正交：读者想「看更多」时可以扩档位，也可以关掉整轮折叠，
+		// 两者入口放在一起，但折叠绝不是刻度上的一格。
+		const onToggleRoundFolding = mock((_next: boolean) => {});
+		await render({ lod: 4, pinned: true, roundFolding: true, onToggleRoundFolding });
+
+		const toggle = byTestId("lod-round-folding");
+		expect(toggle).not.toBeNull();
+		// 刻度数量不受折叠开关影响 —— 证实它没有伪装成一个档位。
+		expect(notchButtons()).toHaveLength(5);
+	});
+
+	test("折叠开关渲染为开着（受控于 roundFolding）", async () => {
+		const onToggleRoundFolding = mock((_next: boolean) => {});
+		await render({ lod: 4, pinned: true, roundFolding: true, onToggleRoundFolding });
+		const input = byTestId("lod-round-folding") as HTMLInputElement | null;
+		expect(input?.checked).toBe(true);
+
+		// 关着的时候要如实反映，而不是永远显示开启。
+		await render({ lod: 4, pinned: true, roundFolding: false, onToggleRoundFolding });
+		const off = byTestId("lod-round-folding") as HTMLInputElement | null;
+		expect(off?.checked).toBe(false);
+	});
+
+	test("不给回调时不渲染折叠开关（只读预览页）", async () => {
+		await render({ lod: 4, pinned: true, roundFolding: true });
+		expect(byTestId("lod-round-folding")).toBeNull();
 	});
 
 	test("picking a level while pinned does not start a hide countdown", async () => {

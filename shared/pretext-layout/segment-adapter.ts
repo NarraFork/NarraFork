@@ -998,6 +998,26 @@ function adapterTextExpanded(
 
 export interface AdapterContext {
 	lod: RenderLod;
+	/**
+	 * 这个会话是子代理。
+	 *
+	 * 只为一件事而存在：给「父代理派发任务」的 user 消息打上 `roundStart` 标记。
+	 * 那条消息的呈现形态有三种（用户气泡 / 注入气泡 / 来源卡），下游无法从形态
+	 * 反推它是不是一轮的开始；形态是展示决策，会随投影策略变化，而切轮判据必须
+	 * 稳定。所以判据在产生 spec 的这一层写死。
+	 */
+	isSubagent?: boolean;
+	/**
+	 * 保持每张工具卡独立（不折成 `tool-run-count` 汇总行）。
+	 *
+	 * 整轮折叠开启时由调用方置真。两层折叠会互相吃掉内容：低 LOD 先把一批工具调用
+	 * 压成一条「工具调用 ×N」，整轮折叠再把这批的**汇总行**收进 pill —— 于是读者
+	 * 点开 pill 看到的是一条没有明细的计数行，这一轮的工具过程等于消失。
+	 *
+	 * 置真后每张卡都是独立元素，既进得了折叠区间、也保留自己的展开身份。
+	 * 代价只在点开 pill 的那一刻：折叠着的时候仍是一行常量高度。
+	 */
+	keepToolCards?: boolean;
 	/** Explicit opt-in; absent/false preserves the historical projection. */
 	compactAuxiliaryContent?: boolean;
 	/** Actual question lifecycle from the existing async-question slot, never tool success alone. */
@@ -1926,6 +1946,28 @@ export function blockIdFromElementKey(key: string): { blockId: string; offset: n
 }
 
 function adaptMessage(
+	msg: AdapterMessage,
+	visibleBlockIndices: number[] | undefined,
+	ctx: AdapterContext,
+): ElementSpec[] {
+	const specs = adaptMessageSpecs(msg, visibleBlockIndices, ctx);
+	// 子代理的「用户」消息就是父代理派发的任务 —— 它是一轮的开始。
+	//
+	// 这条消息的呈现形态并不固定（用户气泡 / 注入气泡 / 来源卡，取决于 origin、
+	// 有没有结构化 injection 块、以及投影策略），所以下游没法靠 `kind` 反推。
+	// 形态是展示决策，切轮判据必须稳定，于是把答案写在这一层：谁产生 spec，谁
+	// 知道自己是不是子代理、这是不是一条 user 消息。
+	//
+	// 只标注，不改任何展示字段 —— measure 与 render 都不读这个键。
+	if (ctx.isSubagent === true && msg.role === "user") {
+		for (const spec of specs) {
+			spec.data = { ...(spec.data as Record<string, unknown> | undefined), roundStart: true };
+		}
+	}
+	return specs;
+}
+
+function adaptMessageSpecs(
 	msg: AdapterMessage,
 	visibleBlockIndices: number[] | undefined,
 	ctx: AdapterContext,
@@ -5638,7 +5680,9 @@ function toolTraceItem(
 function adaptToolRun(items: AdapterToolItem[], ctx: AdapterContext): ElementSpec[] {
 	const isSoleSubagent =
 		items.filter((item) => item.isSubagent && !isCommunicationTool(item.tc)).length === 1;
-	if (ctx.lod >= 3) {
+	// `keepToolCards` 让低 LOD 也逐张出卡片 —— 整轮折叠要求这批调用保持可寻址、
+	// 可展开（见该字段的说明）。其余情况沿用历史投影：L≥3 逐张，L≤2 折成计数行。
+	if (ctx.lod >= 3 || ctx.keepToolCards === true) {
 		const compact = ctx.compactAuxiliaryContent;
 		return items.map((item, index) => {
 			// A bubble breaks the surrounding tool frame as well as the low-LOD fold.

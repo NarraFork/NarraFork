@@ -22,6 +22,7 @@
 import { narratorsApi } from "@frontend/lib/api/narrators";
 import { notifications } from "@mantine/notifications";
 import { coerceInjectionTarget } from "@shared/pretext-layout/injection-target";
+import type { ElementSpec } from "@shared/pretext-layout/segment-adapter";
 import { memo, type ReactNode, useLayoutEffect, useMemo, useRef } from "react";
 import { QUOTE_ROLE_ATTR } from "../composer/quote-source-attrs";
 import { MessageContextMenuCtx } from "../message/MessageContextMenuCtx";
@@ -29,6 +30,7 @@ import { openCommunicationRecipient } from "./communication-navigation";
 import type { MeasuredSubagent } from "./measure/measure-subagent";
 import { isRunningStatus, type MeasuredToolCall } from "./measure/measure-tool-call";
 import type { MeasuredTraceRow } from "./measure/measure-tool-run";
+import type { MeasuredElement } from "./prepared-block";
 import { CaretFiller } from "./render/caret-filler";
 import type { AskInPassingPendingInteraction } from "./render/RenderAskInPassing";
 import type {
@@ -146,6 +148,42 @@ export interface ExactRowProps {
 	/** Interaction signature for this row's key; changes force a re-render. */
 	interactionSig: string;
 	toggles: RowToggles;
+	/**
+	 * 按元素 key 取 toggles —— 给「整轮折叠」里被折进来的元素用。
+	 *
+	 * 折叠条的行只拿到**自己**的 `toggles`（闭包绑在本行 key 上），而被折进去的
+	 * 工具卡/推理行是别的 key，于是它们拿不到任何展开回调：卡片画出来了，点它却
+	 * 什么也不发生（实测就是这样）。折进来的元素仍然是完整的 `RenderXxx`，只要把
+	 * 它们**各自 key** 的 toggles 交给渲染层，交互就能恢复。
+	 *
+	 * 可选：不给时退回旧的静态渲染（只读预览页没有交互）。
+	 */
+	getTogglesForKey?: (key: string) => RowToggles;
+	/**
+	 * 按**当前**交互态重测一个被折进来的元素。
+	 *
+	 * `spec.data.folded` 里存的是折叠那一刻的 `measured`（收起态）。渲染层的形态
+	 * 完全取自 `measured.expanded`，所以不重测的话，读者点开卡片只会看到
+	 * `aria-expanded` 翻转而高度不变 —— 看起来像「点了没反应」。
+	 *
+	 * 顶层元素靠「交互变化 → 重建 → 重测」保持新鲜；折叠内的元素已经不在顶层序列
+	 * 里，那条链路管不到它们，只能由折叠条在渲染时补这一次。
+	 *
+	 * 返回 undefined 时调用方回退到快照（只读分享页没有测量器）。
+	 */
+	remeasureFoldedChild?: (
+		spec: ElementSpec,
+		measured: MeasuredElement,
+	) => MeasuredElement | undefined;
+	/**
+	 * 登记一个被折元素，让 shell 记得它的 measured 与 collapsesByLod。
+	 *
+	 * 折叠把元素从顶层序列移走，按顶层 items 建的三张表（collapsesByLod /
+	 * measuredByKey / itemByKey）全都查不到它们 —— 于是点击写进一个重建后读不到的
+	 * key，`aria-expanded` 翻了而几何不动。折叠条是它们唯一的渲染路径，由它在渲染
+	 * 时登记，读写就都回到同一条通道上。
+	 */
+	registerFoldedChild?: (key: string, measured: MeasuredElement, collapsesByLod: boolean) => void;
 	resolveToolDetailStatus?: UseVListToolDetailsResult["resolveToolDetailStatus"];
 	/** Localized chrome bundles for the render layer (stable across renders). */
 	renderLabels: VListRenderLabels;
@@ -235,6 +273,17 @@ export interface ExactRowProps {
 	 * blocks); recorded as a per-key override that re-derives the canvas geometry.
 	 */
 	onUnknownHeight?: (height: number) => void;
+	/**
+	 * 整轮折叠条的**盒内预览**集合（轮首 spec 的 key）。
+	 *
+	 * 按 key 而不是数组下标：轮首在窗口向上增长时位置会变，下标会让预览态
+	 * 漂到别的轮上。
+	 */
+	roundPreviewOpen?: ReadonlySet<string>;
+	/** 切换某一轮的盒内预览（收起 ↔ 预览）。 */
+	onToggleRoundPreview?: (roundKey: string) => void;
+	/** 把某一轮从预览「提升为完整行」（整轮回到内联）。 */
+	onPromoteRound?: (roundKey: string) => void;
 	/** Interrupt the narrator, stopping a running shell / MCP tool. */
 	onTerminate?: () => void;
 	/**
@@ -367,6 +416,9 @@ export const ExactRow = memo(
 		itemId,
 		sourceIds,
 		toggles,
+		getTogglesForKey,
+		remeasureFoldedChild,
+		registerFoldedChild,
 		resolveToolDetailStatus,
 		renderLabels,
 		interaction,
@@ -387,6 +439,9 @@ export const ExactRow = memo(
 		onPermissionFormHeight,
 		editorSlot,
 		onUnknownHeight,
+		roundPreviewOpen,
+		onToggleRoundPreview,
+		onPromoteRound,
 		onTerminate,
 		resolveUpdateTimeout,
 		onReflectionTakeOver,
@@ -933,6 +988,71 @@ export const ExactRow = memo(
 			() => ({ top, height, immediate: immediateInteraction }),
 			[top, height, immediateInteraction],
 		);
+		// 整轮折叠条（三态两级展开）：折叠进去的元素原样递归渲染成子节点，每个仍是
+		// 自己的 RenderXxx（测量与键都不变）。它们已从顶层序列移除，所以这里是它们
+		// 唯一的渲染路径 —— 也因此没有独立交互表面（要交互就「提升为完整行」）。
+		if (kind === "round-group") {
+			const specData = item.spec.data as
+				| { folded?: readonly unknown[]; roundKey?: string }
+				| undefined;
+			const roundKey = specData?.roundKey ?? "";
+			const folded = specData?.folded;
+			extra.roundGroupOpen = roundPreviewOpen?.has(roundKey) === true;
+			extra.onToggle =
+				roundKey && onToggleRoundPreview ? () => onToggleRoundPreview(roundKey) : undefined;
+			extra.onPromote = roundKey && onPromoteRound ? () => onPromoteRound(roundKey) : undefined;
+			if (Array.isArray(folded) && folded.length > 0) {
+				extra.children = (
+					<>
+						{(folded as Array<{ spec: ElementSpec; measured: MeasuredElement }>).map((child) => {
+							// 被折元素用**自己 key** 的 toggles：折叠条这一行的 `toggles`
+							// 闭包绑在折叠条的 key 上，交给子元素只会去翻折叠条自己的状态，
+							// 子卡片看起来完全没反应（实测：工具卡点不开）。
+							const childToggles = getTogglesForKey?.(child.spec.key);
+							const childExtra = resolveRenderExtra(child.spec);
+							if (childToggles) {
+								// 与主路径一致：可折叠卡片种类才接 onToggle（见
+								// `TOGGLEABLE_CARD_KINDS` 的绑定）。其余种类不吃这个键，
+								// 乱给只会让不该点开的东西变成可点。
+								if (TOGGLEABLE_CARD_KINDS.has(child.spec.kind)) {
+									childExtra.onToggle = childToggles.onToggle;
+								}
+								if (TRACE_KINDS.has(child.spec.kind)) {
+									childExtra.onToggleItems = childToggles.onToggleItems;
+									childExtra.onToggleEarlier = childToggles.onToggleEarlier;
+								}
+								if (child.spec.kind === "reasoning") {
+									childExtra.onToggleTranslation = childToggles.onToggleTranslation;
+								}
+							}
+							// ⚠️ 几何必须按**当前**展开态重算，不能用 `folded` 里的快照。
+							//
+							// 折进 `spec.data.folded` 的是折叠那一刻的 `measured` —— 那时读者
+							// 还没打开这张卡，所以它是收起态。渲染层（`RenderToolCall` 等）从
+							// `measured.expanded` 取形态，快照不变就永远画收起态：点击让
+							// `aria-expanded` 翻转了，卡片却纹丝不动（实测就是这样）。
+							//
+							// 顶层元素没有这个问题，因为它们每次交互变化都会走
+							// 「重建 → 重测」链路；折叠内的元素已从顶层序列移走，那条链路
+							// 不再覆盖它们，只能在这里补一次。
+							const remeasured = remeasureFoldedChild?.(child.spec, child.measured);
+							// 登记必须在渲染期同步完成：`onToggle` 是点击时才跑的，
+							// 那时再登记就已经晚了一步（它要读的正是这张表）。
+							registerFoldedChild?.(
+								child.spec.key,
+								remeasured ?? child.measured,
+								child.spec.opts?.collapsesByLod === true,
+							);
+							return (
+								<div key={child.spec.key}>
+									{renderElement(child.spec.kind, remeasured ?? child.measured, childExtra)}
+								</div>
+							);
+						})}
+					</>
+				);
+			}
+		}
 		const body = editorBody ?? renderElement(kind, item.measured, extra);
 		// A plain content row has no capped box of its own, so its viewer action bar
 		// wraps the whole row body. Never while editing: the editor replaces the row.
@@ -1103,6 +1223,11 @@ export const ExactRow = memo(
 		prev.itemId === next.itemId &&
 		prev.interactionSig === next.interactionSig &&
 		prev.toggles === next.toggles &&
+		// 折叠条靠它给子元素取 toggles；引用变了（换会话 / 关闭交互）必须重渲染，
+		// 否则折进去的工具卡会停在「点不开」的旧状态。
+		prev.getTogglesForKey === next.getTogglesForKey &&
+		prev.remeasureFoldedChild === next.remeasureFoldedChild &&
+		prev.registerFoldedChild === next.registerFoldedChild &&
 		prev.renderLabels === next.renderLabels &&
 		prev.resolveToolDetailStatus === next.resolveToolDetailStatus &&
 		prev.interaction === next.interaction &&

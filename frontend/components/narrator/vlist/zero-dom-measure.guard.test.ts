@@ -71,6 +71,15 @@ const PURE_PATH_FILES = [
 	// make a server event (not a user action) the source of a measured height.
 	"vlist-live-patch.ts",
 	"vlist-live-events.ts",
+	// 整轮折叠：切轮 + 折叠计划 + 运行期合成 + 实测回填，全部是纯算术。
+	//
+	// 这里必须守住「回填不测 DOM」：`round-fold-heights.ts` 消费的是渲染层
+	// （RenderRoundGroup 所在的 render/）量好并上报的数字，自己绝不读元素。
+	// 一旦它开始读 DOM，列表高度就会出现两个真源 —— 而折叠条正是靠「收起态
+	// 高度是常量、展开态只由一次显式上报覆盖」才不破坏其他行的几何。
+	"round-group.ts",
+	"round-group-compose.ts",
+	"round-fold-heights.ts",
 	// Pure decisions consumed by the shell (streaming hand-off, reload
 	// classification), the incremental streaming markdown preparation, and the
 	// "latest spec://tasks.json call" identification the pin exemption is keyed on.
