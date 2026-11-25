@@ -320,7 +320,7 @@ export function ItemMarks({
 				const label = t(`teams.page.marks.${mark}`, { key: exclusiveKey ?? "" });
 				return (
 					<Tooltip key={mark} label={label} withinPortal multiline maw={260}>
-						<span data-mark={mark} aria-label={label} style={{ display: "inline-flex" }}>
+						<span data-mark={mark} role="img" aria-label={label} style={{ display: "inline-flex" }}>
 							<Icon size={13} aria-hidden style={{ opacity: 0.7 }} />
 						</span>
 					</Tooltip>
