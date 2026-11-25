@@ -77,7 +77,7 @@ import { mcpManager } from "./lib/mcp/manager";
 import { prepareMcpTools } from "./lib/mcp/tool-bridge";
 import { getNarraforkHome } from "./lib/narrafork-home";
 import { listenWithLanFallback, resolveListenHost } from "./lib/net/listen-host";
-import { reconcileNugRelayClients } from "./lib/nug-relay/manager";
+import { startNugRelayOwner, stopAllNugRelayClients } from "./lib/nug-relay/manager";
 import { openFrontendOnce } from "./lib/open-frontend";
 import { IS_WINDOWS, initWslFlag } from "./lib/platform";
 import { runPostShutdownHooks } from "./lib/post-shutdown-hooks";
@@ -1644,10 +1644,9 @@ const databaseStartup = createDatabaseReaderStartup({
 });
 const databaseStartupPromise = databaseStartup.start();
 
-// Establish client-egress relay channels for NUG providers configured with
-// local egress (docs/CODEX_CLIENT_RELAY.md). Idempotent; also reconciled after
-// every settings save.
-reconcileNugRelayClients(settings.nugProviders ?? []);
+// Own client-egress relay channels before Auto routing can select NUG. Committed
+// settings and key edits are coalesced by this same owner, outside the read path.
+startNugRelayOwner();
 
 type GracefulShutdownOptions = {
 	reason: string;
@@ -2147,6 +2146,7 @@ async function performGracefulShutdown(
 		await step("teamMaintenance.stop", () => teamMaintenanceStop, budget.businessRemaining());
 		await step("authSessions.stop", () => {});
 		await step("gateway.stop", () => gateway.shutdown());
+		await step("nugRelays.stop", () => stopAllNugRelayClients());
 		await step("prefixSnapshots.stop", () => prefixSnapshotsStop);
 		await step("notificationFanout.stop", () => fanoutStop);
 		await step("notificationMaintenance.stop", () => notificationMaintenanceStop);

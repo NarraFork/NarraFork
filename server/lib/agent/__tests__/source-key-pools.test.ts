@@ -541,7 +541,7 @@ describe("real NUG preparation and relay ownership through pools", () => {
 		});
 	});
 
-	test("rotating inference keys never rotates the connection's relay auth or proxy", async () => {
+	test("an invalid inference credential promotes relay auth without changing connection egress", async () => {
 		const first = store().add(nugKeyOwner(NUG_ID), {
 			apiKey: "relay-connection-key",
 			network: keyNetwork("first"),
@@ -559,13 +559,15 @@ describe("real NUG preparation and relay ownership through pools", () => {
 		expect(await adapter.generateWithMeta("test", model)).toMatchObject({
 			credentialId: second.id,
 		});
-		expect(relayClients).toHaveLength(1);
-		expect(relayClients[0]?.options).toEqual({
-			providerId: original.id,
-			baseUrl: original.baseUrl,
-			apiKey: "relay-connection-key",
-			egressProxyUrl: original.egressProxyUrl,
-		});
+		expect(relayClients).toHaveLength(2);
+		expect(relayClients[0]?.status).toBe("offline");
+		for (const [index, apiKey] of [first.apiKey, second.apiKey].entries())
+			expect(relayClients[index]?.options).toEqual({
+				providerId: original.id,
+				baseUrl: original.baseUrl,
+				apiKey,
+				egressProxyUrl: original.egressProxyUrl,
+			});
 	});
 });
 
@@ -1146,10 +1148,9 @@ describe("real NUG codex pool relay credential and final transport matching", ()
 					expect(requests).toEqual([]);
 				}
 				expect(store().get(backup.id)?.disabled).not.toBe(true);
-				expect(relayClients).toHaveLength(select === "reorder B" && fallback ? 2 : 1);
+				expect(relayClients).toHaveLength(fallback ? 2 : 1);
 				expect(relayClients[0]?.options.apiKey).toBe(first.apiKey);
-				if (select === "reorder B" && fallback)
-					expect(relayClients.at(-1)?.options.apiKey).toBe(backup.apiKey);
+				if (fallback) expect(relayClients.at(-1)?.options.apiKey).toBe(backup.apiKey);
 			});
 		}
 	}

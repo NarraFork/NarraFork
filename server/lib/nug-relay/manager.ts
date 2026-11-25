@@ -1,11 +1,18 @@
 /**
  * Registry of live NUG relay clients, keyed by NUG provider id.
  *
- * Clients are created lazily by NugProvider construction (idempotent: same
- * config reuses the running client) and torn down when a provider's egress
- * mode returns to "nug" or the provider disappears from settings.
+ * Startup and committed settings/key changes reconcile each connection's effective
+ * credential. NugProvider construction uses that same idempotent reconciliation;
+ * Auto eligibility only reads the live channel registry.
  */
-import type { NUGProviderConfig } from "../settings";
+import { logger } from "../logger";
+import {
+	getProviderKeyStore,
+	nugKeyOwner,
+	peekProviderKeyStore,
+	withProviderKey,
+} from "../provider-keys";
+import { type NUGProviderConfig, settings, subscribeSettingsChanges } from "../settings";
 import { NugRelayClient, type NugRelayStatus } from "./relay-client";
 
 interface ManagedRelay {
@@ -15,6 +22,7 @@ interface ManagedRelay {
 }
 
 const managed = new Map<string, ManagedRelay>();
+let stopOwner: (() => void) | undefined;
 
 function relaySignature(config: NUGProviderConfig): string {
 	return JSON.stringify([
@@ -78,31 +86,66 @@ export function getNugRelayStatus(providerId: string): NugRelayStatus | "disable
 	return entry ? entry.client.status : "disabled";
 }
 
-/** Test hook: stop every managed relay client. */
+/** Startup owns reconciliation; Auto only reads the resulting in-memory channel registry. */
+export function startNugRelayOwner(): void {
+	if (stopOwner) return;
+	const store = getProviderKeyStore();
+	let stopped = false;
+	let queued = false;
+	const changed = () => {
+		if (stopped || queued) return;
+		queued = true;
+		queueMicrotask(() => {
+			queued = false;
+			if (stopped) return;
+			try {
+				reconcileNugRelayClients(settings.nugProviders ?? []);
+			} catch (error) {
+				logger.warn("NUG relay reconciliation failed", { error: String(error) });
+			}
+		});
+	};
+	const stopSettings = subscribeSettingsChanges(changed);
+	const stopKeys = store.onChange(changed);
+	stopOwner = () => {
+		stopped = true;
+		stopSettings();
+		stopKeys();
+	};
+	// Key projection writes can precede the settings endpoint commit in the same turn.
+	// Reconcile the final pair once, not a new key against an intermediate old endpoint.
+	changed();
+}
+
+/** Stop relay ownership, including subscriptions and any queued reconciliation, then sockets. */
 export function stopAllNugRelayClients(): void {
+	stopOwner?.();
+	stopOwner = undefined;
 	for (const entry of managed.values()) {
 		entry.client.stop();
 	}
 	managed.clear();
 }
 
-/**
- * Sync the managed set with the configured providers: ensure clients for
- * egress-enabled providers and stop clients whose provider vanished from
- * settings. Called at startup and after every settings save; NugProvider
- * construction also ensures its own client, so this only needs to cover the
- * gaps (startup before first chat, provider removal).
- */
+/** Reconcile one connection against enabled live keys, not its potentially disabled projection. */
+export function reconcileNugRelayProvider(config: NUGProviderConfig): boolean {
+	const stored = peekProviderKeyStore()?.list(nugKeyOwner(config.id)) ?? [];
+	const key = stored.find((candidate) => !candidate.disabled && !!candidate.apiKey.trim());
+	const effective = key ? withProviderKey(config, key) : stored.length ? undefined : config;
+	if (!config.disabled && usesLocalEgress(config) && effective?.apiKey.trim()) {
+		ensureNugRelayClient(effective);
+		return true;
+	}
+	managed.get(config.id)?.client.stop();
+	managed.delete(config.id);
+	return false;
+}
+
+/** Sync the managed set with committed settings and the credential owner's current view. */
 export function reconcileNugRelayClients(providers: NUGProviderConfig[]): void {
 	const wanted = new Set<string>();
-	for (const p of providers) {
-		if (p.disabled) {
-			continue;
-		}
-		ensureNugRelayClient(p);
-		if (usesLocalEgress(p)) {
-			wanted.add(p.id);
-		}
+	for (const provider of providers) {
+		if (reconcileNugRelayProvider(provider)) wanted.add(provider.id);
 	}
 	for (const [id, entry] of managed) {
 		if (!wanted.has(id)) {

@@ -18,7 +18,7 @@ import { IconCheck, IconExternalLink } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { api } from "../../../lib/api";
+import { ApiError, api } from "../../../lib/api";
 import { createQrDataUrl } from "../../../lib/qr";
 import type { PaymentRequiredInfo } from "../useNarratorPanelWS";
 
@@ -48,6 +48,25 @@ interface NugRechargeDialogProps {
 		totalGranted?: number | null,
 		detailedQuotaBalance?: string | null,
 	) => void;
+}
+
+const MAX_NUG_FAILED_POLLS = 6;
+const MIN_NUG_POLL_MS = 3000;
+const MAX_NUG_POLL_MS = 30_000;
+
+function terminalNugPaymentError(error: unknown): boolean {
+	return (
+		error instanceof ApiError &&
+		(error.data?.code === "NUG_PAYMENT_CONTEXT" ||
+			error.data?.code === "NUG_PAYMENT_RESPONSE" ||
+			[401, 403, 404, 409, 410].includes(error.status))
+	);
+}
+
+function nugPollDelay(value: number | undefined): number {
+	return Number.isFinite(value)
+		? Math.max(MIN_NUG_POLL_MS, Math.min(value ?? MIN_NUG_POLL_MS, MAX_NUG_POLL_MS))
+		: MIN_NUG_POLL_MS;
 }
 
 function parseAmount(value: string | number | undefined): number {
@@ -147,14 +166,32 @@ export function NugRechargeDialog({
 	const orderQuery = useQuery({
 		queryKey: ["nug", "billing", "order", providerId, order?.id, order?.binding],
 		queryFn: () => api.nugGetBillingOrder(providerId ?? "", order?.id ?? "", order?.binding ?? ""),
-		retry: false,
-		enabled: opened && !!providerId && !!order?.id && order.status === "pending",
+		retry: (attempt, error) => !terminalNugPaymentError(error) && attempt < 2,
+		retryDelay: (attempt) => nugPollDelay(MIN_NUG_POLL_MS * 2 ** attempt),
+		retryOnMount: false,
+		refetchOnWindowFocus: false,
+		refetchOnReconnect: false,
+		enabled: (query) =>
+			opened &&
+			!!providerId &&
+			!!order?.id &&
+			order.status === "pending" &&
+			!terminalNugPaymentError(query.state.error),
 		refetchInterval: (query) => {
-			if (query.state.error) return false;
+			const error = query.state.error;
+			if (
+				terminalNugPaymentError(error) ||
+				(error && query.state.errorUpdateCount >= MAX_NUG_FAILED_POLLS)
+			)
+				return false;
 			const status = query.state.data?.order.status ?? order?.status;
-			return status === "pending" ? (config?.pollIntervalMs ?? 3000) : false;
+			if (status !== "pending") return false;
+			return error
+				? nugPollDelay(MIN_NUG_POLL_MS * 2 ** query.state.errorUpdateCount)
+				: nugPollDelay(config?.pollIntervalMs);
 		},
 	});
+	const orderContextInvalid = terminalNugPaymentError(orderQuery.error);
 
 	useEffect(() => {
 		if (orderQuery.data?.order) setOrder(orderQuery.data.order);
@@ -341,7 +378,20 @@ export function NugRechargeDialog({
 					</Stack>
 				)}
 
-				{orderQuery.error && <Alert color="red">{orderQuery.error.message}</Alert>}
+				{orderQuery.error && (
+					<Alert color="red">
+						{orderQuery.error.message}
+						{!orderContextInvalid && (
+							<Button
+								variant="subtle"
+								loading={orderQuery.isFetching}
+								onClick={() => void orderQuery.refetch()}
+							>
+								{t("retry")}
+							</Button>
+						)}
+					</Alert>
+				)}
 				{order && (
 					<Stack align="center">
 						<Group gap="xs">
@@ -356,7 +406,7 @@ export function NugRechargeDialog({
 								{t(`recharge.status_${order.status}`, { defaultValue: order.status })}
 							</Badge>
 						</Group>
-						{order.status === "pending" && payUrl && !orderQuery.error && (
+						{order.status === "pending" && payUrl && !orderContextInvalid && (
 							<>
 								{isEmbeddableImageUrl(payUrl) ? (
 									<Box component="img" src={payUrl} alt="payment" maw={260} mah={260} />
