@@ -4,7 +4,11 @@ interface TrayLifecycleOptions {
 	onUnavailable: () => void;
 }
 
-/** Shell 重建会丢弃原图标；退出/交接后的迟到广播则不能再把它加回来。 */
+/**
+ * Shell 重建会丢弃原图标；退出/交接后的迟到广播则不能再把它加回来。
+ * DPI/分辨率变化也会广播 TaskbarCreated，但图标还在。add() 必须把“图标仍在”当成成功，
+ * 否则这里会误报托盘不可用。
+ */
 export class TrayLifecycle {
 	private retired = false;
 	private present = false;

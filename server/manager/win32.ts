@@ -1659,6 +1659,7 @@ export function showTrayMenu(hwnd: Pointer, items: TrayMenuItem[]): number {
 // ── 托盘图标 ────────────────────────────────────────────────────────────────
 
 const NIM_ADD = 0x0000;
+const NIM_MODIFY = 0x0001;
 const NIM_DELETE = 0x0002;
 const NIF_MESSAGE = 0x0001;
 const NIF_ICON = 0x0002;
@@ -1687,7 +1688,14 @@ function loadShell32(): Shell32 | undefined {
 	}
 }
 
-/** 在托盘区添加图标；callbackMessage 是托盘事件发往窗口的消息 id。 */
+/**
+ * 在托盘区添加图标；callbackMessage 是托盘事件发往窗口的消息 id。
+ *
+ * Windows 10 起，主屏 DPI 或分辨率变化也会广播 TaskbarCreated，但通知区图标还在。
+ * 这时 NIM_ADD 因重复注册失败。先 NIM_MODIFY：能改成就说明图标仍在，不能当成托盘丢失
+ * （调用方会因此把隐藏的管理器拉到前台，全屏游戏一切换就被弹回桌面）。图标真被清掉时
+ * MODIFY 失败，再 NIM_ADD。
+ */
 export function addTrayIcon(
 	hwnd: Pointer,
 	icon: Pointer,
@@ -1704,7 +1712,9 @@ export function addTrayIcon(
 	data.writeUInt32LE(callbackMessage, 24);
 	data.writeBigUInt64LE(ptrValue(icon), 32);
 	data.write(`${tip.slice(0, 127)}\0`, NID_TIP_OFFSET, "utf16le");
-	return shell.Shell_NotifyIconW(NIM_ADD, toPtr(data)) !== 0;
+	const notify = (message: number): boolean => shell.Shell_NotifyIconW(message, toPtr(data)) !== 0;
+	if (notify(NIM_MODIFY)) return true;
+	return notify(NIM_ADD);
 }
 
 /** 移除托盘图标。 */

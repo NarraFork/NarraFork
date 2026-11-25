@@ -39,7 +39,7 @@ describe("manager tray lifecycle", () => {
 		expect(f.tray.added).toBe(true);
 	});
 
-	test("重建失败清除过期 added 并显示管理器", () => {
+	test("重建失败清除过期 added 并通知调用方", () => {
 		const f = fixture();
 		f.tray.restore();
 		f.fail();

@@ -164,7 +164,9 @@ test("manager wires taskbar recovery, loopback control and adopted health monito
 	expect(added).toBe(2);
 	addWorks = false;
 	messages(hwnd, taskbarMessage, 0 as Pointer, 0 as Pointer);
-	expect(shown).toBeGreaterThan(0);
+	// 分辨率变化时的注册失败发生在窗口隐藏之后，不能把它激活到前台。
+	expect(shown).toBe(0);
+	expect(added).toBe(3);
 
 	messages(hwnd, win.WM_COMMAND, ID.settings as Pointer, 0 as Pointer);
 	await flush();
