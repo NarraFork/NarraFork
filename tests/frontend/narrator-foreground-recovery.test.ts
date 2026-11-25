@@ -125,6 +125,47 @@ function pageTransition(type: "pagehide" | "pageshow", persisted: boolean): Even
 const FAST_TIMINGS = { foregroundCoalesceMs: 1, syncProbeTimeoutMs: 40 };
 
 describe("narrator foreground recovery", () => {
+	it("合并前台恢复仅通知在线 sync 路径，心跳和重连不重复通知", async () => {
+		const harness = installBrowserHarness(true);
+		const manager = new NarratorWSManager(FAST_TIMINGS);
+		let recoveries = 0;
+		const unsubscribe = manager.onControlPlaneRecovery(() => recoveries++);
+		try {
+			manager.connect();
+			const socket = FakeWebSocket.instances[0];
+			socket.open();
+			expect(recoveries).toBe(0);
+			harness.documentTarget.visibilityState = "hidden";
+			harness.documentTarget.dispatchEvent(new Event("visibilitychange"));
+			harness.documentTarget.visibilityState = "visible";
+			harness.documentTarget.dispatchEvent(new Event("visibilitychange"));
+			harness.windowTarget.dispatchEvent(new Event("focus"));
+			harness.windowTarget.dispatchEvent(pageTransition("pageshow", false));
+			await Bun.sleep(10);
+			expect(recoveries).toBe(1);
+			socket.deliver({ type: "ping" });
+			socket.deliver({ type: "text_delta", narratorId: "narrator-1", text: "noise" });
+			await Promise.resolve();
+			expect(recoveries).toBe(1);
+
+			// A discarded socket takes the reconnect branch; consumers reconcile
+			// via connection events instead of a second control-plane signal.
+			harness.windowTarget.dispatchEvent(pageTransition("pagehide", true));
+			harness.windowTarget.dispatchEvent(pageTransition("pageshow", true));
+			await Bun.sleep(10);
+			FakeWebSocket.instances[1].open();
+			expect(recoveries).toBe(1);
+
+			unsubscribe();
+			harness.windowTarget.dispatchEvent(new Event("focus"));
+			await Bun.sleep(10);
+			expect(recoveries).toBe(1);
+		} finally {
+			manager.disconnect();
+			harness.restore();
+		}
+	});
+
 	it("短时隐藏且连接正常时只执行同步", () => {
 		expect(
 			decideNarratorForegroundRecovery({

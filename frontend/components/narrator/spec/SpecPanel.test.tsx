@@ -12,6 +12,7 @@ import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider } from "react-i18next";
+import { runtimeSettingsQueryOptions } from "../../../hooks/useRuntimeSettings";
 import { api } from "../../../lib/api";
 import type {
 	SpecFileDetail,
@@ -202,7 +203,7 @@ beforeEach(async () => {
 			me: { userId: "u1", name: "u1" },
 		})),
 		spyOn(api, "getUserPreferences").mockResolvedValue({} as never),
-		spyOn(api, "getSettings").mockResolvedValue({ agent: {} } as never),
+		spyOn(api, "getRuntimeSettings").mockResolvedValue({ agent: {} } as never),
 		spyOn(api, "getNarrator").mockResolvedValue({ id: NARRATOR } as never),
 		spyOn(monacoComponent, "MonacoEditor").mockImplementation((props) => {
 			sourceRenders.push({ documentKey: props.documentKey, initialValue: props.initialValue });
@@ -411,12 +412,15 @@ test("the old Spec files of a session the import moved say so and link to its ta
 		revertedAt: null,
 	}));
 	restores.push(() => status.mockRestore());
-	const settingsSpy = spyOn(api, "getSettings").mockResolvedValue({
+	const settingsSpy = spyOn(api, "getRuntimeSettings").mockResolvedValue({
 		agent: {},
 		outline: { enabled: true },
 	} as never);
 	restores.push(() => settingsSpy.mockRestore());
-	queryClient.setQueryData(["settings"], { agent: {}, outline: { enabled: true } });
+	queryClient.setQueryData(runtimeSettingsQueryOptions().queryKey, {
+		agent: {},
+		outline: { enabled: true },
+	});
 	await act(async () => {
 		await queryClient.invalidateQueries();
 	});

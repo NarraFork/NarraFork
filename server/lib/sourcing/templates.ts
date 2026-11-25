@@ -26,7 +26,7 @@ import type {
 	NUGProviderConfig,
 	TokenDanceSettings,
 } from "../settings/types";
-import { readTemplateModelList } from "./model-list-readers";
+import { readTemplateModelList, type SourceModel } from "./model-list-readers";
 import type { SourceGroupView } from "./source-groups";
 
 export type { ServiceTemplateId } from "@shared/sourcing/identify";
@@ -77,12 +77,12 @@ export interface ServiceTemplate {
 	) => Promise<QuotaSnapshot>;
 	/** A read-only projection when another canonical store owns the usage (Codex). */
 	projectQuota?: (credentialId: string) => QuotaSnapshot | undefined;
-	/** Existing cached upstream ids. Explicit refresh stays with the catalog owner. */
+	/** Complete cached model entries. Explicit refresh stays with the catalog owner. */
 	listModels: (
 		group: SourceGroupView,
 		credential?: Credential,
 		signal?: AbortSignal,
-	) => Promise<string[]>;
+	) => Promise<readonly SourceModel[]>;
 }
 
 type ProbeQuota = NonNullable<ServiceTemplate["probeQuota"]>;
@@ -336,20 +336,4 @@ export function listServiceTemplates(): readonly ServiceTemplate[] {
 /** Every id in `SERVICE_TEMPLATE_IDS` has a template (asserted by the tests). */
 export function getServiceTemplate(id: ServiceTemplateId): ServiceTemplate {
 	return byId.get(id) as ServiceTemplate;
-}
-
-/**
- * Management model GETs retain the owner's full metadata and order, selecting ids via
- * the template. The reader executes synchronously before the Promise resolves, so both
- * reads see the same in-memory catalog; no second catalog or last-result cache exists.
- */
-export async function listCachedTemplateModels<T extends { id?: unknown }>(
-	group: SourceGroupView,
-	models: T[],
-	signal?: AbortSignal,
-): Promise<T[]> {
-	const ids = new Set(
-		await getServiceTemplate(group.templateId).listModels(group, undefined, signal),
-	);
-	return models.filter((model) => ids.has(String(model.id ?? "")));
 }

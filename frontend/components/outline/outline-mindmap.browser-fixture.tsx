@@ -16,6 +16,7 @@ import { MantineProvider } from "@mantine/core";
 import { decodeLiveFrame, LIVE_FRAME, type LiveFrame } from "@shared/outline-live-protocol";
 import { headingMetrics, typographyMetrics } from "@shared/pretext-layout/pretext-fonts";
 import { setTypography, type TypographySettings } from "@shared/pretext-layout/typography";
+import type { RuntimeSettings } from "@shared/settings-runtime";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
 	type AnyRouter,
@@ -34,6 +35,7 @@ import { TextSelection } from "prosemirror-state";
 import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
+import { runtimeSettingsQueryOptions } from "../../hooks/useRuntimeSettings";
 import { type OutlineOpener, useOutlineOpener } from "../../lib/outline-opener";
 import { outlineRouterLink, useOutlineRouterNavigate } from "../../lib/outline-router";
 import { parseOutlineBlockSearch } from "../../lib/outline-view";
@@ -262,7 +264,13 @@ export function open(options: OpenOptions): void {
 	transport = new SocketTransport(options.wsUrl);
 	overrideLiveTransportForTests(transport);
 	const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-	queryClient.setQueryData(["settings"], { outline: { enabled: true } });
+	queryClient.setQueryData(runtimeSettingsQueryOptions().queryKey, {
+		revision: 1,
+		agent: { defaultModel: "", summaryModel: "" },
+		outline: { enabled: true },
+		requestEvidence: { autoPin: "off" },
+		summaryModelAvailable: null,
+	} satisfies RuntimeSettings);
 	if (options.host === "page") {
 		const search = new URLSearchParams();
 		if (lens === "all") search.set("view", "all");

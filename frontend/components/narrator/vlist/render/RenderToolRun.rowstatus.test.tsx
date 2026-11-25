@@ -213,7 +213,7 @@ describe("a row that has not executed says nothing about elapsed time", () => {
 		expect(glyphName(slot)).not.toBe("loader-2");
 		// The spin class is the actual motion; a static glyph with it would still move.
 		expect(String(slot.querySelector("svg")?.getAttribute("class") ?? "")).not.toContain(
-			"vlist-spin",
+			"nf-trace-spin",
 		);
 	});
 
@@ -238,7 +238,7 @@ describe("a row that has not executed says nothing about elapsed time", () => {
 		const slot = statusSlots(trace([{ status: "pending" }]))[0] as Element;
 		expect(glyphName(slot)).toBe("player-pause");
 		expect(String(slot.querySelector("svg")?.getAttribute("class") ?? "")).not.toContain(
-			"vlist-spin",
+			"nf-trace-spin",
 		);
 	});
 
@@ -260,7 +260,9 @@ describe("a row that has not executed says nothing about elapsed time", () => {
 		]);
 		const slot = statusSlots(root)[0] as Element;
 		expect(glyphName(slot)).toBe("loader-2");
-		expect(String(slot.querySelector("svg")?.getAttribute("class") ?? "")).toContain("vlist-spin");
+		expect(String(slot.querySelector("svg")?.getAttribute("class") ?? "")).toContain(
+			"nf-trace-spin",
+		);
 		expect(rowText(root)).toMatch(/\d+\s*s\b/);
 	});
 

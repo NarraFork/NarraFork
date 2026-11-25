@@ -3,7 +3,6 @@ import type { AppShellProps } from "@mantine/core";
 import { AppShell, Box, Button, Center, Group, Loader, Modal, Text, Tooltip } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { IconAlertTriangle, IconArrowLeft } from "@tabler/icons-react";
-import { useQuery } from "@tanstack/react-query";
 import { Navigate, Outlet, useNavigate, useRouter, useRouterState } from "@tanstack/react-router";
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -17,9 +16,11 @@ import { useLocalPref } from "../hooks/useLocalPref";
 import { useMobileViewport } from "../hooks/useMobileViewport";
 import { useNavLayout } from "../hooks/useNavLayout";
 import { useRecentTabKeyboardNav } from "../hooks/useRecentTabKeyboardNav";
+import { useRuntimeProjectionSync } from "../hooks/useRuntimeProjectionSync";
+import { useRuntimeSettings } from "../hooks/useRuntimeSettings";
 import { useUpdateUserPreferences, useUserPreferences } from "../hooks/useUserPreferences";
 import { useWakeLock } from "../hooks/useWakeLock";
-import { api, clearToken } from "../lib/api";
+import { clearToken } from "../lib/api";
 import {
 	useAppShellHistoryEntryKey,
 	useAppShellMainScrollRestoration,
@@ -144,6 +145,7 @@ export function AuthenticatedLayout() {
 	const { t: ts } = useTranslation("settings");
 	const { data: user, isLoading, fetchStatus, hasToken, sessionLost } = useAuthenticatedSession();
 	useFastModeUpdates(!!user);
+	useRuntimeProjectionSync(!!user);
 	const { logout } = useLogout();
 	const { data: prefs } = useUserPreferences();
 	const updatePrefs = useUpdateUserPreferences();
@@ -152,11 +154,7 @@ export function AuthenticatedLayout() {
 	useWakeLock(wakeLockEnabled);
 	useRecentTabKeyboardNav();
 
-	const { data: settings } = useQuery({
-		queryKey: ["settings"],
-		queryFn: api.getSettings,
-		enabled: hasToken,
-	});
+	const { data: settings } = useRuntimeSettings(hasToken);
 	const requestEvidenceAutoPin = settings?.requestEvidence?.autoPin;
 	const requestEvidencePinning =
 		requestEvidenceAutoPin === "all" || requestEvidenceAutoPin === "errors";

@@ -1,3 +1,4 @@
+import type { RuntimeModelSummary } from "@shared/model-runtime";
 import { useMemo } from "react";
 import {
 	FOLLOW_PARENT_MODEL,
@@ -22,7 +23,7 @@ import {
 export function capabilityModelReference(
 	narratorModel: string | null | undefined,
 	inheritanceModel: string | null | undefined,
-	runtimeModel?: { model?: unknown } | null,
+	runtimeModel?: { model?: unknown; concreteValue?: unknown } | null,
 ): string | null | undefined {
 	const reference =
 		narratorModel === FOLLOW_PARENT_MODEL && inheritanceModel ? inheritanceModel : narratorModel;
@@ -30,7 +31,12 @@ export function capabilityModelReference(
 	// turns. The server reports the concrete `<prefix>:<model>` its last turn used (only while
 	// the selection is still the same value), so quota, balance and capability lookups follow
 	// the source actually in use rather than the first one in the list.
-	const served = typeof runtimeModel?.model === "string" ? runtimeModel.model.trim() : "";
+	const served =
+		typeof runtimeModel?.concreteValue === "string"
+			? runtimeModel.concreteValue.trim()
+			: typeof runtimeModel?.model === "string"
+				? runtimeModel.model.trim()
+				: "";
 	return isAutoModelOptionValue(reference ?? "") && served.includes(":") ? served : reference;
 }
 
@@ -39,6 +45,29 @@ export interface UseResolvedModelResult {
 	resolvedProvider: string;
 	resolvedBareModel: string;
 	resolvedModelOption: ModelOption | undefined;
+}
+
+/** Unknown auto/aggregation routes stay unknown instead of borrowing their first candidate. */
+export function runtimeSummaryToResolvedModel(
+	summary: RuntimeModelSummary | null | undefined,
+): UseResolvedModelResult {
+	const resolvedModel = summary?.concreteValue ?? "";
+	return {
+		resolvedModel,
+		resolvedProvider: summary?.resolvedProvider ?? "",
+		resolvedBareModel: summary?.resolvedBareModel ?? "",
+		resolvedModelOption:
+			summary && resolvedModel
+				? {
+						value: resolvedModel,
+						label: summary.selection.label,
+						provider: summary.resolvedProvider ?? undefined,
+						bareModel: summary.capabilities?.bareModel ?? summary.resolvedBareModel ?? undefined,
+						channelType: summary.capabilities?.channelType ?? undefined,
+						...(Array.isArray(summary.effortLevels) ? { effortLevels: summary.effortLevels } : {}),
+					}
+				: undefined,
+	};
 }
 
 /**

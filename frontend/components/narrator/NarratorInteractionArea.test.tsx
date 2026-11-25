@@ -219,8 +219,12 @@ test("a viewer without write access gets a read-only notice instead of the compo
 
 test("the panel turns the composer read-only exactly when write access is refused", async () => {
 	const panel = await Bun.file(new URL("./NarratorPanel.tsx", import.meta.url)).text();
-	expect(panel).toContain("const canOpenTerminals = useCanOpenTerminals(narratorId);");
-	expect(panel).toContain("readOnly={canOpenTerminals === false}");
+	// The bounded summary carries the same authorized canWrite fact as the old
+	// standalone terminal-access read; a failed summary remains unknown, not denied.
+	expect(panel.match(/const canOpenTerminals =[^;]+;/)?.[0]).toBe(
+		"const canOpenTerminals = uiSummaryQuery.isError ? undefined : uiSummaryQuery.data?.canWrite;",
+	);
+	expect(panel.includes("readOnly={canOpenTerminals === false}")).toBe(true);
 	for (const locale of ["en", "zh-CN"]) {
 		const resources = await Bun.file(
 			new URL(`../../locales/${locale}/narrator.json`, import.meta.url),

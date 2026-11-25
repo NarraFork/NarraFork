@@ -42,6 +42,16 @@ function fixture(overrides: Partial<UnattendedStatus> = {}): UnattendedStatus {
 
 let status: UnattendedStatus = fixture();
 
+mock.module("../../lib/narrator-ws-manager", () => ({
+	narratorWSManager: {
+		connected: true,
+		addListener: () => ({}),
+		removeListener: () => {},
+		onConnectionChange: () => () => {},
+		onControlPlaneRecovery: () => () => {},
+	},
+}));
+
 mock.module("../../hooks/useAuth", () => ({
 	...originalAuth,
 	useCurrentUser: () => ({ data: { role: admin ? "admin" : "user" } }),

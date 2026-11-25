@@ -19,6 +19,7 @@ type UpdateReleaseInfo = NonNullable<Awaited<ReturnType<typeof api.checkUpdate>>
 
 import { useCurrentUser } from "./useAuth";
 import { useUpdateCapability } from "./usePlatform";
+import { runtimeSettingsQueryOptions } from "./useRuntimeSettings";
 
 /** A disabled/changed selection gets a different key, cancelling and hiding stale notes. */
 export function useUpdateNotes(
@@ -244,17 +245,14 @@ export function extractUpdateFailureDiagnostic(
 }
 
 async function checkWithSavedSettings(queryClient: QueryClient, signal?: AbortSignal) {
-	const settings = await queryClient.ensureQueryData({
-		queryKey: ["settings"],
-		queryFn: api.getSettings,
-	});
+	const settings = await queryClient.fetchQuery(runtimeSettingsQueryOptions());
 	signal?.throwIfAborted();
 	const settingsKey = updateSettingsKey(settings.update);
 	const checked = await api.checkUpdate();
 	signal?.throwIfAborted();
-	const currentSettings = queryClient.getQueryData<Awaited<ReturnType<typeof api.getSettings>>>([
-		"settings",
-	]);
+	const currentSettings = queryClient.getQueryData<
+		Awaited<ReturnType<typeof api.getRuntimeSettings>>
+	>(runtimeSettingsQueryOptions().queryKey);
 	const identity = checked.sourceIdentity ?? checked.releaseInfo?.sourceIdentity;
 	if (
 		(currentSettings && updateSettingsKey(currentSettings.update) !== settingsKey) ||
@@ -415,10 +413,7 @@ export function useUpdateDownload() {
 			abortControllerRef.current = controller;
 
 			try {
-				const settingsAtStart = await queryClient.ensureQueryData({
-					queryKey: ["settings"],
-					queryFn: api.getSettings,
-				});
+				const settingsAtStart = await queryClient.fetchQuery(runtimeSettingsQueryOptions());
 				controller.signal.throwIfAborted();
 				const requestSettingsKey = updateSettingsKey(settingsAtStart.update);
 				const response = await authorizedFetch("/api/update/download", {

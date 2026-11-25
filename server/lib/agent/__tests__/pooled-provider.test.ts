@@ -164,6 +164,214 @@ describe("pooled provider", () => {
 		expect(store().get(PROVIDER)?.disabled).not.toBe(true);
 	});
 
+	for (const operation of ["chat", "generateWithMeta"] as const) {
+		for (const replacement of ["secret", "network"] as const) {
+			for (const outcome of ["401", "429", "success"] as const) {
+				test(`${operation}: late ${outcome} cannot change a same-id ${replacement} replacement`, async () => {
+					const started = Promise.withResolvers<void>();
+					const finish = Promise.withResolvers<void>();
+					const first = store().list(PROVIDER)[0];
+					store().add(PROVIDER, { apiKey: "sk-backup" });
+					const calls: string[] = [];
+					const { build } = fakeBuild({});
+					const pool = new PooledProvider(PROVIDER, (key) => {
+						const secret = key.apiKey;
+						const result = async () => {
+							calls.push(secret);
+							started.resolve();
+							await finish.promise;
+							if (outcome !== "success") throw new ApiError(Number(outcome), "old attempt failed");
+							return { text: secret };
+						};
+						return {
+							...build(key),
+							generateWithMeta: result,
+							async *chat() {
+								yield await result();
+							},
+						};
+					});
+					const pending =
+						operation === "chat"
+							? drain(pool.chat({ ...params("late-attempt"), model: "m" }))
+							: pool.generateWithMeta("hello", "m");
+					const observed = pending.then(
+						(value) => ({ value }),
+						(error: unknown) => ({ error }),
+					);
+					await started.promise;
+					const live = store().update(
+						first.id,
+						replacement === "secret"
+							? { apiKey: "sk-replacement" }
+							: { network: { extraHeaders: { "X-Identity": "replacement" } } },
+					);
+					reportKeyFault(live, new ApiError(429, "retry-after: 7"));
+					const newCooldown = keyCooldown(first.id);
+					expect(newCooldown).toBeDefined();
+					finish.resolve();
+					const completed = await observed;
+					if (outcome === "success") expect(completed).toHaveProperty("value");
+					else expect(completed).toMatchObject({ error: { status: Number(outcome) } });
+					expect(store().get(first.id)?.disabled).not.toBe(true);
+					expect(store().get(first.id)?.apiKey).toBe(
+						replacement === "secret" ? "sk-replacement" : "sk-one",
+					);
+					expect(keyCooldown(first.id)).toEqual(newCooldown);
+					expect(calls).toEqual(["sk-one"]);
+				});
+			}
+		}
+	}
+
+	test("root connection replacement shields an unchanged key from a late stream 401 and non-stream success", async () => {
+		const { setOutboundFetchOverrideForTest } = await import("../../net/outbound-fetch");
+		store().add(PROVIDER, { apiKey: "sk-backup" });
+		const first = store().list(PROVIDER)[0];
+		const originalKeys = structuredClone(store().list(PROVIDER));
+		const { adapter, model } = resolveProviderAndModel("pooltest:m");
+		expect(adapter).toBeInstanceOf(PooledProvider);
+		const started = Promise.withResolvers<void>();
+		const finish = Promise.withResolvers<void>();
+		let sends = 0;
+		let validateDiagnosticCredential: (() => boolean) | undefined;
+		let settled: Promise<unknown> | undefined;
+		setOutboundFetchOverrideForTest(async (_input, init) => {
+			const succeeds = String(init?.body).includes("root-nonstream-success");
+			if (++sends === 2) started.resolve();
+			await finish.promise;
+			return !succeeds
+				? Response.json({ error: { message: "old connection rejected this key" } }, { status: 401 })
+				: Response.json({
+						choices: [{ message: { content: "old connection success" }, finish_reason: "stop" }],
+					});
+		});
+		try {
+			const oldStream = drain(
+				adapter.chat({
+					...params("old-root"),
+					model,
+					content: "test",
+					cwd: ".",
+					history: [],
+					tools: [],
+					toolResults: [],
+					onRequestStart: (info) => {
+						validateDiagnosticCredential = info?.validateDiagnosticCredential;
+					},
+				}),
+			).catch((error: unknown) => error);
+			const oldSuccess = adapter.generateWithMeta("root-nonstream-success", model);
+			settled = Promise.allSettled([oldStream, oldSuccess]);
+			await started.promise;
+			expect(adapter.isDiagnosticConnectionCurrent?.()).toBe(true);
+			const root = settings.customApiProviders?.find((entry) => entry.id === PROVIDER);
+			if (!root) throw new Error("missing root connection");
+			saveSettings({
+				...settings,
+				customApiProviders: settings.customApiProviders?.map((entry) =>
+					entry.id === root.id
+						? { ...entry, baseUrl: "https://replacement.example.com/v1" }
+						: entry,
+				),
+			});
+			expect(adapter.isDiagnosticConnectionCurrent?.()).toBe(false);
+			expect(validateDiagnosticCredential?.()).toBe(false);
+			reportKeyFault(first, new ApiError(429, "retry-after: 7"));
+			const newCooldown = keyCooldown(first.id);
+			expect(newCooldown).toBeDefined();
+			finish.resolve();
+			expect(await oldStream).toMatchObject({ status: 401 });
+			expect(await oldSuccess).toMatchObject({ text: "old connection success" });
+			expect(store().list(PROVIDER)).toEqual(originalKeys);
+			expect(keyCooldown(first.id)).toEqual(newCooldown);
+			expect(sends).toBe(2);
+		} finally {
+			finish.resolve();
+			await settled;
+			setOutboundFetchOverrideForTest(null);
+		}
+	});
+
+	test("a real TokenDance 401 body finishing after OAuth slot replacement cannot disable the new login", async () => {
+		const { setOutboundFetchOverrideForTest } = await import("../../net/outbound-fetch");
+		const { tokenDanceLoginAccount, TOKENDANCE_KEY_OWNER } = await import("../../provider-keys");
+		const { registerTokenDanceRuntime } = await import("../../tokendance-runtime");
+		const { TokenDanceProvider } = await import("../tokendance-provider");
+		const bodyReading = Promise.withResolvers<void>();
+		const finishBody = Promise.withResolvers<void>();
+		let connection = { apiKey: "old-oauth-login", generation: 1, disabled: false };
+		const first = store().add(TOKENDANCE_KEY_OWNER, { apiKey: connection.apiKey });
+		store().update(first.id, { account: tokenDanceLoginAccount(connection.apiKey) });
+		const unregister = registerTokenDanceRuntime({
+			getTokenDanceRuntimeConfig: () => connection,
+			getTokenDanceCatalogModels: () => [
+				{
+					id: "opaque-model",
+					name: "M",
+					context_length: 8192,
+					supported_protocols: ["openai:chat-completions"],
+				},
+			],
+			assertTokenDanceConnection: (generation, apiKey) => {
+				if (generation !== connection.generation || apiKey !== connection.apiKey)
+					throw new Error("login changed");
+			},
+			registerTokenDanceRequest: () => () => {},
+		});
+		const sent: string[] = [];
+		setOutboundFetchOverrideForTest(async (_input, init) => {
+			sent.push(new Headers(init?.headers).get("Authorization") ?? "");
+			return new Response(
+				new ReadableStream<Uint8Array>(
+					{
+						async pull(sink) {
+							bodyReading.resolve();
+							await finishBody.promise;
+							sink.enqueue(new TextEncoder().encode("old OAuth key rejected"));
+							sink.close();
+						},
+					},
+					{ highWaterMark: 0 },
+				),
+				{ status: 401 },
+			);
+		});
+		try {
+			const pool = new PooledProvider(
+				TOKENDANCE_KEY_OWNER,
+				(key) => new TokenDanceProvider(key.apiKey, { ...connection, proxy: { mode: "direct" } }),
+			);
+			const pending = pool
+				.generateWithMeta("hello", "tokendance:opaque-model")
+				.catch((error: unknown) => error);
+			await bodyReading.promise;
+			// Same in-place login slot update as OAuth completion, while the old error body is pending.
+			connection = { apiKey: "new-oauth-login", generation: 2, disabled: false };
+			const live = store().update(first.id, {
+				apiKey: connection.apiKey,
+				account: tokenDanceLoginAccount(connection.apiKey),
+				disabled: false,
+			});
+			reportKeyFault(live, new ApiError(429, "retry-after: 7"));
+			const newCooldown = keyCooldown(first.id);
+			finishBody.resolve();
+			expect(await pending).toMatchObject({ status: 401 });
+			expect(store().get(first.id)).toMatchObject({
+				apiKey: "new-oauth-login",
+				account: tokenDanceLoginAccount("new-oauth-login"),
+			});
+			expect(store().get(first.id)?.disabled).not.toBe(true);
+			expect(keyCooldown(first.id)).toEqual(newCooldown);
+			expect(sent).toEqual(["Bearer old-oauth-login"]);
+		} finally {
+			finishBody.resolve();
+			setOutboundFetchOverrideForTest(null);
+			unregister();
+			store().remove(first.id);
+		}
+	});
+
 	test("synchronously prepares each selected adapter on first use, model change and key/network replacement", async () => {
 		const second = store().add(PROVIDER, { apiKey: "sk-two" });
 		const order: string[] = [];

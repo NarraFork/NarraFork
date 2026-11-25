@@ -510,7 +510,10 @@ export function queryForModel(model: string): { query: CatalogQuery; discovered?
 						};
 			// The gateway's tier list (even `[]`) is what its menu offers; fill it in when the
 			// card is silent so the same model never gets an effort the upstream rejects.
-			if (info.effortLevels !== undefined && discovered.reasoning_effort_levels == null) {
+			if (
+				info.effortLevels !== undefined &&
+				!Object.hasOwn(discovered, "reasoning_effort_levels")
+			) {
 				discovered.reasoning_effort_levels = info.effortLevels;
 				if (discovered.reasoning_mode == null) discovered.reasoning_mode = "levels";
 			}
@@ -642,6 +645,19 @@ export function catalogModelFamily(modelId: string): string | undefined {
 
 export function catalogModelName(modelId: string): string | undefined {
 	return active.models.find((entry) => entry.id === modelId)?.name;
+}
+
+/** A worker loads/validates its own catalog; never transfer the complete catalog over IPC. */
+export function getModelOptionsCatalogSource(): {
+	version: string;
+	path: string;
+	source: "builtin" | "downloaded";
+} {
+	return {
+		version: active.catalogVersion,
+		path: catalogPath,
+		source: active === bundled ? "builtin" : "downloaded",
+	};
 }
 
 /** Freeze catalog and overrides for the duration of one request. */

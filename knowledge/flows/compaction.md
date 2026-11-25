@@ -23,7 +23,7 @@ keywords:
   - 自动压缩
   - 上下文超长
 status: draft
-verified_at: 7fab16d5b
+verified_at: a3d23ae00610fc55ec1709dbd0aaf21c8279397c
 ---
 # 一次上下文压缩
 

@@ -50,17 +50,14 @@ import { NarratorDockProvider } from "../../components/narrator/dock/NarratorDoc
 import { useMobileDrawerHistory } from "../../hooks/useMobileDrawerHistory";
 import { useMobileTerminalDrawerOpen } from "../../hooks/useMobileTerminalDrawerOpen";
 import { useNarrator } from "../../hooks/useNarrator";
+import { useNarratorUiSummary } from "../../hooks/useNarratorUiSummary";
 import { useTerminalCapability } from "../../hooks/usePlatform";
 import {
 	addSubagentRecentTab,
 	recordRecentTabVisit,
 	shouldAddSubagentRecentTab,
 } from "../../hooks/useRecentTabs";
-import {
-	useCanOpenTerminals,
-	useCreateNarratorTerminal,
-	useNarratorTerminals,
-} from "../../hooks/useTerminals";
+import { useCanOpenTerminals, useCreateNarratorTerminal } from "../../hooks/useTerminals";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
 import { APP_HISTORY_SENTINEL, pushHistorySentinel } from "../../lib/history-state";
@@ -274,12 +271,10 @@ function NarratorDetailPage() {
 		};
 	}, [narratorId]);
 
-	// Check if there's a running terminal for this narrator
-	const { data: existingTerminals } = useNarratorTerminals(narratorId);
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	const hasRunningTerminal = (existingTerminals ?? []).some((t: any) => t.status === "running");
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	const runningCount = (existingTerminals ?? []).filter((t: any) => t.status === "running").length;
+	// Badges need only the lightweight ACL/count snapshot, never terminal entities.
+	const { data: uiSummary } = useNarratorUiSummary(narratorId);
+	const runningCount = uiSummary?.activeTerminalCount ?? 0;
+	const hasRunningTerminal = runningCount > 0;
 	const { mutate: createTerminal } = useCreateNarratorTerminal(narratorId);
 	const terminalCapability = useTerminalCapability();
 	// Only a viewer known to have write access gets an auto-created terminal: not a read-only
@@ -609,6 +604,7 @@ function NarratorDetailPage() {
 									}
 								>
 									<NarratorTerminal
+										visible={drawerOpened}
 										narratorId={narratorId}
 										onSendToChat={handleSendToChat}
 										onExit={handleTerminalExit}

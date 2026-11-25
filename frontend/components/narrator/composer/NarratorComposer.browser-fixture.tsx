@@ -41,7 +41,7 @@ const sending = { current: false };
 const persistentAttachments = new URLSearchParams(window.location.search).has("persist");
 const attachmentT = (key: string, options?: Record<string, unknown>) =>
 	String(i18n.t(key, { ...options, ns: "narrator" }));
-if (persistentAttachments) localStorage.setItem("narrafork_token", "fixture-user");
+localStorage.setItem("narrafork_token", "fixture-user");
 const noop = () => {};
 let switchNarrator: (id: string) => void;
 let switchAccount: (id: string) => void;
@@ -434,8 +434,16 @@ export function remember(doc: ComposerDocument) {
 export function clear() {
 	composer.current?.clearTextAndDraft();
 }
-export function namedCandidates(candidates: { id: string; handle: string; title?: string }[]) {
-	query.setQueryData(["named-narrators"], candidates);
+export async function namedCandidates(
+	candidates: { id: string; handle: string; title?: string }[],
+) {
+	// Feed the real on-demand suggestions reader through this isolated fixture's HTTP route.
+	const response = await fetch("/__fixture/named-suggestions", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify(candidates),
+	});
+	if (!response.ok) throw new Error("Unable to seed named suggestions");
 }
 
 function textboxEditor(): Editor {

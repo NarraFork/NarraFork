@@ -16,7 +16,6 @@ Object.assign(globalThis, {
 });
 
 const listeners = new Set<(event: Record<string, unknown>) => void>();
-mock.module("@frontend/hooks/usePermissions", () => ({ usePermissions: () => ({ data: [] }) }));
 mock.module("@frontend/lib/narrator-ws-manager", () => ({
 	narratorWSManager: {
 		addListener: (_options: unknown, callback: (event: Record<string, unknown>) => void) => {
@@ -43,7 +42,7 @@ beforeEach(async () => {
 	await act(async () => {
 		root.render(
 			<QueryClientProvider client={client}>
-				<PermissionRulePolicySync narratorId="owner" />
+				<PermissionRulePolicySync narratorId="owner" pendingPermissions={[]} />
 			</QueryClientProvider>,
 		);
 	});

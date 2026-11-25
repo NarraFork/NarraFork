@@ -1235,6 +1235,7 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 							<ProviderKeysPanel
 								key={p.id}
 								providerId={p.id}
+								showSingleKey
 								onFirstKeyChanged={(apiKey) => onPersistedKeyChanged?.(p.id, apiKey)}
 							/>
 

@@ -38,6 +38,49 @@ test("GET and partial PATCH keep the supplied cancellation signal", async () => 
 	for (const { input } of requests) expect(input?.signal?.aborted).toBe(true);
 });
 
+test("UI preferences use their dedicated bounded endpoint and preserve cancellation", async () => {
+	const controller = new AbortController();
+	await settingsApi.getUIPreferences({ signal: controller.signal });
+	await settingsApi.updateUIPreferences({ fastModeDefault: true }, { signal: controller.signal });
+	expect(requests.map(({ url }) => url)).toEqual([
+		"/api/user-preferences/ui",
+		"/api/user-preferences/ui",
+	]);
+	expect(requests[1]?.input?.method).toBe("PATCH");
+	expect(JSON.parse(String(requests[1]?.input?.body))).toEqual({ fastModeDefault: true });
+	controller.abort();
+	for (const { input } of requests) expect(input?.signal?.aborted).toBe(true);
+});
+
+test.each([
+	false,
+	true,
+])("UI response budget rejects oversized success and error bodies (%s)", async (error) => {
+	globalThis.fetch = (async () =>
+		Response.json(
+			{ payload: "x".repeat(64 * 1024) },
+			{ status: error ? 500 : 200 },
+		)) as unknown as typeof fetch;
+	await expect(settingsApi.getUIPreferences()).rejects.toThrow();
+	await expect(settingsApi.updateUIPreferences({ fastModeDefault: true })).rejects.toThrow();
+});
+
+test("UI preference deadline applies even without a caller signal", async () => {
+	const timeout = AbortSignal.timeout;
+	const deadlines: number[] = [];
+	AbortSignal.timeout = (ms) => {
+		deadlines.push(ms);
+		return timeout(ms);
+	};
+	try {
+		await settingsApi.getUIPreferences();
+		await settingsApi.updateUIPreferences({ language: "en" });
+		expect(deadlines).toEqual([10_000, 10_000]);
+	} finally {
+		AbortSignal.timeout = timeout;
+	}
+});
+
 test("aborting a pending PATCH rejects instead of reporting a saved preference", async () => {
 	const controller = new AbortController();
 	globalThis.fetch = (async (_url, input) =>

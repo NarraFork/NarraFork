@@ -126,6 +126,153 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 }
 
 describe("background occupancy coordinator", () => {
+	test("own lifecycle and reasoning/reflecting noise keep wide occupancy but not list invalidations", async () => {
+		const { source, store } = fixture();
+		source.narrators.set("root", narrator("root", null, { status: "working" }));
+		source.narrators.set("child", narrator("child", "root", { status: "working" }));
+		source.tasks.set(
+			"agent",
+			task("agent", "root", {
+				type: "agent",
+				status: "completed",
+				subagentNarratorId: "child",
+			}),
+		);
+		source.tasks.set("work", task("work", "child"));
+		await store.start();
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		const affected: string[][] = [];
+		const changed: string[][] = [];
+		store.subscribe("semantic-list", (ids, metadata) => {
+			affected.push([...ids]);
+			changed.push([...metadata.listChangedParentIds]);
+		});
+		for (const label of ["reasoning", "reflecting", "reasoning"]) {
+			for (const id of ["root", "child"]) {
+				const row = source.narrators.get(id);
+				if (row) source.narrators.set(id, Object.assign({}, row, { substatus: [label] }));
+			}
+			store.refreshNarrators(["root", "child"]);
+			await store.flush();
+			await new Promise<void>((resolve) => setImmediate(resolve));
+		}
+		expect(affected).toHaveLength(3);
+		for (const ids of affected) expect(ids).toEqual(expect.arrayContaining(["root", "child"]));
+		expect(changed).toEqual([[], [], []]);
+		source.narrators.set("root", narrator("root", null, { status: "waiting" }));
+		store.refreshNarrator("root");
+		await store.flush();
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(changed.at(-1)).toEqual([]);
+		// A child display change belongs to the parent's list, never its own list.
+		source.narrators.set("child", narrator("child", "root", { status: "waiting" }));
+		store.refreshNarrator("child");
+		await store.flush();
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(changed.at(-1)).toEqual(["root"]);
+		await store.stop();
+	});
+
+	test("list comparison detects equal counts with replaced members and changed service classification", async () => {
+		const { source, store } = fixture();
+		source.tasks.set("old", task("old", "root"));
+		await store.start();
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		const changed: string[][] = [];
+		store.subscribe("semantic-list", (_ids, metadata) =>
+			changed.push([...metadata.listChangedParentIds]),
+		);
+		source.tasks.delete("old");
+		source.tasks.set("new", task("new", "root"));
+		store.refreshTask("old");
+		store.refreshTask("new");
+		await store.flush();
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(store.snapshot(["root"]).counts.get("root")?.activeCount).toBe(1);
+		expect(changed.at(-1)).toEqual(["root"]);
+		source.tasks.set("new", task("new", "root", { backgroundKind: "service" }));
+		store.refreshTask("new");
+		await store.flush();
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(changed.at(-1)).toEqual(["root"]);
+		expect(store.snapshot(["root"]).counts.get("root")?.activeServiceCount).toBe(1);
+		await store.stop();
+	});
+
+	test("cold terminal projections notify conservatively and startup establishes a list baseline", async () => {
+		const { source, store } = fixture();
+		source.tasks.set(
+			"agent",
+			task("agent", "root", {
+				type: "agent",
+				status: "completed",
+				subagentNarratorId: "child",
+			}),
+		);
+		const changed: string[][] = [];
+		store.subscribe("semantic-list", (_ids, metadata) =>
+			changed.push([...metadata.listChangedParentIds]),
+		);
+		store.refreshNarrator("child");
+		await store.start();
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(changed[0]).toContain("root");
+		store.refreshNarrator("child");
+		await store.flush();
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(changed[1]).toContain("root");
+		await store.stop();
+	});
+	test.each([
+		{ mode: "task", fail: false },
+		{ mode: "task", fail: true },
+		{ mode: "legacy", fail: false },
+		{ mode: "legacy", fail: true },
+	])("cold $mode read then removed in the same batch stays unknown, retry=$fail", async ({
+		mode,
+		fail,
+	}) => {
+		const { source, store } = fixture();
+		if (mode === "task") source.tasks.set("cold", task("cold", "root", { status: "completed" }));
+		await store.start();
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		const changed: string[][] = [];
+		store.subscribe("semantic-list", (_ids, metadata) =>
+			changed.push([...metadata.listChangedParentIds]),
+		);
+		let reads = 0;
+		source.onRead = async (label) => {
+			if (label !== (mode === "task" ? "getTasks" : "getNarrators")) return;
+			reads++;
+			if (reads === 1) {
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				// The reader already copied this cold row. Replay its removal after
+				// accepting that stale read, all before the next publication.
+				if (mode === "task") {
+					source.tasks.delete("cold");
+					store.refreshTask("cold");
+				} else {
+					source.narrators.delete("child");
+					store.removeNarrators(["child"]);
+				}
+			} else if (reads === 2 && fail) {
+				throw new Error("cold replay failure");
+			}
+		};
+		if (mode === "task") store.refreshTask("cold");
+		else store.refreshNarrator("child");
+		if (fail) {
+			await expect(store.flush()).rejects.toThrow("cold replay failure");
+			expect(changed).toEqual([]);
+		}
+		await store.flush();
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(store.getActiveTaskIds("root")).toEqual([]);
+		expect(store.getActiveLegacyIds("root")).toEqual([]);
+		expect(changed).toEqual([["root"]]);
+		await store.stop();
+	});
+
 	test("terminal narrator invalidations do not issue one empty projection read per leaf", async () => {
 		const { source, store } = fixture();
 		for (let index = 0; index < 512; index++) {
@@ -232,16 +379,17 @@ describe("background occupancy coordinator", () => {
 		client.exec(`
 			CREATE TABLE narrators (
 				id TEXT PRIMARY KEY, parent_narrator_id TEXT, type TEXT, status TEXT,
-				background_status TEXT, is_background INTEGER, variant TEXT, substatus TEXT, created_at TEXT
+				background_status TEXT, is_background INTEGER, variant TEXT, substatus TEXT, created_at TEXT,
+				error_message TEXT
 			);
 			CREATE TABLE background_tasks (
 				id TEXT PRIMARY KEY, parent_narrator_id TEXT, type TEXT, status TEXT,
 				background_kind TEXT, subagent_narrator_id TEXT, created_at TEXT
 			);
-			INSERT INTO narrators VALUES ('root', NULL, 'primary', 'idle', NULL, 0, 'primary', '[]', '2026-01-01');
-			INSERT INTO narrators VALUES ('legacy', 'root', 'subagent', 'idle', 'running', 1, 'subagent:general', '[]', '2026-01-01');
-			INSERT INTO narrators VALUES ('projected', 'root', 'subagent', 'idle', 'running', 1, 'subagent:general', '[]', '2026-01-01');
-			INSERT INTO narrators VALUES ('same-id', 'root', 'subagent', 'idle', 'running', 1, 'subagent:general', '[]', '2026-01-01');
+			INSERT INTO narrators VALUES ('root', NULL, 'primary', 'idle', NULL, 0, 'primary', '[]', '2026-01-01', NULL);
+			INSERT INTO narrators VALUES ('legacy', 'root', 'subagent', 'idle', 'running', 1, 'subagent:general', '[]', '2026-01-01', NULL);
+			INSERT INTO narrators VALUES ('projected', 'root', 'subagent', 'idle', 'running', 1, 'subagent:general', '[]', '2026-01-01', NULL);
+			INSERT INTO narrators VALUES ('same-id', 'root', 'subagent', 'idle', 'running', 1, 'subagent:general', '[]', '2026-01-01', NULL);
 			INSERT INTO background_tasks VALUES ('unrelated', 'root', 'bash', 'running', 'task', NULL, '2026-01-01');
 			INSERT INTO background_tasks VALUES ('projection', 'root', 'agent', 'completed', 'task', 'projected', '2026-01-01');
 			INSERT INTO background_tasks VALUES ('same-id', 'root', 'bash', 'completed', 'task', NULL, '2026-01-01');
@@ -946,8 +1094,10 @@ describe("background occupancy coordinator", () => {
 		await new Promise<void>((resolve) => setImmediate(resolve));
 		const delivered = deferred();
 		let notified: readonly string[] = [];
-		store.subscribe("list", (ids) => {
+		let listChanged: readonly string[] = [];
+		store.subscribe("list", (ids, metadata) => {
 			notified = ids;
+			listChanged = metadata.listChangedParentIds;
 			delivered.resolve();
 		});
 		let fail = true;
@@ -965,7 +1115,11 @@ describe("background occupancy coordinator", () => {
 		await store.flush();
 		await delivered.promise;
 		expect(notified).toEqual(expect.arrayContaining(["leaf", "child", "root"]));
-		if (action === "move") expect(notified).toContain("other");
+		expect(listChanged).toEqual(expect.arrayContaining(["leaf", "child", "root"]));
+		if (action === "move") {
+			expect(notified).toContain("other");
+			expect(listChanged).toContain("other");
+		}
 		expect(store.snapshot(["root"]).counts.get("root")?.activeCount).toBe(0);
 		expect(store.snapshot(["other"]).counts.get("other")?.activeCount).toBe(
 			action === "move" ? 1 : 0,

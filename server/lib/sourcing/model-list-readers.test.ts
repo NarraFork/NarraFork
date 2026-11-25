@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import type { SourceProtocol } from "@shared/sourcing/identify";
 import { readTemplateModelList, registerModelListReader } from "./model-list-readers";
 import { type SourceGroupView, sourceGroupForConnection } from "./source-groups";
-import { getServiceTemplate, listCachedTemplateModels, listServiceTemplates } from "./templates";
+import { getServiceTemplate } from "./templates";
 
 const disposers: Array<() => void> = [];
 afterEach(() => {
@@ -23,69 +23,47 @@ function reader(...args: Parameters<typeof registerModelListReader>) {
 }
 
 describe("template model lists", () => {
-	test("every frozen template has a model-list method", () => {
-		for (const template of listServiceTemplates()) {
-			expect(Object.isFrozen(template)).toBe(true);
-			expect(typeof template.listModels).toBe("function");
-		}
-	});
-
-	test("a frozen known-service template reads late registration and the actual protocol", async () => {
+	test("a known-service template reads its current protocol's complete catalog", async () => {
 		const template = getServiceTemplate("kimi-code");
-		reader("completions-compatible", (group) => [`${group.id}-openai`]);
-		reader("anthropic-messages", (group) => [`${group.id}-anthropic`]);
-		expect(await template.listModels(connection("first"))).toEqual(["first-openai"]);
-		expect(await template.listModels(connection("second", "anthropic-messages"))).toEqual([
-			"second-anthropic",
-		]);
-		reader("completions-compatible", () => ["replacement"]);
-		expect(await template.listModels(connection("first"))).toEqual(["replacement"]);
+		const first = [{ id: "first-openai", contextWindow: 128_000 }];
+		const second = [{ id: "second-anthropic", displayName: "Claude" }];
+		reader("completions-compatible", (group) => (group.id === "first" ? first : []));
+		reader("anthropic-messages", (group) => (group.id === "second" ? second : []));
+		expect(await template.listModels(connection("first"))).toEqual(first);
+		expect(await template.listModels(connection("second", "anthropic-messages"))).toEqual(second);
 	});
 
-	test("old disposal cannot remove a replacement, and callers cannot mutate the cached list", () => {
-		const old = reader("completions-compatible", () => ["old"]);
-		const cached = ["new"];
-		const latest = reader("completions-compatible", () => cached);
+	test("an old owner's disposer cannot remove its replacement", () => {
+		const old = reader("completions-compatible", () => [{ id: "old" }]);
+		const latest = reader("completions-compatible", () => [{ id: "new" }]);
 		old();
-		const returned = readTemplateModelList(connection("one"));
-		expect(returned).toEqual(["new"]);
-		returned.push("not-in-cache");
-		expect(cached).toEqual(["new"]);
+		expect(readTemplateModelList(connection("one"))).toEqual([{ id: "new" }]);
 		latest();
 		expect(readTemplateModelList(connection("one"))).toEqual([]);
 	});
 
-	test("management lists keep disabled connections, metadata, duplicates and source order", async () => {
-		const config = {
-			id: "off",
-			name: "Disabled connection",
-			prefix: "off",
-			baseUrl: "https://api.anthropic.com/v1",
-			disabled: true,
-		};
-		const group = sourceGroupForConnection(config, "anthropic-messages");
+	test("management catalogs preserve disabled connections, metadata, duplicates and order", async () => {
+		const group = sourceGroupForConnection(
+			{ id: "off", name: "Disabled", prefix: "off", disabled: true },
+			"anthropic-messages",
+		);
 		const models = [
 			{ id: "second", display_name: "Second", contextWindow: 123_456 },
 			{ id: "first", display_name: "First", extra: { supported: true } },
 			{ id: "first", display_name: "Duplicate id, distinct metadata" },
 		];
-		reader("anthropic-messages", (current) =>
-			current.id === "off" ? models.map((model) => model.id) : [],
-		);
-		const result = await listCachedTemplateModels(group, models);
-		expect(group.disabled).toBe(true);
-		expect(result).toEqual(models);
-		expect(result[0]).toBe(models[0]);
+		reader("anthropic-messages", (current) => (current.id === "off" ? models : []));
+		expect(await getServiceTemplate(group.templateId).listModels(group)).toEqual(models);
 		expect(
 			await getServiceTemplate(group.templateId).listModels({ ...group, id: "unknown" }),
 		).toEqual([]);
 	});
 
-	test("cancellation stops before reading a catalog", async () => {
+	test("a cancelled listing does not read the catalog", async () => {
 		let reads = 0;
 		reader("completions-compatible", () => {
 			reads++;
-			return ["model"];
+			return [{ id: "model" }];
 		});
 		await expect(
 			getServiceTemplate("kimi-code").listModels(connection("one"), undefined, AbortSignal.abort()),
@@ -93,10 +71,10 @@ describe("template model lists", () => {
 		expect(reads).toBe(0);
 	});
 
-	test("special template readers do not fall back to a protocol catalog", async () => {
-		reader("completions-compatible", () => ["wrong-protocol"]);
+	test("singleton and plugin templates read their own catalog, not a protocol's", async () => {
+		reader("completions-compatible", () => [{ id: "wrong-protocol" }]);
 		for (const templateId of ["codex", "tokendance", "command-code", "nug", "plugin"] as const) {
-			reader(templateId, (group) => [`${group.id}-cached`]);
+			reader(templateId, (group) => [{ id: `${group.id}-cached` }]);
 			const group: SourceGroupView = {
 				id: templateId,
 				templateId,
@@ -107,7 +85,7 @@ describe("template model lists", () => {
 				endpoint: {},
 			};
 			expect(await getServiceTemplate(templateId).listModels(group)).toEqual([
-				`${templateId}-cached`,
+				{ id: `${templateId}-cached` },
 			]);
 		}
 	});
