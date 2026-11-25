@@ -4,7 +4,10 @@ title: 主线程性能规则
 summary: SQLite、JSON、同步 IO 都在主线程；列表不读大字段、游标分页、子进程限流、WebSocket 节流。
 anchors:
   - server/lib/validators/diagnostics.ts
-  - server/lib/db-worker/
+  - server/lib/db-worker/pool.ts
+  - server/lib/db-worker/read-budget.ts
+  - server/lib/db-worker/read-diagnostics.ts
+  - server/lib/db-worker/sql-diagnostics.ts
   - server/services/cpu-profiler.ts
   - server/db/connection.ts
   - server/lib/event-loop-monitor.ts

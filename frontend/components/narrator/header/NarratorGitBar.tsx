@@ -139,6 +139,11 @@ export function NarratorGitBar({
 				key={narratorId}
 				narratorId={narratorId}
 				onRequirement={onRequirement}
+				canCreateWorktree={
+					!!target &&
+					workspace.authorizationState === "authorized" &&
+					workspace.data?.capabilities.write === true
+				}
 			/>
 			{target && !workspace.data?.capabilities.write && (
 				<Text size="xs" c="dimmed">

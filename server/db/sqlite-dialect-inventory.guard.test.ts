@@ -523,7 +523,9 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		// Session model remap filters the imported ids with json_each over a JSON parameter.
 		"json1",
 	],
-	"server/routes/user-preferences.ts": ["handle"],
+	// The per-narrator Spec projection and atomic patch use JSON1 to avoid loading
+	// the whole historical layout map. A PG port needs JSON operators, not a full-map read.
+	"server/routes/user-preferences.ts": ["handle", "json1"],
 	"server/services/agent-runtime/inbox.ts": ["json1"],
 	// History/display ports also have PG implementations. Register the SQLite branches
 	// and Database types without claiming these main-database modules are SQLite-only.

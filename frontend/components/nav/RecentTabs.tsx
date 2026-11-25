@@ -371,6 +371,26 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 
 	const handleWSUpdate = useCallback(
 		(narratorId: string, event: NarratorListWSEvent) => {
+			// A late done carries notification intent only: never touch cache, favicon or runtime fences.
+			if (event.type === "status" && event.notificationOnly) {
+				if (
+					event.status === "idle" &&
+					event.substatus?.includes("unread") &&
+					!isBackgroundWorkSilencedStatus(event) &&
+					userPrefsRef.current
+				) {
+					const tab = tabsRef.current.find((item) => getRecentTabNarratorId(item) === narratorId);
+					if (tab)
+						triggerNotification(
+							narratorId,
+							tab.title,
+							"unread",
+							userPrefsRef.current,
+							event.turnStartedAt,
+						);
+				}
+				return;
+			}
 			const patch: Partial<RecentTab> = {};
 			if (event.type === "title" && event.title) patch.title = clampRecentTabText(event.title);
 			else if (event.type === "status") {
@@ -458,7 +478,7 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 					// in-app unread + favicon state, but stay silent (no sound, no PWA
 					// browser notification). The wake-up turn after the last background
 					// task completes emits a fresh, unflagged done which notifies normally.
-					if (!isBackgroundWorkSilencedStatus(event) && userPrefsRef.current) {
+					if (!event.stateOnly && !isBackgroundWorkSilencedStatus(event) && userPrefsRef.current) {
 						const tab = tabsRef.current.find((item) => getRecentTabNarratorId(item) === narratorId);
 						if (tab) {
 							triggerNotification(

@@ -76,7 +76,7 @@ keywords:
   - createSharedContext
   - createSharedInflight
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 ---
 # 前端通用工具
 
@@ -91,7 +91,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - Window Controls Overlay：`lib/wco.ts` 在 `<html>` 上维护 `data-nf-wco` 并判断窗口按钮在左或右（`getTitlebarAreaRect().x > 0` 为左），`visible !== true` 时不加属性；`lib/wco-titlebar.ts:useWcoTitlebarRows` 让页面自己的顶行当标题栏，给触及根节点上沿的头部打 `data-nf-titlebar-row/-end/-start` 标记，每帧至多重算一次。样式在 `styles/wco.css`。
 - 层级：全局浮层的 z-index 只能取 `lib/z-index.ts:Z` 的语义档位（`dropdown` 1000 … `modal` 5000、`toast` 6000、`imageViewer` 7000、`dragGhost` 8000、`criticalOverlay` 9000，后两档 `criticalModal` 9001 当前没有消费者）；组件内部用 `isolation: isolate` + 小数值，不使用这些档位。
 - 本机偏好：`hooks/useLocalPref.ts` 是布尔/数字偏好的统一入口（键集合在文件头 `Key`/`NumberKey` 联合里，取值经 `appearanceStore`，见[通用组件与主题](components-theme.md)）；`hooks/usePersistedState.ts` 是只存 `"true"/"false"` 的 `useState`，读写 `localStorage` 失败时静默用默认值；`hooks/useWakeLock.ts` 在 `enabled` 时申请屏幕常亮，页面重新可见时再申请，不支持则空操作。
-- 并发与上下文：`lib/shared-inflight.ts:createSharedInflight` 只合并仍在进行的读（`fresh: true` 不加入已有的读；所有读者都取消后才中止底层请求并移出表），不缓存已完成结果。`lib/shared-context.ts:createSharedContext` 按字符串键在全局 `Symbol.for("narrafork.shared-react-contexts")` 登记表里取 React Context，避免 Vite 热更新或 chunk 复制造成 Provider 与消费者拿到不同对象。
+- 并发与上下文：`lib/shared-inflight.ts:createSharedInflight` 只合并仍在进行的读（`fresh: true` 不加入已有的读；所有读者都取消后才中止底层请求并移出表），不缓存已完成结果；真正微任务启动 reader 前再次检查 abort，StrictMode 已退出的读者不能启动 HTTP。`lib/shared-context.ts:createSharedContext` 按字符串键在全局 `Symbol.for("narrafork.shared-react-contexts")` 登记表里取 React Context，避免 Vite 热更新或 chunk 复制造成 Provider 与消费者拿到不同对象。
 - 品牌（实例名与图标色）：服务端 `server/routes/branding.ts` 挂在 `/api/branding`，**公开**（登录页和标签标题需要），`GET /` 只返回 `name/iconColor/customized`，`/favicon.svg`、`/icon-192.png`、`/icon-512.png`、`/apple-touch-icon.png` 按图标色重绘并带 `ETag`，取不到时 404 让前端退回静态默认图。归一化与默认值在 `shared/branding.ts`（名称最长 `BRAND_NAME_MAX_LENGTH`=40、控制字符替换为空格；颜色只收 `#rgb`/`#rrggbb` 并展开为 6 位小写，默认 `#4c6ef5`）。前端 `lib/branding.ts:applyBranding` 更新 `document.title`、favicon 与 apple-touch-icon 链接，并把非默认值镜像到 `localStorage["narrafork_brand_name"|"narrafork_brand_icon_color"]` 给 `index.html` 的内联启动脚本在首帧使用；默认值是移除键而不是写入。远程访问构建（`REMOTE_BUILD`）一律用默认品牌。图标 URL 刻意是相对路径，以便跟随反向代理子路径。`lib/favicon.ts` 在标签页失焦时按最高严重度（error > waiting > unread > reflecting）把 favicon 换成带状态色圆点的版本，Logo 色跟品牌，圆点色固定。
 - `lib/status-registry.ts` 是叙述者状态/子状态到颜色、图标形状的单一登记表（`getEffectiveNarratorDisplay`），git 面板、导航、叙述者列表都引用它；`lib/constants.ts` 主要放模型选项与聚合模型值的辅助（`FOLLOW_DEFAULT_MODEL="__default__"`、`FOLLOW_SUMMARY_MODEL`、`AGG_MODEL_PREFIX="__agg__:"`、`mergeModels`），按内容更接近模型选择而非通用工具（未核实归属）。
 - `lib/pixi-hmr.ts:installPixiCanvasPoolHmrGuard` 修补 PixiJS 画布池在热更新时丢桶的问题；在 `frontend/` 里除它自己的测试外没有找到调用者，`pixi.js` 也没有被 `frontend/` 的组件 import（未核实是否仍有用）。

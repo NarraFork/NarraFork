@@ -23,7 +23,12 @@ const { UpdateModal } = await import("./UpdateModal");
 const { UpdateBadge } = await import("./UpdateBadge");
 const originalCheck = api.checkUpdate;
 const originalGetSettings = api.getSettings;
+const originalGetRuntimeSettings = api.getRuntimeSettings;
+
+import { runtimeSettingsQueryOptions } from "../hooks/useRuntimeSettings";
+
 const originalUpdateSettings = api.updateSettings;
+const originalUpdateRuntimeSettings = api.updateRuntimeSettings;
 const originalStatus = api.getUpdateStatus;
 const originalApply = api.applyUpdate;
 const originalCancel = api.cancelUpdate;
@@ -115,15 +120,25 @@ beforeEach(() => {
 		},
 	);
 	install("getComputedStyle", () => ({ getPropertyValue: () => "", overflowY: "visible" }));
-	install("localStorage", { getItem: () => null, setItem() {}, removeItem() {} });
+	install("localStorage", {
+		getItem: (key: string) => (key === "narrafork_token" ? "test-admin" : null),
+		setItem() {},
+		removeItem() {},
+	});
 	ready = false;
+	api.updateRuntimeSettings = async (input) =>
+		(await api.updateSettings(input)) as unknown as Awaited<
+			ReturnType<typeof originalUpdateRuntimeSettings>
+		>;
 	appliedVersion = undefined;
 	appliedPreparedId = undefined;
 	client = new QueryClient({
 		defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
 	});
+	api.getRuntimeSettings = async () =>
+		(await api.getSettings()) as unknown as Awaited<ReturnType<typeof originalGetRuntimeSettings>>;
 	client.setQueryData(["health"], { status: "ok", version: "1.0.0", platform: "linux" });
-	client.setQueryData(["settings"], {
+	client.setQueryData(runtimeSettingsQueryOptions().queryKey, {
 		update: { source: "github", githubRepository: "fork/project" },
 	});
 	api.getUpdateStatus = async () => ({
@@ -154,7 +169,9 @@ afterEach(async () => {
 	api.getUpdateNotes = originalNotes;
 	api.checkUpdate = originalCheck;
 	api.getSettings = originalGetSettings;
+	api.getRuntimeSettings = originalGetRuntimeSettings;
 	api.updateSettings = originalUpdateSettings;
+	api.updateRuntimeSettings = originalUpdateRuntimeSettings;
 	await translation.changeLanguage("en");
 	clearDOMTimers();
 	expect(pendingTimers.size).toBe(0);
@@ -245,7 +262,7 @@ async function render(
 
 async function changeSavedSource() {
 	await act(async () => {
-		client.setQueryData(["settings"], {
+		client.setQueryData(runtimeSettingsQueryOptions().queryKey, {
 			update: { source: "update-server", githubRepository: "fork/project" },
 		});
 	});
@@ -582,7 +599,7 @@ describe("UpdateModal saved source changes", () => {
 		const recommendation = successfulCheck();
 		const repository = changed === "repository" ? "other/project" : "fork/project";
 		const sourceIdentity = { ...originalIdentity.sourceIdentity, repository };
-		client.setQueryData(["settings"], {
+		client.setQueryData(runtimeSettingsQueryOptions().queryKey, {
 			update: { source: "github", githubRepository: repository },
 		});
 		api.checkUpdate = async () => ({
@@ -826,7 +843,7 @@ describe("UpdateModal saved source changes", () => {
 		expect(document.body.textContent).toContain("hash-a");
 		await show(first, false);
 		await act(async () => {
-			client.setQueryData(["settings"], { update: nextSettings });
+			client.setQueryData(runtimeSettingsQueryOptions().queryKey, { update: nextSettings });
 		});
 		await show(second, true);
 		expect(findButton("Download")).toBeDefined();
@@ -838,7 +855,7 @@ describe("UpdateModal saved source changes", () => {
 	});
 
 	test("the badge waits for saved settings, then opens a downloadable recommendation", async () => {
-		client.removeQueries({ queryKey: ["settings"] });
+		client.removeQueries({ queryKey: runtimeSettingsQueryOptions().queryKey });
 		client.setQueryData(["auth", "me"], { id: "admin", username: "admin", role: "admin" });
 		let resolveSettings!: (value: Awaited<ReturnType<typeof api.getSettings>>) => void;
 		let checkCalls = 0;
@@ -898,9 +915,11 @@ describe("UpdateModal saved source changes", () => {
 			},
 		},
 	])("inactive or equivalent settings keep download usable: $name", async ({ initial, next }) => {
-		client.setQueryData(["settings"], { update: initial });
+		client.setQueryData(runtimeSettingsQueryOptions().queryKey, { update: initial });
 		await render("full", initial);
-		await act(async () => client.setQueryData(["settings"], { update: next }));
+		await act(async () =>
+			client.setQueryData(runtimeSettingsQueryOptions().queryKey, { update: next }),
+		);
 		await settle();
 		expect(document.body.textContent).not.toContain(common.updateSourceChanged);
 		expect(findButton("Download")).toBeDefined();
@@ -943,13 +962,17 @@ describe("UpdateModal saved source changes", () => {
 			next: { ...serverSettings, channel: "beta" as const },
 		},
 	])("active settings invalidate permanently: $name", async ({ initial, next }) => {
-		client.setQueryData(["settings"], { update: initial });
+		client.setQueryData(runtimeSettingsQueryOptions().queryKey, { update: initial });
 		await render("full", initial);
-		await act(async () => client.setQueryData(["settings"], { update: next }));
+		await act(async () =>
+			client.setQueryData(runtimeSettingsQueryOptions().queryKey, { update: next }),
+		);
 		await settle();
 		expect(document.body.textContent).toContain(common.updateSourceChanged);
 		expect(findButton("Download")).toBeUndefined();
-		await act(async () => client.setQueryData(["settings"], { update: initial }));
+		await act(async () =>
+			client.setQueryData(runtimeSettingsQueryOptions().queryKey, { update: initial }),
+		);
 		await settle();
 		expect(findButton("Download")).toBeUndefined();
 	});
@@ -978,7 +1001,7 @@ describe("UpdateModal saved source changes", () => {
 		if (action === "reset") {
 			api.checkUpdate = async () => ({ updateAvailable: false, currentVersion: "1.0.0" });
 			await act(async () => {
-				client.setQueryData(["settings"], { update: serverSettings });
+				client.setQueryData(runtimeSettingsQueryOptions().queryKey, { update: serverSettings });
 				await client.resetQueries({ queryKey: ["update-check"] });
 			});
 		} else await act(async () => root?.render(null));
@@ -987,7 +1010,7 @@ describe("UpdateModal saved source changes", () => {
 		expect(signals).toHaveLength(1);
 		// Re-mount with a fresh recommendation, then cancel and retry a new request.
 		await act(async () => {
-			client.setQueryData(["settings"], { update: githubSettings });
+			client.setQueryData(runtimeSettingsQueryOptions().queryKey, { update: githubSettings });
 			client.setQueryData(["update-check"], {
 				...successfulCheck(),
 				settingsKey: updateSettingsKey(githubSettings),
@@ -1174,7 +1197,7 @@ describe("UpdateModal saved source changes", () => {
 		expect(document.body.textContent).not.toContain("Old recommendation notes");
 		expect(findButton("Download")).toBeUndefined();
 		await act(async () => {
-			client.setQueryData(["settings"], {
+			client.setQueryData(runtimeSettingsQueryOptions().queryKey, {
 				update: { source: "github", githubRepository: "fork/project" },
 			});
 		});
@@ -1201,7 +1224,7 @@ describe("UpdateBadge first-check mirror dialog", () => {
 		const settings = {
 			update: { source: "github" as const, githubRepository: "NarraFork/NarraFork" },
 		};
-		client.setQueryData(["settings"], settings);
+		client.setQueryData(runtimeSettingsQueryOptions().queryKey, settings);
 		api.getSettings = async () => settings;
 		api.checkUpdate = async () => ({
 			updateAvailable: false,

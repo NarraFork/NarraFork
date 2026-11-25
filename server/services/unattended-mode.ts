@@ -288,11 +288,29 @@ export function createUnattendedMode(deps: UnattendedModeDeps): UnattendedMode {
 		return deps.probe({ dueWithinMs: state.options.quietSeconds * 1000 });
 	}
 
+	/** Only public UI semantics: probe timestamps and administrator diagnostics are not hints. */
+	function uiSummary(): string {
+		const blockers = state.blockers;
+		return JSON.stringify([
+			state.phase,
+			state.quietSince,
+			state.shutdownAt,
+			state.blocked,
+			state.lastError,
+			blockers.narrators.count,
+			blockers.compacting,
+			blockers.queuedDeliveries,
+			blockers.backgroundTasks,
+			blockers.dueScheduledTasks,
+			blockers.maintenance,
+			blockers.unknown,
+		]);
+	}
+
 	async function tick(): Promise<void> {
 		if (!state.enabled || state.phase === "shutting_down" || state.ticking) return;
 		const probeGeneration = generation;
-		const previousPhase = state.phase;
-		const previousShutdownAt = state.shutdownAt;
+		const previousSummary = uiSummary();
 		state.ticking = true;
 		try {
 			const report = await probe();
@@ -339,7 +357,7 @@ export function createUnattendedMode(deps: UnattendedModeDeps): UnattendedMode {
 			state.ticking = false;
 			if (probeGeneration !== generation) {
 				void tick();
-			} else if (previousPhase !== state.phase || previousShutdownAt !== state.shutdownAt) {
+			} else if (previousSummary !== uiSummary()) {
 				deps.changed?.();
 			}
 		}

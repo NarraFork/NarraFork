@@ -14,6 +14,7 @@
 import { afterAll, beforeAll, beforeEach, expect, test } from "bun:test";
 import { existsSync, mkdirSync } from "node:fs";
 import { basename, join } from "node:path";
+import type { RuntimeSettings } from "@shared/settings-runtime";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import puppeteer, { type Browser, type Page } from "puppeteer-core";
@@ -128,7 +129,15 @@ function api() {
 			? Response.json({ error: error.message, code: error.code }, { status: error.statusCode })
 			: Response.json({ error: String(error) }, { status: 500 }),
 	);
-	app.get("/api/settings", (c) => c.json({ outline: { enabled: true } }));
+	app.get("/api/settings/runtime", (c) =>
+		c.json({
+			revision: 1,
+			agent: { defaultModel: "", summaryModel: "" },
+			outline: { enabled: true },
+			requestEvidence: { autoPin: "off" },
+			summaryModelAvailable: null,
+		} satisfies RuntimeSettings),
+	);
 	app.route("/api/outline", outlineRoutes);
 	return app;
 }

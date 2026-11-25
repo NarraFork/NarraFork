@@ -17,6 +17,7 @@ function harness() {
 	let now = START;
 	let report: UnattendedBlockers = emptyUnattendedBlockers();
 	let shutdownAccepted = true;
+	const changes: ReturnType<ReturnType<typeof createUnattendedMode>["status"]>[] = [];
 	const probes: Array<{ dueWithinMs: number }> = [];
 	const shutdowns: string[] = [];
 	const powerOffs: Array<string | null> = [];
@@ -39,10 +40,12 @@ function harness() {
 			hook = next;
 		},
 		schedule: () => () => {},
+		changed: () => changes.push(mode.status()),
 		log: { info: () => {}, warn: () => {} },
 	});
 	return {
 		mode,
+		changes,
 		probes,
 		shutdowns,
 		powerOffs,
@@ -303,6 +306,72 @@ describe("unattended mode state machine", () => {
 		h.advance(10_000);
 		await h.mode.tick();
 		expect(h.shutdowns).toHaveLength(2);
+	});
+
+	test("notifies on public blocker changes even while phase and deadline stay unchanged", async () => {
+		const h = harness();
+		h.setReport(busyReport());
+		h.mode.enable();
+		await flush();
+		expect(h.changes).toHaveLength(2);
+		for (const patch of [
+			{ narrators: { count: 2, ids: ["one", "two"] } },
+			{ compacting: 1 },
+			{ queuedDeliveries: true },
+			{ backgroundTasks: true },
+			{ dueScheduledTasks: true },
+			{ maintenance: true },
+			{ unknown: true },
+		]) {
+			const before = h.changes.length;
+			h.setReport({ ...busyReport(), ...patch });
+			await h.mode.tick();
+			expect(h.changes).toHaveLength(before + 1);
+			expect(h.mode.status()).toMatchObject({ phase: "waiting", shutdownAt: null });
+		}
+	});
+
+	test("does not notify on checkedAt or administrator-only probe diagnostic changes", async () => {
+		const h = harness();
+		h.setReport(busyReport());
+		h.mode.enable();
+		await flush();
+		const count = h.changes.length;
+		h.advance(5_000);
+		h.setReport({
+			...busyReport(),
+			narrators: { count: 1, ids: ["different-private-id"] },
+			dbWorkingNarrators: 100,
+			error: "private diagnostics",
+		});
+		await h.mode.tick();
+		expect(h.changes).toHaveLength(count);
+		expect(h.mode.status().checkedAt).toBe(new Date(START + 5_000).toISOString());
+	});
+
+	test("reports lastError changes without a phase or deadline change", async () => {
+		let fail = false;
+		const changes: string[] = [];
+		const mode = createUnattendedMode({
+			now: () => START,
+			probe: async () => {
+				if (fail) throw new Error("probe failed");
+				return { ...emptyUnattendedBlockers(), unknown: true };
+			},
+			requestShutdown: () => true,
+			powerOff: async () => ({ ok: true }),
+			registerHook: () => {},
+			schedule: () => () => {},
+			changed: () => changes.push(mode.status().lastError ?? "none"),
+			log: { info: () => {}, warn: () => {} },
+		});
+		mode.enable();
+		await flush();
+		fail = true;
+		await mode.tick();
+		expect(changes).toEqual(["none", "none", "probe_failed"]);
+		await mode.tick();
+		expect(changes).toHaveLength(3);
 	});
 
 	test("notifies listeners when arming, starting a countdown, and cancelling", async () => {

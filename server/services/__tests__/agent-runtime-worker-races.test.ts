@@ -11,6 +11,8 @@ import { closeRuntimeTestDb, getRuntimeTestDb } from "./agent-runtime-test-datab
 
 const { db, sqlite, ready } = getRuntimeTestDb();
 await ready;
+const realDbModule = { ...(await import("../../db")) };
+mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 const finalization = createRuntimeFinalizationReads(db);
 const mailbox = createMailboxStore(db);
 const publication = createRuntimePublicationService(db);
@@ -21,7 +23,10 @@ beforeEach(() => {
 	db.insert(narrators).values({ id: "actor", createdAt: time, updatedAt: time }).run();
 });
 afterEach(() => mock.restore());
-afterAll(async () => await closeRuntimeTestDb(sqlite));
+afterAll(async () => {
+	await closeRuntimeTestDb(sqlite);
+	mock.module("../../db", () => realDbModule);
+});
 
 function afterSnapshot(write: () => void) {
 	const original = bridge.readQueryFirst;
@@ -83,6 +88,33 @@ for (const changed of ["model", "pending"] as const)
 				: { model: "temporary", pendingModelRestore: "concurrent" },
 		);
 	});
+
+test("transient cleanup returns the full committed patch with its synchronous revision", async () => {
+	const future = "2099-01-01T00:00:00.000Z";
+	db.update(narrators)
+		.set({
+			status: "idle",
+			substatus: '["reasoning","error"]',
+			errorMessage: "retained upstream error",
+			errorRetryable: false,
+			archivedWithNarratorId: "actor",
+			updatedAt: future,
+		})
+		.where(eq(narrators.id, "actor"))
+		.run();
+	expect(await finalization.clearTransientStatusPatch("actor")).toEqual({
+		status: "idle",
+		substatus: ["error"],
+		turnStartedAt: null,
+		updatedAt: future,
+		messageCount: 0,
+		errorMessage: "retained upstream error",
+		errorRetryable: false,
+		archivedWithNarratorId: "actor",
+		statusEpoch: expect.any(String),
+		statusRevision: expect.any(Number),
+	});
+});
 
 test("transient cleanup cannot erase a concurrent substatus", async () => {
 	db.update(narrators).set({ substatus: '["reasoning"]' }).where(eq(narrators.id, "actor")).run();

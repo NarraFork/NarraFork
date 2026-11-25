@@ -76,6 +76,9 @@ export interface ChatMessagePage {
 	hasMore: boolean;
 	/** Cursor for the next (older) page; null at the room start. */
 	nextBeforeSeq: number | null;
+	/** Fixed-range ASC recovery; cursors are exclusive. */
+	hasNext?: boolean;
+	nextAfterSeq?: number | null;
 }
 
 export interface ChatUnreadSummary {
@@ -100,26 +103,43 @@ export const chatApi = {
 			body: JSON.stringify({ userId }),
 		}),
 
-	getNarratorChatRoom: (narratorId: string) =>
-		request<ChatRoomSummary>(`/chat/rooms/narrator/${narratorId}`),
+	getNarratorChatRoom: (narratorId: string, signal?: AbortSignal) =>
+		request<ChatRoomSummary>(`/chat/rooms/narrator/${narratorId}`, { signal }),
 
 	/** The caller's own conversation with a bot narrator (created on first open). */
 	getBotChatRoom: (narratorId: string) => request<ChatRoomSummary>(`/chat/rooms/bot/${narratorId}`),
 
-	listChatMessages: (roomId: string, params?: { beforeSeq?: number; limit?: number }) => {
+	listChatMessages: (
+		roomId: string,
+		params?: {
+			afterSeq?: number;
+			beforeSeq?: number;
+			limit?: number;
+			signal?: AbortSignal;
+			maxResponseBytes?: number;
+			onResponseBytes?: (bytes: number) => void;
+		},
+	) => {
 		const search = new URLSearchParams();
+		if (params?.afterSeq !== undefined) search.set("afterSeq", String(params.afterSeq));
 		if (params?.beforeSeq !== undefined) search.set("beforeSeq", String(params.beforeSeq));
 		if (params?.limit !== undefined) search.set("limit", String(params.limit));
 		const query = search.toString();
 		return request<ChatMessagePage>(
 			query ? `/chat/rooms/${roomId}/messages?${query}` : `/chat/rooms/${roomId}/messages`,
+			{
+				signal: params?.signal,
+				maxResponseBytes: params?.maxResponseBytes ?? 32 * 1024 * 1024,
+				onResponseBytes: params?.onResponseBytes,
+			},
 		);
 	},
 
 	/** Resolve a message id to its room seq (the vlist's jump coordinate). */
-	getChatMessageLocation: (roomId: string, messageId: string) =>
+	getChatMessageLocation: (roomId: string, messageId: string, signal?: AbortSignal) =>
 		request<{ messageId: string; seq: number }>(
 			`/chat/rooms/${roomId}/messages/${messageId}/location`,
+			{ signal },
 		),
 
 	postChatMessage: (
@@ -172,10 +192,11 @@ export const chatApi = {
 			body: JSON.stringify({ narratorId, attachmentIds }),
 		}),
 
-	markChatRead: (roomId: string, seq: number) =>
+	markChatRead: (roomId: string, seq: number, signal?: AbortSignal) =>
 		request<{ lastReadSeq: number }>(`/chat/rooms/${roomId}/read`, {
 			method: "POST",
 			body: JSON.stringify({ seq }),
+			signal,
 		}),
 
 	deleteChatMessage: (roomId: string, messageId: string) =>

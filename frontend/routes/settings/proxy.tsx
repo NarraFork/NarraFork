@@ -24,6 +24,7 @@ import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ProxyOverrideField } from "../../components/common/ProxyOverrideField";
 import { useCurrentUser } from "../../hooks/useAuth";
+import { useUserPreferencesDetail } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
 import { miscApi } from "../../lib/api/misc";
 import {
@@ -715,11 +716,7 @@ interface GatewayPlatformLike {
 function GatewayOverrides() {
 	const { t } = useTranslation("settings");
 	const qc = useQueryClient();
-	const { data: prefs, isLoading } = useQuery({
-		queryKey: ["user-preferences"],
-		queryFn: api.getUserPreferences,
-		staleTime: 60_000,
-	});
+	const { data: prefs, isLoading } = useUserPreferencesDetail();
 
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const gatewayConfig = (prefs as any)?.gatewayConfig as

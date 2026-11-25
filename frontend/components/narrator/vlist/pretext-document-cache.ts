@@ -33,6 +33,7 @@
  * `frontend/lib/shiki-token-cache.ts`.
  */
 
+import { installPretextDocumentCacheInvalidator } from "@frontend/lib/pretext-document-cache-invalidation";
 import { isNestedRow } from "../message/nested-rows";
 import type { PretextDocumentInput } from "./pretext-document-loader";
 import { onPretextSessionChange, pretextSessionEpoch } from "./pretext-session-scope";
@@ -206,6 +207,9 @@ export function createPretextDocumentCache(
 
 const sharedCache = createPretextDocumentCache();
 const unsubscribeSession = onPretextSessionChange(() => sharedCache.clear());
+const uninstallInvalidator = installPretextDocumentCacheInvalidator((narratorId) =>
+	sharedCache.invalidate(narratorId),
+);
 
 export const peekCachedPretextDocument: PretextDocumentCache["peek"] = (narratorId) => {
 	pretextSessionEpoch();
@@ -231,6 +235,7 @@ export const pretextDocumentCacheStats: PretextDocumentCache["stats"] = () => sh
 if (import.meta.hot) {
 	import.meta.hot.dispose(() => {
 		unsubscribeSession();
+		uninstallInvalidator();
 		sharedCache.clear();
 	});
 }

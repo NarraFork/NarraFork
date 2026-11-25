@@ -1,4 +1,4 @@
-import { and, eq, isNull, ne, or } from "drizzle-orm";
+import { and, eq, isNull, ne, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import { narrators } from "../db/schema";
 import { withDbRetry } from "../lib/db-resilience";
@@ -9,6 +9,11 @@ import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { backgroundOccupancyStore } from "./background-occupancy-store";
 import { loadNarratorForAccess, type NarratorPrincipal } from "./narrator-acl";
 import { withNarratorMutationAdmission } from "./narrator-session-state";
+import {
+	committedNarratorStatusPatch,
+	narratorStatusPatchColumns,
+	versionNarratorStatusCommit,
+} from "./narrator-status-version";
 import { rememberArchivedTabPlacement, restoreArchivedTabPlacement } from "./recent-tabs-service";
 import { prepareNarratorArchive, repairArchivedNarrator } from "./subagent-lifecycle";
 import { closeSubagentResources } from "./subagent-resources";
@@ -127,19 +132,21 @@ async function transitionAdmittedGroup(
 					.get();
 				if (!current) throw new NotFoundError("Narrator", parentId);
 				if ((current.status === "archived") === archiving) return [];
-				const updated = (id: string, child: boolean) =>
-					tx
+				const updated = (id: string, child: boolean) => {
+					const row = tx
 						.update(narrators)
 						.set({
 							status: target,
 							errorMessage: null,
 							errorRetryable: null,
-							updatedAt: now,
+							updatedAt: sql`case when ${narrators.updatedAt} > ${now} then ${narrators.updatedAt} else ${now} end`,
 							archivedWithNarratorId: archiving && child ? parentId : null,
 						})
 						.where(and(eq(narrators.id, id), child ? childWhere : undefined))
-						.returning({ id: narrators.id, title: narrators.title })
+						.returning({ id: narrators.id, title: narrators.title, ...narratorStatusPatchColumns })
 						.get();
+					return versionNarratorStatusCommit(row);
+				};
 				const updatedParent = updated(parentId, false);
 				if (!updatedParent) throw new ValidationError("Parent session could not be updated");
 				const updatedChildren = children
@@ -153,10 +160,15 @@ async function transitionAdmittedGroup(
 
 	// Only committed changes are observable by clients and status listeners.
 	await runAsTeamStatusActor(personActor(userId), async () => {
-		for (const { id } of changes) {
+		for (const row of changes) {
+			const id = row.id;
 			backgroundOccupancyStore.refreshNarrator(id);
 			eventBus.emit({ type: "narrator:status_changed", narratorId: id, status: target });
-			broadcastToNarrator(id, { type: "status_change", narratorId: id, status: target });
+			broadcastToNarrator(id, {
+				type: "status_change",
+				narratorId: id,
+				...(await committedNarratorStatusPatch(id, row)),
+			});
 		}
 	});
 	for (const { id, title } of changes) {

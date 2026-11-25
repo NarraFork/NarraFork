@@ -10,6 +10,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { I18nextProvider } from "react-i18next";
 import { api } from "../../lib/api";
+import { appearanceStore } from "../../lib/appearance-preference-store";
 import commonLocale from "../../locales/en/common.json";
 import {
 	type PluginUiSessionContext,
@@ -19,10 +20,15 @@ import {
 import { parsePanelWindowDescriptor } from "../window/panel-window";
 import { DefaultSurfaceTab, fileTabRevealDirectory, withSurfaceTabMenu } from "./SurfaceTab";
 
+const fixtureUser = "surface-tab-fixture-user";
+const fixtureToken = "surface-tab-fixture-token";
+const preferencesKey = ["user-preferences", "ui", fixtureUser, fixtureToken] as const;
+
 function queryClient(platform = "windows") {
 	const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 	client.setQueryData(["health"], { platform });
-	client.setQueryData(["user-preferences"], { treatAsLocalAccess: false });
+	client.setQueryData(["auth", "me"], { id: fixtureUser });
+	client.setQueryData(preferencesKey, { treatAsLocalAccess: false });
 	return client;
 }
 
@@ -118,8 +124,21 @@ async function mountTab(
 		sessionContext?: PluginUiSessionContext;
 	} = {},
 ) {
+	if (root) {
+		await act(async () => root?.unmount());
+		root = undefined;
+		client?.clear();
+		restoreDom?.();
+		restoreDom = undefined;
+	}
 	const { window } = parseHTML("<!doctype html><html><head></head><body></body></html>");
+	const storage = new Map([["narrafork_token", fixtureToken]]);
 	const globals = {
+		localStorage: {
+			getItem: (key: string) => storage.get(key) ?? null,
+			setItem: (key: string, value: string) => storage.set(key, value),
+			removeItem: (key: string) => storage.delete(key),
+		},
 		window,
 		document: window.document,
 		navigator: window.navigator,
@@ -140,14 +159,16 @@ async function mountTab(
 		Object.keys(globals).map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)]),
 	);
 	Object.assign(globalThis, globals);
+	appearanceStore.activate(null, true);
 	restoreDom = () => {
+		appearanceStore.activate(null, true);
 		for (const [key, descriptor] of previous) {
 			if (descriptor) Object.defineProperty(globalThis, key, descriptor);
 			else Reflect.deleteProperty(globalThis, key);
 		}
 	};
 	const testClient = queryClient(options.platform);
-	testClient.setQueryData(["user-preferences"], {
+	testClient.setQueryData(preferencesKey, {
 		treatAsLocalAccess: options.treatAsLocalAccess ?? false,
 	});
 	client = testClient;
@@ -314,12 +335,12 @@ describe("file tab context menu", () => {
 		await mountTab({ hostname: "narrafork.example.com" });
 		expect(revealItem()).toBeUndefined();
 		await act(async () => {
-			client?.setQueryData(["user-preferences"], { treatAsLocalAccess: true });
+			client?.setQueryData(preferencesKey, { treatAsLocalAccess: true });
 			await new Promise((resolve) => setTimeout(resolve, 0));
 		});
 		expect(revealItem()).toBeDefined();
 		await act(async () => {
-			client?.setQueryData(["user-preferences"], { treatAsLocalAccess: false });
+			client?.setQueryData(preferencesKey, { treatAsLocalAccess: false });
 			await new Promise((resolve) => setTimeout(resolve, 0));
 		});
 		expect(revealItem()).toBeUndefined();

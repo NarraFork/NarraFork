@@ -1,5 +1,6 @@
 import type { ModelCard } from "@shared/model-catalog/card";
 import { modelProfile } from "@shared/model-catalog/profile";
+import type { RuntimeModelSummary } from "@shared/model-runtime";
 import {
 	clampReasoningEffort,
 	migrateLegacyReasoningEffort,
@@ -257,6 +258,29 @@ export function resolveCodexCapableProviders(
 	return providers;
 }
 
+/** Reasoning metadata from the bounded runtime projection, without reading a catalog card. */
+export function runtimeReasoningEffortSupport(
+	summary: RuntimeModelSummary,
+): ReasoningEffortSupport {
+	const declared = summary.reasoning;
+	const local = summary.provenance?.reasoning?.startsWith("local-") === true;
+	const levels =
+		!local && Array.isArray(summary.effortLevels) ? summary.effortLevels : declared.levels;
+	const valid = (levels ?? []).filter((level): level is ReasoningEffort =>
+		REASONING_EFFORT_VALUES.includes(level as ReasoningEffort),
+	);
+	const supportsReasoningEffort =
+		summary.state !== "not-observed" &&
+		declared.supported !== false &&
+		!(Array.isArray(levels) && valid.length === 0);
+	const tiers = valid.length ? valid : GENERIC_REASONING_EFFORT_TIERS;
+	const reasoningEffortOptions =
+		declared.canDisable === false
+			? tiers.filter((level) => level !== "none")
+			: (["none", ...tiers.filter((level) => level !== "none")] as ReasoningEffort[]);
+	return { supportsReasoningEffort, reasoningEffortOptions };
+}
+
 /**
  * Resolve the reasoning-effort menu for one model reference.
  *
@@ -271,7 +295,9 @@ export function resolveReasoningEffortSupport(args: {
 	settingsData: ModelSelectionSettings | undefined;
 	modelCard: ModelCard | null | undefined;
 	codexCapableProviders: ReadonlySet<string>;
+	modelSummary?: RuntimeModelSummary;
 }): ReasoningEffortSupport {
+	if (args.modelSummary) return runtimeReasoningEffortSupport(args.modelSummary);
 	const {
 		resolvedModel,
 		resolvedBareModel,
@@ -282,6 +308,7 @@ export function resolveReasoningEffortSupport(args: {
 	} = args;
 	const isCodexChannelModel =
 		resolvedModelOption?.channelType?.toLowerCase() === "codex" ||
+		resolvedModel.startsWith("codex:") ||
 		resolvedBareModel.startsWith("codex:");
 
 	/**
@@ -404,7 +431,8 @@ export interface UseModelSelectionOptions {
 	inheritedReasoningEffort?: string | null;
 	settingsData: ModelSelectionSettings | undefined;
 	/** The catalog card the effective model resolves to (server-side, provider-aware). */
-	modelCard: ModelCard | null | undefined;
+	modelCard?: ModelCard | null;
+	modelSummary?: RuntimeModelSummary;
 	reasoningEffortMutation: ReasoningEffortMutation;
 	updateSettingsMutation: UpdateSettingsMutation;
 }
@@ -443,6 +471,7 @@ export function useModelSelection(options: UseModelSelectionOptions): UseModelSe
 		inheritedReasoningEffort,
 		settingsData,
 		modelCard,
+		modelSummary,
 		reasoningEffortMutation,
 		updateSettingsMutation,
 	} = options;
@@ -453,6 +482,7 @@ export function useModelSelection(options: UseModelSelectionOptions): UseModelSe
 	);
 	const isCodexChannelModel =
 		resolvedModelOption?.channelType?.toLowerCase() === "codex" ||
+		resolvedModel.startsWith("codex:") ||
 		resolvedBareModel.startsWith("codex:");
 	const supportsCodexControls = useMemo(() => {
 		const providerPrefix = resolvedModel?.split(":")[0];
@@ -468,11 +498,13 @@ export function useModelSelection(options: UseModelSelectionOptions): UseModelSe
 				resolvedModelOption,
 				settingsData,
 				modelCard,
+				modelSummary,
 				codexCapableProviders,
 			}),
 		[
 			codexCapableProviders,
 			modelCard,
+			modelSummary,
 			resolvedBareModel,
 			resolvedModel,
 			resolvedModelOption,
@@ -502,16 +534,18 @@ export function useModelSelection(options: UseModelSelectionOptions): UseModelSe
 				globalDefaultReasoningEffort)
 			: (narratorReasoningEffort as ReasoningEffort);
 		if (!desired) return "";
-		const source = modelCard?.provenance.reasoning_effort_levels?.layer;
+		const source =
+			modelSummary?.provenance?.reasoning ?? modelCard?.provenance.reasoning_effort_levels?.layer;
 		const legacyModel =
 			!hasGatewayReportedEffortLevels(resolvedModelOption) &&
 			(source === "preset-model" || source === "preset-variant")
-				? modelCard?.modelId
+				? (modelSummary?.resolvedBareModel ?? modelCard?.modelId)
 				: undefined;
 		return clampReasoningEffort(migrateLegacyReasoningEffort(legacyModel, desired, opts), opts);
 	}, [
 		resolvedModelOption,
 		modelCard,
+		modelSummary,
 		narratorReasoningEffort,
 		reasoningEffortOptions,
 		reasoningFollowsDefault,

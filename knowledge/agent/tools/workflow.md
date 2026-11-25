@@ -16,6 +16,8 @@ anchors:
   - server/lib/recall-contract.ts
   - server/services/search/recall-store.ts
   - server/lib/db-worker/recall-reader.ts
+  - server/lib/db-worker/recall-conversation-query.ts
+  - server/lib/db-worker/recall-tool-call-query.ts
   - server/lib/db-worker/recall-tool-page.ts
   - server/lib/db-worker/recall-effective-refs.ts
   - server/lib/db-worker/recall-pg-message-reader.ts
