@@ -433,6 +433,141 @@ test("service dispose joins a pending authorized create and prevents late sessio
 	expect(service.dispose()).toBe(service.dispose());
 });
 
+for (const authorization of ["allow", "reject"] as const)
+	test(`service dispose joins pinned rawOpen publication authorization: ${authorization}`, async () => {
+		const { root, path } = await fixture();
+		const entered = deferred();
+		const gate = deferred();
+		const denied = new Error("fixture read authorization denied");
+		let hold = false;
+		let authorizations = 0;
+		const service = new EditorDocumentService({
+			root: join(root, "transfers"),
+			execute: async () => {
+				throw new Error("No writes");
+			},
+		});
+		const actor: EditorActor = {
+			userId: "u",
+			narratorId: "n",
+			authorize: async () => {
+				if (hold && ++authorizations === 2) {
+					entered.resolve();
+					await gate.promise;
+					if (authorization === "reject") throw denied;
+				}
+				return {
+					cwd: root,
+					projectId: null,
+					lexicalPath: path,
+					canonicalPath: path,
+					outsideRoots: false,
+				};
+			},
+		};
+		const document = await service.create(actor, { path, origin: "legacy", protocol: "raw-v2" });
+		hold = true;
+		const opening = service.rawOpen(actor, document.docId, document.versionHandle).catch((e) => e);
+		try {
+			await within(entered.promise);
+			const sessions = Reflect.get(service, "sessions") as Map<
+				string,
+				{ pins: number; closing: boolean }
+			>;
+			const pending = Reflect.get(service, "pending") as Set<Promise<unknown>>;
+			expect(sessions.get(document.docId)?.pins).toBe(1);
+			expect(pending.size).toBe(1);
+			expect(service.streams.diagnostics.active).toBe(1);
+			let closed = false;
+			const closing = service.dispose().then(() => {
+				closed = true;
+			});
+			// Join the real stream/Worker drain, not a UI render or an arbitrary delay.
+			await within(service.streams.dispose());
+			expect(service.streams.diagnostics).toEqual({
+				active: 0,
+				queued: 0,
+				streams: 0,
+				windowBytes: 0,
+				workers: 0,
+			});
+			expect(sessions.get(document.docId)).toMatchObject({ pins: 1, closing: true });
+			expect(pending.size).toBe(1);
+			expect(closed).toBe(false);
+			gate.resolve();
+			const result = await within(opening);
+			if (authorization === "reject") expect(result).toBe(denied);
+			else expect(result).toMatchObject({ code: "EDITOR_SESSION_EXPIRED" });
+			await within(closing);
+			expect(closed).toBe(true);
+			expect(service.diagnostics.documents).toBe(0);
+			expect(service.diagnostics.reservedBytes).toBe(0);
+			expect(pending.size).toBe(0);
+			expect((Reflect.get(service, "downloads") as Map<unknown, unknown>).size).toBe(0);
+			await expect(
+				service.rawOpen(actor, document.docId, document.versionHandle),
+			).rejects.toMatchObject({ code: "EDITOR_CLOSED" });
+			expect(authorizations).toBe(2);
+			expect(service.diagnostics.documents).toBe(0);
+			expect(service.dispose()).toBe(service.dispose());
+		} finally {
+			gate.resolve();
+			await opening;
+			await service.dispose().catch(() => {});
+		}
+	});
+
+for (const failure of ["source", "abort"] as const)
+	test(`rawOpen ${failure} failure releases its session pin before dispose`, async () => {
+		const { root, path } = await fixture();
+		const service = new EditorDocumentService({
+			root: join(root, "transfers"),
+			execute: async () => {
+				throw new Error("No writes");
+			},
+		});
+		clean.push(() => service.dispose());
+		const actor: EditorActor = {
+			userId: "u",
+			narratorId: "n",
+			authorize: async () => ({
+				cwd: root,
+				projectId: null,
+				lexicalPath: path,
+				canonicalPath: path,
+				outsideRoots: false,
+			}),
+		};
+		const document = await service.create(actor, { path, origin: "legacy", protocol: "raw-v2" });
+		const controller = new AbortController();
+		if (failure === "source") await rm(path);
+		else controller.abort();
+		const result = await within(
+			service
+				.rawOpen(actor, document.docId, document.versionHandle, controller.signal)
+				.catch((error) => error),
+		);
+		expect(result).toBeInstanceOf(Error);
+		if (failure === "source") expect(result).toMatchObject({ code: "ENOENT" });
+		else expect(result).toMatchObject({ name: "AbortError" });
+		expect(
+			(Reflect.get(service, "sessions") as Map<string, { pins: number }>).get(document.docId)?.pins,
+		).toBe(0);
+		expect((Reflect.get(service, "pending") as Set<Promise<unknown>>).size).toBe(0);
+		expect(service.streams.diagnostics.active).toBe(0);
+		expect(service.streams.diagnostics.streams).toBe(0);
+		await within(service.dispose());
+		expect(service.diagnostics.documents).toBe(0);
+		expect(service.diagnostics.reservedBytes).toBe(0);
+		expect(service.streams.diagnostics).toEqual({
+			active: 0,
+			queued: 0,
+			streams: 0,
+			windowBytes: 0,
+			workers: 0,
+		});
+	});
+
 test("production close without a lazy owner sets an HMR-stable admission latch; reset is idempotent", async () => {
 	await resetEditorDocumentServiceForTests();
 	await closeEditorDocumentService();
