@@ -109,6 +109,7 @@ import {
 	withRuntimePolicyTrait,
 } from "../lib/runtime-policy-trait";
 import {
+	addressableTeamMembersWhere,
 	modelPoolKeyOf,
 	policySourceIdOf,
 	type RuntimeSourceRow,
@@ -190,6 +191,7 @@ import { syncNarratorProjectLinksSafely } from "./project-index";
 import { resolveSkillContextForNarrator } from "./skill-service";
 import { specVfsService } from "./spec-vfs-service";
 import { removeUploadDirectoryWithoutMedia } from "./storage-service";
+import { storedTitleSlug } from "./subagent-alias";
 import { defaultTaskBackendForNewSession } from "./task-source";
 import { readTaskBackend } from "./task-source/backend";
 import { assertTeamRemovable, deleteTeamOfNarratorInTransaction } from "./teams/team-records";
@@ -1767,6 +1769,7 @@ export async function prepareNarratorCreation(
 			inheritMode: "fresh",
 			status: "idle",
 			title: input.title ?? null,
+			titleSlug: storedTitleSlug(input.title),
 			createdAt: now,
 			updatedAt: now,
 		},
@@ -2165,6 +2168,7 @@ export const narratorService = {
 							traits: subTraits,
 							enabledTools: preloadTools.length > 0 ? preloadTools : undefined,
 							title: input.title ?? null,
+							titleSlug: storedTitleSlug(input.title),
 							model: storedModel,
 							systemPrompt: input.systemPrompt ?? null,
 							permissionMode: resolvedPermMode,
@@ -2280,10 +2284,11 @@ export const narratorService = {
 	},
 
 	/**
-	 * Every team member's selector handles, for explicit Send/Await/ContextAsk
-	 * selector resolution and the TeamStatus bash scope. The membership is unbounded
-	 * on purpose — dropping a member would resolve a selector wrongly — but each row
-	 * is not: only `id`/`title`/`traits` are read, which is all
+	 * Addressable team members' selector handles, for explicit Send/Await/Watch
+	 * selector resolution and the TeamStatus bash scope. Archived members are
+	 * omitted: they are finished and no longer part of the team the caller can
+	 * address, so a selector must not land on them. Idle, working and waiting
+	 * members stay. Each row is only `id`/`title`/`traits`, which is all
 	 * `subagentMatchesSelector` and `agentLabelFromNarrator` look at. Callers re-read
 	 * the one matched target with `getById`. Reading full rows here pulled every
 	 * member's `systemPrompt`/`contextSummary` and blew the query result budget on
@@ -2313,7 +2318,7 @@ export const narratorService = {
 					.from(narrators)
 					.where(
 						and(
-							teamMembersWhere(rootId),
+							addressableTeamMembersWhere(rootId),
 							cursor
 								? or(
 										sql`${narrators.createdAt} > ${cursor.createdAt}`,
@@ -3058,6 +3063,7 @@ export const narratorService = {
 								inheritMode: "full",
 								status: "idle",
 								title: opts?.title ?? null,
+								titleSlug: storedTitleSlug(opts?.title),
 								createdAt: now,
 								updatedAt: now,
 							})
@@ -3303,6 +3309,7 @@ export const narratorService = {
 								contextToolsChars: inheritMode === "full" ? parent.contextToolsChars : 0,
 								status: "idle",
 								title: opts?.title ?? null,
+								titleSlug: storedTitleSlug(opts?.title),
 								createdAt: now,
 								updatedAt: now,
 							})

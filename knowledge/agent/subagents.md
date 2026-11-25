@@ -66,7 +66,7 @@ keywords:
   - subagent_nested_changed
   - FORK_NARRATOR_MAX_DEPTH
 status: draft
-verified_at: 69715f280
+verified_at: d8fe2a5ad
 ---
 # 子代理
 
@@ -92,7 +92,7 @@ verified_at: 69715f280
 - 模型来源与池：`subagent-model.ts` 与 `server/lib/runtime-source.ts` 决定子代理的模型和能力来自谁（显式存储的 `policy_source_narrator_id` 列与运行时登记，不靠父子关系推断），「跟随父级模型」用 `__parent__` 标记（`shared/model-inheritance.ts`），模型池与固定推理档位的形状在 `shared/subagent-model-policy.ts`、校验在 `lib/validators/subagent-models.ts`，运行中改模型走 `subagent-model-switch.ts`。登记的读写在 `narrator-runtime-registration.ts`（内部服务，没有路由，模型输入碰不到），旧委派在启动后补登记（`legacy-delegation-materializer.ts`）。
 - 资源上限（`agent-resource-caps.ts`）：每个子代理最多 3 个运行中终端、2 个浏览器会话，一棵团队树最多 6 个，进程内由代理启动的浏览器会话最多 20 个。
 - 嵌套层的展示与路由：第一层子代理卡片最多列 5 个下级（`shared/subagent-nested.ts`，`subagent-nested.ts`），嵌套子代理的事件还要送到 ACL 根的页面（`nested-subagent-routing.ts`）。
-- 结果与活动的投影：卡片结论文本（上限 120000 字符）取自 `shared/subagent-result-text.ts`，最近调用行的输入摘要取自 `shared/subagent-tool-summary.ts`，活动汇总在 `subagent-activity.ts`，别名与对人/模型的标签在 `subagent-alias.ts`、`subagent-label.ts`（`registerTaskAlias` 把标题当别名来源并 slug 化；`restoreTaskAlias` 按原样恢复已持久化的别名，只在本进程内别的 id 已占用时才加后缀，Watch 重启挂接用它）；实时输出字数在 `shared/subagent-output-counts.ts` 与前端 `useSubagentOutputCounts.ts`；`shared/agent-reference.ts` 是消息里 `#nf-agent=` 链接的封闭 URL 形状与排版常量。
+- 结果与活动的投影：卡片结论文本（上限 120000 字符）取自 `shared/subagent-result-text.ts`，最近调用行的输入摘要取自 `shared/subagent-tool-summary.ts`，活动汇总在 `subagent-activity.ts`，别名与对人/模型的标签在 `subagent-alias.ts`、`subagent-label.ts`。占用和 Send/Await/Watch 的选择是同一集合：这个父会话里仍可寻址的成员（`idle` / `working` / `waiting`，`addressableTeamMembersWhere`）。已归档且不在该集合里的别名不再被选中，也不占名，没有时间截止。候选名（基名、`基名-2`…）用 `narrators.title_slug`、`alias_selector` 和进行中的任务行做索引等值查询，按不同的值去重，重复标题填不满条数上限，不扫描历史，也不再因兄弟行数抛错。归档和取消归档只在调用者自己的子代理里解析：归档点可寻址成员，不跟旧的后台任务别名；取消归档只点已归档候选。精确 id 优先，同名多于一个就报错。选择器查询先按归档或可寻址状态过滤，再取有限行，所以活着的同名成员不会把已归档的挤出窗口。取消归档后 `reconcileRestoredSubagentAlias` 只给真正的团队成员重新登记（主会话分叉虽有 parent，也不写子代理别名）：活着的占用者留原名，恢复的那个拿空闲后缀，同一笔写入改掉它拥有的 agent 任务别名。TeamStatus `get_task` 的精确任务 id 仍指向那一行。别名在这个占用者有任务时丢掉其他已归档的 agent 任务，再按创建时间取最新一行，所以较新的 Bash 或传输盖过恢复的 agent，较新的归档 agent 不能盖过它。投递里恰有一个成员的持久别名或完整 id 等于选择器时，它压过别人的标题 slug。Send 的自动放行用同一次解析，审批对象和送达对象是同一个。ContextAsk 和 TeamStatus 的 file_changes 用历史查找：精确 id 能点到已归档成员，名字被复用时不猜；file_changes 只在汇报团队里查。团队外的精确 id 与不存在的会话同一句回复，不带标题。孙代理的别名留在它自己的父上。`registerTaskAlias` 把标题当别名来源并 slug 化；`restoreTaskAlias` 按原样恢复已持久化的别名，只在本进程内别的 id 已占用时才加后缀，Watch 重启挂接用它。`title_slug` 由写入和 `alias-selector-backfill.ts` 保持与 JS 的 `slugifyTaskAlias` 一致；实时输出字数在 `shared/subagent-output-counts.ts` 与前端 `useSubagentOutputCounts.ts`；`shared/agent-reference.ts` 是消息里 `#nf-agent=` 链接的封闭 URL 形状与排版常量。
 - 执行段与文件改动：子代理一次逻辑运行的执行段回执在 `subagent-execution-boundary.ts`，文件改动的有界元数据投影在 `subagent-file-changes.ts`（只有当前执行段内已落定的 v2 结果算精确行，旧 `file_attributions` 只是累计搅动量），团队级改动追踪在 `subagent-team.ts`，终端在 `subagent-terminals.ts`（列表上限 100）。
 - 其他：`subagent-extract.ts` 把子代理会话提取为独立的主叙述者（不是已移除的克隆，也不是普通 fork）；`subagent-knowledge-injection.ts` 对子代理收到的文本做被动知识注入；`subagent-takeover-broadcast.ts` 向父消息层广播接管/释放；`subagent-tools.ts` 按运行时策略过滤工具与 MCP 工具；`subagent-executor.ts` 只剩重试恢复的展示广播；自定义子代理的 REST 在 `routes/custom-subagents.ts`（`/api/custom-subagents`，列表/读取/创建/更新/删除），前端 `useCustomSubagents.ts`。
 

@@ -1,11 +1,21 @@
-import { asc, eq } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import { type ReadQueryOptions, readQuery, readQueryFirst } from "../db/worker-read";
 import { AsyncMutex, narratorTraitsLock } from "../lib/async-mutex";
-import { ValidationError } from "../lib/errors";
+import {
+	ADDRESSABLE_NARRATOR_STATUSES,
+	addressableTeamMembersWhere,
+	isTeamMember,
+	teamMembersWhere,
+} from "../lib/runtime-source";
+import { escapeLikeNeedle } from "../lib/sql-like";
 import { RuntimeReadConflictError } from "./agent-runtime/read-conflict";
 
 type AliasReadOptions = Pick<ReadQueryOptions, "signal" | "deadlineAt" | "timeoutMs">;
-const MAX_ALIAS_SCOPE_ROWS = 1000;
+
+/** Background-task statuses that are still in progress, independent of the narrator row. */
+const LIVE_TASK_STATUSES = ["running", "paused"] as const;
+/** How many candidate suffixes to probe in one indexed query. */
+const ALIAS_CANDIDATE_BATCH = 32;
 
 // === Background task alias registry ===
 // Provides human-readable aliases for background tasks (both Agent and Bash).
@@ -118,6 +128,12 @@ export function slugifyTaskAlias(text: string): string {
 		.slice(0, 40);
 }
 
+/** Column value for `narrators.title_slug`. Empty slug is stored as null. */
+export function storedTitleSlug(title: string | null | undefined): string | null {
+	if (!title) return null;
+	return slugifyTaskAlias(title) || null;
+}
+
 function getPersistedAliasTraits(traits: unknown): string[] {
 	return Array.isArray(traits)
 		? traits.filter(
@@ -191,7 +207,11 @@ export async function persistSubagentAlias(
 		];
 		db.transaction((tx) => {
 			const current = tx
-				.select({ parentNarratorId: narrators.parentNarratorId, traits: narrators.traits })
+				.select({
+					parentNarratorId: narrators.parentNarratorId,
+					traits: narrators.traits,
+					title: narrators.title,
+				})
 				.from(narrators)
 				.where(eq(narrators.id, subagentId))
 				.get();
@@ -201,23 +221,9 @@ export async function persistSubagentAlias(
 				JSON.stringify(current.traits) !== JSON.stringify(row.traits)
 			)
 				throw new RuntimeReadConflictError();
-			const siblings = tx
-				.select({ id: narrators.id, title: narrators.title, traits: narrators.traits })
-				.from(narrators)
-				.where(eq(narrators.parentNarratorId, parentNarratorId))
-				.limit(MAX_ALIAS_SCOPE_ROWS + 1)
-				.all();
-			const tasks = tx
-				.select({
-					id: backgroundTasks.id,
-					alias: backgroundTasks.alias,
-					subagentNarratorId: backgroundTasks.subagentNarratorId,
-				})
-				.from(backgroundTasks)
-				.where(eq(backgroundTasks.parentNarratorId, parentNarratorId))
-				.limit(MAX_ALIAS_SCOPE_ROWS + 1)
-				.all();
-			if (takenAliases(siblings, tasks, subagentId).has(alias))
+			if (
+				aliasTakenInTransaction(tx, narrators, backgroundTasks, parentNarratorId, subagentId, alias)
+			)
 				throw new RuntimeReadConflictError();
 			if (expected) {
 				let currentAlias: string | undefined = getPersistedSubagentAliases(current.traits)[0];
@@ -242,9 +248,31 @@ export async function persistSubagentAlias(
 				}
 				if (currentAlias !== expected.alias) throw new RuntimeReadConflictError();
 			}
+			const updatedAt = new Date().toISOString();
 			tx.update(narrators)
-				.set({ traits: nextTraits, updatedAt: new Date().toISOString() })
+				.set({
+					traits: nextTraits,
+					aliasSelector: alias,
+					titleSlug: storedTitleSlug(current.title),
+					updatedAt,
+				})
 				.where(eq(narrators.id, subagentId))
+				.run();
+			// The name printed at restore is the narrator alias. TeamStatus get_task
+			// looks up the owned agent task by that same string, so the task row
+			// changes in this write.
+			tx.update(backgroundTasks)
+				.set({ alias, updatedAt })
+				.where(
+					and(
+						eq(backgroundTasks.parentNarratorId, parentNarratorId),
+						eq(backgroundTasks.type, "agent"),
+						or(
+							eq(backgroundTasks.subagentNarratorId, subagentId),
+							eq(backgroundTasks.id, subagentId),
+						),
+					),
+				)
 				.run();
 		});
 	});
@@ -288,54 +316,430 @@ async function getExistingSubagentAlias(
 	}
 }
 
+interface AliasTaskRow {
+	id: string;
+	alias: string | null;
+	status: string;
+	type: string;
+	subagentNarratorId: string | null;
+}
+
+interface AddressableNarratorRow {
+	id: string;
+	parentNarratorId: string | null;
+	status: string;
+	runtimeRegistrationJson: unknown;
+}
+
+function candidateBatch(
+	base: string,
+	from: number,
+	count: number,
+): { aliases: string[]; next: number } {
+	const aliases: string[] = [];
+	let suffix = from;
+	while (aliases.length < count && suffix <= MAX_ALIAS_SUFFIX) {
+		aliases.push(suffix === 1 ? base : `${base}-${suffix}`);
+		suffix = suffix === 1 ? 2 : suffix + 1;
+	}
+	return { aliases, next: suffix };
+}
+
+function taskOwnerId(
+	task: Pick<AliasTaskRow, "id" | "type" | "subagentNarratorId">,
+): string | null {
+	if (task.subagentNarratorId) return task.subagentNarratorId;
+	if (task.type === "agent") return task.id;
+	return null;
+}
+
+function narratorRowIsAddressable(row: AddressableNarratorRow, parentNarratorId: string): boolean {
+	return (
+		row.parentNarratorId === parentNarratorId &&
+		(ADDRESSABLE_NARRATOR_STATUSES as readonly string[]).includes(row.status) &&
+		isTeamMember(row, parentNarratorId)
+	);
+}
+
+/**
+ * A task alias is still selectable when the task itself is in progress, or when
+ * the agent it names is still an addressable member of this parent. A finished
+ * task of an archived narrator is not.
+ */
+function taskRowIsAddressable(
+	task: AliasTaskRow,
+	owner: AddressableNarratorRow | undefined,
+	parentNarratorId: string,
+): boolean {
+	if ((LIVE_TASK_STATUSES as readonly string[]).includes(task.status)) return true;
+	return owner ? narratorRowIsAddressable(owner, parentNarratorId) : false;
+}
+
+function excludeTask(task: AliasTaskRow, excludeSubagentId: string): boolean {
+	return task.id === excludeSubagentId || task.subagentNarratorId === excludeSubagentId;
+}
+
+type AliasTables = Awaited<ReturnType<typeof loadAliasDb>>;
+
+function aliasTakenInTransaction(
+	tx: Parameters<Parameters<AliasTables["db"]["transaction"]>[0]>[0],
+	narrators: AliasTables["narrators"],
+	backgroundTasks: AliasTables["backgroundTasks"],
+	parentNarratorId: string,
+	excludeSubagentId: string,
+	alias: string,
+): boolean {
+	const scope = and(
+		addressableTeamMembersWhere(parentNarratorId),
+		ne(narrators.id, excludeSubagentId),
+	);
+	const narratorHit = (
+		column: typeof narrators.id | typeof narrators.titleSlug | typeof narrators.aliasSelector,
+	) =>
+		tx
+			.select({ id: narrators.id })
+			.from(narrators)
+			.where(and(scope, eq(column, alias)))
+			.limit(1)
+			.get();
+	if (
+		narratorHit(narrators.id) ||
+		narratorHit(narrators.titleSlug) ||
+		narratorHit(narrators.aliasSelector)
+	)
+		return true;
+	const taskColumns = {
+		id: backgroundTasks.id,
+		alias: backgroundTasks.alias,
+		status: backgroundTasks.status,
+		type: backgroundTasks.type,
+		subagentNarratorId: backgroundTasks.subagentNarratorId,
+	};
+	const liveTask = tx
+		.select(taskColumns)
+		.from(backgroundTasks)
+		.where(
+			and(
+				eq(backgroundTasks.parentNarratorId, parentNarratorId),
+				eq(backgroundTasks.alias, alias),
+				inArray(backgroundTasks.status, [...LIVE_TASK_STATUSES]),
+			),
+		)
+		.limit(1)
+		.get();
+	const latestTask = tx
+		.select(taskColumns)
+		.from(backgroundTasks)
+		.where(
+			and(eq(backgroundTasks.parentNarratorId, parentNarratorId), eq(backgroundTasks.alias, alias)),
+		)
+		.orderBy(desc(backgroundTasks.createdAt))
+		.limit(1)
+		.get();
+	const taskById = tx
+		.select(taskColumns)
+		.from(backgroundTasks)
+		.where(
+			and(eq(backgroundTasks.parentNarratorId, parentNarratorId), eq(backgroundTasks.id, alias)),
+		)
+		.limit(1)
+		.get();
+	const tasks = [liveTask, latestTask, taskById].filter((task) => task != null);
+	const ownersNeeded = tasks
+		.filter((task) => !excludeTask(task, excludeSubagentId))
+		.map((task) => taskOwnerId(task))
+		.filter((id): id is string => !!id);
+	const owners = new Map<string, AddressableNarratorRow>();
+	if (ownersNeeded.length > 0) {
+		for (const row of tx
+			.select({
+				id: narrators.id,
+				parentNarratorId: narrators.parentNarratorId,
+				status: narrators.status,
+				runtimeRegistrationJson: narrators.runtimeRegistrationJson,
+			})
+			.from(narrators)
+			.where(inArray(narrators.id, ownersNeeded))
+			.all())
+			owners.set(row.id, row);
+	}
+	return tasks.some((task) => {
+		if (excludeTask(task, excludeSubagentId)) return false;
+		const ownerId = taskOwnerId(task);
+		return taskRowIsAddressable(task, ownerId ? owners.get(ownerId) : undefined, parentNarratorId);
+	});
+}
+
+async function takenAmongCandidates(
+	parentNarratorId: string,
+	excludeSubagentId: string,
+	candidates: readonly string[],
+	options: AliasReadOptions,
+): Promise<Set<string>> {
+	const taken = new Set<string>();
+	if (candidates.length === 0) return taken;
+	const wanted = new Set(candidates);
+	const { db, backgroundTasks, narrators } = await loadAliasDb();
+	const scope = and(
+		addressableTeamMembersWhere(parentNarratorId),
+		ne(narrators.id, excludeSubagentId),
+	);
+	const readOptions = {
+		...options,
+		executionPolicy: "worker-required" as const,
+		maxRows: Math.max(candidates.length, 1),
+	};
+	// Distinct values, not rows. Many addressable members can share one title slug;
+	// a row limit of `candidates.length` would hide another candidate those duplicates
+	// pushed past the limit.
+	const selectorValues = (
+		column: typeof narrators.id | typeof narrators.titleSlug | typeof narrators.aliasSelector,
+	) =>
+		readQuery(
+			db
+				.selectDistinct({ value: column })
+				.from(narrators)
+				.where(and(scope, inArray(column, [...candidates])))
+				.limit(candidates.length),
+			readOptions,
+		);
+	const notThisOwner = and(
+		ne(backgroundTasks.id, excludeSubagentId),
+		or(
+			isNull(backgroundTasks.subagentNarratorId),
+			ne(backgroundTasks.subagentNarratorId, excludeSubagentId),
+		),
+	);
+	const taskColumns = {
+		id: backgroundTasks.id,
+		alias: backgroundTasks.alias,
+		status: backgroundTasks.status,
+		type: backgroundTasks.type,
+		subagentNarratorId: backgroundTasks.subagentNarratorId,
+	};
+	const [ids, slugs, aliases, liveTasks, tasksById, latestTasks] = await Promise.all([
+		selectorValues(narrators.id),
+		selectorValues(narrators.titleSlug),
+		selectorValues(narrators.aliasSelector),
+		readQuery(
+			db
+				.selectDistinct({ alias: backgroundTasks.alias })
+				.from(backgroundTasks)
+				.where(
+					and(
+						eq(backgroundTasks.parentNarratorId, parentNarratorId),
+						inArray(backgroundTasks.alias, [...candidates]),
+						inArray(backgroundTasks.status, [...LIVE_TASK_STATUSES]),
+						notThisOwner,
+					),
+				)
+				.limit(candidates.length),
+			readOptions,
+		),
+		readQuery(
+			db
+				.select(taskColumns)
+				.from(backgroundTasks)
+				.where(
+					and(
+						eq(backgroundTasks.parentNarratorId, parentNarratorId),
+						inArray(backgroundTasks.id, [...candidates]),
+						notThisOwner,
+					),
+				)
+				.limit(candidates.length),
+			readOptions,
+		),
+		Promise.all(
+			candidates.map((candidate) =>
+				readQueryFirst(
+					db
+						.select(taskColumns)
+						.from(backgroundTasks)
+						.where(
+							and(
+								eq(backgroundTasks.parentNarratorId, parentNarratorId),
+								eq(backgroundTasks.alias, candidate),
+								notThisOwner,
+							),
+						)
+						.orderBy(desc(backgroundTasks.createdAt))
+						.limit(1),
+					{ ...readOptions, maxRows: 1 },
+				),
+			),
+		),
+	]);
+	for (const row of [...ids, ...slugs, ...aliases]) {
+		if (row.value && wanted.has(row.value)) taken.add(row.value);
+	}
+	for (const row of liveTasks) {
+		if (row.alias && wanted.has(row.alias)) taken.add(row.alias);
+	}
+	const tasks = new Map<string, AliasTaskRow>();
+	for (const task of [...tasksById, ...latestTasks]) {
+		if (task) tasks.set(task.id, task);
+	}
+	const ownerIds = [
+		...new Set(
+			[...tasks.values()]
+				.filter(
+					(task) =>
+						!excludeTask(task, excludeSubagentId) &&
+						!(LIVE_TASK_STATUSES as readonly string[]).includes(task.status),
+				)
+				.map((task) => taskOwnerId(task))
+				.filter((id): id is string => !!id),
+		),
+	];
+	const owners = new Map<string, AddressableNarratorRow>();
+	if (ownerIds.length > 0) {
+		const rows = await readQuery(
+			db
+				.select({
+					id: narrators.id,
+					parentNarratorId: narrators.parentNarratorId,
+					status: narrators.status,
+					runtimeRegistrationJson: narrators.runtimeRegistrationJson,
+				})
+				.from(narrators)
+				.where(inArray(narrators.id, ownerIds))
+				.limit(ownerIds.length),
+			{ ...readOptions, maxRows: ownerIds.length },
+		);
+		for (const row of rows) owners.set(row.id, row);
+	}
+	for (const task of tasks.values()) {
+		if (excludeTask(task, excludeSubagentId)) continue;
+		const ownerId = taskOwnerId(task);
+		if (!taskRowIsAddressable(task, ownerId ? owners.get(ownerId) : undefined, parentNarratorId))
+			continue;
+		if (task.alias && wanted.has(task.alias)) taken.add(task.alias);
+		if (wanted.has(task.id)) taken.add(task.id);
+	}
+	return taken;
+}
+
+/**
+ * Which of `base`, `base-2`, `base-3`, … are already taken by an addressable
+ * member of this parent. Stops at the first free candidate so a long archived
+ * history is never loaded. The returned set contains only the taken prefix.
+ */
 async function getPersistedTakenAliases(
 	parentNarratorId: string,
 	excludeSubagentId: string,
 	options: AliasReadOptions = {},
+	base?: string,
+	alsoTaken?: (alias: string) => boolean,
 ): Promise<Set<string>> {
-	const { db, backgroundTasks, narrators } = await loadAliasDb();
-	const siblings = await readQuery(
-		db.query.narrators.findMany({
-			where: eq(narrators.parentNarratorId, parentNarratorId),
-			columns: { id: true, title: true, traits: true },
-			orderBy: asc(narrators.id),
-			limit: MAX_ALIAS_SCOPE_ROWS + 1,
-		}),
-		{ ...options, executionPolicy: "worker-required", maxRows: MAX_ALIAS_SCOPE_ROWS + 1 },
-	);
-	const tasks = await readQuery(
-		db.query.backgroundTasks.findMany({
-			where: eq(backgroundTasks.parentNarratorId, parentNarratorId),
-			columns: { id: true, alias: true, subagentNarratorId: true },
-			orderBy: asc(backgroundTasks.id),
-			limit: MAX_ALIAS_SCOPE_ROWS + 1,
-		}),
-		{ ...options, executionPolicy: "worker-required", maxRows: MAX_ALIAS_SCOPE_ROWS + 1 },
-	);
-	return takenAliases(siblings, tasks, excludeSubagentId);
-}
-
-function takenAliases(
-	siblings: { id: string; title: string | null; traits: unknown }[],
-	tasks: { id: string; alias: string | null; subagentNarratorId: string | null }[],
-	excludeSubagentId: string,
-): Set<string> {
-	if (siblings.length > MAX_ALIAS_SCOPE_ROWS || tasks.length > MAX_ALIAS_SCOPE_ROWS)
-		throw new ValidationError("Subagent alias scope exceeds its row budget");
+	if (!base) return new Set();
 	const taken = new Set<string>();
-	for (const sibling of siblings) {
-		if (sibling.id === excludeSubagentId) continue;
-		taken.add(sibling.id);
-		const titleAlias = sibling.title ? slugifyTaskAlias(sibling.title) : "";
-		if (titleAlias) taken.add(titleAlias);
-		for (const alias of getPersistedSubagentAliases(sibling.traits)) taken.add(alias);
-	}
-	for (const task of tasks) {
-		if (task.subagentNarratorId === excludeSubagentId || task.id === excludeSubagentId) continue;
-		taken.add(task.id);
-		if (task.alias) taken.add(task.alias);
+	let suffix = 1;
+	while (suffix <= MAX_ALIAS_SUFFIX) {
+		const batch = candidateBatch(base, suffix, suffix === 1 ? 1 : ALIAS_CANDIDATE_BATCH);
+		if (batch.aliases.length === 0) break;
+		suffix = batch.next;
+		const hit = await takenAmongCandidates(
+			parentNarratorId,
+			excludeSubagentId,
+			batch.aliases,
+			options,
+		);
+		let foundFree = false;
+		for (const alias of batch.aliases) {
+			const occupied = hit.has(alias) || (alsoTaken?.(alias) ?? false);
+			if (occupied) taken.add(alias);
+			else {
+				foundFree = true;
+				break;
+			}
+		}
+		if (foundFree) return taken;
 	}
 	return taken;
+}
+
+/**
+ * Narrators under this parent whose stored id, alias or title slug equals
+ * `selector`. Each lookup is an equality (or an id prefix) so it does not scan
+ * the parent's history.
+ *
+ * `membership` is applied before the row limit. Filtering after the limit lets
+ * live title matches fill the window and hide an archived sibling.
+ */
+export async function findSubagentIdsBySelector(
+	parentNarratorId: string,
+	selector: string,
+	options: AliasReadOptions & { membership?: "archived" | "addressable" } = {},
+): Promise<string[]> {
+	const normalized = selector.trim();
+	if (!normalized) return [];
+	const { membership, ...read } = options;
+	const { db, narrators } = await loadAliasDb();
+	const scope = teamMembersWhere(parentNarratorId);
+	const statusWhere =
+		membership === "archived"
+			? eq(narrators.status, "archived")
+			: membership === "addressable"
+				? inArray(narrators.status, [...ADDRESSABLE_NARRATOR_STATUSES])
+				: undefined;
+	const readOptions = { ...read, executionPolicy: "worker-required" as const, maxRows: 5 };
+	const ids = new Set<string>();
+	const collect = async (query: Parameters<typeof readQuery>[0]) => {
+		const rows = (await readQuery(query, readOptions)) as { id: string }[];
+		for (const row of rows) ids.add(row.id);
+	};
+	const newest = [desc(narrators.createdAt), desc(narrators.id)] as const;
+	await collect(
+		db
+			.select({ id: narrators.id })
+			.from(narrators)
+			.where(
+				and(
+					eq(narrators.parentNarratorId, parentNarratorId),
+					eq(narrators.id, normalized),
+					statusWhere,
+				),
+			)
+			.orderBy(...newest)
+			.limit(1),
+	);
+	await collect(
+		db
+			.select({ id: narrators.id })
+			.from(narrators)
+			.where(and(scope, eq(narrators.aliasSelector, normalized), statusWhere))
+			.orderBy(...newest)
+			.limit(5),
+	);
+	await collect(
+		db
+			.select({ id: narrators.id })
+			.from(narrators)
+			.where(and(scope, eq(narrators.titleSlug, normalized), statusWhere))
+			.orderBy(...newest)
+			.limit(5),
+	);
+	await collect(
+		db
+			.select({ id: narrators.id })
+			.from(narrators)
+			.where(and(scope, eq(narrators.title, normalized), statusWhere))
+			.orderBy(...newest)
+			.limit(5),
+	);
+	const like = escapeLikeNeedle(normalized);
+	if (like && normalized.length >= 2 && normalized.length < 21) {
+		await collect(
+			db
+				.select({ id: narrators.id })
+				.from(narrators)
+				.where(and(scope, sql`${narrators.id} LIKE ${`${like}%`} ESCAPE '\\'`, statusWhere))
+				.orderBy(...newest)
+				.limit(5),
+		);
+	}
+	return [...ids];
 }
 
 export interface SubagentAliasPersistenceAdapter {
@@ -348,6 +752,8 @@ export interface SubagentAliasPersistenceAdapter {
 		parentNarratorId: string,
 		excludeSubagentId: string,
 		options?: AliasReadOptions,
+		base?: string,
+		alsoTaken?: (alias: string) => boolean,
 	): Promise<Set<string>>;
 	persistAlias(
 		parentNarratorId: string,
@@ -399,6 +805,11 @@ export async function registerAndPersistSubagentAlias(
 			parentNarratorId,
 			subagentId,
 			options,
+			base,
+			(candidate) => {
+				const memoryOwner = reg.aliasToId.get(candidate);
+				return memoryOwner !== undefined && memoryOwner !== subagentId;
+			},
 		);
 		const isTaken = (candidate: string) => {
 			const memoryOwner = reg.aliasToId.get(candidate);
@@ -421,6 +832,34 @@ export async function registerAndPersistSubagentAlias(
 		setRegistryAlias(reg, subagentId, alias);
 		return { alias, conflicted: conflicted || alias !== base };
 	});
+}
+
+/**
+ * After an archived subagent becomes addressable again, give it a free alias
+ * when a sibling already holds the one it had. The live owner keeps that name.
+ *
+ * Membership is the team grant, not `parentNarratorId`: a primary session fork
+ * also stores a parent and must not gain a subagent alias.
+ */
+export async function reconcileRestoredSubagentAlias(narratorId: string): Promise<void> {
+	const { db, narrators } = await loadAliasDb();
+	const row = await readQueryFirst(
+		db
+			.select({
+				id: narrators.id,
+				parentNarratorId: narrators.parentNarratorId,
+				status: narrators.status,
+				runtimeRegistrationJson: narrators.runtimeRegistrationJson,
+			})
+			.from(narrators)
+			.where(eq(narrators.id, narratorId))
+			.limit(1),
+		{ executionPolicy: "worker-required", maxRows: 1 },
+	);
+	if (!row?.parentNarratorId) return;
+	if (!isTeamMember(row, row.parentNarratorId)) return;
+	if (!(ADDRESSABLE_NARRATOR_STATUSES as readonly string[]).includes(row.status)) return;
+	await registerAndPersistSubagentAlias(row.parentNarratorId, narratorId);
 }
 
 /**

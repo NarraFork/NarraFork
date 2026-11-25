@@ -36,7 +36,7 @@
  *   large fields (`output`, `input_json`, message bodies) are selected.
  */
 
-import { inArray } from "drizzle-orm";
+import { and, inArray, ne } from "drizzle-orm";
 import { db } from "../db";
 import { backgroundTasks, narrators } from "../db/schema";
 import { RUNTIME_SOURCE_COLUMNS, teamMembersWhere, teamRootOf } from "../lib/runtime-source";
@@ -400,7 +400,7 @@ export async function resolveAwaitAgentNarratorIds(
 	try {
 		const [roster, tasks] = await Promise.all([
 			db.query.narrators.findMany({
-				where: teamMembersWhere(teamParentId),
+				where: and(teamMembersWhere(teamParentId), ne(narrators.status, "archived")),
 				columns: { id: true, title: true, traits: true, variant: true },
 			}),
 			db.query.backgroundTasks.findMany({
@@ -422,18 +422,28 @@ export async function resolveAwaitAgentNarratorIds(
 		]);
 		if (roster.length === 0 && tasks.length === 0) return resolved;
 
+		const rosterById = new Map(roster.map((target) => [target.id, target]));
 		const taskAliasToSubagentId = new Map<string, string>();
 		const sendTaskAliases = new Map<string, Map<string, { id: string; createdAt: string }>>();
 		for (const task of tasks) {
 			// Preserve Await's agent-task fallback; Send's aliases additionally honor
 			// the latest non-agent task reusing an alias, just like getByAlias.
+			// An archived narrator is not in the roster, so its task alias is not a target.
 			const subagentId =
 				task.subagentNarratorId ?? (task.type === "agent" ? task.id : (task.alias ?? ""));
-			if (task.type === "agent" && task.parentNarratorId === teamParentId) {
+			if (
+				task.type === "agent" &&
+				task.parentNarratorId === teamParentId &&
+				rosterById.has(subagentId)
+			) {
 				taskAliasToSubagentId.set(task.id, subagentId);
 				if (task.alias) taskAliasToSubagentId.set(task.alias, subagentId);
 			}
-			if (task.parentNarratorId && task.alias) {
+			if (
+				task.parentNarratorId &&
+				task.alias &&
+				(task.type !== "agent" || rosterById.has(subagentId))
+			) {
 				let aliases = sendTaskAliases.get(task.parentNarratorId);
 				if (!aliases) {
 					aliases = new Map();
@@ -449,7 +459,6 @@ export async function resolveAwaitAgentNarratorIds(
 			}
 		}
 
-		const rosterById = new Map(roster.map((target) => [target.id, target]));
 		for (const entry of pending) {
 			if (entry.send) {
 				// Match Send's caller-first alias lookup, and never allow a task pointer

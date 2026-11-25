@@ -67,6 +67,10 @@ import {
 } from "@shared/storage-transfer";
 import archiver from "archiver";
 import { sqlite } from "../db";
+import {
+	backfillNarratorAliasSelectors,
+	recomputeNarratorAliasSelectors,
+} from "../db/alias-selector-backfill";
 import { getDbPath } from "../db/connection";
 import { buildSnapshotInSubprocess } from "../db/snapshot-build";
 import { SNAPSHOT_TABLES } from "../db/snapshot-protocol";
@@ -1168,6 +1172,7 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 
 			const rejected: string[] = [];
 			const skipped: string[] = [];
+			const touchedNarratorIds: string[] = [];
 			if (include.sessions) {
 				const existing = new Set(
 					(sqlite.prepare(`SELECT id FROM main.narrators`).all() as Array<{ id: string }>).map(
@@ -1184,6 +1189,7 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 						// 仍被其它唯一约束挡住时，会话进不来，它的子行必须一起跳过。
 						if (sqlite.prepare(`SELECT 1 FROM main.narrators WHERE id = ?`).get(id)) {
 							counts.sessionsInserted += 1;
+							touchedNarratorIds.push(id);
 						} else {
 							rejected.push(id);
 						}
@@ -1219,6 +1225,7 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 						[id],
 					);
 					counts.sessionsOverwritten += 1;
+					touchedNarratorIds.push(id);
 				}
 				counts.sessionsRejected = rejected.length;
 				if (rejected.length > 0) {
@@ -1249,6 +1256,11 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 					excludeNarrators: excludedNarrators,
 				});
 				reconcileImportedTeamTraits(attachName);
+				// Overwrite keeps destination selector columns when the snapshot predates
+				// them. Recompute from the title and traits just written; skip leaves
+				// those rows alone. The null-only backfill still fills every other row.
+				recomputeNarratorAliasSelectors(sqlite, touchedNarratorIds);
+				backfillNarratorAliasSelectors(sqlite, { ownTransaction: false });
 				copyTable(attachName, "folder_git_identity_bindings");
 				removeInvalidFolderIdentityBindings(baselines.get("folder_git_identity_bindings") ?? 0);
 				if (

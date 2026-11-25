@@ -15,6 +15,7 @@ anchors:
   - server/db/run-migrations.ts
   - server/db/migrate.ts
   - server/db/data-backfills.ts
+  - server/db/alias-selector-backfill.ts
   - server/db/legacy-request-storage.ts
   - server/db/migrate-narrator-drafts.ts
   - server/db/migrate-role-to-disp.ts
@@ -42,7 +43,7 @@ keywords:
   - __agg__
   - auto: 前缀
 status: draft
-verified_at: 7a8bdfb90
+verified_at: bfb277f05
 ---
 # 迁移（SQLite 与 PostgreSQL）
 
@@ -56,7 +57,7 @@ verified_at: 7a8bdfb90
 - 运行时：`server/db/migrate.ts` 按后端选择——PG 走 `runPostgresMigrationsOnce`，SQLite 走 `run-migrations.ts:runMigrations`。源码运行且 `./drizzle` 存在时读文件系统；编译后的二进制只用随构建内嵌的迁移数据（`server/generated/embedded-migrations-data`），没有有效内嵌数据则拒绝启动（`resolveMigrationsFolder`）。
 - `run-migrations.ts` 还含大量针对历史库的修复和按 hash 补迁移逻辑（`applyPendingMigrationsByHash` 等），测试在 `run-migrations.test.ts`。
 - `scripts/check-sqlite-migration-assets.ts` 校验 SQLite 迁移资产（文件数、体积、journal 结构）。
-- 启动期数据回填（不是 drizzle 迁移）：`data-backfills.ts:applySqliteDataBackfills` 由 SQLite 生命周期适配器调用（`server/db/index.ts`），内容是叙述者 status/substatus 旧值折叠、trait、草稿隐私迁移等（草稿部分 `migrate-narrator-drafts.ts:migrateLegacyNarratorDraftTraits`）。
+- 启动期数据回填（不是 drizzle 迁移）：`data-backfills.ts:applySqliteDataBackfills` 由 SQLite 生命周期适配器调用（`server/db/index.ts`），内容是叙述者 status/substatus 旧值折叠、trait、草稿隐私迁移等（草稿部分 `migrate-narrator-drafts.ts:migrateLegacyNarratorDraftTraits`），以及 `alias-selector-backfill.ts` 只给仍为 NULL 的 `narrators.title_slug` / `alias_selector` 补值。导入覆盖后的重算在 `recomputeNarratorAliasSelectors`，不在启动回填里。
 - 迁移 0207（`drop_legacy_request_dumps`）的物理半边由 `legacy-request-storage.ts` 拆开：先删便宜的修复表与部分索引；`api_requests` 三列删除要重写整表，所以在仍保留请求转储时延后（回执前缀 `LEGACY_REQUEST_RETIREMENT_RECEIPT_PREFIX`），管理员在存储页分批清转储后下次启动补完（`run-migrations.ts` 里调用 `retireLegacyRequestStorage` / `completeDeferredLegacyRequestRetirement`）。
 - 模型聚合值迁移（`__agg__:<id>` → `auto:<model>`）：纯规则在 `shared/aggregation-migration.ts`，由 `main.ts` 启动后调用 `migrateAggregationsOnStartup`；`server/services/migration-db.ts` 让同一份查询在 SQLite（同步事务）和 PG（异步事务）上都能跑。
 - `migrate-role-to-disp.ts`（把 `role='system'` 改成 `disp`）和 `test-role-migration.ts` 是手动执行的一次性脚本，不在启动路径上；两者在 `narrator-body-access.guard.test.ts`、`narrator-history-writers.guard.test.ts` 里作为「一次性」例外登记。

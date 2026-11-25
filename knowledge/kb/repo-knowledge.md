@@ -22,7 +22,7 @@ keywords:
   - 改它时
   - TEAM_WORK_ITEM_KNOWLEDGE_STALE
 status: draft
-verified_at: 0bb5312c7
+verified_at: 001ccbf7d
 ---
 # 仓库知识树
 
