@@ -17,6 +17,7 @@ import {
 	CHAT_DRAFT_ATTACHMENT_TTL_MS,
 	deleteChatAttachmentFiles,
 	getChatAttachmentsDir,
+	isChatAttachmentPublishing,
 	listStoredChatAttachmentNames,
 } from "../lib/chat-attachments";
 import { coordinatorOutputsRoot } from "../lib/coordinator-outputs-path";
@@ -1161,8 +1162,13 @@ export async function cleanupOrphanedChatAttachments(): Promise<{
 		);
 		for (const storedName of listStoredChatAttachmentNames(roomId)) {
 			if (known.has(storedName)) continue;
-			// A row published after the room read keeps its file.
-			if (chatAttachmentRecordedNow(roomId, storedName)) continue;
+			// A file still being published, or whose row was published after the room read,
+			// is kept. Both checks run in one synchronous step.
+			if (
+				isChatAttachmentPublishing(roomId, storedName) ||
+				chatAttachmentRecordedNow(roomId, storedName)
+			)
+				continue;
 			const filePath = resolve(dirPath, storedName);
 			try {
 				const size = (await stat(filePath)).size;

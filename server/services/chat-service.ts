@@ -48,6 +48,7 @@ import {
 	CHAT_DRAFT_ATTACHMENTS_MAX,
 	copyChatAttachmentToWorktree,
 	deleteChatAttachmentFiles,
+	finishChatAttachmentPublication,
 	getChatAttachmentFileInfo,
 	saveChatAttachment,
 } from "@server/lib/chat-attachments";
@@ -2123,62 +2124,66 @@ export async function createChatAttachment(
 
 	const saved = await saveChatAttachment(roomId, file);
 	const id = generateId();
-	let publicationAttempted = false;
 	try {
-		options.signal?.throwIfAborted();
-		await assertCanPost(roomId, userId);
-		options.signal?.throwIfAborted();
-		publicationAttempted = true;
-		await db.insert(chatAttachments).values({
-			id,
-			roomId,
-			messageId: null,
-			uploaderUserId: userId,
-			kind: saved.kind,
-			filename: saved.filename,
-			mediaType: saved.mediaType,
-			sizeBytes: saved.sizeBytes,
-			width: saved.width ?? null,
-			height: saved.height ?? null,
-			storedName: saved.storedName,
-			createdAt: nowIso(),
-			claimedAt: null,
-		});
-	} catch (error) {
-		let safeToRemove = !publicationAttempted;
-		if (publicationAttempted) {
-			try {
-				const current = await readQuery(
-					db.query.chatAttachments.findFirst({
-						where: and(
-							eq(chatAttachments.roomId, roomId),
-							eq(chatAttachments.storedName, saved.storedName),
-						),
-						columns: { id: true },
-					}),
-					{ executionPolicy: "worker-required", signal: options.signal },
-				);
-				safeToRemove = !current;
-			} catch (verificationError) {
-				logger.warn("Failed to verify attachment publication during rollback", {
-					roomId,
-					attachmentId: id,
-					error: String(verificationError),
-				});
+		let publicationAttempted = false;
+		try {
+			options.signal?.throwIfAborted();
+			await assertCanPost(roomId, userId);
+			options.signal?.throwIfAborted();
+			publicationAttempted = true;
+			await db.insert(chatAttachments).values({
+				id,
+				roomId,
+				messageId: null,
+				uploaderUserId: userId,
+				kind: saved.kind,
+				filename: saved.filename,
+				mediaType: saved.mediaType,
+				sizeBytes: saved.sizeBytes,
+				width: saved.width ?? null,
+				height: saved.height ?? null,
+				storedName: saved.storedName,
+				createdAt: nowIso(),
+				claimedAt: null,
+			});
+		} catch (error) {
+			let safeToRemove = !publicationAttempted;
+			if (publicationAttempted) {
+				try {
+					const current = await readQuery(
+						db.query.chatAttachments.findFirst({
+							where: and(
+								eq(chatAttachments.roomId, roomId),
+								eq(chatAttachments.storedName, saved.storedName),
+							),
+							columns: { id: true },
+						}),
+						{ executionPolicy: "worker-required", signal: options.signal },
+					);
+					safeToRemove = !current;
+				} catch (verificationError) {
+					logger.warn("Failed to verify attachment publication during rollback", {
+						roomId,
+						attachmentId: id,
+						error: String(verificationError),
+					});
+				}
 			}
-		}
-		if (safeToRemove) {
-			try {
-				deleteChatAttachmentFiles([{ roomId, storedName: saved.storedName }]);
-			} catch (cleanupError) {
-				logger.warn("Failed to clean up unpublished chat attachment", {
-					roomId,
-					attachmentId: id,
-					error: String(cleanupError),
-				});
+			if (safeToRemove) {
+				try {
+					deleteChatAttachmentFiles([{ roomId, storedName: saved.storedName }]);
+				} catch (cleanupError) {
+					logger.warn("Failed to clean up unpublished chat attachment", {
+						roomId,
+						attachmentId: id,
+						error: String(cleanupError),
+					});
+				}
 			}
+			throw error;
 		}
-		throw error;
+	} finally {
+		finishChatAttachmentPublication(roomId, saved.storedName);
 	}
 
 	return {

@@ -338,6 +338,26 @@ export const scheduledTaskService = {
 			// so a persistent failure doesn't wedge the schedule.
 			const nextRunAt = task.enabled ? nextCronRun(task.cronExpr, task.timezone) : null;
 
+			if (!opts.manual) {
+				// `listDue` and the read above run on a Worker, so the task can be disabled or
+				// rescheduled before we get here. Claim the run in the write itself: it only
+				// succeeds while the row is still enabled and due, and it re-arms the schedule.
+				const claimedAt = now();
+				const claim = db
+					.update(scheduledTasks)
+					.set({ nextRunAt, updatedAt: claimedAt })
+					.where(
+						and(
+							eq(scheduledTasks.id, id),
+							eq(scheduledTasks.enabled, true),
+							lte(scheduledTasks.nextRunAt, claimedAt),
+						),
+					)
+					.returning({ id: scheduledTasks.id })
+					.all();
+				if (claim.length === 0) return;
+			}
+
 			const startedAt = now();
 			const startMs = Date.now();
 			let status: "success" | "failed" | "skipped" = "success";
@@ -379,8 +399,8 @@ export const scheduledTaskService = {
 					lastError: error,
 					lastNarratorId: narratorId ?? task.lastNarratorId,
 					reuseNarratorId,
-					// A manual trigger doesn't disturb the cron cadence unless enabled.
-					...(opts.manual ? {} : { nextRunAt }),
+					// The automatic claim already re-armed nextRunAt; a manual trigger leaves it
+					// alone. Not writing it here keeps an edit made during the run.
 					updatedAt: finishedAt,
 				})
 				.where(eq(scheduledTasks.id, id));

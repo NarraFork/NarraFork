@@ -4,7 +4,11 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { cleanDb } from "../../../tests/setup";
-import { setChatAttachmentsDirForTests } from "../../lib/chat-attachments";
+import {
+	finishChatAttachmentPublication,
+	saveChatAttachment,
+	setChatAttachmentsDirForTests,
+} from "../../lib/chat-attachments";
 import { DbReadError } from "../../lib/db-worker/errors";
 import * as pool from "../../lib/db-worker/pool";
 import { closeRuntimeTestDb, getRuntimeTestDb } from "./agent-runtime-test-database";
@@ -105,6 +109,17 @@ describe("chat attachment cleanup", () => {
 		afterRead(3, () => seedAttachment("late", "room", "message"));
 		await cleanupOrphanedChatAttachments();
 		expect(existsSync(join(root, "room", "late.txt"))).toBe(true);
+	});
+
+	test("a file whose upload has not committed its row yet is kept until publication ends", async () => {
+		seedRoom("room");
+		const saved = await saveChatAttachment("room", new File(["body"], "notes.md"));
+		await cleanupOrphanedChatAttachments();
+		expect(existsSync(saved.filePath)).toBe(true);
+		// The upload rolled back without a row: the file is now an ordinary orphan.
+		finishChatAttachmentPublication("room", saved.storedName);
+		await cleanupOrphanedChatAttachments();
+		expect(existsSync(saved.filePath)).toBe(false);
 	});
 
 	test("an unavailable Worker fails the cleanup before anything is deleted", async () => {

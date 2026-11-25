@@ -1,5 +1,5 @@
 import { readdir } from "node:fs/promises";
-import { and, eq, isNull } from "drizzle-orm";
+import { and, asc, eq, gt, isNull } from "drizzle-orm";
 import { db } from "../db";
 import { narrators, terminals } from "../db/schema";
 import { readQuery } from "../db/worker-read";
@@ -37,6 +37,10 @@ import {
 	suspendTerminalWatchesForShutdown,
 } from "./terminal-watch-service";
 import { assertLegacyRuntimeOwner } from "./worktree-resource-owner";
+
+/** Unowned terminals read per page, and pages walked, before a worktree removal. */
+const WORKTREE_TERMINAL_SCAN_PAGE = 500;
+const WORKTREE_TERMINAL_SCAN_MAX_PAGES = 40;
 
 const DEFAULT_SHELL = detectShell().path;
 
@@ -1025,15 +1029,37 @@ export const terminalService = {
 		}
 		const path = input.worktreePath ?? null;
 		if (path) {
-			const owned = await readQuery(
-				db.query.terminals.findMany({
-					where: isNull(terminals.worktreeResourceId),
-					limit: 500,
-				}),
-				{ executionPolicy: "worker-required", maxRows: 500 },
-			);
-			for (const terminal of owned) {
-				if (terminal.cwd && localPathSemantics.contains(path, terminal.cwd)) matched.push(terminal);
+			// Containment is checked in JS (path semantics), so every unowned terminal has to be
+			// seen. Walk them in id order; a scan that cannot finish fails the retirement rather
+			// than leaving a shell running inside a removed checkout.
+			let after: string | null = null;
+			for (let page = 0; ; page++) {
+				if (page >= WORKTREE_TERMINAL_SCAN_MAX_PAGES)
+					throw new AppError(
+						"Too many terminals to check before removing this worktree",
+						409,
+						"WORKTREE_REMOVAL_TERMINAL_SCAN_INCOMPLETE",
+					);
+				const owned: (typeof terminals.$inferSelect)[] = await readQuery(
+					db
+						.select()
+						.from(terminals)
+						.where(
+							and(
+								isNull(terminals.worktreeResourceId),
+								after === null ? undefined : gt(terminals.id, after),
+							),
+						)
+						.orderBy(asc(terminals.id))
+						.limit(WORKTREE_TERMINAL_SCAN_PAGE),
+					{ executionPolicy: "worker-required", maxRows: WORKTREE_TERMINAL_SCAN_PAGE },
+				);
+				for (const terminal of owned) {
+					if (terminal.cwd && localPathSemantics.contains(path, terminal.cwd))
+						matched.push(terminal);
+				}
+				if (owned.length < WORKTREE_TERMINAL_SCAN_PAGE) break;
+				after = owned[owned.length - 1].id;
 			}
 		}
 		const ids = [...new Set(matched.map((terminal) => terminal.id))];
