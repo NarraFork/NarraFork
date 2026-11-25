@@ -524,7 +524,11 @@ export async function fetchAllNugQuotas(): Promise<void> {
 			const quotaSubject = captureNugQuotaSubject(p);
 			const data = await fetchNugQuota(quotaSubject.config);
 			if (data) {
-				setNugCachedQuota(p.id, buildNugQuotaCache(data, getNugCachedQuota(p.id)), quotaSubject);
+				setNugCachedQuota(
+					p.id,
+					buildNugQuotaCache(data, getNugCachedQuota(p.id, quotaSubject)),
+					quotaSubject,
+				);
 				logger.debug("NUG quota fetched on startup", {
 					provider: p.name,
 					balance: data.balance,
@@ -804,7 +808,11 @@ nugRoutes.get("/providers/:id/quota", async (c) => {
 	try {
 		const data = (await entry.provider.getQuota()) as unknown as Record<string, unknown>;
 		const responseData = normalizeNugQuotaResponse(data);
-		setNugCachedQuota(id, buildNugQuotaCache(data, getNugCachedQuota(id)), entry.quotaSubject);
+		setNugCachedQuota(
+			id,
+			buildNugQuotaCache(data, getNugCachedQuota(id, entry.quotaSubject)),
+			entry.quotaSubject,
+		);
 		return c.json(responseData);
 	} catch (err: unknown) {
 		const msg = err instanceof Error ? err.message : "Unknown error";

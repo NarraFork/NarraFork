@@ -214,13 +214,10 @@ export function getNugQuotaSnapshot(
 		: undefined;
 }
 
-export function setNugCachedQuota(
-	providerId: string,
-	cache: NugQuotaCache,
+function matchingSubject(
+	config: NUGProviderConfig,
 	expectedConfig?: NUGProviderConfig | CapturedNugQuotaSubject,
-): void {
-	const config = (settings.nugProviders ?? []).find((provider) => provider.id === providerId);
-	if (!config) return;
+): NugQuotaSubject | undefined {
 	const captured = expectedConfig !== undefined && "config" in expectedConfig;
 	const credential = subject(config, captured ? expectedConfig.id : undefined);
 	if (!credential) return;
@@ -231,6 +228,17 @@ export function setNugCachedQuota(
 			return;
 		}
 	}
+	return credential;
+}
+
+export function setNugCachedQuota(
+	providerId: string,
+	cache: NugQuotaCache,
+	expectedConfig?: NUGProviderConfig | CapturedNugQuotaSubject,
+): void {
+	const config = (settings.nugProviders ?? []).find((provider) => provider.id === providerId);
+	const credential = config && matchingSubject(config, expectedConfig);
+	if (!credential) return;
 	rememberCredential(providerId, credential.id);
 	quotaStore.set(credential.id, nugQuotaIdentity(credential.config), nugQuotaSnapshot(cache));
 }
@@ -304,9 +312,14 @@ function cacheFromSnapshot(snapshot: QuotaSnapshot): NugQuotaCache {
 	};
 }
 
-export function getNugCachedQuota(providerId: string): NugQuotaCache | undefined {
+/** Captured reads use that live identity's probe slot; omitted keeps the legacy first-key view. */
+export function getNugCachedQuota(
+	providerId: string,
+	expectedSubject?: CapturedNugQuotaSubject,
+): NugQuotaCache | undefined {
 	const config = (settings.nugProviders ?? []).find((provider) => provider.id === providerId);
-	const snapshot = config && snapshotOf(config);
+	if (!config || (expectedSubject && !matchingSubject(config, expectedSubject))) return;
+	const snapshot = snapshotOf(config, expectedSubject?.id);
 	return snapshot && cacheFromSnapshot(snapshot);
 }
 
