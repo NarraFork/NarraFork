@@ -49,10 +49,11 @@ export function useNavLayout() {
 		() => (prefs ? mergeNavLayout(prefs.navLayout) : DEFAULT_NAV_ENTRIES),
 		[prefs],
 	);
-	// Entries of features switched off on this server are withheld, not removed.
+	// Entries of features switched off on this server are withheld, not removed. 「项目」 is
+	// withheld too: it is a fixed row of the top section (`NavTopSection.tsx:NavProjectsLink`).
 	const { enabled: outlineEnabled } = useOutlineEnabled();
 	const hidden = useMemo<ReadonlySet<CustomizableNavId>>(
-		() => new Set<CustomizableNavId>(outlineEnabled ? [] : ["outline"]),
+		() => new Set<CustomizableNavId>(outlineEnabled ? ["projects"] : ["projects", "outline"]),
 		[outlineEnabled],
 	);
 	const entries = useMemo(() => projectNavLayout(storedEntries, hidden), [storedEntries, hidden]);

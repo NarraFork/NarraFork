@@ -2,13 +2,16 @@
  * The team page's body (the redesign R): the header, 「等你处理」, the coordinator's conversation
  * and the right column (the work list or the activity), the work item drawer, and the dialogs of
  * the header's menu. The route passes the coordinator's conversation (the narrator panel) and
- * the navigation; the browser fixture passes a stand-in conversation.
+ * the navigation; the browser fixture passes a stand-in conversation. The conversation's own
+ * toolbar is left out (the route mounts the panel with `hideHeader`): the column has a compact
+ * coordinator line instead (`TeamCoordinatorHeader`), and 完整会话 opens the full session page.
  *
  * Reads: the team, its live summary (`useTeamSummary`), the open board columns (queued, in
  * progress, review: one page of 50 each), the pending calls (members only), the members (for the
  * header's avatars) and the sizes of the items shown (`work-stats`, at most 50).
  */
 
+import type { NarratorPanelConnection } from "@frontend/components/narrator/narrator-panel-types";
 import { useProject } from "@frontend/hooks/useProjects";
 import {
 	teamsUnavailable,
@@ -27,6 +30,7 @@ import { type ReactNode, useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { TeamActivity } from "./TeamActivity";
 import { TeamAttention } from "./TeamAttention";
+import { TeamCoordinatorHeader } from "./TeamCoordinatorHeader";
 import { TeamDisbandDialog } from "./TeamDisbandDialog";
 import { TeamHeader } from "./TeamHeader";
 import { TeamSettingsModal } from "./TeamSettingsModal";
@@ -52,10 +56,16 @@ export function TeamPageView({
 	onOpenCoordinatorSession,
 	onBack,
 	onDisbanded,
+	conversationConnection,
 }: {
 	projectId: string;
 	teamId: string;
 	conversation: ReactNode;
+	/**
+	 * The conversation panel's socket state (the panel's `onConnectionChange`): its header is
+	 * hidden, so the coordinator line shows 「断开连接」 and reconnects through the panel.
+	 */
+	conversationConnection?: NarratorPanelConnection | null;
 	onOpenSession?: (narratorId: string) => void;
 	/** The coordinator's own session page (the 「…」 menu's 协调者完整会话). */
 	onOpenCoordinatorSession?: () => void;
@@ -197,6 +207,13 @@ export function TeamPageView({
 					/>
 				)}
 				conversation={conversation}
+				conversationHeader={
+					<TeamCoordinatorHeader
+						summary={summary.data}
+						onOpenCoordinatorSession={onOpenCoordinatorSession}
+						connection={conversationConnection}
+					/>
+				}
 				conversationOverlay={
 					// Only members can tell the coordinator anything; others see a plain line.
 					mode.starting ? member ? <TeamStart teamId={teamId} /> : <TeamReadOnlyStart /> : undefined
@@ -251,6 +268,7 @@ export function TeamPageView({
 				phone={phone}
 				onClose={() => setDrawer(null)}
 				onOpenSession={onOpenSession ? openSession : undefined}
+				onOpenItem={openItem}
 			/>
 			{canDisband && onDisbanded && (
 				<TeamDisbandDialog

@@ -523,8 +523,8 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 149 tables and 1976 columns", () => {
-		expect(target.tables.length).toBe(149);
+	test("covers 151 tables and 1984 columns", () => {
+		expect(target.tables.length).toBe(151);
 		// 1714 SQLite-derived columns include disk_outcome and the two editor recovery columns,
 		// plus the three PG-only insert_seq identity columns.
 		// The numeric context stats replace the 5-column page cache with pins (3) and stats (4).
@@ -577,7 +577,10 @@ describe("real schema parity", () => {
 		// Team tabs in the sidebar add user_recent_tabs.project_id (nullable).
 		// Addressable alias lookup adds narrators.title_slug and narrators.alias_selector (2).
 		// Communication inheritance adds 4 node columns and exact contacts add 8 peer columns.
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1976);
+		// Durable executor-session terminals add terminals.executor_session_id (nullable) and
+		// executor_session_cleanups (3).
+		// Work item dependencies (D) add team_work_item_dependencies (4).
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1984);
 		expect(
 			target.tables
 				.find((table) => table.name === "user_recent_tabs")

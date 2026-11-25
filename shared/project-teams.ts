@@ -192,6 +192,8 @@ export const TEAM_TOOL_ACTIONS = [
 	"work.ready",
 	"work.sync",
 	"work.cancel",
+	/** D: replace a queued item's dependencies (`dependsOn`). */
+	"work.update",
 	"brief",
 	"checkin",
 	"cleanup",
@@ -238,6 +240,10 @@ export const TEAM_WORK_EVENT_KINDS = [
 	TEAM_DECISION_EVENT_KIND,
 	/** R: a person sent the item back with a reason (`TEAM_WORK_RETURNED_EVENT_KIND`). */
 	"work.returned",
+	/** D: the coordinator set or replaced an item's dependencies. */
+	"work.dependencies_changed",
+	/** D: the last dependency of a queued item merged; the coordinator was told it can start. */
+	"work.unblocked",
 ] as const;
 export type TeamWorkEventKind = (typeof TEAM_WORK_EVENT_KINDS)[number];
 
@@ -321,6 +327,11 @@ export interface TeamBoardItem {
 	updatedAt: string;
 	/** R: what a working or waiting worker did last; absent or null otherwise. */
 	activity?: TeamWorkerActivity | null;
+	/**
+	 * D: the items this one waits for (at most {@link TEAM_WORK_DEPENDENCIES_MAX}), oldest created
+	 * first (ties by id).
+	 */
+	dependsOn?: TeamWorkDependencyRef[];
 }
 
 export interface TeamBoardColumnPage {
@@ -705,6 +716,17 @@ export const TEAM_WORK_RETURNED_EVENT_KIND = "work.returned";
 export const TEAM_RETURNABLE_STATES: readonly TeamWorkItemState[] = ["in_review", "ready"];
 /** Characters of a return reason. */
 export const TEAM_RETURN_REASON_MAX_LENGTH = 2000;
+/**
+ * Characters of a review round's findings text (`work.review`'s `summary`). Small enough that
+ * the event detail stays under {@link TEAM_EVENT_DETAIL_MAX_BYTES} even when every character
+ * JSON-escapes to six bytes.
+ */
+export const TEAM_REVIEW_SUMMARY_MAX_LENGTH = 1000;
+/**
+ * Characters of findings text one drawer read sends in all: the newest rounds first, older ones
+ * cut (`summaryClipped`) once it is spent.
+ */
+export const TEAM_REVIEW_SUMMARIES_TOTAL_CHARS = 6000;
 
 /** One review round of a work item, from its events (an agent's review or a person's return). */
 export interface TeamWorkReviewRound {
@@ -718,6 +740,10 @@ export interface TeamWorkReviewRound {
 	by: "agent" | "person" | "system";
 	actorName: string | null;
 	reason: string | null;
+	/** An agent's round: the findings as the coordinator recorded them; null when none. */
+	summary: string | null;
+	/** The findings were cut (or left out) to keep the drawer within its text budget. */
+	summaryClipped?: boolean;
 	at: string;
 }
 
@@ -741,6 +767,12 @@ export interface TeamWorkItemDetail {
 	eventsMore: boolean;
 	/** The caller may return it now (member, active team, a returnable state). */
 	canReturn: boolean;
+	/**
+	 * D: items of this team that depend on this one, oldest created first, at most
+	 * {@link TEAM_WORK_DEPENDENTS_LIMIT}.
+	 */
+	dependents?: TeamWorkDependencyRef[];
+	dependentsMore?: boolean;
 }
 
 /** `GET …/teams/:teamId/work/:itemId/diff?path=`: one file's diff, cut at the byte cap. */
@@ -755,4 +787,58 @@ export interface TeamWorkReturnResponse {
 	item: TeamBoardItem;
 	/** Whether the note reached the coordinator (it relays the reason to the worker). */
 	delivered: boolean;
+}
+
+// ── D: dependencies between work items ───────────────────────────────────────
+
+/** Most dependencies one work item may have. */
+export const TEAM_WORK_DEPENDENCIES_MAX = 20;
+/** Most items that depend on one item the drawer lists. */
+export const TEAM_WORK_DEPENDENTS_LIMIT = 50;
+
+/**
+ * Injection source of the note a coordinator gets when the last dependency of a queued item
+ * merged (woken when idle, like `team_return`).
+ */
+export const TEAM_UNBLOCKED_NOTE_SOURCE = "team_unblocked";
+
+/**
+ * Whether a dependency in this state lets its dependent start: only `merged` does. `ready` does
+ * not (the dependent's branch would start from a base without it); `cancelled` blocks until the
+ * coordinator removes or replaces it.
+ */
+export function dependencySatisfied(state: TeamWorkItemState): boolean {
+	return state === "merged";
+}
+
+/** Another work item of the same team, as a dependency or a dependent. */
+export interface TeamWorkDependencyRef {
+	id: string;
+	title: string;
+	state: TeamWorkItemState;
+	/**
+	 * Set (on a dependency, never on a dependent) when it was made from another base branch than
+	 * the dependent: its merge lands in a base the dependent's branch never brings in, so it never
+	 * satisfies the dependency. Only rows written before the check existed can have it; the
+	 * coordinator removes or replaces it.
+	 */
+	baseMismatch?: { dependencyBase: string | null; dependentBase: string | null };
+}
+
+/**
+ * Whether a dependency lets its dependent start: merged ({@link dependencySatisfied}) into the
+ * dependent's own base.
+ */
+export function dependencyResolved(dependency: {
+	state: TeamWorkItemState;
+	baseMismatch?: unknown;
+}): boolean {
+	return dependencySatisfied(dependency.state) && !dependency.baseMismatch;
+}
+
+/** The dependencies an item still waits for (not resolved), in the given order. */
+export function dependencyBlockers<T extends { state: TeamWorkItemState; baseMismatch?: unknown }>(
+	dependsOn: readonly T[] | undefined,
+): T[] {
+	return (dependsOn ?? []).filter((dependency) => !dependencyResolved(dependency));
 }

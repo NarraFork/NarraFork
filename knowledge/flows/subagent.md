@@ -23,7 +23,7 @@ keywords:
   - subagent_conclusion_updated
   - takeover_by_user
 status: draft
-verified_at: 4d59774711a51a9ac966794090c8b3a04d549048
+verified_at: 4cc3bdf8b
 ---
 # 一次子代理委派
 
@@ -34,7 +34,7 @@ verified_at: 4d59774711a51a9ac966794090c8b3a04d549048
 2. 先走 [一次工具调用](tool-call.md) 的准入与权限，`Agent` 与其他工具一样经过 `executeTool`。
 3. 串行化与解析：`subagent-runner.ts:runSubagent` 在父的 `withNarratorWorkAdmission` 内进入；模板名规范化，解析自定义模板定义，拼委派基础提示词，算超时（后台默认上限 5 小时 `BACKGROUND_TASK_TIMEOUT_MS`）。
 4. 编译能力上限：`policy.ts:compileDelegationPolicy` 把模板变成写进新叙述者的 runtime policy；`resolveEffectiveSubagentModelPolicy` + `selectSubagentModel` 选模型（只能在父有效策略内收窄），无可用模型抛 `ValidationError`。
-5. 建叙述者：`narratorService.createSubagent`（`narrator-service.ts`）先沿 `parent_narrator_id` 校验深度（`delegationDepthOf`，超限报 `DELEGATION_DEPTH_LIMIT_MESSAGE`），再写行并打深度戳 `withDelegationDepth`。见 [会话生命周期](../narrator/lifecycle/index.md)。
+5. 建叙述者：`narratorService.createSubagent`（`narrator-service.ts`）先沿 `parent_narrator_id` 校验深度（`delegationDepthOf`，超限报 `DELEGATION_DEPTH_LIMIT_MESSAGE`），再写行并打深度戳 `withDelegationDepth`。见 [会话生命周期](../narrator/lifecycle/index.md)。随后同步调调用方的 `onCreated(subagentId)`（团队工作项在这里 `attachWorker`）；它抛错就拒绝这次运行：`runSubagent` 的 catch 把还没运行的子代理归档（`archiveUnstartedSubagent`），错误原样成为调用的错误。
 6. 登记：别名注册并持久化。唯一性只相对于这个父会话里仍可寻址的成员（`idle` / `working` / `waiting`）；已归档的旧别名可以再用，冲突时才改名并在结果里加注。可选 `delegateOutlineTask`；组装运行绑定 `binding`：`deliverTo`（父叙述者 + toolUseId + 精确的 toolCall 与 attempt）、前台才带 `cancelWith`、`deadlineAt`。
 7. 写入初始提示：`persistSubagentUserMessage` 把任务文本作为子代理的用户消息落库，挂在父的 `toolUseId` 下。见 [消息存储](../narrator/messages/index.md)。
 8. 分支，前台：`startNarratorRun({ binding, cancelSignal, foreground: true })`，随后 `await handle.foreground`，父的工具调用一直挂着，父的取消经 `cancelWith` 传到子；返回 `result.output` 作为工具结果。
@@ -50,6 +50,8 @@ verified_at: 4d59774711a51a9ac966794090c8b3a04d549048
 - 改嵌套深度：`MAX_DELEGATION_DEPTH` 同时作用于深度戳（`withDelegationDepth`）和兜底校验（`delegationDepthOf`，`createSubagent` 与 `narrator-control.ts` 都用），ForkNarrator 另有独立的 fork 深度。
 - 改结果回传：前台看 `finishRun` 的 foreground 分支，后台看 `deliverDetachedResult` 与 `backgroundTaskService`，崩溃恢复看 [中断与恢复](../narrator/recovery.md) 的子代理接续——三处契约要一起对齐。
 - 改子代理的资源回收：`subagent-resources.ts` 的归档路径与一次运行结束路径是两个入口。
+- 进团队里还没有工作者的工作项的 `workdir`（不论状态）：依赖还没全部合并时步骤 1 就返回错误（`TEAM_WORK_ITEM_BLOCKED`），不调 `runSubagent`；步骤 5 的 `attachWorker` 再查一次，被拒时子代理归档、`settleFailedStart` 收尾。
+- `onCreated` 不能只记日志吞掉错误：记录失败的子代理若照常运行，就在工作项的 worktree 里干活却没有任何记录。
 - 团队工作项（`isolation: "worktree"`）的分支名：标题没有英文单词时用 `description` 作 hint，见[工作项](../collaboration/teams/work-items.md)。
 
 ## 相关

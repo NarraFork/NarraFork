@@ -1,6 +1,6 @@
 {
-  "id": "abeafedc-f054-41e8-b9a0-edc89be12b9b",
-  "prevId": "ff0d57da-e8d7-48db-88a7-1e3066eaae33",
+  "id": "33f56901-d084-4512-a9c0-d4eb2669d3a3",
+  "prevId": "8c8f8481-5557-4bd2-b492-a30ef8532e5d",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -3120,6 +3120,45 @@
         }
       },
       "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.executor_session_cleanups": {
+      "name": "executor_session_cleanups",
+      "schema": "",
+      "columns": {
+        "device_id": {
+          "name": "device_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "session_id": {
+          "name": "session_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {
+        "executor_session_cleanups_device_id_session_id_pk": {
+          "name": "executor_session_cleanups_device_id_session_id_pk",
+          "columns": [
+            "device_id",
+            "session_id"
+          ]
+        }
+      },
       "uniqueConstraints": {},
       "policies": {},
       "checkConstraints": {},
@@ -24673,6 +24712,133 @@
       },
       "isRLSEnabled": false
     },
+    "public.team_work_item_dependencies": {
+      "name": "team_work_item_dependencies",
+      "schema": "",
+      "columns": {
+        "item_id": {
+          "name": "item_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "depends_on_item_id": {
+          "name": "depends_on_item_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "team_id": {
+          "name": "team_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {
+        "idx_team_work_item_dependencies_target": {
+          "name": "idx_team_work_item_dependencies_target",
+          "columns": [
+            {
+              "expression": "depends_on_item_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "item_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_team_work_item_dependencies_team": {
+          "name": "idx_team_work_item_dependencies_team",
+          "columns": [
+            {
+              "expression": "team_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "team_work_item_dependencies_item_id_team_work_items_id_fk": {
+          "name": "team_work_item_dependencies_item_id_team_work_items_id_fk",
+          "tableFrom": "team_work_item_dependencies",
+          "tableTo": "team_work_items",
+          "columnsFrom": [
+            "item_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "team_work_item_dependencies_depends_on_item_id_te_69b44cd09b_fk": {
+          "name": "team_work_item_dependencies_depends_on_item_id_te_69b44cd09b_fk",
+          "tableFrom": "team_work_item_dependencies",
+          "tableTo": "team_work_items",
+          "columnsFrom": [
+            "depends_on_item_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "team_work_item_dependencies_team_id_project_teams_94291c95ba_fk": {
+          "name": "team_work_item_dependencies_team_id_project_teams_94291c95ba_fk",
+          "tableFrom": "team_work_item_dependencies",
+          "tableTo": "project_teams",
+          "columnsFrom": [
+            "team_id"
+          ],
+          "columnsTo": [
+            "narrator_id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "team_work_item_dependencies_item_id_depends_on_item_id_pk": {
+          "name": "team_work_item_dependencies_item_id_depends_on_item_id_pk",
+          "columns": [
+            "item_id",
+            "depends_on_item_id"
+          ]
+        }
+      },
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "ck_team_work_item_dependencies_self": {
+          "name": "ck_team_work_item_dependencies_self",
+          "value": "\"item_id\" <> \"depends_on_item_id\""
+        }
+      },
+      "isRLSEnabled": false
+    },
     "public.team_work_items": {
       "name": "team_work_items",
       "schema": "",
@@ -25242,6 +25408,12 @@
         },
         "device_id": {
           "name": "device_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "executor_session_id": {
+          "name": "executor_session_id",
           "type": "text",
           "primaryKey": false,
           "notNull": false

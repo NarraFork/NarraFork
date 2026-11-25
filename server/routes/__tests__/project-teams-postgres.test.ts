@@ -60,6 +60,19 @@ test("every team route is refused with 503 on PostgreSQL", async () => {
 	}
 });
 
+test("the project pages' overview reads are refused with 503 on PostgreSQL", async () => {
+	for (const path of [
+		"/projects/summaries",
+		"/projects/p1/attention",
+		"/projects/p1/sessions?view=active",
+		"/projects/p1/teams?counts=true",
+	]) {
+		const response = await app.request(`http://localhost${path}`);
+		expect({ path, status: response.status }).toEqual({ path, status: 503 });
+		expect(((await response.json()) as { code: string }).code).toBe("POSTGRES_UNSUPPORTED");
+	}
+});
+
 test("the new-session dialog's directory lookup is refused with 503 on PostgreSQL", async () => {
 	// "Start as a team" asks this first; on PostgreSQL it must say why, not answer `not_git`.
 	for (const create of [false, true]) {

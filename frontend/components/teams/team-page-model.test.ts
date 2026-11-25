@@ -25,9 +25,11 @@ import {
 	boardSignature,
 	cappedCount,
 	chunkIds,
+	coordinatorLine,
 	diffLineKind,
 	eventLabelKey,
 	eventNote,
+	findingsNeedToggle,
 	isCoordinator,
 	itemMarks,
 	itemOfApproval,
@@ -38,6 +40,7 @@ import {
 	onlookerSeesWaiting,
 	pauseNotice,
 	pauseOrder,
+	queuedLine,
 	returnErrorKey,
 	returnReason,
 	rowLine,
@@ -205,7 +208,7 @@ describe("the work list", () => {
 			["ready", false],
 		]);
 		expect(rowLine(groups.needsYou[0] as never, "waiting", "main")).toEqual({
-			key: "waitingTool",
+			key: "waitingTools.runCommand",
 			values: { tool: "Bash" },
 			detail: "pnpm add x",
 			tone: "amber",
@@ -220,10 +223,19 @@ describe("the work list", () => {
 			approval: call,
 		});
 		expect(rowLine(row({}, approval()), "waiting", "main")).toMatchObject({
-			key: "waitingTool",
+			key: "waitingTools.runCommand",
 			detail: "pnpm test",
 			tone: "amber",
 		});
+		// What the call asks for, in words (R2): editing, reading, a web page, or the tool's name.
+		for (const [toolName, key] of [
+			["Edit", "waitingTools.editFile"],
+			["NotebookEdit", "waitingTools.editFile"],
+			["Read", "waitingTools.readFile"],
+			["WebFetch", "waitingTools.fetchWeb"],
+			["mcp__github__create_issue", "waitingTools.useTool"],
+		])
+			expect(rowLine(row({}, approval({ toolName })), "waiting", "main").key).toBe(key);
 		expect(
 			rowLine(row({}, approval({ kind: "question", questions: ["Which?"] })), "waiting", "main"),
 		).toMatchObject({ key: "waitingAnswer", detail: "Which?" });
@@ -720,5 +732,125 @@ describe("review fixes", () => {
 		expect(isCoordinator({ actorKind: "agent", actorId: "lead" }, "lead")).toBe(true);
 		expect(isCoordinator({ actorKind: "agent", actorId: "w" }, "lead")).toBe(false);
 		expect(isCoordinator({ actorKind: "person", actorId: "lead" }, "lead")).toBe(false);
+	});
+});
+
+describe("dependencies (D)", () => {
+	const dep = (id: string, state: TeamBoardItem["state"]) => ({ id, title: `Item ${id}`, state });
+
+	test("a queued row says what it waits for: one or two by title, more by count", () => {
+		expect(queuedLine(undefined)).toEqual({
+			key: "queued",
+			values: {},
+			detail: null,
+			tone: "hollow",
+		});
+		expect(queuedLine([dep("a", "merged")]).key).toBe("queued");
+		expect(queuedLine([dep("a", "ready"), dep("b", "merged")])).toEqual({
+			key: "queuedWaitingOne",
+			values: { first: "Item a" },
+			detail: null,
+			tone: "hollow",
+		});
+		expect(queuedLine([dep("a", "in_progress"), dep("b", "queued")]).values).toEqual({
+			first: "Item a",
+			second: "Item b",
+		});
+		expect(
+			queuedLine([dep("a", "queued"), dep("b", "queued"), dep("c", "in_review")]),
+		).toMatchObject({ key: "queuedWaitingMany", values: { count: 3 } });
+		// A cancelled dependency never merges: said first, whatever else waits.
+		expect(queuedLine([dep("a", "queued"), dep("b", "cancelled")])).toMatchObject({
+			key: "queuedBlockedCancelled",
+			values: { title: "Item b" },
+		});
+		// rowLine uses it for queued items only.
+		const row = {
+			item: item({ state: "queued", worker: null, dependsOn: [dep("a", "queued")] }),
+			approval: null,
+		};
+		expect(rowLine(row, null, "main").key).toBe("queuedWaitingOne");
+		const started = { item: item({ dependsOn: [dep("a", "merged")] }), approval: null };
+		expect(rowLine(started, "working", "main").key.startsWith("queued")).toBe(false);
+	});
+
+	test("dependency events have headlines and notes", () => {
+		expect(eventLabelKey("work.dependencies_changed")).toBe("work_dependencies_changed");
+		expect(eventLabelKey("work.unblocked")).toBe("work_unblocked");
+		expect(
+			eventNote({ kind: "work.dependencies_changed", detail: { dependsOn: ["a", "b"] } }),
+		).toEqual({ key: "dependencies", values: { count: 2 } });
+		expect(eventNote({ kind: "work.dependencies_changed", detail: { dependsOn: [] } })).toEqual({
+			key: "dependenciesCleared",
+			values: {},
+		});
+		expect(eventNote({ kind: "work.dependencies_changed", detail: {} })).toBeNull();
+		expect(eventNote({ kind: "work.unblocked", detail: { mergedItem: "a" } })).toEqual({
+			key: "unblocked",
+			values: {},
+		});
+	});
+});
+
+describe("review findings", () => {
+	test("a short text never gets 展开; many lines or a long text does", () => {
+		expect(findingsNeedToggle("缺少跨日边界用例。")).toBe(false);
+		expect(findingsNeedToggle("a\nb\nc")).toBe(false);
+		expect(findingsNeedToggle("a\nb\nc\nd")).toBe(true);
+		expect(findingsNeedToggle("x".repeat(141))).toBe(true);
+	});
+});
+
+describe("the coordinator's line", () => {
+	const base = {
+		teamId: "lead",
+		coordinatorStatus: "working",
+		runningAgents: [] as { id: string; title: string | null; status: string }[],
+		runningCount: 0,
+	};
+	const agent = (id: string) => ({ id, title: null, status: "working" });
+	test("the other running sessions; a lower bound when the list was cut", () => {
+		expect(
+			coordinatorLine({
+				...base,
+				runningAgents: [agent("lead"), agent("w1"), agent("w2")],
+				runningCount: 3,
+			}),
+		).toEqual({ kind: "running", count: 2, more: false });
+		// One listed, more beyond it: at least two.
+		expect(coordinatorLine({ ...base, runningAgents: [agent("w1")], runningCount: 2 })).toEqual({
+			kind: "running",
+			count: 2,
+			more: true,
+		});
+		// The full list (the coordinator and 19 others) and one past it: 20+.
+		const full = [agent("lead"), ...Array.from({ length: 19 }, (_, i) => agent(`w${i}`))];
+		expect(coordinatorLine({ ...base, runningAgents: full, runningCount: 21 })).toEqual({
+			kind: "running",
+			count: 20,
+			more: true,
+		});
+	});
+	test("a list cut down to the coordinator: 1+, never 0+", () => {
+		expect(coordinatorLine({ ...base, runningAgents: [agent("lead")], runningCount: 2 })).toEqual({
+			kind: "running",
+			count: 1,
+			more: true,
+		});
+	});
+	test("nothing else running: the coordinator's own state", () => {
+		expect(coordinatorLine({ ...base, runningAgents: [agent("lead")], runningCount: 1 })).toEqual({
+			kind: "status",
+			status: "working",
+		});
+		expect(coordinatorLine({ ...base, coordinatorStatus: "waiting" })).toEqual({
+			kind: "status",
+			status: "waiting",
+		});
+		expect(coordinatorLine({ ...base, coordinatorStatus: "archived" }).kind).toBe("status");
+		expect(coordinatorLine({ ...base, coordinatorStatus: "something" })).toEqual({
+			kind: "status",
+			status: "idle",
+		});
 	});
 });

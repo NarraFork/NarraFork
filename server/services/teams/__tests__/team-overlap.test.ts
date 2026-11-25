@@ -190,6 +190,16 @@ const create = (lead: string, title: string, userId: string) =>
 	});
 
 async function clearReview(lead: string, itemId: string) {
+	// Only a started item is reviewed: an idle worker, as an Agent call into its worktree attaches.
+	if (!itemRow(itemId)?.workerNarratorId) {
+		const worker = `x-worker-${itemId}`;
+		sqlite.run(
+			`INSERT INTO narrators (id, type, title, parent_narrator_id, acl_root_narrator_id, created_at, updated_at)
+			VALUES (?, 'subagent', 'w', ?, ?, ?, ?)`,
+			[worker, lead, lead, NOW, NOW],
+		);
+		items.attachWorker(lead, itemId, worker, { kind: "agent", id: lead });
+	}
 	await items.recordReview({
 		coordinatorId: lead,
 		itemId,

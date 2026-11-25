@@ -28,11 +28,11 @@ keywords:
   - db 句柄
   - bun:sqlite
 status: draft
-verified_at: bfb277f05
+verified_at: cbf0722e0
 ---
 # 表结构与 Drizzle
 
-SQLite 表结构的唯一来源是 `server/db/schema.ts`（Drizzle `sqliteTable`，目前 149 张表）；关系在 `relations.ts`；`db/index.ts` 把两者交给 `drizzle({ client, schema })`，导出 `db`（Drizzle）和 `sqlite`（原生 `bun:sqlite` 句柄）。
+SQLite 表结构的唯一来源是 `server/db/schema.ts`（Drizzle `sqliteTable`，目前 150 张表）；关系在 `relations.ts`；`db/index.ts` 把两者交给 `drizzle({ client, schema })`，导出 `db`（Drizzle）和 `sqlite`（原生 `bun:sqlite` 句柄）。
 
 ## 关键规则
 - 主键是文本：多数表 `id: text("id").primaryKey()`，值来自 `server/lib/id.ts:generateId`（nanoid，默认 21 字符）；`generateShortId` 默认 8 字符。部分关联表用复合主键（`primaryKey({ columns: [...] })`）。

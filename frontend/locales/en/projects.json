@@ -5,7 +5,6 @@
 		"manage": "You can manage this configuration.",
 		"readOnly": "Read-only: managing this configuration requires project management permission.",
 		"accessUnavailable": "Could not verify management permission. Editing is disabled.",
-		"settingsTraits": "Settings, permission rules and traits",
 		"workspaceContainers": "Workspace and container settings",
 		"devices": "Devices",
 		"knowledge": "Knowledge",
@@ -14,7 +13,6 @@
 		"instanceSettings": "Instance settings and traits",
 		"routinesSkills": "Routines and skills",
 		"unavailable": "Configuration is unavailable: it may be inaccessible, missing, or temporarily unable to load.",
-		"retirement": "The canvas entry point has retired. Existing configuration, sessions and resources remain here; no data has been moved or deleted.",
 		"sessions": "Sessions",
 		"sessionsUnavailable": "Could not load sessions.",
 		"openSession": "Open session",
@@ -25,7 +23,6 @@
 	"newSession": "New session",
 	"openOutline": "Outline",
 	"outlineNotCreated": "This project has no outline yet. Someone who can edit the project creates it by opening it.",
-	"advancedSettings": "Advanced project settings",
 	"projectDescription": "Description",
 	"defaultDirectoryHint": "Default directory for new sessions only. Existing session directories stay unchanged.",
 	"newProject": "New Project",
@@ -64,9 +61,6 @@
 	"deleteProject": "Delete Project",
 	"deleteProjectTypeName": "Type the project name to confirm:",
 	"projectDeleted": "Project deleted",
-	"commandsButton": "Commands",
-	"commandsTitle": "Project Commands",
-	"commandsDesc": "Define slash commands available to all narrators in this project. Project commands override user commands with the same name.",
 	"commandRunBashFirst": "Run Bash first",
 	"commandRunBashFirstDesc": "When enabled, using this command runs the Bash command below via the /bash flow before sending the prompt to AI. The Bash result is included in the same AI turn context.",
 	"commandRunBashFirstBadge": "Bash first",
@@ -85,21 +79,12 @@
 	"commandEmpty": "No project commands. Add one to get started.",
 	"commandDuplicateName": "A command with this name already exists",
 	"commandInvalidName": "Command name can only contain letters, numbers, hyphens and underscores",
-	"skillsButton": "Skills",
-	"routinesButton": "Routines",
-	"routinesTitle": "Built-in Routines",
-	"routinesDesc": "Enable or disable built-in commands and skills for this project. Override the global setting per routine.",
 	"routinesUnsupportedTitle": "Project routines are unavailable",
 	"routinesUnsupportedDesc": "This backend runtime does not support project-level routine overrides.",
-	"routineFollowGlobal": "Global",
-	"skillsTitle": "Project Skills",
-	"skillsDesc": "Skills are reusable instruction sets that provide domain-specific knowledge to narrators. Create and edit project skills here; new skills are saved to .narrafork/skills/<name>/SKILL.md by default.",
 	"skillsEmpty": "No skills found. Create a project skill to get started.",
 	"skillsFiles": "files",
 	"skillsLocation": "Location",
 	"skillsCompanionFiles": "Companion files",
-	"settingsButton": "Settings",
-	"settingsTitle": "Project Settings",
 	"projectWhitelistDirs": "Whitelist Directories",
 	"projectWhitelistDirsDesc": "Directories auto-allowed for narrators in this project.",
 	"projectBlacklistDirs": "Blacklist Directories",
@@ -143,11 +128,8 @@
 	},
 	"teams": {
 		"title": "Teams",
-		"newTeam": "New team",
-		"noTeams": "No teams yet.",
 		"loadFailed": "Could not load the teams.",
 		"loadMore": "Load more",
-		"open": "Open",
 		"onlooker": "Read only",
 		"archived": "Archived",
 		"pageTitle": "Team",
@@ -244,7 +226,9 @@
 			"work_exclusive_taken": "Took an exclusive path",
 			"work_exclusive_refused": "Exclusive path refused",
 			"work_exclusive_released": "Released an exclusive path",
-			"work_returned": "Returned to the worker"
+			"work_returned": "Returned to the worker",
+			"work_dependencies_changed": "Dependencies changed",
+			"work_unblocked": "Can start now"
 		},
 		"eventNote": {
 			"text": "{{text}}",
@@ -262,7 +246,11 @@
 			"decisionCoordinator": "{{tool}} · coordinator",
 			"decisionPlan": "A plan · {{agent}}",
 			"decisionPlanCoordinator": "A plan · coordinator",
-			"decisionPlanAgent": "A plan · an agent"
+			"decisionPlanAgent": "A plan · an agent",
+			"dependencies_one": "Depends on {{count}} item",
+			"dependencies_other": "Depends on {{count}} items",
+			"dependenciesCleared": "No dependencies left",
+			"unblocked": "Every item it waits for is merged"
 		},
 		"top": {
 			"pauseAll": "Pause all",
@@ -334,8 +322,6 @@
 				"more": "{{count}} more",
 				"less": "Show less",
 				"coordinator": "Coordinator",
-				"asksTool": "· the worker asks to run {{tool}}",
-				"coordinatorAsksTool": "asks to run {{tool}}",
 				"asksQuestion": "· the worker asks",
 				"coordinatorAsksQuestion": "asks",
 				"asksPlan": "· the worker proposes a plan",
@@ -368,7 +354,15 @@
 				"moreInSession": "More are waiting than listed here: open the coordinator's session to see them.",
 				"unscanned": "Some waiting calls may not be listed here: open the coordinator's session to see them.",
 				"openFull": "Open session",
-				"openAsker": "Open this session"
+				"openAsker": "Open this session",
+				"toolVerbs": {
+					"editFile": "asks to edit a file",
+					"runCommand": "asks to run a command",
+					"readFile": "asks to read a file",
+					"fetchWeb": "asks to open a web page",
+					"useTool": "asks to use {{tool}}"
+				},
+				"workerAsksAction": "· the worker {{action}}"
 			},
 			"work": {
 				"work": "Work",
@@ -386,7 +380,6 @@
 				"loadFailed": "Could not load the work items."
 			},
 			"row": {
-				"waitingTool": "Waiting for approval · {{tool}}",
 				"waitingAnswer": "Waiting for an answer",
 				"waitingPlan": "Plan waiting for approval",
 				"waitingRule": "Waiting for a permission rule",
@@ -414,7 +407,18 @@
 					"AskUserQuestion": "Asking",
 					"ExitPlanMode": "Proposing a plan"
 				},
-				"waitingPerson": "Waiting on a person"
+				"waitingPerson": "Waiting on a person",
+				"waitingTools": {
+					"editFile": "Waiting for approval · edit a file",
+					"runCommand": "Waiting for approval · run a command",
+					"readFile": "Waiting for approval · read a file",
+					"fetchWeb": "Waiting for approval · open a web page",
+					"useTool": "Waiting for approval · {{tool}}"
+				},
+				"queuedWaitingOne": "Queued · waiting for “{{first}}” to merge",
+				"queuedWaitingTwo": "Queued · waiting for “{{first}}” and “{{second}}” to merge",
+				"queuedWaitingMany": "Queued · waiting for {{count}} items to merge",
+				"queuedBlockedCancelled": "Queued · its dependency “{{title}}” was cancelled"
 			},
 			"empty": {
 				"title": "Work items show up here",
@@ -470,6 +474,9 @@
 				"round": "Round {{round}} · {{who}}",
 				"reviewer": "reviewer",
 				"findings": "{{count}} findings",
+				"findingsMore": "Show more",
+				"findingsLess": "Show less",
+				"findingsClipped": "The findings are too long in all; this round is not shown in full",
 				"verdictClear": "Passed",
 				"verdictBlocker": "Changes",
 				"verdictReturned": "Returned",
@@ -490,6 +497,19 @@
 					"TEAM_WORK_ITEM_NOT_RETURNABLE": "Only an item in review or ready to merge can be returned; it has moved on meanwhile.",
 					"TEAM_WORK_ITEM_CHANGED": "The item changed meanwhile; look again and return it if it still needs it.",
 					"TEAM_ARCHIVED": "The team is archived; nothing can change. Restore it first."
+				},
+				"dependenciesTitle": "Depends on",
+				"dependentsTitle": "Needed by",
+				"dependentsMore": "More items depend on it than listed here",
+				"dependencyCancelled": "“{{title}}” was cancelled and will never merge, so this item cannot start. The coordinator has to remove or replace this dependency.",
+				"dependencyNote": "Starts once every item here is merged into {{base}}.",
+				"dependencyState": {
+					"queued": "Queued",
+					"in_progress": "In progress",
+					"in_review": "In review",
+					"ready": "Ready to merge",
+					"merged": "Merged",
+					"cancelled": "Cancelled"
 				}
 			},
 			"settings": {
@@ -512,11 +532,138 @@
 				"title": "Running sessions",
 				"none": "Nothing running"
 			},
+			"coordinatorHeader": {
+				"title": "Coordinator",
+				"running_one": "{{count}} session running",
+				"running_other": "{{count}} sessions running",
+				"runningMore": "{{count}}+ sessions running",
+				"disconnected": "Disconnected",
+				"reconnect": "Click to reconnect",
+				"status": {
+					"working": "working",
+					"waiting": "waiting on someone",
+					"idle": "idle",
+					"archived": "archived"
+				},
+				"fullSession": "Full session"
+			},
 			"readOnlyStart": "Nobody has given the coordinator a goal yet.",
 			"coordinator": "Coordinator"
 		}
 	},
-	"skills": "Skills",
-	"routines": "Routines",
-	"commands": "Commands"
+	"page": {
+		"members_one": "{{count}} member",
+		"members_other": "{{count}} members",
+		"membersMore": "{{count}}+ members",
+		"membersHint": "Members and visibility",
+		"newTeam": "New team",
+		"more": "More",
+		"showSessions": "Teams and sessions",
+		"waitingBadge": "{{count}} waiting",
+		"attention": {
+			"ownersSession": "{{name}}'s session",
+			"more": "More are waiting than listed here: open their sessions and teams to see them.",
+			"unscanned": "Some waiting calls may not be listed here: open their sessions and teams to see them."
+		},
+		"teams": {
+			"empty": "No teams yet. A team splits a goal into work items that run side by side.",
+			"newHint": "Let a coordinator split the work and run it in parallel",
+			"numbers": {
+				"inProgress": "In progress",
+				"ready": "Ready",
+				"done": "Done"
+			}
+		},
+		"sessions": {
+			"views": {
+				"active": "Active",
+				"all": "All",
+				"mine": "Mine"
+			},
+			"recent": "Last 7 days",
+			"empty": {
+				"active": "Nothing running and nothing changed in the last 7 days.",
+				"all": "No sessions in this project yet.",
+				"mine": "You have no sessions in this project."
+			},
+			"showAll": "Show all {{count}}"
+		},
+		"newSession": "New session",
+		"waitingBadgeMore": "{{count}}+ waiting"
+	},
+	"list": {
+		"subtitle": "Projects with something waiting on you come first, the rest by recent activity. Sessions join a project by their working directory.",
+		"runningSessions_one": "{{count}}{{more}} active session",
+		"runningSessions_other": "{{count}}{{more}} active sessions",
+		"noRunningSessions": "No active sessions",
+		"teams_one": "{{count}}{{more}} team",
+		"teams_other": "{{count}}{{more}} teams",
+		"archived": "Archived",
+		"activity": {
+			"justNow": "Active just now",
+			"minutes": "{{count}} min ago",
+			"hours": "{{count}} h ago",
+			"yesterday": "Yesterday",
+			"days": "{{count}} days ago",
+			"never": "No activity yet"
+		}
+	},
+	"settingsPage": {
+		"title": "Project settings",
+		"open": "Open project settings",
+		"back": "Back to the project",
+		"autosave": "Changes save automatically",
+		"loading": "Loading…",
+		"saving": "Saving…",
+		"saveFailed": "Could not save: {{message}}",
+		"rulesCount_one": "{{count}} rule",
+		"rulesCount_other": "{{count}} rules",
+		"openDevices": "Device settings",
+		"openKnowledge": "Open the knowledge base",
+		"knowledgeNote": "The knowledge base has its own levels and tags for who may read what; it is shared across projects.",
+		"groups": {
+			"members": {
+				"title": "Members and visibility",
+				"description": "Who can see this project, and who can start sessions and approve actions in it."
+			},
+			"skills": {
+				"title": "Skills",
+				"description": "Skills the sessions of this project can use when they need them."
+			},
+			"routines": {
+				"title": "Routines",
+				"description": "\"Loaded in new sessions\" routines are available in every new session; \"load in a session\" ones are loaded by typing /load there."
+			},
+			"commands": {
+				"title": "Commands",
+				"description": "Shortcuts sessions can run by typing /, and which shell commands they may or may not run."
+			},
+			"workspace": {
+				"title": "Workspace and containers",
+				"description": "The project directory, and which directories its sessions may or may not touch."
+			},
+			"devices": {
+				"title": "Devices",
+				"description": "Which machines sessions can run tools on."
+			},
+			"knowledge": {
+				"title": "Knowledge base",
+				"description": "What the team knows, for sessions to look up."
+			}
+		},
+		"routines": {
+			"modes": {
+				"resident": "Loaded in new sessions",
+				"manual": "Load in a session",
+				"auto": "Automatic"
+			},
+			"followGlobal": "Follow global: {{mode}}"
+		},
+		"unsaved": "Not saved: {{message}}",
+		"pathSave": "Save directory",
+		"pathCancel": "Cancel",
+		"pathConfirmTitle": "Change the project directory?",
+		"pathConfirm": "The project directory changes from {{from}} to {{to}}. Sessions are re-assigned by their working directory: sessions under the new directory join this project, and sessions under the old one that are not under the new one leave it.",
+		"pathConfirmButton": "Change and re-assign"
+	}
 }

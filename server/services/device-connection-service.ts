@@ -124,7 +124,7 @@ const sockets = hotSafe("narrafork:deviceSockets", () => new Set<DeviceWS>());
 
 const DEVICE_HANDSHAKE_TIMEOUT_MS = 10_000;
 /** Methods allowed to bypass the short-RPC quota and timeout (they end on kill/abort). */
-const LONG_LIVED_RPC_METHODS: ReadonlySet<string> = new Set(["pty.open"]);
+const LONG_LIVED_RPC_METHODS: ReadonlySet<string> = new Set(["pty.open", "session.attach"]);
 /**
  * Separate ceiling for long-lived calls: exempting them from the short-RPC quota
  * must not make them unbounded. Generous — each is one open remote terminal.

@@ -45,7 +45,7 @@ keywords:
   - X-Next-Cursor
   - 章节
 status: draft
-verified_at: 69715f280
+verified_at: 0c7feefbf036126fba2e273856e5f7095c54d25b
 ---
 # 项目
 
@@ -61,7 +61,7 @@ verified_at: 69715f280
 - git 探测有超时（2s）、输出上限（8KB）和 30s 缓存。
 - `projects.rootKey`（realpath 规范化）是匹配键，局部唯一；被更早项目占用目录的项目 rootKey 永久为 null、不参与匹配。
 - 访问控制：admin、owner、`visibility=public`（所有登录用户可读）、`acl_grants` 的 read/write/manage，write/manage 隐含 read；owner 为 null 表示由 admin 管理（`project-acl.ts`）。进入项目是必要不充分条件，项目内会话/知识仍受自身 ACL。
-- 成员变更（设置成员、移除、转让 owner、可见性）只有 owner/admin/manage 能做，且有审计与通知（`project-membership.ts`）。
+- 成员变更（设置成员、移除、转让 owner、可见性）只有 owner/admin/manage 能做，且有审计与通知（`project-membership.ts`）。项目页页头只读成员人数（`countProjectMembers`，不带名单），见[项目页](project-pages.md)。
 - 失去项目后清侧栏标签：被移出的成员、以及可见性收紧为 private 时持有项目内标签的人（`usersWithTabsInProject`：项目标签、项目内会话的标签、项目团队的团队标签，各有上限 500）逐个过 `pruneUnreadableProjectTabs`（见[最近标签页](recent-tabs.md)）。
 - 路由层：项目不可见与不存在都返回 NotFound，防止探测；`GET /api/projects/hidden-existence` 只返回是否存在不可见项目（`limit 1` 的有界探测，不泄露名称、id 或数量）；修改设置要 manage。
 - 列表 `GET /api/projects`：按 `updatedAt` 降序，返回裸数组；不带 `limit`/`cursor` 时返回调用者可读的全部项目（`collectAllPages` 逐页有界地走，单页 200，总量上限 2000）；带 `limit`/`cursor` 才是单页，续页游标在响应头 `X-Next-Cursor`，被截断时 `X-Read-Truncated: 1`（`routes/projects.ts`、`services/read/`）。读取经 `projectReadAdapter()`：默认 SQLite 适配器，PG 模式必须显式注入 PG 适配器，不会静默回落。
@@ -80,9 +80,9 @@ verified_at: 69715f280
 
 ## 前端
 - 侧栏「项目」入口（`nav-items.tsx` 的 `projects` → `/projects`）是进入项目页和团队的唯一导航入口，见[应用框架与路由](../frontend/shell-routing.md)。
-- `frontend/routes/projects/index.tsx`（项目列表，卡片没有菜单）、`$projectId.tsx`（项目页：目录与会话列表，`components/project/ProjectSessionList.tsx`；标题旁的 `PinToSidebarButton` 把项目固定到侧栏，见[最近标签页](recent-tabs.md)）；设置/权限在 `ProjectSettingsPanel`、`ProjectAccessPanel`、`ProjectSkillsManager`、`ProjectRoutinesModal`、`ProjectCommandsModal`。
+- 项目列表 `routes/projects/index.tsx`、项目页 `$projectId.tsx`、项目设置页 `$projectId_.settings.tsx` 与它们的读接口见[项目页、项目列表与项目设置页](project-pages.md)。成员与可见性的编辑器仍是 `ProjectAccessPanel`，技能 `ProjectSkillsManager`，都挂在设置页上。
 - `frontend/hooks/useProjects.ts` + `lib/api/projects.ts`：React Query 与客户端；团队页路由 `$projectId_.teams.$teamId.tsx` 属于[团队](teams/index.md)。
-- 新建项目对话框（`routes/projects/index.tsx`）的项目目录建议向上展开（`dropdownPosition="top"`），不盖住紧挨在下面的「创建」按钮。项目设置面板（`ProjectSettingsPanel`）用到的文案键（含 skills / routines / commands）在 en 与 zh-CN 的 `projects` 命名空间里都要有，`ProjectSettingsPanel.test.tsx` 逐个核对。
+- 新建项目对话框（`routes/projects/index.tsx`）的项目目录建议向上展开（`dropdownPosition="top"`），不盖住紧挨在下面的「创建」按钮。会话菜单的项目设置弹窗（`ProjectSettingsPanel`）只是去设置页的入口，文案键在两种语言都要有，`ProjectSettingsPanel.test.tsx` 逐个核对。
 
 ## 从哪读起
 - `server/services/project-index.ts`：目录到项目的推导、链接同步与重建。
@@ -101,7 +101,8 @@ verified_at: 69715f280
 - `resolve-directory` 不得另写路径→项目的推导：只调 `resolveProjectForDirectory`；`create: false` 必须不写库（新建会话弹窗每次换目录都会问）。
 - 读不到的项目必须继续回与非 git 目录逐字节相同的响应：不要加字段、状态或不同的错误码来区分两者。
 - 列表接口形状是契约（裸数组、`updatedAt` 降序、无参返回全部），改成分页信封会破坏现有调用方。
-- 项目页加东西：`frontend/components/project/project-page.test.tsx` 把 Mantine、React Query、i18n 都换成了桩，新引入的组件要么不依赖真实的 i18n 初始化，要么在那里 mock 掉（固定到侧栏按钮就是 mock 的）。
+- 项目页加东西：`frontend/components/project/project-page.test.tsx` 把 Mantine、React Query、i18n 都换成了桩，页面各块（等你处理、团队卡片、会话）也换成了桩；新引入的组件要么不依赖真实的 i18n 初始化，要么在那里 mock 掉（固定到侧栏按钮就是 mock 的）。各块自己的渲染在 `project-components.test.tsx`。
 
 ## 相关
+- [项目页、项目列表与项目设置页](project-pages.md)
 - [团队](teams/index.md)

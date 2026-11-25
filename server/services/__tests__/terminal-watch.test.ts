@@ -1029,3 +1029,27 @@ describe("terminal lifecycle watches are re-attached after a restart", () => {
 		expect(ended?.output).toMatch(/interrupted.*server restart/i);
 	});
 });
+
+describe("output gaps from a durable executor session", () => {
+	test("a text watch keeps a match it already had output for, and otherwise reports the gap", async () => {
+		const { interruptTextWatchesForGap } = await import("../terminal-watch-service");
+		const buffer = newBuffer();
+		output(buffer, "$ ");
+		const matched = await start(buffer, "BUILD OK", { kind: "offset", offset: 0 });
+		const missed = await start(buffer, "DEPLOYED", { kind: "offset", offset: 0 });
+		const lifecycle = await startLifecycle(buffer);
+		// Seen before the hole, but not yet checked when the gap arrives.
+		buffer.append("BUILD OK\r\n");
+		await interruptTextWatchesForGap(TERMINAL, buffer, 4096);
+
+		const ok = await waitForStatus(matched);
+		expect(ok?.status).toBe("completed");
+		expect(ok?.output).toContain("BUILD OK");
+		const lost = await waitForStatus(missed);
+		expect(lost?.status).toBe("failed");
+		expect(lost?.output).toContain("4096 bytes of output");
+		expect(lost?.output).toContain("may have appeared without being observed");
+		// Lifecycle watches are about the terminal, not its text.
+		expect((await row(lifecycle))?.status).toBe("running");
+	});
+});

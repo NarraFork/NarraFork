@@ -86,6 +86,11 @@ export const listProjectTeamsQuerySchema = z.object({
 	status: z.enum(["active", "archived", "all"]).default("active"),
 	limit: z.coerce.number().int().min(1).max(100).default(50),
 	cursor: z.string().max(200).optional(),
+	/** R2: each team carries its card's numbers; the page is then at most 24 teams. */
+	counts: z
+		.enum(["true", "false"])
+		.optional()
+		.transform((value) => value === "true"),
 });
 
 // ── P4: the team page ────────────────────────────────────────────────────────

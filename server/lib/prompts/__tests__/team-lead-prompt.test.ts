@@ -55,6 +55,27 @@ describe("team lead prompt", () => {
 		expect(en).not.toMatch(/pull request|\bPR\b|\bCI\b|integration branch/i);
 	});
 
+	test("D: dependencies between work items are explained in both locales", () => {
+		const en = getTeamLeadPrompt("en");
+		for (const phrase of [
+			'Team({ action: "work.create", title, dependsOn: [item ids] })',
+			"work.update while it is still queued",
+			"Only a merged dependency counts: ready is not enough",
+			"a cancelled one blocks until you remove or replace it",
+			"TEAM_WORK_ITEM_BLOCKED",
+			"run work.sync on it first",
+		])
+			expect(en).toContain(phrase);
+		const zh = getTeamLeadPrompt("zh-CN");
+		for (const phrase of [
+			"dependsOn: [工作项 id]",
+			"只有已合并的依赖才算数：ready 不够",
+			"TEAM_WORK_ITEM_BLOCKED",
+			"先对它跑 work.sync",
+		])
+			expect(zh).toContain(phrase);
+	});
+
 	test("the working directory is described for created and upgraded coordinators alike", () => {
 		const en = getTeamLeadPrompt("en");
 		// Deliberately changed: an upgraded coordinator may work in a linked worktree.

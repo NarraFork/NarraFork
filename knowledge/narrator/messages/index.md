@@ -14,7 +14,7 @@ keywords:
   - narratorStore
   - 消息存储
 status: draft
-verified_at: 4d59774711a51a9ac966794090c8b3a04d549048
+verified_at: cbf0722e0
 ---
 # 消息存储
 

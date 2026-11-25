@@ -6,6 +6,7 @@
  * words each event; every `teams` string exists in both languages.
  */
 import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { MantineProvider } from "@mantine/core";
 import type {
 	TeamActivityPage,
@@ -13,7 +14,7 @@ import type {
 	TeamMembersResponse,
 	TeamPageSummary,
 	TeamPendingApproval,
-	TeamSummary,
+	TeamWorkItemDetail,
 } from "@shared/project-teams";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
@@ -32,12 +33,13 @@ import enNarrator from "../../locales/en/narrator.json";
 import en from "../../locales/en/projects.json";
 import zhNarrator from "../../locales/zh-CN/narrator.json";
 import zh from "../../locales/zh-CN/projects.json";
-import { ProjectTeamsList } from "./ProjectTeamsList";
 import { ActivityLine, TeamActivity } from "./TeamActivity";
 import { TeamAttention } from "./TeamAttention";
+import { TeamCoordinatorHeader } from "./TeamCoordinatorHeader";
 import { TeamHeader } from "./TeamHeader";
 import { TeamMembersPanel } from "./TeamMembers";
 import { TeamReadOnlyStart, TeamStart } from "./TeamStart";
+import { DependencySections, ReviewFindings } from "./TeamWorkDrawer";
 import { TeamWorkList } from "./TeamWorkList";
 import { attentionEntries, statusSentence, teamPageMode } from "./team-page-model";
 
@@ -272,7 +274,7 @@ describe("等你处理", () => {
 		const html = await attention([call()]);
 		expect(html).toContain('data-kind="tool"');
 		expect(html).toContain("Add the board");
-		expect(html).toContain("the worker asks to run Bash");
+		expect(html).toContain("the worker asks to run a command");
 		expect(html).toContain("pnpm --filter web add @acme/pay-sdk@3.2.0");
 		expect(html).toContain('data-testid="team-approval-deny"');
 		expect(html).toContain('data-testid="team-approval-approve"');
@@ -409,7 +411,7 @@ describe("work list", () => {
 		expect(groups).toEqual(["needsYou", "inProgress", "review"]);
 		expect(html).toContain("需要你");
 		expect(html).toContain("评审 · 就绪");
-		expect(html).toContain("等批准 Bash");
+		expect(html).toContain("等批准运行命令");
 		expect(html).toContain("+214");
 		expect(html).toContain("运行");
 		expect(html).toContain("pnpm test api/auth");
@@ -533,52 +535,6 @@ describe("members (M1)", () => {
 		expect(zhHtml).toContain("旁观者");
 		expect(zhHtml).toContain("所有者");
 		expect(zhHtml).toContain("最近没有发言");
-	});
-});
-
-describe("project teams list", () => {
-	test("an archived team's row offers no pin; an active team's row does", async () => {
-		const row = (id: string, patch: Partial<TeamSummary> = {}): TeamSummary => ({
-			id,
-			projectId: "p",
-			name: id,
-			baseBranch: "main",
-			status: "active",
-			coordinatorStatus: "idle",
-			createdBy: null,
-			createdAt: "2026-11-18T00:00:00.000Z",
-			updatedAt: "2026-11-18T00:00:00.000Z",
-			access: "write",
-			briefBytes: 0,
-			...patch,
-		});
-		const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-		// A cached page that outlived an archive (the list asks for active teams only).
-		client.setQueryData(teamKeys.list("p"), {
-			pages: [
-				{
-					teams: [
-						row("live"),
-						row("gone", { status: "archived", coordinatorStatus: "archived" }),
-						row("going", { coordinatorStatus: "archived" }),
-					],
-					nextCursor: null,
-				},
-			],
-			pageParams: [undefined],
-		});
-		const html = await render(
-			<ProjectTeamsList projectId="p" canCreate={false} onOpenTeam={() => {}} />,
-			client,
-		);
-		const rows = [...html.matchAll(/data-team-id="([^"]+)"(.*?)(?=data-team-id=|$)/gs)].map(
-			(match) => [match[1], match[2].includes('data-testid="pin-to-sidebar"')],
-		);
-		expect(rows).toEqual([
-			["live", true],
-			["gone", false],
-			["going", false],
-		]);
 	});
 });
 
@@ -938,5 +894,260 @@ describe("questions keep their context", () => {
 			expect(text).toContain("mian");
 			expect(text).not.toContain("teams.page");
 		}
+	});
+});
+
+describe("dependencies (D)", () => {
+	const dep = (id: string, title: string, state: TeamBoardItem["state"]) => ({ id, title, state });
+	const rows = (items: TeamBoardItem[], lng: "en" | "zh-CN") =>
+		render(
+			<TeamWorkList
+				projectId="p"
+				teamId="lead"
+				summary={summary()}
+				items={items}
+				approvals={[]}
+				stats={{}}
+				base="main"
+				loading={false}
+				failed={false}
+				hasMore={false}
+				onLoadMore={noop}
+				highlightId={null}
+				mode={teamPageMode(summary())}
+				archiving={false}
+				onArchive={noop}
+				onDisband={noop}
+				onOpenItem={noop}
+			/>,
+			new QueryClient(),
+			lng,
+		);
+
+	test("a blocked queued row names what it waits for, or how many; a cancelled one says so", async () => {
+		const queued = (id: string, dependsOn: TeamBoardItem["dependsOn"]) =>
+			item({ id, state: "queued", worker: null, dependsOn });
+		const zhHtml = await rows(
+			[
+				queued("one", [dep("a", "数据表", "in_progress")]),
+				queued("two", [dep("a", "数据表", "ready"), dep("b", "接口", "queued")]),
+				queued("many", [
+					dep("a", "A", "queued"),
+					dep("b", "B", "queued"),
+					dep("c", "C", "queued"),
+					dep("d", "D", "merged"),
+				]),
+				queued("gone", [dep("x", "旧方案", "cancelled")]),
+				queued("free", [dep("d", "D", "merged")]),
+			],
+			"zh-CN",
+		);
+		expect(zhHtml).toContain("排队 · 等「数据表」合并");
+		expect(zhHtml).toContain("排队 · 等「数据表」「接口」合并");
+		expect(zhHtml).toContain("排队 · 等 3 项合并");
+		expect(zhHtml).toContain("排队 · 依赖「旧方案」已取消");
+		const enHtml = await rows(
+			[queued("two", [dep("a", "Schema", "queued"), dep("b", "API", "queued")])],
+			"en",
+		);
+		expect(enHtml).toContain("Queued · waiting for “Schema” and “API” to merge");
+	});
+
+	const detail = (patch: Partial<TeamWorkItemDetail> = {}): TeamWorkItemDetail => ({
+		item: item({
+			id: "w2",
+			state: "queued",
+			worker: null,
+			dependsOn: [dep("a", "数据表", "merged"), dep("b", "旧方案", "cancelled")],
+		}),
+		base: "main",
+		aheadBy: 0,
+		stat: null,
+		files: [],
+		filesMore: false,
+		diffAvailable: false,
+		reviews: [],
+		events: [],
+		eventsMore: false,
+		canReturn: false,
+		dependents: [dep("c", "页面", "queued")],
+		dependentsMore: true,
+		...patch,
+	});
+
+	test("the drawer lists dependencies with their state, warns about a cancelled one, and lists dependents", async () => {
+		const opened: string[] = [];
+		const html = await render(
+			<DependencySections detail={detail()} onOpenItem={(id) => opened.push(id)} />,
+			new QueryClient(),
+			"zh-CN",
+		);
+		expect(html).toContain('data-testid="team-drawer-dependencies"');
+		expect(html).toContain("依赖");
+		expect(html).toContain('data-state="merged"');
+		expect(html).toContain("已合并");
+		expect(html).toContain('data-testid="team-dependency-cancelled"');
+		expect(html).toContain("「旧方案」已取消，永远不会合并");
+		expect(html).toContain('data-testid="team-drawer-dependents"');
+		expect(html).toContain("被依赖");
+		expect(html).toContain("页面");
+		expect(html).toContain("依赖它的工作项比这里列出的多");
+		// Titles are buttons that open the item in the drawer.
+		expect(html.match(/<button/g)?.length).toBe(3);
+
+		const waiting = await render(
+			<DependencySections
+				detail={detail({
+					item: item({ state: "queued", worker: null, dependsOn: [dep("a", "Schema", "ready")] }),
+					dependents: [],
+					dependentsMore: false,
+				})}
+			/>,
+			new QueryClient(),
+			"en",
+		);
+		expect(waiting).toContain("Ready to merge");
+		expect(waiting).toContain("Starts once every item here is merged into main.");
+		expect(waiting).not.toContain("team-dependency-cancelled");
+		expect(waiting).not.toContain("team-drawer-dependents");
+		const none = await render(
+			<DependencySections detail={detail({ item: item(), dependents: [] })} />,
+		);
+		expect(none).not.toContain("data-testid");
+	});
+
+	test("the activity words dependency changes and unblocks", async () => {
+		const event = (kind: string, detailValue: Record<string, unknown>) => ({
+			id: kind,
+			kind,
+			workItemId: "w2",
+			workItemTitle: "API",
+			actorKind: "agent" as const,
+			actorId: "lead",
+			actorName: "Release crew",
+			detail: detailValue,
+			detailOmitted: false,
+			createdAt: "2026-11-18T00:00:01.000Z",
+		});
+		const html = await render(
+			<>
+				<ActivityLine event={event("work.dependencies_changed", { dependsOn: ["a", "b"] })} />
+				<ActivityLine event={event("work.unblocked", { mergedItem: "a", dependsOn: ["a"] })} />
+			</>,
+			new QueryClient(),
+			"zh-CN",
+		);
+		expect(html).toContain("修改依赖");
+		// The event keeps only ids, not which were merged then: the count is worded neutrally.
+		expect(html).toContain("依赖 2 项");
+		expect(html).not.toContain("项合并");
+		expect(html).toContain("可以开始了");
+		expect(html).toContain("依赖的工作项都已合并");
+	});
+});
+
+describe("review findings", () => {
+	test("muted text clamped to three lines, 展开 when long, a note when cut", async () => {
+		const short = await render(
+			<ReviewFindings text="缺少跨日边界用例" clipped={false} />,
+			undefined,
+			"zh-CN",
+		);
+		expect(short).toContain("缺少跨日边界用例");
+		expect(short).toContain("--text-line-clamp:3");
+		expect(short).not.toContain("team-review-findings-toggle");
+		const long = await render(
+			<ReviewFindings text={"x".repeat(300)} clipped />,
+			undefined,
+			"zh-CN",
+		);
+		expect(long).toContain("team-review-findings-toggle");
+		expect(long).toContain("展开");
+		expect(long).toContain("评审意见合计太长");
+		const gone = await render(<ReviewFindings text={null} clipped />);
+		expect(gone).toContain("The findings are too long in all");
+	});
+});
+
+describe("the coordinator's column header", () => {
+	const agent = (id: string, status = "working") => ({ id, title: id, status });
+	test("协调者 · N 个会话在运行 · 完整会话, in place of the session toolbar", async () => {
+		const running = summary({
+			coordinatorStatus: "working",
+			runningAgents: [agent("lead"), agent("w1"), agent("w2"), agent("w3"), agent("w4")],
+			runningCount: 5,
+		});
+		const zhHtml = await render(
+			<TeamCoordinatorHeader summary={running} onOpenCoordinatorSession={() => {}} />,
+			undefined,
+			"zh-CN",
+		);
+		expect(zhHtml).toContain("协调者");
+		expect(zhHtml).toContain("4 个会话在运行");
+		expect(zhHtml).not.toContain("工作者");
+		expect(zhHtml).toContain("完整会话");
+		expect(zhHtml).toContain('data-tone="blue"');
+		const html = await render(<TeamCoordinatorHeader summary={running} />);
+		expect(html).toContain("4 sessions running");
+		// No way to the full session given: no link.
+		expect(html).not.toContain("team-coordinator-full-session");
+		const idle = await render(
+			<TeamCoordinatorHeader summary={summary()} onOpenCoordinatorSession={() => {}} />,
+			undefined,
+			"zh-CN",
+		);
+		expect(idle).toContain("空闲");
+		expect(idle).toContain('data-kind="status"');
+	});
+
+	test("a list cut down to the coordinator still reads 1+, never 0+", async () => {
+		const cut = summary({ runningAgents: [agent("lead")], runningCount: 2 });
+		const zhHtml = await render(<TeamCoordinatorHeader summary={cut} />, undefined, "zh-CN");
+		expect(zhHtml).toContain("1+ 个会话在运行");
+		expect(zhHtml).not.toContain("0+");
+		expect(await render(<TeamCoordinatorHeader summary={cut} />)).toContain("1+ sessions running");
+	});
+
+	test("连接断开 while the panel's socket is down, nothing while it is up", async () => {
+		const down = { disconnected: true, reconnect: () => {} };
+		const zhHtml = await render(
+			<TeamCoordinatorHeader summary={summary()} connection={down} />,
+			undefined,
+			"zh-CN",
+		);
+		expect(zhHtml).toContain("team-coordinator-disconnected");
+		expect(zhHtml).toContain("连接断开");
+		expect(zhHtml).toContain('title="点击重新连接"');
+		const html = await render(<TeamCoordinatorHeader summary={summary()} connection={down} />);
+		expect(html).toContain("Disconnected");
+		for (const connection of [undefined, null, { ...down, disconnected: false }]) {
+			const upHtml = await render(
+				<TeamCoordinatorHeader summary={summary()} connection={connection} />,
+			);
+			expect(upHtml).not.toContain("team-coordinator-disconnected");
+		}
+	});
+
+	test("the session page keeps its toolbar: only the team route leaves it out", () => {
+		const panel = readFileSync(new URL("../narrator/NarratorPanel.tsx", import.meta.url), "utf8");
+		expect(panel).toContain("hideHeader = false,");
+		expect(panel).toMatch(/\{!hideHeader && \(\s*<NarratorHeaderLayout/);
+		const route = readFileSync(
+			new URL("../../routes/projects/$projectId_.teams.$teamId.tsx", import.meta.url),
+			"utf8",
+		);
+		expect(route).toMatch(/\bhideHeader\b/);
+		// The hidden header's 「连接断开」 reaches the coordinator line through the panel's report.
+		expect(route).toMatch(/onConnectionChange=\{onConnectionChange\}/);
+		expect(route).toMatch(/onConnectionChange=\{setConnection\}/);
+		expect(route).toMatch(/conversationConnection=\{connection\}/);
+		expect(panel).toContain(
+			"useReportPanelConnection(onConnectionChange, disconnected && !isWorkspacePreview, reconnect);",
+		);
+		const session = readFileSync(
+			new URL("../../routes/narrators/$narratorId.tsx", import.meta.url),
+			"utf8",
+		);
+		expect(session).not.toMatch(/\bhideHeader\b/);
 	});
 });
