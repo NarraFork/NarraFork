@@ -95,6 +95,9 @@ function goOnline(deviceId = "dev-1") {
 }
 
 afterEach(async () => {
+	// Going offline ends any cleanup retry a test left scheduled.
+	for (const deviceId of ["dev-1", "dev-2", "dev-3"])
+		eventBus.emit({ type: "device:status", deviceId, status: "offline" });
 	await terminalService.shutdownAll().catch(() => {});
 	for (const id of ["t-durable", "t-unnumbered", "t-legacy"])
 		await new BufferManager(id).deleteFromDisk();
@@ -214,6 +217,26 @@ describe("remote terminals backed by executor sessions", () => {
 		await until(() => calls.length === 1);
 		await Bun.sleep(20);
 		expect(cleanups()).toHaveLength(1);
+	});
+
+	test("a stop that fails while the device stays online is retried without a reconnect", async () => {
+		db.insert(executorSessionCleanups)
+			.values({ deviceId: "dev-3", sessionId: "nf-term-retry", createdAt: now })
+			.run();
+		let failures = 1;
+		sendRpc.mockImplementation((_deviceId, method, params, options) => {
+			calls.push({ method, params, options });
+			// A transient failure: the executor is reachable but did not confirm in time.
+			if (failures-- > 0) return Promise.reject(new Error("RPC timed out"));
+			return Promise.resolve({});
+		});
+		goOnline("dev-3");
+		await until(() => calls.length === 2);
+		await until(() => cleanups().length === 0);
+		expect(calls.map((call) => call.params)).toEqual([
+			{ sessionId: "nf-term-retry", release: true },
+			{ sessionId: "nf-term-retry", release: true },
+		]);
 	});
 
 	test("an exited shell is released only after its final state is persisted", async () => {

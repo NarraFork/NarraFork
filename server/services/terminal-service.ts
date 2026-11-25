@@ -286,15 +286,20 @@ async function runExecutorCleanup(deviceId: string, sessionId: string): Promise<
 
 async function stopExecutorSession(deviceId: string, sessionId: string): Promise<void> {
 	await recordExecutorCleanup(deviceId, sessionId);
-	void runExecutorCleanup(deviceId, sessionId).catch((error) =>
-		logger.warn("Executor session cleanup failed", { deviceId, sessionId, error: String(error) }),
-	);
+	void runExecutorCleanup(deviceId, sessionId)
+		.catch((error) => {
+			logger.warn("Executor session cleanup failed", { deviceId, sessionId, error: String(error) });
+			return false;
+		})
+		.then((done) => {
+			if (!done) scheduleExecutorCleanupRetry(deviceId);
+		});
 }
 
 const CLEANUP_PAGE = 100;
 
-/** Retry every pending cleanup for a device, a bounded page at a time. */
-async function reconcileExecutorCleanups(deviceId: string): Promise<void> {
+/** Deliver every pending cleanup for a device, a bounded page at a time; true when none is left. */
+async function reconcileExecutorCleanups(deviceId: string): Promise<boolean> {
 	const pending = await readQuery(
 		db
 			.select({ sessionId: executorSessionCleanups.sessionId })
@@ -304,20 +309,54 @@ async function reconcileExecutorCleanups(deviceId: string): Promise<void> {
 		{ executionPolicy: "worker-required", maxRows: CLEANUP_PAGE },
 	);
 	for (const { sessionId } of pending) {
-		if (!(await runExecutorCleanup(deviceId, sessionId))) return;
+		if (!(await runExecutorCleanup(deviceId, sessionId))) return false;
 	}
-	if (pending.length === CLEANUP_PAGE) await reconcileExecutorCleanups(deviceId);
+	if (pending.length === CLEANUP_PAGE) return reconcileExecutorCleanups(deviceId);
+	return true;
+}
+
+/** Delays between reconcile attempts while the device stays online and stops remain. */
+export const EXECUTOR_CLEANUP_RETRY_MS = [500, 5_000, 30_000, 120_000];
+const cleanupRetries = new Map<string, { timer: ReturnType<typeof setTimeout>; attempt: number }>();
+
+/**
+ * Reconcile a device's pending stops now, and keep retrying with backoff while it stays
+ * online and something is left: a transient failure (read Worker busy, RPC timeout) must
+ * not wait for the next reconnect. Going offline ends the retries; coming online restarts them.
+ */
+function reconcileWithRetry(deviceId: string, attempt = 0): void {
+	const scheduled = cleanupRetries.get(deviceId);
+	if (scheduled) clearTimeout(scheduled.timer);
+	cleanupRetries.delete(deviceId);
+	void reconcileExecutorCleanups(deviceId)
+		.catch((error) => {
+			logger.warn("Executor session cleanup reconcile failed", { deviceId, error: String(error) });
+			return false;
+		})
+		.then((done) => {
+			if (!done) scheduleExecutorCleanupRetry(deviceId, attempt);
+		});
+}
+
+function scheduleExecutorCleanupRetry(deviceId: string, attempt = 0): void {
+	if (cleanupRetries.has(deviceId) || !isDeviceOnline(deviceId)) return;
+	const delay = EXECUTOR_CLEANUP_RETRY_MS[Math.min(attempt, EXECUTOR_CLEANUP_RETRY_MS.length - 1)];
+	const timer = setTimeout(() => {
+		cleanupRetries.delete(deviceId);
+		if (isDeviceOnline(deviceId)) reconcileWithRetry(deviceId, attempt + 1);
+	}, delay);
+	timer.unref?.();
+	cleanupRetries.set(deviceId, { timer, attempt });
 }
 
 if (hotOnce("narrafork:terminal-executor-session-cleanup")) {
 	eventBus.on("device:status", (event) => {
-		if (event.status !== "online") return;
-		void reconcileExecutorCleanups(event.deviceId).catch((error) =>
-			logger.warn("Executor session cleanup reconcile failed", {
-				deviceId: event.deviceId,
-				error: String(error),
-			}),
-		);
+		if (event.status === "online") reconcileWithRetry(event.deviceId);
+		else {
+			const scheduled = cleanupRetries.get(event.deviceId);
+			if (scheduled) clearTimeout(scheduled.timer);
+			cleanupRetries.delete(event.deviceId);
+		}
 	});
 }
 
