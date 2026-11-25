@@ -42,7 +42,7 @@ keywords:
   - scanPendingCalls
   - TeamCard
 status: draft
-verified_at: 5716689ba
+verified_at: 0baba9c1a
 ---
 # 项目页、项目列表与项目设置页
 
@@ -59,7 +59,7 @@ verified_at: 5716689ba
 - 团队卡片走已有的 `GET /:projectId/teams?counts=true`（`server/routes/project-teams.ts`）：每页最多 24 个团队，每个团队带 `card`（`teams/team-board.ts:readTeamCards`，计数经读 worker、5s 超时：未结束的状态按 `(team_id, state, id)` 分组精确计数；已合并、已取消每个团队每种各数到 1000（`LIMIT` 子查询，一条 `UNION ALL`），卡片显示「999+」，24 个团队各 5 万条已合并项约 30ms，旧的整段分组计数在主线程约 120ms；协调者行与最近事件一条语句；运行中数最多 21，成员才有待批数）。
 
 前端：
-- `routes/projects/$projectId.tsx`：页头（`ProjectHeader`：名称、固定到侧栏、路径尾部（悬停看全路径）、默认分支、「N 位成员」（`useProjectAccess.ts:useProjectMemberCount`，键在 `["projects", id, …]` 下，成员变更与 `project_access_changed` 一起失效；超限写「999+ 位成员」，读不到就不显示；点击去设置页 `#settings-members`，设置页按 hash 选中并滚到那一组，`ProjectSettingsPage.tsx:groupOfHash`）；「新团队」「新会话」；「…」里有项目设置，大纲开启时还有打开大纲和任务板切换）。手机上页头第一行带 `MobileNavButton`，浮动菜单按钮不再盖住标题。只在 `canWrite` 时读「等你处理」。PG 上团队卡片 503 时不显示「新团队」。
+- `routes/projects/$projectId.tsx`：页头（`ProjectHeader`：名称、固定到侧栏、路径尾部（悬停看全路径）、默认分支、「N 位成员」（`useProjectAccess.ts:useProjectMemberCount`，键在 `["projects", id, …]` 下，成员变更与 `project_access_changed` 一起失效；超限写「N+ 位成员」（N 取服务端给的上限 999），读不到就不显示；点击去设置页 `#settings-members`，设置页按 hash 选中并滚到那一组，`ProjectSettingsPage.tsx:groupOfHash`）；「新团队」「新会话」；「…」里有项目设置，大纲开启时还有打开大纲和任务板切换）。手机上页头第一行带 `MobileNavButton`，浮动菜单按钮不再盖住标题。只在 `canWrite` 时读「等你处理」。PG 上团队卡片 503 时不显示「新团队」。
 - 「等你处理」复用团队页的 `TeamAttention`（`flush`、`inPage`：桌面上没有内部滚动，多于 3 条折叠；手机上与团队页一样横向滑动加圆点），条目来自 `project-page-model.ts:projectAttentionEntries`，卡片前写团队名、会话卡片后写「谁的会话」；工具调用按工具说成「请求编辑文件 / 运行命令 / 读取文件 / 访问网页 / 使用 X」（`team-page-model.ts:toolVerb`）。决定后刷新 `projectDecisionKeys` 列出的读取：本页等你处理、项目列表汇总、团队卡片、会话列表，来自团队时还有该团队页（审批与摘要）。ready 项和团队名点开团队页。
 - 团队卡片（`ProjectTeamCards`，缓存里已归档的团队不显示，`liveTeamCards`）：状态句用团队页的 `statusSentence`（`teamCardStatus`），数字为进行中（排队+进行+评审中）/就绪/完成，成员看到「N 等你」（待批+就绪）；末尾虚线「新团队」卡；没有团队时一行说明加按钮。
 - 会话（`ProjectSessions`）：三个标签带计数（`999+`）。「进行中」先是运行中与等待中的会话，用首页的会话卡片（`dashboard/DashboardSessions.tsx:SessionCard`，同样的网格 `SESSION_CARD_GRID_COLS`，`dashboard-sessions.ts:toSession` 叠加实时活动），最近工具调用来自 `useNarratorActivity` 的 activity 订阅；最多 12 张卡片（`PROJECT_RUNNING_CARDS_SHOWN`）再「显示全部」，展开后也不超过首页的订阅上限 40；卡片不再另写「在做什么」。其后是「最近 7 天」的紧凑行（`sessionSections`）；「全部」「我的」都是紧凑行。

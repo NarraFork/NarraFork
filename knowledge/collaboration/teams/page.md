@@ -47,7 +47,7 @@ keywords:
   - permission_decided_by
   - answerForm
 status: draft
-verified_at: 5716689ba
+verified_at: 0baba9c1a
 ---
 # 团队页与审批
 
@@ -77,7 +77,7 @@ verified_at: 5716689ba
 - 不在团队里的调用不处理；PG 上不记录。IM 网关永远不能做这种决定。
 
 前端（`frontend/components/teams/`）：
-- 路由 `frontend/routes/projects/$projectId_.teams.$teamId.tsx`（不嵌在项目页下，占满外壳内容区）→ `TeamPageView.tsx`。对话是普通叙述者面板，只读成员的输入区换成「你是只读成员」（`NarratorPanel` 的 `readOnlyNotice`）；面板以 `hideHeader` 挂载，不画它自己的标题行与工具栏，对话上方是 `TeamCoordinatorHeader.tsx` 的一行「协调者 · 在跟进 N 个工作者 · 完整会话 ↗」（`team-page-model.ts:coordinatorLine`：摘要里协调者之外运行中的会话数，名单被截断时写 N+；没有别的在跑时写协调者自己的状态 工作中/在等人处理/空闲/已归档；圆点是协调者的运行状态）。完整工具栏只在协调者自己的会话页上（「完整会话」与「…」菜单的协调者完整会话都走 `onOpenCoordinatorSession`）。
+- 路由 `frontend/routes/projects/$projectId_.teams.$teamId.tsx`（不嵌在项目页下，占满外壳内容区）→ `TeamPageView.tsx`。对话是普通叙述者面板，只读成员的输入区换成「你是只读成员」（`NarratorPanel` 的 `readOnlyNotice`）；面板以 `hideHeader` 挂载，不画它自己的标题行与工具栏，对话上方是 `TeamCoordinatorHeader.tsx` 的一行「协调者 · 在跟进 N 个工作者 · 完整会话 ↗」（`team-page-model.ts:coordinatorLine`：摘要里协调者之外运行中的会话数，名单被截断时写 N+；没有别的在跑时写协调者自己的状态 工作中/在等人处理/空闲/已归档；圆点是协调者的运行状态）。完整工具栏只在协调者自己的会话页上（「完整会话」与「…」菜单的协调者完整会话都走 `onOpenCoordinatorSession`）。消息区本身与会话页相同：协调者的 `Team` 工具调用照常是工具卡片（不折叠成「创建工作项 ×N」这类一行），团队事件也不作为分隔线插进对话（两者都要改虚拟列表的分组与高度模型，未做；事件看右栏动态与抽屉时间线）。
 - 团队页只讲一个团队：没有项目团队列表、没有「新建团队」、没有左侧团队切换。切换走侧栏固定的团队标签和项目页的团队卡片；新建走项目页或新建会话弹窗的「以团队开始」。
 - `TeamWorkspace.tsx`：页头、等你处理、两栏（对话约 60%，右栏约 40%，最小 320、最大 560，右栏顶部「工作 | 动态」切换与「N 项未完成」）；按自身宽度（不是视口）在 `split` 与 `tabs`（帧宽 < `TEAM_SPLIT_MIN_WIDTH` 860）之间选，`tabs` 是「对话 | 工作 (N)」，工作页里仍有同一个切换。对话在各布局里挂在 React 树的同一位置，换布局不重挂；从别处要求聚焦对话时先切到对话标签，渲染后再聚焦输入框。
 - `TeamHeader.tsx`：一行（手机两行）：返回、项目名、团队名、状态句（`team-page-model.ts:statusSentence`：「N 项进行中 · M 项等你」，旁观者是「等成员处理」，「空闲 · 还没有工作项 / N 项已完成」，「已暂停」= 有未完成项、没有在跑的会话且协调者上一轮被人停下，「已归档」）；等待数在审批列表 `more` 时写成「N+ 项等你」；右侧成员头像（最多 3 个加 +N，点开成员抽屉 `TeamMembers.tsx`）、固定到侧栏、「全部暂停」（普通按钮；手机上在「…」里）、「…」菜单（运行中的会话列表，取自摘要，点开会话；团队设置 `TeamSettingsModal.tsx` 改基线分支与简报、协调者完整会话、解散团队 `TeamDisbandDialog.tsx`）。手机上两行，第一行仍有返回箭头。「全部暂停」只给成员，协调者已归档时只在还有会话在跑时出现；协调者先停（`pauseOrder`），一次最多读 500 个运行中会话，结果分 paused / pausedSomeIdle / pausePartial / pauseNothing / pauseMore。
