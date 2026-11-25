@@ -70,8 +70,8 @@ export async function applyCredentialImport(
 		(index, existingId) => {
 			const choice = choices.get(index);
 			if (!choice) return "skip";
-			if (!existingId) return "add";
-			return choice === "replace" ? "replace" : "skip";
+			if (choice === "replace") return "replace";
+			return existingId ? "skip" : "add";
 		},
 	);
 	logger.info("Credentials imported", { userId: actor.userId, ...result });

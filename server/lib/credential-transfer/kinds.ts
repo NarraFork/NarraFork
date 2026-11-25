@@ -1,5 +1,6 @@
 /** The single credential format shared by credential transfer and data exports. */
 import { SERVICE_TEMPLATE_IDS } from "@shared/sourcing/identify";
+import { restoreTokenDanceLoginAccount } from "../../services/tokendance-service";
 import {
 	codexFromCredential,
 	codexToCredential,
@@ -449,7 +450,7 @@ export async function importCredentialItems(
 		}
 		const fields = {
 			label: item.credential.label ?? "",
-			account: item.credential.account ?? null,
+			...(item.templateId === "tokendance" ? {} : { account: item.credential.account ?? null }),
 			disabled: !!item.credential.disabled,
 			...(item.credential.disabledReason === "manual" ||
 			item.credential.disabledReason === "invalid"
@@ -459,6 +460,13 @@ export async function importCredentialItems(
 		};
 		if (existing) {
 			store.update(existing, fields);
+			if (item.templateId === "tokendance") {
+				restoreTokenDanceLoginAccount(
+					existing,
+					item.credential.account ?? null,
+					action === "replace",
+				);
+			}
 			result.replaced++;
 			continue;
 		}
@@ -472,6 +480,13 @@ export async function importCredentialItems(
 			{ apiKey: item.credential.auth.apiKey },
 		);
 		store.update(added.id, fields);
+		if (item.templateId === "tokendance") {
+			restoreTokenDanceLoginAccount(
+				added.id,
+				item.credential.account ?? null,
+				action === "replace",
+			);
+		}
 		result.added++;
 	}
 	return result;
@@ -514,7 +529,7 @@ export function restoreProviderTransferItems(
 				).id;
 			const fields = {
 				label: item.credential.label ?? "",
-				account: item.credential.account ?? null,
+				...(item.templateId === "tokendance" ? {} : { account: item.credential.account ?? null }),
 				disabled: !!item.credential.disabled,
 				...(item.credential.disabledReason === "manual" ||
 				item.credential.disabledReason === "invalid"
@@ -523,6 +538,9 @@ export function restoreProviderTransferItems(
 				network: item.credential.network ?? null,
 			};
 			store.update(id, fields);
+			if (item.templateId === "tokendance") {
+				restoreTokenDanceLoginAccount(id, item.credential.account ?? null);
+			}
 			restored.add(id);
 			result.imported++;
 		} catch {

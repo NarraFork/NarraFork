@@ -1,5 +1,9 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
-import type { TokenDancePaymentSession, TokenDancePublicConnection } from "@shared/tokendance";
+import type {
+	TokenDanceLoginChoice,
+	TokenDancePaymentSession,
+	TokenDancePublicConnection,
+} from "@shared/tokendance";
 import type { QueryClient as QueryClientType } from "@tanstack/react-query";
 import { createInstance } from "i18next";
 import { parseHTML } from "linkedom";
@@ -249,7 +253,12 @@ async function tick(delay: number) {
 	});
 	await settle();
 }
-async function renderSection() {
+async function renderSection(
+	options: {
+		connection?: TokenDancePublicConnection;
+		onLogin?: (choice?: TokenDanceLoginChoice) => Promise<void>;
+	} = {},
+) {
 	await act(async () =>
 		root.render(
 			<QueryClientProvider client={qc}>
@@ -257,11 +266,11 @@ async function renderSection() {
 					<MantineProvider env="test">
 						<ConfirmDialogContext.Provider value={{ confirm: async () => true }}>
 							<TokenDanceSection
-								connection={connection}
+								connection={options.connection ?? connection}
 								enabled
 								onToggleEnabled={() => {}}
 								onToolResultImagesChange={() => {}}
-								onLogin={async () => {}}
+								onLogin={options.onLogin ?? (async () => {})}
 								onChanged={async () => {}}
 								onDeleted={() => {}}
 								hiddenModels={new Set()}
@@ -325,6 +334,44 @@ async function recovery(action = "top_up_balance") {
 	await settle();
 }
 describe("TokenDance recharge behavior", () => {
+	it.each([
+		"replace",
+		"add",
+	] as const)("an unmarked connection requires an explicit %s choice before OAuth", async (mode) => {
+		const choices: Array<TokenDanceLoginChoice | undefined> = [];
+		await renderSection({
+			connection: { ...connection, unboundKeys: [{ id: "old-slot", label: "Old login" }] },
+			onLogin: async (choice) => {
+				choices.push(choice);
+			},
+		});
+		expect(button(settings.tokendance.reauthorize).disabled).toBe(true);
+		const select = container.querySelector(
+			`input[placeholder="${settings.tokendance.loginChoicePlaceholder}"]`,
+		);
+		if (!select) throw new Error("Missing login slot choice");
+		await act(async () => {
+			select.dispatchEvent(new window.Event("click", { bubbles: true }));
+		});
+		await settle();
+		const label =
+			mode === "add"
+				? settings.tokendance.loginKeepKeys
+				: settings.tokendance.loginReplaceKey.replace("{{key}}", "Old login");
+		const option = [...document.querySelectorAll('[role="option"]')].find(
+			(entry) => entry.textContent === label,
+		);
+		if (!option) throw new Error(`Missing option ${label}: ${document.body.textContent}`);
+		await act(async () => {
+			option.dispatchEvent(new window.Event("click", { bubbles: true }));
+		});
+		await settle();
+		expect(button(settings.tokendance.reauthorize).disabled).toBe(false);
+		await act(async () => {
+			button(settings.tokendance.reauthorize).click();
+		});
+		expect(choices).toEqual([mode === "replace" ? { mode, credentialId: "old-slot" } : { mode }]);
+	});
 	it("a single ready TokenDance key exposes its working network editor", async () => {
 		getKeys.mockResolvedValue({
 			keys: [

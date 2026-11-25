@@ -222,7 +222,7 @@ describe("settings projection", () => {
 			}
 		});
 
-		test(`${unified ? "unified" : "legacy"}: only an identifiable legacy TokenDance login is marked`, () => {
+		test(`${unified ? "unified" : "legacy"}: neither inline nor migrated TokenDance keys imply login provenance`, () => {
 			const { store } = freshStore(unified);
 			const projectionStore = spyOn(providerKeys, "getProviderKeyStore").mockReturnValue(store);
 			try {
@@ -232,7 +232,7 @@ describe("settings projection", () => {
 				absorbProviderKeys(legacy);
 				const login = store.list(TOKENDANCE_KEY_OWNER)[0];
 				if (!login) throw new Error("Expected migrated login");
-				expect(providerKeys.isTokenDanceLoginKey(login)).toBe(true);
+				expect(providerKeys.isTokenDanceLoginKey(login)).toBe(false);
 				const edited = structuredClone(legacy);
 				if (!edited.tokendance) throw new Error("Expected connection");
 				edited.tokendance.apiKey = "manually-replaced";

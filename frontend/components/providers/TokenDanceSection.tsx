@@ -1,6 +1,7 @@
 import { Alert, Button, Group, Select, Stack, Switch, Text } from "@mantine/core";
 import {
 	parseTokenDanceRecoveryAction,
+	type TokenDanceLoginChoice,
 	type TokenDancePublicConnection,
 	type TokenDanceRecoveryAction,
 } from "@shared/tokendance";
@@ -32,7 +33,7 @@ export function TokenDanceSection({
 	toolResultImages?: ToolResultImagesMode;
 	onToolResultImagesChange: (value: ToolResultImagesMode) => void;
 	onToggleEnabled: () => void;
-	onLogin: () => Promise<void>;
+	onLogin: (choice?: TokenDanceLoginChoice) => Promise<void>;
 	onChanged: () => Promise<void>;
 	onDeleted: () => void;
 }) {
@@ -51,6 +52,7 @@ export function TokenDanceSection({
 	useEffect(() => {
 		setRechargeOpened(false);
 		setBalanceRefreshFailed(false);
+		setLoginSelection(null);
 	}, [connection.generation, connection.disabled, user?.id, user?.role]);
 	const [recovery, setRecovery] = useState<{
 		generation: number;
@@ -61,6 +63,15 @@ export function TokenDanceSection({
 	const busyRef = useRef(false);
 	const [busy, setBusy] = useState(false);
 	const [error, setError] = useState(false);
+	const [loginSelection, setLoginSelection] = useState<string | null>(null);
+	const unboundKeys = connection.unboundKeys ?? [];
+	const needsLoginChoice = unboundKeys.length > 0;
+	const loginChoice: TokenDanceLoginChoice | undefined =
+		loginSelection === "add"
+			? { mode: "add" }
+			: unboundKeys.some((key) => `replace:${key.id}` === loginSelection)
+				? { mode: "replace", credentialId: loginSelection?.slice(8) ?? "" }
+				: undefined;
 	const run = async (action: () => Promise<unknown>) => {
 		if (busyRef.current || !isAdmin) return;
 		busyRef.current = true;
@@ -167,6 +178,23 @@ export function TokenDanceSection({
 				disabled={busy || !isAdmin}
 				onChange={onToggleEnabled}
 			/>
+			{isAdmin && needsLoginChoice && (
+				<Select
+					label={t("tokendance.loginChoice")}
+					description={t("tokendance.loginChoiceDescription")}
+					placeholder={t("tokendance.loginChoicePlaceholder")}
+					value={loginSelection}
+					onChange={setLoginSelection}
+					disabled={busy}
+					data={[
+						{ value: "add", label: t("tokendance.loginKeepKeys") },
+						...unboundKeys.map((key) => ({
+							value: `replace:${key.id}`,
+							label: t("tokendance.loginReplaceKey", { key: key.label }),
+						})),
+					]}
+				/>
+			)}
 			<Group wrap="wrap">
 				<Button
 					loading={busy}
@@ -175,7 +203,10 @@ export function TokenDanceSection({
 				>
 					{t("tokendance.refresh")}
 				</Button>
-				<Button disabled={busy || !isAdmin} onClick={() => void run(onLogin)}>
+				<Button
+					disabled={busy || !isAdmin || (needsLoginChoice && !loginChoice)}
+					onClick={() => void run(() => onLogin(needsLoginChoice ? loginChoice : undefined))}
+				>
 					{t("tokendance.reauthorize")}
 				</Button>
 				{recoveryAction && !isAdmin && <Text>{t("tokendance.contactAdmin")}</Text>}
