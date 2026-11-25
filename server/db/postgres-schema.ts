@@ -1208,6 +1208,16 @@ export const narratorToolContinuations = pgTable(
 	],
 );
 
+export const executorSessionCleanups = pgTable(
+	"executor_session_cleanups",
+	{
+		deviceId: text("device_id").notNull(),
+		sessionId: text("session_id").notNull(),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [primaryKey({ columns: [table.deviceId, table.sessionId] })],
+);
+
 export const terminals = pgTable(
 	"terminals",
 	{
@@ -1218,6 +1228,7 @@ export const terminals = pgTable(
 		cwd: text("cwd"),
 		dtachSocket: text("dtach_socket"),
 		deviceId: text("device_id"),
+		executorSessionId: text("executor_session_id"),
 		status: text("status").notNull().default("running"),
 		exitCode: integer("exit_code"),
 		createdAt: text("created_at").notNull(),
@@ -4675,8 +4686,8 @@ export const teamWorkEvents = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 149,
-  "columnCount": 1976,
+  "tableCount": 150,
+  "columnCount": 1980,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -11400,6 +11411,52 @@ export const POSTGRES_SCHEMA_COVERAGE = {
       "primaryKeys": []
     },
     {
+      "exportName": "executorSessionCleanups",
+      "name": "executor_session_cleanups",
+      "columns": [
+        {
+          "property": "deviceId",
+          "name": "device_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "sessionId",
+          "name": "session_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": [
+        {
+          "columns": [
+            "deviceId",
+            "sessionId"
+          ]
+        }
+      ]
+    },
+    {
       "exportName": "terminals",
       "name": "terminals",
       "columns": [
@@ -11473,6 +11530,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
         {
           "property": "deviceId",
           "name": "device_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "executorSessionId",
+          "name": "executor_session_id",
           "kind": "text",
           "pgType": "text",
           "notNull": false,

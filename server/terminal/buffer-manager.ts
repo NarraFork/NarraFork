@@ -40,6 +40,12 @@ interface BufferFileV3 {
 	serialized: string; // base64 encoded serialize addon output
 	cols: number;
 	rows: number;
+	/**
+	 * Source stream position (an executor session's byte sequence) of the last
+	 * output this snapshot contains. Present only for sources that number their
+	 * output; a reattach resumes from exactly here.
+	 */
+	streamSeq?: number;
 	mouseMode: {
 		x10: boolean;
 		buttonEvent: boolean;
@@ -202,6 +208,13 @@ export class BufferManager {
 	/** Buffered data waiting to be written to xterm in the next drain cycle. */
 	private pendingWrites: string[] = [];
 
+	/** Stream position after the last appended chunk that carried one. */
+	private pendingStreamSeq: number | undefined;
+	/** Stream position of the output xterm has actually parsed (what a save contains). */
+	private appliedStreamSeq: number | undefined;
+	/** Stream position recorded in the snapshot loaded from disk, if any. */
+	private loadedStreamSeq: number | undefined;
+
 	/** Whether a drain loop is currently scheduled/running. */
 	private draining = false;
 
@@ -268,12 +281,28 @@ export class BufferManager {
 		}
 	}
 
-	append(data: string): void {
+	/**
+	 * Queue output for the emulator. `streamSeq` is the source's position after
+	 * this chunk, for sources that number their output; it is saved with the
+	 * snapshot only once the chunk has been parsed.
+	 */
+	append(data: string, streamSeq?: number): void {
 		this.setCurrentReadView(undefined);
 		this.trackMouseMode(data);
 		this.pendingWrites.push(data);
+		if (streamSeq !== undefined) this.pendingStreamSeq = streamSeq;
 		this.dirty = true;
 		if (!this.draining) this.drain();
+	}
+
+	/** Source position of the output the emulator has parsed so far, if numbered. */
+	get streamSeq(): number | undefined {
+		return this.appliedStreamSeq;
+	}
+
+	/** Source position the snapshot loaded by loadFromDisk() ends at, if it recorded one. */
+	get restoredStreamSeq(): number | undefined {
+		return this.loadedStreamSeq;
 	}
 
 	/**
@@ -287,7 +316,10 @@ export class BufferManager {
 			while (this.pendingWrites.length > 0) {
 				const batch = this.pendingWrites.join("");
 				this.pendingWrites.length = 0;
+				// Captured with the batch: later appends belong to the next batch.
+				const batchSeq = this.pendingStreamSeq;
 				await new Promise<void>((resolve) => this.xterm.write(batch, resolve));
+				if (batchSeq !== undefined) this.appliedStreamSeq = batchSeq;
 				this.setCurrentReadView(undefined);
 			}
 			this.draining = false;
@@ -736,6 +768,7 @@ export class BufferManager {
 					cols: this.xterm.cols,
 					rows: this.xterm.rows,
 					mouseMode: { ...this.mouseMode },
+					...(this.appliedStreamSeq !== undefined ? { streamSeq: this.appliedStreamSeq } : {}),
 				};
 				const written = await Bun.write(filePath, JSON.stringify(fileData));
 				this.dirty = false;
@@ -800,6 +833,10 @@ export class BufferManager {
 				this.writeChain = this.writeChain.then(() => this.replay(content));
 				if (parsed.mouseMode) {
 					this.mouseMode = { ...parsed.mouseMode };
+				}
+				if (Number.isSafeInteger(parsed.streamSeq) && parsed.streamSeq >= 0) {
+					this.loadedStreamSeq = parsed.streamSeq;
+					this.appliedStreamSeq = parsed.streamSeq;
 				}
 				logger.debug("Loaded buffer from disk (V3)", {
 					terminalId: this.terminalId,

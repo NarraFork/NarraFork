@@ -161,6 +161,14 @@ export type RpcMethod =
 	| "pty.write"
 	| "pty.resize"
 	| "pty.kill"
+	| "session.open"
+	| "session.attach"
+	| "session.write"
+	| "session.resize"
+	| "session.kill"
+	| "session.info"
+	| "session.list"
+	| "session.release"
 	| "transfer.begin"
 	| "transfer.stat"
 	| "transfer.ack"
@@ -392,6 +400,67 @@ export interface GitDiffParams {
 export interface GitDiffResult {
 	stdout: string;
 	truncated: boolean;
+}
+
+// ── Durable sessions (feature "session.durable.v1") ────────────────────────
+//
+// Unlike pty.open, a session belongs to the executor process, not to an RPC or
+// connection: session.open returns once the process runs, and losing the
+// connection only detaches. Output is a journal whose sequence number is the
+// byte offset since the session started; session.attach resumes from `since`.
+// Its stream frames are, in order: optional "session.gap" (JSON
+// {from,to}: those bytes are no longer retained), contiguous "session.data"
+// (raw bytes), and a final "session.exit" (JSON {exitCode,endSeq}) before the
+// rpc_result. See docs/GENERAL_EXECUTOR-DESIGN.md.
+
+export const SESSION_DURABLE_FEATURE = "session.durable.v1";
+
+export interface SessionOpenParams {
+	/** Caller-chosen id, [A-Za-z0-9_-]{1,128}; rejected if already registered. */
+	sessionId: string;
+	kind?: "pty";
+	cmd?: string[];
+	cwd: string;
+	cols?: number;
+	rows?: number;
+	env?: Record<string, string>;
+}
+
+export interface SessionInfo {
+	sessionId: string;
+	kind: string;
+	state: "running" | "exited";
+	exitCode?: number;
+	startedAt: string;
+	exitedAt?: string;
+	/** Oldest retained output byte. */
+	firstSeq: number;
+	/** Next output byte to be written. */
+	endSeq: number;
+}
+
+export interface SessionAttachParams {
+	sessionId: string;
+	/** First unseen byte; must not exceed the session's endSeq. */
+	since: number;
+}
+export interface SessionAttachResult {
+	exitCode: number;
+	endSeq: number;
+}
+
+export interface SessionWriteParams {
+	sessionId: string;
+	dataB64: string;
+	/** Retrying with the same id is acknowledged without writing again. */
+	writeId?: string;
+}
+export interface SessionWriteResult {
+	duplicate: boolean;
+}
+
+export interface SessionListResult {
+	sessions: SessionInfo[];
 }
 
 // ── PTY (interactive terminal) ──────────────────────────────────────────────

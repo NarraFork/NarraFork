@@ -459,3 +459,46 @@ describe("BufferManager tool observation cursors", () => {
 		expect(point?.marker.isDisposed).toBe(true);
 	});
 });
+
+describe("snapshot stream position", () => {
+	const ids: string[] = [];
+	afterEach(async () => {
+		for (const id of ids.splice(0)) await new BufferManager(id).deleteFromDisk();
+	});
+
+	test("records the position of the output the snapshot contains and restores it", async () => {
+		const id = `seq-${crypto.randomUUID()}`;
+		ids.push(id);
+		const source = new BufferManager(id);
+		source.append("hello ", 6);
+		source.append("world", 11);
+		await source.saveToDisk();
+		expect(source.streamSeq).toBe(11);
+		await source.dispose();
+
+		const restored = new BufferManager(id);
+		expect(await restored.loadFromDisk()).toBe(true);
+		expect(restored.restoredStreamSeq).toBe(11);
+		expect(await restored.getContents()).toContain("hello world");
+		// Later output advances the position from the restored point.
+		restored.append("!", 12);
+		await restored.flush();
+		expect(restored.streamSeq).toBe(12);
+		await restored.dispose(true);
+	});
+
+	test("a source that does not number its output saves no position", async () => {
+		const id = `seq-${crypto.randomUUID()}`;
+		ids.push(id);
+		const source = new BufferManager(id);
+		source.append("plain");
+		await source.saveToDisk();
+		await source.dispose();
+		const file = JSON.parse(await Bun.file(join(buffersDir, `${id}.buf`)).text());
+		expect(file.streamSeq).toBeUndefined();
+		const restored = new BufferManager(id);
+		await restored.loadFromDisk();
+		expect(restored.restoredStreamSeq).toBeUndefined();
+		await restored.dispose(true);
+	});
+});

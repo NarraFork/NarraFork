@@ -1,6 +1,6 @@
 {
-  "id": "abeafedc-f054-41e8-b9a0-edc89be12b9b",
-  "prevId": "ff0d57da-e8d7-48db-88a7-1e3066eaae33",
+  "id": "8c8f8481-5557-4bd2-b492-a30ef8532e5d",
+  "prevId": "abeafedc-f054-41e8-b9a0-edc89be12b9b",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -3120,6 +3120,45 @@
         }
       },
       "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.executor_session_cleanups": {
+      "name": "executor_session_cleanups",
+      "schema": "",
+      "columns": {
+        "device_id": {
+          "name": "device_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "session_id": {
+          "name": "session_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {
+        "executor_session_cleanups_device_id_session_id_pk": {
+          "name": "executor_session_cleanups_device_id_session_id_pk",
+          "columns": [
+            "device_id",
+            "session_id"
+          ]
+        }
+      },
       "uniqueConstraints": {},
       "policies": {},
       "checkConstraints": {},
@@ -25242,6 +25281,12 @@
         },
         "device_id": {
           "name": "device_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "executor_session_id": {
+          "name": "executor_session_id",
           "type": "text",
           "primaryKey": false,
           "notNull": false
