@@ -28,7 +28,7 @@ import {
 	type TeamWorkDependencyRef,
 	type TeamWorkItemState,
 } from "@shared/project-teams";
-import { and, asc, eq, inArray } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull } from "drizzle-orm";
 import { db } from "../../db";
 import { teamWorkItemDependencies, teamWorkItems } from "../../db/schema";
 import { AppError, ValidationError } from "../../lib/errors";
@@ -343,17 +343,21 @@ export function recordUnblocked(tx: Executor, mergedItemId: string, at: string):
 			id: teamWorkItems.id,
 			teamId: teamWorkItems.teamId,
 			title: teamWorkItems.title,
-			state: teamWorkItems.state,
-			worker: teamWorkItems.workerNarratorId,
 			createdBy: teamWorkItems.createdBy,
 		})
 		.from(teamWorkItemDependencies)
 		.innerJoin(teamWorkItems, eq(teamWorkItems.id, teamWorkItemDependencies.itemId))
-		.where(eq(teamWorkItemDependencies.dependsOnItemId, mergedItemId))
+		// Filtered before the LIMIT: started dependents never crowd out a queued one.
+		.where(
+			and(
+				eq(teamWorkItemDependencies.dependsOnItemId, mergedItemId),
+				eq(teamWorkItems.state, "queued"),
+				isNull(teamWorkItems.workerNarratorId),
+			),
+		)
 		.orderBy(asc(teamWorkItems.createdAt), asc(teamWorkItems.id))
 		.limit(UNBLOCK_SCAN_MAX)
-		.all()
-		.filter((row) => row.state === "queued" && row.worker === null);
+		.all();
 	if (dependents.length === 0) return [];
 	const all = readDependencies(
 		dependents.map((row) => row.id),

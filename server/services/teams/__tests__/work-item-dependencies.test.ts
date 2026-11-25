@@ -12,7 +12,12 @@ import { join } from "node:path";
 import { TEAM_TOOL_ACTIONS, TEAM_WORK_DEPENDENCIES_MAX } from "@shared/project-teams";
 import { eq, sql } from "drizzle-orm";
 import { db, sqlite } from "../../../db";
-import { narratorWorktreeResources, teamWorkEvents, teamWorkItems } from "../../../db/schema";
+import {
+	narratorWorktreeResources,
+	teamWorkEvents,
+	teamWorkItemDependencies,
+	teamWorkItems,
+} from "../../../db/schema";
 import { teamTool, teamToolParameters } from "../../../lib/agent/tools/team";
 import type { ToolContext } from "../../../lib/agent/types";
 import { AppError } from "../../../lib/errors";
@@ -349,6 +354,37 @@ describe("work item dependencies", () => {
 			);
 			expect(review.code).toBe("TEAM_WORK_ITEM_NOT_STARTED");
 		}
+	});
+
+	test("started dependents never crowd a queued one out of the unblock scan", async () => {
+		const a = await create("Schema");
+		// 200 older dependents that already started (the scan's cap), then a queued one.
+		const started = Array.from({ length: 200 }, (_, i) => ({
+			id: `d-started-${String(i).padStart(3, "0")}`,
+			teamId: LEAD,
+			projectId: PROJECT,
+			title: `Started ${i}`,
+			kind: "work",
+			state: "in_progress" as const,
+			createdAt: "2000-01-01T00:00:00.000Z",
+			updatedAt: "2000-01-01T00:00:00.000Z",
+		}));
+		db.insert(teamWorkItems).values(started).run();
+		db.insert(teamWorkItemDependencies)
+			.values(
+				started.map((item) => ({
+					itemId: item.id,
+					dependsOnItemId: a.id,
+					teamId: LEAD,
+					createdAt: NOW,
+				})),
+			)
+			.run();
+		const late = await create("Docs", [a.id]);
+		expect(merge(a.id)).toBe(true);
+		await settle();
+		expect(kinds(late.id).filter((event) => event.kind === "work.unblocked")).toHaveLength(1);
+		expect(delivered.map((note) => note.itemId)).toEqual([late.id]);
 	});
 
 	test("the last dependency merging records work.unblocked and tells the coordinator once", async () => {
