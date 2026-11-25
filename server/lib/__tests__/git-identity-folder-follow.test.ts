@@ -1,17 +1,28 @@
 // 会话没有自己的 git 身份时跟谁：先看它所在的侧栏文件夹，再回落到全局默认。
 // 选择器要显示"跟随文件夹设置"，靠的就是这两步解析的顺序。
-import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { afterAll, afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import { cleanDb } from "../../../tests/setup";
 import {
 	folderGitIdentityBindings,
 	userGitIdentities,
 	userRecentTabs,
 	users,
 } from "../../db/schema";
+import {
+	closeRuntimeTestDb,
+	getRuntimeTestDb,
+} from "../../services/__tests__/agent-runtime-test-database";
 import { generateId } from "../id";
 
-const { db, sqlite } = getTestDb();
-mock.module("../../db", () => ({ db, sqlite }));
+// Identity lookups read on the database Worker (file-backed WAL database).
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
+afterAll(async () => {
+	mock.module("../../db", () => realDbModule);
+	await closeRuntimeTestDb(sqlite);
+});
+const realDbModule = { ...(await import("../../db")) };
+mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
 const { getNarratorFolderIdForUser } = await import("../git-identity");
 const { getFolderGitIdentityPick } = await import("../../services/git-identities");

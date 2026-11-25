@@ -16,15 +16,21 @@ import {
 	users,
 } from "../../../server/db/schema";
 import type { SessionPayload } from "../../../server/lib/auth";
+import * as pool from "../../../server/lib/db-worker/pool";
 import { eventBus } from "../../../server/lib/event-bus";
 import {
 	specTabLayoutPatchSchema,
 	updateUserPreferencesSchema,
 } from "../../../server/lib/validators/settings";
-import { cleanDb, getFileTestDb } from "../../setup";
+import {
+	closeRuntimeTestDb,
+	getRuntimeTestDb,
+} from "../../../server/services/__tests__/agent-runtime-test-database";
+import { cleanDb } from "../../setup";
 
-// UI preference and team coordinator ACL reads require a file-backed worker fixture.
-const { db, sqlite, dispose } = getFileTestDb();
+// Reads run on the database Worker, which needs a file-backed WAL database.
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
 const realDbModule = { ...(await import("../../../server/db")) };
 const realSettingsModule = { ...(await import("../../../server/lib/settings")) };
 const testSettings = {
@@ -143,12 +149,12 @@ afterEach(() => {
 	saveTestSettings.mockClear();
 });
 
-afterAll(() => {
+afterAll(async () => {
+	await closeRuntimeTestDb(sqlite);
 	mock.module("../../../server/db", () => realDbModule);
 	mock.module("../../../server/lib/settings", () => realSettingsModule);
 	mock.module("../../../server/websocket/narrator-ws", () => realNarratorWsModule);
 	mock.restore();
-	dispose();
 });
 
 describe("bounded UI preferences projection", () => {
@@ -1079,8 +1085,6 @@ describe("user preferences secret serialization", () => {
 		});
 		const getResult = await requestJson("/");
 		const masked = getResult.body as Record<string, unknown>;
-		const preferenceQuery = db.query.userPreferences;
-		const originalFindFirst = preferenceQuery.findFirst.bind(preferenceQuery);
 		let releaseStaleRead!: () => void;
 		const staleReadReleased = new Promise<void>((resolve) => {
 			releaseStaleRead = resolve;
@@ -1089,15 +1093,19 @@ describe("user preferences secret serialization", () => {
 		const staleReadStarted = new Promise<void>((resolve) => {
 			markStaleReadStarted = resolve;
 		});
+		// Hold the masked PATCH's preferences read (taken on the Worker) after it returned,
+		// so the rotation PATCH is queued behind it on the preferences lock.
 		let interceptNextRead = true;
-		preferenceQuery.findFirst = (async (...args: Parameters<typeof originalFindFirst>) => {
-			if (!interceptNextRead) return originalFindFirst(...args);
-			interceptNextRead = false;
-			const staleRow = await originalFindFirst(...args);
-			markStaleReadStarted();
-			await staleReadReleased;
-			return staleRow;
-		}) as typeof preferenceQuery.findFirst;
+		const runReadTask = pool.runReadTask;
+		const hold = spyOn(pool, "runReadTask").mockImplementation((async (path, params, options) => {
+			const result = await runReadTask(path, params, options);
+			if (interceptNextRead && "sql" in params && params.sql.includes('"user_preferences"')) {
+				interceptNextRead = false;
+				markStaleReadStarted();
+				await staleReadReleased;
+			}
+			return result;
+		}) as typeof pool.runReadTask);
 
 		try {
 			const maskedPatch = requestJson("/", {
@@ -1128,7 +1136,7 @@ describe("user preferences secret serialization", () => {
 			expect(gatewayConfig.platforms[0].stt.apiKey).toBe("rotated-stt-api-key-9999");
 		} finally {
 			releaseStaleRead();
-			preferenceQuery.findFirst = originalFindFirst as typeof preferenceQuery.findFirst;
+			hold.mockRestore();
 		}
 	});
 

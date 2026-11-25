@@ -193,9 +193,10 @@ describe("snapshot-backed NUG recharge", () => {
 		expect(payment).toMatchObject({ providerId: "gateway", resumeAction: "retry" });
 		expect(current.nugRechargeOpened).toBe(true);
 	});
-	test("non-NUG models never expose NUG recharge from another snapshot", async () => {
+	test("non-NUG models never expose NUG recharge or read another provider's snapshot", async () => {
 		await render({ model: "other:model", snapshot: snapshot(0) });
 		expect(current.shouldShowNugRechargeButton).toBe(false);
 		expect(current.shouldShowNugRechargeInQuotaDetails).toBe(false);
+		expect(read).not.toHaveBeenCalled();
 	});
 });

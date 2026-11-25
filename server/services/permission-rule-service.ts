@@ -6,6 +6,7 @@ import {
 	narratorWhitelistCmds,
 	narratorWhitelistDirs,
 } from "@server/db/schema";
+import { readQuery, readQueryFirst } from "@server/db/worker-read";
 import { AppError, NotFoundError, ValidationError } from "@server/lib/errors";
 import { generateId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
@@ -134,11 +135,12 @@ function rulesFromSet(set: ExecutionPolicyRuleSet): ExecutionPermissionRule[] {
 }
 
 class PermissionRuleService {
+	/** In-transaction check on the live row; the decision the mutation commits against. */
 	private assertEditableNarratorRule(
 		narratorId: string,
 		ruleType: PermissionRuleType,
 		ruleId: string,
-		store: Pick<typeof db, "select"> = db,
+		store: Pick<typeof db, "select">,
 	): void {
 		if (ruleType !== "directoryBlacklist") return;
 		// Check the stored row, never the replacement path/selector supplied by the API.
@@ -153,24 +155,60 @@ class PermissionRuleService {
 			throw new ValidationError("Inherited review workspace boundaries are immutable");
 	}
 
-	async listNarratorRules(narratorId: string): Promise<ExecutionPolicyRuleSet> {
-		const [whitelistDirs, blacklistDirs, commandWhitelist, commandBlacklist] = await Promise.all([
-			db
-				.select()
-				.from(narratorWhitelistDirs)
-				.where(eq(narratorWhitelistDirs.narratorId, narratorId)),
+	/** Advisory preflight on the Worker; the mutation transaction repeats the signed-row check. */
+	private async preflightEditableNarratorRule(
+		narratorId: string,
+		ruleType: PermissionRuleType,
+		ruleId: string,
+	): Promise<void> {
+		if (ruleType !== "directoryBlacklist") return;
+		const row = await readQueryFirst(
 			db
 				.select()
 				.from(narratorBlacklistDirs)
-				.where(eq(narratorBlacklistDirs.narratorId, narratorId)),
-			db
-				.select()
-				.from(narratorWhitelistCmds)
-				.where(eq(narratorWhitelistCmds.narratorId, narratorId)),
-			db
-				.select()
-				.from(narratorBlacklistCmds)
-				.where(eq(narratorBlacklistCmds.narratorId, narratorId)),
+				.where(
+					and(
+						eq(narratorBlacklistDirs.narratorId, narratorId),
+						eq(narratorBlacklistDirs.id, ruleId),
+					),
+				)
+				.limit(1),
+			{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000 },
+		);
+		if (row && isSignedReviewBoundaryRow(row))
+			throw new ValidationError("Inherited review workspace boundaries are immutable");
+	}
+
+	async listNarratorRules(narratorId: string): Promise<ExecutionPolicyRuleSet> {
+		const [whitelistDirs, blacklistDirs, commandWhitelist, commandBlacklist] = await Promise.all([
+			readQuery(
+				db
+					.select()
+					.from(narratorWhitelistDirs)
+					.where(eq(narratorWhitelistDirs.narratorId, narratorId)),
+				{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+			),
+			readQuery(
+				db
+					.select()
+					.from(narratorBlacklistDirs)
+					.where(eq(narratorBlacklistDirs.narratorId, narratorId)),
+				{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+			),
+			readQuery(
+				db
+					.select()
+					.from(narratorWhitelistCmds)
+					.where(eq(narratorWhitelistCmds.narratorId, narratorId)),
+				{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+			),
+			readQuery(
+				db
+					.select()
+					.from(narratorBlacklistCmds)
+					.where(eq(narratorBlacklistCmds.narratorId, narratorId)),
+				{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+			),
 		]);
 		return {
 			directoryWhitelist: whitelistDirs.map((row) =>
@@ -217,7 +255,7 @@ class PermissionRuleService {
 	): Promise<ExecutionPermissionRule> {
 		const normalized = normalizePermissionRuleInput(input);
 		if (!normalized.id) throw new ValidationError("Permission rule id is required");
-		this.assertEditableNarratorRule(narratorId, normalized.ruleType, normalized.id);
+		await this.preflightEditableNarratorRule(narratorId, normalized.ruleType, normalized.id);
 		const current = rulesFromSet(await this.listNarratorRules(narratorId));
 		if (
 			!current.some((rule) => rule.ruleType === normalized.ruleType && rule.id === normalized.id)
@@ -276,7 +314,7 @@ class PermissionRuleService {
 		ruleType: PermissionRuleType,
 		ruleId: string,
 	): Promise<void> {
-		this.assertEditableNarratorRule(narratorId, ruleType, ruleId);
+		await this.preflightEditableNarratorRule(narratorId, ruleType, ruleId);
 		const deleted = await this.deleteRuleRow(narratorId, ruleType, ruleId);
 		if (!deleted) throw new NotFoundError("Permission rule", ruleId);
 		const now = new Date().toISOString();
@@ -469,19 +507,22 @@ class PermissionRuleService {
 					).length > 0
 				);
 			case "directoryBlacklist":
-				return (
-					(
-						await db
+				return db.transaction((tx) => {
+					const predicate = and(
+						eq(narratorBlacklistDirs.id, ruleId),
+						eq(narratorBlacklistDirs.narratorId, narratorId),
+					);
+					const live = tx.select().from(narratorBlacklistDirs).where(predicate).limit(1).get();
+					if (live && isSignedReviewBoundaryRow(live))
+						throw new ValidationError("Inherited review workspace boundaries are immutable");
+					return (
+						tx
 							.delete(narratorBlacklistDirs)
-							.where(
-								and(
-									eq(narratorBlacklistDirs.id, ruleId),
-									eq(narratorBlacklistDirs.narratorId, narratorId),
-								),
-							)
+							.where(predicate)
 							.returning({ id: narratorBlacklistDirs.id })
-					).length > 0
-				);
+							.all().length > 0
+					);
+				});
 			case "commandWhitelist":
 				return (
 					(

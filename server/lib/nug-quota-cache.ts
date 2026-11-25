@@ -201,7 +201,7 @@ function snapshotOf(
 	return stream && (!probe || stream.fetchedAt >= probe.fetchedAt) ? stream : probe;
 }
 
-/** No polling here: NUG is updated by streams, startup and explicit refresh. */
+/** Cached credential/source reads never poll; refresh is explicit and identity-bound. */
 export function getNugQuotaSnapshot(
 	providerId: string,
 	credentialId?: string,

@@ -63,6 +63,7 @@ import type { SideCarBody } from "@shared/sidecar-body";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessages } from "../db/schema";
+import { readQueryFirst } from "../db/worker-read";
 import { projectMessageSenderText } from "../lib/agent/sender-projection";
 import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
@@ -283,17 +284,23 @@ async function deliverInjectionUnlocked(
 	if (!content) return EMPTY_RESULT;
 
 	const locale = options.locale ?? "en";
+	// A message's role never changes once written, so this lookup can run on the Worker.
 	const existingRole = options.messageId
-		? db
-				.select({ role: narratorMessages.role })
-				.from(narratorMessages)
-				.where(
-					and(
-						eq(narratorMessages.id, options.messageId),
-						eq(narratorMessages.narratorId, narratorId),
-					),
+		? (
+				await readQueryFirst(
+					db
+						.select({ role: narratorMessages.role })
+						.from(narratorMessages)
+						.where(
+							and(
+								eq(narratorMessages.id, options.messageId),
+								eq(narratorMessages.narratorId, narratorId),
+							),
+						)
+						.limit(1),
+					{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000 },
 				)
-				.get()?.role
+			)?.role
 		: undefined;
 	const role =
 		options.role ?? (existingRole === "user" || existingRole === "sys" ? existingRole : "sys");

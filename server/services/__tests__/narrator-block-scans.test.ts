@@ -6,9 +6,12 @@
  */
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
+import { closeRuntimeTestDb, getRuntimeTestDb } from "./agent-runtime-test-database";
 
-const { db, sqlite } = getTestDb();
+// Upload-owner scans read on the database Worker, which needs a file-backed WAL database.
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
@@ -127,10 +130,10 @@ afterEach(() => {
 	settings.narratorBlocks.read = true;
 	settings.narratorBlocks.write = true;
 });
-afterAll(() => {
+afterAll(async () => {
 	blockSync.stopBlockSyncSweep();
 	mock.module("../../db", () => realDbModule);
-	sqlite.close();
+	await closeRuntimeTestDb(sqlite);
 });
 
 describe("upload owners", () => {
@@ -140,7 +143,7 @@ describe("upload owners", () => {
 		filename: `${imageId}.png`,
 		mediaType: "image/png",
 	});
-	const owners = () => [...referencedUploadOwnerIds([])].sort();
+	const owners = async () => [...(await referencedUploadOwnerIds([]))].sort();
 
 	test("image owners match the content_json scan, from asset rows", async () => {
 		envelope("i1", [{ type: "text", text: "look" }, image("img1")], { role: "user" });
