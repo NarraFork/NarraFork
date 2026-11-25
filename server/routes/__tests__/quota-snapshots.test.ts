@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { quotaSnapshotText } from "@frontend/components/narrator/model/quota-snapshot-view";
+import { buildModelMenuProviderBadges } from "@frontend/components/narrator/model/use-model-menu-provider-badges";
 import { selectQuotaEntries } from "@frontend/hooks/useQuotaSnapshots";
 import type {
 	QuotaSnapshot,
@@ -318,6 +320,71 @@ describe("unified quota API", () => {
 		]);
 		quotaStore.remove(id);
 		quotaStore.remove(id, STREAM_QUOTA_SOURCE);
+	});
+	test("unsupported gateway probing preserves streamed balances through the public API and both displays", async () => {
+		const fetch = spyOn(outbound, "outboundFetch").mockImplementation(
+			async () => new Response("not found", { status: 404 }),
+		);
+		saveSettings({
+			...settings,
+			customApiProviders: [
+				{ ...config("quota-stream-only"), baseUrl: "https://gateway.example/v1" },
+			],
+		});
+		const provider = settings.customApiProviders?.find((entry) => entry.id === "quota-stream-only");
+		if (!provider) throw new Error("missing live provider fixture");
+		const key = getProviderKeyStore().list(provider.id)[0];
+		providerBalanceCache.sync();
+		await providerBalanceCache.request(provider.id);
+		expect(providerBalanceCache.peek(provider.id)?.status).toBe("unsupported");
+		const discoveryCalls = fetch.mock.calls.length;
+		const probeBefore = structuredClone(quotaStore.peek(key.id));
+		try {
+			for (const amount of [3, 4]) {
+				updateCustomApiQuotaByPrefix(
+					provider.prefix,
+					String(amount),
+					"private-detail",
+					streamQuotaIdentity(provider),
+				);
+				for (const role of ["admin", "user"] as const) {
+					const response = await app(role).request(
+						`/api/quota-snapshots?cachedOnly=true&groupId=${provider.id}`,
+					);
+					expect(response.status).toBe(200);
+					const body = await response.text();
+					const entries = (JSON.parse(body) as QuotaSnapshotsResponse).entries;
+					expect(entries).toHaveLength(2);
+					expect(entries[0]).toMatchObject({ source: "probe", supported: false, snapshot: null });
+					expect(entries[1]).toMatchObject({
+						source: "quota_balance",
+						supported: true,
+						snapshot: { balances: [{ remaining: amount }] },
+					});
+					const before = structuredClone(entries);
+					const selected = selectQuotaEntries(entries)[0];
+					expect(selected).toBe(entries[1]);
+					expect(selected.supported).toBe(true);
+					const t = (value: string) => value;
+					expect(quotaSnapshotText(selected.snapshot, t).balance).toBe(String(amount));
+					expect(
+						buildModelMenuProviderBadges(entries, Date.now(), t).providerBalances?.[provider.prefix]
+							?.text,
+					).toBe(String(amount));
+					expect(entries).toEqual(before);
+					expect(body).not.toMatch(/private-detail|quota-secret/);
+					if (role === "user") {
+						expect(entries.every((entry) => entry.credentialId === null)).toBe(true);
+					}
+				}
+			}
+			expect(providerBalanceCache.peek(provider.id)?.status).toBe("unsupported");
+			expect(fetch).toHaveBeenCalledTimes(discoveryCalls);
+			expect(quotaStore.peek(key.id)).toEqual(probeBefore);
+		} finally {
+			quotaStore.remove(key.id);
+			quotaStore.remove(key.id, STREAM_QUOTA_SOURCE);
+		}
 	});
 	test("plugin unsupported and unprobed allowance stay null, never synthetic zero", () => {
 		pluginProviderRegistry.register({

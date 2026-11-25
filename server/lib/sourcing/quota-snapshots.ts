@@ -292,7 +292,8 @@ export function readQuotaSnapshots(
 				!settings.commandCode?.apiKey
 					? { refreshOnRead: true, generation: commandCodeCliGeneration() }
 					: {}),
-				snapshot: publicQuotaSnapshot(stored || undefined),
+				// Unsupported discovery has no quota observation, only an owner diagnostic snapshot.
+				snapshot: relay?.status === "unsupported" ? null : publicQuotaSnapshot(stored || undefined),
 				...(relay
 					? relay.status === "supported"
 						? { supported: true }

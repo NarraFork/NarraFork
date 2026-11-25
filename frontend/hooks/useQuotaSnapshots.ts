@@ -90,10 +90,10 @@ export function selectQuotaEntries(entries: QuotaSnapshotEntry[]): QuotaSnapshot
 	return [...selected].map<QuotaSnapshotEntry>(([key, entry]) => {
 		const probe = probes.get(key);
 		const stream = streams.get(key);
-		if (probe?.supported === false) return probe;
-		// A missing probe may use the stream; an observed unknown/error is not missing.
+		// Missing or unsupported probing does not make an independent stream unsupported.
+		// An observed unknown/error is not missing and remains authoritative.
 		if (!probe?.snapshot) return stream?.snapshot ? stream : (probe ?? entry);
-		if (!stream?.snapshot) return probe;
+		if (probe.supported === false || !stream?.snapshot) return probe;
 		const metadata = probe.snapshot;
 		const observed = stream.snapshot;
 		const balance = metadata.balances[0];

@@ -21,7 +21,7 @@ function entry(
 	groupId = "group",
 	credentialId = "key",
 	source: QuotaSnapshotEntry["source"] = "probe",
-): QuotaSnapshotEntry {
+): QuotaSnapshotEntry & { snapshot: PublicQuotaSnapshot } {
 	return {
 		groupId,
 		credentialId,
@@ -121,6 +121,30 @@ test("probe snapshots remain authoritative; only a missing snapshot may use stre
 	expect(selectQuotaEntries([stream, empty])).toEqual([stream]);
 	const legacy = { ...probe, source: undefined };
 	expect(selectQuotaEntries([legacy, stream])).toEqual([legacy]);
+});
+
+test("unsupported probing does not hide a same-credential stream or override an observed probe", () => {
+	const stream = { ...entry("group", "key", "quota_balance"), supported: true };
+	const unsupported = { ...entry(), supported: false, snapshot: null };
+	for (const entries of [
+		[unsupported, stream],
+		[stream, unsupported],
+	]) {
+		expect(selectQuotaEntries(entries)).toEqual([stream]);
+	}
+	const observed = entry().snapshot;
+	for (const snapshot of [
+		{ ...observed, balances: [] },
+		{ ...observed, error: "quota_unavailable" as const },
+		{ ...observed, expiresAt: 0 },
+	]) {
+		const probe = { ...unsupported, snapshot };
+		expect(selectQuotaEntries([probe, stream])).toEqual([probe]);
+		expect(selectQuotaEntries([stream, probe])).toEqual([probe]);
+	}
+	const foreign = { ...stream, credentialId: "another-key" };
+	expect(selectQuotaEntries([unsupported, foreign])).toEqual([unsupported, foreign]);
+	expect(selectQuotaEntries([unsupported])).toEqual([unsupported]);
 });
 
 test("known period amounts are probe data even when the ratio is unknown", () => {
@@ -417,7 +441,7 @@ test("only a single comparable NUG wallet may use stream freshness, never mismat
 	expect(selectQuotaEntries([multi, nugWallet(9, 200, "quota_balance")])[0]).toBe(multi);
 });
 
-test("stream data cannot revive observed unknown, unsupported, or terminal-error probes", () => {
+test("stream data cannot revive observed unknown, unsupported observations, or terminal-error probes", () => {
 	const unknowns: Partial<PublicQuotaSnapshot>[] = [
 		{ balances: [] },
 		{ balances: [{ unit: "", remaining: null }] },
@@ -435,9 +459,8 @@ test("stream data cannot revive observed unknown, unsupported, or terminal-error
 	}
 	for (const snapshot of [null, nugWallet(10, 100).snapshot]) {
 		const unsupported = { ...nugWallet(10, 100), supported: false, snapshot };
-		expect(selectQuotaEntries([unsupported, nugWallet(9, 200, "quota_balance")])[0]).toBe(
-			unsupported,
-		);
+		const stream = nugWallet(9, 200, "quota_balance");
+		expect(selectQuotaEntries([unsupported, stream])[0]).toBe(snapshot ? unsupported : stream);
 	}
 	const failedStream = nugWallet(9, 200, "quota_balance", { hasError: true });
 	const probe = nugWallet(10, 100);
