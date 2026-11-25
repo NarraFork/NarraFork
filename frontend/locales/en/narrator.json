@@ -2402,6 +2402,7 @@
 			"team_status": "Team status",
 			"team_upgrade": "Became a team coordinator",
 			"team_disband": "Team disbanded",
+			"team_return": "Work item returned",
 			"outline_team": "Task events for this session",
 			"outline_task_brief": "Opening brief",
 			"spec_import": "Dynamic Spec moved to the outline",
