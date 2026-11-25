@@ -509,6 +509,19 @@
 				"title": "运行中的会话",
 				"none": "没有运行中的会话"
 			},
+			"coordinatorHeader": {
+				"title": "协调者",
+				"following_one": "在跟进 {{count}} 个工作者",
+				"following_other": "在跟进 {{count}} 个工作者",
+				"followingMore": "在跟进 {{count}}+ 个工作者",
+				"status": {
+					"working": "工作中",
+					"waiting": "在等人处理",
+					"idle": "空闲",
+					"archived": "已归档"
+				},
+				"fullSession": "完整会话"
+			},
 			"readOnlyStart": "还没有人给协调者布置任务。",
 			"coordinator": "协调者"
 		}

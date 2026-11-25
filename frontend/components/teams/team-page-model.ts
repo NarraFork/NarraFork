@@ -52,6 +52,26 @@ export function liveWorkerStatus(
 }
 
 /** "50+" past a capped count (the server counts one past its limit). */
+/**
+ * The coordinator column's header line: how many other sessions of the tree are running (the
+ * workers it follows, their reviewers among them), `more` when the summary's list was cut; and
+ * the coordinator's own state when nothing else runs.
+ */
+export function coordinatorLine(
+	summary: Pick<TeamPageSummary, "teamId" | "coordinatorStatus" | "runningAgents" | "runningCount">,
+):
+	| { kind: "following"; count: number; more: boolean }
+	| { kind: "status"; status: "working" | "waiting" | "idle" | "archived" } {
+	const others = summary.runningAgents.filter((agent) => agent.id !== summary.teamId).length;
+	const more = summary.runningCount > summary.runningAgents.length;
+	if (others > 0 || more) return { kind: "following", count: others, more };
+	const status = summary.coordinatorStatus;
+	return {
+		kind: "status",
+		status: status === "working" || status === "waiting" || status === "archived" ? status : "idle",
+	};
+}
+
 export function cappedCount(count: number, limit: number): string {
 	return count > limit ? `${limit}+` : String(count);
 }

@@ -5,8 +5,9 @@
  * Not nested under the project page (`$projectId_`): it fills the app shell's content box the
  * way a session page does. The coordinator's conversation (the ordinary narrator panel, so
  * members talk to the coordinator exactly as in its session page; a read-only member sees
- * 「你是只读成员」 instead of the composer) with the work list and the activity beside it; narrow
- * screens get tabs instead. No list of the project's teams: teams are switched from the
+ * 「你是只读成员」 instead of the composer; its toolbar gives way to the page's compact coordinator
+ * line, the full toolbar being on the session's own page) with the work list and the activity
+ * beside it; narrow screens get tabs instead. No list of the project's teams: teams are switched from the
  * sidebar's pinned team tabs and the project page.
  */
 
@@ -49,6 +50,8 @@ function CoordinatorConversation({
 						compact={compact}
 						onViewSubagentSession={(subagentId) => onOpenSession(subagentId)}
 						readOnlyNotice={t("teams.page.readOnly")}
+						// The page draws the coordinator's compact line instead of the toolbar.
+						hideHeader
 					/>
 				</Suspense>
 			</NarratorDockContext.Provider>

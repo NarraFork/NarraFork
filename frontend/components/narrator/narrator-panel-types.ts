@@ -210,6 +210,11 @@ export interface NarratorPanelProps {
 	 * notice. The team page says 「你是只读成员」 here.
 	 */
 	readOnlyNotice?: string;
+	/**
+	 * The host draws its own header above the panel, so the panel leaves out its title row and
+	 * toolbar (the team page's coordinator column). The session's own page always has them.
+	 */
+	hideHeader?: boolean;
 }
 
 export const MAX_IMAGE_SIZE = 20 * 1024 * 1024; // 20MB

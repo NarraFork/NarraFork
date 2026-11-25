@@ -25,6 +25,7 @@ import {
 	boardSignature,
 	cappedCount,
 	chunkIds,
+	coordinatorLine,
 	diffLineKind,
 	eventLabelKey,
 	eventNote,
@@ -739,5 +740,44 @@ describe("review findings", () => {
 		expect(findingsNeedToggle("a\nb\nc")).toBe(false);
 		expect(findingsNeedToggle("a\nb\nc\nd")).toBe(true);
 		expect(findingsNeedToggle("x".repeat(141))).toBe(true);
+	});
+});
+
+describe("the coordinator's line", () => {
+	const base = {
+		teamId: "lead",
+		coordinatorStatus: "working",
+		runningAgents: [] as { id: string; title: string | null; status: string }[],
+		runningCount: 0,
+	};
+	const agent = (id: string) => ({ id, title: null, status: "working" });
+	test("the other running sessions it follows; more when the list was cut", () => {
+		expect(
+			coordinatorLine({
+				...base,
+				runningAgents: [agent("lead"), agent("w1"), agent("w2")],
+				runningCount: 3,
+			}),
+		).toEqual({ kind: "following", count: 2, more: false });
+		expect(coordinatorLine({ ...base, runningAgents: [agent("w1")], runningCount: 21 })).toEqual({
+			kind: "following",
+			count: 1,
+			more: true,
+		});
+	});
+	test("nothing else running: the coordinator's own state", () => {
+		expect(coordinatorLine({ ...base, runningAgents: [agent("lead")], runningCount: 1 })).toEqual({
+			kind: "status",
+			status: "working",
+		});
+		expect(coordinatorLine({ ...base, coordinatorStatus: "waiting" })).toEqual({
+			kind: "status",
+			status: "waiting",
+		});
+		expect(coordinatorLine({ ...base, coordinatorStatus: "archived" }).kind).toBe("status");
+		expect(coordinatorLine({ ...base, coordinatorStatus: "something" })).toEqual({
+			kind: "status",
+			status: "idle",
+		});
 	});
 });

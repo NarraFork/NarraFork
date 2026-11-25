@@ -509,6 +509,19 @@
 				"title": "Running sessions",
 				"none": "Nothing running"
 			},
+			"coordinatorHeader": {
+				"title": "Coordinator",
+				"following_one": "following {{count}} worker",
+				"following_other": "following {{count}} workers",
+				"followingMore": "following {{count}}+ workers",
+				"status": {
+					"working": "working",
+					"waiting": "waiting on someone",
+					"idle": "idle",
+					"archived": "archived"
+				},
+				"fullSession": "Full session"
+			},
 			"readOnlyStart": "Nobody has given the coordinator a goal yet.",
 			"coordinator": "Coordinator"
 		}

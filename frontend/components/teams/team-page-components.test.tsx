@@ -6,6 +6,7 @@
  * words each event; every `teams` string exists in both languages.
  */
 import { afterAll, describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { MantineProvider } from "@mantine/core";
 import type {
 	TeamActivityPage,
@@ -25,6 +26,7 @@ import en from "../../locales/en/projects.json";
 import zh from "../../locales/zh-CN/projects.json";
 import { ActivityLine, TeamActivity } from "./TeamActivity";
 import { TeamAttention } from "./TeamAttention";
+import { TeamCoordinatorHeader } from "./TeamCoordinatorHeader";
 import { TeamHeader } from "./TeamHeader";
 import { TeamMembersPanel } from "./TeamMembers";
 import { TeamReadOnlyStart, TeamStart } from "./TeamStart";
@@ -892,5 +894,52 @@ describe("review findings", () => {
 		expect(long).toContain("评审意见合计太长");
 		const gone = await render(<ReviewFindings text={null} clipped />);
 		expect(gone).toContain("The findings are too long in all");
+	});
+});
+
+describe("the coordinator's column header", () => {
+	const agent = (id: string, status = "working") => ({ id, title: id, status });
+	test("协调者 · 在跟进 N 个工作者 · 完整会话, in place of the session toolbar", async () => {
+		const following = summary({
+			coordinatorStatus: "working",
+			runningAgents: [agent("lead"), agent("w1"), agent("w2"), agent("w3"), agent("w4")],
+			runningCount: 5,
+		});
+		const zhHtml = await render(
+			<TeamCoordinatorHeader summary={following} onOpenCoordinatorSession={() => {}} />,
+			undefined,
+			"zh-CN",
+		);
+		expect(zhHtml).toContain("协调者");
+		expect(zhHtml).toContain("在跟进 4 个工作者");
+		expect(zhHtml).toContain("完整会话");
+		expect(zhHtml).toContain('data-tone="blue"');
+		const html = await render(<TeamCoordinatorHeader summary={following} />);
+		expect(html).toContain("following 4 workers");
+		// No way to the full session given: no link.
+		expect(html).not.toContain("team-coordinator-full-session");
+		const idle = await render(
+			<TeamCoordinatorHeader summary={summary()} onOpenCoordinatorSession={() => {}} />,
+			undefined,
+			"zh-CN",
+		);
+		expect(idle).toContain("空闲");
+		expect(idle).toContain('data-kind="status"');
+	});
+
+	test("the session page keeps its toolbar: only the team route leaves it out", () => {
+		const panel = readFileSync(new URL("../narrator/NarratorPanel.tsx", import.meta.url), "utf8");
+		expect(panel).toContain("hideHeader = false,");
+		expect(panel).toMatch(/\{!hideHeader && \(\s*<NarratorHeaderLayout/);
+		const route = readFileSync(
+			new URL("../../routes/projects/$projectId_.teams.$teamId.tsx", import.meta.url),
+			"utf8",
+		);
+		expect(route).toMatch(/\bhideHeader\b/);
+		const session = readFileSync(
+			new URL("../../routes/narrators/$narratorId.tsx", import.meta.url),
+			"utf8",
+		);
+		expect(session).not.toMatch(/\bhideHeader\b/);
 	});
 });

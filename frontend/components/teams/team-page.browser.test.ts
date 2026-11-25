@@ -396,6 +396,20 @@ test("the work list reflects work item state changes", async () => {
 		expect(await call(page, (f) => f.attr("[data-testid=team-workspace]", "data-layout"))).toBe(
 			"split",
 		);
+		// The coordinator's column has one compact line above the conversation, not its toolbar;
+		// 完整会话 opens the coordinator's own session page.
+		await until(
+			page,
+			"coordinator line",
+			(f) => f.count("[data-testid=team-coordinator-line]") === 1,
+		);
+		expect(
+			await call(page, (f) =>
+				f.above("[data-testid=team-coordinator-header]", "[data-testid=conversation-stand-in]"),
+			),
+		).toBe(true);
+		await call(page, (f) => f.click("[data-testid=team-coordinator-full-session]"));
+		expect(await call(page, (f) => f.openedTargets())).toContain(`full:${teamId}`);
 		// Finished items are counts until opened: only the open columns are read.
 		expect([...new Set(boardReads)].sort()).toEqual(["in_progress", "queued", "review"]);
 		expect(await call(page, (f, id: string) => f.groupOf(id), movingId)).toBe("inProgress");
