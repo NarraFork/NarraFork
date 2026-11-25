@@ -140,6 +140,8 @@ describe("sessions", () => {
 		updatedAt: "2026-11-25T00:00:00.000Z",
 		owner: null,
 		activity: null,
+		cwd: null,
+		substatus: [],
 		...patch,
 	});
 

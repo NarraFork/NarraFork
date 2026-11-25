@@ -15,7 +15,7 @@
  */
 
 import { coerceAskQuestionShape } from "@shared/ask-user-question-shape";
-import type { TeamCardCounts } from "@shared/project-overview";
+import { TEAM_CARD_FINISHED_COUNT_CAP, type TeamCardCounts } from "@shared/project-overview";
 import {
 	boardColumnIsFinished,
 	TEAM_ACTIVITY_PREVIEW_CHARS,
@@ -55,6 +55,7 @@ import {
 	teamWorkItems,
 	users,
 } from "../../db/schema";
+import { readQuery } from "../../db/worker-read";
 import { ValidationError } from "../../lib/errors";
 import { canManageNarratorAcl, type NarratorPrincipal } from "../narrator-acl";
 import { shouldHidePendingPermission } from "../pending-permission-visibility";
@@ -489,42 +490,107 @@ export function readReadyItems(
 	};
 }
 
+const OPEN_ITEM_STATES = ["queued", "in_progress", "in_review", "ready"] as const;
+const FINISHED_ITEM_STATES = ["merged", "cancelled"] as const;
+const CARD_READ_TIMEOUT_MS = 5_000;
+
 /**
- * A team card's numbers for each listed team (R2: the project page's team grid): work item
- * counts by state in one grouped read of `(team_id, state, id)`, then per team the running count
- * ({@link runningTreeSessions}, at most 21 rows), the coordinator's last stop and message count
- * (primary key), the newest event (`(team_id, created_at)`, one row) and, for members only, the
- * pending count the header shows. The caller bounds the number of teams.
+ * A team card's numbers for each listed team (R2: the project page's team grid), read on the
+ * read worker (5 s timeout) so their cost never lands on the main thread, and bounded by what is
+ * open rather than by history:
+ * - open items (queued, in progress, in review, ready) counted exactly, grouped, over the
+ *   `(team_id, state, id)` index;
+ * - finished items (merged, cancelled) counted up to {@link TEAM_CARD_FINISHED_COUNT_CAP} + 1 per
+ *   team and state (a `LIMIT` subquery each, one `UNION ALL` statement), so a team with 50,000
+ *   merged items costs what one with 1,000 does;
+ * - the coordinators' last stop and message count (primary key) with each team's newest event
+ *   (a correlated `(team_id, created_at, id)` probe), one statement.
+ * Then per team the running count ({@link runningTreeSessions}, at most 21 rows) and, for members
+ * only, the pending count the header shows (the same bounded scans the team page and the sidebar
+ * run). The caller bounds the number of teams (24).
  */
-export function readTeamCards(
+export async function readTeamCards(
 	teams: readonly { id: string; member: boolean }[],
-): Map<string, TeamCardCounts> {
+	signal?: AbortSignal,
+): Promise<Map<string, TeamCardCounts>> {
 	const cards = new Map<string, TeamCardCounts>();
 	if (teams.length === 0) return cards;
 	const ids = teams.map((team) => team.id);
-	const stateRows = db
-		.select({
-			teamId: teamWorkItems.teamId,
-			state: teamWorkItems.state,
-			count: sql<number>`count(*)`,
-		})
-		.from(teamWorkItems)
-		.where(inArray(teamWorkItems.teamId, ids))
-		.groupBy(teamWorkItems.teamId, teamWorkItems.state)
-		.all();
-	const coordinators = new Map(
+	const read = (maxRows: number, diagnosticSource: string) => ({
+		executionPolicy: "worker-required" as const,
+		maxRows,
+		timeoutMs: CARD_READ_TIMEOUT_MS,
+		signal,
+		diagnosticSource,
+	});
+	const openRows = await readQuery(
 		db
 			.select({
-				id: narrators.id,
-				messageCount: narrators.messageCount,
-				stopReason: narrators.lastStopReason,
+				teamId: teamWorkItems.teamId,
+				state: teamWorkItems.state,
+				count: sql<number>`count(*)`,
 			})
-			.from(narrators)
-			.where(inArray(narrators.id, ids))
-			.limit(ids.length)
-			.all()
-			.map((row) => [row.id, row]),
+			.from(teamWorkItems)
+			.where(
+				and(
+					inArray(teamWorkItems.teamId, ids),
+					inArray(teamWorkItems.state, [...OPEN_ITEM_STATES]),
+				),
+			)
+			.groupBy(teamWorkItems.teamId, teamWorkItems.state),
+		read(ids.length * OPEN_ITEM_STATES.length, "teams.cards.open"),
 	);
+	const finishedParts = ids.flatMap((teamId) =>
+		FINISHED_ITEM_STATES.map((state) =>
+			db
+				.select({
+					teamId: sql<string>`${teamId}`.as("team_id"),
+					state: sql<string>`${state}`.as("state"),
+					count: sql<number>`count(*)`.as("count"),
+				})
+				.from(
+					db
+						.select({ one: sql<number>`1`.as("one") })
+						.from(teamWorkItems)
+						.where(and(eq(teamWorkItems.teamId, teamId), eq(teamWorkItems.state, state)))
+						.limit(TEAM_CARD_FINISHED_COUNT_CAP + 1)
+						.as("capped"),
+				),
+		),
+	);
+	const [firstFinished, ...moreFinished] = finishedParts;
+	const finishedRows = firstFinished
+		? await readQuery(
+				// biome-ignore lint/suspicious/noExplicitAny: one UNION ALL of same-shaped selects
+				moreFinished.reduce<any>((query, part) => query.unionAll(part), firstFinished),
+				read(finishedParts.length, "teams.cards.finished"),
+			)
+		: [];
+	const coordinators = new Map(
+		(
+			await readQuery(
+				db
+					.select({
+						id: narrators.id,
+						messageCount: narrators.messageCount,
+						stopReason: narrators.lastStopReason,
+						// The newest event: one `(team_id, created_at, id)` index probe per team. The outer
+						// column is qualified by hand: a one-table select renders bare column names.
+						lastEventAt: sql<
+							string | null
+						>`(select te.created_at from team_work_events te where te.team_id = "narrators"."id" order by te.created_at desc, te.id desc limit 1)`,
+					})
+					.from(narrators)
+					.where(inArray(narrators.id, ids))
+					.limit(ids.length),
+				read(ids.length, "teams.cards.coordinators"),
+			)
+		).map((row) => [row.id, row]),
+	);
+	const stateRows = [
+		...openRows,
+		...(finishedRows as { teamId: string; state: string; count: number }[]),
+	];
 	for (const team of teams) {
 		const columnCounts = Object.fromEntries(
 			TEAM_BOARD_COLUMNS.map((column) => [column, 0]),
@@ -532,19 +598,13 @@ export function readTeamCards(
 		let readyCount = 0;
 		for (const row of stateRows) {
 			if (row.teamId !== team.id) continue;
-			if (row.state === "ready") readyCount += Number(row.count);
+			const state = row.state as TeamBoardItem["state"];
+			if (state === "ready") readyCount += Number(row.count);
 			for (const column of TEAM_BOARD_COLUMNS)
-				if (TEAM_BOARD_COLUMN_STATES[column].includes(row.state))
+				if (TEAM_BOARD_COLUMN_STATES[column].includes(state))
 					columnCounts[column] += Number(row.count);
 		}
 		const running = runningTreeSessions(team.id, TEAM_RUNNING_AGENTS_LIMIT);
-		const lastEvent = db
-			.select({ createdAt: teamWorkEvents.createdAt })
-			.from(teamWorkEvents)
-			.where(eq(teamWorkEvents.teamId, team.id))
-			.orderBy(desc(teamWorkEvents.createdAt), desc(teamWorkEvents.id))
-			.limit(1)
-			.get();
 		const coordinator = coordinators.get(team.id);
 		cards.set(team.id, {
 			columnCounts,
@@ -553,7 +613,7 @@ export function readTeamCards(
 			pendingApprovalCount: team.member ? pendingCount(team.id) : null,
 			coordinatorStopReason: coordinator?.stopReason ?? null,
 			coordinatorMessageCount: coordinator?.messageCount ?? 0,
-			lastEventAt: lastEvent?.createdAt ?? null,
+			lastEventAt: coordinator?.lastEventAt ?? null,
 		});
 	}
 	return cards;

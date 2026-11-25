@@ -1,14 +1,16 @@
 /**
- * The project page's 「会话」 (R2): three tabs — 进行中 (running and waiting sessions first, then
- * the ones changed in the last 7 days under 「最近 7 天」), 全部 and 我的 — each with its count,
- * one row per session: the status dot (the session colours), the title, what it is doing now, who
- * owns it and when it last changed. Team coordinators are on the team cards and workers are not
+ * The project page's 「会话」 (R2): three tabs — 进行中, 全部 and 我的 — each with its count. 进行中
+ * shows the running and waiting sessions as the home page's cards with their latest tool calls
+ * (`RunningCards`), then the ones changed in the last 7 days as compact rows under 「最近 7 天」;
+ * 全部 and 我的 are compact rows: the status dot (the session colours), the title, what a running
+ * one is doing now, who owns it and when it last changed. Team coordinators are on the team cards and workers are not
  * sessions of the project page: the server leaves both out. Keyset pages, 「加载更多」.
  */
 import { useProjectSessions } from "@frontend/hooks/useProjectOverview";
 import { formatSmartTime } from "@frontend/lib/format";
-import { Alert, Box, Button, Group, Loader, Stack, Tabs, Text } from "@mantine/core";
+import { Alert, Box, Button, Group, Loader, SimpleGrid, Stack, Tabs, Text } from "@mantine/core";
 import {
+	PROJECT_RUNNING_CARDS_SHOWN,
 	PROJECT_SESSION_COUNT_CAP,
 	PROJECT_SESSION_VIEWS,
 	type ProjectSessionRow,
@@ -17,6 +19,13 @@ import {
 import { Link } from "@tanstack/react-router";
 import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import {
+	MAX_ACTIVITY_SUBSCRIPTIONS,
+	SESSION_CARD_GRID_COLS,
+	SessionCard,
+} from "../dashboard/DashboardSessions";
+import { toSession } from "../dashboard/dashboard-sessions";
+import { useNarratorActivity } from "../dashboard/useNarratorActivity";
 import { MONO, StatusDot, TABULAR } from "../teams/team-page-ui";
 import { UserAvatar } from "../UserAvatar";
 import { sessionCountLabel, sessionLine, sessionSections, sessionTone } from "./project-page-model";
@@ -137,6 +146,58 @@ function SessionRow({ row, phone }: { row: ProjectSessionRow; phone: boolean }) 
 	);
 }
 
+/**
+ * 进行中's running and waiting sessions as the home page's cards (`SessionCard`, the same grid),
+ * each with its latest tool calls from the live activity subscription (`useNarratorActivity`,
+ * one `activity` subscription for the cards shown). At most {@link PROJECT_RUNNING_CARDS_SHOWN}
+ * cards before 「显示全部」, and never more than the dashboard's subscription cap, so a project
+ * with many running sessions stays bounded.
+ */
+function RunningCards({ rows }: { rows: readonly ProjectSessionRow[] }) {
+	const { t } = useTranslation("projects");
+	const [all, setAll] = useState(false);
+	const shown = rows.slice(0, all ? MAX_ACTIVITY_SUBSCRIPTIONS : PROJECT_RUNNING_CARDS_SHOWN);
+	const activity = useNarratorActivity(shown.map((row) => row.id));
+	return (
+		<Stack gap="xs" data-testid="project-running-cards">
+			<SimpleGrid cols={SESSION_CARD_GRID_COLS} spacing="sm">
+				{shown.map((row) => {
+					const live = activity.get(row.id);
+					return (
+						<SessionCard
+							key={row.id}
+							session={toSession(
+								{
+									id: row.id,
+									title: row.title,
+									cwd: row.cwd,
+									status: row.status,
+									substatus: row.substatus,
+									updatedAt: row.updatedAt,
+								},
+								live,
+							)}
+							activity={live}
+						/>
+					);
+				})}
+			</SimpleGrid>
+			{rows.length > shown.length && !all && (
+				<Box>
+					<Button
+						size="xs"
+						variant="subtle"
+						onClick={() => setAll(true)}
+						data-testid="project-running-show-all"
+					>
+						{t("page.sessions.showAll", { count: rows.length })}
+					</Button>
+				</Box>
+			)}
+		</Stack>
+	);
+}
+
 const ROW_HOVER_CSS = `.nf-project-session-row:hover { background: var(--mantine-color-default-hover); }`;
 
 export function ProjectSessions({ projectId, phone }: { projectId: string; phone: boolean }) {
@@ -182,25 +243,31 @@ export function ProjectSessions({ projectId, phone }: { projectId: string; phone
 				</Text>
 			)}
 			<Stack gap={0}>
-				{sections.map((section) => (
-					<Box key={section.key}>
-						{section.key === "recent" && (
-							<Text
-								size="xs"
-								c="dimmed"
-								px={8}
-								pt={12}
-								pb={6}
-								data-testid="project-sessions-recent"
-							>
-								{t("page.sessions.recent")}
-							</Text>
-						)}
-						{section.rows.map((row) => (
-							<SessionRow key={row.id} row={row} phone={phone} />
-						))}
-					</Box>
-				))}
+				{sections.map((section) =>
+					section.key === "running" ? (
+						<Box key={section.key} pt={6} pb={4}>
+							<RunningCards rows={section.rows} />
+						</Box>
+					) : (
+						<Box key={section.key}>
+							{section.key === "recent" && (
+								<Text
+									size="xs"
+									c="dimmed"
+									px={8}
+									pt={12}
+									pb={6}
+									data-testid="project-sessions-recent"
+								>
+									{t("page.sessions.recent")}
+								</Text>
+							)}
+							{section.rows.map((row) => (
+								<SessionRow key={row.id} row={row} phone={phone} />
+							))}
+						</Box>
+					),
+				)}
 			</Stack>
 			{sessions.hasNextPage && (
 				<Box>

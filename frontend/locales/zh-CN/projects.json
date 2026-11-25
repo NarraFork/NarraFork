@@ -563,7 +563,8 @@
 				"active": "没有运行中的会话，最近 7 天也没有更新。",
 				"all": "这个项目还没有会话。",
 				"mine": "你在这个项目里还没有会话。"
-			}
+			},
+			"showAll": "显示全部 {{count}} 个"
 		},
 		"newSession": "新会话",
 		"waitingBadgeMore": "{{count}}+ 等你"
