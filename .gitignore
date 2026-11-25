@@ -190,6 +190,7 @@ drizzle-postgres/meta/_generation_pending.json
 # Bundled plugin asset generation and the isolated Provider Quota lifecycle smoke.
 !scripts/build-bundled-plugins.ts
 !scripts/smoke-provider-quota.ts
+!scripts/smoke-provider-quota-upgrade.ts
 # Deployable reference source API and bounded, isolated public-package publisher.
 !scripts/plugin-source-server.ts
 !scripts/smoke-plugin-sources.ts

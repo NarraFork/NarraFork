@@ -1057,7 +1057,10 @@ export class QuotaBrowserSmoke {
 		this.context.check("real isolated Chrome/Edge startup");
 	}
 
-	async newPage(locale: SmokeLocale): Promise<Page> {
+	async newPage(
+		locale: SmokeLocale,
+		{ seedSession = true }: { seedSession?: boolean } = {},
+	): Promise<Page> {
 		const browser = this.localeContexts.get(locale);
 		if (!browser) throw new Error("Owned locale browser context not connected");
 		const page = await boundedQuotaWork(browser.newPage(), this.context.signal);
@@ -1097,14 +1100,16 @@ export class QuotaBrowserSmoke {
 			if (++this.responses > 16_384)
 				this.context.controller.abort(new Error("Browser response count budget exceeded"));
 		});
-		await page.evaluateOnNewDocument(
-			(token, language) => {
-				localStorage.setItem("narrafork_token", token);
-				localStorage.setItem("narrafork_lang", language);
-			},
-			this.context.localeTokens.get(locale) ?? this.context.token,
-			locale,
-		);
+		if (seedSession) {
+			await page.evaluateOnNewDocument(
+				(token, language) => {
+					localStorage.setItem("narrafork_token", token);
+					localStorage.setItem("narrafork_lang", language);
+				},
+				this.context.localeTokens.get(locale) ?? this.context.token,
+				locale,
+			);
+		}
 		return page;
 	}
 
