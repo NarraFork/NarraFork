@@ -162,6 +162,7 @@ beforeEach(async () => {
 afterEach(async () => {
 	for (const table of [
 		"team_work_events",
+		"team_work_item_dependencies",
 		"team_work_items",
 		"project_teams",
 		"narrator_worktree_resources",
@@ -265,6 +266,59 @@ describe("Agent with a team work item", () => {
 		await agentTool.execute({ workdir: path, prompt: "go", subagent_type: "worker" }, ctx());
 		expect(runCalls[0]?.cwd).toBe(path);
 		expect(only()).toMatchObject({ state: "in_progress", workerNarratorId: "p3a-worker-1" });
+	});
+
+	test("D: a queued item whose dependency has not merged does not start (409 TEAM_WORK_ITEM_BLOCKED)", async () => {
+		const { teamTool } = await import("../team");
+		const first = JSON.parse(
+			(await teamTool.execute({ action: "work.create", title: "Schema" }, ctx())).output,
+		);
+		const second = JSON.parse(
+			(
+				await teamTool.execute(
+					{ action: "work.create", title: "API", dependsOn: [first.item.id] },
+					ctx(),
+				)
+			).output,
+		);
+		expect(second.item.dependsOn).toEqual([first.item.id]);
+		expect(second.item.blockedBy).toEqual([first.item.id]);
+		expect(second.nextAction).toContain("stays queued");
+
+		const refused = await agentTool.execute(
+			{ workdir: second.item.worktree, prompt: "go", subagent_type: "worker" },
+			ctx(),
+		);
+		expect(refused.isError).toBe(true);
+		expect(refused.output).toContain("TEAM_WORK_ITEM_BLOCKED");
+		expect(refused.output).toContain('"Schema"');
+		// Nothing was created or started.
+		expect(runCalls).toHaveLength(0);
+		const blocked = db
+			.select()
+			.from(teamWorkItems)
+			.where(eq(teamWorkItems.id, second.item.id))
+			.get();
+		expect(blocked).toMatchObject({ state: "queued", workerNarratorId: null });
+		// The service gate itself says 409 (the tool reports its code).
+		let status: number | undefined;
+		try {
+			items.attachWorker(LEAD, second.item.id, "p3a-nobody", { kind: "agent", id: LEAD });
+		} catch (error) {
+			status = (error as { statusCode?: number }).statusCode;
+		}
+		expect(status).toBe(409);
+
+		// Once the dependency is merged, the same call starts it.
+		sqlite.run("UPDATE team_work_items SET state = 'merged' WHERE id = ?", [first.item.id]);
+		await agentTool.execute(
+			{ workdir: second.item.worktree, prompt: "go", subagent_type: "worker" },
+			ctx(),
+		);
+		expect(runCalls).toHaveLength(1);
+		expect(
+			db.select().from(teamWorkItems).where(eq(teamWorkItems.id, second.item.id)).get(),
+		).toMatchObject({ state: "in_progress", workerNarratorId: "p3a-worker-1" });
 	});
 
 	test("refused for other sessions and with a workdir; a failed start leaves nothing behind", async () => {

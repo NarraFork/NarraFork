@@ -29,7 +29,6 @@ import {
 	type TeamWorkItemState,
 } from "@shared/project-teams";
 import { and, asc, eq, inArray } from "drizzle-orm";
-import { alias } from "drizzle-orm/sqlite-core";
 import { db } from "../../db";
 import { teamWorkItemDependencies, teamWorkItems } from "../../db/schema";
 import { AppError, ValidationError } from "../../lib/errors";
@@ -42,8 +41,6 @@ type Executor = Pick<typeof db, "select" | "insert" | "delete">;
 export const DEPENDENCY_WALK_MAX = 500;
 /** Most dependents of one merged item looked at for an unblock. */
 const UNBLOCK_SCAN_MAX = 200;
-
-const targets = alias(teamWorkItems, "dependency_target");
 
 // ── Reading ─────────────────────────────────────────────────────────────────
 
@@ -61,14 +58,18 @@ export function readDependencies(
 	const rows = executor
 		.select({
 			itemId: teamWorkItemDependencies.itemId,
-			id: targets.id,
-			title: targets.title,
-			state: targets.state,
+			id: teamWorkItems.id,
+			title: teamWorkItems.title,
+			state: teamWorkItems.state,
 		})
 		.from(teamWorkItemDependencies)
-		.innerJoin(targets, eq(targets.id, teamWorkItemDependencies.dependsOnItemId))
+		.innerJoin(teamWorkItems, eq(teamWorkItems.id, teamWorkItemDependencies.dependsOnItemId))
 		.where(inArray(teamWorkItemDependencies.itemId, ids))
-		.orderBy(asc(teamWorkItemDependencies.itemId), asc(targets.createdAt), asc(targets.id))
+		.orderBy(
+			asc(teamWorkItemDependencies.itemId),
+			asc(teamWorkItems.createdAt),
+			asc(teamWorkItems.id),
+		)
 		.limit(ids.length * TEAM_WORK_DEPENDENCIES_MAX)
 		.all();
 	for (const row of rows) {

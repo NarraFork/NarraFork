@@ -272,7 +272,8 @@ function DependencyRow({
 	);
 }
 
-function DependencySections({
+/** The drawer's 「依赖」 and 「被依赖」 sections (exported for the component tests). */
+export function DependencySections({
 	detail,
 	onOpenItem,
 }: {

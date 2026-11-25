@@ -485,6 +485,35 @@ describe("board and summary", () => {
 	});
 });
 
+describe("dependencies (D)", () => {
+	test("the board carries each card's dependencies; the drawer lists the dependents", async () => {
+		const first = await newItem("Dependency first");
+		const second = await work.createWorkItem({
+			coordinatorId: teamId,
+			title: "Dependency second",
+			dependsOn: [first.id],
+			actor: { ...agent, id: teamId },
+			principal: { userId: OWNER, isAdmin: false },
+			signal: new AbortController().signal,
+		});
+		const board = await call(READER, teamPath("board?column=queued"));
+		const card = board.body.items.find((entry: { id: string }) => entry.id === second.id);
+		expect(card.dependsOn).toEqual([{ id: first.id, title: "Dependency first", state: "queued" }]);
+		expect(
+			board.body.items.find((entry: { id: string }) => entry.id === first.id).dependsOn,
+		).toEqual([]);
+		const detail = await call(READER, teamPath(`work/${first.id}`));
+		expect(detail.body.dependents).toEqual([
+			{ id: second.id, title: "Dependency second", state: "queued" },
+		]);
+		expect(detail.body.dependentsMore).toBe(false);
+		const events = await call(READER, teamPath("events"));
+		expect(events.body.events.map((event: { kind: string }) => event.kind)).toContain(
+			"work.dependencies_changed",
+		);
+	});
+});
+
 describe("review fixes", () => {
 	test("an in-place question carries each option's whole title; more than six: no form", async () => {
 		const { questionForm } = await import("../../services/teams/team-board");
