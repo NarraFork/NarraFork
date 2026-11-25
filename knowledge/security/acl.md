@@ -34,7 +34,7 @@ keywords:
   - agent.defaultNarratorWriteAudience
   - terminalAccessAllowed
 status: draft
-verified_at: 15e7759dc
+verified_at: e41d5f9b5
 ---
 # 访问控制
 
@@ -57,7 +57,7 @@ verified_at: 15e7759dc
 - 路由层桥接：`lib/narrator-access.ts`（`requireNarratorAccess`、`getAuthorizedNarrator` 等）与 `lib/project-access.ts`（`requireProjectAccess`）把 Hono 上下文转成主体再调 ACL，新端点用它们表达「需要 read/write」，不要自己拼主体。
 - 创建时的受众解析（`lib/narrator-audiences.ts:resolveNarratorAudiences`）：显式值优先；`agent.defaultNarratorVisibility`/`defaultNarratorWriteAudience` 为 `auto` 时，从项目页打开的会话取 project，其余取 private，写受众取该可见性允许的最宽值；只有全局写默认会被收窄，显式的越界组合报校验错。`narrator-service.ts` 创建根叙述者时传入的项目页参数为 null。
 - `narrator-sharing.ts:announceTeamChange`：会话升级为团队或团队解散时，访问没变，但会话树是不是团队变了；给最近标签页里有该会话或其子代理的人（最多 `TEAM_AUDIENCE_NOTICE_LIMIT`=200）和操作者发 `narrator_access_changed`，`reason: "team_changed"`，不触发服务端的 `narrator:access_changed`。
-- 前端：`useNarratorAccess`/`useProjectAccess` 读 `/access` 并按 WebSocket 帧 `narrator_access_changed` 失效（该帧按用户而非按订阅广播，不带授权细节，收到只能重读，同时刷新叙述者列表）。
+- 前端：`useNarratorAccess`/`useProjectAccess` 读 `/access`（项目页页头的 `useProjectMemberCount` 只读人数，同在 `["projects", id]` 下一起失效）并按 WebSocket 帧 `narrator_access_changed` 失效（该帧按用户而非按订阅广播，不带授权细节，收到只能重读，同时刷新叙述者列表）。
 - 单主体与批量判断共用 `readVerdict`/`writeVerdict`，有一致性测试 `services/__tests__/narrator-acl-batch-parity.test.ts`。
 - 两个批量入口：`judgeNarratorAccessBatch`（一个叙述者 × 多个主体，团队成员列表）和 `judgeNarratorsWriteForPrincipal`（一个主体 × 多个叙述者，只判写；按被判行即子代理的根去重，根行连同 `narratorProjectIdColumn`、项目行、该主体的用户与角色授权各一条语句，每 400 个一批；没有根的子代理拒绝）。项目侧对应 `project-acl.ts:projectsWritableBy`（一个主体 × 多个项目，授权一条语句）。项目页的「等你处理」和项目列表汇总用后两者（见[项目页](../collaboration/project-pages.md)）。一致性测试同上，`projectsWritableBy` 在 `server/routes/__tests__/projects-overview.test.ts` 对照 `canWriteProject`。
 - 终端权限（`services/terminal-access.ts`）：叙述者的终端跟随该叙述者 ACL，子代理用其根叙述者；`read` 只看元数据，`write` 覆盖开启、看输出和滚动缓冲、输入、改名、关闭、读进程列表，因为终端等同于在会话工作区的 shell。

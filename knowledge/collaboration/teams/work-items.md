@@ -41,7 +41,7 @@ keywords:
   - Team 工具
   - Agent isolation worktree
 status: draft
-verified_at: 7d5423c07
+verified_at: e41d5f9b5
 ---
 # 工作项
 
@@ -59,7 +59,7 @@ verified_at: 7d5423c07
 - 第一层子代理经 `attachWorker` 记为工作者，queued 的项随之开始。
 
 评审与就绪：
-- `work.review`：blocker 把项退回 `in_progress`，clear 留在 `in_review`。
+- `work.review`：blocker 把项退回 `in_progress`，clear 留在 `in_review`。事件详情记 `round`、`verdict`、`findings`（问题数）、`reviewer`、`head`，以及可选的 `summary`（评审意见原文，trim 后为空不存，最多 `TEAM_REVIEW_SUMMARY_MAX_LENGTH`=1000 字，超出 `recordReview` 抛 ValidationError、工具 schema 先拒；1000 字每字转义成 6 字节也在 8KB 详情上限内），团队页抽屉按轮显示它（见[团队页与审批](page.md)）。
 - `work.ready` 需要最新一轮评审为 clear，否则 409 `TEAM_WORK_ITEM_NOT_REVIEWED`。
 - `work.ready` 还要 worktree 无未提交改动，否则 409 `TEAM_WORK_ITEM_DIRTY`。
 - `work.ready` 事件除 `head`、`changedPathCount` 外还记 `mergeBase` 与 `diffStat`（钉住 head 时的 `+/-` 与文件数，best-effort，读不出为 null），已合并的项（head 已在基线里）靠它们在团队页显示大小和改动文件。
