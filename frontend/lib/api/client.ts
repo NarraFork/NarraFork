@@ -19,6 +19,18 @@ export function apiBase(): string {
 }
 const TOKEN_KEY = "narrafork_token";
 const MAX_RESPONSE_TEXT_PREVIEW_CHARS = 120_000;
+// Keep the credential that actually went over the wire, not the token at error-reading time.
+const responseTokens = new WeakMap<Response, string | null>();
+
+function getRequestToken(headers: Headers): string | null {
+	return headers.get("Authorization")?.match(/^Bearer\s+(.+)$/i)?.[1] ?? null;
+}
+
+function getResponseToken(response: Response): string | null {
+	// Raw/legacy Responses have no request metadata. Snapshot their current session
+	// before reading the body, which may itself finish after a newer login.
+	return responseTokens.has(response) ? (responseTokens.get(response) ?? null) : getToken();
+}
 
 export class ApiError extends Error {
 	status: number;
@@ -155,7 +167,9 @@ export async function authorizedFetch(input: string | URL, init?: RequestInit): 
 	if (token && !headers.has("Authorization")) {
 		headers.set("Authorization", `Bearer ${token}`);
 	}
+	const requestToken = getRequestToken(headers);
 	const response = await businessTransport.request(String(input), { ...init, headers });
+	responseTokens.set(response, requestToken);
 	return response;
 }
 
@@ -168,8 +182,13 @@ export async function authorizedFetch(input: string | URL, init?: RequestInit): 
  * different principal. Treating those as logout was what made NarraFork appear
  * to sign users out at random.
  */
-function clearTokenIfSessionInvalid(data: Record<string, unknown> | null): void {
-	if (isSessionInvalidResponse(data)) clearToken();
+function clearTokenIfSessionInvalid(
+	data: Record<string, unknown> | null,
+	requestToken: string | null,
+): void {
+	if (requestToken !== null && isSessionInvalidResponse(data) && getToken() === requestToken) {
+		clearToken();
+	}
 }
 
 /**
@@ -180,8 +199,9 @@ function clearTokenIfSessionInvalid(data: Record<string, unknown> | null): void 
  */
 export async function clearTokenOnSessionFailure(response: Response): Promise<void> {
 	if (response.status !== 401) return;
+	const requestToken = getResponseToken(response);
 	const data = await readErrorData(response, "Unauthorized").catch(() => null);
-	clearTokenIfSessionInvalid(data);
+	clearTokenIfSessionInvalid(data, requestToken);
 }
 
 function tryParseJson(raw: string): unknown | null {
@@ -317,11 +337,12 @@ export async function readFetchError(
 	response: Response,
 	fallback = response.statusText || "Request failed",
 ): Promise<{ message: string; data: Record<string, unknown> }> {
+	const requestToken = response.status === 401 ? getResponseToken(response) : null;
 	const data = await readErrorData(response, fallback);
 	// The error code lives in the body, so the session verdict has to wait until
 	// the body is parsed rather than branching on the status alone.
 	if (response.status === 401) {
-		clearTokenIfSessionInvalid(data);
+		clearTokenIfSessionInvalid(data, requestToken);
 	}
 	return { message: getErrorMessage(data, fallback), data };
 }
@@ -361,14 +382,18 @@ export async function request<T>(
 	},
 ): Promise<T> {
 	const { maxResponseBytes, onResponseBytes, ...fetchOptions } = options ?? {};
-	const headers: Record<string, string> = { ...(options?.headers as Record<string, string>) };
+	const headers: Record<string, string> =
+		options?.headers instanceof Headers || Array.isArray(options?.headers)
+			? Object.fromEntries(new Headers(options.headers))
+			: { ...options?.headers };
 	if (options?.body) {
 		headers["Content-Type"] = "application/json";
 	}
 	const token = getToken();
-	if (token) {
+	if (token && !new Headers(headers).has("Authorization")) {
 		headers.Authorization = `Bearer ${token}`;
 	}
+	const requestToken = getRequestToken(new Headers(headers));
 	const response = await businessTransport.request(apiUrl(path), { ...fetchOptions, headers });
 	// Apply the same byte budget before parsing either success or error bodies.
 	const boundedText =
@@ -377,7 +402,7 @@ export async function request<T>(
 			: await readBoundedResponseText(response, maxResponseBytes, onResponseBytes);
 	if (response.status === 401) {
 		const error = await readErrorData(response, "Unauthorized", boundedText);
-		clearTokenIfSessionInvalid(error);
+		clearTokenIfSessionInvalid(error, requestToken);
 		throw new ApiError(getErrorMessage(error, "Unauthorized"), 401, error);
 	}
 	if (!response.ok) {

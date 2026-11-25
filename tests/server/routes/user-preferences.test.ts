@@ -1,10 +1,13 @@
-import { afterAll, afterEach, describe, expect, it, mock } from "bun:test";
+import { afterAll, afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import type { PersistedRecentTab, RecentTabsMutationResult } from "@shared/recent-tabs";
 import { Hono } from "hono";
 import { userPreferences, userRecentTabs, users } from "../../../server/db/schema";
 import type { SessionPayload } from "../../../server/lib/auth";
 import { eventBus } from "../../../server/lib/event-bus";
-import { updateUserPreferencesSchema } from "../../../server/lib/validators/settings";
+import {
+	specTabLayoutPatchSchema,
+	updateUserPreferencesSchema,
+} from "../../../server/lib/validators/settings";
 import { cleanDb, getTestDb } from "../../setup";
 
 const { db, sqlite } = getTestDb();
@@ -107,6 +110,348 @@ afterAll(() => {
 	mock.module("../../../server/lib/settings", () => realSettingsModule);
 	mock.module("../../../server/websocket/narrator-ws", () => realNarratorWsModule);
 	mock.restore();
+});
+
+describe("bounded UI preferences projection", () => {
+	function budgetCheckedApp() {
+		const checked = new Hono();
+		checked.use("*", async (c, next) => {
+			c.set("user", authUser);
+			await next();
+		});
+		checked.onError(
+			(error) =>
+				new Response(error.message, {
+					status: (error as { statusCode?: number }).statusCode ?? 500,
+				}),
+		);
+		checked.route("/", userPreferencesRoutes);
+		return checked;
+	}
+	const BODY_BUDGET = 64 * 1024;
+	const bodyPaths = ["/ui", "/?view=ui", "/spec-tab-layout"];
+
+	it("bounds raw whitespace before parsing UI/alias/Spec JSON and leaves the row unchanged", async () => {
+		seedPreferences([], {
+			specTabLayout: JSON.stringify({ retained: { order: ["keep.md"], pinned: [] } }),
+		});
+		const checked = budgetCheckedApp();
+		const readStored = () =>
+			sqlite.query("SELECT language, spec_tab_layout, updated_at FROM user_preferences").get();
+		const before = readStored();
+		for (const path of bodyPaths) {
+			const input =
+				path === "/spec-tab-layout"
+					? { narratorId: "retained", order: ["new.md"], pinned: [] }
+					: { language: "zh-CN" };
+			const smallJson = JSON.stringify(input);
+			const oversized = " ".repeat(BODY_BUDGET) + smallJson;
+			for (const length of [undefined, "1"]) {
+				const headers = new Headers({ "content-type": "application/json" });
+				if (length) headers.set("content-length", length);
+				const response = await checked.request(path, { method: "PATCH", headers, body: oversized });
+				expect(response.status).toBe(413);
+				expect(readStored()).toEqual(before);
+			}
+		}
+		// The compatibility full-detail PATCH retains its original, larger body allowance.
+		const legacy = await checked.request("/", {
+			method: "PATCH",
+			headers: { "content-type": "application/json" },
+			body: " ".repeat(BODY_BUDGET) + JSON.stringify({ language: "zh-CN" }),
+		});
+		expect(legacy.status).toBe(200);
+		expect(
+			sqlite.query<{ language: string }, []>("SELECT language FROM user_preferences").get()
+				?.language,
+		).toBe("zh-CN");
+	});
+
+	it("checks declared bytes before pulling and stops chunked streams at the raw cap", async () => {
+		seedPreferences([], {
+			specTabLayout: JSON.stringify({ retained: { order: ["keep.md"], pinned: [] } }),
+		});
+		const checked = budgetCheckedApp();
+		const before = sqlite
+			.query("SELECT language, spec_tab_layout, updated_at FROM user_preferences")
+			.get();
+		for (const path of bodyPaths) {
+			let pulls = 0;
+			let cancelled = false;
+			const stream = new ReadableStream<Uint8Array>(
+				{
+					pull(controller) {
+						pulls++;
+						controller.enqueue(new TextEncoder().encode(" ".repeat(16 * 1024)));
+					},
+					cancel() {
+						cancelled = true;
+					},
+				},
+				{ highWaterMark: 0 },
+			);
+			const response = await checked.request(
+				new Request(`http://localhost${path}`, {
+					method: "PATCH",
+					headers: { "content-type": "application/json" },
+					body: stream,
+				}),
+			);
+			expect(response.status).toBe(413);
+			expect(pulls).toBe(5);
+			expect(cancelled).toBe(true);
+			let headerPulls = 0;
+			let headerCancelled = false;
+			const declaredStream = new ReadableStream<Uint8Array>(
+				{
+					pull(controller) {
+						headerPulls++;
+						controller.enqueue(new Uint8Array([123, 125]));
+						controller.close();
+					},
+					cancel() {
+						headerCancelled = true;
+					},
+				},
+				{ highWaterMark: 0 },
+			);
+			const declared = await checked.request(
+				new Request(`http://localhost${path}`, {
+					method: "PATCH",
+					headers: {
+						"content-type": "application/json",
+						"content-length": String(BODY_BUDGET + 1),
+					},
+					body: declaredStream,
+				}),
+			);
+			expect(declared.status).toBe(413);
+			expect(headerPulls).toBe(0);
+			expect(headerCancelled).toBe(true);
+			expect(
+				sqlite.query("SELECT language, spec_tab_layout, updated_at FROM user_preferences").get(),
+			).toEqual(before);
+		}
+	});
+
+	it("accepts exact raw-byte boundaries and rejects CJK layout overflow before SQL writes", async () => {
+		seedPreferences([], {
+			specTabLayout: JSON.stringify({ retained: { order: ["keep.md"], pinned: [] } }),
+		});
+		const checked = budgetCheckedApp();
+		const layout = { order: Array.from({ length: 84 }, () => "文".repeat(256)), pinned: [] };
+		const json = JSON.stringify({ narratorId: "retained", ...layout });
+		const rawBytes = Buffer.byteLength(json);
+		expect(rawBytes).toBeLessThan(BODY_BUDGET);
+		const exact = json + " ".repeat(BODY_BUDGET - rawBytes);
+		expect(Buffer.byteLength(exact)).toBe(BODY_BUDGET);
+		expect(
+			(await checked.request("/spec-tab-layout", { method: "PATCH", body: exact })).status,
+		).toBe(200);
+		const get = await checked.request("/spec-tab-layout?narratorId=retained");
+		expect(get.status).toBe(200);
+		expect(await get.json()).toEqual(layout);
+		const before = sqlite.query("SELECT spec_tab_layout, updated_at FROM user_preferences").get();
+		const overflow = {
+			narratorId: "retained",
+			order: Array.from({ length: 100 }, () => "文".repeat(256)),
+			pinned: Array.from({ length: 100 }, () => "文".repeat(256)),
+		};
+		expect(specTabLayoutPatchSchema.safeParse(overflow).success).toBe(true);
+		for (const body of [`${exact} `, JSON.stringify(overflow)]) {
+			expect((await checked.request("/spec-tab-layout", { method: "PATCH", body })).status).toBe(
+				413,
+			);
+			expect(
+				sqlite.query("SELECT spec_tab_layout, updated_at FROM user_preferences").get(),
+			).toEqual(before);
+		}
+		for (const path of ["/ui", "/?view=ui"]) {
+			const small = JSON.stringify({ language: "zh-CN" });
+			const exactUI = small + " ".repeat(BODY_BUDGET - Buffer.byteLength(small));
+			expect((await checked.request(path, { method: "PATCH", body: exactUI })).status).toBe(200);
+		}
+	});
+	it("reads and patches UI without full-row reads, legacy tabs or enrichment", async () => {
+		seedPreferences(
+			Array.from({ length: 1000 }, (_, i) => tab(`legacy-${i}`)),
+			{
+				gatewayConfig: JSON.stringify({ huge: "g".repeat(500_000) }),
+				commands: JSON.stringify([{ name: "huge", prompt: "p".repeat(500_000) }]),
+				specTabLayout: JSON.stringify(
+					Object.fromEntries(
+						Array.from({ length: 1000 }, (_, i) => [`n-${i}`, { order: ["a.md"], pinned: [] }]),
+					),
+				),
+				notifyDingtalkWebhook: "https://secret.invalid/hidden",
+			},
+		);
+		const tabsModule = await import("../../../server/services/recent-tabs-service");
+		const prefsModule = await import("../../../server/services/user-preferences-service");
+		const forbidden = () => {
+			throw new Error("UI projection touched full preferences/tabs");
+		};
+		const fullRead = spyOn(db.query.userPreferences, "findFirst").mockImplementation(forbidden);
+		const legacy = spyOn(tabsModule, "listLegacyTabs").mockImplementation(forbidden);
+		const enrichment = spyOn(prefsModule, "enrichTabs").mockImplementation(forbidden);
+		try {
+			for (const path of ["/ui", "/?view=ui"]) {
+				const result = await requestJson(path);
+				expect(result.status).toBe(200);
+				expect(result.body).toMatchObject({
+					language: "en",
+					appearancePreferences: {},
+					hiddenPluginOverlays: [],
+				});
+				for (const key of [
+					"recentTabs",
+					"commands",
+					"gatewayConfig",
+					"specTabLayout",
+					"graphViewports",
+					"notifyDingtalkWebhook",
+					"outlineDigestTime",
+				]) {
+					expect(result.body).not.toHaveProperty(key);
+				}
+				expect(Buffer.byteLength(JSON.stringify(result.body))).toBeLessThan(8 * 1024);
+			}
+			for (const path of ["/ui", "/?view=ui"]) {
+				const saved = await requestJson(path, {
+					method: "PATCH",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({
+						language: "zh-CN",
+						fastModeDefault: true,
+						narratorLineHeightV2Percent: 112,
+					}),
+				});
+				expect(saved.status).toBe(200);
+				expect(saved.body).toMatchObject({
+					language: "zh-CN",
+					fastModeDefault: true,
+					narratorLineHeightV2Percent: 112,
+				});
+				expect(saved.body).not.toHaveProperty("commands");
+			}
+			expect(fullRead).not.toHaveBeenCalled();
+			expect(legacy).not.toHaveBeenCalled();
+			expect(enrichment).not.toHaveBeenCalled();
+		} finally {
+			fullRead.mockRestore();
+			legacy.mockRestore();
+			enrichment.mockRestore();
+		}
+		const row = sqlite
+			.query<{ commands: string; gateway_config: string }, []>(
+				"SELECT commands, gateway_config FROM user_preferences",
+			)
+			.get();
+		expect(row?.commands.length).toBeGreaterThan(500_000);
+		expect(row?.gateway_config.length).toBeGreaterThan(500_000);
+	});
+
+	it("rejects heavy fields and over-budget persisted UI data without partial success", async () => {
+		seedPreferences([], { navLayout: JSON.stringify({ items: [{ id: "x".repeat(70_000) }] }) });
+		const checked = new Hono();
+		checked.use("*", async (c, next) => {
+			c.set("user", authUser);
+			await next();
+		});
+		checked.onError(
+			(error) =>
+				new Response(error.message, {
+					status: (error as { statusCode?: number }).statusCode ?? 500,
+				}),
+		);
+		checked.route("/", userPreferencesRoutes);
+		expect((await checked.request("/ui")).status).toBe(413);
+		const rejected = await checked.request("/ui", {
+			method: "PATCH",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ language: "zh-CN" }),
+		});
+		expect(rejected.status).toBe(413);
+		expect(
+			sqlite.query<{ language: string }, []>("SELECT language FROM user_preferences").get()
+				?.language,
+		).toBe("en");
+		for (const field of [
+			"commands",
+			"gatewayConfig",
+			"recentTabs",
+			"specTabLayout",
+			"notifyDingtalkSecret",
+			"outlineDigestTime",
+		]) {
+			const response = await checked.request("/ui", {
+				method: "PATCH",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ [field]: [] }),
+			});
+			expect(response.status).toBe(400);
+		}
+	});
+
+	it("uses UI defaults on first write and preserves partial appearance merges", async () => {
+		seedUser();
+		expect((await requestJson("/ui")).body).toMatchObject({
+			notifySoundMaxConcurrent: 2,
+			enterQueueMode: "turn",
+			narratorLineHeightV2Percent: 100,
+		});
+		for (const patch of [
+			{ appearancePreferences: { narrafork_oled: true } },
+			{ appearancePreferences: { narrafork_blur_in_ms: 0 } },
+		]) {
+			expect(
+				(
+					await requestJson("/ui", {
+						method: "PATCH",
+						headers: { "content-type": "application/json" },
+						body: JSON.stringify(patch),
+					})
+				).status,
+			).toBe(200);
+		}
+		expect((await requestJson("/ui")).body).toMatchObject({
+			appearancePreferences: { narrafork_oled: true, narrafork_blur_in_ms: 0 },
+		});
+	});
+
+	it("extracts only the current narrator layout and atomically retains historical entries", async () => {
+		const layouts = Object.fromEntries(
+			Array.from({ length: 1000 }, (_, i) => [`n-${i}`, { order: [`${i}.md`], pinned: [] }]),
+		);
+		seedPreferences([], { specTabLayout: JSON.stringify(layouts) });
+		const fullRead = spyOn(db.query.userPreferences, "findFirst").mockImplementation(() => {
+			throw new Error("No layout map reads");
+		});
+		try {
+			const result = await requestJson("/spec-tab-layout?narratorId=n-517");
+			expect(result).toEqual({ status: 200, body: { order: ["517.md"], pinned: [] } });
+			expect(Buffer.byteLength(JSON.stringify(result.body))).toBeLessThan(100);
+			const saved = await requestJson("/spec-tab-layout", {
+				method: "PATCH",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ narratorId: "n-517", order: ["new.md"], pinned: ["pin.md"] }),
+			});
+			expect(saved.status).toBe(200);
+			expect((await requestJson("/spec-tab-layout?narratorId=n-517")).body).toEqual({
+				order: ["new.md"],
+				pinned: ["pin.md"],
+			});
+			expect((await requestJson("/spec-tab-layout?narratorId=n-518")).body).toEqual(
+				layouts["n-518"],
+			);
+			expect((await requestJson("/spec-tab-layout?narratorId=absent")).body).toEqual({
+				order: [],
+				pinned: [],
+			});
+		} finally {
+			fullRead.mockRestore();
+		}
+	});
 });
 
 describe("account appearance preferences", () => {

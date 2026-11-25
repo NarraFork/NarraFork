@@ -12,11 +12,15 @@
  * sent while the narrator was mid-turn would start a new turn instead of queueing.
  */
 
-import { Box, Text } from "@mantine/core";
-import { useCallback } from "react";
+import { Box, Button, Group, Text } from "@mantine/core";
+import { useQueryClient } from "@tanstack/react-query";
+import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useNarratorChatRoom } from "../../hooks/useChat";
+import { chatKeys, useNarratorChatRoom } from "../../hooks/useChat";
+import { ApiError, getToken } from "../../lib/api/client";
 import { useNarratorDockContext } from "../narrator/dock/NarratorDockContext";
+import { useEditorPanelVisible } from "../narrator/narrator-panel-visibility";
+import { invalidateCachedPretextDocument } from "../narrator/vlist/pretext-document-cache";
 import { ChatRoomView } from "./ChatRoomView";
 
 export interface NarratorUserChatPanelProps {
@@ -37,8 +41,38 @@ export function NarratorUserChatPanel({
 	onForwardToNarrator,
 }: NarratorUserChatPanelProps) {
 	const { t } = useTranslation("chat");
+	const queryClient = useQueryClient();
 	const dock = useNarratorDockContext();
-	const { data: room, isLoading, error } = useNarratorChatRoom(narratorId);
+	const active = useEditorPanelVisible();
+	const {
+		data: room,
+		error,
+		isSuccess,
+		isFetching,
+		refetch,
+	} = useNarratorChatRoom(narratorId, active);
+	// The room hook subscribes to token changes; keep denial state in that same scope.
+	const scope = JSON.stringify([narratorId, getToken()]);
+	const [revokedScope, setRevokedScope] = useState<string | null>(null);
+	// This resolver deliberately uses 404 for both missing narrators and denied canRead.
+	const denied =
+		error instanceof ApiError &&
+		(error.status === 401 || error.status === 403 || error.status === 404);
+	useEffect(() => {
+		if (denied) setRevokedScope(scope);
+		else if (isSuccess) setRevokedScope(null);
+	}, [denied, isSuccess, scope]);
+	// Once denied, another transient failure must not resurrect cached private content.
+	// Only a successful resolver for the hook's current token-scoped key restores access.
+	const authorizationLost = denied || (revokedScope === scope && !isSuccess);
+	const roomId = room?.id;
+	useEffect(() => {
+		if (!authorizationLost || !roomId) return;
+		// Passive child teardown can publish its last window on unmount. Purge after
+		// that cleanup, not during render or a layout effect that it could overwrite.
+		invalidateCachedPretextDocument(roomId);
+		queryClient.removeQueries({ queryKey: chatKeys.messages(roomId) });
+	}, [authorizationLost, roomId, queryClient]);
 
 	const submitToNarrator = onForwardToNarrator ?? dock?.submitToNarrator;
 	const forward = useCallback(
@@ -48,36 +82,46 @@ export function NarratorUserChatPanel({
 		[submitToNarrator],
 	);
 
-	if (error) {
-		return (
-			<Box p="md">
-				<Text size="sm" c="red">
-					{error instanceof Error ? error.message : t("roomLoadFailed")}
-				</Text>
-			</Box>
-		);
-	}
-
-	const roomId = isLoading ? undefined : room?.id;
+	const failureNotice = (
+		<Group wrap="nowrap" gap="xs" role={authorizationLost || !roomId ? "alert" : "status"}>
+			<Text size="sm" c={authorizationLost || !roomId ? "red" : "yellow"} style={{ flex: 1 }}>
+				{error instanceof Error ? error.message : t("roomLoadFailed")}
+			</Text>
+			<Button
+				size="compact-xs"
+				variant="subtle"
+				disabled={!active}
+				loading={isFetching}
+				onClick={() => {
+					void refetch();
+				}}
+			>
+				{t("common:retry")}
+			</Button>
+		</Group>
+	);
+	if (authorizationLost || (error && !roomId)) return <Box p="md">{failureNotice}</Box>;
 
 	return (
-		// Keyed by room so a different narrator's room REMOUNTS the view rather than
-		// reusing it. The subtree holds per-room state that is wrong anywhere else:
-		// the read watermark's last-sent seq (a carried-over higher seq silently
-		// suppresses every read report in the new room), the list's scroll/boot
-		// refs, and the draft / reply target / selection. The `pending` fallback
-		// covers the pre-resolution render, so the real room still gets a fresh
-		// mount once its id arrives.
-		<ChatRoomView
-			key={roomId ?? "pending"}
-			roomId={roomId}
-			// Only offer forwarding when a narrator composer is actually mounted to
-			// receive it; otherwise the button would be a no-op control.
-			onForwardToNarrator={submitToNarrator ? forward : undefined}
-			// Forwarding ATTACHMENTS needs the narrator itself, not just the composer
-			// bridge: the files are copied into its worktree before the forwarded text
-			// can name their paths.
-			narratorId={narratorId}
-		/>
+		<Box h="100%" style={{ display: "flex", flexDirection: "column", minHeight: 0 }}>
+			<Box style={{ flex: 1, minHeight: 0 }}>
+				{/* Keep this slot/key unchanged while a resolver revalidation fails or retries.
+				    Only a real room change should remount its coordinator/draft/reply state. */}
+				<ChatRoomView
+					key={roomId ?? "pending"}
+					roomId={roomId}
+					suspended={!active}
+					// Only offer forwarding when a narrator composer is actually mounted to receive it.
+					onForwardToNarrator={submitToNarrator ? forward : undefined}
+					// Forwarded attachments require the narrator's worktree, not just its composer.
+					narratorId={narratorId}
+				/>
+			</Box>
+			{error ? (
+				<Box p="xs" style={{ flexShrink: 0 }}>
+					{failureNotice}
+				</Box>
+			) : null}
+		</Box>
 	);
 }

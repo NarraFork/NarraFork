@@ -2,7 +2,7 @@ import { afterAll, beforeAll, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ComposerDocument } from "@shared/composer-document";
+import { type ComposerDocument, composerDocumentText } from "@shared/composer-document";
 import puppeteer, { type Browser, type Page } from "puppeteer-core";
 import { heightTransitionStepLimit } from "./height-transition-sampling.test-support";
 import type * as Fixture from "./NarratorComposer.browser-fixture";
@@ -14,6 +14,16 @@ const executablePath =
 let browser: Browser | undefined;
 let server: ReturnType<typeof Bun.serve> | undefined;
 const errors = new WeakMap<Page, string[]>();
+const narratorReads = new WeakMap<Page, string[]>();
+let namedCandidateRows: { id: string; handle: string; title?: string }[] = [];
+function trackNarratorReads(page: Page) {
+	const paths: string[] = [];
+	narratorReads.set(page, paths);
+	page.on("request", (request) => {
+		const path = new URL(request.url()).pathname;
+		if (request.method() === "GET" && path.startsWith("/api/narrators/")) paths.push(path);
+	});
+}
 const emptyDraft = {
 	hasDraft: false,
 	text: "",
@@ -79,7 +89,21 @@ beforeAll(async () => {
 		hostname: "127.0.0.1",
 		port: 0,
 		async fetch(request) {
-			const path = new URL(request.url).pathname;
+			const url = new URL(request.url);
+			const path = url.pathname;
+			if (path === "/__fixture/named-suggestions" && request.method === "POST") {
+				namedCandidateRows = await request.json();
+				return Response.json({ ok: true });
+			}
+			if (path === "/api/narrators/named" && url.searchParams.get("view") === "suggestions") {
+				const q = url.searchParams.get("q") ?? "";
+				return Response.json({
+					items: namedCandidateRows
+						.filter((row) => row.handle.includes(q))
+						.map((row) => ({ ...row, title: row.title ?? null, status: "idle" })),
+					nextCursor: null,
+				});
+			}
 			const persistent = path.match(/^\/api\/narrators\/(persist-[^/]+)\/(draft|panel-state)$/);
 			if (persistent) {
 				const user =
@@ -154,6 +178,14 @@ beforeAll(async () => {
 						},
 					],
 					truncated: false,
+				});
+			if (path === "/api/settings/runtime")
+				return Response.json({
+					revision: 1,
+					agent: { defaultModel: "", summaryModel: "" },
+					outline: { enabled: false },
+					requestEvidence: { autoPin: "off" },
+					summaryModelAvailable: false,
 				});
 			if (path.startsWith("/api/")) return Response.json([]);
 			if (path === "/")
@@ -245,23 +277,39 @@ async function waitForCaretMove(page: Page, previousHead: number) {
 }
 async function open(viewport?: { width: number; height: number }) {
 	if (!browser || !server) throw new Error("Fixture unavailable");
+	namedCandidateRows = [];
 	const page = await browser.newPage();
 	page.setDefaultTimeout(5000);
 	await page.setViewport(viewport ?? { width: 1000, height: 700 });
 	const captured: string[] = [];
 	errors.set(page, captured);
 	page.on("pageerror", (error) => captured.push(String(error)));
-	const hydrated = page.waitForResponse(
+	trackNarratorReads(page);
+	const metadata = page.waitForResponse(
 		(response) =>
-			response.url().endsWith("/draft") && response.request().method() === "GET" && response.ok(),
+			response.url().endsWith("/fixture-narrator/panel-state") &&
+			response.request().method() === "GET" &&
+			response.ok(),
 	);
 	await page.goto(server.url.origin);
 	await page.bringToFront();
 	await page.waitForFunction(() => document.hasFocus());
-	await hydrated;
-	await page.waitForFunction(() => (window as unknown as FixtureWindow).fixture?.ready());
+	await metadata;
+	await waitEditableComposer(page);
 	await settle(page);
+	// Empty metadata is authoritative: no body or independent permission read.
+	expect(narratorReads.get(page)).toEqual(["/api/narrators/fixture-narrator/panel-state"]);
 	return page;
+}
+async function waitEditableComposer(page: Page) {
+	await page.waitForFunction(() => {
+		const textbox = document.querySelector<HTMLElement>('[role="textbox"]');
+		return (
+			(window as unknown as FixtureWindow).fixture?.ready() &&
+			textbox?.isContentEditable &&
+			textbox.getAttribute("aria-disabled") !== "true"
+		);
+	});
 }
 async function close(page: Page) {
 	await page.close();
@@ -1788,9 +1836,13 @@ test.each([
 	15_000,
 );
 
-async function openPersistentAttachments(reuse = false) {
+async function openPersistentAttachments(
+	reuse = false,
+	initialDraft?: NonNullable<ReturnType<typeof persistentDrafts.get>>,
+) {
 	if (!browser || !server) throw new Error("Browser fixture unavailable");
 	persistentDrafts.clear();
+	if (initialDraft) persistentDrafts.set("fixture-user:persist-a", initialDraft);
 	const context = await browser.createBrowserContext();
 	const page = await context.newPage();
 	page.setDefaultTimeout(8000);
@@ -1798,13 +1850,19 @@ async function openPersistentAttachments(reuse = false) {
 	const captured: string[] = [];
 	errors.set(page, captured);
 	page.on("pageerror", (error) => captured.push(String(error)));
-	const loaded = page.waitForResponse(
+	trackNarratorReads(page);
+	const metadata = page.waitForResponse(
 		(response) =>
-			response.url().endsWith("/persist-a/draft") && response.request().method() === "GET",
+			response.url().endsWith("/persist-a/panel-state") &&
+			response.request().method() === "GET" &&
+			response.ok(),
 	);
 	await page.goto(`${server.url.origin}/?persist${reuse ? "&reuse" : ""}`);
-	await loaded;
+	await metadata;
 	await waitAttachmentOwner(page, "persist-a");
+	await waitEditableComposer(page);
+	if (!initialDraft)
+		expect(narratorReads.get(page)).toEqual(["/api/narrators/persist-a/panel-state"]);
 	return page;
 }
 async function closePersistentAttachments(page: Page) {
@@ -1892,6 +1950,58 @@ async function returnWithAttachmentReadHeld(page: Page, expectImage = true) {
 	if (expectImage) expect(await page.$("[data-composer-atom][data-loading]")).not.toBeNull();
 	expect(await page.$("[data-composer-atom][data-missing]")).toBeNull();
 }
+
+test("a nonempty initial rich draft uses matching panel metadata and exactly one necessary body read", async () => {
+	const document: ComposerDocument = {
+		version: 1,
+		paragraphs: [
+			{
+				children: [
+					{ type: "quote", id: "initial-quote", label: "Source", text: "restored quoted detail" },
+					{ type: "text", text: "restored rich input" },
+					{
+						type: "fileReference",
+						id: "initial-reference",
+						reference: {
+							id: "initial-reference",
+							deviceId: "local",
+							path: "/work/source.ts",
+							label: "source.ts",
+						},
+					},
+				],
+			},
+		],
+		assets: [],
+	};
+	const { text, fileReferences } = composerDocumentText(document);
+	const page = await openPersistentAttachments(false, {
+		...emptyDraft,
+		hasDraft: true,
+		text,
+		fileReferences,
+		composerDocument: document,
+		revision: 9,
+		updatedAt: "2026-01-01T00:00:00Z",
+	});
+	try {
+		await page.waitForFunction(
+			(expected) => (window as unknown as FixtureWindow).fixture.snapshot().text === expected,
+			{},
+			text,
+		);
+		await waitEditableComposer(page);
+		expect((await snapshot(page)).document).toEqual(document);
+		expect(await page.$('[data-composer-atom="quote"]')).not.toBeNull();
+		expect(await page.$('[data-composer-atom="fileReference"]')).not.toBeNull();
+		expect(narratorReads.get(page)).toEqual([
+			"/api/narrators/persist-a/panel-state",
+			"/api/narrators/persist-a/draft",
+		]);
+	} finally {
+		await closePersistentAttachments(page);
+	}
+}, 20_000);
 
 test("real IndexedDB draft images survive narrator remounts and a page reload with stable bytes and fresh URLs", async () => {
 	const page = await openPersistentAttachments();

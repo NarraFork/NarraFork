@@ -74,7 +74,7 @@ keywords:
   - 设置导航
   - settings-nav
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 ---
 # 应用框架与路由
 

@@ -33,6 +33,8 @@ anchors:
   - frontend/hooks/useRecentTabKeyboardNav.ts
   - frontend/hooks/useRecentTabs.ts
   - frontend/hooks/useRecentTabsWS.ts
+  - frontend/hooks/useRecentTabsWS.test.ts
+  - frontend/lib/narrator-ws-manager.ts#isStatusVersionStale
   - shared/recent-tab-layout.ts
 keywords:
   - /api/user-preferences/recent-tabs
@@ -49,7 +51,7 @@ keywords:
   - recent_tabs_group_mode
   - useRecentTabs
 status: draft
-verified_at: 2e6441ad0
+verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 ---
 # 最近标签页
 
@@ -70,9 +72,11 @@ verified_at: 2e6441ad0
 
 ## 前端
 - `frontend/hooks/useRecentTabs.ts`（分页读、乐观更新、撤销提示、`user:recent_tabs_delta` 帧的合并）与 `useRecentTabsWS.ts`（订阅叙述者状态/标题等列表事件）；`recent-tabs-utils.ts`、`recent-tab-folders.ts`（把平铺列表按文件夹分组成渲染行；排布规则本身在 `shared/recent-tab-layout.ts`，前后端共用）。
+- 列表状态有独立的 `statusEpoch/statusRevision` 水位（`useRecentTabsWS.ts:acceptRecentTabsStatusVersion`）：同 epoch 拒绝更小 revision，相等可用；legacy/非法版本兼容且不改水位。轻量快照先过管理器只读 `isStatusVersionStale`，再过列表域水位，不推进完整状态水位；过期状态不妨碍同帧的独立标题/终端计数更新。完整 `substatus_change` 走 status 路径并标 `stateOnly`（更新状态/favicon，但不新发声音/PWA），旧的仅标签帧保留稀疏语义。连接建立清本地水位与通知资格快照，取消关注某会话时移除两者（`useRecentTabsWS.test.ts`）。
 - `frontend/components/nav/RecentTabs.tsx` 是侧栏主体；拖拽模型 `recent-tab-drag-model.ts`/`recent-tab-drop-target.ts`/`useRecentTabsDrag.ts`，外部拖入 `useRecentTabExternalDrop.ts`，键盘导航 `recent-tab-keyboard-nav.ts`，触摸滑动 `useRowSwipe.tsx`（右滑关闭、左滑开菜单）。
 - 文件夹的折叠/预览/展开是每台设备的显示状态，存 localStorage，不上服务器（`useFolderDisplay.ts`）；预览条数才是文件夹行上的设置（`RECENT_TAB_FOLDER_DEFAULT_PREVIEW` = 3）。
 - 侧栏在会话完成/等待时触发浏览器声音与 PWA 通知；服务器标记了 `backgroundWorkActive` 的 done 转换保持静默，权限等待始终通知（`recent-tabs-logic.ts:isBackgroundWorkSilencedStatus`，`recent-tabs-silence.test.ts`）。
+- 迟到 done 只保留通知意图：管理器将同 epoch 的过期 live done 转成本地 `status_notification`；被列表水位拒绝的旧 done 也走同一资格判断。`useRecentTabsWS.ts:recentTabsStatusNotification` 只有在本地已接受状态仍为同 epoch、同 `turnStartedAt` 的 `idle+unread` 时才产出 `notificationOnly`；新 working、换回合、已读、缺少回合证明都拒绝。`RecentTabsWSProvider` 对该事件只按原 `backgroundWorkActive` 与原回合调用 `triggerNotification` 后返回，沿用回合去重，绝不改缓存、favicon 或运行时围栏。
 - 状态气泡（`NarratorStatusIcon.tsx`、`narrator-status-icon-logic.ts`、`RecentTabBackgroundBubble.tsx`）同时被叙述者列表卡片和团队页复用，视觉决策放在 logic 文件里避免两处漂移。
 
 ## 从哪读起

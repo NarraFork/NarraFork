@@ -1,4 +1,5 @@
 import type { ModelDescription } from "@shared/model-catalog/schema/api";
+import type { RuntimeModelSummary } from "@shared/model-runtime";
 import {
 	type QueryClient,
 	useMutation,
@@ -6,14 +7,196 @@ import {
 	useQuery,
 	useQueryClient,
 } from "@tanstack/react-query";
-import { modelCatalogApi } from "../lib/api/model-catalog";
+import { useEffect, useRef, useSyncExternalStore } from "react";
+import { getToken, onTokenChange } from "../lib/api/client";
+import { type ModelCatalogOptionsInput, modelCatalogApi } from "../lib/api/model-catalog";
+import { narratorWSManager } from "../lib/narrator-ws-manager";
 
 export const modelCatalogKeys = {
 	all: ["model-catalog"] as const,
 	status: ["model-catalog", "status"] as const,
+	options: (token: string | null, input: ModelCatalogOptionsInput) =>
+		[
+			"model-catalog",
+			"options",
+			token,
+			input.scope ?? "all",
+			input.q ?? "",
+			input.sourceModelId ?? "",
+			input.cursor ?? "",
+			input.limit ?? 40,
+		] as const,
+	runtime: (
+		token: string | null,
+		model: string | undefined,
+		narratorId?: string,
+		revision?: string,
+	) =>
+		[
+			"model-catalog",
+			"runtime",
+			token,
+			narratorId ?? null,
+			model ?? null,
+			revision ?? null,
+		] as const,
 	card: (model?: string) => ["model-catalog", "card", model] as const,
 	model: (model: string) => ["model-catalog", "model", model] as const,
 };
+
+type RuntimeRefresh = { started: boolean; dirty: boolean; promise: Promise<void> };
+const runtimeRefreshes = new WeakMap<QueryClient, Map<string, RuntimeRefresh>>();
+/** The three mounted current-model consumers share a single narrator-marker refresh. */
+function refreshRuntimeSelection(
+	qc: QueryClient,
+	queryKey: ReturnType<typeof modelCatalogKeys.runtime>,
+	token: string | null,
+): Promise<void> {
+	const active = () =>
+		getToken() === token && qc.getQueryCache().find({ queryKey, exact: true })?.isActive() === true;
+	if (!active()) return Promise.resolve();
+	let entries = runtimeRefreshes.get(qc);
+	if (!entries) {
+		entries = new Map();
+		runtimeRefreshes.set(qc, entries);
+	}
+	const key = JSON.stringify(queryKey);
+	const old = entries.get(key);
+	if (old) {
+		if (old.started) old.dirty = true;
+		return old.promise;
+	}
+	let complete!: () => void;
+	let fail!: (error: unknown) => void;
+	const entry: RuntimeRefresh = {
+		started: false,
+		dirty: false,
+		promise: new Promise<void>((resolve, reject) => {
+			complete = resolve;
+			fail = reject;
+		}),
+	};
+	entries.set(key, entry);
+	queueMicrotask(() => {
+		void (async () => {
+			if (!active()) return;
+			entry.started = true;
+			await qc.cancelQueries({ queryKey, exact: true });
+			do {
+				entry.dirty = false;
+				if (!active()) return;
+				await qc.invalidateQueries({ queryKey, exact: true }, { cancelRefetch: false });
+			} while (entry.dirty && active());
+		})().then(
+			() => {
+				entries.delete(key);
+				complete();
+			},
+			(error) => {
+				entries.delete(key);
+				fail(error);
+			},
+		);
+	});
+	return entry.promise;
+}
+
+/** A single bounded page. The caller advances the cursor only on an explicit gesture. */
+export function useModelOptions(input: ModelCatalogOptionsInput, opened: boolean) {
+	const token = useSyncExternalStore(onTokenChange, getToken, getToken);
+	return useQuery({
+		queryKey: modelCatalogKeys.options(token, input),
+		queryFn: async ({ signal }) => {
+			if (getToken() !== token) throw new DOMException("Session changed", "AbortError");
+			const page = await modelCatalogApi.options(input, { signal });
+			if (getToken() !== token) throw new DOMException("Session changed", "AbortError");
+			return page;
+		},
+		enabled: opened && !!token,
+		staleTime: 30_000,
+		gcTime: 60_000,
+		retry: false,
+	});
+}
+
+/** Prefer the already-authorized narrator DTO; never fetch its default placeholder. */
+export function useRuntimeModel({
+	model,
+	narratorId,
+	summary,
+	enabled = true,
+	revision,
+}: {
+	model: string | null | undefined;
+	narratorId?: string;
+	summary?: RuntimeModelSummary | null;
+	enabled?: boolean;
+	/** Small settings/runtime generation, not provider configuration JSON. */
+	revision?: string;
+}) {
+	const token = useSyncExternalStore(onTokenChange, getToken, getToken);
+	const qc = useQueryClient();
+	const summaryOwner = useRef({ token, summary });
+	if (summaryOwner.current.summary !== summary) summaryOwner.current = { token, summary };
+	const matchingSummary =
+		summaryOwner.current.token === token &&
+		summary != null &&
+		summary.selection.value === model &&
+		(revision === undefined || String(summary.settingsRevision) === revision)
+			? summary
+			: undefined;
+	const query = useQuery({
+		initialData: matchingSummary,
+		queryKey: modelCatalogKeys.runtime(token, model ?? undefined, narratorId, revision),
+		queryFn: async ({ signal }) => {
+			if (getToken() !== token) throw new DOMException("Session changed", "AbortError");
+			const result = await modelCatalogApi.runtime(
+				{ model: model as string, narratorId },
+				{ signal },
+			);
+			if (
+				getToken() !== token ||
+				result.selection.value !== model ||
+				(revision !== undefined && String(result.settingsRevision) !== revision)
+			)
+				throw new DOMException("Model selection or configuration changed", "AbortError");
+			return result;
+		},
+		enabled: enabled && !!model && !!token,
+		staleTime: 30_000,
+		gcTime: 60_000,
+		retry: false,
+	});
+	useEffect(() => {
+		if (!enabled || !token || !model || !narratorId) return;
+		const queryKey = modelCatalogKeys.runtime(token, model, narratorId, revision);
+		const listener = narratorWSManager.addListener(
+			{ types: ["runtime_model_changed"], narratorIds: [narratorId] },
+			(message) => {
+				if (getToken() !== token || message.narratorId !== narratorId) return;
+				void refreshRuntimeSelection(qc, queryKey, token);
+			},
+		);
+		return () => narratorWSManager.removeListener(listener);
+	}, [enabled, model, narratorId, qc, revision, token]);
+	useEffect(() => {
+		if (!matchingSummary || !enabled) return;
+		const queryKey = modelCatalogKeys.runtime(token, model ?? undefined, narratorId, revision);
+		const current = qc.getQueryData<RuntimeModelSummary>(queryKey);
+		if (current) {
+			if (current.settingsRevision > matchingSummary.settingsRevision) return;
+			if (
+				current.settingsRevision === matchingSummary.settingsRevision &&
+				(current.observedAt ?? 0) >= (matchingSummary.observedAt ?? 0)
+			)
+				return;
+		}
+		// Only a provably newer snapshot may supersede a completed or in-flight read.
+		void qc.cancelQueries({ queryKey, exact: true });
+		qc.setQueryData(queryKey, matchingSummary);
+	}, [enabled, matchingSummary, model, narratorId, qc, revision, token]);
+	return { ...query, data: enabled ? query.data : undefined };
+}
 
 /** Everything derived from the catalog or the overrides is stale after any change. */
 export async function invalidateModelCatalog(qc: QueryClient) {

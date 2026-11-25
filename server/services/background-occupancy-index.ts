@@ -13,6 +13,13 @@ export interface OccupancyNarrator {
 	isBackground: boolean | null;
 	legacySubagent: boolean;
 	takenOver: boolean;
+	/** Fixed-size display inputs; never retain the full substatus or error text. */
+	timeout?: boolean;
+	unread?: boolean;
+	interrupted?: boolean;
+	error?: boolean;
+	hasError?: boolean;
+	errorTimeout?: boolean;
 	hasProjection: boolean;
 	createdAt?: string;
 }
@@ -46,6 +53,32 @@ export interface OccupancySnapshot {
 	childCounts: Map<string, number>;
 	/** Only requested ids, not a copy of the entire live closure. */
 	occupied: Set<string>;
+}
+
+/** Batch-local, bounded by indexed source rows, not by historical list length. */
+export type OccupancyListSnapshot = Map<
+	string,
+	{ counts: BackgroundTaskActiveCounts; rows: Map<string, string> }
+>;
+
+export function changedOccupancyListParents(
+	before: OccupancyListSnapshot,
+	after: OccupancyListSnapshot,
+): string[] {
+	const changed: string[] = [];
+	for (const id of new Set([...before.keys(), ...after.keys()])) {
+		const a = before.get(id);
+		const b = after.get(id);
+		if (
+			(a?.counts.activeWorkCount ?? 0) !== (b?.counts.activeWorkCount ?? 0) ||
+			(a?.counts.activeServiceCount ?? 0) !== (b?.counts.activeServiceCount ?? 0) ||
+			(a?.counts.activeCount ?? 0) !== (b?.counts.activeCount ?? 0) ||
+			(a?.rows.size ?? 0) !== (b?.rows.size ?? 0) ||
+			(a && [...a.rows].some(([key, value]) => b?.rows.get(key) !== value))
+		)
+			changed.push(id);
+	}
+	return changed;
 }
 
 export function isOccupancyTaskActive(task: OccupancyTask): boolean {
@@ -364,6 +397,72 @@ export class BackgroundOccupancyIndex {
 		for (const id of this.parents.keys()) {
 			if (!this.occupied.has(id)) this.parents.delete(id);
 		}
+	}
+
+	/**
+	 * Capture before mutation and after rebuild/before prune. Only direct list
+	 * rows copy display inputs; an owner's own status is NOT its list's status.
+	 * Terminal rows temporarily hydrated into the graph intentionally compare as
+	 * unknown/new: the bounded index cannot prove a cold historical value equal.
+	 */
+	listSnapshot(): OccupancyListSnapshot {
+		const result: OccupancyListSnapshot = new Map();
+		const bucket = (id: string) => {
+			let value = result.get(id);
+			if (!value) {
+				value = {
+					counts: this.counts.get(id) ?? {
+						activeCount: 0,
+						activeWorkCount: 0,
+						activeServiceCount: 0,
+					},
+					rows: new Map<string, string>(),
+				};
+				result.set(id, value);
+			}
+			return value;
+		};
+		const display = (id: string) => {
+			const row = this.narrators.get(id);
+			return [
+				row?.status ?? null,
+				row?.backgroundStatus ?? null,
+				row?.isBackground ?? null,
+				!!row?.takenOver,
+				!!row?.timeout,
+				!!row?.unread,
+				!!row?.interrupted,
+				!!row?.error,
+				!!row?.hasError,
+				!!row?.errorTimeout,
+				this.runtimeLive.has(id),
+				this.childCounts.get(id) ?? 0,
+			];
+		};
+		for (const task of this.tasks.values()) {
+			bucket(task.parentNarratorId).rows.set(
+				`task:${task.id}`,
+				JSON.stringify([
+					task.type,
+					task.status,
+					task.backgroundKind,
+					task.subagentNarratorId,
+					task.createdAt,
+					isOccupancyTaskActive(task) ||
+						(task.type === "agent" && this.occupied.has(childId(task))),
+					...(task.type === "agent" ? display(childId(task)) : []),
+				]),
+			);
+		}
+		for (const row of this.narrators.values()) {
+			if (!row.parentNarratorId || row.hasProjection || !(row.isBackground || row.legacySubagent))
+				continue;
+			bucket(row.parentNarratorId).rows.set(
+				`legacy:${row.id}`,
+				JSON.stringify([row.type, row.createdAt, this.occupied.has(row.id), ...display(row.id)]),
+			);
+		}
+		return result;
 	}
 
 	snapshot(ids: readonly string[]): OccupancySnapshot {

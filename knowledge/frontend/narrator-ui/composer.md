@@ -16,6 +16,9 @@ anchors:
   - frontend/hooks/useInputMenu.ts
   - frontend/hooks/usePromptOptimize.ts
   - frontend/hooks/usePromptOptimizeTask.ts
+  - frontend/hooks/useNamedNarratorSuggestions.ts
+  - frontend/hooks/useNamedNarratorSuggestions.test.tsx
+  - frontend/hooks/useNamedNarratorSuggestions.remote.test.tsx
   - frontend/hooks/useResizableBottomSpacing.ts
   - frontend/lib/composer-append-queue.ts
   - frontend/lib/dashboard-composer-focus.ts
@@ -49,7 +52,7 @@ keywords:
   - QueuedMessagesPanel
   - PendingAgentMessagesPanel
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 ---
 # 输入框与交互
 
@@ -58,6 +61,9 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ## 关键规则
 - 草稿以服务端为准：`NarratorComposer.tsx` 在输入后防抖 800ms（`INPUT_DRAFT_SYNC_DEBOUNCE_MS`）调 `api.updateNarratorDraft`；超过 `MAX_NARRATOR_DRAFT_CHARS`（200000，`shared/narrator-limits.ts`）直接抛错不同步；账号/叙述者作用域不符或尚未从服务端读到修订号时也抛错。
 - 本地镜像（`narrator-draft-storage.ts`）：key 为 `narrafork_draft_<len>:<userId>:<narratorId>`（用户 id 带长度前缀防碰撞），经 session-store 写入；只镜像不超过 `MAX_LOCAL_DRAFT_MIRROR_CHARS`=16000 的草稿，更长的仍同步到服务端但不落本地。本机未同步草稿若落后于服务端，会作为 `staleLocal` 提供给用户选择，不会自动覆盖。
+- 初始草稿 hydration 与 PanelWS 显式共用挂载级 `readScope`，首次 panel meta 只由 Composer 消费，不再由 initial reconciliation 重复转发成第二次正文读取；本地已确认草稿与 meta 同版直接复用，`hasDraft=false` tombstone 不读正文，否则最多一次。hydration/正文读取期间只保留最高 revision 的后续 meta，结束后最多 3 次补读、每轮 15 秒预算，超时/预算不足显示可重试错误，不无限追远端编辑；身份改变取消旧读，仍保留本地未同步输入/引用/富文本文档冲突语义。
+- `InlineComposerEditor` 初始化不能只相信逻辑签名：imperative `setDocument/restore` 可能在 `useEditor` 尚返回 null 时已更新 latestRef/signature，但之后创建的真实 doc 仍是初始值。每个新 Editor 实例在接收输入前用一次 `useLayoutEffect` 对比真实 doc 与逻辑签名，必要时将 latestRef 补回真实 view；不重放可能滞后的 controlled prop、不等 onCreate，以免 legacy 恢复后的首次键入丢掉原文本。
+- `@` 建议仅在编辑器可见且聚焦、mentionQuery 非 null、非命令/历史模式时读 `named?view=suggestions`；175ms 防抖，token 代际与查询隔离，关闭/换搜索立即脱离旧查询、取消旧读且不显示旧结果；30 秒 stale/60 秒 GC，不调用完整 named 列表。远程构建禁用该端点；服务端四列投影与 ACL 分页见[会话外观与状态](../../narrator/lifecycle/session-surface.md)。
 - 未发送附件：图片/文本文件/媒体以 Blob 存 IndexedDB `narrafork-draft-image-attachments`（v3，`draft-image-attachments.ts`）：单文件 ≤20MB，保留 3 天，总量 ≤100MB，记录数 ≤20（中断发送保留的记录 ≤8）；写入同时触发淘汰，读取不续期。
 - 可发送判定（`composer-send-gate.ts:hasSendableComposerContent`）：有非空白文本，或有任一附件（图片、文本文件、媒体、文件引用）即可；纯附件草稿是完整一轮。
 - 引用选中文本不是独立字段：作为规范 blockquote 存在于输入文本里（`composer-quotes.ts`，预览取前 36 字符），草稿、队列编辑、失败恢复都当普通文本。
@@ -74,7 +80,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 排队消息：`queue-message-mode.ts:queuedMessageMode` 取 `queueMode`，缺省时 `priority` 为真则 `tool` 否则 `turn`；拖拽排序只重排 `turn` 项（`moveQueuedTurn`）。
 - 停止按钮长按 600ms 才触发打断，提前松开只提示（`use-interrupt-long-press.ts`）。
 - Enter 归属（`interaction/enter-ownership.ts`）：输入框、按钮、链接、菜单、对话框、终端等自己的 Enter 不被面板级快捷键（等待中的权限、Enter 回到输入框）抢走；权限按钮条例外（`data-perm-button-bar`）。
-- `PendingAgentMessagesPanel`：显示其他 Agent 发给本会话、尚未被任何一轮读取的消息，用户选择恢复或丢弃（失败/被停止的会话不会被 Agent 消息自动重启）。
+- `PendingAgentMessagesPanel`：显示其他 Agent 发给本会话、尚未被任何一轮读取的消息，用户选择恢复或丢弃（失败/被停止的会话不会被 Agent 消息自动重启）。`interaction/use-pending-agent-messages.ts` 保留服务端的 `running/blockedReason` 为权威；收 `agent_inbox_changed`、连接建立与控制面恢复时读快照，`status_change` 仅在运行/非运行边界、不同非运行终态或缺少基线时读，`working ↔ waiting` 不反复拉取。刷新先取消旧快照，合并同批通知并为读中发生的新变化补尾读；没有周期性收件箱 timer。
 
 ## 从哪读起
 - `composer/NarratorComposer.tsx`（约 2000 行）：草稿同步、附件、发送入口；`composer/InlineComposerEditor.tsx`：编辑器。

@@ -201,10 +201,11 @@ export function CreateNarratorModalBody({
 	const { t: tc } = useTranslation("common");
 	const createNarrator = useCreateNarrator();
 	const queryClient = useQueryClient();
-	const { groupedModels, modelOptionsFilter } = useAllModels();
+	const { groupedModels, modelOptionsFilter } = useAllModels(opened);
 	const { data: settings } = useQuery({
 		queryKey: ["settings"],
 		queryFn: api.getSettings,
+		enabled: opened,
 		gcTime: CREATE_NARRATOR_SETTINGS_QUERY_GC_TIME_MS,
 	});
 	// Only a default that EXISTS is prefilled: the server no longer creates it, so an unset

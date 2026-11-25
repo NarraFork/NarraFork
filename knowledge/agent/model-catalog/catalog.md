@@ -14,6 +14,12 @@ anchors:
   - server/routes/model-catalog.ts
   - frontend/lib/api/model-catalog.ts
   - frontend/hooks/useModelCatalog.ts
+  - frontend/hooks/useModelCatalog.runtime.test.tsx
+  - server/lib/model-runtime.ts
+  - server/services/narrator-session-state.ts#recordNarratorRuntimeModel
+  - server/lib/model-runtime.test.ts
+  - server/routes/model-runtime.test.ts
+  - shared/model-runtime.ts
   - frontend/components/settings/ModelCatalogSection.tsx
   - frontend/components/settings/ModelOverrideEditor.tsx
   - frontend/components/providers/ContextWindowField.tsx
@@ -41,7 +47,7 @@ keywords:
   - 输入模态
   - 推理档位
 status: draft
-verified_at: 776dbf07e
+verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 ---
 # 模型目录
 
@@ -55,6 +61,9 @@ verified_at: 776dbf07e
 - 更新：`checkModelCatalogUpdate` 取分支 revision（带 ETag，上限 1MB），目录版本变了才下载归档（上限 16MB，15s 超时，禁止重定向）；`autoUpdate` 默认 true，开启直接激活，否则存 `pending` 等 `applyModelCatalogUpdate`；`restoreBuiltinModelCatalog` 删除下载文件回到内置。`settings/index.ts` 在非测试环境启动 `startModelCatalogDailyCheck`：每小时检查，距上次检查满 24 小时才真正请求。
 - 覆盖：`setModelOverride(scope, key, input)`，`model` 级 key 必须是目录模型 ID，`connection` 级必须是 `provider:model`；只覆盖默认推理档位时，校验它在继承来的档位列表里。每次提交 `revision` 加一，状态对象不可变。写入口 `PUT /api/model-catalog/overrides` 与更新类接口要求管理员；`GET /card`、`/status`、`/auto` 只需登录。
 - 请求快照：`withModelMetadataSnapshot(Iterator)` 冻结目录与覆盖，`agentLoop` 整个包在其中（`agent/loop.ts`），同一请求内每个模型只解析一次。
+- 当前模型轻摘要：已授权 narrator DTO 附 `modelSummary`，独立 `GET /api/model-catalog/runtime?model=&narratorId=` 用于刷新/草稿，带 narratorId 时先后复核读 ACL；只投影当前 selection、configured/observed/not-observed、concreteValue、必要 provider/quota generation、reasoning/能力与少量 provenance，≤4 KiB，不构造完整目录/card。优先匹配 selection/settingsRevision 的真实运行 observation，其次无路由副作用的父模型/明确配置；未观察的 auto 或未固定聚合保持未知，不借首个候选冒充来源。具体模型确定后只调用一次 `getEffectiveModelProfile`，整个过程在 metadata snapshot 内，读路径不得推进 balanced RR。
+- 真实执行解析记录保留上游裸 `model`，另记当时 `turnEffectiveModel` 为 `concreteValue` 与 `settingsRevision`；前端不再从裸模型猜带前缀值。`useRuntimeModel` 优先复用已授权 DTO，同 token/selection/settingsRevision 才写入独立 runtime key，更旧设置或 observation 不覆盖新选择；未加载 narrator 不先请求默认占位，context-thresholds 等待 concrete provider 就绪。网关 effortLevels 的缺省、`[]`、非空与显式 `null` 不互相替代，本地覆盖优先。
+- runtime 来源标记：`recordNarratorRuntimeModel` 只有 requestedModel/provider/裸 model/concreteValue 四元组真变才经既有授权 `narrator:ws_broadcast` 桥发空数据 `runtime_model_changed(narratorId)`；首次未知→实际来源与后续换源会发，同来源仅时间戳/settingsRevision 刷新不发。前端只刷新精确 token/narrator/selection/settingsRevision key，共用 WeakMap 在途 coalescer：一批先取消旧初读一次，刷新中再到的标记补尾读，不反复 cancel/restart，不影响其他会话或身份。
 - 用法限制在 `agent/provider-model-metadata.ts`：输出上限取请求值与卡上限的较小者；输入预算取工作窗口、输入上限、总窗口减预留输出三者最小；显式声明的空档位列表表示「不可选推理强度」，此时丢弃 effort；`assertModelInputModalities` 在模型不支持图/音/视频输入时直接抛错。Anthropic、Gemini 等适配器调用这些函数。
 
 ## 从哪读起
@@ -66,6 +75,7 @@ verified_at: 776dbf07e
 - 加模型卡字段：改 `shared/model-catalog/` 的 schema 与 `resolveModelCard`（每个字段都要有来源层），再改 `provider-model-metadata.ts` 的使用点和覆盖编辑器（`ModelOverrideEditor.tsx`）；基线 `dist/catalog.json` 是构建产物，不要手改。
 - 覆盖写入口与更新类接口要管理员，`GET /card`、`/status`、`/auto` 只需登录；覆盖每次提交 `revision` 加一，状态对象不可变。
 - 改更新流程：保持上限（revision 1MB、归档 16MB、15s、禁重定向）与「写临时文件再 rename」。
+- 改 runtime 投影：`server/lib/model-runtime.test.ts`、`server/routes/model-runtime.test.ts` 覆盖预算、selection/settings 代际、真实裸模型记录的 concreteValue、三态与连续摘要读取不推进 balanced RR；`frontend/hooks/useModelCatalog.runtime.test.tsx` 覆盖 DTO 首读复用、关闭菜单零模型请求、显式翻页与身份切换。
 - 相关测试：`shared/model-catalog/resolve.test.ts`、`card.test.ts`，`server/lib/agent/__tests__/provider-model-metadata.test.ts`。
 
 ## 相关

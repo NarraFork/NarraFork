@@ -68,7 +68,7 @@ keywords:
   - 历史加载
   - MarkdownContent
 status: draft
-verified_at: 878917e97
+verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 ---
 # 消息列表
 
@@ -91,6 +91,9 @@ verified_at: 878917e97
   - 读者在底部：重载；合并窗口 `EXACT_RELOAD_COALESCE_MS`=120ms，从第一个待处理修订起最迟 `EXACT_RELOAD_MAX_DELAY_MS`=1000ms 必须提交。
   - 读者已上滚：推迟（`deferred`），驱动“有新消息”提示，回到底部再评估。
   - 工具完成、反思裁决、权限决策等生命周期事件不重载，走 `vlist-live-patch.ts` 原地补丁；补丁层拒绝终态回退成非终态（`vlist-live-events.ts` 头注释，防重连重放把完成卡片翻回转圈）。
+- canonical 窗口重验与纯几何重排分离（`pretext-layout-coordinator.ts`）：宽度/字体/头部等 rebuild 通过保留窗口读取来 retarget commit generation，不中止并重发相同 locate/page 链；完成时取最新 buildOptions、viewport 与 anchor。loadOlder/真实结构变更、强制 reload、会话/来源/授权变化仍取消旧数据读取；401/403 清无权缓存。`setSuspended` 取消 transport/older/refresh，但保留 loaded input 与滚动锚点。
+- `VListDataSource` 可由宿主提供 `refreshWindow/finalizeRefreshWindow/refreshFailurePolicy:retain/onWindowChange`：聊天用自己的 ACK+固定 seq 恢复，临时错误保留旧历史并报错，不能静默退化成新 tail；narrator 默认 locate+canonical 分页路径仍保留原 32 MiB/100 页/10 秒预算。
+- 宿主 finalizer 在最后一次异步 `prepareKatex` 与 current 检查后同步执行，再复查 current 并捕获最新锚点提交，finalizer 与 commit 之间无 await；用于聊天叠加读中到达的删除屏障，不能改成早于异步准备的旧投影（`pretext-layout-coordinator.ts:refreshCurrentWindow`）。
 - 更早历史的自动加载（`history/older-history-auto-load.ts`）：需要最近 2500ms 内有朝向历史的用户手势。分支：
   - 无手势、手势已过期、或在底部：不加载，清空手势记录。
   - 关闭自动加载、无更早数据、正在展开、scrollTop 超过触发像素：不加载，但保留手势记录。

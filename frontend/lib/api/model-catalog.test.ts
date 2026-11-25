@@ -38,6 +38,33 @@ describe("model catalog wire contract", () => {
 		]);
 		expect(calls[2].body).toEqual({ models: ["relay:gpt-5.5"] });
 	});
+	test("runtime binds narrator authorization and options preserve opaque search/cursor", async () => {
+		await modelCatalogApi.runtime({ model: "auto:模型:1", narratorId: "session/id" });
+		await modelCatalogApi.options({
+			q: "模型",
+			cursor: "opaque+/=",
+			scope: "concrete",
+			sourceModelId: "model:1",
+			limit: 40,
+		});
+		const runtime = new URL(calls[0].url, "http://test");
+		expect(runtime.pathname).toBe("/api/model-catalog/runtime");
+		expect(runtime.searchParams.get("narratorId")).toBe("session/id");
+		expect(runtime.searchParams.get("model")).toBe("auto:模型:1");
+		const options = new URL(calls[1].url, "http://test");
+		expect(options.searchParams.get("cursor")).toBe("opaque+/=");
+		expect(options.searchParams.get("q")).toBe("模型");
+		expect(options.searchParams.get("sourceModelId")).toBe("model:1");
+		expect(options.searchParams.get("scope")).toBe("concrete");
+	});
+	test("runtime and option responses enforce their independent byte budgets", async () => {
+		globalThis.fetch = (async () =>
+			Response.json({ payload: "x".repeat(5000) })) as unknown as typeof fetch;
+		await expect(modelCatalogApi.runtime({ model: "relay:x" })).rejects.toThrow();
+		globalThis.fetch = (async () =>
+			Response.json({ payload: "x".repeat(66_000) })) as unknown as typeof fetch;
+		await expect(modelCatalogApi.options()).rejects.toThrow();
+	});
 	test("overrides and update actions preserve method, null and false", async () => {
 		await modelCatalogApi.setOverride({
 			scope: "connection",

@@ -638,8 +638,8 @@ class BackgroundTaskService {
 		this.listVersions = hotSafe("narrafork:bg-task:listVersions", () => new Map<string, number>());
 		this._broadcastFn = null;
 		this._livenessFn = null;
-		backgroundOccupancyStore.subscribe("background-task-list", (parentIds) => {
-			for (const parentId of parentIds) {
+		backgroundOccupancyStore.subscribe("background-task-list", (_parentIds, metadata) => {
+			for (const parentId of metadata.listChangedParentIds) {
 				void this.broadcastListDelta(parentId, { invalidate: true }).catch((error) => {
 					logger.warn("Failed to broadcast maintained background occupancy", {
 						parentNarratorId: parentId,

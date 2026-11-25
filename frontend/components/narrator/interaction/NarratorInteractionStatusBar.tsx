@@ -47,11 +47,11 @@ import type {
 	planNarratorWorkIndicator,
 } from "../header/narrator-status-bar";
 import { CodexQuotaIndicator } from "../model/CodexQuotaIndicator";
-import { ModelMenuItems } from "../model/ModelMenuItems";
 import { ModelPriceModal } from "../model/ModelPriceModal";
 import { modelInheritanceLabel } from "../model/model-inheritance-label";
 import { MODEL_MENU_POSITIONING } from "../model/model-menu-selection";
 import { OpencodeQuotaIndicator } from "../model/OpencodeQuotaIndicator";
+import { PaginatedModelMenuItems as ModelMenuItems } from "../model/PaginatedModelMenuItems";
 import { QuotaPanelIndicator } from "../model/QuotaPanelIndicator";
 import type { QuotaPanelView } from "../model/quota-panel-view";
 import { Sub2ApiSubscriptionQuotaIndicator } from "../model/Sub2ApiSubscriptionQuotaIndicator";
@@ -155,6 +155,7 @@ export interface NarratorInteractionStatusBarProps {
 	};
 
 	model: {
+		summary?: import("@shared/model-runtime").RuntimeModelSummary;
 		allModels: ModelOption[];
 		aggregations: ModelAggregation[];
 		providerLabels: Record<string, string>;
@@ -457,6 +458,14 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 	const canFollowParent = !!narrator.variant?.startsWith("subagent:");
 	const inheritance = followsParent ? modelInheritanceLabel(narrator.modelInheritance, t) : null;
 	const followLabel = inheritance?.label ?? t("followParent");
+	const summaryDisplayLabel =
+		model.summary?.selection.value === FOLLOW_DEFAULT_MODEL
+			? t("followDefault", { model: model.defaultModelValue })
+			: model.summary?.selection.value === FOLLOW_PARENT_MODEL
+				? followLabel
+				: model.summary?.selection.value === "__summary__"
+					? t("modelGroupSummary")
+					: model.summary?.selection.label;
 	const followTooltip = inheritance
 		? (inheritance.reason ?? t("inheritance.followTooltip"))
 		: t("followParent");
@@ -722,32 +731,42 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 																// The menu renders the full catalog; the trigger only needs
 																// the selected option so native sizing ignores longer models.
 																data={
-																	followsParent
-																		? [{ value: FOLLOW_PARENT_MODEL, label: followLabel }]
-																		: model.allModels
-																				.filter((m) => {
-																					const raw = narrator.model ?? FOLLOW_DEFAULT_MODEL;
-																					const agg = parseAggModelValue(raw);
-																					return (
-																						m.value ===
-																						(agg ? `${AGG_MODEL_PREFIX}${agg.aggId}` : raw)
-																					);
-																				})
-																				.map((m) => ({
-																					value: m.value,
+																	model.summary
+																		? [
+																				{
+																					value: parseAggModelValue(model.summary.selection.value)
+																						? `${AGG_MODEL_PREFIX}${parseAggModelValue(model.summary.selection.value)?.aggId}`
+																						: model.summary.selection.value,
 																					label:
-																						m.value === FOLLOW_DEFAULT_MODEL
-																							? t("followDefault", {
-																									model: model.defaultModelValue,
-																								})
-																							: m.provider === "__agg__"
-																								? `⚡ ${m.label}`
-																								: m.provider === "__auto__"
-																									? m.label
-																									: m.provider
-																										? `${m.provider}:${m.label}`
-																										: m.label,
-																				}))
+																						summaryDisplayLabel ?? model.summary.selection.value,
+																				},
+																			]
+																		: followsParent
+																			? [{ value: FOLLOW_PARENT_MODEL, label: followLabel }]
+																			: model.allModels
+																					.filter((m) => {
+																						const raw = narrator.model ?? FOLLOW_DEFAULT_MODEL;
+																						const agg = parseAggModelValue(raw);
+																						return (
+																							m.value ===
+																							(agg ? `${AGG_MODEL_PREFIX}${agg.aggId}` : raw)
+																						);
+																					})
+																					.map((m) => ({
+																						value: m.value,
+																						label:
+																							m.value === FOLLOW_DEFAULT_MODEL
+																								? t("followDefault", {
+																										model: model.defaultModelValue,
+																									})
+																								: m.provider === "__agg__"
+																									? `⚡ ${m.label}`
+																									: m.provider === "__auto__"
+																										? m.label
+																										: m.provider
+																											? `${m.provider}:${m.label}`
+																											: m.label,
+																					}))
 																}
 																value={(() => {
 																	const raw = narrator.model ?? FOLLOW_DEFAULT_MODEL;
@@ -1052,8 +1071,9 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 																	// charAt(0) is safe on empty strings ("" → ""); fall back to "?"
 																	// so an empty label never produces `undefined.toUpperCase()`.
 																	return (
-																		(m?.label || narrator.model || "?").charAt(0).toUpperCase() ||
-																		"?"
+																		(summaryDisplayLabel || m?.label || narrator.model || "?")
+																			.charAt(0)
+																			.toUpperCase() || "?"
 																	);
 																})()}
 															</Text>

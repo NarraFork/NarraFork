@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { MantineProvider, Menu } from "@mantine/core";
 import type { SubagentModelInheritance } from "@shared/model-inheritance";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import i18next, { type i18n } from "i18next";
 import { parseHTML } from "linkedom";
 import { act } from "react";
@@ -16,6 +17,7 @@ import narratorLocale from "../../../locales/en/narrator.json";
 import settingsLocale from "../../../locales/en/settings.json";
 import narratorZhLocale from "../../../locales/zh-CN/narrator.json";
 import { ModelMenuItems } from "./ModelMenuItems";
+import { PaginatedModelMenuItems } from "./PaginatedModelMenuItems";
 
 const aggregations: ModelAggregation[] = [
 	{ id: "group", name: "Group", routingMode: "priority", models: ["a:one", "a:two"] },
@@ -250,6 +252,97 @@ async function typeFilter(text: string, placeholder = narratorLocale.modelFilter
 		input.dispatchEvent(new window.Event("keyup", { bubbles: true }));
 	});
 }
+
+test("paginated menu gates reads, pages by gesture, and waits for Chinese composition", async () => {
+	const originalFetch = globalThis.fetch;
+	const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+	const calls: URL[] = [];
+	localStorage.getItem = (key: string) => (key === "narrafork_token" ? "menu-actor" : null);
+	globalThis.fetch = (async (url: unknown) => {
+		const parsed = new URL(String(url), "http://test");
+		calls.push(parsed);
+		return Response.json({
+			revision: "one",
+			items: [{ value: "auto:x", label: "X", modelId: "x", sourceCount: 2 }],
+			nextCursor: "next",
+			hasMore: true,
+		});
+	}) as unknown as typeof fetch;
+	const flush = async (ms = 0) => {
+		await act(async () => {
+			await new Promise((resolve) => setTimeout(resolve, ms));
+		});
+		await act(async () => {
+			await new Promise((resolve) => setTimeout(resolve, 0));
+		});
+	};
+	const mount = async (opened: boolean) => {
+		await act(async () =>
+			root.render(
+				<QueryClientProvider client={qc}>
+					<MantineProvider env="test">
+						<I18nextProvider i18n={instance}>
+							<Menu opened>
+								<PaginatedModelMenuItems
+									opened={opened}
+									currentModel="outside:first-page"
+									onSelect={() => {}}
+								/>
+							</Menu>
+						</I18nextProvider>
+					</MantineProvider>
+				</QueryClientProvider>,
+			),
+		);
+		await flush();
+	};
+	try {
+		await mount(false);
+		expect(calls).toHaveLength(0);
+		await mount(true);
+		expect(calls).toHaveLength(1);
+		await flush();
+		expect(calls).toHaveLength(1);
+		const next = Array.from(host.querySelectorAll("button")).find(
+			(row) => row.textContent === narratorLocale.contextComposition.loadMore,
+		);
+		if (!next) throw new Error("missing next page button");
+		await act(async () => next.click());
+		await flush();
+		expect(calls).toHaveLength(2);
+		expect(calls[1].searchParams.get("cursor")).toBe("next");
+		const input = host.querySelector<HTMLInputElement>("input");
+		if (!input) throw new Error("missing filter");
+		const propsKey = Object.keys(input).find((key) => key.startsWith("__reactProps$"));
+		if (!propsKey) throw new Error("missing input handlers");
+		const props = (
+			input as unknown as Record<
+				string,
+				{
+					onCompositionStart: () => void;
+					onCompositionEnd: (event: { currentTarget: HTMLInputElement }) => void;
+				}
+			>
+		)[propsKey];
+		await act(async () => props.onCompositionStart());
+		await typeFilter("中文");
+		await flush(200);
+		expect(calls).toHaveLength(2);
+		await act(async () => props.onCompositionEnd({ currentTarget: input }));
+		await flush(200);
+		expect(calls).toHaveLength(3);
+		expect(calls[2].searchParams.get("q")).toBe("中文");
+		expect(calls[2].searchParams.has("cursor")).toBe(false);
+		await mount(false);
+		await qc.invalidateQueries({ queryKey: ["model-catalog", "options"] });
+		await flush();
+		expect(calls).toHaveLength(3);
+	} finally {
+		await act(async () => root.render(null));
+		qc.clear();
+		globalThis.fetch = originalFetch;
+	}
+});
 
 describe("follow parent selection", () => {
 	test.each([
