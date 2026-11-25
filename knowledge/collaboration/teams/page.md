@@ -23,6 +23,8 @@ keywords:
   - TeamStart
   - TeamCoordinatorHeader
   - hideHeader
+  - onConnectionChange
+  - reviewHeadColumns
   - 评审意见
   - TEAM_REVIEW_SUMMARIES_TOTAL_CHARS
   - TeamSettingsModal
@@ -47,7 +49,7 @@ keywords:
   - permission_decided_by
   - answerForm
 status: draft
-verified_at: 0baba9c1a
+verified_at: 1d4b267ef
 ---
 # 团队页与审批
 
@@ -60,7 +62,7 @@ verified_at: 0baba9c1a
 - 待批列表每项多 `parentId`（子代理的上级，用来把助手的调用挂到工作者的工作项上）、计划的 `preview` 是计划首行标题（`planTitle`），提问在输入前缀能完整解析、只有一个问题且选项 1–6 个时带 `answerForm`（答案键 = 规范化后的 header，同时是标题；`description` 是完整提问；选项是完整标题，即发给模型的答案值，从不截断，页面只截显示；`optionDescriptions` 是每个选项的说明；同 `shared/ask-user-question-shape.ts`，与会话里的 `AskUserQuestionBanner` 一致），供就地回答。`questions` 预览也按规范化形状取（`description`，没有就标题；旧形状的 `question` 正文同样读得到）。审批接口不再算「最近的决定」（`recent`）：谁批的在动态里。
 - `work-stats?ids=`（读者可读，最多 50 个，逗号分隔）：每项 `+/-`、文件数、二进制数、`truncated`。活的项在其 worktree 里按 HEAD 与基线的合并基 `diff --numstat` 读；已结束或 worktree 没了的项用最近一次 `work.ready` 事件记下的 `head` 与 `mergeBase`，在项目仓库（协调者 cwd）里读；都没有就是 null。结果按项缓存 20 秒、项的 `updated_at` 一变就重读，最多 200 条，每条只留总数和前 300 个文件，同一请求并发 4 个。前端按 50 个一组分批请求，每一行都有大小；没有改动（+0 −0 且 0 个文件）时不显示。
 - `work/:itemId`（读者可读）：卡片、基线、领先几个提交（`rev-list --count`）、大小、改动文件（最多 300，`filesMore`）、能否读 diff、评审轮次（`work.review` 与 `work.returned` 事件）、这一项最近 100 条事件（详情 ≤2304 字才带）、`canReturn`（成员、团队活跃、状态 in_review/ready）。不带 diff 正文。
-- 评审意见（`work.review` 详情里的 `summary`，见[工作项](work-items.md)）：每轮的 `summary` 随轮次返回，读者能读抽屉就能读到，陌生人与抽屉一样 404。详情超过 2304 字时抽屉另读一份（`team-board.ts:reviewSummaryColumns`：`case`/`substr`，只读超出预览的 review 行，最多 8192 字即详情字节上限，不用 JSON 函数），`eventDetail` 解析后留下轮次、结论、问题数与 `summary`。一次抽屉读最多发 `TEAM_REVIEW_SUMMARIES_TOTAL_CHARS`=6000 字意见：从最新一轮往前，装不下的那轮截断，更早的不带，都标 `summaryClipped`（`team-work-view.ts:capReviewSummaries`）；时间线里的 review 事件去掉 `summary`，不重复发。动态（`events`）不读长详情：超过 2304 字的 review 事件照旧 `detailOmitted`。
+- 评审意见（`work.review` 详情里的 `summary`，见[工作项](work-items.md)）：每轮的 `summary` 随轮次返回，读者能读抽屉就能读到，陌生人与抽屉一样 404。详情超过 2304 字的 review 行，分页查询只带头 96 字（`team-board.ts:reviewHeadColumns`：`case`/`substr`，不用 JSON 函数；`reviewHeadDetail` 从 `{"round":N,"verdict":…,"findings":N` 取轮次、结论、问题数），意见原文再按主键逐行读（`readReviewDetailText`，每行最多 8192 字即详情字节上限），从最新往前，攒够 6000 字意见或读满 `TEAM_REVIEW_DETAILS_READ_CHARS`=36000 字详情就停（`team-work-view.ts:itemEvents`）；没读的更早长评审只留轮次、结论、问题数，标 `summaryClipped`。`eventDetail` 解析后留下轮次、结论、问题数与 `summary`。一次抽屉读最多发 `TEAM_REVIEW_SUMMARIES_TOTAL_CHARS`=6000 字意见：从最新一轮往前，装不下的那轮截断，更早的不带，都标 `summaryClipped`（`team-work-view.ts:capReviewSummaries`）；时间线里的 review 事件去掉 `summary`，不重复发。动态（`events`）不读长详情：超过 2304 字的 review 事件照旧 `detailOmitted`。
 - `work/:itemId/diff?path=`：路径按字面、从仓库根算（`:(top,literal)`，`*.txt` 就是那个文件，不是通配；已结束的项在协调者工作目录里读，它可能是子目录），只读合并基 → head 的改动，没改过的路径 diff 为空即 404；`diff -U3` 经 `stdoutStream` 读到 64KB+1 字节即停，`truncated` 标出。
 - git 只经 `teams/team-git.ts`（`mergeBase`、`numstat`、`fileDiff`，见[工作项](work-items.md)）：全部只读提交，60s 超时、输出有上限。
 
@@ -82,7 +84,7 @@ verified_at: 0baba9c1a
 - 拓扑不复用团队摘要的轮询：团队记录/工作项/worker 绑定在外层事务提交后发 ids-only dirty，图经单 narrator socket 的 snapshot/delta 更新。图框显示真实团队名，节点只显示图标和会话名；拓扑注释仅携带团队 ID/名称与详情所需工作项标题，不再推导角色标签。外部团队详情仍单独鉴权，只读旁观者不能拖动改关系。跨团队精确 peer 不授予成员、控制或 worktree 权限。
 
 前端（`frontend/components/teams/`）：
-- 路由 `frontend/routes/projects/$projectId_.teams.$teamId.tsx`（不嵌在项目页下，占满外壳内容区）→ `TeamPageView.tsx`。对话是普通叙述者面板，只读成员的输入区换成「你是只读成员」（`NarratorPanel` 的 `readOnlyNotice`）；面板以 `hideHeader` 挂载，不画它自己的标题行与工具栏，对话上方是 `TeamCoordinatorHeader.tsx` 的一行「协调者 · 在跟进 N 个工作者 · 完整会话 ↗」（`team-page-model.ts:coordinatorLine`：摘要里协调者之外运行中的会话数，名单被截断时写 N+；没有别的在跑时写协调者自己的状态 工作中/在等人处理/空闲/已归档；圆点是协调者的运行状态）。完整工具栏只在协调者自己的会话页上（「完整会话」与「…」菜单的协调者完整会话都走 `onOpenCoordinatorSession`）。消息区本身与会话页相同：协调者的 `Team` 工具调用照常是工具卡片（不折叠成「创建工作项 ×N」这类一行），团队事件也不作为分隔线插进对话（两者都要改虚拟列表的分组与高度模型，未做；事件看右栏动态与抽屉时间线）。
+- 路由 `frontend/routes/projects/$projectId_.teams.$teamId.tsx`（不嵌在项目页下，占满外壳内容区）→ `TeamPageView.tsx`。对话是普通叙述者面板，只读成员的输入区换成「你是只读成员」（`NarratorPanel` 的 `readOnlyNotice`）；面板以 `hideHeader` 挂载，不画它自己的标题行与工具栏，对话上方是 `TeamCoordinatorHeader.tsx` 的一行「协调者 · N 个会话在运行 · 完整会话 ↗」（`team-page-model.ts:coordinatorLine`：摘要里协调者之外运行中的会话数；摘要分不出工作项工作者与评审者、嵌套子代理，所以说「会话」不说「工作者」；名单被截断时写下界 N+，即列出的其他会话数加一，不会出现 0+；没有别的在跑时写协调者自己的状态 工作中/在等人处理/空闲/已归档；圆点是协调者的运行状态）。`hideHeader` 也藏掉了面板的「连接断开」徽标，所以面板经 `onConnectionChange`（`narrator/panel-connection.ts:useReportPanelConnection`）报告自己的连接状态，路由转给 `TeamPageView` 的 `conversationConnection`，这一行在断开时显示「连接断开」，点击调用面板自己的 `reconnect`（不另写连接逻辑；`team-coordinator-connection.test.tsx`）。完整工具栏只在协调者自己的会话页上（「完整会话」与「…」菜单的协调者完整会话都走 `onOpenCoordinatorSession`）。消息区本身与会话页相同：协调者的 `Team` 工具调用照常是工具卡片（不折叠成「创建工作项 ×N」这类一行），团队事件也不作为分隔线插进对话（两者都要改虚拟列表的分组与高度模型，未做；事件看右栏动态与抽屉时间线）。
 - 团队页只讲一个团队：没有项目团队列表、没有「新建团队」、没有左侧团队切换。切换走侧栏固定的团队标签和项目页的团队卡片；新建走项目页或新建会话弹窗的「以团队开始」。
 - `TeamWorkspace.tsx`：页头、等你处理、两栏（对话约 60%，右栏约 40%，最小 320、最大 560，右栏顶部「工作 | 动态」切换与「N 项未完成」）；按自身宽度（不是视口）在 `split` 与 `tabs`（帧宽 < `TEAM_SPLIT_MIN_WIDTH` 860）之间选，`tabs` 是「对话 | 工作 (N)」，工作页里仍有同一个切换。对话在各布局里挂在 React 树的同一位置，换布局不重挂；从别处要求聚焦对话时先切到对话标签，渲染后再聚焦输入框。
 - `TeamHeader.tsx`：一行（手机两行）：返回、项目名、团队名、状态句（`team-page-model.ts:statusSentence`：「N 项进行中 · M 项等你」，旁观者是「等成员处理」，「空闲 · 还没有工作项 / N 项已完成」，「已暂停」= 有未完成项、没有在跑的会话且协调者上一轮被人停下，「已归档」）；等待数在审批列表 `more` 时写成「N+ 项等你」；右侧成员头像（最多 3 个加 +N，点开成员抽屉 `TeamMembers.tsx`）、固定到侧栏、「全部暂停」（普通按钮；手机上在「…」里）、「…」菜单（运行中的会话列表，取自摘要，点开会话；团队设置 `TeamSettingsModal.tsx` 改基线分支与简报、协调者完整会话、解散团队 `TeamDisbandDialog.tsx`）。手机上两行，第一行仍有返回箭头。「全部暂停」只给成员，协调者已归档时只在还有会话在跑时出现；协调者先停（`pauseOrder`），一次最多读 500 个运行中会话，结果分 paused / pausedSomeIdle / pausePartial / pauseNothing / pauseMore。
