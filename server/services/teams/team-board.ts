@@ -520,34 +520,38 @@ export async function readTeamActivity(
 }
 
 /**
- * A return's reason and round read on their own (R): a reason with many quotes or newlines can
- * serialize past {@link TEAM_EVENT_DETAIL_PREVIEW_CHARS}, and a return must never lose its
- * reason. Bounded to the reason's own limit.
+ * Longest `work.returned` detail ever written: a {@link TEAM_RETURN_REASON_MAX_LENGTH}-character
+ * reason JSON-escapes to at most six characters per character (`\u00XX`), plus a few short
+ * fields. Bounded so a corrupt row can't make one page read unbounded text.
+ */
+const TEAM_RETURN_DETAIL_MAX_CHARS = TEAM_RETURN_REASON_MAX_LENGTH * 6 + 1024;
+
+/**
+ * A return's detail read on its own: a reason with many quotes or newlines can serialize past
+ * {@link TEAM_EVENT_DETAIL_PREVIEW_CHARS}, and a return must never lose its reason. Plain
+ * `case`/`substr` rather than JSON functions so the query stays dialect-portable.
  */
 export const returnedReasonColumns = {
-	returnReason: sql<
+	returnDetail: sql<
 		string | null
-	>`case when ${teamWorkEvents.kind} = ${TEAM_WORK_RETURNED_EVENT_KIND} then substr(json_extract(${teamWorkEvents.detailJson}, '$.reason'), 1, ${TEAM_RETURN_REASON_MAX_LENGTH}) end`,
-	returnRound: sql<
-		number | null
-	>`case when ${teamWorkEvents.kind} = ${TEAM_WORK_RETURNED_EVENT_KIND} then json_extract(${teamWorkEvents.detailJson}, '$.round') end`,
+	>`case when ${teamWorkEvents.kind} = ${TEAM_WORK_RETURNED_EVENT_KIND} then substr(${teamWorkEvents.detailJson}, 1, ${TEAM_RETURN_DETAIL_MAX_CHARS}) end`,
 };
 
 /** An event's detail as sent: whole when small, else omitted, but a return keeps its reason. */
 export function eventDetail(row: {
 	detail: string | null;
 	detailLength: number | null;
-	returnReason: string | null;
-	returnRound: number | null;
+	returnDetail: string | null;
 }): { detail: Record<string, unknown> | null; detailOmitted: boolean } {
 	const detail = parseDetail(row.detail);
 	if (detail || row.detailLength === null) return { detail, detailOmitted: false };
-	if (row.returnReason !== null)
+	const returned = parseDetail(row.returnDetail);
+	if (returned && typeof returned.reason === "string")
 		return {
 			detail: {
-				reason: row.returnReason,
+				reason: returned.reason.slice(0, TEAM_RETURN_REASON_MAX_LENGTH),
 				verdict: "blocker",
-				...(typeof row.returnRound === "number" ? { round: row.returnRound } : {}),
+				...(typeof returned.round === "number" ? { round: returned.round } : {}),
 			},
 			detailOmitted: false,
 		};

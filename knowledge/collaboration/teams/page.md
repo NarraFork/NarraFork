@@ -61,7 +61,7 @@ verified_at: 7d5423c07
 
 退回（`work/:itemId/return`，`teams/work-items.ts:returnWorkItem`，`team-work-view.ts:returnWorkItemAsPerson`）：
 - 成员才能退回（旁观者 403、陌生人 404），理由必填（trim 后 1–2000 字，严格 schema），只有 in_review / ready 能退回（否则 409 `TEAM_WORK_ITEM_NOT_RETURNABLE`），已归档 409 `TEAM_ARCHIVED`。
-- 记为这个人的一轮 blocker 评审：状态回 in_progress、`reviewRounds+1`、`lastReview = blocker`（再 ready 前必须重新评审），写 `work.returned` 事件（`detail.reason/round/from/to/worker`；理由多引号或换行时序列化后可能超过 2304 字的详情预览，所以动态和抽屉另用 `json_extract` 单独读出理由与轮次，`team-board.ts:returnedReasonColumns`/`eventDetail`，理由永远可读）；持有独占锁就同事务释放并记 `work.exclusive_released`（`reason: "returned"`）。
+- 记为这个人的一轮 blocker 评审：状态回 in_progress、`reviewRounds+1`、`lastReview = blocker`（再 ready 前必须重新评审），写 `work.returned` 事件（`detail.reason/round/from/to/worker`；理由多引号或换行时序列化后可能超过 2304 字的详情预览，所以动态和抽屉对 `work.returned` 另读一份有上限的完整详情（`substr`，理由上限×6+1024 字，不用 JSON 函数以保持方言可移植）再解析出理由与轮次，`team-board.ts:returnedReasonColumns`/`eventDetail`，理由永远可读）；持有独占锁就同事务释放并记 `work.exclusive_released`（`reason: "returned"`）。
 - 服务端不给工作者发消息、不碰分支：事务后给协调者写一条 `team_return` 注入（`lib/prompts/team-lead.ts:returnedNote`，按退回人的语言，`wakeIfIdle`），由协调者把理由转给工作者，与转达评审 blocker 是同一条路。投递失败只记日志，退回照样成立（`delivered: false`，前端提示去对话里告诉协调者）。测试接缝 `setReturnDeliveryForTests`。
 - 「合并」没有后端：服务端从不合并（见[工作项](work-items.md)）。按钮显示但禁用，提示在仓库里合并后会按祖先检测自动标为已合并。
 
