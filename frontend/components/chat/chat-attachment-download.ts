@@ -8,7 +8,7 @@
  * implementation.
  */
 
-import { clearTokenOnSessionFailure, getToken } from "../../lib/api";
+import { clearTokenOnSessionFailure, getAuthSnapshot, getToken } from "../../lib/api/client";
 import { apiUrl } from "../../lib/base-path";
 
 /**
@@ -31,12 +31,13 @@ export const MAX_DOWNLOAD_BLOB_BYTES = 64 * 1024 * 1024;
  * instead of leaving the reader looking at a button that did nothing.
  */
 export async function downloadChatAttachment(fetchUrl: string, filename: string): Promise<boolean> {
+	const { generation } = getAuthSnapshot();
 	const token = getToken();
 	const headers: Record<string, string> = {};
 	if (token) headers.Authorization = `Bearer ${token}`;
 	const res = await fetch(apiUrl(fetchUrl), { headers });
 	if (!res.ok) {
-		await clearTokenOnSessionFailure(res);
+		await clearTokenOnSessionFailure(res, generation);
 		return false;
 	}
 	const blob = await res.blob();

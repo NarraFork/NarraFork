@@ -24,6 +24,7 @@ import {
 } from "@server/lib/file-reference-input";
 import {
 	bufferQueueModeSchema,
+	clientSubmissionIdSchema,
 	editAndRegenerateJsonSchema,
 	editAssistantMessageSchema,
 	sendMessageSchema,
@@ -220,6 +221,8 @@ function fixture(
 		narratorRoutes: routes,
 		fileReferenceRoutes: child,
 		requestRecordingRoutes: new Hono(),
+		// This file isolates file-reference routes; communication registration has its own suite.
+		registerNarratorCommunicationRoutes: () => {},
 		requireNarratorAccess: acl,
 		AppError,
 		ValidationError,
@@ -243,6 +246,7 @@ function fixture(
 		fileReferenceMessageForDisplay,
 		sendMessageSchema,
 		bufferQueueModeSchema,
+		clientSubmissionIdSchema,
 		updateBufferedMessageSchema,
 		editAndRegenerateJsonSchema,
 		editAssistantMessageSchema,

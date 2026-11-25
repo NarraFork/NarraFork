@@ -226,6 +226,10 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 					return dock ? dock.openToolTypes.has("filetree") : mobileToolPanel === "filetree";
 				case "timeline":
 					return dock ? dock.openToolTypes.has("timeline") : mobileToolPanel === "timeline";
+				case "communication":
+					return dock
+						? dock.openToolTypes.has("communication")
+						: mobileToolPanel === "communication";
 				default:
 					return false;
 			}
@@ -266,6 +270,7 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 				case "userchat":
 				case "filetree":
 				case "timeline":
+				case "communication":
 					if (dock) dock.toggleToolPanel(id);
 					else {
 						const kind = id as MobileToolPanelKind;

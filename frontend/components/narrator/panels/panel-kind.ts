@@ -33,6 +33,7 @@ import { isToolEditReference, type ToolEditReference } from "../tool-call/tool-e
  *   each other; its content never enters the narrator's context unless someone
  *   forwards it explicitly).
  * - `timeline` — per-turn horizontal timeline of this agent and its subagents.
+ * - `communication` — the narrator's communication domain and explicit peer links.
  * - `appearance` — live typography controls for this transcript (font size / letter
  *   spacing / block spacing), so the reader can adjust while watching the effect.
  * - `subagent` — a multi-instance child-narrator session in the cluster's secondary area.
@@ -55,6 +56,7 @@ export type PanelKind =
 	| "userchat"
 	| "appearance"
 	| "timeline"
+	| "communication"
 	| "filetree"
 	| "subagent"
 	| "file"
@@ -305,6 +307,7 @@ export const PANEL_COMPONENT: Record<PanelKind, string> = {
 	userchat: "userchat",
 	appearance: "appearance",
 	timeline: "timeline",
+	communication: "communication",
 	filetree: "filetree",
 	subagent: "subagent",
 	file: "file",
@@ -334,6 +337,7 @@ export const PANEL_DEFAULT_TITLE: Record<PanelKind, string> = {
 	userchat: "Discussion",
 	appearance: "Appearance",
 	timeline: "Timeline",
+	communication: "Communication topology",
 	filetree: "Files",
 	subagent: "Subagent",
 	file: "File",

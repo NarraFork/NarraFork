@@ -4,6 +4,7 @@ import { cleanDb } from "../../../tests/setup";
 import { narratorMessages, narrators } from "../../db/schema";
 import * as reads from "../../db/worker-read";
 import * as pool from "../../lib/db-worker/pool";
+import { delegationRegistration } from "../../lib/validators/runtime-registration";
 import { captureWorkerRejection, getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
 const fixture = getNarratorWorkerTestDb();
@@ -76,8 +77,12 @@ for (const mutation of ["traits", "parent", "deleted", "sibling"] as const) {
 					db.insert(narrators)
 						.values({
 							id: "sibling",
+							type: "subagent",
 							parentNarratorId: "parent",
+							status: "idle",
 							traits: ["subagent-alias:chosen"],
+							aliasSelector: "chosen",
+							runtimeRegistrationJson: delegationRegistration("parent", "general"),
 							createdAt: "now",
 							updatedAt: "now",
 						})

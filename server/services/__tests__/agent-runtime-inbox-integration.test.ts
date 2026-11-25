@@ -6,10 +6,12 @@ import {
 	backgroundTasks,
 	fileChangeExecutionSegments,
 	narratorBufferedMessages,
+	narratorCommunicationNodes,
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
 	narratorToolCalls,
+	users,
 } from "../../db/schema";
 import * as workerRead from "../../db/worker-read";
 import { projectMessageSenderText } from "../../lib/agent/sender-projection";
@@ -134,10 +136,21 @@ beforeEach(async () => {
 	cleanDb(sqlite);
 	await backgroundOccupancyStore.start();
 	failBroadcast = false;
+	// Only the sending session gains a real actor; recipient anonymous/unknown identity tests stay intact.
+	db.insert(users)
+		.values({
+			id: "inbox-sender-owner",
+			username: "inbox-sender-owner",
+			role: "admin",
+			passwordHash: "test",
+			createdAt: time,
+		})
+		.run();
 	for (const id of ["parent", "child", "sender"])
 		db.insert(narrators)
 			.values({
 				id,
+				ownerUserId: id === "sender" ? "inbox-sender-owner" : null,
 				type: id === "parent" ? "primary" : "subagent",
 				variant: id === "parent" ? "primary" : "subagent:general",
 				parentNarratorId: id === "parent" ? null : "parent",
@@ -146,6 +159,15 @@ beforeEach(async () => {
 					id === "parent" ? null : delegationRegistration("parent", "general"),
 				createdAt: time,
 				updatedAt: time,
+			})
+			.run();
+	for (const id of ["parent", "child", "sender"])
+		db.insert(narratorCommunicationNodes)
+			.values({
+				narratorId: id,
+				parentNarratorId: id === "parent" ? null : "parent",
+				originalParentNarratorId: id === "parent" ? null : "parent",
+				version: 1,
 			})
 			.run();
 	backgroundOccupancyStore.refreshNarrators(["parent", "child", "sender"]);
@@ -595,6 +617,33 @@ test("parent/team/child producers persist into the same mailbox, read projection
 	expect(state(buffered.id)?.kind).toBe("agent_message");
 	expect(db.select().from(narratorBufferedMessages).all()).toHaveLength(3);
 	teamOwner.release();
+});
+
+test("TeamStatus ordinary send replays navigation without waking the same queued receipt again", async () => {
+	const value = delivery("child", "team note");
+	const message = {
+		delivery: value,
+		fromId: "sender",
+		fromTitle: "Sender",
+		fromType: "general",
+		text: value.text,
+		timestamp: time,
+		isBroadcast: false,
+		fromToolUseId: value.fromToolUseId,
+		fromToolCallBinding: value.senderToolCallBinding,
+	};
+	const wake = spyOn(inbox, "wakeInboxIfEligible").mockResolvedValue(false);
+	try {
+		const first = await deliverTeamMessage("child", message, "parent");
+		expect(wake).toHaveBeenCalledTimes(1);
+		expect(await deliverTeamMessage("child", message, "parent")).toBe(first);
+		db.update(narrators).set({ lastStopReason: "error" }).where(eq(narrators.id, "child")).run();
+		expect(await deliverTeamMessage("child", message, "parent")).toBe(first);
+		expect(wake).toHaveBeenCalledTimes(1);
+		expect(await inbox.listInboxRows("child", ["agent_message"])).toHaveLength(1);
+	} finally {
+		wake.mockRestore();
+	}
 });
 
 test("broadcast-only inbox never authorizes a wake, regardless of persisted recipient status", async () => {

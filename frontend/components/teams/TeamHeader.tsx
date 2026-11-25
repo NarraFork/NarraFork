@@ -3,7 +3,8 @@
  * one status sentence on the left (「3 项进行中 · 1 项等你」, 「空闲」, 「已暂停」, 「已归档」), and on
  * the right the people (at most three avatars, then +N; they open the members drawer), "pin to
  * sidebar", 「全部暂停」 (a plain button: it stops every running session of the tree, coordinator
- * first) and the 「…」 menu (team settings, the coordinator's full session, disband).
+ * first) and the 「…」 menu (communication topology, team settings, the coordinator's full
+ * session, disband).
  *
  * On a phone the header takes two rows (name and actions, then the sentence and the people), its
  * own menu button stands first (so the shell's floating one never covers it), and 「全部暂停」
@@ -12,15 +13,24 @@
 import { MobileNavButton } from "@frontend/components/nav/MobileNavButton";
 import { NarratorStatusIcon } from "@frontend/components/nav/NarratorStatusIcon";
 import { PinToSidebarButton } from "@frontend/components/nav/PinToSidebarButton";
+import { useMobileDrawerHistory } from "@frontend/hooks/useMobileDrawerHistory";
 import { usePauseTeam, useTeamMembers } from "@frontend/hooks/useTeams";
+import {
+	SAFE_AREA_DRAWER_BODY_STYLE,
+	safeAreaDrawerBodyHeight,
+	safeAreaDrawerHeaderHeight,
+	safeAreaDrawerHeaderPaddingTop,
+} from "@frontend/lib/safe-area";
 import {
 	ActionIcon,
 	Avatar,
 	Badge,
 	Box,
 	Button,
+	Center,
 	Drawer,
 	Group,
+	Loader,
 	Menu,
 	Modal,
 	Stack,
@@ -36,16 +46,38 @@ import {
 	IconExternalLink,
 	IconPlayerPause,
 	IconSettings,
+	IconSitemap,
 	IconUsers,
 	IconUsersGroup,
 	IconUsersMinus,
 } from "@tabler/icons-react";
-import { Fragment, type ReactNode, useState } from "react";
+import { Fragment, lazy, type ReactNode, Suspense, useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { UserAvatar } from "../UserAvatar";
 import { TeamMembersPanel } from "./TeamMembers";
 import { pauseNotice, type StatusPart, type StatusTone } from "./team-page-model";
 import { ATTENTION_TEXT, StatusDot, statusTone, TABULAR } from "./team-page-ui";
+
+const CommunicationTopologyPanel = lazy(() =>
+	import("../narrator/communication/CommunicationTopologyPanel").then((m) => ({
+		default: m.CommunicationTopologyPanel,
+	})),
+);
+
+const COMMUNICATION_DRAWER_HEADER_HEIGHT = 45;
+const COMMUNICATION_DRAWER_STYLES = {
+	header: {
+		minHeight: safeAreaDrawerHeaderHeight(COMMUNICATION_DRAWER_HEADER_HEIGHT),
+		paddingTop: safeAreaDrawerHeaderPaddingTop(8),
+		paddingBottom: 8,
+		borderBottom: "1px solid var(--mantine-color-default-border)",
+	},
+	body: {
+		height: safeAreaDrawerBodyHeight(COMMUNICATION_DRAWER_HEADER_HEIGHT),
+		padding: 0,
+		...SAFE_AREA_DRAWER_BODY_STYLE,
+	},
+} as const;
 
 /** Avatars shown before +N. */
 const AVATARS_SHOWN = 3;
@@ -153,12 +185,16 @@ export function TeamHeader({
 	onBack: () => void;
 	onOpenCoordinatorSession?: () => void;
 	onOpenSettings?: () => void;
-	/** Open a running session from the menu's list (the coordinator's: bring the conversation forward). */
+	/** Open a session from the running list or topology (the coordinator's: bring the conversation forward). */
 	onOpenSession?: (narratorId: string) => void;
 	/** Members get 解散团队 in the menu (the server decides whether they may). */
 	onDisband?: () => void;
 }) {
 	const { t } = useTranslation("projects");
+	const { t: tNarrator } = useTranslation("narrator");
+	const [communicationOpen, setCommunicationOpen] = useState(false);
+	const closeCommunication = useCallback(() => setCommunicationOpen(false), []);
+	useMobileDrawerHistory(communicationOpen, closeCommunication);
 	const [membersOpen, setMembersOpen] = useState(false);
 	const [confirmPause, setConfirmPause] = useState(false);
 	const pause = usePauseTeam(projectId, teamId);
@@ -235,6 +271,16 @@ export function TeamHeader({
 				</ActionIcon>
 			</Menu.Target>
 			<Menu.Dropdown maw="min(320px, calc(100vw - 32px))">
+				<Menu.Item
+					leftSection={<IconSitemap size={14} aria-hidden />}
+					aria-haspopup="dialog"
+					onClick={() => setCommunicationOpen(true)}
+					data-testid="team-communication-button"
+					mih={phone ? 48 : undefined}
+				>
+					{tNarrator("communicationTitle")}
+				</Menu.Item>
+				<Menu.Divider />
 				{/* The running sessions, from the summary already read (at most 20 named). */}
 				<Menu.Label>{t("teams.page.running.title")}</Menu.Label>
 				{summary?.runningAgents.length ? (
@@ -376,6 +422,37 @@ export function TeamHeader({
 					</Group>
 				</Group>
 			)}
+			<Drawer
+				opened={communicationOpen}
+				onClose={closeCommunication}
+				position="right"
+				size="min(1100px, 100%)"
+				title={tNarrator("communicationTitle")}
+				styles={COMMUNICATION_DRAWER_STYLES}
+				closeButtonProps={{ size: "sm", "aria-label": tNarrator("communicationClose") }}
+			>
+				{communicationOpen && (
+					<Suspense
+						fallback={
+							<Center h="100%">
+								<Loader size="sm" />
+							</Center>
+						}
+					>
+						<CommunicationTopologyPanel
+							key={`${projectId}:${teamId}`}
+							scope={{ kind: "team", projectId, teamId }}
+							onOpenNarrator={
+								onOpenSession &&
+								((narratorId) => {
+									closeCommunication();
+									onOpenSession(narratorId);
+								})
+							}
+						/>
+					</Suspense>
+				)}
+			</Drawer>
 			<Drawer
 				opened={membersOpen}
 				onClose={() => setMembersOpen(false)}

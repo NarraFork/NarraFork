@@ -2,7 +2,15 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { cancelDrag, endDrag, getPanelDrag, moveDrag, startDragManual } from "../../lib/panel-drag";
+import {
+	cancelDrag,
+	endDrag,
+	getPanelDrag,
+	moveDrag,
+	PANEL_DROP_PRIORITY,
+	registerPanelDropTarget,
+	startDragManual,
+} from "../../lib/panel-drag";
 import type { RecentTabDropRow } from "./recent-tab-drop-target";
 import {
 	type RecentTabExternalDropState,
@@ -21,6 +29,22 @@ let measurements: number;
 let options: UseRecentTabExternalDropOptions;
 let rect: DOMRect;
 const globals = new Map<string, PropertyDescriptor | undefined>();
+const subscriptions: (() => void)[] = [];
+
+function observeLowerPriorityDrop() {
+	const calls: string[] = [];
+	for (const target of ["composer", "topology", "dock", "page"] as const) {
+		subscriptions.push(
+			registerPanelDropTarget({
+				id: target,
+				priority: PANEL_DROP_PRIORITY[target],
+				hitTest: () => true,
+				onDrop: () => calls.push(target),
+			}),
+		);
+	}
+	return calls;
+}
 
 function Probe() {
 	state = useRecentTabExternalDrop(options);
@@ -94,6 +118,7 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+	for (const off of subscriptions.splice(0)) off();
 	if (mounted) await act(async () => root.unmount());
 	cancelDrag();
 	host.remove();
@@ -105,6 +130,49 @@ afterEach(async () => {
 });
 
 describe("useRecentTabExternalDrop", () => {
+	test("sidebar outranks overlapping composer/topology/dock/page targets", async () => {
+		const lower = observeLowerPriorityDrop();
+		await render();
+		await drag(() => startDragManual("external", "External", 50, 40));
+		await drag(endDrag);
+		expect(drops).toHaveLength(1);
+		expect(lower).toEqual([]);
+		expect(state).toBeNull();
+	});
+
+	test("an in-place sidebar release consumes even when there is no reorder target", async () => {
+		const lower = observeLowerPriorityDrop();
+		rows = [{ ...rows[0], key: "narrator:external" }];
+		await render();
+		await drag(() => startDragManual("external", "External", 50, 40));
+		expect(state).toBeNull();
+		await drag(endDrag);
+		expect(drops).toEqual([]);
+		expect(lower).toEqual([]);
+	});
+
+	test("an explicitly refused sidebar callback does not fall through to a split", async () => {
+		const lower = observeLowerPriorityDrop();
+		options.onDrop = () => {};
+		await render();
+		await drag(() => startDragManual("external", "External", 50, 40));
+		await drag(endDrag);
+		expect(drops).toEqual([]);
+		expect(lower).toEqual([]);
+		expect(state).toBeNull();
+	});
+
+	test("release outside the sidebar can reach the next consumer despite stale inside preview", async () => {
+		const lower = observeLowerPriorityDrop();
+		await render();
+		await drag(() => startDragManual("external", "External", 50, 40));
+		expect(state).not.toBeNull();
+		await drag(() => releaseAt(300, 40));
+		expect(drops).toEqual([]);
+		expect(lower).toEqual(["composer"]);
+		expect(state).toBeNull();
+	});
+
 	test("rejects release outside the sidebar after an inside move", async () => {
 		await render();
 		await drag(() => startDragManual("external", "External", 50, 40));

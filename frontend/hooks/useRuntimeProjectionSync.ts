@@ -1,11 +1,11 @@
 import { type QueryClient, type QueryFilters, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useSyncExternalStore } from "react";
-import { getToken, onTokenChange } from "../lib/api/client";
+import { getAuthSnapshot, subscribeAuth } from "../lib/api/client";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
-import { RUNTIME_SETTINGS_QUERY_KEY } from "./useRuntimeSettings";
+import { runtimeSettingsQueryKey } from "./useRuntimeSettings";
 
 /** One cancellation per burst, then dirty tail reads without restarting the in-flight refresh. */
-export function createRuntimeProjectionInvalidator(qc: QueryClient, token: string | null) {
+export function createRuntimeProjectionInvalidator(qc: QueryClient, generation: number) {
 	let disposed = false;
 	let queued = false;
 	let running = false;
@@ -14,13 +14,14 @@ export function createRuntimeProjectionInvalidator(qc: QueryClient, token: strin
 	let highestRevision = -1;
 	let initialRevisionFloor: number | undefined;
 	let epoch = 0;
-	const active = () => !disposed && getToken() === token;
+	const active = () => !disposed && getAuthSnapshot().generation === generation;
+	const settingsKey = runtimeSettingsQueryKey(generation);
 	const filters = (settings: boolean, models: boolean): QueryFilters[] => [
-		...(settings ? [{ queryKey: [...RUNTIME_SETTINGS_QUERY_KEY, token], exact: true }] : []),
+		...(settings ? [{ queryKey: settingsKey, exact: true }] : []),
 		...(models
 			? [
-					{ queryKey: ["model-catalog", "runtime", token] },
-					{ queryKey: ["model-catalog", "options", token] },
+					{ queryKey: ["model-catalog", "runtime", generation] },
+					{ queryKey: ["model-catalog", "options", generation] },
 				]
 			: []),
 	];
@@ -56,7 +57,7 @@ export function createRuntimeProjectionInvalidator(qc: QueryClient, token: strin
 	};
 	function reconcileInitialRevision() {
 		if (!active() || initialRevisionFloor === undefined) return;
-		const state = qc.getQueryState<{ revision: number }>([...RUNTIME_SETTINGS_QUERY_KEY, token]);
+		const state = qc.getQueryState<{ revision: number }>(settingsKey);
 		if (!state?.data || state.fetchStatus === "fetching") return;
 		const floor = initialRevisionFloor;
 		initialRevisionFloor = undefined;
@@ -74,7 +75,7 @@ export function createRuntimeProjectionInvalidator(qc: QueryClient, token: strin
 			return;
 		}
 		if (settings && typeof revision === "number") {
-			const current = qc.getQueryData<{ revision: number }>([...RUNTIME_SETTINGS_QUERY_KEY, token]);
+			const current = qc.getQueryData<{ revision: number }>(settingsKey);
 			if (revision <= highestRevision || (current && current.revision >= revision)) return;
 			highestRevision = revision;
 		}
@@ -107,10 +108,14 @@ export function createRuntimeProjectionInvalidator(qc: QueryClient, token: strin
 /** Mounted once per authenticated layout. Hidden menus are invalidated without fetching. */
 export function useRuntimeProjectionSync(enabled = true) {
 	const qc = useQueryClient();
-	const token = useSyncExternalStore(onTokenChange, getToken, getToken);
+	const { generation, hasToken } = useSyncExternalStore(
+		subscribeAuth,
+		getAuthSnapshot,
+		getAuthSnapshot,
+	);
 	useEffect(() => {
-		if (!enabled || !token) return;
-		const invalidator = createRuntimeProjectionInvalidator(qc, token);
+		if (!enabled || !hasToken) return;
+		const invalidator = createRuntimeProjectionInvalidator(qc, generation);
 		const listener = narratorWSManager.addListener(
 			{ types: ["settings_runtime_changed", "model_catalog_changed"] },
 			(message) =>
@@ -128,12 +133,13 @@ export function useRuntimeProjectionSync(enabled = true) {
 			// Initial connection sends its server revision as settings_runtime_changed;
 			// a matching HTTP revision costs zero reads and closes the HTTP→WS gap.
 		});
-		const offToken = onTokenChange(() => {
+		const offAuth = subscribeAuth(() => {
+			if (getAuthSnapshot().generation === generation) return;
 			invalidator.dispose();
 			for (const queryKey of [
-				[...RUNTIME_SETTINGS_QUERY_KEY, token],
-				["model-catalog", "runtime", token],
-				["model-catalog", "options", token],
+				runtimeSettingsQueryKey(generation),
+				["model-catalog", "runtime", generation],
+				["model-catalog", "options", generation],
 			]) {
 				void qc.cancelQueries({ queryKey });
 				qc.removeQueries({ queryKey });
@@ -145,8 +151,8 @@ export function useRuntimeProjectionSync(enabled = true) {
 			invalidator.dispose();
 			narratorWSManager.removeListener(listener);
 			offConnection();
-			offToken();
+			offAuth();
 			window.removeEventListener("narrafork:nug-model-availability-changed", onAvailability);
 		};
-	}, [enabled, qc, token]);
+	}, [enabled, generation, hasToken, qc]);
 }

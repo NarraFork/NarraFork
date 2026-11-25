@@ -63,7 +63,12 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "storage") {
 			createdAt: new Date().toISOString(),
 		})
 		.run();
-	mock.module("../../db", () => ({ db, sqlite }));
+	mock.module("../../db", () => ({
+		db,
+		sqlite,
+		activeDatabaseBackend: "sqlite",
+		postgresRuntime: null,
+	}));
 	const drafts = await import("../narrator-draft-service");
 	const buffer = await import("../narrator-buffer");
 	const state = await import("../narrator-session-state");

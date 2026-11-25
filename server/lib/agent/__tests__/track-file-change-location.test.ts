@@ -20,11 +20,16 @@ describe("trackFileChange team location forwarding", () => {
 				transaction(write) { return write(this); },
 				get() { return { type: "subagent", variant: "subagent:general", parentId: "parent" }; },
 			};
-			mock.module("@server/db", () => ({ db: membership, sqlite: membership.$client, activeDatabaseBackend: "sqlite" }));
+			mock.module("@server/db", () => ({
+				db: membership,
+				sqlite: membership.$client,
+				activeDatabaseBackend: "sqlite",
+				postgresRuntime: null,
+			}));
 			const reads = await import("@server/db/worker-read");
 			mock.module("@server/db/worker-read", () => ({ ...reads, readQueryFirst: async (query) => query.get() }));
 			mock.module("@server/websocket/narrator-ws", () => ({ broadcastToNarrator() {} }));
-			mock.module("@server/lib/event-bus", () => ({ eventBus: { emit() {} } }));
+			mock.module("@server/lib/event-bus", () => ({ eventBus: { emit() {}, onAny() {} } }));
 			mock.module("@server/lib/logger", () => ({ logger: { debug() {}, warn() {}, info() {} } }));
 			const attributed = [];
 			mock.module("@server/services/file-attribution-service", () => ({

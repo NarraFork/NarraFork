@@ -317,6 +317,51 @@ afterEach(async () => {
 });
 
 describe("work item lifecycle", () => {
+	test("communication dirty observes committed worker/role state and never a rolled-back binding", async () => {
+		const item = await create("Communication projection binding");
+		seedWorker("p3-projection-worker");
+		const observed: Array<{ inTransaction: boolean; worker: string | null; state: string }> = [];
+		const handler = (event: { teamId: string }) => {
+			if (event.teamId !== LEAD) return;
+			const row = db.select().from(teamWorkItems).where(eq(teamWorkItems.id, item.id)).get();
+			if (!row) throw new Error("Missing committed work item");
+			observed.push({
+				inTransaction: sqlite.inTransaction,
+				worker: row.workerNarratorId,
+				state: row.state,
+			});
+		};
+		eventBus.on("team:communication_changed", handler);
+		try {
+			sqlite.run(
+				"CREATE TEMP TRIGGER reject_communication_work_event BEFORE INSERT ON team_work_events BEGIN SELECT RAISE(ABORT, 'test rollback'); END",
+			);
+			try {
+				expect(() => attachWorker(LEAD, item.id, "p3-projection-worker", agent)).toThrow(
+					"test rollback",
+				);
+			} finally {
+				sqlite.run("DROP TRIGGER reject_communication_work_event");
+			}
+			expect(observed).toEqual([]);
+			expect(
+				db.select().from(teamWorkItems).where(eq(teamWorkItems.id, item.id)).get()
+					?.workerNarratorId,
+			).toBeNull();
+			attachWorker(LEAD, item.id, "p3-projection-worker", agent);
+			expect(observed).toEqual([
+				{ inTransaction: false, worker: "p3-projection-worker", state: "in_progress" },
+			]);
+			cancelWorkItem({ coordinatorId: LEAD, itemId: item.id, actor: agent });
+			expect(observed.at(-1)).toEqual({
+				inTransaction: false,
+				worker: "p3-projection-worker",
+				state: "cancelled",
+			});
+		} finally {
+			eventBus.off("team:communication_changed", handler);
+		}
+	});
 	test("create → the worker commits → blocker round → clear round → ready", async () => {
 		const item = await create("Add the export button");
 		expect(item.state).toBe("queued");

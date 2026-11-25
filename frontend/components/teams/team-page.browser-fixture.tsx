@@ -13,6 +13,12 @@ import "../../styles/nav-collapsed.css";
 import { AppShell, MantineProvider } from "@mantine/core";
 import { Notifications } from "@mantine/notifications";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import {
+	createBrowserHistory,
+	createRootRoute,
+	createRouter,
+	RouterContextProvider,
+} from "@tanstack/react-router";
 import i18next from "i18next";
 import { useEffect, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -52,6 +58,8 @@ let navWidth = 250;
 const opened: string[] = [];
 /** The phone drawer's toggle, as the app shell hands it to the menu buttons. */
 const mobileNav = { opened: false, toggle: () => opened.push("menu") };
+// The team communication drawer uses real browser Back without replacing the fixture page.
+const router = createRouter({ routeTree: createRootRoute(), history: createBrowserHistory() });
 
 function render(): void {
 	if (!root || !queryClient) return;
@@ -72,7 +80,7 @@ function render(): void {
 						</AppShell.Navbar>
 						<MobileNavContext.Provider value={mobileNav}>
 							<AppShell.Main data-testid="page-frame" style={{ height: "100dvh" }}>
-								{mounted}
+								<RouterContextProvider router={router}>{mounted}</RouterContextProvider>
 							</AppShell.Main>
 							<MobileNavFallback />
 						</MobileNavContext.Provider>

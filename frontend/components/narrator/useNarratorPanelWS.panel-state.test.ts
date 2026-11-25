@@ -62,6 +62,8 @@ function callbacks(
 	let permissions = new Map<string, PendingPermission>();
 	let buffer: BufferMessageSummary[] = [];
 	let userId = "u1";
+	const authGeneration = 1;
+	let currentAuthGeneration = authGeneration;
 	const updates: Array<() => void> = [];
 	const generation = { current: 0 };
 	const lifecycle = { current: 0 };
@@ -94,8 +96,8 @@ function callbacks(
 		reconcilePanelStatePages,
 		shouldFallbackPanelState,
 		narratorId: "n1",
-		token: "test-token",
-		getToken: () => "test-token",
+		authGeneration,
+		getAuthSnapshot: () => ({ generation: currentAuthGeneration }),
 		readScope: {},
 		currentUser: { id: "u1" },
 		qc: { getQueryData: () => ({ id: userId }) },
@@ -122,6 +124,7 @@ function callbacks(
 		epoch,
 		switchAccount() {
 			userId = "u2";
+			currentAuthGeneration++;
 		},
 		flush() {
 			for (const update of updates.splice(0)) update();

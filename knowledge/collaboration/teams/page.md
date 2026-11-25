@@ -8,7 +8,7 @@ anchors:
   - server/services/teams/team-work-view.ts
   - server/routes/__tests__/project-teams-work.test.ts
   - frontend/components/teams/
-  - frontend/hooks/team-onlooker-refresh.ts
+  - frontend/lib/recent-tabs-owner.ts
   - frontend/hooks/useTeams.ts
   - frontend/lib/api/teams.ts
   - frontend/routes/projects/$projectId_.teams.$teamId.tsx
@@ -43,7 +43,7 @@ keywords:
   - permission_decided_by
   - answerForm
 status: draft
-verified_at: 6505c4364
+verified_at: db0b59bfcea0ccf12bdffd1bc8cf85fb7e077c24
 ---
 # 团队页与审批
 
@@ -71,6 +71,11 @@ verified_at: 6505c4364
 - best-effort：决定之后、事务之外写，写失败只记日志，决定仍生效。
 - 不在团队里的调用不处理；PG 上不记录。IM 网关永远不能做这种决定。
 
+前端通讯与访问：
+- RecentTabs 的统一访问作用域（`lib/recent-tabs-owner.ts`）在当前认证连接收到 `narrator_access_changed`、`project_access_changed` 后失效旧页并重取授权元数据，同时刷新 `teamOnlooker`。该标记让只读旁观者不收「等待」提醒；不再另设团队专用失效监听器（见[通知与注意力](../notifications.md)、[最近标签页](../recent-tabs.md)）。
+- `TeamHeader.tsx` 的「…」菜单提供「通讯拓扑」，成员与旁观者都可查看，使用 team scope，复用普通会话的图组件与安全区内的右侧 drawer，手机提供返回操作；不恢复旧顶栏。团队身份仍按协调者/ACL root，通讯拆组不改变工作项、worktree、审批、全部暂停或自动报告；一支团队可同时包含多个互不自由互发的通讯框。
+- 拓扑不复用团队摘要的轮询：团队记录/工作项/worker 绑定在外层事务提交后发 ids-only dirty，图经单 narrator socket 的 snapshot/delta 更新。图框显示真实团队名，节点只显示图标和会话名；拓扑注释仅携带团队 ID/名称与详情所需工作项标题，不再推导角色标签。外部团队详情仍单独鉴权，只读旁观者不能拖动改关系。跨团队精确 peer 不授予成员、控制或 worktree 权限。
+
 前端（`frontend/components/teams/`）：
 - 路由 `frontend/routes/projects/$projectId_.teams.$teamId.tsx`（不嵌在项目页下，占满外壳内容区）→ `TeamPageView.tsx`。对话是普通叙述者面板，只读成员的输入区换成「你是只读成员」（`NarratorPanel` 的 `readOnlyNotice`）。「…」菜单的协调者完整会话走 `onOpenCoordinatorSession`。
 - 团队页只讲一个团队：没有项目团队列表、没有「新建团队」、没有左侧团队切换。切换走侧栏固定的团队标签和项目页的团队卡片；新建走项目页或新建会话弹窗的「以团队开始」。
@@ -86,7 +91,6 @@ verified_at: 6505c4364
 - 「升级为团队」不在团队页上：入口是会话溢出菜单（见[会话外框](../../frontend/narrator-ui/session-chrome.md)），对话框 `UpgradeToTeamModal.tsx` 用与新建团队相同的 `TeamCreateFields`/`useTeamDraft`；菜单项只给 `team-upgrade-eligibility.ts:canOfferTeamUpgrade` 为真的会话。
 - `team-page-model.ts` 是纯规则：等你处理与折叠、分组、状态句、起步/收尾、行文案、退回理由、diff 行分类、布局、轮询退避、套接字推送合并（400ms 去抖、最长 2s）、暂停顺序。
 - `hooks/useTeams.ts`：摘要在叙述者 socket 的相关帧上合并重取，同时带退避轮询（变化后 4s，翻倍到 60s，标签页隐藏时暂停）；看板（`lastEventId` 与各列计数变了才重取，连同 `work-stats`、抽屉、diff 一起失效）、动态、审批各自按变化重取。`useDecideApproval` 批准时可带 `answers`；`useApprovalDetail` 读 `permission:<id>` 的 human-attention 详情。`lib/api/teams.ts` 是客户端。
-- `hooks/team-onlooker-refresh.ts`：访问权限变化（`narrator_access_changed`、`project_access_changed`）时刷新最近标签页的 `teamOnlooker` 标记（见[通知与注意力](../notifications.md)）。
 
 ## 从哪读起
 - `team-board.ts`：看板、动态、审批的读模型；`team-work-view.ts`：大小、抽屉、diff、退回入口；`team-decisions.ts`：决定记录。

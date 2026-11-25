@@ -213,7 +213,7 @@ export function EditableComposerDocument(props: EditableComposerDocumentProps) {
 					{ signal },
 				);
 				if (!response.ok) {
-					await clearTokenOnSessionFailure(response.clone());
+					await clearTokenOnSessionFailure(response);
 					return;
 				}
 				const blob = await readBoundedBlob(
@@ -466,6 +466,13 @@ export function EditableComposerDocument(props: EditableComposerDocumentProps) {
 						{t("editCancel")}
 					</Button>
 				</Group>
+			)}
+			{document.paragraphs.some((paragraph) =>
+				paragraph.children.some((node) => node.type === "narratorReference"),
+			) && (
+				<Text size="xs" c="dimmed" role="note" data-queue-reference-hint>
+					{t("queueReferenceConnectionHint")}
+				</Text>
 			)}
 			<InlineComposerEditor
 				ref={editor}

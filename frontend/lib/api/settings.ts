@@ -602,16 +602,11 @@ export const settingsApi = {
 	): Promise<RecentTabsPageResponse> => {
 		const search = new URLSearchParams({ section, limit: String(params.limit ?? 50) });
 		if (params.cursor) search.set("cursor", params.cursor);
-		const result = await request<RecentTabsPageResult>(
+		const { nextCursor, ...page } = await request<RecentTabsPageResult>(
 			`/user-preferences/recent-tabs?${search.toString()}`,
 			params.signal ? { signal: params.signal } : undefined,
 		);
-		return {
-			items: result.items,
-			hasMore: result.hasMore,
-			revision: result.revision,
-			...(result.nextCursor ? { nextCursor: result.nextCursor } : {}),
-		};
+		return nextCursor ? { ...page, nextCursor } : page;
 	},
 	getRecentTabsRuntime: (keys: string[], signal?: AbortSignal) =>
 		request<RecentTabsRuntimeResult>("/user-preferences/recent-tabs/runtime", {

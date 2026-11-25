@@ -1,7 +1,7 @@
 /**
- * Global panel drag state — a framework-agnostic pointer-drag singleton used to
- * drag "something" onto a Dockview surface: a sidebar recent tab (to create /
- * focus a panel) or an existing panel header (to move / swap it).
+ * Global panel drag state — a framework-agnostic pointer-drag singleton for
+ * sidebar sorting, composer references, communication topology and dock/page drops.
+ * Every release goes through one priority arbiter, never a broadcast of business actions.
  *
  * Two entry points:
  * 1. Icon / header pointerdown → startPointerDrag / startPanelDrag
@@ -83,7 +83,69 @@ export interface PanelDragState {
 }
 
 type MoveListener = (state: PanelDragState) => void;
+/** Cleanup/observation only. Business drops must use registerPanelDropTarget. */
 type EndListener = (state: PanelDragState | null) => void;
+
+export const PANEL_DROP_PRIORITY = {
+	sidebar: 400,
+	composer: 300,
+	topology: 200,
+	dock: 100,
+	page: 0,
+} as const;
+
+export interface PanelDropTarget<T> {
+	/** Stable, unique identity. Equal priorities are ordered by id, not mount order. */
+	id: string;
+	priority: number;
+	/** null means outside this target. A hit may represent an explicitly rejected/no-op drop. */
+	hitTest: (state: PanelDragState) => T | null;
+	onDrop: (state: PanelDragState, hit: T) => void;
+}
+
+interface RegisteredDropTarget {
+	id: string;
+	priority: number;
+	resolveDrop: (state: PanelDragState) => (() => void) | null;
+}
+const _dropTargets = new Map<string, RegisteredDropTarget>();
+
+/**
+ * Register a release consumer. The first hit wins, even if its onDrop rejects,
+ * does nothing or throws: a refused composer/topology drop must never become a split.
+ * A replacement with the same id is not removed by an older subscription's cleanup.
+ */
+export function registerPanelDropTarget<T>(target: PanelDropTarget<T>): () => void {
+	const entry: RegisteredDropTarget = {
+		id: target.id,
+		priority: target.priority,
+		resolveDrop: (state) => {
+			const hit = target.hitTest(state);
+			return hit === null ? null : () => target.onDrop(state, hit);
+		},
+	};
+	_dropTargets.set(entry.id, entry);
+	return () => {
+		if (_dropTargets.get(entry.id) === entry) _dropTargets.delete(entry.id);
+	};
+}
+
+function finishDrag(final: PanelDragState) {
+	try {
+		const targets = [..._dropTargets.values()].sort(
+			(a, b) => b.priority - a.priority || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
+		);
+		for (const target of targets) {
+			const drop = target.resolveDrop(final);
+			if (drop === null) continue;
+			drop();
+			break;
+		}
+	} finally {
+		// Clearing previews is unconditional, including a throwing hit-test/drop.
+		for (const fn of _endListeners) fn(final);
+	}
+}
 
 let _current: PanelDragState | null = null;
 /** Whether the drag was started via document pointer listeners (icon drag). */
@@ -299,13 +361,20 @@ function onDocPointerUp(event: PointerEvent) {
 	// The release can cross a group/zone boundary without a final pointermove.
 	const final = _current ? { ..._current, x: event.clientX, y: event.clientY } : null;
 	_current = null;
-	for (const fn of _endListeners) fn(final);
+	if (final) finishDrag(final);
 }
 
 // ── Entry point 2: @dnd-kit managed drag (no document listeners) ──
 
-export function startDragManual(id: string, title: string, x: number, y: number) {
-	_current = { id, title, x, y };
+/** Manual callers classify only subjects whose semantic identity they actually know. */
+export function startDragManual(
+	id: string,
+	title: string,
+	x: number,
+	y: number,
+	subjectKind?: PanelDragSubjectKind,
+) {
+	_current = { id, title, x, y, ...(subjectKind ? { subjectKind } : {}) };
 	_ownsPointer = false;
 	emit();
 }
@@ -341,7 +410,7 @@ export function endDrag(): PanelDragState | null {
 	if (_ownsPointer) return null; // let document listener handle it
 	const final = _current;
 	_current = null;
-	for (const fn of _endListeners) fn(final);
+	if (final) finishDrag(final);
 	return final;
 }
 
@@ -357,6 +426,7 @@ export function onPanelDragMove(fn: MoveListener): () => void {
 	return () => _moveListeners.delete(fn);
 }
 
+/** Observe completion/cancellation for cleanup only; registerPanelDropTarget owns business actions. */
 export function onPanelDragEnd(fn: EndListener): () => void {
 	_endListeners.add(fn);
 	return () => _endListeners.delete(fn);

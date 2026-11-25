@@ -7,7 +7,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { chatKeys } from "../../hooks/useChat";
 import { api } from "../../lib/api";
 import type { ChatRoomSummary } from "../../lib/api/chat";
-import { ApiError, getToken, setToken } from "../../lib/api/client";
+import { ApiError, getAuthSnapshot, setToken } from "../../lib/api/client";
 import type { TreeMessage } from "../../lib/api/types";
 import { NarratorPanelVisibilityProvider } from "../narrator/narrator-panel-visibility";
 import {
@@ -147,7 +147,7 @@ async function flush() {
 }
 function cacheRoom(updatedAt = Date.now() - 31_000) {
 	const room = { id: "cached-room" } as ChatRoomSummary;
-	const key = [...chatKeys.narratorRoom("n"), getToken()];
+	const key = [...chatKeys.narratorRoom("n"), getAuthSnapshot().generation];
 	qc.setQueryData(key, room, { updatedAt });
 	return { key, room };
 }
@@ -283,14 +283,18 @@ test.each([
 	).not.toBe(identity);
 });
 
-test("a new token cannot reuse the preceding token's cached room while its resolver fails", async () => {
-	cacheRoom(Date.now());
+test("returning to the same token cannot reuse an older generation's cached room", async () => {
+	const { key } = cacheRoom(Date.now());
+	const initialGeneration = getAuthSnapshot().generation;
 	await render(true);
 	expect(calls).toHaveLength(0);
 	expect(container.querySelector('[data-room="cached-room"]')).not.toBeNull();
 	await act(async () => {
 		setToken("token-b");
+		setToken("token-a");
 	});
+	expect(getAuthSnapshot().generation).toBeGreaterThan(initialGeneration);
+	expect(key).toEqual(["chat", "narrator-room", "n", initialGeneration]);
 	expect(calls).toHaveLength(1);
 	expect(container.querySelector('[data-room="cached-room"]')).toBeNull();
 	await fail(0, 503);

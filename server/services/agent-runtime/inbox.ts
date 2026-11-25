@@ -23,6 +23,7 @@ import { logger } from "../../lib/logger";
 import type { Locale } from "../../lib/prompt-i18n";
 import type { AgentMessageDelivery } from "../agent-message-delivery";
 import { bufferEditHolds, isBufferConsumptionHeld } from "../buffer-edit-hold";
+import { assertCommunicationSendAuthorizedTx } from "../narrator-communication";
 import type { MessagePlacementOptions } from "../narrator-persistence";
 import { getNarratorMessageRefsPort } from "../narrator-refs/store";
 import { ensureReplyContext, syncActiveReplyContext } from "../narrator-reply-context";
@@ -258,6 +259,8 @@ function enqueueInboxAgentSqlite(
 			source.originToolCallId !== null
 		)
 			throw new Error("Agent message execution receipt is stale or missing");
+		// Last authority check shares the insert transaction, including parent/TeamStatus paths.
+		assertCommunicationSendAuthorizedTx(tx, delivery.sender.id, delivery.recipientNarratorId);
 		const index = modelText.indexOf(delivery.text);
 		if (index < 0) throw new Error("Agent model projection must contain its reader-facing body");
 		const { text, ...coordinates } = delivery;

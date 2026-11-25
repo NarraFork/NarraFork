@@ -37,6 +37,11 @@ import type {
 	RuleTargetSelector,
 } from "../lib/api/types";
 import {
+	getRecentTabsScope,
+	isRecentTabsScopeCurrent,
+	recentTabsScopeKey,
+} from "../lib/recent-tabs-owner";
+import {
 	extractRevertResult,
 	formatRevertFailure,
 	formatRevertSuccessWarning,
@@ -44,7 +49,7 @@ import {
 	isAvailableFilesRestored,
 	isRevertHistoryCommitted,
 } from "../lib/revert-result";
-import { recentTabsSectionQueryKey, removeRecentTabCascade } from "./useRecentTabs";
+import { removeRecentTabCascade } from "./useRecentTabs";
 import {
 	currentWorkspaceContext,
 	isWorkspaceContextIdentity,
@@ -837,11 +842,18 @@ export function useArchiveNarrator() {
 	const { t } = useTranslation("narrator");
 	return useMutation({
 		mutationFn: (id: string) => api.archiveNarrator(id),
-		onSuccess: (_data, narratorId) => {
+		onMutate: () => ({ scope: getRecentTabsScope() }),
+		onSuccess: (_data, narratorId, context) => {
 			qc.invalidateQueries({ queryKey: ["narrators"] });
 			// Cascade cleanup after archive — no undo token for entities that are gone.
 			// 归档是可撤销的，所以它所在的文件夹即使变空也留着，撤销归档才回得去。
-			void removeRecentTabCascade(qc, "narrator", narratorId, { keepEmptyFolder: true });
+			void removeRecentTabCascade(
+				qc,
+				"narrator",
+				narratorId,
+				{ keepEmptyFolder: true },
+				context?.scope ?? null,
+			);
 		},
 		onError: () => {
 			notifications.show({ color: "red", message: t("archiveFailed") });
@@ -852,11 +864,13 @@ export function useUnarchiveNarrator() {
 	const qc = useQueryClient();
 	return useMutation({
 		mutationFn: (id: string) => api.unarchiveNarrator(id),
-		onSuccess: () => {
+		onMutate: () => ({ scope: getRecentTabsScope() }),
+		onSuccess: (_data, _id, context) => {
 			qc.invalidateQueries({ queryKey: ["narrators"] });
 			// 恢复可能把它放回归档前所在的文件夹，侧栏要重新读一遍。
-			void qc.invalidateQueries({ queryKey: recentTabsSectionQueryKey("work") });
-			void qc.invalidateQueries({ queryKey: recentTabsSectionQueryKey("projects") });
+			const scope = context?.scope ?? null;
+			if (isRecentTabsScopeCurrent(scope))
+				void qc.invalidateQueries({ queryKey: recentTabsScopeKey(scope) });
 		},
 	});
 }
