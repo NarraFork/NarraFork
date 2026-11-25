@@ -5,6 +5,7 @@ import {
 	updateCustomApiQuotaByPrefix,
 } from "../../custom-api-quota-cache";
 import { setNugCachedModels } from "../../nug-model-cache";
+import { updateNugQuotaByPrefix } from "../../nug-quota-cache";
 import {
 	streamQuotaIdentityForPrefix,
 	streamQuotaIdentityForRequest,
@@ -729,10 +730,8 @@ for (const variant of ["plain NUG", "pooled NUG", "pooled custom"] as const) {
 						}
 						const live = streamQuotaIdentityForPrefix(prefix, credentialId);
 						expect(live).toBeString();
-						// Proxy-only edits leave the quota identity tuple unchanged, but
-						// still invalidate the prepared transport's request-time guard.
-						if (edit === "globalProxy") expect(live).toBe(before);
-						else expect(live).not.toBe(before);
+						// The opaque identity tracks the effective transport as well as its credential.
+						expect(live).not.toBe(before);
 						expect(info?.validateDiagnosticCredential?.()).toBe(false);
 						expect(streamQuotaIdentityForRequest(prefix, info)).toBeUndefined();
 					},
@@ -742,6 +741,12 @@ for (const variant of ["plain NUG", "pooled NUG", "pooled custom"] as const) {
 			expect(events).toEqual([{ text: "request-selected-old-key", credentialId }]);
 			expect(requests).toEqual([{ apiKey: "request-selected-old-key", operation: "chat" }]);
 			expect(streamQuotaIdentityForRequest(prefix, delivered)).toBeUndefined();
+			// Even a delayed writer holding the original capture must not relabel its balance.
+			if (custom) updateCustomApiQuotaByPrefix(prefix, "999", "stale balance", before);
+			else updateNugQuotaByPrefix(prefix, 999, "stale balance", undefined, before);
+			for (const key of store().list(owner))
+				expect(quotaStore.peek(key.id, STREAM_QUOTA_SOURCE)).toBeUndefined();
+			expect(quotaStore.peek(group, STREAM_QUOTA_SOURCE)).toBeUndefined();
 		});
 	});
 }
@@ -764,8 +769,13 @@ test("promoted plain custom backup bills the group but publishes its balance onl
 	});
 	const first = store().add(CUSTOM_ID, { apiKey: "old-key-A" });
 	const backup = store().add(CUSTOM_ID, { apiKey: "promoted-key-B" });
+	const oldIdentity = streamQuotaIdentityForPrefix("poolcustom", first.id);
+	expect(oldIdentity).toBeString();
 	store().update(first.id, { disabled: true });
 	store().reorder(CUSTOM_ID, [backup.id, first.id]);
+	updateCustomApiQuotaByPrefix("poolcustom", "999", "stale A balance", oldIdentity);
+	for (const key of [first, backup])
+		expect(quotaStore.peek(key.id, STREAM_QUOTA_SOURCE)).toBeUndefined();
 	const { adapter, model } = resolveProviderAndModel("poolcustom:m");
 	expect(adapter).not.toBeInstanceOf(PooledProvider);
 	let publishedIdentity: string | undefined;
@@ -775,9 +785,8 @@ test("promoted plain custom backup bills the group but publishes its balance onl
 			onRequestStart: (info) => {
 				expect(info?.credentialId).toBe(CUSTOM_ID);
 				publishedIdentity = streamQuotaIdentityForRequest("poolcustom", info);
-				expect(publishedIdentity).toBe(
-					JSON.stringify([CUSTOM_ID, "https://promoted-custom.invalid/v1", backup.apiKey]),
-				);
+				expect(publishedIdentity).toBeString();
+				expect(publishedIdentity).toBe(streamQuotaIdentityForPrefix("poolcustom", backup.id));
 				updateCustomApiQuotaByPrefix("poolcustom", "73.5", "backup balance", publishedIdentity);
 			},
 		}),
