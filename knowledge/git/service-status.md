@@ -74,7 +74,7 @@ keywords:
   - git-commit-boundary
   - remote-git-service
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 ---
 # git 服务与状态
 
@@ -89,6 +89,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 状态分页（`git-status-page.ts`）由独立 Worker 处理：并发 2、排队上限 16（`git-status-page-protocol.ts`）；每页默认 100、最多 200（`shared/git-status-page.ts`）。按仓库规则，Worker 不可用时不回退到主线程执行，而是报 `GitStatusPageError`（具体各故障路径的错误码未逐一核实）。统计（行数）是单独的请求。
 - 仓库发现结果缓存 30 秒、最多 128 项，只存文件系统事实，不存授权（`git-discovery-cache.ts`）。
 - 当前差异视图 `getGitCurrentDiffView`：把工作区/索引与记录的文件变更证据对照，只给出「与某个 actor 的变更后状态匹配」，明确不是 blame 或所有权；整体 12 秒超时，最多 200 个路径，只支持本地设备，其他设备返回 `unsupported`（`git-current-diff-view.ts`）。
+  - 分支，设备未启用文件历史（`isFileHistoryEnabledForDevice` 为假，本地设备即如此）：有改动的条目只标 `reason: "history_incomplete"`，不去证据表里推断 actor；干净条目照常 `clean`。由于该视图只支持本地设备，现状下有改动的条目都落在这个分支。
 - 状态分页引擎（`git-status-page-engine.ts`）：快照缓存最多 8 份、64 MiB、空闲 120 秒；分页游标用实例密钥做 HMAC 签名。`git-status-page-process.ts` 负责 Worker 子进程的终止清理（含 Windows 进程树）。
 - 行统计与当前基线各有独立 Worker：`git-line-stats.ts` 输出上限 1 MiB、结果缓存 5 秒（`git-line-stats-cache.ts:GIT_LINE_STATS_TTL_MS`）；未跟踪文件由 `git-untracked-line-worker.ts` 按批读取，单批最多 200 个文件、总字节 20,000,000，超时 30 秒；当前基线 `git-current-baseline.ts`（并发 2、不排队）单文件 4 MiB、总 64 MiB、最多 200 个路径，超限返回未知而不是部分哈希。行统计是独立请求，永远不是轻量状态扫描的一部分，未知与失败不得显示为 0（`GitLineStatsSummary.tsx`）。
 - 提交预览：`GET .../git/commits/:sha`（元数据与文件列表）与 `.../commits/:sha/diff`（按文件取补丁）；解析用 NUL 分隔输出，被预算截断的记录会被丢弃而不是显示成幽灵文件（`git-commit-preview-parse.ts`，本地与远程两个后端共用）；提交号需匹配 40 或 64 位十六进制（`shared/git-commit-preview.ts:GIT_COMMIT_SHA_PATTERN`）。

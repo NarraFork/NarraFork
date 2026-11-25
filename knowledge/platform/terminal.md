@@ -34,7 +34,7 @@ keywords:
   - 孤儿终端
   - /api/admin/terminals
 status: draft
-verified_at: 2c639f086aef21d60357f1e002e62767938833e8
+verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 ---
 # 终端运行时
 
@@ -46,10 +46,12 @@ verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 - dtach 仅限非 Windows：`dtachService.isAvailable()` 在 win32 恒为 false，其余平台用 `which dtach` 检测并缓存（`terminal/dtach-service.ts`）。dtach 会话以 `terminal-<id>.sock` 存放；服务端只持有 attach 进程。
 - 关闭服务时（`shutdownAll`）：dtach 终端保存缓冲、关闭 attach 进程但不杀会话，数据库状态保持 `running`；直连终端被杀并标记已退出（退出码 -1）。启动时 `recoverOnStartup` 对 `running` 的 dtach 终端探测 socket 并重新 attach，探测失败则保留状态而不是删除（`terminal-service.ts`、`dtach-recovery-probe.ts`）。`terminalService.whenStartupRecoverySettled()` 在最近一次启动恢复结束（成败皆算，无恢复则立即）后 resolve；`watch-service.ts` 靠它在 dtach 恢复完成后再重新挂接终端 Watch。
 - 因此「生命周期绑定服务器进程」只对直连/远程终端成立；dtach 终端可存活于重启。
-- 滚动缓冲由 `BufferManager` 维护（默认 80x24、scrollback 5000 行），周期性落盘，订阅时以 `scrollback` 消息回放，并有读取游标/布局快照的数量与字节上限（`terminal/buffer-manager.ts` 顶部常量如 `MAX_BUFFER_READ_CURSORS`、`MAX_LAYOUT_SNAPSHOT_BYTES`）。
+- 滚动缓冲由 `BufferManager` 维护（默认 80x24、scrollback 5000 行），周期性落盘，订阅时以 `scrollback` 消息回放（回放链路失败——attach 被拒、终端消失、读取已关闭——只记 debug 日志、不回放，不成为未处理拒绝：`terminal-ws.ts:subscribeToTerminal`），并有读取游标/布局快照的数量与字节上限（`terminal/buffer-manager.ts` 顶部常量如 `MAX_BUFFER_READ_CURSORS`、`MAX_LAYOUT_SNAPSHOT_BYTES`）。
 - WebSocket 协议：客户端 `subscribe/unsubscribe/input/resize/create/kill/rename`，服务端 `output/exit/error/scrollback/bufferState/created/killed/renamed`，消息体经 `terminalWsMessageSchema` 校验，订阅和创建都要通过 `terminal-access` 的权限判断（`websocket/terminal-ws.ts`）。
 - 谁能使用某个终端（跟随叙述者 ACL、独立终端只属创建者与管理员）由 `terminal-access.ts` 判断，规则见 [访问控制](../security/acl.md)。
 - 终端的 REST 管理在 `routes/terminals.ts`（列表、树、创建、改名、删除、进程列表、视图状态）。
+- `terminal-service.ts` 的数据库读取都经读 Worker（`readQuery`，`worker-required`），Worker 不可用时这些调用直接失败，不回退主线程；写入仍在主线程。
+- worktree 移除时 `cleanupForWorktree` 按 id 分页扫描全部无 owner 终端（每页 500、最多 40 页），扫不完报 409 `WORKTREE_REMOVAL_TERMINAL_SCAN_INCOMPLETE`，见 [会话 worktree](../git/worktrees.md)。
 - 用户终端的 shell 环境会恢复被 NarraFork 清空的环境代理变量（`envWithAmbientProxy`）。
 
 - 前端：`useCanOpenTerminals` 复用会话 ui-summary 的 `canWrite`，不为首屏额外读 `/access`；未知/失败不允许打开。`useNarratorTerminals` 只有真实可见、document 可见且写权限已知为 true 才拉实体，key 包含 narrator/user/token，AbortSignal 贯通（单次 512 KiB，30 秒 stale/60 秒 GC）；`useTreeTerminals` 仍为详情树按需读取。ui-summary 与 WS `terminal_count_changed`、普通终端实体列表统一排除 `worktreeResourceId` 非空的资源终端。管理员页 `/settings/terminals`（`routes/settings/terminals.tsx`）管理全部终端与孤儿 dtach socket（`/api/admin/terminals/*`：列表、终止、批量终止、`kill-orphan`、`reattach-orphan`），`/admin/terminals` 只是重定向到它。
