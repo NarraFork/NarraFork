@@ -6,7 +6,10 @@ import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
+import { seedCurrentUser } from "../hooks/useCurrentUser";
+import { runtimeSettingsQueryOptions } from "../hooks/useRuntimeSettings";
 import { api } from "../lib/api";
+import { confirmAuthUser, getAuthSnapshot, setToken } from "../lib/api/client";
 import * as pwa from "../lib/pwa";
 import { type UpdateSourceSettings, updateSettingsKey } from "../lib/update-source";
 import type { PreparedUpdateStatus } from "../lib/update-state";
@@ -24,8 +27,6 @@ const { UpdateBadge } = await import("./UpdateBadge");
 const originalCheck = api.checkUpdate;
 const originalGetSettings = api.getSettings;
 const originalGetRuntimeSettings = api.getRuntimeSettings;
-
-import { runtimeSettingsQueryOptions } from "../hooks/useRuntimeSettings";
 
 const originalUpdateSettings = api.updateSettings;
 const originalUpdateRuntimeSettings = api.updateRuntimeSettings;
@@ -120,11 +121,13 @@ beforeEach(() => {
 		},
 	);
 	install("getComputedStyle", () => ({ getPropertyValue: () => "", overflowY: "visible" }));
+	const storage = new Map<string, string>();
 	install("localStorage", {
-		getItem: (key: string) => (key === "narrafork_token" ? "test-admin" : null),
-		setItem() {},
-		removeItem() {},
+		getItem: (key: string) => storage.get(key) ?? null,
+		setItem: (key: string, value: string) => storage.set(key, value),
+		removeItem: (key: string) => storage.delete(key),
 	});
+	setToken("test-admin");
 	ready = false;
 	api.updateRuntimeSettings = async (input) =>
 		(await api.updateSettings(input)) as unknown as Awaited<
@@ -182,6 +185,12 @@ afterEach(async () => {
 	globals.clear();
 });
 afterAll(() => mock.restore());
+
+function seedAdmin() {
+	const { generation } = getAuthSnapshot();
+	confirmAuthUser(generation, "admin");
+	seedCurrentUser(client, generation, { id: "admin", username: "admin", role: "admin" });
+}
 
 function clearDOMTimers() {
 	for (const timer of pendingTimers) nativeClearTimeout(timer);
@@ -501,7 +510,7 @@ describe("UpdateModal deferred release notes", () => {
 		};
 	}
 	function setup() {
-		client.setQueryData(["auth", "me"], { id: "admin", role: "admin" });
+		seedAdmin();
 		const check = recommendation();
 		api.checkUpdate = async () => check;
 		return check;
@@ -595,7 +604,7 @@ describe("UpdateModal saved source changes", () => {
 		"size",
 	])("same-version prepared artifact never adopts new %s notes", async (changed) => {
 		ready = true;
-		client.setQueryData(["auth", "me"], { id: "admin", username: "admin", role: "admin" });
+		seedAdmin();
 		const recommendation = successfulCheck();
 		const repository = changed === "repository" ? "other/project" : "fork/project";
 		const sourceIdentity = { ...originalIdentity.sourceIdentity, repository };
@@ -637,7 +646,7 @@ describe("UpdateModal saved source changes", () => {
 			instructions: { manual: false, message: "ready" },
 		};
 		api.getUpdateStatus = async () => status;
-		client.setQueryData(["auth", "me"], { id: "admin", username: "admin", role: "admin" });
+		seedAdmin();
 		client.setQueryData(["update-status", "1.1.0"], status);
 		const recommendation = successfulCheck();
 		api.checkUpdate = async () => ({
@@ -683,7 +692,7 @@ describe("UpdateModal saved source changes", () => {
 
 	test("a verified full identity match may show release notes for the prepared artifact", async () => {
 		ready = true;
-		client.setQueryData(["auth", "me"], { id: "admin", username: "admin", role: "admin" });
+		seedAdmin();
 		const recommendation = successfulCheck();
 		api.checkUpdate = async () => ({
 			...recommendation,
@@ -723,7 +732,7 @@ describe("UpdateModal saved source changes", () => {
 	});
 
 	test("reopening reviews the current artifact instead of a previous SSE download result", async () => {
-		client.setQueryData(["auth", "me"], { id: "admin", username: "admin", role: "admin" });
+		seedAdmin();
 		api.checkUpdate = async () => successfulCheck();
 		const previousFetch = globalThis.fetch;
 		install(
@@ -856,7 +865,7 @@ describe("UpdateModal saved source changes", () => {
 
 	test("the badge waits for saved settings, then opens a downloadable recommendation", async () => {
 		client.removeQueries({ queryKey: runtimeSettingsQueryOptions().queryKey });
-		client.setQueryData(["auth", "me"], { id: "admin", username: "admin", role: "admin" });
+		seedAdmin();
 		let resolveSettings!: (value: Awaited<ReturnType<typeof api.getSettings>>) => void;
 		let checkCalls = 0;
 		api.getSettings = () =>
@@ -981,7 +990,7 @@ describe("UpdateModal saved source changes", () => {
 		"reset",
 		"unmount",
 	])("badge download aborts on %s and can retry after remount", async (action) => {
-		client.setQueryData(["auth", "me"], { id: "admin", username: "admin", role: "admin" });
+		seedAdmin();
 		api.checkUpdate = async () => successfulCheck();
 		const { signals, bodies } = installPersistentDownload();
 		await renderBadge();
@@ -1141,7 +1150,7 @@ describe("UpdateModal saved source changes", () => {
 	});
 	test("the header keeps the prepared target when a new source recommends a different version", async () => {
 		ready = true;
-		client.setQueryData(["auth", "me"], { id: "admin", username: "admin", role: "admin" });
+		seedAdmin();
 		client.setQueryData(["update-check"], {
 			updateAvailable: true,
 			currentVersion: "1.0.0",
@@ -1220,7 +1229,7 @@ describe("UpdateModal saved source changes", () => {
 describe("UpdateBadge first-check mirror dialog", () => {
 	async function renderFailedChineseCheck() {
 		await translation.changeLanguage("zh-CN");
-		client.setQueryData(["auth", "me"], { id: "admin", role: "admin" });
+		seedAdmin();
 		const settings = {
 			update: { source: "github" as const, githubRepository: "NarraFork/NarraFork" },
 		};

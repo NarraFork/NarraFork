@@ -14,23 +14,26 @@ import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider } from "react-i18next";
 import type { RecentTab } from "../../hooks/recent-tabs-utils";
 import {
-	RECENT_TABS_QUERY_KEY,
 	type RecentTabsInfiniteData,
+	recentTabsFlatQueryKey,
 	recentTabsSectionQueryKey,
 } from "../../hooks/useRecentTabs";
+import { userPreferencesQueryKey } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
+import { clearToken, confirmAuthUser, setToken } from "../../lib/api/client";
 import { appearanceStore } from "../../lib/appearance-preference-store";
 import * as favicon from "../../lib/favicon";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import { clearNotifiedAttention } from "../../lib/notification";
 import * as sound from "../../lib/notification-sound";
+import { getRecentTabsScope } from "../../lib/recent-tabs-owner";
 import commonEn from "../../locales/en/common.json";
 import { RecentTabDetails } from "./RecentTabDetailCard";
 import { RecentTabsWSProvider } from "./RecentTabs";
 
 const fixtureUser = "recent-tabs-fixture-user";
 const fixtureToken = "recent-tabs-fixture-token";
-const preferencesKey = ["user-preferences", "ui", fixtureUser, fixtureToken] as const;
+const preferencesKey = () => userPreferencesQueryKey("ui");
 const i18n = i18next.createInstance();
 await i18n.init({ lng: "en", resources: { en: { nav: {} } } });
 
@@ -54,12 +57,18 @@ const page = (items: RecentTab[]) => ({
 	hasMore: false,
 	nextCursor: undefined,
 });
-const workKey = recentTabsSectionQueryKey("work");
+let workKey: ReturnType<typeof recentTabsSectionQueryKey>;
+function scope() {
+	const current = getRecentTabsScope();
+	if (!current) throw Error("Missing test scope");
+	return current;
+}
 let root: Root;
 let client: QueryClient;
 let restoreDom: () => void;
 let frame: FrameRequestCallback | undefined;
 let onListEvent: (event: Record<string, unknown>) => void;
+let onAccessEvent: (event: Record<string, unknown>) => void;
 let onConnection: (connected: boolean, isReconnect: boolean) => void;
 let runtimeRequests: RuntimeRequest[];
 let workTabs: RecentTab[];
@@ -114,7 +123,7 @@ beforeEach(() => {
 			browserNotifications++;
 		}
 	}
-	const storage = new Map([["narrafork_token", fixtureToken]]);
+	const storage = new Map<string, string>();
 	const globals = {
 		localStorage: {
 			getItem: (key: string) => storage.get(key) ?? null,
@@ -149,6 +158,15 @@ beforeEach(() => {
 	};
 	frame = undefined;
 	runtimeRequests = [];
+	confirmAuthUser(setToken(fixtureToken), fixtureUser);
+	workKey = recentTabsSectionQueryKey(scope(), "work");
+	spyOn(api, "me").mockResolvedValue({ id: fixtureUser });
+	spyOn(api, "getUIPreferences").mockResolvedValue(
+		{} as Awaited<ReturnType<typeof api.getUIPreferences>>,
+	);
+	spyOn(narratorWSManager, "getConnectionAuthGeneration").mockImplementation(
+		() => scope().authGeneration,
+	);
 	notifyManager.setScheduler(queueMicrotask);
 	spyOn(api, "getRecentTabsRuntime").mockImplementation(
 		(keys, signal) =>
@@ -161,7 +179,8 @@ beforeEach(() => {
 		page(section === "work" ? workTabs : []),
 	);
 	spyOn(narratorWSManager, "addListener").mockImplementation((options, callback) => {
-		if (options.narratorIds === "*") onListEvent = callback;
+		if (options.types?.includes("status_change")) onListEvent = callback;
+		if (options.types?.includes("narrator_access_changed")) onAccessEvent = callback;
 		return { _id: 1 };
 	});
 	spyOn(narratorWSManager, "removeListener").mockImplementation(() => {});
@@ -177,9 +196,8 @@ beforeEach(() => {
 		return () => {};
 	});
 	client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: Infinity } } });
-	client.setQueryData(["auth", "me"], { id: fixtureUser });
-	client.setQueryData(preferencesKey, {});
-	client.setQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("projects"), {
+	client.setQueryData(preferencesKey(), {});
+	client.setQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey(scope(), "projects"), {
 		pages: [page([])],
 		pageParams: [undefined],
 	});
@@ -191,7 +209,58 @@ afterEach(async () => {
 	client.clear();
 	notifyManager.setScheduler((callback) => setTimeout(callback, 0));
 	mock.restore();
+	clearToken();
 	restoreDom();
+});
+
+test("ACL changes hide the old cache, fetch fresh pages, and reject late runtime/RAF updates", async () => {
+	await mount([tab("revoked"), tab("shared")]);
+	const originalScope = scope();
+	const oldListEvent = onListEvent;
+	let lateFrame: FrameRequestCallback | undefined;
+	await act(async () => {
+		oldListEvent({ type: "title_updated", narratorId: "shared", title: "Old queued title" });
+		lateFrame = frame;
+		workTabs = [tab("shared")];
+		onAccessEvent({ type: "narrator_access_changed", narratorId: "revoked" });
+		workKey = recentTabsSectionQueryKey(scope(), "work");
+		expect(client.getQueryData(workKey)).toBeUndefined();
+	});
+	expect(scope().accessGeneration).toBeGreaterThan(originalScope.accessGeneration);
+	expect(api.getRecentTabsPage).toHaveBeenCalledWith("work", expect.anything());
+	expect(cachedTab("revoked")).toBeUndefined();
+	expect(cachedTab("shared")?.title).toBe("shared");
+	await act(async () => {
+		oldListEvent({ type: "title_updated", narratorId: "shared", title: "Old revoked-scope frame" });
+		lateFrame?.(0);
+	});
+	await resolveRuntime(0, [{ key: "narrator:shared", patch: { title: "Old runtime" } }]);
+	expect(cachedTab("shared")?.title).toBe("shared");
+	await resolveRuntime(1, [{ key: "narrator:shared", patch: { teamOnlooker: true } }]);
+	expect(cachedTab("shared")).toMatchObject({ teamOnlooker: true });
+});
+
+test("the current listener rejects frames attributed to an old connection after token rotation", async () => {
+	await mount([tab("a")]);
+	const oldGeneration = scope().authGeneration;
+	await act(async () => {
+		confirmAuthUser(setToken("new-fixture-auth"), fixtureUser);
+		workKey = recentTabsSectionQueryKey(scope(), "work");
+	});
+	const connection = narratorWSManager.getConnectionAuthGeneration as ReturnType<
+		typeof spyOn<typeof narratorWSManager, "getConnectionAuthGeneration">
+	>;
+	connection.mockReturnValue(oldGeneration);
+	await act(async () =>
+		onListEvent({ type: "title_updated", narratorId: "a", title: "Old socket" }),
+	);
+	expect(cachedTab("a")?.title).toBe("a");
+	connection.mockReturnValue(scope().authGeneration);
+	await act(async () => {
+		onListEvent({ type: "title_updated", narratorId: "a", title: "Current socket" });
+		frame?.(0);
+	});
+	expect(cachedTab("a")?.title).toBe("Current socket");
 });
 
 const statusFrame = (revision: number, extra: Record<string, unknown> = {}) => ({
@@ -205,7 +274,7 @@ const statusFrame = (revision: number, extra: Record<string, unknown> = {}) => (
 	...extra,
 });
 function notificationObservers() {
-	client.setQueryData(preferencesKey, {
+	client.setQueryData(preferencesKey(), {
 		notifyOnDone: true,
 		notifyOnWaiting: true,
 		notifyPwaEnabled: true,
@@ -289,10 +358,9 @@ test("display reorder keeps the in-flight runtime read and the new WS subscripti
 	await act(async () => setTabs([tab("b"), tab("a")]));
 	expect(runtimeRequests.map(({ keys }) => keys)).toEqual([["narrator:a", "narrator:b"]]);
 	expect(runtimeRequests[0]?.signal?.aborted).toBe(false);
-	expect(client.getQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY)?.map(({ id }) => id)).toEqual([
-		"b",
-		"a",
-	]);
+	expect(
+		client.getQueryData<RecentTab[]>(recentTabsFlatQueryKey(scope()))?.map(({ id }) => id),
+	).toEqual(["b", "a"]);
 	expect(narratorWSManager.updateSubscription).toHaveBeenLastCalledWith(expect.anything(), [
 		"b",
 		"a",
@@ -462,6 +530,30 @@ test("a team tab follows its coordinator: title and status only, no promotion", 
 	expect(live?.hasDraft).toBeUndefined();
 	// A session tab of the coordinator would be promoted; a pinned team is not a session.
 	expect(move).not.toHaveBeenCalled();
+});
+
+test("team access changes rebuild coordinator fields and discard late approval counts", async () => {
+	const team: RecentTab = {
+		...tab("coord"),
+		type: "team",
+		projectId: "p1",
+		pinned: true,
+	};
+	await mount([team]);
+	const memberScope = scope();
+	await act(async () => {
+		onAccessEvent({ type: "narrator_access_changed", narratorId: "coord", reason: "team_changed" });
+		workKey = recentTabsSectionQueryKey(scope(), "work");
+	});
+	expect(scope().accessGeneration).toBeGreaterThan(memberScope.accessGeneration);
+	expect(runtimeRequests[0]?.signal?.aborted).toBe(true);
+	expect(runtimeRequests[1]?.keys).toEqual(["team:coord"]);
+	await resolveRuntime(0, [{ key: "team:coord", patch: { pendingApprovalCount: 4 } }]);
+	expect((cachedTab("coord") as RecentTab | undefined)?.pendingApprovalCount).toBeUndefined();
+	await resolveRuntime(1, [
+		{ key: "team:coord", patch: { teamOnlooker: true, pendingApprovalCount: null } },
+	]);
+	expect(cachedTab("coord")).toMatchObject({ teamOnlooker: true, pendingApprovalCount: null });
 });
 
 test("a persisted project row gets its card details: runtime key, then a read when the card opens", async () => {

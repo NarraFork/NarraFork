@@ -271,19 +271,27 @@ export function composerPreviewText(
 	attachments: ComposerSegmentAttachments = { images: [], files: [] },
 ): string {
 	const segments = parseComposerSegments(text, attachments);
-	return segments
-		.map((segment, index) => {
-			if (segment.type === "attachment")
-				return `[${(segment.kind === "image" ? attachments.images : attachments.files)[segment.index]}]`;
-			if (segment.type === "quote")
-				return `[❝ ${segment.quote.label}]${index < segments.length - 1 ? " " : ""}`;
-			// The projection puts every quote block on its own line; a preview keeps one line.
-			return segments[index + 1]?.type === "quote"
-				? segment.text.replace(/\n$/u, " ")
-				: segment.text;
-		})
-		.join("")
-		.trimEnd();
+	return (
+		segments
+			.map((segment, index) => {
+				if (segment.type === "attachment")
+					return `[${(segment.kind === "image" ? attachments.images : attachments.files)[segment.index]}]`;
+				if (segment.type === "quote")
+					return `[❝ ${segment.quote.label}]${index < segments.length - 1 ? " " : ""}`;
+				// The projection puts every quote block on its own line; a preview keeps one line.
+				return segments[index + 1]?.type === "quote"
+					? segment.text.replace(/\n$/u, " ")
+					: segment.text;
+			})
+			.join("")
+			// This is a plain-text summary, not an authored-document parser. Keep canonical
+			// identity links readable here without manufacturing reference atoms or authority.
+			.replace(
+				/\[(@(?:\\.|[^[\]\\\n])*)\]\(nf-agent:\/\/open\?id=[A-Za-z0-9_-]{1,128}\)/gu,
+				(_link, label: string) => label.replace(/\\([\\[\]`*_<>])/gu, "$1"),
+			)
+			.trimEnd()
+	);
 }
 
 function shiftReferences(

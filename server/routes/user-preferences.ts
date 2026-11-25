@@ -45,6 +45,7 @@ import {
 	clearRecentTabs,
 	createRecentTabFolder,
 	dissolveRecentTabFolder,
+	filterReadableRecentTabs,
 	getRecentTabState,
 	getRuntimePatches,
 	listLegacyTabs,
@@ -379,8 +380,10 @@ function serializeUserPreferences(
 	pref: typeof userPreferences.$inferSelect,
 	recentTabs?: Record<string, unknown>[],
 ): Record<string, unknown> {
+	// The compatibility shadow is not ACL-filtered storage. Never serialize it directly.
+	const { recentTabs: _shadow, ...preferences } = pref;
 	return {
-		...pref,
+		...preferences,
 		narratorLineHeightV2Percent: lineHeightPercentFromStored(
 			pref.narratorLineHeightV2Percent,
 			pref.narratorLineHeightScalePercent,
@@ -633,13 +636,10 @@ async function writeUIPreferences(userId: string, body: unknown, isAdmin: boolea
 
 userPreferencesRoutes.get("/", async (c) => {
 	const userId = c.get("user").sub;
-	if (c.req.query("view") === "ui")
+	if (c.req.query("view") === "ui") {
 		return c.json(await readUIPreferences(userId, c.req.raw.signal));
-	const legacyTabs = await listLegacyTabs(userId);
-	const recentTabs = await enrichTabs(
-		legacyTabs.map((tab) => ({ ...tab })) as Record<string, unknown>[],
-		userId,
-	);
+	}
+	const legacyTabs = (await listLegacyTabs(userId)).map((tab) => ({ ...tab }));
 	const pref = await readQueryFirst(
 		db.query.userPreferences.findMany({
 			where: eq(userPreferences.userId, userId),
@@ -647,6 +647,8 @@ userPreferencesRoutes.get("/", async (c) => {
 		}),
 		prefsRead(c),
 	);
+	await enrichTabs(legacyTabs, userId);
+	const recentTabs = filterReadableRecentTabs(userId, legacyTabs);
 	if (!pref) {
 		return c.json({
 			...DEFAULTS,
@@ -965,7 +967,7 @@ userPreferencesRoutes.put("/git-identity/folders/:folderId", async (c) => {
 
 // === Recent Tabs endpoints ===
 
-/** Cursor-paginated authoritative recent tabs, split into project/work sections. */
+/** Cursor-paginated work list; `projects` remains an empty compatibility section. */
 userPreferencesRoutes.get("/recent-tabs", async (c) => {
 	const userId = c.get("user").sub;
 	const parsed = recentTabsPageQuerySchema.safeParse({

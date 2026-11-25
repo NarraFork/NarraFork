@@ -10,7 +10,7 @@
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { cleanDb } from "../../../tests/setup";
-import { narrators } from "../../db/schema";
+import { backgroundTasks, narrators } from "../../db/schema";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
 import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
@@ -21,6 +21,7 @@ const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
 const { shouldAutoAllowSendWithinScope } = await import("../narrator-permission");
+const { resolveSubagentTargets } = await import("../agent-communication");
 
 const PARENT = "auto-allow-parent";
 
@@ -142,6 +143,67 @@ describe("subagent → parent Send auto-allow", () => {
 				message: "x",
 			}),
 		).toBe(false);
+	});
+
+	test("alias reassignment approves the agent Send will deliver to", async () => {
+		const now = "2026-09-21T00:00:00.000Z";
+		const later = "2026-09-22T00:00:00.000Z";
+		await db.insert(narrators).values([
+			{
+				id: "owner-current",
+				variant: "subagent:general",
+				type: "subagent",
+				parentNarratorId: PARENT,
+				...delegated(PARENT),
+				permissionMode: "bypassPermissions",
+				title: "Review",
+				titleSlug: "review",
+				aliasSelector: "review",
+				traits: ["subagent-alias:review"],
+				status: "idle",
+				createdAt: now,
+				updatedAt: now,
+			},
+			{
+				id: "owner-former",
+				variant: "subagent:general",
+				type: "subagent",
+				parentNarratorId: PARENT,
+				...delegated(PARENT),
+				permissionMode: "default",
+				title: "Review",
+				titleSlug: "review",
+				aliasSelector: "review-2",
+				traits: ["subagent-alias:review-2"],
+				status: "idle",
+				createdAt: later,
+				updatedAt: later,
+			},
+		]);
+		await db.insert(backgroundTasks).values({
+			id: "former-task",
+			parentNarratorId: PARENT,
+			type: "agent",
+			status: "completed",
+			alias: "review",
+			subagentNarratorId: "owner-former",
+			startedAt: later,
+			createdAt: later,
+			updatedAt: later,
+		});
+		const caller = await child();
+		const parent = await db.query.narrators.findFirst({
+			where: (t, { eq }) => eq(t.id, PARENT),
+		});
+		if (!parent) throw new Error("parent narrator missing");
+		const delivered = await resolveSubagentTargets({ callerNarratorId: CHILD, id: "review" });
+		expect(delivered.map((target) => target.id)).toEqual(["owner-current"]);
+		expect(
+			await shouldAutoAllowSendWithinScope(CHILD, caller, { id: "review", message: "x" }),
+		).toBe(false);
+		expect(
+			await shouldAutoAllowSendWithinScope(PARENT, parent, { id: "review", message: "x" }),
+		).toBe(true);
 	});
 
 	test("missing caller or empty message targets do not auto-allow", async () => {

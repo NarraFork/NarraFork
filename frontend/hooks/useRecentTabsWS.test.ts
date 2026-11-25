@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { clearToken, confirmAuthUser, setToken } from "@frontend/lib/api/client";
 import { narratorWSManager } from "@frontend/lib/narrator-ws-manager";
+import { getRecentTabsScope, type RecentTabsScope } from "@frontend/lib/recent-tabs-owner";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { parseHTML } from "linkedom";
 import { act, createElement } from "react";
@@ -84,6 +86,7 @@ describe("RecentTabs notification intent", () => {
 describe("RecentTabs mounted WS status ordering", () => {
 	let root: Root;
 	let client: QueryClient;
+	let scope: RecentTabsScope;
 	let ids: string[];
 	let updates: Array<{ narratorId: string; event: NarratorListWSEvent }>;
 	let onFrame: (data: Record<string, unknown>) => void;
@@ -94,6 +97,7 @@ describe("RecentTabs mounted WS status ordering", () => {
 	const globals = new Map<string, PropertyDescriptor | undefined>();
 	function Harness() {
 		useRecentTabsWS(
+			scope,
 			ids,
 			(narratorId, event) => updates.push({ narratorId, event }),
 			undefined,
@@ -136,7 +140,13 @@ describe("RecentTabs mounted WS status ordering", () => {
 
 	beforeEach(() => {
 		const { window } = parseHTML("<html><body></body></html>");
+		const storage = new Map<string, string>();
 		for (const [key, value] of Object.entries({
+			localStorage: {
+				getItem: (key: string) => storage.get(key) ?? null,
+				setItem: (key: string, value: string) => storage.set(key, value),
+				removeItem: (key: string) => storage.delete(key),
+			},
 			window,
 			document: window.document,
 			navigator: window.navigator,
@@ -145,6 +155,10 @@ describe("RecentTabs mounted WS status ordering", () => {
 			globals.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
 			Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
 		}
+		confirmAuthUser(setToken("recent-tabs-ws-fixture"), "test-user");
+		const confirmed = getRecentTabsScope();
+		if (!confirmed) throw new Error("Missing test session scope");
+		scope = confirmed;
 		ids = ["n1"];
 		updates = [];
 		reconnects = 0;
@@ -154,6 +168,7 @@ describe("RecentTabs mounted WS status ordering", () => {
 				if (options.narratorIds === "*") onFrame = callback;
 				return { _id: options.narratorIds === "*" ? 1 : 2 };
 			}),
+			spyOn(narratorWSManager, "getConnectionAuthGeneration").mockReturnValue(scope.authGeneration),
 			spyOn(narratorWSManager, "removeListener").mockImplementation(() => {}),
 			spyOn(narratorWSManager, "subscribe").mockImplementation((narratorIds) => ({
 				_id: 1,
@@ -178,6 +193,7 @@ describe("RecentTabs mounted WS status ordering", () => {
 		await act(async () => root.unmount());
 		client.clear();
 		for (const restore of restores.splice(0)) restore();
+		clearToken();
 		for (const [key, descriptor] of globals) {
 			if (descriptor) Object.defineProperty(globalThis, key, descriptor);
 			else Reflect.deleteProperty(globalThis, key);

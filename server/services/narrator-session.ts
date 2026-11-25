@@ -1424,6 +1424,8 @@ export async function buildSystemPrompt(
 		| "taskSection"
 		| "contextParts"
 		| "outlinePlan"
+		| "communicationSourceNarratorId"
+		| "communicationSignal"
 	>,
 ): Promise<import("./narrator-prompt").BuildPromptResult> {
 	return buildEffectiveSystemPrompt({
@@ -4429,6 +4431,7 @@ export interface UserMessageAdmissionOptions {
 	/** Set only by authenticated human input endpoints; absent for agent/plugin traffic. */
 	humanReplyContext?: ReplyContext;
 	composerDocument?: import("@shared/composer-document").ComposerDocument;
+	submission?: import("./agent-runtime/user-submission").UserSubmission;
 	images?: ImageRef[];
 	media?: MediaRef[];
 	locale?: Locale;
@@ -4449,7 +4452,7 @@ export interface UserMessageAdmissionOptions {
 }
 
 export type UserMessageAdmissionResult =
-	| { buffered: true; id: string; bufferedAt: string }
+	| { buffered: true; id: string; bufferedAt: string; duplicate?: boolean }
 	| { buffered: false; userMsg: typeof narratorMessages.$inferSelect };
 
 /** Execute a materialized control under its own execution epoch, never the old loop's. */
@@ -4513,8 +4516,7 @@ export async function acceptUserMessage(
 			const oldController = activeNarrators.get(narratorId)?.abortController;
 			const oldRecovery = plannedUpdateRecoveryControls.get(narratorId);
 			const busy = isNarratorRuntimeBusy(narratorId) || isLoopRunning(narratorId);
-			const inputOwner =
-				!busy && !options.queueOnly ? tryClaimExecution(narratorId, "tool-replay") : undefined;
+			let inputOwner: ReturnType<typeof tryClaimExecution> | undefined;
 			try {
 				const accepted = await enqueueBufferedMessage(
 					narratorId,
@@ -4533,17 +4535,24 @@ export async function acceptUserMessage(
 					options.composerDocument,
 					options.media,
 					humanReplyContext,
+					options.submission,
 				);
 				if (!accepted.ok) throw new ValidationError("Message queue is full");
 				const queued = {
 					buffered: true as const,
 					id: accepted.id,
 					bufferedAt: accepted.bufferedAt,
+					...(accepted.duplicate ? { duplicate: true } : {}),
 				};
+				// A replay is only its old receipt: never claim, interrupt or wake again.
+				if (accepted.duplicate) return queued;
 				// From here onward the mailbox owns the payload. Dispatch/notification failure
 				// must not make HTTP callers retry the same input or discard its attachments.
 				let claimed: RuntimeMailboxRow | undefined;
 				try {
+					// Only new accepted work can claim execution; duplicates have no runtime effects.
+					inputOwner =
+						!busy && !options.queueOnly ? tryClaimExecution(narratorId, "tool-replay") : undefined;
 					if (queueMode === "interrupt" && busy) {
 						const ownerUnchanged = getExecutionOwner(narratorId) === oldOwner;
 						const controllerUnchanged =
@@ -4640,7 +4649,7 @@ export async function acceptUserMessage(
 			}
 		},
 	);
-	if (result.buffered) {
+	if (result.buffered && !result.duplicate) {
 		// Outside start admission: waking takes the same lock, so awaiting it inside
 		// would deadlock. The wake rechecks compactLocks too: compaction may have
 		// finished while an attachment was staging, before there was anything to drain.

@@ -10,6 +10,8 @@ anchors:
   - server/lib/fs-scan-worker/__tests__/client-failures.test.ts
   - server/db/worker-read-adapter.ts
   - server/lib/compiled-worker.ts
+  - server/lib/attachment-digest.ts
+  - server/lib/attachment-digest-worker.ts
   - server/lib/db-reader-readiness.ts
   - server/lib/db-reader-startup.ts
   - server/lib/compiled-worker.guard.test.ts
@@ -34,7 +36,7 @@ keywords:
   - inlineFallback
   - Worker 隔离不可降级
 status: draft
-verified_at: 4d59774711a51a9ac966794090c8b3a04d549048
+verified_at: fac3988333435e3fc3b5a4a6ace226c72ce14745
 ---
 # Worker 隔离
 
@@ -53,6 +55,7 @@ verified_at: 4d59774711a51a9ac966794090c8b3a04d549048
 - 守卫测试 `tests/worker-main-thread-fallback.guard.test.ts` 用 AST 扫描 `server/frontend/shared/scripts` 等目录（跳过测试文件）：已退役的 `inlineFallback` 等标识不得回到生产代码；Worker 客户端不得 import 或调用重活实现；ORM Worker 错误路径不得执行原查询；大纲 Worker 的 catch 里不得调用 `inlineValues`；脑图冷缓存只用占位而不在 UI 线程测量；Monaco 在暴露编辑器服务前装上严格失败边界；并检查 CLAUDE.md 里该规则的措辞仍在。
 - 其他使用 `WorkerPool` 的地方：gen-ui 编译、git 行统计、大纲文本编辑、编辑器文档任务、前缀快照、历史重写、token 重算等（`grep WorkerPool server`）。
 - 其他隔离形态：只读完整性探测与快照构建用独立子进程，在 `server/index.ts` 中于 `./main` 之前分流；启动状态页用 Worker 线程。
+- 发送附件的稳定 SHA256 由 `attachment-digest-worker.ts` 计算，客户端限制并发、排队、字节、超时和取消；上传 stage 保存摘要以便已消费后的提交对账。Worker 创建、就绪、执行、退出、禁用或超时失败均明确失败，不在 HTTP 主线程重算；入口也登记到编译清单并有真实编译产物测试。
 
 ## 从哪读起
 - `server/lib/worker-runtime/pool.ts`、`queue.ts`、`lifecycle.ts`：通用运行时。

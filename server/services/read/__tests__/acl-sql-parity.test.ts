@@ -1,25 +1,8 @@
 /**
- * `acl-sql.ts` must stay a faithful copy of the ACL modules' SQL, not a second opinion.
- *
- * WHY A COPY EXISTS AT ALL
- * ------------------------
- * `services/project-acl.ts` and `services/narrator-acl.ts` own these rules, but both import
- * `server/db` — the SQLite bootstrap, with migrations, the instance lock and the clean-shutdown
- * marker. The PostgreSQL read adapter must not reach that (`server/db/backend/__tests__/
- * port-purity.test.ts` documents what happens when a backend-neutral module does), so it cannot
- * import either module to reuse their text.
- *
- * WHY THIS IS A TEST AND NOT A COMMENT
- * ------------------------------------
- * A drifted copy of an access rule produces the two worst symptoms available: rows that appear
- * in a list and 404 on open, or rows that should never have appeared. Neither throws, and
- * neither is visible in the diff that caused it — someone edits `narrator-acl.ts`, every SQLite
- * test still passes, and PostgreSQL quietly enforces last month's rules.
- *
- * The comparison is whitespace-insensitive and case-insensitive because indentation and
- * `EXISTS`/`exists` are formatting, while table names, capability lists, `domain_kind is null`
- * and the placement of the grant test inside the gate branch are semantics. Any of those
- * changing on one side and not the other fails here.
+ * Keep the neutral and SQLite ACL entry points aligned on SQL text and bindings. The
+ * PostgreSQL read adapter cannot import the SQLite bootstrap used by the JS ACL verdicts.
+ * Some SQL fragments are shared, so this test checks composition rather than semantics;
+ * `acl-communication-parity.test.ts` runs SQL and compares it with the JS verdicts.
  */
 
 import { describe, expect, test } from "bun:test";

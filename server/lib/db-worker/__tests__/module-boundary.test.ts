@@ -60,6 +60,7 @@ const APPROVED_WORKER_MODULES = new Set([
 	"shared/narrator-blocks/retention.ts",
 	"server/lib/agent/file-reference-projection.ts",
 	"shared/composer-document.ts",
+	"shared/agent-reference.ts",
 	"shared/media-attachments.ts",
 	"shared/pretext-layout/tool-io-projection.ts",
 	"shared/gen-ui-tool-policy.ts",
@@ -117,6 +118,17 @@ describe("db read worker module boundary", () => {
 			"server/lib/db-worker/read-budget.ts",
 		]);
 	});
+	test("agent-reference codec remains initialization-free for composer projections", async () => {
+		const entry = join(ROOT, "shared/agent-reference.ts");
+		const build = await Bun.build({ entrypoints: [entry], target: "bun", metafile: true });
+		expect(build.success).toBe(true);
+		if (!build.metafile)
+			throw new Error("Agent reference codec did not produce a dependency graph");
+		expect(Object.keys(build.metafile.inputs).map(modulePath)).toEqual([
+			"shared/agent-reference.ts",
+		]);
+	});
+
 	test("compiled reader executes the embedded worker outside the source tree", async () => {
 		mkdirSync(join(ROOT, ".narrafork"), { recursive: true });
 		const source = mkdtempSync(join(ROOT, ".narrafork/reader-compile-"));

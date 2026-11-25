@@ -17,9 +17,11 @@ import { NarratorPanelSkeleton } from "../../components/narrator/NarratorPanelSk
 import { serializeSeedEnvelope } from "../../components/narrator/panels/layout-envelope";
 import { twoNarratorWorkspaceSeed } from "../../components/narrator/workspace/dockview-layout";
 import { readOpeningLod } from "../../hooks/useNarratorLod";
+import { getAuthSnapshot } from "../../lib/api/client";
 import { lazyWithRetry } from "../../lib/lazy-with-retry";
 import { narratorLoadingMetrics } from "../../lib/narrator-loading-metrics";
 import { queryClient } from "../../lib/query-client";
+import { getRecentTabsScope, useRecentTabsScope } from "../../lib/recent-tabs-owner";
 import { clearShikiTokenCache } from "../../lib/shiki-token-cache";
 
 // Lazy-loaded heavy panels — not needed for first paint (mobile drawers)
@@ -65,7 +67,9 @@ import {
 	isNarratorSubject,
 	onPanelDragEnd,
 	onPanelDragMove,
+	PANEL_DROP_PRIORITY,
 	type PanelDragState,
+	registerPanelDropTarget,
 } from "../../lib/panel-drag";
 import {
 	APP_SHELL_CONTENT_HEIGHT,
@@ -210,9 +214,24 @@ function NarratorDetailPage() {
 	);
 	const { data: userPrefs, isLoading: userPrefsLoading } = useUserPreferences();
 
-	// First visit: register the tab on the server (once per narratorId)
+	// First visit: register after this credential has a verified identity.
+	const visitGeneration = useRecentTabsScope()?.authGeneration;
+	const visitOrigin = useMemo(
+		() => ({ narratorId, generation: getAuthSnapshot().generation }),
+		[narratorId],
+	);
 	useEffect(() => {
-		if (!narrator) return;
+		// A mounted route can retain narrator data across a credential replacement.
+		// Such a result is not a new visit under the replacement credential.
+		const recentTabsScope = getRecentTabsScope();
+		if (
+			!narrator ||
+			!recentTabsScope ||
+			visitOrigin.narratorId !== narratorId ||
+			visitOrigin.generation !== visitGeneration ||
+			recentTabsScope.authGeneration !== visitGeneration
+		)
+			return;
 		// An archived session must not be re-registered: archiving the one being viewed
 		// flips its status here, and re-running this effect would resurrect the tab that
 		// the archive just removed. Interacting auto-unarchives it, which re-registers.
@@ -227,25 +246,33 @@ function NarratorDetailPage() {
 			) {
 				return;
 			}
-			addSubagentRecentTab({
-				id: narratorId,
-				parentNarratorId,
-				title: narratorTitle,
-				cwd: narratorCwd,
-				status: narratorStatus,
-				isScheduled,
-			});
+			addSubagentRecentTab(
+				{
+					id: narratorId,
+					parentNarratorId,
+					title: narratorTitle,
+					cwd: narratorCwd,
+					status: narratorStatus,
+					isScheduled,
+				},
+				recentTabsScope,
+			);
 			return;
 		}
-		void recordRecentTabVisit({
-			type: "narrator",
-			id: narratorId,
-			title: narratorTitle || "New conversation",
-			subtitle: narratorCwd,
-			status: narratorStatus,
-			isScheduled,
-		});
+		void recordRecentTabVisit(
+			{
+				type: "narrator",
+				id: narratorId,
+				title: narratorTitle || "New conversation",
+				subtitle: narratorCwd,
+				status: narratorStatus,
+				isScheduled,
+			},
+			recentTabsScope,
+		);
 	}, [
+		visitOrigin,
+		visitGeneration,
 		narratorId,
 		narrator,
 		narratorTitle,
@@ -439,36 +466,53 @@ function NarratorDetailPage() {
 			}
 		});
 
-		const unsubEnd = onPanelDragEnd((final: PanelDragState | null) => {
-			const side = dropSideRef.current;
+		const unsubEnd = onPanelDragEnd(() => {
 			dropSideRef.current = null;
 			setDropSide(null);
-			if (!final || !side || final.id === narratorId || !isNarratorSubject(final)) return;
+		});
+		const unsubDrop = registerPanelDropTarget({
+			id: `narrator-page:${narratorId}`,
+			priority: PANEL_DROP_PRIORITY.page,
+			hitTest: (final) => {
+				if (final.id === narratorId || !isNarratorSubject(final)) return null;
+				const rect = pageBoxRef.current?.getBoundingClientRect();
+				if (
+					!rect ||
+					final.x < rect.left ||
+					final.x > rect.right ||
+					final.y < rect.top ||
+					final.y > rect.bottom
+				)
+					return null;
+				return computeSide(rect, final.x, final.y);
+			},
+			onDrop: (final, side) => {
+				// Create a workspace seeded with two narrator panels. The dropped panel
+				// sits on the drop side; the current narrator takes the other half. We
+				// persist an api-free seed envelope (not a legacy split-tree) that the
+				// DockviewWorkspace materialises on mount.
+				const dropFirst = side === "left" || side === "top";
+				const direction: Direction = side === "left" || side === "right" ? "right" : "below";
+				const [firstId, secondId] = dropFirst ? [final.id, narratorId] : [narratorId, final.id];
+				const seed = twoNarratorWorkspaceSeed(firstId, secondId, direction);
 
-			// Create a workspace seeded with two narrator panels. The dropped panel
-			// sits on the drop side; the current narrator takes the other half. We
-			// persist an api-free seed envelope (not a legacy split-tree) that the
-			// DockviewWorkspace materialises on mount.
-			const dropFirst = side === "left" || side === "top";
-			const direction: Direction = side === "left" || side === "right" ? "right" : "below";
-			const [firstId, secondId] = dropFirst ? [final.id, narratorId] : [narratorId, final.id];
-			const seed = twoNarratorWorkspaceSeed(firstId, secondId, direction);
-
-			api
-				.createWorkspace({ tree: serializeSeedEnvelope(seed) })
-				.then((ws) => {
-					// Workspaces are reached from the header switcher, not the sidebar.
-					void queryClient.invalidateQueries({ queryKey: ["workspaces"] });
-					navigate({
-						to: "/narrators/workspace/$workspaceId",
-						params: { workspaceId: ws.id },
-					});
-				})
-				.catch(() => {});
+				api
+					.createWorkspace({ tree: serializeSeedEnvelope(seed) })
+					.then((ws) => {
+						// Workspaces are reached from the header switcher, not the sidebar.
+						void queryClient.invalidateQueries({ queryKey: ["workspaces"] });
+						navigate({
+							to: "/narrators/workspace/$workspaceId",
+							params: { workspaceId: ws.id },
+						});
+					})
+					.catch(() => {});
+			},
 		});
 
 		return () => {
 			unsubMove();
+			unsubDrop();
 			unsubEnd();
 		};
 	}, [narratorId, navigate]);

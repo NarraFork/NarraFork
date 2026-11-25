@@ -77,6 +77,7 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 
 	mock.module("../../db", () => ({
 		activeDatabaseBackend: "sqlite",
+		postgresRuntime: null,
 		sqlite,
 		databaseMaintenance: createSqliteMaintenance(() => sqlite),
 		db: new Proxy(fixtureDb, {

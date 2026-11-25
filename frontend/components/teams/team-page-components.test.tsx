@@ -5,7 +5,7 @@
  * list's groups and rows, its starting and wrap-up states, read-only 「等成员处理」; the activity
  * words each event; every `teams` string exists in both languages.
  */
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import type {
 	TeamActivityPage,
@@ -16,13 +16,21 @@ import type {
 	TeamSummary,
 } from "@shared/project-teams";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import {
+	createMemoryHistory,
+	createRootRoute,
+	createRouter,
+	RouterContextProvider,
+} from "@tanstack/react-router";
 import { createInstance } from "i18next";
 import type { ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { I18nextProvider } from "react-i18next";
-import { RECENT_TABS_QUERY_KEY } from "../../hooks/useRecentTabs";
 import { teamKeys } from "../../hooks/useTeams";
+import * as recentTabsOwner from "../../lib/recent-tabs-owner";
+import enNarrator from "../../locales/en/narrator.json";
 import en from "../../locales/en/projects.json";
+import zhNarrator from "../../locales/zh-CN/narrator.json";
 import zh from "../../locales/zh-CN/projects.json";
 import { ProjectTeamsList } from "./ProjectTeamsList";
 import { ActivityLine, TeamActivity } from "./TeamActivity";
@@ -33,12 +41,21 @@ import { TeamReadOnlyStart, TeamStart } from "./TeamStart";
 import { TeamWorkList } from "./TeamWorkList";
 import { attentionEntries, statusSentence, teamPageMode } from "./team-page-model";
 
+const router = createRouter({ routeTree: createRootRoute(), history: createMemoryHistory() });
+const pinScope = { userId: "team-test-user", authGeneration: 1, accessGeneration: 0 };
+let scopeSpy: ReturnType<typeof spyOn<typeof recentTabsOwner, "useRecentTabsScope">>;
+beforeAll(() => {
+	// Static markup intentionally has no real auth scope; supply one to exercise pin placement.
+	scopeSpy = spyOn(recentTabsOwner, "useRecentTabsScope").mockReturnValue(pinScope);
+});
+
 const previousStorage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
 Object.defineProperty(globalThis, "localStorage", {
 	configurable: true,
 	value: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
 });
 afterAll(() => {
+	scopeSpy.mockRestore();
 	if (previousStorage) Object.defineProperty(globalThis, "localStorage", previousStorage);
 	else Reflect.deleteProperty(globalThis, "localStorage");
 });
@@ -47,7 +64,10 @@ async function i18nFor(lng: "en" | "zh-CN") {
 	const i18n = createInstance();
 	await i18n.init({
 		lng,
-		resources: { en: { projects: en }, "zh-CN": { projects: zh } },
+		resources: {
+			en: { projects: en, narrator: enNarrator },
+			"zh-CN": { projects: zh, narrator: zhNarrator },
+		},
 		defaultNS: "projects",
 		interpolation: { escapeValue: false },
 	});
@@ -59,7 +79,9 @@ async function render(node: ReactNode, client = new QueryClient(), lng: "en" | "
 	return renderToStaticMarkup(
 		<I18nextProvider i18n={i18n}>
 			<QueryClientProvider client={client}>
-				<MantineProvider>{node}</MantineProvider>
+				<MantineProvider>
+					<RouterContextProvider router={router}>{node}</RouterContextProvider>
+				</MantineProvider>
 			</QueryClientProvider>
 		</I18nextProvider>,
 	);
@@ -184,7 +206,7 @@ describe("header", () => {
 
 	test("pin reads the sidebar's pin", async () => {
 		const pinned = new QueryClient();
-		pinned.setQueryData(RECENT_TABS_QUERY_KEY, [
+		pinned.setQueryData(recentTabsOwner.recentTabsFlatQueryKey(pinScope), [
 			{ type: "team", id: "lead", title: "Release crew", lastVisitedAt: 1, pinned: true },
 		]);
 		const html = await render(

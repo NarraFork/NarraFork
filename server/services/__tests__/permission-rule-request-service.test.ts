@@ -91,8 +91,8 @@ mock.module("../../db", () => ({
 	db,
 	sqlite,
 	activeDatabaseBackend: "sqlite",
-	databaseMaintenance: createSqliteMaintenance(() => sqlite),
 	postgresRuntime: null,
+	databaseMaintenance: createSqliteMaintenance(() => sqlite),
 }));
 const wsModule = { ...(await import("../../websocket/narrator-ws")) };
 mock.module("../../websocket/narrator-ws", () => ({ ...wsModule, broadcastToNarrator: () => {} }));

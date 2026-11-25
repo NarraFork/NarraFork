@@ -2,7 +2,6 @@ import type { CustomizableNavId } from "@shared/nav-layout";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useMemo } from "react";
 import type { api } from "../lib/api";
-import { getToken } from "../lib/api/client";
 import {
 	DEFAULT_NAV_ENTRIES,
 	mergeNavLayout,
@@ -13,7 +12,11 @@ import {
 	toPersistedNavLayout,
 } from "./nav-layout";
 import { useOutlineEnabled } from "./useOutlineEnabled";
-import { useUpdateUserPreferences, useUserPreferences } from "./useUserPreferences";
+import {
+	isUserPreferencesScopeCurrent,
+	useUpdateUserPreferences,
+	useUserPreferences,
+} from "./useUserPreferences";
 
 /**
  * The persisted layout is a single flat ordered list of ids. One special id —
@@ -69,6 +72,7 @@ export function useNavLayout() {
 
 	const saveLayout = useCallback(
 		(nextEntries: NavLayoutEntry[]) => {
+			if (!isUserPreferencesScopeCurrent(queryKey)) return;
 			const persisted = toPersistedNavLayout(
 				restoreWithheldNavEntries(nextEntries, storedEntries, hidden),
 			);
@@ -84,7 +88,7 @@ export function useNavLayout() {
 				{ navLayout: persisted },
 				{
 					onError: () => {
-						if (previous && getToken() === queryKey[3]) {
+						if (previous && isUserPreferencesScopeCurrent(queryKey)) {
 							queryClient.setQueryData(queryKey, previous);
 						}
 					},

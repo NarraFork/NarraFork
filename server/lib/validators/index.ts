@@ -139,6 +139,7 @@ export {
 	browserInteractSchema,
 	bufferEditLeaseSchema,
 	bufferQueueModeSchema,
+	clientSubmissionIdSchema,
 	codexBrowserCallbackSchema,
 	codexFingerprintSchema,
 	codexTierOrderSchema,
