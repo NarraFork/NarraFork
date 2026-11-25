@@ -352,7 +352,8 @@ function scheduleExecutorCleanupRetry(deviceId: string, attempt = 0): void {
 if (hotOnce("narrafork:terminal-executor-session-cleanup")) {
 	eventBus.on("device:status", (event) => {
 		if (event.status === "online") reconcileWithRetry(event.deviceId);
-		else {
+		// A late offline from a replaced connection must not cancel the live one's retries.
+		else if (!isDeviceOnline(event.deviceId)) {
 			const scheduled = cleanupRetries.get(event.deviceId);
 			if (scheduled) clearTimeout(scheduled.timer);
 			cleanupRetries.delete(event.deviceId);
