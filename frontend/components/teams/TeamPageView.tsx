@@ -196,6 +196,7 @@ export function TeamPageView({
 						entries={entries}
 						phone={layout === "tabs"}
 						teamId={teamId}
+						projectId={projectId}
 						base={base}
 						stats={stats.stats}
 						more={approvals.data?.more ?? false}

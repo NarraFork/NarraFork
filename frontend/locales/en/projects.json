@@ -228,7 +228,10 @@
 			"work_exclusive_released": "Released an exclusive path",
 			"work_returned": "Returned to the worker",
 			"work_dependencies_changed": "Dependencies changed",
-			"work_unblocked": "Can start now"
+			"work_unblocked": "Can start now",
+			"work_merge_requested": "Asked to merge",
+			"work_merge_failed": "Merge did not happen",
+			"work_merge_prepared": "Merge prepared"
 		},
 		"eventNote": {
 			"text": "{{text}}",
@@ -250,7 +253,16 @@
 			"dependencies_one": "Depends on {{count}} item",
 			"dependencies_other": "Depends on {{count}} items",
 			"dependenciesCleared": "No dependencies left",
-			"unblocked": "Every item it waits for is merged"
+			"unblocked": "Every item it waits for is merged",
+			"mergeRequested": "Merge into the base",
+			"mergeFastForward": "Fast-forward the prepared merge",
+			"mergeConflict_one": "{{count}} conflicting file",
+			"mergeConflict_other": "{{count}} conflicting files",
+			"mergeConflictMore": "{{count}}+ conflicting files",
+			"mergePrepared": "The base is checked out at {{path}}",
+			"mergedLocal": "Merged from the team page",
+			"mergedFastForward": "Fast-forwarded where the base is checked out",
+			"mergedAncestry": "Its branch was found in the base"
 		},
 		"top": {
 			"pauseAll": "Pause all",
@@ -341,7 +353,7 @@
 				"viewChanges": "View changes",
 				"return": "Return",
 				"merge": "Merge",
-				"mergeDisabled": "NarraFork does not merge for you yet: merge the branch into {{base}} in the repository and this item is marked merged on its own.",
+				"mergeDisabled": "Merge it from its card or drawer once it is ready.",
 				"files": "{{count}} files",
 				"reviewPassed": "Review passed · round {{round}}",
 				"notReviewed": "Not reviewed",
@@ -482,7 +494,7 @@
 				"verdictReturned": "Returned",
 				"timelineTitle": "This item's timeline",
 				"eventsMore": "Older entries are not listed",
-				"barNote": "NarraFork doesn't merge for you: once the branch is merged into {{base}}, this item is marked merged.",
+				"barNote": "Return sends the item back to its worker. Once it is reviewed and marked ready, it can be merged into {{base}}.",
 				"return": "Return",
 				"merge": "Merge into {{base}}",
 				"returnTitle": "Return to the worker",
@@ -522,6 +534,14 @@
 					"TEAM_PROJECT_NOT_GIT": "The project's directory is not a git repository, so no base branch can be checked.",
 					"TEAM_PROJECT_CHANGED": "The project's repository changed meanwhile. Try again.",
 					"TEAM_ARCHIVED": "The team is archived; restore it before changing its settings."
+				},
+				"workStart": {
+					"label": "New work items start from",
+					"description": "Where each new work item's branch begins, and what syncing the base brings in. origin/<base> is fetched into the remote-tracking branch only; your local branch and working tree stay as they are.",
+					"default": "Project default ({{mode}})",
+					"defaultChecking": "Project default (checking the repository's origin…)",
+					"remote": "origin/{{base}}",
+					"local": "Local {{base}}"
 				}
 			},
 			"marks": {
@@ -548,7 +568,76 @@
 				"fullSession": "Full session"
 			},
 			"readOnlyStart": "Nobody has given the coordinator a goal yet.",
-			"coordinator": "Coordinator"
+			"coordinator": "Coordinator",
+			"merge": {
+				"merge": "Merge into {{base}}",
+				"merging": "Merging…",
+				"fastForwarding": "Fast-forwarding…",
+				"prepareAgain": "Prepare again",
+				"barNote": "NarraFork makes a merge commit without touching anyone's working tree. Where {{base}} is checked out, the merge waits for you to fast-forward it.",
+				"failedGeneric": "The merge did not happen.",
+				"copy": "Copy the command",
+				"copied": "Copied",
+				"fastForward": "Fast-forward in that directory",
+				"commandHint": "Or run this there yourself; the item is marked merged once its branch is in the base.",
+				"confirmTitle": "Fast-forward {{base}} there?",
+				"confirmText": "This moves {{base}} to the prepared merge in {{path}} and updates these files in that working tree. Your own uncommitted changes stay; if one is in the way, git refuses and nothing changes. Hooks do not run.",
+				"terminalsWarning_one": "A NarraFork terminal is open in that directory.",
+				"terminalsWarning_other": "{{count}} NarraFork terminals are open in that directory.",
+				"confirmFilesMore": "More files change than are listed here.",
+				"confirmButton": "Fast-forward",
+				"conflictTitle_one": "Conflicts with {{base}} in {{count}} file",
+				"conflictTitle_other": "Conflicts with {{base}} in {{count}} files",
+				"conflictsMore": "More files conflict than are listed here.",
+				"conflictHint": "Nothing was changed. The worker brings the base into its branch and resolves them; the coordinator was told.",
+				"returnToWorker": "Return to the worker",
+				"conflictReason": "Merging into {{base}} conflicts in these files. Bring {{base}} into the branch, resolve the conflicts and run the checks:\n{{files}}",
+				"conflictReasonMore": "Merging into {{base}} conflicts in these files (and more). Bring {{base}} into the branch, resolve the conflicts and run the checks:\n{{files}}",
+				"prepared": "The merge is ready. {{base}} is checked out at {{path}}; NarraFork does not change the files there.",
+				"openPrepared": "Fast-forward…",
+				"outcome": {
+					"conflict": "Conflicts with {{base}}",
+					"failed": "Merge did not happen",
+					"prepared": "Merge prepared"
+				},
+				"disabled": {
+					"not_ready": "Only a ready item can be merged.",
+					"team_archived": "The team is archived.",
+					"merging": "A merge of this item is running.",
+					"worker_running": "Its worker is running; merge once it has stopped.",
+					"checking": "Checking the repository's origin…",
+					"github_pending": "Origin is on GitHub: these items will merge through a pull request, which is coming soon.",
+					"base_remote": "The base {{base}} is a remote-tracking branch; only a local branch can be merged into here.",
+					"git_too_old": "git 2.38 or newer is needed to merge without touching a working tree."
+				},
+				"blocker": {
+					"stale": "{{base}} moved since the merge was prepared: prepare it again.",
+					"not_on_base": "That directory is no longer on {{base}}.",
+					"operation_in_progress": "A merge, rebase, cherry-pick or bisect is in progress there.",
+					"index_locked": "git is busy there (index.lock).",
+					"sessions_running": "{{count}} session(s) are running there.",
+					"local_config": "That checkout has filters or a hooks directory of its own: run the command yourself.",
+					"unreadable": "That directory could not be checked."
+				},
+				"errors": {
+					"TEAM_WORK_ITEM_NOT_READY": "Only a ready item can be merged; it changed meanwhile.",
+					"TEAM_WORK_ITEM_MERGING": "A merge of this item is already running.",
+					"TEAM_WORK_ITEM_WORKER_RUNNING": "Its worker is running; merge once it has stopped.",
+					"TEAM_MERGE_GITHUB_PENDING": "Origin is on GitHub: these items will merge through a pull request, which is coming soon.",
+					"TEAM_MERGE_BASE_REMOTE": "The base is a remote-tracking branch; only a local branch can be merged into here.",
+					"TEAM_MERGE_NOT_PREPARED": "There is no prepared merge any more: merge again.",
+					"TEAM_ARCHIVED": "The team is archived. Unarchive it first.",
+					"TEAM_MERGE_BASE_MOVED": "The base kept moving while the merge was computed. Try again.",
+					"TEAM_WORK_ITEM_HEAD_MOVED": "The branch moved after the item was marked ready. Have the coordinator review it and mark it ready again.",
+					"TEAM_MERGE_GIT_TOO_OLD": "git 2.38 or newer is needed to merge without touching a working tree.",
+					"TEAM_MERGE_STALE": "The base moved since the merge was prepared: prepare it again.",
+					"TEAM_MERGE_CHECKOUT_BLOCKED": "That directory cannot be fast-forwarded now: run the command yourself, or try again.",
+					"TEAM_MERGE_CHECKOUT_BUSY": "Sessions are running in that directory. Try again once they stop.",
+					"TEAM_MERGE_FAST_FORWARD_REFUSED": "git refused to fast-forward there because of local changes; nothing changed.",
+					"TEAM_MERGE_IDENTITY_UNKNOWN": "No git identity to commit the merge with: set yours in Settings, or the host's git user.name and user.email.",
+					"GIT_WORKSPACE_BUSY": "git is busy in that directory. Try again shortly."
+				}
+			}
 		}
 	},
 	"page": {
@@ -664,6 +753,14 @@
 		"pathCancel": "Cancel",
 		"pathConfirmTitle": "Change the project directory?",
 		"pathConfirm": "The project directory changes from {{from}} to {{to}}. Sessions are re-assigned by their working directory: sessions under the new directory join this project, and sessions under the old one that are not under the new one leave it.",
-		"pathConfirmButton": "Change and re-assign"
+		"pathConfirmButton": "Change and re-assign",
+		"teamDefaults": {
+			"title": "Team defaults",
+			"baseBranch": "Base branch",
+			"baseBranchHint": "New teams merge their work into this branch. Each team can change its own.",
+			"workStart": "New work items start from",
+			"workStartHint": "Each team can change this in its settings.",
+			"auto": "Automatic: origin when it is on GitHub, otherwise the local branch"
+		}
 	}
 }

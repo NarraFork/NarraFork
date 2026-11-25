@@ -9,8 +9,10 @@
  *     detail read (per card, with the caller's access to that session);
  *   - a plan: its title, 看计划 (the plan text in a dialog) and 批准;
  *   - a rule request: answered in its session (open it);
- *   - a ready item: +/-, files, the review verdict, branch → base, 查看改动 / 退回 / 合并. The
- *     server never merges, so 合并 is shown disabled and says how the item becomes merged.
+ *   - a ready item: +/-, files, the review verdict, branch → base, 查看改动 / 退回 / 合并 (M:
+ *     `TeamMerge.tsx`'s button — 正在合并…, disabled with its reason — and the newest outcome as a
+ *     badge: conflicts (退回 opens the reason prefilled), or a prepared merge (去快进 opens the
+ *     drawer, where the fast-forward and the command are)).
  *
  * More than {@link ATTENTION_SHOWN}: the rest folds into 「还有 N 条」. Hovering a card highlights
  * its work item in the list. On a phone the cards scroll sideways.
@@ -31,7 +33,6 @@ import {
 	Text,
 	TextInput,
 	ThemeIcon,
-	Tooltip,
 	UnstyledButton,
 } from "@mantine/core";
 import type {
@@ -43,7 +44,6 @@ import {
 	IconCheck,
 	IconChevronDown,
 	IconGitBranch,
-	IconGitMerge,
 	IconHelpCircle,
 	IconListCheck,
 	IconShieldQuestion,
@@ -52,6 +52,7 @@ import {
 import { lazy, type ReactNode, Suspense, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { AskUserQuestionBanner, coerceQuestions } from "../narrator/question/AskUserQuestionBanner";
+import { MergeButton } from "./TeamMerge";
 import {
 	type AttentionEntry,
 	type AttentionSource,
@@ -98,6 +99,8 @@ const INLINE_OPTIONS = 4;
 
 export interface AttentionActions {
 	teamId: string;
+	/** The project the cards belong to (the merge button's API path). */
+	projectId?: string;
 	/** The base the team's branches merge into (for the merge card). */
 	base: string;
 	stats: Record<string, TeamWorkDiffStat | null> | undefined;
@@ -673,6 +676,8 @@ function MergeCard({
 	const { item } = entry;
 	const stat = actions.stats?.[item.id];
 	const base = item.baseRef ?? entry.base ?? actions.base;
+	const mergeTeamId = entry.source?.kind === "team" ? entry.source.teamId : actions.teamId;
+	const outcome = item.merge?.phase ? null : (item.merge?.outcome ?? null);
 	return (
 		<CardFrame
 			entry={entry}
@@ -722,6 +727,18 @@ function MergeCard({
 								</Text>
 							</Group>
 						)}
+						{outcome && (
+							<Badge
+								size="sm"
+								variant="light"
+								color={outcome === "prepared" ? "blue" : "red"}
+								tt="none"
+								data-testid="team-merge-outcome"
+								data-outcome={outcome}
+							>
+								{t(`teams.page.merge.outcome.${outcome}`, { base })}
+							</Badge>
+						)}
 					</Group>
 				</>
 			}
@@ -744,23 +761,26 @@ function MergeCard({
 					>
 						{t("teams.page.attention.return")}
 					</Button>
-					<Tooltip
-						label={t("teams.page.attention.mergeDisabled", { base })}
-						withinPortal
-						multiline
-						maw={300}
-					>
-						<span>
-							<Button
-								size="xs"
-								disabled
-								leftSection={<IconGitMerge size={14} aria-hidden />}
-								data-testid="team-merge"
-							>
-								{t("teams.page.attention.merge")}
-							</Button>
-						</span>
-					</Tooltip>
+					{outcome === "prepared" && (
+						<Button
+							size="xs"
+							variant="light"
+							onClick={() => actions.onOpenItem(item.id)}
+							data-testid="team-merge-open-prepared"
+						>
+							{t("teams.page.merge.openPrepared")}
+						</Button>
+					)}
+					{actions.projectId && (
+						<MergeButton
+							projectId={actions.projectId}
+							teamId={mergeTeamId}
+							itemId={item.id}
+							merge={item.merge}
+							base={base}
+							size="xs"
+						/>
+					)}
 				</>
 			}
 		/>

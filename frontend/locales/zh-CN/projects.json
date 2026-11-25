@@ -228,7 +228,10 @@
 			"work_exclusive_released": "释放独占路径",
 			"work_returned": "退回给工作者",
 			"work_dependencies_changed": "修改依赖",
-			"work_unblocked": "可以开始了"
+			"work_unblocked": "可以开始了",
+			"work_merge_requested": "请求合并",
+			"work_merge_failed": "合并未完成",
+			"work_merge_prepared": "合并已准备"
 		},
 		"eventNote": {
 			"text": "{{text}}",
@@ -250,7 +253,16 @@
 			"dependencies_one": "依赖 {{count}} 项",
 			"dependencies_other": "依赖 {{count}} 项",
 			"dependenciesCleared": "不再依赖其他工作项",
-			"unblocked": "依赖的工作项都已合并"
+			"unblocked": "依赖的工作项都已合并",
+			"mergeRequested": "合并到基线",
+			"mergeFastForward": "快进准备好的合并",
+			"mergeConflict_one": "{{count}} 个文件冲突",
+			"mergeConflict_other": "{{count}} 个文件冲突",
+			"mergeConflictMore": "{{count}} 个以上文件冲突",
+			"mergePrepared": "基线检出在 {{path}}",
+			"mergedLocal": "在团队页合并",
+			"mergedFastForward": "在基线检出的目录中快进",
+			"mergedAncestry": "分支已在基线中"
 		},
 		"top": {
 			"pauseAll": "全部暂停",
@@ -341,7 +353,7 @@
 				"viewChanges": "查看改动",
 				"return": "退回",
 				"merge": "合并",
-				"mergeDisabled": "NarraFork 暂不替你合并：在仓库里把分支合并到 {{base}} 后，这一项会自动标为已合并。",
+				"mergeDisabled": "标为可合并后，可以在卡片或抽屉里合并。",
 				"files": "{{count}} 个文件",
 				"reviewPassed": "评审通过 · 第 {{round}} 轮",
 				"notReviewed": "未评审",
@@ -482,7 +494,7 @@
 				"verdictReturned": "退回",
 				"timelineTitle": "这一项的时间线",
 				"eventsMore": "更早的记录没有列出",
-				"barNote": "服务端不替你合并：分支合并到 {{base}} 后，这一项会自动标为已合并",
+				"barNote": "退回会把这一项交回工作者。评审通过、标为可合并后，才能合并到 {{base}}。",
 				"return": "退回",
 				"merge": "合并到 {{base}}",
 				"returnTitle": "退回给工作者",
@@ -522,6 +534,14 @@
 					"TEAM_PROJECT_NOT_GIT": "项目目录不是 git 仓库，无法检查基线分支。",
 					"TEAM_PROJECT_CHANGED": "项目仓库刚刚有变化，请再试一次。",
 					"TEAM_ARCHIVED": "团队已归档，先恢复再改设置。"
+				},
+				"workStart": {
+					"label": "新工作项的起点",
+					"description": "新工作项的分支从哪里开出，同步基线时合进什么。origin/<基线> 只拉取到远程跟踪分支，不动你的本地分支和工作区。",
+					"default": "项目默认（{{mode}}）",
+					"defaultChecking": "项目默认（正在检查仓库的 origin…）",
+					"remote": "origin/{{base}}",
+					"local": "本地 {{base}}"
 				}
 			},
 			"marks": {
@@ -548,7 +568,76 @@
 				"fullSession": "完整会话"
 			},
 			"readOnlyStart": "还没有人给协调者布置任务。",
-			"coordinator": "协调者"
+			"coordinator": "协调者",
+			"merge": {
+				"merge": "合并到 {{base}}",
+				"merging": "正在合并…",
+				"fastForwarding": "正在快进…",
+				"prepareAgain": "重新准备",
+				"barNote": "NarraFork 生成合并提交，不碰任何人的工作区；{{base}} 被检出的地方，合并结果等你去快进。",
+				"failedGeneric": "合并没有完成。",
+				"copy": "复制命令",
+				"copied": "已复制",
+				"fastForward": "在该目录中快进",
+				"commandHint": "也可以自己在那里运行这条命令；分支进入基线后，这一项会自动标为已合并。",
+				"confirmTitle": "在那里快进 {{base}}？",
+				"confirmText": "这会在 {{path}} 把 {{base}} 快进到准备好的合并结果，并更新那个工作区里的以下文件。你自己未提交的改动会保留；如果有冲突，git 会拒绝，什么都不会改。不运行任何 hook。",
+				"terminalsWarning_one": "那个目录里开着 {{count}} 个 NarraFork 终端。",
+				"terminalsWarning_other": "那个目录里开着 {{count}} 个 NarraFork 终端。",
+				"confirmFilesMore": "改动的文件比这里列出的多。",
+				"confirmButton": "快进",
+				"conflictTitle_one": "与 {{base}} 有冲突：{{count}} 个文件",
+				"conflictTitle_other": "与 {{base}} 有冲突：{{count}} 个文件",
+				"conflictsMore": "冲突的文件比这里列出的多。",
+				"conflictHint": "什么都没有改动。由工作者把基线合进分支并解决冲突；协调者已经收到说明。",
+				"returnToWorker": "退回给工作者",
+				"conflictReason": "合并到 {{base}} 时以下文件有冲突。请把 {{base}} 合进分支，解决冲突并跑检查：\n{{files}}",
+				"conflictReasonMore": "合并到 {{base}} 时以下文件（以及更多文件）有冲突。请把 {{base}} 合进分支，解决冲突并跑检查：\n{{files}}",
+				"prepared": "合并结果已准备好。{{base}} 检出在 {{path}}，NarraFork 不改动那里的文件。",
+				"openPrepared": "去快进…",
+				"outcome": {
+					"conflict": "与 {{base}} 有冲突",
+					"failed": "合并未完成",
+					"prepared": "合并已准备"
+				},
+				"disabled": {
+					"not_ready": "只有可以合并的工作项能合并。",
+					"team_archived": "团队已归档。",
+					"merging": "这一项正在合并。",
+					"worker_running": "它的工作者还在运行，停下后再合并。",
+					"checking": "正在检查仓库的 origin…",
+					"github_pending": "GitHub PR 流程即将提供：origin 在 GitHub 上的项目将通过 PR 合并。",
+					"base_remote": "基线 {{base}} 是远程跟踪分支，只能合并到本地分支。",
+					"git_too_old": "需要 git 2.38 或更新版本，才能不碰工作区地合并。"
+				},
+				"blocker": {
+					"stale": "准备合并后 {{base}} 又动了：请重新准备。",
+					"not_on_base": "那个目录已经不在 {{base}} 上。",
+					"operation_in_progress": "那里有进行中的合并、rebase、cherry-pick 或 bisect。",
+					"index_locked": "那里的 git 正忙（index.lock）。",
+					"sessions_running": "那里有 {{count}} 个会话在运行。",
+					"local_config": "那个检出有自己的过滤器或 hooks 目录：请自己运行命令。",
+					"unreadable": "无法检查那个目录。"
+				},
+				"errors": {
+					"TEAM_WORK_ITEM_NOT_READY": "只有可以合并的工作项能合并；它刚刚变了。",
+					"TEAM_WORK_ITEM_MERGING": "这一项已经在合并了。",
+					"TEAM_WORK_ITEM_WORKER_RUNNING": "它的工作者还在运行，停下后再合并。",
+					"TEAM_MERGE_GITHUB_PENDING": "GitHub PR 流程即将提供：origin 在 GitHub 上的项目将通过 PR 合并。",
+					"TEAM_MERGE_BASE_REMOTE": "基线是远程跟踪分支，只能合并到本地分支。",
+					"TEAM_MERGE_NOT_PREPARED": "准备好的合并已经不在了，请重新合并。",
+					"TEAM_ARCHIVED": "团队已归档，先恢复团队。",
+					"TEAM_MERGE_BASE_MOVED": "计算合并期间基线一直在动，请再试一次。",
+					"TEAM_WORK_ITEM_HEAD_MOVED": "标为可合并之后分支又动了。请让协调者重新评审并标为可合并。",
+					"TEAM_MERGE_GIT_TOO_OLD": "需要 git 2.38 或更新版本，才能不碰工作区地合并。",
+					"TEAM_MERGE_STALE": "准备合并后基线又动了：请重新准备。",
+					"TEAM_MERGE_CHECKOUT_BLOCKED": "现在不能在那个目录中快进：请自己运行命令，或稍后再试。",
+					"TEAM_MERGE_CHECKOUT_BUSY": "那个目录里有会话在运行，等它们停下再试。",
+					"TEAM_MERGE_FAST_FORWARD_REFUSED": "那里的本地改动挡住了快进，git 拒绝了，什么都没有改。",
+					"TEAM_MERGE_IDENTITY_UNKNOWN": "没有可用来提交合并的 git 身份：请在设置里配置你的身份，或配置主机的 git user.name 和 user.email。",
+					"GIT_WORKSPACE_BUSY": "那个目录里的 git 正忙，请稍后再试。"
+				}
+			}
 		}
 	},
 	"page": {
@@ -661,6 +750,14 @@
 		"pathCancel": "取消",
 		"pathConfirmTitle": "更改项目目录？",
 		"pathConfirm": "项目目录将从 {{from}} 改为 {{to}}。会话会按工作目录重新归属：新目录下的会话归入本项目，原目录下、不在新目录里的会话离开本项目。",
-		"pathConfirmButton": "更改并重新归属"
+		"pathConfirmButton": "更改并重新归属",
+		"teamDefaults": {
+			"title": "团队默认设置",
+			"baseBranch": "基线分支",
+			"baseBranchHint": "新团队把工作合并到这个分支。每个团队可以自己改。",
+			"workStart": "新工作项的起点",
+			"workStartHint": "每个团队可以在团队设置里自己改。",
+			"auto": "自动：origin 在 GitHub 上时从 origin 开始，否则从本地分支"
+		}
 	}
 }

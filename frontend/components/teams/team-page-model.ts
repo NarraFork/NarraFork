@@ -20,6 +20,7 @@ import {
 	type TeamPendingApproval,
 	type TeamSummary,
 	type TeamWorkDependencyRef,
+	type TeamWorkMergeSummary,
 } from "@shared/project-teams";
 
 /**
@@ -164,6 +165,34 @@ export function eventNote(
 		}
 		case "work.unblocked":
 			return { key: "unblocked", values: {} };
+		case "work.merge_requested":
+			return {
+				key: detail.job === "fast_forward" ? "mergeFastForward" : "mergeRequested",
+				values: {},
+			};
+		case "work.merge_failed": {
+			if (detail.code === "conflict") {
+				const count = Array.isArray(detail.conflicts) ? detail.conflicts.length : 0;
+				return {
+					key: detail.more === true ? "mergeConflictMore" : "mergeConflict",
+					values: { count },
+				};
+			}
+			const message = text(detail.message, 280);
+			return message ? { key: "text", values: { text: message } } : null;
+		}
+		case "work.merge_prepared": {
+			const path = text(detail.checkedOutAt, 300);
+			return path ? { key: "mergePrepared", values: { path } } : null;
+		}
+		case "work.merged":
+			if (detail.detectedBy === "local_merge")
+				return {
+					key: detail.fastForwarded === "checkout" ? "mergedFastForward" : "mergedLocal",
+					values: {},
+				};
+			if (detail.detectedBy === "ancestry") return { key: "mergedAncestry", values: {} };
+			return null;
 		case "approval.allowed":
 		case "approval.denied":
 		case "question.answered":
@@ -814,4 +843,88 @@ export function isCoordinator(
 	teamId: string,
 ): boolean {
 	return actor.actorKind === "agent" && actor.actorId === teamId;
+}
+
+// ── M: merging a ready item ─────────────────────────────────────────────────
+
+/** What the merge control of the drawer's bottom bar and the 等你处理 card shows. */
+export interface MergeControlView {
+	/** The button's label key under `teams.page.merge.`. */
+	label: "merge" | "merging" | "fastForwarding" | "prepareAgain";
+	/** A job runs: the button shows its progress. */
+	busy: boolean;
+	enabled: boolean;
+	/** Why the button is disabled (an i18n key), or null. */
+	disabledKey: string | null;
+	/** The newest outcome to show beside it. */
+	panel: TeamWorkMergeSummary["outcome"];
+}
+
+/** The merge control for an item's merge state; null when the item carries none (not ready). */
+export function mergeControl(merge: TeamWorkMergeSummary | undefined): MergeControlView | null {
+	if (!merge) return null;
+	if (merge.phase !== null || merge.job !== null)
+		return {
+			label: merge.job === "fast_forward" ? "fastForwarding" : "merging",
+			busy: true,
+			enabled: false,
+			disabledKey: null,
+			panel: null,
+		};
+	return {
+		label: merge.outcome === "prepared" ? "prepareAgain" : "merge",
+		busy: false,
+		enabled: merge.canMerge,
+		disabledKey: merge.disabledReason ? `teams.page.merge.disabled.${merge.disabledReason}` : null,
+		panel: merge.outcome,
+	};
+}
+
+/** Refusals of a merge request the page words itself (others show the server's text). */
+const MERGE_ERROR_CODES = new Set([
+	"TEAM_WORK_ITEM_NOT_READY",
+	"TEAM_WORK_ITEM_MERGING",
+	"TEAM_WORK_ITEM_WORKER_RUNNING",
+	"TEAM_MERGE_GITHUB_PENDING",
+	"TEAM_MERGE_BASE_REMOTE",
+	"TEAM_MERGE_NOT_PREPARED",
+	"TEAM_ARCHIVED",
+	"TEAM_MERGE_BASE_MOVED",
+	"TEAM_WORK_ITEM_HEAD_MOVED",
+	"TEAM_MERGE_GIT_TOO_OLD",
+	"TEAM_MERGE_STALE",
+	"TEAM_MERGE_CHECKOUT_BLOCKED",
+	"TEAM_MERGE_CHECKOUT_BUSY",
+	"TEAM_MERGE_FAST_FORWARD_REFUSED",
+	"TEAM_MERGE_IDENTITY_UNKNOWN",
+	"GIT_WORKSPACE_BUSY",
+]);
+
+/** The i18n key of a merge refusal or failure code, or null for the server's own words. */
+export function mergeErrorKey(code: string | null | undefined): string | null {
+	return code && MERGE_ERROR_CODES.has(code) ? `teams.page.merge.errors.${code}` : null;
+}
+
+/** The code of a failed merge request (an API error), if any. */
+export function mergeRequestCode(error: unknown): string | null {
+	const code = (error as { data?: { code?: unknown } } | null)?.data?.code;
+	return typeof code === "string" ? code : null;
+}
+
+/** Most conflicting files a prefilled 退回 reason names. */
+export const MERGE_CONFLICT_REASON_FILES = 20;
+
+/**
+ * The files a prefilled 退回 reason names after a conflict: at most
+ * {@link MERGE_CONFLICT_REASON_FILES}, one per line, and whether more were left out.
+ */
+export function conflictReasonFiles(
+	conflicts: readonly string[] | undefined,
+	more: boolean | undefined,
+): { files: string; more: boolean } {
+	const list = (conflicts ?? []).slice(0, MERGE_CONFLICT_REASON_FILES);
+	return {
+		files: list.map((file) => `- ${file}`).join("\n"),
+		more: more === true || (conflicts?.length ?? 0) > list.length,
+	};
 }

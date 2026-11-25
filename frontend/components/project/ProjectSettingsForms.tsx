@@ -9,7 +9,8 @@
  *  - `ProjectRuleList`: one permission rule list of `chapterSettings` (directory or command white /
  *    black list), saved on every add, edit or removal — only that key is sent, the server merges;
  *    a failed save puts the stored list back and shows the error;
- *  - `ProjectCommandsEditor`: the project's slash commands.
+ *  - `ProjectCommandsEditor`: the project's slash commands;
+ *  - `ProjectTeamDefaults`: the base branch and work start new teams of the project start from.
  */
 import {
 	Alert,
@@ -17,6 +18,7 @@ import {
 	Group,
 	Loader,
 	Modal,
+	Select,
 	Stack,
 	Text,
 	Textarea,
@@ -398,6 +400,91 @@ export function ProjectCommandsEditor({
 					update.mutate({ id: String(project.id), data: { chapterSettings: { commands: next } } })
 				}
 				ns="projects"
+			/>
+			<SaveState pending={update.isPending} error={update.error} />
+		</Stack>
+	);
+}
+
+type WorkStartDefault = "auto" | "remote" | "local";
+
+/** The project's default work start from its `chapterSettings.teams` (`auto` when unset). */
+export function projectWorkStartDefault(project: ApiEntity | undefined): WorkStartDefault {
+	const teams = projectChapterSettings(project).teams as { workStart?: unknown } | undefined;
+	return teams?.workStart === "remote" || teams?.workStart === "local" ? teams.workStart : "auto";
+}
+
+/**
+ * The defaults new teams of this project start from (W): the base branch (`defaultBranch`, saved
+ * when the field is left) and where their work items start (`chapterSettings.teams.workStart`:
+ * from `origin/<base>`, the local base, or by hosting — origin on GitHub starts from origin).
+ * Only the `teams` key is sent, with the project's other team settings kept.
+ */
+export function ProjectTeamDefaults({
+	project,
+	canManage,
+}: {
+	project: ApiEntity;
+	canManage: boolean;
+}) {
+	const { t } = useTranslation("projects");
+	const update = useUpdateProject();
+	const projectId = String(project.id);
+	const storedBranch = String(project.defaultBranch ?? "main");
+	const [branch, setBranch] = useState<string | null>(null);
+	const shownBranch = branch ?? storedBranch;
+	const branchInvalid = !!shownBranch.trim() && !/^[^\s~^:?*[\\]+$/.test(shownBranch.trim());
+	const saveBranch = () => {
+		if (branch === null) return;
+		const next = branch.trim();
+		if (!next || next === storedBranch || branchInvalid) {
+			if (next === storedBranch) setBranch(null);
+			return;
+		}
+		update.mutate(
+			{ id: projectId, data: { defaultBranch: next } },
+			{ onSuccess: () => setBranch(null) },
+		);
+	};
+	const workStart = projectWorkStartDefault(project);
+	const saveWorkStart = (value: WorkStartDefault) => {
+		const teams = { ...((projectChapterSettings(project).teams as object | undefined) ?? {}) };
+		const next: Record<string, unknown> = { ...teams };
+		if (value === "auto") delete next.workStart;
+		else next.workStart = value;
+		update.mutate({ id: projectId, data: { chapterSettings: { teams: next } } });
+	};
+	const base = shownBranch.trim() || "main";
+	return (
+		<Stack gap="sm" data-testid="project-team-defaults">
+			<Text size="sm" fw={600}>
+				{t("settingsPage.teamDefaults.title")}
+			</Text>
+			<TextInput
+				label={t("settingsPage.teamDefaults.baseBranch")}
+				description={t("settingsPage.teamDefaults.baseBranchHint")}
+				value={shownBranch}
+				disabled={!canManage}
+				error={branchInvalid ? t("teams.create.baseBranchInvalid") : undefined}
+				onChange={(event) => setBranch(event.currentTarget.value)}
+				onBlur={saveBranch}
+				data-testid="project-default-branch"
+			/>
+			<Select
+				label={t("settingsPage.teamDefaults.workStart")}
+				description={t("settingsPage.teamDefaults.workStartHint")}
+				value={workStart}
+				allowDeselect={false}
+				disabled={!canManage}
+				onChange={(value) => {
+					if (value === "auto" || value === "remote" || value === "local") saveWorkStart(value);
+				}}
+				data={[
+					{ value: "auto", label: t("settingsPage.teamDefaults.auto") },
+					{ value: "remote", label: t("teams.page.settings.workStart.remote", { base }) },
+					{ value: "local", label: t("teams.page.settings.workStart.local", { base }) },
+				]}
+				data-testid="project-work-start"
 			/>
 			<SaveState pending={update.isPending} error={update.error} />
 		</Stack>

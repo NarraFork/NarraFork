@@ -44,7 +44,12 @@ import { useProject } from "../../hooks/useProjects";
 import { TraitLayerEditor } from "../settings/TraitLayerEditor";
 import { ProjectAccessPanel } from "./ProjectAccessPanel";
 import { ProjectRoutinesList } from "./ProjectRoutinesList";
-import { ProjectBasicsForm, ProjectCommandsEditor, ProjectRuleList } from "./ProjectSettingsForms";
+import {
+	ProjectBasicsForm,
+	ProjectCommandsEditor,
+	ProjectRuleList,
+	ProjectTeamDefaults,
+} from "./ProjectSettingsForms";
 import { ProjectSkillsManager } from "./ProjectSkillsManager";
 
 /** The page's groups, in order (anchors `#settings-<key>`). */
@@ -294,6 +299,7 @@ export function ProjectSettingsPage({ projectId }: { projectId: string }) {
 						>
 							<Stack gap="lg">
 								<ProjectBasicsForm project={data} canManage={canManage} />
+								<ProjectTeamDefaults project={data} canManage={canManage} />
 								<ProjectRuleList project={data} ruleKey="whitelistDirs" canManage={canManage} />
 								<ProjectRuleList project={data} ruleKey="blacklistDirs" canManage={canManage} />
 							</Stack>
