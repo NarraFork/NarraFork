@@ -26,6 +26,7 @@ import {
 import { resetOverlapStateForTests, runChangedPathsPass } from "../team-overlap";
 import {
 	compareRefFor,
+	fetchOnce,
 	itemStartedFrom,
 	peekWorkStartDefault,
 	projectWorkStartOf,
@@ -203,6 +204,26 @@ function createdDetail(itemId: string) {
 		.map((row) => row.detail)
 		.find((detail) => detail && "startFrom" in detail);
 }
+
+describe("origin fetches", () => {
+	test("concurrent fetches of one repository and base share one run", async () => {
+		let runs = 0;
+		const slow = async () => {
+			runs++;
+			await Bun.sleep(30);
+			return { ok: true as const };
+		};
+		const results = await Promise.all([
+			fetchOnce("/repo", "main", slow),
+			fetchOnce("/repo", "main", slow),
+			fetchOnce("/repo", "develop", slow),
+		]);
+		expect(results).toEqual([{ ok: true }, { ok: true }, { ok: true }]);
+		expect(runs).toBe(2);
+		await fetchOnce("/repo", "main", slow);
+		expect(runs).toBe(3);
+	});
+});
 
 describe("where work starts", () => {
 	beforeAll(async () => {

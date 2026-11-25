@@ -23,6 +23,7 @@ import { and, eq } from "drizzle-orm";
 import { db } from "../../db";
 import { projects, teamWorkEvents } from "../../db/schema";
 import { AppError } from "../../lib/errors";
+import { hotSafe } from "../../lib/hot-safe";
 import { logger } from "../../lib/logger";
 import { teamRepoGit } from "./team-git-write";
 import { defaultWorkStart, hostingOf, peekHosting } from "./team-hosting";
@@ -83,6 +84,28 @@ export async function resolveWorkStart(input: {
 	return defaultWorkStart(await hostingOf(facts.repo));
 }
 
+type FetchResult = { ok: true } | { ok: false; message: string };
+
+/** Origin fetches running now, per repository and base: concurrent starts and syncs share one. */
+const fetches = hotSafe(
+	"narrafork.teams.originFetches",
+	() => new Map<string, Promise<FetchResult>>(),
+);
+
+/** Run `fetch` unless the same repository and base are being fetched already; then share it. */
+export function fetchOnce(
+	repo: string,
+	base: string,
+	fetch: () => Promise<FetchResult>,
+): Promise<FetchResult> {
+	const key = `${repo}\0${base}`;
+	const running = fetches.get(key);
+	if (running) return running;
+	const started = fetch().finally(() => fetches.delete(key));
+	fetches.set(key, started);
+	return started;
+}
+
 /** Where one item starts or syncs from. */
 export interface WorkStartPoint {
 	mode: TeamWorkStart;
@@ -118,10 +141,12 @@ export async function workStartPoint(input: {
 	const git = teamRepoGit(repo);
 	const label = `origin/${input.baseBranch}`;
 	const ref = `refs/remotes/origin/${input.baseBranch}`;
-	const fetch = await git.fetchBaseFromOrigin(input.baseBranch).catch((error: unknown) => ({
-		ok: false as const,
-		message: error instanceof Error ? error.message : String(error),
-	}));
+	const fetch = await fetchOnce(repo, input.baseBranch, () =>
+		git.fetchBaseFromOrigin(input.baseBranch).catch((error: unknown) => ({
+			ok: false as const,
+			message: error instanceof Error ? error.message : String(error),
+		})),
+	);
 	if (!fetch.ok)
 		logger.warn("Team base could not be fetched from origin", {
 			projectId: input.projectId,
