@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { db, sqlite } from "../../../../db";
-import { narratorWorktreeResources, teamWorkItems } from "../../../../db/schema";
+import { narratorWorktreeResources, teamWorkEvents, teamWorkItems } from "../../../../db/schema";
 import { generateId } from "../../../../lib/id";
 import { safeSpawn } from "../../../../lib/spawn";
 import type { ToolContext } from "../../types";
@@ -347,13 +347,35 @@ describe("Team tool", () => {
 		const review = JSON.parse(
 			(
 				await teamTool.execute(
-					{ action: "work.review", item: item.id, verdict: "blocker", findings: 3 },
+					{
+						action: "work.review",
+						item: item.id,
+						verdict: "blocker",
+						findings: 3,
+						summary: "Missing the day-boundary case.",
+					},
 					ctx(),
 				)
 			).output,
 		);
 		expect(review.item).toMatchObject({ state: "in_progress", reviewRounds: 1 });
 		expect(review.nextAction).toContain('Send({ id: "');
+		// The findings text rides on the round's event, for the drawer.
+		const reviewed = db
+			.select({ kind: teamWorkEvents.kind, detail: teamWorkEvents.detailJson })
+			.from(teamWorkEvents)
+			.where(eq(teamWorkEvents.workItemId, item.id))
+			.all()
+			.find((row) => row.kind === "work.review");
+		expect(reviewed?.detail).toMatchObject({
+			findings: 3,
+			summary: "Missing the day-boundary case.",
+		});
+		const tooLong = await teamTool.execute(
+			{ action: "work.review", item: item.id, verdict: "clear", summary: "x".repeat(1001) },
+			ctx(),
+		);
+		expect(tooLong.output).toContain("INVALID_ARGUMENT");
 		const missing = await teamTool.execute({ action: "work.ready" }, ctx());
 		expect(missing.output).toContain("work.ready requires item");
 		const listed = JSON.parse((await teamTool.execute({ action: "work.list" }, ctx())).output);

@@ -220,6 +220,23 @@ export function text(selector: string): string | null {
 	return document.querySelector(selector)?.textContent ?? null;
 }
 
+/** The text of every element the selector matches, in document order. */
+export function texts(selector: string): string[] {
+	return [...document.querySelectorAll(selector)].map((element) => element.textContent ?? "");
+}
+
+/** Whether the first element ends at or above where the second starts. */
+export function above(first: string, second: string): boolean {
+	const a = document.querySelector(first)?.getBoundingClientRect();
+	const b = document.querySelector(second)?.getBoundingClientRect();
+	return !!a && !!b && a.height > 0 && a.bottom <= b.top + 0.5;
+}
+
+/** How tall an element is drawn (0 when missing). */
+export function height(selector: string): number {
+	return document.querySelector(selector)?.getBoundingClientRect().height ?? 0;
+}
+
 /** The value of a text field. */
 export function value(selector: string): string | null {
 	return document.querySelector<HTMLInputElement | HTMLTextAreaElement>(selector)?.value ?? null;
