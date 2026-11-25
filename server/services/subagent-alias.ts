@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, ne, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import { type ReadQueryOptions, readQuery, readQueryFirst } from "../db/worker-read";
 import { AsyncMutex, narratorTraitsLock } from "../lib/async-mutex";
 import {
@@ -472,15 +472,27 @@ async function takenAmongCandidates(
 		executionPolicy: "worker-required" as const,
 		maxRows: Math.max(candidates.length, 1),
 	};
-	const selectorValues = (column: typeof narrators.id | typeof narrators.titleSlug) =>
+	// Distinct values, not rows. Many addressable members can share one title slug;
+	// a row limit of `candidates.length` would hide another candidate those duplicates
+	// pushed past the limit.
+	const selectorValues = (
+		column: typeof narrators.id | typeof narrators.titleSlug | typeof narrators.aliasSelector,
+	) =>
 		readQuery(
 			db
-				.select({ value: column })
+				.selectDistinct({ value: column })
 				.from(narrators)
 				.where(and(scope, inArray(column, [...candidates])))
 				.limit(candidates.length),
 			readOptions,
 		);
+	const notThisOwner = and(
+		ne(backgroundTasks.id, excludeSubagentId),
+		or(
+			isNull(backgroundTasks.subagentNarratorId),
+			ne(backgroundTasks.subagentNarratorId, excludeSubagentId),
+		),
+	);
 	const taskColumns = {
 		id: backgroundTasks.id,
 		alias: backgroundTasks.alias,
@@ -494,13 +506,14 @@ async function takenAmongCandidates(
 		selectorValues(narrators.aliasSelector),
 		readQuery(
 			db
-				.select(taskColumns)
+				.selectDistinct({ alias: backgroundTasks.alias })
 				.from(backgroundTasks)
 				.where(
 					and(
 						eq(backgroundTasks.parentNarratorId, parentNarratorId),
 						inArray(backgroundTasks.alias, [...candidates]),
 						inArray(backgroundTasks.status, [...LIVE_TASK_STATUSES]),
+						notThisOwner,
 					),
 				)
 				.limit(candidates.length),
@@ -514,6 +527,7 @@ async function takenAmongCandidates(
 					and(
 						eq(backgroundTasks.parentNarratorId, parentNarratorId),
 						inArray(backgroundTasks.id, [...candidates]),
+						notThisOwner,
 					),
 				)
 				.limit(candidates.length),
@@ -529,6 +543,7 @@ async function takenAmongCandidates(
 							and(
 								eq(backgroundTasks.parentNarratorId, parentNarratorId),
 								eq(backgroundTasks.alias, candidate),
+								notThisOwner,
 							),
 						)
 						.orderBy(desc(backgroundTasks.createdAt))
@@ -541,8 +556,11 @@ async function takenAmongCandidates(
 	for (const row of [...ids, ...slugs, ...aliases]) {
 		if (row.value && wanted.has(row.value)) taken.add(row.value);
 	}
+	for (const row of liveTasks) {
+		if (row.alias && wanted.has(row.alias)) taken.add(row.alias);
+	}
 	const tasks = new Map<string, AliasTaskRow>();
-	for (const task of [...liveTasks, ...tasksById, ...latestTasks]) {
+	for (const task of [...tasksById, ...latestTasks]) {
 		if (task) tasks.set(task.id, task);
 	}
 	const ownerIds = [
@@ -776,6 +794,30 @@ export async function registerAndPersistSubagentAlias(
 		setRegistryAlias(reg, subagentId, alias);
 		return { alias, conflicted: conflicted || alias !== base };
 	});
+}
+
+/**
+ * After an archived subagent becomes addressable again, give it a free alias
+ * when a sibling already holds the one it had. The live owner keeps that name.
+ * Primary sessions have no parent and are left unchanged.
+ */
+export async function reconcileRestoredSubagentAlias(narratorId: string): Promise<void> {
+	const { db, narrators } = await loadAliasDb();
+	const row = await readQueryFirst(
+		db
+			.select({
+				id: narrators.id,
+				parentNarratorId: narrators.parentNarratorId,
+				status: narrators.status,
+			})
+			.from(narrators)
+			.where(eq(narrators.id, narratorId))
+			.limit(1),
+		{ executionPolicy: "worker-required", maxRows: 1 },
+	);
+	if (!row?.parentNarratorId) return;
+	if (!(ADDRESSABLE_NARRATOR_STATUSES as readonly string[]).includes(row.status)) return;
+	await registerAndPersistSubagentAlias(row.parentNarratorId, narratorId);
 }
 
 /**

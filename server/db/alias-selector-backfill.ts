@@ -73,3 +73,31 @@ export function backfillNarratorAliasSelectors(
 	}
 	if (updated > 0) logger.info("Backfilled narrator alias selectors", { updated });
 }
+
+/**
+ * Rewrite `title_slug` and `alias_selector` from the current title and traits.
+ * Import overwrite copies only the snapshot's columns, so a pre-upgrade snapshot
+ * can change the title while leaving a newer selector behind. Empty string clears
+ * a stale value. Rows not listed are left untouched.
+ */
+export function recomputeNarratorAliasSelectors(sqlite: Database, ids: readonly string[]): void {
+	if (ids.length === 0) return;
+	const select = sqlite.prepare(`SELECT title, traits FROM narrators WHERE id = ?`);
+	const update = sqlite.prepare(
+		`UPDATE narrators SET title_slug = ?, alias_selector = ? WHERE id = ?`,
+	);
+	for (const id of ids) {
+		const row = select.get(id) as { title: string | null; traits: string | null } | null;
+		if (!row) continue;
+		const titleSlug = row.title ? slugifyTaskAlias(row.title) || "" : "";
+		let alias = "";
+		if (typeof row.traits === "string" && row.traits.includes("subagent-alias:")) {
+			try {
+				alias = getPersistedSubagentAliases(JSON.parse(row.traits))[0] ?? "";
+			} catch {
+				alias = "";
+			}
+		}
+		update.run(titleSlug, alias, id);
+	}
+}

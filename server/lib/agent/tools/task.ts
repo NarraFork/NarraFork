@@ -274,28 +274,16 @@ function buildRawJsonSchema(): Record<string, unknown> {
 /**
  * Resolve an Agent archive/unarchive selector to a narrator id.
  *
- * Resolve a scoped task alias, then fall through to the shared Send/Watch selector
- * grammar so a title or slug printed by TeamStatus can be archived directly.
+ * Exact id wins. Archive uses the addressable roster. Unarchive uses archived
+ * candidates only. An ambiguous name throws instead of following an old task row.
  */
-async function resolveArchiveTargetId(callerNarratorId: string, selector: string): Promise<string> {
-	const trimmed = selector.trim();
-	const { resolveTaskAlias } = await import("@server/services/narrator-subagent");
-	const fromAlias = resolveTaskAlias(callerNarratorId, trimmed);
-	if (fromAlias !== trimmed) return fromAlias;
-
-	const { backgroundTaskService } = await import("@server/services/background-task-service");
-	const task = await backgroundTaskService.getByAlias(trimmed, callerNarratorId);
-	if (task?.subagentNarratorId) return task.subagentNarratorId;
-	if (task) return task.id;
-
-	const { resolveSubagentTargets } = await import("@server/services/agent-communication");
-	const targets = await resolveSubagentTargets({
-		callerNarratorId,
-		id: trimmed,
-		includeArchived: true,
-	}).catch(() => []);
-	if (targets.length === 1) return targets[0].id;
-	return trimmed;
+async function resolveArchiveTargetId(
+	callerNarratorId: string,
+	selector: string,
+	action: "archive" | "unarchive",
+): Promise<string> {
+	const { resolveAgentLifecycleTarget } = await import("@server/services/agent-communication");
+	return resolveAgentLifecycleTarget(callerNarratorId, selector, action);
 }
 
 export const agentTool: ToolDefinition = {
@@ -344,7 +332,7 @@ export const agentTool: ToolDefinition = {
 		// --- Archive mode: retire a subagent so broadcasts stop waking it ---
 		if (raw.archive) {
 			try {
-				const targetId = await resolveArchiveTargetId(ctx.narratorId, raw.archive);
+				const targetId = await resolveArchiveTargetId(ctx.narratorId, raw.archive, "archive");
 				const { narratorService } = await import("@server/services/narrator-service");
 				const { authorizeAgentControl } = await import("@server/services/narrator-control");
 				const { agentLabelFromNarrator } = await import("@server/services/subagent-label");
@@ -405,7 +393,7 @@ export const agentTool: ToolDefinition = {
 		// --- Unarchive mode: restore an archived subagent ---
 		if (raw.unarchive) {
 			try {
-				const targetId = await resolveArchiveTargetId(ctx.narratorId, raw.unarchive);
+				const targetId = await resolveArchiveTargetId(ctx.narratorId, raw.unarchive, "unarchive");
 				const { narratorService } = await import("@server/services/narrator-service");
 				const { authorizeAgentControl } = await import("@server/services/narrator-control");
 				const { agentLabelFromNarrator } = await import("@server/services/subagent-label");
@@ -439,9 +427,13 @@ export const agentTool: ToolDefinition = {
 				await runAsTeamStatusActor({ kind: "agent", id: ctx.narratorId }, () =>
 					narratorService.updateStatus(narrator.id, "idle"),
 				);
+				const { reconcileRestoredSubagentAlias } = await import("@server/services/subagent-alias");
+				await reconcileRestoredSubagentAlias(narrator.id);
+				const restored = await narratorService.getById(narrator.id);
+				const restoredLabel = agentLabelFromNarrator(restored, ctx.narratorId);
 				return {
 					output:
-						`Agent ${label} (${narrator.id}) has been unarchived. ` +
+						`Agent ${restoredLabel} (${narrator.id}) has been unarchived. ` +
 						"It can receive messages and TeamStatus broadcast (@all members) again.",
 				};
 			} catch (err) {

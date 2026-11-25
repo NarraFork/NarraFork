@@ -28,7 +28,7 @@ keywords:
   - db 句柄
   - bun:sqlite
 status: draft
-verified_at: 001ccbf7d
+verified_at: bfb277f05
 ---
 # 表结构与 Drizzle
 
@@ -40,7 +40,7 @@ SQLite 表结构的唯一来源是 `server/db/schema.ts`（Drizzle `sqliteTable`
 - 可写主库连接只能经 `connection.ts:openDatabase` 打开：设置 WAL、`synchronous=NORMAL`、`foreign_keys=ON`、`busy_timeout=250`（刻意很短，锁冲突交给应用层重试），并在测试进程里拒绝打开真实 `~/.narrafork` 库。
 - `ensure-columns.ts:ensureColumns` 在迁移后按 schema 补缺失列，兜底迁移历史与实际库分叉的情况。
 - 改 schema 必须同步 `data-portability`（`SNAPSHOT_TABLES` / `copyTable` / `clearData`），见 [数据导入导出](portability.md)。
-- `narrators.title_slug` 存 `slugifyTaskAlias(title)`，`alias_selector` 存持久化的 `subagent-alias:`。两列可空；空字符串表示已检查且没有值。旧行由 `alias-selector-backfill.ts` 在启动时补上，会话导入之后同样补。
+- `narrators.title_slug` 存 `slugifyTaskAlias(title)`，`alias_selector` 存持久化的 `subagent-alias:`。两列可空；空字符串表示已检查且没有值。旧行由 `alias-selector-backfill.ts` 在启动时补上。导入时插入和覆盖的行按当前 title 与 traits 重算，其余 NULL 行再补。
 - PG 的 `server/db/postgres-schema.ts` 是由 `scripts/generate-postgres-schema.ts` 从本文件转译出的生成物，文件头写明不可手改；`scripts/check-postgres-schema-parity.ts` 检查两边一致。
 - 迁移文件不手写，流程见 [迁移](migrations.md)。
 - `type-level-claims.probe.ts` 是一份纯类型层面的反例（异步回调能通过 `=> T` / `=> void` 的包装签名），配合 `transaction-atomicity-contract.test.ts` 说明类型系统挡不住事务回调里的 async，该约束靠 `transaction-atomicity-contract.test.ts` 守。

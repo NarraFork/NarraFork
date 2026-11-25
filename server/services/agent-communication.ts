@@ -26,6 +26,7 @@ import { getSubagentFinalText } from "./narrator-session";
 import { formatRecentSubagentActivity, getRecentSubagentToolActivity } from "./subagent-activity";
 import {
 	findSubagentIdsBySelector,
+	getPersistedSubagentAliases,
 	resolveTaskAlias,
 	subagentMatchesSelector,
 } from "./subagent-alias";
@@ -59,10 +60,19 @@ export interface ResolveTargetsInput {
 	name?: string;
 	names?: string[];
 	/**
-	 * Archive and unarchive must still name a finished member. Send, Await and
-	 * Watch leave this unset so an archived alias is not a target.
+	 * When no addressable member matches, also accept one archived member.
+	 * Send, Await and Watch leave this unset.
 	 */
 	includeArchived?: boolean;
+	/**
+	 * ContextAsk and TeamStatus file changes. Exact id finds an archived member.
+	 * A name that matches both a live member and an archived one is ambiguous.
+	 */
+	historical?: boolean;
+	/**
+	 * Unarchive. Only archived members match. An ambiguous historical name throws.
+	 */
+	archivedOnly?: boolean;
 }
 
 export interface SendSubagentInput extends ResolveTargetsInput {
@@ -320,10 +330,36 @@ async function resolveAliasCandidate(selector: string, scope: CommunicationScope
 	return selector;
 }
 
-async function resolveArchivedTarget(
+function ambiguousTargetError(
+	selector: string,
+	candidates: Array<{ id: string; title?: string | null; traits?: unknown }>,
+	scope: CommunicationScope,
+): Error {
+	const lines = candidates
+		.map(
+			(c) =>
+				`- ${agentLabelFromNarrator(c, scope.teamParentId)} | ${c.title ?? "(untitled)"} ` +
+				`(id: ${shortAgentId(c.id)})`,
+		)
+		.join("\n");
+	return new Error(`Ambiguous subagent target "${selector}". Candidates:\n${lines}`);
+}
+
+function matchesExactAliasOrId(
+	candidate: { id: string; traits?: unknown },
+	selector: string,
+): boolean {
+	const normalized = selector.trim();
+	return (
+		candidate.id === normalized ||
+		getPersistedSubagentAliases(candidate.traits).includes(normalized)
+	);
+}
+
+async function findArchivedMatches(
 	selector: string,
 	scope: CommunicationScope,
-): Promise<Narrator | undefined> {
+): Promise<Narrator[]> {
 	const ids = new Set<string>();
 	for (const teamId of reachableTeamIds(scope)) {
 		for (const id of await findSubagentIdsBySelector(teamId, selector)) ids.add(id);
@@ -334,61 +370,109 @@ async function resolveArchivedTarget(
 		const row = await narratorService.getById(id).catch(() => null);
 		if (row?.status === "archived") matches.push(row);
 	}
+	return matches;
+}
+
+async function resolveArchivedTarget(
+	selector: string,
+	scope: CommunicationScope,
+): Promise<Narrator | undefined> {
+	const matches = await findArchivedMatches(selector, scope);
 	if (matches.length === 0) return;
-	if (matches.length > 1) {
-		const lines = matches
-			.map(
-				(c) =>
-					`- ${agentLabelFromNarrator(c, scope.teamParentId)} | ${c.title ?? "(untitled)"} ` +
-					`(id: ${shortAgentId(c.id)})`,
-			)
-			.join("\n");
-		throw new Error(`Ambiguous subagent target "${selector}". Candidates:\n${lines}`);
-	}
+	if (matches.length > 1) throw ambiguousTargetError(selector, matches, scope);
 	assertTargetAllowed(matches[0], scope);
 	return matches[0];
+}
+
+async function addressableMatches(selector: string, scope: CommunicationScope) {
+	const siblings: Awaited<ReturnType<typeof narratorService.listTeamMembers>> = [];
+	for (const teamId of reachableTeamIds(scope))
+		siblings.push(...(await narratorService.listTeamMembers(teamId)));
+	return siblings.filter((s) => {
+		if (scope.callerIsSubagent && s.id === scope.caller.id) return false;
+		return subagentMatchesSelector(s, selector);
+	});
+}
+
+async function resolveHistoricalTarget(
+	selector: string,
+	scope: CommunicationScope,
+): Promise<Narrator> {
+	const trimmed = selector.trim();
+	const byId = await narratorService.getById(trimmed).catch(() => null);
+	if (byId?.id === trimmed) {
+		assertTargetAllowed(byId, scope);
+		return byId;
+	}
+	const live = await addressableMatches(selector, scope);
+	const archived = await findArchivedMatches(selector, scope);
+	if (live.length === 1 && archived.length === 0) {
+		const target = await narratorService.getById(live[0].id);
+		assertTargetAllowed(target, scope);
+		return target;
+	}
+	if (live.length === 0 && archived.length === 1) {
+		assertTargetAllowed(archived[0], scope);
+		return archived[0];
+	}
+	if (live.length + archived.length === 0) {
+		throw new Error(`No accessible subagent found for "${selector}"`);
+	}
+	throw ambiguousTargetError(selector, [...live, ...archived], scope);
 }
 
 async function resolveOneTarget(
 	selector: string,
 	scope: CommunicationScope,
-	includeArchived = false,
+	options: { includeArchived?: boolean; historical?: boolean; archivedOnly?: boolean } = {},
 ): Promise<Narrator> {
-	const aliasCandidate = await resolveAliasCandidate(selector, scope);
-	const direct = await narratorService.getById(aliasCandidate).catch(() => null);
-	// An archived narrator is not addressable. Ignore an alias that points at one
-	// unless the caller is archiving or restoring that member.
-	if (direct && (includeArchived || direct.status !== "archived")) {
-		assertTargetAllowed(direct, scope);
-		return direct;
+	if (options.historical) return resolveHistoricalTarget(selector, scope);
+	if (options.archivedOnly) {
+		const archived = await resolveArchivedTarget(selector, scope);
+		if (!archived) throw new Error(`No accessible subagent found for "${selector}"`);
+		return archived;
 	}
 
-	const siblings: Awaited<ReturnType<typeof narratorService.listTeamMembers>> = [];
-	for (const teamId of reachableTeamIds(scope))
-		siblings.push(...(await narratorService.listTeamMembers(teamId)));
-	const candidates = siblings.filter((s) => {
-		if (scope.callerIsSubagent && s.id === scope.caller.id) return false;
-		return subagentMatchesSelector(s, selector);
-	});
+	const aliasCandidate = await resolveAliasCandidate(selector, scope);
+	const direct = await narratorService.getById(aliasCandidate).catch(() => null);
+	// A task row keeps the alias printed at launch. After a restore gives that
+	// agent a suffix, the row must not hide the member who still holds the name.
+	// An in-memory registry entry is the current claim and still wins.
+	if (direct && direct.status !== "archived") {
+		const normalized = selector.trim();
+		const redirected = aliasCandidate !== normalized;
+		const remembered = [scope.caller.id, ...reachableTeamIds(scope)].some((ownerId) => {
+			const hit = resolveTaskAlias(ownerId, normalized);
+			return hit !== normalized && hit === direct.id;
+		});
+		const stillOwns =
+			!redirected ||
+			direct.id === normalized ||
+			remembered ||
+			getPersistedSubagentAliases(direct.traits).includes(normalized);
+		if (stillOwns) {
+			assertTargetAllowed(direct, scope);
+			return direct;
+		}
+	}
+
+	let candidates = await addressableMatches(selector, scope);
 
 	if (candidates.length === 0) {
-		if (includeArchived) {
+		if (options.includeArchived) {
 			const archived = await resolveArchivedTarget(selector, scope);
 			if (archived) return archived;
 		}
 		throw new Error(`No accessible subagent found for "${selector}"`);
 	}
 	if (candidates.length > 1) {
+		const exact = candidates.filter((candidate) => matchesExactAliasOrId(candidate, selector));
+		if (exact.length === 1) candidates = exact;
+	}
+	if (candidates.length > 1) {
 		// Lead with the label so the model's next attempt can disambiguate with an
 		// alias instead of copying a nanoid back.
-		const lines = candidates
-			.map(
-				(c) =>
-					`- ${agentLabelFromNarrator(c, scope.teamParentId)} | ${c.title ?? "(untitled)"} ` +
-					`(id: ${shortAgentId(c.id)})`,
-			)
-			.join("\n");
-		throw new Error(`Ambiguous subagent target "${selector}". Candidates:\n${lines}`);
+		throw ambiguousTargetError(selector, candidates, scope);
 	}
 
 	const target = await narratorService.getById(candidates[0].id);
@@ -406,12 +490,36 @@ export async function resolveSubagentTargets(input: ResolveTargetsInput): Promis
 	const resolved: Narrator[] = [];
 	const seen = new Set<string>();
 	for (const selector of selectors) {
-		const target = await resolveOneTarget(selector, scope, input.includeArchived);
+		const target = await resolveOneTarget(selector, scope, {
+			includeArchived: input.includeArchived,
+			historical: input.historical,
+			archivedOnly: input.archivedOnly,
+		});
 		if (seen.has(target.id)) continue;
 		seen.add(target.id);
 		resolved.push(target);
 	}
 	return resolved;
+}
+
+/**
+ * Archive names the addressable owner. Unarchive names the archived candidate.
+ * An exact narrator id wins either way. An ambiguous name throws.
+ */
+export async function resolveAgentLifecycleTarget(
+	callerNarratorId: string,
+	selector: string,
+	action: "archive" | "unarchive",
+): Promise<string> {
+	const trimmed = selector.trim();
+	const byId = await narratorService.getById(trimmed).catch(() => null);
+	if (byId?.id === trimmed) return byId.id;
+	const targets = await resolveSubagentTargets({
+		callerNarratorId,
+		id: trimmed,
+		archivedOnly: action === "unarchive",
+	});
+	return targets[0].id;
 }
 
 function formatSubagentResult(label: string, finalText: string | null | undefined): string {
