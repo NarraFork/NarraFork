@@ -17,7 +17,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { realpath } from "node:fs/promises";
+import { realpath, stat } from "node:fs/promises";
 import type { WorktreeRemovalPlan, WorktreeRemovalResult } from "@shared/narrator-worktrees";
 import {
 	dependencyBlockers,
@@ -677,6 +677,7 @@ export async function workItemAtWorktree(
 	teamId: string,
 	path: string,
 	platform: NodeJS.Platform = process.platform,
+	sameDirectory: (a: string, b: string) => Promise<boolean> = sameDirectoryOnDisk,
 ): Promise<WorkItemRow | null> {
 	const real = await realWorkdir(path, platform);
 	const candidates = [...new Set(real ? [path, real] : [path])];
@@ -709,7 +710,34 @@ export async function workItemAtWorktree(
 		.orderBy(asc(teamWorkItems.createdAt), asc(teamWorkItems.id))
 		.limit(WORKTREE_CASE_SCAN_MAX)
 		.all();
-	return rows.find((row) => keys.has(localPathIdentityKey(row.path, platform)))?.item ?? null;
+	// The folded key only shortlists: a case-sensitive volume on Windows or macOS can hold two
+	// distinct directories whose names differ only by case, so a match must be the same directory
+	// on disk (device and inode) as the one asked for.
+	for (const row of rows) {
+		if (!keys.has(localPathIdentityKey(row.path, platform))) continue;
+		if (await sameDirectory(path, row.path)) return row.item;
+	}
+	return null;
+}
+
+/** Whether two paths name the same directory on disk (device and inode); false when unsure. */
+async function sameDirectoryOnDisk(a: string, b: string): Promise<boolean> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		const both = await Promise.race([
+			Promise.all([stat(a, { bigint: true }), stat(b, { bigint: true })]),
+			new Promise<null>((resolve) => {
+				timer = setTimeout(() => resolve(null), WORKDIR_REALPATH_TIMEOUT_MS);
+			}),
+		]);
+		if (!both) return false;
+		const [left, right] = both;
+		return left.isDirectory() && left.dev === right.dev && left.ino === right.ino;
+	} catch {
+		return false;
+	} finally {
+		clearTimeout(timer);
+	}
 }
 
 // ── Review, ready, cancel ───────────────────────────────────────────────────

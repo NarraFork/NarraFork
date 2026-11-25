@@ -9,7 +9,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, tes
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { eq } from "drizzle-orm";
 import { db, sqlite } from "../../../../db";
 import { narratorWorktreeResources, teamWorkItems } from "../../../../db/schema";
@@ -369,11 +369,26 @@ describe("Agent with a team work item", () => {
 			expect(refused.output).toContain("TEAM_WORK_ITEM_BLOCKED");
 		}
 		expect(runCalls).toHaveLength(0);
-		// Another case finds the item where the filesystem ignores case, never on Linux.
+		// Another case finds the item where the filesystem ignores case and both spellings are the
+		// same directory on disk; never on Linux.
 		const upper = recorded.toUpperCase();
+		const sameDirectory = async () => true;
 		for (const platform of ["win32", "darwin"] as const)
-			expect((await items.workItemAtWorktree(LEAD, upper, platform))?.id).toBe(second.item.id);
-		expect(await items.workItemAtWorktree(LEAD, upper, "linux")).toBeNull();
+			expect((await items.workItemAtWorktree(LEAD, upper, platform, sameDirectory))?.id).toBe(
+				second.item.id,
+			);
+		expect(await items.workItemAtWorktree(LEAD, upper, "linux", sameDirectory)).toBeNull();
+		// A case-sensitive volume on Windows or macOS can hold a different directory whose name
+		// differs only by case: the folded key alone is not enough.
+		const distinct = async () => false;
+		for (const platform of ["win32", "darwin"] as const)
+			expect(await items.workItemAtWorktree(LEAD, upper, platform, distinct)).toBeNull();
+		// The real check: a separate directory with the same name in another case is not the
+		// worktree (this runner's filesystem is case-sensitive).
+		const sibling = join(dirname(recorded), basename(recorded).toUpperCase());
+		await mkdir(sibling, { recursive: true });
+		for (const platform of ["win32", "darwin"] as const)
+			expect(await items.workItemAtWorktree(LEAD, sibling, platform)).toBeNull();
 
 		// Once it may start, the worker runs in the worktree as recorded.
 		sqlite.run("UPDATE team_work_items SET state = 'merged' WHERE id = ?", [first.item.id]);
