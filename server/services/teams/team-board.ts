@@ -23,11 +23,13 @@ import {
 	TEAM_APPROVALS_LIMIT,
 	TEAM_BOARD_COLUMN_STATES,
 	TEAM_BOARD_COLUMNS,
+	TEAM_EVENT_DETAIL_MAX_BYTES,
 	TEAM_EVENT_DETAIL_PREVIEW_CHARS,
 	TEAM_HELD_WORKTREES_LIMIT,
 	TEAM_PAUSE_LIMIT,
 	TEAM_QUESTION_OPTIONS_MAX,
 	TEAM_RETURN_REASON_MAX_LENGTH,
+	TEAM_REVIEW_SUMMARY_MAX_LENGTH,
 	TEAM_RUNNING_AGENTS_LIMIT,
 	TEAM_WORK_RETURNED_EVENT_KIND,
 	type TeamActivityEvent,
@@ -711,11 +713,32 @@ export const returnedReasonColumns = {
 	>`case when ${teamWorkEvents.kind} = ${TEAM_WORK_RETURNED_EVENT_KIND} then substr(${teamWorkEvents.detailJson}, 1, ${TEAM_RETURN_DETAIL_MAX_CHARS}) end`,
 };
 
-/** An event's detail as sent: whole when small, else omitted, but a return keeps its reason. */
+/**
+ * Longest `work.review` detail read for its findings: a stored detail is at most
+ * {@link TEAM_EVENT_DETAIL_MAX_BYTES} UTF-8 bytes, so never more characters than that.
+ */
+const TEAM_REVIEW_DETAIL_MAX_CHARS = TEAM_EVENT_DETAIL_MAX_BYTES;
+
+/**
+ * A review's detail read on its own when it is past {@link TEAM_EVENT_DETAIL_PREVIEW_CHARS} (long
+ * findings), so the drawer still shows them. Same plain `case`/`substr` as the return's column;
+ * only rows the preview left out are read twice.
+ */
+export const reviewSummaryColumns = {
+	reviewDetail: sql<
+		string | null
+	>`case when ${teamWorkEvents.kind} = ${"work.review"} and length(${teamWorkEvents.detailJson}) > ${TEAM_EVENT_DETAIL_PREVIEW_CHARS} then substr(${teamWorkEvents.detailJson}, 1, ${TEAM_REVIEW_DETAIL_MAX_CHARS}) end`,
+};
+
+/**
+ * An event's detail as sent: whole when small, else omitted, but a return keeps its reason and,
+ * where the read asked for it ({@link reviewSummaryColumns}), a review keeps its findings.
+ */
 export function eventDetail(row: {
 	detail: string | null;
 	detailLength: number | null;
 	returnDetail: string | null;
+	reviewDetail?: string | null;
 }): { detail: Record<string, unknown> | null; detailOmitted: boolean } {
 	const detail = parseDetail(row.detail);
 	if (detail || row.detailLength === null) return { detail, detailOmitted: false };
@@ -729,6 +752,16 @@ export function eventDetail(row: {
 			},
 			detailOmitted: false,
 		};
+	const review = parseDetail(row.reviewDetail ?? null);
+	if (review) {
+		const kept: Record<string, unknown> = {};
+		for (const key of ["round", "verdict", "findings", "from", "to"])
+			if (typeof review[key] === "number" || typeof review[key] === "string")
+				kept[key] = review[key];
+		if (typeof review.summary === "string")
+			kept.summary = review.summary.slice(0, TEAM_REVIEW_SUMMARY_MAX_LENGTH);
+		return { detail: kept, detailOmitted: false };
+	}
 	return { detail: null, detailOmitted: true };
 }
 

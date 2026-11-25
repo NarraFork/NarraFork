@@ -705,6 +705,17 @@ export const TEAM_WORK_RETURNED_EVENT_KIND = "work.returned";
 export const TEAM_RETURNABLE_STATES: readonly TeamWorkItemState[] = ["in_review", "ready"];
 /** Characters of a return reason. */
 export const TEAM_RETURN_REASON_MAX_LENGTH = 2000;
+/**
+ * Characters of a review round's findings text (`work.review`'s `summary`). Small enough that
+ * the event detail stays under {@link TEAM_EVENT_DETAIL_MAX_BYTES} even when every character
+ * JSON-escapes to six bytes.
+ */
+export const TEAM_REVIEW_SUMMARY_MAX_LENGTH = 1000;
+/**
+ * Characters of findings text one drawer read sends in all: the newest rounds first, older ones
+ * cut (`summaryClipped`) once it is spent.
+ */
+export const TEAM_REVIEW_SUMMARIES_TOTAL_CHARS = 6000;
 
 /** One review round of a work item, from its events (an agent's review or a person's return). */
 export interface TeamWorkReviewRound {
@@ -718,6 +729,10 @@ export interface TeamWorkReviewRound {
 	by: "agent" | "person" | "system";
 	actorName: string | null;
 	reason: string | null;
+	/** An agent's round: the findings as the coordinator recorded them; null when none. */
+	summary: string | null;
+	/** The findings were cut (or left out) to keep the drawer within its text budget. */
+	summaryClipped?: boolean;
 	at: string;
 }
 

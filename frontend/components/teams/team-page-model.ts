@@ -619,6 +619,18 @@ export function returnReason(text: string): string | null {
 	return trimmed && trimmed.length <= TEAM_RETURN_REASON_MAX_LENGTH ? trimmed : null;
 }
 
+/** Lines a review round's findings show before 「展开」. */
+export const REVIEW_FINDINGS_CLAMP_LINES = 3;
+
+/**
+ * Whether a round's findings may run past {@link REVIEW_FINDINGS_CLAMP_LINES} lines in the drawer
+ * and so get 「展开 / 收起」: more lines than that, or more text than fits them at the drawer's
+ * narrowest width (an estimate; a short text never gets the toggle).
+ */
+export function findingsNeedToggle(text: string): boolean {
+	return text.split("\n").length > REVIEW_FINDINGS_CLAMP_LINES || text.length > 140;
+}
+
 /** How one line of a unified diff is drawn. */
 export type DiffLineKind = "add" | "del" | "hunk" | "meta" | "context";
 

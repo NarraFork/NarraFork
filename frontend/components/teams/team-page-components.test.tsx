@@ -28,6 +28,7 @@ import { TeamAttention } from "./TeamAttention";
 import { TeamHeader } from "./TeamHeader";
 import { TeamMembersPanel } from "./TeamMembers";
 import { TeamReadOnlyStart, TeamStart } from "./TeamStart";
+import { ReviewFindings } from "./TeamWorkDrawer";
 import { TeamWorkList } from "./TeamWorkList";
 import { attentionEntries, statusSentence, teamPageMode } from "./team-page-model";
 
@@ -868,5 +869,28 @@ describe("questions keep their context", () => {
 			expect(text).toContain("mian");
 			expect(text).not.toContain("teams.page");
 		}
+	});
+});
+
+describe("review findings", () => {
+	test("muted text clamped to three lines, 展开 when long, a note when cut", async () => {
+		const short = await render(
+			<ReviewFindings text="缺少跨日边界用例" clipped={false} />,
+			undefined,
+			"zh-CN",
+		);
+		expect(short).toContain("缺少跨日边界用例");
+		expect(short).toContain("--text-line-clamp:3");
+		expect(short).not.toContain("team-review-findings-toggle");
+		const long = await render(
+			<ReviewFindings text={"x".repeat(300)} clipped />,
+			undefined,
+			"zh-CN",
+		);
+		expect(long).toContain("team-review-findings-toggle");
+		expect(long).toContain("展开");
+		expect(long).toContain("评审意见合计太长");
+		const gone = await render(<ReviewFindings text={null} clipped />);
+		expect(gone).toContain("The findings are too long in all");
 	});
 });

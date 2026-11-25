@@ -16,6 +16,7 @@
 import {
 	TEAM_EVENT_DETAIL_PREVIEW_CHARS,
 	TEAM_RETURNABLE_STATES,
+	TEAM_REVIEW_SUMMARIES_TOTAL_CHARS,
 	TEAM_WORK_DIFF_MAX_BYTES,
 	TEAM_WORK_EVENTS_LIMIT,
 	TEAM_WORK_FILES_LIMIT,
@@ -39,7 +40,12 @@ import { GitError, NotFoundError, ValidationError } from "../../lib/errors";
 import { getUserLanguage } from "../../lib/i18n";
 import { logger } from "../../lib/logger";
 import type { NarratorPrincipal } from "../narrator-acl";
-import { eventDetail, readBoardItem, returnedReasonColumns } from "./team-board";
+import {
+	eventDetail,
+	readBoardItem,
+	returnedReasonColumns,
+	reviewSummaryColumns,
+} from "./team-board";
 import { teamGit } from "./team-git";
 import { loadTeamForAccess } from "./team-service";
 import { diffStatOf, returnWorkItem, worktreePathOf } from "./work-items";
@@ -267,6 +273,7 @@ function itemEvents(itemId: string): { events: TeamActivityEvent[]; more: boolea
 				string | null
 			>`case when length(${teamWorkEvents.detailJson}) <= ${TEAM_EVENT_DETAIL_PREVIEW_CHARS} then ${teamWorkEvents.detailJson} end`,
 			...returnedReasonColumns,
+			...reviewSummaryColumns,
 			createdAt: teamWorkEvents.createdAt,
 		})
 		.from(teamWorkEvents)
@@ -330,10 +337,45 @@ export function reviewRounds(events: readonly TeamActivityEvent[]): TeamWorkRevi
 			actorId: event.actorId,
 			actorName: event.actorName,
 			reason: event.kind === TEAM_WORK_RETURNED_EVENT_KIND ? reason : null,
+			summary:
+				event.kind === "work.review" && typeof detail.summary === "string" && detail.summary
+					? detail.summary
+					: null,
 			at: event.createdAt,
 		});
 	}
 	return rounds;
+}
+
+/**
+ * Keep the findings text one drawer sends within `budget` characters: the newest rounds keep
+ * theirs whole, the first that does not fit is cut, older ones go without (`summaryClipped`).
+ */
+export function capReviewSummaries(
+	rounds: TeamWorkReviewRound[],
+	budget = TEAM_REVIEW_SUMMARIES_TOTAL_CHARS,
+): TeamWorkReviewRound[] {
+	let left = budget;
+	const capped = [...rounds];
+	for (let index = capped.length - 1; index >= 0; index--) {
+		const round = capped[index];
+		if (!round?.summary) continue;
+		if (round.summary.length <= left) {
+			left -= round.summary.length;
+			continue;
+		}
+		const cut = left > 1 ? `${round.summary.slice(0, left - 1)}…` : null;
+		left = 0;
+		capped[index] = { ...round, summary: cut, summaryClipped: true };
+	}
+	return capped;
+}
+
+/** The timeline does not repeat the findings the review rounds already carry. */
+function withoutSummary(event: TeamActivityEvent): TeamActivityEvent {
+	if (event.kind !== "work.review" || !event.detail || !("summary" in event.detail)) return event;
+	const { summary: _summary, ...detail } = event.detail;
+	return { ...event, detail };
 }
 
 /**
@@ -375,8 +417,8 @@ export async function readWorkItemDetail(
 		files,
 		filesMore: stat.filesMore,
 		diffAvailable: stat.target !== null,
-		reviews: reviewRounds(events),
-		events,
+		reviews: capReviewSummaries(reviewRounds(events)),
+		events: events.map(withoutSummary),
 		eventsMore: more,
 		canReturn:
 			access === "write" &&

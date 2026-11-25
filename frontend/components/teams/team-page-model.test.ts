@@ -28,6 +28,7 @@ import {
 	diffLineKind,
 	eventLabelKey,
 	eventNote,
+	findingsNeedToggle,
 	isCoordinator,
 	itemMarks,
 	itemOfApproval,
@@ -729,5 +730,14 @@ describe("review fixes", () => {
 		expect(isCoordinator({ actorKind: "agent", actorId: "lead" }, "lead")).toBe(true);
 		expect(isCoordinator({ actorKind: "agent", actorId: "w" }, "lead")).toBe(false);
 		expect(isCoordinator({ actorKind: "person", actorId: "lead" }, "lead")).toBe(false);
+	});
+});
+
+describe("review findings", () => {
+	test("a short text never gets 展开; many lines or a long text does", () => {
+		expect(findingsNeedToggle("缺少跨日边界用例。")).toBe(false);
+		expect(findingsNeedToggle("a\nb\nc")).toBe(false);
+		expect(findingsNeedToggle("a\nb\nc\nd")).toBe(true);
+		expect(findingsNeedToggle("x".repeat(141))).toBe(true);
 	});
 });
