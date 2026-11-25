@@ -12,6 +12,21 @@ import type { TeamDetail } from "@shared/project-teams";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
+const SETTINGS_ERROR_CODES = new Set([
+	"TEAM_BASE_BRANCH_UNRESOLVED",
+	"TEAM_PROJECT_NOT_GIT",
+	"TEAM_PROJECT_CHANGED",
+	"TEAM_ARCHIVED",
+]);
+
+/** The i18n key of a refused settings change, or null for a generic message. */
+export function settingsErrorKey(error: unknown): string | null {
+	const code = (error as { data?: { code?: unknown } } | null)?.data?.code;
+	return typeof code === "string" && SETTINGS_ERROR_CODES.has(code)
+		? `teams.page.settings.errors.${code}`
+		: null;
+}
+
 export function TeamSettingsModal({
 	projectId,
 	team,
@@ -48,6 +63,18 @@ export function TeamSettingsModal({
 	const briefError = !teamBriefSchema.safeParse(brief).success
 		? t("teams.create.briefTooLong")
 		: null;
+	// The server checks a new base resolves in the project's repository: its refusal is shown on
+	// the field itself (and goes once the field is edited).
+	const refusalKey = settingsErrorKey(update.error);
+	const refusalText = update.isError
+		? refusalKey
+			? t(refusalKey, { branch: update.variables?.baseBranch ?? baseBranch })
+			: describeApiError(update.error, t).message
+		: null;
+	const refusedBase =
+		update.isError &&
+		refusalKey === "teams.page.settings.errors.TEAM_BASE_BRANCH_UNRESOLVED" &&
+		update.variables?.baseBranch === baseBranch.trim();
 	const save = () => {
 		if (!team || branchError || briefError) return;
 		const patch: { baseBranch?: string; brief?: string } = {};
@@ -73,7 +100,7 @@ export function TeamSettingsModal({
 					description={t("teams.create.baseBranchDescription")}
 					value={baseBranch}
 					onChange={(event) => setBaseBranch(event.currentTarget.value)}
-					error={branchError}
+					error={branchError ?? (refusedBase ? refusalText : null)}
 					data-testid="team-settings-base"
 				/>
 				<Textarea
@@ -87,9 +114,9 @@ export function TeamSettingsModal({
 					error={briefError}
 					data-testid="team-settings-brief"
 				/>
-				{update.isError && (
+				{update.isError && !refusedBase && (
 					<Alert color="red" title={t("teams.page.settings.failed")}>
-						{describeApiError(update.error, t).message}
+						{refusalText}
 					</Alert>
 				)}
 				<Group justify="flex-end" gap="xs">

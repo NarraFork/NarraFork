@@ -496,7 +496,13 @@
 				"title": "团队设置",
 				"save": "保存",
 				"saved": "团队设置已保存",
-				"failed": "保存失败。"
+				"failed": "保存失败。",
+				"errors": {
+					"TEAM_BASE_BRANCH_UNRESOLVED": "「{{branch}}」在项目仓库里找不到对应的提交，请检查分支名。",
+					"TEAM_PROJECT_NOT_GIT": "项目目录不是 git 仓库，无法检查基线分支。",
+					"TEAM_PROJECT_CHANGED": "项目仓库刚刚有变化，请再试一次。",
+					"TEAM_ARCHIVED": "团队已归档，先恢复再改设置。"
+				}
 			},
 			"marks": {
 				"exclusive": "持有独占路径锁（{{key}}）",

@@ -275,7 +275,13 @@ describe("等你处理", () => {
 					toolName: "AskUserQuestion",
 					preview: "",
 					questions: ["Which rounding rule?"],
-					answerForm: { header: "Rounding", options: ["Half up", "Banker's"], multiSelect: false },
+					answerForm: {
+						header: "Rounding",
+						description: null,
+						options: ["Half up", "Banker's"],
+						optionDescriptions: [null, null],
+						multiSelect: false,
+					},
 				}),
 				call({
 					id: "plan",
@@ -740,7 +746,13 @@ describe("review fixes", () => {
 							kind: "question",
 							toolName: "AskUserQuestion",
 							questions: ["Which?"],
-							answerForm: { header: "Zone", options: [long, "UTC"], multiSelect: false },
+							answerForm: {
+								header: "Zone",
+								description: null,
+								options: [long, "UTC"],
+								optionDescriptions: [null, null],
+								multiSelect: false,
+							},
 						}),
 					],
 					items: [],
@@ -841,5 +853,68 @@ describe("review fixes", () => {
 		const start = await render(<TeamReadOnlyStart />, new QueryClient(), "zh-CN");
 		expect(start).toContain("还没有人给协调者布置任务");
 		expect(start).not.toContain("team-start-example");
+	});
+});
+
+describe("questions keep their context", () => {
+	const card = (form: TeamPendingApproval["answerForm"], questions: string[] = []) =>
+		render(
+			<TeamAttention
+				entries={attentionEntries({
+					member: true,
+					approvals: [
+						call({ kind: "question", toolName: "AskUserQuestion", questions, answerForm: form }),
+					],
+					items: [],
+				})}
+				phone={false}
+				teamId="lead"
+				base="main"
+				stats={undefined}
+				onOpenItem={noop}
+			/>,
+		);
+
+	test("the title, the whole prompt and each option's explanation; the answer is the title", async () => {
+		const html = await card({
+			header: "Rounding rule",
+			description: "Discounts split across lines leave a 0.005 remainder. Which rule rounds it?",
+			options: ["Half up", "Banker's rounding"],
+			optionDescriptions: ["Rounds 0.5 away from zero", null],
+			multiSelect: false,
+		});
+		expect(html).toContain("Rounding rule");
+		expect(html).toContain("leave a 0.005 remainder. Which rule rounds it?");
+		expect(html.match(/data-testid="team-question-option-description"/g)).toHaveLength(1);
+		expect(html).toContain("Rounds 0.5 away from zero");
+		expect(html).toContain('data-value="Banker&#x27;s rounding"');
+	});
+
+	test("context too long for a card: the full form, no one-click answers", async () => {
+		const html = await card(
+			{
+				header: "Plan",
+				description: "x".repeat(700),
+				options: ["A", "B"],
+				optionDescriptions: [null, null],
+				multiSelect: false,
+			},
+			["Long"],
+		);
+		expect(html).not.toContain("team-question-option");
+		expect(html).toContain('data-testid="team-question-answer"');
+	});
+
+	test("a refused base branch has its own words in both languages", async () => {
+		const { settingsErrorKey } = await import("./TeamSettingsModal");
+		const key = settingsErrorKey({ data: { code: "TEAM_BASE_BRANCH_UNRESOLVED" } });
+		expect(key).toBe("teams.page.settings.errors.TEAM_BASE_BRANCH_UNRESOLVED");
+		expect(settingsErrorKey({ data: { code: "OTHER" } })).toBeNull();
+		for (const lng of ["en", "zh-CN"] as const) {
+			const i18n = await i18nFor(lng);
+			const text = i18n.t(key ?? "", { branch: "mian" });
+			expect(text).toContain("mian");
+			expect(text).not.toContain("teams.page");
+		}
 	});
 });

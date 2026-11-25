@@ -34,7 +34,11 @@ import {
 	Tooltip,
 	UnstyledButton,
 } from "@mantine/core";
-import type { TeamPendingApproval, TeamWorkDiffStat } from "@shared/project-teams";
+import type {
+	TeamPendingApproval,
+	TeamQuestionForm,
+	TeamWorkDiffStat,
+} from "@shared/project-teams";
 import {
 	IconCheck,
 	IconChevronDown,
@@ -64,6 +68,25 @@ const MarkdownContent = lazy(() =>
 		default: module.MarkdownContent,
 	})),
 );
+
+/** Characters of a prompt and of one option's explanation still answered in place. */
+const INLINE_PROMPT_CHARS = 600;
+const INLINE_OPTION_NOTE_CHARS = 300;
+
+/**
+ * Whether a question is answered right on its card: one single-choice question with a few
+ * options whose prompt and explanations fit a card. Anything bigger opens the session's form,
+ * so nobody answers without having been shown what was asked.
+ */
+export function fitsInPlace(form: TeamQuestionForm): boolean {
+	return (
+		!form.multiSelect &&
+		form.options.length > 0 &&
+		form.options.length <= INLINE_OPTIONS &&
+		(form.description?.length ?? 0) <= INLINE_PROMPT_CHARS &&
+		form.optionDescriptions.every((note) => (note?.length ?? 0) <= INLINE_OPTION_NOTE_CHARS)
+	);
+}
 
 /** Options a question card shows inline before its full form is needed. */
 const INLINE_OPTIONS = 4;
@@ -239,7 +262,7 @@ function QuestionCard({
 	// One single-choice question read whole by the list: answered right here. Anything else
 	// (several questions, several choices, a long input) opens the session's own form.
 	const form = entry.approval.answerForm;
-	const inline = form && !form.multiSelect && form.options.length <= INLINE_OPTIONS ? form : null;
+	const inline = form && fitsInPlace(form) ? form : null;
 	const detail = useApprovalDetail(actions.teamId, entry.approval.id, formOpen);
 	const questions = coerceQuestions(detail.data?.permission?.inputJson?.questions);
 	const answer = (text: string) => {
@@ -247,6 +270,50 @@ function QuestionCard({
 		decision.send("allow", { [form.header]: text.trim() });
 	};
 	const asked = entry.approval.questions[0] ?? form?.header ?? "";
+	// With the form: its title, its whole prompt and each option's explanation, as the session's
+	// own form shows them (clamped). Without: the prompt the list read.
+	const prompt = inline
+		? (inline.description ?? (asked && asked !== inline.header ? asked : null))
+		: null;
+	const context = inline ? (
+		<Stack gap={2} data-testid="team-question-context">
+			<Text size="sm" fw={600} style={{ overflowWrap: "anywhere" }}>
+				{inline.header}
+			</Text>
+			{prompt && (
+				<Text
+					size="sm"
+					c="dimmed"
+					lineClamp={4}
+					title={prompt}
+					style={{ overflowWrap: "anywhere", whiteSpace: "pre-wrap" }}
+					data-testid="team-approval-questions"
+				>
+					{prompt}
+				</Text>
+			)}
+			{inline.options.map((option, index) =>
+				inline.optionDescriptions[index] ? (
+					<Text
+						// biome-ignore lint/suspicious/noArrayIndexKey: the options of one question, in order
+						key={index}
+						size="xs"
+						c="dimmed"
+						lineClamp={2}
+						title={inline.optionDescriptions[index] ?? undefined}
+						style={{ overflowWrap: "anywhere" }}
+						data-testid="team-question-option-description"
+					>
+						<Text component="span" inherit fw={600}>
+							{option}
+						</Text>
+						{"："}
+						{inline.optionDescriptions[index]}
+					</Text>
+				) : null,
+			)}
+		</Stack>
+	) : null;
 	let controls: ReactNode;
 	if (inline && !writing)
 		controls = (
@@ -329,16 +396,17 @@ function QuestionCard({
 				body={
 					<>
 						<Asker entry={entry} onOpenSession={actions.onOpenSession} />
-						{asked && (
-							<Text
-								size="sm"
-								c="dimmed"
-								style={{ overflowWrap: "anywhere" }}
-								data-testid="team-approval-questions"
-							>
-								{asked}
-							</Text>
-						)}
+						{context ??
+							(asked && (
+								<Text
+									size="sm"
+									c="dimmed"
+									style={{ overflowWrap: "anywhere" }}
+									data-testid="team-approval-questions"
+								>
+									{asked}
+								</Text>
+							))}
 						{decision.note}
 					</>
 				}

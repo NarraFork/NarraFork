@@ -414,9 +414,14 @@ const NUMSTAT_MAX_BYTES = 512 * 1024;
 
 async function numstatOf(run: GitQueryRunner, from: string, to: string): Promise<BranchNumstat> {
 	if (!SHA.test(from) || !SHA.test(to)) throw new GitError("Expected full commit SHAs");
-	const listing = await run(["diff", "--numstat", "--no-renames", "-z", from, to], {
-		maxOutputBytes: NUMSTAT_MAX_BYTES,
-	});
+	// Paths relative to the repository root wherever git runs (a coordinator may work in a
+	// subdirectory), whatever `diff.relative` says.
+	const listing = await run(
+		["diff", "--numstat", "--no-renames", "--no-relative", "-z", from, to],
+		{
+			maxOutputBytes: NUMSTAT_MAX_BYTES,
+		},
+	);
 	const truncated = listing.truncated === true;
 	if (listing.exitCode !== 0 && !truncated)
 		throw new GitError("git diff could not count the changed lines");
@@ -463,8 +468,19 @@ async function fileDiffOf(
 	// Raw bytes, at most one past the budget: reading stops there and the text is cut off.
 	const result = await spawnGit(
 		cwd,
-		// `:(literal)`: the path is a file name, never a pattern (`*.txt` is that file only).
-		["diff", "--no-renames", "--no-color", "-U3", from, to, "--", `:(literal)${path}`],
+		// `:(top,literal)`: a file name from the repository root (as numstat lists it, whatever
+		// directory git runs in), never a pattern (`*.txt` is that file only).
+		[
+			"diff",
+			"--no-renames",
+			"--no-relative",
+			"--no-color",
+			"-U3",
+			from,
+			to,
+			"--",
+			`:(top,literal)${path}`,
+		],
 		config,
 		0,
 		READ_TIMEOUT_MS,

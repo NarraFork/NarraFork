@@ -598,3 +598,94 @@ describe("review fixes", () => {
 		expect((await call(READER, teamPath("summary"))).body.heldWorktreeCount).toBe(before + 1);
 	});
 });
+
+describe("review fixes (PR review)", () => {
+	test("an unresolved base branch is refused and the old base stays", async () => {
+		const path = `/projects/${projectId}/teams/${teamId}`;
+		const refused = await call(MEMBER, path, { method: "PATCH", body: { baseBranch: "mian" } });
+		expect(refused.status).toBe(409);
+		expect(refused.body.code).toBe("TEAM_BASE_BRANCH_UNRESOLVED");
+		expect((await call(OWNER, path)).body.baseBranch).toBe("main");
+		// A base that resolves is saved; then back to main.
+		git(repo, "branch", "-f", "release", "main");
+		const saved = await call(MEMBER, path, { method: "PATCH", body: { baseBranch: "release" } });
+		expect(saved.status).toBe(200);
+		expect(saved.body.baseBranch).toBe("release");
+		// Changing only the brief runs no branch check.
+		expect(
+			(await call(MEMBER, path, { method: "PATCH", body: { brief: "Be kind." } })).status,
+		).toBe(200);
+		expect(
+			(await call(MEMBER, path, { method: "PATCH", body: { baseBranch: "main" } })).body.baseBranch,
+		).toBe("main");
+	});
+
+	test("a diff opens from the repository root when the coordinator works in a subdirectory", async () => {
+		resetWorkStatCacheForTests();
+		const { item } = await readyItem("Root readme", { "README.md": "more\n" });
+		git(repo, "merge", "-q", "--no-ff", "-m", "land readme", item.branchName ?? "");
+		expect(
+			work.markMergedByAncestry({
+				itemId: item.id,
+				head: item.headSha ?? "",
+				base: "main",
+				expectedHeadSha: item.headSha,
+				expectedUpdatedAt: item.updatedAt,
+			}),
+		).toBe(true);
+		// Merged: read in the repository through the coordinator's working directory.
+		mkdirSync(join(repo, "frontend"), { recursive: true });
+		writeFileSync(join(repo, "frontend", "README.md"), "a different file\n");
+		const before = db
+			.select({ cwd: narrators.cwd })
+			.from(narrators)
+			.where(eq(narrators.id, teamId))
+			.get();
+		await db
+			.update(narrators)
+			.set({ cwd: join(repo, "frontend") })
+			.where(eq(narrators.id, teamId));
+		try {
+			const detail = await call(READER, teamPath(`work/${item.id}`));
+			expect(detail.body.files).toEqual([{ path: "README.md", added: 1, removed: 1 }]);
+			const diff = await call(READER, teamPath(`work/${item.id}/diff?path=README.md`));
+			expect(diff.status).toBe(200);
+			expect(diff.body.text).toContain("+more");
+		} finally {
+			await db
+				.update(narrators)
+				.set({ cwd: before?.cwd ?? repo })
+				.where(eq(narrators.id, teamId));
+		}
+	});
+
+	test("a question's prompt and option explanations come from the normalized shape", async () => {
+		const { questionForm, questionPreview } = await import("../../services/teams/team-board");
+		const input = JSON.stringify({
+			questions: [
+				{
+					header: "Rounding",
+					description: "Which rule rounds a 0.005 remainder?",
+					options: [
+						{ header: "Half up", description: "0.5 rounds away from zero" },
+						{ header: "Banker's" },
+					],
+				},
+			],
+		});
+		expect(questionPreview(input)).toEqual(["Which rule rounds a 0.005 remainder?"]);
+		expect(questionForm(input)).toEqual({
+			header: "Rounding",
+			description: "Which rule rounds a 0.005 remainder?",
+			options: ["Half up", "Banker's"],
+			optionDescriptions: ["0.5 rounds away from zero", null],
+			multiSelect: false,
+		});
+		// The legacy shape still reads: the body in `question`.
+		expect(
+			questionPreview(
+				JSON.stringify({ questions: [{ question: "Ship today?", header: "When", options: [] }] }),
+			),
+		).toEqual(["Ship today?"]);
+	});
+});

@@ -370,8 +370,12 @@ export function teamApprovalKind(toolName: string): TeamApprovalKind {
 
 /** One question answered in place on the team page (`TeamPendingApproval.answerForm`). */
 export interface TeamQuestionForm {
-	/** The answers key the session's own form sends (the question's header). */
+	/** The answers key the session's own form sends (the question's header), also its title. */
 	header: string;
+	/** The question's full prompt under its title (the normalized `description`), if any. */
+	description: string | null;
+	/** Each option's explanation, in the order of {@link options}; null when it has none. */
+	optionDescriptions: (string | null)[];
 	/**
 	 * The option titles exactly as the session's form sends them (the answer value): never
 	 * shortened here, the page clips only what it displays. At most

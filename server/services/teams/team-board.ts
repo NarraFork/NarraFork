@@ -697,8 +697,12 @@ export function questionForm(prefix: string | null): TeamQuestionForm | null {
 	const only = questions.length === 1 ? questions[0] : undefined;
 	if (!only || only.options.length === 0 || only.options.length > TEAM_QUESTION_OPTIONS_MAX)
 		return null;
+	// The same normalized shape the session's form renders: title, prompt, options with their
+	// explanations. All of it comes from the bounded prefix, which parsed whole.
 	return {
 		header: only.header,
+		description: only.description?.trim() || null,
+		optionDescriptions: only.options.map((option) => option.description?.trim() || null),
 		// The answer value is the option's whole title: never shortened (the page clips only what
 		// it shows). The prefix this reads is bounded, so the titles are too.
 		options: only.options.map((option) => option.header),
@@ -721,13 +725,13 @@ export function questionPreview(prefix: string | null): string[] {
 	let texts: string[] = [];
 	try {
 		const parsed = JSON.parse(prefix) as { questions?: unknown };
-		if (Array.isArray(parsed.questions))
-			texts = parsed.questions.map((question) =>
-				question && typeof question === "object"
-					? String((question as { question?: unknown }).question ?? "")
-					: "",
-			);
+		// The normalized shape (legacy `question` bodies included): the prompt, else the title.
+		texts = coerceAskQuestionShape(parsed.questions).map(
+			(question) => question.description?.trim() || question.header,
+		);
 	} catch {
+		// A cut-off input (its session has the full form): the legacy `question` bodies it shows.
+		// Not `description` / `header`: options carry those keys too.
 		for (const match of prefix.matchAll(/"question"\s*:\s*"((?:[^"\\]|\\.)*)"/g)) {
 			try {
 				texts.push(JSON.parse(`"${match[1]}"`) as string);

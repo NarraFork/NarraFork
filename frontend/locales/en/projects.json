@@ -496,7 +496,13 @@
 				"title": "Team settings",
 				"save": "Save",
 				"saved": "Team settings saved",
-				"failed": "Could not save the settings."
+				"failed": "Could not save the settings.",
+				"errors": {
+					"TEAM_BASE_BRANCH_UNRESOLVED": "\"{{branch}}\" does not name a commit in the project's repository. Check the branch name.",
+					"TEAM_PROJECT_NOT_GIT": "The project's directory is not a git repository, so no base branch can be checked.",
+					"TEAM_PROJECT_CHANGED": "The project's repository changed meanwhile. Try again.",
+					"TEAM_ARCHIVED": "The team is archived; restore it before changing its settings."
+				}
 			},
 			"marks": {
 				"exclusive": "Holds the exclusive path lock ({{key}})",

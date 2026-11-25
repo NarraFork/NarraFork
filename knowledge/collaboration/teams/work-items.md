@@ -97,7 +97,7 @@ verified_at: 3a43303a2
 事件与 check-in：
 - 每次状态变更、评审、同步、清理、check-in、决策都追加一行 `team_work_events`（`recordWorkEvent`）。actor 为 person / agent / system，详情上限 8KB。
 - check-in 是一个团队只保留一个的定时唤醒（5 分钟到 1 天），记为 `team.checkin` 事件，重启与取消归档时重新装填。
-- 服务端读 git 只经 `teams/team-git.ts`：禁用 hook、fsmonitor、外部 diff/textconv、写 index，读上限沿用 `gitService`（60s、1MB；`readBlob` 按 blob 大小限输出）。`changedPaths`、`branchFileChanges`、`treeEntry`、`treeBlobs`、`readBlob`、`mergeBase`、`numstat`（`diff --numstat -z`，512KB 上限，超出标 `truncated`）、`fileDiff`（单个字面路径 `:(literal)` 的 `diff -U3`，经 `stdoutStream` 读到上限 +1 字节即停）只读提交与对象，不读工作区；前两者可传入钉住的提交。团队页的大小、抽屉与 diff 都经它们（`team-work-view.ts`）。同一文件的 `isGitWorkTree`（10s 超时）供建团队和 `resolve-directory` 判断项目目录是否 git 工作树。
+- 服务端读 git 只经 `teams/team-git.ts`：禁用 hook、fsmonitor、外部 diff/textconv、写 index，读上限沿用 `gitService`（60s、1MB；`readBlob` 按 blob 大小限输出）。`changedPaths`、`branchFileChanges`、`treeEntry`、`treeBlobs`、`readBlob`、`mergeBase`、`numstat`（`diff --numstat --no-relative -z`，路径总是相对仓库根，512KB 上限，超出标 `truncated`）、`fileDiff`（单个从仓库根算起的字面路径 `:(top,literal)` 的 `diff -U3 --no-relative`，git 在子目录里跑也一样，经 `stdoutStream` 读到上限 +1 字节即停）只读提交与对象，不读工作区；前两者可传入钉住的提交。团队页的大小、抽屉与 diff 都经它们（`team-work-view.ts`）。同一文件的 `isGitWorkTree`（10s 超时）供建团队和 `resolve-directory` 判断项目目录是否 git 工作树。
 
 `Team` 工具（`server/lib/agent/tools/team.ts`，仅 team trait 会话提供）：
 - 动作：work.list/create/review/ready/sync/cancel、brief、checkin、cleanup、decision；`work.list` 最多 30 项。
