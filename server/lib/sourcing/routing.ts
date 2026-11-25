@@ -77,6 +77,13 @@ export function keyRouting<T extends KeyConfig>(
 		streamIdentity?: (config: T) => string;
 		/** Model-specific transport constraints are checked on the same credential as quota. */
 		isEligible?: (config: T, model?: string) => boolean;
+		/** Source owner decides comparable balance authority; generic windows/errors stay separate. */
+		balanceSources?: (
+			probe: QuotaSnapshot | undefined,
+			stream: QuotaSnapshot | undefined,
+			now: number,
+			streamMaxAgeMs: number,
+		) => { probe: boolean; stream: boolean };
 	} = {},
 ): CredentialRouting {
 	function state(group: SourceGroupView, now: number, model?: string) {
@@ -94,19 +101,21 @@ export function keyRouting<T extends KeyConfig>(
 				current && options.streamIdentity
 					? quotaStore.peekForIdentity(key.id, options.streamIdentity(current), STREAM_QUOTA_SOURCE)
 					: undefined;
+			const probe = current && quotaStore.peekForIdentity(key.id, identity(current));
+			const balances = options.balanceSources?.(probe, stream, now, STREAM_BALANCE_MAX_AGE_MS);
 			const block = combine([
 				{ blocked: !!current && options.isEligible?.(current, model) === false },
 				{
 					blocked: !!failure && failure.reason !== "rate_limited",
 					until: failure?.until,
 				},
+				quotaBlock(probe, now, !options.probeBalanceIsFallback && (balances?.probe ?? true)),
+				// Only the owner's comparable NUG balance choice changes; windows remain independent.
 				quotaBlock(
-					current && quotaStore.peekForIdentity(key.id, identity(current)),
+					stream,
 					now,
-					!options.probeBalanceIsFallback,
+					balances?.stream ?? (!!stream && now - stream.fetchedAt < STREAM_BALANCE_MAX_AGE_MS),
 				),
-				// Do not merge sources or let a wallet refresh clear an independent key window.
-				quotaBlock(stream, now, !!stream && now - stream.fetchedAt < STREAM_BALANCE_MAX_AGE_MS),
 			]);
 			return { key, block, rateLimited: failure?.reason === "rate_limited" };
 		});

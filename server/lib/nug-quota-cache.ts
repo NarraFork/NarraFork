@@ -14,6 +14,9 @@ export interface NugQuotaCache {
 	detailedQuotaBalance: string | null;
 	extra?: unknown;
 	fetchedAt: number;
+	/** Private host observation times: null = never observed; absent = legacy fetchedAt. */
+	_remainingObservedAt?: number | null;
+	_totalObservedAt?: number | null;
 }
 
 export type NugQuotaSubject = UsageSubject<NUGProviderConfig>;
@@ -25,6 +28,33 @@ function normalizeNullableNumber(value: unknown): number | null {
 	if (typeof value !== "number" && (typeof value !== "string" || !value.trim())) return null;
 	const numericValue = typeof value === "number" ? value : Number(value);
 	return Number.isFinite(numericValue) ? numericValue : null;
+}
+
+type AmountField = "remaining" | "total";
+function observationMetadata(value: unknown): number | null | undefined {
+	return value === null
+		? null
+		: typeof value === "number" && Number.isFinite(value) && value >= 0
+			? value
+			: undefined;
+}
+function amountTime(cache: NugQuotaCache, field: AmountField): number | null {
+	const held = observationMetadata(
+		field === "remaining" ? cache._remainingObservedAt : cache._totalObservedAt,
+	);
+	return held === undefined ? cache.fetchedAt : held;
+}
+function amountFields(remaining: number | null, total: number | null, fetchedAt: number) {
+	return {
+		...(remaining !== fetchedAt ? { _remainingObservedAt: remaining } : {}),
+		...(total !== fetchedAt ? { _totalObservedAt: total } : {}),
+	};
+}
+/** Presence is separate from value: explicit null/invalid is authoritative unknown, not fallback. */
+function observedNumber(data: object, names: readonly string[]): number | null | undefined {
+	const record = data as Record<string, unknown>;
+	const field = names.find((name) => Object.hasOwn(record, name));
+	return field === undefined ? undefined : normalizeNullableNumber(record[field]);
 }
 
 function normalizeNullableString(value: unknown): string | null {
@@ -96,24 +126,28 @@ export function buildNugQuotaCache(
 	existing?: NugQuotaCache,
 ): NugQuotaCache {
 	const detailedQuotaBalance = nugQuotaDetailsFrom(data) ?? existing?.detailedQuotaBalance ?? null;
+	const fetchedAt = Date.now();
+	const balance = observedNumber(data, ["balance", "quotaBalance", "remaining"]);
+	const total = observedNumber(data, [
+		"totalGranted",
+		"quotaTotalGranted",
+		"total_granted",
+		"total",
+	]);
+	const remainingAt =
+		balance !== undefined ? fetchedAt : existing ? amountTime(existing, "remaining") : null;
+	const totalAt = total !== undefined ? fetchedAt : existing ? amountTime(existing, "total") : null;
 	return {
-		balance:
-			normalizeNullableNumber(data.balance ?? data.quotaBalance ?? data.remaining) ??
-			existing?.balance ??
-			null,
-		totalGranted:
-			normalizeNullableNumber(
-				data.totalGranted ?? data.quotaTotalGranted ?? data.total_granted ?? data.total,
-			) ??
-			existing?.totalGranted ??
-			null,
+		balance: balance !== undefined ? balance : (existing?.balance ?? null),
+		totalGranted: total !== undefined ? total : (existing?.totalGranted ?? null),
 		detailedQuotaBalance,
 		...(data.extra !== undefined
 			? { extra: data.extra }
 			: existing?.extra !== undefined
 				? { extra: existing.extra }
 				: {}),
-		fetchedAt: Date.now(),
+		fetchedAt,
+		...amountFields(remainingAt, totalAt, fetchedAt),
 	};
 }
 
@@ -137,13 +171,20 @@ function nugQuotaSnapshot(cache: NugQuotaCache): QuotaSnapshot {
 function restoreSnapshot(snapshot: QuotaSnapshot): QuotaSnapshot | null {
 	if (!snapshot.detail || typeof snapshot.detail !== "object") return null;
 	const detail = snapshot.detail as Record<string, unknown>;
-	return nugQuotaSnapshot({
-		balance: normalizeNullableNumber(detail.balance),
-		totalGranted: normalizeNullableNumber(detail.totalGranted),
-		detailedQuotaBalance: normalizeNullableString(detail.detailedQuotaBalance),
-		...(detail.extra !== undefined ? { extra: detail.extra } : {}),
-		fetchedAt: snapshot.fetchedAt,
-	});
+	const remainingAt = observationMetadata(detail._remainingObservedAt);
+	const totalAt = observationMetadata(detail._totalObservedAt);
+	return {
+		...snapshot,
+		...nugQuotaSnapshot({
+			balance: normalizeNullableNumber(detail.balance),
+			totalGranted: normalizeNullableNumber(detail.totalGranted),
+			detailedQuotaBalance: normalizeNullableString(detail.detailedQuotaBalance),
+			...(detail.extra !== undefined ? { extra: detail.extra } : {}),
+			fetchedAt: snapshot.fetchedAt,
+			...(remainingAt !== undefined ? { _remainingObservedAt: remainingAt } : {}),
+			...(totalAt !== undefined ? { _totalObservedAt: totalAt } : {}),
+		}),
+	};
 }
 
 function subject(config: NUGProviderConfig): NugQuotaSubject;
@@ -183,6 +224,99 @@ function rememberCredential(providerId: string, credentialId: string): void {
 	knownCredentialIds.set(providerId, ids);
 }
 
+function snapshotAmountTime(snapshot: QuotaSnapshot, field: AmountField): number | null {
+	return amountTime(cacheFromSnapshot(snapshot), field);
+}
+function expired(snapshot: QuotaSnapshot, now: number): boolean {
+	const expiresAt = (snapshot as QuotaSnapshot & { expiresAt?: number }).expiresAt;
+	return typeof expiresAt === "number" && Number.isFinite(expiresAt) && expiresAt <= now;
+}
+function comparableWallets(probe: QuotaSnapshot, stream: QuotaSnapshot, now: number): boolean {
+	return (
+		probe.scope === "wallet" &&
+		stream.scope === "wallet" &&
+		!probe.error &&
+		!stream.error &&
+		!expired(probe, now) &&
+		!expired(stream, now) &&
+		Number.isFinite(probe.fetchedAt) &&
+		probe.fetchedAt > 0 &&
+		Number.isFinite(stream.fetchedAt) &&
+		stream.fetchedAt > 0 &&
+		probe.balances.length === 1 &&
+		stream.balances.length === 1 &&
+		probe.balances[0]?.unit === stream.balances[0]?.unit &&
+		!probe.balances[0]?.unlimited &&
+		!stream.balances[0]?.unlimited
+	);
+}
+function amountSource(
+	probe: QuotaSnapshot,
+	stream: QuotaSnapshot,
+	field: AmountField,
+): "probe" | "stream" {
+	const probeAt = snapshotAmountTime(probe, field);
+	const streamAt = snapshotAmountTime(stream, field);
+	return streamAt !== null && (probeAt === null || streamAt > probeAt) ? "stream" : "probe";
+}
+/** A read-only view, never a write into either source slot. */
+function quotaView(
+	probe: QuotaSnapshot | undefined,
+	stream: QuotaSnapshot | undefined,
+): QuotaSnapshot | undefined {
+	const latest = stream && (!probe || stream.fetchedAt >= probe.fetchedAt) ? stream : probe;
+	if (!probe || !stream || !latest || !comparableWallets(probe, stream, Date.now())) return latest;
+	const remaining = amountSource(probe, stream, "remaining") === "stream" ? stream : probe;
+	const total = amountSource(probe, stream, "total") === "stream" ? stream : probe;
+	const {
+		_remainingObservedAt: _remaining,
+		_totalObservedAt: _total,
+		...base
+	} = cacheFromSnapshot(latest);
+	const projected = nugQuotaSnapshot({
+		...base,
+		balance: normalizeNullableNumber(remaining.balances[0]?.remaining),
+		totalGranted: normalizeNullableNumber(total.balances[0]?.total),
+		...amountFields(
+			snapshotAmountTime(remaining, "remaining"),
+			snapshotAmountTime(total, "total"),
+			latest.fetchedAt,
+		),
+	});
+	return {
+		...latest,
+		balances: [{ ...projected.balances[0], unit: latest.balances[0]?.unit ?? "" }],
+		detail: projected.detail,
+	};
+}
+
+/** Same owner clock policy for Auto; keep independent windows/error/unknown checks intact. */
+export function nugQuotaBalanceSources(
+	probe: QuotaSnapshot | undefined,
+	stream: QuotaSnapshot | undefined,
+	now: number,
+	streamMaxAgeMs: number,
+): { probe: boolean; stream: boolean } {
+	const streamAt = stream ? snapshotAmountTime(stream, "remaining") : null;
+	const base = {
+		probe: !probe || !expired(probe, now),
+		stream:
+			!!stream && !expired(stream, now) && streamAt !== null && now - streamAt < streamMaxAgeMs,
+	};
+	if (!probe || !stream || !base.stream || !comparableWallets(probe, stream, now)) return base;
+	const remaining = probe.balances[0]?.remaining;
+	const reported = stream.balances[0]?.remaining;
+	if (
+		typeof remaining !== "number" ||
+		!Number.isFinite(remaining) ||
+		typeof reported !== "number" ||
+		!Number.isFinite(reported)
+	)
+		return base;
+	const selected = amountSource(probe, stream, "remaining");
+	return { probe: selected === "probe", stream: selected === "stream" };
+}
+
 function snapshotOf(
 	config: NUGProviderConfig,
 	credentialId?: string,
@@ -198,7 +332,7 @@ function snapshotOf(
 	if (credentialId !== undefined) return probe;
 	// Only the legacy source-level view merges the current first key's two slots.
 	const stream = quotaStore.get(credential.id, key, restoreSnapshot, STREAM_QUOTA_SOURCE);
-	return stream && (!probe || stream.fetchedAt >= probe.fetchedAt) ? stream : probe;
+	return quotaView(probe, stream);
 }
 
 /** Read an exact credential without changing the legacy first-key view or starting IO. */
@@ -292,7 +426,7 @@ export function updateNugQuotaByPrefix(
 	const identity = nugQuotaIdentity(credential.config);
 	const probe = quotaStore.get(credential.id, identity, restoreSnapshot);
 	const stream = quotaStore.get(credential.id, identity, restoreSnapshot, STREAM_QUOTA_SOURCE);
-	const previous = stream && (!probe || stream.fetchedAt >= probe.fetchedAt) ? stream : probe;
+	const previous = quotaView(probe, stream);
 	const cache = buildNugQuotaCache(
 		{
 			balance: quotaBalance,
@@ -306,9 +440,17 @@ export function updateNugQuotaByPrefix(
 }
 
 function cacheFromSnapshot(snapshot: QuotaSnapshot): NugQuotaCache {
+	const { _remainingObservedAt, _totalObservedAt, ...values } = (snapshot.detail ?? {}) as Record<
+		string,
+		unknown
+	>;
+	const remainingAt = observationMetadata(_remainingObservedAt);
+	const totalAt = observationMetadata(_totalObservedAt);
 	return {
-		...(snapshot.detail as Omit<NugQuotaCache, "fetchedAt">),
+		...(values as Omit<NugQuotaCache, "fetchedAt">),
 		fetchedAt: snapshot.fetchedAt,
+		...(remainingAt !== undefined ? { _remainingObservedAt: remainingAt } : {}),
+		...(totalAt !== undefined ? { _totalObservedAt: totalAt } : {}),
 	};
 }
 
@@ -320,7 +462,11 @@ export function getNugCachedQuota(
 	const config = (settings.nugProviders ?? []).find((provider) => provider.id === providerId);
 	if (!config || (expectedSubject && !matchingSubject(config, expectedSubject))) return;
 	const snapshot = snapshotOf(config, expectedSubject?.id);
-	return snapshot && cacheFromSnapshot(snapshot);
+	if (!snapshot) return;
+	const cache = cacheFromSnapshot(snapshot);
+	if (expectedSubject) return cache;
+	const { _remainingObservedAt: _remaining, _totalObservedAt: _total, ...legacy } = cache;
+	return legacy;
 }
 
 export function getAllNugCachedQuotas(): Record<

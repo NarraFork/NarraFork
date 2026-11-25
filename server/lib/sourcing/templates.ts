@@ -29,7 +29,12 @@ import { customApiStreamQuotaIdentity } from "../custom-api-quota-cache";
 import { deepSeekQuotaIdentity, probeDeepSeekQuota } from "../deepseek-balance-cache";
 import { kimiQuotaIdentity, probeKimiQuota } from "../kimi-usage-cache";
 import { resolveKnownUnavailableNugModel } from "../nug-model-availability";
-import { type NugQuotaSubject, nugQuotaIdentity, probeNugQuota } from "../nug-quota-cache";
+import {
+	type NugQuotaSubject,
+	nugQuotaBalanceSources,
+	nugQuotaIdentity,
+	probeNugQuota,
+} from "../nug-quota-cache";
 import { opencodeQuotaIdentity, probeOpencodeQuota } from "../opencode-usage-cache";
 import { probeRelayQuota, providerBalanceQuotaIdentity } from "../provider-balance-cache";
 import type { UsageSubject } from "../provider-key-subjects";
@@ -169,7 +174,11 @@ const ROUTING: Partial<Record<ServiceTemplateId, RoutingBehavior>> = {
 		...keyRouting(
 			(group) => settings.nugProviders?.find((provider) => provider.id === group.id),
 			nugQuotaIdentity,
-			{ streamIdentity: nugQuotaIdentity, isEligible: isNugRelayEligible },
+			{
+				streamIdentity: nugQuotaIdentity,
+				isEligible: isNugRelayEligible,
+				balanceSources: nugQuotaBalanceSources,
+			},
 		),
 		isModelAvailable: (group, value) => !resolveKnownUnavailableNugModel(value, group.prefix),
 	},

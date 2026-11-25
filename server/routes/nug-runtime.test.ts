@@ -1,17 +1,19 @@
-import { afterEach, expect, spyOn, test } from "bun:test";
+import { afterEach, expect, setSystemTime, spyOn, test } from "bun:test";
 import { Hono } from "hono";
 import { NugProvider } from "../lib/agent/nug-provider";
 import { setOutboundFetchOverrideForTest } from "../lib/net/outbound-fetch";
 import * as quota from "../lib/nug-quota-cache";
+import { streamQuotaIdentityForRequest } from "../lib/provider-key-subjects";
 import { getProviderKeyStore, nugKeyOwner } from "../lib/provider-keys";
 import { getSettingsRevision, saveSettings, settings } from "../lib/settings";
-import { quotaStore } from "../lib/sourcing/quota-store";
+import { quotaStore, STREAM_QUOTA_SOURCE } from "../lib/sourcing/quota-store";
 import { fetchAllNugQuotas, nugRoutes } from "./nug";
 
 const app = new Hono().route("/api/nug", nugRoutes);
 const id = "runtime-cached-nug";
 const saved = structuredClone(settings);
 afterEach(() => {
+	setSystemTime();
 	setOutboundFetchOverrideForTest(null);
 	quota.purgeNugQuotaCache([id]);
 	getProviderKeyStore().removeProvider(nugKeyOwner(id));
@@ -51,6 +53,7 @@ for (const source of ["startup", "manual"] as const) {
 			}),
 			capturedA,
 		);
+		const observedA = quotaStore.peek(first.id)?.fetchedAt;
 		const backup = keys.add(nugKeyOwner(id), { apiKey: "credential-B" });
 		keys.reorder(nugKeyOwner(id), [backup.id, first.id]);
 		const capturedB = quota.captureNugQuotaSubject(config);
@@ -90,7 +93,11 @@ for (const source of ["startup", "manual"] as const) {
 				detailedQuotaBalance: "A probe details",
 				extra: { owner: "A" },
 			};
-			expect(quotaStore.peek(first.id)?.detail).toEqual(expectedA);
+			expect(quotaStore.peek(first.id)?.detail).toMatchObject(expectedA);
+			const probe = quota.getNugCachedQuota(id, capturedA);
+			expect(probe?._totalObservedAt ?? probe?.fetchedAt).toBe(observedA);
+			if (source === "manual")
+				expect(probe?._remainingObservedAt ?? probe?.fetchedAt).toBe(observedA);
 			expect(quotaStore.peek(backup.id)).toEqual(beforeB);
 			expect(quota.getNugCachedQuota(id)).toMatchObject({
 				balance: 22,
@@ -98,7 +105,7 @@ for (const source of ["startup", "manual"] as const) {
 			});
 			await quotaStore.flush();
 			quotaStore.forget(first.id);
-			expect(quota.getNugQuotaSnapshot(id, first.id)?.snapshot?.detail).toEqual(expectedA);
+			expect(quota.getNugQuotaSnapshot(id, first.id)?.snapshot?.detail).toMatchObject(expectedA);
 			expect(quotaStore.peek(backup.id)).toEqual(beforeB);
 		} finally {
 			finish.resolve(Response.json({}));
@@ -107,6 +114,168 @@ for (const source of ["startup", "manual"] as const) {
 		}
 	});
 }
+
+for (const source of ["startup", "manual", "manual reverse"] as const) {
+	test(`${source} metadata-only probe keeps the real observation order against stream 0`, async () => {
+		saveSettings({
+			...settings,
+			proxy: { mode: "direct" },
+			nugProviders: [
+				{
+					id,
+					name: "Timed quota",
+					prefix: "cached-nug",
+					apiKey: "credential-A",
+					baseUrl: "https://quota-timed.invalid",
+					defaultModel: "anthropic:test",
+					proxy: { mode: "direct" },
+				},
+			],
+		});
+		const config = settings.nugProviders?.[0];
+		if (!config) throw new Error("missing timed quota connection");
+		const captured = quota.captureNugQuotaSubject(config);
+		const start = Date.now();
+		const probe = () =>
+			quota.setNugCachedQuota(
+				id,
+				quota.buildNugQuotaCache({ balance: 11, totalGranted: 100 }),
+				captured,
+			);
+		const stream = () =>
+			quota.updateNugQuotaByPrefix(
+				config.prefix,
+				0,
+				null,
+				undefined,
+				streamQuotaIdentityForRequest(config.prefix, { credentialId: captured.id }),
+			);
+		setSystemTime(start);
+		if (source === "manual reverse") stream();
+		else probe();
+		setSystemTime(start + 1000);
+		if (source === "manual reverse") probe();
+		else stream();
+		const streamBefore = structuredClone(quotaStore.peek(captured.id, STREAM_QUOTA_SOURCE));
+		const started = Promise.withResolvers<void>();
+		const finish = Promise.withResolvers<void>();
+		let payload: Record<string, unknown> = { totalGranted: 111 };
+		let calls = 0;
+		setOutboundFetchOverrideForTest(async () => {
+			calls++;
+			started.resolve();
+			await finish.promise;
+			return Response.json(payload);
+		});
+		const task =
+			source === "startup" ? fetchAllNugQuotas() : app.request(`/api/nug/providers/${id}/quota`);
+		const settled = Promise.allSettled([task]);
+		try {
+			await started.promise;
+			setSystemTime(start + 2000);
+			finish.resolve();
+			await task;
+			expect(quotaStore.peek(captured.id)?.fetchedAt).toBe(start + 2000);
+			expect(quotaStore.peek(captured.id)?.balances[0]?.remaining).toBe(11);
+			expect(quotaStore.peek(captured.id, STREAM_QUOTA_SOURCE)).toEqual(streamBefore);
+			const header = await app.request(
+				`/api/nug/quotas?providerId=${id}&expectedGeneration=${getSettingsRevision()}`,
+			);
+			expect((await header.json()).quota).toMatchObject({
+				balance: source === "manual reverse" ? 11 : 0,
+				totalGranted: 111,
+			});
+			expect(quota.getNugCachedQuota(id, captured)?._remainingObservedAt).toBe(
+				start + (source === "manual reverse" ? 1000 : 0),
+			);
+			await quotaStore.flush();
+			quotaStore.forget(captured.id);
+			quotaStore.forget(captured.id, STREAM_QUOTA_SOURCE);
+			expect(quota.getNugCachedQuota(id)).toMatchObject({
+				balance: source === "manual reverse" ? 11 : 0,
+				totalGranted: 111,
+			});
+			setSystemTime(start + 3000);
+			payload = { balance: 11 };
+			expect((await app.request(`/api/nug/providers/${id}/quota`)).status).toBe(200);
+			expect(quota.getNugCachedQuota(id)).toMatchObject({ balance: 11, totalGranted: 111 });
+			expect(quotaStore.peek(captured.id, STREAM_QUOTA_SOURCE)).toEqual(streamBefore);
+			expect(calls).toBe(2);
+		} finally {
+			finish.resolve();
+			await settled;
+			setOutboundFetchOverrideForTest(null);
+		}
+	});
+}
+
+test("stream-only metadata stays displayable but explicit unknown and failed probes cannot revive it", async () => {
+	saveSettings({
+		...settings,
+		proxy: { mode: "direct" },
+		nugProviders: [
+			{
+				id,
+				name: "Unknown quota",
+				prefix: "cached-nug",
+				apiKey: "credential-A",
+				baseUrl: "https://quota-unknown.invalid",
+				defaultModel: "anthropic:test",
+				proxy: { mode: "direct" },
+			},
+		],
+	});
+	const config = settings.nugProviders?.[0];
+	if (!config) throw new Error("missing unknown quota connection");
+	const captured = quota.captureNugQuotaSubject(config);
+	const start = Date.now();
+	setSystemTime(start);
+	quota.updateNugQuotaByPrefix(
+		config.prefix,
+		0,
+		null,
+		undefined,
+		streamQuotaIdentityForRequest(config.prefix, { credentialId: captured.id }),
+	);
+	const streamBefore = structuredClone(quotaStore.peek(captured.id, STREAM_QUOTA_SOURCE));
+	let payload: Record<string, unknown> = { totalGranted: 111, _remainingObservedAt: 987654321 };
+	let status = 200;
+	setOutboundFetchOverrideForTest(async () => Response.json(payload, { status }));
+	const probe = () => app.request(`/api/nug/providers/${id}/quota`);
+	setSystemTime(start + 1000);
+	expect((await probe()).status).toBe(200);
+	expect(quota.getNugCachedQuota(id, captured)).toMatchObject({
+		balance: null,
+		totalGranted: 111,
+		_remainingObservedAt: null,
+	});
+	expect(quota.getNugCachedQuota(id)).toMatchObject({ balance: 0, totalGranted: 111 });
+	await quotaStore.flush();
+	quotaStore.forget(captured.id);
+	quotaStore.forget(captured.id, STREAM_QUOTA_SOURCE);
+	expect(quota.getNugCachedQuota(id)).toMatchObject({ balance: 0, totalGranted: 111 });
+	setSystemTime(start + 2000);
+	payload = { balance: null, _remainingObservedAt: null };
+	expect((await probe()).status).toBe(200);
+	expect(quota.getNugCachedQuota(id)?.balance).toBeNull();
+	const beforeFailure = structuredClone(quotaStore.peek(captured.id));
+	setSystemTime(start + 3000);
+	status = 502;
+	expect((await probe()).status).toBe(502);
+	expect(quotaStore.peek(captured.id)).toEqual(beforeFailure);
+	expect(quota.getNugCachedQuota(id)?.balance).toBeNull();
+	setSystemTime(start + 4000);
+	status = 200;
+	payload = { balance: "invalid", _remainingObservedAt: null };
+	expect((await probe()).status).toBe(200);
+	expect(quota.getNugCachedQuota(id)?.balance).toBeNull();
+	setSystemTime(start + 5000);
+	payload = { totalGranted: 222 };
+	expect((await probe()).status).toBe(200);
+	expect(quota.getNugCachedQuota(id, captured)?._remainingObservedAt).toBe(start + 4000);
+	expect(quota.getNugCachedQuota(id)).toMatchObject({ balance: null, totalGranted: 222 });
+	expect(quotaStore.peek(captured.id, STREAM_QUOTA_SOURCE)).toEqual(streamBefore);
+});
 
 test("header quota view only reads one identity-protected cache; never calls upstream RPC", async () => {
 	settings.nugProviders = [

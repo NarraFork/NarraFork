@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
 import { existsSync } from "node:fs";
 import type { CredentialNetwork } from "@shared/credential-network";
 import { Hono } from "hono";
@@ -96,6 +96,7 @@ function expectLateNugQuotaRejected(expectedIdentity: string): void {
 }
 
 afterEach(() => {
+	setSystemTime();
 	purgeNugQuotaCache([providerId]);
 	getProviderKeyStore().removeProvider(nugKeyOwner(providerId));
 	saveSettings(original);
@@ -105,6 +106,8 @@ afterEach(() => {
 describe("NUG quota snapshots", () => {
 	test("legacy quotas round-trip field for field and stream updates stay partial", async () => {
 		useProvider();
+		const start = Date.now();
+		setSystemTime(start);
 		setNugCachedQuota(
 			providerId,
 			buildNugQuotaCache({
@@ -127,6 +130,7 @@ describe("NUG quota snapshots", () => {
 			{ unit: "", remaining: 12, total: 30 },
 		]);
 
+		setSystemTime(start + 1000);
 		reportNugQuota("nug-quota", 7);
 		expect(getNugCachedQuota(providerId)).toEqual({
 			balance: 7,
@@ -177,6 +181,139 @@ describe("NUG quota snapshots", () => {
 		getProviderKeyStore().update(second.id, { apiKey: "key-other" });
 		expect(getNugCachedQuota(providerId)).toBeUndefined();
 		quotaStore.remove(second.id);
+	});
+
+	test("Auto excludes a newer stream zero through partial probes and recovers on a real newer balance", async () => {
+		const config = useProvider();
+		const captured = captureNugQuotaSubject(config);
+		const { autoSourceFacts } = await import("../agent/auto-route-signals");
+		const start = Date.now();
+		setSystemTime(start);
+		setNugCachedQuota(providerId, buildNugQuotaCache({ balance: 11, totalGranted: 100 }), captured);
+		setSystemTime(start + 1000);
+		reportNugQuota(config.prefix, 0);
+		expect(autoSourceFacts(config.prefix).available).toBe(false);
+		setSystemTime(start + 2000);
+		setNugCachedQuota(
+			providerId,
+			buildNugQuotaCache({ totalGranted: 111 }, getNugCachedQuota(providerId, captured)),
+			captured,
+		);
+		expect(autoSourceFacts(config.prefix).available).toBe(false);
+		setSystemTime(start + 3000);
+		setNugCachedQuota(
+			providerId,
+			buildNugQuotaCache({ balance: 11 }, getNugCachedQuota(providerId, captured)),
+			captured,
+		);
+		expect(autoSourceFacts(config.prefix).available).toBe(true);
+	});
+
+	for (const [probeBalance, streamBalance, available] of [
+		[11, 0, true],
+		[0, 11, false],
+	] as const) {
+		test(`same-ms probe ${probeBalance} wins stream ${streamBalance} in both legacy view and Auto`, async () => {
+			const config = useProvider();
+			const captured = captureNugQuotaSubject(config);
+			const { autoSourceFacts } = await import("../agent/auto-route-signals");
+			const now = Date.now();
+			setSystemTime(now);
+			setNugCachedQuota(
+				providerId,
+				buildNugQuotaCache({ balance: probeBalance, totalGranted: 100 }),
+				captured,
+			);
+			reportNugQuota(config.prefix, streamBalance);
+			expect(quotaStore.peek(captured.id)?.fetchedAt).toBe(now);
+			expect(quotaStore.peek(captured.id, STREAM_QUOTA_SOURCE)?.fetchedAt).toBe(now);
+			expect(getNugCachedQuota(providerId)?.balance).toBe(probeBalance);
+			expect(autoSourceFacts(config.prefix).available).toBe(available);
+			expect(quotaStore.peek(captured.id)?.balances[0]?.remaining).toBe(probeBalance);
+			expect(quotaStore.peek(captured.id, STREAM_QUOTA_SOURCE)?.balances[0]?.remaining).toBe(
+				streamBalance,
+			);
+		});
+	}
+
+	for (const invalid of ["not-a-time", Number.NaN, -1]) {
+		test(`invalid stored observation ${String(invalid)} falls back to legacy authority, never to never-observed`, async () => {
+			const config = useProvider();
+			const captured = captureNugQuotaSubject(config);
+			const start = Date.now();
+			setSystemTime(start);
+			reportNugQuota(config.prefix, 0);
+			setSystemTime(start + 1000);
+			quotaStore.set(
+				captured.id,
+				captured.identity,
+				{
+					fetchedAt: start + 1000,
+					scope: "wallet",
+					windows: [],
+					balances: [{ unit: "", remaining: null, total: 111 }],
+					detail: {
+						balance: null,
+						totalGranted: 111,
+						detailedQuotaBalance: null,
+						_remainingObservedAt: invalid,
+					},
+				},
+				Number.isFinite(invalid) || typeof invalid === "string",
+			);
+			expect(getNugCachedQuota(providerId)?.balance).toBeNull();
+			expect(getNugCachedQuota(providerId, captured)?._remainingObservedAt).toBeUndefined();
+			if (!Number.isNaN(invalid)) {
+				await quotaStore.flush();
+				quotaStore.forget(captured.id);
+				quotaStore.forget(captured.id, STREAM_QUOTA_SOURCE);
+				expect(getNugCachedQuota(providerId)?.balance).toBeNull();
+				expect(getNugCachedQuota(providerId, captured)?._remainingObservedAt).toBeUndefined();
+			}
+		});
+	}
+
+	test("owner clocks keep the stream TTL, restore errors and do not overlay an expired source", async () => {
+		const config = useProvider();
+		const captured = captureNugQuotaSubject(config);
+		const { autoSourceFacts } = await import("../agent/auto-route-signals");
+		const start = Date.now();
+		setSystemTime(start);
+		setNugCachedQuota(providerId, buildNugQuotaCache({ balance: 11, totalGranted: 100 }), captured);
+		setSystemTime(start + 1000);
+		reportNugQuota(config.prefix, 0);
+		const stream = structuredClone(quotaStore.peek(captured.id, STREAM_QUOTA_SOURCE));
+		setSystemTime(start + 2000);
+		setNugCachedQuota(
+			providerId,
+			buildNugQuotaCache({ totalGranted: 111 }, getNugCachedQuota(providerId, captured)),
+			captured,
+		);
+		const probe = structuredClone(quotaStore.peek(captured.id));
+		if (!probe || !stream) throw new Error("missing timed owner snapshots");
+		expect(autoSourceFacts(config.prefix).available).toBe(false);
+		setSystemTime(start + 61001);
+		expect(autoSourceFacts(config.prefix).available).toBe(true);
+		setSystemTime(start + 3000);
+		quotaStore.set(captured.id, captured.identity, {
+			...probe,
+			fetchedAt: start + 3000,
+			error: "quota_unavailable",
+		});
+		expect(getNugQuotaSnapshot(providerId)?.snapshot?.error).toBe("quota_unavailable");
+		expect(autoSourceFacts(config.prefix).available).toBe(false);
+		await quotaStore.flush();
+		quotaStore.forget(captured.id);
+		expect(getNugQuotaSnapshot(providerId, captured.id)?.snapshot?.error).toBe("quota_unavailable");
+		quotaStore.set(captured.id, captured.identity, probe);
+		const expiredStream = { ...stream, expiresAt: start + 1500 };
+		quotaStore.set(captured.id, captured.identity, expiredStream, true, STREAM_QUOTA_SOURCE);
+		expect(getNugCachedQuota(providerId)?.balance).toBe(11);
+		expect(autoSourceFacts(config.prefix).available).toBe(true);
+		expect(
+			getNugQuotaSnapshot(providerId, captured.id, STREAM_QUOTA_SOURCE)?.snapshot,
+		).toHaveProperty("expiresAt", start + 1500);
+		expect(quotaStore.peek(captured.id, STREAM_QUOTA_SOURCE)?.fetchedAt).toBe(start + 1000);
 	});
 
 	test("captured fallback stays on A's probe slot across reorder while legacy keeps its merged first-key view", () => {
@@ -237,6 +374,7 @@ describe("NUG quota snapshots", () => {
 			capturedA,
 		);
 		expect(getNugQuotaSnapshot(providerId, capturedA.id)?.snapshot?.detail).toEqual({
+			_totalObservedAt: 100,
 			balance: 5,
 			totalGranted: 111,
 			detailedQuotaBalance: "A probe",
@@ -300,6 +438,8 @@ describe("NUG quota snapshots", () => {
 			balance: null,
 			totalGranted: null,
 			detailedQuotaBalance: null,
+			_remainingObservedAt: null,
+			_totalObservedAt: null,
 		});
 	});
 
