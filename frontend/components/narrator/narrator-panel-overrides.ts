@@ -18,6 +18,7 @@
 
 import { DEFAULT_CONTEXT_THRESHOLDS } from "@shared/context-thresholds";
 import { type MessageWithBody, messageBody } from "@shared/narrator-blocks/message-blocks";
+import { isNugPaymentContext } from "@shared/nug-payment";
 import type { AsyncQuestion } from "../../types/narrator";
 import type { ContentBlock } from "./narrator-panel-types";
 import { PERM_MODES } from "./narrator-panel-types";
@@ -32,6 +33,9 @@ export function parsePersistedPaymentRequired(value: unknown): Partial<PaymentRe
 		const balance = typeof parsed.balance === "number" ? parsed.balance : undefined;
 		const required = typeof parsed.required === "number" ? parsed.required : undefined;
 		return {
+			...(isNugPaymentContext(parsed.paymentContext)
+				? { paymentContext: parsed.paymentContext }
+				: {}),
 			providerId: typeof parsed.providerId === "string" ? parsed.providerId : undefined,
 			providerPrefix: typeof parsed.providerPrefix === "string" ? parsed.providerPrefix : undefined,
 			balance,

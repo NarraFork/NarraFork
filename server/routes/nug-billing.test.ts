@@ -92,7 +92,12 @@ function app(userId: string | null = owner, external = false) {
 function create(userId = owner) {
 	return app(userId).request(ROOT, {
 		method: "POST",
-		body: JSON.stringify({ amount: 10, provider: "mockpay", channel: "alipay" }),
+		body: JSON.stringify({
+			amount: 10,
+			provider: "mockpay",
+			channel: "alipay",
+			intent: { mode: "standalone" },
+		}),
 	});
 }
 function query(
@@ -211,7 +216,7 @@ test("billing config and creation both skip disabled A for enabled B without reb
 					totalGranted: 20,
 				})
 			: order();
-	const config = await app().request(`/api/nug/providers/${ID}/billing/config`);
+	const config = await app().request(`/api/nug/providers/${ID}/billing/config?mode=standalone`);
 	expect(config.status).toBe(200);
 	expect(await config.json()).toMatchObject({ enabled: true, balance: 12 });
 	const bound = await created();
@@ -228,7 +233,9 @@ test("billing config and creation both skip disabled A for enabled B without reb
 test("managed but entirely disabled billing keys never fall back to the projected inline secret", async () => {
 	store.update(first.id, { disabled: true });
 	store.update(second.id, { disabled: true });
-	expect((await app().request(`/api/nug/providers/${ID}/billing/config`)).status).toBe(409);
+	expect(
+		(await app().request(`/api/nug/providers/${ID}/billing/config?mode=standalone`)).status,
+	).toBe(409);
 	expect((await create()).status).toBe(409);
 	expect(calls).toEqual([]);
 });

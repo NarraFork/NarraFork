@@ -355,6 +355,8 @@ export type NarratorServerMessage =
 	| {
 			type: "payment_required";
 			narratorId: string;
+			/** 服务器签发的专用 opaque context，不能由客户端推导凭据身份。 */
+			paymentContext?: string;
 			providerId?: string;
 			providerPrefix?: string;
 			balance?: number;

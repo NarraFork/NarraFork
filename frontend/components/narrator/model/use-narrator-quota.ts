@@ -1,5 +1,6 @@
 import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { useDisclosure } from "@mantine/hooks";
+import { isNugPaymentContext } from "@shared/nug-payment";
 import type { PublicQuotaSnapshot } from "@shared/quota-snapshot";
 import { useEffect } from "react";
 import type { PaymentRequiredInfo } from "../useNarratorPanelWS";
@@ -14,6 +15,9 @@ function parsePersistedPaymentRequired(value: unknown): Partial<PaymentRequiredI
 		const balance = typeof parsed.balance === "number" ? parsed.balance : undefined;
 		const required = typeof parsed.required === "number" ? parsed.required : undefined;
 		return {
+			...(isNugPaymentContext(parsed.paymentContext)
+				? { paymentContext: parsed.paymentContext }
+				: {}),
 			providerId: typeof parsed.providerId === "string" ? parsed.providerId : undefined,
 			providerPrefix: typeof parsed.providerPrefix === "string" ? parsed.providerPrefix : undefined,
 			balance,
@@ -62,11 +66,12 @@ export function useNarratorQuota({
 		if (paymentRequired) return;
 		if (!narratorSubstatus.includes("payment_required")) return;
 		const persisted = parsePersistedPaymentRequired(narratorErrorMessage);
-		const providerId = nugProviderInfo?.providerId ?? persisted?.providerId;
+		const providerId = persisted?.providerId ?? nugProviderInfo?.providerId;
 		if (!providerId) return;
 		setPaymentRequired({
 			providerId,
-			providerPrefix: nugProviderInfo?.providerPrefix ?? persisted?.providerPrefix,
+			providerPrefix: persisted?.providerPrefix ?? nugProviderInfo?.providerPrefix,
+			...(persisted?.paymentContext ? { paymentContext: persisted.paymentContext } : {}),
 			balance: persisted?.balance,
 			required: persisted?.required,
 			resumeAction: persisted?.resumeAction ?? "retry",

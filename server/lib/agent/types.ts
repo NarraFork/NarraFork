@@ -705,6 +705,8 @@ export type AgentEvent =
 	| {
 			type: "payment_required";
 			message: string;
+			/** 专用于该失败请求的钱包证明；不含公开 CID/私有 identity。 */
+			paymentContext?: string;
 			providerId?: string;
 			providerPrefix?: string;
 			balance?: number;

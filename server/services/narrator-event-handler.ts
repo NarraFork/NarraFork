@@ -8,6 +8,7 @@ import {
 } from "@shared/agent-protocol/tool-output";
 import type { ContextUsageSnapshot } from "@shared/context-usage";
 import type { FileReferenceContext } from "@shared/file-reference";
+import { isNugPaymentContext } from "@shared/nug-payment";
 import type { TextDocumentStreamUpdate } from "@shared/pretext-layout/text-document";
 import {
 	getValidReasoningTranslationParts,
@@ -3137,6 +3138,9 @@ export async function processEvent(
 				providerPrefix: event.providerPrefix,
 				balance: event.balance,
 				required: event.required,
+				...(isNugPaymentContext(event.paymentContext)
+					? { paymentContext: event.paymentContext }
+					: {}),
 				resumeAction: event.resumeAction,
 				...(routedToAnotherNarrator && { isSubagent: true }),
 			});

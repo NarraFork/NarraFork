@@ -132,6 +132,8 @@ export interface QuotaWaitInfo {
 }
 
 export interface PaymentRequiredInfo {
+	/** 失败请求专用的服务器 opaque 充值上下文；缺失时不能回退首 Key。 */
+	paymentContext?: string;
 	providerId?: string;
 	providerPrefix?: string;
 	balance?: number;

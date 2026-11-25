@@ -150,6 +150,40 @@ describe("snapshot-backed NUG recharge", () => {
 		});
 		expect(current.nugRechargeOpened).toBe(true);
 	});
+	test("重载保留失败source的opaque context，不改充当前模型的另一个source", async () => {
+		const paymentContext = `npc1.${(Date.now() + 900000).toString(36)}.${"n".repeat(22)}.${"m".repeat(43)}`;
+		await render({
+			substatus: ["payment_required"],
+			errorMessage: JSON.stringify({
+				type: "payment_required",
+				providerId: "failed-source",
+				providerPrefix: "failed-prefix",
+				paymentContext,
+				resumeAction: "continue",
+			}),
+		});
+		expect(payment).toMatchObject({
+			providerId: "failed-source",
+			providerPrefix: "failed-prefix",
+			paymentContext,
+			resumeAction: "continue",
+		});
+		expect(current.nugRechargeOpened).toBe(true);
+	});
+
+	test("旧数据中的私有identity不能被恢复成公开付款context", async () => {
+		await render({
+			substatus: ["payment_required"],
+			errorMessage: JSON.stringify({
+				type: "payment_required",
+				providerId: "failed-source",
+				paymentContext: '["private-CID","private-secret"]',
+			}),
+		});
+		expect(payment).not.toHaveProperty("paymentContext");
+		expect(payment).toMatchObject({ providerId: "failed-source" });
+	});
+
 	test("persisted provider still recovers when current model no longer resolves to NUG", async () => {
 		await render({
 			model: "other:model",
