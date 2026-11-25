@@ -29,8 +29,6 @@ import {
 	fetchNugQuota,
 	getAllNugCachedQuotas,
 	getNugCachedQuota,
-	getNugQuotaSnapshot,
-	type NugQuotaCache,
 	normalizeNugQuotaResponse,
 	nugQuotaIdentity,
 	purgeNugQuotaCache,
@@ -525,7 +523,11 @@ export async function fetchAllNugQuotas(): Promise<void> {
 			const quotaSubject = captureNugQuotaSubject(p);
 			const data = await fetchNugQuota(quotaSubject.config);
 			if (data) {
-				setNugCachedQuota(p.id, buildNugQuotaCache(data, getNugCachedQuota(p.id)), quotaSubject);
+				setNugCachedQuota(
+					p.id,
+					buildNugQuotaCache(data, getNugCachedQuota(p.id, quotaSubject)),
+					quotaSubject,
+				);
 				logger.debug("NUG quota fetched on startup", {
 					provider: p.name,
 					balance: data.balance,
@@ -811,10 +813,11 @@ nugRoutes.get("/providers/:id/quota", async (c) => {
 			string,
 			unknown
 		>;
-		const previous = getNugQuotaSnapshot(id, entry.quotaSubject.id)?.snapshot?.detail as
-			| NugQuotaCache
-			| undefined;
-		setNugCachedQuota(id, buildNugQuotaCache(data, previous), entry.quotaSubject);
+		setNugCachedQuota(
+			id,
+			buildNugQuotaCache(data, getNugCachedQuota(id, entry.quotaSubject)),
+			entry.quotaSubject,
+		);
 		const response = normalizeNugQuotaResponse(data);
 		// Keep the payment consumer's contract, not the template-private upstream payload.
 		return c.json({

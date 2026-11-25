@@ -13,6 +13,7 @@ import {
 	isNugQuotaRefreshing,
 	nugQuotaIdentity,
 	probeNugQuota,
+	purgeNugQuotaCache,
 	refreshNugQuota,
 	setNugCachedQuota,
 	updateNugQuotaByPrefix,
@@ -104,11 +105,7 @@ function expectLateNugQuotaRejected(expectedIdentity: string): void {
 }
 
 afterEach(() => {
-	for (const key of getProviderKeyStore().list(nugKeyOwner(providerId))) {
-		quotaStore.remove(key.id);
-		quotaStore.remove(key.id, STREAM_QUOTA_SOURCE);
-	}
-	quotaStore.remove(providerId);
+	purgeNugQuotaCache([providerId]);
 	getProviderKeyStore().removeProvider(nugKeyOwner(providerId));
 	saveSettings(original);
 	globalThis.fetch = originalFetch;
@@ -189,6 +186,126 @@ describe("NUG quota snapshots", () => {
 		getProviderKeyStore().update(second.id, { apiKey: "key-other" });
 		expect(getNugCachedQuota(providerId)).toBeUndefined();
 		quotaStore.remove(second.id);
+	});
+
+	test("captured fallback stays on A's probe slot across reorder while legacy keeps its merged first-key view", () => {
+		const config = useProvider();
+		const store = getProviderKeyStore();
+		const capturedA = captureNugQuotaSubject(config);
+		setNugCachedQuota(
+			providerId,
+			{
+				...buildNugQuotaCache({
+					balance: 11,
+					totalGranted: 111,
+					detailedQuotaBalance: "A probe",
+					extra: { owner: "A" },
+				}),
+				fetchedAt: 100,
+			},
+			capturedA,
+		);
+		quotaStore.set(
+			capturedA.id,
+			capturedA.identity,
+			{
+				fetchedAt: 200,
+				scope: "wallet",
+				windows: [],
+				balances: [{ unit: "", remaining: 0, total: 999 }],
+				detail: {
+					balance: 0,
+					totalGranted: 999,
+					detailedQuotaBalance: "A stream",
+					extra: { owner: "A-stream" },
+				},
+			},
+			false,
+			STREAM_QUOTA_SOURCE,
+		);
+		expect(getNugCachedQuota(providerId)?.detailedQuotaBalance).toBe("A stream");
+		const streamBefore = structuredClone(quotaStore.peek(capturedA.id, STREAM_QUOTA_SOURCE));
+		const backup = store.add(nugKeyOwner(providerId), { apiKey: "key-two" });
+		store.reorder(nugKeyOwner(providerId), [backup.id, capturedA.id]);
+		const capturedB = captureNugQuotaSubject(config);
+		setNugCachedQuota(
+			providerId,
+			buildNugQuotaCache({ balance: 22, totalGranted: 222, detailedQuotaBalance: "B probe" }),
+			capturedB,
+		);
+		const beforeB = structuredClone(quotaStore.peek(backup.id));
+		expect(getNugCachedQuota(providerId)?.balance).toBe(22);
+		expect(getNugCachedQuota(providerId, capturedA)).toMatchObject({
+			balance: 11,
+			totalGranted: 111,
+			detailedQuotaBalance: "A probe",
+		});
+		setNugCachedQuota(
+			providerId,
+			buildNugQuotaCache({ balance: 5 }, getNugCachedQuota(providerId, capturedA)),
+			capturedA,
+		);
+		expect(getNugQuotaSnapshot(providerId, capturedA.id)?.snapshot?.detail).toEqual({
+			balance: 5,
+			totalGranted: 111,
+			detailedQuotaBalance: "A probe",
+			extra: { owner: "A" },
+		});
+		expect(getNugQuotaSnapshot(providerId, capturedA.id, STREAM_QUOTA_SOURCE)?.snapshot).toEqual(
+			streamBefore,
+		);
+		expect(quotaStore.peek(backup.id)).toEqual(beforeB);
+	});
+
+	for (const change of ["secret", "network", "deleted CID"] as const) {
+		test(`a captured fallback cannot inherit a new subject after ${change} changes`, () => {
+			const config = useProvider();
+			const store = getProviderKeyStore();
+			const captured = captureNugQuotaSubject(config);
+			setNugCachedQuota(
+				providerId,
+				buildNugQuotaCache({ balance: 11, detailedQuotaBalance: "retired A" }),
+				captured,
+			);
+			if (change === "secret") store.update(captured.id, { apiKey: "rotated-key" });
+			else if (change === "network")
+				store.update(captured.id, {
+					network: { userAgentMode: "custom", customUserAgent: "rotated-network" },
+				});
+			else {
+				store.add(nugKeyOwner(providerId), { apiKey: captured.config.apiKey });
+				store.remove(captured.id);
+			}
+			const current = captureNugQuotaSubject(config);
+			setNugCachedQuota(
+				providerId,
+				buildNugQuotaCache({ balance: 99, detailedQuotaBalance: "new subject" }),
+				current,
+			);
+			const before = structuredClone(quotaStore.peek(current.id));
+			expect(getNugCachedQuota(providerId, captured)).toBeUndefined();
+			setNugCachedQuota(
+				providerId,
+				buildNugQuotaCache({}, getNugCachedQuota(providerId, captured)),
+				captured,
+			);
+			expect(quotaStore.peek(current.id)).toEqual(before);
+			expect(getNugCachedQuota(providerId, current)?.detailedQuotaBalance).toBe("new subject");
+		});
+	}
+
+	test("an empty credential probe preserves unknown amounts instead of manufacturing zero", async () => {
+		const config = useProvider();
+		const captured = captureNugQuotaSubject(config);
+		expect(getNugCachedQuota(providerId, captured)).toBeUndefined();
+		globalThis.fetch = (async () => Response.json({})) as unknown as typeof fetch;
+		const snapshot = await probeNugQuota(captured, new AbortController().signal);
+		expect(snapshot?.balances).toEqual([{ unit: "", remaining: null }]);
+		expect(snapshot?.detail).toEqual({
+			balance: null,
+			totalGranted: null,
+			detailedQuotaBalance: null,
+		});
 	});
 
 	const networkChanges: Array<[string, CredentialNetwork]> = [
