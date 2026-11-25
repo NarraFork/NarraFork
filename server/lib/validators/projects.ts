@@ -128,3 +128,10 @@ export const projectTransferOwnerSchema = z.object({
 	/** null hands the project back to "no owner" (admin-managed). */
 	userId: z.string().min(1).max(128).nullable(),
 });
+
+/** The project page's session list (R2): which tab, a keyset cursor, a page size. */
+export const projectSessionsQuerySchema = z.object({
+	view: z.enum(["active", "all", "mine"]).default("active"),
+	cursor: z.string().max(512).optional(),
+	limit: z.coerce.number().int().min(1).max(100).default(30),
+});

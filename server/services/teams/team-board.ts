@@ -15,6 +15,7 @@
  */
 
 import { coerceAskQuestionShape } from "@shared/ask-user-question-shape";
+import type { TeamCardCounts } from "@shared/project-overview";
 import {
 	boardColumnIsFinished,
 	TEAM_ACTIVITY_PREVIEW_CHARS,
@@ -45,7 +46,7 @@ import {
 	type TeamWorkerActivity,
 	teamApprovalKind,
 } from "@shared/project-teams";
-import { and, asc, desc, eq, gt, inArray, isNotNull, lt, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNotNull, lt, or, type SQL, sql } from "drizzle-orm";
 import { db } from "../../db";
 import {
 	narrators,
@@ -119,7 +120,11 @@ export function runningTreeSessions(
 	return { agents: rows.slice(0, limit).map(agentRef), more: rows.length > limit };
 }
 
-function agentRef(session: { id: string; title: string | null; status: string }): TeamAgentRef {
+export function agentRef(session: {
+	id: string;
+	title: string | null;
+	status: string;
+}): TeamAgentRef {
 	return { id: session.id, title: session.title, status: session.status };
 }
 
@@ -155,7 +160,7 @@ const PENDING_PAGE = 100;
 /** Pages read at most: past this many hidden calls the list says "more" instead of counting on. */
 const PENDING_MAX_PAGES = 5;
 
-interface PendingRow {
+export interface PendingRow {
 	id: string;
 	narratorId: string;
 	toolName: string;
@@ -163,15 +168,105 @@ interface PendingRow {
 	title: string | null;
 	status: string;
 	parentNarratorId: string | null;
+	/** The asking session's ACL columns (a project's scan judges each one; R2). */
+	type: string;
+	aclRootNarratorId: string | null;
+	ownerUserId: string | null;
+	visibility: string;
+	writeAudience: string;
+	contextProjectId: string | null;
 }
 
 /**
- * The tree's tool calls waiting for a person, oldest first, after the same visibility rule as
- * the session's own list (a call whose reflection still runs is not waiting for a person).
- * Driven by `idx_toolcalls_status_narrator_created` (status leads, and few calls are pending at
- * any time) joined to the narrator by primary key; read in keyset pages until `wanted` visible
- * rows are found, at most {@link PENDING_MAX_PAGES} pages. `complete` is false when the pages
- * ran out before the pending calls did.
+ * One keyset page of pending calls in a scope (`where` on the joined narrator), oldest first,
+ * after the same visibility rule as the session's own list (a call whose reflection still runs is
+ * not waiting for a person). Driven by `idx_toolcalls_status_narrator_created` (status leads, and
+ * few calls are pending at any time) joined to the narrator by primary key.
+ */
+function pendingCallPage(
+	scope: SQL | undefined,
+	after: { createdAt: string; id: string } | null,
+): { visible: PendingRow[]; last: { createdAt: string; id: string } | null; full: boolean } {
+	const batch = db
+		.select({
+			id: narratorToolCalls.id,
+			narratorId: narratorToolCalls.narratorId,
+			toolName: narratorToolCalls.toolName,
+			suggestions: narratorToolCalls.permissionSuggestions,
+			createdAt: narratorToolCalls.createdAt,
+			title: narrators.title,
+			status: narrators.status,
+			parentNarratorId: narrators.parentNarratorId,
+			type: narrators.type,
+			aclRootNarratorId: narrators.aclRootNarratorId,
+			ownerUserId: narrators.ownerUserId,
+			visibility: narrators.visibility,
+			writeAudience: narrators.writeAudience,
+			contextProjectId: narrators.contextProjectId,
+		})
+		.from(narratorToolCalls)
+		.innerJoin(narrators, eq(narrators.id, narratorToolCalls.narratorId))
+		.where(
+			and(
+				eq(narratorToolCalls.status, "pending"),
+				scope,
+				after
+					? or(
+							gt(narratorToolCalls.createdAt, after.createdAt),
+							and(
+								eq(narratorToolCalls.createdAt, after.createdAt),
+								gt(narratorToolCalls.id, after.id),
+							),
+						)
+					: undefined,
+			),
+		)
+		.orderBy(asc(narratorToolCalls.createdAt), asc(narratorToolCalls.id))
+		.limit(PENDING_PAGE)
+		.all();
+	const visible: PendingRow[] = [];
+	for (const row of batch) {
+		if (shouldHidePendingPermission(row.suggestions)) continue;
+		const { suggestions: _suggestions, ...rest } = row;
+		visible.push(rest);
+	}
+	const last = batch.at(-1);
+	return {
+		visible,
+		last: last ? { createdAt: last.createdAt, id: last.id } : null,
+		full: batch.length >= PENDING_PAGE,
+	};
+}
+
+/**
+ * The visible pending calls of a scope, oldest first, read in keyset pages until `wanted` rows
+ * pass `accept` (default: all), at most {@link PENDING_MAX_PAGES} pages. `complete` is false when
+ * the pages ran out before the pending calls did. The team tree and the project page (R2) share
+ * it; `accept` lets a scan skip calls the person may not decide without counting them.
+ */
+export async function scanPendingCalls(
+	scope: SQL | undefined,
+	wanted: number,
+	accept?: (row: PendingRow) => boolean | Promise<boolean>,
+): Promise<{ rows: PendingRow[]; complete: boolean }> {
+	const rows: PendingRow[] = [];
+	let after: { createdAt: string; id: string } | null = null;
+	for (let page = 0; page < PENDING_MAX_PAGES; page++) {
+		const { visible, last, full } = pendingCallPage(scope, after);
+		for (const row of visible) {
+			if (accept && !(await accept(row))) continue;
+			rows.push(row);
+			if (rows.length >= wanted) return { rows, complete: true };
+		}
+		if (!full || !last) return { rows, complete: true };
+		after = last;
+	}
+	return { rows, complete: false };
+}
+
+/**
+ * The tree's tool calls waiting for a person: {@link scanPendingCalls} over the tree, without an
+ * acceptance step (members see every call of their tree), synchronous for the sidebar's count.
  */
 export function visiblePendingCalls(
 	teamId: string,
@@ -180,47 +275,13 @@ export function visiblePendingCalls(
 	const rows: PendingRow[] = [];
 	let after: { createdAt: string; id: string } | null = null;
 	for (let page = 0; page < PENDING_MAX_PAGES; page++) {
-		const batch = db
-			.select({
-				id: narratorToolCalls.id,
-				narratorId: narratorToolCalls.narratorId,
-				toolName: narratorToolCalls.toolName,
-				suggestions: narratorToolCalls.permissionSuggestions,
-				createdAt: narratorToolCalls.createdAt,
-				title: narrators.title,
-				status: narrators.status,
-				parentNarratorId: narrators.parentNarratorId,
-			})
-			.from(narratorToolCalls)
-			.innerJoin(narrators, eq(narrators.id, narratorToolCalls.narratorId))
-			.where(
-				and(
-					eq(narratorToolCalls.status, "pending"),
-					inTree(teamId),
-					after
-						? or(
-								gt(narratorToolCalls.createdAt, after.createdAt),
-								and(
-									eq(narratorToolCalls.createdAt, after.createdAt),
-									gt(narratorToolCalls.id, after.id),
-								),
-							)
-						: undefined,
-				),
-			)
-			.orderBy(asc(narratorToolCalls.createdAt), asc(narratorToolCalls.id))
-			.limit(PENDING_PAGE)
-			.all();
-		for (const row of batch) {
-			if (shouldHidePendingPermission(row.suggestions)) continue;
-			const { suggestions: _suggestions, ...visible } = row;
-			rows.push(visible);
+		const { visible, last, full } = pendingCallPage(inTree(teamId), after);
+		for (const row of visible) {
+			rows.push(row);
 			if (rows.length >= wanted) return { rows, complete: true };
 		}
-		if (batch.length < PENDING_PAGE) return { rows, complete: true };
-		const last = batch.at(-1);
-		if (!last) return { rows, complete: true };
-		after = { createdAt: last.createdAt, id: last.id };
+		if (!full || !last) return { rows, complete: true };
+		after = last;
 	}
 	return { rows, complete: false };
 }
@@ -371,6 +432,107 @@ export function readBoardItem(teamId: string, itemId: string): TeamBoardItem | n
 		.limit(1)
 		.get();
 	return row ? boardItemOf(row) : null;
+}
+
+/**
+ * The ready items (可以合并) of the given teams of a project, oldest change first, at most `limit`
+ * (one more is read to say "more"). Driven by `idx_team_work_items_project_state`; each card is
+ * read like the board's (R2: the project page's 「等你处理」).
+ */
+export function readReadyItems(
+	projectId: string,
+	teamIds: readonly string[],
+	limit: number,
+): { items: (TeamBoardItem & { teamId: string })[]; more: boolean } {
+	if (teamIds.length === 0) return { items: [], more: false };
+	const rows = db
+		.select({ ...BOARD_ITEM_COLUMNS, teamId: teamWorkItems.teamId })
+		.from(teamWorkItems)
+		.leftJoin(narrators, eq(narrators.id, teamWorkItems.workerNarratorId))
+		.where(
+			and(
+				eq(teamWorkItems.projectId, projectId),
+				eq(teamWorkItems.state, "ready"),
+				inArray(teamWorkItems.teamId, [...teamIds]),
+			),
+		)
+		.orderBy(asc(teamWorkItems.updatedAt), asc(teamWorkItems.id))
+		.limit(limit + 1)
+		.all();
+	return {
+		items: rows.slice(0, limit).map(({ teamId, ...row }) => ({ ...boardItemOf(row), teamId })),
+		more: rows.length > limit,
+	};
+}
+
+/**
+ * A team card's numbers for each listed team (R2: the project page's team grid): work item
+ * counts by state in one grouped read of `(team_id, state, id)`, then per team the running count
+ * ({@link runningTreeSessions}, at most 21 rows), the coordinator's last stop and message count
+ * (primary key), the newest event (`(team_id, created_at)`, one row) and, for members only, the
+ * pending count the header shows. The caller bounds the number of teams.
+ */
+export function readTeamCards(
+	teams: readonly { id: string; member: boolean }[],
+): Map<string, TeamCardCounts> {
+	const cards = new Map<string, TeamCardCounts>();
+	if (teams.length === 0) return cards;
+	const ids = teams.map((team) => team.id);
+	const stateRows = db
+		.select({
+			teamId: teamWorkItems.teamId,
+			state: teamWorkItems.state,
+			count: sql<number>`count(*)`,
+		})
+		.from(teamWorkItems)
+		.where(inArray(teamWorkItems.teamId, ids))
+		.groupBy(teamWorkItems.teamId, teamWorkItems.state)
+		.all();
+	const coordinators = new Map(
+		db
+			.select({
+				id: narrators.id,
+				messageCount: narrators.messageCount,
+				stopReason: narrators.lastStopReason,
+			})
+			.from(narrators)
+			.where(inArray(narrators.id, ids))
+			.limit(ids.length)
+			.all()
+			.map((row) => [row.id, row]),
+	);
+	for (const team of teams) {
+		const columnCounts = Object.fromEntries(
+			TEAM_BOARD_COLUMNS.map((column) => [column, 0]),
+		) as Record<TeamBoardColumn, number>;
+		let readyCount = 0;
+		for (const row of stateRows) {
+			if (row.teamId !== team.id) continue;
+			if (row.state === "ready") readyCount += Number(row.count);
+			for (const column of TEAM_BOARD_COLUMNS)
+				if (TEAM_BOARD_COLUMN_STATES[column].includes(row.state))
+					columnCounts[column] += Number(row.count);
+		}
+		const running = runningTreeSessions(team.id, TEAM_RUNNING_AGENTS_LIMIT);
+		const lastEvent = db
+			.select({ createdAt: teamWorkEvents.createdAt })
+			.from(teamWorkEvents)
+			.where(eq(teamWorkEvents.teamId, team.id))
+			.orderBy(desc(teamWorkEvents.createdAt), desc(teamWorkEvents.id))
+			.limit(1)
+			.get();
+		const coordinator = coordinators.get(team.id);
+		cards.set(team.id, {
+			columnCounts,
+			readyCount,
+			runningCount: running.agents.length + (running.more ? 1 : 0),
+			pendingApprovalCount: team.member ? pendingCount(team.id) : null,
+			coordinatorStopReason: coordinator?.stopReason ?? null,
+			coordinatorMessageCount: coordinator?.messageCount ?? 0,
+			lastEventAt: lastEvent?.createdAt ?? null,
+		});
+	}
+	return cards;
 }
 
 /**
@@ -752,18 +914,14 @@ export function questionPreview(prefix: string | null): string[] {
 }
 
 /**
- * The tool calls of the team tree waiting for a person, oldest first, at most
- * {@link TEAM_APPROVALS_LIMIT}. Members only: an onlooker gets 403 (a stranger 404). Each one
- * is decided through the ordinary permission routes, which check write access on its session.
+ * Pending calls as the approvals list shows them: one bounded read of each call's input prefix
+ * and reason (`substr`, by primary key), then the preview, questions and in-place answer form.
+ * Shared by the team page and the project page's 「等你处理」 (R2).
  */
-export async function readTeamApprovals(
-	teamId: string,
-	principal: NarratorPrincipal,
-	projectId: string,
-): Promise<TeamApprovalsResponse> {
-	await loadTeamForAccess(teamId, principal, "write", projectId);
-	const { rows, complete } = visiblePendingCalls(teamId, TEAM_APPROVALS_LIMIT + 1);
-	const shown = rows.slice(0, TEAM_APPROVALS_LIMIT);
+export function pendingApprovalsOf(
+	shown: readonly PendingRow[],
+	depth: (row: PendingRow) => number,
+): TeamPendingApproval[] {
 	const details =
 		shown.length > 0
 			? new Map(
@@ -788,13 +946,13 @@ export async function readTeamApprovals(
 						.map((row) => [row.id, row]),
 				)
 			: new Map<string, { input: string | null; reason: string | null }>();
-	const approvals: TeamPendingApproval[] = shown.map((row) => {
+	return shown.map((row) => {
 		const detail = details.get(row.id);
 		const kind = teamApprovalKind(row.toolName);
 		return {
 			id: row.id,
 			agent: agentRef({ id: row.narratorId, title: row.title, status: row.status }),
-			depth: depthOf(teamId, { id: row.narratorId, parentNarratorId: row.parentNarratorId }),
+			depth: depth(row),
 			toolName: row.toolName,
 			kind,
 			parentId: row.parentNarratorId,
@@ -810,6 +968,23 @@ export async function readTeamApprovals(
 			createdAt: row.createdAt,
 		};
 	});
+}
+
+/**
+ * The tool calls of the team tree waiting for a person, oldest first, at most
+ * {@link TEAM_APPROVALS_LIMIT}. Members only: an onlooker gets 403 (a stranger 404). Each one
+ * is decided through the ordinary permission routes, which check write access on its session.
+ */
+export async function readTeamApprovals(
+	teamId: string,
+	principal: NarratorPrincipal,
+	projectId: string,
+): Promise<TeamApprovalsResponse> {
+	await loadTeamForAccess(teamId, principal, "write", projectId);
+	const { rows, complete } = visiblePendingCalls(teamId, TEAM_APPROVALS_LIMIT + 1);
+	const approvals = pendingApprovalsOf(rows.slice(0, TEAM_APPROVALS_LIMIT), (row) =>
+		depthOf(teamId, { id: row.narratorId, parentNarratorId: row.parentNarratorId }),
+	);
 	return {
 		approvals,
 		// "More" only when visible calls were cut off; an unfinished scan is said apart.
