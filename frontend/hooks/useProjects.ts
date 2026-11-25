@@ -1,15 +1,16 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useRef, useState } from "react";
 import { api } from "../lib/api";
+import {
+	getRecentTabsScope,
+	isRecentTabsScopeCurrent,
+	type RecentTabsScope,
+	recentTabsScopeKey,
+} from "../lib/recent-tabs-owner";
 
 const PROJECT_QUERY_GC_TIME_MS = 60_000;
 
 export const PROJECT_CREATE_REFRESH_QUERY_KEYS = [["projects"]] as const;
-
-export const PROJECT_DELETE_REFRESH_QUERY_KEYS = [
-	["projects"],
-	["user-preferences", "recent-tabs"],
-] as const;
 
 type ProjectRefreshInvalidator = {
 	invalidateQueries: (filters: { queryKey: readonly unknown[] }) => unknown;
@@ -26,10 +27,13 @@ export function invalidateProjectCreateQueries(queryClient: ProjectRefreshInvali
 	}
 }
 
-export function invalidateProjectDeleteQueries(queryClient: ProjectRefreshInvalidator) {
-	for (const queryKey of PROJECT_DELETE_REFRESH_QUERY_KEYS) {
-		queryClient.invalidateQueries({ queryKey });
-	}
+export function invalidateProjectDeleteQueries(
+	queryClient: ProjectRefreshInvalidator,
+	scope: RecentTabsScope | null,
+) {
+	invalidateProjectCreateQueries(queryClient);
+	if (isRecentTabsScopeCurrent(scope))
+		queryClient.invalidateQueries({ queryKey: recentTabsScopeKey(scope) });
 }
 
 export function recentTabsSnapshotRemovedProject(
@@ -177,6 +181,7 @@ export function useDeleteProject() {
 	const qc = useQueryClient();
 	return useMutation({
 		mutationFn: api.deleteProject,
-		onSuccess: () => invalidateProjectDeleteQueries(qc),
+		onMutate: () => ({ scope: getRecentTabsScope() }),
+		onSuccess: (_data, _id, context) => invalidateProjectDeleteQueries(qc, context?.scope ?? null),
 	});
 }

@@ -174,6 +174,30 @@ describe("parent injection initiating user", () => {
 		const { createAgentMessageDelivery } = await import("../agent-message-delivery");
 		seedNarrator(PARENT_ID, { status: "working" });
 		seedNarrator(SUB_ID, { variant: "subagent:general", parent: PARENT_ID });
+		const { narrators, users } = await import("../../db/schema");
+		const { eq } = await import("drizzle-orm");
+		const { ensureCommunicationNodeTx, grantFixtureNarratorWrite } = await import(
+			"./runtime-communication-fixtures"
+		);
+		db.transaction((tx) => {
+			tx.insert(users)
+				.values({ id: "A", username: "A", passwordHash: "test", createdAt: now })
+				.run();
+			grantFixtureNarratorWrite(tx, PARENT_ID, "A");
+			tx.update(narrators)
+				.set({
+					type: "subagent",
+					aclRootNarratorId: PARENT_ID,
+					runtimeRegistrationJson: {
+						version: 1,
+						run: { logicalRunId: "send-pass", principal: { userId: "A" } },
+					},
+				})
+				.where(eq(narrators.id, SUB_ID))
+				.run();
+			ensureCommunicationNodeTx(tx, PARENT_ID, null);
+			ensureCommunicationNodeTx(tx, SUB_ID, PARENT_ID);
+		});
 		const toolCallId = `${SUB_ID}-send-tool`;
 		const messageId = `${SUB_ID}-send-msg`;
 		sqlite

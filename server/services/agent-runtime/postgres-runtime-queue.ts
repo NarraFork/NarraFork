@@ -1,4 +1,10 @@
 import { mailboxReplyContext } from "@shared/reply-context";
+import {
+	assertCommunicationSendAuthorizedPg,
+	commitUserCommunicationAdmissionPg,
+} from "../narrator-communication/postgres";
+import type { PreparedUserConnections } from "../narrator-communication/service";
+import { assertUserSubmissionReplay, type UserSubmission } from "./user-submission";
 
 /**
  * agent-runtime/postgres-runtime-queue.ts — the PostgreSQL production adapter for the
@@ -170,6 +176,8 @@ export interface PgAgentAdmissionReceipt {
 export interface PgBufferedOrdering {
 	position: "back" | "front";
 	frontOrder: "stack" | "fifo";
+	communication?: PreparedUserConnections;
+	submission?: UserSubmission;
 }
 
 /**
@@ -354,7 +362,10 @@ const pendingStates = ["queued", "claimed", "failed"] as const;
 const now = () => new Date().toISOString();
 const releasedPayload = {
 	text: "",
-	metadataJson: null,
+	// Keep only immutable admission identity after releasing the mutable payload.
+	metadataJson: sql<
+		string | null
+	>`CASE WHEN ${mailbox.kind} = 'user_input' AND ${mailbox.metadataJson}::jsonb ->> 'submissionFingerprint' IS NOT NULL THEN json_build_object('submissionFingerprint', ${mailbox.metadataJson}::jsonb ->> 'submissionFingerprint', 'submissionAttachments', ${mailbox.metadataJson}::jsonb -> 'submissionAttachments')::text ELSE NULL END`,
 	payloadRefJson: null,
 	imagesJson: null,
 	mediaJson: null,
@@ -695,6 +706,7 @@ export function createPostgresRuntimeQueue(
 				.from(narrators)
 				.where(eq(narrators.id, input.sourceNarratorId));
 			if (!source[0]) throw new Error("Mailbox source narrator does not exist");
+			await assertCommunicationSendAuthorizedPg(tx, input.sourceNarratorId, input.narratorId);
 		}
 		const sizes = validatePgInput(input);
 		if (input.kind === "task_notice") {
@@ -773,7 +785,14 @@ export function createPostgresRuntimeQueue(
 	async function enqueue(input: MailboxInput): Promise<PgEnqueueResult> {
 		const label = "mailbox.enqueue";
 		try {
-			return await withPgRetry(() => db.transaction((tx) => enqueueSection(tx, input)), { label });
+			return await withPgRetry(
+				() =>
+					db.transaction(
+						(tx) => enqueueSection(tx, input),
+						input.kind === "agent_message" ? { isolationLevel: "serializable" } : undefined,
+					),
+				{ label },
+			);
 		} catch (error) {
 			const translated = translateWriteError(error, label);
 			// Idempotency under a lost acknowledgement: two first acceptances of the same
@@ -880,6 +899,13 @@ export function createPostgresRuntimeQueue(
 			priority: ordering.position === "front",
 			seq,
 		});
+		if (accepted.status === "duplicate" && ordering.submission)
+			assertUserSubmissionReplay(accepted.delivery, ordering.submission);
+		if (accepted.status === "accepted" && ordering.communication)
+			await commitUserCommunicationAdmissionPg(tx, ordering.communication, {
+				admissionId: accepted.delivery.id,
+				messageId: accepted.delivery.recipientMessageId ?? undefined,
+			});
 		if (accepted.status === "accepted" && fifoPriority) {
 			// Subagent priority inputs historically preserve FIFO within the priority
 			// group. Publish their order atomically with acceptance, never afterward.
@@ -1645,6 +1671,28 @@ export function createPostgresRuntimeQueue(
 	const mailboxStore = {
 		enqueue,
 		getByDelivery,
+		async getUserSubmission(narratorId: string, dedupeKey: string) {
+			pointer(narratorId);
+			const rows = await db
+				.select({
+					id: mailbox.id,
+					bufferedAt: mailbox.bufferedAt,
+					state: mailbox.state,
+					currentMessageId: mailbox.currentMessageId,
+					dedupeExpiresAt: mailbox.dedupeExpiresAt,
+					metadataJson: mailbox.metadataJson,
+				})
+				.from(mailbox)
+				.where(
+					and(
+						eq(mailbox.narratorId, narratorId),
+						eq(mailbox.kind, "user_input"),
+						eq(mailbox.dedupeKey, dedupeKey),
+					),
+				)
+				.limit(1);
+			return rows[0];
+		},
 		/**
 		 * Agent-message admission (Send/TeamStatus/parent injection). Dedupe, the exact
 		 * execution receipt check and the insert commit in ONE retryable section;
@@ -1662,7 +1710,10 @@ export function createPostgresRuntimeQueue(
 			const label = "mailbox.admitAgentMessage";
 			try {
 				return await withPgRetry(
-					() => db.transaction((tx) => admitAgentMessageSection(tx, input, receipt)),
+					() =>
+						db.transaction((tx) => admitAgentMessageSection(tx, input, receipt), {
+							isolationLevel: "serializable",
+						}),
 					{ label },
 				);
 			} catch (error) {
@@ -1685,14 +1736,20 @@ export function createPostgresRuntimeQueue(
 			const label = "mailbox.admitUserBuffered";
 			try {
 				return await withPgRetry(
-					() => db.transaction((tx) => admitUserBufferedSection(tx, input, ordering)),
+					() =>
+						db.transaction((tx) => admitUserBufferedSection(tx, input, ordering), {
+							isolationLevel: "serializable",
+						}),
 					{ label },
 				);
 			} catch (error) {
 				const translated = translateWriteError(error, label);
 				if (translated instanceof WriteConflictError) {
 					const existing = await getByDedupe(input.narratorId, mailboxDedupeKey(input));
-					if (existing) return { status: "duplicate", delivery: existing };
+					if (existing) {
+						if (ordering.submission) assertUserSubmissionReplay(existing, ordering.submission);
+						return { status: "duplicate", delivery: existing };
+					}
 				}
 				throw translated;
 			}

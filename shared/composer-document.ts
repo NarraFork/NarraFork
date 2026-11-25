@@ -1,3 +1,4 @@
+import { agentReferenceHref } from "./agent-reference";
 import type { FileReference, FileSelection } from "./file-reference";
 
 export const MAX_COMPOSER_DOCUMENT_BYTES = 2 * 1024 * 1024;
@@ -13,8 +14,23 @@ export interface ComposerAsset {
 	size: number;
 	mimeType: string;
 }
+/** The label is an authored snapshot; only narratorId identifies the referenced session. */
+export interface ComposerNarratorReference {
+	type: "narratorReference";
+	id: string;
+	narratorId: string;
+	label: string;
+}
+/** Model-visible identity travels with this occurrence, even when a roster is truncated. */
+export function composerNarratorReferenceText(
+	node: Pick<ComposerNarratorReference, "narratorId" | "label">,
+): string {
+	const label = node.label.replace(/([\\[\]`*_<>])/gu, "\\$1");
+	return `[@${label}](${agentReferenceHref(node.narratorId)})`;
+}
 export type ComposerInlineNode =
 	| { type: "text"; text: string }
+	| ComposerNarratorReference
 	| { type: "break" }
 	| { type: "quote"; id: string; label: string; text: string; anchor?: string }
 	| { type: "fileReference"; id: string; reference: FileReference }
@@ -155,6 +171,7 @@ export function parseComposerDocument(value: unknown): ComposerDocument {
 					"anchor",
 					"reference",
 					"assetId",
+					"narratorId",
 				]);
 				if (node.type === "text") {
 					object(value, ["type", "text"]);
@@ -183,6 +200,15 @@ export function parseComposerDocument(value: unknown): ComposerDocument {
 						result.anchor = anchor;
 					}
 					return result;
+				}
+				if (node.type === "narratorReference") {
+					object(value, ["type", "id", "narratorId", "label"]);
+					const narratorId = string(node.narratorId, 128);
+					const label = string(node.label, 256);
+					if (!/^[A-Za-z0-9_-]+$/u.test(narratorId) || hasControl(label) || label.trim() !== label)
+						throw new Error("Invalid narrator reference");
+					textChars += label.length;
+					return { type: "narratorReference", id, narratorId, label };
 				}
 				if (node.type === "fileReference") {
 					object(value, ["type", "id", "reference"]);
@@ -286,7 +312,11 @@ export interface ComposerProjectionSpan {
 }
 
 function isComposerContentNode(node: ComposerInlineNode): boolean {
-	return (node.type === "text" && /\S/u.test(node.text)) || node.type === "fileReference";
+	return (
+		(node.type === "text" && /\S/u.test(node.text)) ||
+		node.type === "fileReference" ||
+		node.type === "narratorReference"
+	);
 }
 
 /**
@@ -351,6 +381,7 @@ function projectComposerDocument(
 		const start = text.length;
 		if (node.type === "text") text += doc.assets.length ? escapeText(node.text) : node.text;
 		if (node.type === "break") text += "\n";
+		if (node.type === "narratorReference") text += composerNarratorReferenceText(node);
 		if (node.type === "fileReference") {
 			text += composerFileReferenceToken(node.reference);
 			fileReferences.push({ ...node.reference, inputRange: [start, text.length] });
@@ -420,6 +451,7 @@ export function legacyComposerDocumentText(doc: ComposerDocument): {
 			const start = text.length;
 			if (node.type === "text") text += node.text;
 			if (node.type === "break") text += "\n";
+			if (node.type === "narratorReference") text += composerNarratorReferenceText(node);
 			if (node.type === "fileReference") {
 				text += composerFileReferenceToken(node.reference);
 				fileReferences.push({ ...node.reference, inputRange: [start, text.length] });

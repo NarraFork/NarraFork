@@ -1,3 +1,4 @@
+import { readQuery } from "../db/worker-read";
 /**
  * chat-notify.ts — `chat:*` event-bus events → WebSocket fan-out.
  *
@@ -80,9 +81,12 @@ async function onMessageCreated(
 	},
 	deps: ChatNotifyDeps = { listRoomUnread: listRoomUnreadForFanout },
 ): Promise<void> {
-	const row = await db.query.chatMessages.findFirst({
-		where: eq(chatMessages.id, event.messageId),
-	});
+	const row = await readQuery(
+		db.query.chatMessages.findFirst({
+			where: eq(chatMessages.id, event.messageId),
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!row) return;
 
 	// Assembled by chat-service rather than field-by-field here. The frame and the

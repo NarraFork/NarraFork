@@ -176,14 +176,7 @@ describe("project tab runtime state", () => {
 			.set({ visibility: "private" })
 			.where(eq(projects.id, privateProjectId));
 		const { patches } = await getRuntimePatches(reader, [`project:${privateProjectId}`]);
-		expect(patches).toHaveLength(1);
-		expect(patches[0]?.patch).toMatchObject({
-			projectPath: null,
-			activeSessionCount: null,
-			waitingSessionCount: null,
-			teamCount: null,
-			projectCountsCapped: false,
-		});
+		expect(patches).toEqual([]);
 	});
 
 	test("the row cap is a bound, not a scan of the project's history", () => {

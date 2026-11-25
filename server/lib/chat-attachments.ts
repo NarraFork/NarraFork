@@ -195,6 +195,24 @@ export function isChatImageUpload(file: File): boolean {
  * — this function cannot do it, because a successful return is exactly the case
  * where the file must survive.
  */
+/**
+ * Files written to their final path whose row is not committed yet, keyed `room/storedName`.
+ *
+ * An upload writes the file, then re-checks access and inserts the row; those steps wait on
+ * Worker reads. The orphan sweep checks this set in the same synchronous step as its row
+ * lookup, so a file is either still being published, already recorded, or truly orphaned.
+ * The uploader must call `finishChatAttachmentPublication` once the insert or rollback ends.
+ */
+const publishingChatAttachments = new Set<string>();
+
+export function isChatAttachmentPublishing(roomId: string, storedName: string): boolean {
+	return publishingChatAttachments.has(`${roomId}/${storedName}`);
+}
+
+export function finishChatAttachmentPublication(roomId: string, storedName: string): void {
+	publishingChatAttachments.delete(`${roomId}/${storedName}`);
+}
+
 export async function saveChatAttachment(roomId: string, file: File): Promise<SavedChatAttachment> {
 	const dir = resolveRoomDir(roomId);
 	const asImage = isChatImageUpload(file);
@@ -256,10 +274,13 @@ export async function saveChatAttachment(roomId: string, file: File): Promise<Sa
 	const filePath = resolve(dir, storedName);
 	if (!isWithinDir(dir, filePath)) throw new ValidationError("Invalid attachment name");
 
+	// Registered before the file can appear, so the sweep never sees it unprotected.
+	publishingChatAttachments.add(`${roomId}/${storedName}`);
 	try {
 		await Bun.write(filePath, bytes);
 	} catch (error) {
 		rmSync(filePath, { force: true });
+		finishChatAttachmentPublication(roomId, storedName);
 		throw toUploadPermissionError(error, filePath);
 	}
 

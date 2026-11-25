@@ -20,7 +20,7 @@ import {
 } from "@shared/recent-tabs";
 import type { BusinessSocket } from "@shared/remote-access/business-transport";
 import { getToken } from "./api";
-import { onTokenChange } from "./api/client";
+import { getAuthSnapshot, onTokenChange } from "./api/client";
 import { decodeBlockFrame } from "./block-protocol";
 import { observePageLifecycle } from "./page-lifecycle";
 import { dispatchTokenDanceRecovery } from "./tokendance-recovery";
@@ -414,6 +414,8 @@ export class NarratorWSManager {
 	private credentialIdentity = 0;
 	private credentialIds = new Map<string, number>();
 	private connectionCredentialIdentity: number | undefined;
+	private connectionAuthGeneration: number | undefined;
+	private unsubscribeTokenChange: (() => void) | undefined;
 	private hasConnectedOnce = false;
 	private networkOffline = false;
 	private reconnectAttempts = 0;
@@ -510,6 +512,9 @@ export class NarratorWSManager {
 	connect(): void {
 		if (this.ws) return; // already connected / connecting
 		this.cancelled = false;
+		this.unsubscribeTokenChange ??= onTokenChange(() => {
+			if (!shareAuth) this.reconnect();
+		});
 		this._listenVisibility();
 		this._listenNetwork();
 		this.networkOffline = this._browserReportsOffline();
@@ -519,6 +524,8 @@ export class NarratorWSManager {
 	disconnect(): void {
 		this._clearConnectTimeout();
 		this.cancelled = true;
+		this.unsubscribeTokenChange?.();
+		this.unsubscribeTokenChange = undefined;
 		this._unlistenVisibility();
 		this._unlistenNetwork();
 		clearTimeout(this.reconnectTimer);
@@ -1481,7 +1488,11 @@ export class NarratorWSManager {
 	getConnectionCredentialIdentity(): number | undefined {
 		return this._connected ? this.connectionCredentialIdentity : undefined;
 	}
+	getConnectionAuthGeneration(): number | undefined {
+		return this._connected && this.ws ? this.connectionAuthGeneration : undefined;
+	}
 	reconnect(): void {
+		this.pendingDispatchQueue = [];
 		this._clearConnectTimeout();
 		clearTimeout(this.reconnectTimer);
 		clearTimeout(this.pingTimeoutTimer);
@@ -1552,6 +1563,10 @@ export class NarratorWSManager {
 			? `share=${encodeURIComponent(shareAuth.shareId)}&token=${encodeURIComponent(shareAuth.token)}`
 			: `token=${encodeURIComponent(token ?? "")}`;
 		this.connectionCredentialIdentity = this.getCredentialIdentity();
+		const authGeneration = shareAuth ? undefined : getAuthSnapshot().generation;
+		this.connectionAuthGeneration = authGeneration;
+		const isCurrentAuth = () =>
+			authGeneration === undefined || authGeneration === getAuthSnapshot().generation;
 		const ws = businessTransport.openSocket("/ws/narrator", tokenQuery);
 		// Binary frames (outline live sessions) arrive as bytes, not Blobs.
 		ws.binaryType = "arraybuffer";
@@ -1567,7 +1582,7 @@ export class NarratorWSManager {
 		}, CONNECT_TIMEOUT_MS);
 
 		ws.onopen = () => {
-			if (this.cancelled || this.ws !== ws) {
+			if (this.cancelled || this.ws !== ws || !isCurrentAuth()) {
 				ws.close();
 				return;
 			}
@@ -1591,7 +1606,7 @@ export class NarratorWSManager {
 		};
 
 		ws.onmessage = (event) => {
-			if (this.cancelled || this.ws !== ws) return;
+			if (this.cancelled || this.ws !== ws || !isCurrentAuth()) return;
 			// Any inbound frame proves the socket still delivers, including a
 			// heartbeat `ping` on an otherwise idle narrator.
 			this._clearSyncProbe();
@@ -2174,6 +2189,12 @@ export class NarratorWSManager {
 
 	private _dispatch(data: Record<string, unknown>): void {
 		const msgType = data.type as string | undefined;
+		// Authorized topology frames are bounded and ordered; in particular an access
+		// invalidation must clear sensitive cache synchronously, not wait behind queued data.
+		if (msgType?.startsWith("communication_")) {
+			this._dispatchImmediate(data);
+			return;
+		}
 
 		// Latency-sensitive messages (streaming) are dispatched immediately —
 		// their consumers already have RAF-based batching.

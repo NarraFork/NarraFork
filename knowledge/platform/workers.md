@@ -4,12 +4,18 @@ title: Worker 隔离
 summary: 哪些工作放 Worker/子进程，Worker 故障时不得回退主线程的规则。
 anchors:
   - server/lib/worker-runtime/
-  - server/lib/db-worker/
+  - server/lib/db-worker/pool.ts
+  - server/lib/db-worker/worker-entry.ts
+  - server/lib/db-worker/protocol.ts
+  - server/lib/db-worker/domain-protocol.ts
+  - server/lib/db-worker/domain-task-registry.ts
   - server/lib/fs-scan-worker/
   - server/db/worker-read.ts
   - server/lib/fs-scan-worker/__tests__/client-failures.test.ts
   - server/db/worker-read-adapter.ts
   - server/lib/compiled-worker.ts
+  - server/lib/attachment-digest.ts
+  - server/lib/attachment-digest-worker.ts
   - server/lib/db-reader-readiness.ts
   - server/lib/db-reader-startup.ts
   - server/lib/compiled-worker.guard.test.ts
@@ -34,7 +40,7 @@ keywords:
   - inlineFallback
   - Worker 隔离不可降级
 status: draft
-verified_at: 4d59774711a51a9ac966794090c8b3a04d549048
+verified_at: fac3988333435e3fc3b5a4a6ace226c72ce14745
 ---
 # Worker 隔离
 
@@ -51,8 +57,10 @@ verified_at: 4d59774711a51a9ac966794090c8b3a04d549048
 - 编译产物里的 Worker：入口必须登记在 `COMPILED_WORKER_ENTRIES`（相对 `server/`，以注册表和显式 owner 清单为准），构建脚本展开它作为额外入口；`new Worker` 的路径不会被打包器跟踪，漏登记就进不了二进制。`compiledWorkerSpecifiers` 依次尝试 `./<路径>.js`、`./server/<路径>.js`、`./<文件名>.js`，源码运行只有相对 `import.meta.url` 的一个候选；Windows 的 `~BUN` 虚拟根要用正斜杠字符串而不是 URL（`lib/compiled-worker.ts`）。
 - 模型选项专用 Worker 也登记在编译入口，owner 为 `lib/model-options.ts`：只在菜单实际需求时构建紧凑代际索引，批传输/ACK 背压与队列/时间/字节预算见[来源组与模型列表](../agent/model-catalog/sourcing.md)，创建/运行/预算失败不得回主线程重新计算。
 - 守卫测试 `tests/worker-main-thread-fallback.guard.test.ts` 用 AST 扫描 `server/frontend/shared/scripts` 等目录（跳过测试文件）：已退役的 `inlineFallback` 等标识不得回到生产代码；Worker 客户端不得 import 或调用重活实现；ORM Worker 错误路径不得执行原查询；大纲 Worker 的 catch 里不得调用 `inlineValues`；脑图冷缓存只用占位而不在 UI 线程测量；Monaco 在暴露编辑器服务前装上严格失败边界；并检查 CLAUDE.md 里该规则的措辞仍在。
+- Recall 的 PG 原始 TEXT 正文/工具 JSON 使用 `db-worker/recall-pg-projection-client.ts` 隔离投影，不在服务线程解析大 JSON，也不通过 jsonb 转换丢失 codec 可保存的转义字符。准入限制并发 2、排队 0，先准入再读有界源；取消/超时若 SQL 尚未结束，配额持续保留到 SQL settle 与 Worker exit 都确认，故障不在主线程重算。该读路径不改变现有 PG 写入/生成列表达式的字符约束。
 - 其他使用 `WorkerPool` 的地方：gen-ui 编译、git 行统计、大纲文本编辑、编辑器文档任务、前缀快照、历史重写、token 重算等（`grep WorkerPool server`）。
 - 其他隔离形态：只读完整性探测与快照构建用独立子进程，在 `server/index.ts` 中于 `./main` 之前分流；启动状态页用 Worker 线程。
+- 发送附件的稳定 SHA256 由 `attachment-digest-worker.ts` 计算，客户端限制并发、排队、字节、超时和取消；上传 stage 保存摘要以便已消费后的提交对账。Worker 创建、就绪、执行、退出、禁用或超时失败均明确失败，不在 HTTP 主线程重算；入口也登记到编译清单并有真实编译产物测试。
 
 ## 从哪读起
 - `server/lib/worker-runtime/pool.ts`、`queue.ts`、`lifecycle.ts`：通用运行时。

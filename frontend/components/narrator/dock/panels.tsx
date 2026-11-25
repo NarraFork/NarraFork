@@ -27,6 +27,7 @@ import {
 	IconNotebook,
 	IconRobot,
 	IconSearch,
+	IconSitemap,
 	IconTerminal2,
 	IconTextSize,
 	IconTimeline,
@@ -52,6 +53,7 @@ import { useNarratorCurrentTask } from "../../../hooks/useTaskBoard";
 import { useUserPreferences } from "../../../hooks/useUserPreferences";
 import { NARRATOR_STATUS_COLORS } from "../../../lib/constants";
 import { lazyWithRetry } from "../../../lib/lazy-with-retry";
+import { useRecentTabsScope } from "../../../lib/recent-tabs-owner";
 import type { PluginDockPanelProps } from "../../plugins/types";
 import { FileReferenceScopeProvider } from "../composer/FileReferenceScope";
 import {
@@ -111,6 +113,11 @@ const FileTreePanel = lazy(() =>
 );
 const NarratorTimelinePanel = lazy(() =>
 	import("../timeline/NarratorTimelinePanel").then((m) => ({ default: m.NarratorTimelinePanel })),
+);
+const CommunicationTopologyPanel = lazy(() =>
+	import("../communication/CommunicationTopologyPanel").then((m) => ({
+		default: m.CommunicationTopologyPanel,
+	})),
 );
 // Both dock and drawer defer the same editor / binary-preview entry.
 const FilePanelContent = lazy(() =>
@@ -365,6 +372,7 @@ export function SubagentSessionPanelContent({
 }: SubagentSessionPanelContentProps) {
 	const navigate = useNavigate();
 	const { data: narrator } = useNarrator(subagentNarratorId);
+	const recentTabsScope = useRecentTabsScope();
 	const { data: userPrefs, isLoading: userPrefsLoading } = useUserPreferences();
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic narrator entity
 	const narratorData = narrator as any;
@@ -382,14 +390,17 @@ export function SubagentSessionPanelContent({
 				addSubagentToRecentTabs: userPrefs?.addSubagentToRecentTabs,
 			})
 		) {
-			addSubagentRecentTab({
-				id: subagentNarratorId,
-				parentNarratorId: narratorData?.parentNarratorId,
-				title,
-				cwd: narratorData?.cwd,
-				status: narratorData?.status,
-				isScheduled: traits.includes("scheduled"),
-			});
+			addSubagentRecentTab(
+				{
+					id: subagentNarratorId,
+					parentNarratorId: narratorData?.parentNarratorId,
+					title,
+					cwd: narratorData?.cwd,
+					status: narratorData?.status,
+					isScheduled: traits.includes("scheduled"),
+				},
+				recentTabsScope,
+			);
 		}
 		if (onOpenStandalonePage) {
 			onOpenStandalonePage(subagentNarratorId);
@@ -405,6 +416,7 @@ export function SubagentSessionPanelContent({
 		narratorData,
 		onClose,
 		onOpenStandalonePage,
+		recentTabsScope,
 		subagentNarratorId,
 		title,
 		traits,
@@ -802,6 +814,42 @@ export function UserChatDockPanel(props: IDockviewPanelProps<NarratorBoundPanelP
 					<NarratorUserChatPanel narratorId={narratorId} />
 				</LazyPanelBoundary>
 			</DockviewNarratorPanelVisibilityProvider>
+		</ToolPanelShell>
+	);
+}
+
+// ── Communication (the current domain and its explicit neighbours) ──
+export function CommunicationDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams>) {
+	const { t } = useTranslation("narrator");
+	const dock = useNarratorDockContext();
+	const narratorId = dock?.narratorId ?? props.params.narratorId;
+	const navigate = useNavigate();
+	const openNarrator = useCallback(
+		(id: string) => void navigate({ to: "/narrators/$narratorId", params: { narratorId: id } }),
+		[navigate],
+	);
+
+	useLayoutEffect(() => {
+		const title = t("communicationTitle");
+		if (title && title !== props.api.title) props.api.setTitle(title);
+	}, [t, props.api]);
+
+	return (
+		<ToolPanelShell
+			title={t("communicationTitle")}
+			icon={<IconSitemap size={16} color="var(--mantine-color-dimmed)" />}
+			props={props}
+			subjectId="__communication__"
+		>
+			<LazyPanelBoundary>
+				<DockviewNarratorPanelVisibilityProvider api={props.api}>
+					<CommunicationTopologyPanel
+						key={narratorId}
+						scope={{ kind: "narrator", narratorId }}
+						onOpenNarrator={openNarrator}
+					/>
+				</DockviewNarratorPanelVisibilityProvider>
+			</LazyPanelBoundary>
 		</ToolPanelShell>
 	);
 }
@@ -1258,6 +1306,7 @@ export const narratorDockComponents: Record<
 	userchat: UserChatDockPanel,
 	appearance: AppearanceDockPanel,
 	timeline: TimelineDockPanel,
+	communication: CommunicationDockPanel,
 	subagent: SubagentDockPanel,
 	filetree: FileTreeDockPanel,
 	file: FileDockPanel,

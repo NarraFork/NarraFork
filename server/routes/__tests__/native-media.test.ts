@@ -40,6 +40,7 @@ import {
 import { setUploadsDirForTests } from "../../lib/uploads";
 import {
 	bufferQueueModeSchema,
+	clientSubmissionIdSchema,
 	sendMessageSchema,
 	updateBufferedMessageSchema,
 } from "../../lib/validators/narrators";
@@ -91,6 +92,7 @@ const common = {
 	releaseStagedFiles: () => {},
 	parseFileReferenceInput,
 	bufferQueueModeSchema,
+	clientSubmissionIdSchema,
 	sendMessageSchema,
 	updateBufferedMessageSchema,
 	validateUploadedImage: () => {

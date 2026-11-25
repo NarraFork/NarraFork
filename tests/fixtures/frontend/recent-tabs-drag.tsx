@@ -13,16 +13,27 @@ import {
 	recentTabsSectionQueryKey,
 } from "../../../frontend/hooks/useRecentTabs";
 import { api } from "../../../frontend/lib/api";
+import { confirmAuthUser, setToken } from "../../../frontend/lib/api/client";
 import type { RecentTabsMutationResponse } from "../../../frontend/lib/api/settings";
 import {
 	getPanelDrag,
 	onPanelDragEnd,
 	type PanelDragState,
 } from "../../../frontend/lib/panel-drag";
+import {
+	getRecentTabsScope,
+	requireRecentTabsScope,
+} from "../../../frontend/lib/recent-tabs-owner";
 
 const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 const folderOptions: FolderViewOptions = { displayOf: () => "expanded", defaultPreview: 3 };
-const key = recentTabsSectionQueryKey("work");
+confirmAuthUser(setToken("fixture-auth"), "fixture-user");
+const scope = (() => {
+	const current = getRecentTabsScope();
+	requireRecentTabsScope(current);
+	return current;
+})();
+const key = recentTabsSectionQueryKey(scope, "work");
 const calls: { method: string; key?: string; target?: unknown; keys?: string[] }[] = [];
 const ends: (PanelDragState | null)[] = [];
 const deliveries: PanelDragState[] = [];
@@ -149,6 +160,7 @@ function Fixture() {
 		[],
 	);
 	const drag = useRecentTabsDrag({
+		scope,
 		tabs,
 		folderOptions,
 		containerRef,

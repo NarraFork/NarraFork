@@ -1,11 +1,15 @@
 import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import type { NotificationListItem } from "@shared/notification-center";
 import { SQLiteSyncDialect } from "drizzle-orm/sqlite-core";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
+import * as workerRead from "../../db/worker-read";
 import { NotFoundError, ValidationError } from "../../lib/errors";
 import { eventBus } from "../../lib/event-bus";
+import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+const workerFixture = getNarratorWorkerTestDb();
+const { db, sqlite } = workerFixture;
+await workerFixture.ready;
 const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const service = await import("../notification-center-service");
@@ -155,10 +159,11 @@ beforeEach(() => {
 			[id, id, "x", new Date(now).toISOString()],
 		);
 });
-afterAll(() => {
+afterAll(async () => {
 	mock.restore();
 	mock.module("../../db", () => realDb);
 	cleanDb(sqlite);
+	await workerFixture.close();
 });
 
 describe("write and boundary helpers", () => {
@@ -223,6 +228,73 @@ describe("write and boundary helpers", () => {
 			);
 		} finally {
 			eventBus.off("notification_center_changed", handler);
+		}
+	});
+
+	test("item writes report committed rows and broadcasts without a Worker state read", async () => {
+		notification("first");
+		notification("second");
+		notification("already-read", { status: "read", readAt: now });
+		notification("foreign", { userId: bob });
+		const events: unknown[] = [];
+		const off = onNotificationCenterChanged((event) => events.push(event));
+		const readSpy = spyOn(workerRead, "readDbAll").mockImplementation(() => {
+			throw new Error("Notification item writes must consume their own statement results");
+		});
+		try {
+			const input = {
+				userId: alice,
+				kind: "chat_message" as const,
+				sourceKey: "inserted-source",
+				title: "sender",
+				preview: "message",
+				link: { type: "unavailable" as const },
+			};
+			await recordNotifications([input, input]);
+			expect(events).toEqual([expect.objectContaining({ userId: alice, kinds: ["chat_message"] })]);
+			await recordNotifications([input]);
+			expect(events).toHaveLength(1);
+			expect(
+				sqlite
+					.query("SELECT count(*) AS count FROM notifications WHERE source_key = ?")
+					.get("inserted-source"),
+			).toEqual({ count: 1 });
+			expect(
+				await markNotificationsRead({
+					userId: alice,
+					scope: "items",
+					ids: ["first", "second", "first", "already-read", "foreign", "missing"],
+				}),
+			).toEqual({ updated: 2 });
+			expect(events).toHaveLength(2);
+			expect(events[1]).toMatchObject({ userId: alice });
+			expect(sqlite.query("SELECT status FROM notifications WHERE id = 'foreign'").get()).toEqual({
+				status: "unread",
+			});
+			expect(
+				await markNotificationsRead({
+					userId: alice,
+					scope: "items",
+					ids: ["first", "second", "foreign", "missing"],
+				}),
+			).toEqual({ updated: 0 });
+			expect(events).toHaveLength(2);
+			await expect(deleteNotification(alice, "foreign")).rejects.toBeInstanceOf(NotFoundError);
+			await expect(deleteNotification(alice, "missing")).rejects.toBeInstanceOf(NotFoundError);
+			expect(events).toHaveLength(2);
+			expect(sqlite.query("SELECT id FROM notifications WHERE id = 'foreign'").get()).toEqual({
+				id: "foreign",
+			});
+			await expect(deleteNotification(alice, "first")).resolves.toBeUndefined();
+			expect(sqlite.query("SELECT id FROM notifications WHERE id = 'first'").get()).toBeNull();
+			expect(events).toHaveLength(3);
+			expect(events[2]).toMatchObject({ userId: alice });
+			await expect(deleteNotification(alice, "first")).rejects.toBeInstanceOf(NotFoundError);
+			expect(events).toHaveLength(3);
+			expect(readSpy).not.toHaveBeenCalled();
+		} finally {
+			readSpy.mockRestore();
+			off();
 		}
 	});
 
@@ -393,17 +465,19 @@ describe("whole-window grouping and derived source state", () => {
 			message(`m${i}`, "room", i + 1);
 			notification(`m${i}`);
 		}
+		const readSpy = spyOn(workerRead, "readDbAll");
 		const allSpy = spyOn(db, "all");
-		const runSpy = spyOn(db, "run");
 		try {
 			await getUnreadCounts(alice);
-			await markNotificationsRead({
-				userId: alice,
-				scope: "items",
-				ids: Array.from({ length: 450 }, (_, i) => `m${i}`),
-			});
+			expect(
+				await markNotificationsRead({
+					userId: alice,
+					scope: "items",
+					ids: Array.from({ length: 450 }, (_, i) => `m${i}`),
+				}),
+			).toEqual({ updated: 450 });
 			const dialect = new SQLiteSyncDialect();
-			const reads = allSpy.mock.calls.map(([query]) =>
+			const reads = readSpy.mock.calls.map(([, query]) =>
 				dialect.sqlToQuery(query as Parameters<typeof dialect.sqlToQuery>[0]),
 			);
 			const sources = reads.filter((query) => query.sql.includes("FROM chat_messages"));
@@ -414,17 +488,17 @@ describe("whole-window grouping and derived source state", () => {
 				);
 				expect(query.params.length).toBeLessThanOrEqual(202);
 			}
-			const updates = runSpy.mock.calls.map(([query]) =>
+			const updates = allSpy.mock.calls.map(([query]) =>
 				dialect.sqlToQuery(query as Parameters<typeof dialect.sqlToQuery>[0]),
 			);
 			expect(updates).toHaveLength(3);
 			for (const query of updates) {
 				expect(query.params.length).toBeLessThanOrEqual(202);
-				expect(query.sql).not.toContain("RETURNING");
+				expect(query.sql).toContain("RETURNING id");
 			}
 		} finally {
+			readSpy.mockRestore();
 			allSpy.mockRestore();
-			runSpy.mockRestore();
 		}
 	});
 });

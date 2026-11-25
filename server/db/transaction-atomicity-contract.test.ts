@@ -1398,7 +1398,8 @@ describe("gate: no async SQLite atomic sections in production code", () => {
 			);
 		}
 		expect(violations).toHaveLength(0);
-	});
+		// Whole-repository AST inspection exceeds the 5s fixture default under parallel CI load.
+	}, 15_000);
 
 	it("self-check: detects every async callback shape, including the ones text matching misses", () => {
 		const detect = (source: string) => findViolations(source, "fixture.ts").map((v) => v.reason);

@@ -2,9 +2,10 @@ import { DEFAULT_LOCALE, type Locale } from "@shared/i18n-locales";
 import { formatOriginLabel } from "@shared/message-origin";
 import type { ScheduledTaskCleanupPolicy } from "@shared/scheduled-task-cleanup";
 import { normalizeRunContext, type ScheduledRunContext } from "@shared/scheduled-task-run-context";
-import { and, asc, desc, eq, lt, lte } from "drizzle-orm";
+import { and, asc, desc, eq, gt, lt, lte } from "drizzle-orm";
 import { db } from "../db";
 import { narrators, projects, scheduledTaskRuns, scheduledTasks, users } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { AsyncMutex } from "../lib/async-mutex";
 import { nextCronRun } from "../lib/cron";
 import { NotFoundError, ValidationError } from "../lib/errors";
@@ -15,6 +16,7 @@ import { canWriteNarrator, type NarratorPrincipal } from "./narrator-acl";
 import { narratorService } from "./narrator-service";
 import { isLoopRunning, sendMessage } from "./narrator-session";
 import { canWriteProject } from "./project-acl";
+import { collectKeysetRows } from "./read/read-collect";
 import { cleanupScheduledTaskNarrators } from "./scheduled-task-cleanup";
 
 type ScheduledTask = typeof scheduledTasks.$inferSelect;
@@ -106,10 +108,13 @@ function now(): string {
 async function principalForTask(task: ScheduledTask): Promise<NarratorPrincipal> {
 	const userId = task.createdBy ?? "";
 	if (!userId) return { userId: "", isAdmin: false };
-	const user = await db.query.users.findFirst({
-		where: eq(users.id, userId),
-		columns: { role: true },
-	});
+	const user = await readQuery(
+		db.query.users.findFirst({
+			where: eq(users.id, userId),
+			columns: { role: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	return { userId, isAdmin: user?.role === "admin" };
 }
 
@@ -124,10 +129,13 @@ export const scheduledTaskService = {
 	async list(): Promise<{ tasks: ScheduledTask[]; truncated: boolean }> {
 		// `LIMIT n + 1` rather than a separate COUNT: one extra row answers "is there
 		// more" without a second scan of the table.
-		const rows = await db.query.scheduledTasks.findMany({
-			orderBy: (t) => [asc(t.createdAt)],
-			limit: LIST_MAX + 1,
-		});
+		const rows = await readQuery(
+			db.query.scheduledTasks.findMany({
+				orderBy: (t) => [asc(t.createdAt)],
+				limit: LIST_MAX + 1,
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		if (rows.length > LIST_MAX) {
 			logger.warn("scheduled task list truncated", { limit: LIST_MAX });
 			return { tasks: rows.slice(0, LIST_MAX), truncated: true };
@@ -136,7 +144,9 @@ export const scheduledTaskService = {
 	},
 
 	async get(id: string): Promise<ScheduledTask | undefined> {
-		return db.query.scheduledTasks.findFirst({ where: eq(scheduledTasks.id, id) });
+		return readQuery(db.query.scheduledTasks.findFirst({ where: eq(scheduledTasks.id, id) }), {
+			executionPolicy: "worker-required",
+		});
 	},
 
 	async create(input: CreateScheduledTaskInput): Promise<ScheduledTask> {
@@ -192,13 +202,13 @@ export const scheduledTaskService = {
 		const timezone = input.timezone !== undefined ? input.timezone : existing.timezone;
 		const enabled = input.enabled ?? existing.enabled;
 
-		// Recompute nextRunAt whenever schedule or enabled state changes.
+		// Recompute nextRunAt whenever schedule or enabled state changes. Otherwise it is left
+		// out of the patch: `existing` came from a Worker read, and writing it back could undo a
+		// run's claim that re-armed the schedule in between.
 		let nextRunAt = existing.nextRunAt;
-		if (
-			input.cronExpr !== undefined ||
-			input.timezone !== undefined ||
-			input.enabled !== undefined
-		) {
+		const scheduleChanged =
+			input.cronExpr !== undefined || input.timezone !== undefined || input.enabled !== undefined;
+		if (scheduleChanged) {
 			if (!enabled) {
 				nextRunAt = null;
 			} else {
@@ -223,7 +233,7 @@ export const scheduledTaskService = {
 			...(input.narratorMode !== undefined && { narratorMode: input.narratorMode }),
 			...(input.cleanupPolicy !== undefined && { cleanupPolicy: input.cleanupPolicy }),
 			...(input.enabled !== undefined && { enabled: input.enabled }),
-			nextRunAt,
+			...(scheduleChanged && { nextRunAt }),
 			updatedAt: now(),
 		};
 		await db.update(scheduledTasks).set(patch).where(eq(scheduledTasks.id, id));
@@ -252,9 +262,25 @@ export const scheduledTaskService = {
 
 	/** Tasks that are enabled and due (nextRunAt <= now). */
 	async listDue(at: Date = new Date()): Promise<ScheduledTask[]> {
-		return db.query.scheduledTasks.findMany({
-			where: and(eq(scheduledTasks.enabled, true), lte(scheduledTasks.nextRunAt, at.toISOString())),
-		});
+		return collectKeysetRows(
+			(after) =>
+				readQuery(
+					db
+						.select()
+						.from(scheduledTasks)
+						.where(
+							and(
+								eq(scheduledTasks.enabled, true),
+								lte(scheduledTasks.nextRunAt, at.toISOString()),
+								after === null ? undefined : gt(scheduledTasks.id, after),
+							),
+						)
+						.orderBy(asc(scheduledTasks.id))
+						.limit(100),
+					{ executionPolicy: "worker-required" },
+				),
+			(row) => row.id,
+		);
 	},
 
 	/**
@@ -263,9 +289,28 @@ export const scheduledTaskService = {
 	 * avoid a thundering herd of catch-up runs at boot.
 	 */
 	async recoverOnStartup(): Promise<void> {
-		const tasks = await db.query.scheduledTasks.findMany({
-			where: eq(scheduledTasks.enabled, true),
-		});
+		const tasks = await collectKeysetRows(
+			(after) =>
+				readQuery(
+					db
+						.select({
+							id: scheduledTasks.id,
+							cronExpr: scheduledTasks.cronExpr,
+							timezone: scheduledTasks.timezone,
+						})
+						.from(scheduledTasks)
+						.where(
+							and(
+								eq(scheduledTasks.enabled, true),
+								after === null ? undefined : gt(scheduledTasks.id, after),
+							),
+						)
+						.orderBy(asc(scheduledTasks.id))
+						.limit(200),
+					{ executionPolicy: "worker-required" },
+				),
+			(row) => row.id,
+		);
 		const at = new Date();
 		for (const task of tasks) {
 			const next = nextCronRun(task.cronExpr, task.timezone, at);
@@ -292,6 +337,26 @@ export const scheduledTaskService = {
 			// Re-arm the next scheduled run up front (even if this run fails/skips),
 			// so a persistent failure doesn't wedge the schedule.
 			const nextRunAt = task.enabled ? nextCronRun(task.cronExpr, task.timezone) : null;
+
+			if (!opts.manual) {
+				// `listDue` and the read above run on a Worker, so the task can be disabled or
+				// rescheduled before we get here. Claim the run in the write itself: it only
+				// succeeds while the row is still enabled and due, and it re-arms the schedule.
+				const claimedAt = now();
+				const claim = db
+					.update(scheduledTasks)
+					.set({ nextRunAt, updatedAt: claimedAt })
+					.where(
+						and(
+							eq(scheduledTasks.id, id),
+							eq(scheduledTasks.enabled, true),
+							lte(scheduledTasks.nextRunAt, claimedAt),
+						),
+					)
+					.returning({ id: scheduledTasks.id })
+					.all();
+				if (claim.length === 0) return;
+			}
 
 			const startedAt = now();
 			const startMs = Date.now();
@@ -334,8 +399,8 @@ export const scheduledTaskService = {
 					lastError: error,
 					lastNarratorId: narratorId ?? task.lastNarratorId,
 					reuseNarratorId,
-					// A manual trigger doesn't disturb the cron cadence unless enabled.
-					...(opts.manual ? {} : { nextRunAt }),
+					// The automatic claim already re-armed nextRunAt; a manual trigger leaves it
+					// alone. Not writing it here keeps an edit made during the run.
 					updatedAt: finishedAt,
 				})
 				.where(eq(scheduledTasks.id, id));
@@ -407,11 +472,14 @@ export const scheduledTaskService = {
 		const where = opts.cursor
 			? and(eq(scheduledTaskRuns.taskId, taskId), lt(scheduledTaskRuns.createdAt, opts.cursor))
 			: eq(scheduledTaskRuns.taskId, taskId);
-		const rows = await db.query.scheduledTaskRuns.findMany({
-			where,
-			orderBy: (t) => [desc(t.createdAt)],
-			limit: limit + 1,
-		});
+		const rows = await readQuery(
+			db.query.scheduledTaskRuns.findMany({
+				where,
+				orderBy: (t) => [desc(t.createdAt)],
+				limit: limit + 1,
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		const hasMore = rows.length > limit;
 		const runs = hasMore ? rows.slice(0, limit) : rows;
 		const nextCursor = hasMore ? (runs[runs.length - 1]?.createdAt ?? null) : null;
@@ -438,10 +506,13 @@ export const scheduledTaskService = {
 			if (!task.projectId) {
 				return { status: "skipped", narratorId: null, error: "Missing projectId" };
 			}
-			const project = await db.query.projects.findFirst({
-				where: eq(projects.id, task.projectId),
-				columns: { id: true, ownerUserId: true, visibility: true, gitPath: true },
-			});
+			const project = await readQuery(
+				db.query.projects.findFirst({
+					where: eq(projects.id, task.projectId),
+					columns: { id: true, ownerUserId: true, visibility: true, gitPath: true },
+				}),
+				{ executionPolicy: "worker-required" },
+			);
 			if (!project) {
 				return { status: "skipped", narratorId: null, error: "Project not found" };
 			}

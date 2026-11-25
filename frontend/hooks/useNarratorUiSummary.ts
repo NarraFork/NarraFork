@@ -1,35 +1,17 @@
 import { type QueryClient, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useSyncExternalStore } from "react";
-import { getToken, onTokenChange } from "../lib/api/client";
+import { getAuthSnapshot, subscribeAuth } from "../lib/api/client";
 import { getNarratorUiSummary, type NarratorUiSummary } from "../lib/api/narrator-ui-summary";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
-import { useCurrentUser } from "./useCurrentUser";
 
-export const narratorUiSummaryKey = (
-	narratorId: string,
-	userId: string | null,
-	token: string | null,
-) => ["narrator-ui-summary", narratorId, userId, token] as const;
+export const narratorUiSummaryKey = (narratorId: string, generation: number) =>
+	["narrator-ui-summary", narratorId, generation] as const;
 type SummaryKey = ReturnType<typeof narratorUiSummaryKey>;
 const SUMMARY_STALE_TIME_MS = 30_000;
 
-function subscribeSession(listener: () => void) {
-	const stop = onTokenChange(listener);
-	const storage = (event: StorageEvent) => {
-		if (event.key === "narrafork_token" || event.key === null) listener();
-	};
-	if (typeof window !== "undefined") window.addEventListener("storage", storage);
-	return () => {
-		stop();
-		if (typeof window !== "undefined") window.removeEventListener("storage", storage);
-	};
-}
-
-/** Identity is part of both summary and terminal-entity caches; no cross-account placeholder. */
+/** Shared authenticated reads are generation-scoped and need not wait for the profile. */
 export function useNarratorUiScope() {
-	const token = useSyncExternalStore(subscribeSession, getToken, () => null);
-	const { data: user } = useCurrentUser();
-	return { token, userId: (user?.id as string | undefined) ?? null };
+	return useSyncExternalStore(subscribeAuth, getAuthSnapshot, getAuthSnapshot);
 }
 
 const observers = new WeakMap<QueryClient, Map<string, { count: number; stop: () => void }>>();
@@ -45,10 +27,10 @@ function observeSummary(qc: QueryClient, key: SummaryKey) {
 	let entry = entries.get(identity);
 	if (!entry) {
 		const narratorId = key[1];
-		const token = key[3];
+		const generation = key[2];
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		let lastLegacyProbeAt = 0;
-		const valid = () => getToken() === token;
+		const valid = () => getAuthSnapshot().generation === generation;
 		const cancel = () => {
 			void qc.cancelQueries({ queryKey: key, exact: true });
 		};
@@ -90,7 +72,7 @@ function observeSummary(qc: QueryClient, key: SummaryKey) {
 			(event) => {
 				if (!valid()) return;
 				const type = event.type as string;
-				if (type === "chat:read" && event.userId !== key[2]) return;
+				if (type === "chat:read" && event.userId !== getAuthSnapshot().userId) return;
 				if (event.narratorId && event.narratorId !== narratorId) return;
 				if (type === "terminal_count_changed") {
 					if (
@@ -170,12 +152,16 @@ function observeSummary(qc: QueryClient, key: SummaryKey) {
 
 export function useNarratorUiSummary(narratorId: string, enabled = true) {
 	const qc = useQueryClient();
-	const { userId, token } = useNarratorUiScope();
-	const active = enabled && !!narratorId && !!userId && !!token;
-	const queryKey = narratorUiSummaryKey(narratorId, userId, token);
+	const { hasToken, generation } = useNarratorUiScope();
+	const active = enabled && !!narratorId && hasToken;
+	const queryKey = narratorUiSummaryKey(narratorId, generation);
 	const query = useQuery({
 		queryKey,
-		queryFn: ({ signal }) => getNarratorUiSummary(narratorId, { signal }),
+		queryFn: ({ signal }) => {
+			if (getAuthSnapshot().generation !== generation)
+				throw new DOMException("Session changed", "AbortError");
+			return getNarratorUiSummary(narratorId, { signal });
+		},
 		enabled: active,
 		staleTime: SUMMARY_STALE_TIME_MS,
 		refetchOnWindowFocus: true,
@@ -185,7 +171,7 @@ export function useNarratorUiSummary(narratorId: string, enabled = true) {
 	});
 	useEffect(() => {
 		if (!active) return;
-		return observeSummary(qc, narratorUiSummaryKey(narratorId, userId, token));
-	}, [qc, narratorId, userId, token, active]);
+		return observeSummary(qc, narratorUiSummaryKey(narratorId, generation));
+	}, [qc, narratorId, generation, active]);
 	return query;
 }

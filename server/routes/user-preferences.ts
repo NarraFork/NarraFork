@@ -7,10 +7,10 @@ import {
 	lineHeightPercentFromStored,
 } from "@shared/pretext-layout/typography";
 import { eq, sql } from "drizzle-orm";
-import { Hono } from "hono";
+import { type Context, Hono } from "hono";
 import { db, sqlite } from "../db";
 import { userPreferences } from "../db/schema";
-import { readQuery } from "../db/worker-read";
+import { readQuery, readQueryFirst } from "../db/worker-read";
 import { userPreferencesLock } from "../lib/async-mutex";
 import { AppError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
@@ -45,6 +45,7 @@ import {
 	clearRecentTabs,
 	createRecentTabFolder,
 	dissolveRecentTabFolder,
+	filterReadableRecentTabs,
 	getRecentTabState,
 	getRuntimePatches,
 	listLegacyTabs,
@@ -60,6 +61,14 @@ import {
 import { enrichTabs } from "../services/user-preferences-service";
 
 export const userPreferencesRoutes = new Hono();
+
+/**
+ * Preferences reads run on the database Worker. Every writer of the merged JSON columns
+ * holds `userPreferencesLock`, so a read taken inside the lock cannot be overwritten.
+ */
+function prefsRead(c: Context) {
+	return { executionPolicy: "worker-required" as const, signal: c.req.raw.signal, maxRows: 1 };
+}
 
 const DEFAULTS = {
 	autoLoadOlderMessages: true,
@@ -371,8 +380,10 @@ function serializeUserPreferences(
 	pref: typeof userPreferences.$inferSelect,
 	recentTabs?: Record<string, unknown>[],
 ): Record<string, unknown> {
+	// The compatibility shadow is not ACL-filtered storage. Never serialize it directly.
+	const { recentTabs: _shadow, ...preferences } = pref;
 	return {
-		...pref,
+		...preferences,
 		narratorLineHeightV2Percent: lineHeightPercentFromStored(
 			pref.narratorLineHeightV2Percent,
 			pref.narratorLineHeightScalePercent,
@@ -625,16 +636,19 @@ async function writeUIPreferences(userId: string, body: unknown, isAdmin: boolea
 
 userPreferencesRoutes.get("/", async (c) => {
 	const userId = c.get("user").sub;
-	if (c.req.query("view") === "ui")
+	if (c.req.query("view") === "ui") {
 		return c.json(await readUIPreferences(userId, c.req.raw.signal));
-	const legacyTabs = await listLegacyTabs(userId);
-	const recentTabs = await enrichTabs(
-		legacyTabs.map((tab) => ({ ...tab })) as Record<string, unknown>[],
-		userId,
+	}
+	const legacyTabs = (await listLegacyTabs(userId)).map((tab) => ({ ...tab }));
+	const pref = await readQueryFirst(
+		db.query.userPreferences.findMany({
+			where: eq(userPreferences.userId, userId),
+			limit: 1,
+		}),
+		prefsRead(c),
 	);
-	const pref = await db.query.userPreferences.findFirst({
-		where: eq(userPreferences.userId, userId),
-	});
+	await enrichTabs(legacyTabs, userId);
+	const recentTabs = filterReadableRecentTabs(userId, legacyTabs);
 	if (!pref) {
 		return c.json({
 			...DEFAULTS,
@@ -681,9 +695,13 @@ userPreferencesRoutes.patch("/", async (c) => {
 	const body = await c.req.json();
 
 	const updated = await userPreferencesLock.acquire(userId, async () => {
-		const existing = await db.query.userPreferences.findFirst({
-			where: eq(userPreferences.userId, userId),
-		});
+		const existing = await readQueryFirst(
+			db.query.userPreferences.findMany({
+				where: eq(userPreferences.userId, userId),
+				limit: 1,
+			}),
+			prefsRead(c),
+		);
 		const mergedBody = isRecord(body) ? { ...body } : body;
 		if (isRecord(mergedBody)) {
 			for (const field of TOP_LEVEL_SECRET_FIELDS) {
@@ -916,7 +934,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 
 		const [saved] = await readQuery(
 			db.select().from(userPreferences).where(eq(userPreferences.userId, userId)).limit(1),
-			{ maxRows: 1 },
+			prefsRead(c),
 		);
 		return saved;
 	});
@@ -949,7 +967,7 @@ userPreferencesRoutes.put("/git-identity/folders/:folderId", async (c) => {
 
 // === Recent Tabs endpoints ===
 
-/** Cursor-paginated authoritative recent tabs, split into project/work sections. */
+/** Cursor-paginated work list; `projects` remains an empty compatibility section. */
 userPreferencesRoutes.get("/recent-tabs", async (c) => {
 	const userId = c.get("user").sub;
 	const parsed = recentTabsPageQuerySchema.safeParse({
@@ -1097,10 +1115,14 @@ userPreferencesRoutes.patch("/graph-viewports", async (c) => {
 	const id = generateId();
 
 	await userPreferencesLock.acquire(userId, async () => {
-		const existing = await db.query.userPreferences.findFirst({
-			where: eq(userPreferences.userId, userId),
-			columns: { graphViewports: true },
-		});
+		const existing = await readQueryFirst(
+			db.query.userPreferences.findMany({
+				where: eq(userPreferences.userId, userId),
+				columns: { graphViewports: true },
+				limit: 1,
+			}),
+			prefsRead(c),
+		);
 
 		let viewports: Record<string, { x: number; y: number; zoom: number }> = {};
 		try {
@@ -1161,10 +1183,14 @@ userPreferencesRoutes.patch("/plugin-overlays", async (c) => {
 	const id = generateId();
 
 	const next = await userPreferencesLock.acquire(userId, async () => {
-		const existing = await db.query.userPreferences.findFirst({
-			where: eq(userPreferences.userId, userId),
-			columns: { hiddenPluginOverlays: true },
-		});
+		const existing = await readQueryFirst(
+			db.query.userPreferences.findMany({
+				where: eq(userPreferences.userId, userId),
+				columns: { hiddenPluginOverlays: true },
+				limit: 1,
+			}),
+			prefsRead(c),
+		);
 		const others = parseHiddenPluginOverlays(existing?.hiddenPluginOverlays).filter(
 			(stored) => stored !== pluginId,
 		);

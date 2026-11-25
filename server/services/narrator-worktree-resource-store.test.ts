@@ -1,4 +1,4 @@
-import { Database } from "bun:sqlite";
+import type { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -9,6 +9,9 @@ import { applyPendingMigrationsByHash } from "../db/run-migrations";
 import * as schema from "../db/schema";
 import { LocalBackend } from "../lib/agent/execution/local-backend";
 import { safeSpawn } from "../lib/spawn";
+import { closeFileWorkerDatabase, openFileWorkerDatabase } from "./__tests__/file-worker-database";
+// Rejections settle natively before matching: Bun's `.rejects` stalls on a reused read Worker.
+import { captureWorkerRejectionThrower } from "./__tests__/narrator-worker-fixture";
 import { FileWorktreeJournal, worktreeReceiptHasResourceEffect } from "./narrator-worktree-journal";
 import {
 	createWorktreeResourceRegistry,
@@ -38,7 +41,7 @@ const registration = {
 	createRequestId: "request",
 };
 function fixture(upgraded = true) {
-	const sqlite = new Database(":memory:");
+	const sqlite = openFileWorkerDatabase();
 	fixtures.push(sqlite);
 	const folder = mkdtempSync(join(tmpdir(), "nf-resource-schema-fixture-"));
 	try {
@@ -67,8 +70,8 @@ function upgrade(sqlite: Database) {
 		if (statement.trim()) sqlite.exec(statement);
 	sqlite.exec("PRAGMA foreign_keys=ON");
 }
-afterEach(() => {
-	for (const sqlite of fixtures.splice(0)) sqlite.close();
+afterEach(async () => {
+	for (const sqlite of fixtures.splice(0)) await closeFileWorkerDatabase(sqlite);
 });
 
 describe("resource schema real old-chain upgrade", () => {
@@ -157,9 +160,9 @@ describe("resource schema real old-chain upgrade", () => {
 			sqlite.query("SELECT scope_kind, scope_project_id FROM narrator_worktree_resources").get(),
 		).toEqual({ scope_kind: "project", scope_project_id: null });
 		expect(sqlite.query("SELECT id FROM volume_snapshots").all()).toEqual([]);
-		await expect(registry.compareAndSetScope(id, 0, unknownWorktreeScope)).rejects.toThrow(
-			"cannot downgrade",
-		);
+		expect(
+			await captureWorkerRejectionThrower(registry.compareAndSetScope(id, 0, unknownWorktreeScope)),
+		).toThrow("cannot downgrade");
 		sqlite.exec("DELETE FROM users WHERE id='owner'");
 		expect(
 			sqlite.query("SELECT scope_owner_user_id FROM narrator_worktree_resources").get(),
@@ -240,13 +243,15 @@ test("registration pins verified project scope and scope CAS pins both old and n
 	admitted.length = 0;
 	blocked = "next-project";
 	const id = worktreeResourceId("local", registration.worktreePath);
-	await expect(
-		registry.compareAndSetScope(id, 0, {
-			scopeKind: "project",
-			scopeProjectId: "next-project",
-			scopeOwnerUserId: "owner",
-		}),
-	).rejects.toThrow("reserved");
+	expect(
+		await captureWorkerRejectionThrower(
+			registry.compareAndSetScope(id, 0, {
+				scopeKind: "project",
+				scopeProjectId: "next-project",
+				scopeOwnerUserId: "owner",
+			}),
+		),
+	).toThrow("reserved");
 	expect(admitted).toEqual(["p", "next-project"]);
 	expect(
 		sqlite
@@ -510,13 +515,15 @@ describe("registry stable verified scope", () => {
 			sqlite.query("SELECT scope_kind, scope_owner_user_id FROM narrator_worktree_resources").get(),
 		).toEqual({ scope_kind: "unknown", scope_owner_user_id: null });
 		blocked = true;
-		await expect(
-			registry.compareAndSetScope(id, 0, {
-				scopeKind: "standalone",
-				scopeProjectId: null,
-				scopeOwnerUserId: "owner",
-			}),
-		).rejects.toThrow("reserved");
+		expect(
+			await captureWorkerRejectionThrower(
+				registry.compareAndSetScope(id, 0, {
+					scopeKind: "standalone",
+					scopeProjectId: null,
+					scopeOwnerUserId: "owner",
+				}),
+			),
+		).toThrow("reserved");
 		blocked = false;
 		expect(
 			await registry.compareAndSetScope(id, 0, {
@@ -535,34 +542,44 @@ describe("registry stable verified scope", () => {
 	test("null/missing verified owner and missing project/root evidence are rejected, never filled from actor", async () => {
 		const { database } = fixture();
 		const registry = createWorktreeResourceRegistry(database, (_resource, body) => body());
-		await expect(
-			registry.register({
-				...registration,
-				scope: { scopeKind: "standalone", scopeProjectId: null, scopeOwnerUserId: null },
-			}),
-		).rejects.toThrow("incomplete");
-		await expect(
-			registry.register({
-				...registration,
-				scope: { scopeKind: "project", scopeProjectId: null, scopeOwnerUserId: "owner" },
-			}),
-		).rejects.toThrow("incomplete");
-		await expect(
-			registry.register({
-				...registration,
-				scope: { scopeKind: "standalone", scopeProjectId: null, scopeOwnerUserId: "missing" },
-			}),
-		).rejects.toThrow("FOREIGN KEY");
-		await registry.register(registration);
-		await expect(
-			registry.register({ ...registration, ownerNarratorId: "other" }),
-		).rejects.toThrow();
-		await expect(
-			registry.compareAndSetScope(
-				worktreeResourceId("local", registration.worktreePath),
-				-1,
-				unknownWorktreeScope,
+		expect(
+			await captureWorkerRejectionThrower(
+				registry.register({
+					...registration,
+					scope: { scopeKind: "standalone", scopeProjectId: null, scopeOwnerUserId: null },
+				}),
 			),
-		).rejects.toThrow("revision");
+		).toThrow("incomplete");
+		expect(
+			await captureWorkerRejectionThrower(
+				registry.register({
+					...registration,
+					scope: { scopeKind: "project", scopeProjectId: null, scopeOwnerUserId: "owner" },
+				}),
+			),
+		).toThrow("incomplete");
+		expect(
+			await captureWorkerRejectionThrower(
+				registry.register({
+					...registration,
+					scope: { scopeKind: "standalone", scopeProjectId: null, scopeOwnerUserId: "missing" },
+				}),
+			),
+		).toThrow("FOREIGN KEY");
+		await registry.register(registration);
+		expect(
+			await captureWorkerRejectionThrower(
+				registry.register({ ...registration, ownerNarratorId: "other" }),
+			),
+		).toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				registry.compareAndSetScope(
+					worktreeResourceId("local", registration.worktreePath),
+					-1,
+					unknownWorktreeScope,
+				),
+			),
+		).toThrow("revision");
 	});
 });

@@ -1,23 +1,31 @@
 import type { RuntimeSettings } from "@shared/settings-runtime";
 import { type MutateOptions, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
-import { getToken, onTokenChange } from "../lib/api/client";
-import { RUNTIME_SETTINGS_QUERY_KEY } from "./useRuntimeSettings";
+import { getAuthSnapshot, subscribeAuth } from "../lib/api/client";
+import { runtimeSettingsQueryKey } from "./useRuntimeSettings";
 
 type Input = Record<string, unknown>;
-type Scope = { input: Input; token: string | null };
+type Scope = { input: Input; generation: number };
 type Options = MutateOptions<RuntimeSettings, Error, Input, void>;
+const isCurrentGeneration = (generation: number) => getAuthSnapshot().generation === generation;
+
 function scopedOptions(
 	options?: Options,
 ): MutateOptions<RuntimeSettings, Error, Scope, void> | undefined {
 	return (
 		options && {
-			onSuccess: (data, scope, context, mutation) =>
-				options.onSuccess?.(data, scope.input, context, mutation),
-			onError: (error, scope, context, mutation) =>
-				options.onError?.(error, scope.input, context, mutation),
-			onSettled: (data, error, scope, context, mutation) =>
-				options.onSettled?.(data, error, scope.input, context, mutation),
+			onSuccess: (data, scope, context, mutation) => {
+				if (isCurrentGeneration(scope.generation))
+					options.onSuccess?.(data, scope.input, context, mutation);
+			},
+			onError: (error, scope, context, mutation) => {
+				if (isCurrentGeneration(scope.generation))
+					options.onError?.(error, scope.input, context, mutation);
+			},
+			onSettled: (data, error, scope, context, mutation) => {
+				if (isCurrentGeneration(scope.generation))
+					options.onSettled?.(data, error, scope.input, context, mutation);
+			},
 		}
 	);
 }
@@ -26,32 +34,36 @@ function scopedOptions(
 export function useUpdateRuntimeSettings() {
 	const qc = useQueryClient();
 	const mutation = useMutation<RuntimeSettings, Error, Scope, void>({
-		onMutate: async ({ token }) => {
-			await qc.cancelQueries({ queryKey: [...RUNTIME_SETTINGS_QUERY_KEY, token] });
+		onMutate: async ({ generation }) => {
+			await qc.cancelQueries({ queryKey: runtimeSettingsQueryKey(generation), exact: true });
 		},
-		mutationFn: async ({ input, token }) => {
-			if (!token || getToken() !== token) throw new DOMException("Session changed", "AbortError");
+		mutationFn: async ({ input, generation }) => {
+			const auth = getAuthSnapshot();
+			if (!auth.hasToken || auth.generation !== generation)
+				throw new DOMException("Session changed", "AbortError");
 			const controller = new AbortController();
-			const off = onTokenChange(() => controller.abort());
+			const off = subscribeAuth(() => {
+				if (!isCurrentGeneration(generation)) controller.abort();
+			});
 			try {
 				const data = await api.updateRuntimeSettings(input, { signal: controller.signal });
-				if (getToken() !== token || controller.signal.aborted)
+				if (!isCurrentGeneration(generation) || controller.signal.aborted)
 					throw new DOMException("Session changed", "AbortError");
 				return data;
 			} finally {
 				off();
 			}
 		},
-		onSuccess: async (data, { token }) => {
-			if (token !== getToken()) return;
-			const queryKey = [...RUNTIME_SETTINGS_QUERY_KEY, token];
-			await qc.cancelQueries({ queryKey });
-			if (token !== getToken()) return;
+		onSuccess: async (data, { generation }) => {
+			if (!isCurrentGeneration(generation)) return;
+			const queryKey = runtimeSettingsQueryKey(generation);
+			await qc.cancelQueries({ queryKey, exact: true });
+			if (!isCurrentGeneration(generation)) return;
 			qc.setQueryData(queryKey, data);
 			await Promise.all([
 				qc.invalidateQueries({ queryKey: ["settings"] }),
-				qc.invalidateQueries({ queryKey: ["model-catalog", "runtime"] }),
-				qc.invalidateQueries({ queryKey: ["model-catalog", "options"] }),
+				qc.invalidateQueries({ queryKey: ["model-catalog", "runtime", generation] }),
+				qc.invalidateQueries({ queryKey: ["model-catalog", "options", generation] }),
 			]);
 		},
 	});
@@ -59,8 +71,11 @@ export function useUpdateRuntimeSettings() {
 		...mutation,
 		variables: mutation.variables?.input,
 		mutate: (input: Input, options?: Options) =>
-			mutation.mutate({ input, token: getToken() }, scopedOptions(options)),
+			mutation.mutate({ input, generation: getAuthSnapshot().generation }, scopedOptions(options)),
 		mutateAsync: (input: Input, options?: Options) =>
-			mutation.mutateAsync({ input, token: getToken() }, scopedOptions(options)),
+			mutation.mutateAsync(
+				{ input, generation: getAuthSnapshot().generation },
+				scopedOptions(options),
+			),
 	};
 }

@@ -9,8 +9,22 @@ import type { FileReference } from "@shared/file-reference";
 import type { SavedRecording } from "@shared/request-recording";
 import type { TFunction } from "i18next";
 import type React from "react";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+	createElement,
+	useCallback,
+	useEffect,
+	useLayoutEffect,
+	useMemo,
+	useRef,
+	useState,
+} from "react";
 import { api, type BufferMessageSummary, isAbortError } from "../../../lib/api";
+import { getToken } from "../../../lib/api/client";
+import {
+	NarratorSubmissionReconciler,
+	SubmissionOutcomeUnknown,
+	submissionFingerprint,
+} from "../../../lib/narrator-submission";
 import { narratorWSManager } from "../../../lib/narrator-ws-manager";
 import { hasSendableComposerContent } from "../composer/composer-send-gate";
 import {
@@ -488,6 +502,57 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 		[currentUser, setQueuedMessages, reconcileBufferedMessages, t],
 	);
 
+	const submissionReconciler = useRef<NarratorSubmissionReconciler | null>(null);
+	if (!submissionReconciler.current)
+		submissionReconciler.current = new NarratorSubmissionReconciler(
+			typeof localStorage === "undefined" ? undefined : localStorage,
+		);
+	const receiptReconciler = submissionReconciler.current;
+	/** The snapshot and ID survive an unknown response; only a receipt can authorize retry. */
+	const sendMessageWithReceipt = async (...args: Parameters<typeof api.sendNarratorMessage>) => {
+		const token = getToken();
+		const files = (values: File[] | undefined) =>
+			values?.map((file) => ({
+				name: file.name,
+				size: file.size,
+				type: file.type,
+				lastModified: file.lastModified,
+			}));
+		const queueMode = args[9] ?? (args[8] ? "interrupt" : args[4] ? "tool" : "turn");
+		const fingerprint = await submissionFingerprint({
+			message: args[1],
+			images: files(args[2]) ?? [],
+			textFiles: files(args[3]) ?? [],
+			media: files(args[11]) ?? [],
+			priority: queueMode !== "turn",
+			fileReferences: args[7] ?? [],
+			interrupt: queueMode === "interrupt",
+			queueMode,
+			composerDocument: args[10]?.composerDocument,
+		});
+		return receiptReconciler.submit({
+			scope: JSON.stringify([userId, args[0]]),
+			fingerprint,
+			send: (clientSubmissionId) => {
+				if (getToken() !== token) throw new SubmissionOutcomeUnknown();
+				const snapshot = [...args] as Parameters<typeof api.sendNarratorMessage>;
+				snapshot[10] = { ...args[10], clientSubmissionId };
+				return api.sendNarratorMessage(...snapshot);
+			},
+			receipt: (id) => {
+				if (getToken() !== token) throw new SubmissionOutcomeUnknown();
+				return api.getNarratorSubmissionReceipt(args[0], id, AbortSignal.timeout(10_000));
+			},
+			accepted: (receipt) => ({
+				buffered: true,
+				id: receipt.id,
+				bufferedAt: receipt.bufferedAt,
+				state: receipt.state,
+			}),
+			canRetry: () => !args[6]?.aborted && getToken() === token,
+		});
+	};
+
 	// --- Send / retry message ---
 	/**
 	 * Send as a new turn on an idle narrator.
@@ -546,7 +611,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 		];
 		scrollToBottom(true);
 		try {
-			const result = await api.sendNarratorMessage(
+			const result = await sendMessageWithReceipt(
 				narratorId,
 				msg,
 				images.length > 0 ? images : undefined,
@@ -644,7 +709,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 		if (!files) throw new Error(t("composerMissingAssets"));
 		const images = files.images;
 		const textFiles = files.textFiles;
-		const result = await api.sendNarratorMessage(
+		const result = await sendMessageWithReceipt(
 			narratorId,
 			msg,
 			images.length > 0 ? images : undefined,
@@ -947,7 +1012,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 						sendArgs[10] = { composerDocument: initialInput.composerDocument };
 					}
 					if (files.media.length) sendArgs[11] = files.media;
-					await api.sendNarratorMessage(...sendArgs);
+					await sendMessageWithReceipt(...sendArgs);
 				}
 
 				if (!isCurrentSendScope()) return;
@@ -1027,6 +1092,46 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				retainDetachedFiles(sendRecord);
 				return;
 			}
+			if (err instanceof SubmissionOutcomeUnknown && err.reason === "expired") {
+				notifications.show({
+					title: t("sendFailed"),
+					color: "yellow",
+					autoClose: false,
+					message: createElement(
+						"div",
+						null,
+						t(err.message),
+						createElement(
+							"button",
+							{
+								type: "button",
+								style: {
+									display: "block",
+									marginTop: 8,
+									minHeight: 44,
+									cursor: "pointer",
+									color: "var(--mantine-color-text)",
+									background: "var(--mantine-color-default)",
+									border: "1px solid var(--mantine-color-default-border)",
+									borderRadius: 4,
+									padding: "4px 12px",
+								},
+								onClick: () => {
+									if (!isCurrentSendScope()) return;
+									if (
+										submissionReconciler.current?.startNewAfterExpiry(
+											JSON.stringify([userId, narratorId]),
+										)
+									)
+										void handleSendWithMode(mode);
+								},
+							},
+							t("submissionReceipt_sendNew"),
+						),
+					),
+				});
+				return;
+			}
 			// The original draft stays visible and persisted until acceptance. Do not
 			// restore an old snapshot over a newer remotely synchronized draft.
 			// A user-initiated cancel is not a failure — show a gentle notice, not an error.
@@ -1036,7 +1141,12 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 			}
 			notifications.show({
 				title: t("sendFailed"),
-				message: err instanceof Error ? err.message : String(err),
+				message:
+					err instanceof SubmissionOutcomeUnknown
+						? t(err.message)
+						: err instanceof Error
+							? err.message
+							: String(err),
 				color: "red",
 			});
 		} finally {

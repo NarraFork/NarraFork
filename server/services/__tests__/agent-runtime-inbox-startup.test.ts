@@ -5,7 +5,12 @@ import { closeRuntimeTestDb, getRuntimeTestDb } from "./agent-runtime-test-datab
 
 const { db, sqlite, ready } = getRuntimeTestDb();
 await ready;
-mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
+mock.module("../../db", () => ({
+	db,
+	sqlite,
+	activeDatabaseBackend: "sqlite",
+	postgresRuntime: null,
+}));
 const inbox = await import("../agent-runtime/inbox");
 const { createMailboxStore } = await import("../agent-runtime/mailbox");
 const { tryClaimExecution, getExecutionOwner } = await import("../agent-runtime/ownership");

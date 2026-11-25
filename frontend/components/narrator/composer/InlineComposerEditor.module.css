@@ -191,6 +191,17 @@
 	cursor: pointer;
 }
 
+.narratorReference {
+	color: var(--mantine-color-anchor);
+	text-decoration: none;
+}
+
+.narratorReference:focus-visible {
+	outline: 2px solid var(--mantine-primary-color-filled);
+	outline-offset: 1px;
+	border-radius: var(--mantine-radius-xs);
+}
+
 .nodeBody svg,
 .nodeBody small {
 	flex-shrink: 0;

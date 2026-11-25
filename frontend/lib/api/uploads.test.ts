@@ -200,7 +200,7 @@ describe("attachment staging and upload transport", () => {
 		).toEqual(["/api/narrator-attachments/n/first"]);
 	});
 
-	test.each(paths)("%s cleans stages after a final network failure", async (path) => {
+	test.each(paths)("%s handles staged attachments after a final network failure", async (path) => {
 		respondXHR = (xhr) =>
 			xhr.body instanceof FormData ? xhr.onerror() : xhr.reply({ uploadId: "first" });
 		respondFetch = async (_url, init) => {
@@ -208,7 +208,9 @@ describe("attachment staging and upload transport", () => {
 			throw new Error("Network request failed");
 		};
 		await expect(submit(path, [largeFile("one.txt")])).rejects.toThrow("Network request failed");
-		expect(fetchRequests.some((request) => request.init.method === "DELETE")).toBe(true);
+		// A new send may already be accepted: preserve its stages for receipt/TTL.
+		// Queue/history edits keep their existing cleanup contract.
+		expect(fetchRequests.some((request) => request.init.method === "DELETE")).toBe(path !== "send");
 	});
 
 	test.each([

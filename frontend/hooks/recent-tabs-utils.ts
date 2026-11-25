@@ -59,55 +59,11 @@ export function isTeamOnlookerTab(tabs: readonly RecentTab[], narratorId: string
 }
 
 /**
- * A session tab of a team coordinator: a `narrator` tab of a team session (a coordinator is the
- * only primary session of a team tree; its subagents are `subagent` tabs). The sidebar can hold
- * it next to the team's own tab, with the same title: the row labels it "coordinator" so the two
- * are told apart. The session tab stays a session tab (it drives notification recipients).
- * Known once the runtime patch has said `teamSession`.
+ * A coordinator's session can sit beside a team tab with the same title. Only a session tab
+ * drives notification recipients, and this label distinguishes it from the team tab.
  */
 export function isCoordinatorSessionTab(tab: Pick<RecentTab, "type" | "teamSession">): boolean {
 	return tab.type === "narrator" && tab.teamSession === true;
-}
-
-/**
- * A subagent tab whose team membership is not known yet: the runtime patch (which says whether
- * it is a team session) has not been read. A subagent's root is not known on the client.
- */
-function subagentOfUnknownTeam(tab: RecentTab): boolean {
-	return tab.type === "subagent" && tab.teamSession === undefined;
-}
-
-/**
- * Whether an access change of `narratorId` may have changed `teamOnlooker` on these tabs, so
- * their runtime patches must be read again (M1): a tab of that narrator, an onlooker tab, or a
- * subagent tab of a team session (or of a team not known yet: its root may be that narrator).
- */
-export function accessChangeNeedsRuntimeRefresh(
-	tabs: readonly RecentTab[],
-	narratorId: string,
-): boolean {
-	return tabs.some(
-		(tab) =>
-			tab.teamOnlooker === true ||
-			(tab.type === "subagent" && tab.teamSession === true) ||
-			subagentOfUnknownTeam(tab) ||
-			((tab.type === "narrator" || tab.type === "team") && tab.id === narratorId),
-	);
-}
-
-/**
- * Whether a project access change may have changed `teamOnlooker` (M1): project grants and
- * visibility decide who passes a team coordinator's project-wide audiences. Any team session tab
- * qualifies, and a subagent tab whose team is not known yet.
- */
-export function projectAccessChangeNeedsRuntimeRefresh(tabs: readonly RecentTab[]): boolean {
-	return tabs.some(
-		(tab) =>
-			tab.type === "team" ||
-			tab.teamSession === true ||
-			tab.teamOnlooker === true ||
-			subagentOfUnknownTeam(tab),
-	);
 }
 
 /**
@@ -226,6 +182,7 @@ const RECENT_TAB_RUNTIME_KEYS = [
 	"viewerCount",
 	"hasDraft",
 	"pendingApprovalCount",
+	"teamOnlooker",
 	"teamSession",
 	"projectPath",
 	"activeSessionCount",
@@ -316,8 +273,11 @@ export function mergeRecentTabRuntime(tab: PersistedRecentTab, previous?: Recent
  * Attention (sounds, favicon, PWA notifications) stays with session tabs: a pinned team is not
  * a subscription to its coordinator's alerts.
  */
-export function recentTabLiveNarratorId(tab: Pick<RecentTab, "type" | "id">): string | null {
-	if (tab.type === "narrator" || tab.type === "subagent" || tab.type === "team") return tab.id;
+export function recentTabLiveNarratorId(
+	tab: Pick<RecentTab, "type" | "id" | "narratorId">,
+): string | null {
+	if (tab.type === "subagent") return tab.narratorId ?? tab.id;
+	if (tab.type === "narrator" || tab.type === "team") return tab.id;
 	return null;
 }
 

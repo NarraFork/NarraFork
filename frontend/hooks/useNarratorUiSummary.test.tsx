@@ -7,8 +7,6 @@ import { createRoot, type Root } from "react-dom/client";
 const listeners = new Set<(event: Record<string, unknown>) => void>();
 const connections = new Set<(connected: boolean) => void>();
 const recoveries = new Set<() => void>();
-let userId = "user-a";
-mock.module("./useCurrentUser", () => ({ useCurrentUser: () => ({ data: { id: userId } }) }));
 mock.module("./usePlatform", () => ({ useTerminalCapability: () => ({ supported: true }) }));
 mock.module("../lib/narrator-ws-manager", () => ({
 	narratorWSManager: {
@@ -29,7 +27,9 @@ mock.module("../lib/narrator-ws-manager", () => ({
 	},
 }));
 const { businessTransport } = await import("../lib/business-transport");
-const { getToken, setToken } = await import("../lib/api/client");
+const { clearToken, confirmAuthUser, getAuthSnapshot, setToken } = await import(
+	"../lib/api/client"
+);
 const { getNarratorUiSummary } = await import("../lib/api/narrator-ui-summary");
 const { narratorUiSummaryKey, useNarratorUiSummary } = await import("./useNarratorUiSummary");
 const { useCanOpenTerminals, useNarratorTerminals } = await import("./useTerminals");
@@ -97,7 +97,9 @@ function emit(event: Record<string, unknown>) {
 	for (const callback of listeners) callback(event);
 }
 const cache = () =>
-	client.getQueryData<ReturnType<typeof summary>>(narratorUiSummaryKey("n", userId, getToken()));
+	client.getQueryData<ReturnType<typeof summary>>(
+		narratorUiSummaryKey("n", getAuthSnapshot().generation),
+	);
 
 beforeEach(() => {
 	const { window } = parseHTML("<!doctype html><html><body></body></html>");
@@ -119,7 +121,6 @@ beforeEach(() => {
 		originals.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
 		Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
 	}
-	userId = "user-a";
 	setToken("token-a");
 	calls = [];
 	delay = false;
@@ -148,6 +149,7 @@ afterEach(async () => {
 	client.clear();
 	await flush();
 	requests.mockRestore();
+	clearToken();
 	host.remove();
 	for (const [key, descriptor] of originals) {
 		if (descriptor) Object.defineProperty(globalThis, key, descriptor);
@@ -161,6 +163,9 @@ test("route/badge/access observers share one summary and hidden terminals read n
 	expect(calls).toEqual(["/api/narrators/n/ui-summary"]);
 	expect(listeners.size).toBe(1);
 	expect(host.textContent).toBe("2:4:true".repeat(3));
+	await act(async () => confirmAuthUser(getAuthSnapshot().generation, "user-a"));
+	await flush();
+	expect(calls).toEqual(["/api/narrators/n/ui-summary"]);
 	await render(true);
 	expect(calls.filter((path) => path.includes("/terminals?"))).toHaveLength(1);
 	expect(calls.some((path) => path.includes("/access") || path.includes("/chat"))).toBe(false);
@@ -270,14 +275,14 @@ test("a targeted creation refreshes only its narrator among multiple no-room pan
 	expect(calls.filter((path) => path === "/api/narrators/other/ui-summary")).toHaveLength(1);
 	expect(
 		client.getQueryData<ReturnType<typeof summary>>(
-			narratorUiSummaryKey("other", userId, getToken()),
+			narratorUiSummaryKey("other", getAuthSnapshot().generation),
 		)?.discussion.roomId,
 	).toBeNull();
 });
 test("legacy unknown-room events allow one stale probe per 30 seconds even when that probe fails", async () => {
 	payload = summary(0, null);
 	await render();
-	client.setQueryData(narratorUiSummaryKey("n", userId, getToken()), payload, {
+	client.setQueryData(narratorUiSummaryKey("n", getAuthSnapshot().generation), payload, {
 		updatedAt: Date.now() - 31_000,
 	});
 	requests.mockImplementation(async (url: string) => {
@@ -298,7 +303,7 @@ test("legacy unknown-room events allow one stale probe per 30 seconds even when 
 });
 test("known-room legacy unread updates remain a direct cache patch and unrelated rooms never refresh it", async () => {
 	await render();
-	client.setQueryData(narratorUiSummaryKey("n", userId, getToken()), summary(), {
+	client.setQueryData(narratorUiSummaryKey("n", getAuthSnapshot().generation), summary(), {
 		updatedAt: Date.now() - 31_000,
 	});
 	await act(async () => {
@@ -320,7 +325,7 @@ test("workspace changes, connection edges and foreground recovery coalesce bound
 	await flush();
 	expect(calls).toHaveLength(2);
 });
-test("token/principal replacement aborts old reads and cannot hydrate new account from old data", async () => {
+test("a replacement generation aborts old reads even when the same token returns", async () => {
 	delay = true;
 	await render();
 	const resolveOld = pending;
@@ -328,8 +333,8 @@ test("token/principal replacement aborts old reads and cannot hydrate new accoun
 	delay = false;
 	payload = { ...summary(7), canWrite: false };
 	await act(async () => {
-		userId = "user-b";
 		setToken("token-b");
+		setToken("token-a");
 	});
 	await flush();
 	expect(oldSignal?.aborted).toBe(true);
@@ -391,7 +396,7 @@ test("fresh focus is free while a stale focus revalidates the shared summary onc
 	});
 	await flush();
 	expect(calls).toHaveLength(1);
-	client.setQueryData(narratorUiSummaryKey("n", userId, getToken()), summary(), {
+	client.setQueryData(narratorUiSummaryKey("n", getAuthSnapshot().generation), summary(), {
 		updatedAt: Date.now() - 31_000,
 	});
 	await act(async () =>

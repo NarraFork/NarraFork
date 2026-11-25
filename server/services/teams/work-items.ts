@@ -51,6 +51,7 @@ import {
 	teamWorkItems,
 } from "../../db/schema";
 import { AppError, NotFoundError, ValidationError } from "../../lib/errors";
+import { eventBus } from "../../lib/event-bus";
 import { hotSafe } from "../../lib/hot-safe";
 import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
@@ -526,6 +527,7 @@ export async function createWorkItem(input: CreateWorkItemInput): Promise<WorkIt
 			at: now,
 		});
 	});
+	eventBus.emit({ type: "team:communication_changed", teamId: team.teamId });
 	logger.info("Team work item created", { teamId: team.teamId, workItemId: id, branchName });
 	return requireWorkItem(team.teamId, id);
 }
@@ -563,6 +565,8 @@ export function attachWorker(
 			at: now,
 		});
 	});
+	// Outermost write committed: never publish a worker binding from recordWorkEvent's tx.
+	eventBus.emit({ type: "team:communication_changed", teamId });
 }
 
 /** The live item whose recorded worktree is exactly `path`, for an `Agent({ workdir })`. */
@@ -645,6 +649,7 @@ export async function recordReview(
 			at: now,
 		});
 	});
+	eventBus.emit({ type: "team:communication_changed", teamId: team.teamId });
 	return { item: requireWorkItem(team.teamId, item.id), round };
 }
 
@@ -806,6 +811,7 @@ export async function markReady(input: {
 			await refuseWhileHeld(team, item, hits, input.actor);
 		throw error;
 	}
+	eventBus.emit({ type: "team:communication_changed", teamId: team.teamId });
 	return { item: requireWorkItem(team.teamId, item.id), commitsSinceReview };
 }
 
@@ -988,6 +994,7 @@ export function cancelWorkItem(input: {
 			at: now,
 		});
 	});
+	eventBus.emit({ type: "team:communication_changed", teamId: team.teamId });
 	return requireWorkItem(team.teamId, item.id);
 }
 
@@ -1009,6 +1016,7 @@ export function markMergedByAncestry(input: {
 }): boolean {
 	const now = new Date().toISOString();
 	let merged = false;
+	let changedTeamId: string | null = null;
 	try {
 		db.transaction((tx) => {
 			const item = tx
@@ -1027,6 +1035,7 @@ export function markMergedByAncestry(input: {
 			)
 				return;
 			merged = true;
+			changedTeamId = item.teamId;
 			updateItem(
 				tx,
 				item,
@@ -1051,6 +1060,7 @@ export function markMergedByAncestry(input: {
 		if (error instanceof AppError && error.code === "TEAM_WORK_ITEM_CHANGED") return false;
 		throw error;
 	}
+	if (changedTeamId) eventBus.emit({ type: "team:communication_changed", teamId: changedTeamId });
 	if (merged)
 		logger.info("Team work item merged (its head is in the base)", { workItemId: input.itemId });
 	return merged;
@@ -1314,6 +1324,7 @@ export async function cleanupWorkItem(input: {
 			at: now,
 		});
 	});
+	eventBus.emit({ type: "team:communication_changed", teamId: team.teamId });
 	return result;
 }
 
@@ -1393,6 +1404,7 @@ export async function settleFailedStart(
 			at: now,
 		});
 	});
+	eventBus.emit({ type: "team:communication_changed", teamId });
 	return "requeued";
 }
 
@@ -1517,6 +1529,7 @@ async function settleItem(
 					at: now,
 				});
 			});
+			eventBus.emit({ type: "team:communication_changed", teamId: item.teamId });
 			return "cleaned";
 		}
 	} catch (error) {

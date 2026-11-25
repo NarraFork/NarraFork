@@ -20,6 +20,8 @@ import {
 	updateProjectSkill,
 	updateProjectSkillFromUrl,
 } from "../skill-service";
+// Rejections settle natively before matching: Bun's `.rejects` stalls on a reused read Worker.
+import { captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 const url = "https://github.com/example/skills/tree/main";
 const rawUrl = "https://gitee.com/example/skills/raw/main/SKILL.md";
@@ -190,7 +192,9 @@ describe("skill update from a link", () => {
 	test("rejects mismatching names and external scan roots without modifying a skill", async () => {
 		await createProjectSkill(root, name, "local", "local content");
 		fixture({ "SKILL.md": markdown("wrong", "other-name") });
-		await expect(updateProjectSkillFromUrl(root, name, url)).rejects.toThrow("name must match");
+		expect(await captureWorkerRejectionThrower(updateProjectSkillFromUrl(root, name, url))).toThrow(
+			"name must match",
+		);
 		expect((await loadProjectSkills(root)).find((s) => s.name === name)?.content).toBe(
 			"local content",
 		);
@@ -201,7 +205,9 @@ describe("skill update from a link", () => {
 		if (!external) throw new Error("Expected external skill fixture");
 		expect((await describeSkillManagement(root, external)).canUpdateFromUrl).toBe(false);
 		calls.length = 0;
-		await expect(updateProjectSkillFromUrl(root, "external", url)).rejects.toThrow("Only skills");
+		expect(
+			await captureWorkerRejectionThrower(updateProjectSkillFromUrl(root, "external", url)),
+		).toThrow("Only skills");
 		expect(calls).toHaveLength(0);
 	});
 
@@ -244,7 +250,9 @@ describe("skill update from a link", () => {
 		fixture({ "SKILL.md": markdown() });
 		const skill = await importProjectSkill(root, url);
 		setOutboundFetchOverrideForTest(async () => new Response(null, { status: 429 }));
-		await expect(updateProjectSkillFromUrl(root, name, url)).rejects.toThrow("rate limit");
+		expect(await captureWorkerRejectionThrower(updateProjectSkillFromUrl(root, name, url))).toThrow(
+			"rate limit",
+		);
 		const gate = latch();
 		fixture({ "SKILL.md": markdown("cancelled") }, gate.gate);
 		const controller = new AbortController();
@@ -263,7 +271,9 @@ describe("skill update from a link", () => {
 		fixture({
 			"SKILL.md": `---\nname: ${name}\ndescription: test\nbase: &base {a: 0}\nextra: { <<: [*base, *base] }\n---\nbody`,
 		});
-		await expect(updateProjectSkillFromUrl(root, name, url)).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(updateProjectSkillFromUrl(root, name, url)),
+		).toThrow();
 		expect((await loadProjectSkills(root)).find((s) => s.name === name)?.content).toBe(
 			"local body",
 		);
@@ -291,9 +301,9 @@ describe("skill update from a link", () => {
 		);
 		process.env.NARRAFORK_HOME = home;
 		try {
-			await expect(updateGlobalSkill(name, name, "unsafe", "unsafe")).rejects.toThrow(
-				"symbolic links",
-			);
+			expect(
+				await captureWorkerRejectionThrower(updateGlobalSkill(name, name, "unsafe", "unsafe")),
+			).toThrow("symbolic links");
 			expect(await fs.readFile(skill.location, "utf8")).toBe(markdown());
 		} finally {
 			if (originalHome === undefined) delete process.env.NARRAFORK_HOME;
@@ -311,7 +321,9 @@ describe("skill update from a link", () => {
 			return original(from, to);
 		});
 		try {
-			await expect(updateProjectSkillFromUrl(root, name, url)).rejects.toThrow();
+			expect(
+				await captureWorkerRejectionThrower(updateProjectSkillFromUrl(root, name, url)),
+			).toThrow();
 		} finally {
 			spy.mockRestore();
 		}

@@ -228,6 +228,8 @@ export const narrators = pgTable(
 		hiddenFromLists: boolean("hidden_from_lists").notNull().default(false),
 		modeltraceKey: text("modeltrace_key"),
 		title: text("title"),
+		titleSlug: text("title_slug"),
+		aliasSelector: text("alias_selector"),
 		inheritMode: text("inherit_mode").notNull().default("fresh"),
 		parentNarratorId: text("parent_narrator_id").references((): PgColumn => narrators.id, {}),
 		askInPassingGroupId: text("ask_in_passing_group_id").references((): PgColumn => narrators.id, {
@@ -367,6 +369,19 @@ export const narrators = pgTable(
 		index("idx_narrators_background_parent_created")
 			.on(table.parentNarratorId, table.createdAt, table.id)
 			.where(sql.raw('"is_background" = TRUE')),
+		index("idx_narrators_parent_title_slug")
+			.on(table.parentNarratorId, table.titleSlug)
+			.where(sql.raw('"parent_narrator_id" IS NOT NULL AND "title_slug" IS NOT NULL')),
+		index("idx_narrators_parent_alias_selector")
+			.on(table.parentNarratorId, table.aliasSelector)
+			.where(sql.raw('"parent_narrator_id" IS NOT NULL AND "alias_selector" IS NOT NULL')),
+		index("idx_narrators_addressable_parent_created")
+			.on(table.parentNarratorId, table.createdAt, table.id)
+			.where(
+				sql.raw(
+					"\"parent_narrator_id\" IS NOT NULL AND \"status\" IN ('idle', 'working', 'waiting')",
+				),
+			),
 	],
 );
 
@@ -1080,7 +1095,7 @@ export const narratorBlockBackfill = pgTable(
 		processed: integer("processed").notNull().default(0),
 		updatedAt: text("updated_at").notNull(),
 	},
-	(table) => [
+	() => [
 		check(
 			"ck_block_backfill_job",
 			sql.raw("\"job\" in ('convert', 'verify', 'reindex', 'clear', 'restore')"),
@@ -1099,9 +1114,7 @@ export const narratorBlockDiagnostics = pgTable(
 		detail: text("detail"),
 		createdAt: text("created_at").notNull(),
 	},
-	(table) => [
-		check("ck_block_diagnostics_kind", sql.raw("\"kind\" in ('mismatch', 'undecodable')")),
-	],
+	() => [check("ck_block_diagnostics_kind", sql.raw("\"kind\" in ('mismatch', 'undecodable')"))],
 );
 
 export const narratorQuestions = pgTable(
@@ -2568,6 +2581,12 @@ export const backgroundTasks = pgTable(
 		uniqueIndex("idx_bg_tasks_tool_attempt").on(table.toolCallId, table.executionAttempt),
 		index("idx_bg_tasks_transfer").on(table.transferTaskId),
 		index("idx_bg_tasks_parent_created").on(table.parentNarratorId, table.createdAt, table.id),
+		index("idx_bg_tasks_parent_alias")
+			.on(table.parentNarratorId, table.alias, table.createdAt)
+			.where(sql.raw('"alias" IS NOT NULL')),
+		index("idx_bg_tasks_parent_live_alias")
+			.on(table.parentNarratorId, table.alias)
+			.where(sql.raw("\"alias\" IS NOT NULL AND \"status\" IN ('running', 'paused')")),
 	],
 );
 
@@ -4506,6 +4525,62 @@ export const projectTeams = pgTable(
 	],
 );
 
+export const narratorCommunicationNodes = pgTable(
+	"narrator_communication_nodes",
+	{
+		narratorId: text("narrator_id")
+			.primaryKey()
+			.notNull()
+			.references((): PgColumn => narrators.id, { onDelete: "cascade" }),
+		parentNarratorId: text("parent_narrator_id").references((): PgColumn => narrators.id, {
+			onDelete: "set null",
+		}),
+		originalParentNarratorId: text("original_parent_narrator_id"),
+		version: integer("version").notNull().default(1),
+	},
+	(table) => [
+		index("idx_communication_nodes_parent").on(table.parentNarratorId),
+		index("idx_communication_nodes_original_parent").on(table.originalParentNarratorId),
+		check(
+			"ck_communication_nodes_not_self",
+			sql.raw('"parent_narrator_id" is null or "parent_narrator_id" <> "narrator_id"'),
+		),
+		check("ck_communication_nodes_version", sql.raw('"version" >= 1')),
+		foreignKey({
+			name: "narrator_communication_nodes_original_parent_narr_88c92662fd_fk",
+			columns: [table.originalParentNarratorId],
+			foreignColumns: [narrators.id],
+		}).onDelete("set null"),
+	],
+);
+
+export const narratorCommunicationPeers = pgTable(
+	"narrator_communication_peers",
+	{
+		id: text("id").primaryKey().notNull(),
+		endpointLo: text("endpoint_lo")
+			.notNull()
+			.references((): PgColumn => narrators.id, { onDelete: "cascade" }),
+		endpointHi: text("endpoint_hi")
+			.notNull()
+			.references((): PgColumn => narrators.id, { onDelete: "cascade" }),
+		createdBy: text("created_by").references((): PgColumn => users.id, { onDelete: "set null" }),
+		source: text("source").notNull(),
+		admissionId: text("admission_id"),
+		messageId: text("message_id"),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("uq_communication_peers_pair").on(table.endpointLo, table.endpointHi),
+		index("idx_communication_peers_hi").on(table.endpointHi),
+		index("idx_communication_peers_created_by").on(table.createdBy),
+		check(
+			"ck_communication_peers_canonical",
+			sql.raw('("endpoint_lo" COLLATE "C") < ("endpoint_hi" COLLATE "C")'),
+		),
+	],
+);
+
 export const teamWorkItems = pgTable(
 	"team_work_items",
 	{
@@ -4600,8 +4675,8 @@ export const teamWorkEvents = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 147,
-  "columnCount": 1962,
+  "tableCount": 149,
+  "columnCount": 1976,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -5709,6 +5784,24 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "property": "titleSlug",
+          "name": "title_slug",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "aliasSelector",
+          "name": "alias_selector",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
           "property": "inheritMode",
           "name": "inherit_mode",
           "kind": "text",
@@ -6703,6 +6796,34 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           ],
           "unique": false,
           "predicate": "\"is_background\" = TRUE"
+        },
+        {
+          "name": "idx_narrators_parent_title_slug",
+          "columns": [
+            "parentNarratorId",
+            "titleSlug"
+          ],
+          "unique": false,
+          "predicate": "\"parent_narrator_id\" IS NOT NULL AND \"title_slug\" IS NOT NULL"
+        },
+        {
+          "name": "idx_narrators_parent_alias_selector",
+          "columns": [
+            "parentNarratorId",
+            "aliasSelector"
+          ],
+          "unique": false,
+          "predicate": "\"parent_narrator_id\" IS NOT NULL AND \"alias_selector\" IS NOT NULL"
+        },
+        {
+          "name": "idx_narrators_addressable_parent_created",
+          "columns": [
+            "parentNarratorId",
+            "createdAt",
+            "id"
+          ],
+          "unique": false,
+          "predicate": "\"parent_narrator_id\" IS NOT NULL AND \"status\" IN ('idle', 'working', 'waiting')"
         }
       ],
       "checks": [],
@@ -19512,6 +19633,25 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "id"
           ],
           "unique": false
+        },
+        {
+          "name": "idx_bg_tasks_parent_alias",
+          "columns": [
+            "parentNarratorId",
+            "alias",
+            "createdAt"
+          ],
+          "unique": false,
+          "predicate": "\"alias\" IS NOT NULL"
+        },
+        {
+          "name": "idx_bg_tasks_parent_live_alias",
+          "columns": [
+            "parentNarratorId",
+            "alias"
+          ],
+          "unique": false,
+          "predicate": "\"alias\" IS NOT NULL AND \"status\" IN ('running', 'paused')"
         }
       ],
       "checks": [],
@@ -30607,6 +30747,239 @@ export const POSTGRES_SCHEMA_COVERAGE = {
         {
           "name": "ck_project_teams_settings_bytes",
           "expression": "octet_length(\"settings_json\") <= 16384"
+        }
+      ],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "narratorCommunicationNodes",
+      "name": "narrator_communication_nodes",
+      "columns": [
+        {
+          "property": "narratorId",
+          "name": "narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false,
+          "references": {
+            "table": "narrators",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "narrator_communication_nodes_narrator_id_narrators_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "parentNarratorId",
+          "name": "parent_narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narrators",
+            "column": "id",
+            "onDelete": "set null",
+            "constraintName": "narrator_communication_nodes_parent_narrator_id_narrators_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "originalParentNarratorId",
+          "name": "original_parent_narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narrators",
+            "column": "id",
+            "onDelete": "set null",
+            "constraintName": "narrator_communication_nodes_original_parent_narr_88c92662fd_fk"
+          },
+          "emitAsTableConstraint": true
+        },
+        {
+          "property": "version",
+          "name": "version",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "1",
+          "defaultExpression": "1"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_communication_nodes_parent",
+          "columns": [
+            "parentNarratorId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_communication_nodes_original_parent",
+          "columns": [
+            "originalParentNarratorId"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [
+        "ck_communication_nodes_not_self",
+        "ck_communication_nodes_version"
+      ],
+      "checkDefinitions": [
+        {
+          "name": "ck_communication_nodes_not_self",
+          "expression": "\"parent_narrator_id\" is null or \"parent_narrator_id\" <> \"narrator_id\""
+        },
+        {
+          "name": "ck_communication_nodes_version",
+          "expression": "\"version\" >= 1"
+        }
+      ],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "narratorCommunicationPeers",
+      "name": "narrator_communication_peers",
+      "columns": [
+        {
+          "property": "id",
+          "name": "id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "endpointLo",
+          "name": "endpoint_lo",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narrators",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "narrator_communication_peers_endpoint_lo_narrators_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "endpointHi",
+          "name": "endpoint_hi",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narrators",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "narrator_communication_peers_endpoint_hi_narrators_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "createdBy",
+          "name": "created_by",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "users",
+            "column": "id",
+            "onDelete": "set null",
+            "constraintName": "narrator_communication_peers_created_by_users_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "source",
+          "name": "source",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "admissionId",
+          "name": "admission_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "messageId",
+          "name": "message_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "uq_communication_peers_pair",
+          "columns": [
+            "endpointLo",
+            "endpointHi"
+          ],
+          "unique": true
+        },
+        {
+          "name": "idx_communication_peers_hi",
+          "columns": [
+            "endpointHi"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_communication_peers_created_by",
+          "columns": [
+            "createdBy"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [
+        "ck_communication_peers_canonical"
+      ],
+      "checkDefinitions": [
+        {
+          "name": "ck_communication_peers_canonical",
+          "expression": "(\"endpoint_lo\" COLLATE \"C\") < (\"endpoint_hi\" COLLATE \"C\")"
         }
       ],
       "foreignKeys": [],

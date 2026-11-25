@@ -164,6 +164,30 @@ describe("storage provider export authorization", () => {
 
 describe("storage import passphrase errors", () => {
 	test.each([
+		[undefined, 401],
+		["user", 403],
+	] as const)("rejects an unauthorized importer (%s)", async (currentRole, expectedStatus) => {
+		role = currentRole;
+		const response = await post("/import", {
+			token: "preview-token",
+			passphrase: PASSPHRASE,
+			importingUserId: "admin-id",
+		});
+		expect(response.status).toBe(expectedStatus);
+		expect(applyImport).not.toHaveBeenCalled();
+	});
+
+	test("takes the communication restoration principal from the session, not JSON", async () => {
+		const response = await post("/import", {
+			token: "preview-token",
+			passphrase: PASSPHRASE,
+			importingUserId: "another-person",
+		});
+		expect(response.status).toBe(200);
+		expect(applyImport.mock.calls[0][1].importingUserId).toBe("admin-id");
+	});
+
+	test.each([
 		["missing", undefined, "IMPORT_PASSPHRASE_REQUIRED"],
 		["wrong", "wrong-passphrase", "BUNDLE_PASSPHRASE"],
 	] as const)("%s passphrase is returned to the caller", async (_label, passphrase, code) => {
@@ -188,6 +212,7 @@ describe("storage import passphrase errors", () => {
 		expect(response.status).toBe(200);
 		expect((await response.json()).keysImported).toBe(1);
 		expect(applyImport).toHaveBeenCalledWith("preview-token", {
+			importingUserId: "admin-id",
 			conflictDefault: "skip",
 			conflictById: undefined,
 			include: { providers: true },

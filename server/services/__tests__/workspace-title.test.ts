@@ -92,6 +92,16 @@ async function invalidateOutlineWorkspaceTitles(spaceId: string, pageIds: readon
 	queueOutlineTitleInvalidation(spaceId, pageIds);
 	await settleOutlineTitleInvalidations();
 }
+/**
+ * Wait for the title model to be called. Generation first reads through a Worker, whose reply
+ * arrives as a macrotask, so this must yield to the event loop: a microtask-only loop would
+ * spin forever.
+ */
+async function modelCalled() {
+	for (let i = 0; i < 1000 && !model.mock.calls.length; i++)
+		await new Promise((done) => setTimeout(done, 5));
+	if (!model.mock.calls.length) throw new Error("Title model was never called");
+}
 function deferred() {
 	let resolve!: (value: string) => void;
 	const promise = new Promise<string>((done) => {
@@ -711,7 +721,7 @@ describe("concurrency and automatic generation", () => {
 		generate = () => pending.promise;
 		const first = titleService.generateWorkspaceTitle("owner", workspaceId);
 		expect(titleService.generateWorkspaceTitle("owner", workspaceId)).toBe(first);
-		while (!model.mock.calls.length) await Promise.resolve();
+		await modelCalled();
 		await updateWorkspacePanelConfig("owner", workspaceId, panel.id, { title: "Changed" });
 		pending.resolve("Old candidate");
 		await expect(await captureWorkerRejectionThrower(first)).toThrow("changed");
@@ -778,7 +788,7 @@ describe("concurrency and automatic generation", () => {
 		const pending = deferred();
 		generate = () => pending.promise;
 		const first = titleService.generateWorkspaceTitle("owner", workspaceId);
-		while (!model.mock.calls.length) await Promise.resolve();
+		await modelCalled();
 		await titleService.updateWorkspaceTitle("owner", workspaceId, "My name");
 		pending.resolve("Generated");
 		await expect(await captureWorkerRejectionThrower(first)).toThrow("changed");

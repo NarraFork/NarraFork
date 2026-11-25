@@ -391,6 +391,9 @@ export function accessCases(world: AccessWorld): AccessCase[] {
 	person("bob", "open", true, false);
 	person("carol", "open", true, true);
 	person("bob", "roleOpen", true, false);
+	person("alice", "roleOpen", true, false);
+	person("alice", "session:roleOpenVis", true, false);
+	person("alice", "session:linkedForeign", false, false);
 	person("owner", "personalOwner", true, true);
 	person("alice", "personalOwner", false, false);
 	person("admin", "personalOwner", false, false);
@@ -582,14 +585,17 @@ export function accessCases(world: AccessWorld): AccessCase[] {
 		(await walkPages(as(who), 200)).filter((id) => worldIds.has(id)).sort();
 	cases.push({
 		group: "list",
-		label: "alice lists what she can read through user grants and audiences",
+		label: "alice lists what she can read through user grants, role grants and audiences",
 		expected: ids([
 			spaces.main,
 			spaces.allMembers,
 			spaces.open,
+			// The `user` role's read grant on Carol's private project also opens its project gate.
+			spaces.roleOpen,
 			spaces.personalAlice,
 			spaces["session:grantA"],
 			spaces["session:projectVis"],
+			spaces["session:roleOpenVis"],
 			spaces["session:publicVis"],
 		]),
 		actual: () => listed("alice"),

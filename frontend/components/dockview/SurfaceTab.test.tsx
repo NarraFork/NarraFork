@@ -9,7 +9,9 @@ import { act, useEffect } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { I18nextProvider } from "react-i18next";
+import { userPreferencesQueryKey } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
+import { confirmAuthUser, getAuthSnapshot } from "../../lib/api/client";
 import { appearanceStore } from "../../lib/appearance-preference-store";
 import commonLocale from "../../locales/en/common.json";
 import {
@@ -22,13 +24,14 @@ import { DefaultSurfaceTab, fileTabRevealDirectory, withSurfaceTabMenu } from ".
 
 const fixtureUser = "surface-tab-fixture-user";
 const fixtureToken = "surface-tab-fixture-token";
-const preferencesKey = ["user-preferences", "ui", fixtureUser, fixtureToken] as const;
+const preferencesKey = () => userPreferencesQueryKey("ui");
 
 function queryClient(platform = "windows") {
 	const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 	client.setQueryData(["health"], { platform });
+	confirmAuthUser(getAuthSnapshot().generation, fixtureUser);
 	client.setQueryData(["auth", "me"], { id: fixtureUser });
-	client.setQueryData(preferencesKey, { treatAsLocalAccess: false });
+	client.setQueryData(preferencesKey(), { treatAsLocalAccess: false });
 	return client;
 }
 
@@ -168,7 +171,7 @@ async function mountTab(
 		}
 	};
 	const testClient = queryClient(options.platform);
-	testClient.setQueryData(preferencesKey, {
+	testClient.setQueryData(preferencesKey(), {
 		treatAsLocalAccess: options.treatAsLocalAccess ?? false,
 	});
 	client = testClient;
@@ -335,12 +338,12 @@ describe("file tab context menu", () => {
 		await mountTab({ hostname: "narrafork.example.com" });
 		expect(revealItem()).toBeUndefined();
 		await act(async () => {
-			client?.setQueryData(preferencesKey, { treatAsLocalAccess: true });
+			client?.setQueryData(preferencesKey(), { treatAsLocalAccess: true });
 			await new Promise((resolve) => setTimeout(resolve, 0));
 		});
 		expect(revealItem()).toBeDefined();
 		await act(async () => {
-			client?.setQueryData(preferencesKey, { treatAsLocalAccess: false });
+			client?.setQueryData(preferencesKey(), { treatAsLocalAccess: false });
 			await new Promise((resolve) => setTimeout(resolve, 0));
 		});
 		expect(revealItem()).toBeUndefined();

@@ -40,6 +40,10 @@ const loaders: { [K in SyncDomainReadTaskKind]: () => Promise<DomainReadModule<K
 	recallToolCallDetail: async () => ({
 		read: (await import("./recall-reader")).readRecallToolCallDetail,
 	}),
+	recallMessage: async () => ({ read: (await import("./recall-reader")).readRecallMessage }),
+	recallToolCallPage: async () => ({
+		read: (await import("./recall-reader")).readRecallToolCallPage,
+	}),
 	editorOperationEvidence: async () => ({
 		read: (await import("./file-read-snapshots")).readEditorOperationEvidence,
 	}),

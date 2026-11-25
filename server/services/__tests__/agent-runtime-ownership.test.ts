@@ -328,6 +328,32 @@ describe("continued subagents remain checkpointable during maintenance", () => {
 				try {
 					if (entry === "Send") {
 						const now = new Date().toISOString();
+						const { users } = await import("../../db/schema");
+						const { ensureCommunicationNodeTx, grantFixtureNarratorWrite } = await import(
+							"./runtime-communication-fixtures"
+						);
+						const userId = "runtime-send-principal";
+						db.transaction((tx) => {
+							tx.insert(users)
+								.values({ id: userId, username: userId, passwordHash: "test", createdAt: now })
+								.run();
+							grantFixtureNarratorWrite(tx, ROOT, userId);
+							tx.update(narrators)
+								.set({ aclRootNarratorId: ROOT })
+								.where(eq(narrators.id, CHILD))
+								.run();
+							tx.update(narrators)
+								.set({
+									runtimeRegistrationJson: {
+										version: 1,
+										run: { logicalRunId: `seed-${ROOT}`, principal: { userId } },
+									},
+								})
+								.where(eq(narrators.id, ROOT))
+								.run();
+							ensureCommunicationNodeTx(tx, ROOT, null);
+							ensureCommunicationNodeTx(tx, CHILD, ROOT);
+						});
 						await db.insert(narratorMessages).values({
 							id: "sender-message",
 							narratorId: ROOT,

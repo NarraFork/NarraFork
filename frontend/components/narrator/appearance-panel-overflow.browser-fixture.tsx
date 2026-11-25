@@ -1,3 +1,5 @@
+import { userPreferencesQueryKey } from "../../hooks/useUserPreferences";
+import { confirmAuthUser, getAuthSnapshot } from "../../lib/api/client";
 /**
  * Browser fixture for the typography-dock overflow regression.
  *
@@ -53,8 +55,9 @@ appearanceStore.activate(null, true);
 const queryClient = new QueryClient({
 	defaultOptions: { queries: { retry: false, refetchOnWindowFocus: false, staleTime: Infinity } },
 });
+confirmAuthUser(getAuthSnapshot().generation, fixtureUser);
 queryClient.setQueryData(["auth", "me"], { id: fixtureUser });
-queryClient.setQueryData(["user-preferences", "ui", fixtureUser, fixtureToken], {
+queryClient.setQueryData(userPreferencesQueryKey("ui"), {
 	narratorFontScalePercent: 100,
 	narratorLetterSpacingPercent: 0,
 	narratorLineHeightV2Percent: 100,

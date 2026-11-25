@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,20 +10,28 @@ import { getTableConfig, SQLiteSyncDialect } from "drizzle-orm/sqlite-core";
 import { z } from "zod/v4";
 import * as relations from "../../db/relations";
 import * as schema from "../../db/schema";
+import * as workerReads from "../../db/worker-read";
 import type { ExecutionBackend } from "../../lib/agent/execution/backend";
 import { localBackend } from "../../lib/agent/execution/registry";
 import type { ProviderAdapter } from "../../lib/agent/provider";
 import type { AgentConfig, ToolCallBinding } from "../../lib/agent/types";
+import {
+	assertDbReadersReady,
+	closeReadDatabase,
+	resetDbWorkerPoolForTest,
+} from "../../lib/db-worker/pool";
+import { appendRuntimePolicyTrait } from "../../lib/runtime-policy-trait";
 import { narraforkDir, saveSettings, settings } from "../../lib/settings";
 import { createExecutionTargetContext } from "../execution-policy/target-context";
-import { captureWorkerRejectionThrower } from "./narrator-worker-fixture";
+import { signReviewBoundaryRuleId } from "../narrator-review-boundary";
+import { captureWorkerRejection, captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
-const databaseDirectory = mkdtempSync(join(tmpdir(), "permission-rule-request-db-"));
-const sqlite = new Database(join(databaseDirectory, "test.sqlite"));
+const workerFixtureDirectory = mkdtempSync(join(tmpdir(), "permission-rule-worker-"));
+const sqlite = new Database(join(workerFixtureDirectory, "permission.db"));
+sqlite.run("PRAGMA journal_mode = WAL");
 const dialect = new SQLiteSyncDialect();
 const tableNames: string[] = [];
-// Build a test-only schema from the typed declarations. This worktree
-// intentionally has no migration directory; never generate or migrate the real DB.
+// Build an isolated file-backed schema so strict worker reads use their real connection.
 for (const table of Object.values(schema)) {
 	let config: ReturnType<typeof getTableConfig>;
 	try {
@@ -78,10 +86,12 @@ for (const statement of [
 		if (!String(error).includes("duplicate column name")) throw error;
 	}
 }
+await assertDbReadersReady(sqlite.filename, { timeoutMs: 30_000 });
 mock.module("../../db", () => ({
 	db,
 	sqlite,
 	activeDatabaseBackend: "sqlite",
+	postgresRuntime: null,
 	databaseMaintenance: createSqliteMaintenance(() => sqlite),
 }));
 const wsModule = { ...(await import("../../websocket/narrator-ws")) };
@@ -92,6 +102,7 @@ mock.module("../narrator-service", () => ({
 	narratorService: { ...narratorModule.narratorService, updateStatus: async () => {} },
 }));
 const service = await import("../permission-rule-request-service");
+const traitLayer = await import("../trait-layer-service");
 const { materializeLegacyDelegations } = await import("../legacy-delegation-materializer");
 const permission = await import("../narrator-permission");
 test("explicit worktree tools enforce destination write ACLs without expanding receipt paths", () => {
@@ -733,10 +744,11 @@ afterEach(() => {
 		rmSync(directory, { recursive: true, force: true });
 	cleanDb();
 });
-afterAll(() => {
+afterAll(async () => {
+	await closeReadDatabase(sqlite.filename);
 	mock.restore();
 	sqlite.close();
-	rmSync(databaseDirectory, { recursive: true, force: true });
+	rmSync(workerFixtureDirectory, { recursive: true, force: true });
 });
 
 async function waitForManual(id: string) {
@@ -1283,7 +1295,7 @@ describe("attempt-bound permission requests", () => {
 		let after: string | undefined;
 		let terminated = 0;
 		do {
-			const page = service.recoverPermissionRuleRequests({
+			const page = await service.recoverPermissionRuleRequests({
 				after,
 				limit: 1,
 				reason: "Server restarted before tool completion",
@@ -1329,8 +1341,12 @@ describe("attempt-bound permission requests", () => {
 			}),
 		).toBe(false);
 		expect(
-			service.recoverPermissionRuleRequests({ expiredOnly: true, reason: "Receipt expired" })
-				.terminated,
+			(
+				await service.recoverPermissionRuleRequests({
+					expiredOnly: true,
+					reason: "Receipt expired",
+				})
+			).terminated,
 		).toBe(1);
 		const get = (id: string) =>
 			db
@@ -1825,7 +1841,9 @@ describe("attempt-bound permission requests", () => {
 		});
 		expect(result.isError).toBe(true);
 		expect(count()).toBe(0);
-		expect(service.listPermissionRuleRequests(identity.narratorId).items[0]?.status).toBe("failed");
+		expect((await service.listPermissionRuleRequests(identity.narratorId)).items[0]?.status).toBe(
+			"failed",
+		);
 	});
 	test("child project context cannot erase its ancestor project blacklist", async () => {
 		const parent = await seed(),
@@ -2384,22 +2402,157 @@ describe("attempt-bound permission requests", () => {
 		}
 		expect(count()).toBe(0);
 	});
+	test("commit rechecks an inherited capability ceiling after the awaited snapshot", async () => {
+		const parent = await seed();
+		const identity = await seed("default", parent.narratorId);
+		const prepared = await service.preparePermissionRuleRequest(
+			identity,
+			proposal,
+			identity.context,
+		);
+		service.recordPermissionRuleRequestDecision(prepared.requestId, "allow", "user", "human");
+		const resolve = traitLayer.resolveNarratorRuntimePolicy;
+		let reads = 0;
+		const snapshot = spyOn(traitLayer, "resolveNarratorRuntimePolicy").mockImplementation(
+			async (...args: Parameters<typeof resolve>) => {
+				const policy = await resolve(...args);
+				if (args[0] === identity.narratorId && ++reads === 2) {
+					const source = db
+						.select({ traits: schema.narrators.traits })
+						.from(schema.narrators)
+						.where(eq(schema.narrators.id, parent.narratorId))
+						.get();
+					db.update(schema.narrators)
+						.set({
+							traits: appendRuntimePolicyTrait(source?.traits, { version: 1, readOnly: true }),
+						})
+						.where(eq(schema.narrators.id, parent.narratorId))
+						.run();
+				}
+				return policy;
+			},
+		);
+		try {
+			expect(
+				await captureWorkerRejectionThrower(
+					service.consumePermissionRuleRequest(identity, prepared.input, identity.context),
+				),
+			).toThrow("ceilings");
+			expect(reads).toBe(2);
+			expect(count()).toBe(0);
+		} finally {
+			snapshot.mockRestore();
+		}
+	});
+
+	test("worker failures propagate instead of becoming permission denials", async () => {
+		const identity = await seed();
+		const previous = process.env.NARRAFORK_DB_WORKER;
+		process.env.NARRAFORK_DB_WORKER = "off";
+		await resetDbWorkerPoolForTest();
+		try {
+			expect(
+				await captureWorkerRejection(
+					service.preparePermissionRuleRequest(identity, proposal, identity.context),
+				),
+			).toMatchObject({ code: "DB_READ_UNAVAILABLE" });
+			expect(
+				await captureWorkerRejection(
+					permission.handlePermission(
+						identity.narratorId,
+						new AbortController().signal,
+						"Notification",
+						{},
+						identity.toolUseId,
+						"/tmp",
+					),
+				),
+			).toMatchObject({ code: "DB_READ_UNAVAILABLE" });
+			expect(count()).toBe(0);
+		} finally {
+			if (previous === undefined) delete process.env.NARRAFORK_DB_WORKER;
+			else process.env.NARRAFORK_DB_WORKER = previous;
+			await resetDbWorkerPoolForTest();
+		}
+	});
+
+	for (const action of ["update", "delete"] as const)
+		test(`signed review boundary is checked again at ${action} commit`, async () => {
+			const identity = await seed();
+			const id = signReviewBoundaryRuleId(identity.narratorId, "/signed-boundary");
+			db.insert(schema.narratorBlacklistDirs)
+				.values({
+					id,
+					narratorId: identity.narratorId,
+					path: "/untrusted-path",
+					targetKind: "host",
+					deviceScope: "local",
+					createdAt: now(),
+				})
+				.run();
+			const readFirst = workerReads.readQueryFirst;
+			let changed = false;
+			const preflight = spyOn(workerReads, "readQueryFirst").mockImplementation(
+				async <T>(...args: Parameters<typeof readFirst<T>>) => {
+					const row = await readFirst<T>(...args);
+					if (!changed) {
+						changed = true;
+						db.update(schema.narratorBlacklistDirs)
+							.set({ path: "/signed-boundary" })
+							.where(eq(schema.narratorBlacklistDirs.id, id))
+							.run();
+					}
+					return row;
+				},
+			);
+			try {
+				const pending =
+					action === "update"
+						? permissionRuleService.updateNarratorRule(identity.narratorId, {
+								ruleType: "directoryBlacklist",
+								value: { id, path: "/replacement", selector: { kind: "host" } },
+							})
+						: permissionRuleService.deleteNarratorRule(
+								identity.narratorId,
+								"directoryBlacklist",
+								id,
+							);
+				expect(await captureWorkerRejectionThrower(pending)).toThrow("immutable");
+				expect(changed).toBe(true);
+				expect(
+					db
+						.select()
+						.from(schema.narratorBlacklistDirs)
+						.where(eq(schema.narratorBlacklistDirs.id, id))
+						.get()?.path,
+				).toBe("/signed-boundary");
+			} finally {
+				preflight.mockRestore();
+			}
+		});
+
 	test("summary paging is bounded and excludes proposal bodies", async () => {
 		const identity = await seed();
 		await service.preparePermissionRuleRequest(identity, proposal, identity.context);
 		const other = await call(identity.narratorId);
 		await service.preparePermissionRuleRequest(other, proposal, other.context);
-		const first = service.listPermissionRuleRequests(identity.narratorId, { limit: 1 });
+		const first = await service.listPermissionRuleRequests(identity.narratorId, { limit: 1 });
 		expect(first.items).toHaveLength(1);
 		expect(first.nextCursor).not.toBeNull();
 		expect(first.items[0]).not.toHaveProperty("proposalJson");
 		expect(
-			service.listPermissionRuleRequests(identity.narratorId, {
-				limit: 1,
-				cursor: first.nextCursor,
-			}).items,
+			(
+				await service.listPermissionRuleRequests(identity.narratorId, {
+					limit: 1,
+					cursor: first.nextCursor,
+				})
+			).items,
 		).toHaveLength(1);
-		expect(() => service.listPermissionRuleRequests(identity.narratorId, { limit: 101 })).toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				service.listPermissionRuleRequests(identity.narratorId, { limit: 101 }),
+			),
+		).toThrow();
 	});
 	test("NarraForkAdmin cannot enable opt-in through direct or ancestor update/reset", async () => {
 		for (const [action, path, value] of [

@@ -6,7 +6,8 @@ import {
 	ApiError,
 	apiBase,
 	authorizedFetch,
-	getToken,
+	confirmAuthUser,
+	getAuthSnapshot,
 	type RequestOptions,
 	readFetchError,
 	request,
@@ -216,11 +217,18 @@ export const authApi = {
 			body: JSON.stringify(data),
 		}),
 	me: async (options?: RequestOptions) => {
-		const token = getToken();
+		const { generation, hasToken } = getAuthSnapshot();
 		const timeout = AbortSignal.timeout(CURRENT_USER_TIMEOUT_MS);
 		const signal = options?.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
 		const user = await request<ApiEntity>("/auth/me", { ...options, signal });
-		if (token && getToken() === token) writeCurrentUserCache(user);
+		signal.throwIfAborted();
+		if (getAuthSnapshot().generation !== generation) {
+			throw new DOMException("Session changed", "AbortError");
+		}
+		if (hasToken) {
+			writeCurrentUserCache(user);
+			confirmAuthUser(generation, user.id);
+		}
 		return user;
 	},
 
