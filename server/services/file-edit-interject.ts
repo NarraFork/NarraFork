@@ -20,6 +20,7 @@ import type { DiffLineStats } from "@shared/pretext-layout/diff-core";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { users } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
@@ -110,10 +111,13 @@ export function formatFileEditInterjection(notification: FileEditNotification): 
 async function resolveCreator(userId: string | null): Promise<BufferCreator | null> {
 	if (!userId) return null;
 	try {
-		const user = await db.query.users.findFirst({
-			where: eq(users.id, userId),
-			columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
-		});
+		const user = await readQuery(
+			db.query.users.findFirst({
+				where: eq(users.id, userId),
+				columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
+			}),
+			{ executionPolicy: "worker-required", maxRows: 1 },
+		);
 		return user ?? null;
 	} catch (err) {
 		// Attribution is cosmetic; never block delivery on it.

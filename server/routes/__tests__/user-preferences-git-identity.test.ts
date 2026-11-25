@@ -1,11 +1,17 @@
 // 提交身份入口的显示偏好必须按账号隔离：这是「跟账号走」的唯一意义所在。
 import { afterAll, afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import { Hono } from "hono";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { userGitIdentities, userPreferences, userRecentTabs, users } from "../../db/schema";
 import { generateId } from "../../lib/id";
+import {
+	closeRuntimeTestDb,
+	getRuntimeTestDb,
+} from "../../services/__tests__/agent-runtime-test-database";
 
-const { db, sqlite } = getTestDb();
+// Reads run on the database Worker, which needs a file-backed WAL database.
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 
@@ -259,7 +265,8 @@ describe("folder git identity endpoints", () => {
 
 // Restore the module mock only after every describe has run: restoring it at the end of one
 // describe leaves the next one resolving against the real database.
-afterAll(() => {
+afterAll(async () => {
+	await closeRuntimeTestDb(sqlite);
 	mock.module("../../db", () => realDbModule);
 	mock.restore();
 });

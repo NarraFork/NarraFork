@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	narrators,
 	userPreferences,
@@ -11,8 +11,14 @@ import {
 	workspacePanels,
 	workspaces,
 } from "../../db/schema";
+import {
+	closeRuntimeTestDb,
+	getRuntimeTestDb,
+} from "../../services/__tests__/agent-runtime-test-database";
 
-const { db, sqlite } = getTestDb();
+// Workspace listing/detail read on the database Worker, which needs a file-backed WAL db.
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
 const broadcasts: Array<{ userId: string; event: Record<string, unknown> }> = [];
 const realDbModule = { ...(await import("../../db")) };
 const realNarratorWsModule = { ...(await import("../../websocket/narrator-ws")) };
@@ -123,7 +129,8 @@ beforeEach(() => {
 
 afterEach(() => cleanDb(sqlite));
 
-afterAll(() => {
+afterAll(async () => {
+	await closeRuntimeTestDb(sqlite);
 	mock.module("../../db", () => realDbModule);
 	mock.module("../../websocket/narrator-ws", () => realNarratorWsModule);
 	mock.restore();

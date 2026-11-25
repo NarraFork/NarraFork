@@ -50,6 +50,7 @@ import {
 	userRecentTabsMeta,
 	users,
 } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { userPreferencesLock } from "../lib/async-mutex";
 import { AppError, ValidationError } from "../lib/errors";
 import { invalidateNarratorFolderCache } from "../lib/git-identity";
@@ -883,18 +884,21 @@ let ensureAllRecentTabsMigrationPromise: Promise<void> | undefined;
 async function runAllRecentTabsMigration(): Promise<void> {
 	let cursor: string | undefined;
 	while (true) {
-		const rows = await db
-			.select({ userId: userPreferences.userId })
-			.from(userPreferences)
-			.leftJoin(userRecentTabsMeta, eq(userRecentTabsMeta.userId, userPreferences.userId))
-			.where(
-				and(
-					isNull(userRecentTabsMeta.userId),
-					cursor ? gt(userPreferences.userId, cursor) : undefined,
-				),
-			)
-			.orderBy(asc(userPreferences.userId))
-			.limit(MIGRATION_BATCH_SIZE);
+		const rows = await readQuery(
+			db
+				.select({ userId: userPreferences.userId })
+				.from(userPreferences)
+				.leftJoin(userRecentTabsMeta, eq(userRecentTabsMeta.userId, userPreferences.userId))
+				.where(
+					and(
+						isNull(userRecentTabsMeta.userId),
+						cursor ? gt(userPreferences.userId, cursor) : undefined,
+					),
+				)
+				.orderBy(asc(userPreferences.userId))
+				.limit(MIGRATION_BATCH_SIZE),
+			{ executionPolicy: "worker-required" },
+		);
 		if (rows.length === 0) break;
 		for (const row of rows) await ensureMigrated(row.userId);
 		cursor = rows.at(-1)?.userId;
@@ -904,12 +908,15 @@ async function runAllRecentTabsMigration(): Promise<void> {
 }
 
 async function migratePendingRecentTabsUsers(): Promise<void> {
-	const pending = await db
-		.select({ userId: userPreferences.userId })
-		.from(userPreferences)
-		.leftJoin(userRecentTabsMeta, eq(userRecentTabsMeta.userId, userPreferences.userId))
-		.where(isNull(userRecentTabsMeta.userId))
-		.limit(1);
+	const pending = await readQuery(
+		db
+			.select({ userId: userPreferences.userId })
+			.from(userPreferences)
+			.leftJoin(userRecentTabsMeta, eq(userRecentTabsMeta.userId, userPreferences.userId))
+			.where(isNull(userRecentTabsMeta.userId))
+			.limit(1),
+		{ executionPolicy: "worker-required" },
+	);
 	if (pending.length > 0) await runAllRecentTabsMigration();
 }
 
@@ -1424,10 +1431,13 @@ async function firstIdleUnitIndex(tabs: PersistedRecentTab[]): Promise<number> {
 	const narratorIds = tabs.map(getTabNarratorId).filter((id): id is string => id !== undefined);
 	const statusByNarrator = new Map<string, string>();
 	if (narratorIds.length > 0) {
-		const rows = await db
-			.select({ id: narrators.id, status: narrators.status })
-			.from(narrators)
-			.where(inArray(narrators.id, narratorIds));
+		const rows = await readQuery(
+			db
+				.select({ id: narrators.id, status: narrators.status })
+				.from(narrators)
+				.where(inArray(narrators.id, narratorIds)),
+			{ executionPolicy: "worker-required" },
+		);
 		for (const row of rows) statusByNarrator.set(row.id, row.status);
 	}
 	for (let candidateIndex = 0; candidateIndex < tabs.length; candidateIndex++) {
@@ -1593,10 +1603,13 @@ export async function clearRecentTabs(
 		const narratorIds = before.map(getTabNarratorId).filter((id): id is string => id !== undefined);
 		const activeNarrators = new Set<string>();
 		if (scope === "inactive_narrators" && narratorIds.length > 0) {
-			const rows = await db
-				.select({ id: narrators.id, status: narrators.status, substatus: narrators.substatus })
-				.from(narrators)
-				.where(inArray(narrators.id, narratorIds));
+			const rows = await readQuery(
+				db
+					.select({ id: narrators.id, status: narrators.status, substatus: narrators.substatus })
+					.from(narrators)
+					.where(inArray(narrators.id, narratorIds)),
+				{ executionPolicy: "worker-required" },
+			);
 			for (const row of rows) {
 				const substatus = parseSubstatus(row.substatus);
 				if (
@@ -1781,17 +1794,19 @@ export async function listPage(
 		// the stored order in the same shape, which makes this the stored order whenever the
 		// list was last written by current code. Bounded: one user's section holds at most
 		// RECENT_TABS_STORAGE_LIMIT rows, read through the (user, section, ...) index.
-		const topLevelRows = db
-			.select()
-			.from(userRecentTabs)
-			.where(cursorWhere ? and(baseWhere, cursorWhere) : baseWhere)
-			.orderBy(
-				desc(userRecentTabs.pinned),
-				asc(userRecentTabs.sortOrder),
-				asc(userRecentTabs.tabKey),
-			)
-			.limit(pageLimit + 1)
-			.all();
+		const topLevelRows = await readQuery(
+			db
+				.select()
+				.from(userRecentTabs)
+				.where(cursorWhere ? and(baseWhere, cursorWhere) : baseWhere)
+				.orderBy(
+					desc(userRecentTabs.pinned),
+					asc(userRecentTabs.sortOrder),
+					asc(userRecentTabs.tabKey),
+				)
+				.limit(pageLimit + 1),
+			{ executionPolicy: "worker-required" },
+		);
 		const hasMore = topLevelRows.length > pageLimit;
 		const pageTopLevelRows = topLevelRows.slice(0, pageLimit);
 		// A page always carries its folders' members, so a folder is never split across pages.
@@ -1800,20 +1815,22 @@ export async function listPage(
 			.map((row) => row.entityId);
 		const members =
 			folderIds.length > 0
-				? db
-						.select()
-						.from(userRecentTabs)
-						.where(
-							and(
-								eq(userRecentTabs.userId, userId),
-								eq(userRecentTabs.section, section),
-								inArray(userRecentTabs.folderId, folderIds),
-								EXCLUDE_REMOVED_TAB_TYPES,
-							),
-						)
-						.orderBy(asc(userRecentTabs.sortOrder), asc(userRecentTabs.tabKey))
-						.limit(RECENT_TABS_STORAGE_LIMIT)
-						.all()
+				? await readQuery(
+						db
+							.select()
+							.from(userRecentTabs)
+							.where(
+								and(
+									eq(userRecentTabs.userId, userId),
+									eq(userRecentTabs.section, section),
+									inArray(userRecentTabs.folderId, folderIds),
+									EXCLUDE_REMOVED_TAB_TYPES,
+								),
+							)
+							.orderBy(asc(userRecentTabs.sortOrder), asc(userRecentTabs.tabKey))
+							.limit(RECENT_TABS_STORAGE_LIMIT),
+						{ executionPolicy: "worker-required" },
+					)
 				: [];
 		const membersByFolder = new Map<string, RecentTabRow[]>();
 		for (const member of members) {
@@ -1876,10 +1893,13 @@ export async function getRuntimePatches(
 	const snapshot = await userPreferencesLock.acquire(userId, async () => {
 		const revision = ensureMigratedLocked(userId);
 		if (uniqueKeys.length === 0) return { revision, tabs: [] as PersistedRecentTab[] };
-		const rows = await db
-			.select()
-			.from(userRecentTabs)
-			.where(and(eq(userRecentTabs.userId, userId), inArray(userRecentTabs.tabKey, uniqueKeys)));
+		const rows = await readQuery(
+			db
+				.select()
+				.from(userRecentTabs)
+				.where(and(eq(userRecentTabs.userId, userId), inArray(userRecentTabs.tabKey, uniqueKeys))),
+			{ executionPolicy: "worker-required" },
+		);
 		const byKey = new Map(rows.map((row) => [row.tabKey, rowToTab(row)]));
 		const tabs = uniqueKeys.map((key) => byKey.get(key)).filter((tab) => tab !== undefined);
 		const readableKeys = readableRecentTabKeys(userId, tabs);
@@ -1969,18 +1989,21 @@ export async function getRecentTabUserIds(type: RecentTabType, id: string): Prom
 	const userIds: string[] = [];
 	let cursor: string | undefined;
 	while (true) {
-		const rows = await db
-			.selectDistinct({ userId: userRecentTabs.userId })
-			.from(userRecentTabs)
-			.where(
-				and(
-					eq(userRecentTabs.type, type),
-					eq(userRecentTabs.entityId, id),
-					cursor ? gt(userRecentTabs.userId, cursor) : undefined,
-				),
-			)
-			.orderBy(asc(userRecentTabs.userId))
-			.limit(MIGRATION_BATCH_SIZE);
+		const rows = await readQuery(
+			db
+				.selectDistinct({ userId: userRecentTabs.userId })
+				.from(userRecentTabs)
+				.where(
+					and(
+						eq(userRecentTabs.type, type),
+						eq(userRecentTabs.entityId, id),
+						cursor ? gt(userRecentTabs.userId, cursor) : undefined,
+					),
+				)
+				.orderBy(asc(userRecentTabs.userId))
+				.limit(MIGRATION_BATCH_SIZE),
+			{ executionPolicy: "worker-required" },
+		);
 		if (rows.length === 0) break;
 		userIds.push(...rows.map((row) => row.userId));
 		cursor = rows.at(-1)?.userId;
@@ -1998,17 +2021,20 @@ export async function getRecentTabUserIdsForNarrator(
 	const userIds: string[] = [];
 	let cursor: string | undefined;
 	while (userIds.length < limit) {
-		const rows = await db
-			.selectDistinct({ userId: userRecentTabs.userId })
-			.from(userRecentTabs)
-			.where(
-				and(
-					eq(userRecentTabs.representedNarratorId, narratorId),
-					cursor ? gt(userRecentTabs.userId, cursor) : undefined,
-				),
-			)
-			.orderBy(asc(userRecentTabs.userId))
-			.limit(Math.min(MIGRATION_BATCH_SIZE, limit - userIds.length));
+		const rows = await readQuery(
+			db
+				.selectDistinct({ userId: userRecentTabs.userId })
+				.from(userRecentTabs)
+				.where(
+					and(
+						eq(userRecentTabs.representedNarratorId, narratorId),
+						cursor ? gt(userRecentTabs.userId, cursor) : undefined,
+					),
+				)
+				.orderBy(asc(userRecentTabs.userId))
+				.limit(Math.min(MIGRATION_BATCH_SIZE, limit - userIds.length)),
+			{ executionPolicy: "worker-required" },
+		);
 		if (rows.length === 0) break;
 		userIds.push(...rows.map((row) => row.userId));
 		cursor = rows.at(-1)?.userId;
@@ -2119,10 +2145,13 @@ export async function pruneUnreadableProjectTabs(userId: string, projectId: stri
 	const { resolveProjectGate } = await import("./project-acl");
 	const { resolveNarratorProjectId } = await import("./narrator-project");
 
-	const user = await db.query.users.findFirst({
-		where: eq(users.id, userId),
-		columns: { id: true, role: true },
-	});
+	const user = await readQuery(
+		db.query.users.findFirst({
+			where: eq(users.id, userId),
+			columns: { id: true, role: true },
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	// No user row → nothing to prune (the cascade already removed their tabs).
 	if (!user) return;
 	const principal = { userId: user.id, isAdmin: user.role === "admin" };
@@ -2146,10 +2175,13 @@ export async function pruneUnreadableProjectTabs(userId: string, projectId: stri
 		if (tab.type === "project") {
 			owningProject = tab.id;
 		} else if (tab.type === "narrator" || tab.type === "subagent") {
-			const narrator = await db.query.narrators.findFirst({
-				where: eq(narrators.id, tab.id),
-				columns: { id: true, contextProjectId: true },
-			});
+			const narrator = await readQuery(
+				db.query.narrators.findFirst({
+					where: eq(narrators.id, tab.id),
+					columns: { id: true, contextProjectId: true },
+				}),
+				{ executionPolicy: "worker-required" },
+			);
 			owningProject = narrator ? await resolveNarratorProjectId(narrator) : null;
 		} else if (tab.type === "team") {
 			teamTabs.push(tab.id);

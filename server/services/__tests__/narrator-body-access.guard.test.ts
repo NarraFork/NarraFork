@@ -76,7 +76,7 @@ const RAW_BODY_ACCESS: Record<string, { count: number; why: string }> = {
 	"server/db/test-role-migration.ts": { count: 4, why: "one-off role migration check" },
 	// Readers whose column branch serves block reads off (or PG), where it is the body.
 	"server/services/narrator-question-service.ts": { count: 3, why: "read switch off" },
-	"server/services/storage-service.ts": { count: 2, why: "read switch off" },
+	"server/services/storage-service.ts": { count: 1, why: "read switch off" },
 	"server/services/narrator-export.ts": { count: 1, why: "read switch off" },
 	"server/services/session-interchange/export.ts": { count: 1, why: "read switch off" },
 	"server/services/narrator-epochs.ts": {

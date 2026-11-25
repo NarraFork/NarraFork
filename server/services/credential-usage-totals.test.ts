@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,7 +8,8 @@ import * as schema from "@server/db/schema";
 import { apiRequests, credentialUsageTotals } from "@server/db/schema";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
-import { cleanDb, getTestDb } from "../../tests/setup";
+import { cleanDb } from "../../tests/setup";
+import { getNarratorWorkerTestDb } from "./__tests__/narrator-worker-fixture";
 import {
 	deleteCredentialUsageTotals,
 	getCredentialUsageTotals,
@@ -18,7 +19,10 @@ import {
 	serializeCredentialUsageSummary,
 } from "./credential-usage-totals";
 
-const { db, sqlite } = getTestDb();
+const workerFixture = getNarratorWorkerTestDb();
+const { db, sqlite } = workerFixture;
+beforeAll(() => workerFixture.ready);
+afterAll(() => workerFixture.close());
 
 afterEach(() => cleanDb(sqlite));
 
@@ -38,16 +42,16 @@ function record(overrides: Partial<Parameters<typeof recordCredentialUsage>[0]> 
 }
 
 describe("credential usage totals", () => {
-	test("explicit free and partial zero costs remain distinguishable in durable totals", () => {
+	test("explicit free and partial zero costs remain distinguishable in durable totals", async () => {
 		record({ costUsd: 0, costStatus: "complete" });
-		expect(getCredentialUsageTotals("codex", "cred-a", 50, db)).toMatchObject({
+		expect(await getCredentialUsageTotals("codex", "cred-a", 50, db)).toMatchObject({
 			costStatus: "complete",
 			costUsd: 0,
 			unpricedRequestCount: 0,
 		});
 		record({ costUsd: 0, costStatus: "partial" });
 		record({ costUsd: null, costStatus: "unknown" });
-		const summary = getCredentialUsageTotals("codex", "cred-a", 50, db);
+		const summary = await getCredentialUsageTotals("codex", "cred-a", 50, db);
 		expect(summary).toMatchObject({
 			costStatus: "partial",
 			costUsd: 0,
@@ -56,11 +60,11 @@ describe("credential usage totals", () => {
 			costIsPartial: true,
 		});
 		expect(summary.byModel[0]?.costStatus).toBe("partial");
-		expect(listProviderCredentialTotals("codex", 50, db)[0]?.costStatus).toBe("partial");
+		expect((await listProviderCredentialTotals("codex", 50, db))[0]?.costStatus).toBe("partial");
 	});
-	test("partial amounts contribute known cost without increasing complete coverage", () => {
+	test("partial amounts contribute known cost without increasing complete coverage", async () => {
 		record({ costUsd: 0.03, costStatus: "partial" });
-		expect(getCredentialUsageTotals("codex", "cred-a", 50, db)).toMatchObject({
+		expect(await getCredentialUsageTotals("codex", "cred-a", 50, db)).toMatchObject({
 			costStatus: "partial",
 			costUsd: 0.03,
 			unpricedRequestCount: 1,
@@ -68,12 +72,12 @@ describe("credential usage totals", () => {
 		});
 	});
 
-	test("首次记录建立行，后续记录累加", () => {
+	test("首次记录建立行，后续记录累加", async () => {
 		record({ at: "2026-07-01T00:00:00.000Z" });
 		record({ at: "2026-07-02T00:00:00.000Z" });
 		record({ at: "2026-07-03T00:00:00.000Z" });
 
-		const summary = getCredentialUsageTotals("codex", "cred-a", 50, db);
+		const summary = await getCredentialUsageTotals("codex", "cred-a", 50, db);
 		expect(summary.requestCount).toBe(3);
 		expect(summary.inputTokens).toBe(3000);
 		expect(summary.outputTokens).toBe(600);
@@ -84,53 +88,55 @@ describe("credential usage totals", () => {
 		expect(summary.lastSeenAt).toBe("2026-07-03T00:00:00.000Z");
 	});
 
-	test("同一凭据的不同模型各自成行，汇总时相加", () => {
+	test("同一凭据的不同模型各自成行，汇总时相加", async () => {
 		record({ model: "gpt-5.5", inputTokens: 1000, costUsd: 0.01 });
 		record({ model: "gpt-5.4-mini", inputTokens: 500, costUsd: 0.001 });
 
-		const summary = getCredentialUsageTotals("codex", "cred-a", 50, db);
+		const summary = await getCredentialUsageTotals("codex", "cred-a", 50, db);
 		expect(summary.byModel).toHaveLength(2);
 		expect(summary.inputTokens).toBe(1500);
 		expect(summary.costUsd).toBeCloseTo(0.011, 6);
 		expect(summary.byModel.map((r) => r.model).sort()).toEqual(["gpt-5.4-mini", "gpt-5.5"]);
 	});
 
-	test("不同 provider 的同名 credentialId 不会串账", () => {
+	test("不同 provider 的同名 credentialId 不会串账", async () => {
 		record({ provider: "codex", credentialId: "shared-id", inputTokens: 100 });
 		record({ provider: "anthropic", credentialId: "shared-id", inputTokens: 700 });
 
-		expect(getCredentialUsageTotals("codex", "shared-id", 50, db).inputTokens).toBe(100);
-		expect(getCredentialUsageTotals("anthropic", "shared-id", 50, db).inputTokens).toBe(700);
+		expect((await getCredentialUsageTotals("codex", "shared-id", 50, db)).inputTokens).toBe(100);
+		expect((await getCredentialUsageTotals("anthropic", "shared-id", 50, db)).inputTokens).toBe(
+			700,
+		);
 	});
 
-	test("未定价请求被单独计数，成本标记为部分覆盖", () => {
+	test("未定价请求被单独计数，成本标记为部分覆盖", async () => {
 		record({ costUsd: 0.02 });
 		record({ costUsd: null });
 		record({ costUsd: undefined });
 
-		const summary = getCredentialUsageTotals("codex", "cred-a", 50, db);
+		const summary = await getCredentialUsageTotals("codex", "cred-a", 50, db);
 		expect(summary.requestCount).toBe(3);
 		expect(summary.unpricedRequestCount).toBe(2);
 		expect(summary.costIsPartial).toBe(true);
 		expect(summary.costUsd).toBeCloseTo(0.02, 6);
 	});
 
-	test("全部定价时 costIsPartial 为 false", () => {
+	test("全部定价时 costIsPartial 为 false", async () => {
 		record({ costUsd: 0.01 });
 		record({ costUsd: 0.02 });
-		const summary = getCredentialUsageTotals("codex", "cred-a", 50, db);
+		const summary = await getCredentialUsageTotals("codex", "cred-a", 50, db);
 		expect(summary.unpricedRequestCount).toBe(0);
 		expect(summary.costIsPartial).toBe(false);
 	});
 
-	test("非法/负数 token 与成本被归零，不产生负累计", () => {
+	test("非法/负数 token 与成本被归零，不产生负累计", async () => {
 		record({
 			inputTokens: -100,
 			outputTokens: Number.NaN,
 			cachedInputTokens: Number.POSITIVE_INFINITY,
 			costUsd: -5,
 		});
-		const summary = getCredentialUsageTotals("codex", "cred-a", 50, db);
+		const summary = await getCredentialUsageTotals("codex", "cred-a", 50, db);
 		expect(summary.inputTokens).toBe(0);
 		expect(summary.outputTokens).toBe(0);
 		expect(summary.cachedInputTokens).toBe(0);
@@ -143,10 +149,10 @@ describe("credential usage totals", () => {
 		expect(summary.costIsPartial).toBe(true);
 	});
 
-	test("成本为 NaN/Infinity 时同样计入未定价，而不是静默记 0 成本", () => {
+	test("成本为 NaN/Infinity 时同样计入未定价，而不是静默记 0 成本", async () => {
 		record({ costUsd: Number.NaN });
 		record({ costUsd: Number.POSITIVE_INFINITY });
-		const summary = getCredentialUsageTotals("codex", "cred-a", 50, db);
+		const summary = await getCredentialUsageTotals("codex", "cred-a", 50, db);
 		expect(summary.requestCount).toBe(2);
 		expect(summary.unpricedRequestCount).toBe(2);
 		expect(summary.costUsd).toBe(0);
@@ -160,15 +166,15 @@ describe("credential usage totals", () => {
 		expect(rows).toHaveLength(0);
 	});
 
-	test("空模型名归入 unknown 桶，而不是撞成同一空键", () => {
+	test("空模型名归入 unknown 桶，而不是撞成同一空键", async () => {
 		record({ model: "" });
 		record({ model: "   " });
-		const summary = getCredentialUsageTotals("codex", "cred-a", 50, db);
+		const summary = await getCredentialUsageTotals("codex", "cred-a", 50, db);
 		expect(summary.byModel.map((r) => r.model)).toEqual(["unknown"]);
 		expect(summary.requestCount).toBe(2);
 	});
 
-	test("删除叙述者会清掉明细但保留累计（核心：历史不随叙述者消失）", () => {
+	test("删除叙述者会清掉明细但保留累计（核心：历史不随叙述者消失）", async () => {
 		db.insert(apiRequests)
 			.values({
 				id: "req-1",
@@ -189,23 +195,23 @@ describe("credential usage totals", () => {
 		db.delete(apiRequests).where(eq(apiRequests.credentialId, "cred-a")).run();
 		expect(db.select().from(apiRequests).all()).toHaveLength(0);
 
-		const summary = getCredentialUsageTotals("codex", "cred-a", 50, db);
+		const summary = await getCredentialUsageTotals("codex", "cred-a", 50, db);
 		expect(summary.requestCount).toBe(1);
 		expect(summary.inputTokens).toBe(1000);
 	});
 
-	test("删除凭据会清掉累计，且只影响该凭据", () => {
+	test("删除凭据会清掉累计，且只影响该凭据", async () => {
 		record({ credentialId: "cred-a" });
 		record({ credentialId: "cred-b" });
 
 		deleteCredentialUsageTotals("codex", "cred-a", db);
 
-		expect(getCredentialUsageTotals("codex", "cred-a", 50, db).requestCount).toBe(0);
-		expect(getCredentialUsageTotals("codex", "cred-b", 50, db).requestCount).toBe(1);
+		expect((await getCredentialUsageTotals("codex", "cred-a", 50, db)).requestCount).toBe(0);
+		expect((await getCredentialUsageTotals("codex", "cred-b", 50, db)).requestCount).toBe(1);
 	});
 
-	test("没有记录时返回全零汇总而不是抛错", () => {
-		const summary = getCredentialUsageTotals("codex", "never-used", 50, db);
+	test("没有记录时返回全零汇总而不是抛错", async () => {
+		const summary = await getCredentialUsageTotals("codex", "never-used", 50, db);
 		expect(summary.requestCount).toBe(0);
 		expect(summary.totalTokens).toBe(0);
 		expect(summary.costUsd).toBe(0);
@@ -214,12 +220,12 @@ describe("credential usage totals", () => {
 		expect(summary.byModel).toEqual([]);
 	});
 
-	test("listProviderCredentialTotals 按凭据聚合并跨模型求和", () => {
+	test("listProviderCredentialTotals 按凭据聚合并跨模型求和", async () => {
 		record({ credentialId: "cred-a", model: "gpt-5.5", inputTokens: 100, costUsd: 0.01 });
 		record({ credentialId: "cred-a", model: "gpt-5.4", inputTokens: 200, costUsd: 0.02 });
 		record({ credentialId: "cred-b", model: "gpt-5.5", inputTokens: 300, costUsd: null });
 
-		const entries = listProviderCredentialTotals("codex", 200, db);
+		const entries = await listProviderCredentialTotals("codex", 200, db);
 		const byId = new Map(entries.map((e) => [e.credentialId, e]));
 
 		expect(byId.get("cred-a")?.requestCount).toBe(2);
@@ -231,15 +237,15 @@ describe("credential usage totals", () => {
 		expect(byId.get("cred-b")?.costIsPartial).toBe(true);
 	});
 
-	test("listProviderCredentialTotals 只返回指定 provider", () => {
+	test("listProviderCredentialTotals 只返回指定 provider", async () => {
 		record({ provider: "codex", credentialId: "c1" });
 		record({ provider: "anthropic", credentialId: "k1" });
 
-		const codexEntries = listProviderCredentialTotals("codex", 200, db);
+		const codexEntries = await listProviderCredentialTotals("codex", 200, db);
 		expect(codexEntries.map((e) => e.credentialId)).toEqual(["c1"]);
 	});
 
-	test("模型数超过 limit 时汇总仍然完整，只有 byModel 被截断并标记", () => {
+	test("模型数超过 limit 时汇总仍然完整，只有 byModel 被截断并标记", async () => {
 		// A long-lived credential accumulates one row per distinct model string.
 		// Summing only the returned `byModel` rows would undercount by 5 requests
 		// here, with nothing on the wire to say so.
@@ -253,7 +259,7 @@ describe("credential usage totals", () => {
 			});
 		}
 
-		const summary = getCredentialUsageTotals("codex", "cred-a", 3, db);
+		const summary = await getCredentialUsageTotals("codex", "cred-a", 3, db);
 
 		// byModel is capped and flagged...
 		expect(summary.byModel).toHaveLength(3);
@@ -271,15 +277,15 @@ describe("credential usage totals", () => {
 		expect(summary.byModel.map((r) => r.model)).toEqual(["model-7", "model-6", "model-5"]);
 	});
 
-	test("模型数未超过 limit 时 byModelTruncated 为 false", () => {
+	test("模型数未超过 limit 时 byModelTruncated 为 false", async () => {
 		record({ model: "gpt-5.5" });
 		record({ model: "gpt-5.4" });
-		const summary = getCredentialUsageTotals("codex", "cred-a", 50, db);
+		const summary = await getCredentialUsageTotals("codex", "cred-a", 50, db);
 		expect(summary.byModel).toHaveLength(2);
 		expect(summary.byModelTruncated).toBe(false);
 	});
 
-	test("未定价请求在截断场景下也全部计入（* 标记不会因截断丢失）", () => {
+	test("未定价请求在截断场景下也全部计入（* 标记不会因截断丢失）", async () => {
 		record({ model: "priced", costUsd: 0.5, at: "2026-07-09T00:00:00.000Z" });
 		for (let i = 0; i < 5; i++) {
 			// Oldest rows, so a limit of 1 excludes every unpriced model from byModel.
@@ -290,14 +296,14 @@ describe("credential usage totals", () => {
 			});
 		}
 
-		const summary = getCredentialUsageTotals("codex", "cred-a", 1, db);
+		const summary = await getCredentialUsageTotals("codex", "cred-a", 1, db);
 		expect(summary.byModel.map((r) => r.model)).toEqual(["priced"]);
 		expect(summary.byModelTruncated).toBe(true);
 		expect(summary.unpricedRequestCount).toBe(5);
 		expect(summary.costIsPartial).toBe(true);
 	});
 
-	test("cache/reasoning token 分别累加，totalTokens 不含 reasoning（避免与 output 重复计）", () => {
+	test("cache/reasoning token 分别累加，totalTokens 不含 reasoning（避免与 output 重复计）", async () => {
 		record({
 			inputTokens: 100,
 			outputTokens: 50,
@@ -305,7 +311,7 @@ describe("credential usage totals", () => {
 			cacheCreationTokens: 200,
 			reasoningTokens: 30,
 		});
-		const summary = getCredentialUsageTotals("codex", "cred-a", 50, db);
+		const summary = await getCredentialUsageTotals("codex", "cred-a", 50, db);
 		expect(summary.cachedInputTokens).toBe(900);
 		expect(summary.cacheCreationTokens).toBe(200);
 		expect(summary.reasoningTokens).toBe(30);
@@ -315,11 +321,11 @@ describe("credential usage totals", () => {
 });
 
 describe("cost rounding at the serialization boundary", () => {
-	test("float 累加的长尾在序列化时被收敛到 6 位", () => {
+	test("float 累加的长尾在序列化时被收敛到 6 位", async () => {
 		// 0.1 + 0.2 in binary floating point; the raw sum keeps a long tail.
 		record({ model: "m", costUsd: 0.1 });
 		record({ model: "m", costUsd: 0.2 });
-		const raw = getCredentialUsageTotals("codex", "cred-a", 50, db);
+		const raw = await getCredentialUsageTotals("codex", "cred-a", 50, db);
 		const wire = serializeCredentialUsageSummary(raw);
 
 		expect(wire.costUsd).toBe(0.3);

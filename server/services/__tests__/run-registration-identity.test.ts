@@ -33,6 +33,7 @@ import {
 import { activeNarrators } from "../narrator-session-state";
 import { runSubagent } from "../subagent-runner";
 import { resetTraitLayerCaches } from "../trait-layer-service";
+import { settleWorkerRead } from "./file-worker-database";
 
 const A = "identity-human-a";
 const B = "identity-human-b";
@@ -315,12 +316,18 @@ test("S1 real foreground runSubagent uses the caller's principal in its first pa
 		expect(new Set(config.disabledTools).has("Write")).toBe(true);
 		const finalGate = config.onToolExecutionFinalAuthorization;
 		if (!finalGate) throw new Error("Missing final tool gate");
+		// The gate reads traits on a Worker: settle it before Bun's .rejects matcher, which
+		// can stall a reused read Worker.
 		await expect(
-			finalGate({
-				toolUse: { name: "Write", toolUseId: "blocked-write", input: {} },
-				effectiveInput: {},
-				binding: { toolCallId: "not-started-write", attempt: 1 },
-			} as Parameters<typeof finalGate>[0]),
+			(
+				await settleWorkerRead(
+					finalGate({
+						toolUse: { name: "Write", toolUseId: "blocked-write", input: {} },
+						effectiveInput: {},
+						binding: { toolCallId: "not-started-write", attempt: 1 },
+					} as Parameters<typeof finalGate>[0]),
+				)
+			).result(),
 		).rejects.toThrow("Tool disabled by the current effective traits: Write");
 		return done;
 	});

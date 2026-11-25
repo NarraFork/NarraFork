@@ -1,7 +1,8 @@
 import { readdir } from "node:fs/promises";
-import { and, eq, isNull } from "drizzle-orm";
+import { and, asc, eq, gt, isNull } from "drizzle-orm";
 import { db } from "../db";
 import { executorSessionCleanups, narrators, terminals } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { detectShell } from "../lib/agent/shell";
 import { resetCursorForTerminal } from "../lib/agent/tools/terminal";
@@ -45,6 +46,10 @@ import {
 	suspendTerminalWatchesForShutdown,
 } from "./terminal-watch-service";
 import { assertLegacyRuntimeOwner } from "./worktree-resource-owner";
+
+/** Unowned terminals read per page, and pages walked, before a worktree removal. */
+const WORKTREE_TERMINAL_SCAN_PAGE = 500;
+const WORKTREE_TERMINAL_SCAN_MAX_PAGES = 40;
 
 const DEFAULT_SHELL = detectShell().path;
 
@@ -190,10 +195,13 @@ async function markTerminalExited(
 	// Resolve the narrator ID if not provided
 	let nId = narratorId;
 	if (nId === undefined) {
-		const row = await db.query.terminals.findFirst({
-			where: eq(terminals.id, terminalId),
-			columns: { narratorId: true },
-		});
+		const row = await readQuery(
+			db.query.terminals.findFirst({
+				where: eq(terminals.id, terminalId),
+				columns: { narratorId: true },
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		if (row) nId = row.narratorId;
 	}
 	eventBus.emit({
@@ -287,11 +295,14 @@ const CLEANUP_PAGE = 100;
 
 /** Retry every pending cleanup for a device, a bounded page at a time. */
 async function reconcileExecutorCleanups(deviceId: string): Promise<void> {
-	const pending = await db
-		.select({ sessionId: executorSessionCleanups.sessionId })
-		.from(executorSessionCleanups)
-		.where(eq(executorSessionCleanups.deviceId, deviceId))
-		.limit(CLEANUP_PAGE);
+	const pending = await readQuery(
+		db
+			.select({ sessionId: executorSessionCleanups.sessionId })
+			.from(executorSessionCleanups)
+			.where(eq(executorSessionCleanups.deviceId, deviceId))
+			.limit(CLEANUP_PAGE),
+		{ executionPolicy: "worker-required", maxRows: CLEANUP_PAGE },
+	);
 	for (const { sessionId } of pending) {
 		if (!(await runExecutorCleanup(deviceId, sessionId))) return;
 	}
@@ -530,17 +541,20 @@ async function recoverTerminalsOnStartup(): Promise<void> {
 	const available = await dtachService.isAvailable();
 	const availabilityMs = Math.round(performance.now() - started);
 	const queryStarted = performance.now();
-	const running = await db.query.terminals.findMany({
-		where: and(eq(terminals.status, "running"), isNull(terminals.worktreeResourceId)),
-		columns: {
-			id: true,
-			narratorId: true,
-			dtachSocket: true,
-			worktreeResourceId: true,
-			deviceId: true,
-			executorSessionId: true,
-		},
-	});
+	const running = await readQuery(
+		db.query.terminals.findMany({
+			where: and(eq(terminals.status, "running"), isNull(terminals.worktreeResourceId)),
+			columns: {
+				id: true,
+				narratorId: true,
+				dtachSocket: true,
+				worktreeResourceId: true,
+				deviceId: true,
+				executorSessionId: true,
+			},
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	const queryMs = Math.round(performance.now() - queryStarted);
 	stats.tracked = running.length;
 	let probeTask: ReturnType<typeof dtachService.createRecoveryProbe> | undefined;
@@ -597,10 +611,13 @@ async function recoverTerminalsOnStartup(): Promise<void> {
 			const terminalId = match[1];
 			if (attempted.has(terminalId) || activeTerminals.has(terminalId)) return;
 			await isolated(terminalId, async () => {
-				const existing = await db.query.terminals.findFirst({
-					where: eq(terminals.id, terminalId),
-					columns: { status: true, worktreeResourceId: true, narratorId: true },
-				});
+				const existing = await readQuery(
+					db.query.terminals.findFirst({
+						where: eq(terminals.id, terminalId),
+						columns: { status: true, worktreeResourceId: true, narratorId: true },
+					}),
+					{ executionPolicy: "worker-required", maxRows: 1 },
+				);
 				if (!existing || existing.worktreeResourceId != null || existing.status !== "exited")
 					return;
 				const state = await (await getProbe()).check(dtachService.getSocketPath(terminalId));
@@ -651,9 +668,12 @@ async function createTerminal(opts: CreateTerminalOptions) {
 		hasExplicitDevice && requestedDeviceId !== "local" ? requestedDeviceId : undefined;
 
 	if (narratorId) {
-		const narrator = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-		});
+		const narrator = await readQuery(
+			db.query.narrators.findFirst({
+				where: eq(narrators.id, narratorId),
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		if (!narrator) throw new NotFoundError("Narrator", narratorId);
 		if (!hasExplicitDevice && narrator.defaultDeviceId && narrator.defaultDeviceId !== "local") {
 			deviceId = narrator.defaultDeviceId;
@@ -931,35 +951,47 @@ export const terminalService = {
 	},
 
 	async rename(terminalId: string, name: string) {
-		const terminal = await db.query.terminals.findFirst({
-			where: eq(terminals.id, terminalId),
-		});
+		const terminal = await readQuery(
+			db.query.terminals.findFirst({
+				where: eq(terminals.id, terminalId),
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		if (!terminal) throw new NotFoundError("Terminal", terminalId);
 		assertLegacyRuntimeOwner(terminal);
 		await db.update(terminals).set({ name }).where(eq(terminals.id, terminalId));
 	},
 
 	async getById(id: string) {
-		const terminal = await db.query.terminals.findFirst({
-			where: eq(terminals.id, id),
-		});
+		const terminal = await readQuery(
+			db.query.terminals.findFirst({
+				where: eq(terminals.id, id),
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		if (!terminal) throw new NotFoundError("Terminal", id);
 		assertLegacyRuntimeOwner(terminal);
 		return terminal;
 	},
 
 	async listByNarrator(narratorId: string) {
-		return db.query.terminals.findMany({
-			where: and(eq(terminals.narratorId, narratorId), isNull(terminals.worktreeResourceId)),
-		});
+		return readQuery(
+			db.query.terminals.findMany({
+				where: and(eq(terminals.narratorId, narratorId), isNull(terminals.worktreeResourceId)),
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 	},
 
 	/** List all terminals (admin use) */
 	async listAll() {
-		return db.query.terminals.findMany({
-			where: isNull(terminals.worktreeResourceId),
-			orderBy: (t, { desc }) => [desc(t.createdAt)],
-		});
+		return readQuery(
+			db.query.terminals.findMany({
+				where: isNull(terminals.worktreeResourceId),
+				orderBy: (t, { desc }) => [desc(t.createdAt)],
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 	},
 
 	/** Find orphan dtach sockets — sockets on disk with no matching running terminal in DB */
@@ -974,10 +1006,13 @@ export const terminalService = {
 				const match = file.match(/^terminal-(.+)\.sock$/);
 				if (!match) continue;
 				const terminalId = match[1];
-				const tracked = await db.query.terminals.findFirst({
-					where: eq(terminals.id, terminalId),
-					columns: { worktreeResourceId: true },
-				});
+				const tracked = await readQuery(
+					db.query.terminals.findFirst({
+						where: eq(terminals.id, terminalId),
+						columns: { worktreeResourceId: true },
+					}),
+					{ executionPolicy: "worker-required" },
+				);
 				if (tracked?.worktreeResourceId != null) continue;
 				const socketPath = dtachService.getSocketPath(terminalId);
 				// Check if the socket is alive but terminal is not in activeTerminals
@@ -996,7 +1031,10 @@ export const terminalService = {
 
 	/** Kill an orphan dtach socket that has no DB record */
 	async killOrphanSocket(terminalId: string) {
-		const existing = await db.query.terminals.findFirst({ where: eq(terminals.id, terminalId) });
+		const existing = await readQuery(
+			db.query.terminals.findFirst({ where: eq(terminals.id, terminalId) }),
+			{ executionPolicy: "worker-required" },
+		);
 		if (existing) assertLegacyRuntimeOwner(existing);
 		await dtachService.killSession(terminalId);
 		// Clean up buffer file if any
@@ -1019,10 +1057,13 @@ export const terminalService = {
 		if (activeTerminals.has(terminalId)) return;
 		if (!(await dtachService.isAvailable())) return;
 
-		const terminal = await db.query.terminals.findFirst({
-			where: eq(terminals.id, terminalId),
-			columns: { id: true, status: true, dtachSocket: true, worktreeResourceId: true },
-		});
+		const terminal = await readQuery(
+			db.query.terminals.findFirst({
+				where: eq(terminals.id, terminalId),
+				columns: { id: true, status: true, dtachSocket: true, worktreeResourceId: true },
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		if (!terminal || terminal.status !== "running" || !terminal.dtachSocket) return;
 		if (terminal.worktreeResourceId != null) return;
 
@@ -1039,9 +1080,12 @@ export const terminalService = {
 	 * Returns true if successfully re-attached.
 	 */
 	async reattach(terminalId: string): Promise<boolean> {
-		const terminal = await db.query.terminals.findFirst({
-			where: eq(terminals.id, terminalId),
-		});
+		const terminal = await readQuery(
+			db.query.terminals.findFirst({
+				where: eq(terminals.id, terminalId),
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		if (!terminal) return false;
 		assertLegacyRuntimeOwner(terminal);
 		if (activeTerminals.has(terminalId)) return true; // already attached
@@ -1089,7 +1133,10 @@ export const terminalService = {
 	 * Creates a DB record and attaches. Returns the new terminal record.
 	 */
 	async reattachOrphan(terminalId: string): Promise<unknown> {
-		const existing = await db.query.terminals.findFirst({ where: eq(terminals.id, terminalId) });
+		const existing = await readQuery(
+			db.query.terminals.findFirst({ where: eq(terminals.id, terminalId) }),
+			{ executionPolicy: "worker-required" },
+		);
 		if (existing) assertLegacyRuntimeOwner(existing);
 		if (!(await dtachService.isAvailable()) || !(await dtachService.isSocketAlive(terminalId))) {
 			throw new AppError("dtach socket not alive", 500);
@@ -1121,7 +1168,9 @@ export const terminalService = {
 		const success = await this.reattach(id);
 		if (!success) throw new AppError("Failed to reattach", 500);
 
-		return db.query.terminals.findFirst({ where: eq(terminals.id, id) });
+		return readQuery(db.query.terminals.findFirst({ where: eq(terminals.id, id) }), {
+			executionPolicy: "worker-required",
+		});
 	},
 
 	async getScrollback(
@@ -1180,9 +1229,12 @@ export const terminalService = {
 	async cleanupForNarrator(narratorId: string) {
 		const col = terminals.narratorId;
 		const value = narratorId;
-		const matched = await db.query.terminals.findMany({
-			where: and(eq(col, value), isNull(terminals.worktreeResourceId)),
-		});
+		const matched = await readQuery(
+			db.query.terminals.findMany({
+				where: and(eq(col, value), isNull(terminals.worktreeResourceId)),
+			}),
+			{ executionPolicy: "worker-required" },
+		);
 		for (const terminal of matched) {
 			if (terminal.worktreeResourceId != null) continue;
 			if (terminal.status === "running") {
@@ -1211,19 +1263,47 @@ export const terminalService = {
 		const matched: (typeof terminals.$inferSelect)[] = [];
 		if (input.worktreeResourceId) {
 			matched.push(
-				...(await db.query.terminals.findMany({
-					where: eq(terminals.worktreeResourceId, input.worktreeResourceId),
-				})),
+				...(await readQuery(
+					db.query.terminals.findMany({
+						where: eq(terminals.worktreeResourceId, input.worktreeResourceId),
+					}),
+					{ executionPolicy: "worker-required" },
+				)),
 			);
 		}
 		const path = input.worktreePath ?? null;
 		if (path) {
-			const owned = await db.query.terminals.findMany({
-				where: isNull(terminals.worktreeResourceId),
-				limit: 500,
-			});
-			for (const terminal of owned) {
-				if (terminal.cwd && localPathSemantics.contains(path, terminal.cwd)) matched.push(terminal);
+			// Containment is checked in JS (path semantics), so every unowned terminal has to be
+			// seen. Walk them in id order; a scan that cannot finish fails the retirement rather
+			// than leaving a shell running inside a removed checkout.
+			let after: string | null = null;
+			for (let page = 0; ; page++) {
+				if (page >= WORKTREE_TERMINAL_SCAN_MAX_PAGES)
+					throw new AppError(
+						"Too many terminals to check before removing this worktree",
+						409,
+						"WORKTREE_REMOVAL_TERMINAL_SCAN_INCOMPLETE",
+					);
+				const owned: (typeof terminals.$inferSelect)[] = await readQuery(
+					db
+						.select()
+						.from(terminals)
+						.where(
+							and(
+								isNull(terminals.worktreeResourceId),
+								after === null ? undefined : gt(terminals.id, after),
+							),
+						)
+						.orderBy(asc(terminals.id))
+						.limit(WORKTREE_TERMINAL_SCAN_PAGE),
+					{ executionPolicy: "worker-required", maxRows: WORKTREE_TERMINAL_SCAN_PAGE },
+				);
+				for (const terminal of owned) {
+					if (terminal.cwd && localPathSemantics.contains(path, terminal.cwd))
+						matched.push(terminal);
+				}
+				if (owned.length < WORKTREE_TERMINAL_SCAN_PAGE) break;
+				after = owned[owned.length - 1].id;
 			}
 		}
 		const ids = [...new Set(matched.map((terminal) => terminal.id))];
@@ -1245,7 +1325,10 @@ export const terminalService = {
 	 * direct mode: the subprocess PID is the shell.
 	 */
 	async getShellPid(terminalId: string): Promise<number | null> {
-		const existing = await db.query.terminals.findFirst({ where: eq(terminals.id, terminalId) });
+		const existing = await readQuery(
+			db.query.terminals.findFirst({ where: eq(terminals.id, terminalId) }),
+			{ executionPolicy: "worker-required" },
+		);
 		if (existing) assertLegacyRuntimeOwner(existing);
 		const active = activeTerminals.get(terminalId);
 		if (active) {

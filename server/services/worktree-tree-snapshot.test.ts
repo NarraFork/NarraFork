@@ -207,6 +207,57 @@ afterEach(async () => {
 });
 
 describe("worktree tree snapshots", () => {
+	for (const check of [1, 2]) {
+		test(`cancellation after staging safety check ${check} prevents later scans and publication`, async () => {
+			const repo = await createRepo("nf-tree-staging-cancel-");
+			writeFileSync(join(repo, "a.txt"), "preserve\n");
+			const controller = new AbortController();
+			const reason = new Error(`cancelled at staging safety check ${check}`);
+			const realSpawn = spawn.safeSpawn;
+			let checks = 0;
+			let dispatchesAfterAbort = 0;
+			const dispatch = spyOn(spawn, "safeSpawn").mockImplementation(async (opts) => {
+				if (controller.signal.aborted) dispatchesAfterAbort++;
+				const result = await realSpawn(opts);
+				if (
+					opts.cwd === repo &&
+					opts.cmd.includes("ls-files") &&
+					opts.cmd.includes(":(top,literal).narrafork/git-staging")
+				) {
+					expect(opts.signal).toBe(controller.signal);
+					if (++checks === check) controller.abort(reason);
+				}
+				return result;
+			});
+			try {
+				let failure: unknown;
+				try {
+					await worktreeTreeSnapshot.capture(repo, LOCAL_DEVICE_ID, { signal: controller.signal });
+				} catch (error) {
+					failure = error;
+				}
+				expect(String(failure)).toContain(reason.message);
+				expect(checks).toBe(check);
+				expect(dispatchesAfterAbort).toBe(0);
+				expect(dispatch.mock.calls.some(([opts]) => opts.cmd.includes("write-tree"))).toBe(false);
+				expect(
+					dispatch.mock.calls.some(
+						([opts]) => opts.cmd.includes("ls-files") && opts.cmd.includes("-i"),
+					),
+				).toBe(false);
+			} finally {
+				dispatch.mockRestore();
+			}
+			expect(
+				await db.query.worktreeTreeSnapshots.findMany({
+					where: eq(worktreeTreeSnapshots.worktreePath, snapshotPathIdentity(repo)),
+				}),
+			).toHaveLength(0);
+			const tree = await worktreeTreeSnapshot.capture(repo);
+			expect(await treePaths(repo, tree)).toEqual(["a.txt"]);
+		});
+	}
+
 	test("captures a mixed-case native workspace through its canonical comparison path", async () => {
 		const repo = await createRepo("Nf-Tree-Case-Identity-");
 		const target = normalizePathForComparison(repo);
