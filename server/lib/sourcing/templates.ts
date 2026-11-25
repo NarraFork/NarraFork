@@ -14,14 +14,14 @@ import {
 import { getCodexManager } from "../codex-manager";
 import { projectCodexUsageSnapshot } from "../codex-usage";
 import { getCommandCodeQuotaSnapshot, refreshCommandCodeQuota } from "../commandcode-usage";
-import type { CredentialAuth } from "../credential-store";
+import type { Credential, CredentialAuth } from "../credential-store";
 import { getDeepSeekQuotaSnapshot, refreshDeepSeekBalance } from "../deepseek-balance-cache";
 import { getKimiQuotaSnapshot, refreshKimiKeyUsage } from "../kimi-usage-cache";
 import { getNugQuotaSnapshot, refreshNugQuota } from "../nug-quota-cache";
 import { getOpencodeQuotaSnapshot, refreshOpencodeKeyUsage } from "../opencode-usage-cache";
 import { providerBalanceCache } from "../provider-balance-cache";
-import { getProviderKeyStore } from "../provider-keys";
 import type { CustomApiProviderConfig } from "../settings/types";
+import { readTemplateModelList } from "./model-list-readers";
 import type { SourceGroupView } from "./source-groups";
 
 export type { ServiceTemplateId } from "@shared/sourcing/identify";
@@ -56,13 +56,19 @@ export interface ServiceTemplate {
 	probeQuota?: (group: SourceGroupView, credentialId: string) => Promise<QuotaSnapshot | undefined>;
 	/** A read-only projection when another canonical store owns the usage (Codex). */
 	projectQuota?: (credentialId: string) => QuotaSnapshot | undefined;
+	/** Existing cached upstream ids. Explicit refresh stays with the catalog owner. */
+	listModels: (
+		group: SourceGroupView,
+		credential?: Credential,
+		signal?: AbortSignal,
+	) => Promise<string[]>;
 }
 
 type ProbeQuota = NonNullable<ServiceTemplate["probeQuota"]>;
 
 /**
- * Kimi Code and OpenCode Go answer per key; DeepSeek and relay balances per provider, so
- * their caches probe the group's first credential (§15.4). Relays are probed on every
+ * Sources own credential-specific probes and retain their legacy first-key views.
+ * Relay balances still follow their selected credential. Relays are probed on every
  * endpoint that is not a dedicated service, official APIs included, as before.
  */
 const relay: ProbeQuota = async (group, credentialId) => {
@@ -81,8 +87,7 @@ const QUOTA_PROBES: Partial<Record<ServiceTemplateId, ProbeQuota>> = {
 		return getOpencodeQuotaSnapshot(credentialId);
 	},
 	deepseek: async (group, credentialId) => {
-		if (credentialId !== (getProviderKeyStore().list(group.id)[0]?.id ?? group.id)) return;
-		await refreshDeepSeekBalance(group.id);
+		await refreshDeepSeekBalance(group.id, credentialId);
 		return getDeepSeekQuotaSnapshot(group.id, credentialId);
 	},
 	tokendance: async (_group, credentialId) => {
@@ -92,15 +97,12 @@ const QUOTA_PROBES: Partial<Record<ServiceTemplateId, ProbeQuota>> = {
 		return quota?.credentialId === credentialId ? quota.snapshot : undefined;
 	},
 	"command-code": async (_group, credentialId) => {
-		if (credentialId !== getCommandCodeQuotaSnapshot()?.credentialId) return;
-		await refreshCommandCodeQuota(true);
-		const quota = getCommandCodeQuotaSnapshot();
-		return quota?.credentialId === credentialId ? quota.snapshot : undefined;
+		await refreshCommandCodeQuota(true, credentialId);
+		return getCommandCodeQuotaSnapshot(credentialId)?.snapshot;
 	},
 	nug: async (group, credentialId) => {
-		if (credentialId !== getNugQuotaSnapshot(group.id)?.credentialId) return;
-		await refreshNugQuota(group.id);
-		const quota = getNugQuotaSnapshot(group.id);
+		await refreshNugQuota(group.id, credentialId);
+		const quota = getNugQuotaSnapshot(group.id, credentialId);
 		return quota?.credentialId === credentialId ? quota.snapshot : undefined;
 	},
 	openai: relay,
@@ -117,7 +119,7 @@ const KIMI_CODE = (host: string): ProtocolEndpoints => ({
 	"openai-responses": `https://${host}/coding/v1`,
 });
 
-const TEMPLATES: readonly ServiceTemplate[] = [
+const TEMPLATES: readonly Omit<ServiceTemplate, "listModels">[] = [
 	{
 		id: "codex",
 		kind: "known",
@@ -206,22 +208,20 @@ const TEMPLATES: readonly ServiceTemplate[] = [
 		personal: true,
 	},
 	{
-		// Prepaid balance. One key until TokenDance joins the credential pool (S2 PR 7).
 		id: "tokendance",
 		kind: "known",
 		preferredPrefix: "tokendance",
 		authKinds: ["api_key"],
-		multiCredential: false,
+		multiCredential: true,
 		subscription: false,
 		personal: false,
 	},
 	{
-		// Routed as pay-per-use today; one key until the credential pool takes it (S2 PR 7).
 		id: "command-code",
 		kind: "known",
 		preferredPrefix: "CommandCode",
 		authKinds: ["api_key"],
-		multiCredential: false,
+		multiCredential: true,
 		subscription: false,
 		personal: false,
 	},
@@ -250,12 +250,11 @@ const TEMPLATES: readonly ServiceTemplate[] = [
 		personal: true,
 	},
 	{
-		// NUG is excluded from the key pool until S2 PR 7.
 		id: "nug",
 		kind: "api",
 		preferredPrefix: "nug",
 		authKinds: ["api_key"],
-		multiCredential: false,
+		multiCredential: true,
 		subscription: false,
 		personal: true,
 	},
@@ -282,7 +281,21 @@ function deepFreeze<T>(value: T): T {
 const byId = new Map<ServiceTemplateId, ServiceTemplate>(
 	TEMPLATES.map((template) => {
 		const probeQuota = QUOTA_PROBES[template.id];
-		return [template.id, deepFreeze(probeQuota ? { ...template, probeQuota } : template)];
+		return [
+			template.id,
+			deepFreeze({
+				...template,
+				...(probeQuota ? { probeQuota } : {}),
+				listModels: async (
+					group: SourceGroupView,
+					_credential?: Credential,
+					signal?: AbortSignal,
+				) => {
+					signal?.throwIfAborted();
+					return readTemplateModelList(group);
+				},
+			}),
+		];
 	}),
 );
 
@@ -293,4 +306,20 @@ export function listServiceTemplates(): readonly ServiceTemplate[] {
 /** Every id in `SERVICE_TEMPLATE_IDS` has a template (asserted by the tests). */
 export function getServiceTemplate(id: ServiceTemplateId): ServiceTemplate {
 	return byId.get(id) as ServiceTemplate;
+}
+
+/**
+ * Management model GETs retain the owner's full metadata and order, selecting ids via
+ * the template. The reader executes synchronously before the Promise resolves, so both
+ * reads see the same in-memory catalog; no second catalog or last-result cache exists.
+ */
+export async function listCachedTemplateModels<T extends { id?: unknown }>(
+	group: SourceGroupView,
+	models: T[],
+	signal?: AbortSignal,
+): Promise<T[]> {
+	const ids = new Set(
+		await getServiceTemplate(group.templateId).listModels(group, undefined, signal),
+	);
+	return models.filter((model) => ids.has(String(model.id ?? "")));
 }

@@ -13,7 +13,7 @@ import { invalidateGitStatusPushQueries } from "../../hooks/useGit";
 import { type NarratorWarningInfo, useNarratorWS } from "../../hooks/useNarratorWS";
 import { useNarratorPermissionsCapability } from "../../hooks/usePlatform";
 import { quotaSnapshotsKey } from "../../hooks/useQuotaSnapshots";
-import { api, type BufferMessageSummary } from "../../lib/api";
+import { ApiError, api, type BufferMessageSummary } from "../../lib/api";
 import { formatFullLocaleDateTime } from "../../lib/format";
 import {
 	createPanelReconcileRestartScheduler,
@@ -849,6 +849,45 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		[permissionDecisionsSupported, resolveAndRemovePerm, t],
 	);
 
+	/**
+	 * Run one plan reflection for a plan that is already waiting for approval.
+	 *
+	 * The permission itself is never removed optimistically: it is only settled once the review
+	 * decides — a review that cannot decide leaves the card (and this permission) where it was.
+	 * Only the 计划反思 entry is hidden while the review runs.
+	 */
+	const handlePlanReflect = useCallback(
+		async (requestId: string) => {
+			if (!permissionDecisionsSupported) return;
+			// Hide the entry while the review runs: the server refuses a second start (409), and a
+			// card that still offers the button reads as if the first click did nothing. A review
+			// that hands the plan back sends `plan_reflection_stopped`, whose reconcile restores it.
+			const setAvailable = (available: boolean) => {
+				const current = pendingPermsByRequestIdRef.current.get(requestId);
+				if (current && current.planReflectionAvailable !== available) {
+					upsertPendingPermission({ ...current, planReflectionAvailable: available });
+				}
+			};
+			setAvailable(false);
+			try {
+				await api.reflectPlan(requestId);
+			} catch (err) {
+				if (err instanceof ApiError && err.status === 409) {
+					// Already running, or no longer reflectable: the server's state is the answer.
+					requestPanelReconcileRef.current();
+					return;
+				}
+				setAvailable(true);
+				notifications.show({
+					message: t("planReflectFailed"),
+					color: "red",
+					autoClose: 3000,
+				});
+			}
+		},
+		[permissionDecisionsSupported, t, upsertPendingPermission],
+	);
+
 	// --- Stable permission callbacks ---
 	const permCbRef = useRef<PermissionCallbacks | null>(null);
 	permCbRef.current = {
@@ -859,6 +898,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		onQuestionReflect: handleQuestionReflect,
 		onQuestionDeny: handleQuestionDeny,
 		onQuestionDefer: handleQuestionDefer,
+		onPlanReflect: handlePlanReflect,
 	};
 	const stablePermCb = useMemo<PermissionCallbacks>(
 		() => ({
@@ -869,6 +909,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			onQuestionReflect: (...args) => permCbRef.current?.onQuestionReflect(...args),
 			onQuestionDeny: (...args) => permCbRef.current?.onQuestionDeny(...args),
 			onQuestionDefer: (...args) => permCbRef.current?.onQuestionDefer?.(...args),
+			onPlanReflect: (...args) => permCbRef.current?.onPlanReflect?.(...args),
 		}),
 		[],
 	);

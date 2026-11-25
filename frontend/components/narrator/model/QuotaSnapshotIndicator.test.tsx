@@ -71,6 +71,31 @@ test("period percentages keep the spending, dollar limit and remaining amount ac
 	expect(html).toContain("Remaining 8 USD");
 });
 
+test("uncapped subscription periods never invent a zero limit or remaining allowance", () => {
+	const html = render({
+		scope: "subscription",
+		fetchedAt: 1,
+		windows: [
+			{
+				kind: "other",
+				label: "daily",
+				usedRatio: 0.2,
+				resetsAt: null,
+				used: 2,
+				total: 10,
+				remaining: 8,
+				unit: "USD",
+			},
+			{ kind: "monthly", label: "monthly", usedRatio: null, resetsAt: null, used: 0, unit: "USD" },
+		],
+		balances: [],
+	});
+	expect(html).toContain("Monthly");
+	expect(html).toContain("Used 2 USD / 10 USD");
+	expect(html).toContain("Remaining 8 USD");
+	expect(html).not.toContain("/ 0 USD");
+	expect(html).not.toContain("Remaining 0 USD");
+});
 test("expired plans render unavailable instead of positive quota bars or spendable amounts", () => {
 	const html = render({
 		scope: "subscription",

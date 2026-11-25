@@ -379,6 +379,7 @@ describe("main shutdown wiring without booting the server", () => {
 			"owner.closeRevertRewriteWorkers()",
 			"owner.closeSharePreviewHtmlWorkers()",
 			"owner.closeRequestJsonWorkers()",
+			"owner.closeStructuralWorkers()",
 			"owner.closeImageGenerationResponseWorkers()",
 		])
 			expect(shutdown).toContain(close);

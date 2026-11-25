@@ -1213,6 +1213,8 @@ export interface AsyncRuntimePublicationService {
 		text: string;
 		eventKind: "failed" | "cancelled";
 		now: string;
+		/** Scanned row; the CAS skips a row whose identity changed after the scan. */
+		expected?: PgStaleTaskRow;
 	}): Promise<unknown>;
 	/** PG-native paused transfer recovery. */
 	pauseStaleTransfer(input: { taskId: string; now: string; notice: string }): Promise<unknown>;

@@ -1,19 +1,31 @@
-import { isTeamMember, teamRootOf } from "@server/lib/runtime-source";
-import { formatWatchTarget, WATCH_DEADLINE_OUTPUT_PREFIX } from "@shared/watch-command";
+import { isTeamMember, runDeliverToOf, teamRootOf } from "@server/lib/runtime-source";
+import {
+	formatWatchTarget,
+	WATCH_DEADLINE_OUTPUT_PREFIX,
+	type WatchTargetType,
+} from "@shared/watch-command";
 import type { ToolContext, ToolResult } from "../lib/agent/types";
 import { isRuntimeToolAllowed, runtimeWatchTargets } from "./agent-runtime/policy";
 import { prepareBackgroundBashResult } from "./background-bash-result";
 import { type BackgroundTaskRecord, backgroundTaskService } from "./background-task-service";
 import { assertOAuthNarratorRuntimeActive } from "./oauth-narrator-runtime-policy";
 import { resolveTaskAlias } from "./subagent-alias";
+import { agentLabelFromNarrator } from "./subagent-label";
 import { TERMINAL_WATCH_COMMAND_PREFIX, WATCH_COMMAND_PREFIX } from "./terminal-watch-constants";
+import { startTerminalWatch, terminalLifecycleReader } from "./terminal-watch-service";
 import { resolveNarratorRuntimePolicy } from "./trait-layer-service";
 import {
+	type AdoptedWatchRow,
 	cancelWatchRegistration,
 	MAX_WATCH_TIMEOUT_MS,
 	registerWatchObservation,
 	type WatchObservation,
 } from "./watch-observation";
+import {
+	type RestartWatchRow,
+	type ResumableWatchTarget,
+	restartWatchDeadline,
+} from "./watch-restart";
 import { subscribeWatchSource } from "./watch-source";
 
 export interface TaskWatchInput {
@@ -22,6 +34,14 @@ export interface TaskWatchInput {
 	pattern?: string;
 	timeout: number;
 }
+
+/**
+ * Who is observing. A tool call passes its whole `ToolContext`; a watch re-attached
+ * after a restart has no tool call and acts as the identity that registered it.
+ */
+type WatchActor = Pick<ToolContext, "narratorId" | "signal" | "currentToolUseId"> & {
+	userId?: string | null;
+};
 
 interface TargetResult {
 	status: string;
@@ -125,7 +145,9 @@ async function untilSettled(
 
 interface ObserveTargetOptions {
 	input: TaskWatchInput;
-	ctx: ToolContext;
+	ctx: WatchActor;
+	/** Re-attach to this restart-surviving row instead of creating a new observation. */
+	adopt?: AdoptedWatchRow;
 	id: string;
 	label: string;
 	title: string;
@@ -172,7 +194,9 @@ async function observeTarget(opts: ObserveTargetOptions): Promise<ToolResult> {
 		toolUseId: ctx.currentToolUseId,
 		dedupKey: opts.conditionKey,
 		timeoutMs: input.timeout,
+		principal: { userId: ctx.userId ?? null },
 		onDeadline: () => void reachDeadline(),
+		...(opts.adopt ? { adopt: opts.adopt } : {}),
 	});
 	const { observation, reused, remainingMs } = registered;
 	if (reused) {
@@ -210,8 +234,8 @@ async function observeTarget(opts: ObserveTargetOptions): Promise<ToolResult> {
 }
 
 async function checkObservationAuthorization(
-	ctx: ToolContext,
-	type: TaskWatchInput["type"],
+	ctx: WatchActor,
+	type: WatchTargetType,
 ): Promise<void> {
 	// Re-resolve the live principal, not the already-returned tool's signal/workspace lease.
 	const policy = await resolveNarratorRuntimePolicy(ctx.narratorId, ctx.userId ?? null);
@@ -249,11 +273,22 @@ export async function watchTask(input: TaskWatchInput, ctx: ToolContext): Promis
 			metadata: { kind: "watch", type: "bash", id: task.id, targetId: input.id, status },
 		};
 	}
+	return observeBashTask(task, input, ctx);
+}
+
+function observeBashTask(
+	task: BackgroundTaskRecord,
+	input: TaskWatchInput,
+	ctx: WatchActor,
+	adopt?: AdoptedWatchRow,
+): Promise<ToolResult> {
+	const label = task.alias ?? task.id;
 	const runKey = `bash ${JSON.stringify(task.id)} run ${JSON.stringify(task.logicalRunId)}`;
 	const condition = input.pattern ? ` for ${JSON.stringify(input.pattern)}` : "";
 	return observeTarget({
 		input,
 		ctx,
+		adopt,
 		id: task.id,
 		label,
 		title: `watch bash ${label}`,
@@ -278,7 +313,7 @@ export async function watchTask(input: TaskWatchInput, ctx: ToolContext): Promis
 }
 
 async function watchAgent(input: TaskWatchInput, ctx: ToolContext): Promise<ToolResult> {
-	const { awaitAgentResultDetailed, waitForSubagentResult } = await import("./agent-communication");
+	const { awaitAgentResultDetailed } = await import("./agent-communication");
 	const snapshot = await awaitAgentResultDetailed({
 		callerNarratorId: ctx.narratorId,
 		id: input.id,
@@ -302,9 +337,26 @@ async function watchAgent(input: TaskWatchInput, ctx: ToolContext): Promise<Tool
 			},
 		};
 	}
+	return observeAgentRun(
+		input,
+		ctx,
+		{ id, label, title: snapshot.title },
+		snapshot.publicationRun?.recipientId ?? ctx.narratorId,
+		snapshot.publicationRun?.logicalRunId,
+	);
+}
+
+async function observeAgentRun(
+	input: TaskWatchInput,
+	ctx: WatchActor,
+	target: { id: string; label: string; title?: string | null },
+	recipientId: string,
+	expectedRunId: string | undefined,
+	adopt?: AdoptedWatchRow,
+): Promise<ToolResult> {
+	const { id, label } = target;
+	const { waitForSubagentResult } = await import("./agent-communication");
 	const { narratorService } = await import("./narrator-service");
-	const recipientId = snapshot.publicationRun?.recipientId ?? ctx.narratorId;
-	const expectedRunId = snapshot.publicationRun?.logicalRunId;
 	// Committed reads verify the target against its team root, so watchers that share a
 	// root and recipient share one waiter; each still re-checks its own access below.
 	const teamRoot = teamRootOf(await narratorService.getById(id));
@@ -314,7 +366,8 @@ async function watchAgent(input: TaskWatchInput, ctx: ToolContext): Promise<Tool
 		ctx,
 		id,
 		label,
-		title: `watch agent ${snapshot.title ?? label}`,
+		adopt,
+		title: `watch agent ${target.title ?? label}`,
 		command: formatWatchTarget({
 			type: "agent",
 			id,
@@ -342,4 +395,120 @@ async function watchAgent(input: TaskWatchInput, ctx: ToolContext): Promise<Tool
 			return result;
 		},
 	});
+}
+
+/**
+ * Re-attach a lifecycle watch to the same target after a restart, keeping its original
+ * deadline. Returns false when the target is gone, re-bound to another run, no longer
+ * owned by the watcher, or (Bash/agent) no longer running; the caller then ends the row
+ * as interrupted. A Bash task or agent ended by the restart publishes a `cancelled`
+ * notice, which never wakes its recipient, so the interruption notice must still be
+ * what tells the waiting session to look. A terminal's ending is reported by the watch
+ * itself, so an exited or detached terminal is re-attached and reported as such.
+ */
+export async function resumeWatchAfterRestart(
+	row: RestartWatchRow,
+	target: ResumableWatchTarget,
+): Promise<boolean> {
+	const adopt: AdoptedWatchRow = {
+		taskId: row.id,
+		alias: row.alias,
+		deadlineAt: restartWatchDeadline(row, target),
+	};
+	// Only the time left: a merge into another re-attached observation must not extend it.
+	const timeout = Math.max(1, adopt.deadlineAt - Date.now());
+	// Authorize as the identity that registered the watch, as its live observation
+	// would, so a user-level revocation still applies and a later collaborator's policy
+	// is never borrowed. A row that does not record it is never re-attached.
+	if (!row.principal) return false;
+	const { narratorService } = await import("./narrator-service");
+	const actor: WatchActor = {
+		narratorId: row.parentNarratorId,
+		signal: new AbortController().signal,
+		userId: row.principal.userId,
+	};
+	await checkObservationAuthorization(actor, target.type);
+	if (target.type === "terminal") return resumeTerminalWatch(row, target.id, adopt, timeout);
+	const input: TaskWatchInput = { type: target.type, id: target.id, timeout };
+	let result: ToolResult;
+	if (target.type === "bash") {
+		const task = await backgroundTaskService.getById(target.id);
+		if (
+			!task ||
+			task.type !== "bash" ||
+			task.parentNarratorId !== row.parentNarratorId ||
+			task.logicalRunId !== target.runId ||
+			task.status !== "running"
+		)
+			return false;
+		result = await observeBashTask(task, input, actor, adopt);
+	} else {
+		const { awaitAgentResultDetailed } = await import("./agent-communication");
+		const narrator = await narratorService.getById(target.id);
+		if (!narrator || narrator.logicalRunId !== target.runId) return false;
+		if (!isTeamMember(narrator, row.parentNarratorId)) return false;
+		const snapshot = await awaitAgentResultDetailed({
+			callerNarratorId: row.parentNarratorId,
+			id: target.id,
+			userId: actor.userId,
+			signal: actor.signal,
+			snapshotOnly: true,
+		});
+		if (snapshot.status !== "running") return false;
+		result = await observeAgentRun(
+			input,
+			actor,
+			{
+				id: narrator.id,
+				label: agentLabelFromNarrator(narrator, row.parentNarratorId),
+				title: narrator.title,
+			},
+			runDeliverToOf(narrator)?.narratorId ?? row.parentNarratorId,
+			target.runId,
+			adopt,
+		);
+	}
+	// A duplicate leftover row merges into an earlier re-attached observation of the same
+	// condition; only the row that owns the live observation counts as re-attached.
+	return result.metadata?.status === "watching" && result.metadata.watchId === row.id;
+}
+
+async function resumeTerminalWatch(
+	row: RestartWatchRow,
+	terminalId: string,
+	adopt: AdoptedWatchRow,
+	timeoutMs: number,
+): Promise<boolean> {
+	const [{ terminalService }, { db }, { terminals }, { eq }] = await Promise.all([
+		import("./terminal-service"),
+		import("../db"),
+		import("../db/schema"),
+		import("drizzle-orm"),
+	]);
+	// Startup reattaches dtach sessions concurrently with narrator recovery; observe the
+	// terminal only once that has settled, so a live session is not reported detached.
+	await terminalService.whenStartupRecoverySettled();
+	const readTerminal = () =>
+		db.query.terminals.findFirst({
+			where: eq(terminals.id, terminalId),
+			columns: { name: true, status: true, narratorId: true },
+		});
+	const terminal = await readTerminal();
+	if (!terminal || terminal.narratorId !== row.parentNarratorId) return false;
+	const buffer = terminalService.getActiveBuffer(terminalId);
+	const started = await startTerminalWatch({
+		narratorId: row.parentNarratorId,
+		terminalId,
+		terminalName: terminal.name,
+		timeoutMs,
+		buffer,
+		readLifecycleState: terminalLifecycleReader(
+			terminalId,
+			buffer,
+			terminalService,
+			async () => (await readTerminal())?.status,
+		),
+		adopt,
+	});
+	return started.status === "started" && started.taskId === row.id;
 }

@@ -444,13 +444,33 @@ test("the options form: model, working directory and a note, which reaches the s
 		await page.click("[data-testid=task-open-session-model]");
 		const option = '[data-testid=task-open-session-form] [role=option][value="__summary__"]';
 		await page.waitForSelector(option, { visible: true });
+		const optionLabel = (await page.$eval(option, (el) => el.textContent ?? "")).trim();
+		// The row reads as a model / role, never the settings sentinel.
+		expect(optionLabel).not.toBe("");
+		expect(optionLabel).not.toContain("__summary__");
 		await page.click(option);
+		// The select's value (Mantine's hidden input beside the visible one) is the sentinel; the
+		// visible input shows the readable label of the picked row.
 		await page.waitForFunction(
-			() =>
-				document.querySelector<HTMLInputElement>("[data-testid=task-open-session-model]")?.value ===
-				"__summary__",
+			() => {
+				const form = document.querySelector("[data-testid=task-open-session-form]");
+				const visible = form?.querySelector<HTMLInputElement>(
+					"[data-testid=task-open-session-model]",
+				);
+				let node = visible?.parentElement ?? null;
+				while (node && form?.contains(node) && !node.querySelector(":scope > input[type=hidden]"))
+					node = node.parentElement;
+				const hidden = node?.querySelector<HTMLInputElement>(":scope > input[type=hidden]");
+				return hidden?.value === "__summary__";
+			},
 			{ timeout: 5_000, polling: 50 },
 		);
+		const shown = await page.$eval(
+			"[data-testid=task-open-session-model]",
+			(el) => (el as HTMLInputElement).value,
+		);
+		expect(shown).toBe(optionLabel);
+		expect(shown).not.toContain("__summary__");
 		expect(await call(page, (f) => f.count("[data-testid=task-open-session-form]"))).toBe(1);
 		expect(
 			await page.$eval(

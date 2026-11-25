@@ -1486,6 +1486,7 @@ export const userRecentTabs = pgTable(
 		folderIcon: text("folder_icon"),
 		folderColor: text("folder_color"),
 		folderPreviewCount: integer("folder_preview_count"),
+		projectId: text("project_id"),
 		title: text("title").notNull(),
 		subtitle: text("subtitle"),
 		status: text("status"),
@@ -2547,6 +2548,7 @@ export const backgroundTasks = pgTable(
 		executionAttempt: integer("execution_attempt"),
 		alias: text("alias"),
 		title: text("title"),
+		principalJson: jsonText("principal_json"),
 		output: text("output"),
 		outputBytes: integer("output_bytes").notNull().default(0),
 		outputTruncated: boolean("output_truncated").notNull().default(false),
@@ -4599,7 +4601,7 @@ export const teamWorkEvents = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 147,
-  "columnCount": 1960,
+  "columnCount": 1962,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -13105,6 +13107,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "property": "projectId",
+          "name": "project_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
           "property": "title",
           "name": "title",
           "kind": "text",
@@ -19346,6 +19357,16 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "property": "title",
           "name": "title",
           "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "principalJson",
+          "name": "principal_json",
+          "kind": "text",
+          "mode": "json",
           "pgType": "text",
           "notNull": false,
           "primary": false,

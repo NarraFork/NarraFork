@@ -25,7 +25,7 @@ const analyze = mock(
 		outputs: { text: string; expected_count: number }[],
 		_locale?: string,
 		_signal?: AbortSignal,
-	): Promise<ModelTraceResultBlock> =>
+	): Promise<ModelTraceResultBlock & { acceptedSampleIndexes?: number[] }> =>
 		outputs[0]?.text.startsWith("[")
 			? ranked
 			: { type: "modeltrace_result", results: [], error: "unscorable" },
@@ -36,7 +36,6 @@ mock.module("@server/lib/modeltrace", () => ({
 	MODELTRACE_MAX_TEXT_LENGTH: 10_000,
 }));
 
-const latestRef = mock(async () => ({ messageId: "latest-parent-message" }));
 const childRow = mock(
 	async (): Promise<{ traits: string[]; status: string; model?: string }> => ({
 		traits: ["modeltrace"],
@@ -63,7 +62,30 @@ const persistAssistant = mock(async (..._args: unknown[]) => ({
 	seq: 21,
 	role: "assistant",
 }));
-const persistDisplay = mock(async (..._args: unknown[]) => ({}));
+function required<T>(value: T | undefined): T {
+	if (value === undefined) throw new Error("Missing test fixture value");
+	return value;
+}
+
+const reports = new Map<string, ModelTraceResultBlock>();
+let reportSequence = 0;
+const persistDisplay = mock(async (id: string, _text: string, blocks: ModelTraceResultBlock[]) => {
+	const messageId = `report-${++reportSequence}`;
+	reports.set(messageId, required(blocks[0]));
+	return { id: messageId, narratorId: id };
+});
+const patchReport = mock((_tx: unknown, id: string, blocks: ModelTraceResultBlock[]) => {
+	if (!reports.has(id)) return false;
+	reports.set(id, required(blocks[0]));
+	return true;
+});
+mock.module("./narrator-body-writes", () => ({
+	writeEnvelopeBody: patchReport,
+	readEnvelope: (_tx: unknown, id: string) =>
+		reports.has(id)
+			? { id, narratorId: "probe", role: "disp", contentJson: [reports.get(id)] }
+			: undefined,
+}));
 const updateConversationId = mock(async (..._args: unknown[]) => true);
 let idle = Promise.withResolvers<void>();
 const status = mock(async (_id: string, state: string, _options?: unknown) => {
@@ -86,10 +108,30 @@ const claim = mock((_id: string, _kind: string) => {
 	claimed = true;
 	return { release, isCurrent: () => true };
 });
+const calibrationRef = mock(
+	async (): Promise<{ id: string } | undefined> => ({ id: "return-ref" }),
+);
 mock.module("@server/db", () => ({
 	db: {
-		query: { narratorMessageRefs: { findFirst: latestRef }, narrators: { findFirst: childRow } },
+		query: {
+			narratorMessageRefs: { findFirst: calibrationRef },
+			narrators: { findFirst: childRow },
+		},
 		update: () => ({ set: updateSet }),
+		transaction: (operation: (tx: unknown) => unknown) => {
+			let lookups = 0;
+			return operation({
+				query: {
+					narratorMessageRefs: {
+						findFirst: () => ({
+							sync: () =>
+								lookups++ === 0 ? { id: "report-ref", narratorId: "probe", seq: 20 } : undefined,
+						}),
+					},
+				},
+				update: () => ({ set: () => ({ where: () => ({ run: () => {} }) }) }),
+			});
+		},
 	},
 }));
 mock.module("./narrator-service", () => ({ narratorService: { forkNarrator: fork } }));
@@ -150,7 +192,10 @@ mock.module("./narrator-acl", () => ({
 	assertNarratorAccess: async () => {},
 }));
 mock.module("@server/websocket/narrator-ws", () => ({ broadcastToNarrator: broadcast }));
-const { startModelTrace, retryModelTrace, cancelModelTrace } = await import("./modeltrace-service");
+const { startModelTrace, retryModelTrace, calibrateModelTrace, cancelModelTrace } = await import(
+	"./modeltrace-service"
+);
+const principal = { userId: "operator", isAdmin: false };
 let received: ChatParams | undefined;
 let events: ParsedStreamEvent[];
 let source: ChatParams;
@@ -165,6 +210,7 @@ beforeEach(() => {
 	woke = Promise.withResolvers<void>();
 	wake.mockClear();
 	claimed = false;
+	reports.clear();
 	received = undefined;
 	events = [
 		{ text: JSON.stringify(Array(300).fill(17)) },
@@ -173,7 +219,8 @@ beforeEach(() => {
 	];
 	for (const fn of [
 		analyze,
-		latestRef,
+		calibrationRef,
+		patchReport,
 		childRow,
 		startRequest,
 		finishRequest,
@@ -234,7 +281,7 @@ afterEach(() => {
 });
 
 function reportedResult(): ModelTraceResultBlock {
-	return (persistDisplay.mock.calls[0]?.[2] as ModelTraceResultBlock[])[0];
+	return required(Array.from(reports.values()).at(-1));
 }
 
 async function complete(options?: Parameters<typeof startModelTrace>[3]) {
@@ -306,7 +353,7 @@ describe("ModelTrace independent single-request probe", () => {
 			skipErrorMessage: true,
 		});
 		expect(finishRequest.mock.calls[0]?.[1]).toMatchObject({
-			errorMessage: reportedResult().error,
+			errorMessage: undefined,
 			usage: { inputTokens: 3, outputTokens: 2 },
 		});
 		expect(getModelTraceRequest("probe")).toBeUndefined();
@@ -503,6 +550,7 @@ describe("ModelTrace independent single-request probe", () => {
 		expect(reportedResult()).toEqual({
 			...ranked,
 			calibrationRequested: false,
+			calibrationId: expect.any(String),
 			cacheReadTokens: [null],
 		});
 		expect(analyze).toHaveBeenCalledTimes(1);
@@ -603,11 +651,17 @@ describe("ModelTrace independent single-request probe", () => {
 			})),
 		);
 		expect(analyze).toHaveBeenCalledTimes(1);
-		expect(reportedResult()).toEqual({
+		expect(reportedResult()).toMatchObject({
 			...ranked,
 			calibrationRequested: true,
 			cacheReadTokens: [0, 12, null],
+			sampleProgress: [
+				{ state: "complete", attempt: 1, text: "[0]" },
+				{ state: "complete", attempt: 1, text: "[1]" },
+				{ state: "complete", attempt: 1, text: "[2]" },
+			],
 		});
+		expect(reportedResult().calibrationId).toBeUndefined();
 		forgetModelTraceRequest("parent");
 		woke = Promise.withResolvers<void>();
 		await retryModelTrace("probe", "retry-operator");
@@ -621,7 +675,7 @@ describe("ModelTrace independent single-request probe", () => {
 	test.each([
 		false,
 		true,
-	])("one round deadline/cancel stops the second calibration sample (timeout=%s)", async (timeout) => {
+	])("one round deadline/cancel stops all active calibration samples (timeout=%s)", async (timeout) => {
 		const active = Promise.withResolvers<void>();
 		const deadlines: Array<() => void> = [];
 		const original = globalThis.setTimeout;
@@ -629,16 +683,14 @@ describe("ModelTrace independent single-request probe", () => {
 			fn: () => void,
 			ms: number,
 		) => {
-			if (ms === 180_000) deadlines.push(fn);
+			if (ms === 1_020_000) deadlines.push(fn);
 			return original(fn, ms);
 		}) as typeof setTimeout);
 		try {
-			chat.mockImplementationOnce(async function* () {
-				yield { text: "[1]", usage: { cachedInputTokens: 64 } };
-			});
-			chat.mockImplementationOnce(async function* () {
+			let stalled = 0;
+			chat.mockImplementation(async function* () {
 				yield { text: "[2", usage: { inputTokens: 17, completionTokens: 2 } };
-				active.resolve();
+				if (++stalled === 3) active.resolve();
 				await new Promise(() => {});
 			});
 			await startModelTrace("parent", "operator", "en", { calibrate: true });
@@ -647,19 +699,239 @@ describe("ModelTrace independent single-request probe", () => {
 			if (timeout) deadlines[0]?.();
 			else expect(cancelModelTrace("probe")).toBe(true);
 			await woke.promise;
-			expect(chat).toHaveBeenCalledTimes(2);
+			expect(chat).toHaveBeenCalledTimes(3);
+			expect(chat.mock.calls.every(([params]) => params.signal.aborted)).toBe(true);
 			expect(analyze).not.toHaveBeenCalled();
 			expect(reportedResult()).toMatchObject({
-				cacheReadTokens: [64, null, null],
+				cacheReadTokens: [null, null, null],
 				calibrationRequested: true,
-				error: timeout ? "ModelTrace timed out (180 seconds)" : "ModelTrace canceled",
+				sampleProgress: Array.from({ length: 3 }, () => ({
+					state: timeout ? "failed" : "cancelled",
+				})),
+				error: timeout ? "ModelTrace timed out (17 minutes)" : "ModelTrace canceled",
 			});
-			expect(finishRequest).toHaveBeenCalledTimes(2);
-			expect(finishRequest.mock.calls[1]?.[1]).toMatchObject({
-				usage: { inputTokens: 17, outputTokens: 2 },
-				errorMessage: reportedResult().error,
-			});
+			expect(finishRequest).toHaveBeenCalledTimes(3);
+			for (const [, final] of finishRequest.mock.calls) {
+				expect(final).toMatchObject({
+					usage: { inputTokens: 17, outputTokens: 2 },
+					errorMessage: reportedResult().error,
+				});
+			}
 			expect(parentController.signal.aborted).toBe(false);
+		} finally {
+			timer.mockRestore();
+		}
+	});
+
+	test("supplements a bound result once, then retries only the missing slot with a new capability", async () => {
+		await complete();
+		const first = required(reportedResult().calibrationId);
+		const child = { traits: ["modeltrace"], status: "idle", model: source.model };
+		childRow.mockResolvedValueOnce({ ...child, model: "changed" });
+		await expect(calibrateModelTrace("probe", first, principal)).rejects.toThrow("target changed");
+		childRow.mockResolvedValueOnce(child);
+		calibrationRef.mockResolvedValueOnce(undefined);
+		await expect(calibrateModelTrace("probe", first, principal)).rejects.toThrow("expired");
+		childRow.mockResolvedValueOnce(child);
+		claimed = true;
+		await expect(calibrateModelTrace("probe", first, principal)).rejects.toThrow(
+			"active execution",
+		);
+		claimed = false;
+		expect(chat).toHaveBeenCalledTimes(1);
+		expect(clearTrace).toHaveBeenCalledTimes(1);
+
+		const active = Promise.withResolvers<void>();
+		const resume = Promise.withResolvers<void>();
+		let started = 0;
+		chat.mockImplementation(async function* (params) {
+			if (++started === 2) active.resolve();
+			await resume.promise;
+			if (params.content === challenges[1]?.prompt) yield { text: "[2]" };
+			else yield { stopReason: "content_filter" };
+		});
+		childRow.mockResolvedValueOnce(child);
+		woke = Promise.withResolvers<void>();
+		await calibrateModelTrace("probe", first, principal);
+		await active.promise;
+		expect(chat.mock.calls.map(([params]) => params.content)).toEqual(
+			challenges.map(({ prompt }) => prompt),
+		);
+		resume.resolve();
+		await woke.promise;
+		const partial = reportedResult();
+		expect(partial.sampleProgress?.map(({ state }) => state)).toEqual([
+			"complete",
+			"complete",
+			"failed",
+		]);
+		const second = required(partial.calibrationId);
+		expect(second).toBeString();
+		expect(second).not.toBe(first);
+		childRow.mockResolvedValueOnce(child);
+		await expect(calibrateModelTrace("probe", first, principal)).rejects.toThrow("expired");
+
+		chat.mockImplementation(async function* () {
+			yield { text: "[3]" };
+		});
+		childRow.mockResolvedValueOnce(child);
+		woke = Promise.withResolvers<void>();
+		await calibrateModelTrace("probe", second, principal);
+		await woke.promise;
+		expect(chat).toHaveBeenCalledTimes(4);
+		expect(chat.mock.calls[3]?.[0].content).toBe(challenges[2]?.prompt);
+		expect(analyze.mock.calls[2]?.[0].map(({ text }) => text)).toEqual([
+			required(events[0]?.text),
+			"[2]",
+			"[3]",
+		]);
+		expect(reportedResult().calibrationId).toBeUndefined();
+		expect(persistAssistant).toHaveBeenCalledTimes(1);
+		expect(finishRequest).toHaveBeenCalledTimes(4);
+	});
+
+	test("SDK-rejected samples can be recollected without rerunning accepted slots", async () => {
+		analyze.mockResolvedValueOnce({ ...ranked, acceptedSampleIndexes: [0, 2] });
+		let sample = 0;
+		chat.mockImplementation(async function* () {
+			yield { text: "[17]", usage: { cachedInputTokens: ++sample } };
+		});
+		await complete({ calibrate: true });
+		const partial = reportedResult();
+		expect(partial).not.toHaveProperty("acceptedSampleIndexes");
+		expect(partial.cacheReadTokens).toEqual([1, 2, 3]);
+		expect(partial.sampleProgress?.map(({ state }) => state)).toEqual([
+			"complete",
+			"failed",
+			"complete",
+		]);
+		const token = required(partial.calibrationId);
+		childRow.mockResolvedValueOnce({ traits: ["modeltrace"], status: "idle", model: source.model });
+		woke = Promise.withResolvers<void>();
+		await calibrateModelTrace("probe", token, principal);
+		await woke.promise;
+		expect(chat.mock.calls.map(([params]) => params.content)).toEqual([
+			...challenges.map(({ prompt }) => prompt),
+			required(challenges[1]).prompt,
+		]);
+		expect(reportedResult().sampleProgress?.every(({ state }) => state === "complete")).toBe(true);
+		expect(reportedResult().cacheReadTokens).toEqual([1, 4, 3]);
+	});
+
+	test("only the transiently failed calibration slot is automatically retried", async () => {
+		const original = globalThis.setTimeout;
+		const timer = spyOn(globalThis, "setTimeout").mockImplementation(((
+			fn: () => void,
+			ms: number,
+		) => original(fn, ms >= 800 && ms <= 1200 ? 0 : ms)) as typeof setTimeout);
+		let failed = false;
+		try {
+			chat.mockImplementation(async function* (params) {
+				if (params.content === challenges[1]?.prompt && !failed) {
+					failed = true;
+					yield {
+						invalidState: {
+							reason: "overloaded",
+							message: "service unavailable",
+							diagnostics: { schema: "narrafork.error-diagnostics.v1", statusCode: 503 },
+						},
+					};
+					return;
+				}
+				yield { text: "[1]" };
+			});
+			await complete({ calibrate: true });
+			expect(chat.mock.calls.map(([params]) => params.content)).toEqual([
+				...challenges.map(({ prompt }) => prompt),
+				required(challenges[1]).prompt,
+			]);
+			expect(reportedResult().sampleProgress?.map(({ attempt }) => attempt)).toEqual([1, 2, 1]);
+			expect(finishRequest).toHaveBeenCalledTimes(4);
+		} finally {
+			timer.mockRestore();
+		}
+	});
+
+	test("age-expired capabilities cannot resubmit or bill a provider request", async () => {
+		await complete();
+		const token = required(reportedResult().calibrationId);
+		const clock = spyOn(Date, "now").mockReturnValue(Date.now() + 31 * 60_000);
+		try {
+			await expect(calibrateModelTrace("probe", token, principal)).rejects.toThrow("expired");
+			expect(chat).toHaveBeenCalledTimes(1);
+			expect(finishRequest).toHaveBeenCalledTimes(1);
+		} finally {
+			clock.mockRestore();
+		}
+	});
+
+	test("a transient single sample gets three jittered retries with distinct streams and billing", async () => {
+		const backoffs: number[] = [];
+		const original = globalThis.setTimeout;
+		const timer = spyOn(globalThis, "setTimeout").mockImplementation(((
+			fn: () => void,
+			ms: number,
+		) => {
+			if (ms >= 800 && ms <= 4800) {
+				backoffs.push(ms);
+				return original(fn, 0);
+			}
+			return original(fn, ms);
+		}) as typeof setTimeout);
+		try {
+			let attempt = 0;
+			chat.mockImplementation(async function* () {
+				attempt++;
+				yield { text: `[${attempt}]`, usage: { inputTokens: attempt } };
+				if (attempt < 4) yield { silentDisconnect: true };
+			});
+			await complete();
+			expect(backoffs).toHaveLength(3);
+			for (const [index, ms] of backoffs.entries()) {
+				const expected = 1000 * 2 ** index;
+				expect(ms).toBeGreaterThanOrEqual(expected * 0.8);
+				expect(ms).toBeLessThanOrEqual(expected * 1.2);
+			}
+			expect(new Set(chat.mock.calls.map(([params]) => params.transportSessionKey)).size).toBe(4);
+			expect(startRequest).toHaveBeenCalledTimes(4);
+			expect(finishRequest).toHaveBeenCalledTimes(4);
+			expect(persistAssistant).toHaveBeenCalledTimes(4);
+			expect(persistDisplay).toHaveBeenCalledTimes(1);
+			expect(analyze.mock.calls[0]?.[0][0]?.text).toBe("[4]");
+			expect(finishRequest.mock.calls.slice(0, 3).map(([, final]) => final)).toEqual(
+				[1, 2, 3].map((inputTokens) =>
+					expect.objectContaining({
+						errorMessage: expect.stringContaining("disconnected"),
+						usage: expect.objectContaining({ inputTokens }),
+					}),
+				),
+			);
+		} finally {
+			timer.mockRestore();
+		}
+	});
+
+	test("manual cancellation aborts a pending retry backoff without starting another attempt", async () => {
+		const backoff = Promise.withResolvers<void>();
+		const original = globalThis.setTimeout;
+		const timer = spyOn(globalThis, "setTimeout").mockImplementation(((
+			fn: () => void,
+			ms: number,
+		) => {
+			if (ms >= 800 && ms <= 1200) backoff.resolve();
+			return original(fn, ms);
+		}) as typeof setTimeout);
+		try {
+			chat.mockImplementation(async function* () {
+				yield { silentDisconnect: true };
+			});
+			await startModelTrace("parent", principal);
+			await backoff.promise;
+			expect(cancelModelTrace("probe")).toBe(true);
+			await woke.promise;
+			expect(chat).toHaveBeenCalledTimes(1);
+			expect(finishRequest).toHaveBeenCalledTimes(1);
+			expect(reportedResult().error).toContain("canceled");
 		} finally {
 			timer.mockRestore();
 		}
@@ -691,7 +963,6 @@ describe("ModelTrace independent single-request probe", () => {
 		["native search", { webSearch: { id: "s", status: "searching" } }],
 		["truncation", { stopReason: "max_tokens" }],
 		["provider error", { invalidState: { reason: "broken", message: "upstream failure" } }],
-		["silent disconnect", { silentDisconnect: true }],
 	] as Array<[string, ParsedStreamEvent]>) {
 		test(`${name} fails without an extra sampling round or a scored report`, async () => {
 			events = [event, { text: JSON.stringify(Array(300).fill(17)) }];
@@ -762,6 +1033,7 @@ describe("ModelTrace independent single-request probe", () => {
 		expect(reportedResult()).toEqual({
 			...ranked,
 			calibrationRequested: false,
+			calibrationId: expect.any(String),
 			cacheReadTokens: [null],
 		});
 	});
@@ -844,7 +1116,7 @@ describe("ModelTrace independent single-request probe", () => {
 			fn: () => void,
 			ms: number,
 		) => {
-			if (ms === 180_000) deadlines.push(fn);
+			if (ms === 1_020_000) deadlines.push(fn);
 			return original(fn, ms);
 		}) as typeof setTimeout);
 		try {
@@ -862,7 +1134,7 @@ describe("ModelTrace independent single-request probe", () => {
 			if (timeout) deadlines[0]?.();
 			else expect(cancelModelTrace("probe")).toBe(true);
 			await woke.promise;
-			const errorMessage = timeout ? "ModelTrace timed out (180 seconds)" : "ModelTrace canceled";
+			const errorMessage = timeout ? "ModelTrace timed out (17 minutes)" : "ModelTrace canceled";
 			expect(reportedResult()).toEqual({
 				type: "modeltrace_result",
 				results: [],
@@ -878,9 +1150,44 @@ describe("ModelTrace independent single-request probe", () => {
 			expect(finishRequest.mock.calls[0]?.[1]).toMatchObject({
 				messageId: "assistant-row",
 				usage: { inputTokens: 42, outputTokens: 99 },
-				errorMessage,
+				errorMessage: undefined,
 			});
 			expect(release).toHaveBeenCalledTimes(1);
+		} finally {
+			timer.mockRestore();
+		}
+	});
+
+	test("each 240-second attempt timeout aborts a stalled adapter, with a maximum of four attempts", async () => {
+		const original = globalThis.setTimeout;
+		let deadlineCount = 0;
+		const timer = spyOn(globalThis, "setTimeout").mockImplementation(((
+			fn: () => void,
+			ms: number,
+		) => {
+			if (ms === 240_000) {
+				deadlineCount++;
+				return original(fn, 1);
+			}
+			return original(fn, ms >= 800 && ms <= 4800 ? 0 : ms);
+		}) as typeof setTimeout);
+		try {
+			chat.mockImplementation(
+				() =>
+					({
+						next: () => new Promise(() => {}),
+						return: async () => ({ done: true, value: undefined }),
+					}) as unknown as AsyncGenerator<ParsedStreamEvent>,
+			);
+			await complete();
+			expect(deadlineCount).toBe(4);
+			expect(chat).toHaveBeenCalledTimes(4);
+			expect(chat.mock.calls.every(([params]) => params.signal.aborted)).toBe(true);
+			expect(finishRequest.mock.calls).toHaveLength(4);
+			expect(reportedResult().error).toBe("ModelTrace attempt timed out (240 seconds)");
+			for (const [, billing] of finishRequest.mock.calls) {
+				expect(billing).toMatchObject({ errorMessage: reportedResult().error });
+			}
 		} finally {
 			timer.mockRestore();
 		}
@@ -891,7 +1198,7 @@ describe("ModelTrace independent single-request probe", () => {
 		const timer = spyOn(globalThis, "setTimeout").mockImplementation(((
 			fn: () => void,
 			ms: number,
-		) => original(fn, ms === 180_000 ? 1 : ms)) as typeof setTimeout);
+		) => original(fn, ms === 1_020_000 ? 1 : ms)) as typeof setTimeout);
 		try {
 			chat.mockImplementation(
 				() =>

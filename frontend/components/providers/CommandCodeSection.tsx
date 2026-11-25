@@ -47,6 +47,7 @@ import { ClientFingerprintFields } from "./ClientFingerprintFields";
 import { type CustomModelEntry, InlineCustomModels } from "./InlineCustomModels";
 import { ModelList, type ModelListItem } from "./ModelList";
 import { COMMAND_CODE_PROTOCOL_OPTIONS } from "./ModelProtocolSelect";
+import { ProviderKeysPanel } from "./ProviderKeysPanel";
 import type { CommandCodeState } from "./providers-reducer";
 import type { CustomApiProtocol } from "./types";
 
@@ -72,6 +73,8 @@ export interface CommandCodeSectionProps {
 	/** settings.commandCode 的草稿镜像。 */
 	value: CommandCodeState;
 	onChange: (config: CommandCodeState) => void;
+	/** The page rebases this immediately persisted field into its discard baseline. */
+	onPersistedKeyChanged?: (apiKey: string) => void;
 	/** 启用开关：平台 provider 的开关统一走草稿入口（见 PLATFORM_PROVIDER_PREFIXES）。 */
 	onToggleDisabled: () => void;
 	/** 已带 `commandcode:` 前缀的模型选项。 */
@@ -92,6 +95,7 @@ export interface CommandCodeSectionProps {
 export function CommandCodeSection({
 	value,
 	onChange,
+	onPersistedKeyChanged,
 	onToggleDisabled,
 	models: modelItems,
 	hiddenModels,
@@ -181,6 +185,11 @@ export function CommandCodeSection({
 					type="password"
 					value={value.apiKey}
 					onChange={(event) => onChange({ ...value, apiKey: event.currentTarget.value })}
+				/>
+				<ProviderKeysPanel
+					key="CommandCode"
+					providerId="CommandCode"
+					onFirstKeyChanged={onPersistedKeyChanged}
 				/>
 				<Anchor
 					size="xs"

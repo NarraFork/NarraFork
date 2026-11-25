@@ -26,7 +26,7 @@ const { keyCooldown, resetProviderKeyRuntimeForTests, selectProviderKey } = awai
 const { keyQuotaBlockedUntil } = await import("../provider-key-quota");
 const { saveSettings, settings } = await import("../settings");
 const { quotaStore } = await import("../sourcing/quota-store");
-const { refreshQuotaSnapshots } = await import("../sourcing/quota-snapshots");
+const { readQuotaSnapshots, refreshQuotaSnapshots } = await import("../sourcing/quota-snapshots");
 const { getKimiKeyUsages, getKimiCachedUsage, parseKimiUsagesResponse, refreshKimiKeyUsage } =
 	await import("../kimi-usage-cache");
 const {
@@ -35,9 +35,12 @@ const {
 	refreshOpencodeKeyUsage,
 	syncOpencodeUsageCache,
 } = await import("../opencode-usage-cache");
-const { getDeepSeekQuotaSnapshot, refreshDeepSeekBalance, syncDeepSeekBalanceCache } = await import(
-	"../deepseek-balance-cache"
-);
+const {
+	getDeepSeekQuotaSnapshot,
+	isDeepSeekQuotaRefreshing,
+	refreshDeepSeekBalance,
+	syncDeepSeekBalanceCache,
+} = await import("../deepseek-balance-cache");
 const { probeRelayQuota } = await import("../provider-balance-cache");
 const { firstCredential } = await import("../provider-key-subjects");
 
@@ -383,6 +386,67 @@ describe("DeepSeek quota probe", () => {
 		expect(quotaStore.peek(second.id)?.balances[0]?.remaining).toBe(12.5);
 		expect(quotaStore.peek(config.id)).toBeUndefined();
 		expect(getDeepSeekQuotaSnapshot(config.id, second.id)?.balances).toHaveLength(1);
+	});
+
+	test("second-key DeepSeek probes use the selected key and route without replacing the first view", async () => {
+		const config = useProvider(provider("ds-per-key", "https://api.deepseek.com/v1"));
+		const store = getProviderKeyStore();
+		const second = store.add(config.id, {
+			apiKey: "sk-two",
+			network: { proxy: { mode: "custom", url: "http://second.proxy:8080" } },
+		});
+		const balance = (amount: string) =>
+			Response.json({
+				is_available: true,
+				balance_infos: [
+					{
+						currency: "USD",
+						total_balance: amount,
+						granted_balance: "0",
+						topped_up_balance: amount,
+					},
+				],
+			});
+		respond = async () => balance("9");
+		await refreshDeepSeekBalance(config.id);
+		const gate = Promise.withResolvers<Response>();
+		respond = async (_url, init, transport) => {
+			expect(new Headers(init.headers).get("Authorization")).toBe("Bearer sk-two");
+			expect(transport?.proxyUrl).toBe("http://second.proxy:8080");
+			return gate.promise;
+		};
+		const probing = refreshQuotaSnapshots({ groupId: config.id, credentialId: second.id });
+		expect(isDeepSeekQuotaRefreshing(config.id, second.id)).toBe(true);
+		expect(isDeepSeekQuotaRefreshing(config.id)).toBe(false);
+		expect(
+			readQuotaSnapshots(true, false).entries.find((entry) => entry.credentialId === second.id)
+				?.refreshing,
+		).toBe(true);
+		gate.resolve(balance("20"));
+		await probing;
+		expect(getDeepSeekQuotaSnapshot(config.id)?.balances[0]?.remaining).toBe(9);
+		expect(
+			readQuotaSnapshots(true, false).entries.find((entry) => entry.credentialId === second.id)
+				?.snapshot?.balances[0]?.remaining,
+		).toBe(20);
+		for (const change of ["network", "headers", "key"] as const) {
+			const late = Promise.withResolvers<Response>();
+			respond = async () => late.promise;
+			const stale = refreshQuotaSnapshots({ groupId: config.id, credentialId: second.id });
+			if (change === "network") store.update(second.id, { network: { proxy: { mode: "direct" } } });
+			else if (change === "headers")
+				store.update(second.id, {
+					network: { proxy: { mode: "direct" }, extraHeaders: { "X-Key-Route": "new" } },
+				});
+			else store.update(second.id, { apiKey: "sk-replaced" });
+			expect(getDeepSeekQuotaSnapshot(config.id, second.id)).toBeUndefined();
+			respond = async () => balance("30");
+			await refreshQuotaSnapshots({ groupId: config.id, credentialId: second.id });
+			late.resolve(balance("99"));
+			await stale;
+			expect(getDeepSeekQuotaSnapshot(config.id, second.id)?.balances[0]?.remaining).toBe(30);
+			expect(getDeepSeekQuotaSnapshot(config.id)?.balances[0]?.remaining).toBe(9);
+		}
 	});
 
 	test("the balance request uses the first key's own proxy", async () => {

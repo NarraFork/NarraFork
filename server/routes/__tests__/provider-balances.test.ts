@@ -7,7 +7,7 @@ import { AppError } from "../../lib/errors";
 import { getNarraforkPath } from "../../lib/narrafork-home";
 import * as outbound from "../../lib/net/outbound-fetch";
 import { providerBalanceCache } from "../../lib/provider-balance-cache";
-import { streamQuotaIdentity } from "../../lib/provider-key-subjects";
+import { streamQuotaIdentityForRequest } from "../../lib/provider-key-subjects";
 import { getProviderKeyStore } from "../../lib/provider-keys";
 import { type CustomApiProviderConfig, saveSettings, settings } from "../../lib/settings";
 import { quotaKeyOwner } from "../../lib/settings/provider-keys-projection";
@@ -130,7 +130,7 @@ describe("relay balance through the unified quota API", () => {
 						daily_limit_usd: 10,
 						daily_usage_usd: 2,
 						weekly_limit_usd: 50,
-						weekly_usage_usd: 4,
+						weekly_usage_usd: 50,
 						monthly_limit_usd: 0,
 						monthly_usage_usd: 0,
 						weekly_window_start: "2026-10-19T00:00:00Z",
@@ -159,25 +159,16 @@ describe("relay balance through the unified quota API", () => {
 						{
 							kind: "weekly",
 							label: "weekly",
-							usedRatio: 0.08,
+							usedRatio: 1,
 							resetsAt: null,
-							used: 4,
+							used: 50,
 							total: 50,
-							remaining: 46,
-							unit: "USD",
-						},
-						{
-							kind: "monthly",
-							label: "monthly",
-							usedRatio: null,
-							resetsAt: null,
-							used: 0,
-							total: 0,
 							remaining: 0,
 							unit: "USD",
 						},
 					],
 				});
+				expect(snapshot?.windows.some((window) => window.kind === "monthly")).toBe(false);
 				if (expiresAt !== undefined) {
 					expect(snapshot?.expiresAt).toBe(expiresAt);
 					expect((snapshot?.expiresAt ?? Infinity) <= Date.now()).toBe(expiry === "past");
@@ -192,23 +183,21 @@ describe("relay balance through the unified quota API", () => {
 		const store = getProviderKeyStore();
 		const first = store.list(config().id)[0];
 		const second = store.add(config().id, { apiKey: "second-relay-secret" });
-		store.update(first.id, { disabled: true });
 		try {
 			const provider = settings.customApiProviders?.find((p) => p.id === config().id);
 			if (!provider) throw new Error("missing provider");
-			updateCustomApiQuotaByPrefix(provider.prefix, "3", null, streamQuotaIdentity(provider));
-			quotaStore.set(
-				second.id,
-				JSON.stringify([provider.baseUrl, second.apiKey]),
-				{
-					fetchedAt: Date.now(),
-					scope: "key",
-					windows: [],
-					balances: [{ unit: "", remaining: 7 }],
-					detail: { quotaBalance: "7", detailedQuotaBalance: null },
-				},
-				false,
-				STREAM_QUOTA_SOURCE,
+			updateCustomApiQuotaByPrefix(
+				provider.prefix,
+				"3",
+				null,
+				streamQuotaIdentityForRequest(provider.prefix, { credentialId: first.id }),
+			);
+			store.update(first.id, { disabled: true });
+			updateCustomApiQuotaByPrefix(
+				provider.prefix,
+				"7",
+				null,
+				streamQuotaIdentityForRequest(provider.prefix, { credentialId: second.id }),
 			);
 			await providerBalanceCache.request(provider.id);
 			const admin = (await (
@@ -220,9 +209,10 @@ describe("relay balance through the unified quota API", () => {
 					?.primary,
 			).toBe(false);
 			expect(
-				entries.find((entry) => entry.credentialId === first.id && entry.source === "quota_balance")
-					?.primary,
-			).toBe(false);
+				entries
+					.filter((entry) => entry.credentialId === first.id)
+					.every((entry) => entry.primary === false),
+			).toBe(true);
 			expect(
 				entries.find((entry) => entry.credentialId === second.id && entry.source === "probe"),
 			).toMatchObject({ primary: true, snapshot: { balances: [{ unit: "USD", remaining: 12 }] } });

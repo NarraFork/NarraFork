@@ -49,6 +49,12 @@ interface ExitPlanReflectionMeta {
 	abortController?: AbortController;
 	/** Original persisted start time when restoring this gate. */
 	restoredStartedAt?: string;
+	/**
+	 * Started on demand against an ExitPlanMode permission that is already waiting (计划反思 button
+	 * or switch). Such a review is transient: it never writes the tool-call row, which stays the
+	 * person's pending approval (panel visibility and restart recovery read it as such).
+	 */
+	onDemand?: boolean;
 }
 
 interface ExitPlanReflectionPending extends ExitPlanReflectionMeta {
@@ -174,7 +180,12 @@ async function markExitPlanReflectionStatus(
 ): Promise<void> {
 	const message = statusReason(status, reason);
 	try {
-		const toolCallId = await resolveExitPlanReflectionToolCallId(pending);
+		// An on-demand review runs against a permission that is ALREADY waiting for a person, and
+		// that row belongs to the person's approval: its state (pending/decided), its visibility
+		// in the panel and its restart recovery all read the row. The review therefore persists
+		// nothing there; its verdict reaches the row through `resolvePermission`, and live clients
+		// follow it through the frames below.
+		const toolCallId = pending.onDemand ? null : await resolveExitPlanReflectionToolCallId(pending);
 		if (toolCallId) {
 			const { eq } = await import("drizzle-orm");
 			const { db } = await import("@server/db");
@@ -387,6 +398,37 @@ export async function takeOverExitPlanReflection(
 	// This synthetic gate is NOT approvable; the subsequent real permission registration
 	// sends its own invalidation once it is discoverable.
 	notifyHumanAttentionChanged();
+	return true;
+}
+
+/**
+ * Drop a gate whose wait ended elsewhere, WITHOUT persisting anything.
+ *
+ * For a review started against an ExitPlanMode permission that is ALREADY pending
+ * (`runPendingExitPlanReflection` in loop.ts): the tool-call row belongs to whoever ended that
+ * wait — the person's approve/deny, or the pass's own abort. Writing this gate's
+ * `cancelled`/`awaiting_user` status over the row would overwrite that decision (status, error,
+ * input and suggestions). Live clients still get a terminal frame so the review's progress clears.
+ */
+export function discardExitPlanReflection(requestId: string, reason: string): boolean {
+	const pending = pendingExitPlanReflections.get(requestId);
+	if (!pending || pending.resolved) return false;
+	pending.resolved = true;
+	pending.abortController?.abort(new Error(reason));
+	if (pendingExitPlanReflections.delete(requestId)) notifyHumanAttentionChanged();
+	void import("@server/services/reflection-broadcast")
+		.then(({ broadcastReflectionFrame }) => {
+			broadcastReflectionFrame(pending, {
+				type: "plan_reflection_resolved",
+				requestId: pending.requestId,
+				toolUseId: pending.toolUseId,
+				decision: "aborted",
+				reason,
+			});
+		})
+		.catch(() => {
+			// Broadcast is best-effort; the real permission's own resolution follows.
+		});
 	return true;
 }
 

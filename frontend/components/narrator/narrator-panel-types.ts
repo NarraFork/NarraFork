@@ -99,6 +99,8 @@ export interface PermissionCallbacks {
 	onQuestionSubmit: (requestId: string, answers: Record<string, string>) => void;
 	onQuestionReflect: (requestId: string) => Promise<void> | void;
 	onQuestionDeny: (requestId: string) => void;
+	/** Run one plan reflection for a plan that is already waiting for approval. */
+	onPlanReflect?: (requestId: string) => Promise<void> | void;
 	/** Release the blocked loop and move the question to the async inbox. */
 	onQuestionDefer?: (requestId: string) => Promise<void> | void;
 	/**
@@ -203,6 +205,11 @@ export interface NarratorPanelProps {
 	specPanelOpen?: boolean;
 	/** Toggle the spec panel (desktop sidebar mode) */
 	onToggleSpecPanel?: () => void;
+	/**
+	 * What a read-only viewer sees in place of the composer; omitted keeps the session's own
+	 * notice. The team page says 「你是只读成员」 here.
+	 */
+	readOnlyNotice?: string;
 }
 
 export const MAX_IMAGE_SIZE = 20 * 1024 * 1024; // 20MB

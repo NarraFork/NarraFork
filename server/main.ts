@@ -1357,6 +1357,16 @@ async function initializeDatabaseStartup(): Promise<void> {
 						restoreOrdinaryRestartRecovery(ordinaryRestart),
 					])
 				: [];
+			// A notice can be durable in the mailbox while its post-commit wake was lost to
+			// the previous process. Re-probe those recipients once recovery owners are mounted.
+			if (automaticResumeEnabled())
+				void import("./services/agent-runtime/inbox")
+					.then(({ wakeQueuedTaskNoticeRecipientsOnStartup }) =>
+						wakeQueuedTaskNoticeRecipientsOnStartup(),
+					)
+					.catch((err) =>
+						logger.warn("Startup task-notice wake reconciliation failed", { error: String(err) }),
+					);
 			const completions = recoveryHandles.flatMap((handle) => (handle ? [handle.completion] : []));
 			if (completions.length) startupReadiness.markRecovering();
 			else startupReadiness.markReady();
@@ -2237,6 +2247,9 @@ async function performGracefulShutdown(
 				),
 				import("./lib/share-preview-html").then((owner) => owner.closeSharePreviewHtmlWorkers()),
 				import("./lib/agent/request-json").then((owner) => owner.closeRequestJsonWorkers()),
+				import("./lib/agent/structural/worker-client").then((owner) =>
+					owner.closeStructuralWorkers(),
+				),
 				import("./services/gen-ui/compiler").then((owner) => owner.closeGenUiCompilerWorkers()),
 				import("./lib/agent/execution/local-backend").then((owner) =>
 					owner.closeLocalGlobWorkers(),

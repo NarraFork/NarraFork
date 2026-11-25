@@ -47,6 +47,7 @@ import {
 	TOKENDANCE_KEY_OWNER,
 } from "../provider-keys";
 import { settings } from "../settings";
+import { STREAM_QUOTA_SOURCE } from "./quota-store";
 import { listSourceGroups, type SourceGroupView } from "./source-groups";
 import { getServiceTemplate } from "./templates";
 
@@ -118,17 +119,15 @@ function directSnapshot(group: SourceGroupView, id: string): QuotaSnapshot | und
 		case "deepseek":
 			return getDeepSeekQuotaSnapshot(group.id, id);
 		case "nug": {
-			const quota = getNugQuotaSnapshot(group.id);
+			const quota = getNugQuotaSnapshot(group.id, id);
 			return quota?.credentialId === id ? quota.snapshot : undefined;
 		}
 		case "tokendance": {
 			const quota = getTokenDanceQuotaSnapshot();
 			return quota?.credentialId === id ? quota.snapshot : undefined;
 		}
-		case "command-code": {
-			const quota = getCommandCodeQuotaSnapshot();
-			return quota?.credentialId === id ? quota.snapshot : undefined;
-		}
+		case "command-code":
+			return getCommandCodeQuotaSnapshot(id)?.snapshot;
 		default: {
 			const quota = providerBalanceCache.quotaSnapshot(group.id);
 			return quota?.credentialId === id ? quota.snapshot : undefined;
@@ -144,15 +143,15 @@ function sourceRefreshing(group: SourceGroupView, id: string | null): boolean {
 		case "opencode-go":
 			return !!id && isOpencodeQuotaRefreshing(id);
 		case "deepseek":
-			return isDeepSeekQuotaRefreshing(group.id);
+			return isDeepSeekQuotaRefreshing(group.id, id ?? undefined);
 		case "nug":
-			return isNugQuotaRefreshing(group.id);
+			return isNugQuotaRefreshing(group.id, id ?? undefined);
 		case "tokendance":
 			return isTokenDanceQuotaRefreshing();
 		case "command-code":
-			return isCommandCodeQuotaRefreshing();
+			return isCommandCodeQuotaRefreshing(id ?? undefined);
 		default:
-			return false;
+			return providerBalanceCache.isRefreshing(group.id, id ?? undefined);
 	}
 }
 
@@ -230,7 +229,10 @@ export function readQuotaSnapshots(
 	for (const group of listSourceGroups()) {
 		const template = getServiceTemplate(group.templateId);
 		const ids = credentialIds(group);
-		const selected = providerBalanceCache.quotaSnapshot(group.id)?.credentialId;
+		const selected =
+			group.templateId === "tokendance"
+				? getTokenDanceQuotaSnapshot()?.credentialId
+				: providerBalanceCache.quotaSnapshot(group.id)?.credentialId;
 		let shown = ids;
 		if (!isAdmin) {
 			// The old ordinary-user endpoints showed one credential per provider, not the pool.
@@ -284,7 +286,11 @@ export function readQuotaSnapshots(
 			// Use the stream's identity-checked accessor, never quotaStore.peek or the probe slot.
 			const streamId = id;
 			const stream =
-				streamId && !group.disabled ? getCustomApiQuotaSnapshot(group.id, streamId) : undefined;
+				streamId && !group.disabled
+					? group.templateId === "nug"
+						? getNugQuotaSnapshot(group.id, streamId, STREAM_QUOTA_SOURCE)?.snapshot
+						: getCustomApiQuotaSnapshot(group.id, streamId)
+					: undefined;
 			if (stream)
 				entries.push({
 					...base,

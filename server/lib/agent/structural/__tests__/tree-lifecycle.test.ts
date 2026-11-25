@@ -111,13 +111,17 @@ describeWithGrammar("parse tree lifecycle", () => {
 		expect(violations).toEqual([]);
 	});
 
-	test("repeated parses of the same content reuse the cache instead of reparsing", async () => {
+	test("repeated cached outlines cross the worker boundary as independent plain data", async () => {
 		clearOutlineCache();
 		const first = await treeSitterProvider.outline(doc());
 		const second = await treeSitterProvider.outline(doc());
-		// Same array identity proves the second call never reached the parser — and
-		// therefore never allocated (or needed to free) a second tree.
-		expect(second).toBe(first);
+		// Worker cache identity stays on its own heap. Replies must be independent
+		// structured clones, so mutating one caller's result cannot poison the cache.
+		expect(second).toEqual(first);
+		expect(second).not.toBe(first);
+		first[0].name = "mutated by caller";
+		const third = await treeSitterProvider.outline(doc());
+		expect(third).toEqual(second);
 	});
 
 	test("imports also completes before its tree is freed", async () => {

@@ -3,13 +3,13 @@ import { identifyService } from "@shared/sourcing/identify";
 import { outboundFetch } from "./net/outbound-fetch";
 import { resolveProxyForUrl } from "./net/proxy";
 import { firstCredential, type UsageSubject } from "./provider-key-subjects";
+import { getProviderKeyStore, withProviderKey } from "./provider-keys";
 import { type CustomApiProviderConfig, settings } from "./settings";
 import { importLegacyQuotaCache, quotaStore } from "./sourcing/quota-store";
 
 /**
- * DeepSeek account balance. One balance per provider, kept in the shared quota store under
- * the provider's first credential (the key settings shows), as §15.4 places provider-level
- * quotas; this module owns scheduling and identity-checked publication.
+ * DeepSeek account balances, stored and scheduled per credential. Omitting a credential id
+ * preserves the historical first-key view; this module owns every request and identity check.
  */
 
 export interface DeepSeekBalanceCache {
@@ -31,7 +31,7 @@ const FETCH_TIMEOUT_MS = 15_000;
 
 interface Entry {
 	identity: string;
-	/** Where the snapshot is stored: the provider's first credential. */
+	providerId: string;
 	credentialId: string;
 	inFlight?: Promise<DeepSeekBalanceCache | null>;
 	controller?: AbortController;
@@ -108,19 +108,34 @@ function cacheOf(entry: Entry): DeepSeekBalanceCache {
 	};
 }
 
-export const isDeepSeekQuotaRefreshing = (providerId: string): boolean =>
-	!!entries.get(providerId)?.inFlight;
+function balanceSubject(providerId: string, credentialId?: string): UsageSubject | undefined {
+	const config = settings.customApiProviders?.find((provider) => provider.id === providerId);
+	if (!config || !isDeepSeekCustomApiProvider(config)) return;
+	if (credentialId === undefined) return firstCredential(config);
+	const keys = getProviderKeyStore().list(providerId);
+	const key = keys.find((entry) => entry.id === credentialId);
+	return key
+		? { id: key.id, providerId, config: withProviderKey(config, key) }
+		: keys.length === 0 && credentialId === providerId
+			? { id: providerId, providerId, config }
+			: undefined;
+}
 
-/** The provider probe belongs only to its current first credential. */
+export function isDeepSeekQuotaRefreshing(providerId: string, credentialId?: string): boolean {
+	syncDeepSeekBalanceCache();
+	const subject = balanceSubject(providerId, credentialId);
+	return !!subject && !!entries.get(subject.id)?.inFlight;
+}
+
+/** Explicit keys are independent; callers without an id retain the first-key view. */
 export function getDeepSeekQuotaSnapshot(
 	providerId: string,
-	credentialId: string,
+	credentialId?: string,
 ): QuotaSnapshot | undefined {
 	syncDeepSeekBalanceCache();
-	const entry = entries.get(providerId);
-	return entry?.credentialId === credentialId
-		? quotaStore.get(credentialId, entry.identity, restoreSnapshot)
-		: undefined;
+	const subject = balanceSubject(providerId, credentialId);
+	const entry = subject && entries.get(subject.id);
+	return entry ? quotaStore.get(entry.credentialId, entry.identity, restoreSnapshot) : undefined;
 }
 
 /** Never-fetched numbers are not worth a disk write. */
@@ -149,7 +164,8 @@ export function isDeepSeekCustomApiProvider(config: {
 	return !config.disabled && identifyService(config).templateId === "deepseek";
 }
 
-function identity(config: CustomApiProviderConfig): string {
+function identity(config: CustomApiProviderConfig, credentialId?: string): string {
+	const network = credentialId ? getProviderKeyStore().get(credentialId)?.network : undefined;
 	return JSON.stringify([
 		config.baseUrl,
 		config.protocol,
@@ -157,6 +173,7 @@ function identity(config: CustomApiProviderConfig): string {
 		config.proxy,
 		config.tlsRejectUnauthorized,
 		settings.proxy,
+		...(network ? [network] : []),
 	]);
 }
 
@@ -165,52 +182,64 @@ let legacyImported = false;
 /** Reconcile on every read/refresh as well as settings writes. Old requests lose
  * their entry token, so even an abort-ignoring transport cannot publish a result. */
 export function syncDeepSeekBalanceCache(): void {
-	// The balance is probed with the first credential's effective config, so a proxy set on
-	// that key applies here exactly as it does to inference.
-	const providers = new Map<string, { config: CustomApiProviderConfig; credentialId: string }>(
-		(settings.customApiProviders ?? [])
-			.filter((p) => isDeepSeekCustomApiProvider(p) && p.apiKey)
-			.map((p) => {
-				const credential = firstCredential(p);
-				return [p.id, { config: credential.config, credentialId: credential.id }];
-			}),
+	const providers = (settings.customApiProviders ?? []).filter(isDeepSeekCustomApiProvider);
+	const subjects = new Map<string, UsageSubject>(
+		providers.flatMap((provider) => {
+			const keys = getProviderKeyStore().list(provider.id);
+			const selected = keys.length
+				? keys.map((key) => ({
+						id: key.id,
+						providerId: provider.id,
+						config: withProviderKey(provider, key),
+					}))
+				: provider.apiKey
+					? [firstCredential(provider)]
+					: [];
+			return selected.map((subject) => [subject.id, subject] as const);
+		}),
 	);
 	if (!legacyImported) {
 		legacyImported = true;
 		void importLegacyQuotaCache(
 			LEGACY_FILE,
 			parsePersistedBalance,
-			[...providers].map(([id, p]) => ({
-				legacyKey: id,
-				id: p.credentialId,
-				// Legacy files were keyed by the provider config, before per-key networks applied.
-				identity: identity(settings.customApiProviders?.find((c) => c.id === id) ?? p.config),
-				storeIdentity: identity(p.config),
-			})),
+			providers
+				.filter((provider) => provider.apiKey)
+				.map((provider) => {
+					const first = firstCredential(provider);
+					return {
+						legacyKey: provider.id,
+						id: first.id,
+						// Legacy files belong only to the historical first credential.
+						identity: identity(provider),
+						storeIdentity: identity(first.config, first.id),
+					};
+				}),
 			(balance) => (balance.isAvailable === null ? null : deepseekSnapshot(balance)),
 		);
 	}
 	for (const [id, entry] of entries) {
-		const provider = providers.get(id);
+		const subject = subjects.get(id);
 		if (
-			!provider ||
-			identity(provider.config) !== entry.identity ||
-			provider.credentialId !== entry.credentialId
+			!subject ||
+			identity(subject.config, subject.id) !== entry.identity ||
+			subject.providerId !== entry.providerId
 		) {
 			entries.delete(id);
 			entry.controller?.abort();
-			if (provider) quotaStore.forget(entry.credentialId);
+			if (subject) quotaStore.forget(entry.credentialId);
 			else quotaStore.remove(entry.credentialId);
 		}
 	}
-	for (const [id, { config, credentialId }] of providers) {
+	for (const [id, subject] of subjects) {
 		if (!entries.has(id)) {
 			entries.set(id, {
-				identity: identity(config),
-				credentialId,
+				identity: identity(subject.config, subject.id),
+				providerId: subject.providerId,
+				credentialId: subject.id,
 			});
 			// Restore synchronously, as the old entry-creation did.
-			quotaStore.get(credentialId, identity(config), restoreSnapshot);
+			quotaStore.get(id, identity(subject.config, subject.id), restoreSnapshot);
 		}
 	}
 }
@@ -298,17 +327,16 @@ async function fetchBalance(
 	}
 }
 
-export function refreshDeepSeekBalance(providerId: string): Promise<DeepSeekBalanceCache | null> {
+export function refreshDeepSeekBalance(
+	providerId: string,
+	credentialId?: string,
+): Promise<DeepSeekBalanceCache | null> {
 	syncDeepSeekBalanceCache();
-	const entry = entries.get(providerId);
-	const config = settings.customApiProviders?.find((p) => p.id === providerId);
-	if (!entry || !config) return Promise.resolve(null);
+	const subject = balanceSubject(providerId, credentialId);
+	const entry = subject && entries.get(subject.id);
+	if (!entry || !subject?.config.apiKey) return Promise.resolve(null);
 	if (entry.inFlight) return entry.inFlight;
-	const credential = {
-		id: entry.credentialId,
-		providerId,
-		config: structuredClone(firstCredential(config).config),
-	};
+	const credential = { ...subject, config: structuredClone(subject.config) };
 	const controller = new AbortController();
 	entry.controller = controller;
 	entry.inFlight = (async () => {
@@ -325,11 +353,11 @@ export function refreshDeepSeekBalance(providerId: string): Promise<DeepSeekBala
 				cancelled,
 			]);
 			syncDeepSeekBalanceCache();
-			if (entries.get(providerId) !== entry) return null;
+			if (entries.get(credential.id) !== entry) return null;
 			quotaStore.set(entry.credentialId, entry.identity, fresh);
 		} catch {
 			syncDeepSeekBalanceCache();
-			if (entries.get(providerId) !== entry) return null;
+			if (entries.get(credential.id) !== entry) return null;
 			// Never copy transport exceptions, response text, or credentials to logs/API.
 			const previous = cacheOf(entry);
 			store(entry, {
@@ -349,7 +377,11 @@ export function refreshDeepSeekBalance(providerId: string): Promise<DeepSeekBala
 
 export async function refreshAllDeepSeekBalances(): Promise<void> {
 	syncDeepSeekBalanceCache();
-	await Promise.allSettled([...entries.keys()].map(refreshDeepSeekBalance));
+	await Promise.allSettled(
+		[...entries.values()].map((entry) =>
+			refreshDeepSeekBalance(entry.providerId, entry.credentialId),
+		),
+	);
 }
 
 export async function refreshStaleDeepSeekBalances(
@@ -363,6 +395,6 @@ export async function refreshStaleDeepSeekBalances(
 				const { fetchedAt } = cacheOf(entry);
 				return !fetchedAt || now - fetchedAt >= maxAgeMs;
 			})
-			.map(([id]) => refreshDeepSeekBalance(id)),
+			.map(([, entry]) => refreshDeepSeekBalance(entry.providerId, entry.credentialId)),
 	);
 }

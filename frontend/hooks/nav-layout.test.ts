@@ -5,7 +5,7 @@ import {
 	DEFAULT_NAV_ENTRIES,
 	mergeNavLayout,
 	projectNavLayout,
-	restoreRetiredNavEntries,
+	restoreWithheldNavEntries,
 	toPersistedNavLayout,
 } from "./nav-layout";
 
@@ -38,9 +38,9 @@ describe("nav layout defaults", () => {
 		expect(CUSTOMIZABLE_NAV_ITEMS.find((def) => def.id === "learn")?.to).toBe("/learn");
 	});
 
-	it("keeps the historical project preference but removes its presentation", () => {
+	it("surfaces projects: it is the only way to the project pages and their teams", () => {
 		expect(split(DEFAULT_NAV_ENTRIES).visible).toContain("projects");
-		expect(split(projectNavLayout(DEFAULT_NAV_ENTRIES)).visible).not.toContain("projects");
+		expect(split(projectNavLayout(DEFAULT_NAV_ENTRIES)).visible).toContain("projects");
 	});
 
 	it("applies the same defaults to a user with no persisted layout", () => {
@@ -175,36 +175,53 @@ describe("nav layout merge", () => {
 	});
 });
 
-describe("retired navigation presentation, shared by desktop and mobile", () => {
+describe("withheld navigation presentation, shared by desktop and mobile", () => {
+	// `projects` was withheld from Oct 2026 (the project page was a retired canvas) until the
+	// project page came back with sessions and teams. Its stored position was kept all along,
+	// so a reader's own layout brings it back exactly where they had put it.
 	it.each([
-		undefined,
-		{ items: [{ id: "projects" }, { id: "messages" }, { id: NAV_DIVIDER_ID }] },
-		{ items: [{ id: "messages" }, { id: NAV_DIVIDER_ID }, { id: "projects" }] },
-		{
-			items: [
-				{ id: "projects", hidden: false },
-				{ id: "learn", hidden: true },
-			],
-		},
-	])("filters both the sidebar and overflow without rewriting preferences: %j", (preferences) => {
+		[undefined, { visible: true, index: 0 }],
+		[
+			{ items: [{ id: "projects" }, { id: "messages" }, { id: NAV_DIVIDER_ID }] },
+			{ visible: true, index: 0 },
+		],
+		[
+			{ items: [{ id: "messages" }, { id: NAV_DIVIDER_ID }, { id: "projects" }] },
+			{ visible: false, index: 0 },
+		],
+		[
+			{ items: [{ id: "learn" }, { id: "knowledge" }, { id: "projects" }, { id: NAV_DIVIDER_ID }] },
+			{ visible: true, index: 2 },
+		],
+		[
+			{
+				items: [
+					{ id: "projects", hidden: false },
+					{ id: "learn", hidden: true },
+				],
+			},
+			{ visible: true, index: 0 },
+		],
+	])("shows projects again at its stored position: %j", (preferences, expected) => {
 		const before = structuredClone(preferences);
 		const stored = mergeNavLayout(preferences);
 		const projected = projectNavLayout(stored);
-		expect(split(projected).visible).not.toContain("projects");
-		expect(split(projected).tucked).not.toContain("projects");
+		const side = split(projected)[expected.visible ? "visible" : "tucked"];
+		expect(side.indexOf("projects")).toBe(expected.index);
+		expect(projected).toEqual(stored);
 		expect(preferences).toEqual(before);
-		expect(restoreRetiredNavEntries(projected, stored)).toEqual(stored);
+		expect(restoreWithheldNavEntries(projected, stored)).toEqual(stored);
 	});
 
-	it("preserves a retired id when saving an explicit reorder", () => {
+	it("saves a reorder as is when nothing is withheld", () => {
 		const stored = mergeNavLayout({
 			items: [{ id: "projects" }, { id: "learn" }, { id: "messages" }, { id: NAV_DIVIDER_ID }],
 		});
 		const projected = projectNavLayout(stored);
 		const reordered = [projected[1], projected[0], ...projected.slice(2)];
-		const saved = restoreRetiredNavEntries(reordered, stored);
-		expect(saved[0]).toEqual({ kind: "item", id: "projects" });
-		expect(projectNavLayout(saved)).toEqual(reordered);
+		const saved = restoreWithheldNavEntries(reordered, stored);
+		expect(saved).toEqual(reordered);
+		expect(saved[1]).toEqual({ kind: "item", id: "projects" });
 	});
 
 	it("withholds the entry of a switched-off feature and keeps its place on save", () => {
@@ -215,9 +232,9 @@ describe("retired navigation presentation, shared by desktop and mobile", () => 
 		const projected = projectNavLayout(stored, hidden);
 		expect(split(projected).visible).not.toContain("outline");
 		expect(split(projected).tucked).not.toContain("outline");
-		expect(restoreRetiredNavEntries(projected, stored, hidden)).toEqual(stored);
+		expect(restoreWithheldNavEntries(projected, stored, hidden)).toEqual(stored);
 		const reordered = [projected[1], projected[0], ...projected.slice(2)];
-		const saved = restoreRetiredNavEntries(reordered, stored, hidden);
+		const saved = restoreWithheldNavEntries(reordered, stored, hidden);
 		expect(saved[1]).toEqual({ kind: "item", id: "outline" });
 		expect(projectNavLayout(saved, hidden)).toEqual(reordered);
 		// Switched on, it shows where it was.

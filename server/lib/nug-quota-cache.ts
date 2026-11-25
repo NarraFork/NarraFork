@@ -2,10 +2,10 @@ import { unlink } from "node:fs/promises";
 import type { QuotaSnapshot } from "@shared/quota-snapshot";
 import { NugProvider } from "./agent/nug-provider";
 import { getNarraforkPath } from "./narrafork-home";
-import { streamQuotaIdentity, type UsageSubject } from "./provider-key-subjects";
+import { credentialForStream, type UsageSubject } from "./provider-key-subjects";
 import { getProviderKeyStore, nugKeyOwner, withProviderKey } from "./provider-keys";
 import { type NUGProviderConfig, settings } from "./settings";
-import { quotaStore } from "./sourcing/quota-store";
+import { quotaStore, STREAM_QUOTA_SOURCE } from "./sourcing/quota-store";
 
 export interface NugQuotaCache {
 	balance: number | null;
@@ -132,30 +132,62 @@ function restoreSnapshot(snapshot: QuotaSnapshot): QuotaSnapshot | null {
 	});
 }
 
-function subject(config: NUGProviderConfig): NugQuotaSubject {
-	const key = getProviderKeyStore().list(nugKeyOwner(config.id))[0];
+function subject(config: NUGProviderConfig, credentialId?: string): NugQuotaSubject | undefined {
+	const keys = getProviderKeyStore().list(nugKeyOwner(config.id));
+	const key =
+		credentialId === undefined ? keys[0] : keys.find((entry) => entry.id === credentialId);
 	return key
 		? { id: key.id, providerId: config.id, config: withProviderKey(config, key) }
-		: { id: config.id, providerId: config.id, config };
+		: keys.length === 0 && (credentialId === undefined || credentialId === config.id)
+			? { id: config.id, providerId: config.id, config }
+			: undefined;
 }
 
-const identity = (config: NUGProviderConfig) => JSON.stringify([config.baseUrl, config.apiKey]);
+function identity(config: NUGProviderConfig, credentialId?: string): string {
+	const network = credentialId ? getProviderKeyStore().get(credentialId)?.network : undefined;
+	const route = [
+		config.proxy,
+		settings.proxy?.mode === "direct" ? undefined : settings.proxy,
+		network,
+	];
+	// Network-free snapshots from earlier releases still restore under their original identity.
+	return JSON.stringify(
+		route.some((value) => value !== undefined)
+			? [config.baseUrl, config.apiKey, ...route]
+			: [config.baseUrl, config.apiKey],
+	);
+}
 const knownCredentialIds = new Map<string, string>();
 
-function snapshotOf(config: NUGProviderConfig): QuotaSnapshot | undefined {
-	const credential = subject(config);
-	knownCredentialIds.set(config.id, credential.id);
-	return quotaStore.get(credential.id, identity(credential.config), restoreSnapshot);
+function snapshotOf(
+	config: NUGProviderConfig,
+	credentialId?: string,
+	source?: typeof STREAM_QUOTA_SOURCE,
+): QuotaSnapshot | undefined {
+	const credential = subject(config, credentialId);
+	if (!credential) return;
+	if (credentialId === undefined) knownCredentialIds.set(config.id, credential.id);
+	const key = identity(credential.config, credential.id);
+	if (source === STREAM_QUOTA_SOURCE)
+		return quotaStore.get(credential.id, key, restoreSnapshot, STREAM_QUOTA_SOURCE);
+	const probe = quotaStore.get(credential.id, key, restoreSnapshot);
+	if (credentialId !== undefined) return probe;
+	// Only the legacy source-level view merges the current first key's two slots.
+	const stream = quotaStore.get(credential.id, key, restoreSnapshot, STREAM_QUOTA_SOURCE);
+	return stream && (!probe || stream.fetchedAt >= probe.fetchedAt) ? stream : probe;
 }
 
 /** No polling here: NUG is updated by streams, startup and explicit refresh. */
 export function getNugQuotaSnapshot(
 	providerId: string,
+	credentialId?: string,
+	source?: typeof STREAM_QUOTA_SOURCE,
 ): { credentialId: string; snapshot: QuotaSnapshot | undefined } | undefined {
 	const config = (settings.nugProviders ?? []).find((provider) => provider.id === providerId);
-	if (!config) return undefined;
-	const credential = subject(config);
-	return { credentialId: credential.id, snapshot: snapshotOf(config) };
+	const credential = config && subject(config, credentialId);
+	return credential && config
+		? { credentialId: credential.id, snapshot: snapshotOf(config, credentialId, source) }
+		: undefined;
 }
 
 const refreshes = new Map<
@@ -163,27 +195,35 @@ const refreshes = new Map<
 	{ identity: string; controller: AbortController; task: Promise<void> }
 >();
 
-export const isNugQuotaRefreshing = (providerId: string): boolean => refreshes.has(providerId);
+export function isNugQuotaRefreshing(providerId: string, credentialId?: string): boolean {
+	const config = settings.nugProviders?.find((provider) => provider.id === providerId);
+	const credential = config && subject(config, credentialId);
+	return (
+		!!credential &&
+		refreshes.get(credential.id)?.identity === identity(credential.config, credential.id)
+	);
+}
 
 /** Explicit refresh, bounded and coalesced by the live credential identity. */
-export function refreshNugQuota(providerId: string): Promise<void> {
+export function refreshNugQuota(providerId: string, credentialId?: string): Promise<void> {
 	const config = (settings.nugProviders ?? []).find((provider) => provider.id === providerId);
 	if (!config || config.disabled) return Promise.resolve();
-	const credential = subject(config);
-	if (!credential.config.apiKey) return Promise.resolve();
-	const key = identity(credential.config);
-	const previous = refreshes.get(providerId);
+	const credential = subject(config, credentialId);
+	if (!credential?.config.apiKey) return Promise.resolve();
+	const key = identity(credential.config, credential.id);
+	const previous = refreshes.get(credential.id);
 	if (previous?.identity === key) return previous.task;
 	previous?.controller.abort();
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), 15_000);
 	const current = () => {
-		const live = getNugQuotaSnapshot(providerId);
 		const liveConfig = (settings.nugProviders ?? []).find((p) => p.id === providerId);
+		const live =
+			liveConfig && !liveConfig.disabled ? subject(liveConfig, credential.id) : undefined;
 		return (
-			live?.credentialId === credential.id &&
-			liveConfig &&
-			identity(subject(liveConfig).config) === key
+			refreshes.get(credential.id)?.controller === controller &&
+			!!live &&
+			identity(live.config, live.id) === key
 		);
 	};
 	const cancelled = new Promise<never>((_resolve, reject) => {
@@ -215,9 +255,9 @@ export function refreshNugQuota(providerId: string): Promise<void> {
 		})
 		.finally(() => {
 			clearTimeout(timer);
-			if (refreshes.get(providerId)?.controller === controller) refreshes.delete(providerId);
+			if (refreshes.get(credential.id)?.controller === controller) refreshes.delete(credential.id);
 		});
-	refreshes.set(providerId, { identity: key, controller, task });
+	refreshes.set(credential.id, { identity: key, controller, task });
 	return task;
 }
 
@@ -229,15 +269,23 @@ export function setNugCachedQuota(
 	const config = (settings.nugProviders ?? []).find((provider) => provider.id === providerId);
 	if (!config) return;
 	const credential = subject(config);
+	if (!credential) return;
 	if (expectedConfig) {
 		const expectedId =
 			getProviderKeyStore().list(nugKeyOwner(expectedConfig.id))[0]?.id ?? expectedConfig.id;
-		if (credential.id !== expectedId || identity(credential.config) !== identity(expectedConfig)) {
+		if (
+			credential.id !== expectedId ||
+			identity(credential.config, credential.id) !== identity(expectedConfig, credential.id)
+		) {
 			return;
 		}
 	}
 	knownCredentialIds.set(providerId, credential.id);
-	quotaStore.set(credential.id, identity(credential.config), nugQuotaSnapshot(cache));
+	quotaStore.set(
+		credential.id,
+		identity(credential.config, credential.id),
+		nugQuotaSnapshot(cache),
+	);
 }
 
 /** Fetch quota from a single NUG provider. */
@@ -264,7 +312,10 @@ export async function probeNugQuota(
 	credential: NugQuotaSubject,
 	signal: AbortSignal,
 ): Promise<QuotaSnapshot> {
-	const data = await new NugProvider(credential.config).getQuota(signal);
+	const connection = settings.nugProviders?.find((entry) => entry.id === credential.providerId);
+	const data = await new NugProvider(credential.config, connection ?? credential.config).getQuota(
+		signal,
+	);
 	return nugQuotaSnapshot(
 		buildNugQuotaCache(normalizeNugQuotaResponse(data as unknown as Record<string, unknown>)),
 	);
@@ -281,17 +332,41 @@ export function updateNugQuotaByPrefix(
 	const config = (settings.nugProviders ?? []).find(
 		(provider) => provider.prefix === prefix || provider.id === prefix,
 	);
-	if (!config || streamQuotaIdentity(config) !== expectedProviderIdentity) return;
-	setNugCachedQuota(
-		config.id,
-		buildNugQuotaCache(
-			{
-				balance: quotaBalance,
-				detailedQuotaBalance,
-				...(extra !== undefined ? { extra } : {}),
-			},
-			getNugCachedQuota(config.id),
+	if (!config) return;
+	const credential = credentialForStream(config, expectedProviderIdentity, nugKeyOwner(config.id));
+	if (!credential) return;
+	const probe = quotaStore.get(
+		credential.id,
+		identity(credential.config, credential.id),
+		restoreSnapshot,
+	);
+	const stream = quotaStore.get(
+		credential.id,
+		identity(credential.config, credential.id),
+		restoreSnapshot,
+		STREAM_QUOTA_SOURCE,
+	);
+	const previous = stream && (!probe || stream.fetchedAt >= probe.fetchedAt) ? stream : probe;
+	quotaStore.set(
+		credential.id,
+		identity(credential.config, credential.id),
+		nugQuotaSnapshot(
+			buildNugQuotaCache(
+				{
+					balance: quotaBalance,
+					detailedQuotaBalance,
+					...(extra !== undefined ? { extra } : {}),
+				},
+				previous
+					? {
+							...(previous.detail as Omit<NugQuotaCache, "fetchedAt">),
+							fetchedAt: previous.fetchedAt,
+						}
+					: undefined,
+			),
 		),
+		true,
+		STREAM_QUOTA_SOURCE,
 	);
 }
 
@@ -330,9 +405,19 @@ export function getAllNugCachedQuotas(): Record<
 
 export function purgeNugQuotaCache(removedIds: string[]): void {
 	for (const id of removedIds) {
-		const credentialId =
-			knownCredentialIds.get(id) ?? getProviderKeyStore().list(nugKeyOwner(id))[0]?.id ?? id;
+		const ids = new Set([
+			knownCredentialIds.get(id) ?? id,
+			...getProviderKeyStore()
+				.list(nugKeyOwner(id))
+				.map((key) => key.id),
+		]);
 		knownCredentialIds.delete(id);
-		quotaStore.remove(credentialId);
+		for (const credentialId of ids) {
+			const pending = refreshes.get(credentialId);
+			refreshes.delete(credentialId);
+			pending?.controller.abort();
+			quotaStore.remove(credentialId);
+			quotaStore.remove(credentialId, STREAM_QUOTA_SOURCE);
+		}
 	}
 }

@@ -301,14 +301,31 @@ export async function probeCommandCodeQuota(
 const identity = (config: CommandCodeUsageSubject["config"]) =>
 	JSON.stringify([commandCodeApiOrigin(config.baseUrl), config.apiKey]);
 
-function settingsSubject(): CommandCodeUsageSubject | undefined {
+/** Each managed key owns its window; the legacy endpoint still shows the first one. */
+export function listCommandCodeUsageSubjects(): CommandCodeUsageSubject[] {
 	const configured = settings.commandCode;
-	if (!configured?.apiKey) return undefined;
-	const config = { ...configured, apiKey: configured.apiKey };
-	const key = getProviderKeyStore().list(COMMAND_CODE_KEY_OWNER)[0];
-	return key
-		? { id: key.id, providerId: COMMAND_CODE_PREFIX, config: withProviderKey(config, key) }
-		: { id: COMMAND_CODE_PREFIX, providerId: COMMAND_CODE_PREFIX, config };
+	if (configured?.disabled) return [];
+	const config = { ...configured, apiKey: configured?.apiKey ?? "" };
+	const stored = getProviderKeyStore().list(COMMAND_CODE_KEY_OWNER);
+	if (stored.length > 0) {
+		return stored
+			.filter((key) => !key.disabled)
+			.map((key) => ({
+				id: key.id,
+				providerId: COMMAND_CODE_PREFIX,
+				config: withProviderKey(config, key),
+			}));
+	}
+	return config.apiKey
+		? [{ id: COMMAND_CODE_PREFIX, providerId: COMMAND_CODE_PREFIX, config }]
+		: [];
+}
+
+function commandCodeUsageSubject(credentialId?: string): CommandCodeUsageSubject | undefined {
+	const subjects = listCommandCodeUsageSubjects();
+	return credentialId === undefined
+		? subjects[0]
+		: subjects.find((subject) => subject.id === credentialId);
 }
 
 function restoreSnapshot(snapshot: QuotaSnapshot): QuotaSnapshot {
@@ -324,21 +341,24 @@ function cachedSnapshot(subject: CommandCodeUsageSubject): QuotaSnapshot | undef
 	return quotaStore.get(subject.id, identity(subject.config), restoreSnapshot);
 }
 
-export function getCommandCodeQuotaSnapshot():
-	| { credentialId: string; snapshot: QuotaSnapshot | undefined }
-	| undefined {
-	const subject = settingsSubject();
+export function getCommandCodeQuotaSnapshot(
+	credentialId?: string,
+): { credentialId: string; snapshot: QuotaSnapshot | undefined } | undefined {
+	const subject = commandCodeUsageSubject(credentialId);
 	return subject ? { credentialId: subject.id, snapshot: cachedSnapshot(subject) } : undefined;
 }
 
-export function isCommandCodeQuotaRefreshing(): boolean {
-	const subject = settingsSubject();
+export function isCommandCodeQuotaRefreshing(credentialId?: string): boolean {
+	const subject = commandCodeUsageSubject(credentialId);
 	return !!subject && refreshes.has(identity(subject.config));
 }
 
-/** Reuse the settings-key cache and in-flight deduplication, without awaiting it on GET. */
-export function refreshCommandCodeQuota(force = false): Promise<CommandCodeUsage | undefined> {
-	const subject = settingsSubject();
+/** Refresh the selected managed key; omitted id keeps the legacy first-usable view. */
+export function refreshCommandCodeQuota(
+	force = false,
+	credentialId?: string,
+): Promise<CommandCodeUsage | undefined> {
+	const subject = commandCodeUsageSubject(credentialId);
 	if (!subject) return Promise.resolve(undefined);
 	const cached = cachedSnapshot(subject);
 	if (!force && cached && Date.now() - cached.fetchedAt < COMMAND_CODE_USAGE_STALE_MS)
@@ -354,14 +374,16 @@ async function refreshUsage(subject: CommandCodeUsageSubject): Promise<CommandCo
 	if (existing) return existing;
 	const task = probeCommandCodeQuota(subject, new AbortController().signal)
 		.then((snapshot) => {
-			const current = settingsSubject();
+			const current = listCommandCodeUsageSubjects().find(
+				(candidate) => candidate.id === subject.id,
+			);
 			if (current?.id === subject.id && identity(current.config) === key) {
 				quotaStore.set(subject.id, key, snapshot);
 			}
 			return snapshot.detail as CommandCodeUsage;
 		})
 		.catch(() => {
-			const current = settingsSubject();
+			const current = commandCodeUsageSubject(subject.id);
 			if (current?.id === subject.id && identity(current.config) === key) {
 				const previous = cachedSnapshot(subject);
 				quotaStore.set(
@@ -388,11 +410,11 @@ async function refreshUsage(subject: CommandCodeUsageSubject): Promise<CommandCo
 
 /** Request-driven 60-second cache for a settings key; there is no polling timer. */
 export async function getCommandCodeUsageFromSettings(): Promise<CommandCodeUsage | undefined> {
-	const subject = settingsSubject();
-	if (!subject) return undefined;
-	const cached = cachedSnapshot(subject);
-	if (cached && Date.now() - cached.fetchedAt < COMMAND_CODE_USAGE_STALE_MS) {
-		return cached.detail as CommandCodeUsage;
-	}
-	return refreshUsage(subject);
+	return getCommandCodeUsageForCredential();
+}
+
+export async function getCommandCodeUsageForCredential(
+	credentialId?: string,
+): Promise<CommandCodeUsage | undefined> {
+	return refreshCommandCodeQuota(false, credentialId);
 }

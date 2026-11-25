@@ -53,6 +53,7 @@ import type { ChannelHealth } from "./channel-health";
 import { channelHealthKey, normalizeChannelHealth } from "./channel-health";
 import type { CustomModelEntry } from "./InlineCustomModels";
 import { InlineCustomModels } from "./InlineCustomModels";
+import { ProviderKeysPanel } from "./ProviderKeysPanel";
 
 /* ── Types ─────────────────────────────────────────────── */
 
@@ -111,6 +112,8 @@ interface UsageSummary {
 interface NUGProvidersSectionProps {
 	providers: NUGProviderState[];
 	onProvidersChange: (updater: ProvidersUpdater) => void;
+	/** The page rebases this immediately persisted field into its discard baseline. */
+	onPersistedKeyChanged?: (providerId: string, apiKey: string) => void;
 	providerModelsMap: Record<string, ModelOption[]>;
 	hiddenModels: Set<string>;
 	onToggleHidden: (modelVal: string) => void;
@@ -766,6 +769,7 @@ function NUGUsageRecords({ providerId }: { providerId: string }) {
 export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 	providers,
 	onProvidersChange,
+	onPersistedKeyChanged,
 	providerModelsMap,
 	hiddenModels,
 	onToggleHidden,
@@ -1169,6 +1173,12 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 									</Tooltip>
 								)}
 							</Group>
+
+							<ProviderKeysPanel
+								key={p.id}
+								providerId={p.id}
+								onFirstKeyChanged={(apiKey) => onPersistedKeyChanged?.(p.id, apiKey)}
+							/>
 
 							{/* OAuth config (collapsible) */}
 							<Group gap="xs">

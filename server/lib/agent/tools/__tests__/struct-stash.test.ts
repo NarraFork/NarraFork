@@ -6,11 +6,12 @@
  * entire cost this feature exists to remove — and a regression there would look like a
  * working feature.
  */
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { peekStash, resetStash } from "../../structural/stash";
+import { treeSitterProvider } from "../../structural/tree-sitter-provider";
 import type { ToolContext } from "../../types";
 import { structSedTool } from "../struct-sed";
 import { structViewTool } from "../struct-view";
@@ -39,6 +40,39 @@ async function sed(args: Record<string, unknown>, narratorId = "n1") {
 }
 
 describe("stash mode", () => {
+	test("address and list stashes need no provider while the worker is disabled", async () => {
+		resetStash();
+		const previous = process.env.NF_STRUCTURAL_WORKER_DISABLED;
+		const supports = spyOn(treeSitterProvider, "supports");
+		process.env.NF_STRUCTURAL_WORKER_DISABLED = "1";
+		try {
+			const held = await stash({ address: "4,6", name: "parser-free" });
+			expect(held.isError).toBeFalsy();
+			expect(held.metadata).toMatchObject({ startLine: 4, endLine: 6 });
+			const stored = peekStash("stash_parser-free", "n1");
+			expect("entry" in stored).toBe(true);
+			if (!("entry" in stored)) throw new Error("Expected address stash to be held");
+			expect(stored.entry.text).toBe("function moved() {\n\treturn 1;\n}");
+			const listed = await stash({});
+			expect(listed.isError).toBeFalsy();
+			expect(listed.metadata).toMatchObject({ action: "list", count: 1 });
+			expect(listed.output).toContain("stash_parser-free");
+			const ambiguous = await stash({ address: "1", symbol: "moved" });
+			expect(ambiguous.isError).toBe(true);
+			expect(ambiguous.output).toContain("not both");
+			expect(supports).not.toHaveBeenCalled();
+			await expect(stash({ symbol: "moved" })).rejects.toMatchObject({
+				code: "STRUCTURAL_WORKER_DISABLED",
+			});
+			expect(supports).toHaveBeenCalledTimes(1);
+		} finally {
+			if (previous === undefined) delete process.env.NF_STRUCTURAL_WORKER_DISABLED;
+			else process.env.NF_STRUCTURAL_WORKER_DISABLED = previous;
+			supports.mockRestore();
+			resetStash();
+		}
+	});
+
 	test("never echoes the stashed content", async () => {
 		resetStash();
 		const r = await stash({ address: "3,$" });

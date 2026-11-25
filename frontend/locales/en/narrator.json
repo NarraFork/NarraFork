@@ -11,7 +11,21 @@
 	"modelTraceRetryFailed": "Could not retry ModelTrace.",
 	"modelTraceUsage": "Usage: /modeltrace [--fork|-f] [--calibrate|-c]",
 	"modelTraceFootnote": "Reference-bank ranking, not proof of identity.",
-	"modelTracePartial": "Uncalibrated match weights, not model identity probabilities.",
+	"modelTracePartial": "Uncalibrated match weights among the displayed candidates, not model identity probabilities.",
+	"modelTraceCalibrate": "Calibrate",
+	"modelTraceContinueCalibration": "Continue calibration",
+	"modelTraceCalibrateFailed": "Could not start ModelTrace calibration.",
+	"modelTraceCalibrationRequested": "Calibration requested",
+	"modelTraceSampleSlot": "Sample {{slot}}: {{state}}",
+	"modelTraceSampleAttempt": "Attempt {{attempt}}",
+	"modelTraceSampleState": {
+		"pending": "Pending",
+		"running": "Sampling",
+		"retrying": "Retrying",
+		"complete": "Complete",
+		"failed": "Failed",
+		"cancelled": "Cancelled"
+	},
 	"modelTraceUnscorable": "Not enough valid fingerprint samples to score.",
 	"modelTraceNotModel": "The replies do not look like model-generated samples.",
 	"modelTraceCalibrationIncomplete": "Calibration did not complete (three valid samples required).",
@@ -1498,6 +1512,8 @@
 	"planEdited": "Edited",
 	"planExecute": "Execute Plan",
 	"planRevise": "Revise Plan",
+	"planReflect": "Reflect on Plan",
+	"planReflectFailed": "Plan reflection could not be started",
 	"planFeedbackConfirmTitle": "You entered feedback text",
 	"planFeedbackConfirmMessage": "You have entered feedback text. Would you like the agent to revise the plan?",
 	"planExecuteWithoutRevision": "Execute Without Revision",
@@ -2398,6 +2414,9 @@
 			"outline_task_finished": "Tasks this session created were finished elsewhere",
 			"outline_team_activity": "Team activity",
 			"team_status": "Team status",
+			"team_upgrade": "Became a team coordinator",
+			"team_disband": "Team disbanded",
+			"team_return": "Work item returned",
 			"outline_team": "Task events for this session",
 			"outline_task_brief": "Opening brief",
 			"spec_import": "Dynamic Spec moved to the outline",
@@ -3340,5 +3359,10 @@
 			"showWhole": "Show all",
 			"showLess": "Show less"
 		}
-	}
+	},
+	"followDefaultUnset": "Default model (not configured)",
+	"followSummaryUnset": "Summary model (not configured)",
+	"composerReadOnly": "Read-only: you can follow this session but not send it messages.",
+	"teamBadge": "Team",
+	"teamBadgeOpen": "Open the team page of {{name}}"
 }

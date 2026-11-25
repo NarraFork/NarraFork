@@ -562,6 +562,13 @@ export class ProviderBalanceCache {
 			: undefined;
 	}
 
+	/** Query the source-owned task, including refreshes that retain a settled snapshot. */
+	isRefreshing(id: string, credentialId?: string): boolean {
+		this.sync();
+		const entry = this.entries.get(id);
+		return !!entry?.task && (credentialId === undefined || entry.credentialId === credentialId);
+	}
+
 	/** Does not schedule network activity; useful immediately after scheduling a mutation. */
 	peek(id: string): ProviderBalanceSnapshot | null {
 		this.sync();

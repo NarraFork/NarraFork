@@ -47,7 +47,11 @@ const signal = () => AbortSignal.timeout(10_000);
 async function setup(
 	intercept?: NonNullable<Parameters<typeof createWebDavFixture>[0]>["intercept"],
 	mirrorLimits?: ServerConfig["mirrorLimits"],
-	relayBudgets: { totalTimeoutMinutes?: number; transferTimeoutMinutes?: number } = {},
+	relayBudgets: {
+		totalTimeoutMinutes?: number;
+		transferTimeoutMinutes?: number;
+		downloadConcurrency?: number;
+	} = {},
 ) {
 	const directory = mkdtempSync(join(tmpdir(), "nf-relay-pull-"));
 	const path = join(directory, "config.json");
@@ -134,10 +138,15 @@ async function stage(
 		full?: boolean;
 		binarySize?: number;
 		overBudget?: number;
+		conflictingSizes?: boolean;
 	} = {},
 ) {
 	const f = mirrorFixture(options.patch ?? true, true);
 	if (options.binarySize) f.index.releases[0].files[0].size = options.binarySize;
+	if (options.conflictingSizes) {
+		const file = f.index.releases[0].files[0];
+		file.metadata.sha256 = file.sha256;
+	}
 	if (options.overBudget) {
 		const file = f.index.releases[0].files[0];
 		f.index.releases[0].files = Object.entries(UPDATE_INDEX_PLATFORMS)
@@ -182,7 +191,9 @@ async function stage(
 		.slice(0, -1)
 		.join("/");
 	await ctx.client.ensureCollection(objectDirectory, signal());
-	for (const asset of options.overBudget || options.binarySize ? [] : snapshot.assets) {
+	for (const asset of options.overBudget || options.binarySize || options.conflictingSizes
+		? []
+		: snapshot.assets) {
 		const bytes = asset.kind === "notes" ? Buffer.from(f.notesRaw) : f.raw.get(asset.name);
 		if (!bytes) throw new Error("Missing canonical test bytes");
 		await ctx.client.put(relayObjectPath(manifest, asset.sha256), bytes, asset, signal());
@@ -225,6 +236,164 @@ async function pollUntilSeen(ctx: Context, count = 1) {
 		failed += result.failed;
 	}
 	return { committed, failed };
+}
+
+test("relay rejects conflicting same-hash sizes before any asset dispatch", async () => {
+	const ctx = await setup();
+	const commit = spyOn(ctx.ingest, "commitMain");
+	try {
+		const staged = await stage(ctx, { full: true, conflictingSizes: true });
+		const start = ctx.dav.requests.length;
+		expect(await pollUntilSeen(ctx)).toEqual({ committed: 0, failed: 1 });
+		expect(
+			ctx.dav.requests
+				.slice(start)
+				.filter((r) => r.method === "GET" && r.path.includes("/objects/"))
+				.map((r) => r.path),
+		).toEqual([staged.payloadPath]);
+		expect(commit).not.toHaveBeenCalled();
+		expect(await ctx.storage.listFiles("mirror-objects")).toEqual([]);
+	} finally {
+		commit.mockRestore();
+		await ctx.close();
+	}
+});
+
+for (const concurrency of [undefined, 1, 2, 8]) {
+	test(`relay asset stream barriers enforce concurrency ${concurrency ?? "default 8"} before commit`, async () => {
+		const paths = new Set<string>();
+		const entered = Array.from({ length: 5 }, () => Promise.withResolvers<void>());
+		const gates: Array<() => void> = [];
+		let active = 0;
+		let peak = 0;
+		const ctx = await setup(
+			(request) => {
+				const path = new URL(request.url).pathname;
+				if (request.method !== "GET" || !paths.has(path)) return null;
+				const bytes = ctx.dav.objects.get(path);
+				if (!bytes) throw new Error("Missing asset fixture");
+				return new Response(
+					new ReadableStream<Uint8Array>({
+						start(controller) {
+							active++;
+							peak = Math.max(peak, active);
+							gates.push(() => {
+								active--;
+								controller.enqueue(bytes);
+								controller.close();
+							});
+							entered[gates.length - 1].resolve();
+						},
+					}),
+				);
+			},
+			undefined,
+			{ downloadConcurrency: concurrency },
+		);
+		const commit = spyOn(ctx.ingest, "commitMain");
+		try {
+			const staged = await stage(ctx, { full: true });
+			for (const asset of staged.snapshot.assets) paths.add(staged.assetPath(asset.sha256));
+			expect(paths.size).toBe(5);
+			const work = pollUntilSeen(ctx);
+			const width = Math.min(concurrency ?? 8, paths.size);
+			await entered[width - 1].promise;
+			expect(gates).toHaveLength(width);
+			expect(commit).not.toHaveBeenCalled();
+			for (let i = 0; i < paths.size; i++) {
+				await entered[i].promise;
+				gates[i]();
+			}
+			expect(await work).toEqual({ committed: 1, failed: 0 });
+			expect(peak).toBe(width);
+			expect(commit).toHaveBeenCalledTimes(1);
+		} finally {
+			commit.mockRestore();
+			await ctx.close();
+		}
+	});
+}
+
+for (const failure of ["stream-error", "bad-hash", "stop"] as const) {
+	test(`concurrent relay ${failure} cancels siblings, joins cleanup and never dispatches the queue`, async () => {
+		const paths = new Set<string>();
+		const reading = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+		const controllers: ReadableStreamDefaultController<Uint8Array>[] = [];
+		const cancelled = Promise.withResolvers<void>();
+		const cleanup = Promise.withResolvers<void>();
+		let cancellations = 0;
+		let settled = false;
+		const ctx = await setup(
+			(request) => {
+				const path = new URL(request.url).pathname;
+				if (request.method !== "GET" || !paths.has(path)) return null;
+				const index = controllers.length;
+				return new Response(
+					new ReadableStream<Uint8Array>({
+						start(controller) {
+							controllers.push(controller);
+						},
+						pull() {
+							reading[index]?.resolve();
+						},
+						async cancel() {
+							cancellations++;
+							cancelled.resolve();
+							await cleanup.promise;
+						},
+					}),
+				);
+			},
+			undefined,
+			{ downloadConcurrency: 2 },
+		);
+		const commit = spyOn(ctx.ingest, "commitMain");
+		try {
+			const staged = await stage(ctx, { full: true });
+			for (const asset of staged.snapshot.assets) paths.add(staged.assetPath(asset.sha256));
+			const work = ctx.puller.pollOnce().finally(() => {
+				settled = true;
+			});
+			await Promise.all(reading.map((barrier) => barrier.promise));
+			expect(controllers).toHaveLength(2);
+			let stopped: Promise<void> | undefined;
+			if (failure === "stop") stopped = ctx.puller.stop();
+			else if (failure === "stream-error")
+				controllers[0].error(new Error("Injected stream failure"));
+			else {
+				controllers[0].enqueue(Buffer.alloc(staged.snapshot.assets[0].size, 9));
+				controllers[0].close();
+			}
+			await cancelled.promise;
+			expect(settled).toBe(false);
+			expect(commit).not.toHaveBeenCalled();
+			expect(controllers).toHaveLength(2);
+			cleanup.resolve();
+			const result = await work;
+			await stopped;
+			expect(result.committed).toBe(0);
+			if (failure !== "stop") expect(result.failed).toBe(1);
+			expect(cancellations).toBe(failure === "stop" ? 2 : 1);
+			expect(controllers).toHaveLength(2);
+			expect(commit).not.toHaveBeenCalled();
+			expect(await ctx.storage.listFiles("mirror-objects")).toEqual([]);
+			// Both ingest and storage reservations must be reusable immediately after joined failure.
+			const asset = staged.snapshot.assets[1];
+			const bytes = ctx.dav.objects.get(staged.assetPath(asset.sha256));
+			if (!bytes) throw new Error("Missing retry bytes");
+			await ctx.ingest.ingestAsset(
+				"narrafork",
+				asset,
+				new Blob([Uint8Array.from(bytes)]).stream(),
+				signal(),
+				"relay",
+			);
+		} finally {
+			cleanup.resolve();
+			commit.mockRestore();
+			await ctx.close();
+		}
+	});
 }
 
 test("signed v2 relay streams full binaries, retains v1 availability and restart visibility", async () => {
@@ -295,7 +464,10 @@ test("signed relay admits one 4GiB binary plus metadata but never commits a trun
 				.slice(start)
 				.filter((r) => r.method === "GET" && r.path.includes("/objects/"))
 				.map((r) => r.path),
-		).toEqual([staged.payloadPath, binaryPath]);
+		).toEqual([
+			staged.payloadPath,
+			...staged.snapshot.assets.slice(0, 3).map((asset) => staged.assetPath(asset.sha256)),
+		]);
 		expect(saving.mock.calls).toHaveLength(1);
 		expect(saving.mock.calls[0][2].size).toBe(4 * 1024 ** 3);
 		expect((await ctx.app.request(`${root}/index`)).status).toBe(404);
@@ -807,6 +979,104 @@ function executorPayload(commit: string) {
 	};
 }
 
+test("executor relay uses bounded parallel binary streams and commits only after the last barrier", async () => {
+	const paths = new Set<string>();
+	const entered = EXECUTOR_PLATFORMS.map(() => Promise.withResolvers<void>());
+	const gates: Array<() => void> = [];
+	let active = 0;
+	let peak = 0;
+	const ctx = await setup(
+		(request) => {
+			const path = new URL(request.url).pathname;
+			if (request.method !== "GET" || !paths.has(path)) return null;
+			const bytes = ctx.dav.objects.get(path);
+			if (!bytes) throw new Error("Missing executor object");
+			return new Response(
+				new ReadableStream<Uint8Array>({
+					start(controller) {
+						active++;
+						peak = Math.max(peak, active);
+						gates.push(() => {
+							active--;
+							controller.enqueue(bytes);
+							controller.close();
+						});
+						entered[gates.length - 1].resolve();
+					},
+				}),
+			);
+		},
+		undefined,
+		{ downloadConcurrency: 2 },
+	);
+	const commit = spyOn(ctx.ingest, "commitTools");
+	try {
+		const original = executorPayload("a".repeat(40));
+		const manifest = JSON.parse(original.assets[0].content);
+		const binaries = EXECUTOR_PLATFORMS.map((platform, i) => {
+			const bytes = Buffer.alloc(128, i + 1);
+			const entry = manifest.manifest.platforms[platform];
+			entry.sha256 = hash(bytes);
+			return {
+				kind: "executor-binary",
+				version: "1.2.0",
+				platform,
+				name: entry.filename,
+				size: bytes.length,
+				sha256: entry.sha256,
+			};
+		});
+		const content = JSON.stringify(manifest);
+		const payload = {
+			...original,
+			binaries,
+			assets: [
+				{
+					...original.assets[0],
+					content,
+					size: Buffer.byteLength(content),
+					sha256: hash(Buffer.from(content)),
+				},
+				original.assets[1],
+			],
+		};
+		const producer = new MirrorRelayStage(
+			{ kind: "executor", repository, tag: payload.tag },
+			{
+				config: ctx.settings.webdav,
+				signingKey: key,
+				client: ctx.client,
+				now: () => new Date(ctx.clock.now),
+				jobId: "executor-parallel",
+			},
+			signal(),
+		);
+		for (const [i, binary] of binaries.entries())
+			await producer.uploadObject(binary, Buffer.alloc(128, i + 1));
+		await producer.preparePayload(payload, 1024 * 1024);
+		await producer.publish(async () => {});
+		for (const request of ctx.dav.requests)
+			if (request.method === "PUT" && binaries.some((a) => request.path.endsWith(a.sha256)))
+				paths.add(request.path);
+		// First discovery page is main/helpers; the second reaches executor, without parallelizing jobs.
+		await ctx.puller.pollOnce();
+		const work = ctx.puller.pollOnce();
+		await entered[1].promise;
+		expect(gates).toHaveLength(2);
+		for (let i = 0; i < binaries.length; i++) {
+			await entered[i].promise;
+			expect(commit).not.toHaveBeenCalled();
+			gates[i]();
+		}
+		expect((await work).committed).toBe(1);
+		expect(peak).toBe(2);
+		expect(commit).toHaveBeenCalledTimes(1);
+	} finally {
+		commit.mockRestore();
+		await ctx.close();
+	}
+});
+
 for (const corrupt of [false, true]) {
 	test(`relay streams executor binary objects before atomic tag commit (corrupt=${corrupt})`, async () => {
 		const ctx = await setup();
@@ -873,9 +1143,10 @@ for (const corrupt of [false, true]) {
 			);
 			expect(response.status).toBe(corrupt ? 404 : 200);
 			if (!corrupt) expect(Buffer.from(await response.arrayBuffer()).equals(bytes)).toBe(true);
-			expect(ctx.dav.requests.some((r) => r.method === "GET" && r.path.endsWith(hash(bytes)))).toBe(
-				true,
-			);
+			// All platform names share one object: download once, but commit validates every descriptor.
+			expect(
+				ctx.dav.requests.filter((r) => r.method === "GET" && r.path.endsWith(hash(bytes))),
+			).toHaveLength(1);
 		} finally {
 			await ctx.close();
 		}

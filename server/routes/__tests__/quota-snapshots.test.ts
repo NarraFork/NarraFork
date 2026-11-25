@@ -3,6 +3,7 @@ import type { QuotaSnapshot, QuotaSnapshotsResponse } from "@shared/quota-snapsh
 import { Hono } from "hono";
 import { getCodexManager } from "../../lib/codex-manager";
 import * as commandAuth from "../../lib/commandcode-manager";
+import * as customQuota from "../../lib/custom-api-quota-cache";
 import { updateCustomApiQuotaByPrefix } from "../../lib/custom-api-quota-cache";
 import { AppError } from "../../lib/errors";
 import * as outbound from "../../lib/net/outbound-fetch";
@@ -268,6 +269,38 @@ describe("unified quota API", () => {
 		expect((await refresh("admin", { apiKey: "secret" })).status).toBe(400);
 		expect((await refresh("admin", { groupId: "x".repeat(2048) })).status).toBe(413);
 	});
+	test("TokenDance overview and both primary slots stay with the portal login after pool reorder", () => {
+		saveSettings({
+			...settings,
+			tokendance: { apiKey: "portal-login", generation: 0, disabled: false },
+		});
+		const store = getProviderKeyStore();
+		const login = store.list(TOKENDANCE_KEY_OWNER)[0];
+		if (!login) throw new Error("Missing portal login key");
+		const backup = store.add(TOKENDANCE_KEY_OWNER, { apiKey: "inference-backup" });
+		store.reorder(TOKENDANCE_KEY_OWNER, [backup.id, login.id]);
+		spyOn(tokenDance, "getTokenDanceQuotaSnapshot").mockReturnValue({
+			credentialId: login.id,
+			snapshot: { ...snap(), balances: [{ unit: "CNY", remaining: 7 }] },
+		});
+		spyOn(customQuota, "getCustomApiQuotaSnapshot").mockImplementation((groupId, credentialId) =>
+			groupId === "tokendance" && credentialId === login.id
+				? { ...snap(), balances: [{ unit: "CNY", remaining: 6 }] }
+				: undefined,
+		);
+		const overview = byGroup(readQuotaSnapshots(false, false), "tokendance");
+		expect(overview.map((entry) => entry.source)).toEqual(["probe", "quota_balance"]);
+		expect(overview.map((entry) => entry.snapshot?.balances[0]?.remaining)).toEqual([7, 6]);
+		expect(overview.every((entry) => entry.primary === true && entry.credentialId === null)).toBe(
+			true,
+		);
+		const entries = byGroup(readQuotaSnapshots(true, false), "tokendance");
+		expect(
+			entries.filter((entry) => entry.primary).every((entry) => entry.credentialId === login.id),
+		).toBe(true);
+		expect(entries.find((entry) => entry.credentialId === backup.id)?.primary).toBe(false);
+	});
+
 	test("explicit TokenDance refresh waits for the new balance instead of returning a stale failure", async () => {
 		saveSettings({
 			...settings,
@@ -670,4 +703,66 @@ describe("uncached Command Code CLI quota", () => {
 		const snapshot = await refreshCommandCodeCliQuota();
 		expect(snapshot).toMatchObject({ error: "quota_unavailable", balances: [] });
 	});
+});
+
+test("refreshing the second Command Code key exposes its own standard snapshot without querying the first", async () => {
+	const { COMMAND_CODE_KEY_OWNER } = await import("../../lib/provider-keys");
+	const { getCommandCodeUsageForCredential } = await import("../../lib/commandcode-usage");
+	const keys = getProviderKeyStore();
+	saveSettings({
+		...settings,
+		commandCode: {
+			apiKey: "cc-first-secret",
+			baseUrl: "https://cc-quota.example/provider/v1",
+			disabled: false,
+		},
+	});
+	const first = keys.list(COMMAND_CODE_KEY_OWNER)[0];
+	if (!first) throw new Error("missing Command Code fixture");
+	const second = keys.add(COMMAND_CODE_KEY_OWNER, { apiKey: "cc-second-secret" });
+	const auth: Array<string | null> = [];
+	let release!: () => void;
+	const upstream = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	stubFetch(async (input, init) => {
+		auth.push(new Headers(init?.headers).get("Authorization"));
+		await upstream;
+		return Response.json(
+			String(input).endsWith("/credits")
+				? {
+						credits: { monthlyCredits: 7 },
+						windowLimits: {
+							limited: true,
+							fiveHour: { used: 2, cap: 10, exceeded: false, resetAt: Date.now() + 60_000 },
+						},
+					}
+				: {},
+		);
+	});
+	try {
+		const response = await refresh("admin", { groupId: "CommandCode", credentialId: second.id });
+		expect(response.status).toBe(200);
+		const pending = byGroup((await response.json()) as QuotaSnapshotsResponse, "CommandCode");
+		expect(pending.find((row) => row.credentialId === second.id)?.refreshing).toBe(true);
+		expect(pending.find((row) => row.credentialId === first.id)?.refreshing).toBe(false);
+		expect(auth).toContain("Bearer cc-second-secret");
+		// Join the existing source-owned task; the API deliberately acknowledges non-TD probes early.
+		const completion = getCommandCodeUsageForCredential(second.id);
+		release();
+		await completion;
+		const data = readQuotaSnapshots(true, false);
+		const rows = byGroup(data, "CommandCode");
+		expect(
+			rows.find((row) => row.credentialId === second.id)?.snapshot?.balances[0]?.remaining,
+		).toBe(7);
+		expect(rows.find((row) => row.credentialId === first.id)?.snapshot).toBeNull();
+		expect(auth.every((header) => header === "Bearer cc-second-secret")).toBe(true);
+		expect(JSON.stringify(data)).not.toMatch(/cc-first-secret|cc-second-secret/);
+	} finally {
+		release();
+		keys.removeProvider(COMMAND_CODE_KEY_OWNER);
+		quotaStore.remove(first.id);
+		quotaStore.remove(second.id);
+	}
 });

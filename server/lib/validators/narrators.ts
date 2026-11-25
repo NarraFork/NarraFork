@@ -27,6 +27,14 @@ export const modelTraceOptionsSchema = z.strictObject({
 	calibrate: z.boolean().optional(),
 });
 
+export const modelTraceCalibrationSchema = z.strictObject({
+	resultId: z
+		.string()
+		.min(1)
+		.max(128)
+		.regex(/^[A-Za-z0-9_-]+$/),
+});
+
 const composerDocumentSchema = z
 	.unknown()
 	.transform((value, ctx) => {

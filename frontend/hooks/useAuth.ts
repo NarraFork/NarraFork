@@ -17,7 +17,9 @@ export async function applySession(qc: QueryClient, data: LoginSession): Promise
 	} else {
 		setToken(data.token);
 	}
-	// Never let a new account hydrate from the preceding account's raw preference cache.
+	// Never let a new account hydrate from the preceding account's raw preference cache. The
+	// prefix covers every per-user preference read, the sidebar's tab pages and one-tab pin
+	// states (`RECENT_TAB_STATE_QUERY_ROOT`) included.
 	qc.removeQueries({ queryKey: ["user-preferences"] });
 	appearanceStore.activate(data.user.id);
 	// Seed the user cache immediately so AuthenticatedLayout won't flash.

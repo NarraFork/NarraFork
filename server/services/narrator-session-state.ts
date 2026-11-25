@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import type { EventEmitter } from "node:events";
 import type { FileReferenceSnapshot } from "@shared/file-reference";
 import type { DangerInfo, PermissionResult, ReasoningEffort } from "../lib/agent";
+import type { PendingPlanReflectionRunner } from "../lib/agent/pending-plan-reflection";
 import { AsyncMutex } from "../lib/async-mutex";
 import { AppError, NotFoundError } from "../lib/errors";
 import { hotSafe } from "../lib/hot-safe";
@@ -311,6 +312,18 @@ export interface PendingPermission {
 	planSource?: Readonly<PendingPlanSource>;
 	planModeSoftDeny?: boolean;
 	planSubmittedFromFile?: boolean;
+	/**
+	 * Runs this call's plan reflection on demand while its ExitPlanMode approval waits.
+	 *
+	 * The loop publishes it for the length of the wait (`agent/pending-plan-reflection.ts`),
+	 * because only that stack frame still holds the AgentConfig and history a reflection
+	 * projects from. Absent for a request raised without a live gate behind it.
+	 */
+	planReflection?: PendingPlanReflectionRunner;
+	/** A reflection started from this wait is in flight; a second trigger is a no-op. */
+	planReflectionRunning?: boolean;
+	/** Aborted when the request is decided first, so a running review stops immediately. */
+	planReflectionAbort?: AbortController;
 	questionReflectionTimer?: ReturnType<typeof setTimeout>;
 	/**
 	 * Absolute epoch-ms timestamp at which automatic AskUserQuestion reflection

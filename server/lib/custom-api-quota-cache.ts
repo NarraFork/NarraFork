@@ -1,7 +1,7 @@
 import { unlink } from "node:fs/promises";
 import type { QuotaSnapshot } from "@shared/quota-snapshot";
 import { getNarraforkPath } from "./narrafork-home";
-import { firstCredential, streamQuotaIdentity } from "./provider-key-subjects";
+import { credentialForStream, firstCredential } from "./provider-key-subjects";
 import { getProviderKeyStore, withProviderKey } from "./provider-keys";
 import { type CustomApiProviderConfig, settings } from "./settings";
 import { quotaStore, STREAM_QUOTA_SOURCE } from "./sourcing/quota-store";
@@ -72,8 +72,9 @@ export function updateCustomApiQuotaByPrefix(
 	expectedProviderIdentity?: string,
 ): void {
 	const config = (settings.customApiProviders ?? []).find((provider) => provider.prefix === prefix);
-	if (!config || streamQuotaIdentity(config) !== expectedProviderIdentity) return;
-	const credential = firstCredential(config);
+	if (!config) return;
+	const credential = credentialForStream(config, expectedProviderIdentity);
+	if (!credential) return;
 	knownCredentialIds.set(config.id, credential.id);
 	quotaStore.set(
 		credential.id,

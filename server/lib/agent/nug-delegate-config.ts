@@ -1,6 +1,10 @@
+import type { CredentialNetwork } from "@shared/credential-network";
 import type { ToolResultImagesMode } from "@shared/tool-result-images";
 import type { ResolvedNugModelMeta } from "../nug-model-cache";
 import type { NUGProviderConfig, ProxyOverride } from "../settings";
+
+export type NugInferenceConfig = NUGProviderConfig &
+	Pick<CredentialNetwork, "userAgentMode" | "customUserAgent" | "extraHeaders">;
 
 export interface NugDelegateBaseConfig {
 	toolResultImages?: ToolResultImagesMode;
@@ -10,12 +14,14 @@ export interface NugDelegateBaseConfig {
 	apiKey: string;
 	defaultModel: string;
 	proxy?: ProxyOverride;
+	userAgentMode?: CredentialNetwork["userAgentMode"];
+	customUserAgent?: string;
 	extraHeaders: Record<string, string>;
 }
 
 /** Shared configuration inherited by every NUG protocol delegate. */
 export function buildNugDelegateBaseConfig(
-	config: NUGProviderConfig,
+	config: NugInferenceConfig,
 	meta: ResolvedNugModelMeta,
 	extraHeaders: Record<string, string>,
 ): NugDelegateBaseConfig {
@@ -27,6 +33,8 @@ export function buildNugDelegateBaseConfig(
 		apiKey: config.apiKey,
 		defaultModel: meta.routedModel,
 		proxy: config.proxy,
-		extraHeaders,
+		userAgentMode: config.userAgentMode,
+		customUserAgent: config.customUserAgent,
+		extraHeaders: { ...config.extraHeaders, ...extraHeaders },
 	};
 }
