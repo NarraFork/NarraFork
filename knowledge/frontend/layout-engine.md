@@ -78,7 +78,7 @@ keywords:
   - KaTeX 几何
   - shared-core.guard
 status: draft
-verified_at: b3a48662f
+verified_at: 27bdc3eb5
 ---
 # 前端排版引擎
 
