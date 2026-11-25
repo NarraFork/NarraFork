@@ -33,7 +33,6 @@ import { TEAM_MERGE_CONFLICTS_MAX, TEAM_MERGE_REF_PREFIX } from "@shared/project
 import { AppError, GitError } from "../../lib/errors";
 import {
 	cleanGitEnv,
-	ensureConfigOverridesHonored,
 	GIT_NO_EXEC_CONFIG,
 	gitConfigEnv,
 	TRUE_HISTORY_ENV,
@@ -43,7 +42,7 @@ import type { GitIdentityEnv } from "../../lib/git-identity";
 import { envWithAmbientProxy } from "../../lib/net/proxy-env";
 import { DEV_NULL } from "../../lib/platform";
 import { safeSpawn } from "../../lib/spawn";
-import { assertTrueHistory, configuredPrograms } from "./team-git";
+import { assertTrueHistory, configuredPrograms, prepareTeamRepo } from "./team-git";
 
 /** Ordinary reads and ref writes. */
 const SHORT_TIMEOUT_MS = 30_000;
@@ -88,7 +87,9 @@ async function run(
 	},
 ): Promise<RunResult> {
 	options.signal?.throwIfAborted();
-	await ensureConfigOverridesHonored();
+	// Before anything that could read an object: no lazy fetch through a promisor remote.
+	await prepareTeamRepo(cwd);
+	options.signal?.throwIfAborted();
 	// Nothing inherited routes git to another repository, object store or configuration.
 	const base = cleanGitEnv(options.network ? envWithAmbientProxy() : process.env);
 	const result = await safeSpawn({

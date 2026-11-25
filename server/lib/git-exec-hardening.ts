@@ -275,6 +275,14 @@ export function setLazyFetchProbeSeamsForTests(seams: {
 const noLazyFetchSupported = () => lazyFetchVerdict === "supported";
 
 /**
+ * Whether every hardened command is already kept from fetching a missing object lazily
+ * (`GIT_NO_LAZY_FETCH` honoured, as settled by {@link ensureConfigOverridesHonored}). When not,
+ * a repository must be checked for partial-clone / promisor settings before any command that
+ * reads objects (`untrustedProgramOverrides` refuses it).
+ */
+export const lazyFetchPrevented = (): boolean => noLazyFetchSupported();
+
+/**
  * Probe the behaviour itself: a scratch partial clone whose promisor remote (a scratch
  * repository next to it) holds a blob the clone lacks. With `GIT_NO_LAZY_FETCH=1` `cat-file -e`
  * must fail; without it (explicitly unset), the same command must fetch the blob and succeed.

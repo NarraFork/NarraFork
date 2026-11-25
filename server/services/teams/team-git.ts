@@ -34,6 +34,7 @@ import {
 	GIT_NO_EXEC_CONFIG,
 	type GitConfiguredPrograms,
 	gitConfigEnv,
+	lazyFetchPrevented,
 	noExternalDiffArgs,
 	PROGRAM_CONFIG_QUERY,
 	parseProgramConfig,
@@ -68,7 +69,36 @@ const TREE_ENTRY_MAX_BYTES = 16 * 1024;
 const BLOB_STDERR_MAX_BYTES = 16 * 1024;
 const SHA = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 
+/**
+ * The gate every team git command passes before it runs: git honours the configuration
+ * overrides, and — unless this git is known to honour `GIT_NO_LAZY_FETCH` — the repository at
+ * `dir` has no partial-clone or promisor setting (`GIT_TOO_OLD_FOR_PARTIAL_CLONE`). Only
+ * configuration is read here, never an object, so a missing object (say one a replacement ref
+ * names) can never be fetched lazily through a remote the repository configured before the
+ * refusal. `spawnGit` and team-git-write's `run()` await it first; on a git that honours
+ * `GIT_NO_LAZY_FETCH` it costs nothing.
+ */
+export async function prepareTeamRepo(dir: string): Promise<void> {
+	await ensureConfigOverridesHonored();
+	if (lazyFetchPrevented()) return;
+	untrustedProgramOverrides(await configuredPrograms(dir));
+}
+
+/** A team git command, after {@link prepareTeamRepo}. */
 async function spawnGit(
+	cwd: string,
+	args: readonly string[],
+	config: ReadonlyArray<readonly [string, string]>,
+	maxOutputBytes: number,
+	timeout = READ_TIMEOUT_MS,
+	stdoutStream?: { maxBytes: number; onChunk: (chunk: Uint8Array) => boolean | undefined },
+) {
+	await prepareTeamRepo(cwd);
+	return spawnGitUngated(cwd, args, config, maxOutputBytes, timeout, stdoutStream);
+}
+
+/** Only for reading configuration (the gate itself): no object is read. */
+async function spawnGitUngated(
 	cwd: string,
 	args: readonly string[],
 	config: ReadonlyArray<readonly [string, string]>,
@@ -235,7 +265,8 @@ export async function assertNoReplacedHistory(
 
 /** The filters and configuration-defined hooks a checkout's configuration names (all scopes). */
 export async function configuredPrograms(cwd: string): Promise<GitConfiguredPrograms> {
-	const result = await spawnGit(cwd, PROGRAM_CONFIG_QUERY, GIT_NO_EXEC_CONFIG, 64 * 1024);
+	// Configuration only: this is what the gate itself reads.
+	const result = await spawnGitUngated(cwd, PROGRAM_CONFIG_QUERY, GIT_NO_EXEC_CONFIG, 64 * 1024);
 	// Exit 1 without output: nothing matched.
 	if (result.exitCode === 1 && !result.stdout) return { filters: [], hooks: [] };
 	if (result.exitCode !== 0 || result.truncated)

@@ -13,7 +13,12 @@ import { join } from "node:path";
 import { TEAM_MERGE_CONFLICTS_MAX } from "@shared/project-teams";
 import { GIT_NO_EXEC_CONFIG, setNoLazyFetchSupportForTests } from "../../../lib/git-exec-hardening";
 import { safeSpawn } from "../../../lib/spawn";
-import { configuredPrograms, teamGit } from "../team-git";
+import {
+	assertNoReplacedHistory,
+	assertTrueHistory,
+	configuredPrograms,
+	teamGit,
+} from "../team-git";
 import {
 	type FastForwardCommands,
 	fastForwardCheckout,
@@ -485,6 +490,53 @@ describe("team git writes", () => {
 			expect(await inspectCheckout(path, "main", sha)).toBe("unsafe_path");
 		}
 		expect(fastForwardCommand("/srv/r\u00e9po \u2019x", "main", sha)).not.toBeNull();
+	});
+
+	test("without lazy-fetch protection a promisor repository is refused before any object is read (Devin)", async () => {
+		const head = await commitFile("a.txt", "a\n", "base");
+		// A promisor remote, and a replacement ref (an agent can write one) naming a missing object.
+		const marker = join(temporary, `promisor-ran-${Math.random().toString(36).slice(2)}`);
+		const helper = join(temporary, `upload-pack-${Math.random().toString(36).slice(2)}`);
+		await writeFile(helper, `#!/bin/sh\ntouch '${marker}'\nexit 1\n`);
+		await chmod(helper, 0o755);
+		for (const [key, value] of [
+			["core.repositoryformatversion", "1"],
+			["extensions.partialClone", "evil"],
+			["remote.evil.url", join(temporary, "nowhere.git")],
+			["remote.evil.promisor", "true"],
+			["remote.evil.uploadpack", helper],
+		] as const)
+			await git(["config", key, value]);
+		const missing = "e".repeat(40);
+		await git(["update-ref", `refs/replace/${missing}`, head]);
+		const trace = join(temporary, `trace-${Math.random().toString(36).slice(2)}`);
+		setNoLazyFetchSupportForTests(false);
+		process.env.GIT_TRACE = trace;
+		try {
+			const refused = expect.objectContaining({ code: "GIT_TOO_OLD_FOR_PARTIAL_CLONE" });
+			for (const attempt of [
+				() => assertNoReplacedHistory(repo, [head]),
+				() => assertTrueHistory(repo),
+				() => teamGit(repo).isAncestor(head, head),
+				() => teamGit(repo).resolveCommit("HEAD"),
+				() => teamRepoGit(repo).resolve("HEAD"),
+				() => teamRepoGit(repo).isAncestor(head, head),
+				() => teamRepoGit(repo).mergeTree(head, head),
+			])
+				await expect(attempt()).rejects.toEqual(refused);
+			expect(await inspectCheckout(repo, "main", head, { repo })).toBe("unreadable");
+			// Only configuration was read: no command that reads objects ran, nothing was fetched.
+			const commands = (await readFile(trace, "utf8"))
+				.split("\n")
+				.map((line) => /trace: built-in: git (\S+)/.exec(line)?.[1])
+				.filter(Boolean);
+			expect(commands.length).toBeGreaterThan(0);
+			expect([...new Set(commands)]).toEqual(["config"]);
+			expect(existsSync(marker)).toBe(false);
+		} finally {
+			delete process.env.GIT_TRACE;
+			setNoLazyFetchSupportForTests(null);
+		}
 	});
 });
 
