@@ -10,6 +10,7 @@
  * and the bar says how an item becomes merged (its branch landing in the base is noticed).
  */
 import { useReturnWorkItem, useTeamWorkDiff, useTeamWorkItem } from "@frontend/hooks/useTeams";
+import { describeApiError } from "@frontend/lib/api-error";
 import { formatSmartTime } from "@frontend/lib/format";
 import {
 	ActionIcon,
@@ -44,9 +45,15 @@ import {
 import { type ReactNode, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ActivityLine } from "./TeamActivity";
-import { diffLineKind, liveWorkerStatus, returnReason } from "./team-page-model";
+import {
+	diffLineKind,
+	itemMarks,
+	liveWorkerStatus,
+	returnErrorKey,
+	returnReason,
+	showsStat,
+} from "./team-page-model";
 import { ATTENTION_BG, ATTENTION_TEXT, DiffCount, MONO, StatusDot, TABULAR } from "./team-page-ui";
-import { teamErrorMessage } from "./UpgradeToTeamModal";
 
 const DIFF_COLOR = {
 	add: {
@@ -284,7 +291,11 @@ function DrawerBody({
 					)}
 				</Field>
 				<Field label={t("teams.page.drawer.changes")}>
-					{detail.stat ? (
+					{detail.stat && !showsStat(detail.stat) ? (
+						<Text size="sm" c="dimmed">
+							{t("teams.page.drawer.noFiles")}
+						</Text>
+					) : detail.stat ? (
 						<Group gap={8}>
 							<DiffCount stat={detail.stat} size="sm" />
 							<Text size="sm" c="dimmed" style={TABULAR}>
@@ -365,7 +376,11 @@ function DrawerBody({
 										<Text size="sm" style={{ flex: 1, minWidth: 0 }} truncate>
 											{t("teams.page.drawer.round", {
 												round: round.round,
-												who: round.actorName ?? t("teams.page.drawer.reviewer"),
+												// An agent's round is the coordinator recording a reviewer's verdict.
+												who:
+													round.by === "person"
+														? (round.actorName ?? t("teams.activity.unknownPerson"))
+														: t("teams.page.drawer.reviewer"),
 											})}
 											{round.findings !== null && round.findings > 0 && (
 												<Text component="span" inherit c="dimmed">
@@ -394,7 +409,7 @@ function DrawerBody({
 				<SectionTitle>{t("teams.page.drawer.timelineTitle")}</SectionTitle>
 				<Stack gap={0} ml={-10}>
 					{detail.events.map((event) => (
-						<ActivityLine key={event.id} event={event} showItem={false} />
+						<ActivityLine key={event.id} event={event} showItem={false} coordinatorId={teamId} />
 					))}
 				</Stack>
 				{detail.eventsMore && (
@@ -424,6 +439,12 @@ function ReturnBar({
 	const { t } = useTranslation("projects");
 	const [reason, setReason] = useState("");
 	const send = useReturnWorkItem(projectId, teamId);
+	const returnErrorText = (error: unknown) => {
+		const key = returnErrorKey(error);
+		return key
+			? t(key)
+			: `${t("teams.page.drawer.returnFailed")} ${describeApiError(error, t).message}`;
+	};
 	const ready = returnReason(reason);
 	const base = detail.base;
 	const submit = () => {
@@ -467,7 +488,7 @@ function ReturnBar({
 				/>
 				{send.isError && (
 					<Alert color="red" p="xs" data-testid="team-return-error">
-						{teamErrorMessage(send.error, t, "disband") || t("teams.page.drawer.returnFailed")}
+						{returnErrorText(send.error)}
 					</Alert>
 				)}
 				<Group justify="space-between" wrap="wrap" gap="sm" style={{ rowGap: 6 }}>
@@ -606,6 +627,20 @@ export function TeamWorkDrawer({
 								{t(`teams.page.drawer.verdict.${item.lastReview ?? "none"}`)}
 							</Badge>
 						)}
+						{item &&
+							itemMarks(item).map((mark) => (
+								<Badge
+									key={mark}
+									size="sm"
+									radius="sm"
+									variant="light"
+									color="gray"
+									tt="none"
+									data-mark={mark}
+								>
+									{t(`teams.page.marks.${mark}`, { key: item.exclusiveKey ?? "" })}
+								</Badge>
+							))}
 					</Group>
 					<ActionIcon
 						variant="subtle"

@@ -75,3 +75,30 @@ export function TeamStart({ teamId, onPick }: { teamId: string; onPick?: () => v
 		</Box>
 	);
 }
+
+/** The starting state for a read-only member: no prompts to pick, one plain line. */
+export function TeamReadOnlyStart() {
+	const { t } = useTranslation("projects");
+	return (
+		<Box
+			data-testid="team-start-read-only"
+			style={{
+				position: "absolute",
+				left: 0,
+				right: 0,
+				top: 56,
+				bottom: 150,
+				display: "flex",
+				alignItems: "center",
+				justifyContent: "center",
+				padding: "var(--mantine-spacing-md)",
+				background: "var(--mantine-color-body)",
+				pointerEvents: "none",
+			}}
+		>
+			<Text size="sm" c="dimmed" ta="center">
+				{t("teams.page.readOnlyStart")}
+			</Text>
+		</Box>
+	);
+}

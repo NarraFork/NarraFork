@@ -316,7 +316,8 @@
 				"waitingYou": "{{count}} waiting on you",
 				"waitingMembers": "{{count}} waiting on members",
 				"noWork": "No work items yet",
-				"done": "{{count}} done"
+				"done": "{{count}} done",
+				"waitingYouMore": "{{count}}+ waiting on you"
 			},
 			"header": {
 				"pauseAll": "Pause all",
@@ -363,7 +364,11 @@
 				"questionTitle": "Answer the question",
 				"planTitle": "Plan",
 				"tooLarge": "Too large to show here: open the session.",
-				"gone": "Already answered or withdrawn."
+				"gone": "Already answered or withdrawn.",
+				"moreInSession": "More are waiting than listed here: open the coordinator's session to see them.",
+				"unscanned": "Some waiting calls may not be listed here: open the coordinator's session to see them.",
+				"openFull": "Open session",
+				"openAsker": "Open this session"
 			},
 			"work": {
 				"work": "Work",
@@ -408,7 +413,8 @@
 					"Agent": "Delegating",
 					"AskUserQuestion": "Asking",
 					"ExitPlanMode": "Proposing a plan"
-				}
+				},
+				"waitingPerson": "Waiting on a person"
 			},
 			"empty": {
 				"title": "Work items show up here",
@@ -424,7 +430,8 @@
 				"archive": "Archive team",
 				"disband": "Disband…",
 				"archived": "Team archived",
-				"archiveFailed": "Could not archive the team."
+				"archiveFailed": "Could not archive the team.",
+				"held": "{{count}} finished items still hold their worktree, so the team cannot be disbanded yet: ask the coordinator to clean them up (you approve each cleanup), or archive the team."
 			},
 			"start": {
 				"title": "Tell the coordinator what this team should get done",
@@ -478,14 +485,29 @@
 				"confirmReturn": "Confirm return",
 				"returned": "Returned to the worker",
 				"returnedNotDelivered": "Returned, but the coordinator could not be told; tell it in the conversation.",
-				"returnFailed": "Could not return it."
+				"returnFailed": "Could not return it.",
+				"errors": {
+					"TEAM_WORK_ITEM_NOT_RETURNABLE": "Only an item in review or ready to merge can be returned; it has moved on meanwhile.",
+					"TEAM_WORK_ITEM_CHANGED": "The item changed meanwhile; look again and return it if it still needs it.",
+					"TEAM_ARCHIVED": "The team is archived; nothing can change. Restore it first."
+				}
 			},
 			"settings": {
 				"title": "Team settings",
 				"save": "Save",
 				"saved": "Team settings saved",
 				"failed": "Could not save the settings."
-			}
+			},
+			"marks": {
+				"exclusive": "Holds the exclusive path lock ({{key}})",
+				"worktree": "Finished but still holds its worktree; the coordinator can clean it up"
+			},
+			"running": {
+				"title": "Running sessions",
+				"none": "Nothing running"
+			},
+			"readOnlyStart": "Nobody has given the coordinator a goal yet.",
+			"coordinator": "Coordinator"
 		}
 	},
 	"skills": "Skills",

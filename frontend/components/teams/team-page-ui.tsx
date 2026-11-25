@@ -5,7 +5,7 @@
 import { Box, Text } from "@mantine/core";
 import type { TeamWorkDiffStat } from "@shared/project-teams";
 import type { CSSProperties } from "react";
-import type { RowTone, StatusTone } from "./team-page-model";
+import { type RowTone, type StatusTone, showsStat } from "./team-page-model";
 
 /** 「等你处理」's amber: the page's only saturated colour. */
 export const ATTENTION_COLOR = "var(--mantine-color-yellow-6)";
@@ -64,10 +64,11 @@ export function DiffCount({
 	stat,
 	size = "xs",
 }: {
-	stat: Pick<TeamWorkDiffStat, "added" | "removed"> | null | undefined;
+	stat: (Pick<TeamWorkDiffStat, "added" | "removed"> & { files?: number }) | null | undefined;
 	size?: "xs" | "sm";
 }) {
-	if (!stat) return null;
+	// Nothing changed yet (a queued item, a branch with no commit): no "+0 -0".
+	if (!stat || !showsStat(stat)) return null;
 	return (
 		<Text
 			component="span"

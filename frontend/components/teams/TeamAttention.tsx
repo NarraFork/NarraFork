@@ -87,7 +87,13 @@ const KIND_ICON = {
 } as const;
 
 /** Who asks: the work item's title (its worker asks), or the coordinator, or the session. */
-function Asker({ entry }: { entry: Exclude<AttentionEntry, { kind: "merge" }> }) {
+function Asker({
+	entry,
+	onOpenSession,
+}: {
+	entry: Exclude<AttentionEntry, { kind: "merge" }>;
+	onOpenSession?: (narratorId: string) => void;
+}) {
 	const { t } = useTranslation("projects");
 	const coordinator = entry.approval.depth === 0;
 	const who = coordinator
@@ -99,16 +105,39 @@ function Asker({ entry }: { entry: Exclude<AttentionEntry, { kind: "merge" }> })
 		plan: coordinator ? "coordinatorAsksPlan" : "asksPlan",
 		rule: coordinator ? "coordinatorAsksRule" : "asksRule",
 	}[entry.kind];
+	const reason = entry.approval.decisionReason;
 	return (
-		<Text size="sm" style={{ overflowWrap: "anywhere" }}>
-			<Text component="span" inherit fw={700}>
-				{who}
-			</Text>{" "}
-			{t(`teams.page.attention.${verb}`, { tool: entry.approval.toolName })}{" "}
-			<Text component="span" size="xs" c="dimmed" title={entry.approval.createdAt}>
-				{formatSmartTime(entry.approval.createdAt)}
+		<>
+			<Text size="sm" style={{ overflowWrap: "anywhere" }}>
+				{/* The name opens the asking session (the coordinator's is this page's conversation). */}
+				<UnstyledButton
+					onClick={() => onOpenSession?.(entry.approval.agent.id)}
+					disabled={!onOpenSession}
+					title={t("teams.page.attention.openAsker")}
+					data-testid="team-approval-asker"
+					style={{
+						fontWeight: 700,
+						textDecoration: onOpenSession ? "underline dotted" : undefined,
+					}}
+				>
+					{who}
+				</UnstyledButton>{" "}
+				{t(`teams.page.attention.${verb}`, { tool: entry.approval.toolName })}{" "}
+				<Text component="span" size="xs" c="dimmed" title={entry.approval.createdAt}>
+					{formatSmartTime(entry.approval.createdAt)}
+				</Text>
 			</Text>
-		</Text>
+			{reason && entry.kind === "tool" && (
+				<Text
+					size="xs"
+					c="dimmed"
+					style={{ overflowWrap: "anywhere" }}
+					data-testid="team-approval-reason"
+				>
+					{reason}
+				</Text>
+			)}
+		</>
 	);
 }
 
@@ -155,7 +184,7 @@ function ToolCard({
 			actions={actions}
 			body={
 				<>
-					<Asker entry={entry} />
+					<Asker entry={entry} onOpenSession={actions.onOpenSession} />
 					{entry.approval.preview && (
 						<Code
 							block
@@ -227,9 +256,14 @@ function QuestionCard({
 						key={option}
 						size="xs"
 						variant="default"
+						maw={220}
 						disabled={decision.sent || decision.pending}
+						// The whole title is the answer; only the label is clipped.
 						onClick={() => answer(option)}
+						title={option}
 						data-testid="team-question-option"
+						data-value={option}
+						styles={{ label: { overflow: "hidden", textOverflow: "ellipsis" } }}
 					>
 						{option}
 					</Button>
@@ -294,7 +328,7 @@ function QuestionCard({
 				actions={actions}
 				body={
 					<>
-						<Asker entry={entry} />
+						<Asker entry={entry} onOpenSession={actions.onOpenSession} />
 						{asked && (
 							<Text
 								size="sm"
@@ -374,7 +408,7 @@ function PlanCard({
 				actions={actions}
 				body={
 					<>
-						<Asker entry={entry} />
+						<Asker entry={entry} onOpenSession={actions.onOpenSession} />
 						{entry.approval.preview && (
 							<Text
 								size="sm"
@@ -458,7 +492,7 @@ function RuleCard({
 		<CardFrame
 			entry={entry}
 			actions={actions}
-			body={<Asker entry={entry} />}
+			body={<Asker entry={entry} onOpenSession={actions.onOpenSession} />}
 			buttons={
 				<Button
 					size="xs"
@@ -656,14 +690,39 @@ const PHONE_CSS = `
 export function TeamAttention({
 	entries,
 	phone,
+	more: moreCalls = false,
+	unscanned = false,
+	onOpenCoordinatorSession,
 	...actions
-}: AttentionActions & { entries: AttentionEntry[]; phone: boolean }) {
+}: AttentionActions & {
+	entries: AttentionEntry[];
+	phone: boolean;
+	/** More calls wait than the list holds (50). */
+	more?: boolean;
+	/** The scan stopped before reading every pending call. */
+	unscanned?: boolean;
+	onOpenCoordinatorSession?: () => void;
+}) {
 	const { t } = useTranslation("projects");
 	const [expanded, setExpanded] = useState(false);
 	const [position, setPosition] = useState(0);
 	const scroller = useRef<HTMLDivElement | null>(null);
 	if (entries.length === 0) return null;
 	const { shown, hidden } = attentionView(entries, expanded);
+	// The list holds at most 50 calls; past it (or when the scan stopped early) say so.
+	const beyond =
+		moreCalls || unscanned ? (
+			<Group gap="xs" wrap="nowrap" justify="space-between" data-testid="team-attention-beyond">
+				<Text size="xs" c="dimmed">
+					{t(moreCalls ? "teams.page.attention.moreInSession" : "teams.page.attention.unscanned")}
+				</Text>
+				{onOpenCoordinatorSession && (
+					<Button size="compact-xs" variant="subtle" onClick={onOpenCoordinatorSession}>
+						{t("teams.page.attention.openFull")}
+					</Button>
+				)}
+			</Group>
+		) : null;
 	const header = (
 		<Group gap={8} wrap="nowrap" justify="space-between">
 			<Group gap={8} wrap="nowrap">
@@ -677,7 +736,7 @@ export function TeamAttention({
 					style={{ background: ATTENTION_COLOR, color: "var(--mantine-color-dark-9)", ...TABULAR }}
 					data-testid="team-attention-count"
 				>
-					{entries.length}
+					{moreCalls ? `${entries.length}+` : entries.length}
 				</Badge>
 				{phone && (
 					<Text size="xs" c="dimmed">
@@ -778,6 +837,7 @@ export function TeamAttention({
 							))}
 						</Group>
 					)}
+					{beyond}
 				</Stack>
 			</Box>
 		);
@@ -808,6 +868,11 @@ export function TeamAttention({
 				{more && (
 					<Box px="md" py={6} style={{ borderTop: `1px solid ${ATTENTION_BORDER}` }}>
 						{more}
+					</Box>
+				)}
+				{beyond && (
+					<Box px="md" py={6} style={{ borderTop: `1px solid ${ATTENTION_BORDER}` }}>
+						{beyond}
 					</Box>
 				)}
 			</Box>

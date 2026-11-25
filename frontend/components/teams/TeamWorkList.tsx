@@ -14,17 +14,36 @@
  */
 import { useTeamBoardColumn } from "@frontend/hooks/useTeams";
 import { formatSmartTime } from "@frontend/lib/format";
-import { Alert, Box, Button, Group, Loader, Stack, Text, UnstyledButton } from "@mantine/core";
+import {
+	Alert,
+	Box,
+	Button,
+	Group,
+	Loader,
+	Stack,
+	Text,
+	Tooltip,
+	UnstyledButton,
+} from "@mantine/core";
 import type {
 	TeamBoardItem,
 	TeamPageSummary,
 	TeamPendingApproval,
 	TeamWorkDiffStat,
 } from "@shared/project-teams";
-import { IconArchive, IconChevronRight, IconGitBranch } from "@tabler/icons-react";
+import {
+	IconArchive,
+	IconChevronRight,
+	IconFolderCode,
+	IconGitBranch,
+	IconLock,
+} from "@tabler/icons-react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
+	type ItemMark,
+	itemMarks,
+	liveActivity,
 	liveWorkerStatus,
 	onlookerSeesWaiting,
 	type RowLine,
@@ -63,9 +82,11 @@ export function WorkItemRow({
 	onOpen: (itemId: string) => void;
 }) {
 	const { t } = useTranslation("projects");
-	const { item } = row;
+	// What it is doing now comes from the live summary when it names the worker.
+	const item = { ...row.item, activity: liveActivity(row.item, summary) };
 	const workerStatus = item.worker ? liveWorkerStatus(item.worker, summary) : null;
-	const line = rowLine(row, workerStatus, item.baseRef ?? base);
+	const marks = itemMarks(item);
+	const line = rowLine({ ...row, item }, workerStatus, item.baseRef ?? base);
 	return (
 		<UnstyledButton
 			onClick={() => onOpen(item.id)}
@@ -88,9 +109,12 @@ export function WorkItemRow({
 					<StatusDot tone={line.tone} />
 				</Box>
 				<Stack gap={1} style={{ flex: 1, minWidth: 0 }}>
-					<Text size="sm" truncate fw={500}>
-						{item.title}
-					</Text>
+					<Group gap={6} wrap="nowrap" style={{ minWidth: 0 }}>
+						<Text size="sm" truncate fw={500}>
+							{item.title}
+						</Text>
+						<ItemMarks marks={marks} exclusiveKey={item.exclusiveKey} />
+					</Group>
 					<Text size="xs" c="dimmed" truncate data-testid="team-work-line" data-line={line.key}>
 						<Text
 							component="span"
@@ -279,9 +303,37 @@ export function TeamWorkEmpty() {
 	);
 }
 
+/** Small marks after a title: the exclusive path lock, a finished item's kept worktree. */
+export function ItemMarks({
+	marks,
+	exclusiveKey,
+}: {
+	marks: ItemMark[];
+	exclusiveKey: string | null;
+}) {
+	const { t } = useTranslation("projects");
+	if (marks.length === 0) return null;
+	return (
+		<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
+			{marks.map((mark) => {
+				const Icon = mark === "exclusive" ? IconLock : IconFolderCode;
+				const label = t(`teams.page.marks.${mark}`, { key: exclusiveKey ?? "" });
+				return (
+					<Tooltip key={mark} label={label} withinPortal multiline maw={260}>
+						<span data-mark={mark} aria-label={label} style={{ display: "inline-flex" }}>
+							<Icon size={13} aria-hidden style={{ opacity: 0.7 }} />
+						</span>
+					</Tooltip>
+				);
+			})}
+		</Group>
+	);
+}
+
 /** Everything finished: keep going in the conversation, or archive / disband the team. */
 function TeamWrapUp({
 	done,
+	held,
 	base,
 	member,
 	archiving,
@@ -289,6 +341,8 @@ function TeamWrapUp({
 	onDisband,
 }: {
 	done: number;
+	/** Finished items still holding a worktree: disbanding is refused until they are cleaned. */
+	held: number;
 	base: string;
 	member: boolean;
 	archiving: boolean;
@@ -314,6 +368,11 @@ function TeamWrapUp({
 					? t("teams.page.wrapUp.bodyMerged", { count: done, base })
 					: t("teams.page.wrapUp.body")}
 			</Text>
+			{held > 0 && (
+				<Text size="sm" mt={6} style={TABULAR} data-testid="team-wrap-up-held">
+					{t("teams.page.wrapUp.held", { count: held })}
+				</Text>
+			)}
 			{member && (
 				<Group gap="xs" mt="md">
 					{onArchive && (
@@ -328,7 +387,7 @@ function TeamWrapUp({
 							{t("teams.page.wrapUp.archive")}
 						</Button>
 					)}
-					{onDisband && (
+					{onDisband && held === 0 && (
 						<Button
 							size="xs"
 							variant="subtle"
@@ -403,6 +462,7 @@ export function TeamWorkList({
 			{mode.wrapUp && (
 				<TeamWrapUp
 					done={counts?.done ?? 0}
+					held={summary?.heldWorktreeCount ?? 0}
 					base={base}
 					member={member}
 					archiving={archiving}

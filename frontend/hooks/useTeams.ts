@@ -9,11 +9,22 @@
  * or column counts), the activity on a new event, the approvals when their count changed.
  */
 import type { CreateTeamPayload, UpgradeToTeamPayload } from "@frontend/lib/api/teams";
-import { TEAM_WORK_STATS_IDS_MAX, type TeamBoardColumn } from "@shared/project-teams";
-import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+	TEAM_WORK_STATS_IDS_MAX,
+	type TeamBoardColumn,
+	type TeamWorkStatsResponse,
+} from "@shared/project-teams";
+import {
+	useInfiniteQuery,
+	useMutation,
+	useQueries,
+	useQuery,
+	useQueryClient,
+} from "@tanstack/react-query";
 import { useEffect, useRef } from "react";
 import {
 	boardSignature,
+	chunkIds,
 	nextPollDelay,
 	nudgeDelay,
 	type PauseOutcome,
@@ -318,17 +329,27 @@ export function useApprovalDetail(teamId: string, requestId: string, enabled: bo
 	});
 }
 
-/** Lines added / removed and files of the listed work items (at most 50; none: no request). */
+/**
+ * Lines added / removed and files of the listed work items: one request per 50 ids (the
+ * endpoint's limit), merged; none listed, no request.
+ */
 export function useTeamWorkStats(projectId: string, teamId: string, ids: readonly string[]) {
-	const sorted = [...new Set(ids)].sort().slice(0, TEAM_WORK_STATS_IDS_MAX);
-	return useQuery({
-		queryKey: teamKeys.workStats(teamId, sorted),
-		queryFn: () => api.getTeamWorkStats(projectId, teamId, sorted),
-		enabled: !!projectId && !!teamId && sorted.length > 0,
-		gcTime: TEAM_GC_TIME_MS,
-		staleTime: 15_000,
-		placeholderData: (previous) => previous,
-		refetchOnWindowFocus: false,
+	const chunks = chunkIds(ids, TEAM_WORK_STATS_IDS_MAX);
+	return useQueries({
+		queries: chunks.map((chunk) => ({
+			queryKey: teamKeys.workStats(teamId, chunk),
+			queryFn: () => api.getTeamWorkStats(projectId, teamId, chunk),
+			enabled: !!projectId && !!teamId,
+			gcTime: TEAM_GC_TIME_MS,
+			staleTime: 15_000,
+			placeholderData: (previous: TeamWorkStatsResponse | undefined) => previous,
+			refetchOnWindowFocus: false,
+		})),
+		combine: (results) => {
+			const stats: TeamWorkStatsResponse["stats"] = {};
+			for (const result of results) Object.assign(stats, result.data?.stats);
+			return { stats, isLoading: results.some((result) => result.isLoading) };
+		},
 	});
 }
 
@@ -386,6 +407,8 @@ export function useArchiveTeam(projectId: string, teamId: string) {
 			void queryClient.invalidateQueries({ queryKey: teamKeys.team(teamId) });
 			void queryClient.invalidateQueries({ queryKey: teamKeys.summary(teamId) });
 			void queryClient.invalidateQueries({ queryKey: teamKeys.list(projectId) });
+			// The drawer's 退回 depends on the team being active.
+			void queryClient.invalidateQueries({ queryKey: teamKeys.work(teamId) });
 		},
 	});
 }
@@ -399,6 +422,8 @@ export function useUpdateTeam(projectId: string, teamId: string) {
 		meta: { suppressErrorToast: true },
 		onSuccess: (team) => {
 			queryClient.setQueryData(teamKeys.team(teamId), team);
+			// A new base branch changes every item's merge base, sizes and diffs.
+			void queryClient.invalidateQueries({ queryKey: teamKeys.work(teamId) });
 		},
 	});
 }

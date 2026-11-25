@@ -25,11 +25,11 @@ import { teamKeys } from "../../hooks/useTeams";
 import en from "../../locales/en/projects.json";
 import zh from "../../locales/zh-CN/projects.json";
 import { ProjectTeamsList } from "./ProjectTeamsList";
-import { TeamActivity } from "./TeamActivity";
+import { ActivityLine, TeamActivity } from "./TeamActivity";
 import { TeamAttention } from "./TeamAttention";
 import { TeamHeader } from "./TeamHeader";
 import { TeamMembersPanel } from "./TeamMembers";
-import { TeamStart } from "./TeamStart";
+import { TeamReadOnlyStart, TeamStart } from "./TeamStart";
 import { TeamWorkList } from "./TeamWorkList";
 import { attentionEntries, statusSentence, teamPageMode } from "./team-page-model";
 
@@ -668,5 +668,178 @@ describe("strings", () => {
 				? Object.entries(value).flatMap(([key, child]) => keys(child, `${prefix}${key}.`))
 				: [prefix.slice(0, -1)];
 		expect(keys(zh.teams).sort()).toEqual(keys(en.teams).sort());
+	});
+});
+
+describe("review fixes", () => {
+	const header = (phone: boolean) =>
+		render(
+			<TeamHeader
+				projectId="p"
+				teamId="lead"
+				projectName="acme-app"
+				title="Release crew"
+				summary={summary()}
+				status={null}
+				phone={phone}
+				onBack={noop}
+			/>,
+		);
+
+	test("the phone header keeps its back arrow", async () => {
+		expect(await header(true)).toContain('data-testid="team-back"');
+		expect(await header(false)).toContain('data-testid="team-back"');
+	});
+
+	test("等你处理: the asker opens its session, a reason shows, more than listed is said", async () => {
+		const items = [item({ id: "a" })];
+		const html = await render(
+			<TeamAttention
+				entries={attentionEntries({
+					member: true,
+					approvals: [call({ decisionReason: "Writes outside the worktree" })],
+					items,
+				})}
+				phone={false}
+				teamId="lead"
+				base="main"
+				stats={undefined}
+				more
+				onOpenItem={noop}
+				onOpenSession={noop}
+				onOpenCoordinatorSession={noop}
+			/>,
+		);
+		expect(html).toContain('data-testid="team-approval-asker"');
+		expect(html).toContain("Writes outside the worktree");
+		expect(html).toContain('data-testid="team-attention-beyond"');
+		expect(html).toContain("More are waiting than listed here");
+		expect(html).toContain(">1+<");
+		const unscanned = await render(
+			<TeamAttention
+				entries={attentionEntries({ member: true, approvals: [call()], items })}
+				phone={false}
+				teamId="lead"
+				base="main"
+				stats={undefined}
+				unscanned
+				onOpenItem={noop}
+			/>,
+		);
+		expect(unscanned).toContain("may not be listed here");
+	});
+
+	test("a long option is answered with its whole title, only its label clipped", async () => {
+		const long = `Read the team's default time zone ${"x".repeat(100)}`;
+		const html = await render(
+			<TeamAttention
+				entries={attentionEntries({
+					member: true,
+					approvals: [
+						call({
+							kind: "question",
+							toolName: "AskUserQuestion",
+							questions: ["Which?"],
+							answerForm: { header: "Zone", options: [long, "UTC"], multiSelect: false },
+						}),
+					],
+					items: [],
+				})}
+				phone={false}
+				teamId="lead"
+				base="main"
+				stats={undefined}
+				onOpenItem={noop}
+			/>,
+		);
+		expect(html).toContain(
+			`data-value="Read the team&#x27;s default time zone ${"x".repeat(100)}"`,
+		);
+	});
+
+	test("marks on rows; no +0 -0; the wrap-up never offers disband while worktrees are held", async () => {
+		const s = summary({
+			columnCounts: { queued: 1, in_progress: 1, review: 0, done: 2, cancelled: 0 },
+		});
+		const html = await render(
+			<TeamWorkList
+				projectId="p"
+				teamId="lead"
+				summary={s}
+				items={[
+					item({ id: "lock", exclusiveKey: "paths" }),
+					item({ id: "q", state: "queued", worker: null }),
+				]}
+				approvals={[]}
+				stats={{ q: { added: 0, removed: 0, files: 0, binaryFiles: 0, truncated: false } }}
+				base="main"
+				loading={false}
+				failed={false}
+				hasMore={false}
+				onLoadMore={noop}
+				highlightId={null}
+				mode={teamPageMode(s)}
+				archiving={false}
+				onOpenItem={noop}
+			/>,
+		);
+		expect(html).toContain('data-mark="exclusive"');
+		expect(html).not.toContain("diff-count");
+		const held = summary({
+			columnCounts: { queued: 0, in_progress: 0, review: 0, done: 2, cancelled: 1 },
+			heldWorktreeCount: 2,
+		});
+		const wrap = await render(
+			<TeamWorkList
+				projectId="p"
+				teamId="lead"
+				summary={held}
+				items={[]}
+				approvals={[]}
+				stats={undefined}
+				base="main"
+				loading={false}
+				failed={false}
+				hasMore={false}
+				onLoadMore={noop}
+				highlightId={null}
+				mode={teamPageMode(held)}
+				archiving={false}
+				onArchive={noop}
+				onDisband={noop}
+				onOpenItem={noop}
+			/>,
+			new QueryClient(),
+			"zh-CN",
+		);
+		expect(wrap).toContain('data-testid="team-wrap-up-held"');
+		expect(wrap).toContain("还有 2 个已结束的工作项保留着 worktree");
+		expect(wrap).toContain("team-wrap-up-archive");
+		expect(wrap).not.toContain("team-wrap-up-disband");
+	});
+
+	test("the coordinator signs its events as 协调者; read-only members get a plain start line", async () => {
+		const event = {
+			id: "e",
+			kind: "work.created",
+			workItemId: "w",
+			workItemTitle: "Fix",
+			actorKind: "agent" as const,
+			actorId: "lead",
+			actorName: "发布小组",
+			detail: null,
+			detailOmitted: false,
+			createdAt: "2026-11-18T00:00:00.000Z",
+		};
+		const html = await render(
+			<ActivityLine event={event} coordinatorId="lead" />,
+			new QueryClient(),
+			"zh-CN",
+		);
+		expect(html).toContain("协调者");
+		expect(html).not.toContain("发布小组");
+		const start = await render(<TeamReadOnlyStart />, new QueryClient(), "zh-CN");
+		expect(start).toContain("还没有人给协调者布置任务");
+		expect(start).not.toContain("team-start-example");
 	});
 });

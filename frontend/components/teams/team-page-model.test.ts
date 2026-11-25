@@ -24,20 +24,26 @@ import {
 	audienceNotes,
 	boardSignature,
 	cappedCount,
+	chunkIds,
 	diffLineKind,
 	eventLabelKey,
 	eventNote,
+	isCoordinator,
+	itemMarks,
 	itemOfApproval,
+	liveActivity,
 	liveWorkerStatus,
 	nextPollDelay,
 	nudgeDelay,
 	onlookerSeesWaiting,
 	pauseNotice,
 	pauseOrder,
+	returnErrorKey,
 	returnReason,
 	rowLine,
 	SUMMARY_POLL_MAX_MS,
 	SUMMARY_POLL_MIN_MS,
+	showsStat,
 	statusSentence,
 	summarySignature,
 	teamPageMode,
@@ -639,5 +645,80 @@ describe("pin to sidebar", () => {
 		// The page's live summary can see the archive before the team detail does.
 		expect(teamPinTitle(team, "archived")).toBeUndefined();
 		expect(teamPinTitle(team, "working")).toBe("Release crew");
+	});
+});
+
+describe("review fixes", () => {
+	test("a row's doing-now follows the summary's running list, else what the board read", () => {
+		const worker = { id: "n-1", title: null, status: "working" };
+		const board = { toolName: "Read", preview: "old.ts", at: at(1) };
+		const fresh = { toolName: "Bash", preview: "pnpm test", at: at(5) };
+		const live = summary({ runningAgents: [{ ...worker, activity: fresh }], runningCount: 1 });
+		expect(liveActivity(item({ worker, activity: board }), live)).toEqual(fresh);
+		// An older server's summary without activity: keep the board's.
+		const older = summary({ runningAgents: [worker], runningCount: 1 });
+		expect(liveActivity(item({ worker, activity: board }), older)).toEqual(board);
+		expect(liveActivity(item({ worker: null, activity: null }), live)).toBeNull();
+	});
+
+	test("onlookers: a waiting worker with nothing known waits on a person; a question is no tool", () => {
+		const waiting = { item: item({ activity: null }), approval: null, waiting: true };
+		expect(rowLine(waiting, "waiting", "main")).toMatchObject({
+			key: "waitingPerson",
+			detail: null,
+		});
+		const asking = {
+			item: item({ activity: { toolName: "AskUserQuestion", preview: "Ship?", at: at(1) } }),
+			approval: null,
+			waiting: true,
+		};
+		expect(rowLine(asking, "waiting", "main")).toMatchObject({
+			key: "waitingAnswer",
+			detail: "Ship?",
+		});
+	});
+
+	test("the header never undercounts: N+ when more calls wait than listed", () => {
+		const s = summary({
+			columnCounts: { queued: 0, in_progress: 2, review: 0, done: 0, cancelled: 0 },
+		});
+		expect(
+			statusSentence({ summary: s, member: true, waiting: 50, waitingItems: 1, waitingMore: true })
+				.parts,
+		).toContainEqual({ key: "waitingYouMore", count: 50 });
+	});
+
+	test("marks: the exclusive lock; a finished item still holding its worktree", () => {
+		expect(itemMarks(item())).toEqual([]);
+		expect(itemMarks(item({ exclusiveKey: "paths" }))).toEqual(["exclusive"]);
+		expect(itemMarks(item({ state: "merged" }))).toEqual(["worktree"]);
+		expect(itemMarks(item({ state: "cancelled", hasWorktree: false }))).toEqual([]);
+		// A live item's worktree is expected, not a mark.
+		expect(itemMarks(item({ state: "in_progress", hasWorktree: true }))).toEqual([]);
+	});
+
+	test("sizes: nothing changed shows nothing; requests of 50", () => {
+		expect(showsStat({ added: 0, removed: 0, files: 0 })).toBe(false);
+		expect(showsStat({ added: 0, removed: 0, files: 1 })).toBe(true);
+		expect(showsStat({ added: 3, removed: 0 })).toBe(true);
+		expect(showsStat(null)).toBe(false);
+		const ids = Array.from({ length: 120 }, (_, index) => `id${String(index).padStart(3, "0")}`);
+		const chunks = chunkIds([...ids, "id000"], 50);
+		expect(chunks.map((chunk) => chunk.length)).toEqual([50, 50, 20]);
+		expect(chunks.flat()).toEqual(ids);
+	});
+
+	test("a return's refusals have their own words; the coordinator signs as such", () => {
+		expect(returnErrorKey({ data: { code: "TEAM_WORK_ITEM_NOT_RETURNABLE" } })).toBe(
+			"teams.page.drawer.errors.TEAM_WORK_ITEM_NOT_RETURNABLE",
+		);
+		expect(returnErrorKey({ data: { code: "TEAM_ARCHIVED" } })).toBe(
+			"teams.page.drawer.errors.TEAM_ARCHIVED",
+		);
+		expect(returnErrorKey({ data: { code: "TEAM_HAS_LIVE_WORK" } })).toBeNull();
+		expect(returnErrorKey(new Error("x"))).toBeNull();
+		expect(isCoordinator({ actorKind: "agent", actorId: "lead" }, "lead")).toBe(true);
+		expect(isCoordinator({ actorKind: "agent", actorId: "w" }, "lead")).toBe(false);
+		expect(isCoordinator({ actorKind: "person", actorId: "lead" }, "lead")).toBe(false);
 	});
 });

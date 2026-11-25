@@ -9,27 +9,32 @@ import { formatSmartTime } from "@frontend/lib/format";
 import { Alert, Box, Button, Group, Loader, Stack, Text } from "@mantine/core";
 import type { TeamActivityEvent } from "@shared/project-teams";
 import { useTranslation } from "react-i18next";
-import { eventLabelKey, eventNote } from "./team-page-model";
+import { eventLabelKey, eventNote, isCoordinator } from "./team-page-model";
 import { TABULAR } from "./team-page-ui";
 
 export function ActivityLine({
 	event,
 	showItem = true,
+	coordinatorId,
 }: {
 	event: TeamActivityEvent;
 	/** Off inside a work item's own timeline, where the item is known. */
 	showItem?: boolean;
+	/** The team's coordinator: its entries are signed 「协调者」, not with the team's name. */
+	coordinatorId?: string;
 }) {
 	const { t } = useTranslation("projects");
 	const actor =
 		event.actorKind === "system"
 			? t("teams.activity.system")
-			: (event.actorName ??
-				t(
-					event.actorKind === "person"
-						? "teams.activity.unknownPerson"
-						: "teams.activity.unknownAgent",
-				));
+			: coordinatorId && isCoordinator(event, coordinatorId)
+				? t("teams.page.coordinator")
+				: (event.actorName ??
+					t(
+						event.actorKind === "person"
+							? "teams.activity.unknownPerson"
+							: "teams.activity.unknownAgent",
+					));
 	const note = eventNote(event);
 	const labelKey = eventLabelKey(event.kind);
 	return (
@@ -100,7 +105,7 @@ export function TeamActivity({ projectId, teamId }: { projectId: string; teamId:
 				</Text>
 			)}
 			{events.map((event) => (
-				<ActivityLine key={event.id} event={event} />
+				<ActivityLine key={event.id} event={event} coordinatorId={teamId} />
 			))}
 			{pages.hasNextPage && (
 				<Box p={6}>

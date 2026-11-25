@@ -225,7 +225,7 @@
 			"work_started": "开始工作",
 			"work_start_failed": "工作未能开始",
 			"work_review": "记录评审",
-			"work_ready": "标记为可合",
+			"work_ready": "标记为可合并",
 			"work_sync": "同步基线",
 			"work_cancelled": "取消工作",
 			"work_cleanup": "清理 worktree",
@@ -316,7 +316,8 @@
 				"waitingYou": "{{count}} 项等你",
 				"waitingMembers": "{{count}} 项等成员处理",
 				"noWork": "还没有工作项",
-				"done": "{{count}} 项已完成"
+				"done": "{{count}} 项已完成",
+				"waitingYouMore": "{{count}}+ 项等你"
 			},
 			"header": {
 				"pauseAll": "全部暂停",
@@ -363,7 +364,11 @@
 				"questionTitle": "回答提问",
 				"planTitle": "计划",
 				"tooLarge": "内容太大，这里放不下：到会话里处理。",
-				"gone": "已经有人处理，或已撤回。"
+				"gone": "已经有人处理，或已撤回。",
+				"moreInSession": "还有更多待处理没有列在这里，打开协调者会话查看。",
+				"unscanned": "可能还有待处理没有读到，打开协调者会话查看。",
+				"openFull": "打开会话",
+				"openAsker": "打开这个会话"
 			},
 			"work": {
 				"work": "工作",
@@ -408,7 +413,8 @@
 					"Agent": "派出",
 					"AskUserQuestion": "提问",
 					"ExitPlanMode": "提交计划"
-				}
+				},
+				"waitingPerson": "等人处理"
 			},
 			"empty": {
 				"title": "工作项会出现在这里",
@@ -424,7 +430,8 @@
 				"archive": "归档团队",
 				"disband": "解散…",
 				"archived": "团队已归档",
-				"archiveFailed": "归档失败。"
+				"archiveFailed": "归档失败。",
+				"held": "还有 {{count}} 个已结束的工作项保留着 worktree，团队暂时不能解散：让协调者清理它们（每次清理都要你批准），或者先归档团队。"
 			},
 			"start": {
 				"title": "告诉协调者这个团队要完成什么",
@@ -478,14 +485,29 @@
 				"confirmReturn": "确认退回",
 				"returned": "已退回给工作者",
 				"returnedNotDelivered": "已退回，但没能通知协调者，请在对话里告诉它。",
-				"returnFailed": "退回失败。"
+				"returnFailed": "退回失败。",
+				"errors": {
+					"TEAM_WORK_ITEM_NOT_RETURNABLE": "只有评审中或可以合并的工作项能退回；它已经变了。",
+					"TEAM_WORK_ITEM_CHANGED": "这一项刚刚有变化，重新看一下，还需要的话再退回。",
+					"TEAM_ARCHIVED": "团队已归档，不能再改动。先恢复团队。"
+				}
 			},
 			"settings": {
 				"title": "团队设置",
 				"save": "保存",
 				"saved": "团队设置已保存",
 				"failed": "保存失败。"
-			}
+			},
+			"marks": {
+				"exclusive": "持有独占路径锁（{{key}}）",
+				"worktree": "已结束但还保留着 worktree，可让协调者清理"
+			},
+			"running": {
+				"title": "运行中的会话",
+				"none": "没有运行中的会话"
+			},
+			"readOnlyStart": "还没有人给协调者布置任务。",
+			"coordinator": "协调者"
 		}
 	},
 	"skills": "技能",

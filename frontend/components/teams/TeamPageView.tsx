@@ -22,7 +22,7 @@ import {
 import { APP_SHELL_FULL_BLEED_HEIGHT } from "@frontend/lib/safe-area";
 import { Alert, Box, Skeleton } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
-import { TEAM_WORK_STATS_IDS_MAX, type TeamBoardItem } from "@shared/project-teams";
+import type { TeamBoardItem } from "@shared/project-teams";
 import { type ReactNode, useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { TeamActivity } from "./TeamActivity";
@@ -30,7 +30,7 @@ import { TeamAttention } from "./TeamAttention";
 import { TeamDisbandDialog } from "./TeamDisbandDialog";
 import { TeamHeader } from "./TeamHeader";
 import { TeamSettingsModal } from "./TeamSettingsModal";
-import { TeamStart } from "./TeamStart";
+import { TeamReadOnlyStart, TeamStart } from "./TeamStart";
 import { TeamWorkDrawer } from "./TeamWorkDrawer";
 import { TeamWorkList } from "./TeamWorkList";
 import { TeamWorkspace } from "./TeamWorkspace";
@@ -93,10 +93,8 @@ export function TeamPageView({
 	);
 	const statIds = useMemo(
 		() =>
-			[...items.map((item) => item.id), ...finishedIds.done, ...finishedIds.cancelled].slice(
-				0,
-				TEAM_WORK_STATS_IDS_MAX,
-			),
+			// Every row shown gets its size: requested 50 at a time.
+			[...items.map((item) => item.id), ...finishedIds.done, ...finishedIds.cancelled],
 		[items, finishedIds],
 	);
 	const stats = useTeamWorkStats(projectId, teamId, statIds);
@@ -147,6 +145,7 @@ export function TeamPageView({
 				member,
 				waiting: member ? entries.length : groups.needsYou.length,
 				waitingItems: groups.needsYou.length,
+				waitingMore: member && (approvals.data?.more ?? false),
 			})
 		: null;
 	const openCount = summary.data ? unfinishedCount(summary.data) : items.length;
@@ -178,6 +177,7 @@ export function TeamPageView({
 						onBack={onBack}
 						onOpenCoordinatorSession={onOpenCoordinatorSession}
 						onOpenSettings={() => setSettingsOpen(true)}
+						onOpenSession={openSession}
 						onDisband={canDisband ? () => setDisbanding(true) : undefined}
 					/>
 				)}
@@ -187,14 +187,20 @@ export function TeamPageView({
 						phone={layout === "tabs"}
 						teamId={teamId}
 						base={base}
-						stats={stats.data?.stats}
+						stats={stats.stats}
+						more={approvals.data?.more ?? false}
+						unscanned={approvals.data?.unscanned ?? false}
+						onOpenCoordinatorSession={onOpenCoordinatorSession}
 						onHover={setHighlightId}
 						onOpenItem={openItem}
 						onOpenSession={openSession}
 					/>
 				)}
 				conversation={conversation}
-				conversationOverlay={mode.starting ? <TeamStart teamId={teamId} /> : undefined}
+				conversationOverlay={
+					// Only members can tell the coordinator anything; others see a plain line.
+					mode.starting ? member ? <TeamStart teamId={teamId} /> : <TeamReadOnlyStart /> : undefined
+				}
 				work={
 					<TeamWorkList
 						projectId={projectId}
@@ -202,7 +208,7 @@ export function TeamPageView({
 						summary={summary.data}
 						items={items}
 						approvals={pendingCalls}
-						stats={stats.data?.stats}
+						stats={stats.stats}
 						base={base}
 						loading={columns.some((column) => column.isLoading)}
 						failed={columns.some((column) => column.isError)}

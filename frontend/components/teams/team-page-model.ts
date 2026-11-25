@@ -402,6 +402,7 @@ export interface StatusPart {
 		| "idle"
 		| "inProgress"
 		| "waitingYou"
+		| "waitingYouMore"
 		| "waitingMembers"
 		| "noWork"
 		| "done";
@@ -423,6 +424,8 @@ export function statusSentence(input: {
 	member: boolean;
 	waiting: number;
 	waitingItems: number;
+	/** More calls wait than the list holds: the count is a lower bound ("N+"). */
+	waitingMore?: boolean;
 }): { tone: StatusTone; parts: StatusPart[] } {
 	const { summary } = input;
 	if (summary.coordinatorStatus === "archived")
@@ -430,7 +433,7 @@ export function statusSentence(input: {
 	const open = unfinishedCount(summary);
 	if (open > 0 && summary.runningCount === 0 && summary.coordinatorStopReason === "user_interrupt")
 		return { tone: "paused", parts: [{ key: "paused" }] };
-	if (open === 0 && input.waiting === 0) {
+	if (open === 0 && input.waiting === 0 && !input.waitingMore) {
 		const done = summary.columnCounts.done;
 		const total = totalCount(summary);
 		return {
@@ -449,7 +452,10 @@ export function statusSentence(input: {
 	const doing = Math.max(0, open - input.waitingItems);
 	if (doing > 0) parts.push({ key: "inProgress", count: doing });
 	if (input.waiting > 0)
-		parts.push({ key: input.member ? "waitingYou" : "waitingMembers", count: input.waiting });
+		parts.push({
+			key: !input.member ? "waitingMembers" : input.waitingMore ? "waitingYouMore" : "waitingYou",
+			count: input.waiting,
+		});
 	return { tone: "active", parts };
 }
 
@@ -508,6 +514,8 @@ export function rowLine(row: WorkRow, workerStatus: string | null, base: string)
 	}
 	if (row.waiting) {
 		const tool = item.activity?.toolName ?? "";
+		// Not known what it waits on (no tool call read yet): say only that a person is needed.
+		if (!tool) return { key: "waitingPerson", values: {}, detail: null, tone: "amber" };
 		const kind =
 			tool === "AskUserQuestion" ? "question" : tool === "ExitPlanMode" ? "plan" : "tool";
 		return {
@@ -605,4 +613,73 @@ export function onlookerSeesWaiting(
 	summary: Pick<TeamPageSummary, "runningAgents" | "runningCount"> | undefined,
 ): boolean {
 	return !!item.worker && liveWorkerStatus(item.worker, summary) === "waiting";
+}
+
+/**
+ * What a worker is doing now: the summary's running list (refreshed with every summary read) when
+ * it names the worker, else what the board read. A worker that stopped has no "now".
+ */
+export function liveActivity(
+	item: Pick<TeamBoardItem, "worker" | "activity">,
+	summary: Pick<TeamPageSummary, "runningAgents"> | undefined,
+): TeamBoardItem["activity"] {
+	const listed = item.worker
+		? summary?.runningAgents.find((agent) => agent.id === item.worker?.id)
+		: undefined;
+	if (listed && listed.activity !== undefined) return listed.activity;
+	return item.activity ?? null;
+}
+
+/** Marks a row and the drawer show besides the state. */
+export type ItemMark = "exclusive" | "worktree";
+
+export function itemMarks(
+	item: Pick<TeamBoardItem, "state" | "exclusiveKey" | "hasWorktree">,
+): ItemMark[] {
+	const marks: ItemMark[] = [];
+	if (item.exclusiveKey) marks.push("exclusive");
+	// Finished but still holding its worktree: the coordinator can clean it up (and the team
+	// cannot be disbanded until it does).
+	if ((item.state === "merged" || item.state === "cancelled") && item.hasWorktree)
+		marks.push("worktree");
+	return marks;
+}
+
+/** A size worth showing: something changed (a queued item with no commit shows nothing). */
+export function showsStat(
+	stat: { added: number; removed: number; files?: number } | null | undefined,
+): boolean {
+	return !!stat && (stat.added > 0 || stat.removed > 0 || (stat.files ?? 0) > 0);
+}
+
+/** Ids split into requests of at most `size` (the size endpoint takes 50 at a time). */
+export function chunkIds(ids: readonly string[], size: number): string[][] {
+	const unique = [...new Set(ids)].sort();
+	const chunks: string[][] = [];
+	for (let index = 0; index < unique.length; index += size)
+		chunks.push(unique.slice(index, index + size));
+	return chunks;
+}
+
+/** Refusal codes of a return with their own wording (`teams.page.drawer.errors.*`). */
+const RETURN_ERROR_CODES = new Set([
+	"TEAM_WORK_ITEM_NOT_RETURNABLE",
+	"TEAM_WORK_ITEM_CHANGED",
+	"TEAM_ARCHIVED",
+]);
+
+/** The i18n key of a failed return, or null for a generic message. */
+export function returnErrorKey(error: unknown): string | null {
+	const code = (error as { data?: { code?: unknown } } | null)?.data?.code;
+	return typeof code === "string" && RETURN_ERROR_CODES.has(code)
+		? `teams.page.drawer.errors.${code}`
+		: null;
+}
+
+/** The coordinator's events and reviews are signed 「协调者」, not by the team (its title). */
+export function isCoordinator(
+	actor: { actorKind: string; actorId: string | null },
+	teamId: string,
+): boolean {
+	return actor.actorKind === "agent" && actor.actorId === teamId;
 }

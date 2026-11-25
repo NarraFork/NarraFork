@@ -65,6 +65,8 @@ let projectId: string;
 let teamId: string;
 let workerId: string;
 const decisions: string[] = [];
+/** What each decision handed the waiting call (its answers among it). */
+const resolutions = new Map<string, unknown>();
 /** Notes a return sent the coordinator (captured; no turn is started in tests). */
 const returnNotes: string[] = [];
 /** The narrator sockets connected to the test server. */
@@ -320,7 +322,10 @@ async function seedApproval(
 		cwd: "/work",
 		locale: "en",
 		signal: new AbortController().signal,
-		resolve: (result) => decisions.push(`${requestId}:${result.behavior}`),
+		resolve: (result) => {
+			decisions.push(`${requestId}:${result.behavior}`);
+			resolutions.set(requestId, result);
+		},
 		cleanup: () => {
 			pendingPermissions.delete(requestId);
 		},
@@ -353,6 +358,20 @@ test("a new team starts with what to tell the coordinator; an example fills the 
 		expect(errors).toEqual([]);
 	} finally {
 		await page.close();
+	}
+	// A read-only member cannot tell the coordinator anything: a plain line, no prompts.
+	const reader = await openPage(bob, { width: 1440, height: 900 });
+	try {
+		await call(reader.page, (f, p: string, t: string) => f.openTeam(p, t), projectId, fresh.id);
+		await until(
+			reader.page,
+			"plain line",
+			(f) => f.count("[data-testid=team-start-read-only]") === 1,
+		);
+		expect(await call(reader.page, (f) => f.count("[data-testid=team-start-example]"))).toBe(0);
+		expect(reader.errors).toEqual([]);
+	} finally {
+		await reader.page.close();
 		// Out of the project's active list the last test counts.
 		await archiveTeam(fresh.id, owner, projectId);
 	}
@@ -474,12 +493,15 @@ test("等你处理: approve a tool call and answer a question in place; onlooker
 		.set({ workerNarratorId: workerId })
 		.where(eq(teamWorkItems.id, movingId));
 	const requestId = await seedApproval("bun test --isolate server/routes");
+	// An option longer than any label is drawn: its whole title is the answer.
+	const longOption =
+		`Merge the docs branch first, then rebase nothing: ${"keep both sides ".repeat(6)}`.trim();
 	const questionId = await seedApproval("", "AskUserQuestion", {
 		questions: [
 			{
 				question: "Which branch first?",
 				header: "Order",
-				options: [{ label: "A" }, { label: "B" }],
+				options: [{ label: longOption }, { label: "B" }],
 			},
 		],
 	});
@@ -529,6 +551,8 @@ test("等你处理: approve a tool call and answer a question in place; onlooker
 		);
 		await until(page, "answered", (f, q: string) => f.count(q) === 0, 10_000, question);
 		expect(decisions).toContain(`${questionId}:allow`);
+		expect(longOption.length).toBeGreaterThan(80);
+		expect(JSON.stringify(resolutions.get(questionId))).toContain(longOption);
 		expect(pendingPermissions.has(requestId)).toBe(false);
 		expect(errors).toEqual([]);
 	} finally {

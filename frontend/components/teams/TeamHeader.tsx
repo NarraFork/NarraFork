@@ -10,6 +10,7 @@
  * moves into the 「…」 menu.
  */
 import { MobileNavButton } from "@frontend/components/nav/MobileNavButton";
+import { NarratorStatusIcon } from "@frontend/components/nav/NarratorStatusIcon";
 import { PinToSidebarButton } from "@frontend/components/nav/PinToSidebarButton";
 import { usePauseTeam, useTeamMembers } from "@frontend/hooks/useTeams";
 import {
@@ -137,6 +138,7 @@ export function TeamHeader({
 	onBack,
 	onOpenCoordinatorSession,
 	onOpenSettings,
+	onOpenSession,
 	onDisband,
 }: {
 	projectId: string;
@@ -151,6 +153,8 @@ export function TeamHeader({
 	onBack: () => void;
 	onOpenCoordinatorSession?: () => void;
 	onOpenSettings?: () => void;
+	/** Open a running session from the menu's list (the coordinator's: bring the conversation forward). */
+	onOpenSession?: (narratorId: string) => void;
 	/** Members get 解散团队 in the menu (the server decides whether they may). */
 	onDisband?: () => void;
 }) {
@@ -230,7 +234,32 @@ export function TeamHeader({
 					<IconDots size={18} aria-hidden />
 				</ActionIcon>
 			</Menu.Target>
-			<Menu.Dropdown>
+			<Menu.Dropdown maw="min(320px, calc(100vw - 32px))">
+				{/* The running sessions, from the summary already read (at most 20 named). */}
+				<Menu.Label>{t("teams.page.running.title")}</Menu.Label>
+				{summary?.runningAgents.length ? (
+					summary.runningAgents.map((agent) => (
+						<Menu.Item
+							key={agent.id}
+							leftSection={<NarratorStatusIcon size={14} status={agent.status} />}
+							onClick={() => onOpenSession?.(agent.id)}
+							disabled={!onOpenSession}
+							data-testid="team-running-session"
+						>
+							<Text size="sm" truncate>
+								{agent.id === teamId ? t("teams.page.coordinator") : agent.title || agent.id}
+							</Text>
+						</Menu.Item>
+					))
+				) : (
+					<Menu.Item disabled>{t("teams.page.running.none")}</Menu.Item>
+				)}
+				{running > (summary?.runningAgents.length ?? 0) && (
+					<Menu.Item disabled style={TABULAR}>
+						+{running - (summary?.runningAgents.length ?? 0)}
+					</Menu.Item>
+				)}
+				<Menu.Divider />
 				{phone && canPause && (
 					<Menu.Item
 						leftSection={<IconPlayerPause size={14} />}
@@ -294,6 +323,7 @@ export function TeamHeader({
 					<Group gap={8} wrap="nowrap">
 						{/* The page's own title row carries the phone menu button (no floating one). */}
 						<MobileNavButton />
+						{back}
 						{name}
 						<Box style={{ flex: 1 }} />
 						{pin}
