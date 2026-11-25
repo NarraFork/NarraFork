@@ -1157,17 +1157,41 @@ export async function handleBashCommand(
 	}
 	bashControllers.add(bashAbort);
 
+	let executionStartedAt = streamStartedAt;
 	const progressTimer = setInterval(() => {
 		broadcastToNarrator(narratorId, {
 			type: "tool_progress",
 			narratorId,
 			toolUseId,
-			elapsed: Math.floor((Date.now() - streamStartedAt) / 1000),
+			elapsed: Math.floor((Date.now() - executionStartedAt) / 1000),
 		});
 	}, 5000);
 
 	let result: Awaited<ReturnType<typeof bashTool.execute>>;
 	try {
+		// Direct commands bypass the agent executor: persist the execution boundary
+		// before tool I/O, and use that same timestamp for live and settled views.
+		const [started] = await db
+			.update(narratorToolCalls)
+			.set({
+				executionStartedAt: sql`coalesce(${narratorToolCalls.executionStartedAt}, ${new Date().toISOString()})`,
+			})
+			.where(
+				and(
+					eq(narratorToolCalls.id, toolCallId),
+					eq(narratorToolCalls.narratorId, narratorId),
+					eq(narratorToolCalls.toolUseId, toolUseId),
+				),
+			)
+			.returning({ executionStartedAt: narratorToolCalls.executionStartedAt });
+		if (!started?.executionStartedAt) throw new NotFoundError("Tool call", toolCallId);
+		executionStartedAt = Date.parse(started.executionStartedAt);
+		broadcastToNarrator(narratorId, {
+			type: "tool_executing",
+			narratorId,
+			toolUseId,
+			executionStartedAt,
+		});
 		result = await bashTool.execute(toolInput, {
 			narratorId,
 			cwd,
@@ -1211,7 +1235,7 @@ export async function handleBashCommand(
 	}
 
 	const completedAt = Date.now();
-	const durationMs = completedAt - streamStartedAt;
+	const durationMs = completedAt - executionStartedAt;
 	const status = result.isError ? "fail" : "success";
 	const persistedOutput = encodeToolOutput(result.output, { metadata: result.metadata });
 	const toolResultBlock = {
@@ -1229,7 +1253,7 @@ export async function handleBashCommand(
 			status,
 			errorMessage: result.isError ? result.output : undefined,
 			durationMs,
-			executionStartedAt: streamStartedAt,
+			executionStartedAt,
 			completedAt,
 			onPersist: (tx) => {
 				writeEnvelopeBody(tx, assistantMsgId, [toolUseBlock, toolResultBlock], {
