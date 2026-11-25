@@ -568,6 +568,13 @@
 			"when": 1795534873527,
 			"tag": "0080_recent_tab_team_project",
 			"breakpoints": true
+		},
+		{
+			"idx": 81,
+			"version": "7",
+			"when": 1795580959074,
+			"tag": "0081_subagent-alias-addressable-scope",
+			"breakpoints": true
 		}
   ]
 }

@@ -33,7 +33,7 @@ keywords:
   - MAX_IMPORT_BYTES
   - 4 GB
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 001ccbf7d
 ---
 # 数据导入导出
 
@@ -48,6 +48,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 版本：manifest `version` 1=无密钥、3=带 sealed 密钥；高于导入端支持版本抛 `IMPORT_VERSION_TOO_NEW`（`assertVersion`）。供应商密钥不进 `providers.json`，用口令封进 `provider-keys.sealed.json`（`data-portability-keys.ts`）。
 - `clearData`（requests / sessions / providers / all）在一个事务内执行；清 sessions 要先断开 terminals、benchmark 结果等对会话的引用，并先删 team 三表（它们不导出）。清空前由路由校验当前用户密码（`storage-transfer.ts` 的 `/clear`）。
 - 不导出的会话附属表：`outline_spec_imports`、`outline_spec_loss_*`、team 三表；导入后 `reconcileImportedTeamTraits` 按本机有无 team 行修正 `team` trait。
+- 会话拷贝之后、导入事务提交前，`backfillNarratorAliasSelectors` 补上旧快照没有的 `narrators.title_slug` / `alias_selector`。两列可空，缺列的旧快照不会因此导入失败。
 - 导入大小上限 `MAX_IMPORT_BYTES`=4GB（预览与执行都按它流式累计校验），快照解压后上限 `MAX_SNAPSHOT_UNCOMPRESSED_BYTES`=16GB，常量在 `shared/storage-transfer.ts`；前端用同一常量本地预检。
 - 路由全部 `requireAdmin`（导出含供应商时 `GET` 直接拒绝 `STEP_UP_REQUIRED`，要走 `POST` 带 `stepUpToken` 和封存口令）：`GET/POST /api/storage/export`、`POST /export/ticket`、`POST /import/preview`、`POST /import`、`POST /clear`；票据下载 `GET /api/storage/export/download` 不走 `requireAdmin`（凭票据）。
 - 无 File System Access API 的浏览器走短期导出票据：2 分钟 TTL、一次有效、最多 32 张（`EXPORT_TICKET_TTL_MS`、`consumeExportTicket`）。

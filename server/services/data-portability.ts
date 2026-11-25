@@ -67,6 +67,7 @@ import {
 } from "@shared/storage-transfer";
 import archiver from "archiver";
 import { sqlite } from "../db";
+import { backfillNarratorAliasSelectors } from "../db/alias-selector-backfill";
 import { getDbPath } from "../db/connection";
 import { buildSnapshotInSubprocess } from "../db/snapshot-build";
 import { SNAPSHOT_TABLES } from "../db/snapshot-protocol";
@@ -1249,6 +1250,9 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 					excludeNarrators: excludedNarrators,
 				});
 				reconcileImportedTeamTraits(attachName);
+				// Old snapshots have no selector columns. Fill them before the import
+				// transaction commits so a live member's title slug is occupied.
+				backfillNarratorAliasSelectors(sqlite, { ownTransaction: false });
 				copyTable(attachName, "folder_git_identity_bindings");
 				removeInvalidFolderIdentityBindings(baselines.get("folder_git_identity_bindings") ?? 0);
 				if (

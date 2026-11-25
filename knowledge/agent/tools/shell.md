@@ -50,7 +50,7 @@ keywords:
   - terminal watch
   - [watch]
 status: draft
-verified_at: 2e6441ad0
+verified_at: 001ccbf7d
 ---
 # 命令与终端工具
 
@@ -61,7 +61,7 @@ verified_at: 2e6441ad0
 - 并行：同一轮里 Bash 默认串行，仅 `parallel: true` 且未设 `strict_serial` 才能与同组并发（`shared/tool-parallel-groups.ts:isBashParallelOptIn`）。
 - 后台：`run_in_background: true`；`background_kind` 为 `task`（默认，构建/测试）或 `service`（dev/preview/watch 服务，必须配合后台运行；service 不关闭超时，非请求的退出——即使退出码 0——算失败）。取消用 `Stop({type:"bash", id})`，Bash 只负责启动。运行中可更新超时（`updateBashTimeout`，钳到 1000ms 以上）。
 - `BackgroundBashLifecycle` 管后台 Bash 的收集器与终态写入：`stop()` 后拒绝新准入；`preserveProcesses` 时已启动进程被保留，尚在准备阶段的任务仍需把任务行结算（`services/background-bash-lifecycle.ts`）。
-- Await：工具已退役，执行器（`tool-executor.ts`）与 `tools/await.ts` 都只返回「Await is retired」错误，提示改用 Watch；它不在 `tools/index.ts` 的注册清单中，`listRunningAwaits` 恒返回空。`services/await-agent-resolution.ts` 仍被 `narrator-messages.ts` 引用，用于解析历史里仍在运行的 `Await({type:"agent"})` 调用的目标（只服务旧数据，不要给新功能用）。
+- Await：工具已退役，执行器（`tool-executor.ts`）与 `tools/await.ts` 都只返回「Await is retired」错误，提示改用 Watch；它不在 `tools/index.ts` 的注册清单中，`listRunningAwaits` 恒返回空。`services/await-agent-resolution.ts` 仍被 `narrator-messages.ts` 引用，用于解析历史里仍在运行的 `Await({type:"agent"})` 调用的目标（只服务旧数据，不要给新功能用）。解析时跳过已归档叙述者，其别名不再链到那次调用。
 - Watch：对 terminal / 后台 bash / agent 注册非阻塞观察，立即返回句柄；匹配文本、完成或超时通过邮箱送达。默认超时 600000ms，最大 86,400,000ms（`watch-observation.ts`）。超时只结束观察，不停止目标；已结束的目标立即返回保存的结果；agent 观察不支持 `pattern`；`start_at` 只用于 terminal。
 - Stop：只取消本叙述者拥有的后台 bash 或 agent，不能停服务器或任意 PID；取消前重新校验 OAuth 工具能力。
 - 后台任务服务（`background-task-service.ts`，很大）：后台 Bash、Watch 观察行和子代理共用 `background_tasks` 表，`BackgroundTaskEffectiveStatus` 还会按叙述者状态派生 `continued` / `child_running`；任务列表是游标分页加增量推送（默认页 30、上限 50，首页进行中任务按「工作」与「服务」各最多 200 条并带 `activeTruncated`，列表行的 `output` 有字符上限），不再整表轮询（`shared/background-task-list.ts`）。占用索引只读小列、不含消息/输出/标题（`background-occupancy-index.ts`、`-store.ts`），启动时初始化且关停中的进程不被辅助恢复拖住（`background-occupancy-startup.ts`）。

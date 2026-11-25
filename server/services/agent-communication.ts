@@ -24,7 +24,11 @@ import { authorizeAgentControl } from "./narrator-control";
 import { narratorService } from "./narrator-service";
 import { getSubagentFinalText } from "./narrator-session";
 import { formatRecentSubagentActivity, getRecentSubagentToolActivity } from "./subagent-activity";
-import { resolveTaskAlias, subagentMatchesSelector } from "./subagent-alias";
+import {
+	findSubagentIdsBySelector,
+	resolveTaskAlias,
+	subagentMatchesSelector,
+} from "./subagent-alias";
 import { assertRuntimeCanAwaitAgent } from "./subagent-communication-policy";
 import {
 	agentLabelFromNarrator,
@@ -54,6 +58,11 @@ export interface ResolveTargetsInput {
 	ids?: string[];
 	name?: string;
 	names?: string[];
+	/**
+	 * Archive and unarchive must still name a finished member. Send, Await and
+	 * Watch leave this unset so an archived alias is not a target.
+	 */
+	includeArchived?: boolean;
 }
 
 export interface SendSubagentInput extends ResolveTargetsInput {
@@ -311,10 +320,45 @@ async function resolveAliasCandidate(selector: string, scope: CommunicationScope
 	return selector;
 }
 
-async function resolveOneTarget(selector: string, scope: CommunicationScope): Promise<Narrator> {
+async function resolveArchivedTarget(
+	selector: string,
+	scope: CommunicationScope,
+): Promise<Narrator | undefined> {
+	const ids = new Set<string>();
+	for (const teamId of reachableTeamIds(scope)) {
+		for (const id of await findSubagentIdsBySelector(teamId, selector)) ids.add(id);
+	}
+	const matches: Narrator[] = [];
+	for (const id of ids) {
+		if (scope.callerIsSubagent && id === scope.caller.id) continue;
+		const row = await narratorService.getById(id).catch(() => null);
+		if (row?.status === "archived") matches.push(row);
+	}
+	if (matches.length === 0) return;
+	if (matches.length > 1) {
+		const lines = matches
+			.map(
+				(c) =>
+					`- ${agentLabelFromNarrator(c, scope.teamParentId)} | ${c.title ?? "(untitled)"} ` +
+					`(id: ${shortAgentId(c.id)})`,
+			)
+			.join("\n");
+		throw new Error(`Ambiguous subagent target "${selector}". Candidates:\n${lines}`);
+	}
+	assertTargetAllowed(matches[0], scope);
+	return matches[0];
+}
+
+async function resolveOneTarget(
+	selector: string,
+	scope: CommunicationScope,
+	includeArchived = false,
+): Promise<Narrator> {
 	const aliasCandidate = await resolveAliasCandidate(selector, scope);
 	const direct = await narratorService.getById(aliasCandidate).catch(() => null);
-	if (direct) {
+	// An archived narrator is not addressable. Ignore an alias that points at one
+	// unless the caller is archiving or restoring that member.
+	if (direct && (includeArchived || direct.status !== "archived")) {
 		assertTargetAllowed(direct, scope);
 		return direct;
 	}
@@ -328,6 +372,10 @@ async function resolveOneTarget(selector: string, scope: CommunicationScope): Pr
 	});
 
 	if (candidates.length === 0) {
+		if (includeArchived) {
+			const archived = await resolveArchivedTarget(selector, scope);
+			if (archived) return archived;
+		}
 		throw new Error(`No accessible subagent found for "${selector}"`);
 	}
 	if (candidates.length > 1) {
@@ -358,7 +406,7 @@ export async function resolveSubagentTargets(input: ResolveTargetsInput): Promis
 	const resolved: Narrator[] = [];
 	const seen = new Set<string>();
 	for (const selector of selectors) {
-		const target = await resolveOneTarget(selector, scope);
+		const target = await resolveOneTarget(selector, scope, input.includeArchived);
 		if (seen.has(target.id)) continue;
 		seen.add(target.id);
 		resolved.push(target);

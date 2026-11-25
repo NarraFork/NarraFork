@@ -228,6 +228,8 @@ export const narrators = pgTable(
 		hiddenFromLists: boolean("hidden_from_lists").notNull().default(false),
 		modeltraceKey: text("modeltrace_key"),
 		title: text("title"),
+		titleSlug: text("title_slug"),
+		aliasSelector: text("alias_selector"),
 		inheritMode: text("inherit_mode").notNull().default("fresh"),
 		parentNarratorId: text("parent_narrator_id").references((): PgColumn => narrators.id, {}),
 		askInPassingGroupId: text("ask_in_passing_group_id").references((): PgColumn => narrators.id, {
@@ -367,6 +369,19 @@ export const narrators = pgTable(
 		index("idx_narrators_background_parent_created")
 			.on(table.parentNarratorId, table.createdAt, table.id)
 			.where(sql.raw('"is_background" = TRUE')),
+		index("idx_narrators_parent_title_slug")
+			.on(table.parentNarratorId, table.titleSlug)
+			.where(sql.raw('"parent_narrator_id" IS NOT NULL AND "title_slug" IS NOT NULL')),
+		index("idx_narrators_parent_alias_selector")
+			.on(table.parentNarratorId, table.aliasSelector)
+			.where(sql.raw('"parent_narrator_id" IS NOT NULL AND "alias_selector" IS NOT NULL')),
+		index("idx_narrators_addressable_parent_created")
+			.on(table.parentNarratorId, table.createdAt, table.id)
+			.where(
+				sql.raw(
+					"\"parent_narrator_id\" IS NOT NULL AND \"status\" IN ('idle', 'working', 'waiting')",
+				),
+			),
 	],
 );
 
@@ -2568,6 +2583,12 @@ export const backgroundTasks = pgTable(
 		uniqueIndex("idx_bg_tasks_tool_attempt").on(table.toolCallId, table.executionAttempt),
 		index("idx_bg_tasks_transfer").on(table.transferTaskId),
 		index("idx_bg_tasks_parent_created").on(table.parentNarratorId, table.createdAt, table.id),
+		index("idx_bg_tasks_parent_alias")
+			.on(table.parentNarratorId, table.alias, table.createdAt)
+			.where(sql.raw('"alias" IS NOT NULL')),
+		index("idx_bg_tasks_parent_live_alias")
+			.on(table.parentNarratorId, table.alias)
+			.where(sql.raw("\"alias\" IS NOT NULL AND \"status\" IN ('running', 'paused')")),
 	],
 );
 
@@ -4601,7 +4622,7 @@ export const teamWorkEvents = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 147,
-  "columnCount": 1962,
+  "columnCount": 1964,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -5709,6 +5730,24 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "property": "titleSlug",
+          "name": "title_slug",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "aliasSelector",
+          "name": "alias_selector",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
           "property": "inheritMode",
           "name": "inherit_mode",
           "kind": "text",
@@ -6703,6 +6742,34 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           ],
           "unique": false,
           "predicate": "\"is_background\" = TRUE"
+        },
+        {
+          "name": "idx_narrators_parent_title_slug",
+          "columns": [
+            "parentNarratorId",
+            "titleSlug"
+          ],
+          "unique": false,
+          "predicate": "\"parent_narrator_id\" IS NOT NULL AND \"title_slug\" IS NOT NULL"
+        },
+        {
+          "name": "idx_narrators_parent_alias_selector",
+          "columns": [
+            "parentNarratorId",
+            "aliasSelector"
+          ],
+          "unique": false,
+          "predicate": "\"parent_narrator_id\" IS NOT NULL AND \"alias_selector\" IS NOT NULL"
+        },
+        {
+          "name": "idx_narrators_addressable_parent_created",
+          "columns": [
+            "parentNarratorId",
+            "createdAt",
+            "id"
+          ],
+          "unique": false,
+          "predicate": "\"parent_narrator_id\" IS NOT NULL AND \"status\" IN ('idle', 'working', 'waiting')"
         }
       ],
       "checks": [],
@@ -19512,6 +19579,25 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "id"
           ],
           "unique": false
+        },
+        {
+          "name": "idx_bg_tasks_parent_alias",
+          "columns": [
+            "parentNarratorId",
+            "alias",
+            "createdAt"
+          ],
+          "unique": false,
+          "predicate": "\"alias\" IS NOT NULL"
+        },
+        {
+          "name": "idx_bg_tasks_parent_live_alias",
+          "columns": [
+            "parentNarratorId",
+            "alias"
+          ],
+          "unique": false,
+          "predicate": "\"alias\" IS NOT NULL AND \"status\" IN ('running', 'paused')"
         }
       ],
       "checks": [],

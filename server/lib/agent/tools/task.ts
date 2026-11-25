@@ -292,6 +292,7 @@ async function resolveArchiveTargetId(callerNarratorId: string, selector: string
 	const targets = await resolveSubagentTargets({
 		callerNarratorId,
 		id: trimmed,
+		includeArchived: true,
 	}).catch(() => []);
 	if (targets.length === 1) return targets[0].id;
 	return trimmed;

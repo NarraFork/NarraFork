@@ -15,7 +15,7 @@ keywords:
   - bypassPermissions
   - permission_request
 status: draft
-verified_at: 878917e97
+verified_at: 001ccbf7d
 ---
 # 工具调用审批
 

@@ -46,7 +46,7 @@ keywords:
   - partitionTimeline
   - resolveLazyLineage
 status: draft
-verified_at: 776dbf07e
+verified_at: 001ccbf7d
 ---
 # 消息与引用
 

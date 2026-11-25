@@ -28,7 +28,7 @@ keywords:
   - 审批卡片
   - PreToolUse
 status: draft
-verified_at: 878917e97
+verified_at: 001ccbf7d
 ---
 # 一次工具调用
 

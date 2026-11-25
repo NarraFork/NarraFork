@@ -3765,6 +3765,7 @@ async function resolveSendTargetsForPermission(
 					relaxedPlan: true,
 					previousPermissionMode: true,
 					traits: true,
+					status: true,
 				},
 			}),
 			narratorSurfaceReadOptions(readBudget),
@@ -3789,7 +3790,10 @@ async function resolveSendTargetsForPermission(
 			continue;
 		}
 		const target = byId.get(alias);
-		if (target) {
+		// Archived members are not Send targets. Fall through so a live member with
+		// the same selector can still match; if nobody addressable matches, this Send
+		// is not auto-allowed.
+		if (target && target.status !== "archived") {
 			if (!isTeamMember(target, parentId) || target.id === callerId) return [];
 			selected.push(target.id);
 			continue;

@@ -40,7 +40,7 @@ keywords:
   - parent 选择器
   - send_await
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 001ccbf7d
 ---
 # 与人交互的工具
 
@@ -60,7 +60,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - `server/lib/agent/tools/share-file.ts`
 - `server/lib/agent/tools/gen-ui.ts`
 - 测试：`tools/__tests__/send-navigation.test.ts`、`share-file-archiver.test.ts`
-- `server/services/agent-communication.ts`：给子代理发消息的服务端实现（`resolveSubagentTargets` 解析 `id/ids/name/names` 与别名，`sendSubagentMessageDetailed` 投递并返回每个目标的送达结果）；父级选择器 `parent`、`main`、`@parent`、`@main`（不区分大小写、先于同级别名解析）在 `shared/communication-tool.ts`，同一文件的 `isCommunicationTool` 把 `Send` 与 `TeamStatus` 的 `send`/`broadcast` 动作认作「通信」，供送达回执与交接去重使用。文件里的 `awaitAgentResultDetailed` / `waitForSubagentResult` 现在由 Watch 的 agent 观察使用（`watch-service.ts`）。
+- `server/services/agent-communication.ts`：给子代理发消息的服务端实现（`resolveSubagentTargets` 解析 `id/ids/name/names` 与别名，`sendSubagentMessageDetailed` 投递并返回每个目标的送达结果）。可解析集合是仍可寻址的成员（`idle` / `working` / `waiting`）；已归档别名不是 Send 的目标。归档与取消归档传 `includeArchived`，才能再点到已结束成员。父级选择器 `parent`、`main`、`@parent`、`@main`（不区分大小写、先于同级别名解析）在 `shared/communication-tool.ts`，同一文件的 `isCommunicationTool` 把 `Send` 与 `TeamStatus` 的 `send`/`broadcast` 动作认作「通信」，供送达回执与交接去重使用。文件里的 `awaitAgentResultDetailed` / `waitForSubagentResult` 现在由 Watch 的 agent 观察使用（`watch-service.ts`），同样不把已归档别名当成目标。
 - `server/services/legacy-send-await.ts`：已退役的 `Send({ await: true })`。Send 不再等待，对方用自己的 Send 回复，作为普通消息唤醒请求者；旧进程在计划内更新时可能留下 `send_await` 检查点，恢复只按检查点记录的结果收尾，不重新发送消息。
 - GenUI 共享约定（`shared/gen-ui-*.ts`）：UI 源文件是普通工作区文件，目录 `.narrafork/gen_ui`，入口 `App.tsx`（`gen-ui-files.ts`）；组件库 kit 在 `.narrafork/gen_ui/kit`，由 `kit.json` 声明、宿主生成入口与 Vite 配置并构建，浏览器只看到宿主签收过的 `dist/`（`gen-ui-kit.ts`，清单 ≤256KiB、组件 ≤200）；`render` 的标记是数据而非代码（`gen-ui-markup.ts`）；预览壳（`gen-ui-preview-shell.ts`）；公开转录与可移植导出里 GenUI 卡片是静态的，预览引用不授予对活资源的访问（`gen-ui-public.ts`）；权限闸用无依赖的动作表（`gen-ui-tool-policy.ts`）。
 
