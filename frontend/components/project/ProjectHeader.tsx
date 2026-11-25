@@ -125,7 +125,7 @@ export function ProjectHeader({
 							<IconUsers size={13} aria-hidden style={{ opacity: 0.6 }} />
 							<Text size="xs" c="dimmed" style={{ fontVariantNumeric: "tabular-nums" }}>
 								{memberCount.more
-									? t("page.membersMore")
+									? t("page.membersMore", { count: memberCount.count })
 									: t("page.members", { count: memberCount.count })}
 							</Text>
 						</Group>

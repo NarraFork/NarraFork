@@ -529,7 +529,7 @@
 	"page": {
 		"members_one": "{{count}} 位成员",
 		"members_other": "{{count}} 位成员",
-		"membersMore": "999+ 位成员",
+		"membersMore": "{{count}}+ 位成员",
 		"membersHint": "成员与可见性",
 		"newTeam": "新团队",
 		"more": "更多",

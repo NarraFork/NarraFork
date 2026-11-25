@@ -7,8 +7,8 @@
  * members talk to the coordinator exactly as in its session page; a read-only member sees
  * 「你是只读成员」 instead of the composer; its toolbar gives way to the page's compact coordinator
  * line, the full toolbar being on the session's own page) with the work list and the activity
- * beside it; narrow screens get tabs instead. No list of the project's teams: teams are switched from the
- * sidebar's pinned team tabs and the project page.
+ * beside it; narrow screens get tabs instead. No list of the project's teams: teams are switched
+ * from the sidebar's pinned team tabs and the project page.
  */
 
 import { NarratorPanelSkeleton } from "@frontend/components/narrator/NarratorPanelSkeleton";

@@ -51,7 +51,6 @@ export function liveWorkerStatus(
 	return worker.status;
 }
 
-/** "50+" past a capped count (the server counts one past its limit). */
 /**
  * The coordinator column's header line: how many other sessions of the tree are running (the
  * workers it follows, their reviewers among them), `more` when the summary's list was cut; and
@@ -72,6 +71,7 @@ export function coordinatorLine(
 	};
 }
 
+/** "50+" past a capped count (the server counts one past its limit). */
 export function cappedCount(count: number, limit: number): string {
 	return count > limit ? `${limit}+` : String(count);
 }
