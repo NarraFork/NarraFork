@@ -848,7 +848,7 @@ export function createPluginPlatformServices(
 	registerModelListReader("plugin", (group) => {
 		const entry = providerRegistry.get(group.id);
 		// Registry.get also accepts aliases and type ids; a group names an exact instance.
-		return entry?.providerInstanceId === group.id ? entry.getModels().map((model) => model.id) : [];
+		return entry?.providerInstanceId === group.id ? entry.getModels() : [];
 	});
 	// Plugin-contributed web search sources. Credentials and config come from the provider
 	// each source binds to, which is why this reuses the provider registry, credential

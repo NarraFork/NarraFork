@@ -12,6 +12,7 @@ mock.module("../../db", () => ({
 	db,
 	sqlite,
 	activeDatabaseBackend: "sqlite",
+	postgresRuntime: null,
 	databaseMaintenance: createSqliteMaintenance(() => sqlite),
 }));
 const realCharacters = { ...(await import("../../lib/context-characters")) };

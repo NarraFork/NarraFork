@@ -8,18 +8,18 @@ import {
 	useQueryClient,
 } from "@tanstack/react-query";
 import { useEffect, useRef, useSyncExternalStore } from "react";
-import { getToken, onTokenChange } from "../lib/api/client";
+import { getAuthSnapshot, subscribeAuth } from "../lib/api/client";
 import { type ModelCatalogOptionsInput, modelCatalogApi } from "../lib/api/model-catalog";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
 
 export const modelCatalogKeys = {
 	all: ["model-catalog"] as const,
 	status: ["model-catalog", "status"] as const,
-	options: (token: string | null, input: ModelCatalogOptionsInput) =>
+	options: (generation: number, input: ModelCatalogOptionsInput) =>
 		[
 			"model-catalog",
 			"options",
-			token,
+			generation,
 			input.scope ?? "all",
 			input.q ?? "",
 			input.sourceModelId ?? "",
@@ -28,7 +28,7 @@ export const modelCatalogKeys = {
 			input.limit ?? 40,
 		] as const,
 	runtime: (
-		token: string | null,
+		generation: number,
 		model: string | undefined,
 		narratorId?: string,
 		revision?: string,
@@ -36,7 +36,7 @@ export const modelCatalogKeys = {
 		[
 			"model-catalog",
 			"runtime",
-			token,
+			generation,
 			narratorId ?? null,
 			model ?? null,
 			revision ?? null,
@@ -51,10 +51,11 @@ const runtimeRefreshes = new WeakMap<QueryClient, Map<string, RuntimeRefresh>>()
 function refreshRuntimeSelection(
 	qc: QueryClient,
 	queryKey: ReturnType<typeof modelCatalogKeys.runtime>,
-	token: string | null,
+	generation: number,
 ): Promise<void> {
 	const active = () =>
-		getToken() === token && qc.getQueryCache().find({ queryKey, exact: true })?.isActive() === true;
+		getAuthSnapshot().generation === generation &&
+		qc.getQueryCache().find({ queryKey, exact: true })?.isActive() === true;
 	if (!active()) return Promise.resolve();
 	let entries = runtimeRefreshes.get(qc);
 	if (!entries) {
@@ -104,16 +105,22 @@ function refreshRuntimeSelection(
 
 /** A single bounded page. The caller advances the cursor only on an explicit gesture. */
 export function useModelOptions(input: ModelCatalogOptionsInput, opened: boolean) {
-	const token = useSyncExternalStore(onTokenChange, getToken, getToken);
+	const { generation, hasToken } = useSyncExternalStore(
+		subscribeAuth,
+		getAuthSnapshot,
+		getAuthSnapshot,
+	);
 	return useQuery({
-		queryKey: modelCatalogKeys.options(token, input),
+		queryKey: modelCatalogKeys.options(generation, input),
 		queryFn: async ({ signal }) => {
-			if (getToken() !== token) throw new DOMException("Session changed", "AbortError");
+			if (getAuthSnapshot().generation !== generation)
+				throw new DOMException("Session changed", "AbortError");
 			const page = await modelCatalogApi.options(input, { signal });
-			if (getToken() !== token) throw new DOMException("Session changed", "AbortError");
+			if (getAuthSnapshot().generation !== generation)
+				throw new DOMException("Session changed", "AbortError");
 			return page;
 		},
-		enabled: opened && !!token,
+		enabled: opened && hasToken,
 		staleTime: 30_000,
 		gcTime: 60_000,
 		retry: false,
@@ -135,12 +142,17 @@ export function useRuntimeModel({
 	/** Small settings/runtime generation, not provider configuration JSON. */
 	revision?: string;
 }) {
-	const token = useSyncExternalStore(onTokenChange, getToken, getToken);
+	const { generation, hasToken } = useSyncExternalStore(
+		subscribeAuth,
+		getAuthSnapshot,
+		getAuthSnapshot,
+	);
 	const qc = useQueryClient();
-	const summaryOwner = useRef({ token, summary });
-	if (summaryOwner.current.summary !== summary) summaryOwner.current = { token, summary };
+	const summaryOwner = useRef({ generation, summary });
+	if (summaryOwner.current.summary !== summary) summaryOwner.current = { generation, summary };
 	const matchingSummary =
-		summaryOwner.current.token === token &&
+		hasToken &&
+		summaryOwner.current.generation === generation &&
 		summary != null &&
 		summary.selection.value === model &&
 		(revision === undefined || String(summary.settingsRevision) === revision)
@@ -148,41 +160,43 @@ export function useRuntimeModel({
 			: undefined;
 	const query = useQuery({
 		initialData: matchingSummary,
-		queryKey: modelCatalogKeys.runtime(token, model ?? undefined, narratorId, revision),
+		queryKey: modelCatalogKeys.runtime(generation, model ?? undefined, narratorId, revision),
 		queryFn: async ({ signal }) => {
-			if (getToken() !== token) throw new DOMException("Session changed", "AbortError");
+			if (getAuthSnapshot().generation !== generation)
+				throw new DOMException("Session changed", "AbortError");
 			const result = await modelCatalogApi.runtime(
 				{ model: model as string, narratorId },
 				{ signal },
 			);
 			if (
-				getToken() !== token ||
+				getAuthSnapshot().generation !== generation ||
 				result.selection.value !== model ||
 				(revision !== undefined && String(result.settingsRevision) !== revision)
 			)
 				throw new DOMException("Model selection or configuration changed", "AbortError");
 			return result;
 		},
-		enabled: enabled && !!model && !!token,
+		enabled: enabled && !!model && hasToken,
 		staleTime: 30_000,
 		gcTime: 60_000,
 		retry: false,
 	});
 	useEffect(() => {
-		if (!enabled || !token || !model || !narratorId) return;
-		const queryKey = modelCatalogKeys.runtime(token, model, narratorId, revision);
+		if (!enabled || !hasToken || !model || !narratorId) return;
+		const queryKey = modelCatalogKeys.runtime(generation, model, narratorId, revision);
 		const listener = narratorWSManager.addListener(
 			{ types: ["runtime_model_changed"], narratorIds: [narratorId] },
 			(message) => {
-				if (getToken() !== token || message.narratorId !== narratorId) return;
-				void refreshRuntimeSelection(qc, queryKey, token);
+				if (getAuthSnapshot().generation !== generation || message.narratorId !== narratorId)
+					return;
+				void refreshRuntimeSelection(qc, queryKey, generation);
 			},
 		);
 		return () => narratorWSManager.removeListener(listener);
-	}, [enabled, model, narratorId, qc, revision, token]);
+	}, [enabled, generation, hasToken, model, narratorId, qc, revision]);
 	useEffect(() => {
-		if (!matchingSummary || !enabled) return;
-		const queryKey = modelCatalogKeys.runtime(token, model ?? undefined, narratorId, revision);
+		if (!matchingSummary || !enabled || getAuthSnapshot().generation !== generation) return;
+		const queryKey = modelCatalogKeys.runtime(generation, model ?? undefined, narratorId, revision);
 		const current = qc.getQueryData<RuntimeModelSummary>(queryKey);
 		if (current) {
 			if (current.settingsRevision > matchingSummary.settingsRevision) return;
@@ -195,7 +209,7 @@ export function useRuntimeModel({
 		// Only a provably newer snapshot may supersede a completed or in-flight read.
 		void qc.cancelQueries({ queryKey, exact: true });
 		qc.setQueryData(queryKey, matchingSummary);
-	}, [enabled, matchingSummary, model, narratorId, qc, revision, token]);
+	}, [enabled, matchingSummary, model, narratorId, qc, revision, generation]);
 	return { ...query, data: enabled ? query.data : undefined };
 }
 

@@ -94,7 +94,7 @@ function buildSnapshot(statement: string): Buffer {
 	const path = join(dir, "snapshot.db");
 	const db = new Database(path);
 	try {
-		db.run(statement);
+		db.exec(statement);
 	} finally {
 		db.close();
 	}
@@ -215,6 +215,69 @@ describe("data portability · 异常与边界", () => {
 		};
 		expect(a.title).toBe("会话A"); // 被导入值覆盖
 		expect(b.title).toBe("本地B"); // 跳过，保留本地
+	});
+
+	test("覆盖旧快照会按标题和 traits 重算选择器，跳过的行不动", async () => {
+		const now = "2026-10-01T00:00:00Z";
+		sqlite.run(
+			`INSERT INTO narrators (
+				id, type, title, title_slug, alias_selector, traits, created_at, updated_at
+			) VALUES (?, 'subagent', 'New Name', 'new-name', 'new-name', ?, ?, ?)`,
+			["sess-over", JSON.stringify(["subagent-alias:new-name"]), now, now],
+		);
+		sqlite.run(
+			`INSERT INTO narrators (
+				id, type, title, title_slug, alias_selector, traits, created_at, updated_at
+			) VALUES (?, 'subagent', 'Keep', 'stale-keep', 'stale-keep', ?, ?, ?)`,
+			["sess-skip", JSON.stringify(["subagent-alias:fresh-keep"]), now, now],
+		);
+		const oldTraits = JSON.stringify(["subagent-alias:old-name"]).replaceAll("'", "''");
+		const skipTraits = JSON.stringify(["subagent-alias:should-not-apply"]).replaceAll("'", "''");
+		const snapshot = buildSnapshot(`
+			CREATE TABLE api_requests (id TEXT PRIMARY KEY, created_at TEXT NOT NULL);
+			CREATE TABLE narrator_messages (
+				id TEXT PRIMARY KEY,
+				narrator_id TEXT,
+				role TEXT,
+				content_json TEXT,
+				created_at TEXT
+			);
+			CREATE TABLE narrators (
+				id TEXT PRIMARY KEY,
+				type TEXT,
+				title TEXT,
+				traits TEXT,
+				handle TEXT,
+				handle_fold TEXT,
+				message_count INTEGER,
+				created_at TEXT,
+				updated_at TEXT
+			);
+			INSERT INTO narrators (id, type, title, traits, created_at, updated_at)
+			VALUES ('sess-over', 'subagent', 'Old Name', '${oldTraits}', '${now}', '${now}');
+			INSERT INTO narrators (id, type, title, traits, created_at, updated_at)
+			VALUES ('sess-skip', 'subagent', 'Imported Skip', '${skipTraits}', '${now}', '${now}');
+		`);
+		const zip = await buildZip({
+			"snapshot.db": snapshot,
+			"manifest.json": JSON.stringify({ version: 1 }),
+		});
+		const preview = await previewImport(toArrayBuffer(zip), "old-snapshot.zip");
+		await applyImport(preview.token, {
+			conflictById: { "sess-over": "overwrite", "sess-skip": "skip" },
+		});
+		const overwritten = sqlite
+			.prepare(`SELECT title, title_slug, alias_selector FROM narrators WHERE id = 'sess-over'`)
+			.get() as { title: string; title_slug: string; alias_selector: string };
+		expect(overwritten.title).toBe("Old Name");
+		expect(overwritten.title_slug).toBe("old-name");
+		expect(overwritten.alias_selector).toBe("old-name");
+		const skipped = sqlite
+			.prepare(`SELECT title, title_slug, alias_selector FROM narrators WHERE id = 'sess-skip'`)
+			.get() as { title: string; title_slug: string; alias_selector: string };
+		expect(skipped.title).toBe("Keep");
+		expect(skipped.title_slug).toBe("stale-keep");
+		expect(skipped.alias_selector).toBe("stale-keep");
 	});
 
 	test("供应商同 apiKey+baseUrl：重复导入直接跳过，不产生副本", async () => {

@@ -35,6 +35,8 @@ import {
 	parseRuntimeRegistration,
 } from "../lib/validators/runtime-registration";
 import { compileDelegationCeiling } from "./custom-subagent-service";
+import { ensureLegacyCommunicationNodeTx } from "./narrator-communication/initialize";
+import { publishCommunicationChanged } from "./narrator-communication/service";
 
 const BATCH = 200;
 
@@ -92,6 +94,7 @@ function basePrompt(prompt: string | null): string | null {
 
 type LegacyRow = {
 	id: string;
+	type: string;
 	variant: string;
 	subagentType: string | null;
 	parentNarratorId: string | null;
@@ -119,7 +122,14 @@ async function materialize(row: LegacyRow): Promise<void> {
 	set.systemPrompt = basePrompt(row.systemPrompt);
 	if (!hasRuntimePolicyTrait(row.traits))
 		set.traits = withRuntimePolicyTrait(row.traits, await compileDelegationCeiling(template));
-	await db.update(narrators).set(set).where(eq(narrators.id, row.id));
+	db.transaction((tx) => {
+		tx.update(narrators).set(set).where(eq(narrators.id, row.id)).run();
+		ensureLegacyCommunicationNodeTx(tx, {
+			...row,
+			runtimeRegistrationJson: set.runtimeRegistrationJson ?? row.runtimeRegistrationJson,
+		});
+	});
+	publishCommunicationChanged([row.id]);
 }
 
 /** Materialize every legacy delegation, or only those among `ids`. Returns the rows written. */
@@ -136,6 +146,7 @@ export async function materializeLegacyDelegations(ids?: readonly string[]): Pro
 				orderBy: [asc(narrators.id)],
 				columns: {
 					id: true,
+					type: true,
 					variant: true,
 					subagentType: true,
 					parentNarratorId: true,

@@ -17,7 +17,12 @@ export type ModelListSource =
 	| "nug"
 	| "plugin";
 
-type ModelListReader = (group: SourceGroupView) => readonly string[];
+/** Catalog owners keep their complete model objects; only the shared id is required here. */
+export interface SourceModel {
+	readonly id: string;
+}
+
+type ModelListReader = (group: SourceGroupView) => readonly SourceModel[];
 const readers = new Map<ModelListSource, ModelListReader>();
 const singletonSources: Partial<Record<SourceGroupView["templateId"], ModelListSource>> = {
 	codex: "codex",
@@ -38,11 +43,11 @@ export function registerModelListReader(
 	};
 }
 
-/** Read existing upstream ids without applying the agent's hidden/disabled filtering. */
-export function readTemplateModelList(group: SourceGroupView): string[] {
+/** Read the owner's complete catalog once, without the agent's hidden/disabled filtering. */
+export function readTemplateModelList(group: SourceGroupView): readonly SourceModel[] {
 	// Known services such as Kimi can speak more than one protocol. The connection's
 	// actual protocol, not the recognised vendor, chooses its catalog owner.
 	const source =
 		singletonSources[group.templateId] ?? group.endpoint.protocol ?? "completions-compatible";
-	return [...(readers.get(source)?.(group) ?? [])];
+	return readers.get(source)?.(group) ?? [];
 }

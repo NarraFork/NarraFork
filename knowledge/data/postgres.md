@@ -46,7 +46,7 @@ verified_at: 27bdc3eb5
 - SQLite 专属机制在 PG 下不存在：WAL、干净关闭标记、完整性探针、VACUUM 窗口。维护端口对 checkpoint / 统计 / 可回收空间 / 回收空间全部返回 `notApplicable`（`createPostgresMaintenanceRefusals`）；VACUUM 路由因此得到 501。
 - 存储统计：PG 的 `databaseStoragePort` 声明所有能力为 false，`scanBreakdown` 抛 `DatabaseStorageUnsupportedError`，不返回 0（`storage/postgres-database-storage.ts`）。
 - 全文搜索：用 pg_trgm GIN 影子表 + 触发器代替 FTS5（`pg-fts.ts`），见 [全文搜索](search.md)。
-- 数据导入导出直接使用 `sqlite` 句柄，PG 下不可用，见 [数据导入导出](portability.md)。
+- 数据导入导出直接使用 `sqlite` 句柄，PG 下不可用，见 [数据导入导出](portability.md)。PG 迁移包含通讯节点和精确联系人表；联系人端点的规范排序检查使用 `COLLATE "C"`，不随数据库默认排序规则变化。
 - 方言差异的守护：`server/db/sqlite-dialect-inventory.guard.test.ts` 盘点 SQLite 方言用法；`db/pg-errors.ts`、`pg-retry.ts` 处理 PG 错误分类与重试。
 
 ## 从哪读起

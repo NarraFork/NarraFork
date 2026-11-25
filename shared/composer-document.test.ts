@@ -4,6 +4,7 @@ import {
 	composerDocumentProjection,
 	composerDocumentText,
 	composerDocumentTextCandidates,
+	composerNarratorReferenceText,
 	escapeComposerText,
 	legacyComposerDocumentText,
 	parseComposerDocument,
@@ -14,6 +15,80 @@ import { fileReferenceMessageForDisplay } from "./file-reference";
 
 const empty = (): ComposerDocument => ({ version: 1, paragraphs: [{ children: [] }], assets: [] });
 describe("semantic composer document", () => {
+	test("narrator identity survives JSON roundtrip while unicode labels project with exact spans", () => {
+		const doc = parseComposerDocument({
+			...empty(),
+			paragraphs: [
+				{
+					children: [
+						{ type: "text", text: "😀 " },
+						{
+							type: "narratorReference",
+							id: "ref-node",
+							narratorId: "stable_target",
+							label: "会话 😀",
+						},
+						{ type: "text", text: " @ordinary [legacy](nf-agent://open?id=old)" },
+					],
+				},
+			],
+		});
+		expect(parseComposerDocument(JSON.parse(JSON.stringify(doc)))).toEqual(doc);
+		for (const projected of [composerDocumentProjection(doc), legacyComposerDocumentText(doc)]) {
+			expect(projected.text).toBe(
+				"😀 [@会话 😀](nf-agent://open?id=stable_target) @ordinary [legacy](nf-agent://open?id=old)",
+			);
+			expect(projected.fileReferences).toEqual([]);
+			if ("spans" in projected) {
+				const span = projected.spans[1];
+				expect(projected.text.slice(span.start, span.end)).toBe(
+					"[@会话 😀](nf-agent://open?id=stable_target)",
+				);
+				expect(span.start).toBe(3);
+			}
+		}
+	});
+	test("same-title authored references carry distinct exact IDs in current and legacy wire text", () => {
+		const one = {
+			type: "narratorReference" as const,
+			id: "one",
+			narratorId: "target-one",
+			label: "同名",
+		};
+		const two = { ...one, id: "two", narratorId: "target-two" };
+		const doc = parseComposerDocument({
+			...empty(),
+			paragraphs: [{ children: [one, { type: "text", text: " " }, two] }],
+		});
+		for (const projection of [composerDocumentText(doc), legacyComposerDocumentText(doc)]) {
+			expect(projection.text).toBe(
+				"[@同名](nf-agent://open?id=target-one) [@同名](nf-agent://open?id=target-two)",
+			);
+		}
+		expect(
+			composerNarratorReferenceText({ narratorId: "target", label: "name [fake](x) *bold*" }),
+		).toBe("[@name \\[fake\\](x) \\*bold\\*](nf-agent://open?id=target)");
+		const plain = parseComposerDocument({
+			...empty(),
+			paragraphs: [{ children: [{ type: "text", text: composerNarratorReferenceText(one) }] }],
+		});
+		expect(plain.paragraphs[0].children).toEqual([
+			{ type: "text", text: "[@同名](nf-agent://open?id=target-one)" },
+		]);
+	});
+	test("narrator reference is an explicit allowlisted atom, never a link or text upgrade", () => {
+		const ref = { type: "narratorReference", id: "r", narratorId: "target", label: "Label" };
+		const wrap = (node: unknown) => ({ ...empty(), paragraphs: [{ children: [node] }] });
+		expect(readComposerDocument(wrap({ ...ref, narratorId: "bad/id" }))).toBeUndefined();
+		expect(readComposerDocument(wrap({ ...ref, label: " bad " }))).toBeUndefined();
+		expect(readComposerDocument(wrap({ ...ref, label: "bad\nlabel" }))).toBeUndefined();
+		expect(
+			readComposerDocument(wrap({ ...ref, href: "nf-agent://open?id=other" })),
+		).toBeUndefined();
+		expect(
+			parseComposerDocument(wrap({ type: "text", text: "@Label" })).paragraphs[0].children,
+		).toEqual([{ type: "text", text: "@Label" }]);
+	});
 	test("projects quotes, unicode token offsets and independent attachment order", () => {
 		const doc: ComposerDocument = {
 			version: 1,

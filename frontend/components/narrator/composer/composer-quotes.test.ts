@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { composerNarratorReferenceText } from "@shared/composer-document";
 import type { FileReference } from "@shared/file-reference";
 import {
 	composerPreviewText,
@@ -217,6 +218,17 @@ describe("parseComposerSegments", () => {
 });
 
 describe("composerPreviewText", () => {
+	test("queue summaries show authored link labels without exposing canonical URLs or adding semantics", () => {
+		const label = "same [label] *literal*";
+		const wire = composerNarratorReferenceText({ narratorId: "stable-target", label });
+		expect(composerPreviewText(`Ask ${wire} next`)).toBe(`Ask @${label} next`);
+		expect(composerPreviewText("[@ordinary](https://example.test)")).toBe(
+			"[@ordinary](https://example.test)",
+		);
+		expect(composerPreviewText("[@invalid](nf-agent://open?id=bad/id)")).toBe(
+			"[@invalid](nf-agent://open?id=bad/id)",
+		);
+	});
 	test("reads as one plain line in composed order", () => {
 		const text =
 			"> [quote] 来源 @@m:abcd\n> 内容\n\n怎样算？\n> [quote] 第二\n> 二\n\n看[image #1: a.png]";

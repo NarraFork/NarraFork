@@ -23,6 +23,7 @@ import { aclGrants, projects } from "../db/schema";
 import { type ReadQueryOptions, readQuery, readQueryFirst } from "../db/worker-read";
 import { NotFoundError } from "../lib/errors";
 import { type AclPrincipal, applyGrant, type GrantRow, resolveCaps } from "./acl/acl-core";
+import { bindPlaceholders, grantPrincipalText, projectReadableText } from "./read/acl-sql";
 
 /** What an operation needs from the caller. */
 export type ProjectAccessNeed = "read" | "write" | "manage";
@@ -330,8 +331,7 @@ export function projectReadableWhere(principal: ProjectPrincipal) {
 				and acl_grants.scope_id = ${projects.id}
 				and acl_grants.capability in ('read','write','manage')
 				and acl_grants.domain_kind is null
-				and acl_grants.principal_type = 'user'
-				and acl_grants.principal_id = ${principal.userId}
+				and ${bindPlaceholders(grantPrincipalText("acl_grants"), principal.userId)}
 		)`,
 	);
 }
@@ -348,19 +348,7 @@ export function projectReadableWhereForColumn(
 	return sql`exists (
 		select 1 from projects p
 		where p.id = ${projectIdColumn}
-			and (
-				p.visibility = 'public'
-				or p.owner_user_id = ${principal.userId}
-				or exists (
-					select 1 from acl_grants
-					where acl_grants.scope_type = 'project'
-						and acl_grants.scope_id = p.id
-						and acl_grants.capability in ('read','write','manage')
-						and acl_grants.domain_kind is null
-						and acl_grants.principal_type = 'user'
-						and acl_grants.principal_id = ${principal.userId}
-				)
-			)
+			and ${bindPlaceholders(projectReadableText("p"), principal.userId)}
 	)`;
 }
 
@@ -382,21 +370,7 @@ export function projectReadableSqlFragment(
 	projectAlias: string,
 ): { sql: string } | null {
 	if (isAdmin) return null;
-	return {
-		sql: `(
-			${projectAlias}.visibility = 'public'
-			OR ${projectAlias}.owner_user_id = ?
-			OR EXISTS (
-				SELECT 1 FROM acl_grants pg
-				WHERE pg.scope_type = 'project'
-					AND pg.scope_id = ${projectAlias}.id
-					AND pg.capability IN ('read','write','manage')
-					AND pg.domain_kind IS NULL
-					AND pg.principal_type = 'user'
-					AND pg.principal_id = ?
-			)
-		)`,
-	};
+	return { sql: projectReadableText(projectAlias) };
 }
 
 /**

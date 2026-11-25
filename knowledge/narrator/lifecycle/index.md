@@ -13,7 +13,7 @@ keywords:
   - 会话生命周期
   - ActiveNarrator
 status: draft
-verified_at: 160e3f0d4
+verified_at: 001ccbf7d
 ---
 # 会话生命周期
 

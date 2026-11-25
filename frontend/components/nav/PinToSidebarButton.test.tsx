@@ -61,9 +61,14 @@ mock.module("../../lib/i18n", () => ({
 }));
 
 const { api } = await import("../../lib/api");
+const { clearToken, confirmAuthUser, setToken } = await import("../../lib/api/client");
+const { narratorWSManager } = await import("../../lib/narrator-ws-manager");
 const { queryClient } = await import("../../lib/query-client");
-const { applyRecentTabsDeltaAndFollowUp, RECENT_TABS_QUERY_KEY, recentTabStateQueryKey } =
-	await import("../../hooks/useRecentTabs");
+const { getRecentTabsScope, recentTabsFlatQueryKey } = await import("../../lib/recent-tabs-owner");
+const { seedCurrentUser } = await import("../../hooks/useCurrentUser");
+const { applyRecentTabsDeltaAndFollowUp, recentTabStateQueryKey } = await import(
+	"../../hooks/useRecentTabs"
+);
 const { applySession } = await import("../../hooks/useAuth");
 const { PinToSidebarButton } = await import("./PinToSidebarButton");
 
@@ -79,13 +84,16 @@ let container: HTMLDivElement;
 const saved = new Map<string, PropertyDescriptor | undefined>();
 
 const storage = new Map<string, string>();
+function scope() {
+	const current = getRecentTabsScope();
+	if (!current) throw new Error("Missing test scope");
+	return current;
+}
 
 beforeEach(() => {
 	notify.mockClear();
 	queryClient.clear();
 	storage.clear();
-	// Signed in as user A (the button keys its read by the user).
-	queryClient.setQueryData(["auth", "me"], { id: "user-a" });
 	const { window } = parseHTML("<!doctype html><html><body></body></html>");
 	for (const [key, value] of Object.entries({
 		localStorage: {
@@ -103,6 +111,9 @@ beforeEach(() => {
 		saved.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
 		Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
 	}
+	const generation = setToken("token-a");
+	seedCurrentUser(queryClient, generation, { id: "user-a" } as Awaited<ReturnType<typeof api.me>>);
+	confirmAuthUser(generation, "user-a");
 	container = document.createElement("div");
 	document.body.appendChild(container);
 	root = createRoot(container);
@@ -111,6 +122,7 @@ beforeEach(() => {
 afterEach(async () => {
 	await act(async () => root.unmount());
 	container.remove();
+	clearToken();
 	for (const [key, descriptor] of saved) {
 		if (descriptor) Object.defineProperty(globalThis, key, descriptor);
 		else Reflect.deleteProperty(globalThis, key);
@@ -152,7 +164,7 @@ async function click() {
 
 test("a pinned tab outside the loaded pages reads as pinned, and a click unpins it", async () => {
 	// The sidebar has loaded some other tabs, not this one.
-	queryClient.setQueryData(RECENT_TABS_QUERY_KEY, [
+	queryClient.setQueryData(recentTabsFlatQueryKey(scope()), [
 		{ type: "narrator", id: "near", title: "Near", lastVisitedAt: 1, pinned: true },
 	]);
 	const state = spyOn(api, "getRecentTabState").mockResolvedValue({
@@ -178,7 +190,7 @@ test("a pinned tab outside the loaded pages reads as pinned, and a click unpins 
 });
 
 test("a loaded row answers at once, without a read", async () => {
-	queryClient.setQueryData(RECENT_TABS_QUERY_KEY, [
+	queryClient.setQueryData(recentTabsFlatQueryKey(scope()), [
 		{ type: "team", id: "far", title: "Far team", lastVisitedAt: 1, pinned: true },
 	]);
 	const state = spyOn(api, "getRecentTabState").mockResolvedValue({
@@ -245,6 +257,44 @@ test("a delta touching the tab re-reads it; one touching another tab does not", 
 	expect(button().getAttribute("data-pinned")).toBe("false");
 });
 
+test("an access change never reuses a late pin read for the same account", async () => {
+	const listeners = spyOn(narratorWSManager, "addListener").mockReturnValue({ _id: 1 });
+	spyOn(narratorWSManager, "removeListener").mockImplementation(() => {});
+	spyOn(narratorWSManager, "getConnectionAuthGeneration").mockReturnValue(scope().authGeneration);
+	const reads: Array<{ signal?: AbortSignal; resolve: (result: RecentTabStateResult) => void }> =
+		[];
+	spyOn(api, "getRecentTabState").mockImplementation(
+		(_type, _id, signal) => new Promise((resolve) => reads.push({ signal, resolve })),
+	);
+	const oldScope = scope();
+	await renderButton();
+	expect(reads).toHaveLength(1);
+	await act(async () => {
+		listeners.mock.calls[0]?.[1]({
+			type: "narrator_access_changed",
+			narratorId: "far",
+			reason: "team_changed",
+		});
+	});
+	await settle();
+	const current = scope();
+	expect(current).toMatchObject({
+		userId: oldScope.userId,
+		authGeneration: oldScope.authGeneration,
+	});
+	expect(current.accessGeneration).toBeGreaterThan(oldScope.accessGeneration);
+	expect(reads).toHaveLength(2);
+	expect(reads[0]?.signal?.aborted).toBe(true);
+	await act(async () => reads[0]?.resolve({ present: true, pinned: true }));
+	await settle();
+	expect(button().disabled).toBe(true);
+	expect(queryClient.getQueryData(recentTabStateQueryKey(current, "team:far"))).toBeUndefined();
+	await act(async () => reads[1]?.resolve({ present: false, pinned: false }));
+	await settle();
+	expect(button().disabled).toBe(false);
+	expect(button().getAttribute("data-pinned")).toBe("false");
+});
+
 test("a pin the server refuses is reported, not silently dropped", async () => {
 	spyOn(api, "getRecentTabState").mockResolvedValue({ present: false, pinned: false });
 	const refused = Object.assign(new Error("This tab cannot be kept in the sidebar"), {
@@ -270,8 +320,9 @@ test("another account signing in does not see the previous account's pin state",
 	});
 	spyOn(api, "me").mockResolvedValue({ id: "user-b" } as Awaited<ReturnType<typeof api.me>>);
 	await renderButton();
+	const oldKey = recentTabStateQueryKey(scope(), "team:far");
 	expect(button().getAttribute("data-pinned")).toBe("true");
-	expect(queryClient.getQueryData(recentTabStateQueryKey("user-a", "team:far"))).toEqual({
+	expect(queryClient.getQueryData(oldKey)).toEqual({
 		present: true,
 		pinned: true,
 	});
@@ -292,14 +343,14 @@ test("another account signing in does not see the previous account's pin state",
 	});
 	await settle();
 	// A's answer is gone, and B's button waits for B's own read instead of showing A's pin.
-	expect(queryClient.getQueryData(recentTabStateQueryKey("user-a", "team:far"))).toBeUndefined();
+	expect(queryClient.getQueryData(oldKey)).toBeUndefined();
 	expect(state).toHaveBeenCalledTimes(2);
 	expect(button().getAttribute("data-pinned")).toBe("false");
 	expect(button().disabled).toBe(true);
 
 	await act(async () => answer({ present: true, pinned: false }));
 	await settle();
-	expect(queryClient.getQueryData(recentTabStateQueryKey("user-b", "team:far"))).toEqual({
+	expect(queryClient.getQueryData(recentTabStateQueryKey(scope(), "team:far"))).toEqual({
 		present: true,
 		pinned: false,
 	});

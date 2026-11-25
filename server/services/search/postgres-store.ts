@@ -35,6 +35,12 @@
  */
 
 import type { PgExecutor } from "../../db/pg-fts";
+import {
+	guardRecallEffectiveRefsQuery,
+	type RecallEffectiveRefs,
+	recallEffectiveRefsQueries,
+	unwrapRecallEffectiveRefsRows,
+} from "../../lib/db-worker/recall-effective-refs";
 import { AppError, ValidationError } from "../../lib/errors";
 import { narratorReadableSqlFragment } from "../narrator-acl";
 import { narratorProjectIdText } from "../read/acl-sql";
@@ -724,59 +730,119 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 		async searchRecallMessages(query: RecallSearchQuery): Promise<RecallMessageRow[]> {
 			const params = new Params();
 			const global = query.narratorId === null;
+			let refs: RecallEffectiveRefs | null = null;
+			if (query.narratorId !== null) {
+				if (query.signal?.aborted)
+					throw new AppError("Search was cancelled", 499, "SEARCH_QUERY_CANCELLED");
+				const plan = recallEffectiveRefsQueries(query.narratorId, true);
+				const first = plan.next();
+				if (first.done) throw new Error("Recall lineage query was not yielded");
+				const lineage = await client.unsafe(first.value.sql, first.value.params);
+				if (query.signal?.aborted)
+					throw new AppError("Search was cancelled", 499, "SEARCH_QUERY_CANCELLED");
+				const effective = plan.next(lineage);
+				if (!effective.done) throw new Error("Unexpected additional Recall lineage query");
+				let index = 0;
+				refs = {
+					cte: effective.value.cte.replace(/\?/g, () =>
+						params.add(effective.value.params[index++]),
+					),
+					params: [],
+				};
+			}
+			const runRecall = async (sql: string, order: string): Promise<Row[]> => {
+				const guarded = refs
+					? guardRecallEffectiveRefsQuery(refs, sql, [], order.replaceAll("m.", ""))
+					: { sql };
+				const rows = await run(guarded.sql, params);
+				return refs ? unwrapRecallEffectiveRefsRows(rows) : rows;
+			};
 			const source = global
-				? `JOIN narrators n ON n.id = m.narrator_id ${narratorScopeSql()}`
-				: `JOIN narrator_message_refs r ON r.message_id = m.id
-			 JOIN narrators n ON n.id = r.narrator_id ${narratorScopeSql()}`;
-			const narratorIdColumn = global ? "n.id AS narrator_id" : "r.narrator_id";
-			const scopeFilter = global ? "" : ` AND r.narrator_id = ${params.add(query.narratorId)}`;
-			let timeSuffix = "";
-			if (query.createdFrom) timeSuffix += ` AND m.created_at >= ${params.add(query.createdFrom)}`;
-			if (query.createdTo) timeSuffix += ` AND m.created_at <= ${params.add(query.createdTo)}`;
+				? `JOIN narrators n ON n.id = COALESCE(
+					(SELECT hr.narrator_id FROM narrator_message_refs hr
+					 WHERE hr.message_id = m.id AND hr.narrator_id = m.narrator_id),
+					(SELECT MIN(n.id) FROM narrator_message_refs hr
+					 JOIN narrators n ON n.id = hr.narrator_id ${narratorScopeSql()}
+					 WHERE hr.message_id = m.id)
+				) ${narratorScopeSql()}
+				AND EXISTS (SELECT 1 FROM narrators n
+				 WHERE n.id = m.narrator_id ${narratorScopeSql()})`
+				: `JOIN effective_recall_refs r ON r.message_id = m.id
+			 JOIN narrators n ON n.id = (SELECT narrator_id FROM recall_ref_sources WHERE depth = 0) ${narratorScopeSql()}`;
+			const narratorIdColumn = "n.id AS narrator_id";
+			let filterSuffix = "";
+			if (query.createdFrom)
+				filterSuffix += ` AND m.created_at >= ${params.add(query.createdFrom)}`;
+			if (query.createdTo) filterSuffix += ` AND m.created_at <= ${params.add(query.createdTo)}`;
+			if (query.roles) {
+				const roles = [...new Set(query.roles)];
+				filterSuffix += roles.length
+					? ` AND m.role IN (${roles.map((role) => params.add(role)).join(",")})`
+					: " AND FALSE";
+			}
+			if (query.origins) {
+				const known = [...new Set(query.origins.filter((origin) => origin !== "unknown"))];
+				const alternatives: string[] = [];
+				if (known.length) {
+					alternatives.push(`m.origin IN (${known.map((origin) => params.add(origin)).join(",")})`);
+				}
+				if (query.origins.includes("unknown")) alternatives.push("m.origin IS NULL");
+				filterSuffix += alternatives.length ? ` AND (${alternatives.join(" OR ")})` : " AND FALSE";
+			}
+			const timeOrder = `m.created_at ${query.sort === "oldest" ? "ASC" : "DESC"}, m.id ASC`;
 			let rows: Row[];
 			if (query.strategy === "index") {
 				const terms = queryTerms(query.text);
 				const where = termsClause(["f.content_text"], terms, "and", params);
 				const snippet = snippetSql("f.content_text", terms, RECALL_SNIPPET, params);
-				rows = await run(
-					`SELECT m.id, ${narratorIdColumn}, m.role, m.created_at,
+				const rank = rankSql(["f.content_text"], params.add(query.text));
+				const order =
+					!query.sort || query.sort === "relevance"
+						? `rank_score ASC NULLS LAST, ${timeOrder}`
+						: timeOrder;
+				rows = await runRecall(
+					`SELECT m.id, ${narratorIdColumn}, m.narrator_id AS owner_narrator_id, m.role, m.origin, m.created_at, ${rank} AS rank_score,
 						n.title AS narrator_title,
 						${snippet} AS snippet
 					 FROM search_narrator_messages f
 					 JOIN narrator_messages m ON m.id = f.id
 					 ${source}
-					 WHERE ${where}${scopeFilter}${timeSuffix}
-					 ORDER BY m.created_at DESC
+					 WHERE ${where}${filterSuffix}
+					 ORDER BY ${order}
 					 LIMIT ${params.add(query.limit)}`,
-					params,
+					order,
 				);
 				return rows.map((row) => ({
 					messageId: strOr(row, "id", ""),
 					narratorId: strOr(row, "narrator_id", ""),
 					narratorTitle: str(row, "narrator_title"),
+					ownerNarratorId: str(row, "owner_narrator_id") ?? undefined,
 					role: strOr(row, "role", ""),
+					origin: str(row, "origin"),
 					createdAt: strOr(row, "created_at", ""),
 					snippet: markSnippet(str(row, "snippet"), terms, RECALL_SNIPPET),
 				}));
 			}
 			const preview = params.add(query.previewChars);
 			const contains = globalClause(["m.content_text"], query.text, params);
-			rows = await run(
-				`SELECT m.id, ${narratorIdColumn}, m.role, m.created_at,
+			rows = await runRecall(
+				`SELECT m.id, ${narratorIdColumn}, m.narrator_id AS owner_narrator_id, m.role, m.origin, m.created_at,
 					n.title AS narrator_title,
 					substr(m.content_text, 1, ${preview}) AS snippet
 				 FROM narrator_messages m
 				 ${source}
-				 WHERE ${contains}${scopeFilter}${timeSuffix}
-				 ORDER BY m.created_at DESC
+				 WHERE ${contains}${filterSuffix}
+				 ORDER BY ${timeOrder}
 				 LIMIT ${params.add(query.limit)}`,
-				params,
+				timeOrder,
 			);
 			return rows.map((row) => ({
 				messageId: strOr(row, "id", ""),
 				narratorId: strOr(row, "narrator_id", ""),
 				narratorTitle: str(row, "narrator_title"),
+				ownerNarratorId: str(row, "owner_narrator_id") ?? undefined,
 				role: strOr(row, "role", ""),
+				origin: str(row, "origin"),
 				createdAt: strOr(row, "created_at", ""),
 				snippet: str(row, "snippet") ?? "",
 			}));

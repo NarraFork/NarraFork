@@ -250,12 +250,22 @@ describe("the pin state of one tab", () => {
 			lastVisitedAt: index + 2,
 			pin: true,
 		}));
+		await db.insert(narrators).values(
+			sessions.map(({ id, title }) => ({
+				id,
+				title,
+				ownerUserId: user,
+				createdAt: now(),
+				updatedAt: now(),
+			})),
+		);
 		for (let start = 0; start < sessions.length; start += 50) {
 			await upsertRecentTabsBatch(user, sessions.slice(start, start + 50));
 		}
 		await upsertRecentTab(user, teamTab(teamId), { pin: true });
 		const firstPage = await listPage(user, "work");
 		expect(firstPage.hasMore).toBe(true);
+		expect(firstPage.items).toHaveLength(50);
 		expect(firstPage.items.some((item) => item.id === teamId)).toBe(false);
 
 		expect(service.getRecentTabState(user, "team", teamId)).toEqual({
@@ -279,27 +289,29 @@ describe("the pin state of one tab", () => {
 
 	test("an old unpinned project visit reads as gone before its conversion runs", async () => {
 		const user = await makeUser();
+		const old = await makeProject();
+		const kept = await makeProject();
 		await db.insert(userRecentTabs).values(
-			(["old", "kept"] as const).map((name) => ({
+			[kept, old].map((projectId, index) => ({
 				id: generateId(),
 				userId: user,
-				tabKey: `project:${name}`,
+				tabKey: `project:${projectId}`,
 				section: "projects" as const,
 				type: "project" as const,
-				entityId: name,
-				title: name,
+				entityId: projectId,
+				title: `p-${index}`,
 				lastVisitedAt: 1,
-				pinned: name === "kept",
-				sortOrder: name === "kept" ? 0 : 1,
+				pinned: index === 0,
+				sortOrder: index,
 				createdAt: now(),
 				updatedAt: now(),
 			})),
 		);
-		expect(service.getRecentTabState(user, "project", "old")).toEqual({
+		expect(service.getRecentTabState(user, "project", old)).toEqual({
 			present: false,
 			pinned: false,
 		});
-		expect(service.getRecentTabState(user, "project", "kept")).toEqual({
+		expect(service.getRecentTabState(user, "project", kept)).toEqual({
 			present: true,
 			pinned: true,
 		});
@@ -493,8 +505,8 @@ describe("team tabs follow the team", () => {
 
 		// Lost access: the tab still exists until the prune, but it reads no state.
 		await db.delete(aclGrants).where(eq(aclGrants.id, onlookerGrant));
-		const [lostPatch] = (await getRuntimePatches(onlooker, [`team:${teamId}`])).patches;
-		expect(lostPatch.patch).toMatchObject({ status: null, pendingApprovalCount: null });
+		const { patches } = await getRuntimePatches(onlooker, [`team:${teamId}`]);
+		expect(patches).toEqual([]);
 	});
 
 	test("access loss on the coordinator drops the tab for that holder only", async () => {
@@ -511,6 +523,22 @@ describe("team tabs follow the team", () => {
 		await pruneTeamTabs(teamId);
 		expect(await keysOf(kept)).toContain(`team:${teamId}`);
 		expect(await keysOf(lost)).not.toContain(`team:${teamId}`);
+	});
+
+	test("undo does not restore a team after its coordinator grant was revoked", async () => {
+		const holder = await makeUser();
+		const projectId = await makeProject();
+		const teamId = await makeTeam(projectId);
+		const grant = await grantNarrator(teamId, holder, "read");
+		await upsertRecentTab(holder, teamTab(teamId), { pin: true });
+		const closed = await removeRecentTab(holder, "team", teamId, { storeUndo: true });
+		expect(closed.undoToken).toBeString();
+		await db.delete(aclGrants).where(eq(aclGrants.id, grant));
+		expect(await restoreRecentTabs(holder, { token: closed.undoToken })).toMatchObject({
+			changed: false,
+			operations: [],
+		});
+		expect(await keysOf(holder)).not.toContain(`team:${teamId}`);
 	});
 
 	test("archiving the team drops every holder's tab", async () => {
@@ -603,6 +631,15 @@ describe("the retired projects section", () => {
 		});
 		// A first read migrates the (empty) legacy list and creates the meta row.
 		await listAllRecentTabs(user);
+		const kept = await makeProject();
+		const old = await makeProject();
+		const session = generateId();
+		await db.insert(narrators).values({
+			id: session,
+			ownerUserId: user,
+			createdAt: now(),
+			updatedAt: now(),
+		});
 		const row = (key: string, type: "project" | "narrator", pinned: boolean, order: number) => ({
 			id: generateId(),
 			userId: user,
@@ -621,15 +658,15 @@ describe("the retired projects section", () => {
 		await db
 			.insert(userRecentTabs)
 			.values([
-				row("project:kept", "project", true, 1),
-				row("project:old", "project", false, 2),
-				row("narrator:s", "narrator", false, 3),
+				row(`project:${kept}`, "project", true, 1),
+				row(`project:${old}`, "project", false, 2),
+				row(`narrator:${session}`, "narrator", false, 3),
 			]);
 
 		const page = await listPage(user, "work");
 		expect(page.items.map((item) => `${item.type}:${item.id}`)).toEqual([
-			"project:kept",
-			"narrator:s",
+			`project:${kept}`,
+			`narrator:${session}`,
 		]);
 		expect((await listPage(user, "projects")).items).toEqual([]);
 		const sections = db

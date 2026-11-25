@@ -572,8 +572,22 @@
 		{
 			"idx": 81,
 			"version": "7",
-			"when": 1795586699160,
-			"tag": "0081_team_work_item_dependencies",
+			"when": 1795580959074,
+			"tag": "0081_subagent-alias-addressable-scope",
+			"breakpoints": true
+		},
+		{
+			"idx": 82,
+			"version": "7",
+			"when": 1795595730488,
+			"tag": "0082_communication_topology",
+			"breakpoints": true
+		},
+		{
+			"idx": 83,
+			"version": "7",
+			"when": 1795622141682,
+			"tag": "0083_team_work_item_dependencies",
 			"breakpoints": true
 		}
   ]

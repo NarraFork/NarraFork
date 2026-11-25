@@ -6,6 +6,8 @@ import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider } from "react-i18next";
+import { userPreferencesQueryKey } from "../../hooks/useUserPreferences";
+import { confirmAuthUser, getAuthSnapshot } from "../../lib/api/client";
 import { appearanceStore } from "../../lib/appearance-preference-store";
 import type { NarratorPanelProps } from "../narrator/narrator-panel-types";
 import type { PluginUiSessionContext } from "../plugins/PluginUiSurfaceContext";
@@ -15,7 +17,7 @@ import type { PanelWindowDescriptor } from "./panel-window";
 
 const fixtureUser = "standalone-panel-fixture-user";
 const fixtureToken = "standalone-panel-fixture-token";
-const preferencesKey = ["user-preferences", "ui", fixtureUser, fixtureToken] as const;
+const preferencesKey = () => userPreferencesQueryKey("ui");
 const i18n = i18next.createInstance();
 await i18n.init({ lng: "en", resources: { en: { plugins: {} } }, initImmediate: false });
 const navigate = mock(() => {});
@@ -146,6 +148,7 @@ beforeEach(() => {
 	delegate = undefined;
 	appearanceStore.activate(null, true);
 	client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
+	confirmAuthUser(getAuthSnapshot().generation, fixtureUser);
 	client.setQueryData(["auth", "me"], { id: fixtureUser });
 	client.setQueryData(["narrators", "n1"], {
 		id: "n1",
@@ -158,7 +161,7 @@ beforeEach(() => {
 		parentNarratorId: "n1",
 		traits: [],
 	});
-	client.setQueryData(preferencesKey, { addSubagentToRecentTabs: true });
+	client.setQueryData(preferencesKey(), { addSubagentToRecentTabs: true });
 	container = document.body.appendChild(document.createElement("div"));
 	root = createRoot(container);
 });

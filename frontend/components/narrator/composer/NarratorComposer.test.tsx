@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { ImageViewerContext } from "@frontend/components/common/image-viewer-context";
+import { seedCurrentUser } from "@frontend/hooks/useCurrentUser";
 import { ApiError, api } from "@frontend/lib/api";
-import { setToken } from "@frontend/lib/api/client";
+import { clearToken, confirmAuthUser, setToken } from "@frontend/lib/api/client";
 import type {
 	NarratorPanelReadScope,
 	NarratorPanelStateResponse,
@@ -245,7 +246,6 @@ beforeEach(async () => {
 		defaultOptions: { queries: { retry: false, gcTime: Infinity, staleTime: Infinity } },
 	});
 	qc.setQueryData(["auth", "me"], { id: "u1" });
-	qc.setQueryData(["named-narrators"], []);
 	// Body-focused unit cases model a legacy server unless they explicitly provide metadata.
 	// This avoids an impossible empty metadata snapshot paired with a nonempty mocked body.
 	panelSpy = spyOn(api, "getNarratorPanelState").mockRejectedValue(
@@ -306,6 +306,7 @@ afterEach(async () => {
 	});
 	host.remove();
 	qc.clear();
+	clearToken();
 	notifyManager.setScheduler((callback) => setTimeout(callback, 0));
 	getSpy.mockRestore();
 	panelSpy.mockRestore();
@@ -408,13 +409,19 @@ function panelDomainRequests() {
 	return panelRequests.filter((request) => request.path !== "/api/settings/runtime");
 }
 
+function seedComposerUser(token: string, userId: string) {
+	const generation = setToken(token);
+	seedCurrentUser(qc, generation, { id: userId });
+	confirmAuthUser(generation, userId);
+}
+
 function enablePanelSharing() {
 	panelSharingMode = true;
 	// The integration lane uses the real API readers and components, not their unit-test spies.
 	panelSpy.mockRestore();
 	getSpy.mockRestore();
 	updateSpy.mockRestore();
-	setToken("panel-sharing-token");
+	seedComposerUser("panel-sharing-token", "u1");
 	for (const key of ["connected", "disconnected"]) {
 		panelManagerOriginals.set(key, Object.getOwnPropertyDescriptor(narratorWSManager, key));
 		Object.defineProperty(narratorWSManager, key, {
@@ -710,8 +717,7 @@ describe("real panel, composer and policy share scoped HTTP reads", () => {
 		await render();
 		const old = panelReads()[0];
 		await act(async () => {
-			setToken("new-panel-sharing-token");
-			qc.setQueryData(["auth", "me"], { id: "u2" });
+			seedComposerUser("new-panel-sharing-token", "u2");
 		});
 		await render();
 		expect(old.init?.signal?.aborted).toBe(true);
@@ -1461,6 +1467,37 @@ describe("composer revision-only initial reconciliation", () => {
 });
 
 describe("composer rich document contract", () => {
+	test("authored narrator identity survives draft storage, hidden send snapshot and failed-send recovery", async () => {
+		await render();
+		const atom = {
+			type: "narratorReference" as const,
+			id: "occurrence",
+			narratorId: "stable-target",
+			label: "Snapshot title",
+		};
+		const doc: ComposerDocument = {
+			version: 1,
+			assets: [],
+			paragraphs: [
+				{ children: [{ type: "text", text: "Ask " }, atom, { type: "text", text: " later" }] },
+			],
+		};
+		const input = composerDocumentText(doc);
+		await act(async () => handle.current?.restoreInput(input.text, input.fileReferences, doc));
+		expect(handle.current?.getDocument()).toEqual(doc);
+		expect(readNarratorInputDraft("u1", "n1").composerDocument).toEqual(doc);
+		await act(async () => handle.current?.noteSent(input.text, input.fileReferences, doc));
+		sendingRef.current = true;
+		await act(async () => handle.current?.hideTextForSend());
+		expect(readNarratorInputDraft("u1", "n1").composerDocument).toEqual(doc);
+		sendingRef.current = false;
+		await act(async () => handle.current?.restoreInput(input.text, input.fileReferences, doc));
+		expect(handle.current?.getDocument()?.paragraphs[0].children).toContainEqual(atom);
+		const editor = getEditor();
+		await act(async () => editor.view.dispatch(editor.state.tr.insertText("new ", 1)));
+		await act(async () => editor.commands.undo());
+		expect(handle.current?.getDocument()).toEqual(doc);
+	});
 	function richDocument(): ComposerDocument {
 		return parseComposerDocument({
 			version: 1,
@@ -2085,10 +2122,14 @@ describe("composer rich document contract", () => {
 	});
 });
 
-describe("on-demand named suggestions", () => {
-	test("plain editor focus and non-mention input make zero named requests", async () => {
-		setToken("mention-session");
-		const suggestions = spyOn(api, "listNamedNarratorSuggestions").mockResolvedValue({
+describe("on-demand narrator mentions", () => {
+	test("plain editor focus and non-mention input make zero candidate requests", async () => {
+		seedComposerUser("mention-session", "u1");
+		const communication = spyOn(api, "searchCommunicationCandidates").mockResolvedValue({
+			items: [],
+			hasMore: false,
+		});
+		const named = spyOn(api, "listNamedNarratorSuggestions").mockResolvedValue({
 			items: [],
 			nextCursor: null,
 		});
@@ -2103,49 +2144,68 @@ describe("on-demand named suggestions", () => {
 			await act(async () => {
 				input.dispatchEvent(new Event("focus"));
 				handle.current?.setText("ordinary focused input");
-				await new Promise((resolve) => setTimeout(resolve, 225));
 			});
-			expect(suggestions).not.toHaveBeenCalled();
+			expect(communication).not.toHaveBeenCalled();
+			expect(named).not.toHaveBeenCalled();
 			expect(legacy).not.toHaveBeenCalled();
 		} finally {
-			suggestions.mockRestore();
+			communication.mockRestore();
+			named.mockRestore();
 			legacy.mockRestore();
 		}
 	});
 
-	test("only an active focused mention searches; hiding aborts its in-flight page", async () => {
-		setToken("mention-session");
-		let requestSignal: AbortSignal | undefined;
-		const pending = deferred<Awaited<ReturnType<typeof api.listNamedNarratorSuggestions>>>();
-		const suggestions = spyOn(api, "listNamedNarratorSuggestions").mockImplementation(
-			(_query, options) => {
-				requestSignal = options?.signal;
-				return pending.promise;
-			},
+	test.each([
+		"hidden",
+		"blur",
+	] as const)("only an active focused mention searches; %s aborts its in-flight page", async (stop) => {
+		seedComposerUser("mention-session", "u1");
+		const pending = deferred<Awaited<ReturnType<typeof api.searchCommunicationCandidates>>>();
+		const communication = spyOn(api, "searchCommunicationCandidates").mockReturnValue(
+			pending.promise,
 		);
+		const named = spyOn(api, "listNamedNarratorSuggestions").mockResolvedValue({
+			items: [],
+			nextCursor: null,
+		});
 		try {
 			await render();
 			const input = host.querySelector<HTMLElement>('[role="textbox"]');
 			if (!input) throw new Error("Missing composer textbox");
-			Object.defineProperty(document, "activeElement", { configurable: true, get: () => input });
+			let active: HTMLElement = input;
+			Object.defineProperty(document, "activeElement", {
+				configurable: true,
+				get: () => active,
+			});
 			await act(async () => handle.current?.setText("@Alpha"));
+			expect(communication).not.toHaveBeenCalled();
 			await act(async () => {
 				getEditor().commands.setTextSelection(7);
 				input.dispatchEvent(new Event("focus"));
 			});
+			expect(communication).toHaveBeenCalledTimes(1);
+			expect(named).not.toHaveBeenCalled();
+			const [narratorId, query, options] = communication.mock.calls[0];
+			expect([narratorId, query]).toEqual([testNarratorId, "alpha"]);
+			expect(options?.signal?.aborted).toBe(false);
 			await act(async () => {
-				await new Promise((resolve) => setTimeout(resolve, 225));
+				if (stop === "hidden") {
+					Object.defineProperty(document, "visibilityState", {
+						configurable: true,
+						value: "hidden",
+					});
+					document.dispatchEvent(new Event("visibilitychange"));
+				} else {
+					active = document.body;
+					input.dispatchEvent(new Event("blur"));
+				}
 			});
-			expect(suggestions).toHaveBeenCalledTimes(1);
-			expect(suggestions.mock.calls[0][0]).toEqual({ q: "alpha" });
-			await act(async () => {
-				Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
-				document.dispatchEvent(new Event("visibilitychange"));
-			});
-			expect(requestSignal?.aborted).toBe(true);
-			pending.resolve({ items: [], nextCursor: null });
+			expect(options?.signal?.aborted).toBe(true);
+			expect(host.querySelector('[role="listbox"]')).toBeNull();
 		} finally {
-			suggestions.mockRestore();
+			pending.resolve({ items: [], hasMore: false });
+			communication.mockRestore();
+			named.mockRestore();
 		}
 	});
 });

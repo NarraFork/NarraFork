@@ -244,7 +244,7 @@ export function useResolvedImageSrc(
 		authorizedFetch(url, { signal })
 			.then(async (res) => {
 				if (!res.ok) {
-					await clearTokenOnSessionFailure(res.clone());
+					await clearTokenOnSessionFailure(res);
 					throw new Error(`Request failed (${res.status})`);
 				}
 				return readBoundedBlob(

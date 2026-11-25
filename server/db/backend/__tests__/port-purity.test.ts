@@ -78,6 +78,17 @@ describe("database backend ports are dialect-free", () => {
 		expect(bundled).toContain("requireCapability");
 	}, 60_000);
 
+	test("communication ACL predicates allow neutral Drizzle but do not reach SQLite", async () => {
+		const bundled = await bundle("server/services/narrator-communication/predicates.ts");
+		expect(bundled).toContain("narratorWritableText");
+		expect(bundled).not.toContain("bun:sqlite");
+		expect(bundled).not.toContain("drizzle-orm/sqlite");
+		expect(bundled).not.toContain("drizzle-orm/bun-sqlite");
+		for (const symbol of BOOTSTRAP_SYMBOLS) {
+			expect(bundled).not.toContain(symbol);
+		}
+	}, 60_000);
+
 	test("the SQLite adapters DO carry the driver, which is why they are not ports", async () => {
 		// The complement of the assertions above, and the reason the split exists: if an adapter had
 		// no engine in it, either the boundary is in the wrong place or the adapter is a stub.

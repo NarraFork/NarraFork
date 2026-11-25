@@ -35,7 +35,7 @@ verified_at: 27bdc3eb5
 3. 串行化与解析：`subagent-runner.ts:runSubagent` 在父的 `withNarratorWorkAdmission` 内进入；模板名规范化，解析自定义模板定义，拼委派基础提示词，算超时（后台默认上限 5 小时 `BACKGROUND_TASK_TIMEOUT_MS`）。
 4. 编译能力上限：`policy.ts:compileDelegationPolicy` 把模板变成写进新叙述者的 runtime policy；`resolveEffectiveSubagentModelPolicy` + `selectSubagentModel` 选模型（只能在父有效策略内收窄），无可用模型抛 `ValidationError`。
 5. 建叙述者：`narratorService.createSubagent`（`narrator-service.ts`）先沿 `parent_narrator_id` 校验深度（`delegationDepthOf`，超限报 `DELEGATION_DEPTH_LIMIT_MESSAGE`），再写行并打深度戳 `withDelegationDepth`。见 [会话生命周期](../narrator/lifecycle/index.md)。
-6. 登记：别名注册并持久化（会话内唯一，冲突时改名并在结果里加注）；可选 `delegateOutlineTask`；组装运行绑定 `binding`：`deliverTo`（父叙述者 + toolUseId + 精确的 toolCall 与 attempt）、前台才带 `cancelWith`、`deadlineAt`。
+6. 登记：别名注册并持久化。唯一性只相对于这个父会话里仍可寻址的成员（`idle` / `working` / `waiting`）；已归档的旧别名可以再用，冲突时才改名并在结果里加注。可选 `delegateOutlineTask`；组装运行绑定 `binding`：`deliverTo`（父叙述者 + toolUseId + 精确的 toolCall 与 attempt）、前台才带 `cancelWith`、`deadlineAt`。
 7. 写入初始提示：`persistSubagentUserMessage` 把任务文本作为子代理的用户消息落库，挂在父的 `toolUseId` 下。见 [消息存储](../narrator/messages/index.md)。
 8. 分支，前台：`startNarratorRun({ binding, cancelSignal, foreground: true })`，随后 `await handle.foreground`，父的工具调用一直挂着，父的取消经 `cancelWith` 传到子；返回 `result.output` 作为工具结果。
 9. 分支，后台：`backgroundTaskService.createAgentTask` 登记，发 `narrator:background_task_started` 事件与同名 WebSocket 帧，`startNarratorRun` 采用该登记，工具**立即**返回含 `<background_task_id>` 的启动文本。`takeover_by_user` 时先建运行保持（hold），完成不通知父。

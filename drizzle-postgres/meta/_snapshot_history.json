@@ -651,11 +651,27 @@
 		},
 		{
 			"idx": 81,
-			"tag": "0081_team_work_item_dependencies",
-			"id": "4c2a67db-0b4b-41c8-b8f9-2f9d1f232663",
+			"tag": "0081_subagent-alias-addressable-scope",
+			"id": "ff0d57da-e8d7-48db-88a7-1e3066eaae33",
 			"prevId": "c07b4921-245c-4e69-b29f-01132e3f6156",
 			"version": "7",
-			"snapshotDigest": "d4da7688c16bc884d708440022ade7d0071304b738df5d9b0a6314754bad771a"
+			"snapshotDigest": "e83c4ffd33b7c9b6347b41369135b22413c697523ec468a84144e96005a0a95b"
+		},
+		{
+			"idx": 82,
+			"tag": "0082_communication_topology",
+			"id": "abeafedc-f054-41e8-b9a0-edc89be12b9b",
+			"prevId": "ff0d57da-e8d7-48db-88a7-1e3066eaae33",
+			"version": "7",
+			"snapshotDigest": "5988cdbd02f574a70bd00e258f910cd54341bd2480df10735d1b513262a7f12e"
+		},
+		{
+			"idx": 83,
+			"tag": "0083_team_work_item_dependencies",
+			"id": "4bf3c31a-d05b-40d5-a692-085afe0dc19c",
+			"prevId": "abeafedc-f054-41e8-b9a0-edc89be12b9b",
+			"version": "7",
+			"snapshotDigest": "1eb64e32029b75e1372446060f6b6519d75bb1e8ac80d27842d5781b88f51194"
 		}
 	]
 }

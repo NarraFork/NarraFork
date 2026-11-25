@@ -22,7 +22,7 @@ import {
 } from "../lib/settings";
 import { registerModelListReader } from "../lib/sourcing/model-list-readers";
 import { sourceGroupForConnection } from "../lib/sourcing/source-groups";
-import { listCachedTemplateModels } from "../lib/sourcing/templates";
+import { getServiceTemplate } from "../lib/sourcing/templates";
 
 export const openaiRoutes = new Hono();
 
@@ -100,9 +100,7 @@ for (const protocol of ["openai-responses", "completions-compatible"] as const) 
 			cachedModelsByProvider.generation,
 		),
 	);
-	registerModelListReader(protocol, (group) =>
-		getOpenaiCachedModelsByProvider(group.id).map((model) => model.id),
-	);
+	registerModelListReader(protocol, (group) => getOpenaiCachedModelsByProvider(group.id));
 }
 
 function activeOpenaiProviderIds(): Set<string> {
@@ -384,9 +382,9 @@ openaiRoutes.get("/providers/:id/models", async (c) => {
 		config ? customApiProtocolFromOpenAI(config) : "completions-compatible",
 	);
 	return c.json({
-		models: await listCachedTemplateModels(
+		models: await getServiceTemplate(group.templateId).listModels(
 			group,
-			getOpenaiCachedModelsByProvider(id),
+			undefined,
 			c.req.raw.signal,
 		),
 		fromCache: true,

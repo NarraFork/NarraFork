@@ -852,6 +852,50 @@ test("the page is about one team: no teams list, no new team, at desktop and pho
 	}
 }, 60_000);
 
+test("at 360 px a read-only user opens team communications and Back closes only the drawer", async () => {
+	const { page, errors } = await openPage(bob, { width: 360, height: 780 });
+	try {
+		await call(page, (f, p: string, t: string) => f.openTeam(p, t), projectId, teamId);
+		await until(page, "members loaded", (f) => f.count("[data-testid=team-members-button]") === 1);
+		await until(
+			page,
+			"phone header",
+			(f) => f.attr("[data-testid=team-top-bar]", "data-phone") === "true",
+		);
+		await page.click("[data-testid=team-more-menu]");
+		const entrySelector = "[data-testid=team-communication-button]";
+		await page.waitForSelector(entrySelector, { visible: true });
+		const entry = await page.$eval(entrySelector, (el) => ({
+			text: el.textContent,
+			role: el.getAttribute("role"),
+			iconHidden: el.querySelector("svg")?.getAttribute("aria-hidden"),
+			height: el.getBoundingClientRect().height,
+		}));
+		expect(entry).toMatchObject({
+			text: "Communication topology",
+			role: "menuitem",
+			iconHidden: "true",
+		});
+		expect(entry.height).toBeGreaterThanOrEqual(48);
+		expect(await call(page, (f) => f.count("[data-testid=team-pause-all]"))).toBe(0);
+		await page.click(entrySelector);
+		await until(page, "topology drawer", (f) => {
+			const fit = f.fitsWidth("[data-testid=communication-topology]");
+			return fit.found && fit.inside && !fit.scrolls;
+		});
+		await page.waitForFunction(() => typeof history.state?.__NF_sentinel_id === "string");
+		const teamPageUrl = page.url();
+		await page.evaluate(() => history.back());
+		await until(page, "topology drawer closed", (f) => f.gone(".mantine-Drawer-content"));
+		expect(page.url()).toBe(teamPageUrl);
+		expect(await call(page, (f) => f.text("[data-testid=team-title]"))).toBe("Release crew");
+		expect(await call(page, (f) => f.openedTargets())).toEqual([]);
+		expect(errors).toEqual([]);
+	} finally {
+		await page.close();
+	}
+}, 60_000);
+
 test("an archived team says so in the header and offers no pause all", async () => {
 	const owner = { userId: alice, isAdmin: false };
 	const old = await createTeam({ projectId, name: "Old crew" }, owner);

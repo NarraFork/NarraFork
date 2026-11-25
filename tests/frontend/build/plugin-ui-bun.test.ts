@@ -127,10 +127,15 @@ describe("Bun shared UI adapter", () => {
 		});
 	}
 	it("rejects extra emitted assets", async () => {
-		await writeFile(join(temporary, "asset.png"), "test");
-		await expect(
-			buildSource('import image from "./asset.png"; globalThis.image = image;'),
-		).rejects.toThrow("one IIFE");
+		// Earlier builds must not cache a module directory before this asset exists.
+		const directory = await mkdtemp(join(temporary, "extra-assets-"));
+		const entrypoint = join(directory, "input.tsx");
+		await Promise.all([
+			writeFile(join(directory, "asset.png"), "test"),
+			writeFile(entrypoint, 'import image from "./asset.png"; globalThis.image = image;'),
+		]);
+		expect(await readFile(join(directory, "asset.png"), "utf8")).toBe("test");
+		await expect(buildPluginUi(entrypoint)).rejects.toThrow("one IIFE");
 	});
 	it("works as a reusable BunPlugin with re-exports and namespace imports", async () => {
 		await writeFile(join(temporary, "reexport.ts"), 'export { useState } from "react";');

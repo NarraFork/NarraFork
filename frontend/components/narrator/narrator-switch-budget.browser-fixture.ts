@@ -16,6 +16,7 @@ import {
 	switchBudgetMessageCount,
 } from "../../../server/services/__tests__/narrator-switch-budget-seed.fixture";
 import { backgroundOccupancyStore } from "../../../server/services/background-occupancy-store";
+import { ensureCommunicationNodeTx } from "../../../server/services/narrator-communication/store";
 import { type WSData, wsHandlers } from "../../../server/websocket/ws-handler";
 import { testEnvironment } from "../../../tests/preload";
 import { cleanDb } from "../../../tests/setup";
@@ -125,6 +126,7 @@ export async function createSwitchBudgetFixture() {
 				handle: `budget-${suffix}-${index}`,
 				handleFold: `budget-${suffix}-${index}`,
 				traits: ["named"],
+				// An idle primary without a registered run executes as its persisted owner.
 				ownerUserId: userId,
 				visibility: "private",
 				writeAudience: "owner",
@@ -138,6 +140,8 @@ export async function createSwitchBudgetFixture() {
 				updatedAt: now,
 			} satisfies typeof schema.narrators.$inferInsert)
 			.run();
+		// Direct fixture inserts bypass narrator creation; materialize its normal root node.
+		ensureCommunicationNodeTx(db, id, null);
 		db.insert(schema.userRecentTabs)
 			.values({
 				id: `tab-${id}`,

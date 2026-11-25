@@ -7,6 +7,7 @@ import {
 	MAX_STAGED_ATTACHMENTS_TOTAL_BYTES,
 	MAX_TEXT_FILE_SIZE,
 } from "@shared/text-file-types";
+import { digestAttachment } from "./attachment-digest";
 import { AppError, ValidationError } from "./errors";
 import { generateShortId } from "./id";
 import { logger } from "./logger";
@@ -81,6 +82,8 @@ export interface StagedAttachment {
 	size: number;
 	path: string;
 	createdAtMs: number;
+	/** Frozen raw SHA-256, computed off the main thread before upload acceptance. */
+	contentDigest?: string;
 }
 
 const stagedByFile = new WeakMap<File, StagedAttachment>();
@@ -234,11 +237,26 @@ export async function stageAttachment(
 		if (size === 0) throw new ValidationError("Attachment is empty");
 		await handle.close();
 		handle = undefined;
-		await writeFile(sidecar, JSON.stringify({ filename, mediaType, size }), { mode: 0o600 });
+		const contentDigest = await digestAttachment(path, {
+			signal: controller.signal,
+			maxBytes: maxStagedAttachmentBytes(),
+		});
+		await writeFile(sidecar, JSON.stringify({ filename, mediaType, size, contentDigest }), {
+			mode: 0o600,
+		});
 		controller.signal.throwIfAborted();
 		completed = true;
 		logger.info("Attachment staged", { narratorId, uploadId, size, filename });
-		return { narratorId, uploadId, filename, mediaType, size, path, createdAtMs: Date.now() };
+		return {
+			narratorId,
+			uploadId,
+			filename,
+			mediaType,
+			size,
+			path,
+			createdAtMs: Date.now(),
+			contentDigest,
+		};
 	} finally {
 		clearTimeout(timer);
 		options.signal?.removeEventListener("abort", onAbort);
@@ -299,16 +317,25 @@ export function findStagedAttachment(
 		if (!info.isFile() || info.size === 0) return null;
 		let filename = basename(path);
 		let mediaType = "application/octet-stream";
+		let contentDigest: string | undefined;
 		try {
 			const meta = statSync(sidecar);
 			if (meta.isFile() && meta.size <= MAX_SIDECAR_BYTES) {
 				const parsed = JSON.parse(readFileSync(sidecar, "utf8")) as {
 					filename?: unknown;
 					mediaType?: unknown;
+					contentDigest?: unknown;
+					size?: unknown;
 				};
 				if (typeof parsed.filename === "string")
 					filename = sanitizeAttachmentFilename(parsed.filename);
 				if (typeof parsed.mediaType === "string") mediaType = sanitizeMediaType(parsed.mediaType);
+				if (
+					typeof parsed.contentDigest === "string" &&
+					/^[a-f0-9]{64}$/u.test(parsed.contentDigest) &&
+					parsed.size === info.size
+				)
+					contentDigest = parsed.contentDigest;
 			}
 		} catch {
 			// Missing metadata falls back to the opaque filename.
@@ -321,6 +348,7 @@ export function findStagedAttachment(
 			size: info.size,
 			path,
 			createdAtMs: info.mtimeMs,
+			contentDigest,
 		};
 	} catch {
 		return null;

@@ -392,6 +392,10 @@ const SQLITE_ONLY_MODULES: ReadonlyMap<string, string> = new Map([
 	["server/db/migrate.ts", "the `bun run db:migrate` entry point: opens the file and applies SQL"],
 	["server/db/ensure-columns.ts", "patches columns on SQLite databases from older versions"],
 	[
+		"server/db/alias-selector-backfill.ts",
+		"fills narrators.title_slug and alias_selector with sync bun:sqlite prepares during SQLite startup and snapshot import",
+	],
+	[
 		"server/db/data-backfills.ts",
 		"repairs rows in SQLite databases written by older builds (status model, traits, handle fold, draft privacy); wired only into the SQLite lifecycle's backfill hook",
 	],
@@ -454,6 +458,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/db/backend/sqlite-lifecycle.ts": ["driver", "connectionModule", "sqliteCli"],
 	"server/db/backend/sqlite-maintenance.ts": ["driver", "pragma", "errorCode", "vacuum"],
 	"server/db/connection.ts": ["driver", "pragma"],
+	"server/db/alias-selector-backfill.ts": ["driver"],
 	"server/db/data-backfills.ts": ["driver", "sqliteCatalog", "json1"],
 	"server/db/ensure-columns.ts": ["driver", "drizzleDialect", "pragma", "sqliteCatalog"],
 	"server/db/fts.ts": ["driver", "pragma", "sqliteCatalog", "rowid", "fts5", "insertOr"],
@@ -485,9 +490,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"blobFn",
 	],
 	"server/db/schema.ts": ["drizzleDialect", "json1"],
-	// Recall's FTS5/rowid statements moved to `services/search/sqlite-store.ts`; what remains is
-	// the raw-handle access path for its non-search reads.
-	"server/lib/agent/tools/recall.ts": ["handle"],
+	// Recall dispatches through the search/read ports; dialect-specific access stays there.
 	"server/lib/db-worker/recall-conversation-query.ts": ["driver"],
 	"server/lib/db-resilience.ts": ["driver", "sqliteCli", "pragma", "sqliteCatalog", "errorCode"],
 	// Finite diagnostic categories still depend on the engine's error identity, never driver text.
@@ -506,7 +509,12 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/lib/db-worker/select-digest-batch.ts": ["driver"],
 	"server/lib/db-worker/select-extended.ts": ["driver"],
 	"server/services/search/sqlite-worker-runner.ts": ["connectionModule"],
+	// These dual-backend readers dispatch the SQLite branch through the bounded Worker only.
+	"server/services/narrator-communication/reader.ts": ["connectionModule", "json1"],
+	"server/services/search/communication-candidates.ts": ["connectionModule", "rowid", "fts5"],
+	"server/services/agent-runtime/mailbox.ts": ["json1"],
 	"server/lib/db-worker/recall-tool-call-query.ts": ["driver"],
+	"server/lib/db-worker/recall-tool-page.ts": ["driver"],
 	"server/lib/runtime-source.ts": ["json1"],
 	"server/routes/storage.ts": ["vacuum"],
 	// 固定表清单的导入/导出走的是 SQLite 专属路径：快照由 snapshot-builder-worker 子进程生成
@@ -726,7 +734,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/token-recalculation-sqlite.ts": ["driver"],
 	"server/lib/db-worker/knowledge-entry-query.ts": ["driver"],
 	"server/lib/db-worker/knowledge-entry-reader.ts": ["driver"],
-	"server/lib/db-worker/recall-reader.ts": ["driver"],
+	"server/lib/db-worker/recall-reader.ts": ["driver", "json1"],
 	"server/services/knowledge/sqlite-read-store.ts": ["handle", "json1"],
 	"server/services/search/recall-store.ts": ["handle"],
 	"server/services/token-recalculation-worker.ts": ["connectionModule", "pragma"],

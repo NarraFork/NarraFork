@@ -3,6 +3,8 @@ import { existsSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { type ComposerDocument, composerDocumentText } from "@shared/composer-document";
+import type { CommunicationCandidates } from "@shared/narrator-communication";
+import { foldHandle } from "@shared/narrator-handle";
 import puppeteer, { type Browser, type Page } from "puppeteer-core";
 import { heightTransitionStepLimit } from "./height-transition-sampling.test-support";
 import type * as Fixture from "./NarratorComposer.browser-fixture";
@@ -15,7 +17,16 @@ let browser: Browser | undefined;
 let server: ReturnType<typeof Bun.serve> | undefined;
 const errors = new WeakMap<Page, string[]>();
 const narratorReads = new WeakMap<Page, string[]>();
-let namedCandidateRows: { id: string; handle: string; title?: string }[] = [];
+type MentionFixtureSeed = Parameters<typeof Fixture.mentionCandidates>[0];
+let mentionCandidateRows: MentionFixtureSeed = [];
+let heldMentionSearch: ReturnType<typeof Promise.withResolvers<void>> | undefined;
+let heldMentionExact: ReturnType<typeof Promise.withResolvers<void>> | undefined;
+function releaseMentionSearch() {
+	heldMentionSearch?.resolve();
+	heldMentionSearch = undefined;
+	heldMentionExact?.resolve();
+	heldMentionExact = undefined;
+}
 function trackNarratorReads(page: Page) {
 	const paths: string[] = [];
 	narratorReads.set(page, paths);
@@ -91,24 +102,53 @@ beforeAll(async () => {
 		async fetch(request) {
 			const url = new URL(request.url);
 			const path = url.pathname;
-			if (path === "/__fixture/named-suggestions" && request.method === "POST") {
-				namedCandidateRows = await request.json();
+			if (path === "/__fixture/mention-candidates" && request.method === "POST") {
+				const seed = (await request.json()) as {
+					candidates: MentionFixtureSeed;
+					holdRemote: boolean;
+					holdExact: boolean;
+				};
+				releaseMentionSearch();
+				mentionCandidateRows = seed.candidates;
+				if (seed.holdRemote) heldMentionSearch = Promise.withResolvers<void>();
+				if (seed.holdExact) heldMentionExact = Promise.withResolvers<void>();
 				return Response.json({ ok: true });
 			}
-			if (path === "/api/narrators/named" && url.searchParams.get("view") === "suggestions") {
+			if (path.endsWith("/communication/candidates")) {
 				const q = url.searchParams.get("q") ?? "";
+				const targetId = url.searchParams.get("targetId");
+				const rows = mentionCandidateRows;
+				await (targetId ? heldMentionExact : heldMentionSearch)?.promise;
+				if (targetId && rows.some((row) => row.id === targetId && row.verificationFails))
+					return Response.json({ error: "Temporarily unavailable" }, { status: 503 });
+				const items = rows
+					.filter(
+						(row) =>
+							!row.readOnly &&
+							(targetId
+								? row.id === targetId
+								: !row.outsideSearchPage &&
+									foldHandle(`${row.handle ?? ""} ${row.title ?? ""} ${row.id}`).includes(q)),
+					)
+					.map((row) => ({
+						id: row.id,
+						handle: row.handle,
+						title: row.title ?? null,
+						status: "idle",
+						isRecent: row.isRecent !== false,
+						lastActivityAt: null,
+						canConnect: true,
+					}));
 				return Response.json({
-					items: namedCandidateRows
-						.filter((row) => row.handle.includes(q))
-						.map((row) => ({ ...row, title: row.title ?? null, status: "idle" })),
-					nextCursor: null,
-				});
+					items,
+					hasMore: !targetId && rows.some((row) => row.outsideSearchPage),
+				} satisfies CommunicationCandidates);
 			}
+			const user = request.headers.get("authorization")?.replace(/^Bearer fixture-auth:/, "");
+			if (path === "/api/auth/me" && user) return Response.json({ id: user });
 			const persistent = path.match(/^\/api\/narrators\/(persist-[^/]+)\/(draft|panel-state)$/);
 			if (persistent) {
-				const user =
-					request.headers.get("authorization")?.replace(/^Bearer /, "") ?? "fixture-user";
-				const key = `${user}:${persistent[1]}`;
+				const key = `${user ?? "fixture-user"}:${persistent[1]}`;
 				const row = persistentDrafts.get(key) ?? emptyDraft;
 				if (persistent[2] === "panel-state")
 					return Response.json({
@@ -208,6 +248,7 @@ afterAll(async () => {
 	try {
 		await browser?.close();
 	} finally {
+		releaseMentionSearch();
 		server?.stop(true);
 	}
 });
@@ -277,7 +318,8 @@ async function waitForCaretMove(page: Page, previousHead: number) {
 }
 async function open(viewport?: { width: number; height: number }) {
 	if (!browser || !server) throw new Error("Fixture unavailable");
-	namedCandidateRows = [];
+	releaseMentionSearch();
+	mentionCandidateRows = [];
 	const page = await browser.newPage();
 	page.setDefaultTimeout(5000);
 	await page.setViewport(viewport ?? { width: 1000, height: 700 });
@@ -461,6 +503,15 @@ async function loadDocument(page: Page, document: ComposerDocument) {
 	await page.evaluate((doc) => (window as unknown as FixtureWindow).fixture.load(doc), document);
 	await settle(page);
 }
+function waitForExactMention(page: Page, targetId: string) {
+	return page.waitForRequest((request) => {
+		const url = new URL(request.url());
+		return (
+			url.pathname.endsWith("/communication/candidates") &&
+			url.searchParams.get("targetId") === targetId
+		);
+	});
+}
 for (const key of ["Tab", "Enter"] as const) {
 	test(`file completion ${key} is handled before the composer send shortcut`, async () => {
 		const page = await open();
@@ -497,6 +548,311 @@ test("file completion Escape closes the menu without clearing the draft", async 
 		await close(page);
 	}
 });
+test("typed completion creates one stable narrator atom; IME and empty list never leak Enter into send", async () => {
+	const page = await open();
+	try {
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.mentionCandidates(
+				[{ id: "stable-no-handle", title: "Target session" }],
+				true,
+			),
+		);
+		const requested = page.waitForRequest((request) => {
+			const url = new URL(request.url());
+			return (
+				url.pathname === "/api/narrators/fixture-narrator/communication/candidates" &&
+				url.searchParams.get("q") === "tar"
+			);
+		});
+		await loadDocument(page, textDocument("@Tar"));
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.nativeSelection(5));
+		await requested;
+		// The option must come from loaded recents: HTTP is deliberately still pending.
+		await page.waitForSelector('[role="listbox"][aria-busy="true"] [role="option"]');
+		expect(narratorReads.get(page)).toEqual([
+			"/api/narrators/fixture-narrator/panel-state",
+			"/api/narrators/fixture-narrator/communication/candidates",
+		]);
+		await page.$eval('[role="textbox"]', (element) => {
+			element.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+			element.dispatchEvent(
+				new KeyboardEvent("keydown", {
+					key: "Enter",
+					bubbles: true,
+					isComposing: true,
+					keyCode: 229,
+				}),
+			);
+			element.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true }));
+		});
+		await settle(page);
+		expect((await snapshot(page)).document?.paragraphs[0].children).toEqual([
+			{ type: "text", text: "@Tar" },
+		]);
+		expect((await snapshot(page)).sends).toBe(0);
+		await focusedComposer(page);
+		await page.waitForSelector('[role="option"]');
+		await settle(page);
+		const exact = waitForExactMention(page, "stable-no-handle");
+		await page.keyboard.press("Enter");
+		await exact;
+		await page.waitForFunction(() =>
+			(window as unknown as FixtureWindow).fixture
+				.snapshot()
+				.document?.paragraphs[0].children.some((node) => node.type === "narratorReference"),
+		);
+		const state = await snapshot(page);
+		expect(state.sends).toBe(0);
+		expect(state.document?.paragraphs[0].children).toContainEqual(
+			expect.objectContaining({
+				type: "narratorReference",
+				narratorId: "stable-no-handle",
+				label: "Target session",
+			}),
+		);
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.mentionCandidates([]));
+		await loadDocument(page, textDocument("@zzzz-no-match"));
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.nativeSelection(15));
+		await page.waitForSelector('[role="listbox"][aria-busy="false"]');
+		await page.keyboard.press("Enter");
+		await settle(page);
+		expect((await snapshot(page)).sends).toBe(0);
+		expect((await snapshot(page)).text).toBe("@zzzz-no-match");
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
+test.each([
+	["readOnly", "This session cannot be connected"],
+	["verificationFails", "Could not check connection permissions"],
+] as const)(
+	"a loaded %s candidate never turns the draft into a typed reference",
+	async (condition, error) => {
+		const page = await open();
+		try {
+			await page.evaluate(
+				(flag) =>
+					(window as unknown as FixtureWindow).fixture.mentionCandidates([
+						{ id: "target", title: "Target session", outsideSearchPage: true, [flag]: true },
+					]),
+				condition,
+			);
+			await loadDocument(page, textDocument("@Tar"));
+			await page.evaluate(() => (window as unknown as FixtureWindow).fixture.nativeSelection(5));
+			await page.waitForSelector('[role="listbox"][aria-busy="false"] [data-mention-item]');
+			expect(await page.$eval("[data-mention-item]", (node) => node.textContent)).toContain(
+				"Not yet verified",
+			);
+			const exact = waitForExactMention(page, "target");
+			await page.keyboard.press("Enter");
+			await exact;
+			await page.waitForFunction(
+				(message) => document.querySelector('[role="alert"]')?.textContent?.includes(message),
+				{},
+				error,
+			);
+			expect((await snapshot(page)).document?.paragraphs[0].children).toEqual([
+				{ type: "text", text: "@Tar" },
+			]);
+			expect(await page.evaluate(() => window.getSelection()?.anchorOffset)).toBe(4);
+			await page.keyboard.press("Escape");
+			await page.waitForSelector('[role="listbox"]', { hidden: true });
+			await page.keyboard.press("Enter");
+			expect((await snapshot(page)).sends).toBe(1);
+		} finally {
+			await close(page);
+		}
+	},
+	15_000,
+);
+
+test("an eligible loaded recent omitted from ranked search is still selectable", async () => {
+	const page = await open();
+	try {
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.mentionCandidates([
+				{ id: "below-top-fifty", title: "Target after the cutoff", outsideSearchPage: true },
+			]),
+		);
+		await loadDocument(page, textDocument("@Tar"));
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.nativeSelection(5));
+		await page.waitForSelector('[role="listbox"][aria-busy="false"] [data-mention-item]');
+		const exact = waitForExactMention(page, "below-top-fifty");
+		await page.click("[data-mention-item]");
+		await exact;
+		await page.waitForSelector('[role="listbox"]', { hidden: true });
+		expect((await snapshot(page)).document?.paragraphs[0].children).toContainEqual(
+			expect.objectContaining({ type: "narratorReference", narratorId: "below-top-fifty" }),
+		);
+		expect((await snapshot(page)).sends).toBe(0);
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
+test.each([
+	"blur",
+	"edit",
+	"caret",
+	"Escape",
+] as const)("pending exact mention verification cannot insert after %s", async (cancelBy) => {
+	const page = await open();
+	try {
+		const candidate = { id: "slow", title: "Target session", outsideSearchPage: true };
+		await page.evaluate(
+			(row) => (window as unknown as FixtureWindow).fixture.mentionCandidates([row], false, true),
+			candidate,
+		);
+		await loadDocument(page, textDocument("@Tar suffix"));
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.nativeSelection(5));
+		await page.waitForSelector('[role="listbox"][aria-busy="false"] [data-mention-item]');
+		const exact = waitForExactMention(page, "slow");
+		let exactCalls = 0;
+		page.on("request", (request) => {
+			if (new URL(request.url()).searchParams.get("targetId") === "slow") exactCalls++;
+		});
+		await page.keyboard.press("Enter");
+		await exact;
+		await page.waitForSelector('[role="listbox"][aria-busy="true"]');
+		await page.keyboard.press("Enter");
+		expect((await snapshot(page)).sends).toBe(0);
+		expect(exactCalls).toBe(1);
+		if (cancelBy === "blur") await page.click("#quote-source");
+		else if (cancelBy === "edit") await page.keyboard.type("x");
+		else await page.keyboard.press(cancelBy === "caret" ? "End" : "Escape");
+		if (cancelBy === "edit") {
+			await page.waitForFunction(() =>
+				(window as unknown as FixtureWindow).fixture.snapshot().text?.includes("@Tarx"),
+			);
+		} else await page.waitForSelector('[role="listbox"]', { hidden: true });
+		await page.evaluate(
+			(row) => (window as unknown as FixtureWindow).fixture.mentionCandidates([row]),
+			candidate,
+		);
+		await settle(page);
+		const result = await snapshot(page);
+		expect(result.document?.paragraphs[0].children).toEqual([
+			{ type: "text", text: cancelBy === "edit" ? "@Tarx suffix" : "@Tar suffix" },
+		]);
+		expect(result.sends).toBe(0);
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
+test("loading Enter is owned and candidate enrichment preserves the keyboard-selected narrator ID", async () => {
+	const page = await open();
+	try {
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.mentionCandidates([], true),
+		);
+		await loadDocument(page, textDocument("@pending"));
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.nativeSelection(9));
+		await page.waitForSelector('[role="listbox"][aria-busy="true"]').catch(async (error) => {
+			throw new Error(
+				JSON.stringify(
+					await page.evaluate(() => ({
+						list: document.querySelector('[role="listbox"]')?.outerHTML,
+						input: document.querySelector('[role="textbox"]')?.outerHTML,
+						focus: document.activeElement?.getAttribute("role"),
+					})),
+				),
+				{ cause: error },
+			);
+		});
+		await focusedComposer(page);
+		await page.keyboard.press("Enter");
+		await settle(page);
+		expect((await snapshot(page)).sends).toBe(0);
+		expect((await snapshot(page)).text).toBe("@pending");
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.mentionCandidates([
+				{ id: "a", title: "Alpha" },
+				{ id: "b", title: "Beta" },
+			]),
+		);
+		await loadDocument(page, textDocument("@"));
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.nativeSelection(2));
+		await page.waitForSelector('[role="option"]');
+		await focusedComposer(page);
+		await page.keyboard.press("ArrowDown");
+		await settle(page);
+		expect(
+			await page.$eval('[role="option"][aria-selected="true"]', (element) => element.textContent),
+		).toContain("Beta");
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.mentionCandidates([
+				{ id: "new", title: "Newest" },
+				{ id: "a", title: "Alpha" },
+				{ id: "b", title: "Beta" },
+			]),
+		);
+		await settle(page);
+		expect(
+			await page.$eval('[role="option"][aria-selected="true"]', (element) => element.textContent),
+		).toContain("Beta");
+		await page.keyboard.press("Enter");
+		await settle(page);
+		expect((await snapshot(page)).document?.paragraphs[0].children).toContainEqual(
+			expect.objectContaining({ type: "narratorReference", narratorId: "b" }),
+		);
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
+test("RecentTabs-style pointer release is consumed by composer once, tool/self cannot turn into references", async () => {
+	const page = await open();
+	try {
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.mentionCandidates([
+				{ id: "target-stable", title: "Server label", isRecent: false },
+			]),
+		);
+		await loadDocument(page, textDocument("before after"));
+		const exact = waitForExactMention(page, "target-stable");
+		const fallback = await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.panelReferenceDrop(
+				"target-stable",
+				"Unchanged label",
+			),
+		);
+		await exact;
+		await page.waitForFunction(() =>
+			(window as unknown as FixtureWindow).fixture
+				.snapshot()
+				.document?.paragraphs[0].children.some((node) => node.type === "narratorReference"),
+		);
+		expect(fallback).toBe(0);
+		let refs = (await snapshot(page)).document?.paragraphs.flatMap((paragraph) =>
+			paragraph.children.filter((node) => node.type === "narratorReference"),
+		);
+		expect(refs).toHaveLength(1);
+		expect(refs?.[0]).toMatchObject({ narratorId: "target-stable", label: "Unchanged label" });
+		expect(
+			await page.evaluate(() =>
+				(window as unknown as FixtureWindow).fixture.panelReferenceDrop("fixture-narrator", "Self"),
+			),
+		).toBe(0);
+		expect(
+			await page.evaluate(() =>
+				(window as unknown as FixtureWindow).fixture.panelReferenceDrop(
+					"tool-resource",
+					"Tool",
+					"tool",
+				),
+			),
+		).toBe(1);
+		refs = (await snapshot(page)).document?.paragraphs.flatMap((paragraph) =>
+			paragraph.children.filter((node) => node.type === "narratorReference"),
+		);
+		expect(refs).toHaveLength(1);
+	} finally {
+		await close(page);
+	}
+});
+
 test("file and mention queries stop at inline atoms instead of deleting them", async () => {
 	const page = await open();
 	const quote = {
@@ -518,8 +874,8 @@ test("file and mention queries stop at inline atoms instead of deleting them", a
 		expect(await page.$("[data-file-reference-item]")).toBeNull();
 		expect((await snapshot(page)).document?.paragraphs[0].children).toContainEqual(quote);
 		await page.evaluate(() =>
-			(window as unknown as FixtureWindow).fixture.namedCandidates([
-				{ id: "named", handle: "foo", title: "Foo" },
+			(window as unknown as FixtureWindow).fixture.mentionCandidates([
+				{ id: "named", handle: "foo", title: "Foo", isRecent: false },
 			]),
 		);
 		await loadDocument(page, {
@@ -557,7 +913,7 @@ test("file and mention queries stop at inline atoms instead of deleting them", a
 		await settle(page);
 		const state = await snapshot(page);
 		expect(state.document?.paragraphs[0].children).toContainEqual(quote);
-		expect(state.text).toContain("@foo ");
+		expect(state.text).toContain("[@Foo](nf-agent://open?id=named) ");
 	} finally {
 		await close(page);
 	}
@@ -1423,7 +1779,7 @@ for (const target of ["search", "monaco"] as const) {
 		const page = await open();
 		try {
 			await page.evaluate(() =>
-				(window as unknown as FixtureWindow).fixture.namedCandidates([
+				(window as unknown as FixtureWindow).fixture.mentionCandidates([
 					{ id: "named", handle: "foo" },
 				]),
 			);
@@ -1460,7 +1816,7 @@ for (const target of ["search", "monaco"] as const) {
 			await page.waitForSelector("[data-mention-item]", { visible: true });
 			await page.keyboard.press("Tab");
 			await settle(page);
-			expect((await snapshot(page)).text).toBe("@foo ");
+			expect((await snapshot(page)).text).toBe("[@foo](nf-agent://open?id=named) ");
 		} finally {
 			await close(page);
 		}

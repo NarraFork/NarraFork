@@ -130,7 +130,9 @@ afterAll(() => {
 });
 
 function seedNarrator(id: string): void {
-	db.insert(narrators).values({ id, title: id, createdAt: NOW, updatedAt: NOW }).run();
+	db.insert(narrators)
+		.values({ id, title: id, ownerUserId: "workspace-user", createdAt: NOW, updatedAt: NOW })
+		.run();
 }
 
 function readRevision(): number | undefined {

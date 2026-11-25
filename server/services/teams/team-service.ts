@@ -310,6 +310,7 @@ export async function createTeam(
 			},
 		},
 	);
+	eventBus.emit({ type: "team:communication_changed", teamId: narrator.id });
 	logger.info("Team created", { teamId: narrator.id, projectId: project.id });
 	return getTeam(narrator.id, principal);
 }
@@ -384,6 +385,7 @@ export async function updateTeam(
 				now,
 			);
 	});
+	eventBus.emit({ type: "team:communication_changed", teamId });
 	return getTeam(teamId, principal, projectId);
 }
 
@@ -440,6 +442,7 @@ function syncTeamStatus(teamId: string, archived: boolean, actor: TeamStatusActo
 			now,
 		);
 	});
+	eventBus.emit({ type: "team:communication_changed", teamId });
 	return true;
 }
 

@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "01749f25-9267-4849-81d6-697f245d7b06",
+  "id": "b7d911d3-3a29-40c6-9ffa-6a234b71a8f7",
   "prevId": "8df2e944-dc76-4ebd-a0d1-3da5b55cbffe",
   "tables": {
     "acl_events": {
@@ -987,6 +987,25 @@
             "id"
           ],
           "isUnique": false
+        },
+        "idx_bg_tasks_parent_alias": {
+          "name": "idx_bg_tasks_parent_alias",
+          "columns": [
+            "parent_narrator_id",
+            "alias",
+            "created_at"
+          ],
+          "isUnique": false,
+          "where": "\"alias\" IS NOT NULL"
+        },
+        "idx_bg_tasks_parent_live_alias": {
+          "name": "idx_bg_tasks_parent_live_alias",
+          "columns": [
+            "parent_narrator_id",
+            "alias"
+          ],
+          "isUnique": false,
+          "where": "\"alias\" IS NOT NULL AND \"status\" IN ('running', 'paused')"
         }
       },
       "foreignKeys": {
@@ -12266,6 +12285,20 @@
           "notNull": false,
           "autoincrement": false
         },
+        "title_slug": {
+          "name": "title_slug",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "alias_selector": {
+          "name": "alias_selector",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
         "inherit_mode": {
           "name": "inherit_mode",
           "type": "text",
@@ -12991,6 +13024,34 @@
           ],
           "isUnique": false,
           "where": "\"is_background\" = 1"
+        },
+        "idx_narrators_parent_title_slug": {
+          "name": "idx_narrators_parent_title_slug",
+          "columns": [
+            "parent_narrator_id",
+            "title_slug"
+          ],
+          "isUnique": false,
+          "where": "\"parent_narrator_id\" IS NOT NULL AND \"title_slug\" IS NOT NULL"
+        },
+        "idx_narrators_parent_alias_selector": {
+          "name": "idx_narrators_parent_alias_selector",
+          "columns": [
+            "parent_narrator_id",
+            "alias_selector"
+          ],
+          "isUnique": false,
+          "where": "\"parent_narrator_id\" IS NOT NULL AND \"alias_selector\" IS NOT NULL"
+        },
+        "idx_narrators_addressable_parent_created": {
+          "name": "idx_narrators_addressable_parent_created",
+          "columns": [
+            "parent_narrator_id",
+            "created_at",
+            "id"
+          ],
+          "isUnique": false,
+          "where": "\"parent_narrator_id\" IS NOT NULL AND \"status\" IN ('idle', 'working', 'waiting')"
         }
       },
       "foreignKeys": {
@@ -20120,113 +20181,6 @@
         "ck_team_work_events_detail_bytes": {
           "name": "ck_team_work_events_detail_bytes",
           "value": "\"team_work_events\".\"detail_json\" is null or length(cast(\"team_work_events\".\"detail_json\" as blob)) <= 8192"
-        }
-      }
-    },
-    "team_work_item_dependencies": {
-      "name": "team_work_item_dependencies",
-      "columns": {
-        "item_id": {
-          "name": "item_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "depends_on_item_id": {
-          "name": "depends_on_item_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "team_id": {
-          "name": "team_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "created_at": {
-          "name": "created_at",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        }
-      },
-      "indexes": {
-        "idx_team_work_item_dependencies_target": {
-          "name": "idx_team_work_item_dependencies_target",
-          "columns": [
-            "depends_on_item_id",
-            "item_id"
-          ],
-          "isUnique": false
-        },
-        "idx_team_work_item_dependencies_team": {
-          "name": "idx_team_work_item_dependencies_team",
-          "columns": [
-            "team_id"
-          ],
-          "isUnique": false
-        }
-      },
-      "foreignKeys": {
-        "team_work_item_dependencies_item_id_team_work_items_id_fk": {
-          "name": "team_work_item_dependencies_item_id_team_work_items_id_fk",
-          "tableFrom": "team_work_item_dependencies",
-          "tableTo": "team_work_items",
-          "columnsFrom": [
-            "item_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
-        },
-        "team_work_item_dependencies_depends_on_item_id_team_work_items_id_fk": {
-          "name": "team_work_item_dependencies_depends_on_item_id_team_work_items_id_fk",
-          "tableFrom": "team_work_item_dependencies",
-          "tableTo": "team_work_items",
-          "columnsFrom": [
-            "depends_on_item_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
-        },
-        "team_work_item_dependencies_team_id_project_teams_narrator_id_fk": {
-          "name": "team_work_item_dependencies_team_id_project_teams_narrator_id_fk",
-          "tableFrom": "team_work_item_dependencies",
-          "tableTo": "project_teams",
-          "columnsFrom": [
-            "team_id"
-          ],
-          "columnsTo": [
-            "narrator_id"
-          ],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
-        }
-      },
-      "compositePrimaryKeys": {
-        "team_work_item_dependencies_item_id_depends_on_item_id_pk": {
-          "columns": [
-            "item_id",
-            "depends_on_item_id"
-          ],
-          "name": "team_work_item_dependencies_item_id_depends_on_item_id_pk"
-        }
-      },
-      "uniqueConstraints": {},
-      "checkConstraints": {
-        "ck_team_work_item_dependencies_self": {
-          "name": "ck_team_work_item_dependencies_self",
-          "value": "\"team_work_item_dependencies\".\"item_id\" <> \"team_work_item_dependencies\".\"depends_on_item_id\""
         }
       }
     },

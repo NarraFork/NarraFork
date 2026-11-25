@@ -1,8 +1,9 @@
 import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { type QueryClient, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useSyncExternalStore } from "react";
+import { runtimeSettingsQueryKey } from "../../../hooks/useRuntimeSettings";
 import { api } from "../../../lib/api";
-import { ApiError, getToken, onTokenChange } from "../../../lib/api/client";
+import { ApiError, getAuthSnapshot, subscribeAuth } from "../../../lib/api/client";
 
 /** Only the current provider's bounded runtime projection is needed. */
 export interface NugProviderSetting {
@@ -24,8 +25,8 @@ export interface NugProviderInfo {
 export const nugQuotaKey = (
 	providerId: string | undefined,
 	generation: number | string | undefined,
-	token: string | null,
-) => ["nug", "quota", providerId, generation, token] as const;
+	authGeneration: number,
+) => ["nug", "quota", providerId, generation, authGeneration] as const;
 
 type QuotaRefresh = { started: boolean; dirty: boolean; promise: Promise<void> };
 const quotaRefreshes = new WeakMap<QueryClient, Map<string, QuotaRefresh>>();
@@ -36,12 +37,16 @@ export function invalidateNugQuotaForIdentity(
 	identity: {
 		providerId: string;
 		generation: number | string | undefined;
-		token: string | null;
+		authGeneration: number;
 	},
 ): Promise<void> {
-	if (!identity.providerId || identity.generation === undefined || getToken() !== identity.token)
+	if (
+		!identity.providerId ||
+		identity.generation === undefined ||
+		getAuthSnapshot().generation !== identity.authGeneration
+	)
 		return Promise.resolve();
-	const queryKey = nugQuotaKey(identity.providerId, identity.generation, identity.token);
+	const queryKey = nugQuotaKey(identity.providerId, identity.generation, identity.authGeneration);
 	const key = JSON.stringify(queryKey);
 	let refreshes = quotaRefreshes.get(qc);
 	if (!refreshes) {
@@ -70,7 +75,7 @@ export function invalidateNugQuotaForIdentity(
 			let externalRead = qc.isFetching({ queryKey, exact: true }) > 0;
 			do {
 				entry.dirty = false;
-				if (getToken() !== identity.token) return;
+				if (getAuthSnapshot().generation !== identity.authGeneration) return;
 				await qc.invalidateQueries({ queryKey, exact: true }, { cancelRefetch: false });
 				// A marker received during the hook's initial read must not be cleared
 				// by that older promise; wait for it, then do exactly one fresh tail read.
@@ -78,7 +83,7 @@ export function invalidateNugQuotaForIdentity(
 					externalRead = false;
 					entry.dirty = true;
 				}
-			} while (entry.dirty && getToken() === identity.token);
+			} while (entry.dirty && getAuthSnapshot().generation === identity.authGeneration);
 		})().then(
 			() => {
 				refreshes.delete(key);
@@ -99,7 +104,11 @@ export function useNugQuota(
 	nugProviders: NugProviderSetting[] | undefined,
 	enabled = true,
 ): NugProviderInfo | null {
-	const token = useSyncExternalStore(onTokenChange, getToken, getToken);
+	const { generation: authGeneration, hasToken } = useSyncExternalStore(
+		subscribeAuth,
+		getAuthSnapshot,
+		getAuthSnapshot,
+	);
 	const qc = useQueryClient();
 	const provider = useMemo(() => {
 		const prefix = resolvedModel?.split(":")[0];
@@ -108,15 +117,17 @@ export function useNugQuota(
 			: undefined;
 	}, [resolvedModel, nugProviders]);
 	const { data: quota } = useQuery({
-		queryKey: nugQuotaKey(provider?.id, provider?.generation, token),
+		queryKey: nugQuotaKey(provider?.id, provider?.generation, authGeneration),
 		queryFn: async ({ signal }) => {
-			if (getToken() !== token) throw new DOMException("Session changed", "AbortError");
+			if (getAuthSnapshot().generation !== authGeneration)
+				throw new DOMException("Session changed", "AbortError");
 			try {
 				const result = await api.nugGetCachedQuota(provider?.id ?? "", {
 					signal: AbortSignal.any([signal, AbortSignal.timeout(15_000)]),
 					expectedGeneration: provider?.generation,
 				});
-				if (getToken() !== token) throw new DOMException("Session changed", "AbortError");
+				if (getAuthSnapshot().generation !== authGeneration)
+					throw new DOMException("Session changed", "AbortError");
 				if (String(result.generation) !== String(provider?.generation))
 					throw new ApiError("Model runtime generation changed", 409, {
 						code: "MODEL_RUNTIME_STALE",
@@ -124,19 +135,22 @@ export function useNugQuota(
 				return result.quota;
 			} catch (error) {
 				if (
-					getToken() === token &&
+					getAuthSnapshot().generation === authGeneration &&
 					error instanceof ApiError &&
 					error.status === 409 &&
 					error.data?.code === "MODEL_RUNTIME_STALE"
 				) {
-					void qc.invalidateQueries({ queryKey: ["settings-runtime"] });
-					void qc.invalidateQueries({ queryKey: ["model-catalog", "runtime"] });
+					void qc.invalidateQueries({
+						queryKey: runtimeSettingsQueryKey(authGeneration),
+						exact: true,
+					});
+					void qc.invalidateQueries({ queryKey: ["model-catalog", "runtime", authGeneration] });
 				}
 				throw error;
 			}
 		},
 		enabled:
-			!REMOTE_BUILD && enabled && !!token && !!provider?.id && provider.generation !== undefined,
+			!REMOTE_BUILD && enabled && hasToken && !!provider?.id && provider.generation !== undefined,
 		retry: false,
 		staleTime: 30_000,
 		gcTime: 60_000,

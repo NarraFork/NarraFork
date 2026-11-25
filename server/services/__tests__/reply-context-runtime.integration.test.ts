@@ -292,6 +292,14 @@ test("adopts queued human pairs only on consumption; Send, answers, completion a
 	await idle(2);
 
 	// The real Send agent lane has sender provenance, not a human language adoption.
+	const { ensureCommunicationNodeTx, seedFixtureCommunicationPeer } = await import(
+		"./runtime-communication-fixtures"
+	);
+	db.transaction((tx) => {
+		ensureCommunicationNodeTx(tx, sender, null);
+		ensureCommunicationNodeTx(tx, recipient, null);
+		seedFixtureCommunicationPeer(tx, sender, recipient, "user-a");
+	});
 	seedTool(sender, "send-source", "Send");
 	const text = "中文发送者的消息，不应替换收件会话语言";
 	const delivery = createAgentMessageDelivery(
