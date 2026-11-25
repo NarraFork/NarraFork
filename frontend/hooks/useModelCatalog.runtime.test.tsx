@@ -1,6 +1,11 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import type { RuntimeModelSummary } from "@shared/model-runtime";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import {
+	defaultScheduler,
+	notifyManager,
+	QueryClient,
+	QueryClientProvider,
+} from "@tanstack/react-query";
 import { parseHTML } from "linkedom";
 import { act, StrictMode } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -46,6 +51,7 @@ let calls: string[];
 let signals: Array<AbortSignal | null | undefined>;
 let answer: ((value: Response) => void) | undefined;
 let delay: boolean;
+let pendingNotifications: number;
 let updateRuntimeSettings: ReturnType<typeof useUpdateRuntimeSettings>;
 let runtimeSettingsEnabled: boolean;
 let syncEnabled: boolean;
@@ -94,6 +100,19 @@ async function render() {
 	await flush();
 }
 beforeEach(() => {
+	pendingNotifications = 0;
+	// Keep observer deliveries inside act's microtask lifetime. The default timer
+	// can otherwise retain a React callback past restoration of the test's window.
+	notifyManager.setScheduler((callback) => {
+		pendingNotifications++;
+		queueMicrotask(() => {
+			try {
+				callback();
+			} finally {
+				pendingNotifications--;
+			}
+		});
+	});
 	const { window } = parseHTML("<!doctype html><html><body></body></html>");
 	const values = new Map<string, string>([["narrafork_token", "actor-one"]]);
 	model = undefined;
@@ -160,11 +179,19 @@ beforeEach(() => {
 	root = createRoot(document.createElement("div"));
 });
 afterEach(async () => {
-	await act(async () => root.unmount());
-	qc.clear();
-	for (const [key, descriptor] of originals) {
-		if (descriptor) Object.defineProperty(globalThis, key, descriptor);
-		else Reflect.deleteProperty(globalThis, key);
+	try {
+		await act(async () => {
+			root.unmount();
+			await qc.cancelQueries();
+			qc.clear();
+		});
+		expect(pendingNotifications).toBe(0);
+	} finally {
+		notifyManager.setScheduler(defaultScheduler);
+		for (const [key, descriptor] of originals) {
+			if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+			else Reflect.deleteProperty(globalThis, key);
+		}
 	}
 });
 test("a real settings marker retires the initial HTTP read and burst refreshes keep closed options idle", async () => {
