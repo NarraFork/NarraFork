@@ -31,7 +31,8 @@ import { spawnPortablePty } from "../terminal/runtime-pty";
 import { REMOTE_PTY_READY_FEATURE, spawnRemotePty } from "../terminal/runtime-remote";
 import { sendToTerminal } from "../websocket/terminal-ws";
 import { withTerminalSlot } from "./agent-resource-caps";
-import { getConnectedDeviceHello, isDeviceOnline, sendRpc } from "./device-connection-service";
+import * as deviceConnections from "./device-connection-service";
+import { getConnectedDeviceHello, isDeviceOnline } from "./device-connection-service";
 import {
 	DeviceScopeError,
 	deviceHasFeature,
@@ -241,7 +242,7 @@ async function recordExecutorCleanup(deviceId: string, sessionId: string): Promi
 async function runExecutorCleanup(deviceId: string, sessionId: string): Promise<boolean> {
 	if (!isDeviceOnline(deviceId)) return false;
 	try {
-		await sendRpc(
+		await deviceConnections.sendRpc(
 			deviceId,
 			"session.kill",
 			{ sessionId, release: true },

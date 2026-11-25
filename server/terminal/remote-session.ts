@@ -15,27 +15,29 @@
  * once it has persisted what it needs, so neither a restart nor an offline
  * device can leave a shell orphaned.
  */
-import { SESSION_DURABLE_FEATURE } from "../lib/agent/execution/rpc-types";
+import type * as RpcTypes from "../lib/agent/execution/rpc-types";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
-import {
-	DeviceConnectionChangedError,
-	DeviceOfflineError,
-	isDeviceOnline as defaultIsDeviceOnline,
-	sendRpc as defaultSendRpc,
-	type SendRpcOptions,
-} from "../services/device-connection-service";
+import type { SendRpcOptions } from "../services/device-connection-service";
+// Namespace import, read at call time: modules that partially mock the device
+// connection service still load this one.
+import * as deviceConnections from "../services/device-connection-service";
 import type { TerminalRuntime } from "./runtime";
 
-export { SESSION_DURABLE_FEATURE };
+/**
+ * Same value as `rpc-types.ts`, checked at compile time; defined here so a test
+ * that partially mocks rpc-types cannot break loading this module.
+ */
+export const SESSION_DURABLE_FEATURE: typeof RpcTypes.SESSION_DURABLE_FEATURE =
+	"session.durable.v1";
 
 const DEFAULT_MAX_QUEUED_WRITE_BYTES = 1024 * 1024;
 const DEFAULT_OPEN_TIMEOUT_MS = 15_000;
 
 type SendRpc = (
 	deviceId: string,
-	method: Parameters<typeof defaultSendRpc>[1],
+	method: Parameters<typeof deviceConnections.sendRpc>[1],
 	params: Record<string, unknown>,
 	opts?: SendRpcOptions,
 ) => Promise<unknown>;
@@ -87,9 +89,13 @@ export function terminalSessionId(terminalId: string): string {
 	return `nf-term-${terminalId}`;
 }
 
-/** A transport loss the executor survives: wait for the device and resume. */
-function isConnectionLoss(error: unknown): boolean {
-	return error instanceof DeviceOfflineError || error instanceof DeviceConnectionChangedError;
+/**
+ * A transport loss the executor survives: wait for the device and resume.
+ * Matched by name (`DeviceOfflineError`, `DeviceConnectionChangedError`).
+ */
+export function isConnectionLoss(error: unknown): boolean {
+	const name = error instanceof Error ? error.name : "";
+	return name === "DeviceOfflineError" || name === "DeviceConnectionChangedError";
 }
 
 /** Bytes at the end of `bytes` that start an unfinished UTF-8 sequence. */
@@ -109,8 +115,12 @@ export function spawnRemoteSession(
 	opts: RemoteSessionOptions,
 	deps: RemoteSessionDependencies = {},
 ): RemoteSessionRuntime {
-	const sendRpc = deps.sendRpc ?? defaultSendRpc;
-	const isDeviceOnline = deps.isDeviceOnline ?? defaultIsDeviceOnline;
+	const sendRpc: SendRpc =
+		deps.sendRpc ??
+		((deviceId, method, params, options) =>
+			deviceConnections.sendRpc(deviceId, method, params, options));
+	const isDeviceOnline =
+		deps.isDeviceOnline ?? ((deviceId: string) => deviceConnections.isDeviceOnline(deviceId));
 	const maxQueuedWriteBytes = deps.maxQueuedWriteBytes ?? DEFAULT_MAX_QUEUED_WRITE_BYTES;
 	const openTimeoutMs = deps.openTimeoutMs ?? DEFAULT_OPEN_TIMEOUT_MS;
 	const rpcOpts = { requiredFeatures: [SESSION_DURABLE_FEATURE] };
