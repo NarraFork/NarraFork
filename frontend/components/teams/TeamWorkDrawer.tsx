@@ -42,13 +42,15 @@ import {
 	IconGitMerge,
 	IconX,
 } from "@tabler/icons-react";
-import { type ReactNode, useEffect, useState } from "react";
+import { type ReactNode, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ActivityLine } from "./TeamActivity";
 import {
 	diffLineKind,
+	findingsNeedToggle,
 	itemMarks,
 	liveWorkerStatus,
+	REVIEW_FINDINGS_CLAMP_LINES,
 	returnErrorKey,
 	returnReason,
 	showsStat,
@@ -68,6 +70,52 @@ const DIFF_COLOR = {
 	meta: { background: undefined, color: "var(--mantine-color-dimmed)" },
 	context: { background: undefined, color: undefined },
 } as const;
+
+/** A review round's findings: muted, clamped to a few lines, 「展开」 for the rest. */
+export function ReviewFindings({ text, clipped }: { text: string | null; clipped: boolean }) {
+	const { t } = useTranslation("projects");
+	const [open, setOpen] = useState(false);
+	// A guess first (also what a static render shows), then what the clamped text really does.
+	const [overflows, setOverflows] = useState(() => !!text && findingsNeedToggle(text));
+	const textRef = useRef<HTMLParagraphElement | null>(null);
+	useLayoutEffect(() => {
+		const element = textRef.current;
+		if (!element || open) return;
+		setOverflows(element.scrollHeight > element.clientHeight + 1);
+	}, [open]);
+	const toggle = !!text && (open || overflows);
+	return (
+		<Box data-testid="team-review-findings">
+			{text && (
+				<Text
+					ref={textRef}
+					size="sm"
+					c="dimmed"
+					lineClamp={open ? undefined : REVIEW_FINDINGS_CLAMP_LINES}
+					style={{ overflowWrap: "anywhere", whiteSpace: "pre-wrap" }}
+				>
+					{text}
+				</Text>
+			)}
+			{clipped && (
+				<Text size="xs" c="dimmed" fs="italic">
+					{t("teams.page.drawer.findingsClipped")}
+				</Text>
+			)}
+			{toggle && (
+				<Anchor
+					component="button"
+					type="button"
+					size="xs"
+					onClick={() => setOpen((value) => !value)}
+					data-testid="team-review-findings-toggle"
+				>
+					{t(open ? "teams.page.drawer.findingsLess" : "teams.page.drawer.findingsMore")}
+				</Anchor>
+			)}
+		</Box>
+	);
+}
 
 function FileDiff({
 	projectId,
@@ -397,6 +445,9 @@ function DrawerBody({
 										<Text size="sm" c="dimmed" style={{ overflowWrap: "anywhere" }}>
 											{round.reason}
 										</Text>
+									)}
+									{(round.summary || round.summaryClipped) && (
+										<ReviewFindings text={round.summary} clipped={!!round.summaryClipped} />
 									)}
 								</Stack>
 							);

@@ -2,8 +2,9 @@
  * The project page `/projects/$projectId` (R2): one repository's home — who is doing what, what
  * waits for me, and where new work starts.
  *
- *  - the header (`ProjectHeader`): name, path tail, default branch, pin, 「新团队」, 「新会话」 and
- *    the 「…」 menu (项目设置 → `/projects/$projectId/settings`);
+ *  - the header (`ProjectHeader`): name, path tail, default branch, 「N 位成员」 (a count; opens
+ *    the settings page at 成员与可见性), pin, 「新团队」, 「新会话」 and the 「…」 menu (项目设置 →
+ *    `/projects/$projectId/settings`);
  *  - 「等你处理」 (`ProjectAttention`, members only, hidden when empty);
  *  - 团队 (`ProjectTeamCards`) and 会话 (`ProjectSessions`);
  *  - with the outline on, the 「…」 menu opens the outline and switches the body to the project's
@@ -23,7 +24,7 @@ import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { Component, lazy, type ReactNode, Suspense, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useOpenOutlineSpace, useOutlineEnabled } from "../../hooks/useOutline";
-import { installProjectAccessListener } from "../../hooks/useProjectAccess";
+import { installProjectAccessListener, useProjectMemberCount } from "../../hooks/useProjectAccess";
 import { useProjectTeamCards } from "../../hooks/useProjectOverview";
 import { useProject } from "../../hooks/useProjects";
 import { teamsUnavailable } from "../../hooks/useTeams";
@@ -76,6 +77,7 @@ function ProjectPage() {
 	// The team cards' own read (same query): it also tells whether teams exist here (503 on PG).
 	const teamProbe = useProjectTeamCards(projectId, !project.isError);
 	const teamsAvailable = !(teamProbe.isError && teamsUnavailable(teamProbe.error));
+	const memberCount = useProjectMemberCount(projectId, !project.isError);
 	const [creating, setCreating] = useState<"session" | "team" | null>(null);
 	const outline = useOutlineEnabled();
 	const [showTasks, setShowTasks] = useState(false);
@@ -106,6 +108,14 @@ function ProjectPage() {
 				onNewTeam={() => setCreating("team")}
 				onOpenSettings={() =>
 					void navigate({ to: "/projects/$projectId/settings", params: { projectId } })
+				}
+				memberCount={memberCount.data ?? null}
+				onOpenMembers={() =>
+					void navigate({
+						to: "/projects/$projectId/settings",
+						params: { projectId },
+						hash: "settings-members",
+					})
 				}
 				outline={
 					outline.enabled

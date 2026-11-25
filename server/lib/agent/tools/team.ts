@@ -12,6 +12,7 @@
 import {
 	TEAM_CHECKIN_MAX_MINUTES,
 	TEAM_CHECKIN_MIN_MINUTES,
+	TEAM_REVIEW_SUMMARY_MAX_LENGTH,
 	TEAM_REVIEW_VERDICTS,
 	TEAM_TOOL_ACTIONS,
 	TEAM_WORK_BRANCH_HINT_MAX_LENGTH,
@@ -82,6 +83,13 @@ export const teamToolParameters = z.object({
 		.max(100_000)
 		.optional()
 		.describe("work.review: how many issues the review reported."),
+	summary: z
+		.string()
+		.max(TEAM_REVIEW_SUMMARY_MAX_LENGTH)
+		.optional()
+		.describe(
+			"work.review: the findings in a few short lines (each blocking issue; for a clear round, what was checked). People read it on the team page.",
+		),
 	reviewer: z
 		.string()
 		.max(200)
@@ -220,6 +228,7 @@ async function run(input: TeamInput, ctx: ToolContext): Promise<ToolResult> {
 				itemId: requireField(input, "item", action),
 				verdict,
 				findings: input.findings ?? 0,
+				summary: input.summary,
 				reviewer: await resolveReviewer(ctx, input.reviewer),
 				actor,
 			});
@@ -366,7 +375,7 @@ export const teamTool: ToolDefinition = {
 	description:
 		"Team coordinator only: manage the team's work items, brief, decisions and check-ins. " +
 		"work.list lists items; work.create makes an item with its own branch and worktree from the team's base branch; " +
-		"work.review records one review round (verdict, findings, reviewer); work.ready marks an item done after a clear review " +
+		"work.review records one review round (verdict, findings, a short summary of them, reviewer); work.ready marks an item done after a clear review " +
 		"(refused while its worktree has uncommitted changes, or, in a repository with knowledge/index.md, while the branch changed code a knowledge node anchors without updating that node, or added a source file no node anchors: details lists them for the worker to fix); " +
 		"work.sync tells the item's worker to merge the base into its branch with a merge commit (never on the server, never a rebase); " +
 		"work.cancel stops tracking an item; cleanup removes a cancelled or merged item's worktree (never its branch) and always asks a person; " +

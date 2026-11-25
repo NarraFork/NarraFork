@@ -5,6 +5,7 @@ import type {
 import type {
 	ProjectAttentionResponse,
 	ProjectListSummaryResponse,
+	ProjectMemberCount,
 	ProjectSessionPage,
 	ProjectSessionView,
 } from "@shared/project-overview";
@@ -180,6 +181,10 @@ export const projectsApi = {
 	getHiddenProjectExistence: () => request<{ hasHidden: boolean }>("/projects/hidden-existence"),
 
 	getProjectAccess: (projectId: string) => request<ProjectAccess>(`/projects/${projectId}/access`),
+
+	/** The header's 「N 位成员」: a count, never the list. */
+	getProjectMemberCount: (projectId: string, signal?: AbortSignal) =>
+		request<ProjectMemberCount>(`/projects/${projectId}/members/count`, { signal }),
 
 	setProjectVisibility: (projectId: string, visibility: ProjectVisibility) =>
 		request<ProjectAccess>(`/projects/${projectId}/visibility`, {

@@ -218,6 +218,7 @@ import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
 import type { NarratorPanelProps } from "./narrator-panel-types";
 import { useNarratorPanelVisible } from "./narrator-panel-visibility";
 import { OutlineDrawerHost } from "./OutlineDrawerHost";
+import { useReportPanelConnection } from "./panel-connection";
 import {
 	createResponsiveNarratorPanel,
 	NarratorPanelCompactContext,
@@ -321,6 +322,8 @@ function NarratorPanelBody({
 	specPanelOpen,
 	onToggleSpecPanel,
 	readOnlyNotice,
+	hideHeader = false,
+	onConnectionChange,
 }: Omit<NarratorPanelProps, "compact">) {
 	const navigate = useNavigate();
 	const fileDrawerVisible = useNarratorPanelVisible();
@@ -1315,6 +1318,9 @@ function NarratorPanelBody({
 		viewers,
 	} = wsState;
 	setUnreadCountRef.current = setUnreadCount;
+	// A host that hides the header (the team page) shows the 「连接断开」 badge's state itself and
+	// reconnects through the panel: the same socket, no second connection logic.
+	useReportPanelConnection(onConnectionChange, disconnected && !isWorkspacePreview, reconnect);
 	// Quota display + NUG recharge derivations (flags, dialog disclosure, and the
 	// payment-required reconstruction / auto-open effects) live in useNarratorQuota.
 	const {
@@ -3194,143 +3200,146 @@ function NarratorPanelBody({
 					{/* Drop overlay */}
 					<DropOverlay visible={isDragging} />
 					{/* Header — title-first arithmetic, single flex row, no flex fight:
-					    fixed title @ pretext W, then only tools that fit after it. */}
-					<NarratorHeaderLayout
-						titleFullWidth={headerTitleFullWidth}
-						showBack={showLeadingChrome}
-						showMenu={showMobileNav}
-						showTitleActions={!hostOwnsTitle && !isWorkspacePreview}
-						titleBadgeWidth={teamBadge?.width ?? 0}
-						surfacedToolCount={toolbarController.toolbarSurfacedDefs.length}
-						showClose={!!onClose}
-						onHeaderPointerDown={onHeaderPointerDown}
-					>
-						{(headerLayout) => (
-							<>
-								{/* Leading: fixed chrome + title; does not flex-shrink the title away. */}
-								<div
-									style={{
-										display: "flex",
-										alignItems: "center",
-										gap: HEADER_LEADING_GAP_PX,
-										flexWrap: "nowrap",
-										flex: "0 0 auto",
-										minWidth: 0,
-										maxWidth: "100%",
-										overflow: "hidden",
-									}}
-								>
-									{/* Phones: this row is the top of the screen, so it opens the drawer. */}
-									{showMobileNav && <MobileNavButton />}
-									{showLeadingChrome &&
-										(onBack ? (
-											<ActionIcon size="sm" variant="subtle" color="gray" onClick={onBack}>
-												<IconArrowLeft size={16} />
-											</ActionIcon>
-										) : onOpenStandalonePage ? (
-											<Tooltip label={t("openStandalonePage")} position="right">
-												<ActionIcon
-													size="sm"
-													variant="subtle"
-													color="gray"
-													onClick={onOpenStandalonePage}
-												>
-													<IconExternalLink size={16} />
+					    fixed title @ pretext W, then only tools that fit after it. Left out
+					    when the host draws its own (`hideHeader`, the team page). */}
+					{!hideHeader && (
+						<NarratorHeaderLayout
+							titleFullWidth={headerTitleFullWidth}
+							showBack={showLeadingChrome}
+							showMenu={showMobileNav}
+							showTitleActions={!hostOwnsTitle && !isWorkspacePreview}
+							titleBadgeWidth={teamBadge?.width ?? 0}
+							surfacedToolCount={toolbarController.toolbarSurfacedDefs.length}
+							showClose={!!onClose}
+							onHeaderPointerDown={onHeaderPointerDown}
+						>
+							{(headerLayout) => (
+								<>
+									{/* Leading: fixed chrome + title; does not flex-shrink the title away. */}
+									<div
+										style={{
+											display: "flex",
+											alignItems: "center",
+											gap: HEADER_LEADING_GAP_PX,
+											flexWrap: "nowrap",
+											flex: "0 0 auto",
+											minWidth: 0,
+											maxWidth: "100%",
+											overflow: "hidden",
+										}}
+									>
+										{/* Phones: this row is the top of the screen, so it opens the drawer. */}
+										{showMobileNav && <MobileNavButton />}
+										{showLeadingChrome &&
+											(onBack ? (
+												<ActionIcon size="sm" variant="subtle" color="gray" onClick={onBack}>
+													<IconArrowLeft size={16} />
 												</ActionIcon>
-											</Tooltip>
-										) : (
-											<NarratorPanelCompactContext.Consumer>
-												{(compact) =>
-													compact || workspaceId ? (
-														<ActionIcon
-															size="sm"
-															variant="subtle"
-															color="gray"
-															onClick={() =>
-																navigate({
-																	to: "/narrators/$narratorId",
-																	params: { narratorId },
-																	search: workspaceId
-																		? { from: "workspace", workspaceId }
-																		: undefined,
-																})
-															}
-														>
-															<IconExternalLink size={16} />
-														</ActionIcon>
-													) : (
-														<ActionIcon
-															size="sm"
-															variant="subtle"
-															color="gray"
-															onClick={() => navigate({ to: ".." })}
-														>
-															<IconArrowLeft size={16} />
-														</ActionIcon>
-													)
-												}
-											</NarratorPanelCompactContext.Consumer>
-										))}
-									{/*
-									 * `flex: 1` even when the title is suppressed: it is what pushes the
-									 * tool row to the right edge, and it hands the freed width to those
-									 * buttons instead of leaving a gap where the title used to be.
-									 *
-									 * The floor that keeps the title readable is the capacity BUDGET
-									 * (`headerTitleSlotMinWidth`), not a CSS `min-width`. A min-width here
-									 * would win against the tool row's `flex-shrink: 0` only by overflowing
-									 * or wrapping a nowrap row — both worse than the truncation it would
-									 * prevent. `HEADER_TITLE_SLOT_ATTR` marks the slot so the measurement
-									 * budgets it by policy instead of reading a width this element derives
-									 * from whatever the tool row left over.
-									 */}
-									<NarratorPanelHeaderTitle
-										narratorId={narratorId}
-										narrator={narrator}
-										hostOwnsTitle={hostOwnsTitle}
-										isWorkspacePreview={isWorkspacePreview}
-										titleFullWidth={headerLayout.titleWidth}
-									/>
-									{teamBadge && headerLayout.showTitleBadge && (
-										<NarratorTeamBadge target={teamBadge} />
+											) : onOpenStandalonePage ? (
+												<Tooltip label={t("openStandalonePage")} position="right">
+													<ActionIcon
+														size="sm"
+														variant="subtle"
+														color="gray"
+														onClick={onOpenStandalonePage}
+													>
+														<IconExternalLink size={16} />
+													</ActionIcon>
+												</Tooltip>
+											) : (
+												<NarratorPanelCompactContext.Consumer>
+													{(compact) =>
+														compact || workspaceId ? (
+															<ActionIcon
+																size="sm"
+																variant="subtle"
+																color="gray"
+																onClick={() =>
+																	navigate({
+																		to: "/narrators/$narratorId",
+																		params: { narratorId },
+																		search: workspaceId
+																			? { from: "workspace", workspaceId }
+																			: undefined,
+																	})
+																}
+															>
+																<IconExternalLink size={16} />
+															</ActionIcon>
+														) : (
+															<ActionIcon
+																size="sm"
+																variant="subtle"
+																color="gray"
+																onClick={() => navigate({ to: ".." })}
+															>
+																<IconArrowLeft size={16} />
+															</ActionIcon>
+														)
+													}
+												</NarratorPanelCompactContext.Consumer>
+											))}
+										{/*
+										 * `flex: 1` even when the title is suppressed: it is what pushes the
+										 * tool row to the right edge, and it hands the freed width to those
+										 * buttons instead of leaving a gap where the title used to be.
+										 *
+										 * The floor that keeps the title readable is the capacity BUDGET
+										 * (`headerTitleSlotMinWidth`), not a CSS `min-width`. A min-width here
+										 * would win against the tool row's `flex-shrink: 0` only by overflowing
+										 * or wrapping a nowrap row — both worse than the truncation it would
+										 * prevent. `HEADER_TITLE_SLOT_ATTR` marks the slot so the measurement
+										 * budgets it by policy instead of reading a width this element derives
+										 * from whatever the tool row left over.
+										 */}
+										<NarratorPanelHeaderTitle
+											narratorId={narratorId}
+											narrator={narrator}
+											hostOwnsTitle={hostOwnsTitle}
+											isWorkspacePreview={isWorkspacePreview}
+											titleFullWidth={headerLayout.titleWidth}
+										/>
+										{teamBadge && headerLayout.showTitleBadge && (
+											<NarratorTeamBadge target={teamBadge} />
+										)}
+										{disconnected && !isWorkspacePreview && (
+											<Badge
+												size="xs"
+												variant="dot"
+												color="red"
+												style={{ cursor: "pointer", flex: "0 0 auto" }}
+												onClick={reconnect}
+												title={t("reconnect")}
+											>
+												{t("disconnected")}
+											</Badge>
+										)}
+									</div>
+									{!isWorkspacePreview && (
+										<HeaderToolbar
+											onOpenSavedRecordings={() => setSaveDumpOpened(true)}
+											narratorId={narratorId}
+											controller={toolbarController}
+											inlineControls={toolbarInlineControls}
+											toolbarBadgeCounts={toolbarBadgeCounts}
+											headerHostCapabilities={headerHostCapabilities}
+											openArchiveConfirm={openArchiveConfirm}
+											archiveMutation={archiveMutation}
+											dock={dock}
+											mockStreamEnabled={mockStreamEnabled}
+											onOpenCompatibility={compatibilityProjectId ? openCompatibility : undefined}
+											onOpenOutline={outlineEnabled ? openOutline : undefined}
+											onUpgradeToTeam={teamUpgradeOffered ? openUpgradeToTeam : undefined}
+											onClose={onClose}
+											visibleToolCount={headerLayout.visibleToolCount}
+											unmeasured={headerLayout.unmeasured}
+											t={t}
+										/>
 									)}
-									{disconnected && !isWorkspacePreview && (
-										<Badge
-											size="xs"
-											variant="dot"
-											color="red"
-											style={{ cursor: "pointer", flex: "0 0 auto" }}
-											onClick={reconnect}
-											title={t("reconnect")}
-										>
-											{t("disconnected")}
-										</Badge>
-									)}
-								</div>
-								{!isWorkspacePreview && (
-									<HeaderToolbar
-										onOpenSavedRecordings={() => setSaveDumpOpened(true)}
-										narratorId={narratorId}
-										controller={toolbarController}
-										inlineControls={toolbarInlineControls}
-										toolbarBadgeCounts={toolbarBadgeCounts}
-										headerHostCapabilities={headerHostCapabilities}
-										openArchiveConfirm={openArchiveConfirm}
-										archiveMutation={archiveMutation}
-										dock={dock}
-										mockStreamEnabled={mockStreamEnabled}
-										onOpenCompatibility={compatibilityProjectId ? openCompatibility : undefined}
-										onOpenOutline={outlineEnabled ? openOutline : undefined}
-										onUpgradeToTeam={teamUpgradeOffered ? openUpgradeToTeam : undefined}
-										onClose={onClose}
-										visibleToolCount={headerLayout.visibleToolCount}
-										unmeasured={headerLayout.unmeasured}
-										t={t}
-									/>
-								)}
-							</>
-						)}
-					</NarratorHeaderLayout>
+								</>
+							)}
+						</NarratorHeaderLayout>
+					)}
 
 					<LeakedToolCallModal
 						narratorId={narratorId}

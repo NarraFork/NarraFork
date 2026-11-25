@@ -45,7 +45,7 @@ keywords:
   - X-Next-Cursor
   - 章节
 status: draft
-verified_at: 5d8877414a1141e8ce4d70cc3bb970a48645a2cc
+verified_at: 66bc772cb8dbb321753b7f326178e78e513230f1
 ---
 # 项目
 
@@ -61,7 +61,7 @@ verified_at: 5d8877414a1141e8ce4d70cc3bb970a48645a2cc
 - git 探测有超时（2s）、输出上限（8KB）和 30s 缓存。
 - `projects.rootKey`（realpath 规范化）是匹配键，局部唯一；被更早项目占用目录的项目 rootKey 永久为 null、不参与匹配。
 - 访问控制：admin、owner、`visibility=public`（所有登录用户可读）、`acl_grants` 的 read/write/manage，write/manage 隐含 read；owner 为 null 表示由 admin 管理（`project-acl.ts`）。进入项目是必要不充分条件，项目内会话/知识仍受自身 ACL。
-- 成员变更（设置成员、移除、转让 owner、可见性）只有 owner/admin/manage 能做，且有审计与通知（`project-membership.ts`）。
+- 成员变更（设置成员、移除、转让 owner、可见性）只有 owner/admin/manage 能做，且有审计与通知（`project-membership.ts`）。项目页页头只读成员人数（`countProjectMembers`，不带名单），见[项目页](project-pages.md)。
 - 失去项目后清侧栏标签：被移出的成员、以及可见性收紧为 private 时持有项目内标签的人（`usersWithTabsInProject`：项目标签、项目内会话的标签、项目团队的团队标签，各有上限 500）逐个过 `pruneUnreadableProjectTabs`（见[最近标签页](recent-tabs.md)）。
 - 路由层：项目不可见与不存在都返回 NotFound，防止探测；`GET /api/projects/hidden-existence` 只返回是否存在不可见项目（`limit 1` 的有界探测，不泄露名称、id 或数量）；修改设置要 manage。
 - 列表 `GET /api/projects`：按 `updatedAt` 降序，返回裸数组；不带 `limit`/`cursor` 时返回调用者可读的全部项目（`collectAllPages` 逐页有界地走，单页 200，总量上限 2000）；带 `limit`/`cursor` 才是单页，续页游标在响应头 `X-Next-Cursor`，被截断时 `X-Read-Truncated: 1`（`routes/projects.ts`、`services/read/`）。读取经 `projectReadAdapter()`：默认 SQLite 适配器，PG 模式必须显式注入 PG 适配器，不会静默回落。SQLite 适配器的列表、单读与存在探测都走读 Worker（`readQuery`，`worker-required`，不回退主线程；`read/sqlite-project-read-adapter.ts`）。

@@ -396,6 +396,20 @@ test("the work list reflects work item state changes", async () => {
 		expect(await call(page, (f) => f.attr("[data-testid=team-workspace]", "data-layout"))).toBe(
 			"split",
 		);
+		// The coordinator's column has one compact line above the conversation, not its toolbar;
+		// 完整会话 opens the coordinator's own session page.
+		await until(
+			page,
+			"coordinator line",
+			(f) => f.count("[data-testid=team-coordinator-line]") === 1,
+		);
+		expect(
+			await call(page, (f) =>
+				f.above("[data-testid=team-coordinator-header]", "[data-testid=conversation-stand-in]"),
+			),
+		).toBe(true);
+		await call(page, (f) => f.click("[data-testid=team-coordinator-full-session]"));
+		expect(await call(page, (f) => f.openedTargets())).toContain(`full:${teamId}`);
 		// Finished items are counts until opened: only the open columns are read.
 		expect([...new Set(boardReads)].sort()).toEqual(["in_progress", "queued", "review"]);
 		expect(await call(page, (f, id: string) => f.groupOf(id), movingId)).toBe("inProgress");
@@ -583,7 +597,30 @@ test("等你处理: approve a tool call and answer a question in place; onlooker
 	}
 }, 60_000);
 
+const BLOCKER_FINDINGS =
+	"Missing the day-boundary case: an order placed after 16:00 UTC belongs to the next day in UTC+8. " +
+	"The export also reads the server's zone when the user has none set; use the team default. " +
+	"Add a test for each.\n" +
+	"1. Orders at 15:59 and 16:00 UTC land on different days.\n" +
+	"2. A user without a zone gets the team default, not the server's.\n" +
+	"3. The CSV header names the zone it used.";
+
 test("the drawer opens from a card; 退回 needs a reason and sends the item back", async () => {
+	// Two review rounds with their findings, as the coordinator records them.
+	for (const [round, verdict, summary] of [
+		[1, "blocker", BLOCKER_FINDINGS],
+		[2, "clear", "Added three day-boundary tests; the export suite passes."],
+	] as const)
+		await db.insert(teamWorkEvents).values({
+			id: generateId(),
+			teamId,
+			workItemId: readyId,
+			kind: "work.review",
+			actorKind: "agent",
+			actorId: teamId,
+			detailJson: { round, verdict, findings: verdict === "blocker" ? 2 : 0, summary },
+			createdAt: tick(),
+		});
 	const { page, errors } = await openPage(alice, { width: 1440, height: 900 });
 	try {
 		await call(page, (f, p: string, t: string) => f.openTeam(p, t), projectId, teamId);
@@ -604,7 +641,26 @@ test("the drawer opens from a card; 退回 needs a reason and sends the item bac
 			"team/write-the-docs-9f9f",
 		);
 		expect(await call(page, (f) => f.attr("[data-testid=team-drawer-merge]", "disabled"))).toBe("");
+		// Each round shows its findings; the long one is clamped until 展开.
+		await until(page, "findings", (f) => f.count("[data-testid=team-review-findings]") === 2);
+		expect(await call(page, (f) => f.texts("[data-testid=team-review-findings] p"))).toEqual([
+			BLOCKER_FINDINGS,
+			"Added three day-boundary tests; the export suite passes.",
+		]);
+		expect(await call(page, (f) => f.count("[data-testid=team-review-findings-toggle]"))).toBe(1);
+		const clamped = await call(page, (f) => f.height("[data-testid=team-review-findings] p"));
 		await shot(page, "desktop-light-drawer");
+		await call(page, (f) => f.click("[data-testid=team-review-findings-toggle]"));
+		await until(
+			page,
+			"expanded",
+			(f, before: number) => f.height("[data-testid=team-review-findings] p") > before,
+			5_000,
+			clamped,
+		);
+		expect(await call(page, (f) => f.text("[data-testid=team-review-findings-toggle]"))).toBe(
+			"Show less",
+		);
 		await call(page, (f) => f.click("[data-testid=team-drawer-return]"));
 		await until(page, "reason", (f) => f.count("[data-testid=team-return-reason]") === 1);
 		// No reason, no return.

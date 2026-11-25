@@ -464,6 +464,9 @@
 				"round": "Round {{round}} · {{who}}",
 				"reviewer": "reviewer",
 				"findings": "{{count}} findings",
+				"findingsMore": "Show more",
+				"findingsLess": "Show less",
+				"findingsClipped": "The findings are too long in all; this round is not shown in full",
 				"verdictClear": "Passed",
 				"verdictBlocker": "Changes",
 				"verdictReturned": "Returned",
@@ -506,11 +509,30 @@
 				"title": "Running sessions",
 				"none": "Nothing running"
 			},
+			"coordinatorHeader": {
+				"title": "Coordinator",
+				"running_one": "{{count}} session running",
+				"running_other": "{{count}} sessions running",
+				"runningMore": "{{count}}+ sessions running",
+				"disconnected": "Disconnected",
+				"reconnect": "Click to reconnect",
+				"status": {
+					"working": "working",
+					"waiting": "waiting on someone",
+					"idle": "idle",
+					"archived": "archived"
+				},
+				"fullSession": "Full session"
+			},
 			"readOnlyStart": "Nobody has given the coordinator a goal yet.",
 			"coordinator": "Coordinator"
 		}
 	},
 	"page": {
+		"members_one": "{{count}} member",
+		"members_other": "{{count}} members",
+		"membersMore": "{{count}}+ members",
+		"membersHint": "Members and visibility",
 		"newTeam": "New team",
 		"more": "More",
 		"showSessions": "Teams and sessions",
