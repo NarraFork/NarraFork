@@ -1554,6 +1554,136 @@ describe("real shared orchestrator profile contract", () => {
 			});
 		});
 
+		for (const recoveredText of ["recovered", ""]) {
+			test(`${profile.kind}: admitted replay clears an earlier pass failure${recoveredText ? "" : " even without new text"}`, async () => {
+				const diagnostics = {
+					schema: "narrafork.error-diagnostics.v1" as const,
+					apiRequestId: "failed-before-workspace-replay",
+				};
+				const h = fixture(profile, [
+					async (options) => {
+						await options.hooks?.onErrorCleanup?.("upstream request body timed out", diagnostics);
+						// The existing workspace boundary authorizes a fresh pass, not a new run.
+						h.session._workspacePassInvalidated = true;
+						return { ...finished, hasError: true, finalText: "upstream request body timed out" };
+					},
+					{ ...finished, finalText: recoveredText },
+				]);
+				const result = await h.run();
+				expect(h.calls).toHaveLength(2);
+				expect(result).toMatchObject({ started: true, hasError: false, allowInboxWake: true });
+				expect(result.terminalStatus).toBeUndefined();
+				expect(result.finalText).not.toContain("timed out");
+				const row = db.select().from(narrators).where(eq(narrators.id, h.session.narratorId)).get();
+				expect(row?.lastStopReason).toBe("normal");
+				expect(row?.errorMessage).toBeNull();
+				expect(JSON.parse(row?.substatus ?? "[]")).not.toContain("error");
+			});
+		}
+
+		test(`${profile.kind}: recovery cannot overwrite an archive admitted before its status write`, async () => {
+			let failed = false;
+			let archived = false;
+			const updateStatus = narratorService.updateStatus.bind(narratorService);
+			const h = fixture(profile, [
+				async (options) => {
+					await options.hooks?.onErrorCleanup?.("failure before archive");
+					failed = true;
+					h.session._workspacePassInvalidated = true;
+					return { ...finished, hasError: true, finalText: "failure before archive" };
+				},
+				finished,
+			]);
+			spyOn(narratorService, "updateStatus").mockImplementation(async (id, status, options) => {
+				if (id === h.session.narratorId && failed && status === "working" && !options?.substatus) {
+					archived = true;
+					// Land the archive immediately before the real guarded write. The check
+					// outside updateStatus cannot prevent this race on its own.
+					db.update(narrators)
+						.set({ status: "archived", archivedWithNarratorId: "contract-parent" })
+						.where(eq(narrators.id, id))
+						.run();
+					h.session.alive = false;
+					h.session.abortController.abort("archived");
+				}
+				return updateStatus(id, status, options);
+			});
+			const result = await h.run();
+			expect(archived).toBe(true);
+			expect(h.calls).toHaveLength(1);
+			expect(result).toMatchObject({ aborted: true, allowInboxWake: false });
+			expect(
+				db.select().from(narrators).where(eq(narrators.id, h.session.narratorId)).get(),
+			).toMatchObject({ status: "archived", archivedWithNarratorId: "contract-parent" });
+		});
+
+		test(`${profile.kind}: a failed replay retains only its own failure and stops`, async () => {
+			const diagnostics = {
+				schema: "narrafork.error-diagnostics.v1" as const,
+				apiRequestId: "latest-failure-request",
+			};
+			const h = fixture(profile, [
+				async (options) => {
+					await options.hooks?.onErrorCleanup?.("earlier failure", {
+						...diagnostics,
+						apiRequestId: "earlier-failure-request",
+					});
+					h.session._workspacePassInvalidated = true;
+					return { ...finished, hasError: true, finalText: "earlier failure" };
+				},
+				// Not all executor failures emit an error event. The returned failure must
+				// still be classified, rather than hidden behind the earlier cleanup latch.
+				{
+					...finished,
+					hasError: true,
+					completedNaturally: false,
+					finalText: "latest failure",
+					errorCode: "LATEST_FAILURE",
+					errorDiagnostics: diagnostics,
+				},
+			]);
+			const result = await h.run();
+			expect(h.calls).toHaveLength(2);
+			expect(result).toMatchObject({
+				hasError: true,
+				allowInboxWake: false,
+				finalText: "latest failure",
+				terminalStatus: {
+					substatus: ["error"],
+					errorMessage: "latest failure",
+					errorCode: "LATEST_FAILURE",
+					diagnostics,
+				},
+			});
+			expect(
+				db.select().from(narrators).where(eq(narrators.id, h.session.narratorId)).get(),
+			).toMatchObject({ lastStopReason: "error", errorMessage: "latest failure" });
+		});
+
+		test(`${profile.kind}: a terminal cleanup error without an admitted replay remains stopped`, async () => {
+			const h = fixture(profile, [
+				async (options) => {
+					await options.hooks?.onErrorCleanup?.("unrecoverable provider failure");
+					return {
+						...finished,
+						hasError: true,
+						completedNaturally: false,
+						finalText: "unrecoverable provider failure",
+					};
+				},
+			]);
+			const result = await h.run();
+			expect(h.calls).toHaveLength(1);
+			expect(result).toMatchObject({
+				hasError: true,
+				allowInboxWake: false,
+				terminalStatus: { substatus: ["error"], errorMessage: "unrecoverable provider failure" },
+			});
+			expect(
+				db.select().from(narrators).where(eq(narrators.id, h.session.narratorId)).get(),
+			).toMatchObject({ lastStopReason: "error", errorMessage: "unrecoverable provider failure" });
+		});
+
 		test(`${profile.kind}: payment-required result fails the run without another model pass`, async () => {
 			const ws = await import("../../websocket/narrator-ws");
 			const broadcast = spyOn(ws, "broadcastToNarrator").mockImplementation(() => {});
@@ -2114,6 +2244,35 @@ describe("real shared orchestrator profile contract", () => {
 				expect(h.calls).toHaveLength(2);
 				expect(modelInputText(h.calls[1])).toContain("manual resume");
 				expect(getExecutionOwner(h.session.narratorId)).toBe(h.owner);
+			} finally {
+				await endRun(h, run);
+			}
+		});
+
+		test(`${profile.kind}: explicit input after a held failure clears its terminal diagnostics`, async () => {
+			const h = fixture(profile, [
+				async () => {
+					throw new Error("held pass failed");
+				},
+				finished,
+			]);
+			const parked = heldRun(h);
+			const run = h.run();
+			try {
+				await parked();
+				// Parking intentionally replaces the visible error with taken_over;
+				// the local terminal diagnostics must also disappear after explicit recovery.
+				expect(h.calls).toHaveLength(1);
+				expect(isExecutionSuspended(h.session.narratorId)).toBe(true);
+				await queueUserInput(h.session.narratorId, "recover held failure");
+				setRunHold(h.session.narratorId, { released: true });
+				h.runControl.wake?.("input");
+				const result = await run;
+				expect(result).toMatchObject({ hasError: false, allowInboxWake: true });
+				expect(result.terminalStatus).toBeUndefined();
+				expect(result.finalText).toBe("finished");
+				expect(h.calls).toHaveLength(2);
+				expect(modelInputText(h.calls[1])).toContain("recover held failure");
 			} finally {
 				await endRun(h, run);
 			}

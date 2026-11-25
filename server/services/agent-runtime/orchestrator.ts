@@ -2707,6 +2707,31 @@ export async function runAgentLoopUnlocked(
 					eventContext,
 					hooks,
 				);
+			// Only an already-admitted continuation can reach another model pass. Its
+			// outcome supersedes the failed pass, including cleanup's eager error latch
+			// and diagnostics. Otherwise a later success would still stop inbox wakes
+			// at finalization. Keep genuine terminal failures latched when no pass follows.
+			if (
+				(runState.hadError || terminalStatus) &&
+				active.alive &&
+				owner.isCurrent() &&
+				!config.signal.aborted
+			) {
+				const resumed = await narratorService.updateStatus(narratorId, "working", {
+					unlessArchived: true,
+				});
+				if (resumed === false) {
+					runState.wasInterrupted = true;
+					break;
+				}
+				// Cancellation may have landed while the status write was pending. Leave
+				// its abort handling (including a held turn) to the executor as before.
+				if (active.alive && owner.isCurrent() && !config.signal.aborted) {
+					runState.hadError = false;
+					terminalStatus = undefined;
+					runState.finalText = "";
+				}
+			}
 			let result: ExecuteLoopResult;
 			if (checkpointIdentity) bindCheckpointGateActor(config.signal, checkpointIdentity);
 			try {
