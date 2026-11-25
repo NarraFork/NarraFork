@@ -20,6 +20,7 @@ import type { ExecutionBackend } from "../lib/agent/execution/backend";
 import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { AppError } from "../lib/errors";
 import {
+	cleanGitEnv,
 	ensureConfigOverridesHonored,
 	GIT_NO_EXEC_CONFIG,
 	gitConfigEnv,
@@ -809,14 +810,9 @@ export class NarratorWorktreeService<Principal> {
 						maxOutputBytes: maxBytes,
 						killProcessTree: true,
 						env: {
-							...process.env,
+							...cleanGitEnv(),
 							// Keep the unsupported-option diagnostic stable across server locales.
 							LC_ALL: "C",
-							GIT_DIR: undefined,
-							GIT_COMMON_DIR: undefined,
-							GIT_WORK_TREE: undefined,
-							GIT_INDEX_FILE: undefined,
-							GIT_EXTERNAL_DIFF: undefined,
 							...(config ? gitConfigEnv(config) : {}),
 						},
 						signal,
@@ -861,12 +857,8 @@ export class NarratorWorktreeService<Principal> {
 			maxOutputBytes: 64 * 1024,
 			killProcessTree: true,
 			env: {
-				...process.env,
+				...cleanGitEnv(),
 				LC_ALL: "C",
-				GIT_DIR: undefined,
-				GIT_COMMON_DIR: undefined,
-				GIT_WORK_TREE: undefined,
-				GIT_INDEX_FILE: undefined,
 				...gitConfigEnv(config),
 			},
 			signal,

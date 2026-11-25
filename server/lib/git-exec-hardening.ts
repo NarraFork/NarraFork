@@ -109,7 +109,7 @@ export function parseProgramConfig(stdout: string): GitConfiguredPrograms {
 export function untrustedProgramOverrides(
 	programs: GitConfiguredPrograms,
 ): Array<readonly [string, string]> {
-	if (programs.partialClone && !noLazyFetchSupported)
+	if (programs.partialClone && !noLazyFetchSupported())
 		throw new AppError(
 			"This repository is a partial clone (or names a promisor remote) and this git cannot be kept from fetching missing objects through it (GIT_NO_LAZY_FETCH needs git 2.45); update git to use it with teams",
 			409,
@@ -159,7 +159,7 @@ async function defaultProbe(): Promise<boolean> {
 	const result = await safeSpawn({
 		cmd: ["git", "config", "--get", GIT_HARDENING_SENTINEL[0]],
 		cwd: tmpdir(),
-		env: { ...process.env, ...gitConfigEnv([GIT_HARDENING_SENTINEL]) },
+		env: { ...cleanGitEnv(), ...gitConfigEnv([GIT_HARDENING_SENTINEL]) },
 		timeout: 10_000,
 		maxOutputBytes: 4096,
 	});
@@ -169,87 +169,188 @@ async function defaultProbe(): Promise<boolean> {
 let probe: HardeningProbe = defaultProbe;
 let verdict: Promise<boolean> | null = null;
 
+// ── The environment git inherits ────────────────────────────────────────────
+
 /**
- * Whether this git honours `GIT_NO_LAZY_FETCH` (git 2.45, "git --no-lazy-fetch"): known once the
- * behaviour probe ran (false until then, and when it could not tell).
+ * Variables that route git to another repository, object store, index or template, add
+ * configuration (`git -c` from a parent process), or change what is read: none may reach a
+ * hardened command from the server's own environment. The host's configuration FILES
+ * (`GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_NOSYSTEM`) are the operator's and kept,
+ * unless `configFiles: false` (the lazy-fetch probe, which uses none).
  */
-let noLazyFetchSupported = false;
-let lazyFetchProbe: Promise<void> | null = null;
+const ROUTING_VARIABLES = [
+	"GIT_DIR",
+	"GIT_WORK_TREE",
+	"GIT_COMMON_DIR",
+	"GIT_INDEX_FILE",
+	"GIT_OBJECT_DIRECTORY",
+	"GIT_ALTERNATE_OBJECT_DIRECTORIES",
+	"GIT_NAMESPACE",
+	"GIT_CEILING_DIRECTORIES",
+	"GIT_DISCOVERY_ACROSS_FILESYSTEM",
+	"GIT_TEMPLATE_DIR",
+	"GIT_CONFIG",
+	"GIT_CONFIG_PARAMETERS",
+	"GIT_CONFIG_COUNT",
+	"GIT_EXTERNAL_DIFF",
+	"GIT_REPLACE_REF_BASE",
+	"GIT_NO_REPLACE_OBJECTS",
+	"GIT_GRAFT_FILE",
+	"GIT_SHALLOW_FILE",
+	"GIT_QUARANTINE_PATH",
+	"GIT_PREFIX",
+	"GIT_NO_LAZY_FETCH",
+] as const;
+const CONFIG_FILE_VARIABLES = ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM"];
+
+/**
+ * The server's environment without anything that routes git elsewhere or adds configuration
+ * (see {@link ROUTING_VARIABLES}; every `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n` too). Callers add
+ * their own overrides on top.
+ */
+export function cleanGitEnv(
+	base: Record<string, string | undefined> = process.env,
+	options: { configFiles?: boolean } = {},
+): Record<string, string | undefined> {
+	const env: Record<string, string | undefined> = {};
+	const drop = new Set<string>([
+		...ROUTING_VARIABLES,
+		...(options.configFiles === false ? CONFIG_FILE_VARIABLES : []),
+	]);
+	for (const [key, value] of Object.entries(base)) {
+		if (
+			drop.has(key) ||
+			/^GIT_CONFIG_(KEY|VALUE)_\d+$/.test(key) ||
+			key.startsWith("GIT_INTERNAL_")
+		)
+			continue;
+		env[key] = value;
+	}
+	return env;
+}
+
+// ── Lazy fetching ───────────────────────────────────────────────────────────
+
+/** What the lazy-fetch probe found: inconclusive is never cached. */
+export type LazyFetchVerdict = "supported" | "unsupported" | "inconclusive";
+
+/** The cached verdict (supported / unsupported); null until the probe could tell. */
+let lazyFetchVerdict: "supported" | "unsupported" | null = null;
+let lazyFetchProbe: Promise<LazyFetchVerdict> | null = null;
+let lastInconclusiveAt = 0;
+/** How long after an inconclusive probe the next one waits. */
+let inconclusiveBackoffMs = 30_000;
 
 const PROBE_TIMEOUT_MS = 10_000;
 
+type ScratchDir = (prefix: string) => Promise<string>;
+let scratchDir: ScratchDir = (prefix) => mkdtemp(prefix);
+
+/** Replace how the probe makes its scratch directory, and the retry backoff (tests). */
+export function setLazyFetchProbeSeamsForTests(seams: {
+	scratch?: ScratchDir | null;
+	backoffMs?: number | null;
+}): void {
+	if (seams.scratch !== undefined) scratchDir = seams.scratch ?? ((prefix) => mkdtemp(prefix));
+	if (seams.backoffMs !== undefined) inconclusiveBackoffMs = seams.backoffMs ?? 30_000;
+}
+
+/** Whether this git is known to honour `GIT_NO_LAZY_FETCH` (an unknown answer is "no"). */
+const noLazyFetchSupported = () => lazyFetchVerdict === "supported";
+
 /**
- * Probe the behaviour itself, once per process: a scratch partial clone whose promisor remote
- * (a scratch repository next to it) holds a blob the clone lacks. With `GIT_NO_LAZY_FETCH=1`
- * `cat-file -e` must fail; without it, the same command must fetch the blob and succeed (the
- * control: otherwise the setup proves nothing and the answer is "not honoured"). Bounded: a
- * handful of git commands with a timeout each, in a temporary directory removed afterwards.
+ * Probe the behaviour itself: a scratch partial clone whose promisor remote (a scratch
+ * repository next to it) holds a blob the clone lacks. With `GIT_NO_LAZY_FETCH=1` `cat-file -e`
+ * must fail; without it (explicitly unset), the same command must fetch the blob and succeed.
+ * `supported` when both hold, `unsupported` when the blob was fetched despite the variable, and
+ * `inconclusive` when anything else went wrong (no scratch space, git failing, the control not
+ * fetching): that answer is not cached. Every command runs with a clean environment — nothing
+ * inherited routes it to another repository or adds configuration — and a timeout; the scratch
+ * directory is removed afterwards. Never rejects.
  */
-export async function probeLazyFetchHonoured(): Promise<boolean> {
-	const dir = await mkdtemp(join(tmpdir(), "nf-lazy-fetch-"));
-	const git = (cwd: string, args: string[], env: Record<string, string> = {}) =>
-		safeSpawn({
-			cmd: ["git", "-C", cwd, ...args],
-			env: {
-				...process.env,
-				LC_ALL: "C",
-				GIT_TERMINAL_PROMPT: "0",
-				GIT_CONFIG_NOSYSTEM: "1",
-				GIT_CONFIG_GLOBAL: DEV_NULL,
-				...env,
-			},
-			timeout: PROBE_TIMEOUT_MS,
-			maxOutputBytes: 4096,
-			killProcessTree: true,
-		});
+export async function probeLazyFetch(): Promise<LazyFetchVerdict> {
+	let dir: string | null = null;
 	try {
+		dir = await scratchDir(join(tmpdir(), "nf-lazy-fetch-"));
+		const git = (cwd: string, args: string[], env: Record<string, string | undefined> = {}) =>
+			safeSpawn({
+				cmd: ["git", "-C", cwd, ...args],
+				env: {
+					...cleanGitEnv(process.env, { configFiles: false }),
+					LC_ALL: "C",
+					GIT_TERMINAL_PROMPT: "0",
+					GIT_CONFIG_NOSYSTEM: "1",
+					GIT_CONFIG_GLOBAL: DEV_NULL,
+					GIT_CEILING_DIRECTORIES: dir ?? undefined,
+					...env,
+				},
+				timeout: PROBE_TIMEOUT_MS,
+				maxOutputBytes: 4096,
+				killProcessTree: true,
+			});
 		const source = join(dir, "source");
 		const clone = join(dir, "clone");
 		await mkdir(source);
 		await mkdir(clone);
-		if ((await git(source, ["init", "-q"])).exitCode !== 0) return false;
+		if ((await git(source, ["init", "-q"])).exitCode !== 0) return "inconclusive";
 		await writeFile(join(source, "blob"), "narrafork lazy fetch probe\n");
 		const blob = await git(source, ["hash-object", "-w", "blob"]);
 		const oid = blob.stdout.trim();
-		if (blob.exitCode !== 0 || !/^[a-f0-9]{40,64}$/.test(oid)) return false;
+		if (blob.exitCode !== 0 || !/^[a-f0-9]{40,64}$/.test(oid)) return "inconclusive";
 		for (const args of [
 			["config", "uploadpack.allowAnySHA1InWant", "true"],
 			["config", "uploadpack.allowFilter", "true"],
 		])
-			await git(source, args);
-		if ((await git(clone, ["init", "-q"])).exitCode !== 0) return false;
+			if ((await git(source, args)).exitCode !== 0) return "inconclusive";
+		if ((await git(clone, ["init", "-q"])).exitCode !== 0) return "inconclusive";
 		for (const args of [
 			["config", "core.repositoryformatversion", "1"],
 			["config", "extensions.partialClone", "probe"],
 			["config", "remote.probe.url", source],
 			["config", "remote.probe.promisor", "true"],
 		])
-			await git(clone, args);
+			if ((await git(clone, args)).exitCode !== 0) return "inconclusive";
 		const lookup = ["-c", "protocol.file.allow=always", "cat-file", "-e", oid];
 		const refused = await git(clone, lookup, { GIT_NO_LAZY_FETCH: "1" });
-		if (refused.exitCode === 0) return false;
-		const control = await git(clone, lookup);
-		return control.exitCode === 0;
+		if (refused.exitCode === 0) return "unsupported";
+		const control = await git(clone, lookup, { GIT_NO_LAZY_FETCH: undefined });
+		return control.exitCode === 0 ? "supported" : "inconclusive";
 	} catch {
-		return false;
+		return "inconclusive";
 	} finally {
-		await rm(dir, { recursive: true, force: true }).catch(() => {});
+		if (dir) await rm(dir, { recursive: true, force: true }).catch(() => {});
 	}
 }
 
-async function probeLazyFetchSupport(): Promise<void> {
-	noLazyFetchSupported = await probeLazyFetchHonoured();
+/** The boolean form of {@link probeLazyFetch} (supported or not). */
+export async function probeLazyFetchHonoured(): Promise<boolean> {
+	return (await probeLazyFetch()) === "supported";
 }
 
-/** Force the `GIT_NO_LAZY_FETCH` support verdict (tests); null reads git again. */
+/**
+ * Settle the lazy-fetch verdict once (single-flight): a supported or unsupported answer is kept
+ * for the process, an inconclusive one is not (the next call after the backoff probes again).
+ * Meanwhile partial clones and promisor remotes are refused, everything else proceeds.
+ */
+async function settleLazyFetchVerdict(): Promise<void> {
+	if (lazyFetchVerdict !== null) return;
+	if (!lazyFetchProbe && Date.now() - lastInconclusiveAt < inconclusiveBackoffMs) return;
+	lazyFetchProbe ??= probeLazyFetch()
+		.catch((): LazyFetchVerdict => "inconclusive")
+		.then((verdict) => {
+			if (verdict === "inconclusive") lastInconclusiveAt = Date.now();
+			else lazyFetchVerdict = verdict;
+			lazyFetchProbe = null;
+			return verdict;
+		});
+	await lazyFetchProbe;
+}
+
+/** Force the lazy-fetch verdict (tests); null forgets it so git is probed again. */
 export function setNoLazyFetchSupportForTests(supported: boolean | null): void {
-	if (supported === null) {
-		lazyFetchProbe = null;
-		noLazyFetchSupported = false;
-		return;
-	}
-	lazyFetchProbe = Promise.resolve();
-	noLazyFetchSupported = supported;
+	lazyFetchProbe = null;
+	lastInconclusiveAt = 0;
+	lazyFetchVerdict = supported === null ? null : supported ? "supported" : "unsupported";
 }
 
 /** Replace the probe (tests); null restores git. Clears the cached verdict. */
@@ -263,8 +364,7 @@ export function setGitHardeningProbeForTests(next: HardeningProbe | null): void 
  * none of the overrides above would apply. Checked once per process (a failed check is retried).
  */
 export async function ensureConfigOverridesHonored(): Promise<void> {
-	lazyFetchProbe ??= probeLazyFetchSupport();
-	await lazyFetchProbe;
+	await settleLazyFetchVerdict();
 	verdict ??= probe().catch(() => false);
 	const honored = await verdict;
 	if (!honored) {

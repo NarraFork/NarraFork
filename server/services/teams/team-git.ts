@@ -29,6 +29,7 @@ import {
 } from "@shared/project-teams";
 import { GitError } from "../../lib/errors";
 import {
+	cleanGitEnv,
 	ensureConfigOverridesHonored,
 	GIT_NO_EXEC_CONFIG,
 	type GitConfiguredPrograms,
@@ -78,13 +79,9 @@ async function spawnGit(
 	const result = await safeSpawn({
 		cmd: ["git", "--no-optional-locks", "-C", cwd, ...noExternalDiffArgs(args)],
 		env: {
-			...process.env,
-			// Never redirected to another repository by the server's own environment.
-			GIT_DIR: undefined,
-			GIT_COMMON_DIR: undefined,
-			GIT_WORK_TREE: undefined,
-			GIT_INDEX_FILE: undefined,
-			GIT_EXTERNAL_DIFF: undefined,
+			// Never redirected to another repository, object store or configuration by the
+			// server's own environment.
+			...cleanGitEnv(),
 			GIT_TERMINAL_PROMPT: "0",
 			LC_ALL: "C",
 			...gitConfigEnv(config),

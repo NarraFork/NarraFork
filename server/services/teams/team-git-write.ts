@@ -32,6 +32,7 @@ import { join } from "node:path";
 import { TEAM_MERGE_CONFLICTS_MAX, TEAM_MERGE_REF_PREFIX } from "@shared/project-teams";
 import { AppError, GitError } from "../../lib/errors";
 import {
+	cleanGitEnv,
 	ensureConfigOverridesHonored,
 	GIT_NO_EXEC_CONFIG,
 	gitConfigEnv,
@@ -87,16 +88,12 @@ async function run(
 ): Promise<RunResult> {
 	options.signal?.throwIfAborted();
 	await ensureConfigOverridesHonored();
-	const base = options.network ? envWithAmbientProxy() : { ...process.env };
+	// Nothing inherited routes git to another repository, object store or configuration.
+	const base = cleanGitEnv(options.network ? envWithAmbientProxy() : process.env);
 	const result = await safeSpawn({
 		cmd: ["git", "--no-optional-locks", "-C", cwd, ...args],
 		env: {
 			...base,
-			GIT_DIR: undefined,
-			GIT_COMMON_DIR: undefined,
-			GIT_WORK_TREE: undefined,
-			GIT_INDEX_FILE: undefined,
-			GIT_EXTERNAL_DIFF: undefined,
 			GIT_TERMINAL_PROMPT: "0",
 			GIT_ASKPASS: undefined,
 			SSH_ASKPASS: undefined,
@@ -161,7 +158,7 @@ let versionProbe: Promise<[number, number, number] | null> | null = null;
 export function gitVersion(): Promise<[number, number, number] | null> {
 	versionProbe ??= safeSpawn({
 		cmd: ["git", "--version"],
-		env: { ...process.env, LC_ALL: "C" },
+		env: { ...cleanGitEnv(), LC_ALL: "C" },
 		timeout: 10_000,
 		maxOutputBytes: 1024,
 	})
