@@ -62,16 +62,25 @@ export function TeamWorkspace({
 		if (measured) onLayout?.(layout);
 	}, [measured, layout, onLayout]);
 
+	// Bring the conversation forward, then focus its composer once it is shown (after the tab
+	// switch has rendered, not in the same frame).
+	const [focusWanted, setFocusWanted] = useState(0);
 	useEffect(() => {
 		if (!focusConversation) return;
 		setTab("conversation");
-		requestAnimationFrame(() => {
+		setFocusWanted(focusConversation);
+	}, [focusConversation]);
+	useEffect(() => {
+		if (!focusWanted || (tabs && tab !== "conversation")) return;
+		const frame = requestAnimationFrame(() => {
 			const element = conversationRef.current;
 			if (!element) return;
 			element.scrollIntoView({ block: "nearest" });
 			element.querySelector<HTMLElement>("textarea, [contenteditable=true]")?.focus();
+			setFocusWanted(0);
 		});
-	}, [focusConversation]);
+		return () => cancelAnimationFrame(frame);
+	}, [focusWanted, tabs, tab]);
 
 	const conversationShown = !tabs || tab === "conversation";
 	const sideShown = !tabs || tab === "work";
