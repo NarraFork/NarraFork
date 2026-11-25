@@ -1,4 +1,5 @@
 import { type Locale, type LocalizedValue, pickLocalizedValue } from "@shared/i18n-locales";
+import { oneLine } from "./team-coordinator-notes";
 
 // ─── Team coordinator ───
 //
@@ -160,13 +161,15 @@ export function returnedNote(locale: Locale, input: ReturnedNoteInput): string {
 
 /**
  * The note a coordinator gets when the last dependency of a queued work item merged (source
- * `team_unblocked`, woken when idle): the item can start now, after a base sync. Deterministic
- * for the same inputs.
+ * `team_unblocked`, woken when idle): the item can start now, after a base sync. The title is put
+ * on one line (as in the overlap notice), so it cannot forge lines of its own. Deterministic for
+ * the same inputs.
  */
 export function unblockedNote(locale: Locale, input: { itemId: string; title: string }): string {
+	const title = oneLine(input.title);
 	if (locale === "zh-CN")
-		return `「${input.title}」现在可以开始了\n它依赖的工作项都已合并（${input.itemId}）。先对它跑 Team work.sync，再用 Agent({ workdir: <它的 worktree> }) 派工人，把 work.sync 返回的指令放在简报最前面。`;
-	return `"${input.title}" can start now\nEvery item it depends on is merged (${input.itemId}). Run Team work.sync on it first, then delegate it with Agent({ workdir: <its worktree> }), the instruction work.sync returns first in the brief.`;
+		return `「${title}」现在可以开始了\n它依赖的工作项都已合并（${input.itemId}）。先对它跑 Team work.sync，再用 Agent({ workdir: <它的 worktree> }) 派工人，把 work.sync 返回的指令放在简报最前面。`;
+	return `"${title}" can start now\nEvery item it depends on is merged (${input.itemId}). Run Team work.sync on it first, then delegate it with Agent({ workdir: <its worktree> }), the instruction work.sync returns first in the brief.`;
 }
 
 // ─── Upgrade and disband notes ───

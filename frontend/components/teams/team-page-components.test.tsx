@@ -1036,7 +1036,9 @@ describe("dependencies (D)", () => {
 			"zh-CN",
 		);
 		expect(html).toContain("修改依赖");
-		expect(html).toContain("等 2 项合并");
+		// The event keeps only ids, not which were merged then: the count is worded neutrally.
+		expect(html).toContain("依赖 2 项");
+		expect(html).not.toContain("项合并");
 		expect(html).toContain("可以开始了");
 		expect(html).toContain("依赖的工作项都已合并");
 	});

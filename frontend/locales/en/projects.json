@@ -247,8 +247,8 @@
 			"decisionPlan": "A plan · {{agent}}",
 			"decisionPlanCoordinator": "A plan · coordinator",
 			"decisionPlanAgent": "A plan · an agent",
-			"dependencies_one": "Waits for {{count}} item to merge",
-			"dependencies_other": "Waits for {{count}} items to merge",
+			"dependencies_one": "Depends on {{count}} item",
+			"dependencies_other": "Depends on {{count}} items",
 			"dependenciesCleared": "No dependencies left",
 			"unblocked": "Every item it waits for is merged"
 		},

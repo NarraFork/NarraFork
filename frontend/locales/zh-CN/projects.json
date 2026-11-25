@@ -247,8 +247,8 @@
 			"decisionPlan": "计划 · {{agent}}",
 			"decisionPlanCoordinator": "计划 · 协调者",
 			"decisionPlanAgent": "计划 · 某个代理",
-			"dependencies_one": "等 {{count}} 项合并",
-			"dependencies_other": "等 {{count}} 项合并",
+			"dependencies_one": "依赖 {{count}} 项",
+			"dependencies_other": "依赖 {{count}} 项",
 			"dependenciesCleared": "不再依赖其他工作项",
 			"unblocked": "依赖的工作项都已合并"
 		},

@@ -327,7 +327,10 @@ export interface TeamBoardItem {
 	updatedAt: string;
 	/** R: what a working or waiting worker did last; absent or null otherwise. */
 	activity?: TeamWorkerActivity | null;
-	/** D: the items this one waits for (at most {@link TEAM_WORK_DEPENDENCIES_MAX}), in id order. */
+	/**
+	 * D: the items this one waits for (at most {@link TEAM_WORK_DEPENDENCIES_MAX}), oldest created
+	 * first (ties by id).
+	 */
 	dependsOn?: TeamWorkDependencyRef[];
 }
 
@@ -749,7 +752,10 @@ export interface TeamWorkItemDetail {
 	eventsMore: boolean;
 	/** The caller may return it now (member, active team, a returnable state). */
 	canReturn: boolean;
-	/** D: items of this team that depend on this one, at most {@link TEAM_WORK_DEPENDENTS_LIMIT}. */
+	/**
+	 * D: items of this team that depend on this one, oldest created first, at most
+	 * {@link TEAM_WORK_DEPENDENTS_LIMIT}.
+	 */
 	dependents?: TeamWorkDependencyRef[];
 	dependentsMore?: boolean;
 }

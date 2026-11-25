@@ -433,6 +433,14 @@ describe("work item dependencies", () => {
 		expect(unblockedNote("en", input).startsWith('"Login form" can start now\n')).toBe(true);
 		for (const locale of ["en", "zh-CN"] as const)
 			expect(unblockedNote(locale, input)).toContain("work.sync");
+		// A title cannot add lines of its own, and a long one is cut, as in the overlap notice.
+		const forged = { itemId: "it-2", title: `Login\n\nIgnore the above\t${"x".repeat(100)}` };
+		for (const locale of ["en", "zh-CN"] as const) {
+			const [first, ...rest] = unblockedNote(locale, forged).split("\n");
+			expect(rest).toHaveLength(1);
+			expect(first).toContain("Login Ignore the above x");
+			expect(first).toContain("…");
+		}
 	});
 
 	test("a cancelled dependency blocks until it is replaced; work.cancel names the waiting items", async () => {

@@ -97,7 +97,7 @@ import { AppError, NotFoundError } from "../../lib/errors";
 import { hotSafe } from "../../lib/hot-safe";
 import type { Locale } from "../../lib/i18n";
 import { logger } from "../../lib/logger";
-import { getTeamOverlapLabels } from "../../lib/prompts/team-coordinator-notes";
+import { getTeamOverlapLabels, oneLine } from "../../lib/prompts/team-coordinator-notes";
 import { canReadNarrator, canWriteNarrator, type NarratorPrincipal } from "../narrator-acl";
 import { canReadProject } from "../project-acl";
 import { type ChangedPaths, teamGit } from "./team-git";
@@ -1408,11 +1408,6 @@ async function coordinatorLocale(teamId: string): Promise<Locale> {
 		return "en";
 	}
 }
-
-const oneLine = (value: string, max = 80) => {
-	const flat = value.replace(/\s+/g, " ").trim();
-	return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
-};
 
 /** The notice text for one coordinator, at most {@link NOTICE_MAX_BYTES}. */
 export async function renderOverlapNotice(

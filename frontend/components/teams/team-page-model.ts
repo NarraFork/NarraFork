@@ -132,6 +132,7 @@ export function eventNote(
 			return reason ? { key: "text", values: { text: reason } } : null;
 		}
 		case "work.dependencies_changed": {
+			// The whole set, merged ones included (the event keeps no states): never "waits for N".
 			const count = Array.isArray(detail.dependsOn) ? detail.dependsOn.length : null;
 			if (count === null) return null;
 			return count === 0
