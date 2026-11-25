@@ -414,6 +414,7 @@ async function checkoutActivity(
 const NO_COMMAND_BLOCKERS: ReadonlySet<TeamFastForwardBlocker> = new Set([
 	"not_on_base",
 	"other_repository",
+	"altered_history",
 	"stale",
 	"unreadable",
 	"unsafe_path",
@@ -927,6 +928,8 @@ async function runMerge(context: JobContext, signal: AbortSignal): Promise<void>
 	const facts = await jobFacts(context, signal);
 	const { item, head, branch, base, git } = facts;
 	const title = item.title;
+	// Merge bases and "already in the base" are only answered over the real, full history.
+	await git.assertTrueHistory();
 	for (let attempt = 0; attempt < 2; attempt++) {
 		const old = await git.resolve(`refs/heads/${base}`);
 		if (!old) throw new MergeFailure("TEAM_BASE_UNRESOLVED", `The base ${base} is gone`);
@@ -1016,6 +1019,7 @@ async function runFastForward(context: JobContext, signal: AbortSignal): Promise
 	setPhase(context.itemId, "checking");
 	const facts = await jobFacts(context, signal);
 	const { item, head, branch, base, git, repo } = facts;
+	await git.assertTrueHistory();
 	const outcome = readMergeOutcome(item.id);
 	if (outcome?.kind !== "prepared")
 		throw new MergeFailure("TEAM_MERGE_NOT_PREPARED", "There is no prepared merge any more");

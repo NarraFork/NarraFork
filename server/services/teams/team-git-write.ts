@@ -42,7 +42,7 @@ import type { GitIdentityEnv } from "../../lib/git-identity";
 import { envWithAmbientProxy } from "../../lib/net/proxy-env";
 import { DEV_NULL } from "../../lib/platform";
 import { safeSpawn } from "../../lib/spawn";
-import { configuredPrograms } from "./team-git";
+import { assertTrueHistory, configuredPrograms } from "./team-git";
 
 /** Ordinary reads and ref writes. */
 const SHORT_TIMEOUT_MS = 30_000;
@@ -520,6 +520,9 @@ export interface TeamRepoGit {
 	/** `git remote get-url --push origin` (insteadOf and pushurl applied); null without origin. */
 	originPushUrl(): Promise<string | null>;
 	resolve(ref: string): Promise<string | null>;
+	/** Refuse a shallow repository or one with a graft file (`TEAM_GIT_HISTORY_ALTERED`). */
+	assertTrueHistory(): Promise<void>;
+	/** Whether `ancestor` is in `descendant`'s history (refused like `assertTrueHistory`). */
 	isAncestor(ancestor: string, descendant: string): Promise<boolean>;
 	mergeTree(ours: string, theirs: string): Promise<MergeTreeResult>;
 	/**
@@ -631,9 +634,11 @@ export function teamRepoGit(repo: string, options: { signal?: AbortSignal } = {}
 			return result.stdout.trim() || null;
 		},
 		resolve,
+		assertTrueHistory: () => assertTrueHistory(repo),
 		async isAncestor(ancestor, descendant) {
 			assertSha(ancestor);
 			assertSha(descendant);
+			await assertTrueHistory(repo);
 			const result = await read(["merge-base", "--is-ancestor", ancestor, descendant]);
 			if (result.exitCode === 0) return true;
 			if (result.exitCode === 1 && !result.stderr.trim()) return false;
@@ -873,6 +878,7 @@ export type CheckoutBlocker =
 	| "index_locked"
 	| "local_config"
 	| "other_repository"
+	| "altered_history"
 	| "unsafe_path"
 	| "unreadable";
 
@@ -935,6 +941,8 @@ export async function inspectCheckout(
 			]);
 			if (mine !== theirs) return "other_repository";
 		}
+		// A shallow history or a graft file would fool the person's own git (the command).
+		if (await historyAltered(dir)) return "altered_history";
 		const head = await run(dir, ["symbolic-ref", "--quiet", "HEAD"], { config, signal });
 		if (head.exitCode !== 0 || head.stdout.trim() !== `refs/heads/${base}`) return "not_on_base";
 		const at = await run(dir, ["rev-parse", "--verify", "--quiet", `refs/heads/${base}^{commit}`], {
@@ -957,6 +965,17 @@ export async function inspectCheckout(
 	} catch (error) {
 		if (signal?.aborted) throw error;
 		return "unreadable";
+	}
+}
+
+/** Whether `assertTrueHistory` refuses the repository at `dir` (other failures propagate). */
+async function historyAltered(dir: string): Promise<boolean> {
+	try {
+		await assertTrueHistory(dir);
+		return false;
+	} catch (error) {
+		if (error instanceof AppError && error.code === "TEAM_GIT_HISTORY_ALTERED") return true;
+		throw error;
 	}
 }
 
@@ -1173,8 +1192,9 @@ export function fastForwardCommand(
 	assertSha(mergeCommit);
 	if (unsafeForCommand(dir) || unsafeForCommand(base)) return null;
 	const merge = `merge --ff-only --no-autostash --no-overwrite-ignore ${mergeCommit}`;
-	const sh = `git -C ${shellWord(dir)}`;
-	const ps = `git -C ${powershellWord(dir)}`;
+	// The person's git ignores replacement refs too (the merge was computed without them).
+	const sh = `git --no-replace-objects -C ${shellWord(dir)}`;
+	const ps = `git --no-replace-objects -C ${powershellWord(dir)}`;
 	return {
 		sh: `[ "$(${sh} symbolic-ref --quiet HEAD)" = ${shellWord(`refs/heads/${base}`)} ] && ${sh} ${merge}`,
 		powershell: `if ((${ps} symbolic-ref --quiet HEAD) -ceq ${powershellWord(`refs/heads/${base}`)}) { ${ps} ${merge} } else { Write-Error ${powershellWord(`Not on ${base}: nothing was changed`)} }`,

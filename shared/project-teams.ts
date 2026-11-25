@@ -928,6 +928,7 @@ export const TEAM_FAST_FORWARD_BLOCKERS = [
 	"sessions_running",
 	"local_config",
 	"other_repository",
+	"altered_history",
 	"unsafe_path",
 	"unreadable",
 ] as const;

@@ -538,6 +538,35 @@ describe("where work starts", () => {
 		await assertDependenciesReachStart(api.id);
 	});
 
+	test("a replacement ref or a shallow file cannot make a dependency look inside the start (Devin 4)", async () => {
+		setTeamSettings({ workStart: "local" });
+		const schema = await create("Schema");
+		const api = await create("API", [schema.id]);
+		const head = await commitFile(worktreePathOf(schema) ?? "", "schema.txt", "s\n", "schema");
+		// main's commit replaced by a copy that lists the dependency's head as a parent.
+		const main = await git(["rev-parse", "main"]);
+		const body = await git(["cat-file", "commit", main]);
+		const fake = join(repo, ".git", "fake-commit");
+		await writeFile(fake, `${body.replace(/^(tree [0-9a-f]+)$/m, `$1\nparent ${head}`)}\n`);
+		await git(["replace", main, await git(["hash-object", "-t", "commit", "-w", "--", fake])]);
+		await git(["merge-base", "--is-ancestor", head, "main"]);
+		await mergedAt(schema.id, head);
+		expect(unblocks(api.id)).toBe(0);
+		await expect(assertDependenciesReachStart(api.id)).rejects.toMatchObject({
+			code: "TEAM_WORK_ITEM_BLOCKED",
+			message: expect.stringContaining("not into main"),
+		});
+		// Really inside, but behind a shallow boundary: not answered, so still not started.
+		await git(["replace", "-d", main]);
+		await git(["merge", "-q", "--ff-only", head]);
+		await writeFile(join(repo, ".git", "shallow"), `${main}\n`);
+		await expect(assertDependenciesReachStart(api.id)).rejects.toMatchObject({
+			code: "TEAM_WORK_ITEM_BLOCKED",
+		});
+		await rm(join(repo, ".git", "shallow"));
+		await assertDependenciesReachStart(api.id);
+	});
+
 	test("a dependency inside the start ref unblocks once (Devin 5)", async () => {
 		setTeamSettings({ workStart: "local" });
 		const schema = await create("Schema");

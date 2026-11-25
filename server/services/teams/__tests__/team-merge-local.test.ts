@@ -159,6 +159,16 @@ async function checkoutFingerprint(dir: string) {
 
 const merge = (itemId: string) => requestMerge({ teamId: LEAD, itemId, userId: USER });
 
+/** `git replace` `commit` with a copy that also lists `parent` as a parent. */
+async function replaceWithExtraParent(commit: string, parent: string) {
+	const body = await git(["cat-file", "commit", commit]);
+	const fake = body.replace(/^(tree [0-9a-f]+)$/m, `$1\nparent ${parent}`);
+	const path = join(temporary, `fake-${commit}`);
+	await writeFile(path, `${fake}\n`);
+	const replacement = await git(["hash-object", "-t", "commit", "-w", "--", path]);
+	await git(["replace", commit, replacement]);
+}
+
 beforeAll(async () => {
 	temporary = await mkdtemp(join(tmpdir(), "nf-team-merge-"));
 	globalConfig = join(temporary, "gitconfig");
@@ -314,7 +324,7 @@ describe("local merge", () => {
 		expect(view.canMerge).toBe(true);
 		expect(view.fastForward).toMatchObject({ available: true, blocker: null });
 		expect(view.fastForward?.command?.sh).toBe(
-			`[ "$(git -C ${repo} symbolic-ref --quiet HEAD)" = refs/heads/main ] && git -C ${repo} merge --ff-only --no-autostash --no-overwrite-ignore ${outcome.mergeCommit}`,
+			`[ "$(git --no-replace-objects -C ${repo} symbolic-ref --quiet HEAD)" = refs/heads/main ] && git --no-replace-objects -C ${repo} merge --ff-only --no-autostash --no-overwrite-ignore ${outcome.mergeCommit}`,
 		);
 		expect(view.fastForward?.command?.powershell).toContain(outcome.mergeCommit);
 
@@ -632,6 +642,61 @@ describe("local merge", () => {
 		expect(events(a.id, "work.merged")[0]?.detail).toMatchObject({ detectedBy: "ancestry" });
 		expect(await pruneProjectMergeRefs(PROJECT)).toBe(1);
 		expect(await git(["for-each-ref", "refs/narrafork/"])).toBe("");
+	});
+
+	test("a replacement ref claiming the base holds the item never makes it merged unintegrated (Devin 4)", async () => {
+		const a = await readyItem("replaced");
+		await git(["checkout", "-q", "--detach"]);
+		const old = await git(["rev-parse", "main"]);
+		await replaceWithExtraParent(old, a.head);
+		// The repository's own git (replacements honoured) now calls the item part of main.
+		await git(["merge-base", "--is-ancestor", a.head, "main"]);
+		// Ancestry detection is not fooled: the item stays ready.
+		await runChangedPathsPass({ sweep: true });
+		expect(item(a.id)?.state).toBe("ready");
+		expect(events(a.id, "work.merged")).toHaveLength(0);
+		// The merge integrates it for real: main is a merge commit of the true base and the head.
+		merge(a.id);
+		await settleMergeJobs();
+		const now = await git(["--no-replace-objects", "rev-parse", "main"]);
+		expect(now).not.toBe(old);
+		expect(await git(["--no-replace-objects", "log", "-1", "--format=%P", "main"])).toBe(
+			`${old} ${a.head}`,
+		);
+		await git(["--no-replace-objects", "merge-base", "--is-ancestor", a.head, "main"]);
+		expect(item(a.id)?.state).toBe("merged");
+		const merged = events(a.id, "work.merged")[0]?.detail;
+		expect(merged).toMatchObject({ detectedBy: "local_merge", mergeCommit: now });
+		expect(merged?.alreadyInBase).toBeUndefined();
+	});
+
+	test("a shallow repository or a graft file is refused: nothing merged, the base untouched (Devin 4)", async () => {
+		for (const altered of ["shallow", "grafts"] as const) {
+			const a = await readyItem(`altered-${altered}`);
+			await git(["checkout", "-q", "--detach"]);
+			const old = await git(["rev-parse", "main"]);
+			const file =
+				altered === "shallow"
+					? join(repo, ".git", "shallow")
+					: join(repo, ".git", "info", "grafts");
+			await mkdir(join(repo, ".git", "info"), { recursive: true });
+			await writeFile(file, altered === "shallow" ? `${old}\n` : `${old} ${a.head}\n`);
+			try {
+				await runChangedPathsPass({ sweep: true });
+				expect(item(a.id)?.state).toBe("ready");
+				merge(a.id);
+				await settleMergeJobs();
+				expect(await git(["rev-parse", "main"])).toBe(old);
+				expect(item(a.id)?.state).toBe("ready");
+				expect(events(a.id, "work.merged")).toHaveLength(0);
+				expect(readMergeOutcome(a.id)).toMatchObject({
+					kind: "failed",
+					code: "TEAM_GIT_HISTORY_ALTERED",
+				});
+			} finally {
+				await rm(file, { force: true });
+			}
+		}
 	});
 
 	test("pruning keeps the private ref of an item still ready", async () => {

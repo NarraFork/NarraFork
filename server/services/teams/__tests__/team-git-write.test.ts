@@ -370,15 +370,17 @@ describe("team git writes", () => {
 		const sha = "a".repeat(40);
 		const plain = fastForwardCommand("/repo/main", "main", sha, "linux");
 		expect(plain).toEqual({
-			sh: `[ "$(git -C /repo/main symbolic-ref --quiet HEAD)" = refs/heads/main ] && git -C /repo/main merge --ff-only --no-autostash --no-overwrite-ignore ${sha}`,
-			powershell: `if ((git -C '/repo/main' symbolic-ref --quiet HEAD) -ceq 'refs/heads/main') { git -C '/repo/main' merge --ff-only --no-autostash --no-overwrite-ignore ${sha} } else { Write-Error 'Not on main: nothing was changed' }`,
+			sh: `[ "$(git --no-replace-objects -C /repo/main symbolic-ref --quiet HEAD)" = refs/heads/main ] && git --no-replace-objects -C /repo/main merge --ff-only --no-autostash --no-overwrite-ignore ${sha}`,
+			powershell: `if ((git --no-replace-objects -C '/repo/main' symbolic-ref --quiet HEAD) -ceq 'refs/heads/main') { git --no-replace-objects -C '/repo/main' merge --ff-only --no-autostash --no-overwrite-ignore ${sha} } else { Write-Error 'Not on main: nothing was changed' }`,
 			preferred: "sh",
 		});
 		// Spaces and quotes: one word each way (sh closes and reopens the quote, PowerShell doubles it).
 		const quoted = commandsFor("C:\\My Repo\\it's", "main", sha, "win32");
 		expect(quoted.preferred).toBe("powershell");
-		expect(quoted.powershell).toContain("git -C 'C:\\My Repo\\it''s' symbolic-ref");
-		expect(quoted.sh).toContain("git -C 'C:\\My Repo\\it'\\''s' symbolic-ref");
+		expect(quoted.powershell).toContain(
+			"git --no-replace-objects -C 'C:\\My Repo\\it''s' symbolic-ref",
+		);
+		expect(quoted.sh).toContain("git --no-replace-objects -C 'C:\\My Repo\\it'\\''s' symbolic-ref");
 		// Run the sh form for real, from a directory with a space and a quote in its name.
 		const spaced = join(temporary, `my repo it's ${Math.random().toString(36).slice(2)}`);
 		await rm(repo, { recursive: true, force: true });
@@ -420,10 +422,10 @@ describe("team git writes", () => {
 		const sha = "b".repeat(40);
 		// The exact escaping, for the plain quote and a typographic one.
 		expect(commandsFor("/srv/';Remove-Item x;'", "main", sha, "win32").powershell).toBe(
-			`if ((git -C '/srv/'';Remove-Item x;''' symbolic-ref --quiet HEAD) -ceq 'refs/heads/main') { git -C '/srv/'';Remove-Item x;''' merge --ff-only --no-autostash --no-overwrite-ignore ${sha} } else { Write-Error 'Not on main: nothing was changed' }`,
+			`if ((git --no-replace-objects -C '/srv/'';Remove-Item x;''' symbolic-ref --quiet HEAD) -ceq 'refs/heads/main') { git --no-replace-objects -C '/srv/'';Remove-Item x;''' merge --ff-only --no-autostash --no-overwrite-ignore ${sha} } else { Write-Error 'Not on main: nothing was changed' }`,
 		);
 		expect(commandsFor("/srv/a\u2019;Remove-Item x;\u2018", "main", sha).powershell).toContain(
-			"git -C '/srv/a\u2019\u2019;Remove-Item x;\u2018\u2018' symbolic-ref",
+			"git --no-replace-objects -C '/srv/a\u2019\u2019;Remove-Item x;\u2018\u2018' symbolic-ref",
 		);
 		const paths = ["'", "\u2018", "\u2019", "\u201a", "\u201b"].flatMap((q) => [
 			`/srv/${q};Remove-Item x;${q}`,
@@ -433,15 +435,15 @@ describe("team git writes", () => {
 		// Read back with PowerShell's own quoting rules (readPowerShellQuoted), not by starting pwsh.
 		for (const path of paths) {
 			const ps = commandsFor(path, "main", sha).powershell;
-			let at = ps.indexOf("git -C ");
+			let at = ps.indexOf("git --no-replace-objects -C ");
 			let words = 0;
 			while (at !== -1) {
-				const word = readPowerShellQuoted(ps, at + "git -C ".length);
+				const word = readPowerShellQuoted(ps, at + "git --no-replace-objects -C ".length);
 				expect(word.value).toBe(path);
 				// The string ends exactly where the argument does: the subcommand follows.
 				expect(ps.slice(word.end)).toMatch(/^ (symbolic-ref|merge) /);
 				words++;
-				at = ps.indexOf("git -C ", word.end);
+				at = ps.indexOf("git --no-replace-objects -C ", word.end);
 			}
 			expect(words).toBe(2);
 		}
@@ -453,8 +455,9 @@ describe("team git writes", () => {
 		await mkdir(bin, { recursive: true });
 		const log = join(bin, "args.log");
 		const marker = join(bin, "PWNED");
-		// A git that records the directory it was given and fails (so nothing else runs).
-		await writeFile(join(bin, "git"), `#!/bin/sh\nprintf '%s\\n' "$2" >> '${log}'\nexit 1\n`);
+		// A git that records the directory it was given (after `--no-replace-objects -C`) and
+		// fails, so nothing else runs.
+		await writeFile(join(bin, "git"), `#!/bin/sh\nprintf '%s\\n' "$3" >> '${log}'\nexit 1\n`);
 		await chmod(join(bin, "git"), 0o755);
 		const paths = ["'", "\u2018", "\u2019", "\u201a", "\u201b"].map(
 			(q) => `/srv/${q};touch ${marker};${q} $(touch ${marker}) \`touch ${marker}\``,

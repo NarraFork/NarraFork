@@ -21,13 +21,13 @@
  * a partial result. `work.ready` pins one head commit and passes it to every one of them.
  */
 import { stat } from "node:fs/promises";
-import { isAbsolute, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import {
 	TEAM_CHANGED_DIR_SUFFIX,
 	TEAM_CHANGED_PATHS_MAX,
 	TEAM_CHANGED_PATHS_MAX_BYTES,
 } from "@shared/project-teams";
-import { GitError } from "../../lib/errors";
+import { AppError, GitError } from "../../lib/errors";
 import {
 	cleanGitEnv,
 	ensureConfigOverridesHonored,
@@ -97,6 +97,40 @@ async function spawnGit(
 		exitCode: result.exitCode,
 		truncated: result.stdoutTruncated === true || result.stderrTruncated === true,
 	};
+}
+
+/**
+ * Refuse a repository whose history git would answer for only partly: a shallow one (`shallow`
+ * cuts parents, so merge bases and ancestry are guesses) or one with a legacy graft file
+ * (`info/grafts`; hardened commands ignore it, but a person's own git in that repository would
+ * not). Replacement refs need no check: no hardened command reads them. An agent can write
+ * either file, so this runs right before each ancestry answer and each merge.
+ */
+export async function assertTrueHistory(cwd: string): Promise<void> {
+	const result = await spawnGit(
+		cwd,
+		["rev-parse", "--path-format=absolute", "--is-shallow-repository", "--git-common-dir"],
+		GIT_NO_EXEC_CONFIG,
+		16 * 1024,
+	);
+	const [shallow, common] = result.stdout.split("\n").map((line) => line.trim());
+	if (result.exitCode !== 0 || result.truncated || !common || !isAbsolute(common))
+		throw new GitError("git rev-parse could not read whether the repository is shallow");
+	const grafts = await stat(join(common, "info", "grafts")).then(
+		() => true,
+		(error: NodeJS.ErrnoException) => {
+			if (error.code === "ENOENT" || error.code === "ENOTDIR") return false;
+			throw new GitError(`Could not check ${common} for a graft file`);
+		},
+	);
+	if (shallow === "true" || grafts)
+		throw new AppError(
+			shallow === "true"
+				? "The repository is shallow: its history is cut, so what is merged cannot be told. Fetch the full history (git fetch --unshallow) first"
+				: "The repository has a graft file (info/grafts) rewriting its history: remove it (or convert it with git replace --convert-graft-file) first",
+			409,
+			"TEAM_GIT_HISTORY_ALTERED",
+		);
 }
 
 /** The filters and configuration-defined hooks a checkout's configuration names (all scopes). */
@@ -517,7 +551,10 @@ export function teamGit(cwd: string): TeamGit {
 		);
 	return {
 		resolveCommit: (ref) => resolveCommit(run, ref),
-		isAncestor: (ancestor, descendant) => isAncestor(run, ancestor, descendant),
+		isAncestor: async (ancestor, descendant) => {
+			await assertTrueHistory(cwd);
+			return isAncestor(run, ancestor, descendant);
+		},
 		countCommitsNotIn: (tip, reachableFrom) => countCommitsNotIn(run, tip, reachableFrom),
 		uncommittedChanges: () => uncommittedChanges(run),
 		changedPaths: (baseRef, at) => changedPathsOf(run, baseRef, at),

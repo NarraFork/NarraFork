@@ -128,6 +128,19 @@ export function untrustedProgramOverrides(
 	];
 }
 
+/**
+ * Git reads the objects and history that are really there: replacement refs (`refs/replace/*`,
+ * repository content anyone who can write the repository can add) and a legacy graft file
+ * (`info/grafts`) are both ignored. Either could make `merge-base --is-ancestor` call a commit
+ * part of the base, or show other trees, parents or blobs to merges, diffs and stats. Set on
+ * every hardened command whatever the host's environment says; the graft file named does not
+ * exist (`/dev/null` itself would be read, with a deprecation hint).
+ */
+export const TRUE_HISTORY_ENV: Readonly<Record<string, string>> = Object.freeze({
+	GIT_NO_REPLACE_OBJECTS: "1",
+	GIT_GRAFT_FILE: join(DEV_NULL, "no-grafts"),
+});
+
 /** The environment carrying configuration overrides (replaces any inherited GIT_CONFIG_*). */
 export function gitConfigEnv(
 	entries: ReadonlyArray<readonly [string, string]>,
@@ -138,6 +151,7 @@ export function gitConfigEnv(
 		GIT_OPTIONAL_LOCKS: "0",
 		// A missing object is never fetched lazily from a (repository-configured) promisor remote.
 		GIT_NO_LAZY_FETCH: "1",
+		...TRUE_HISTORY_ENV,
 	};
 	entries.forEach(([key, value], index) => {
 		env[`GIT_CONFIG_KEY_${index}`] = key;
@@ -205,8 +219,9 @@ const CONFIG_FILE_VARIABLES = ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CO
 
 /**
  * The server's environment without anything that routes git elsewhere or adds configuration
- * (see {@link ROUTING_VARIABLES}; every `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n` too). Callers add
- * their own overrides on top.
+ * (see {@link ROUTING_VARIABLES}; every `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n` too), with
+ * replacement refs and grafts off ({@link TRUE_HISTORY_ENV}). Callers add their own overrides on
+ * top.
  */
 export function cleanGitEnv(
 	base: Record<string, string | undefined> = process.env,
@@ -226,7 +241,7 @@ export function cleanGitEnv(
 			continue;
 		env[key] = value;
 	}
-	return env;
+	return { ...env, ...TRUE_HISTORY_ENV };
 }
 
 // ── Lazy fetching ───────────────────────────────────────────────────────────

@@ -18,8 +18,10 @@ import {
 	setGitHardeningProbeForTests,
 	setLazyFetchProbeSeamsForTests,
 	setNoLazyFetchSupportForTests,
+	TRUE_HISTORY_ENV,
 	untrustedProgramOverrides,
 } from "../git-exec-hardening";
+import { DEV_NULL } from "../platform";
 
 afterEach(() => {
 	setGitHardeningProbeForTests(null);
@@ -48,6 +50,8 @@ describe("git exec hardening", () => {
 			GIT_CONFIG_COUNT: "1",
 			GIT_OPTIONAL_LOCKS: "0",
 			GIT_NO_LAZY_FETCH: "1",
+			GIT_NO_REPLACE_OBJECTS: "1",
+			GIT_GRAFT_FILE: join(DEV_NULL, "no-grafts"),
 			GIT_CONFIG_KEY_0: "a.b",
 			GIT_CONFIG_VALUE_0: "1",
 		});
@@ -137,19 +141,27 @@ describe("git exec hardening", () => {
 			GIT_CONFIG_VALUE_0: "/evil",
 			GIT_EXTERNAL_DIFF: "x",
 			GIT_NO_LAZY_FETCH: "0",
+			GIT_NO_REPLACE_OBJECTS: "0",
+			GIT_GRAFT_FILE: "/r/.git/info/grafts",
+			GIT_SHALLOW_FILE: "/r/.git/shallow",
 			GIT_CONFIG_GLOBAL: "/g",
 			GIT_CONFIG_NOSYSTEM: "1",
 		});
-		// The operator's configuration files stay; the probe drops them too.
+		// The operator's configuration files stay; the probe drops them too. Replacement refs and
+		// grafts are off whatever the host said.
 		expect(env).toEqual({
 			PATH: "/bin",
 			HOME: "/home/x",
 			GIT_CONFIG_GLOBAL: "/g",
 			GIT_CONFIG_NOSYSTEM: "1",
+			...TRUE_HISTORY_ENV,
 		});
 		expect(cleanGitEnv({ PATH: "/bin", GIT_CONFIG_GLOBAL: "/g" }, { configFiles: false })).toEqual({
 			PATH: "/bin",
+			...TRUE_HISTORY_ENV,
 		});
+		expect(cleanGitEnv({}).GIT_NO_REPLACE_OBJECTS).toBe("1");
+		expect(gitConfigEnv([]).GIT_NO_REPLACE_OBJECTS).toBe("1");
 	});
 
 	test("the lazy-fetch probe never writes to a repository the environment points at", async () => {
