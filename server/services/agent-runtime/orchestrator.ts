@@ -3555,20 +3555,23 @@ export async function runAgentLoopUnlocked(
 				}
 			}
 
-			// Anything queued during this turn (completions AND inbound messages) keeps the
-			// loop running instead of going idle. Previously only completions were checked
-			// here, so a message that arrived at this exact moment waited for the next wake.
+			// Queued completions and inbound messages keep a successful turn running.
+			// They are not recovery authorization: preserve them if this pass failed,
+			// just as the buffered-input path below does, rather than retrying a terminal
+			// error merely to acknowledge a notice that arrived before the failure.
 			// [continuation-source: injection-drain]
-			const bgCompletionPrompt = await drainAndPersistPendingInjections(active, placement);
-			if (bgCompletionPrompt) {
-				await narratorService.updateStatus(narratorId, "working");
-				runState.input.media = undefined;
-				runState.input.text = "";
-				runState.input.images = undefined;
-				// This drain starts a fresh pass before the buffer consumer below is
-				// reached, which would strand a cut-in message for the rest of the loop.
-				await rearmCutInSoftStopBeforeContinuing(active);
-				continue;
+			if (!runState.hadError) {
+				const bgCompletionPrompt = await drainAndPersistPendingInjections(active, placement);
+				if (bgCompletionPrompt) {
+					await narratorService.updateStatus(narratorId, "working");
+					runState.input.media = undefined;
+					runState.input.text = "";
+					runState.input.images = undefined;
+					// This drain starts a fresh pass before the buffer consumer below is
+					// reached, which would strand a cut-in message for the rest of the loop.
+					await rearmCutInSoftStopBeforeContinuing(active);
+					continue;
+				}
 			}
 
 			// Queued input BEFORE transitioning to idle/unread — this prevents spurious

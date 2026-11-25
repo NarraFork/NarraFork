@@ -427,6 +427,7 @@ test("watch completion during run finalization automatically survives owner hand
 
 function injectCleanupFailure(
 	outcome: "workspace-restart" | "error" | "user-interrupt",
+	beforeFailure?: () => Promise<void>,
 ): () => boolean {
 	const execute = executor.executeAgentLoop;
 	let cleanedUp = false;
@@ -436,6 +437,7 @@ function injectCleanupFailure(
 		// provider event source is injected, avoiding transport retry backoff.
 		const result = await execute(options, {
 			eventSource: (async function* (): AsyncGenerator<AgentEvent> {
+				await beforeFailure?.();
 				if (outcome === "user-interrupt") {
 					expect(interruptNarrator(narratorId)).toBe(true);
 					yield { type: "error", message: "Aborted" };
@@ -549,6 +551,37 @@ for (const source of ["watch", "agent"] as const) {
 			expect(final.errorMessage).toBeNull();
 		}, 15_000);
 	}
+}
+
+for (const source of ["watch", "agent"] as const) {
+	test(`${source} completion already queued before failure cannot authorize a recovery pass`, async () => {
+		const cleanedUp = injectCleanupFailure("error", async () => {
+			await completeSource(source);
+			await until(() => notices().length === 1, "completion is queued before the provider fails");
+			expect(getExecutionOwner(narratorId)).toBeDefined();
+			expect(notices()[0].state).toBe("queued");
+			expect(notices()[0].adoptedAt).toBeNull();
+		});
+		await acceptUserMessage(
+			narratorId,
+			"a queued notice is not permission to retry my failed task",
+		);
+		await until(
+			() => cleanedUp() && !getExecutionOwner(narratorId),
+			"unrecovered failure releases its owner without consuming the notice",
+		);
+		const stopped = await narratorService.getById(narratorId);
+		expect(stopped.status).toBe("idle");
+		expect(stopped.lastStopReason).toBe("error");
+		expect(stopped.substatus).toContain("error");
+		expect(stopped.errorMessage).toContain("HTTP 408");
+		expect(task()?.status).toBe("completed");
+		expect(notices()).toHaveLength(1);
+		expect(notices()[0].state).toBe("queued");
+		expect(notices()[0].adoptedAt).toBeNull();
+		// The only HTTP request allowed here is the background child's request.
+		expect(requests).toHaveLength(source === "watch" ? 0 : 1);
+	}, 15_000);
 }
 
 for (const outcome of ["error", "user-interrupt"] as const) {

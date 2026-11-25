@@ -20,6 +20,8 @@ anchors:
   - server/services/agent-runtime/prompt-characters.ts
   - server/services/turn-continuation-decisions.ts
   - server/services/turn-continuation-registry.ts
+  - server/services/__tests__/agent-runtime-orchestrator-contract.test.ts
+  - server/services/__tests__/terminal-watch-real-wake.integration.test.ts
 keywords:
   - startNarratorRun
   - runAgentLoopUnlocked
@@ -35,7 +37,7 @@ keywords:
   - 跟随父会话模型
   - RuntimePolicy
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 76675714460e80e3a2d4ca0a0ca7e55b76731ed1
 ---
 # 调度与执行
 
@@ -58,6 +60,8 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
   - 无状态模型的可重试错误 → `retry-exhausted`（提供方循环已重试过，外层不再重放）。
   - 有状态模型的可重试错误或 Codex 静默断开 → `backoff`；`bypassRetryLimit` 时 maxRetries 为 -1。
   - 其余 → `completed`。
+- 失败状态按 pass 结算：`onErrorCleanup` 可提前置 `hadError` 并记录 `terminalStatus`；只有既有续跑规则已准入的新 pass（例如工作区重放、held 运行接收明确输入）到达模型调用前，才可清旧 `hadError`、`terminalStatus`、`finalText`。先检查 `active.alive`、当前 owner 与未取消的请求信号，成功写 `working`（`unlessArchived`）后再次检查；归档拒绝写入则中断，不清旧状态。新 pass 成功后不遗留旧诊断；新 pass 失败则按其自身错误收尾（`orchestrator.ts:runAgentLoopUnlocked`）。
+- 轮后的 `injection-drain` 只在 `hadError` 为 false 时排空注入并续跑；失败前排队的 Watch/agent 通知不能自行授权恢复。没有获准的新 pass 时，真实失败保留错误终态，`allowInboxWake` 为 false，排队输入保留。错误清理不扩大续跑来源，也不改变取消、held 本地 Stop 与整次运行取消的区别。
 - 预算：上下文溢出重试 2 次（`MAX_CONTEXT_OVERFLOW_RETRIES`），回合中断重试 3 次，配额等待每次运行 3 次，`auto:` 源切换每次运行 3 次（`MAX_AUTO_SWITCHES_PER_RUN`）。
 - `auto:` 模型：等待不超过 15 分钟则等，否则切到另一个能服务同模型的来源；`<前缀>:<模型>` 不切换（`auto-forced-switch.ts`）。
 - 计划批准：响应仍在流式时只标记，等响应落定再压缩并中止；响应落定前结束则丢弃批准（`plan-approval-restart.ts`）。
@@ -72,6 +76,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 
 ## 改它时
 - 新增一种失败恢复：先在 `transition.ts` 的 `RuntimeRecoveryTransition` 与 `settleRuntimeRecovery` 加分支，再在 orchestrator 对应的 `[continuation-source: …]` 处理，并同步 `turn-continuation-registry.ts` 的来源。
+- 改失败后的 pass 边界：同时看 `agent-runtime-orchestrator-contract.test.ts` 的合法重放、空成功输出、二次失败、归档竞争与 held 明确输入用例，以及 `terminal-watch-real-wake.integration.test.ts` 的 Watch/agent 通知在失败前排队与失败后送达用例；不能靠清错误锁存让异步通知变成恢复授权。
 - 新增控制动作：改 `RunControlAction` 与 `controlRunUnlocked`，注意 `finalizing` 与 `detaching` 的竞争约定。
 - `ownership.ts` 末尾会改写旧热重载遗留的 Map/Set；改字段名前先看 `adoptLegacyMap`。
 
