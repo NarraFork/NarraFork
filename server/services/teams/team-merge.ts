@@ -987,6 +987,10 @@ async function runMerge(context: JobContext, signal: AbortSignal): Promise<void>
 			message: `Merge team work item: ${oneLine(title, 120)} (${branch})`,
 			identity,
 		});
+		// A clean merge can produce a tree or blob neither side had — one a replacement ref
+		// rewrites. Refused here, before the private ref, the base or a recorded outcome: a
+		// prepared merge its own fast-forward would refuse leaves the item stuck.
+		await assertNoReplacedHistory(repo, [mergeCommit]);
 		const existing = await git.resolve(`${TEAM_MERGE_REF_PREFIX}${item.id}`);
 		signal.throwIfAborted();
 		await git.setPrivateRef(item.id, mergeCommit, existing);

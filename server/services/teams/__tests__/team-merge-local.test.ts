@@ -734,6 +734,36 @@ describe("local merge", () => {
 		});
 	});
 
+	test("a merge whose own result is a replaced tree is refused before anything is recorded (Devin)", async () => {
+		// x and y start "old"; main makes both "new"; the item restores x, main restores y, so the
+		// clean merge recreates the old tree — which a replacement ref rewrites.
+		await commitFile(repo, "x.txt", "old\n", "x old");
+		const before = await commitFile(repo, "y.txt", "old\n", "y old");
+		const oldTree = await git(["rev-parse", `${before}^{tree}`]);
+		await writeFile(join(repo, "x.txt"), "new\n");
+		await git(["add", "x.txt"]);
+		await commitFile(repo, "y.txt", "new\n", "both new");
+		const a = await readyItem("restore", "x.txt", "old\n");
+		const base = await commitFile(repo, "y.txt", "old\n", "y restored");
+		const merged = (await git(["merge-tree", "--write-tree", base, a.head])).split("\n")[0];
+		expect(merged).toBe(oldTree);
+		await git(["replace", oldTree, await git(["rev-parse", `${a.head}^{tree}`])]);
+		for (const checkedOut of [true, false]) {
+			if (!checkedOut) await git(["checkout", "-q", "--detach"]);
+			merge(a.id);
+			await settleMergeJobs();
+			expect(await git(["rev-parse", "main"])).toBe(base);
+			expect(readMergeOutcome(a.id)).toMatchObject({
+				kind: "failed",
+				code: "TEAM_GIT_REPLACED_HISTORY",
+			});
+			expect(events(a.id, "work.merge_prepared")).toHaveLength(0);
+			expect(events(a.id, "work.merged")).toHaveLength(0);
+			expect(item(a.id)?.state).toBe("ready");
+			expect(await git(["for-each-ref", "refs/narrafork/"])).toBe("");
+		}
+	});
+
 	test("a shallow repository or a graft file is refused: nothing merged, the base untouched (Devin 4)", async () => {
 		for (const altered of ["shallow", "grafts"] as const) {
 			const a = await readyItem(`altered-${altered}`);
