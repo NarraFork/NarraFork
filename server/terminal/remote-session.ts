@@ -9,6 +9,11 @@
  * so nothing is shown twice and a missing range is reported, never skipped.
  * Input carries a `writeId` and is sent in order, so a write retried after a
  * reconnect reaches the shell exactly once.
+ *
+ * Stopping and releasing the executor session is not this runtime's job: the
+ * terminal service does it from durable state (`terminals.executor_session_id`)
+ * once it has persisted what it needs, so neither a restart nor an offline
+ * device can leave a shell orphaned.
  */
 import { SESSION_DURABLE_FEATURE } from "../lib/agent/execution/rpc-types";
 import { eventBus } from "../lib/event-bus";
@@ -26,6 +31,7 @@ import type { TerminalRuntime } from "./runtime";
 export { SESSION_DURABLE_FEATURE };
 
 const DEFAULT_MAX_QUEUED_WRITE_BYTES = 1024 * 1024;
+const DEFAULT_OPEN_TIMEOUT_MS = 15_000;
 
 type SendRpc = (
 	deviceId: string,
@@ -38,6 +44,22 @@ export interface RemoteSessionDependencies {
 	sendRpc?: SendRpc;
 	isDeviceOnline?: (deviceId: string) => boolean;
 	maxQueuedWriteBytes?: number;
+	/** How long an open that lost its reply may wait for the device to reconcile it. */
+	openTimeoutMs?: number;
+}
+
+/**
+ * `session.open` was sent but neither its result nor a confirmation arrived:
+ * the shell may be running on the device. The caller must keep a cleanup
+ * intent for the session instead of forgetting it.
+ */
+export class RemoteSessionOpenUnknownError extends Error {
+	constructor(sessionId: string, cause: string) {
+		super(
+			`Remote terminal session ${sessionId} may have started, but its start was not confirmed: ${cause}`,
+		);
+		this.name = "RemoteSessionOpenUnknownError";
+	}
 }
 
 export interface RemoteSessionOptions {
@@ -46,6 +68,11 @@ export interface RemoteSessionOptions {
 	/** First unseen output byte when resuming (0 for a new session). */
 	since: number;
 	onData: (data: string, streamSeq: number) => void;
+	/**
+	 * Output was lost before `streamSeq`. Called before the visible notice and
+	 * any later output are delivered through onData.
+	 */
+	onGap?: (missingBytes: number, streamSeq: number) => void;
 }
 
 export interface RemoteSessionRuntime extends TerminalRuntime {
@@ -76,48 +103,6 @@ export function utf8IncompleteTail(bytes: Uint8Array): number {
 	return 0;
 }
 
-/**
- * Kills requested while a device was offline, delivered when it reconnects.
- * Without this, killing a terminal whose device is away would orphan its shell.
- */
-const pendingKills = new Map<string, Set<string>>();
-let pendingKillListener: ((event: { deviceId: string; status: string }) => void) | undefined;
-
-function queueKill(deviceId: string, sessionId: string, sendRpc: SendRpc) {
-	let set = pendingKills.get(deviceId);
-	if (!set) {
-		set = new Set();
-		pendingKills.set(deviceId, set);
-	}
-	set.add(sessionId);
-	if (pendingKillListener) return;
-	pendingKillListener = (event) => {
-		if (event.status !== "online") return;
-		const ids = pendingKills.get(event.deviceId);
-		if (!ids) return;
-		pendingKills.delete(event.deviceId);
-		for (const id of ids) {
-			void sendRpc(event.deviceId, "session.kill", { sessionId: id })
-				.then(() => sendRpc(event.deviceId, "session.release", { sessionId: id }))
-				.catch((error) =>
-					logger.warn("Deferred remote session kill failed", {
-						deviceId: event.deviceId,
-						sessionId: id,
-						error: String(error),
-					}),
-				);
-		}
-	};
-	eventBus.on("device:status", pendingKillListener);
-}
-
-/** Test hook: forget deferred kills and their listener. */
-export function resetRemoteSessionStateForTests(): void {
-	pendingKills.clear();
-	if (pendingKillListener) eventBus.off("device:status", pendingKillListener);
-	pendingKillListener = undefined;
-}
-
 export function spawnRemoteSession(
 	deviceId: string,
 	sessionId: string,
@@ -127,6 +112,7 @@ export function spawnRemoteSession(
 	const sendRpc = deps.sendRpc ?? defaultSendRpc;
 	const isDeviceOnline = deps.isDeviceOnline ?? defaultIsDeviceOnline;
 	const maxQueuedWriteBytes = deps.maxQueuedWriteBytes ?? DEFAULT_MAX_QUEUED_WRITE_BYTES;
+	const openTimeoutMs = deps.openTimeoutMs ?? DEFAULT_OPEN_TIMEOUT_MS;
 	const rpcOpts = { requiredFeatures: [SESSION_DURABLE_FEATURE] };
 
 	let consumed = opts.since;
@@ -214,6 +200,7 @@ export function spawnRemoteSession(
 			// The partial character before the hole can never be completed.
 			carry = new Uint8Array(0);
 			consumed = gap.to;
+			opts.onGap?.(missing, consumed);
 			opts.onData(
 				`\r\n\x1b[2m[NarraFork: ${missing} bytes of output were not retained by the device]\x1b[0m\r\n`,
 				consumed,
@@ -236,7 +223,7 @@ export function spawnRemoteSession(
 				if (stopped) return;
 				const tail = decoder.decode();
 				if (tail) opts.onData(tail, consumed);
-				void sendRpc(deviceId, "session.release", { sessionId }, rpcOpts).catch(() => {});
+				// Not released here: the owner releases after persisting the final state.
 				finish(typeof result?.exitCode === "number" ? result.exitCode : null);
 				return;
 			} catch (error) {
@@ -310,14 +297,43 @@ export function spawnRemoteSession(
 		}
 	}
 
+	/** Resolves true once the device is online, false after `ms` or when stopped. */
+	function waitOnlineWithin(ms: number): Promise<boolean> {
+		return new Promise<boolean>((resolve) => {
+			const timer = setTimeout(() => resolve(false), ms);
+			void waitUntilOnline().then(() => {
+				clearTimeout(timer);
+				resolve(!stopped && isDeviceOnline(deviceId));
+			});
+		});
+	}
+
+	/**
+	 * A lost reply does not mean the shell did not start. Retry once the device is
+	 * back: "already exists" then proves the earlier open landed and is adopted.
+	 */
+	async function openSession(open: NonNullable<RemoteSessionOptions["open"]>) {
+		const deadline = Date.now() + openTimeoutMs;
+		let sent = false;
+		for (;;) {
+			try {
+				await sendRpc(deviceId, "session.open", { sessionId, kind: "pty", ...open }, rpcOpts);
+				return;
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				if (sent && message.includes("already exists")) return;
+				if (!isConnectionLoss(error)) throw error;
+				sent = true;
+				const remaining = deadline - Date.now();
+				if (remaining <= 0 || !(await waitOnlineWithin(remaining)))
+					throw new RemoteSessionOpenUnknownError(sessionId, message);
+			}
+		}
+	}
+
 	let readyPromise: Promise<void>;
 	if (opts.open) {
-		readyPromise = sendRpc(
-			deviceId,
-			"session.open",
-			{ sessionId, kind: "pty", ...opts.open },
-			rpcOpts,
-		).then(() => {
+		readyPromise = openSession(opts.open).then(() => {
 			void readLoop();
 		});
 		readyPromise.catch((error) =>
@@ -359,16 +375,8 @@ export function spawnRemoteSession(
 			this.detach();
 		},
 		kill() {
-			if (exited) return;
-			if (isDeviceOnline(deviceId)) {
-				void sendRpc(deviceId, "session.kill", { sessionId }, rpcOpts)
-					.then(() => sendRpc(deviceId, "session.release", { sessionId }, rpcOpts))
-					.catch((error) => {
-						if (isConnectionLoss(error)) queueKill(deviceId, sessionId, sendRpc);
-					});
-			} else {
-				queueKill(deviceId, sessionId, sendRpc);
-			}
+			// Stops reading only: the terminal service stops and releases the
+			// executor session from its persisted cleanup intent.
 			finish(-1);
 		},
 		get pid() {

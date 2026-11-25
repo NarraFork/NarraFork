@@ -1195,6 +1195,16 @@ export const narratorToolContinuations = pgTable(
 	],
 );
 
+export const executorSessionCleanups = pgTable(
+	"executor_session_cleanups",
+	{
+		deviceId: text("device_id").notNull(),
+		sessionId: text("session_id").notNull(),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [primaryKey({ columns: [table.deviceId, table.sessionId] })],
+);
+
 export const terminals = pgTable(
 	"terminals",
 	{
@@ -4601,8 +4611,8 @@ export const teamWorkEvents = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 147,
-  "columnCount": 1963,
+  "tableCount": 148,
+  "columnCount": 1966,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -11278,6 +11288,52 @@ export const POSTGRES_SCHEMA_COVERAGE = {
       "foreignKeys": [],
       "uniqueConstraints": [],
       "primaryKeys": []
+    },
+    {
+      "exportName": "executorSessionCleanups",
+      "name": "executor_session_cleanups",
+      "columns": [
+        {
+          "property": "deviceId",
+          "name": "device_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "sessionId",
+          "name": "session_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": [
+        {
+          "columns": [
+            "deviceId",
+            "sessionId"
+          ]
+        }
+      ]
     },
     {
       "exportName": "terminals",

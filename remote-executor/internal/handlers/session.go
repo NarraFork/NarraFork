@@ -132,7 +132,7 @@ func (h *Handlers) SessionKill(params map[string]any) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{}, m.Kill(id)
+	return map[string]any{}, m.Kill(id, boolParam(params, "release"))
 }
 
 func (h *Handlers) SessionInfo(params map[string]any) (any, error) {

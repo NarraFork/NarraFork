@@ -2,10 +2,10 @@ import { afterAll, afterEach, beforeEach, describe, expect, spyOn, test } from "
 import { eq } from "drizzle-orm";
 import { cleanDb } from "../../../tests/setup";
 import { db, sqlite } from "../../db";
-import { terminals } from "../../db/schema";
+import { executorSessionCleanups, terminals } from "../../db/schema";
+import { eventBus } from "../../lib/event-bus";
 import { logger } from "../../lib/logger";
 import { BufferManager } from "../../terminal/buffer-manager";
-import { resetRemoteSessionStateForTests } from "../../terminal/remote-session";
 import type { SendRpcOptions } from "../device-connection-service";
 import * as deviceConnections from "../device-connection-service";
 import * as deviceService from "../device-service";
@@ -14,15 +14,25 @@ import { terminalService } from "../terminal-service";
 const now = "2026-01-01T00:00:00.000Z";
 const calls: { method: string; params: Record<string, unknown>; options?: SendRpcOptions }[] = [];
 
-const sendRpc = spyOn(deviceConnections, "sendRpc").mockImplementation(
-	(_deviceId, method, params, options) => {
-		calls.push({ method, params, options });
-		// attach stays open like a live session; everything else succeeds.
-		if (method === "session.attach") return new Promise(() => {});
-		return Promise.resolve({});
-	},
-);
-const online = spyOn(deviceConnections, "isDeviceOnline").mockReturnValue(true);
+let endAttach: ((result: unknown) => void) | undefined;
+/** Terminal row status at the moment each session.kill was sent. */
+const killSeenStatus: (string | undefined)[] = [];
+const defaultRpc: typeof deviceConnections.sendRpc = (_deviceId, method, params, options) => {
+	calls.push({ method, params, options });
+	// attach stays open like a live session; everything else succeeds.
+	if (method === "session.attach")
+		return new Promise((resolve) => {
+			endAttach = resolve;
+		});
+	if (method === "session.kill") {
+		const id = String(params.sessionId).replace(/^nf-term-/, "");
+		killSeenStatus.push(db.select().from(terminals).where(eq(terminals.id, id)).get()?.status);
+	}
+	return Promise.resolve({});
+};
+const sendRpc = spyOn(deviceConnections, "sendRpc").mockImplementation(defaultRpc);
+let deviceOnline = true;
+const online = spyOn(deviceConnections, "isDeviceOnline").mockImplementation(() => deviceOnline);
 const info = spyOn(logger, "info").mockImplementation(() => {});
 let features = ["pty.ready-stream.v1", "session.durable.v1"];
 const hello = spyOn(deviceConnections, "getConnectedDeviceHello").mockImplementation(
@@ -64,12 +74,24 @@ async function until(cond: () => boolean) {
 
 beforeEach(() => {
 	calls.length = 0;
+	killSeenStatus.length = 0;
+	deviceOnline = true;
+	endAttach = undefined;
 	features = ["pty.ready-stream.v1", "session.durable.v1"];
+	sendRpc.mockImplementation(defaultRpc);
 });
+
+function cleanups() {
+	return db.select().from(executorSessionCleanups).all();
+}
+
+function goOnline(deviceId = "dev-1") {
+	deviceOnline = true;
+	eventBus.emit({ type: "device:status", deviceId, status: "online" });
+}
 
 afterEach(async () => {
 	await terminalService.shutdownAll().catch(() => {});
-	resetRemoteSessionStateForTests();
 	for (const id of ["t-durable", "t-unnumbered", "t-legacy"])
 		await new BufferManager(id).deleteFromDisk();
 	cleanDb(sqlite);
@@ -138,8 +160,68 @@ describe("remote terminals backed by executor sessions", () => {
 		await until(() => calls.some((call) => call.method === "session.kill"));
 		expect(calls.find((call) => call.method === "session.kill")?.params).toEqual({
 			sessionId: "nf-term-t-durable",
+			release: true,
 		});
 		expect(row("t-durable")?.status).toBe("exited");
+		await until(() => cleanups().length === 0);
+	});
+
+	test("a stop requested while the device is away is kept until the device confirms it", async () => {
+		insertTerminal("t-durable", { deviceId: "dev-1", executorSessionId: "nf-term-t-durable" });
+		await terminalService.recoverOnStartup();
+		deviceOnline = false;
+		await terminalService.kill("t-durable");
+		expect(row("t-durable")?.status).toBe("exited");
+		expect(cleanups()).toMatchObject([{ deviceId: "dev-1", sessionId: "nf-term-t-durable" }]);
+		expect(calls.some((call) => call.method === "session.kill")).toBe(false);
+		// Deleting the terminal row (narrator cleanup) must not drop the stop.
+		db.delete(terminals).where(eq(terminals.id, "t-durable")).run();
+		goOnline();
+		await until(() => cleanups().length === 0);
+		expect(calls.find((call) => call.method === "session.kill")?.params).toEqual({
+			sessionId: "nf-term-t-durable",
+			release: true,
+		});
+	});
+
+	test("a pending stop left by a previous process is delivered when the device connects", async () => {
+		db.insert(executorSessionCleanups)
+			.values({ deviceId: "dev-2", sessionId: "nf-term-old", createdAt: now })
+			.run();
+		sendRpc.mockImplementation((_deviceId, method, params, options) => {
+			calls.push({ method, params, options });
+			// The executor restarted meanwhile: the session is gone, which settles it too.
+			return Promise.reject(new Error("session not found"));
+		});
+		goOnline("dev-2");
+		await until(() => cleanups().length === 0);
+		expect(calls.map((call) => call.method)).toEqual(["session.kill"]);
+	});
+
+	test("a stop the device cannot confirm stays pending", async () => {
+		db.insert(executorSessionCleanups)
+			.values({ deviceId: "dev-3", sessionId: "nf-term-x", createdAt: now })
+			.run();
+		sendRpc.mockImplementation((_deviceId, method, params, options) => {
+			calls.push({ method, params, options });
+			return Promise.reject(new deviceConnections.DeviceOfflineError("dev-3"));
+		});
+		goOnline("dev-3");
+		await until(() => calls.length === 1);
+		await Bun.sleep(20);
+		expect(cleanups()).toHaveLength(1);
+	});
+
+	test("an exited shell is released only after its final state is persisted", async () => {
+		insertTerminal("t-durable", { deviceId: "dev-1", executorSessionId: "nf-term-t-durable" });
+		await terminalService.recoverOnStartup();
+		await until(() => endAttach !== undefined);
+		endAttach?.({ exitCode: 7, endSeq: 0 });
+		await until(() => calls.some((call) => call.method === "session.kill"));
+		expect(killSeenStatus).toEqual(["exited"]);
+		expect(row("t-durable")?.exitCode).toBe(7);
+		expect(calls.some((call) => call.method === "session.release")).toBe(false);
+		await until(() => cleanups().length === 0);
 	});
 
 	test("a legacy remote terminal (pty.open) is still marked exited on startup", async () => {
@@ -192,5 +274,29 @@ describe("remote terminals backed by executor sessions", () => {
 				return Promise.resolve({});
 			});
 		}
+	});
+
+	test("an open whose reply was lost is adopted when the device returns", async () => {
+		let opens = 0;
+		sendRpc.mockImplementation((_deviceId, method, params, options) => {
+			calls.push({ method, params, options });
+			if (method === "session.open") {
+				opens++;
+				if (opens === 1) {
+					deviceOnline = false;
+					setTimeout(() => goOnline(), 20);
+					return Promise.reject(new deviceConnections.DeviceOfflineError("dev-1"));
+				}
+				return Promise.reject(new Error("session already exists"));
+			}
+			if (method === "session.attach") return new Promise(() => {});
+			return Promise.resolve({});
+		});
+		const terminal = await terminalService.create({ deviceId: "dev-1" });
+		expect(terminal.status).toBe("running");
+		expect(opens).toBe(2);
+		expect(cleanups()).toEqual([]);
+		await terminalService.kill(terminal.id);
+		await new BufferManager(terminal.id).deleteFromDisk();
 	});
 });

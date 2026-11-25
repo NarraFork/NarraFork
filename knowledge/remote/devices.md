@@ -18,6 +18,8 @@ anchors:
   - remote-executor/internal/handlers/session.go
   - remote-executor/internal/handlers/session_unix.go
   - remote-executor/internal/handlers/session_windows.go
+  - remote-executor/internal/handlers/session_kill_linux.go
+  - remote-executor/internal/handlers/session_kill_other.go
   - remote-executor/internal/transport/session_test.go
   - frontend/components/settings/DevicePathRulesEditor.tsx
   - frontend/components/settings/ExecutorInstallModal.tsx
@@ -84,7 +86,9 @@ verified_at: 8d4bc063
 - 握手：服务端与执行器各出 32 字节 nonce，互相发 HMAC 证明（key 由 tokenHash 派生，transcript 含 role），`device-auth.ts` 与 Go 侧共用格式；握手超时 10s；协议版本 `DEVICE_PROTOCOL_VERSION = 1`。`DeviceScopeError` 的码（`device-service.ts:DeviceScopeErrorCode`）：`DEVICE_SCOPE_FORBIDDEN`（`device-service.ts` 的授权检查：设备是别人私有的，或项目范围不匹配，403）；其余在 `terminal-service.ts` 创建远程终端时抛：`DEVICE_OFFLINE`（设备未连接）、`DEVICE_PTY_UNAVAILABLE`（能力未声明 `pty`）、`DEVICE_PLATFORM_UNSUPPORTED`（Windows 设备暂不支持交互终端）、`DEVICE_EXECUTOR_UPGRADE_REQUIRED`（缺 `pty.ready-stream.v1` 特性）。
 - 可用性有两条轴：项目轴（`scope: global|project`，project 设备要求项目精确匹配）和用户轴（`ownerScope: private|shared`，private 只有创建者可用）（`isDeviceAuthorized`）。设备管理（改名、轮换、吊销）仅限管理员或创建者（`canManageDevice`）；列表接口对非管理员只返回自己注册的设备。
 - RPC 方法集由 `rpc-types.ts:RpcMethod` 定义：`fs.*`、`glob`、`grep`、`exec.*`、`git.*`、`pty.*`、`session.*`、`editor.*`、`transfer.*`。执行器通过握手上报 features，服务端按 `deviceHasFeature` 判断某能力是否可用；只有 `pty.open` 和 `session.attach` 能以长连方式调用（`device-connection-service.ts:LONG_LIVED_RPC_METHODS`，不计超时和短 RPC 并发），单设备长连 RPC 上限 256。
-- 持久会话（特性 `session.durable.v1`，执行器在支持 PTY 且未 `--disable-shell` 时声明，`cmd/narrafork-executor/main.go`）：会话管理器在执行器进程里只有一份，所有连接共用（`handlers.go:ConnectionScoped` 传同一个指针），会话不随请求或连接结束，只在 `session.kill`（杀整个进程组）或执行器退出（`Manager.Shutdown`）时结束。
+- 持久会话（特性 `session.durable.v1`，执行器在支持 PTY 且未 `--disable-shell` 时声明，`cmd/narrafork-executor/main.go`）：会话管理器在执行器进程里只有一份，所有连接共用（`handlers.go:ConnectionScoped` 传同一个指针），会话不随请求或连接结束，只在 `session.kill` 或执行器退出（`Manager.Shutdown`）时结束。
+  - `session.kill` 停止整个 PTY 会话（shell 是会话首进程，会话 ID 即其 pid）：Linux 扫 `/proc/<pid>/stat` 杀掉同一会话里的所有进程，包括交互 shell 为 `cmd &` 作业建的独立进程组（`session_kill_linux.go`）；其他 Unix 先给 shell 进程组发 SIGHUP（交互 shell 会转发给作业），500ms 后 SIGKILL 进程组（`session_kill_other.go`）。自行 `setsid` 的进程已离开终端，不处理。
+  - `session.kill { release: true }`：退出记录下来时就把会话从登记表删掉，已退出的会话立即删掉，不会和单独的 `session.release` 竞争（`manager.go:Kill`）。
   - 输出日志的序号等于字节偏移，每会话保留最近 4 MiB；PTY 读线程只追加，不等待读者；读者落后到被淘汰时收到 `session.gap {from,to}`（`internal/session/journal.go`）。
   - `session.attach { since }` 依次发 `session.gap`（可选）、连续的 `session.data`、`session.exit {exitCode,endSeq}`；`since` 超过末尾报错；取消只脱离。
   - `session.write` 在每会话最近 256 个 `writeId` 内去重；会话总数上限 64，已退出的会话 24 小时后自动释放；进程退出后输出最多再排空 2 秒（`internal/session/manager.go:DefaultLimits`）。

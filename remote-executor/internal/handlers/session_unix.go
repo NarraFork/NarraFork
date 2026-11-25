@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/exec"
 	"sync"
-	"syscall"
 
 	"github.com/creack/pty"
 	"github.com/narrafork/remote-executor/internal/session"
@@ -40,13 +39,18 @@ func (p *ptyProcess) Resize(cols, rows uint16) error {
 	return pty.Setsize(p.ptmx, &pty.Winsize{Cols: cols, Rows: rows})
 }
 
-// Kill stops the whole process group, so jobs started from the shell go too.
+// Kill stops everything the terminal started. An interactive shell with job
+// control puts each job in its own process group, so signalling the shell's
+// group alone would leave `cmd &` jobs running; the whole PTY session (whose
+// id is the shell's pid, since pty.Start makes it a session leader) is stopped.
 func (p *ptyProcess) Kill() error {
 	if p.cmd.Process == nil {
 		return nil
 	}
-	_ = syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL)
-	return p.cmd.Process.Kill()
+	killPtySession(p.cmd.Process.Pid)
+	// Best effort: the session kill usually reaps the shell first.
+	_ = p.cmd.Process.Kill()
+	return nil
 }
 
 func (p *ptyProcess) Wait() int {

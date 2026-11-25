@@ -105,7 +105,7 @@ Go 执行器（远端设备上的常驻服务 / 本地脱离进程）
 | `session.attach` | `sessionId, since` | 流：`session.gap` / `session.data` / `session.exit`；结果 `{exitCode, endSeq}` | 见 §4.3 |
 | `session.write` | `sessionId, dataB64, writeId?` | `{duplicate: bool}` | `writeId` 在每会话最近 256 个内去重 |
 | `session.resize` | `sessionId, cols, rows` | `{}` | |
-| `session.kill` | `sessionId` | `{}` | 显式停止；对已退出会话是空操作 |
+| `session.kill` | `sessionId, release?` | `{}` | 显式停止整个 PTY 会话（含作业控制建的进程组）；`release` 为真时退出一记录就释放，已退出会话立即释放 |
 | `session.info` | `sessionId` | 会话状态 + `firstSeq/endSeq` | |
 | `session.list` | — | 会话摘要数组（有上限） | 重连后对账用 |
 | `session.release` | `sessionId` | `{}` | 已退出会话的日志可以释放 |
@@ -154,7 +154,10 @@ NarraFork 侧对应展示：缺口在终端里显示为一行提示（"有 N 字
 - 新运行时 `server/terminal/remote-session.ts`：设备支持 `session.durable.v1` 时 `terminal-service` 改用它（`session.open` + `session.attach`），不支持时仍走 `runtime-remote.ts` 的 `pty.open`。
 - 会话 ID 固定为 `nf-term-<终端id>`，存进新增的可空列 `terminals.executor_session_id`（SQLite 0264、PG 0081）。
 - **已消费序号不存数据库，而是和缓冲快照存在一起**（`.buf` 的 `streamSeq` 字段）：`BufferManager` 只记录 xterm 已解析的位置，所以快照内容和序号严格对应，重启续读不重复、不遗漏。快照没有这个字段时丢弃快照、从 0 重放。
-- 设备断线时等 `device:status` 上线后 `attach(since)` 续读；输入带 `writeId` 顺序发送；设备离线时的 kill 在设备上线后补发。
+- 设备断线时等 `device:status` 上线后 `attach(since)` 续读；输入带 `writeId` 顺序发送。
+- 停止与释放由持久记录驱动：终端关闭、或 shell 退出且最终状态已落盘之后，写一行 `executor_session_cleanups`，发 `session.kill { release: true }`，执行器确认后才删记录；设备每次上线重试。独立于终端行，删行、重启、离线都不丢。
+- `session.open` 回复丢失时等设备回来重发，"already exists" 即接管；仍不确定则写清理记录。
+- 缺口先通知文本 Watch（缺口前已有输出照常匹配，未匹配的报告"可能错过"），期间后续输出暂存。
 - NarraFork 关闭时只脱离、不杀；启动时 `recoverOnStartup` 恢复这些终端（设备不在线也恢复，等设备上线）。
 
 **本地终端**（第二期）

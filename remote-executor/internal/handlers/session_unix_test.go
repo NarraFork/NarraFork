@@ -144,3 +144,43 @@ func TestSessionOpenGuardsCwdAndKind(t *testing.T) {
 		t.Fatal("missing sessionId must be rejected")
 	}
 }
+
+// An interactive shell with job control gives every `cmd &` job its own process
+// group; stopping the terminal must stop those jobs too, not only the shell's group.
+func TestSessionKillStopsJobControlGroups(t *testing.T) {
+	if _, err := os.Stat("/bin/bash"); err != nil {
+		t.Skip("bash not installed")
+	}
+	h, root := newSessionHandlers(t)
+	childPath := filepath.Join(root, "job.pid")
+	if _, err := h.SessionOpen(map[string]any{
+		"sessionId": "pty-jobs",
+		"cmd":       []any{"/bin/bash", "--norc", "--noprofile", "-i"},
+		"cwd":       root,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.SessionWrite(map[string]any{
+		"sessionId": "pty-jobs",
+		"dataB64":   base64.StdEncoding.EncodeToString([]byte("sleep 300 & echo $! > " + childPath + "\n")),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	child := readPID(t, childPath)
+	shellInfo, err := h.SessionInfo(map[string]any{"sessionId": "pty-jobs"})
+	if err != nil || shellInfo.(session.Info).State != "running" {
+		t.Fatalf("session not running: %v", err)
+	}
+	// The job really is in a different process group than the shell.
+	if pgid, err := syscall.Getpgid(child); err != nil || pgid != child {
+		t.Fatalf("job is not its own process group leader: pgid=%d err=%v", pgid, err)
+	}
+	if _, err := h.SessionKill(map[string]any{"sessionId": "pty-jobs", "release": true}); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, func() bool { return syscall.Kill(child, 0) != nil })
+	waitUntil(t, func() bool {
+		_, err := h.SessionInfo(map[string]any{"sessionId": "pty-jobs"})
+		return err != nil
+	})
+}

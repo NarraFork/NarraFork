@@ -2142,6 +2142,23 @@ export const narratorToolContinuations = sqliteTable(
 );
 
 // === terminals ===
+/**
+ * Executor sessions NarraFork still has to stop and release on a device
+ * (`session.kill { release: true }`): written before a remote terminal's local
+ * close or exit is final, and removed only once the executor confirms (or reports
+ * the session unknown). Independent of the terminal row, so deleting a terminal,
+ * restarting NarraFork or an offline device can never orphan a remote shell.
+ */
+export const executorSessionCleanups = sqliteTable(
+	"executor_session_cleanups",
+	{
+		deviceId: text("device_id").notNull(),
+		sessionId: text("session_id").notNull(),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [primaryKey({ columns: [table.deviceId, table.sessionId] })],
+);
+
 export const terminals = sqliteTable(
 	"terminals",
 	{

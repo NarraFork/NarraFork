@@ -199,11 +199,18 @@ func TestDurableSessionSurvivesDisconnectAndResumesFromSequence(t *testing.T) {
 	if raw, _ := json.Marshal(info.Result); !strings.Contains(string(raw), `"state":"running"`) {
 		t.Fatalf("info = %s", raw)
 	}
-	rpcCall(t, second, "kill", "session.kill", map[string]any{"sessionId": "durable-1"})
-	awaitProcessExit(t, pid, 5*time.Second)
+	// The attach may end (exit frame and result) before the kill's own reply,
+	// so read the attach stream rather than waiting on the kill result first.
+	if err := writeJSON(context.Background(), second, rpc.RequestFrame{
+		Type: "rpc", ID: "kill", Method: "session.kill",
+		Params: map[string]any{"sessionId": "durable-1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
 	readSession(t, second, "attach-2", after, 5*time.Second, func(s *sessionStream) bool {
 		return s.result != nil
 	})
+	awaitProcessExit(t, pid, 5*time.Second)
 	if !after.exited || !after.result.OK {
 		t.Fatalf("attach did not end with the exit: %+v", after.result)
 	}

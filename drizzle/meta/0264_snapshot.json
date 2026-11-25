@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "5e59a365-92c5-457c-8f74-99f51bd9beb0",
+  "id": "ff5b1634-ec71-4355-8961-13c46a6258c2",
   "prevId": "8df2e944-dc76-4ebd-a0d1-3da5b55cbffe",
   "tables": {
     "acl_events": {
@@ -2568,6 +2568,45 @@
         }
       },
       "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    },
+    "executor_session_cleanups": {
+      "name": "executor_session_cleanups",
+      "columns": {
+        "device_id": {
+          "name": "device_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "session_id": {
+          "name": "session_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {
+        "executor_session_cleanups_device_id_session_id_pk": {
+          "columns": [
+            "device_id",
+            "session_id"
+          ],
+          "name": "executor_session_cleanups_device_id_session_id_pk"
+        }
+      },
       "uniqueConstraints": {},
       "checkConstraints": {}
     },

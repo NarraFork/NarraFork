@@ -307,7 +307,7 @@ func TestWriteDedupeResizeKillAndRelease(t *testing.T) {
 	if err := m.Release("s1"); err == nil {
 		t.Fatal("releasing a running session must fail")
 	}
-	if err := m.Kill("s1"); err != nil {
+	if err := m.Kill("s1", false); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, func() bool {
@@ -320,7 +320,7 @@ func TestWriteDedupeResizeKillAndRelease(t *testing.T) {
 	if dup, _ := m.Write("s1", []byte("ls\n"), "w1"); !dup {
 		t.Fatal("an applied writeId stays a duplicate after exit")
 	}
-	if err := m.Kill("s1"); err != nil {
+	if err := m.Kill("s1", false); err != nil {
 		t.Fatal("killing an exited session is a no-op")
 	}
 	if err := m.Release("s1"); err != nil {
@@ -434,4 +434,52 @@ func TestMultipleAttachersProgressIndependently(t *testing.T) {
 	p.emit("two")
 	p.finish(0)
 	waitFor(t, func() bool { return a.data() == "onetwo" && b.data() == "onetwo" })
+}
+
+func TestKillWithReleaseForgetsTheSessionOnceExitIsRecorded(t *testing.T) {
+	m := NewManager(testLimits())
+	p := open(t, m, "running")
+	if err := m.Kill("running", true); err != nil {
+		t.Fatal(err)
+	}
+	// Released only after the exit is recorded, never racing it.
+	waitFor(t, func() bool {
+		_, err := m.Info("running")
+		return errors.Is(err, ErrNotFound)
+	})
+	p.mu.Lock()
+	killed := p.killed
+	p.mu.Unlock()
+	if !killed {
+		t.Fatal("kill with release must still stop the process")
+	}
+
+	done := open(t, m, "exited")
+	done.finish(0)
+	waitFor(t, func() bool {
+		info, _ := m.Info("exited")
+		return info.State == "exited"
+	})
+	if err := m.Kill("exited", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Info("exited"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("an exited session is released at once: %v", err)
+	}
+
+	kept := open(t, m, "kept")
+	if err := m.Kill("kept", false); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		info, _ := m.Info("kept")
+		return info.State == "exited"
+	})
+	if _, err := m.Info("kept"); err != nil {
+		t.Fatalf("kill without release keeps the exited session readable: %v", err)
+	}
+	_ = kept
+	if err := m.Kill("missing", true); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("killing an unknown session err = %v", err)
+	}
 }

@@ -83,10 +83,11 @@ type Session struct {
 	limits    Limits
 	startedAt time.Time
 
-	mu       sync.Mutex
-	exited   bool
-	exitCode int
-	exitedAt time.Time
+	mu            sync.Mutex
+	exited        bool
+	exitCode      int
+	exitedAt      time.Time
+	releaseOnExit bool
 
 	writeMu  sync.Mutex
 	seen     map[string]struct{}
@@ -235,9 +236,13 @@ func (m *Manager) run(s *Session) {
 		s.exited = true
 		s.exitCode = code
 		s.exitedAt = m.now()
+		release := s.releaseOnExit
 		s.mu.Unlock()
 		// Exit facts are visible before attachers observe end of output.
 		s.journal.Close()
+		if release {
+			m.forget(s)
+		}
 	}()
 }
 
@@ -331,16 +336,37 @@ func (m *Manager) Resize(id string, cols, rows uint16) error {
 	return s.proc.Resize(cols, rows)
 }
 
-// Kill stops a session's process. Killing an exited session is a no-op.
-func (m *Manager) Kill(id string) error {
+// Kill stops a session's process. With release, the session is also forgotten
+// as soon as its exit is recorded, so a caller that has already persisted what
+// it needs never races the exit with a separate Release. Killing an exited
+// session is a no-op (and, with release, releases it now).
+func (m *Manager) Kill(id string, release bool) error {
 	s, err := m.get(id)
 	if err != nil {
 		return err
 	}
-	if exited, _, _ := s.exitState(); exited {
+	s.mu.Lock()
+	exited := s.exited
+	if release && !exited {
+		s.releaseOnExit = true
+	}
+	s.mu.Unlock()
+	if exited {
+		if release {
+			m.forget(s)
+		}
 		return nil
 	}
 	return s.proc.Kill()
+}
+
+// forget removes s from the registry if it is still the registered session.
+func (m *Manager) forget(s *Session) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.sessions[s.id] == s {
+		delete(m.sessions, s.id)
+	}
 }
 
 // Release forgets an exited session and its output. A running session must be

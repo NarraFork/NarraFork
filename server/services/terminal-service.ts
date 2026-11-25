@@ -1,12 +1,13 @@
 import { readdir } from "node:fs/promises";
 import { and, eq, isNull } from "drizzle-orm";
 import { db } from "../db";
-import { narrators, terminals } from "../db/schema";
+import { executorSessionCleanups, narrators, terminals } from "../db/schema";
 import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { detectShell } from "../lib/agent/shell";
 import { resetCursorForTerminal } from "../lib/agent/tools/terminal";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
+import { hotOnce } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { envWithAmbientProxy } from "../lib/net/proxy-env";
@@ -19,6 +20,7 @@ import {
 	ProcessSnapshot,
 } from "../terminal/dtach-service";
 import {
+	RemoteSessionOpenUnknownError,
 	SESSION_DURABLE_FEATURE,
 	spawnRemoteSession,
 	terminalSessionId,
@@ -29,7 +31,7 @@ import { spawnPortablePty } from "../terminal/runtime-pty";
 import { REMOTE_PTY_READY_FEATURE, spawnRemotePty } from "../terminal/runtime-remote";
 import { sendToTerminal } from "../websocket/terminal-ws";
 import { withTerminalSlot } from "./agent-resource-caps";
-import { getConnectedDeviceHello, isDeviceOnline } from "./device-connection-service";
+import { getConnectedDeviceHello, isDeviceOnline, sendRpc } from "./device-connection-service";
 import {
 	DeviceScopeError,
 	deviceHasFeature,
@@ -37,6 +39,7 @@ import {
 } from "./device-service";
 import {
 	endWatchesForBuffer,
+	interruptTextWatchesForGap,
 	notifyTerminalOutput,
 	suspendTerminalWatchesForShutdown,
 } from "./terminal-watch-service";
@@ -158,7 +161,7 @@ interface ActiveTerminal {
 	 * Backed by a durable executor session: like dtach, the shell outlives this
 	 * process, so shutdown detaches instead of killing.
 	 */
-	executorSession?: boolean;
+	executorSession?: { deviceId: string; sessionId: string };
 	/** Serializes geometry changes so the emulator resizes before the PTY. */
 	resizeChain?: Promise<void>;
 }
@@ -199,8 +202,111 @@ async function markTerminalExited(
 	});
 }
 
+/**
+ * Output held back while a gap is reported to text watches, so neither the
+ * visible gap notice nor output after the hole can satisfy a pattern that was
+ * being matched against output before it.
+ */
+const heldOutput = new Map<string, Array<[string, number | undefined]>>();
+
+function onGap(id: string, buffer: BufferManager, missingBytes: number) {
+	if (heldOutput.has(id)) return;
+	const held: Array<[string, number | undefined]> = [];
+	heldOutput.set(id, held);
+	void interruptTextWatchesForGap(id, buffer, missingBytes)
+		.catch((error) =>
+			logger.warn("Terminal watch gap handling failed", { terminalId: id, error: String(error) }),
+		)
+		.finally(() => {
+			heldOutput.delete(id);
+			for (const [text, streamSeq] of held) onData(id, buffer, text, streamSeq);
+		});
+}
+
+/**
+ * Durable cleanup of executor sessions. An intent row is written before a
+ * remote terminal's close or exit is final and removed only when the executor
+ * confirms `session.kill { release: true }` (or no longer knows the session),
+ * so a restart, an offline device or a deleted terminal row never orphans a
+ * shell, and the executor's slot is released only after NarraFork persisted
+ * the terminal's final state.
+ */
+async function recordExecutorCleanup(deviceId: string, sessionId: string): Promise<void> {
+	await db
+		.insert(executorSessionCleanups)
+		.values({ deviceId, sessionId, createdAt: new Date().toISOString() })
+		.onConflictDoNothing();
+}
+
+async function runExecutorCleanup(deviceId: string, sessionId: string): Promise<boolean> {
+	if (!isDeviceOnline(deviceId)) return false;
+	try {
+		await sendRpc(
+			deviceId,
+			"session.kill",
+			{ sessionId, release: true },
+			{ requiredFeatures: [SESSION_DURABLE_FEATURE] },
+		);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		// Already gone (released, or the executor restarted): nothing left to stop.
+		if (!message.includes("session not found")) {
+			logger.debug("Executor session cleanup deferred", { deviceId, sessionId, error: message });
+			return false;
+		}
+	}
+	await db
+		.delete(executorSessionCleanups)
+		.where(
+			and(
+				eq(executorSessionCleanups.deviceId, deviceId),
+				eq(executorSessionCleanups.sessionId, sessionId),
+			),
+		);
+	return true;
+}
+
+async function stopExecutorSession(deviceId: string, sessionId: string): Promise<void> {
+	await recordExecutorCleanup(deviceId, sessionId);
+	void runExecutorCleanup(deviceId, sessionId).catch((error) =>
+		logger.warn("Executor session cleanup failed", { deviceId, sessionId, error: String(error) }),
+	);
+}
+
+const CLEANUP_PAGE = 100;
+
+/** Retry every pending cleanup for a device, a bounded page at a time. */
+async function reconcileExecutorCleanups(deviceId: string): Promise<void> {
+	const pending = await db
+		.select({ sessionId: executorSessionCleanups.sessionId })
+		.from(executorSessionCleanups)
+		.where(eq(executorSessionCleanups.deviceId, deviceId))
+		.limit(CLEANUP_PAGE);
+	for (const { sessionId } of pending) {
+		if (!(await runExecutorCleanup(deviceId, sessionId))) return;
+	}
+	if (pending.length === CLEANUP_PAGE) await reconcileExecutorCleanups(deviceId);
+}
+
+if (hotOnce("narrafork:terminal-executor-session-cleanup")) {
+	eventBus.on("device:status", (event) => {
+		if (event.status !== "online") return;
+		void reconcileExecutorCleanups(event.deviceId).catch((error) =>
+			logger.warn("Executor session cleanup reconcile failed", {
+				deviceId: event.deviceId,
+				error: String(error),
+			}),
+		);
+	});
+}
+
 function onData(id: string, buffer: BufferManager, data: string | Uint8Array, streamSeq?: number) {
 	const text = typeof data === "string" ? data : new TextDecoder().decode(data);
+	const held = heldOutput.get(id);
+	if (held) {
+		if (text) held.push([text, streamSeq]);
+		return;
+	}
 	if (text) {
 		buffer.append(text, streamSeq);
 		sendToTerminal(id, { type: "output", terminalId: id, data: text });
@@ -220,6 +326,9 @@ function monitorShellExit(terminalId: string, runtime: TerminalRuntime, narrator
 		activeTerminals.delete(terminalId);
 		runtime.close();
 		await markTerminalExited(terminalId, code ?? 0, narratorId);
+		// Only now, with the final output and exit persisted, may the device forget them.
+		if (active.executorSession)
+			await stopExecutorSession(active.executorSession.deviceId, active.executorSession.sessionId);
 		sendToTerminal(terminalId, { type: "exit", terminalId, code: code ?? 0 });
 		logger.info("Terminal exited", { terminalId, code });
 	});
@@ -256,6 +365,7 @@ async function resumeExecutorSession(
 	const resumed = spawnRemoteSession(deviceId, sessionId, {
 		since,
 		onData: (data, streamSeq) => onData(terminalId, buffer, data, streamSeq),
+		onGap: (missing) => onGap(terminalId, buffer, missing),
 	});
 	runtime = resumed;
 	activeTerminals.set(terminalId, {
@@ -263,7 +373,7 @@ async function resumeExecutorSession(
 		terminalId,
 		buffer,
 		useDtach: false,
-		executorSession: true,
+		executorSession: { deviceId, sessionId },
 	});
 	resetCursorForTerminal(terminalId);
 	monitorShellExit(terminalId, resumed, narratorId);
@@ -606,6 +716,7 @@ async function createTerminal(opts: CreateTerminalOptions) {
 			},
 			since: 0,
 			onData: (data, streamSeq) => onData(id, buffer, data, streamSeq),
+			onGap: (missing) => onGap(id, buffer, missing),
 		});
 	} else if (useRemote && deviceId && remoteShell) {
 		runtime = spawnRemotePty(deviceId, {
@@ -669,6 +780,9 @@ async function createTerminal(opts: CreateTerminalOptions) {
 		} catch (error) {
 			runtime.kill();
 			await buffer.dispose();
+			// The shell may be running on the device without a confirmed start.
+			if (error instanceof RemoteSessionOpenUnknownError && deviceId && executorSessionId)
+				await stopExecutorSession(deviceId, executorSessionId);
 			throw new ValidationError(
 				`Remote terminal failed to start: ${error instanceof Error ? error.message : String(error)}`,
 			);
@@ -680,7 +794,9 @@ async function createTerminal(opts: CreateTerminalOptions) {
 		terminalId: id,
 		buffer,
 		useDtach,
-		...(executorSessionId ? { executorSession: true } : {}),
+		...(executorSessionId && deviceId
+			? { executorSession: { deviceId, sessionId: executorSessionId } }
+			: {}),
 	});
 
 	if (useDtach) {
@@ -775,6 +891,8 @@ export const terminalService = {
 			active.runtime.kill();
 			active.runtime.close();
 			activeTerminals.delete(terminalId);
+		} else if (terminal.executorSessionId) {
+			await createBufferManager(terminalId).deleteFromDisk();
 		} else if (await dtachService.isAvailable()) {
 			// Terminal might be detached (no active entry) but dtach session alive
 			if (await dtachService.isSocketAlive(terminalId)) {
@@ -786,6 +904,9 @@ export const terminalService = {
 		}
 
 		await markTerminalExited(terminalId, -1, terminal.narratorId);
+		// Persisted before returning, so the stop survives an offline device and a restart.
+		if (terminal.deviceId && terminal.executorSessionId)
+			await stopExecutorSession(terminal.deviceId, terminal.executorSessionId);
 
 		sendToTerminal(terminalId, { type: "exit", terminalId, code: -1 });
 		logger.info("Terminal killed", { terminalId });

@@ -1,8 +1,8 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { eventBus } from "../lib/event-bus";
 import { DeviceOfflineError, type SendRpcOptions } from "../services/device-connection-service";
 import {
-	resetRemoteSessionStateForTests,
+	RemoteSessionOpenUnknownError,
 	spawnRemoteSession,
 	terminalSessionId,
 	utf8IncompleteTail,
@@ -35,6 +35,8 @@ function fakeExecutor(retain = 1 << 20) {
 		attachers: new Set<Attacher>(),
 		/** Apply the next write but lose its acknowledgement (connection drops). */
 		loseNextWriteAck: false,
+		/** Start the session but lose the open's reply (connection drops). */
+		loseNextOpenAck: false,
 	};
 	const pump = (a: Attacher) => {
 		if (a.pos < state.firstSeq) {
@@ -91,7 +93,13 @@ function fakeExecutor(retain = 1 << 20) {
 			if (!state.online) return Promise.reject(new DeviceOfflineError(DEVICE));
 			switch (method) {
 				case "session.open":
+					if (state.opened) return Promise.reject(new Error("session already exists"));
 					state.opened = true;
+					if (state.loseNextOpenAck) {
+						state.loseNextOpenAck = false;
+						exec.disconnect();
+						return Promise.reject(new DeviceOfflineError(DEVICE));
+					}
 					return Promise.resolve({ sessionId: params.sessionId });
 				case "session.attach": {
 					if (!state.opened) return Promise.reject(new Error("session not found"));
@@ -153,8 +161,6 @@ function capture() {
 }
 
 const openOpts = { cmd: ["/bin/sh", "-l"], cwd: "/home", env: {}, cols: 80, rows: 24 };
-
-afterEach(() => resetRemoteSessionStateForTests());
 
 describe("utf8IncompleteTail", () => {
 	test("counts only an unfinished trailing sequence", () => {
@@ -221,7 +227,8 @@ describe("spawnRemoteSession", () => {
 		expect(attaches.at(-1)?.params.since).toBe(4);
 		exec.exit(0);
 		expect(await runtime.exited).toBe(0);
-		expect(exec.state.calls.some((c) => c.method === "session.release")).toBe(true);
+		// The terminal service releases only after persisting the final state.
+		expect(exec.state.calls.some((c) => c.method.match(/session\.(release|kill)/))).toBe(false);
 	});
 
 	test("input is ordered and applied once across a lost acknowledgement", async () => {
@@ -302,7 +309,7 @@ describe("spawnRemoteSession", () => {
 		expect(exec.state.calls.some((c) => c.method === "session.kill")).toBe(false);
 	});
 
-	test("killing while the device is away is delivered when it returns", async () => {
+	test("kill stops reading and leaves stopping the session to the terminal service", async () => {
 		const exec = fakeExecutor();
 		const runtime = spawnRemoteSession(
 			DEVICE,
@@ -311,13 +318,65 @@ describe("spawnRemoteSession", () => {
 			exec,
 		);
 		await runtime.ready;
-		exec.disconnect();
 		runtime.kill();
 		expect(await runtime.exited).toBe(-1);
+		await Bun.sleep(20);
 		expect(exec.state.calls.some((c) => c.method === "session.kill")).toBe(false);
+	});
+
+	test("an open whose reply was lost is adopted once the device returns", async () => {
+		const exec = fakeExecutor();
+		exec.state.loseNextOpenAck = true;
+		const out = capture();
+		const runtime = spawnRemoteSession(
+			DEVICE,
+			"s1",
+			{ open: openOpts, since: 0, onData: out.onData },
+			exec,
+		);
+		await until(() => !exec.state.online);
 		exec.reconnect();
-		await until(() => exec.state.calls.some((c) => c.method === "session.kill"));
-		await until(() => exec.state.calls.some((c) => c.method === "session.release"));
+		await runtime.ready;
+		expect(exec.state.calls.filter((c) => c.method === "session.open")).toHaveLength(2);
+		exec.emit("adopted");
+		await until(() => out.text() === "adopted");
+		runtime.detach();
+	});
+
+	test("an open that stays unconfirmed is reported as possibly started", async () => {
+		const exec = fakeExecutor();
+		exec.state.loseNextOpenAck = true;
+		const runtime = spawnRemoteSession(
+			DEVICE,
+			"s1",
+			{ open: openOpts, since: 0, onData: () => {} },
+			{ ...exec, openTimeoutMs: 50 },
+		);
+		await expect(runtime.ready).rejects.toBeInstanceOf(RemoteSessionOpenUnknownError);
+		expect(await runtime.exited).toBeNull();
+	});
+
+	test("a gap is reported before its notice and later output", async () => {
+		const exec = fakeExecutor(4);
+		const events: string[] = [];
+		const runtime = spawnRemoteSession(
+			DEVICE,
+			"s1",
+			{
+				open: openOpts,
+				since: 0,
+				onData: (text) => events.push(`data:${text.includes("not retained") ? "notice" : text}`),
+				onGap: (missing, seq) => events.push(`gap:${missing}@${seq}`),
+			},
+			exec,
+		);
+		await runtime.ready;
+		exec.disconnect();
+		exec.emit("0123456789");
+		exec.reconnect();
+		await until(() => events.includes("data:6789"));
+		expect(events).toEqual(["gap:6@6", "data:notice", "data:6789"]);
+		runtime.detach();
 	});
 
 	test("terminal session ids are stable and valid executor ids", () => {
