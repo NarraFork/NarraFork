@@ -236,6 +236,8 @@ export const TEAM_WORK_EVENT_KINDS = [
 	"work.cleanup",
 	"team.checkin",
 	TEAM_DECISION_EVENT_KIND,
+	/** R: a person sent the item back with a reason (`TEAM_WORK_RETURNED_EVENT_KIND`). */
+	"work.returned",
 ] as const;
 export type TeamWorkEventKind = (typeof TEAM_WORK_EVENT_KINDS)[number];
 
@@ -291,6 +293,11 @@ export interface TeamAgentRef {
 	title: string | null;
 	/** Narrator run status: idle / working / waiting / archived. */
 	status: string;
+	/**
+	 * R: a running worker's newest tool call, in the summary's running list only (at most
+	 * {@link TEAM_RUNNING_AGENTS_LIMIT} probes per summary), so a row's "doing now" stays live.
+	 */
+	activity?: TeamWorkerActivity | null;
 }
 
 /** One card on the board. Never carries the changed paths or other large columns. */
@@ -312,6 +319,8 @@ export interface TeamBoardItem {
 	exclusiveKey: string | null;
 	createdAt: string;
 	updatedAt: string;
+	/** R: what a working or waiting worker did last; absent or null otherwise. */
+	activity?: TeamWorkerActivity | null;
 }
 
 export interface TeamBoardColumnPage {
@@ -359,6 +368,26 @@ export function teamApprovalKind(toolName: string): TeamApprovalKind {
 	return (TEAM_SESSION_DECIDED_TOOLS as Record<string, TeamApprovalKind>)[toolName] ?? "tool";
 }
 
+/** One question answered in place on the team page (`TeamPendingApproval.answerForm`). */
+export interface TeamQuestionForm {
+	/** The answers key the session's own form sends (the question's header), also its title. */
+	header: string;
+	/** The question's full prompt under its title (the normalized `description`), if any. */
+	description: string | null;
+	/** Each option's explanation, in the order of {@link options}; null when it has none. */
+	optionDescriptions: (string | null)[];
+	/**
+	 * The option titles exactly as the session's form sends them (the answer value): never
+	 * shortened here, the page clips only what it displays. At most
+	 * {@link TEAM_QUESTION_OPTIONS_MAX}; a question with more has no in-place form.
+	 */
+	options: string[];
+	multiSelect: boolean;
+}
+
+/** Options of an in-place question the approvals list carries. */
+export const TEAM_QUESTION_OPTIONS_MAX = 6;
+
 /** A tool call of the team tree waiting for a person. */
 export interface TeamPendingApproval {
 	/** The permission request id (the tool call id) the approve / deny routes take. */
@@ -366,6 +395,8 @@ export interface TeamPendingApproval {
 	agent: TeamAgentRef;
 	/** 0 = the coordinator, 1 = a worker, 2 = a worker's helper. */
 	depth: number;
+	/** R: the session's parent (a helper's worker), to tie the call to a work item. */
+	parentId?: string | null;
 	toolName: string;
 	/** "tool": approve / deny here; anything else is answered in the session (open it). */
 	kind: TeamApprovalKind;
@@ -373,6 +404,12 @@ export interface TeamPendingApproval {
 	preview: string;
 	/** For a question: the questions asked (at most three, each clipped). */
 	questions: string[];
+	/**
+	 * R: a call asking exactly one question, read whole from its input's bounded prefix: the
+	 * answer key (its header) and its options, so it can be answered in place. Absent otherwise
+	 * (several questions, or an input too long to read here: its session has the full form).
+	 */
+	answerForm?: TeamQuestionForm | null;
 	decisionReason: string | null;
 	createdAt: string;
 }
@@ -393,11 +430,6 @@ export interface TeamApprovalsResponse {
 	 * reflections came first): there may be visible ones it did not reach.
 	 */
 	unscanned: boolean;
-	/**
-	 * M1: the latest decisions people took on the tree's calls (approved, denied, answered),
-	 * newest first, at most {@link TEAM_RECENT_DECISIONS_LIMIT}.
-	 */
-	recent: TeamRecentDecision[];
 }
 
 /** The team page's top bar; small and cheap so the page can poll it. */
@@ -416,7 +448,19 @@ export interface TeamPageSummary {
 	/** The newest team event: the page refetches the board and activity when it changes. */
 	lastEventId: string | null;
 	lastEventAt: string | null;
+	/** R: messages in the coordinator's conversation (0: nobody has spoken to it yet). */
+	coordinatorMessageCount?: number;
+	/** R: how the coordinator's last turn ended (`user_interrupt`: a person stopped it). */
+	coordinatorStopReason?: string | null;
+	/**
+	 * R: finished (merged / cancelled) items still holding a worktree, counted up to
+	 * {@link TEAM_HELD_WORKTREES_LIMIT} + 1: the team cannot be disbanded until they are cleaned.
+	 */
+	heldWorktreeCount?: number;
 }
+
+/** Finished items holding a worktree the summary counts (one more means "more"). */
+export const TEAM_HELD_WORKTREES_LIMIT = 50;
 
 // ── X: who is changing what across teams, exclusive paths ────────────────────
 
@@ -601,22 +645,114 @@ export const TEAM_PERSON_DECISION_EVENT_KINDS = [
 ] as const;
 export type TeamPersonDecisionEventKind = (typeof TEAM_PERSON_DECISION_EVENT_KINDS)[number];
 
-/** Most recent decisions the approvals drawer lists. */
-export const TEAM_RECENT_DECISIONS_LIMIT = 10;
+// ── R: the team page redesign (work list, drawer, return with a reason) ─────────────────────
 
-/** A decision a person took on a call of the team tree, for the approvals drawer. */
-export interface TeamRecentDecision {
-	/** The team event id. */
-	id: string;
-	kind: TeamPersonDecisionEventKind;
-	/** The person who decided, and their username when still known. */
-	actorId: string | null;
-	actorName: string | null;
+/**
+ * What a running worker did last, for its row's second line: the newest tool call of its
+ * session (name and a short preview of its input). Only for items whose worker is working or
+ * waiting; the board reads it with one indexed probe per such row.
+ */
+export interface TeamWorkerActivity {
 	toolName: string;
-	approvalKind: TeamApprovalKind;
-	/** The session the call belonged to, and its level (0 coordinator, 1 worker, 2 helper). */
-	agentId: string | null;
-	agentTitle: string | null;
-	depth: number;
-	createdAt: string;
+	/** At most {@link TEAM_ACTIVITY_PREVIEW_CHARS} characters. */
+	preview: string;
+	at: string;
+}
+
+/** Characters of a worker's newest tool input a row shows. */
+export const TEAM_ACTIVITY_PREVIEW_CHARS = 120;
+
+/** A branch's size against its merge base: lines added and removed, files changed. */
+export interface TeamWorkDiffStat {
+	added: number;
+	removed: number;
+	files: number;
+	/** Files git counts as binary (no line counts). */
+	binaryFiles: number;
+	/** The listing was over its byte cap: the counts cover what was read. */
+	truncated: boolean;
+}
+
+/** Most work items `GET …/work-stats` takes in one request. */
+export const TEAM_WORK_STATS_IDS_MAX = 50;
+
+/** `GET …/teams/:teamId/work-stats?ids=…`: null for an item whose size is not known. */
+export interface TeamWorkStatsResponse {
+	stats: Record<string, TeamWorkDiffStat | null>;
+}
+
+/** One file a work item's branch changed; null line counts for a binary file. */
+export interface TeamWorkFileChange {
+	path: string;
+	added: number | null;
+	removed: number | null;
+}
+
+/** Most changed files the drawer lists. */
+export const TEAM_WORK_FILES_LIMIT = 300;
+/** Most events of one work item the drawer reads (its timeline and review rounds). */
+export const TEAM_WORK_EVENTS_LIMIT = 100;
+/** Bytes of one file's diff the drawer shows; past it the text is cut off. */
+export const TEAM_WORK_DIFF_MAX_BYTES = 64 * 1024;
+
+/**
+ * Event of a person sending a work item back to its worker with a reason (from in review or
+ * ready to in progress). Counted as a review round with a blocker verdict, so the item needs a
+ * new clear review before it can be ready again.
+ */
+export const TEAM_WORK_RETURNED_EVENT_KIND = "work.returned";
+/** States a person may return an item from. */
+export const TEAM_RETURNABLE_STATES: readonly TeamWorkItemState[] = ["in_review", "ready"];
+/** Characters of a return reason. */
+export const TEAM_RETURN_REASON_MAX_LENGTH = 2000;
+
+/** One review round of a work item, from its events (an agent's review or a person's return). */
+export interface TeamWorkReviewRound {
+	eventId: string;
+	round: number;
+	/** The person's user id, or the agent's session id (the coordinator for agents' rounds). */
+	actorId: string | null;
+	verdict: TeamReviewVerdict;
+	findings: number | null;
+	/** `person`: returned by a person, with their reason. */
+	by: "agent" | "person" | "system";
+	actorName: string | null;
+	reason: string | null;
+	at: string;
+}
+
+/** `GET …/teams/:teamId/work/:itemId`: everything the work item drawer shows but the diff text. */
+export interface TeamWorkItemDetail {
+	item: TeamBoardItem;
+	/** The base branch the item merges into. */
+	base: string;
+	/** Commits on the branch not in the base; null when git could not tell. */
+	aheadBy: number | null;
+	stat: TeamWorkDiffStat | null;
+	/** At most {@link TEAM_WORK_FILES_LIMIT}, in git's order. */
+	files: TeamWorkFileChange[];
+	filesMore: boolean;
+	/** A file's diff can be read (`…/work/:itemId/diff?path=`). */
+	diffAvailable: boolean;
+	/** Oldest first. */
+	reviews: TeamWorkReviewRound[];
+	/** The item's own events, oldest first, at most {@link TEAM_WORK_EVENTS_LIMIT} (the newest). */
+	events: TeamActivityEvent[];
+	eventsMore: boolean;
+	/** The caller may return it now (member, active team, a returnable state). */
+	canReturn: boolean;
+}
+
+/** `GET …/teams/:teamId/work/:itemId/diff?path=`: one file's diff, cut at the byte cap. */
+export interface TeamWorkFileDiff {
+	path: string;
+	text: string;
+	truncated: boolean;
+}
+
+/** `POST …/teams/:teamId/work/:itemId/return`. */
+export interface TeamWorkReturnResponse {
+	item: TeamBoardItem;
+	/** Whether the note reached the coordinator (it relays the reason to the worker). */
+	delivered: boolean;
 }

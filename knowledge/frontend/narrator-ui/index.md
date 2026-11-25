@@ -16,7 +16,7 @@ anchors:
   - frontend/components/narrator/knowledge/
   - frontend/components/narrator/mock/
 status: draft
-verified_at: 8d618cddc
+verified_at: 7d5423c07
 keywords:
   - NarratorPanel
   - useNarratorPanelWS
@@ -43,7 +43,7 @@ keywords:
   - 权限与提问：内联在消息列表里的 `permission/`、`question/`（见[工具卡片](tool-cards.md)）。
   - 侧面板：详情、Spec、文件面板等同样 `lazy()` 加载；`REMOTE_BUILD` 下被替换为 `RemoteUnsupported`（`remote-ui-panels.tsx`、`remote-ui-contexts.tsx` 提供构建别名），不加载这些模块（见[文件面板](file-panels.md)、[会话外框](session-chrome.md)）。
 - 同一个叙述者可以出现在 dock（桌面）、工作区预览、抽屉（手机/分离窗口）等不同宿主，面板通过 `NarratorDockContext` 等上下文与兄弟面板协作，无 Provider 时回退为旧的 prop 回调。
-- 头部标题后：团队协调者会话显示「团队」标记（`header/NarratorTeamBadge.tsx`，见[会话外框](session-chrome.md)）。是否显示由 `NarratorPanel` 用 `useNarratorTeamBadge` 决定（远程访问构建与工作区预览里不显示），宽度经 `titleBadgeWidth` 计入头部布局，窄到放不下时由 `headerLayout.showTitleBadge` 隐藏；底部输入区按叙述者写权限变成只读提示（见[输入框与交互](composer.md)）。列表卡片 `list/NarratorListCard.tsx` 的「跟随默认（模型）」经 `followDefaultLabel`。
+- 头部标题后：团队协调者会话显示「团队」标记（`header/NarratorTeamBadge.tsx`，见[会话外框](session-chrome.md)）。是否显示由 `NarratorPanel` 用 `useNarratorTeamBadge` 决定（远程访问构建与工作区预览里不显示），宽度经 `titleBadgeWidth` 计入头部布局，窄到放不下时由 `headerLayout.showTitleBadge` 隐藏；底部输入区按叙述者写权限变成只读提示（文字可由 `readOnlyNotice` 换掉，见[输入框与交互](composer.md)）。列表卡片 `list/NarratorListCard.tsx` 的「跟随默认（模型）」经 `followDefaultLabel`。
 
 ## 本节点直接覆盖的部分
 - `narrator-panel-types.ts`：面板对外属性与快照类型；`narrator-panel-overrides.ts`：每叙述者设置的三态（跟随默认 `inherit` / 开 / 关）归一化，未知的存储值回落为“跟随默认”而不是当成显式覆盖；`narrator-panel-visibility.tsx`：嵌套的面板可见性上下文（父级与自身都可见才算可见）。

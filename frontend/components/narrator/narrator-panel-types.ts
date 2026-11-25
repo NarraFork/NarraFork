@@ -205,6 +205,11 @@ export interface NarratorPanelProps {
 	specPanelOpen?: boolean;
 	/** Toggle the spec panel (desktop sidebar mode) */
 	onToggleSpecPanel?: () => void;
+	/**
+	 * What a read-only viewer sees in place of the composer; omitted keeps the session's own
+	 * notice. The team page says 「你是只读成员」 here.
+	 */
+	readOnlyNotice?: string;
 }
 
 export const MAX_IMAGE_SIZE = 20 * 1024 * 1024; // 20MB
