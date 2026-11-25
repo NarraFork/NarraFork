@@ -89,6 +89,20 @@ describe("automatic scheduled-task dispatch", () => {
 		expect(row("moved")).toEqual({ nextRunAt: FUTURE, lastStatus: null });
 	});
 
+	test("a prompt-only edit read before the claim does not restore the old due time", async () => {
+		seedTask("edited");
+		const stale = await scheduledTaskService.get("edited");
+		await scheduledTaskService.runTask("edited");
+		const rearmed = row("edited").nextRunAt;
+		expect(rearmed !== null && rearmed > new Date().toISOString()).toBe(true);
+		// The edit's Worker read returned before the claim committed.
+		spyOn(scheduledTaskService, "get").mockResolvedValueOnce(stale);
+		await scheduledTaskService.update("edited", { prompt: "new prompt" });
+		expect(row("edited").nextRunAt).toBe(rearmed);
+		expect(await scheduledTaskService.listDue()).toEqual([]);
+		expect(launched).toEqual(["edited"]);
+	});
+
 	test("a manual run still launches a disabled task and leaves its schedule alone", async () => {
 		seedTask("manual", { enabled: false, nextRunAt: null });
 		await scheduledTaskService.runTask("manual", { manual: true });

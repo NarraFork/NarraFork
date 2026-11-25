@@ -202,13 +202,13 @@ export const scheduledTaskService = {
 		const timezone = input.timezone !== undefined ? input.timezone : existing.timezone;
 		const enabled = input.enabled ?? existing.enabled;
 
-		// Recompute nextRunAt whenever schedule or enabled state changes.
+		// Recompute nextRunAt whenever schedule or enabled state changes. Otherwise it is left
+		// out of the patch: `existing` came from a Worker read, and writing it back could undo a
+		// run's claim that re-armed the schedule in between.
 		let nextRunAt = existing.nextRunAt;
-		if (
-			input.cronExpr !== undefined ||
-			input.timezone !== undefined ||
-			input.enabled !== undefined
-		) {
+		const scheduleChanged =
+			input.cronExpr !== undefined || input.timezone !== undefined || input.enabled !== undefined;
+		if (scheduleChanged) {
 			if (!enabled) {
 				nextRunAt = null;
 			} else {
@@ -233,7 +233,7 @@ export const scheduledTaskService = {
 			...(input.narratorMode !== undefined && { narratorMode: input.narratorMode }),
 			...(input.cleanupPolicy !== undefined && { cleanupPolicy: input.cleanupPolicy }),
 			...(input.enabled !== undefined && { enabled: input.enabled }),
-			nextRunAt,
+			...(scheduleChanged && { nextRunAt }),
 			updatedAt: now(),
 		};
 		await db.update(scheduledTasks).set(patch).where(eq(scheduledTasks.id, id));
