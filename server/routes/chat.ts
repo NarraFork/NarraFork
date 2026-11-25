@@ -86,6 +86,7 @@ chatRoutes.get("/rooms/bot/:narratorId", async (c) => {
 chatRoutes.get("/rooms/:roomId/messages", async (c) => {
 	const parsed = chatMessagesQuerySchema.safeParse({
 		beforeSeq: c.req.query("beforeSeq"),
+		afterSeq: c.req.query("afterSeq"),
 		limit: c.req.query("limit"),
 	});
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
@@ -95,7 +96,9 @@ chatRoutes.get("/rooms/:roomId/messages", async (c) => {
 			roomId: c.req.param("roomId"),
 			userId,
 			beforeSeq: parsed.data.beforeSeq,
+			afterSeq: parsed.data.afterSeq,
 			limit: parsed.data.limit,
+			signal: c.req.raw.signal,
 		}),
 	);
 });

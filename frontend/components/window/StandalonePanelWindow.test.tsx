@@ -6,12 +6,16 @@ import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider } from "react-i18next";
+import { appearanceStore } from "../../lib/appearance-preference-store";
 import type { NarratorPanelProps } from "../narrator/narrator-panel-types";
 import type { PluginUiSessionContext } from "../plugins/PluginUiSurfaceContext";
 import { RuntimeContext, type RuntimeContextValue } from "../plugins/plugin-ui-runtime-context";
 import type { PluginDockPanelParams } from "../plugins/protocol";
 import type { PanelWindowDescriptor } from "./panel-window";
 
+const fixtureUser = "standalone-panel-fixture-user";
+const fixtureToken = "standalone-panel-fixture-token";
+const preferencesKey = ["user-preferences", "ui", fixtureUser, fixtureToken] as const;
 const i18n = i18next.createInstance();
 await i18n.init({ lng: "en", resources: { en: { plugins: {} } }, initImmediate: false });
 const navigate = mock(() => {});
@@ -119,7 +123,13 @@ beforeEach(() => {
 		close,
 		matchMedia: () => ({ matches: false, addEventListener() {}, removeEventListener() {} }),
 	});
+	const storage = new Map([["narrafork_token", fixtureToken]]);
 	for (const [key, value] of Object.entries({
+		localStorage: {
+			getItem: (key: string) => storage.get(key) ?? null,
+			setItem: (key: string, value: string) => storage.set(key, value),
+			removeItem: (key: string) => storage.delete(key),
+		},
 		window,
 		document: window.document,
 		navigator: window.navigator,
@@ -134,7 +144,9 @@ beforeEach(() => {
 	recent.mockClear();
 	sessions.length = 0;
 	delegate = undefined;
+	appearanceStore.activate(null, true);
 	client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
+	client.setQueryData(["auth", "me"], { id: fixtureUser });
 	client.setQueryData(["narrators", "n1"], {
 		id: "n1",
 		title: "Narrator",
@@ -146,7 +158,7 @@ beforeEach(() => {
 		parentNarratorId: "n1",
 		traits: [],
 	});
-	client.setQueryData(["user-preferences"], { addSubagentToRecentTabs: true });
+	client.setQueryData(preferencesKey, { addSubagentToRecentTabs: true });
 	container = document.body.appendChild(document.createElement("div"));
 	root = createRoot(container);
 });
@@ -154,6 +166,7 @@ beforeEach(() => {
 afterEach(async () => {
 	await act(async () => root.unmount());
 	client.clear();
+	appearanceStore.activate(null, true);
 	for (const [key, descriptor] of originals) {
 		if (descriptor) Object.defineProperty(globalThis, key, descriptor);
 		else Reflect.deleteProperty(globalThis, key);

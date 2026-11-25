@@ -50,7 +50,7 @@ keywords:
   - ThemeSwitcher
   - colorScheme
 status: draft
-verified_at: 69715f280
+verified_at: 4d59774711a51a9ac966794090c8b3a04d549048
 ---
 # 通用组件与主题
 

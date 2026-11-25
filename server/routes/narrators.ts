@@ -135,6 +135,7 @@ import {
 	validateUploadedMedia,
 } from "../lib/media-uploads";
 import { readMessageLanguagePreferences } from "../lib/message-language-read";
+import { buildRuntimeModelSummary } from "../lib/model-runtime";
 import {
 	getAuthorizedNarrator,
 	narratorPrincipalOf,
@@ -341,6 +342,7 @@ import {
 	getHumanAttentionForPrincipal,
 	listHumanAttentionForPrincipal,
 } from "../services/human-attention-service";
+import { listNamedNarratorSuggestions } from "../services/named-narrator-suggestions";
 import {
 	canWriteNarrator,
 	filterReadableNarrators,
@@ -517,6 +519,7 @@ import {
 } from "../services/narrator-surface-reads";
 import { generateTitle, persistTitle } from "../services/narrator-title";
 import { readCommittedToolDetail } from "../services/narrator-tool-detail";
+import { getNarratorUiSummary } from "../services/narrator-ui-summary";
 import { permissionRuleService } from "../services/permission-rule-service";
 import { usableProjectDir } from "../services/project-dir";
 import {
@@ -1082,6 +1085,14 @@ function narratorSubPath(requestPath: string, id: string): string {
 	}
 	return requestPath.slice(at + marker.length);
 }
+
+// This handler owns the same read ACL using only NARRATOR_ACL_COLUMNS. Register it
+// before the generic gate, whose full narrator snapshot is unnecessary for badges.
+narratorRoutes.get("/:id/ui-summary", async (c) => {
+	return c.json(
+		await getNarratorUiSummary(c.req.param("id"), narratorPrincipalOf(c), c.req.raw.signal),
+	);
+});
 
 narratorRoutes.use("/:id/*", async (c, next) => {
 	const id = c.req.param("id");
@@ -2086,6 +2097,16 @@ narratorRoutes.get("/by-handle/:handle", async (c) => {
 
 // List all named narrators (handle-based @mention targets).
 narratorRoutes.get("/named", async (c) => {
+	if (c.req.query("view") === "suggestions") {
+		return c.json(
+			await listNamedNarratorSuggestions(narratorPrincipalOf(c), {
+				q: c.req.query("q"),
+				limit: c.req.query("limit"),
+				cursor: c.req.query("cursor"),
+				signal: c.req.raw.signal,
+			}),
+		);
+	}
 	// Bounded set (named narrators are deliberately few), so filtering in memory is
 	// fine here; the paginated list endpoint pushes the same predicate into SQL.
 	const named = await filterReadableNarrators(
@@ -2219,10 +2240,16 @@ narratorRoutes.get("/:id", async (c) => {
 		navigationSummary,
 		messageCount,
 		...(modelInheritance && { modelInheritance }),
+		modelSummary: buildRuntimeModelSummary({
+			selection: narrator.model?.trim() || FOLLOW_DEFAULT_MODEL,
+			inheritance: modelInheritance,
+			observation: runtimeModel,
+		}),
 		...(runtimeModel && {
 			runtimeModel: {
 				provider: runtimeModel.provider,
 				model: runtimeModel.model,
+				concreteValue: runtimeModel.concreteValue,
 				resolvedAt: runtimeModel.resolvedAt,
 			},
 		}),

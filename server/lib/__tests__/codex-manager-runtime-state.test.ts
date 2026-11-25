@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -77,6 +77,64 @@ function mockUsage(usedPercent: number) {
 }
 
 describe("CodexManager runtime state", () => {
+	test("configured presence excludes manual/banned/archive but retains system blocks", () => {
+		for (const [extra, blocked, configured] of [
+			[{}, undefined, true],
+			[{}, { reason: "quota_exhausted", resetsAt: Date.now() - 1000 }, true],
+			[{}, { reason: "too_many_failures" }, true],
+			[{ disabled: true, disabledReason: "manual" }, undefined, false],
+			[{ disabled: true, disabledReason: "banned" }, undefined, false],
+			[{ disabled: true }, undefined, false],
+			[{ archivedAt: Date.now() }, undefined, false],
+			[
+				{ archivedAt: Date.now() },
+				{ reason: "quota_exhausted", resetsAt: Date.now() - 1000 },
+				false,
+			],
+		] as const) {
+			const { home } = setupHome(
+				[credential("a", extra)],
+				blocked ? { state: { a: { blocked } } } : {},
+			);
+			expect(open(home).hasConfiguredCredentials).toBe(configured);
+		}
+		expect(open(setupHome([]).home).hasConfiguredCredentials).toBe(false);
+	});
+
+	test("configured presence reads never revive, route, fetch, or persist real quota state", async () => {
+		const { home, paths } = setupHome([credential("a")]);
+		const manager = open(home);
+		mockUsage(100);
+		await manager.getUsage("a");
+		expect(manager.availableCount).toBe(0);
+		manager.dispose(); // Flush the real usage mutation before observing readonly reads.
+		const beforeCredentials = readFileSync(paths.credentials, "utf8");
+		const beforeState = readFileSync(paths.state, "utf8");
+		const effects = manager as unknown as {
+			saveState(id: string): void;
+			saveCredentials(): void;
+			reviveQuotaResetCredentials(): void;
+			applyCachedQuotaStates(): void;
+		};
+		const spies = [
+			spyOn(effects, "saveState"),
+			spyOn(effects, "saveCredentials"),
+			spyOn(effects, "reviveQuotaResetCredentials"),
+			spyOn(effects, "applyCachedQuotaStates"),
+			spyOn(manager, "snapshot"),
+			spyOn(manager, "getUsage"),
+			spyOn(manager, "acquireContext"),
+		];
+		try {
+			for (let i = 0; i < 100; i++) expect(manager.hasConfiguredCredentials).toBe(true);
+			for (const spy of spies) expect(spy).not.toHaveBeenCalled();
+			expect(readFileSync(paths.credentials, "utf8")).toBe(beforeCredentials);
+			expect(readFileSync(paths.state, "utf8")).toBe(beforeState);
+			expect(manager.availableCount).toBe(0);
+		} finally {
+			for (const spy of spies) spy.mockRestore();
+		}
+	});
 	test("usage refreshes and request outcomes go to credential-state.json, not the credential file", async () => {
 		const { home, paths } = setupHome([credential("a")]);
 		const manager = open(home);

@@ -23,7 +23,7 @@ keywords:
   - stopHooks
   - 钩子
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 ---
 # 钩子
 

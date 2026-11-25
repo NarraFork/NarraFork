@@ -12,6 +12,8 @@ import {
 	parseCommandCodeModels,
 } from "./commandcode-protocol";
 import { readResponseJsonLimited } from "./commandcode-usage";
+import { captureModelOptionsArray, optionInput } from "./model-options-contract";
+import type { SourceGroupView } from "./sourcing/source-groups";
 
 const CACHE_TTL_MS = 10 * 60 * 1000;
 const NEGATIVE_TTL_MS = 30 * 1000;
@@ -30,6 +32,24 @@ interface ModelCache {
 let cache: ModelCache | undefined;
 let generation = 0;
 let inflight: { key: string; task: Promise<void> } | undefined;
+let publicationGeneration = 0;
+/** Read only the owner cache; options must not trigger stale-while-revalidate network work. */
+export function captureCommandCodeModelOptions(
+	group: SourceGroupView,
+	apiKey?: string,
+	baseUrl?: string,
+) {
+	const credential = resolveCommandCodeToken(apiKey).credential;
+	const pinned =
+		credential && cache && sameSlot(cache, credential.token, commandCodeProviderBase(baseUrl))
+			? cache.models
+			: undefined;
+	return captureModelOptionsArray(
+		pinned,
+		(model) => optionInput(group, model.id),
+		publicationGeneration,
+	);
+}
 
 export interface CommandCodeModelSnapshot {
 	models: string[];
@@ -53,6 +73,7 @@ function fresh(entry: ModelCache): boolean {
 /** 丢弃缓存，让下一次拉取重新向上游请求（设置页的「刷新模型」）。 */
 export function invalidateCommandCodeModelsCache(): void {
 	generation += 1;
+	publicationGeneration++;
 	cache = undefined;
 	inflight = undefined;
 }
@@ -119,6 +140,7 @@ async function fetchCommandCodeModels(token: string, base: string, gen: number):
 		}
 		const models = parseCommandCodeModels(await readResponseJsonLimited(response, MAX_BODY_BYTES));
 		if (gen !== generation) return;
+		publicationGeneration++;
 		cache = { models, fetchedAt: Date.now(), token, base, negative: false };
 	} catch {
 		if (gen !== generation) return;
@@ -127,6 +149,7 @@ async function fetchCommandCodeModels(token: string, base: string, gen: number):
 }
 
 function rememberFailure(token: string, base: string, previous: CommandCodeModelInfo[]): void {
+	publicationGeneration++;
 	cache = {
 		models: previous,
 		fetchedAt: Date.now(),

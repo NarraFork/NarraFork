@@ -50,7 +50,7 @@ keywords:
   - terminal watch
   - [watch]
 status: draft
-verified_at: 001ccbf7d
+verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 ---
 # 命令与终端工具
 
@@ -65,6 +65,7 @@ verified_at: 001ccbf7d
 - Watch：对 terminal / 后台 bash / agent 注册非阻塞观察，立即返回句柄；匹配文本、完成或超时通过邮箱送达。默认超时 600000ms，最大 86,400,000ms（`watch-observation.ts`）。超时只结束观察，不停止目标；已结束的目标立即返回保存的结果；agent 观察不支持 `pattern`；`start_at` 只用于 terminal。
 - Stop：只取消本叙述者拥有的后台 bash 或 agent，不能停服务器或任意 PID；取消前重新校验 OAuth 工具能力。
 - 后台任务服务（`background-task-service.ts`，很大）：后台 Bash、Watch 观察行和子代理共用 `background_tasks` 表，`BackgroundTaskEffectiveStatus` 还会按叙述者状态派生 `continued` / `child_running`；任务列表是游标分页加增量推送（默认页 30、上限 50，首页进行中任务按「工作」与「服务」各最多 200 条并带 `activeTruncated`，列表行的 `output` 有字符上限），不再整表轮询（`shared/background-task-list.ts`）。占用索引只读小列、不含消息/输出/标题（`background-occupancy-index.ts`、`-store.ts`），启动时初始化且关停中的进程不被辅助恢复拖住（`background-occupancy-startup.ts`）。
+- 占用通知分两层（`background-occupancy-store.ts:OccupancyNotification`）：`affectedParentIds` 保留本批次及旧/新祖先的宽影响范围；任务列表只消费 `listChangedParentIds`，比较工作/服务/总活跃计数、直接任务/legacy 行成员和有限展示字段（含 runtime 存活、子任务计数与错误标记），不把所有叙述者状态变化都当列表失效。列表所有者自身 `working ↔ waiting` 不变更其列表；作为直接 agent 行的子会话状态变化仍会通知其父。冷历史行无法证明旧值相等时保守通知；维护读取失败保留变更前基线与未知行标记，成功重放后才发布并清理（`background-occupancy-index.ts:listSnapshot`、`changedOccupancyListParents`）。
 - 后台 Bash 结果：输出超过 5120 字节溢出到磁盘、预览 1024 字节、采集上限 10MB，写盘超时 2s（`background-bash-result.ts`）；后台 agent 完成通知只是显示格式与调度提示，持久意图在结果事务里，由 `agent-runtime/publication.ts` 转入唯一邮箱（`bg-completion-queue.ts`）。
 - 用户手动起的后台命令（`manual-background-task.ts`）：代理环境变量只转发主机后缀和全局通配规则，不把精确的正则/URL/端口豁免放宽成更宽的主机名豁免；经 `resolveBackend` 选后端，并受最终更新的互斥控制。
 - Stop 的授权以被跟踪的任务为准，而不是入参里的 `device` 或会话目录：先解别名，任务必须存在、属于本叙述者、类型相符（`stop-task-policy.ts:resolveOwnedStopTask`）。

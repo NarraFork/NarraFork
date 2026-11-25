@@ -10,6 +10,7 @@ import type { NarratorListWSEvent } from "./useNarratorWS";
 export const RECENT_TABS_LIST_EVENT_TYPES = [
 	"status_change",
 	"substatus_change",
+	"status_notification",
 	"narrator:status_changed",
 	"title_updated",
 	"narrator:title_updated",
@@ -24,10 +25,71 @@ export const RECENT_TABS_LIST_EVENT_TYPES = [
 ] as const;
 
 type RecentTabsWSUpdate = (narratorId: string, event: NarratorListWSEvent) => void;
+type RecentTabsStatusVersion = { statusEpoch: string; statusRevision: number };
+type RecentTabsAcceptedStatus = {
+	status?: string;
+	substatus?: string[];
+	turnStartedAt?: string;
+	statusEpoch?: string;
+};
+
+/** A late done can notify, but must never resurrect a previous turn or an already-read state. */
+export function recentTabsStatusNotification(
+	current: RecentTabsAcceptedStatus | undefined,
+	data: Record<string, unknown>,
+): NarratorListWSEvent | null {
+	if (
+		!current ||
+		typeof data.statusEpoch !== "string" ||
+		current.statusEpoch !== data.statusEpoch ||
+		typeof data.turnStartedAt !== "string" ||
+		current.turnStartedAt !== data.turnStartedAt ||
+		current.status !== "idle" ||
+		!current.substatus?.includes("unread") ||
+		data.status !== "idle" ||
+		!Array.isArray(data.substatus) ||
+		!data.substatus.includes("unread")
+	)
+		return null;
+	return {
+		type: "status",
+		notificationOnly: true,
+		status: "idle",
+		substatus: data.substatus.filter((value): value is string => typeof value === "string"),
+		turnStartedAt: data.turnStartedAt,
+		...(typeof data.backgroundWorkActive === "boolean"
+			? { backgroundWorkActive: data.backgroundWorkActive }
+			: {}),
+	};
+}
+type AcceptSnapshotStatus = (narratorId: string, state: Record<string, unknown>) => boolean;
+
+/** The list domain has its own watermark: lightweight snapshots must not advance full-frame state. */
+export function acceptRecentTabsStatusVersion(
+	versions: Map<string, RecentTabsStatusVersion>,
+	narratorId: string,
+	data: Record<string, unknown>,
+): boolean {
+	const { statusEpoch, statusRevision } = data;
+	if (
+		typeof statusEpoch !== "string" ||
+		!statusEpoch ||
+		typeof statusRevision !== "number" ||
+		!Number.isSafeInteger(statusRevision) ||
+		statusRevision < 0
+	)
+		return true; // Preserve legacy producers without manufacturing an ordering proof.
+	const previous = versions.get(narratorId);
+	if (previous?.statusEpoch === statusEpoch && previous.statusRevision > statusRevision)
+		return false;
+	versions.set(narratorId, { statusEpoch, statusRevision });
+	return true;
+}
 
 function dispatchListStateItem(
 	item: Record<string, unknown>,
 	onUpdate: RecentTabsWSUpdate,
+	acceptStatus?: AcceptSnapshotStatus,
 ): boolean {
 	const narratorId = typeof item.narratorId === "string" ? item.narratorId : undefined;
 	if (!narratorId) return false;
@@ -38,7 +100,10 @@ function dispatchListStateItem(
 	if (typeof state.title === "string") {
 		onUpdate(narratorId, { type: "title", title: state.title });
 	}
-	if (typeof state.status === "string" || Array.isArray(state.substatus)) {
+	if (
+		(typeof state.status === "string" || Array.isArray(state.substatus)) &&
+		(!acceptStatus || acceptStatus(narratorId, state))
+	) {
 		onUpdate(narratorId, {
 			type: "status",
 			status: typeof state.status === "string" ? state.status : undefined,
@@ -81,6 +146,7 @@ function dispatchListStateItem(
 export function dispatchRecentTabsListStateSnapshot(
 	data: Record<string, unknown>,
 	onUpdate: RecentTabsWSUpdate,
+	acceptStatus?: AcceptSnapshotStatus,
 ): number {
 	const raw = Array.isArray(data.items)
 		? data.items
@@ -91,7 +157,8 @@ export function dispatchRecentTabsListStateSnapshot(
 				: [];
 	let count = 0;
 	for (const item of raw) {
-		if (item && typeof item === "object" && dispatchListStateItem(item, onUpdate)) count++;
+		if (item && typeof item === "object" && dispatchListStateItem(item, onUpdate, acceptStatus))
+			count++;
 	}
 	return count;
 }
@@ -113,9 +180,37 @@ export function useRecentTabsWS(
 
 	const subHandleRef = useRef<SubscriptionHandle | null>(null);
 	const narratorIdSetRef = useRef<Set<string>>(new Set(narratorIds));
+	const statusVersionsRef = useRef(new Map<string, RecentTabsStatusVersion>());
+	const acceptedStatusesRef = useRef(new Map<string, RecentTabsAcceptedStatus>());
 	const idsKey = useMemo(() => narratorIds.join(","), [narratorIds]);
 
 	useEffect(() => {
+		const rememberStatus = (narratorId: string, data: Record<string, unknown>) => {
+			const substatus = Array.isArray(data.substatus)
+				? data.substatus.filter((value): value is string => typeof value === "string")
+				: undefined;
+			if (typeof data.status === "string") {
+				// A full list state establishes its own turn proof; missing/null turn clears it.
+				acceptedStatusesRef.current.set(narratorId, {
+					status: data.status,
+					substatus,
+					turnStartedAt: typeof data.turnStartedAt === "string" ? data.turnStartedAt : undefined,
+					statusEpoch: typeof data.statusEpoch === "string" ? data.statusEpoch : undefined,
+				});
+			} else if (substatus) {
+				acceptedStatusesRef.current.set(narratorId, {
+					...acceptedStatusesRef.current.get(narratorId),
+					substatus,
+				});
+			}
+		};
+		const notifyLateStatus = (narratorId: string, data: Record<string, unknown>) => {
+			const notification = recentTabsStatusNotification(
+				acceptedStatusesRef.current.get(narratorId),
+				data,
+			);
+			if (notification) onUpdateRef.current(narratorId, notification);
+		};
 		const narratorListenerHandle: ListenerHandle = narratorWSManager.addListener(
 			{
 				narratorIds: "*",
@@ -123,25 +218,53 @@ export function useRecentTabsWS(
 			},
 			(data) => {
 				if (data.type === "list_state_snapshot") {
-					dispatchRecentTabsListStateSnapshot(data, (narratorId, event) => {
-						if (narratorIdSetRef.current.has(narratorId)) {
-							onUpdateRef.current(narratorId, event);
-						}
-					});
+					dispatchRecentTabsListStateSnapshot(
+						data,
+						(narratorId, event) => {
+							if (narratorIdSetRef.current.has(narratorId)) {
+								onUpdateRef.current(narratorId, event);
+							}
+						},
+						(narratorId, state) => {
+							if (
+								!narratorIdSetRef.current.has(narratorId) ||
+								narratorWSManager.isStatusVersionStale(narratorId, state) ||
+								!acceptRecentTabsStatusVersion(statusVersionsRef.current, narratorId, state)
+							)
+								return false;
+							rememberStatus(narratorId, state);
+							return true;
+						},
+					);
 					return;
 				}
 				const narratorId = data.narratorId as string | undefined;
 				if (!narratorId || !narratorIdSetRef.current.has(narratorId)) return;
+				if (data.type === "status_notification") {
+					notifyLateStatus(narratorId, data);
+					return;
+				}
 
-				if (data.type === "status_change" || data.type === "narrator:status_changed") {
+				if (
+					data.type === "status_change" ||
+					data.type === "narrator:status_changed" ||
+					(data.type === "substatus_change" && typeof data.status === "string")
+				) {
+					if (!acceptRecentTabsStatusVersion(statusVersionsRef.current, narratorId, data)) {
+						if (data.type !== "substatus_change") notifyLateStatus(narratorId, data);
+						return;
+					}
+					rememberStatus(narratorId, data);
 					onUpdateRef.current(narratorId, {
 						type: "status",
 						status: data.status as string,
 						substatus: data.substatus as string[] | undefined,
+						...(data.type === "substatus_change" ? { stateOnly: true } : {}),
 						turnStartedAt: data.turnStartedAt as string | undefined,
 						...(data.backgroundWorkActive === true ? { backgroundWorkActive: true } : {}),
 					});
 				} else if (data.type === "substatus_change") {
+					rememberStatus(narratorId, data);
 					onUpdateRef.current(narratorId, {
 						type: "status",
 						substatus: data.substatus as string[],
@@ -184,6 +307,10 @@ export function useRecentTabsWS(
 			(data) => onGlobalEventRef.current?.(data as { type: string; [key: string]: unknown }),
 		);
 		const unsubscribeConnection = narratorWSManager.onConnectionChange((connected, isReconnect) => {
+			if (connected) {
+				statusVersionsRef.current.clear();
+				acceptedStatusesRef.current.clear();
+			}
 			if (connected && isReconnect) onReconnectRef.current?.();
 		});
 
@@ -202,6 +329,12 @@ export function useRecentTabsWS(
 	useEffect(() => {
 		const desired = new Set(narratorIds);
 		narratorIdSetRef.current = desired;
+		for (const narratorId of statusVersionsRef.current.keys()) {
+			if (!desired.has(narratorId)) statusVersionsRef.current.delete(narratorId);
+		}
+		for (const narratorId of acceptedStatusesRef.current.keys()) {
+			if (!desired.has(narratorId)) acceptedStatusesRef.current.delete(narratorId);
+		}
 		if (!subHandleRef.current) {
 			subHandleRef.current = narratorWSManager.subscribe(narratorIds, { kind: "list" });
 		} else {

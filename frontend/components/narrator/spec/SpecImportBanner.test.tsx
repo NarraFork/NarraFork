@@ -6,13 +6,16 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import type { OutlineSpecImportReason, OutlineSpecImportStatus } from "@shared/outline-spec-import";
+import type { RuntimeSettings } from "@shared/settings-runtime";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import i18next from "i18next";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider } from "react-i18next";
+import { runtimeSettingsQueryOptions } from "../../../hooks/useRuntimeSettings";
 import { api } from "../../../lib/api";
+import { setToken } from "../../../lib/api/client";
 import en from "../../../locales/en/narrator.json";
 import zh from "../../../locales/zh-CN/narrator.json";
 import { SpecImportBanner } from "./SpecImportBanner";
@@ -58,7 +61,14 @@ const button = () => host.querySelector<HTMLButtonElement>('[data-testid="spec-i
 async function mount(initial: Partial<OutlineSpecImportStatus>, outline = true) {
 	status = { ...base, ...initial };
 	queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-	queryClient.setQueryData(["settings"], { outline: { enabled: outline } });
+	const runtimeSettings: RuntimeSettings = {
+		revision: 1,
+		agent: { defaultModel: "auto:test", summaryModel: "auto:test" },
+		outline: { enabled: outline },
+		requestEvidence: { autoPin: "off" },
+		summaryModelAvailable: null,
+	};
+	queryClient.setQueryData(runtimeSettingsQueryOptions().queryKey, runtimeSettings);
 	host = document.createElement("div");
 	document.body.appendChild(host);
 	root = createRoot(host);
@@ -77,10 +87,16 @@ async function mount(initial: Partial<OutlineSpecImportStatus>, outline = true) 
 
 beforeEach(async () => {
 	const { window } = parseHTML("<!doctype html><html><head></head><body></body></html>");
+	const storage = new Map<string, string>();
 	const overrides = {
 		window,
 		document: window.document,
 		navigator: { ...window.navigator, platform: "Linux", userAgent: "test" },
+		localStorage: {
+			getItem: (key: string) => storage.get(key) ?? null,
+			setItem: (key: string, value: string) => storage.set(key, value),
+			removeItem: (key: string) => storage.delete(key),
+		},
 		HTMLElement: window.HTMLElement,
 		Element: window.Element,
 		Node: window.Node,
@@ -101,6 +117,7 @@ beforeEach(async () => {
 		originalGlobals.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
 		Object.defineProperty(globalThis, key, { value, configurable: true, writable: true });
 	}
+	setToken("spec-import-banner-test");
 	if (!i18n.isInitialized)
 		await i18n.init({
 			lng: "en",

@@ -38,7 +38,8 @@ function open(userId?: string, share = false, subscribedNarrators = new Set<stri
 	} as unknown as Socket;
 	handleNarratorWS.open(ws);
 	opened.push(ws);
-	return { ws, sent };
+	const initialFrames = sent.splice(0);
+	return { ws, sent, initialFrames };
 }
 afterEach(() => {
 	for (const ws of opened.splice(0)) handleNarratorWS.close(ws);
