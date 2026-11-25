@@ -9,8 +9,10 @@ import type { TeamBoardItem, TeamPendingApproval } from "@shared/project-teams";
 import { attentionView } from "../teams/team-page-model";
 import {
 	activityAgo,
+	liveTeamCards,
 	pathTail,
 	projectAttentionEntries,
+	projectDecisionKeys,
 	sessionCountLabel,
 	sessionLine,
 	sessionSections,
@@ -99,6 +101,18 @@ describe("attention", () => {
 		expect(merge?.kind === "merge" && merge.base).toBe("main");
 	});
 
+	test("a decision refreshes this list, the project list, the cards, sessions and the team's page", () => {
+		const [teamCall, sessionCall] = projectAttentionEntries(entries);
+		expect(projectDecisionKeys("p", teamCall as never)).toEqual([
+			["project-overview", "p", "attention"],
+			["project-overview", "summaries"],
+			["teams", "project", "p"],
+			["narrators", "project", "p"],
+			["teams", "page", "team-a"],
+		]);
+		expect(projectDecisionKeys("p", sessionCall as never)).toHaveLength(4);
+	});
+
 	test("a ready item opens the team it belongs to", () => {
 		expect(teamOfItem(entries, "w1")).toBe("team-b");
 		expect(teamOfItem(entries, "missing")).toBeNull();
@@ -146,7 +160,7 @@ describe("sessions", () => {
 		expect(sessionTone("idle")).toBe("hollow");
 		const activity = (toolName: string, preview: string) => ({ toolName, preview, at: "" });
 		expect(sessionLine(row("w", "waiting", { activity: activity("Edit", "docs/a.md") }))).toEqual({
-			key: "waitingTool",
+			key: "waitingTools.editFile",
 			values: { tool: "Edit" },
 			detail: "docs/a.md",
 			tool: false,
@@ -201,6 +215,15 @@ describe("team cards", () => {
 			lastEventAt: null,
 			...card,
 		},
+	});
+
+	test("a cached archived team is not shown", () => {
+		const cards = [
+			team({ id: "live" }),
+			team({ id: "gone", status: "archived", coordinatorStatus: "archived" }),
+			team({ id: "going", coordinatorStatus: "archived" }),
+		];
+		expect(liveTeamCards(cards).map((card) => card.id)).toEqual(["live"]);
 	});
 
 	test("numbers: in progress counts queued, working and in review; ready and done apart", () => {

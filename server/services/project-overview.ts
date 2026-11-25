@@ -41,12 +41,18 @@ import { db } from "../db";
 import { narratorProjectLinks, narrators, projectTeams, teamWorkItems, users } from "../db/schema";
 import { readQuery } from "../db/worker-read";
 import { ForbiddenError, ValidationError } from "../lib/errors";
-import { canWriteNarrator, type NarratorPrincipal, narratorReadableWhere } from "./narrator-acl";
+import {
+	judgeNarratorsWriteForPrincipal,
+	type NarratorAclRow,
+	type NarratorPrincipal,
+	narratorReadableWhere,
+} from "./narrator-acl";
 import {
 	canWriteProject,
 	loadProjectForAccess,
 	type ProjectAclRow,
 	type ProjectPrincipal,
+	projectsWritableBy,
 } from "./project-acl";
 import { projectReadAdapter } from "./read";
 import {
@@ -94,37 +100,98 @@ function inProjects(projectIds: readonly string[]): SQL | undefined {
 /** Not a team's coordinator: those belong to the team cards, not the session list. */
 const notCoordinator = sql`not exists (select 1 from ${projectTeams} where ${projectTeams.narratorId} = ${narrators.id})`;
 
-/** Primary sessions a project page lists (one project): linked, or explicitly in it. */
-function sessionOfProject(projectId: string): SQL {
-	return sql`${narrators.id} in (select npl.narrator_id from narrator_project_links npl where npl.project_id = ${projectId} union select n2.id from narrators n2 where n2.context_project_id = ${projectId})`;
+/**
+ * The sessions a project page lists (one project): linked (any role, by
+ * `idx_narrator_project_links_project`) or explicitly in it (`idx_narrators_context_project`).
+ * The list reads FROM this set and CROSS JOINs `narrators` by primary key, so the project's own
+ * sessions drive the query: as an `IN` filter, SQLite without statistics walks the whole
+ * `(variant, …)` index instead (about 150 ms at 200k sessions; under 1 ms this way).
+ */
+function projectSessionIds(projectId: string) {
+	return db
+		.select({ id: narratorProjectLinks.narratorId })
+		.from(narratorProjectLinks)
+		.where(eq(narratorProjectLinks.projectId, projectId))
+		.union(
+			db
+				.select({ id: narrators.id })
+				.from(narrators)
+				.where(eq(narrators.contextProjectId, projectId)),
+		)
+		.as("project_sessions");
 }
 
 const rootOf = (row: Pick<PendingRow, "type" | "aclRootNarratorId" | "narratorId">) =>
 	row.type === "subagent" && row.aclRootNarratorId ? row.aclRootNarratorId : row.narratorId;
 
-/** Whether the caller may decide a call: write on its session, read once per session. */
+/** The access columns of a pending call's session, as the ACL judges them. */
+const aclRowOf = (row: PendingRow): NarratorAclRow => ({
+	id: row.narratorId,
+	ownerUserId: row.ownerUserId,
+	visibility: row.visibility,
+	writeAudience: row.writeAudience,
+	type: row.type,
+	aclRootNarratorId: row.aclRootNarratorId,
+	contextProjectId: row.contextProjectId,
+});
+
+/**
+ * The access work this module did, for tests: batches of judgements and the sessions (judged
+ * roots) they covered. It grows with the distinct sessions a scan meets, never with its calls.
+ */
+export const overviewAccessStats = { batches: 0, judged: 0 };
+
+/**
+ * Whether the caller may decide each call of a page: write on its session, judged once per ACL
+ * root (a team's whole tree is one judgement) in one batch per page
+ * (`judgeNarratorsWriteForPrincipal`), the verdicts kept for the later pages of the same scan.
+ */
 function decider(principal: NarratorPrincipal) {
-	const cache = new Map<string, Promise<boolean>>();
-	return (row: PendingRow): Promise<boolean> => {
-		let verdict = cache.get(row.narratorId);
-		if (!verdict) {
-			verdict = canWriteNarrator(
-				{
-					id: row.narratorId,
-					ownerUserId: row.ownerUserId,
-					visibility: row.visibility,
-					writeAudience: row.writeAudience,
-					type: row.type,
-					aclRootNarratorId: row.aclRootNarratorId,
-					contextProjectId: row.contextProjectId,
-				},
+	const verdictByRoot = new Map<string, boolean>();
+	return async (rows: readonly PendingRow[]) => {
+		const unknown = new Map<string, PendingRow>();
+		for (const row of rows) {
+			const root = rootOf(row);
+			if (!verdictByRoot.has(root) && !unknown.has(root)) unknown.set(root, row);
+		}
+		if (unknown.size > 0) {
+			const { verdicts, judged } = await judgeNarratorsWriteForPrincipal(
+				[...unknown.values()].map(aclRowOf),
 				principal,
 			);
-			cache.set(row.narratorId, verdict);
+			overviewAccessStats.batches++;
+			overviewAccessStats.judged += judged;
+			for (const [root, row] of unknown)
+				verdictByRoot.set(root, verdicts.get(row.narratorId) === true);
 		}
-		return verdict;
+		return (row: PendingRow) => verdictByRoot.get(rootOf(row)) === true;
 	};
 }
+
+/** The teams among these coordinators the caller is a member of (write), in one batch. */
+async function memberTeamIds(
+	coordinators: readonly NarratorAclRow[],
+	principal: NarratorPrincipal,
+): Promise<Set<string>> {
+	if (coordinators.length === 0) return new Set();
+	const { verdicts, judged } = await judgeNarratorsWriteForPrincipal(coordinators, principal);
+	overviewAccessStats.batches++;
+	overviewAccessStats.judged += judged;
+	return new Set(coordinators.filter((row) => verdicts.get(row.id) === true).map((row) => row.id));
+}
+
+const coordinatorAclColumns = {
+	id: narrators.id,
+	ownerUserId: narrators.ownerUserId,
+	visibility: narrators.visibility,
+	writeAudience: narrators.writeAudience,
+	type: narrators.type,
+	aclRootNarratorId: narrators.aclRootNarratorId,
+	contextProjectId: narrators.contextProjectId,
+};
+
+/** An active team whose coordinator is not archived: the only teams that count anywhere here. */
+const liveTeam = and(eq(projectTeams.status, "active"), ne(narrators.status, "archived"));
 
 // ── The project list ────────────────────────────────────────────────────────
 
@@ -181,25 +248,22 @@ export async function readProjectSummaries(
 			.limit(PROJECT_SUMMARY_ROW_CAP + 1),
 		workerRead(PROJECT_SUMMARY_ROW_CAP + 1, "projects.summaries.running-explicit", signal),
 	);
-	const sessionRows = [
-		...linkedRunning,
-		...explicitRunning.flatMap((row) =>
-			row.projectId ? [{ projectId: row.projectId, id: row.id }] : [],
-		),
-	];
+	// One row per (project, session), capped like every other count here.
+	const sessionKeys = new Set<string>();
+	const sessionRows: { projectId: string; id: string }[] = [];
+	for (const row of [...linkedRunning, ...explicitRunning]) {
+		if (!row.projectId) continue;
+		const key = `${row.projectId}:${row.id}`;
+		if (sessionKeys.has(key)) continue;
+		sessionKeys.add(key);
+		sessionRows.push({ projectId: row.projectId, id: row.id });
+	}
 	const teamRows = await readQuery(
 		db
 			.select({ projectId: projectTeams.projectId, id: projectTeams.narratorId })
 			.from(projectTeams)
 			.innerJoin(narrators, eq(narrators.id, projectTeams.narratorId))
-			.where(
-				and(
-					inArray(projectTeams.projectId, ids),
-					eq(projectTeams.status, "active"),
-					ne(narrators.status, "archived"),
-					readable,
-				),
-			)
+			.where(and(inArray(projectTeams.projectId, ids), liveTeam, readable))
 			.limit(PROJECT_SUMMARY_ROW_CAP + 1),
 		workerRead(PROJECT_SUMMARY_ROW_CAP + 1, "projects.summaries.teams", signal),
 	);
@@ -268,14 +332,19 @@ export async function readProjectSummaries(
 		}
 	}
 
-	// What waits: pending calls the caller may decide, then ready items of their teams; counted
-	// only in projects they are a member of.
+	// What waits: pending calls the caller may decide, then ready items of their live teams;
+	// read only in the projects they may write in (a reader cannot act there).
+	const writable = await projectsWritableBy(rows, principal);
+	const writableIds = ids.filter((id) => writable.has(id));
 	const waiting = new Map<string, Set<string>>();
-	const pending = await scanPendingCalls(
-		inProjects(ids),
-		PROJECT_SUMMARY_ROW_CAP + 1,
-		decider(principal),
-	);
+	const pending =
+		writableIds.length > 0
+			? await scanPendingCalls(
+					inProjects(writableIds),
+					PROJECT_SUMMARY_ROW_CAP + 1,
+					decider(principal),
+				)
+			: { rows: [] as PendingRow[], complete: true };
 	const pendingRows = pending.rows.slice(0, PROJECT_SUMMARY_ROW_CAP);
 	if (pendingRows.length > 0) {
 		const roots = [...new Set(pendingRows.map(rootOf))];
@@ -287,18 +356,18 @@ export async function readProjectSummaries(
 				.where(
 					and(
 						inArray(narratorProjectLinks.narratorId, roots),
-						inArray(narratorProjectLinks.projectId, ids),
+						inArray(narratorProjectLinks.projectId, writableIds),
 					),
 				)
-				.limit(roots.length * ids.length),
-			workerRead(roots.length * ids.length, "projects.summaries.pending-links", signal),
+				.limit(roots.length * writableIds.length),
+			workerRead(roots.length * writableIds.length, "projects.summaries.pending-links", signal),
 		);
 		for (const link of links) add(rootProjects, link.id, link.projectId);
 		const explicit = await readQuery(
 			db
 				.select({ id: narrators.id, projectId: narrators.contextProjectId })
 				.from(narrators)
-				.where(and(inArray(narrators.id, roots), inArray(narrators.contextProjectId, ids)))
+				.where(and(inArray(narrators.id, roots), inArray(narrators.contextProjectId, writableIds)))
 				.limit(roots.length),
 			workerRead(roots.length, "projects.summaries.pending-explicit", signal),
 		);
@@ -306,39 +375,38 @@ export async function readProjectSummaries(
 		for (const row of pendingRows)
 			for (const projectId of rootProjects.get(rootOf(row)) ?? []) add(waiting, projectId, row.id);
 	}
-	const ready = await readQuery(
-		db
-			.select({
-				id: teamWorkItems.id,
-				projectId: teamWorkItems.projectId,
-				teamId: teamWorkItems.teamId,
-				coordinator: {
-					id: narrators.id,
-					ownerUserId: narrators.ownerUserId,
-					visibility: narrators.visibility,
-					writeAudience: narrators.writeAudience,
-					type: narrators.type,
-					aclRootNarratorId: narrators.aclRootNarratorId,
-					contextProjectId: narrators.contextProjectId,
-				},
-			})
-			.from(teamWorkItems)
-			.innerJoin(narrators, eq(narrators.id, teamWorkItems.teamId))
-			.where(and(inArray(teamWorkItems.projectId, ids), eq(teamWorkItems.state, "ready")))
-			.limit(PROJECT_SUMMARY_ROW_CAP + 1),
-		workerRead(PROJECT_SUMMARY_ROW_CAP + 1, "projects.summaries.ready", signal),
-	);
-	const memberOf = new Map<string, Promise<boolean>>();
-	for (const item of ready.slice(0, PROJECT_SUMMARY_ROW_CAP)) {
-		let member = memberOf.get(item.teamId);
-		if (!member) {
-			member = canWriteNarrator(item.coordinator, principal);
-			memberOf.set(item.teamId, member);
-		}
-		if (await member) add(waiting, item.projectId, `merge:${item.id}`);
-	}
+	const ready =
+		writableIds.length > 0
+			? await readQuery(
+					db
+						.select({
+							id: teamWorkItems.id,
+							projectId: teamWorkItems.projectId,
+							teamId: teamWorkItems.teamId,
+							coordinator: coordinatorAclColumns,
+						})
+						.from(teamWorkItems)
+						.innerJoin(projectTeams, eq(projectTeams.narratorId, teamWorkItems.teamId))
+						.innerJoin(narrators, eq(narrators.id, teamWorkItems.teamId))
+						.where(
+							and(
+								inArray(teamWorkItems.projectId, writableIds),
+								eq(teamWorkItems.state, "ready"),
+								liveTeam,
+							),
+						)
+						.limit(PROJECT_SUMMARY_ROW_CAP + 1),
+					workerRead(PROJECT_SUMMARY_ROW_CAP + 1, "projects.summaries.ready", signal),
+				)
+			: [];
+	const readyRows = ready.slice(0, PROJECT_SUMMARY_ROW_CAP);
+	const coordinators = new Map(readyRows.map((item) => [item.teamId, item.coordinator]));
+	const members = await memberTeamIds([...coordinators.values()], principal);
+	for (const item of readyRows)
+		if (members.has(item.teamId)) add(waiting, item.projectId, `merge:${item.id}`);
 
 	const capped =
+		sessionRows.length > PROJECT_SUMMARY_ROW_CAP ||
 		linkedRunning.length > PROJECT_SUMMARY_ROW_CAP ||
 		explicitRunning.length > PROJECT_SUMMARY_ROW_CAP ||
 		teamRows.length > PROJECT_SUMMARY_ROW_CAP ||
@@ -346,20 +414,20 @@ export async function readProjectSummaries(
 		!pending.complete ||
 		ready.length > PROJECT_SUMMARY_ROW_CAP;
 	const running = new Map<string, Set<string>>();
-	for (const row of sessionRows) add(running, row.projectId, row.id);
+	for (const row of sessionRows.slice(0, PROJECT_SUMMARY_ROW_CAP))
+		add(running, row.projectId, row.id);
 	const teams = new Map<string, Set<string>>();
 	for (const row of teamRows.slice(0, PROJECT_SUMMARY_ROW_CAP)) add(teams, row.projectId, row.id);
 
 	const summaries: ProjectListSummary[] = [];
 	for (const row of rows) {
-		// A waiting badge is a member's: a reader cannot act on what waits there.
-		const waits = waiting.get(row.id)?.size ?? 0;
-		const member = waits > 0 ? await canWriteProject(row, principal) : false;
+		// A waiting badge is a member's: only projects they may write in were read.
+		const waits = writable.has(row.id) ? (waiting.get(row.id)?.size ?? 0) : 0;
 		summaries.push({
 			projectId: row.id,
 			runningSessionCount: running.get(row.id)?.size ?? 0,
 			teamCount: teams.get(row.id)?.size ?? 0,
-			waitingCount: member ? waits : 0,
+			waitingCount: waits,
 			lastActivityAt: lastActivity.get(row.id) ?? row.updatedAt ?? null,
 			capped,
 		});
@@ -442,35 +510,24 @@ export async function readProjectAttention(
 		};
 	});
 
-	// Ready items of the teams this person is a member of.
+	// Ready items of the live teams this person is a member of (one batch for all teams).
 	const teamRows = await readQuery(
 		db
 			.select({
-				id: narrators.id,
+				...coordinatorAclColumns,
 				title: sql<string | null>`substr(${narrators.title}, 1, 160)`,
 				baseBranch: projectTeams.baseBranch,
-				ownerUserId: narrators.ownerUserId,
-				visibility: narrators.visibility,
-				writeAudience: narrators.writeAudience,
-				type: narrators.type,
-				aclRootNarratorId: narrators.aclRootNarratorId,
-				contextProjectId: narrators.contextProjectId,
 			})
 			.from(projectTeams)
 			.innerJoin(narrators, eq(narrators.id, projectTeams.narratorId))
-			.where(
-				and(
-					eq(projectTeams.projectId, projectId),
-					eq(projectTeams.status, "active"),
-					ne(narrators.status, "archived"),
-				),
-			)
+			.where(and(eq(projectTeams.projectId, projectId), liveTeam))
 			.limit(ATTENTION_TEAM_SCAN),
 		workerRead(ATTENTION_TEAM_SCAN, "projects.attention.teams", signal),
 	);
+	const members = await memberTeamIds(teamRows, principal);
 	const memberTeams = new Map<string, { name: string; baseBranch: string }>();
 	for (const team of teamRows)
-		if (await canWriteNarrator(team, principal))
+		if (members.has(team.id))
 			memberTeams.set(team.id, { name: team.title || team.id, baseBranch: team.baseBranch });
 	const ready = readReadyItems(projectId, [...memberTeams.keys()], PROJECT_ATTENTION_READY_LIMIT);
 	for (const item of ready.items) {
@@ -542,11 +599,16 @@ const after = (cursor: SessionCursor | null) =>
 		: undefined;
 
 /** A tab's count, counted up to the cap + 1 (a bounded subquery, never the whole history). */
-async function cappedCount(where: SQL | undefined, signal?: AbortSignal): Promise<number> {
+async function cappedCount(
+	ids: ReturnType<typeof projectSessionIds>,
+	where: SQL | undefined,
+	signal?: AbortSignal,
+): Promise<number> {
 	const inner = db
 		.select({ one: sql<number>`1`.as("one") })
-		.from(narrators)
-		.where(where)
+		.from(ids)
+		.crossJoin(narrators)
+		.where(and(eq(narrators.id, ids.id), where))
 		.limit(PROJECT_SESSION_COUNT_CAP + 1)
 		.as("capped");
 	const [row] = await readQuery(
@@ -584,9 +646,9 @@ export async function readProjectSessions(
 		eq(narrators.hiddenFromLists, false),
 		ne(narrators.status, "archived"),
 		narratorReadableWhere(principal),
-		sessionOfProject(projectId),
 		notCoordinator,
 	);
+	const ids = projectSessionIds(projectId);
 	const running = and(base, inArray(narrators.status, RUNNING));
 	const recent = and(
 		base,
@@ -599,9 +661,10 @@ export async function readProjectSessions(
 		readQuery(
 			db
 				.select(sessionColumns)
-				.from(narrators)
+				.from(ids)
+				.crossJoin(narrators)
 				.leftJoin(users, eq(users.id, narrators.ownerUserId))
-				.where(where)
+				.where(and(eq(narrators.id, ids.id), where))
 				.orderBy(desc(narrators.updatedAt), desc(narrators.id))
 				.limit(rows),
 			workerRead(rows, "projects.sessions.page", signal),
@@ -611,6 +674,7 @@ export async function readProjectSessions(
 	const picked: { row: Row; phase: SessionCursor["phase"] }[] = [];
 	let more = false;
 	if (options.view === "active") {
+		if (cursor?.phase === "all") throw new ValidationError("Invalid cursor");
 		if (!cursor || cursor.phase === "running") {
 			const rows = await readPage(and(running, after(cursor)), limit + 1);
 			for (const row of rows.slice(0, limit)) picked.push({ row, phase: "running" });
@@ -662,10 +726,10 @@ export async function readProjectSessions(
 		: {
 				active: Math.min(
 					PROJECT_SESSION_COUNT_CAP + 1,
-					(await cappedCount(running, signal)) + (await cappedCount(recent, signal)),
+					(await cappedCount(ids, running, signal)) + (await cappedCount(ids, recent, signal)),
 				),
-				all: await cappedCount(base, signal),
-				mine: await cappedCount(mine, signal),
+				all: await cappedCount(ids, base, signal),
+				mine: await cappedCount(ids, mine, signal),
 			};
 	return {
 		items,

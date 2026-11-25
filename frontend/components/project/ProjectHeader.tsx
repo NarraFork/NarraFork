@@ -113,7 +113,7 @@ export function ProjectHeader({
 			fullWidth={phone}
 			data-testid="project-new-session"
 		>
-			{t("newSession")}
+			{t("page.newSession")}
 		</Button>
 	);
 	const newTeam = teamsAvailable ? (

@@ -9,9 +9,8 @@ import { useProjectAttention } from "@frontend/hooks/useProjectOverview";
 import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { useMemo } from "react";
-import { teamKeys } from "../../hooks/useTeams";
 import { TeamAttention } from "../teams/TeamAttention";
-import { projectAttentionEntries, teamOfItem } from "./project-page-model";
+import { projectAttentionEntries, projectDecisionKeys, teamOfItem } from "./project-page-model";
 
 export function ProjectAttention({
 	projectId,
@@ -38,8 +37,10 @@ export function ProjectAttention({
 			base="main"
 			stats={undefined}
 			entries={entries}
-			phone={false}
-			compact={phone}
+			// On a phone the cards scroll sideways with dots, as on the team page; on a desktop they
+			// are listed in the page, folded past three.
+			phone={phone}
+			inPage
 			flush
 			more={attention.data.more}
 			unscanned={attention.data.unscanned}
@@ -52,9 +53,9 @@ export function ProjectAttention({
 				void navigate({ to: "/narrators/$narratorId", params: { narratorId } })
 			}
 			onOpenTeam={openTeam}
-			onDecided={() => {
-				void queryClient.invalidateQueries({ queryKey: ["project-overview", projectId] });
-				void queryClient.invalidateQueries({ queryKey: teamKeys.list(projectId) });
+			onDecided={(entry) => {
+				for (const queryKey of projectDecisionKeys(projectId, entry))
+					void queryClient.invalidateQueries({ queryKey });
 			}}
 		/>
 	);

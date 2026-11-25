@@ -150,8 +150,9 @@ export function NewSessionLink({ onNavigate }: { onNavigate?: () => void }) {
 
 /**
  * 「项目」: the project list, and the way to every project page and team (R2: the third row of
- * the top section, as the redesign's sidebar has it). Active on the list and on any project's
- * pages, unless one of the project's own pinned tabs below is the active row.
+ * the top section, as the redesign's sidebar has it). Active on the list only (`/projects`): on a
+ * project's or a team's page the highlighted row is that page's tab below, as in the redesign
+ * (two active rows would say two places at once), like 新会话 is active on `/` only.
  */
 export function NavProjectsLink({ onNavigate }: { onNavigate?: () => void }) {
 	const { t } = useTranslation("nav");

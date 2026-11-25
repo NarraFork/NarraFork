@@ -240,21 +240,23 @@ function pendingCallPage(
 
 /**
  * The visible pending calls of a scope, oldest first, read in keyset pages until `wanted` rows
- * pass `accept` (default: all), at most {@link PENDING_MAX_PAGES} pages. `complete` is false when
- * the pages ran out before the pending calls did. The team tree and the project page (R2) share
- * it; `accept` lets a scan skip calls the person may not decide without counting them.
+ * are accepted, at most {@link PENDING_MAX_PAGES} pages. `acceptPage` (default: all) decides a
+ * whole page at once, so a caller can judge access once per page — one batch per distinct
+ * session, never one check per call. `complete` is false when the pages ran out before the
+ * pending calls did. The team tree and the project page (R2) share it.
  */
 export async function scanPendingCalls(
 	scope: SQL | undefined,
 	wanted: number,
-	accept?: (row: PendingRow) => boolean | Promise<boolean>,
+	acceptPage?: (rows: readonly PendingRow[]) => Promise<(row: PendingRow) => boolean>,
 ): Promise<{ rows: PendingRow[]; complete: boolean }> {
 	const rows: PendingRow[] = [];
 	let after: { createdAt: string; id: string } | null = null;
 	for (let page = 0; page < PENDING_MAX_PAGES; page++) {
 		const { visible, last, full } = pendingCallPage(scope, after);
+		const accepted = acceptPage && visible.length > 0 ? await acceptPage(visible) : () => true;
 		for (const row of visible) {
-			if (accept && !(await accept(row))) continue;
+			if (!accepted(row)) continue;
 			rows.push(row);
 			if (rows.length >= wanted) return { rows, complete: true };
 		}

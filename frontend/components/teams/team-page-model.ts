@@ -503,6 +503,31 @@ export function teamPageMode(
 /** The tint of a row's status dot. */
 export type RowTone = "amber" | "green" | "blue" | "hollow" | "gray";
 
+/**
+ * What a tool call asks for, in words (R2: 「请求编辑文件」, 「等批准运行命令」): editing a file,
+ * running a command, reading a file, opening a web page, or (any other tool) using it by name.
+ */
+export type ToolVerb = "editFile" | "runCommand" | "readFile" | "fetchWeb" | "useTool";
+
+const TOOL_VERBS: Readonly<Record<string, ToolVerb>> = {
+	Edit: "editFile",
+	Write: "editFile",
+	MultiEdit: "editFile",
+	NotebookEdit: "editFile",
+	Bash: "runCommand",
+	Read: "readFile",
+	WebFetch: "fetchWeb",
+};
+
+export function toolVerb(toolName: string): ToolVerb {
+	return TOOL_VERBS[toolName] ?? "useTool";
+}
+
+/** The i18n key (under `teams.page.row.`) of a row waiting for approval of this tool. */
+export function waitingToolKey(toolName: string): string {
+	return `waitingTools.${toolVerb(toolName)}`;
+}
+
 /** A row's second line: an i18n key under `teams.page.row.` and its values. */
 export interface RowLine {
 	key: string;
@@ -520,7 +545,7 @@ export function rowLine(row: WorkRow, workerStatus: string | null, base: string)
 			approval.kind === "question" ? (approval.questions[0] ?? null) : approval.preview || null;
 		const key =
 			approval.kind === "tool"
-				? "waitingTool"
+				? waitingToolKey(approval.toolName)
 				: approval.kind === "question"
 					? "waitingAnswer"
 					: approval.kind === "plan"
@@ -535,7 +560,12 @@ export function rowLine(row: WorkRow, workerStatus: string | null, base: string)
 		const kind =
 			tool === "AskUserQuestion" ? "question" : tool === "ExitPlanMode" ? "plan" : "tool";
 		return {
-			key: kind === "question" ? "waitingAnswer" : kind === "plan" ? "waitingPlan" : "waitingTool",
+			key:
+				kind === "question"
+					? "waitingAnswer"
+					: kind === "plan"
+						? "waitingPlan"
+						: waitingToolKey(tool),
 			values: { tool },
 			detail: item.activity?.preview || null,
 			tone: "amber",

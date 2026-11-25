@@ -8,15 +8,17 @@ const box = ({ children }: { children?: ReactNode }) => <div>{children}</div>;
 const input = ({
 	label,
 	value,
+	error,
 	onChange,
 	onBlur,
 }: {
 	label: string;
 	value?: string;
+	error?: string;
 	onChange?: (event: ChangeEvent<HTMLInputElement>) => void;
 	onBlur?: () => void;
 }) => (
-	<div data-input={label} data-value={value}>
+	<div data-input={label} data-value={value} data-error={error ?? ""}>
 		<button
 			type="button"
 			onClick={() =>
@@ -166,12 +168,18 @@ mock.module("../../lib/api", () => ({
 mock.module("../permissions/PermissionRuleEditor", () => ({
 	PermissionRuleEditor: ({
 		kind,
+		rules,
 		onCreate,
 	}: {
 		kind: string;
+		rules: unknown[];
 		onCreate: (rule: Record<string, unknown>) => void;
 	}) => (
-		<button type="button" onClick={() => onCreate({ pattern: "/tmp/**" })}>
+		<button
+			type="button"
+			data-rule-count={rules.length}
+			onClick={() => onCreate({ pattern: "/tmp/**" })}
+		>
 			{`add-rule:${kind}`}
 		</button>
 	),
@@ -316,15 +324,22 @@ test("closing the dialog clears a typed session title", async () => {
 	await click("createNarrator");
 	expect(create.mock.calls[0]?.[0]).not.toHaveProperty("title");
 });
-test("the settings page saves a field when it is left, only that field, never a blank name", async () => {
-	const project = {
-		id: "original-id",
-		name: "Original project",
-		description: "Original description",
-		gitPath: "/original",
-		chapterSettings: { commands: [{ name: "old", prompt: "x" }], futureSetting: { retain: true } },
-	};
-	await act(async () => root.render(<ProjectBasicsForm project={project} canManage />));
+type Callbacks = {
+	onSuccess?: () => void;
+	onError?: (error: Error) => void;
+	onSettled?: () => void;
+};
+const callbacks = (call: number) => update.mock.calls[call]?.[1] as Callbacks;
+const field = (label: string) => container.querySelector(`[data-input="${label}"]`);
+const settingsProject = {
+	id: "original-id",
+	name: "Original project",
+	description: "Original description",
+	gitPath: "/home/u/repo",
+	chapterSettings: { commands: [{ name: "old", prompt: "x" }], futureSetting: { retain: true } },
+};
+test("name and description save when left, only that field, never a blank name", async () => {
+	await act(async () => root.render(<ProjectBasicsForm project={settingsProject} canManage />));
 	edits = { projectName: "New name" };
 	await click("projectName");
 	await click("leave:projectName");
@@ -332,10 +347,67 @@ test("the settings page saves a field when it is left, only that field, never a 
 	// Unchanged: nothing is sent.
 	await click("leave:projectDescription");
 	expect(update).toHaveBeenCalledTimes(1);
-	edits = { repositoryPath: "   " };
-	await click("repositoryPath");
-	await click("leave:repositoryPath");
+	edits = { projectName: "   " };
+	await click("projectName");
+	await click("leave:projectName");
 	expect(update).toHaveBeenCalledTimes(1);
+});
+test("a failed save keeps the typed value marked unsaved; a saved one shows the stored value again", async () => {
+	await act(async () => root.render(<ProjectBasicsForm project={settingsProject} canManage />));
+	edits = { projectDescription: "Typed" };
+	await click("projectDescription");
+	await click("leave:projectDescription");
+	await act(async () => callbacks(0).onError?.(new Error("offline")));
+	expect(field("projectDescription")?.getAttribute("data-value")).toBe("Typed");
+	expect(field("projectDescription")?.getAttribute("data-error")).toBe("settingsPage.unsaved");
+	// Leaving again retries; once saved the field follows the stored (server) value.
+	await click("leave:projectDescription");
+	await act(async () => callbacks(1).onSuccess?.());
+	expect(field("projectDescription")?.getAttribute("data-value")).toBe("Original description");
+	expect(field("projectDescription")?.getAttribute("data-error")).toBe("");
+});
+test("the project directory never saves on blur, only on 保存 after a confirmation", async () => {
+	await act(async () => root.render(<ProjectBasicsForm project={settingsProject} canManage />));
+	edits = { repositoryPath: "/home/u" };
+	await click("repositoryPath");
+	// No blur save at all: the field has no leave handler.
+	expect(
+		Array.from(container.querySelectorAll("button")).some(
+			(button) => button.textContent === "leave:repositoryPath",
+		),
+	).toBe(false);
+	expect(update).not.toHaveBeenCalled();
+	await click("settingsPage.pathSave");
+	expect(update).not.toHaveBeenCalled();
+	expect(container.textContent).toContain("settingsPage.pathConfirm");
+	await click("settingsPage.pathConfirmButton");
+	expect(update.mock.calls[0]?.[0]).toEqual({ id: "original-id", data: { gitPath: "/home/u" } });
+	// Saved: the field shows the stored, resolved value, and saving again has nothing to send.
+	await act(async () => callbacks(0).onSuccess?.());
+	expect(field("repositoryPath")?.getAttribute("data-value")).toBe("/home/u/repo");
+	const save = Array.from(container.querySelectorAll("button")).find(
+		(button) => button.textContent === "settingsPage.pathSave",
+	);
+	expect(save?.disabled).toBe(true);
+});
+test("the same directory with a trailing slash is not a change; cancel drops the draft", async () => {
+	await act(async () => root.render(<ProjectBasicsForm project={settingsProject} canManage />));
+	edits = { repositoryPath: "/home/u/repo/" };
+	await click("repositoryPath");
+	const save = () =>
+		Array.from(container.querySelectorAll("button")).find(
+			(button) => button.textContent === "settingsPage.pathSave",
+		);
+	expect(save()?.disabled).toBe(true);
+	await click("settingsPage.pathCancel");
+	expect(field("repositoryPath")?.getAttribute("data-value")).toBe("/home/u/repo");
+	edits = { repositoryPath: "/home/u/other" };
+	await click("repositoryPath");
+	await click("settingsPage.pathSave");
+	await click("settingsPage.pathConfirmButton");
+	await act(async () => callbacks(0).onError?.(new Error("not a directory")));
+	expect(field("repositoryPath")?.getAttribute("data-value")).toBe("/home/u/other");
+	expect(field("repositoryPath")?.getAttribute("data-error")).toBe("settingsPage.unsaved");
 });
 test("a rule list saves on every change and sends only its own key", async () => {
 	const project = {
@@ -356,6 +428,11 @@ test("a rule list saves on every change and sends only its own key", async () =>
 	expect(Object.keys(sent.data.chapterSettings)).toEqual(["whitelistDirs"]);
 	expect(sent.data.chapterSettings.whitelistDirs).toHaveLength(1);
 	expect(create).not.toHaveBeenCalled();
+	const editor = () => container.querySelector("[data-rule-count]");
+	expect(editor()?.getAttribute("data-rule-count")).toBe("1");
+	// A failed save puts the stored list back instead of showing the unsaved rule as saved.
+	await act(async () => callbacks(0).onSettled?.());
+	expect(editor()?.getAttribute("data-rule-count")).toBe("0");
 });
 test("a reader sees the rules but no editor", async () => {
 	await act(async () =>

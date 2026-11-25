@@ -248,7 +248,7 @@ describe("等你处理", () => {
 		const html = await attention([call()]);
 		expect(html).toContain('data-kind="tool"');
 		expect(html).toContain("Add the board");
-		expect(html).toContain("the worker asks to run Bash");
+		expect(html).toContain("the worker asks to run a command");
 		expect(html).toContain("pnpm --filter web add @acme/pay-sdk@3.2.0");
 		expect(html).toContain('data-testid="team-approval-deny"');
 		expect(html).toContain('data-testid="team-approval-approve"');
@@ -385,7 +385,7 @@ describe("work list", () => {
 		expect(groups).toEqual(["needsYou", "inProgress", "review"]);
 		expect(html).toContain("需要你");
 		expect(html).toContain("评审 · 就绪");
-		expect(html).toContain("等批准 Bash");
+		expect(html).toContain("等批准运行命令");
 		expect(html).toContain("+214");
 		expect(html).toContain("运行");
 		expect(html).toContain("pnpm test api/auth");

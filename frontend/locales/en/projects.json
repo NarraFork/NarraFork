@@ -316,8 +316,6 @@
 				"more": "{{count}} more",
 				"less": "Show less",
 				"coordinator": "Coordinator",
-				"asksTool": "· the worker asks to run {{tool}}",
-				"coordinatorAsksTool": "asks to run {{tool}}",
 				"asksQuestion": "· the worker asks",
 				"coordinatorAsksQuestion": "asks",
 				"asksPlan": "· the worker proposes a plan",
@@ -350,7 +348,15 @@
 				"moreInSession": "More are waiting than listed here: open the coordinator's session to see them.",
 				"unscanned": "Some waiting calls may not be listed here: open the coordinator's session to see them.",
 				"openFull": "Open session",
-				"openAsker": "Open this session"
+				"openAsker": "Open this session",
+				"toolVerbs": {
+					"editFile": "asks to edit a file",
+					"runCommand": "asks to run a command",
+					"readFile": "asks to read a file",
+					"fetchWeb": "asks to open a web page",
+					"useTool": "asks to use {{tool}}"
+				},
+				"workerAsksAction": "· the worker {{action}}"
 			},
 			"work": {
 				"work": "Work",
@@ -368,7 +374,6 @@
 				"loadFailed": "Could not load the work items."
 			},
 			"row": {
-				"waitingTool": "Waiting for approval · {{tool}}",
 				"waitingAnswer": "Waiting for an answer",
 				"waitingPlan": "Plan waiting for approval",
 				"waitingRule": "Waiting for a permission rule",
@@ -396,7 +401,14 @@
 					"AskUserQuestion": "Asking",
 					"ExitPlanMode": "Proposing a plan"
 				},
-				"waitingPerson": "Waiting on a person"
+				"waitingPerson": "Waiting on a person",
+				"waitingTools": {
+					"editFile": "Waiting for approval · edit a file",
+					"runCommand": "Waiting for approval · run a command",
+					"readFile": "Waiting for approval · read a file",
+					"fetchWeb": "Waiting for approval · open a web page",
+					"useTool": "Waiting for approval · {{tool}}"
+				}
 			},
 			"empty": {
 				"title": "Work items show up here",
@@ -529,7 +541,9 @@
 				"all": "No sessions in this project yet.",
 				"mine": "You have no sessions in this project."
 			}
-		}
+		},
+		"newSession": "New session",
+		"waitingBadgeMore": "{{count}}+ waiting"
 	},
 	"list": {
 		"subtitle": "Projects with something waiting on you come first, the rest by recent activity. Sessions join a project by their working directory.",
@@ -598,6 +612,12 @@
 				"auto": "Automatic"
 			},
 			"followGlobal": "Follow global: {{mode}}"
-		}
+		},
+		"unsaved": "Not saved: {{message}}",
+		"pathSave": "Save directory",
+		"pathCancel": "Cancel",
+		"pathConfirmTitle": "Change the project directory?",
+		"pathConfirm": "The project directory changes from {{from}} to {{to}}. Sessions are re-assigned by their working directory: sessions under the new directory join this project, and sessions under the old one that are not under the new one leave it.",
+		"pathConfirmButton": "Change and re-assign"
 	}
 }

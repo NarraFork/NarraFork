@@ -32,7 +32,12 @@ import {
 	statusTone,
 	TABULAR,
 } from "../teams/team-page-ui";
-import { teamCardBadge, teamCardNumbers, teamCardStatus } from "./project-page-model";
+import {
+	liveTeamCards,
+	teamCardBadge,
+	teamCardNumbers,
+	teamCardStatus,
+} from "./project-page-model";
 
 const CARD_STYLE = {
 	display: "block",
@@ -111,7 +116,7 @@ export function ProjectTeamCards({
 }) {
 	const { t } = useTranslation("projects");
 	const teams = useProjectTeamCards(projectId);
-	const rows = teams.data?.pages.flatMap((page) => page.teams) ?? [];
+	const rows = liveTeamCards(teams.data?.pages.flatMap((page) => page.teams) ?? []);
 	if (teams.isError && teamsUnavailable(teams.error)) return null;
 	return (
 		<Stack gap="sm" data-testid="project-teams">

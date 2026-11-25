@@ -205,7 +205,7 @@ describe("the work list", () => {
 			["ready", false],
 		]);
 		expect(rowLine(groups.needsYou[0] as never, "waiting", "main")).toEqual({
-			key: "waitingTool",
+			key: "waitingTools.runCommand",
 			values: { tool: "Bash" },
 			detail: "pnpm add x",
 			tone: "amber",
@@ -220,10 +220,19 @@ describe("the work list", () => {
 			approval: call,
 		});
 		expect(rowLine(row({}, approval()), "waiting", "main")).toMatchObject({
-			key: "waitingTool",
+			key: "waitingTools.runCommand",
 			detail: "pnpm test",
 			tone: "amber",
 		});
+		// What the call asks for, in words (R2): editing, reading, a web page, or the tool's name.
+		for (const [toolName, key] of [
+			["Edit", "waitingTools.editFile"],
+			["NotebookEdit", "waitingTools.editFile"],
+			["Read", "waitingTools.readFile"],
+			["WebFetch", "waitingTools.fetchWeb"],
+			["mcp__github__create_issue", "waitingTools.useTool"],
+		])
+			expect(rowLine(row({}, approval({ toolName })), "waiting", "main").key).toBe(key);
 		expect(
 			rowLine(row({}, approval({ kind: "question", questions: ["Which?"] })), "waiting", "main"),
 		).toMatchObject({ key: "waitingAnswer", detail: "Which?" });

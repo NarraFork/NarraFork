@@ -20,6 +20,7 @@ import {
 	type StatusPart,
 	type StatusTone,
 	statusSentence,
+	waitingToolKey,
 } from "../teams/team-page-model";
 
 /** The last `segments` parts of a path, after 「…/」 when anything was cut off. */
@@ -68,6 +69,22 @@ export function teamOfItem(
 	for (const entry of entries)
 		if (entry.kind === "merge" && entry.item.id === itemId) return entry.source.teamId;
 	return null;
+}
+
+/**
+ * What a decision on the project page makes stale (the query keys to refetch): its 「等你处理」,
+ * the project list's numbers, the project's team cards and session list, and the team's own page
+ * (approvals, summary) when the call came from a team.
+ */
+export function projectDecisionKeys(projectId: string, entry: AttentionEntry): unknown[][] {
+	const keys: unknown[][] = [
+		["project-overview", projectId, "attention"],
+		["project-overview", "summaries"],
+		["teams", "project", projectId],
+		["narrators", "project", projectId],
+	];
+	if (entry.source?.kind === "team") keys.push(["teams", "page", entry.source.teamId]);
+	return keys;
 }
 
 // ── Sessions ────────────────────────────────────────────────────────────────
@@ -138,7 +155,7 @@ export function sessionLine(
 				? "waitingAnswer"
 				: tool === "ExitPlanMode"
 					? "waitingPlan"
-					: "waitingTool";
+					: waitingToolKey(tool);
 		return { key, values: { tool }, detail: activity?.preview || null, tool: false, tone: "amber" };
 	}
 	if (row.status === "working") {
@@ -155,6 +172,16 @@ export function sessionLine(
 }
 
 // ── Team cards ──────────────────────────────────────────────────────────────
+
+/**
+ * The cards shown: active teams whose coordinator is not archived. The list asks for active
+ * teams, but a cached page can outlive an archive (the server keeps no tab of one either).
+ */
+export function liveTeamCards<T extends Pick<TeamCard, "status" | "coordinatorStatus">>(
+	teams: readonly T[],
+): T[] {
+	return teams.filter((team) => team.status === "active" && team.coordinatorStatus !== "archived");
+}
 
 /** A card's three numbers: 进行中 (queued, in progress, in review), 就绪 (ready), 完成 (merged). */
 export function teamCardNumbers(card: TeamCard["card"]): {

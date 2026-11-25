@@ -2,15 +2,28 @@
  * The editors of the project settings page (R2; moved from the old settings dialog), each saving
  * its own change at once ("更改会自动保存"):
  *
- *  - `ProjectBasicsForm`: name, description and the project directory, saved when a field is left
- *    (a blank name or directory is not sent);
+ *  - `ProjectBasicsForm`: name and description, saved when the field is left (a blank name is not
+ *    sent); the project directory only on its own 保存, after a confirmation that sessions will be
+ *    re-assigned (a half-typed path is never saved). A field shows the stored value again after a
+ *    save, and an unsaved one says so;
  *  - `ProjectRuleList`: one permission rule list of `chapterSettings` (directory or command white /
  *    black list), saved on every add, edit or removal — only that key is sent, the server merges;
+ *    a failed save puts the stored list back and shows the error;
  *  - `ProjectCommandsEditor`: the project's slash commands.
  */
-import { Alert, Group, Loader, Stack, Text, Textarea, TextInput } from "@mantine/core";
+import {
+	Alert,
+	Button,
+	Group,
+	Loader,
+	Modal,
+	Stack,
+	Text,
+	Textarea,
+	TextInput,
+} from "@mantine/core";
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useRef, useState } from "react";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { usePlatform } from "../../hooks/usePlatform";
 import { useUpdateProject } from "../../hooks/useProjects";
@@ -54,6 +67,15 @@ function SaveState({ pending, error }: { pending: boolean; error: Error | null }
 	return null;
 }
 
+/** A directory as typed, without the trailing separators the server drops (`/repo/` = `/repo`). */
+export function comparablePath(path: string): string {
+	const trimmed = path.trim();
+	const stripped = trimmed.replace(/[\\/]+$/, "");
+	return stripped || trimmed;
+}
+
+type BasicsField = "name" | "description";
+
 export function ProjectBasicsForm({
 	project,
 	canManage,
@@ -64,65 +86,135 @@ export function ProjectBasicsForm({
 	const { t } = useTranslation("projects");
 	const update = useUpdateProject();
 	const projectId = String(project.id);
-	const [name, setName] = useState(String(project.name ?? ""));
-	const [description, setDescription] = useState(String(project.description ?? ""));
-	const [gitPath, setGitPath] = useState(String(project.gitPath ?? ""));
-	// Follow the stored values until the person edits a field.
-	const touched = useRef(false);
-	useEffect(() => {
-		if (touched.current) return;
-		setName(String(project.name ?? ""));
-		setDescription(String(project.description ?? ""));
-		setGitPath(String(project.gitPath ?? ""));
-	}, [project.name, project.description, project.gitPath]);
-	const save = (field: "name" | "description" | "gitPath", value: string) => {
-		const trimmed = value.trim();
-		const current = String(project[field] ?? "");
-		if (trimmed === current.trim()) return;
-		if ((field === "name" || field === "gitPath") && !trimmed) return;
-		update.mutate({ id: projectId, data: { [field]: trimmed } });
+	const stored = {
+		name: String(project.name ?? ""),
+		description: String(project.description ?? ""),
+		gitPath: String(project.gitPath ?? ""),
 	};
+	// A field follows the stored value until it is edited (its draft), and again once its change
+	// is saved: the server stores the resolved form, which the page then shows.
+	const [drafts, setDrafts] = useState<Partial<Record<BasicsField | "gitPath", string>>>({});
+	const [failed, setFailed] = useState<Partial<Record<BasicsField | "gitPath", string>>>({});
+	const [confirming, setConfirming] = useState(false);
+	const shown = (field: BasicsField | "gitPath") => drafts[field] ?? stored[field];
+	const edit = (field: BasicsField | "gitPath", value: string) =>
+		setDrafts((current) => ({ ...current, [field]: value }));
+	const settle = (field: BasicsField | "gitPath") => {
+		setDrafts(({ [field]: _done, ...rest }) => rest);
+		setFailed(({ [field]: _done, ...rest }) => rest);
+	};
+	const send = (field: BasicsField | "gitPath", value: string) =>
+		update.mutate(
+			{ id: projectId, data: { [field]: value } },
+			{
+				onSuccess: () => settle(field),
+				// The draft stays, marked unsaved, so a failed save never looks saved.
+				onError: (error: Error) => setFailed((current) => ({ ...current, [field]: error.message })),
+			},
+		);
+	/** Name and description save when the field is left, if they changed and are valid. */
+	const saveOnLeave = (field: BasicsField) => {
+		const draft = drafts[field];
+		if (draft === undefined) return;
+		const trimmed = draft.trim();
+		if (trimmed === stored[field].trim()) {
+			settle(field);
+			return;
+		}
+		if (field === "name" && !trimmed) return;
+		send(field, trimmed);
+	};
+	const pathDraft = drafts.gitPath;
+	const pathChanged =
+		pathDraft !== undefined &&
+		!!pathDraft.trim() &&
+		comparablePath(pathDraft) !== comparablePath(stored.gitPath);
+	const unsaved = (field: BasicsField | "gitPath") =>
+		failed[field] ? t("settingsPage.unsaved", { message: failed[field] }) : undefined;
 	return (
 		<Stack gap="sm" data-testid="project-basics">
 			<TextInput
 				label={t("projectName")}
-				value={name}
+				value={shown("name")}
 				required
 				disabled={!canManage}
-				error={!name.trim() ? t("projectNameRequired") : undefined}
-				onChange={(event) => {
-					touched.current = true;
-					setName(event.currentTarget.value);
-				}}
-				onBlur={() => save("name", name)}
+				error={!shown("name").trim() ? t("projectNameRequired") : unsaved("name")}
+				onChange={(event) => edit("name", event.currentTarget.value)}
+				onBlur={() => saveOnLeave("name")}
 			/>
 			<Textarea
 				label={t("projectDescription")}
-				value={description}
+				value={shown("description")}
 				autosize
 				minRows={1}
 				disabled={!canManage}
-				onChange={(event) => {
-					touched.current = true;
-					setDescription(event.currentTarget.value);
-				}}
-				onBlur={() => save("description", description)}
+				error={unsaved("description")}
+				onChange={(event) => edit("description", event.currentTarget.value)}
+				onBlur={() => saveOnLeave("description")}
 			/>
-			<TextInput
-				label={t("repositoryPath")}
-				description={t("defaultDirectoryHint")}
-				value={gitPath}
-				required
-				disabled={!canManage}
-				styles={{ input: { fontFamily: "var(--mantine-font-family-monospace)" } }}
-				error={!gitPath.trim() ? t("repoPathRequired") : undefined}
-				onChange={(event) => {
-					touched.current = true;
-					setGitPath(event.currentTarget.value);
-				}}
-				onBlur={() => save("gitPath", gitPath)}
-			/>
-			<SaveState pending={update.isPending} error={update.error} />
+			{/* The project directory decides which sessions belong here: it is saved only on 保存,
+			    after a confirmation, never when the field is left half typed. */}
+			<Group gap="xs" align="flex-end" wrap="nowrap">
+				<TextInput
+					label={t("repositoryPath")}
+					description={t("defaultDirectoryHint")}
+					value={shown("gitPath")}
+					required
+					disabled={!canManage}
+					style={{ flex: 1 }}
+					styles={{ input: { fontFamily: "var(--mantine-font-family-monospace)" } }}
+					error={!shown("gitPath").trim() ? t("repoPathRequired") : unsaved("gitPath")}
+					onChange={(event) => edit("gitPath", event.currentTarget.value)}
+				/>
+				{canManage && pathDraft !== undefined && (
+					<Button
+						variant="default"
+						onClick={() => settle("gitPath")}
+						data-testid="project-path-cancel"
+					>
+						{t("settingsPage.pathCancel")}
+					</Button>
+				)}
+				{canManage && (
+					<Button
+						disabled={!pathChanged}
+						loading={update.isPending && update.variables?.data?.gitPath !== undefined}
+						onClick={() => setConfirming(true)}
+						data-testid="project-path-save"
+					>
+						{t("settingsPage.pathSave")}
+					</Button>
+				)}
+			</Group>
+			<Modal
+				opened={confirming}
+				onClose={() => setConfirming(false)}
+				title={t("settingsPage.pathConfirmTitle")}
+			>
+				<Stack>
+					<Text size="sm">
+						{t("settingsPage.pathConfirm", {
+							from: stored.gitPath,
+							to: pathDraft?.trim() ?? "",
+						})}
+					</Text>
+					<Group justify="flex-end" gap="xs">
+						<Button variant="default" onClick={() => setConfirming(false)}>
+							{t("settingsPage.pathCancel")}
+						</Button>
+						<Button
+							onClick={() => {
+								setConfirming(false);
+								if (pathChanged && pathDraft !== undefined) send("gitPath", pathDraft.trim());
+							}}
+							data-testid="project-path-confirm"
+						>
+							{t("settingsPage.pathConfirmButton")}
+						</Button>
+					</Group>
+				</Stack>
+			</Modal>
+			{update.isPending && <SaveState pending error={null} />}
 		</Stack>
 	);
 }
@@ -177,17 +269,17 @@ export function ProjectRuleList({
 		enabled: canManage,
 	});
 	const stored = projectChapterSettings(project)[ruleKey];
-	const [rules, setRules] = useState<Rule[]>(() => normalizeRules(stored));
-	const touched = useRef(false);
-	const storedText = JSON.stringify(stored ?? []);
-	// biome-ignore lint/correctness/useExhaustiveDependencies: follows the stored list by value
-	useEffect(() => {
-		if (!touched.current) setRules(normalizeRules(stored));
-	}, [storedText]);
+	// The list shown is the stored one, or the change being saved. On success it follows the
+	// stored list again (re-read after the save); on failure the change is dropped, so an
+	// unsaved list never looks saved, and the error says so.
+	const [pending, setPending] = useState<Rule[] | null>(null);
+	const rules = pending ?? normalizeRules(stored);
 	const commit = (next: Rule[]) => {
-		touched.current = true;
-		setRules(next);
-		update.mutate({ id: String(project.id), data: { chapterSettings: { [ruleKey]: next } } });
+		setPending(next);
+		update.mutate(
+			{ id: String(project.id), data: { chapterSettings: { [ruleKey]: next } } },
+			{ onSettled: () => setPending(null) },
+		);
 	};
 	const directory = ruleKey === "whitelistDirs" || ruleKey === "blacklistDirs";
 	const [title, description] = RULE_TEXT[ruleKey];

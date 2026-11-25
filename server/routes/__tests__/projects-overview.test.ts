@@ -39,6 +39,8 @@ const {
 	users,
 } = await import("../../db/schema");
 const { generateId } = await import("../../lib/id");
+const { overviewAccessStats } = await import("../../services/project-overview");
+const { canWriteProject, projectsWritableBy } = await import("../../services/project-acl");
 
 const OWNER = "overview-owner";
 const MEMBER = "overview-member";
@@ -328,6 +330,12 @@ describe("sessions", () => {
 		expect(
 			(await call(OWNER, `/projects/${projectId}/sessions?view=all&cursor=${cursor}`)).status,
 		).toBe(400);
+		// And the other way round: 进行中 does not restart on a 全部 cursor.
+		const all = await call(OWNER, `/projects/${projectId}/sessions?view=all&limit=1`);
+		const allCursor = encodeURIComponent(all.body.nextCursor);
+		expect(
+			(await call(OWNER, `/projects/${projectId}/sessions?view=active&cursor=${allCursor}`)).status,
+		).toBe(400);
 	});
 });
 
@@ -415,5 +423,102 @@ describe("team cards", () => {
 		const plain = await call(MEMBER, `/projects/${projectId}/teams`);
 		expect(plain.body.teams[0].card).toBeUndefined();
 		expect((await call(OUTSIDER, `/projects/${projectId}/teams?counts=true`)).status).toBe(404);
+	});
+});
+
+describe("bounded work", () => {
+	test("access is judged once per session, not once per call, in a few batches", async () => {
+		// Many calls from ten workers of one team (one root) and from one session.
+		const workers = [workerId];
+		for (let index = 0; index < 9; index++) {
+			const id = await session(`helper-${index}`, { owner: OWNER, status: "working" });
+			await db
+				.update(narrators)
+				.set({
+					type: "subagent",
+					variant: "subagent:general",
+					aclRootNarratorId: teamId,
+					parentNarratorId: workerId,
+					contextProjectId: null,
+				})
+				.where(eq(narrators.id, id));
+			workers.push(id);
+		}
+		for (let index = 0; index < 120; index++)
+			await pendingCall(
+				index % 2
+					? (workers[index % workers.length] as string)
+					: (sessions["running-member"] as string),
+				{ command: `step ${index}` },
+			);
+		for (const read of [
+			() => call(MEMBER, `/projects/${projectId}/attention`),
+			() => call(MEMBER, "/projects/summaries"),
+		]) {
+			overviewAccessStats.batches = 0;
+			overviewAccessStats.judged = 0;
+			const response = await read();
+			expect(response.status).toBe(200);
+			// Roots: the team, the member's session, the owner's private one (and the other
+			// project's session for the summary), plus one batch for the teams' membership.
+			expect(overviewAccessStats.judged).toBeGreaterThan(0);
+			expect(overviewAccessStats.judged).toBeLessThanOrEqual(6);
+			expect(overviewAccessStats.batches).toBeLessThanOrEqual(7);
+		}
+		const attention = await call(MEMBER, `/projects/${projectId}/attention`);
+		expect(attention.body.more).toBe(true);
+	});
+
+	test("project write in one batch agrees with canWriteProject", async () => {
+		const rows = await db.query.projects.findMany();
+		for (const userId of [OWNER, MEMBER, READER, OUTSIDER]) {
+			const principal = { userId, isAdmin: false };
+			const batch = await projectsWritableBy(rows, principal);
+			for (const row of rows)
+				expect({ userId, project: row.name, write: batch.has(row.id) }).toEqual({
+					userId,
+					project: row.name,
+					write: await canWriteProject(row, principal),
+				});
+		}
+	});
+
+	test("ready items of an archived team count nowhere", async () => {
+		const before = (await call(OWNER, "/projects/summaries")).body.summaries.find(
+			(row: { projectId: string }) => row.projectId === projectId,
+		).waitingCount;
+		const archived = await call(OWNER, `/projects/${projectId}/teams`, {
+			method: "POST",
+			body: { name: "Archived team" },
+		});
+		expect(archived.status).toBe(201);
+		const at = new Date().toISOString();
+		await db.insert(teamWorkItems).values({
+			id: generateId(),
+			teamId: archived.body.id,
+			projectId,
+			title: "Ready in an archived team",
+			state: "ready",
+			createdAt: at,
+			updatedAt: at,
+		});
+		const live = (await call(OWNER, "/projects/summaries")).body.summaries.find(
+			(row: { projectId: string }) => row.projectId === projectId,
+		).waitingCount;
+		expect(live).toBe(before + 1);
+		await db
+			.update(narrators)
+			.set({ status: "archived" })
+			.where(eq(narrators.id, archived.body.id));
+		const after = (await call(OWNER, "/projects/summaries")).body.summaries.find(
+			(row: { projectId: string }) => row.projectId === projectId,
+		).waitingCount;
+		expect(after).toBe(before);
+		const attention = await call(OWNER, `/projects/${projectId}/attention`);
+		expect(
+			attention.body.entries.some(
+				(entry: { item?: { title: string } }) => entry.item?.title === "Ready in an archived team",
+			),
+		).toBe(false);
 	});
 });

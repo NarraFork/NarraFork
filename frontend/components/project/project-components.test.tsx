@@ -214,7 +214,7 @@ describe("sessions", () => {
 		expect(first).toBeGreaterThan(-1);
 		expect(recent).toBeGreaterThan(first);
 		expect(html.indexOf('href="/narrators/s2"')).toBeGreaterThan(recent);
-		expect(html).toContain("等批准 Edit");
+		expect(html).toContain("等批准编辑文件");
 		expect(html).toContain("zhouning");
 	});
 });
@@ -268,7 +268,19 @@ describe("attention", () => {
 		expect(html.match(/data-testid="team-approval-approve"/g)).toHaveLength(2);
 		// A plain session asks for itself: no "the worker asks".
 		expect(html).toContain("调研缓存方案");
-		expect(html).toContain("请求运行 Edit");
+		expect(html).toContain("请求编辑文件");
+		expect(html).toContain("的工作者请求运行命令");
+	});
+
+	test("no inner scroll on a desktop; on a phone the cards scroll sideways with dots", async () => {
+		const client = new QueryClient();
+		client.setQueryData(projectOverviewKeys.attention("p"), response);
+		const desktop = await render(<ProjectAttention projectId="p" enabled phone={false} />, client);
+		expect(desktop).toContain('data-attention-layout="desktop"');
+		expect(desktop).not.toContain("mantine-ScrollArea");
+		const phone = await render(<ProjectAttention projectId="p" enabled phone />, client);
+		expect(phone).toContain('data-attention-layout="phone"');
+		expect(phone).toContain("左右滑动");
 	});
 
 	test("hidden when nothing waits, and for a non-member", async () => {
@@ -325,6 +337,21 @@ describe("project list card", () => {
 			"en",
 		);
 		expect(quiet).toContain("No active sessions");
+		const capped = await render(
+			<ProjectListCard
+				project={{ id: "c", name: "busy", gitPath: null }}
+				summary={{
+					projectId: "c",
+					runningSessionCount: 500,
+					teamCount: 0,
+					waitingCount: 3,
+					lastActivityAt: null,
+					capped: true,
+				}}
+				now={now}
+			/>,
+		);
+		expect(capped).toContain(">3+ 等你<");
 		expect(quiet).not.toContain('data-testid="project-card-waiting"');
 		expect(quiet).not.toContain('data-testid="project-card-teams"');
 	});

@@ -316,8 +316,6 @@
 				"more": "还有 {{count}} 条",
 				"less": "收起",
 				"coordinator": "协调者",
-				"asksTool": "的工作者请求运行 {{tool}}",
-				"coordinatorAsksTool": "请求运行 {{tool}}",
 				"asksQuestion": "的工作者在问",
 				"coordinatorAsksQuestion": "在问",
 				"asksPlan": "的工作者提交了计划",
@@ -350,7 +348,15 @@
 				"moreInSession": "还有更多待处理没有列在这里，打开协调者会话查看。",
 				"unscanned": "可能还有待处理没有读到，打开协调者会话查看。",
 				"openFull": "打开会话",
-				"openAsker": "打开这个会话"
+				"openAsker": "打开这个会话",
+				"toolVerbs": {
+					"editFile": "请求编辑文件",
+					"runCommand": "请求运行命令",
+					"readFile": "请求读取文件",
+					"fetchWeb": "请求访问网页",
+					"useTool": "请求使用 {{tool}}"
+				},
+				"workerAsksAction": "的工作者{{action}}"
 			},
 			"work": {
 				"work": "工作",
@@ -368,7 +374,6 @@
 				"loadFailed": "读不到工作项。"
 			},
 			"row": {
-				"waitingTool": "等批准 {{tool}}",
 				"waitingAnswer": "等回答",
 				"waitingPlan": "等批准计划",
 				"waitingRule": "等权限规则",
@@ -396,7 +401,14 @@
 					"AskUserQuestion": "提问",
 					"ExitPlanMode": "提交计划"
 				},
-				"waitingPerson": "等人处理"
+				"waitingPerson": "等人处理",
+				"waitingTools": {
+					"editFile": "等批准编辑文件",
+					"runCommand": "等批准运行命令",
+					"readFile": "等批准读取文件",
+					"fetchWeb": "等批准访问网页",
+					"useTool": "等批准使用 {{tool}}"
+				}
 			},
 			"empty": {
 				"title": "工作项会出现在这里",
@@ -529,7 +541,9 @@
 				"all": "这个项目还没有会话。",
 				"mine": "你在这个项目里还没有会话。"
 			}
-		}
+		},
+		"newSession": "新会话",
+		"waitingBadgeMore": "{{count}}+ 等你"
 	},
 	"list": {
 		"subtitle": "有事等你处理的排在前面，其余按最近活动。会话按工作目录自动归入项目。",
@@ -595,6 +609,12 @@
 				"auto": "自动"
 			},
 			"followGlobal": "跟随全局：{{mode}}"
-		}
+		},
+		"unsaved": "未保存：{{message}}",
+		"pathSave": "保存目录",
+		"pathCancel": "取消",
+		"pathConfirmTitle": "更改项目目录？",
+		"pathConfirm": "项目目录将从 {{from}} 改为 {{to}}。会话会按工作目录重新归属：新目录下的会话归入本项目，原目录下、不在新目录里的会话离开本项目。",
+		"pathConfirmButton": "更改并重新归属"
 	}
 }

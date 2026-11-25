@@ -85,8 +85,9 @@ export function ProjectListCard({
 							}}
 							data-testid="project-card-waiting"
 						>
-							{t("page.waitingBadge", { count: waiting })}
-							{more}
+							{t(summary?.capped ? "page.waitingBadgeMore" : "page.waitingBadge", {
+								count: waiting,
+							})}
 						</Badge>
 					)}
 				</Group>

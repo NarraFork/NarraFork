@@ -52,7 +52,12 @@ import {
 import { lazy, type ReactNode, Suspense, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { AskUserQuestionBanner, coerceQuestions } from "../narrator/question/AskUserQuestionBanner";
-import { type AttentionEntry, type AttentionSource, attentionView } from "./team-page-model";
+import {
+	type AttentionEntry,
+	type AttentionSource,
+	attentionView,
+	toolVerb,
+} from "./team-page-model";
 import {
 	ATTENTION_BG,
 	ATTENTION_BORDER,
@@ -101,8 +106,8 @@ export interface AttentionActions {
 	onOpenSession?: (narratorId: string) => void;
 	/** R2 (the project page): open the team a card comes from. */
 	onOpenTeam?: (teamId: string) => void;
-	/** Called after a decision is sent (the project page refetches its own list). */
-	onDecided?: () => void;
+	/** Called after a decision is sent (the project page refetches what the card fed). */
+	onDecided?: (entry: AttentionEntry) => void;
 }
 
 const KIND_ICON = {
@@ -164,12 +169,24 @@ function Asker({
 			? t("teams.page.attention.coordinator")
 			: (entry.item?.title ?? entry.approval.agent.title ?? entry.approval.agent.id);
 	const generic = plain || coordinator;
-	const verb = {
-		tool: generic ? "coordinatorAsksTool" : "asksTool",
-		question: generic ? "coordinatorAsksQuestion" : "asksQuestion",
-		plan: generic ? "coordinatorAsksPlan" : "asksPlan",
-		rule: generic ? "coordinatorAsksRule" : "asksRule",
-	}[entry.kind];
+	// A tool call says what it asks for (「请求编辑文件」, 「请求运行命令」), not the tool's name.
+	const action = t(`teams.page.attention.toolVerbs.${toolVerb(entry.approval.toolName)}`, {
+		tool: entry.approval.toolName,
+	});
+	const asks =
+		entry.kind === "tool"
+			? generic
+				? action
+				: t("teams.page.attention.workerAsksAction", { action })
+			: t(
+					`teams.page.attention.${
+						{
+							question: generic ? "coordinatorAsksQuestion" : "asksQuestion",
+							plan: generic ? "coordinatorAsksPlan" : "asksPlan",
+							rule: generic ? "coordinatorAsksRule" : "asksRule",
+						}[entry.kind]
+					}`,
+				);
 	const reason = entry.approval.decisionReason;
 	return (
 		<>
@@ -188,7 +205,7 @@ function Asker({
 				>
 					{who}
 				</UnstyledButton>{" "}
-				{t(`teams.page.attention.${verb}`, { tool: entry.approval.toolName })}{" "}
+				{asks}{" "}
 				<Text component="span" size="xs" c="dimmed" title={entry.approval.createdAt}>
 					{formatSmartTime(entry.approval.createdAt)}
 					{plain &&
@@ -251,7 +268,7 @@ function ToolCard({
 	actions: AttentionActions;
 }) {
 	const { t } = useTranslation("projects");
-	const decision = useDecision(actions.teamId, entry.approval, actions.onDecided);
+	const decision = useDecision(actions.teamId, entry.approval, () => actions.onDecided?.(entry));
 	return (
 		<CardFrame
 			entry={entry}
@@ -310,7 +327,7 @@ function QuestionCard({
 	actions: AttentionActions;
 }) {
 	const { t } = useTranslation("projects");
-	const decision = useDecision(actions.teamId, entry.approval, actions.onDecided);
+	const decision = useDecision(actions.teamId, entry.approval, () => actions.onDecided?.(entry));
 	const [writing, setWriting] = useState(false);
 	const [own, setOwn] = useState("");
 	const [formOpen, setFormOpen] = useState(false);
@@ -524,7 +541,7 @@ function PlanCard({
 	actions: AttentionActions;
 }) {
 	const { t } = useTranslation("projects");
-	const decision = useDecision(actions.teamId, entry.approval, actions.onDecided);
+	const decision = useDecision(actions.teamId, entry.approval, () => actions.onDecided?.(entry));
 	const [open, setOpen] = useState(false);
 	const detail = useApprovalDetail(actions.teamId, entry.approval.id, open);
 	const plan = detail.data?.permission?.inputJson?.plan;
@@ -827,13 +844,6 @@ const PHONE_CSS = `
 [data-attention-layout="phone"] .nf-attention-buttons > * { flex: 1; }
 `;
 
-/** A narrow list: the buttons go under the text, full width, so each card stays usable. */
-const COMPACT_CSS = `
-[data-attention-layout="compact"] .nf-attention-card { flex-wrap: wrap !important; }
-[data-attention-layout="compact"] .nf-attention-card > .mantine-Stack-root { flex-basis: calc(100% - 44px); }
-[data-attention-layout="compact"] .nf-attention-buttons { max-width: none !important; width: 100%; padding-left: 42px; justify-content: flex-end; }
-`;
-
 export function TeamAttention({
 	entries,
 	phone,
@@ -841,12 +851,15 @@ export function TeamAttention({
 	unscanned = false,
 	onOpenCoordinatorSession,
 	flush = false,
-	compact = false,
+	inPage = false,
 	beyondKeys,
 	...actions
 }: AttentionActions & {
-	/** A narrow column with the cards listed (the project page on a phone): buttons wrap below. */
-	compact?: boolean;
+	/**
+	 * The block flows with its page (the project page): no inner scroll on a desktop, where the
+	 * fold to 「还有 N 条」 keeps it short.
+	 */
+	inPage?: boolean;
 	/** The wording of the "more than listed" line (default: open the coordinator's session). */
 	beyondKeys?: { more: string; unscanned: string };
 	entries: AttentionEntry[];
@@ -1007,14 +1020,21 @@ export function TeamAttention({
 			</Box>
 		);
 
+	const cards = shown.map((entry, index) => (
+		<Box
+			key={entry.id}
+			style={index > 0 ? { borderTop: `1px solid ${ATTENTION_BORDER}` } : undefined}
+		>
+			<AttentionCard entry={entry} actions={actions} />
+		</Box>
+	));
 	return (
 		<Box
 			px={flush ? 0 : "md"}
 			pt={flush ? 0 : "md"}
 			data-testid="team-attention"
-			data-attention-layout={compact ? "compact" : "desktop"}
+			data-attention-layout="desktop"
 		>
-			{compact && <style>{COMPACT_CSS}</style>}
 			<Box
 				style={{
 					background: ATTENTION_BG,
@@ -1026,16 +1046,13 @@ export function TeamAttention({
 				<Box px="md" py={8} style={{ borderBottom: `1px solid ${ATTENTION_BORDER}` }}>
 					{header}
 				</Box>
-				<ScrollArea.Autosize mah="40vh" type="auto">
-					{shown.map((entry, index) => (
-						<Box
-							key={entry.id}
-							style={index > 0 ? { borderTop: `1px solid ${ATTENTION_BORDER}` } : undefined}
-						>
-							<AttentionCard entry={entry} actions={actions} />
-						</Box>
-					))}
-				</ScrollArea.Autosize>
+				{inPage ? (
+					cards
+				) : (
+					<ScrollArea.Autosize mah="40vh" type="auto">
+						{cards}
+					</ScrollArea.Autosize>
+				)}
 				{more && (
 					<Box px="md" py={6} style={{ borderTop: `1px solid ${ATTENTION_BORDER}` }}>
 						{more}
