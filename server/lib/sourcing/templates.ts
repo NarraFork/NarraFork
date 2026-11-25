@@ -5,14 +5,16 @@
  * The behaviours (quota probe, then model list, availability, import dedupe) are attached
  * by the S2 PRs as each caller moves onto templates.
  */
+import { createHash } from "node:crypto";
 import type { QuotaSnapshot } from "@shared/quota-snapshot";
 import type { ServiceTemplateId, SourceProtocol, SourceRegion } from "@shared/sourcing/identify";
 import { probeTokenDanceQuota, type TokenDanceSubject } from "../../services/tokendance-service";
 import type { CommandCodeProviderSettings } from "../agent/commandcode-provider";
+import { getCodexCredentialDedupeKeys } from "../codex-credential-dedupe";
 import { getCodexManager } from "../codex-manager";
 import { projectCodexUsageSnapshot } from "../codex-usage";
 import { type CommandCodeUsageSubject, probeCommandCodeQuota } from "../commandcode-usage";
-import type { CredentialAuth } from "../credential-store";
+import type { Credential, CredentialAuth } from "../credential-store";
 import { probeDeepSeekQuota } from "../deepseek-balance-cache";
 import { probeKimiQuota } from "../kimi-usage-cache";
 import { type NugQuotaSubject, probeNugQuota } from "../nug-quota-cache";
@@ -53,6 +55,8 @@ export interface ServiceTemplate {
 	/** Regional endpoints; keys from different regions are not interchangeable. */
 	regions?: Partial<Record<SourceRegion, ProtocolEndpoints>>;
 	authKinds: readonly AuthKind[];
+	/** Import identity keys; unsupported auth has no identity in this template. */
+	dedupeKeys(credential: Omit<Credential, "id">): readonly string[];
 	/** Several credentials can share the group's pool. */
 	multiCredential: boolean;
 	/** Plan allowance windows rather than pay-per-use. */
@@ -108,7 +112,7 @@ const KIMI_CODE = (host: string): ProtocolEndpoints => ({
 	"openai-responses": `https://${host}/coding/v1`,
 });
 
-const TEMPLATES: readonly ServiceTemplate[] = [
+const TEMPLATES: readonly Omit<ServiceTemplate, "dedupeKeys">[] = [
 	{
 		id: "codex",
 		kind: "known",
@@ -270,10 +274,46 @@ function deepFreeze<T>(value: T): T {
 	return value;
 }
 
+const fingerprint = (kind: string, value: unknown): string =>
+	`${kind}:${createHash("sha256").update(JSON.stringify(value)).digest("hex")}`;
+
+function templateDedupeKeys(
+	template: Pick<ServiceTemplate, "authKinds">,
+): ServiceTemplate["dedupeKeys"] {
+	return (credential) => {
+		const { auth, target } = credential;
+		if (!template.authKinds.includes(auth.kind)) return [];
+		switch (auth.kind) {
+			case "oauth":
+			case "pat":
+			case "agent_identity":
+				return getCodexCredentialDedupeKeys({ ...credential.account, ...auth });
+			case "api_key": {
+				const key = auth.apiKey.trim();
+				return key && target.groupId ? [fingerprint("api_key", [target.groupId, key])] : [];
+			}
+			case "opaque": {
+				if (!target.pluginContributionId) return [];
+				const fields = Object.keys(auth.fields)
+					.sort()
+					.map((name) => [name, auth.fields[name]]);
+				return [fingerprint("opaque", [target.pluginContributionId, fields])];
+			}
+		}
+	};
+}
+
 const byId = new Map<ServiceTemplateId, ServiceTemplate>(
 	TEMPLATES.map((template) => {
 		const probeQuota = QUOTA_PROBES[template.id];
-		return [template.id, deepFreeze(probeQuota ? { ...template, probeQuota } : template)];
+		return [
+			template.id,
+			deepFreeze({
+				...template,
+				...(probeQuota ? { probeQuota } : {}),
+				dedupeKeys: templateDedupeKeys(template),
+			}),
+		];
 	}),
 );
 

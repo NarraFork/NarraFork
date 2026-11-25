@@ -1852,6 +1852,9 @@ export async function clearData(target: ClearTarget): Promise<ClearResult> {
 			}
 		});
 		transaction();
+		if (clearProviders) {
+			await (await import("@server/lib/credential-transfer/plugin")).clearPluginCredentialSecrets();
+		}
 		if (clearSessions) {
 			invalidateGitIdentityCache();
 			invalidateTaskBackend();
