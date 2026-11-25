@@ -390,11 +390,9 @@ for (const cancellation of ["deadline", "caller"] as const) {
 			});
 			const control = getRunControl(TARGET);
 			expect(control).toBeDefined();
-			// Registration is asynchronous. A deadline may cancel preparation before
-			// any model pass, so inspect its persisted binding after the terminal;
-			// only caller cancellation must wait for the fake executor to start.
-			if (cancellation === "caller") await passStarted;
-			else await handle.terminal;
+			// Both cancellation branches are controlled after the model pass starts.
+			// Waiting for terminal here would deadlock the deadline callback below.
+			await passStarted;
 			expect(stored().registration?.run).toMatchObject({
 				principal: { userId: A },
 				deadlineAt,
