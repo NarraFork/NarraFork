@@ -5,13 +5,20 @@
  * 那样硬编码，而是拉取后缓存。设置读取只看缓存并在后台补拉，不把上游延迟算进这次响应。
  */
 
-import { type CommandCodeCredential, resolveCommandCodeToken } from "./commandcode-manager";
+import fs, { type FSWatcher } from "node:fs";
+import { basename, dirname } from "node:path";
+import {
+	type CommandCodeCredential,
+	commandCodeAuthPath,
+	resolveCommandCodeToken,
+} from "./commandcode-manager";
 import {
 	type CommandCodeModelInfo,
 	commandCodeProviderBase,
 	parseCommandCodeModels,
 } from "./commandcode-protocol";
 import { readResponseJsonLimited } from "./commandcode-usage";
+import { logger } from "./logger";
 import { captureModelOptionsArray, optionInput } from "./model-options-contract";
 import { getProviderKeyStore } from "./provider-keys";
 import { settings, subscribeSettingsChanges } from "./settings";
@@ -92,7 +99,7 @@ export function getCachedCommandCodeModels(
 	return (token ? cache.token === token : cache.source === "cli") ? cache.models : [];
 }
 
-/** Prime before startup recovery; later connection edits refresh through the same owner. */
+/** Prime before recovery; settings and CLI auth edits publish through this same owner. */
 export async function startCommandCodeModelCatalog(): Promise<() => void> {
 	let connection: string | undefined;
 	let stopped = false;
@@ -100,18 +107,23 @@ export async function startCommandCodeModelCatalog(): Promise<() => void> {
 	const refresh = async () => {
 		if (stopped) return;
 		const config = settings.commandCode;
-		const next = JSON.stringify([
-			config?.apiKey?.trim() ?? "",
-			commandCodeProviderBase(config?.baseUrl),
-			!!config?.disabled,
-		]);
+		const base = commandCodeProviderBase(config?.baseUrl);
+		// Only the owner re-reads CLI auth on change; picker and routing read publications.
+		const credential = config?.disabled
+			? undefined
+			: resolveCommandCodeToken(config?.apiKey, { fresh: true }).credential;
+		const key = credential && cacheKey(credential.token, base, credential.source);
+		const next = JSON.stringify([base, key, !!config?.disabled]);
 		if (next === connection) return;
-		if (connection === undefined) {
-			// Preserve the owner's same-slot stale fallback if startup refresh fails.
+		if (
+			connection === undefined &&
+			(!cache || cacheKey(cache.token, cache.base, cache.source) === key)
+		) {
+			// Preserve only the owner's same-identity stale fallback on startup failure.
 			generation++;
 			inflight = undefined;
 		} else {
-			// A changed connection must not inherit a late response or old directory.
+			// Account switch/logout must also fence late responses from the old identity.
 			invalidateCommandCodeModelsCache();
 		}
 		connection = next;
@@ -127,6 +139,50 @@ export async function startCommandCodeModelCatalog(): Promise<() => void> {
 			void refresh().catch(() => {});
 		});
 	};
+	const authPath = commandCodeAuthPath();
+	const authDirectory = dirname(authPath);
+	let authWatcher: FSWatcher | undefined;
+	let homeWatcher: FSWatcher | undefined;
+	const watchAuthDirectory = () => {
+		authWatcher?.close();
+		authWatcher = undefined;
+		try {
+			// Watch the directory so atomic auth.json replacements do not orphan the handle.
+			const watcher = fs.watch(authDirectory, { persistent: false }, (_event, filename) => {
+				if (stopped || watcher !== authWatcher) return;
+				if (filename && filename !== basename(authPath)) return;
+				changed();
+			});
+			authWatcher = watcher;
+			watcher.on("error", () => {
+				if (stopped || watcher !== authWatcher) return;
+				watcher.close();
+				authWatcher = undefined;
+				changed();
+			});
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+				logger.warn("Command Code CLI auth watcher unavailable", { error: String(error) });
+			}
+		}
+	};
+	try {
+		// The CLI directory may not exist on cold start, or be replaced during login.
+		homeWatcher = fs.watch(dirname(authDirectory), { persistent: false }, (_event, filename) => {
+			if (stopped || (filename && filename !== basename(authDirectory))) return;
+			watchAuthDirectory();
+			changed();
+		});
+		homeWatcher.on("error", (error) => {
+			if (stopped) return;
+			homeWatcher?.close();
+			homeWatcher = undefined;
+			logger.warn("Command Code CLI home watcher unavailable", { error: String(error) });
+		});
+	} catch (error) {
+		logger.warn("Command Code CLI home watcher unavailable", { error: String(error) });
+	}
+	watchAuthDirectory();
 	const stopSettings = subscribeSettingsChanges(changed);
 	const stopKeys = getProviderKeyStore().onChange(changed);
 	await refresh().catch(() => {});
@@ -134,6 +190,8 @@ export async function startCommandCodeModelCatalog(): Promise<() => void> {
 		stopped = true;
 		stopSettings();
 		stopKeys();
+		authWatcher?.close();
+		homeWatcher?.close();
 		invalidateCommandCodeModelsCache();
 	};
 }

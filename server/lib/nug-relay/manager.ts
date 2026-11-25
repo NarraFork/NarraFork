@@ -28,9 +28,18 @@ function relaySignature(config: NUGProviderConfig): string {
 	return JSON.stringify([
 		config.baseUrl,
 		config.apiKey,
-		config.egressMode,
+		config.egressMode ?? "nug",
 		config.egressProxyUrl ?? "",
 	]);
+}
+
+/** A captured request may keep its key, but must not combine it with a retired connection. */
+export function assertNugConnectionCurrent(config: NUGProviderConfig): void {
+	const live = settings.nugProviders?.find((provider) => provider.id === config.id);
+	// Standalone adapters can inspect explicit configs; they cannot create an uncommitted relay.
+	// Normalize only auth here: inference keys can legitimately differ from the root projection.
+	if (live && relaySignature({ ...config, apiKey: live.apiKey }) !== relaySignature(live))
+		throw new Error("NUG connection changed before provider construction");
 }
 
 export function usesLocalEgress(config: NUGProviderConfig): boolean {
@@ -43,6 +52,11 @@ export function usesLocalEgress(config: NUGProviderConfig): boolean {
  * (baseUrl/apiKey/egress proxy) changed, stops it when the mode reverted.
  */
 export function ensureNugRelayClient(config: NUGProviderConfig): void {
+	// Old callers may hold a pre-await snapshot. Only its id may select live relay ownership.
+	reconcileNugRelayProvider(config.id);
+}
+
+function ensureCommittedNugRelayClient(config: NUGProviderConfig): void {
 	const existing = managed.get(config.id);
 	if (!usesLocalEgress(config)) {
 		if (existing) {
@@ -99,7 +113,7 @@ export function startNugRelayOwner(): void {
 			queued = false;
 			if (stopped) return;
 			try {
-				reconcileNugRelayClients(settings.nugProviders ?? []);
+				reconcileNugRelayClients();
 			} catch (error) {
 				logger.warn("NUG relay reconciliation failed", { error: String(error) });
 			}
@@ -127,13 +141,17 @@ export function stopAllNugRelayClients(): void {
 	managed.clear();
 }
 
-/** Reconcile one connection against enabled live keys, not its potentially disabled projection. */
-export function reconcileNugRelayProvider(config: NUGProviderConfig): boolean {
+/** Resolve the committed connection by id before combining it with enabled live keys. */
+export function reconcileNugRelayProvider(providerId: string): boolean {
+	const config = settings.nugProviders?.find((provider) => provider.id === providerId);
+	// A stale lazy constructor is not an owner-removal event. Batch reconciliation
+	// below owns deleting retired ids; an absent snapshot must not mutate live sockets.
+	if (!config) return false;
 	const stored = peekProviderKeyStore()?.list(nugKeyOwner(config.id)) ?? [];
 	const key = stored.find((candidate) => !candidate.disabled && !!candidate.apiKey.trim());
 	const effective = key ? withProviderKey(config, key) : stored.length ? undefined : config;
 	if (!config.disabled && usesLocalEgress(config) && effective?.apiKey.trim()) {
-		ensureNugRelayClient(effective);
+		ensureCommittedNugRelayClient(effective);
 		return true;
 	}
 	managed.get(config.id)?.client.stop();
@@ -141,11 +159,11 @@ export function reconcileNugRelayProvider(config: NUGProviderConfig): boolean {
 	return false;
 }
 
-/** Sync the managed set with committed settings and the credential owner's current view. */
-export function reconcileNugRelayClients(providers: NUGProviderConfig[]): void {
+/** Sync the committed set; caller snapshots never authorize endpoints or retiring live ids. */
+export function reconcileNugRelayClients(_capturedProviders?: readonly NUGProviderConfig[]): void {
 	const wanted = new Set<string>();
-	for (const provider of providers) {
-		if (reconcileNugRelayProvider(provider)) wanted.add(provider.id);
+	for (const provider of settings.nugProviders ?? []) {
+		if (reconcileNugRelayProvider(provider.id)) wanted.add(provider.id);
 	}
 	for (const [id, entry] of managed) {
 		if (!wanted.has(id)) {

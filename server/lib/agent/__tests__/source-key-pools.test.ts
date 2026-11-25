@@ -20,6 +20,7 @@ import {
 	withProviderKey,
 } from "../../provider-keys";
 import {
+	type NUGProviderConfig,
 	registerAutoSourceProbe,
 	resolveEffectiveModel,
 	saveSettings,
@@ -887,6 +888,16 @@ function relayPool(fallback?: boolean) {
 	client.currentChannelId = "online-A-channel";
 	return { adapter, model, first, backup, relayConfig };
 }
+function commitRelayChange(config: NUGProviderConfig) {
+	saveSettings({
+		...settings,
+		nugProviders: settings.nugProviders?.map((current) =>
+			current.id === config.id ? config : current,
+		),
+	});
+	ensureNugRelayClient(config);
+}
+
 function expectRelayResult(
 	result: Awaited<ReturnType<typeof relayRequest>>,
 	operation: RelayOperation,
@@ -1100,7 +1111,7 @@ describe("real NUG codex pool relay credential and final transport matching", ()
 			requests.length = 0;
 			await expect(
 				relayRequest(adapter, model, operation, () => {
-					ensureNugRelayClient({ ...relayConfig, apiKey: "reconnected-key-C" });
+					commitRelayChange({ ...relayConfig, apiKey: "reconnected-key-C" });
 					const client = relayClients.at(-1);
 					if (!client) throw new Error("missing rebound relay socket");
 					client.status = "online";
@@ -1159,6 +1170,7 @@ describe("real NUG codex pool relay credential and final transport matching", ()
 		for (const fallback of [false, true]) {
 			test(`relay ${change} changes after headers assembled, fallback=${fallback}`, async () => {
 				const { adapter, model, first, relayConfig } = relayPool(fallback);
+				const attemptedApiKey = first.apiKey;
 				let mutations = 0;
 				const rebind = () => {
 					mutations++;
@@ -1168,7 +1180,7 @@ describe("real NUG codex pool relay credential and final transport matching", ()
 						client.status = "connecting";
 						return;
 					}
-					ensureNugRelayClient({
+					commitRelayChange({
 						...relayConfig,
 						...(change === "apiKey" ? { apiKey: "reconnected-key-C" } : {}),
 						...(change === "baseUrl" ? { baseUrl: "https://different-gateway.invalid" } : {}),
@@ -1184,7 +1196,7 @@ describe("real NUG codex pool relay credential and final transport matching", ()
 					expectRelayResult(
 						await relayRequest(adapter, model, "chat", rebind),
 						"chat",
-						first.apiKey,
+						attemptedApiKey,
 						first.id,
 					);
 					expect(new Headers(requests[0]?.headers).has("X-NUG-Relay-Channel")).toBe(false);
