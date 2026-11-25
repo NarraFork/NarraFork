@@ -7,20 +7,17 @@ import {
 	Loader,
 	Menu,
 	NativeSelect,
-	Popover,
-	Stack,
 	Text,
 	Tooltip,
 	UnstyledButton,
 } from "@mantine/core";
 import type { SubagentModelInheritance } from "@shared/model-inheritance";
-import type { ProviderBalanceSnapshot } from "@shared/provider-balance";
+import type { QuotaSnapshotEntry } from "@shared/quota-snapshot";
 import { IconLock, IconLockOpen, IconShield } from "@tabler/icons-react";
 import type React from "react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useInputMenu } from "../../../hooks/useInputMenu";
 import type { SpecTaskItem } from "../../../lib/api/spec";
-import type { OpencodeUsageCache } from "../../../lib/api/types";
 import {
 	AGG_MODEL_PREFIX,
 	FOLLOW_DEFAULT_MODEL,
@@ -51,11 +48,8 @@ import { CodexQuotaIndicator } from "../model/CodexQuotaIndicator";
 import { ModelPriceModal } from "../model/ModelPriceModal";
 import { modelInheritanceLabel } from "../model/model-inheritance-label";
 import { MODEL_MENU_POSITIONING } from "../model/model-menu-selection";
-import { OpencodeQuotaIndicator } from "../model/OpencodeQuotaIndicator";
 import { PaginatedModelMenuItems as ModelMenuItems } from "../model/PaginatedModelMenuItems";
-import { QuotaPanelIndicator } from "../model/QuotaPanelIndicator";
-import type { QuotaPanelView } from "../model/quota-panel-view";
-import { Sub2ApiSubscriptionQuotaIndicator } from "../model/Sub2ApiSubscriptionQuotaIndicator";
+import { QuotaSnapshotIndicator } from "../model/QuotaSnapshotIndicator";
 import { useModelMenuProviderBadges } from "../model/use-model-menu-provider-badges";
 import type { ProviderHeaderActions } from "../model/use-model-menu-refresh-props";
 import { PERM_MODE_ICONS, PERM_MODES } from "../narrator-panel-types";
@@ -234,29 +228,9 @@ export interface NarratorInteractionStatusBarProps {
 	};
 
 	quota: {
-		balance: string | null;
-		detailsText: string | null;
-		hasDetailsPopover: boolean;
-		/**
-		 * OpenCode Go plan allowance for the current model's provider. Rendered by its
-		 * own structured indicator; `undefined` when the model is not on a Go endpoint.
-		 */
-		opencode?: {
-			usage: OpencodeUsageCache | null | undefined;
-			waitingForQuota: boolean;
-			waitingText: string | null;
-		};
-		/** The active sub2api subscription, already isolated by the balance query. */
-		sub2api?: { snapshot: ProviderBalanceSnapshot; queryFailed: boolean };
-		/**
-		 * Windowed allowance of another provider (Kimi, Command Code), shown with the
-		 * same progress-bar indicator as OpenCode Go. `undefined` when not applicable.
-		 */
-		panel?: {
-			view: QuotaPanelView | null;
-			waitingForQuota: boolean;
-			waitingText: string | null;
-		};
+		entries: QuotaSnapshotEntry[];
+		waitingForQuota: boolean;
+		waitingText: string | null;
 		shouldShowNugRechargeButton: boolean;
 		shouldShowNugRechargeInQuotaDetails: boolean;
 		onOpenNugRecharge: () => void;
@@ -353,22 +327,6 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 	// the status bar since nothing else drives it; hovering the balance opens it and
 	// leaving schedules a short (150ms) close so a small gap between trigger and
 	// dropdown does not snap it shut.
-	const [quotaDetailsOpened, setQuotaDetailsOpened] = useState(false);
-	const quotaDetailsCloseTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-	const cancelQuotaDetailsClose = useCallback(() => {
-		if (quotaDetailsCloseTimer.current) {
-			clearTimeout(quotaDetailsCloseTimer.current);
-			quotaDetailsCloseTimer.current = null;
-		}
-	}, []);
-	const scheduleQuotaDetailsClose = useCallback(() => {
-		cancelQuotaDetailsClose();
-		quotaDetailsCloseTimer.current = setTimeout(() => {
-			setQuotaDetailsOpened(false);
-			quotaDetailsCloseTimer.current = null;
-		}, 150);
-	}, [cancelQuotaDetailsClose]);
-	useEffect(() => () => cancelQuotaDetailsClose(), [cancelQuotaDetailsClose]);
 
 	// Retry countdown ticker. Only the work-indicator text below reads it, so it
 	// lives here rather than in NarratorPanel. Recomputes every second while a
@@ -587,119 +545,27 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 							)}
 							{contextIndicator}
 							<CodexQuotaIndicator
+								detailsOnly
 								enabled={codexControls.isBuiltInCodexModel && !isWorkspacePreview}
 								isAdmin={currentUser?.role === "admin"}
 								compact={isMobileViewport}
 							/>
-							{quota.opencode && !isWorkspacePreview && (
-								<OpencodeQuotaIndicator
-									usage={quota.opencode.usage}
-									waitingForQuota={quota.opencode.waitingForQuota}
-									waitingText={quota.opencode.waitingText}
-									isMobile={isMobileViewport}
-								/>
-							)}
-							{quota.sub2api && !isWorkspacePreview && (
-								<Sub2ApiSubscriptionQuotaIndicator
-									snapshot={quota.sub2api.snapshot}
-									queryFailed={quota.sub2api.queryFailed}
-									isMobile={isMobileViewport}
-								/>
-							)}
-							{quota.panel && !isWorkspacePreview && (
-								<QuotaPanelIndicator
-									view={quota.panel.view}
-									waitingForQuota={quota.panel.waitingForQuota}
-									waitingText={quota.panel.waitingText}
-									isMobile={isMobileViewport}
-								/>
-							)}
-							{/* Generic gateway/API quota balance */}
-							{!quota.sub2api &&
-								quota.balance != null &&
-								(quota.hasDetailsPopover ? (
-									<Popover
-										opened={quotaDetailsOpened}
-										onChange={setQuotaDetailsOpened}
-										position="top"
-										withArrow
-										withinPortal
-										shadow="md"
-									>
-										<Popover.Target>
-											<UnstyledButton
-												onClick={(event) => {
-													event.stopPropagation();
-													cancelQuotaDetailsClose();
-													setQuotaDetailsOpened((opened) => !opened);
-												}}
-												onPointerEnter={() => {
-													if (!isMobileViewport) {
-														cancelQuotaDetailsClose();
-														setQuotaDetailsOpened(true);
-													}
-												}}
-												onPointerLeave={() => {
-													if (!isMobileViewport) scheduleQuotaDetailsClose();
-												}}
-												style={{ flexShrink: 0, maxWidth: 120 }}
-											>
-												<Text
-													size="xs"
-													c="dimmed"
-													style={{
-														cursor: "pointer",
-														maxWidth: 120,
-														overflow: "hidden",
-														textOverflow: "ellipsis",
-														whiteSpace: "nowrap",
-													}}
-												>
-													{quota.balance}
-												</Text>
-											</UnstyledButton>
-										</Popover.Target>
-										<Popover.Dropdown
-											maw={360}
-											onPointerEnter={() => {
-												if (!isMobileViewport) cancelQuotaDetailsClose();
-											}}
-											onPointerLeave={() => {
-												if (!isMobileViewport) scheduleQuotaDetailsClose();
-											}}
-										>
-											<Stack gap={6}>
-												{quota.detailsText && (
-													<Text
-														size="xs"
-														style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}
-													>
-														{quota.detailsText}
-													</Text>
-												)}
-												{recharge.showInDetails && (
-													<Button
-														size="compact-xs"
-														variant="light"
-														onClick={() => {
-															setQuotaDetailsOpened(false);
-															recharge.onOpen();
-														}}
-													>
-														{t("recharge.open")}
-													</Button>
-												)}
-											</Stack>
-										</Popover.Dropdown>
-									</Popover>
-								) : (
-									// No details popover here, so the clipped balance needs its own
-									// hover/tap reveal.
-									<TruncatedText
-										size="xs"
-										c="dimmed"
-										text={quota.balance}
-										style={{ flexShrink: 0, maxWidth: 120 }}
+							{!isWorkspacePreview &&
+								quota.entries.map((entry, index) => (
+									<QuotaSnapshotIndicator
+										key={`${entry.groupId}:${entry.credentialId ?? ""}`}
+										snapshot={entry.snapshot}
+										title={entry.prefix}
+										waitingForQuota={quota.waitingForQuota}
+										waitingText={quota.waitingText}
+										isMobile={isMobileViewport}
+										detailsFooter={
+											index === 0 && recharge.showInDetails ? (
+												<Button size="compact-xs" variant="light" onClick={recharge.onOpen}>
+													{t("recharge.open")}
+												</Button>
+											) : undefined
+										}
 									/>
 								))}
 							{recharge.showButton && (

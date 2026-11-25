@@ -9,10 +9,8 @@ import {
 	completeTokenDanceOAuth,
 	createTokenDancePaymentSession,
 	deleteTokenDanceConnection,
-	getTokenDanceBalance,
 	getTokenDanceConnection,
 	getTokenDancePaymentSession,
-	refreshTokenDanceBalance,
 	refreshTokenDanceModels,
 	restoreTokenDanceDraft,
 	setTokenDanceDisabled,
@@ -43,10 +41,7 @@ tokendanceRoutes.onError((error, c) => {
 // Explicit session gate remains necessary when this router is mounted independently.
 // External OAuth admin principals must never reach credential management.
 tokendanceRoutes.use("*", requireSessionAuth);
-// Register the ordinary-user summary before the administrator gate.
-tokendanceRoutes.get("/balance", (c) => c.json(getTokenDanceBalance()));
 tokendanceRoutes.use("*", requireAdmin);
-tokendanceRoutes.post("/balance/refresh", async (c) => c.json(await refreshTokenDanceBalance()));
 tokendanceRoutes.post("/payment/sessions", async (c) => {
 	const input = await body(
 		c.req.raw,

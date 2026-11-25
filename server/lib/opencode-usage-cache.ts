@@ -43,7 +43,7 @@ import { importLegacyQuotaCache, quotaStore } from "./sourcing/quota-store";
  * key under its credential identity, because a percentage of a plan belongs to one
  * account: a restart never resurrects an allowance under a different key. This module
  * keeps the scheduling (staleness, failure backoff, post-request refreshes) and the
- * `generation` that stops a late response from an account the user has since replaced
+ * entry identity that stops a late response from an account the user has since replaced
  * from publishing into the current one.
  */
 
@@ -78,7 +78,6 @@ export interface OpencodeUsagePayload {
 }
 
 export interface OpencodeUsageCache extends OpencodeUsagePayload {
-	generation: string;
 	fetchedAt: number;
 	error: string | null;
 }
@@ -101,6 +100,7 @@ const FETCH_TIMEOUT_MS = 15_000;
 
 interface Entry {
 	identity: string;
+	/** Opaque identity publication consumed by the existing model-options reader. */
 	generation: string;
 	inFlight?: Promise<OpencodeUsageCache | null>;
 	controller?: AbortController;
@@ -111,7 +111,7 @@ interface Entry {
 }
 const entries = new Map<string, Entry>();
 
-type PersistedUsage = Omit<OpencodeUsageCache, "generation">;
+type PersistedUsage = OpencodeUsageCache;
 
 /** The file this cache used before the quota store; read once, then deleted. */
 const LEGACY_FILE = "opencode-usages.json";
@@ -168,7 +168,6 @@ function cacheOf(id: string, entry: Entry): OpencodeUsageCache {
 	const snapshot = quotaStore.get(id, entry.identity, restoreSnapshot);
 	const detail = snapshot?.detail as OpencodeUsagePayload | undefined;
 	return {
-		generation: entry.generation,
 		rolling: detail?.rolling ?? null,
 		weekly: detail?.weekly ?? null,
 		monthly: detail?.monthly ?? null,
@@ -176,6 +175,15 @@ function cacheOf(id: string, entry: Entry): OpencodeUsageCache {
 		fetchedAt: snapshot?.fetchedAt ?? 0,
 		error: snapshot?.error ?? null,
 	};
+}
+
+export const isOpencodeQuotaRefreshing = (keyId: string): boolean => !!entries.get(keyId)?.inFlight;
+
+/** Reconcile live credential identity before exposing a snapshot. */
+export function getOpencodeQuotaSnapshot(keyId: string): QuotaSnapshot | undefined {
+	syncOpencodeUsageCache();
+	const entry = entries.get(keyId);
+	return entry ? quotaStore.get(keyId, entry.identity, restoreSnapshot) : undefined;
 }
 
 /** One quota probe: fetch, then the shared snapshot shape. Throws on failure. */
@@ -501,7 +509,7 @@ export function refreshOpencodeKeyUsage(keyId: string): Promise<OpencodeUsageCac
 			if (entries.get(keyId) !== entry) return null;
 			// Never copy transport exceptions, response text, or credentials to logs/API.
 			// The last good numbers stay so the UI can show them as stale.
-			const { generation: _generation, ...previous } = cacheOf(keyId, entry);
+			const previous = cacheOf(keyId, entry);
 			quotaStore.set(
 				keyId,
 				entry.identity,
@@ -542,34 +550,10 @@ export function peekOpencodeUsageGeneration(providerId: string): string | undefi
 		? entry.generation
 		: undefined;
 }
-
-/** Provider id → `pick(entry)` of the key it reports. */
-function byProvider<T>(pick: (id: string, entry: Entry) => T): Record<string, T> {
-	syncOpencodeUsageCache();
-	const result: Record<string, T> = {};
-	const subjects = opencodeSubjects();
-	for (const providerId of new Set(subjects.map((s) => s.providerId))) {
-		const id = shownSubjectId(subjects, providerId) ?? "";
-		const entry = entries.get(id);
-		if (entry) result[providerId] = pick(id, entry);
-	}
-	return result;
-}
-
-/** Provider id → the allowance it reports (status bar). */
-export function getAllOpencodeCachedUsages(): Record<string, OpencodeUsageCache> {
-	return byProvider(cacheOf);
-}
-
 /** Key id → its allowance (key list). */
 export function getOpencodeKeyUsages(): Record<string, OpencodeUsageCache> {
 	syncOpencodeUsageCache();
 	return Object.fromEntries([...entries].map(([id, entry]) => [id, cacheOf(id, entry)]));
-}
-
-/** Opaque, random runtime tokens only; never expose or derive them from credentials. */
-export function getOpencodeUsageGenerations(): Record<string, string> {
-	return byProvider((_id, entry) => entry.generation);
 }
 
 export async function refreshAllOpencodeUsages(): Promise<void> {

@@ -15,6 +15,7 @@ import { withProviderKey } from "../provider-keys";
 import { settings } from "../settings";
 import {
 	importLegacyQuotaCache,
+	parseQuotaSnapshot,
 	QuotaStore,
 	quotaStore,
 	STREAM_QUOTA_SOURCE,
@@ -89,6 +90,56 @@ for (const { name, identity, source } of quotaSources) {
 }
 
 describe("quota store", () => {
+	test("period absolute amounts round-trip through persistence and ignore invalid optional fields", async () => {
+		const window = {
+			kind: "other" as const,
+			label: "daily",
+			usedRatio: 1,
+			resetsAt: null,
+			used: 12,
+			total: 10,
+			remaining: -2,
+			unit: "USD",
+		};
+		const raw = {
+			...snapshot(1, null),
+			windows: [{ ...window, detail: { secret: "private-window-detail" } }],
+		};
+		expect(parseQuotaSnapshot(raw)?.windows).toEqual([window]);
+		const invalid = {
+			...window,
+			used: "12",
+			total: Infinity,
+			remaining: NaN,
+			unit: { secret: "private-unit" },
+		};
+		expect(parseQuotaSnapshot({ ...raw, windows: [invalid] })?.windows).toEqual([
+			{ kind: "other", label: "daily", usedRatio: 1, resetsAt: null },
+		]);
+		const file = `quota-periods-test-${crypto.randomUUID()}.json`;
+		const store = new QuotaStore(createPersistedCredentialCache(file, parseQuotaSnapshot));
+		store.set("period-key", "identity", { ...snapshot(1, null), windows: [window] });
+		await store.flush();
+		const restarted = new QuotaStore(createPersistedCredentialCache(file, parseQuotaSnapshot));
+		expect(restarted.get("period-key", "identity")?.windows).toEqual([window]);
+	});
+	test("public expiry survives persisted parsing, while legacy and invalid expiries stay unknown", async () => {
+		const expiresAt = Date.parse("2027-01-01T00:00:00Z");
+		const raw = { ...snapshot(0.4, null), expiresAt };
+		expect(parseQuotaSnapshot(raw)?.expiresAt).toBe(expiresAt);
+		for (const legacy of [
+			snapshot(0.4, null),
+			{ ...raw, expiresAt: "2027-01-01" },
+			{ ...raw, expiresAt: Number.NaN },
+		])
+			expect(parseQuotaSnapshot(legacy)).not.toHaveProperty("expiresAt");
+		const file = `quota-expiry-test-${crypto.randomUUID()}.json`;
+		const store = new QuotaStore(createPersistedCredentialCache(file, parseQuotaSnapshot));
+		store.set("expiring", "same-identity", raw);
+		await store.flush();
+		const restored = new QuotaStore(createPersistedCredentialCache(file, parseQuotaSnapshot));
+		expect(restored.get("expiring", "same-identity")?.expiresAt).toBe(expiresAt);
+	});
 	test("restart restores only matching fingerprints, with cold peeks and independent persisted slots", async () => {
 		const file = `quota-store-test-${crypto.randomUUID()}.json`;
 		const store = new QuotaStore(createPersistedCredentialCache(file, (raw) => raw as never));

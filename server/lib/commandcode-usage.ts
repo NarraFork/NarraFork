@@ -338,6 +338,13 @@ export function listCommandCodeUsageSubjects(): CommandCodeUsageSubject[] {
 		: [];
 }
 
+function commandCodeUsageSubject(credentialId?: string): CommandCodeUsageSubject | undefined {
+	const subjects = listCommandCodeUsageSubjects();
+	return credentialId === undefined
+		? subjects[0]
+		: subjects.find((subject) => subject.id === credentialId);
+}
+
 function restoreSnapshot(snapshot: QuotaSnapshot): QuotaSnapshot {
 	const detail = (snapshot.detail ?? {}) as Partial<CommandCodeUsage>;
 	const parsed = parseCommandCodeCredits(detail);
@@ -349,6 +356,31 @@ function restoreSnapshot(snapshot: QuotaSnapshot): QuotaSnapshot {
 
 function cachedSnapshot(subject: CommandCodeUsageSubject): QuotaSnapshot | undefined {
 	return quotaStore.get(subject.id, commandCodeQuotaIdentity(subject.config), restoreSnapshot);
+}
+
+export function getCommandCodeQuotaSnapshot(
+	credentialId?: string,
+): { credentialId: string; snapshot: QuotaSnapshot | undefined } | undefined {
+	const subject = commandCodeUsageSubject(credentialId);
+	return subject ? { credentialId: subject.id, snapshot: cachedSnapshot(subject) } : undefined;
+}
+
+export function isCommandCodeQuotaRefreshing(credentialId?: string): boolean {
+	const subject = commandCodeUsageSubject(credentialId);
+	return !!subject && refreshes.has(commandCodeQuotaIdentity(subject.config));
+}
+
+/** Refresh the selected managed key; omitted id keeps the legacy first-usable view. */
+export function refreshCommandCodeQuota(
+	force = false,
+	credentialId?: string,
+): Promise<CommandCodeUsage | undefined> {
+	const subject = commandCodeUsageSubject(credentialId);
+	if (!subject) return Promise.resolve(undefined);
+	const cached = cachedSnapshot(subject);
+	if (!force && cached && Date.now() - cached.fetchedAt < COMMAND_CODE_USAGE_STALE_MS)
+		return Promise.resolve(cached.detail as CommandCodeUsage);
+	return refreshUsage(subject);
 }
 
 const refreshes = new Map<string, Promise<CommandCodeUsage>>();
@@ -367,6 +399,27 @@ async function refreshUsage(subject: CommandCodeUsageSubject): Promise<CommandCo
 			}
 			return snapshot.detail as CommandCodeUsage;
 		})
+		.catch(() => {
+			const current = commandCodeUsageSubject(subject.id);
+			if (current?.id === subject.id && commandCodeQuotaIdentity(current.config) === key) {
+				const previous = cachedSnapshot(subject);
+				quotaStore.set(
+					subject.id,
+					key,
+					{
+						scope: "subscription",
+						windows: [],
+						balances: [],
+						...previous,
+						error: "quota_unavailable",
+						// Failed attempts must also obey the request-driven TTL.
+						fetchedAt: Date.now(),
+					},
+					false,
+				);
+			}
+			throw new CommandCodeUsageError(502, "usage_unavailable");
+		})
 		.finally(() => refreshes.delete(key));
 	refreshes.set(key, task);
 	return task;
@@ -380,13 +433,5 @@ export async function getCommandCodeUsageFromSettings(): Promise<CommandCodeUsag
 export async function getCommandCodeUsageForCredential(
 	credentialId?: string,
 ): Promise<CommandCodeUsage | undefined> {
-	const subjects = listCommandCodeUsageSubjects();
-	const subject =
-		credentialId === undefined ? subjects[0] : subjects.find((item) => item.id === credentialId);
-	if (!subject) return undefined;
-	const cached = cachedSnapshot(subject);
-	if (cached && Date.now() - cached.fetchedAt < COMMAND_CODE_USAGE_STALE_MS) {
-		return cached.detail as CommandCodeUsage;
-	}
-	return refreshUsage(subject);
+	return refreshCommandCodeQuota(false, credentialId);
 }

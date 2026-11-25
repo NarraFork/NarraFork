@@ -37,7 +37,6 @@ import {
 } from "../lib/nug-quota-cache";
 import { getNugRelayStatus } from "../lib/nug-relay/manager";
 import {
-	getSettingsRevision,
 	type NUGProviderConfig,
 	nugProviderPrefix,
 	registerNugModelChecker,
@@ -762,7 +761,11 @@ nugRoutes.get("/providers/:id/channels/health", async (c) => {
 	}
 });
 
-/** Proxy quota balance from NUG service (updates cache). */
+/**
+ * Payment confirmation only: NugRechargeDialog re-reads this after an order becomes paid,
+ * then resumes the paused narrator. It must remain available to ordinary session users,
+ * like the billing/order endpoints; ordinary quota displays use /api/quota-snapshots.
+ */
 nugRoutes.get("/providers/:id/quota", async (c) => {
 	const id = c.req.param("id");
 	if (c.req.query("binding") !== undefined || c.req.query("orderId") !== undefined) {
@@ -805,20 +808,26 @@ nugRoutes.get("/providers/:id/quota", async (c) => {
 		}
 	}
 	const entry = getNugProvider(id);
-	if (!entry) return c.json({ error: `Provider "${id}" not found` }, 404);
+	if (!entry) return c.json({ error: "quota_subject_not_found" }, 404);
 	try {
-		const data = (await entry.provider.getQuota()) as unknown as Record<string, unknown>;
-		const responseData = normalizeNugQuotaResponse(data);
+		const data = (await entry.provider.getQuota(AbortSignal.timeout(15_000))) as unknown as Record<
+			string,
+			unknown
+		>;
 		setNugCachedQuota(
 			id,
 			buildNugQuotaCache(data, getNugCachedQuota(id, entry.quotaSubject)),
 			entry.quotaSubject,
 		);
-		return c.json(responseData);
-	} catch (err: unknown) {
-		const msg = err instanceof Error ? err.message : "Unknown error";
-		logger.error("NUG quota fetch failed", { error: msg, provider: entry.config.name });
-		return c.json({ error: msg }, 502);
+		const response = normalizeNugQuotaResponse(data);
+		// Keep the payment consumer's contract, not the template-private upstream payload.
+		return c.json({
+			balance: response.balance,
+			totalGranted: response.totalGranted,
+			detailedQuotaBalance: response.detailedQuotaBalance,
+		});
+	} catch {
+		return c.json({ error: "quota_unavailable" }, 502);
 	}
 });
 
@@ -1088,44 +1097,6 @@ nugRoutes.post("/providers/:id/api-key", async (c) => {
 		logger.error("NUG API key creation failed", { error: msg, provider: config.name });
 		return c.json({ error: msg }, 502);
 	}
-});
-
-/** Targeted header view is cached-only; legacy management callers retain the all-provider view. */
-nugRoutes.get("/quotas", (c) => {
-	const providerId = c.req.query("providerId");
-	if (providerId !== undefined) {
-		if (!providerId || providerId.length > 128)
-			return c.json({ error: "Invalid provider id" }, 400);
-		const generation = getSettingsRevision();
-		const expected = c.req.query("expectedGeneration");
-		if (expected !== undefined && (!/^\d{1,16}$/.test(expected) || Number(expected) !== generation))
-			return c.json(
-				{ error: "Provider identity changed", code: "MODEL_RUNTIME_STALE", generation },
-				409,
-			);
-		const config = settings.nugProviders?.find(
-			(provider) => provider.id === providerId && !provider.disabled,
-		);
-		if (!config) return c.json({ error: "Provider not found" }, 404);
-		const cached = getNugCachedQuota(providerId);
-		if ((cached?.detailedQuotaBalance?.length ?? 0) > 64 * 1024)
-			return c.json({ error: "Cached quota exceeds byte budget", code: "RESPONSE_TOO_LARGE" }, 413);
-		const response = {
-			generation,
-			quota: cached
-				? {
-						balance: cached.balance,
-						totalGranted: cached.totalGranted,
-						detailedQuotaBalance: cached.detailedQuotaBalance,
-						fetchedAt: cached.fetchedAt,
-					}
-				: null,
-		};
-		if (new TextEncoder().encode(JSON.stringify(response)).byteLength > 64 * 1024)
-			return c.json({ error: "Cached quota exceeds byte budget", code: "RESPONSE_TOO_LARGE" }, 413);
-		return c.json(response);
-	}
-	return c.json(getAllNugCachedQuotas());
 });
 
 // ─── OAuth Flow ───

@@ -3178,6 +3178,26 @@
 		"resetUnavailable": "The API does not provide reset times.",
 		"refreshFailed": "Could not confirm current subscription quota; cached figures may be out of date."
 	},
+	"quotaSnapshot": {
+		"unknown": "Quota unknown",
+		"pluginDisabled": "Quota plugin is disabled",
+		"unlimited": "Unlimited",
+		"balance": "Balance",
+		"plan": "Plan",
+		"total": "Total",
+		"used": "Used",
+		"resetsAt": "Resets at {{time}}",
+		"expired": "Subscription expired",
+		"expiresAt": "Expires at",
+		"remainingAmount": "Remaining {{amount}}",
+		"window": {
+			"5h": "5h",
+			"daily": "Daily",
+			"weekly": "Weekly",
+			"monthly": "Monthly",
+			"other": "Quota"
+		}
+	},
 	"quotaPanel": {
 		"short5h": "5h",
 		"shortWeekly": "Wk",

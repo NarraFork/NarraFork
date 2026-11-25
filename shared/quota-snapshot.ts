@@ -15,6 +15,11 @@ export interface QuotaWindow {
 	usedRatio: number | null;
 	/** Epoch ms when the window refills, if known. */
 	resetsAt: number | null;
+	/** Absolute period allowance, when upstream reports it; omitted rather than invented. */
+	used?: number;
+	total?: number;
+	remaining?: number;
+	unit?: string;
 }
 
 export interface QuotaBalance {
@@ -22,6 +27,13 @@ export interface QuotaBalance {
 	remaining: number | null;
 	total?: number;
 	unlimited?: boolean;
+	/**
+	 * Epoch ms of the remaining observation, not a later partial update.
+	 * Null = never observed; omitted = legacy snapshot.fetchedAt.
+	 */
+	remainingObservedAt?: number | null;
+	/** Epoch ms of the total observation, with the same null/legacy semantics as remainingObservedAt. */
+	totalObservedAt?: number | null;
 }
 
 export interface QuotaSnapshot {
@@ -34,8 +46,43 @@ export interface QuotaSnapshot {
 	balances: QuotaBalance[];
 	/** Plan tier, when the upstream names one. */
 	plan?: string;
+	/** Epoch ms when the allowance expires; distinct from a window's refill time. */
+	expiresAt?: number;
 	/** Template-private original data. */
 	detail?: unknown;
+}
+
+/** Public API boundary: template-private upstream payloads never leave the server. */
+export type PublicQuotaSnapshot = Omit<QuotaSnapshot, "detail"> & { hasError?: boolean };
+
+export interface QuotaSnapshotEntry {
+	groupId: string;
+	prefix: string;
+	templateId: string;
+	credentialId: string | null;
+	snapshot: PublicQuotaSnapshot | null;
+	/** Stream-reported allowance is separate from the direct quota probe. */
+	source?: "probe" | "quota_balance";
+	/** Omitted while support is unknown; false is not a zero allowance. */
+	supported?: boolean;
+	/** The relay credential currently selected for the group summary, not its first key. */
+	primary?: boolean;
+	refreshing?: boolean;
+	/** CLI-only Command Code has no cache; an active view may request a one-shot refresh. */
+	refreshOnRead?: boolean;
+	/** Opaque process-local CLI identity generation; never a raw credential fingerprint. */
+	generation?: string;
+}
+
+export interface QuotaSnapshotReadScope {
+	groupId?: string;
+	cachedOnly?: boolean;
+	/** The model-runtime settings revision; mismatches are rejected, never reused. */
+	expectedGeneration?: number | string;
+}
+
+export interface QuotaSnapshotsResponse {
+	entries: QuotaSnapshotEntry[];
 }
 
 /** Epoch ms for an upstream timestamp string, or null. */

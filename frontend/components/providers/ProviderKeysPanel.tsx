@@ -12,7 +12,6 @@ import {
 	Group,
 	Paper,
 	PasswordInput,
-	Progress,
 	Stack,
 	Switch,
 	Text,
@@ -30,9 +29,16 @@ import {
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import {
+	invalidateQuotaSnapshots,
+	useQuotaSnapshot,
+	useQuotaSnapshots,
+	useRefreshQuotaSnapshots,
+} from "../../hooks/useQuotaSnapshots";
 import { ApiError } from "../../lib/api/client";
 import { type ProviderKeyInfo, providerKeysApi } from "../../lib/api/provider-keys";
 import { describeApiError } from "../../lib/api-error";
+import { QuotaSnapshotIndicator } from "../narrator/model/QuotaSnapshotIndicator";
 import { CredentialNetworkEditor } from "./CredentialNetworkEditor";
 
 function relativeTime(target: number, locale: string): string {
@@ -71,43 +77,10 @@ function KeyStatus({ entry }: { entry: ProviderKeyInfo }) {
 	);
 }
 
-function KeyUsage({ usage }: { usage: NonNullable<ProviderKeyInfo["usage"]> }) {
-	const { t, i18n } = useTranslation("settings");
-	if (usage.windows.length === 0) {
-		return usage.error ? (
-			<Text size="xs" c="dimmed">
-				{t("providerKeys.usageUnavailable")}
-			</Text>
-		) : null;
-	}
-	return (
-		<Group gap="md" wrap="wrap">
-			{usage.windows.map((window) => {
-				const percent = window.usedRatio == null ? null : Math.round(window.usedRatio * 100);
-				const reset = window.resetsAt ? Date.parse(window.resetsAt) : Number.NaN;
-				return (
-					<Stack key={window.label} gap={2} style={{ minWidth: 120 }}>
-						<Group gap={4} justify="space-between" wrap="nowrap">
-							<Text size="xs" c="dimmed">
-								{t(`providerKeys.window.${window.label}`, window.label)}
-							</Text>
-							<Text size="xs">{percent == null ? "—" : `${percent}%`}</Text>
-						</Group>
-						<Progress
-							size="xs"
-							value={percent ?? 0}
-							color={percent != null && percent >= 90 ? "red" : "indigo"}
-						/>
-						{Number.isFinite(reset) && (
-							<Text size="10px" c="dimmed">
-								{t("providerKeys.resets", { time: relativeTime(reset, i18n.language) })}
-							</Text>
-						)}
-					</Stack>
-				);
-			})}
-		</Group>
-	);
+function KeyQuota({ providerId, credentialId }: { providerId: string; credentialId: string }) {
+	const { t } = useTranslation("settings");
+	const quota = useQuotaSnapshot(providerId, credentialId);
+	return <QuotaSnapshotIndicator snapshot={quota.data} title={t("providerKeys.refreshUsage")} />;
 }
 
 export function ProviderKeysPanel({
@@ -123,6 +96,12 @@ export function ProviderKeysPanel({
 }) {
 	const { t } = useTranslation("settings");
 	const qc = useQueryClient();
+	const quotas = useQuotaSnapshots();
+	const refresh = useRefreshQuotaSnapshots();
+	const hasQuota =
+		quotas.data?.entries.some(
+			(entry) => entry.groupId === providerId && entry.supported !== false,
+		) ?? false;
 	const queryKey = ["provider-keys", providerId];
 	const keys = useQuery({
 		queryKey,
@@ -139,14 +118,20 @@ export function ProviderKeysPanel({
 	const onFirstKeyChangedRef = useRef(onFirstKeyChanged);
 	onFirstKeyChangedRef.current = onFirstKeyChanged;
 	const changed = async (data?: { keys?: ProviderKeyInfo[] }) => {
-		// Add/update/remove return one key (or ok), not the final order. While the
-		// final read is pending (or fails), '*' tells settings PATCH to preserve the
-		// current server secret instead of deleting it from a stale empty draft.
-		if (!data?.keys) onFirstKeyChangedRef.current?.("*");
+		// Reorder returns the final pool immediately; other writes need a fresh list.
+		// '*' keeps a pending/failed list read from clearing the server's first key
+		// when an older settings draft is saved.
+		if (data?.keys) {
+			qc.setQueryData(queryKey, { keys: data.keys });
+			onFirstKeyChangedRef.current?.(data.keys[0]?.masked ?? "");
+		} else onFirstKeyChangedRef.current?.("*");
 		try {
-			const result = data?.keys ? { keys: data.keys } : await providerKeysApi.list(providerId);
-			qc.setQueryData(queryKey, result);
-			onFirstKeyChangedRef.current?.(result.keys[0]?.masked ?? "");
+			await invalidateQuotaSnapshots(qc);
+			if (!data?.keys) {
+				const result = await providerKeysApi.list(providerId);
+				qc.setQueryData(queryKey, result);
+				onFirstKeyChangedRef.current?.(result.keys[0]?.masked ?? "");
+			}
 		} finally {
 			void qc.invalidateQueries({ queryKey: ["admin", "settings"] });
 			void qc.invalidateQueries({ queryKey: ["settings"] });
@@ -172,7 +157,8 @@ export function ProviderKeysPanel({
 	const showList =
 		(showSingleKey && list.length > 0) ||
 		list.length > 1 ||
-		list.some((k) => k.usage || k.cooldown || k.disabled);
+		hasQuota ||
+		list.some((k) => k.cooldown || k.disabled);
 
 	const move = (index: number, delta: number) => {
 		const ids = list.map((k) => k.id);
@@ -189,14 +175,14 @@ export function ProviderKeysPanel({
 					{t("providerKeys.title", { count: list.length })}
 				</Text>
 				<Group gap={4} wrap="nowrap">
-					{list.some((k) => k.usage) && (
+					{hasQuota && (
 						<Tooltip label={t("providerKeys.refreshUsage")}>
 							<ActionIcon
 								size="sm"
 								variant="subtle"
-								loading={run.isPending}
+								loading={refresh.isPending}
 								aria-label={t("providerKeys.refreshUsage")}
-								onClick={() => run.mutate(() => providerKeysApi.refreshUsage(providerId))}
+								onClick={() => refresh.mutate({ groupId: providerId })}
 							>
 								<IconRefresh size={14} />
 							</ActionIcon>
@@ -293,7 +279,7 @@ export function ProviderKeysPanel({
 									</ActionIcon>
 								</Group>
 							</Group>
-							{entry.usage && <KeyUsage usage={entry.usage} />}
+							{hasQuota && <KeyQuota providerId={providerId} credentialId={entry.id} />}
 						</Stack>
 					</Paper>
 				))}

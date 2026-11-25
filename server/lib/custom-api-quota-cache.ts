@@ -2,6 +2,7 @@ import { unlink } from "node:fs/promises";
 import type { QuotaSnapshot } from "@shared/quota-snapshot";
 import { getNarraforkPath } from "./narrafork-home";
 import { credentialForStream, firstCredential } from "./provider-key-subjects";
+import { getProviderKeyStore, withProviderKey } from "./provider-keys";
 import { type CustomApiProviderConfig, settings } from "./settings";
 import { quotaNetworkIdentity } from "./sourcing/quota-identity";
 import { quotaStore, STREAM_QUOTA_SOURCE } from "./sourcing/quota-store";
@@ -96,6 +97,30 @@ export function updateCustomApiQuotaByPrefix(
 		true,
 		STREAM_QUOTA_SOURCE,
 	);
+}
+
+/** Stream allowances never overwrite the credential's direct probe slot. */
+export function getCustomApiQuotaSnapshot(
+	providerId: string,
+	credentialId: string,
+): QuotaSnapshot | undefined {
+	const config = provider(providerId);
+	if (!config) return undefined;
+	const keys = getProviderKeyStore().list(config.id);
+	const key = keys.find((entry) => entry.id === credentialId);
+	const effective = key
+		? withProviderKey(config, key)
+		: keys.length === 0 && credentialId === config.id
+			? config
+			: undefined;
+	return effective
+		? quotaStore.get(
+				credentialId,
+				customApiStreamQuotaIdentity(effective),
+				restoreSnapshot,
+				STREAM_QUOTA_SOURCE,
+			)
+		: undefined;
 }
 
 export function getCustomApiCachedQuota(providerId: string): CustomApiQuotaCache | undefined {

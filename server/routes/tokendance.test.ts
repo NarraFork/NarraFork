@@ -108,19 +108,16 @@ const endpoints = [
 	["POST", "/oauth/cancel"],
 	["POST", "/oauth/restore"],
 	["POST", "/models/refresh"],
-	["POST", "/balance/refresh"],
 	["POST", "/payment/sessions"],
 	["GET", "/payment/sessions/payment-1"],
 ] as const;
 describe("TokenDance first-party admin boundary", () => {
-	test("ordinary session users can read balance but anonymous users cannot", async () => {
+	test("old balance endpoints are retired; anonymous access is still rejected", async () => {
+		const instance = app({ type: "session", user });
+		expect((await instance.request("/api/tokendance/balance")).status).toBe(404);
 		expect(
-			(
-				await app({ type: "session", user: { ...user, role: "user" } }).request(
-					"/api/tokendance/balance",
-				)
-			).status,
-		).toBe(200);
+			(await instance.request("/api/tokendance/balance/refresh", { method: "POST" })).status,
+		).toBe(404);
 		expect((await app().request("/api/tokendance/balance")).status).toBe(401);
 	});
 	test("payment creation validates input and status is owner scoped", async () => {

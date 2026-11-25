@@ -1,4 +1,5 @@
 import { afterAll, afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import type { QuotaSnapshotsResponse } from "@shared/quota-snapshot";
 import type { TokenDanceDraftSnapshot } from "@shared/tokendance";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
@@ -194,6 +195,7 @@ let nugDetail: ComponentProps<typeof nugSection.NUGProvidersSection> | undefined
 let saveCalls = 0;
 let confirmAnswer = false;
 let serverSettings: Record<string, unknown>;
+let quotaResponse: QuotaSnapshotsResponse;
 let savedPayloads: Record<string, unknown>[];
 let onSettingsSave: ((payload: Record<string, unknown>) => void) | undefined;
 let refreshCalls: Array<{ method: string; id: string }>;
@@ -264,6 +266,7 @@ beforeEach(() => {
 	saveCalls = 0;
 	confirmAnswer = false;
 	serverSettings = clone(initialSettings);
+	quotaResponse = { entries: [] };
 	savedPayloads = [];
 	onSettingsSave = undefined;
 	refreshCalls = [];
@@ -301,6 +304,13 @@ beforeEach(() => {
 		nugByProvider: [],
 		pluginProviderGroups: [],
 	} as unknown as ReturnType<typeof models.useAllModels>);
+	const quotasSpy = spyOn(api, "quotaSnapshots").mockImplementation(async () =>
+		clone(quotaResponse),
+	);
+	const usageSummarySpy = spyOn(api, "commandCodeUsageSummary").mockResolvedValue({
+		loggedIn: false,
+	});
+	const channelsSpy = spyOn(api, "nugGetChannelsHealth").mockResolvedValue({ channels: [] });
 	const getSpy = spyOn(api, "getSettings").mockImplementation(async (options) => {
 		requestOptions.push(options);
 		if (settingsGate) await settingsGate;
@@ -353,7 +363,17 @@ beforeEach(() => {
 			<output data-nug-detail>{props.providers[0]?.name}</output>
 		);
 	}) as unknown as typeof nugSection.NUGProvidersSection);
-	for (const spy of [authSpy, modelsSpy, getSpy, saveSpy, customSpy, nugSpy])
+	for (const spy of [
+		authSpy,
+		modelsSpy,
+		quotasSpy,
+		usageSummarySpy,
+		channelsSpy,
+		getSpy,
+		saveSpy,
+		customSpy,
+		nugSpy,
+	])
 		restorers.push(() => spy.mockRestore());
 	queryClient = new QueryClient({
 		defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
@@ -494,8 +514,41 @@ describe("immediate key pool changes keep the real settings draft safe", () => {
 		disabledReason: null,
 		network: {},
 		cooldown: null,
-		usage: null,
 	});
+	for (const [groupId, section] of [
+		["CommandCode", "command-code"],
+		["pool-nug", "nug"],
+	] as const) {
+		test(`${section}: one enabled key without usage or cooldown opens the real network editor`, async () => {
+			useRealProviderDetails = true;
+			serverSettings.commandCode = { apiKey: "********ready", disabled: false };
+			serverSettings.nugProviders = [
+				{
+					id: "pool-nug",
+					name: "Single NUG",
+					prefix: "pool-nug",
+					apiKey: "********ready",
+					baseUrl: "https://nug.example",
+					defaultModel: "",
+					disabled: false,
+				},
+			];
+			queryClient.setQueryData(["admin", "settings"], clone(serverSettings));
+			const list = spyOn(providerKeysApi, "list").mockResolvedValue({
+				keys: [entry("ready-key", "********ready")],
+			});
+			restorers.push(() => list.mockRestore());
+			await mount(`/settings/providers?provider=${groupId}`);
+			const network = container.querySelector(`[aria-label="${text("credentialNetwork.button")}"]`);
+			if (!network) throw new Error("Missing ready single key network entry");
+			await click(network);
+			expect(document.querySelector('[role="dialog"]')?.textContent).toContain(
+				text("credentialNetwork.description"),
+			);
+			expect(quotaResponse.entries).toEqual([]);
+		});
+	}
+
 	test("a delayed empty response from A cannot clear B after same-page deep-link navigation", async () => {
 		useRealProviderDetails = true;
 		const template = initialSettings.customApiProviders[0];
@@ -622,11 +675,7 @@ describe("immediate key pool changes keep the real settings draft safe", () => {
 				// credential, while a stars-prefixed placeholder keeps the stored secret.
 				if (apiKey === "") pool.shift();
 			};
-			const usage = spyOn(api, "commandCodeUsage").mockResolvedValue({ loggedIn: false });
-			const quota = spyOn(api, "nugGetQuota").mockResolvedValue({ balance: 0, totalGranted: 0 });
-			const channels = spyOn(api, "nugGetChannelsHealth").mockResolvedValue({ channels: [] });
-			for (const mock of [list, add, usage, quota, channels])
-				restorers.push(() => mock.mockRestore());
+			for (const mock of [list, add]) restorers.push(() => mock.mockRestore());
 			await mount(`/settings/providers?provider=${groupId}`);
 			await click(button("providerKeys.add"));
 			await type("providerKeys.key", "new-live-pool-key", true);
@@ -721,8 +770,31 @@ describe("immediate key pool changes keep the real settings draft safe", () => {
 					},
 				];
 				queryClient.setQueryData(["admin", "settings"], clone(serverSettings));
+				quotaResponse = {
+					entries: [
+						{
+							groupId,
+							prefix: groupId,
+							templateId:
+								section === "command-code"
+									? "command-code"
+									: section === "nug"
+										? "nug"
+										: "openai-compatible",
+							credentialId: "first",
+							source: "probe",
+							supported: true,
+							snapshot: {
+								scope: "key",
+								fetchedAt: 1,
+								windows: [],
+								balances: [{ unit: "USD", remaining: 12.5 }],
+							},
+						},
+					],
+				};
 				let pool: ProviderKeyInfo[] = [
-					{ ...entry("first", "********old"), usage: { fetchedAt: 1, error: null, windows: [] } },
+					entry("first", "********old"),
 					{ ...entry("backup", "********back", 1), network: { proxy: { mode: "direct" } } },
 				];
 				const list = spyOn(providerKeysApi, "list").mockImplementation(async () => ({
@@ -742,14 +814,10 @@ describe("immediate key pool changes keep the real settings draft safe", () => {
 					if (!key) throw new Error("Unknown pool key");
 					return { key };
 				});
-				const refresh = spyOn(providerKeysApi, "refreshUsage").mockImplementation(async () => ({
-					keys: clone(pool),
-				}));
-				const usage = spyOn(api, "commandCodeUsage").mockResolvedValue({ loggedIn: false });
-				const quota = spyOn(api, "nugGetQuota").mockResolvedValue({ balance: 0, totalGranted: 0 });
-				const channels = spyOn(api, "nugGetChannelsHealth").mockResolvedValue({ channels: [] });
-				for (const mock of [list, update, refresh, usage, quota, channels])
-					restorers.push(() => mock.mockRestore());
+				const refresh = spyOn(api, "refreshQuotaSnapshots").mockImplementation(async () =>
+					clone(quotaResponse),
+				);
+				for (const mock of [list, update, refresh]) restorers.push(() => mock.mockRestore());
 				await mount(`/settings/providers?provider=${groupId}`);
 				await type(keyLabel, "typed-new-secret");
 				if (operation === "disable") {
@@ -779,7 +847,11 @@ describe("immediate key pool changes keep the real settings draft safe", () => {
 					);
 					if (!refreshButton) throw new Error("Missing pool usage refresh");
 					await click(refreshButton);
-					expect(refresh).toHaveBeenCalledWith(groupId);
+					expect(refresh).toHaveBeenCalledWith(
+						{ groupId },
+						expect.objectContaining({ signal: expect.any(AbortSignal) }),
+					);
+					expect(container.textContent).toContain("12.5 USD");
 				}
 				await click(button("unsavedSave"));
 				const payload = savedPayloads[0];
@@ -1666,6 +1738,7 @@ describe("provider add nested route", () => {
 		// 概览按「平台集成 / 自定义」分区渲染，排序语义是分区内 active 在前、
 		// inactive 沉底 —— 所以断言 codex 与 CommandCode 的分区内相对顺序。
 		serverSettings = clone(initialSettings);
+
 		await mount();
 		const cardIndex = (needle: string) =>
 			[...container.querySelectorAll('[role="button"]')].findIndex((node) =>

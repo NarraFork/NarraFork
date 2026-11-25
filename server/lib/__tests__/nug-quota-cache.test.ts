@@ -1,23 +1,29 @@
-import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
+import { afterEach, describe, expect, setSystemTime, spyOn, test } from "bun:test";
 import { existsSync } from "node:fs";
 import type { CredentialNetwork } from "@shared/credential-network";
 import { Hono } from "hono";
 import { getNarraforkPath } from "../narrafork-home";
+import * as outbound from "../net/outbound-fetch";
 import {
 	buildNugQuotaCache,
 	captureNugQuotaSubject,
 	getAllNugCachedQuotas,
 	getNugCachedQuota,
 	getNugQuotaSnapshot,
+	isNugQuotaRefreshing,
 	nugQuotaIdentity,
+	probeNugQuota,
 	purgeNugQuotaCache,
+	refreshNugQuota,
 	setNugCachedQuota,
 	updateNugQuotaByPrefix,
 } from "../nug-quota-cache";
 import { streamQuotaIdentityForRequest } from "../provider-key-subjects";
 import { getProviderKeyStore, nugKeyOwner, withProviderKey } from "../provider-keys";
 import { saveSettings, settings } from "../settings";
+import { readQuotaSnapshots, refreshQuotaSnapshots } from "../sourcing/quota-snapshots";
 import { quotaStore, STREAM_QUOTA_SOURCE } from "../sourcing/quota-store";
+import { getSourceGroup } from "../sourcing/source-groups";
 import { getServiceTemplate } from "../sourcing/templates";
 
 const original = structuredClone(settings);
@@ -58,6 +64,9 @@ function useProvider() {
 	});
 	const config = settings.nugProviders?.[0];
 	if (!config) throw new Error("NUG test provider was not saved");
+	const keys = getProviderKeyStore();
+	if (!keys.listGroup(providerId).length)
+		keys.add(nugKeyOwner(providerId), { id: providerId, apiKey: config.apiKey });
 	return config;
 }
 
@@ -104,6 +113,40 @@ afterEach(() => {
 });
 
 describe("NUG quota snapshots", () => {
+	test("a failed first refresh preserves never-observed fields through a metadata-only startup", async () => {
+		const config = useProvider();
+		const captured = captureNugQuotaSubject(config);
+		const start = Date.now();
+		setSystemTime(start);
+		const transport = spyOn(outbound, "outboundFetch").mockRejectedValue(new Error("offline"));
+		try {
+			await refreshNugQuota(providerId, captured.id);
+			expect(getNugQuotaSnapshot(providerId, captured.id)?.snapshot).toMatchObject({
+				error: "quota_unavailable",
+				balances: [{ unit: "", remaining: null, remainingObservedAt: null, totalObservedAt: null }],
+				detail: { _remainingObservedAt: null, _totalObservedAt: null },
+			});
+			setSystemTime(start + 1000);
+			transport.mockResolvedValue(
+				Response.json({ totalGranted: 111, _remainingObservedAt: 999999 }),
+			);
+			const { fetchAllNugQuotas } = await import("../../routes/nug");
+			await fetchAllNugQuotas();
+			const snapshot = getNugQuotaSnapshot(providerId, captured.id)?.snapshot;
+			expect(snapshot?.error).toBeUndefined();
+			expect(snapshot?.balances[0]).toEqual({
+				unit: "",
+				remaining: null,
+				total: 111,
+				remainingObservedAt: null,
+			});
+			expect(getNugCachedQuota(providerId, captured)?._remainingObservedAt).toBeNull();
+			expect(quotaStore.peek(captured.id, STREAM_QUOTA_SOURCE)).toBeUndefined();
+		} finally {
+			transport.mockRestore();
+		}
+	});
+
 	test("legacy quotas round-trip field for field and stream updates stay partial", async () => {
 		useProvider();
 		const start = Date.now();
@@ -183,7 +226,7 @@ describe("NUG quota snapshots", () => {
 		quotaStore.remove(second.id);
 	});
 
-	test("real billing config keeps stream-only breakdown in cached view without writing it into probe", async () => {
+	test("real billing config keeps stream-only breakdown in the owner view without writing it into probe", async () => {
 		const config = useProvider();
 		const captured = captureNugQuotaSubject(config);
 		const start = Date.now();
@@ -201,8 +244,8 @@ describe("NUG quota snapshots", () => {
 		expect(
 			(await requestNugRoute(nugRoutes, `/providers/${providerId}/billing/config`)).status,
 		).toBe(200);
-		const cached = await requestNugRoute(nugRoutes, `/quotas?providerId=${providerId}`);
-		expect((await cached.json()).quota).toMatchObject({
+		// Q's ordinary reads use the unified API; the private breakdown stays in its owner.
+		expect(getNugCachedQuota(providerId)).toMatchObject({
 			balance: 12,
 			detailedQuotaBalance: "stream allocation details",
 		});
@@ -506,17 +549,15 @@ describe("NUG quota snapshots", () => {
 		});
 	}
 
-	test("an empty template probe preserves unknown amounts instead of manufacturing zero", async () => {
+	test("an empty credential probe preserves unknown amounts instead of manufacturing zero", async () => {
 		const config = useProvider();
 		const captured = captureNugQuotaSubject(config);
 		expect(getNugCachedQuota(providerId, captured)).toBeUndefined();
 		globalThis.fetch = (async () => Response.json({})) as unknown as typeof fetch;
-		const snapshot = await getServiceTemplate("nug").probeQuota?.(
-			{} as never,
-			captured,
-			new AbortController().signal,
-		);
-		expect(snapshot?.balances).toEqual([{ unit: "", remaining: null }]);
+		const snapshot = await probeNugQuota(captured, new AbortController().signal);
+		expect(snapshot?.balances).toEqual([
+			{ unit: "", remaining: null, remainingObservedAt: null, totalObservedAt: null },
+		]);
 		expect(snapshot?.detail).toEqual({
 			balance: null,
 			totalGranted: null,
@@ -593,6 +634,86 @@ describe("NUG quota snapshots", () => {
 		expect(getNugCachedQuota(providerId)).toBeUndefined();
 		updateNugQuotaByPrefix("nug-quota", 100, null, undefined, undefined);
 		expect(getNugCachedQuota(providerId)).toBeUndefined();
+	});
+
+	test("second-key probes use that key's transport and cannot replace the first view or a new identity", async () => {
+		const config = useProvider();
+		const store = getProviderKeyStore();
+		const first = store.list(nugKeyOwner(providerId))[0];
+		if (!first) throw new Error("Missing first NUG key");
+		const second = store.add(nugKeyOwner(providerId), {
+			apiKey: "key-two",
+			network: { proxy: { mode: "custom", url: "http://second.proxy:8080" } },
+		});
+		let gate: ReturnType<typeof Promise.withResolvers<Response>> | undefined;
+		const transport = spyOn(outbound, "outboundFetch").mockImplementation(
+			async (_url, init, options) => {
+				const auth = new Headers(init?.headers).get("Authorization");
+				if (auth === "Bearer key-one") return Response.json({ balance: 9, totalGranted: 10 });
+				expect(auth).toBe("Bearer key-two");
+				expect(options?.proxyUrl).toBe("http://second.proxy:8080");
+				return gate ? gate.promise : Response.json({ balance: 20, totalGranted: 30 });
+			},
+		);
+		try {
+			await refreshNugQuota(providerId);
+			gate = Promise.withResolvers<Response>();
+			const probing = refreshQuotaSnapshots({ groupId: providerId, credentialId: second.id });
+			expect(isNugQuotaRefreshing(providerId, second.id)).toBe(true);
+			expect(isNugQuotaRefreshing(providerId)).toBe(false);
+			expect(
+				readQuotaSnapshots(true, false).entries.find((entry) => entry.credentialId === second.id)
+					?.refreshing,
+			).toBe(true);
+			gate.resolve(Response.json({ balance: 20, totalGranted: 30 }));
+			await probing;
+			expect(getNugCachedQuota(providerId)?.balance).toBe(9);
+			expect(getNugQuotaSnapshot(providerId, second.id)?.snapshot?.balances[0]?.remaining).toBe(20);
+			// Auto keyRouting consumes this exact exported effective-config fingerprint.
+			expect(
+				quotaStore.peekForIdentity(second.id, nugQuotaIdentity(withProviderKey(config, second)))
+					?.balances[0]?.remaining,
+			).toBe(20);
+			reportNugQuota(
+				"nug-quota",
+				7,
+				null,
+				undefined,
+				streamQuotaIdentityForRequest("nug-quota", { credentialId: second.id }),
+			);
+			const entries = readQuotaSnapshots(true, false).entries.filter(
+				(entry) => entry.credentialId === second.id,
+			);
+			expect(
+				entries.find((entry) => entry.source === "probe")?.snapshot?.balances[0]?.remaining,
+			).toBe(20);
+			expect(
+				entries.find((entry) => entry.source === "quota_balance")?.snapshot?.balances[0]?.remaining,
+			).toBe(7);
+			for (const change of ["network", "headers", "key"] as const) {
+				const late = Promise.withResolvers<Response>();
+				transport.mockImplementation(async () => late.promise);
+				const stale = refreshQuotaSnapshots({ groupId: providerId, credentialId: second.id });
+				if (change === "network")
+					store.update(second.id, { network: { proxy: { mode: "direct" } } });
+				else if (change === "headers")
+					store.update(second.id, {
+						network: { proxy: { mode: "direct" }, extraHeaders: { "X-Key-Route": "new" } },
+					});
+				else store.update(second.id, { apiKey: "key-replaced" });
+				expect(getNugQuotaSnapshot(providerId, second.id)?.snapshot).toBeUndefined();
+				transport.mockImplementation(async () => Response.json({ balance: 30, totalGranted: 40 }));
+				await refreshQuotaSnapshots({ groupId: providerId, credentialId: second.id });
+				late.resolve(Response.json({ balance: 99, totalGranted: 100 }));
+				await stale;
+				expect(getNugQuotaSnapshot(providerId, second.id)?.snapshot?.balances[0]?.remaining).toBe(
+					30,
+				);
+				expect(getNugCachedQuota(providerId)?.balance).toBe(9);
+			}
+		} finally {
+			transport.mockRestore();
+		}
 	});
 
 	test("an actual secondary-key stream balance never overwrites the first key's wallet", () => {
@@ -708,19 +829,33 @@ describe("NUG quota snapshots", () => {
 		}
 	}
 
+	test("the leaf probe keeps unknown amounts distinct from explicit zero", async () => {
+		const request = captureNugQuotaSubject(useProvider());
+		globalThis.fetch = (async () =>
+			Response.json({ balance: false, totalGranted: "" })) as unknown as typeof fetch;
+		const unknown = await probeNugQuota(request, AbortSignal.timeout(1_000));
+		expect(unknown.balances[0]?.remaining).toBeNull();
+		expect(unknown.balances[0]).not.toHaveProperty("total");
+		globalThis.fetch = (async () =>
+			Response.json({ balance: 0, totalGranted: 0 })) as unknown as typeof fetch;
+		expect((await probeNugQuota(request, AbortSignal.timeout(1_000))).balances).toEqual([
+			{ unit: "", remaining: 0, total: 0 },
+		]);
+	});
+
 	test("the nug template probes into the shared shape", async () => {
-		const config = useProvider();
+		useProvider();
 		globalThis.fetch = (async () =>
 			Response.json({
 				balance: 4,
 				totalGranted: 9,
 				detailedQuotaBalance: "details",
 			})) as unknown as typeof fetch;
-		const snapshot = await getServiceTemplate("nug").probeQuota?.(
-			{} as never,
-			{ id: providerId, providerId, config },
-			AbortSignal.timeout(1000),
-		);
+		const credentialId = getProviderKeyStore().list(nugKeyOwner(providerId))[0]?.id;
+		const group = getSourceGroup(providerId);
+		if (!credentialId || !group) throw new Error("NUG template fixture is not registered");
+		await getServiceTemplate("nug").probeQuota?.(group, credentialId);
+		const snapshot = quotaStore.peek(credentialId);
 		expect(snapshot?.scope).toBe("wallet");
 		expect(snapshot?.windows).toEqual([]);
 		expect(snapshot?.balances).toEqual([{ unit: "", remaining: 4, total: 9 }]);

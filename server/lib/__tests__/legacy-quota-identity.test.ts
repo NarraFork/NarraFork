@@ -220,8 +220,14 @@ describe("TokenDance real legacy fingerprints", () => {
 				expect(snapshot).toBeUndefined();
 				expect(restored?.snapshot).toBeUndefined();
 			}
-			const balance = await service.refreshTokenDanceBalance(false, key.id);
-			expect(balance.balance).toBe(change.compatible ? 5_000_000 : null);
+			await expect(service.refreshTokenDanceBalance(false, key.id)).rejects.toMatchObject({
+				code: "TOKENDANCE_ERROR",
+				statusCode: 502,
+			});
+			expect(service.getTokenDanceQuotaSnapshot(key.id)?.snapshot?.detail).toMatchObject({
+				balance: change.compatible ? 5_000_000 : null,
+				hasError: true,
+			});
 			// A legacy balance proves this key's allowance, never OAuth/portal provenance.
 			expect(getProviderKeyStore().list(TOKENDANCE_KEY_OWNER).some(isTokenDanceLoginKey)).toBe(
 				false,
@@ -267,7 +273,14 @@ describe("TokenDance real legacy fingerprints", () => {
 				snapshot: undefined,
 			});
 		} else {
-			expect((await service.refreshTokenDanceBalance(false, other.id)).balance).toBeNull();
+			await expect(service.refreshTokenDanceBalance(false, other.id)).rejects.toMatchObject({
+				code: "TOKENDANCE_ERROR",
+				statusCode: 502,
+			});
+			expect(service.getTokenDanceQuotaSnapshot(other.id)?.snapshot?.detail).toMatchObject({
+				balance: null,
+				hasError: true,
+			});
 		}
 		const restored = service.getTokenDanceQuotaSnapshot(matching.id);
 		expect(restored?.credentialId).toBe(matching.id);

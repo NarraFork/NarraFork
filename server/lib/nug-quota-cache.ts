@@ -153,6 +153,8 @@ export function buildNugQuotaCache(
 
 function nugQuotaSnapshot(cache: NugQuotaCache): QuotaSnapshot {
 	const { fetchedAt, ...detail } = cache;
+	const remainingObservedAt = observationMetadata(cache._remainingObservedAt);
+	const totalObservedAt = observationMetadata(cache._totalObservedAt);
 	return {
 		fetchedAt,
 		scope: "wallet",
@@ -162,6 +164,8 @@ function nugQuotaSnapshot(cache: NugQuotaCache): QuotaSnapshot {
 				unit: "",
 				remaining: cache.balance,
 				...(cache.totalGranted !== null ? { total: cache.totalGranted } : {}),
+				...(remainingObservedAt !== undefined ? { remainingObservedAt } : {}),
+				...(totalObservedAt !== undefined ? { totalObservedAt } : {}),
 			},
 		],
 		detail,
@@ -207,7 +211,7 @@ export const nugQuotaIdentity = (config: NUGProviderConfig): string =>
 	JSON.stringify([config.baseUrl, config.apiKey, quotaNetworkIdentity(config, settings.proxy)]);
 export type CapturedNugQuotaSubject = NugQuotaSubject & { identity: string };
 
-/** The exact credential/network used by a route or startup request, captured before await. */
+/** Capture the actual first-key route before the legacy request awaits its response. */
 export function captureNugQuotaSubject(config: NUGProviderConfig): CapturedNugQuotaSubject {
 	const credential = subject(config);
 	return {
@@ -340,7 +344,7 @@ function snapshotOf(
 	return quotaView(probe, stream);
 }
 
-/** Read an exact credential without changing the legacy first-key view or starting IO. */
+/** Cached credential/source reads never poll; refresh is explicit and identity-bound. */
 export function getNugQuotaSnapshot(
 	providerId: string,
 	credentialId?: string,
@@ -351,6 +355,80 @@ export function getNugQuotaSnapshot(
 	return credential && config
 		? { credentialId: credential.id, snapshot: snapshotOf(config, credentialId, source) }
 		: undefined;
+}
+
+const refreshes = new Map<
+	string,
+	{ identity: string; controller: AbortController; task: Promise<void> }
+>();
+
+export function isNugQuotaRefreshing(providerId: string, credentialId?: string): boolean {
+	const config = settings.nugProviders?.find((provider) => provider.id === providerId);
+	const credential = config && subject(config, credentialId);
+	return (
+		!!credential && refreshes.get(credential.id)?.identity === nugQuotaIdentity(credential.config)
+	);
+}
+
+/** Explicit refresh, bounded and coalesced by the live credential identity. */
+export function refreshNugQuota(providerId: string, credentialId?: string): Promise<void> {
+	const config = (settings.nugProviders ?? []).find((provider) => provider.id === providerId);
+	if (!config || config.disabled) return Promise.resolve();
+	const credential = subject(config, credentialId);
+	if (!credential?.config.apiKey) return Promise.resolve();
+	const key = nugQuotaIdentity(credential.config);
+	const previous = refreshes.get(credential.id);
+	if (previous?.identity === key) return previous.task;
+	previous?.controller.abort();
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), 15_000);
+	const current = () => {
+		const liveConfig = (settings.nugProviders ?? []).find((p) => p.id === providerId);
+		const live =
+			liveConfig && !liveConfig.disabled ? subject(liveConfig, credential.id) : undefined;
+		return (
+			refreshes.get(credential.id)?.controller === controller &&
+			!!live &&
+			nugQuotaIdentity(live.config) === key
+		);
+	};
+	const cancelled = new Promise<never>((_resolve, reject) => {
+		controller.signal.addEventListener("abort", () => reject(new Error("quota_cancelled")), {
+			once: true,
+		});
+	});
+	const task = Promise.race([probeNugQuota(credential, controller.signal), cancelled])
+		.then((snapshot) => {
+			if (!controller.signal.aborted && current()) quotaStore.set(credential.id, key, snapshot);
+		})
+		.catch(() => {
+			if (current()) {
+				const old = quotaStore.get(credential.id, key, restoreSnapshot);
+				// Freeze legacy field times before stamping the failed attempt's fetchedAt.
+				const retained = nugQuotaSnapshot(
+					buildNugQuotaCache({}, old ? cacheFromSnapshot(old) : undefined),
+				);
+				quotaStore.set(
+					credential.id,
+					key,
+					{
+						...retained,
+						...old,
+						balances: retained.balances,
+						detail: retained.detail,
+						fetchedAt: retained.fetchedAt,
+						error: "quota_unavailable",
+					},
+					false,
+				);
+			}
+		})
+		.finally(() => {
+			clearTimeout(timer);
+			if (refreshes.get(credential.id)?.controller === controller) refreshes.delete(credential.id);
+		});
+	refreshes.set(credential.id, { identity: key, controller, task });
+	return task;
 }
 
 function matchingSubject(
@@ -499,15 +577,18 @@ export function getAllNugCachedQuotas(): Record<
 
 export function purgeNugQuotaCache(removedIds: string[]): void {
 	for (const id of removedIds) {
-		const credentialIds = new Set([
+		const ids = new Set([
 			...(knownCredentialIds.get(id) ?? []),
+			id,
 			...getProviderKeyStore()
 				.list(nugKeyOwner(id))
 				.map((key) => key.id),
-			id,
 		]);
 		knownCredentialIds.delete(id);
-		for (const credentialId of credentialIds) {
+		for (const credentialId of ids) {
+			const pending = refreshes.get(credentialId);
+			refreshes.delete(credentialId);
+			pending?.controller.abort();
 			quotaStore.remove(credentialId);
 			quotaStore.remove(credentialId, STREAM_QUOTA_SOURCE);
 		}

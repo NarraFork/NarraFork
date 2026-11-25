@@ -307,53 +307,6 @@ test("没有失败请求的独立充值显式使用 standalone 意图", async ()
 });
 
 test.each([
-	true,
-	false,
-])("付款钱包是否仍为首 Key=%s：只按旧 provider-record 形状更新对应余额，不覆盖另一钱包", async (isPrimary) => {
-	const oldQuota = {
-		balance: 10,
-		totalGranted: 20,
-		detailedQuotaBalance: "Primary wallet",
-		extra: { wallet: "primary" },
-	};
-	const otherQuota = { balance: 99, totalGranted: 100 };
-	const oldCache = { gateway: oldQuota, other: otherQuota };
-	const currentQuotaKey = ["nug", "quota", "gateway", 1, getAuthSnapshot().generation];
-	const currentQuota = { ...oldQuota, fetchedAt: 1 };
-	qc.setQueryData(["nug", "quotas"], oldCache);
-	qc.setQueryData(currentQuotaKey, currentQuota);
-	const paidQuota = {
-		...quota,
-		detailedQuotaBalance: "Paid wallet",
-		extra: { wallet: "paid" },
-		paymentCredentialIsPrimary: isPrimary,
-	};
-	create.mockResolvedValueOnce(order("paid"));
-	balance.mockResolvedValueOnce(paidQuota);
-	await mountAndCreate();
-	expect(balance).toHaveBeenCalledWith("gateway", undefined, {
-		orderId: "order-A",
-		binding: BINDING,
-	});
-	expect(qc.getQueryData(["nug", "quotas"])).toEqual({
-		gateway: isPrimary
-			? {
-					balance: paidQuota.balance,
-					totalGranted: paidQuota.totalGranted,
-					detailedQuotaBalance: paidQuota.detailedQuotaBalance,
-					extra: paidQuota.extra,
-				}
-			: oldQuota,
-		other: otherQuota,
-	});
-	expect(qc.getQueryData(currentQuotaKey)).toEqual(currentQuota);
-	expect(qc.getQueryState(currentQuotaKey)?.isInvalidated).toBe(true);
-	expect(events).toEqual(
-		isPrimary ? ["quota", "continue", "paid", "close"] : ["continue", "paid", "close"],
-	);
-});
-
-test.each([
 	"gateway-502",
 	"network",
 ])("%s recovers through the real Query retry, confirms quota, then signals paid once", async (failure) => {

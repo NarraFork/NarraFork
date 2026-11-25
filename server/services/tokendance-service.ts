@@ -1037,6 +1037,7 @@ function balanceSummary(cache?: BalanceCache, subject = balanceSubject()): Token
 			: {}),
 	};
 }
+
 /** Stale-while-revalidate: never waits on the upstream in ordinary user requests. */
 export function getTokenDanceBalance(): TokenDanceBalance {
 	const subject = balanceSubject();
@@ -1111,7 +1112,7 @@ export async function refreshTokenDanceBalance(
 				throw fail("TokenDance connection changed", 409);
 			}
 			quotaStore.set(subject.id, identity, snapshot);
-		} catch {
+		} catch (error) {
 			if (current()) {
 				const previous = balanceSummary({ ...cache, task: undefined }, subject);
 				quotaStore.set(
@@ -1125,6 +1126,7 @@ export async function refreshTokenDanceBalance(
 					false,
 				);
 			}
+			throw error;
 		} finally {
 			if (balanceCaches.get(subject.id) === cache && cache.task === task) cache.task = undefined;
 		}

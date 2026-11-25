@@ -25,7 +25,7 @@ import {
 	useProviderModelRefreshCapability,
 	useProviderRouteCapability,
 } from "../../hooks/usePlatform";
-import { useProviderBalanceCapability } from "../../hooks/useProviderBalance";
+import { useProviderBalanceCapability } from "../../hooks/useProviderBalanceProbe";
 import { api } from "../../lib/api";
 import type { ModelOption } from "../../lib/constants";
 import { extractPrimaryDomainLabel } from "../../lib/url";

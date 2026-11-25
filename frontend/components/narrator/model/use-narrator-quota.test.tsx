@@ -1,5 +1,6 @@
 import { afterAll, afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { notifyManager, QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { PublicQuotaSnapshot } from "@shared/quota-snapshot";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { parseHTML } from "linkedom";
 import { act, useState } from "react";
 import type { Root } from "react-dom/client";
@@ -27,33 +28,32 @@ for (const [key, value] of Object.entries({
 	Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
 }
 const { createRoot } = await import("react-dom/client");
-notifyManager.setScheduler(queueMicrotask);
 let root: Root;
 let host: HTMLElement;
 let current: ReturnType<typeof useNarratorQuota>;
 let payment: PaymentRequiredInfo | null;
 let qc: QueryClient;
-let read: ReturnType<typeof spyOn<typeof api, "nugGetCachedQuota">>;
+let read: ReturnType<typeof spyOn<typeof api, "quotaSnapshots">>;
 const providers = [{ id: "gateway", prefix: "nug", name: "Gateway", generation: 1 }];
 const noSubstatus: string[] = [];
 function Harness({
+	snapshot,
 	initialPayment = null,
 	substatus = noSubstatus,
 	errorMessage,
 	model = "nug:model",
 }: {
+	snapshot?: PublicQuotaSnapshot | null;
 	initialPayment?: PaymentRequiredInfo | null;
 	substatus?: string[];
 	errorMessage?: string;
 	model?: string;
 }) {
 	const [paymentRequired, setPaymentRequired] = useState(initialPayment);
-	const nugProviderInfo = useNugQuota(model, providers);
 	payment = paymentRequired;
 	current = useNarratorQuota({
-		nugProviderInfo,
-		quotaBalance: nugProviderInfo?.quotaBalance ?? null,
-		detailedQuotaBalance: nugProviderInfo?.detailedQuotaBalance ?? null,
+		nugProviderInfo: useNugQuota(model, providers),
+		snapshot,
 		paymentRequired,
 		setPaymentRequired,
 		narratorSubstatus: substatus,
@@ -61,9 +61,11 @@ function Harness({
 	});
 	return null;
 }
-const cachedQuota = (balance: number | null, detailedQuotaBalance: string | null = null) => ({
-	generation: 1,
-	quota: { balance, totalGranted: 50, detailedQuotaBalance, fetchedAt: 1 },
+const snapshot = (remaining: number | null, unlimited = false): PublicQuotaSnapshot => ({
+	fetchedAt: 1,
+	scope: "wallet",
+	windows: [],
+	balances: [{ unit: "USD", remaining, unlimited }],
 });
 const render = (props: Parameters<typeof Harness>[0] = {}) =>
 	act(async () => {
@@ -77,7 +79,7 @@ const render = (props: Parameters<typeof Harness>[0] = {}) =>
 beforeEach(() => {
 	setToken("quota-session");
 	qc = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: Infinity } } });
-	read = spyOn(api, "nugGetCachedQuota").mockResolvedValue({ generation: 1, quota: null });
+	read = spyOn(api, "quotaSnapshots").mockResolvedValue({ entries: [] });
 	host = document.createElement("div");
 	document.body.appendChild(host);
 	root = createRoot(host);
@@ -90,35 +92,30 @@ afterEach(async () => {
 	host.remove();
 });
 afterAll(() => {
-	notifyManager.setScheduler((callback) => setTimeout(callback, 0));
 	for (const [key, descriptor] of originals) {
 		if (descriptor) Object.defineProperty(globalThis, key, descriptor);
 		else Reflect.deleteProperty(globalThis, key);
 	}
 });
 
-describe("cached NUG recharge", () => {
+describe("snapshot-backed NUG recharge", () => {
 	test.each([
 		undefined,
 		null,
-		0,
-		-1,
+		snapshot(null),
+		snapshot(0),
+		snapshot(-1),
 	])("unknown or exhausted allowance keeps a direct recharge entry (%j)", async (value) => {
-		if (value !== undefined) read.mockResolvedValue(cachedQuota(value));
-		await render();
+		await render({ snapshot: value });
 		expect(current.shouldShowNugRechargeButton).toBe(true);
 		expect(current.shouldShowNugRechargeInQuotaDetails).toBe(false);
 		expect(current.nugRechargeOpened).toBe(false);
-		expect(read).toHaveBeenCalledWith("gateway", {
-			signal: expect.any(AbortSignal),
-			expectedGeneration: 1,
-		});
 	});
 	test.each([
-		0.000001, 10,
-	])("positive cached allowance keeps recharge in quota details (%j)", async (value) => {
-		read.mockResolvedValue(cachedQuota(value));
-		await render();
+		snapshot(0.000001),
+		snapshot(null, true),
+	])("positive or unlimited allowance keeps recharge in snapshot details (%j)", async (value) => {
+		await render({ snapshot: value });
 		expect(current.shouldShowNugRechargeButton).toBe(false);
 		expect(current.shouldShowNugRechargeInQuotaDetails).toBe(true);
 		await act(() => current.openNugRecharge());
@@ -126,15 +123,9 @@ describe("cached NUG recharge", () => {
 		await act(() => current.closeNugRecharge());
 		expect(current.nugRechargeOpened).toBe(false);
 	});
-	test("legacy cached quota details are preserved", async () => {
-		read.mockResolvedValue(cachedQuota(10, "Wallet: 10 / 50"));
-		await render();
-		expect(current.quotaDetailsText).toBe("Wallet: 10 / 50");
-		expect(current.hasQuotaDetailsPopover).toBe(true);
-	});
 	test("payment-required overrides a positive cached allowance and opens recharge", async () => {
-		read.mockResolvedValue(cachedQuota(10));
 		await render({
+			snapshot: snapshot(10),
 			initialPayment: { providerId: "gateway", required: 20, resumeAction: "continue" },
 		});
 		expect(current.shouldShowNugRechargeButton).toBe(true);
@@ -202,9 +193,8 @@ describe("cached NUG recharge", () => {
 		expect(payment).toMatchObject({ providerId: "gateway", resumeAction: "retry" });
 		expect(current.nugRechargeOpened).toBe(true);
 	});
-	test("non-NUG models never expose or read another provider's cached NUG quota", async () => {
-		read.mockResolvedValue(cachedQuota(0));
-		await render({ model: "other:model" });
+	test("non-NUG models never expose NUG recharge or read another provider's snapshot", async () => {
+		await render({ model: "other:model", snapshot: snapshot(0) });
 		expect(current.shouldShowNugRechargeButton).toBe(false);
 		expect(current.shouldShowNugRechargeInQuotaDetails).toBe(false);
 		expect(read).not.toHaveBeenCalled();

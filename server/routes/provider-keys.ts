@@ -18,18 +18,11 @@ import { clearKeyCooldown, keyCooldown } from "../lib/agent/pooled-provider";
 import { maskSecret } from "../lib/auth-settings";
 import { AppError, zodValidationError } from "../lib/errors";
 import {
-	getKimiKeyUsages,
 	isKimiCustomApiProvider,
-	type KimiUsageWindow,
 	purgeKimiUsageCache,
 	refreshKimiKeyUsage,
 } from "../lib/kimi-usage-cache";
-import {
-	getOpencodeKeyUsages,
-	isOpencodeCustomApiProvider,
-	type OpencodeUsageWindow,
-	refreshOpencodeKeyUsage,
-} from "../lib/opencode-usage-cache";
+import { isOpencodeCustomApiProvider, refreshOpencodeKeyUsage } from "../lib/opencode-usage-cache";
 import {
 	COMMAND_CODE_KEY_OWNER,
 	getProviderKeyStore,
@@ -47,64 +40,6 @@ import { requireAdmin } from "../middleware/auth";
 export const providerKeyRoutes = new Hono();
 providerKeyRoutes.use("*", requireAdmin);
 
-/** One allowance window, the same shape for every provider family. */
-export interface KeyUsageWindow {
-	/** "5h", "weekly", "monthly", or the upstream's own label. */
-	label: string;
-	/** 0..1, when known. */
-	usedRatio: number | null;
-	resetsAt: string | null;
-}
-
-function kimiWindow(label: string, w: KimiUsageWindow | null): KeyUsageWindow | null {
-	if (!w) return null;
-	const ratio =
-		w.limit && w.limit > 0 && w.used != null
-			? w.used / w.limit
-			: w.limit && w.limit > 0 && w.remaining != null
-				? 1 - w.remaining / w.limit
-				: null;
-	return { label, usedRatio: ratio, resetsAt: w.resetTime };
-}
-
-function opencodeWindow(label: string, w: OpencodeUsageWindow | null): KeyUsageWindow | null {
-	if (!w) return null;
-	return { label, usedRatio: w.percent == null ? null : w.percent / 100, resetsAt: w.resetsAt };
-}
-
-function usageOf(providerId: string, keyId: string) {
-	const provider = settings.customApiProviders?.find((p) => p.id === providerId);
-	if (!provider) return undefined;
-	if (isKimiCustomApiProvider(provider)) {
-		const cache = getKimiKeyUsages()[keyId];
-		if (!cache) return undefined;
-		return {
-			fetchedAt: cache.fetchedAt,
-			error: cache.error,
-			windows: [
-				kimiWindow("5h", cache.fiveHour),
-				kimiWindow("weekly", cache.weekly),
-				kimiWindow("monthly", cache.monthly),
-				...cache.extraWindows.map((w) => kimiWindow(w.label, w)),
-			].filter((w): w is KeyUsageWindow => !!w),
-		};
-	}
-	if (isOpencodeCustomApiProvider(provider)) {
-		const cache = getOpencodeKeyUsages()[keyId];
-		if (!cache) return undefined;
-		return {
-			fetchedAt: cache.fetchedAt,
-			error: cache.error,
-			windows: [
-				opencodeWindow("5h", cache.rolling),
-				opencodeWindow("weekly", cache.weekly),
-				opencodeWindow("monthly", cache.monthly),
-			].filter((w): w is KeyUsageWindow => !!w),
-		};
-	}
-	return undefined;
-}
-
 function publicKey(key: ProviderKey) {
 	return {
 		id: key.id,
@@ -115,7 +50,6 @@ function publicKey(key: ProviderKey) {
 		disabledReason: key.disabledReason ?? null,
 		network: publicCredentialNetwork(key.network),
 		cooldown: keyCooldown(key.id) ?? null,
-		usage: usageOf(key.providerId, key.id) ?? null,
 	};
 }
 
@@ -268,14 +202,5 @@ providerKeyRoutes.put("/:providerId/order", async (c) => {
 		throw new AppError("Order contains duplicate or foreign keys", 400, "INVALID_KEY_ORDER");
 	}
 	getProviderKeyStore().reorder(keyOwner(group), parsed.data.ids);
-	return c.json({ keys: getProviderKeyStore().listGroup(providerId).map(publicKey) });
-});
-
-/** Re-read every key's allowance (Kimi Code, OpenCode Go); waits for the answers. */
-providerKeyRoutes.post("/:providerId/usage/refresh", async (c) => {
-	const providerId = c.req.param("providerId");
-	providerOr404(providerId);
-	const keys = getProviderKeyStore().listGroup(providerId);
-	await Promise.allSettled(keys.map((key) => refreshUsage(providerId, key.id)));
 	return c.json({ keys: getProviderKeyStore().listGroup(providerId).map(publicKey) });
 });

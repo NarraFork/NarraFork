@@ -6,19 +6,19 @@ import { pluginProviderRegistry } from "../../../services/plugin-provider-regist
 import { tokenDanceQuotaIdentity } from "../../../services/tokendance-service";
 import { __setCodexManagerForTests } from "../../codex-manager";
 import type { CodexUsageResult } from "../../codex-usage";
-import { commandCodeQuotaIdentity } from "../../commandcode-usage";
+import { commandCodeQuotaIdentity, probeCommandCodeQuota } from "../../commandcode-usage";
 import { getCredentialStore } from "../../credential-store";
 import { customApiStreamQuotaIdentity } from "../../custom-api-quota-cache";
 import { deepSeekQuotaIdentity } from "../../deepseek-balance-cache";
 import { kimiQuotaIdentity } from "../../kimi-usage-cache";
 import { setNugCachedModels } from "../../nug-model-cache";
-import { nugQuotaIdentity } from "../../nug-quota-cache";
+import { nugQuotaIdentity, probeNugQuota } from "../../nug-quota-cache";
 import { opencodeQuotaIdentity } from "../../opencode-usage-cache";
 import { providerBalanceQuotaIdentity } from "../../provider-balance-cache";
 import { getProviderKeyStore, type ProviderKey, withProviderKey } from "../../provider-keys";
 import { type CustomApiProviderConfig, saveSettings, settings } from "../../settings";
 import { quotaStore, STREAM_QUOTA_SOURCE } from "../../sourcing/quota-store";
-import { getSourceGroup, listSourceGroups } from "../../sourcing/source-groups";
+import { listSourceGroups } from "../../sourcing/source-groups";
 import { getServiceTemplate, listServiceTemplates } from "../../sourcing/templates";
 import { autoSourceFacts, autoSourcePreview, installAutoRouteSignals } from "../auto-route-signals";
 import { reportKeyFault, resetProviderKeyRuntimeForTests } from "../pooled-provider";
@@ -297,7 +297,7 @@ describe("template auto routing", () => {
 
 	test("real NUG probe preserves unknown raw balances and recognizes numeric aliases before routing", async () => {
 		const key = nugSource.add();
-		const probe = getServiceTemplate("nug").probeQuota!;
+		const probe = probeNugQuota;
 		const network = spyOn(globalThis, "fetch");
 		try {
 			for (const [raw, remaining] of [
@@ -312,7 +312,6 @@ describe("template auto routing", () => {
 			] as const) {
 				network.mockResolvedValueOnce(Response.json(raw));
 				const result = await probe(
-					getSourceGroup(nugSource.id)!,
 					{
 						id: key.id,
 						providerId: nugSource.id,
@@ -334,7 +333,7 @@ describe("template auto routing", () => {
 	test("real Command Code probe rejects unknown monthly credits rather than manufacturing exhausted quota", async () => {
 		const entry = walletSources[1]!;
 		const key = entry.add();
-		const probe = getServiceTemplate("command-code").probeQuota!;
+		const probe = probeCommandCodeQuota;
 		const network = spyOn(globalThis, "fetch");
 		try {
 			for (const credits of [
@@ -347,7 +346,6 @@ describe("template auto routing", () => {
 				network.mockResolvedValueOnce(Response.json({ credits }));
 				await expect(
 					probe(
-						getSourceGroup(entry.id)!,
 						{
 							id: key.id,
 							providerId: entry.id,

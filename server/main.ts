@@ -1238,7 +1238,7 @@ async function initializeDatabaseStartup(): Promise<void> {
 
 	try {
 		// One-shot warmup when Kimi providers exist; no periodic timer — refresh is
-		// demand-driven (stale-while-revalidate on GET /api/kimi/usages, plus a
+		// demand-driven (stale-while-revalidate on GET /api/quota-snapshots, plus a
 		// refresh when provider settings change).
 		const { refreshAllKimiUsages } = await import("./lib/kimi-usage-cache");
 		void refreshAllKimiUsages().catch(() => {});
