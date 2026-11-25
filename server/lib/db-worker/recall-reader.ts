@@ -12,6 +12,11 @@ import type {
 	RecallPagination,
 } from "../recall-contract";
 import { DbReadError } from "./errors";
+import {
+	guardRecallEffectiveRefsQuery,
+	recallEffectiveRefsQueries,
+	unwrapRecallEffectiveRefsRows,
+} from "./recall-effective-refs";
 
 export { readRecallToolCallPage } from "./recall-tool-page";
 
@@ -191,8 +196,9 @@ export function* recallConversationQueries(
 	};
 	if (!narrator) return result;
 	budget(Buffer.byteLength(JSON.stringify(narrator)), 256 * 1024);
-	const params: RecallQuery["params"] = [input.narratorId];
-	const where = ["r.narrator_id = ?"];
+	const refs = yield* recallEffectiveRefsQueries(input.narratorId, postgres);
+	const params: RecallQuery["params"] = [];
+	const where = ["1 = 1"];
 	if (input.roles) {
 		where.push(`m.role IN (${input.roles.map(() => "?").join(",")})`);
 		params.push(...input.roles);
@@ -212,41 +218,83 @@ export function* recallConversationQueries(
 		where.push("m.created_at <= ?");
 		params.push(input.createdTo);
 	}
-	const scope = `FROM narrator_message_refs r JOIN narrator_messages m ON m.id = r.message_id WHERE ${where.join(" AND ")}`;
+	const scope = `FROM effective_recall_refs r JOIN narrator_messages m ON m.id = r.message_id WHERE ${where.join(" AND ")}`;
 	const columns = `m.id, m.role, m.origin, ${postgres ? "substr(m.content_text, 1, 501)" : "substr(CAST(m.content_text AS BLOB), 1, 2004)"} AS content_prefix, ${postgres ? "length(m.content_text) > 500" : "length(CAST(m.content_text AS BLOB)) > 2004"} AS truncated, m.created_at, r.seq`;
-	const select = (extra: string, order: string, count: number, values: number[] = []) =>
-		query(`SELECT ${columns} ${scope} ${extra} ORDER BY r.seq ${order} LIMIT ?`, [
-			...params,
-			...values,
-			count,
-		]);
+	function* effectiveQuery(
+		selectSql: string,
+		tailParams: RecallQuery["params"] = [],
+		orderBy?: string,
+	): Generator<RecallQuery, QueryRows, QueryRows> {
+		const guarded = guardRecallEffectiveRefsQuery(refs, selectSql, tailParams, orderBy);
+		return unwrapRecallEffectiveRefsRows(yield query(guarded.sql, guarded.params));
+	}
+	const select = (
+		extra: string,
+		order: string,
+		count: number,
+		values: RecallQuery["params"] = [],
+	) =>
+		effectiveQuery(
+			`SELECT ${columns} ${scope} ${extra} ORDER BY r.seq ${order}, m.id ${order} LIMIT ?`,
+			[...params, ...values, count],
+			`seq ${order}, id ${order}`,
+		);
+	const cursorOf = (row: Record<string, unknown>) => ({
+		seq: Number(row.seq),
+		messageId: String(row.id),
+	});
+	const tuple = (row: Record<string, unknown>): RecallQuery["params"] => [
+		Number(row.seq),
+		String(row.id),
+	];
 	const direction = input.direction ?? (input.messageId ? "around" : "older");
 	let rows: QueryRows;
 	if (direction === "around") {
-		const anchor = (yield query(
-			"SELECT seq FROM narrator_message_refs WHERE narrator_id = ? AND message_id = ? LIMIT 1",
-			[input.narratorId, input.messageId],
+		const anchor = (yield* effectiveQuery(
+			"SELECT seq, message_id AS id FROM effective_recall_refs WHERE message_id = ? LIMIT 1",
+			[input.messageId],
 		))[0];
 		if (!anchor) return { ...result, messageMissing: true };
-		const seq = Number(anchor.seq);
-		const before = yield select("AND r.seq < ?", "DESC", Math.floor(input.limit / 2), [seq]);
-		const after = yield select("AND r.seq >= ?", "ASC", input.limit - before.length, [seq]);
+		const before = yield* select(
+			"AND (r.seq, m.id) < (?, ?)",
+			"DESC",
+			Math.floor(input.limit / 2),
+			tuple(anchor),
+		);
+		const after = yield* select(
+			"AND (r.seq, m.id) >= (?, ?)",
+			"ASC",
+			input.limit - before.length,
+			tuple(anchor),
+		);
 		if (before.length + after.length < input.limit) {
-			const tail = before.length ? Number(before[before.length - 1].seq) : seq;
+			const tail = before.length ? before[before.length - 1] : anchor;
 			before.push(
-				...(yield select("AND r.seq < ?", "DESC", input.limit - before.length - after.length, [
-					tail,
-				])),
+				...(yield* select(
+					"AND (r.seq, m.id) < (?, ?)",
+					"DESC",
+					input.limit - before.length - after.length,
+					tuple(tail),
+				)),
 			);
 		}
 		rows = [...before.reverse(), ...after];
 	} else {
 		const newer = direction === "newer";
-		rows = yield select(
-			input.cursor === undefined ? "" : `AND r.seq ${newer ? ">" : "<"} ?`,
+		const cursor = input.cursor;
+		rows = yield* select(
+			cursor === undefined
+				? ""
+				: typeof cursor === "number"
+					? `AND r.seq ${newer ? ">" : "<"} ?`
+					: `AND (r.seq, m.id) ${newer ? ">" : "<"} (?, ?)`,
 			newer ? "ASC" : "DESC",
 			input.limit,
-			input.cursor === undefined ? [] : [input.cursor],
+			cursor === undefined
+				? []
+				: typeof cursor === "number"
+					? [cursor]
+					: [cursor.seq, cursor.messageId],
 		);
 		if (!newer) rows.reverse();
 	}
@@ -267,15 +315,21 @@ export function* recallConversationQueries(
 		};
 	}) as RecallConversationSnapshot["rows"];
 	if (!rows.length) return result;
-	const first = Number(rows[0].seq),
-		last = Number(rows[rows.length - 1].seq);
+	const first = rows[0],
+		last = rows[rows.length - 1];
 	result.pagination = {
 		hasOlder:
-			(yield query(`SELECT 1 ${scope} AND r.seq < ? LIMIT 1`, [...params, first])).length > 0,
+			(yield* effectiveQuery(`SELECT 1 ${scope} AND (r.seq, m.id) < (?, ?) LIMIT 1`, [
+				...params,
+				...tuple(first),
+			])).length > 0,
 		hasNewer:
-			(yield query(`SELECT 1 ${scope} AND r.seq > ? LIMIT 1`, [...params, last])).length > 0,
-		olderCursor: first,
-		newerCursor: last,
+			(yield* effectiveQuery(`SELECT 1 ${scope} AND (r.seq, m.id) > (?, ?) LIMIT 1`, [
+				...params,
+				...tuple(last),
+			])).length > 0,
+		olderCursor: cursorOf(first),
+		newerCursor: cursorOf(last),
 	};
 	if (!input.includeToolCalls) return result;
 	const ids = result.rows.map((row) => row.id);
@@ -304,17 +358,28 @@ export function* recallConversationQueries(
 	];
 	const fields = keys.map(
 		(key) =>
-			`substr(${postgres ? `(input_json::jsonb ->> '${key}')` : `CASE WHEN json_valid(input_json) THEN json_extract(input_json, '$.${key}') END`}, 1, 512) AS "${key}"`,
+			`substr(CASE WHEN json_valid(input_json) THEN json_extract(input_json, '$.${key}') END, 1, 512) AS "${key}"`,
 	);
 	fields.push(
-		`substr(${postgres ? "(input_json::jsonb #>> '{questions,0,header}')" : "CASE WHEN json_valid(input_json) THEN json_extract(input_json, '$.questions[0].header') END"}, 1, 512) AS question_header`,
+		"substr(CASE WHEN json_valid(input_json) THEN json_extract(input_json, '$.questions[0].header') END, 1, 512) AS question_header",
 	);
 	let time = "",
 		id = "",
 		resultBytes = Buffer.byteLength(JSON.stringify(result));
+	const toolMetadataColumns = [
+		"id",
+		"created_at",
+		"tool_use_id",
+		"tool_name",
+		"status",
+		"message_id",
+	];
+	const pgBatchAllowed = `sum(bytes) OVER () <= ${RECALL_CONVERSATION_INPUT_BYTES} AND max(metadata_bytes) OVER () <= 4096`;
 	while (true) {
 		const tools = yield query(
-			`SELECT id, created_at, tool_use_id, tool_name, status, message_id, ${fields.join(",")} ${toolScope} AND (created_at, id) > (?, ?) ORDER BY created_at, id LIMIT 128`,
+			postgres
+				? `WITH tool_batch AS (SELECT id, created_at, tool_use_id, tool_name, status, message_id, input_json::text AS raw, coalesce(octet_length(input_json::text),0) AS bytes, ${toolMetadataColumns.map((column) => `coalesce(octet_length(${column}),0)`).join(" + ")} AS metadata_bytes ${toolScope} AND (created_at, id) > (?, ?) ORDER BY created_at, id LIMIT 128) SELECT ${toolMetadataColumns.map((column) => `CASE WHEN ${pgBatchAllowed} THEN ${column} END AS ${column}`).join(",")}, CASE WHEN ${pgBatchAllowed} THEN raw END AS recall_summary_input, NOT (${pgBatchAllowed}) AS recall_summary_oversized FROM tool_batch ORDER BY created_at, id`
+				: `SELECT id, created_at, tool_use_id, tool_name, status, message_id, ${fields.join(",")} ${toolScope} AND (created_at, id) > (?, ?) ORDER BY created_at, id LIMIT 128`,
 			[input.narratorId, ...ids, time, id],
 		);
 		for (const tool of tools) {
@@ -372,11 +437,23 @@ export function readRecallMessage(
 ): RecallMessagePage | null {
 	check(signal, deadlineAt);
 	return database.transaction(() => {
+		const plan = recallEffectiveRefsQueries(input.narratorId);
+		let step = plan.next();
+		while (!step.done) {
+			check(signal, deadlineAt);
+			const statement = database.prepare(step.value.sql);
+			try {
+				step = plan.next(statement.all(...step.value.params) as QueryRows);
+			} finally {
+				statement.finalize();
+			}
+		}
+		const refs = step.value;
 		const row = database
 			.query(
-				`SELECT m.id AS messageId, r.narrator_id AS narratorId, n.title AS narratorTitle, m.role, m.origin, m.origin_label AS originLabel, m.created_at AS createdAt, r.seq, ${hasBodyRevisions(database) ? "m.body_revision" : "0"} AS bodyRevision FROM narrator_message_refs r JOIN narrator_messages m ON m.id = r.message_id JOIN narrators n ON n.id = r.narrator_id WHERE r.narrator_id = ? AND r.message_id = ? LIMIT 1`,
+				`${refs.cte} SELECT m.id AS messageId, n.id AS narratorId, n.title AS narratorTitle, m.role, m.origin, m.created_at AS createdAt, r.seq, ${hasBodyRevisions(database) ? "m.body_revision" : "0"} AS bodyRevision FROM effective_recall_refs r JOIN narrator_messages m ON m.id = r.message_id JOIN narrators n ON n.id = ? WHERE r.message_id = ? LIMIT 1`,
 			)
-			.get(input.narratorId, input.messageId) as Omit<
+			.get(...refs.params, input.narratorId, input.messageId) as Omit<
 			RecallMessagePage,
 			"text" | "offset" | "totalChars" | "hasMore" | "nextOffset"
 		> | null;
@@ -419,7 +496,6 @@ export function readRecallMessage(
 		const result: RecallMessagePage = {
 			...row,
 			origin: row.origin ?? null,
-			originLabel: row.originLabel ?? null,
 			text: text.slice(input.offset, end).join(""),
 			offset: input.offset,
 			totalChars: text.length,

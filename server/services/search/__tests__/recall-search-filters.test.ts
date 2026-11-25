@@ -1,10 +1,12 @@
 import { afterAll, describe, expect, mock, test } from "bun:test";
-import { getTestDb } from "../../../../tests/setup";
 import type { PgExecutor } from "../../../db/pg-fts";
+import { getNarratorWorkerTestDb } from "../../__tests__/narrator-worker-fixture";
 import type { RecallSearchQuery } from "../types";
 
-// All SQL runs against this in-memory migration fixture, never the production worker/DB.
-const { db, sqlite } = getTestDb();
+// All SQL runs against this temporary fixture, never the production DB.
+const fixture = getNarratorWorkerTestDb();
+const { db, sqlite } = fixture;
+await fixture.ready;
 mock.module("../../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
 const { ensureFts, replaceBlockIndexText } = await import("../../../db/fts");
 ensureFts(sqlite, { skipUncleanShutdownRebuild: true });
@@ -109,7 +111,54 @@ for (const [id, owner, refs, hasBlock] of [
 		replaceBlockIndexText(sqlite, `block-${id}`, HISTORY_TEXT);
 	}
 }
-afterAll(() => sqlite.close());
+// Lazy full forks keep only new/partially copied refs until backfill catches up.
+for (const [id, parent, cursor] of [
+	["lazy-root", null, null],
+	["lazy-middle", "lazy-root", 5],
+	["lazy-child", "lazy-middle", 4],
+] as const) {
+	sqlite.run(
+		`INSERT INTO narrators (id, title, refs_inherited_from, refs_backfill_cursor, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		[id, `title-${id}`, parent, cursor, NOW, NOW],
+	);
+}
+const LAZY_TEXT = "lazyneedle 祖先需求";
+for (const [id, narratorId, seq, compacted, legacy] of [
+	["lazy-before", "lazy-root", 0, false, true],
+	["lazy-duplicate", "lazy-root", 1, false, false],
+	["lazy-compacted", "lazy-root", 2, true, false],
+	["lazy-boundary", "lazy-root", 4, false, false],
+	["lazy-after", "lazy-root", 5, false, false],
+	["lazy-middle-own", "lazy-middle", 3, false, false],
+	["lazy-middle-after", "lazy-middle", 4, false, false],
+	["lazy-child-own", "lazy-child", 21, false, false],
+] as const) {
+	sqlite.run(
+		`INSERT INTO narrator_messages (id, narrator_id, role, origin, content_json, content_text, created_at, body_format)
+		 VALUES (?, ?, 'user', 'user', '[]', ?, ?, ?)`,
+		[id, narratorId, LAZY_TEXT, NOW, legacy ? 1 : 2],
+	);
+	sqlite.run(
+		`INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq, segment_compact_id)
+		 VALUES (?, ?, ?, ?, ?)`,
+		[`ref-${id}`, narratorId, id, seq, compacted ? "marker" : null],
+	);
+	if (!legacy) {
+		sqlite.run(
+			`INSERT INTO narrator_blocks (id, message_id, ordinal, kind, payload, created_at)
+			 VALUES (?, ?, 0, 'output', ?, ?)`,
+			[`block-${id}`, id, JSON.stringify({ text: LAZY_TEXT }), NOW],
+		);
+		replaceBlockIndexText(sqlite, `block-${id}`, LAZY_TEXT);
+	}
+}
+// Partial backfill: the child owns a ref already present in its grandparent.
+sqlite.run(
+	`INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq)
+	 VALUES ('partial-duplicate', 'lazy-child', 'lazy-duplicate', 20)`,
+);
+afterAll(() => fixture.close());
 
 const query = (options: Partial<RecallSearchQuery> = {}): RecallSearchQuery => ({
 	text: "needle",
@@ -120,6 +169,60 @@ const query = (options: Partial<RecallSearchQuery> = {}): RecallSearchQuery => (
 	...options,
 });
 const ids = (rows: { messageId: string }[]) => rows.map((row) => row.messageId);
+
+/** Exact inter-query schedule: fork materializes m1, then ancestor COW replaces its ref with m2. */
+function lineageRaceFixture(prefix: string, hasBlock: boolean) {
+	const owner = `${prefix}-A`;
+	const child = `${prefix}-B`;
+	const m1 = `${prefix}-m1`;
+	const m2 = `${prefix}-m2`;
+	for (const [id, parent, cursor] of [
+		[owner, null, null],
+		[child, owner, 2],
+	] as const) {
+		sqlite.run(
+			`INSERT INTO narrators (id, title, refs_inherited_from, refs_backfill_cursor, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?)`,
+			[id, id, parent, cursor, NOW, NOW],
+		);
+	}
+	const insertMessage = (id: string, text: string) => {
+		sqlite.run(
+			`INSERT INTO narrator_messages (id, narrator_id, role, origin, content_json, content_text, created_at, body_format)
+			 VALUES (?, ?, 'user', 'user', '[]', ?, ?, ?)`,
+			[id, owner, text, NOW, hasBlock ? 2 : 1],
+		);
+		if (hasBlock) {
+			sqlite.run(
+				`INSERT INTO narrator_blocks (id, message_id, ordinal, kind, payload, created_at)
+				 VALUES (?, ?, 0, 'output', ?, ?)`,
+				[`block-${id}`, id, JSON.stringify({ text }), NOW],
+			);
+			replaceBlockIndexText(sqlite, `block-${id}`, text);
+		}
+	};
+	insertMessage(m1, "raceguard 原文一");
+	sqlite.run(
+		`INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq) VALUES (?, ?, ?, 1)`,
+		[`ref-${prefix}`, owner, m1],
+	);
+	const materializeThenCow = sqlite.transaction(() => {
+		sqlite.run(
+			`INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq) VALUES (?, ?, ?, 1)`,
+			[`copy-${prefix}`, child, m1],
+		);
+		sqlite.run(
+			"UPDATE narrators SET refs_inherited_from = NULL, refs_backfill_cursor = NULL WHERE id = ?",
+			[child],
+		);
+		insertMessage(m2, "raceguard 新原文二");
+		sqlite.run("UPDATE narrator_message_refs SET message_id = ? WHERE id = ?", [
+			m2,
+			`ref-${prefix}`,
+		]);
+	});
+	return { child, m1, m2, materializeThenCow };
+}
 
 for (const blockOnly of [false, true]) {
 	const store = createSqliteSearchStore(
@@ -247,6 +350,53 @@ for (const blockOnly of [false, true]) {
 				).toBe(true);
 			});
 
+			test("scoped lazy forks search one/two inherited levels without materializing refs", async () => {
+				const lazyQuery = q({
+					text: strategy === "index" ? "lazyneedle" : "祖先",
+					origins: ["user"],
+					roles: ["user"],
+					sort: "newest",
+				});
+				const middle = await store.searchRecallMessages({
+					...lazyQuery,
+					narratorId: "lazy-middle",
+				});
+				expect(ids(middle)).toEqual([
+					"lazy-before",
+					"lazy-boundary",
+					"lazy-duplicate",
+					"lazy-middle-after",
+					"lazy-middle-own",
+				]);
+				const childQuery = { ...lazyQuery, narratorId: "lazy-child" };
+				const child = await store.searchRecallMessages(childQuery);
+				expect(ids(child)).toEqual([
+					"lazy-before",
+					"lazy-child-own",
+					"lazy-duplicate",
+					"lazy-middle-own",
+				]);
+				expect(
+					child.every(
+						(row) => row.narratorId === "lazy-child" && row.narratorTitle === "title-lazy-child",
+					),
+				).toBe(true);
+				expect(child.find((row) => row.messageId === "lazy-before")?.ownerNarratorId).toBe(
+					"lazy-root",
+				);
+				expect(ids(await store.searchRecallMessages({ ...childQuery, limit: 1 }))).toEqual([
+					"lazy-before",
+				]);
+				expect(await store.searchRecallMessages({ ...childQuery, createdFrom: NEW })).toEqual([]);
+				expect(
+					sqlite
+						.prepare(
+							"SELECT COUNT(*) AS count FROM narrator_message_refs WHERE narrator_id = 'lazy-child'",
+						)
+						.get(),
+				).toEqual({ count: 2 });
+			});
+
 			test("newest/oldest order before LIMIT, breaking equal timestamps by id", async () => {
 				const newest = q({ origins: ["user"], sort: "newest", limit: 2 });
 				expect(ids(await store.searchRecallMessages(newest))).toEqual(["a-user", "b-user"]);
@@ -262,8 +412,214 @@ for (const blockOnly of [false, true]) {
 	}
 }
 
+describe("scoped lineage changes fail closed in the final SQLite SQL snapshot", () => {
+	for (const blockOnly of [false, true]) {
+		for (const strategy of ["index", "substring"] as const) {
+			for (const hasBlock of [false, true]) {
+				test(`materialize then ancestor COW: blockOnly=${blockOnly}, ${strategy}, block=${hasBlock}`, async () => {
+					const race = lineageRaceFixture(`race-${blockOnly}-${strategy}-${hasBlock}`, hasBlock);
+					const controller = new AbortController();
+					let mutateAfterLineage = false;
+					let mutations = 0;
+					const store = createSqliteSearchStore(
+						async (sql, params, options) => {
+							expect(options?.signal).toBe(controller.signal);
+							const rows = sqlite
+								.prepare<Record<string, unknown>, typeof params>(sql)
+								.all(...params);
+							if (mutateAfterLineage && sql.startsWith("WITH RECURSIVE lineage")) {
+								mutateAfterLineage = false;
+								race.materializeThenCow();
+								mutations++;
+							}
+							return rows;
+						},
+						{ blockOnly: () => blockOnly },
+					);
+					const q = query({
+						text: "raceguard",
+						strategy,
+						narratorId: race.child,
+						signal: controller.signal,
+					});
+					expect(ids(await store.searchRecallMessages(q))).toEqual([race.m1]);
+					mutateAfterLineage = true;
+					await expect(store.searchRecallMessages(q)).rejects.toMatchObject({
+						code: "DB_READ_PROTOCOL",
+					});
+					expect(mutations).toBe(1);
+					expect(ids(await store.searchRecallMessages(q))).toEqual([race.m1]);
+					expect(await store.searchRecallMessages({ ...q, text: "新原文" })).toEqual([]);
+				});
+			}
+		}
+	}
+});
+
+test("scoped lineage and effective-refs CTE both execute in the SQLite Worker with cancellation", async () => {
+	const { createSqliteSearchQueryExecutor } = await import("../sqlite-worker-runner");
+	const controller = new AbortController();
+	const statements: string[] = [];
+	const worker = createSqliteSearchQueryExecutor(sqlite.filename);
+	const store = createSqliteSearchStore(
+		async (sql, params, options) => {
+			statements.push(sql);
+			expect(options?.signal).toBe(controller.signal);
+			return worker(sql, params, options);
+		},
+		{ blockOnly: () => true },
+	);
+	const rows = await store.searchRecallMessages(
+		query({
+			text: "lazyneedle",
+			narratorId: "lazy-child",
+			sort: "newest",
+			signal: controller.signal,
+		}),
+	);
+	expect(ids(rows)).toEqual(["lazy-before", "lazy-child-own", "lazy-duplicate", "lazy-middle-own"]);
+	expect(statements).toHaveLength(2);
+	expect(statements[0]).toContain("WITH RECURSIVE lineage");
+	expect(statements[1]).toContain("effective_recall_refs AS");
+	expect(statements[1]).toContain("recall_query_result AS (WITH hits AS");
+	expect(statements[1]).toContain("recall_lineage_guard.valid AS recall_lineage_valid");
+	controller.abort();
+	await expect(
+		store.searchRecallMessages(query({ narratorId: "lazy-child", signal: controller.signal })),
+	).rejects.toMatchObject({ code: "SEARCH_QUERY_CANCELLED" });
+});
+
+// Execute PG callers against the same temporary SQL fixture: only dialect functions and
+// numbered casts are adapted; lineage/guard/refs SQL and inter-query schedule are real.
+sqlite.run(
+	"CREATE TEMP VIEW search_narrator_messages AS SELECT id, content_text FROM narrator_messages",
+);
+const pgFixtureRows = (sql: string, params: unknown[]) =>
+	sqlite
+		.prepare<Record<string, unknown>, Array<string | number | null>>(
+			sql
+				.replace(/::(?:text|bigint)/g, "")
+				.replace(/\$(\d+)/g, "?$1")
+				.replace(/\bILIKE\b/g, "LIKE")
+				.replace(/\(1 - GREATEST\([\s\S]*?\)\) AS rank_score/, "0 AS rank_score")
+				.replace(
+					/CASE\s+WHEN f\.content_text IS NULL THEN NULL[\s\S]*?END AS snippet/,
+					"substr(f.content_text, 1, 66) AS snippet",
+				),
+		)
+		.all(...(params as Array<string | number | null>));
+
 describe("PostgreSQL Recall bound SQL contract (no database connection)", () => {
 	for (const strategy of ["index", "substring"] as const) {
+		test(`${strategy} final guard rejects materialization + ancestor COW between executor calls`, async () => {
+			const race = lineageRaceFixture(`pg-race-${strategy}`, strategy === "index");
+			let mutateAfterLineage = false;
+			let mutations = 0;
+			const store = createPostgresSearchStore({
+				unsafe: async (sql: string, params: unknown[]) => {
+					const rows = pgFixtureRows(sql, params);
+					if (mutateAfterLineage && sql.startsWith("WITH RECURSIVE lineage")) {
+						mutateAfterLineage = false;
+						race.materializeThenCow();
+						mutations++;
+					}
+					return rows;
+				},
+			} as unknown as PgExecutor);
+			const q = query({ text: "raceguard", strategy, narratorId: race.child });
+			expect(ids(await store.searchRecallMessages(q))).toEqual([race.m1]);
+			mutateAfterLineage = true;
+			await expect(store.searchRecallMessages(q)).rejects.toMatchObject({
+				code: "DB_READ_PROTOCOL",
+			});
+			expect(mutations).toBe(1);
+			expect(ids(await store.searchRecallMessages(q))).toEqual([race.m1]);
+			expect(await store.searchRecallMessages({ ...q, text: "新原文" })).toEqual([]);
+		});
+
+		test(`${strategy} scoped lazy CTE binds lineage first and preserves target history identity`, async () => {
+			const calls: { sql: string; params: unknown[] }[] = [];
+			const store = createPostgresSearchStore({
+				unsafe: async (sql: string, params: unknown[]) => {
+					calls.push({ sql, params });
+					if (sql.startsWith("WITH RECURSIVE lineage"))
+						return [
+							{ id: "lazy-child", refs_inherited_from: "lazy-middle", refs_backfill_cursor: 4 },
+							{ id: "lazy-middle", refs_inherited_from: "lazy-root", refs_backfill_cursor: 5 },
+							{ id: "lazy-root", refs_inherited_from: null, refs_backfill_cursor: null },
+						];
+					return [
+						{
+							recall_lineage_valid: true,
+							recall_row_present: 1,
+							id: "lazy-before",
+							narrator_id: "lazy-child",
+							narrator_title: "title-lazy-child",
+							owner_narrator_id: "lazy-root",
+							role: "user",
+							origin: "user",
+							created_at: NOW,
+						},
+					];
+				},
+			} as unknown as PgExecutor);
+			const rows = await store.searchRecallMessages(
+				query({
+					strategy,
+					narratorId: "lazy-child",
+					origins: ["user"],
+					createdFrom: OLD,
+					limit: 1,
+				}),
+			);
+			expect(calls).toHaveLength(2);
+			expect(calls[0].params).toEqual(["lazy-child"]);
+			expect(calls[0].sql).toContain("WHERE id = $1");
+			expect(calls[0].sql).toContain("l.depth < 32");
+			expect(calls[0].sql).toContain("LIMIT 33");
+			const { sql, params } = calls[1];
+			expect(params.slice(0, 12)).toEqual([
+				"lazy-child",
+				null,
+				"lazy-middle",
+				4,
+				"lazy-middle",
+				4,
+				"lazy-root",
+				5,
+				"lazy-root",
+				4,
+				null,
+				null,
+			]);
+			expect(sql).toContain(
+				"VALUES ($1::text, $2::bigint, 0, $3::text, $4::bigint, 1),($5::text, $6::bigint, 1, $7::text, $8::bigint, 1),($9::text, $10::bigint, 2, $11::text, $12::bigint, 1)",
+			);
+			expect(sql).toContain(
+				"observed.refs_inherited_from IS DISTINCT FROM captured.expected_parent",
+			);
+			expect(sql).toContain(
+				"observed.refs_backfill_cursor IS DISTINCT FROM captured.expected_cursor",
+			);
+			expect(sql).toContain("WHERE (SELECT valid FROM recall_lineage_guard)");
+			expect(sql).toContain("recall_lineage_guard.valid AS recall_lineage_valid");
+			expect(sql).toContain("JOIN effective_recall_refs r ON r.message_id = m.id");
+			expect(sql).toContain("n.id = (SELECT narrator_id FROM recall_ref_sources WHERE depth = 0)");
+			expect(sql).toContain("r.seq < s.upper_bound AND r.segment_compact_id IS NULL");
+			expect(sql).toContain("closer.depth < s.depth");
+			expect(sql).toContain("n.hidden_from_lists = 0");
+			expect(sql).not.toContain("?");
+			expect(params.at(-1)).toBe(1);
+			expect(Math.max(...Array.from(sql.matchAll(/\$(\d+)/g), (match) => Number(match[1])))).toBe(
+				params.length,
+			);
+			expect(rows[0]).toMatchObject({
+				narratorId: "lazy-child",
+				narratorTitle: "title-lazy-child",
+				ownerNarratorId: "lazy-root",
+			});
+		});
+
 		test(`${strategy} global SQL chooses an existing history ref and preserves owner identity`, async () => {
 			let statement = "";
 			const store = createPostgresSearchStore({
@@ -307,7 +663,19 @@ describe("PostgreSQL Recall bound SQL contract (no database connection)", () => 
 			const store = createPostgresSearchStore({
 				unsafe: async (sql: string, params: unknown[]) => {
 					calls.push({ sql, params });
-					return [{ id: "a", narrator_id: "fork", role: "user", origin: null, created_at: NOW }];
+					if (sql.startsWith("WITH RECURSIVE lineage"))
+						return [{ id: "fork", refs_inherited_from: null, refs_backfill_cursor: null }];
+					return [
+						{
+							recall_lineage_valid: true,
+							recall_row_present: 1,
+							id: "a",
+							narrator_id: "fork",
+							role: "user",
+							origin: null,
+							created_at: NOW,
+						},
+					];
 				},
 			} as unknown as PgExecutor);
 			for (const sort of ["relevance", "newest", "oldest"] as const) {

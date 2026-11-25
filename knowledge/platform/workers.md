@@ -34,7 +34,7 @@ keywords:
   - inlineFallback
   - Worker 隔离不可降级
 status: draft
-verified_at: 412d79d6a
+verified_at: 6685025e0c8c65c61ad08b60ccb28a1413196dd1
 ---
 # Worker 隔离
 
@@ -48,8 +48,9 @@ verified_at: 412d79d6a
 - 目录扫描：`lib/fs-scan-worker/client.ts` 并发 4、就绪超时 5 秒、总超时 15 分钟；Worker 不可用时抛 `FsScanWorkerUnavailableError` 并进入 5 秒冷却，冷却内的请求同样失败，绝不在服务线程遍历目录。编译产物会依次尝试候选入口，但已派发的扫描不会换入口重放。测试 `client-failures.test.ts` 覆盖创建失败、运行失败、冷却、取消、队列满。
 - 读 Worker 就绪门（`lib/db-reader-readiness.ts`）：认证读只走短读 Worker 池、不回主线程，所以启动时探测池一次（超时 30 秒，失败码 `DB_READERS_UNAVAILABLE`/`DB_READERS_TIMEOUT`）；之后 `requiresDatabaseReaders` 判定的路径（`/api`、`/ws`，但 `/api/health`、`/api/gracefully_shutdown` 和少数只读的品牌/许可证 GET 除外）在池不可用时返回 503 `DATABASE_READ_UNAVAILABLE` + `Retry-After: 5`，而不是让每个请求各自失败；PostgreSQL 后端恒为 `not-required`（`http-dispatcher.ts`）。`createDatabaseReaderStartup`（`db-reader-startup.ts`）在就绪前每 5 秒重试，就绪后才执行 `initialize`（`main.ts` 把数据库启动任务挂在它上面）。
 - `/api/health` 带出 `databaseReaders` 状态，读者不可用时返回 503 且 `status: "not_ready"`，所以监控能区分“进程活着”和“读池坏了”（`http-dispatcher.ts`）。
-- 编译产物里的 Worker：入口必须登记在 `COMPILED_WORKER_ENTRIES`（相对 `server/`，当前 22 个），构建脚本展开它作为额外入口；`new Worker` 的路径不会被打包器跟踪，漏登记就进不了二进制。`compiledWorkerSpecifiers` 依次尝试 `./<路径>.js`、`./server/<路径>.js`、`./<文件名>.js`，源码运行只有相对 `import.meta.url` 的一个候选；Windows 的 `~BUN` 虚拟根要用正斜杠字符串而不是 URL（`lib/compiled-worker.ts`）。
+- 编译产物里的 Worker：入口必须登记在 `COMPILED_WORKER_ENTRIES`（相对 `server/`，当前 24 个），构建脚本展开它作为额外入口；`new Worker` 的路径不会被打包器跟踪，漏登记就进不了二进制。`compiledWorkerSpecifiers` 依次尝试 `./<路径>.js`、`./server/<路径>.js`、`./<文件名>.js`，源码运行只有相对 `import.meta.url` 的一个候选；Windows 的 `~BUN` 虚拟根要用正斜杠字符串而不是 URL（`lib/compiled-worker.ts`）。
 - 守卫测试 `tests/worker-main-thread-fallback.guard.test.ts` 用 AST 扫描 `server/frontend/shared/scripts` 等目录（跳过测试文件）：已退役的 `inlineFallback` 等标识不得回到生产代码；Worker 客户端不得 import 或调用重活实现；ORM Worker 错误路径不得执行原查询；大纲 Worker 的 catch 里不得调用 `inlineValues`；脑图冷缓存只用占位而不在 UI 线程测量；Monaco 在暴露编辑器服务前装上严格失败边界；并检查 CLAUDE.md 里该规则的措辞仍在。
+- Recall 的 PG 原始 TEXT 正文/工具 JSON 使用 `db-worker/recall-pg-projection-client.ts` 隔离投影，不在服务线程解析大 JSON，也不通过 jsonb 转换丢失 codec 可保存的转义字符。准入限制并发 2、排队 0，先准入再读有界源；取消/超时若 SQL 尚未结束，配额持续保留到 SQL settle 与 Worker exit 都确认，故障不在主线程重算。该读路径不改变现有 PG 写入/生成列表达式的字符约束。
 - 其他使用 `WorkerPool` 的地方：gen-ui 编译、git 行统计、大纲文本编辑、编辑器文档任务、前缀快照、历史重写、token 重算等（`grep WorkerPool server`）。
 - 其他隔离形态：只读完整性探测与快照构建用独立子进程，在 `server/index.ts` 中于 `./main` 之前分流；启动状态页用 Worker 线程。
 

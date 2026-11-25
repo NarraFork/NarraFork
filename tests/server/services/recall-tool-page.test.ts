@@ -292,18 +292,14 @@ function pgRow(): Record<string, unknown> {
 		question_decided_at: null,
 		source_bytes: 1500,
 		metadata_bytes: 150,
-		input_text: "中文🌿",
-		input_chars: 8,
-		output_text: null,
-		output_chars: null,
-		questions_text: null,
-		questions_chars: null,
-		answers_text: null,
-		answers_chars: null,
+		input_json: "xx中文🌿xxx",
+		output_json: null,
+		questions_json: null,
+		answers_json: null,
 	};
 }
 
-test("PG projects text slices in SQL, uses production ledger join, and never returns full raw JSON columns", async () => {
+test("PG admits bounded raw TEXT to a Worker and uses the production ledger join", async () => {
 	let sql = "";
 	let bindings: unknown[] = [];
 	const pg: PgExecutor = {
@@ -322,25 +318,24 @@ test("PG projects text slices in SQL, uses production ledger join, and never ret
 	expect(pages(result)).toEqual({
 		input: { text: "中文🌿", offset: 2, totalChars: 8, hasMore: true, nextOffset: 5 },
 	});
-	expect(bindings).toEqual(["use", "owner", 3, 3]);
+	expect(bindings).toEqual(["use", "owner"]);
 	expect(sql).toContain("q.tool_call_id = tc.id");
 	expect(sql).toContain("q.narrator_id = tc.narrator_id");
 	expect(sql).toContain("tc.narrator_id = $2");
-	expect(sql).toContain("substring(input_json from $3::integer for $4::integer)");
-	expect(sql).toContain("char_length(input_json)");
-	expect(sql).toContain("input_json::json -> 'answers'");
+	expect(sql).not.toContain("substring(");
+	expect(sql).not.toContain("::json");
+	expect(sql).toContain("tc.input_json::text AS input_json");
 	expect(sql).toContain("source_bytes <= 41943040");
 	expect(sql).toContain("metadata_bytes <= 524288");
 	expect(sql).not.toContain("resolution_json");
-	const projection = sql.slice(sql.lastIndexOf("SELECT admitted.id"));
-	expect(projection).not.toContain("input_json");
-	expect(projection).not.toContain("output_json");
+	expect(result?.metadata).not.toHaveProperty("input_json");
+	expect(result?.metadata).not.toHaveProperty("output_json");
 	await readRecallToolCallPagePg(pg, {
 		...request,
 		narratorId: null,
 		offset: Number.MAX_SAFE_INTEGER,
 	});
-	expect(bindings).toEqual(["use", 41943041, 8]);
+	expect(bindings).toEqual(["use"]);
 	expect(sql).not.toContain("tc.narrator_id = $2");
 });
 
@@ -354,10 +349,8 @@ test("PG accepts bounded answer evidence without parsing page fragments as compl
 		answer_message_id: "answer-message",
 		question_decided_by: "auto",
 		question_decided_at: "2026-07-03",
-		questions_text: '[{"ques',
-		questions_chars: 150,
-		answers_text: '{"问🌿":',
-		answers_chars: 80,
+		questions_json: JSON.stringify([{ question: "x".repeat(133) }]),
+		answers_json: JSON.stringify({ "问🌿": "x".repeat(71) }),
 	};
 	const pg: PgExecutor = { unsafe: async () => [row] };
 	const result = await readRecallToolCallPagePg(pg, request);
@@ -365,7 +358,7 @@ test("PG accepts bounded answer evidence without parsing page fragments as compl
 		id: "question",
 		decidedBy: "auto",
 		answerMessageId: "answer-message",
-		answers: { text: '{"问🌿":', totalChars: 80, hasMore: true },
+		answers: { text: '{"问🌿":"x', totalChars: 80, hasMore: true },
 	});
 	expect(result?.output).not.toContain("human");
 });
@@ -384,9 +377,9 @@ test("PG rejects source/result budgets explicitly and propagates failures with n
 	});
 	row.metadata_bytes = 150;
 	row.error_message = "x".repeat(300 * 1024);
-	await expect(readRecallToolCallPagePg(pg, request)).rejects.toThrow(
-		"result exceeds its byte budget",
-	);
+	await expect(readRecallToolCallPagePg(pg, request)).rejects.toMatchObject({
+		code: "DB_READ_BUDGET",
+	});
 	const error = new Error("PG failed");
 	await expect(
 		readRecallToolCallPagePg(
@@ -397,7 +390,7 @@ test("PG rejects source/result budgets explicitly and propagates failures with n
 			},
 			request,
 		),
-	).rejects.toBe(error);
+	).rejects.toMatchObject({ code: "DB_READ_UNAVAILABLE" });
 	expect(await readRecallToolCallPagePg({ unsafe: async () => [] }, request)).toBeNull();
 });
 

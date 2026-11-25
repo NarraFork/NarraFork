@@ -448,7 +448,7 @@ export interface TimelineSearchRow {
 
 export interface RecallMessageRow {
 	messageId: string;
-	/** A history narrator that actually references this message, suitable for read_message. */
+	/** A history narrator with an effective (possibly inherited) ref, suitable for read_message. */
 	narratorId: string;
 	narratorTitle: string | null;
 	/** The immutable message owner, which need not retain its own history ref after rollback. */

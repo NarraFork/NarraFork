@@ -47,6 +47,7 @@ const APPROVED_WORKER_MODULES = new Set([
 	"server/lib/narrator-bodies.ts",
 	"shared/file-change-protocol.ts",
 	"server/lib/agent/recall-tool-summary.ts",
+	"server/lib/recall-contract.ts",
 	"server/lib/narrator-project-sql.ts",
 	"server/lib/validators/runtime-registration.ts",
 	"server/services/agent-runtime/limits.ts",

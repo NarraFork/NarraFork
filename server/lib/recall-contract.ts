@@ -24,18 +24,23 @@ export interface RecallFilters {
 	createdTo?: string;
 }
 
+export interface RecallCursor {
+	seq: number;
+	messageId: string;
+}
+
 export interface RecallConversationOptions extends RecallFilters {
 	direction?: RecallDirection;
-	/** Exclusive sequence boundary; around uses messageId instead. */
-	cursor?: number;
+	/** Exact exclusive boundary; legacy numbers exclude the whole sequence. */
+	cursor?: RecallCursor | number;
 	includeToolCalls?: boolean;
 }
 
 export interface RecallPagination {
 	hasOlder: boolean;
 	hasNewer: boolean;
-	olderCursor: number | null;
-	newerCursor: number | null;
+	olderCursor: RecallCursor | null;
+	newerCursor: RecallCursor | null;
 }
 
 /** All offsets and counts below use Unicode code points, not UTF-16 code units. */
@@ -59,7 +64,6 @@ export interface RecallMessagePage extends RecallTextPage {
 	narratorTitle: string | null;
 	role: string;
 	origin: string | null;
-	originLabel: string | null;
 	createdAt: string;
 	seq: number;
 	bodyRevision: number;

@@ -24,8 +24,8 @@ test("production compile spreads the worker registry instead of listing worker p
 	}
 });
 
-test("local and release builds share all 23 unique, existing worker entries", () => {
-	expect(COMPILED_WORKER_ENTRIES).toHaveLength(23);
+test("local and release builds share all 24 unique, existing worker entries", () => {
+	expect(COMPILED_WORKER_ENTRIES).toHaveLength(24);
 	expect(new Set(COMPILED_WORKER_ENTRIES).size).toBe(COMPILED_WORKER_ENTRIES.length);
 	expect(compiledWorkerBuildEntrypoints()).toEqual(
 		COMPILED_WORKER_ENTRIES.map((entry) => `./server/${entry}`),
@@ -143,6 +143,7 @@ test("eval/Blob text, namespace aliases and Reflect cannot grant a file-wide con
 // Static coverage evidence, never a runtime registry or business protocol dispatch table.
 const entryOwners: Record<(typeof COMPILED_WORKER_ENTRIES)[number], readonly string[]> = {
 	"lib/db-worker/worker-entry.ts": ["lib/db-worker/pool.ts"],
+	"lib/db-worker/recall-pg-projection-worker.ts": ["lib/db-worker/recall-pg-projection-client.ts"],
 	"lib/fs-scan-worker/fs-scan-worker-entry.ts": ["lib/fs-scan-worker/client.ts"],
 	"lib/browser/memory-snapshot-worker.ts": [
 		"lib/browser/memory-snapshot.ts",
@@ -228,11 +229,11 @@ function ownerText(paths: readonly string[]): string {
 }
 const admission = /\bnew\s+(?:WorkerPool|TaskQueue)\s*\(/;
 
-test("all 34 families have explicit common-runtime coverage: 23 entries, 6 trusted evals, 5 processes", () => {
-	expect(Object.keys(entryOwners)).toHaveLength(23);
+test("all 35 families have explicit common-runtime coverage: 24 entries, 6 trusted evals, 5 processes", () => {
+	expect(Object.keys(entryOwners)).toHaveLength(24);
 	expect(evalOwners).toHaveLength(6);
 	expect(processOwners).toHaveLength(5);
-	expect(COMPILED_WORKER_ENTRIES.length + evalOwners.length + processOwners.length).toBe(34);
+	expect(COMPILED_WORKER_ENTRIES.length + evalOwners.length + processOwners.length).toBe(35);
 	for (const entry of COMPILED_WORKER_ENTRIES) {
 		const text = ownerText(entryOwners[entry]);
 		expect(text.includes(entry), entry).toBe(true);

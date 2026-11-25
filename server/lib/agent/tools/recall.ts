@@ -1,10 +1,5 @@
 import { searchStore } from "../../../services/search/backend";
 import { globalStrategy, sanitizeQuery } from "../../../services/search/query";
-import {
-	recallConversation,
-	recallMessage,
-	recallToolCallPage,
-} from "../../../services/search/recall-store";
 import type { RecallMessageRow } from "../../../services/search/types";
 import { RECALL_LIMITS } from "../../recall-contract";
 import type { ToolDefinition, ToolResult } from "../types";
@@ -16,7 +11,7 @@ export const recallTool: ToolDefinition = {
 
 Choose the smallest action:
 - search: locate messages with plain keywords. Filters are applied before limit. Query arrays are alternatives, merged into ONE deduplicated result list; limit is the total, default 20/max 50. Use sort:oldest for early requirements, newest for recent statements.
-- read_conversation: browse chronological previews without keywords. By default reads the latest page without tool logs. direction:newer starts at the earliest page. Follow returned sequence cursors with direction:older/newer. message_id reads around a known anchor; do not combine anchors with cursors.
+- read_conversation: browse chronological previews without keywords. By default reads the latest page without tool logs. direction:newer starts at the earliest page. Copy the complete returned {seq,messageId} cursor with direction:older/newer; the ID avoids skipping messages tied on sequence. message_id reads around a known anchor; do not combine anchors with cursors.
 - read_message: read one saved message body by message_id, including block-backed bodies. Previews are not complete bodies. offset/max_chars and nextOffset use Unicode code points, not bytes or UTF-16 units. Attachments and tool outputs are not fabricated as message text.
 - read_tool_call: inspect saved input/output by toolUseId (tool_call_id). Use part:input for questions/arguments and part:output for results; continue each field with its own nextOffset. Question answers retain their decision provenance; reflection/auto is not a human decision.
 
@@ -337,6 +332,7 @@ async function handleReadConversation(
 	signal: AbortSignal,
 ): Promise<ToolResult> {
 	const narratorId = input.narrator_id ?? currentNarratorId;
+	const { recallConversation } = await import("../../../services/search/recall-store");
 	const snapshot = await recallConversation(
 		{
 			narratorId,
@@ -442,6 +438,7 @@ async function handleReadToolCall(
 	currentNarratorId: string,
 	signal: AbortSignal,
 ): Promise<ToolResult> {
+	const { recallToolCallPage } = await import("../../../services/search/recall-store");
 	const result = await recallToolCallPage(
 		{
 			toolCallId: input.tool_call_id ?? "",
@@ -511,6 +508,7 @@ async function handleReadMessage(
 	signal: AbortSignal,
 ): Promise<ToolResult> {
 	const narratorId = input.narrator_id ?? currentNarratorId;
+	const { recallMessage } = await import("../../../services/search/recall-store");
 	const page = await recallMessage(
 		{
 			narratorId,
@@ -528,7 +526,7 @@ async function handleReadMessage(
 	const length = Array.from(page.text).length;
 	const lines = [
 		`Message ${page.messageId} in ${page.narratorTitle ?? narratorId} [${narratorId}], seq=${page.seq}, bodyRevision=${page.bodyRevision}.`,
-		`Role: ${page.role}; stored origin: ${page.origin ?? "unknown (legacy provenance, not verified human)"}${page.originLabel ? ` (${page.originLabel})` : ""}. Created: ${page.createdAt}.`,
+		`Role: ${page.role}; stored origin: ${page.origin ?? "unknown (legacy provenance, not verified human)"}. Created: ${page.createdAt}.`,
 		`Stored message text, Unicode code points [${page.offset}, ${page.offset + length}) of ${page.totalChars}. Tool outputs and attachment bytes are not part of this text.`,
 		"\n--- Stored message text ---\n",
 		page.text,
@@ -543,9 +541,17 @@ async function handleReadMessage(
 		lines.push(
 			`\nContinue this message: ${JSON.stringify({ action: "read_message", ...continuationScope(narratorId, currentNarratorId), message_id: page.messageId, offset: page.nextOffset, max_chars: input.max_chars ?? RECALL_LIMITS.defaultPageChars })}`,
 		);
+	// origin_label is display-only provenance; never forward it to model text or metadata.
+	const { originLabel: _displayOnlyLabel, ...messagePage } = page as typeof page & {
+		originLabel?: unknown;
+	};
 	return {
 		output: lines.join("\n"),
 		title: `Message: ${page.messageId}`,
-		metadata: { action: "read_message", ...page, truncated: page.offset > 0 || page.hasMore },
+		metadata: {
+			action: "read_message",
+			...messagePage,
+			truncated: page.offset > 0 || page.hasMore,
+		},
 	};
 }

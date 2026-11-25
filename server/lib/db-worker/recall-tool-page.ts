@@ -237,41 +237,64 @@ export function readRecallToolCallPage(
 		}
 		if (!row) return null;
 		verify();
-		let questions = row.questions_json;
-		let answers = row.answers_json;
-		if (
-			row.tool_name === "AskUserQuestion" &&
-			row.question_id === null &&
-			row.input_json !== null
-		) {
-			let parsed: unknown;
-			try {
-				parsed = JSON.parse(row.input_json);
-			} catch {
-				throw new DbReadError("DB_READ_FAILED", "Saved question input is not valid JSON");
-			}
-			if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-				const value = parsed as Record<string, unknown>;
-				questions = value.questions === undefined ? null : JSON.stringify(value.questions);
-				answers = value.answers === undefined ? null : JSON.stringify(value.answers);
-			}
-		}
-		const result = format(
-			row,
-			{
-				input: input.part === "output" ? null : page(row.input_json, input, verify),
-				output: input.part === "input" ? null : page(row.output_json, input, verify),
-				questions: page(questions, input, verify),
-				answers: page(answers, input, verify),
-			},
-			input,
-		);
-		verify();
-		return result;
+		return projectRecallToolCallRow(row, input, verify);
 	})();
 }
 
-/** PG slices fields on the database side; no full input/output JSON crosses to the caller. */
+export interface RecallToolPageSource extends Row {
+	input_json: string | null;
+	output_json: string | null;
+	questions_json: string | null;
+	answers_json: string | null;
+}
+
+/** Worker-only pure projection, shared by SQLite reads and the isolated PG projector. */
+export function projectRecallToolCallRow(
+	row: RecallToolPageSource,
+	input: RecallToolCallPageInput,
+	verify: () => void,
+): ToolResult {
+	validate(input);
+	verify();
+	budget(
+		Object.values(row).reduce<number>(
+			(bytes, value) => bytes + (typeof value === "string" ? Buffer.byteLength(value) : 16),
+			1024,
+		),
+		SOURCE_BYTES,
+		"source",
+	);
+	let questions = row.questions_json;
+	let answers = row.answers_json;
+	if (row.tool_name === "AskUserQuestion" && row.question_id === null && row.input_json !== null) {
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(row.input_json);
+		} catch {
+			throw new DbReadError("DB_READ_FAILED", "Saved question input is not valid JSON");
+		}
+		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+			const value = parsed as Record<string, unknown>;
+			questions = value.questions === undefined ? null : JSON.stringify(value.questions);
+			answers = value.answers === undefined ? null : JSON.stringify(value.answers);
+		}
+	}
+	verify();
+	const result = format(
+		row,
+		{
+			input: input.part === "output" ? null : page(row.input_json, input, verify),
+			output: input.part === "input" ? null : page(row.output_json, input, verify),
+			questions: page(questions, input, verify),
+			answers: page(answers, input, verify),
+		},
+		input,
+	);
+	verify();
+	return result;
+}
+
+/** PG transfers only admitted raw TEXT; JSON decoding and paging remain in a Worker. */
 export async function readRecallToolCallPagePg(
 	pg: PgExecutor,
 	input: RecallToolCallPageInput,
@@ -287,70 +310,33 @@ export async function readRecallToolCallPagePg(
 	const sizeExpression = SOURCE_COLUMNS.map(
 		(column) => `coalesce(octet_length(${column}::text),0)::bigint`,
 	).join(" + ");
-	// MATERIALIZED + the admission predicate prevent extracting question JSON before its budget check.
 	const metadataBytes = SOURCE_COLUMNS.filter((column) => !column.endsWith("_json"))
 		.map((column) => `coalesce(octet_length(${column}::text),0)::bigint`)
 		.join(" + ");
-	const source = `SELECT ${COLUMNS}, tc.input_json::text AS input_json, tc.output_json::text AS output_json,
-	q.questions_json::text AS questions_json, q.answers_json::text AS answers_json,
-	${sizeExpression} + 1024 AS source_bytes, ${metadataBytes} AS metadata_bytes ${FROM} ${where}`;
-	// Every admitted field is shorter than SOURCE_BYTES; clamp only the SQL start to avoid int4 overflow.
-	params.push(Math.min(input.offset, SOURCE_BYTES) + 1, input.maxChars);
-	const start = `$${params.length - 1}`;
-	const length = `$${params.length}`;
-	const fieldPage = (name: string, expression: string) =>
-		`substring(${expression} from ${start}::integer for ${length}::integer) AS ${name}_text,
-		char_length(${expression}) AS ${name}_chars`;
-	const questionField = (key: "questions" | "answers") =>
-		`CASE WHEN question_id IS NOT NULL THEN ${key}_json
-		WHEN tool_name = 'AskUserQuestion' THEN (input_json::json -> '${key}')::text ELSE NULL END`;
-	const result = await pg.unsafe(
-		`WITH source AS MATERIALIZED (${source}), admitted AS MATERIALIZED (
-		SELECT * FROM source WHERE source_bytes <= ${SOURCE_BYTES} AND metadata_bytes <= ${RESULT_BYTES}
-	), pages AS (SELECT id,
-		${fieldPage("input", input.part === "output" ? "NULL::text" : "input_json")},
-		${fieldPage("output", input.part === "input" ? "NULL::text" : "output_json")},
-		${fieldPage("questions", questionField("questions"))},
-		${fieldPage("answers", questionField("answers"))}
-		FROM admitted)
-	SELECT admitted.id, admitted.tool_use_id, admitted.tool_name, admitted.status, admitted.duration_ms,
-	admitted.error_message, admitted.created_at, admitted.narrator_id, admitted.narrator_title,
-	admitted.permission_decided_by, admitted.permission_decided_at, admitted.question_id,
-	admitted.question_status, admitted.question_origin, admitted.answer_message_id,
-	admitted.question_decided_by, admitted.question_decided_at, source.source_bytes, source.metadata_bytes,
-	pages.input_text, pages.input_chars, pages.output_text, pages.output_chars,
-	pages.questions_text, pages.questions_chars, pages.answers_text, pages.answers_chars
-	FROM source LEFT JOIN admitted ON admitted.id = source.id
-	LEFT JOIN pages ON pages.id = source.id`,
-		params,
-	);
-	verify();
-	const row = result[0];
-	if (!row) return null;
-	budget(Number(row.source_bytes), SOURCE_BYTES, "source");
-	budget(Number(row.metadata_bytes), RESULT_BYTES, "result metadata");
-	const getPage = (name: string): RecallTextPage | null => {
-		if (row[`${name}_chars`] === null) return null;
-		const totalChars = Number(row[`${name}_chars`]);
-		const hasMore = input.offset + input.maxChars < totalChars;
-		return {
-			text: row[`${name}_text`] as string,
-			offset: input.offset,
-			totalChars,
-			hasMore,
-			nextOffset: hasMore ? input.offset + input.maxChars : null,
-		};
-	};
-	const formatted = format(
-		row as unknown as Row,
-		{
-			input: getPage("input"),
-			output: getPage("output"),
-			questions: getPage("questions"),
-			answers: getPage("answers"),
+	const { runRecallPgProjection } = await import("./recall-pg-projection-client");
+	return runRecallPgProjection<ToolResult>(
+		async (taskSignal, taskDeadline) => {
+			const taskCheck = () => check(taskSignal, taskDeadline);
+			taskCheck();
+			const source = `SELECT ${COLUMNS}, tc.input_json::text AS input_json, tc.output_json::text AS output_json,
+		q.questions_json::text AS questions_json, q.answers_json::text AS answers_json,
+		${sizeExpression} + 1024 AS source_bytes, ${metadataBytes} AS metadata_bytes ${FROM} ${where}`;
+			// Materialized admission keeps even concurrent source changes bounded before transfer.
+			const result = await pg.unsafe(
+				`WITH source AS MATERIALIZED (${source}), admitted AS MATERIALIZED (
+			SELECT * FROM source WHERE source_bytes <= ${SOURCE_BYTES} AND metadata_bytes <= ${RESULT_BYTES}
+		) SELECT admitted.*, source.source_bytes, source.metadata_bytes
+		FROM source LEFT JOIN admitted ON admitted.id = source.id`,
+				params,
+			);
+			taskCheck();
+			const row = result[0];
+			if (!row) return null;
+			budget(Number(row.source_bytes), SOURCE_BYTES, "source");
+			budget(Number(row.metadata_bytes), RESULT_BYTES, "result metadata");
+			return { kind: "tool", input, row: row as unknown as RecallToolPageSource };
 		},
-		input,
+		signal,
+		deadlineAt,
 	);
-	verify();
-	return formatted;
 }

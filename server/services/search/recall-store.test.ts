@@ -119,13 +119,26 @@ for (const fault of ["spawn", "crash", "timeout", "disabled", "cancelled", "dead
 	});
 }
 
+function pgMock(read: (sql: string, params: unknown[]) => Promise<Record<string, unknown>[]>) {
+	return mock(async (sql: string, params: unknown[]) => {
+		const rows = await read(sql, params);
+		if (!sql.includes("recall_marked_results")) return rows;
+		return rows.length
+			? rows.map((row) => ({ recall_lineage_valid: true, recall_row_present: 1, ...row }))
+			: [{ recall_lineage_valid: true, recall_row_present: null }];
+	});
+}
+
 test("PG conversation uses shared filter-before-limit plan and normalized page metadata", async () => {
 	const calls: Array<{ sql: string; params: unknown[] }> = [];
-	const unsafe = mock(async (sql: string, params: unknown[]) => {
+	const unsafe = pgMock(async (sql: string, params: unknown[]) => {
 		calls.push({ sql, params });
+		if (sql.startsWith("WITH RECURSIVE lineage"))
+			return [{ id: "pg", refs_inherited_from: null, refs_backfill_cursor: null }];
 		if (sql.includes("FROM narrators WHERE"))
 			return [{ id: "pg", title: "PG", model: "model", source_bytes: 7 }];
-		if (sql.startsWith("SELECT 1")) return sql.includes("r.seq <") ? [{}] : [];
+		if (sql.includes("SELECT 1 FROM effective_recall_refs"))
+			return sql.includes("(r.seq, m.id) <") ? [{}] : [];
 		return [
 			{
 				id: "m",
@@ -156,26 +169,28 @@ test("PG conversation uses shared filter-before-limit plan and normalized page m
 	expect(result.pagination).toEqual({
 		hasOlder: true,
 		hasNewer: false,
-		olderCursor: 400,
-		newerCursor: 400,
+		olderCursor: { seq: 400, messageId: "m" },
+		newerCursor: { seq: 400, messageId: "m" },
 	});
 	const select = calls.find((call) => call.sql.includes("content_prefix"));
-	expect(select?.sql).toContain("m.role IN ($2)");
+	expect(select?.sql).toContain("m.role IN ($5)");
 	expect(select?.sql).toContain("m.origin IS NULL");
-	expect(select?.sql).toContain("m.created_at >= $3");
-	expect(select?.sql).toContain("r.seq < $4 ORDER BY r.seq DESC LIMIT $5");
-	expect(select?.params).toEqual(["pg", "user", "2026-01-01", 500, 1]);
+	expect(select?.sql).toContain("m.created_at >= $6");
+	expect(select?.sql).toContain("r.seq < $7 ORDER BY r.seq DESC, m.id DESC LIMIT $8");
+	expect(select?.params).toEqual(["pg", null, null, null, "user", "2026-01-01", 500, 1]);
 	expect(calls.every((call) => !call.sql.includes("narrator_tool_calls"))).toBe(true);
 });
 
 test("PG tool summaries are fetched in 128-row keyset batches with bounded Ask headers", async () => {
 	const calls: Array<{ sql: string; params: unknown[] }> = [];
 	let batches = 0;
-	const unsafe = mock(async (sql: string, params: unknown[]) => {
+	const unsafe = pgMock(async (sql: string, params: unknown[]) => {
 		calls.push({ sql, params });
+		if (sql.startsWith("WITH RECURSIVE lineage"))
+			return [{ id: "pg", refs_inherited_from: null, refs_backfill_cursor: null }];
 		if (sql.includes("FROM narrators WHERE"))
 			return [{ id: "pg", title: "PG", model: "model", source_bytes: 7 }];
-		if (sql.startsWith("SELECT 1")) return [];
+		if (sql.includes("SELECT 1 FROM effective_recall_refs")) return [];
 		if (sql.includes("content_prefix"))
 			return [
 				{
@@ -198,7 +213,8 @@ test("PG tool summaries are fetched in 128-row keyset batches with bounded Ask h
 			tool_name: "AskUserQuestion",
 			status: "success",
 			message_id: "m",
-			question_header: "选择方案",
+			recall_summary_input: JSON.stringify({ questions: [{ header: "选择方案" }] }),
+			recall_summary_oversized: false,
 		}));
 	});
 	mock.module("../../db", () => ({
@@ -214,21 +230,23 @@ test("PG tool summaries are fetched in 128-row keyset batches with bounded Ask h
 	});
 	expect(result.tools).toHaveLength(129);
 	expect(result.tools.every((tool) => tool.summary === "选择方案")).toBe(true);
-	const toolReads = calls.filter((call) => call.sql.includes("question_header"));
+	const toolReads = calls.filter((call) => call.sql.includes("recall_summary_input"));
 	expect(toolReads).toHaveLength(2);
 	for (const call of toolReads) {
 		expect(call.sql).toContain("LIMIT 128");
-		expect(call.sql).toContain("{questions,0,header}");
+		expect(call.sql).not.toContain("::json");
+		expect(call.sql).toContain("recall_summary_oversized");
 	}
 	expect(toolReads[1].params.slice(-2)).toEqual(["2026", "t127"]);
 });
 
-test("PG message projects text and code-point pages in SQL rather than returning full content", async () => {
+test("PG message sends bounded raw TEXT to its Worker without JSON casts or origin labels", async () => {
 	const calls: Array<{ sql: string; params: unknown[] }> = [];
-	const unsafe = mock(async (sql: string, params: unknown[]) => {
+	const unsafe = pgMock(async (sql: string, params: unknown[]) => {
 		calls.push({ sql, params });
-		if (sql.includes("AS bytes")) return [{ bytes: 100 }];
-		if (sql.startsWith("WITH body"))
+		if (sql.startsWith("WITH RECURSIVE lineage"))
+			return [{ id: "pg", refs_inherited_from: null, refs_backfill_cursor: null }];
+		if (sql.includes("recall_body AS MATERIALIZED"))
 			return [
 				{
 					messageId: "m",
@@ -240,9 +258,12 @@ test("PG message projects text and code-point pages in SQL rather than returning
 					createdAt: "2026",
 					seq: "20",
 					bodyRevision: "3",
-					omittedBlocks: ["image"],
-					text: "原文😄",
-					totalChars: "10",
+					contentJson: JSON.stringify([
+						{ type: "text", text: "前缀原文😄后面的尾巴" },
+						{ type: "image", data: "omitted\0" },
+					]),
+					bytes: 100,
+					metadata_bytes: 50,
 				},
 			];
 		return [];
@@ -263,24 +284,24 @@ test("PG message projects text and code-point pages in SQL rather than returning
 		bodyRevision: 3,
 		omittedBlocks: ["image"],
 	});
-	expect(calls[1].sql).toContain("jsonb_array_elements");
-	expect(calls[1].sql).toContain("substr(text,$4+1,$5)");
-	expect(calls[1].params).toEqual(["pg", "m", 40 * 1024 * 1024, 2, 3]);
-	expect(calls[1].sql.slice(calls[1].sql.lastIndexOf(" SELECT "))).not.toContain("content_json");
+	const body = calls.find((call) => call.sql.includes("recall_body AS MATERIALIZED"));
+	expect(body?.sql).toContain('m.content_json AS "contentJson"');
+	expect(body?.sql).toContain("bytes <= 41943040");
+	expect(body?.sql).not.toContain("::json");
+	expect(body?.sql).not.toContain("origin_label");
+	expect(body?.params).toEqual(["pg", null, null, null, "pg", "m"]);
+	expect(result).not.toHaveProperty("originLabel");
 });
 
-test("PG message clamps int4-overflow offsets only for SQL while preserving requested page metadata", async () => {
+test("PG Worker preserves large safe-integer offsets without PostgreSQL int4 slicing", async () => {
 	const calls: Array<{ sql: string; params: unknown[] }> = [];
 	const original = "原文😄";
 	const points = Array.from(original);
-	const unsafe = mock(async (sql: string, params: unknown[]) => {
+	const unsafe = pgMock(async (sql: string, params: unknown[]) => {
 		calls.push({ sql, params });
-		if (sql.includes("AS bytes")) return [{ bytes: 100 }];
-		if (sql.startsWith("WITH body")) {
-			const sqlOffset = Number(params[3]);
-			// PostgreSQL evaluates $4+1 as int4 for substr(text,int4,int4).
-			expect(Number.isInteger(sqlOffset)).toBe(true);
-			expect(sqlOffset + 1).toBeLessThanOrEqual(2147483647);
+		if (sql.startsWith("WITH RECURSIVE lineage"))
+			return [{ id: "pg", refs_inherited_from: null, refs_backfill_cursor: null }];
+		if (sql.includes("recall_body AS MATERIALIZED")) {
 			return [
 				{
 					messageId: "m",
@@ -292,9 +313,9 @@ test("PG message clamps int4-overflow offsets only for SQL while preserving requ
 					createdAt: "2026",
 					seq: "1",
 					bodyRevision: "3",
-					omittedBlocks: [],
-					text: points.slice(sqlOffset, sqlOffset + Number(params[4])).join(""),
-					totalChars: String(points.length),
+					contentJson: JSON.stringify([{ type: "text", text: original }]),
+					bytes: 100,
+					metadata_bytes: 50,
 				},
 			];
 		}
@@ -319,15 +340,45 @@ test("PG message clamps int4-overflow offsets only for SQL while preserving requ
 			hasMore: false,
 			nextOffset: null,
 		});
-		const pageQuery = calls.filter((call) => call.sql.startsWith("WITH body")).at(-1);
-		expect(pageQuery?.sql).toContain("substr(text,$4+1,$5)");
-		expect(pageQuery?.params).toEqual(["pg", "m", 40 * 1024 * 1024, 40 * 1024 * 1024, 20000]);
+		const pageQuery = calls
+			.filter((call) => call.sql.includes("recall_body AS MATERIALIZED"))
+			.at(-1);
+		expect(pageQuery?.sql).not.toContain("substr(");
+		expect(pageQuery?.params).toEqual(["pg", null, null, null, "pg", "m"]);
+	}
+});
+
+test("PG message fails closed on changed or missing lineage envelopes instead of missing/ancestor success", async () => {
+	for (const envelope of [
+		[{ recall_lineage_valid: false, recall_row_present: null }],
+		[{ recall_row_present: 1 }],
+		[{ recall_lineage_valid: true }],
+		[],
+	]) {
+		const unsafe = mock(async (sql: string) => {
+			if (sql.startsWith("WITH RECURSIVE lineage"))
+				return [{ id: "pg", refs_inherited_from: null, refs_backfill_cursor: null }];
+			expect(sql).toContain("recall_lineage_guard");
+			expect(sql).toContain("recall_body AS MATERIALIZED");
+			return envelope;
+		});
+		mock.module("../../db", () => ({
+			...sqliteDb,
+			activeDatabaseBackend: "postgres",
+			postgresRuntime: { closed: false, executor: { unsafe } },
+		}));
+		const failure = await captureWorkerRejection(
+			recallMessage({ narratorId: "pg", messageId: "ancestor-m2", offset: 0, maxChars: 10 }),
+		);
+		expect(failure).toMatchObject({ code: "DB_READ_PROTOCOL" });
+		expect(String((failure as Error).message)).toContain("lineage");
+		expect(unsafe).toHaveBeenCalledTimes(2);
 	}
 });
 
 test("PostgreSQL misses and source-budget failures do not touch SQLite", async () => {
 	let oversized = false;
-	const unsafe = mock(async () => (oversized ? [{ bytes: 41 * 1024 * 1024 }] : []));
+	const unsafe = pgMock(async () => (oversized ? [{ bytes: 41 * 1024 * 1024 }] : []));
 	mock.module("../../db", () => ({
 		...sqliteDb,
 		activeDatabaseBackend: "postgres",

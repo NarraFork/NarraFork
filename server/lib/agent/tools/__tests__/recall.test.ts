@@ -28,7 +28,12 @@ const conversation = mock(async (_input: Record<string, unknown>) => ({
 		},
 	],
 	tools: [],
-	pagination: { hasOlder: true, hasNewer: true, olderCursor: 10, newerCursor: 10 },
+	pagination: {
+		hasOlder: true,
+		hasNewer: true,
+		olderCursor: { seq: 10, messageId: "message" },
+		newerCursor: { seq: 10, messageId: "message" },
+	},
 }));
 let body: RecallMessagePage | null;
 const message = mock(async (_input: Record<string, unknown>) => body);
@@ -59,7 +64,6 @@ beforeEach(() => {
 		bodyRevision: 2,
 		role: "user",
 		origin: "user",
-		originLabel: null,
 		createdAt: "2026-01-01",
 		text: "\u{1F600}中文",
 		offset: 8,
@@ -198,7 +202,7 @@ test("conversation defaults are quiet and its continuation preserves filters wit
 		action: "read_conversation",
 		narrator_id: "self",
 		direction: "older",
-		cursor: 10,
+		cursor: { seq: 10, messageId: "message" },
 		roles: ["user"],
 		origins: ["user"],
 		limit: 1,
@@ -267,4 +271,14 @@ test("long async answers remain reachable when the original tool input is alread
 		part: "input",
 		offset: 8000,
 	});
+});
+
+test("display-only sender labels are not sent to model text or result metadata", async () => {
+	if (!body) throw new Error("Missing message fixture");
+	Object.assign(body, { originLabel: "Telegram @private-handle / OAuth integration" });
+	const result = await run({ action: "read_message", message_id: "message" });
+	expect(result.output).not.toContain("Telegram");
+	expect(result.output).not.toContain("@private-handle");
+	expect(result.metadata).not.toHaveProperty("originLabel");
+	expect(result.metadata?.text).toBe(body.text);
 });

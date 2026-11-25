@@ -26,6 +26,9 @@ beforeEach(() => {
 		"preview".repeat(200),
 	]);
 	database.run("INSERT INTO narrator_message_refs VALUES ('n1','shared',1),('n2','shared',1)");
+	database.run("ALTER TABLE narrators ADD COLUMN refs_inherited_from TEXT");
+	database.run("ALTER TABLE narrators ADD COLUMN refs_backfill_cursor INTEGER");
+	database.run("ALTER TABLE narrator_message_refs ADD COLUMN segment_compact_id TEXT");
 	database.run(
 		"INSERT INTO narrator_tool_calls VALUES ('t1','use1','Bash','completed',?,NULL,12,NULL,'2026-01-01','n1','shared'),('t2','use2','Bash','completed',?,NULL,13,NULL,'2026-01-01','n2','shared')",
 		[JSON.stringify({ command: "pwd" }), JSON.stringify({ command: "private" })],
@@ -105,6 +108,52 @@ test("message page domain reads stored Unicode text after refs validation, never
 	} finally {
 		prepare.mockRestore();
 	}
+});
+
+test("worker resolves inherited anchors and exact cursors without materializing refs on its owner", async () => {
+	database.run(
+		"UPDATE narrators SET refs_inherited_from='n2', refs_backfill_cursor=3 WHERE id='n1'",
+	);
+	database.run("DELETE FROM narrator_message_refs WHERE narrator_id='n1'");
+	database.run(
+		"INSERT INTO narrator_messages VALUES ('tie','user','old request','2026-01-01','user')",
+	);
+	database.run(
+		"INSERT INTO narrator_message_refs(narrator_id,message_id,seq) VALUES ('n2','tie',1)",
+	);
+	const prepare = spyOn(database, "prepare").mockImplementation(() => {
+		throw new Error("main-thread SQL is forbidden");
+	});
+	try {
+		const around = await readDomainTask(
+			database,
+			"recallConversation",
+			{ narratorId: "n1", messageId: "tie", limit: 1 },
+			strict,
+		);
+		expect(around.narrator?.id).toBe("n1");
+		expect(around.rows.map((row) => row.id)).toEqual(["tie"]);
+		expect(around.pagination.olderCursor).toEqual({ seq: 1, messageId: "tie" });
+		const older = await readDomainTask(
+			database,
+			"recallConversation",
+			{
+				narratorId: "n1",
+				messageId: null,
+				limit: 1,
+				cursor: around.pagination.olderCursor ?? undefined,
+			},
+			strict,
+		);
+		expect(older.rows.map((row) => row.id)).toEqual(["shared"]);
+		expect(older.pagination.hasNewer).toBe(true);
+		expect(prepare).not.toHaveBeenCalled();
+	} finally {
+		prepare.mockRestore();
+	}
+	expect(
+		database.query("SELECT * FROM narrator_message_refs WHERE narrator_id='n1'").all(),
+	).toEqual([]);
 });
 
 test("dedicated tool-detail budget preserves complete payloads beyond generic SELECT size", async () => {

@@ -72,13 +72,18 @@ export const recallParameters = z
 				"read_conversation only. older starts at the latest page; newer starts at the earliest page. around requires message_id and cannot use cursor. Output is always chronological. Default around with message_id, otherwise older.",
 			),
 		cursor: z
-			.number()
-			.int()
-			.min(0)
-			.max(Number.MAX_SAFE_INTEGER)
+			.union([
+				z
+					.object({
+						seq: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+						messageId: reference,
+					})
+					.strict(),
+				z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+			])
 			.optional()
 			.describe(
-				"read_conversation only. Exclusive sequence boundary copied from olderCursor/newerCursor. Combine with direction:older/newer. Do not combine with message_id or direction:around.",
+				"read_conversation only. Copy the complete {seq,messageId} object from olderCursor/newerCursor, with direction:older/newer. messageId breaks sequence ties so no messages are skipped. Legacy integer boundaries exclude the whole sequence; prefer returned objects. Do not combine with message_id or around.",
 			),
 		include_tool_calls: z
 			.boolean()

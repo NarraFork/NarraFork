@@ -241,7 +241,14 @@ export const DOMAIN_READ_DEFINITIONS: { [K in DomainReadTaskKind]: DomainDefinit
 				(input.direction === undefined ||
 					["older", "newer", "around"].includes(String(input.direction))) &&
 				(input.cursor === undefined ||
-					(Number.isSafeInteger(input.cursor) && Number(input.cursor) >= 0)) &&
+					(Number.isSafeInteger(input.cursor) && Number(input.cursor) >= 0) ||
+					(record(input.cursor) &&
+						Object.keys(input.cursor).length === 2 &&
+						Object.hasOwn(input.cursor, "seq") &&
+						Object.hasOwn(input.cursor, "messageId") &&
+						Number.isSafeInteger(input.cursor.seq) &&
+						Number(input.cursor.seq) >= 0 &&
+						boundedId(input.cursor.messageId))) &&
 				(input.includeToolCalls === undefined || typeof input.includeToolCalls === "boolean") &&
 				date(input.createdFrom) &&
 				date(input.createdTo) &&

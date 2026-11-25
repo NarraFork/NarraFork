@@ -32,6 +32,7 @@ import { WorkerCleanupError, WorkerHandle } from "./worker-runtime/lifecycle";
  */
 export const COMPILED_WORKER_ENTRIES = [
 	"lib/db-worker/worker-entry.ts",
+	"lib/db-worker/recall-pg-projection-worker.ts",
 	"lib/fs-scan-worker/fs-scan-worker-entry.ts",
 	"lib/browser/memory-snapshot-worker.ts",
 	"lib/browser/memory-profile-worker.ts",

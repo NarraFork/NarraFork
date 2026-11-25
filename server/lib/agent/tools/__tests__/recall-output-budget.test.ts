@@ -48,7 +48,6 @@ function body(text: string, hasMore: boolean): RecallMessagePage {
 		seq: 1,
 		role: "user",
 		origin: "user",
-		originLabel: null,
 		createdAt: "2026-01-01",
 		bodyRevision: 1,
 		text,
