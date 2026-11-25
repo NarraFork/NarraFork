@@ -801,11 +801,29 @@ export interface TeamWorkDependencyRef {
 	id: string;
 	title: string;
 	state: TeamWorkItemState;
+	/**
+	 * Set (on a dependency, never on a dependent) when it was made from another base branch than
+	 * the dependent: its merge lands in a base the dependent's branch never brings in, so it never
+	 * satisfies the dependency. Only rows written before the check existed can have it; the
+	 * coordinator removes or replaces it.
+	 */
+	baseMismatch?: { dependencyBase: string | null; dependentBase: string | null };
 }
 
-/** The dependencies an item still waits for (not merged), in the given order. */
-export function dependencyBlockers<T extends { state: TeamWorkItemState }>(
+/**
+ * Whether a dependency lets its dependent start: merged ({@link dependencySatisfied}) into the
+ * dependent's own base.
+ */
+export function dependencyResolved(dependency: {
+	state: TeamWorkItemState;
+	baseMismatch?: unknown;
+}): boolean {
+	return dependencySatisfied(dependency.state) && !dependency.baseMismatch;
+}
+
+/** The dependencies an item still waits for (not resolved), in the given order. */
+export function dependencyBlockers<T extends { state: TeamWorkItemState; baseMismatch?: unknown }>(
 	dependsOn: readonly T[] | undefined,
 ): T[] {
-	return (dependsOn ?? []).filter((dependency) => !dependencySatisfied(dependency.state));
+	return (dependsOn ?? []).filter((dependency) => !dependencyResolved(dependency));
 }

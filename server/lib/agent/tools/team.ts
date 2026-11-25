@@ -77,7 +77,7 @@ export const teamToolParameters = z.object({
 		.max(TEAM_WORK_DEPENDENCIES_MAX)
 		.optional()
 		.describe(
-			"work.create / work.update: ids (from work.list) of items of this team that must be merged before this one may start; work.update replaces the whole list ([] clears it) and only while the item is queued.",
+			"work.create / work.update: ids (from work.list) of items of this team, made from the same base branch, that must be merged before this one may start; work.update replaces the whole list ([] clears it) and only while the item is queued.",
 		),
 	verdict: z
 		.enum(TEAM_REVIEW_VERDICTS)

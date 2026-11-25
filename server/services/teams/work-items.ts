@@ -510,7 +510,7 @@ export async function createWorkItem(input: CreateWorkItemInput): Promise<WorkIt
 	const dependsOn = normalizeDependencyIds(input.dependsOn ?? []);
 	if (dependsOn.length > 0 && kind === TEAM_ISOLATED_WORK_KIND)
 		throw new ValidationError("An isolated work item starts at once; it cannot wait for others");
-	checkDependencies(db, team.teamId, null, dependsOn);
+	checkDependencies(db, team.teamId, null, team.baseBranch, dependsOn);
 	const port = await ports();
 	const created = await port.createWorktree({
 		coordinatorId: team.teamId,
@@ -579,7 +579,7 @@ export async function createWorkItem(input: CreateWorkItemInput): Promise<WorkIt
 				teamId: team.teamId,
 				itemId: id,
 				// Again inside the transaction: a target may have been cancelled meanwhile.
-				refs: checkDependencies(tx, team.teamId, null, dependsOn),
+				refs: checkDependencies(tx, team.teamId, null, team.baseBranch, dependsOn),
 				actor: input.actor,
 				at: now,
 			});
@@ -1072,7 +1072,7 @@ export function cancelWorkItem(input: {
 /**
  * Replace a queued item's dependencies (D, `Team` `work.update`; `[]` clears them). Only while
  * it has not started (409 `TEAM_WORK_ITEM_NOT_QUEUED`): a started item already passed the gate.
- * The set is checked (same team, not cancelled, no cycle, at most 20) and written with its
+ * The set is checked (same team and base, not cancelled, no cycle, at most 20) and written with its
  * `work.dependencies_changed` event in one transaction that also bumps the item's `updated_at`
  * under the usual state + `updated_at` condition.
  */
@@ -1094,7 +1094,7 @@ export function setWorkItemDependencies(input: {
 	const now = new Date().toISOString();
 	let changed = false;
 	db.transaction((tx) => {
-		const refs = checkDependencies(tx, team.teamId, item.id, ids);
+		const refs = checkDependencies(tx, team.teamId, item.id, item.baseRef, ids);
 		changed = writeDependencies(tx, {
 			teamId: team.teamId,
 			itemId: item.id,

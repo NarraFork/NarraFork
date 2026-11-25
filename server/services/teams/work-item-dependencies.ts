@@ -10,6 +10,10 @@
  *   `TEAM_WORK_ITEM_BLOCKED` while any dependency is not merged — `ready` is not enough (the
  *   branch would start from a base without it), and a cancelled one blocks until the coordinator
  *   removes or replaces it.
+ * - Every target is made from the same base branch as the item (409
+ *   `TEAM_WORK_DEPENDENCY_BASE_MISMATCH`): items pin the team's base when created and the team's
+ *   base can change, while `work.sync` only brings the item's own base in. A dependency on another
+ *   base (rows from before this check) never counts as merged, with its own blocker reason.
  * - When an item merges (`markMergedByAncestry`, the only writer of `merged`), each queued
  *   dependent whose dependencies are now all merged gets one `work.unblocked` event in the same
  *   transaction; the coordinator is then told 「「X」现在可以开始了」 (woken when idle, like
@@ -21,7 +25,7 @@
  */
 
 import {
-	dependencySatisfied,
+	dependencyResolved,
 	TEAM_UNBLOCKED_NOTE_SOURCE,
 	TEAM_WORK_DEPENDENCIES_MAX,
 	TEAM_WORK_DEPENDENTS_LIMIT,
@@ -29,8 +33,9 @@ import {
 	type TeamWorkItemState,
 } from "@shared/project-teams";
 import { and, asc, eq, inArray, isNull } from "drizzle-orm";
+import { aliasedTable } from "drizzle-orm/alias";
 import { db } from "../../db";
-import { teamWorkItemDependencies, teamWorkItems } from "../../db/schema";
+import { projectTeams, teamWorkItemDependencies, teamWorkItems } from "../../db/schema";
 import { AppError, ValidationError } from "../../lib/errors";
 import { logger } from "../../lib/logger";
 import { recordWorkEvent, type WorkActor } from "./work-items";
@@ -44,9 +49,16 @@ const UNBLOCK_SCAN_MAX = 200;
 
 // ── Reading ─────────────────────────────────────────────────────────────────
 
+/** The base an item's branch was made from: its own `base_ref`, else the team's base. */
+const effectiveBase = (baseRef: string | null, teamBase: string | null): string | null =>
+	baseRef ?? teamBase;
+
+const dependentItems = aliasedTable(teamWorkItems, "dependent_items");
+
 /**
  * The dependencies of each listed item (one query, at most {@link TEAM_WORK_DEPENDENCIES_MAX}
- * per item), oldest dependency target first. Items without any are absent from the map.
+ * per item), oldest dependency target first. Items without any are absent from the map. A target
+ * made from another base than the item carries `baseMismatch`.
  */
 export function readDependencies(
 	itemIds: readonly string[],
@@ -61,9 +73,14 @@ export function readDependencies(
 			id: teamWorkItems.id,
 			title: teamWorkItems.title,
 			state: teamWorkItems.state,
+			dependencyBaseRef: teamWorkItems.baseRef,
+			dependentBaseRef: dependentItems.baseRef,
+			teamBase: projectTeams.baseBranch,
 		})
 		.from(teamWorkItemDependencies)
 		.innerJoin(teamWorkItems, eq(teamWorkItems.id, teamWorkItemDependencies.dependsOnItemId))
+		.innerJoin(dependentItems, eq(dependentItems.id, teamWorkItemDependencies.itemId))
+		.leftJoin(projectTeams, eq(projectTeams.narratorId, teamWorkItemDependencies.teamId))
 		.where(inArray(teamWorkItemDependencies.itemId, ids))
 		.orderBy(
 			asc(teamWorkItemDependencies.itemId),
@@ -74,7 +91,16 @@ export function readDependencies(
 		.all();
 	for (const row of rows) {
 		const list = byItem.get(row.itemId) ?? [];
-		list.push({ id: row.id, title: row.title, state: row.state });
+		const dependencyBase = effectiveBase(row.dependencyBaseRef, row.teamBase);
+		const dependentBase = effectiveBase(row.dependentBaseRef, row.teamBase);
+		list.push({
+			id: row.id,
+			title: row.title,
+			state: row.state,
+			...(dependencyBase !== dependentBase
+				? { baseMismatch: { dependencyBase, dependentBase } }
+				: {}),
+		});
 		byItem.set(row.itemId, list);
 	}
 	return byItem;
@@ -107,18 +133,23 @@ export function readDependents(
 	return { items: rows.slice(0, limit), more: rows.length > limit };
 }
 
-/** The dependencies of one item that are not merged yet (its blockers), in order. */
+/**
+ * The dependencies of one item that are not merged into its base yet (its blockers), in order:
+ * one made from another base never is.
+ */
 export function blockersOf(
 	itemId: string,
 	executor: Pick<typeof db, "select"> = db,
 ): TeamWorkDependencyRef[] {
 	return (readDependencies([itemId], executor).get(itemId) ?? []).filter(
-		(dependency) => !dependencySatisfied(dependency.state),
+		(dependency) => !dependencyResolved(dependency),
 	);
 }
 
 const quoted = (refs: readonly TeamWorkDependencyRef[]) =>
 	refs.map((ref) => `"${ref.title}" (${ref.id}, ${ref.state})`).join(", ");
+
+const baseName = (base: string | null) => base ?? "(unknown)";
 
 /**
  * Refuse to start an item whose dependencies have not all merged: 409 `TEAM_WORK_ITEM_BLOCKED`,
@@ -131,14 +162,23 @@ export function assertWorkItemStartable(
 ): void {
 	const blockers = blockersOf(itemId, executor);
 	if (blockers.length === 0) return;
-	const cancelled = blockers.filter((blocker) => blocker.state === "cancelled");
-	const waiting = blockers.filter((blocker) => blocker.state !== "cancelled");
+	const otherBase = blockers.filter((blocker) => blocker.baseMismatch);
+	const cancelled = blockers.filter(
+		(blocker) => !blocker.baseMismatch && blocker.state === "cancelled",
+	);
+	const waiting = blockers.filter(
+		(blocker) => !blocker.baseMismatch && blocker.state !== "cancelled",
+	);
 	const parts: string[] = [];
 	if (waiting.length > 0)
 		parts.push(`it waits for ${quoted(waiting)} to be merged into the base first`);
 	if (cancelled.length > 0)
 		parts.push(
 			`its dependency ${quoted(cancelled)} was cancelled and will never merge: remove or replace it with Team work.update (dependsOn)`,
+		);
+	for (const blocker of otherBase)
+		parts.push(
+			`its dependency ${quoted([blocker])} was made from base ${baseName(blocker.baseMismatch?.dependencyBase ?? null)}, not this item's base ${baseName(blocker.baseMismatch?.dependentBase ?? null)}, so its merge never reaches this item: remove or replace it with Team work.update (dependsOn)`,
 		);
 	throw new AppError(
 		`Work item ${itemId} cannot start yet: ${parts.join("; ")}. Nothing was started.`,
@@ -163,14 +203,16 @@ export function normalizeDependencyIds(ids: readonly string[]): string[] {
 
 /**
  * Check a new set of dependencies for `itemId` (null: an item about to be created, which nothing
- * can depend on yet): every target an item of `teamId` and not cancelled, not the item itself,
- * and no cycle through the existing edges. Synchronous, so it can run inside the write
- * transaction as well as before any side effect.
+ * can depend on yet): every target an item of `teamId`, not cancelled, made from the same base as
+ * the item (`baseRef`: the item's pinned base; null, the team's), not the item itself, and no
+ * cycle through the existing edges. Synchronous, so it can run inside the write transaction as
+ * well as before any side effect.
  */
 export function checkDependencies(
 	executor: Pick<typeof db, "select">,
 	teamId: string,
 	itemId: string | null,
+	baseRef: string | null,
 	ids: readonly string[],
 ): TeamWorkDependencyRef[] {
 	if (ids.length === 0) return [];
@@ -183,8 +225,15 @@ export function checkDependencies(
 			{ cycle: [itemId, itemId] },
 		);
 	const rows = executor
-		.select({ id: teamWorkItems.id, title: teamWorkItems.title, state: teamWorkItems.state })
+		.select({
+			id: teamWorkItems.id,
+			title: teamWorkItems.title,
+			state: teamWorkItems.state,
+			baseRef: teamWorkItems.baseRef,
+			teamBase: projectTeams.baseBranch,
+		})
 		.from(teamWorkItems)
+		.leftJoin(projectTeams, eq(projectTeams.narratorId, teamWorkItems.teamId))
 		.where(and(eq(teamWorkItems.teamId, teamId), inArray(teamWorkItems.id, [...ids])))
 		.limit(ids.length)
 		.all();
@@ -199,7 +248,10 @@ export function checkDependencies(
 			undefined,
 			{ missing },
 		);
-	const refs = ids.map((id) => byId.get(id) as TeamWorkDependencyRef);
+	const refs: TeamWorkDependencyRef[] = ids.map((id) => {
+		const row = byId.get(id) as (typeof rows)[number];
+		return { id: row.id, title: row.title, state: row.state };
+	});
 	const cancelled = refs.filter((ref) => ref.state === "cancelled");
 	if (cancelled.length > 0)
 		throw new AppError(
@@ -208,6 +260,33 @@ export function checkDependencies(
 			"TEAM_WORK_ITEM_DEPENDENCY_CANCELLED",
 			undefined,
 			{ cancelled: cancelled.map((ref) => ref.id) },
+		);
+	// Same team, so one team base for every row.
+	const teamBase = rows[0]?.teamBase ?? null;
+	const base = effectiveBase(baseRef, teamBase);
+	const otherBase = ids
+		.map((id) => byId.get(id) as (typeof rows)[number])
+		.filter((row) => effectiveBase(row.baseRef, teamBase) !== base);
+	if (otherBase.length > 0)
+		throw new AppError(
+			`This item starts from base ${baseName(base)}, but ${otherBase
+				.map(
+					(row) =>
+						`"${row.title}" (${row.id}) was made from base ${baseName(effectiveBase(row.baseRef, teamBase))}`,
+				)
+				.join(
+					", ",
+				)}: its merge never reaches this item's base (work.sync brings in this item's base only), so it cannot be a dependency. Depend only on items made from the same base.`,
+			409,
+			"TEAM_WORK_DEPENDENCY_BASE_MISMATCH",
+			undefined,
+			{
+				base,
+				mismatched: otherBase.map((row) => ({
+					id: row.id,
+					base: effectiveBase(row.baseRef, teamBase),
+				})),
+			},
 		);
 	if (itemId !== null) assertNoCycle(executor, itemId, ids);
 	return refs;
@@ -366,7 +445,8 @@ export function recordUnblocked(tx: Executor, mergedItemId: string, at: string):
 	const unblocked: UnblockedItem[] = [];
 	for (const row of dependents) {
 		const dependsOn = all.get(row.id) ?? [];
-		if (!dependsOn.every((dependency) => dependencySatisfied(dependency.state))) continue;
+		// A dependency on another base never resolves: its dependent is not unblocked by it.
+		if (!dependsOn.every((dependency) => dependencyResolved(dependency))) continue;
 		const ids = dependsOn.map((dependency) => dependency.id);
 		recordWorkEvent(tx, {
 			teamId: row.teamId,

@@ -494,6 +494,55 @@ describe("work item dependencies", () => {
 		expect(teamTool.description).toContain("TEAM_WORK_ITEM_BLOCKED");
 	});
 
+	test("a dependency made from another base is refused, and an old one never counts as merged", async () => {
+		const a = await create("Schema");
+		// The team's base changes between the two items: B is pinned to release, A to main.
+		sqlite.run("UPDATE project_teams SET base_branch = 'release' WHERE narrator_id = ?", [LEAD]);
+		const resources = db.select().from(narratorWorktreeResources).all().length;
+		const onCreate = await refusal(() => create("API", [a.id]));
+		expect(onCreate.statusCode).toBe(409);
+		expect(onCreate.code).toBe("TEAM_WORK_DEPENDENCY_BASE_MISMATCH");
+		expect(onCreate.message).toContain("base release");
+		expect(onCreate.message).toContain("base main");
+		expect(onCreate.details).toEqual({ base: "release", mismatched: [{ id: a.id, base: "main" }] });
+		// Refused before any worktree is made.
+		expect(db.select().from(narratorWorktreeResources).all()).toHaveLength(resources);
+		const b = await create("API");
+		const onUpdate = await refusal(() => setDeps(b.id, [a.id]));
+		expect(onUpdate.code).toBe("TEAM_WORK_DEPENDENCY_BASE_MISMATCH");
+		expect(readDependencies([b.id]).has(b.id)).toBe(false);
+		// The same base is fine, whatever the team's base is now.
+		const c = await create("Docs");
+		expect(setDeps(b.id, [c.id]).changed).toBe(true);
+		setDeps(b.id, []);
+
+		// An edge written before the check: A merging into main does not unblock B (on release).
+		sqlite.run(
+			`INSERT INTO team_work_item_dependencies (item_id, depends_on_item_id, team_id, created_at)
+			VALUES (?, ?, ?, ?)`,
+			[b.id, a.id, LEAD, NOW],
+		);
+		expect(readDependencies([b.id]).get(b.id)).toEqual([
+			{
+				id: a.id,
+				title: "Schema",
+				state: "queued",
+				baseMismatch: { dependencyBase: "main", dependentBase: "release" },
+			},
+		]);
+		expect(merge(a.id)).toBe(true);
+		await settle();
+		expect(kinds(b.id).filter((event) => event.kind === "work.unblocked")).toHaveLength(0);
+		expect(delivered).toEqual([]);
+		const listed = listWorkItems(LEAD).items.find((item) => item.id === b.id);
+		expect(listed?.blockedBy).toEqual([a.id]);
+		const blocked = await refusal(() => attachWorker(LEAD, b.id, "d-worker", agent));
+		expect(blocked.code).toBe("TEAM_WORK_ITEM_BLOCKED");
+		expect(blocked.message).toContain("was made from base main, not this item's base release");
+		expect(blocked.message).not.toContain("waits for");
+		expect(row(b.id)).toMatchObject({ state: "queued", workerNarratorId: null });
+	});
+
 	test("deleting an item or its team removes its edges", async () => {
 		const a = await create("A");
 		const b = await create("B", [a.id]);
