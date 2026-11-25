@@ -1,8 +1,12 @@
 import { createHash, randomBytes } from "node:crypto";
-import { Hono } from "hono";
+import type { NugPaymentIntent } from "@shared/nug-payment";
+import { isNugPaymentContext } from "@shared/nug-payment";
+import { type Context, Hono } from "hono";
+import { z } from "zod";
 import { type NugBillingOrderResponse, NugProvider } from "../lib/agent/nug-provider";
 import { AppError } from "../lib/errors";
 import { logger } from "../lib/logger";
+import { requireNarratorAccess } from "../lib/narrator-access";
 import {
 	deleteNugCachedModels,
 	getNugCachedModelsByProvider,
@@ -14,6 +18,10 @@ import {
 	nugModelRefreshCoordinator,
 } from "../lib/nug-model-refresh-coordinator";
 import { applyNugModelCatalogUpdate } from "../lib/nug-model-sync";
+import {
+	getNugPaymentSubject as nugBillingSubject,
+	resolveNugPaymentContext,
+} from "../lib/nug-payment-context";
 import {
 	buildNugQuotaCache,
 	type CapturedNugQuotaSubject,
@@ -28,7 +36,6 @@ import {
 	updateNugQuotaByPrefix,
 } from "../lib/nug-quota-cache";
 import { getNugRelayStatus } from "../lib/nug-relay/manager";
-import { getProviderKeyStore, nugKeyOwner, withProviderKey } from "../lib/provider-keys";
 import {
 	getSettingsRevision,
 	type NUGProviderConfig,
@@ -82,48 +89,46 @@ interface NugBillingBinding {
 	/** Hash only: never retain another long-lived copy of a secret or config. */
 	identityHash: string;
 	orderId?: string;
+	/** 失败请求发起的订单继续受该 narrator 写权限约束；独立充值没有此字段。 */
+	narratorId?: string;
 	expiresAt: number;
 }
 const nugBillingBindings = new Map<string, NugBillingBinding>();
 
-function nugBillingSubject(providerId: string, binding?: NugBillingBinding) {
-	const connection = (settings.nugProviders ?? []).find((provider) => provider.id === providerId);
-	if (!connection)
+const paymentIntentSchema = z.discriminatedUnion("mode", [
+	z.object({ mode: z.literal("standalone") }).strict(),
+	z
+		.object({
+			mode: z.literal("request"),
+			narratorId: z.string().min(1).max(128),
+			paymentContext: z.string().max(256).refine(isNugPaymentContext),
+		})
+		.strict(),
+]);
+
+function parsePaymentIntent(input: unknown): NugPaymentIntent {
+	const parsed = paymentIntentSchema.safeParse(input);
+	if (!parsed.success)
 		throw new AppError(
-			"NUG payment connection is unavailable",
-			binding ? 409 : 404,
-			"NUG_PAYMENT_CONTEXT",
-		);
-	if (connection.disabled)
-		throw new AppError("NUG payment connection is disabled", 409, "NUG_PAYMENT_CONTEXT");
-	const keys = getProviderKeyStore().list(nugKeyOwner(providerId));
-	const key = binding
-		? binding.storedCredential
-			? keys.find((entry) => entry.id === binding.credentialId)
-			: undefined
-		: keys.find((entry) => !entry.disabled);
-	if (
-		(binding?.storedCredential && !key) ||
-		(binding && !binding.storedCredential && keys.length) ||
-		key?.disabled ||
-		(!key && keys.length)
-	) {
-		throw new AppError(
-			"NUG payment credential changed or is unavailable",
+			"必须明确提供失败请求的充值上下文或独立充值意图",
 			409,
 			"NUG_PAYMENT_CONTEXT",
 		);
-	}
-	const config = structuredClone(key ? withProviderKey(connection, key) : connection);
-	if (!config.apiKey?.trim())
-		throw new AppError("NUG payment credential is unavailable", 409, "NUG_PAYMENT_CONTEXT");
-	return {
-		config,
-		connection,
-		credentialId: key?.id ?? providerId,
-		storedCredential: !!key,
-		identityHash: createHash("sha256").update(nugQuotaIdentity(config)).digest("hex"),
-	};
+	return parsed.data;
+}
+
+async function subjectForPaymentIntent(c: Context, providerId: string, intent: NugPaymentIntent) {
+	if (intent.mode === "standalone") return nugBillingSubject(providerId);
+	await requireNarratorAccess(c, intent.narratorId, "write");
+	return resolveNugPaymentContext(providerId, intent.narratorId, intent.paymentContext);
+}
+
+async function recheckPaymentIntent(c: Context, providerId: string, intent: NugPaymentIntent) {
+	if (intent.mode === "request") await subjectForPaymentIntent(c, providerId, intent);
+}
+
+async function requirePaymentOrderAccess(c: Context, binding: NugBillingBinding) {
+	if (binding.narratorId) await requireNarratorAccess(c, binding.narratorId, "write");
 }
 
 function pruneNugBillingBindings(): void {
@@ -209,7 +214,7 @@ function ownedNugBillingBinding(
 	) {
 		throw new AppError("NUG payment session not found or expired", 404, "NUG_PAYMENT_CONTEXT");
 	}
-	return { binding, token, subject: currentNugBillingSubject(token, binding) };
+	return { binding, token };
 }
 
 function boundNugBillingResponse(
@@ -765,8 +770,11 @@ nugRoutes.get("/providers/:id/quota", async (c) => {
 				c.req.query("orderId") ?? "",
 				c.req.query("binding"),
 			);
-			const provider = new NugProvider(bound.subject.config, bound.subject.connection);
+			await requirePaymentOrderAccess(c, bound.binding);
+			const subject = currentNugBillingSubject(bound.token, bound.binding);
+			const provider = new NugProvider(subject.config, subject.connection);
 			const data = (await provider.getQuota()) as unknown as Record<string, unknown>;
+			await requirePaymentOrderAccess(c, bound.binding);
 			const current = currentNugBillingSubject(bound.token, bound.binding);
 			const primary = captureNugQuotaSubject(current.connection);
 			const paymentCredentialIsPrimary =
@@ -780,8 +788,8 @@ nugRoutes.get("/providers/:id/quota", async (c) => {
 				{
 					id: bound.binding.credentialId,
 					providerId: id,
-					config: bound.subject.config,
-					identity: nugQuotaIdentity(bound.subject.config),
+					config: subject.config,
+					identity: nugQuotaIdentity(subject.config),
 				},
 			);
 			return c.json({ ...normalizeNugQuotaResponse(data), paymentCredentialIsPrimary });
@@ -813,12 +821,14 @@ nugRoutes.use("/providers/:id/billing/orders/*", requireSessionAuth);
 /** Proxy billing config from NUG service. */
 nugRoutes.get("/providers/:id/billing/config", async (c) => {
 	const id = c.req.param("id");
+	await requireSessionAuth(c, async () => {});
 	try {
-		// The config and a new order must speak for the same first enabled credential.
-		const subject = nugBillingSubject(id);
+		const intent = parsePaymentIntent(c.req.query());
+		const subject = await subjectForPaymentIntent(c, id, intent);
 		const identity = nugQuotaIdentity(subject.config);
 		const provider = new NugProvider(subject.config, subject.connection);
 		const data = (await provider.getBillingConfig()) as unknown as Record<string, unknown>;
+		await recheckPaymentIntent(c, id, intent);
 		const primary = captureNugQuotaSubject(subject.connection);
 		const existing =
 			primary.id === subject.credentialId && primary.identity === identity
@@ -843,7 +853,12 @@ nugRoutes.post("/providers/:id/billing/orders", async (c) => {
 	const id = c.req.param("id");
 	let token: string | undefined;
 	try {
-		const body = (await c.req.json()) as { amount?: number; provider?: string; channel?: string };
+		const body = (await c.req.json()) as {
+			amount?: number;
+			provider?: string;
+			channel?: string;
+			intent?: unknown;
+		};
 		const amount = Number(body.amount);
 		if (!Number.isFinite(amount) || amount <= 0)
 			return c.json({ error: "amount must be greater than 0" }, 400);
@@ -851,8 +866,10 @@ nugRoutes.post("/providers/:id/billing/orders", async (c) => {
 			return c.json({ error: "provider is required" }, 400);
 		if (body.channel !== undefined && typeof body.channel !== "string")
 			return c.json({ error: "invalid channel" }, 400);
-		const subject = nugBillingSubject(id);
+		const intent = parsePaymentIntent(body.intent);
+		const subject = await subjectForPaymentIntent(c, id, intent);
 		const reserved = reserveNugBillingBinding(c.get("user").sub, id, subject);
+		if (intent.mode === "request") reserved.binding.narratorId = intent.narratorId;
 		token = reserved.token;
 		const provider = new NugProvider(subject.config, subject.connection);
 		const data = await provider.createBillingOrder({
@@ -860,7 +877,8 @@ nugRoutes.post("/providers/:id/billing/orders", async (c) => {
 			provider: body.provider,
 			channel: body.channel,
 		});
-		// Never publish a QR/URL for a subject that changed during the gateway call.
+		// 发布支付二维码前再次校验失败请求权限及已绑定主体，不能改充新首 Key。
+		await recheckPaymentIntent(c, id, intent);
 		currentNugBillingSubject(token, reserved.binding);
 		const response = boundNugBillingResponse(data, token);
 		reserved.binding.orderId = response.order.id;
@@ -879,8 +897,11 @@ nugRoutes.get("/providers/:id/billing/orders/:orderId", async (c) => {
 	const orderId = c.req.param("orderId");
 	try {
 		const bound = ownedNugBillingBinding(c.get("user").sub, id, orderId, c.req.query("binding"));
-		const provider = new NugProvider(bound.subject.config, bound.subject.connection);
+		await requirePaymentOrderAccess(c, bound.binding);
+		const subject = currentNugBillingSubject(bound.token, bound.binding);
+		const provider = new NugProvider(subject.config, subject.connection);
 		const data = await provider.getBillingOrder(orderId);
+		await requirePaymentOrderAccess(c, bound.binding);
 		currentNugBillingSubject(bound.token, bound.binding);
 		return c.json(boundNugBillingResponse(data, bound.token, orderId));
 	} catch (err: unknown) {
@@ -896,8 +917,11 @@ nugRoutes.post("/providers/:id/billing/orders/:orderId/repay", async (c) => {
 	const orderId = c.req.param("orderId");
 	try {
 		const bound = ownedNugBillingBinding(c.get("user").sub, id, orderId, c.req.query("binding"));
-		const provider = new NugProvider(bound.subject.config, bound.subject.connection);
+		await requirePaymentOrderAccess(c, bound.binding);
+		const subject = currentNugBillingSubject(bound.token, bound.binding);
+		const provider = new NugProvider(subject.config, subject.connection);
 		const data = await provider.repayBillingOrder(orderId);
+		await requirePaymentOrderAccess(c, bound.binding);
 		currentNugBillingSubject(bound.token, bound.binding);
 		return c.json(boundNugBillingResponse(data, bound.token, orderId));
 	} catch (err: unknown) {

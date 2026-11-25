@@ -46,8 +46,13 @@ afterEach(() => {
 test("create, poll, repay and the post-payment balance retain the opaque order context", async () => {
 	response = boundOrder();
 	expect(
-		(await miscApi.nugCreateBillingOrder("gateway", { amount: 10, provider: "mockpay" })).order
-			.binding,
+		(
+			await miscApi.nugCreateBillingOrder(
+				"gateway",
+				{ amount: 10, provider: "mockpay" },
+				{ mode: "standalone" },
+			)
+		).order.binding,
 	).toBe(binding);
 	await miscApi.nugGetBillingOrder("gateway", orderId, binding);
 	await miscApi.nugRepayBillingOrder("gateway", orderId, binding);
@@ -69,7 +74,11 @@ test("create, poll, repay and the post-payment balance retain the opaque order c
 
 test("an old backend without a binding cannot expose a payment QR and missing client contexts never issue RPCs", async () => {
 	response = { order: { id: orderId, pay_url: "https://pay.example/unsafe-old-context" } };
-	const pending = miscApi.nugCreateBillingOrder("gateway", { amount: 10, provider: "mockpay" });
+	const pending = miscApi.nugCreateBillingOrder(
+		"gateway",
+		{ amount: 10, provider: "mockpay" },
+		{ mode: "standalone" },
+	);
 	await expect(pending).rejects.toThrow("payment context");
 	await expect(pending).rejects.toMatchObject({
 		status: 409,
@@ -105,6 +114,59 @@ test.each([
 			data: { code: "NUG_PAYMENT_RESPONSE" },
 		});
 	}
+});
+
+test("失败充值的opaque context完整传给配置和下单，不夹带客户端CID", async () => {
+	const paymentContext = `npc1.${(Date.now() + 900000).toString(36)}.${"n".repeat(22)}.${"m".repeat(43)}`;
+	const intent = { mode: "request" as const, narratorId: "narrator-B", paymentContext };
+	response = {};
+	await miscApi.nugGetBillingConfig("gateway", intent);
+	response = boundOrder();
+	await miscApi.nugCreateBillingOrder("gateway", { amount: 10, provider: "mockpay" }, intent);
+	expect(calls[0]?.path).toBe(
+		`/nug/providers/gateway/billing/config?mode=request&narratorId=narrator-B&paymentContext=${paymentContext}`,
+	);
+	expect(JSON.parse(String(calls[1]?.init?.body))).toEqual({
+		amount: 10,
+		provider: "mockpay",
+		intent,
+	});
+	expect(JSON.stringify(calls)).not.toContain("credentialId");
+	calls.length = 0;
+	for (const paymentContext of ["", '["private-CID","private-identity"]']) {
+		const missing = { mode: "request" as const, narratorId: "narrator-B", paymentContext };
+		expect(() => miscApi.nugGetBillingConfig("gateway", missing)).toThrow("充值上下文");
+		expect(() =>
+			miscApi.nugCreateBillingOrder("gateway", { amount: 10, provider: "mockpay" }, missing),
+		).toThrow("充值上下文");
+	}
+	expect(calls).toEqual([]);
+});
+
+test("省略intent的旧JS调用不能默认为standalone或发起RPC", () => {
+	expect(() => Reflect.apply(miscApi.nugGetBillingConfig, undefined, ["gateway"])).toThrow(
+		"充值上下文",
+	);
+	expect(() =>
+		Reflect.apply(miscApi.nugCreateBillingOrder, undefined, [
+			"gateway",
+			{ amount: 10, provider: "mockpay" },
+		]),
+	).toThrow("充值上下文");
+	expect(calls).toEqual([]);
+});
+
+test("独立充值在wire上明确声明standalone而非缺省请求钱包", async () => {
+	response = {};
+	await miscApi.nugGetBillingConfig("gateway", { mode: "standalone" });
+	response = boundOrder();
+	await miscApi.nugCreateBillingOrder(
+		"gateway",
+		{ amount: 10, provider: "mockpay" },
+		{ mode: "standalone" },
+	);
+	expect(calls[0]?.path).toBe("/nug/providers/gateway/billing/config?mode=standalone");
+	expect(JSON.parse(String(calls[1]?.init?.body)).intent).toEqual({ mode: "standalone" });
 });
 
 test("a legacy unbound quota response cannot masquerade as the paid account's balance", async () => {

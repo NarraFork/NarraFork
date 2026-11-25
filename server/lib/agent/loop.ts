@@ -41,6 +41,7 @@ import { withModelMetadataSnapshotIterator } from "../model-catalog";
 import { historyPreparationFailure } from "../model-history-preparation";
 import { captureReferencePricingSnapshot } from "../model-pricing";
 import { redactSecretPatterns } from "../net/diagnostic-redaction";
+import { captureNugPaymentRequest } from "../nug-payment-context";
 import { noteOpencodeUsageActivity } from "../opencode-usage-cache";
 import { buildPlanFileRelPath, isPlanAuthoringPath, PLAN_DIR_REL } from "../plan-file-path";
 import {
@@ -4449,6 +4450,9 @@ async function* agentLoopInMetadataSnapshot(
 			const requestUserId = config.userId ?? null;
 			let requestStarted = false;
 			let requestQuotaProviderIdentity: string | undefined;
+			// 每次真实请求重新冻结付款主体，不能沿用池切 Key 前的钱包。
+			let requestPaymentContext: (() => string | undefined) | undefined;
+			const issuePaymentContext = () => requestPaymentContext?.();
 			let requestFinished = false;
 			let requestStartPending = false;
 			let startFirstTokenTimerForAttempt: (() => void) | undefined;
@@ -4465,6 +4469,11 @@ async function* agentLoopInMetadataSnapshot(
 					...info,
 					credentialId,
 				});
+				requestPaymentContext = captureNugPaymentRequest(
+					config.narratorId,
+					effectiveProvider,
+					requestQuotaProviderIdentity,
+				);
 				if (requestStarted) return;
 				requestStarted = true;
 				requestStartPending = true;
@@ -5087,6 +5096,7 @@ async function* agentLoopInMetadataSnapshot(
 				messageId = undefined;
 				credentialId = undefined;
 				requestQuotaProviderIdentity = undefined;
+				requestPaymentContext = undefined;
 				earlyExecMap.clear();
 				settledResults.clear();
 				streamReadyTools.clear();
@@ -6866,6 +6876,7 @@ async function* agentLoopInMetadataSnapshot(
 					if (paymentRequired) {
 						yield* outputContent.flush();
 						yield* finishRequest(msg);
+						const paymentContext = issuePaymentContext();
 						yield {
 							type: "payment_required",
 							message: paymentRequired.message,
@@ -6873,6 +6884,7 @@ async function* agentLoopInMetadataSnapshot(
 							providerPrefix: nugProvider?.prefix ?? effectiveProvider,
 							balance: paymentRequired.balance,
 							required: paymentRequired.required,
+							...(paymentContext ? { paymentContext } : {}),
 							resumeAction:
 								hasStartedEarlyToolExecution() || !!config.historyEndsWithToolResults
 									? "continue"

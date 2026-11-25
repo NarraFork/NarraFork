@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import type { CredentialNetwork } from "@shared/credential-network";
+import { Hono } from "hono";
 import { getNarraforkPath } from "../narrafork-home";
 import {
 	buildNugQuotaCache,
@@ -20,6 +21,24 @@ import { getServiceTemplate } from "../sourcing/templates";
 const original = structuredClone(settings);
 const originalFetch = globalThis.fetch;
 const providerId = "nug-quota-test";
+
+/** 真实路由请求沿用普通会话权限；没有失败请求的 fixture 明确声明独立充值。 */
+function requestNugRoute(routes: Hono, path: string) {
+	const app = new Hono();
+	app.use("*", async (c, next) => {
+		const user = {
+			sub: "quota-test-user",
+			role: "user" as const,
+			iat: 0,
+			exp: Number.MAX_SAFE_INTEGER,
+		};
+		c.set("auth", { type: "session", user });
+		c.set("user", user);
+		await next();
+	});
+	app.route("/", routes);
+	return app.request(`${path}${path.endsWith("billing/config") ? "?mode=standalone" : ""}`);
+}
 
 function useProvider() {
 	saveSettings({
@@ -298,7 +317,7 @@ describe("NUG quota snapshots", () => {
 			if (endpoint === "startup") {
 				await fetchAllNugQuotas();
 			} else {
-				const response = await nugRoutes.request(`/providers/${config.id}/${endpoint}`);
+				const response = await requestNugRoute(nugRoutes, `/providers/${config.id}/${endpoint}`);
 				expect(response.status).toBe(200);
 				expect(await response.json()).toMatchObject({ balance: 5, totalGranted: 20 });
 			}
@@ -330,7 +349,7 @@ describe("NUG quota snapshots", () => {
 				const task =
 					endpoint === "startup"
 						? fetchAllNugQuotas()
-						: nugRoutes.request(`/providers/${config.id}/${endpoint}`);
+						: requestNugRoute(nugRoutes, `/providers/${config.id}/${endpoint}`);
 				await reached;
 				if (change === "global proxy") {
 					settings.proxy = { mode: "custom", url: "http://new-global-proxy.example:8080" };

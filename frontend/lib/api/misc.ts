@@ -4,6 +4,7 @@ import type {
 } from "@frontend/types/usage-history";
 import type { ResolvedBranding } from "@shared/branding";
 import type { McpLoadingMode } from "@shared/mcp-loading-mode";
+import { isNugPaymentContext, type NugPaymentIntent } from "@shared/nug-payment";
 import type { ProviderBalanceSnapshot } from "@shared/provider-balance";
 import type { ToolRoutineMode, ToolRoutineModeOverride } from "@shared/routine-modes";
 import type { WorkspacePanel, WorkspacePanelInput } from "@shared/workspace-panels";
@@ -58,6 +59,35 @@ import type {
 	StorageScanJobState,
 	StorageScanResult,
 } from "./types";
+
+function checkedNugPaymentIntent(intent: NugPaymentIntent): NugPaymentIntent {
+	if (intent?.mode === "standalone") return { mode: "standalone" };
+	if (
+		intent?.mode !== "request" ||
+		typeof intent.narratorId !== "string" ||
+		!intent.narratorId ||
+		intent.narratorId.length > 128 ||
+		!isNugPaymentContext(intent.paymentContext)
+	) {
+		throw new ApiError("失败请求缺少有效的充值上下文，请重新发起该请求", 409, {
+			code: "NUG_PAYMENT_CONTEXT",
+		});
+	}
+	return { mode: "request", narratorId: intent.narratorId, paymentContext: intent.paymentContext };
+}
+
+function nugPaymentIntentQuery(intent: NugPaymentIntent): string {
+	const checked = checkedNugPaymentIntent(intent);
+	return new URLSearchParams(
+		checked.mode === "request"
+			? {
+					mode: checked.mode,
+					narratorId: checked.narratorId,
+					paymentContext: checked.paymentContext,
+				}
+			: { mode: checked.mode },
+	).toString();
+}
 
 function nugPaymentBinding(binding: unknown): string {
 	if (typeof binding !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(binding)) {
@@ -951,7 +981,7 @@ export const miscApi = {
 		request<Record<string, OpencodeUsageCache>>("/opencode/usages/refresh", {
 			method: "POST",
 		}),
-	nugGetBillingConfig: (providerId: string) =>
+	nugGetBillingConfig: (providerId: string, intent: NugPaymentIntent) =>
 		request<{
 			enabled: boolean;
 			providers: Array<{ name: string; displayName: string }>;
@@ -965,10 +995,11 @@ export const miscApi = {
 			detailedQuotaBalance?: string | null;
 			extra?: unknown;
 			pollIntervalMs?: number;
-		}>(`/nug/providers/${providerId}/billing/config`),
+		}>(`/nug/providers/${providerId}/billing/config?${nugPaymentIntentQuery(intent)}`),
 	nugCreateBillingOrder: (
 		providerId: string,
 		body: { amount: number; provider: string; channel?: "alipay" | "wechat" | string },
+		intent: NugPaymentIntent,
 	) =>
 		request<{
 			order: {
@@ -985,7 +1016,7 @@ export const miscApi = {
 			pollIntervalMs?: number;
 		}>(`/nug/providers/${providerId}/billing/orders`, {
 			method: "POST",
-			body: JSON.stringify(body),
+			body: JSON.stringify({ ...body, intent: checkedNugPaymentIntent(intent) }),
 		}).then((data) => requireNugPaymentOrder(data)),
 	nugGetBillingOrder: (providerId: string, orderId: string, binding: string) =>
 		request<{

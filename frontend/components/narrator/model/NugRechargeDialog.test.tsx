@@ -2,12 +2,14 @@ import { afterAll, afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import type { QueryClient as QueryClientType } from "@tanstack/react-query";
 import { createInstance } from "i18next";
 import { parseHTML } from "linkedom";
-import { act } from "react";
+import { act, useLayoutEffect, useSyncExternalStore } from "react";
 import type { Root } from "react-dom/client";
 import narratorEn from "../../../locales/en/narrator.json";
+import type { PaymentRequiredInfo } from "../useNarratorPanelWS";
 
 const { window } = parseHTML("<!doctype html><html><body></body></html>");
 const originals = new Map<string, PropertyDescriptor | undefined>();
+const storage = new Map<string, string>();
 const globals = {
 	window,
 	document: window.document,
@@ -19,7 +21,15 @@ const globals = {
 	Node: window.Node,
 	Event: window.Event,
 	ShadowRoot: window.ShadowRoot ?? class {},
-	localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
+	localStorage: {
+		getItem: (key: string) => storage.get(key) ?? null,
+		setItem: (key: string, value: string) => {
+			storage.set(key, value);
+		},
+		removeItem: (key: string) => {
+			storage.delete(key);
+		},
+	},
 	getComputedStyle: () => ({ getPropertyValue: () => "", overflow: "visible" }),
 	matchMedia: () => ({
 		matches: false,
@@ -53,6 +63,9 @@ const { MantineProvider } = await import("@mantine/core");
 const { notifications } = await import("@mantine/notifications");
 const { I18nextProvider } = await import("react-i18next");
 const { api, ApiError } = await import("../../../lib/api");
+const { getAuthSnapshot, subscribeAuth, setToken, clearToken } = await import(
+	"../../../lib/api/client"
+);
 const { NugRechargeDialog } = await import("./NugRechargeDialog");
 notifyManager.setScheduler(queueMicrotask);
 const i18n = createInstance();
@@ -63,9 +76,13 @@ await i18n.init({
 	resources: { en: { narrator: narratorEn } },
 });
 const BINDING = "a".repeat(43);
+const PAYMENT_CONTEXT = `npc1.${(Date.now() + 15 * 60_000).toString(36)}.${"n".repeat(22)}.${"s".repeat(43)}`;
 const PAY_URL = "https://pay.example/qr.png";
 type OrderResponse = Awaited<ReturnType<typeof api.nugGetBillingOrder>>;
-const order = (status = "pending"): OrderResponse => ({
+const order = (
+	status = "pending",
+	overrides: Partial<OrderResponse["order"]> = {},
+): OrderResponse => ({
 	order: {
 		id: "order-A",
 		binding: BINDING,
@@ -75,9 +92,25 @@ const order = (status = "pending"): OrderResponse => ({
 		status,
 		pay_url: PAY_URL,
 		created_at: "2026-11-25",
+		...overrides,
 	},
 });
 const quota = { balance: 35, totalGranted: 50, paymentCredentialIsPrimary: true };
+const billingConfig = {
+	enabled: true,
+	providers: [{ name: "mockpay", displayName: "Mock pay" }],
+	unitName: "credits",
+	quotaRate: 1,
+	orderMinAmount: 1,
+	orderMaxAmount: 100,
+	balance: 10,
+	totalGranted: 20,
+	pollIntervalMs: 1,
+};
+const CONTEXT_C = PAYMENT_CONTEXT.replace("n".repeat(22), "c".repeat(22));
+const C_URL = "https://pay.example/qr-C.png";
+const orderC = (status = "pending") =>
+	order(status, { id: "order-C", binding: "c".repeat(43), pay_url: C_URL });
 function deferred<T>() {
 	let resolve!: (value: T) => void;
 	let reject!: (error: unknown) => void;
@@ -109,6 +142,8 @@ const nativeTimeout = globalThis.setTimeout;
 const nativeClearTimeout = globalThis.clearTimeout;
 
 beforeEach(() => {
+	storage.clear();
+	setToken("dialog-owner-A");
 	container = document.createElement("div");
 	document.body.appendChild(container);
 	root = createRoot(container);
@@ -118,17 +153,7 @@ beforeEach(() => {
 	intervals = new Map();
 	nextTimer = 100000;
 	fetchSpy = spyOn(globalThis, "fetch").mockRejectedValue(new Error("Real network forbidden"));
-	config = spyOn(api, "nugGetBillingConfig").mockResolvedValue({
-		enabled: true,
-		providers: [{ name: "mockpay", displayName: "Mock pay" }],
-		unitName: "credits",
-		quotaRate: 1,
-		orderMinAmount: 1,
-		orderMaxAmount: 100,
-		balance: 10,
-		totalGranted: 20,
-		pollIntervalMs: 1,
-	});
+	config = spyOn(api, "nugGetBillingConfig").mockResolvedValue(billingConfig);
 	create = spyOn(api, "nugCreateBillingOrder").mockResolvedValue(order());
 	poll = spyOn(api, "nugGetBillingOrder").mockResolvedValue(order());
 	balance = spyOn(api, "nugGetQuota").mockResolvedValue(quota);
@@ -167,6 +192,7 @@ beforeEach(() => {
 });
 afterEach(async () => {
 	await act(async () => root.unmount());
+	clearToken();
 	qc.clear();
 	container.remove();
 	const realCalls = fetchSpy.mock.calls.length;
@@ -200,7 +226,26 @@ function button(text: string) {
 	if (!found) throw new Error(`Missing button ${text}: ${document.body.textContent}`);
 	return found;
 }
-async function mountAndCreate() {
+interface DialogScope {
+	narratorId?: string;
+	providerId?: string;
+	onLayout?: (generation: number) => void;
+}
+function ScopeProbe({ onLayout }: Pick<DialogScope, "onLayout">) {
+	const { generation } = useSyncExternalStore(subscribeAuth, getAuthSnapshot, getAuthSnapshot);
+	useLayoutEffect(() => {
+		onLayout?.(generation);
+	}, [onLayout, generation]);
+	return null;
+}
+async function mountAndCreate(
+	payment: PaymentRequiredInfo | null = {
+		resumeAction: "continue",
+		paymentContext: PAYMENT_CONTEXT,
+	},
+	startOrder = true,
+	scope: DialogScope = {},
+) {
 	await act(async () =>
 		root.render(
 			<QueryClientProvider client={qc}>
@@ -208,23 +253,25 @@ async function mountAndCreate() {
 					<MantineProvider env="test">
 						<NugRechargeDialog
 							opened
-							narratorId="narrator-A"
-							providerId="gateway"
-							paymentRequired={{ resumeAction: "continue" }}
+							narratorId={scope.narratorId ?? "narrator-A"}
+							providerId={scope.providerId ?? "gateway"}
+							paymentRequired={payment}
 							onClose={() => events.push("close")}
 							onQuotaUpdated={() => events.push("quota")}
 							onPaymentRequiredChange={(value) => {
 								if (value === null) events.push("paid");
 							}}
 						/>
+						<ScopeProbe onLayout={scope.onLayout} />
 					</MantineProvider>
 				</I18nextProvider>
 			</QueryClientProvider>,
 		),
 	);
-	await act(async () => {
-		button(narratorEn.recharge.createOrder).click();
-	});
+	if (startOrder)
+		await act(async () => {
+			button(narratorEn.recharge.createOrder).click();
+		});
 }
 async function fireNextTimer() {
 	const pending = timers.entries().next().value;
@@ -243,6 +290,68 @@ async function fireNextTimer() {
 function qrVisible() {
 	return !!document.querySelector(`img[src="${PAY_URL}"]`);
 }
+
+test("失败事件缺少服务器上下文时不查询首 Key、也不能创建订单", async () => {
+	await mountAndCreate({ resumeAction: "continue" }, false);
+	expect(config).not.toHaveBeenCalled();
+	expect(create).not.toHaveBeenCalled();
+	expect(poll).not.toHaveBeenCalled();
+	expect(qrVisible()).toBe(false);
+	expect(document.body.textContent).toContain("充值上下文");
+});
+
+test("没有失败请求的独立充值显式使用 standalone 意图", async () => {
+	await mountAndCreate(null);
+	expect(config).toHaveBeenCalledWith("gateway", { mode: "standalone" });
+	expect(create.mock.calls[0]?.[2]).toEqual({ mode: "standalone" });
+});
+
+test.each([
+	true,
+	false,
+])("付款钱包是否仍为首 Key=%s：只按旧 provider-record 形状更新对应余额，不覆盖另一钱包", async (isPrimary) => {
+	const oldQuota = {
+		balance: 10,
+		totalGranted: 20,
+		detailedQuotaBalance: "Primary wallet",
+		extra: { wallet: "primary" },
+	};
+	const otherQuota = { balance: 99, totalGranted: 100 };
+	const oldCache = { gateway: oldQuota, other: otherQuota };
+	const currentQuotaKey = ["nug", "quota", "gateway", 1, getAuthSnapshot().generation];
+	const currentQuota = { ...oldQuota, fetchedAt: 1 };
+	qc.setQueryData(["nug", "quotas"], oldCache);
+	qc.setQueryData(currentQuotaKey, currentQuota);
+	const paidQuota = {
+		...quota,
+		detailedQuotaBalance: "Paid wallet",
+		extra: { wallet: "paid" },
+		paymentCredentialIsPrimary: isPrimary,
+	};
+	create.mockResolvedValueOnce(order("paid"));
+	balance.mockResolvedValueOnce(paidQuota);
+	await mountAndCreate();
+	expect(balance).toHaveBeenCalledWith("gateway", undefined, {
+		orderId: "order-A",
+		binding: BINDING,
+	});
+	expect(qc.getQueryData(["nug", "quotas"])).toEqual({
+		gateway: isPrimary
+			? {
+					balance: paidQuota.balance,
+					totalGranted: paidQuota.totalGranted,
+					detailedQuotaBalance: paidQuota.detailedQuotaBalance,
+					extra: paidQuota.extra,
+				}
+			: oldQuota,
+		other: otherQuota,
+	});
+	expect(qc.getQueryData(currentQuotaKey)).toEqual(currentQuota);
+	expect(qc.getQueryState(currentQuotaKey)?.isInvalidated).toBe(true);
+	expect(events).toEqual(
+		isPrimary ? ["quota", "continue", "paid", "close"] : ["continue", "paid", "close"],
+	);
+});
 
 test.each([
 	"gateway-502",
@@ -283,6 +392,16 @@ test.each([
 	});
 	expect(events).toEqual(["quota", "continue", "paid", "close"]);
 	expect(create).toHaveBeenCalledTimes(1);
+	expect(config).toHaveBeenCalledWith("gateway", {
+		mode: "request",
+		narratorId: "narrator-A",
+		paymentContext: PAYMENT_CONTEXT,
+	});
+	expect(create.mock.calls[0]?.[2]).toEqual({
+		mode: "request",
+		narratorId: "narrator-A",
+		paymentContext: PAYMENT_CONTEXT,
+	});
 	expect(poll.mock.calls).toEqual(Array(2).fill(["gateway", "order-A", BINDING]));
 });
 
@@ -332,4 +451,141 @@ test("persistent gateway errors consume a finite budget; explicit Retry keeps th
 			(args) => args[0] === "gateway" && args[1] === "order-A" && args[2] === BINDING,
 		),
 	).toBe(true);
+});
+
+test("B 下单未返回就切到 C：C 能独立下单，迟到 B 不能覆盖 C 的 QR 或启动旧轮询", async () => {
+	const lateB = deferred<OrderResponse>();
+	create.mockReturnValueOnce(lateB.promise).mockResolvedValueOnce(orderC());
+	poll.mockResolvedValue(orderC());
+	await mountAndCreate();
+	await mountAndCreate({ resumeAction: "continue", paymentContext: CONTEXT_C }, false);
+	await act(async () => button(narratorEn.recharge.createOrder).click());
+	expect(create.mock.calls[1]?.[2]).toEqual({
+		mode: "request",
+		narratorId: "narrator-A",
+		paymentContext: CONTEXT_C,
+	});
+	expect(document.querySelector(`img[src="${C_URL}"]`)).not.toBeNull();
+	await act(async () => {
+		lateB.resolve(order());
+	});
+	expect(qrVisible()).toBe(false);
+	expect(document.querySelector(`img[src="${C_URL}"]`)).not.toBeNull();
+	expect(poll.mock.calls.every((args) => args[1] === "order-C" && args[2] === "c".repeat(43))).toBe(
+		true,
+	);
+	expect(events).toEqual([]);
+});
+
+test.each([
+	"paymentContext",
+	"narratorId",
+	"providerId",
+	"authGeneration",
+])("%s 变化时在 layout 前隐藏已有 B QR；旧 paid 轮询不能进入新 scope", async (change) => {
+	const latePoll = deferred<OrderResponse>();
+	const initialGeneration = getAuthSnapshot().generation;
+	poll.mockReturnValueOnce(latePoll.promise).mockResolvedValue(orderC());
+	await mountAndCreate();
+	expect(qrVisible()).toBe(true);
+	const payment = {
+		resumeAction: "continue" as const,
+		paymentContext: change === "paymentContext" ? CONTEXT_C : PAYMENT_CONTEXT,
+	};
+	const scope: DialogScope = {
+		narratorId: change === "narratorId" ? "narrator-C" : "narrator-A",
+		providerId: change === "providerId" ? "gateway-C" : "gateway",
+		onLayout: () => expect(qrVisible()).toBe(false),
+	};
+	if (change === "narratorId" || change === "providerId") {
+		config.mockImplementation(async (_source, intent) => {
+			if (intent?.mode === "request" && intent.paymentContext === PAYMENT_CONTEXT)
+				throw new ApiError("context belongs to the previous narrator/source", 409, {
+					code: "NUG_PAYMENT_CONTEXT",
+				});
+			return billingConfig;
+		});
+	}
+	if (change === "authGeneration") {
+		await mountAndCreate(undefined, false, {
+			onLayout: (generation) => {
+				if (generation !== initialGeneration) expect(qrVisible()).toBe(false);
+			},
+		});
+		await act(async () => {
+			setToken("dialog-owner-C");
+		});
+	} else await mountAndCreate(payment, false, scope);
+	expect(qrVisible()).toBe(false);
+	await act(async () => {
+		latePoll.resolve(order("paid"));
+	});
+	expect(balance).not.toHaveBeenCalled();
+	expect(events).toEqual([]);
+	create.mockResolvedValueOnce(orderC());
+	await mountAndCreate({ resumeAction: "continue", paymentContext: CONTEXT_C }, true, scope);
+	expect(create.mock.calls.at(-1)?.[0]).toBe(scope.providerId);
+	expect(create.mock.calls.at(-1)?.[2]).toEqual({
+		mode: "request",
+		narratorId: scope.narratorId ?? "narrator-A",
+		paymentContext: CONTEXT_C,
+	});
+	expect(document.querySelector(`img[src="${C_URL}"]`)).not.toBeNull();
+});
+
+test.each([
+	"quota",
+	"resume",
+])("B 已 paid 但 %s 仍在途，切到 C 后不能更新额度、清除新失败或关闭新窗口", async (stage) => {
+	const lateQuota = deferred<Awaited<ReturnType<typeof api.nugGetQuota>>>();
+	const lateResume = deferred<{ ok: boolean }>();
+	create.mockResolvedValueOnce(order("paid")).mockResolvedValueOnce(orderC("paid"));
+	if (stage === "quota") balance.mockReturnValueOnce(lateQuota.promise);
+	else
+		resume.mockImplementationOnce(async () => {
+			events.push("continue");
+			return lateResume.promise;
+		});
+	await mountAndCreate();
+	const beforeSwitch = [...events];
+	await mountAndCreate({ resumeAction: "continue", paymentContext: CONTEXT_C }, false);
+	await act(async () => {
+		lateQuota.resolve(quota);
+		lateResume.resolve({ ok: true });
+	});
+	expect(events).toEqual(beforeSwitch);
+	await act(async () => button(narratorEn.recharge.createOrder).click());
+	expect(events.slice(beforeSwitch.length)).toEqual(["quota", "continue", "paid", "close"]);
+	expect(balance.mock.calls.at(-1)?.[2]).toEqual({ orderId: "order-C", binding: "c".repeat(43) });
+});
+
+test("跨标签 token 变化尚未触发 render 时，旧 paid quota 确认仍按 authGeneration 拒绝", async () => {
+	const lateQuota = deferred<Awaited<ReturnType<typeof api.nugGetQuota>>>();
+	create.mockResolvedValueOnce(order("paid"));
+	balance.mockReturnValueOnce(lateQuota.promise);
+	await mountAndCreate();
+	await act(async () => {
+		storage.set("narrafork_token", "other-tab-owner");
+		lateQuota.resolve(quota);
+	});
+	expect(events).toEqual([]);
+	expect(resume).not.toHaveBeenCalled();
+});
+
+test("standalone 同 source 的健康重排/配置刷新不清除已创建订单，后续仍查原 binding", async () => {
+	await mountAndCreate(null);
+	config.mockResolvedValue({ ...billingConfig, balance: 99 });
+	await act(async () => {
+		await qc.invalidateQueries({ queryKey: ["nug", "billing", "config"] });
+	});
+	await mountAndCreate(null, false);
+	expect(qrVisible()).toBe(true);
+	expect(await fireNextTimer()).toBe(true);
+	expect(
+		poll.mock.calls.every(
+			(args) => args[0] === "gateway" && args[1] === "order-A" && args[2] === BINDING,
+		),
+	).toBe(true);
+	expect(create.mock.calls[0]?.[2]).toEqual({ mode: "standalone" });
+	expect(events).toEqual([]);
 });

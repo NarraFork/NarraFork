@@ -146,11 +146,20 @@ function restoreSnapshot(snapshot: QuotaSnapshot): QuotaSnapshot | null {
 	});
 }
 
-function subject(config: NUGProviderConfig): NugQuotaSubject {
-	const key = getProviderKeyStore().list(nugKeyOwner(config.id))[0];
+function subject(config: NUGProviderConfig): NugQuotaSubject;
+function subject(
+	config: NUGProviderConfig,
+	credentialId: string | undefined,
+): NugQuotaSubject | undefined;
+function subject(config: NUGProviderConfig, credentialId?: string): NugQuotaSubject | undefined {
+	const keys = getProviderKeyStore().list(nugKeyOwner(config.id));
+	const key =
+		credentialId === undefined ? keys[0] : keys.find((entry) => entry.id === credentialId);
 	return key
 		? { id: key.id, providerId: config.id, config: withProviderKey(config, key) }
-		: { id: config.id, providerId: config.id, config };
+		: keys.length === 0 && (credentialId === undefined || credentialId === config.id)
+			? { id: config.id, providerId: config.id, config }
+			: undefined;
 }
 
 export const nugQuotaIdentity = (config: NUGProviderConfig): string =>
@@ -174,13 +183,35 @@ function rememberCredential(providerId: string, credentialId: string): void {
 	knownCredentialIds.set(providerId, ids);
 }
 
-function snapshotOf(config: NUGProviderConfig): QuotaSnapshot | undefined {
-	const credential = subject(config);
+function snapshotOf(
+	config: NUGProviderConfig,
+	credentialId?: string,
+	source?: typeof STREAM_QUOTA_SOURCE,
+): QuotaSnapshot | undefined {
+	const credential = subject(config, credentialId);
+	if (!credential) return;
 	rememberCredential(config.id, credential.id);
-	const identity = nugQuotaIdentity(credential.config);
-	const probe = quotaStore.get(credential.id, identity, restoreSnapshot);
-	const stream = quotaStore.get(credential.id, identity, restoreSnapshot, STREAM_QUOTA_SOURCE);
+	const key = nugQuotaIdentity(credential.config);
+	if (source === STREAM_QUOTA_SOURCE)
+		return quotaStore.get(credential.id, key, restoreSnapshot, STREAM_QUOTA_SOURCE);
+	const probe = quotaStore.get(credential.id, key, restoreSnapshot);
+	if (credentialId !== undefined) return probe;
+	// Only the legacy source-level view merges the current first key's two slots.
+	const stream = quotaStore.get(credential.id, key, restoreSnapshot, STREAM_QUOTA_SOURCE);
 	return stream && (!probe || stream.fetchedAt >= probe.fetchedAt) ? stream : probe;
+}
+
+/** Read an exact credential without changing the legacy first-key view or starting IO. */
+export function getNugQuotaSnapshot(
+	providerId: string,
+	credentialId?: string,
+	source?: typeof STREAM_QUOTA_SOURCE,
+): { credentialId: string; snapshot: QuotaSnapshot | undefined } | undefined {
+	const config = (settings.nugProviders ?? []).find((provider) => provider.id === providerId);
+	const credential = config && subject(config, credentialId);
+	return credential && config
+		? { credentialId: credential.id, snapshot: snapshotOf(config, credentialId, source) }
+		: undefined;
 }
 
 export function setNugCachedQuota(
@@ -190,9 +221,10 @@ export function setNugCachedQuota(
 ): void {
 	const config = (settings.nugProviders ?? []).find((provider) => provider.id === providerId);
 	if (!config) return;
-	const credential = subject(config);
+	const captured = expectedConfig !== undefined && "config" in expectedConfig;
+	const credential = subject(config, captured ? expectedConfig.id : undefined);
+	if (!credential) return;
 	if (expectedConfig) {
-		const captured = "config" in expectedConfig;
 		const expectedId = captured ? expectedConfig.id : subject(expectedConfig).id;
 		const expectedIdentity = captured ? expectedConfig.identity : nugQuotaIdentity(expectedConfig);
 		if (credential.id !== expectedId || nugQuotaIdentity(credential.config) !== expectedIdentity) {

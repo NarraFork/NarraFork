@@ -2,9 +2,11 @@ import { afterEach, beforeEach, expect, setSystemTime, spyOn, test } from "bun:t
 import { createHash } from "node:crypto";
 import { Hono } from "hono";
 import { seedUnifiedCredentials } from "../../tests/unified-credentials";
+import { autoSourceFacts } from "../lib/agent/auto-route-signals";
 import { AppError } from "../lib/errors";
 import {
 	getNugCachedQuota,
+	getNugQuotaSnapshot,
 	nugQuotaIdentity,
 	purgeNugQuotaCache,
 	setNugCachedQuota,
@@ -90,7 +92,12 @@ function app(userId: string | null = owner, external = false) {
 function create(userId = owner) {
 	return app(userId).request(ROOT, {
 		method: "POST",
-		body: JSON.stringify({ amount: 10, provider: "mockpay", channel: "alipay" }),
+		body: JSON.stringify({
+			amount: 10,
+			provider: "mockpay",
+			channel: "alipay",
+			intent: { mode: "standalone" },
+		}),
 	});
 }
 function query(
@@ -209,7 +216,7 @@ test("billing config and creation both skip disabled A for enabled B without reb
 					totalGranted: 20,
 				})
 			: order();
-	const config = await app().request(`/api/nug/providers/${ID}/billing/config`);
+	const config = await app().request(`/api/nug/providers/${ID}/billing/config?mode=standalone`);
 	expect(config.status).toBe(200);
 	expect(await config.json()).toMatchObject({ enabled: true, balance: 12 });
 	const bound = await created();
@@ -226,7 +233,9 @@ test("billing config and creation both skip disabled A for enabled B without reb
 test("managed but entirely disabled billing keys never fall back to the projected inline secret", async () => {
 	store.update(first.id, { disabled: true });
 	store.update(second.id, { disabled: true });
-	expect((await app().request(`/api/nug/providers/${ID}/billing/config`)).status).toBe(409);
+	expect(
+		(await app().request(`/api/nug/providers/${ID}/billing/config?mode=standalone`)).status,
+	).toBe(409);
 	expect((await create()).status).toBe(409);
 	expect(calls).toEqual([]);
 });
@@ -348,6 +357,12 @@ test.each([
 	false,
 	true,
 ])("post-payment balance uses A and cannot overwrite B's provider view (reordered: %s)", async (reordered) => {
+	setNugCachedQuota(ID, {
+		balance: 0,
+		totalGranted: 0,
+		detailedQuotaBalance: null,
+		fetchedAt: Date.now(),
+	});
 	const bound = await created();
 	if (reordered) store.reorder(nugKeyOwner(ID), [second.id, first.id]);
 	setNugCachedQuota(ID, {
@@ -356,6 +371,11 @@ test.each([
 		detailedQuotaBalance: null,
 		fetchedAt: Date.now(),
 	});
+	if (reordered) {
+		store.update(second.id, { disabled: true });
+		expect(autoSourceFacts(ID).available).toBe(false);
+		store.update(second.id, { disabled: false });
+	}
 	gateway = (call) =>
 		call.url.endsWith("/v1/quota")
 			? Response.json({ balance: 11, totalGranted: 22 })
@@ -369,6 +389,12 @@ test.each([
 		paymentCredentialIsPrimary: !reordered,
 	});
 	expect(getNugCachedQuota(ID)?.balance).toBe(reordered ? 77 : 11);
+	expect(getNugQuotaSnapshot(ID, first.id)?.snapshot?.balances[0]?.remaining).toBe(11);
+	if (reordered) {
+		expect(getNugQuotaSnapshot(ID, second.id)?.snapshot?.balances[0]?.remaining).toBe(77);
+		store.update(second.id, { disabled: true });
+		expect(autoSourceFacts(ID).available).toBe(true);
+	}
 	expect(calls.map((call) => call.authorization)).toEqual(Array(3).fill(`Bearer ${A}`));
 	expect((await paymentQuota(bound, "another-local-user")).status).toBe(404);
 	store.update(first.id, { apiKey: "replaced-after-payment" });
