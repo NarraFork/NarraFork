@@ -46,7 +46,7 @@ keywords:
   - .narrafork/plans
   - Question 工具
 status: draft
-verified_at: 878917e97
+verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 ---
 # 提问与计划模式
 
@@ -57,6 +57,7 @@ Agent 向人提问有两档：同步（阻塞等待）和异步（不停工，�
 - 一次 1–4 个问题，每题选项 0–4 个（0 为自由输入），“Other” 由界面自动提供；单选题才支持 `preview`（schema 描述）。
 - 异步提问：`async: true` 且必须带非空 `context`（上限 2KiB，`QUESTION_CONTEXT_MAX_BYTES`）；先落一行 `narrator_questions`（状态 open / answered / dismissed / withdrawn，来源 `agent_async` 或 `user_deferred`），`tool_call_id` 唯一索引保证重放不产生第二行（`narrator-question-service.ts:createAsyncQuestion`）。
 - 答案回流：答案/驳回在一个同步事务内完成“条件更新状态 + 写消息 + 写历史引用”，失败则问题仍保持 open 可重试；撤回同样以 `status='open'` 为条件，先到者生效（返回 `stale`）。答案作为 `role: "user"` 的消息行经 `deliverInjection` 投递，因为模型每次请求都重放完整历史，改旧工具输出不会让正在运行的循环看到（见 [提示词与注入](prompts.md)）。
+- 运行时采纳答案：`narrator-session.ts:deliverPendingInjectionsInOrder` 采纳已落库的答案回执、不另建消息；回执的历史引用先在读 Worker 上查到，再在收件箱 `materialize` 的事务里按同一 ref id 复核，引用已不存在则抛 `RuntimeReadConflictError`，不把回执绑到失效引用上。
 - 数量与大小：每个叙述者未答问题软上限 `ASYNC_QUESTION_SOFT_LIMIT = 20`（超出仍创建，只是提示 Agent 别再延后）；快照 64KiB、答案 16KiB、回执 80KiB、备注 2KiB（`shared/question-protocol.ts`）。`Question` 工具的 get/list/resolve/withdraw 用于压缩之后找回历史问题。
 - 限制：outline 任务后端的根会话不允许 `async: true`（改用 `Ask`，子代理仍可用 async）；bot 等运行时上限拒绝提问（`assertRuntimeCanAskQuestion`，见 [Bot](bot.md)）。
 - 计划模式状态：`narrators.planMode` 布尔 + `plan` trait；进入/退出在 `narratorTraitsLock` 下同时更新两者（`narrator-plan-mode.ts:enterNarratorPlanMode`、`exitNarratorPlanMode`）。EnterPlanMode 先 `prepareNarratorPlanMode` 预留计划文件身份，待对应 tool_result 成功后才 `commitPreparedEnterPlanModeResult` 提交，预留的 id 为一次性。

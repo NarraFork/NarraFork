@@ -29,7 +29,7 @@ keywords:
   - 讨论室
   - /messages
 status: draft
-verified_at: 2c639f086aef21d60357f1e002e62767938833e8
+verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 ---
 # 聊天与站内消息
 
@@ -49,6 +49,11 @@ verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 - 转发讨论室内容给叙述者是客户端的显式动作，走叙述者正常输入路径。
 - 推送：`chat-notify.ts` 把 `chat:*` 事件分两路：房间订阅者收完整消息行（`chat:message`），未在查看的成员只收 id + 未读数（`chat:unread_changed`）；失败只记日志，不影响已提交的写入。
 - 附件：每条消息最多 10 个（`CHAT_ATTACHMENTS_PER_MESSAGE_MAX`），草稿最多 30 个，一条消息附件总大小 64MB（`server/lib/chat-attachments.ts`）；路由里另有 `materialize-attachments`。
+- 读取走读 Worker（`readQuery`/`readDbAll`，`worker-required`，不回退主线程）：房间解析、列表、未读、目录、发帖前的回复目标/附件/发送者查询、`chat-notify.ts:onMessageCreated` 取消息行。
+- ACL 例外：`assertCanRead`、`loadMembership`、`resolvePrincipal` 带可选 `ReadQueryOptions`；传了才走 Worker，不传（发帖等写路径）保留主线程有索引点读——这不是 Worker 故障回退（`chat-service.ts:loadMembership`）。
+- 上传附件：`saveChatAttachment` 在写文件前把 `room/storedName` 登记为“发布中”（`isChatAttachmentPublishing`），孤儿扫描会跳过它；`createChatAttachment` 写完文件后重新 `assertCanPost` 再插行，`finally` 里 `finishChatAttachmentPublication` 注销；插行前失败直接删文件，插行时失败先查行是否已落库，没落库才删（`chat-service.ts:createChatAttachment`）。
+- 删草稿附件与软删除消息：`DELETE ... RETURNING`，只删实际删掉的行对应的文件（`discardChatAttachment`、`softDeleteMessage`）。
+- 公开讨论：Worker 读取访问后，列表读完消息会再读一次访问，房间或叙述者变了就按不可用处理；发帖在写事务内用 `requirePublicDiscussion` 重新校验（`listPublicDiscussion`、`postPublicDiscussion`）。
 - 路由 `/api/chat`：directory、rooms、unread、rooms/dm、rooms/narrator/:id、rooms/bot/:id、消息列表/发送/删除、附件上传/下载/删除、read（已读）、summarize（带限频令牌桶，上限 200 条/40000 字符）。
 
 ## 从哪读起

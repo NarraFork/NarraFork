@@ -69,7 +69,7 @@ keywords:
   - pendingApprovalCount
   - project_id
 status: draft
-verified_at: fac3988333435e3fc3b5a4a6ace226c72ce14745
+verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 ---
 # 最近标签页
 
@@ -95,6 +95,7 @@ verified_at: fac3988333435e3fc3b5a4a6ace226c72ce14745
   - 何时移除：团队归档（`startTeamStatusSync` 发现归档后调 `pruneTeamTabs`，取消归档不恢复）、删除协调者（`narrator-service` 删除时 `removeTabFromAllUsers("team", id)`）、解散团队（`team-conversion.ts:disbandTeam` 提交后同样调用，会话自己的标签保留）、协调者共享变化后读不了（`narrator-sharing.ts:announceAccessChange` 调 `pruneTeamTabs`，逐个持有者重新判读）、失去项目（`pruneUnreadableProjectTabs` 对该项目的团队标签按协调者 ACL 判读，`usersWithTabsInProject` 也把团队标签持有者算进去）。
 - 每次写入都在用户级锁内进行：读行 → 变换 → 去重加限额 → 在一个事务里只更新有差异的行并把 `user_recent_tabs_meta.revision` +1，再向该用户广播 `user:recent_tabs_delta`（每批 100 个操作）（`persistMutationLocked`、`broadcastDelta`）。无变化不增版本。
 - 读取走游标分页：每页最多 50 行，游标绑定分区和版本，版本变了返回 409 `stale cursor`，客户端须从第一页重载（`listPage`）；文件夹成员不在顶层分页里。
+- 分页 `listPage`、`getRuntimePatches`、`getRecentTabUserIds*`、补迁扫描、`pruneUnreadableProjectTabs`、`enrichTabs` 的叙述者/终端/团队查询走读 Worker（`readQuery`，`worker-required`，不回退主线程）（`recent-tabs-service.ts`、`user-preferences-service.ts:enrichTabs`）。
 - 运行时信息与记录分开：`getRuntimePatches` 一次最多 100 个键，返回状态、草稿、终端/后台任务计数、在线查看者、团队只读旁观者标记等，不写库（`POST /api/user-preferences/recent-tabs/runtime`）。
   - 项目标签没有叙述者 socket，不进实时窗口，另由 `recent-tabs-utils.ts:selectProjectRuntimeTabs` 选进运行时请求（当前页的、置顶的、其余的，最多 20 个，`PROJECT_TAB_RUNTIME_LIMIT`）；`RecentTabsWSProvider` 从实时窗口的预算里扣掉这些名额，一次请求仍不超过 `RECENT_TABS_LIVE_LIMIT` 个键。卡片或触屏详情打开时再单读这一个键（`useRecentTabs.ts:refreshProjectTabDetails`，同一键 10 秒内不重复，取消或失败不算），补丁并进标签缓存。行菜单（右键或触屏左滑）只记行的 `type:id`，每次渲染从当前列表按键取标签（`recent-tab-menu-target.ts:useRecentTabMenuTarget`）：运行时补丁替换缓存里的标签对象而不是原地改，打开时抓住的对象看不到之后到达的详情；行离开列表时菜单关闭（测试 `recent-tab-menu-target.test.tsx`）。菜单的位置（`RecentTabMenu.tsx:placeRecentTabMenu`）：在指针处，超出右边或下边时翻转，再夹进视口；高度上限是顶边到视口底的空间，所以过高时滚动、最后一个操作总能够到。打开后详情到达会让菜单变高，`useMenuPosition` 用 `ResizeObserver` 盯菜单和它的内容，尺寸一变就重新放置，关闭时断开（测试 `recent-tab-menu-position.test.tsx`，用真实的 `TabContextMenu`）。测试 `RecentTabs.requests.test.tsx`（持久化行的键进请求、打开卡片显示路径与计数并单读一次）。
   - 项目标签的悬停卡片数据只在这条运行时路径上算（`recent-tab-projects.ts:enrichProjectTabs`，不在分页列表里）：读得了项目（`resolveProjectGate`）才给 `projectPath`（项目目录）、`activeSessionCount` / `waitingSessionCount`（链到该项目、此刻 `working`/`waiting`、本人读得了的 primary 会话，`narratorReadableWhere`）、`teamCount`（活跃且协调者读得了的团队）；读不了或已删的项目全为 null。上限：每次请求最多 20 个项目标签（`PROJECT_TAB_DETAIL_LIMIT`），两条连接查询经读 worker（`readQuery`，`worker-required`，5s 超时）各最多读 `PROJECT_TAB_ROW_CAP` + 1 = 201 行，只读正在运行的会话，不对项目历史做 `COUNT(*)`；碰到上限时 `projectCountsCapped`，卡片显示「N+」。卡片（`RecentTabDetailCard.tsx:ProjectTabDetails`）没有进行中的会话时写「没有进行中的会话」，等待数和团队数为 0 时不显示。测试 `recent-tab-projects.test.ts`（真实 ACL：别人的私有会话/团队不计，失去项目读权限后为空）、`recent-tab-project-coordinator.test.tsx`。

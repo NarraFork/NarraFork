@@ -69,7 +69,7 @@ keywords:
   - installationId
   - UPDATE_SOURCE_CHANGED
 status: draft
-verified_at: 4d59774711a51a9ac966794090c8b3a04d549048
+verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 ---
 # 设置与数据目录
 
@@ -84,6 +84,7 @@ verified_at: 4d59774711a51a9ac966794090c8b3a04d549048
 - 实例设置与用户偏好是两套：`settings` 是整个实例共享的状态，只有管理员能 `PATCH /api/settings`（`settingsUpdateLock` 串行化，先 `updateSettingsSchema` 校验，`expectedUpdateSettingsKey` 与当前更新源不符返回 409 `UPDATE_SOURCE_CHANGED`）；`GET /api/settings` 对管理员与普通用户返回不同视图（`buildSettingsResponse(settings, { admin })`）。每个用户自己的偏好在 `user_preferences` 表，经 `/api/user-preferences`（`routes/user-preferences.ts`，校验在 `validators/settings.ts:updateUserPreferencesSchema`），前端 `useUserPreferences` 读写，`user_preferences:changed` 事件 → WS `user_preferences_changed` → `useUserPreferencesChangeSync` 让各标签页失效重取。
 - 会话 UI 用 `GET /api/settings/runtime`：`settings/runtime.ts:buildRuntimeSettings` 从配置与只读运行时事实直接白名单构造（模型标识、reasoning/反思/压缩/提醒参数、outline、requestEvidence、revision），响应上限 8 KiB，不调用完整 `buildSettingsResponse`，不带 providers、prompt、密钥/头部、完整模型目录或额度图。管理员额外得到小型更新源与 `updateSettingsKey`；`PATCH /api/settings?view=runtime` 保持原管理员写入与冲突前置条件，只改变返回视图。
 - runtime 的 `summaryModelAvailable` 是纯只读三态：缓存配置可证为 true/false，未观察的 auto/未固定聚合/插件等返回 null，不调用执行 resolver 或以候选首项推导就绪；只有明确 false 才强制摘要模型设置。设置/插件等变化通过小型 revision 标记失效，未知不伪装成失败（`settings/runtime-readiness.ts`）。
+- `/api/user-preferences` 读偏好行走读 Worker（`prefsRead`：`worker-required`、带请求 signal、`maxRows: 1`，不回退主线程）；所有写合并 JSON 列的路由（完整 PATCH、`graph-viewports`、`plugin-overlays`、Spec 布局等）都持 `userPreferencesLock`，锁内读到的值不会被别的写覆盖（`routes/user-preferences.ts`）。
 - 用户 UI 偏好用 `GET/PATCH /api/user-preferences/ui`（本地兼容 `?view=ui`）：路由最先分支，SQL 显式选 UI 列，不读取整行或 legacy tabs/enrichTabs；白名单包含外观/语言/输入队列/通知开关/导航与工具栏，排除命令正文、网关、webhook/secret、全会话 Spec 布局与日报。实际合并 DTO 写前校验，读写响应预算 64 KiB；完整编辑接口保留。
 - 前端 `useUserPreferences` 使用独立 `[user-preferences, ui, userId, authGeneration]` 与 30 秒 stale；完整编辑页用 `useUserPreferencesDetail/useUpdateUserPreferencesDetail`，瘦 DTO 不写进完整缓存，未载入字段不靠默认值保存。认证代际变化取消并移除旧偏好/身份查询；账户偏好事件使 UI/detail/当前 Spec 布局一起失效。runtime 用独立 `[settings-runtime, authGeneration]`（30 秒 stale/60 秒 GC），更新成功只写该瘦缓存；鉴权外壳的 `useRuntimeProjectionSync` 接 settings/catalog 标记与重连失效，换认证取消旧读并移除旧 runtime/options，关闭菜单不因失效发 GET。缓存键及单飞身份只包含非秘密代际，不序列化原始凭据。
 - WS 首连仅给已登录非公开分享发送 `settings_runtime_changed {revision,initial:true}`；`useRuntimeProjectionSync` 把 initial revision 当待核对下界，无数据/HTTP 在途时先等该 GET 完成，同版不强制第二 GET，落后才补读。普通 settings/catalog 标记合并 burst，一批取消旧初读，读中变更补尾读；旧 token 的 runtime/settings/options 不参与失效。真实 reconnect 调 `resetEpoch` 清最高 revision/initial 下界与待刷标记，并用 epoch fence 退休旧队列和在途后续动作；新进程 revision 可从 100 降至 0 后继续接受 1，不能沿用旧高水位压掉新配置（`useModelCatalog.runtime.test.tsx`）。

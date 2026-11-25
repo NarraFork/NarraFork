@@ -23,7 +23,7 @@ keywords:
   - stopHooks
   - 钩子
 status: draft
-verified_at: a3d23ae00610fc55ec1709dbd0aaf21c8279397c
+verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 ---
 # 钩子
 
@@ -35,6 +35,7 @@ verified_at: a3d23ae00610fc55ec1709dbd0aaf21c8279397c
 - 只有 `PreToolUse` 可阻塞：一旦某个钩子返回 `blocked` 就立即返回；其它事件的 `blocked` 被忽略，`error` 只记录告警、不中断，最后返回最后一个 error 或 success（`runHooks`）。
 - command 钩子：固定 `spawn("bash", ["-c", …])`，没有任何回退到其他 shell 的逻辑；Windows 上没有 bash 时 spawn 触发 `error` 事件，钩子返回 `error`（原因为系统错误信息），`error` 不会阻塞。输入的 JSON 通过 stdin 传入，cwd 为叙述者目录，默认超时 30s；退出码 0 成功，2 为阻塞（原因取 stderr 否则 stdout），其它为 error；stdout/stderr 各最多保留 64KiB（`executeCommandHook`）。
 - http 钩子：POST JSON，可带自定义头和代理覆盖；响应非 2xx 为 error；响应体 `decision: "block"` 为阻塞（`executeHttpHook`）。
+- 配置读取（`list`、`listAll`、`get`、`getMatchingHooks`）走读 Worker（`readQuery`，`worker-required`，不回退主线程）；匹配查询失败会从 `runHooks` 抛出，不当作没有钩子；只有补充叙述者标题的查询失败被吞掉（`runHooks`）。
 - 每次执行发 `hook:executed` 事件（含结果与耗时），并写调试日志。
 - 触发点：工具循环的 `hookHandler`（受运行时策略 `capabilities.stopHooks` 约束，关闭时直接返回 success）、回合结束的 `Stop`、注意力事件桥接（`orchestrator.ts`、`attention-hook-bridge.ts`）。
 - 路由 `/api/hooks` 整体要求管理员（`routes/hooks.ts`：`requireAdmin`），含列表、`/all`、读取、创建、更新、删除。

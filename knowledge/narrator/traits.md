@@ -25,6 +25,7 @@ keywords:
   - enforced
   - resolveEffectiveTraits
   - resolveNarratorRuntimePolicy
+  - resolveNarratorRuntimePolicyNow
   - trait-layer:changed
   - 设备注入
   - 禁用工具
@@ -33,7 +34,7 @@ keywords:
   - 能力上限
   - narrators.traits
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 ---
 # 会话特性层
 
@@ -47,10 +48,11 @@ Trait 是叙述者身上的字符串标签（`narrators.traits`，JSON 数组）
   - `preference`（设备注入等）：最近的显式值胜出，`inherit` 向下穿透（`mergeToggleTrait`、`mergeValueTrait`、`mergeToggleMapTrait`）。
 - enforced 标记以单独的 `custom-enforced:` trait 存（按 trait key：`disabledTools` / `blockedSkills` / `subagentModels`），不改变三种载荷格式；`source` 层没有自己的标记，它的限制与授权一律视为边界（`lib/trait-resolution.ts`）。
 - 解析结果是“拍平”的 traits 数组：已有调用点仍把 `narrator.traits` 换成 `resolved.traits` 传给 `getDisabledToolSet` / `getBlockedSkills` / `resolveEffectiveSubagentModelPolicy`，上层为空时与叙述者自身 trait 逐字节一致；enforced 信息随 `enforced` 字段另给，写路径据此提前拒绝无效编辑（`canRelaxRestriction`、`canExtendGrant`）。
-- 加载与缓存：`trait-layer-service.ts:resolveEffectiveTraits` 并行读项目层、用户层与策略来源；项目层/用户层读失败时降级为只用叙述者自身 trait（记 debug），策略来源层永远严格——读不到、成环（`Policy source cycle detected`）或链过深（`MAX_POLICY_SOURCE_DEPTH`）都抛错而不是丢掉边界。两个上层各有 5 秒 TTL 缓存（最多 500 项），写入会显式失效。
+- 加载与缓存：`trait-layer-service.ts:resolveEffectiveTraits` 并行读项目层、用户层与策略来源；项目层/用户层读失败时降级为只用叙述者自身 trait（记 debug），策略来源层永远严格——读不到、成环（`Policy source cycle detected`）或链过深（`MAX_POLICY_SOURCE_DEPTH`）都抛错而不是丢掉边界。两个上层各有 5 秒 TTL 缓存（最多 500 项），写入会显式失效。项目层、用户层与策略来源叙述者都经读 Worker（`worker-required`）读取；每层有失效代数，读取期间该层被失效则这次结果不写回缓存（`loadProjectTraits`、`loadUserTraits`）。
+- 提交时的能力上限：`trait-layer-service.ts:resolveNarratorRuntimePolicyNow` 在调用方给的事务里同步重算整条策略来源链（同样的环/深度检查），不走 Worker、不用 TTL 缓存；`permission-rule-request-service.ts` 的提交事务用它复核上限，Worker 读到的快照只作预检。
 - 能力上限 `custom-runtime-policy:`：不在 trait 合并里处理，各层条目原样带过，由 `resolveNarratorRuntimePolicy` / `resolveNarratorCapabilities`（严格模式，任何一层读不到就失败，绝不当作“没有上限”）交给 `agent-runtime/policy.ts` 做保序无关的只收窄合并。载荷字段（`version: 1`）：`tools`、`mcp`（none / readOnly / nonDenied）、`mcpNames`、`readOnly`、`searchOnly`、`readOnlyGitShell`、`deny`（`spawnAgent`、`watchAgent`、`awaitAgent`、`askUserQuestion`、`planApproval`、`stopHooks`、`switchWorkingDirectory`；旧的 `sendAwait` 读后丢弃）、`delegationDepth`（1–16，取最深）、`continuation`（`promoteTodo`、`maxPasses`）。无法解析的条目抛错，不静默当作没有（`lib/runtime-policy-trait.ts`）。
 - 设备注入是偏好型：模式 `none` / `private` / `global`（默认）/ `all` 加逐设备 `on` / `off` 覆盖（最多 200 项，设备 ID ≤ 64 字符）；授权与注入是两件事——最终注入集合永远是授权集合的子集，且设备必须在线；显式 `on`/`off` 双向压过模式；无范围信息的旧设备按项目范围处理（`lib/device-injection-trait.ts:resolveInjectedDevices`）。
-- 编辑上层：`/api/trait-layers/:layer/:ownerId`（`layer` 只能是 `user` 或 `project`），GET 读取，`PUT`/`DELETE` 分别作用于 `disabled-tools`、`blocked-skills`、`subagent-model-restriction`、`device-injection`；项目层需要管理员，用户层本人或管理员；JSON 体无效返回 400；写入在该层自己的锁内进行，完成后失效缓存并发 `trait-layer:changed` 事件（`routes/trait-layers.ts`、`trait-layer-service.ts:updateLayerTraits`）。叙述者自身层的编辑走 `/api/narrators/:id/custom-traits/*`，用同一套载荷。
+- 编辑上层：`/api/trait-layers/:layer/:ownerId`（`layer` 只能是 `user` 或 `project`），GET 读取，`PUT`/`DELETE` 分别作用于 `disabled-tools`、`blocked-skills`、`subagent-model-restriction`、`device-injection`；项目层需要管理员，用户层本人或管理员；JSON 体无效返回 400；写入在该层自己的锁内进行（用户层以 `user_preferences.user_id` 唯一键 upsert，并发新建的偏好行被更新而不是重复或报错），完成后失效缓存并发 `trait-layer:changed` 事件（`routes/trait-layers.ts`、`trait-layer-service.ts:updateLayerTraits`）。叙述者自身层的编辑走 `/api/narrators/:id/custom-traits/*`，用同一套载荷。
 - 前端：`TraitLayerEditor` 是项目设置与全局 Agent 设置共用的上层编辑器，enforced 与默认用显式开关区分，设备注入三态（inherit ≠ off）；`lib/api/trait-layers.ts` 是客户端。
 
 ## 从哪读起
