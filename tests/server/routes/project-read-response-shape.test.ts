@@ -15,9 +15,16 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import { Hono } from "hono";
 import { aclGrants, projects, users } from "../../../server/db/schema";
-import { cleanDb, getTestDb } from "../../setup";
+import {
+	closeRuntimeTestDb,
+	getRuntimeTestDb,
+} from "../../../server/services/__tests__/agent-runtime-test-database";
+import { cleanDb } from "../../setup";
 
-const { db, sqlite } = getTestDb();
+// File-backed WAL fixture: the project reads run on a read Worker, which cannot open
+// an in-memory database.
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
 const realDbModule = { ...(await import("../../../server/db")) };
 mock.module("../../../server/db", () => ({ db, sqlite }));
 
@@ -54,11 +61,11 @@ beforeEach(() => {
 
 afterEach(() => cleanDb(sqlite));
 
-afterAll(() => {
+afterAll(async () => {
 	mock.module("../../../server/db", () => realDbModule);
 	mock.restore();
 	cleanDb(sqlite);
-	sqlite.close();
+	await closeRuntimeTestDb(sqlite);
 });
 
 function seedProject(id: string, updatedAt: string, visibility: "public" | "private" = "private") {

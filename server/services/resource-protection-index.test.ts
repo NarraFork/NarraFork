@@ -617,7 +617,8 @@ describe("resource protection reverse index", () => {
 		await service.maintain(deadline());
 		expect(changes()).toBe(before);
 		expect(await claims([{ path: join(root, "unrelated") }])).toEqual([]);
-	});
+		// 1100 sources bootstrap through Worker pages; Windows CI needs several seconds.
+	}, 30_000);
 	test("descendant keyset pages follow path index order and equal-key lookups retain null paths", async () => {
 		for (let i = 0; i < 150; i++)
 			registry(`r${String(149 - i).padStart(3, "0")}`, join(root, String(i).padStart(3, "0")));
@@ -631,7 +632,7 @@ describe("resource protection reverse index", () => {
 		expect((await claims([{ repositoryKey: "repo-no-path" }])).map((claim) => claim.id)).toEqual([
 			"no-path",
 		]);
-	});
+	}, 30_000);
 	test("raw empty workspace_context remains malformed JSON instead of an empty inventory", async () => {
 		narrator("empty-context", root);
 		database.query("UPDATE narrators SET workspace_context='' WHERE id='empty-context'").run();
