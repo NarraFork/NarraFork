@@ -1,6 +1,14 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { parseHTML } from "linkedom";
-import { act, type ChangeEvent, type ComponentType, type ReactNode, useState } from "react";
+import {
+	act,
+	type ChangeEvent,
+	type ComponentType,
+	type ReactNode,
+	useEffect,
+	useRef,
+	useState,
+} from "react";
 import { createRoot, type Root } from "react-dom/client";
 
 const box = ({ children }: { children?: ReactNode }) => <div>{children}</div>;
@@ -153,7 +161,32 @@ const projectData = {
 };
 mock.module("../../hooks/useProjects", () => ({
 	useProject: () => ({ data: projectData }),
-	useUpdateProject: () => ({ mutate: update }),
+	// Like TanStack Query: a per-call `mutate` callback is dropped once the component unmounts,
+	// while `mutateAsync` settles regardless. Both settle through the recorded callbacks.
+	useUpdateProject: () => {
+		const mounted = useRef(true);
+		useEffect(
+			() => () => {
+				mounted.current = false;
+			},
+			[],
+		);
+		return {
+			mutate: (variables: unknown, options?: Callbacks) =>
+				update(variables, {
+					onSuccess: () => {
+						if (mounted.current) options?.onSuccess?.();
+					},
+					onError: (error: Error) => {
+						if (mounted.current) options?.onError?.(error);
+					},
+				}),
+			mutateAsync: (variables: unknown) =>
+				new Promise((resolve, reject) =>
+					update(variables, { onSuccess: resolve, onError: reject }),
+				),
+		};
+	},
 	useProjects: () => ({ data: [], isLoading: false }),
 	useHiddenProjectExistence: () => ({ data: { hasHidden: false } }),
 	useCreateProject: () => ({ ...mutation, mutate: createProject }),
@@ -503,6 +536,19 @@ test("rule saves are serialized: an edit made while one is in flight is sent aft
 	await click("delete-first-rule");
 	expect(update).toHaveBeenCalledTimes(1);
 	expect(shownRules()).toBe("");
+	await act(async () => callbacks(0).onSuccess?.());
+	expect(update).toHaveBeenCalledTimes(2);
+	expect(sentRules(1)).toEqual([]);
+});
+test("leaving settings mid-save still sends the queued rule list", async () => {
+	await act(async () =>
+		root.render(<ProjectRuleList project={twoRules} ruleKey="blacklistDirs" canManage />),
+	);
+	await click("delete-first-rule");
+	await click("delete-first-rule");
+	expect(update).toHaveBeenCalledTimes(1);
+	await act(async () => root.unmount());
+	root = createRoot(container);
 	await act(async () => callbacks(0).onSuccess?.());
 	expect(update).toHaveBeenCalledTimes(2);
 	expect(sentRules(1)).toEqual([]);
