@@ -51,8 +51,14 @@
   写权限与 live 身份，不公开 CID / 私有请求身份 / secret；重排仍为原 Key，显式 standalone 才选首个启用项。
   创建后的 [订单 binding](../../routes/nug.ts) 固定用户、订单、CID 与连接身份；付款额度按捕获 CID
   回写 per-Key 快照，不污染重排后的首 Key 摘要。[付款界面](../../../frontend/components/narrator/model/NugRechargeDialog.tsx)
-  对瞬时失败有界退避 / 重试，身份或权限失效则停止；该路径不替代普通额度 Query。展示层可取较新的同身份、
-  同单位 NUG 单钱包余额，probe 的窗口 / 有效期 / 错误仍权威，存储槽不互写。
+  对瞬时失败有界退避 / 重试，身份或权限失效则停止；该路径不替代普通额度 Query。NUG 全局 `fetchedAt` 仍记最后尝试，carry 数字保留宿主真实观察时间，私有
+  `detail._remainingObservedAt` / `_totalObservedAt` 经公开白名单成为 balance 的
+  `remainingObservedAt` / `totalObservedAt`。其三态为 number（真实 epoch-ms）、null（从未观察）、
+  undefined（按旧 snapshot 合同回退 `fetchedAt`）；非法观察时间省略、不转 null，不信任上游时间。
+  legacy / Unified 对同 CID、同单位单 wallet 按字段比较，同毫秒 probe 优先：partial `total=111`
+  不遮较新 STREAM `remaining=0`，旧 STREAM total 不盖新 total。metadata-only 不等于显式
+  unknown / error / expiry；legacy 可比视图明细缺席才只读回退另一槽，非空 latest 优先、
+  `extra: null` 合同不变，Unified 保留 probe 元数据，两个原槽不互写。
 
 ## 命令契约
 

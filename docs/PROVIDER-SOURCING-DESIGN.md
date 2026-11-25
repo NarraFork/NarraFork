@@ -454,7 +454,7 @@ resolveRoute({ modelValue, billingOwner, narratorId, epoch, caps }) →
 
 **NUG 出口不可静默降级**：[NugProvider](../server/lib/agent/nug-provider.ts) 只有 `egressAllowDirectFallback === true` 才允许直连；relay 不匹配或不可用时不能默认把 false / 未设置当成同意。
 
-**NUG 订单与付款额度固定身份**：失败请求经 [opaque context](../server/lib/nug-payment-context.ts) 绑定实际请求的 Key，配置与下单先核验叙述者写权限及 live 身份，不公开 CID / 私有请求身份 / secret；重排仍选择原 Key，只有显式 standalone 充值才选首个启用 Key。创建后的 [billing binding](../server/routes/nug.ts) 继续绑定用户、订单、CID 与连接身份，后续请求不改绑新首 Key。付款确认按捕获 CID 写入 per-Key 快照，只在仍为 primary 时更新该摘要，不把 A 的余额或旧值合并进重排后的 B。[NugRechargeDialog](../frontend/components/narrator/model/NugRechargeDialog.tsx) 对订单查询的瞬时失败作有界退避 / 重试，身份或权限失效立即停止；普通额度展示仍走统一 Query。同身份、同单位的 NUG 单钱包只在展示层选择较新余额，probe 窗口、有效期及错误边界仍保留，两个存储槽不互写。
+**NUG 订单与付款额度固定身份**：失败请求经 [opaque context](../server/lib/nug-payment-context.ts) 绑定实际请求的 Key，配置与下单先核验叙述者写权限及 live 身份，不公开 CID / 私有请求身份 / secret；重排仍选择原 Key，只有显式 standalone 充值才选首个启用 Key。创建后的 [billing binding](../server/routes/nug.ts) 继续绑定用户、订单、CID 与连接身份，后续请求不改绑新首 Key。付款确认按捕获 CID 写入 per-Key 快照，只在仍为 primary 时更新该摘要，不把 A 的余额或旧值合并进重排后的 B。[NugRechargeDialog](../frontend/components/narrator/model/NugRechargeDialog.tsx) 对订单查询的瞬时失败作有界退避 / 重试，身份或权限失效立即停止；普通额度展示仍走统一 Query。同 CID、同单位的 NUG 单钱包按字段观察时间形成只读数值视图（§15.4），不以全局尝试时间刷新 carry 数字的年龄，两个存储槽不互写。
 
 ### 14.3 下一步与保留约定
 
@@ -633,7 +633,8 @@ interface QuotaSnapshot {
   windows: Array<{ kind: "5h" | "weekly" | "monthly" | "other"; label?: string;
                    usedRatio: number | null; resetsAt: number | null;
                    used?: number; total?: number; remaining?: number; unit?: string }>;
-  balances: Array<{ unit: string; remaining: number | null; total?: number; unlimited?: boolean }>;
+  balances: Array<{ unit: string; remaining: number | null; total?: number; unlimited?: boolean;
+                    remainingObservedAt?: number | null; totalObservedAt?: number | null }>;
   plan?: string;               // 套餐档位，如 Codex 的 plan_type
   expiresAt?: number;          // 额度有效期，不是窗口 refill 的 resetsAt
   detail?: unknown;            // 仅服务端：Codex credits、code_review、重置额度等原结构
@@ -643,6 +644,7 @@ interface QuotaSnapshot {
 - 实际类型见 [shared/quota-snapshot.ts](../shared/quota-snapshot.ts)。窗口与余额由上游能力决定，不再用固定来源白名单假定“某家只能有余额”；每日 / 每周 / 每月额度保留上游的周期标签与绝对用量。
 - **逐 Key 身份**：按 `credentialId` 与实时身份读写，不能把首 Key 的额度复制给全部 Key。源协议只给账户 / 钱包额度时保留 `scope`，且只挂到 owner 能确认的凭据；旧 provider 摘要仍可显示首个 / 当前选中凭据，但不能替代逐 Key 探测。换 Key、端点、网络或站点凭据后旧身份未知，实际 probe 的晚到结果不得回写为新身份。
 - **STREAM / probe 独立**：[QuotaStore](../server/lib/sourcing/quota-store.ts) 的 probe 与 `STREAM_QUOTA_SOURCE` 分开保存、失效和恢复，不能让响应头余额覆盖独立窗口。前端可按身份选择显示值，但须保留直接探测的有效期、窗口、套餐等元数据。
+- **NUG 字段观察时间**：[owner](../server/lib/nug-quota-cache.ts) 的全局 `fetchedAt` 仍记最后尝试，carry 数字保留宿主真实观察时刻，私有 `detail._remainingObservedAt` / `_totalObservedAt` 经[公开白名单](../server/lib/sourcing/quota-snapshots.ts) 映射为 balance 的 `remainingObservedAt` / `totalObservedAt`。观察时间三态为 number（真实 epoch-ms）、null（从未观察）、undefined（按旧 snapshot 合同回退 `fetchedAt`）；非法观察时间省略、不造 null，上游时间不采信。legacy / Unified 仅对同 CID、同单位单 wallet 按 remaining / total 各自时间比较，同毫秒 probe 优先：partial `total=111` 不遮较新 STREAM `remaining=0`，旧 STREAM total 也不覆盖新 total。metadata-only 不等于显式 unknown / error / expiry；legacy 可比视图的明细仅在缺席时只读回退另一槽，非空 latest 优先、`extra: null` 合同不变，Unified 保留 probe 元数据，两个源槽不互写。
 - **未知不是零**：未探测、未知数值、失败、无支持端点都不伪造 `remaining: 0`；null / 缺失与真实零值不同。未知余额不阻挡路由；多币种、unlimited / uncapped、Codex credits 续用按原业务处理。未设限时不制造 `total: 0` 或 0 限额，只有上游给出有限上限才显示分母。
 - **有效期不是重置时间**：`expiresAt` 只表示额度失效时间；`windows[].resetsAt` 才表示窗口补充时间。通用视图保留周期绝对用量、未知、过期、无限额与刷新失败提示，不能把过期说成“到时自动补满”。
 - **owner 保留调度**：`probeQuota(group, credentialId)` 委托原源模块，队列、并发、TTL、手动节流与身份检查不搬到统一 API。持久化经带身份指纹的 `persisted-credential-cache`；旧格式兼容 / 损坏文件丢弃与源自身恢复规则保留。Codex `usage` / credits 的 canonical 状态仍由 CodexManager 管，统一接口只投影。
