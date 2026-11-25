@@ -16,6 +16,7 @@ anchors:
   - frontend/components/project/ProjectSettingsForms.tsx
   - frontend/components/project/ProjectRoutinesList.tsx
   - frontend/components/project/ProjectSettingsPanel.tsx
+  - server/services/__tests__/narrator-acl-batch-parity.test.ts
   - frontend/routes/projects/$projectId.tsx
   - frontend/routes/projects/$projectId_.settings.tsx
   - frontend/routes/projects/index.tsx
@@ -37,7 +38,7 @@ keywords:
   - scanPendingCalls
   - TeamCard
 status: draft
-verified_at: ef28ecaaf
+verified_at: 15e7759dc
 ---
 # 项目页、项目列表与项目设置页
 
@@ -46,18 +47,18 @@ verified_at: ef28ecaaf
 ## 关键规则
 读接口（`server/services/project-overview.ts`，路由在 `server/routes/projects.ts`，形状与上限在 `shared/project-overview.ts`）：
 - 三个新接口都先 `requireSqliteProjectMutation`：PG 上 503 `POSTGRES_UNSUPPORTED`，在任何权限检查之前（`project-teams-postgres.test.ts`）。SQL 不用 JSON 函数和 `indexed by`。
-- `GET /api/projects/summaries`：调用者可读的前 200 个项目（列表同序）。正在运行的会话（primary、非隐藏、非协调者、可读，按链接或 `context_project_id` 各读一次）、团队（活跃、协调者可读）、待决调用、ready 工作项，每类最多读 501 行；超出则 `capped`。最近活动：先按 `(variant, updated_at, id)` 取最新 2000 个会话，再查其中可读、属于这些项目的。`waitingCount` 只算调用者能决定的调用（`canWriteNarrator`）和他是成员的团队的 ready 项，且只在调用者对项目有写权限时给。
-- `GET /api/projects/:id/attention`：读不到项目 404；能读但没有项目写权限 403。待决调用经 `teams/team-board.ts:scanPendingCalls`（团队页同一个 `status` 索引扫描，最多 5 页×100，`accept` 跳过不能决定的调用），范围是根会话（子代理取 `acl_root_narrator_id`）链到本项目或 `context_project_id` 是本项目；最多 50 条，再加调用者是成员的团队的 ready 项最多 20 条（`readReadyItems`，`(project_id, state, id)`）。每条带来源：团队（id、名称）或会话（标题、所有者名）。预览同团队页（`pendingApprovalsOf`，输入只读 4KB 前缀）。
-- `GET /api/projects/:id/sessions?view=active|all|mine&cursor&limit`：读不到项目 404。primary、非隐藏、未归档、可读、链到项目（任一角色或 `context_project_id`），排除协调者（`project_teams` 主键不存在）。`active` 先 working/waiting 再最近 7 天内更新的其余会话，游标带阶段；`all`/`mine` 按 `(updated_at, id)` 降序。首页带三个标签的计数，各数到 1000 为止（子查询 `limit 1000`）。运行中的行带最近一次工具调用（每行一次索引探测）。页大小默认 30、最多 100。
+- `GET /api/projects/summaries`：调用者可读的前 200 个项目（列表同序）。正在运行的会话（primary、非隐藏、非协调者、可读，按链接或 `context_project_id` 各读一次）、团队（活跃、协调者可读）、待决调用、ready 工作项，每类最多读 501 行；超出则 `capped`。最近活动：先按 `(variant, updated_at, id)` 取最新 2000 个会话，再查其中可读、属于这些项目的。等待数只在调用者有写权限的项目里读（`projectsWritableBy`，一条授权查询）：待决调用只扫这些项目，ready 项只算活跃且协调者未归档的团队（与「等你处理」同一个 `liveTeam` 条件）里他是成员的；运行中会话数与团队数同样截到 500。
+- `GET /api/projects/:id/attention`：读不到项目 404；能读但没有项目写权限 403。待决调用经 `teams/team-board.ts:scanPendingCalls`（团队页同一个 `status` 索引扫描，最多 5 页×100；`acceptPage` 每页一次批量判断：按 ACL 根去重后交给 `narrator-acl.ts:judgeNarratorsWriteForPrincipal`，判断次数随不同会话数增长、不随调用数增长，`overviewAccessStats` 记账，测试断言上限），范围是根会话（子代理取 `acl_root_narrator_id`）链到本项目或 `context_project_id` 是本项目；最多 50 条，再加调用者是成员的团队的 ready 项最多 20 条（`readReadyItems`，`(project_id, state, id)`）。每条带来源：团队（id、名称）或会话（标题、所有者名）。预览同团队页（`pendingApprovalsOf`，输入只读 4KB 前缀）。
+- `GET /api/projects/:id/sessions?view=active|all|mine&cursor&limit`：读不到项目 404。primary、非隐藏、未归档、可读、链到项目（任一角色或 `context_project_id`），排除协调者（`project_teams` 主键不存在）。`active` 先 working/waiting 再最近 7 天内更新的其余会话，游标带阶段；`all`/`mine` 按 `(updated_at, id)` 降序。查询从项目自己的会话集合出发（`projectSessionIds`：链接表 `project_id` 索引 ∪ `context_project_id` 索引，`CROSS JOIN narrators` 按主键取行；写成 `IN` 过滤时，没有统计信息的 SQLite 会走整个 `(variant, …)` 索引，20 万会话约 150ms，这样不到 1ms）。首页带三个标签的计数，各数到 1000 为止（子查询 `limit 1000`）。「进行中」拒绝「全部」的游标、反之亦然（400）。运行中的行带最近一次工具调用（每行一次索引探测）。页大小默认 30、最多 100。
 - 团队卡片走已有的 `GET /:projectId/teams?counts=true`（`server/routes/project-teams.ts`）：每页最多 24 个团队，每个团队带 `card`（`teams/team-board.ts:readTeamCards`：按状态分组计数一次读完，运行中数最多 21，成员才有待批数，最近事件一行）。
 
 前端：
 - `routes/projects/$projectId.tsx`：页头（`ProjectHeader`：名称、固定到侧栏、路径尾部（悬停看全路径）、默认分支；「新团队」「新会话」；「…」里有项目设置，大纲开启时还有打开大纲和任务板切换）。手机上页头第一行带 `MobileNavButton`，浮动菜单按钮不再盖住标题。只在 `canWrite` 时读「等你处理」。PG 上团队卡片 503 时不显示「新团队」。
-- 「等你处理」复用团队页的 `TeamAttention`（`flush`、手机 `compact`），条目来自 `project-page-model.ts:projectAttentionEntries`，卡片前写团队名、会话卡片后写「谁的会话」；决定后刷新项目的读取。ready 项和团队名点开团队页。
-- 团队卡片（`ProjectTeamCards`）：状态句用团队页的 `statusSentence`（`teamCardStatus`），数字为进行中（排队+进行+评审中）/就绪/完成，成员看到「N 等你」（待批+就绪）；末尾虚线「新团队」卡；没有团队时一行说明加按钮。
+- 「等你处理」复用团队页的 `TeamAttention`（`flush`、`inPage`：桌面上没有内部滚动，多于 3 条折叠；手机上与团队页一样横向滑动加圆点），条目来自 `project-page-model.ts:projectAttentionEntries`，卡片前写团队名、会话卡片后写「谁的会话」；工具调用按工具说成「请求编辑文件 / 运行命令 / 读取文件 / 访问网页 / 使用 X」（`team-page-model.ts:toolVerb`）。决定后刷新 `projectDecisionKeys` 列出的读取：本页等你处理、项目列表汇总、团队卡片、会话列表，来自团队时还有该团队页（审批与摘要）。ready 项和团队名点开团队页。
+- 团队卡片（`ProjectTeamCards`，缓存里已归档的团队不显示，`liveTeamCards`）：状态句用团队页的 `statusSentence`（`teamCardStatus`），数字为进行中（排队+进行+评审中）/就绪/完成，成员看到「N 等你」（待批+就绪）；末尾虚线「新团队」卡；没有团队时一行说明加按钮。
 - 会话（`ProjectSessions`）：三个标签带计数（`999+`），「进行中」分运行中与「最近 7 天」两段（`sessionSections`）。
 - 项目列表（`routes/projects/index.tsx` + `ProjectListCard`）：排序有等你处理的在前，再按最近活动（`sortProjects`）；搜索框常驻。
-- 设置页 `/projects/$projectId/settings`（`ProjectSettingsPage`）七组：成员与可见性（`ProjectAccessPanel`）、技能（`ProjectSkillsManager`）、例程（`ProjectRoutinesList`，模式写成「新会话默认加载 / 会话内手动加载」，加项目特质层）、命令（命令编辑器、命令白/黑名单）、工作区与容器（名称、说明、项目目录、目录白/黑名单）、设备、知识库（链接到实例设置）。改动即存（`ProjectSettingsForms`：文本框离开时存、规则每次增删改都只发那一个 `chapterSettings` 键，服务端浅合并）。只有核实过的 `canManage` 才可编辑。会话菜单的项目设置弹窗（`ProjectSettingsPanel`）现在只是去设置页的入口。
+- 设置页 `/projects/$projectId/settings`（`ProjectSettingsPage`）七组：成员与可见性（`ProjectAccessPanel`）、技能（`ProjectSkillsManager`）、例程（`ProjectRoutinesList`，模式写成「新会话默认加载 / 会话内手动加载」，加项目特质层）、命令（命令编辑器、命令白/黑名单）、工作区与容器（名称、说明、项目目录、目录白/黑名单）、设备、知识库（链接到实例设置）。改动即存（`ProjectSettingsForms`）：名称与说明离开输入框时存；项目目录只在点「保存目录」并确认（说明会话会按目录重新归属）后存，与已存值比较时忽略末尾的 `/`，保存后显示服务端存的解析后路径；保存失败时输入保留并标「未保存」。规则每次增删改只发那一个 `chapterSettings` 键（服务端浅合并），失败则显示已存列表和错误。只有核实过的 `canManage` 才可编辑。会话菜单的项目设置弹窗（`ProjectSettingsPanel`）现在只是去设置页的入口。
 
 ## 从哪读起
 - `server/services/project-overview.ts`，再到 `teams/team-board.ts` 的 `scanPendingCalls`、`pendingApprovalsOf`、`readTeamCards`。
