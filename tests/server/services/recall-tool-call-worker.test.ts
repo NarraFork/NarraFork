@@ -59,19 +59,18 @@ function trackMainQueries() {
 
 afterEach(() => mock.restore());
 
-test("uses a Worker for scoped Recall details and preserves bounded text plus full metadata", async () => {
+test("uses a Worker for scoped Recall details and exposes resumable stored-JSON pages", async () => {
 	const owner = narrator("Owner");
 	const other = narrator("Other");
-	const output = { _text: "🌿 abc\n".repeat(1100) };
+	const output = { _text: "🌿 abc\n".repeat(2100) };
 	const { toolUseId } = toolCall(owner, output);
 	const mainReads = trackMainQueries();
 	const result = await read(owner, toolUseId);
-	expect(result.title).toBe("Read: example.txt");
+	expect(result.title).toBe(`Read: ${toolUseId}`);
 	expect(result.output).toContain("Status: success (123ms)");
-	expect(result.output).toContain(
-		`${output._text.slice(0, 4000)}\n... (truncated, ${output._text.length} chars total)`,
-	);
-	expect(result.metadata).toEqual({
+	const stored = Array.from(JSON.stringify(output));
+	expect(result.output).toContain(stored.slice(0, 8000).join(""));
+	expect(result.metadata).toMatchObject({
 		action: "read_tool_call",
 		toolUseId,
 		toolName: "Read",
@@ -79,8 +78,16 @@ test("uses a Worker for scoped Recall details and preserves bounded text plus fu
 		durationMs: 123,
 		narratorId: owner,
 		narratorTitle: "Owner",
-		input: { path: "/some/path/example.txt" },
-		output,
+		textFormat: "stored_json_or_text",
+		pages: {
+			input: { text: JSON.stringify({ path: "/some/path/example.txt" }), hasMore: false },
+			output: {
+				text: stored.slice(0, 8000).join(""),
+				hasMore: true,
+				nextOffset: 8000,
+				totalChars: stored.length,
+			},
+		},
 	});
 	expect(await read(other, toolUseId)).toMatchObject({ isError: true });
 	expect((await read(other, toolUseId, true)).metadata).toEqual(result.metadata);
@@ -92,8 +99,9 @@ test("returns raw invalid JSON in the preview without changing metadata", async 
 	const { id, toolUseId } = toolCall(owner, {});
 	sqlite.query("UPDATE narrator_tool_calls SET output_json = ? WHERE id = ?").run("raw output", id);
 	const result = await read(owner, toolUseId);
-	expect(result.output).toContain("--- Output ---\nraw output");
-	expect(result.metadata?.output).toBeNull();
+	expect(result.output).toContain("raw output");
+	expect(result.metadata?.pages).toMatchObject({ output: { text: "raw output", hasMore: false } });
+	expect(result.metadata?.output).toBeUndefined();
 });
 
 test("oversized payloads are rejected after scope filtering instead of returned partially", async () => {
@@ -108,7 +116,7 @@ test("oversized payloads are rejected after scope filtering instead of returned 
 		() => null,
 		(error: unknown) => error,
 	);
-	expect(failure).toBeInstanceOf(pool.DbReadTaskExecutionError);
+	expect(failure).toMatchObject({ code: "DB_READ_BUDGET" });
 	expect((failure as Error).message).toContain("Recall tool call source exceeds its byte budget");
 });
 

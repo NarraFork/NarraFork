@@ -146,6 +146,7 @@ test("eval/Blob text, namespace aliases and Reflect cannot grant a file-wide con
 // Static coverage evidence, never a runtime registry or business protocol dispatch table.
 const entryOwners: Record<(typeof COMPILED_WORKER_ENTRIES)[number], readonly string[]> = {
 	"lib/db-worker/worker-entry.ts": ["lib/db-worker/pool.ts"],
+	"lib/db-worker/recall-pg-projection-worker.ts": ["lib/db-worker/recall-pg-projection-client.ts"],
 	"lib/fs-scan-worker/fs-scan-worker-entry.ts": ["lib/fs-scan-worker/client.ts"],
 	"lib/browser/memory-snapshot-worker.ts": [
 		"lib/browser/memory-snapshot.ts",

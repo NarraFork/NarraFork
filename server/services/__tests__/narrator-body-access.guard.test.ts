@@ -83,6 +83,10 @@ const RAW_BODY_ACCESS: Record<string, { count: number; why: string }> = {
 		count: 2,
 		why: "PG compact epoch-only projection, whose column is the body",
 	},
+	"server/lib/db-worker/recall-pg-message-reader.ts": {
+		count: 2,
+		why: "PG-only bounded raw TEXT body/byte admission; JSON codec projection runs in an isolated Worker (escaped NUL is not jsonb-compatible)",
+	},
 	// Writes whose rows the sync queue builds from the column (`insertEnvelopeQueued`'s
 	// contract): a legacy-format import, and the revert program's prepared statements, which
 	// apply without reads or JSON work and so cannot sync inline.
