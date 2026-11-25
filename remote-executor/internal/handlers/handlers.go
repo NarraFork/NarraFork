@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+
+	"github.com/narrafork/remote-executor/internal/session"
 )
 
 // StreamFunc is invoked by streaming methods (exec) to push output chunks back
@@ -31,6 +33,10 @@ type Handlers struct {
 
 	ptyMu       sync.Mutex
 	ptySessions map[string]*ptySession
+
+	// sessions is process-wide and shared by every connection (unlike
+	// ptySessions above, which belongs to one connection).
+	sessions *session.Manager
 }
 
 func New(guard *PathGuard, maxRpcBytes int64) *Handlers {
@@ -56,6 +62,7 @@ func NewWithOptions(guard *PathGuard, maxRpcBytes int64, disableShell bool) *Han
 func (h *Handlers) ConnectionScoped() *Handlers {
 	scoped := NewWithOptions(h.guard, h.maxRpcBytes, h.disableShell)
 	scoped.editor = h.editor
+	scoped.sessions = h.sessions
 	return scoped
 }
 

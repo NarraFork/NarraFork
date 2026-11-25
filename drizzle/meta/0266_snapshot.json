@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "4864ed28-87dd-49b3-809f-bb915dc68219",
+  "id": "3082ae95-75e6-4fa7-8e19-e80b244de774",
   "prevId": "6c929a1e-e412-41c2-9086-767119c417c0",
   "tables": {
     "acl_events": {
@@ -2587,6 +2587,45 @@
         }
       },
       "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    },
+    "executor_session_cleanups": {
+      "name": "executor_session_cleanups",
+      "columns": {
+        "device_id": {
+          "name": "device_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "session_id": {
+          "name": "session_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {
+        "executor_session_cleanups_device_id_session_id_pk": {
+          "columns": [
+            "device_id",
+            "session_id"
+          ],
+          "name": "executor_session_cleanups_device_id_session_id_pk"
+        }
+      },
       "uniqueConstraints": {},
       "checkConstraints": {}
     },
@@ -20421,113 +20460,6 @@
         }
       }
     },
-    "team_work_item_dependencies": {
-      "name": "team_work_item_dependencies",
-      "columns": {
-        "item_id": {
-          "name": "item_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "depends_on_item_id": {
-          "name": "depends_on_item_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "team_id": {
-          "name": "team_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "created_at": {
-          "name": "created_at",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        }
-      },
-      "indexes": {
-        "idx_team_work_item_dependencies_target": {
-          "name": "idx_team_work_item_dependencies_target",
-          "columns": [
-            "depends_on_item_id",
-            "item_id"
-          ],
-          "isUnique": false
-        },
-        "idx_team_work_item_dependencies_team": {
-          "name": "idx_team_work_item_dependencies_team",
-          "columns": [
-            "team_id"
-          ],
-          "isUnique": false
-        }
-      },
-      "foreignKeys": {
-        "team_work_item_dependencies_item_id_team_work_items_id_fk": {
-          "name": "team_work_item_dependencies_item_id_team_work_items_id_fk",
-          "tableFrom": "team_work_item_dependencies",
-          "tableTo": "team_work_items",
-          "columnsFrom": [
-            "item_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
-        },
-        "team_work_item_dependencies_depends_on_item_id_team_work_items_id_fk": {
-          "name": "team_work_item_dependencies_depends_on_item_id_team_work_items_id_fk",
-          "tableFrom": "team_work_item_dependencies",
-          "tableTo": "team_work_items",
-          "columnsFrom": [
-            "depends_on_item_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
-        },
-        "team_work_item_dependencies_team_id_project_teams_narrator_id_fk": {
-          "name": "team_work_item_dependencies_team_id_project_teams_narrator_id_fk",
-          "tableFrom": "team_work_item_dependencies",
-          "tableTo": "project_teams",
-          "columnsFrom": [
-            "team_id"
-          ],
-          "columnsTo": [
-            "narrator_id"
-          ],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
-        }
-      },
-      "compositePrimaryKeys": {
-        "team_work_item_dependencies_item_id_depends_on_item_id_pk": {
-          "columns": [
-            "item_id",
-            "depends_on_item_id"
-          ],
-          "name": "team_work_item_dependencies_item_id_depends_on_item_id_pk"
-        }
-      },
-      "uniqueConstraints": {},
-      "checkConstraints": {
-        "ck_team_work_item_dependencies_self": {
-          "name": "ck_team_work_item_dependencies_self",
-          "value": "\"team_work_item_dependencies\".\"item_id\" <> \"team_work_item_dependencies\".\"depends_on_item_id\""
-        }
-      }
-    },
     "team_work_items": {
       "name": "team_work_items",
       "columns": {
@@ -21010,6 +20942,13 @@
         },
         "device_id": {
           "name": "device_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "executor_session_id": {
+          "name": "executor_session_id",
           "type": "text",
           "primaryKey": false,
           "notNull": false,

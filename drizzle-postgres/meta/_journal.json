@@ -586,8 +586,15 @@
 		{
 			"idx": 83,
 			"version": "7",
-			"when": 1795622141682,
-			"tag": "0083_team_work_item_dependencies",
+			"when": 1795622211933,
+			"tag": "0083_terminal_executor_session",
+			"breakpoints": true
+		},
+		{
+			"idx": 84,
+			"version": "7",
+			"when": 1795626264812,
+			"tag": "0084_team_work_item_dependencies",
 			"breakpoints": true
 		}
   ]
