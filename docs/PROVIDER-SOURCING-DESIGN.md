@@ -505,7 +505,7 @@ interface ServiceTemplate {
   subscription: boolean;       // 订阅制（额度窗口内不另计费）
   defaults?: Partial<SourceGroupOptions>;  // 模板默认的高级项，如 Kimi 的 UA
   probeQuota?(group, credential, signal): Promise<QuotaSnapshot>;
-  listModels?(group, credential, signal): Promise<string[]>;
+  listModels?(group, credential, signal): Promise<readonly SourceModel[]>; // 完整模型条目，保留来源元数据
   isModelAvailable?(group, upstreamModel): boolean;  // 内存判断，如 NUG 按网关模型的可用性
   dedupeKeys?(credential): string[];   // 导入时识别同一账号（Codex：rt / sub / 账号+邮箱 / at / agent）
   identify?(input: { baseUrl?: string; protocol?: Protocol; apiKey?: string }): boolean;  // 粘贴识别与旧配置归类
@@ -513,6 +513,7 @@ interface ServiceTemplate {
 }
 ```
 
+- 模型列表保留统一模板入口，直接返回缓存所有者的完整模型条目；`SourceModel` 只规定共享的 `id`，各来源元数据原样保留。管理接口只读取一次，不再把对象转成 ID 后重新筛回对象；显式刷新仍由原目录所有者负责，Agent 的同步枚举顺序不变。
 - `autoSourceFacts` 的“能否服务 / 是否订阅”改由模板的 `subscription`、`isModelAvailable` 与凭据状态得出，不再按类型写分支。前端预设改由后端下发模板列表。
 - `identify` 用精确的主机 + 路径表（`shared/sourcing/identify.ts` 的 `identifyService({ baseUrl, protocol })` → `{ templateId, region? }`，前后端共用），识别不出就给对应协议的 `*-compatible`，NUG 连接一律 `nug`。原来散在各处的额度探测白名单（`isKimiCustomApiProvider` / `isOpencodeCustomApiProvider` / `isDeepSeekCustomApiProvider` 及前端同款）改为调用它，判定逐条不变：Kimi 行仍是 `kimi.com` / `kimi.ai` 及子域的任意地址（国内 / 国际），OpenCode Go、DeepSeek 与新增的 OpenAI / Anthropic / Gemini 官方行要求 https、默认端口、无用户信息 / 查询 / 片段，因为命中即会把 Key 发去额度接口。Moonshot 的 `api.moonshot.{cn,ai}` 是按量计费平台，不是 Kimi Code 套餐，归 `*-compatible`。`isOfficialChatGPTDomain`（决定是否发送 `ChatGPT-Account-Id` / ChatGPT Origin）不是模板识别，保持原样。归类错了只影响默认值和额度探测，不影响请求发往哪里，因为端点保存在组上。
 - 现有的 `ProviderSourceRegistry` 保留为“按模板构造适配器”的后端；`registerCredentialProviderSource` 的协议族注册变成 `api` 类模板。

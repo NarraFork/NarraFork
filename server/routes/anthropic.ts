@@ -19,7 +19,7 @@ import {
 } from "../lib/settings";
 import { registerModelListReader } from "../lib/sourcing/model-list-readers";
 import { sourceGroupForConnection } from "../lib/sourcing/source-groups";
-import { listCachedTemplateModels } from "../lib/sourcing/templates";
+import { getServiceTemplate } from "../lib/sourcing/templates";
 
 export const anthropicRoutes = new Hono();
 
@@ -80,7 +80,7 @@ registerModelOptionsCapture("anthropic-messages", (group) =>
 	),
 );
 registerModelListReader("anthropic-messages", (group) =>
-	getAnthropicCachedModelsByProvider(group.id).map((model) => model.id),
+	getAnthropicCachedModelsByProvider(group.id),
 );
 
 function activeAnthropicProviderIds(): Set<string> {
@@ -328,9 +328,9 @@ anthropicRoutes.get("/providers/:id/models", async (c) => {
 		"anthropic-messages",
 	);
 	return c.json({
-		models: await listCachedTemplateModels(
+		models: await getServiceTemplate(group.templateId).listModels(
 			group,
-			getAnthropicCachedModelsByProvider(id),
+			undefined,
 			c.req.raw.signal,
 		),
 		fromCache: true,
