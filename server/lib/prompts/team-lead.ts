@@ -119,6 +119,41 @@ export function checkinText(locale: Locale, minutes: number, note: string | null
 	return locale === "zh-CN" ? `${head}\n你留的备注：${note}` : `${head}\nYour note: ${note}`;
 }
 
+// ─── A person returned a work item ───
+
+export interface ReturnedNoteInput {
+	itemId: string;
+	title: string;
+	branch: string | null;
+	/** The item's worker session, or null when it has none. */
+	worker: string | null;
+	/** The state it was returned from (`in_review` or `ready`). */
+	from: string;
+	/** The person's username, or null when not known. */
+	by: string | null;
+	reason: string;
+}
+
+/**
+ * The note a coordinator gets when a person returns a work item from the team page (source
+ * `team_return`, woken when idle): relay the reason to the worker like a reviewer's blockers,
+ * then review again before `work.ready`. Deterministic for the same inputs.
+ */
+export function returnedNote(locale: Locale, input: ReturnedNoteInput): string {
+	const who = input.by ?? (locale === "zh-CN" ? "一位成员" : "A member");
+	const branch = input.branch ? ` (${input.branch})` : "";
+	if (locale === "zh-CN") {
+		const next = input.worker
+			? `用 Send 把理由原样转给它的工作者（${input.worker}），让它在同一分支上改完并提交；改完再评审一轮，结论为 clear 后才能再 work.ready。`
+			: "这一项还没有工作者：派一个工作者到它的 worktree 按理由修改；改完再评审一轮，结论为 clear 后才能再 work.ready。";
+		return `${who} 在团队页退回了工作项「${input.title}」${branch}（${input.itemId}），它已回到 in_progress。\n退回理由：${input.reason}\n${next}`;
+	}
+	const next = input.worker
+		? `Send the reason unchanged to its worker (${input.worker}) and have it fix and commit on the same branch; then review again, and only a clear review allows work.ready.`
+		: "It has no worker yet: delegate the fix to a worker in its worktree; then review again, and only a clear review allows work.ready.";
+	return `${who} returned work item "${input.title}"${branch} (${input.itemId}) from the team page; it is in_progress again.\nReason: ${input.reason}\n${next}`;
+}
+
 // ─── Upgrade and disband notes ───
 //
 // One `sys` history row each (sources `team_upgrade` / `team_disband`, `schedule: "none"`),

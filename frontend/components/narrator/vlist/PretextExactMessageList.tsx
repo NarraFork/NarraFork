@@ -5510,6 +5510,7 @@ export const PretextExactMessageList = memo(
 						rowInteraction: traceBinding?.rowInteraction,
 						closingRowKeys: closingRows.get(item.spec.key),
 						narratorId,
+						canCalibrateModelTrace: item.spec.kind === "modeltrace-result" && !dataSource,
 						onOpenFilePanel: rowHandlers?.onOpenFilePanel,
 						onFetchAttachment: dataSource?.onFetchAttachment,
 						openAttachmentLabel,

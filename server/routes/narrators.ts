@@ -260,6 +260,7 @@ import {
 	createRevertActionPreviewSchema,
 	createRevertPlanSchema,
 	deleteBlocksSchema,
+	modelTraceCalibrationSchema,
 	modelTraceOptionsSchema,
 	optimizePromptSchema,
 	revertPlanFilesQuerySchema,
@@ -6500,6 +6501,46 @@ narratorRoutes.post("/:id/modeltrace/retry", async (c) => {
 		await getUserLanguage(userId),
 	);
 	return c.json(result);
+});
+
+// Reuse the sample associated with an eligible result in the diagnostic narrator.
+narratorRoutes.post("/:id/modeltrace/calibrate", async (c) => {
+	const userId = c.get("user").sub;
+	const bytes = new Uint8Array(512);
+	let length = 0;
+	const reader = c.req.raw.body?.getReader();
+	if (reader) {
+		try {
+			while (true) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				if (length + value.byteLength > bytes.byteLength) {
+					void reader.cancel().catch(() => {});
+					return c.json({ error: "ModelTrace calibration request is too large" }, 413);
+				}
+				bytes.set(value, length);
+				length += value.byteLength;
+			}
+		} finally {
+			reader.releaseLock();
+		}
+	}
+	let body: unknown;
+	try {
+		body = JSON.parse(new TextDecoder().decode(bytes.subarray(0, length)));
+	} catch {
+		throw new ValidationError("Invalid ModelTrace calibration JSON");
+	}
+	const parsed = modelTraceCalibrationSchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const { calibrateModelTrace } = await import("../services/modeltrace-service");
+	const result = await calibrateModelTrace(
+		c.req.param("id"),
+		parsed.data.resultId,
+		narratorPrincipalOf(c),
+		await getUserLanguage(userId),
+	);
+	return c.json(result, 202);
 });
 
 // Start: create a persistent pending message in the source narrator's chat
