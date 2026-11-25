@@ -17,6 +17,7 @@ import {
 	assertNoReplacedHistory,
 	assertTrueHistory,
 	configuredPrograms,
+	isGitWorkTree,
 	teamGit,
 } from "../team-git";
 import {
@@ -532,6 +533,8 @@ describe("team git writes", () => {
 				.filter(Boolean);
 			expect(commands.length).toBeGreaterThan(0);
 			expect([...new Set(commands)]).toEqual(["config"]);
+			// The metadata-only probe still answers: a partial clone is a work tree.
+			expect(await isGitWorkTree(repo)).toBe(true);
 			expect(existsSync(marker)).toBe(false);
 		} finally {
 			delete process.env.GIT_TRACE;

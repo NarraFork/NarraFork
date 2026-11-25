@@ -26,7 +26,7 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { AppError } from "./errors";
+import { AppError, catalogError } from "./errors";
 import { DEV_NULL } from "./platform";
 import { safeSpawn } from "./spawn";
 
@@ -110,11 +110,7 @@ export function untrustedProgramOverrides(
 	programs: GitConfiguredPrograms,
 ): Array<readonly [string, string]> {
 	if (programs.partialClone && !noLazyFetchSupported())
-		throw new AppError(
-			"This repository is a partial clone (or names a promisor remote) and this git cannot be kept from fetching missing objects through it (GIT_NO_LAZY_FETCH needs git 2.45); update git to use it with teams",
-			409,
-			"GIT_TOO_OLD_FOR_PARTIAL_CLONE",
-		);
+		throw catalogError("GIT_TOO_OLD_FOR_PARTIAL_CLONE");
 	return [
 		...programs.filters.flatMap((name) => [
 			[`filter.${name}.clean`, ""] as const,

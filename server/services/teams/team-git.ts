@@ -84,7 +84,27 @@ export async function prepareTeamRepo(dir: string): Promise<void> {
 	untrustedProgramOverrides(await configuredPrograms(dir));
 }
 
-/** A team git command, after {@link prepareTeamRepo}. */
+/**
+ * The only commands that run without {@link prepareTeamRepo}'s partial-clone check, because they
+ * never read an object: whether a directory is inside a work tree (a partial clone still is one,
+ * and a team on it must be refused for the real reason, not "not a git repository"), and the
+ * configuration query the gate itself reads. Audited; keep it this short — anything that resolves
+ * a revision, lists a tree or walks history reads objects and goes through the gate.
+ */
+const METADATA_ONLY_COMMANDS: ReadonlyArray<readonly string[]> = [
+	["rev-parse", "--is-inside-work-tree"],
+	PROGRAM_CONFIG_QUERY,
+];
+
+const isMetadataOnly = (args: readonly string[]) =>
+	METADATA_ONLY_COMMANDS.some(
+		(command) => command.length === args.length && command.every((arg, i) => arg === args[i]),
+	);
+
+/**
+ * A team git command, after {@link prepareTeamRepo}; `metadataOnly` skips its partial-clone check
+ * for a command of {@link METADATA_ONLY_COMMANDS} (any other is refused).
+ */
 async function spawnGit(
 	cwd: string,
 	args: readonly string[],
@@ -92,12 +112,15 @@ async function spawnGit(
 	maxOutputBytes: number,
 	timeout = READ_TIMEOUT_MS,
 	stdoutStream?: { maxBytes: number; onChunk: (chunk: Uint8Array) => boolean | undefined },
+	options: { metadataOnly?: boolean } = {},
 ) {
-	await prepareTeamRepo(cwd);
+	if (!options.metadataOnly) await prepareTeamRepo(cwd);
+	else if (!isMetadataOnly(args))
+		throw new GitError(`git ${args[0] ?? ""} reads objects: it is not a metadata-only command`);
 	return spawnGitUngated(cwd, args, config, maxOutputBytes, timeout, stdoutStream);
 }
 
-/** Only for reading configuration (the gate itself): no object is read. */
+/** The spawn itself: callers go through {@link spawnGit}. */
 async function spawnGitUngated(
 	cwd: string,
 	args: readonly string[],
@@ -266,7 +289,15 @@ export async function assertNoReplacedHistory(
 /** The filters and configuration-defined hooks a checkout's configuration names (all scopes). */
 export async function configuredPrograms(cwd: string): Promise<GitConfiguredPrograms> {
 	// Configuration only: this is what the gate itself reads.
-	const result = await spawnGitUngated(cwd, PROGRAM_CONFIG_QUERY, GIT_NO_EXEC_CONFIG, 64 * 1024);
+	const result = await spawnGit(
+		cwd,
+		PROGRAM_CONFIG_QUERY,
+		GIT_NO_EXEC_CONFIG,
+		64 * 1024,
+		READ_TIMEOUT_MS,
+		undefined,
+		{ metadataOnly: true },
+	);
 	// Exit 1 without output: nothing matched.
 	if (result.exitCode === 1 && !result.stdout) return { filters: [], hooks: [] };
 	if (result.exitCode !== 0 || result.truncated)
@@ -283,12 +314,16 @@ export async function configuredPrograms(cwd: string): Promise<GitConfiguredProg
 export async function isGitWorkTree(dir: string): Promise<boolean> {
 	const info = await stat(dir).catch(() => null);
 	if (!info?.isDirectory()) return false;
+	// Metadata only: a partial clone is a work tree too (a team on it is refused later, for that
+	// reason, when its base is resolved).
 	const result = await spawnGit(
 		dir,
 		["rev-parse", "--is-inside-work-tree"],
 		GIT_NO_EXEC_CONFIG,
 		1024,
 		WORK_TREE_PROBE_TIMEOUT_MS,
+		undefined,
+		{ metadataOnly: true },
 	).catch(() => null);
 	return (
 		result !== null && result.exitCode === 0 && !result.truncated && result.stdout.trim() === "true"
