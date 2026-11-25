@@ -346,10 +346,25 @@
  * sync. Nothing selects the old class any more.
  */
 
+/* Shared compact-row spinner, including surfaces outside the lazy vlist bundle. */
+@keyframes nf-trace-spin {
+	to {
+		transform: rotate(360deg);
+	}
+}
+
+.nf-trace-spin {
+	animation: nf-trace-spin 1s linear infinite;
+}
+
 /* Reduced motion: stop the sweep and restore plain text. Dropping the animation
    alone would freeze the gradient mid-sweep, leaving the row permanently
    half-transparent — so the fill colour has to come back too. */
 @media (prefers-reduced-motion: reduce) {
+	.nf-trace-spin {
+		animation: none;
+	}
+
 	.nf-trace-shimmer--stream,
 	.nf-trace-shimmer--reflect,
 	.nf-trace-shimmer--run,
