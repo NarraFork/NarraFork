@@ -12,6 +12,11 @@ import {
 	type RestArrival,
 } from "./narrator-switch-budget.browser-fixture";
 
+interface BrowserTransportTimeline {
+	wsOpens: Array<{ path: string; at: number }>;
+}
+type BudgetWindow = Window & { switchBudgetTransport: BrowserTransportTimeline };
+
 const executablePath =
 	process.env.NF_TEST_CHROMIUM_PATH ??
 	"/home/fulcrum/.cache/puppeteer/chrome/linux-146.0.7680.31/chrome-linux64/chrome";
@@ -237,6 +242,24 @@ test("real Chromium full SPA cold A → sidebar B → warm A has bounded request
 		localStorage.setItem("narrafork_token", token);
 		localStorage.setItem("i18nextLng", "en");
 		performance.setResourceTimingBufferSize(5000);
+		const timeline: BrowserTransportTimeline = { wsOpens: [] };
+		(window as unknown as BudgetWindow).switchBudgetTransport = timeline;
+		// Construct the native socket unchanged. Register before application
+		// handlers, so this is the actual browser open event (not a CDP event's
+		// later delivery to Bun) in the same clock as ResourceTiming.startTime.
+		window.WebSocket = new Proxy(window.WebSocket, {
+			construct(target, args, newTarget) {
+				const socket = Reflect.construct(target, args, newTarget) as WebSocket;
+				socket.addEventListener(
+					"open",
+					() => {
+						timeline.wsOpens.push({ path: new URL(socket.url).pathname, at: performance.now() });
+					},
+					{ once: true },
+				);
+				return socket;
+			},
+		});
 	}, fixture.token);
 	const reports: unknown[] = [];
 	const budgetFailures: Array<{ phase: string; error: string }> = [];
@@ -275,6 +298,9 @@ test("real Chromium full SPA cold A → sidebar B → warm A has bounded request
 							transferBytes: resource.transferSize,
 						};
 					}),
+			);
+			const nativeTransport = await page.evaluate(
+				() => (window as unknown as BudgetWindow).switchBudgetTransport,
 			);
 			const phaseResources = resourceRows.filter((row) => row.startTime >= resourcePhaseStart);
 			const browserLifetimes = phaseResources.map((row) => ({
@@ -342,11 +368,18 @@ test("real Chromium full SPA cold A → sidebar B → warm A has bounded request
 				if (index === 0) {
 					expect(arrivals.filter((row) => pathOf(row) === "/api/settings/runtime")).toHaveLength(1);
 					const preferences = arrivals.filter((row) => pathOf(row) === "/api/user-preferences/ui");
+					const preferenceResources = phaseResources.filter(
+						(row) => pathOf(row) === "/api/user-preferences/ui",
+					);
 					console.info("switch-budget cold preferences / real WS chronology", {
-						readStartsMs: preferences.map((row) => row.startedAt - startedAt),
-						connectionEdgesMs: wsConnected.map((at) => at - startedAt),
+						browserResources: preferenceResources,
+						nativeWebSocketOpens: nativeTransport.wsOpens,
+						serverArrivalStartsMs: preferences.map((row) => row.startedAt - startedAt),
+						cdpHandshakeDeliveryMs: wsConnected.map((at) => at - startedAt),
 						gapMs:
-							preferences.length === 2 ? preferences[1].startedAt - preferences[0].startedAt : null,
+							preferenceResources.length === 2
+								? preferenceResources[1].startTime - preferenceResources[0].startTime
+								: null,
 						relevantFrames: wsFrames.filter((frame) =>
 							/user_preferences_changed|fast_mode_changed/.test(frame.data),
 						),
@@ -355,9 +388,12 @@ test("real Chromium full SPA cold A → sidebar B → warm A has bounded request
 						// Approved safety exception only: the first HTTP read really
 						// preceded the unique connection edge, then FastMode closes
 						// that HTTP→WS gap. Never forgive arbitrary duplicate reads.
-						expect(wsConnected).toHaveLength(1);
-						expect(preferences[0].startedAt).toBeLessThan(wsConnected[0]);
-						expect(preferences[1].startedAt).toBeGreaterThanOrEqual(wsConnected[0]);
+						expect(nativeTransport.wsOpens).toHaveLength(1);
+						expect(preferenceResources).toHaveLength(2);
+						expect(preferenceResources[0].startTime).toBeLessThan(nativeTransport.wsOpens[0].at);
+						expect(preferenceResources[1].startTime).toBeGreaterThanOrEqual(
+							nativeTransport.wsOpens[0].at,
+						);
 						expect(
 							arrivals.filter(
 								(row) =>
@@ -371,9 +407,13 @@ test("real Chromium full SPA cold A → sidebar B → warm A has bounded request
 				if (index === 0 && panel.length === 2) {
 					// Do not blanket-allow duplicate snapshots: prove the initial read
 					// actually preceded the first real WebSocket connection edge.
-					expect(wsConnected).toHaveLength(1);
-					expect(panel[0].startedAt).toBeLessThan(wsConnected[0]);
-					expect(panel[1].startedAt).toBeGreaterThanOrEqual(wsConnected[0]);
+					const panelResources = phaseResources.filter((row) =>
+						pathOf(row).endsWith("/panel-state"),
+					);
+					expect(nativeTransport.wsOpens).toHaveLength(1);
+					expect(panelResources).toHaveLength(2);
+					expect(panelResources[0].startTime).toBeLessThan(nativeTransport.wsOpens[0].at);
+					expect(panelResources[1].startTime).toBeGreaterThanOrEqual(nativeTransport.wsOpens[0].at);
 				} else expect(panel).toHaveLength(1);
 				expect(
 					arrivals.filter((row) => pathOf(row).endsWith("/ui-summary")).length,
@@ -440,6 +480,9 @@ test("real Chromium full SPA cold A → sidebar B → warm A has bounded request
 			named: { rows: suggestions.items.length, bytes: namedRequests[0].bytes },
 		});
 		expect(wsConnected).toHaveLength(1);
+		expect(
+			await page.evaluate(() => (window as unknown as BudgetWindow).switchBudgetTransport.wsOpens),
+		).toHaveLength(1);
 		for (const id of fixture.ids)
 			expect(
 				wsSent.some((frame) => frame.type === "subscribe" && frame.narratorIds?.includes(id)),
