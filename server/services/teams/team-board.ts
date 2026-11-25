@@ -23,11 +23,12 @@ import {
 	TEAM_BOARD_COLUMN_STATES,
 	TEAM_BOARD_COLUMNS,
 	TEAM_EVENT_DETAIL_PREVIEW_CHARS,
+	TEAM_HELD_WORKTREES_LIMIT,
 	TEAM_PAUSE_LIMIT,
-	TEAM_PERSON_DECISION_EVENT_KINDS,
 	TEAM_QUESTION_OPTIONS_MAX,
-	TEAM_RECENT_DECISIONS_LIMIT,
+	TEAM_RETURN_REASON_MAX_LENGTH,
 	TEAM_RUNNING_AGENTS_LIMIT,
+	TEAM_WORK_RETURNED_EVENT_KIND,
 	type TeamActivityEvent,
 	type TeamActivityPage,
 	type TeamAgentRef,
@@ -39,9 +40,7 @@ import {
 	type TeamMembersResponse,
 	type TeamPageSummary,
 	type TeamPendingApproval,
-	type TeamPersonDecisionEventKind,
 	type TeamQuestionForm,
-	type TeamRecentDecision,
 	type TeamRunningResponse,
 	type TeamWorkerActivity,
 	teamApprovalKind,
@@ -250,6 +249,23 @@ export async function readTeamPageSummary(
 ): Promise<TeamPageSummary> {
 	const { coordinator, access } = await loadTeamForAccess(teamId, principal, "read", projectId);
 	const running = runningTreeSessions(teamId, TEAM_RUNNING_AGENTS_LIMIT);
+	// What each running session (at most the limit) did last, so rows stay live between board
+	// reads: one `(narrator_id, created_at)` probe each.
+	const runningAgents = running.agents.map((agent) =>
+		agent.id === teamId ? agent : { ...agent, activity: workerActivity(agent.id) },
+	);
+	const held = db
+		.select({ id: teamWorkItems.id })
+		.from(teamWorkItems)
+		.where(
+			and(
+				eq(teamWorkItems.teamId, teamId),
+				inArray(teamWorkItems.state, ["merged", "cancelled"]),
+				isNotNull(teamWorkItems.worktreeResourceId),
+			),
+		)
+		.limit(TEAM_HELD_WORKTREES_LIMIT + 1)
+		.all().length;
 	const conversation = db
 		.select({ messageCount: narrators.messageCount, stopReason: narrators.lastStopReason })
 		.from(narrators)
@@ -267,7 +283,7 @@ export async function readTeamPageSummary(
 		teamId,
 		access,
 		coordinatorStatus: coordinator.status,
-		runningAgents: running.agents,
+		runningAgents,
 		runningCount: running.agents.length + (running.more ? 1 : 0),
 		pendingApprovalCount: access === "write" ? pendingCount(teamId) : null,
 		columnCounts: columnCounts(teamId),
@@ -275,6 +291,7 @@ export async function readTeamPageSummary(
 		lastEventAt: lastEvent?.createdAt ?? null,
 		coordinatorMessageCount: conversation?.messageCount ?? 0,
 		coordinatorStopReason: conversation?.stopReason ?? null,
+		heldWorktreeCount: held,
 	};
 }
 
@@ -463,6 +480,7 @@ export async function readTeamActivity(
 			detail: sql<
 				string | null
 			>`case when length(${teamWorkEvents.detailJson}) <= ${TEAM_EVENT_DETAIL_PREVIEW_CHARS} then ${teamWorkEvents.detailJson} end`,
+			...returnedReasonColumns,
 			createdAt: teamWorkEvents.createdAt,
 		})
 		.from(teamWorkEvents)
@@ -491,8 +509,7 @@ export async function readTeamActivity(
 		actorKind: row.actorKind as TeamEventActorKind,
 		actorId: row.actorId,
 		actorName: row.actorId ? (names.get(`${row.actorKind}:${row.actorId}`) ?? null) : null,
-		detail: parseDetail(row.detail),
-		detailOmitted: row.detail === null && row.detailLength !== null,
+		...eventDetail(row),
 		createdAt: row.createdAt,
 	}));
 	const last = page.at(-1);
@@ -500,6 +517,41 @@ export async function readTeamActivity(
 		events,
 		nextCursor: rows.length > options.limit && last ? encodeCursor(last.createdAt, last.id) : null,
 	};
+}
+
+/**
+ * A return's reason and round read on their own (R): a reason with many quotes or newlines can
+ * serialize past {@link TEAM_EVENT_DETAIL_PREVIEW_CHARS}, and a return must never lose its
+ * reason. Bounded to the reason's own limit.
+ */
+export const returnedReasonColumns = {
+	returnReason: sql<
+		string | null
+	>`case when ${teamWorkEvents.kind} = ${TEAM_WORK_RETURNED_EVENT_KIND} then substr(json_extract(${teamWorkEvents.detailJson}, '$.reason'), 1, ${TEAM_RETURN_REASON_MAX_LENGTH}) end`,
+	returnRound: sql<
+		number | null
+	>`case when ${teamWorkEvents.kind} = ${TEAM_WORK_RETURNED_EVENT_KIND} then json_extract(${teamWorkEvents.detailJson}, '$.round') end`,
+};
+
+/** An event's detail as sent: whole when small, else omitted, but a return keeps its reason. */
+export function eventDetail(row: {
+	detail: string | null;
+	detailLength: number | null;
+	returnReason: string | null;
+	returnRound: number | null;
+}): { detail: Record<string, unknown> | null; detailOmitted: boolean } {
+	const detail = parseDetail(row.detail);
+	if (detail || row.detailLength === null) return { detail, detailOmitted: false };
+	if (row.returnReason !== null)
+		return {
+			detail: {
+				reason: row.returnReason,
+				verdict: "blocker",
+				...(typeof row.returnRound === "number" ? { round: row.returnRound } : {}),
+			},
+			detailOmitted: false,
+		};
+	return { detail: null, detailOmitted: true };
 }
 
 function parseDetail(text: string | null): Record<string, unknown> | null {
@@ -628,9 +680,6 @@ export function planTitle(prefix: string | null): string {
 	return line ? clipText(line, TEAM_APPROVAL_PREVIEW_CHARS) : "";
 }
 
-/** Characters of one option title an in-place question carries. */
-const OPTION_CHARS = 80;
-
 /**
  * The in-place answer form of an AskUserQuestion call (R): only when the bounded prefix is the
  * whole input and it asks exactly one question with options; the same normalization as the
@@ -646,12 +695,13 @@ export function questionForm(prefix: string | null): TeamQuestionForm | null {
 	}
 	const questions = coerceAskQuestionShape(parsed.questions);
 	const only = questions.length === 1 ? questions[0] : undefined;
-	if (!only || only.options.length === 0) return null;
+	if (!only || only.options.length === 0 || only.options.length > TEAM_QUESTION_OPTIONS_MAX)
+		return null;
 	return {
 		header: only.header,
-		options: only.options
-			.slice(0, TEAM_QUESTION_OPTIONS_MAX)
-			.map((option) => clipText(option.header, OPTION_CHARS)),
+		// The answer value is the option's whole title: never shortened (the page clips only what
+		// it shows). The prefix this reads is bounded, so the titles are too.
+		options: only.options.map((option) => option.header),
 		multiSelect: only.multiSelect === true,
 	};
 }
@@ -757,67 +807,7 @@ export async function readTeamApprovals(
 		// "More" only when visible calls were cut off; an unfinished scan is said apart.
 		more: rows.length > TEAM_APPROVALS_LIMIT,
 		unscanned: !complete && rows.length <= TEAM_APPROVALS_LIMIT,
-		recent: readRecentDecisions(teamId),
 	};
-}
-
-/** Latest team events looked at for the recent decisions (index range, newest first). */
-const RECENT_DECISION_SCAN = 200;
-
-/**
- * The latest decisions people took on the tree's calls (M1: who approved, denied, answered),
- * newest first, at most {@link TEAM_RECENT_DECISIONS_LIMIT}: among the team's latest
- * {@link RECENT_DECISION_SCAN} events (`(team_id, created_at, id)` index), then their details by
- * primary key and the deciders' names in one `IN` lookup.
- */
-export function readRecentDecisions(teamId: string): TeamRecentDecision[] {
-	const kinds = new Set<string>(TEAM_PERSON_DECISION_EVENT_KINDS);
-	const ids = db
-		.select({ id: teamWorkEvents.id, kind: teamWorkEvents.kind })
-		.from(teamWorkEvents)
-		.where(eq(teamWorkEvents.teamId, teamId))
-		.orderBy(desc(teamWorkEvents.createdAt), desc(teamWorkEvents.id))
-		.limit(RECENT_DECISION_SCAN)
-		.all()
-		.filter((row) => kinds.has(row.kind))
-		.slice(0, TEAM_RECENT_DECISIONS_LIMIT)
-		.map((row) => row.id);
-	if (ids.length === 0) return [];
-	const rows = db
-		.select({
-			id: teamWorkEvents.id,
-			kind: teamWorkEvents.kind,
-			actorKind: teamWorkEvents.actorKind,
-			actorId: teamWorkEvents.actorId,
-			detail: sql<
-				string | null
-			>`case when length(${teamWorkEvents.detailJson}) <= ${TEAM_EVENT_DETAIL_PREVIEW_CHARS} then ${teamWorkEvents.detailJson} end`,
-			createdAt: teamWorkEvents.createdAt,
-		})
-		.from(teamWorkEvents)
-		.where(inArray(teamWorkEvents.id, ids))
-		.all()
-		.sort(
-			(a, b) => b.createdAt.localeCompare(a.createdAt) || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0),
-		);
-	const names = actorNames(rows);
-	return rows.map((row) => {
-		const detail = parseDetail(row.detail) ?? {};
-		const tool = typeof detail.tool === "string" ? detail.tool : "";
-		return {
-			id: row.id,
-			kind: row.kind as TeamPersonDecisionEventKind,
-			actorId: row.actorId,
-			actorName: row.actorId ? (names.get(`${row.actorKind}:${row.actorId}`) ?? null) : null,
-			toolName: tool,
-			approvalKind: teamApprovalKind(tool),
-			agentId: typeof detail.narratorId === "string" ? detail.narratorId : null,
-			agentTitle:
-				typeof detail.agentTitle === "string" && detail.agentTitle ? detail.agentTitle : null,
-			depth: typeof detail.depth === "number" ? detail.depth : 0,
-			createdAt: row.createdAt,
-		};
-	});
 }
 
 // ── Members (M1) ────────────────────────────────────────────────────────────

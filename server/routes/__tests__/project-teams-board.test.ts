@@ -297,7 +297,8 @@ describe("board", () => {
 			cancelled: 1,
 		});
 		expect(summary.runningAgents).toEqual([
-			{ id: workerId, title: "worker one", status: "working" },
+			// What the worker did last (none yet): the rows' "doing now" stays live from here.
+			{ id: workerId, title: "worker one", status: "working", activity: null },
 		]);
 		expect(summary.runningCount).toBe(1);
 		await db.update(narrators).set({ status: "idle" }).where(eq(narrators.id, workerId));

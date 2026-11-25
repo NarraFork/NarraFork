@@ -463,7 +463,8 @@ async function fileDiffOf(
 	// Raw bytes, at most one past the budget: reading stops there and the text is cut off.
 	const result = await spawnGit(
 		cwd,
-		["diff", "--no-renames", "--no-color", "-U3", from, to, "--", path],
+		// `:(literal)`: the path is a file name, never a pattern (`*.txt` is that file only).
+		["diff", "--no-renames", "--no-color", "-U3", from, to, "--", `:(literal)${path}`],
 		config,
 		0,
 		READ_TIMEOUT_MS,

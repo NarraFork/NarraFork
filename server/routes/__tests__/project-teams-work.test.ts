@@ -484,3 +484,117 @@ describe("board and summary", () => {
 		);
 	});
 });
+
+describe("review fixes", () => {
+	test("an in-place question carries each option's whole title; more than six: no form", async () => {
+		const { questionForm } = await import("../../services/teams/team-board");
+		const long = `Use the team's default time zone, ${"x".repeat(120)}`;
+		const form = questionForm(
+			JSON.stringify({
+				questions: [
+					{ question: "Which?", header: "Zone", options: [{ label: long }, { label: "UTC" }] },
+				],
+			}),
+		);
+		expect(form?.options).toEqual([long, "UTC"]);
+		const seven = Array.from({ length: 7 }, (_, index) => ({ label: `o${index}` }));
+		expect(
+			questionForm(
+				JSON.stringify({ questions: [{ question: "Which?", header: "H", options: seven }] }),
+			),
+		).toBeNull();
+	});
+
+	test("a long return reason full of quotes and newlines stays readable everywhere", async () => {
+		resetWorkStatCacheForTests();
+		const { item } = await readyItem("Quoted reason", { "src/q.ts": "q\n" });
+		const reason = `"\n`.repeat(999).trim().padEnd(2000, '"');
+		const returned = await call(MEMBER, teamPath(`work/${item.id}/return`), {
+			method: "POST",
+			body: { reason },
+		});
+		expect(returned.status).toBe(200);
+		const detail = await call(READER, teamPath(`work/${item.id}`));
+		expect(detail.body.reviews.at(-1)).toMatchObject({ by: "person", round: 2, reason });
+		const returnedEvent = detail.body.events.find(
+			(event: { kind: string }) => event.kind === "work.returned",
+		);
+		expect(returnedEvent).toMatchObject({ detailOmitted: false, detail: { reason } });
+		const activity = await call(READER, teamPath("events"));
+		const listed = activity.body.events.find(
+			(event: { kind: string; workItemId: string }) =>
+				event.kind === "work.returned" && event.workItemId === item.id,
+		);
+		expect(listed).toMatchObject({ detailOmitted: false, detail: { reason } });
+	});
+
+	test("a diff path is literal: *.txt is that file only; files past the first 300 still open", async () => {
+		resetWorkStatCacheForTests();
+		const item = await newItem("Many files");
+		const files: Record<string, string> = { "*.txt": "star\n", "a.txt": "plain\n" };
+		for (let index = 0; index < 305; index++)
+			files[`many/f-${String(index).padStart(3, "0")}.txt`] = `${index}\n`;
+		commitIn(work.worktreePathOf(item) ?? "", files, "many");
+		const detail = await call(OWNER, teamPath(`work/${item.id}`));
+		expect(detail.body.files).toHaveLength(300);
+		expect(detail.body.filesMore).toBe(true);
+		expect(detail.body.stat).toMatchObject({ files: 307 });
+		const star = await call(
+			OWNER,
+			teamPath(`work/${item.id}/diff?path=${encodeURIComponent("*.txt")}`),
+		);
+		expect(star.status).toBe(200);
+		expect(star.body.text).toContain("+star");
+		expect(star.body.text).not.toContain("+plain");
+		const late = await call(OWNER, teamPath("work/" + item.id + "/diff?path=many/f-304.txt"));
+		expect(late.status).toBe(200);
+		expect(late.body.text).toContain("+304");
+		expect((await call(OWNER, teamPath(`work/${item.id}/diff?path=many/*.txt`))).status).toBe(404);
+	});
+
+	test("the summary carries running workers' latest activity and held worktrees", async () => {
+		const item = await newItem("Live activity");
+		const live = await narratorService.create({ title: "live worker", cwd: repo });
+		await db
+			.update(narrators)
+			.set({
+				type: "subagent",
+				aclRootNarratorId: teamId,
+				parentNarratorId: teamId,
+				status: "working",
+			})
+			.where(eq(narrators.id, live.id));
+		work.attachWorker(teamId, item.id, live.id, { kind: "agent", id: teamId });
+		const messageId = generateId();
+		const at = new Date(Date.now() + 240_000).toISOString();
+		await db.insert(narratorMessages).values({
+			id: messageId,
+			narratorId: live.id,
+			role: "assistant",
+			contentJson: [],
+			createdAt: at,
+		});
+		await db.insert(narratorToolCalls).values({
+			id: generateId(),
+			narratorId: live.id,
+			messageId,
+			toolUseId: `use-${messageId}`,
+			toolName: "AskUserQuestion",
+			status: "pending",
+			inputJson: { questions: [{ question: "Ship today?", header: "When", options: [] }] },
+			createdAt: at,
+		});
+		const summary = await call(READER, teamPath("summary"));
+		const agent = summary.body.runningAgents.find((entry: { id: string }) => entry.id === live.id);
+		expect(agent.activity).toMatchObject({ toolName: "AskUserQuestion", preview: "Ship today?" });
+		await db.update(narrators).set({ status: "idle" }).where(eq(narrators.id, live.id));
+		// A cancelled item keeps its worktree until cleanup: counted.
+		const before = summary.body.heldWorktreeCount;
+		work.cancelWorkItem({
+			coordinatorId: teamId,
+			itemId: item.id,
+			actor: { kind: "agent", id: teamId },
+		});
+		expect((await call(READER, teamPath("summary"))).body.heldWorktreeCount).toBe(before + 1);
+	});
+});

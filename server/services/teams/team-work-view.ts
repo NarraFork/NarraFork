@@ -25,6 +25,7 @@ import {
 	type TeamEventActorKind,
 	type TeamReviewVerdict,
 	type TeamWorkDiffStat,
+	type TeamWorkFileChange,
 	type TeamWorkFileDiff,
 	type TeamWorkItemDetail,
 	type TeamWorkReturnResponse,
@@ -34,12 +35,12 @@ import {
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { db } from "../../db";
 import { narrators, teamWorkEvents, teamWorkItems, users } from "../../db/schema";
-import { NotFoundError, ValidationError } from "../../lib/errors";
+import { GitError, NotFoundError, ValidationError } from "../../lib/errors";
 import { getUserLanguage } from "../../lib/i18n";
 import { logger } from "../../lib/logger";
 import type { NarratorPrincipal } from "../narrator-acl";
-import { readBoardItem } from "./team-board";
-import { type BranchNumstat, teamGit } from "./team-git";
+import { eventDetail, readBoardItem, returnedReasonColumns } from "./team-board";
+import { teamGit } from "./team-git";
 import { loadTeamForAccess } from "./team-service";
 import { diffStatOf, returnWorkItem, worktreePathOf } from "./work-items";
 
@@ -102,8 +103,12 @@ async function diffTarget(
 
 /** How long a size is reused before git is asked again. */
 const STAT_TTL_MS = 20_000;
-/** Most sizes kept (oldest dropped first). */
-const STAT_CACHE_MAX = 500;
+/**
+ * Most sizes kept (oldest dropped first). Each keeps its totals and at most
+ * {@link TEAM_WORK_FILES_LIMIT} files (what the drawer lists), never the whole listing: at
+ * most 200 × 300 short records.
+ */
+const STAT_CACHE_MAX = 200;
 /** Sizes read at once by one request. */
 const STAT_CONCURRENCY = 4;
 
@@ -112,7 +117,10 @@ interface CachedStat {
 	/** The item's `updated_at` when read: any change of the item reads again. */
 	version: string;
 	value: TeamWorkDiffStat | null;
-	numstat: BranchNumstat | null;
+	/** The first {@link TEAM_WORK_FILES_LIMIT} files of the listing. */
+	files: TeamWorkFileChange[];
+	/** The listing had more files than kept, or was cut at its byte cap. */
+	filesMore: boolean;
 	target: DiffTarget | null;
 }
 
@@ -139,7 +147,10 @@ async function readStat(
 			at: now,
 			version: item.updatedAt,
 			value: numstat ? diffStatOf(numstat) : null,
-			numstat,
+			files: numstat ? numstat.files.slice(0, TEAM_WORK_FILES_LIMIT) : [],
+			filesMore: numstat
+				? numstat.files.length > TEAM_WORK_FILES_LIMIT || numstat.truncated
+				: false,
 			target,
 		};
 	} catch (error) {
@@ -147,7 +158,14 @@ async function readStat(
 			workItemId: item.id,
 			error: error instanceof Error ? error.message : String(error),
 		});
-		entry = { at: now, version: item.updatedAt, value: null, numstat: null, target: null };
+		entry = {
+			at: now,
+			version: item.updatedAt,
+			value: null,
+			files: [],
+			filesMore: false,
+			target: null,
+		};
 	}
 	statCache.delete(item.id);
 	statCache.set(item.id, entry);
@@ -233,18 +251,6 @@ function requireItem(teamId: string, itemId: string): WorkItemRow {
 	return row;
 }
 
-function parseDetail(text: string | null): Record<string, unknown> | null {
-	if (text === null) return null;
-	try {
-		const value = JSON.parse(text) as unknown;
-		return value && typeof value === "object" && !Array.isArray(value)
-			? (value as Record<string, unknown>)
-			: null;
-	} catch {
-		return null;
-	}
-}
-
 const num = (value: unknown): number | null =>
 	typeof value === "number" && Number.isFinite(value) ? value : null;
 
@@ -260,6 +266,7 @@ function itemEvents(itemId: string): { events: TeamActivityEvent[]; more: boolea
 			detail: sql<
 				string | null
 			>`case when length(${teamWorkEvents.detailJson}) <= ${TEAM_EVENT_DETAIL_PREVIEW_CHARS} then ${teamWorkEvents.detailJson} end`,
+			...returnedReasonColumns,
 			createdAt: teamWorkEvents.createdAt,
 		})
 		.from(teamWorkEvents)
@@ -299,8 +306,7 @@ function itemEvents(itemId: string): { events: TeamActivityEvent[]; more: boolea
 			actorKind: row.actorKind as TeamEventActorKind,
 			actorId: row.actorId,
 			actorName: row.actorId ? (names.get(`${row.actorKind}:${row.actorId}`) ?? null) : null,
-			detail: parseDetail(row.detail),
-			detailOmitted: row.detail === null && row.detailLength !== null,
+			...eventDetail(row),
 			createdAt: row.createdAt,
 		})),
 		more: rows.length > TEAM_WORK_EVENTS_LIMIT,
@@ -321,6 +327,7 @@ export function reviewRounds(events: readonly TeamActivityEvent[]): TeamWorkRevi
 			verdict,
 			findings: num(detail.findings),
 			by: event.actorKind,
+			actorId: event.actorId,
 			actorName: event.actorName,
 			reason: event.kind === TEAM_WORK_RETURNED_EVENT_KIND ? reason : null,
 			at: event.createdAt,
@@ -359,14 +366,14 @@ export async function readWorkItemDetail(
 			.catch(() => null);
 	}
 	const { events, more } = itemEvents(itemId);
-	const files = stat.numstat?.files ?? [];
+	const files = stat.files;
 	return {
 		item,
 		base,
 		aheadBy,
 		stat: stat.value,
-		files: files.slice(0, TEAM_WORK_FILES_LIMIT),
-		filesMore: files.length > TEAM_WORK_FILES_LIMIT || (stat.numstat?.truncated ?? false),
+		files,
+		filesMore: stat.filesMore,
 		diffAvailable: stat.target !== null,
 		reviews: reviewRounds(events),
 		events,
@@ -380,8 +387,9 @@ export async function readWorkItemDetail(
 }
 
 /**
- * One changed file's diff for the drawer, cut at {@link TEAM_WORK_DIFF_MAX_BYTES}. Only a path
- * the branch changed is read (it must be in the item's numstat listing).
+ * One changed file's diff for the drawer, cut at {@link TEAM_WORK_DIFF_MAX_BYTES}. The path is
+ * a literal repository-relative path (never a pathspec pattern) and only the branch's own change
+ * is read (merge base → head): a path it did not change has an empty diff and is not found.
  */
 export async function readWorkFileDiff(
 	teamId: string,
@@ -393,15 +401,16 @@ export async function readWorkFileDiff(
 	const { team, coordinator } = await loadTeamForAccess(teamId, principal, "read", projectId);
 	const row = requireItem(teamId, itemId);
 	const stat = await readStat(row, team.baseBranch, await repositoryOf(coordinator.id));
-	if (!stat.target || !stat.numstat?.files.some((file) => file.path === path))
-		throw new NotFoundError("Changed file", path);
+	if (!stat.target) throw new NotFoundError("Changed file", path);
 	const target = stat.target;
-	const diff = await teamGit(target.cwd).fileDiff(
-		target.from,
-		target.to,
-		path,
-		TEAM_WORK_DIFF_MAX_BYTES,
-	);
+	const diff = await teamGit(target.cwd)
+		.fileDiff(target.from, target.to, path, TEAM_WORK_DIFF_MAX_BYTES)
+		.catch((error) => {
+			// A path that is not repository-relative is refused before git runs.
+			if (error instanceof GitError) throw new NotFoundError("Changed file", path);
+			throw error;
+		});
+	if (!diff.text && !diff.truncated) throw new NotFoundError("Changed file", path);
 	return { path, text: diff.text, truncated: diff.truncated };
 }
 

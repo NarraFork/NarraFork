@@ -293,6 +293,11 @@ export interface TeamAgentRef {
 	title: string | null;
 	/** Narrator run status: idle / working / waiting / archived. */
 	status: string;
+	/**
+	 * R: a running worker's newest tool call, in the summary's running list only (at most
+	 * {@link TEAM_RUNNING_AGENTS_LIMIT} probes per summary), so a row's "doing now" stays live.
+	 */
+	activity?: TeamWorkerActivity | null;
 }
 
 /** One card on the board. Never carries the changed paths or other large columns. */
@@ -367,7 +372,11 @@ export function teamApprovalKind(toolName: string): TeamApprovalKind {
 export interface TeamQuestionForm {
 	/** The answers key the session's own form sends (the question's header). */
 	header: string;
-	/** Option titles, at most {@link TEAM_QUESTION_OPTIONS_MAX}. */
+	/**
+	 * The option titles exactly as the session's form sends them (the answer value): never
+	 * shortened here, the page clips only what it displays. At most
+	 * {@link TEAM_QUESTION_OPTIONS_MAX}; a question with more has no in-place form.
+	 */
 	options: string[];
 	multiSelect: boolean;
 }
@@ -417,11 +426,6 @@ export interface TeamApprovalsResponse {
 	 * reflections came first): there may be visible ones it did not reach.
 	 */
 	unscanned: boolean;
-	/**
-	 * M1: the latest decisions people took on the tree's calls (approved, denied, answered),
-	 * newest first, at most {@link TEAM_RECENT_DECISIONS_LIMIT}.
-	 */
-	recent: TeamRecentDecision[];
 }
 
 /** The team page's top bar; small and cheap so the page can poll it. */
@@ -444,7 +448,15 @@ export interface TeamPageSummary {
 	coordinatorMessageCount?: number;
 	/** R: how the coordinator's last turn ended (`user_interrupt`: a person stopped it). */
 	coordinatorStopReason?: string | null;
+	/**
+	 * R: finished (merged / cancelled) items still holding a worktree, counted up to
+	 * {@link TEAM_HELD_WORKTREES_LIMIT} + 1: the team cannot be disbanded until they are cleaned.
+	 */
+	heldWorktreeCount?: number;
 }
+
+/** Finished items holding a worktree the summary counts (one more means "more"). */
+export const TEAM_HELD_WORKTREES_LIMIT = 50;
 
 // ── X: who is changing what across teams, exclusive paths ────────────────────
 
@@ -629,26 +641,6 @@ export const TEAM_PERSON_DECISION_EVENT_KINDS = [
 ] as const;
 export type TeamPersonDecisionEventKind = (typeof TEAM_PERSON_DECISION_EVENT_KINDS)[number];
 
-/** Most recent decisions the approvals drawer lists. */
-export const TEAM_RECENT_DECISIONS_LIMIT = 10;
-
-/** A decision a person took on a call of the team tree, for the approvals drawer. */
-export interface TeamRecentDecision {
-	/** The team event id. */
-	id: string;
-	kind: TeamPersonDecisionEventKind;
-	/** The person who decided, and their username when still known. */
-	actorId: string | null;
-	actorName: string | null;
-	toolName: string;
-	approvalKind: TeamApprovalKind;
-	/** The session the call belonged to, and its level (0 coordinator, 1 worker, 2 helper). */
-	agentId: string | null;
-	agentTitle: string | null;
-	depth: number;
-	createdAt: string;
-}
-
 // ── R: the team page redesign (work list, drawer, return with a reason) ─────────────────────
 
 /**
@@ -714,6 +706,8 @@ export const TEAM_RETURN_REASON_MAX_LENGTH = 2000;
 export interface TeamWorkReviewRound {
 	eventId: string;
 	round: number;
+	/** The person's user id, or the agent's session id (the coordinator for agents' rounds). */
+	actorId: string | null;
 	verdict: TeamReviewVerdict;
 	findings: number | null;
 	/** `person`: returned by a person, with their reason. */
