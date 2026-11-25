@@ -6,6 +6,7 @@ import type {
 	PersistedRecentTab,
 	RecentTabFolderColor,
 	RecentTabFolderIcon,
+	RecentTabStateResult,
 	RecentTabsMutationResult,
 	RecentTabsPageResult,
 	RecentTabsRuntimeResult,
@@ -106,6 +107,8 @@ export interface RecentTabsPageResponse {
 export type RecentTabsMutationResponse = RecentTabsMutationResult;
 export type RecentTabUpsertInput = PersistedRecentTab & {
 	updateOnly?: boolean;
+	/** Pin (or unpin) in the same revision as the upsert; omitted keeps the stored pin. */
+	pin?: boolean;
 	/**
 	 * Place the tab relative to an existing one in the SAME revision that creates it.
 	 * Mutually exclusive. Only the single-tab endpoint is used with these; the batch
@@ -651,6 +654,12 @@ export const settingsApi = {
 			body: JSON.stringify({ key, ...target }),
 			signal,
 		}),
+	/** Whether one tab is in the sidebar and pinned, wherever it sits in the list. */
+	getRecentTabState: (type: "project" | "team", id: string, signal?: AbortSignal) =>
+		request<RecentTabStateResult>(
+			`/user-preferences/recent-tabs/state?${new URLSearchParams({ type, id }).toString()}`,
+			signal ? { signal } : undefined,
+		),
 	pinRecentTab: (key: string, pinned: boolean) =>
 		request<RecentTabsMutationResponse>("/user-preferences/recent-tabs/pin", {
 			method: "PATCH",

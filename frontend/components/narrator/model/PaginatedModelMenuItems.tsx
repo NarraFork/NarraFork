@@ -11,6 +11,7 @@ import {
 	FOLLOW_SUMMARY_MODEL,
 	type ModelOption,
 } from "../../../lib/constants";
+import { followDefaultLabel } from "../../../lib/follow-model-label";
 import type { ModelMenuItems } from "./ModelMenuItems";
 
 export interface PaginatedModelMenuItemsProps
@@ -106,7 +107,7 @@ export function PaginatedModelMenuItems({
 						}
 						onClick={() => select(FOLLOW_DEFAULT_MODEL)}
 					>
-						{t("followDefault", { model: defaultModelValue ?? "" })}
+						{followDefaultLabel(t, defaultModelValue)}
 					</Menu.Item>
 					{onEditDefaultModel && (
 						<Menu.Item onClick={onEditDefaultModel}>{t("setAsDefaultModel")}</Menu.Item>

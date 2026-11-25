@@ -9,6 +9,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod/v4";
+import { initTeamRepo } from "./team-repo.fixture";
 
 const previousHome = process.env.NARRAFORK_HOME;
 const testHome = mkdtempSync(join(tmpdir(), "narrafork-coordinator-limits-"));
@@ -65,7 +66,7 @@ afterAll(() => {
 });
 
 beforeAll(async () => {
-	mkdirSync(repo, { recursive: true });
+	initTeamRepo(repo);
 	const now = new Date().toISOString();
 	await db.insert(users).values({
 		id: OWNER,

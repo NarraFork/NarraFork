@@ -5,6 +5,7 @@ import { useInputMenu } from "../../../hooks/useInputMenu";
 import { useRuntimeModel } from "../../../hooks/useModelCatalog";
 import { useModelRuntimeSettings } from "../../../hooks/useModels";
 import { FOLLOW_DEFAULT_MODEL, type ModelOption } from "../../../lib/constants";
+import { followDefaultLabel } from "../../../lib/follow-model-label";
 import { ModelPriceModal } from "./ModelPriceModal";
 import { MODEL_MENU_POSITIONING } from "./model-menu-selection";
 import { PaginatedModelMenuItems } from "./PaginatedModelMenuItems";
@@ -31,7 +32,7 @@ export function ModelPickerMenu({
 	});
 	const label =
 		value === FOLLOW_DEFAULT_MODEL
-			? t("followDefault", { model: defaultModelValue })
+			? followDefaultLabel(t, defaultModelValue)
 			: value === "__parent__"
 				? t("followParent")
 				: value === "__summary__"

@@ -18,8 +18,8 @@ const targetSelectorFields = {
 	deviceScope: legacyRuleDeviceScopeSchema,
 };
 
-/** Reusable: valid git branch name (no flags, no special chars) */
-export const gitBranchName = z.string().regex(/^[a-zA-Z0-9._\-/]+$/, "Invalid branch name");
+/** Reusable: valid git branch name (no flags, no special chars); shared with the client. */
+export { gitBranchName } from "@shared/project-team-draft";
 
 /** Reusable schema for whitelist directory entries (global / project level). */
 export const whitelistDirEntrySchema = z.object({

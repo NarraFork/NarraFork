@@ -11,8 +11,14 @@
  * functions with `gitService`'s read bounds (60 s, 1 MB).
  *
  * `changedPaths` (X) lists what a branch changed since its merge base with the base: a diff of
- * two commits, which never reads the working tree, the index or a filter.
+ * two commits, which never reads the working tree, the index or a filter. `branchFileChanges`,
+ * `treeEntry`, `treeBlobs` and `readBlob` feed the knowledge check of `work.ready`
+ * (`team-knowledge.ts`): the full, uncollapsed listing with what was added, one path of a commit,
+ * the files (with blob ids and sizes) a commit holds under a directory, and one blob's bytes.
+ * All of them read commits and objects only, never the working tree, and fail rather than return
+ * a partial result. `work.ready` pins one head commit and passes it to every one of them.
  */
+import { stat } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import {
 	TEAM_CHANGED_DIR_SUFFIX,
@@ -41,17 +47,30 @@ import {
 } from "../git-ref-queries";
 
 const READ_TIMEOUT_MS = 60_000;
+/** The work-tree probe answers a dialog's lookup: a stuck filesystem must not hold it a minute. */
+const WORK_TREE_PROBE_TIMEOUT_MS = 10_000;
 const READ_MAX_OUTPUT_BYTES = 1024 * 1024;
 /** Name-only listing cap: well past {@link TEAM_CHANGED_PATHS_MAX} typical paths. */
 const CHANGED_LISTING_MAX_BYTES = 512 * 1024;
 /** Top-level listing cap (one raw record per changed top-level entry). */
 const TOP_LEVEL_LISTING_MAX_BYTES = 256 * 1024;
+/** Full name-status listing cap for the knowledge check: over it, the check fails. */
+const FILE_CHANGES_MAX_BYTES = READ_MAX_OUTPUT_BYTES;
+/** Tree listing cap for the knowledge check: over it, the check fails. */
+const TREE_LISTING_MAX_BYTES = 512 * 1024;
+/** One-path `ls-tree` cap (a single record). */
+const TREE_ENTRY_MAX_BYTES = 16 * 1024;
+/** Stderr kept from a blob read. */
+const BLOB_STDERR_MAX_BYTES = 16 * 1024;
+const SHA = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 
 async function spawnGit(
 	cwd: string,
 	args: readonly string[],
 	config: ReadonlyArray<readonly [string, string]>,
 	maxOutputBytes: number,
+	timeout = READ_TIMEOUT_MS,
+	stdoutStream?: { maxBytes: number; onChunk: (chunk: Uint8Array) => boolean | undefined },
 ) {
 	await ensureConfigOverridesHonored();
 	const result = await safeSpawn({
@@ -68,8 +87,9 @@ async function spawnGit(
 			LC_ALL: "C",
 			...gitConfigEnv(config),
 		},
-		timeout: READ_TIMEOUT_MS,
+		timeout,
 		maxOutputBytes,
+		...(stdoutStream ? { stdoutStream, maxStderrBytes: BLOB_STDERR_MAX_BYTES } : {}),
 		killProcessTree: true,
 	});
 	return {
@@ -90,6 +110,27 @@ export async function configuredPrograms(cwd: string): Promise<GitConfiguredProg
 	return parseProgramConfig(result.stdout);
 }
 
+/**
+ * Whether `dir` is an existing directory inside a local git work tree: what a team needs from its
+ * project's directory (a project may be associated with any existing folder). A bare repository,
+ * a `.git` directory, a missing path, a timeout or any other failure all answer false. Asking
+ * runs no program of the repository's configuration.
+ */
+export async function isGitWorkTree(dir: string): Promise<boolean> {
+	const info = await stat(dir).catch(() => null);
+	if (!info?.isDirectory()) return false;
+	const result = await spawnGit(
+		dir,
+		["rev-parse", "--is-inside-work-tree"],
+		GIT_NO_EXEC_CONFIG,
+		1024,
+		WORK_TREE_PROBE_TIMEOUT_MS,
+	).catch(() => null);
+	return (
+		result !== null && result.exitCode === 0 && !result.truncated && result.stdout.trim() === "true"
+	);
+}
+
 /** What a branch changed since its merge base with the base (committed changes only). */
 export interface ChangedPaths {
 	head: string;
@@ -100,6 +141,34 @@ export interface ChangedPaths {
 	collapsed: boolean;
 }
 
+/** Every file a branch changed since its merge base with the base, uncollapsed. */
+export interface BranchFileChanges {
+	head: string;
+	mergeBase: string;
+	/** Sorted; a rename counts as both paths (`--no-renames`). */
+	changed: string[];
+	/** Sorted; the paths the branch added, the new side of a rename included. */
+	added: string[];
+}
+
+/** One entry of a commit's tree (`ls-tree -l`). */
+export interface TreeEntry {
+	path: string;
+	/** `100644`, `100755`, `120000` (symlink), `040000` (tree), `160000` (submodule). */
+	mode: string;
+	type: string;
+	oid: string;
+	/** Bytes of a blob; null for a tree or a submodule. */
+	size: number | null;
+}
+
+/** A regular file of a commit: blob mode 100644 or 100755 (no symlink, no submodule). */
+export interface TreeBlob {
+	path: string;
+	oid: string;
+	size: number;
+}
+
 /** One worktree's hardened, read-only git: G1's queries. */
 export interface TeamGit {
 	resolveCommit(ref: string): Promise<string | null>;
@@ -107,11 +176,35 @@ export interface TeamGit {
 	countCommitsNotIn(tip: string, reachableFrom: readonly string[]): Promise<number>;
 	uncommittedChanges(): Promise<{ count: number; exact: boolean }>;
 	/**
-	 * Paths changed between the merge base of HEAD and `baseRef`, and HEAD (`diff --name-only
-	 * --no-renames`: a rename counts as both paths). Null when either does not resolve or the
-	 * histories are unrelated.
+	 * Paths changed between the merge base of the head and `baseRef`, and the head (`diff
+	 * --name-only --no-renames`: a rename counts as both paths). The head is `at` (a full commit
+	 * SHA) when given, else HEAD as it is now. Null when either does not resolve or the histories
+	 * are unrelated.
 	 */
-	changedPaths(baseRef: string): Promise<ChangedPaths | null>;
+	changedPaths(baseRef: string, at?: string): Promise<ChangedPaths | null>;
+	/**
+	 * Every path changed between the merge base of `head` (a full commit SHA) and `baseRef`, and
+	 * `head`, with the added ones (`diff --name-status --no-renames`). Null when the base does not
+	 * resolve or the histories are unrelated; throws when git fails or the listing is over its
+	 * byte cap.
+	 */
+	branchFileChanges(baseRef: string, head: string): Promise<BranchFileChanges | null>;
+	/**
+	 * The entry at exactly `path` (repository-relative, no trailing `/`) of a commit, or null
+	 * when the commit has nothing there. Lists one level only, whatever `path` is.
+	 */
+	treeEntry(commit: string, path: string): Promise<TreeEntry | null>;
+	/**
+	 * The regular files (blob modes 100644/100755; no symlink or submodule) a commit holds under
+	 * `dir` (a repository-relative directory ending in `/`), with blob ids and sizes, sorted by
+	 * path. Throws when git fails or the listing is over its byte cap.
+	 */
+	treeBlobs(commit: string, dir: string): Promise<TreeBlob[]>;
+	/**
+	 * The bytes of one blob (`cat-file blob`, no filter or textconv), decoded as UTF-8. `size` is
+	 * the blob's size from a listing: reading stops past it, and any other length throws.
+	 */
+	readBlob(oid: string, size: number): Promise<string>;
 }
 
 const utf8Bytes = (value: string) => Buffer.byteLength(value, "utf8");
@@ -124,8 +217,19 @@ function nulRecords(stdout: string, truncated: boolean): string[] {
 	return records;
 }
 
-async function changedPathsOf(run: GitQueryRunner, baseRef: string): Promise<ChangedPaths | null> {
-	const head = await resolveCommit(run, "HEAD");
+/** `at` (a full commit SHA) when given, else HEAD as it is now. */
+async function headAt(run: GitQueryRunner, at: string | undefined): Promise<string | null> {
+	if (at === undefined) return resolveCommit(run, "HEAD");
+	if (!SHA.test(at)) throw new GitError("Expected a full commit SHA");
+	return at;
+}
+
+async function changedPathsOf(
+	run: GitQueryRunner,
+	baseRef: string,
+	at?: string,
+): Promise<ChangedPaths | null> {
+	const head = await headAt(run, at);
 	const base = await resolveCommit(run, baseRef);
 	if (!head || !base) return null;
 	const fork = await mergeBase(run, head, base);
@@ -167,6 +271,117 @@ async function changedPathsOf(run: GitQueryRunner, baseRef: string): Promise<Cha
 	return { head, mergeBase: fork, paths: collapsed, collapsed: true };
 }
 
+async function branchFileChangesOf(
+	run: GitQueryRunner,
+	baseRef: string,
+	at: string,
+): Promise<BranchFileChanges | null> {
+	const head = await headAt(run, at);
+	const base = await resolveCommit(run, baseRef);
+	if (!head || !base) return null;
+	const fork = await mergeBase(run, head, base);
+	if (!fork) return null;
+	const listing = await run(["diff", "--name-status", "--no-renames", "-z", fork, head], {
+		maxOutputBytes: FILE_CHANGES_MAX_BYTES,
+	});
+	if (listing.exitCode !== 0) throw new GitError("git diff could not list the changed files");
+	if (listing.truncated)
+		throw new GitError("The branch changes more files than the knowledge check reads");
+	// `-z --name-status`: a status record, then its path, each NUL-terminated.
+	const records = nulRecords(listing.stdout, false);
+	const changed = new Set<string>();
+	const added = new Set<string>();
+	for (let index = 0; index + 1 < records.length; index += 2) {
+		const status = records[index] ?? "";
+		const path = records[index + 1] ?? "";
+		if (!status || !path) throw new GitError("git diff returned an unreadable listing");
+		changed.add(path);
+		if (status === "A") added.add(path);
+	}
+	if (records.length % 2 !== 0) throw new GitError("git diff returned an unreadable listing");
+	return { head, mergeBase: fork, changed: [...changed].sort(), added: [...added].sort() };
+}
+
+function assertRelativePath(path: string): void {
+	if (!path || path.startsWith("/") || path.startsWith("-") || path.split("/").includes(".."))
+		throw new GitError("Expected a repository-relative path");
+}
+
+/** `<mode> SP <type> SP <object> SP+ <size> TAB <path>` (`ls-tree -l -z`). */
+function treeEntryOf(record: string): TreeEntry {
+	const tab = record.indexOf("\t");
+	const [mode, type, oid, size, extra] = record.slice(0, Math.max(0, tab)).split(/ +/);
+	if (tab < 0 || !mode || !type || !oid || !size || extra !== undefined || !SHA.test(oid))
+		throw new GitError("git ls-tree returned an unreadable listing");
+	const bytes = size === "-" ? null : Number(size);
+	if (bytes !== null && !(Number.isSafeInteger(bytes) && bytes >= 0))
+		throw new GitError("git ls-tree returned an unreadable listing");
+	return { path: record.slice(tab + 1), mode, type, oid, size: bytes };
+}
+
+const isRegularBlob = (entry: TreeEntry): entry is TreeEntry & { size: number } =>
+	entry.type === "blob" &&
+	(entry.mode === "100644" || entry.mode === "100755") &&
+	entry.size !== null;
+
+async function treeEntryAt(
+	run: GitQueryRunner,
+	commit: string,
+	path: string,
+): Promise<TreeEntry | null> {
+	if (!SHA.test(commit)) throw new GitError("Expected a full commit SHA");
+	assertRelativePath(path);
+	if (path.endsWith("/")) throw new GitError("Expected a path without a trailing /");
+	// Without `-r` a directory is listed as its own entry, never descended into.
+	const listing = await run(["ls-tree", "-l", "-z", "--full-tree", commit, "--", path], {
+		maxOutputBytes: TREE_ENTRY_MAX_BYTES,
+	});
+	if (listing.exitCode !== 0) throw new GitError(`git ls-tree could not read ${path}`);
+	if (listing.truncated) throw new GitError(`git ls-tree listed more than ${path}`);
+	const entries = nulRecords(listing.stdout, false).map(treeEntryOf);
+	return entries.find((entry) => entry.path === path) ?? null;
+}
+
+async function treeBlobsOf(run: GitQueryRunner, commit: string, dir: string): Promise<TreeBlob[]> {
+	if (!SHA.test(commit)) throw new GitError("Expected a full commit SHA");
+	assertRelativePath(dir);
+	if (!dir.endsWith("/")) throw new GitError("Expected a repository-relative directory");
+	const listing = await run(["ls-tree", "-r", "-l", "-z", "--full-tree", commit, "--", dir], {
+		maxOutputBytes: TREE_LISTING_MAX_BYTES,
+	});
+	if (listing.exitCode !== 0) throw new GitError(`git ls-tree could not list ${dir}`);
+	if (listing.truncated) throw new GitError(`${dir} holds more files than the listing reads`);
+	const files: TreeBlob[] = [];
+	for (const record of nulRecords(listing.stdout, false)) {
+		const entry = treeEntryOf(record);
+		if (isRegularBlob(entry)) files.push({ path: entry.path, oid: entry.oid, size: entry.size });
+	}
+	return files.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+}
+
+async function readBlobOf(
+	cwd: string,
+	config: ReadonlyArray<readonly [string, string]>,
+	oid: string,
+	size: number,
+): Promise<string> {
+	if (!SHA.test(oid)) throw new GitError("Expected a full object id");
+	if (!Number.isSafeInteger(size) || size < 0) throw new GitError("Expected a blob size");
+	const chunks: Buffer[] = [];
+	// Raw bytes, at most one past the size: a longer blob is cut off and refused.
+	const result = await spawnGit(cwd, ["cat-file", "blob", oid], config, 0, READ_TIMEOUT_MS, {
+		maxBytes: size + 1,
+		onChunk: (chunk) => {
+			chunks.push(Buffer.from(chunk));
+			return true;
+		},
+	});
+	const bytes = Buffer.concat(chunks);
+	if (result.exitCode !== 0 || result.truncated || bytes.byteLength !== size)
+		throw new GitError(`git cat-file could not read blob ${oid}`);
+	return bytes.toString("utf8");
+}
+
 export function teamGit(cwd: string): TeamGit {
 	let overrides: Promise<Array<readonly [string, string]>> | null = null;
 	const config = () => {
@@ -188,7 +403,11 @@ export function teamGit(cwd: string): TeamGit {
 		isAncestor: (ancestor, descendant) => isAncestor(run, ancestor, descendant),
 		countCommitsNotIn: (tip, reachableFrom) => countCommitsNotIn(run, tip, reachableFrom),
 		uncommittedChanges: () => uncommittedChanges(run),
-		changedPaths: (baseRef) => changedPathsOf(run, baseRef),
+		changedPaths: (baseRef, at) => changedPathsOf(run, baseRef, at),
+		branchFileChanges: (baseRef, head) => branchFileChangesOf(run, baseRef, head),
+		treeEntry: (commit, path) => treeEntryAt(run, commit, path),
+		treeBlobs: (commit, dir) => treeBlobsOf(run, commit, dir),
+		readBlob: async (oid, size) => readBlobOf(cwd, await config(), oid, size),
 	};
 }
 

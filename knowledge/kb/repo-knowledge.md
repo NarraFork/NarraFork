@@ -4,7 +4,9 @@ title: 仓库知识树
 summary: 本目录：放什么、格式、事实来源、何时更新。
 anchors:
   - scripts/knowledge.ts
+  - shared/knowledge-tree.ts
   - tests/scripts/knowledge.test.ts
+  - tests/shared/knowledge-tree.test.ts
   - knowledge/README.md
   - knowledge/index.md
 keywords:
@@ -18,8 +20,9 @@ keywords:
   - stale
   - 覆盖率
   - 改它时
+  - TEAM_WORK_ITEM_KNOWLEDGE_STALE
 status: draft
-verified_at: 2e6441ad0
+verified_at: 0bb5312c7
 ---
 # 仓库知识树
 
@@ -31,20 +34,24 @@ verified_at: 2e6441ad0
 - 结构：目录即层次；有下级的节点是目录加 `index.md`，叶子是单个 `.md`；顶层按主题而非代码目录划分，顶层只由人或整理者调整。
 - 每个文件有 YAML 头：`id`（稳定，移动改名不变，链接用它）、`title`、`summary`、`anchors`、`keywords`、`status`（stub / draft / verified）、`verified_at`。
 - 叶子正文：开头一两句说明，然后「关键规则」「从哪读起」「改它时」「相关」；`index.md` 写这一块的整体构成与配合，并保留下级列表。
-- 锚点：文件、以 `/` 结尾的目录、或 glob；只统计 `server/`、`frontend/`、`shared/` 下的 `.ts/.tsx/.go`，排除测试、`.browser.`、`.fixture.`、fixtures 目录、`.d.ts`、`routeTree.gen.ts`（`scripts/knowledge.ts:SOURCE_ROOTS`、`NOT_SOURCE`）。一个锚点匹配的源文件超过 40 个（`BROAD_ANCHOR_FILES`）时 `check` 报错，且这种锚点不计入覆盖率。
+- 锚点：文件、以 `/` 结尾的目录、或 glob；只统计 `server/`、`frontend/`、`shared/` 下的 `.ts/.tsx/.go`，排除测试、`.browser.`、`.fixture.`、fixtures 目录、`.d.ts`、`routeTree.gen.ts`（`shared/knowledge-tree.ts:SOURCE_ROOTS`、`isSourceFile`）。一个锚点匹配的源文件超过 40 个（`BROAD_ANCHOR_FILES`）时 `check` 报错，且这种锚点不计入覆盖率。
 - 过期按 git 判断：节点文件最后一次提交之后，若有提交改了它的锚点，就是过期（`stale()`），节点与代码在同一提交里一起改则不算；未提交的节点文件（工作区有改动）不参与判断。判断用的是这些提交实际改过的路径（`git log --name-only --no-renames --diff-merges=combined`，合并提交只算合并结果与每个父提交都不同的文件），所以删除文件、改名的旧路径、花括号 glob、以及锚在 `knowledge/` 自身文件上的锚点都会被算到；`affected` 同样不合并改名（`--no-renames`），也不过滤 `knowledge/` 路径；但「没有节点覆盖的改动文件」只列工作区里还存在的文件（改名的旧路径不算缺口）。
 - `find` 的评分：id、title 5 分，keywords 4 分，summary 3 分，anchors 2 分，正文 1 分；单个词按它命中的最强字段计；只有一个含 `/` 或 `.` 的参数时按路径匹配锚点（精确 10、目录前缀 6）。所以 `keywords` 比正文更容易被搜到。
 - `check` 检查：`knowledge/` 下除 README 外每个 `.md` 都必须有节点头部（否则报「no node header」）、头部必填项（id、title、summary、status）、状态取值、id 唯一、锚点必须真实存在、正文里的相对 `.md` 链接、每个目录有 `index.md` 且列出全部下级、锚点不过宽。节点路径一律用正斜杠（`repoPath`），CRLF 换行与 LF 一样解析，所以 Windows 检出结果相同。它不检查 `keywords`、`verified_at` 是否填写，也不检查「改它时」是否存在。
 - 更新：改动合并前跑 `affected`，在同一个 PR 里核对被碰到的节点并更新 `verified_at`；新功能需要新节点就加在最合适的主题下，放不进现有主题则提出来，不随手加顶层。
+- 头部解析、锚点匹配、源文件规则是 `shared/knowledge-tree.ts` 一份实现：`scripts/knowledge.ts` 从它导入（并再导出 `parseNode`、`anchorMatches` 等），服务端团队工作项的 `work.ready` 也用它。
+- 团队工作项在服务端被强制：仓库分支头有 `knowledge/index.md` 时，`work.ready` 拒绝「改了锚定代码却没改节点」或「新增源文件无节点锚定」的分支（409 `TEAM_WORK_ITEM_KNOWLEDGE_STALE`），比较的是合并基 → head 的提交，不看工作区（`knowledgeGaps`，详见 [工作项](../collaboration/teams/work-items.md)）。与 `affected` 的差别：只算已提交的改动；缺口只看新增文件（不看修改）；节点文件本身改了就不算要更新。
 
 ## 从哪读起
 - `knowledge/README.md`：约定全文。
 - `knowledge/index.md`：顶层主题列表。
 - `scripts/knowledge.ts`：`find | affected | stale | coverage | check` 五个子命令；测试在 `tests/scripts/knowledge.test.ts`。
+- `shared/knowledge-tree.ts`：纯规则（`parseNode`、`anchorMatches`、`isSourceFile`、`isNodeFile`、`indexAnchors`、`knowledgeGaps`），不读盘、不跑 git；测试在 `tests/shared/knowledge-tree.test.ts`。
 - 本树当前的顶层目录：agent、automation、collaboration、data、engineering、files、flows、frontend、git、kb、narrator、platform、remote、security（`kb/` 的节点 id 仍以 `knowledge.` 开头）。
 
 ## 改它时
-- 改 `scripts/knowledge.ts` 的解析或判定（头部格式、锚点语法、上限）：同步 `tests/scripts/knowledge.test.ts` 与 `knowledge/README.md` 的约定，并让现有节点仍通过 `bun scripts/knowledge.ts check`。
+- 改解析或判定（头部格式、锚点语法、源文件规则，在 `shared/knowledge-tree.ts`；上限与 git 部分在 `scripts/knowledge.ts`）：同步 `tests/scripts/knowledge.test.ts`、`tests/shared/knowledge-tree.test.ts` 与 `knowledge/README.md` 的约定，并让现有节点仍通过 `bun scripts/knowledge.ts check`。共享规则一改，团队 `work.ready` 的检查也跟着变（`server/services/teams/__tests__/work-item-knowledge.test.ts`）。
+- `shared/knowledge-tree.ts` 用 `Bun.Glob`，只能在 Bun 里跑（服务端与脚本），不能进前端包。
 - 移动或改名节点文件：`id` 不变，同时改父级 `index.md` 里的下级列表行和其他节点的相对链接，否则 `check` 报错。
 - 移动源文件：全仓搜索旧路径，节点锚点指向不存在的路径会让 `check` 失败。
 

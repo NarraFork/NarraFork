@@ -22,6 +22,8 @@ export interface HeaderToolbarProps extends Omit<NarratorToolbarItemProps, "def"
 	onOpenSavedRecordings?: () => void;
 	/** Opens the session's outline space; absent while the outline is switched off. */
 	onOpenOutline?: () => void;
+	/** Opens the "upgrade to a team" dialog; absent when the session cannot become a team. */
+	onUpgradeToTeam?: () => void;
 	onClose?: () => void;
 	/**
 	 * How many surfaced tools fit AFTER the full pretext-measured title reserved
@@ -109,6 +111,7 @@ export const HeaderToolbar = memo(function HeaderToolbar(props: HeaderToolbarPro
 				onOpenCompatibility={props.onOpenCompatibility}
 				onOpenSavedRecordings={props.onOpenSavedRecordings}
 				onOpenOutline={props.onOpenOutline}
+				onUpgradeToTeam={props.onUpgradeToTeam}
 			/>
 			{onClose && controls?.pinAction && (
 				<Box

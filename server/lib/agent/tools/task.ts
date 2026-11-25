@@ -30,7 +30,7 @@ const ISOLATION_DESCRIPTION =
 	"When that run ends with no commit and no uncommitted change, the worktree is removed and the item cancelled; otherwise the item stays in progress. Not combinable with workdir.";
 
 const TITLE_DESCRIPTION =
-	'With isolation "worktree": the work item\'s title (also names its branch). Defaults to description.';
+	"With isolation \"worktree\": the work item's title (also names its branch; a title without English words leaves the branch to description's English words). Defaults to description.";
 
 // Use text import so the bundler inlines the file content at build time
 import baseDescription from "./task.txt" with { type: "text" };
@@ -558,6 +558,8 @@ export const agentTool: ToolDefinition = {
 					const item = await items.createWorkItem({
 						coordinatorId: ctx.narratorId,
 						title,
+						// A title with no ASCII words (a Chinese title) cannot name the branch.
+						branchHint: items.workBranchSlug(title) ? undefined : description,
 						kind: TEAM_ISOLATED_WORK_KIND,
 						actor: { kind: "agent", id: ctx.narratorId },
 						principal: await narratorWorktreePrincipalForTool(ctx),

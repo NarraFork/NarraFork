@@ -14,7 +14,7 @@
 
 import { and, asc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import { activeDatabaseBackend, db } from "../db";
-import { aclGrants, narrators, projects, users } from "../db/schema";
+import { aclGrants, narrators, projects, projectTeams, users } from "../db/schema";
 import { readQuery, readQueryFirst } from "../db/worker-read";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
@@ -637,6 +637,23 @@ async function usersWithTabsInProject(projectId: string): Promise<string[]> {
 	).map((row) => row.id);
 	for (const narratorId of narratorIds) {
 		for (const userId of await getRecentTabUserIds("narrator", narratorId)) found.add(userId);
+	}
+	// Pinned teams of the project: a team tab is not a narrator tab of its coordinator. Teams
+	// are SQLite-only.
+	const teamIds = (
+		activeDatabaseBackend !== "sqlite"
+			? []
+			: await readQuery(
+					db
+						.select({ id: projectTeams.narratorId })
+						.from(projectTeams)
+						.where(eq(projectTeams.projectId, projectId))
+						.limit(TAB_SCAN_ENTITY_LIMIT),
+					{ executionPolicy: "worker-required" },
+				)
+	).map((row) => row.id);
+	for (const teamId of teamIds) {
+		for (const userId of await getRecentTabUserIds("team", teamId)) found.add(userId);
 	}
 
 	return [...found];

@@ -33,6 +33,7 @@ mock.module("../../../server/websocket/narrator-ws", () => ({
 }));
 
 const { userPreferencesRoutes } = await import("../../../server/routes/user-preferences");
+const { buildAppErrorResponse } = await import("../../../server/lib/app-error-response");
 
 const authUser: SessionPayload = {
 	sub: "user-1",
@@ -47,6 +48,7 @@ app.use("*", async (c, next) => {
 	await next();
 });
 app.route("/", userPreferencesRoutes);
+app.onError((err, c) => buildAppErrorResponse(err, c) ?? c.json({ error: String(err) }, 500));
 
 const NOW = "2026-07-19T00:00:00.000Z";
 
@@ -1589,8 +1591,13 @@ describe("recent-tabs route contracts", () => {
 		).toEqual(["narrator:a", "narrator:c", "narrator:b"]);
 	});
 
-	it("supports section pagination and key-relative moves", async () => {
+	it("supports work-list pagination and key-relative moves", async () => {
+		// An unpinned legacy project tab is an old automatic page visit: the migration drops it,
+		// so the list holds the two sessions and the retired `projects` section stays empty.
 		seedPreferences([tab("n-1"), tab("n-2"), tab("p-1", { type: "project" })]);
+		const projects = await requestJson("/recent-tabs?section=projects");
+		expect(projects.status).toBe(200);
+		expect(projects.body).toMatchObject({ items: [], hasMore: false, revision: 0 });
 
 		const first = await requestJson("/recent-tabs?section=work&limit=1");
 		expect(first.status).toBe(200);
@@ -1620,7 +1627,55 @@ describe("recent-tabs route contracts", () => {
 			.from(userRecentTabs)
 			.orderBy(userRecentTabs.sortOrder)
 			.all();
-		expect(stored.map((row) => row.key)).toEqual(["narrator:n-2", "narrator:n-1", "project:p-1"]);
+		expect(stored.map((row) => row.key)).toEqual(["narrator:n-2", "narrator:n-1"]);
+	});
+
+	it("reads one tab's pin state wherever it sits in the list", async () => {
+		// The pinned project sits after more pinned sessions than a page holds.
+		seedPreferences([
+			...Array.from({ length: 55 }, (_, index) => tab(`n-${index}`, { pinned: true })),
+			tab("p-pinned", { type: "project", pinned: true }),
+			tab("n-loose"),
+		]);
+		const firstPage = await requestJson("/recent-tabs?section=work");
+		expect(firstPage.body).toMatchObject({ hasMore: true });
+		expect(
+			(firstPage.body as { items: PersistedRecentTab[] }).items.some(
+				(item) => item.id === "p-pinned",
+			),
+		).toBe(false);
+
+		expect(await requestJson("/recent-tabs/state?type=project&id=p-pinned")).toEqual({
+			status: 200,
+			body: { present: true, pinned: true },
+		});
+		expect(await requestJson("/recent-tabs/state?type=narrator&id=n-loose")).toEqual({
+			status: 200,
+			body: { present: true, pinned: false },
+		});
+		expect(await requestJson("/recent-tabs/state?type=team&id=nowhere")).toEqual({
+			status: 200,
+			body: { present: false, pinned: false },
+		});
+		for (const query of [
+			"type=workspace&id=x",
+			"type=project",
+			`type=project&id=${"x".repeat(51)}`,
+		]) {
+			expect((await requestJson(`/recent-tabs/state?${query}`)).status).toBe(400);
+		}
+	});
+
+	it("answers 409 to a pin the server refuses instead of a silent no-op", async () => {
+		seedPreferences([]);
+		const refused = await requestJson("/recent-tabs", {
+			method: "PUT",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ ...tab("no-such-team", { type: "team" }), pin: true }),
+		});
+		expect(refused.status).toBe(409);
+		expect(refused.body).toMatchObject({ code: "RECENT_TAB_REFUSED" });
+		expect(db.select().from(userRecentTabs).all()).toHaveLength(0);
 	});
 
 	it("keeps GET /user-preferences compatible with at most 20 enriched legacy tabs", async () => {

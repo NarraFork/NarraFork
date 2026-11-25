@@ -531,7 +531,8 @@ export interface ChangedPathsGit {
 	head(): Promise<string | null>;
 	resolve(ref: string): Promise<string | null>;
 	isAncestor(ancestor: string, descendant: string): Promise<boolean>;
-	changed(baseRef: string): Promise<ChangedPaths | null>;
+	/** At `at` (a full commit SHA) when given, else at HEAD as it is now. */
+	changed(baseRef: string, at?: string): Promise<ChangedPaths | null>;
 }
 
 /** Where changed paths come from: the hardened git of `team-git.ts` (tests replace it). */
@@ -543,7 +544,7 @@ const hardenedSource: ChangedPathsSource = (worktree) => {
 		head: () => git.resolveCommit("HEAD"),
 		resolve: (ref) => git.resolveCommit(ref),
 		isAncestor: (ancestor, descendant) => git.isAncestor(ancestor, descendant),
-		changed: (baseRef) => git.changedPaths(baseRef),
+		changed: (baseRef, at) => git.changedPaths(baseRef, at),
 	};
 };
 
@@ -556,12 +557,16 @@ export function setChangedPathsSourceForTests(next: ChangedPathsSource | null): 
 
 const source = () => sourceOverride ?? hardenedSource;
 
-/** Read an item's changed paths now (hardened git). Null when they cannot be read. */
+/**
+ * Read an item's changed paths now (hardened git), at the commit `at` when given (`work.ready`
+ * pins one), else at HEAD. Null when they cannot be read.
+ */
 export async function readChangedPaths(
 	worktree: string,
 	baseRef: string,
+	at?: string,
 ): Promise<ChangedPaths | null> {
-	return source()(worktree).changed(baseRef);
+	return source()(worktree).changed(baseRef, at);
 }
 
 /**

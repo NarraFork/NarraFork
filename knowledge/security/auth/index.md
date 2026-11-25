@@ -48,7 +48,7 @@ keywords:
   - releaseUserForeignKeys
   - 删除用户
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 99e33f8fc
 ---
 # 登录与会话令牌
 
@@ -64,7 +64,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 高风险操作（导出凭据）在以上之外还要 step-up 再验证，见登录方式一节。认证之后的资源授权与操作审批见 [访问控制](../acl.md)、[工具调用审批](../tool-permissions/index.md)。
 
 ## 前端与用户管理
-- 登录成功后 `hooks/useAuth.ts:applySession` 存令牌、清掉上一个账号的偏好缓存、把用户写进查询 `["auth","me"]` 与本地缓存、再切换界面语言；远程构建（`REMOTE_BUILD`）改走 `remote/session` 建立会话。
+- 登录成功后 `hooks/useAuth.ts:applySession` 存令牌、清掉上一个账号的偏好缓存（整个 `["user-preferences"]` 前缀，侧栏标签页与单个标签的置顶状态都在其下，见[最近标签页](../../collaboration/recent-tabs.md)）、把用户写进查询 `["auth","me"]` 与本地缓存、再切换界面语言；远程构建（`REMOTE_BUILD`）改走 `remote/session` 建立会话。
 - `hooks/useCurrentUser.ts` 用 `lib/current-user-cache.ts`（localStorage 键 `narrafork_current_user_v1`，上限 16384 字符）做初值避免闪屏；`/auth/me` 返回 401 时清缓存，401/404 不重试。`hooks/useAuthenticatedSession.ts` 在令牌被清除时触发重定向，供主应用与独立窗口共用。
 - 页面：`routes/login.tsx`、`routes/settings/profile.tsx`（头像经 `AvatarCropModal`、`UserAvatar`、`useAvatarBlobUrl`，后端 `PATCH/DELETE /api/auth/me/avatar`）、`routes/settings/security.tsx`、`routes/settings/authentication.tsx`（细节见 [登录方式](login-methods.md)）。
 - 管理员的用户管理在 `routes/settings/users.tsx`（`/admin/users` 只是跳转到它）与 `components/settings/CreateUserModal.tsx`，新建账号的初始密码可用 `lib/random-password.ts` 生成（`crypto.getRandomValues`、去歧义字符集）。

@@ -51,6 +51,7 @@ anchors:
   - frontend/components/settings/ModelAggregationsSection.tsx
   - frontend/components/settings/ModelsSection.tsx
   - frontend/components/settings/broken-model-selection.ts
+  - frontend/lib/follow-model-label.ts
 keywords:
   - 来源组
   - sourceGroupForConnection
@@ -75,7 +76,7 @@ keywords:
   - auto 参与
   - settings.agent.modelProtocols
 status: draft
-verified_at: 2c639f086aef21d60357f1e002e62767938833e8
+verified_at: 4d59774711a51a9ac966794090c8b3a04d549048
 ---
 # 来源组与模型列表
 
@@ -96,6 +97,7 @@ verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 - `model-sourcing/auto-models.ts:listAutoModels` 为兼容管理接口 `GET /api/model-catalog/auto` 列出 `auto:` 模型及按当前路由顺序排列的来源，最多 500 个逻辑模型。
 - 选择菜单用 `GET /api/model-catalog/options`，只有实际请求才启动单个专用 Worker；`scope=all|auto|concrete`、q 最多 100 字符、limit 默认 40/最大 100、cursor 最多 2KiB，返回 `revision/items/nextCursor/hasMore`。静态索引最多当前与在建两代；来源组只读插件 registry 的小型 owner 投影，不克隆 configSchema。缓存 owner 的 capture 固定数组引用，先 slice 再仅投影 value/label/provider/identity 小字段，逐批最多 128 行/64KiB 且等待 ACK；筛选配置也按相同批预算传输。总输入最多 20,000 模型行/8MiB，队列合计最多 8 请求，构建 10s、查询 2s、含排队冷请求 12s；未就绪、崩溃、预算超限明确可重试错误，无主线程计算兜底。
 - options Worker 自行加载与核对当前 catalog 版本，构建 identity/去重与 modelId→provider 最佳候选反向索引并排序，不调用全量 legacy auto/readAll/card 函数。每个 auto 行仅给 sourceCount；展开用同接口 `sourceModelId` 只处理该模型最多 256 个候选，动态 available/subscription/referencePrice 排序先于分页，不携带账号 label/email。游标绑定 revision/搜索/scope/来源模型及来源排序事实；变化返回 409。settings/plugin/catalog/cache publication 的代际只在需求时检查，关闭菜单不主动扫描或预构建；额度与 availability 不主动重建静态索引。
+- 「跟随默认 / 跟随摘要」选项（`hooks/useModels.ts:useAllModels` 的 `buildFollowOption`）的标签是目标模型的标签，再退到目标值；目标为空（还没配置默认或摘要模型）时显示 `followDefaultUnset` / `followSummaryUnset`（「默认模型（未配置）」），从不显示 `__default__` 这类哨兵值（`lib/follow-model-label.ts`）。Default / Summary / Aggregations 分组标题走 `narrator` 命名空间翻译。状态栏、模型菜单触发器与列表卡片的「默认（模型）」都经 `followDefaultLabel`，未配置时同样显示未配置文案。
 
 ## 从哪读起
 - `server/lib/sourcing/source-groups.ts`、`model-list-readers.ts`、`templates.ts`。

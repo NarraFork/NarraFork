@@ -6,11 +6,12 @@
  * session, with the questions as text.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
 import { AppError } from "../../lib/errors";
+import { initTeamRepo } from "../../services/teams/__tests__/team-repo.fixture";
 
 const previousHome = process.env.NARRAFORK_HOME;
 const testHome = mkdtempSync(join(tmpdir(), "narrafork-team-board-tree-"));
@@ -156,7 +157,7 @@ function seedOldSubagents(templateId: string, count: number, status = "idle") {
 }
 
 beforeAll(async () => {
-	mkdirSync(repo, { recursive: true });
+	initTeamRepo(repo);
 	const now = new Date().toISOString();
 	for (const id of [OWNER, MEMBER, READER, OUTSIDER])
 		await db

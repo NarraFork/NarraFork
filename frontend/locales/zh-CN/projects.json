@@ -158,13 +158,49 @@
 			"namePlaceholder": "例如：发布小组",
 			"nameDescription": "即协调者会话的名称；改会话名就是改团队名。",
 			"nameRequired": "团队需要一个名称",
+			"nameInvalid": "团队名称最多 {{max}} 个字符",
 			"baseBranch": "基线分支",
 			"baseBranchDescription": "工作最终合回的分支。留空使用项目的默认分支。",
+			"baseBranchInvalid": "不是有效的分支名：只能用字母、数字和 . _ - /（不能有空格，不能以 - 或 / 开头，不能含 ..）",
 			"brief": "简报",
 			"briefDescription": "协调者和它派出的每个代理共同遵守的规则（最多 4 KB）。",
+			"briefTooLong": "简报最多 4 KB",
 			"submit": "创建团队",
 			"cancel": "取消",
 			"failed": "无法创建团队"
+		},
+		"upgrade": {
+			"menu": "升级为团队",
+			"title": "把这个会话升级为团队",
+			"intro": "这个会话会成为团队的协调者。对话、工作目录和分享设置都保留；从下一条消息起，它把工作派给代理去做，并在团队页上跟踪。",
+			"submit": "升级为团队",
+			"failed": "无法升级这个会话",
+			"errors": {
+				"TEAM_ALREADY": "这个会话已经是团队协调者。",
+				"TEAM_SESSION_ARCHIVED": "请先取消归档这个会话。",
+				"NARRATOR_EXECUTION_BUSY": "会话正在运行或等待中，等它空闲后再试。",
+				"TEAM_WORKSPACE_UNAVAILABLE": "会话的工作目录不是这个项目在本机上的 Git 检出。",
+				"TEAM_SESSION_OTHER_PROJECT": "这个会话属于另一个项目。",
+				"TEAM_SESSION_KIND_UNSUPPORTED": "这类会话不能成为团队协调者。",
+				"TEAM_NAME_INVALID": "请给团队起一个不超过 120 个字符的名称。",
+				"PROJECT_ARCHIVED": "项目已归档。",
+				"TEAM_PROJECT_NOT_GIT": "项目目录不是本地 Git 工作树。",
+				"TEAM_BASE_BRANCH_UNRESOLVED": "基线分支在项目仓库中找不到对应的提交，请填写已有的分支。",
+				"TEAM_PROJECT_CHANGED": "项目目录或默认分支刚刚被修改，请重试。"
+			}
+		},
+		"disband": {
+			"menu": "解散团队",
+			"title": "解散这个团队？",
+			"confirm": "团队的工作项和动态记录会被删除。协调者的会话和对话会保留，作为普通会话继续；分支不受影响。",
+			"confirmButton": "解散团队",
+			"failed": "无法解散团队",
+			"done": "团队已解散，会话已保留",
+			"errors": {
+				"TEAM_HAS_LIVE_WORK": "团队还有未完成或仍占用 worktree 的工作项。请先完成、取消或清理它们。",
+				"NARRATOR_EXECUTION_BUSY": "协调者正在运行或等待中，等它空闲后再试。",
+				"TEAM_ARCHIVED": "请先取消归档这个团队。"
+			}
 		},
 		"tabs": {
 			"conversation": "对话",
@@ -230,7 +266,7 @@
 			"work_cancelled": "取消工作",
 			"work_cleanup": "清理 worktree",
 			"overrun": "协调者超出建议值",
-			"other": "{{kind}}",
+			"other": "其他团队动态",
 			"approval_allowed": "批准",
 			"approval_denied": "拒绝",
 			"question_answered": "回答了提问",
@@ -238,7 +274,12 @@
 			"question_ignored": "静默关闭了提问",
 			"question_supplemented": "补充了回答",
 			"question_deferred": "选择稍后回答提问",
-			"question_answered_by_ai": "让 AI 回答了提问"
+			"question_answered_by_ai": "让 AI 回答了提问",
+			"work_merged": "已合并",
+			"work_overlap": "改动与其他工作项重叠",
+			"work_exclusive_taken": "占用独占路径",
+			"work_exclusive_refused": "独占路径被拒",
+			"work_exclusive_released": "释放独占路径"
 		},
 		"eventNote": {
 			"text": "{{text}}",
@@ -276,7 +317,8 @@
 			"pauseMore": "已停止 {{stopped}} 个；运行中的会话超过一次能读取的数量，请再暂停一次",
 			"pauseError": "无法读取运行中的会话，没有停止任何会话",
 			"pausedSomeIdle": "已停止 {{stopped}} 个；{{idle}} 个本来已经停了",
-			"members": "团队成员"
+			"members": "团队成员",
+			"archivedHint": "团队已归档：工作项不能再改动，它启动的工作者可能仍在运行。恢复协调者会话即可继续。"
 		},
 		"approvals": {
 			"title": "待批",
@@ -352,5 +394,8 @@
 			"manageExplain": "给某人写权限，他就成为成员；给读权限，他可以旁观。收回权限立即生效。",
 			"onlyOwnerManages": "只有协调者的所有者或管理员可以调整团队里的人。"
 		}
-	}
+	},
+	"skills": "技能",
+	"routines": "例程",
+	"commands": "命令"
 }

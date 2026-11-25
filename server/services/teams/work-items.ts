@@ -52,6 +52,7 @@ import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
 import type { NarratorPrincipal } from "../narrator-acl";
 import { teamGit } from "./team-git";
+import { assertKnowledgeFresh } from "./team-knowledge";
 import {
 	describeHolderFor,
 	exclusiveHits,
@@ -393,21 +394,46 @@ export function listWorkItems(coordinatorId: string): {
 
 // ── Create ──────────────────────────────────────────────────────────────────
 
-/** A branch name for an item: `team/<title slug>-<8 hex of the item id>`. */
-export function workItemBranchName(itemId: string, title: string): string {
-	const slug =
-		title
-			.toLowerCase()
-			.replace(/[^a-z0-9]+/g, "-")
-			.replace(/^-+|-+$/g, "")
-			.slice(0, 40)
-			.replace(/-+$/g, "") || "work";
+/** Longest slug part of a work item branch (before `-<8 hex>`). */
+const WORK_BRANCH_SLUG_MAX = 40;
+
+/**
+ * The ASCII words of `text`, lower-case and joined by `-`, at most 40 characters; "" when it has
+ * none. Accents are dropped (`Résumé` → `resume`) and full-width letters folded (`ＡＰＩ` → `api`);
+ * no other script is transliterated.
+ */
+export function workBranchSlug(text: string): string {
+	return text
+		.normalize("NFKD")
+		.replace(/\p{M}+/gu, "")
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, "-")
+		.replace(/^-+|-+$/g, "")
+		.slice(0, WORK_BRANCH_SLUG_MAX)
+		.replace(/-+$/g, "");
+}
+
+/**
+ * A branch name for an item: `team/<slug>-<8 hex of the item id>`.
+ *
+ * The slug is ASCII on purpose, so the name passes every branch check the app has: the
+ * ASCII-only `gitBranchName` (shared/project-team-draft.ts) that a team's base branch goes
+ * through, the worktree service's ref checks and `git check-ref-format`, and shells and
+ * file systems that handle non-ASCII refs badly. A title in a script without ASCII words (a
+ * Chinese title) has no slug of its own, so the coordinator's `branchHint` — a few English
+ * words it chose — names the branch first; without either the slug is `work`. The hash keeps
+ * names unique whatever the slug.
+ */
+export function workItemBranchName(itemId: string, title: string, branchHint?: string): string {
+	const slug = workBranchSlug(branchHint ?? "") || workBranchSlug(title) || "work";
 	return `team/${slug}-${createHash("sha256").update(itemId).digest("hex").slice(0, 8)}`;
 }
 
 export interface CreateWorkItemInput {
 	coordinatorId: string;
 	title: string;
+	/** A few English words for the branch, when the title has no ASCII words of its own. */
+	branchHint?: string;
 	/** `isolated` for `Agent({ isolation: "worktree" })`; default kind otherwise. */
 	kind?: string;
 	/** Who asked: the coordinator agent (its id) — the person behind its turn is `principal`. */
@@ -430,7 +456,7 @@ export async function createWorkItem(input: CreateWorkItemInput): Promise<WorkIt
 			`A work item title is at most ${TEAM_WORK_TITLE_MAX_LENGTH} characters`,
 		);
 	const id = generateId();
-	const branchName = workItemBranchName(id, title);
+	const branchName = workItemBranchName(id, title, input.branchHint);
 	const kind = input.kind ?? TEAM_DEFAULT_WORK_KIND;
 	const port = await ports();
 	const created = await port.createWorktree({
@@ -633,9 +659,17 @@ function lastReviewedHead(itemId: string): string | null {
 }
 
 /**
- * Mark an item ready: its newest review round is clear and its worktree has no uncommitted
- * change. Commits made after that review do not block (soft, like every coordinator rule) but
- * are counted in the result, so the coordinator sees when it should review again.
+ * Mark an item ready: its newest review round is clear, its worktree has no uncommitted change,
+ * and its branch leaves no knowledge node stale (`team-knowledge.ts`; only in a repository with
+ * `knowledge/index.md`). Commits made after that review do not block (soft, like every
+ * coordinator rule) but are counted in the result, so the coordinator sees when it should review
+ * again.
+ *
+ * One head commit is pinned for the whole of readiness: the knowledge check, the changed paths
+ * and the exclusive paths are all read at it, and it is the head recorded (the evidence a later
+ * automatic merge relies on). The worker may commit meanwhile, so HEAD is read again right before
+ * the synchronous write: when it is no longer the pinned commit, nothing is marked (409
+ * `TEAM_WORK_ITEM_HEAD_MOVED`).
  */
 export async function markReady(input: {
 	coordinatorId: string;
@@ -662,19 +696,36 @@ export async function markReady(input: {
 			409,
 			"TEAM_WORK_ITEM_DIRTY",
 		);
-	const head = await git.resolveCommit("HEAD");
+	// The one commit everything below is read at and the row records.
+	const head = await git.resolveCommit("HEAD").catch(() => null);
+	if (!head)
+		throw new AppError(
+			`The head commit of work item ${item.id} could not be read; nothing was marked. Try work.ready again.`,
+			409,
+			"TEAM_WORK_ITEM_HEAD_UNAVAILABLE",
+		);
+	await assertKnowledgeFresh({
+		itemId: item.id,
+		worktree: path,
+		head,
+		baseRef: item.baseRef ?? team.baseBranch,
+	});
 	const reviewed = lastReviewedHead(item.id);
 	// Commits made after the review, not counting what a base sync brought in from the base.
 	const baseSha = await git.resolveCommit(item.baseRef ?? team.baseBranch).catch(() => null);
 	let commitsSinceReview: number | null = null;
-	if (head && reviewed && head !== reviewed)
+	if (reviewed && head !== reviewed)
 		commitsSinceReview = await git
 			.countCommitsNotIn(head, baseSha ? [reviewed, baseSha] : [reviewed])
 			.catch(() => null);
-	else if (head && reviewed) commitsSinceReview = 0;
-	// X: the paths this item changed, and the project's exclusive lock when they touch it.
+	else if (reviewed) commitsSinceReview = 0;
+	// X: the paths this item changed at the pinned head, and the project's exclusive lock when
+	// they touch it. Paths read at any other commit count as unreadable.
 	const globs = projectExclusivePaths(team.projectId);
-	const changed = await readChangedPaths(path, item.baseRef ?? team.baseBranch).catch(() => null);
+	const read = await readChangedPaths(path, item.baseRef ?? team.baseBranch, head).catch(
+		() => null,
+	);
+	const changed = read?.head === head ? read : null;
 	if (!changed && globs.length > 0)
 		throw new AppError(
 			`The changed paths of work item ${item.id} could not be read, so it is not known whether it touches the project's exclusive paths; try work.ready again`,
@@ -684,6 +735,14 @@ export async function markReady(input: {
 	const hits = changed ? exclusiveHits(changed.paths, globs) : [];
 	const takeLock = hits.length > 0 && item.exclusiveKey === null;
 	if (takeLock) await refuseWhileHeld(team, item, hits, input.actor);
+	// The last await before the write: from here to the end of the transaction nothing yields.
+	const current = await git.resolveCommit("HEAD").catch(() => null);
+	if (current !== head)
+		throw new AppError(
+			`The branch of work item ${item.id} moved while it was checked (head ${head.slice(0, 12)}, now ${current ? current.slice(0, 12) : "unreadable"}); nothing was marked. Call work.ready again so the new head is checked.`,
+			409,
+			"TEAM_WORK_ITEM_HEAD_MOVED",
+		);
 	const now = new Date().toISOString();
 	try {
 		db.transaction((tx) => {
@@ -696,7 +755,7 @@ export async function markReady(input: {
 				item,
 				{
 					state: "ready",
-					...(head ? { headSha: head } : {}),
+					headSha: head,
 					...(takeLock ? { exclusiveKey: TEAM_EXCLUSIVE_LOCK_KEY } : {}),
 				},
 				now,

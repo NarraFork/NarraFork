@@ -640,6 +640,14 @@
 			"prevId": "f040e99e-e551-4687-99f8-ee370353a9c1",
 			"version": "7",
 			"snapshotDigest": "e4f307ddcee16da5f22769fe557dc9b1889f3af55d102e00a52e36d9bebcc5c4"
+		},
+		{
+			"idx": 80,
+			"tag": "0080_recent_tab_team_project",
+			"id": "c07b4921-245c-4e69-b29f-01132e3f6156",
+			"prevId": "c9d8eed4-015f-4e6c-9274-610534f33c08",
+			"version": "7",
+			"snapshotDigest": "8748e2df5e280195b6f16925413c3586a2bc211ff10e4797aff075cf9f80ab87"
 		}
 	]
 }

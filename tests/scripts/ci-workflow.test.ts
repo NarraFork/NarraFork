@@ -4,6 +4,7 @@ import {
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
+	readdirSync,
 	readFileSync,
 	rmSync,
 	statSync,
@@ -205,6 +206,8 @@ describe("generic CI workflow", () => {
 			for (const valueStep of value.steps) {
 				expect(valueStep["continue-on-error"]).toBeUndefined();
 				const isReport = id === "tests" && valueStep.uses === pins.upload;
+				const isFailureSummary =
+					id === "tests" && valueStep.name === "Summarize test shard failure";
 				const isDeclaredRemoteAsset =
 					(id === "build" &&
 						[
@@ -216,9 +219,11 @@ describe("generic CI workflow", () => {
 				expect(valueStep.if).toBe(
 					isReport
 						? expression("always()")
-						: isDeclaredRemoteAsset
-							? expression("hashFiles('shared/remote-access/frontend-capability.json') != ''")
-							: undefined,
+						: isFailureSummary
+							? expression("failure() || cancelled()")
+							: isDeclaredRemoteAsset
+								? expression("hashFiles('shared/remote-access/frontend-capability.json') != ''")
+								: undefined,
 				);
 				if (valueStep.uses) {
 					expect(valueStep.uses).toMatch(/^[\w-]+\/[\w-]+@[a-f0-9]{40}$/);
@@ -639,6 +644,8 @@ describe("generic CI workflow", () => {
 			"artifacts/ci-tests.xml",
 			"artifacts/ci-test-timings.json",
 			"artifacts/native-tests*.log",
+			"artifacts/native-tests*-diagnostics.jsonl",
+			"artifacts/ci-stage*.jsonl",
 		]);
 		// Logs alone satisfy upload-artifact; a separate normal step must require JUnit.
 		expect(report.with?.["if-no-files-found"]).toBe("error");
@@ -646,7 +653,10 @@ describe("generic CI workflow", () => {
 		expect(verify.name).toBe("Verify test report");
 		expect(verify.if).toBeUndefined();
 		expect(job("tests").steps.indexOf(run)).toBeLessThan(job("tests").steps.indexOf(verify));
-		expect(job("tests").steps.indexOf(verify)).toBeLessThan(job("tests").steps.indexOf(report));
+		const summary = step("tests", (value) => value.name === "Summarize test shard failure");
+		expect(summary.if).toBe(expression("failure() || cancelled()"));
+		expect(job("tests").steps.indexOf(verify)).toBeLessThan(job("tests").steps.indexOf(summary));
+		expect(job("tests").steps.indexOf(summary)).toBeLessThan(job("tests").steps.indexOf(report));
 		// Render Actions expressions first: a shell substitution error is not test failure evidence.
 		for (const shard of [1, 2, 3, 4]) {
 			const rendered = (run.run ?? "").replaceAll(expression("matrix.shard"), String(shard));
@@ -727,6 +737,20 @@ function privateRunnerRoot(): string {
 	const root = mkdtempSync(join(tmpdir(), "ci-file-stdio-"));
 	roots.push(root);
 	return root;
+}
+
+const fixtureDiagnostics = { shardIndex: 2, shardTotal: 4, parallel: 2 };
+
+function readDiagnostics(cwd: string, shard = 2) {
+	const raw = readFileSync(
+		join(cwd, `artifacts/native-tests-${shard}-of-4-diagnostics.jsonl`),
+		"utf8",
+	);
+	const records = raw
+		.trimEnd()
+		.split("\n")
+		.map((line) => JSON.parse(line));
+	return { raw, records };
 }
 
 function fixture(source: string, options: Partial<FileStdioOptions> = {}) {
@@ -946,14 +970,20 @@ test("discovered file ${i} has a fresh global", () => {
 			}
 			const original = readFileSync(join(root, CI_TEST_TIMINGS_SOURCE), "utf8");
 			const args = balancedArgs(shard);
-			await prepareNativeTestTimings(args, root);
-			const result = await runWithFileStdio({
-				command: buildNativeTestCommand(args),
-				cwd: root,
-				timeoutMs: 10_000,
-			});
-			expectReleased(result);
-			expect(result.exitCode, readFileSync(result.stderrLog, "utf8")).toBe(0);
+			const result = spawnSync(
+				process.execPath,
+				[join(repository, "scripts/run-ci-tests.ts"), ...args],
+				{
+					cwd: root,
+					timeout: 10_000,
+					encoding: "utf8",
+				},
+			);
+			expect(result.error).toBeUndefined();
+			expect(result.status, result.stderr).toBe(0);
+			const { records } = readDiagnostics(root, shard);
+			expect(records[0]).toMatchObject({ event: "start", shard: `${shard}/4`, parallel: 2 });
+			expect(records.at(-1)).toMatchObject({ event: "exit", exitCode: 0, failure: null });
 			expect(readFileSync(join(root, CI_TEST_TIMINGS_SOURCE), "utf8")).toBe(original);
 			if (existsSync(marker))
 				seen.push(...readFileSync(marker, "utf8").trim().split("\n").map(Number));
@@ -962,6 +992,7 @@ test("discovered file ${i} has a fresh global", () => {
 		expect(seen.sort((a, b) => a - b)).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
 	}, 20_000);
 	test("child fds are real private regular files and raw stdout/stderr plus nonzero exit survive", async () => {
+		const cwd = privateRunnerRoot();
 		const stdoutChunks: Buffer[] = [];
 		const stderrChunks: Buffer[] = [];
 		const result = await fixture(
@@ -972,6 +1003,8 @@ test("discovered file ${i} has a fresh global", () => {
 			writeSync(2, Buffer.from([255, 0, 129, 10]));
 			process.exit(23);`,
 			{
+				cwd,
+				diagnostics: fixtureDiagnostics,
 				onStdout: (chunk) => {
 					stdoutChunks.push(Buffer.from(chunk));
 				},
@@ -991,6 +1024,17 @@ test("discovered file ${i} has a fresh global", () => {
 		expect(Buffer.concat(stdoutChunks)).toEqual(out);
 		expect(Buffer.concat(stderrChunks)).toEqual(err);
 		expect(result.exitCode).toBe(23);
+		const { records } = readDiagnostics(cwd);
+		expect(records.find((record) => record.event === "child-exit")).toMatchObject({
+			exitCode: 23,
+			failure: "nonzero-exit",
+		});
+		expect(records.at(-1)).toMatchObject({
+			event: "exit",
+			exitCode: 23,
+			stdoutBytes: out.length,
+			stderrBytes: err.length,
+		});
 		expect(result.error).toBeUndefined();
 		expect(result.timedOut || result.cancelled || result.outputLimitExceeded).toBe(false);
 		for (const path of [result.stdoutLog, result.stderrLog]) {
@@ -1009,6 +1053,7 @@ test("discovered file ${i} has a fresh global", () => {
 			writeSync(1, Buffer.alloc(196_731, 65)); writeSync(2, Buffer.alloc(131_077, 66));`,
 			{
 				cwd,
+				diagnostics: fixtureDiagnostics,
 				onStdout: (chunk) => {
 					out.push(Buffer.from(chunk));
 				},
@@ -1017,7 +1062,19 @@ test("discovered file ${i} has a fresh global", () => {
 				},
 			},
 		);
-		const second = await fixture('console.log("another run")', { cwd });
+		const firstDiagnostics = readDiagnostics(cwd).raw;
+		const second = await fixture('console.log("another run")', {
+			cwd,
+			diagnostics: fixtureDiagnostics,
+		});
+		expect(readDiagnostics(cwd).raw).toBe(firstDiagnostics);
+		const artifacts = join(cwd, "artifacts");
+		const retryDiagnostics = readdirSync(artifacts).find((name) =>
+			/^native-tests-2-of-4-.+-diagnostics\.jsonl$/.test(name),
+		);
+		expect(retryDiagnostics).toBeDefined();
+		if (retryDiagnostics)
+			expect(statSync(join(artifacts, retryDiagnostics)).mode & 0o777).toBe(0o600);
 		expect(first.exitCode).toBe(0);
 		expect(second.exitCode).toBe(0);
 		expect(first.stdoutLog).not.toBe(second.stdoutLog);
@@ -1032,25 +1089,105 @@ test("discovered file ${i} has a fresh global", () => {
 
 	test("watchdog fails and kills its stubborn leader and owned descendants", async () => {
 		const started = Date.now();
-		const result = await fixture(ownedGroupFixture, { timeoutMs: 500 });
+		const cwd = privateRunnerRoot();
+		const secret = "must-not-leak-private-command-or-stdio";
+		const result = await fixture(
+			`${ownedGroupFixture}\nprocess.env.CI_PRIVATE_FIXTURE = ${JSON.stringify(secret)}; console.error(${JSON.stringify(secret)});`,
+			{
+				cwd,
+				timeoutMs: 600,
+				diagnostics: { ...fixtureDiagnostics, quietMs: 75, heartbeatMs: 100 },
+			},
+		);
 		expect(result.exitCode).not.toBe(0);
 		expect(result.timedOut).toBe(true);
 		expect(result.cancelled).toBe(false);
 		expect(Date.now() - started).toBeLessThan(3_000);
 		expectGroupReleased(result);
+		const { raw, records } = readDiagnostics(cwd);
+		expect(raw).not.toContain(secret);
+		expect(records[0]).toMatchObject({ schemaVersion: 1, event: "start", bunVersion: Bun.version });
+		expect(records.find((record) => record.event === "spawn")).toMatchObject({ pid: result.pid });
+		const quiet = records.find(
+			(record) => record.event === "quiet" && record.lastOutputElapsedMs !== null,
+		);
+		expect(quiet).toMatchObject({
+			stdoutBytes: result.stdoutBytes,
+			stderrBytes: result.stderrBytes,
+		});
+		expect(quiet.elapsedMs - quiet.lastOutputElapsedMs).toBeGreaterThanOrEqual(75);
+		expect(records.find((record) => record.event === "timeout")).toMatchObject({
+			failure: "timeout",
+		});
+		expect(records.at(-1)).toMatchObject({
+			event: "exit",
+			failure: "timeout",
+			exitCode: result.exitCode,
+		});
+		if (process.platform === "linux") {
+			const timeoutSample = records.find(
+				(record) => record.event === "sample" && record.reason === "timeout",
+			);
+			const snapshots = records.filter((record) => record.event === "sample");
+			expect(timeoutSample.resources.hostPressure).toHaveProperty("cpu");
+			expect(timeoutSample.resources.hostPressure).toHaveProperty("memory");
+			expect(timeoutSample.resources.hostPressure).toHaveProperty("io");
+			expect(
+				snapshots.some((sample) =>
+					sample.resources.processes.some((entry: { ppid: number }) => entry.ppid === result.pid),
+				),
+			).toBe(true);
+			for (const sample of snapshots) {
+				expect(sample.resources.processes.length).toBeLessThanOrEqual(24);
+				for (const entry of sample.resources.processes) {
+					expect(entry.pid).not.toBe(process.pid);
+					expect(entry.session).toBe(result.pid);
+				}
+			}
+		}
+	});
+
+	test("regular heartbeat records activity without requiring a quiet interval", async () => {
+		const cwd = privateRunnerRoot();
+		const result = await fixture(
+			`
+			const timer = setInterval(() => { console.log("out"); console.error("err"); }, 15);
+			setTimeout(() => clearInterval(timer), 250);
+		`,
+			{ cwd, diagnostics: { ...fixtureDiagnostics, quietMs: 1_000, heartbeatMs: 75 } },
+		);
+		expect(result.exitCode).toBe(0);
+		const { records } = readDiagnostics(cwd);
+		expect(records.some((record) => record.event === "quiet")).toBe(false);
+		const beat = records.find(
+			(record) => record.event === "heartbeat" && record.stdoutBytes && record.stderrBytes,
+		);
+		expect(beat.lastStdoutElapsedMs).toBeGreaterThanOrEqual(0);
+		expect(beat.lastStderrElapsedMs).toBeGreaterThanOrEqual(0);
 	});
 
 	test("abort after real child startup fails and releases the entire owned group", async () => {
+		const cwd = privateRunnerRoot();
 		const controller = new AbortController();
+		let sawEarlyAbort = false;
 		const result = await fixture(ownedGroupFixture, {
+			cwd,
+			diagnostics: fixtureDiagnostics,
 			signal: controller.signal,
 			onStdout: (chunk) => {
-				if (Buffer.from(chunk).toString().includes("pids:")) controller.abort();
+				if (!Buffer.from(chunk).toString().includes("pids:")) return;
+				controller.abort();
+				const { records } = readDiagnostics(cwd);
+				sawEarlyAbort =
+					records.some((record) => record.event === "abort") &&
+					!records.some((record) => record.event === "exit");
 			},
 		});
 		expect(result.exitCode).not.toBe(0);
 		expect(result.cancelled).toBe(true);
 		expect(result.timedOut).toBe(false);
+		expect(sawEarlyAbort).toBe(true);
+		expect(readDiagnostics(cwd).records.at(-1)).toMatchObject({ event: "exit", failure: "abort" });
 		expectGroupReleased(result);
 	});
 
@@ -1087,10 +1224,15 @@ test("discovered file ${i} has a fresh global", () => {
 			import { writeFileSync, writeSync } from "node:fs";
 			writeFileSync("fixture-data", Buffer.alloc(128 * 1024));
 			setInterval(() => writeSync(2, Buffer.alloc(1024)), 10);`,
-			{ cwd, maxOutputBytes: 4096 },
+			{ cwd, maxOutputBytes: 4096, diagnostics: fixtureDiagnostics },
 		);
 		expect(result.outputLimitExceeded).toBe(true);
 		expect(result.exitCode).not.toBe(0);
+		const { records } = readDiagnostics(cwd);
+		expect(records.find((record) => record.event === "output-limit")).toMatchObject({
+			failure: "output-limit",
+		});
+		expect(records.at(-1)).toMatchObject({ event: "exit", failure: "output-limit" });
 		expect(statSync(join(cwd, "fixture-data")).size).toBe(128 * 1024);
 		expectGroupReleased(result);
 	});
@@ -1120,9 +1262,17 @@ test("discovered file ${i} has a fresh global", () => {
 			command: [join(cwd, "nonexistent-executable")],
 			timeoutMs: 1_000,
 			killGraceMs: 100,
+			diagnostics: fixtureDiagnostics,
 		});
 		expect(missing.exitCode).not.toBe(0);
 		expect(missing.error).toBeDefined();
+		const { raw, records } = readDiagnostics(cwd);
+		expect(raw).not.toContain("nonexistent-executable");
+		expect(records.find((record) => record.event === "error")).toMatchObject({
+			failure: "error",
+			pid: null,
+		});
+		expect(records.at(-1)).toMatchObject({ event: "exit", failure: "error" });
 	});
 
 	test("invalid low-level budgets reject before spawning a real fixture", async () => {

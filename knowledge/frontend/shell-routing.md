@@ -74,7 +74,7 @@ keywords:
   - 设置导航
   - settings-nav
 status: draft
-verified_at: 2c639f086aef21d60357f1e002e62767938833e8
+verified_at: 4d59774711a51a9ac966794090c8b3a04d549048
 ---
 # 应用框架与路由
 
@@ -87,7 +87,8 @@ verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 - 路由文件由 `TanStackRouterVite`（`autoCodeSplitting: true`，`frontend/vite.config.ts`）生成 `routeTree.gen.ts`；该文件不入库，CI 先 `bun run build` 再类型检查。
 - 根路由 `frontend/routes/__root.tsx` 在 `beforeLoad` 里预取当前路径所需的 i18n 命名空间（失败不阻塞），布局为 `AppRootLayout.tsx:RootLayout`。
 - `RootLayout` 分流：独立窗口路径（`/windows/*`）直接 `<Outlet/>`；`/login`、`/oauth/authorize`、公开叙述者分享页、以及未登录访问 `/licenses`、`/changelog` 走无外壳的 `I18nNamespaceGate`；其余路径懒加载 `AuthenticatedLayout`（`AuthenticatedAppLayout.tsx`），外面套 `APP_SHELL_NAMESPACES` 的命名空间门。
-- 侧栏导航项 id 来自 `shared/nav-layout.ts:CUSTOMIZABLE_NAV_IDS`（projects、messages、routines、scheduled-tasks、learn、knowledge、outline），前端 `nav-items.tsx` 用 `Record<CustomizableNavId, …>` 补展示细节，新增 id 漏补会编译失败；服务端校验器也从同一列表派生。用户布局存于 `user_preferences.nav_layout`，`__divider__` 之后的项收进“更多”菜单，未出现在已存布局中的 id 由 `useNavLayout` 自动补入；`outline` 在 `outline.enabled` 关闭时隐藏。
+- 侧栏导航项 id 来自 `shared/nav-layout.ts:CUSTOMIZABLE_NAV_IDS`（projects、messages、routines、scheduled-tasks、learn、knowledge、outline），前端 `nav-items.tsx` 用 `Record<CustomizableNavId, …>` 补展示细节，新增 id 漏补会编译失败；服务端校验器也从同一列表派生。用户布局存于 `user_preferences.nav_layout`，`__divider__` 之后的项收进“更多”菜单，未出现在已存布局中的 id 由 `useNavLayout` 自动补入。
+- 侧栏只扣留本服务器关掉的功能：`hooks/nav-layout.ts:projectNavLayout(entries, hidden)` 过滤 `hidden` 里的 id，目前只有 `outline.enabled` 关闭时的 `outline`（`useNavLayout`）；被扣留的项仍留在已存布局里，用户重排后由 `restoreWithheldNavEntries` 按原下标放回，功能打开时原位出现。`projects`（项目，通往项目页与团队）不扣留；它曾被当作退役画布入口扣留，期间已存布局一直保留它的位置，所以恢复后各人按自己存的位置看到它（`nav-layout.test.ts`）。
 
 - 部署前缀：`lib/base-path.ts:getAppBase` 由 `document.baseURI` 算出挂载根（只取目录部分，解析失败回退 `/`），`apiUrl`/`assetUrl` 据此拼地址，带 `api` 段的路径不会拼成 `/api/api`。`lib/app-path-classify.ts` 单独成模块，是因为 Service Worker 没有 `document`、要共用同一套“哪些相对路径是 API/WS 流量”的判断，两边必须一致（见 [PWA 与远程前端](pwa-remote.md)）。
 - 懒加载与错误隔离：`lib/lazy-with-retry.ts:lazyWithRetry` 只对“动态 import 取模块失败”（`Failed to fetch` 等消息）重试，默认再试 1 次、间隔 250ms，模块求值抛的错不重试；`lib/dom-mutation-guard.ts` 在 import 时给 `Node.prototype.removeChild/insertBefore` 打补丁（父节点不符时 `removeChild` 原样返回、`insertBefore` 退成 `appendChild`），防浏览器翻译插件改乱 DOM 后 React 崩溃；`lib/legacy-browser-polyfills.ts` 给旧 Safari 补内建方法，`lib/legacy-builtins.guard.test.ts` 扫 `frontend/` 与 `shared/`，用了清单里没有 shim 的禁用内建方法（构建目标 `es2020`/`safari14` 只降语法不补运行时）就失败。
@@ -105,6 +106,7 @@ verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 
 ## 改它时
 - 加侧栏导航项：在 `shared/nav-layout.ts:CUSTOMIZABLE_NAV_IDS` 加 id，`nav-items.tsx` 的 `Record<CustomizableNavId, …>` 会在编译期要求补展示项；服务端校验器从同一列表派生，不用另改；`hooks/nav-layout.test.ts` 覆盖合并规则（漏项会静默丢失，所以逻辑拆成纯函数测）。
+- 按服务器开关隐藏一个侧栏项：把它加进 `useNavLayout` 的 `hidden` 集合，不要从布局里删；保存走 `restoreWithheldNavEntries`，否则用户一重排就丢了它的位置。
 - 加页面：新建 `frontend/routes/` 下文件，在 `lib/i18n.ts:getRouteNamespaces` 登记命名空间；`tests/frontend/app-shell-i18n-namespaces.test.ts` 断言登录后路径都含外壳命名空间。`routeTree.gen.ts` 不入库，不要手改。
 - 加设置页：只改 `lib/settings-nav.ts`；需要管理员的同时进 `ADMIN_PATHS`。
 - 往 `App.tsx` 加导出：只能是组件，`lib/app-hmr-boundary.test.ts` 守着；入口副作用放 `main.tsx`，且 polyfill 保持第一个 import。

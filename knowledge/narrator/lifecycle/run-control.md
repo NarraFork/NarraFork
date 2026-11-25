@@ -41,7 +41,7 @@ keywords:
   - archivedWithNarratorId
   - narrator:status_changed
 status: draft
-verified_at: 2c639f086aef21d60357f1e002e62767938833e8
+verified_at: 4d59774711a51a9ac966794090c8b3a04d549048
 ---
 # 运行与停止
 
@@ -51,6 +51,7 @@ verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 - 创建：`narratorService.create` 先 `prepareNarratorCreation` 组装行（校验 handle、项目、工作区、traits，`kind` 为 knowledge/setup/bot 时预装对应工具/提示词），再由 `createPreparedNarratorInTransaction` 在同一事务里同步断言并插入，提交后 `publishNarratorCreated` 做事件副作用（`narrator-service.ts`）。
 - 运行入口 `narrator-session.ts:acceptUserMessage`：先在 `withNarratorStartAdmission`（按叙述者串行）内把输入写进缓冲邮箱 `enqueueBufferedMessage`（满则 `ValidationError("Message queue is full")`）；空闲则 `claimInboxHead` 认领并 `feedMessageUnlocked` 立即起跑，忙则按 `queueMode`（turn / tool / interrupt）排队、软停或紧急插入。
 - `feedMessageUnlocked` 把状态置为 `working`（`updateStatus(..., "working", { setTurnStart })`），`ensureNarrator` 懒创建内存中的 `ActiveNarrator`（`activeNarrators` 表），同一叙述者的重建用 `narratorCreationLocks` 去重。
+- 人点的重试与继续：`retryLastMessage`（历史步骤 `rewindHistoryForRetry`：找人的最后一条消息、删其后的输出但保留宿主写的非回合行，再起循环）与 `continueNarrator`；它们怎么判定目标与末尾输入见[中断与恢复](../recovery.md)。
 - 一轮执行：`runAgentLoop` → `narrator-executor.ts:executeAgentLoop`，它把 `agentLoop` 事件交给 `narrator-event-handler.ts:processEvent` 落库/广播，并把结果归类（上下文超长、可重试错误、余额不足、模型不可用、中断、最大轮数等）返回给 session 层决定重试、压缩或收尾。`executeAgentLoop` 的调用点在 `agent-runtime/orchestrator.ts:runAgentLoopUnlocked`，位于 `while (active.alive && owner.isCurrent())` 循环内（已核对）；子代理是否只跑一次、走不走这条路径：未核实。
 - 运行失败兜底：仍处 working/waiting 的叙述者被置回 `idle` 并带 `substatus: ["error"]`（`reportUnsettledRunLoopError`）。
 - 文本/推理块的落库点是 `block_complete`，不是流式增量：`processEvent` 的 `stream_text` 分支只更新内存快照并广播 `stream_event`；`block_complete` 分支先 `openStep` 保证存在部分消息，再经 `persistContentCheckpoint`（调用 `narratorStore.writeStepItem`）写入 text / reasoning 块。`executeAgentLoop` 里“文本块不在流式期间增量落库、只在内存里等到回合末”的注释已过时，以此为准。
@@ -58,6 +59,7 @@ verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 - 控制：叙述者对另一叙述者的 stop / steer / archive 必须持有目标登记的 controller 授权，且调用方上限允许编排、未到最大委派深度、其执行用户当前对目标有写权限；用户正接管（run hold）时 stop/archive 被拒（`narrator-control.ts:authorizeAgentControl`）。人通过 HTTP 的操作走普通写 ACL，不经此处。
 - 归档：`narrator-archive.ts:transitionNarratorArchiveGroup` 对父会话和满足条件的“顺带提问”子会话（`isAskInPassing`，最多 200 个，超出报错）成组切换 `archived` / `idle`。先做运行时取消（`prepareNarratorArchive`），再在单个事务内改状态，仅提交后才发 `narrator:status_changed` 和 WS `status_change`；归档子会话记 `archivedWithNarratorId`，只有它们会随父会话一起恢复。
 - 所属项目、权限等不在此展开，见各自节点。
+- `TEAM_TRAIT` 定义在无依赖的叶子模块 `shared/team-trait.ts`，`narrator-utils.ts` 与 `shared/project-teams.ts` 都原样转出，`isTeamNarrator` 的判断不变。`narrator-utils.ts` 在 DB 读 worker 的模块图里，不能改从 `shared/project-teams.ts` 导入（`db-worker/__tests__/module-boundary.test.ts` 的白名单只收这个叶子）。
 
 ## 从哪读起
 - `server/services/narrator-service.ts:narratorService`（CRUD 与状态）、`prepareNarratorCreation`。

@@ -158,13 +158,49 @@
 			"namePlaceholder": "e.g. Release crew",
 			"nameDescription": "The name of the coordinator's session; renaming the session renames the team.",
 			"nameRequired": "A team needs a name",
+			"nameInvalid": "A team name is at most {{max}} characters",
 			"baseBranch": "Base branch",
 			"baseBranchDescription": "Where work merges back. Empty uses the project's default branch.",
+			"baseBranchInvalid": "Not a valid branch name: use letters, digits, . _ - / (no spaces, no leading - or /, no ..)",
 			"brief": "Brief",
 			"briefDescription": "Shared rules for the coordinator and every agent it sends (up to 4 KB).",
+			"briefTooLong": "The brief is limited to 4 KB",
 			"submit": "Create team",
 			"cancel": "Cancel",
 			"failed": "Could not create the team"
+		},
+		"upgrade": {
+			"menu": "Upgrade to a team",
+			"title": "Upgrade this session to a team",
+			"intro": "This session becomes the team's coordinator. Its conversation, working directory and sharing are kept; from the next message on it delegates the work to agents and tracks it on the team page.",
+			"submit": "Upgrade to a team",
+			"failed": "Could not upgrade the session",
+			"errors": {
+				"TEAM_ALREADY": "This session is already a team coordinator.",
+				"TEAM_SESSION_ARCHIVED": "Unarchive the session first.",
+				"NARRATOR_EXECUTION_BUSY": "The session is running or waiting. Try again once it is idle.",
+				"TEAM_WORKSPACE_UNAVAILABLE": "The session's working directory is not a local Git checkout of this project.",
+				"TEAM_SESSION_OTHER_PROJECT": "The session belongs to another project.",
+				"TEAM_SESSION_KIND_UNSUPPORTED": "This kind of session cannot become a team coordinator.",
+				"TEAM_NAME_INVALID": "Give the team a name of up to 120 characters.",
+				"PROJECT_ARCHIVED": "The project is archived.",
+				"TEAM_PROJECT_NOT_GIT": "The project's directory is not a local Git work tree.",
+				"TEAM_BASE_BRANCH_UNRESOLVED": "The base branch does not resolve to a commit in the project's repository. Enter an existing branch.",
+				"TEAM_PROJECT_CHANGED": "The project's directory or default branch changed meanwhile. Try again."
+			}
+		},
+		"disband": {
+			"menu": "Disband team",
+			"title": "Disband this team?",
+			"confirm": "The team's work items and its activity history are deleted. The coordinator's session and its conversation are kept and continue as an ordinary session; branches are not touched.",
+			"confirmButton": "Disband team",
+			"failed": "Could not disband the team",
+			"done": "Team disbanded; its session is kept",
+			"errors": {
+				"TEAM_HAS_LIVE_WORK": "The team still has unfinished work items or work items holding a worktree. Finish, cancel or clean them up first.",
+				"NARRATOR_EXECUTION_BUSY": "The coordinator is running or waiting. Try again once it is idle.",
+				"TEAM_ARCHIVED": "Unarchive the team first."
+			}
 		},
 		"tabs": {
 			"conversation": "Conversation",
@@ -230,7 +266,7 @@
 			"work_cancelled": "Work cancelled",
 			"work_cleanup": "Worktree cleanup",
 			"overrun": "Coordinator went over a suggested limit",
-			"other": "{{kind}}",
+			"other": "Other team activity",
 			"approval_allowed": "Approved",
 			"approval_denied": "Denied",
 			"question_answered": "Answered a question",
@@ -238,7 +274,12 @@
 			"question_ignored": "Closed a question silently",
 			"question_supplemented": "Followed up on an answer",
 			"question_deferred": "Chose to answer a question later",
-			"question_answered_by_ai": "Had the AI answer a question"
+			"question_answered_by_ai": "Had the AI answer a question",
+			"work_merged": "Merged",
+			"work_overlap": "Changes overlap another item",
+			"work_exclusive_taken": "Took an exclusive path",
+			"work_exclusive_refused": "Exclusive path refused",
+			"work_exclusive_released": "Released an exclusive path"
 		},
 		"eventNote": {
 			"text": "{{text}}",
@@ -276,7 +317,8 @@
 			"pauseMore": "Stopped {{stopped}}; more were running than one pause reads, pause again",
 			"pauseError": "Could not read the running sessions; nothing was stopped",
 			"pausedSomeIdle": "Stopped {{stopped}}; {{idle}} had already stopped",
-			"members": "Team members"
+			"members": "Team members",
+			"archivedHint": "This team is archived: its work items cannot change. Workers it started may still be running. Restore the coordinator's session to continue."
 		},
 		"approvals": {
 			"title": "Pending approvals",
@@ -352,5 +394,8 @@
 			"manageExplain": "Give someone write access to make them a member, read access to let them look on. Removing access takes effect at once.",
 			"onlyOwnerManages": "Only the coordinator's owner or an administrator can change who is in the team."
 		}
-	}
+	},
+	"skills": "Skills",
+	"routines": "Routines",
+	"commands": "Commands"
 }

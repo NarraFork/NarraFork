@@ -364,6 +364,7 @@ export function recentTabWindowHref(tab: {
 	type: string;
 	id: string;
 	narratorId?: string;
+	projectId?: string;
 }): string | null {
 	switch (tab.type) {
 		case "narrator":
@@ -375,6 +376,12 @@ export function recentTabWindowHref(tab: {
 			return assetUrl(`/windows/workspaces/${encodeURIComponent(tab.id)}`);
 		case "project":
 			return assetUrl(`/projects/${encodeURIComponent(tab.id)}`);
+		case "team":
+			return tab.projectId
+				? assetUrl(
+						`/projects/${encodeURIComponent(tab.projectId)}/teams/${encodeURIComponent(tab.id)}`,
+					)
+				: null;
 		default:
 			return null;
 	}
