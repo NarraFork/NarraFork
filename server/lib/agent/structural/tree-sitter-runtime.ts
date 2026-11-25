@@ -2,11 +2,10 @@
  * Shared web-tree-sitter engine bootstrap.
  *
  * The core engine (`tree-sitter.wasm`, 205 KB) stays embedded in the binary —
- * only the per-language grammars are downloaded on demand. Materializing it into
- * a real temp directory is what makes dev and compiled-binary runs take the same
- * path: in a single-executable build the imported asset lives behind a virtual
- * `$bunfs` path that Emscripten's `fs.readFileSync` cannot open, while
- * `require.resolve` may still point at the build machine's `node_modules`.
+ * only the per-language grammars are downloaded on demand. Pass its bytes to
+ * Emscripten directly: its native filesystem reader cannot open compiled `$bunfs`
+ * assets. Avoid materialized temp files, which otherwise leak whenever a worker
+ * retires or is terminated during initialization.
  *
  * This module exists because `Parser.init` is a PROCESS-WIDE singleton with an
  * unguarded initialization check:
@@ -34,7 +33,7 @@ export interface TreeSitterNodeLike {
 }
 
 interface ParserCtor {
-	init(options: { locateFile(): string }): Promise<void>;
+	init(options: { wasmBinary: Uint8Array; locateFile(): string }): Promise<void>;
 	new (): ParserInstance;
 }
 
@@ -85,18 +84,12 @@ async function initRuntime(): Promise<TreeSitterRuntime> {
 	if (!Parser) throw new Error("web-tree-sitter Parser API is unavailable");
 	if (!Language) throw new Error("web-tree-sitter Language API is unavailable");
 
-	const { mkdtempSync, writeFileSync } = await import("node:fs");
-	const { tmpdir } = await import("node:os");
-	const { join } = await import("node:path");
-	const tmpDir = mkdtempSync(join(tmpdir(), "narrafork-wasm-"));
-
 	const coreBuf = await Bun.file(embeddedTreeSitterWasm).arrayBuffer();
-	const corePath = join(tmpDir, "tree-sitter.wasm");
-	writeFileSync(corePath, new Uint8Array(coreBuf));
-
 	await Parser.init({
+		wasmBinary: new Uint8Array(coreBuf),
+		// Emscripten still computes a name, but wasmBinary avoids native FS reads.
 		locateFile() {
-			return corePath;
+			return embeddedTreeSitterWasm;
 		},
 	});
 
