@@ -523,8 +523,8 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 147 tables and 1964 columns", () => {
-		expect(target.tables.length).toBe(147);
+	test("covers 149 tables and 1976 columns", () => {
+		expect(target.tables.length).toBe(149);
 		// 1714 SQLite-derived columns include disk_outcome and the two editor recovery columns,
 		// plus the three PG-only insert_seq identity columns.
 		// The numeric context stats replace the 5-column page cache with pins (3) and stats (4).
@@ -576,7 +576,8 @@ describe("real schema parity", () => {
 		// Watch registrants add background_tasks.principal_json (nullable).
 		// Team tabs in the sidebar add user_recent_tabs.project_id (nullable).
 		// Addressable alias lookup adds narrators.title_slug and narrators.alias_selector (2).
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1964);
+		// Communication inheritance adds 4 node columns and exact contacts add 8 peer columns.
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1976);
 		expect(
 			target.tables
 				.find((table) => table.name === "user_recent_tabs")
@@ -733,6 +734,99 @@ describe("real schema parity", () => {
 				.find((table) => table.name === "narrators")
 				?.columns.map((column) => column.property),
 		).toContain("lastStopReason");
+	});
+
+	test("preserves the addressable alias columns and partial indexes", () => {
+		const narrators = target.tables.find((table) => table.name === "narrators");
+		expect(narrators?.columns).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					property: "titleSlug",
+					name: "title_slug",
+					pgType: "text",
+					notNull: false,
+				}),
+				expect.objectContaining({
+					property: "aliasSelector",
+					name: "alias_selector",
+					pgType: "text",
+					notNull: false,
+				}),
+			]),
+		);
+		expect(narrators?.indexes).toEqual(
+			expect.arrayContaining([
+				{
+					name: "idx_narrators_parent_title_slug",
+					columns: ["parentNarratorId", "titleSlug"],
+					unique: false,
+					predicate: '"parent_narrator_id" IS NOT NULL AND "title_slug" IS NOT NULL',
+				},
+				{
+					name: "idx_narrators_parent_alias_selector",
+					columns: ["parentNarratorId", "aliasSelector"],
+					unique: false,
+					predicate: '"parent_narrator_id" IS NOT NULL AND "alias_selector" IS NOT NULL',
+				},
+				{
+					name: "idx_narrators_addressable_parent_created",
+					columns: ["parentNarratorId", "createdAt", "id"],
+					unique: false,
+					predicate: `"parent_narrator_id" IS NOT NULL AND "status" IN ('idle', 'working', 'waiting')`,
+				},
+			]),
+		);
+		const tasks = target.tables.find((table) => table.name === "background_tasks");
+		expect(tasks?.indexes).toEqual(
+			expect.arrayContaining([
+				{
+					name: "idx_bg_tasks_parent_alias",
+					columns: ["parentNarratorId", "alias", "createdAt"],
+					unique: false,
+					predicate: '"alias" IS NOT NULL',
+				},
+				{
+					name: "idx_bg_tasks_parent_live_alias",
+					columns: ["parentNarratorId", "alias"],
+					unique: false,
+					predicate: `"alias" IS NOT NULL AND "status" IN ('running', 'paused')`,
+				},
+			]),
+		);
+	});
+
+	test("preserves the communication tables, columns, and indexes", () => {
+		const nodes = target.tables.find((table) => table.name === "narrator_communication_nodes");
+		expect(nodes?.columns.map((column) => column.name)).toEqual([
+			"narrator_id",
+			"parent_narrator_id",
+			"original_parent_narrator_id",
+			"version",
+		]);
+		expect(nodes?.indexes).toEqual([
+			{ name: "idx_communication_nodes_parent", columns: ["parentNarratorId"], unique: false },
+			{
+				name: "idx_communication_nodes_original_parent",
+				columns: ["originalParentNarratorId"],
+				unique: false,
+			},
+		]);
+		const peers = target.tables.find((table) => table.name === "narrator_communication_peers");
+		expect(peers?.columns.map((column) => column.name)).toEqual([
+			"id",
+			"endpoint_lo",
+			"endpoint_hi",
+			"created_by",
+			"source",
+			"admission_id",
+			"message_id",
+			"created_at",
+		]);
+		expect(peers?.indexes).toEqual([
+			{ name: "uq_communication_peers_pair", columns: ["endpointLo", "endpointHi"], unique: true },
+			{ name: "idx_communication_peers_hi", columns: ["endpointHi"], unique: false },
+			{ name: "idx_communication_peers_created_by", columns: ["createdBy"], unique: false },
+		]);
 	});
 
 	test("the PG-only insert_seq identity columns are present on exactly the three ordinal tables", () => {

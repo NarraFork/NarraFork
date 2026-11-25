@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { seedCurrentUser } from "@frontend/hooks/useCurrentUser";
 import { ApiError, api } from "@frontend/lib/api";
-import { setToken } from "@frontend/lib/api/client";
+import { confirmAuthUser, setToken } from "@frontend/lib/api/client";
 import type {
 	NarratorPanelStateOptions,
 	NarratorPanelStateResponse,
@@ -192,6 +193,13 @@ const retryTick = () =>
 		await new Promise((resolve) => setTimeout(resolve, 275));
 	});
 
+function bindUser(token: string, id = "u1") {
+	const generation = setToken(token);
+	confirmAuthUser(generation, id);
+	seedCurrentUser(qc, generation, { id });
+	return generation;
+}
+
 beforeEach(async () => {
 	const { window } = parseHTML("<html><body></body></html>");
 	const tokens = new Map<string, string>();
@@ -271,7 +279,11 @@ beforeEach(async () => {
 	qc = new QueryClient({
 		defaultOptions: { queries: { retry: false, staleTime: Infinity, gcTime: Infinity } },
 	});
-	qc.setQueryData(["auth", "me"], { id: "u1" });
+	bindUser("quota-token");
+	const me = spyOn(api, "me").mockImplementation(
+		async () => qc.getQueryData<{ id: string }>(["auth", "me"]) ?? { id: "u1" },
+	);
+	restores.push(() => me.mockRestore());
 	instance = i18next.createInstance();
 	await instance
 		.use(initReactI18next)
@@ -376,9 +388,9 @@ describe("NUG quota identity refresh with the real panel and active query observ
 	function activeOtherIdentity(
 		providerId: string,
 		generation: number | string | undefined,
-		token: string | null,
+		authGeneration: number,
 	) {
-		const key = nugQuotaKey(providerId, generation, token);
+		const key = nugQuotaKey(providerId, generation, authGeneration);
 		const snapshot = quotaResult(Number(generation) || 7).quota;
 		qc.setQueryData(key, snapshot);
 		const result = { key, reads: 0, snapshot };
@@ -413,15 +425,17 @@ describe("NUG quota identity refresh with the real panel and active query observ
 				listener({ narratorId, type: "quota_balance", quotaBalance: `pushed-${index}` });
 	}
 
-	test("a burst refreshes only the active provider+generation+token through its cached-only reader", async () => {
-		setToken("quota-token");
+	test("a burst refreshes only the active provider and auth generation through its cached-only reader", async () => {
+		const oldAuthGeneration = setToken("quota-token");
+		setToken("other-token");
+		const authGeneration = bindUser("quota-token");
 		nugProvider = { id: "nug-current", generation: 7 };
 		const domain = quotaDomainSpies();
 		const others = [
-			activeOtherIdentity("nug-other", 7, "quota-token"),
-			activeOtherIdentity("nug-current", 6, "quota-token"),
-			activeOtherIdentity("nug-current", 7, "other-token"),
-			activeOtherIdentity("nug-current", undefined, "quota-token"),
+			activeOtherIdentity("nug-other", 7, authGeneration),
+			activeOtherIdentity("nug-current", 6, authGeneration),
+			activeOtherIdentity("nug-current", 7, oldAuthGeneration),
+			activeOtherIdentity("nug-current", undefined, authGeneration),
 		];
 		await render();
 		expect(domain.cached).toHaveBeenCalledTimes(1);
@@ -433,7 +447,7 @@ describe("NUG quota identity refresh with the real panel and active query observ
 		expect(domain.cached.mock.calls[0]?.[0]).toBe("nug-current");
 		expect(domain.cached.mock.calls[0]?.[1]).toMatchObject({ expectedGeneration: 7 });
 		expect(invalidate.mock.calls.map((call) => call[0])).toEqual([
-			{ queryKey: nugQuotaKey("nug-current", 7, "quota-token"), exact: true },
+			{ queryKey: nugQuotaKey("nug-current", 7, authGeneration), exact: true },
 		]);
 		for (const other of others) {
 			expect(other.reads).toBe(0);
@@ -506,10 +520,10 @@ describe("NUG quota identity refresh with the real panel and active query observ
 	});
 
 	test("a legacy caller without a provider generation does not add quota reads on a push", async () => {
-		setToken("quota-token");
+		const authGeneration = setToken("quota-token");
 		nugProvider = { id: "nug-current" };
 		const domain = quotaDomainSpies();
-		activeOtherIdentity("nug-current", 7, "quota-token");
+		activeOtherIdentity("nug-current", 7, authGeneration);
 		await render();
 		const initialReads = domain.cached.mock.calls.length;
 		await event({ type: "quota_balance", quotaBalance: "legacy push" });
@@ -931,8 +945,7 @@ describe("mounted panel and real WS hook reconciliation", () => {
 			await render();
 			await event({ type: "permission_resolved", requestId: "p0" });
 			panelSpy.mockResolvedValue(page([]));
-			if (switchKind === "account")
-				await act(async () => qc.setQueryData(["auth", "me"], { id: "u2" }));
+			if (switchKind === "account") await act(async () => bindUser("other-token", "u2"));
 			else {
 				narratorId = "n2";
 				await render();

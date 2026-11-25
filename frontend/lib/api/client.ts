@@ -19,18 +19,6 @@ export function apiBase(): string {
 }
 const TOKEN_KEY = "narrafork_token";
 const MAX_RESPONSE_TEXT_PREVIEW_CHARS = 120_000;
-// Keep the credential that actually went over the wire, not the token at error-reading time.
-const responseTokens = new WeakMap<Response, string | null>();
-
-function getRequestToken(headers: Headers): string | null {
-	return headers.get("Authorization")?.match(/^Bearer\s+(.+)$/i)?.[1] ?? null;
-}
-
-function getResponseToken(response: Response): string | null {
-	// Raw/legacy Responses have no request metadata. Snapshot their current session
-	// before reading the body, which may itself finish after a newer login.
-	return responseTokens.has(response) ? (responseTokens.get(response) ?? null) : getToken();
-}
 
 export class ApiError extends Error {
 	status: number;
@@ -56,8 +44,117 @@ export class ApiError extends Error {
 type TokenChangeListener = (token: string | null) => void;
 const tokenChangeListeners = new Set<TokenChangeListener>();
 
+export interface AuthSnapshot {
+	readonly generation: number;
+	readonly hasToken: boolean;
+	readonly userId: string | null;
+}
+
+const authListeners = new Set<() => void>();
+let authSnapshot: AuthSnapshot = Object.freeze({ generation: 0, hasToken: false, userId: null });
+let observedToken: string | null | undefined;
+let notifiedGeneration = 0;
+let storageWindow: Window | undefined;
+
+function advanceAuthGeneration(token: string | null): void {
+	authSnapshot = Object.freeze({
+		generation: authSnapshot.generation + 1,
+		hasToken: !!token,
+		userId: null,
+	});
+}
+
+function observeToken(token: string | null): void {
+	if (observedToken === token) return;
+	const initialized = observedToken !== undefined;
+	observedToken = token;
+	if (initialized) clearCurrentUserCache();
+	if (initialized || token) advanceAuthGeneration(token);
+	if (!initialized) notifiedGeneration = authSnapshot.generation;
+}
+
+function notifyAuth(): void {
+	for (const listener of authListeners) {
+		try {
+			listener();
+		} catch {
+			// A failing observer must never break authentication itself.
+		}
+	}
+}
+
+export function getAuthSnapshot(): AuthSnapshot {
+	// A storage event is asynchronous. Check the stored value before accepting a
+	// response as current, even if the event from the other tab has not arrived.
+	observeToken(getToken() || null);
+	return authSnapshot;
+}
+
+function getSessionRequestGeneration(token: string | null, headers: Headers): number | undefined {
+	observeToken(token || null);
+	const sent = headers.get("Authorization")?.match(/^Bearer\s+(.+)$/i)?.[1];
+	return token && token === sent ? authSnapshot.generation : undefined;
+}
+
+function publishTokenChange(token: string | null): void {
+	if (notifiedGeneration === authSnapshot.generation) return;
+	notifiedGeneration = authSnapshot.generation;
+	notifyTokenChange(token);
+	notifyAuth();
+}
+
+function onStorage(event: StorageEvent): void {
+	if (event.key !== TOKEN_KEY && event.key !== null) return;
+	try {
+		if (event.storageArea && event.storageArea !== localStorage) return;
+	} catch {
+		return;
+	}
+	const token = getToken() || null;
+	observeToken(token);
+	// Even if another tab has already switched back, a real storage change
+	// breaks the lifetime of the credential used for in-flight requests.
+	if (
+		notifiedGeneration === authSnapshot.generation &&
+		((event.key === TOKEN_KEY && event.oldValue !== event.newValue) ||
+			(event.key === null && event.storageArea && token))
+	) {
+		clearCurrentUserCache();
+		advanceAuthGeneration(token);
+	}
+	publishTokenChange(token);
+}
+
+function listenForStorageChanges(): void {
+	if (typeof window === "undefined" || storageWindow === window) return;
+	storageWindow?.removeEventListener("storage", onStorage);
+	storageWindow = window;
+	storageWindow.addEventListener("storage", onStorage);
+}
+
+export function subscribeAuth(listener: () => void): () => void {
+	listenForStorageChanges();
+	authListeners.add(listener);
+	return () => authListeners.delete(listener);
+}
+
+export function confirmAuthUser(generation: number, userId: string): void {
+	const current = getAuthSnapshot();
+	if (
+		!current.hasToken ||
+		current.generation !== generation ||
+		typeof userId !== "string" ||
+		!userId ||
+		current.userId === userId
+	)
+		return;
+	authSnapshot = Object.freeze({ ...current, userId });
+	notifyAuth();
+}
+
 /** Subscribe to token changes. Returns an unsubscribe function. */
 export function onTokenChange(listener: TokenChangeListener): () => void {
+	listenForStorageChanges();
 	tokenChangeListeners.add(listener);
 	return () => tokenChangeListeners.delete(listener);
 }
@@ -84,20 +181,24 @@ export function getToken(): string | null {
 	}
 }
 
-export function setToken(token: string): void {
+/** Persist a token and return the generation assigned before notifying observers. */
+export function setToken(token: string): number {
 	// Compare first so a no-op write does not announce a change: hydration paths re-assert
 	// the current value, and the bridge would otherwise send a redundant message.
-	const changed = localStorage.getItem(TOKEN_KEY) !== token;
-	if (changed) clearCurrentUserCache();
+	observeToken(localStorage.getItem(TOKEN_KEY) || null);
 	localStorage.setItem(TOKEN_KEY, token);
-	if (changed) notifyTokenChange(token);
+	observeToken(token || null);
+	const generation = authSnapshot.generation;
+	publishTokenChange(token || null);
+	return generation;
 }
 
 export function clearToken(): void {
 	clearCurrentUserCache();
-	const had = localStorage.getItem(TOKEN_KEY) !== null;
+	observeToken(localStorage.getItem(TOKEN_KEY) || null);
 	localStorage.removeItem(TOKEN_KEY);
-	if (had) notifyTokenChange(null);
+	observeToken(null);
+	publishTokenChange(null);
 }
 
 /**
@@ -122,11 +223,7 @@ export function endSession(): Promise<void> {
 		.then(
 			() => {},
 			() => {},
-		)
-		.finally(() => {
-			// A newer login may have arrived while this older revocation was in flight.
-			if (getToken() === token) clearToken();
-		});
+		);
 }
 
 /**
@@ -167,9 +264,19 @@ export async function authorizedFetch(input: string | URL, init?: RequestInit): 
 	if (token && !headers.has("Authorization")) {
 		headers.set("Authorization", `Bearer ${token}`);
 	}
-	const requestToken = getRequestToken(headers);
+	const sessionGeneration = getSessionRequestGeneration(token, headers);
 	const response = await businessTransport.request(String(input), { ...init, headers });
-	responseTokens.set(response, requestToken);
+	return recordResponseGeneration(response, sessionGeneration);
+}
+
+// Only the original Response proves its request's credential generation. No
+// credentials or tracking properties are added to the returned Response.
+const responseGenerations = new WeakMap<Response, number>();
+
+function recordResponseGeneration(response: Response, generation: number | undefined): Response {
+	if (response.status === 401 && generation !== undefined) {
+		responseGenerations.set(response, generation);
+	}
 	return response;
 }
 
@@ -184,24 +291,27 @@ export async function authorizedFetch(input: string | URL, init?: RequestInit): 
  */
 function clearTokenIfSessionInvalid(
 	data: Record<string, unknown> | null,
-	requestToken: string | null,
+	generation: number | undefined,
 ): void {
-	if (requestToken !== null && isSessionInvalidResponse(data) && getToken() === requestToken) {
-		clearToken();
-	}
+	if (generation === undefined || !isSessionInvalidResponse(data)) return;
+	const current = getAuthSnapshot();
+	if (current.hasToken && generation === current.generation) clearToken();
 }
 
 /**
  * 401 handling for call sites that fetch binary assets (avatars, uploaded
  * images, notification sounds) and discard the error body. They still need the
  * error code to tell a dead session apart from an unrelated authorization
- * failure, so the body is parsed here and thrown away.
+ * failure, so the body is parsed here and thrown away. Raw fetches or rebuilt
+ * responses must supply the generation captured when the request was sent.
  */
-export async function clearTokenOnSessionFailure(response: Response): Promise<void> {
-	if (response.status !== 401) return;
-	const requestToken = getResponseToken(response);
+export async function clearTokenOnSessionFailure(
+	response: Response,
+	generation = responseGenerations.get(response),
+): Promise<void> {
+	if (response.status !== 401 || generation === undefined) return;
 	const data = await readErrorData(response, "Unauthorized").catch(() => null);
-	clearTokenIfSessionInvalid(data, requestToken);
+	clearTokenIfSessionInvalid(data, generation);
 }
 
 function tryParseJson(raw: string): unknown | null {
@@ -336,13 +446,13 @@ async function readErrorData(
 export async function readFetchError(
 	response: Response,
 	fallback = response.statusText || "Request failed",
+	generation = responseGenerations.get(response),
 ): Promise<{ message: string; data: Record<string, unknown> }> {
-	const requestToken = response.status === 401 ? getResponseToken(response) : null;
 	const data = await readErrorData(response, fallback);
 	// The error code lives in the body, so the session verdict has to wait until
 	// the body is parsed rather than branching on the status alone.
 	if (response.status === 401) {
-		clearTokenIfSessionInvalid(data, requestToken);
+		clearTokenIfSessionInvalid(data, generation);
 	}
 	return { message: getErrorMessage(data, fallback), data };
 }
@@ -350,8 +460,9 @@ export async function readFetchError(
 export async function readFetchErrorMessage(
 	response: Response,
 	fallback = response.statusText || "Request failed",
+	generation?: number,
 ): Promise<string> {
-	return (await readFetchError(response, fallback)).message;
+	return (await readFetchError(response, fallback, generation)).message;
 }
 
 export interface RequestOptions {
@@ -393,7 +504,7 @@ export async function request<T>(
 	if (token && !new Headers(headers).has("Authorization")) {
 		headers.Authorization = `Bearer ${token}`;
 	}
-	const requestToken = getRequestToken(new Headers(headers));
+	const generation = getSessionRequestGeneration(token, new Headers(headers));
 	const response = await businessTransport.request(apiUrl(path), { ...fetchOptions, headers });
 	// Apply the same byte budget before parsing either success or error bodies.
 	const boundedText =
@@ -402,7 +513,7 @@ export async function request<T>(
 			: await readBoundedResponseText(response, maxResponseBytes, onResponseBytes);
 	if (response.status === 401) {
 		const error = await readErrorData(response, "Unauthorized", boundedText);
-		clearTokenIfSessionInvalid(error, requestToken);
+		clearTokenIfSessionInvalid(error, generation);
 		throw new ApiError(getErrorMessage(error, "Unauthorized"), 401, error);
 	}
 	if (!response.ok) {
@@ -442,8 +553,10 @@ function postWithProgress(
 	body: Blob | FormData,
 	options?: UploadProgressOptions,
 ): Promise<Response> {
+	const sessionGeneration = getSessionRequestGeneration(getToken(), new Headers(options?.headers));
 	return businessTransport
 		.upload(String(resolveApiInput(url)), body, options)
+		.then((response) => recordResponseGeneration(response, sessionGeneration))
 		.catch((error: unknown) => {
 			if (error instanceof DOMException && error.name === "AbortError") {
 				throw new ApiError("Upload cancelled", 0, { code: "UPLOAD_ABORTED" });

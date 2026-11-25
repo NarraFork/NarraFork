@@ -156,6 +156,7 @@ const entryOwners: Record<(typeof COMPILED_WORKER_ENTRIES)[number], readonly str
 		"lib/browser/memory-job.ts",
 	],
 	"lib/share-preview-worker.ts": ["lib/share-preview-html.ts"],
+	"lib/attachment-digest-worker.ts": ["lib/attachment-digest.ts"],
 	"lib/request-recorder-worker.ts": ["lib/request-recorder.ts"],
 	"lib/startup-status/worker.ts": ["lib/startup-status/index.ts"],
 	"lib/agent/request-json-worker.ts": ["lib/agent/request-json.ts"],

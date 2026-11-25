@@ -1,5 +1,7 @@
 {
 	"title": "设置",
+	"dataImportCommunication": "通讯关系：恢复 {{restored}} 条联系，跳过 {{skipped}} 条，保留 {{preserved}} 个现有通讯节点。",
+	"dataImportCommunicationDetached": "因缺少端点或权限，{{count}} 条通讯父关系已安全拆分。",
 	"remoteAccessSection": "WebRTC 远程访问",
 	"remoteAccess": {
 		"description": "使用匹配版本的托管远程前端，让已配对浏览器直连此实例。配对不能替代管理员登录，业务流量不经信令服务器中继。",

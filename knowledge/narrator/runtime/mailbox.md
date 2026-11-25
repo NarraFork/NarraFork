@@ -13,6 +13,7 @@ anchors:
   - server/services/agent-runtime/limits.ts
   - server/services/agent-runtime/mailbox-shared.ts
   - server/services/agent-runtime/mailbox-types.ts
+  - server/services/agent-runtime/user-submission.ts
   - server/services/agent-runtime/runtime-queue-port.ts
   - server/services/agent-runtime/postgres-runtime-queue.ts
   - server/services/agent-runtime/read-options.ts
@@ -37,7 +38,7 @@ keywords:
   - 收件箱
   - 排队消息
 status: draft
-verified_at: 2e6441ad0
+verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 ---
 # 收件箱与唤醒
 
@@ -69,6 +70,9 @@ verified_at: 2e6441ad0
 - `pending-wake.ts:hasPendingWork`：运行中的 bash/agent 后台任务或未答的异步问题；`hasQueuedWake` 看 user_input/agent_message/task_notice。
 - `async-work.ts`：分离的通信尾部任务集合，失败只置标志与计数；`drainCommunicationWork` 默认 4 秒内排空，否则抛错。
 - 后端选择：`runtime-queue-port.ts` 无绑定即 SQLite；显式 PostgreSQL 而未绑定队列时抛错，绝不回退 SQLite。
+- 新用户发送可带 `clientSubmissionId`，按用户与接收会话作用域进入已有 requestKey 去重。原始请求摘要覆盖正文、结构化引用、控制意图和附件通道/内容摘要，不使用每次生成的 uploadId；同 ID 不同内容返回 `SUBMISSION_CONFLICT`。附件摘要由有界 Worker 计算，已消费的 stage 重试先核对旧 receipt。
+- 只有首次 accepted 的用户入队事务会为不同组的有效 typed 会话引用建立 peer，已同组不建冗余边；202 已是 durable acceptance，不等模型读取。duplicate 返回旧回执，不再 claim、interrupt、wake 或重建已切断的 peer。`GET /narrators/:id/submissions/:clientSubmissionId` 返回当前用户的接受事实和状态；窗口外或结果未知不能后台盲重发。
+- 普通 agent_message 在最终入队事务内复核当前通讯可达性与授权，SQLite 同步事务、PG serializable 整段有界重试。Send、父级特殊通道和 TeamStatus 均受该规则约束；task_notice 的可靠结果交付不因通讯拆组取消，也不会顺便建连。重复工具 receipt 的各条发送通道均不得再次唤醒旧 queued 项。
 
 ## 从哪读起
 - `inbox.ts:wakeInboxIfEligible`、`claimInboxHead`、`deliverInboxInjection`、`persistClaimedUserInput`。

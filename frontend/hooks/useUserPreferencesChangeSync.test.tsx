@@ -77,8 +77,8 @@ afterAll(() => {
 
 test("invalidates only preferences on the account's data-free WS hint", async () => {
 	const invalidate = spyOn(client, "invalidateQueries");
-	const uiKey = ["user-preferences", "ui", "a", "token-a"];
-	const detailKey = ["user-preferences", "detail", "a", "token-a"];
+	const uiKey = ["user-preferences", "ui", "a", 1];
+	const detailKey = ["user-preferences", "detail", "a", 1];
 	client.setQueryData(uiKey, { language: "en" });
 	client.setQueryData(detailKey, { commands: [] });
 	await mount();

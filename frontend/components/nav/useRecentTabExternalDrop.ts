@@ -11,12 +11,14 @@
  * (or a highlight when it would merge into a new folder or join an existing one).
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import {
 	isNarratorSubject,
 	onPanelDragEnd,
 	onPanelDragMove,
+	PANEL_DROP_PRIORITY,
 	type PanelDragState,
+	registerPanelDropTarget,
 } from "../../lib/panel-drag";
 import {
 	type RecentTabDropRow,
@@ -76,6 +78,7 @@ export function useRecentTabExternalDrop({
 	onDrop,
 }: UseRecentTabExternalDropOptions): RecentTabExternalDropState | null {
 	const [state, setState] = useState<RecentTabExternalDropState | null>(null);
+	const targetId = useId();
 
 	// Refs so the subscription is registered once and never re-registered mid-drag:
 	// resubscribing would drop the pending target and the release would do nothing.
@@ -105,7 +108,9 @@ export function useRecentTabExternalDrop({
 		clear();
 		if (!enabled) return;
 
-		const resolveDrag = (drag: PanelDragState): RecentTabExternalDropState | null => {
+		const resolveDrag = (
+			drag: PanelDragState,
+		): { drop: RecentTabExternalDropState | null } | null => {
 			// A tool/resource panel can never become a recent tab.
 			if (readSuspended() || !isNarratorSubject(drag)) return null;
 			const el = containerRef.current;
@@ -116,18 +121,23 @@ export function useRecentTabExternalDrop({
 			if (!inside) return null;
 			const rows = measureRef.current();
 			const target = resolveRecentTabDropTarget(rows, drag.y, sourceForRef.current(drag.id));
-			if (!target) return null;
+			// In-place/invalid sidebar targets still consume the release. They must not
+			// fall through to an overlapping composer, dock or page.
 			return {
-				narratorId: drag.id,
-				title: drag.title,
-				target,
-				rows,
-				containerTop: rect.top,
+				drop: target
+					? {
+							narratorId: drag.id,
+							title: drag.title,
+							target,
+							rows,
+							containerTop: rect.top,
+						}
+					: null,
 			};
 		};
 
 		const unsubMove = onPanelDragMove((drag: PanelDragState) => {
-			const next = resolveDrag(drag);
+			const next = resolveDrag(drag)?.drop;
 			if (!next) {
 				clear();
 				return;
@@ -136,24 +146,30 @@ export function useRecentTabExternalDrop({
 			setState(next);
 		});
 
-		const unsubEnd = onPanelDragEnd((final: PanelDragState | null) => {
-			clear();
+		const unsubDrop = registerPanelDropTarget({
+			id: `sidebar-external:${targetId}`,
+			priority: PANEL_DROP_PRIORITY.sidebar,
 			// Release coordinates, rows and identity are authoritative, not the last move.
-			const resolved = final ? resolveDrag(final) : null;
-			if (!resolved) return;
-			onDropRef.current({
-				narratorId: resolved.narratorId,
-				title: resolved.title,
-				target: resolved.target,
-			});
+			hitTest: resolveDrag,
+			onDrop: (_final, { drop }) => {
+				if (drop) {
+					onDropRef.current({
+						narratorId: drop.narratorId,
+						title: drop.title,
+						target: drop.target,
+					});
+				}
+			},
 		});
+		const unsubEnd = onPanelDragEnd(clear);
 
 		return () => {
 			unsubMove();
+			unsubDrop();
 			unsubEnd();
 			clear();
 		};
-	}, [enabled, containerRef, clear, readSuspended]);
+	}, [enabled, containerRef, clear, readSuspended, targetId]);
 
 	// A drag that starts inside the sidebar arms `suspended` only after the first frame,
 	// so drop any indicator that slipped through before the gate closed.

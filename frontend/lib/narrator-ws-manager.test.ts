@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION } from "@shared/recent-tabs";
 import { coerceMessageReplacementAliases, coerceNarratorStatusPatch } from "../hooks/useNarratorWS";
+import { getAuthSnapshot, setToken } from "./api/client";
 import {
 	chunkNarratorIds,
 	limitNarratorSubscriptionIds,
@@ -1341,6 +1342,56 @@ function withSilencedWarn(fn: () => void): void {
 }
 
 describe("reconnect resilience", () => {
+	test("A → B → A retires the original socket and its queued frames even when token bytes match again", async () => {
+		const received: unknown[] = [];
+		withMockBrowserGlobals(() => {
+			const values = new Map<string, string>();
+			const storage = patchGlobal("localStorage", {
+				getItem: (key: string) => values.get(key) ?? null,
+				setItem: (key: string, value: string) => values.set(key, value),
+				removeItem: (key: string) => values.delete(key),
+			});
+			const manager = new NarratorWSManager();
+			try {
+				setToken("fixture-a");
+				manager.addListener({ types: ["user:recent_tabs_delta"] }, (frame) =>
+					received.push(frame.revision),
+				);
+				manager.connect();
+				const first = MockWebSocket.instances[0];
+				first.readyState = MockWebSocket.OPEN;
+				first.onopen?.();
+				const originalGeneration = manager.getConnectionAuthGeneration();
+				first.onmessage?.({
+					data: JSON.stringify({ type: "user:recent_tabs_delta", revision: 1 }),
+				});
+				setToken("fixture-b");
+				setToken("fixture-a");
+				const current = MockWebSocket.instances.at(-1);
+				if (!current) throw Error("Missing replacement socket");
+				expect(first.readyState).toBe(MockWebSocket.CLOSED);
+				expect(MockWebSocket.instances).toHaveLength(3);
+				current.readyState = MockWebSocket.OPEN;
+				current.onopen?.();
+				expect(manager.getConnectionAuthGeneration()).toBe(getAuthSnapshot().generation);
+				expect(manager.getConnectionAuthGeneration()).not.toBe(originalGeneration);
+				first.onmessage?.({
+					data: JSON.stringify({ type: "user:recent_tabs_delta", revision: 2 }),
+				});
+				manager.addListener({ types: ["communication_updated"] }, (frame) =>
+					received.push(frame.revision),
+				);
+				current.onmessage?.({
+					data: JSON.stringify({ type: "communication_updated", revision: 3 }),
+				});
+			} finally {
+				manager.disconnect();
+				restoreGlobal(storage);
+			}
+		});
+		await Promise.resolve();
+		expect(received).toEqual([3]);
+	});
 	test("times out a silent handshake and reconnects through backoff", () => {
 		withMockBrowserGlobals(() =>
 			withSocketTimers((fire) => {

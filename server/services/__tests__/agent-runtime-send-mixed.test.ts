@@ -3,19 +3,20 @@ import { eq } from "drizzle-orm";
 import { cleanDb } from "../../../tests/setup";
 import {
 	narratorBufferedMessages,
+	narratorCommunicationNodes,
 	narratorMessages,
 	narrators,
 	narratorToolCalls,
+	users,
 } from "../../db/schema";
+import { shutdownDbWorkerPool } from "../../lib/db-worker/pool";
 import { withRuntimePolicyTrait } from "../../lib/runtime-policy-trait";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
-import { captureWorkerRejectionThrower, getNarratorWorkerTestDb } from "./narrator-worker-fixture";
+import { captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
-const fixture = getNarratorWorkerTestDb();
-const { db, sqlite } = fixture;
-await fixture.ready;
-const realDbModule = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
+// Communication projection reads the production file path through its own Worker.
+// Use the preload-isolated database so both readers observe the same committed rows.
+const { db, sqlite } = await import("../../db");
 const ws = { ...(await import("../../websocket/narrator-ws")) };
 const broadcasts: Array<{ narratorId: string; type: string; model?: string }> = [];
 mock.module("../../websocket/narrator-ws", () => ({
@@ -26,6 +27,7 @@ mock.module("../../websocket/narrator-ws", () => ({
 }));
 const { sendSubagentMessageDetailed } = await import("../agent-communication");
 const inbox = await import("../agent-runtime/inbox");
+const runtimeRun = await import("../agent-runtime/run");
 const settingsModule = await import("../../lib/settings");
 const modelSwitch = await import("../subagent-model-switch");
 const { createMailboxStore } = await import("../agent-runtime/mailbox");
@@ -63,6 +65,9 @@ beforeEach(() => {
 		activeNarrators.delete(id);
 	}
 	cleanDb(sqlite);
+	db.insert(users)
+		.values({ id: "sender-user", username: "sender", passwordHash: "test", createdAt: time })
+		.run();
 	for (const id of ids) {
 		const primary = id.endsWith("root");
 		const parent = primary ? null : id === "foreign-child" ? "foreign-root" : "parent-root";
@@ -73,6 +78,8 @@ beforeEach(() => {
 				type: primary ? "primary" : "subagent",
 				variant: primary ? "primary" : "subagent:general",
 				parentNarratorId: parent,
+				ownerUserId: "sender-user",
+				aclRootNarratorId: parent,
 				policySourceNarratorId: parent,
 				runtimeRegistrationJson: parent ? delegationRegistration(parent, "general") : null,
 				traits: withRuntimePolicyTrait(
@@ -85,6 +92,14 @@ beforeEach(() => {
 				updatedAt: time,
 			})
 			.run();
+		db.insert(narratorCommunicationNodes)
+			.values({
+				narratorId: id,
+				parentNarratorId: parent,
+				originalParentNarratorId: parent,
+				version: 1,
+			})
+			.run();
 	}
 	tryClaimExecution("parent-root", "run");
 });
@@ -94,7 +109,7 @@ afterAll(async () => {
 		getExecutionOwner(id)?.release();
 		activeNarrators.delete(id);
 	}
-	await fixture.close();
+	await shutdownDbWorkerPool();
 });
 function input(
 	callerNarratorId = "sender-child",
@@ -232,11 +247,30 @@ test("whole-call selector authorization rejects foreign or missing targets befor
 	}
 });
 
-test("one archived target retains both earlier parent and later sibling successes", async () => {
+test("a reachable archived exact ID fails individually, but an archived alias is not addressable", async () => {
 	db.update(narrators).set({ status: "archived" }).where(eq(narrators.id, "sibling-a")).run();
-	const result = await sendSubagentMessageDetailed(
-		input("sender-child", ["parent", "sibling-a", "sibling-b"]),
-	);
+	expect(
+		await captureWorkerRejectionThrower(
+			sendSubagentMessageDetailed(input("sender-child", ["parent", "alpha"])),
+		),
+	).toThrow("No accessible communication target");
+	expect(rows()).toHaveLength(0);
+	const result = await sendSubagentMessageDetailed(input());
+	expect(result.targets.map((target) => [target.id, target.status])).toEqual([
+		["parent-root", "queued"],
+		["sibling-a", "failed"],
+	]);
+	expect(result.targets[1]?.error).toContain("archived");
+	expect(rows("sibling-a")).toHaveLength(0);
+	expect(rows("parent-root")).toHaveLength(1);
+});
+
+test("a target archived after preflight retains earlier parent and later sibling successes", async () => {
+	const request = input("sender-child", ["parent", "sibling-a", "sibling-b"]);
+	request.onTargetsResolved = () => {
+		db.update(narrators).set({ status: "archived" }).where(eq(narrators.id, "sibling-a")).run();
+	};
+	const result = await sendSubagentMessageDetailed(request);
 	expect(result.targets.map((target) => target.status)).toEqual(["queued", "failed", "queued"]);
 	expect(
 		rows()
@@ -342,10 +376,13 @@ test("database failure at one recipient preserves before/after recipient success
 });
 
 test("retry after one archived recipient becomes eligible preserves previous successes", async () => {
-	db.update(narrators).set({ status: "archived" }).where(eq(narrators.id, "sibling-a")).run();
 	const request = input();
+	request.onTargetsResolved = () => {
+		db.update(narrators).set({ status: "archived" }).where(eq(narrators.id, "sibling-a")).run();
+	};
 	const first = await sendSubagentMessageDetailed(request);
 	db.update(narrators).set({ status: "working" }).where(eq(narrators.id, "sibling-a")).run();
+	request.onTargetsResolved = undefined;
 	const second = await sendSubagentMessageDetailed(request);
 	expect(first.targets.map((target) => target.status)).toEqual(["queued", "failed"]);
 	expect(second.targets.map((target) => target.status)).toEqual(["queued", "queued"]);
@@ -413,6 +450,104 @@ test("resume=true restarts an error-stopped child through the explicit override 
 		expect(wake).toHaveBeenCalledWith("sibling-a", "en", { resumeStopped: ["error"] });
 		expect(result.targets[0]).toMatchObject({ status: "started", resumed: true });
 		expect(result.output).toContain("resumed after its failed last turn");
+	} finally {
+		wake.mockRestore();
+	}
+});
+
+test.each([false, true])("duplicate idle Send never wakes again (held=%s)", async (held) => {
+	db.update(narrators).set({ status: "idle" }).where(eq(narrators.id, "sibling-a")).run();
+	if (held) setRunHold("sibling-a", { released: false });
+	const wakeHeld = spyOn(runtimeRun, "wakeHeldRun").mockReturnValue(held);
+	const wake = spyOn(inbox, "wakeInboxIfEligible").mockResolvedValue(true);
+	try {
+		const request = input("parent-root", ["sibling-a"]);
+		const first = await sendSubagentMessageDetailed(request);
+		expect(first.targets[0]?.status).toBe("started");
+		expect(wakeHeld).toHaveBeenCalledTimes(1);
+		expect(wake).toHaveBeenCalledTimes(held ? 0 : 1);
+		const repeated = await sendSubagentMessageDetailed(request);
+		expect(wakeHeld).toHaveBeenCalledTimes(1);
+		expect(wake).toHaveBeenCalledTimes(held ? 0 : 1);
+		expect(repeated.targets[0]).toMatchObject({
+			status: "queued",
+			deliveryId: first.targets[0]?.deliveryId,
+		});
+		expect(repeated.targets[0]?.resumed).toBeUndefined();
+		expect(rows("sibling-a")).toHaveLength(1);
+	} finally {
+		wakeHeld.mockRestore();
+		wake.mockRestore();
+	}
+});
+
+test.each([
+	"error",
+	"user_interrupt",
+] as const)("duplicate Send cannot resume a subsequently %s-stopped child", async (reason) => {
+	const wakeHeld = spyOn(runtimeRun, "wakeHeldRun").mockReturnValue(false);
+	const wake = spyOn(inbox, "wakeInboxIfEligible").mockResolvedValue(true);
+	try {
+		const request = input("parent-root", ["sibling-a"]);
+		const first = await sendSubagentMessageDetailed(request);
+		stopTarget(reason);
+		wakeHeld.mockClear();
+		wake.mockClear();
+		const repeated = await sendSubagentMessageDetailed({ ...request, resume: true });
+		expect(wakeHeld).not.toHaveBeenCalled();
+		expect(wake).not.toHaveBeenCalled();
+		expect(repeated.targets[0]).toMatchObject({
+			status: "blocked",
+			blockedReason: reason,
+			deliveryId: first.targets[0]?.deliveryId,
+		});
+		expect(repeated.targets[0]?.resumed).toBeUndefined();
+		expect(rows("sibling-a")).toHaveLength(1);
+	} finally {
+		wakeHeld.mockRestore();
+		wake.mockRestore();
+	}
+});
+
+test("duplicate of an accepted resume does not restart an error-stopped child again", async () => {
+	stopTarget("error");
+	const wakeHeld = spyOn(runtimeRun, "wakeHeldRun").mockReturnValue(false);
+	const wake = spyOn(inbox, "wakeInboxIfEligible").mockResolvedValue(true);
+	try {
+		const request = { ...input("parent-root", ["sibling-a"]), resume: true };
+		const first = await sendSubagentMessageDetailed(request);
+		expect(first.targets[0]).toMatchObject({ status: "started", resumed: true });
+		const repeated = await sendSubagentMessageDetailed(request);
+		expect(wakeHeld).toHaveBeenCalledTimes(1);
+		expect(wake).toHaveBeenCalledTimes(1);
+		expect(repeated.targets[0]).toMatchObject({
+			status: "blocked",
+			blockedReason: "error",
+			deliveryId: first.targets[0]?.deliveryId,
+		});
+		expect(repeated.targets[0]?.resumed).toBeUndefined();
+		expect(rows("sibling-a")).toHaveLength(1);
+	} finally {
+		wakeHeld.mockRestore();
+		wake.mockRestore();
+	}
+});
+
+test("duplicate child-to-parent Send never wakes an idle parent again", async () => {
+	getExecutionOwner("parent-root")?.release();
+	db.update(narrators).set({ status: "idle" }).where(eq(narrators.id, "parent-root")).run();
+	const wake = spyOn(inbox, "wakeInboxIfEligible").mockResolvedValue(true);
+	try {
+		const request = input("sender-child", ["parent"]);
+		const first = await sendSubagentMessageDetailed(request);
+		expect(first.targets[0]?.status).toBe("started");
+		const repeated = await sendSubagentMessageDetailed(request);
+		expect(wake).toHaveBeenCalledTimes(1);
+		expect(repeated.targets[0]).toMatchObject({
+			status: "queued",
+			deliveryId: first.targets[0]?.deliveryId,
+		});
+		expect(rows("parent-root")).toHaveLength(1);
 	} finally {
 		wake.mockRestore();
 	}

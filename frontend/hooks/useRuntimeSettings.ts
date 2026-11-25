@@ -1,17 +1,21 @@
 import { useQuery } from "@tanstack/react-query";
 import { useSyncExternalStore } from "react";
 import { api } from "../lib/api";
-import { getToken, onTokenChange } from "../lib/api/client";
+import { getAuthSnapshot, subscribeAuth } from "../lib/api/client";
 
 export const RUNTIME_SETTINGS_QUERY_KEY = ["settings-runtime"] as const;
-export function runtimeSettingsQueryOptions() {
-	const token = getToken();
+export const runtimeSettingsQueryKey = (authGeneration: number) =>
+	[...RUNTIME_SETTINGS_QUERY_KEY, authGeneration] as const;
+
+export function runtimeSettingsQueryOptions(authGeneration = getAuthSnapshot().generation) {
 	return {
-		queryKey: [...RUNTIME_SETTINGS_QUERY_KEY, token],
+		queryKey: runtimeSettingsQueryKey(authGeneration),
 		queryFn: async ({ signal }: { signal: AbortSignal }) => {
-			if (getToken() !== token) throw new DOMException("Identity changed", "AbortError");
+			if (getAuthSnapshot().generation !== authGeneration)
+				throw new DOMException("Identity changed", "AbortError");
 			const result = await api.getRuntimeSettings({ signal });
-			if (getToken() !== token) throw new DOMException("Identity changed", "AbortError");
+			if (getAuthSnapshot().generation !== authGeneration)
+				throw new DOMException("Identity changed", "AbortError");
 			return result;
 		},
 		staleTime: 30_000,
@@ -21,6 +25,10 @@ export function runtimeSettingsQueryOptions() {
 
 /** Independent cache: a slim DTO must never replace the complete [settings] object. */
 export function useRuntimeSettings(enabled = true) {
-	const token = useSyncExternalStore(onTokenChange, getToken, () => null);
-	return useQuery({ ...runtimeSettingsQueryOptions(), enabled: enabled && !!token });
+	const { generation, hasToken } = useSyncExternalStore(
+		subscribeAuth,
+		getAuthSnapshot,
+		getAuthSnapshot,
+	);
+	return useQuery({ ...runtimeSettingsQueryOptions(generation), enabled: enabled && hasToken });
 }

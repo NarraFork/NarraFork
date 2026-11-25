@@ -866,7 +866,15 @@ for (const host of HOSTS) {
 	test(`${host}: with reduced motion every switch completes at once, unanimated (item 7)`, async () => {
 		const s = await seed(`Motion ${host}`);
 		const a = await openHost(h, host, s.pageId);
-		await a.page.emulateMediaFeatures([{ name: "prefers-reduced-motion", value: "reduce" }]);
+		const setMotion = async (value: "reduce" | "no-preference") => {
+			await a.page.emulateMediaFeatures([{ name: "prefers-reduced-motion", value }]);
+			await a.page.waitForFunction(
+				(preference) => window.matchMedia(`(prefers-reduced-motion: ${preference})`).matches,
+				{ timeout: 5000 },
+				value,
+			);
+		};
+		await setMotion("reduce");
 		const t2 = s.id("T2");
 		/** Run an operation and read, in the same task, the animations and the state. */
 		const act = (src: string) =>
@@ -928,12 +936,24 @@ for (const host of HOSTS) {
 		await press(a.page, "Alt", "ArrowRight");
 		expect(await a.call((f) => f.frameAnimations())).toBe(0);
 		expect((await state(a)).focus).toBe(t2);
-		// Without reduced motion the same switch animates.
-		await a.page.emulateMediaFeatures([{ name: "prefers-reduced-motion", value: "no-preference" }]);
-		await a.call((f) => f.setView("map"));
-		await new Promise((r) => setTimeout(r, 60));
-		expect(await a.call((f) => f.frameAnimations())).toBeGreaterThan(0);
-		await settled(a);
+		// Wait for this switch's own record: it counts animations even after they finish.
+		await setMotion("no-preference");
+		const logStart = await a.call((f) => {
+			const length = f.log().length;
+			f.setView("map");
+			return length;
+		});
+		await until(
+			a,
+			"normal-motion map switch completed",
+			`(f) => f.log().slice(${logStart}).some((entry) => entry.kind === "toMap" && entry.doneAt !== undefined)`,
+			5000,
+		);
+		const transition = await a.call((f, start) => {
+			const events = f.log().slice(start as number);
+			return events.find((entry) => entry.kind === "toMap");
+		}, logStart);
+		expect(transition?.animated).toBeGreaterThan(0);
 		expect(a.errors).toEqual([]);
 	}, 60_000);
 }

@@ -16,7 +16,7 @@ import type {
 	ChatRoomSummary,
 	ChatUnreadSummary,
 } from "../lib/api/chat";
-import { getToken, onTokenChange } from "../lib/api/client";
+import { getAuthSnapshot, getToken, onTokenChange, subscribeAuth } from "../lib/api/client";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
 
 const activeRoomResolvers = new WeakMap<object, Map<string, number>>();
@@ -87,13 +87,17 @@ export function useChatUnread(enabled = true) {
 
 /** Resolve (lazily creating) the discussion room bound to a narrator. */
 export function useNarratorChatRoom(narratorId: string | undefined, enabled = true) {
-	const token = useSyncExternalStore(onTokenChange, getToken, () => null);
+	const { generation, hasToken } = useSyncExternalStore(
+		subscribeAuth,
+		getAuthSnapshot,
+		getAuthSnapshot,
+	);
 	const queryClient = useQueryClient();
 	const queryKey = useMemo(
-		() => [...chatKeys.narratorRoom(narratorId ?? ""), token],
-		[narratorId, token],
+		() => [...chatKeys.narratorRoom(narratorId ?? ""), generation],
+		[generation, narratorId],
 	);
-	const active = !REMOTE_BUILD && enabled && !!narratorId;
+	const active = !REMOTE_BUILD && enabled && hasToken && !!narratorId;
 	useEffect(() => {
 		if (!active) return;
 		let refs = activeRoomResolvers.get(queryClient);
@@ -114,7 +118,14 @@ export function useNarratorChatRoom(narratorId: string | undefined, enabled = tr
 	}, [active, queryClient, queryKey]);
 	return useQuery({
 		queryKey,
-		queryFn: ({ signal }) => api.getNarratorChatRoom(narratorId as string, signal),
+		queryFn: async ({ signal }) => {
+			if (getAuthSnapshot().generation !== generation)
+				throw new DOMException("Session changed", "AbortError");
+			const room = await api.getNarratorChatRoom(narratorId as string, signal);
+			if (getAuthSnapshot().generation !== generation)
+				throw new DOMException("Session changed", "AbortError");
+			return room;
+		},
 		enabled: active,
 		gcTime: CHAT_GC_TIME_MS,
 		staleTime: CHAT_SUMMARY_STALE_TIME_MS,

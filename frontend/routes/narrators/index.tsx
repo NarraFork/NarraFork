@@ -39,6 +39,7 @@ import { useArchiveNarrator, useNarratorsPaginated } from "../../hooks/useNarrat
 import { useNarratorsListWS } from "../../hooks/useNarratorWS";
 import { addRecentTab } from "../../hooks/useRecentTabs";
 import { useSetupWizardGuard } from "../../hooks/useSetupWizardGuard";
+import { isRecentTabsScopeCurrent, useRecentTabsScope } from "../../lib/recent-tabs-owner";
 
 const importImportSessionModal = () =>
 	import("../../components/narrator/session-interchange/ImportSessionModal");
@@ -65,6 +66,7 @@ export const Route = createFileRoute("/narrators/")({
 function NarratorsPage() {
 	const search = Route.useSearch();
 	const navigate = useNavigate();
+	const recentTabsScope = useRecentTabsScope();
 	const listState = useMemo(() => getNarratorListState(search), [search]);
 	const { localQuery } = listState;
 
@@ -185,24 +187,29 @@ function NarratorsPage() {
 
 	const handleCreated = useCallback(
 		(data: CreateNarratorResult) => {
-			addRecentTab({
-				type: "narrator",
-				id: data.id,
-				title: data.title,
-				subtitle: data.cwd,
-				status: data.status,
-			});
+			if (recentTabsScope && !isRecentTabsScopeCurrent(recentTabsScope)) return;
+			addRecentTab(
+				{
+					type: "narrator",
+					id: data.id,
+					title: data.title,
+					subtitle: data.cwd,
+					status: data.status,
+				},
+				recentTabsScope,
+			);
 			navigate({ to: "/narrators/$narratorId", params: { narratorId: data.id } });
 		},
-		[navigate],
+		[navigate, recentTabsScope],
 	);
 
 	const handleImported = useCallback(
 		(data: { narratorId: string; title: string }) => {
-			addRecentTab({ type: "narrator", id: data.narratorId, title: data.title });
+			if (recentTabsScope && !isRecentTabsScopeCurrent(recentTabsScope)) return;
+			addRecentTab({ type: "narrator", id: data.narratorId, title: data.title }, recentTabsScope);
 			navigate({ to: "/narrators/$narratorId", params: { narratorId: data.narratorId } });
 		},
-		[navigate],
+		[navigate, recentTabsScope],
 	);
 
 	return (

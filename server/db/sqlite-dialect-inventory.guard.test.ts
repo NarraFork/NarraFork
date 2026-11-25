@@ -511,6 +511,10 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/lib/db-worker/select-digest-batch.ts": ["driver"],
 	"server/lib/db-worker/select-extended.ts": ["driver"],
 	"server/services/search/sqlite-worker-runner.ts": ["connectionModule"],
+	// These dual-backend readers dispatch the SQLite branch through the bounded Worker only.
+	"server/services/narrator-communication/reader.ts": ["connectionModule", "json1"],
+	"server/services/search/communication-candidates.ts": ["connectionModule", "rowid", "fts5"],
+	"server/services/agent-runtime/mailbox.ts": ["json1"],
 	"server/lib/db-worker/recall-tool-call-query.ts": ["driver"],
 	"server/lib/runtime-source.ts": ["json1"],
 	"server/routes/storage.ts": ["vacuum"],

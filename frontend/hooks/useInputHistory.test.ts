@@ -73,6 +73,29 @@ function storedEntries(storageId: string): string[] | null {
 }
 
 describe("writeInputHistoryEntries", () => {
+	test("history roundtrip retains authored narrator identity but never upgrades ordinary mentions", () => {
+		const doc: ComposerDocument = {
+			version: 1,
+			assets: [],
+			paragraphs: [
+				{
+					children: [
+						{
+							type: "narratorReference",
+							id: "ref",
+							narratorId: "stable-id",
+							label: "Renamable title",
+						},
+						{ type: "text", text: " @ordinary" },
+					],
+				},
+			],
+		};
+		writeInputHistoryEntries("u:n", [{ ...composerDocumentText(doc), composerDocument: doc }]);
+		const recalled = readInputHistoryEntries("u:n")[0];
+		expect(recalled.composerDocument).toEqual(doc);
+		expect(recalled.text).toBe("[@Renamable title](nf-agent://open?id=stable-id) @ordinary");
+	});
 	test("stores a small list verbatim, newest first", () => {
 		writeInputHistoryEntries("u1:n1", ["newest", "older"]);
 		flush();

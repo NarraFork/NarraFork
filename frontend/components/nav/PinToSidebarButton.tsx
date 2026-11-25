@@ -15,48 +15,71 @@ import { IconPin, IconPinnedFilled } from "@tabler/icons-react";
 import { skipToken, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useCurrentUser } from "../../hooks/useCurrentUser";
 import {
 	invalidateRecentTabStates,
-	RECENT_TABS_QUERY_KEY,
 	type RecentTab,
 	recentTabStateQueryKey,
 	setRecentTabPinnedFromPage,
 } from "../../hooks/useRecentTabs";
 import { api } from "../../lib/api";
+import {
+	isRecentTabsScopeCurrent,
+	type RecentTabsScope,
+	recentTabsFlatQueryKey,
+	requireRecentTabsScope,
+	useRecentTabsScope,
+} from "../../lib/recent-tabs-owner";
 import { loadedSidebarPin, resolvePagePin } from "./recent-tab-page-pin";
 
 /** How long one tab's pin read stays fresh; deltas touching the tab invalidate it sooner. */
 const PIN_STATE_STALE_MS = 60_000;
 
-export function PinToSidebarButton({
-	type,
-	id,
-	title,
-	size = "md",
-}: {
+type PinToSidebarButtonProps = {
 	type: "project" | "team";
 	id: string;
 	/** The tab's title until the server writes its own (a team's is its coordinator's title). */
 	title: string;
 	size?: "sm" | "md";
-}) {
+};
+
+export function PinToSidebarButton(props: PinToSidebarButtonProps) {
+	const scope = useRecentTabsScope();
+	if (!scope) return null;
+	return (
+		<ScopedPinToSidebarButton
+			key={`${scope.authGeneration}:${scope.accessGeneration}`}
+			{...props}
+			scope={scope}
+		/>
+	);
+}
+
+function ScopedPinToSidebarButton({
+	type,
+	id,
+	title,
+	size = "md",
+	scope,
+}: PinToSidebarButtonProps & { scope: RecentTabsScope }) {
 	const { t } = useTranslation("nav");
 	const qc = useQueryClient();
 	const key = `${type}:${id}`;
 	const { data: tabs } = useQuery<RecentTab[]>({
-		queryKey: RECENT_TABS_QUERY_KEY,
+		queryKey: recentTabsFlatQueryKey(scope),
 		queryFn: skipToken,
 	});
 	const loaded = loadedSidebarPin(tabs, type, id);
-	// Keyed by the signed-in user: a cached read never crosses accounts.
-	const { data: user } = useCurrentUser();
-	const userId = user?.id ?? "";
 	const state = useQuery({
-		queryKey: recentTabStateQueryKey(userId, key),
-		queryFn: ({ signal }) => api.getRecentTabState(type, id, signal),
-		enabled: loaded === undefined && !!userId,
+		queryKey: recentTabStateQueryKey(scope, key),
+		queryFn: async ({ signal }) => {
+			requireRecentTabsScope(scope);
+			const result = await api.getRecentTabState(type, id, signal);
+			requireRecentTabsScope(scope);
+			return result;
+		},
+		enabled: loaded === undefined,
 		staleTime: PIN_STATE_STALE_MS,
+		gcTime: PIN_STATE_STALE_MS,
 		// A failed read leaves the button unpinned and usable; it is not worth a toast.
 		meta: { suppressErrorToast: true },
 	});
@@ -65,15 +88,17 @@ export function PinToSidebarButton({
 	const label = t(pinned ? "unpinFromSidebar" : "pinToSidebar");
 	const toggle = () => {
 		setBusy(true);
-		setRecentTabPinnedFromPage({ type, id, title }, !pinned)
-			.catch(() =>
+		setRecentTabPinnedFromPage({ type, id, title }, !pinned, scope)
+			.catch(() => {
+				if (!isRecentTabsScopeCurrent(scope)) return;
 				notifications.show({
 					color: "red",
 					message: t(pinned ? "unpinFromSidebarFailed" : "pinToSidebarFailed"),
-				}),
-			)
+				});
+			})
 			.finally(() => {
-				invalidateRecentTabStates(qc, [key]);
+				if (!isRecentTabsScopeCurrent(scope)) return;
+				invalidateRecentTabStates(qc, scope, [key]);
 				setBusy(false);
 			});
 	};
