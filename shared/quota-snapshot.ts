@@ -27,6 +27,13 @@ export interface QuotaBalance {
 	remaining: number | null;
 	total?: number;
 	unlimited?: boolean;
+	/**
+	 * Epoch ms of the remaining observation, not a later partial update.
+	 * Null = never observed; omitted = legacy snapshot.fetchedAt.
+	 */
+	remainingObservedAt?: number | null;
+	/** Epoch ms of the total observation, with the same null/legacy semantics as remainingObservedAt. */
+	totalObservedAt?: number | null;
 }
 
 export interface QuotaSnapshot {

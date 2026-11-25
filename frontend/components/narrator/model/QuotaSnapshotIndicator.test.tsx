@@ -63,6 +63,48 @@ test("NUG status UI shows probe 10, then newer stream 9, then the newer paid pro
 	expect(stream.snapshot?.balances[0]?.remaining).toBe(9);
 });
 
+test.each([
+	100, 250,
+])("partial totals do not refresh a carried remaining observation from %i in the real indicator", (remainingObservedAt) => {
+	const partial = nugWallet(11, 300, "probe", {
+		balances: [{ unit: "", remaining: 11, total: 111, remainingObservedAt, totalObservedAt: 300 }],
+	});
+	const stream = nugWallet(0, 200, "quota_balance", {
+		balances: [
+			{ unit: "", remaining: 0, total: 100, remainingObservedAt: 200, totalObservedAt: 100 },
+		],
+	});
+	const html = render(selected([partial, stream]));
+	expect(html).toContain(remainingObservedAt === 100 ? "Balance: 0" : "Balance: 11");
+	expect(html).toContain("Total: 111");
+	expect(html).not.toContain("Total: 100");
+});
+
+test("metadata-only display can use a real stream, but explicit unknown and expiry remain authoritative", () => {
+	const partial = nugWallet(null, 300, "probe", {
+		balances: [
+			{ unit: "", remaining: null, total: 111, remainingObservedAt: null, totalObservedAt: 300 },
+		],
+		expiresAt: 1_000,
+	});
+	const stream = nugWallet(9, 200, "quota_balance", {
+		balances: [{ unit: "", remaining: 9, remainingObservedAt: 200, totalObservedAt: null }],
+	});
+	const projection = selected([partial, stream]);
+	expect(render(projection, 999)).toContain("Balance: 9");
+	expect(render(projection, 999)).toContain("Total: 111");
+	expect(render(projection, 1_000)).toContain("Subscription expired");
+	expect(render(projection, 1_000)).not.toContain("Balance: 9");
+	const unknown = nugWallet(null, 300, "probe", {
+		balances: [
+			{ unit: "", remaining: null, total: 111, remainingObservedAt: 100, totalObservedAt: 300 },
+		],
+	});
+	expect(render(selected([unknown, stream]))).toContain("Quota unknown");
+	expect(render(selected([unknown, stream]))).not.toContain("Balance: 9");
+	expect(partial.snapshot?.balances[0]?.remaining).toBeNull();
+});
+
 test("a newer NUG amount keeps probe windows, plan and expiration in the real indicator", () => {
 	const probe = nugWallet(10, 100, "probe", {
 		plan: "Pro",

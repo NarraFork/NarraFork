@@ -57,6 +57,8 @@ export function publicQuotaSnapshot(
 	snapshot: QuotaSnapshot | undefined,
 ): PublicQuotaSnapshot | null {
 	if (!snapshot) return null;
+	const observedAt = (value: unknown) =>
+		typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
 	return {
 		fetchedAt: snapshot.fetchedAt,
 		scope: snapshot.scope,
@@ -72,12 +74,18 @@ export function publicQuotaSnapshot(
 				...(typeof unit === "string" ? { unit } : {}),
 			}),
 		),
-		balances: snapshot.balances.map(({ unit, remaining, total, unlimited }) => ({
-			unit,
-			remaining,
-			...(total !== undefined ? { total } : {}),
-			...(unlimited !== undefined ? { unlimited } : {}),
-		})),
+		balances: snapshot.balances.map(
+			({ unit, remaining, total, unlimited, remainingObservedAt, totalObservedAt }) => ({
+				unit,
+				remaining,
+				...(total !== undefined ? { total } : {}),
+				...(unlimited !== undefined ? { unlimited } : {}),
+				...(remainingObservedAt !== undefined
+					? { remainingObservedAt: observedAt(remainingObservedAt) }
+					: {}),
+				...(totalObservedAt !== undefined ? { totalObservedAt: observedAt(totalObservedAt) } : {}),
+			}),
+		),
 		...(snapshot.plan ? { plan: snapshot.plan } : {}),
 		...(snapshot.expiresAt !== undefined ? { expiresAt: snapshot.expiresAt } : {}),
 		hasError: !!snapshot.error,

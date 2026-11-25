@@ -107,10 +107,6 @@ export function selectQuotaEntries(entries: QuotaSnapshotEntry[]): QuotaSnapshot
 			metadata.hasError ||
 			observed.error ||
 			observed.hasError ||
-			!Number.isFinite(metadata.fetchedAt) ||
-			metadata.fetchedAt <= 0 ||
-			!Number.isFinite(observed.fetchedAt) ||
-			observed.fetchedAt <= metadata.fetchedAt ||
 			metadata.balances.length !== 1 ||
 			observed.balances.length !== 1 ||
 			!balance ||
@@ -118,19 +114,51 @@ export function selectQuotaEntries(entries: QuotaSnapshotEntry[]): QuotaSnapshot
 			balance.unit !== reported.unit ||
 			balance.unlimited ||
 			reported.unlimited ||
-			balance.remaining == null ||
-			reported.remaining == null ||
-			!Number.isFinite(balance.remaining) ||
-			!Number.isFinite(reported.remaining)
+			(balance.remaining == null && balance.remainingObservedAt !== null) ||
+			(balance.remaining != null && !Number.isFinite(balance.remaining)) ||
+			(reported.remaining == null && reported.remainingObservedAt !== null) ||
+			(reported.remaining != null && !Number.isFinite(reported.remaining))
 		)
 			return probe;
+		const remainingAt =
+			balance.remainingObservedAt === undefined ? metadata.fetchedAt : balance.remainingObservedAt;
+		const totalAt =
+			balance.totalObservedAt === undefined ? metadata.fetchedAt : balance.totalObservedAt;
+		const streamRemainingAt =
+			reported.remainingObservedAt === undefined
+				? observed.fetchedAt
+				: reported.remainingObservedAt;
+		const streamTotalAt =
+			reported.totalObservedAt === undefined ? observed.fetchedAt : reported.totalObservedAt;
+		const newer = (current: number | null, candidate: number | null) =>
+			candidate !== null &&
+			Number.isFinite(candidate) &&
+			candidate >= 0 &&
+			(current === null || (Number.isFinite(current) && current >= 0 && candidate > current));
+		const updateRemaining =
+			reported.remaining != null &&
+			Number.isFinite(reported.remaining) &&
+			newer(remainingAt, streamRemainingAt);
+		const updateTotal =
+			reported.total !== undefined &&
+			Number.isFinite(reported.total) &&
+			newer(totalAt, streamTotalAt);
+		if (!updateRemaining && !updateTotal) return probe;
 		return {
 			...probe,
 			source: "quota_balance",
 			snapshot: {
 				...metadata,
-				fetchedAt: observed.fetchedAt,
-				balances: [{ ...balance, ...reported }],
+				fetchedAt: Math.max(metadata.fetchedAt, observed.fetchedAt),
+				balances: [
+					{
+						...balance,
+						...(updateRemaining ? { remaining: reported.remaining } : {}),
+						...(updateTotal ? { total: reported.total } : {}),
+						remainingObservedAt: updateRemaining ? streamRemainingAt : remainingAt,
+						totalObservedAt: updateTotal ? streamTotalAt : totalAt,
+					},
+				],
 			},
 		};
 	});

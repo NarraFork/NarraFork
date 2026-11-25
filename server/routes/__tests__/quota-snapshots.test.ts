@@ -142,6 +142,59 @@ describe("unified quota API", () => {
 			/private-window|secret-token|detail|headers|Authorization/,
 		);
 	});
+	test("public balances whitelist field observation times without identity or private payload", () => {
+		const raw = {
+			...snap(),
+			balances: [
+				{
+					unit: "",
+					remaining: 0,
+					total: 111,
+					remainingObservedAt: 200,
+					totalObservedAt: 300,
+					identity: "private-identity",
+					extra: { secret: "private-balance" },
+				},
+			],
+		};
+		expect(publicQuotaSnapshot(raw)?.balances).toEqual([
+			{
+				unit: "",
+				remaining: 0,
+				total: 111,
+				remainingObservedAt: 200,
+				totalObservedAt: 300,
+			},
+		]);
+		const partial = {
+			...raw,
+			balances: [
+				{ unit: "", remaining: null, total: 111, remainingObservedAt: null, totalObservedAt: 300 },
+			],
+		};
+		expect(publicQuotaSnapshot(partial)?.balances[0]?.remainingObservedAt).toBeNull();
+		const legacy = publicQuotaSnapshot({ ...raw, balances: [{ unit: "", remaining: 11 }] });
+		expect(Object.hasOwn(legacy?.balances[0] ?? {}, "remainingObservedAt")).toBe(false);
+		expect(Object.hasOwn(legacy?.balances[0] ?? {}, "totalObservedAt")).toBe(false);
+		expect(JSON.stringify(publicQuotaSnapshot(raw))).not.toMatch(
+			/private-identity|private-balance|identity|extra|detail/,
+		);
+	});
+	test("invalid observation times become explicit no-observation, never a legacy fetchedAt fallback", () => {
+		for (const value of [NaN, Infinity, -1, "private-token", { identity: "private-identity" }]) {
+			const projected = publicQuotaSnapshot({
+				...snap(),
+				balances: [{ unit: "", remaining: 11, remainingObservedAt: value, totalObservedAt: value }],
+			} as unknown as QuotaSnapshot);
+			expect(projected?.balances[0]).toEqual({
+				unit: "",
+				remaining: 11,
+				remainingObservedAt: null,
+				totalObservedAt: null,
+			});
+			expect(JSON.stringify(projected)).not.toMatch(/private-token|private-identity|identity/);
+		}
+	});
 	test("anonymous callers cannot read or refresh", async () => {
 		expect((await app().request("/api/quota-snapshots")).status).toBe(401);
 		expect(

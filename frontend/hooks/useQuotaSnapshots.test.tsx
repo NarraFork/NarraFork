@@ -229,6 +229,147 @@ test.each([
 	expect(values).toEqual(original);
 });
 
+test.each([
+	false,
+	true,
+])("NUG partial total updates retain real per-field observations (reversed=%s)", (reversed) => {
+	const probe = nugWallet(11, 100, "probe", {
+		balances: [
+			{ unit: "", remaining: 11, total: 100, remainingObservedAt: 100, totalObservedAt: 100 },
+		],
+	});
+	const stream = nugWallet(0, 200, "quota_balance", {
+		balances: [
+			{ unit: "", remaining: 0, total: 100, remainingObservedAt: 200, totalObservedAt: 100 },
+		],
+	});
+	const partial = nugWallet(11, 300, "probe", {
+		balances: [
+			{ unit: "", remaining: 11, total: 111, remainingObservedAt: 100, totalObservedAt: 300 },
+		],
+	});
+	const pair = (value: typeof partial) => (reversed ? [stream, value] : [value, stream]);
+	expect(selectQuotaEntries(pair(probe))[0]?.snapshot?.balances[0]?.remaining).toBe(0);
+	const values = pair(partial);
+	const original = structuredClone(values);
+	expect(selectQuotaEntries(values)[0]?.snapshot?.balances[0]).toEqual({
+		unit: "",
+		remaining: 0,
+		total: 111,
+		remainingObservedAt: 200,
+		totalObservedAt: 300,
+	});
+	// A real later probe of remaining, unlike a carried value, supersedes the old stream.
+	const observedProbe = nugWallet(11, 250, "probe", {
+		balances: [
+			{ unit: "", remaining: 11, total: 100, remainingObservedAt: 250, totalObservedAt: 100 },
+		],
+	});
+	expect(selectQuotaEntries(pair(observedProbe))[0]).toBe(observedProbe);
+	const laterPartial = nugWallet(11, 300, "probe", {
+		balances: [
+			{ unit: "", remaining: 11, total: 111, remainingObservedAt: 250, totalObservedAt: 300 },
+		],
+	});
+	expect(selectQuotaEntries(pair(laterPartial))[0]).toBe(laterPartial);
+	expect(values).toEqual(original);
+});
+
+test("NUG remaining and total compare independently, with probe winning per-field timestamp ties", () => {
+	const probe = nugWallet(11, 500, "probe", {
+		balances: [
+			{ unit: "", remaining: 11, total: 111, remainingObservedAt: 300, totalObservedAt: 100 },
+		],
+	});
+	const stream = nugWallet(0, 400, "quota_balance", {
+		balances: [
+			{ unit: "", remaining: 0, total: 222, remainingObservedAt: 200, totalObservedAt: 400 },
+		],
+	});
+	expect(selectQuotaEntries([probe, stream])[0]?.snapshot?.balances[0]).toEqual({
+		unit: "",
+		remaining: 11,
+		total: 222,
+		remainingObservedAt: 300,
+		totalObservedAt: 400,
+	});
+	const tied = nugWallet(0, 999, "quota_balance", {
+		balances: [
+			{ unit: "", remaining: 0, total: 222, remainingObservedAt: 300, totalObservedAt: 100 },
+		],
+	});
+	expect(selectQuotaEntries([probe, tied])[0]).toBe(probe);
+});
+
+test.each([
+	0, 9,
+])("a metadata-only probe may display the real stream remaining %i without changing its unknown store slot", (remaining) => {
+	const partial = nugWallet(null, 300, "probe", {
+		balances: [
+			{ unit: "", remaining: null, total: 111, remainingObservedAt: null, totalObservedAt: 300 },
+		],
+	});
+	const stream = nugWallet(remaining, 200, "quota_balance", {
+		balances: [{ unit: "", remaining, total: 100, remainingObservedAt: 200, totalObservedAt: 100 }],
+	});
+	const projected = selectQuotaEntries([partial, stream])[0];
+	expect(projected?.snapshot?.balances[0]).toEqual({
+		unit: "",
+		remaining,
+		total: 111,
+		remainingObservedAt: 200,
+		totalObservedAt: 300,
+	});
+	expect(partial.snapshot.balances[0]?.remaining).toBeNull();
+	expect(partial.snapshot.balances[0]?.remainingObservedAt).toBeNull();
+	const failed = {
+		...partial,
+		snapshot: { ...partial.snapshot, error: "quota_unavailable", hasError: true },
+	};
+	expect(selectQuotaEntries([failed, stream])[0]).toBe(failed);
+	const expired = { ...partial, snapshot: { ...partial.snapshot, expiresAt: 400 } };
+	expect(
+		quotaSnapshotText(selectQuotaEntries([expired, stream])[0]?.snapshot, (key) => key, 400)
+			.balance,
+	).toBe("quotaSnapshot.expired");
+});
+
+test("explicit unknown probe observations never become metadata-only through timestamps", () => {
+	const stream = nugWallet(9, 400, "quota_balance", {
+		balances: [{ unit: "", remaining: 9, remainingObservedAt: 400, totalObservedAt: null }],
+	});
+	for (const remainingObservedAt of [undefined, 100, 300]) {
+		const unknown = nugWallet(null, 300, "probe", {
+			balances: [
+				{ unit: "", remaining: null, total: 111, remainingObservedAt, totalObservedAt: 300 },
+			],
+		});
+		expect(selectQuotaEntries([unknown, stream])[0]).toBe(unknown);
+	}
+	const noObservation = nugWallet(9, 999, "quota_balance", {
+		balances: [
+			{ unit: "", remaining: 9, total: 999, remainingObservedAt: null, totalObservedAt: null },
+		],
+	});
+	const probe = nugWallet(11, 100);
+	expect(selectQuotaEntries([probe, noObservation])[0]).toBe(probe);
+	const legacyUnknownStream = nugWallet(null, 400, "quota_balance", {
+		balances: [{ unit: "", remaining: null, total: 999 }],
+	});
+	expect(selectQuotaEntries([probe, legacyUnknownStream])[0]).toBe(probe);
+	const metadataOnlyStream = nugWallet(null, 400, "quota_balance", {
+		balances: [
+			{ unit: "", remaining: null, total: 999, remainingObservedAt: null, totalObservedAt: 400 },
+		],
+	});
+	expect(selectQuotaEntries([probe, metadataOnlyStream])[0]?.snapshot?.balances[0]).toMatchObject({
+		remaining: 11,
+		total: 999,
+		remainingObservedAt: 100,
+		totalObservedAt: 400,
+	});
+});
+
 test("NUG same-millisecond observations prefer probe, while later zero and negative balances remain real", () => {
 	const probe = nugWallet(10, 100);
 	for (const fetchedAt of [50, 100]) {
