@@ -449,6 +449,161 @@ test("file completion Escape closes the menu without clearing the draft", async 
 		await close(page);
 	}
 });
+test("typed completion creates one stable narrator atom; IME and empty list never leak Enter into send", async () => {
+	const page = await open();
+	try {
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.namedCandidates([
+				{ id: "stable-no-handle", title: "Target session" },
+			]),
+		);
+		await loadDocument(page, textDocument("@Tar"));
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.nativeSelection(5));
+		await page.waitForSelector('[role="option"]');
+		await page.$eval('[role="textbox"]', (element) => {
+			element.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+			element.dispatchEvent(
+				new KeyboardEvent("keydown", {
+					key: "Enter",
+					bubbles: true,
+					isComposing: true,
+					keyCode: 229,
+				}),
+			);
+			element.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true }));
+		});
+		await settle(page);
+		expect((await snapshot(page)).document?.paragraphs[0].children).toEqual([
+			{ type: "text", text: "@Tar" },
+		]);
+		expect((await snapshot(page)).sends).toBe(0);
+		await focusedComposer(page);
+		await page.waitForSelector('[role="option"]');
+		await settle(page);
+		await page.keyboard.press("Enter");
+		await settle(page);
+		const state = await snapshot(page);
+		expect(state.sends).toBe(0);
+		expect(state.document?.paragraphs[0].children).toContainEqual(
+			expect.objectContaining({
+				type: "narratorReference",
+				narratorId: "stable-no-handle",
+				label: "Target session",
+			}),
+		);
+		await loadDocument(page, textDocument("@zzzz-no-match"));
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.nativeSelection(15));
+		await page.waitForSelector('[role="listbox"]');
+		await page.keyboard.press("Enter");
+		await settle(page);
+		expect((await snapshot(page)).sends).toBe(0);
+		expect((await snapshot(page)).text).toBe("@zzzz-no-match");
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
+test("loading Enter is owned and candidate enrichment preserves the keyboard-selected narrator ID", async () => {
+	const page = await open();
+	try {
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.namedCandidates([], true),
+		);
+		await loadDocument(page, textDocument("@pending"));
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.nativeSelection(9));
+		await page.waitForSelector('[role="listbox"][aria-busy="true"]').catch(async (error) => {
+			throw new Error(
+				JSON.stringify(
+					await page.evaluate(() => ({
+						list: document.querySelector('[role="listbox"]')?.outerHTML,
+						input: document.querySelector('[role="textbox"]')?.outerHTML,
+						focus: document.activeElement?.getAttribute("role"),
+					})),
+				),
+				{ cause: error },
+			);
+		});
+		await focusedComposer(page);
+		await page.keyboard.press("Enter");
+		await settle(page);
+		expect((await snapshot(page)).sends).toBe(0);
+		expect((await snapshot(page)).text).toBe("@pending");
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.namedCandidates([
+				{ id: "a", title: "Alpha" },
+				{ id: "b", title: "Beta" },
+			]),
+		);
+		await loadDocument(page, textDocument("@"));
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.nativeSelection(2));
+		await page.waitForSelector('[role="option"]');
+		await focusedComposer(page);
+		await page.keyboard.press("ArrowDown");
+		await settle(page);
+		expect(
+			await page.$eval('[role="option"][aria-selected="true"]', (element) => element.textContent),
+		).toContain("Beta");
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.namedCandidates([
+				{ id: "new", title: "Newest" },
+				{ id: "a", title: "Alpha" },
+				{ id: "b", title: "Beta" },
+			]),
+		);
+		await settle(page);
+		expect(
+			await page.$eval('[role="option"][aria-selected="true"]', (element) => element.textContent),
+		).toContain("Beta");
+		await page.keyboard.press("Enter");
+		await settle(page);
+		expect((await snapshot(page)).document?.paragraphs[0].children).toContainEqual(
+			expect.objectContaining({ type: "narratorReference", narratorId: "b" }),
+		);
+	} finally {
+		await close(page);
+	}
+}, 15_000);
+
+test("RecentTabs-style pointer release is consumed by composer once, tool/self cannot turn into references", async () => {
+	const page = await open();
+	try {
+		await loadDocument(page, textDocument("before after"));
+		const fallback = await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.panelReferenceDrop(
+				"target-stable",
+				"Unchanged label",
+			),
+		);
+		await settle(page);
+		expect(fallback).toBe(0);
+		let refs = (await snapshot(page)).document?.paragraphs.flatMap((paragraph) =>
+			paragraph.children.filter((node) => node.type === "narratorReference"),
+		);
+		expect(refs).toHaveLength(1);
+		expect(refs?.[0]).toMatchObject({ narratorId: "target-stable", label: "Unchanged label" });
+		expect(
+			await page.evaluate(() =>
+				(window as unknown as FixtureWindow).fixture.panelReferenceDrop("fixture-narrator", "Self"),
+			),
+		).toBe(0);
+		expect(
+			await page.evaluate(() =>
+				(window as unknown as FixtureWindow).fixture.panelReferenceDrop(
+					"tool-resource",
+					"Tool",
+					"tool",
+				),
+			),
+		).toBe(1);
+		refs = (await snapshot(page)).document?.paragraphs.flatMap((paragraph) =>
+			paragraph.children.filter((node) => node.type === "narratorReference"),
+		);
+		expect(refs).toHaveLength(1);
+	} finally {
+		await close(page);
+	}
+});
+
 test("file and mention queries stop at inline atoms instead of deleting them", async () => {
 	const page = await open();
 	const quote = {
@@ -509,7 +664,7 @@ test("file and mention queries stop at inline atoms instead of deleting them", a
 		await settle(page);
 		const state = await snapshot(page);
 		expect(state.document?.paragraphs[0].children).toContainEqual(quote);
-		expect(state.text).toContain("@foo ");
+		expect(state.text).toContain("[@Foo](nf-agent://open?id=named) ");
 	} finally {
 		await close(page);
 	}
@@ -1407,7 +1562,7 @@ for (const target of ["search", "monaco"] as const) {
 			await page.waitForSelector("[data-mention-item]");
 			await page.keyboard.press("Tab");
 			await settle(page);
-			expect((await snapshot(page)).text).toBe("@foo ");
+			expect((await snapshot(page)).text).toBe("[@foo](nf-agent://open?id=named) ");
 		} finally {
 			await close(page);
 		}

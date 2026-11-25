@@ -41,6 +41,7 @@ import { and, asc, desc, eq, gt, inArray, isNull, notInArray, or, sql } from "dr
 import { db } from "../db";
 import {
 	narrators,
+	projects,
 	recentTabArchiveMarks,
 	userPreferences,
 	userRecentTabs,
@@ -53,6 +54,8 @@ import { invalidateNarratorFolderCache } from "../lib/git-identity";
 import { generateId } from "../lib/id";
 import { parseSubstatus } from "../lib/narrator-utils";
 import { broadcastToUser } from "../websocket/narrator-ws";
+import { narratorReadableWhere } from "./narrator-acl";
+import { projectReadableWhere } from "./project-acl";
 
 const RECENT_TAB_TEXT_MAX_CHARS = 1_000;
 const UNDO_TTL_MS = 30_000;
@@ -122,6 +125,64 @@ function getTabNarratorId(tab: PersistedRecentTab): string | undefined {
 
 function cloneTab(tab: PersistedRecentTab): PersistedRecentTab {
 	return { ...tab };
+}
+
+/** Recheck only the bounded IDs already collected for a user-facing read or delta. */
+function readableRecentTabKeys(userId: string, tabs: readonly PersistedRecentTab[]): Set<string> {
+	const readableKeys = new Set<string>();
+	if (tabs.length === 0) return readableKeys;
+	const user = db.select({ role: users.role }).from(users).where(eq(users.id, userId)).get();
+	if (!user) return readableKeys;
+	const principal = { userId, isAdmin: user.role === "admin" };
+	const narratorIds = [...new Set(tabs.map(getTabNarratorId).filter((id) => id !== undefined))];
+	const projectIds = [
+		...new Set(tabs.filter((tab) => tab.type === "project").map((tab) => tab.id)),
+	];
+	const readableNarrators = new Set(
+		narratorIds.length
+			? db
+					.select({ id: narrators.id })
+					.from(narrators)
+					.where(
+						and(
+							inArray(narrators.id, narratorIds),
+							eq(narrators.hiddenFromLists, false),
+							narratorReadableWhere(principal),
+						),
+					)
+					.limit(narratorIds.length)
+					.all()
+					.map((row) => row.id)
+			: [],
+	);
+	const readableProjects = new Set(
+		projectIds.length
+			? db
+					.select({ id: projects.id })
+					.from(projects)
+					.where(and(inArray(projects.id, projectIds), projectReadableWhere(principal)))
+					.limit(projectIds.length)
+					.all()
+					.map((row) => row.id)
+			: [],
+	);
+	for (const tab of tabs) {
+		const narratorId = getTabNarratorId(tab);
+		if (
+			tab.type === "folder" ||
+			(tab.type === "project" && readableProjects.has(tab.id)) ||
+			(narratorId !== undefined && readableNarrators.has(narratorId))
+		) {
+			readableKeys.add(tabKey(tab));
+		}
+	}
+	return readableKeys;
+}
+
+function projectVisibleRecentTabs(tabs: PersistedRecentTab[], readableKeys: ReadonlySet<string>) {
+	const visible = tabs.filter((tab) => readableKeys.has(tabKey(tab)));
+	const foldersWithVisibleMembers = new Set(visible.map((tab) => tab.folderId));
+	return visible.filter((tab) => tab.type !== "folder" || foldersWithVisibleMembers.has(tab.id));
 }
 
 function normalizeLegacyTab(value: unknown): PersistedRecentTab | null {
@@ -813,9 +874,30 @@ function diffOperations(
 	return operations;
 }
 
+function visibleDeltaOperations(
+	userId: string,
+	before: PersistedRecentTab[],
+	after: PersistedRecentTab[],
+): RecentTabsOperation[] {
+	const readableKeys = readableRecentTabKeys(userId, [...before, ...after]);
+	const visible = diffOperations(
+		projectVisibleRecentTabs(before, readableKeys),
+		projectVisibleRecentTabs(after, readableKeys),
+	);
+	// Preserve key-only removals after entity teardown; only the visible projection
+	// may supply upsert payloads and move anchors to the client.
+	const retainedKeys = new Set(after.map(tabKey));
+	const removedKeys = new Set(before.map(tabKey).filter((key) => !retainedKeys.has(key)));
+	return [
+		...[...removedKeys].map((key) => ({ type: "remove" as const, key })),
+		...visible.filter((op) => op.type !== "remove" || !removedKeys.has(op.key)),
+	];
+}
+
 function broadcastDelta(userId: string, result: RecentTabsMutationResult): void {
-	if (!result.changed || result.operations.length === 0) return;
-	const batchCount = Math.ceil(result.operations.length / RECENT_TABS_WS_BATCH_SIZE);
+	if (!result.changed) return;
+	// A durable change to hidden rows still advances the revision on every connection.
+	const batchCount = Math.max(1, Math.ceil(result.operations.length / RECENT_TABS_WS_BATCH_SIZE));
 	for (let batchIndex = 0; batchIndex < batchCount; batchIndex++) {
 		const event: RecentTabsDelta = {
 			type: "user:recent_tabs_delta",
@@ -877,7 +959,7 @@ function persistMutationLocked(
 		changed: true,
 		baseRevision,
 		revision,
-		operations: diffOperations(before, after),
+		operations: visibleDeltaOperations(userId, before, after),
 		removedCount: options.removedCount,
 	};
 	// Moves, folder removal/dissolve and reordering can all change which folder's identity
@@ -1526,6 +1608,7 @@ export async function listPage(
 								eq(userRecentTabs.userId, userId),
 								eq(userRecentTabs.section, section),
 								inArray(userRecentTabs.folderId, folderIds),
+								EXCLUDE_REMOVED_TAB_TYPES,
 							),
 						)
 						.orderBy(asc(userRecentTabs.sortOrder), asc(userRecentTabs.tabKey))
@@ -1545,15 +1628,13 @@ export async function listPage(
 				pageRows.push(row);
 				continue;
 			}
-			// A folder emptied outside this service (a direct narrator delete) is not shown;
-			// the next write removes it for good.
-			const folderMembers = membersByFolder.get(row.entityId) ?? [];
-			if (folderMembers.length === 0) continue;
-			pageRows.push(row, ...folderMembers);
+			pageRows.push(row, ...(membersByFolder.get(row.entityId) ?? []));
 		}
+		const pageTabs = pageRows.map(rowToTab);
+		// ACL only changes the returned projection; even an empty page advances over its stored rows.
 		const lastTopLevelRow = pageTopLevelRows.at(-1);
 		return {
-			items: pageRows.map(rowToTab),
+			items: projectVisibleRecentTabs(pageTabs, readableRecentTabKeys(userId, pageTabs)),
 			revision,
 			hasMore,
 			nextCursor:
@@ -1565,7 +1646,8 @@ export async function listPage(
 export async function listLegacyTabs(userId: string): Promise<PersistedRecentTab[]> {
 	return userPreferencesLock.acquire(userId, async () => {
 		ensureMigratedLocked(userId);
-		return readRows(userId).slice(0, RECENT_TABS_LEGACY_LIMIT).map(rowToTab);
+		const tabs = readRows(userId).slice(0, RECENT_TABS_LEGACY_LIMIT).map(rowToTab);
+		return projectVisibleRecentTabs(tabs, readableRecentTabKeys(userId, tabs));
 	});
 }
 
@@ -1597,12 +1679,9 @@ export async function getRuntimePatches(
 			.from(userRecentTabs)
 			.where(and(eq(userRecentTabs.userId, userId), inArray(userRecentTabs.tabKey, uniqueKeys)));
 		const byKey = new Map(rows.map((row) => [row.tabKey, rowToTab(row)]));
-		return {
-			revision,
-			tabs: uniqueKeys
-				.map((key) => byKey.get(key))
-				.filter((tab): tab is PersistedRecentTab => !!tab),
-		};
+		const tabs = uniqueKeys.map((key) => byKey.get(key)).filter((tab) => tab !== undefined);
+		const readableKeys = readableRecentTabKeys(userId, tabs);
+		return { revision, tabs: tabs.filter((tab) => readableKeys.has(tabKey(tab))) };
 	});
 	if (snapshot.tabs.length === 0) return { revision: snapshot.revision, patches: [] };
 	const tabs = snapshot.tabs;
@@ -1611,24 +1690,28 @@ export async function getRuntimePatches(
 		tabs.map((tab) => ({ ...tab })) as Record<string, unknown>[],
 		userId,
 	);
-	const patches: RecentTabRuntimePatch[] = enriched.map((tab) => ({
-		key: `${String(tab.type)}:${String(tab.id)}`,
-		patch: {
-			status: tab.status ?? null,
-			substatus: tab.substatus ?? null,
-			hasDraft: tab.hasDraft ?? false,
-			activeTerminalCount: tab.activeTerminalCount ?? 0,
-			activeBackgroundTaskCount: tab.activeBackgroundTaskCount ?? 0,
-			activeBackgroundWorkCount: tab.activeBackgroundWorkCount ?? 0,
-			activeBackgroundServiceCount: tab.activeBackgroundServiceCount ?? 0,
-			viewers: tab.viewers ?? [],
-			viewerCount: tab.viewerCount ?? 0,
-			containerStatus: tab.containerStatus ?? null,
-			// M1: a team session this user can only read (no "waiting for you" alerts).
-			teamOnlooker: tab.teamOnlooker === true,
-			teamSession: tab.teamSession === true,
-		},
-	}));
+	// Runtime enrichment awaits other services; use the current ACL again before returning.
+	const readableKeys = readableRecentTabKeys(userId, tabs);
+	const patches: RecentTabRuntimePatch[] = enriched
+		.filter((tab) => readableKeys.has(`${String(tab.type)}:${String(tab.id)}`))
+		.map((tab) => ({
+			key: `${String(tab.type)}:${String(tab.id)}`,
+			patch: {
+				status: tab.status ?? null,
+				substatus: tab.substatus ?? null,
+				hasDraft: tab.hasDraft ?? false,
+				activeTerminalCount: tab.activeTerminalCount ?? 0,
+				activeBackgroundTaskCount: tab.activeBackgroundTaskCount ?? 0,
+				activeBackgroundWorkCount: tab.activeBackgroundWorkCount ?? 0,
+				activeBackgroundServiceCount: tab.activeBackgroundServiceCount ?? 0,
+				viewers: tab.viewers ?? [],
+				viewerCount: tab.viewerCount ?? 0,
+				containerStatus: tab.containerStatus ?? null,
+				// M1: a team session this user can only read (no "waiting for you" alerts).
+				teamOnlooker: tab.teamOnlooker === true,
+				teamSession: tab.teamSession === true,
+			},
+		}));
 	return { revision: snapshot.revision, patches };
 }
 

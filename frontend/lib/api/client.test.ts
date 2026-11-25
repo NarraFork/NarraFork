@@ -1,13 +1,20 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { businessTransport } from "../business-transport";
 import {
 	authorizedFetch,
+	clearToken,
 	clearTokenOnSessionFailure,
+	confirmAuthUser,
 	endSession,
+	getAuthSnapshot,
 	getErrorMessage,
 	getToken,
+	postFormDataWithProgress,
 	readFetchError,
 	readFetchErrorMessage,
+	request,
 	setToken,
+	subscribeAuth,
 } from "./client";
 
 const g = globalThis as typeof globalThis & { localStorage?: Storage };
@@ -63,6 +70,55 @@ describe("getToken without usable browser storage", () => {
 		});
 		expect(getToken()).toBeNull();
 	});
+});
+
+test("auth snapshots are stable, credential-free and never reuse a generation", () => {
+	installMapLocalStorage();
+	const initial = getAuthSnapshot();
+	const snapshots: ReturnType<typeof getAuthSnapshot>[] = [];
+	const unsubscribe = subscribeAuth(() => snapshots.push(getAuthSnapshot()));
+	try {
+		const a = setToken(opaqueToken("first-a"));
+		const unconfirmed = getAuthSnapshot();
+		expect(unconfirmed).toEqual({ generation: a, hasToken: true, userId: null });
+		expect(a).toBeGreaterThan(initial.generation);
+		expect(getAuthSnapshot()).toBe(unconfirmed);
+
+		confirmAuthUser(a, "account-a");
+		const confirmed = getAuthSnapshot();
+		expect(confirmed).toEqual({ generation: a, hasToken: true, userId: "account-a" });
+		expect(setToken(opaqueToken("first-a"))).toBe(a);
+		confirmAuthUser(a, "account-a");
+		expect(getAuthSnapshot()).toBe(confirmed);
+		expect(snapshots).toEqual([unconfirmed, confirmed]);
+
+		const sameAccount = setToken(opaqueToken("renewed-a"));
+		expect(sameAccount).toBeGreaterThan(a);
+		expect(getAuthSnapshot().userId).toBeNull();
+		confirmAuthUser(a, "account-a");
+		expect(getAuthSnapshot().userId).toBeNull();
+		confirmAuthUser(sameAccount, "account-a");
+
+		const b = setToken(opaqueToken("account-b"));
+		confirmAuthUser(b, "account-b");
+		const backToA = setToken(opaqueToken("first-a"));
+		expect(backToA).toBeGreaterThan(b);
+		confirmAuthUser(a, "account-a");
+		confirmAuthUser(b, "account-b");
+		expect(getAuthSnapshot()).toEqual({ generation: backToA, hasToken: true, userId: null });
+		confirmAuthUser(backToA, "account-a");
+		clearToken();
+		const signedOut = getAuthSnapshot();
+		confirmAuthUser(signedOut.generation, "account-a");
+		expect(signedOut.generation).toBeGreaterThan(backToA);
+		expect(getAuthSnapshot()).toEqual({
+			generation: signedOut.generation,
+			hasToken: false,
+			userId: null,
+		});
+	} finally {
+		unsubscribe();
+	}
 });
 
 describe("getErrorMessage", () => {
@@ -156,7 +212,9 @@ describe("getErrorMessage", () => {
 				headers: { "content-type": "application/json" },
 			},
 		);
-		expect(await readFetchErrorMessage(response)).toBe("Authentication required");
+		expect(await readFetchErrorMessage(response, undefined, getAuthSnapshot().generation)).toBe(
+			"Authentication required",
+		);
 		expect(getToken()).toBeNull();
 	});
 });
@@ -176,7 +234,9 @@ describe("session preservation on non-session 401s", () => {
 		// The user mistyped a TOTP code while turning two-factor auth off. Their
 		// session is untouched, so logging them out here would be a regression.
 		const response = json401({ code: "MFA_CODE_INVALID", error: "Invalid verification code" });
-		expect(await readFetchErrorMessage(response)).toBe("Invalid verification code");
+		expect(await readFetchErrorMessage(response, undefined, getAuthSnapshot().generation)).toBe(
+			"Invalid verification code",
+		);
 		expect(getToken()).toBe("live-session");
 	});
 
@@ -184,7 +244,7 @@ describe("session preservation on non-session 401s", () => {
 		installMapLocalStorage();
 		setToken("live-session");
 		const response = json401({ code: "OAUTH_REQUIRED", error: "OAuth access token required" });
-		await readFetchError(response);
+		await readFetchError(response, undefined, getAuthSnapshot().generation);
 		expect(getToken()).toBe("live-session");
 	});
 
@@ -192,7 +252,7 @@ describe("session preservation on non-session 401s", () => {
 		installMapLocalStorage();
 		setToken("expired-session");
 		const response = json401({ code: "TOKEN_EXPIRED", error: "Token expired" });
-		await readFetchError(response);
+		await readFetchError(response, undefined, getAuthSnapshot().generation);
 		expect(getToken()).toBeNull();
 	});
 
@@ -200,25 +260,38 @@ describe("session preservation on non-session 401s", () => {
 		installMapLocalStorage();
 		setToken("live-session");
 		const response = new Response("Unauthorized", { status: 401, statusText: "Unauthorized" });
-		await readFetchError(response);
+		await readFetchError(response, undefined, getAuthSnapshot().generation);
 		expect(getToken()).toBeNull();
 	});
 
 	test("clearTokenOnSessionFailure distinguishes session loss from other 401s", async () => {
 		installMapLocalStorage();
 		setToken("live-session");
-		await clearTokenOnSessionFailure(json401({ code: "PASSKEY_AUTH_FAILED" }));
+		const { generation } = getAuthSnapshot();
+		await clearTokenOnSessionFailure(json401({ code: "PASSKEY_AUTH_FAILED" }), generation);
 		expect(getToken()).toBe("live-session");
 
-		await clearTokenOnSessionFailure(json401({ code: "TOKEN_EXPIRED" }));
+		await clearTokenOnSessionFailure(json401({ code: "TOKEN_EXPIRED" }), generation);
 		expect(getToken()).toBeNull();
 	});
 
 	test("clearTokenOnSessionFailure ignores non-401 responses", async () => {
 		installMapLocalStorage();
 		setToken("live-session");
-		await clearTokenOnSessionFailure(new Response("nope", { status: 403 }));
+		await clearTokenOnSessionFailure(
+			new Response("nope", { status: 403 }),
+			getAuthSnapshot().generation,
+		);
 		expect(getToken()).toBe("live-session");
+	});
+
+	test("an untracked 401 can be read but cannot clear a session", async () => {
+		installMapLocalStorage();
+		setToken("new-session");
+		await clearTokenOnSessionFailure(json401({ code: "TOKEN_EXPIRED" }));
+		const error = await readFetchError(json401({ code: "TOKEN_EXPIRED" }));
+		expect(error.data.code).toBe("TOKEN_EXPIRED");
+		expect(getAuthSnapshot().hasToken).toBe(true);
 	});
 });
 
@@ -235,7 +308,7 @@ describe("authorizedFetch", () => {
 	});
 
 	function stubFetch(
-		respond: (input: string | URL, init?: RequestInit) => Response,
+		respond: (input: string | URL, init?: RequestInit) => Response | Promise<Response>,
 	): Array<{ input: string | URL; init?: RequestInit }> {
 		const calls: Array<{ input: string | URL; init?: RequestInit }> = [];
 		globalThis.fetch = (async (input: string | URL, init?: RequestInit) => {
@@ -276,12 +349,103 @@ describe("authorizedFetch", () => {
 		expect(calls[0].init?.body).toBe("{}");
 	});
 
+	test("late JSON and binary 401s cannot clear the returning account", async () => {
+		installMapLocalStorage();
+		const tokenA = opaqueToken("returning-a");
+		setToken(tokenA);
+		const releases: Array<() => void> = [];
+		stubFetch(
+			() =>
+				new Promise((resolve) => {
+					releases.push(() => resolve(json401({ code: "TOKEN_EXPIRED" })));
+				}),
+		);
+		const json = request("/anything");
+		const binary = authorizedFetch("/api/anything");
+		setToken(opaqueToken("other-b"));
+		const generation = setToken(tokenA);
+		confirmAuthUser(generation, "account-a");
+		for (const release of releases) release();
+		await expect(json).rejects.toMatchObject({ status: 401 });
+		await clearTokenOnSessionFailure(await binary);
+		expect(getAuthSnapshot()).toEqual({ generation, hasToken: true, userId: "account-a" });
+	});
+
+	test("a binary 401 only clears the current stored credential and remains caller-handled", async () => {
+		installMapLocalStorage();
+		const generation = setToken(opaqueToken("active"));
+		confirmAuthUser(generation, "account-a");
+		stubFetch(() => json401({ code: "TOKEN_EXPIRED" }));
+		const unrelated = await authorizedFetch("/api/anything", {
+			headers: { Authorization: "Bearer another-credential" },
+		});
+		await readFetchError(unrelated);
+		const response = await authorizedFetch("/api/anything");
+		await clearTokenOnSessionFailure(response.clone());
+		expect(getAuthSnapshot().generation).toBe(generation);
+		expect(getAuthSnapshot().hasToken).toBe(true);
+		await clearTokenOnSessionFailure(response);
+		expect(getAuthSnapshot().hasToken).toBe(false);
+		expect(getAuthSnapshot().userId).toBeNull();
+	});
+
+	test("a credential change during 401 body parsing prevents clearing the new session", async () => {
+		installMapLocalStorage();
+		setToken(opaqueToken("original"));
+		let writeBody!: () => void;
+		const body = new ReadableStream<Uint8Array>({
+			start(controller) {
+				writeBody = () => {
+					controller.enqueue(new TextEncoder().encode('{"code":"TOKEN_EXPIRED"}'));
+					controller.close();
+				};
+			},
+		});
+		stubFetch(
+			() => new Response(body, { status: 401, headers: { "Content-Type": "application/json" } }),
+		);
+		const handling = readFetchError(await authorizedFetch("/api/anything"));
+		const generation = setToken(opaqueToken("replacement"));
+		writeBody();
+		expect((await handling).data.code).toBe("TOKEN_EXPIRED");
+		expect(getAuthSnapshot()).toEqual({ generation, hasToken: true, userId: null });
+	});
+
 	test("sends no Authorization header when there is no session", async () => {
 		installMapLocalStorage();
 		const calls = stubFetch(() => new Response(null, { status: 200 }));
 		await authorizedFetch("/api/anything");
 		expect(new Headers(calls[0].init?.headers).get("Authorization")).toBeNull();
 	});
+});
+
+test("upload responses can only clear the generation that supplied their Authorization", async () => {
+	installMapLocalStorage();
+	const token = opaqueToken("upload");
+	setToken(token);
+	let finish!: (response: Response) => void;
+	const upload = spyOn(businessTransport, "upload").mockImplementation(
+		() =>
+			new Promise((resolve) => {
+				finish = resolve;
+			}),
+	);
+	try {
+		const opts = { headers: { Authorization: `Bearer ${token}` } };
+		const pending = postFormDataWithProgress("/api/upload", new FormData(), opts);
+		setToken(opaqueToken("replacement"));
+		const generation = setToken(token);
+		finish(json401({ code: "TOKEN_EXPIRED" }));
+		await readFetchError(await pending);
+		expect(getAuthSnapshot()).toEqual({ generation, hasToken: true, userId: null });
+
+		const current = postFormDataWithProgress("/api/upload", new FormData(), opts);
+		finish(json401({ code: "TOKEN_EXPIRED" }));
+		await readFetchError(await current);
+		expect(getAuthSnapshot().hasToken).toBe(false);
+	} finally {
+		upload.mockRestore();
+	}
 });
 
 describe("endSession", () => {
@@ -332,6 +496,23 @@ describe("endSession", () => {
 			expect(getToken()).toBe(replacement);
 		});
 	}
+	test("a completed revocation cannot clear a new generation with the same credential", async () => {
+		installMapLocalStorage();
+		let complete!: (response: Response) => void;
+		const response = new Promise<Response>((resolve) => {
+			complete = resolve;
+		});
+		globalThis.fetch = (() => response) as unknown as typeof fetch;
+		const token = opaqueToken("returned");
+		const before = setToken(token);
+		const pending = endSession();
+		const after = setToken(token);
+		complete(new Response(null));
+		await pending;
+		expect(after).toBeGreaterThan(before);
+		expect(getAuthSnapshot()).toEqual({ generation: after, hasToken: true, userId: null });
+	});
+
 	test("sends nothing when there is no session", () => {
 		installMapLocalStorage();
 		let called = false;

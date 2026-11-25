@@ -37,7 +37,7 @@ const { act } = await import("react");
 const { QueryClient, QueryClientProvider } = await import("@tanstack/react-query");
 const { createRoot } = await import("react-dom/client");
 const { api } = await import("../lib/api");
-const { clearToken, getToken, setToken } = await import("../lib/api/client");
+const { clearToken, getAuthSnapshot, getToken, setToken } = await import("../lib/api/client");
 const { appearanceStore } = await import("../lib/appearance-preference-store");
 const { applySession } = await import("./useAuth");
 const { useAppearanceSync } = await import("./useAppearanceSync");
@@ -209,6 +209,21 @@ afterAll(() => {
 		if (descriptor) Object.defineProperty(globalThis, key, descriptor);
 		else Reflect.deleteProperty(globalThis, key);
 	}
+});
+
+test("applySession confirms its login result even with no me or preferences mounted", async () => {
+	const initial = getAuthSnapshot();
+	await login("a");
+	expect(getAuthSnapshot()).toEqual({ ...initial, hasToken: true, userId: "a" });
+	await login("b");
+	const b = getAuthSnapshot();
+	expect(b.generation).toBeGreaterThan(initial.generation);
+	expect(b.userId).toBe("b");
+	await login("a");
+	const a = getAuthSnapshot();
+	expect(a.generation).toBeGreaterThan(b.generation);
+	expect(a.userId).toBe("a");
+	expect(client.getQueryData(["auth", "me"])).toEqual({ id: "a" });
 });
 
 test("defaults retain account fields and legacy local OLED without uploading hydration", async () => {

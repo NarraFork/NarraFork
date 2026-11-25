@@ -44,6 +44,9 @@ export const REMOTE_REQUEST_POLICY: RemoteRequestRule[] = [
 	rule("project-access", ["GET"], `/api/projects/${narratorId}/access`),
 	rule("narrators", ["GET"], "/api/narrators"),
 	rule("narrator", ["GET"], narrator),
+	rule("communication-candidates", ["GET"], `${narrator}/communication/candidates`),
+	rule("communication-manage", ["POST"], `${narrator}/communication`),
+	rule("submission-receipt", ["GET"], `${narrator}/submissions/${id}`),
 	rule(
 		"narrator-state",
 		["GET"],

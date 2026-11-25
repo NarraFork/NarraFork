@@ -59,6 +59,36 @@ describe("mergeToolbarLayout", () => {
 		expect(flat.indexOf("browser")).toBeLessThan(flat.indexOf(NARRATOR_TOOLBAR_DIVIDER_ID));
 	});
 
+	it("surfaces communication in old layouts without moving saved zones", () => {
+		const flat = ids(
+			mergeToolbarLayout({
+				items: [
+					{ id: "git" },
+					{ id: NARRATOR_TOOLBAR_DIVIDER_ID },
+					{ id: "details" },
+					{ id: NARRATOR_TOOLBAR_BOTTOM_DIVIDER_ID },
+					{ id: "terminal" },
+				],
+			}),
+		);
+		expect(flat.indexOf("communication")).toBeLessThan(flat.indexOf(NARRATOR_TOOLBAR_DIVIDER_ID));
+		expect(flat.indexOf("details")).toBeGreaterThan(flat.indexOf(NARRATOR_TOOLBAR_DIVIDER_ID));
+		expect(flat.indexOf("terminal")).toBeGreaterThan(
+			flat.indexOf(NARRATOR_TOOLBAR_BOTTOM_DIVIDER_ID),
+		);
+		expect(flat.filter((id) => id === "communication")).toHaveLength(1);
+	});
+
+	it("keeps communication reachable through a narrow mobile overflow menu", () => {
+		const { visible, overflow } = partitionToolbar({
+			entries: mergeToolbarLayout(undefined),
+			hostCapabilities: ["drawer", "inline"],
+			visibleLimit: 0,
+		});
+		expect(visible).toEqual([]);
+		expect(overflow.map((item) => item.id)).toContain("communication");
+	});
+
 	it("surfaces the lodlevel entry for layouts saved before it existed", () => {
 		// `lodlevel` ships as the Alt-gesture-independent detail-level entry point;
 		// existing users (no stored id) must get it surfaced, not tucked away.
@@ -386,9 +416,9 @@ describe("partitionToolbar", () => {
 				visibleLimit: 2,
 				entryEnabled: (id) => id !== "tasks",
 			});
-			// filetree is drawer-capable since MobileToolPanelHost grew a tree drawer,
-			// so on this host it legitimately takes the first capped slot.
-			expect(visible.map((d) => d.id)).toEqual(["filetree", "details"]);
+			// Communication and filetree both have drawer hosts and back-fill the
+			// disabled task entry before applying the narrow header cap.
+			expect(visible.map((d) => d.id)).toEqual(["communication", "filetree"]);
 		});
 
 		it("drops disabled entries from both lists on an uncapped host", () => {

@@ -1,4 +1,10 @@
 import { describe, expect, test } from "bun:test";
+import { clearToken, confirmAuthUser, setToken } from "../lib/api/client";
+import {
+	getRecentTabsScope,
+	recentTabsScopeKey,
+	requireRecentTabsScope,
+} from "../lib/recent-tabs-owner";
 import {
 	invalidateProjectCreateQueries,
 	invalidateProjectDeleteQueries,
@@ -19,15 +25,36 @@ describe("project create frontend refresh helpers", () => {
 });
 
 describe("project delete frontend refresh helpers", () => {
-	test("invalidates project list and recent tabs after local delete mutation", () => {
+	test("invalidates only the initiating RecentTabs account after local delete mutation", () => {
 		const calls: unknown[][] = [];
-		invalidateProjectDeleteQueries({
-			invalidateQueries: ({ queryKey }) => {
+		const queryClient = {
+			invalidateQueries: ({ queryKey }: { queryKey: readonly unknown[] }) => {
 				calls.push([...queryKey]);
 			},
+		};
+		const storage = new Map<string, string>();
+		const original = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+		Object.defineProperty(globalThis, "localStorage", {
+			configurable: true,
+			value: {
+				getItem: (key: string) => storage.get(key) ?? null,
+				setItem: (key: string, value: string) => storage.set(key, value),
+				removeItem: (key: string) => storage.delete(key),
+			},
 		});
-
-		expect(calls).toEqual([["projects"], ["user-preferences", "recent-tabs"]]);
+		try {
+			confirmAuthUser(setToken("project-test-auth"), "project-test-user");
+			const scope = getRecentTabsScope();
+			requireRecentTabsScope(scope);
+			invalidateProjectDeleteQueries(queryClient, scope);
+			confirmAuthUser(setToken("project-replacement-auth"), "project-test-user");
+			invalidateProjectDeleteQueries(queryClient, scope);
+			expect(calls).toEqual([["projects"], [...recentTabsScopeKey(scope)], ["projects"]]);
+		} finally {
+			clearToken();
+			if (original) Object.defineProperty(globalThis, "localStorage", original);
+			else Reflect.deleteProperty(globalThis, "localStorage");
+		}
 	});
 
 	test("refreshes project list when a recent-tabs snapshot removes a project tab", () => {

@@ -824,6 +824,37 @@ describe("composer revision-only initial reconciliation", () => {
 });
 
 describe("composer rich document contract", () => {
+	test("authored narrator identity survives draft storage, hidden send snapshot and failed-send recovery", async () => {
+		await render();
+		const atom = {
+			type: "narratorReference" as const,
+			id: "occurrence",
+			narratorId: "stable-target",
+			label: "Snapshot title",
+		};
+		const doc: ComposerDocument = {
+			version: 1,
+			assets: [],
+			paragraphs: [
+				{ children: [{ type: "text", text: "Ask " }, atom, { type: "text", text: " later" }] },
+			],
+		};
+		const input = composerDocumentText(doc);
+		await act(async () => handle.current?.restoreInput(input.text, input.fileReferences, doc));
+		expect(handle.current?.getDocument()).toEqual(doc);
+		expect(readNarratorInputDraft("u1", "n1").composerDocument).toEqual(doc);
+		await act(async () => handle.current?.noteSent(input.text, input.fileReferences, doc));
+		sendingRef.current = true;
+		await act(async () => handle.current?.hideTextForSend());
+		expect(readNarratorInputDraft("u1", "n1").composerDocument).toEqual(doc);
+		sendingRef.current = false;
+		await act(async () => handle.current?.restoreInput(input.text, input.fileReferences, doc));
+		expect(handle.current?.getDocument()?.paragraphs[0].children).toContainEqual(atom);
+		const editor = getEditor();
+		await act(async () => editor.view.dispatch(editor.state.tr.insertText("new ", 1)));
+		await act(async () => editor.commands.undo());
+		expect(handle.current?.getDocument()).toEqual(doc);
+	});
 	function richDocument(): ComposerDocument {
 		return parseComposerDocument({
 			version: 1,

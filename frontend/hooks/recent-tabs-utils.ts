@@ -43,43 +43,6 @@ export function isTeamOnlookerTab(tabs: readonly RecentTab[], narratorId: string
 }
 
 /**
- * A subagent tab whose team membership is not known yet: the runtime patch (which says whether
- * it is a team session) has not been read. A subagent's root is not known on the client.
- */
-function subagentOfUnknownTeam(tab: RecentTab): boolean {
-	return tab.type === "subagent" && tab.teamSession === undefined;
-}
-
-/**
- * Whether an access change of `narratorId` may have changed `teamOnlooker` on these tabs, so
- * their runtime patches must be read again (M1): a tab of that narrator, an onlooker tab, or a
- * subagent tab of a team session (or of a team not known yet: its root may be that narrator).
- */
-export function accessChangeNeedsRuntimeRefresh(
-	tabs: readonly RecentTab[],
-	narratorId: string,
-): boolean {
-	return tabs.some(
-		(tab) =>
-			tab.teamOnlooker === true ||
-			(tab.type === "subagent" && tab.teamSession === true) ||
-			subagentOfUnknownTeam(tab) ||
-			(tab.type === "narrator" && tab.id === narratorId),
-	);
-}
-
-/**
- * Whether a project access change may have changed `teamOnlooker` (M1): project grants and
- * visibility decide who passes a team coordinator's project-wide audiences. Any team session tab
- * qualifies, and a subagent tab whose team is not known yet.
- */
-export function projectAccessChangeNeedsRuntimeRefresh(tabs: readonly RecentTab[]): boolean {
-	return tabs.some(
-		(tab) => tab.teamSession === true || tab.teamOnlooker === true || subagentOfUnknownTeam(tab),
-	);
-}
-
-/**
  * The attention a narrator status calls for (after the reflecting and model-wait checks):
  * "waiting" for a person, "unread" (done), or none. A team onlooker (M1) cannot act on what
  * a team session waits for, so a waiting session alerts them only as far as it is unread.

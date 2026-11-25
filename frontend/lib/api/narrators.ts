@@ -37,7 +37,6 @@ import {
 	ApiError,
 	apiBase,
 	authorizedFetch,
-	clearTokenOnSessionFailure,
 	getToken,
 	postBodyWithProgress,
 	postFormDataWithProgress,
@@ -73,6 +72,15 @@ import type {
 	WhitelistDir,
 } from "./types";
 import { normalizeRuleTargetSelector, selectorToLegacyDeviceScope } from "./types";
+
+export interface NarratorSubmissionReceipt {
+	status: "accepted";
+	id: string;
+	bufferedAt: string;
+	state: string;
+	messageId: string | null;
+	dedupeExpiresAt: string;
+}
 
 export interface ComposerDocumentDetail {
 	composerDocument?: ComposerDocument;
@@ -921,7 +929,6 @@ export const narratorsApi = {
 			{ signal },
 		);
 		if (!response.ok) {
-			await clearTokenOnSessionFailure(response.clone());
 			const error = await readFetchError(response, "Git summary read failed");
 			throw new ApiError(error.message, response.status, error.data);
 		}
@@ -1986,7 +1993,7 @@ export const narratorsApi = {
 		fileReferences?: FileReference[],
 		interrupt?: boolean,
 		queueMode?: "turn" | "tool" | "interrupt",
-		options?: { composerDocument?: ComposerDocument },
+		options?: { composerDocument?: ComposerDocument; clientSubmissionId?: string },
 		media?: File[],
 	) => {
 		// Only files that ride inside the multipart body count against its budget;
@@ -2032,6 +2039,8 @@ export const narratorsApi = {
 				: [];
 			const formData = new FormData();
 			formData.append("message", message);
+			if (options?.clientSubmissionId)
+				formData.append("clientSubmissionId", options.clientSubmissionId);
 			if (images) {
 				for (const img of images) formData.append("images", img);
 			}
@@ -2049,24 +2058,18 @@ export const narratorsApi = {
 			if (options?.composerDocument !== undefined) {
 				formData.append("composerDocument", JSON.stringify(options.composerDocument));
 			}
-			// Use XHR-backed upload so we can surface real upload progress to the UI.
-			try {
-				res = await postFormDataWithProgress(url, formData, {
-					headers,
-					onProgress: onUploadProgress
-						? (fraction) =>
-								onUploadProgress(
-									totalBytes ? (streamedBytes + fraction * requestBytes) / totalBytes : fraction,
-								)
-						: undefined,
-					signal,
-				});
-			} catch (error) {
-				// The send failed, so nothing will claim these uploads. Dropping them now
-				// keeps the staging area from holding gigabytes until the TTL sweep.
-				discardStagedAttachments(narratorId, staged);
-				throw error;
-			}
+			// Transport failure does not prove rejection: admission may already own these
+			// uploads. Keep them for receipt reconciliation / the bounded staging TTL.
+			res = await postFormDataWithProgress(url, formData, {
+				headers,
+				onProgress: onUploadProgress
+					? (fraction) =>
+							onUploadProgress(
+								totalBytes ? (streamedBytes + fraction * requestBytes) / totalBytes : fraction,
+							)
+					: undefined,
+				signal,
+			});
 		} else {
 			headers["Content-Type"] = "application/json";
 			res = await authorizedFetch(url, {
@@ -2079,6 +2082,7 @@ export const narratorsApi = {
 					...(queueMode !== undefined ? { queueMode } : {}),
 					fileReferences,
 					composerDocument: options?.composerDocument,
+					clientSubmissionId: options?.clientSubmissionId,
 				}),
 				signal,
 			});
@@ -2089,12 +2093,21 @@ export const narratorsApi = {
 			throw new ApiError(error.message, 401, error.data);
 		}
 		if (!res.ok) {
-			discardStagedAttachments(narratorId, staged);
+			if (res.status < 500 && res.status !== 408) discardStagedAttachments(narratorId, staged);
 			const error = await readFetchError(res, "Request failed");
 			throw new ApiError(error.message, res.status, error.data);
 		}
 		return res.json();
 	},
+	getNarratorSubmissionReceipt: (
+		narratorId: string,
+		clientSubmissionId: string,
+		signal?: AbortSignal,
+	) =>
+		request<NarratorSubmissionReceipt>(
+			`/narrators/${encodeURIComponent(narratorId)}/submissions/${encodeURIComponent(clientSubmissionId)}`,
+			{ signal },
+		),
 	retryLastMessage: (narratorId: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/retry`, { method: "POST" }),
 	continueNarrator: (narratorId: string, recoveryMessageId?: string) =>

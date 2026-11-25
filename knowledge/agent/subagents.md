@@ -23,6 +23,17 @@ anchors:
   - server/services/subagent-activity.ts
   - server/services/subagent-alias.ts
   - server/services/subagent-communication-policy.ts
+  - server/services/narrator-communication.ts
+  - server/routes/narrator-communication.ts
+  - server/services/narrator-communication/store.ts
+  - server/services/narrator-communication/access.ts
+  - server/services/narrator-communication/predicates.ts
+  - server/services/narrator-communication/service.ts
+  - server/services/narrator-communication/reader.ts
+  - server/services/narrator-communication/postgres.ts
+  - server/services/narrator-communication/initialize.ts
+  - server/services/narrator-communication/index.ts
+  - shared/narrator-communication.ts
   - server/services/subagent-execution-boundary.ts
   - server/services/subagent-executor.ts
   - server/services/subagent-extract.ts
@@ -66,7 +77,7 @@ keywords:
   - subagent_nested_changed
   - FORK_NARRATOR_MAX_DEPTH
 status: draft
-verified_at: 2e6441ad0
+verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 ---
 # 子代理
 
@@ -82,6 +93,9 @@ verified_at: 2e6441ad0
 - 资源回收（`subagent-resources.ts`）：子代理被归档或删除时，关闭它创建的所有运行中终端和启动的浏览器会话；一次运行结束且没有待处理工作（helper 仍在工作、或已排队的输入）时，关闭此刻打开的浏览器会话，终端保留（dev server、REPL 可跨轮使用）。主叙述者不受影响，所有函数尽力而为、不抛错；单次最多关闭 50 个终端。
 - `subagent-lifecycle.ts:interruptAndArchiveSubagent`：先取消运行再标记归档，不抛错，保证删除历史不会因副作用失败。
 - 与子代理通信：Send（异步）与 Watch（观察）；运行时策略不含 `watchAgent` 能力时 Watch agent 被拒（`subagent-communication-policy.ts`）。
+- 普通 Send 的可达性单独由通讯森林和精确 peer 决定：同一通讯根下的主代理、子代理和二级助手可互发；不同组只有两个精确端点的 peer 可达，不沿 peer 传递。每次重连分配新关系 ID，断连按此身份且以任一实际可管理端点发起，不另维护固定代际。名单和投影有展示上限，精确 ID 的授权不依赖截断名单。ContextAsk、Watch、Stop、TeamStatus 的原控制/读取范围不因此扩大。
+- “移出通讯组”仅清所选节点的通讯父边，后代仍随该节点组成一组；恢复只接回持久保存的原通讯父边。controller、policy source、ACL root、工作项和自动结果回传保持不变。普通 Send(parent)、TeamStatus.send/broadcast 与 work.sync 都受普通消息最终准入 gate 约束，注册的任务结果通知不借此重建 peer。
+- 子代理出生同事务写通讯节点；普通 fork 创建独立通讯根。旧数据初始化只补缺失节点，显式 NULL 不再推导为继承；坏链/环/超深拒绝域授权。发送时重新读取源会话持久执行身份和当前权限，不能借消息作者覆盖接收会话身份。
 
 ## 从哪读起
 - `server/lib/agent/tools/task.ts`：工具入口与参数。

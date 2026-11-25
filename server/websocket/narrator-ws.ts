@@ -104,6 +104,10 @@ import {
 	toolOpened,
 } from "./narrator-block-protocol";
 import {
+	handleCommunicationMessage,
+	releaseCommunicationSubscriptions,
+} from "./narrator-communication-ws";
+import {
 	createCodexQuotaOverviewWsMessage,
 	type NarratorListStateSnapshotItem,
 	type NarratorServerMessage,
@@ -172,6 +176,7 @@ export type NarratorClientMessage =
 	| ReasoningTranslationVisibilityReport
 	| import("@shared/editor-file-events").EditorFileClientMessage
 	| import("@shared/outline-page-events").OutlinePageClientMessage
+	| import("@shared/narrator-communication").CommunicationClientMessage
 	| { type: "pong" }
 	| {
 			type: "subscribe";
@@ -348,6 +353,7 @@ function removeConnection(ws: NarratorWS): void {
 	releaseGitWorkspaceSubscriptions(ws);
 	releaseEditorFileSubscriptions(ws);
 	releaseOutlinePageSubscriptions(ws);
+	releaseCommunicationSubscriptions(ws);
 	releaseOutlineLive(ws);
 	const removed = connections.delete(ws);
 	if (removed && ws.data.publicShare) {
@@ -2100,6 +2106,10 @@ export const handleNarratorWS = {
 		if (!(await authorizeNarratorFrame(ws, msg))) return;
 
 		switch (msg.type) {
+			case "communication_subscribe":
+			case "communication_unsubscribe":
+				handleCommunicationMessage(ws, msg);
+				break;
 			case "reasoning_translation_visibility":
 				setTranslationDemand(ws, msg);
 				break;

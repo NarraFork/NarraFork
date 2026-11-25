@@ -3,6 +3,7 @@ import { type PersistedRecentTab, RECENT_TABS_STORAGE_LIMIT } from "@shared/rece
 import { eq } from "drizzle-orm";
 import {
 	narrators,
+	projects,
 	userPreferences,
 	userRecentTabs,
 	userRecentTabsMeta,
@@ -64,6 +65,30 @@ function seedLegacyTabs(tabs: PersistedRecentTab[], userId = "user-1"): void {
 			updatedAt: NOW,
 		})
 		.run();
+}
+
+function seedReadableLegacyTabs(
+	tabs: PersistedRecentTab[],
+	extraResources: PersistedRecentTab[] = [],
+): void {
+	seedLegacyTabs(tabs);
+	for (const tab of [...tabs, ...extraResources]) {
+		if (tab.type === "narrator") {
+			db.insert(narrators)
+				.values({ id: tab.id, ownerUserId: "user-1", createdAt: NOW, updatedAt: NOW })
+				.run();
+		} else if (tab.type === "project") {
+			db.insert(projects)
+				.values({
+					id: tab.id,
+					name: tab.title,
+					ownerUserId: "user-1",
+					createdAt: NOW,
+					updatedAt: NOW,
+				})
+				.run();
+		}
+	}
 }
 
 function makeTab(id: string, overrides: Partial<PersistedRecentTab> = {}): PersistedRecentTab {
@@ -241,7 +266,7 @@ describe("recent-tabs lazy migration", () => {
 
 describe("recent-tabs revisions and deltas", () => {
 	it("does not advance revision or broadcast for a no-op", async () => {
-		seedLegacyTabs([makeTab("n-1")]);
+		seedReadableLegacyTabs([makeTab("n-1")], [makeTab("n-2")]);
 		await recentTabs.ensureMigrated("user-1");
 
 		const first = await recentTabs.upsertRecentTab("user-1", makeTab("n-2"));
@@ -271,7 +296,7 @@ describe("recent-tabs revisions and deltas", () => {
 	});
 
 	it("anchors metadata deltas within the tab's own section", async () => {
-		seedLegacyTabs([
+		seedReadableLegacyTabs([
 			makeTab("n-1"),
 			makeTab("p-1", { type: "project" }),
 			makeTab("n-2"),
@@ -294,7 +319,7 @@ describe("recent-tabs revisions and deltas", () => {
 	});
 
 	it("marks the first row of a section with a null predecessor", async () => {
-		seedLegacyTabs([makeTab("p-1", { type: "project" }), makeTab("n-1"), makeTab("n-2")]);
+		seedReadableLegacyTabs([makeTab("p-1", { type: "project" }), makeTab("n-1"), makeTab("n-2")]);
 		await recentTabs.ensureMigrated("user-1");
 
 		const result = await recentTabs.upsertRecentTab("user-1", makeTab("n-1", { title: "Renamed" }));
@@ -308,7 +333,7 @@ describe("recent-tabs revisions and deltas", () => {
 	});
 
 	it("includes displaced block members when constructing sequential moves", async () => {
-		seedLegacyTabs([makeTab("a"), makeTab("b"), makeTab("c"), makeTab("d")]);
+		seedReadableLegacyTabs([makeTab("a"), makeTab("b"), makeTab("c"), makeTab("d")]);
 		await recentTabs.ensureMigrated("user-1");
 
 		const result = await recentTabs.restoreRecentTabs("user-1", {
@@ -338,7 +363,7 @@ describe("recent-tabs revisions and deltas", () => {
 				]),
 			);
 		}
-		seedLegacyTabs(blocks.flat());
+		seedReadableLegacyTabs(blocks.flat());
 		await recentTabs.ensureMigrated("user-1");
 
 		for (const order of permutations(blocks)) {
@@ -431,7 +456,7 @@ describe("recent-tabs row-level persistence", () => {
 
 describe("recent-tabs pagination and folders", () => {
 	it("places narrator tabs in work and only project tabs in projects", async () => {
-		seedLegacyTabs([
+		seedReadableLegacyTabs([
 			makeTab("project-1", { type: "project" }),
 			makeTab("narrator-1", { type: "narrator" }),
 		]);
@@ -443,7 +468,7 @@ describe("recent-tabs pagination and folders", () => {
 	});
 
 	it("drops legacy chat-group tabs (the feature was removed)", async () => {
-		seedLegacyTabs([
+		seedReadableLegacyTabs([
 			makeTab("project-1", { type: "project" }),
 			makeTab("group-1", { type: "group" }),
 		]);
@@ -470,7 +495,7 @@ describe("recent-tabs pagination and folders", () => {
 
 	it("pages the pinned block first even when stored sort keys disagree", async () => {
 		const tabs = Array.from({ length: 6 }, (_, index) => makeTab(`n-${index}`));
-		seedLegacyTabs(tabs);
+		seedReadableLegacyTabs(tabs);
 		await recentTabs.ensureMigrated("user-1");
 		// Rows written before the pinned block was enforced: pinned rows below unpinned ones.
 		db.update(userRecentTabs)
@@ -514,7 +539,7 @@ describe("recent-tabs pagination and folders", () => {
 			tabs.push(makeTab(`child-${index}`, { folderId: "ws-1" }));
 		}
 		tabs.push(makeTab("n-last"));
-		seedLegacyTabs(tabs);
+		seedReadableLegacyTabs(tabs);
 
 		const first = await recentTabs.listPage("user-1", "work", undefined, 50);
 		expect(first.items).toHaveLength(55);
@@ -727,7 +752,7 @@ describe("recent-tabs capacity and undo", () => {
 describe("recent-tabs folder member anchored moves", () => {
 	const memberIds = ["child-a", "child-b", "child-c", "child-d"];
 	const seedWorkspace = async () => {
-		seedLegacyTabs([
+		seedReadableLegacyTabs([
 			makeTab("project-1", { type: "project", pinned: true }),
 			makeTab("n-top"),
 			makeTab("ws-1", { type: "folder", title: "Folder" }),
@@ -1005,7 +1030,7 @@ describe("recent-tabs folder deltas replay on the client", () => {
 	});
 
 	it("create, join, reorder, pin, leave, dissolve and close", async () => {
-		seedLegacyTabs(["a", "b", "c", "d", "e"].map((id) => makeTab(id)));
+		seedReadableLegacyTabs(["a", "b", "c", "d", "e"].map((id) => makeTab(id)));
 		await recentTabs.ensureMigrated("user-1");
 		let folderId = "";
 		await expectReplay(async () => {

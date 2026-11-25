@@ -18,6 +18,7 @@ import {
 	type RefObject,
 	useCallback,
 	useEffect,
+	useId,
 	useImperativeHandle,
 	useMemo,
 	useRef,
@@ -27,13 +28,14 @@ import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../../hooks/useAuth";
 import { useDraftComposerCommands, useNarratorCommands } from "../../../hooks/useCommands";
 import { useInputHistory, writeInputHistoryEntries } from "../../../hooks/useInputHistory";
-import { useNamedNarrators } from "../../../hooks/useNamedNarrator";
+import { useNarratorMentionCandidates } from "../../../hooks/useNarratorMentionCandidates";
 import { usePromptOptimize } from "../../../hooks/usePromptOptimize";
 import { api } from "../../../lib/api";
 import { listenComposerAppend } from "../../../lib/composer-append-queue";
 import { useFullscreenEscape } from "../../../lib/fullscreen-escape";
 import { formatLocaleNumber } from "../../../lib/intl-format";
 import { shouldFallbackPanelState } from "../../../lib/narrator-panel-state";
+import { PANEL_DROP_PRIORITY, registerPanelDropTarget } from "../../../lib/panel-drag";
 import { Z } from "../../../lib/z-index";
 import { useImageViewer } from "../../common/image-viewer-context";
 import { useNarratorDockContext } from "../dock/NarratorDockContext";
@@ -383,6 +385,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		const draftOwnerScopeRef = useRef<string | null>(null);
 		const textareaRef = useRef<HTMLDivElement>(null);
 		const editorRef = useRef<InlineComposerEditorHandle>(null);
+		const dropTargetId = useId();
 		const [editorElement, setEditorElement] = useState<HTMLDivElement | null>(null);
 		const [editorFocused, setEditorFocused] = useState(false);
 		useEffect(() => {
@@ -1362,8 +1365,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			clearTextAndDraft();
 		}, [clearTextAndDraft]);
 
-		// === @mention of named narrators ===========================================
-		const { data: namedNarrators } = useNamedNarrators();
+		// === Authored narrator references (ordinary @text is never promoted) =========
 		const [mentionCaret, setMentionCaret] = useState<number | null>(null);
 		const [queryContext, setQueryContext] =
 			useState<ReturnType<InlineComposerEditorHandle["getTextContext"]>>(null);
@@ -1391,43 +1393,74 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			if (commandInput.startsWith("/")) return null;
 			return getMentionQuery(queryContext.text, queryContext.caret - queryContext.start);
 		}, [commandInput, mentionCaret, queryContext]);
-		const mentionCandidates = useMemo<MentionCandidate[]>(() => {
-			if (!namedNarrators) return [];
-			return namedNarrators
-				.filter((n: { handle?: string | null }) => !!n.handle)
-				.map((n: { id: string; handle: string; title?: string | null; status?: string }) => ({
-					id: n.id,
-					handle: n.handle,
-					title: n.title,
-					status: n.status,
-				}));
-		}, [namedNarrators]);
 		const mentionPopoverVisible =
-			editorFocused &&
-			mentionQuery !== null &&
-			!inputHistory.isBrowsing &&
-			mentionCandidates.length > 0;
+			editorFocused && mentionQuery !== null && !inputHistory.isBrowsing && !draft;
+		const {
+			candidates: mentionCandidates,
+			loading: mentionLoading,
+			error: mentionError,
+		} = useNarratorMentionCandidates(narratorId, mentionQuery, mentionPopoverVisible);
+		const insertNarratorReference = useCallback(
+			(candidate: MentionCandidate) => {
+				if (candidate.id === narratorId || candidate.canConnect === false) return;
+				const editor = editorRef.current;
+				if (!editor) return;
+				editor.focus();
+				editor.insertNodes([
+					{
+						type: "narratorReference",
+						id: composerNodeId(),
+						narratorId: candidate.id,
+						label: (
+							candidate.title?.replace(/\p{Cc}/gu, " ").trim() ||
+							candidate.handle ||
+							candidate.id
+						).slice(0, 256),
+					},
+					{ type: "text", text: " " },
+				]);
+				setMentionCaret(null);
+				setQueryContext(null);
+			},
+			[narratorId],
+		);
 		const handleMentionSelect = useCallback(
 			(candidate: MentionCandidate) => {
-				const caret = mentionCaret;
-				if (caret === null) return;
-				const upto = bodyText.slice(0, caret);
-				const at = upto.lastIndexOf("@");
-				if (at === -1) return;
-				const before = bodyText.slice(0, at);
-				const after = bodyText.slice(caret);
-				const insert = `@${candidate.handle} `;
-				const next = before + insert + after;
-				setBodyText(next);
-				// Move caret to just after the inserted handle.
-				const nextCaret = before.length + insert.length;
-				requestAnimationFrame(() => {
-					editorRef.current?.focus();
-					editorRef.current?.setSelection(nextCaret, nextCaret);
-					setMentionCaret(nextCaret);
-				});
+				if (!queryContext || mentionCaret === null) return;
+				const at = queryContext.text
+					.slice(0, queryContext.caret - queryContext.start)
+					.lastIndexOf("@");
+				if (at < 0) return;
+				editorRef.current?.setSelection(queryContext.start + at, queryContext.caret);
+				insertNarratorReference(candidate);
 			},
-			[bodyText, mentionCaret, setBodyText],
+			[queryContext, mentionCaret, insertNarratorReference],
+		);
+		useEffect(
+			() =>
+				registerPanelDropTarget({
+					id: `composer:${narratorId}:${dropTargetId}`,
+					priority: PANEL_DROP_PRIORITY.composer,
+					hitTest: (state) => {
+						const element = editorRef.current?.getElement();
+						if (!element || draft || state.subjectKind !== "narrator") return null;
+						const rect = element.getBoundingClientRect();
+						return rect.width > 0 &&
+							rect.height > 0 &&
+							state.x >= rect.left &&
+							state.x <= rect.right &&
+							state.y >= rect.top &&
+							state.y <= rect.bottom
+							? state
+							: null;
+					},
+					onDrop: (_state, hit) => {
+						if (sendingRef.current || hit.id === narratorId) return;
+						if (!editorRef.current?.setSelectionAtPoint(hit.x, hit.y)) return;
+						insertNarratorReference({ id: hit.id, title: hit.title });
+					},
+				}),
+			[narratorId, dropTargetId, draft, sendingRef, insertNarratorReference],
 		);
 		const closeMentionPopover = useCallback(() => setMentionCaret(null), []);
 
@@ -1675,7 +1708,15 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			if (commandPopoverVisible && e.key !== "Enter") return;
 			// Same for the @mention popover: it consumes arrow/tab/escape/enter via a
 			// capture-phase listener; guard here so navigation keys don't double-handle.
-			if (mentionPopoverVisible && e.key !== "Enter") return;
+			if (mentionPopoverVisible) {
+				// Even before the popover's effect installs its capture listener, a visible
+				// empty/loading list owns Enter; the editor must never race it into sending.
+				if (e.key === "Enter" && !e.shiftKey) {
+					e.preventDefault();
+					e.stopPropagation();
+				}
+				return;
+			}
 
 			if (e.key === "Enter" && !e.nativeEvent.isComposing) {
 				// 全屏编辑模式下 Enter/Shift+Enter 一律只换行,不发送(发送走按钮或 mod+Enter)。
@@ -1863,6 +1904,8 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					candidates={mentionCandidates}
 					query={mentionQuery}
 					visible={mentionPopoverVisible}
+					loading={mentionLoading}
+					error={mentionError}
 					onSelect={handleMentionSelect}
 					onClose={closeMentionPopover}
 				/>

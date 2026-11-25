@@ -196,9 +196,12 @@ export const codexFingerprintSchema = z.object({
 export const bufferQueueModeSchema = z.enum(["turn", "tool", "interrupt"]);
 export const updateBufferedMessageModeSchema = z.object({ mode: bufferQueueModeSchema }).strict();
 
+export const clientSubmissionIdSchema = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/u);
+
 export const sendMessageSchema = z
 	.object({
 		message: z.string().default(""),
+		clientSubmissionId: clientSubmissionIdSchema.optional(),
 		priority: z.boolean().optional(),
 		interrupt: z.boolean().optional(),
 		queueMode: bufferQueueModeSchema.optional(),

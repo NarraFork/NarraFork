@@ -1,3 +1,4 @@
+import { assetUrl } from "@frontend/lib/base-path";
 import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { isRemoteInlineImage } from "@frontend/lib/remote-resource-policy";
 import type {
@@ -5,7 +6,11 @@ import type {
 	ComposerDocument,
 	ComposerInlineNode,
 } from "@shared/composer-document";
-import { parseComposerDocument } from "@shared/composer-document";
+import {
+	composerNarratorReferenceText,
+	MAX_COMPOSER_DOCUMENT_BYTES,
+	parseComposerDocument,
+} from "@shared/composer-document";
 import type { FileReference } from "@shared/file-reference";
 import {
 	IconFileText,
@@ -27,6 +32,7 @@ import {
 	type SelectionBookmark,
 	TextSelection,
 } from "@tiptap/pm/state";
+import type { EditorView } from "@tiptap/pm/view";
 import {
 	EditorContent,
 	Extension,
@@ -53,6 +59,8 @@ import {
 	useState,
 } from "react";
 import { useTranslation } from "react-i18next";
+import { AgentReferenceOpenerContext } from "../markdown/AgentReferenceLink";
+import { composerNodeId } from "./composer-document-adapter";
 import { fileReferenceToken } from "./file-reference-input";
 import classes from "./InlineComposerEditor.module.css";
 import { useComposerLayout } from "./use-composer-layout";
@@ -95,6 +103,8 @@ export interface InlineComposerEditorHandle {
 	getTextContext(): InlineComposerTextContext | null;
 	captureSelectionBookmark(): InlineComposerSelectionBookmark;
 	setSelection(start: number, end: number): void;
+	/** Use the editor's native atom-aware mapping for pointer drop insertion. */
+	setSelectionAtPoint(x: number, y: number): boolean;
 	getElement(): HTMLDivElement | null;
 }
 export interface InlineComposerEditorProps {
@@ -126,6 +136,9 @@ export interface InlineComposerEditorProps {
 
 /** Bounds the unacknowledged-emission queue for a parent that never renders changes back. */
 const MAX_PENDING_ECHOES = 32;
+
+/** Only this explicit semantic channel can carry authored references; never HTML or @text. */
+export const COMPOSER_CLIPBOARD_MIME = "application/x-narrafork-composer-document";
 
 type AtomNode = Exclude<ComposerInlineNode, { type: "text" } | { type: "break" }>;
 type AtomContextValue = Pick<
@@ -201,6 +214,10 @@ export function editorBodyPositions(doc: ProseMirrorNode) {
 			let length = 0;
 			if (node.isText) length = node.text?.length ?? 0;
 			else if (node.type.name === "hardBreak") length = 1;
+			else if (node.type.name === "narratorReference")
+				length = composerNarratorReferenceText(
+					node.attrs.value as Extract<AtomNode, { type: "narratorReference" }>,
+				).length;
 			else if (node.type.name === "fileReference")
 				length = fileReferenceToken(
 					(node.attrs.value as Extract<AtomNode, { type: "fileReference" }>).reference,
@@ -239,6 +256,50 @@ export function editorBodyPositions(doc: ProseMirrorNode) {
 	};
 }
 
+function clipboardText(slice: Slice, assets: ReadonlyMap<string, ComposerAsset>): string {
+	return slice.content.textBetween(0, slice.content.size, "\n", (node) => {
+		if (node.type.name === "hardBreak") return "\n";
+		const value = node.attrs.value as AtomNode | undefined;
+		if (value?.type === "quote") return `${value.label}: ${value.text}`;
+		if (value?.type === "narratorReference") return composerNarratorReferenceText(value);
+		if (value?.type === "fileReference") return fileReferenceToken(value.reference);
+		if (value?.type === "attachment") return assets.get(value.assetId)?.name ?? "[attachment]";
+		return "";
+	});
+}
+
+/** Copying creates new atom identities, never another occurrence of the same editor node. */
+function rekeyClipboardDocument(
+	document: ComposerDocument,
+	knownAssets: ReadonlyMap<string, ComposerAsset>,
+): ComposerDocument {
+	// Existing resource identities may be reused, but clipboard metadata cannot overwrite them.
+	const assetIds = new Map(
+		document.assets.map((asset) => [
+			asset.id,
+			knownAssets.has(asset.id) &&
+			JSON.stringify(knownAssets.get(asset.id)) !== JSON.stringify(asset)
+				? composerNodeId()
+				: asset.id,
+		]),
+	);
+	return {
+		...document,
+		assets: document.assets.map((asset) => ({ ...asset, id: assetIds.get(asset.id) ?? asset.id })),
+		paragraphs: document.paragraphs.map((paragraph) => ({
+			children: paragraph.children.map((node): ComposerInlineNode => {
+				if (node.type === "text" || node.type === "break") return node;
+				const id = composerNodeId();
+				if (node.type === "fileReference")
+					return { ...node, id, reference: { ...node.reference, id: composerNodeId() } };
+				if (node.type === "attachment")
+					return { ...node, id, assetId: assetIds.get(node.assetId) ?? node.assetId };
+				return { ...node, id };
+			}),
+		})),
+	};
+}
+
 function warnSlowComposer(
 	phase: "conversion" | "transaction",
 	elapsedMs: number,
@@ -260,6 +321,7 @@ function safeImageSource(resource: File | string | undefined): string | undefine
 }
 function ComposerAtomView({ node, selected, editor, getPos }: NodeViewProps) {
 	const context = useContext(AtomContext);
+	const openNarrator = useContext(AgentReferenceOpenerContext);
 	const { t } = useTranslation("narrator");
 	const value = node.attrs.value as AtomNode;
 	const asset = value.type === "attachment" ? context.assets.get(value.assetId) : undefined;
@@ -291,7 +353,7 @@ function ComposerAtomView({ node, selected, editor, getPos }: NodeViewProps) {
 		((!resource && context.attachmentsHydrating) ||
 			(image && !!resource && typeof resource !== "string" && !source));
 	const label =
-		value.type === "quote"
+		value.type === "quote" || value.type === "narratorReference"
 			? value.label
 			: value.type === "fileReference"
 				? fileReferenceToken(value.reference).replace(/^#file:/, "")
@@ -348,74 +410,105 @@ function ComposerAtomView({ node, selected, editor, getPos }: NodeViewProps) {
 			data-loading={restoring || undefined}
 			aria-busy={restoring || undefined}
 		>
-			<button
-				type="button"
-				className={classes.nodeBody}
-				title={value.type === "quote" ? value.text.slice(0, 600) : label}
-				aria-label={label}
-				onPointerDown={(event) => {
-					event.preventDefault();
-					pointerType.current = event.pointerType;
-					gesture.current = {
-						type: event.pointerType,
-						x: event.clientX,
-						y: event.clientY,
-						moved: false,
-					};
-				}}
-				onPointerMove={(event) => {
-					const start = gesture.current;
-					if (start && Math.hypot(event.clientX - start.x, event.clientY - start.y) > 8)
-						start.moved = true;
-				}}
-				onPointerCancel={() => {
-					gesture.current = null;
-				}}
-				onClick={(event) => {
-					const start = gesture.current;
-					gesture.current = null;
-					const type = (event.nativeEvent as PointerEvent).pointerType || start?.type;
-					if ((!type && event.detail === 0) || (start && !start.moved && type !== "mouse"))
-						preview();
-					else {
-						select();
-						// A quote chip opens its detail on a plain click; other atoms keep
-						// click-to-select and open on double-click.
-						if (value.type === "quote" && type === "mouse" && !start?.moved) preview();
-					}
-				}}
-				onDoubleClick={() => {
-					if (pointerType.current === "mouse" && value.type !== "quote") preview();
-				}}
-				onKeyDown={(event) => {
-					if (event.key === "Enter" || event.key === " ") {
-						// Let the button generate its native keyboard click, but never submit the composer.
+			{value.type === "narratorReference" ? (
+				<a
+					className={`${classes.nodeBody} ${classes.narratorReference}`}
+					href={assetUrl(`/narrators/${encodeURIComponent(value.narratorId)}`)}
+					title={label}
+					aria-label={`${t("narratorReferenceLabel", { defaultValue: "Session reference" })}: ${label}`}
+					onClick={(event) => {
+						if (
+							!openNarrator ||
+							event.defaultPrevented ||
+							event.button !== 0 ||
+							event.metaKey ||
+							event.ctrlKey ||
+							event.shiftKey ||
+							event.altKey
+						)
+							return;
+						event.preventDefault();
 						event.stopPropagation();
+						openNarrator(value.narratorId);
+					}}
+				>
+					<span className={classes.label}>{label}</span>
+				</a>
+			) : (
+				<button
+					type="button"
+					className={classes.nodeBody}
+					title={value.type === "quote" ? value.text.slice(0, 600) : label}
+					aria-label={label}
+					onPointerDown={(event) => {
+						event.preventDefault();
+						pointerType.current = event.pointerType;
+						gesture.current = {
+							type: event.pointerType,
+							x: event.clientX,
+							y: event.clientY,
+							moved: false,
+						};
+					}}
+					onPointerMove={(event) => {
+						const start = gesture.current;
+						if (start && Math.hypot(event.clientX - start.x, event.clientY - start.y) > 8)
+							start.moved = true;
+					}}
+					onPointerCancel={() => {
 						gesture.current = null;
-					}
-				}}
-			>
-				{image ? (
-					<span className={classes.thumbnail}>
-						{source && !failed ? (
-							<img key={source} src={source} alt={label} onError={() => setFailedSource(source)} />
-						) : restoring ? (
-							<IconLoader2 size={22} />
-						) : (
-							<IconPhoto size={22} />
-						)}
-						<span className={classes.imageLabel}>
-							{restoring ? t("attachments.restoring") : label}
+					}}
+					onClick={(event) => {
+						const start = gesture.current;
+						gesture.current = null;
+						const type = (event.nativeEvent as PointerEvent).pointerType || start?.type;
+						if ((!type && event.detail === 0) || (start && !start.moved && type !== "mouse"))
+							preview();
+						else {
+							select();
+							// A quote chip opens its detail on a plain click; other atoms keep
+							// click-to-select and open on double-click.
+							if (value.type === "quote" && type === "mouse" && !start?.moved) preview();
+						}
+					}}
+					onDoubleClick={() => {
+						if (pointerType.current === "mouse" && value.type !== "quote") preview();
+					}}
+					onKeyDown={(event) => {
+						if (event.key === "Enter" || event.key === " ") {
+							// Let the button generate its native keyboard click, but never submit the composer.
+							event.stopPropagation();
+							gesture.current = null;
+						}
+					}}
+				>
+					{image ? (
+						<span className={classes.thumbnail}>
+							{source && !failed ? (
+								<img
+									key={source}
+									src={source}
+									alt={label}
+									onError={() => setFailedSource(source)}
+								/>
+							) : restoring ? (
+								<IconLoader2 size={22} />
+							) : (
+								<IconPhoto size={22} />
+							)}
+							<span className={classes.imageLabel}>
+								{restoring ? t("attachments.restoring") : label}
+							</span>
 						</span>
-					</span>
-				) : (
-					<>
-						{restoring ? <IconLoader2 size={14} /> : <Icon size={14} />}
-						<span className={classes.label}>{label}</span>
-						{asset && <small>{Math.ceil(asset.size / 1024)} KB</small>}
-					</>
-				)}
-			</button>
+					) : (
+						<>
+							{restoring ? <IconLoader2 size={14} /> : <Icon size={14} />}
+							<span className={classes.label}>{label}</span>
+							{asset && <small>{Math.ceil(asset.size / 1024)} KB</small>}
+						</>
+					)}
+				</button>
+			)}
 			<span className={classes.nodeActions}>
 				<button
 					type="button"
@@ -424,7 +517,7 @@ function ComposerAtomView({ node, selected, editor, getPos }: NodeViewProps) {
 					aria-label={t(
 						value.type === "quote"
 							? "quote.remove"
-							: value.type === "fileReference"
+							: value.type === "fileReference" || value.type === "narratorReference"
 								? "fileReferences.remove"
 								: "attachments.remove",
 						{ defaultValue: "Remove attachment" },
@@ -519,6 +612,29 @@ export const InlineComposerEditor = forwardRef<
 			},
 		);
 	};
+	const copySelection = (view: EditorView, event: ClipboardEvent, cut = false): boolean => {
+		if (!event.clipboardData || view.state.selection.empty) return false;
+		try {
+			const slice = view.state.selection.content();
+			const content = slice.content.firstChild?.isInline
+				? view.state.schema.nodes.paragraph.create(null, slice.content)
+				: slice.content;
+			const document = parseComposerDocument(
+				readEditorDocument(view.state.schema.topNodeType.create(null, content), assetsRef.current),
+			);
+			event.clipboardData.setData("text/plain", clipboardText(slice, assetsRef.current));
+			event.clipboardData.setData(COMPOSER_CLIPBOARD_MIME, JSON.stringify(document));
+			event.preventDefault();
+			if (cut && !propsRef.current.disabled) {
+				view.dispatch(closeHistory(view.state.tr).deleteSelection().scrollIntoView());
+				view.dispatch(closeHistory(view.state.tr));
+			}
+			return true;
+		} catch {
+			// If a platform refuses custom MIME, leave native plain-text copy available.
+			return false;
+		}
+	};
 	const editor = useEditor({
 		immediatelyRender: false,
 		shouldRerenderOnTransaction: false,
@@ -547,6 +663,7 @@ export const InlineComposerEditor = forwardRef<
 			}),
 			atomExtension("quote"),
 			atomExtension("fileReference"),
+			atomExtension("narratorReference"),
 			atomExtension("attachment"),
 			Extension.create({
 				name: "composerBoundaries",
@@ -614,16 +731,11 @@ export const InlineComposerEditor = forwardRef<
 				),
 			}),
 			handleKeyDown: (_view, event) => event.defaultPrevented,
-			clipboardTextSerializer: (slice) =>
-				slice.content.textBetween(0, slice.content.size, "\n", (node) => {
-					if (node.type.name === "hardBreak") return "\n";
-					const value = node.attrs.value as AtomNode | undefined;
-					if (value?.type === "quote") return `${value.label}: ${value.text}`;
-					if (value?.type === "fileReference") return fileReferenceToken(value.reference);
-					if (value?.type === "attachment")
-						return assetsRef.current.get(value.assetId)?.name ?? "[attachment]";
-					return "";
-				}),
+			clipboardTextSerializer: (slice) => clipboardText(slice, assetsRef.current),
+			handleDOMEvents: {
+				copy: (view, event) => copySelection(view, event),
+				cut: (view, event) => copySelection(view, event, true),
+			},
 			handlePaste: (view, event) => {
 				if (propsRef.current.disabled) return true;
 				const files = Array.from(event.clipboardData?.files ?? []);
@@ -631,6 +743,31 @@ export const InlineComposerEditor = forwardRef<
 					event.preventDefault();
 					propsRef.current.onPasteFiles?.(files);
 					return true;
+				}
+				const semantic = event.clipboardData?.getData(COMPOSER_CLIPBOARD_MIME);
+				if (semantic && semantic.length <= MAX_COMPOSER_DOCUMENT_BYTES) {
+					try {
+						const document = rekeyClipboardDocument(
+							parseComposerDocument(JSON.parse(semantic)),
+							assetsRef.current,
+						);
+						const assets = new Map(assetsRef.current);
+						for (const asset of document.assets) assets.set(asset.id, asset);
+						const doc = view.state.schema.nodeFromJSON(composerDocumentToEditorJSON(document));
+						const transaction = closeHistory(view.state.tr)
+							.replaceSelection(new Slice(doc.content, 1, 1))
+							.scrollIntoView();
+						// Validate the resulting whole document before allocating metadata or dispatching.
+						parseComposerDocument(readEditorDocument(transaction.doc, assets));
+						assetsRef.current = assets;
+						event.preventDefault();
+						view.dispatch(transaction);
+						view.dispatch(closeHistory(view.state.tr));
+						setAssetGeneration((generation) => generation + 1);
+						return true;
+					} catch {
+						// Invalid/custom editor JSON never grants reference authority; fall back to text.
+					}
 				}
 				const text = (event.clipboardData?.getData("text/plain") ?? "").replace(/\r\n?/g, "\n");
 				event.preventDefault();
@@ -940,6 +1077,17 @@ export const InlineComposerEditor = forwardRef<
 				},
 			};
 		},
+		setSelectionAtPoint: (x, y) => {
+			if (!editor || editor.isDestroyed || propsRef.current.disabled) return false;
+			const position = editor.view.posAtCoords({ left: x, top: y });
+			if (!position) return false;
+			editor.view.dispatch(
+				editor.state.tr
+					.setSelection(TextSelection.near(editor.state.doc.resolve(position.pos)))
+					.setMeta("addToHistory", false),
+			);
+			return true;
+		},
 		setSelection: (start, end) => {
 			if (!editor) return;
 			const mapping = editorBodyPositions(editor.state.doc);
@@ -995,7 +1143,7 @@ export const InlineComposerEditor = forwardRef<
 				}}
 				onKeyDownCapture={(event) => {
 					const target = event.target as HTMLElement;
-					if (!editor?.view.dom.contains(target) || target.closest("button")) return;
+					if (!editor?.view.dom.contains(target) || target.closest("button, a")) return;
 					if (
 						!event.nativeEvent.isComposing &&
 						event.nativeEvent.keyCode !== 229 &&

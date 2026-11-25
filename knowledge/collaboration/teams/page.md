@@ -6,7 +6,7 @@ anchors:
   - server/services/teams/team-board.ts
   - server/services/teams/team-decisions.ts
   - frontend/components/teams/
-  - frontend/hooks/team-onlooker-refresh.ts
+  - frontend/lib/recent-tabs-owner.ts
   - frontend/hooks/useTeams.ts
   - frontend/lib/api/teams.ts
   - frontend/routes/projects/$projectId_.teams.$teamId.tsx
@@ -27,7 +27,7 @@ keywords:
   - /teams/:teamId/approvals
   - permission_decided_by
 status: draft
-verified_at: 776dbf07e
+verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 ---
 # 团队页与审批
 
@@ -50,7 +50,9 @@ verified_at: 776dbf07e
 - `TeamTopBar.tsx` 含待批抽屉和「全部暂停」：协调者排在最前，先于工作者停下（`pauseOrder`），一次最多读 500 个运行中会话，结果分 paused / pausedSomeIdle / pausePartial / pauseNothing / pauseMore（`team-page-model.ts`）。
 - `team-page-model.ts` 是纯规则：状态图标、轮询退避、套接字推送合并（400ms 去抖、最长 2s）、暂停顺序。
 - `hooks/useTeams.ts`：摘要在叙述者 socket 的相关帧上合并重取，同时带退避轮询（变化后 4s，翻倍到 60s，标签页隐藏时暂停）；看板、动态、审批各自按变化重取。`lib/api/teams.ts` 是客户端。
-- `hooks/team-onlooker-refresh.ts`：访问权限变化（`narrator_access_changed`、`project_access_changed`）时刷新最近标签页的 `teamOnlooker` 标记，该标记让只读旁观者不收「等待」提醒（见[通知与注意力](../notifications.md)、[最近标签页](../recent-tabs.md)）。
+- RecentTabs 的统一访问作用域（`lib/recent-tabs-owner.ts`）在当前认证连接收到 `narrator_access_changed`、`project_access_changed` 后失效旧页并重取授权元数据，同时刷新 `teamOnlooker`。该标记让只读旁观者不收「等待」提醒；不再另设团队专用失效监听器（见[通知与注意力](../notifications.md)、[最近标签页](../recent-tabs.md)）。
+- 团队顶栏的「通讯拓扑」打开与普通会话共用的图组件，使用 team scope。团队身份仍按协调者/ACL root，通讯拆组不改变工作项、worktree、审批、全部暂停或自动报告；一支团队可同时包含多个互不自由互发的通讯框。
+- 拓扑不复用团队摘要的轮询：团队记录/工作项/worker 绑定在外层事务提交后发 ids-only dirty，图经单 narrator socket 的 snapshot/delta 更新。图框显示真实团队名，节点只显示图标和会话名；拓扑注释仅携带团队 ID/名称与详情所需工作项标题，不再推导角色标签。外部团队详情仍单独鉴权，只读旁观者不能拖动改关系。跨团队精确 peer 不授予成员、控制或 worktree 权限。
 
 ## 从哪读起
 - `team-board.ts`：看板、动态、审批的读模型；`team-decisions.ts`：决定记录。

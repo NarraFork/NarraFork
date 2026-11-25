@@ -17,6 +17,8 @@ const { applyImport, clearData, exportData, previewImport } = await import("../d
 const selection = { sessions: true, requests: false, providers: false };
 const sessionTables = [
 	"narrators",
+	"narrator_communication_nodes",
+	"narrator_communication_peers",
 	"narrator_messages",
 	"narrator_message_refs",
 	"narrator_tool_calls",

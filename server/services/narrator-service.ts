@@ -158,6 +158,11 @@ import { assertNarratorAccess, type NarratorAccessNeed } from "./narrator-acl";
 import { newEnvelopeColumns } from "./narrator-block-sync";
 import { contentJsonSql, fillBodies } from "./narrator-body-reads";
 import { insertEnvelope, writeEnvelopeBody } from "./narrator-body-writes";
+import { publishCommunicationChanged } from "./narrator-communication/service";
+import {
+	detachCommunicationBeforeDeleteTx,
+	ensureCommunicationNodeTx,
+} from "./narrator-communication/store";
 import { isFormerChapterSessionWithoutDirectory, resolveNarratorSessionCwd } from "./narrator-cwd";
 import { buildSystemInjectionBlock, type SystemInjectionBlock } from "./narrator-injection";
 import { DEFAULT_TOOL_IO_BUDGET, narratorMessageQueries, truncateJson } from "./narrator-messages";
@@ -1893,11 +1898,14 @@ export function createPreparedNarratorInTransaction(
 	assertCreationProject(executor, creationProjectObservations.get(prepared.row));
 	assertHandleFree(executor, prepared.handleFold);
 	for (const target of admission.target) assertWorkspaceAdmission(target);
-	return executor.insert(narrators).values(prepared.row).returning().get();
+	const narrator = executor.insert(narrators).values(prepared.row).returning().get();
+	ensureCommunicationNodeTx(executor, narrator.id, null);
+	return narrator;
 }
 
 /** Publish non-transactional narrator creation side effects after commit. */
 export function publishNarratorCreated(narrator: typeof narrators.$inferSelect): void {
+	publishCommunicationChanged([narrator.id]);
 	backgroundOccupancyStore.refreshNarrator(narrator.id);
 	logger.info("Narrator created", {
 		id: narrator.id,
@@ -2130,7 +2138,7 @@ export const narratorService = {
 						],
 					);
 					assertOrigin?.(tx);
-					return tx
+					const created = tx
 						.insert(narrators)
 						.values({
 							id,
@@ -2197,8 +2205,11 @@ export const narratorService = {
 						})
 						.returning()
 						.all();
+					ensureCommunicationNodeTx(tx, id, input.parentNarratorId);
+					return created;
 				});
 
+				publishCommunicationChanged([id, input.parentNarratorId]);
 				backgroundOccupancyStore.refreshNarrator(id);
 				// A nested helper's permission and reflection frames also reach its root's page.
 				rememberNestedSubagentRoot(narrator);
@@ -2871,9 +2882,11 @@ export const narratorService = {
 				.run();
 			// The team row restricts the narrator delete; its finished items and events cascade.
 			deleteTeamOfNarratorInTransaction(tx, narratorId);
+			detachCommunicationBeforeDeleteTx(tx, narratorId);
 			tx.delete(narrators).where(eq(narrators.id, narratorId)).run();
 			return transition;
 		});
+		publishCommunicationChanged([narratorId]);
 		backgroundOccupancyStore.removeNarrators([narratorId]);
 		backgroundOccupancyStore.refreshNarrators(survivingForks.map((child) => child.id));
 		// FK cascades remove durable questions without emitting their own lifecycle frames.
@@ -3032,6 +3045,7 @@ export const narratorService = {
 							.returning()
 							.get();
 
+						ensureCommunicationNodeTx(tx, id, null);
 						copyForkAccessAndRules(tx, parentNarratorId, id);
 
 						// Re-read selected refs in this synchronous transaction. A compact can
@@ -3530,6 +3544,7 @@ export const narratorService = {
 								.run();
 						}
 
+						ensureCommunicationNodeTx(tx, id, null);
 						copyForkAccessAndRules(tx, parentNarratorId, id);
 
 						const finalNarrator = tx.query.narrators

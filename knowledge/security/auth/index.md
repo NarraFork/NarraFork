@@ -22,6 +22,7 @@ anchors:
   - frontend/hooks/useAvatarBlobUrl.ts
   - frontend/hooks/useCurrentUser.ts
   - frontend/lib/api/auth.ts
+  - frontend/lib/api/client.ts
   - frontend/lib/current-user-cache.ts
   - frontend/lib/random-password.ts
   - frontend/routes/admin/users.tsx
@@ -48,7 +49,7 @@ keywords:
   - releaseUserForeignKeys
   - 删除用户
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 ---
 # 登录与会话令牌
 
@@ -65,7 +66,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 
 ## 前端与用户管理
 - 登录成功后 `hooks/useAuth.ts:applySession` 存令牌、清掉上一个账号的偏好缓存、把用户写进查询 `["auth","me"]` 与本地缓存、再切换界面语言；远程构建（`REMOTE_BUILD`）改走 `remote/session` 建立会话。
-- `hooks/useCurrentUser.ts` 用 `lib/current-user-cache.ts`（localStorage 键 `narrafork_current_user_v1`，上限 16384 字符）做初值避免闪屏；`/auth/me` 返回 401 时清缓存，401/404 不重试。`hooks/useAuthenticatedSession.ts` 在令牌被清除时触发重定向，供主应用与独立窗口共用。
+- `hooks/useCurrentUser.ts` 用 `lib/current-user-cache.ts`（localStorage 键 `narrafork_current_user_v1`，上限 16384 字符）做初值避免闪屏；本地初值不证明新凭据身份。`api/client.ts` 的认证快照仅含单调 generation、hasToken、已确认 userId：token 实际变化先失效，只有当前代际的登录结果或 `/auth/me` 成功才能绑定身份，A→B→A 不复用旧代际。CurrentUser 自己观察变更并重取，不依赖偏好组件挂载；迟到 401 只能清理发起时仍当前的认证。401/404 不重试。`hooks/useAuthenticatedSession.ts` 在令牌被清除时触发重定向，供主应用与独立窗口共用。
 - 页面：`routes/login.tsx`、`routes/settings/profile.tsx`（头像经 `AvatarCropModal`、`UserAvatar`、`useAvatarBlobUrl`，后端 `PATCH/DELETE /api/auth/me/avatar`）、`routes/settings/security.tsx`、`routes/settings/authentication.tsx`（细节见 [登录方式](login-methods.md)）。
 - 管理员的用户管理在 `routes/settings/users.tsx`（`/admin/users` 只是跳转到它）与 `components/settings/CreateUserModal.tsx`，新建账号的初始密码可用 `lib/random-password.ts` 生成（`crypto.getRandomValues`、去歧义字符集）。
 - 删除用户前 `services/user-deletion.ts:releaseUserForeignKeys` 在同一事务里处理没有级联的外键：消息的 `createdBy`/`editedBy`、`projects.ownerUserId`、网关映射的 `appUserId` 置空，`user_plugin_themes` 连带删除；由 `routes/admin.ts` 的删除用户调用。

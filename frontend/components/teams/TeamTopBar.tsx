@@ -6,13 +6,21 @@
  * session's turn, coordinator first).
  */
 import { NarratorStatusIcon } from "@frontend/components/nav/NarratorStatusIcon";
+import { useMobileDrawerHistory } from "@frontend/hooks/useMobileDrawerHistory";
 import { useDecideApproval, usePauseTeam, useTeamApprovals } from "@frontend/hooks/useTeams";
 import { formatSmartTime } from "@frontend/lib/format";
+import {
+	SAFE_AREA_DRAWER_BODY_STYLE,
+	safeAreaDrawerBodyHeight,
+	safeAreaDrawerHeaderHeight,
+	safeAreaDrawerHeaderPaddingTop,
+} from "@frontend/lib/safe-area";
 import {
 	ActionIcon,
 	Alert,
 	Badge,
 	Button,
+	Center,
 	Code,
 	Drawer,
 	Group,
@@ -41,11 +49,12 @@ import {
 	IconMessagePlus,
 	IconPlayerPause,
 	IconShieldQuestion,
+	IconSitemap,
 	IconSparkles,
 	IconUsers,
 	IconX,
 } from "@tabler/icons-react";
-import { type ReactNode, useState } from "react";
+import { lazy, type ReactNode, Suspense, useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { TeamMembersPanel } from "./TeamMembers";
 import {
@@ -55,6 +64,27 @@ import {
 	recentDecisionKey,
 	recentDecisionTextKey,
 } from "./team-page-model";
+
+const CommunicationTopologyPanel = lazy(() =>
+	import("../narrator/communication/CommunicationTopologyPanel").then((m) => ({
+		default: m.CommunicationTopologyPanel,
+	})),
+);
+
+const COMMUNICATION_DRAWER_HEADER_HEIGHT = 45;
+const COMMUNICATION_DRAWER_STYLES = {
+	header: {
+		minHeight: safeAreaDrawerHeaderHeight(COMMUNICATION_DRAWER_HEADER_HEIGHT),
+		paddingTop: safeAreaDrawerHeaderPaddingTop(8),
+		paddingBottom: 8,
+		borderBottom: "1px solid var(--mantine-color-default-border)",
+	},
+	body: {
+		height: safeAreaDrawerBodyHeight(COMMUNICATION_DRAWER_HEADER_HEIGHT),
+		padding: 0,
+		...SAFE_AREA_DRAWER_BODY_STYLE,
+	},
+} as const;
 
 const DEPTH_ROLE = ["coordinator", "worker", "helper"] as const;
 
@@ -328,6 +358,10 @@ export function TeamTopBar({
 	onOpenSession?: (narratorId: string) => void;
 }) {
 	const { t } = useTranslation("projects");
+	const { t: tNarrator } = useTranslation("narrator");
+	const [communicationOpen, setCommunicationOpen] = useState(false);
+	const closeCommunication = useCallback(() => setCommunicationOpen(false), []);
+	useMobileDrawerHistory(communicationOpen, closeCommunication);
 	const [approvalsOpen, setApprovalsOpen] = useState(false);
 	const [membersOpen, setMembersOpen] = useState(false);
 	const [confirmPause, setConfirmPause] = useState(false);
@@ -371,6 +405,19 @@ export function TeamTopBar({
 				</Text>
 			</Group>
 			<Group gap={6} wrap="wrap" justify="flex-end" style={{ rowGap: 6 }}>
+				<Tooltip label={tNarrator("communicationTitle")} withinPortal>
+					<ActionIcon
+						size={44}
+						variant={communicationOpen ? "filled" : "light"}
+						color="gray"
+						aria-label={tNarrator("communicationTitle")}
+						aria-expanded={communicationOpen}
+						onClick={() => setCommunicationOpen(true)}
+						data-testid="team-communication-button"
+					>
+						<IconSitemap size={18} aria-hidden />
+					</ActionIcon>
+				</Tooltip>
 				{member && (
 					<Button
 						size="xs"
@@ -458,6 +505,37 @@ export function TeamTopBar({
 					</Button>
 				)}
 			</Group>
+			<Drawer
+				opened={communicationOpen}
+				onClose={closeCommunication}
+				position="right"
+				size="min(1100px, 100%)"
+				title={tNarrator("communicationTitle")}
+				styles={COMMUNICATION_DRAWER_STYLES}
+				closeButtonProps={{ size: "sm" }}
+			>
+				{communicationOpen && (
+					<Suspense
+						fallback={
+							<Center h="100%">
+								<Loader size="sm" />
+							</Center>
+						}
+					>
+						<CommunicationTopologyPanel
+							key={`${projectId}:${teamId}`}
+							scope={{ kind: "team", projectId, teamId }}
+							onOpenNarrator={
+								onOpenSession &&
+								((narratorId) => {
+									closeCommunication();
+									onOpenSession(narratorId);
+								})
+							}
+						/>
+					</Suspense>
+				)}
+			</Drawer>
 			<Drawer
 				opened={approvalsOpen}
 				onClose={() => setApprovalsOpen(false)}

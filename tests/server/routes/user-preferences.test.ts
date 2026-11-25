@@ -1,7 +1,19 @@
 import { afterAll, afterEach, describe, expect, it, mock } from "bun:test";
-import type { PersistedRecentTab, RecentTabsMutationResult } from "@shared/recent-tabs";
+import type {
+	PersistedRecentTab,
+	RecentTabsMutationResult,
+	RecentTabsPageResult,
+} from "@shared/recent-tabs";
+import { eq, ne } from "drizzle-orm";
 import { Hono } from "hono";
-import { userPreferences, userRecentTabs, users } from "../../../server/db/schema";
+import {
+	aclGrants,
+	narrators,
+	projects,
+	userPreferences,
+	userRecentTabs,
+	users,
+} from "../../../server/db/schema";
 import type { SessionPayload } from "../../../server/lib/auth";
 import { eventBus } from "../../../server/lib/event-bus";
 import { updateUserPreferencesSchema } from "../../../server/lib/validators/settings";
@@ -24,8 +36,9 @@ mock.module("../../../server/lib/settings", () => ({
 }));
 const realNarratorWsModule = { ...(await import("../../../server/websocket/narrator-ws")) };
 mock.module("../../../server/db", () => ({ db, sqlite }));
+const userBroadcasts: Array<{ userId: string; event: unknown }> = [];
 mock.module("../../../server/websocket/narrator-ws", () => ({
-	broadcastToUser: () => {},
+	broadcastToUser: (userId: string, event: unknown) => userBroadcasts.push({ userId, event }),
 	getNarratorPresenceBatch: () => new Map(),
 }));
 
@@ -57,11 +70,11 @@ function tab(id: string, overrides: Partial<PersistedRecentTab> = {}): Persisted
 	};
 }
 
-function seedUser(): void {
+function seedUser(userId = "user-1"): void {
 	db.insert(users)
 		.values({
-			id: "user-1",
-			username: "user-1",
+			id: userId,
+			username: userId,
 			passwordHash: "test-password-hash",
 			role: "user",
 			createdAt: NOW,
@@ -86,6 +99,26 @@ function seedPreferences(
 		.run();
 }
 
+function seedRecentResources(tabs: PersistedRecentTab[]): void {
+	for (const tab of tabs) {
+		if (tab.type === "narrator") {
+			db.insert(narrators)
+				.values({ id: tab.id, ownerUserId: "user-1", createdAt: NOW, updatedAt: NOW })
+				.run();
+		} else if (tab.type === "project") {
+			db.insert(projects)
+				.values({
+					id: tab.id,
+					name: tab.title,
+					ownerUserId: "user-1",
+					createdAt: NOW,
+					updatedAt: NOW,
+				})
+				.run();
+		}
+	}
+}
+
 async function requestJson(
 	path: string,
 	init?: RequestInit,
@@ -96,6 +129,7 @@ async function requestJson(
 
 afterEach(() => {
 	cleanDb(sqlite);
+	userBroadcasts.length = 0;
 	authUser.sub = "user-1";
 	authUser.role = "user";
 	testSettings.setupWizardCompleted = undefined;
@@ -1151,9 +1185,201 @@ describe("narrator line height across the rescale", () => {
 	});
 });
 
+describe("recent-tabs current read authorization", () => {
+	function page(body: unknown) {
+		return body as RecentTabsPageResult;
+	}
+
+	it("checks the account, read grants and delegated ACL root for each page and intact folder", async () => {
+		seedPreferences([]);
+		seedUser("owner");
+		seedUser("other");
+		const tabs = [
+			tab("empty", { type: "folder", pinned: true }),
+			tab("only-denied", { folderId: "empty" }),
+			tab("folder", { type: "folder" }),
+			tab("root", { folderId: "folder", pinned: true, title: "Revoked root title" }),
+			tab("child", { type: "subagent", folderId: "folder", title: "Revoked child title" }),
+			tab("own", { folderId: "folder" }),
+			tab("role-read"),
+			tab("outside", { title: "Never authorized title" }),
+			tab("shared-project", { type: "project", title: "Revoked project title" }),
+			tab("my-project", { type: "project" }),
+		];
+		seedRecentResources(tabs);
+		db.update(narrators).set({ ownerUserId: "owner" }).where(ne(narrators.id, "own")).run();
+		db.update(projects)
+			.set({ ownerUserId: "owner" })
+			.where(eq(projects.id, "shared-project"))
+			.run();
+		db.insert(narrators)
+			.values({
+				id: "child",
+				type: "subagent",
+				ownerUserId: "user-1",
+				visibility: "public",
+				aclRootNarratorId: "root",
+				createdAt: NOW,
+				updatedAt: NOW,
+			})
+			.run();
+		db.insert(aclGrants)
+			.values([
+				{
+					id: "root-grant",
+					scopeType: "narrator",
+					scopeId: "root",
+					principalType: "user",
+					principalId: "user-1",
+					capability: "read",
+					createdAt: NOW,
+				},
+				{
+					id: "role-grant",
+					scopeType: "narrator",
+					scopeId: "role-read",
+					principalType: "role",
+					principalId: "user",
+					capability: "read",
+					createdAt: NOW,
+				},
+				{
+					id: "project-grant",
+					scopeType: "project",
+					scopeId: "shared-project",
+					principalType: "user",
+					principalId: "user-1",
+					capability: "read",
+					createdAt: NOW,
+				},
+			])
+			.run();
+		const { restoreRecentTabs } = await import("../../../server/services/recent-tabs-service");
+		await restoreRecentTabs("user-1", { tabs });
+		await restoreRecentTabs("other", {
+			tabs: [tab("root", { title: "Other account's bookmark" }), tab("role-read")],
+		});
+		const first = page((await requestJson("/recent-tabs?section=work&limit=1")).body);
+		expect(first.items).toEqual([]);
+		expect(first.hasMore).toBe(true);
+		expect(first.nextCursor).toBeString();
+		const folderPath = `/recent-tabs?section=work&limit=1&cursor=${encodeURIComponent(first.nextCursor ?? "")}`;
+		expect(page((await requestJson(folderPath)).body).items.map((item) => item.id)).toEqual([
+			"folder",
+			"root",
+			"child",
+			"own",
+		]);
+		expect(
+			page((await requestJson("/recent-tabs?section=projects")).body).items.map((item) => item.id),
+		).toEqual(["shared-project", "my-project"]);
+
+		authUser.sub = "other";
+		expect(
+			page((await requestJson("/recent-tabs?section=work")).body).items.map((item) => item.id),
+		).toEqual(["role-read"]);
+		authUser.sub = "user-1";
+		db.delete(aclGrants).where(ne(aclGrants.id, "role-grant")).run();
+		const filtered = page((await requestJson("/recent-tabs?section=work")).body);
+		expect(filtered.items.map((item) => item.id)).toEqual(["folder", "own", "role-read"]);
+		expect(page((await requestJson(folderPath)).body).items.map((item) => item.id)).toEqual([
+			"folder",
+			"own",
+		]);
+		expect(
+			page((await requestJson("/recent-tabs?section=projects")).body).items.map((item) => item.id),
+		).toEqual(["my-project"]);
+		expect(JSON.stringify(filtered.items)).not.toContain("Revoked");
+		expect(filtered.revision).toBe(first.revision);
+		expect(
+			db.select().from(userRecentTabs).where(eq(userRecentTabs.userId, "user-1")).all(),
+		).toHaveLength(tabs.length);
+	});
+
+	it("does not return revoked metadata through legacy preferences, runtime patches, or HTTP and WS upserts", async () => {
+		const revoked = tab("revoked", { title: "Old secret", status: "waiting" });
+		const visible = tab("visible");
+		seedPreferences([revoked, visible]);
+		seedRecentResources([revoked, visible]);
+		seedUser("owner");
+		const runtime = () =>
+			requestJson("/recent-tabs/runtime", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ keys: ["narrator:revoked", "narrator:visible"] }),
+			});
+		const keys = (body: unknown) =>
+			(body as { patches: { key: string }[] }).patches.map((item) => item.key);
+		expect(keys((await runtime()).body)).toEqual(["narrator:revoked", "narrator:visible"]);
+		db.update(narrators).set({ ownerUserId: "owner" }).where(eq(narrators.id, "revoked")).run();
+		const preferences = await requestJson("/");
+		expect(
+			(preferences.body as { recentTabs: PersistedRecentTab[] }).recentTabs.map((item) => item.id),
+		).toEqual(["visible"]);
+		expect(JSON.stringify(preferences.body)).not.toContain("Old secret");
+		expect(keys((await runtime()).body)).toEqual(["narrator:visible"]);
+		const update = await requestJson("/recent-tabs", {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ ...revoked, title: "Late secret update" }),
+		});
+		expect(update.status).toBe(200);
+		const delta = { baseRevision: 0, revision: 1, operations: [] };
+		expect(update.body).toMatchObject({ changed: true, ...delta });
+		expect(userBroadcasts).toEqual([
+			{
+				userId: "user-1",
+				event: {
+					type: "user:recent_tabs_delta",
+					...delta,
+					batchIndex: 0,
+					batchCount: 1,
+				},
+			},
+		]);
+		expect(
+			db
+				.select({ title: userRecentTabs.title })
+				.from(userRecentTabs)
+				.where(eq(userRecentTabs.entityId, "revoked"))
+				.get(),
+		).toEqual({ title: "Late secret update" });
+		const updatedVisible = { ...visible, title: "Still readable" };
+		const mixed = await requestJson("/recent-tabs/batch", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ tabs: [revoked, updatedVisible] }),
+		});
+		const operations = [
+			{
+				type: "upsert",
+				key: "narrator:visible",
+				tab: updatedVisible,
+				beforeKey: null,
+				afterKey: null,
+			},
+		];
+		expect(mixed.body).toMatchObject({ baseRevision: 1, revision: 2, operations });
+		expect(userBroadcasts.at(-1)?.event).toMatchObject({
+			baseRevision: 1,
+			revision: 2,
+			operations,
+		});
+		const removal = await requestJson("/recent-tabs/narrator/revoked?cascade=1", {
+			method: "DELETE",
+		});
+		expect(removal.body).toMatchObject({
+			baseRevision: 2,
+			revision: 3,
+			operations: [{ type: "remove", key: "narrator:revoked" }],
+		});
+	});
+});
+
 describe("recent-tabs route contracts", () => {
 	it("returns a mutation delta instead of the full tab collection", async () => {
 		seedPreferences([]);
+		seedRecentResources([tab("n-1")]);
 		const { status, body } = await requestJson("/recent-tabs", {
 			method: "PUT",
 			headers: { "Content-Type": "application/json" },
@@ -1245,7 +1471,9 @@ describe("recent-tabs route contracts", () => {
 	});
 
 	it("supports section pagination and key-relative moves", async () => {
-		seedPreferences([tab("n-1"), tab("n-2"), tab("p-1", { type: "project" })]);
+		const tabs = [tab("n-1"), tab("n-2"), tab("p-1", { type: "project" })];
+		seedPreferences(tabs);
+		seedRecentResources(tabs);
 
 		const first = await requestJson("/recent-tabs?section=work&limit=1");
 		expect(first.status).toBe(200);
@@ -1279,7 +1507,9 @@ describe("recent-tabs route contracts", () => {
 	});
 
 	it("keeps GET /user-preferences compatible with at most 20 enriched legacy tabs", async () => {
-		seedPreferences(Array.from({ length: 30 }, (_, index) => tab(`n-${index}`)));
+		const tabs = Array.from({ length: 30 }, (_, index) => tab(`n-${index}`));
+		seedPreferences(tabs);
+		seedRecentResources(tabs);
 
 		const { status, body } = await requestJson("/");
 		expect(status).toBe(200);

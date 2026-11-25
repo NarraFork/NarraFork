@@ -1,6 +1,6 @@
 {
-  "id": "c9d8eed4-015f-4e6c-9274-610534f33c08",
-  "prevId": "f040e99e-e551-4687-99f8-ee370353a9c1",
+  "id": "db32c6cf-8633-4b7c-8e8d-a36ac9238316",
+  "prevId": "630d8b06-358e-45f0-8599-6498ad65ea9e",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -10984,6 +10984,282 @@
       "uniqueConstraints": {},
       "policies": {},
       "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.narrator_communication_nodes": {
+      "name": "narrator_communication_nodes",
+      "schema": "",
+      "columns": {
+        "narrator_id": {
+          "name": "narrator_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "parent_narrator_id": {
+          "name": "parent_narrator_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "original_parent_narrator_id": {
+          "name": "original_parent_narrator_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "version": {
+          "name": "version",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 1
+        }
+      },
+      "indexes": {
+        "idx_communication_nodes_parent": {
+          "name": "idx_communication_nodes_parent",
+          "columns": [
+            {
+              "expression": "parent_narrator_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_communication_nodes_original_parent": {
+          "name": "idx_communication_nodes_original_parent",
+          "columns": [
+            {
+              "expression": "original_parent_narrator_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "narrator_communication_nodes_narrator_id_narrators_id_fk": {
+          "name": "narrator_communication_nodes_narrator_id_narrators_id_fk",
+          "tableFrom": "narrator_communication_nodes",
+          "tableTo": "narrators",
+          "columnsFrom": [
+            "narrator_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "narrator_communication_nodes_parent_narrator_id_narrators_id_fk": {
+          "name": "narrator_communication_nodes_parent_narrator_id_narrators_id_fk",
+          "tableFrom": "narrator_communication_nodes",
+          "tableTo": "narrators",
+          "columnsFrom": [
+            "parent_narrator_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "set null",
+          "onUpdate": "no action"
+        },
+        "narrator_communication_nodes_original_parent_narr_88c92662fd_fk": {
+          "name": "narrator_communication_nodes_original_parent_narr_88c92662fd_fk",
+          "tableFrom": "narrator_communication_nodes",
+          "tableTo": "narrators",
+          "columnsFrom": [
+            "original_parent_narrator_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "set null",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "ck_communication_nodes_not_self": {
+          "name": "ck_communication_nodes_not_self",
+          "value": "\"parent_narrator_id\" is null or \"parent_narrator_id\" <> \"narrator_id\""
+        },
+        "ck_communication_nodes_version": {
+          "name": "ck_communication_nodes_version",
+          "value": "\"version\" >= 1"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.narrator_communication_peers": {
+      "name": "narrator_communication_peers",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "endpoint_lo": {
+          "name": "endpoint_lo",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "endpoint_hi": {
+          "name": "endpoint_hi",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_by": {
+          "name": "created_by",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "source": {
+          "name": "source",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "admission_id": {
+          "name": "admission_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "message_id": {
+          "name": "message_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {
+        "uq_communication_peers_pair": {
+          "name": "uq_communication_peers_pair",
+          "columns": [
+            {
+              "expression": "endpoint_lo",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "endpoint_hi",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_communication_peers_hi": {
+          "name": "idx_communication_peers_hi",
+          "columns": [
+            {
+              "expression": "endpoint_hi",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_communication_peers_created_by": {
+          "name": "idx_communication_peers_created_by",
+          "columns": [
+            {
+              "expression": "created_by",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "narrator_communication_peers_endpoint_lo_narrators_id_fk": {
+          "name": "narrator_communication_peers_endpoint_lo_narrators_id_fk",
+          "tableFrom": "narrator_communication_peers",
+          "tableTo": "narrators",
+          "columnsFrom": [
+            "endpoint_lo"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "narrator_communication_peers_endpoint_hi_narrators_id_fk": {
+          "name": "narrator_communication_peers_endpoint_hi_narrators_id_fk",
+          "tableFrom": "narrator_communication_peers",
+          "tableTo": "narrators",
+          "columnsFrom": [
+            "endpoint_hi"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "narrator_communication_peers_created_by_users_id_fk": {
+          "name": "narrator_communication_peers_created_by_users_id_fk",
+          "tableFrom": "narrator_communication_peers",
+          "tableTo": "users",
+          "columnsFrom": [
+            "created_by"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "set null",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "ck_communication_peers_canonical": {
+          "name": "ck_communication_peers_canonical",
+          "value": "(\"endpoint_lo\" COLLATE \"C\") < (\"endpoint_hi\" COLLATE \"C\")"
+        }
+      },
       "isRLSEnabled": false
     },
     "public.narrator_context_pins": {

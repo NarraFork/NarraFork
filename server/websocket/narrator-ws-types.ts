@@ -82,6 +82,7 @@ export interface RecentTabsSnapshotMessage {
 
 // Server → Client messages
 export type NarratorServerMessage =
+	| import("@shared/narrator-communication").CommunicationServerMessage
 	| import("@shared/reasoning-translation").ReasoningTranslationPatch
 	| import("@shared/reasoning-translation").ReasoningTranslationStatusFrame
 	| import("@shared/workspace-context").WorkspaceContextChangedEvent

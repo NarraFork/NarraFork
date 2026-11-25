@@ -8,6 +8,7 @@ anchors:
   - shared/recent-tabs.ts
   - server/routes/user-preferences.ts
   - server/db/schema.ts
+  - frontend/components/nav/RecentTabIcon.tsx
   - frontend/components/nav/NarratorStatusIcon.tsx
   - frontend/components/nav/RecentTabBackgroundBubble.tsx
   - frontend/components/nav/RecentTabDetailCard.tsx
@@ -26,6 +27,7 @@ anchors:
   - frontend/components/nav/recent-tabs-logic.ts
   - frontend/components/nav/useRecentTabExternalDrop.ts
   - frontend/components/nav/useRecentTabsDrag.ts
+  - frontend/components/nav/recent-tabs-composer-drop.browser-fixture.tsx
   - frontend/components/nav/useRowSwipe.tsx
   - frontend/hooks/recent-tab-folders.ts
   - frontend/hooks/recent-tabs-utils.ts
@@ -33,6 +35,8 @@ anchors:
   - frontend/hooks/useRecentTabKeyboardNav.ts
   - frontend/hooks/useRecentTabs.ts
   - frontend/hooks/useRecentTabsWS.ts
+  - frontend/lib/recent-tabs-owner.ts
+  - frontend/lib/api/settings.ts
   - shared/recent-tab-layout.ts
 keywords:
   - /api/user-preferences/recent-tabs
@@ -49,7 +53,7 @@ keywords:
   - recent_tabs_group_mode
   - useRecentTabs
 status: draft
-verified_at: 2e6441ad0
+verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 ---
 # 最近标签页
 
@@ -73,7 +77,8 @@ verified_at: 2e6441ad0
 - `frontend/components/nav/RecentTabs.tsx` 是侧栏主体；拖拽模型 `recent-tab-drag-model.ts`/`recent-tab-drop-target.ts`/`useRecentTabsDrag.ts`，外部拖入 `useRecentTabExternalDrop.ts`，键盘导航 `recent-tab-keyboard-nav.ts`，触摸滑动 `useRowSwipe.tsx`（右滑关闭、左滑开菜单）。
 - 文件夹的折叠/预览/展开是每台设备的显示状态，存 localStorage，不上服务器（`useFolderDisplay.ts`）；预览条数才是文件夹行上的设置（`RECENT_TAB_FOLDER_DEFAULT_PREVIEW` = 3）。
 - 侧栏在会话完成/等待时触发浏览器声音与 PWA 通知；服务器标记了 `backgroundWorkActive` 的 done 转换保持静默，权限等待始终通知（`recent-tabs-logic.ts:isBackgroundWorkSilencedStatus`，`recent-tabs-silence.test.ts`）。
-- 状态气泡（`NarratorStatusIcon.tsx`、`narrator-status-icon-logic.ts`、`RecentTabBackgroundBubble.tsx`）同时被叙述者列表卡片和团队页复用，视觉决策放在 logic 文件里避免两处漂移。
+- `RecentTabIcon.tsx` 共用侧栏和通讯拓扑卡片的会话图标：主会话使用状态气泡，子代理用机器人，项目用文件夹；保留颜色及推理、草稿、计划等已有标记。状态气泡（`NarratorStatusIcon.tsx`、`narrator-status-icon-logic.ts`、`RecentTabBackgroundBubble.tsx`）也被叙述者列表卡片和团队页复用，视觉决策放在 logic 文件里避免各处漂移。
+- RecentTabs 缓存按已验证 userId、单调认证代际及访问代际分区；分页与兼容平铺数组共用作用域，异步请求/回滚/WS/拖动写回只接受起始作用域仍有效的结果。@ 补全只读当前作用域已加载的页，不为本地候选遍历全量分页；不再给每个 tab 盖 Symbol 或比较公开字段 JSON proof，本地改名/副标题/状态更新不会使候选失去归属。原始凭据不得进入 queryKey 或序列化快照。
 
 ## 从哪读起
 - `server/services/recent-tabs-service.ts:mutate`：所有写入的入口。

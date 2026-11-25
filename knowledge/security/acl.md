@@ -7,6 +7,8 @@ anchors:
   - server/services/narrator-acl.ts
   - server/services/narrator-sharing.ts
   - server/services/project-acl.ts
+  - server/services/read/acl-sql.ts
+  - server/services/narrator-communication/predicates.ts
   - shared/narrator-access.ts
   - server/services/terminal-access.ts
   - server/websocket/terminal-ws.ts
@@ -34,7 +36,7 @@ keywords:
   - agent.defaultNarratorWriteAudience
   - terminalAccessAllowed
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 ---
 # 访问控制
 
@@ -52,7 +54,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 子代理没有自己的受众，判断委托给根叙述者（`acl_root_narrator_id`，`resolveJudgedRow`）；根无法确定则拒绝。
 - 项目 ACL 是最外层的门：管理员、owner、`public` 可见、或项目范围的授权（`project-acl.ts:canReadProject`）。
 - 只有 owner 和管理员能改共享（`canManageNarratorAcl`）：write 授权不含再分享权。每次改动后通知客户端并断开已失去权限的 WebSocket 订阅（`narrator-sharing.ts` 文件头 `announceAccessChange`）。
-- 列表过滤下推到 SQL（`narratorReadableWhere`/`narratorReadableSqlFragment`），不在取出的页上过滤，以保持 `LIMIT n+1` 与总数正确。
+- 列表过滤下推到 SQL（`narratorReadableWhere`/`narratorReadableSqlFragment`），不在取出的页上过滤，以保持 `LIMIT n+1` 与总数正确。项目、叙述者与通讯读写共用中立 `read/acl-sql.ts` 的主体授权及项目门构造，不通过正则改写 SQL；SQL 与 JS 同样识别 user/role 授权。项目门使用正向存在判定，悬空引用或私有 NULL owner 且无授权的项目不能因 SQL 三值逻辑放行。
 - 授权变更审计只写 id、布尔、角色名和计数，不写标题与内容；写入失败只记日志、不使被审计操作失败，并在事务提交之后调用（`acl/acl-audit.ts`）。
 - 路由层桥接：`lib/narrator-access.ts`（`requireNarratorAccess`、`getAuthorizedNarrator` 等）与 `lib/project-access.ts`（`requireProjectAccess`）把 Hono 上下文转成主体再调 ACL，新端点用它们表达「需要 read/write」，不要自己拼主体。
 - 创建时的受众解析（`lib/narrator-audiences.ts:resolveNarratorAudiences`）：显式值优先；`agent.defaultNarratorVisibility`/`defaultNarratorWriteAudience` 为 `auto` 时，从项目页打开的会话取 project，其余取 private，写受众取该可见性允许的最宽值；只有全局写默认会被收窄，显式的越界组合报校验错。`narrator-service.ts` 创建根叙述者时传入的项目页参数为 null。

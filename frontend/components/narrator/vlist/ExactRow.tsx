@@ -431,7 +431,12 @@ export const ExactRow = memo(
 		}
 		// User bubbles: build the avatar/name/time header node from the forwarded
 		// creator data (the pure render layer cannot construct it itself).
-		injectUserBubbleHeader(kind, extra);
+		injectUserBubbleHeader(kind, extra, {
+			narratorId,
+			composerDocumentSource: (
+				item.spec.data as { composerDocumentSource?: { messageId: string; revision: number } }
+			).composerDocumentSource,
+		});
 		// Reply quote strip: wire the jump when the strip carries a reachable target.
 		if (kind === "message-bubble" && onQuoteJump) {
 			const quote = (item.spec.data as { quote?: { targetId?: string | null } | null })?.quote;

@@ -7153,6 +7153,58 @@ export const projectTeams = sqliteTable(
  * One unit of team work: one branch and one worktree (P3 creates them). PR / CI / integration
  * columns are deferred with the hosting and integration PRs.
  */
+/** Communication inheritance is separate from historical parent/controller/ACL. */
+export const narratorCommunicationNodes = sqliteTable(
+	"narrator_communication_nodes",
+	{
+		narratorId: text("narrator_id")
+			.primaryKey()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		parentNarratorId: text("parent_narrator_id").references(() => narrators.id, {
+			onDelete: "set null",
+		}),
+		/** Immutable birth delegator; NULL for ordinary forks and standalone primary sessions. */
+		originalParentNarratorId: text("original_parent_narrator_id").references(() => narrators.id, {
+			onDelete: "set null",
+		}),
+		version: integer("version").notNull().default(1),
+	},
+	(table) => [
+		index("idx_communication_nodes_parent").on(table.parentNarratorId),
+		index("idx_communication_nodes_original_parent").on(table.originalParentNarratorId),
+		check(
+			"ck_communication_nodes_not_self",
+			sql`${table.parentNarratorId} is null or ${table.parentNarratorId} <> ${table.narratorId}`,
+		),
+		check("ck_communication_nodes_version", sql`${table.version} >= 1`),
+	],
+);
+
+/** One exact undirected contact; it never merges or transitively connects domains. */
+export const narratorCommunicationPeers = sqliteTable(
+	"narrator_communication_peers",
+	{
+		id: text("id").primaryKey(),
+		endpointLo: text("endpoint_lo")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		endpointHi: text("endpoint_hi")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		createdBy: text("created_by").references(() => users.id, { onDelete: "set null" }),
+		source: text("source", { enum: ["manual", "admission"] }).notNull(),
+		admissionId: text("admission_id"),
+		messageId: text("message_id"),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("uq_communication_peers_pair").on(table.endpointLo, table.endpointHi),
+		index("idx_communication_peers_hi").on(table.endpointHi),
+		index("idx_communication_peers_created_by").on(table.createdBy),
+		check("ck_communication_peers_canonical", sql`${table.endpointLo} < ${table.endpointHi}`),
+	],
+);
+
 export const teamWorkItems = sqliteTable(
 	"team_work_items",
 	{

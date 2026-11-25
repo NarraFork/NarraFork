@@ -13,6 +13,11 @@ anchors:
   - frontend/components/narrator/NarratorInteractionArea.tsx
   - frontend/hooks/useCommands.ts
   - frontend/hooks/useInputHistory.ts
+  - frontend/hooks/useNarratorMentionCandidates.ts
+  - frontend/hooks/narrator-mention-candidates.ts
+  - frontend/lib/narrator-submission.ts
+  - frontend/lib/narrator-submission.browser-fixture.ts
+  - frontend/lib/api/narrator-communication.ts
   - frontend/hooks/useInputMenu.ts
   - frontend/hooks/usePromptOptimize.ts
   - frontend/hooks/usePromptOptimizeTask.ts
@@ -49,7 +54,7 @@ keywords:
   - QueuedMessagesPanel
   - PendingAgentMessagesPanel
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 ---
 # 输入框与交互
 
@@ -75,6 +80,9 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 停止按钮长按 600ms 才触发打断，提前松开只提示（`use-interrupt-long-press.ts`）。
 - Enter 归属（`interaction/enter-ownership.ts`）：输入框、按钮、链接、菜单、对话框、终端等自己的 Enter 不被面板级快捷键（等待中的权限、Enter 回到输入框）抢走；权限按钮条例外（`data-perm-button-bar`）。
 - `PendingAgentMessagesPanel`：显示其他 Agent 发给本会话、尚未被任何一轮读取的消息，用户选择恢复或丢弃（失败/被停止的会话不会被 Agent 消息自动重启）。
+- 会话引用是绑定稳定 `narratorId` 的 `narratorReference` 文档 atom。RecentTabs 拖入与 @ 选择共用插入事务，贯通草稿、历史、队列编辑、undo 与失败恢复；无需 handle。规范文本投影使用带精确 ID 的 agent 链接，即使同名或动态名单截断，模型输入也保留本次选择的身份。内部文档 MIME 可保留引用，普通文本/HTML 不会升级为引用或连接授权；插入草稿本身不建立联系。
+- @ 候选先筛当前账号查询作用域内已加载的 recentTabs，再以 250ms leading/trailing throttle 搜索服务器；最近会话优先、组内活动时间降序，按 ID 去重和保持键盘选中。账号/token/访问代际/查询/源会话变化立即使旧请求失效；本地归属不依赖逐对象 Symbol 或公开字段 proof，合法改名/副标题/运行态 patch 不会抹掉本地候选。远端只返回授权后的有界 top-N 与 hasMore，提示缩小搜索范围，不维护无消费者的游标翻页。
+- 每个发送快照有 `clientSubmissionId`；结果未知时保存 ID、时间与摘要并先查 receipt，不保存正文/凭据到这份对账记录。相关 ID 和有界元数据 SHA256 不依赖安全上下文限定的 randomUUID/subtle，因此局域网 HTTP 也能首发和对账；不全局伪造 secure API，附件大文件摘要仍由服务端 Worker 处理。仅明确未接收且仍在七天窗口内才以同 ID 重试；过期必须显式作为新消息发送，已接受的提交不因重新点击而再发送。队列/历史编辑不自动新增或解除联系。
 
 ## 从哪读起
 - `composer/NarratorComposer.tsx`（约 2000 行）：草稿同步、附件、发送入口；`composer/InlineComposerEditor.tsx`：编辑器。

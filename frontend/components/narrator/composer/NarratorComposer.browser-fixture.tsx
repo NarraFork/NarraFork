@@ -1,11 +1,21 @@
 import "@mantine/core/styles.css";
 import { ImageViewerContext } from "@frontend/components/common/image-viewer-context";
 import { api } from "@frontend/lib/api";
+import { confirmAuthUser, setToken } from "@frontend/lib/api/client";
+import {
+	endDrag,
+	moveDrag,
+	PANEL_DROP_PRIORITY,
+	registerPanelDropTarget,
+	startDragManual,
+} from "@frontend/lib/panel-drag";
+import { getRecentTabsScope, recentTabsSectionQueryKey } from "@frontend/lib/recent-tabs-owner";
 import common from "@frontend/locales/en/common.json";
 import narrator from "@frontend/locales/en/narrator.json";
 import { MantineProvider } from "@mantine/core";
 import { type ComposerDocument, composerDocumentText } from "@shared/composer-document";
 import type { FileReferenceEditorSelection } from "@shared/file-reference";
+import type { CommunicationCandidates } from "@shared/narrator-communication";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Editor } from "@tiptap/react";
 import i18next from "i18next";
@@ -41,11 +51,13 @@ const sending = { current: false };
 const persistentAttachments = new URLSearchParams(window.location.search).has("persist");
 const attachmentT = (key: string, options?: Record<string, unknown>) =>
 	String(i18n.t(key, { ...options, ns: "narrator" }));
-if (persistentAttachments) localStorage.setItem("narrafork_token", "fixture-user");
+confirmAuthUser(setToken("fixture-auth:fixture-user"), "fixture-user");
 const noop = () => {};
 let switchNarrator: (id: string) => void;
 let switchAccount: (id: string) => void;
 let currentUser = "fixture-user";
+api.me = async () => ({ id: currentUser });
+api.searchCommunicationCandidates = async () => ({ items: [], hasMore: false });
 let attachmentsHydrating = false;
 let hidePersistedAttachments: () => void;
 let clearPersistedAttachments: () => void;
@@ -434,8 +446,66 @@ export function remember(doc: ComposerDocument) {
 export function clear() {
 	composer.current?.clearTextAndDraft();
 }
-export function namedCandidates(candidates: { id: string; handle: string; title?: string }[]) {
-	query.setQueryData(["named-narrators"], candidates);
+export function namedCandidates(
+	candidates: { id: string; handle?: string; title?: string }[],
+	holdRemote = false,
+) {
+	confirmAuthUser(setToken("fixture-auth:fixture-user"), "fixture-user");
+	const scope = getRecentTabsScope();
+	if (!scope) throw Error("Missing composer fixture scope");
+	query.setQueryData(["auth", "me"], { id: "fixture-user" });
+	query.setQueryData(recentTabsSectionQueryKey(scope, "work"), {
+		pages: [
+			{
+				items: candidates.map((candidate, index) => ({
+					type: "narrator" as const,
+					id: candidate.id,
+					title: candidate.title ?? candidate.handle ?? candidate.id,
+					lastVisitedAt: 100 - index,
+					folderId: "collapsed-folder",
+				})),
+			},
+		],
+	});
+	api.searchCommunicationCandidates = async () => {
+		if (holdRemote) return new Promise<CommunicationCandidates>(() => {});
+		return {
+			items: candidates.map((candidate) => ({
+				...candidate,
+				title: candidate.title ?? candidate.handle ?? candidate.id,
+				status: "idle",
+				isRecent: true,
+				lastActivityAt: null,
+				canConnect: true,
+			})),
+			hasMore: false,
+		};
+	};
+}
+export function panelReferenceDrop(
+	id: string,
+	title: string,
+	kind: "narrator" | "tool" = "narrator",
+) {
+	const element = document.querySelector('[role="textbox"]') as HTMLElement;
+	const rect = element.getBoundingClientRect();
+	let fallbacks = 0;
+	const off = registerPanelDropTarget({
+		id: "fixture-dock",
+		priority: PANEL_DROP_PRIORITY.dock,
+		hitTest: () => true,
+		onDrop: () => {
+			fallbacks++;
+		},
+	});
+	try {
+		startDragManual(id, title, rect.left + 10, rect.top + 10, kind);
+		moveDrag(rect.left + 10, rect.top + 10);
+		endDrag();
+	} finally {
+		off();
+	}
+	return fallbacks;
 }
 
 function textboxEditor(): Editor {
@@ -548,7 +618,8 @@ export function switchToNarrator(narratorId: string) {
 }
 export function switchToUser(userId: string) {
 	flushSync(() => {
-		localStorage.setItem("narrafork_token", userId);
+		currentUser = userId;
+		confirmAuthUser(setToken(`fixture-auth:${userId}`), userId);
 		query.setQueryData(["auth", "me"], { id: userId });
 		switchAccount(userId);
 	});

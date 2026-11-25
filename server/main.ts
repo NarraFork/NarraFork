@@ -1197,6 +1197,14 @@ async function initializeDatabaseStartup(): Promise<void> {
 			logger.warn("Legacy delegation materialization failed", { error: String(error) }),
 		);
 		if (!httpLifecycle.accepting) return cancelDatabaseStartup();
+		await import("./services/narrator-communication/initialize")
+			.then(({ initializeCommunicationNodes }) => initializeCommunicationNodes())
+			.catch((error) =>
+				logger.warn("Communication initialization failed; missing nodes remain denied", {
+					error: String(error),
+				}),
+			);
+		if (!httpLifecycle.accepting) return cancelDatabaseStartup();
 		// The server is already serving here, so a failure is logged rather than thrown. It fails
 		// closed: a grant without its authority row is rejected as invalid_grant, and a resource
 		// without its binding is not listed for the client. The next startup retries the backfill.

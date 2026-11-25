@@ -18,23 +18,11 @@ const sessionObservers = new WeakMap<QueryClient, { count: number; stop: () => v
 function observeSession(qc: QueryClient) {
 	let observer = sessionObservers.get(qc);
 	if (!observer) {
-		const reset = () => {
+		const stop = onTokenChange(() => {
 			qc.removeQueries({ queryKey: ["user-preferences"] });
-			qc.removeQueries({ queryKey: ["auth", "me"], exact: true });
 			appearanceStore.activate(null, true);
-		};
-		const offToken = onTokenChange(reset);
-		const onStorage = (event: StorageEvent) => {
-			if (event.key === "narrafork_token" || event.key === null) reset();
-		};
-		if (typeof window !== "undefined") window.addEventListener("storage", onStorage);
-		observer = {
-			count: 0,
-			stop: () => {
-				offToken();
-				if (typeof window !== "undefined") window.removeEventListener("storage", onStorage);
-			},
-		};
+		});
+		observer = { count: 0, stop };
 		sessionObservers.set(qc, observer);
 	}
 	observer.count++;

@@ -3,8 +3,15 @@ import { eventBus } from "@server/lib/event-bus";
 import { logger } from "@server/lib/logger";
 import { getSubagentType, parseSubstatus } from "@server/lib/narrator-utils";
 import type { Locale } from "@server/lib/prompt-i18n";
-import { isTeamMember, runDeliverToOf, teamRootOf } from "@server/lib/runtime-source";
+import {
+	controllerOf,
+	executionPrincipalOf,
+	isTeamMember,
+	runDeliverToOf,
+	teamRootOf,
+} from "@server/lib/runtime-source";
 import { isParentSelector, type SendDeliveryTarget } from "@shared/communication-tool";
+import { foldHandle } from "@shared/narrator-handle";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import { narratorBufferedMessages } from "../db/schema";
@@ -20,6 +27,10 @@ import { getExecutionOwner, getRunHold } from "./agent-runtime/ownership";
 import { getRuntimePublicationService, type PublicationRun } from "./agent-runtime/publication";
 import { controlRun, wakeHeldRun } from "./agent-runtime/run";
 import { backgroundTaskService } from "./background-task-service";
+import {
+	assertCommunicationSendAuthorized,
+	listCommunicationTargets,
+} from "./narrator-communication";
 import { authorizeAgentControl } from "./narrator-control";
 import { narratorService } from "./narrator-service";
 import { getSubagentFinalText } from "./narrator-session";
@@ -75,11 +86,7 @@ export interface SendSubagentInput extends ResolveTargetsInput {
 	toolUseId: string;
 	signal: AbortSignal;
 	locale: string;
-	/**
-	 * User who triggered the sending turn. Carried onto the delivered message so
-	 * the receiving subagent resolves knowledge ACL and fast-mode "inherit"
-	 * against a real user instead of anonymous/disabled.
-	 */
+	/** Current caller principal for the existing controller-only actions, not recipient identity. */
 	userId?: string | null;
 }
 
@@ -245,7 +252,8 @@ function getSelectors(input: ResolveTargetsInput): string[] {
 }
 
 /**
- * Who a caller can reach. A narrator reaches the team it belongs to (`teamParentId`: its
+ * Legacy team scope for observation/selector APIs, not ordinary Send reachability.
+ * A narrator reaches the team it belongs to (`teamParentId`: its
  * controller, or itself when nobody controls it) and the team it leads (its own children).
  * For a primary the two are the same team. A first-level subagent therefore reaches its
  * parent, its siblings and its own helpers; a helper reaches its parent and siblings.
@@ -274,10 +282,9 @@ function reachableTeamIds(scope: CommunicationScope): string[] {
 		: [scope.teamParentId, scope.caller.id];
 }
 
-/** The target is the caller's own child (its controller is the caller). */
+/** Display parenthood only for the explicit controller, never a peer or result recipient. */
 function isOwnChild(target: Narrator, scope: CommunicationScope): boolean {
-	const root = teamRootOf(target);
-	return root !== target.id && root === scope.caller.id;
+	return target.id !== scope.caller.id && controllerOf(target)?.narratorId === scope.caller.id;
 }
 
 function assertTargetAllowed(target: Narrator, scope: CommunicationScope) {
@@ -1037,28 +1044,22 @@ function callerSubagentType(caller: Narrator): string {
 	return getSubagentType(caller.variant) ?? "subagent";
 }
 
-/**
- * Prefix a sibling/child-bound message with a sender label so the recipient can
- * tell who sent it. User-typed buffer messages (entered on the subagent page)
- * bypass this path and are unaffected.
- */
+/** A communication relation does not imply a delegation or control relationship. */
 function withSenderPrefix(
 	caller: Narrator,
-	callerIsSubagent: boolean,
+	asParent: boolean,
 	message: string,
 	locale: Locale,
 ): string {
 	const isZh = locale === "zh-CN";
-	if (callerIsSubagent) {
-		// Stays synchronous: the caller's own row carries its alias/title, so no
-		// query is needed to name the sender readably.
-		const name = caller.title?.trim() || agentLabelFromNarrator(caller);
-		const label = isZh
-			? `[来自同级子代理"${name}"（${callerSubagentType(caller)}）的消息]`
-			: `[Message from sibling subagent "${name}" (${callerSubagentType(caller)})]`;
-		return `${label}\n${message}`;
-	}
-	const label = isZh ? "[来自父叙述者的消息]" : "[Message from the parent narrator]";
+	const name = JSON.stringify(caller.title?.trim() || agentLabelFromNarrator(caller));
+	const label = asParent
+		? isZh
+			? "[来自父叙述者的消息]"
+			: "[Message from the parent narrator]"
+		: isZh
+			? `[来自会话 ${name} 的消息（id: ${caller.id}）]`
+			: `[Message from session ${name} (id: ${caller.id})]`;
 	return `${label}\n${message}`;
 }
 
@@ -1069,8 +1070,10 @@ function withSenderPrefix(
 async function deliverSubagentMessageToParent(
 	input: SendSubagentInput,
 	scope: CommunicationScope,
+	parentId: string,
 ): Promise<SendTargetResult> {
-	const parentId = scope.teamParentId;
+	// A manual progress report is an ordinary message, not an automatic task result.
+	await assertCommunicationSendAuthorized(scope.caller.id, parentId);
 	const parent = await narratorService.getById(parentId).catch(() => null);
 	if (!parent) {
 		return { id: parentId, status: "failed", error: "Parent narrator not found" };
@@ -1095,20 +1098,22 @@ async function deliverSubagentMessageToParent(
 		input.toolCallBinding,
 		input.showToUser ?? false,
 	);
+	input.signal.throwIfAborted();
 	const accepted = await enqueueInboxAgent(delivery, input.message, {
 		channel: "parent",
-		userId: input.userId ?? null,
-		createdBy: input.userId ?? null,
+		createdBy: executionPrincipalOf(scope.caller)?.userId ?? null,
 	});
 	if (accepted.delivery.state === "cancelled" || accepted.delivery.state === "failed")
 		throw new Error(`Previous delivery is ${accepted.delivery.state}; explicit retry is required`);
 
 	notifyDeliveryResolved(input, parentId, delivery.recipientMessageId, parent.title, delivery);
 
-	// Wake the parent only when idle; a working/waiting parent drains the queue
-	// at its next after_tools sidecar boundary.
+	// Only first acceptance may wake the parent. A duplicate receipt is observation,
+	// not a new wake intent; a live parent drains at its next safe boundary.
 	const started =
-		accepted.delivery.state === "queued" && !getExecutionOwner(parentId)
+		accepted.status === "accepted" &&
+		accepted.delivery.state === "queued" &&
+		!getExecutionOwner(parentId)
 			? await wakeInboxIfEligible(parentId, input.locale as Locale)
 			: false;
 
@@ -1121,25 +1126,94 @@ async function deliverSubagentMessageToParent(
 	};
 }
 
-/** Resolve every Send destination before delivery; parent/main are reserved, not sibling aliases. */
+/** Send's parent alias names the original delegator, not a current result recipient. */
+function sendParentId(scope: CommunicationScope): string | null {
+	return scope.caller.type === "subagent" ? scope.caller.parentNarratorId : null;
+}
+
+const SEND_TARGET_LIST_LIMIT = 200;
+type CommunicationTarget = Awaited<ReturnType<typeof listCommunicationTargets>>[number] & {
+	/** Lightweight aliases, when supplied by the communication projection. */
+	aliases?: readonly string[];
+};
+
+/**
+ * Send-only resolution. The legacy team resolver above remains the authority for
+ * ContextAsk, observation and control; a communication peer grants none of those.
+ */
 async function resolveSendTargets(
-	input: SendSubagentInput,
+	input: ResolveTargetsInput & { signal?: AbortSignal },
 	scope: CommunicationScope,
 ): Promise<Narrator[]> {
 	const selectors = getSelectors(input);
 	if (!selectors.length) throw new Error("At least one target id/name is required");
+	let candidates: CommunicationTarget[] | undefined;
 	const targets = new Map<string, Narrator>();
 	for (const selector of selectors) {
-		const targetsParent =
-			scope.callerIsSubagent && (isParentSelector(selector) || selector === scope.teamParentId);
-		// The parent is the caller's controller: a primary, or for a helper the subagent
-		// that launched it.
-		const target = targetsParent
-			? await narratorService.getById(scope.teamParentId)
-			: await resolveOneTarget(selector, scope);
+		input.signal?.throwIfAborted();
+		let target: Narrator | null;
+		if (isParentSelector(selector)) {
+			const parentId = sendParentId(scope);
+			if (!parentId) throw new Error("This narrator has no parent destination");
+			target = await narratorService.getById(parentId);
+		} else {
+			// An exact ID never depends on a truncated display/name index. Do not
+			// swallow read failures and turn them into a different selector.
+			target = await narratorService.getById(selector).catch((error) => {
+				if (error instanceof NotFoundError) return null;
+				throw error;
+			});
+			if (!target) {
+				candidates ??= await listCommunicationTargets(scope.caller.id, {
+					limit: SEND_TARGET_LIST_LIMIT,
+					signal: input.signal,
+				});
+				// A name cannot be proven unique outside this bounded projection.
+				// Fail closed rather than choosing the first visible match.
+				if (candidates.length >= SEND_TARGET_LIST_LIMIT)
+					throw new Error("Communication target list may be truncated; use the full narrator ID");
+				const handle = foldHandle(selector.replace(/^@/, ""));
+				const matches = new Map(
+					candidates
+						.filter(
+							(candidate) =>
+								candidate.id !== scope.caller.id &&
+								(subagentMatchesSelector(candidate, selector) ||
+									(candidate.handle != null && foldHandle(candidate.handle) === handle) ||
+									candidate.aliases?.includes(selector)),
+						)
+						.map((candidate) => [candidate.id, candidate]),
+				);
+				if (matches.size === 0)
+					throw new Error(
+						`No accessible communication target found for "${selector}"; use a full narrator ID`,
+					);
+				if (matches.size > 1) {
+					const lines = [...matches.values()]
+						.map((candidate) => `- ${candidate.title ?? "(untitled)"} (id: ${candidate.id})`)
+						.join("\n");
+					throw new Error(
+						`Ambiguous communication target "${selector}". Use a full narrator ID:\n${lines}`,
+					);
+				}
+				const [candidate] = matches.values();
+				target = await narratorService.getById(candidate.id);
+			}
+		}
+		if (target.id === scope.caller.id) throw new Error("Narrators cannot send to themselves");
+		input.signal?.throwIfAborted();
+		await assertCommunicationSendAuthorized(scope.caller.id, target.id);
+		input.signal?.throwIfAborted();
 		targets.set(target.id, target);
 	}
 	return [...targets.values()];
+}
+
+/** Shared by Send preflights only; deliberately separate from resolveSubagentTargets. */
+export async function resolveCommunicationSendTargets(
+	input: ResolveTargetsInput & { signal?: AbortSignal },
+): Promise<Narrator[]> {
+	return resolveSendTargets(input, await getCommunicationScope(input.callerNarratorId));
 }
 
 function blockedSendNote(
@@ -1209,9 +1283,10 @@ export async function sendSubagentMessageDetailed(
 		// below once it is loaded.
 		let label = agentLabelFromNarrator(target, teamRootOf(target));
 		try {
-			if (scope.callerIsSubagent && target.id === scope.teamParentId) {
+			input.signal.throwIfAborted();
+			if (target.id === sendParentId(scope)) {
 				label = "parent";
-				const delivered = await deliverSubagentMessageToParent(input, scope);
+				const delivered = await deliverSubagentMessageToParent(input, scope, target.id);
 				targetResults.push({ ...delivered, label });
 				sections.push(
 					delivered.status === "failed"
@@ -1224,12 +1299,12 @@ export async function sendSubagentMessageDetailed(
 			}
 
 			const fresh = await narratorService.getById(target.id);
-			assertTargetAllowed(fresh, scope);
+			await assertCommunicationSendAuthorized(scope.caller.id, fresh.id);
 			label = agentLabelFromNarrator(fresh, teamRootOf(fresh));
-			// A subagent writing to its own helper speaks as that helper's parent.
-			const asParent = !scope.callerIsSubagent || isOwnChild(fresh, scope);
+			// Only the recipient's explicit controller is displayed as its parent.
+			const asParent = isOwnChild(fresh, scope);
 			if (fresh.status === "archived") {
-				throw new Error("Target subagent is archived");
+				throw new Error("Target narrator is archived");
 			}
 
 			// A taken-over subagent is driven by the user like an independent narrator, and
@@ -1254,7 +1329,7 @@ export async function sendSubagentMessageDetailed(
 			// can tell who sent it (user-typed page messages bypass this path entirely).
 			const deliveredMessage = withSenderPrefix(
 				scope.caller,
-				!asParent,
+				asParent,
 				input.message,
 				input.locale as Locale,
 			);
@@ -1274,9 +1349,9 @@ export async function sendSubagentMessageDetailed(
 				input.toolCallBinding,
 				input.showToUser ?? false,
 			);
+			input.signal.throwIfAborted();
 			const accepted = await enqueueInboxAgent(delivery, deliveredMessage, {
-				createdBy: input.userId ?? null,
-				...(!running && { userId: input.userId ?? null }),
+				createdBy: executionPrincipalOf(scope.caller)?.userId ?? null,
 			});
 			if (accepted.delivery.state === "cancelled" || accepted.delivery.state === "failed")
 				throw new Error(
@@ -1343,9 +1418,11 @@ export async function sendSubagentMessageDetailed(
 			// Agent messages never restart a failed or user-stopped session by themselves;
 			// `resume` is the explicit opt-in, and only for a failure (the user's stop stands).
 			const stopped = takenOver ? null : blockingStopReason(fresh.lastStopReason);
-			const resumeRequested = input.resume === true && stopped === "error";
+			const resumeRequested = !duplicate && input.resume === true && stopped === "error";
 			let wakeFailed = false;
-			if (accepted.delivery.state === "queued") {
+			if (!duplicate && accepted.delivery.state === "queued") {
+				// Replaying a receipt never grants another wake/resume intent, even when
+				// its original message remains queued after a later error or user stop.
 				// The ordinary wake of any idle session: a held run is woken in place, an
 				// idle session starts a run that adopts the message in order. The sender's
 				// identity is the message author only, never the recipient's principal.
@@ -1374,7 +1451,7 @@ export async function sendSubagentMessageDetailed(
 						: `Sent to ${label}; durable message retained for the next eligible turn.`
 					: resumeRequested
 						? `Sent to ${label}; resumed after its failed last turn and started asynchronously.`
-						: `Sent to ${label}; subagent started asynchronously.`;
+						: `Sent to ${label}; session started asynchronously.`;
 			sections.push(outcome + modelNote + takeoverNote);
 			targetResults.push({
 				id: fresh.id,

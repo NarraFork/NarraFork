@@ -42,9 +42,13 @@ import { runAtomicWrite } from "./runtime-write";
 
 const pendingStates = ["queued", "claimed", "failed"] as const;
 const now = () => new Date().toISOString();
+// Receipt fingerprints outlive payload cleanup for the existing seven-day dedupe window.
+const receiptMetadata = sql<
+	string | null
+>`CASE WHEN ${mailbox.kind} = 'user_input' AND json_valid(${mailbox.metadataJson}) AND json_type(${mailbox.metadataJson}, '$.submissionFingerprint') = 'text' THEN json_object('submissionFingerprint', json_extract(${mailbox.metadataJson}, '$.submissionFingerprint'), 'submissionAttachments', json_extract(${mailbox.metadataJson}, '$.submissionAttachments')) ELSE NULL END`;
 const releasedPayload = {
 	text: "",
-	metadataJson: null,
+	metadataJson: receiptMetadata,
 	payloadRefJson: null,
 	imagesJson: null,
 	mediaJson: null,
@@ -772,7 +776,7 @@ export function createMailboxStore(db: RuntimeDb) {
 						textFilePathsJson: null,
 						fileReferencesJson: null,
 						payloadRefJson: null,
-						metadataJson: null,
+						metadataJson: receiptMetadata,
 						creatorJson: null,
 						commandText: null,
 						bashCommand: null,

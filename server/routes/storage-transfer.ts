@@ -222,6 +222,7 @@ storageTransferRoutes.post("/import", requireAdmin, async (c) => {
 	const parsed = importSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw catalogError("IMPORT_PARAMS_INVALID");
 	const result = await applyImport(parsed.data.token, {
+		importingUserId: c.get("user").sub,
 		conflictDefault: parsed.data.conflictDefault,
 		conflictById: parsed.data.conflictById,
 		include: parsed.data.include,

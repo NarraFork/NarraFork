@@ -33,6 +33,16 @@ import type {
 	RecentTabsPageResponse,
 } from "../lib/api/settings";
 import { queryClient as globalQC } from "../lib/query-client";
+import {
+	getRecentTabsScope,
+	isRecentTabsScopeCurrent,
+	type RecentTabsScope,
+	recentTabsFlatQueryKey,
+	recentTabsScopeKey,
+	recentTabsSectionQueryKey,
+	requireRecentTabsScope,
+	useRecentTabsScope,
+} from "../lib/recent-tabs-owner";
 import { invalidateNarratorGitIdentities } from "./git-identity-query-keys";
 import type { AddRecentTabInput, RecentTab, SubagentRecentTabInput } from "./recent-tabs-utils";
 import {
@@ -45,6 +55,11 @@ import {
 	recentTabVisitSignature,
 } from "./recent-tabs-utils";
 
+export {
+	RECENT_TABS_QUERY_KEY,
+	recentTabsFlatQueryKey,
+	recentTabsSectionQueryKey,
+} from "../lib/recent-tabs-owner";
 export type {
 	AddRecentTabInput,
 	ReadonlyRecentTabRuntimeVersions,
@@ -74,14 +89,17 @@ export {
 	snapshotRecentTabRuntimeVersions,
 } from "./recent-tabs-utils";
 
-export const RECENT_TABS_QUERY_KEY = ["user-preferences", "recent-tabs"] as const;
-export const recentTabsSectionQueryKey = (section: RecentTabsSection) =>
-	[...RECENT_TABS_QUERY_KEY, section] as const;
 const RECENT_TABS_QUERY_GC_TIME_MS = 60_000;
 const RECENT_TABS_REFRESH_DEDUPE_MS = 500;
 const loadedWindowRefreshes = new WeakMap<
 	QueryClient,
-	{ startedAt: number; reset: boolean; minimumRevision: number; promise: Promise<void> }
+	{
+		scope: RecentTabsScope;
+		startedAt: number;
+		reset: boolean;
+		minimumRevision: number;
+		promise: Promise<void>;
+	}
 >();
 const loadedWindowRefreshGenerations = new WeakMap<QueryClient, number>();
 
@@ -285,11 +303,12 @@ function replaceLoadedTabs(
 
 function updateSectionData(
 	qc: QueryClient,
+	scope: RecentTabsScope,
 	section: RecentTabsSection,
 	updater: (tabs: RecentTab[], data: RecentTabsInfiniteData) => RecentTab[],
 	revision?: number,
 ): void {
-	qc.setQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey(section), (data) => {
+	qc.setQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey(scope, section), (data) => {
 		if (!data) return data;
 		return replaceLoadedTabs(
 			data,
@@ -305,17 +324,17 @@ function sameTabList(previous: RecentTab[] | undefined, next: RecentTab[]): bool
 	return previous.every((tab, index) => tab === next[index]);
 }
 
-function syncCompatibilityCache(qc: QueryClient): void {
+function syncCompatibilityCache(qc: QueryClient, scope: RecentTabsScope): void {
 	const projects = flattenPages(
-		qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("projects")),
+		qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey(scope, "projects")),
 	);
 	const work = flattenPages(
-		qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("work")),
+		qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey(scope, "work")),
 	);
 	// Same reasoning as `replaceLoadedTabs`: this flat array is a separate cache entry
 	// that several components read, so re-allocating it on an unchanged tick would
 	// re-render them even after the section windows correctly stayed put.
-	qc.setQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY, (previous) => {
+	qc.setQueryData<RecentTab[]>(recentTabsFlatQueryKey(scope), (previous) => {
 		const next = [...projects, ...work];
 		return sameTabList(previous, next) ? (previous as RecentTab[]) : next;
 	});
@@ -453,14 +472,16 @@ const NO_DELTA_FOLLOW_UP: RecentTabsDeltaApplyResult = { gaps: [], backfill: [] 
 export function applyRecentTabsDelta(
 	qc: QueryClient,
 	delta: RecentTabsDelta,
+	scope = getRecentTabsScope(),
 ): RecentTabsDeltaApplyResult {
-	if (!Number.isFinite(delta.revision) || delta.revision <= 0) return NO_DELTA_FOLLOW_UP;
+	if (!isRecentTabsScopeCurrent(scope) || !Number.isFinite(delta.revision) || delta.revision <= 0)
+		return NO_DELTA_FOLLOW_UP;
 	const baseRevision = delta.baseRevision ?? delta.revision - 1;
 	const loaded = (["projects", "work"] as const)
 		.map((section) => ({
 			section,
-			key: recentTabsSectionQueryKey(section),
-			data: qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey(section)),
+			key: recentTabsSectionQueryKey(scope, section),
+			data: qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey(scope, section)),
 		}))
 		.filter(
 			(entry): entry is typeof entry & { data: RecentTabsInfiniteData } => entry.data !== undefined,
@@ -497,18 +518,19 @@ export function applyRecentTabsDelta(
 			backfill.push(section);
 		}
 	}
-	syncCompatibilityCache(qc);
+	syncCompatibilityCache(qc, scope);
 	return { gaps: [], backfill };
 }
 
 export function applyRecentTabsRuntimePatches(
 	qc: QueryClient,
 	patches: Array<{ key: string; patch: Record<string, unknown> }>,
+	scope = getRecentTabsScope(),
 ): void {
-	if (patches.length === 0) return;
+	if (!isRecentTabsScopeCurrent(scope) || patches.length === 0) return;
 	const patchMap = new Map(patches.map(({ key, patch }) => [key, patch]));
 	for (const section of ["projects", "work"] as const) {
-		updateSectionData(qc, section, (tabs) => {
+		updateSectionData(qc, scope, section, (tabs) => {
 			let changed = false;
 			const next = tabs.map((tab) => {
 				const patch = patchMap.get(tabKey(tab));
@@ -523,7 +545,7 @@ export function applyRecentTabsRuntimePatches(
 			return changed ? next : tabs;
 		});
 	}
-	syncCompatibilityCache(qc);
+	syncCompatibilityCache(qc, scope);
 }
 
 function applyFolderPatch(
@@ -593,30 +615,38 @@ export function clearLoadedTabs(
 
 function snapshotSections(
 	qc: QueryClient,
+	scope: RecentTabsScope,
 ): Record<RecentTabsSection, RecentTabsInfiniteData | undefined> {
 	return {
-		projects: qc.getQueryData(recentTabsSectionQueryKey("projects")),
-		work: qc.getQueryData(recentTabsSectionQueryKey("work")),
+		projects: qc.getQueryData(recentTabsSectionQueryKey(scope, "projects")),
+		work: qc.getQueryData(recentTabsSectionQueryKey(scope, "work")),
 	};
 }
 
 function restoreSectionSnapshots(
 	qc: QueryClient,
+	scope: RecentTabsScope | null,
 	snapshots: Record<RecentTabsSection, RecentTabsInfiniteData | undefined>,
 ): void {
+	if (!isRecentTabsScopeCurrent(scope)) return;
 	for (const section of ["projects", "work"] as const) {
-		const current = qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey(section));
+		const current = qc.getQueryData<RecentTabsInfiniteData>(
+			recentTabsSectionQueryKey(scope, section),
+		);
 		const snapshot = snapshots[section];
 		if (
 			(current !== undefined && recentTabsDataRevision(current) === undefined) ||
 			recentTabsDataRevision(current) !== recentTabsDataRevision(snapshot)
 		) {
-			void qc.invalidateQueries({ queryKey: recentTabsSectionQueryKey(section), exact: true });
+			void qc.invalidateQueries({
+				queryKey: recentTabsSectionQueryKey(scope, section),
+				exact: true,
+			});
 			continue;
 		}
-		qc.setQueryData(recentTabsSectionQueryKey(section), snapshot);
+		qc.setQueryData(recentTabsSectionQueryKey(scope, section), snapshot);
 	}
-	syncCompatibilityCache(qc);
+	syncCompatibilityCache(qc, scope);
 }
 
 /**
@@ -630,22 +660,25 @@ export async function removeRecentTabCascade(
 	type: RecentTab["type"],
 	id: string,
 	options: { keepEmptyFolder?: boolean } = {},
+	scope = getRecentTabsScope(),
 ): Promise<void> {
-	const section = recentTabsSectionQueryKey(type === "project" ? "projects" : "work");
+	if (!isRecentTabsScopeCurrent(scope)) return;
+	const section = recentTabsSectionQueryKey(scope, type === "project" ? "projects" : "work");
 	await qc.cancelQueries({ queryKey: section });
-	const snapshots = snapshotSections(qc);
-	updateSectionData(qc, type === "project" ? "projects" : "work", (current) =>
+	if (!isRecentTabsScopeCurrent(scope)) return;
+	const snapshots = snapshotSections(qc, scope);
+	updateSectionData(qc, scope, type === "project" ? "projects" : "work", (current) =>
 		applyOperation(current, { type: "remove", key: `${type}:${id}` }),
 	);
-	syncCompatibilityCache(qc);
+	syncCompatibilityCache(qc, scope);
 	try {
 		const result = await api.removeRecentTab(type, id, {
 			cascade: true,
 			keepEmptyFolder: options.keepEmptyFolder,
 		});
-		await applyRecentTabsDeltaAndFollowUp(qc, mutationDelta(result));
+		await applyRecentTabsDeltaAndFollowUp(qc, mutationDelta(result), scope);
 	} catch {
-		restoreSectionSnapshots(qc, snapshots);
+		restoreSectionSnapshots(qc, scope, snapshots);
 	}
 }
 
@@ -666,13 +699,16 @@ async function fetchLoadedWindows(
 		pageCount: number;
 	}>,
 	minimumRevision: number,
+	scope: RecentTabsScope,
 ): Promise<Map<RecentTabsSection, RecentTabsInfiniteData>> {
+	requireRecentTabsScope(scope);
 	const firstPages = await Promise.all(
 		plans.map(async (plan) => ({
 			plan,
 			page: await api.getRecentTabsPage(plan.section, { limit: RECENT_TABS_PAGE_SIZE }),
 		})),
 	);
+	requireRecentTabsScope(scope);
 	const revision = firstPages[0]?.page.revision;
 	if (
 		revision === undefined ||
@@ -692,6 +728,7 @@ async function fetchLoadedWindows(
 					limit: RECENT_TABS_PAGE_SIZE,
 					cursor,
 				});
+				requireRecentTabsScope(scope);
 				if (page.revision !== revision) {
 					throw new RecentTabsStaleWindowError("Recent-tabs page revision changed");
 				}
@@ -715,14 +752,15 @@ async function fetchLoadedWindows(
  */
 function withCachedRuntimeFields(
 	qc: QueryClient,
+	scope: RecentTabsScope,
 	section: RecentTabsSection,
 	data: RecentTabsInfiniteData,
 	fallbackTabs: ReadonlyMap<string, RecentTab>,
 ): RecentTabsInfiniteData {
 	const current = new Map(
-		flattenPages(qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey(section))).map(
-			(tab) => [tabKey(tab), tab],
-		),
+		flattenPages(
+			qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey(scope, section)),
+		).map((tab) => [tabKey(tab), tab]),
 	);
 	return {
 		...data,
@@ -736,29 +774,37 @@ function withCachedRuntimeFields(
 	};
 }
 
-export async function refreshRecentTabsAfterReconnect(qc: QueryClient): Promise<void> {
+export async function refreshRecentTabsAfterReconnect(
+	qc: QueryClient,
+	scope = getRecentTabsScope(),
+): Promise<void> {
+	if (!isRecentTabsScopeCurrent(scope)) return;
 	try {
-		await refreshRecentTabsLoadedWindow(qc);
+		await refreshRecentTabsLoadedWindow(qc, {}, scope);
 	} finally {
-		await qc.refetchQueries(
-			{
-				queryKey: RECENT_TABS_QUERY_KEY,
-				predicate: (query) => query.state.status === "error",
-			},
-			{ throwOnError: true },
-		);
+		if (isRecentTabsScopeCurrent(scope)) {
+			await qc.refetchQueries(
+				{
+					queryKey: recentTabsScopeKey(scope),
+					predicate: (query) => query.state.status === "error",
+				},
+				{ throwOnError: true },
+			);
+		}
 	}
 }
 
 export function refreshRecentTabsLoadedWindow(
 	qc: QueryClient,
 	options: { reset?: boolean; minimumRevision?: number } = {},
+	scope = getRecentTabsScope(),
 ): Promise<void> {
+	if (!isRecentTabsScopeCurrent(scope)) return Promise.resolve();
 	const now = Date.now();
 	const minimumRevision = options.minimumRevision ?? 0;
 	const existing = loadedWindowRefreshes.get(qc);
 	if (
-		existing &&
+		existing?.scope === scope &&
 		now - existing.startedAt < RECENT_TABS_REFRESH_DEDUPE_MS &&
 		(existing.reset || !options.reset) &&
 		existing.minimumRevision >= minimumRevision
@@ -768,7 +814,7 @@ export function refreshRecentTabsLoadedWindow(
 	const generation = (loadedWindowRefreshGenerations.get(qc) ?? 0) + 1;
 	loadedWindowRefreshGenerations.set(qc, generation);
 	const plans = (["projects", "work"] as const).flatMap((section) => {
-		const data = qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey(section));
+		const data = qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey(scope, section));
 		if (!data) return [];
 		return [
 			{
@@ -785,22 +831,27 @@ export function refreshRecentTabsLoadedWindow(
 	const promise = (async () => {
 		await Promise.all(
 			plans.map(({ section }) =>
-				qc.cancelQueries({ queryKey: recentTabsSectionQueryKey(section), exact: true }),
+				qc.cancelQueries({ queryKey: recentTabsSectionQueryKey(scope, section), exact: true }),
 			),
 		);
+		if (!isRecentTabsScopeCurrent(scope)) return;
 		if (options.reset && loadedWindowRefreshGenerations.get(qc) === generation) {
 			for (const { section } of plans) {
-				qc.setQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey(section), (data) =>
-					data ? { pages: data.pages.slice(0, 1), pageParams: data.pageParams.slice(0, 1) } : data,
+				qc.setQueryData<RecentTabsInfiniteData>(
+					recentTabsSectionQueryKey(scope, section),
+					(data) =>
+						data
+							? { pages: data.pages.slice(0, 1), pageParams: data.pageParams.slice(0, 1) }
+							: data,
 				);
 			}
-			syncCompatibilityCache(qc);
+			syncCompatibilityCache(qc, scope);
 		}
 		let windows: Map<RecentTabsSection, RecentTabsInfiniteData> | undefined;
 		let lastError: unknown;
 		for (let attempt = 0; attempt < 3; attempt++) {
 			try {
-				windows = await fetchLoadedWindows(plans, minimumRevision);
+				windows = await fetchLoadedWindows(plans, minimumRevision, scope);
 				break;
 			} catch (error) {
 				lastError = error;
@@ -808,7 +859,8 @@ export function refreshRecentTabsLoadedWindow(
 			}
 		}
 		if (!windows) throw lastError;
-		if (loadedWindowRefreshGenerations.get(qc) !== generation) return;
+		if (!isRecentTabsScopeCurrent(scope) || loadedWindowRefreshGenerations.get(qc) !== generation)
+			return;
 		for (const { section, truncatedTabs } of plans) {
 			const data = windows.get(section);
 			if (!data) continue;
@@ -816,20 +868,25 @@ export function refreshRecentTabsLoadedWindow(
 			// while the pages were in flight are already in the cache, and a pre-fetch
 			// snapshot would roll status/substatus icons back to their pre-event values.
 			qc.setQueryData(
-				recentTabsSectionQueryKey(section),
-				withCachedRuntimeFields(qc, section, data, truncatedTabs),
+				recentTabsSectionQueryKey(scope, section),
+				withCachedRuntimeFields(qc, scope, section, data, truncatedTabs),
 			);
 		}
-		syncCompatibilityCache(qc);
+		syncCompatibilityCache(qc, scope);
 	})().catch((error) => {
+		if (!isRecentTabsScopeCurrent(scope)) return;
 		if (options.reset && loadedWindowRefreshGenerations.get(qc) === generation) {
 			for (const { section } of plans) {
-				void qc.invalidateQueries({ queryKey: recentTabsSectionQueryKey(section), exact: true });
+				void qc.invalidateQueries({
+					queryKey: recentTabsSectionQueryKey(scope, section),
+					exact: true,
+				});
 			}
 		}
 		throw error;
 	});
 	loadedWindowRefreshes.set(qc, {
+		scope,
 		startedAt: now,
 		reset: options.reset === true,
 		minimumRevision,
@@ -848,26 +905,36 @@ export function refreshRecentTabsLoadedWindow(
 export function applyRecentTabsDeltaAndFollowUp(
 	qc: QueryClient,
 	delta: RecentTabsDelta,
+	scope = getRecentTabsScope(),
 ): Promise<void> {
-	const { gaps, backfill } = applyRecentTabsDelta(qc, delta);
+	const { gaps, backfill } = applyRecentTabsDelta(qc, delta, scope);
 	if (gaps.length === 0 && backfill.length === 0) return Promise.resolve();
-	return refreshRecentTabsLoadedWindow(qc, {
-		reset: gaps.length > 0,
-		minimumRevision: delta.revision,
-	});
+	return refreshRecentTabsLoadedWindow(
+		qc,
+		{
+			reset: gaps.length > 0,
+			minimumRevision: delta.revision,
+		},
+		scope,
+	);
 }
 
-function useRecentTabsSection(section: RecentTabsSection) {
+function useRecentTabsSection(scope: RecentTabsScope | null, section: RecentTabsSection) {
 	const qc = useQueryClient();
 	return useInfiniteQuery({
-		queryKey: recentTabsSectionQueryKey(section),
+		queryKey: recentTabsSectionQueryKey(scope, section),
+		enabled: scope !== null,
 		queryFn: async ({ pageParam, signal }) => {
+			requireRecentTabsScope(scope);
 			const page = await api.getRecentTabsPage(section, {
 				limit: RECENT_TABS_PAGE_SIZE,
 				...(pageParam ? { cursor: pageParam } : {}),
 				signal,
 			});
-			const current = qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey(section));
+			requireRecentTabsScope(scope);
+			const current = qc.getQueryData<RecentTabsInfiniteData>(
+				recentTabsSectionQueryKey(scope, section),
+			);
 			if (pageParam) {
 				const revision = recentTabsDataRevision(current);
 				if (revision === undefined || page.revision !== revision) {
@@ -891,11 +958,14 @@ function useRecentTabsSection(section: RecentTabsSection) {
 	});
 }
 
+type ScopedMutation = { scope: RecentTabsScope | null };
+
 export function useRecentTabs() {
 	const qc = useQueryClient();
 	const { t } = useTranslation("nav");
-	const projectsQuery = useRecentTabsSection("projects");
-	const workQuery = useRecentTabsSection("work");
+	const scope = useRecentTabsScope();
+	const projectsQuery = useRecentTabsSection(scope, "projects");
+	const workQuery = useRecentTabsSection(scope, "work");
 	const projectTabs = useMemo(() => flattenPages(projectsQuery.data), [projectsQuery.data]);
 	const workTabs = useMemo(() => flattenPages(workQuery.data), [workQuery.data]);
 	const tabs = useMemo(() => [...projectTabs, ...workTabs], [projectTabs, workTabs]);
@@ -903,21 +973,22 @@ export function useRecentTabs() {
 	// Every mounted `useRecentTabs()` maintains the flat compatibility array, and each
 	// one memoizes its own copy — so writing unconditionally meant N cache writes per
 	// change for a value that had not changed.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: page updates trigger sync, but read the latest cache to avoid overwriting intervening WS deltas.
 	useEffect(() => {
-		qc.setQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY, (previous) =>
-			sameTabList(previous, tabs) ? (previous as RecentTab[]) : tabs,
-		);
-	}, [qc, tabs]);
+		if (isRecentTabsScopeCurrent(scope)) syncCompatibilityCache(qc, scope);
+	}, [qc, scope, tabs]);
 
 	const applyAuthoritativeResult = useCallback(
-		(result: RecentTabsMutationResponse) => {
-			void applyRecentTabsDeltaAndFollowUp(qc, mutationDelta(result)).catch(() => {});
+		(result: RecentTabsMutationResponse, { scope }: ScopedMutation) => {
+			if (!isRecentTabsScopeCurrent(scope)) return;
+			void applyRecentTabsDeltaAndFollowUp(qc, mutationDelta(result), scope).catch(() => {});
 		},
 		[qc],
 	);
 
 	const restoreMutation = useMutation({
-		mutationFn: (input: { snapshot?: RecentTab[]; token?: string }) => {
+		mutationFn: (input: ScopedMutation & { snapshot?: RecentTab[]; token?: string }) => {
+			requireRecentTabsScope(input.scope);
 			// Refuse an empty full-list replace: a missing snapshot must never wipe the
 			// user's recent tabs. Token restore is the only path that needs no snapshot.
 			if (!input.token && (!input.snapshot || input.snapshot.length === 0)) {
@@ -929,8 +1000,9 @@ export function useRecentTabs() {
 			});
 		},
 		onSuccess: applyAuthoritativeResult,
-		onError: () => {
-			void qc.invalidateQueries({ queryKey: RECENT_TABS_QUERY_KEY });
+		onError: (_error, { scope }) => {
+			if (!isRecentTabsScopeCurrent(scope)) return;
+			void qc.invalidateQueries({ queryKey: recentTabsScopeKey(scope) });
 			notifications.show({ color: "red", message: t("undoFailed") });
 		},
 	});
@@ -941,7 +1013,12 @@ export function useRecentTabs() {
 	 * matching the server's single pending undo token per user.
 	 */
 	const showUndoNotification = useCallback(
-		(message: string, undo: { undoToken?: string; snapshot?: RecentTab[] }) => {
+		(
+			message: string,
+			undo: { undoToken?: string; snapshot?: RecentTab[] },
+			scope: RecentTabsScope | null,
+		) => {
+			if (!isRecentTabsScopeCurrent(scope)) return;
 			const snapshot = undo.snapshot && undo.snapshot.length > 0 ? undo.snapshot : undefined;
 			// Nothing to restore with — showing an undo button would only fail.
 			if (!undo.undoToken && !snapshot) return;
@@ -973,11 +1050,11 @@ export function useRecentTabs() {
 							size: "compact-xs",
 							variant: "light",
 							onClick: () => {
+								if (!isRecentTabsScopeCurrent(scope)) return;
 								// Hide immediately so a second click cannot fire a duplicate restore.
-								// Failure feedback is a separate `undoFailed` toast.
 								notifications.hide(UNDO_NOTIFICATION_ID);
-								if (undo.undoToken) restoreMutation.mutate({ token: undo.undoToken });
-								else if (snapshot) restoreMutation.mutate({ snapshot });
+								if (undo.undoToken) restoreMutation.mutate({ scope, token: undo.undoToken });
+								else if (snapshot) restoreMutation.mutate({ scope, snapshot });
 							},
 						},
 						t("undo"),
@@ -989,67 +1066,90 @@ export function useRecentTabs() {
 	);
 
 	const removeMutation = useMutation({
-		mutationFn: ({ type, id }: { type: RecentTab["type"]; id: string }) =>
-			api.removeRecentTab(type, id),
-		onMutate: async ({ type, id }) => {
-			await qc.cancelQueries({ queryKey: RECENT_TABS_QUERY_KEY });
-			const snapshots = snapshotSections(qc);
+		mutationFn: ({ scope, type, id }: ScopedMutation & { type: RecentTab["type"]; id: string }) => {
+			requireRecentTabsScope(scope);
+			return api.removeRecentTab(type, id);
+		},
+		onMutate: async ({ scope, type, id }) => {
+			requireRecentTabsScope(scope);
+			await qc.cancelQueries({ queryKey: recentTabsScopeKey(scope) });
+			requireRecentTabsScope(scope);
+			const snapshots = snapshotSections(qc, scope);
 			const section = type === "project" ? "projects" : "work";
-			updateSectionData(qc, section, (current) => applyRecentTabRemove(current, `${type}:${id}`));
-			syncCompatibilityCache(qc);
+			updateSectionData(qc, scope, section, (current) =>
+				applyRecentTabRemove(current, `${type}:${id}`),
+			);
+			syncCompatibilityCache(qc, scope);
 			return { snapshots };
 		},
-		onError: (_error, _variables, context) => {
-			if (context) restoreSectionSnapshots(qc, context.snapshots);
+		onError: (_error, { scope }, context) => {
+			if (context) restoreSectionSnapshots(qc, scope, context.snapshots);
 		},
 		onSuccess: (result, variables) => {
-			applyAuthoritativeResult(result);
+			applyAuthoritativeResult(result, variables);
 			// Single-tab (or whole-folder) close via swipe / context menu / middle-click — same
 			// undo affordance as one-click clear. Token-only: a loaded-window snapshot would
 			// wipe unloaded pages if used as a full-list restore fallback.
 			if (!result.removedCount || !result.undoToken) return;
-			showUndoNotification(t(variables.type === "folder" ? "folderClosed" : "tabClosed"), {
-				undoToken: result.undoToken,
-			});
+			showUndoNotification(
+				t(variables.type === "folder" ? "folderClosed" : "tabClosed"),
+				{
+					undoToken: result.undoToken,
+				},
+				variables.scope,
+			);
 		},
 	});
 
 	const moveMutation = useMutation({
-		mutationFn: ({ key, target }: { key: string; target: RecentTabMoveTarget }) =>
-			api.moveRecentTab(key, target),
-		onMutate: async ({ key, target }) => {
-			await qc.cancelQueries({ queryKey: RECENT_TABS_QUERY_KEY });
-			const snapshots = snapshotSections(qc);
-			updateSectionData(qc, sectionFromKey(key), (current) =>
+		mutationFn: ({
+			scope,
+			key,
+			target,
+		}: ScopedMutation & { key: string; target: RecentTabMoveTarget }) => {
+			requireRecentTabsScope(scope);
+			return api.moveRecentTab(key, target);
+		},
+		onMutate: async ({ scope, key, target }) => {
+			requireRecentTabsScope(scope);
+			await qc.cancelQueries({ queryKey: recentTabsScopeKey(scope) });
+			requireRecentTabsScope(scope);
+			const snapshots = snapshotSections(qc, scope);
+			updateSectionData(qc, scope, sectionFromKey(key), (current) =>
 				applyRecentTabMove(current, key, target),
 			);
-			syncCompatibilityCache(qc);
+			syncCompatibilityCache(qc, scope);
 			return { snapshots };
 		},
-		onError: (_error, _variables, context) => {
-			if (context) restoreSectionSnapshots(qc, context.snapshots);
+		onError: (_error, { scope }, context) => {
+			if (context) restoreSectionSnapshots(qc, scope, context.snapshots);
 		},
-		onSuccess: (result) => {
-			applyAuthoritativeResult(result);
+		onSuccess: (result, variables) => {
+			if (!isRecentTabsScopeCurrent(variables.scope)) return;
+			applyAuthoritativeResult(result, variables);
 			// A move can change which folder's git identity a session follows.
 			void invalidateNarratorGitIdentities(qc);
 		},
 	});
 
 	const pinMutation = useMutation({
-		mutationFn: ({ key, pinned }: { key: string; pinned: boolean }) =>
-			api.pinRecentTab(key, pinned),
-		onMutate: async ({ key, pinned }) => {
-			await qc.cancelQueries({ queryKey: RECENT_TABS_QUERY_KEY });
-			const snapshots = snapshotSections(qc);
-			updateSectionData(qc, sectionFromKey(key), (current) =>
+		mutationFn: ({ scope, key, pinned }: ScopedMutation & { key: string; pinned: boolean }) => {
+			requireRecentTabsScope(scope);
+			return api.pinRecentTab(key, pinned);
+		},
+		onMutate: async ({ scope, key, pinned }) => {
+			requireRecentTabsScope(scope);
+			await qc.cancelQueries({ queryKey: recentTabsScopeKey(scope) });
+			requireRecentTabsScope(scope);
+			const snapshots = snapshotSections(qc, scope);
+			updateSectionData(qc, scope, sectionFromKey(key), (current) =>
 				applyRecentTabPin(current, key, pinned),
 			);
-			syncCompatibilityCache(qc);
+			syncCompatibilityCache(qc, scope);
 			return { snapshots };
 		},
-		onError: (_error, _variables, context) => {
-			if (context) restoreSectionSnapshots(qc, context.snapshots);
+		onError: (_error, { scope }, context) => {
+			if (context) restoreSectionSnapshots(qc, scope, context.snapshots);
 		},
 		onSuccess: applyAuthoritativeResult,
 	});
@@ -1060,59 +1160,73 @@ export function useRecentTabs() {
 			request: () => Promise<RecentTabsMutationResponse>,
 			optimistic?: (tabs: RecentTab[]) => RecentTab[],
 		): Promise<RecentTabsMutationResponse> => {
-			await qc.cancelQueries({ queryKey: RECENT_TABS_QUERY_KEY });
-			const snapshots = snapshotSections(qc);
+			requireRecentTabsScope(scope);
+			await qc.cancelQueries({ queryKey: recentTabsScopeKey(scope) });
+			requireRecentTabsScope(scope);
+			const snapshots = snapshotSections(qc, scope);
 			if (optimistic) {
-				updateSectionData(qc, "work", optimistic);
-				syncCompatibilityCache(qc);
+				updateSectionData(qc, scope, "work", optimistic);
+				syncCompatibilityCache(qc, scope);
 			}
 			try {
 				const result = await request();
-				applyAuthoritativeResult(result);
+				applyAuthoritativeResult(result, { scope });
 				return result;
 			} catch (error) {
-				restoreSectionSnapshots(qc, snapshots);
-				notifications.show({ color: "red", message: t("folderActionFailed") });
+				if (isRecentTabsScopeCurrent(scope)) {
+					restoreSectionSnapshots(qc, scope, snapshots);
+					notifications.show({ color: "red", message: t("folderActionFailed") });
+				}
 				throw error;
 			}
 		},
-		[qc, applyAuthoritativeResult, t],
+		[qc, scope, applyAuthoritativeResult, t],
 	);
 
 	const clearMutation = useMutation({
 		mutationFn: ({
 			scope,
+			clearScope,
 			keepTabKey,
-		}: {
-			scope: "all" | "projects" | "inactive_narrators";
+		}: ScopedMutation & {
+			clearScope: "all" | "projects" | "inactive_narrators";
 			keepTabKey?: string;
-		}) => api.clearRecentTabs(scope, keepTabKey),
-		onMutate: async ({ scope, keepTabKey }) => {
-			await qc.cancelQueries({ queryKey: RECENT_TABS_QUERY_KEY });
-			const snapshots = snapshotSections(qc);
+		}) => {
+			requireRecentTabsScope(scope);
+			return api.clearRecentTabs(clearScope, keepTabKey);
+		},
+		onMutate: async ({ scope, clearScope, keepTabKey }) => {
+			requireRecentTabsScope(scope);
+			await qc.cancelQueries({ queryKey: recentTabsScopeKey(scope) });
+			requireRecentTabsScope(scope);
+			const snapshots = snapshotSections(qc, scope);
 			const snapshot = [...flattenPages(snapshots.projects), ...flattenPages(snapshots.work)];
 			let removedCount = 0;
 			for (const section of ["projects", "work"] as const) {
-				updateSectionData(qc, section, (current) => {
-					const next = clearLoadedTabs(current, scope, keepTabKey);
+				updateSectionData(qc, scope, section, (current) => {
+					const next = clearLoadedTabs(current, clearScope, keepTabKey);
 					removedCount += current.length - next.length;
 					return next;
 				});
 			}
-			syncCompatibilityCache(qc);
+			syncCompatibilityCache(qc, scope);
 			return { snapshots, snapshot, removedCount };
 		},
-		onError: (_error, _variables, context) => {
-			if (context) restoreSectionSnapshots(qc, context.snapshots);
+		onError: (_error, { scope }, context) => {
+			if (context) restoreSectionSnapshots(qc, scope, context.snapshots);
 		},
-		onSuccess: (result, _variables, context) => {
-			applyAuthoritativeResult(result);
+		onSuccess: (result, variables, context) => {
+			applyAuthoritativeResult(result, variables);
 			const removedCount = result.removedCount ?? context?.removedCount ?? 0;
 			if (!context || removedCount <= 0) return;
-			showUndoNotification(t("tabsCleared", { count: removedCount }), {
-				...(result.undoToken ? { undoToken: result.undoToken } : {}),
-				snapshot: context.snapshot,
-			});
+			showUndoNotification(
+				t("tabsCleared", { count: removedCount }),
+				{
+					...(result.undoToken ? { undoToken: result.undoToken } : {}),
+					snapshot: context.snapshot,
+				},
+				variables.scope,
+			);
 		},
 	});
 
@@ -1125,35 +1239,37 @@ export function useRecentTabs() {
 			isError: query.isError,
 			isFetchingNextPage: query.isFetchingNextPage,
 			loadMore: () => {
+				if (!isRecentTabsScopeCurrent(scope)) return;
 				void query
 					.fetchNextPage()
 					.then((result) => {
 						if (isRecentTabsStaleCursorError(result.error)) {
-							return refreshRecentTabsLoadedWindow(qc, { reset: true });
+							return refreshRecentTabsLoadedWindow(qc, { reset: true }, scope);
 						}
 					})
 					.catch((error) => {
 						if (isRecentTabsStaleCursorError(error)) {
-							return refreshRecentTabsLoadedWindow(qc, { reset: true });
+							return refreshRecentTabsLoadedWindow(qc, { reset: true }, scope);
 						}
 					});
 			},
 			retry: () => {
-				void query.refetch();
+				if (isRecentTabsScopeCurrent(scope)) void query.refetch();
 			},
 		}),
-		[qc],
+		[qc, scope],
 	);
 
 	return {
+		scope,
 		tabs,
 		projectTabs,
 		workTabs,
 		projects: toSectionState(projectsQuery, projectTabs),
 		work: toSectionState(workQuery, workTabs),
 		removeTab: useCallback(
-			(type: RecentTab["type"], id: string) => removeMutation.mutate({ type, id }),
-			[removeMutation],
+			(type: RecentTab["type"], id: string) => removeMutation.mutate({ scope, type, id }),
+			[removeMutation, scope],
 		),
 		/**
 		 * Optimistic move with an authoritative follow-up. `onError` runs after the
@@ -1164,12 +1280,20 @@ export function useRecentTabs() {
 				key: string,
 				target: RecentTabMoveTarget,
 				options?: { onError?: (error: unknown) => void },
-			) => moveMutation.mutate({ key, target }, { onError: options?.onError }),
-			[moveMutation],
+			) =>
+				moveMutation.mutate(
+					{ scope, key, target },
+					{
+						onError: (error) => {
+							if (isRecentTabsScopeCurrent(scope)) options?.onError?.(error);
+						},
+					},
+				),
+			[moveMutation, scope],
 		),
 		pinTab: useCallback(
-			(key: string, pinned: boolean) => pinMutation.mutate({ key, pinned }),
-			[pinMutation],
+			(key: string, pinned: boolean) => pinMutation.mutate({ scope, key, pinned }),
+			[pinMutation, scope],
 		),
 		updateFolder: useCallback(
 			(folderId: string, patch: RecentTabFolderPatch) =>
@@ -1187,32 +1311,34 @@ export function useRecentTabs() {
 				);
 				// The folder layout is hand-built work; dissolving it is undoable like a close.
 				if (result.undoToken) {
-					showUndoNotification(t("folderDissolved"), { undoToken: result.undoToken });
+					showUndoNotification(t("folderDissolved"), { undoToken: result.undoToken }, scope);
 				}
 			},
-			[runFolderMutation, showUndoNotification, t],
+			[runFolderMutation, scope, showUndoNotification, t],
 		),
 		clearTabs: useCallback(
-			(scope: "all" | "projects" | "inactive_narrators", keepTabKey?: string) =>
-				clearMutation.mutate({ scope, keepTabKey }),
-			[clearMutation],
+			(clearScope: "all" | "projects" | "inactive_narrators", keepTabKey?: string) =>
+				clearMutation.mutate({ scope, clearScope, keepTabKey }),
+			[clearMutation, scope],
 		),
 		restoreTabs: useCallback(
-			(snapshot: RecentTab[]) => restoreMutation.mutate({ snapshot }),
-			[restoreMutation],
+			(snapshot: RecentTab[]) => restoreMutation.mutate({ scope, snapshot }),
+			[restoreMutation, scope],
 		),
 	};
 }
 
 async function applyGlobalRecentTabsMutation(
+	scope: RecentTabsScope,
 	request: Promise<RecentTabsMutationResponse>,
 ): Promise<void> {
 	const result = await request;
-	await applyRecentTabsDeltaAndFollowUp(globalQC, mutationDelta(result));
+	await applyRecentTabsDeltaAndFollowUp(globalQC, mutationDelta(result), scope);
 }
 
-export function addRecentTab(tab: AddRecentTabInput): Promise<void> {
-	return applyGlobalRecentTabsMutation(api.upsertRecentTab(buildRecentTabUpsert(tab))).catch(
+export function addRecentTab(tab: AddRecentTabInput, scope = getRecentTabsScope()): Promise<void> {
+	if (!isRecentTabsScopeCurrent(scope)) return Promise.resolve();
+	return applyGlobalRecentTabsMutation(scope, api.upsertRecentTab(buildRecentTabUpsert(tab))).catch(
 		(error) => {
 			if (import.meta.env.DEV) console.warn("[useRecentTabs] upsertRecentTab failed:", error);
 		},
@@ -1230,11 +1356,14 @@ export function addRecentTab(tab: AddRecentTabInput): Promise<void> {
  *    revision. Doing it as upsert-then-move renders the tab at the default insertion point
  *    for a frame before it jumps to where the user aimed.
  */
-export function addRecentTabOrThrow(
+export async function addRecentTabOrThrow(
 	tab: AddRecentTabInput,
 	anchor?: { beforeKey: string } | { afterKey: string },
+	scope = getRecentTabsScope(),
 ): Promise<void> {
+	requireRecentTabsScope(scope);
 	return applyGlobalRecentTabsMutation(
+		scope,
 		api.upsertRecentTab({ ...buildRecentTabUpsert(tab), ...(anchor ?? {}) }),
 	);
 }
@@ -1247,6 +1376,7 @@ export function addRecentTabOrThrow(
  * costs one redundant upsert on the next visit to that tab, which is exactly the
  * behaviour before this dedupe existed — the safe direction to fail in.
  */
+let visitScope: RecentTabsScope | null = null;
 const visitSignatures = new Map<string, string>();
 const MAX_TRACKED_VISIT_SIGNATURES = 200;
 
@@ -1262,9 +1392,11 @@ function rememberVisitSignature(key: string, signature: string): void {
 	}
 }
 
-function isRecentTabLoaded(key: string): boolean {
+function isRecentTabLoaded(scope: RecentTabsScope, key: string): boolean {
 	for (const section of ["projects", "work"] as const) {
-		const data = globalQC.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey(section));
+		const data = globalQC.getQueryData<RecentTabsInfiniteData>(
+			recentTabsSectionQueryKey(scope, section),
+		);
 		if (data?.pages.some((page) => page.items.some((tab) => tabKey(tab) === key))) return true;
 	}
 	return false;
@@ -1282,26 +1414,39 @@ function isRecentTabLoaded(key: string): boolean {
  * from the sidebar and navigating back to the same page must re-create it, and the
  * signature alone cannot tell that apart from a redundant re-render.
  */
-export function recordRecentTabVisit(tab: AddRecentTabInput): Promise<void> {
+export function recordRecentTabVisit(
+	tab: AddRecentTabInput,
+	scope = getRecentTabsScope(),
+): Promise<void> {
+	if (!isRecentTabsScopeCurrent(scope)) return Promise.resolve();
+	if (visitScope !== scope) {
+		visitSignatures.clear();
+		visitScope = scope;
+	}
 	const key = `${tab.type}:${tab.id}`;
 	const signature = recentTabVisitSignature(tab);
-	if (visitSignatures.get(key) === signature && isRecentTabLoaded(key)) {
+	if (visitSignatures.get(key) === signature && isRecentTabLoaded(scope, key)) {
 		return Promise.resolve();
 	}
 	rememberVisitSignature(key, signature);
-	return applyGlobalRecentTabsMutation(api.upsertRecentTab(buildRecentTabUpsert(tab))).catch(
+	return applyGlobalRecentTabsMutation(scope, api.upsertRecentTab(buildRecentTabUpsert(tab))).catch(
 		(error) => {
 			// A failed write must not be remembered as persisted, or the tab would stay
 			// missing until something else happened to change the signature.
-			if (visitSignatures.get(key) === signature) visitSignatures.delete(key);
+			if (visitScope === scope && visitSignatures.get(key) === signature)
+				visitSignatures.delete(key);
 			if (import.meta.env.DEV) console.warn("[useRecentTabs] upsertRecentTab failed:", error);
 		},
 	);
 }
 
-export function addRecentTabsBatch(tabs: AddRecentTabInput[]): Promise<void> {
-	if (tabs.length === 0) return Promise.resolve();
+export function addRecentTabsBatch(
+	tabs: AddRecentTabInput[],
+	scope = getRecentTabsScope(),
+): Promise<void> {
+	if (!isRecentTabsScopeCurrent(scope) || tabs.length === 0) return Promise.resolve();
 	return applyGlobalRecentTabsMutation(
+		scope,
 		api.upsertRecentTabsBatch(tabs.map(buildRecentTabUpsert)),
 	).catch((error) => {
 		if (import.meta.env.DEV) console.warn("[useRecentTabs] batch upsert failed:", error);
@@ -1309,19 +1454,24 @@ export function addRecentTabsBatch(tabs: AddRecentTabInput[]): Promise<void> {
 	});
 }
 
-export function addSubagentRecentTab(input: SubagentRecentTabInput): void {
-	void recordRecentTabVisit(buildSubagentRecentTab(input)).catch(() => {});
+export function addSubagentRecentTab(
+	input: SubagentRecentTabInput,
+	scope = getRecentTabsScope(),
+): void {
+	void recordRecentTabVisit(buildSubagentRecentTab(input), scope).catch(() => {});
 }
 
 export function updateRecentTabLocal(
 	type: RecentTab["type"],
 	id: string,
 	patch: Partial<Pick<RecentTab, "title" | "subtitle" | "status">>,
+	scope = getRecentTabsScope(),
 ) {
+	if (!isRecentTabsScopeCurrent(scope)) return;
 	const normalizedPatch = { ...patch };
 	if ("title" in patch) normalizedPatch.title = clampRecentTabText(patch.title);
 	if ("subtitle" in patch) normalizedPatch.subtitle = clampRecentTabText(patch.subtitle);
-	updateSectionData(globalQC, type === "project" ? "projects" : "work", (tabs) => {
+	updateSectionData(globalQC, scope, type === "project" ? "projects" : "work", (tabs) => {
 		let changed = false;
 		const next = tabs.map((tab) => {
 			if (tab.type !== type || tab.id !== id) return tab;
@@ -1330,5 +1480,5 @@ export function updateRecentTabLocal(
 		});
 		return changed ? next : tabs;
 	});
-	syncCompatibilityCache(globalQC);
+	syncCompatibilityCache(globalQC, scope);
 }

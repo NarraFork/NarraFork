@@ -16,6 +16,7 @@ import { createRef, useEffect, useState } from "react";
 import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
+import { AgentReferenceOpenerContext } from "../markdown/AgentReferenceLink";
 import { composerOptimizeTarget } from "./composer-optimize-target";
 import {
 	InlineComposerEditor,
@@ -66,6 +67,7 @@ let sends = 0;
 let accepted = 0;
 let dismissed = 0;
 let opened = 0;
+const openedNarrators: string[] = [];
 let pasted: string[] = [];
 let pasteCalls = 0;
 let panelDrops = 0;
@@ -103,44 +105,46 @@ function Fixture() {
 						Source text to quote
 					</div>
 					<div id="shell">
-						<InlineComposerEditor
-							ref={attachEditor}
-							elementRef={element}
-							value={value}
-							onChange={(document) => {
-								changes++;
-								if (heldEchoes) heldEchoes.push(document);
-								else setValue(document);
-							}}
-							resources={resources}
-							attachmentsHydrating={hydrating}
-							disabled={disabled}
-							placeholder="Message"
-							onRemoveAsset={(id) => removed.push(id)}
-							onOpenQuote={() => opened++}
-							onOpenImage={() => opened++}
-							onOpenFile={() => opened++}
-							onOpenAttachment={() => opened++}
-							onPasteFiles={(files) => {
-								pasteCalls++;
-								pasted = files.map((file) => file.name);
-								if (captureNextDrop && files.length) {
-									captureNextDrop = false;
-									captureBookmark("drop");
+						<AgentReferenceOpenerContext.Provider value={(id) => openedNarrators.push(id)}>
+							<InlineComposerEditor
+								ref={attachEditor}
+								elementRef={element}
+								value={value}
+								onChange={(document) => {
+									changes++;
+									if (heldEchoes) heldEchoes.push(document);
+									else setValue(document);
+								}}
+								resources={resources}
+								attachmentsHydrating={hydrating}
+								disabled={disabled}
+								placeholder="Message"
+								onRemoveAsset={(id) => removed.push(id)}
+								onOpenQuote={() => opened++}
+								onOpenImage={() => opened++}
+								onOpenFile={() => opened++}
+								onOpenAttachment={() => opened++}
+								onPasteFiles={(files) => {
+									pasteCalls++;
+									pasted = files.map((file) => file.name);
+									if (captureNextDrop && files.length) {
+										captureNextDrop = false;
+										captureBookmark("drop");
+									}
+								}}
+								onKeyDown={(event) => {
+									if (event.key === "Enter" && !event.shiftKey) {
+										event.preventDefault();
+										sends++;
+									}
+								}}
+								controls={
+									<button type="button" id="outside">
+										Controls
+									</button>
 								}
-							}}
-							onKeyDown={(event) => {
-								if (event.key === "Enter" && !event.shiftKey) {
-									event.preventDefault();
-									sends++;
-								}
-							}}
-							controls={
-								<button type="button" id="outside">
-									Controls
-								</button>
-							}
-						/>
+							/>
+						</AgentReferenceOpenerContext.Provider>
 					</div>
 				</div>
 			</MantineProvider>
@@ -176,6 +180,26 @@ export function replaceUndoable(document: ComposerDocument) {
 }
 export function insert(nodes: ComposerInlineNode[], assets?: ComposerAsset[]) {
 	editor.current?.insertNodes(nodes, assets);
+}
+export function copy(cut = false): Record<string, string> {
+	const transfer = new DataTransfer();
+	editor.current?.getElement()?.dispatchEvent(
+		new ClipboardEvent(cut ? "cut" : "copy", {
+			clipboardData: transfer,
+			bubbles: true,
+			cancelable: true,
+		}),
+	);
+	return Object.fromEntries([...transfer.types].map((type) => [type, transfer.getData(type)]));
+}
+export function paste(data: Record<string, string>) {
+	const transfer = new DataTransfer();
+	for (const [type, value] of Object.entries(data)) transfer.setData(type, value);
+	editor.current
+		?.getElement()
+		?.dispatchEvent(
+			new ClipboardEvent("paste", { clipboardData: transfer, bubbles: true, cancelable: true }),
+		);
 }
 export function selection(start: number, end = start) {
 	editor.current?.setSelection(start, end);

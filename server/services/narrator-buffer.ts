@@ -41,7 +41,7 @@ import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import type { ImageRef } from "../lib/uploads";
 import { MAILBOX_LIMITS } from "./agent-runtime/limits";
-import { createMailboxStore } from "./agent-runtime/mailbox";
+import { createMailboxStore, mailboxDedupeKey } from "./agent-runtime/mailbox";
 import type { MailboxRow } from "./agent-runtime/mailbox-types";
 import { RuntimeReadConflictError } from "./agent-runtime/read-conflict";
 import {
@@ -51,7 +51,18 @@ import {
 	type RuntimeMailboxStagingLookup,
 	type RuntimeQueuePort,
 } from "./agent-runtime/runtime-queue-port";
+import {
+	assertUserSubmissionReplay,
+	communicationReferenceTargets,
+	submissionRequestKey,
+	type UserSubmission,
+} from "./agent-runtime/user-submission";
 import { bufferEditHolds, isBufferConsumptionHeld } from "./buffer-edit-hold";
+import {
+	commitUserCommunicationAdmissionTx,
+	prepareUserCommunicationAdmission,
+	publishCommunicationChanged,
+} from "./narrator-communication";
 import {
 	activeNarrators,
 	type BufferCreator,
@@ -504,6 +515,8 @@ function ensureStagingDirectory(id: string): string {
 	return dir;
 }
 interface StagingMetadata {
+	submissionFingerprint?: string;
+	submissionAttachments?: UserSubmission["attachments"];
 	humanReplyContext?: import("@shared/reply-context").ReplyContext;
 	composerDocumentPath?: string;
 	queueMode?: BufferQueueMode;
@@ -939,6 +952,75 @@ export async function pushBufferedMessage(
 		return { ok: false, bufferedAt: "", id: "" };
 	return enqueueBufferedMessage(...args);
 }
+export interface UserSubmissionReceipt {
+	status: "accepted";
+	id: string;
+	bufferedAt: string;
+	state: string;
+	messageId: string | null;
+	dedupeExpiresAt: string;
+}
+
+/** An indexed, user+source scoped lookup; absence is not evidence of expiry. */
+export async function readUserSubmission(
+	narratorId: string,
+	userId: string,
+	clientSubmissionId: string,
+): Promise<(UserSubmissionReceipt & { metadataJson: string | null }) | undefined> {
+	const requestKey = submissionRequestKey(userId, clientSubmissionId);
+	const dedupeKey = mailboxDedupeKey({
+		kind: "user_input",
+		narratorId,
+		text: "",
+		projectedByteSize: 0,
+		requestKey,
+	});
+	const port = pgQueue();
+	const row = port
+		? await port.mailbox.getUserSubmission(narratorId, dedupeKey)
+		: await readQueryFirst(
+				db
+					.select({
+						id: mailbox.id,
+						bufferedAt: mailbox.bufferedAt,
+						state: mailbox.state,
+						currentMessageId: mailbox.currentMessageId,
+						dedupeExpiresAt: mailbox.dedupeExpiresAt,
+						metadataJson: mailbox.metadataJson,
+					})
+					.from(mailbox)
+					.where(
+						and(
+							eq(mailbox.narratorId, narratorId),
+							eq(mailbox.kind, "user_input"),
+							eq(mailbox.dedupeKey, dedupeKey),
+						),
+					)
+					.limit(1),
+			);
+	if (!row) return undefined;
+	const dedupeExpiresAt =
+		row.dedupeExpiresAt ??
+		json<{ cleanupDedupeExpiresAt?: string }>(row.metadataJson, {}).cleanupDedupeExpiresAt;
+	if (!dedupeExpiresAt || !Number.isFinite(Date.parse(dedupeExpiresAt)))
+		throw new AppError("Submission receipt is temporarily unavailable", 503, "SUBMISSION_UNKNOWN");
+	if (Date.parse(dedupeExpiresAt) <= Date.now())
+		throw new AppError(
+			"Submission receipt expired; explicitly send again with a new ID",
+			410,
+			"SUBMISSION_EXPIRED",
+		);
+	return {
+		status: "accepted",
+		id: row.id,
+		bufferedAt: row.bufferedAt,
+		state: row.state,
+		messageId: row.currentMessageId,
+		dedupeExpiresAt,
+		metadataJson: row.metadataJson,
+	};
+}
+
 export async function enqueueBufferedMessage(
 	narratorId: string,
 	text: string,
@@ -956,7 +1038,8 @@ export async function enqueueBufferedMessage(
 	composerDocument?: ComposerDocument,
 	media?: MediaRef[],
 	humanReplyContext?: import("@shared/reply-context").ReplyContext,
-): Promise<{ ok: boolean; bufferedAt: string; id: string; full?: boolean }> {
+	submission?: UserSubmission,
+): Promise<{ ok: boolean; bufferedAt: string; id: string; full?: boolean; duplicate?: boolean }> {
 	humanReplyContext = humanReplyContext ? { ...humanReplyContext } : undefined;
 	composerDocument = parseOptionalComposerDocument(composerDocument);
 	validateComposerProjection(
@@ -965,6 +1048,30 @@ export async function enqueueBufferedMessage(
 		(fileReferences ?? []).map((snapshot) => snapshot.reference),
 	);
 	validateComposerAssets(composerDocument, images ?? [], textFiles ?? [], media ?? []);
+	const targetNarratorIds = communicationReferenceTargets(composerDocument);
+	if ((submission || targetNarratorIds.length) && !createdBy)
+		throw new AppError("User submission requires an authenticated principal", 403, "FORBIDDEN");
+	if (submission && createdBy) {
+		const previous = await readUserSubmission(narratorId, createdBy, submission.clientSubmissionId);
+		if (previous) {
+			assertUserSubmissionReplay(previous, submission);
+			releaseStagedFiles(textFiles);
+			return { ok: true, id: previous.id, bufferedAt: previous.bufferedAt, duplicate: true };
+		}
+	}
+	const communication =
+		targetNarratorIds.length && createdBy
+			? await prepareUserCommunicationAdmission({
+					sourceNarratorId: narratorId,
+					userId: createdBy,
+					targetNarratorIds,
+				})
+			: undefined;
+	const requestKey =
+		submission && createdBy
+			? submissionRequestKey(createdBy, submission.clientSubmissionId)
+			: undefined;
+	let communicationDirty: string[] = [];
 	const stagingId = generateShortId();
 	const refs = freezeFileReferenceSnapshots(fileReferences);
 	images = images?.map((image) => ({ ...image }));
@@ -988,7 +1095,18 @@ export async function enqueueBufferedMessage(
 			payloadRef = { storage: "buffered_file", path, byteSize: bytes, ownership: "mailbox" };
 		}
 		let fileReferencesJson = refs.length ? JSON.stringify(refs) : null;
-		const metadata: StagingMetadata = { stagingId, executionIntent, queueMode, humanReplyContext };
+		const metadata: StagingMetadata = {
+			stagingId,
+			executionIntent,
+			queueMode,
+			humanReplyContext,
+			...(submission
+				? {
+						submissionFingerprint: submission.fingerprint,
+						submissionAttachments: submission.attachments?.filter((item) => item.uploadId),
+					}
+				: {}),
+		};
 		if (composerDocument)
 			metadata.composerDocumentPath = await writeStagingText(
 				stagingId,
@@ -1019,6 +1137,7 @@ export async function enqueueBufferedMessage(
 		const input = {
 			narratorId,
 			kind: "user_input" as const,
+			requestKey,
 			text: payloadRef ? "" : text,
 			projectedByteSize: bytes,
 			payloadRef,
@@ -1036,7 +1155,12 @@ export async function enqueueBufferedMessage(
 		// commits atomically in the adapter. SQLite: the original synchronous segment below.
 		admissionStarted = true;
 		const result = port
-			? await port.mailbox.admitUserBuffered(input, { position, frontOrder })
+			? await port.mailbox.admitUserBuffered(input, {
+					position,
+					frontOrder,
+					communication,
+					submission,
+				})
 			: db.transaction((tx) => {
 					const rows = tx
 						.select({ id: mailbox.id, seq: mailbox.seq, priority: mailbox.priority })
@@ -1069,6 +1193,13 @@ export async function enqueueBufferedMessage(
 						},
 						tx,
 					);
+					if (accepted.status === "duplicate" && submission)
+						assertUserSubmissionReplay(accepted.delivery, submission);
+					if (accepted.status === "accepted" && communication)
+						communicationDirty = commitUserCommunicationAdmissionTx(tx, communication, {
+							admissionId: accepted.delivery.id,
+							messageId: accepted.delivery.recipientMessageId ?? undefined,
+						});
 					if (accepted.status === "accepted" && fifoPriority) {
 						// Subagent priority inputs historically preserve FIFO within the priority
 						// group. Publish their order atomically with acceptance, never afterward.
@@ -1107,9 +1238,28 @@ export async function enqueueBufferedMessage(
 			discardUnownedStaging(stagingId);
 			return { ok: false, bufferedAt: "", id: "", full: true };
 		}
+		if (result.status === "duplicate") discardUnownedStaging(stagingId);
+		// Dispatch/dirty listeners cannot turn a committed acceptance into rejection.
+		if (result.status === "accepted" && communication) {
+			try {
+				publishCommunicationChanged(
+					port ? [narratorId, ...communication.targetNarratorIds] : communicationDirty,
+				);
+			} catch (error) {
+				logger.warn("Accepted communication dirty notification deferred", {
+					narratorId,
+					error: String(error),
+				});
+			}
+		}
 		// The mailbox row now owns its own copy, so the staged originals can go.
 		releaseStagedFiles(textFiles);
-		return { ok: true, bufferedAt: result.delivery.bufferedAt, id: result.delivery.id };
+		return {
+			ok: true,
+			bufferedAt: result.delivery.bufferedAt,
+			id: result.delivery.id,
+			duplicate: result.status === "duplicate",
+		};
 	} catch (error) {
 		if (!admissionStarted) {
 			discardUnownedStaging(stagingId);
@@ -1671,6 +1821,10 @@ async function clearBufferedMessagesUnlocked(narratorId: string): Promise<void> 
 						metadataJson: JSON.stringify({
 							stagingId: json<{ stagingId?: string }>(row.metadataJson, {}).stagingId ?? row.id,
 							cleanupDedupeExpiresAt: row.dedupeExpiresAt,
+							submissionFingerprint: json<StagingMetadata>(row.metadataJson, {})
+								.submissionFingerprint,
+							submissionAttachments: json<StagingMetadata>(row.metadataJson, {})
+								.submissionAttachments,
 						}),
 					})
 					.where(eq(mailbox.id, row.id))
@@ -1709,11 +1863,20 @@ async function clearBufferedMessagesUnlocked(narratorId: string): Promise<void> 
 				cleanupRows.slice(offset, offset + 4).map((row) =>
 					trackBufferedCleanup(async () => {
 						if (!row.metadataJson) throw new RuntimeReadConflictError();
-						const metadata = json<{ cleanupDedupeExpiresAt?: string | null }>(row.metadataJson, {});
+						const metadata = json<{
+							cleanupDedupeExpiresAt?: string | null;
+							submissionFingerprint?: string;
+							submissionAttachments?: UserSubmission["attachments"];
+						}>(row.metadataJson, {});
 						await cleanupObservedBufferedTextFiles(row.id, row);
 						db.update(mailbox)
 							.set({
-								metadataJson: null,
+								metadataJson: metadata.submissionFingerprint
+									? JSON.stringify({
+											submissionFingerprint: metadata.submissionFingerprint,
+											submissionAttachments: metadata.submissionAttachments,
+										})
+									: null,
 								lastError: "Removed by user",
 								dedupeExpiresAt: metadata.cleanupDedupeExpiresAt ?? null,
 							})

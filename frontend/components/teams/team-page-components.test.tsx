@@ -22,7 +22,9 @@ import type { ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { I18nextProvider } from "react-i18next";
 import { teamKeys } from "../../hooks/useTeams";
+import enNarrator from "../../locales/en/narrator.json";
 import en from "../../locales/en/projects.json";
+import zhNarrator from "../../locales/zh-CN/narrator.json";
 import zh from "../../locales/zh-CN/projects.json";
 import { TeamActivity } from "./TeamActivity";
 import { TeamBoard, TeamBoardCard } from "./TeamBoard";
@@ -44,7 +46,10 @@ async function i18nFor(lng: "en" | "zh-CN") {
 	const i18n = createInstance();
 	await i18n.init({
 		lng,
-		resources: { en: { projects: en }, "zh-CN": { projects: zh } },
+		resources: {
+			en: { projects: en, narrator: enNarrator },
+			"zh-CN": { projects: zh, narrator: zhNarrator },
+		},
 		defaultNS: "projects",
 		interpolation: { escapeValue: false },
 	});
@@ -423,6 +428,28 @@ describe("board", () => {
 });
 
 describe("top bar", () => {
+	test("members and read-only onlookers can open the shared communication topology", async () => {
+		for (const access of ["write", "read"] as const) {
+			for (const lng of ["en", "zh-CN"] as const) {
+				const html = await render(
+					<TeamTopBar
+						projectId="p"
+						teamId="lead"
+						title="Release crew"
+						summary={summary({ access, pendingApprovalCount: access === "write" ? 0 : null })}
+					/>,
+					new QueryClient(),
+					lng,
+				);
+				expect(html).toContain('data-testid="team-communication-button"');
+				expect(html).toContain(
+					`aria-label="${lng === "en" ? enNarrator.communicationTitle : zhNarrator.communicationTitle}"`,
+				);
+				expect(html).toContain('aria-expanded="false"');
+			}
+		}
+	});
+
 	test("members see approvals (capped) and pause all; onlookers see neither", async () => {
 		const member = await render(
 			<TeamTopBar

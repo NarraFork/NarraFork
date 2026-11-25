@@ -63,6 +63,47 @@ function fakeFile(name: string): File {
 	return new File(["x"], name, { type: "text/plain" });
 }
 
+describe("narrator reference queued/history edits", () => {
+	test("retains existing identities and newly authored atoms only in the document payload", () => {
+		const first = {
+			type: "narratorReference" as const,
+			id: "first",
+			narratorId: "target-one",
+			label: "First",
+		};
+		const added = {
+			type: "narratorReference" as const,
+			id: "added",
+			narratorId: "target-two",
+			label: "Second",
+		};
+		const document: ComposerDocument = {
+			version: 1,
+			assets: [],
+			paragraphs: [{ children: [first] }],
+		};
+		const session = seedComposerEditSession(
+			{
+				text: "[@First](nf-agent://open?id=target-one)",
+				fileReferences: [],
+				composerDocument: document,
+			},
+			[],
+		);
+		const edited: ComposerDocument = {
+			...document,
+			paragraphs: [{ children: [first, { type: "text", text: " " }, added] }],
+		};
+		const projected = projectComposerEdit(session, edited);
+		expect(projected.text).toBe(
+			"[@First](nf-agent://open?id=target-one) [@Second](nf-agent://open?id=target-two)",
+		);
+		expect(projected.composerDocument).toEqual(edited);
+		expect(projected.fileReferences).toEqual([]);
+		expect(projectComposerEdit(session, session.document).composerDocument).toEqual(document);
+	});
+});
+
 describe("native media queued edits", () => {
 	const media = {
 		mediaId: "media-a",

@@ -10,8 +10,14 @@
  */
 
 import type { DockviewApi } from "dockview-react";
-import { type RefObject, useEffect, useState } from "react";
-import { onPanelDragEnd, onPanelDragMove, type PanelDragState } from "../../lib/panel-drag";
+import { type RefObject, useEffect, useId, useState } from "react";
+import {
+	onPanelDragEnd,
+	onPanelDragMove,
+	PANEL_DROP_PRIORITY,
+	type PanelDragState,
+	registerPanelDropTarget,
+} from "../../lib/panel-drag";
 import {
 	type DropIndicator,
 	type DropIntent,
@@ -304,6 +310,7 @@ export function dropNativePanel(
 export function useDockviewDnd(options: UseDockviewDndOptions): UseDockviewDndResult {
 	const { apiRef, rootRef, onDropSubject, thresholds, surfaceId } = options;
 	const [dropIndicator, setDropIndicator] = useState<DropIndicator | null>(null);
+	const targetId = useId();
 
 	useEffect(() => {
 		const unsubMove = onPanelDragMove((state: PanelDragState) => {
@@ -326,50 +333,45 @@ export function useDockviewDnd(options: UseDockviewDndOptions): UseDockviewDndRe
 			setDropIndicator(toIndicator(hit, thresholds));
 		});
 
-		const unsubEnd = onPanelDragEnd((final: PanelDragState | null) => {
-			setDropIndicator(null);
-			const api = apiRef.current;
-			const root = rootRef.current;
-			if (!api || !root || !final) return;
-			if (!canSurfaceHandleDrag(final, surfaceId, !!onDropSubject)) return;
-			// Release may have crossed a zone boundary since the last move event.
-			const hit = hitTestGroups(api, final.x, final.y, final.panelId, thresholds);
-			if (!hit) return;
-			const resolved = {
-				groupId: hit.group.id,
-				intent: hit.intent,
-				targetPanelId: hit.targetPanelId,
-			};
-
-			// Only the surface the pointer was actually released over may act.
-			//
-			// Every surface subscribes to this singleton, so without this check a drag
-			// from surface A onto surface B is handled TWICE: B creates the panel while A
-			// — for which `isLocalPanelDrag` is true — also "rearranges" it locally from
-			// its own stale hit-test. The result is the same panel in both places, which
-			// is what "the target got it but the original is still there" was.
-			//
-			// DOM hit-testing rather than comparing rects: when surfaces overlap, rect
-			// containment would be true for both. But the topmost
-			// element is often NOT a surface (a drag ghost rides under the pointer), so
-			// the whole stack is consulted and non-surface layers are skipped — see
-			// `isTopmostSurface`.
-			const stack = document.elementsFromPoint?.(final.x, final.y) ?? [];
-			if (!isTopmostSurface(root, stack)) return;
-
-			if (isLocalPanelDrag(final, surfaceId)) {
-				// biome-ignore lint/style/noNonNullAssertion: isLocalPanelDrag requires panelId
-				dropExistingPanel(api, final.panelId!, resolved);
-			} else {
-				onDropSubject?.(final, resolved);
-			}
+		const unsubDrop = registerPanelDropTarget({
+			id: `dock:${surfaceId ?? targetId}`,
+			priority: PANEL_DROP_PRIORITY.dock,
+			hitTest: (final) => {
+				const api = apiRef.current;
+				const root = rootRef.current;
+				if (!api || !root || !canSurfaceHandleDrag(final, surfaceId, !!onDropSubject)) return null;
+				// Release coordinates and the topmost DOM surface, never the last preview.
+				const stack = document.elementsFromPoint?.(final.x, final.y) ?? [];
+				if (!isTopmostSurface(root, stack)) return null;
+				const hit = hitTestGroups(api, final.x, final.y, final.panelId, thresholds);
+				return hit
+					? {
+							api,
+							target: {
+								groupId: hit.group.id,
+								intent: hit.intent,
+								targetPanelId: hit.targetPanelId,
+							},
+						}
+					: null;
+			},
+			onDrop: (final, { api, target }) => {
+				if (isLocalPanelDrag(final, surfaceId)) {
+					// biome-ignore lint/style/noNonNullAssertion: isLocalPanelDrag requires panelId
+					dropExistingPanel(api, final.panelId!, target);
+				} else {
+					onDropSubject?.(final, target);
+				}
+			},
 		});
+		const unsubEnd = onPanelDragEnd(() => setDropIndicator(null));
 
 		return () => {
 			unsubMove();
+			unsubDrop();
 			unsubEnd();
 		};
-	}, [apiRef, rootRef, onDropSubject, thresholds, surfaceId]);
+	}, [apiRef, rootRef, onDropSubject, thresholds, surfaceId, targetId]);
 
 	return { dropIndicator };
 }

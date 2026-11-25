@@ -249,6 +249,9 @@ export interface AdapterMessage extends MessageWithBody<AdapterContentBlock> {
 	id?: string;
 	role: string;
 	createdAt?: string;
+	/** Bounded composer detail is fetched only for mounted, explicitly flagged user rows. */
+	hasComposerDocument?: boolean;
+	stateRevision?: number;
 	/**
 	 * Slash command the user typed, when this user message was produced by one.
 	 *
@@ -2131,6 +2134,9 @@ function adaptMessage(
 				data: {
 					role: "user",
 					text,
+					...(msg.hasComposerDocument && msg.id
+						? { composerDocumentSource: { messageId: msg.id, revision: msg.stateRevision ?? 0 } }
+						: {}),
 					// Chat-style surfaces fold a follow-up's header (grouping) and may
 					// carry a reply quote strip or a tombstone; the narrator defaults
 					// remain byte-identical when none of these are set.

@@ -2,7 +2,7 @@ import { afterAll, beforeAll, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { basename } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ComposerDocument } from "@shared/composer-document";
+import { type ComposerDocument, composerNarratorReferenceText } from "@shared/composer-document";
 import puppeteer, { type Browser, type Page } from "puppeteer-core";
 import type * as Fixture from "./InlineComposerEditor.browser-fixture";
 
@@ -145,6 +145,90 @@ async function chord(page: Page, key: "z" | "Z" | "Enter", ...modifiers: ("Contr
 	await page.keyboard.press(key);
 	for (const modifier of [...modifiers].reverse()) await page.keyboard.up(modifier);
 }
+
+test("narrator atom preserves identity and undo without secure crypto APIs; HTML/text cannot grant it", async () => {
+	const page = await open();
+	try {
+		const atom = {
+			type: "narratorReference" as const,
+			id: "authored-atom",
+			narratorId: "stable-target",
+			label: "会话\u{1F600}",
+		};
+		await load(page, {
+			...empty,
+			paragraphs: [
+				{ children: [{ type: "text", text: "\u{1F600} " }, atom, { type: "text", text: " tail" }] },
+			],
+		});
+		const wire = composerNarratorReferenceText(atom);
+		await page.evaluate(
+			(end) => (window as unknown as FixtureWindow).fixture.selection(3, end),
+			3 + wire.length,
+		);
+		expect((await snapshot(page)).selection).toEqual({ start: 3, end: 3 + wire.length });
+		const copied = await page.evaluate(() => (window as unknown as FixtureWindow).fixture.copy());
+		expect(copied["text/plain"]).toBe("[@会话\u{1F600}](nf-agent://open?id=stable-target)");
+		expect(
+			JSON.parse(copied["application/x-narrafork-composer-document"]).paragraphs[0].children[0],
+		).toMatchObject(atom);
+		expect(
+			await page.evaluate(() => {
+				// Match plaintext LAN HTTP at the call site, without global API polyfills.
+				Object.defineProperty(crypto, "randomUUID", { value: undefined, configurable: true });
+				Object.defineProperty(crypto, "subtle", { value: undefined, configurable: true });
+				return [typeof crypto.randomUUID, typeof crypto.subtle];
+			}),
+		).toEqual(["undefined", "undefined"]);
+		await load(page, empty);
+		await page.evaluate((data) => {
+			const fixture = (window as unknown as FixtureWindow).fixture;
+			fixture.selection(0);
+			fixture.paste(data);
+		}, copied);
+		await settle(page);
+		const inserted = (await snapshot(page)).document?.paragraphs[0].children[0];
+		if (!inserted) throw new Error("Missing pasted narrator reference");
+		expect(inserted).toMatchObject({
+			type: "narratorReference",
+			narratorId: "stable-target",
+			label: atom.label,
+		});
+		expect("id" in inserted && inserted.id).not.toBe(atom.id);
+		await focusedEditor(page);
+		await chord(page, "z", "Control");
+		await settle(page);
+		expect((await snapshot(page)).document?.paragraphs[0].children).toEqual([]);
+		await load(page, empty);
+		await page.evaluate((text) => {
+			const fixture = (window as unknown as FixtureWindow).fixture;
+			fixture.selection(0);
+			fixture.paste({
+				"text/plain": text,
+				"text/html": '<a href="nf-agent://open?id=stable-target">@会话</a>',
+			});
+		}, copied["text/plain"]);
+		await settle(page);
+		expect((await snapshot(page)).document?.paragraphs[0].children).toEqual([
+			{ type: "text", text: wire },
+		]);
+		await load(page, empty);
+		await page.evaluate(() => {
+			const fixture = (window as unknown as FixtureWindow).fixture;
+			fixture.selection(0);
+			fixture.paste({
+				"text/plain": "@会话",
+				"text/html": '<span data-type="narratorReference" data-narrator-id="forged">@会话</span>',
+			});
+		});
+		await settle(page);
+		expect((await snapshot(page)).document?.paragraphs[0].children).toEqual([
+			{ type: "text", text: "@会话" },
+		]);
+	} finally {
+		await close(page);
+	}
+});
 
 test("empty insert deletes a selected suffix once but remains a noop for a collapsed cursor", async () => {
 	const page = await open();
