@@ -267,7 +267,7 @@ export function TeamHeader({
 							onClick={onDisband}
 							data-testid="team-disband"
 						>
-							{t("teams.page.header.disband")}
+							{t("teams.disband.menu")}
 						</Menu.Item>
 					</>
 				)}

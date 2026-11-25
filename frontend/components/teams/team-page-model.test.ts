@@ -34,8 +34,6 @@ import {
 	onlookerSeesWaiting,
 	pauseNotice,
 	pauseOrder,
-	recentDecisionKey,
-	recentDecisionTextKey,
 	returnReason,
 	rowLine,
 	SUMMARY_POLL_MAX_MS,
@@ -583,18 +581,7 @@ describe("live updates", () => {
 });
 
 describe("people (M1)", () => {
-	test("a decision's line and its activity note", () => {
-		expect(recentDecisionKey("approval.allowed")).toBe("allowed");
-		expect(recentDecisionKey("approval.denied")).toBe("denied");
-		expect(recentDecisionKey("question.answered")).toBe("answered");
-		expect(recentDecisionKey("question.dismissed")).toBe("dismissed");
-		expect(recentDecisionKey("question.ignored")).toBe("ignored");
-		expect(recentDecisionKey("question.supplemented")).toBe("supplemented");
-		expect(recentDecisionKey("question.deferred")).toBe("deferred");
-		expect(recentDecisionKey("question.answered_by_ai")).toBe("answeredByAi");
-		expect(recentDecisionTextKey("approval.allowed", "plan")).toBe("allowedPlan");
-		expect(recentDecisionTextKey("approval.denied", "plan")).toBe("deniedPlan");
-		expect(recentDecisionTextKey("approval.denied", "tool")).toBe("denied");
+	test("a decision's activity note", () => {
 		expect(
 			eventNote({
 				kind: "approval.allowed",

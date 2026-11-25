@@ -203,43 +203,7 @@
 			}
 		},
 		"tabs": {
-			"conversation": "对话",
-			"board": "看板",
-			"activity": "动态"
-		},
-		"columns": {
-			"queued": "排队",
-			"in_progress": "进行中",
-			"review": "待评审",
-			"done": "完成",
-			"cancelled": "取消"
-		},
-		"states": {
-			"queued": "排队",
-			"in_progress": "进行中",
-			"in_review": "评审中",
-			"ready": "可合",
-			"merged": "已合回",
-			"cancelled": "已取消"
-		},
-		"board": {
-			"empty": "暂无",
-			"loadFailed": "无法加载这一列。",
-			"noWorker": "还没有工人",
-			"noBranch": "还没有分支",
-			"worker": "工人",
-			"reviewRounds_one": "{{count}} 轮评审",
-			"reviewRounds_other": "{{count}} 轮评审",
-			"verdict": {
-				"clear": "最近评审：通过",
-				"blocker": "最近评审：有阻塞"
-			},
-			"marks": {
-				"exclusive": "独占：{{key}}",
-				"cleanable": "worktree 可清理"
-			},
-			"expand": "展开{{column}}",
-			"collapse": "收起{{column}}"
+			"conversation": "对话"
 		},
 		"activity": {
 			"empty": "还没有动态。",
@@ -301,16 +265,10 @@
 			"decisionPlanAgent": "计划 · 某个代理"
 		},
 		"top": {
-			"approvals_one": "{{shown}} 个待批",
-			"approvals_other": "{{shown}} 个待批",
-			"running_one": "{{shown}} 个运行中",
-			"running_other": "{{shown}} 个运行中",
-			"noneRunning": "没有运行中的会话",
 			"pauseAll": "全部暂停",
 			"pauseConfirmTitle": "暂停整个团队？",
 			"pauseConfirm": "这会停止团队里每个运行中会话的当前一轮：协调者和它的代理。历史保留，发消息即可继续。",
 			"pauseConfirmButton": "全部暂停",
-			"membersOnly": "只有团队成员能审批",
 			"paused_one": "已停止 {{count}} 个会话",
 			"paused_other": "已停止 {{count}} 个会话",
 			"pausePartial": "已停止 {{stopped}} 个；{{failed}} 个未能停止",
@@ -318,55 +276,8 @@
 			"pauseMore": "已停止 {{stopped}} 个；运行中的会话超过一次能读取的数量，请再暂停一次",
 			"pauseError": "无法读取运行中的会话，没有停止任何会话",
 			"pausedSomeIdle": "已停止 {{stopped}} 个；{{idle}} 个本来已经停了",
-			"members": "团队成员",
 			"archivedHint": "团队已归档：工作项不能再改动，它启动的工作者可能仍在运行。恢复协调者会话即可继续。"
 		},
-		"approvals": {
-			"title": "待批",
-			"empty": "没有等待审批的操作。",
-			"loadFailed": "无法加载待批列表。",
-			"more": "还有更多在等待；这里显示最早的 {{count}} 个。",
-			"approve": "批准",
-			"deny": "拒绝",
-			"coordinator": "协调者",
-			"worker": "工人",
-			"helper": "帮手",
-			"decided": "已提交决定",
-			"failed": "无法提交决定",
-			"openSession": "打开会话",
-			"answerInSession": "需在会话里回答",
-			"kinds": {
-				"question": "提问",
-				"plan": "待批准的计划",
-				"rule": "权限规则申请"
-			},
-			"unscanned": "很多调用正在等它们自己的检查，有些会话可能还有待批的，打开会话查看。",
-			"recentTitle": "最近的决定",
-			"recent": {
-				"allowed": "{{who}} 批准了 {{what}}",
-				"denied": "{{who}} 拒绝了 {{what}}",
-				"answered": "{{who}} 回答了提问",
-				"allowedLabel": "已批准",
-				"deniedLabel": "已拒绝",
-				"answeredLabel": "已回答",
-				"dismissed": "{{who}} 驳回了提问",
-				"ignored": "{{who}} 关闭了提问（没有告诉代理）",
-				"supplemented": "{{who}} 补充了回答",
-				"dismissedLabel": "已驳回",
-				"ignoredLabel": "已静默关闭",
-				"supplementedLabel": "已补充",
-				"deferred": "{{who}} 选择稍后回答提问",
-				"deferredLabel": "稍后回答",
-				"answeredByAi": "{{who}} 让 AI 回答了提问",
-				"answeredByAiLabel": "AI 已回答",
-				"allowedPlan": "{{who}} 批准了一份计划",
-				"deniedPlan": "{{who}} 退回了一份计划"
-			}
-		},
-		"agents": {
-			"title": "运行中的会话"
-		},
-		"back": "返回项目",
 		"unavailable": "这个部署不支持团队。",
 		"members": {
 			"title": "团队成员",
@@ -410,7 +321,6 @@
 			"header": {
 				"pauseAll": "全部暂停",
 				"more": "更多",
-				"disband": "解散团队…",
 				"settings": "团队设置",
 				"fullSession": "协调者完整会话",
 				"members": "成员",
@@ -452,7 +362,6 @@
 				"failed": "没有发出去。再试一次，或到会话里处理。",
 				"questionTitle": "回答提问",
 				"planTitle": "计划",
-				"loading": "加载中…",
 				"tooLarge": "内容太大，这里放不下：到会话里处理。",
 				"gone": "已经有人处理，或已撤回。"
 			},
@@ -520,8 +429,6 @@
 			"start": {
 				"title": "告诉协调者这个团队要完成什么",
 				"body": "说清目标和约束就行。协调者会拆成工作项，每项一个分支，交给工作者去做。",
-				"coordinator": "协调者",
-				"waiting": "等你给方向",
 				"examples": {
 					"upgrade": "把一个依赖升级到新的大版本，去掉旧的兼容代码；每一步单独分支，合并前过评审。",
 					"issues": "过一遍标了 bug 的 issue，能修的修掉，修不了的在 issue 里写清原因。",

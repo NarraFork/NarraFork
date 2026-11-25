@@ -203,43 +203,7 @@
 			}
 		},
 		"tabs": {
-			"conversation": "Conversation",
-			"board": "Board",
-			"activity": "Activity"
-		},
-		"columns": {
-			"queued": "Queued",
-			"in_progress": "In progress",
-			"review": "In review",
-			"done": "Done",
-			"cancelled": "Cancelled"
-		},
-		"states": {
-			"queued": "Queued",
-			"in_progress": "In progress",
-			"in_review": "In review",
-			"ready": "Ready to merge",
-			"merged": "Merged",
-			"cancelled": "Cancelled"
-		},
-		"board": {
-			"empty": "Nothing here",
-			"loadFailed": "Could not load this column.",
-			"noWorker": "No worker yet",
-			"noBranch": "No branch yet",
-			"worker": "Worker",
-			"reviewRounds_one": "{{count}} review round",
-			"reviewRounds_other": "{{count}} review rounds",
-			"verdict": {
-				"clear": "Last review: clear",
-				"blocker": "Last review: blocker"
-			},
-			"marks": {
-				"exclusive": "Exclusive: {{key}}",
-				"cleanable": "Worktree can be cleaned up"
-			},
-			"expand": "Show {{column}}",
-			"collapse": "Hide {{column}}"
+			"conversation": "Conversation"
 		},
 		"activity": {
 			"empty": "No activity yet.",
@@ -301,16 +265,10 @@
 			"decisionPlanAgent": "A plan · an agent"
 		},
 		"top": {
-			"approvals_one": "{{shown}} approval",
-			"approvals_other": "{{shown}} approvals",
-			"running_one": "{{shown}} running",
-			"running_other": "{{shown}} running",
-			"noneRunning": "Nothing running",
 			"pauseAll": "Pause all",
 			"pauseConfirmTitle": "Pause the whole team?",
 			"pauseConfirm": "This stops the current turn of every running session in this team: the coordinator and its agents. They keep their history and can be resumed by sending a message.",
 			"pauseConfirmButton": "Pause all",
-			"membersOnly": "Only team members can approve",
 			"paused_one": "Stopped {{count}} session",
 			"paused_other": "Stopped {{count}} sessions",
 			"pausePartial": "Stopped {{stopped}}; {{failed}} could not be stopped",
@@ -318,55 +276,8 @@
 			"pauseMore": "Stopped {{stopped}}; more were running than one pause reads, pause again",
 			"pauseError": "Could not read the running sessions; nothing was stopped",
 			"pausedSomeIdle": "Stopped {{stopped}}; {{idle}} had already stopped",
-			"members": "Team members",
 			"archivedHint": "This team is archived: its work items cannot change. Workers it started may still be running. Restore the coordinator's session to continue."
 		},
-		"approvals": {
-			"title": "Pending approvals",
-			"empty": "Nothing is waiting for approval.",
-			"loadFailed": "Could not load the approvals.",
-			"more": "More are waiting; the oldest {{count}} are shown.",
-			"approve": "Approve",
-			"deny": "Deny",
-			"coordinator": "Coordinator",
-			"worker": "Worker",
-			"helper": "Helper",
-			"decided": "Decision sent",
-			"failed": "Could not send the decision",
-			"openSession": "Open session",
-			"answerInSession": "Answered in the session",
-			"kinds": {
-				"question": "Question",
-				"plan": "Plan to approve",
-				"rule": "Permission rule request"
-			},
-			"unscanned": "Many calls are waiting on a check of their own; some sessions may have more waiting. Open them to see.",
-			"recentTitle": "Recently decided",
-			"recent": {
-				"allowed": "{{who}} approved {{what}}",
-				"denied": "{{who}} denied {{what}}",
-				"answered": "{{who}} answered a question",
-				"allowedLabel": "Approved",
-				"deniedLabel": "Denied",
-				"answeredLabel": "Answered",
-				"dismissed": "{{who}} dismissed a question",
-				"ignored": "{{who}} closed a question without telling the agent",
-				"supplemented": "{{who}} followed up on an answer",
-				"dismissedLabel": "Dismissed",
-				"ignoredLabel": "Closed silently",
-				"supplementedLabel": "Followed up",
-				"deferred": "{{who}} chose to answer a question later",
-				"deferredLabel": "Answer later",
-				"answeredByAi": "{{who}} had the AI answer a question",
-				"answeredByAiLabel": "AI answered",
-				"allowedPlan": "{{who}} approved a plan",
-				"deniedPlan": "{{who}} returned a plan"
-			}
-		},
-		"agents": {
-			"title": "Running sessions"
-		},
-		"back": "Back to project",
 		"unavailable": "Teams are not available on this deployment.",
 		"members": {
 			"title": "Team members",
@@ -410,7 +321,6 @@
 			"header": {
 				"pauseAll": "Pause all",
 				"more": "More",
-				"disband": "Disband team…",
 				"settings": "Team settings",
 				"fullSession": "Coordinator's full session",
 				"members": "People",
@@ -452,7 +362,6 @@
 				"failed": "Could not send it. Try again, or open the session.",
 				"questionTitle": "Answer the question",
 				"planTitle": "Plan",
-				"loading": "Loading…",
 				"tooLarge": "Too large to show here: open the session.",
 				"gone": "Already answered or withdrawn."
 			},
@@ -520,8 +429,6 @@
 			"start": {
 				"title": "Tell the coordinator what this team should get done",
 				"body": "Say the goal and the constraints. The coordinator splits it into work items, one branch each, and hands them to workers.",
-				"coordinator": "Coordinator",
-				"waiting": "Waiting for your direction",
 				"examples": {
 					"upgrade": "Upgrade a dependency to its new major version and drop the old compatibility code; one branch per step, reviewed before merging.",
 					"issues": "Go through the issues labelled bug: fix what can be fixed, and explain in the issue what can't.",

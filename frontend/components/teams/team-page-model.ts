@@ -17,7 +17,6 @@ import {
 	type TeamBoardItem,
 	type TeamPageSummary,
 	type TeamPendingApproval,
-	type TeamPersonDecisionEventKind,
 	type TeamSummary,
 } from "@shared/project-teams";
 
@@ -244,35 +243,6 @@ export function pauseNotice(outcome: PauseOutcome): {
 }
 
 // ── People (M1) ─────────────────────────────────────────────────────────────
-
-/** The i18n key (under `teams.approvals.recent.`) of a recent decision's line. */
-export function recentDecisionKey(kind: TeamPersonDecisionEventKind): RecentDecisionKey {
-	return RECENT_DECISION_KEYS[kind] ?? "allowed";
-}
-
-/**
- * The i18n key (under `teams.approvals.recent.`) of a recent decision's line: a plan's approval
- * or return has its own wording ("approved a plan"), anything else names its tool.
- */
-export function recentDecisionTextKey(
-	kind: TeamPersonDecisionEventKind,
-	approvalKind: string,
-): string {
-	const key = recentDecisionKey(kind);
-	return approvalKind === "plan" && (key === "allowed" || key === "denied") ? `${key}Plan` : key;
-}
-
-const RECENT_DECISION_KEYS = {
-	"approval.allowed": "allowed",
-	"approval.denied": "denied",
-	"question.answered": "answered",
-	"question.dismissed": "dismissed",
-	"question.ignored": "ignored",
-	"question.supplemented": "supplemented",
-	"question.deferred": "deferred",
-	"question.answered_by_ai": "answeredByAi",
-} as const satisfies Record<TeamPersonDecisionEventKind, string>;
-export type RecentDecisionKey = (typeof RECENT_DECISION_KEYS)[TeamPersonDecisionEventKind];
 
 /**
  * What the members drawer says about the coordinator's broad audiences (keys under
