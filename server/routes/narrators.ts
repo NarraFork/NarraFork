@@ -71,7 +71,9 @@ import { takeOverExitPlanReflection } from "../lib/agent/tools/exit-plan-reflect
 import { previewStructSedChange } from "../lib/agent/tools/struct-sed";
 import { takeOverTaskReflection } from "../lib/agent/tools/task-reflection";
 import { narratorTraitsLock } from "../lib/async-mutex";
+import { digestAttachment } from "../lib/attachment-digest";
 import {
+	discardStagedAttachment,
 	findStagedAttachment,
 	releaseStagedAttachment,
 	stagedAttachmentAsFile,
@@ -135,6 +137,7 @@ import {
 	validateUploadedMedia,
 } from "../lib/media-uploads";
 import { readMessageLanguagePreferences } from "../lib/message-language-read";
+import { buildRuntimeModelSummary } from "../lib/model-runtime";
 import {
 	getAuthorizedNarrator,
 	narratorPrincipalOf,
@@ -209,6 +212,7 @@ import {
 	browserInteractSchema,
 	bufferEditLeaseSchema,
 	bufferQueueModeSchema,
+	clientSubmissionIdSchema,
 	createBlacklistCmdSchema,
 	createBlacklistDirSchema,
 	createNarratorSchema,
@@ -259,6 +263,7 @@ import {
 	createRevertActionPreviewSchema,
 	createRevertPlanSchema,
 	deleteBlocksSchema,
+	modelTraceCalibrationSchema,
 	modelTraceOptionsSchema,
 	optimizePromptSchema,
 	revertPlanFilesQuerySchema,
@@ -269,6 +274,12 @@ import { outlinePlanDecisionSchema } from "../lib/validators/outline";
 import { validateSubagentModelRestrictionInput } from "../lib/validators/subagent-models";
 import { requireAdmin } from "../middleware/auth";
 import { isExecutionSuspended } from "../services/agent-runtime/ownership";
+import {
+	assertUserSubmissionReplay,
+	type SubmissionAttachment,
+	submissionFingerprint,
+	USER_SUBMISSION_WINDOW_MS,
+} from "../services/agent-runtime/user-submission";
 import { coerceAskQuestions } from "../services/ask-user-question-coerce";
 import { generateAskUserQuestionAnswers } from "../services/ask-user-question-reflection";
 import {
@@ -340,6 +351,7 @@ import {
 	getHumanAttentionForPrincipal,
 	listHumanAttentionForPrincipal,
 } from "../services/human-attention-service";
+import { listNamedNarratorSuggestions } from "../services/named-narrator-suggestions";
 import {
 	canWriteNarrator,
 	filterReadableNarrators,
@@ -364,6 +376,7 @@ import {
 	canEditBufferedMessage,
 	deleteBufferedTextFile,
 	persistAdditionalBufferedTextFiles,
+	readUserSubmission,
 	releaseStagedFiles,
 	retryBufferedMessage,
 	updateBufferedMessageMode,
@@ -516,6 +529,7 @@ import {
 } from "../services/narrator-surface-reads";
 import { generateTitle, persistTitle } from "../services/narrator-title";
 import { readCommittedToolDetail } from "../services/narrator-tool-detail";
+import { getNarratorUiSummary } from "../services/narrator-ui-summary";
 import { permissionRuleService } from "../services/permission-rule-service";
 import { usableProjectDir } from "../services/project-dir";
 import {
@@ -562,6 +576,7 @@ import {
 	getNarratorIdsWithPresence,
 	getNarratorPresenceBatch,
 } from "../websocket/narrator-ws";
+import { registerNarratorCommunicationRoutes } from "./narrator-communication";
 import { fileReferenceRoutes } from "./narrator-file-references";
 import { narratorManualResourceRoutes } from "./narrator-manual-resources";
 import { narratorWorkspaceContextRoutes } from "./narrator-workspace-context";
@@ -671,6 +686,69 @@ export function attachmentBytesOf(files: readonly File[]): number {
 	return files.reduce((total, file) => total + file.size, 0);
 }
 
+async function submissionAttachmentSnapshot(
+	narratorId: string,
+	groups: { images: File[]; media: File[]; textFiles: File[] },
+	staged: StagedAttachmentInput[],
+	previousMetadata: string | null | undefined,
+	signal?: AbortSignal,
+): Promise<SubmissionAttachment[]> {
+	const snapshots: SubmissionAttachment[] = [];
+	for (const channel of ["images", "media"] as const) {
+		for (const file of groups[channel]) {
+			if (!(file instanceof File)) throw new ValidationError(`${channel} must contain files`);
+			snapshots.push({
+				channel,
+				name: file.name,
+				size: file.size,
+				type: file.type,
+				digest: await digestAttachment(file, { signal }),
+			});
+		}
+	}
+	const textCount = groups.textFiles.length + staged.length;
+	if (textCount > MAX_EDIT_TEXT_FILES_PER_MESSAGE) throw new ValidationError("Too many text files");
+	const previous = JSON.parse(previousMetadata ?? "{}") as {
+		submissionAttachments?: SubmissionAttachment[];
+	};
+	let inlineIndex = 0;
+	for (let index = 0; index < textCount; index++) {
+		const descriptor = staged.find((item) => item.index === index);
+		if (descriptor) {
+			const current = findStagedAttachment(narratorId, descriptor.uploadId);
+			// A consumed immutable stage is resolved only from this exact original receipt.
+			const original = previous.submissionAttachments?.find(
+				(item) => item.channel === "textFiles" && item.uploadId === descriptor.uploadId,
+			);
+			if (!current && !original)
+				throw new ValidationError("Staged attachment is no longer available");
+			if (current)
+				snapshots.push({
+					channel: "textFiles",
+					uploadId: descriptor.uploadId,
+					name: current.filename,
+					size: current.size,
+					type: current.mediaType,
+					digest: current.contentDigest ?? (await digestAttachment(current.path, { signal })),
+				});
+			else if (original) snapshots.push({ ...original });
+		} else {
+			const file = groups.textFiles[inlineIndex++];
+			if (!(file instanceof File)) throw new ValidationError("Invalid staged attachment index");
+			snapshots.push({
+				channel: "textFiles",
+				name: file.name,
+				size: file.size,
+				type: file.type,
+				digest: await digestAttachment(file, { signal }),
+			});
+		}
+	}
+	if (inlineIndex !== groups.textFiles.length)
+		throw new ValidationError("Invalid staged attachment index");
+	return snapshots;
+}
+
 /** Parse message request supporting both JSON and multipart/form-data (with images and text files) */
 export async function parseMessageRequest(
 	c: {
@@ -678,10 +756,21 @@ export async function parseMessageRequest(
 			header: (name: string) => string | undefined;
 			formData: () => Promise<FormData>;
 			json: () => Promise<unknown>;
+			raw?: { signal: AbortSignal };
 		};
 	},
 	narratorId: string,
+	lookupSubmission?: (clientSubmissionId: string) => Promise<
+		| {
+				id: string;
+				bufferedAt: string;
+				metadataJson: string | null;
+				dedupeExpiresAt: string | null;
+		  }
+		| undefined
+	>,
 ): Promise<{
+	replayedSubmission?: { id: string; bufferedAt: string };
 	message: string;
 	images: ImageRef[];
 	media: MediaRef[];
@@ -691,6 +780,9 @@ export async function parseMessageRequest(
 	queueMode?: import("@shared/buffer-queue-mode").BufferQueueMode;
 	fileReferences?: FileReference[];
 	composerDocument?: ComposerDocument;
+	clientSubmissionId?: string;
+	submissionFingerprint?: string;
+	submissionAttachments?: SubmissionAttachment[];
 }> {
 	const contentType = c.req.header("content-type") ?? "";
 	if (contentType.split(";")[0]?.trim().toLowerCase() === "multipart/form-data") {
@@ -698,6 +790,10 @@ export async function parseMessageRequest(
 		const rawMode = formData.get("queueMode");
 		const modeResult = bufferQueueModeSchema.optional().safeParse(rawMode ?? undefined);
 		if (!modeResult.success) throw new ValidationError(modeResult.error.message);
+		const submissionResult = clientSubmissionIdSchema
+			.optional()
+			.safeParse(formData.get("clientSubmissionId") ?? undefined);
+		if (!submissionResult.success) throw new ValidationError(submissionResult.error.message);
 		const rawMessage = formData.get("message");
 		let fileReferences = parseFileReferenceInput(formData.get("fileReferences"));
 		let composerDocument = parseOptionalComposerDocument(formData.get("composerDocument"));
@@ -722,14 +818,54 @@ export async function parseMessageRequest(
 			throw new ValidationError(`Maximum ${MAX_EDIT_IMAGES_PER_MESSAGE} images per message`);
 		}
 		const textFileEntries = formData.getAll("textFiles") as File[];
+		const stagedInputs = parseStagedAttachmentInput(formData.get("stagedAttachments"));
+		const previous =
+			submissionResult.data && lookupSubmission
+				? await lookupSubmission(submissionResult.data)
+				: undefined;
+		const submissionAttachments = submissionResult.data
+			? await submissionAttachmentSnapshot(
+					narratorId,
+					{ images: imageFiles, media: mediaFiles, textFiles: textFileEntries },
+					stagedInputs,
+					previous?.metadataJson,
+					c.req.raw?.signal,
+				)
+			: undefined;
+		const fingerprint = submissionResult.data
+			? submissionFingerprint({
+					message,
+					composerDocument,
+					fileReferences,
+					queueMode: modeResult.data,
+					priority: formData.get("priority"),
+					interrupt: formData.get("interrupt"),
+					attachments: submissionAttachments?.map(
+						({ uploadId: _coordinate, ...content }) => content,
+					),
+				})
+			: undefined;
+		if (previous && fingerprint && submissionResult.data) {
+			assertUserSubmissionReplay(previous, {
+				clientSubmissionId: submissionResult.data,
+				fingerprint,
+			});
+			for (const descriptor of stagedInputs)
+				discardStagedAttachment(narratorId, descriptor.uploadId);
+			return {
+				replayedSubmission: { id: previous.id, bufferedAt: previous.bufferedAt },
+				message,
+				images: [],
+				media: [],
+				textFiles: [],
+				clientSubmissionId: submissionResult.data,
+				submissionFingerprint: fingerprint,
+			};
+		}
 		// Attachments over the buffered ceiling never appear here: the composer
 		// uploaded them through the streaming endpoint and sent only their ids, so
 		// the multipart body stays small no matter how large the file is.
-		const allTextFiles = resolveStagedAttachments(
-			narratorId,
-			parseStagedAttachmentInput(formData.get("stagedAttachments")),
-			textFileEntries,
-		);
+		const allTextFiles = resolveStagedAttachments(narratorId, stagedInputs, textFileEntries);
 		// An attachment carries the turn on its own: images (and text files, whose
 		// paths are injected as an <attached_files> hint) are meaningful content even
 		// when the user typed nothing. Only a fully empty request is rejected.
@@ -795,6 +931,9 @@ export async function parseMessageRequest(
 			priority: priority || undefined,
 			interrupt: formData.get("interrupt") === "true" || undefined,
 			queueMode: modeResult.data,
+			clientSubmissionId: submissionResult.data,
+			submissionFingerprint: fingerprint,
+			submissionAttachments,
 			fileReferences,
 			composerDocument,
 		};
@@ -816,6 +955,17 @@ export async function parseMessageRequest(
 		priority: parsed.data.priority,
 		interrupt: parsed.data.interrupt,
 		queueMode: parsed.data.queueMode,
+		clientSubmissionId: parsed.data.clientSubmissionId,
+		submissionFingerprint: parsed.data.clientSubmissionId
+			? submissionFingerprint({
+					message: parsed.data.message,
+					composerDocument: parsed.data.composerDocument,
+					fileReferences: parsed.data.fileReferences,
+					queueMode: parsed.data.queueMode,
+					priority: parsed.data.priority,
+					interrupt: parsed.data.interrupt,
+				})
+			: undefined,
 		fileReferences: parsed.data.fileReferences,
 		composerDocument: parsed.data.composerDocument,
 	};
@@ -1082,6 +1232,14 @@ function narratorSubPath(requestPath: string, id: string): string {
 	return requestPath.slice(at + marker.length);
 }
 
+// This handler owns the same read ACL using only NARRATOR_ACL_COLUMNS. Register it
+// before the generic gate, whose full narrator snapshot is unnecessary for badges.
+narratorRoutes.get("/:id/ui-summary", async (c) => {
+	return c.json(
+		await getNarratorUiSummary(c.req.param("id"), narratorPrincipalOf(c), c.req.raw.signal),
+	);
+});
+
 narratorRoutes.use("/:id/*", async (c, next) => {
 	const id = c.req.param("id");
 	if (!id || NARRATOR_ID_GATE_EXEMPT_SEGMENTS.has(id)) return next();
@@ -1130,6 +1288,21 @@ narratorRoutes.use("/:id", async (c, next) => {
 	if (!id || NARRATOR_ID_GATE_EXEMPT_SEGMENTS.has(id)) return next();
 	await requireNarratorAccess(c, id, c.req.method === "GET" ? "read" : "write");
 	return c.req.method === "GET" ? next() : withNarratorWorkAdmission(id, next);
+});
+
+registerNarratorCommunicationRoutes(narratorRoutes);
+
+// A mailbox admission exists before (and independently of) message materialization.
+narratorRoutes.get("/:id/submissions/:clientSubmissionId", async (c) => {
+	const receipt = await readUserSubmission(
+		c.req.param("id"),
+		c.get("user").sub,
+		clientSubmissionIdSchema.parse(c.req.param("clientSubmissionId")),
+	);
+	if (!receipt)
+		return c.json({ status: "not_found", dedupeWindowMs: USER_SUBMISSION_WINDOW_MS }, 404);
+	const { metadataJson: _metadata, ...accepted } = receipt;
+	return c.json(accepted, 200);
 });
 
 narratorRoutes.route("/:id/file-references", fileReferenceRoutes);
@@ -2085,6 +2258,16 @@ narratorRoutes.get("/by-handle/:handle", async (c) => {
 
 // List all named narrators (handle-based @mention targets).
 narratorRoutes.get("/named", async (c) => {
+	if (c.req.query("view") === "suggestions") {
+		return c.json(
+			await listNamedNarratorSuggestions(narratorPrincipalOf(c), {
+				q: c.req.query("q"),
+				limit: c.req.query("limit"),
+				cursor: c.req.query("cursor"),
+				signal: c.req.raw.signal,
+			}),
+		);
+	}
 	// Bounded set (named narrators are deliberately few), so filtering in memory is
 	// fine here; the paginated list endpoint pushes the same predicate into SQL.
 	const named = await filterReadableNarrators(
@@ -2218,10 +2401,16 @@ narratorRoutes.get("/:id", async (c) => {
 		navigationSummary,
 		messageCount,
 		...(modelInheritance && { modelInheritance }),
+		modelSummary: buildRuntimeModelSummary({
+			selection: narrator.model?.trim() || FOLLOW_DEFAULT_MODEL,
+			inheritance: modelInheritance,
+			observation: runtimeModel,
+		}),
 		...(runtimeModel && {
 			runtimeModel: {
 				provider: runtimeModel.provider,
 				model: runtimeModel.model,
+				concreteValue: runtimeModel.concreteValue,
 				resolvedAt: runtimeModel.resolvedAt,
 			},
 		}),
@@ -2748,11 +2937,6 @@ narratorRoutes.post("/:id/messages", async (c) => {
 	const id = c.req.param("id");
 	const narrator = await narratorService.getById(id, undefined, { signal: c.req.raw.signal }); // throws NotFoundError if missing
 
-	// Auto-unarchive on interaction
-	if (narrator.status === "archived") {
-		await unarchiveAsCaller(c, id);
-	}
-
 	const {
 		message,
 		images,
@@ -2763,7 +2947,18 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		queueMode,
 		fileReferences,
 		composerDocument: requestedComposerDocument,
-	} = await parseMessageRequest(c, id);
+		clientSubmissionId,
+		submissionFingerprint: fingerprint,
+		submissionAttachments,
+		replayedSubmission,
+	} = await parseMessageRequest(c, id, (submissionId) =>
+		readUserSubmission(id, c.get("user").sub, submissionId),
+	);
+	if (replayedSubmission) return c.json({ buffered: true, ...replayedSubmission }, 202);
+	const submission =
+		clientSubmissionId && fingerprint
+			? { clientSubmissionId, fingerprint, attachments: submissionAttachments }
+			: undefined;
 	// Explicit mode wins over legacy booleans; omission retains existing callers.
 	const interrupt = queueMode ? queueMode === "interrupt" : requestedInterrupt;
 	const priority = queueMode ? queueMode !== "turn" : requestedPriority || interrupt;
@@ -2772,6 +2967,16 @@ narratorRoutes.post("/:id/messages", async (c) => {
 	// a rejected reference must not strand images saved by multipart parsing.
 	let uploadsAccepted = false;
 	try {
+		// Reconcile before command expansion, file snapshots, interruption or peer checks.
+		if (submission) {
+			const previous = await readUserSubmission(id, userId, submission.clientSubmissionId);
+			if (previous) {
+				assertUserSubmissionReplay(previous, submission);
+				return c.json({ buffered: true, id: previous.id, bufferedAt: previous.bufferedAt }, 202);
+			}
+		}
+		// Only a new interaction revives an archived session; a receipt replay does not.
+		if (narrator.status === "archived") await unarchiveAsCaller(c, id);
 		const mixedDocument = requestedComposerDocument?.paragraphs.some((paragraph) =>
 			paragraph.children.some((node) => node.type !== "text" && node.type !== "break"),
 		);
@@ -2836,6 +3041,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 				interrupt: true,
 				queueMode,
 				executionIntent: { controlCommand: true },
+				submission,
 			});
 			// Controls do not consume attachments; retain the direct path's cleanup.
 			return c.json(result, result.buffered ? 202 : 201);
@@ -2970,7 +3176,9 @@ narratorRoutes.post("/:id/messages", async (c) => {
 						undefined,
 						undefined,
 						{ locale, replyInUserLanguage },
+						submission,
 					);
+					if (accepted.duplicate) return { accepted, outcome: null };
 					if (!accepted.ok) throw new ValidationError("Message queue is full");
 					try {
 						return await withInboxOwner(id, async () => {
@@ -3239,6 +3447,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		// The service atomically enqueues and claims this message, or leaves it queued
 		// behind an existing owner/backlog. HTTP status observations never decide admission.
 		const result = await acceptUserMessage(id, finalMessage, {
+			submission,
 			humanReplyContext: { locale, replyInUserLanguage },
 			images,
 			media,
@@ -3257,7 +3466,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			queueOnly: queueBehindCompaction,
 			executionIntent: modelOverride?.model ? { modelOverride } : undefined,
 		});
-		uploadsAccepted = true;
+		uploadsAccepted = !result.buffered || !result.duplicate;
 
 		if (result.buffered) {
 			return c.json(
@@ -6473,6 +6682,46 @@ narratorRoutes.post("/:id/modeltrace/retry", async (c) => {
 		await getUserLanguage(userId),
 	);
 	return c.json(result);
+});
+
+// Reuse the sample associated with an eligible result in the diagnostic narrator.
+narratorRoutes.post("/:id/modeltrace/calibrate", async (c) => {
+	const userId = c.get("user").sub;
+	const bytes = new Uint8Array(512);
+	let length = 0;
+	const reader = c.req.raw.body?.getReader();
+	if (reader) {
+		try {
+			while (true) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				if (length + value.byteLength > bytes.byteLength) {
+					void reader.cancel().catch(() => {});
+					return c.json({ error: "ModelTrace calibration request is too large" }, 413);
+				}
+				bytes.set(value, length);
+				length += value.byteLength;
+			}
+		} finally {
+			reader.releaseLock();
+		}
+	}
+	let body: unknown;
+	try {
+		body = JSON.parse(new TextDecoder().decode(bytes.subarray(0, length)));
+	} catch {
+		throw new ValidationError("Invalid ModelTrace calibration JSON");
+	}
+	const parsed = modelTraceCalibrationSchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const { calibrateModelTrace } = await import("../services/modeltrace-service");
+	const result = await calibrateModelTrace(
+		c.req.param("id"),
+		parsed.data.resultId,
+		narratorPrincipalOf(c),
+		await getUserLanguage(userId),
+	);
+	return c.json(result, 202);
 });
 
 // Start: create a persistent pending message in the source narrator's chat

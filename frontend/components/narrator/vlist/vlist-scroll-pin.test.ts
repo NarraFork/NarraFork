@@ -101,6 +101,7 @@ async function loadedTopHarness(itemCount = 40, narratorId = "loaded-top") {
 	};
 	const bindings = {
 		narratorId,
+		suspendedRef: { current: false },
 		jumpTokenRef,
 		loadedTopNarratorRef,
 		viewportRef: { current: node },
@@ -229,6 +230,70 @@ async function loadedTopHarness(itemCount = 40, narratorId = "loaded-top") {
 }
 
 describe("loaded-history scroll-to-top action", () => {
+	it("keeps a suspended queued scroll frame and older-history admission inert", async () => {
+		const harness = await loadedTopHarness();
+		const before = harness.readState();
+		const originalTop = harness.bindings.scrollTopRef.current;
+		harness.bindings.suspendedRef.current = true;
+		harness.readerScrollTo(0);
+		expect(harness.bindings.scrollTopRef.current).toBe(originalTop);
+		expect(harness.readState()).toEqual(before);
+		expect(harness.events).toEqual([]);
+		let olderLoads = 0;
+		const maybeAutoLoadOlder = shellScrollCallback<(top: number, atBottom: boolean) => void>(
+			harness.source,
+			"maybeAutoLoadOlder",
+			{
+				suspendedRef: harness.bindings.suspendedRef,
+				olderHistoryIntentAtRef: harness.olderHistoryIntentAtRef,
+				autoLoadEnabledRef: { current: true },
+				hasPrevRef: { current: true },
+				loadingOlderRef: { current: false },
+				loadOlderRef: { current: () => olderLoads++ },
+				resolveOlderHistoryAutoLoad,
+				OLDER_LOAD_TRIGGER_PX: 400,
+				Date: { now: () => 10_001 },
+			},
+		);
+		maybeAutoLoadOlder(0, false);
+		expect(olderLoads).toBe(0);
+		expect(harness.olderHistoryIntentAtRef.current).toBe(10_000);
+		harness.bindings.suspendedRef.current = false;
+		maybeAutoLoadOlder(0, false);
+		expect(olderLoads).toBe(1);
+	});
+
+	it("keeps first-screen fill paused until the surface resumes", async () => {
+		const harness = await loadedTopHarness(1);
+		const fill = sliceBracketedRegion(
+			harness.source.slice(harness.source.indexOf("// First-screen fill:")),
+			"useEffect(",
+		);
+		if (!fill) throw new Error("Missing first-screen fill effect");
+		const code = new Bun.Transpiler({ loader: "tsx" }).transformSync(`${fill};`);
+		let olderLoads = 0;
+		const bindings = {
+			suspended: true,
+			pinnedToBottomRef: harness.bindings.pinnedToBottomRef,
+			pinnedToBottom: true,
+			pretextDocument: { status: "ready" },
+			hasPrev: true,
+			loadingOlder: false,
+			viewportHeight: harness.node.clientHeight,
+			exactLayout: { totalHeight: 100 },
+			ITEM_OVERSCAN: 400,
+			getLastTrimAt: () => 0,
+			loadOlder: () => olderLoads++,
+			useEffect: (callback: () => void) => callback(),
+		};
+		const run = () => new Function(...Object.keys(bindings), code)(...Object.values(bindings));
+		run();
+		expect(olderLoads).toBe(0);
+		bindings.suspended = false;
+		run();
+		expect(olderLoads).toBe(1);
+	});
+
 	it("invalidates jumps, cancels the follower and synchronously unpins before writing the window", async () => {
 		const harness = await loadedTopHarness();
 		harness.toTop();
@@ -258,6 +323,7 @@ describe("loaded-history scroll-to-top action", () => {
 			harness.source,
 			"maybeAutoLoadOlder",
 			{
+				suspendedRef: harness.bindings.suspendedRef,
 				olderHistoryIntentAtRef: harness.olderHistoryIntentAtRef,
 				autoLoadEnabledRef: { current: true },
 				hasPrevRef: { current: true },
@@ -739,6 +805,7 @@ describe("loaded-history scroll-to-top action", () => {
 		);
 		if (!fill) throw new Error("Missing first-screen fill effect");
 		const fillBindings = {
+			suspended: false,
 			pinnedToBottomRef: harness.bindings.pinnedToBottomRef,
 			pinnedToBottom: true,
 			pretextDocument: { status: "ready" },

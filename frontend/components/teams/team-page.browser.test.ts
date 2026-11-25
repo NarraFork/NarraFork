@@ -1,18 +1,21 @@
 /**
- * The team page in Chromium (docs/PROJECT_TEAMS-PLAN.md §二.11, §二.12; P4), against a test
- * server running the real team, project and narrator routes on the isolated SQLite of
+ * The team page in Chromium (docs/PROJECT_TEAMS-PLAN.md §二.11, §二.12; the redesign R), against a
+ * test server running the real team, project and narrator routes on the isolated SQLite of
  * `tests/preload.ts`:
  *
- *   - the board reflects work item state changes: a queued item moves to "in progress" with its
- *     worker after the change, picked up through the coordinator's narrator socket;
- *   - a member opens the pending approvals and approves one through the ordinary permission
- *     route; an onlooker sees no approvals and no "pause all";
+ *   - a new team starts with what to tell the coordinator; an example fills the composer, and the
+ *     work column explains where items will appear;
+ *   - the work list reflects work item state changes, picked up through the coordinator's
+ *     narrator socket; the activity tab lists them;
+ *   - 等你处理: a member approves a tool call and answers a question in place through the
+ *     ordinary permission routes; hovering a card highlights its item; an onlooker sees none and
+ *     reads 「你是只读成员」-style gating (no pause all);
+ *   - the work item drawer opens from a card; 退回 needs a reason and sends the item back;
  *   - "pause all" stops the tree's running sessions through the ordinary Stop route;
- *   - the page is about one team: no list of the project's teams and no "new team", at desktop
- *     and phone widths; on a phone the top bar carries the menu button, so nothing floats over
- *     the back arrow;
- *   - an archived team says so in the top bar and offers no "pause all";
- *   - at 360 px the page is conversation / board / activity tabs without sideways scrolling, in
+ *   - two columns when the frame has room, 对话 | 工作 tabs otherwise, the conversation never
+ *     remounted; the page is about one team; on a phone the header carries the menu button so
+ *     nothing floats over it;
+ *   - an archived team says so and offers no "pause all"; at 360 px nothing scrolls sideways, in
  *     light and dark; the project page's teams section creates a team.
  *
  * Set `TEAMS_P4_SHOTS` to a directory to keep screenshots.
@@ -44,6 +47,7 @@ import { narratorService } from "../../../server/services/narrator-service";
 import { pendingPermissions } from "../../../server/services/narrator-session-state";
 import { initTeamRepo } from "../../../server/services/teams/__tests__/team-repo.fixture";
 import { archiveTeam, createTeam } from "../../../server/services/teams/team-service";
+import { setReturnDeliveryForTests } from "../../../server/services/teams/work-items";
 import type * as Fixture from "./team-page.browser-fixture";
 
 type FixtureWindow = Window & { fixture: typeof Fixture };
@@ -61,6 +65,10 @@ let projectId: string;
 let teamId: string;
 let workerId: string;
 const decisions: string[] = [];
+/** What each decision handed the waiting call (its answers among it). */
+const resolutions = new Map<string, unknown>();
+/** Notes a return sent the coordinator (captured; no turn is started in tests). */
+const returnNotes: string[] = [];
 /** The narrator sockets connected to the test server. */
 const sockets = new Set<{ send(data: string): unknown }>();
 
@@ -154,6 +162,10 @@ beforeAll(async () => {
 			},
 		},
 	});
+	setReturnDeliveryForTests(async ({ text }) => {
+		returnNotes.push(text);
+		return true;
+	});
 	browser = await puppeteer.launch({ executablePath, headless: true, args: ["--no-sandbox"] });
 
 	alice = await person(`alice${Date.now()}`);
@@ -194,6 +206,7 @@ beforeAll(async () => {
 }, 60_000);
 
 afterAll(async () => {
+	setReturnDeliveryForTests(null);
 	for (const [id, pending] of pendingPermissions)
 		if (pending.narratorId === workerId) pendingPermissions.delete(id);
 	await browser?.close();
@@ -309,7 +322,10 @@ async function seedApproval(
 		cwd: "/work",
 		locale: "en",
 		signal: new AbortController().signal,
-		resolve: (result) => decisions.push(`${requestId}:${result.behavior}`),
+		resolve: (result) => {
+			decisions.push(`${requestId}:${result.behavior}`);
+			resolutions.set(requestId, result);
+		},
 		cleanup: () => {
 			pendingPermissions.delete(requestId);
 		},
@@ -320,13 +336,53 @@ async function seedApproval(
 let movingId: string;
 let readyId: string;
 
-test("the board reflects work item state changes", async () => {
+test("a new team starts with what to tell the coordinator; an example fills the composer", async () => {
+	const owner = { userId: alice, isAdmin: false };
+	const fresh = await createTeam({ projectId, name: "Fresh crew" }, owner);
+	const { page, errors } = await openPage(alice, { width: 1440, height: 900 });
+	try {
+		await call(page, (f, p: string, t: string) => f.openTeam(p, t), projectId, fresh.id);
+		await until(page, "start", (f) => f.count("[data-testid=team-start-example]") === 3);
+		await until(page, "empty work", (f) => f.count("[data-testid=team-work-empty]") === 1);
+		expect(await call(page, (f) => f.attr("[data-testid=team-status]", "data-tone"))).toBe("idle");
+		expect(await call(page, (f) => f.count("[data-testid=team-attention]"))).toBe(0);
+		await call(page, (f) => f.click("[data-testid=team-start-example]"));
+		await until(
+			page,
+			"composer filled",
+			(f) => (f.value("[data-testid=composer-stand-in]") ?? "").length > 20,
+		);
+		// The composer itself stays usable under the prompt.
+		expect(await call(page, (f) => f.tappable("[data-testid=composer-stand-in]"))).toBe(true);
+		await shot(page, "desktop-starting");
+		expect(errors).toEqual([]);
+	} finally {
+		await page.close();
+	}
+	// A read-only member cannot tell the coordinator anything: a plain line, no prompts.
+	const reader = await openPage(bob, { width: 1440, height: 900 });
+	try {
+		await call(reader.page, (f, p: string, t: string) => f.openTeam(p, t), projectId, fresh.id);
+		await until(
+			reader.page,
+			"plain line",
+			(f) => f.count("[data-testid=team-start-read-only]") === 1,
+		);
+		expect(await call(reader.page, (f) => f.count("[data-testid=team-start-example]"))).toBe(0);
+		expect(reader.errors).toEqual([]);
+	} finally {
+		await reader.page.close();
+		// Out of the project's active list the last test counts.
+		await archiveTeam(fresh.id, owner, projectId);
+	}
+}, 60_000);
+
+test("the work list reflects work item state changes", async () => {
 	movingId = await seedItem("Wire the board", "queued", { branchName: "team/wire-the-board-1a2b" });
 	readyId = await seedItem("Write the docs", "ready", {
 		branchName: "team/write-the-docs-9f9f",
 		reviewRounds: 2,
 		lastReview: "clear",
-		exclusiveKey: "docs",
 	});
 	const { page, errors } = await openPage(alice, { width: 1600, height: 900 });
 	const boardReads: string[] = [];
@@ -336,16 +392,20 @@ test("the board reflects work item state changes", async () => {
 	});
 	try {
 		await call(page, (f, p: string, t: string) => f.openTeam(p, t), projectId, teamId);
-		await until(page, "the board", (f) => f.count("[data-testid=team-card]") === 2);
+		await until(page, "the list", (f) => f.count("[data-testid=team-work-row]") === 2);
 		expect(await call(page, (f) => f.attr("[data-testid=team-workspace]", "data-layout"))).toBe(
 			"split",
 		);
-		// Folded columns (done, cancelled) read nothing.
+		// Finished items are counts until opened: only the open columns are read.
 		expect([...new Set(boardReads)].sort()).toEqual(["in_progress", "queued", "review"]);
-		// A ready item says so in words inside "In review".
-		expect(await call(page, (f) => f.text("[data-testid=team-card-state]"))).toBe("Ready to merge");
-		expect(await call(page, (f, id: string) => f.columnOf(id), movingId)).toBe("queued");
-		expect(await call(page, (f, id: string) => f.columnOf(id), readyId)).toBe("review");
+		expect(await call(page, (f, id: string) => f.groupOf(id), movingId)).toBe("inProgress");
+		// A ready item waits for the member: in 需要你, and as a card in 等你处理.
+		expect(await call(page, (f, id: string) => f.groupOf(id), readyId)).toBe("needsYou");
+		await until(
+			page,
+			"merge card",
+			(f) => f.count("[data-testid=team-attention-card][data-kind=merge]") === 1,
+		);
 		expect(await call(page, (f) => f.text("[data-testid=team-title]"))).toBe("Release crew");
 		await until(page, "the socket", (f) => f.socketConnected());
 
@@ -369,41 +429,43 @@ test("the board reflects work item state changes", async () => {
 		nudge();
 		await until(
 			page,
-			"the card moved",
-			(f, id: string) => f.columnOf(id) === "in_progress",
+			"the row works",
+			(f, id: string) =>
+				f.attr(`[data-testid=team-work-row][data-item-id="${id}"]`, "data-state") === "in_progress",
 			10_000,
 			movingId,
 		);
 		await until(
 			page,
 			"the worker shows",
-			(f) => f.attr("[data-testid=team-card-worker]", "data-status") === "working",
+			(f, id: string) =>
+				f.attr(
+					`[data-testid=team-work-row][data-item-id="${id}"] [data-testid=team-work-line]`,
+					"data-line",
+				) === "working",
+			10_000,
+			movingId,
 		);
-		expect(
-			await call(page, (f) =>
-				f.attr("[data-testid=team-column][data-column=queued]", "data-count"),
-			),
-		).toBe("0");
-		await until(
-			page,
-			"running count",
-			(f) => f.attr("[data-testid=team-running-button]", "data-count") === "1",
-		);
-		await shot(page, "desktop-light-board");
+		await shot(page, "desktop-light-work");
 
-		// The worker starts waiting: the card follows from the summary, the board is not re-read.
+		// The worker stops: the row follows from the summary, the board is not re-read.
 		const readsBefore = boardReads.length;
-		await db.update(narrators).set({ status: "waiting" }).where(eq(narrators.id, workerId));
+		await db.update(narrators).set({ status: "idle" }).where(eq(narrators.id, workerId));
 		nudge();
 		await until(
 			page,
-			"the worker waits",
-			(f) => f.attr("[data-testid=team-card-worker]", "data-status") === "waiting",
+			"the worker stopped",
+			(f, id: string) =>
+				f.attr(
+					`[data-testid=team-work-row][data-item-id="${id}"] [data-testid=team-work-line]`,
+					"data-line",
+				) === "workerIdle",
+			10_000,
+			movingId,
 		);
 		expect(boardReads.length).toBe(readsBefore);
-		await db.update(narrators).set({ status: "working" }).where(eq(narrators.id, workerId));
 
-		// The activity tab lists the change.
+		// The activity tab lists the change, quietly.
 		expect(
 			await call(page, (f) => f.click("[data-testid=team-side-switch] input[value=activity]")),
 		).toBe(true);
@@ -415,50 +477,59 @@ test("the board reflects work item state changes", async () => {
 		await shot(page, "desktop-light-activity");
 		await call(page, (f) => f.setScheme("dark"));
 		await until(page, "dark", (f) => f.colors().scheme === "dark");
-		await call(page, (f) => f.click("[data-testid=team-side-switch] input[value=board]"));
-		await until(page, "board again", (f) => f.count("[data-testid=team-card]") === 2);
-		await shot(page, "desktop-dark-board");
+		await call(page, (f) => f.click("[data-testid=team-side-switch] input[value=work]"));
+		await until(page, "work again", (f) => f.count("[data-testid=team-work-row]") === 2);
+		await shot(page, "desktop-dark-work");
 		expect(errors).toEqual([]);
 	} finally {
+		await call(page, (f) => f.setScheme("light")).catch(() => {});
 		await page.close();
 	}
 }, 60_000);
 
-test("a member approves a pending tool call; questions open their session; onlookers see none", async () => {
+test("等你处理: approve a tool call and answer a question in place; onlookers see none", async () => {
+	await db
+		.update(teamWorkItems)
+		.set({ workerNarratorId: workerId })
+		.where(eq(teamWorkItems.id, movingId));
 	const requestId = await seedApproval("bun test --isolate server/routes");
+	// An option longer than any label is drawn: its whole title is the answer.
+	const longOption =
+		`Merge the docs branch first, then rebase nothing: ${"keep both sides ".repeat(6)}`.trim();
 	const questionId = await seedApproval("", "AskUserQuestion", {
-		questions: [{ question: "Which branch first?", header: "Order", options: [{ label: "A" }] }],
+		questions: [
+			{
+				question: "Which branch first?",
+				header: "Order",
+				options: [{ label: longOption }, { label: "B" }],
+			},
+		],
 	});
 	const { page, errors } = await openPage(alice, { width: 1600, height: 900 });
 	try {
 		await call(page, (f, p: string, t: string) => f.openTeam(p, t), projectId, teamId);
+		const tool = `[data-testid=team-attention-card][data-request-id="${requestId}"]`;
+		const question = `[data-testid=team-attention-card][data-request-id="${questionId}"]`;
+		await until(page, "cards", (f) => f.text("[data-testid=team-attention-count]") === "3");
+		expect(
+			await call(page, (f, c: string) => f.text(`${c} [data-testid=team-approval-preview]`), tool),
+		).toBe("bun test --isolate server/routes");
+		// The call belongs to the worker's item: in 需要你, highlighted while the card is hovered.
+		expect(await call(page, (f, id: string) => f.groupOf(id), movingId)).toBe("needsYou");
+		await page.hover(tool);
 		await until(
 			page,
-			"approvals count",
-			(f) => f.attr("[data-testid=team-approvals-button]", "data-count") === "2",
-		);
-		await call(page, (f) => f.click("[data-testid=team-approvals-button]"));
-		await until(page, "approval rows", (f) => f.count("[data-testid=team-approval]") === 2);
-		expect(await call(page, (f) => f.text("[data-testid=team-approval-preview]"))).toBe(
-			"bun test --isolate server/routes",
-		);
-		await until(page, "drawer in place", (f) => {
-			const fit = f.fitsWidth("[data-testid=team-approval]");
-			return fit.found && fit.inside;
-		});
-		await shot(page, "desktop-light-approvals");
-		await call(
-			page,
+			"highlight",
 			(f, id: string) =>
-				f.click(
-					`[data-testid=team-approval][data-request-id="${id}"] [data-testid=team-approval-approve]`,
-				),
-			requestId,
+				f.attr(`[data-testid=team-work-row][data-item-id="${id}"]`, "data-highlighted") === "true",
+			10_000,
+			movingId,
 		);
-		await until(page, "approved", (f) => f.count("[data-testid=team-approval]") === 1);
-		expect(decisions).toEqual([`${requestId}:allow`]);
-		// Then the question: its text, no Approve / Deny, and a way to answer it in its session.
-		const question = `[data-testid=team-approval][data-request-id="${questionId}"]`;
+		await shot(page, "desktop-light-attention");
+		await call(page, (f, c: string) => f.click(`${c} [data-testid=team-approval-approve]`), tool);
+		await until(page, "approved", (f, c: string) => f.count(c) === 0, 10_000, tool);
+		expect(decisions).toContain(`${requestId}:allow`);
+		// The question: its text and options, answered right here.
 		expect(
 			await call(
 				page,
@@ -469,36 +540,93 @@ test("a member approves a pending tool call; questions open their session; onloo
 		expect(
 			await call(
 				page,
-				(f, q: string) => f.count(`${q} [data-testid=team-approval-approve]`),
+				(f, q: string) => f.count(`${q} [data-testid=team-question-option]`),
 				question,
 			),
-		).toBe(0);
-		await call(page, (f, q: string) => f.click(`${q} [data-testid=team-approval-open]`), question);
-		expect(await call(page, (f) => f.openedTargets())).toContain(`session:${workerId}`);
-		await db
-			.update(narratorToolCalls)
-			.set({ status: "fail" })
-			.where(eq(narratorToolCalls.id, questionId));
-		pendingPermissions.delete(questionId);
+		).toBe(2);
+		await call(
+			page,
+			(f, q: string) => f.click(`${q} [data-testid=team-question-option]`),
+			question,
+		);
+		await until(page, "answered", (f, q: string) => f.count(q) === 0, 10_000, question);
+		expect(decisions).toContain(`${questionId}:allow`);
+		expect(longOption.length).toBeGreaterThan(80);
+		expect(JSON.stringify(resolutions.get(questionId))).toContain(longOption);
 		expect(pendingPermissions.has(requestId)).toBe(false);
 		expect(errors).toEqual([]);
 	} finally {
 		await page.close();
 	}
 
-	// An onlooker: the board, but no approvals and no pause.
-	await seedApproval("echo hidden");
+	// An onlooker: the list, but no 等你处理 and no pause.
+	const hidden = await seedApproval("echo hidden");
 	const reader = await openPage(bob, { width: 1600, height: 900 });
 	try {
 		await call(reader.page, (f, p: string, t: string) => f.openTeam(p, t), projectId, teamId);
-		await until(reader.page, "board", (f) => f.count("[data-testid=team-card]") === 2);
-		await until(reader.page, "top bar", (f) => f.count("[data-testid=team-running-button]") === 1);
-		expect(await call(reader.page, (f) => f.count("[data-testid=team-approvals-button]"))).toBe(0);
+		await until(reader.page, "list", (f) => f.count("[data-testid=team-work-row]") === 2);
+		await until(reader.page, "header", (f) => f.count("[data-testid=team-status]") === 1);
+		expect(await call(reader.page, (f) => f.count("[data-testid=team-attention]"))).toBe(0);
 		expect(await call(reader.page, (f) => f.count("[data-testid=team-pause-all]"))).toBe(0);
 		expect(await call(reader.page, (f) => f.count("[data-testid=new-team]"))).toBe(0);
+		expect(
+			await call(reader.page, () => document.body.innerText.includes("Waiting on members")),
+		).toBe(true);
 		expect(reader.errors).toEqual([]);
 	} finally {
 		await reader.page.close();
+		await db
+			.update(narratorToolCalls)
+			.set({ status: "fail" })
+			.where(eq(narratorToolCalls.id, hidden));
+		pendingPermissions.delete(hidden);
+	}
+}, 60_000);
+
+test("the drawer opens from a card; 退回 needs a reason and sends the item back", async () => {
+	const { page, errors } = await openPage(alice, { width: 1440, height: 900 });
+	try {
+		await call(page, (f, p: string, t: string) => f.openTeam(p, t), projectId, teamId);
+		const card = `[data-testid=team-attention-card][data-item-id="${readyId}"]`;
+		await until(page, "merge card", (f, c: string) => f.count(c) === 1, 10_000, card);
+		// The server never merges: 合并 is there, disabled.
+		expect(
+			await call(page, (f, c: string) => f.attr(`${c} [data-testid=team-merge]`, "disabled"), card),
+		).toBe("");
+		await call(page, (f, c: string) => f.click(`${c} [data-testid=team-merge-view]`), card);
+		await until(
+			page,
+			"drawer",
+			(f) => f.text("[data-testid=team-drawer-title]") === "Write the docs",
+		);
+		await until(page, "bar", (f) => f.count("[data-testid=team-drawer-return]") === 1);
+		expect(await call(page, (f) => f.text("[data-testid=team-drawer-branch]"))).toBe(
+			"team/write-the-docs-9f9f",
+		);
+		expect(await call(page, (f) => f.attr("[data-testid=team-drawer-merge]", "disabled"))).toBe("");
+		await shot(page, "desktop-light-drawer");
+		await call(page, (f) => f.click("[data-testid=team-drawer-return]"));
+		await until(page, "reason", (f) => f.count("[data-testid=team-return-reason]") === 1);
+		// No reason, no return.
+		expect(await call(page, (f) => f.attr("[data-testid=team-return-confirm]", "disabled"))).toBe(
+			"",
+		);
+		await call(page, (f) => f.type("[data-testid=team-return-reason]", "Name the config file."));
+		await until(
+			page,
+			"enabled",
+			(f) => f.attr("[data-testid=team-return-confirm]", "disabled") === null,
+		);
+		await shot(page, "desktop-light-return");
+		await call(page, (f) => f.click("[data-testid=team-return-confirm]"));
+		await until(page, "returned", (f) => f.count("[data-testid=team-return-form]") === 0);
+		const row = await db.query.teamWorkItems.findFirst({ where: eq(teamWorkItems.id, readyId) });
+		expect(row).toMatchObject({ state: "in_progress", lastReview: "blocker", reviewRounds: 3 });
+		expect(returnNotes.at(-1)).toContain("Name the config file.");
+		await until(page, "card gone", (f, c: string) => f.count(c) === 0, 10_000, card);
+		expect(errors).toEqual([]);
+	} finally {
+		await page.close();
 	}
 }, 60_000);
 
@@ -507,21 +635,12 @@ test("pause all reads the running sessions now and stops every one", async () =>
 	const { page, errors } = await openPage(alice, { width: 1600, height: 900 });
 	try {
 		await call(page, (f, p: string, t: string) => f.openTeam(p, t), projectId, teamId);
-		await until(
-			page,
-			"running",
-			(f) => f.attr("[data-testid=team-running-button]", "data-count") === "1",
-		);
+		await until(page, "pause", (f) => f.count("[data-testid=team-pause-all]") === 1);
 		// The coordinator starts working after the summary was read: pause still stops it.
 		await db.update(narrators).set({ status: "working" }).where(eq(narrators.id, teamId));
 		await call(page, (f) => f.click("[data-testid=team-pause-all]"));
 		await until(page, "confirm", (f) => f.count("[data-testid=team-pause-confirm]") === 1);
 		await call(page, (f) => f.click("[data-testid=team-pause-confirm]"));
-		await until(
-			page,
-			"nothing running",
-			(f) => f.attr("[data-testid=team-running-button]", "data-count") === "0",
-		);
 		await until(page, "notice", (f) => (f.text(".mantine-Notification-description") ?? "") !== "");
 		expect(await call(page, (f) => f.text(".mantine-Notification-description"))).toBe(
 			"Stopped 2 sessions",
@@ -539,7 +658,7 @@ test("pause all reads the running sessions now and stops every one", async () =>
 	}
 }, 60_000);
 
-test("the layout follows the room beside the app sidebar; the conversation keeps 480 px", async () => {
+test("two columns when the frame has room beside the app sidebar, tabs otherwise", async () => {
 	const cases = [
 		{ viewport: 992, sidebar: 250, layout: "tabs" },
 		{ viewport: 1280, sidebar: 250, layout: "split" },
@@ -571,13 +690,14 @@ test("the layout follows the room beside the app sidebar; the conversation keeps
 			};
 			expect(seen).toEqual({ viewport, sidebar, layout, sidebarShown: sidebar });
 			if (layout !== "tabs") {
+				// The conversation is the wider column (about 60%) and the two share the frame.
 				const conversation = await call(page, (f) => f.widthOf("[data-testid=team-conversation]"));
-				expect(conversation).toBeGreaterThanOrEqual(480);
-				// The conversation and the side panel share the whole frame: no empty gutter.
 				const side = await call(page, (f) => f.widthOf("[data-testid=team-side]"));
 				const frame = await call(page, (f) => f.widthOf("[data-testid=team-workspace]"));
+				expect(conversation).toBeGreaterThanOrEqual(480);
+				expect(conversation).toBeGreaterThan(side);
 				expect(Math.abs(conversation + side - frame)).toBeLessThanOrEqual(1);
-			}
+			} else expect(await call(page, (f) => f.count("[data-testid=team-phone-tabs]"))).toBe(1);
 			expect(await call(page, (f) => f.count("[data-testid=project-teams]"))).toBe(0);
 			const fit = await call(page, (f) => f.fitsWidth("[data-testid=team-top-bar]"));
 			expect(fit).toEqual({ found: true, inside: true, scrolls: false });
@@ -608,7 +728,7 @@ test("the conversation is never remounted across split and tabs", async () => {
 		await call(page, (f) => f.markConversation());
 		const steps: Array<[number, string]> = [
 			[1600, "split"],
-			[1109, "split"],
+			[1110, "split"],
 			[1100, "tabs"],
 			[1300, "split"],
 			[900, "tabs"],
@@ -631,9 +751,9 @@ test("the conversation is never remounted across split and tabs", async () => {
 			});
 		}
 		// Switching tabs keeps it too.
-		await call(page, (f) => f.click("[data-testid=team-tab-board]"));
-		await until(page, "board tab", (f) => f.count("[data-testid=team-card]") === 2);
-		await call(page, (f) => f.click("[data-testid=team-tab-conversation]"));
+		await call(page, (f) => f.click("[data-testid=team-phone-tabs] input[value=work]"));
+		await until(page, "work tab", (f) => f.count("[data-testid=team-work-row]") > 0);
+		await call(page, (f) => f.click("[data-testid=team-phone-tabs] input[value=conversation]"));
 		expect(await call(page, (f) => f.conversationKept())).toBe(true);
 		expect(errors).toEqual([]);
 	} finally {
@@ -641,11 +761,11 @@ test("the conversation is never remounted across split and tabs", async () => {
 	}
 }, 60_000);
 
-test("opening the coordinator's own question brings its conversation forward", async () => {
+test("a call the coordinator asks in its session brings its conversation forward", async () => {
 	const requestId = await seedApproval(
 		"",
-		"AskUserQuestion",
-		{ questions: [{ question: "Release today?", header: "When", options: [{ label: "Yes" }] }] },
+		"RequestPermissionRule",
+		{ rule: "Bash(bun test:*)" },
 		teamId,
 	);
 	const { page, errors } = await openPage(alice, { width: 360, height: 780 });
@@ -657,22 +777,13 @@ test("opening the coordinator's own question brings its conversation forward", a
 			(f) => f.attr("[data-testid=team-workspace]", "data-layout") === "tabs",
 		);
 		await call(page, (f) => f.markConversation());
-		await call(page, (f) => f.click("[data-testid=team-tab-board]"));
-		await until(page, "board", (f) => f.gone("[data-testid=conversation-stand-in]"));
-		await until(page, "approvals", (f) => f.count("[data-testid=team-approvals-button]") === 1);
-		await call(page, (f) => f.click("[data-testid=team-approvals-button]"));
-		const open = `[data-testid=team-approval][data-request-id="${requestId}"] [data-testid=team-approval-open]`;
-		await until(
-			page,
-			"the coordinator's question",
-			(f, o: string) => f.count(o) === 1,
-			10_000,
-			open,
-		);
+		await call(page, (f) => f.click("[data-testid=team-phone-tabs] input[value=work]"));
+		await until(page, "work", (f) => f.gone("[data-testid=conversation-stand-in]"));
+		const open = `[data-testid=team-attention-card][data-request-id="${requestId}"] [data-testid=team-approval-open]`;
+		await until(page, "the coordinator's call", (f, o: string) => f.count(o) === 1, 10_000, open);
 		await call(page, (f, o: string) => f.click(o), open);
 		await until(page, "conversation shown", (f) => !f.gone("[data-testid=conversation-stand-in]"));
 		await until(page, "composer focused", (f) => f.focused() === "composer-stand-in");
-		await until(page, "drawer closed", (f) => f.gone(".mantine-Drawer-content"));
 		expect(await call(page, (f) => f.conversationKept())).toBe(true);
 		expect(await call(page, (f) => f.openedTargets())).not.toContain(`session:${teamId}`);
 		expect(errors).toEqual([]);
@@ -695,12 +806,6 @@ test("the page is about one team: no teams list, no new team, at desktop and pho
 		const { page, errors } = await openPage(alice, viewport);
 		try {
 			await call(page, (f, p: string, t: string) => f.openTeam(p, t), projectId, teamId);
-			await until(
-				page,
-				"board",
-				(f) =>
-					f.count("[data-testid=team-card]") > 0 || f.count("[data-testid=team-tab-board]") === 1,
-			);
 			await until(page, "title", (f) => f.text("[data-testid=team-title]") === "Release crew");
 			const seen = {
 				width: viewport.width,
@@ -720,18 +825,23 @@ test("the page is about one team: no teams list, no new team, at desktop and pho
 			await until(page, "Chinese", (f) => f.text("[data-testid=team-title]") === "Release crew");
 			expect(await call(page, () => document.body.innerText.includes("新建团队"))).toBe(false);
 			await call(page, (f) => f.setLanguage("en"));
-			// The back arrow is never covered: on a phone the top bar carries the menu button and
-			// the floating fallback stays away; on a desktop neither shows.
+			// Nothing floats over the header: on a phone it carries the menu button (two rows) and
+			// the floating fallback stays away; on a desktop the back arrow leads to the project.
 			const phone = viewport.width < 768;
-			expect(await call(page, (f) => f.tappable("[data-testid=team-back]"))).toBe(true);
 			expect(await call(page, (f) => f.count("[data-mobile-nav-fallback]"))).toBe(0);
 			expect(await call(page, (f) => !f.gone("[data-mobile-nav-button]"))).toBe(phone);
+			expect(await call(page, (f) => f.attr("[data-testid=team-top-bar]", "data-phone"))).toBe(
+				phone ? "true" : "false",
+			);
 			if (phone) {
 				const menu = await call(page, (f) =>
 					f.fitsWidth("[data-testid=team-top-bar] [data-mobile-nav-button]"),
 				);
 				expect(menu).toEqual({ found: true, inside: true, scrolls: false });
 				expect(await call(page, (f) => f.tappable("[data-mobile-nav-button]"))).toBe(true);
+				expect(await call(page, (f) => f.tappable("[data-testid=team-more-menu]"))).toBe(true);
+			} else {
+				expect(await call(page, (f) => f.tappable("[data-testid=team-back]"))).toBe(true);
 				await call(page, (f) => f.click("[data-testid=team-back]"));
 				expect(await call(page, (f) => f.openedTargets())).toContain("back");
 			}
@@ -742,7 +852,51 @@ test("the page is about one team: no teams list, no new team, at desktop and pho
 	}
 }, 60_000);
 
-test("an archived team says so in the top bar and offers no pause all", async () => {
+test("at 360 px a read-only user opens team communications and Back closes only the drawer", async () => {
+	const { page, errors } = await openPage(bob, { width: 360, height: 780 });
+	try {
+		await call(page, (f, p: string, t: string) => f.openTeam(p, t), projectId, teamId);
+		await until(page, "members loaded", (f) => f.count("[data-testid=team-members-button]") === 1);
+		await until(
+			page,
+			"phone header",
+			(f) => f.attr("[data-testid=team-top-bar]", "data-phone") === "true",
+		);
+		await page.click("[data-testid=team-more-menu]");
+		const entrySelector = "[data-testid=team-communication-button]";
+		await page.waitForSelector(entrySelector, { visible: true });
+		const entry = await page.$eval(entrySelector, (el) => ({
+			text: el.textContent,
+			role: el.getAttribute("role"),
+			iconHidden: el.querySelector("svg")?.getAttribute("aria-hidden"),
+			height: el.getBoundingClientRect().height,
+		}));
+		expect(entry).toMatchObject({
+			text: "Communication topology",
+			role: "menuitem",
+			iconHidden: "true",
+		});
+		expect(entry.height).toBeGreaterThanOrEqual(48);
+		expect(await call(page, (f) => f.count("[data-testid=team-pause-all]"))).toBe(0);
+		await page.click(entrySelector);
+		await until(page, "topology drawer", (f) => {
+			const fit = f.fitsWidth("[data-testid=communication-topology]");
+			return fit.found && fit.inside && !fit.scrolls;
+		});
+		await page.waitForFunction(() => typeof history.state?.__NF_sentinel_id === "string");
+		const teamPageUrl = page.url();
+		await page.evaluate(() => history.back());
+		await until(page, "topology drawer closed", (f) => f.gone(".mantine-Drawer-content"));
+		expect(page.url()).toBe(teamPageUrl);
+		expect(await call(page, (f) => f.text("[data-testid=team-title]"))).toBe("Release crew");
+		expect(await call(page, (f) => f.openedTargets())).toEqual([]);
+		expect(errors).toEqual([]);
+	} finally {
+		await page.close();
+	}
+}, 60_000);
+
+test("an archived team says so in the header and offers no pause all", async () => {
 	const owner = { userId: alice, isAdmin: false };
 	const old = await createTeam({ projectId, name: "Old crew" }, owner);
 	await archiveTeam(old.id, owner, projectId);
@@ -756,7 +910,12 @@ test("an archived team says so in the top bar and offers no pause all", async ()
 			await until(page, "archived", (f) => f.count("[data-testid=team-archived]") === 1);
 			expect(await call(page, (f) => f.text("[data-testid=team-archived]"))).toBe("Archived");
 			expect(await call(page, (f) => f.text("[data-testid=team-title]"))).toBe("Old crew");
+			expect(await call(page, (f) => f.attr("[data-testid=team-status]", "data-tone"))).toBe(
+				"archived",
+			);
 			expect(await call(page, (f) => f.count("[data-testid=team-pause-all]"))).toBe(0);
+			// No starting prompt on an archived team.
+			expect(await call(page, (f) => f.count("[data-testid=team-start]"))).toBe(0);
 			// The people list stays (the owner still manages access).
 			expect(await call(page, (f) => f.count("[data-testid=team-members-button]"))).toBe(1);
 			const fit = await call(page, (f) => f.fitsWidth("[data-testid=team-archived]"));
@@ -764,6 +923,7 @@ test("an archived team says so in the top bar and offers no pause all", async ()
 			await call(page, (f) => f.setLanguage("zh-CN"));
 			await until(page, "Chinese", (f) => f.text("[data-testid=team-archived]") === "已归档");
 			await shot(page, `archived-${viewport.width}`);
+			await call(page, (f) => f.setLanguage("en"));
 			expect(errors).toEqual([]);
 		} finally {
 			await page.close();
@@ -772,6 +932,7 @@ test("an archived team says so in the top bar and offers no pause all", async ()
 }, 60_000);
 
 test("360 px: tabs without sideways scrolling, light and dark, English and Chinese", async () => {
+	const pending = await seedApproval("bun run build");
 	const { page, errors } = await openPage(alice, { width: 360, height: 780 });
 	try {
 		await call(page, (f, p: string, t: string) => f.openTeam(p, t), projectId, teamId);
@@ -781,27 +942,29 @@ test("360 px: tabs without sideways scrolling, light and dark, English and Chine
 			(f) => f.attr("[data-testid=team-workspace]", "data-layout") === "tabs",
 		);
 		await until(page, "title", (f) => f.text("[data-testid=team-title]") === "Release crew");
+		await until(page, "cards", (f) => f.count("[data-testid=team-attention-card]") > 0);
 		for (const selector of [
 			"[data-testid=team-top-bar]",
-			// Every control of the bar stays on screen (it wraps rather than running off).
-			"[data-testid=team-approvals-button]",
+			"[data-testid=team-status]",
 			"[data-testid=team-members-button]",
-			"[data-testid=team-running-button]",
-			"[data-testid=team-pause-all]",
-			"[data-testid=team-tab-board]",
+			"[data-testid=team-more-menu]",
+			"[data-testid=team-attention-card]",
+			"[data-testid=team-phone-tabs]",
 			"[data-testid=conversation-stand-in]",
 		]) {
 			const fit = await call(page, (f, s: string) => f.fitsWidth(s), selector);
 			expect({ selector, ...fit }).toEqual({ selector, found: true, inside: true, scrolls: false });
 		}
+		// 全部暂停 lives in the 「…」 menu on a phone.
+		expect(
+			await call(page, (f) => f.count("[data-testid=team-top-bar] [data-testid=team-pause-all]")),
+		).toBe(0);
 		await shot(page, "phone-light-conversation");
-		await call(page, (f) => f.click("[data-testid=team-tab-board]"));
-		await until(page, "cards", (f) => f.count("[data-testid=team-card]") === 2);
-		for (const selector of ["[data-testid=team-card]", "[data-testid=team-card-branch]"]) {
-			const fit = await call(page, (f, s: string) => f.fitsWidth(s), selector);
-			expect({ selector, ...fit }).toEqual({ selector, found: true, inside: true, scrolls: false });
-		}
-		await shot(page, "phone-light-board");
+		await call(page, (f) => f.click("[data-testid=team-phone-tabs] input[value=work]"));
+		await until(page, "rows", (f) => f.count("[data-testid=team-work-row]") > 0);
+		const fit = await call(page, (f) => f.fitsWidth("[data-testid=team-work-row]"));
+		expect(fit).toEqual({ found: true, inside: true, scrolls: false });
+		await shot(page, "phone-light-work");
 
 		await call(page, (f) => f.setScheme("dark"));
 		await until(page, "dark", (f) => f.colors().scheme === "dark");
@@ -812,17 +975,17 @@ test("360 px: tabs without sideways scrolling, light and dark, English and Chine
 		expect(dark.background).not.toBe(light.background);
 		await call(page, (f) => f.setScheme("dark"));
 		await until(page, "dark again", (f) => f.colors().scheme === "dark");
-		await shot(page, "phone-dark-board");
+		await shot(page, "phone-dark-work");
 
-		await call(page, (f) => f.click("[data-testid=team-approvals-button]"));
-		await until(page, "approvals drawer", (f) => f.count("[data-testid=team-approval]") === 1);
-		// Once the drawer has slid in, the approval lies inside the 360 px viewport.
+		// The drawer of an item fills the phone.
+		await call(page, (f) => f.click("[data-testid=team-work-row]"));
+		await until(page, "drawer", (f) => (f.text("[data-testid=team-drawer-title]") ?? "") !== "");
 		await until(page, "drawer in place", (f) => {
-			const fit = f.fitsWidth("[data-testid=team-approval]");
+			const fit = f.fitsWidth("[data-testid=team-drawer-title]");
 			return fit.found && fit.inside && !fit.scrolls;
 		});
-		await shot(page, "phone-dark-approvals");
-		await page.keyboard.press("Escape");
+		await shot(page, "phone-dark-drawer");
+		await call(page, (f) => f.click("[data-testid=team-drawer-close]"));
 		await until(page, "drawer closed", (f) => f.gone(".mantine-Drawer-content"));
 
 		// M1: the people drawer (members, onlookers; the owner's sharing panel) fits too.
@@ -832,7 +995,6 @@ test("360 px: tabs without sideways scrolling, light and dark, English and Chine
 			const fit = f.fitsWidth("[data-testid=team-members]");
 			return fit.found && fit.inside && !fit.scrolls;
 		});
-		// The owner gets the coordinator's ordinary sharing panel below the list.
 		await until(
 			page,
 			"sharing panel",
@@ -852,13 +1014,18 @@ test("360 px: tabs without sideways scrolling, light and dark, English and Chine
 
 		// Chinese wording (no width checks: CI has no CJK fonts).
 		await call(page, (f) => f.setLanguage("zh-CN"));
-		await until(page, "Chinese", (f) => f.text("[data-testid=team-tab-board]") === "看板");
-		await call(page, (f) => f.click("[data-testid=team-tab-activity]"));
+		await until(page, "Chinese", () => document.body.innerText.includes("等你处理"));
+		await call(page, (f) => f.click("[data-testid=team-side-switch] input[value=activity]"));
 		await until(page, "activity", (f) => f.count("[data-testid=team-event]") > 0);
 		await shot(page, "phone-dark-activity-zh");
 		expect(errors).toEqual([]);
 	} finally {
 		await page.close();
+		await db
+			.update(narratorToolCalls)
+			.set({ status: "fail" })
+			.where(eq(narratorToolCalls.id, pending));
+		pendingPermissions.delete(pending);
 	}
 }, 60_000);
 

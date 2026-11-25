@@ -66,6 +66,7 @@ const PROP_KEYS = {
 	rowInteraction: true,
 	closingRowKeys: true,
 	narratorId: true,
+	canCalibrateModelTrace: true,
 	onOpenFilePanel: true,
 	openAttachmentLabel: true,
 	injectionNoteLabel: true,

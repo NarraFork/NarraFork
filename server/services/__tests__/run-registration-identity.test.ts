@@ -55,6 +55,15 @@ const unregister = registerExternalProviderResolver({
 const done = { finalText: "done", hasError: false, shouldUpdateTitle: false };
 const originalAutoContinuation = settings.agent.autoContinuationMode;
 
+function waitForAbort(signal: AbortSignal): Promise<void> {
+	return new Promise<void>((resolve) => {
+		// Worker-backed preparation may outlive the absolute deadline before the
+		// fake executor subscribes. Abort events are not replayed to late listeners.
+		if (signal.aborted) resolve();
+		else signal.addEventListener("abort", () => resolve(), { once: true });
+	});
+}
+
 beforeEach(async () => {
 	backgroundOccupancyStore.resetForTests();
 	await closePrefixSnapshotStore();
@@ -236,6 +245,14 @@ test("S3 a pre-registration session wakes as its own owner", async () => {
 });
 
 test("S3 Send to an ownerless unregistered session leaves input queued and makes no model request", async () => {
+	const { ensureCommunicationNodeTx, grantFixtureNarratorWrite, seedFixtureCommunicationPeer } =
+		await import("./runtime-communication-fixtures");
+	db.transaction((tx) => {
+		ensureCommunicationNodeTx(tx, CALLER, null);
+		ensureCommunicationNodeTx(tx, TARGET, null);
+		grantFixtureNarratorWrite(tx, TARGET, A);
+		seedFixtureCommunicationPeer(tx, CALLER, TARGET, A);
+	});
 	const call = callerTool("Send", "identity-send");
 	db.insert(fileChangeExecutionSegments)
 		.values({
@@ -253,9 +270,9 @@ test("S3 Send to an ownerless unregistered session leaves input queued and makes
 		"keep this queued",
 		call,
 	);
-	await enqueueInboxAgent(delivery, delivery.text, { userId: B, createdBy: B });
 	const execute = spyOn(executor, "executeAgentLoop").mockResolvedValue(done);
 	try {
+		await enqueueInboxAgent(delivery, delivery.text, { userId: B, createdBy: B });
 		expect(await startParentInboundContinuationIfPossible(TARGET)).toEqual({ started: false });
 		expect(execute).not.toHaveBeenCalled();
 		expect(
@@ -265,7 +282,10 @@ test("S3 Send to an ownerless unregistered session leaves input queued and makes
 				.where(eq(narratorBufferedMessages.narratorId, TARGET))
 				.get(),
 		).toMatchObject({ kind: "agent_message", state: "queued" });
-		expect(stored().registration).toBeNull();
+		expect(db.select().from(narrators).where(eq(narrators.id, TARGET)).get()).toMatchObject({
+			ownerUserId: null,
+			runtimeRegistrationJson: null,
+		});
 	} finally {
 		execute.mockRestore();
 	}
@@ -328,11 +348,40 @@ test("S1 real foreground runSubagent uses the caller's principal in its first pa
 	}
 });
 
+test("the executor fixture observes cancellation that preceded listener registration", async () => {
+	const cancel = new AbortController();
+	cancel.abort("deadline already elapsed during preparation");
+	await waitForAbort(cancel.signal);
+	expect(cancel.signal.aborted).toBe(true);
+});
+
 for (const cancellation of ["deadline", "caller"] as const) {
 	test(`A2 no deliverTo persists the binding and is stopped by its ${cancellation}`, async () => {
-		const deadlineAt = new Date(
-			Date.now() + (cancellation === "deadline" ? 200 : 30_000),
-		).toISOString();
+		const deadlineAt = new Date(Date.now() + 30_000).toISOString();
+		const realSetTimeout = globalThis.setTimeout;
+		let fireDeadline: (() => void) | undefined;
+		// Preparation uses real workers and must not race a 200ms wall-clock budget.
+		// Capture only the runtime's actual deadline callback; fire it after the pass
+		// starts, leaving all other timers and the production cancellation path real.
+		const timer =
+			cancellation === "deadline"
+				? spyOn(globalThis, "setTimeout").mockImplementation(((
+						callback: (...args: unknown[]) => void,
+						delay?: number,
+						...args: unknown[]
+					) => {
+						const handle = realSetTimeout(callback, delay, ...args);
+						if (callback.name === "onDeadline") {
+							expect(delay).toBeGreaterThan(0);
+							expect(delay).toBeLessThanOrEqual(30_000);
+							fireDeadline = () => {
+								clearTimeout(handle);
+								callback(...args);
+							};
+						}
+						return handle;
+					}) as typeof setTimeout)
+				: undefined;
 		const cancelWith = { narratorId: CALLER, toolCallId: "identity-bound-call", attempt: 1 };
 		let sawPass!: () => void;
 		const passStarted = new Promise<void>((resolve) => {
@@ -340,9 +389,7 @@ for (const cancellation of ["deadline", "caller"] as const) {
 		});
 		const execute = spyOn(executor, "executeAgentLoop").mockImplementation(async ({ config }) => {
 			sawPass();
-			await new Promise<void>((resolve) =>
-				config.signal.addEventListener("abort", () => resolve(), { once: true }),
-			);
+			await waitForAbort(config.signal);
 			return { ...done, aborted: true };
 		});
 		try {
@@ -352,6 +399,10 @@ for (const cancellation of ["deadline", "caller"] as const) {
 				text: "work",
 				binding: { principal: { userId: A }, deadlineAt, cancelWith },
 			});
+			const control = getRunControl(TARGET);
+			expect(control).toBeDefined();
+			// Both cancellation branches are controlled after the model pass starts.
+			// Waiting for terminal here would deadlock the deadline callback below.
 			await passStarted;
 			expect(stored().registration?.run).toMatchObject({
 				principal: { userId: A },
@@ -359,11 +410,16 @@ for (const cancellation of ["deadline", "caller"] as const) {
 				cancelWith,
 			});
 			expect(stored().logicalRunId).toBeTruthy();
-			expect(getRunControl(TARGET)?.binding).toEqual(stored().registration?.run);
+			expect(control?.binding).toEqual(stored().registration?.run);
 			if (cancellation === "caller") expect(cancelRunsBoundTo(CALLER, "cancel caller")).toBe(1);
+			else {
+				if (!fireDeadline) throw new Error("Run did not schedule its absolute deadline");
+				fireDeadline();
+			}
 			expect((await handle.terminal).timedOut).toBe(cancellation === "deadline");
 			expect(db.select().from(runtimePublicationOutbox).all()).toEqual([]);
 		} finally {
+			timer?.mockRestore();
 			execute.mockRestore();
 		}
 	});

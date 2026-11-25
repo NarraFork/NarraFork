@@ -1,47 +1,55 @@
 /**
- * The team page's pure rules (P4): the board mapping from the six work item states to the five
- * columns, the state icons, card marks, activity wording, the poll backoff and the pause order.
+ * The team page's pure rules (P4, the redesign R): what waits for a person and how 「等你处理」
+ * folds, the work list's groups and their order, the header's status sentence, the starting and
+ * wrap-up states, each row's line, read-only gating, activity wording, the poll backoff and the
+ * pause order.
  */
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
-import { OUTLINE_STATUS_KEYS } from "@shared/outline-status";
 import {
 	COORDINATOR_OVERRUN_EVENT_PREFIX,
 	COORDINATOR_OVERRUN_KINDS,
-	TEAM_BOARD_COLUMN_STATES,
 	TEAM_LEVEL_EVENT_KINDS,
 	TEAM_OVERLAP_EVENT_KINDS,
 	TEAM_PERSON_DECISION_EVENT_KINDS,
 	TEAM_WORK_EVENT_KINDS,
-	TEAM_WORK_ITEM_STATES,
 	type TeamBoardItem,
 	type TeamPageSummary,
+	type TeamPendingApproval,
 } from "@shared/project-teams";
 import {
+	ATTENTION_SHOWN,
+	attentionEntries,
+	attentionView,
 	audienceNotes,
-	BOARD_COLUMN_STATUS_ICON,
-	boardColumnOf,
 	boardSignature,
 	cappedCount,
-	cardMarks,
-	cardNeedsStateChip,
+	chunkIds,
+	diffLineKind,
 	eventLabelKey,
 	eventNote,
+	isCoordinator,
+	itemMarks,
+	itemOfApproval,
+	liveActivity,
 	liveWorkerStatus,
 	nextPollDelay,
 	nudgeDelay,
+	onlookerSeesWaiting,
 	pauseNotice,
 	pauseOrder,
-	recentDecisionKey,
-	recentDecisionTextKey,
+	returnErrorKey,
+	returnReason,
+	rowLine,
 	SUMMARY_POLL_MAX_MS,
 	SUMMARY_POLL_MIN_MS,
+	showsStat,
+	statusSentence,
 	summarySignature,
-	TEAM_BOARD_COLUMNS,
-	TEAM_CONVERSATION_MIN_WIDTH,
+	teamPageMode,
 	teamPinTitle,
 	teamWorkspaceLayout,
-	WORK_ITEM_STATUS_ICON,
+	workGroups,
 } from "./team-page-model";
 
 const item = (patch: Partial<TeamBoardItem> = {}): TeamBoardItem => ({
@@ -75,71 +83,337 @@ const summary = (patch: Partial<TeamPageSummary> = {}): TeamPageSummary => ({
 	...patch,
 });
 
-describe("board mapping", () => {
-	test("five columns: queued; in progress; in review + ready; merged; cancelled", () => {
-		expect([...TEAM_BOARD_COLUMNS]).toEqual([
-			"queued",
-			"in_progress",
-			"review",
-			"done",
-			"cancelled",
+const approval = (patch: Partial<TeamPendingApproval> = {}): TeamPendingApproval => ({
+	id: "call-1",
+	agent: { id: "n-1", title: "worker one", status: "waiting" },
+	depth: 1,
+	parentId: "lead",
+	toolName: "Bash",
+	kind: "tool",
+	preview: "pnpm test",
+	questions: [],
+	decisionReason: null,
+	createdAt: "2026-11-18T00:01:00.000Z",
+	...patch,
+});
+
+const at = (minute: number) => `2026-11-18T00:${String(minute).padStart(2, "0")}:00.000Z`;
+
+describe("等你处理", () => {
+	const items = [
+		item({ id: "a", worker: { id: "n-1", title: "w", status: "waiting" }, createdAt: at(1) }),
+		item({ id: "b", worker: { id: "n-2", title: "w", status: "working" }, createdAt: at(2) }),
+		item({ id: "r1", state: "ready", lastReview: "clear", updatedAt: at(9) }),
+		item({ id: "r2", state: "ready", lastReview: "clear", updatedAt: at(5) }),
+	];
+
+	test("calls first (as asked), then ready items, oldest change first; each tied to its item", () => {
+		const calls = [
+			approval({ id: "c1" }),
+			approval({
+				id: "c2",
+				kind: "question",
+				toolName: "AskUserQuestion",
+				agent: { id: "h", title: "helper", status: "waiting" },
+				depth: 2,
+				parentId: "n-2",
+			}),
+			approval({
+				id: "c3",
+				kind: "plan",
+				toolName: "ExitPlanMode",
+				agent: { id: "lead", title: "Lead", status: "waiting" },
+				depth: 0,
+				parentId: null,
+			}),
+		];
+		const entries = attentionEntries({ member: true, approvals: calls, items });
+		expect(entries.map((entry) => [entry.kind, entry.id, entry.item?.id ?? null])).toEqual([
+			["tool", "approval:c1", "a"],
+			// A helper's call belongs to its worker's item.
+			["question", "approval:c2", "b"],
+			// The coordinator's own call has no item.
+			["plan", "approval:c3", null],
+			["merge", "merge:r2", "r2"],
+			["merge", "merge:r1", "r1"],
 		]);
-		expect(TEAM_WORK_ITEM_STATES.map((state) => [state, boardColumnOf(state)])).toEqual([
-			["queued", "queued"],
-			["in_progress", "in_progress"],
-			["in_review", "review"],
-			["ready", "review"],
-			["merged", "done"],
-			["cancelled", "cancelled"],
+	});
+
+	test("onlookers decide nothing: no cards", () => {
+		expect(attentionEntries({ member: false, approvals: [approval()], items })).toEqual([]);
+	});
+
+	test("more than three fold into 还有 N 条; expanded shows all", () => {
+		expect(ATTENTION_SHOWN).toBe(3);
+		expect(attentionView([1, 2, 3], false)).toEqual({ shown: [1, 2, 3], hidden: 0 });
+		expect(attentionView([1, 2, 3, 4, 5], false)).toEqual({ shown: [1, 2, 3], hidden: 2 });
+		expect(attentionView([1, 2, 3, 4, 5], true)).toEqual({ shown: [1, 2, 3, 4, 5], hidden: 0 });
+		expect(attentionView([], false)).toEqual({ shown: [], hidden: 0 });
+	});
+
+	test("a call matches no item when its session is not a worker", () => {
+		expect(
+			itemOfApproval(
+				approval({ agent: { id: "x", title: null, status: "waiting" }, parentId: "y" }),
+				items,
+			),
+		).toBeNull();
+	});
+});
+
+describe("the work list", () => {
+	test("groups in order: needs you, in progress (then queued), review; finished left out", () => {
+		const items = [
+			item({ id: "q", state: "queued", createdAt: at(1) }),
+			item({ id: "p1", state: "in_progress", createdAt: at(2) }),
+			item({
+				id: "asked",
+				state: "in_progress",
+				worker: { id: "n-1", title: null, status: "waiting" },
+				createdAt: at(3),
+			}),
+			item({ id: "rev", state: "in_review", createdAt: at(4) }),
+			item({ id: "ready", state: "ready", createdAt: at(0) }),
+			item({ id: "p2", state: "in_progress", createdAt: at(5) }),
+			item({ id: "m", state: "merged" }),
+			item({ id: "c", state: "cancelled" }),
+		];
+		const groups = workGroups(items, [approval()]);
+		const ids = (rows: { item: { id: string } }[]) => rows.map((row) => row.item.id);
+		expect(ids(groups.needsYou)).toEqual(["asked", "ready"]);
+		expect(groups.needsYou[0]?.approval?.id).toBe("call-1");
+		expect(ids(groups.inProgress)).toEqual(["p1", "p2", "q"]);
+		expect(ids(groups.review)).toEqual(["rev"]);
+	});
+
+	test("read-only gating: an onlooker sees no calls; a waiting worker stands for one", () => {
+		const items = [
+			item({
+				id: "w",
+				worker: { id: "n-1", title: null, status: "waiting" },
+				activity: { toolName: "Bash", preview: "pnpm add x", at: at(1) },
+			}),
+			item({ id: "ready", state: "ready" }),
+		];
+		const live = summary({
+			runningAgents: [{ id: "n-1", title: null, status: "waiting" }],
+			runningCount: 1,
+		});
+		const groups = workGroups(items, [], (entry) => onlookerSeesWaiting(entry, live));
+		expect(groups.needsYou.map((row) => [row.item.id, row.waiting ?? false])).toEqual([
+			["w", true],
+			["ready", false],
 		]);
-		// Every state is in exactly one column.
-		const listed = TEAM_BOARD_COLUMNS.flatMap((column) => TEAM_BOARD_COLUMN_STATES[column]);
-		expect([...listed].sort()).toEqual([...TEAM_WORK_ITEM_STATES].sort());
+		expect(rowLine(groups.needsYou[0] as never, "waiting", "main")).toEqual({
+			key: "waitingTool",
+			values: { tool: "Bash" },
+			detail: "pnpm add x",
+			tone: "amber",
+		});
+		// Stopped meanwhile (no longer running): not waiting.
+		expect(onlookerSeesWaiting(items[0] as TeamBoardItem, summary())).toBe(false);
 	});
 
-	test("every state and column is drawn with an outline state badge, distinct per state", () => {
-		for (const state of TEAM_WORK_ITEM_STATES)
-			expect(OUTLINE_STATUS_KEYS).toContain(WORK_ITEM_STATUS_ICON[state]);
-		for (const column of TEAM_BOARD_COLUMNS)
-			expect(OUTLINE_STATUS_KEYS).toContain(BOARD_COLUMN_STATUS_ICON[column]);
-		expect(new Set(Object.values(WORK_ITEM_STATUS_ICON)).size).toBe(TEAM_WORK_ITEM_STATES.length);
+	test("each row says what it is doing now", () => {
+		const row = (patch: Partial<TeamBoardItem>, call: TeamPendingApproval | null = null) => ({
+			item: item(patch),
+			approval: call,
+		});
+		expect(rowLine(row({}, approval()), "waiting", "main")).toMatchObject({
+			key: "waitingTool",
+			detail: "pnpm test",
+			tone: "amber",
+		});
+		expect(
+			rowLine(row({}, approval({ kind: "question", questions: ["Which?"] })), "waiting", "main"),
+		).toMatchObject({ key: "waitingAnswer", detail: "Which?" });
+		expect(rowLine(row({ state: "ready", reviewRounds: 2 }), null, "main")).toMatchObject({
+			key: "mergeable",
+			values: { round: 2 },
+			tone: "green",
+		});
+		expect(rowLine(row({ state: "in_review", reviewRounds: 0 }), null, "main")).toMatchObject({
+			key: "reviewing",
+			values: { round: 1 },
+		});
+		expect(
+			rowLine(row({ state: "in_review", reviewRounds: 1, lastReview: "clear" }), null, "main").key,
+		).toBe("reviewClear");
+		expect(rowLine(row({ state: "queued" }), null, "main")).toMatchObject({
+			key: "queued",
+			tone: "hollow",
+		});
+		expect(rowLine(row({ state: "merged", baseRef: null }), null, "dev")).toMatchObject({
+			key: "merged",
+			values: { base: "dev" },
+		});
+		const running = { id: "n", title: null, status: "working" };
+		expect(
+			rowLine(
+				row({ worker: running, activity: { toolName: "Edit", preview: "a.ts", at: at(1) } }),
+				"working",
+				"main",
+			),
+		).toMatchObject({ key: "activity", detail: "a.ts", tone: "blue" });
+		// The last tool call of a worker that stopped is not "now".
+		expect(
+			rowLine(
+				row({ worker: running, activity: { toolName: "Edit", preview: "a.ts", at: at(1) } }),
+				"idle",
+				"main",
+			).key,
+		).toBe("workerIdle");
+		expect(rowLine(row({ lastReview: "blocker", reviewRounds: 2 }), "idle", "main")).toMatchObject({
+			key: "fixing",
+			values: { round: 2 },
+		});
+		expect(rowLine(row({}), null, "main").key).toBe("noWorker");
 	});
+});
 
-	test("a ready item in the review column says its state in words; the icon is no check", () => {
-		expect(WORK_ITEM_STATUS_ICON.ready).toBe("delegated");
-		expect(cardNeedsStateChip({ state: "ready" })).toBe(true);
-		expect(cardNeedsStateChip({ state: "in_review" })).toBe(false);
-		for (const state of ["queued", "in_progress", "merged", "cancelled"] as const)
-			expect(cardNeedsStateChip({ state })).toBe(false);
+describe("status sentence", () => {
+	const counts = (patch: Partial<TeamPageSummary["columnCounts"]>) => ({
+		queued: 0,
+		in_progress: 0,
+		review: 0,
+		done: 0,
+		cancelled: 0,
+		...patch,
 	});
+	test("in progress · waiting on you (members) or on members (onlookers)", () => {
+		const s = summary({
+			columnCounts: counts({ queued: 1, in_progress: 4, review: 2 }),
+			runningCount: 3,
+		});
+		expect(statusSentence({ summary: s, member: true, waiting: 3, waitingItems: 3 })).toEqual({
+			tone: "active",
+			parts: [
+				{ key: "inProgress", count: 4 },
+				{ key: "waitingYou", count: 3 },
+			],
+		});
+		expect(
+			statusSentence({ summary: s, member: false, waiting: 1, waitingItems: 1 }).parts,
+		).toEqual([
+			{ key: "inProgress", count: 6 },
+			{ key: "waitingMembers", count: 1 },
+		]);
+	});
+	test("idle, done, no work yet, paused, archived", () => {
+		expect(
+			statusSentence({
+				summary: summary({ columnCounts: counts({}) }),
+				member: true,
+				waiting: 0,
+				waitingItems: 0,
+			}),
+		).toEqual({ tone: "idle", parts: [{ key: "idle" }, { key: "noWork" }] });
+		expect(
+			statusSentence({
+				summary: summary({ columnCounts: counts({ done: 7, cancelled: 1 }) }),
+				member: true,
+				waiting: 0,
+				waitingItems: 0,
+			}).parts,
+		).toEqual([{ key: "idle" }, { key: "done", count: 7 }]);
+		expect(
+			statusSentence({
+				summary: summary({
+					columnCounts: counts({ in_progress: 2 }),
+					runningCount: 0,
+					coordinatorStopReason: "user_interrupt",
+				}),
+				member: true,
+				waiting: 0,
+				waitingItems: 0,
+			}),
+		).toEqual({ tone: "paused", parts: [{ key: "paused" }] });
+		// Stopped by a person but something still runs: not paused.
+		expect(
+			statusSentence({
+				summary: summary({
+					columnCounts: counts({ in_progress: 2 }),
+					runningCount: 1,
+					coordinatorStopReason: "user_interrupt",
+				}),
+				member: true,
+				waiting: 0,
+				waitingItems: 0,
+			}).tone,
+		).toBe("active");
+		expect(
+			statusSentence({
+				summary: summary({
+					coordinatorStatus: "archived",
+					columnCounts: counts({ in_progress: 2 }),
+				}),
+				member: true,
+				waiting: 1,
+				waitingItems: 1,
+			}),
+		).toEqual({ tone: "archived", parts: [{ key: "archived" }] });
+	});
+});
 
-	test("layout follows the frame's width with room for the conversation", () => {
-		expect(teamWorkspaceLayout(360)).toBe("tabs");
-		// 1280 px window, 480 px app sidebar: 800 px frame.
+describe("starting and wrap-up", () => {
+	const counts = (patch: Partial<TeamPageSummary["columnCounts"]>) => ({
+		queued: 0,
+		in_progress: 0,
+		review: 0,
+		done: 0,
+		cancelled: 0,
+		...patch,
+	});
+	test("starting: no work and nobody spoke to the coordinator yet", () => {
+		expect(teamPageMode(summary({ coordinatorMessageCount: 0 }))).toEqual({
+			starting: true,
+			emptyWork: true,
+			wrapUp: false,
+		});
+		// Spoken to, still no work: the list explains, the conversation shows.
+		expect(teamPageMode(summary({ coordinatorMessageCount: 3 }))).toEqual({
+			starting: false,
+			emptyWork: true,
+			wrapUp: false,
+		});
+		expect(
+			teamPageMode(summary({ coordinatorStatus: "archived", coordinatorMessageCount: 0 })).starting,
+		).toBe(false);
+		expect(teamPageMode(undefined)).toEqual({ starting: false, emptyWork: false, wrapUp: false });
+	});
+	test("wrap-up: work happened and nothing is open (not when archived)", () => {
+		expect(teamPageMode(summary({ columnCounts: counts({ done: 3, cancelled: 1 }) })).wrapUp).toBe(
+			true,
+		);
+		expect(teamPageMode(summary({ columnCounts: counts({ done: 3, queued: 1 }) })).wrapUp).toBe(
+			false,
+		);
+		expect(
+			teamPageMode(summary({ coordinatorStatus: "archived", columnCounts: counts({ done: 3 }) }))
+				.wrapUp,
+		).toBe(false);
+	});
+});
+
+describe("drawer and layout rules", () => {
+	test("a return needs a reason of at most 2000 characters", () => {
+		expect(returnReason("  fix the time zone  ")).toBe("fix the time zone");
+		expect(returnReason("   ")).toBeNull();
+		expect(returnReason("x".repeat(2001))).toBeNull();
+	});
+	test("diff lines", () => {
+		expect(diffLineKind("@@ -1 +1 @@")).toBe("hunk");
+		expect(diffLineKind("+++ b/a.ts")).toBe("meta");
+		expect(diffLineKind("+added")).toBe("add");
+		expect(diffLineKind("-removed")).toBe("del");
+		expect(diffLineKind(" same")).toBe("context");
+	});
+	test("two columns when the frame has room, tabs otherwise; capped counts", () => {
+		expect(teamWorkspaceLayout(390)).toBe("tabs");
 		expect(teamWorkspaceLayout(800)).toBe("tabs");
-		expect(teamWorkspaceLayout(TEAM_CONVERSATION_MIN_WIDTH + 380)).toBe("split");
-		// 1280 px window, 250 px sidebar.
-		expect(teamWorkspaceLayout(1030)).toBe("split");
-		// No third column: the page is about one team, never a list of the project's teams.
-		expect(teamWorkspaceLayout(1600)).toBe("split");
-		expect(TEAM_CONVERSATION_MIN_WIDTH).toBeGreaterThanOrEqual(480);
-	});
-
-	test("card marks: exclusive lock; a finished item still holding its worktree", () => {
-		expect(cardMarks(item())).toEqual([]);
-		expect(cardMarks(item({ exclusiveKey: "migrations" }))).toEqual(["exclusive"]);
-		expect(cardMarks(item({ state: "merged" }))).toEqual(["cleanable"]);
-		expect(cardMarks(item({ state: "cancelled", hasWorktree: false }))).toEqual([]);
-		expect(cardMarks(item({ state: "merged", exclusiveKey: "x" }))).toEqual([
-			"exclusive",
-			"cleanable",
-		]);
-	});
-
-	test("capped counts", () => {
-		expect(cappedCount(3, 50)).toBe("3");
-		expect(cappedCount(50, 50)).toBe("50");
+		expect(teamWorkspaceLayout(1190)).toBe("split");
 		expect(cappedCount(51, 50)).toBe("50+");
+		expect(cappedCount(3, 50)).toBe("3");
 	});
 });
 
@@ -213,6 +487,12 @@ describe("activity wording", () => {
 			}),
 		).toEqual({ key: "overrun", values: { tool: "Edit", size: 84, limit: 30 } });
 		expect(eventNote({ kind: "work.ready", detail: null })).toBeNull();
+		expect(eventNote({ kind: "work.returned", detail: { reason: " Use the team zone " } })).toEqual(
+			{
+				key: "text",
+				values: { text: "Use the team zone" },
+			},
+		);
 		const long = eventNote({ kind: "team.decision", detail: { summary: "x".repeat(2000) } });
 		expect(String(long?.values.text).length).toBe(600);
 	});
@@ -307,18 +587,7 @@ describe("live updates", () => {
 });
 
 describe("people (M1)", () => {
-	test("a decision's line and its activity note", () => {
-		expect(recentDecisionKey("approval.allowed")).toBe("allowed");
-		expect(recentDecisionKey("approval.denied")).toBe("denied");
-		expect(recentDecisionKey("question.answered")).toBe("answered");
-		expect(recentDecisionKey("question.dismissed")).toBe("dismissed");
-		expect(recentDecisionKey("question.ignored")).toBe("ignored");
-		expect(recentDecisionKey("question.supplemented")).toBe("supplemented");
-		expect(recentDecisionKey("question.deferred")).toBe("deferred");
-		expect(recentDecisionKey("question.answered_by_ai")).toBe("answeredByAi");
-		expect(recentDecisionTextKey("approval.allowed", "plan")).toBe("allowedPlan");
-		expect(recentDecisionTextKey("approval.denied", "plan")).toBe("deniedPlan");
-		expect(recentDecisionTextKey("approval.denied", "tool")).toBe("denied");
+	test("a decision's activity note", () => {
 		expect(
 			eventNote({
 				kind: "approval.allowed",
@@ -376,5 +645,80 @@ describe("pin to sidebar", () => {
 		// The page's live summary can see the archive before the team detail does.
 		expect(teamPinTitle(team, "archived")).toBeUndefined();
 		expect(teamPinTitle(team, "working")).toBe("Release crew");
+	});
+});
+
+describe("review fixes", () => {
+	test("a row's doing-now follows the summary's running list, else what the board read", () => {
+		const worker = { id: "n-1", title: null, status: "working" };
+		const board = { toolName: "Read", preview: "old.ts", at: at(1) };
+		const fresh = { toolName: "Bash", preview: "pnpm test", at: at(5) };
+		const live = summary({ runningAgents: [{ ...worker, activity: fresh }], runningCount: 1 });
+		expect(liveActivity(item({ worker, activity: board }), live)).toEqual(fresh);
+		// An older server's summary without activity: keep the board's.
+		const older = summary({ runningAgents: [worker], runningCount: 1 });
+		expect(liveActivity(item({ worker, activity: board }), older)).toEqual(board);
+		expect(liveActivity(item({ worker: null, activity: null }), live)).toBeNull();
+	});
+
+	test("onlookers: a waiting worker with nothing known waits on a person; a question is no tool", () => {
+		const waiting = { item: item({ activity: null }), approval: null, waiting: true };
+		expect(rowLine(waiting, "waiting", "main")).toMatchObject({
+			key: "waitingPerson",
+			detail: null,
+		});
+		const asking = {
+			item: item({ activity: { toolName: "AskUserQuestion", preview: "Ship?", at: at(1) } }),
+			approval: null,
+			waiting: true,
+		};
+		expect(rowLine(asking, "waiting", "main")).toMatchObject({
+			key: "waitingAnswer",
+			detail: "Ship?",
+		});
+	});
+
+	test("the header never undercounts: N+ when more calls wait than listed", () => {
+		const s = summary({
+			columnCounts: { queued: 0, in_progress: 2, review: 0, done: 0, cancelled: 0 },
+		});
+		expect(
+			statusSentence({ summary: s, member: true, waiting: 50, waitingItems: 1, waitingMore: true })
+				.parts,
+		).toContainEqual({ key: "waitingYouMore", count: 50 });
+	});
+
+	test("marks: the exclusive lock; a finished item still holding its worktree", () => {
+		expect(itemMarks(item())).toEqual([]);
+		expect(itemMarks(item({ exclusiveKey: "paths" }))).toEqual(["exclusive"]);
+		expect(itemMarks(item({ state: "merged" }))).toEqual(["worktree"]);
+		expect(itemMarks(item({ state: "cancelled", hasWorktree: false }))).toEqual([]);
+		// A live item's worktree is expected, not a mark.
+		expect(itemMarks(item({ state: "in_progress", hasWorktree: true }))).toEqual([]);
+	});
+
+	test("sizes: nothing changed shows nothing; requests of 50", () => {
+		expect(showsStat({ added: 0, removed: 0, files: 0 })).toBe(false);
+		expect(showsStat({ added: 0, removed: 0, files: 1 })).toBe(true);
+		expect(showsStat({ added: 3, removed: 0 })).toBe(true);
+		expect(showsStat(null)).toBe(false);
+		const ids = Array.from({ length: 120 }, (_, index) => `id${String(index).padStart(3, "0")}`);
+		const chunks = chunkIds([...ids, "id000"], 50);
+		expect(chunks.map((chunk) => chunk.length)).toEqual([50, 50, 20]);
+		expect(chunks.flat()).toEqual(ids);
+	});
+
+	test("a return's refusals have their own words; the coordinator signs as such", () => {
+		expect(returnErrorKey({ data: { code: "TEAM_WORK_ITEM_NOT_RETURNABLE" } })).toBe(
+			"teams.page.drawer.errors.TEAM_WORK_ITEM_NOT_RETURNABLE",
+		);
+		expect(returnErrorKey({ data: { code: "TEAM_ARCHIVED" } })).toBe(
+			"teams.page.drawer.errors.TEAM_ARCHIVED",
+		);
+		expect(returnErrorKey({ data: { code: "TEAM_HAS_LIVE_WORK" } })).toBeNull();
+		expect(returnErrorKey(new Error("x"))).toBeNull();
+		expect(isCoordinator({ actorKind: "agent", actorId: "lead" }, "lead")).toBe(true);
+		expect(isCoordinator({ actorKind: "agent", actorId: "w" }, "lead")).toBe(false);
+		expect(isCoordinator({ actorKind: "person", actorId: "lead" }, "lead")).toBe(false);
 	});
 });

@@ -310,6 +310,7 @@ export async function createTeam(
 			},
 		},
 	);
+	eventBus.emit({ type: "team:communication_changed", teamId: narrator.id });
 	logger.info("Team created", { teamId: narrator.id, projectId: project.id });
 	return getTeam(narrator.id, principal);
 }
@@ -333,9 +334,29 @@ export async function updateTeam(
 			409,
 			"TEAM_ARCHIVED",
 		);
+	// A new base must name a commit in the project's repository, as at creation: otherwise every
+	// later work item's worktree fails. Async git (bounded by team-git's timeout), outside the
+	// transaction; the transaction refuses if the project's directory changed meanwhile.
+	const changingBase = patch.baseBranch !== undefined && patch.baseBranch !== team.baseBranch;
+	const checkedGitPath = changingBase ? projectGitPath(team.projectId) : null;
+	if (changingBase && patch.baseBranch !== undefined) {
+		if (!checkedGitPath)
+			throw new AppError(
+				"The team's project has no repository directory",
+				409,
+				"TEAM_PROJECT_NOT_GIT",
+			);
+		await assertTeamProjectUsable({ gitPath: checkedGitPath }, patch.baseBranch);
+	}
 	const now = new Date().toISOString();
 	const actor = { kind: "person" as const, id: principal.userId || null };
 	db.transaction((tx) => {
+		if (changingBase && projectGitPath(team.projectId, tx) !== checkedGitPath)
+			throw new AppError(
+				"The project's repository changed while the base branch was checked; try again",
+				409,
+				"TEAM_PROJECT_CHANGED",
+			);
 		tx.update(projectTeams)
 			.set({
 				...(patch.baseBranch !== undefined ? { baseBranch: patch.baseBranch } : {}),
@@ -364,7 +385,23 @@ export async function updateTeam(
 				now,
 			);
 	});
+	eventBus.emit({ type: "team:communication_changed", teamId });
 	return getTeam(teamId, principal, projectId);
+}
+
+/** A project's repository directory (primary key), or null. */
+function projectGitPath(
+	projectId: string,
+	executor: Pick<typeof db, "select"> = db,
+): string | null {
+	return (
+		executor
+			.select({ gitPath: projects.gitPath })
+			.from(projects)
+			.where(eq(projects.id, projectId))
+			.limit(1)
+			.get()?.gitPath ?? null
+	);
 }
 
 /**
@@ -405,6 +442,7 @@ function syncTeamStatus(teamId: string, archived: boolean, actor: TeamStatusActo
 			now,
 		);
 	});
+	eventBus.emit({ type: "team:communication_changed", teamId });
 	return true;
 }
 

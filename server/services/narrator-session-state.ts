@@ -5,6 +5,7 @@ import type { DangerInfo, PermissionResult, ReasoningEffort } from "../lib/agent
 import type { PendingPlanReflectionRunner } from "../lib/agent/pending-plan-reflection";
 import { AsyncMutex } from "../lib/async-mutex";
 import { AppError, NotFoundError } from "../lib/errors";
+import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
 import { isSubagentVariant } from "../lib/narrator-utils";
 import { normalizePathForComparison } from "../lib/platform-path";
@@ -441,6 +442,9 @@ export interface NarratorRuntimeModel {
 	requestedModel: string;
 	provider: string;
 	model: string;
+	/** Actual execution value; model above remains the upstream bare identifier. */
+	concreteValue?: string;
+	settingsRevision?: number;
 	resolvedAt: number;
 }
 
@@ -456,12 +460,23 @@ export function recordNarratorRuntimeModel(
 	requestedModel: string,
 	provider: string,
 	model: string,
+	concreteValue?: string,
+	settingsRevision?: number,
 ): void {
+	const previous = recentRuntimeModels.get(narratorId);
+	const sourceChanged =
+		!previous ||
+		previous.requestedModel !== requestedModel ||
+		previous.provider !== provider ||
+		previous.model !== model ||
+		previous.concreteValue !== concreteValue;
 	recentRuntimeModels.delete(narratorId);
 	recentRuntimeModels.set(narratorId, {
 		requestedModel,
 		provider,
 		model,
+		concreteValue,
+		settingsRevision,
 		resolvedAt: Date.now(),
 	});
 	while (recentRuntimeModels.size > RECENT_RUNTIME_MODELS_MAX) {
@@ -469,6 +484,12 @@ export function recordNarratorRuntimeModel(
 		if (oldest === undefined) break;
 		recentRuntimeModels.delete(oldest);
 	}
+	if (sourceChanged)
+		eventBus.emit({
+			type: "narrator:ws_broadcast",
+			narratorId,
+			message: { type: "runtime_model_changed", narratorId },
+		});
 }
 
 export function clearNarratorRuntimeModel(narratorId: string): void {
@@ -481,14 +502,13 @@ export function getNarratorRuntimeModel(
 ): NarratorRuntimeModel | null {
 	const entry = recentRuntimeModels.get(narratorId);
 	if (!entry) return null;
-	if (
-		entry.requestedModel !== currentModel ||
-		Date.now() - entry.resolvedAt > RECENT_RUNTIME_MODEL_TTL_MS
-	) {
+	if (Date.now() - entry.resolvedAt > RECENT_RUNTIME_MODEL_TTL_MS) {
 		recentRuntimeModels.delete(narratorId);
 		return null;
 	}
-	return entry;
+	// A delayed read may still carry the previous selection. It must not erase a
+	// newer execution observation belonging to the narrator's current selection.
+	return entry.requestedModel === currentModel ? entry : null;
 }
 
 export interface KnowledgeInjectionCycleState {

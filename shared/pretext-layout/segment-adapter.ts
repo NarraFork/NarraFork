@@ -249,6 +249,9 @@ export interface AdapterMessage extends MessageWithBody<AdapterContentBlock> {
 	id?: string;
 	role: string;
 	createdAt?: string;
+	/** Bounded composer detail is fetched only for mounted, explicitly flagged user rows. */
+	hasComposerDocument?: boolean;
+	stateRevision?: number;
 	/**
 	 * Slash command the user typed, when this user message was produced by one.
 	 *
@@ -2131,6 +2134,9 @@ function adaptMessage(
 				data: {
 					role: "user",
 					text,
+					...(msg.hasComposerDocument && msg.id
+						? { composerDocumentSource: { messageId: msg.id, revision: msg.stateRevision ?? 0 } }
+						: {}),
 					// Chat-style surfaces fold a follow-up's header (grouping) and may
 					// carry a reply quote strip or a tombstone; the narrator defaults
 					// remain byte-identical when none of these are set.
@@ -2721,6 +2727,7 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	sidecarSourceTeamStatus: "Team status",
 	sidecarSourceTeamUpgrade: "Became a team coordinator",
 	sidecarSourceTeamDisband: "Team disbanded",
+	sidecarSourceTeamReturn: "Work item returned",
 	// An update of an outline session's views (`context_update` row of `outline.*` parts).
 	contextViewsUpdated: "Context updated: {parts}",
 	contextViewOutlineTasks: "Current tasks",
@@ -2856,6 +2863,8 @@ const INJECTION_SOURCE_LABEL_KEYS: Record<string, string> = {
 	// A session turned into a team coordinator, or its team disbanded and the session kept.
 	team_upgrade: "sidecarSourceTeamUpgrade",
 	team_disband: "sidecarSourceTeamDisband",
+	// A person returned a work item from the team page, with the reason to relay (R).
+	team_return: "sidecarSourceTeamReturn",
 	// Loop-control notices: written as rows so a rebuilt request says what the live one did.
 	turn_nudge: "sidecarSourceTurnNudge",
 	broken_call: "sidecarSourceBrokenCall",

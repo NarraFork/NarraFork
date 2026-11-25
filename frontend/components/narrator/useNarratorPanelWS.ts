@@ -5,7 +5,15 @@ import { type ContextUsageSnapshot, parseContextUsageSnapshot } from "@shared/co
 import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import type { ProgressSnapshot } from "@shared/progress-phase";
 import { useQueryClient } from "@tanstack/react-query";
-import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
+import {
+	useCallback,
+	useEffect,
+	useMemo,
+	useReducer,
+	useRef,
+	useState,
+	useSyncExternalStore,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { useApplyAsyncQuestionChange } from "../../hooks/useAsyncQuestions";
 import { useCurrentUser } from "../../hooks/useAuth";
@@ -13,6 +21,8 @@ import { invalidateGitStatusPushQueries } from "../../hooks/useGit";
 import { type NarratorWarningInfo, useNarratorWS } from "../../hooks/useNarratorWS";
 import { useNarratorPermissionsCapability } from "../../hooks/usePlatform";
 import { ApiError, api, type BufferMessageSummary } from "../../lib/api";
+import { getAuthSnapshot, subscribeAuth } from "../../lib/api/client";
+import { createNarratorPanelReadScope, type NarratorPanelReadScope } from "../../lib/api/narrators";
 import { formatFullLocaleDateTime } from "../../lib/format";
 import {
 	createPanelReconcileRestartScheduler,
@@ -22,6 +32,7 @@ import {
 	reconcilePanelStatePages,
 	shouldFallbackPanelState,
 } from "../../lib/narrator-panel-state";
+import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import { statusRegistry } from "../../lib/status-registry";
 import {
 	contextSnapshotFields,
@@ -31,6 +42,7 @@ import {
 import { localizeNarratorError } from "./error-localization";
 import { withQueueSubstatus } from "./header/narrator-status-bar";
 import { isForeignSubagentRow } from "./message/nested-rows";
+import { invalidateNugQuotaForIdentity } from "./model/use-nug-quota";
 import type {
 	ContentBlock,
 	NarratorMsg,
@@ -187,6 +199,8 @@ export interface UseNarratorPanelWSOptions {
 	customApiProviderId?: string | null;
 	/** NUG provider ID for the current narrator model (used to sync quota back to NUG cache). */
 	nugProviderId?: string | null;
+	/** Current provider configuration generation; never infer it from an unscoped quota frame. */
+	nugProviderGeneration?: number | string;
 	/** Generic provider key for resetting runtime quota/payment state when provider changes. */
 	quotaProviderKey?: string | null;
 	/** Persisted substatus from narrator data — used to seed the reducer on mount so that
@@ -206,6 +220,7 @@ export interface UseNarratorPanelWSOptions {
 }
 
 export interface UseNarratorPanelWSReturn {
+	readScope: NarratorPanelReadScope;
 	// WS connection
 	connected: boolean;
 	disconnected: boolean;
@@ -356,6 +371,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		initialDetailedQuotaBalance,
 		customApiProviderId,
 		nugProviderId,
+		nugProviderGeneration,
 		quotaProviderKey,
 		narratorSubstatus,
 		onDraftChanged,
@@ -365,8 +381,19 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	const { t, i18n } = useTranslation("narrator");
 	const qc = useQueryClient();
 	const { data: currentUser } = useCurrentUser();
-	const panelScope = JSON.stringify([currentUser?.id ?? null, narratorId]);
+	const { generation: authGeneration } = useSyncExternalStore(
+		subscribeAuth,
+		getAuthSnapshot,
+		getAuthSnapshot,
+	);
+	const panelScope = JSON.stringify([authGeneration, currentUser?.id ?? null, narratorId]);
+	// Each mount owns its own pool, even when another panel reads the same narrator.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: identity changes retire the scope.
+	const readScope = useMemo(() => createNarratorPanelReadScope(), [panelScope]);
 	const connectionReconcileRef = useRef<PanelConnectionState | null>(null);
+	const lastStatusRef = useRef({ scope: panelScope, status: narratorStatus });
+	if (lastStatusRef.current.scope !== panelScope)
+		lastStatusRef.current = { scope: panelScope, status: narratorStatus };
 	const activeReconcileRef = useRef<{
 		controller: AbortController;
 		promise: Promise<void>;
@@ -648,7 +675,14 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		setQuotaBalance(initialQuotaBalance ?? null);
 		setDetailedQuotaBalance(initialDetailedQuotaBalance ?? null);
 		setPaymentRequired(null);
-	}, [narratorId, quotaProviderKey, initialQuotaBalance, initialDetailedQuotaBalance]);
+	}, [
+		narratorId,
+		quotaProviderKey,
+		nugProviderGeneration,
+		authGeneration,
+		initialQuotaBalance,
+		initialDetailedQuotaBalance,
+	]);
 	const [retryInfo, setRetryInfo] = useState<RetryInfo | null>(null);
 	const [quotaWaitInfo, setQuotaWaitInfo] = useState<QuotaWaitInfo | null>(null);
 	const [paymentRequired, setPaymentRequired] = useState<PaymentRequiredInfo | null>(null);
@@ -1031,7 +1065,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			) => {
 				removePendingPermission(requestId);
 				if (subagentNarratorId) {
-					qc.invalidateQueries({ queryKey: ["narrators", subagentNarratorId] });
+					qc.invalidateQueries({ queryKey: ["narrators", subagentNarratorId], exact: true });
 				}
 			},
 			// Live gate progress feeds the render-only store both renderers read from.
@@ -1175,7 +1209,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			onAsyncQuestionChanged: ({ change, question }) => {
 				applyAsyncQuestionChange(change, question);
 			},
-			onStatusChange: (status, turnStartedAt, eventSubstatus) => {
+			onStatusChange: (status, turnStartedAt, eventSubstatus, statusPatch) => {
 				clearRetryIfActive();
 				// A self-recovering wait is only meaningful while the narrator is still
 				// parked on it. Leaving `waiting` is the single signal that it ended —
@@ -1209,12 +1243,43 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				if (eventSubstatus !== undefined) {
 					narratorPatch.substatus = eventSubstatus;
 				}
+				if (statusPatch && Object.hasOwn(statusPatch, "messageCount")) {
+					narratorPatch.messageCount = statusPatch.messageCount;
+				}
+				const persistedFields = [
+					"substatus",
+					"turnStartedAt",
+					"updatedAt",
+					"errorMessage",
+					"errorRetryable",
+					"archivedWithNarratorId",
+					"backgroundWorkActive",
+				] as const;
+				for (const field of persistedFields) {
+					if (statusPatch && Object.hasOwn(statusPatch, field))
+						narratorPatch[field] = statusPatch[field];
+				}
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) => {
 					if (!old) return old;
 					if (typeof old.id === "string" && old.id !== narratorId) return old;
 					return { ...old, ...narratorPatch };
 				});
-				qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });
+				const previous = lastStatusRef.current.status;
+				lastStatusRef.current.status = status;
+				const wasRunning = previous === "working" || previous === "waiting";
+				const running = !isNotWorking;
+				const lifecycleChanged = previous !== status && (!wasRunning || !running);
+				const complete =
+					statusPatch &&
+					persistedFields.every(
+						(field) => field === "backgroundWorkActive" || Object.hasOwn(statusPatch, field),
+					);
+				// Legacy sparse producers need a bounded lifecycle recovery, not a read per status label.
+				if (!complete && lifecycleChanged)
+					void qc.invalidateQueries(
+						{ queryKey: ["narrators", narratorId], exact: true },
+						{ cancelRefetch: false },
+					);
 			},
 			onSubstatusChange: (newSubstatus) => {
 				const hasCompact = hasActiveCompactSubstatus(newSubstatus);
@@ -1244,7 +1309,13 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				setQueuedMessages(remaining);
 			},
 			onQueuedNewNarratorCreated: (_messageId, newNarratorId) => {
-				qc.invalidateQueries({ queryKey: ["narrators"] });
+				qc.invalidateQueries({
+					queryKey: ["narrators"],
+					// List filters and paginated lists only; never invalidate another
+					// narrator's detail children (tasks/current, file trees, etc.).
+					predicate: ({ queryKey }) =>
+						queryKey.length === 1 || typeof queryKey[1] === "object" || queryKey[1] === "paginated",
+				});
 				qc.invalidateQueries({ queryKey: ["narrators", newNarratorId], exact: true });
 				onQueuedNewNarratorCreated?.(newNarratorId);
 			},
@@ -1319,6 +1390,21 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				});
 			},
 			onQuotaBalance: (balance, detailedBalance) => {
+				// The callback owns its render/subscription generation, not whichever
+				// generation is current when an old socket frame finally arrives.
+				if (getAuthSnapshot().generation !== authGeneration) return;
+				const connectionIdentity = narratorWSManager.getConnectionCredentialIdentity();
+				if (
+					connectionIdentity !== undefined &&
+					connectionIdentity !== narratorWSManager.getCredentialIdentity()
+				)
+					return;
+				if (nugProviderId && nugProviderGeneration !== undefined)
+					void invalidateNugQuotaForIdentity(qc, {
+						providerId: nugProviderId,
+						generation: nugProviderGeneration,
+						authGeneration,
+					});
 				setQuotaBalance(balance);
 				setDetailedQuotaBalance(detailedBalance ?? null);
 				if (customApiProviderId) {
@@ -1389,7 +1475,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						? { resumeAt: info.resumeAt ?? null, quotaProvider: info.quotaProvider, waitKind }
 						: null,
 				);
-				qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
+				qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });
 				notifications.show({
 					id: `model-unavailable-${narratorId}`,
 					title: t(
@@ -1437,7 +1523,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
 					old ? { ...old, status: "working", substatus: [] } : old,
 				);
-				qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
+				qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });
 				notifications.show({
 					title: t(
 						transientPrefix
@@ -1547,7 +1633,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
 					old ? { ...old, substatus: withoutCompactingSubstatus(old.substatus) } : old,
 				);
-				qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
+				qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });
 				if (contextPercentAfter != null) {
 					notifications.show({
 						title: t(isSegment ? "segmentCompactSuccess" : "compactSuccess"),
@@ -1602,15 +1688,16 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				);
 			},
 			onSubagentSuspended: (subagentNarratorId: string) => {
-				qc.invalidateQueries({ queryKey: ["narrators", subagentNarratorId] });
+				qc.invalidateQueries({ queryKey: ["narrators", subagentNarratorId], exact: true });
 			},
 			onSubagentStatusChanged: (
 				subagentNarratorId: string,
 				status: string,
 				substatus?: string[],
 			) => {
-				// biome-ignore lint/suspicious/noExplicitAny: dynamic narrator shape
-				qc.setQueryData(["narrators", subagentNarratorId], (old: any) =>
+				const queryKey = ["narrators", subagentNarratorId];
+				const previous = qc.getQueryData<{ status?: string }>(queryKey)?.status;
+				qc.setQueryData(queryKey, (old: Record<string, unknown> | undefined) =>
 					old
 						? {
 								...old,
@@ -1620,7 +1707,10 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 							}
 						: old,
 				);
-				qc.invalidateQueries({ queryKey: ["narrators", subagentNarratorId] });
+				const wasRunning = previous === "working" || previous === "waiting";
+				const running = status === "working" || status === "waiting";
+				if (previous !== undefined && previous !== status && (!wasRunning || !running))
+					void qc.invalidateQueries({ queryKey, exact: true }, { cancelRefetch: false });
 			},
 			onSubagentWarning: (subagentNarratorId: string, info: NarratorWarningInfo) => {
 				const fallbackNotice = nativeMediaFallbackNotice(info, t);
@@ -1683,19 +1773,27 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	// --- Initial REST is shared with the composer; every WS connection edge closes its event gap. ---
 	const reconcilePanelState = useCallback(
 		(fresh = false) => {
+			// Principal hydration owns this boundary; do not read once anonymously and
+			// repeat the entire snapshot when auth/me supplies the actual owner.
+			if (!currentUser?.id || getAuthSnapshot().generation !== authGeneration)
+				return Promise.resolve();
 			if (!fresh && activeReconcileRef.current) return activeReconcileRef.current.promise;
 			reconcileRestartSchedulerRef.current?.cancel();
 			if (fresh) activeReconcileRef.current?.controller.abort();
 			const controller = new AbortController();
-			const timer = setTimeout(() => controller.abort(), 15_000);
+			const timer = setTimeout(() => {
+				controller.abort(new DOMException("Panel reconciliation timed out", "TimeoutError"));
+				if (isCurrent()) reconcileRestartSchedulerRef.current?.schedule();
+			}, 15_000);
 			const generation = permissionGenerationRef.current;
 			const lifecycle = permissionLifecycleRef.current;
 			const bufferEpoch = bufferEpochRef.current;
-			const alive = () =>
-				!controller.signal.aborted &&
+			const isCurrent = () =>
+				getAuthSnapshot().generation === authGeneration &&
 				permissionLifecycleRef.current === lifecycle &&
 				(qc.getQueryData<{ id?: string }>(["auth", "me"])?.id ?? null) ===
 					(currentUser?.id ?? null);
+			const alive = () => !controller.signal.aborted && isCurrent();
 			const onDiscard = () => {
 				if (alive()) requestPanelReconcileRef.current();
 			};
@@ -1730,16 +1828,16 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						onDiscard,
 					);
 					applyBuffer(snapshot.buffer, !snapshot.hasMore.buffer);
-					// Draft metadata rides every page; the composer no-ops it unless it
-					// proves a live draft_changed was missed while disconnected.
-					onDraftMetaRef.current?.(snapshot.draft);
+					// Initial metadata belongs solely to Composer hydration. Only recovery
+					// reads can announce a missed update, avoiding a second initial body GET.
+					if (fresh) onDraftMetaRef.current?.(snapshot.draft);
 				},
-				{ signal: controller.signal, fresh },
+				{ signal: controller.signal, fresh, readScope },
 			)
 				.catch(async (error) => {
 					if (!alive() || !shouldFallbackPanelState(error)) return;
 					// Independent fallbacks: a draft/network failure must never hide safety permissions.
-					await Promise.allSettled([
+					const fallbacks = await Promise.allSettled([
 						api.getPendingPermissions(narratorId, controller.signal).then((permissions) => {
 							if (alive())
 								replacePendingPermissions(permissions, generation, lifecycle, true, onDiscard);
@@ -1748,6 +1846,13 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 							.getBufferedMessages(narratorId, controller.signal)
 							.then((messages) => applyBuffer(messages ?? [])),
 					]);
+					if (
+						alive() &&
+						fallbacks.some(
+							(result) => result.status === "rejected" && shouldFallbackPanelState(result.reason),
+						)
+					)
+						reconcileRestartSchedulerRef.current?.schedule();
 				})
 				.finally(() => {
 					clearTimeout(timer);
@@ -1757,7 +1862,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			activeReconcileRef.current = { controller, promise, generation, lifecycle, bufferEpoch };
 			return promise;
 		},
-		[narratorId, replacePendingPermissions, qc, currentUser?.id],
+		[narratorId, replacePendingPermissions, qc, currentUser?.id, authGeneration, readScope],
 	);
 	reconcilePanelStateRef.current = reconcilePanelState;
 	requestPanelReconcileRef.current = () => {
@@ -1774,26 +1879,44 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	};
 
 	useEffect(() => {
-		const transition = panelConnectionRead(connectionReconcileRef.current, panelScope, connected);
-		connectionReconcileRef.current = transition.state;
-		if (!transition.read) return;
-		if (transition.read === "fresh") {
-			bumpPermissionGeneration();
-			bumpBufferEpoch();
-		}
-		void reconcilePanelState(transition.read === "fresh");
-	}, [panelScope, connected, reconcilePanelState, bumpPermissionGeneration, bumpBufferEpoch]);
-
-	// --- Fallback polling for permissions ---
-	useEffect(() => {
-		if (narratorStatus !== "waiting" || pendingPermissions.length > 0) return;
-		const poll = () => {
-			void reconcilePanelState();
+		const observe = (isConnected: boolean) => {
+			const transition = panelConnectionRead(
+				connectionReconcileRef.current,
+				panelScope,
+				isConnected,
+			);
+			connectionReconcileRef.current = transition.state;
+			if (!transition.read) return;
+			if (transition.read === "fresh") {
+				bumpPermissionGeneration();
+				bumpBufferEpoch();
+			}
+			void reconcilePanelState(transition.read === "fresh");
 		};
-		poll();
-		const timer = setInterval(poll, 5000);
+		// Observe raw edges: React may batch false→true back to the same boolean.
+		const unsubscribe = narratorWSManager.onConnectionChange(observe);
+		observe(narratorWSManager.connected);
+		return unsubscribe;
+	}, [panelScope, reconcilePanelState, bumpPermissionGeneration, bumpBufferEpoch]);
+
+	useEffect(
+		() =>
+			narratorWSManager.onControlPlaneRecovery(() => {
+				bumpPermissionGeneration();
+				bumpBufferEpoch();
+				void reconcilePanelState(true);
+			}),
+		[reconcilePanelState, bumpPermissionGeneration, bumpBufferEpoch],
+	);
+
+	// Only a visible, disconnected waiting page needs the rate-limited safety fallback.
+	// The initial/connection-edge reads above already cover entry; do not add an immediate poll.
+	useEffect(() => {
+		if (connected || !pageVisible || narratorStatus !== "waiting" || pendingPermissions.length > 0)
+			return;
+		const timer = setInterval(() => void reconcilePanelState(), 5000);
 		return () => clearInterval(timer);
-	}, [narratorStatus, pendingPermissions.length, reconcilePanelState]);
+	}, [connected, pageVisible, narratorStatus, pendingPermissions.length, reconcilePanelState]);
 
 	// --- Mark "done" narrator as read ---
 	const hasUnreadSubstatus = substatus.includes("unread");
@@ -1840,6 +1963,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 
 	return useMemo(
 		() => ({
+			readScope,
 			connected,
 			disconnected,
 			reconnect,
@@ -1878,6 +2002,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			viewers,
 		}),
 		[
+			readScope,
 			connected,
 			disconnected,
 			reconnect,

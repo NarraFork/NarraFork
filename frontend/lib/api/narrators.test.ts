@@ -27,6 +27,104 @@ describe("narrators API", () => {
 	});
 
 	test.each([
+		false,
+		true,
+	])("submission identity and authored document cross JSON/multipart transport (%s)", async (multipart) => {
+		Object.defineProperty(g, "localStorage", {
+			configurable: true,
+			value: { getItem: () => null },
+		});
+		const requests: RequestInit[] = [];
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async (_url: unknown, init: RequestInit) => {
+				requests.push(init);
+				return Response.json({ id: "accepted" });
+			},
+		});
+		const document: ComposerDocument = {
+			version: 1,
+			assets: [],
+			paragraphs: [
+				{
+					children: [
+						{
+							type: "narratorReference",
+							id: "atom",
+							narratorId: "stable-target",
+							label: "A title",
+						},
+					],
+				},
+			],
+		};
+		const originalXHR = Object.getOwnPropertyDescriptor(globalThis, "XMLHttpRequest");
+		class TestXHR {
+			status = 200;
+			statusText = "OK";
+			responseText = '{"id":"accepted"}';
+			onload: (() => void) | null = null;
+			open() {}
+			setRequestHeader() {}
+			getAllResponseHeaders() {
+				return "Content-Type: application/json";
+			}
+			send(body: FormData) {
+				requests.push({ body });
+				queueMicrotask(() => this.onload?.());
+			}
+		}
+		Object.defineProperty(globalThis, "XMLHttpRequest", { configurable: true, value: TestXHR });
+		try {
+			await api.sendNarratorMessage(
+				"source",
+				"[@A title](nf-agent://open?id=stable-target)",
+				undefined,
+				multipart ? [new File(["note"], "notes.txt")] : undefined,
+				false,
+				undefined,
+				undefined,
+				[],
+				false,
+				"turn",
+				{ composerDocument: document, clientSubmissionId: "submission-id" },
+			);
+			const body = requests[0].body;
+			const data =
+				body instanceof FormData
+					? {
+							clientSubmissionId: body.get("clientSubmissionId"),
+							composerDocument: JSON.parse(String(body.get("composerDocument"))),
+						}
+					: JSON.parse(String(body));
+			expect(data.clientSubmissionId).toBe("submission-id");
+			expect(data.composerDocument).toEqual(document);
+		} finally {
+			if (originalXHR) Object.defineProperty(globalThis, "XMLHttpRequest", originalXHR);
+			else Reflect.deleteProperty(globalThis, "XMLHttpRequest");
+		}
+	});
+
+	test("receipt GET has one canonical encoded endpoint and no send side effects", async () => {
+		Object.defineProperty(g, "localStorage", {
+			configurable: true,
+			value: { getItem: () => null },
+		});
+		const calls: { url: string; init: RequestInit }[] = [];
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async (url: unknown, init: RequestInit) => {
+				calls.push({ url: String(url), init });
+				return Response.json({ status: "accepted", id: "receipt" });
+			},
+		});
+		await api.getNarratorSubmissionReceipt("source/id", "submission/id");
+		expect(calls).toHaveLength(1);
+		expect(calls[0].url).toBe("/api/narrators/source%2Fid/submissions/submission%2Fid");
+		expect(calls[0].init.method ?? "GET").toBe("GET");
+	});
+
+	test.each([
 		undefined,
 		{ fork: true, calibrate: true },
 	])("modeltrace posts once with options %j", async (options) => {
@@ -67,6 +165,26 @@ describe("narrators API", () => {
 		expect(requests[0].url).toBe("/api/narrators/child%2Fa/modeltrace/retry");
 		expect(requests[0].init.method).toBe("POST");
 		expect(requests[0].init.body).toBeUndefined();
+	});
+
+	test("modeltrace calibration posts the result ID to the encoded child endpoint", async () => {
+		Object.defineProperty(g, "localStorage", {
+			value: { getItem: () => null },
+			configurable: true,
+		});
+		const requests: Array<{ url: string; init: RequestInit }> = [];
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async (url: unknown, init: RequestInit) => {
+				requests.push({ url: String(url), init });
+				return Response.json({ id: "child/a" });
+			},
+		});
+		expect(await api.calibrateModelTrace("child/a", "result/a")).toEqual({ id: "child/a" });
+		expect(requests).toHaveLength(1);
+		expect(requests[0].url).toBe("/api/narrators/child%2Fa/modeltrace/calibrate");
+		expect(requests[0].init.method).toBe("POST");
+		expect(JSON.parse(String(requests[0].init.body))).toEqual({ resultId: "result/a" });
 	});
 
 	test("message and block deletions are always history-only", async () => {

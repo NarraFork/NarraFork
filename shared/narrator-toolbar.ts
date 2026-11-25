@@ -37,6 +37,7 @@
  */
 export const NARRATOR_TOOLBAR_IDS = [
 	"tasks",
+	"communication",
 	"filetree",
 	"details",
 	"terminal",

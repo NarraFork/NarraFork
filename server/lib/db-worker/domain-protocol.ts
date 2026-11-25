@@ -1,11 +1,17 @@
 import type { readPublicationTerminalResultTask } from "../../services/agent-runtime/publication-reader";
+import { RECALL_ORIGINS, RECALL_ROLES } from "../recall-contract";
 import type { ComposerDocumentMetadata, ComposerDocumentParams } from "./composer-document-query";
 import { DbReadError } from "./errors";
 import type { readEditorOperationEvidence, readRevertPlan } from "./file-read-snapshots";
 import type { readIntegrationAuthoritySnapshotTask } from "./integration-authority-read-task";
 import type { readKnowledgeEntryDetail } from "./knowledge-entry-reader";
 import type { ReadBudgetMeter } from "./read-budget";
-import type { readRecallConversation, readRecallToolCallDetail } from "./recall-reader";
+import type {
+	readRecallConversation,
+	readRecallMessage,
+	readRecallToolCallDetail,
+	readRecallToolCallPage,
+} from "./recall-reader";
 import type { ToolDetailMetadata, ToolDetailSnapshotParams } from "./tool-detail-query";
 import { TOOL_DETAIL_PAYLOAD_BYTE_LIMIT } from "./tool-detail-selection";
 
@@ -29,6 +35,14 @@ interface SyncDomainReadTaskMap {
 	recallToolCallDetail: {
 		params: Parameters<typeof readRecallToolCallDetail>[1];
 		result: ReturnType<typeof readRecallToolCallDetail>;
+	};
+	recallMessage: {
+		params: Parameters<typeof readRecallMessage>[1];
+		result: ReturnType<typeof readRecallMessage>;
+	};
+	recallToolCallPage: {
+		params: Parameters<typeof readRecallToolCallPage>[1];
+		result: ReturnType<typeof readRecallToolCallPage>;
 	};
 	editorOperationEvidence: {
 		params: Parameters<typeof readEditorOperationEvidence>[1];
@@ -183,17 +197,104 @@ export const DOMAIN_READ_DEFINITIONS: { [K in DomainReadTaskKind]: DomainDefinit
 			nullableId(input.narratorId),
 	},
 	recallConversation: {
-		maxInputBytes: 1024,
+		maxInputBytes: 4096,
 		maxResultBytes: 4 * 1024 * 1024,
 		maxArrayItems: 10_000,
+		validate: (input) => {
+			if (
+				!record(input) ||
+				Object.keys(input).some(
+					(key) =>
+						![
+							"narratorId",
+							"messageId",
+							"limit",
+							"direction",
+							"cursor",
+							"roles",
+							"origins",
+							"createdFrom",
+							"createdTo",
+							"includeToolCalls",
+						].includes(key),
+				) ||
+				!boundedId(input.narratorId) ||
+				!nullableId(input.messageId) ||
+				!Number.isInteger(input.limit) ||
+				Number(input.limit) < 1 ||
+				Number(input.limit) > 50
+			)
+				return false;
+			const enums = (value: unknown, choices: readonly string[]) =>
+				value === undefined ||
+				(Array.isArray(value) &&
+					value.length > 0 &&
+					value.length <= choices.length &&
+					value.every((item) => typeof item === "string" && choices.includes(item)) &&
+					new Set(value).size === value.length);
+			const date = (value: unknown) =>
+				value === undefined ||
+				(typeof value === "string" && value.length <= 40 && Number.isFinite(Date.parse(value)));
+			return (
+				enums(input.roles, RECALL_ROLES) &&
+				enums(input.origins, RECALL_ORIGINS) &&
+				(input.direction === undefined ||
+					["older", "newer", "around"].includes(String(input.direction))) &&
+				(input.cursor === undefined ||
+					(Number.isSafeInteger(input.cursor) && Number(input.cursor) >= 0) ||
+					(record(input.cursor) &&
+						Object.keys(input.cursor).length === 2 &&
+						Object.hasOwn(input.cursor, "seq") &&
+						Object.hasOwn(input.cursor, "messageId") &&
+						Number.isSafeInteger(input.cursor.seq) &&
+						Number(input.cursor.seq) >= 0 &&
+						boundedId(input.cursor.messageId))) &&
+				(input.includeToolCalls === undefined || typeof input.includeToolCalls === "boolean") &&
+				date(input.createdFrom) &&
+				date(input.createdTo) &&
+				!(
+					input.createdFrom &&
+					input.createdTo &&
+					Date.parse(String(input.createdFrom)) > Date.parse(String(input.createdTo))
+				) &&
+				!(
+					input.messageId &&
+					(input.cursor !== undefined || (input.direction && input.direction !== "around"))
+				) &&
+				!(input.direction === "around" && !input.messageId)
+			);
+		},
+	},
+	recallMessage: {
+		maxInputBytes: 1024,
+		maxResultBytes: 512 * 1024,
+		maxArrayItems: 10000,
 		validate: (input) =>
 			record(input) &&
-			Object.keys(input).length === 3 &&
+			Object.keys(input).length === 4 &&
 			boundedId(input.narratorId) &&
-			nullableId(input.messageId) &&
-			Number.isInteger(input.limit) &&
-			Number(input.limit) >= 1 &&
-			Number(input.limit) <= 50,
+			boundedId(input.messageId) &&
+			Number.isSafeInteger(input.offset) &&
+			Number(input.offset) >= 0 &&
+			Number.isInteger(input.maxChars) &&
+			Number(input.maxChars) >= 1 &&
+			Number(input.maxChars) <= 20000,
+	},
+	recallToolCallPage: {
+		maxInputBytes: 1024,
+		maxResultBytes: 512 * 1024,
+		maxArrayItems: 10000,
+		validate: (input) =>
+			record(input) &&
+			Object.keys(input).length === 5 &&
+			boundedId(input.toolCallId) &&
+			nullableId(input.narratorId) &&
+			["both", "input", "output"].includes(String(input.part)) &&
+			Number.isSafeInteger(input.offset) &&
+			Number(input.offset) >= 0 &&
+			Number.isInteger(input.maxChars) &&
+			Number(input.maxChars) >= 1 &&
+			Number(input.maxChars) <= 20000,
 	},
 	editorOperationEvidence: {
 		maxInputBytes: 2048,

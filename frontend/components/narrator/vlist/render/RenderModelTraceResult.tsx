@@ -1,11 +1,81 @@
+import { narratorsApi } from "@frontend/lib/api/narrators";
 import { formatLocaleNumber } from "@frontend/lib/intl-format";
-import { Box, Group, Progress, Stack, Text } from "@mantine/core";
+import { Box, Button, Group, Progress, Stack, Text } from "@mantine/core";
 import type { ModelTraceResultBlock } from "@shared/modeltrace-result";
+import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { MODELTRACE_LAYOUT as C, modelTraceRowHeight } from "../measure/measure-modeltrace-result";
+import {
+	MODELTRACE_LAYOUT as C,
+	hasIncompleteCalibration,
+	modelTraceRowHeight,
+} from "../measure/measure-modeltrace-result";
 import type { MeasuredElement, PreparedFixedBlock } from "../prepared-block";
 
-export function RenderModelTraceResult({ measured }: { measured: MeasuredElement }) {
+function CalibrationAction({
+	narratorId,
+	resultId,
+	continuing,
+}: {
+	narratorId: string;
+	resultId: string;
+	continuing: boolean;
+}) {
+	const { t } = useTranslation("narrator");
+	const submitting = useRef(false);
+	const [status, setStatus] = useState<"idle" | "submitting" | "requested">("idle");
+	const [error, setError] = useState<string>();
+	const calibrate = async () => {
+		if (submitting.current || status === "requested") return;
+		submitting.current = true;
+		setStatus("submitting");
+		setError(undefined);
+		try {
+			// The narrator message stream delivers progress and the new result card.
+			await narratorsApi.calibrateModelTrace(narratorId, resultId);
+			setStatus("requested");
+		} catch (cause) {
+			setError(
+				cause instanceof Error && cause.message ? cause.message : t("modelTraceCalibrateFailed"),
+			);
+			setStatus("idle");
+		} finally {
+			submitting.current = false;
+		}
+	};
+	return (
+		<Group h={C.calibration} gap="xs" wrap="nowrap" style={{ minWidth: 0 }}>
+			<Button
+				size="compact-xs"
+				variant="light"
+				loading={status === "submitting"}
+				disabled={status !== "idle"}
+				onClick={calibrate}
+				style={{ maxWidth: "100%", flexShrink: 0 }}
+			>
+				{t(
+					status === "requested"
+						? "modelTraceCalibrationRequested"
+						: continuing
+							? "modelTraceContinueCalibration"
+							: "modelTraceCalibrate",
+				)}
+			</Button>
+			{error && (
+				<Text role="alert" fz={11} c="red" truncate title={error} style={{ minWidth: 0 }}>
+					{error}
+				</Text>
+			)}
+		</Group>
+	);
+}
+
+export function RenderModelTraceResult({
+	measured,
+	calibrationNarratorId,
+}: {
+	measured: MeasuredElement;
+	calibrationNarratorId?: string;
+}) {
 	const { t, i18n } = useTranslation("narrator");
 	const block = measured.blocks[0] as PreparedFixedBlock | undefined;
 	if (!block || block.kind !== "fixed") return null;
@@ -13,11 +83,13 @@ export function RenderModelTraceResult({ measured }: { measured: MeasuredElement
 	const footnote = data.decision === "partial" ? t("modelTracePartial") : t("modelTraceFootnote");
 	const emptyMessage =
 		data.error ||
-		(data.decision === "not_model"
-			? t("modelTraceNotModel")
-			: data.decision === "unscorable"
-				? t("modelTraceUnscorable")
-				: t("modelTraceUnavailable"));
+		(data.progressOnly
+			? t("modelTraceSampling")
+			: data.decision === "not_model"
+				? t("modelTraceNotModel")
+				: data.decision === "unscorable"
+					? t("modelTraceUnscorable")
+					: t("modelTraceUnavailable"));
 	const cacheNote = data.cacheReadTokens?.length
 		? t("modelTraceCacheReads", {
 				reads: data.cacheReadTokens
@@ -30,9 +102,7 @@ export function RenderModelTraceResult({ measured }: { measured: MeasuredElement
 			})
 		: undefined;
 	const notes = [
-		data.calibrationRequested && data.decision !== "scored"
-			? t("modelTraceCalibrationIncomplete")
-			: undefined,
+		hasIncompleteCalibration(data) ? t("modelTraceCalibrationIncomplete") : undefined,
 		cacheNote,
 	];
 	return (
@@ -105,10 +175,38 @@ export function RenderModelTraceResult({ measured }: { measured: MeasuredElement
 						</Text>
 					</>
 				) : (
-					<Text fz={12} lh={`${C.name}px`} h={C.name} c="red" truncate title={emptyMessage}>
+					<Text
+						fz={12}
+						lh={`${C.name}px`}
+						h={C.name}
+						c={data.progressOnly && !data.error ? "dimmed" : "red"}
+						truncate
+						title={emptyMessage}
+					>
 						{emptyMessage}
 					</Text>
 				)}
+				{data.sampleProgress?.map((slot, index) => {
+					const state = t(`modelTraceSampleState.${slot.state}`);
+					const label = t("modelTraceSampleSlot", { slot: index + 1, state });
+					const attempt = slot.attempt && t("modelTraceSampleAttempt", { attempt: slot.attempt });
+					const description = [label, attempt, slot.text].filter(Boolean).join(" · ");
+					return (
+						<Text
+							// biome-ignore lint/suspicious/noArrayIndexKey: fixed protocol slots never reorder
+							key={index + 1}
+							data-modeltrace-sample-state={slot.state}
+							fz={11}
+							lh={`${C.footnote}px`}
+							h={C.footnote}
+							c={slot.state === "failed" ? "red" : "dimmed"}
+							truncate
+							title={description}
+						>
+							{description}
+						</Text>
+					);
+				})}
 				{notes.map(
 					(note) =>
 						note && (
@@ -124,6 +222,14 @@ export function RenderModelTraceResult({ measured }: { measured: MeasuredElement
 								{note}
 							</Text>
 						),
+				)}
+				{data.calibrationId && calibrationNarratorId && (
+					<CalibrationAction
+						key={JSON.stringify([calibrationNarratorId, data.calibrationId])}
+						narratorId={calibrationNarratorId}
+						resultId={data.calibrationId}
+						continuing={data.calibrationRequested === true}
+					/>
 				)}
 			</Stack>
 		</Box>

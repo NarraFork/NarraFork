@@ -109,6 +109,7 @@ import {
 	withRuntimePolicyTrait,
 } from "../lib/runtime-policy-trait";
 import {
+	addressableTeamMembersWhere,
 	modelPoolKeyOf,
 	policySourceIdOf,
 	type RuntimeSourceRow,
@@ -158,6 +159,11 @@ import { assertNarratorAccess, type NarratorAccessNeed } from "./narrator-acl";
 import { newEnvelopeColumns } from "./narrator-block-sync";
 import { contentJsonSql, fillBodies } from "./narrator-body-reads";
 import { insertEnvelope, writeEnvelopeBody } from "./narrator-body-writes";
+import { publishCommunicationChanged } from "./narrator-communication/service";
+import {
+	detachCommunicationBeforeDeleteTx,
+	ensureCommunicationNodeTx,
+} from "./narrator-communication/store";
 import { isFormerChapterSessionWithoutDirectory, resolveNarratorSessionCwd } from "./narrator-cwd";
 import { buildSystemInjectionBlock, type SystemInjectionBlock } from "./narrator-injection";
 import { DEFAULT_TOOL_IO_BUDGET, narratorMessageQueries, truncateJson } from "./narrator-messages";
@@ -190,6 +196,7 @@ import { syncNarratorProjectLinksSafely } from "./project-index";
 import { resolveSkillContextForNarrator } from "./skill-service";
 import { specVfsService } from "./spec-vfs-service";
 import { removeUploadDirectoryWithoutMedia } from "./storage-service";
+import { storedTitleSlug } from "./subagent-alias";
 import { defaultTaskBackendForNewSession } from "./task-source";
 import { readTaskBackend } from "./task-source/backend";
 import { assertTeamRemovable, deleteTeamOfNarratorInTransaction } from "./teams/team-records";
@@ -1157,17 +1164,41 @@ export async function handleBashCommand(
 	}
 	bashControllers.add(bashAbort);
 
+	let executionStartedAt = streamStartedAt;
 	const progressTimer = setInterval(() => {
 		broadcastToNarrator(narratorId, {
 			type: "tool_progress",
 			narratorId,
 			toolUseId,
-			elapsed: Math.floor((Date.now() - streamStartedAt) / 1000),
+			elapsed: Math.floor((Date.now() - executionStartedAt) / 1000),
 		});
 	}, 5000);
 
 	let result: Awaited<ReturnType<typeof bashTool.execute>>;
 	try {
+		// Direct commands bypass the agent executor: persist the execution boundary
+		// before tool I/O, and use that same timestamp for live and settled views.
+		const [started] = await db
+			.update(narratorToolCalls)
+			.set({
+				executionStartedAt: sql`coalesce(${narratorToolCalls.executionStartedAt}, ${new Date().toISOString()})`,
+			})
+			.where(
+				and(
+					eq(narratorToolCalls.id, toolCallId),
+					eq(narratorToolCalls.narratorId, narratorId),
+					eq(narratorToolCalls.toolUseId, toolUseId),
+				),
+			)
+			.returning({ executionStartedAt: narratorToolCalls.executionStartedAt });
+		if (!started?.executionStartedAt) throw new NotFoundError("Tool call", toolCallId);
+		executionStartedAt = Date.parse(started.executionStartedAt);
+		broadcastToNarrator(narratorId, {
+			type: "tool_executing",
+			narratorId,
+			toolUseId,
+			executionStartedAt,
+		});
 		result = await bashTool.execute(toolInput, {
 			narratorId,
 			cwd,
@@ -1211,7 +1242,7 @@ export async function handleBashCommand(
 	}
 
 	const completedAt = Date.now();
-	const durationMs = completedAt - streamStartedAt;
+	const durationMs = completedAt - executionStartedAt;
 	const status = result.isError ? "fail" : "success";
 	const persistedOutput = encodeToolOutput(result.output, { metadata: result.metadata });
 	const toolResultBlock = {
@@ -1229,7 +1260,7 @@ export async function handleBashCommand(
 			status,
 			errorMessage: result.isError ? result.output : undefined,
 			durationMs,
-			executionStartedAt: streamStartedAt,
+			executionStartedAt,
 			completedAt,
 			onPersist: (tx) => {
 				writeEnvelopeBody(tx, assistantMsgId, [toolUseBlock, toolResultBlock], {
@@ -1743,6 +1774,7 @@ export async function prepareNarratorCreation(
 			inheritMode: "fresh",
 			status: "idle",
 			title: input.title ?? null,
+			titleSlug: storedTitleSlug(input.title),
 			createdAt: now,
 			updatedAt: now,
 		},
@@ -1893,11 +1925,14 @@ export function createPreparedNarratorInTransaction(
 	assertCreationProject(executor, creationProjectObservations.get(prepared.row));
 	assertHandleFree(executor, prepared.handleFold);
 	for (const target of admission.target) assertWorkspaceAdmission(target);
-	return executor.insert(narrators).values(prepared.row).returning().get();
+	const narrator = executor.insert(narrators).values(prepared.row).returning().get();
+	ensureCommunicationNodeTx(executor, narrator.id, null);
+	return narrator;
 }
 
 /** Publish non-transactional narrator creation side effects after commit. */
 export function publishNarratorCreated(narrator: typeof narrators.$inferSelect): void {
+	publishCommunicationChanged([narrator.id]);
 	backgroundOccupancyStore.refreshNarrator(narrator.id);
 	logger.info("Narrator created", {
 		id: narrator.id,
@@ -2130,7 +2165,7 @@ export const narratorService = {
 						],
 					);
 					assertOrigin?.(tx);
-					return tx
+					const created = tx
 						.insert(narrators)
 						.values({
 							id,
@@ -2141,6 +2176,7 @@ export const narratorService = {
 							traits: subTraits,
 							enabledTools: preloadTools.length > 0 ? preloadTools : undefined,
 							title: input.title ?? null,
+							titleSlug: storedTitleSlug(input.title),
 							model: storedModel,
 							systemPrompt: input.systemPrompt ?? null,
 							permissionMode: resolvedPermMode,
@@ -2197,8 +2233,11 @@ export const narratorService = {
 						})
 						.returning()
 						.all();
+					ensureCommunicationNodeTx(tx, id, input.parentNarratorId);
+					return created;
 				});
 
+				publishCommunicationChanged([id, input.parentNarratorId]);
 				backgroundOccupancyStore.refreshNarrator(id);
 				// A nested helper's permission and reflection frames also reach its root's page.
 				rememberNestedSubagentRoot(narrator);
@@ -2256,10 +2295,11 @@ export const narratorService = {
 	},
 
 	/**
-	 * Every team member's selector handles, for explicit Send/Await/ContextAsk
-	 * selector resolution and the TeamStatus bash scope. The membership is unbounded
-	 * on purpose — dropping a member would resolve a selector wrongly — but each row
-	 * is not: only `id`/`title`/`traits` are read, which is all
+	 * Addressable team members' selector handles, for explicit Send/Await/Watch
+	 * selector resolution and the TeamStatus bash scope. Archived members are
+	 * omitted: they are finished and no longer part of the team the caller can
+	 * address, so a selector must not land on them. Idle, working and waiting
+	 * members stay. Each row is only `id`/`title`/`traits`, which is all
 	 * `subagentMatchesSelector` and `agentLabelFromNarrator` look at. Callers re-read
 	 * the one matched target with `getById`. Reading full rows here pulled every
 	 * member's `systemPrompt`/`contextSummary` and blew the query result budget on
@@ -2289,7 +2329,7 @@ export const narratorService = {
 					.from(narrators)
 					.where(
 						and(
-							teamMembersWhere(rootId),
+							addressableTeamMembersWhere(rootId),
 							cursor
 								? or(
 										sql`${narrators.createdAt} > ${cursor.createdAt}`,
@@ -2871,9 +2911,11 @@ export const narratorService = {
 				.run();
 			// The team row restricts the narrator delete; its finished items and events cascade.
 			deleteTeamOfNarratorInTransaction(tx, narratorId);
+			detachCommunicationBeforeDeleteTx(tx, narratorId);
 			tx.delete(narrators).where(eq(narrators.id, narratorId)).run();
 			return transition;
 		});
+		publishCommunicationChanged([narratorId]);
 		backgroundOccupancyStore.removeNarrators([narratorId]);
 		backgroundOccupancyStore.refreshNarrators(survivingForks.map((child) => child.id));
 		// FK cascades remove durable questions without emitting their own lifecycle frames.
@@ -3034,12 +3076,14 @@ export const narratorService = {
 								inheritMode: "full",
 								status: "idle",
 								title: opts?.title ?? null,
+								titleSlug: storedTitleSlug(opts?.title),
 								createdAt: now,
 								updatedAt: now,
 							})
 							.returning()
 							.get();
 
+						ensureCommunicationNodeTx(tx, id, null);
 						copyForkAccessAndRules(tx, parentNarratorId, id);
 
 						// Re-read selected refs in this synchronous transaction. A compact can
@@ -3279,6 +3323,7 @@ export const narratorService = {
 								contextToolsChars: inheritMode === "full" ? parent.contextToolsChars : 0,
 								status: "idle",
 								title: opts?.title ?? null,
+								titleSlug: storedTitleSlug(opts?.title),
 								createdAt: now,
 								updatedAt: now,
 							})
@@ -3538,6 +3583,7 @@ export const narratorService = {
 								.run();
 						}
 
+						ensureCommunicationNodeTx(tx, id, null);
 						copyForkAccessAndRules(tx, parentNarratorId, id);
 
 						const finalNarrator = tx.query.narrators

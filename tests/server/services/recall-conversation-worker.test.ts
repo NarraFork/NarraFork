@@ -63,7 +63,7 @@ function trackMainQueries() {
 
 afterEach(() => mock.restore());
 
-test("reads the inclusive anchor window and summarizes only the current narrator's tools off-thread", async () => {
+test("reads a strict anchor page and opt-in target-owned tool summaries off-thread", async () => {
 	const self = narrator("Self");
 	const other = narrator("Other");
 	const exactText = `hello\0${"写😄".repeat(200)}`;
@@ -74,13 +74,12 @@ test("reads the inclusive anchor window and summarizes only the current narrator
 	const visible = call(self, current, "/example/visible.txt");
 	const trace = trackMainQueries();
 
-	const result = await read(self, { message_id: current, limit: 2 });
+	const result = await read(self, { message_id: current, limit: 2, include_tool_calls: true });
 	expect(result.metadata).toMatchObject({
 		narratorId: self,
 		messages: [
-			{ id: shared, seq: 1, text: exactText.slice(0, 500) },
+			{ id: shared, seq: 1, text: Array.from(exactText).slice(0, 500).join("") },
 			{ id: current, seq: 2, toolCalls: [{ toolUseId: visible, summary: "visible.txt" }] },
-			{ id: last, seq: 3 },
 		],
 	});
 	expect(result.output).not.toContain("nonvisible.txt");
@@ -105,8 +104,13 @@ test("keeps cross-narrator scope and exact message-reference checks", async () =
 
 test("rejects an over-budget result rather than returning a truncated tool summary", async () => {
 	const self = narrator("Self");
-	call(self, message(self, "text", 1), "x".repeat(2 * 1024 * 1024));
-	await expect(read(self)).rejects.toThrow("Recall conversation exceeds its read budget");
+	call(self, message(self, "text", 1), "large");
+	sqlite
+		.query(
+			"UPDATE narrator_tool_calls SET input_json=CAST(zeroblob(?) AS TEXT) WHERE narrator_id=?",
+		)
+		.run(64 * 1024 * 1024 + 1, self);
+	await expect(read(self, { include_tool_calls: true })).rejects.toThrow("budget");
 });
 
 test("propagates Worker failures and cancellation without reading on the main thread", async () => {

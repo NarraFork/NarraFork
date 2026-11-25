@@ -185,6 +185,7 @@ export function NugRechargeDialog({
 						},
 					};
 				});
+				qc.invalidateQueries({ queryKey: ["nug", "quota", providerId] });
 				qc.invalidateQueries({ queryKey: ["settings"] });
 				qc.invalidateQueries({ queryKey: ["admin", "settings"] });
 				notifications.show({

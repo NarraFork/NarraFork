@@ -1,8 +1,8 @@
-import { useInstanceSettings } from "@frontend/hooks/useInstanceSettings";
 import {
 	useNarratorComposerOptimizeTask,
 	usePromptOptimizeTask,
 } from "@frontend/hooks/usePromptOptimizeTask";
+import { useRuntimeSettings } from "@frontend/hooks/useRuntimeSettings";
 import {
 	acknowledgePromptOptimizeDelivery,
 	cancelPromptOptimizeTask,
@@ -68,15 +68,14 @@ export interface UsePromptOptimizeResult {
 
 export function usePromptOptimize(options: UsePromptOptimizeOptions): UsePromptOptimizeResult {
 	const { t } = useTranslation("narrator");
-	const is = useInstanceSettings();
-	const [contextMessageCount, setContextMessageCount] = useState(
-		is.promptOptimizeContextMaxMessages,
-	);
+	const { data: settings } = useRuntimeSettings();
+	const defaultContextMessageCount = settings?.agent.promptOptimizeContextMaxMessages ?? 3;
+	const [contextMessageCount, setContextMessageCount] = useState(defaultContextMessageCount);
 
 	// Sync with settings when it changes
 	useEffect(() => {
-		setContextMessageCount(is.promptOptimizeContextMaxMessages);
-	}, [is.promptOptimizeContextMaxMessages]);
+		setContextMessageCount(defaultContextMessageCount);
+	}, [defaultContextMessageCount]);
 
 	const [withContext, setWithContext] = useState(() => {
 		try {

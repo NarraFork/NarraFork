@@ -87,10 +87,15 @@ mock.module("@mantine/hooks", () => ({
 	},
 }));
 mock.module("react-i18next", () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
+const queryClient = { invalidateQueries: async () => {} };
+const instanceSettings = { paths: { defaultProjectDir: "/instance" }, agent: {} };
 mock.module("@tanstack/react-query", () => ({
 	useMutation: () => mutation,
-	useQuery: () => ({ data: { paths: { defaultProjectDir: "/instance" }, agent: {} } }),
-	useQueryClient: () => ({ invalidateQueries: () => {} }),
+	useQuery: ({ queryKey, enabled }: { queryKey: readonly unknown[]; enabled?: boolean }) => ({
+		// Settings are the only seeded query; anonymous me/preferences observers have no data.
+		data: enabled !== false && queryKey[0] === "settings" ? instanceSettings : undefined,
+	}),
+	useQueryClient: () => queryClient,
 }));
 mock.module("@mantine/notifications", () => ({
 	notifications: { show: () => {} },
@@ -120,7 +125,15 @@ mock.module("../../hooks/useProjectDirStatus", () => ({
 const create = mock((_data: unknown, _options?: unknown) => {});
 const update = mock((_data: unknown, _options?: unknown) => {});
 const createProject = mock((_data: unknown, _options?: unknown) => {});
-const mutation = { mutate: mock(() => {}), reset: mock(() => {}), isPending: false };
+// The real preferences hook unwraps { patch, auth } only after a mutation starts.
+const mutation = {
+	status: "idle" as const,
+	variables: undefined,
+	isPending: false,
+	mutate: mock((_variables: unknown, _options?: unknown) => {}),
+	mutateAsync: mock(async (_variables: unknown, _options?: unknown) => undefined),
+	reset: mock(() => {}),
+};
 mock.module("../../hooks/useNarrator", () => ({ useCreateNarrator: () => ({ mutate: create }) }));
 // 弹窗右侧的项目提示词框带「从提示词库插入」，读一个空库即可；库本身有独立测试。
 mock.module("../../hooks/usePromptLibrary", () => ({

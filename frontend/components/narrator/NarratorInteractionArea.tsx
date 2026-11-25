@@ -8,6 +8,7 @@ import { useTranslation } from "react-i18next";
 import { useLocalPref } from "../../hooks/useLocalPref";
 import { startBottomSpacingResize, useBottomSpacing } from "../../hooks/useResizableBottomSpacing";
 import { api } from "../../lib/api";
+import type { PendingPermission } from "../../types/narrator";
 import { NarratorComposerRow, type NarratorComposerRowProps } from "./composer/NarratorComposerRow";
 import { NarratorGitBar } from "./header/NarratorGitBar";
 import { NarratorInteractionStatusBar } from "./interaction/NarratorInteractionStatusBar";
@@ -44,6 +45,7 @@ export interface NarratorInteractionCommon {
 export interface NarratorInteractionAreaProps {
 	// ── Shared context, passed once (see NarratorInteractionCommon). ──
 	common: NarratorInteractionCommon;
+	pendingPermissions?: readonly PendingPermission[];
 	/** Model traces expose read-only sampling/retry controls, never the composer. */
 	onModelTraceReturn?: () => void;
 	/**
@@ -52,6 +54,8 @@ export interface NarratorInteractionAreaProps {
 	 * an editable box and send button would only invite a failed send.
 	 */
 	readOnly?: boolean;
+	/** Replaces the read-only notice's text (the team page's 「你是只读成员」). */
+	readOnlyNotice?: string;
 
 	// ── Attachments ──
 	// imagePreviewUrls, formatFileSize and openImageViewer are no longer passed in:
@@ -180,7 +184,7 @@ function ModelTraceInteraction({
 }
 
 /** Stands where the composer would be for a viewer without write access to the session. */
-function ReadOnlyComposerNotice() {
+function ReadOnlyComposerNotice({ text }: { text?: string }) {
 	const { t } = useTranslation("narrator");
 	return (
 		<Box
@@ -198,7 +202,7 @@ function ReadOnlyComposerNotice() {
 			<Group gap={6} wrap="nowrap">
 				<IconLock size={14} aria-hidden style={{ flexShrink: 0 }} />
 				<Text size="sm" c="dimmed">
-					{t("composerReadOnly")}
+					{text ?? t("composerReadOnly")}
 				</Text>
 			</Group>
 		</Box>
@@ -315,6 +319,7 @@ function NarratorEditableInteractionArea(props: NarratorInteractionAreaProps) {
 				<PermissionRulePolicySync
 					key={props.common.narratorId}
 					narratorId={props.common.narratorId}
+					pendingPermissions={props.pendingPermissions ?? []}
 				/>
 			)}
 			{/* Status bar */}
@@ -327,7 +332,7 @@ function NarratorEditableInteractionArea(props: NarratorInteractionAreaProps) {
 			<UploadProgressBar sendingState={props.sendingState} cancelSending={props.cancelSending} />
 			{/* Input */}
 			{props.common.isWorkspacePreview ? null : props.readOnly ? (
-				<ReadOnlyComposerNotice />
+				<ReadOnlyComposerNotice text={props.readOnlyNotice} />
 			) : (
 				<NarratorComposerRow
 					{...props.composerRowProps}

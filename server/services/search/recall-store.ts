@@ -1,16 +1,24 @@
 import { activeDatabaseBackend, postgresRuntime, sqlite } from "../../db";
 import type { PgExecutor } from "../../db/pg-fts";
 import { type ReadQueryOptions, readDomainTask } from "../../db/worker-read";
+import type { ToolResult } from "../../lib/agent/types";
 import { createDomainReadParams } from "../../lib/db-worker/domain-protocol";
 import { DbReadError } from "../../lib/db-worker/errors";
+import { readRecallMessagePg } from "../../lib/db-worker/recall-pg-message-reader";
+import { runRecallPgProjection } from "../../lib/db-worker/recall-pg-projection-client";
+import { readRecallToolCallPagePg } from "../../lib/db-worker/recall-tool-page";
+import type {
+	RecallMessageInput,
+	RecallMessagePage,
+	RecallToolCallPageInput,
+} from "../../lib/recall-contract";
 import {
-	getToolCallSummary,
-	RECALL_CONVERSATION_INPUT_BYTES,
 	RECALL_DETAIL_BYTES,
 	type RecallConversationInput,
 	type RecallConversationSnapshot,
 	type RecallToolCallDetailInput,
 	type RecallToolCallRow,
+	recallConversationQueries,
 } from "./recall-reader";
 
 function executor(): PgExecutor {
@@ -26,6 +34,9 @@ function check(signal: AbortSignal | undefined, options: RecallReadOptions) {
 	signal?.throwIfAborted();
 	if (options.deadlineAt !== undefined && Date.now() >= options.deadlineAt)
 		throw new DbReadError("DB_READ_TASK_TIMEOUT", "Recall read deadline expired");
+}
+function deadline(options: RecallReadOptions) {
+	return Math.min(options.deadlineAt ?? Infinity, Date.now() + (options.timeoutMs ?? 30000));
 }
 export async function recallToolCallDetail(
 	input: RecallToolCallDetailInput,
@@ -73,90 +84,76 @@ export async function recallConversation(
 	signal ??= options.signal;
 	createDomainReadParams("recallConversation", input);
 	check(signal, options);
-	if (activeDatabaseBackend !== "postgres")
-		return readDomainTask(sqlite, "recallConversation", input, {
+	if (activeDatabaseBackend !== "postgres") {
+		const result = await readDomainTask(sqlite, "recallConversation", input, {
 			...options,
 			executionPolicy: "worker-required",
 			signal,
 		});
-	const pg = executor();
-	const narrator = await pg.unsafe("SELECT id, title, model FROM narrators WHERE id = $1 LIMIT 1", [
-		input.narratorId,
-	]);
-	check(signal, options);
-	const result: RecallConversationSnapshot = {
-		narrator: (narrator[0] as RecallConversationSnapshot["narrator"]) ?? null,
-		messageMissing: false,
-		rows: [],
-		tools: [],
-	};
-	if (!result.narrator) return result;
-	const columns =
-		"m.id, m.role, substr(m.content_text, 1, 500) AS content_text, m.created_at, r.seq";
-	if (input.messageId) {
-		const refs = await pg.unsafe(
-			"SELECT seq FROM narrator_message_refs WHERE narrator_id = $1 AND message_id = $2 LIMIT 1",
-			[input.narratorId, input.messageId],
-		);
 		check(signal, options);
-		if (!refs[0]) return { ...result, messageMissing: true };
-		const half = Math.floor(input.limit / 2),
-			seq = Number(refs[0].seq);
-		result.rows = (await pg.unsafe(
-			`SELECT ${columns} FROM narrator_message_refs r JOIN narrator_messages m ON m.id = r.message_id WHERE r.narrator_id = $1 AND r.seq >= $2 AND r.seq <= $3 ORDER BY r.seq LIMIT 51`,
-			[input.narratorId, seq - half, seq + input.limit - half],
-		)) as unknown as typeof result.rows;
-	} else {
-		result.rows = (
-			(await pg.unsafe(
-				`SELECT ${columns} FROM narrator_message_refs r JOIN narrator_messages m ON m.id = r.message_id WHERE r.narrator_id = $1 ORDER BY r.seq DESC LIMIT $2`,
-				[input.narratorId, input.limit],
-			)) as unknown as typeof result.rows
-		).reverse();
+		return result;
 	}
+	const pg = executor(),
+		deadlineAt = deadline(options);
+	const plan = recallConversationQueries(input, true);
+	let step = plan.next();
+	while (!step.done) {
+		check(signal, { deadlineAt });
+		const query = step.value;
+		const rows = query.sql.includes("recall_summary_input")
+			? await runRecallPgProjection<Record<string, unknown>[]>(
+					async (taskSignal, taskDeadline) => {
+						check(taskSignal, { deadlineAt: taskDeadline });
+						const rows = await pg.unsafe(query.sql, query.params);
+						check(taskSignal, { deadlineAt: taskDeadline });
+						if (rows.some((row) => row.recall_summary_oversized))
+							throw new DbReadError("DB_READ_BUDGET", "Recall summary source exceeds budget");
+						return { kind: "summaries", rows: rows as Record<string, unknown>[] };
+					},
+					signal,
+					deadlineAt,
+				)
+			: await pg.unsafe(query.sql, query.params);
+		check(signal, { deadlineAt });
+		step = plan.next((rows ?? []) as Record<string, unknown>[]);
+	}
+	return step.value;
+}
+export async function recallToolCallPage(
+	input: RecallToolCallPageInput,
+	signal?: AbortSignal,
+	options: RecallReadOptions = {},
+): Promise<ToolResult | null> {
+	signal ??= options.signal;
+	createDomainReadParams("recallToolCallPage", input);
 	check(signal, options);
-	result.rows = result.rows.map((row) => ({ ...row, seq: Number(row.seq) }));
-	const ids = result.rows.map((row) => row.id);
-	if (!ids.length) return result;
-	let time = "",
-		id = "",
-		bytes = 0;
-	while (true) {
-		const tools = await pg.unsafe(
-			`SELECT id, tool_use_id, tool_name, status, message_id, created_at, octet_length(input_json::text) AS bytes FROM narrator_tool_calls WHERE message_id = ANY($1::text[]) AND narrator_id = $2 AND (created_at, id) > ($3, $4) ORDER BY created_at, id LIMIT 128`,
-			[ids, input.narratorId, time, id],
-		);
+	if (activeDatabaseBackend !== "postgres") {
+		const result = await readDomainTask(sqlite, "recallToolCallPage", input, {
+			...options,
+			executionPolicy: "worker-required",
+			signal,
+		});
 		check(signal, options);
-		for (const tool of tools) {
-			const size = Number(tool.bytes ?? 0);
-			if (bytes + size > RECALL_CONVERSATION_INPUT_BYTES || result.tools.length >= 10_000)
-				throw new DbReadError("DB_READ_BUDGET", "Recall conversation exceeds its source budget");
-			const values = await pg.unsafe(
-				"SELECT input_json FROM narrator_tool_calls WHERE id = $1 AND coalesce(octet_length(input_json::text),0) <= $2 LIMIT 1",
-				[tool.id, RECALL_CONVERSATION_INPUT_BYTES - bytes],
-			);
-			check(signal, options);
-			if (!values[0])
-				throw new DbReadError("DB_READ_BUDGET", "Recall input changed beyond its source budget");
-			const raw = jsonText(values[0].input_json);
-			bytes += Buffer.byteLength(raw ?? "");
-			let parsed: unknown = null;
-			try {
-				parsed = raw ? JSON.parse(raw) : null;
-			} catch {
-				/* Invalid JSON retains the tool-name summary. */
-			}
-			result.tools.push({
-				tool_use_id: String(tool.tool_use_id),
-				tool_name: String(tool.tool_name),
-				status: String(tool.status),
-				message_id: String(tool.message_id),
-				summary: getToolCallSummary(String(tool.tool_name), parsed),
-			});
-		}
-		if (tools.length < 128) break;
-		time = String(tools[tools.length - 1].created_at);
-		id = String(tools[tools.length - 1].id);
+		return result;
 	}
-	return result;
+	return readRecallToolCallPagePg(executor(), input, signal, deadline(options));
+}
+export async function recallMessage(
+	input: RecallMessageInput,
+	signal?: AbortSignal,
+	options: RecallReadOptions = {},
+): Promise<RecallMessagePage | null> {
+	signal ??= options.signal;
+	createDomainReadParams("recallMessage", input);
+	check(signal, options);
+	if (activeDatabaseBackend !== "postgres") {
+		const result = await readDomainTask(sqlite, "recallMessage", input, {
+			...options,
+			executionPolicy: "worker-required",
+			signal,
+		});
+		check(signal, options);
+		return result;
+	}
+	return readRecallMessagePg(executor(), input, signal, deadline(options));
 }

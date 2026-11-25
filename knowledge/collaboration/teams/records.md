@@ -66,7 +66,7 @@ keywords:
   - team_upgrade
   - team_disband
 status: draft
-verified_at: 1f8e28731
+verified_at: d723c61fe
 ---
 # 团队与成员
 
@@ -84,6 +84,7 @@ verified_at: 1f8e28731
   - 基线分支（给定的，或项目 `defaultBranch`，再缺省 `main`）必须解析到提交（`teamGit(gitPath).resolveCommit`，即工作项建 worktree 时用的同一个 `rev-parse --verify ...^{commit}`），否则 409 `TEAM_BASE_BRANCH_UNRESOLVED`，消息里带分支名；git 读不成单个修订的项目默认值同样按这个码拒绝。
   - 测试：`projects-resolve-directory.test.ts`（拒绝后叙述者与团队行数不变）；其他团队测试用 `__tests__/team-repo.fixture.ts:initTeamRepo` 给项目目录建真实仓库。
 - 协调者的 cwd 永远是项目的 `gitPath`，不是用户选的子目录（`createTeam`）。
+- 改基线分支（`PATCH …/teams/:teamId`，`updateTeam`）同样先过 `assertTeamProjectUsable`（事务外的异步 git，`team-git` 的超时），解析不到 → 409 `TEAM_BASE_BRANCH_UNRESOLVED`，原基线不变；事务内项目 `gitPath` 变了 → 409 `TEAM_PROJECT_CHANGED`。只改简报或设置不跑 git。团队页设置对话框把拒绝写在基线分支字段上（`TeamSettingsModal.tsx:settingsErrorKey`，中英文）。
 
 两个创建入口，都调同一条 `POST /api/projects/:projectId/teams`，字段都来自 `components/teams/TeamCreateFields.tsx`（名称、基线分支、说明；「升级为团队」的对话框也用它，见[团队页](page.md)）：
 - 名称、基线分支、说明的 Zod 规则只有一份，在 `shared/project-team-draft.ts`（`teamNameSchema`、`teamBaseBranchSchema`、`teamBriefSchema`，`gitBranchName` 也在这里，`validators/common.ts` 转出）；路由校验器 `validators/project-teams.ts` 与前端 `teams/team-draft.ts:checkTeamDraft` 都用它。`useTeamDraft().submit()` 在草稿不合规时返回 null 并在对应字段显示错误，两个入口都因此不发请求。

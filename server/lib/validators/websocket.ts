@@ -30,6 +30,25 @@ const reasoningId = z.string().min(1).max(MAX_REASONING_TRANSLATION_ID_LENGTH);
 // Narrator client → server
 export const narratorWsMessageSchema = z.discriminatedUnion("type", [
 	z.strictObject({
+		type: z.literal("communication_subscribe"),
+		subscriptionId: z.string().min(1).max(128),
+		scope: z.discriminatedUnion("kind", [
+			z.strictObject({
+				kind: z.literal("narrator"),
+				narratorId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/u),
+			}),
+			z.strictObject({
+				kind: z.literal("team"),
+				projectId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/u),
+				teamId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/u),
+			}),
+		]),
+	}),
+	z.strictObject({
+		type: z.literal("communication_unsubscribe"),
+		subscriptionId: z.string().min(1).max(128),
+	}),
+	z.strictObject({
 		type: z.literal("reasoning_translation_visibility"),
 		narratorId: reasoningId,
 		visibilityId: reasoningId,
@@ -152,6 +171,7 @@ export const narratorWsMessageSchema = z.discriminatedUnion("type", [
 	z.object({
 		type: z.literal("chat_subscribe"),
 		roomIds: z.array(z.string().min(1)).max(50),
+		requestId: z.string().min(1).max(128).optional(),
 	}),
 	z.object({
 		type: z.literal("chat_unsubscribe"),

@@ -27,6 +27,7 @@ const dbStub = {
 	sqlite,
 	databaseMaintenance: createSqliteMaintenance(() => sqlite),
 	activeDatabaseBackend: "sqlite" as const,
+	postgresRuntime: null,
 	startupShutdownState: { canSkipVerification: true },
 	markDatabaseCleanShutdown: () => true,
 	releaseDatabaseInstanceLockOnly: () => {},
@@ -482,6 +483,10 @@ describe("tool input websocket lane", () => {
 			},
 		} as unknown as Parameters<typeof handleNarratorWS.open>[0];
 		handleNarratorWS.open(ws);
+		// The independent revision handshake must not consume this lane's first
+		// backpressure result; the first tool-input frame is the accepted -1 frame.
+		sent.length = 0;
+		first = true;
 		let drained!: () => void;
 		const completed = new Promise<void>((resolve) => {
 			drained = resolve;

@@ -89,6 +89,9 @@ export type NarraForkEvent =
 	| { type: "narrator:fast_mode_changed"; narratorId: string }
 	| { type: "user:fast_mode_default_changed"; userId: string }
 	| { type: "narrator:execution_principal_changed"; narratorId: string }
+	/** Post-commit ids-only invalidation of the communication projection. */
+	| { type: "narrator:communication_changed"; narratorIds: string[]; teamId?: string }
+	| { type: "team:communication_changed"; teamId: string }
 	| { type: "narrator:imported" }
 	// Narrator lifecycle
 	| { type: "narrator:message"; narratorId: string; role: string }
@@ -517,11 +520,19 @@ export type NarraForkEvent =
 			narratorId: string | null;
 	  }
 	| {
+			/** A discussion was actually inserted, not merely resolved again. */
+			type: "chat:room_created";
+			roomId: string;
+			narratorId: string;
+	  }
+	| {
 			/** A member advanced their read watermark (read receipts, badge refresh). */
 			type: "chat:room_read";
 			roomId: string;
 			userId: string;
 			lastReadSeq: number;
+			/** Only discussion rooms, never DM/bot conversations. */
+			narratorId?: string;
 	  };
 
 export type NarraForkEventType = NarraForkEvent["type"];

@@ -44,7 +44,7 @@
  */
 
 import { type NarratorWriteAudience, widestWriteAudienceFor } from "@shared/narrator-access";
-import { and, asc, eq, gt, inArray, or, type SQL, type SQLWrapper, sql } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, or, type SQLWrapper, sql } from "drizzle-orm";
 import { db } from "../db";
 import { aclGrants, narrators, projects } from "../db/schema";
 import { type ReadQueryOptions, readQuery, readQueryFirst } from "../db/worker-read";
@@ -53,7 +53,12 @@ import type { AclPrincipal, GrantRow } from "./acl/acl-core";
 import { applyGrant, resolveCaps } from "./acl/acl-core";
 import { resolveProjectIdForNarratorId } from "./narrator-project";
 import { projectReadVerdict, projectWriteVerdict, resolveProjectGate } from "./project-acl";
-import { narratorProjectIdText } from "./read/acl-sql";
+import {
+	bindPlaceholders,
+	grantPrincipalText,
+	narratorProjectGateReadText,
+	narratorProjectIdText,
+} from "./read/acl-sql";
 
 /** What an operation needs from the caller. */
 export type NarratorAccessNeed = "read" | "write";
@@ -610,52 +615,6 @@ export async function loadNarratorForAccess(
 // rows that should have appeared and silently did not.
 
 /**
- * The project a narrator resolves to, as a SQL scalar — the exact rule
- * `resolveNarratorProjectId` implements.
- *
- */
-function projectIdOfSql(alias: string): string {
-	return narratorProjectIdText(alias);
-}
-
-/**
- * Whether the principal passes the project gate's READ — the SQL mirror of
- * `canReadProject` behind `resolveProjectGate`.
- *
- * Phrased as "no project stands in the way" so a narrator belonging to no project
- * passes automatically. That is the same "no gate here, which is not the same as no
- * restrictions" rule the row-level code follows, without a second branch that could
- * drift from it.
- *
- * Consumes two `?`, both the requesting user id.
- */
-function projectGateReadSql(alias: string): string {
-	return `not exists (
-		select 1 from projects p
-		where p.id = ${projectIdOfSql(alias)}
-			and not (
-				p.visibility = 'public'
-				or p.owner_user_id = ?
-				or exists (
-					select 1 from acl_grants pg
-					where pg.scope_type = 'project'
-						and pg.scope_id = p.id
-						and pg.capability in ('read','write','manage')
-						and pg.domain_kind is null
-						and pg.principal_type = 'user'
-						and pg.principal_id = ?
-				)
-			)
-	)`;
-}
-
-// NOTE: there is deliberately no SQL mirror of the project WRITE gate here. The list
-// predicate answers "what may this principal READ", and since the write audience is
-// nested inside the read audience it can never admit anyone the read branches do not.
-// A write-side predicate would only be needed if the two could disagree — which is
-// exactly the state this design removed.
-
-/**
  * The readability rules applied to the judged row, aliased `jn` — the single body
  * shared by both exported predicates.
  *
@@ -675,17 +634,16 @@ function judgedReadableSql(jn: string): string {
 		${jn}.owner_user_id = ?
 		or ${jn}.visibility = 'public'
 		or (
-			${projectGateReadSql(jn)}
+			${narratorProjectGateReadText(jn)}
 			and (
-				(${jn}.visibility = 'project' and ${projectIdOfSql(jn)} is not null)
+				(${jn}.visibility = 'project' and ${narratorProjectIdText(jn)} is not null)
 				or exists (
 					select 1 from acl_grants g
 					where g.scope_type = 'narrator'
 						and g.scope_id = ${jn}.id
 						and g.capability in ('read','write')
 						and g.domain_kind is null
-						and g.principal_type = 'user'
-						and g.principal_id = ?
+						and ${grantPrincipalText("g")}
 				)
 			)
 		)
@@ -717,22 +675,6 @@ function judgedRowJoinSql(outer: string): string {
 }
 
 /**
- * Bind the user id at each `?` of a raw fragment.
- *
- * Never interpolated: the same text must serve every user (these statements are
- * prepared once and cached), and interpolating an id into SQL is how a predicate
- * becomes an injection site.
- */
-function bindUserId(text: string, userId: string): SQL {
-	const parts = text.split("?");
-	const chunks: SQL[] = [sql.raw(parts[0] ?? "")];
-	for (const part of parts.slice(1)) {
-		chunks.push(sql`${userId}`, sql.raw(part));
-	}
-	return sql.join(chunks, sql``);
-}
-
-/**
  * A Drizzle condition selecting the narrators this principal may read, for use in
  * list/aggregate queries.
  *
@@ -761,7 +703,7 @@ export function narratorReadableWhere(
 				when ${table.type} = 'subagent' then ${table.aclRootNarratorId}
 				else ${table.id}
 			end
-			and ${bindUserId(judgedReadableSql("jn"), principal.userId)}
+			and ${bindPlaceholders(judgedReadableSql("jn"), principal.userId)}
 	)`;
 }
 

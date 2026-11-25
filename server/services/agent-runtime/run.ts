@@ -53,6 +53,7 @@ import {
 } from "../narrator-session-state";
 import { waitForRestartBeforeFailure } from "../update-coordinator";
 import { freezeCheckpointStopAdmission, matchesCheckpointRun } from "./checkpoint-stop";
+import { notifyAgentInboxChanged } from "./inbox";
 import {
 	type ExecutionOwner,
 	getRunControl,
@@ -964,7 +965,12 @@ async function executeRun(
 			const { backgroundTaskService } = await import("../background-task-service");
 			backgroundTaskService.unregisterAbortController(id, run.cancel);
 		} finally {
-			if (owner.release() && !run.checkpointStop) afterRunRelease(id, active, allowInboxWake);
+			if (owner.release() && !run.checkpointStop) {
+				// The loop has cleared _loopRunning and committed its late lastStopReason.
+				// Notify even when error/user interruption forbids an automatic inbox wake.
+				notifyAgentInboxChanged(id);
+				afterRunRelease(id, active, allowInboxWake);
+			}
 		}
 	}
 }

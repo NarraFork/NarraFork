@@ -22,6 +22,7 @@ import { NarratorDockContext } from "../dock/NarratorDockContext";
 import { OutlineDockPanel } from "../dock/OutlineDockPanel";
 import {
 	BrowserDockPanel as BrowserToolAdapter,
+	CommunicationDockPanel as CommunicationToolAdapter,
 	DetailsDockPanel as DetailsToolAdapter,
 	FileTreeDockPanel as FileTreeToolAdapter,
 	FileDockPanel as FileViewerAdapter,
@@ -241,6 +242,9 @@ function NarratorToolDockPanel(props: IDockviewPanelProps<NarratorToolPanelParam
 			break;
 		case "timeline":
 			inner = <TimelineToolAdapter {...toolProps} />;
+			break;
+		case "communication":
+			inner = <CommunicationToolAdapter {...toolProps} />;
 			break;
 		default:
 			inner = null;

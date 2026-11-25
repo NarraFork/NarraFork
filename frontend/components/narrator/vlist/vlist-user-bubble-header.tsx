@@ -17,6 +17,7 @@
  */
 
 import { NarratorAvatar } from "@frontend/components/narrator/header/NarratorAvatar";
+import { ComposerNarratorReferences } from "@frontend/components/narrator/message/ComposerNarratorReferences";
 import {
 	MessageOriginBadge,
 	OriginAvatar,
@@ -69,8 +70,12 @@ export function UserBubbleHeader({
 	origin,
 	originLabel,
 	deliveryState,
+	composerDocumentSource,
+	narratorId,
 }: {
 	creator?: BubbleCreator | null;
+	narratorId?: string;
+	composerDocumentSource?: { messageId: string; revision: number };
 	createdAt?: string | null;
 	origin?: string | null;
 	originLabel?: string | null;
@@ -121,6 +126,14 @@ export function UserBubbleHeader({
 					{badge.label}
 				</Badge>
 			) : null}
+			{narratorId && composerDocumentSource ? (
+				<ComposerNarratorReferences
+					narratorId={narratorId}
+					messageId={composerDocumentSource.messageId}
+					revision={composerDocumentSource.revision}
+					hasComposerDocument
+				/>
+			) : null}
 			{createdAt ? (
 				<Text size="xs" c="dimmed" ml="auto" style={{ whiteSpace: "nowrap" }}>
 					{formatBubbleTime(createdAt)}
@@ -160,7 +173,14 @@ export function injectUserBubbleAttachmentOpen(
  * (permissionSlot, rowInteraction) are attached, and is a no-op for every other
  * kind / role so callers can invoke it unconditionally per row.
  */
-export function injectUserBubbleHeader(kind: VListElementKind, extra: RenderExtra): void {
+export function injectUserBubbleHeader(
+	kind: VListElementKind,
+	extra: RenderExtra,
+	composer?: {
+		narratorId: string;
+		composerDocumentSource?: { messageId: string; revision: number };
+	},
+): void {
 	if (kind !== "message-bubble" || extra.role !== "user") return;
 	// Measure only reserves header space when hasHeader is not false; keep the
 	// painted node in lockstep so height and content never disagree.
@@ -172,6 +192,8 @@ export function injectUserBubbleHeader(kind: VListElementKind, extra: RenderExtr
 			origin={(extra.origin as string | null | undefined) ?? null}
 			originLabel={(extra.originLabel as string | null | undefined) ?? null}
 			deliveryState={(extra.deliveryState as DeliveryState | null | undefined) ?? null}
+			narratorId={composer?.narratorId}
+			composerDocumentSource={composer?.composerDocumentSource}
 		/>
 	);
 }

@@ -37,7 +37,7 @@ keywords:
   - 待批权限
   - 应急批准
 status: draft
-verified_at: 878917e97
+verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 ---
 # 审批流程
 
@@ -47,6 +47,7 @@ Agent 每次调用工具前都经过 `narrator-permission.ts:handlePermission`�
 - 权限模式存在 `narrators.permission_mode`：`default`、`acceptEdits`、`bypassPermissions`、`readOnly`、`dontAsk`（`server/db/schema.ts`）。
 - plan 是叙述者的 trait，不是模式：严格计划模式下有效模式降为 `readOnly`；开启宽松计划（`relaxedPlan`）则沿用原模式；`bypassPermissions` 强制宽松计划（`lib/permission-modes.ts:resolveEffectiveRelaxedPlan`，`resolvePermissionDecision` 里的 `effectiveMode`）。
 - 判定顺序（`resolvePermissionDecision`）：参数/路径规格错误 → 灾难性 Bash 直接 `fatal` → 受保护路径与评审边界 deny → 命令黑名单 → 目录黑名单（优先于白名单）→ 评审只读 Bash 上限 → `.git` 内部写入复核 → 各模式。
+- Send 在同团队里按权限等级自动放行前，`shouldAutoAllowSendWithinScope` 用和投递相同的 `resolveSubagentTargets` 解析目标。别名改派后，被比较等级的成员就是将被送达的成员。
 - 各模式的处理：`bypassPermissions` 放行；`dontAsk` 拒绝所有需要询问的；`readOnly` 拒绝写；`acceptEdits` 自动放行编辑类。
 - `ExitPlanMode`、`AskUserQuestion` 始终询问（`ALWAYS_ASK_TOOLS`）；异步提问和只撤回的提问不需要审批。
 - 路由类工具必须带冻结的执行目标上下文，缺失或校验失败即 deny（`handlePermission` 的 `freezePermissionExecutionContext` 段）；工具调用记录有歧义或缺失也 deny。

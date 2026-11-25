@@ -5,7 +5,7 @@
  *    route lists both with their roles; access is granted and revoked through the ordinary
  *    narrator sharing routes;
  *  - any member approves, denies or answers a call anywhere in the tree, and the team records who
- *    (a team event, the approvals drawer's recent decisions, the activity log);
+ *    (a team event, shown in the activity log);
  *  - an onlooker or a stranger cannot approve or answer (the existing 403/404);
  *  - revoking access takes effect at once: for the next approval, for an approval already in
  *    flight, and for open WebSocket subscriptions of the coordinator and its subagents;
@@ -370,23 +370,10 @@ describe("who decided", () => {
 			detail: { tool: "AskUserQuestion", approvalKind: "question" },
 		});
 
-		// The approvals drawer: the latest decisions, newest first, with names.
+		// The team page has no separate list of recent decisions: the activity says who decided.
 		const approvals = await call(MEMBER, teamPath("approvals"));
 		expect(approvals.status).toBe(200);
-		expect(
-			approvals.body.recent
-				.slice(0, 3)
-				.map((d: { kind: string; actorName: string; toolName: string; agentTitle: string }) => [
-					d.kind,
-					d.actorName,
-					d.toolName,
-				]),
-		).toEqual([
-			["question.answered", `${OWNER}-name`, "AskUserQuestion"],
-			["approval.denied", `${GRANTED}-name`, "Edit"],
-			["approval.allowed", `${MEMBER}-name`, "Bash"],
-		]);
-		expect(approvals.body.recent[2]).toMatchObject({ agentId: workerId, agentTitle: "worker one" });
+		expect("recent" in approvals.body).toBe(false);
 		// The activity log has them too, with the person.
 		const activity = await call(READER, teamPath("events"));
 		const decided = activity.body.events.filter((event: { kind: string }) =>
@@ -740,7 +727,7 @@ describe("asynchronous questions (M1)", () => {
 			detail: { depth: 0 },
 		});
 		expect(of(ignored, "question.ignored")).toMatchObject({ actorId: OWNER });
-		const recent = (await call(MEMBER, teamPath("approvals"))).body.recent.map(
+		const recent = (await call(MEMBER, teamPath("events"))).body.events.map(
 			(d: { kind: string }) => d.kind,
 		);
 		for (const kind of [

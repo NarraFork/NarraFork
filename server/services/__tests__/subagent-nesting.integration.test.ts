@@ -35,7 +35,7 @@ import { parseRuntimePolicyTraits, withRuntimePolicyTrait } from "../../lib/runt
 import * as ws from "../../websocket/narrator-ws";
 import {
 	awaitAgentResultDetailed,
-	resolveSubagentTargets,
+	resolveCommunicationSendTargets,
 	sendSubagentMessageDetailed,
 } from "../agent-communication";
 import { setRunHold } from "../agent-runtime/ownership";
@@ -394,23 +394,32 @@ describe("depth backstops", () => {
 });
 
 describe("reach", () => {
-	test("Send: parent, child and sibling; never a grandchild or another tree", async () => {
-		const { primary, worker, sibling, helper, helperSibling } = await tree();
+	test("Send: any member of the communication forest, not another unconnected tree", async () => {
+		const owner = await makeUser("communication-owner");
+		const { primary, worker, sibling, helper, helperSibling } = await tree(owner);
 		const ids = async (caller: string, selector: string) =>
-			(await resolveSubagentTargets({ callerNarratorId: caller, id: selector })).map((n) => n.id);
+			(await resolveCommunicationSendTargets({ callerNarratorId: caller, id: selector })).map(
+				(n) => n.id,
+			);
 		expect(await ids(worker, helper)).toEqual([helper]);
 		expect(await ids(worker, sibling)).toEqual([sibling]);
 		expect(await ids(helper, helperSibling)).toEqual([helperSibling]);
 		expect(await ids(primary, worker)).toEqual([worker]);
-		// The primary does not message its grandchildren; a helper does not reach its
-		// parent's siblings; a first-level sibling does not reach the worker's helpers.
-		expect(await captureWorkerRejectionThrower(ids(primary, helper))).toThrow("does not belong");
-		expect(await captureWorkerRejectionThrower(ids(helper, sibling))).toThrow("does not belong");
-		expect(await captureWorkerRejectionThrower(ids(sibling, helper))).toThrow("does not belong");
-		const other = await tree();
-		expect(await captureWorkerRejectionThrower(ids(worker, other.helper))).toThrow(
-			"does not belong",
-		);
+		expect(await ids(primary, helper)).toEqual([helper]);
+		expect(await ids(helper, sibling)).toEqual([sibling]);
+		expect(await ids(sibling, helper)).toEqual([helper]);
+		// The same writer owns the other tree; topology, not ACL, blocks this Send.
+		const other = await tree(owner);
+		expect(
+			await captureWorkerRejectionThrower(
+				sendSubagentMessageDetailed(sendInput(worker, [other.helper])),
+			),
+		).toThrow("Communication target is unavailable or disconnected");
+		expect(
+			await db.query.narratorBufferedMessages.findMany({
+				where: eq(narratorBufferedMessages.narratorId, other.helper),
+			}),
+		).toHaveLength(0);
 
 		// A helper reports to its parent (a subagent itself) through "parent".
 		const toParent = await sendSubagentMessageDetailed(sendInput(helper, ["parent"]));
@@ -425,6 +434,10 @@ describe("reach", () => {
 		expect(queued).toHaveLength(1);
 		expect(JSON.stringify(queued[0])).toContain("[Message from the parent narrator]");
 		expect(JSON.stringify(queued[0])).not.toContain("sibling subagent");
+		const toGrandchild = await sendSubagentMessageDetailed(sendInput(primary, [helper]));
+		expect(toGrandchild.targets).toEqual([
+			expect.objectContaining({ id: helper, status: "queued" }),
+		]);
 	});
 
 	test("Watch: only agents the caller launched", async () => {

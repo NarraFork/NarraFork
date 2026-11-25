@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "ff5b1634-ec71-4355-8961-13c46a6258c2",
+  "id": "b7d911d3-3a29-40c6-9ffa-6a234b71a8f7",
   "prevId": "8df2e944-dc76-4ebd-a0d1-3da5b55cbffe",
   "tables": {
     "acl_events": {
@@ -987,6 +987,25 @@
             "id"
           ],
           "isUnique": false
+        },
+        "idx_bg_tasks_parent_alias": {
+          "name": "idx_bg_tasks_parent_alias",
+          "columns": [
+            "parent_narrator_id",
+            "alias",
+            "created_at"
+          ],
+          "isUnique": false,
+          "where": "\"alias\" IS NOT NULL"
+        },
+        "idx_bg_tasks_parent_live_alias": {
+          "name": "idx_bg_tasks_parent_live_alias",
+          "columns": [
+            "parent_narrator_id",
+            "alias"
+          ],
+          "isUnique": false,
+          "where": "\"alias\" IS NOT NULL AND \"status\" IN ('running', 'paused')"
         }
       },
       "foreignKeys": {
@@ -2568,45 +2587,6 @@
         }
       },
       "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "checkConstraints": {}
-    },
-    "executor_session_cleanups": {
-      "name": "executor_session_cleanups",
-      "columns": {
-        "device_id": {
-          "name": "device_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "session_id": {
-          "name": "session_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "created_at": {
-          "name": "created_at",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        }
-      },
-      "indexes": {},
-      "foreignKeys": {},
-      "compositePrimaryKeys": {
-        "executor_session_cleanups_device_id_session_id_pk": {
-          "columns": [
-            "device_id",
-            "session_id"
-          ],
-          "name": "executor_session_cleanups_device_id_session_id_pk"
-        }
-      },
       "uniqueConstraints": {},
       "checkConstraints": {}
     },
@@ -12305,6 +12285,20 @@
           "notNull": false,
           "autoincrement": false
         },
+        "title_slug": {
+          "name": "title_slug",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "alias_selector": {
+          "name": "alias_selector",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
         "inherit_mode": {
           "name": "inherit_mode",
           "type": "text",
@@ -13030,6 +13024,34 @@
           ],
           "isUnique": false,
           "where": "\"is_background\" = 1"
+        },
+        "idx_narrators_parent_title_slug": {
+          "name": "idx_narrators_parent_title_slug",
+          "columns": [
+            "parent_narrator_id",
+            "title_slug"
+          ],
+          "isUnique": false,
+          "where": "\"parent_narrator_id\" IS NOT NULL AND \"title_slug\" IS NOT NULL"
+        },
+        "idx_narrators_parent_alias_selector": {
+          "name": "idx_narrators_parent_alias_selector",
+          "columns": [
+            "parent_narrator_id",
+            "alias_selector"
+          ],
+          "isUnique": false,
+          "where": "\"parent_narrator_id\" IS NOT NULL AND \"alias_selector\" IS NOT NULL"
+        },
+        "idx_narrators_addressable_parent_created": {
+          "name": "idx_narrators_addressable_parent_created",
+          "columns": [
+            "parent_narrator_id",
+            "created_at",
+            "id"
+          ],
+          "isUnique": false,
+          "where": "\"parent_narrator_id\" IS NOT NULL AND \"status\" IN ('idle', 'working', 'waiting')"
         }
       },
       "foreignKeys": {
@@ -20644,13 +20666,6 @@
         },
         "device_id": {
           "name": "device_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "executor_session_id": {
-          "name": "executor_session_id",
           "type": "text",
           "primaryKey": false,
           "notNull": false,

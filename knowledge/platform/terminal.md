@@ -9,6 +9,8 @@ anchors:
   - server/services/terminal-service.ts
   - server/websocket/terminal-ws.ts
   - frontend/hooks/useTerminals.ts
+  - server/services/narrator-ui-summary.ts
+  - frontend/hooks/useNarratorUiSummary.ts
   - frontend/lib/api/terminals.ts
   - frontend/routes/admin/terminals.tsx
   - frontend/routes/settings/terminals.tsx
@@ -37,7 +39,7 @@ keywords:
   - 孤儿终端
   - /api/admin/terminals
 status: draft
-verified_at: 8d4bc063
+verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 ---
 # 终端运行时
 
@@ -64,7 +66,7 @@ verified_at: 8d4bc063
 - 终端的 REST 管理在 `routes/terminals.ts`（列表、树、创建、改名、删除、进程列表、视图状态）。
 - 用户终端的 shell 环境会恢复被 NarraFork 清空的环境代理变量（`envWithAmbientProxy`）。
 
-- 前端：`useNarratorTerminals`/`useTreeTerminals`/`useCanOpenTerminals`（`hooks/useTerminals.ts`）按叙述者拉列表、树和是否可开终端（`/api/terminals`、`/tree`、`/access`），查询键以 `["terminals", …]` 开头；管理员页 `/settings/terminals`（`routes/settings/terminals.tsx`）管理全部终端与孤儿 dtach socket（`/api/admin/terminals/*`：列表、终止、批量终止、`kill-orphan`、`reattach-orphan`），`/admin/terminals` 只是重定向到它。
+- 前端：`useCanOpenTerminals` 复用会话 ui-summary 的 `canWrite`，不为首屏额外读 `/access`；未知/失败不允许打开。`useNarratorTerminals` 只有真实可见、document 可见且写权限已知为 true 才拉实体，key 包含 narrator/user/token，AbortSignal 贯通（单次 512 KiB，30 秒 stale/60 秒 GC）；`useTreeTerminals` 仍为详情树按需读取。ui-summary 与 WS `terminal_count_changed`、普通终端实体列表统一排除 `worktreeResourceId` 非空的资源终端。管理员页 `/settings/terminals`（`routes/settings/terminals.tsx`）管理全部终端与孤儿 dtach socket（`/api/admin/terminals/*`：列表、终止、批量终止、`kill-orphan`、`reattach-orphan`），`/admin/terminals` 只是重定向到它。
 
 ## 从哪读起
 - `server/services/terminal-service.ts`：创建、恢复、关闭、清理。

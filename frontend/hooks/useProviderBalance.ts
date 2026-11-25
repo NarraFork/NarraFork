@@ -142,12 +142,12 @@ export function useProbeProviderBalance(
  * costs no extra request, and an unknown answer counts as enabled (the safe direction).
  */
 export function useProviderBalanceCapability(): boolean {
-	const { data: settings } = useQuery({
-		queryKey: ["settings"],
-		queryFn: api.getSettings,
-		staleTime: 30_000,
-	});
-	const capability = (settings as { providerBalanceCapability?: { enabled?: unknown } } | undefined)
-		?.providerBalanceCapability;
-	return capability?.enabled !== false;
+	// This is a management-detail flag. A session's current-provider balance does
+	// not justify downloading all provider configuration. Runtime routes authorize
+	// independently; unknown remains enabled as before.
+	const client = useQueryClient();
+	const settings = client.getQueryData<{ providerBalanceCapability?: { enabled?: unknown } }>([
+		"settings",
+	]);
+	return settings?.providerBalanceCapability?.enabled !== false;
 }

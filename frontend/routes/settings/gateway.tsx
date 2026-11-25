@@ -2,7 +2,10 @@ import { Stack, Title } from "@mantine/core";
 import { createFileRoute } from "@tanstack/react-router";
 import { useTranslation } from "react-i18next";
 import { GatewaySection } from "../../components/settings/GatewaySection";
-import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
+import {
+	useUpdateUserPreferencesDetail as useUpdateUserPreferences,
+	useUserPreferencesDetail as useUserPreferences,
+} from "../../hooks/useUserPreferences";
 
 export const Route = createFileRoute("/settings/gateway")({
 	component: SettingsGatewayPage,
