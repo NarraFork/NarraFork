@@ -226,6 +226,89 @@ describe("NUG quota snapshots", () => {
 		quotaStore.remove(second.id);
 	});
 
+	test("real billing config keeps stream-only breakdown in cached view without writing it into probe", async () => {
+		const config = useProvider();
+		const captured = captureNugQuotaSubject(config);
+		const start = Date.now();
+		setSystemTime(start);
+		reportNugQuota(config.prefix, 0, "stream allocation details", { allocation: "stream" });
+		const streamBefore = structuredClone(quotaStore.peek(captured.id, STREAM_QUOTA_SOURCE));
+		let payload: Record<string, unknown> = { balance: 12 };
+		globalThis.fetch = (async (input, init) => {
+			expect(String(input)).toBe("https://nug.example/v1/billing/config");
+			expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer key-one");
+			return Response.json(payload);
+		}) as typeof fetch;
+		const { nugRoutes } = await import("../../routes/nug");
+		setSystemTime(start + 1000);
+		expect(
+			(await requestNugRoute(nugRoutes, `/providers/${providerId}/billing/config`)).status,
+		).toBe(200);
+		const cached = await requestNugRoute(nugRoutes, `/quotas?providerId=${providerId}`);
+		expect((await cached.json()).quota).toMatchObject({
+			balance: 12,
+			detailedQuotaBalance: "stream allocation details",
+		});
+		expect(getNugCachedQuota(providerId)?.extra).toEqual({ allocation: "stream" });
+		expect(getNugCachedQuota(providerId, captured)?.detailedQuotaBalance).toBeNull();
+		expect(getNugCachedQuota(providerId, captured)?.extra).toBeUndefined();
+		expect(quotaStore.peek(captured.id)?.balances[0]?.remaining).toBe(12);
+		expect(quotaStore.peek(captured.id, STREAM_QUOTA_SOURCE)).toEqual(streamBefore);
+		await quotaStore.flush();
+		quotaStore.forget(captured.id);
+		quotaStore.forget(captured.id, STREAM_QUOTA_SOURCE);
+		expect(getNugCachedQuota(providerId)?.detailedQuotaBalance).toBe("stream allocation details");
+		expect(getNugCachedQuota(providerId, captured)?.detailedQuotaBalance).toBeNull();
+		setSystemTime(start + 2000);
+		payload = {
+			balance: 13,
+			detailedQuotaBalance: "latest probe details",
+			extra: { allocation: "probe" },
+		};
+		expect(
+			(await requestNugRoute(nugRoutes, `/providers/${providerId}/billing/config`)).status,
+		).toBe(200);
+		expect(getNugCachedQuota(providerId)).toMatchObject({
+			balance: 13,
+			detailedQuotaBalance: "latest probe details",
+			extra: { allocation: "probe" },
+		});
+		setSystemTime(start + 3000);
+		payload = { balance: 14, extra: null };
+		expect(
+			(await requestNugRoute(nugRoutes, `/providers/${providerId}/billing/config`)).status,
+		).toBe(200);
+		expect(getNugCachedQuota(providerId)?.extra).toBeNull();
+		expect(quotaStore.peek(captured.id, STREAM_QUOTA_SOURCE)).toEqual(streamBefore);
+	});
+
+	test("metadata view fallback never crosses error, currency or expiry comparison guards", () => {
+		const config = useProvider();
+		const captured = captureNugQuotaSubject(config);
+		const start = Date.now();
+		setSystemTime(start);
+		reportNugQuota(config.prefix, 0, "stream-only details", { allocation: "stream" });
+		const stream = structuredClone(quotaStore.peek(captured.id, STREAM_QUOTA_SOURCE));
+		if (!stream) throw new Error("missing metadata stream fixture");
+		setSystemTime(start + 1000);
+		setNugCachedQuota(providerId, buildNugQuotaCache({ balance: 12 }), captured);
+		const probe = structuredClone(quotaStore.peek(captured.id));
+		for (const guarded of [
+			{ ...stream, error: "quota_unavailable" },
+			{ ...stream, balances: [{ unit: "USD", remaining: 0 }] },
+			{ ...stream, expiresAt: start + 500 },
+		]) {
+			quotaStore.set(captured.id, captured.identity, guarded, false, STREAM_QUOTA_SOURCE);
+			expect(getNugCachedQuota(providerId)).toMatchObject({
+				balance: 12,
+				detailedQuotaBalance: null,
+			});
+			expect(getNugCachedQuota(providerId)?.extra).toBeUndefined();
+			expect(quotaStore.peek(captured.id)).toEqual(probe);
+			expect(quotaStore.peek(captured.id, STREAM_QUOTA_SOURCE)).toEqual(guarded);
+		}
+	});
+
 	test("Auto excludes a newer stream zero through partial probes and recovers on a real newer balance", async () => {
 		const config = useProvider();
 		const captured = captureNugQuotaSubject(config);
