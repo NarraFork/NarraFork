@@ -11,6 +11,7 @@ import { MantineProvider } from "@mantine/core";
 import type { ComposerDocument } from "@shared/composer-document";
 import { decodeLiveFrame, LIVE_FRAME, type LiveFrame } from "@shared/outline-live-protocol";
 import { setTypography, type TypographySettings } from "@shared/pretext-layout/typography";
+import type { RuntimeSettings } from "@shared/settings-runtime";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
 	type AnyRouter,
@@ -24,6 +25,7 @@ import i18next from "i18next";
 import { useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
+import { runtimeSettingsQueryOptions } from "../../hooks/useRuntimeSettings";
 import { type OutlineOpener, useOutlineOpener } from "../../lib/outline-opener";
 import type { OutlinePanelState } from "../../lib/outline-panel";
 import outlineEn from "../../locales/en/outline.json";
@@ -189,7 +191,13 @@ export function open(options: { wsUrl: string }): void {
 	overrideLiveTransportForTests(transport);
 	const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 	// The session dock opens outline panels only while the app shell knows the outline is on.
-	queryClient.setQueryData(["settings"], { outline: { enabled: true } });
+	queryClient.setQueryData(runtimeSettingsQueryOptions().queryKey, {
+		revision: 1,
+		agent: { defaultModel: "", summaryModel: "" },
+		outline: { enabled: true },
+		requestEvidence: { autoPin: "off" },
+		summaryModelAvailable: null,
+	} satisfies RuntimeSettings);
 	const rootRoute = createRootRoute({
 		component: () => (
 			<NarratorDockProvider narratorId="n-fixture">

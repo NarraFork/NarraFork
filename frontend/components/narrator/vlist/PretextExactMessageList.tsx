@@ -406,6 +406,8 @@ type ScrollRef = RefObject<HTMLElement | null> | ((node: HTMLDivElement | null) 
 
 type PretextExactMessageListProps = {
 	narratorId: string;
+	/** Pause transport/subscriptions without unmounting the loaded document or anchor. */
+	suspended?: boolean;
 	/** Chat rooms have no narrator identity for error diagnostics or model actions. */
 	enableNarratorErrorActions?: boolean;
 	/** Defer optional cold controllers by default; public read-only transcripts opt out. */
@@ -539,6 +541,7 @@ export const PretextExactMessageList = memo(
 		function PretextExactMessageList(props, ref) {
 			const {
 				narratorId,
+				suspended = false,
 				enableNarratorErrorActions = true,
 				deferInteractions = true,
 				isSubagent,
@@ -622,6 +625,8 @@ export const PretextExactMessageList = memo(
 			 */
 			const compactProgressKeysRef = useRef<Map<string, boolean>>(new Map());
 			const panelVisible = useNarratorPanelVisible();
+			const suspendedRef = useRef(suspended);
+			suspendedRef.current = suspended;
 			const interactionOwner = useMemo(
 				() => ({
 					narratorId,
@@ -2010,7 +2015,11 @@ export const PretextExactMessageList = memo(
 				[narratorId, truncatedToolCalls, ensureWriteSource, writeSources.isWrite],
 			);
 			const { resolveFullToolInput, resolveFullToolOutput, resolveToolDetailStatus } =
-				useVListToolDetails(narratorId, fullDetailRequests, dataSource?.fetchToolDetail);
+				useVListToolDetails(
+					narratorId,
+					suspended ? [] : fullDetailRequests,
+					dataSource?.fetchToolDetail,
+				);
 			const resolveDocumentToolInput = useCallback(
 				(
 					toolUseId: string | undefined,
@@ -2170,10 +2179,22 @@ export const PretextExactMessageList = memo(
 				() => ({
 					...(dataSource?.fetchPage ? { fetchPage: dataSource.fetchPage } : {}),
 					...(dataSource?.locateMessage ? { locateMessage: dataSource.locateMessage } : {}),
+					refreshWindow: dataSource?.refreshWindow,
+					finalizeRefreshWindow: dataSource?.finalizeRefreshWindow,
+					refreshFailurePolicy: dataSource?.refreshFailurePolicy,
+					onRefreshError: dataSource?.onRefreshError,
 				}),
-				[dataSource?.fetchPage, dataSource?.locateMessage],
+				[
+					dataSource?.fetchPage,
+					dataSource?.locateMessage,
+					dataSource?.refreshWindow,
+					dataSource?.finalizeRefreshWindow,
+					dataSource?.refreshFailurePolicy,
+					dataSource?.onRefreshError,
+				],
 			);
 			const pretextDocument = usePretextDocument(narratorId, {
+				suspended,
 				compactAuxiliaryContent,
 				layoutReady: panelVisible && viewportNode != null && layoutGeometryNode === viewportNode,
 				lod,
@@ -2235,6 +2256,21 @@ export const PretextExactMessageList = memo(
 				onScrollTopCorrection,
 				isSubagent,
 			});
+			useEffect(() => {
+				if (!dataSource?.onWindowChange) return;
+				if (pretextDocument.document) {
+					dataSource.onWindowChange(pretextDocument.document);
+				} else {
+					const status = (pretextDocument.error as { status?: number })?.status;
+					if (status === 401 || status === 403)
+						dataSource.onWindowChange({
+							messages: [],
+							messageVersion: 0,
+							oldestLoadedSeq: null,
+							hasPrev: false,
+						});
+				}
+			}, [dataSource?.onWindowChange, pretextDocument.document, pretextDocument.error]);
 			upsertMessageRef.current = pretextDocument.upsertMessage;
 			insertMessageRef.current = pretextDocument.insertMessage;
 			removeMessagesRef.current = pretextDocument.removeMessages;
@@ -2319,7 +2355,9 @@ export const PretextExactMessageList = memo(
 			}, [narratorId]);
 
 			const revisionSubscriptionId =
-				pretextDocument.index && pretextDocument.status !== "loading" ? narratorId : undefined;
+				!suspended && pretextDocument.index && pretextDocument.status !== "loading"
+					? narratorId
+					: undefined;
 			// Cursor AND version travel together: the server needs both to decide whether this
 			// subscriber is behind. Passing a bare cursor made `useNarratorWS` read `.cursor`
 			// off a `CatchUpCursor` and get `undefined`, silently disabling catch-up for this
@@ -2531,7 +2569,8 @@ export const PretextExactMessageList = memo(
 					translationVisibility?.resume();
 					clearAllCompactProgress();
 					compactProgressKeysRef.current.clear();
-					bumpMessageRevision();
+					if (dataSource?.refreshWindow) pretextDocumentRef.current.reload();
+					else bumpMessageRevision();
 				},
 				// Live compact-progress ticks repaint only the mounted fixed-height marker.
 				// They never enter the pretext document or its measurement cache.
@@ -2600,6 +2639,7 @@ export const PretextExactMessageList = memo(
 			const stableExternalHandlers = useMemo<NarratorWSCallbacks>(() => {
 				const forward = <K extends keyof NarratorWSCallbacks>(key: K) =>
 					((...args: unknown[]) => {
+						if (suspendedRef.current) return;
 						const handler = messageWsCallbacksRef.current[key];
 						if (typeof handler === "function") (handler as (...a: unknown[]) => void)(...args);
 					}) as never;
@@ -2619,9 +2659,9 @@ export const PretextExactMessageList = memo(
 				};
 			}, []);
 			useEffect(() => {
-				if (!externalSubscribeMessages) return;
+				if (suspended || !externalSubscribeMessages) return;
 				return externalSubscribeMessages(stableExternalHandlers);
-			}, [externalSubscribeMessages, stableExternalHandlers]);
+			}, [suspended, externalSubscribeMessages, stableExternalHandlers]);
 			// Live LIFECYCLE updates (tool started/completed, reflection gates, permission
 			// decisions, background terminals, subagent activity). These mutate an
 			// already-loaded message in place, so they are applied as anchor-preserving
@@ -3194,7 +3234,7 @@ export const PretextExactMessageList = memo(
 			onVisibleMessagesChangeRef.current = onVisibleMessagesChange;
 			useEffect(() => {
 				const callback = onVisibleMessagesChangeRef.current;
-				if (!callback) return;
+				if (suspended || !callback) return;
 				const manifestItems = pretextDocument.manifest?.items ?? [];
 				const lastItem = manifestItems[seenWindow.end - 1];
 				const lastId = lastItem?.sourceMessageIds.at(-1) ?? null;
@@ -3206,7 +3246,7 @@ export const PretextExactMessageList = memo(
 							}
 						: null,
 				);
-			}, [seenWindow.end, pretextDocument.manifest]);
+			}, [suspended, seenWindow.end, pretextDocument.manifest]);
 
 			/**
 			 * Identity of the currently committed DOCUMENT (not its geometry).
@@ -4260,7 +4300,7 @@ export const PretextExactMessageList = memo(
 			// exhausted). Each load grows totalHeight or clears hasPrev, so this settles.
 			// Gated on !loadingOlder so one page is in flight at a time (no request storm).
 			useEffect(() => {
-				if (pretextDocument.status !== "ready") return;
+				if (suspended || pretextDocument.status !== "ready") return;
 				if (!hasPrev || loadingOlder) return;
 				if (!pinnedToBottom || !pinnedToBottomRef.current) return;
 				if (viewportHeight <= 0) return;
@@ -4287,6 +4327,7 @@ export const PretextExactMessageList = memo(
 				loadingOlder,
 				pinnedToBottom,
 				pretextDocument.status,
+				suspended,
 				viewportHeight,
 			]);
 
@@ -4295,6 +4336,7 @@ export const PretextExactMessageList = memo(
 			// uses the header button instead. The exact rebuild anchors on the viewport
 			// top, so the prepended page grows the canvas upward with zero visible shift.
 			const maybeAutoLoadOlder = useCallback((scrollTopNow: number, atBottom: boolean) => {
+				if (suspendedRef.current) return;
 				const decision = resolveOlderHistoryAutoLoad({
 					intentAt: olderHistoryIntentAtRef.current,
 					now: Date.now(),
@@ -4315,6 +4357,7 @@ export const PretextExactMessageList = memo(
 			// do at most one window computation.
 			const processScrollFrame = useCallback(() => {
 				scrollRafRef.current = 0;
+				if (suspendedRef.current) return;
 				const node = viewportRef.current;
 				// A queued scroll rAF can run after the host parks in display:none.
 				// Zero geometry must not change pin, unread count, intent or window.
@@ -5467,6 +5510,7 @@ export const PretextExactMessageList = memo(
 						rowInteraction: traceBinding?.rowInteraction,
 						closingRowKeys: closingRows.get(item.spec.key),
 						narratorId,
+						canCalibrateModelTrace: item.spec.kind === "modeltrace-result" && !dataSource,
 						onOpenFilePanel: rowHandlers?.onOpenFilePanel,
 						onFetchAttachment: dataSource?.onFetchAttachment,
 						openAttachmentLabel,

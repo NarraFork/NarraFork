@@ -14,7 +14,7 @@ import {
 	isBackgroundTaskActiveStatus,
 } from "@shared/background-task-list";
 import type { ToolProgressPayload } from "@shared/tool-progress";
-import type { WatchTargetType } from "@shared/watch-command";
+import { formatWatchTarget, parseWatchCommand, type WatchTargetType } from "@shared/watch-command";
 import {
 	and,
 	asc,
@@ -51,6 +51,7 @@ import { teamMembersWhere } from "../lib/runtime-source";
 import { escapeLikeNeedle } from "../lib/sql-like";
 import type { RunBindingInput, RunDeliverTo } from "../lib/validators/runtime-registration";
 import type { RuntimeTx } from "./agent-runtime/mailbox-types";
+import type { PgStaleTaskRow } from "./agent-runtime/postgres-runtime-publication";
 import {
 	getRuntimePublicationService,
 	type PublicationEvent,
@@ -73,11 +74,26 @@ import {
 	type ResumeSubagent,
 } from "./recovery-observation";
 import { TERMINAL_WATCH_COMMAND_PREFIX, WATCH_COMMAND_PREFIX } from "./terminal-watch-constants";
+import {
+	type RestartWatchRow,
+	type ResumableWatchTarget,
+	restartResumableWatch,
+	restartWatchPrincipal,
+} from "./watch-restart";
 
-const TERMINAL_WATCH_RESTART_NOTICE =
-	"Observation interrupted by server restart; the target was not stopped. Check its status before observing again.";
+// Only claim what the watch itself did: the restart's own shutdown may have ended
+// the target (direct-mode terminals, unprotected bash/agent runs).
+export const TERMINAL_WATCH_RESTART_NOTICE =
+	"Observation interrupted by server restart. The watch did not stop the target, but the restart may have; check the target's status before observing again.";
 
 type RecoveryReadOptions = Pick<ReadQueryOptions, "signal" | "deadlineAt" | "timeoutMs">;
+
+/** A lifecycle watch row restart recovery leaves running for re-attachment. */
+interface DeferredRestartWatch {
+	task: RestartTaskObservation;
+	row: RestartWatchRow;
+	target: ResumableWatchTarget;
+}
 
 function taskReadOptions(options: RecoveryReadOptions = {}, maxRows = 10_000): ReadQueryOptions {
 	return {
@@ -622,8 +638,8 @@ class BackgroundTaskService {
 		this.listVersions = hotSafe("narrafork:bg-task:listVersions", () => new Map<string, number>());
 		this._broadcastFn = null;
 		this._livenessFn = null;
-		backgroundOccupancyStore.subscribe("background-task-list", (parentIds) => {
-			for (const parentId of parentIds) {
+		backgroundOccupancyStore.subscribe("background-task-list", (_parentIds, metadata) => {
+			for (const parentId of metadata.listChangedParentIds) {
 				void this.broadcastListDelta(parentId, { invalidate: true }).catch((error) => {
 					logger.warn("Failed to broadcast maintained background occupancy", {
 						parentNarratorId: parentId,
@@ -934,6 +950,8 @@ class BackgroundTaskService {
 		executionTarget?: ToolExecutionTarget;
 		alias?: string;
 		title?: string;
+		/** Watch rows: who registered the observation (see `principalJson`). */
+		principal?: { userId: string | null };
 	}): Promise<BackgroundTaskRecord> {
 		this.bashLifecycle.assertAdmission();
 		const binding = opts.toolCallBinding;
@@ -963,6 +981,7 @@ class BackgroundTaskService {
 				executionAttempt: binding?.attempt ?? null,
 				alias: opts.alias ?? null,
 				title: opts.title ?? null,
+				principalJson: opts.principal ?? null,
 				output: null,
 				outputBytes: 0,
 				outputTruncated: false,
@@ -1002,6 +1021,7 @@ class BackgroundTaskService {
 			executionAttempt: binding?.attempt ?? null,
 			alias: opts.alias ?? null,
 			title: opts.title ?? null,
+			principalJson: opts.principal ?? null,
 			output: null,
 			outputBytes: 0,
 			outputTruncated: false,
@@ -2432,6 +2452,34 @@ class BackgroundTaskService {
 			taskReadOptions(options, 1),
 		);
 		return row ?? null;
+	}
+
+	/**
+	 * Record an extended Watch deadline on its running row, so restart recovery
+	 * re-attaches the watch until the extended deadline rather than the first one.
+	 * The command's `timeout` keeps its meaning, "ms from registration"; the write is
+	 * a compare-and-set on the command it read, and never shortens a deadline.
+	 */
+	async extendWatchDeadline(taskId: string, deadlineAt: number): Promise<void> {
+		const row = await this.getById(taskId);
+		if (!row || row.status !== "running" || !row.command) return;
+		const target = parseWatchCommand(row.command);
+		if (!target || target.timeoutMs == null) return;
+		const timeoutMs = Math.ceil(deadlineAt - Date.parse(row.createdAt));
+		if (!Number.isFinite(timeoutMs) || timeoutMs <= target.timeoutMs) return;
+		await db
+			.update(backgroundTasks)
+			.set({
+				command: `${WATCH_COMMAND_PREFIX} ${formatWatchTarget({ ...target, timeoutMs })}`,
+				updatedAt: new Date().toISOString(),
+			})
+			.where(
+				and(
+					eq(backgroundTasks.id, taskId),
+					eq(backgroundTasks.status, "running"),
+					eq(backgroundTasks.command, row.command),
+				),
+			);
 	}
 
 	/**
@@ -4282,6 +4330,70 @@ class BackgroundTaskService {
 		afterId?: string,
 		options: RecoveryReadOptions = {},
 	): Promise<number> {
+		const deferred: DeferredRestartWatch[] = [];
+		const recovered = await this.recoverStaleTaskPages(
+			protectedTaskIds,
+			afterId,
+			options,
+			deferred,
+		);
+		// Targets are settled or re-attached by now, so a resumed watch observes their
+		// post-restart state rather than racing the scan that produces it.
+		return recovered + (await this.resumeDeferredWatches(deferred));
+	}
+
+	/**
+	 * Re-attach each deferred lifecycle watch to its target; a watch that cannot be
+	 * re-attached ends with the restart notice, exactly as it would have without this.
+	 */
+	private async resumeDeferredWatches(deferred: readonly DeferredRestartWatch[]): Promise<number> {
+		if (deferred.length === 0) return 0;
+		const { resumeWatchAfterRestart } = await import("./watch-service");
+		const resumeOne = async ({ task, row, target }: DeferredRestartWatch): Promise<boolean> => {
+			try {
+				if (await resumeWatchAfterRestart(row, target)) return true;
+			} catch (error) {
+				logger.warn("Watch could not be re-attached after restart", {
+					taskId: task.id,
+					error: String(error),
+				});
+			}
+			try {
+				await this.markFailed(task.id, TERMINAL_WATCH_RESTART_NOTICE, undefined, undefined, {
+					expectedRestartTask: task,
+				});
+			} catch (error) {
+				// Left running: the next restart's recovery ends it.
+				logger.warn("Restart watch interruption could not be saved", {
+					taskId: task.id,
+					error: String(error),
+				});
+			}
+			return false;
+		};
+		let resumed = 0;
+		for (const watch of deferred)
+			if (watch.target.type !== "terminal" && (await resumeOne(watch))) resumed++;
+		if (resumed) logger.info("Re-attached lifecycle watches after restart", { resumed });
+		// Terminal watches wait for the dtach reattach that startup runs concurrently; keep
+		// that wait off narrator recovery so it never delays startup readiness.
+		const terminalWatches = deferred.filter((watch) => watch.target.type === "terminal");
+		if (terminalWatches.length)
+			void (async () => {
+				let reattached = 0;
+				for (const watch of terminalWatches) if (await resumeOne(watch)) reattached++;
+				if (reattached)
+					logger.info("Re-attached terminal watches after restart", { resumed: reattached });
+			})();
+		return deferred.length;
+	}
+
+	private async recoverStaleTaskPages(
+		protectedTaskIds: ReadonlySet<string>,
+		afterId: string | undefined,
+		options: RecoveryReadOptions,
+		deferred: DeferredRestartWatch[],
+	): Promise<number> {
 		const page =
 			resolveRuntimeQueueBackend() === "postgres"
 				? await getRuntimePublicationService().readRunningStaleTasks(afterId)
@@ -4303,7 +4415,7 @@ class BackgroundTaskService {
 		const nextPage = async () => {
 			if (page.length <= 100) return 0;
 			await new Promise<void>((resolve) => setImmediate(resolve));
-			return this.recoverStaleTasksAfterRestart(protectedTaskIds, scanned.at(-1)?.id, options);
+			return this.recoverStaleTaskPages(protectedTaskIds, scanned.at(-1)?.id, options, deferred);
 		};
 		// A failed source transaction may have left a same-run terminal checkpoint.
 		// Finish it through the one run finalizer before the generic stale-task path
@@ -4366,8 +4478,40 @@ class BackgroundTaskService {
 			if (await this.recoverDurableService(task.id, task.parentNarratorId, task))
 				settledServices.add(task.id);
 		}
+		// Lifecycle watches (no pattern) whose deadline has not passed keep running: they
+		// are re-attached after every page is recovered (see `resumeDeferredWatches`).
+		const deferredWatchIds = new Set<string>();
+		for (const task of scanned) {
+			if (
+				task.type !== "bash" ||
+				!task.logicalRunId ||
+				!task.command?.startsWith(WATCH_COMMAND_PREFIX)
+			)
+				continue;
+			const row = await this.getById(task.id);
+			if (!row || row.status !== "running") continue;
+			const target = parseWatchCommand(row.command);
+			if (!restartResumableWatch(target, row.createdAt)) continue;
+			deferred.push({
+				task,
+				row: {
+					id: row.id,
+					parentNarratorId: row.parentNarratorId,
+					alias: row.alias,
+					createdAt: row.createdAt,
+					principal: restartWatchPrincipal(row.principalJson),
+				},
+				target,
+			});
+			deferredWatchIds.add(task.id);
+		}
 		const staleTasks = scanned
-			.filter((task) => !restoredTerminals.has(task.id) && !settledServices.has(task.id))
+			.filter(
+				(task) =>
+					!restoredTerminals.has(task.id) &&
+					!settledServices.has(task.id) &&
+					!deferredWatchIds.has(task.id),
+			)
 			// Only an agent row can be protected — see the note above on why a bash row
 			// has no resume path to protect.
 			.filter((task) => task.type === "bash" || !protectedTaskIds.has(task.id));
@@ -4431,11 +4575,14 @@ class BackgroundTaskService {
 				// followed by a failed publication would otherwise leave a non-atomic terminal.
 				if (resolveRuntimeQueueBackend() === "postgres") {
 					const pub = getRuntimePublicationService();
+					// `expected` is this page's scanned row: a row that was re-run,
+					// re-owned or re-bound since the scan is skipped, as on SQLite.
 					await pub.recoverStaleTask({
 						taskId: task.id,
 						text,
 						eventKind,
 						now,
+						expected: task as PgStaleTaskRow,
 					});
 					continue;
 				}

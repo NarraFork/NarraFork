@@ -28,6 +28,7 @@ import {
 	TextSelection,
 } from "@tiptap/pm/state";
 import {
+	type Editor,
 	EditorContent,
 	Extension,
 	type JSONContent,
@@ -48,6 +49,7 @@ import {
 	useContext,
 	useEffect,
 	useImperativeHandle,
+	useLayoutEffect,
 	useMemo,
 	useRef,
 	useState,
@@ -482,6 +484,7 @@ export const InlineComposerEditor = forwardRef<
 	const latestRef = useRef(props.value);
 	const signatureRef = useRef(JSON.stringify(props.value));
 	const actualSignatureRef = useRef<string | null>(null);
+	const initializedEditorRef = useRef<Editor | null>(null);
 	/*
 	 * Documents emitted through onChange that the parent has not rendered back yet,
 	 * oldest first. Under load the parent can commit an older emission after the
@@ -771,6 +774,18 @@ export const InlineComposerEditor = forwardRef<
 		}
 		setAssetGeneration((generation) => generation + 1);
 	};
+	useLayoutEffect(() => {
+		if (!editor || editor.isDestroyed || initializedEditorRef.current === editor) return;
+		initializedEditorRef.current = editor;
+		// setDocument can arrive while useEditor still returns null. Its logical
+		// signature is already current, but the asynchronously created view may
+		// still contain the original content. Reconcile the actual view once, before
+		// it accepts input, using the latest imperative restore/transaction rather
+		// than replaying a possibly stale controlled prop or waiting for onCreate.
+		const actual = JSON.stringify(readEditorDocument(editor.state.doc, assetsRef.current));
+		if (actual !== signatureRef.current) replaceDocument(latestRef.current);
+		else actualSignatureRef.current = actual;
+	});
 	useEffect(() => {
 		if (!editor || receivedValueRef.current === props.value) return;
 		receivedValueRef.current = props.value;

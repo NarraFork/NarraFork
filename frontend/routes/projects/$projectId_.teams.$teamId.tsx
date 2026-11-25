@@ -1,20 +1,23 @@
 /**
- * The team page `/projects/$projectId/teams/$teamId` (docs/PROJECT_TEAMS-PLAN.md §二.11; P4).
+ * The team page `/projects/$projectId/teams/$teamId` (docs/PROJECT_TEAMS-PLAN.md §二.11; the
+ * redesign R).
  *
  * Not nested under the project page (`$projectId_`): it fills the app shell's content box the
- * way a session page does. Left: the project's teams; middle: the coordinator's conversation
- * (the ordinary narrator panel, so members talk to the coordinator exactly as in its session
- * page); right: the board and the activity. Narrow screens get tabs instead.
+ * way a session page does. The coordinator's conversation (the ordinary narrator panel, so
+ * members talk to the coordinator exactly as in its session page; a read-only member sees
+ * 「你是只读成员」 instead of the composer) with the work list and the activity beside it; narrow
+ * screens get tabs instead. No list of the project's teams: teams are switched from the
+ * sidebar's pinned team tabs and the project page.
  */
 
 import { NarratorPanelSkeleton } from "@frontend/components/narrator/NarratorPanelSkeleton";
 import { usePanelCompact } from "@frontend/components/narrator/panels/shared";
 import { TeamPageView } from "@frontend/components/teams/TeamPageView";
-import { useProject } from "@frontend/hooks/useProjects";
 import { lazyWithRetry } from "@frontend/lib/lazy-with-retry";
 import { Box } from "@mantine/core";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { memo, Suspense, useCallback } from "react";
+import { useTranslation } from "react-i18next";
 import { NarratorDockContext } from "../../components/narrator/dock/NarratorDockContext";
 
 const NarratorPanel = lazyWithRetry(() =>
@@ -35,6 +38,7 @@ function CoordinatorConversation({
 	onOpenSession: (narratorId: string) => void;
 }) {
 	const { ref, compact } = usePanelCompact();
+	const { t } = useTranslation("projects");
 	return (
 		<Box ref={ref} h="100%" style={{ overflow: "hidden", minHeight: 0 }}>
 			<NarratorDockContext.Provider value={null}>
@@ -44,6 +48,7 @@ function CoordinatorConversation({
 						narratorId={teamId}
 						compact={compact}
 						onViewSubagentSession={(subagentId) => onOpenSession(subagentId)}
+						readOnlyNotice={t("teams.page.readOnly")}
 					/>
 				</Suspense>
 			</NarratorDockContext.Provider>
@@ -54,28 +59,19 @@ function CoordinatorConversation({
 function TeamPage() {
 	const { projectId, teamId } = Route.useParams();
 	const navigate = useNavigate();
-	const project = useProject(projectId);
 	const openSession = useCallback(
 		(narratorId: string) => void navigate({ to: "/narrators/$narratorId", params: { narratorId } }),
 		[navigate],
-	);
-	const openTeam = useCallback(
-		(id: string) =>
-			void navigate({
-				to: "/projects/$projectId/teams/$teamId",
-				params: { projectId, teamId: id },
-			}),
-		[navigate, projectId],
 	);
 	return (
 		<TeamPageView
 			projectId={projectId}
 			teamId={teamId}
-			canCreateTeam={!project.isError && project.data?.canWrite === true}
 			conversation={<CoordinatorConversation teamId={teamId} onOpenSession={openSession} />}
 			onOpenSession={openSession}
-			onOpenTeam={openTeam}
+			onOpenCoordinatorSession={() => openSession(teamId)}
 			onBack={() => void navigate({ to: "/projects/$projectId", params: { projectId } })}
+			onDisbanded={openSession}
 		/>
 	);
 }

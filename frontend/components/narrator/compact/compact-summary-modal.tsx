@@ -205,7 +205,7 @@ export function CompactSummaryModal({
 }) {
 	const { t } = useTranslation("narrator");
 	const queryClient = useQueryClient();
-	const { visibleModels, summaryModelValue, providerLabels } = useAllModels();
+	const { visibleModels, summaryModelValue, providerLabels } = useAllModels(target != null);
 	const [deleting, setDeleting] = useState(false);
 	const [editing, setEditing] = useState(false);
 	const [editText, setEditText] = useState("");
@@ -612,8 +612,12 @@ export function CompactSummaryModal({
 		if (!retryModel) return;
 		setSavingSummaryModel(true);
 		try {
-			await api.updateSettings({ agent: { summaryModel: retryModel } });
-			await queryClient.invalidateQueries({ queryKey: ["settings"] });
+			await api.updateRuntimeSettings({ agent: { summaryModel: retryModel } });
+			await Promise.all([
+				queryClient.invalidateQueries({ queryKey: ["settings"] }),
+				queryClient.invalidateQueries({ queryKey: ["settings-runtime"] }),
+				queryClient.invalidateQueries({ queryKey: ["model-catalog", "runtime"] }),
+			]);
 			notifications.show({ title: t("summaryModelUpdated"), message: t("summaryModelUpdated") });
 		} catch (err) {
 			notifications.show({

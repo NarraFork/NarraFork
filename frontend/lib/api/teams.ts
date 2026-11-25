@@ -8,6 +8,10 @@ import type {
 	TeamMembersResponse,
 	TeamPageSummary,
 	TeamRunningResponse,
+	TeamWorkFileDiff,
+	TeamWorkItemDetail,
+	TeamWorkReturnResponse,
+	TeamWorkStatsResponse,
 } from "@shared/project-teams";
 import { request } from "./client";
 
@@ -24,6 +28,15 @@ function query(params: Record<string, string | number | undefined>): string {
 
 export interface CreateTeamPayload {
 	name: string;
+	baseBranch?: string;
+	brief?: string;
+}
+
+/** Turn an existing session into a team's coordinator; its audiences stay as they are. */
+export interface UpgradeToTeamPayload {
+	fromNarratorId: string;
+	/** Omitted keeps the session's title. */
+	name?: string;
 	baseBranch?: string;
 	brief?: string;
 }
@@ -45,6 +58,17 @@ export const teamsApi = {
 		request<TeamDetail>(`/projects/${encodeURIComponent(projectId)}/teams`, {
 			method: "POST",
 			body: JSON.stringify(payload),
+		}),
+	upgradeSessionToTeam: (projectId: string, payload: UpgradeToTeamPayload) =>
+		request<TeamDetail>(`/projects/${encodeURIComponent(projectId)}/teams`, {
+			method: "POST",
+			body: JSON.stringify(payload),
+		}),
+	/** Disband the team and keep its coordinator as an ordinary session. */
+	disbandTeam: (projectId: string, teamId: string) =>
+		request<{ narratorId: string }>(`${teamBase(projectId, teamId)}/disband`, {
+			method: "POST",
+			body: "{}",
 		}),
 	getProjectTeam: (projectId: string, teamId: string) =>
 		request<TeamDetail>(teamBase(projectId, teamId)),
@@ -69,4 +93,38 @@ export const teamsApi = {
 	/** The tree's running sessions now, for "pause all" (members only, at most 500). */
 	getTeamRunning: (projectId: string, teamId: string) =>
 		request<TeamRunningResponse>(`${teamBase(projectId, teamId)}/running`),
+	/** Change the team's base branch or brief (members). */
+	updateProjectTeam: (
+		projectId: string,
+		teamId: string,
+		patch: { baseBranch?: string; brief?: string },
+	) =>
+		request<TeamDetail>(teamBase(projectId, teamId), {
+			method: "PATCH",
+			body: JSON.stringify(patch),
+		}),
+	/** Archive the team (its coordinator): kept read-only with every record. */
+	archiveProjectTeam: (projectId: string, teamId: string) =>
+		request<TeamDetail>(`${teamBase(projectId, teamId)}/archive`, { method: "POST", body: "{}" }),
+	/** Lines added / removed and files changed of up to 50 work items. */
+	getTeamWorkStats: (projectId: string, teamId: string, ids: readonly string[]) =>
+		request<TeamWorkStatsResponse>(
+			`${teamBase(projectId, teamId)}/work-stats${query({ ids: ids.join(",") })}`,
+		),
+	/** The work item drawer (no diff text). */
+	getTeamWorkItem: (projectId: string, teamId: string, itemId: string) =>
+		request<TeamWorkItemDetail>(
+			`${teamBase(projectId, teamId)}/work/${encodeURIComponent(itemId)}`,
+		),
+	/** One changed file's diff, capped; read when the drawer opens that file. */
+	getTeamWorkDiff: (projectId: string, teamId: string, itemId: string, path: string) =>
+		request<TeamWorkFileDiff>(
+			`${teamBase(projectId, teamId)}/work/${encodeURIComponent(itemId)}/diff${query({ path })}`,
+		),
+	/** Send a work item in review or ready back to work with a reason (members). */
+	returnTeamWorkItem: (projectId: string, teamId: string, itemId: string, reason: string) =>
+		request<TeamWorkReturnResponse>(
+			`${teamBase(projectId, teamId)}/work/${encodeURIComponent(itemId)}/return`,
+			{ method: "POST", body: JSON.stringify({ reason }) },
+		),
 };

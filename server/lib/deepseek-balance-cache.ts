@@ -368,6 +368,18 @@ export function getAllDeepSeekCachedBalances(): Record<string, DeepSeekBalanceCa
 	return Object.fromEntries([...entries].map(([id, entry]) => [id, cacheOf(entry)]));
 }
 
+/** Targeted read of the published runtime token; no catalog or all-provider projection. */
+export function peekDeepSeekBalanceGeneration(providerId: string): string | undefined {
+	const entry = entries.get(providerId);
+	const config = settings.customApiProviders?.find((provider) => provider.id === providerId);
+	if (!entry || !config || !isDeepSeekCustomApiProvider(config)) return undefined;
+	const credential = firstCredential(config);
+	return entry.credentialId === credential.id &&
+		entry.identity === deepSeekQuotaIdentity(credential.config)
+		? entry.generation
+		: undefined;
+}
+
 /** Opaque, random runtime tokens only; never expose or derive them from credentials. */
 export function getDeepSeekBalanceGenerations(): Record<string, string> {
 	syncDeepSeekBalanceCache();

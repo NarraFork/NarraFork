@@ -31,7 +31,7 @@ import {
 	type GrammarTier,
 	getGrammarEntry,
 } from "./grammar-manifest";
-import { createTreeSitterParser, loadTreeSitterLanguage } from "./tree-sitter-runtime";
+import { verifyStructuralGrammar } from "./worker-client";
 
 /** Cache directory for downloaded grammar wasm files. */
 export const GRAMMAR_DIR = join(narraforkDir, "grammars");
@@ -374,31 +374,9 @@ async function fetchGrammarBytes(doFetch: typeof fetch, url: string): Promise<Ui
 	}
 }
 
-/**
- * Load the grammar and parse a trivial input, returning an error string on failure.
- *
- * Deliberately catches everything: the failure being guarded against originates inside
- * wasm and surfaces as an ordinary `TypeError`, so a narrow catch would let it through.
- * A grammar that cannot parse a two-character document will not parse a real file, and
- * keeping it would arm a crash for a later tool call.
- */
+/** Loading and smoke-parsing downloaded WASM must also stay off the server thread. */
 async function verifyGrammarParses(bytes: Uint8Array): Promise<string | null> {
-	try {
-		const language = await loadTreeSitterLanguage(bytes);
-		const parser = await createTreeSitterParser(language);
-		const tree = parser.parse("x\n");
-		if (!tree) return "parser returned no tree";
-		try {
-			// Touching the root is part of the check: some failures only appear when the
-			// tree is walked rather than when it is created.
-			void tree.rootNode.type;
-		} finally {
-			tree.delete();
-		}
-		return null;
-	} catch (err) {
-		return err instanceof Error ? err.message : String(err);
-	}
+	return verifyStructuralGrammar(bytes);
 }
 
 function verifyDigest(bytes: Uint8Array, entry: GrammarManifestEntry): boolean {

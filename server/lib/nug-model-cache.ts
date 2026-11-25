@@ -2,6 +2,13 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { type ModelCard, validateRawMetadata } from "@shared/model-catalog/card";
 import { type LegacyResolvedEnvelope, legacyMetadataToRaw } from "./model-catalog/legacy-v1";
+import {
+	captureModelOptionsArray,
+	ModelOptionsCacheMap,
+	modelOptionPrice,
+	optionInput,
+	registerModelOptionsCapture,
+} from "./model-options-contract";
 import { getNarraforkHome } from "./narrafork-home";
 import type { NUGProviderConfig } from "./settings/types";
 
@@ -64,7 +71,32 @@ export interface NugModelCacheEntry {
 	capabilities?: string[];
 }
 
-const cachedModelsByProvider = new Map<string, NugModelInfo[]>();
+const cachedModelsByProvider = new ModelOptionsCacheMap<string, NugModelInfo[]>();
+registerModelOptionsCapture("nug", (group) =>
+	captureModelOptionsArray(
+		cachedModelsByProvider.get(group.id),
+		(model) => {
+			const split = splitNugModelId(model.id);
+			const price = (side: "input" | "output") => {
+				const rawKey = `${side}_cost_per_token`;
+				if (model.modelCard) return modelOptionPrice(model.modelCard.metadata[rawKey], true);
+				const metadata = model.metadata?.metadata;
+				const grouped = metadata?.referencePricing as Record<string, unknown> | undefined;
+				return grouped && Object.hasOwn(grouped, side)
+					? modelOptionPrice(grouped[side])
+					: modelOptionPrice(metadata?.[rawKey], true);
+			};
+			return {
+				...optionInput(group, model.id, model.name ?? model.id),
+				inputPrice: price("input"),
+				outputPrice: price("output"),
+				upstreamModelId: model.model || split?.bareModel || model.id,
+				providerKey: model.channelType || model.channel || split?.channel,
+			};
+		},
+		cachedModelsByProvider.generation,
+	),
+);
 const cachedModelHashByProvider = new Map<string, string>();
 const cachedModelsFetchedAtByProvider = new Map<string, number>();
 const cachedUsdRateByProvider = new Map<string, number>();

@@ -1,7 +1,7 @@
 import { REMOTE_BUILD } from "@frontend/lib/build-target";
-import { QueryClientContext, useQuery } from "@tanstack/react-query";
+import { QueryClientContext } from "@tanstack/react-query";
 import { useCallback, useContext, useSyncExternalStore } from "react";
-import { api } from "../lib/api";
+import { runtimeSettingsQueryOptions, useRuntimeSettings } from "./useRuntimeSettings";
 
 function outlineOn(data: unknown): boolean {
 	return (
@@ -13,16 +13,11 @@ function outlineOn(data: unknown): boolean {
 /**
  * Whether `outline.enabled` is on; `loading` until the settings have been read once.
  *
- * Read from the settings every signed-in user already reads (the same `["settings"]` query the
- * app shell uses), so nothing admin-only is fetched for it. While it is off the outline routes
+ * Read from the same bounded runtime projection as the authenticated app shell. While it is off the outline routes
  * answer 404, and the pages and entry points hide themselves.
  */
 export function useOutlineEnabled(): { enabled: boolean; loading: boolean } {
-	const { data, isLoading } = useQuery({
-		queryKey: ["settings"],
-		queryFn: api.getSettings,
-		enabled: !REMOTE_BUILD,
-	});
+	const { data, isLoading } = useRuntimeSettings(!REMOTE_BUILD);
 	return { enabled: outlineOn(data), loading: isLoading };
 }
 
@@ -41,7 +36,7 @@ export function useOutlineEnabledInCache(): boolean {
 	);
 	return useSyncExternalStore(
 		!REMOTE_BUILD && client ? subscribe : noSubscription,
-		() => outlineOn(client?.getQueryData(["settings"])),
+		() => outlineOn(client?.getQueryData(runtimeSettingsQueryOptions().queryKey)),
 		() => false,
 	);
 }

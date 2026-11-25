@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { api } from "@frontend/lib/api";
+import { ApiError, api } from "@frontend/lib/api";
+import { setToken } from "@frontend/lib/api/client";
 import type {
 	NarratorPanelStateOptions,
 	NarratorPanelStateResponse,
@@ -8,13 +9,20 @@ import { narratorWSManager } from "@frontend/lib/narrator-ws-manager";
 import type { PendingPermission } from "@frontend/types/narrator";
 import { notifications } from "@mantine/notifications";
 import type { ProviderBalanceSnapshot } from "@shared/provider-balance";
-import { notifyManager, QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
+import {
+	notifyManager,
+	QueryClient,
+	QueryClientProvider,
+	QueryObserver,
+	useQuery,
+} from "@tanstack/react-query";
 import i18next from "i18next";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import { customApiBalanceDisplayFor } from "./model/custom-api-usage-source";
+import { nugQuotaKey, useNugQuota } from "./model/use-nug-quota";
 import { type UseNarratorPanelWSReturn, useNarratorPanelWS } from "./useNarratorPanelWS";
 import { findPendingForKey } from "./vlist/vlist-permission-match";
 
@@ -22,6 +30,7 @@ type QuotaSettings = {
 	customApiQuotas: NonNullable<Parameters<typeof customApiBalanceDisplayFor>[0]["pushedQuotas"]>;
 };
 let quotaProviderId: string | null = null;
+let nugProvider: { id: string; generation?: number | string } | null = null;
 let balanceSnapshot: ProviderBalanceSnapshot | undefined;
 let quotaDisplay: ReturnType<typeof customApiBalanceDisplayFor>;
 function subscriptionSnapshot(): ProviderBalanceSnapshot {
@@ -53,6 +62,11 @@ const originals = new Map<string, PropertyDescriptor | undefined>();
 const managerOriginals = new Map<string, PropertyDescriptor | undefined>();
 const restores: Array<() => void> = [];
 const connections = new Set<(connected: boolean, isReconnect: boolean) => void>();
+const recoveries = new Set<() => void>();
+let observeDetails = false;
+let observedDetailId: string | undefined;
+let detailReads = 0;
+let childReads = 0;
 const listeners = new Map<number, (frame: Record<string, unknown>) => void>();
 let nextListenerId = 0;
 
@@ -98,6 +112,24 @@ function cancelable<T>(promise: Promise<T>, signal?: AbortSignal) {
 }
 function Harness() {
 	current = useNarratorPanelWS({ narratorId, narratorStatus, isAtBottomRef: { current: true } });
+	return observeDetails ? <DetailObservers /> : null;
+}
+function DetailObservers() {
+	const id = observedDetailId ?? narratorId;
+	useQuery({
+		queryKey: ["narrators", id],
+		queryFn: async () => {
+			detailReads++;
+			return qc.getQueryData(["narrators", id]) ?? { id };
+		},
+	});
+	useQuery({
+		queryKey: ["narrators", id, "tasks", "current"],
+		queryFn: async () => {
+			childReads++;
+			return [];
+		},
+	});
 	return null;
 }
 function QuotaHarness() {
@@ -122,12 +154,26 @@ function QuotaHarness() {
 	});
 	return null;
 }
+function NugQuotaHarness() {
+	const quota = useNugQuota("nug:model", nugProvider ? [{ ...nugProvider, prefix: "nug" }] : []);
+	current = useNarratorPanelWS({
+		narratorId,
+		narratorStatus,
+		isAtBottomRef: { current: true },
+		nugProviderId: nugProvider?.id,
+		nugProviderGeneration: nugProvider?.generation,
+		quotaProviderKey: nugProvider?.id,
+		initialQuotaBalance: quota?.quotaBalance,
+		initialDetailedQuotaBalance: quota?.detailedQuotaBalance,
+	});
+	return null;
+}
 const render = () =>
 	act(async () =>
 		root.render(
 			<QueryClientProvider client={qc}>
 				<I18nextProvider i18n={instance}>
-					{quotaProviderId ? <QuotaHarness /> : <Harness />}
+					{nugProvider ? <NugQuotaHarness /> : quotaProviderId ? <QuotaHarness /> : <Harness />}
 				</I18nextProvider>
 			</QueryClientProvider>,
 		),
@@ -148,11 +194,20 @@ const retryTick = () =>
 
 beforeEach(async () => {
 	const { window } = parseHTML("<html><body></body></html>");
+	const tokens = new Map<string, string>();
 	for (const [key, value] of Object.entries({
 		window,
 		document: window.document,
 		navigator: window.navigator,
-		localStorage: { getItem: () => null },
+		localStorage: {
+			getItem: (key: string) => tokens.get(key) ?? null,
+			setItem: (key: string, value: string) => {
+				tokens.set(key, value);
+			},
+			removeItem: (key: string) => {
+				tokens.delete(key);
+			},
+		},
 		IS_REACT_ACT_ENVIRONMENT: true,
 	})) {
 		originals.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
@@ -185,6 +240,12 @@ beforeEach(async () => {
 		spyOn(narratorWSManager, "removeListener").mockImplementation((handle) => {
 			listeners.delete(handle._id);
 		}),
+		spyOn(narratorWSManager, "onControlPlaneRecovery").mockImplementation((callback) => {
+			recoveries.add(callback);
+			return () => {
+				recoveries.delete(callback);
+			};
+		}),
 		spyOn(narratorWSManager, "onConnectionChange").mockImplementation((callback) => {
 			connections.add(callback);
 			return () => {
@@ -196,10 +257,16 @@ beforeEach(async () => {
 	narratorId = "n1";
 	narratorStatus = "waiting";
 	quotaProviderId = null;
+	nugProvider = null;
 	balanceSnapshot = undefined;
 	connected = false;
 	listeners.clear();
 	connections.clear();
+	recoveries.clear();
+	observeDetails = false;
+	observedDetailId = undefined;
+	detailReads = 0;
+	childReads = 0;
 	notifyManager.setScheduler(queueMicrotask);
 	qc = new QueryClient({
 		defaultOptions: { queries: { retry: false, staleTime: Infinity, gcTime: Infinity } },
@@ -298,6 +365,158 @@ describe("upstream timed wait notifications with the real WS hook", () => {
 		expect(show.mock.calls.at(-1)?.[0].title).toBe("capacityWaitingTitle");
 		await event({ type: "model_unavailable_recovered", waitKind: "quota", model: "ocg:test" });
 		expect(show.mock.calls.at(-1)?.[0].title).toBe("capacityRecoveredTitle");
+	});
+});
+
+describe("NUG quota identity refresh with the real panel and active query observers", () => {
+	const quotaResult = (generation = 7) => ({
+		generation,
+		quota: { balance: 3, totalGranted: 10, detailedQuotaBalance: "cached quota", fetchedAt: 1 },
+	});
+	function activeOtherIdentity(
+		providerId: string,
+		generation: number | string | undefined,
+		token: string | null,
+	) {
+		const key = nugQuotaKey(providerId, generation, token);
+		const snapshot = quotaResult(Number(generation) || 7).quota;
+		qc.setQueryData(key, snapshot);
+		const result = { key, reads: 0, snapshot };
+		const observer = new QueryObserver(qc, {
+			queryKey: key,
+			queryFn: async () => {
+				result.reads++;
+				return snapshot;
+			},
+			staleTime: Infinity,
+		});
+		const unsubscribe = observer.subscribe(() => {});
+		restores.push(unsubscribe);
+		return result;
+	}
+	function quotaDomainSpies() {
+		const cached = spyOn(api, "nugGetCachedQuota").mockResolvedValue(quotaResult());
+		const aggregate = spyOn(api, "nugGetQuotas").mockRejectedValue(
+			new Error("aggregate quota read is forbidden"),
+		);
+		const rpc = spyOn(api, "nugGetQuota").mockRejectedValue(new Error("quota RPC is forbidden"));
+		restores.push(
+			() => cached.mockRestore(),
+			() => aggregate.mockRestore(),
+			() => rpc.mockRestore(),
+		);
+		return { cached, aggregate, rpc };
+	}
+	function emitQuotaBurst(count: number) {
+		for (let index = 0; index < count; index++)
+			for (const listener of listeners.values())
+				listener({ narratorId, type: "quota_balance", quotaBalance: `pushed-${index}` });
+	}
+
+	test("a burst refreshes only the active provider+generation+token through its cached-only reader", async () => {
+		setToken("quota-token");
+		nugProvider = { id: "nug-current", generation: 7 };
+		const domain = quotaDomainSpies();
+		const others = [
+			activeOtherIdentity("nug-other", 7, "quota-token"),
+			activeOtherIdentity("nug-current", 6, "quota-token"),
+			activeOtherIdentity("nug-current", 7, "other-token"),
+			activeOtherIdentity("nug-current", undefined, "quota-token"),
+		];
+		await render();
+		expect(domain.cached).toHaveBeenCalledTimes(1);
+		domain.cached.mockClear();
+		const invalidate = spyOn(qc, "invalidateQueries");
+		restores.push(() => invalidate.mockRestore());
+		await act(async () => emitQuotaBurst(20));
+		expect(domain.cached).toHaveBeenCalledTimes(1);
+		expect(domain.cached.mock.calls[0]?.[0]).toBe("nug-current");
+		expect(domain.cached.mock.calls[0]?.[1]).toMatchObject({ expectedGeneration: 7 });
+		expect(invalidate.mock.calls.map((call) => call[0])).toEqual([
+			{ queryKey: nugQuotaKey("nug-current", 7, "quota-token"), exact: true },
+		]);
+		for (const other of others) {
+			expect(other.reads).toBe(0);
+			expect(qc.getQueryData(other.key)).toBe(other.snapshot);
+			expect(qc.getQueryState(other.key)?.isInvalidated).toBe(false);
+		}
+		expect(domain.aggregate).not.toHaveBeenCalled();
+		expect(domain.rpc).not.toHaveBeenCalled();
+	});
+
+	test("events during a cached refresh coalesce into one follow-up without cancelling transport", async () => {
+		setToken("quota-token");
+		nugProvider = { id: "nug-current", generation: 7 };
+		const domain = quotaDomainSpies();
+		await render();
+		domain.cached.mockClear();
+		const first = deferred<Awaited<ReturnType<typeof api.nugGetCachedQuota>>>();
+		const followup = deferred<Awaited<ReturnType<typeof api.nugGetCachedQuota>>>();
+		domain.cached.mockReturnValueOnce(first.promise).mockReturnValueOnce(followup.promise);
+		await event({ type: "quota_balance", quotaBalance: "first" });
+		expect(domain.cached).toHaveBeenCalledTimes(1);
+		const signal = domain.cached.mock.calls[0]?.[1]?.signal;
+		await act(async () => emitQuotaBurst(20));
+		expect(domain.cached).toHaveBeenCalledTimes(1);
+		expect(signal?.aborted).toBe(false);
+		await act(async () => first.resolve(quotaResult()));
+		expect(domain.cached).toHaveBeenCalledTimes(2);
+		await act(async () => followup.resolve(quotaResult()));
+		expect(domain.cached).toHaveBeenCalledTimes(2);
+		expect(domain.aggregate).not.toHaveBeenCalled();
+		expect(domain.rpc).not.toHaveBeenCalled();
+	});
+
+	test("an old connection credential cannot update local quota state or invalidate any observer", async () => {
+		setToken("quota-token");
+		nugProvider = { id: "nug-current", generation: 7 };
+		const domain = quotaDomainSpies();
+		let socketIdentity = 2;
+		const socket = spyOn(narratorWSManager, "getConnectionCredentialIdentity").mockImplementation(
+			() => socketIdentity,
+		);
+		const credential = spyOn(narratorWSManager, "getCredentialIdentity").mockReturnValue(2);
+		restores.push(
+			() => socket.mockRestore(),
+			() => credential.mockRestore(),
+		);
+		await render();
+		await event({
+			type: "quota_balance",
+			quotaBalance: "accepted",
+			detailedQuotaBalance: "accepted detail",
+		});
+		const balance = current.quotaBalance;
+		const detail = current.detailedQuotaBalance;
+		domain.cached.mockClear();
+		const invalidate = spyOn(qc, "invalidateQueries");
+		restores.push(() => invalidate.mockRestore());
+		socketIdentity = 1;
+		await event({
+			type: "quota_balance",
+			quotaBalance: "stale credential",
+			detailedQuotaBalance: "stale detail",
+		});
+		expect(current.quotaBalance).toBe(balance);
+		expect(current.detailedQuotaBalance).toBe(detail);
+		expect(invalidate).not.toHaveBeenCalled();
+		expect(domain.cached).not.toHaveBeenCalled();
+		expect(domain.aggregate).not.toHaveBeenCalled();
+		expect(domain.rpc).not.toHaveBeenCalled();
+	});
+
+	test("a legacy caller without a provider generation does not add quota reads on a push", async () => {
+		setToken("quota-token");
+		nugProvider = { id: "nug-current" };
+		const domain = quotaDomainSpies();
+		activeOtherIdentity("nug-current", 7, "quota-token");
+		await render();
+		const initialReads = domain.cached.mock.calls.length;
+		await event({ type: "quota_balance", quotaBalance: "legacy push" });
+		expect(current.quotaBalance).toBe("legacy push");
+		expect(domain.cached).toHaveBeenCalledTimes(initialReads);
+		expect(domain.aggregate).not.toHaveBeenCalled();
+		expect(domain.rpc).not.toHaveBeenCalled();
 	});
 });
 
@@ -402,14 +621,226 @@ describe("quota isolation between a main agent and its subagent side by side", (
 	});
 });
 
+describe("event-driven panel control plane", () => {
+	test("online waiting has no permission timer for sixty simulated seconds; offline/hidden recovery is bounded", async () => {
+		Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
+		const intervals = new Map<number, () => void>();
+		let nextId = 0;
+		const fakeInterval = ((callback: Parameters<typeof setInterval>[0], delay?: number) => {
+			expect(delay).toBe(5000);
+			intervals.set(++nextId, callback as () => void);
+			return nextId as unknown as ReturnType<typeof setInterval>;
+		}) as typeof setInterval;
+		const interval = spyOn(globalThis, "setInterval").mockImplementation(fakeInterval);
+		const clear = spyOn(globalThis, "clearInterval").mockImplementation((id) => {
+			intervals.delete(id as unknown as number);
+		});
+		restores.push(
+			() => interval.mockRestore(),
+			() => clear.mockRestore(),
+		);
+		const tick = () =>
+			act(async () => {
+				for (const callback of intervals.values()) callback();
+			});
+		connected = true;
+		await render();
+		for (let seconds = 0; seconds < 60; seconds += 5) await tick();
+		expect(intervals.size).toBe(0);
+		expect(panelSpy).toHaveBeenCalledTimes(1);
+		await connection(false);
+		expect(intervals.size).toBe(1);
+		expect(panelSpy).toHaveBeenCalledTimes(1);
+		await tick();
+		expect(panelSpy).toHaveBeenCalledTimes(2);
+		Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
+		await act(async () => document.dispatchEvent(new window.Event("visibilitychange")));
+		expect(intervals.size).toBe(0);
+		await tick();
+		expect(panelSpy).toHaveBeenCalledTimes(2);
+		Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
+		await act(async () => document.dispatchEvent(new window.Event("visibilitychange")));
+		expect(intervals.size).toBe(1);
+		await connection(true);
+		expect(intervals.size).toBe(0);
+		expect(panelSpy).toHaveBeenCalledTimes(3);
+	});
+
+	test("foreground control-plane recovery starts one fresh reconciliation", async () => {
+		connected = true;
+		await render();
+		panelSpy.mockResolvedValue(page(permissions(1)));
+		await act(async () => {
+			for (const recover of recoveries) recover();
+		});
+		expect(panelSpy).toHaveBeenCalledTimes(2);
+		expect(panelSpy.mock.calls[1]?.[1]?.fresh).toBe(true);
+		expect(current.pendingPermissions).toHaveLength(1);
+	});
+
+	test("complete status patches clear errors and preserve unrelated fields without refetching detail or children", async () => {
+		connected = true;
+		observeDetails = true;
+		qc.setQueryData(["narrators", "n1"], {
+			id: "n1",
+			status: "waiting",
+			model: "keep-model",
+			errorMessage: "old error",
+			errorRetryable: true,
+			archivedWithNarratorId: "old",
+			updatedAt: "old-time",
+			messageCount: 1,
+		});
+		await render();
+		const baseline = detailReads;
+		const frame = {
+			type: "status_change",
+			status: "idle",
+			substatus: [],
+			turnStartedAt: null,
+			updatedAt: "committed-time",
+			messageCount: 17,
+			errorMessage: null,
+			errorRetryable: null,
+			archivedWithNarratorId: null,
+			backgroundWorkActive: false,
+		};
+		await event(frame);
+		await event(frame);
+		expect(qc.getQueryData(["narrators", "n1"])).toMatchObject({
+			status: "idle",
+			model: "keep-model",
+			errorMessage: null,
+			errorRetryable: null,
+			archivedWithNarratorId: null,
+			turnStartedAt: null,
+			updatedAt: "committed-time",
+			messageCount: 17,
+			backgroundWorkActive: false,
+		});
+		// The work-active hint is optional even in an authoritative persisted snapshot.
+		await event({
+			type: "status_change",
+			status: "archived",
+			substatus: [],
+			turnStartedAt: null,
+			updatedAt: "archive-time",
+			errorMessage: null,
+			errorRetryable: null,
+			archivedWithNarratorId: "parent",
+		});
+		expect(qc.getQueryData(["narrators", "n1"])).toMatchObject({
+			status: "archived",
+			updatedAt: "archive-time",
+			archivedWithNarratorId: "parent",
+			model: "keep-model",
+		});
+		expect(detailReads).toBe(baseline);
+		expect(childReads).toBe(1);
+	});
+
+	test("sparse status noise does not read; a legacy lifecycle edge recovers detail exactly once", async () => {
+		connected = true;
+		observeDetails = true;
+		qc.setQueryData(["narrators", "n1"], { id: "n1", status: "waiting", model: "keep" });
+		await render();
+		const baseline = detailReads;
+		for (const status of ["working", "waiting", "waiting", "working"])
+			await event({ type: "status_change", status });
+		expect(detailReads).toBe(baseline);
+		await event({ type: "status_change", status: "idle" });
+		await event({ type: "status_change", status: "idle" });
+		expect(detailReads).toBe(baseline + 1);
+		expect(childReads).toBe(1);
+	});
+
+	test("sparse subagent statuses merge labels and recover only real lifecycle boundaries", async () => {
+		connected = true;
+		observeDetails = true;
+		observedDetailId = "child";
+		qc.setQueryData(["narrators", "child"], { id: "child", status: "working", model: "keep" });
+		await render();
+		const baseline = detailReads;
+		for (const status of ["working", "waiting", "waiting", "working"])
+			await event({
+				type: "subagent_status_changed",
+				subagentNarratorId: "child",
+				status,
+				substatus: ["reasoning"],
+			});
+		expect(detailReads).toBe(baseline);
+		expect(qc.getQueryData(["narrators", "child"])).toMatchObject({
+			model: "keep",
+			substatus: ["reasoning"],
+		});
+		await event({
+			type: "subagent_status_changed",
+			subagentNarratorId: "child",
+			status: "idle",
+			substatus: [],
+		});
+		await event({ type: "subagent_status_changed", subagentNarratorId: "child", status: "idle" });
+		expect(detailReads).toBe(baseline + 1);
+		expect(childReads).toBe(1);
+		await event({
+			type: "subagent_status_changed",
+			subagentNarratorId: "uncached",
+			status: "idle",
+		});
+		expect(qc.getQueryData(["narrators", "uncached"])).toBeUndefined();
+	});
+
+	test("a sparse status never creates a fake complete narrator cache", async () => {
+		connected = true;
+		await render();
+		await event({ type: "status_change", status: "working" });
+		expect(qc.getQueryData(["narrators", "n1"])).toBeUndefined();
+	});
+});
+
 describe("mounted panel and real WS hook reconciliation", () => {
-	test("mounting on an already connected socket still starts a fresh post-subscription read", async () => {
+	test("mounting on an already connected socket starts one initial mount-scoped read", async () => {
 		connected = true;
 		panelSpy.mockResolvedValue(page(permissions(1)));
 		await render();
 		expect(panelSpy).toHaveBeenCalledTimes(1);
-		expect(panelSpy.mock.calls[0]?.[1]?.fresh).toBe(true);
+		expect(panelSpy.mock.calls[0]?.[1]?.fresh).toBe(false);
 		expect(current.pendingPermissions.map((item) => item.id)).toEqual(["p0"]);
+	});
+
+	test("online initial transport failure retries with a budget and stops after restoring permissions", async () => {
+		connected = true;
+		panelSpy
+			.mockRejectedValueOnce(new ApiError("temporarily unavailable", 503))
+			.mockResolvedValue(page(permissions(1)));
+		const pending = spyOn(api, "getPendingPermissions").mockRejectedValue(new TypeError("offline"));
+		const buffer = spyOn(api, "getBufferedMessages").mockRejectedValue(new TypeError("offline"));
+		restores.push(
+			() => pending.mockRestore(),
+			() => buffer.mockRestore(),
+		);
+		await render();
+		expect(panelSpy).toHaveBeenCalledTimes(1);
+		await retryTick();
+		expect(panelSpy).toHaveBeenCalledTimes(2);
+		expect(current.pendingPermissions.map((permission) => permission.id)).toEqual(["p0"]);
+		await retryTick();
+		expect(panelSpy).toHaveBeenCalledTimes(2);
+	});
+
+	test("raw disconnect/reconnect batched in one act still starts a fresh read", async () => {
+		connected = true;
+		await render();
+		const readScope = current.readScope;
+		expect(panelSpy).toHaveBeenCalledTimes(1);
+		await act(async () => {
+			connected = false;
+			for (const update of connections) update(false, false);
+			connected = true;
+			for (const update of connections) update(true, true);
+		});
+		expect(panelSpy).toHaveBeenCalledTimes(2);
+		expect(panelSpy.mock.calls[1]?.[1]).toMatchObject({ fresh: true, readScope });
 	});
 
 	test("first connect removes permissions and buffer consumed during the disconnected REST-to-WS gap", async () => {

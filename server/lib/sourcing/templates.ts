@@ -21,7 +21,7 @@ import {
 	commandCodeQuotaIdentity,
 	probeCommandCodeQuota,
 } from "../commandcode-usage";
-import type { CredentialAuth } from "../credential-store";
+import type { Credential, CredentialAuth } from "../credential-store";
 import { customApiStreamQuotaIdentity } from "../custom-api-quota-cache";
 import { deepSeekQuotaIdentity, probeDeepSeekQuota } from "../deepseek-balance-cache";
 import { kimiQuotaIdentity, probeKimiQuota } from "../kimi-usage-cache";
@@ -36,6 +36,7 @@ import type {
 	NUGProviderConfig,
 	TokenDanceSettings,
 } from "../settings/types";
+import { readTemplateModelList, type SourceModel } from "./model-list-readers";
 import { type CredentialRouting, keyRouting, type RoutingPreview } from "./routing";
 import type { SourceGroupView } from "./source-groups";
 
@@ -90,6 +91,12 @@ export interface ServiceTemplate {
 	/** Whether any credential can serve; specialised pools retain their own policies. */
 	hasAvailableCredentials?: CredentialRouting["hasAvailableCredentials"];
 	routingPreview?: (group: SourceGroupView, now: number) => RoutingPreview | null;
+	/** Complete cached model entries. Explicit refresh stays with the catalog owner. */
+	listModels: (
+		group: SourceGroupView,
+		credential?: Credential,
+		signal?: AbortSignal,
+	) => Promise<readonly SourceModel[]>;
 }
 
 type ProbeQuota = NonNullable<ServiceTemplate["probeQuota"]>;
@@ -179,7 +186,7 @@ const KIMI_CODE = (host: string): ProtocolEndpoints => ({
 	"openai-responses": `https://${host}/coding/v1`,
 });
 
-const TEMPLATES: readonly ServiceTemplate[] = [
+const TEMPLATES: readonly Omit<ServiceTemplate, "listModels">[] = [
 	{
 		id: "codex",
 		kind: "known",
@@ -346,7 +353,19 @@ const byId = new Map<ServiceTemplateId, ServiceTemplate>(
 		const probeQuota = QUOTA_PROBES[template.id];
 		return [
 			template.id,
-			deepFreeze({ ...template, ...(probeQuota && { probeQuota }), ...ROUTING[template.id] }),
+			deepFreeze({
+				...template,
+				...(probeQuota ? { probeQuota } : {}),
+				...ROUTING[template.id],
+				listModels: async (
+					group: SourceGroupView,
+					_credential?: Credential,
+					signal?: AbortSignal,
+				) => {
+					signal?.throwIfAborted();
+					return readTemplateModelList(group);
+				},
+			}),
 		];
 	}),
 );

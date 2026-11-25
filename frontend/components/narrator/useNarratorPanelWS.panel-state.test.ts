@@ -94,6 +94,9 @@ function callbacks(
 		reconcilePanelStatePages,
 		shouldFallbackPanelState,
 		narratorId: "n1",
+		token: "test-token",
+		getToken: () => "test-token",
+		readScope: {},
 		currentUser: { id: "u1" },
 		qc: { getQueryData: () => ({ id: userId }) },
 		api: {

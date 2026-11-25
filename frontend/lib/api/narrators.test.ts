@@ -69,6 +69,26 @@ describe("narrators API", () => {
 		expect(requests[0].init.body).toBeUndefined();
 	});
 
+	test("modeltrace calibration posts the result ID to the encoded child endpoint", async () => {
+		Object.defineProperty(g, "localStorage", {
+			value: { getItem: () => null },
+			configurable: true,
+		});
+		const requests: Array<{ url: string; init: RequestInit }> = [];
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async (url: unknown, init: RequestInit) => {
+				requests.push({ url: String(url), init });
+				return Response.json({ id: "child/a" });
+			},
+		});
+		expect(await api.calibrateModelTrace("child/a", "result/a")).toEqual({ id: "child/a" });
+		expect(requests).toHaveLength(1);
+		expect(requests[0].url).toBe("/api/narrators/child%2Fa/modeltrace/calibrate");
+		expect(requests[0].init.method).toBe("POST");
+		expect(JSON.parse(String(requests[0].init.body))).toEqual({ resultId: "result/a" });
+	});
+
 	test("message and block deletions are always history-only", async () => {
 		Object.defineProperty(g, "localStorage", {
 			value: { getItem: () => null },

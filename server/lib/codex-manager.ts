@@ -2744,6 +2744,19 @@ export class CodexManager {
 		return this.entries.find((entry) => entry.id === id)?.usage;
 	}
 
+	/**
+	 * Configured pool membership, not immediate serving availability. Quota and failure
+	 * blocks are runtime state; manual/legacy disables, bans and archival retire a credential.
+	 * Pure in-memory read: never revive, apply quota, select an account, or persist state.
+	 */
+	get hasConfiguredCredentials(): boolean {
+		return this.entries.some(
+			(entry) =>
+				!isArchivedCodexCredential(entry) &&
+				(!entry.disabled || isBlockReason(entry.disabledReason)),
+		);
+	}
+
 	/** Lightweight availability check without building account snapshots or quota forecasts. */
 	get hasAvailableCredentials(): boolean {
 		this.reviveQuotaResetCredentials();

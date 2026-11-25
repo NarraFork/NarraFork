@@ -39,6 +39,7 @@ import {
 	authorizedFetch,
 	clearTokenOnSessionFailure,
 	getToken,
+	onTokenChange,
 	postBodyWithProgress,
 	postFormDataWithProgress,
 	readFetchError,
@@ -95,7 +96,18 @@ export interface ComposerDocumentDetail {
 	bodyRevision?: number;
 }
 
+const panelReadScopeBrand = Symbol("NarratorPanelReadScope");
+/** Opaque mount/principal lifetime. Never serialize it into request URLs. */
+export type NarratorPanelReadScope = Readonly<{ [panelReadScopeBrand]: true }>;
+const panelReadTokens = new WeakMap<NarratorPanelReadScope, string | null>();
+export function createNarratorPanelReadScope(): NarratorPanelReadScope {
+	const scope = Object.freeze({ [panelReadScopeBrand]: true as const });
+	panelReadTokens.set(scope, getToken());
+	return scope;
+}
+
 export interface NarratorPanelStateOptions extends SharedReadOptions {
+	readScope?: NarratorPanelReadScope;
 	permissionsCursor?: string;
 	bufferCursor?: string;
 }
@@ -134,34 +146,58 @@ export type NarratorDetail = ApiEntity &
 		deliversResult?: boolean;
 	};
 
-const sharePanelStateRead = createSharedInflight<NarratorPanelStateResponse>();
+const panelStateReads = new WeakMap<
+	NarratorPanelReadScope,
+	ReturnType<typeof createSharedInflight<NarratorPanelStateResponse>>
+>();
 
 /** Live-request deduplication only; safety reconciliation never adopts query-cache permissions. */
 export function getNarratorPanelState(id: string, options: NarratorPanelStateOptions = {}) {
 	const { permissionsCursor, bufferCursor } = options;
-	const scope = getToken();
-	const key = JSON.stringify([scope, id, permissionsCursor ?? null, bufferCursor ?? null]);
+	// Callers without an explicit mount scope remain isolated rather than borrowing
+	// a request that predates their event subscription.
+	const readScope = options.readScope ?? createNarratorPanelReadScope();
+	let sharePanelStateRead = panelStateReads.get(readScope);
+	if (!sharePanelStateRead) {
+		sharePanelStateRead = createSharedInflight<NarratorPanelStateResponse>();
+		panelStateReads.set(readScope, sharePanelStateRead);
+	}
+	const token = panelReadTokens.get(readScope);
+	if (token === undefined || getToken() !== token)
+		return Promise.reject(new DOMException("Principal changed", "AbortError"));
+	const key = JSON.stringify([token, id, permissionsCursor ?? null, bufferCursor ?? null]);
 	return sharePanelStateRead(
 		key,
 		async (signal) => {
 			const controller = new AbortController();
 			const abort = () => controller.abort(signal.reason);
+			const checkToken = () => {
+				if (getToken() !== token)
+					controller.abort(new DOMException("Principal changed", "AbortError"));
+			};
+			const unsubscribe = onTokenChange(checkToken);
 			signal.addEventListener("abort", abort, { once: true });
 			if (signal.aborted) abort();
+			checkToken();
 			const timer = setTimeout(
 				() => controller.abort(new Error("Panel state read timed out")),
 				10_000,
 			);
 			try {
+				controller.signal.throwIfAborted();
 				const params = new URLSearchParams();
 				if (permissionsCursor) params.set("permissionsCursor", permissionsCursor);
 				if (bufferCursor) params.set("bufferCursor", bufferCursor);
 				const query = params.toString();
-				return await request<NarratorPanelStateResponse>(
+				const snapshot = await request<NarratorPanelStateResponse>(
 					`/narrators/${encodeURIComponent(id)}/panel-state${query ? `?${query}` : ""}`,
 					{ signal: controller.signal },
 				);
+				checkToken();
+				controller.signal.throwIfAborted();
+				return snapshot;
 			} finally {
+				unsubscribe();
 				clearTimeout(timer);
 				signal.removeEventListener("abort", abort);
 			}
@@ -817,6 +853,11 @@ export const narratorsApi = {
 		request<{ id: string }>(`/narrators/${encodeURIComponent(narratorId)}/modeltrace/retry`, {
 			method: "POST",
 		}),
+	calibrateModelTrace: (narratorId: string, resultId: string) =>
+		request<{ id: string }>(`/narrators/${encodeURIComponent(narratorId)}/modeltrace/calibrate`, {
+			method: "POST",
+			body: JSON.stringify({ resultId }),
+		}),
 	/** 该模型是否已经有 ModelTrace 舱；没有跑过时为 null。 */
 	getModelTraceNarrator: (model: string) =>
 		request<{ narratorId: string | null }>(
@@ -1127,6 +1168,23 @@ export const narratorsApi = {
 		}),
 	// Named narrators (@handle mention targets)
 	listNamedNarrators: () => request<ApiEntity[]>("/narrators/named"),
+	listNamedNarratorSuggestions: (
+		params: { q?: string; limit?: number; cursor?: string } = {},
+		opts?: { signal?: AbortSignal },
+	) => {
+		const query = new URLSearchParams({ view: "suggestions" });
+		if (params.q !== undefined) query.set("q", params.q);
+		if (params.limit !== undefined) query.set("limit", String(params.limit));
+		if (params.cursor !== undefined) query.set("cursor", params.cursor);
+		const timeout = AbortSignal.timeout(5_000);
+		return request<import("@shared/named-narrator-suggestions").NamedNarratorSuggestionsPage>(
+			`/narrators/named?${query}`,
+			{
+				signal: opts?.signal ? AbortSignal.any([opts.signal, timeout]) : timeout,
+				maxResponseBytes: 48 * 1024,
+			},
+		);
+	},
 	getNarratorByHandle: (handle: string) =>
 		request<ApiEntity>(`/narrators/by-handle/${encodeURIComponent(handle)}`),
 	updateNarratorHandle: (id: string, handle: string | null) =>
@@ -1644,6 +1702,15 @@ export const narratorsApi = {
 				method: "POST",
 			},
 		),
+	/**
+	 * Run one plan reflection for a plan that is already waiting for approval. Answers as soon
+	 * as the review starts; its outcome arrives through the `plan_reflection_*` WS frames and
+	 * the permission resolution that follows them.
+	 */
+	reflectPlan: (requestId: string) =>
+		request<{ ok: boolean; started: boolean }>(`/narrators/permissions/${requestId}/reflect-plan`, {
+			method: "POST",
+		}),
 	disarmQuestionReflection: (requestId: string) =>
 		request<{ ok: boolean; disarmed: boolean }>(
 			`/narrators/permissions/${requestId}/disarm-question-reflection`,
@@ -1746,13 +1813,13 @@ export const narratorsApi = {
 			`/narrators/${id}/custom-traits/blocked-skills`,
 			{ method: "DELETE" },
 		),
-	getNarratorExecutionDevices: (id: string) =>
+	getNarratorExecutionDevices: (id: string, signal?: AbortSignal) =>
 		request<{
 			defaultDeviceId: string | null;
 			devices: NarratorExecutionDevice[];
 			/** Working directory recorded per device; absence means "not configured". */
 			directories?: WorkspaceDirectoryMap;
-		}>(`/narrators/${id}/execution-devices`),
+		}>(`/narrators/${id}/execution-devices`, { signal }),
 	/**
 	 * Browse one level of a device's filesystem through a narrator's device
 	 * authorization, so non-admin users can use the remote path picker.

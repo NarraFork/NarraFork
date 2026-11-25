@@ -530,6 +530,19 @@ export function getOpencodeCachedUsage(providerId: string): OpencodeUsageCache |
 	return id && entry ? cacheOf(id, entry) : null;
 }
 
+/** Targeted published token only; do not construct the all-provider usage map. */
+export function peekOpencodeUsageGeneration(providerId: string): string | undefined {
+	const subjects = usageSubjects(
+		(config) => config.id === providerId && isOpencodeCustomApiProvider(config),
+	);
+	const id = shownSubjectId(subjects, providerId);
+	const current = subjects.find((subject) => subject.id === id);
+	const entry = id ? entries.get(id) : undefined;
+	return entry && current && entry.identity === opencodeQuotaIdentity(current.config)
+		? entry.generation
+		: undefined;
+}
+
 /** Provider id → `pick(entry)` of the key it reports. */
 function byProvider<T>(pick: (id: string, entry: Entry) => T): Record<string, T> {
 	syncOpencodeUsageCache();

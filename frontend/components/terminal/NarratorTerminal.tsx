@@ -1,4 +1,5 @@
 import { ActionIcon, Box, Group, Text, Tooltip } from "@mantine/core";
+import { useDocumentVisibility } from "@mantine/hooks";
 import { IconPlus } from "@tabler/icons-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -17,6 +18,8 @@ import { TerminalTabBar } from "./TerminalTabBar";
 
 interface NarratorTerminalProps {
 	narratorId: string;
+	/** Dock visibility, not keyboard focus. Hidden terminals must not read or connect. */
+	visible?: boolean;
 	onSendToChat?: (text: string) => void;
 	onExit?: (code: number) => void;
 }
@@ -56,7 +59,20 @@ const LAYOUT_PANEL_COUNT: Record<TerminalLayout, number> = {
 	quad: 4,
 };
 
-export function NarratorTerminal({ narratorId, onSendToChat, onExit }: NarratorTerminalProps) {
+export function NarratorTerminal({ visible = true, ...props }: NarratorTerminalProps) {
+	const documentVisibility = useDocumentVisibility();
+	const canOpen = useCanOpenTerminals(props.narratorId);
+	// PTY state remains on the server; unmounting releases xterm/WS and in-flight list reads.
+	return visible &&
+		documentVisibility === "visible" &&
+		typeof document !== "undefined" &&
+		document.visibilityState === "visible" &&
+		canOpen === true ? (
+		<NarratorTerminalContent {...props} />
+	) : null;
+}
+
+function NarratorTerminalContent({ narratorId, onSendToChat, onExit }: NarratorTerminalProps) {
 	const ctx = useMemo(() => ({ narratorId }), [narratorId]);
 	const { data: terminals } = useNarratorTerminals(narratorId);
 	const createTerminal = useCreateNarratorTerminal(narratorId);

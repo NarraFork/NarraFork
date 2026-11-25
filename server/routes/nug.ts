@@ -26,6 +26,7 @@ import {
 } from "../lib/nug-quota-cache";
 import { getNugRelayStatus } from "../lib/nug-relay/manager";
 import {
+	getSettingsRevision,
 	type NUGProviderConfig,
 	nugProviderPrefix,
 	registerNugModelChecker,
@@ -33,10 +34,15 @@ import {
 	saveSettings,
 	settings,
 } from "../lib/settings";
+import { registerModelListReader } from "../lib/sourcing/model-list-readers";
+import { sourceGroupForConnection } from "../lib/sourcing/source-groups";
+import { getServiceTemplate } from "../lib/sourcing/templates";
 import { spaRedirectLocation } from "../lib/spa-base-href";
 
 export const nugRoutes = new Hono();
 export { getAllNugCachedQuotas, getNugCachedQuota, updateNugQuotaByPrefix };
+
+registerModelListReader("nug", (group) => getNugCachedModelsByProvider(group.id));
 
 function normalizeNugBaseUrl(baseUrl: string | undefined): string {
 	return (baseUrl ?? "")
@@ -531,9 +537,21 @@ nugRoutes.post("/models/refresh-if-stale", async (c) => {
 	});
 });
 
-nugRoutes.get("/providers/:id/models", (c) => {
+nugRoutes.get("/providers/:id/models", async (c) => {
 	const id = c.req.param("id");
-	return c.json({ models: getNugCachedModelsByProvider(id), fromCache: true });
+	const config = (settings.nugProviders ?? []).find((provider) => provider.id === id);
+	const group = sourceGroupForConnection(
+		{ id, name: config?.name ?? id, ...config, prefix: config ? nugProviderPrefix(config) : id },
+		"nug",
+	);
+	return c.json({
+		models: await getServiceTemplate(group.templateId).listModels(
+			group,
+			undefined,
+			c.req.raw.signal,
+		),
+		fromCache: true,
+	});
 });
 
 nugRoutes.post("/providers/:id/models/refresh", async (c) => {
@@ -812,8 +830,41 @@ nugRoutes.post("/providers/:id/api-key", async (c) => {
 	}
 });
 
-/** Get cached quotas for all NUG providers. */
+/** Targeted header view is cached-only; legacy management callers retain the all-provider view. */
 nugRoutes.get("/quotas", (c) => {
+	const providerId = c.req.query("providerId");
+	if (providerId !== undefined) {
+		if (!providerId || providerId.length > 128)
+			return c.json({ error: "Invalid provider id" }, 400);
+		const generation = getSettingsRevision();
+		const expected = c.req.query("expectedGeneration");
+		if (expected !== undefined && (!/^\d{1,16}$/.test(expected) || Number(expected) !== generation))
+			return c.json(
+				{ error: "Provider identity changed", code: "MODEL_RUNTIME_STALE", generation },
+				409,
+			);
+		const config = settings.nugProviders?.find(
+			(provider) => provider.id === providerId && !provider.disabled,
+		);
+		if (!config) return c.json({ error: "Provider not found" }, 404);
+		const cached = getNugCachedQuota(providerId);
+		if ((cached?.detailedQuotaBalance?.length ?? 0) > 64 * 1024)
+			return c.json({ error: "Cached quota exceeds byte budget", code: "RESPONSE_TOO_LARGE" }, 413);
+		const response = {
+			generation,
+			quota: cached
+				? {
+						balance: cached.balance,
+						totalGranted: cached.totalGranted,
+						detailedQuotaBalance: cached.detailedQuotaBalance,
+						fetchedAt: cached.fetchedAt,
+					}
+				: null,
+		};
+		if (new TextEncoder().encode(JSON.stringify(response)).byteLength > 64 * 1024)
+			return c.json({ error: "Cached quota exceeds byte budget", code: "RESPONSE_TOO_LARGE" }, 413);
+		return c.json(response);
+	}
 	return c.json(getAllNugCachedQuotas());
 });
 

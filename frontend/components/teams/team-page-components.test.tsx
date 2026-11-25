@@ -1,34 +1,37 @@
 /**
- * The team page's components rendered with the real Mantine and both locales (P4): a card shows
- * its title, branch, worker, last verdict and marks as icons; the board's columns show the
- * summary's counts with finished columns folded; the top bar shows approvals and "pause all" to
- * members only; the activity words each event; every `teams` string exists in both languages.
+ * The team page's components rendered with the real Mantine and both locales (the redesign R):
+ * the header's status sentence, people and 全部暂停 (members only, kept while an archived team's
+ * workers run); 「等你处理」 cards of each kind, folded past three, 合并 shown disabled; the work
+ * list's groups and rows, its starting and wrap-up states, read-only 「等成员处理」; the activity
+ * words each event; every `teams` string exists in both languages.
  */
 import { afterAll, describe, expect, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import type {
 	TeamActivityPage,
-	TeamApprovalsResponse,
-	TeamBoardColumn,
-	TeamBoardColumnPage,
 	TeamBoardItem,
 	TeamMembersResponse,
 	TeamPageSummary,
-	TeamPersonDecisionEventKind,
+	TeamPendingApproval,
+	TeamSummary,
 } from "@shared/project-teams";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createInstance } from "i18next";
 import type { ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { I18nextProvider } from "react-i18next";
+import { RECENT_TABS_QUERY_KEY } from "../../hooks/useRecentTabs";
 import { teamKeys } from "../../hooks/useTeams";
 import en from "../../locales/en/projects.json";
 import zh from "../../locales/zh-CN/projects.json";
-import { TeamActivity } from "./TeamActivity";
-import { TeamBoard, TeamBoardCard } from "./TeamBoard";
+import { ProjectTeamsList } from "./ProjectTeamsList";
+import { ActivityLine, TeamActivity } from "./TeamActivity";
+import { TeamAttention } from "./TeamAttention";
+import { TeamHeader } from "./TeamHeader";
 import { TeamMembersPanel } from "./TeamMembers";
-import { TeamApprovalsList, TeamTopBar } from "./TeamTopBar";
-import { TEAM_BOARD_COLUMNS } from "./team-page-model";
+import { TeamReadOnlyStart, TeamStart } from "./TeamStart";
+import { TeamWorkList } from "./TeamWorkList";
+import { attentionEntries, statusSentence, teamPageMode } from "./team-page-model";
 
 const previousStorage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
 Object.defineProperty(globalThis, "localStorage", {
@@ -71,10 +74,10 @@ const item = (patch: Partial<TeamBoardItem> = {}): TeamBoardItem => ({
 	baseRef: "main",
 	headSha: "0123456789ab",
 	worker: { id: "n-worker", title: "Board worker", status: "working" },
-	reviewRounds: 2,
-	lastReview: "blocker",
+	reviewRounds: 0,
+	lastReview: null,
 	hasWorktree: true,
-	exclusiveKey: "migrations",
+	exclusiveKey: null,
 	createdAt: "2026-11-18T00:00:00.000Z",
 	updatedAt: "2026-11-18T00:00:00.000Z",
 	...patch,
@@ -87,225 +90,358 @@ const summary = (patch: Partial<TeamPageSummary> = {}): TeamPageSummary => ({
 	runningAgents: [],
 	runningCount: 0,
 	pendingApprovalCount: 0,
-	columnCounts: { queued: 1, in_progress: 1, review: 0, done: 3, cancelled: 0 },
+	columnCounts: { queued: 1, in_progress: 2, review: 1, done: 3, cancelled: 1 },
 	lastEventId: null,
 	lastEventAt: null,
+	coordinatorMessageCount: 4,
+	coordinatorStopReason: null,
 	...patch,
 });
 
-function seededClient(columns: Partial<Record<TeamBoardColumn, TeamBoardItem[]>>) {
-	const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-	for (const column of TEAM_BOARD_COLUMNS) {
-		const page: TeamBoardColumnPage = { column, items: columns[column] ?? [], nextCursor: null };
-		client.setQueryData(teamKeys.board("lead", column), {
-			pages: [page],
-			pageParams: [undefined],
-		});
-	}
-	return client;
-}
+const call = (patch: Partial<TeamPendingApproval> = {}): TeamPendingApproval => ({
+	id: "call-1",
+	agent: { id: "n-worker", title: "Board worker", status: "waiting" },
+	depth: 1,
+	parentId: "lead",
+	toolName: "Bash",
+	kind: "tool",
+	preview: "pnpm --filter web add @acme/pay-sdk@3.2.0",
+	questions: [],
+	decisionReason: null,
+	createdAt: "2026-11-18T00:00:00.000Z",
+	...patch,
+});
 
-describe("board card", () => {
-	test("title, branch, worker status, verdict with rounds, marks as icons", async () => {
-		const html = await render(<TeamBoardCard item={item()} />);
-		expect(html).toContain('data-state="in_progress"');
-		expect(html).toContain("Add the board");
-		expect(html).toContain("team/add-the-board-1a2b3c4d");
-		expect(html).toContain("Board worker");
-		expect(html).toContain('data-verdict="blocker"');
-		expect(html).toContain("Last review: blocker · 2 review rounds");
-		expect(html).toContain('data-mark="exclusive"');
-		expect(html).not.toContain('data-mark="cleanable"');
-		// The state is the outline's badge (an SVG with its state), never a text glyph.
-		expect(html).toMatch(/<svg[^>]*data-status="doing"[^>]*aria-label="In progress"/);
-		expect(html).not.toMatch(/[☐☑✓✔✗✘●○◐]/);
-	});
+const noop = () => {};
 
-	test("no worker, no branch, no verdict; a merged item holding its worktree", async () => {
-		const html = await render(
-			<TeamBoardCard
-				item={item({
-					state: "merged",
-					worker: null,
-					branch: null,
-					lastReview: null,
-					exclusiveKey: null,
+describe("header", () => {
+	const header = (s: TeamPageSummary, phone = false, lng: "en" | "zh-CN" = "en") =>
+		render(
+			<TeamHeader
+				projectId="p"
+				teamId="lead"
+				projectName="acme-app"
+				title="Release crew"
+				pinTitle="Release crew"
+				summary={s}
+				status={statusSentence({
+					summary: s,
+					member: s.access === "write",
+					waiting: 1,
+					waitingItems: 1,
 				})}
+				phone={phone}
+				onBack={noop}
+				onOpenCoordinatorSession={noop}
+				onOpenSettings={noop}
+				onDisband={noop}
 			/>,
+			new QueryClient(),
+			lng,
 		);
-		expect(html).toContain("No worker yet");
-		expect(html).toContain("No branch yet");
-		expect(html).not.toContain("data-verdict");
-		expect(html).toContain('data-mark="cleanable"');
-		expect(html).toMatch(/data-status="done"/);
+
+	test("crumb, name, one status sentence; members get pause all, people, pin and the menu", async () => {
+		const html = await header(summary({ runningCount: 2 }));
+		expect(html).toContain("acme-app");
+		expect(html).toContain("Release crew");
+		expect(html).toContain('data-testid="team-status" data-tone="active"');
+		expect(html).toContain("3 in progress");
+		expect(html).toContain("1 waiting on you");
+		expect(html).toContain('data-testid="team-pause-all"');
+		expect(html).toContain('data-testid="team-members-button"');
+		expect(html).toContain('data-testid="pin-to-sidebar"');
+		expect(html).toContain('data-testid="team-more-menu"');
+		// 全部暂停 is an ordinary button, not a red one.
+		expect(html).not.toMatch(/data-testid="team-pause-all"[^>]*red/);
+		const zhHtml = await header(summary({ runningCount: 2 }), false, "zh-CN");
+		expect(zhHtml).toContain("3 项进行中");
+		expect(zhHtml).toContain("1 项等你");
+		expect(zhHtml).toContain("全部暂停");
 	});
 
-	test("Chinese", async () => {
-		const html = await render(<TeamBoardCard item={item()} />, new QueryClient(), "zh-CN");
-		expect(html).toContain("最近评审：有阻塞 · 2 轮评审");
-		expect(html).toContain('aria-label="进行中"');
+	test("onlookers: no pause all; their sentence says waiting on members", async () => {
+		const html = await header(summary({ access: "read", pendingApprovalCount: null }));
+		expect(html).not.toContain("team-pause-all");
+		expect(html).toContain("1 waiting on members");
+		expect(html).toContain('data-testid="team-members-button"');
+	});
+
+	test("phone: two rows, the menu button first, pause all moved into the menu", async () => {
+		const html = await header(summary({ runningCount: 1 }), true);
+		expect(html).toContain('data-phone="true"');
+		expect(html).not.toContain('data-testid="team-pause-all"');
+		expect(html).not.toContain("team-crumb-project");
+	});
+
+	test("an archived team says so; pause all only while its workers still run", async () => {
+		const archived = summary({ coordinatorStatus: "archived" });
+		const html = await header(archived);
+		expect(html).toContain('data-testid="team-archived"');
+		expect(html).toContain("Archived");
+		expect(html).not.toContain("team-pause-all");
+		expect(await header({ ...archived, runningCount: 2 })).toContain("team-pause-all");
+	});
+
+	test("pin reads the sidebar's pin", async () => {
+		const pinned = new QueryClient();
+		pinned.setQueryData(RECENT_TABS_QUERY_KEY, [
+			{ type: "team", id: "lead", title: "Release crew", lastVisitedAt: 1, pinned: true },
+		]);
+		const html = await render(
+			<TeamHeader
+				projectId="p"
+				teamId="lead"
+				projectName={null}
+				title="Release crew"
+				pinTitle="Release crew"
+				summary={summary()}
+				status={null}
+				phone={false}
+				onBack={noop}
+			/>,
+			pinned,
+		);
+		expect(html).toContain('data-pinned="true"');
 	});
 });
 
-describe("ready items and approvals answered in their session", () => {
-	test("a ready card in the review column says its state in words", async () => {
-		const html = await render(
-			<TeamBoardCard item={item({ state: "ready", lastReview: "clear" })} />,
+describe("等你处理", () => {
+	const items = [
+		item({ id: "a" }),
+		item({
+			id: "r",
+			state: "ready",
+			lastReview: "clear",
+			reviewRounds: 2,
+			title: "Fix the CSV time zone",
+			branch: "team/csv-tz",
+		}),
+	];
+	const attention = (approvals: TeamPendingApproval[], lng: "en" | "zh-CN" = "en", phone = false) =>
+		render(
+			<TeamAttention
+				entries={attentionEntries({ member: true, approvals, items })}
+				phone={phone}
+				teamId="lead"
+				base="main"
+				stats={{ r: { added: 42, removed: 11, files: 5, binaryFiles: 0, truncated: false } }}
+				onOpenItem={noop}
+				onOpenSession={noop}
+			/>,
+			new QueryClient(),
+			lng,
 		);
-		expect(html).toContain('data-testid="team-card-state"');
-		expect(html).toContain("Ready to merge");
-		expect(html).toMatch(/data-status="delegated"/);
-		expect(html).not.toMatch(/data-status="newly_done"/);
-		const review = await render(<TeamBoardCard item={item({ state: "in_review" })} />);
-		expect(review).not.toContain("team-card-state");
+
+	test("hidden when nothing waits", async () => {
+		const html = await render(
+			<TeamAttention
+				entries={[]}
+				phone={false}
+				teamId="lead"
+				base="main"
+				stats={undefined}
+				onOpenItem={noop}
+			/>,
+		);
+		expect(html).not.toContain("team-attention");
 	});
 
-	test("questions show as text with Open session, never Approve / Deny", async () => {
-		const client = new QueryClient();
-		const approvals: TeamApprovalsResponse = {
-			more: false,
-			unscanned: false,
-			recent: [],
-			approvals: [
-				{
-					id: "q1",
-					agent: { id: "w", title: "Worker", status: "waiting" },
-					depth: 1,
-					toolName: "AskUserQuestion",
+	test("a tool call: who, the command, deny / approve; a ready item: +/-, files, verdict, branch, merge disabled", async () => {
+		const html = await attention([call()]);
+		expect(html).toContain('data-kind="tool"');
+		expect(html).toContain("Add the board");
+		expect(html).toContain("the worker asks to run Bash");
+		expect(html).toContain("pnpm --filter web add @acme/pay-sdk@3.2.0");
+		expect(html).toContain('data-testid="team-approval-deny"');
+		expect(html).toContain('data-testid="team-approval-approve"');
+		expect(html).toContain('data-kind="merge"');
+		expect(html).toContain("+42");
+		expect(html).toContain("-11");
+		expect(html).toContain("5 files");
+		expect(html).toContain("Review passed · round 2");
+		expect(html).toContain("team/csv-tz → main");
+		expect(html).toContain('data-testid="team-merge-view"');
+		expect(html).toContain('data-testid="team-merge-return"');
+		expect(html).toMatch(/<button[^>]*disabled=""[^>]*data-testid="team-merge"/);
+		expect(html).toContain('data-testid="team-attention-count"');
+	});
+
+	test("a question with options and 自己写…; a plan with 看计划 / 批准; a rule opens its session", async () => {
+		const html = await attention(
+			[
+				call({
+					id: "q",
 					kind: "question",
+					toolName: "AskUserQuestion",
 					preview: "",
-					questions: ["Which branch first?"],
-					decisionReason: null,
-					createdAt: "2026-11-18T00:00:00.000Z",
-				},
-				{
-					id: "t1",
-					agent: { id: "w", title: "Worker", status: "waiting" },
-					depth: 1,
-					toolName: "Bash",
-					kind: "tool",
-					preview: "bun test",
-					questions: [],
-					decisionReason: null,
-					createdAt: "2026-11-18T00:00:01.000Z",
-				},
+					questions: ["Which rounding rule?"],
+					answerForm: {
+						header: "Rounding",
+						description: null,
+						options: ["Half up", "Banker's"],
+						optionDescriptions: [null, null],
+						multiSelect: false,
+					},
+				}),
+				call({
+					id: "plan",
+					kind: "plan",
+					toolName: "ExitPlanMode",
+					preview: "Release order",
+					depth: 0,
+					agent: { id: "lead", title: "Lead", status: "waiting" },
+					parentId: null,
+				}),
 			],
-		};
-		client.setQueryData(teamKeys.approvals("lead"), approvals);
-		const html = await render(
-			<TeamApprovalsList projectId="p" teamId="lead" onOpenSession={() => {}} />,
-			client,
+			"zh-CN",
 		);
-		const [question, tool] = html.split('data-testid="team-approval"').slice(1);
-		expect(question).toContain("Question");
-		expect(question).toContain("Which branch first?");
-		expect(question).toContain("team-approval-open");
-		expect(question).not.toContain("team-approval-approve");
-		expect(question).not.toContain("questions&quot;");
-		expect(tool).toContain("team-approval-approve");
-		expect(tool).toContain("bun test");
-		expect(html).not.toContain("team-recent-decisions");
+		expect(html).toContain("Which rounding rule?");
+		expect(html.match(/data-testid="team-question-option"/g)).toHaveLength(2);
+		expect(html).toContain("Banker&#x27;s");
+		expect(html).toContain("自己写…");
+		expect(html).toContain("协调者");
+		expect(html).toContain("提交了计划");
+		expect(html).toContain("Release order");
+		expect(html).toContain("看计划");
+		expect(html).toContain('data-testid="team-plan-approve"');
+		const several = await attention([
+			call({
+				kind: "question",
+				toolName: "AskUserQuestion",
+				questions: ["a", "b"],
+				answerForm: null,
+			}),
+		]);
+		expect(several).toContain('data-testid="team-question-answer"');
+		const rule = await attention([call({ kind: "rule", toolName: "RequestPermissionRule" })]);
+		expect(rule).toContain('data-testid="team-approval-open"');
 	});
 
-	test("the latest decisions say who approved, denied or answered, and where (M1)", async () => {
-		const client = new QueryClient();
-		const decision = (
-			id: string,
-			kind: TeamPersonDecisionEventKind,
-			patch: Record<string, unknown>,
-		) => ({
-			id,
-			kind,
-			actorId: "u",
-			actorName: "alice",
-			toolName: "Bash",
-			approvalKind: "tool" as const,
-			agentId: "w",
-			agentTitle: "Parser worker",
-			depth: 1,
-			createdAt: "2026-11-18T00:00:00.000Z",
-			...patch,
+	test("past three the rest fold into 还有 N 条; on a phone the cards scroll sideways", async () => {
+		const calls = ["1", "2", "3", "4"].map((id) => call({ id }));
+		const html = await attention(calls, "zh-CN");
+		expect(html.match(/data-testid="team-attention-card"/g)).toHaveLength(3);
+		expect(html).toContain("还有 2 条");
+		const phone = await attention(calls, "zh-CN", true);
+		expect(phone).toContain('data-attention-layout="phone"');
+		expect(phone).toContain("左右滑动");
+		expect(phone).toContain("1 / 5");
+	});
+});
+
+describe("work list", () => {
+	const list = (props: {
+		s?: TeamPageSummary;
+		items?: TeamBoardItem[];
+		approvals?: TeamPendingApproval[];
+		lng?: "en" | "zh-CN";
+		highlightId?: string | null;
+	}) => {
+		const s = props.s ?? summary();
+		return render(
+			<TeamWorkList
+				projectId="p"
+				teamId="lead"
+				summary={s}
+				items={props.items ?? []}
+				approvals={props.approvals ?? []}
+				stats={{ a: { added: 214, removed: 97, files: 4, binaryFiles: 0, truncated: false } }}
+				base="main"
+				loading={false}
+				failed={false}
+				hasMore={false}
+				onLoadMore={noop}
+				highlightId={props.highlightId ?? null}
+				mode={teamPageMode(s)}
+				archiving={false}
+				onArchive={noop}
+				onDisband={noop}
+				onOpenItem={noop}
+			/>,
+			new QueryClient(),
+			props.lng ?? "en",
+		);
+	};
+
+	test("groups in order with counts; each row its line and +/-; finished as counts", async () => {
+		const html = await list({
+			items: [
+				item({ id: "q", state: "queued", worker: null }),
+				item({ id: "a", worker: { id: "n-worker", title: null, status: "waiting" } }),
+				item({ id: "rev", state: "in_review", reviewRounds: 0 }),
+				item({
+					id: "p",
+					worker: { id: "n-p", title: null, status: "working" },
+					activity: { toolName: "Bash", preview: "pnpm test api/auth", at: "x" },
+				}),
+			],
+			s: summary({
+				runningAgents: [{ id: "n-p", title: null, status: "working" }],
+				runningCount: 1,
+			}),
+			approvals: [call()],
+			highlightId: "a",
+			lng: "zh-CN",
 		});
-		const approvals: TeamApprovalsResponse = {
-			more: false,
-			unscanned: false,
-			approvals: [],
-			recent: [
-				decision("d3", "question.answered", {
-					actorName: "carol",
-					toolName: "AskUserQuestion",
-					approvalKind: "question",
-					agentId: "lead",
-					agentTitle: "Release crew",
-					depth: 0,
-				}),
-				decision("d2", "approval.denied", { actorName: "bob", toolName: "Edit", depth: 2 }),
-				decision("d1", "approval.allowed", {}),
-				decision("dp", "approval.denied", {
-					actorName: "erin",
-					toolName: "ExitPlanMode",
-					approvalKind: "plan",
-				}),
-				decision("da", "question.answered_by_ai", {
-					actorName: "gina",
-					toolName: "AskUserQuestion",
-					approvalKind: "question",
-				}),
-				decision("dd", "question.deferred", {
-					actorName: "frank",
-					toolName: "AskUserQuestion",
-					approvalKind: "question",
-				}),
-				decision("d0", "question.ignored", {
-					actorName: "dave",
-					toolName: "AskUserQuestion",
-					approvalKind: "question",
-				}),
-			],
-		};
-		client.setQueryData(teamKeys.approvals("lead"), approvals);
-		for (const [lng, expected] of [
-			[
-				"en",
-				[
-					"carol answered a question",
-					"Coordinator",
-					"bob denied Edit",
-					"Parser worker · Helper",
-					"alice approved Bash",
-					"Parser worker · Worker",
-					'aria-label="Approved"',
-					'aria-label="Denied"',
-					'aria-label="Answered"',
-					"dave closed a question without telling the agent",
-					'aria-label="Closed silently"',
-					"erin returned a plan",
-					"gina had the AI answer a question",
-					'aria-label="AI answered"',
-					"frank chose to answer a question later",
-					'aria-label="Answer later"',
-				],
-			],
-			[
-				"zh-CN",
-				[
-					"carol 回答了提问",
-					"bob 拒绝了 Edit",
-					"alice 批准了 Bash",
-					"协调者",
-					"dave 关闭了提问",
-					"erin 退回了一份计划",
-					"gina 让 AI 回答了提问",
-					"frank 选择稍后回答提问",
-				],
-			],
-		] as const) {
-			const html = await render(<TeamApprovalsList projectId="p" teamId="lead" />, client, lng);
-			expect(html).toContain("team-recent-decisions");
-			expect(html.split('data-testid="team-recent-decision"').length - 1).toBe(7);
-			expect(html).not.toContain("ExitPlanMode");
-			for (const text of expected) expect(html).toContain(text);
-		}
+		const groups = [...html.matchAll(/data-testid="team-group-([a-zA-Z]+)"/g)].map((m) => m[1]);
+		expect(groups).toEqual(["needsYou", "inProgress", "review"]);
+		expect(html).toContain("需要你");
+		expect(html).toContain("评审 · 就绪");
+		expect(html).toContain("等批准 Bash");
+		expect(html).toContain("+214");
+		expect(html).toContain("运行");
+		expect(html).toContain("pnpm test api/auth");
+		expect(html).toContain("排队");
+		expect(html).toContain('data-item-id="a" data-state="in_progress" data-highlighted="true"');
+		expect(html).toContain("已完成");
+		expect(html).toContain("已取消");
+		expect(html).toContain('data-testid="team-finished-done" data-open="false"');
+	});
+
+	test("read-only: the first group is 等成员处理, holding the ready items", async () => {
+		const html = await list({
+			s: summary({ access: "read", pendingApprovalCount: null }),
+			items: [item({ id: "r", state: "ready", reviewRounds: 2, lastReview: "clear" })],
+			lng: "zh-CN",
+		});
+		expect(html).toContain("等成员处理");
+		expect(html).not.toContain("需要你");
+		expect(html).toContain("可以合并");
+	});
+
+	test("no work yet: the dashed explanation, not empty columns", async () => {
+		const empty = summary({
+			columnCounts: { queued: 0, in_progress: 0, review: 0, done: 0, cancelled: 0 },
+		});
+		const html = await list({ s: empty, lng: "zh-CN" });
+		expect(html).toContain('data-testid="team-work-empty"');
+		expect(html).toContain("工作项会出现在这里");
+		expect(html).not.toContain("team-group-");
+	});
+
+	test("wrap-up: archive or disband, done opened", async () => {
+		const done = summary({
+			columnCounts: { queued: 0, in_progress: 0, review: 0, done: 7, cancelled: 1 },
+		});
+		const html = await list({ s: done, lng: "zh-CN" });
+		expect(html).toContain('data-testid="team-wrap-up"');
+		expect(html).toContain("没有进行中的工作项");
+		expect(html).toContain("7 个分支都已合并到 main");
+		expect(html).toContain('data-testid="team-wrap-up-archive"');
+		expect(html).toContain('data-testid="team-wrap-up-disband"');
+		expect(html).toContain('data-testid="team-finished-done" data-open="true"');
+		// Onlookers get the explanation without the buttons.
+		const reader = await list({ s: { ...done, access: "read", pendingApprovalCount: null } });
+		expect(reader).toContain("team-wrap-up");
+		expect(reader).not.toContain("team-wrap-up-archive");
+	});
+});
+
+describe("starting state", () => {
+	test("tells what to do, with three examples", async () => {
+		const html = await render(<TeamStart teamId="lead" />, new QueryClient(), "zh-CN");
+		expect(html).toContain("告诉协调者这个团队要完成什么");
+		expect(html.match(/data-testid="team-start-example"/g)).toHaveLength(3);
 	});
 });
 
@@ -376,102 +512,51 @@ describe("members (M1)", () => {
 		expect(zhHtml).toContain("所有者");
 		expect(zhHtml).toContain("最近没有发言");
 	});
-
-	test("everyone on the page can open the people list from the top bar", async () => {
-		for (const access of ["write", "read"] as const) {
-			const html = await render(
-				<TeamTopBar
-					projectId="p"
-					teamId="lead"
-					title="Release crew"
-					summary={summary({ access, pendingApprovalCount: access === "write" ? 0 : null })}
-				/>,
-			);
-			expect(html).toContain('data-testid="team-members-button"');
-			expect(html).toContain('aria-label="Team members"');
-		}
-	});
 });
 
-describe("board", () => {
-	test("five columns with the summary's counts; finished ones folded", async () => {
-		const client = seededClient({
-			queued: [item({ id: "q", state: "queued", title: "Queued one" })],
-			in_progress: [item()],
-			done: [item({ id: "m", state: "merged", title: "Merged one" })],
+describe("project teams list", () => {
+	test("an archived team's row offers no pin; an active team's row does", async () => {
+		const row = (id: string, patch: Partial<TeamSummary> = {}): TeamSummary => ({
+			id,
+			projectId: "p",
+			name: id,
+			baseBranch: "main",
+			status: "active",
+			coordinatorStatus: "idle",
+			createdBy: null,
+			createdAt: "2026-11-18T00:00:00.000Z",
+			updatedAt: "2026-11-18T00:00:00.000Z",
+			access: "write",
+			briefBytes: 0,
+			...patch,
+		});
+		const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		// A cached page that outlived an archive (the list asks for active teams only).
+		client.setQueryData(teamKeys.list("p"), {
+			pages: [
+				{
+					teams: [
+						row("live"),
+						row("gone", { status: "archived", coordinatorStatus: "archived" }),
+						row("going", { coordinatorStatus: "archived" }),
+					],
+					nextCursor: null,
+				},
+			],
+			pageParams: [undefined],
 		});
 		const html = await render(
-			<TeamBoard projectId="p" teamId="lead" summary={summary()} />,
+			<ProjectTeamsList projectId="p" canCreate={false} onOpenTeam={() => {}} />,
 			client,
 		);
-		const columns = [...html.matchAll(/data-column="([a-z_]+)" data-count="(\d+)"/g)].map(
-			(match) => [match[1], Number(match[2])],
+		const rows = [...html.matchAll(/data-team-id="([^"]+)"(.*?)(?=data-team-id=|$)/gs)].map(
+			(match) => [match[1], match[2].includes('data-testid="pin-to-sidebar"')],
 		);
-		expect(columns).toEqual([
-			["queued", 1],
-			["in_progress", 1],
-			["review", 0],
-			["done", 3],
-			["cancelled", 0],
+		expect(rows).toEqual([
+			["live", true],
+			["gone", false],
+			["going", false],
 		]);
-		expect(html).toContain("Queued one");
-		expect(html).toContain("Add the board");
-		// Done is folded: its card is not rendered until opened.
-		expect(html).not.toContain("Merged one");
-		expect(html).toContain("Nothing here");
-	});
-});
-
-describe("top bar", () => {
-	test("members see approvals (capped) and pause all; onlookers see neither", async () => {
-		const member = await render(
-			<TeamTopBar
-				projectId="p"
-				teamId="lead"
-				title="Release crew"
-				summary={summary({
-					pendingApprovalCount: 51,
-					runningCount: 2,
-					runningAgents: [
-						{ id: "lead", title: "Release crew", status: "working" },
-						{ id: "w", title: "Worker", status: "waiting" },
-					],
-				})}
-			/>,
-		);
-		expect(member).toContain("Release crew");
-		expect(member).toContain('data-testid="team-approvals-button"');
-		expect(member).toContain("50+ approvals");
-		expect(member).toContain("2 running");
-		expect(member).toContain('data-testid="team-pause-all"');
-
-		const reader = await render(
-			<TeamTopBar
-				projectId="p"
-				teamId="lead"
-				title="Release crew"
-				summary={summary({ access: "read", pendingApprovalCount: null })}
-			/>,
-		);
-		expect(reader).not.toContain("team-approvals-button");
-		expect(reader).not.toContain("team-pause-all");
-		expect(reader).toContain("Nothing running");
-	});
-
-	test("Chinese", async () => {
-		const html = await render(
-			<TeamTopBar
-				projectId="p"
-				teamId="lead"
-				title="发布小组"
-				summary={summary({ pendingApprovalCount: 1, runningCount: 1 })}
-			/>,
-			new QueryClient(),
-			"zh-CN",
-		);
-		expect(html).toContain("1 个待批");
-		expect(html).toContain("1 个运行中");
-		expect(html).toContain("全部暂停");
 	});
 });
 
@@ -589,5 +674,247 @@ describe("strings", () => {
 				? Object.entries(value).flatMap(([key, child]) => keys(child, `${prefix}${key}.`))
 				: [prefix.slice(0, -1)];
 		expect(keys(zh.teams).sort()).toEqual(keys(en.teams).sort());
+	});
+});
+
+describe("review fixes", () => {
+	const header = (phone: boolean) =>
+		render(
+			<TeamHeader
+				projectId="p"
+				teamId="lead"
+				projectName="acme-app"
+				title="Release crew"
+				summary={summary()}
+				status={null}
+				phone={phone}
+				onBack={noop}
+			/>,
+		);
+
+	test("the phone header keeps its back arrow", async () => {
+		expect(await header(true)).toContain('data-testid="team-back"');
+		expect(await header(false)).toContain('data-testid="team-back"');
+	});
+
+	test("等你处理: the asker opens its session, a reason shows, more than listed is said", async () => {
+		const items = [item({ id: "a" })];
+		const html = await render(
+			<TeamAttention
+				entries={attentionEntries({
+					member: true,
+					approvals: [call({ decisionReason: "Writes outside the worktree" })],
+					items,
+				})}
+				phone={false}
+				teamId="lead"
+				base="main"
+				stats={undefined}
+				more
+				onOpenItem={noop}
+				onOpenSession={noop}
+				onOpenCoordinatorSession={noop}
+			/>,
+		);
+		expect(html).toContain('data-testid="team-approval-asker"');
+		expect(html).toContain("Writes outside the worktree");
+		expect(html).toContain('data-testid="team-attention-beyond"');
+		expect(html).toContain("More are waiting than listed here");
+		expect(html).toContain(">1+<");
+		const unscanned = await render(
+			<TeamAttention
+				entries={attentionEntries({ member: true, approvals: [call()], items })}
+				phone={false}
+				teamId="lead"
+				base="main"
+				stats={undefined}
+				unscanned
+				onOpenItem={noop}
+			/>,
+		);
+		expect(unscanned).toContain("may not be listed here");
+	});
+
+	test("a long option is answered with its whole title, only its label clipped", async () => {
+		const long = `Read the team's default time zone ${"x".repeat(100)}`;
+		const html = await render(
+			<TeamAttention
+				entries={attentionEntries({
+					member: true,
+					approvals: [
+						call({
+							kind: "question",
+							toolName: "AskUserQuestion",
+							questions: ["Which?"],
+							answerForm: {
+								header: "Zone",
+								description: null,
+								options: [long, "UTC"],
+								optionDescriptions: [null, null],
+								multiSelect: false,
+							},
+						}),
+					],
+					items: [],
+				})}
+				phone={false}
+				teamId="lead"
+				base="main"
+				stats={undefined}
+				onOpenItem={noop}
+			/>,
+		);
+		expect(html).toContain(
+			`data-value="Read the team&#x27;s default time zone ${"x".repeat(100)}"`,
+		);
+	});
+
+	test("marks on rows; no +0 -0; the wrap-up never offers disband while worktrees are held", async () => {
+		const s = summary({
+			columnCounts: { queued: 1, in_progress: 1, review: 0, done: 2, cancelled: 0 },
+		});
+		const html = await render(
+			<TeamWorkList
+				projectId="p"
+				teamId="lead"
+				summary={s}
+				items={[
+					item({ id: "lock", exclusiveKey: "paths" }),
+					item({ id: "q", state: "queued", worker: null }),
+				]}
+				approvals={[]}
+				stats={{ q: { added: 0, removed: 0, files: 0, binaryFiles: 0, truncated: false } }}
+				base="main"
+				loading={false}
+				failed={false}
+				hasMore={false}
+				onLoadMore={noop}
+				highlightId={null}
+				mode={teamPageMode(s)}
+				archiving={false}
+				onOpenItem={noop}
+			/>,
+		);
+		expect(html).toContain('data-mark="exclusive"');
+		expect(html).not.toContain("diff-count");
+		const held = summary({
+			columnCounts: { queued: 0, in_progress: 0, review: 0, done: 2, cancelled: 1 },
+			heldWorktreeCount: 2,
+		});
+		const wrap = await render(
+			<TeamWorkList
+				projectId="p"
+				teamId="lead"
+				summary={held}
+				items={[]}
+				approvals={[]}
+				stats={undefined}
+				base="main"
+				loading={false}
+				failed={false}
+				hasMore={false}
+				onLoadMore={noop}
+				highlightId={null}
+				mode={teamPageMode(held)}
+				archiving={false}
+				onArchive={noop}
+				onDisband={noop}
+				onOpenItem={noop}
+			/>,
+			new QueryClient(),
+			"zh-CN",
+		);
+		expect(wrap).toContain('data-testid="team-wrap-up-held"');
+		expect(wrap).toContain("还有 2 个已结束的工作项保留着 worktree");
+		expect(wrap).toContain("team-wrap-up-archive");
+		expect(wrap).not.toContain("team-wrap-up-disband");
+	});
+
+	test("the coordinator signs its events as 协调者; read-only members get a plain start line", async () => {
+		const event = {
+			id: "e",
+			kind: "work.created",
+			workItemId: "w",
+			workItemTitle: "Fix",
+			actorKind: "agent" as const,
+			actorId: "lead",
+			actorName: "发布小组",
+			detail: null,
+			detailOmitted: false,
+			createdAt: "2026-11-18T00:00:00.000Z",
+		};
+		const html = await render(
+			<ActivityLine event={event} coordinatorId="lead" />,
+			new QueryClient(),
+			"zh-CN",
+		);
+		expect(html).toContain("协调者");
+		expect(html).not.toContain("发布小组");
+		const start = await render(<TeamReadOnlyStart />, new QueryClient(), "zh-CN");
+		expect(start).toContain("还没有人给协调者布置任务");
+		expect(start).not.toContain("team-start-example");
+	});
+});
+
+describe("questions keep their context", () => {
+	const card = (form: TeamPendingApproval["answerForm"], questions: string[] = []) =>
+		render(
+			<TeamAttention
+				entries={attentionEntries({
+					member: true,
+					approvals: [
+						call({ kind: "question", toolName: "AskUserQuestion", questions, answerForm: form }),
+					],
+					items: [],
+				})}
+				phone={false}
+				teamId="lead"
+				base="main"
+				stats={undefined}
+				onOpenItem={noop}
+			/>,
+		);
+
+	test("the title, the whole prompt and each option's explanation; the answer is the title", async () => {
+		const html = await card({
+			header: "Rounding rule",
+			description: "Discounts split across lines leave a 0.005 remainder. Which rule rounds it?",
+			options: ["Half up", "Banker's rounding"],
+			optionDescriptions: ["Rounds 0.5 away from zero", null],
+			multiSelect: false,
+		});
+		expect(html).toContain("Rounding rule");
+		expect(html).toContain("leave a 0.005 remainder. Which rule rounds it?");
+		expect(html.match(/data-testid="team-question-option-description"/g)).toHaveLength(1);
+		expect(html).toContain("Rounds 0.5 away from zero");
+		expect(html).toContain('data-value="Banker&#x27;s rounding"');
+	});
+
+	test("context too long for a card: the full form, no one-click answers", async () => {
+		const html = await card(
+			{
+				header: "Plan",
+				description: "x".repeat(700),
+				options: ["A", "B"],
+				optionDescriptions: [null, null],
+				multiSelect: false,
+			},
+			["Long"],
+		);
+		expect(html).not.toContain("team-question-option");
+		expect(html).toContain('data-testid="team-question-answer"');
+	});
+
+	test("a refused base branch has its own words in both languages", async () => {
+		const { settingsErrorKey } = await import("./TeamSettingsModal");
+		const key = settingsErrorKey({ data: { code: "TEAM_BASE_BRANCH_UNRESOLVED" } });
+		expect(key).toBe("teams.page.settings.errors.TEAM_BASE_BRANCH_UNRESOLVED");
+		expect(settingsErrorKey({ data: { code: "OTHER" } })).toBeNull();
+		for (const lng of ["en", "zh-CN"] as const) {
+			const i18n = await i18nFor(lng);
+			const text = i18n.t(key ?? "", { branch: "mian" });
+			expect(text).toContain("mian");
+			expect(text).not.toContain("teams.page");
+		}
 	});
 });

@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { runtimeSettingsQueryOptions } from "@frontend/hooks/useRuntimeSettings";
 import { api } from "@frontend/lib/api";
 import { MantineProvider, Popover } from "@mantine/core";
 import {
@@ -30,8 +31,8 @@ let restoreGeometry: (() => void) | undefined;
 let makeEvent: (name: string) => Event;
 let setValue: (input: HTMLInputElement, value: string) => void;
 let settings = { agent: { tasksReminderInterval: 15, silentToolCallThreshold: 50 } };
-let getSettings: ReturnType<typeof spyOn<typeof api, "getSettings">>;
-let updateSettings: ReturnType<typeof spyOn<typeof api, "updateSettings">>;
+let getSettings: ReturnType<typeof spyOn<typeof api, "getRuntimeSettings">>;
+let updateSettings: ReturnType<typeof spyOn<typeof api, "updateRuntimeSettings">>;
 let updateReflection: ReturnType<typeof spyOn<typeof api, "updateNarratorReflectionOverrides">>;
 let navigations = 0;
 let rowClicks = 0;
@@ -101,7 +102,7 @@ beforeEach(() => {
 		},
 		requestAnimationFrame: (cb: FrameRequestCallback) => setTimeout(() => cb(Date.now()), 0),
 		cancelAnimationFrame: (id: Timer) => clearTimeout(id),
-		localStorage: { getItem: () => null },
+		localStorage: { getItem: (key: string) => (key === "narrafork_token" ? "test-token" : null) },
 		IS_REACT_ACT_ENVIRONMENT: true,
 	};
 	for (const [key, value] of Object.entries(values)) {
@@ -126,10 +127,12 @@ beforeEach(() => {
 	qc.setQueryData(["auth", "me"], { id: "admin", role: "admin" });
 	qc.setQueryData(["narrators", "owner"], { id: "owner", tasksReminderIntervalOverride: 30 });
 	settings = { agent: { tasksReminderInterval: 15, silentToolCallThreshold: 50 } };
-	getSettings = spyOn(api, "getSettings").mockImplementation(async () => settings);
-	updateSettings = spyOn(api, "updateSettings").mockImplementation(async (data) => {
+	getSettings = spyOn(api, "getRuntimeSettings").mockImplementation(
+		async () => settings as unknown as Awaited<ReturnType<typeof api.getRuntimeSettings>>,
+	);
+	updateSettings = spyOn(api, "updateRuntimeSettings").mockImplementation(async (data) => {
 		settings = { agent: { ...settings.agent, ...(data.agent as typeof settings.agent) } };
-		return settings;
+		return settings as unknown as Awaited<ReturnType<typeof api.getRuntimeSettings>>;
 	});
 	updateReflection = spyOn(api, "updateNarratorReflectionOverrides").mockResolvedValue({
 		ok: true,
@@ -303,7 +306,10 @@ describe("reminder frequency quick settings", () => {
 		await click(button("save"));
 		expect(updateSettings.mock.calls[0]?.[0]).toEqual({ agent: { tasksReminderInterval: 40 } });
 		expect(updateReflection).toHaveBeenCalledWith("owner", { tasksReminderIntervalOverride: null });
-		expect(qc.getQueryData<typeof settings>(["settings"])?.agent.tasksReminderInterval).toBe(40);
+		expect(
+			qc.getQueryData<typeof settings>(runtimeSettingsQueryOptions().queryKey)?.agent
+				.tasksReminderInterval,
+		).toBe(40);
 	});
 
 	test("Enter uses the primary Save action and updates the global default", async () => {
@@ -350,7 +356,7 @@ describe("reminder frequency quick settings", () => {
 		await click(button("save"));
 		expect(updateSettings.mock.calls[0]?.[0]).toEqual({ agent: { silentToolCallThreshold: 20 } });
 		expect(updateReflection).not.toHaveBeenCalled();
-		expect(qc.getQueryData<typeof settings>(["settings"])).toEqual({
+		expect(qc.getQueryData<typeof settings>(runtimeSettingsQueryOptions().queryKey)).toEqual({
 			agent: { tasksReminderInterval: 15, silentToolCallThreshold: 20 },
 		});
 	});

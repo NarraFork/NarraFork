@@ -14,6 +14,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createInstance } from "i18next";
 import { createRoot } from "react-dom/client";
 import { I18nextProvider } from "react-i18next";
+import { appearanceStore } from "../../lib/appearance-preference-store";
 import chatTranslations from "../../locales/en/chat.json";
 import commonTranslations from "../../locales/en/common.json";
 import narratorTranslations from "../../locales/en/narrator.json";
@@ -44,10 +45,16 @@ await i18n.init({
  * Seeded so the panel never issues a preferences request: its defaults are what
  * the panel must render, and the fixture stays transport-free.
  */
+const fixtureUser = "appearance-overflow-fixture-user";
+const originalToken = localStorage.getItem("narrafork_token");
+const fixtureToken = "appearance-overflow-fixture-token";
+localStorage.setItem("narrafork_token", fixtureToken);
+appearanceStore.activate(null, true);
 const queryClient = new QueryClient({
-	defaultOptions: { queries: { retry: false, refetchOnWindowFocus: false } },
+	defaultOptions: { queries: { retry: false, refetchOnWindowFocus: false, staleTime: Infinity } },
 });
-queryClient.setQueryData(["user-preferences"], {
+queryClient.setQueryData(["auth", "me"], { id: fixtureUser });
+queryClient.setQueryData(["user-preferences", "ui", fixtureUser, fixtureToken], {
 	narratorFontScalePercent: 100,
 	narratorLetterSpacingPercent: 0,
 	narratorLineHeightV2Percent: 100,
@@ -103,7 +110,15 @@ function AppearanceHost() {
 
 const root = document.getElementById("root");
 if (!root) throw new Error("Missing #root");
-createRoot(root).render(<AppearanceHost />);
+const reactRoot = createRoot(root);
+reactRoot.render(<AppearanceHost />);
+window.addEventListener("pagehide", () => {
+	reactRoot.unmount();
+	queryClient.clear();
+	appearanceStore.activate(null, true);
+	if (originalToken === null) localStorage.removeItem("narrafork_token");
+	else localStorage.setItem("narrafork_token", originalToken);
+});
 
 /** The panel's own scroll box: `ToolPanelShell`'s flex-1 `overflow: auto` body. */
 function panelScroller(): HTMLElement | null {

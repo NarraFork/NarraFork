@@ -6,7 +6,7 @@
 import { describe, expect, test } from "bun:test";
 import { DEFAULT_COORDINATOR_LIMITS } from "@shared/project-teams";
 import { TEAM_TRAIT } from "../../narrator-utils";
-import { getTeamLeadPrompt } from "../team-lead";
+import { getTeamLeadPrompt, teamDisbandNote, teamUpgradeNote } from "../team-lead";
 
 const { runtimeBasePrompt } = await import("../../../services/agent-runtime/orchestrator");
 const { resolveRuntimePolicy } = await import("../../../services/agent-runtime/policy");
@@ -53,6 +53,52 @@ describe("team lead prompt", () => {
 			expect(zh).toContain(phrase);
 		// No hosting / CI / integration instructions before those PRs.
 		expect(en).not.toMatch(/pull request|\bPR\b|\bCI\b|integration branch/i);
+	});
+
+	test("the working directory is described for created and upgraded coordinators alike", () => {
+		const en = getTeamLeadPrompt("en");
+		// Deliberately changed: an upgraded coordinator may work in a linked worktree.
+		expect(en).not.toContain("Your working directory is the project's main checkout");
+		expect(en).toContain(
+			"Your working directory is a checkout of this project's repository: the main checkout for a team created on the project page, or the checkout this session already worked in when it became the coordinator. Either way, never commit there directly.",
+		);
+		const zh = getTeamLeadPrompt("zh-CN");
+		expect(zh).not.toContain("你的工作目录是项目的主检出");
+		expect(zh).toContain("由已有会话升级来的团队是升级时会话所在的检出");
+	});
+
+	test("the upgrade and disband notes: both locales, deterministic, naming the facts", () => {
+		const input = {
+			name: "Payments",
+			convertedBy: "alice",
+			cwd: "/work/repo-feature",
+			mainCheckout: false,
+			mainCheckoutPath: "/work/repo",
+		};
+		for (const locale of ["en", "zh-CN"] as const) {
+			expect(teamUpgradeNote(locale, input)).toBe(teamUpgradeNote(locale, input));
+			const note = teamUpgradeNote(locale, input);
+			for (const fact of ["Payments", "alice", "/work/repo-feature", "/work/repo", "Team"])
+				expect(note).toContain(fact);
+			const disband = teamDisbandNote(locale, { name: "Payments", disbandedBy: "bob" });
+			expect(disband).toBe(teamDisbandNote(locale, { name: "Payments", disbandedBy: "bob" }));
+			expect(disband).toContain("Payments");
+			expect(disband).toContain("bob");
+		}
+		expect(teamUpgradeNote("en", input)).toContain("other than its main checkout");
+		expect(teamUpgradeNote("en", { ...input, mainCheckout: true })).toContain(
+			"in the project's main checkout",
+		);
+		expect(teamUpgradeNote("zh-CN", { ...input, mainCheckout: true })).toContain(
+			"在项目的主检出里",
+		);
+		expect(teamUpgradeNote("en", { ...input, convertedBy: null })).not.toContain(" by ");
+		expect(teamDisbandNote("en", { name: "P", disbandedBy: null })).toContain(
+			"no longer a team coordinator",
+		);
+		expect(teamDisbandNote("zh-CN", { name: "P", disbandedBy: null })).toContain(
+			"不再是团队协调者",
+		);
 	});
 
 	test("a coordinator gets it after its own prompt; other narrators do not", () => {

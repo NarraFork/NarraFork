@@ -3,7 +3,9 @@ import type { ModelTraceResultBlock } from "@shared/modeltrace-result";
 export const MODELTRACE_MAX_TEXT_LENGTH = 10_000;
 export const MODELTRACE_RESULT_LIMIT = 5;
 export type ModelTraceOutput = { text: string; expected_count: number };
-export type Ranking = Required<Pick<ModelTraceResultBlock, "decision" | "results">>;
+export type Ranking = Required<Pick<ModelTraceResultBlock, "decision" | "results">> & {
+	acceptedSampleIndexes?: number[];
+};
 export type WorkerReply = { type: "ranked"; ranking: Ranking } | { type: "unavailable" };
 
 export function validOutputs(outputs: ModelTraceOutput[]): boolean {
@@ -24,7 +26,15 @@ export function validOutputs(outputs: ModelTraceOutput[]): boolean {
 
 export function isRanking(value: unknown): value is Ranking {
 	if (!value || typeof value !== "object") return false;
-	const { decision, results } = value as Partial<Ranking>;
+	const { decision, results, acceptedSampleIndexes } = value as Partial<Ranking>;
+	if (
+		acceptedSampleIndexes !== undefined &&
+		(!Array.isArray(acceptedSampleIndexes) ||
+			acceptedSampleIndexes.length > 3 ||
+			new Set(acceptedSampleIndexes).size !== acceptedSampleIndexes.length ||
+			!acceptedSampleIndexes.every((index) => Number.isInteger(index) && index >= 0 && index < 3))
+	)
+		return false;
 	if (!Array.isArray(results)) return false;
 	if (decision === "unscorable" || decision === "not_model") return results.length === 0;
 	return (

@@ -117,6 +117,29 @@ describe("project settings panel", () => {
 		expect(html).toContain("compatibility.unavailable");
 		expect(html).not.toContain("compatibility.settingsTraits");
 	});
+	test("every label the panel shows is translated in both locales", () => {
+		const source = readFileSync(new URL("./ProjectSettingsPanel.tsx", import.meta.url), "utf8");
+		const keys = [...source.matchAll(/\bt\("([^"]+)"/g)].map((match) => match[1] as string);
+		expect(keys).toEqual(expect.arrayContaining(["skills", "routines", "commands"]));
+		for (const locale of ["en", "zh-CN"]) {
+			const resources = JSON.parse(
+				readFileSync(new URL(`../../locales/${locale}/projects.json`, import.meta.url), "utf8"),
+			);
+			for (const key of keys) {
+				const value = key
+					.split(".")
+					.reduce<unknown>(
+						(node, part) => (node as Record<string, unknown> | undefined)?.[part],
+						resources,
+					);
+				expect({ locale, key, translated: typeof value === "string" && value !== key }).toEqual({
+					locale,
+					key,
+					translated: true,
+				});
+			}
+		}
+	});
 	test("narrator entry lazy-loads the panel", () => {
 		const entry = readFileSync(new URL("./NarratorProjectSettings.tsx", import.meta.url), "utf8");
 		expect(entry).not.toMatch(/import\s+\{\s*ProjectSettingsPanel\s*\}\s+from/);
