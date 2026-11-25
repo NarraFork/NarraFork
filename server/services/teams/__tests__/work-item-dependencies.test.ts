@@ -16,6 +16,7 @@ import { narratorWorktreeResources, teamWorkEvents, teamWorkItems } from "../../
 import { teamTool, teamToolParameters } from "../../../lib/agent/tools/team";
 import type { ToolContext } from "../../../lib/agent/types";
 import { AppError } from "../../../lib/errors";
+import { eventBus } from "../../../lib/event-bus";
 import { generateId } from "../../../lib/id";
 import { unblockedNote } from "../../../lib/prompts/team-lead";
 import { readBoardItem } from "../team-board";
@@ -279,6 +280,24 @@ describe("work item dependencies", () => {
 		);
 		sqlite.run("UPDATE team_work_items SET state = 'merged' WHERE id = ?", [a.id]);
 		expect(() => assertWorkItemStartable(b.id)).not.toThrow();
+	});
+
+	test("a change refreshes the team page; the same set again does not", async () => {
+		const a = await create("Schema");
+		const b = await create("API");
+		const refreshed: string[] = [];
+		const handler = (event: { teamId: string }) => refreshed.push(event.teamId);
+		eventBus.on("team:communication_changed", handler);
+		try {
+			setDeps(b.id, [a.id]);
+			expect(refreshed).toEqual([LEAD]);
+			setDeps(b.id, [a.id]);
+			expect(refreshed).toEqual([LEAD]);
+			setDeps(b.id, []);
+			expect(refreshed).toEqual([LEAD, LEAD]);
+		} finally {
+			eventBus.off("team:communication_changed", handler);
+		}
 	});
 
 	test("a queued item cannot be reviewed or marked ready, so a review never skips the start", async () => {

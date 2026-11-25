@@ -1104,6 +1104,7 @@ export function setWorkItemDependencies(input: {
 		});
 		if (changed) updateItem(tx, item, {}, now);
 	});
+	if (changed) eventBus.emit({ type: "team:communication_changed", teamId: team.teamId });
 	return { item: requireWorkItem(team.teamId, item.id), changed };
 }
 
