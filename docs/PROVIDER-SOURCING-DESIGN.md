@@ -1,6 +1,6 @@
 # 模型供应体系重设计
 
-> 状态：设计与实施说明，更新于 **2026-11-25**。主要决策见 §13；模型值保留 `前缀:模型`，新增 `auto:模型`（§4.1）。S1 统一凭据已完成，S2 的现有接缝与收口要求见 §14、§15.9；不代表 S2 剩余改动已发布，更不代表 S3–S6 已完成。具体接口以链接的实现为准。
+> 状态：设计与实施说明，更新于 **2026-11-25**。主要决策见 §13；模型值保留 `前缀:模型`，新增 `auto:模型`（§4.1）。S1 与 S2 的实现能力及安全边界见 §14、§15.9；合并、发布与门禁结果以对应 PR / CI 为准，本文不替代发布状态。**S3–S6 尚未完成**。具体接口以链接的实现为准。
 >
 > P0–P3 是旧配置结构上的过渡实现。S2 继续从旧数组生成来源组内存视图，**不落盘 `sourceGroups[]`**；该结构迁移留到 S5。数据、兼容与后续阶段契约见 §15。
 
@@ -404,7 +404,7 @@ resolveRoute({ modelValue, billingOwner, narratorId, epoch, caps }) →
 
 ### 14.1 已完成
 
-下表保留 P0–P3 的已完成工作记录，不是 S2 剩余改动的合并清单。它们最初建在按类型分开的配置结构上；统一凭据已经落地，来源组落盘仍留到 S5。
+下表保留 P0–P3 的已完成工作记录，不是 S2 的合并或发布状态清单。它们最初建在按类型分开的配置结构上；统一凭据已经落地，来源组落盘仍留到 S5。
 
 | 阶段 | 内容 | 主要位置 |
 |---|---|---|
@@ -432,9 +432,9 @@ resolveRoute({ modelValue, billingOwner, narratorId, epoch, caps }) →
 
 **S1 统一凭据已完成**：统一文件、启动迁移、备份 / 拒读 / 冲突提示、显式 `credentialId` 与运行时状态分离均已建立。[CredentialStore](../server/lib/credential-store.ts) 是 `credentials.json` 的文件读写与加密重写所有者；**不是把所有运行时对象合成一个内存容器**。[ProviderKeyStore](../server/lib/provider-keys.ts) 与 [CodexManager](../server/lib/codex-manager.ts) 仍保留各自的内存数据与兼容 API，按段交给文件所有者保存，互不覆盖。旧 owner 名称与 Key 投影暂留；不能把“尚未删掉兼容视图”误判为 S1 未完成，也不能提前把 `provider-keys.ts` 改成搜索专用。
 
-### 14.2 S2 接缝与本轮收口边界
+### 14.2 S2 已实现能力与安全边界
 
-以下区分已有公共接缝与需要在 S2 收口时保住的行为，不据此宣称剩余改动已经发布：
+以下记录已落地的实现，不是待办清单；合并、发布与门禁状态由对应 PR / CI 决定。S3–S6 仍按 §15.9 后续推进。
 
 | 接缝 | 实现位置与约束 |
 |---|---|
@@ -442,24 +442,28 @@ resolveRoute({ modelValue, billingOwner, narratorId, epoch, caps }) →
 | 模型列表与额度 | `listModels` 一次返回 owner 的完整 `SourceModel` 条目，共享类型只要求 `id`；不先转 ID 再二次读取。`probeQuota(group, credentialId)` 委托原源模块的队列、TTL、并发去重和身份核对；Codex 只投影既有 usage，不另起探测。 |
 | 统一额度 API / Query | [quota-snapshots 路由](../server/routes/quota-snapshots.ts) 提供 GET 与 POST `/refresh`；[API 包装](../frontend/lib/api/quota-snapshots.ts) 只转发请求，[useQuotaSnapshots](../frontend/hooks/useQuotaSnapshots.ts) 由 React Query 管缓存、取消、失效、重取与 GC，不在 API 层另放 pending 表。 |
 | NUG 轻量头部 | [use-nug-quota.ts](../frontend/components/narrator/model/use-nug-quota.ts) 使用同一 API 的标准 scoped Query：`groupId`、`cachedOnly: true`、`expectedGeneration`，按会话与模型运行时代次隔离；保留 64 KiB / 15s 预算、隐藏时停发与停用后台轮询。 |
-| Auto 收口 | [auto-route-signals.ts](../server/lib/agent/auto-route-signals.ts) 按模板读取订阅、模型可用性与凭据状态，不再复制类型分支。保留旧 `tokendance` 前缀 precedence；[catalog 身份识别](../server/lib/model-catalog/index.ts) 与 [候选枚举](../server/lib/settings/provider.ts) 必须纳入已配置 TD / CC、已发布的 CLI 模型目录，不能用未配置 CC 的静态兜底抢路由。 |
+| Auto | [auto-route-signals.ts](../server/lib/agent/auto-route-signals.ts) 按模板读取订阅、模型可用性与凭据状态。旧 `tokendance` 前缀 precedence 保留；[catalog 身份识别](../server/lib/model-catalog/index.ts) 与 [候选枚举](../server/lib/settings/provider.ts) 已纳入已配置 TD / CC、已发布的 CLI 模型目录，未配置 CC 不用静态兜底抢路由。 |
+| CC 模型 owner | [startCommandCodeModelCatalog](../server/lib/commandcode-models.ts) 在 [main.ts](../server/main.ts) 中先完成真实目录 prime，再继续恢复 / 定时工作；settings 与 KeyStore 的提交事件触发刷新，关闭时退订。冷启动不依赖访问 settings 页面，Auto 热路径仍纯读内存；失败保留同槽已知目录，不伪造 CLI 元数据。 |
+| NUG relay owner | [startNugRelayOwner](../server/lib/nug-relay/manager.ts) 订阅 settings 与 KeyStore，提交后以微任务合并 `reconcileNugRelayClients`，按有效启用 Key 建链，不把新 Key 配给旧 endpoint。`stopAllNugRelayClients` 退订、阻止排队的 reconcile 再执行并关闭连接；Auto 只读已有 channel registry。 |
 | 同步准备 | [PooledProvider.prepareForModel](../server/lib/agent/pooled-provider.ts) 同步准备实际选中的适配器；不增加 Promise / WeakMap 准备屏障，后续切 Key 仍要准备对应模型。 |
-| 迁移与旧包 | [credential-transfer](../server/lib/credential-transfer/index.ts) 收口为直接调用统一凭据实现，不保留只有一个元素的 `KINDS` 分派。兼容解析留在 [legacy-transfer.ts](../server/lib/sourcing/legacy-transfer.ts)：v1 明文 / v2 密封旧包、Codex 各登录方式与账号字段、插件字段都不能因简化而丢失。 |
+| 迁移与旧包 | [credential-transfer](../server/lib/credential-transfer/index.ts) 已直接调用统一凭据实现，移除单元素 `KINDS` 分派。[legacy-transfer.ts](../server/lib/sourcing/legacy-transfer.ts) 继续兼容 v1 明文 / v2 密封旧包、Codex 各登录方式与账号字段及插件字段。 |
 
 **业务边界不能被收口删掉**：额度按 Key 身份关联；STREAM 与 probe 独立；未知不是零；`expiresAt` 不是窗口 `resetsAt`；uncapped 不制造 0 限额（§15.4）。429 不应让健康粘性来源被换走，真实耗尽、403、停用 / 归档才按原策略排除；池有记录但全被停用时不能复活投影 Key 或 CLI。
 
-**TokenDance 门户登录不是“池的第一个 Key”**：现有标记由 [tokenDanceLoginAccount / isTokenDanceLoginKey](../server/lib/provider-keys.ts) 识别，[门户操作](../server/services/tokendance-service.ts) 必须只绑定唯一登录身份，不随排序变化。普通导入保留本地门户归属；显式替换才退休旧登录，独立手工 Key、网络身份与顺序不动。无可靠来源标记的旧仓不能猜首 Key：OAuth 中须选择替换槽，或明确保留旧 Key；这些是 S2 收口要求，不把尚未接入的交互写成已完成。
+**TokenDance 门户登录不是“池的第一个 Key”**：[tokenDanceLoginAccount / isTokenDanceLoginKey](../server/lib/provider-keys.ts) 识别唯一登录标记，[门户操作](../server/services/tokendance-service.ts) 绑定该身份，不随排序变化。普通导入保留本地门户归属；显式替换才退休旧登录，独立手工 Key、网络身份与顺序不动。无可靠来源标记的旧仓已在 OAuth 中要求选择替换槽或明确保留旧 Key，不猜首项。
 
 **NUG 出口不可静默降级**：[NugProvider](../server/lib/agent/nug-provider.ts) 只有 `egressAllowDirectFallback === true` 才允许直连；relay 不匹配或不可用时不能默认把 false / 未设置当成同意。
 
+**NUG 订单与付款额度固定身份**：[billing binding](../server/routes/nug.ts) 以不透明 `binding` 绑定用户、订单、CID 与连接身份；后续请求复核同一身份，重排不会改绑新首 Key。付款确认按捕获 CID 写入 per-Key 快照，只在仍为 primary 时更新该摘要，不把 A 的余额或旧值合并进重排后的 B。[NugRechargeDialog](../frontend/components/narrator/model/NugRechargeDialog.tsx) 对订单查询的瞬时失败作有界退避 / 重试，身份或权限失效立即停止；普通额度展示仍走统一 Query。
+
 ### 14.3 下一步与保留约定
 
-1. 完成 §15.9 的 S2 接缝整合，维持旧配置、旧包、原探测预算与授权行为；不以固定用例数量、内部对象引用或函数调用次数代替业务验收。
+1. 合并、发布及门禁结果以对应 PR / CI 为准；本节只说明实现能力与安全边界，不把文档状态当作 CI 结论。
 2. S3 再实现渠道快照与 `resolveRoute`，S4 做个人来源，S5 才落盘来源组、重组设置页与路由预设，S6 做成本 / 用量。本文没有声明这些阶段完成。
 3. 仓库构建、迁移与测试规则仍以 [CLAUDE.md](../CLAUDE.md) 为准；只跑相关 `bun test --isolate`，全量交给 CI，不停止承载会话的进程。
 
 - Key 冷却仍是内存状态；统一模式的持久停用写入 `credentials.json`，不是重新把模型 Key 写回 `provider-keys.json`。降级与备份恢复见 §15.8。
-- 路由热读取必须纯内存，包括超过 CLI auth / 模型目录 TTL 后。Command Code 的模型目录由原 owner 显式读取 / 刷新；真正请求继续按原规则读取 CLI auth，不能为了无 IO 删除登录或刷新功能。
+- 路由热读取在 CLI auth / 模型目录 TTL 之后仍是纯内存。Command Code 的目录已由启动 / 配置事件和显式刷新驱动；真正请求继续按原规则读取 CLI auth，不靠管理页偶然暖缓存，也不增加轮询运行时。
 - Codex 热路径读 `availableCount` / `routingPreview`，不调用可能恢复账号、重写凭据文件的 `hasAvailableCredentials`。
 - `referencePricing` 仍是每百万 token 的十进制字符串，可为 null；不把目录缺失当作免费或零额度。
 - [auto-forced-switch.ts](../server/services/agent-runtime/auto-forced-switch.ts) 的被迫切换等待阈值仍为 15 分钟，每次运行最多 3 次；S2 模板化不顺手改这些策略预算。
@@ -473,9 +477,9 @@ resolveRoute({ modelValue, billingOwner, narratorId, epoch, caps }) →
 | 设计要素 | 现状 | 证据 |
 |---|---|---|
 | 服务 / 凭据 / 渠道（§3） | 分阶段落地 | S1 凭据已统一；S2 的 `SourceGroupView` 从旧数组生成，持久来源组与渠道快照分别留到 S5 / S3 |
-| 服务模板 | S2 接缝已建立，继续收口 | 模板、`identifyService`、完整模型列表与 owner 额度探测入口已存在；Auto 的模板化整合及保留边界见 §14.2 |
+| 服务模板 | S2 已实现 | 模板、`identifyService`、完整模型列表、owner 额度探测与模板 Auto 已接通；生命周期与安全边界见 §14.2 |
 | 凭据统一形态（§6） | S1 已完成 | `credentials.json` 与 `credential-state.json` 分离；`CredentialStore` 管文件，各 manager / Key 兼容视图仍管自己的运行时数据；个人归属与计费留到 S4 / S6 |
-| 通用凭据池 | 共享核心与来源接入 | `credential-pool.ts` 复用选择 / 失败策略；TD / CC / NUG 接池须保留逐 Key 网络、记账、额度、同步 prepare 与 NUG 出口约束，不能把门户操作等同于轮询池 Key |
+| 通用凭据池 | 已接入共享核心 | TD / CC / NUG 复用 `credential-pool.ts`，保留逐 Key 网络、记账、额度与同步 prepare；门户 / 订单固定身份，relay 有独立的提交事件与关闭生命周期 |
 | 来源 id | 显式凭据身份 | 请求显式上报 `credentialId`；S1 迁移保住历史 id，`nug:` / `builtin:` 是兼容外观，不重新作为统一凭据的组 id |
 | 路由入口 | S3 待统一 | `resolveProviderAndModel`、`resolveEffectiveModel` 仍存在；`resolveRoute` 与按计费主体过滤是后续工作 |
 | 权限 | 团队凭据阶段 | 当前 `ownerUserId` 只接受 null；个人凭据鉴权与个人 → 团队回落在 S4，不能借 S2 放宽秘密读取权限 |
@@ -497,7 +501,7 @@ resolveRoute({ modelValue, billingOwner, narratorId, epoch, caps }) →
 - **自动消失**：组里最后一个凭据被删除时，组一起删除。
 - **不需要配置**：显示名默认取模板名或主机名（可改），前缀自动生成且不再变；高级项（协议、请求头、UA、代理、上下文窗口、工具图片等）在组的“高级”里，默认折叠，模板默认值能用就不展示。
 
-**服务模板**（[templates.ts](../server/lib/sourcing/templates.ts)）：描述“一种上游怎么用”，不含用户数据。下面列已建立的共同接口；Auto 行为按 §14.2 在 S2 收口。`identify` 是共享识别表，不伪装成模板中尚未接入的方法；导入仍保留 Codex 的 refresh token / sub / 账号与邮箱 / access token / agent identity 去重规则。
+**服务模板**（[templates.ts](../server/lib/sourcing/templates.ts)）：描述“一种上游怎么用”，不含用户数据。共同接口与 Auto 行为已接通（§14.2）；`identify` 仍在共享识别表中，导入经模板 `dedupeKeys` 保留 Codex 的 refresh token / sub / 账号与邮箱 / access token / agent identity 去重规则。
 
 ```ts
 interface SourceModel { readonly id: string } // 其余字段属于来源，完整保留
@@ -510,12 +514,16 @@ interface ServiceTemplate {
   endpoints?: Partial<Record<SourceProtocol, string>>;
   regions?: Partial<Record<SourceRegion, Partial<Record<SourceProtocol, string>>>>;
   authKinds: readonly AuthKind[];
+  dedupeKeys(credential: Omit<Credential, "id">): readonly string[];
   multiCredential: boolean;
   subscription: boolean;
   defaults?: Partial<Pick<CustomApiProviderConfig, "userAgentMode">>;
   personal: boolean;           // S4 的能力标志，不代表个人来源已开放
   probeQuota?(group: SourceGroupView, credentialId: string): Promise<QuotaSnapshot | undefined>;
   projectQuota?(credentialId: string): QuotaSnapshot | undefined; // Codex 只投影 canonical usage
+  isModelAvailable?(group: SourceGroupView, value?: string): boolean;
+  hasAvailableCredentials?: CredentialRouting["hasAvailableCredentials"];
+  routingPreview?(group: SourceGroupView, now: number): RoutingPreview | null;
   listModels(group: SourceGroupView, credential?: Credential,
              signal?: AbortSignal): Promise<readonly SourceModel[]>;
 }
@@ -523,7 +531,7 @@ interface ServiceTemplate {
 
 - 模型列表保留统一模板入口，经 [readTemplateModelList](../server/lib/sourcing/model-list-readers.ts) 一次返回 owner 的完整条目；`SourceModel` 只规定共享 `id`，各来源的协议、窗口等元数据原样保留，不先降为 ID 再二次读取。显式刷新仍由原目录 owner 负责；Agent 同步枚举与 Auto 候选只读已发布目录，不因 CLI auth / 目录 TTL 到期触发 IO。
 - `probeQuota(group, credentialId)` 直接委托该源的 owner；返回 undefined 表示本次没有可确认属于该身份的快照，不制造零额度。原队列、TTL、回退 / 退避与晚到结果的身份检查仍归源模块；Codex 的额度只走 `projectQuota`，不借统一入口重发探测。
-- Auto 收口时，`autoSourceFacts` / `autoSourcePreview` 的订阅、模型可用性与池可用性由模板提供，不再按类型重复写分支；NUG 的已知不可用模型、Codex credits 续用和原池策略仍保留。来源组解析须保住旧 `tokendance` 前缀 precedence；TD / CC 的有效模型也必须进入强匹配候选，不能让健康 sticky 因 catalog 漏前缀而被绕开。前端预设由后端下发。
+- `autoSourceFacts` / `autoSourcePreview` 已由模板提供订阅、模型可用性与池可用性，不再按类型重复写分支；NUG 的已知不可用模型、Codex credits 续用和原池策略保留。来源组解析保留旧 `tokendance` 前缀 precedence；TD / CC 的有效模型进入强匹配候选，健康 sticky 不再因 catalog 漏前缀而被绕开。前端预设由后端下发。
 - `identify` 用精确的主机 + 路径表（`shared/sourcing/identify.ts` 的 `identifyService({ baseUrl, protocol })` → `{ templateId, region? }`，前后端共用），识别不出就给对应协议的 `*-compatible`，NUG 连接一律 `nug`。原来散在各处的额度探测白名单（`isKimiCustomApiProvider` / `isOpencodeCustomApiProvider` / `isDeepSeekCustomApiProvider` 及前端同款）改为调用它，判定逐条不变：Kimi 行仍是 `kimi.com` / `kimi.ai` 及子域的任意地址（国内 / 国际），OpenCode Go、DeepSeek 与新增的 OpenAI / Anthropic / Gemini 官方行要求 https、默认端口、无用户信息 / 查询 / 片段，因为命中即会把 Key 发去额度接口。Moonshot 的 `api.moonshot.{cn,ai}` 是按量计费平台，不是 Kimi Code 套餐，归 `*-compatible`。`isOfficialChatGPTDomain`（决定是否发送 `ChatGPT-Account-Id` / ChatGPT Origin）不是模板识别，保持原样。归类错了只影响默认值和额度探测，不影响请求发往哪里，因为端点保存在组上。
 - 现有的 `ProviderSourceRegistry` 保留为“按模板构造适配器”的后端；`registerCredentialProviderSource` 的协议族注册变成 `api` 类模板。
 
@@ -681,10 +689,10 @@ resolveRoute({
 
 ### 15.7 插件供应商
 
-插件的 secret 已在宿主的 `plugins/secrets.json`（明文 0600，键 `provider.<contributionId>.<field>`），宿主每次调用时读出传给插件；插件协议没有额度、登录、订阅方法。
+插件 provider 的 secret 已经由 [PluginSecretVault](../server/services/plugin-secret-vault.ts) 的兼容 API 读写统一凭据中的 `opaque` 字段包；非 provider 秘密仍留在 vault。宿主仍在调用时传入凭据，插件协议没有因此新增额度、登录或订阅方法。
 
 - 插件供应商是一个 `plugin` 模板的来源组，配置仍由插件配置服务管理；凭据是 `opaque` 字段包。不参与多凭据池、不声明订阅，`auto:` 中视为按量来源。每个插件供应商只有一个凭据，所以来源 id 按 `plugin:<pluginId>:<contributionId>` 记账；插件内部若轮换多个账号，宿主看到的仍是一个来源。
-- 迁入时机已决：S1 不动插件 vault，S2 把 provider 字段搬进统一凭据，其余插件秘密留在 vault。迁移 / 导入须保留插件字段及原授权、启停与失败回退契约，不借存储收口修改插件协议。
+- S2 已迁入 provider 字段，迁移 / 导入继续兼容原插件字段；非 provider 秘密、授权、启停与失败回退契约保持原样，不因存储统一而改协议。
 - 额度、多账号要等插件协议新增方法，本契约不预设。
 
 ### 15.8 迁移与兼容
@@ -710,7 +718,7 @@ resolveRoute({
   - NarraForkAdmin 的 `deepMerge` 不得改写投影出的数组与 `sourceGroups`。
 - **降级**：迁移后旧版本读不到新文件；用备份目录可手动恢复迁移前的全部文件。发布说明写明。
 - **数据导入 / 导出**：S2 起供应商部分导出旧数组里的非机密配置（与逐模型设置）与密封的统一凭据（`credential` / `group-secrets` 条目）；S5 落盘后再改为导出来源组。下面的兼容规则不变：导入同时接受旧格式（v1 明文 Key、v2 密封 Key）并按一对一规则转换，前缀冲突沿用现有的改名与会话联动。旧包按 `nug:<id>`、`nug-oauth:<id>`、`quota:<id>`、`builtin:*` 归属存条目且不带 Key id，这些命名空间的解析只留在导入兼容模块里；导入的凭据拿新 id，旧实例上的用量不跟过来（与现状相同）。
-- **凭据迁移收口**：对外保留 `listTransferableCredentials`、`exportCredentials`、`previewCredentialImport`、`applyCredentialImport`（[入口](../server/lib/credential-transfer/index.ts)）；内部直接调用统一凭据实现，不保留单元素 `KINDS` / `TransferKind` 分派。旧包先经兼容模块规范化，不是删除旧读取器。v1 / v2、旧 codex / api-key 条目、插件 `opaque` 字段、Codex 账号与登录字段均须兼容，包括只有 access token 的 OAuth、`agentRuntimeId` / `agentPrivateKey` / `taskId`、`account` 与 `useCreditQuota` 等信息；不能为简化而静默丢字段。
+- **统一凭据迁移**：对外保留 `listTransferableCredentials`、`exportCredentials`、`previewCredentialImport`、`applyCredentialImport`（[入口](../server/lib/credential-transfer/index.ts)）；内部直接调用统一凭据实现，不保留单元素 `KINDS` / `TransferKind` 分派。旧包先经兼容模块规范化，不是删除旧读取器。v1 / v2、旧 codex / api-key 条目、插件 `opaque` 字段、Codex 账号与登录字段均须兼容，包括只有 access token 的 OAuth、`agentRuntimeId` / `agentPrivateKey` / `taskId`、`account` 与 `useCreditQuota` 等信息；不能为简化而静默丢字段。
 - **门户来源不随导入漂移**：TD 的唯一门户 marker 不由排序或首 Key 推断；普通导入保留本地门户身份，显式替换才退休旧登录，手工 Key 不动。无可靠标记的旧仓在 OAuth 中选择替换槽或明确保留旧 Key，不自动授予某个旧 Key 门户权限（§14.2）。
 - **用量历史**：凭据 id 规则见 15.3；`usage_daily.provider` 与 `credential_usage_totals.provider` 仍是请求时前缀。迁移不改前缀，按前缀与按凭据的汇总都连续。按 id 查询的地方（`usage-history-service`、`requestSourceName`、`resolveCredentialDisplayName`）改为查凭据实体。删除凭据时沿用 Codex 现在的做法清掉其 `credential_usage_totals`，对所有模板一致。
 - **数据库**：凭据仍走文件，无表结构变更。
@@ -720,7 +728,7 @@ resolveRoute({
 | 阶段 | 交付 | 验收 | 用户可见变化 | 删掉的旧代码 |
 |---|---|---|---|---|
 | **S1 统一凭据（已完成）** | `Credential` 与 `credentials.json`；显式 `credentialId`；运行时状态拆到 `credential-state.json`；`CredentialStore` 为统一文件所有者，`ProviderKeyStore` / CodexManager 仍是有各自内存的兼容视图；启动迁移、备份与冲突提示 | 迁移后历史记账 id、连接 id、前缀、模型值与纪元指纹不变；设置 API / Key 面板 / Codex 页兼容；旧包可读；不可读 / 冲突时零写入；搜索不受影响 | 几乎没有 | 统一模式不再把模型凭据写回两个旧文件；旧格式读取与兼容 API 暂留，不宣称已收窄为搜索专用 |
-| **S2 服务模板（接缝收口中）** | 模板、共享识别与 `SourceGroupView`；完整 `SourceModel` 列表；owner 额度探测 / Codex 投影；统一 API 与 React Query；TD / CC / NUG 池、同步 prepare、模板 Auto；后端预设；统一迁移 / 导出与插件秘密 | 不落 `sourceGroups[]`、不加设置翻译层；逐 Key / STREAM / 未知 / 有效期 / uncapped 语义保持；热路由无 IO 且显式刷新保留；旧包、插件、账号字段与 TD 门户归属不丢；具体接缝见 §14.2、§15.2、§15.4 | 额度展示统一；同一来源可放多个凭据 | 重复 Auto 类型分支、明文额度缓存、前端重复预设、API 第二 pending 表、Promise 准备弱表、单元素迁移分派；旧格式解析保留在兼容边界 |
+| **S2 服务模板（实现已落地）** | 模板、共享识别与 `SourceGroupView`；完整 `SourceModel` 列表；owner 额度探测 / Codex 投影；统一 API 与 React Query；TD / CC / NUG 池、同步 prepare、模板 Auto；CC 目录与 NUG relay 生命周期；固定身份的付款额度；后端预设；统一迁移 / 导出与插件秘密 | 不落 `sourceGroups[]`、不加设置翻译层；逐 Key / STREAM / 未知 / 有效期 / uncapped 语义保持；热路由无 IO，冷启动与显式刷新有 owner；旧包、账号字段、TD 门户与 NUG 订单身份不漂移；具体实现见 §14.2、§15.2、§15.4 | 额度展示统一；同一来源可放多个凭据 | 重复 Auto 类型分支、明文额度缓存、前端重复预设、API 第二 pending 表、Promise 准备弱表、单元素迁移分派；旧格式解析保留在兼容边界 |
 | **S3 resolveRoute** | 渠道快照；`resolveRoute` 与薄壳；计费主体缓存；直接构造适配器的入口收口；聚合下线 | 全部路由调用经 `resolveRoute`；行为测试覆盖粘性、被迫切换、能力过滤不回归；菜单无聚合项 | “模型聚合”彻底消失 | `resolveAggregation`、`modelAggregations` |
 | **S4 个人来源**（原 P4） | 凭据与 API 按归属鉴权；个人 → 团队分层与回落；状态条回落提示 | 协作者回合用所有者凭据；所有者为空只用团队；个人秘密不对管理员可见 | 非管理员能登录自己的订阅、加自己的 Key 或 API | `requireAdmin` 的凭据路由 |
 | **S5 设置页重组** | `settings.sourceGroups[]` 落盘（一对一迁移、`identify` 推断模板）并删除旧数组；Key 归属命名空间外观清理；NarraForkAdmin 对来源组的写保护；“我的来源 / 团队来源 / 路由策略”；按来源组列出凭据，Codex 式统一凭据详情；添加入口只有“添加凭据 / 添加 API”，粘贴 Key → 模板识别 → 拉模型与额度；路由策略两个预设 | 迁移后连接 id 与前缀不变；设置页不再按类型分派；新用户粘贴一个 Key 即可用 | 设置结构按 §10 | `providers.tsx` 分派、`providers-reducer` 多数组状态、`customApiProviders` / `nugProviders` 等旧数组、Key 投影的归属命名空间（只留导入兼容） |
@@ -730,17 +738,17 @@ resolveRoute({
 
 **2026-11-25 实施说明**：S1 已完成的是文件与身份统一，不是删除所有 manager / Key 外观。`CredentialStore` 管统一文件，CodexManager 与 `ProviderKeyStore` 保留各自运行时数据并按段保存；模式切换与旧文件恢复见 §15.8。S1 / S2 不改旧配置数组，Key 冷却仍只在内存。来源组落盘、设置翻译层与 owner 命名空间外观清理均留到 S5；这取代早先把 `sourceGroups[]` 放进 S2 的安排。
 
-**S2 收口清单**（接缝与保留要求，不是剩余 PR 已合并 / CI 已完成的声明）：
+**S2 已实现能力**（合并、发布与门禁状态以对应 PR / CI 为准；S3–S6 未完成）：
 
 1. 模板注册表、共享 `identifyService` 与 `SourceGroupView`；S2 只做旧连接内存视图，不新增 `sourceGroups[]`。旧模板归类、连接 id、前缀与旧 `tokendance` precedence 保持。
 2. 预设由后端模板 / 识别数据下发，仍经 `GET /api/sourcing/templates`；模型列表一次返回完整 `SourceModel`，不加第二套模型目录或先转 ID 再回读。
 3. `QuotaSnapshot` 按凭据身份存储；`probeQuota(group, credentialId)` 委托原 owner 的队列、TTL、并发与身份核对，Codex 只投影。STREAM / probe 独立、未知非零、有效期非 reset、uncapped 不造 0 限额，原有 credits / 窗口 / 错误行为保留。
 4. 前端统一走 quota-snapshots；Query 缓存、取消、失效、GC 归 React Query，API 不再维护第二 pending 表。NUG 轻量头部也走同一 `groupId` / `cachedOnly` / `expectedGeneration` scoped Query，64 KiB / 15s 与隐藏停发不变。显式管理员 `:id/probe` 诊断仍保留，`plugin_not_enabled` 只以安全码本地化显示。
-5. `autoSourceFacts` / `autoSourcePreview` 模板化；TD / CC 有效来源进入 catalog 强匹配候选，健康 sticky 保留，池全禁用且有备用来源时切换。CLI 热读在 auth / 模型 TTL 之后仍无 IO；owner 的显式刷新与真正请求的 CLI auth 读取不删。
-6. TD / CC / NUG 按模板进池，`prepareForModel` 同步，不加 Promise 弱表；切 Key 后的模型准备、记账、流式归属、逐 Key 网络保持。NUG relay 未就绪时，只有 `egressAllowDirectFallback === true` 才能直连。
+5. `autoSourceFacts` / `autoSourcePreview` 已模板化；TD / CC 有效来源进入 catalog 强匹配候选，健康 sticky 保留，池全禁用且有备用来源时切换。CC 模型 owner 冷启动 prime，settings / KeyStore 提交后刷新并在关闭时退订，不依赖 settings GET。CLI 热读在 auth / 模型 TTL 之后仍无 IO；显式刷新与真正请求的 CLI auth 读取保留。
+6. TD / CC / NUG 已按模板进池，`prepareForModel` 同步，无 Promise 弱表；切 Key 后的准备、记账、流式归属与逐 Key 网络保持。NUG relay 在启动及 settings / KeyStore 提交后以微任务 reconcile，关停退订并阻止排队工作；只有 `egressAllowDirectFallback === true` 才允许直连。
 7. 迁移 / 数据导出继续“旧数组非机密配置 + 密封统一凭据”，组 id / 前缀避让共享；迁移直接调用统一实现，不留单元素 `KINDS`。v1 / v2、插件与账号字段兼容留在边界，不因删分派而删除读取能力。
-8. TD 门户 marker 唯一且不随排序改变；普通导入保留本地归属，显式替换才退休旧登录，手工 Key 不动。无可靠标记的旧仓必须经 OAuth 选择替换槽或明确保留旧 Key，不能推测首项。
-9. 插件供应商按 `plugin` 模板列出，provider 秘密迁入统一凭据，其余插件秘密仍由 vault 管；原插件协议、授权、启停与失败回退契约不变。此项仍属 S2，不借文档宣布 S3–S6 完成。
+8. TD 门户 marker 唯一且不随排序改变；普通导入保留本地归属，显式替换退休旧登录，手工 Key 不动；无标记旧仓的 OAuth 已要求选择替换槽或明确保留。NUG opaque 订单固定 CID、付款额度 per-Key 回写与瞬时失败有界重试已接通，不污染重排后的首 Key。
+9. 插件供应商按 `plugin` 模板列出，provider 秘密已迁入统一凭据，其余秘密仍由 vault 管；原插件协议、授权、启停与失败回退契约不变。
 
 ### 15.10 不做 / 推迟
 
