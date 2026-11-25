@@ -85,11 +85,12 @@ import { compareRefFor, workStartPoint } from "./team-work-start";
 import {
 	assertWorkItemStartable,
 	checkDependencies,
+	confirmUnblocks,
 	deliverUnblockedNotes,
 	normalizeDependencyIds,
 	readDependencies,
-	recordUnblocked,
-	type UnblockedItem,
+	type UnblockCandidate,
+	unblockCandidates,
 	writeDependencies,
 } from "./work-item-dependencies";
 
@@ -1294,7 +1295,7 @@ function markMerged(input: {
 }): boolean {
 	const now = new Date().toISOString();
 	let merged = false;
-	let unblocked: UnblockedItem[] = [];
+	let candidates: UnblockCandidate[] = [];
 	let changedTeamId: string | null = null;
 	try {
 		db.transaction((tx) => {
@@ -1335,7 +1336,7 @@ function markMerged(input: {
 				at: now,
 			});
 			// D: the queued items that waited for this one and now wait for nothing.
-			unblocked = recordUnblocked(tx, item.id, now);
+			candidates = unblockCandidates(tx, item.id);
 		});
 	} catch (error) {
 		if (error instanceof AppError && error.code === "TEAM_WORK_ITEM_CHANGED") return false;
@@ -1347,9 +1348,15 @@ function markMerged(input: {
 			workItemId: input.itemId,
 			detectedBy: input.detail.detectedBy,
 		});
-	if (unblocked.length > 0)
-		void trackTeamLifecycleWork(deliverUnblockedNotes(unblocked)).catch((error) =>
-			logger.warn("Team unblock notes failed", { error: String(error) }),
+	// D: confirmed (git: the dependency inside each dependent's start ref) after the transaction.
+	if (candidates.length > 0)
+		void trackTeamLifecycleWork(
+			confirmUnblocks(candidates)
+				.then(deliverUnblockedNotes)
+				.catch((error) => {
+					logger.warn("Team unblock notes failed", { error: String(error) });
+					return 0;
+				}),
 		);
 	return merged;
 }

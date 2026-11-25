@@ -35,8 +35,13 @@ import {
 } from "../team-work-start";
 import { readWorkStats, resetWorkStatCacheForTests } from "../team-work-view";
 import {
+	assertDependenciesReachStart,
+	setUnblockDeliveryForTests,
+} from "../work-item-dependencies";
+import {
 	attachWorker,
 	createWorkItem,
+	markMergedByAncestry,
 	setWorkItemPortsForTests,
 	syncWorkItem,
 	worktreePathOf,
@@ -199,10 +204,11 @@ function setProjectSettings(settings: Record<string, unknown> | null) {
 	]);
 }
 
-const create = (title: string) =>
+const create = (title: string, dependsOn?: string[]) =>
 	createWorkItem({
 		coordinatorId: LEAD,
 		title,
+		...(dependsOn ? { dependsOn } : {}),
 		actor: agent,
 		principal,
 		signal: new AbortController().signal,
@@ -464,5 +470,113 @@ describe("where work starts", () => {
 		expect(after.settings).toEqual({ coordinatorLimits: { editLines: 5 }, workStart: "remote" });
 		const removed = await updateTeam(LEAD, admin, { settings: { workStart: null } });
 		expect(removed.settings).toEqual({ coordinatorLimits: { editLines: 5 } });
+	});
+
+	/** Mark an item merged by ancestry at `head` (its head recorded at ready). */
+	async function mergedAt(itemId: string, head: string) {
+		sqlite.run("UPDATE team_work_items SET state = 'ready', head_sha = ? WHERE id = ?", [
+			head,
+			itemId,
+		]);
+		const row = db.select().from(teamWorkItems).where(eq(teamWorkItems.id, itemId)).get();
+		expect(
+			markMergedByAncestry({
+				itemId,
+				head,
+				base: head,
+				expectedHeadSha: head,
+				expectedUpdatedAt: row?.updatedAt ?? "",
+			}),
+		).toBe(true);
+		// The unblock is confirmed (git) after the merge transaction.
+		await Bun.sleep(300);
+	}
+	const unblocks = (itemId: string) =>
+		db
+			.select({ kind: teamWorkEvents.kind })
+			.from(teamWorkEvents)
+			.where(eq(teamWorkEvents.workItemId, itemId))
+			.all()
+			.filter((event) => event.kind === "work.unblocked").length;
+
+	beforeEach(() => setUnblockDeliveryForTests(async () => true));
+	afterEach(() => setUnblockDeliveryForTests(null));
+
+	test("a dependency merged only into the local base does not unblock an origin start (Devin 5)", async () => {
+		setTeamSettings({ workStart: "remote" });
+		const schema = await create("Schema");
+		const api = await create("API", [schema.id]);
+		const head = await commitFile(worktreePathOf(schema) ?? "", "schema.txt", "s\n", "schema");
+		// Landed in the local main only (fast-forwarded there); origin/main does not have it.
+		await git(["merge", "-q", "--ff-only", head]);
+		await mergedAt(schema.id, head);
+		expect(unblocks(api.id)).toBe(0);
+		await expect(assertDependenciesReachStart(api.id)).rejects.toMatchObject({
+			code: "TEAM_WORK_ITEM_BLOCKED",
+			message: expect.stringContaining("not into origin/main"),
+		});
+		// Once origin has it (pushed and fetched), it may start.
+		await git(["push", "-q", "origin", "main"]);
+		await git(["fetch", "-q", "origin", "+refs/heads/main:refs/remotes/origin/main"]);
+		await assertDependenciesReachStart(api.id);
+	});
+
+	test("a dependency merged only on origin does not unblock a local start (Devin 5)", async () => {
+		setTeamSettings({ workStart: "local" });
+		const schema = await create("Schema");
+		const api = await create("API", [schema.id]);
+		const head = await commitFile(worktreePathOf(schema) ?? "", "schema.txt", "s\n", "schema");
+		await git(["push", "-q", "origin", `${head}:refs/heads/main`, "--force"]);
+		await git(["fetch", "-q", "origin", "+refs/heads/main:refs/remotes/origin/main"]);
+		await mergedAt(schema.id, head);
+		expect(unblocks(api.id)).toBe(0);
+		await expect(assertDependenciesReachStart(api.id)).rejects.toMatchObject({
+			message: expect.stringContaining("not into main"),
+		});
+		await git(["merge", "-q", "--ff-only", head]);
+		await assertDependenciesReachStart(api.id);
+	});
+
+	test("a dependency inside the start ref unblocks once (Devin 5)", async () => {
+		setTeamSettings({ workStart: "local" });
+		const schema = await create("Schema");
+		const api = await create("API", [schema.id]);
+		const head = await commitFile(worktreePathOf(schema) ?? "", "schema.txt", "s\n", "schema");
+		await git(["merge", "-q", "--ff-only", head]);
+		await mergedAt(schema.id, head);
+		expect(unblocks(api.id)).toBe(1);
+	});
+
+	test("a team whose base is origin/main: never origin/origin/main (Devin 9)", async () => {
+		sqlite.run("UPDATE project_teams SET base_branch = 'origin/main' WHERE narrator_id = ?", [
+			LEAD,
+		]);
+		const before = await git(["rev-parse", "refs/remotes/origin/main"]);
+		// Local start: the tracking ref as it is, not fetched.
+		setTeamSettings({ workStart: "local" });
+		const local = await create("Local from tracking");
+		expect(await git(["rev-parse", "HEAD"], worktreePathOf(local) ?? "")).toBe(before);
+		expect(createdDetail(local.id)).toMatchObject({ startFrom: "origin/main" });
+		// Remote start: origin's main fetched into refs/remotes/origin/main.
+		setTeamSettings({ workStart: "remote" });
+		const remote = await create("Remote from tracking");
+		expect(await git(["rev-parse", "HEAD"], worktreePathOf(remote) ?? "")).toBe(upstream);
+		expect(createdDetail(remote.id)).toMatchObject({ startFrom: "origin/main" });
+		await expect(
+			git(["rev-parse", "--verify", "refs/remotes/origin/origin/main"]),
+		).rejects.toThrow();
+		// Sync names origin/main and its commit.
+		sqlite.run(
+			`INSERT INTO narrators (id, type, title, status, parent_narrator_id, acl_root_narrator_id, created_at, updated_at)
+			VALUES ('ws-tracking-worker', 'subagent', 'w', 'idle', ?, ?, ?, ?)`,
+			[LEAD, LEAD, NOW, NOW],
+		);
+		attachWorker(LEAD, local.id, "ws-tracking-worker", agent);
+		const sync = await syncWorkItem({ coordinatorId: LEAD, itemId: local.id, actor: agent });
+		expect(sync).toMatchObject({ outcome: "handed_off", baseSha: upstream });
+		if (sync.outcome === "handed_off") {
+			expect(sync.instruction).toContain(`the base origin/main (commit ${upstream})`);
+			expect(sync.instruction).not.toContain("origin/origin");
+		}
 	});
 });

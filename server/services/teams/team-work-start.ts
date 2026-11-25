@@ -129,8 +129,20 @@ export async function workStartPoint(input: {
 	settings: TeamSettings | null | undefined;
 }): Promise<WorkStartPoint> {
 	const mode = await resolveWorkStart(input);
-	if (mode === "local")
-		return { mode, label: input.baseBranch, ref: input.baseBranch, commit: null, fetched: null };
+	const { branch, tracking } = baseBranchOf(input.baseBranch);
+	if (mode === "local") {
+		// A tracking base (`origin/main`) is used as it is, by its commit (a worktree made from a
+		// remote-tracking ref would also get it as upstream).
+		if (!tracking)
+			return { mode, label: input.baseBranch, ref: input.baseBranch, commit: null, fetched: null };
+		const { repo } = projectStartFacts(input.projectId);
+		const commit = repo
+			? await teamRepoGit(repo)
+					.resolve(input.baseBranch)
+					.catch(() => null)
+			: null;
+		return { mode, label: input.baseBranch, ref: input.baseBranch, commit, fetched: null };
+	}
 	const { repo } = projectStartFacts(input.projectId);
 	if (!repo)
 		throw new AppError(
@@ -139,10 +151,12 @@ export async function workStartPoint(input: {
 			"TEAM_PROJECT_NOT_GIT",
 		);
 	const git = teamRepoGit(repo);
-	const label = `origin/${input.baseBranch}`;
-	const ref = `refs/remotes/origin/${input.baseBranch}`;
-	const fetch = await fetchOnce(repo, input.baseBranch, () =>
-		git.fetchBaseFromOrigin(input.baseBranch).catch((error: unknown) => ({
+	// `origin/main` and `refs/remotes/origin/main` name the branch `main` on origin: never
+	// `origin/origin/main`.
+	const label = `origin/${branch}`;
+	const ref = remoteTrackingRef(branch);
+	const fetch = await fetchOnce(repo, branch, () =>
+		git.fetchBaseFromOrigin(branch).catch((error: unknown) => ({
 			ok: false as const,
 			message: error instanceof Error ? error.message : String(error),
 		})),
@@ -158,11 +172,27 @@ export async function workStartPoint(input: {
 		throw new AppError(
 			`New work starts from ${label} (team settings), but it could not be fetched${
 				fetch.ok ? "" : ` (${fetch.message})`
-			} and there is no ${ref} to start from. Fetch it, or set the team to start from the local ${input.baseBranch}.`,
+			} and there is no ${ref} to start from. Fetch it, or set the team to start from the local ${branch}.`,
 			409,
 			"TEAM_WORK_START_UNAVAILABLE",
 		);
 	return { mode, label, ref, commit, fetched: fetch.ok };
+}
+
+/**
+ * Where work of a team on `baseBranch` starts now, without fetching: `refs/remotes/origin/<b>`
+ * (`origin/<b>`) in `remote` mode, else the base as it is. What a dependency must be inside for a
+ * dependent to start: `work.sync` brings in exactly this ref.
+ */
+export async function startRefFor(input: {
+	projectId: string;
+	baseBranch: string;
+	settings: TeamSettings | null | undefined;
+}): Promise<{ ref: string; label: string }> {
+	const mode = await resolveWorkStart(input);
+	if (mode === "local") return { ref: input.baseBranch, label: input.baseBranch };
+	const { branch } = baseBranchOf(input.baseBranch);
+	return { ref: remoteTrackingRef(branch), label: `origin/${branch}` };
 }
 
 // ── What an item's branch is compared against ───────────────────────────────
@@ -180,7 +210,20 @@ export function itemStartedFrom(itemId: string): string | null {
 }
 
 /** The remote-tracking ref of a base (`refs/remotes/origin/<base>`). */
-export const remoteTrackingRef = (base: string) => `refs/remotes/origin/${base}`;
+export const remoteTrackingRef = (base: string) =>
+	`refs/remotes/origin/${baseBranchOf(base).branch}`;
+
+/**
+ * The branch a base names, and whether it was given as origin's remote-tracking ref
+ * (`origin/<b>` or `refs/remotes/origin/<b>`): such a team's work starts and syncs from origin's
+ * `<b>`, and a local merge refuses it.
+ */
+export function baseBranchOf(base: string): { branch: string; tracking: boolean } {
+	if (base.startsWith("refs/remotes/origin/"))
+		return { branch: base.slice("refs/remotes/origin/".length), tracking: true };
+	if (base.startsWith("origin/")) return { branch: base.slice("origin/".length), tracking: true };
+	return { branch: base, tracking: false };
+}
 
 /**
  * The ref an item's branch is compared against — its changed paths, size, diff, commits since
@@ -194,7 +237,8 @@ export async function compareRefFor(
 	base: string,
 	resolve: (ref: string) => Promise<string | null>,
 ): Promise<string> {
-	if (itemStartedFrom(itemId) !== `origin/${base}`) return base;
-	const remote = remoteTrackingRef(base);
+	const { branch, tracking } = baseBranchOf(base);
+	if (!tracking && itemStartedFrom(itemId) !== `origin/${branch}`) return base;
+	const remote = remoteTrackingRef(branch);
 	return (await resolve(remote).catch(() => null)) ? remote : base;
 }
