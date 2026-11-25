@@ -226,7 +226,7 @@ describe("NUG quota snapshots", () => {
 		quotaStore.remove(second.id);
 	});
 
-	test("real billing config keeps stream-only breakdown in cached view without writing it into probe", async () => {
+	test("real billing config keeps stream-only breakdown in the owner view without writing it into probe", async () => {
 		const config = useProvider();
 		const captured = captureNugQuotaSubject(config);
 		const start = Date.now();
@@ -244,8 +244,8 @@ describe("NUG quota snapshots", () => {
 		expect(
 			(await requestNugRoute(nugRoutes, `/providers/${providerId}/billing/config`)).status,
 		).toBe(200);
-		const cached = await requestNugRoute(nugRoutes, `/quotas?providerId=${providerId}`);
-		expect((await cached.json()).quota).toMatchObject({
+		// Q's ordinary reads use the unified API; the private breakdown stays in its owner.
+		expect(getNugCachedQuota(providerId)).toMatchObject({
 			balance: 12,
 			detailedQuotaBalance: "stream allocation details",
 		});
