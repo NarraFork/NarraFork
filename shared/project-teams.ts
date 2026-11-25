@@ -87,6 +87,13 @@ export interface TeamSettings {
 	workStart?: TeamWorkStart;
 }
 
+/**
+ * A change to a team's settings (`PATCH …/teams/:teamId`): only the keys given change, merged on
+ * the server into what is stored; `null` removes a key. So two people changing different settings
+ * at once never overwrite each other.
+ */
+export type TeamSettingsPatch = { [K in keyof TeamSettings]?: TeamSettings[K] | null };
+
 /** The effective coordinator limits of a team. */
 export function effectiveCoordinatorLimits(settings: TeamSettings | null | undefined) {
 	return { ...DEFAULT_COORDINATOR_LIMITS, ...(settings?.coordinatorLimits ?? {}) };

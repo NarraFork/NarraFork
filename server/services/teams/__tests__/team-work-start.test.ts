@@ -24,6 +24,7 @@ import {
 	setHostingSourceForTests,
 } from "../team-hosting";
 import { resetOverlapStateForTests, runChangedPathsPass } from "../team-overlap";
+import { updateTeam } from "../team-service";
 import {
 	compareRefFor,
 	fetchOnce,
@@ -453,5 +454,15 @@ describe("where work starts", () => {
 		setTeamSettings({ workStart: "local" });
 		const localItem = await create("Local start");
 		expect(await compareRefFor(localItem.id, "main", resolve)).toBe("main");
+	});
+
+	test("a settings change merges into what is stored: another key changed meanwhile is kept", async () => {
+		const admin = { userId: USER, isAdmin: true };
+		// Two people, each from a dialog that read the settings before the other saved.
+		await updateTeam(LEAD, admin, { settings: { coordinatorLimits: { editLines: 5 } } });
+		const after = await updateTeam(LEAD, admin, { settings: { workStart: "remote" } });
+		expect(after.settings).toEqual({ coordinatorLimits: { editLines: 5 }, workStart: "remote" });
+		const removed = await updateTeam(LEAD, admin, { settings: { workStart: null } });
+		expect(removed.settings).toEqual({ coordinatorLimits: { editLines: 5 } });
 	});
 });

@@ -12,7 +12,7 @@ import type { CreateTeamPayload, UpgradeToTeamPayload } from "@frontend/lib/api/
 import {
 	TEAM_WORK_STATS_IDS_MAX,
 	type TeamBoardColumn,
-	type TeamSettings,
+	type TeamSettingsPatch,
 	type TeamWorkStatsResponse,
 } from "@shared/project-teams";
 import {
@@ -449,7 +449,7 @@ export function useArchiveTeam(projectId: string, teamId: string) {
 export function useUpdateTeam(projectId: string, teamId: string) {
 	const queryClient = useQueryClient();
 	return useMutation({
-		mutationFn: (patch: { baseBranch?: string; brief?: string; settings?: TeamSettings }) =>
+		mutationFn: (patch: { baseBranch?: string; brief?: string; settings?: TeamSettingsPatch }) =>
 			api.updateProjectTeam(projectId, teamId, patch),
 		meta: { suppressErrorToast: true },
 		onSuccess: (team) => {

@@ -9,7 +9,7 @@ import type {
 	TeamMembersResponse,
 	TeamPageSummary,
 	TeamRunningResponse,
-	TeamSettings,
+	TeamSettingsPatch,
 	TeamWorkFileDiff,
 	TeamWorkItemDetail,
 	TeamWorkMergeResponse,
@@ -110,7 +110,7 @@ export const teamsApi = {
 	updateProjectTeam: (
 		projectId: string,
 		teamId: string,
-		patch: { baseBranch?: string; brief?: string; settings?: TeamSettings },
+		patch: { baseBranch?: string; brief?: string; settings?: TeamSettingsPatch },
 	) =>
 		request<TeamDetail>(teamBase(projectId, teamId), {
 			method: "PATCH",

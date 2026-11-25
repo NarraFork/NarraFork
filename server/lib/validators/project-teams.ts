@@ -43,6 +43,18 @@ export const teamSettingsSchema = z
 		message: `Team settings are limited to ${TEAM_SETTINGS_MAX_BYTES} bytes`,
 	});
 
+/** A settings change: the keys given replace the stored ones, `null` removes one. */
+export const teamSettingsPatchSchema = z
+	.object({
+		coordinatorLimits: coordinatorLimitsSchema.nullable().optional(),
+		mergeNeedsPerson: z.boolean().nullable().optional(),
+		workStart: z.enum(TEAM_WORK_START_MODES).nullable().optional(),
+	})
+	.strict()
+	.refine((value) => utf8Bytes(JSON.stringify(value)) <= TEAM_SETTINGS_MAX_BYTES, {
+		message: `Team settings are limited to ${TEAM_SETTINGS_MAX_BYTES} bytes`,
+	});
+
 export const createProjectTeamSchema = z
 	.object({
 		/** The team name, which is the coordinator session's title. */
@@ -78,7 +90,7 @@ export const updateProjectTeamSchema = z
 	.object({
 		baseBranch: teamBaseBranchSchema.optional(),
 		brief: teamBriefSchema.optional(),
-		settings: teamSettingsSchema.optional(),
+		settings: teamSettingsPatchSchema.optional(),
 	})
 	.strict()
 	.refine((value) => Object.values(value).some((field) => field !== undefined), {

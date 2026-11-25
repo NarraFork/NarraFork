@@ -895,14 +895,10 @@ describe("questions keep their context", () => {
 	});
 
 	test("a refused base branch has its own words in both languages", async () => {
-		const { settingsErrorKey, settingsWithWorkStart } = await import("./TeamSettingsModal");
-		// W: the work start replaces only its own key; the default drops it.
-		const settings = { mergeNeedsPerson: true, workStart: "local" as const };
-		expect(settingsWithWorkStart(settings, "remote")).toEqual({
-			mergeNeedsPerson: true,
-			workStart: "remote",
-		});
-		expect(settingsWithWorkStart(settings, "default")).toEqual({ mergeNeedsPerson: true });
+		const { settingsErrorKey, workStartPatch } = await import("./TeamSettingsModal");
+		// W: only the work start key is sent; the default removes it (the server merges).
+		expect(workStartPatch("remote")).toEqual({ workStart: "remote" });
+		expect(workStartPatch("default")).toEqual({ workStart: null });
 		const key = settingsErrorKey({ data: { code: "TEAM_BASE_BRANCH_UNRESOLVED" } });
 		expect(key).toBe("teams.page.settings.errors.TEAM_BASE_BRANCH_UNRESOLVED");
 		expect(settingsErrorKey({ data: { code: "OTHER" } })).toBeNull();

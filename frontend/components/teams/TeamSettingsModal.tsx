@@ -9,7 +9,7 @@ import { describeApiError } from "@frontend/lib/api-error";
 import { Alert, Button, Group, Modal, Select, Stack, Textarea, TextInput } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import { teamBaseBranchSchema, teamBriefSchema } from "@shared/project-team-draft";
-import type { TeamDetail, TeamSettings, TeamWorkStart } from "@shared/project-teams";
+import type { TeamDetail, TeamSettingsPatch, TeamWorkStart } from "@shared/project-teams";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -22,13 +22,12 @@ const SETTINGS_ERROR_CODES = new Set([
 
 type WorkStartChoice = TeamWorkStart | "default";
 
-/** The settings to save for a work start choice (`default` drops the team's own). */
-export function settingsWithWorkStart(
-	settings: TeamSettings,
-	choice: WorkStartChoice,
-): TeamSettings {
-	const { workStart: _previous, ...rest } = settings;
-	return choice === "default" ? rest : { ...rest, workStart: choice };
+/**
+ * The settings change for a work start choice: only that key is sent (the server merges it, so a
+ * concurrent change of another setting is kept); `default` removes the team's own.
+ */
+export function workStartPatch(choice: WorkStartChoice): TeamSettingsPatch {
+	return { workStart: choice === "default" ? null : choice };
 }
 
 /** The i18n key of a refused settings change, or null for a generic message. */
@@ -92,12 +91,12 @@ export function TeamSettingsModal({
 		update.variables?.baseBranch === baseBranch.trim();
 	const save = () => {
 		if (!team || branchError || briefError) return;
-		const patch: { baseBranch?: string; brief?: string; settings?: TeamSettings } = {};
+		const patch: { baseBranch?: string; brief?: string; settings?: TeamSettingsPatch } = {};
 		if (baseBranch.trim() && baseBranch.trim() !== team.baseBranch)
 			patch.baseBranch = baseBranch.trim();
 		if (brief !== team.brief) patch.brief = brief;
 		if (workStart !== (team.settings.workStart ?? "default"))
-			patch.settings = settingsWithWorkStart(team.settings, workStart);
+			patch.settings = workStartPatch(workStart);
 		if (Object.keys(patch).length === 0) {
 			close();
 			return;
