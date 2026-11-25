@@ -18,7 +18,10 @@
  */
 
 import type { NarratorWSCallbacks } from "@frontend/hooks/useNarratorWS";
-import type { PretextDocumentFetchPage } from "./pretext-document-loader";
+import type {
+	PretextDocumentFetchPage,
+	PretextDocumentLoadOptions,
+} from "./pretext-document-loader";
 
 /** Reference pinning for a tool detail fetch (provider ids can repeat). */
 export interface VListToolDetailRef {
@@ -49,6 +52,16 @@ export interface VListDataSource {
 	onFetchAttachment?: (fetchUrl: string, filename: string) => void;
 	/** Document page fetch (pretext document windows). */
 	fetchPage?: PretextDocumentFetchPage;
+	/** Resume/canonical recovery owned by the host, instead of narrator locate + pages. */
+	refreshWindow?: PretextDocumentLoadOptions["refreshWindow"];
+	/** Final synchronous delete/barrier projection after the last preparation await. */
+	finalizeRefreshWindow?: PretextDocumentLoadOptions["finalizeRefreshWindow"];
+	/** Temporary recovery failures preserve the current window; 401/403 always clear it. */
+	refreshFailurePolicy?: "retain";
+	/** Recovery diagnostics without discarding the retained history/anchor. */
+	onRefreshError?: (error: unknown) => void;
+	/** Mirror only the committed window, including trims/patches; denied access sends an empty window. */
+	onWindowChange?: (window: import("./pretext-document-loader").PretextDocumentInput) => void;
 	/** Message id → document coordinate (jump targets). */
 	locateMessage?: (
 		narratorId: string,

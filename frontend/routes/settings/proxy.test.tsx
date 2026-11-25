@@ -61,6 +61,9 @@ mock.module("react-i18next", () => ({
 	}),
 }));
 mock.module("../../hooks/useAuth", () => ({ useCurrentUser: () => ({ data: { role: "admin" } }) }));
+mock.module("../../hooks/useUserPreferences", () => ({
+	useUserPreferencesDetail: () => ({ data: {}, isLoading: false }),
+}));
 mock.module("../../lib/api", () => ({
 	api: {
 		getSettings: async () => structuredClone(settingsData),

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION } from "@shared/recent-tabs";
-import { coerceMessageReplacementAliases } from "../hooks/useNarratorWS";
+import { coerceMessageReplacementAliases, coerceNarratorStatusPatch } from "../hooks/useNarratorWS";
 import {
 	chunkNarratorIds,
 	limitNarratorSubscriptionIds,
@@ -46,6 +46,85 @@ describe("complete input document lane ordering", () => {
 		expect(seen).toEqual([snapshot, live, seal]);
 		await Promise.resolve();
 		expect(seen).toHaveLength(3);
+	});
+});
+
+describe("status patch projection", () => {
+	test("preserves explicit clears and false while omitting absent legacy fields", () => {
+		expect(coerceNarratorStatusPatch({ status: "working" })).toEqual({ status: "working" });
+		expect(
+			coerceNarratorStatusPatch({
+				status: "idle",
+				substatus: [],
+				turnStartedAt: null,
+				updatedAt: "2026-11-24T01:00:00.000Z",
+				errorMessage: null,
+				errorRetryable: false,
+				archivedWithNarratorId: null,
+				backgroundWorkActive: false,
+				model: "must-not-overwrite",
+			}),
+		).toEqual({
+			status: "idle",
+			substatus: [],
+			turnStartedAt: null,
+			updatedAt: "2026-11-24T01:00:00.000Z",
+			errorMessage: null,
+			errorRetryable: false,
+			archivedWithNarratorId: null,
+			backgroundWorkActive: false,
+		});
+	});
+
+	test("rejects malformed status and excludes invalid optional values", () => {
+		expect(coerceNarratorStatusPatch({ status: null })).toBeNull();
+		expect(
+			coerceNarratorStatusPatch(
+				Object.assign(Object.create({ updatedAt: "inherited", errorRetryable: false }), {
+					status: "idle",
+				}),
+			),
+		).toEqual({ status: "idle" });
+		expect(
+			coerceNarratorStatusPatch({
+				status: "waiting",
+				substatus: ["reasoning", 1],
+				turnStartedAt: false,
+				errorMessage: undefined,
+				errorRetryable: "false",
+			}),
+		).toEqual({ status: "waiting" });
+	});
+});
+
+describe("late completion intent", () => {
+	test("stale same-epoch done emits only a notification intent; foreign epochs and snapshots do not", async () => {
+		const manager = new NarratorWSManager();
+		const seen: Array<Record<string, unknown>> = [];
+		manager.addListener({ narratorIds: ["n1"] }, (frame) => seen.push(frame));
+		const route = manager as unknown as { _dispatch: (frame: Record<string, unknown>) => void };
+		const state = {
+			type: "substatus_change",
+			narratorId: "n1",
+			statusEpoch: "epoch",
+			statusRevision: 2,
+			status: "idle",
+			substatus: ["unread", "new-label"],
+			turnStartedAt: "turn",
+		};
+		const done = {
+			...state,
+			type: "status_change",
+			statusRevision: 1,
+			substatus: ["unread"],
+			backgroundWorkActive: true,
+		};
+		route._dispatch(state);
+		route._dispatch(done);
+		route._dispatch({ ...done, statusEpoch: "old-process" });
+		route._dispatch({ ...done, subscriptionRequestId: "removed-subscription" });
+		await Promise.resolve();
+		expect(seen).toEqual([state, { ...done, type: "status_notification" }]);
 	});
 });
 

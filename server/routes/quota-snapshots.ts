@@ -3,7 +3,7 @@ import { bodyLimit } from "hono/body-limit";
 import { HTTPException } from "hono/http-exception";
 import { z } from "zod";
 import { RateLimitError } from "../lib/errors";
-import { settings } from "../lib/settings";
+import { getSettingsRevision, settings } from "../lib/settings";
 import {
 	currentCommandCodeCliIdentity,
 	publicQuotaSnapshot,
@@ -13,6 +13,7 @@ import {
 	refreshQuotaSnapshots,
 	waitForTokenDanceQuotaRefresh,
 } from "../lib/sourcing/quota-snapshots";
+import { getSourceGroup } from "../lib/sourcing/source-groups";
 import { assertAdmin, requireSessionAuth } from "../middleware/auth";
 
 const refreshSchema = z
@@ -28,7 +29,35 @@ quotaSnapshotRoutes.use("*", async (c, next) => {
 	c.header("Cache-Control", "no-store");
 	await next();
 });
-quotaSnapshotRoutes.get("/", (c) => c.json(readQuotaSnapshots(c.get("user").role === "admin")));
+quotaSnapshotRoutes.get("/", (c) => {
+	const parsed = z
+		.object({
+			groupId: z.string().min(1).max(256).optional(),
+			cachedOnly: z.enum(["true", "false"]).optional(),
+			expectedGeneration: z.coerce.number().int().nonnegative().optional(),
+		})
+		.strict()
+		.safeParse(c.req.query());
+	if (!parsed.success) return c.json({ error: "invalid_scope" }, 400);
+	const { groupId, cachedOnly, expectedGeneration } = parsed.data;
+	if (groupId && !getSourceGroup(groupId)) return c.json({ error: "quota_subject_not_found" }, 404);
+	if (expectedGeneration !== undefined && expectedGeneration !== getSettingsRevision())
+		return c.json({ error: "Model runtime generation changed", code: "MODEL_RUNTIME_STALE" }, 409);
+	const response = readQuotaSnapshots(
+		c.get("user").role === "admin",
+		cachedOnly !== "true",
+		groupId,
+	);
+	if (expectedGeneration !== undefined && expectedGeneration !== getSettingsRevision())
+		return c.json({ error: "Model runtime generation changed", code: "MODEL_RUNTIME_STALE" }, 409);
+	const body = JSON.stringify(response);
+	if ((groupId || cachedOnly === "true") && Buffer.byteLength(body) > 64 * 1024)
+		return c.json(
+			{ error: "Quota response exceeds the read budget", code: "QUOTA_RESPONSE_TOO_LARGE" },
+			502,
+		);
+	return c.body(body, 200, { "Content-Type": "application/json" });
+});
 quotaSnapshotRoutes.post(
 	"/refresh",
 	bodyLimit({ maxSize: 1024, onError: (c) => c.json({ error: "body_too_large" }, 413) }),

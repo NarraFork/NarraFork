@@ -139,3 +139,24 @@ test("the API's safe error code uses the localized failure hint, not internal id
 	expect(html).not.toContain("quota_unavailable");
 	expect(html).toContain("figures may be out of date");
 });
+
+test("disabled quota plugins keep their localized reason and prior balance without exposing error text", () => {
+	const snapshot: PublicQuotaSnapshot = {
+		scope: "wallet",
+		fetchedAt: 1,
+		error: "plugin_not_enabled",
+		hasError: true,
+		windows: [],
+		balances: [{ unit: "USD", remaining: 12 }],
+	};
+	const t = (key: string, options?: Record<string, unknown>) => String(i18n.t(key, options));
+	expect(quotaSnapshotView(snapshot, "Provider quota", t).failureDetail).toBe(
+		"Quota plugin is disabled",
+	);
+	const html = render(snapshot);
+	expect(html).toContain("12 USD");
+	expect(html).not.toContain("plugin_not_enabled");
+	const privateError = { ...snapshot, error: "private-account@example.invalid" };
+	expect(quotaSnapshotView(privateError, "Provider quota", t).failureDetail).toBeNull();
+	expect(render(privateError)).not.toContain(privateError.error);
+});

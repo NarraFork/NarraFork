@@ -40,6 +40,28 @@ test("quota reads and targeted refreshes use the single public contract and canc
 	});
 });
 
+test("scoped cached reads retain the generation, cancellation and 64 KiB transport budget", async () => {
+	fetch.mockResolvedValue(Response.json({ entries: [] }));
+	const controller = new AbortController();
+	await api.quotaSnapshots({
+		groupId: "nug-one",
+		cachedOnly: true,
+		expectedGeneration: 7,
+		signal: controller.signal,
+	});
+	const url = new URL(String(fetch.mock.calls[0]?.[0]), "http://test");
+	expect(url.pathname).toBe("/api/quota-snapshots");
+	expect(url.searchParams.get("groupId")).toBe("nug-one");
+	expect(url.searchParams.get("cachedOnly")).toBe("true");
+	expect(url.searchParams.get("expectedGeneration")).toBe("7");
+	controller.abort();
+	expect(fetch.mock.calls[0]?.[1]?.signal?.aborted).toBe(true);
+	fetch.mockResolvedValue(Response.json({ entries: [], oversized: "x".repeat(64 * 1024) }));
+	await expect(
+		api.quotaSnapshots({ groupId: "nug-one", cachedOnly: true, expectedGeneration: 7 }),
+	).rejects.toHaveProperty("status", 413);
+});
+
 test("Command Code usage is summary-only and the separate probe diagnostic remains available", async () => {
 	fetch.mockResolvedValue(Response.json({ loggedIn: true, summary: { totalCount: 2 } }));
 	await api.commandCodeUsageSummary();

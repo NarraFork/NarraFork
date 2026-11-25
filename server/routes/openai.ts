@@ -3,6 +3,12 @@ import { resolve } from "node:path";
 import { Hono } from "hono";
 import { buildOpencodeSessionHeader } from "../lib/agent/opencode-session";
 import { logger } from "../lib/logger";
+import {
+	captureModelOptionsArray,
+	ModelOptionsCacheMap,
+	optionInput,
+	registerModelOptionsCapture,
+} from "../lib/model-options-contract";
 import { getNarraforkHome } from "../lib/narrafork-home";
 import { resolveProxyForUrl } from "../lib/net/proxy";
 import {
@@ -16,7 +22,7 @@ import {
 } from "../lib/settings";
 import { registerModelListReader } from "../lib/sourcing/model-list-readers";
 import { sourceGroupForConnection } from "../lib/sourcing/source-groups";
-import { listCachedTemplateModels } from "../lib/sourcing/templates";
+import { getServiceTemplate } from "../lib/sourcing/templates";
 
 export const openaiRoutes = new Hono();
 
@@ -30,7 +36,7 @@ export interface OpenAIModelInfo {
 }
 
 /** Per-provider cached model lists. Key = provider id. */
-const cachedModelsByProvider = new Map<string, OpenAIModelInfo[]>();
+const cachedModelsByProvider = new ModelOptionsCacheMap<string, OpenAIModelInfo[]>();
 
 // Load legacy flat cache and per-provider cache on startup
 loadAllCachedModels();
@@ -87,9 +93,14 @@ export function getOpenaiCachedModelsByProvider(providerId: string): OpenAIModel
 }
 
 for (const protocol of ["openai-responses", "completions-compatible"] as const) {
-	registerModelListReader(protocol, (group) =>
-		getOpenaiCachedModelsByProvider(group.id).map((model) => model.id),
+	registerModelOptionsCapture(protocol, (group) =>
+		captureModelOptionsArray(
+			cachedModelsByProvider.get(group.id),
+			(model) => optionInput(group, model.id),
+			cachedModelsByProvider.generation,
+		),
 	);
+	registerModelListReader(protocol, (group) => getOpenaiCachedModelsByProvider(group.id));
 }
 
 function activeOpenaiProviderIds(): Set<string> {
@@ -371,9 +382,9 @@ openaiRoutes.get("/providers/:id/models", async (c) => {
 		config ? customApiProtocolFromOpenAI(config) : "completions-compatible",
 	);
 	return c.json({
-		models: await listCachedTemplateModels(
+		models: await getServiceTemplate(group.templateId).listModels(
 			group,
-			getOpenaiCachedModelsByProvider(id),
+			undefined,
 			c.req.raw.signal,
 		),
 		fromCache: true,

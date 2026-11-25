@@ -24,6 +24,7 @@ import {
 } from "../lib/nug-quota-cache";
 import { getNugRelayStatus } from "../lib/nug-relay/manager";
 import {
+	getSettingsRevision,
 	type NUGProviderConfig,
 	nugProviderPrefix,
 	registerNugModelChecker,
@@ -33,15 +34,13 @@ import {
 } from "../lib/settings";
 import { registerModelListReader } from "../lib/sourcing/model-list-readers";
 import { sourceGroupForConnection } from "../lib/sourcing/source-groups";
-import { listCachedTemplateModels } from "../lib/sourcing/templates";
+import { getServiceTemplate } from "../lib/sourcing/templates";
 import { spaRedirectLocation } from "../lib/spa-base-href";
 
 export const nugRoutes = new Hono();
 export { getAllNugCachedQuotas, getNugCachedQuota, updateNugQuotaByPrefix };
 
-registerModelListReader("nug", (group) =>
-	getNugCachedModelsByProvider(group.id).map((model) => String(model.id ?? "")),
-);
+registerModelListReader("nug", (group) => getNugCachedModelsByProvider(group.id));
 
 function normalizeNugBaseUrl(baseUrl: string | undefined): string {
 	return (baseUrl ?? "")
@@ -535,9 +534,9 @@ nugRoutes.get("/providers/:id/models", async (c) => {
 		"nug",
 	);
 	return c.json({
-		models: await listCachedTemplateModels(
+		models: await getServiceTemplate(group.templateId).listModels(
 			group,
-			getNugCachedModelsByProvider(id),
+			undefined,
 			c.req.raw.signal,
 		),
 		fromCache: true,

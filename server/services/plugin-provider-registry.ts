@@ -1,6 +1,12 @@
 import type { ProviderAdapter } from "@server/lib/agent/provider";
+import {
+	captureModelOptionsArray,
+	type ModelOptionsCapture,
+	optionInput,
+} from "@server/lib/model-options-contract";
 import { isContributionId, isPluginId } from "@server/lib/plugins/manifest";
 import type { JsonValue } from "@server/lib/plugins/protocol";
+import type { SourceGroupView } from "@server/lib/sourcing/source-groups";
 
 const DEFAULT_MODEL_PAGE_SIZE = 100;
 const MAX_MODEL_PAGE_SIZE = 200;
@@ -260,6 +266,8 @@ interface InternalProviderEntry {
 	compatible: boolean;
 	explicitUnavailableReason?: string;
 	models: Map<string, ProviderModelDescriptor>;
+	/** Immutable publication array for bounded, slice-before-projection consumers. */
+	modelOptionsArray: readonly ProviderModelDescriptor[];
 	catalogVersion?: string;
 	catalogStale: boolean;
 	lastCatalogRefresh?: string;
@@ -1071,6 +1079,7 @@ export class PluginProviderRegistry {
 					? "provider-unavailable"
 					: undefined),
 			models,
+			modelOptionsArray: Object.freeze([...models.values()]),
 			catalogVersion: catalog?.catalogVersion ?? registration.catalogVersion,
 			catalogStale: catalog?.stale ?? registration.catalogStale ?? models.size === 0,
 			lastCatalogRefresh:
@@ -1222,6 +1231,26 @@ export class PluginProviderRegistry {
 
 	get(reference: string): ProviderRegistryEntry | undefined {
 		return this.describe(reference);
+	}
+
+	get modelOptionsOwnerCount(): number {
+		return this.entriesByInstance.size;
+	}
+
+	/** Source-group discovery must not clone configuration schemas or model descriptors. */
+	listModelOptionsOwners(): Array<
+		Pick<
+			ProviderRegistryEntry,
+			"kind" | "providerInstanceId" | "providerPrefix" | "displayName" | "disabled"
+		>
+	> {
+		return [...this.entriesByInstance.values()].sort(entrySort).map((entry) => ({
+			kind: entry.kind,
+			providerInstanceId: entry.providerInstanceId,
+			providerPrefix: entry.providerPrefix,
+			displayName: entry.displayName,
+			disabled: entry.disabled,
+		}));
 	}
 
 	list(): ProviderRegistryEntry[] {
@@ -1380,6 +1409,8 @@ export class PluginProviderRegistry {
 		try {
 			const nextModels = buildModelMap(models);
 			entry.models = nextModels;
+			entry.modelOptionsArray = Object.freeze([...nextModels.values()]);
+			this.listingRevision++;
 			entry.catalogVersion = options.catalogVersion ?? entry.catalogVersion;
 			entry.catalogStale = options.stale ?? false;
 			entry.lastCatalogRefresh = options.fetchedAt ?? this.now().toISOString();
@@ -1438,6 +1469,15 @@ export class PluginProviderRegistry {
 			available: current.status === "available",
 			unavailableReason: current.reason,
 		};
+	}
+
+	captureModelOptions(group: SourceGroupView): ModelOptionsCapture {
+		const entry = this.requireInternal(group.id);
+		return captureModelOptionsArray(
+			entry.modelOptionsArray,
+			(model) => optionInput(group, model.id, model.displayName),
+			this.listingRevision,
+		);
 	}
 
 	getModels(reference: string): ProviderModelDescriptor[] {

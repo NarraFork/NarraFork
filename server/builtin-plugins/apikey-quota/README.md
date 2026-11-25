@@ -6,17 +6,40 @@
 宿主（NarraFork 核心）保留配置来源、凭据、调度/节流/缓存/持久化、HTTP 路由、DTO 和前端展示；
 插件只负责「怎么问、怎么解析」。
 
+**2026-11-25 接缝更新**：宿主额度展示改走统一 quota-snapshots；下面的插件输入 / 输出、
+`commands.invoke` 协议、授权、启停与失败回退契约不变。
+
 ## 边界
 
 | 关注点 | 归属 |
 |---|---|
-| provider 配置、APIKey 存储 | 宿主（`settings.customApiProviders`） |
-| 队列、并发上限、手动节流、stale 刷新、generation、落盘 | 宿主（`provider-balance-cache.ts`） |
-| `GET /api/provider-balances`、`POST /api/provider-balances/:id/{probe,refresh}` | 宿主 |
+| provider 非机密配置 | 宿主（`settings.customApiProviders`；S2 不新增 `sourceGroups[]`） |
+| API Key / 组秘密存储 | 宿主统一文件 `credentials.json`；`ProviderKeyStore` 与 settings Key 字段只是兼容视图，不把秘密写回 settings |
+| 队列、并发上限、手动节流、stale 刷新、generation | 原源模块 owner（[provider-balance-cache.ts](../../lib/provider-balance-cache.ts) 等），不搬进插件或统一 API |
+| 额度快照持久化 | 宿主 [QuotaStore](../../lib/sourcing/quota-store.ts)，以凭据身份指纹存取 |
+| `GET /api/quota-snapshots`、`POST /api/quota-snapshots/refresh` | 宿主统一读取 / 刷新；显式管理员 `POST /api/provider-balances/:id/probe` 诊断仍保留 |
 | 前端徽章 / 设置页展示 | 宿主 |
 | **端点探测路径、HTTP 请求、响应归一化（sub2api / new-api）** | **本插件** |
 
 插件不读写宿主的 storage / secret / config，也不注册 UI。它是一次调用的纯函数进程。
+
+## 宿主统一读取与刷新
+
+- [统一路由](../../routes/quota-snapshots.ts)：`GET /api/quota-snapshots` 返回按来源组 / 凭据区分的
+  `entries`；`POST /api/quota-snapshots/refresh` 可带 `{ groupId?, credentialId? }`，仍经原鉴权与节流。
+  管理员的 `POST /api/provider-balances/:id/probe` 用于显式重新诊断端点，不因统一展示而删除。
+- [模板](../../lib/sourcing/templates.ts) 的 `probeQuota(group, credentialId)` 委托原 owner，沿用它的队列、
+  TTL、并发去重、退避及晚到结果身份核对；Codex 只投影已有 usage，不新起一套探测。
+- 每个 Key 的额度只关联自己的身份。直接 probe 与 STREAM 的 `quota_balance` 是独立来源，
+  不能互相覆盖；未知 / 失败 / 不支持不是零，`expiresAt` 不是窗口 `resetsAt`，uncapped 不伪造 0 限额。
+  [公开投影](../../lib/sourcing/quota-snapshots.ts) 不输出 `detail`、原始错误或私密身份。
+- [API 包装](../../../frontend/lib/api/quota-snapshots.ts) 只转发请求；共享缓存、取消、失效、重取与 GC
+  由 [React Query hook](../../../frontend/hooks/useQuotaSnapshots.ts) 管，不在 API 层再维护 pending 表。
+  隐藏 / 取消视图不能改写源 owner 的调度或越权取消共享后台探测。
+- [NUG 轻量头部](../../../frontend/components/narrator/model/use-nug-quota.ts) 也使用同一个 API 的标准
+  scoped Query：`groupId`、`cachedOnly: true`、`expectedGeneration`；按会话与模型运行时代次隔离，
+  保留 **64 KiB / 15s** 读取预算、generation 不匹配拒绝复用、隐藏时停发与不在后台轮询。
+  该预算不替换本插件下文的单次出站 **64 KiB / 8s** 约束。
 
 ## 命令契约
 
@@ -75,10 +98,11 @@
 首次启动时状态记录**隐式创建**为 `desiredState: "enabled"`（没有安装动作，所以也不存在
 「用户选择启用」这一刻）。管理员的显式停用会被尊重并持久化。
 
-关闭后的行为：该能力归插件所有，因此停用插件即关闭额度查询。快照会记录
-`error: "plugin_not_enabled"`，前端在该供应商的额度区块提示「插件已停用」，并且
-`/api/provider-balances` 不会改用过程内的内置适配器回答同一问题；插件重新启用后，下一次
-自动探测（最多 60s）恢复原值。
+关闭后的行为：该能力归插件所有，因此停用插件即关闭额度查询。宿主公开快照只保留安全码
+`error: "plugin_not_enabled"`；[统一额度组件](../../../frontend/components/narrator/model/quota-snapshot-view.ts)
+将它本地化为「插件已停用」，不显示旧接口或上游的原始 error 文本。统一 quota-snapshots
+不会因此改用过程内的内置适配器回答同一问题。插件重新启用后，按源 owner 原有 TTL / 调度或
+显式刷新恢复，不另造一套插件轮询器。
 
 ### 与外部插件的标准差异（逐条及理由）
 
@@ -118,7 +142,7 @@ bun scripts/validate-plugin-release.ts "$(pwd)/server/builtin-plugins" --runtime
 | 插件 `status: "ok"` | 直接采用（宿主内置路径不执行） |
 | 插件 `status: "unsupported"` | 视为权威结论，不探测内置路径 |
 | 插件 `status: "failed"` | 按既有的 `request_failed` 语义记录 |
-| 插件被停用（`PLUGIN_NOT_ENABLED` / `PLUGIN_DISABLED`） | 不回落：快照记 `plugin_not_enabled`，前端提示「插件已停用」，重新启用后下一次探测自动恢复 |
+| 插件被停用（`PLUGIN_NOT_ENABLED` / `PLUGIN_DISABLED`） | 不回落：公开快照仅留安全码 `plugin_not_enabled`，统一组件本地化提示；重新启用后按原 owner 调度或显式刷新恢复 |
 | 包缺失 / 进程启动失败 / 进程崩溃 / 输出非法 | 回退内置适配器（不向用户报错） |
 
 > 该能力归插件所有：停用插件等于关闭额度查询，因此不会静默改用过程内的内置适配器。

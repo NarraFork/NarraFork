@@ -98,6 +98,8 @@ const FETCH_TIMEOUT_MS = 15_000;
 
 interface Entry {
 	identity: string;
+	/** Opaque identity publication consumed by the existing model-options reader. */
+	generation: string;
 	inFlight?: Promise<OpencodeUsageCache | null>;
 	controller?: AbortController;
 	/** Consecutive failed refreshes, for the backoff. */
@@ -273,7 +275,7 @@ export function syncOpencodeUsageCache(): void {
 	}
 	for (const [id, config] of providers) {
 		if (!entries.has(id)) {
-			entries.set(id, { identity: identity(config), failures: 0 });
+			entries.set(id, { identity: identity(config), generation: crypto.randomUUID(), failures: 0 });
 			// Restore synchronously: the pool reads the snapshot before any refresh finishes.
 			quotaStore.get(id, identity(config), restoreSnapshot);
 		}
@@ -510,6 +512,18 @@ export function getOpencodeCachedUsage(providerId: string): OpencodeUsageCache |
 	return id && entry ? cacheOf(id, entry) : null;
 }
 
+/** Targeted published token only; do not construct the all-provider usage map. */
+export function peekOpencodeUsageGeneration(providerId: string): string | undefined {
+	const subjects = usageSubjects(
+		(config) => config.id === providerId && isOpencodeCustomApiProvider(config),
+	);
+	const id = shownSubjectId(subjects, providerId);
+	const current = subjects.find((subject) => subject.id === id);
+	const entry = id ? entries.get(id) : undefined;
+	return entry && current && entry.identity === identity(current.config)
+		? entry.generation
+		: undefined;
+}
 /** Key id → its allowance (key list). */
 export function getOpencodeKeyUsages(): Record<string, OpencodeUsageCache> {
 	syncOpencodeUsageCache();

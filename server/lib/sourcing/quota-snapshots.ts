@@ -17,6 +17,7 @@ import {
 	fetchCommandCodeUsage,
 	getCommandCodeQuotaSnapshot,
 	isCommandCodeQuotaRefreshing,
+	listCommandCodeUsageSubjects,
 	refreshCommandCodeQuota,
 } from "../commandcode-usage";
 import { getCustomApiQuotaSnapshot } from "../custom-api-quota-cache";
@@ -80,7 +81,12 @@ export function publicQuotaSnapshot(
 		...(snapshot.plan ? { plan: snapshot.plan } : {}),
 		...(snapshot.expiresAt !== undefined ? { expiresAt: snapshot.expiresAt } : {}),
 		hasError: !!snapshot.error,
-		...(snapshot.error ? { error: "quota_unavailable" } : {}),
+		...(snapshot.error
+			? {
+					error:
+						snapshot.error === "plugin_not_enabled" ? "plugin_not_enabled" : "quota_unavailable",
+				}
+			: {}),
 	};
 }
 
@@ -211,22 +217,31 @@ function codexOverview(): PublicQuotaSnapshot | null {
 }
 
 /** Preserve the sources' own TTL/backoff/concurrency budgets. Never await an upstream. */
-function revalidate(): void {
-	void refreshStaleKimiUsages(KIMI_USAGES_STALE_MS).catch(() => {});
-	void refreshStaleOpencodeUsages().catch(() => {});
-	void refreshStaleDeepSeekBalances().catch(() => {});
-	providerBalanceCache.read();
-	getTokenDanceBalance();
-	if (!settings.commandCode?.disabled) void refreshCommandCodeQuota().catch(() => {});
+function revalidate(isAdmin: boolean, groupId?: string): void {
+	if (!groupId) {
+		void refreshStaleKimiUsages(KIMI_USAGES_STALE_MS).catch(() => {});
+		void refreshStaleOpencodeUsages().catch(() => {});
+		void refreshStaleDeepSeekBalances().catch(() => {});
+		providerBalanceCache.read();
+		getTokenDanceBalance();
+	}
+	if ((!groupId || groupId === "CommandCode") && !settings.commandCode?.disabled) {
+		if (isAdmin) {
+			for (const subject of listCommandCodeUsageSubjects())
+				void refreshCommandCodeQuota(false, subject.id).catch(() => {});
+		} else void refreshCommandCodeQuota(false).catch(() => {});
+	}
 }
 
 export function readQuotaSnapshots(
 	isAdmin: boolean,
 	staleWhileRevalidate = true,
+	groupId?: string,
 ): QuotaSnapshotsResponse {
-	if (staleWhileRevalidate) revalidate();
+	if (staleWhileRevalidate) revalidate(isAdmin, groupId);
 	const entries: QuotaSnapshotEntry[] = [];
 	for (const group of listSourceGroups()) {
+		if (groupId && group.id !== groupId) continue;
 		const template = getServiceTemplate(group.templateId);
 		const ids = credentialIds(group);
 		const selected =

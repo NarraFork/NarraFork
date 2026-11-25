@@ -1339,6 +1339,8 @@ export async function runAgentLoopUnlocked(
 				active._modelSelectionRef ?? active._modelRef ?? FOLLOW_DEFAULT_MODEL,
 				resolved.provider,
 				resolved.model,
+				turnEffectiveModel,
+				getSettingsRevision(),
 			);
 
 			// Resolve behavior-fence injection settings for this turn (narrator override → global default).
@@ -2707,6 +2709,31 @@ export async function runAgentLoopUnlocked(
 					eventContext,
 					hooks,
 				);
+			// Only an already-admitted continuation can reach another model pass. Its
+			// outcome supersedes the failed pass, including cleanup's eager error latch
+			// and diagnostics. Otherwise a later success would still stop inbox wakes
+			// at finalization. Keep genuine terminal failures latched when no pass follows.
+			if (
+				(runState.hadError || terminalStatus) &&
+				active.alive &&
+				owner.isCurrent() &&
+				!config.signal.aborted
+			) {
+				const resumed = await narratorService.updateStatus(narratorId, "working", {
+					unlessArchived: true,
+				});
+				if (resumed === false) {
+					runState.wasInterrupted = true;
+					break;
+				}
+				// Cancellation may have landed while the status write was pending. Leave
+				// its abort handling (including a held turn) to the executor as before.
+				if (active.alive && owner.isCurrent() && !config.signal.aborted) {
+					runState.hadError = false;
+					terminalStatus = undefined;
+					runState.finalText = "";
+				}
+			}
 			let result: ExecuteLoopResult;
 			if (checkpointIdentity) bindCheckpointGateActor(config.signal, checkpointIdentity);
 			try {
@@ -3530,20 +3557,23 @@ export async function runAgentLoopUnlocked(
 				}
 			}
 
-			// Anything queued during this turn (completions AND inbound messages) keeps the
-			// loop running instead of going idle. Previously only completions were checked
-			// here, so a message that arrived at this exact moment waited for the next wake.
+			// Queued completions and inbound messages keep a successful turn running.
+			// They are not recovery authorization: preserve them if this pass failed,
+			// just as the buffered-input path below does, rather than retrying a terminal
+			// error merely to acknowledge a notice that arrived before the failure.
 			// [continuation-source: injection-drain]
-			const bgCompletionPrompt = await drainAndPersistPendingInjections(active, placement);
-			if (bgCompletionPrompt) {
-				await narratorService.updateStatus(narratorId, "working");
-				runState.input.media = undefined;
-				runState.input.text = "";
-				runState.input.images = undefined;
-				// This drain starts a fresh pass before the buffer consumer below is
-				// reached, which would strand a cut-in message for the rest of the loop.
-				await rearmCutInSoftStopBeforeContinuing(active);
-				continue;
+			if (!runState.hadError) {
+				const bgCompletionPrompt = await drainAndPersistPendingInjections(active, placement);
+				if (bgCompletionPrompt) {
+					await narratorService.updateStatus(narratorId, "working");
+					runState.input.media = undefined;
+					runState.input.text = "";
+					runState.input.images = undefined;
+					// This drain starts a fresh pass before the buffer consumer below is
+					// reached, which would strand a cut-in message for the rest of the loop.
+					await rearmCutInSoftStopBeforeContinuing(active);
+					continue;
+				}
 			}
 
 			// Queued input BEFORE transitioning to idle/unread — this prevents spurious
@@ -3952,13 +3982,17 @@ export async function runAgentLoopUnlocked(
 				);
 			} else {
 				try {
-					const substatus =
-						await createRuntimeFinalizationReads(db).clearTransientSubstatus(narratorId);
-					if (substatus) {
+					const statusPatch =
+						await createRuntimeFinalizationReads(db).clearTransientStatusPatch(narratorId);
+					if (statusPatch) {
 						(
 							await import("../background-occupancy-store")
 						).backgroundOccupancyStore.refreshNarrator(narratorId);
-						broadcastToNarrator(narratorId, { type: "substatus_change", narratorId, substatus });
+						broadcastToNarrator(narratorId, {
+							type: "substatus_change",
+							narratorId,
+							...statusPatch,
+						});
 					}
 				} catch (err) {
 					logger.warn("Failed to clear stale transient substatus after narrator loop", {

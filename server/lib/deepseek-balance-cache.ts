@@ -31,6 +31,8 @@ const FETCH_TIMEOUT_MS = 15_000;
 
 interface Entry {
 	identity: string;
+	/** Opaque identity publication consumed by the existing model-options reader. */
+	generation: string;
 	providerId: string;
 	credentialId: string;
 	inFlight?: Promise<DeepSeekBalanceCache | null>;
@@ -235,6 +237,7 @@ export function syncDeepSeekBalanceCache(): void {
 		if (!entries.has(id)) {
 			entries.set(id, {
 				identity: identity(subject.config, subject.id),
+				generation: crypto.randomUUID(),
 				providerId: subject.providerId,
 				credentialId: subject.id,
 			});
@@ -375,6 +378,16 @@ export function refreshDeepSeekBalance(
 	return entry.inFlight;
 }
 
+/** Targeted read of the published runtime token; no catalog or all-provider projection. */
+export function peekDeepSeekBalanceGeneration(providerId: string): string | undefined {
+	const config = settings.customApiProviders?.find((provider) => provider.id === providerId);
+	if (!config || !isDeepSeekCustomApiProvider(config)) return undefined;
+	const credential = firstCredential(config);
+	const entry = entries.get(credential.id);
+	return entry?.identity === identity(credential.config, credential.id)
+		? entry.generation
+		: undefined;
+}
 export async function refreshAllDeepSeekBalances(): Promise<void> {
 	syncDeepSeekBalanceCache();
 	await Promise.allSettled(

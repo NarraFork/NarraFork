@@ -78,6 +78,7 @@ import {
 	stripLegacyRequestDumpKeys,
 	stripObsoleteSettingsKeys,
 } from "../lib/settings";
+import { buildRuntimeSettings } from "../lib/settings/runtime";
 import { isSensitiveHeaderName } from "../lib/settings/search-header-secrets";
 import { isLegacyTokenDancePrefixAllowed } from "../lib/settings/tokendance-prefix";
 import { updateSourceSettingsSchema } from "../lib/settings/update-source";
@@ -1293,6 +1294,10 @@ settingsRoutes.get("/", async (c) => {
 	return c.json(await buildSettingsResponse(settings, { admin: c.get("user").role === "admin" }));
 });
 
+settingsRoutes.get("/runtime", (c) =>
+	c.json(buildRuntimeSettings(settings, c.get("user").role === "admin")),
+);
+
 settingsRoutes.get("/context-thresholds", (c) => {
 	const model = c.req.query("model") ?? "";
 	const provider = c.req.query("provider") ?? "";
@@ -1964,13 +1969,16 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 		}
 
 		const responseStartedAt = performance.now();
-		const response = c.json(
-			await buildSettingsResponse(merged, {
-				serverRestarting: needsRestart,
-				newUrl,
-				admin: true,
-			}),
-		);
+		const response =
+			c.req.query("view") === "runtime"
+				? c.json(buildRuntimeSettings(merged, true))
+				: c.json(
+						await buildSettingsResponse(merged, {
+							serverRestarting: needsRestart,
+							newUrl,
+							admin: true,
+						}),
+					);
 		const finishedAt = performance.now();
 		if (finishedAt - requestStartedAt >= 500) {
 			// Timings only: never log settings contents or provider credentials.

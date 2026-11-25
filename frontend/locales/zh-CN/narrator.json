@@ -3088,6 +3088,7 @@
 	},
 	"quotaSnapshot": {
 		"unknown": "额度未知",
+		"pluginDisabled": "额度插件已停用",
 		"unlimited": "无限",
 		"balance": "余额",
 		"plan": "套餐",

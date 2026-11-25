@@ -1,5 +1,9 @@
 import { REMOTE_BUILD } from "@frontend/lib/build-target";
-import type { QuotaSnapshotEntry, QuotaSnapshotsResponse } from "@shared/quota-snapshot";
+import type {
+	QuotaSnapshotEntry,
+	QuotaSnapshotReadScope,
+	QuotaSnapshotsResponse,
+} from "@shared/quota-snapshot";
 import {
 	type QueryClient,
 	QueryObserver,
@@ -10,9 +14,26 @@ import {
 } from "@tanstack/react-query";
 import { useCallback, useEffect, useId, useMemo, useSyncExternalStore } from "react";
 import { api } from "../lib/api";
+import { ApiError, getToken, onTokenChange } from "../lib/api/client";
 import type { QuotaSnapshotRefreshTarget } from "../lib/api/quota-snapshots";
 
 export const quotaSnapshotsKey = ["quota-snapshots"] as const;
+export const quotaSnapshotsReadKey = (scope?: QuotaSnapshotReadScope, token = getToken()) =>
+	scope ? ([...quotaSnapshotsKey, scope, token] as const) : quotaSnapshotsKey;
+
+/** Framework de-duplication coalesces a burst; an in-flight pre-marker read gets one fresh tail. */
+export async function invalidateQuotaSnapshotRead(
+	client: QueryClient,
+	scope?: QuotaSnapshotReadScope,
+	token = getToken(),
+) {
+	if (getToken() !== token) return;
+	const filter = { queryKey: quotaSnapshotsReadKey(scope, token), exact: true };
+	const reading = client.isFetching(filter) > 0;
+	await client.invalidateQueries(filter, { cancelRefetch: false });
+	if (reading && getToken() === token)
+		await client.invalidateQueries(filter, { cancelRefetch: false });
+}
 const cliQuotaKey = ["command-code-cli-quota"] as const;
 const refreshQuotaKey = ["quota-refresh"] as const;
 const quotaEditKey = ["quota-edit-generation"] as const;
@@ -43,7 +64,7 @@ export async function invalidateQuotaSnapshots(client: QueryClient): Promise<voi
 		),
 	);
 	client.removeQueries({ queryKey: cliQuotaKey, type: "inactive" });
-	client.setQueryData<QuotaSnapshotsResponse>(quotaSnapshotsKey, { entries: [] });
+	client.setQueriesData<QuotaSnapshotsResponse>({ queryKey: quotaSnapshotsKey }, { entries: [] });
 	await client.invalidateQueries({ queryKey: quotaSnapshotsKey });
 	await client.invalidateQueries({ queryKey: cliQuotaKey });
 }
@@ -111,13 +132,41 @@ export function mergeCommandCodeCliQuota(
 	};
 }
 
-export function quotaSnapshotsOptions(enabled = true, client?: QueryClient) {
+export function quotaSnapshotsOptions(
+	enabled = true,
+	client?: QueryClient,
+	scope?: QuotaSnapshotReadScope,
+) {
+	const token = getToken();
+	const queryKey = quotaSnapshotsReadKey(scope, token);
 	return queryOptions({
-		queryKey: quotaSnapshotsKey,
+		queryKey,
 		queryFn: async ({ signal }) => {
-			const data = await api.quotaSnapshots({ signal });
+			if (scope && token !== getToken()) throw new DOMException("Session changed", "AbortError");
+			let data: QuotaSnapshotsResponse;
+			try {
+				data = await api.quotaSnapshots({ ...scope, signal });
+			} catch (error) {
+				if (
+					scope &&
+					client &&
+					getToken() === token &&
+					error instanceof ApiError &&
+					error.status === 409 &&
+					error.data?.code === "MODEL_RUNTIME_STALE"
+				) {
+					void client.invalidateQueries({ queryKey: ["settings-runtime"] });
+					void client.invalidateQueries({ queryKey: ["model-catalog", "runtime"] });
+				}
+				throw error;
+			}
+			if (scope && token !== getToken()) throw new DOMException("Session changed", "AbortError");
 			signal.throwIfAborted();
-			if (client && cliIdentity(client.getQueryData(quotaSnapshotsKey)) !== cliIdentity(data)) {
+			if (
+				!scope &&
+				client &&
+				cliIdentity(client.getQueryData(quotaSnapshotsKey)) !== cliIdentity(data)
+			) {
 				advanceQuotaEditGeneration(client);
 				await client.cancelQueries({ queryKey: refreshQuotaKey });
 				await client.cancelQueries({
@@ -130,7 +179,7 @@ export function quotaSnapshotsOptions(enabled = true, client?: QueryClient) {
 		enabled: !REMOTE_BUILD && enabled,
 		staleTime: 30_000,
 		refetchInterval: (query) => {
-			if (REMOTE_BUILD || !enabled) return false;
+			if (REMOTE_BUILD || !enabled || scope?.cachedOnly) return false;
 			return query.state.data?.entries.some((entry) => entry.refreshing) ? 3_000 : 30_000;
 		},
 		refetchIntervalInBackground: false,
@@ -138,9 +187,10 @@ export function quotaSnapshotsOptions(enabled = true, client?: QueryClient) {
 	});
 }
 
-export function useQuotaSnapshots(enabled = true) {
+export function useQuotaSnapshots(enabled = true, scope?: QuotaSnapshotReadScope) {
 	const client = useQueryClient();
-	const query = useQuery(quotaSnapshotsOptions(enabled, client));
+	useSyncExternalStore(onTokenChange, getToken, () => null);
+	const query = useQuery(quotaSnapshotsOptions(enabled, client, scope));
 	const cli = cliEntry(query.data);
 	// Subscribe to data, not as a Query observer: passive displays must not retain a probe.
 	const subscribe = useCallback(
@@ -241,20 +291,24 @@ export function useRefreshQuotaSnapshots(identity?: unknown) {
 			});
 		},
 		onMutate: async () => {
-			// Capture before awaiting: an edit can happen between cancellation and query startup.
+			// Capture before awaiting: either the credential or the session may change meanwhile.
 			const generation = quotaEditGeneration(client);
+			const session = getToken();
 			await client.cancelQueries({ queryKey: quotaSnapshotsKey });
-			return { generation };
+			return { generation, session };
 		},
 		onSuccess: async (data, _target, context) => {
 			// Ordinary GET updates are not credential edits and must not discard a real refresh.
-			if (context.generation !== quotaEditGeneration(client)) return;
+			if (context.session !== getToken() || context.generation !== quotaEditGeneration(client))
+				return;
 			await client.cancelQueries({ queryKey: quotaSnapshotsKey });
-			if (context.generation !== quotaEditGeneration(client)) return;
+			if (context.session !== getToken() || context.generation !== quotaEditGeneration(client))
+				return;
 			const cli = cliEntry(data);
 			if (cli?.snapshot) {
 				await client.cancelQueries({ queryKey: commandCodeCliQuotaKey(cli) });
-				if (context.generation !== quotaEditGeneration(client)) return;
+				if (context.session !== getToken() || context.generation !== quotaEditGeneration(client))
+					return;
 				client.setQueryData(commandCodeCliQuotaKey(cli), cli);
 			}
 			if (cliIdentity(client.getQueryData(quotaSnapshotsKey)) !== cliIdentity(data))
@@ -263,6 +317,11 @@ export function useRefreshQuotaSnapshots(identity?: unknown) {
 				entries: data.entries.map((entry) =>
 					entry.refreshOnRead ? { ...entry, snapshot: null } : entry,
 				),
+			});
+			// Scoped readers re-read their cached projection with their own generation guard.
+			void client.invalidateQueries({
+				queryKey: quotaSnapshotsKey,
+				predicate: (query) => query.queryKey.length > 1,
 			});
 		},
 	});

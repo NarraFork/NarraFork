@@ -47,14 +47,12 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } fro
 import { useTranslation } from "react-i18next";
 import { resolveSwipeAnchorOffScreen } from "../../hooks/scroll-parent";
 import { useCurrentUser } from "../../hooks/useAuth";
-import { useChatUnread, useNarratorChatRoom } from "../../hooks/useChat";
 import { useFirstScreenActivity } from "../../hooks/useFirstScreenActivity";
 import { useGitWorkspace } from "../../hooks/useGit";
 import { useLocalPref } from "../../hooks/useLocalPref";
 import { useLodIndicatorTrigger } from "../../hooks/useLodIndicatorTrigger";
 import { useMobileDrawerHistory } from "../../hooks/useMobileDrawerHistory";
-import { useActualResolvedModelCard } from "../../hooks/useModelCatalog";
-import { useAllModels } from "../../hooks/useModels";
+import { useRuntimeModel } from "../../hooks/useModelCatalog";
 import {
 	useArchiveNarrator,
 	useCreateNarrator,
@@ -73,7 +71,9 @@ import {
 	useUpdateRelaxedPlan,
 	useUpdateSubagentConclusion,
 } from "../../hooks/useNarrator";
+import { useNarratorExecutionDevices } from "../../hooks/useNarratorExecutionDevices";
 import { readOpeningLod, useNarratorLod } from "../../hooks/useNarratorLod";
+import { useNarratorUiSummary } from "../../hooks/useNarratorUiSummary";
 import { useOpenOutlineSpace, useOutlineEnabled } from "../../hooks/useOutline";
 import {
 	useNarratorBrowserSessionsCapability,
@@ -89,8 +89,8 @@ import {
 	useCommandCodeCliQuota,
 	useQuotaSnapshots,
 } from "../../hooks/useQuotaSnapshots";
+import { RUNTIME_SETTINGS_QUERY_KEY, useRuntimeSettings } from "../../hooks/useRuntimeSettings";
 import { useNarratorCurrentTask } from "../../hooks/useTaskBoard";
-import { useCanOpenTerminals, useNarratorTerminals } from "../../hooks/useTerminals";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 import {
 	currentWorkspaceContext,
@@ -190,7 +190,7 @@ import { useMessageRevertConfirm } from "./interaction/use-message-revert-confir
 import { useNarratorForkActions } from "./interaction/use-narrator-fork-actions";
 import { useNarratorSend } from "./interaction/use-narrator-send";
 import { usePermissionFocusNav } from "./interaction/use-permission-focus-nav";
-import { capabilityModelReference, useResolvedModel } from "./interaction/use-resolved-model";
+import { runtimeSummaryToResolvedModel } from "./interaction/use-resolved-model";
 import { useSubagentSessionOpener } from "./interaction/use-subagent-session-opener";
 import { LodSwitchToast } from "./lod/LodSwitchToast";
 import { type RenderLod, RenderLodCtx } from "./lod/RenderLodCtx";
@@ -414,17 +414,34 @@ function NarratorPanelBody({
 	const relaxedPlanMutation = useUpdateRelaxedPlan();
 	const reflectionOverridesMutation = useUpdateReflectionOverrides();
 	const modelMutation = useUpdateModel();
-	const {
-		visibleWithDefault: allModels,
-		groupedModels,
-		modelOptionsFilter,
-		defaultModelValue,
-		summaryModelValue,
-		settingsData,
-		aggregations,
-		providerLabels,
-		nugProviderIdByPrefix,
-	} = useAllModels();
+	const { data: settingsData } = useRuntimeSettings();
+	const defaultModelValue = settingsData?.agent.defaultModel ?? "";
+	const summaryModelValue = settingsData?.agent.summaryModel;
+	const { data: modelSummary } = useRuntimeModel({
+		model: narrator ? narrator.model?.trim() || "__default__" : undefined,
+		narratorId,
+		summary: narrator?.modelSummary,
+		revision: settingsData ? String(settingsData.revision) : undefined,
+	});
+	const { resolvedModel, resolvedProvider, resolvedBareModel, resolvedModelOption } =
+		runtimeSummaryToResolvedModel(modelSummary);
+	const allModels = useMemo(
+		() => (resolvedModelOption ? [resolvedModelOption] : []),
+		[resolvedModelOption],
+	);
+	const aggregations = useMemo(() => [], []);
+	const providerLabels = useMemo(
+		() =>
+			modelSummary?.provider ? { [modelSummary.provider.prefix]: modelSummary.provider.name } : {},
+		[modelSummary?.provider],
+	);
+	const nugProviderIdByPrefix = useMemo(
+		() =>
+			modelSummary?.provider?.quotaKind === "nug"
+				? { [modelSummary.provider.prefix]: modelSummary.provider.id }
+				: {},
+		[modelSummary?.provider],
+	);
 	const { data: currentUser } = useCurrentUser();
 	const { data: workspaceContext } = useWorkspaceContext(narratorId);
 	const currentUserId = currentUser?.id ? String(currentUser.id) : null;
@@ -490,34 +507,14 @@ function NarratorPanelBody({
 	const browserSessionsCapability = useNarratorBrowserSessionsCapability();
 	const confirm = useConfirmDialog();
 	const { t: tt } = useTranslation("terminal");
-	/*
-	 * Unread count for the discussion-room toolbar entry.
-	 *
-	 * Deliberately NOT gated on `dock` any more. It used to be, on the premise that
-	 * a dock surface is "the only surface with a panel to open" — that premise is no
-	 * longer true (MobileToolPanelHost opens the room in a Drawer), and leaving the
-	 * gate would have made the mobile badge silently read zero: the room would never
-	 * resolve, so `byRoom[...]` would have nothing to look up and the entry would
-	 * claim there was nothing to read.
-	 *
-	 * Still skipped for workspace previews, which stay lightweight and offer no
-	 * tool entries at all.
-	 */
-	const userChatRoomQuery = useNarratorChatRoom(
+	// The badge never resolves/creates a room or reads every room's unread count.
+	const uiSummaryQuery = useNarratorUiSummary(
 		narratorId,
 		!isWorkspacePreview && firstScreenActivity,
 	);
-	const chatUnreadQuery = useChatUnread(firstScreenActivity);
-	const userChatRoomId = userChatRoomQuery.data?.id;
-	const userChatUnread = userChatRoomId ? (chatUnreadQuery.data?.byRoom[userChatRoomId] ?? 0) : 0;
+	const userChatUnread = uiSummaryQuery.data?.discussion.unread ?? 0;
 	const qc = useQueryClient();
-	const executionDevicesQuery = useQuery({
-		queryKey: ["narratorExecutionDevices", narratorId],
-		queryFn: () => api.getNarratorExecutionDevices(narratorId),
-		enabled: !REMOTE_BUILD && !isWorkspacePreview,
-		// 设备列表变化缓慢, 60s 轮询足够
-		refetchInterval: 60_000,
-	});
+	const executionDevicesQuery = useNarratorExecutionDevices(narratorId, !isWorkspacePreview);
 	// A device with no recorded directory refuses the switch; that is a prompt, not a
 	// failure, so it opens the directory dialog instead of a red toast. The dialog is
 	// mounted here (outside the header and overflow menus) so both entry points share it.
@@ -535,9 +532,12 @@ function NarratorPanelBody({
 		notifications.show({ color: "red", message: error.message });
 	});
 	const updateSettingsMutation = useMutation({
-		mutationFn: api.updateSettings,
-		onSuccess: (data) => {
-			qc.setQueryData(["settings"], data);
+		mutationFn: api.updateRuntimeSettings,
+		onSuccess: () => {
+			void qc.invalidateQueries({ queryKey: ["settings"] });
+			void qc.invalidateQueries({ queryKey: RUNTIME_SETTINGS_QUERY_KEY });
+			void qc.invalidateQueries({ queryKey: ["model-catalog", "runtime"] });
+			void qc.invalidateQueries({ queryKey: ["model-catalog", "options"] });
 			// Only invalidate contextThresholds — settings cache is already
 			// updated via setQueryData above, no need to trigger a refetch.
 			qc.invalidateQueries({ queryKey: ["contextThresholds"] });
@@ -654,72 +654,56 @@ function NarratorPanelBody({
 	// menu button: phones have no header row of their own.
 	const showMobileNav = !REMOTE_BUILD && ownsHorizontalSafeArea && isMobileViewport;
 
-	// Resolve the effective model: when following default, use the actual default
-	// model value; when using a model aggregation, resolve to a representative
-	// concrete member so capability/context-window lookups work (the backend
-	// resolves the actual member at request time). A follow-parent subagent
-	// resolves through its server-reported inheritance instead of the raw
-	// `__parent__` sentinel, which no capability lookup can parse.
-	// Only the model *resolution* stays in the panel: resolvedModel selects public
-	// quota snapshots, the recharge target and context-threshold queries. The
-	// reasoning/codex/fast-mode/permission control derivations moved down into the
-	// status bar (see useStatusBarProps), which is where they are consumed.
-	const { resolvedModel, resolvedProvider, resolvedBareModel, resolvedModelOption } =
-		useResolvedModel(
-			capabilityModelReference(
-				narrator?.model,
-				narrator?.modelInheritance?.model,
-				narrator?.runtimeModel,
-			),
-			defaultModelValue,
-			aggregations,
-			allModels,
-		);
-	// The catalog card a request for this model resolves to; feeds the reasoning tiers.
-	const { data: modelCard } = useActualResolvedModelCard(resolvedModel || undefined);
+	// The authorized runtime summary above owns the concrete provider and capabilities.
 
 	// Fetch context thresholds for the current model (used as fallback when WS hasn't pushed yet)
 	const { data: modelThresholds } = useQuery({
 		queryKey: ["contextThresholds", resolvedBareModel, resolvedProvider],
 		queryFn: () => api.getContextThresholds(resolvedBareModel, resolvedProvider),
+		enabled: !!narrator && !!modelSummary?.concreteValue && !!resolvedProvider,
 		staleTime: 5 * 60 * 1000,
 		placeholderData: DEFAULT_CONTEXT_THRESHOLDS.standard,
 	});
 
-	// Quotas are public, provider-neutral snapshots; NUG identity is only for recharge.
-	const nugProviderInfo = useNugQuota(resolvedModel, settingsData?.nugProviders);
-	const { data: quotaSnapshots } = useQuotaSnapshots(firstScreenActivity);
+	// NUG uses one cached-only group read tied to the authorized runtime generation.
+	const currentRuntimeProvider = modelSummary?.provider;
+	const nugProviderSettings = useMemo(
+		() => (currentRuntimeProvider?.quotaKind === "nug" ? [currentRuntimeProvider] : undefined),
+		[currentRuntimeProvider],
+	);
+	const nugProviderInfo = useNugQuota(resolvedModel, nugProviderSettings, firstScreenActivity);
+	const { data: quotaSnapshots } = useQuotaSnapshots(
+		firstScreenActivity &&
+			!!modelSummary?.concreteValue &&
+			currentRuntimeProvider?.quotaKind !== "nug",
+	);
 	// CLI-only accounts have no reusable server cache. Only this active consumer may
 	// request the one-shot read; ordinary snapshot readers never start CLI work.
 	useCommandCodeCliQuota(firstScreenActivity && resolvedModel?.split(":")[0] === "CommandCode");
 	const currentQuotaEntries = useMemo(() => {
+		if (currentRuntimeProvider?.quotaKind === "nug") return nugProviderInfo?.entries ?? [];
 		const prefix = resolvedModel?.split(":")[0];
 		if (!prefix) return [];
 		return selectQuotaEntries(quotaSnapshots?.entries ?? []).filter(
 			(entry) => entry.prefix === prefix && entry.supported !== false,
 		);
-	}, [resolvedModel, quotaSnapshots]);
+	}, [resolvedModel, quotaSnapshots, currentRuntimeProvider, nugProviderInfo]);
 	const nugQuotaSnapshot = currentQuotaEntries.find(
 		(entry) => entry.groupId === nugProviderInfo?.providerId,
 	)?.snapshot;
 	const tokenDanceRechargeEnabled = Boolean(
 		!REMOTE_BUILD &&
-			resolvedModel?.startsWith("tokendance:") &&
-			settingsData?.tokendance?.connected &&
-			!settingsData.tokendance.disabled &&
+			currentRuntimeProvider?.quotaKind === "tokendance" &&
+			typeof currentRuntimeProvider.generation === "number" &&
 			currentUser?.role === "admin",
 	);
 	const tokenDanceRemaining = currentQuotaEntries[0]?.snapshot?.balances[0]?.remaining;
 	const tokenDanceBalanceKnown =
 		typeof tokenDanceRemaining === "number" && Number.isFinite(tokenDanceRemaining);
 
-	// Active terminal count for badge indicator
-	const { data: narratorTerminals } = useNarratorTerminals(narratorId);
-	const canOpenTerminals = useCanOpenTerminals(narratorId);
-	const activeTerminalCount = useMemo(
-		() => narratorTerminals?.filter((t) => t.status === "running").length ?? 0,
-		[narratorTerminals],
-	);
+	// Shared with the route and terminal access gate.
+	const canOpenTerminals = uiSummaryQuery.isError ? undefined : uiSummaryQuery.data?.canWrite;
+	const activeTerminalCount = uiSummaryQuery.data?.activeTerminalCount ?? 0;
 
 	// --- Message operations ---
 	const setUnreadCountRef = useRef<React.Dispatch<React.SetStateAction<number>>>(undefined);
@@ -1135,7 +1119,21 @@ function NarratorPanelBody({
 		isAtBottomRef,
 		isSubagent,
 		narratorSubstatus,
-		quotaProviderKey: resolvedModel?.split(":")[0],
+		quotaReadScope:
+			currentRuntimeProvider?.quotaKind === "nug"
+				? {
+						groupId: currentRuntimeProvider.id,
+						cachedOnly: true,
+						expectedGeneration: currentRuntimeProvider.generation,
+					}
+				: undefined,
+		quotaProviderKey: currentRuntimeProvider
+			? JSON.stringify([
+					currentRuntimeProvider.id,
+					currentRuntimeProvider.quotaKind,
+					currentRuntimeProvider.generation ?? null,
+				])
+			: undefined,
 		onDraftChanged: forwardDraftChanged,
 		onDraftMeta: forwardDraftMeta,
 		onQueuedNewNarratorCreated: (newNarratorId) => {
@@ -1416,7 +1414,7 @@ function NarratorPanelBody({
 	// Terminal toggle: dock context takes precedence over onToggleTerminal.
 	// Hidden from read-only viewers: opening a terminal needs write access.
 	const terminalToolAvailable =
-		!REMOTE_BUILD && (!!dock || !!onToggleTerminal) && canOpenTerminals !== false;
+		!REMOTE_BUILD && (!!dock || !!onToggleTerminal) && canOpenTerminals === true;
 	const terminalToolOpened = dock ? dock.openToolTypes.has("terminal") : (terminalOpen ?? false);
 	const toggleTerminalTool = useCallback(() => {
 		if (dock) dock.toggleToolPanel("terminal");
@@ -3447,6 +3445,7 @@ function NarratorPanelBody({
 						readOnly={canOpenTerminals === false}
 						readOnlyNotice={readOnlyNotice}
 						common={{ narratorId, narrator, isWorkspacePreview, isMobileViewport }}
+						pendingPermissions={wsState.pendingPermissions}
 						attachedImages={attachedImages}
 						attachedTextFiles={attachedTextFiles}
 						attachedMedia={attachedMedia}
@@ -3533,10 +3532,11 @@ function NarratorPanelBody({
 								},
 							},
 							model: {
+								summary: modelSummary ?? undefined,
 								allModels,
 								aggregations,
 								providerLabels,
-								settingsData,
+								settingsData: undefined,
 								defaultModelValue,
 								summaryModelValue,
 								refreshProps: modelMenuRefreshProps,
@@ -3591,7 +3591,7 @@ function NarratorPanelBody({
 							resolvedModelOption,
 							narratorReasoningEffort: narrator.reasoningEffort,
 							settingsData,
-							modelCard,
+							modelSummary: modelSummary ?? undefined,
 							reasoningEffortMutation,
 							updateSettingsMutation,
 							narratorFastModeOverride: narrator.fastModeOverride,
@@ -3627,6 +3627,7 @@ function NarratorPanelBody({
 							reflectionSettingsDisabled,
 						}}
 						composerRowProps={{
+							readScope: wsState.readScope,
 							onAskSelection: askSelectionInPassing,
 							fileInputRef,
 							composerRef,
@@ -3838,8 +3839,7 @@ function NarratorPanelBody({
 			<SetGlobalModelModal
 				opened={globalModelEditTarget != null}
 				mode={globalModelEditTarget}
-				groupedModels={groupedModels}
-				modelOptionsFilter={modelOptionsFilter}
+				groupedModels={[]}
 				currentValue={globalModelEditTarget === "summary" ? summaryModelValue : defaultModelValue}
 				saving={updateSettingsMutation.isPending}
 				onClose={closeGlobalModelModal}

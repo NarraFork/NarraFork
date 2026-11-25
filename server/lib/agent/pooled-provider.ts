@@ -160,6 +160,29 @@ export function reportKeyFault(key: ProviderKey, err: unknown, now = Date.now())
 	return true;
 }
 
+function keyFingerprint(key: ProviderKey): string {
+	return JSON.stringify([key.apiKey, key.network ?? null]);
+}
+
+/** Store keys mutate in place; snapshot the attempt before async requests can outlive an edit. */
+function captureKeyAttempt(
+	key: ProviderKey,
+	connection: Pick<ProviderAdapter, "isDiagnosticConnectionCurrent">,
+): () => boolean {
+	const { id, providerId } = key;
+	const version = keyFingerprint(key);
+	return () => {
+		const live = getProviderKeyStore().get(id);
+		return (
+			!!live &&
+			!live.disabled &&
+			live.providerId === providerId &&
+			keyFingerprint(live) === version &&
+			connection.isDiagnosticConnectionCurrent?.() !== false
+		);
+	};
+}
+
 /**
  * One adapter per key, built on demand. The wrapper exposes exactly the optional
  * methods the underlying adapter family has, so callers that probe for them see no
@@ -221,7 +244,7 @@ export class PooledProvider implements ProviderAdapter {
 	}
 
 	private adapterFor(key: ProviderKey, model = this.preparedModel): ProviderAdapter {
-		const signature = JSON.stringify([key.apiKey, key.network ?? null]);
+		const signature = keyFingerprint(key);
 		let entry = this.adapters.get(key.id);
 		if (entry?.signature !== signature) {
 			entry = { signature, adapter: this.build(key) };
@@ -255,17 +278,20 @@ export class PooledProvider implements ProviderAdapter {
 			const key = selectProviderKey(this.providerId, undefined, tried);
 			if (!key) throw new Error("This provider has no usable API key");
 			tried.add(key.id);
+			const isAttemptCurrent = captureKeyAttempt(key, this);
 			try {
 				const adapter = this.adapterFor(key, model);
 				const result = await run(adapter);
-				clearKeyCooldown(key.id);
+				if (isAttemptCurrent()) clearKeyCooldown(key.id);
 				// The key is the credential; an inner adapter's own id is the connection's.
 				return typeof result === "object" && result !== null
 					? { ...result, credentialId: key.id }
 					: result;
 			} catch (err) {
 				const more =
-					reportKeyFault(key, err) && !!selectProviderKey(this.providerId, undefined, tried);
+					isAttemptCurrent() &&
+					reportKeyFault(key, err) &&
+					!!selectProviderKey(this.providerId, undefined, tried);
 				if (!more) throw err;
 			}
 		}
@@ -321,13 +347,7 @@ export class PooledProvider implements ProviderAdapter {
 			const key = selectProviderKey(this.providerId, session, tried);
 			if (!key) throw new Error("This provider has no usable API key");
 			tried.add(key.id);
-			const version = JSON.stringify([key.apiKey, key.network ?? null]);
-			const validateDiagnosticCredential = () => {
-				const live = usableProviderKeys(this.providerId).find(
-					(candidate) => candidate.id === key.id,
-				);
-				return !!live && JSON.stringify([live.apiKey, live.network ?? null]) === version;
-			};
+			const isAttemptCurrent = captureKeyAttempt(key, this);
 			let streamed = false;
 			try {
 				const adapter = this.adapterFor(key, params.model);
@@ -337,19 +357,17 @@ export class PooledProvider implements ProviderAdapter {
 						params.onRequestStart?.({
 							credentialId: key.id,
 							validateDiagnosticCredential: () =>
-								validateDiagnosticCredential() &&
-								this.isDiagnosticConnectionCurrent?.() !== false &&
-								info?.validateDiagnosticCredential?.() !== false,
+								isAttemptCurrent() && info?.validateDiagnosticCredential?.() !== false,
 						}),
 				})) {
 					streamed ||= shouldTreatCodexStreamEventAsYielded(event);
 					yield { ...event, credentialId: key.id };
 				}
-				clearKeyCooldown(key.id);
+				if (isAttemptCurrent()) clearKeyCooldown(key.id);
 				return;
 			} catch (err) {
 				if (params.signal.aborted) throw err;
-				const faulted = reportKeyFault(key, err);
+				const faulted = isAttemptCurrent() && reportKeyFault(key, err);
 				const next = faulted && !streamed && selectProviderKey(this.providerId, session, tried);
 				if (!next) throw err;
 				logger.info("Retrying with the provider's next key", {

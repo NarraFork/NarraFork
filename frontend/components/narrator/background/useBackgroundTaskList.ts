@@ -36,22 +36,6 @@ export function backgroundTaskListQueryKey(narratorId: string): readonly unknown
 	return ["background-tasks", narratorId];
 }
 
-/**
- * Debounce for the `subagent_status_changed` fallback refetch.
- *
- * `continued` and `child_running` are derived from NARRATOR state, not from the
- * task row, so they produce no task delta — a subagent that starts working again
- * after its task row went terminal would otherwise leave the badge permanently
- * wrong.
- *
- * The window is deliberately several seconds rather than one: this hook is
- * mounted by the toolbar badge on every narrator panel (no open panel required),
- * a parent with several live subagents emits these frames frequently, and the
- * refetch pulls page 0 including its `activeTasks` set. At one second per frame
- * this fallback could cost MORE than the 10 s poll it replaced.
- */
-const SUBAGENT_STATUS_REFETCH_DEBOUNCE_MS = 5_000;
-
 export interface BackgroundTaskListResult {
 	tasks: BackgroundTaskListItem[];
 	activeCount: number;
@@ -99,33 +83,20 @@ export function useBackgroundTaskList(
 	});
 
 	/**
-	 * Reload the list.
-	 *
-	 * `dropPages` distinguishes the two reasons this is called:
-	 *
-	 * - After a gap/invalidate/epoch change the cached cursors may address rows that
-	 *   no longer exist, so keeping later pages would stitch a window that was never
-	 *   contiguous. Those callers drop back to page 1.
-	 * - The `subagent_status_changed` fallback is only re-deriving narrator-derived
-	 *   statuses; the pages themselves are still valid. Dropping them there would
-	 *   silently undo every "load older tasks" click each time any subagent changed
-	 *   state, which on a busy parent is constantly.
+	 * Recover from the first page: after a gap/invalidate/epoch change the cached
+	 * cursors may address rows that no longer exist. Explicit refresh and reconnect
+	 * use the same reset so later pages cannot stitch a non-contiguous window.
 	 */
-	const reload = useCallback(
-		(opts?: { dropPages?: boolean }) => {
-			if (opts?.dropPages) {
-				qc.setQueryData<BackgroundTaskInfiniteData>(queryKey, (old) =>
-					old && old.pages.length > 1
-						? { pages: old.pages.slice(0, 1), pageParams: old.pageParams.slice(0, 1) }
-						: old,
-				);
-			}
-			void qc.invalidateQueries({ queryKey });
-		},
-		[qc, queryKey],
-	);
+	const reload = useCallback(() => {
+		qc.setQueryData<BackgroundTaskInfiniteData>(queryKey, (old) =>
+			old && old.pages.length > 1
+				? { pages: old.pages.slice(0, 1), pageParams: old.pageParams.slice(0, 1) }
+				: old,
+		);
+		void qc.invalidateQueries({ queryKey });
+	}, [qc, queryKey]);
 
-	const refresh = useCallback(() => reload({ dropPages: true }), [reload]);
+	const refresh = reload;
 
 	const reloadRef = useRef(reload);
 	reloadRef.current = reload;
@@ -195,7 +166,7 @@ export function useBackgroundTaskList(
 			});
 			// A delta the reducer could not apply means the cached cursors are suspect,
 			// so this is the branch that must drop back to page 1.
-			if (needsRefresh) reloadRef.current({ dropPages: true });
+			if (needsRefresh) reloadRef.current();
 		},
 		[qc, queryKey],
 	);
@@ -206,30 +177,14 @@ export function useBackgroundTaskList(
 		if (!enabled || !narratorId) return;
 		const subscription = narratorWSManager.subscribe([narratorId], { kind: "list" });
 
-		let subagentTimer: ReturnType<typeof setTimeout> | undefined;
-		const scheduleSubagentRefresh = () => {
-			if (subagentTimer) return;
-			subagentTimer = setTimeout(() => {
-				subagentTimer = undefined;
-				// Keep the loaded pages: this only re-derives narrator-derived statuses.
-				reloadRef.current();
-			}, SUBAGENT_STATUS_REFETCH_DEBOUNCE_MS);
-		};
-
+		// Narrator-derived row changes (including continued/child_running) are covered
+		// by the server's list deltas/invalidation, not broad subagent status noise.
 		const listener = narratorWSManager.addListener(
 			{
 				narratorIds: [narratorId],
-				types: [
-					"background_task_list_delta",
-					"background_task_progress",
-					"subagent_status_changed",
-				],
+				types: ["background_task_list_delta", "background_task_progress"],
 			},
 			(data) => {
-				if (data.type === "subagent_status_changed") {
-					scheduleSubagentRefresh();
-					return;
-				}
 				if (data.type === "background_task_progress") {
 					// Validated, not cast: a malformed frame must leave the row's bar alone
 					// rather than paint NaN%.
@@ -258,11 +213,10 @@ export function useBackgroundTaskList(
 		// delta to be diagnosed as a gap (which would leave the list wrong until
 		// something happens to change).
 		const offConnection = narratorWSManager.onConnectionChange((connected, isReconnect) => {
-			if (connected && isReconnect) reloadRef.current({ dropPages: true });
+			if (connected && isReconnect) reloadRef.current();
 		});
 
 		return () => {
-			if (subagentTimer) clearTimeout(subagentTimer);
 			offConnection();
 			narratorWSManager.removeListener(listener);
 			narratorWSManager.unsubscribe(subscription);

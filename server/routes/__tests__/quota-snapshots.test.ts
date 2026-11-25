@@ -243,6 +243,33 @@ describe("unified quota API", () => {
 		}
 		quotaStore.remove(id);
 	});
+	test("both roles receive the fixed plugin-disabled code without private quota detail", async () => {
+		saveSettings({ ...settings, customApiProviders: [config("quota-plugin-code")] });
+		const id = getProviderKeyStore().list("quota-plugin-code")[0].id;
+		quotaStore.set(
+			id,
+			JSON.stringify([config().baseUrl, "quota-secret"]),
+			{ ...snap(), error: "plugin_not_enabled" },
+			false,
+		);
+		try {
+			for (const role of ["admin", "user"] as const) {
+				const response = await app(role).request(
+					"/api/quota-snapshots?groupId=quota-plugin-code&cachedOnly=true",
+				);
+				expect(response.status).toBe(200);
+				const text = await response.text();
+				expect(byGroup(JSON.parse(text), "quota-plugin-code")[0].snapshot).toMatchObject({
+					hasError: true,
+					error: "plugin_not_enabled",
+				});
+				expect(text).not.toMatch(/quota-secret|private-account|headers|detail/);
+			}
+		} finally {
+			quotaStore.remove(id);
+		}
+	});
+
 	test("cold GET returns immediately and repeated reads share the original source refresh", async () => {
 		saveSettings({ ...settings, customApiProviders: [config("quota-hanging")] });
 		let finish!: (response: Response) => void;
@@ -703,6 +730,83 @@ describe("uncached Command Code CLI quota", () => {
 		const snapshot = await refreshCommandCodeCliQuota();
 		expect(snapshot).toMatchObject({ error: "quota_unavailable", balances: [] });
 	});
+});
+
+test("admin GET automatically fills both usable Command Code keys through the source owner", async () => {
+	const { COMMAND_CODE_KEY_OWNER } = await import("../../lib/provider-keys");
+	const { getCommandCodeUsageForCredential } = await import("../../lib/commandcode-usage");
+	const keys = getProviderKeyStore();
+	saveSettings({
+		...settings,
+		commandCode: {
+			apiKey: "cc-auto-first",
+			baseUrl: "https://cc-auto.example/v1",
+			disabled: false,
+		},
+	});
+	const first = keys.list(COMMAND_CODE_KEY_OWNER)[0];
+	if (!first) throw new Error("missing Command Code fixture");
+	const second = keys.add(COMMAND_CODE_KEY_OWNER, { apiKey: "cc-auto-second" });
+	const disabled = keys.add(COMMAND_CODE_KEY_OWNER, { apiKey: "cc-auto-disabled" });
+	keys.update(disabled.id, { disabled: true });
+	const firstGate = Promise.withResolvers<void>();
+	const secondGate = Promise.withResolvers<void>();
+	const auth: Array<string | null> = [];
+	stubFetch(async (input, init) => {
+		const header = new Headers(init?.headers).get("Authorization");
+		auth.push(header);
+		if (header === "Bearer cc-auto-first") await firstGate.promise;
+		else if (header === "Bearer cc-auto-second") await secondGate.promise;
+		else throw new Error("disabled or foreign Command Code key was probed");
+		return Response.json(
+			String(input).endsWith("/credits")
+				? { credits: { monthlyCredits: header === "Bearer cc-auto-first" ? 3 : 7 } }
+				: {},
+		);
+	});
+	let completions: Promise<unknown>[] = [];
+	try {
+		const cached = await app("admin").request("/api/quota-snapshots?cachedOnly=true");
+		expect(cached.status).toBe(200);
+		expect(auth).toEqual([]);
+		const ordinary = await app("user").request("/api/quota-snapshots");
+		expect(ordinary.status).toBe(200);
+		expect(auth.length).toBeGreaterThan(0);
+		expect(auth.every((header) => header === "Bearer cc-auto-first")).toBe(true);
+		const response = await app("admin").request("/api/quota-snapshots");
+		expect(response.status).toBe(200);
+		const pending = byGroup(await response.json(), "CommandCode");
+		expect(pending.find((entry) => entry.credentialId === first.id)?.refreshing).toBe(true);
+		expect(pending.find((entry) => entry.credentialId === second.id)?.refreshing).toBe(true);
+		expect(pending.find((entry) => entry.credentialId === disabled.id)?.refreshing).toBe(false);
+		expect(auth).toContain("Bearer cc-auto-second");
+		// Join, rather than create a second scheduler or force a cache-bypassing refresh.
+		completions = [
+			getCommandCodeUsageForCredential(first.id),
+			getCommandCodeUsageForCredential(second.id),
+		];
+		firstGate.resolve();
+		secondGate.resolve();
+		await Promise.all(completions);
+		const requests = auth.length;
+		const settled = await app("admin").request("/api/quota-snapshots");
+		const rows = byGroup(await settled.json(), "CommandCode");
+		expect(
+			rows.find((entry) => entry.credentialId === first.id)?.snapshot?.balances[0]?.remaining,
+		).toBe(3);
+		expect(
+			rows.find((entry) => entry.credentialId === second.id)?.snapshot?.balances[0]?.remaining,
+		).toBe(7);
+		expect(rows.find((entry) => entry.credentialId === disabled.id)?.snapshot).toBeNull();
+		expect(auth.length).toBe(requests);
+		expect(auth).not.toContain("Bearer cc-auto-disabled");
+	} finally {
+		firstGate.resolve();
+		secondGate.resolve();
+		await Promise.allSettled(completions);
+		keys.removeProvider(COMMAND_CODE_KEY_OWNER);
+		for (const key of [first, second, disabled]) quotaStore.remove(key.id);
+	}
 });
 
 test("refreshing the second Command Code key exposes its own standard snapshot without querying the first", async () => {

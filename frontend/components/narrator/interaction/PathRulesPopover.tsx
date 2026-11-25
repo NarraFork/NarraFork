@@ -13,7 +13,6 @@ import {
 } from "@mantine/core";
 import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import { IconFolderPlus } from "@tabler/icons-react";
-import { useQuery } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef } from "react";
 import {
 	useBlacklistDirs,
@@ -33,8 +32,8 @@ import {
 	useUpdateWhitelistDir,
 	useWhitelistDirs,
 } from "../../../hooks/useNarrator";
+import { useNarratorExecutionDevices } from "../../../hooks/useNarratorExecutionDevices";
 import { usePlatform } from "../../../hooks/usePlatform";
-import { api } from "../../../lib/api";
 import type { PathFlavor } from "../../../lib/api/types";
 import { PermissionRuleEditor } from "../../permissions/PermissionRuleEditor";
 
@@ -76,11 +75,7 @@ export function PathRulesPopover({
 	const createCmdBl = useCreateCmdBlacklist();
 	const updateCmdBl = useUpdateCmdBlacklist(narratorId);
 	const deleteCmdBl = useDeleteCmdBlacklist(narratorId);
-	const { data: execDevices } = useQuery({
-		queryKey: ["narratorExecutionDevices", narratorId],
-		queryFn: () => api.getNarratorExecutionDevices(narratorId),
-		enabled: opened,
-	});
+	const { data: execDevices } = useNarratorExecutionDevices(narratorId, opened);
 	const permissionDevices = useMemo(
 		() =>
 			(execDevices?.devices ?? []).map((device) => ({

@@ -3091,6 +3091,7 @@
 	},
 	"quotaSnapshot": {
 		"unknown": "Quota unknown",
+		"pluginDisabled": "Quota plugin is disabled",
 		"unlimited": "Unlimited",
 		"balance": "Balance",
 		"plan": "Plan",

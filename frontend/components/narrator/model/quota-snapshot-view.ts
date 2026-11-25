@@ -131,8 +131,9 @@ export function quotaSnapshotView(
 		rows,
 		expired,
 		failed: !!(snapshot?.error || snapshot?.hasError),
-		// The public API's safe status code is not user-facing failure detail.
-		failureDetail: snapshot?.error === "quota_unavailable" ? null : (snapshot?.error ?? null),
+		// Only host-defined reasons are localized; arbitrary error text is never a UI detail.
+		failureDetail:
+			snapshot?.error === "plugin_not_enabled" ? t("quotaSnapshot.pluginDisabled") : null,
 		fetchedAt: snapshot?.fetchedAt ?? 0,
 	};
 }

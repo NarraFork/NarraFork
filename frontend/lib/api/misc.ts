@@ -817,7 +817,7 @@ export const miscApi = {
 			body: JSON.stringify(body),
 		}),
 	/** Explicit payment confirmation refresh; ordinary quota readers use quotaSnapshots. */
-	nugGetQuota: (providerId: string) =>
+	nugGetQuota: (providerId: string, options?: object) =>
 		request<{
 			balance: number;
 			totalGranted: number;
@@ -825,7 +825,7 @@ export const miscApi = {
 			extra?: unknown;
 			username?: string;
 			role?: string;
-		}>(`/nug/providers/${providerId}/quota`),
+		}>(`/nug/providers/${providerId}/quota`, pickRequestOptions(options)),
 	// Client-egress relay status per provider (docs/CODEX_CLIENT_RELAY.md).
 	nugGetRelayStatus: () =>
 		request<

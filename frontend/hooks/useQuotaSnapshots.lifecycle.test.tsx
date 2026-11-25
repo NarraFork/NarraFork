@@ -5,8 +5,10 @@ import { parseHTML } from "linkedom";
 import { act, StrictMode } from "react";
 import type { Root } from "react-dom/client";
 import { api } from "../lib/api";
+import { setToken } from "../lib/api/client";
 
 const originals = new Map<string, PropertyDescriptor | undefined>();
+const tokens = new Map<string, string>();
 const { window } = parseHTML("<!doctype html><html><body></body></html>");
 for (const [key, value] of Object.entries({
 	window,
@@ -15,6 +17,11 @@ for (const [key, value] of Object.entries({
 	HTMLElement: window.HTMLElement,
 	Node: window.Node,
 	Event: window.Event,
+	localStorage: {
+		getItem: (key: string) => tokens.get(key) ?? null,
+		setItem: (key: string, value: string) => tokens.set(key, value),
+		removeItem: (key: string) => tokens.delete(key),
+	},
 	IS_REACT_ACT_ENVIRONMENT: true,
 })) {
 	originals.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
@@ -99,6 +106,7 @@ function deferredRefresh() {
 }
 const displayed = () => visible?.entries.find((entry) => entry.groupId === "CommandCode");
 beforeEach(() => {
+	tokens.clear();
 	container = document.createElement("div");
 	document.body.appendChild(container);
 	root = createRoot(container);
@@ -368,6 +376,44 @@ test.each([
 		await pending;
 	});
 	expect(displayed()?.snapshot ?? null).toBeNull();
+});
+
+test("a pending manual refresh cannot overwrite the replacement session's Root projection", async () => {
+	setToken("quota-session-old");
+	const entry: QuotaSnapshotEntry = {
+		...cli(),
+		groupId: "plain",
+		credentialId: "shared-key",
+		refreshOnRead: false,
+		generation: undefined,
+		snapshot: known,
+	};
+	qc.setQueryData(quotaSnapshotsKey, { entries: [entry] });
+	const requests = deferredRefresh();
+	await mount(false);
+	const pending = mutation.mutateAsync({ groupId: "plain" });
+	await waitFor(() => requests.length > 0);
+	const freshRoot: QuotaSnapshotsResponse = {
+		entries: [
+			{
+				...entry,
+				snapshot: { ...known, balances: [{ unit: "credits", remaining: 9 }] },
+			},
+		],
+	};
+	await act(async () => {
+		setToken("quota-session-new");
+		qc.setQueryData(quotaSnapshotsKey, freshRoot);
+	});
+	await waitFor(() => visible?.entries[0]?.snapshot?.balances[0]?.remaining === 9);
+	// No edit invalidation or cancellation masks the session barrier being exercised.
+	expect(requests[0]?.signal?.aborted).toBe(false);
+	await act(async () => {
+		requests[0]?.complete({ entries: [entry] });
+		await pending;
+	});
+	expect(qc.getQueryData(quotaSnapshotsKey)).toEqual(freshRoot);
+	expect(visible).toEqual(freshRoot);
 });
 
 test("closing an unrelated refresh surface does not cancel the request owner", async () => {

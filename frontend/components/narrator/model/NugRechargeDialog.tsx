@@ -170,6 +170,8 @@ export function NugRechargeDialog({
 					quota.detailedQuotaBalance ?? null,
 				);
 				void qc.invalidateQueries({ queryKey: quotaSnapshotsKey });
+				void qc.invalidateQueries({ queryKey: ["settings"] });
+				void qc.invalidateQueries({ queryKey: ["admin", "settings"] });
 				notifications.show({
 					color: "green",
 					title: t("recharge.success"),

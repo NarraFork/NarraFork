@@ -67,6 +67,13 @@ export interface QuotaSnapshotEntry {
 	generation?: string;
 }
 
+export interface QuotaSnapshotReadScope {
+	groupId?: string;
+	cachedOnly?: boolean;
+	/** The model-runtime settings revision; mismatches are rejected, never reused. */
+	expectedGeneration?: number | string;
+}
+
 export interface QuotaSnapshotsResponse {
 	entries: QuotaSnapshotEntry[];
 }
