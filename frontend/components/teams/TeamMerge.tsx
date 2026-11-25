@@ -28,7 +28,6 @@ import {
 	Tooltip,
 } from "@mantine/core";
 import type {
-	TeamWorkFileChange,
 	TeamWorkMergeOutcome,
 	TeamWorkMergeSummary,
 	TeamWorkMergeView,
@@ -148,8 +147,6 @@ function FastForward({
 	base,
 	prepared,
 	fastForward,
-	files,
-	filesMore,
 }: {
 	projectId: string;
 	teamId: string;
@@ -157,13 +154,13 @@ function FastForward({
 	base: string;
 	prepared: Extract<TeamWorkMergeOutcome, { kind: "prepared" }>;
 	fastForward: NonNullable<TeamWorkMergeView["fastForward"]>;
-	files: readonly TeamWorkFileChange[];
-	filesMore: boolean;
 }) {
 	const { t } = useTranslation("projects");
 	const send = useMergeWorkItem(projectId, teamId);
 	const errorText = useMergeErrorText();
 	const [confirming, setConfirming] = useState(false);
+	// What the fast-forward writes there (prepared base → merge commit), not the review diff.
+	const files = fastForward.files;
 	const shown = files.slice(0, 50);
 	return (
 		<>
@@ -210,12 +207,12 @@ function FastForward({
 					<Box style={{ maxHeight: 240, overflow: "auto" }}>
 						<List size="sm" spacing={2} data-testid="team-merge-confirm-files">
 							{shown.map((file) => (
-								<List.Item key={file.path} style={{ ...MONO, overflowWrap: "anywhere" }}>
-									{file.path}
+								<List.Item key={file} style={{ ...MONO, overflowWrap: "anywhere" }}>
+									{file}
 								</List.Item>
 							))}
 						</List>
-						{(filesMore || files.length > shown.length) && (
+						{(fastForward.filesMore || files.length > shown.length) && (
 							<Text size="xs" c="dimmed">
 								{t("teams.page.merge.confirmFilesMore")}
 							</Text>
@@ -251,8 +248,6 @@ export function MergeOutcome({
 	itemId,
 	base,
 	merge,
-	files,
-	filesMore,
 	canReturn,
 	onReturn,
 }: {
@@ -261,8 +256,6 @@ export function MergeOutcome({
 	itemId: string;
 	base: string;
 	merge: TeamWorkMergeView;
-	files: readonly TeamWorkFileChange[];
-	filesMore: boolean;
 	canReturn: boolean;
 	onReturn: () => void;
 }) {
@@ -352,13 +345,15 @@ export function MergeOutcome({
 							base={base}
 							prepared={detail}
 							fastForward={merge.fastForward}
-							files={files}
-							filesMore={filesMore}
 						/>
-						<Text size="xs" c="dimmed">
-							{t("teams.page.merge.commandHint")}
-						</Text>
-						<CopyCommand command={merge.fastForward.command} />
+						{merge.fastForward.command && (
+							<>
+								<Text size="xs" c="dimmed">
+									{t("teams.page.merge.commandHint")}
+								</Text>
+								<CopyCommand command={merge.fastForward.command} />
+							</>
+						)}
 					</>
 				)}
 			</Stack>

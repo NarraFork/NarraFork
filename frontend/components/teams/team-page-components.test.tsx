@@ -1254,8 +1254,6 @@ describe("merge (M)", () => {
 					itemId="r"
 					base="main"
 					merge={merge}
-					files={[{ path: "src/a.ts", added: 1, removed: 0 }]}
-					filesMore={false}
 					canReturn
 					onReturn={noop}
 				/>,
@@ -1303,6 +1301,8 @@ describe("merge (M)", () => {
 						runningSessions: 0,
 						terminals: 1,
 						command: "git -C /home/alice/app merge --ff-only refs/narrafork/team-merges/r",
+						files: ["src/a.ts", "upstream/u.ts"],
+						filesMore: false,
 					},
 				},
 			),
@@ -1332,6 +1332,8 @@ describe("merge (M)", () => {
 						runningSessions: 2,
 						terminals: 0,
 						command: "git -C /home/alice/app merge --ff-only refs/narrafork/team-merges/r",
+						files: ["src/a.ts", "upstream/u.ts"],
+						filesMore: false,
 					},
 				},
 			),
@@ -1360,6 +1362,8 @@ describe("merge (M)", () => {
 						runningSessions: 0,
 						terminals: 0,
 						command: "git -C /home/alice/app merge --ff-only refs/narrafork/team-merges/r",
+						files: ["src/a.ts", "upstream/u.ts"],
+						filesMore: false,
 					},
 				},
 			),
@@ -1369,5 +1373,30 @@ describe("merge (M)", () => {
 		expect(refused).toContain('data-testid="team-merge-fast-forward"');
 		expect(refused).toContain("git -C /home/alice/app merge --ff-only");
 		expect(blocked).toContain("那里有 2 个会话在运行");
+		// Off the base the blocker shows and no command is offered (Devin 2).
+		const offBase = await outcome(
+			view(
+				{
+					kind: "prepared",
+					mergeCommit: "a".repeat(40),
+					baseSha: "b".repeat(40),
+					checkedOutAt: "/home/alice/app",
+					at: "2026-11-25T00:00:00.000Z",
+				},
+				{
+					fastForward: {
+						available: false,
+						blocker: "not_on_base",
+						runningSessions: 0,
+						terminals: 0,
+						command: null,
+						files: [],
+						filesMore: false,
+					},
+				},
+			),
+		);
+		expect(offBase).toContain('data-testid="team-merge-blocker"');
+		expect(offBase).not.toContain('data-testid="team-merge-command"');
 	});
 });

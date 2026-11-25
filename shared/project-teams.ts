@@ -1002,7 +1002,14 @@ export interface TeamWorkMergeView extends TeamWorkMergeSummary {
 		runningSessions: number;
 		/** NarraFork terminals open there: a warning only. */
 		terminals: number;
-		command: string;
+		/**
+		 * What a person can run there instead (asserts the branch, fast-forwards to the prepared
+		 * commit); null when the checkout is off the base, stale or another repository.
+		 */
+		command: string | null;
+		/** The files the fast-forward writes there (prepared base → merge commit), bounded. */
+		files: string[];
+		filesMore: boolean;
 	};
 }
 

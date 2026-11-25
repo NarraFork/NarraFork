@@ -978,7 +978,7 @@ describe("merge (M)", () => {
 				detail: { kind: "prepared", baseSha: before },
 				fastForward: {
 					available: true,
-					command: expect.stringContaining(`merge --ff-only refs/narrafork/team-merges/${item.id}`),
+					command: expect.stringContaining("merge --ff-only --no-autostash --no-overwrite-ignore"),
 				},
 			});
 			const onlooker = await call(READER, teamPath(`work/${item.id}`));

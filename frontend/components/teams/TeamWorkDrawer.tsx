@@ -722,8 +722,6 @@ function ReturnBar({
 					itemId={detail.item.id}
 					base={base}
 					merge={merge}
-					files={detail.files}
-					filesMore={detail.filesMore}
 					canReturn={detail.canReturn}
 					onReturn={() => setReturning(true)}
 				/>

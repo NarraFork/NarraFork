@@ -27,6 +27,7 @@ import {
 	requestMerge,
 	resetMergeJobsForTests,
 	setMergeDeadlineForTests,
+	setMergeStepHookForTests,
 	settleMergeJobs,
 } from "../team-merge";
 import { claimMerging, isMerging, releaseMerging, resetMergingForTests } from "../team-merge-guard";
@@ -71,11 +72,11 @@ async function commitFile(cwd: string, file: string, text: string, message: stri
 }
 
 /** A ready item: its branch from main with one commit in its own worktree, recorded as ready. */
-async function readyItem(name: string, file = `${name}.txt`, text = `${name}\n`) {
+async function readyItem(name: string, file = `${name}.txt`, text = `${name}\n`, from = "main") {
 	const id = `mg-${name}-${generateId().slice(0, 6)}`;
 	const branch = `team/${name}`;
 	const worktree = join(repo, ".worktrees", name);
-	await git(["worktree", "add", "-q", "-b", branch, worktree, "main"]);
+	await git(["worktree", "add", "-q", "-b", branch, worktree, from]);
 	const head = await commitFile(worktree, file, text, `work ${name}`);
 	const mergeBase = await git(["merge-base", "main", head]);
 	const resourceId = generateId();
@@ -313,7 +314,7 @@ describe("local merge", () => {
 		expect(view.canMerge).toBe(true);
 		expect(view.fastForward).toMatchObject({ available: true, blocker: null });
 		expect(view.fastForward?.command).toBe(
-			`git -C ${repo} merge --ff-only refs/narrafork/team-merges/${a.id}`,
+			`[ "$(git -C ${repo} symbolic-ref --quiet --short HEAD)" = main ] && git -C ${repo} merge --ff-only --no-autostash --no-overwrite-ignore ${outcome.mergeCommit}`,
 		);
 
 		// 「在该目录中快进」: only now does that checkout change, keeping the person's own edits.
@@ -747,5 +748,146 @@ describe("local merge", () => {
 		}
 		expect(item(a.id)).toMatchObject({ state: "ready", reviewRounds: 1 });
 		expect(events(a.id, "work.sync")).toHaveLength(0);
+	});
+
+	test("a worker commit after the first check is never closed by the merge (Devin 6)", async () => {
+		// Before the base moves: nothing moves.
+		const a = await readyItem("sigma");
+		await git(["checkout", "-q", "--detach"]);
+		const old = await git(["rev-parse", "main"]);
+		let calls = 0;
+		setMergeStepHookForTests(async () => {
+			if (++calls === 1) await commitFile(a.worktree, "late.txt", "late\n", "late commit");
+		});
+		try {
+			merge(a.id);
+			await settleMergeJobs();
+		} finally {
+			setMergeStepHookForTests(null);
+		}
+		expect(readMergeOutcome(a.id)).toMatchObject({ code: "TEAM_WORK_ITEM_HEAD_MOVED" });
+		expect(await git(["rev-parse", "main"])).toBe(old);
+		expect(item(a.id)?.state).toBe("ready");
+
+		// After the base moved, before the merge is recorded: the item is not closed.
+		const b = await readyItem("tau");
+		calls = 0;
+		setMergeStepHookForTests(async () => {
+			if (++calls === 2) await commitFile(b.worktree, "later.txt", "later\n", "later commit");
+		});
+		try {
+			merge(b.id);
+			await settleMergeJobs();
+		} finally {
+			setMergeStepHookForTests(null);
+		}
+		expect(readMergeOutcome(b.id)).toMatchObject({ code: "TEAM_WORK_ITEM_HEAD_MOVED" });
+		expect(item(b.id)?.state).toBe("ready");
+		// The ancestry pass does not close it either: the branch's new commit is not in the base.
+		await runChangedPathsPass({ sweep: true });
+		expect(item(b.id)?.state).toBe("ready");
+	});
+
+	test("a worker commit during the fast-forward's checks stops it before the checkout changes (Devin 6)", async () => {
+		const a = await readyItem("upsilon");
+		merge(a.id);
+		await settleMergeJobs();
+		expect(readMergeOutcome(a.id)?.kind).toBe("prepared");
+		const old = await git(["rev-parse", "main"]);
+		setMergeStepHookForTests(async () => {
+			await commitFile(a.worktree, "late.txt", "late\n", "late commit");
+			setMergeStepHookForTests(null);
+		});
+		try {
+			requestFastForward({ teamId: LEAD, itemId: a.id, userId: USER });
+			await settleMergeJobs();
+		} finally {
+			setMergeStepHookForTests(null);
+		}
+		const outcome = readMergeOutcome(a.id);
+		expect(outcome?.kind === "prepared" && outcome.fastForwardFailure?.code).toBe(
+			"TEAM_WORK_ITEM_HEAD_MOVED",
+		);
+		expect(await git(["rev-parse", "main"])).toBe(old);
+		expect(item(a.id)?.state).toBe("ready");
+	});
+
+	test("a running session among hundreds of idle ones in the checkout blocks the fast-forward (Devin 7)", async () => {
+		const a = await readyItem("phi");
+		merge(a.id);
+		await settleMergeJobs();
+		const values = Array.from({ length: 250 }, (_, index) => [
+			`mg-idle-${String(index).padStart(3, "0")}`,
+			join(repo, "src", String(index)),
+		]);
+		for (const [id, cwd] of values)
+			sqlite.run(
+				`INSERT INTO narrators (id, type, title, status, cwd, created_at, updated_at)
+				VALUES (?, 'primary', 'Idle', 'idle', ?, ?, ?)`,
+				[id ?? "", cwd ?? "", NOW, NOW],
+			);
+		sqlite.run(
+			`INSERT INTO narrators (id, type, title, status, cwd, created_at, updated_at)
+			VALUES ('mg-zz-running', 'primary', 'Running', 'working', ?, ?, ?)`,
+			[join(repo, "src", "last"), NOW, NOW],
+		);
+		const row = item(a.id);
+		if (!row) throw new Error("missing item");
+		const view = await mergeViewOf({
+			item: row,
+			baseBranch: "main",
+			teamActive: true,
+			workerRunning: false,
+			member: true,
+		});
+		expect(view.fastForward).toMatchObject({
+			available: false,
+			blocker: "sessions_running",
+			runningSessions: 1,
+		});
+		const old = await git(["rev-parse", "main"]);
+		requestFastForward({ teamId: LEAD, itemId: a.id, userId: USER });
+		await settleMergeJobs();
+		const outcome = readMergeOutcome(a.id);
+		expect(outcome?.kind === "prepared" && outcome.fastForwardFailure?.code).toBe(
+			"TEAM_MERGE_CHECKOUT_BUSY",
+		);
+		expect(await git(["rev-parse", "main"])).toBe(old);
+	});
+
+	test("the confirmation lists what the fast-forward writes, upstream files included; off the base no command (Devin 8, 2)", async () => {
+		// The item started from a commit main does not have yet (as from origin/main).
+		await git(["branch", "upstream", "main"]);
+		await git(["checkout", "-q", "upstream"]);
+		await commitFile(repo, "upstream.txt", "up\n", "upstream work");
+		await git(["checkout", "-q", "main"]);
+		const a = await readyItem("chi", "chi.txt", "chi\n", "upstream");
+		merge(a.id);
+		await settleMergeJobs();
+		const prepared = readMergeOutcome(a.id);
+		if (prepared?.kind !== "prepared") throw new Error("expected a prepared merge");
+		const row = item(a.id);
+		if (!row) throw new Error("missing item");
+		const view = await mergeViewOf({
+			item: row,
+			baseBranch: "main",
+			teamActive: true,
+			workerRunning: false,
+			member: true,
+		});
+		expect(view.fastForward?.files).toEqual(["chi.txt", "upstream.txt"]);
+		expect(view.fastForward?.filesMore).toBe(false);
+		expect(view.fastForward?.command).toContain(prepared.mergeCommit);
+		// Off the base, the blocker shows and no command is offered.
+		resetMergeJobsForTests();
+		await git(["checkout", "-q", "-b", "elsewhere"]);
+		const off = await mergeViewOf({
+			item: row,
+			baseBranch: "main",
+			teamActive: true,
+			workerRunning: false,
+			member: true,
+		});
+		expect(off.fastForward).toMatchObject({ blocker: "not_on_base", command: null });
 	});
 });

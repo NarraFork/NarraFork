@@ -39,6 +39,7 @@
 import {
 	TEAM_MERGE_CONFLICTS_MAX,
 	TEAM_MERGE_REF_PREFIX,
+	TEAM_WORK_FILES_LIMIT,
 	type TeamFastForwardBlocker,
 	type TeamMergeDisabledReason,
 	type TeamMergeMode,
@@ -48,7 +49,7 @@ import {
 	type TeamWorkMergeSummary,
 	type TeamWorkMergeView,
 } from "@shared/project-teams";
-import { and, desc, eq, inArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, or, sql } from "drizzle-orm";
 import { db } from "../../db";
 import {
 	narrators,
@@ -59,6 +60,7 @@ import {
 	terminals,
 	users,
 } from "../../db/schema";
+import { readQuery } from "../../db/worker-read";
 import { AsyncMutex, worktreeLock } from "../../lib/async-mutex";
 import { AppError, NotFoundError } from "../../lib/errors";
 import { eventBus } from "../../lib/event-bus";
@@ -67,6 +69,7 @@ import { hotSafe } from "../../lib/hot-safe";
 import { getUserLanguage, type Locale } from "../../lib/i18n";
 import { logger } from "../../lib/logger";
 import { oneLine } from "../../lib/prompts/team-coordinator-notes";
+import { teamGit } from "./team-git";
 import {
 	canonicalCheckout,
 	fastForwardCheckout,
@@ -88,6 +91,10 @@ const JOB_DEADLINE_MS = 10 * 60_000;
 /** Sessions in a checkout scanned for the fast-forward's "nothing runs there" check. */
 const CHECKOUT_SESSIONS_SCAN = 200;
 const CHECKOUT_TERMINALS_SCAN = 50;
+/** Sessions in a checkout whose background tasks are counted; past it the check is incomplete. */
+const CHECKOUT_PARENTS_SCAN = 2000;
+const ID_CHUNK = 500;
+const ACTIVITY_READ_TIMEOUT_MS = 5_000;
 /** How long a prepared checkout's inspection is reused by the drawer. */
 const INSPECTION_TTL_MS = 15_000;
 
@@ -118,16 +125,7 @@ interface MergeJob {
 const state = hotSafe("narrafork.teams.mergeJobs", () => ({
 	jobs: new Map<string, MergeJob>(),
 	running: new Set<Promise<void>>(),
-	inspections: new Map<
-		string,
-		{
-			at: number;
-			key: string;
-			blocker: TeamFastForwardBlocker | null;
-			running: number;
-			terminals: number;
-		}
-	>(),
+	inspections: new Map<string, PreparedInspection>(),
 }));
 const projectLocks = hotSafe("narrafork.teams.mergeLocks", () => new AsyncMutex());
 
@@ -328,47 +326,80 @@ export function mergeSummaryOf(input: {
 }
 
 /**
- * Sessions running in a person's checkout (the directory or below, outside its `.worktrees/`),
- * by status, and NarraFork terminals open there (a warning only). Bounded scans.
+ * What runs in a person's checkout (the directory or below, outside its `.worktrees/`): sessions
+ * working or waiting by status (an indexed status read, then the directory), sessions the runtime
+ * holds busy (the in-memory registries), and sessions with active background tasks; plus the
+ * NarraFork terminals open there (a warning only). Reads that are not indexed by directory run on
+ * the read worker. A scan that reaches its cap leaves the answer `incomplete`: the fast-forward
+ * is then refused rather than run on a partial check.
  */
 async function checkoutActivity(
 	dir: string,
 	options: { backgroundTasks: boolean },
-): Promise<{ running: number; terminals: number }> {
+): Promise<{ running: number; terminals: number; incomplete: boolean }> {
 	const root = await canonicalCheckout(dir);
 	const prefix = `${root.replace(/\/+$/, "")}/`;
 	const pattern = `${escapeLike(prefix)}%`;
 	const nested = `${escapeLike(`${prefix}.worktrees/`)}%`;
-	const rows = db
-		.select({ id: narrators.id, status: narrators.status })
-		.from(narrators)
-		.where(
-			and(
-				or(eq(narrators.cwd, root), sql`${narrators.cwd} like ${pattern} escape '\\'`),
-				sql`${narrators.cwd} not like ${nested} escape '\\'`,
-			),
-		)
-		.limit(CHECKOUT_SESSIONS_SCAN)
-		.all();
-	let running = 0;
-	const { isNarratorRuntimeBusy } = await import("../narrator-session-state");
-	for (const row of rows) {
-		if (RUNNING.has(row.status) || isNarratorRuntimeBusy(row.id)) {
-			running++;
-			continue;
-		}
-		if (options.backgroundTasks) {
-			const { backgroundTaskService } = await import("../background-task-service");
-			// No background task store (nothing was ever started in this process): none run.
-			const active = await backgroundTaskService.countActiveByParent(row.id).catch((error) => {
-				logger.debug("Background tasks of a session could not be counted", {
-					narratorId: row.id,
+	const inCheckout = and(
+		or(eq(narrators.cwd, root), sql`${narrators.cwd} like ${pattern} escape '\\'`),
+		sql`${narrators.cwd} not like ${nested} escape '\\'`,
+	);
+	const read = (maxRows: number, diagnosticSource: string) => ({
+		executionPolicy: "worker-required" as const,
+		maxRows,
+		timeoutMs: ACTIVITY_READ_TIMEOUT_MS,
+		diagnosticSource,
+	});
+	let incomplete = false;
+	const running = new Set<string>();
+	// 1. Working or waiting by status: the status index first, then the directory.
+	const byStatus = await readQuery(
+		db
+			.select({ id: narrators.id })
+			.from(narrators)
+			.where(and(inArray(narrators.status, ["working", "waiting"]), inCheckout))
+			.limit(CHECKOUT_SESSIONS_SCAN + 1),
+		read(CHECKOUT_SESSIONS_SCAN + 1, "teams.merge.running"),
+	);
+	if (byStatus.length > CHECKOUT_SESSIONS_SCAN) incomplete = true;
+	for (const row of byStatus) running.add(row.id);
+	// 2. Busy in the runtime (a loop, a pending permission, a claim) whatever the stored status.
+	const { listRuntimeBusyNarratorIds } = await import("../narrator-session-state");
+	const busy = listRuntimeBusyNarratorIds().filter((id) => !running.has(id));
+	for (let index = 0; index < busy.length; index += ID_CHUNK) {
+		const ids = busy.slice(index, index + ID_CHUNK);
+		for (const row of db
+			.select({ id: narrators.id })
+			.from(narrators)
+			.where(and(inArray(narrators.id, ids), inCheckout))
+			.limit(ids.length)
+			.all())
+			running.add(row.id);
+	}
+	// 3. Active background tasks of any session there, idle or not.
+	if (options.backgroundTasks) {
+		const sessions = await readQuery(
+			db
+				.select({ id: narrators.id })
+				.from(narrators)
+				.where(inCheckout)
+				.orderBy(asc(narrators.id))
+				.limit(CHECKOUT_PARENTS_SCAN + 1),
+			read(CHECKOUT_PARENTS_SCAN + 1, "teams.merge.sessions"),
+		);
+		if (sessions.length > CHECKOUT_PARENTS_SCAN) incomplete = true;
+		const { backgroundTaskService } = await import("../background-task-service");
+		// No background task store (nothing was ever started in this process): none run.
+		const active = await backgroundTaskService
+			.countActiveByParentBatch(sessions.slice(0, CHECKOUT_PARENTS_SCAN).map((row) => row.id))
+			.catch((error) => {
+				logger.debug("Background tasks in a checkout could not be counted", {
 					error: error instanceof Error ? error.message : String(error),
 				});
-				return 0;
+				return new Map<string, number>();
 			});
-			if (active > 0) running++;
-		}
+		for (const [id, count] of active) if (count > 0) running.add(id);
 	}
 	const open = db
 		.select({ id: terminals.id })
@@ -376,7 +407,26 @@ async function checkoutActivity(
 		.where(or(eq(terminals.cwd, root), sql`${terminals.cwd} like ${pattern} escape '\\'`))
 		.limit(CHECKOUT_TERMINALS_SCAN)
 		.all();
-	return { running, terminals: open.length };
+	return { running: running.size, terminals: open.length, incomplete };
+}
+
+/** Blockers under which the copyable command is not offered (it would not apply as prepared). */
+const NO_COMMAND_BLOCKERS: ReadonlySet<TeamFastForwardBlocker> = new Set([
+	"not_on_base",
+	"other_repository",
+	"stale",
+	"unreadable",
+]);
+
+interface PreparedInspection {
+	at: number;
+	key: string;
+	blocker: TeamFastForwardBlocker | null;
+	running: number;
+	terminals: number;
+	/** What the fast-forward changes in that checkout: base → merge commit, bounded. */
+	files: string[];
+	filesMore: boolean;
 }
 
 /** The drawer's check of a prepared checkout, reused for a few seconds. */
@@ -385,7 +435,7 @@ async function inspectPrepared(
 	base: string,
 	prepared: Extract<TeamWorkMergeOutcome, { kind: "prepared" }>,
 	repo: string | null,
-): Promise<{ blocker: TeamFastForwardBlocker | null; running: number; terminals: number }> {
+): Promise<PreparedInspection> {
 	const key = `${prepared.mergeCommit}:${prepared.baseSha}:${prepared.checkedOutAt}`;
 	const cached = state.inspections.get(itemId);
 	if (cached && cached.key === key && Date.now() - cached.at < INSPECTION_TTL_MS) return cached;
@@ -393,14 +443,25 @@ async function inspectPrepared(
 		? await inspectCheckout(prepared.checkedOutAt, base, prepared.baseSha, { repo })
 		: ("unreadable" as const);
 	const activity = await checkoutActivity(prepared.checkedOutAt, { backgroundTasks: false }).catch(
-		() => ({ running: 0, terminals: 0 }),
+		() => ({ running: 0, terminals: 0, incomplete: true }),
 	);
-	const entry = {
+	// The files the fast-forward writes there: everything from the base it was prepared on to the
+	// merge commit, upstream changes included (not the item's own review diff).
+	const changes = repo
+		? await teamGit(repo)
+				.numstat(prepared.baseSha, prepared.mergeCommit)
+				.catch(() => null)
+		: null;
+	const entry: PreparedInspection = {
 		at: Date.now(),
 		key,
-		blocker: blocker ?? (activity.running > 0 ? ("sessions_running" as const) : null),
+		blocker:
+			blocker ??
+			(activity.running > 0 || activity.incomplete ? ("sessions_running" as const) : null),
 		running: activity.running,
 		terminals: activity.terminals,
+		files: (changes?.files ?? []).slice(0, TEAM_WORK_FILES_LIMIT).map((file) => file.path),
+		filesMore: !changes || changes.truncated || changes.files.length > TEAM_WORK_FILES_LIMIT,
 	};
 	state.inspections.set(itemId, entry);
 	if (state.inspections.size > 200) {
@@ -424,17 +485,30 @@ export async function mergeViewOf(input: {
 	if (outcome?.kind === "prepared") {
 		const base = input.item.baseRef ?? input.baseBranch;
 		const repo = repositoryOf(input.item.projectId);
-		const inspected = await inspectPrepared(input.item.id, base, outcome, repo).catch(() => ({
-			blocker: "unreadable" as const,
-			running: 0,
-			terminals: 0,
-		}));
+		const inspected = await inspectPrepared(input.item.id, base, outcome, repo).catch(
+			(): PreparedInspection => ({
+				at: 0,
+				key: "",
+				blocker: "unreadable",
+				running: 0,
+				terminals: 0,
+				files: [],
+				filesMore: true,
+			}),
+		);
 		view.fastForward = {
 			available: inspected.blocker === null,
 			blocker: inspected.blocker,
 			runningSessions: inspected.running,
 			terminals: inspected.terminals,
-			command: fastForwardCommand(outcome.checkedOutAt, input.item.id),
+			// Off the base (or another repository, or stale) the command would not apply as
+			// prepared: the blocker is shown instead.
+			command:
+				inspected.blocker && NO_COMMAND_BLOCKERS.has(inspected.blocker)
+					? null
+					: fastForwardCommand(outcome.checkedOutAt, base, outcome.mergeCommit),
+			files: inspected.files,
+			filesMore: inspected.filesMore,
 		};
 	}
 	return view;
@@ -761,6 +835,33 @@ async function jobFacts(context: JobContext, signal: AbortSignal) {
 	return { team, item, head: item.headSha, branch: item.branchName, base, repo, git };
 }
 
+/**
+ * The item's branch must still be the head the merge was computed from: checked right before the
+ * base moves and again before the merge is recorded. A worker commit made meanwhile is never
+ * closed by the merge (409-style `TEAM_WORK_ITEM_HEAD_MOVED`).
+ */
+async function assertTipStill(
+	git: { resolve(ref: string): Promise<string | null> },
+	branch: string,
+	head: string,
+): Promise<void> {
+	await mergeStepHook?.("tip");
+	const tip = await git.resolve(`refs/heads/${branch}`);
+	if (tip !== head)
+		throw new MergeFailure(
+			"TEAM_WORK_ITEM_HEAD_MOVED",
+			`The branch ${branch} moved while it was being merged (head ${head.slice(0, 12)}, now ${tip ? tip.slice(0, 12) : "missing"}); its new commits are not in the base, so the item stays ready: mark it ready again`,
+		);
+}
+
+/** Called at named points of a job (tests: something changes right there). */
+let mergeStepHook: ((step: string) => Promise<void> | void) | null = null;
+
+/** Run `hook` at each named point of a merge job (tests); null removes it. */
+export function setMergeStepHookForTests(hook: ((step: string) => Promise<void> | void) | null) {
+	mergeStepHook = hook;
+}
+
 async function personOf(userId: string | null): Promise<{ name: string | null; locale: Locale }> {
 	if (!userId) return { name: null, locale: "en" };
 	const row = db
@@ -829,6 +930,7 @@ async function runMerge(context: JobContext, signal: AbortSignal): Promise<void>
 		const old = await git.resolve(`refs/heads/${base}`);
 		if (!old) throw new MergeFailure("TEAM_BASE_UNRESOLVED", `The base ${base} is gone`);
 		if (await git.isAncestor(head, old)) {
+			await assertTipStill(git, branch, head);
 			await landed(context, { item, head, base, title, branch }, null, old, {
 				alreadyInBase: true,
 			});
@@ -872,11 +974,14 @@ async function runMerge(context: JobContext, signal: AbortSignal): Promise<void>
 		// The last safe point: past it the base may move, and the merge is recorded whatever the
 		// deadline says.
 		signal.throwIfAborted();
+		await assertTipStill(git, branch, head);
 		const moved = await git.fastForwardBase(mergeCommit, base);
 		if (moved.outcome === "updated") {
 			const now = await git.resolve(`refs/heads/${base}`);
 			if (now !== mergeCommit && !(now && (await git.isAncestor(mergeCommit, now))))
 				throw new MergeFailure("TEAM_MERGE_BASE_MOVED", `${base} did not take the merge`);
+			// The base holds the head now; a commit made since is not in it: never closed.
+			await assertTipStill(git, branch, head);
 			await landed(context, { item, head, base, title, branch }, mergeCommit, mergeCommit, {});
 			await git.deletePrivateRef(item.id, mergeCommit);
 			return;
@@ -922,6 +1027,7 @@ async function runFastForward(context: JobContext, signal: AbortSignal): Promise
 	const now = await git.resolve(`refs/heads/${base}`);
 	// The person ran the command (or merged) already: nothing left to fast-forward.
 	if (now && (now === outcome.mergeCommit || (await git.isAncestor(outcome.mergeCommit, now)))) {
+		await assertTipStill(git, branch, head);
 		await landed(
 			context,
 			{ item, head, base, title: item.title, branch },
@@ -951,13 +1057,14 @@ async function runFastForward(context: JobContext, signal: AbortSignal): Promise
 					{ blocker },
 				);
 			const activity = await checkoutActivity(dir, { backgroundTasks: true });
-			if (activity.running > 0)
+			if (activity.running > 0 || activity.incomplete)
 				throw new MergeFailure(
 					"TEAM_MERGE_CHECKOUT_BUSY",
 					`${activity.running} session(s) or background task(s) are running in ${dir}`,
 					{ blocker: "sessions_running", runningSessions: activity.running },
 				);
 			signal.throwIfAborted();
+			await assertTipStill(git, branch, head);
 			setPhase(context.itemId, "fast_forwarding");
 			return fastForwardCheckout(
 				dir,
@@ -974,6 +1081,10 @@ async function runFastForward(context: JobContext, signal: AbortSignal): Promise
 			"Git is busy in that checkout; retry after the current operation completes",
 		);
 	const result = locked.value;
+	if (!result.ok && result.kind === "unsafe")
+		throw new MergeFailure("TEAM_MERGE_CHECKOUT_BLOCKED", result.message, {
+			blocker: "local_config",
+		});
 	if (!result.ok)
 		throw result.kind === "moved"
 			? new MergeFailure("TEAM_MERGE_CHECKOUT_BLOCKED", result.message, {
@@ -991,6 +1102,7 @@ async function runFastForward(context: JobContext, signal: AbortSignal): Promise
 	const after = await git.resolve(`refs/heads/${base}`);
 	if (after !== outcome.mergeCommit)
 		throw new MergeFailure("TEAM_MERGE_BASE_MOVED", `${base} did not take the merge`);
+	await assertTipStill(git, branch, head);
 	await landed(
 		context,
 		{ item, head, base, title: item.title, branch },
