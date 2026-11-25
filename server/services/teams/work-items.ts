@@ -11,7 +11,9 @@
  * `team_work_events` row naming its person or agent. Each statement is a primary-key or index
  * lookup bounded by a LIMIT. The server only reads git in a worktree, through the hardened
  * `team-git.ts` (no hooks of any kind, fsmonitor, external diff, filter programs or index writes;
- * read bounds of `gitService`); a base sync is the worker's job.
+ * read bounds of `gitService`); a base sync is the worker's job. Merging a ready item back into
+ * its base, on a member's request, is `team-merge.ts`'s: it never touches a worktree, and while
+ * it runs the item refuses every change here (409 `TEAM_WORK_ITEM_MERGING`).
  *
  * SQLite only, like the rest of the team surface.
  */
@@ -30,6 +32,7 @@ import {
 	TEAM_EVENT_DETAIL_MAX_BYTES,
 	TEAM_EXCLUSIVE_LOCK_KEY,
 	TEAM_ISOLATED_WORK_KIND,
+	TEAM_MERGE_NOTE_SOURCE,
 	TEAM_RETURN_REASON_MAX_LENGTH,
 	TEAM_RETURNABLE_STATES,
 	TEAM_REVIEW_SUMMARY_MAX_LENGTH,
@@ -40,6 +43,7 @@ import {
 	type TeamEventKind,
 	type TeamOverlapEventKind,
 	type TeamReviewVerdict,
+	type TeamSettings,
 	type TeamWorkDependencyRef,
 	type TeamWorkDiffStat,
 	type TeamWorkEventKind,
@@ -67,6 +71,7 @@ import {
 import type { NarratorPrincipal } from "../narrator-acl";
 import { type BranchNumstat, teamGit } from "./team-git";
 import { assertKnowledgeFresh } from "./team-knowledge";
+import { assertNotMerging } from "./team-merge-guard";
 import {
 	describeHolderFor,
 	exclusiveHits,
@@ -76,14 +81,16 @@ import {
 	readChangedPaths,
 	storeChangedPaths,
 } from "./team-overlap";
+import { assertStartNotReplaced, compareRefFor, workStartPoint } from "./team-work-start";
 import {
 	assertWorkItemStartable,
 	checkDependencies,
+	confirmUnblocks,
 	deliverUnblockedNotes,
 	normalizeDependencyIds,
 	readDependencies,
-	recordUnblocked,
-	type UnblockedItem,
+	type UnblockCandidate,
+	unblockCandidates,
 	writeDependencies,
 } from "./work-item-dependencies";
 
@@ -217,6 +224,7 @@ interface TeamRecord {
 	baseBranch: string;
 	status: string;
 	brief: string;
+	settings: TeamSettings | null;
 }
 
 /** The team a coordinator leads, or a 404-style error for any other session. */
@@ -229,6 +237,7 @@ export function requireCoordinatedTeam(coordinatorId: string): TeamRecord {
 			baseBranch: projectTeams.baseBranch,
 			status: projectTeams.status,
 			brief: projectTeams.brief,
+			settings: projectTeams.settingsJson,
 		})
 		.from(projectTeams)
 		.where(eq(projectTeams.narratorId, coordinatorId))
@@ -518,13 +527,21 @@ export async function createWorkItem(input: CreateWorkItemInput): Promise<WorkIt
 	if (dependsOn.length > 0 && kind === TEAM_ISOLATED_WORK_KIND)
 		throw new ValidationError("An isolated work item starts at once; it cannot wait for others");
 	checkDependencies(db, team.teamId, null, team.baseBranch, dependsOn);
+	// W: from origin/<base> (fetched into the remote-tracking ref only) or the local base.
+	const start = await workStartPoint({
+		projectId: team.projectId,
+		baseBranch: team.baseBranch,
+		settings: team.settings,
+	});
+	await assertStartNotReplaced(team.projectId, start);
 	const port = await ports();
 	const created = await port.createWorktree({
 		coordinatorId: team.teamId,
 		principal: input.principal,
 		requestId: `team-${id}`,
 		branchName,
-		baseRef: team.baseBranch,
+		// The fetched commit itself: a remote-tracking ref would also set the branch's upstream.
+		baseRef: start.commit ?? team.baseBranch,
 		signal: input.signal,
 	});
 	const resource = db
@@ -576,6 +593,8 @@ export async function createWorkItem(input: CreateWorkItemInput): Promise<WorkIt
 				kind,
 				branch: branchName,
 				baseRef: team.baseBranch,
+				startFrom: start.label,
+				...(start.fetched === false ? { fetched: false } : {}),
 				worktree: created.path,
 				head,
 			},
@@ -770,6 +789,7 @@ export async function recordReview(
 	const item = requireWorkItem(team.teamId, input.itemId);
 	requireLive(item);
 	requireStarted(item, "review");
+	assertNotMerging(item.id);
 	if (!Number.isSafeInteger(input.findings) || input.findings < 0)
 		throw new ValidationError("findings must be a non-negative integer");
 	const summary = input.summary?.trim() || null;
@@ -783,6 +803,8 @@ export async function recordReview(
 				.resolveCommit("HEAD")
 				.catch(() => null)
 		: null;
+	// A merge may have taken the item while HEAD was read.
+	assertNotMerging(item.id);
 	const round = item.reviewRounds + 1;
 	const now = new Date().toISOString();
 	const state: TeamWorkItemState = input.verdict === "blocker" ? "in_progress" : "in_review";
@@ -851,6 +873,7 @@ export async function markReady(input: {
 	const item = requireWorkItem(team.teamId, input.itemId);
 	requireLive(item);
 	requireStarted(item, "ready");
+	assertNotMerging(item.id);
 	if (item.lastReview !== "clear")
 		throw new AppError(
 			item.reviewRounds === 0
@@ -876,15 +899,20 @@ export async function markReady(input: {
 			409,
 			"TEAM_WORK_ITEM_HEAD_UNAVAILABLE",
 		);
+	// W: an item that started from origin/<base> is compared with it, not with a local base that
+	// may be behind.
+	const compareRef = await compareRefFor(item.id, item.baseRef ?? team.baseBranch, (ref) =>
+		git.resolveCommit(ref),
+	);
 	await assertKnowledgeFresh({
 		itemId: item.id,
 		worktree: path,
 		head,
-		baseRef: item.baseRef ?? team.baseBranch,
+		baseRef: compareRef,
 	});
 	const reviewed = lastReviewedHead(item.id);
 	// Commits made after the review, not counting what a base sync brought in from the base.
-	const baseSha = await git.resolveCommit(item.baseRef ?? team.baseBranch).catch(() => null);
+	const baseSha = await git.resolveCommit(compareRef).catch(() => null);
 	let commitsSinceReview: number | null = null;
 	if (reviewed && head !== reviewed)
 		commitsSinceReview = await git
@@ -894,9 +922,7 @@ export async function markReady(input: {
 	// X: the paths this item changed at the pinned head, and the project's exclusive lock when
 	// they touch it. Paths read at any other commit count as unreadable.
 	const globs = projectExclusivePaths(team.projectId);
-	const read = await readChangedPaths(path, item.baseRef ?? team.baseBranch, head).catch(
-		() => null,
-	);
+	const read = await readChangedPaths(path, compareRef, head).catch(() => null);
 	const changed = read?.head === head ? read : null;
 	if (!changed && globs.length > 0)
 		throw new AppError(
@@ -923,6 +949,8 @@ export async function markReady(input: {
 			409,
 			"TEAM_WORK_ITEM_HEAD_MOVED",
 		);
+	// A merge may have taken the item during the reads above.
+	assertNotMerging(item.id);
 	const now = new Date().toISOString();
 	try {
 		db.transaction((tx) => {
@@ -1063,6 +1091,7 @@ export async function returnWorkItem(input: {
 	const team = requireActiveTeam(input.teamId);
 	const item = requireWorkItem(team.teamId, input.itemId);
 	requireLive(item);
+	assertNotMerging(item.id);
 	const reason = input.reason.trim().slice(0, TEAM_RETURN_REASON_MAX_LENGTH);
 	if (!reason) throw new ValidationError("A reason is required to return a work item");
 	if (!TEAM_RETURNABLE_STATES.includes(item.state))
@@ -1145,6 +1174,7 @@ export function cancelWorkItem(input: {
 	const team = requireActiveTeam(input.coordinatorId);
 	const item = requireWorkItem(team.teamId, input.itemId);
 	requireLive(item);
+	assertNotMerging(item.id);
 	const now = new Date().toISOString();
 	db.transaction((tx) => {
 		updateItem(tx, item, { state: "cancelled" }, now);
@@ -1216,9 +1246,57 @@ export function markMergedByAncestry(input: {
 	expectedHeadSha: string | null;
 	expectedUpdatedAt: string;
 }): boolean {
+	return markMerged({
+		...input,
+		actor: { kind: "system", id: null },
+		detail: { detectedBy: "ancestry" },
+	});
+}
+
+/**
+ * A member's local merge moved the base (M, `team-merge.ts`): the base now holds `mergeCommit`
+ * (or the head itself, already inside it). Recorded as `work.merged` with `detectedBy:
+ * "local_merge"` and the person as actor, under the same in-transaction check as the ancestry
+ * pass. False when the item changed meanwhile.
+ */
+export function markMergedByLocalMerge(input: {
+	itemId: string;
+	head: string;
+	base: string;
+	mergeCommit: string | null;
+	expectedUpdatedAt: string;
+	actor: WorkActor;
+	/** Extra facts for the event (how the base moved, where). */
+	detail?: Record<string, unknown>;
+}): boolean {
+	return markMerged({
+		itemId: input.itemId,
+		head: input.head,
+		base: input.base,
+		expectedHeadSha: input.head,
+		expectedUpdatedAt: input.expectedUpdatedAt,
+		actor: input.actor,
+		detail: { detectedBy: "local_merge", mergeCommit: input.mergeCommit, ...(input.detail ?? {}) },
+	});
+}
+
+/**
+ * The one writer of `merged`: in one transaction re-check the item (ready, same head, same
+ * `updated_at`, team active), move it, record `work.merged`, and (D) record which queued items it
+ * unblocked; their notes are delivered after the transaction.
+ */
+function markMerged(input: {
+	itemId: string;
+	head: string;
+	base: string;
+	expectedHeadSha: string | null;
+	expectedUpdatedAt: string;
+	actor: WorkActor;
+	detail: Record<string, unknown> & { detectedBy: string };
+}): boolean {
 	const now = new Date().toISOString();
 	let merged = false;
-	let unblocked: UnblockedItem[] = [];
+	let candidates: UnblockCandidate[] = [];
 	let changedTeamId: string | null = null;
 	try {
 		db.transaction((tx) => {
@@ -1254,12 +1332,12 @@ export function markMergedByAncestry(input: {
 				teamId: item.teamId,
 				workItemId: item.id,
 				kind: "work.merged",
-				actor: { kind: "system", id: null },
-				detail: { head: input.head, base: input.base, detectedBy: "ancestry", from: item.state },
+				actor: input.actor,
+				detail: { head: input.head, base: input.base, ...input.detail, from: item.state },
 				at: now,
 			});
 			// D: the queued items that waited for this one and now wait for nothing.
-			unblocked = recordUnblocked(tx, item.id, now);
+			candidates = unblockCandidates(tx, item.id);
 		});
 	} catch (error) {
 		if (error instanceof AppError && error.code === "TEAM_WORK_ITEM_CHANGED") return false;
@@ -1267,12 +1345,69 @@ export function markMergedByAncestry(input: {
 	}
 	if (changedTeamId) eventBus.emit({ type: "team:communication_changed", teamId: changedTeamId });
 	if (merged)
-		logger.info("Team work item merged (its head is in the base)", { workItemId: input.itemId });
-	if (unblocked.length > 0)
-		void trackTeamLifecycleWork(deliverUnblockedNotes(unblocked)).catch((error) =>
-			logger.warn("Team unblock notes failed", { error: String(error) }),
+		logger.info("Team work item merged", {
+			workItemId: input.itemId,
+			detectedBy: input.detail.detectedBy,
+		});
+	// D: confirmed (git: the dependency inside each dependent's start ref) after the transaction.
+	if (candidates.length > 0)
+		void trackTeamLifecycleWork(
+			confirmUnblocks(candidates)
+				.then(deliverUnblockedNotes)
+				.catch((error) => {
+					logger.warn("Team unblock notes failed", { error: String(error) });
+					return 0;
+				}),
 		);
 	return merged;
+}
+
+/** How the coordinator hears that a merge landed or needs its worker (one `sys` row). */
+export type MergeNoteDelivery = (input: {
+	teamId: string;
+	text: string;
+	userId: string | null;
+}) => Promise<boolean>;
+
+let mergeDeliveryOverride: MergeNoteDelivery | null = null;
+
+/** Replace the merge note's delivery (tests). Null restores production. */
+export function setMergeNoteDeliveryForTests(next: MergeNoteDelivery | null): void {
+	mergeDeliveryOverride = next;
+}
+
+/**
+ * Tell the coordinator about a merge outcome (merged, or a blocker its worker must fix), woken
+ * when idle like a return note. Best effort: a failed delivery is logged, the outcome stands.
+ */
+export async function deliverMergeNote(input: {
+	teamId: string;
+	text: string;
+	userId: string | null;
+}): Promise<boolean> {
+	const deliver: MergeNoteDelivery =
+		mergeDeliveryOverride ??
+		(async ({ teamId, text, userId }) => {
+			const { deliverInjection } = await import("../narrator-injection");
+			const written = await deliverInjection(teamId, {
+				content: text,
+				source: TEAM_MERGE_NOTE_SOURCE,
+				body: { kind: "prose", text },
+				schedule: "wakeIfIdle",
+				createdBy: userId,
+				executionPrincipal: { version: 1, userId },
+			});
+			return written.messageId !== null;
+		});
+	return trackTeamLifecycleWork(
+		deliver(input).catch((error) => {
+			logger.warn("Team merge note was not delivered", {
+				teamId: input.teamId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return false;
+		}),
+	);
 }
 
 // ── Base sync ───────────────────────────────────────────────────────────────
@@ -1363,16 +1498,27 @@ export async function syncWorkItem(input: {
 	const team = requireActiveTeam(input.coordinatorId);
 	const item = requireWorkItem(team.teamId, input.itemId);
 	requireLive(item);
+	assertNotMerging(item.id);
 	const git = teamGit(requireWorktree(item));
-	const baseRef = item.baseRef ?? team.baseBranch;
-	const baseSha = await git.resolveCommit(baseRef);
+	// W: the team's work start decides what a sync brings in: origin/<base> (fetched into the
+	// remote-tracking ref first) or the local base.
+	const start = await workStartPoint({
+		projectId: team.projectId,
+		baseBranch: item.baseRef ?? team.baseBranch,
+		settings: team.settings,
+	});
+	const baseRef = start.label;
+	const baseSha = start.commit ?? (await git.resolveCommit(start.ref));
 	if (!baseSha)
 		throw new AppError(`The base ${baseRef} does not name a commit`, 409, "TEAM_BASE_UNRESOLVED");
 	const head = await git.resolveCommit("HEAD");
 	if (!head)
 		throw new AppError("The work item's branch has no commit", 409, "TEAM_HEAD_UNRESOLVED");
 	let result: SyncOutcome;
-	if (await git.isAncestor(baseSha, head)) result = { outcome: "up_to_date", baseSha, head };
+	const upToDate = await git.isAncestor(baseSha, head);
+	// A merge may have taken the item during the reads above: nothing is handed to the worker.
+	assertNotMerging(item.id);
+	if (upToDate) result = { outcome: "up_to_date", baseSha, head };
 	else {
 		const instruction = syncInstruction({
 			itemId: item.id,
@@ -1404,6 +1550,7 @@ export async function syncWorkItem(input: {
 			reason: result.outcome === "handed_off" ? "handed_off" : null,
 			baseRef,
 			baseSha,
+			...(start.fetched === false ? { fetched: false } : {}),
 			head,
 			...(result.outcome === "handed_off"
 				? { worker: result.worker, delivered: result.delivered, delivery: result.delivery }
@@ -1630,7 +1777,11 @@ async function settleItem(
 		const path = worktreePathOf(item);
 		if (!path) return "none";
 		const git = teamGit(path);
-		const baseSha = await git.resolveCommit(item.baseRef ?? "HEAD");
+		const baseSha = await git.resolveCommit(
+			item.baseRef
+				? await compareRefFor(item.id, item.baseRef, (ref) => git.resolveCommit(ref))
+				: "HEAD",
+		);
 		if (signal.aborted) return "kept";
 		const head = await git.resolveCommit("HEAD");
 		if (signal.aborted || !baseSha || !head) return "kept";

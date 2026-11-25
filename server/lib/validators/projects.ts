@@ -1,7 +1,9 @@
+import { teamBaseBranchSchema } from "@shared/project-team-draft";
 import {
 	TEAM_EXCLUSIVE_PATH_MAX_LENGTH,
 	TEAM_EXCLUSIVE_PATHS_MAX,
 	TEAM_EXCLUSIVE_PATHS_MAX_BYTES,
+	TEAM_WORK_START_MODES,
 } from "@shared/project-teams";
 import { z } from "zod";
 import {
@@ -66,6 +68,8 @@ const exclusivePathGlobSchema = z
 export const teamProjectSettingsSchema = z
 	.object({
 		exclusivePaths: z.array(exclusivePathGlobSchema).max(TEAM_EXCLUSIVE_PATHS_MAX).optional(),
+		/** The default work start of the project's teams (`TeamProjectSettings.workStart`). */
+		workStart: z.enum(TEAM_WORK_START_MODES).optional(),
 	})
 	.strict()
 	.refine(
@@ -98,7 +102,8 @@ export const updateProjectSchema = z.object({
 	description: z.string().max(2000).optional(),
 	gitPath: z.string().trim().min(1).max(4096).optional(),
 	status: z.enum(["active", "archived"]).optional(),
-	defaultBranch: gitBranchName.optional(),
+	/** New teams' base branch: the same rules as a team's own (`teamBaseBranchSchema`). */
+	defaultBranch: teamBaseBranchSchema.optional(),
 	chapterSettings: projectChapterSettingsSchema.optional(),
 });
 

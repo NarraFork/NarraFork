@@ -45,7 +45,7 @@ keywords:
   - X-Next-Cursor
   - 章节
 status: draft
-verified_at: 0c7feefbf036126fba2e273856e5f7095c54d25b
+verified_at: 3586b5dd803f5035f610fc36d2c7d0245a2cd8e9
 ---
 # 项目
 
@@ -64,6 +64,7 @@ verified_at: 0c7feefbf036126fba2e273856e5f7095c54d25b
 - 成员变更（设置成员、移除、转让 owner、可见性）只有 owner/admin/manage 能做，且有审计与通知（`project-membership.ts`）。项目页页头只读成员人数（`countProjectMembers`，不带名单），见[项目页](project-pages.md)。
 - 失去项目后清侧栏标签：被移出的成员、以及可见性收紧为 private 时持有项目内标签的人（`usersWithTabsInProject`：项目标签、项目内会话的标签、项目团队的团队标签，各有上限 500）逐个过 `pruneUnreadableProjectTabs`（见[最近标签页](recent-tabs.md)）。
 - 路由层：项目不可见与不存在都返回 NotFound，防止探测；`GET /api/projects/hidden-existence` 只返回是否存在不可见项目（`limit 1` 的有界探测，不泄露名称、id 或数量）；修改设置要 manage。
+- 项目设置里给团队用的两项（`validators/projects.ts:updateProjectSchema`，manage）：`defaultBranch`（`teamBaseBranchSchema`，与团队基线分支同一规则；新团队的基线，不在这里检查能否解析）与 `chapterSettings.teams`（`teamProjectSettingsSchema`：`exclusivePaths` 与 `workStart` = `remote` / `local`，新工作项起点的项目默认；`chapterSettings` 按顶层键浅合并，`teams` 整个替换）。见[合并工作项与基线配置](teams/merge.md)。
 - 列表 `GET /api/projects`：按 `updatedAt` 降序，返回裸数组；不带 `limit`/`cursor` 时返回调用者可读的全部项目（`collectAllPages` 逐页有界地走，单页 200，总量上限 2000）；带 `limit`/`cursor` 才是单页，续页游标在响应头 `X-Next-Cursor`，被截断时 `X-Read-Truncated: 1`（`routes/projects.ts`、`services/read/`）。读取经 `projectReadAdapter()`：默认 SQLite 适配器，PG 模式必须显式注入 PG 适配器，不会静默回落。
 - PG 模式下创建、更新、删除、改可见性、成员变更、转让 owner 一律返回 503 `POSTGRES_UNSUPPORTED`（`requireSqliteProjectMutation`，在权限检查之前）；读取仍可用。
 - 会话之外问"这个目录属于哪个项目"：`POST /api/projects/resolve-directory { cwd, create }`（`routes/projects.ts`，校验 `validators/projects.ts:resolveProjectDirectorySchema`，响应形状 `shared/project-directory.ts`），新建会话弹窗的「以团队开始」用它（见[团队与成员](teams/records.md)）。

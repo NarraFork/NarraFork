@@ -10,8 +10,9 @@
  * 「被依赖」. Read-only: only the coordinator changes dependencies.
  *
  * 退回 expands in place into a required one-line reason: the item goes back to in progress and
- * the coordinator relays the reason to the worker. The server never merges, so 合并 is disabled
- * and the bar says how an item becomes merged (its branch landing in the base is noticed).
+ * the coordinator relays the reason to the worker. 合并到 <base> (M, `TeamMerge.tsx`) starts a
+ * background merge for a ready item: it lands in the base, or is prepared for a person to
+ * fast-forward where the base is checked out, or lists its conflicts with 退回 prefilled.
  */
 import { useReturnWorkItem, useTeamWorkDiff, useTeamWorkItem } from "@frontend/hooks/useTeams";
 import { describeApiError } from "@frontend/lib/api-error";
@@ -31,7 +32,6 @@ import {
 	Text,
 	Textarea,
 	Title,
-	Tooltip,
 	UnstyledButton,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
@@ -49,13 +49,14 @@ import {
 	IconChevronRight,
 	IconExternalLink,
 	IconGitBranch,
-	IconGitMerge,
 	IconX,
 } from "@tabler/icons-react";
 import { type ReactNode, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ActivityLine } from "./TeamActivity";
+import { MergeButton, MergeOutcome } from "./TeamMerge";
 import {
+	conflictReasonFiles,
 	diffLineKind,
 	findingsNeedToggle,
 	itemMarks,
@@ -598,7 +599,10 @@ function DrawerBody({
 	);
 }
 
-/** The fixed bottom bar: 退回 / 合并; 退回 opens the reason in place. */
+/**
+ * The fixed bottom bar: 退回 / 合并; 退回 opens the reason in place (prefilled with the conflicting
+ * files after a merge conflicted). A ready item's merge outcome shows above the buttons.
+ */
 function ReturnBar({
 	projectId,
 	teamId,
@@ -623,6 +627,21 @@ function ReturnBar({
 	};
 	const ready = returnReason(reason);
 	const base = detail.base;
+	const merge = detail.merge;
+	const conflict =
+		merge?.detail?.kind === "failed" && merge.detail.code === "conflict" ? merge.detail : null;
+	// After a conflict, 退回 starts from the conflicting files (the person may edit it).
+	useEffect(() => {
+		if (!returning || !conflict) return;
+		setReason((current) => {
+			if (current.trim()) return current;
+			const { files, more } = conflictReasonFiles(conflict.conflicts, conflict.more);
+			return t(more ? "teams.page.merge.conflictReasonMore" : "teams.page.merge.conflictReason", {
+				base,
+				files,
+			});
+		});
+	}, [returning, conflict, base, t]);
 	const submit = () => {
 		if (!ready) return;
 		send.mutate(
@@ -695,37 +714,44 @@ function ReturnBar({
 			</Stack>
 		);
 	return (
-		<Group justify="space-between" wrap="wrap" gap="sm" style={{ rowGap: 6 }}>
-			<Text size="xs" c="dimmed" style={{ minWidth: 0, flex: "1 1 220px" }}>
-				{t("teams.page.drawer.barNote", { base })}
-			</Text>
-			<Group gap="xs" wrap="nowrap" style={{ flexShrink: 0 }}>
-				<Button
-					variant="default"
-					leftSection={<IconArrowBackUp size={16} aria-hidden />}
-					onClick={() => setReturning(true)}
-					data-testid="team-drawer-return"
-				>
-					{t("teams.page.drawer.return")}
-				</Button>
-				<Tooltip
-					label={t("teams.page.attention.mergeDisabled", { base })}
-					withinPortal
-					multiline
-					maw={300}
-				>
-					<span>
-						<Button
-							disabled
-							leftSection={<IconGitMerge size={16} aria-hidden />}
-							data-testid="team-drawer-merge"
-						>
-							{t("teams.page.drawer.merge", { base })}
-						</Button>
-					</span>
-				</Tooltip>
+		<Stack gap="xs">
+			{merge && (
+				<MergeOutcome
+					projectId={projectId}
+					teamId={teamId}
+					itemId={detail.item.id}
+					base={base}
+					merge={merge}
+					canReturn={detail.canReturn}
+					onReturn={() => setReturning(true)}
+				/>
+			)}
+			<Group justify="space-between" wrap="wrap" gap="sm" style={{ rowGap: 6 }}>
+				<Text size="xs" c="dimmed" style={{ minWidth: 0, flex: "1 1 220px" }}>
+					{t(merge ? "teams.page.merge.barNote" : "teams.page.drawer.barNote", { base })}
+				</Text>
+				<Group gap="xs" wrap="nowrap" align="flex-start" style={{ flexShrink: 0 }}>
+					<Button
+						variant="default"
+						leftSection={<IconArrowBackUp size={16} aria-hidden />}
+						onClick={() => setReturning(true)}
+						disabled={!!merge?.phase}
+						data-testid="team-drawer-return"
+					>
+						{t("teams.page.drawer.return")}
+					</Button>
+					{merge && (
+						<MergeButton
+							projectId={projectId}
+							teamId={teamId}
+							itemId={detail.item.id}
+							merge={merge}
+							base={base}
+						/>
+					)}
+				</Group>
 			</Group>
-		</Group>
+		</Stack>
 	);
 }
 

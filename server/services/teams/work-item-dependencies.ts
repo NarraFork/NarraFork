@@ -14,9 +14,12 @@
  *   `TEAM_WORK_DEPENDENCY_BASE_MISMATCH`): items pin the team's base when created and the team's
  *   base can change, while `work.sync` only brings the item's own base in. A dependency on another
  *   base (rows from before this check) never counts as merged, with its own blocker reason.
- * - When an item merges (`markMergedByAncestry`, the only writer of `merged`), each queued
- *   dependent whose dependencies are now all merged gets one `work.unblocked` event in the same
- *   transaction; the coordinator is then told 「「X」现在可以开始了」 (woken when idle, like
+ * - Merged is necessary, not sufficient: a dependency counts only once its head is inside the ref
+ *   the dependent's work starts from (`origin/<base>` or the local base, `unreachedDependencies`):
+ *   the `Agent` tool refuses the start otherwise, naming where it merged.
+ * - When an item merges (`markMerged`, the only writer of `merged`), each queued dependent whose
+ *   dependencies are now all merged is a candidate (same transaction); after it, once git shows
+ *   them inside its start ref, it gets one `work.unblocked` event and the coordinator is told 「「X」现在可以开始了」 (woken when idle, like
  *   `team_return`). Nothing starts automatically: nothing in a team does.
  *
  * Every statement is a primary-key or index range with a LIMIT: `(item_id, depends_on_item_id)`
@@ -32,12 +35,19 @@ import {
 	type TeamWorkDependencyRef,
 	type TeamWorkItemState,
 } from "@shared/project-teams";
-import { and, asc, eq, inArray, isNull } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull } from "drizzle-orm";
 import { aliasedTable } from "drizzle-orm/alias";
 import { db } from "../../db";
-import { projectTeams, teamWorkItemDependencies, teamWorkItems } from "../../db/schema";
+import {
+	projectTeams,
+	teamWorkEvents,
+	teamWorkItemDependencies,
+	teamWorkItems,
+} from "../../db/schema";
 import { AppError, ValidationError } from "../../lib/errors";
 import { logger } from "../../lib/logger";
+import { teamRepoGit } from "./team-git-write";
+import { projectStartFacts, startRefFor } from "./team-work-start";
 import { recordWorkEvent, type WorkActor } from "./work-items";
 
 type Executor = Pick<typeof db, "select" | "insert" | "delete">;
@@ -186,6 +196,100 @@ export function assertWorkItemStartable(
 		"TEAM_WORK_ITEM_BLOCKED",
 		undefined,
 		{ blockers },
+	);
+}
+
+// ── Merged where this item's work starts ────────────────────────────────────
+
+/** Merged dependencies whose head the dependent's start ref does not hold yet. */
+export interface UnreachedDependencies {
+	/** What the dependent's work starts from (`origin/main`, `main`). */
+	label: string;
+	missing: TeamWorkDependencyRef[];
+}
+
+type ReachCheck = (dependentId: string) => Promise<UnreachedDependencies>;
+let reachOverride: ReachCheck | null = null;
+
+/** Replace the git check of {@link unreachedDependencies} (tests); null restores git. */
+export function setDependencyReachForTests(next: ReachCheck | null): void {
+	reachOverride = next;
+}
+
+/**
+ * The merged dependencies of an item that are NOT inside the ref its work starts from: merged is
+ * not enough when the dependency landed in the local base but the dependent starts from
+ * `origin/<base>` (or the other way round) — its sync would never bring the dependency in. Git
+ * runs here (a resolve and one `merge-base --is-ancestor` per dependency, at most
+ * {@link TEAM_WORK_DEPENDENCIES_MAX}, each with `team-git-write.ts`'s timeout), never inside a
+ * transaction. A dependency without a recorded head, or a start ref that does not resolve,
+ * counts as not inside.
+ */
+export async function unreachedDependencies(itemId: string): Promise<UnreachedDependencies> {
+	const merged = (readDependencies([itemId]).get(itemId) ?? []).filter((dependency) =>
+		dependencyResolved(dependency),
+	);
+	if (merged.length === 0) return { label: "", missing: [] };
+	if (reachOverride) return reachOverride(itemId);
+	const item = db
+		.select({
+			projectId: teamWorkItems.projectId,
+			baseRef: teamWorkItems.baseRef,
+			teamBase: projectTeams.baseBranch,
+			settings: projectTeams.settingsJson,
+		})
+		.from(teamWorkItems)
+		.innerJoin(projectTeams, eq(projectTeams.narratorId, teamWorkItems.teamId))
+		.where(eq(teamWorkItems.id, itemId))
+		.limit(1)
+		.get();
+	if (!item) return { label: "", missing: [] };
+	const start = await startRefFor({
+		projectId: item.projectId,
+		baseBranch: item.baseRef ?? item.teamBase,
+		settings: item.settings,
+	});
+	const heads = new Map(
+		db
+			.select({ id: teamWorkItems.id, head: teamWorkItems.headSha })
+			.from(teamWorkItems)
+			.where(
+				inArray(
+					teamWorkItems.id,
+					merged.map((dependency) => dependency.id),
+				),
+			)
+			.limit(TEAM_WORK_DEPENDENCIES_MAX)
+			.all()
+			.map((row) => [row.id, row.head]),
+	);
+	const { repo } = projectStartFacts(item.projectId);
+	const git = repo ? teamRepoGit(repo) : null;
+	const target = git ? await git.resolve(start.ref).catch(() => null) : null;
+	const missing: TeamWorkDependencyRef[] = [];
+	for (const dependency of merged) {
+		const head = heads.get(dependency.id);
+		const inside =
+			git && target && head ? await git.isAncestor(head, target).catch(() => false) : false;
+		if (!inside) missing.push(dependency);
+	}
+	return { label: start.label, missing };
+}
+
+/**
+ * Refuse to start an item while a merged dependency is not inside the ref its work starts from
+ * (409 `TEAM_WORK_ITEM_BLOCKED`, `details.blockers` with `notInStart`). Async (git); the `Agent`
+ * tool checks it before creating the worker, next to {@link assertWorkItemStartable}.
+ */
+export async function assertDependenciesReachStart(itemId: string): Promise<void> {
+	const { label, missing } = await unreachedDependencies(itemId);
+	if (missing.length === 0) return;
+	throw new AppError(
+		`Work item ${itemId} cannot start yet: ${quoted(missing)} merged, but not into ${label}, where this item's work starts, so work.sync would not bring it in. Get it into ${label} first (push or fetch the base), or change where the team's work starts. Nothing was started.`,
+		409,
+		"TEAM_WORK_ITEM_BLOCKED",
+		undefined,
+		{ blockers: missing.map((dependency) => ({ ...dependency, notInStart: label })) },
 	);
 }
 
@@ -411,12 +515,17 @@ export interface UnblockedItem {
 	dependsOn: string[];
 }
 
+/** A queued dependent whose dependencies all merged, to be confirmed after the transaction. */
+export interface UnblockCandidate extends UnblockedItem {
+	mergedItem: string;
+}
+
 /**
- * Inside the transaction that marked `mergedItemId` merged: every queued dependent whose
- * dependencies are now all merged gets one `work.unblocked` event. `merged` is written once and
- * never undone, so each unblock is recorded exactly once.
+ * Inside the transaction that marked `mergedItemId` merged: the queued dependents whose
+ * dependencies are now all merged (no git here). {@link confirmUnblocks} records them after the
+ * transaction, once their dependencies are inside the ref their work starts from.
  */
-export function recordUnblocked(tx: Executor, mergedItemId: string, at: string): UnblockedItem[] {
+export function unblockCandidates(tx: Executor, mergedItemId: string): UnblockCandidate[] {
 	const dependents = tx
 		.select({
 			id: teamWorkItems.id,
@@ -442,29 +551,130 @@ export function recordUnblocked(tx: Executor, mergedItemId: string, at: string):
 		dependents.map((row) => row.id),
 		tx,
 	);
-	const unblocked: UnblockedItem[] = [];
+	const candidates: UnblockCandidate[] = [];
 	for (const row of dependents) {
 		const dependsOn = all.get(row.id) ?? [];
 		// A dependency on another base never resolves: its dependent is not unblocked by it.
 		if (!dependsOn.every((dependency) => dependencyResolved(dependency))) continue;
-		const ids = dependsOn.map((dependency) => dependency.id);
-		recordWorkEvent(tx, {
-			teamId: row.teamId,
-			workItemId: row.id,
-			kind: "work.unblocked",
-			actor: { kind: "system", id: null },
-			detail: { mergedItem: mergedItemId, dependsOn: ids },
-			at,
-		});
-		unblocked.push({
-			id: row.id,
-			teamId: row.teamId,
-			title: row.title,
-			createdBy: row.createdBy,
-			dependsOn: ids,
+		candidates.push({
+			...row,
+			dependsOn: dependsOn.map((dependency) => dependency.id),
+			mergedItem: mergedItemId,
 		});
 	}
-	return unblocked;
+	return candidates;
+}
+
+/**
+ * After the merge transaction: each candidate whose merged dependencies are all inside the ref
+ * its work starts from (git, outside any transaction) gets one `work.unblocked` event — recorded
+ * in a short transaction that re-reads it (still queued, no worker, no `work.unblocked` since its
+ * dependencies last changed), so two merges at once record it once. A candidate whose dependency
+ * merged elsewhere (the local base for an origin start, or origin only for a local start) is not
+ * unblocked; starting it names why.
+ */
+export async function confirmUnblocks(
+	candidates: readonly UnblockCandidate[],
+): Promise<UnblockedItem[]> {
+	const confirmed: UnblockedItem[] = [];
+	for (const candidate of candidates) {
+		const reach = await unreachedDependencies(candidate.id).catch((error) => {
+			logger.warn("Team unblock could not be checked", {
+				workItemId: candidate.id,
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return null;
+		});
+		if (!reach || reach.missing.length > 0) continue;
+		const at = new Date().toISOString();
+		const recorded = db.transaction((tx) => {
+			const row = tx
+				.select({ state: teamWorkItems.state, worker: teamWorkItems.workerNarratorId })
+				.from(teamWorkItems)
+				.where(eq(teamWorkItems.id, candidate.id))
+				.limit(1)
+				.get();
+			if (!row || row.state !== "queued" || row.worker) return false;
+			const latest = tx
+				.select({ kind: teamWorkEvents.kind })
+				.from(teamWorkEvents)
+				.where(
+					and(
+						eq(teamWorkEvents.workItemId, candidate.id),
+						inArray(teamWorkEvents.kind, ["work.unblocked", "work.dependencies_changed"]),
+					),
+				)
+				.orderBy(desc(teamWorkEvents.createdAt), desc(teamWorkEvents.id))
+				.limit(1)
+				.get();
+			if (latest?.kind === "work.unblocked") return false;
+			recordWorkEvent(tx, {
+				teamId: candidate.teamId,
+				workItemId: candidate.id,
+				kind: "work.unblocked",
+				actor: { kind: "system", id: null },
+				detail: { mergedItem: candidate.mergedItem, dependsOn: candidate.dependsOn },
+				at,
+			});
+			return true;
+		});
+		if (recorded) {
+			const { mergedItem: _merged, ...item } = candidate;
+			confirmed.push(item);
+		}
+	}
+	return confirmed;
+}
+
+/** Queued items one reconcile looks at. */
+const RECONCILE_SCAN_MAX = 200;
+
+/**
+ * Unblocks that a merge could not confirm then: a dependency merged into the local base while its
+ * dependent starts from `origin/<base>` (or the other way round) reaches the dependent's start ref
+ * only later, through a fetch. Called after a work-start fetch and by the periodic refresh: the
+ * queued, workerless items of a project (or of all projects) that have dependencies — an indexed
+ * read, at most {@link RECONCILE_SCAN_MAX} — whose dependencies are all merged go through
+ * {@link confirmUnblocks} (the same git check and the same once-only recording), and the
+ * coordinators of the newly unblocked ones are told. Returns how many were unblocked.
+ */
+export async function reconcileUnblocks(options: { projectId?: string } = {}): Promise<number> {
+	const rows = db
+		.selectDistinct({
+			id: teamWorkItems.id,
+			teamId: teamWorkItems.teamId,
+			title: teamWorkItems.title,
+			createdBy: teamWorkItems.createdBy,
+		})
+		.from(teamWorkItems)
+		.innerJoin(teamWorkItemDependencies, eq(teamWorkItemDependencies.itemId, teamWorkItems.id))
+		.where(
+			and(
+				eq(teamWorkItems.state, "queued"),
+				isNull(teamWorkItems.workerNarratorId),
+				...(options.projectId ? [eq(teamWorkItems.projectId, options.projectId)] : []),
+			),
+		)
+		.orderBy(asc(teamWorkItems.id))
+		.limit(RECONCILE_SCAN_MAX)
+		.all();
+	if (rows.length === 0) return 0;
+	const all = readDependencies(rows.map((row) => row.id));
+	const candidates: UnblockCandidate[] = [];
+	for (const row of rows) {
+		const dependsOn = all.get(row.id) ?? [];
+		if (dependsOn.length === 0 || !dependsOn.every((dependency) => dependencyResolved(dependency)))
+			continue;
+		candidates.push({
+			...row,
+			dependsOn: dependsOn.map((dependency) => dependency.id),
+			mergedItem: dependsOn.at(-1)?.id ?? "",
+		});
+	}
+	if (candidates.length === 0) return 0;
+	const unblocked = await confirmUnblocks(candidates);
+	await deliverUnblockedNotes(unblocked);
+	return unblocked.length;
 }
 
 /** How a coordinator hears that an item can start (one `sys` row, woken when idle). */

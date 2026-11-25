@@ -436,7 +436,11 @@ describe("who gets reminders, in which words", () => {
 			);
 			expect(output).toContain("is 5 lines per edit");
 		} finally {
-			await updateTeam(teamId, { userId: OWNER, isAdmin: false }, { settings: {} });
+			await updateTeam(
+				teamId,
+				{ userId: OWNER, isAdmin: false },
+				{ settings: { coordinatorLimits: null } },
+			);
 		}
 	});
 

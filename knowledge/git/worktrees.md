@@ -50,6 +50,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 工具：现用的是 `ListWorktrees`、`CreateWorktree`、`AttachWorktree`、`GetWorktreeOperation`；旧的 `Worktree` 工具 `isAvailable: () => false`。工具声明远程执行、删除和 prune 均不支持（`lib/agent/tools/worktree.ts`）。
 - 删除只有一条通道：`NarratorWorktreeService.remove` → `applyGuardedRemoval` 里的 `git worktree remove`，在整个 `server/` 非测试代码中没有其他调用点。先 `removal/plan` 预检，列出阻塞项（主工作区、已锁定、有容器或卷快照在用、依赖会话在运行、依赖无处迁移、依赖枚举无界等，错误码形如 `WORKTREE_REMOVAL_*`）。
 - 保护声明是 `narrators.cwd` / `workspace_context.cwd`，不是状态：归档的会话仍占着目录，所以移除时要把它们迁到别处（`relocate`）；终端先于所有者行关闭（`onDelete: restrict`），后台任务先取消并确认停止才动 git（`narrator-worktree-retirement.ts` 文件头）。
+- 会丢什么（`measureLoss`）：未提交文件按 git 默认读；游离 HEAD 上只有它能到达的提交（`countCommitsOnlyReachableFrom`，`rev-list <head> --not --branches --remotes --tags`）带 `TRUE_HISTORY_ENV` 算——替换引用或 graft 文件（仓库内容）声称某分支到达它时，仍算丢失、要求 force 确认。worktree 创建与状态查询不带它，保持人自己 git 看到的历史。
 - 删除执行前在保护预留里重新检查所有声明，重新被占用的目录会被拒绝而不是被删；一旦分发，客户端断开不会中断 git（用独立的超时信号）。重试是幂等的，已不存在的目录走 `already_absent`。
 - 既不在 git 列表、也没有登记过的路径，只有位于 `<仓库根>/.worktrees/` 下才能进入删除流程，否则 `WORKTREE_REMOVAL_UNKNOWN_PATH`（`narrator-worktree-service.ts` 约 1360–1380 行）。叙事线时代遗留在 `.worktrees/` 下的目录没有记录；任何自动清理逻辑都不应删除它们，状态/树快照也把 `.worktrees` 排除在外（`worktree-tree-snapshot.ts:WORKTREES_DIR_NAME`）。本节后半「不应自动清理」来自项目约定，代码里只确认了删除必须由显式请求触发。
 - 需要隔离的 git 命令都带加固配置，见 [外部进程加固](../security/hardening.md)；`hardenedConfig` 对除 `worktree add` 外的命令生效。

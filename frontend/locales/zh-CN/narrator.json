@@ -2503,6 +2503,7 @@
 			"team_disband": "团队已解散",
 			"team_return": "工作项被退回",
 			"team_unblocked": "工作项可以开始了",
+			"team_merge": "工作项合并",
 			"outline_team": "与本会话有关的任务事件",
 			"outline_task_brief": "开工说明",
 			"spec_import": "Dynamic Spec 已搬进大纲",

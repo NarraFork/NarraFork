@@ -629,10 +629,14 @@ test("the drawer opens from a card; 退回 needs a reason and sends the item bac
 		await call(page, (f, p: string, t: string) => f.openTeam(p, t), projectId, teamId);
 		const card = `[data-testid=team-attention-card][data-item-id="${readyId}"]`;
 		await until(page, "merge card", (f, c: string) => f.count(c) === 1, 10_000, card);
-		// The server never merges: 合并 is there, disabled.
+		// M: origin is not on GitHub here, so the local merge is offered.
 		expect(
-			await call(page, (f, c: string) => f.attr(`${c} [data-testid=team-merge]`, "disabled"), card),
-		).toBe("");
+			await call(
+				page,
+				(f, c: string) => f.attr(`${c} [data-testid=team-merge-button]`, "disabled"),
+				card,
+			),
+		).toBeNull();
 		await call(page, (f, c: string) => f.click(`${c} [data-testid=team-merge-view]`), card);
 		await until(
 			page,
@@ -643,7 +647,29 @@ test("the drawer opens from a card; 退回 needs a reason and sends the item bac
 		expect(await call(page, (f) => f.text("[data-testid=team-drawer-branch]"))).toBe(
 			"team/write-the-docs-9f9f",
 		);
-		expect(await call(page, (f) => f.attr("[data-testid=team-drawer-merge]", "disabled"))).toBe("");
+		// 合并 runs in the background; this seeded item has no recorded head, so the job refuses
+		// and the drawer says so.
+		await call(page, (f) =>
+			f.click("[data-testid=team-drawer-bar] [data-testid=team-merge-button]"),
+		);
+		await until(
+			page,
+			"merge refused",
+			(f) =>
+				f.attr("[data-testid=team-merge-failed]", "data-code") ===
+				"TEAM_WORK_ITEM_HEAD_UNAVAILABLE",
+			15_000,
+		);
+		// Refused, the button is there again for a later try.
+		await until(
+			page,
+			"merge again",
+			(f) =>
+				f.attr(
+					"[data-testid=team-drawer-bar] [data-testid=team-merge-button]",
+					"data-merge-label",
+				) === "merge",
+		);
 		// Each round shows its findings; the long one is clamped until 展开.
 		await until(page, "findings", (f) => f.count("[data-testid=team-review-findings]") === 2);
 		expect(await call(page, (f) => f.texts("[data-testid=team-review-findings] p"))).toEqual([

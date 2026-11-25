@@ -1,7 +1,9 @@
 /**
  * Every git command the team lifecycle runs inside a work item's worktree (P3). All read-only:
  * the server never merges, commits or checks out there — a base sync is handed to the item's
- * worker, whose own git calls go through the ordinary permissions.
+ * worker, whose own git calls go through the ordinary permissions. (A member's merge of a ready
+ * item into its base is computed in the object store by `team-git-write.ts`, never in a
+ * worktree.)
  *
  * The worktree is a directory agents write to without a person's approval, so its git
  * configuration is untrusted input: each command runs with the overrides of
@@ -19,21 +21,24 @@
  * a partial result. `work.ready` pins one head commit and passes it to every one of them.
  */
 import { stat } from "node:fs/promises";
-import { isAbsolute, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import {
 	TEAM_CHANGED_DIR_SUFFIX,
 	TEAM_CHANGED_PATHS_MAX,
 	TEAM_CHANGED_PATHS_MAX_BYTES,
 } from "@shared/project-teams";
-import { GitError } from "../../lib/errors";
+import { AppError, GitError } from "../../lib/errors";
 import {
+	cleanGitEnv,
 	ensureConfigOverridesHonored,
 	GIT_NO_EXEC_CONFIG,
 	type GitConfiguredPrograms,
 	gitConfigEnv,
+	lazyFetchPrevented,
 	noExternalDiffArgs,
 	PROGRAM_CONFIG_QUERY,
 	parseProgramConfig,
+	TRUE_HISTORY_ENV,
 	untrustedProgramOverrides,
 } from "../../lib/git-exec-hardening";
 import { safeSpawn } from "../../lib/spawn";
@@ -64,7 +69,59 @@ const TREE_ENTRY_MAX_BYTES = 16 * 1024;
 const BLOB_STDERR_MAX_BYTES = 16 * 1024;
 const SHA = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 
+/**
+ * The gate every team git command passes before it runs: git honours the configuration
+ * overrides, and — unless this git is known to honour `GIT_NO_LAZY_FETCH` — the repository at
+ * `dir` has no partial-clone or promisor setting (`GIT_TOO_OLD_FOR_PARTIAL_CLONE`). Only
+ * configuration is read here, never an object, so a missing object (say one a replacement ref
+ * names) can never be fetched lazily through a remote the repository configured before the
+ * refusal. `spawnGit` and team-git-write's `run()` await it first; on a git that honours
+ * `GIT_NO_LAZY_FETCH` it costs nothing.
+ */
+export async function prepareTeamRepo(dir: string): Promise<void> {
+	await ensureConfigOverridesHonored();
+	if (lazyFetchPrevented()) return;
+	untrustedProgramOverrides(await configuredPrograms(dir));
+}
+
+/**
+ * The only commands that run without {@link prepareTeamRepo}'s partial-clone check, because they
+ * never read an object: whether a directory is inside a work tree (a partial clone still is one,
+ * and a team on it must be refused for the real reason, not "not a git repository"), and the
+ * configuration query the gate itself reads. Audited; keep it this short — anything that resolves
+ * a revision, lists a tree or walks history reads objects and goes through the gate.
+ */
+const METADATA_ONLY_COMMANDS: ReadonlyArray<readonly string[]> = [
+	["rev-parse", "--is-inside-work-tree"],
+	PROGRAM_CONFIG_QUERY,
+];
+
+const isMetadataOnly = (args: readonly string[]) =>
+	METADATA_ONLY_COMMANDS.some(
+		(command) => command.length === args.length && command.every((arg, i) => arg === args[i]),
+	);
+
+/**
+ * A team git command, after {@link prepareTeamRepo}; `metadataOnly` skips its partial-clone check
+ * for a command of {@link METADATA_ONLY_COMMANDS} (any other is refused).
+ */
 async function spawnGit(
+	cwd: string,
+	args: readonly string[],
+	config: ReadonlyArray<readonly [string, string]>,
+	maxOutputBytes: number,
+	timeout = READ_TIMEOUT_MS,
+	stdoutStream?: { maxBytes: number; onChunk: (chunk: Uint8Array) => boolean | undefined },
+	options: { metadataOnly?: boolean } = {},
+) {
+	if (!options.metadataOnly) await prepareTeamRepo(cwd);
+	else if (!isMetadataOnly(args))
+		throw new GitError(`git ${args[0] ?? ""} reads objects: it is not a metadata-only command`);
+	return spawnGitUngated(cwd, args, config, maxOutputBytes, timeout, stdoutStream);
+}
+
+/** The spawn itself: callers go through {@link spawnGit}. */
+async function spawnGitUngated(
 	cwd: string,
 	args: readonly string[],
 	config: ReadonlyArray<readonly [string, string]>,
@@ -76,16 +133,14 @@ async function spawnGit(
 	const result = await safeSpawn({
 		cmd: ["git", "--no-optional-locks", "-C", cwd, ...noExternalDiffArgs(args)],
 		env: {
-			...process.env,
-			// Never redirected to another repository by the server's own environment.
-			GIT_DIR: undefined,
-			GIT_COMMON_DIR: undefined,
-			GIT_WORK_TREE: undefined,
-			GIT_INDEX_FILE: undefined,
-			GIT_EXTERNAL_DIFF: undefined,
+			// Never redirected to another repository, object store or configuration by the
+			// server's own environment.
+			...cleanGitEnv(),
 			GIT_TERMINAL_PROMPT: "0",
 			LC_ALL: "C",
 			...gitConfigEnv(config),
+			// Replacement refs and grafts are never read (`TRUE_HISTORY_ENV`).
+			...TRUE_HISTORY_ENV,
 		},
 		timeout,
 		maxOutputBytes,
@@ -100,9 +155,149 @@ async function spawnGit(
 	};
 }
 
+/**
+ * Refuse a repository whose history git would answer for only partly: a shallow one (`shallow`
+ * cuts parents, so merge bases and ancestry are guesses) or one with a legacy graft file
+ * (`info/grafts`; hardened commands ignore it, but a person's own git in that repository would
+ * not). Replacement refs need no check: no hardened command reads them. An agent can write
+ * either file, so this runs right before each ancestry answer and each merge.
+ */
+export async function assertTrueHistory(cwd: string): Promise<void> {
+	const result = await spawnGit(
+		cwd,
+		["rev-parse", "--path-format=absolute", "--is-shallow-repository", "--git-common-dir"],
+		GIT_NO_EXEC_CONFIG,
+		16 * 1024,
+	);
+	const [shallow, common] = result.stdout.split("\n").map((line) => line.trim());
+	if (result.exitCode !== 0 || result.truncated || !common || !isAbsolute(common))
+		throw new GitError("git rev-parse could not read whether the repository is shallow");
+	const grafts = await stat(join(common, "info", "grafts")).then(
+		() => true,
+		(error: NodeJS.ErrnoException) => {
+			if (error.code === "ENOENT" || error.code === "ENOTDIR") return false;
+			throw new GitError(`Could not check ${common} for a graft file`);
+		},
+	);
+	if (shallow === "true" || grafts)
+		throw new AppError(
+			shallow === "true"
+				? "The repository is shallow: its history is cut, so what is merged cannot be told. Fetch the full history (git fetch --unshallow) first"
+				: "The repository has a graft file (info/grafts) rewriting its history: remove it (or convert it with git replace --convert-graft-file) first",
+			409,
+			"TEAM_GIT_HISTORY_ALTERED",
+		);
+}
+
+/** Most replacement refs looked at; with more the history is refused without looking. */
+export const REPLACE_REFS_CHECKED_MAX = 20;
+/** Tree listing read to find a replaced tree or blob in a commit's files (over it: refused). */
+const REPLACED_TREE_LISTING_MAX_BYTES = READ_MAX_OUTPUT_BYTES;
+
+/**
+ * Refuse to build on history a replacement ref (`refs/replace/<oid>`) rewrites: one that replaces
+ * any of `commits`, a commit in their history, or a tree or blob in their files. Team commands
+ * never read replacements (`TRUE_HISTORY_ENV`), but the person's own git — and the narrator's
+ * worktree — do, so a worktree made from such a commit, or a fast-forward to it, would show
+ * changes nobody made. Replacements elsewhere (unrelated objects) do not matter. Without
+ * replacement refs this is one `for-each-ref`; with more than {@link REPLACE_REFS_CHECKED_MAX},
+ * or files too many to list, it refuses rather than guess. `TEAM_GIT_REPLACED_HISTORY` (409).
+ */
+export async function assertNoReplacedHistory(
+	cwd: string,
+	commits: readonly string[],
+): Promise<void> {
+	for (const commit of commits)
+		if (!SHA.test(commit)) throw new GitError("Expected a full commit id");
+	const listed = await spawnGit(
+		cwd,
+		[
+			"for-each-ref",
+			`--count=${REPLACE_REFS_CHECKED_MAX + 1}`,
+			"--format=%(refname)",
+			"refs/replace/",
+		],
+		GIT_NO_EXEC_CONFIG,
+		64 * 1024,
+	);
+	if (listed.exitCode !== 0 || listed.truncated)
+		throw new GitError("git for-each-ref could not list the replacement refs");
+	const refs = listed.stdout.split("\n").filter(Boolean);
+	if (refs.length === 0) return;
+	const refuse = (why: string): never => {
+		throw new AppError(
+			`${why}: a team does not build on replaced history, which the person's own git would show differently. Remove the replacement (git replace -d <oid>) or merge outside the team`,
+			409,
+			"TEAM_GIT_REPLACED_HISTORY",
+		);
+	};
+	if (refs.length > REPLACE_REFS_CHECKED_MAX)
+		refuse(`The repository has more than ${REPLACE_REFS_CHECKED_MAX} replacement refs`);
+	const run: GitQueryRunner = (args, options) =>
+		spawnGit(
+			cwd,
+			args,
+			GIT_NO_EXEC_CONFIG,
+			Math.min(options?.maxOutputBytes ?? READ_MAX_OUTPUT_BYTES, READ_MAX_OUTPUT_BYTES),
+		);
+	const inFiles: string[] = [];
+	for (const ref of refs) {
+		const oid = ref.slice("refs/replace/".length);
+		if (!SHA.test(oid)) refuse(`The replacement ref ${ref} does not name an object id`);
+		const type = await spawnGit(cwd, ["cat-file", "-t", oid], GIT_NO_EXEC_CONFIG, 1024);
+		// Replacing an object this repository does not have changes nothing here.
+		if (type.exitCode !== 0) continue;
+		const kind = type.stdout.trim();
+		if (kind === "commit") {
+			for (const commit of commits)
+				if (await isAncestor(run, oid, commit))
+					refuse(`${ref} replaces commit ${oid}, which is in the history of ${commit}`);
+		} else if (kind === "tree" || kind === "blob") inFiles.push(oid);
+	}
+	if (inFiles.length === 0) return;
+	const wanted = new Set(inFiles);
+	for (const commit of commits) {
+		// `<mode> <type> <oid>\t<path>\0` for every entry, trees included, and the root tree.
+		const root = await spawnGit(
+			cwd,
+			["rev-parse", "--verify", "--quiet", `${commit}^{tree}`],
+			GIT_NO_EXEC_CONFIG,
+			1024,
+		);
+		if (root.exitCode !== 0) throw new GitError(`git rev-parse could not read ${commit}'s tree`);
+		if (wanted.has(root.stdout.trim()))
+			refuse(`A replacement ref replaces the root tree of ${commit}`);
+		const listing = await spawnGit(
+			cwd,
+			["ls-tree", "-r", "-t", "-z", "--full-tree", commit],
+			GIT_NO_EXEC_CONFIG,
+			REPLACED_TREE_LISTING_MAX_BYTES,
+		);
+		if (listing.exitCode !== 0) throw new GitError(`git ls-tree could not list ${commit}`);
+		if (listing.truncated)
+			refuse(
+				`The repository has replacement refs for trees or blobs, and ${commit} has too many files to check them against`,
+			);
+		for (const entry of listing.stdout.split("\0")) {
+			const oid = entry.split("\t", 1)[0]?.split(" ")[2];
+			if (oid && wanted.has(oid))
+				refuse(`A replacement ref replaces ${oid}, which is among the files of ${commit}`);
+		}
+	}
+}
+
 /** The filters and configuration-defined hooks a checkout's configuration names (all scopes). */
 export async function configuredPrograms(cwd: string): Promise<GitConfiguredPrograms> {
-	const result = await spawnGit(cwd, PROGRAM_CONFIG_QUERY, GIT_NO_EXEC_CONFIG, 64 * 1024);
+	// Configuration only: this is what the gate itself reads.
+	const result = await spawnGit(
+		cwd,
+		PROGRAM_CONFIG_QUERY,
+		GIT_NO_EXEC_CONFIG,
+		64 * 1024,
+		READ_TIMEOUT_MS,
+		undefined,
+		{ metadataOnly: true },
+	);
 	// Exit 1 without output: nothing matched.
 	if (result.exitCode === 1 && !result.stdout) return { filters: [], hooks: [] };
 	if (result.exitCode !== 0 || result.truncated)
@@ -119,12 +314,16 @@ export async function configuredPrograms(cwd: string): Promise<GitConfiguredProg
 export async function isGitWorkTree(dir: string): Promise<boolean> {
 	const info = await stat(dir).catch(() => null);
 	if (!info?.isDirectory()) return false;
+	// Metadata only: a partial clone is a work tree too (a team on it is refused later, for that
+	// reason, when its base is resolved).
 	const result = await spawnGit(
 		dir,
 		["rev-parse", "--is-inside-work-tree"],
 		GIT_NO_EXEC_CONFIG,
 		1024,
 		WORK_TREE_PROBE_TIMEOUT_MS,
+		undefined,
+		{ metadataOnly: true },
 	).catch(() => null);
 	return (
 		result !== null && result.exitCode === 0 && !result.truncated && result.stdout.trim() === "true"
@@ -518,7 +717,10 @@ export function teamGit(cwd: string): TeamGit {
 		);
 	return {
 		resolveCommit: (ref) => resolveCommit(run, ref),
-		isAncestor: (ancestor, descendant) => isAncestor(run, ancestor, descendant),
+		isAncestor: async (ancestor, descendant) => {
+			await assertTrueHistory(cwd);
+			return isAncestor(run, ancestor, descendant);
+		},
 		countCommitsNotIn: (tip, reachableFrom) => countCommitsNotIn(run, tip, reachableFrom),
 		uncommittedChanges: () => uncommittedChanges(run),
 		changedPaths: (baseRef, at) => changedPathsOf(run, baseRef, at),

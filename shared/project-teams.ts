@@ -66,13 +66,33 @@ export const DEFAULT_COORDINATOR_LIMITS: Readonly<CoordinatorLimits> = Object.fr
 	contextPercent: 60,
 });
 
+/**
+ * Where a team's new work items start (and what `work.sync` brings in):
+ * - `remote`: `origin/<base>`, fetched into the remote-tracking ref only (never the local branch
+ *   or any working tree);
+ * - `local`: the local `<base>` branch as it is.
+ * Unset on the team falls back to the project's default, then to `remote` when origin is on
+ * GitHub and `local` otherwise ({@link TeamDetail.workStartDefault}).
+ */
+export const TEAM_WORK_START_MODES = ["remote", "local"] as const;
+export type TeamWorkStart = (typeof TEAM_WORK_START_MODES)[number];
+
 /** Team-level settings. Every field is optional; absent means the default. */
 export interface TeamSettings {
 	/** Overrides of {@link DEFAULT_COORDINATOR_LIMITS}. */
 	coordinatorLimits?: Partial<CoordinatorLimits>;
 	/** When true, merging back to the base waits for a person (decision T7's opt-out). */
 	mergeNeedsPerson?: boolean;
+	/** Where new work items start; absent follows the project default ({@link TeamWorkStart}). */
+	workStart?: TeamWorkStart;
 }
+
+/**
+ * A change to a team's settings (`PATCH …/teams/:teamId`): only the keys given change, merged on
+ * the server into what is stored; `null` removes a key. So two people changing different settings
+ * at once never overwrite each other.
+ */
+export type TeamSettingsPatch = { [K in keyof TeamSettings]?: TeamSettings[K] | null };
 
 /** The effective coordinator limits of a team. */
 export function effectiveCoordinatorLimits(settings: TeamSettings | null | undefined) {
@@ -104,6 +124,12 @@ export interface TeamSummary {
 export interface TeamDetail extends TeamSummary {
 	brief: string;
 	settings: TeamSettings;
+	/**
+	 * Where new work items start when the team sets nothing: the project's default, else `remote`
+	 * when origin is on GitHub and `local` otherwise. Null while the repository's origin is still
+	 * being looked at.
+	 */
+	workStartDefault?: TeamWorkStart | null;
 }
 
 export interface TeamListResponse {
@@ -244,6 +270,12 @@ export const TEAM_WORK_EVENT_KINDS = [
 	"work.dependencies_changed",
 	/** D: the last dependency of a queued item merged; the coordinator was told it can start. */
 	"work.unblocked",
+	/** M: a member asked to merge the item (or to fast-forward a prepared merge). */
+	"work.merge_requested",
+	/** M: the merge did not happen (conflicts, the base or the branch moved, a refusal). */
+	"work.merge_failed",
+	/** M: the merge commit is ready, but the base is checked out: a person fast-forwards it. */
+	"work.merge_prepared",
 ] as const;
 export type TeamWorkEventKind = (typeof TEAM_WORK_EVENT_KINDS)[number];
 
@@ -332,6 +364,8 @@ export interface TeamBoardItem {
 	 * first (ties by id).
 	 */
 	dependsOn?: TeamWorkDependencyRef[];
+	/** M: a ready item's merge state, as the 等你处理 card shows it (absent otherwise). */
+	merge?: TeamWorkMergeSummary;
 }
 
 export interface TeamBoardColumnPage {
@@ -515,6 +549,11 @@ export const TEAM_EXCLUSIVE_LOCK_KEY = "paths";
  * Nothing is filled in automatically.
  */
 export interface TeamProjectSettings {
+	/**
+	 * Where new work items of this project's teams start unless a team says otherwise
+	 * ({@link TeamWorkStart}); absent: `remote` when origin is on GitHub, else `local`.
+	 */
+	workStart?: TeamWorkStart;
 	/**
 	 * Path globs (relative to the repository root, `**` for any depth) only one item may change at
 	 * a time. `dir/` is stored as `dir/**`; a bare name without glob characters (`drizzle`) covers
@@ -767,6 +806,8 @@ export interface TeamWorkItemDetail {
 	eventsMore: boolean;
 	/** The caller may return it now (member, active team, a returnable state). */
 	canReturn: boolean;
+	/** M: merging it back into its base, for a `ready` item (absent otherwise). */
+	merge?: TeamWorkMergeView;
 	/**
 	 * D: items of this team that depend on this one, oldest created first, at most
 	 * {@link TEAM_WORK_DEPENDENTS_LIMIT}.
@@ -842,3 +883,144 @@ export function dependencyBlockers<T extends { state: TeamWorkItemState; baseMis
 ): T[] {
 	return (dependsOn ?? []).filter((dependency) => !dependencyResolved(dependency));
 }
+
+// ── M: merging a work item back into its base ────────────────────────────────
+
+/**
+ * How a ready item is merged:
+ * - `local`: NarraFork computes the merge commit in the object store and fast-forwards the base
+ *   branch where it is not checked out; where it is, the merge is prepared and a person
+ *   fast-forwards that checkout explicitly;
+ * - `github`: origin is on GitHub, merged through a pull request (a later PR: disabled for now);
+ * - `checking`: the repository's origin is still being looked at.
+ */
+export type TeamMergeMode = "local" | "github" | "checking";
+
+/** What a running merge job is doing. */
+export const TEAM_MERGE_PHASES = [
+	"queued",
+	"checking",
+	"merging",
+	"updating",
+	"fast_forwarding",
+] as const;
+export type TeamMergePhase = (typeof TEAM_MERGE_PHASES)[number];
+
+/** Why the merge button is disabled for this caller (null: enabled). */
+export const TEAM_MERGE_DISABLED_REASONS = [
+	"not_ready",
+	"team_archived",
+	"merging",
+	"worker_running",
+	"checking",
+	"github_pending",
+	"base_remote",
+	"git_too_old",
+] as const;
+export type TeamMergeDisabledReason = (typeof TEAM_MERGE_DISABLED_REASONS)[number];
+
+/** Why 「在该目录中快进」 is not offered (only the copyable command is). */
+export const TEAM_FAST_FORWARD_BLOCKERS = [
+	"stale",
+	"not_on_base",
+	"operation_in_progress",
+	"index_locked",
+	"sessions_running",
+	"local_config",
+	"other_repository",
+	"altered_history",
+	"unsafe_path",
+	"unreadable",
+] as const;
+export type TeamFastForwardBlocker = (typeof TEAM_FAST_FORWARD_BLOCKERS)[number];
+
+/** Most conflicting files a `work.merge_failed` event lists. */
+export const TEAM_MERGE_CONFLICTS_MAX = 50;
+
+/** Private ref a prepared merge commit is kept at (out of `git branch`, safe from gc). */
+export const TEAM_MERGE_REF_PREFIX = "refs/narrafork/team-merges/";
+
+/** The newest merge outcome of a ready item since it became ready. */
+export type TeamWorkMergeOutcome =
+	| {
+			kind: "failed";
+			/** `conflict`, or an error code (`TEAM_MERGE_BASE_MOVED`, `TEAM_WORK_ITEM_HEAD_MOVED`, …). */
+			code: string;
+			message: string | null;
+			/** Conflicting files, at most {@link TEAM_MERGE_CONFLICTS_MAX}. */
+			conflicts?: string[];
+			/** More conflicting files than listed. */
+			more?: boolean;
+			at: string;
+	  }
+	| {
+			kind: "prepared";
+			/** The merge commit, kept at {@link TEAM_MERGE_REF_PREFIX}`<itemId>`. */
+			mergeCommit: string;
+			/** The base commit the merge was computed on. */
+			baseSha: string;
+			/** The checkout the base branch is checked out in. */
+			checkedOutAt: string;
+			at: string;
+			/**
+			 * The newest 「在该目录中快进」 that failed since: the prepared merge stays, so it can be tried
+			 * again (or the command run by hand); the files git named, when it refused.
+			 */
+			fastForwardFailure?: {
+				code: string;
+				message: string | null;
+				files?: string[];
+				blocker?: string;
+				at: string;
+			};
+	  };
+
+/** A ready item's merge state as a card shows it. */
+export interface TeamWorkMergeSummary {
+	mode: TeamMergeMode;
+	/** The running job's phase; null when nothing runs. */
+	phase: TeamMergePhase | null;
+	/** What the running job does. */
+	job: "merge" | "fast_forward" | null;
+	/** The newest outcome's kind since the item became ready (or since the last request). */
+	outcome: "conflict" | "failed" | "prepared" | null;
+	/** The caller may press 合并 now (a member). */
+	canMerge: boolean;
+	disabledReason: TeamMergeDisabledReason | null;
+}
+
+/** A ready item's merge state in the drawer. */
+export interface TeamWorkMergeView extends TeamWorkMergeSummary {
+	/** The newest outcome in full (conflict list, the prepared merge). */
+	detail: TeamWorkMergeOutcome | null;
+	/**
+	 * A prepared merge: whether 「在该目录中快进」 is offered, why not, and the command a person can
+	 * run instead.
+	 */
+	fastForward?: {
+		available: boolean;
+		blocker: TeamFastForwardBlocker | null;
+		/** Sessions running in that checkout (outside `.worktrees/`). */
+		runningSessions: number;
+		/** NarraFork terminals open there: a warning only. */
+		terminals: number;
+		/**
+		 * What a person can run there instead (asserts the branch, fast-forwards to the prepared
+		 * commit); null when the checkout is off the base, stale or another repository.
+		 */
+		command: { sh: string; powershell: string; preferred: "sh" | "powershell" } | null;
+		/** The files the fast-forward writes there (prepared base → merge commit), bounded. */
+		files: string[];
+		filesMore: boolean;
+	};
+}
+
+/** `POST …/work/:itemId/merge` and `…/merge/fast-forward`: accepted, running in the background. */
+export interface TeamWorkMergeResponse {
+	itemId: string;
+	job: "merge" | "fast_forward";
+	phase: TeamMergePhase;
+}
+
+/** Injection source of the note a coordinator gets when a merge lands or needs its worker. */
+export const TEAM_MERGE_NOTE_SOURCE = "team_merge";

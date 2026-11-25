@@ -55,21 +55,28 @@ keywords:
   - TEAM_WORK_ITEM_DEPENDENCY_NOT_FOUND
   - TEAM_WORK_ITEM_DEPENDENCY_CANCELLED
   - TEAM_WORK_ITEM_DEPENDENCY_GRAPH_TOO_LARGE
+  - TEAM_WORK_ITEM_MERGING
+  - assertDependenciesReachStart
+  - unreachedDependencies
+  - confirmUnblocks
+  - reconcileUnblocks
+  - markMergedByLocalMerge
+  - startFrom
   - team_unblocked
   - 依赖
 status: draft
-verified_at: 66bc772cb8dbb321753b7f326178e78e513230f1
+verified_at: 3588311eac166b9c044478105016c59ebd95688b
 ---
 # 工作项
 
-工作项（`team_work_items`）是团队里的一个交付单位：一条分支、一个 worktree、一个状态。协调者经 `Team` 工具推进它，服务端只记录和校验，从不替人合并。
+工作项（`team_work_items`）是团队里的一个交付单位：一条分支、一个 worktree、一个状态。协调者经 `Team` 工具推进它，服务端记录和校验；合回基线由成员在团队页发起（见[合并工作项与基线配置](merge.md)），协调者不能合并。
 
 ## 关键规则
 状态与创建（`teams/work-items.ts`）：
 - 状态：queued / in_progress / in_review / ready / merged / cancelled（`shared/project-teams.ts:TEAM_WORK_ITEM_STATES`）。
 - 看板五列：queued、in_progress、review（含 in_review 与 ready）、done（merged）、cancelled。
 - `work.create`：
-  - 先经现有 narrator worktree 创建通道建分支 `team/<slug>-<id 哈希 8 位>` 与 worktree；
+  - 先经现有 narrator worktree 创建通道建分支 `team/<slug>-<id 哈希 8 位>` 与 worktree，起点按团队的起点模式（`team-work-start.ts:workStartPoint`：`origin/<基线>` 先拉取到远程跟踪 ref 再传那个提交，或本地基线；见[合并工作项与基线配置](merge.md)），`work.created` 记 `startFrom`；行的 `base_ref` 永远是基线分支名；
   - slug 只取 ASCII 单词（`workBranchSlug`：NFKD 去重音、全角折半，其余文字不音译，最多 40 字符），先取协调者给的 `branchHint`，再取标题，都没有就是 `work`；全 ASCII 是为了过 `gitBranchName`、worktree 服务的 ref 检查和 `git check-ref-format`，哈希保证唯一。`Agent({ isolation })` 的标题没有 ASCII 单词时用 description 当 hint。已有分支不改名；
   - 再写行与 `work.created` 事件，初始 `queued`。
 - `Agent({ isolation: "worktree" })` 建的是 kind=`isolated` 的项，初始 `in_progress`。子代理结束时若没有提交也没有未提交改动，就清理 worktree 并取消该项（`settleIsolatedWorkItem`）。
@@ -79,8 +86,10 @@ verified_at: 66bc772cb8dbb321753b7f326178e78e513230f1
 - 一项可以等同团队的其他项**合并**后才开始。表的主键 `(item_id, depends_on_item_id)`，另有 `(depends_on_item_id, item_id)` 与 `team_id` 索引；两端都外键到 `team_work_items` 并级联删除，`team_id` 外键到团队（级联）；`check item_id <> depends_on_item_id`。同团队不靠复合外键（PG 转译器不支持复合目标），由服务判定。
 - 设置：`Team` 的 `work.create` 与 `work.update` 带 `dependsOn`（工作项 id，不收标题），整组替换（`[]` 清空），最多 `TEAM_WORK_DEPENDENCIES_MAX` = 20（多了 400），重复去掉。只能在项 queued 且没有工作者时改（否则 409 `TEAM_WORK_ITEM_NOT_QUEUED`）；改了（`changed`）就在事务后发 `team:communication_changed` 刷新团队页。每个目标都必须是本团队的项（别的团队的、不存在的都是 404 `TEAM_WORK_ITEM_DEPENDENCY_NOT_FOUND`，不说属于谁）；不能是已取消的（409 `TEAM_WORK_ITEM_DEPENDENCY_CANCELLED`）；必须和这一项从同一条基线建出（409 `TEAM_WORK_DEPENDENCY_BASE_MISMATCH`，消息点名两条基线，`details: { base, mismatched: [{ id, base }] }`；基线是项的 `base_ref`，为空时取团队当前基线。项建时钉住团队当时的基线，团队基线之后能改，而 `work.sync` 只拉这一项自己的基线，合进别的基线的依赖永远到不了它）；不能是自己或成环（409 `TEAM_WORK_ITEM_DEPENDENCY_CYCLE`，`details.cycle` 是环路）。查环是从新目标沿已有边广度优先，每层一次 `IN` 索引读，最多访问 500 项，超了 409 `TEAM_WORK_ITEM_DEPENDENCY_GRAPH_TOO_LARGE`。`work.create` 在建 worktree 之前就查，被拒不留 worktree；写入与 `work.dependencies_changed` 事件（`dependsOn/added/removed`）同事务，事务内再查一次。`work.update` 还按「状态 + `updated_at`」条件更新项。
 - 开始的闸：只有合并进这一项自己基线的依赖算满足（`dependencyResolved`：`merged`（`dependencySatisfied`）且没有 `baseMismatch`），`ready` 不算（分支会从不含它的基线出发），已取消的依赖一直挡着，直到协调者去掉或换掉。加基线检查之前写下的跨基线边由 `readDependencies` 标上 `baseMismatch: { dependencyBase, dependentBase }`，不论状态都算挡着（`blockersOf`、`blockedBy`、解锁扫描同一规则）。`assertWorkItemStartable` 抛 409 `TEAM_WORK_ITEM_BLOCKED`，`details.blockers` 列出 `{ id, title, state }`（跨基线的另带 `baseMismatch`），消息点名已取消的与跨基线的（两条基线都写出）那些，让协调者用 `work.update` 处理。只要项还没有工作者，不论状态，`Agent({ workdir })` 都在创建子代理之前查（被拒什么都不建，工具结果带错误码），`attachWorker` 在事务内再查一次。
-- 解锁：`merged` 的唯一写入者 `markMergedByAncestry` 在同一事务里调 `recordUnblocked`：按反向索引读被它挡着、仍 queued 且没有工作者的项（这两个条件在查询里过滤，再取最多 200，已开始的项挤不掉排队的），对依赖全部满足（`dependencyResolved`，跨基线的依赖永不满足）的项写一条 `work.unblocked`（system，`detail: { mergedItem, dependsOn }`）。`merged` 只写一次且不可逆，所以每项只解锁一次。事务后每个解锁项给协调者投一条说明（来源 `team_unblocked`，`wakeIfIdle`，与 `team_return` 同一条路；`createdBy`/执行主体是建这一项的人；按协调者会话的语言，`lib/prompts/team-lead.ts:unblockedNote`，首行「「X」现在可以开始了」，标题经 `team-coordinator-notes.ts:oneLine` 压成一行（最多 80 字，与重叠提醒相同），第二行让它先 `work.sync` 再派工人）。投递经 check-in 的生命周期排空跟踪，失败只记日志，事件照样成立。测试接缝 `setUnblockDeliveryForTests`。不会自动开始。
-- 基线：worktree 在 `work.create` 时就从本地基线分支当时的提交建出（不 fetch），所以依赖合并前建的项分支是旧基线。不挪动建 worktree 的时机：说明和提示词让协调者先 `work.sync`（还没有工作者时返回确定的合并指令），把指令放在工人简报最前面。
+- 解锁：`merged` 的唯一写入者 `markMerged` 在同一事务里只挑候选（`unblockCandidates`：按反向索引读被它挡着、仍 queued 且没有工作者的项，这两个条件在查询里过滤，再取最多 200；依赖全部满足、跨基线的永不满足）。事务后（不在事务里跑 git）`confirmUnblocks` 逐个核对：每个已合并依赖的记录 head 在不在被挡项的起点 ref 里（`unreachedDependencies`：团队当前起点模式下的 `refs/remotes/origin/<b>` 或本地基线，不拉取；一次 resolve 加每个依赖一次 `merge-base --is-ancestor`，最多 20 个，读不出就算不在）——在才在一个短事务里复读（仍 queued、无工作者、自上次依赖变更后没记过）后写 `work.unblocked`（system，`detail: { mergedItem, dependsOn }`），所以两次合并同时发生也只记一次。合并在本地基线而工作从 origin 开始（或反过来）的项不解锁。然后给协调者投一条说明（来源 `team_unblocked`，`wakeIfIdle`，与 `team_return` 同一条路；`createdBy`/执行主体是建这一项的人；按协调者会话的语言，`lib/prompts/team-lead.ts:unblockedNote`，首行「「X」现在可以开始了」，标题经 `team-coordinator-notes.ts:oneLine` 压成一行（最多 80 字，与重叠提醒相同），第二行让它先 `work.sync` 再派工人）。投递经 check-in 的生命周期排空跟踪，失败只记日志，事件照样成立。测试接缝 `setUnblockDeliveryForTests`、`setDependencyReachForTests`。不会自动开始。
+- 依赖之后才到起点 ref（例如合并在本地基线、工作从 origin 开始，之后 push 再 fetch）：每次起点拉取成功后（`workStartPoint` 在后台调）与后台刷新的每次扫一遍时，`reconcileUnblocks` 读 queued、无工作者、有依赖的项（索引读，最多 200），依赖全部已合并的再走 `confirmUnblocks`（同一个 git 核对与只记一次），新解锁的给协调者投说明。
+- 开始时同样核对：`Agent({ workdir })` 在 `assertWorkItemStartable` 之后再 `await assertDependenciesReachStart`，已合并却不在起点 ref 里的依赖让开始 409 `TEAM_WORK_ITEM_BLOCKED`（`details.blockers[].notInStart` 是起点名，消息说明合并到了别处）。
+- 基线：worktree 在 `work.create` 时就从起点当时的提交建出（本地基线，或刚拉取的 `origin/<基线>`），所以依赖合并前建的项分支是旧基线。不挪动建 worktree 的时机：说明和提示词让协调者先 `work.sync`（还没有工作者时返回确定的合并指令），把指令放在工人简报最前面。
 - `work.list` 与工具返回的项带 `dependsOn`（id）与 `blockedBy`（未合并的 id），整页一次读（`readDependencies`）。`work.cancel` 的结果列出依赖它、仍在排队的项（`dependents`，最多 20，状态在查询里过滤，`queuedDependentsOf`）并提示用 `work.update` 处理。
 - 人不能在团队页改依赖（这一轮只读展示，见[团队页与审批](page.md)）。
 
@@ -113,13 +122,15 @@ verified_at: 66bc772cb8dbb321753b7f326178e78e513230f1
 - `Team` 工具的错误结果带上 `AppError.details`，协调者由此拿到节点清单。
 
 同步、清理、并发：
-- `work.sync`：服务端从不合并。基线已在分支内就返回 up_to_date，否则把一条确定性的 `git merge --no-ff <基线提交>` 指令交给工作者。
+- `work.sync`：服务端不在工作项分支上合并。要合进来的基线按起点模式取（`origin/<基线>` 先拉取，或本地基线，事件 `baseRef` 记的是它，拉取失败用已有的远程跟踪 ref 时记 `fetched: false`）；已在分支内就返回 up_to_date，否则把一条确定性的 `git merge --no-ff <基线提交>` 指令交给工作者。
 - 投递结果分 started / queued / blocked / wake_failed / failed / none 六种。
 - 服务端从不删分支、不自己跑 `git worktree`：创建与清理都走现有 worktree 服务（`work-item-ports.ts`）。
 - `cleanup` 只能用于 merged 或 cancelled 的项。丢未提交文件或未合并提交时必须带人确认过的损失（`force` + `confirmedLoss`），分支保留。`Team` 的 `cleanup` 每次都等人批准。
 - 更新是乐观并发：按「状态 + `updated_at`」条件更新，对不上就 409 `TEAM_WORK_ITEM_CHANGED`。
 - 进入 merged/cancelled 时同事务释放独占锁并记 `work.exclusive_released`。
-- `merged` 只由祖先检测自动判定：`ready` 项的记录 head 已在基线分支内（squash/rebase 合并检测不到）。事务内核对状态、head、`updated_at` 一致才写入，之后不可逆。
+- `merged` 有两个来源，都经同一个写入者 `markMerged`（事务内核对 ready、head、`updated_at`、团队活跃，同事务释放独占锁并解锁依赖，之后不可逆）：祖先检测（`markMergedByAncestry`，`detectedBy: "ancestry"`，system；`ready` 项的记录 head 已在基线分支内，squash/rebase 合并检测不到）与成员的本地合并（`markMergedByLocalMerge`，`detectedBy: "local_merge"`，actor 为那个人，见[合并](merge.md)）。
+- 合并任务持有一项时（`team-merge-guard.ts`），`work.review`、`work.ready`、`work.sync`、`work.cancel` 与人的退回都 409 `TEAM_WORK_ITEM_MERGING`；review、ready、sync 在最后一次 await 之后、写入或交给工人之前再查一次。
+- 起点为 `origin/<基线>` 的项（`work.created` 的 `startFrom`）在 ready 的知识检查、评审后提交数与改动路径、以及隔离项结束时的提交计数里按 `refs/remotes/origin/<基线>` 比较（`team-work-start.ts:compareRefFor`），免得把本地基线落后的 origin 提交算成这一项的。
 
 事件与 check-in：
 - 每次状态变更、评审、同步、清理、check-in、决策都追加一行 `team_work_events`（`recordWorkEvent`）。actor 为 person / agent / system，详情上限 8KB。
@@ -143,9 +154,9 @@ verified_at: 66bc772cb8dbb321753b7f326178e78e513230f1
 - 加工作项状态或事件种类：`TEAM_WORK_ITEM_STATES`/`TeamWorkEventKind`、表上的 check 约束（SQLite 与 `drizzle-postgres` 两边，`team-tables-contract.test.ts` 会失败）、看板列映射 `TEAM_BOARD_COLUMN_STATES`。
 - 加 ready 的前置条件：保持顺序（NOT_REVIEWED → DIRTY → 钉住 head → 知识检查 → 独占路径 → 复核 HEAD），新读的 git 都按钉住的 head 读，同步 `tools/team.ts` 的工具描述与 `team-lead.ts` 中英文提示词。
 - 改知识检查的判定（锚点、源文件规则）改 `shared/knowledge-tree.ts`，工具与 ready 一起变；`tests/shared/knowledge-tree.test.ts`、`tests/scripts/knowledge.test.ts`、`work-item-knowledge.test.ts` 会拦。检查失败只能拒绝，不能放行。
-- 加别的写 `merged` 的路径：必须同事务调 `recordUnblocked` 并在事务后投递说明，否则被挡的项永远等不到通知。
+- 加别的写 `merged` 的路径：经 `markMerged`（它同事务调 `recordUnblocked` 并在事务后投递说明），不要另写，否则被挡的项永远等不到通知。
 - 依赖规则（什么算满足）只在 `shared/project-teams.ts:dependencySatisfied` / `dependencyResolved`，前端行文案（`dependencyBlockers`）与服务端闸共用。
-- 不变量：服务端不合并、不删分支、不直接跑 `git worktree`；读 git 只经 `team-git.ts`；状态更新必须带「状态 + `updated_at`」条件。
+- 不变量：服务端不在工作项的 worktree 里写 git、只在成员要求时合并（`team-merge.ts`，不碰任何工作区）、不删分支、不直接跑 `git worktree`；worktree 里的读只经 `team-git.ts`，写 git 只经 `team-git-write.ts`；状态更新必须带「状态 + `updated_at`」条件。
 
 ## 相关
 - [团队与成员](records.md)：删除团队前对未收尾工作项的检查。
