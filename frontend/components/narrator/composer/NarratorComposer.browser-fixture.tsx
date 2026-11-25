@@ -1,5 +1,6 @@
 import "@mantine/core/styles.css";
 import { ImageViewerContext } from "@frontend/components/common/image-viewer-context";
+import { seedCurrentUser } from "@frontend/hooks/useCurrentUser";
 import { api } from "@frontend/lib/api";
 import { confirmAuthUser, setToken } from "@frontend/lib/api/client";
 import {
@@ -15,7 +16,6 @@ import narrator from "@frontend/locales/en/narrator.json";
 import { MantineProvider } from "@mantine/core";
 import { type ComposerDocument, composerDocumentText } from "@shared/composer-document";
 import type { FileReferenceEditorSelection } from "@shared/file-reference";
-import type { CommunicationCandidates } from "@shared/narrator-communication";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Editor } from "@tiptap/react";
 import i18next from "i18next";
@@ -43,21 +43,22 @@ await i18n
 const query = new QueryClient({
 	defaultOptions: { queries: { retry: false, staleTime: Infinity, gcTime: Infinity } },
 });
-query.setQueryData(["auth", "me"], { id: "fixture-user" });
-query.setQueryData(["named-narrators"], []);
+function seedFixtureUser(userId: string) {
+	const generation = setToken(`fixture-auth:${userId}`);
+	seedCurrentUser(query, generation, { id: userId });
+	confirmAuthUser(generation, userId);
+}
+seedFixtureUser("fixture-user");
 const composer = createRef<NarratorComposerHandle>();
 const fileInput = createRef<HTMLInputElement>();
 const sending = { current: false };
 const persistentAttachments = new URLSearchParams(window.location.search).has("persist");
 const attachmentT = (key: string, options?: Record<string, unknown>) =>
 	String(i18n.t(key, { ...options, ns: "narrator" }));
-confirmAuthUser(setToken("fixture-auth:fixture-user"), "fixture-user");
 const noop = () => {};
 let switchNarrator: (id: string) => void;
 let switchAccount: (id: string) => void;
 let currentUser = "fixture-user";
-api.me = async () => ({ id: currentUser });
-api.searchCommunicationCandidates = async () => ({ items: [], hasMore: false });
 let attachmentsHydrating = false;
 let hidePersistedAttachments: () => void;
 let clearPersistedAttachments: () => void;
@@ -446,41 +447,34 @@ export function remember(doc: ComposerDocument) {
 export function clear() {
 	composer.current?.clearTextAndDraft();
 }
-export function namedCandidates(
-	candidates: { id: string; handle?: string; title?: string }[],
+export async function mentionCandidates(
+	candidates: { id: string; handle?: string; title?: string; isRecent?: boolean }[],
 	holdRemote = false,
 ) {
-	confirmAuthUser(setToken("fixture-auth:fixture-user"), "fixture-user");
+	// Keep the communication reader on the real HTTP stack, independently of loaded recent tabs.
+	const response = await fetch("/__fixture/mention-candidates", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ candidates, holdRemote }),
+	});
+	if (!response.ok) throw new Error("Unable to seed mention candidates");
 	const scope = getRecentTabsScope();
-	if (!scope) throw Error("Missing composer fixture scope");
-	query.setQueryData(["auth", "me"], { id: "fixture-user" });
+	if (!scope) throw new Error("Missing composer fixture scope");
 	query.setQueryData(recentTabsSectionQueryKey(scope, "work"), {
 		pages: [
 			{
-				items: candidates.map((candidate, index) => ({
-					type: "narrator" as const,
-					id: candidate.id,
-					title: candidate.title ?? candidate.handle ?? candidate.id,
-					lastVisitedAt: 100 - index,
-					folderId: "collapsed-folder",
-				})),
+				items: candidates
+					.filter((candidate) => candidate.isRecent !== false)
+					.map((candidate, index) => ({
+						type: "narrator" as const,
+						id: candidate.id,
+						title: candidate.title ?? candidate.handle ?? candidate.id,
+						lastVisitedAt: 100 - index,
+						folderId: "collapsed-folder",
+					})),
 			},
 		],
 	});
-	api.searchCommunicationCandidates = async () => {
-		if (holdRemote) return new Promise<CommunicationCandidates>(() => {});
-		return {
-			items: candidates.map((candidate) => ({
-				...candidate,
-				title: candidate.title ?? candidate.handle ?? candidate.id,
-				status: "idle",
-				isRecent: true,
-				lastActivityAt: null,
-				canConnect: true,
-			})),
-			hasMore: false,
-		};
-	};
 }
 export function panelReferenceDrop(
 	id: string,
@@ -619,8 +613,7 @@ export function switchToNarrator(narratorId: string) {
 export function switchToUser(userId: string) {
 	flushSync(() => {
 		currentUser = userId;
-		confirmAuthUser(setToken(`fixture-auth:${userId}`), userId);
-		query.setQueryData(["auth", "me"], { id: userId });
+		seedFixtureUser(userId);
 		switchAccount(userId);
 	});
 }

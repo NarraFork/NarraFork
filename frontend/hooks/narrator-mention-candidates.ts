@@ -55,7 +55,9 @@ export function mergeNarratorMentionCandidates(
 	sourceId?: string,
 ): CommunicationCandidate[] {
 	const byId = new Map(local.map((item) => [item.id, item]));
+	const remoteMatches = new Set<string>();
 	for (const item of remote) {
+		remoteMatches.add(item.id);
 		const previous = byId.get(item.id);
 		byId.set(item.id, {
 			...item,
@@ -70,7 +72,10 @@ export function mergeNarratorMentionCandidates(
 		.filter(
 			(item) =>
 				item.id !== sourceId &&
+				// The server matched and authorized this page already, possibly using a
+				// field we don't show (or a newer title than the loaded sidebar row).
 				(!folded ||
+					remoteMatches.has(item.id) ||
 					foldHandle(
 						`${item.title ?? ""} ${item.handle ?? ""} ${item.parentTitle ?? ""} ${item.id}`,
 					).includes(folded)),

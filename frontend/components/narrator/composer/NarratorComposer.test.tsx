@@ -1,6 +1,14 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { ImageViewerContext } from "@frontend/components/common/image-viewer-context";
+import { seedCurrentUser } from "@frontend/hooks/useCurrentUser";
 import { ApiError, api } from "@frontend/lib/api";
+import { clearToken, confirmAuthUser, setToken } from "@frontend/lib/api/client";
+import type {
+	NarratorPanelReadScope,
+	NarratorPanelStateResponse,
+} from "@frontend/lib/api/narrators";
+import { businessTransport } from "@frontend/lib/business-transport";
+import { narratorWSManager } from "@frontend/lib/narrator-ws-manager";
 import {
 	resetPromptOptimizeTasksForTest,
 	startPromptOptimizeTask,
@@ -18,13 +26,16 @@ import { notifyManager, QueryClient, QueryClientProvider } from "@tanstack/react
 import type { Editor, JSONContent } from "@tiptap/core";
 import i18next, { type i18n } from "i18next";
 import { parseHTML } from "linkedom";
-import { act, createRef } from "react";
+import { act, createRef, StrictMode, useLayoutEffect } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import narratorEn from "../../../locales/en/narrator.json";
+import { PermissionRulePolicySync } from "../permission/PermissionRuleResultNotice";
+import { type UseNarratorPanelWSReturn, useNarratorPanelWS } from "../useNarratorPanelWS";
 import { joinQuotedComposerInput } from "./composer-quotes";
 import { FileReferenceScopeProvider } from "./FileReferenceScope";
 import { insertFileReference } from "./file-reference-input";
+import { InlineComposerEditor, type InlineComposerEditorHandle } from "./InlineComposerEditor";
 import {
 	NarratorComposer,
 	type NarratorComposerHandle,
@@ -69,13 +80,54 @@ let panelSpy: ReturnType<typeof spyOn<typeof api, "getNarratorPanelState">>;
 let updateSpy: ReturnType<typeof spyOn<typeof api, "updateNarratorDraft">>;
 let mockServerRevision = 1;
 const previousGlobals = new Map<string, PropertyDescriptor | undefined>();
+let panelSharingMode = false;
+let strictMode = false;
+let panelCurrent: UseNarratorPanelWSReturn;
+let panelConnected = true;
+const panelRestores: Array<() => void> = [];
+const panelManagerOriginals = new Map<string, PropertyDescriptor | undefined>();
+const panelConnections = new Set<(connected: boolean, isReconnect: boolean) => void>();
+type PanelListenerOptions = Parameters<typeof narratorWSManager.addListener>[0];
+type PanelListener = Parameters<typeof narratorWSManager.addListener>[1];
+const panelListeners = new Map<
+	number,
+	{ options: PanelListenerOptions; callback: PanelListener }
+>();
+let panelNextListener = 0;
+type ControlledPanelRequest = {
+	path: string;
+	init: RequestInit | undefined;
+	resolve: (value: Response) => void;
+	settled: boolean;
+};
+let panelRequests: ControlledPanelRequest[] = [];
 
-function Harness() {
+function PanelSharingHarness() {
+	panelCurrent = useNarratorPanelWS({
+		narratorId: testNarratorId,
+		narratorStatus: "waiting",
+		isAtBottomRef: { current: true },
+		onDraftChanged: (draft) => handle.current?.handleDraftChanged(draft),
+		onDraftMeta: (meta) => handle.current?.handleDraftMeta(meta),
+	});
+	return (
+		<>
+			<Harness readScope={panelCurrent.readScope} />
+			<PermissionRulePolicySync
+				narratorId={testNarratorId}
+				pendingPermissions={panelCurrent.pendingPermissions}
+			/>
+		</>
+	);
+}
+
+function Harness({ readScope }: { readScope?: NarratorPanelReadScope }) {
 	renders++;
 	return (
 		<NarratorComposer
 			ref={handle}
 			narratorId={testNarratorId}
+			readScope={readScope}
 			sendingRef={sendingRef}
 			permEnterActive={false}
 			hasAttachments={false}
@@ -194,13 +246,11 @@ beforeEach(async () => {
 		defaultOptions: { queries: { retry: false, gcTime: Infinity, staleTime: Infinity } },
 	});
 	qc.setQueryData(["auth", "me"], { id: "u1" });
-	qc.setQueryData(["named-narrators"], []);
-	panelSpy = spyOn(api, "getNarratorPanelState").mockResolvedValue({
-		permissions: [],
-		buffer: [],
-		draft: { hasDraft: false, revision: 1, updatedAt: null },
-		hasMore: { permissions: false, buffer: false },
-	});
+	// Body-focused unit cases model a legacy server unless they explicitly provide metadata.
+	// This avoids an impossible empty metadata snapshot paired with a nonempty mocked body.
+	panelSpy = spyOn(api, "getNarratorPanelState").mockRejectedValue(
+		new ApiError("legacy server has no panel snapshot", 404),
+	);
 	getSpy = spyOn(api, "getNarratorDraft").mockResolvedValue(initial);
 	mockServerRevision = initial.revision;
 	updateSpy = spyOn(api, "updateNarratorDraft").mockImplementation(
@@ -228,16 +278,35 @@ beforeEach(async () => {
 	attachmentsRestoreFailed = false;
 	retryAttachments = mock(() => {});
 	documentAssetsChange = mock((_ids: readonly string[]) => {});
+	panelSharingMode = false;
+	strictMode = false;
+	panelConnected = true;
+	panelRequests = [];
+	panelConnections.clear();
+	panelListeners.clear();
 });
 
 afterEach(async () => {
-	await act(async () => root.unmount());
+	await act(async () => {
+		root.unmount();
+		// Deliberately non-cooperative HTTP can settle after abort; release every test response.
+		for (const request of panelRequests) {
+			if (!request.settled) respondPanelRequest(request, panelPage());
+		}
+	});
+	for (const restore of panelRestores.splice(0)) restore();
+	for (const [key, descriptor] of panelManagerOriginals) {
+		if (descriptor) Object.defineProperty(narratorWSManager, key, descriptor);
+		else Reflect.deleteProperty(narratorWSManager, key);
+	}
+	panelManagerOriginals.clear();
 	// Tiptap releases its view on a zero-delay destroy timer; keep this fixture's DOM alive.
 	await act(async () => {
 		await new Promise((resolve) => setTimeout(resolve, 1));
 	});
 	host.remove();
 	qc.clear();
+	clearToken();
 	notifyManager.setScheduler((callback) => setTimeout(callback, 0));
 	getSpy.mockRestore();
 	panelSpy.mockRestore();
@@ -261,7 +330,15 @@ async function render() {
 							value={{ narratorId: "n1", context: { deviceId: "RemoteABC", cwd: "/work" } }}
 						>
 							<ImageViewerContext.Provider value={{ open: () => {} }}>
-								<Harness />
+								{strictMode ? (
+									<StrictMode>
+										{panelSharingMode ? <PanelSharingHarness /> : <Harness />}
+									</StrictMode>
+								) : panelSharingMode ? (
+									<PanelSharingHarness />
+								) : (
+									<Harness />
+								)}
 							</ImageViewerContext.Provider>
 						</FileReferenceScopeProvider>
 					</I18nextProvider>
@@ -287,6 +364,140 @@ function deferred<T>() {
 	return { promise, resolve };
 }
 
+function panelPage(
+	draft: NarratorPanelStateResponse["draft"] = {
+		hasDraft: false,
+		revision: 0,
+		updatedAt: null,
+	},
+	permissions: NarratorPanelStateResponse["permissions"] = [],
+): NarratorPanelStateResponse {
+	return {
+		permissions,
+		buffer: [],
+		draft,
+		hasMore: { permissions: false, buffer: false },
+	};
+}
+
+function respondPanelRequest(request: ControlledPanelRequest, value: unknown) {
+	request.settled = true;
+	request.resolve(Response.json(value));
+}
+
+function panelReads() {
+	return panelRequests.filter((request) => request.path.endsWith("/panel-state"));
+}
+
+function draftBodyReads() {
+	return panelRequests.filter((request) => request.path.endsWith("/draft"));
+}
+
+function runtimeReads() {
+	return panelRequests.filter((request) => request.path === "/api/settings/runtime");
+}
+
+function panelDomainRequests() {
+	// Exclude only the legitimate global lightweight projection. Unexpected
+	// permissions/full-settings/other reads still fail the exact domain assertions.
+	const perToken = new Map<string | null, number>();
+	for (const request of runtimeReads()) {
+		const token = new Headers(request.init?.headers).get("Authorization");
+		perToken.set(token, (perToken.get(token) ?? 0) + 1);
+	}
+	for (const count of perToken.values()) expect(count).toBe(1);
+	return panelRequests.filter((request) => request.path !== "/api/settings/runtime");
+}
+
+function seedComposerUser(token: string, userId: string) {
+	const generation = setToken(token);
+	seedCurrentUser(qc, generation, { id: userId });
+	confirmAuthUser(generation, userId);
+}
+
+function enablePanelSharing() {
+	panelSharingMode = true;
+	// The integration lane uses the real API readers and components, not their unit-test spies.
+	panelSpy.mockRestore();
+	getSpy.mockRestore();
+	updateSpy.mockRestore();
+	seedComposerUser("panel-sharing-token", "u1");
+	for (const key of ["connected", "disconnected"]) {
+		panelManagerOriginals.set(key, Object.getOwnPropertyDescriptor(narratorWSManager, key));
+		Object.defineProperty(narratorWSManager, key, {
+			configurable: true,
+			get: () => (key === "connected" ? panelConnected : !panelConnected),
+		});
+	}
+	for (const spy of [
+		spyOn(narratorWSManager, "subscribe").mockImplementation((ids, options) => ({
+			_id: ++panelNextListener,
+			_narratorIds: [...ids],
+			_kind: options?.kind ?? "messages",
+		})),
+		spyOn(narratorWSManager, "unsubscribe").mockImplementation(() => {}),
+		spyOn(narratorWSManager, "joinPresence").mockImplementation(() => {}),
+		spyOn(narratorWSManager, "leavePresence").mockImplementation(() => {}),
+		spyOn(narratorWSManager, "addListener").mockImplementation((options, callback) => {
+			const id = ++panelNextListener;
+			panelListeners.set(id, { options, callback });
+			return { _id: id };
+		}),
+		spyOn(narratorWSManager, "removeListener").mockImplementation((listener) => {
+			panelListeners.delete(listener._id);
+		}),
+		spyOn(narratorWSManager, "onConnectionChange").mockImplementation((callback) => {
+			panelConnections.add(callback);
+			return () => {
+				panelConnections.delete(callback);
+			};
+		}),
+		spyOn(narratorWSManager, "onControlPlaneRecovery").mockImplementation(() => () => {}),
+		spyOn(businessTransport, "request").mockImplementation((path, init) => {
+			const response = deferred<Response>();
+			const request = { path: String(path), init, resolve: response.resolve, settled: false };
+			panelRequests.push(request);
+			if (request.path === "/api/settings/runtime") {
+				respondPanelRequest(request, {
+					revision: 1,
+					agent: { defaultModel: "", summaryModel: "" },
+					outline: { enabled: false },
+					requestEvidence: { autoPin: "off" },
+					summaryModelAvailable: false,
+				});
+			}
+			// Keep abort observable but do not auto-reject: stale-response safety must be real.
+			return response.promise;
+		}),
+	])
+		panelRestores.push(() => spy.mockRestore());
+}
+
+function emitPanelEvent(event: Record<string, unknown>) {
+	const frame: Record<string, unknown> = { narratorId: testNarratorId, ...event };
+	for (const { options, callback } of [...panelListeners.values()]) {
+		if (
+			options.narratorIds &&
+			options.narratorIds !== "*" &&
+			!options.narratorIds.includes(String(frame.narratorId))
+		)
+			continue;
+		if (options.types && !options.types.includes(String(frame.type))) continue;
+		if (
+			options.typePrefixes &&
+			!options.typePrefixes.some((prefix) => String(frame.type).startsWith(prefix))
+		)
+			continue;
+		if (options.excludeTypes?.includes(String(frame.type))) continue;
+		callback(frame as Parameters<PanelListener>[0]);
+	}
+}
+
+function rawPanelConnection(connected: boolean) {
+	panelConnected = connected;
+	for (const callback of panelConnections) callback(connected, false);
+}
+
 async function activateAttachment(name: string) {
 	const button = host.querySelector<HTMLButtonElement>(
 		`[data-composer-atom="attachment"] button[aria-label="${name}"]`,
@@ -304,6 +515,438 @@ async function clickButton(label: string) {
 	expect(button).toBeDefined();
 	await act(async () => button?.click());
 }
+
+test("delayed InlineComposerEditor creation applies an early restore once before input and preserves later edits and undo", async () => {
+	const inline = createRef<InlineComposerEditorHandle>();
+	const empty: ComposerDocument = { version: 1, paragraphs: [{ children: [] }], assets: [] };
+	const restored: ComposerDocument = {
+		version: 1,
+		paragraphs: [{ children: [{ type: "text", text: "early restore" }] }],
+		assets: [],
+	};
+	let restoreBeforeView = false;
+	const changes: ComposerDocument[] = [];
+	function DelayedEditor() {
+		useLayoutEffect(() => {
+			restoreBeforeView = host.querySelector(".ProseMirror") === null;
+			inline.current?.setDocument(restored);
+		}, []);
+		// A slow parent deliberately keeps its original prop while accepting edits.
+		return (
+			<InlineComposerEditor ref={inline} value={empty} onChange={(value) => changes.push(value)} />
+		);
+	}
+	const renderInline = () =>
+		act(async () =>
+			root.render(
+				<MantineProvider env="test">
+					<I18nextProvider i18n={instance}>
+						<DelayedEditor />
+					</I18nextProvider>
+				</MantineProvider>,
+			),
+		);
+	await renderInline();
+	expect(restoreBeforeView).toBe(true);
+	const editor = getEditor();
+	expect(editor.state.doc.textContent).toBe("early restore");
+	await act(async () =>
+		editor.view.dispatch(editor.state.tr.insertText(" typed", editor.state.doc.content.size - 1)),
+	);
+	expect(editor.state.doc.textContent).toBe("early restore typed");
+	await act(async () => {
+		await new Promise((resolve) => setTimeout(resolve, 1));
+	});
+	await renderInline();
+	expect(editor.state.doc.textContent).toBe("early restore typed");
+	expect(composerDocumentText(inline.current?.getDocument() as ComposerDocument).text).toBe(
+		"early restore typed",
+	);
+	expect(changes).toHaveLength(1);
+	await act(async () => {
+		expect(editor.commands.undo()).toBe(true);
+	});
+	expect(editor.state.doc.textContent).toBe("early restore");
+});
+
+describe("real panel, composer and policy share scoped HTTP reads", () => {
+	for (const local of ["empty", "acknowledged"] as const) {
+		test(`initially online ${local} needs one panel read and no body or permission read`, async () => {
+			enablePanelSharing();
+			const revision = local === "acknowledged" ? 7 : 0;
+			const text = local === "acknowledged" ? "acknowledged local input" : "";
+			if (local === "acknowledged") {
+				persistNarratorInputDraft("u1", "n1", text, revision, "t7", [], {
+					text,
+					fileReferences: [],
+				});
+			}
+			const policyKeys = ["whitelist-dirs", "blacklist-dirs", "cmd-whitelist", "cmd-blacklist"];
+			for (const key of policyKeys) qc.setQueryData([key, "n1"], []);
+			await render();
+			expect(panelReads()).toHaveLength(1);
+			expect(runtimeReads()).toHaveLength(1);
+			expect(panelDomainRequests()).toHaveLength(1);
+			await act(async () =>
+				respondPanelRequest(
+					panelReads()[0],
+					panelPage({ hasDraft: !!text, revision, updatedAt: text ? "t7" : null }, [
+						{
+							id: "policy-pending",
+							toolName: "RequestPermissionRule",
+							toolUseId: "policy-tool",
+							inputJson: {},
+						},
+					]),
+				),
+			);
+			expect(handle.current?.getText()).toBe(text);
+			expect(panelCurrent.pendingPermissions.map((request) => request.id)).toEqual([
+				"policy-pending",
+			]);
+			expect(draftBodyReads()).toHaveLength(0);
+			expect(panelDomainRequests().map((request) => request.path)).toEqual([
+				"/api/narrators/n1/panel-state",
+			]);
+			if (text) expect(readNarratorInputDraft("u1", "n1").syncedRevision).toBe(7);
+			// Resolution can remove the parent's row before its tool completion receipt.
+			await act(async () =>
+				emitPanelEvent({
+					type: "permission_resolved",
+					requestId: "policy-pending",
+					toolUseId: "policy-tool",
+					decision: "allow",
+				}),
+			);
+			expect(panelCurrent.pendingPermissions).toEqual([]);
+			// PolicySync must retain the RequestPermissionRule seeded only by the shared snapshot.
+			await act(async () =>
+				emitPanelEvent({
+					type: "tool_completed",
+					toolUseId: "policy-tool",
+					status: "success",
+					output: {
+						status: "applied",
+						scope: "narrator",
+						requestId: "r1",
+						ruleId: "rule1",
+						deviceId: "RemoteABC",
+					},
+				}),
+			);
+			for (const key of policyKeys) expect(qc.getQueryState([key, "n1"])?.isInvalidated).toBe(true);
+			expect(panelDomainRequests()).toHaveLength(1);
+		});
+	}
+
+	test("one shared snapshot requiring a body performs at most one body GET", async () => {
+		enablePanelSharing();
+		await render();
+		expect(panelReads()).toHaveLength(1);
+		await act(async () =>
+			respondPanelRequest(
+				panelReads()[0],
+				panelPage({ hasDraft: true, revision: 8, updatedAt: "t8" }),
+			),
+		);
+		expect(draftBodyReads()).toHaveLength(1);
+		await act(async () =>
+			respondPanelRequest(draftBodyReads()[0], {
+				...initial,
+				hasDraft: true,
+				revision: 8,
+				updatedAt: "t8",
+				text: "remote body",
+			}),
+		);
+		expect(handle.current?.getText()).toBe("remote body");
+		expect(readNarratorInputDraft("u1", "n1").syncedRevision).toBe(8);
+		expect(panelDomainRequests().map((request) => request.path)).toEqual([
+			"/api/narrators/n1/panel-state",
+			"/api/narrators/n1/draft",
+		]);
+	});
+
+	test("StrictMode cancels the abandoned setup before starting real transport", async () => {
+		enablePanelSharing();
+		strictMode = true;
+		await render();
+		expect(panelReads()).toHaveLength(1);
+		expect(panelReads()[0].init?.signal?.aborted).toBe(false);
+		await act(async () => respondPanelRequest(panelReads()[0], panelPage()));
+		expect(panelDomainRequests()).toHaveLength(1);
+		expect(handle.current?.getText()).toBe("");
+	});
+
+	test("raw false-to-true in one React batch starts a fresh reconnect snapshot", async () => {
+		enablePanelSharing();
+		await render();
+		expect(panelReads()).toHaveLength(1);
+		await act(async () => {
+			rawPanelConnection(false);
+			rawPanelConnection(true);
+		});
+		expect(panelReads()).toHaveLength(2);
+		await act(async () =>
+			respondPanelRequest(
+				panelReads()[1],
+				panelPage(undefined, [
+					{ id: "fresh-permission", toolName: "Bash", inputJson: { command: "pwd" } },
+				]),
+			),
+		);
+		expect(panelCurrent.pendingPermissions.map((request) => request.id)).toEqual([
+			"fresh-permission",
+		]);
+		await act(async () =>
+			respondPanelRequest(
+				panelReads()[0],
+				panelPage(undefined, [
+					{ id: "stale-permission", toolName: "Bash", inputJson: { command: "old" } },
+				]),
+			),
+		);
+		expect(panelCurrent.pendingPermissions.map((request) => request.id)).toEqual([
+			"fresh-permission",
+		]);
+		expect(panelDomainRequests()).toHaveLength(2);
+	});
+
+	test("token switching rejects a non-cooperative old response before applying state", async () => {
+		enablePanelSharing();
+		await render();
+		const old = panelReads()[0];
+		await act(async () => {
+			seedComposerUser("new-panel-sharing-token", "u2");
+		});
+		await render();
+		expect(old.init?.signal?.aborted).toBe(true);
+		expect(panelReads()).toHaveLength(2);
+		expect(new Headers(panelReads()[1].init?.headers).get("Authorization")).toBe(
+			"Bearer new-panel-sharing-token",
+		);
+		await act(async () => respondPanelRequest(panelReads()[1], panelPage()));
+		await act(async () =>
+			respondPanelRequest(
+				old,
+				panelPage({ hasDraft: true, revision: 99, updatedAt: "old-principal" }, [
+					{ id: "old-principal-permission", toolName: "Bash", inputJson: {} },
+				]),
+			),
+		);
+		expect(panelCurrent.pendingPermissions).toEqual([]);
+		expect(handle.current?.getText()).toBe("");
+		expect(draftBodyReads()).toHaveLength(0);
+		expect(readNarratorInputDraft("u2", "n1").text).toBe("");
+		expect(readNarratorInputDraft("u2", "n1").syncedRevision).not.toBe(99);
+	});
+});
+
+function captureDraftReadTimeouts() {
+	const callbacks: Array<() => void> = [];
+	const realSetTimeout = globalThis.setTimeout;
+	const timerSpy = spyOn(globalThis, "setTimeout").mockImplementation(((
+		callback: TimerHandler,
+		delay?: number,
+		...args: unknown[]
+	) => {
+		if (delay === 15_000 && typeof callback === "function") {
+			callbacks.push(() => callback(...args));
+		}
+		// Keep every real timer and its cancellation semantics; only the chosen deadline is fired early.
+		return realSetTimeout(callback, delay, ...args);
+	}) as typeof setTimeout);
+	return { callbacks, restore: () => timerSpy.mockRestore() };
+}
+
+function draftReadUntilAbort(_id: string, signal?: AbortSignal) {
+	return new Promise<NarratorRemoteDraft>((_resolve, reject) => {
+		if (!signal) throw new Error("Draft read must carry its lifecycle signal");
+		const abort = () => reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+		if (signal.aborted) abort();
+		else signal.addEventListener("abort", abort, { once: true });
+	});
+}
+
+test("hydration body timeout becomes a retryable error instead of remaining loading", async () => {
+	panelSpy.mockResolvedValue(panelPage({ hasDraft: true, revision: 2, updatedAt: "t2" }));
+	getSpy
+		.mockResolvedValue({
+			...initial,
+			hasDraft: true,
+			text: "hydrated after retry",
+			revision: 2,
+			updatedAt: "t2",
+		})
+		.mockImplementationOnce(draftReadUntilAbort);
+	const deadline = captureDraftReadTimeouts();
+	try {
+		await render();
+		expect(getSpy).toHaveBeenCalledTimes(1);
+		expect(deadline.callbacks).toHaveLength(1);
+		const signal = getSpy.mock.calls[0]?.[1];
+		expect(signal?.aborted).toBe(false);
+		expect(host.textContent).not.toContain("draftLoadFailed");
+		await act(async () => deadline.callbacks[0]());
+		expect(signal?.aborted).toBe(true);
+		expect(host.textContent).toContain("draftLoadFailed");
+		expect(
+			[...host.querySelectorAll("button")].some((button) => button.textContent === "draftRetry"),
+		).toBe(true);
+		await clickButton("draftRetry");
+		expect(getSpy).toHaveBeenCalledTimes(2);
+		expect(handle.current?.getText()).toBe("hydrated after retry");
+		expect(host.textContent).not.toContain("draftLoadFailed");
+		expect(
+			[...host.querySelectorAll("button")].some((button) => button.textContent === "draftRetry"),
+		).toBe(false);
+	} finally {
+		deadline.restore();
+	}
+});
+
+test("metadata recovery timeout becomes a retryable error without treating timeout as lifecycle cancellation", async () => {
+	const text = "acknowledged before recovery";
+	persistNarratorInputDraft("u1", "n1", text, 1, "t1", [], { text, fileReferences: [] });
+	panelSpy.mockResolvedValue(panelPage({ hasDraft: true, revision: 1, updatedAt: "t1" }));
+	await render();
+	expect(getSpy).not.toHaveBeenCalled();
+	getSpy
+		.mockResolvedValue({
+			...initial,
+			hasDraft: true,
+			text: "recovered after retry",
+			revision: 4,
+			updatedAt: "t4",
+		})
+		.mockImplementationOnce(draftReadUntilAbort);
+	const deadline = captureDraftReadTimeouts();
+	try {
+		await act(async () =>
+			handle.current?.handleDraftMeta({ hasDraft: true, revision: 4, updatedAt: "t4" }),
+		);
+		expect(getSpy).toHaveBeenCalledTimes(1);
+		expect(deadline.callbacks).toHaveLength(1);
+		const signal = getSpy.mock.calls[0]?.[1];
+		expect(signal?.aborted).toBe(false);
+		await act(async () => deadline.callbacks[0]());
+		expect(signal?.aborted).toBe(true);
+		expect(handle.current?.getText()).toBe(text);
+		expect(host.textContent).toContain("draftLoadFailed");
+		expect(
+			[...host.querySelectorAll("button")].some((button) => button.textContent === "draftRetry"),
+		).toBe(true);
+		panelSpy.mockResolvedValue(panelPage({ hasDraft: true, revision: 4, updatedAt: "t4" }));
+		await clickButton("draftRetry");
+		expect(getSpy).toHaveBeenCalledTimes(2);
+		expect(handle.current?.getText()).toBe("recovered after retry");
+		expect(host.textContent).not.toContain("draftLoadFailed");
+		expect(
+			[...host.querySelectorAll("button")].some((button) => button.textContent === "draftRetry"),
+		).toBe(false);
+	} finally {
+		deadline.restore();
+	}
+});
+
+test("hydration coalesces recovery metadata to the highest revision with bounded follow-up and preserves new input", async () => {
+	panelSpy.mockResolvedValue(panelPage({ hasDraft: true, revision: 2, updatedAt: "t2" }));
+	const initialBody = deferred<NarratorRemoteDraft>();
+	const recoveredBody = deferred<NarratorRemoteDraft>();
+	getSpy.mockReturnValueOnce(initialBody.promise).mockReturnValueOnce(recoveredBody.promise);
+	await render();
+	expect(getSpy).toHaveBeenCalledTimes(1);
+	await act(async () => {
+		for (const revision of [8, 12, 9, 12]) {
+			handle.current?.handleDraftMeta({ hasDraft: true, revision, updatedAt: `t${revision}` });
+		}
+		handle.current?.setText("new input typed while hydration was pending");
+	});
+	expect(getSpy).toHaveBeenCalledTimes(1);
+	await act(async () =>
+		initialBody.resolve({
+			...initial,
+			hasDraft: true,
+			text: "initial old body",
+			revision: 2,
+			updatedAt: "t2",
+		}),
+	);
+	expect(getSpy).toHaveBeenCalledTimes(2);
+	expect(handle.current?.getText()).toBe("new input typed while hydration was pending");
+	await act(async () =>
+		recoveredBody.resolve({
+			...initial,
+			hasDraft: true,
+			text: "highest recovered body",
+			revision: 12,
+			updatedAt: "t12",
+		}),
+	);
+	expect(handle.current?.getText()).toBe("new input typed while hydration was pending");
+	expect(getSpy).toHaveBeenCalledTimes(2);
+	expect(readNarratorInputDraft("u1", "n1").text).toBe(
+		"new input typed while hydration was pending",
+	);
+	expect(readNarratorInputDraft("u1", "n1").unsynced).toBe(true);
+});
+
+test("hydration recovery keeps the highest announcement when later metadata arrives out of order", async () => {
+	panelSpy.mockResolvedValue(panelPage({ hasDraft: true, revision: 2, updatedAt: "t2" }));
+	const initialBody = deferred<NarratorRemoteDraft>();
+	const recoveredBody = deferred<NarratorRemoteDraft>();
+	getSpy.mockReturnValueOnce(initialBody.promise).mockReturnValueOnce(recoveredBody.promise);
+	await render();
+	await act(async () => {
+		for (const revision of [8, 12, 9]) {
+			handle.current?.handleDraftMeta({ hasDraft: true, revision, updatedAt: `t${revision}` });
+		}
+	});
+	expect(getSpy).toHaveBeenCalledTimes(1);
+	await act(async () =>
+		initialBody.resolve({ ...initial, hasDraft: true, text: "initial body", revision: 2 }),
+	);
+	expect(getSpy).toHaveBeenCalledTimes(2);
+	await act(async () =>
+		recoveredBody.resolve({
+			...initial,
+			hasDraft: true,
+			text: "below highest revision",
+			revision: 9,
+		}),
+	);
+	// Accepting 9 would prove the trailing announcement replaced the queued maximum 12.
+	expect(handle.current?.getText()).toBe("initial body");
+	expect(readNarratorInputDraft("u1", "n1").syncedRevision).toBe(2);
+	expect(getSpy).toHaveBeenCalledTimes(2);
+});
+
+test("hydration catch-up stops at its bounded body-read budget under continuous newer metadata", async () => {
+	panelSpy.mockResolvedValue(panelPage({ hasDraft: true, revision: 2, updatedAt: "t2" }));
+	const bodies = Array.from({ length: 4 }, () => deferred<NarratorRemoteDraft>());
+	for (const body of bodies) getSpy.mockReturnValueOnce(body.promise);
+	await render();
+	await act(async () =>
+		handle.current?.handleDraftMeta({ hasDraft: true, revision: 3, updatedAt: "t3" }),
+	);
+	await act(async () =>
+		bodies[0].resolve({ ...initial, hasDraft: true, text: "body 2", revision: 2 }),
+	);
+	for (let index = 1; index < bodies.length; index++) {
+		const revision = index + 2;
+		await act(async () => {
+			handle.current?.handleDraftMeta({
+				hasDraft: true,
+				revision: revision + 1,
+				updatedAt: `t${revision + 1}`,
+			});
+			bodies[index].resolve({ ...initial, hasDraft: true, text: `body ${revision}`, revision });
+		});
+	}
+	expect(getSpy).toHaveBeenCalledTimes(4); // Initial hydration plus at most three catch-up reads.
+	expect(handle.current?.getText()).toBe("body 5");
+	expect(readNarratorInputDraft("u1", "n1").syncedRevision).toBe(5);
+});
 
 test("switching a mounted composer waits for the target narrator's draft before delivering", async () => {
 	for (const [id, text] of [
@@ -457,7 +1100,7 @@ describe("composer revision-only initial reconciliation", () => {
 			expect(handle.current?.getText()).toBe(remote.text);
 			expect(handle.current?.getFileReferences()).toEqual(remote.fileReferences);
 			expect(host.textContent).not.toContain("replaced by remote");
-			expect(getSpy).toHaveBeenCalledTimes(1);
+			expect(getSpy).toHaveBeenCalledTimes(remote.hasDraft ? 1 : 0);
 			expect(readNarratorInputDraft("u1", "n1").syncedRevision).toBe(8);
 			expect(readNarratorInputDraft("u1", "n1").unsynced).toBeUndefined();
 			await act(async () =>
@@ -964,7 +1607,9 @@ describe("composer rich document contract", () => {
 		);
 		await render();
 		expect(documentAssetsChange).not.toHaveBeenCalled();
+		expect(handle.current?.getText()).toBe(input.text);
 		const editor = getEditor();
+		expect(editor.state.doc.textContent).toBe(input.text);
 		await act(async () => editor.view.dispatch(editor.state.tr.insertText("typed ", 1)));
 		expect(handle.current?.getText()).toBe("typed legacy input");
 		expect(documentAssetsChange).not.toHaveBeenCalled();
@@ -1474,6 +2119,94 @@ describe("composer rich document contract", () => {
 		await act(async () => pending.resolve({ ...summary, composerDocument: doc }));
 		expect(handle.current?.getDocument()).toEqual(doc);
 		expect(handle.current?.hasMissingAssets()).toBe(true);
+	});
+});
+
+describe("on-demand narrator mentions", () => {
+	test("plain editor focus and non-mention input make zero candidate requests", async () => {
+		seedComposerUser("mention-session", "u1");
+		const communication = spyOn(api, "searchCommunicationCandidates").mockResolvedValue({
+			items: [],
+			hasMore: false,
+		});
+		const named = spyOn(api, "listNamedNarratorSuggestions").mockResolvedValue({
+			items: [],
+			nextCursor: null,
+		});
+		const legacy = spyOn(api, "listNamedNarrators").mockRejectedValue(
+			new Error("Never fetch the complete named directory"),
+		);
+		try {
+			await render();
+			const input = host.querySelector<HTMLElement>('[role="textbox"]');
+			if (!input) throw new Error("Missing composer textbox");
+			Object.defineProperty(document, "activeElement", { configurable: true, get: () => input });
+			await act(async () => {
+				input.dispatchEvent(new Event("focus"));
+				handle.current?.setText("ordinary focused input");
+			});
+			expect(communication).not.toHaveBeenCalled();
+			expect(named).not.toHaveBeenCalled();
+			expect(legacy).not.toHaveBeenCalled();
+		} finally {
+			communication.mockRestore();
+			named.mockRestore();
+			legacy.mockRestore();
+		}
+	});
+
+	test.each([
+		"hidden",
+		"blur",
+	] as const)("only an active focused mention searches; %s aborts its in-flight page", async (stop) => {
+		seedComposerUser("mention-session", "u1");
+		const pending = deferred<Awaited<ReturnType<typeof api.searchCommunicationCandidates>>>();
+		const communication = spyOn(api, "searchCommunicationCandidates").mockReturnValue(
+			pending.promise,
+		);
+		const named = spyOn(api, "listNamedNarratorSuggestions").mockResolvedValue({
+			items: [],
+			nextCursor: null,
+		});
+		try {
+			await render();
+			const input = host.querySelector<HTMLElement>('[role="textbox"]');
+			if (!input) throw new Error("Missing composer textbox");
+			let active: HTMLElement = input;
+			Object.defineProperty(document, "activeElement", {
+				configurable: true,
+				get: () => active,
+			});
+			await act(async () => handle.current?.setText("@Alpha"));
+			expect(communication).not.toHaveBeenCalled();
+			await act(async () => {
+				getEditor().commands.setTextSelection(7);
+				input.dispatchEvent(new Event("focus"));
+			});
+			expect(communication).toHaveBeenCalledTimes(1);
+			expect(named).not.toHaveBeenCalled();
+			const [narratorId, query, options] = communication.mock.calls[0];
+			expect([narratorId, query]).toEqual([testNarratorId, "alpha"]);
+			expect(options?.signal?.aborted).toBe(false);
+			await act(async () => {
+				if (stop === "hidden") {
+					Object.defineProperty(document, "visibilityState", {
+						configurable: true,
+						value: "hidden",
+					});
+					document.dispatchEvent(new Event("visibilitychange"));
+				} else {
+					active = document.body;
+					input.dispatchEvent(new Event("blur"));
+				}
+			});
+			expect(options?.signal?.aborted).toBe(true);
+			expect(host.querySelector('[role="listbox"]')).toBeNull();
+		} finally {
+			pending.resolve({ items: [], hasMore: false });
+			communication.mockRestore();
+			named.mockRestore();
+		}
 	});
 });
 

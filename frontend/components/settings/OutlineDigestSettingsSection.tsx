@@ -3,7 +3,10 @@ import { OUTLINE_DIGEST_DEFAULT_TIME, OUTLINE_DIGEST_TIME_PATTERN } from "@share
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useOutlineEnabled } from "../../hooks/useOutline";
-import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
+import {
+	useUpdateUserPreferencesDetail as useUpdateUserPreferences,
+	useUserPreferencesDetail as useUserPreferences,
+} from "../../hooks/useUserPreferences";
 
 /** The Select's value for "the server's zone" (stored as null). */
 const SERVER_ZONE = "__server__";

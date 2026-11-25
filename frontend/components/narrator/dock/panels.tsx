@@ -492,6 +492,7 @@ export function SubagentDockPanel(props: IDockviewPanelProps<SubagentPanelParams
 
 // ── Terminal ──
 export function TerminalDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams>) {
+	const visible = useDockviewPanelVisible(props.api);
 	const { t } = useTranslation("terminal");
 	const dock = useNarratorDockContext();
 	// Live context is the source of truth (see ChatDockPanel note).
@@ -523,7 +524,12 @@ export function TerminalDockPanel(props: IDockviewPanelProps<NarratorBoundPanelP
 					</Center>
 				}
 			>
-				<NarratorTerminal narratorId={narratorId} onSendToChat={sendToChat} onExit={close} />
+				<NarratorTerminal
+					narratorId={narratorId}
+					visible={visible}
+					onSendToChat={sendToChat}
+					onExit={close}
+				/>
 			</Suspense>
 		</ToolPanelShell>
 	);
@@ -803,9 +809,11 @@ export function UserChatDockPanel(props: IDockviewPanelProps<NarratorBoundPanelP
 			subjectId="__userchat__"
 			detachKind="userchat"
 		>
-			<LazyPanelBoundary>
-				<NarratorUserChatPanel narratorId={narratorId} />
-			</LazyPanelBoundary>
+			<DockviewNarratorPanelVisibilityProvider api={props.api}>
+				<LazyPanelBoundary>
+					<NarratorUserChatPanel narratorId={narratorId} />
+				</LazyPanelBoundary>
+			</DockviewNarratorPanelVisibilityProvider>
 		</ToolPanelShell>
 	);
 }

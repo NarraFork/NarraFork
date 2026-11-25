@@ -1,7 +1,12 @@
-import { and, eq, isNull } from "drizzle-orm";
+import { and, eq, isNull, sql } from "drizzle-orm";
 import { narrators } from "../../db/schema";
 import { readQueryFirst } from "../../db/worker-read";
 import { parseSubstatus } from "../../lib/narrator-utils";
+import {
+	committedNarratorStatusPatch,
+	narratorStatusPatchColumns,
+	versionNarratorStatusCommit,
+} from "../narrator-status-version";
 import type { RuntimeDb } from "./mailbox-types";
 import { RuntimeReadConflictError } from "./read-conflict";
 import type { RuntimeReadOptions } from "./read-options";
@@ -42,6 +47,9 @@ export function createRuntimeFinalizationReads(db: RuntimeDb) {
 			return row.pending;
 		},
 		async clearTransientSubstatus(narratorId: string, options: RuntimeReadOptions = {}) {
+			return (await this.clearTransientStatusPatch(narratorId, options))?.substatus;
+		},
+		async clearTransientStatusPatch(narratorId: string, options: RuntimeReadOptions = {}) {
 			const row = await readQueryFirst(
 				db
 					.select({ substatus: narrators.substatus })
@@ -54,10 +62,14 @@ export function createRuntimeFinalizationReads(db: RuntimeDb) {
 			if (!row || !tags.some((tag) => tag === "reflecting" || tag === "reasoning"))
 				return undefined;
 			const substatus = tags.filter((tag) => tag !== "reflecting" && tag !== "reasoning");
-			runAtomicWrite(db, "runtime.clearTransientSubstatus", (tx) => {
+			const now = new Date().toISOString();
+			const committed = runAtomicWrite(db, "runtime.clearTransientSubstatus", (tx) => {
 				const updated = tx
 					.update(narrators)
-					.set({ substatus: JSON.stringify(substatus), updatedAt: new Date().toISOString() })
+					.set({
+						substatus: JSON.stringify(substatus),
+						updatedAt: sql`case when ${narrators.updatedAt} > ${now} then ${narrators.updatedAt} else ${now} end`,
+					})
 					.where(
 						and(
 							eq(narrators.id, narratorId),
@@ -66,11 +78,12 @@ export function createRuntimeFinalizationReads(db: RuntimeDb) {
 								: eq(narrators.substatus, row.substatus),
 						),
 					)
-					.returning({ id: narrators.id })
+					.returning(narratorStatusPatchColumns)
 					.get();
 				if (!updated) throw new RuntimeReadConflictError();
+				return versionNarratorStatusCommit(updated);
 			});
-			return substatus;
+			return committed && committedNarratorStatusPatch(narratorId, committed);
 		},
 	};
 }

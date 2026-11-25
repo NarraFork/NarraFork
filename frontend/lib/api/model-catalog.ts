@@ -7,10 +7,69 @@ import type {
 	ModelDescriptionsResponse,
 	ModelOverrideRequest,
 } from "@shared/model-catalog/schema/api";
-import { request } from "./client";
+import { MODEL_RUNTIME_MAX_BYTES, type RuntimeModelSummary } from "@shared/model-runtime";
+import { type RequestOptions, request } from "./client";
+
+export interface ModelCatalogOption {
+	value: string;
+	label: string;
+	provider?: string;
+	modelId?: string;
+	sourceCount?: number;
+	aggregationId?: string;
+	memberCount?: number;
+	available?: boolean;
+	/** Raw configured member, distinct from the aggregation pin used for selection. */
+	concreteValue?: string;
+}
+export interface ModelCatalogOptionsPage {
+	revision: string;
+	items: ModelCatalogOption[];
+	nextCursor: string | null;
+	hasMore: boolean;
+}
+export interface ModelCatalogOptionsInput {
+	q?: string;
+	cursor?: string;
+	limit?: number;
+	scope?: "all" | "auto" | "concrete";
+	sourceModelId?: string;
+	aggregationId?: string;
+}
+
+function boundedOptions(options: RequestOptions | undefined, bytes: number): RequestOptions {
+	return {
+		...options,
+		maxResponseBytes: bytes,
+		signal: options?.signal
+			? AbortSignal.any([options.signal, AbortSignal.timeout(15_000)])
+			: AbortSignal.timeout(15_000),
+	};
+}
 
 const root = "/model-catalog";
 export const modelCatalogApi = {
+	runtime: (input: { model: string; narratorId?: string }, options?: RequestOptions) => {
+		const query = new URLSearchParams({ model: input.model });
+		if (input.narratorId) query.set("narratorId", input.narratorId);
+		return request<RuntimeModelSummary>(
+			`${root}/runtime?${query}`,
+			boundedOptions(options, MODEL_RUNTIME_MAX_BYTES),
+		);
+	},
+	options: (input: ModelCatalogOptionsInput = {}, options?: RequestOptions) => {
+		const query = new URLSearchParams();
+		if (input.q) query.set("q", input.q);
+		if (input.cursor) query.set("cursor", input.cursor);
+		if (input.scope) query.set("scope", input.scope);
+		if (input.limit != null) query.set("limit", String(input.limit));
+		if (input.sourceModelId) query.set("sourceModelId", input.sourceModelId);
+		if (input.aggregationId) query.set("aggregationId", input.aggregationId);
+		return request<ModelCatalogOptionsPage>(
+			`${root}/options?${query}`,
+			boundedOptions(options, 64 * 1024),
+		);
+	},
 	status: () => request<CatalogStatus>(`${root}/status`),
 	/** Every `auto:<model>` some provider serves, sources in the order routing tries them. */
 	autoModels: () => request<{ models: AutoModelInfo[] }>(`${root}/auto`),

@@ -520,11 +520,19 @@ export type NarraForkEvent =
 			narratorId: string | null;
 	  }
 	| {
+			/** A discussion was actually inserted, not merely resolved again. */
+			type: "chat:room_created";
+			roomId: string;
+			narratorId: string;
+	  }
+	| {
 			/** A member advanced their read watermark (read receipts, badge refresh). */
 			type: "chat:room_read";
 			roomId: string;
 			userId: string;
 			lastReadSeq: number;
+			/** Only discussion rooms, never DM/bot conversations. */
+			narratorId?: string;
 	  };
 
 export type NarraForkEventType = NarraForkEvent["type"];

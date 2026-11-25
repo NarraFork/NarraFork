@@ -6,7 +6,10 @@ import { AppearanceSection } from "../../components/settings/AppearanceSection";
 import { AppearanceSwitch } from "../../components/settings/AppearanceSyncControl";
 import { PluginOverlaySettings } from "../../components/settings/PluginOverlaySettings";
 import { useLocalNumberPref, useLocalPref } from "../../hooks/useLocalPref";
-import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
+import {
+	useUpdateUserPreferencesDetail as useUpdateUserPreferences,
+	useUserPreferencesDetail as useUserPreferences,
+} from "../../hooks/useUserPreferences";
 
 export const Route = createFileRoute("/settings/appearance")({
 	component: SettingsAppearancePage,

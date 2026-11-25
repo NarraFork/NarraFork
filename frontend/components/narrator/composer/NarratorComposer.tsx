@@ -23,6 +23,7 @@ import {
 	useMemo,
 	useRef,
 	useState,
+	useSyncExternalStore,
 } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../../hooks/useAuth";
@@ -31,6 +32,11 @@ import { useInputHistory, writeInputHistoryEntries } from "../../../hooks/useInp
 import { useNarratorMentionCandidates } from "../../../hooks/useNarratorMentionCandidates";
 import { usePromptOptimize } from "../../../hooks/usePromptOptimize";
 import { api } from "../../../lib/api";
+import { getToken, onTokenChange } from "../../../lib/api/client";
+import {
+	createNarratorPanelReadScope,
+	type NarratorPanelReadScope,
+} from "../../../lib/api/narrators";
 import { listenComposerAppend } from "../../../lib/composer-append-queue";
 import { useFullscreenEscape } from "../../../lib/fullscreen-escape";
 import { formatLocaleNumber } from "../../../lib/intl-format";
@@ -41,6 +47,7 @@ import { useImageViewer } from "../../common/image-viewer-context";
 import { useNarratorDockContext } from "../dock/NarratorDockContext";
 import { enterOwnedByTarget } from "../interaction/enter-ownership";
 import type { AskSelectionInput } from "../interaction/use-ask-selection-in-passing";
+import { useEditorPanelVisible } from "../narrator-panel-visibility";
 import { CommandParamHelper } from "./CommandParamHelper";
 import { type CommandItem, CommandPopover } from "./CommandPopover";
 import { ComposerTextAttachmentPreview } from "./ComposerTextAttachmentPreview";
@@ -181,6 +188,7 @@ export interface NarratorComposerHandle {
 
 export interface NarratorComposerProps {
 	narratorId: string;
+	readScope?: NarratorPanelReadScope;
 	sendingRef: RefObject<boolean>;
 	appendInputRef?: RefObject<((text: string) => void) | null>;
 	permEnterActive: boolean;
@@ -241,6 +249,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 	function NarratorComposer(
 		{
 			narratorId,
+			readScope: parentReadScope,
 			sendingRef,
 			appendInputRef,
 			permEnterActive,
@@ -272,6 +281,14 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		const qc = useQueryClient();
 		const { data: currentUser } = useCurrentUser();
 		const currentUserId = currentUser?.id ? String(currentUser.id) : null;
+		const token = useSyncExternalStore(onTokenChange, getToken, () => null);
+		// Standalone composers get the same isolation, without borrowing any panel's read.
+		// biome-ignore lint/correctness/useExhaustiveDependencies: identity changes retire the scope.
+		const ownReadScope = useMemo(
+			() => createNarratorPanelReadScope(),
+			[token, currentUserId, narratorId],
+		);
+		const readScope = parentReadScope ?? ownReadScope;
 		const currentDraftScope = currentUserId
 			? getNarratorDraftStorageId(currentUserId, narratorId)
 			: null;
@@ -382,6 +399,12 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		const draftSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 		const draftSyncSeqRef = useRef(0);
 		const draftReadEpochRef = useRef(0);
+		const hydrationEpochRef = useRef<number | null>(null);
+		const pendingDraftMetaRef = useRef<
+			Parameters<NarratorComposerHandle["handleDraftMeta"]>[0] | null
+		>(null);
+		const metaReadRef = useRef<AbortController | null>(null);
+		const drainDraftMetaRef = useRef<() => void>(() => {});
 		const draftOwnerScopeRef = useRef<string | null>(null);
 		const textareaRef = useRef<HTMLDivElement>(null);
 		const editorRef = useRef<InlineComposerEditorHandle>(null);
@@ -845,7 +868,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				composerDocument: ComposerDocument | null = inputStateRef.current.composerDocument ?? null,
 			) => {
 				const refs = copyFileReferences(references, text);
-				if (!currentUserId) throw new Error("Current user is unavailable");
+				if (!currentUserId || getToken() !== token) throw new Error("Current user is unavailable");
 				if (draftOwnerScopeRef.current !== currentDraftScope)
 					throw new Error("Draft belongs to a previous account or narrator");
 				if (lastDraftRevisionRef.current == null)
@@ -867,6 +890,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				);
 				if (
 					seq === draftSyncSeqRef.current &&
+					getToken() === token &&
 					qc.getQueryData<{ id?: string }>(["auth", "me"])?.id === currentUserId
 				) {
 					lastSyncedDraftRef.current = {
@@ -900,7 +924,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				}
 				return result;
 			},
-			[currentUserId, currentDraftScope, narratorId, qc, readPersistableDocument],
+			[currentUserId, currentDraftScope, narratorId, qc, readPersistableDocument, token],
 		);
 
 		const clearTextAndDraft = useCallback(() => {
@@ -934,6 +958,10 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			// An old account/narrator's in-flight save must not overwrite the newly hydrated pair.
 			draftSyncSeqRef.current++;
 			const readEpoch = ++draftReadEpochRef.current;
+			hydrationEpochRef.current = readEpoch;
+			metaReadRef.current?.abort();
+			metaReadRef.current = null;
+			pendingDraftMetaRef.current = null;
 			draftOwnerScopeRef.current = null;
 			seenDraftRevisionRef.current = null;
 			unsyncedBaseRevisionRef.current = null;
@@ -950,10 +978,12 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			let cancelled = false;
 			const controller = new AbortController();
 			const timer = setTimeout(() => controller.abort(), 15_000);
-			const alive = () =>
+			const isCurrent = () =>
 				!cancelled &&
+				getToken() === token &&
 				draftReadEpochRef.current === readEpoch &&
 				qc.getQueryData<{ id?: string }>(["auth", "me"])?.id === currentUserId;
+			const alive = () => isCurrent() && !controller.signal.aborted;
 			setDraftHydrated(false);
 			setDraftSyncState("loading");
 			setDisplacedDraft(null);
@@ -984,6 +1014,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			draftOwnerScopeRef.current = currentDraftScope;
 			setDraftHydrated(true);
 			if (localDraftOnly) {
+				hydrationEpochRef.current = null;
 				clearTimeout(timer);
 				setDraftSyncState("local");
 				return;
@@ -992,10 +1023,15 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			const loadDraft = async () => {
 				try {
 					const panel = await api.getNarratorPanelState(narratorId, {
+						readScope,
 						signal: controller.signal,
 						fresh: draftLoadAttempt > 0,
 					});
 					if (!alive()) return;
+					seenDraftRevisionRef.current = Math.max(
+						seenDraftRevisionRef.current ?? -1,
+						panel.draft.revision,
+					);
 					if (canHydrateNarratorDraftFromMeta(localDraft, panel.draft)) {
 						// The local snapshot is acknowledged. Keep any text/references typed while metadata loaded.
 						lastSyncedDraftRef.current = {
@@ -1018,9 +1054,20 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						);
 						return;
 					}
+					if (!panel.draft.hasDraft) {
+						// A tombstone has no body, references or rich document to retrieve.
+						return {
+							...panel.draft,
+							text: "",
+							fileReferences: [],
+							sourceId: null,
+							updatedBy: null,
+						};
+					}
 				} catch (error) {
 					if (!alive() || !shouldFallbackPanelState(error)) throw error;
 				}
+				if (!alive()) return;
 				return api.getNarratorDraft(narratorId, controller.signal);
 			};
 
@@ -1084,11 +1131,20 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					setDraftSyncState("ready");
 				})
 				.catch(() => {
-					if (alive()) setDraftSyncState("error");
+					// A timeout is an actionable error, not a lifecycle cancellation.
+					if (isCurrent()) setDraftSyncState("error");
 				})
-				.finally(() => clearTimeout(timer));
+				.finally(() => {
+					clearTimeout(timer);
+					if (hydrationEpochRef.current !== readEpoch) return;
+					hydrationEpochRef.current = null;
+					if (!cancelled && getToken() === token) drainDraftMetaRef.current();
+				});
 			return () => {
 				cancelled = true;
+				if (hydrationEpochRef.current === readEpoch) hydrationEpochRef.current = null;
+				metaReadRef.current?.abort();
+				metaReadRef.current = null;
 				clearTimeout(timer);
 				draftSyncSeqRef.current++;
 				controller.abort();
@@ -1096,6 +1152,8 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		}, [
 			currentUserId,
 			currentDraftScope,
+			readScope,
+			token,
 			draftLoadAttempt,
 			localDraftOnly,
 			narratorId,
@@ -1152,16 +1210,26 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		const remoteDraftHandlerRef = useRef<(draft: NarratorRemoteDraft) => void>(() => {});
 		const handleDraftChanged = useCallback(
 			(draft: NarratorRemoteDraft) => {
+				if (getToken() !== token) return;
 				const currentRevision = lastDraftRevisionRef.current;
 				if (currentRevision != null && draft.revision < currentRevision) return;
 				seenDraftRevisionRef.current = Math.max(seenDraftRevisionRef.current ?? -1, draft.revision);
 				if (draft.hasDraft && draft.hasComposerDocument && !draft.composerDocument) {
+					if (hydrationEpochRef.current !== null || metaReadRef.current) {
+						if (
+							!pendingDraftMetaRef.current ||
+							draft.revision > pendingDraftMetaRef.current.revision
+						)
+							pendingDraftMetaRef.current = draft;
+						return;
+					}
 					const epoch = ++draftReadEpochRef.current;
 					const scope = draftOwnerScopeRef.current;
 					void api
 						.getNarratorDraft(narratorId, AbortSignal.timeout(15_000))
 						.then((detail) => {
 							if (
+								getToken() !== token ||
 								epoch !== draftReadEpochRef.current ||
 								scope !== draftOwnerScopeRef.current ||
 								detail.revision < draft.revision ||
@@ -1180,6 +1248,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						})
 						.catch(() => {
 							if (
+								getToken() === token &&
 								epoch === draftReadEpochRef.current &&
 								scope === draftOwnerScopeRef.current &&
 								// PUT already returns the full draft after broadcasting its summary.
@@ -1269,6 +1338,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				restoreRemoteInput,
 				readPersistableDocument,
 				hasUnsyncedLocalInput,
+				token,
 			],
 		);
 
@@ -1280,26 +1350,85 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		 * write (WS gap), pull the body and run it through the normal state machine.
 		 * The local-keystrokes-win rule inside handleDraftChanged still applies.
 		 */
+		const drainDraftMeta = useCallback(() => {
+			if (
+				localDraftOnly ||
+				hydrationEpochRef.current !== null ||
+				metaReadRef.current ||
+				getToken() !== token
+			)
+				return;
+			if (!pendingDraftMetaRef.current) return;
+			if (pendingDraftMetaRef.current.revision <= (lastDraftRevisionRef.current ?? -1)) {
+				pendingDraftMetaRef.current = null;
+				return;
+			}
+			const controller = new AbortController();
+			metaReadRef.current = controller;
+			const scope = draftOwnerScopeRef.current;
+			const unsubscribe = onTokenChange(() => {
+				if (getToken() !== token) controller.abort();
+			});
+			let timedOut = false;
+			const timer = setTimeout(() => {
+				timedOut = true;
+				controller.abort();
+			}, 15_000);
+			void (async () => {
+				// Coalesce all announcements during hydration/in-flight reads. A busy
+				// remote editor cannot create an unbounded catch-up request loop.
+				for (let reads = 0; reads < 3; reads++) {
+					const meta = pendingDraftMetaRef.current;
+					if (!meta || meta.revision <= (lastDraftRevisionRef.current ?? -1)) {
+						pendingDraftMetaRef.current = null;
+						return;
+					}
+					const epoch = draftReadEpochRef.current;
+					const detail = await api.getNarratorDraft(narratorId, controller.signal);
+					if (
+						controller.signal.aborted ||
+						getToken() !== token ||
+						scope !== draftOwnerScopeRef.current
+					)
+						return;
+					if (epoch !== draftReadEpochRef.current) continue;
+					if (detail.revision < meta.revision)
+						throw new Error("Draft detail predates announced revision");
+					if (detail.revision > (lastDraftRevisionRef.current ?? -1))
+						remoteDraftHandlerRef.current({ ...detail, hasComposerDocument: false });
+				}
+				if ((pendingDraftMetaRef.current?.revision ?? -1) > (lastDraftRevisionRef.current ?? -1))
+					throw new Error("Draft recovery budget exceeded");
+			})()
+				.catch(() => {
+					if (
+						(timedOut || !controller.signal.aborted) &&
+						getToken() === token &&
+						scope === draftOwnerScopeRef.current
+					)
+						setDraftSyncState("error");
+				})
+				.finally(() => {
+					clearTimeout(timer);
+					unsubscribe();
+					if (metaReadRef.current === controller) metaReadRef.current = null;
+				});
+		}, [localDraftOnly, narratorId, token]);
+		drainDraftMetaRef.current = drainDraftMeta;
 		const handleDraftMeta = useCallback(
 			(meta: { hasDraft: boolean; revision: number; updatedAt: string | null }) => {
-				const current = lastDraftRevisionRef.current;
-				if (current == null || meta.revision <= current) return;
-				const epoch = draftReadEpochRef.current;
-				const scope = draftOwnerScopeRef.current;
-				void api
-					.getNarratorDraft(narratorId, AbortSignal.timeout(15_000))
-					.then((detail) => {
-						if (
-							epoch !== draftReadEpochRef.current ||
-							scope !== draftOwnerScopeRef.current ||
-							detail.revision <= (lastDraftRevisionRef.current ?? 0)
-						)
-							return;
-						remoteDraftHandlerRef.current({ ...detail, hasComposerDocument: false });
-					})
-					.catch(() => {});
+				if (
+					localDraftOnly ||
+					getToken() !== token ||
+					meta.revision <= (lastDraftRevisionRef.current ?? -1)
+				)
+					return;
+				seenDraftRevisionRef.current = Math.max(seenDraftRevisionRef.current ?? -1, meta.revision);
+				if (!pendingDraftMetaRef.current || meta.revision > pendingDraftMetaRef.current.revision)
+					pendingDraftMetaRef.current = meta;
+				drainDraftMeta();
 			},
-			[narratorId],
+			[drainDraftMeta, localDraftOnly, token],
 		);
 
 		// --- Command popover ---
@@ -1366,6 +1495,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		}, [clearTextAndDraft]);
 
 		// === Authored narrator references (ordinary @text is never promoted) =========
+		const composerVisible = useEditorPanelVisible();
 		const [mentionCaret, setMentionCaret] = useState<number | null>(null);
 		const [queryContext, setQueryContext] =
 			useState<ReturnType<InlineComposerEditorHandle["getTextContext"]>>(null);
@@ -1394,7 +1524,11 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			return getMentionQuery(queryContext.text, queryContext.caret - queryContext.start);
 		}, [commandInput, mentionCaret, queryContext]);
 		const mentionPopoverVisible =
-			editorFocused && mentionQuery !== null && !inputHistory.isBrowsing && !draft;
+			composerVisible &&
+			editorFocused &&
+			mentionQuery !== null &&
+			!inputHistory.isBrowsing &&
+			!draft;
 		const {
 			candidates: mentionCandidates,
 			loading: mentionLoading,
@@ -1443,7 +1577,8 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					priority: PANEL_DROP_PRIORITY.composer,
 					hitTest: (state) => {
 						const element = editorRef.current?.getElement();
-						if (!element || draft || state.subjectKind !== "narrator") return null;
+						if (!element || !composerVisible || draft || state.subjectKind !== "narrator")
+							return null;
 						const rect = element.getBoundingClientRect();
 						return rect.width > 0 &&
 							rect.height > 0 &&
@@ -1460,7 +1595,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 						insertNarratorReference({ id: hit.id, title: hit.title });
 					},
 				}),
-			[narratorId, dropTargetId, draft, sendingRef, insertNarratorReference],
+			[narratorId, dropTargetId, composerVisible, draft, sendingRef, insertNarratorReference],
 		);
 		const closeMentionPopover = useCallback(() => setMentionCaret(null), []);
 

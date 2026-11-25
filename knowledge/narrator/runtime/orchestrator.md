@@ -35,7 +35,7 @@ keywords:
   - 跟随父会话模型
   - RuntimePolicy
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 ---
 # 调度与执行
 
@@ -53,6 +53,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
   - `hold`：接管，加 `taken_over` 子状态；`finalizing` 时返回 false。
   - `release`：运行中则标记已释放并唤醒；已结束则起一个有界 owner 投递保留的结果。
 - 终态：`finishRun` 先置 `finalizing`；事件类型按顺序判定：超时 `timed_out`、错误 `failed`、中断 `cancelled`、否则 `completed`；被中断（`interrupted`）时不计为错误，超时则同时记为错误。
+- 真实运行收尾通知：`executeRun` 等循环 finalizer 清除 `_loopRunning` 并提交最终 `lastStopReason`，仅在 `owner.release()` 成功且不是 checkpoint stop 时发 `notifyAgentInboxChanged`，然后才进入 `afterRunRelease`。错误/用户中断即使禁止自动唤醒也仍通知界面；通知不是允许自动恢复的许可。`afterRunRelease` 仍受运行准入与 `allowInboxWake/_resumeBufferedAfterLoop` 限制（`agent-runtime-orchestrator-contract.test.ts` 覆盖 normal/error/user_interrupt 的释放时序）。
 - 回合失败恢复（`transition.ts:selectRuntimeRecovery`，纯函数），按顺序：
   - 中止 → `aborted`；欠费 → `payment`；模型不可用 → `model-unavailable`；上下文溢出 → `overflow`。
   - 无状态模型的可重试错误 → `retry-exhausted`（提供方循环已重试过，外层不再重放）。

@@ -12,7 +12,11 @@ import {
 	toPersistedNavLayout,
 } from "./nav-layout";
 import { useOutlineEnabled } from "./useOutlineEnabled";
-import { useUpdateUserPreferences, useUserPreferences } from "./useUserPreferences";
+import {
+	isUserPreferencesScopeCurrent,
+	useUpdateUserPreferences,
+	useUserPreferences,
+} from "./useUserPreferences";
 
 /**
  * The persisted layout is a single flat ordered list of ids. One special id —
@@ -29,7 +33,7 @@ export interface NavLayout {
 	items: NavLayoutEntry[];
 }
 
-type Preferences = Awaited<ReturnType<typeof api.getUserPreferences>>;
+type Preferences = Awaited<ReturnType<typeof api.getUIPreferences>>;
 
 /**
  * Read and write the user's customizable sidebar navigation layout.
@@ -37,7 +41,7 @@ type Preferences = Awaited<ReturnType<typeof api.getUserPreferences>>;
  * follows the user across devices.
  */
 export function useNavLayout() {
-	const { data: prefs } = useUserPreferences();
+	const { data: prefs, queryKey } = useUserPreferences();
 	const updatePrefs = useUpdateUserPreferences();
 	const queryClient = useQueryClient();
 
@@ -68,13 +72,14 @@ export function useNavLayout() {
 
 	const saveLayout = useCallback(
 		(nextEntries: NavLayoutEntry[]) => {
+			if (!isUserPreferencesScopeCurrent(queryKey)) return;
 			const persisted = toPersistedNavLayout(
 				restoreWithheldNavEntries(nextEntries, storedEntries, hidden),
 			);
-			const previous = queryClient.getQueryData<Preferences>(["user-preferences"]);
+			const previous = queryClient.getQueryData<Preferences>(queryKey);
 			// Optimistic update
 			if (previous) {
-				queryClient.setQueryData<Preferences>(["user-preferences"], {
+				queryClient.setQueryData<Preferences>(queryKey, {
 					...previous,
 					navLayout: persisted,
 				});
@@ -83,14 +88,14 @@ export function useNavLayout() {
 				{ navLayout: persisted },
 				{
 					onError: () => {
-						if (previous) {
-							queryClient.setQueryData(["user-preferences"], previous);
+						if (previous && isUserPreferencesScopeCurrent(queryKey)) {
+							queryClient.setQueryData(queryKey, previous);
 						}
 					},
 				},
 			);
 		},
-		[queryClient, updatePrefs, storedEntries, hidden],
+		[queryClient, updatePrefs, storedEntries, hidden, queryKey],
 	);
 
 	return { entries, visibleItems, dividerIndex, saveLayout };

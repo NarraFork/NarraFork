@@ -2,10 +2,12 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { clearToken, setToken } from "@frontend/lib/api/client";
 import type { PretextDocumentPageResult, TreeMessage } from "@frontend/lib/api/types";
 import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
+import { restorePretextLayoutAnchor } from "@shared/pretext-layout";
 import type { MessageSegmentationCache } from "../message/message-segments";
 import type { NarratorMsg } from "../narrator-panel-types";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 import { peekCachedPretextDocument } from "./pretext-document-cache";
+import type { PretextDocumentInput } from "./pretext-document-loader";
 import { captureCoordinatorAnchor, PretextLayoutCoordinator } from "./pretext-layout-coordinator";
 import type { StreamingBlockCache } from "./streaming-block-cache";
 
@@ -107,7 +109,7 @@ describe("PretextLayoutCoordinator", () => {
 		expect(coordinator.getSnapshot().input?.messageVersion).toBe(4);
 	});
 
-	for (const boundary of ["reset", "cancel", "generation", "narrator", "session"] as const) {
+	for (const boundary of ["reset", "cancel", "structure", "narrator", "session"] as const) {
 		it(`${boundary} cancels canonical transport and rejects a late commit`, async () => {
 			if (boundary === "session") setToken("canonical-window-first-principal");
 			const coordinator = new PretextLayoutCoordinator();
@@ -137,7 +139,7 @@ describe("PretextLayoutCoordinator", () => {
 			expect(signal?.aborted).toBe(false);
 			if (boundary === "reset") coordinator.reset();
 			if (boundary === "cancel") coordinator.cancel();
-			if (boundary === "generation") coordinator.rebuild({ ...buildOptions, contentWidth: 900 });
+			if (boundary === "structure") coordinator.removeMessages(["m-0"]);
 			if (boundary === "narrator")
 				await coordinator.load("replacement-scope", buildOptions, {
 					fetchPage: async () => ({ ...page(), messageVersion: 12 }),
@@ -156,6 +158,265 @@ describe("PretextLayoutCoordinator", () => {
 			}
 		});
 	}
+
+	it("geometry rebuilds retarget one canonical chain with zero aborts or tail reads", async () => {
+		const coordinator = new PretextLayoutCoordinator();
+		let release = () => {};
+		let started = () => {};
+		let signal: AbortSignal | undefined;
+		let queries = 0;
+		let tails = 0;
+		let locates = 0;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const opened = new Promise<void>((resolve) => {
+			started = resolve;
+		});
+		await coordinator.load("geometry-canonical", buildOptions, {
+			locateMessage: async () => {
+				locates++;
+				return { seq: 0 };
+			},
+			fetchPage: async (_id, opts) => {
+				if (opts.afterSeq === undefined) {
+					tails++;
+					return page();
+				}
+				queries++;
+				signal = opts.signal;
+				started();
+				await gate;
+				return { ...page(), messageVersion: 4 };
+			},
+		});
+		let view = { scrollTop: 0, viewportHeight: 60, pinnedToBottom: false };
+		const refresh = coordinator.refreshCurrentWindow(() => view);
+		await opened;
+		coordinator.rebuild({ ...buildOptions, contentWidth: 640, widthBucket: "640", topPadding: 80 });
+		coordinator.invalidateFontDependentLayout(() => view);
+		coordinator.finishResize(
+			{ ...buildOptions, contentWidth: 480, widthBucket: "480", topPadding: 96 },
+			view,
+		);
+		view = { ...view, scrollTop: 12 };
+		const before = coordinator.getSnapshot();
+		if (!before.index) throw new Error("missing index");
+		const anchor = captureCoordinatorAnchor(before.index, view);
+		expect(coordinator.refreshCurrentWindow(() => view)).toBe(refresh);
+		expect(signal?.aborted).toBe(false);
+		release();
+		expect(await refresh).toBe(true);
+		const next = coordinator.getSnapshot();
+		expect(next.manifest?.widthBucket).toBe("480");
+		expect(next.input?.messageVersion).toBe(4);
+		expect(next.scrollTop).toBe(
+			restorePretextLayoutAnchor(anchor, before.index, view.viewportHeight),
+		);
+		expect({ queries, tails, locates }).toEqual({ queries: 1, tails: 1, locates: 1 });
+		expect(signal?.aborted).toBe(false);
+	});
+
+	it("suspension retains window/anchor, aborts transport and resumes via host recovery only", async () => {
+		const coordinator = new PretextLayoutCoordinator();
+		let reads = 0;
+		let signal: AbortSignal | undefined;
+		let fail = false;
+		const errors: unknown[] = [];
+		await coordinator.load("suspended-host", buildOptions, {
+			fetchPage: async () => {
+				reads++;
+				return { ...page(), hasPrev: true };
+			},
+			locateMessage: async () => {
+				throw new Error("host must not locate");
+			},
+			refreshFailurePolicy: "retain",
+			onRefreshError: (error) => errors.push(error),
+			refreshWindow: async ({ window, signal: currentSignal }) => {
+				signal = currentSignal;
+				if (fail) throw new Error("temporary catch-up failure");
+				return { ...window, messageVersion: window.messageVersion + 1 };
+			},
+		});
+		const before = coordinator.getSnapshot();
+		coordinator.setSuspended(true);
+		expect(coordinator.getSnapshot().input).toBe(before.input);
+		expect(coordinator.getSnapshot().index).toBe(before.index);
+		expect(await coordinator.loadOlder(buildOptions)).toBe(0);
+		await expect(
+			coordinator.refreshCurrentWindow(() => ({
+				scrollTop: 0,
+				viewportHeight: 720,
+				pinnedToBottom: false,
+			})),
+		).rejects.toMatchObject({ name: "AbortError" });
+		coordinator.setSuspended(false);
+		const view = () => ({ scrollTop: 0, viewportHeight: 720, pinnedToBottom: false });
+		expect(await coordinator.refreshCurrentWindow(view)).toBe(true);
+		expect(reads).toBe(1);
+		fail = true;
+		const retained = coordinator.getSnapshot();
+		await expect(coordinator.refreshCurrentWindow(view)).rejects.toThrow(
+			"temporary catch-up failure",
+		);
+		expect(coordinator.getSnapshot().input).toBe(retained.input);
+		expect(coordinator.getSnapshot().index).toBe(retained.index);
+		expect(coordinator.getSnapshot().status).toBe("ready");
+		expect(errors).toHaveLength(1);
+		expect(signal?.aborted).toBe(false);
+	});
+
+	for (const kind of ["tail", "older"] as const) {
+		it(`suspension aborts a pending ${kind} HTTP and retains the prior committed window`, async () => {
+			const coordinator = new PretextLayoutCoordinator();
+			let signal: AbortSignal | undefined;
+			let release = () => {};
+			const gate = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const fetchPage = async (_id: string, opts: { signal?: AbortSignal; beforeSeq?: number }) => {
+				if (kind === "tail" || opts.beforeSeq !== undefined) {
+					signal = opts.signal;
+					await gate;
+				}
+				return opts.beforeSeq === undefined
+					? {
+							...page(),
+							messages: [message(10, "ten"), message(11, "eleven")],
+							minSeq: 10,
+							maxSeq: 11,
+							hasPrev: true,
+						}
+					: page();
+			};
+			if (kind === "older")
+				await coordinator.load(`suspend-http-${kind}`, buildOptions, { fetchPage });
+			const before = coordinator.getSnapshot();
+			const pending = (
+				kind === "tail"
+					? coordinator.load(`suspend-http-${kind}`, buildOptions, { fetchPage })
+					: coordinator.loadOlder(buildOptions)
+			).catch((error) => error);
+			for (let i = 0; i < 6; i++) await Promise.resolve();
+			expect(signal?.aborted).toBe(false);
+			coordinator.setSuspended(true);
+			for (let i = 0; i < 6; i++) await Promise.resolve();
+			expect(signal?.aborted).toBe(true);
+			release();
+			await pending;
+			expect(coordinator.getSnapshot().input).toBe(before.input);
+			expect(coordinator.getSnapshot().index).toBe(before.index);
+			expect(coordinator.getSnapshot().loadingOlder).toBe(false);
+		});
+	}
+
+	for (const status of [401, 403]) {
+		it(`host recovery ${status} clears retained content even with retain policy`, async () => {
+			const coordinator = new PretextLayoutCoordinator();
+			await coordinator.load(`host-auth-${status}`, buildOptions, {
+				fetchPage: async () => page(),
+				refreshFailurePolicy: "retain",
+				refreshWindow: async () => {
+					throw Object.assign(new Error("denied"), { status });
+				},
+			});
+			coordinator.publishDocumentSnapshot();
+			await expect(
+				coordinator.refreshCurrentWindow(() => ({
+					scrollTop: 0,
+					viewportHeight: 720,
+					pinnedToBottom: false,
+				})),
+			).rejects.toMatchObject({ status });
+			expect(coordinator.getSnapshot().input).toBeUndefined();
+			expect(coordinator.getSnapshot().index).toBeUndefined();
+			expect(peekCachedPretextDocument(`host-auth-${status}`)).toBeNull();
+		});
+	}
+
+	it("finalizes a late deletion after async preparation, before publishing any canonical body", async () => {
+		const coordinator = new PretextLayoutCoordinator();
+		let deleted = false;
+		let finalizations = 0;
+		await coordinator.load("late-finalize", buildOptions, {
+			fetchPage: async () => page(),
+			refreshWindow: async (args) => ({
+				...args.window,
+				messages: [message(0, "STALE_BODY_TO_REMOVE"), message(1, "two")],
+				messageVersion: 4,
+			}),
+			finalizeRefreshWindow: (window) => {
+				finalizations++;
+				return deleted
+					? {
+							...window,
+							messages: window.messages.map((entry) =>
+								entry.id === "m-0" ? message(0, "deleted during preparation") : entry,
+							),
+						}
+					: window;
+			},
+		});
+		const preparation = coordinator as unknown as {
+			prepareKatex: (input: PretextDocumentInput) => Promise<void>;
+		};
+		const original = preparation.prepareKatex.bind(coordinator);
+		let release = () => {};
+		let started = () => {};
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const opened = new Promise<void>((resolve) => {
+			started = resolve;
+		});
+		preparation.prepareKatex = async (input) => {
+			started();
+			await gate;
+			await original(input);
+		};
+		const committedBodies: string[] = [];
+		coordinator.subscribe(() => {
+			for (const entry of coordinator.getSnapshot().input?.messages ?? [])
+				committedBodies.push(entry.contentText ?? "");
+		});
+		const refresh = coordinator.refreshCurrentWindow(() => ({
+			scrollTop: 0,
+			viewportHeight: 720,
+			pinnedToBottom: false,
+		}));
+		await opened;
+		expect(finalizations).toBe(0);
+		deleted = true;
+		release();
+		expect(await refresh).toBe(true);
+		expect(finalizations).toBe(1);
+		expect(coordinator.getSnapshot().input?.messages[0]?.contentText).toBe(
+			"deleted during preparation",
+		);
+		expect(committedBodies).not.toContain("STALE_BODY_TO_REMOVE");
+	});
+
+	it("a genuine structural mutation inside the final barrier still aborts canonical commit", async () => {
+		const coordinator = new PretextLayoutCoordinator();
+		await coordinator.load("finalize-structure", buildOptions, {
+			fetchPage: async () => page(),
+			refreshWindow: async ({ window }) => ({ ...window, messageVersion: 99 }),
+			finalizeRefreshWindow: (window) => {
+				coordinator.removeMessages(["m-0"]);
+				return window;
+			},
+		});
+		await expect(
+			coordinator.refreshCurrentWindow(() => ({
+				scrollTop: 0,
+				viewportHeight: 720,
+				pinnedToBottom: false,
+			})),
+		).rejects.toMatchObject({ name: "AbortError" });
+		expect(coordinator.getSnapshot().input?.messages.map((entry) => entry.id)).toEqual(["m-1"]);
+		expect(coordinator.getSnapshot().input?.messageVersion).not.toBe(99);
+	});
 
 	it("an unpositioned restore never evicts a valid input or invents a one-pixel layout", async () => {
 		const first = new PretextLayoutCoordinator();

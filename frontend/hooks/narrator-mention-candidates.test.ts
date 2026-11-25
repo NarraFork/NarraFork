@@ -97,8 +97,12 @@ describe("mention candidate local model", () => {
 			["local", true],
 			["more", false],
 		]);
-		expect(mergeNarratorMentionCandidates(local, remote, "renamed")).toHaveLength(0);
-		expect(mergeNarratorMentionCandidates(local, remote, "local")[0]?.title).toBe("local");
+		// The server page has already matched the current title. Enrichment can retain
+		// a locally edited label without accidentally hiding that authorized hit.
+		expect(mergeNarratorMentionCandidates(local, remote.slice(0, 1), "renamed")).toMatchObject([
+			{ id: "local", title: "local" },
+		]);
+		expect(mergeNarratorMentionCandidates(local, [], "local")[0]?.title).toBe("local");
 	});
 });
 

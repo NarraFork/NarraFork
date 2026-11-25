@@ -32,7 +32,7 @@ export function useFastModeUpdates(enabled = true) {
 				timer = undefined;
 				void invalidateFastModeDetails(client);
 				if (refreshPreferences) {
-					void client.invalidateQueries({ queryKey: ["user-preferences"], exact: true });
+					void client.invalidateQueries({ queryKey: ["user-preferences"] });
 				}
 				refreshPreferences = false;
 			}, 100);

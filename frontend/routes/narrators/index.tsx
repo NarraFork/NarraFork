@@ -34,7 +34,7 @@ import {
 	useNarratorInfiniteScroll,
 	validateNarratorListSearch,
 } from "../../components/narrator/list/narrator-list-utils";
-import { useAllModels } from "../../hooks/useModels";
+import { useModelRuntimeSettings } from "../../hooks/useModels";
 import { useArchiveNarrator, useNarratorsPaginated } from "../../hooks/useNarrator";
 import { useNarratorsListWS } from "../../hooks/useNarratorWS";
 import { addRecentTab } from "../../hooks/useRecentTabs";
@@ -123,7 +123,7 @@ function NarratorsPage() {
 		}
 	}, [search.create, guardedOpen, setSearch]);
 
-	const { defaultModelValue } = useAllModels();
+	const { defaultModelValue } = useModelRuntimeSettings();
 
 	// 顺便提问子会话也订阅：它们的状态变化同样会到达这张列表，只是挂在父项下面。
 	const narratorIds = useMemo(

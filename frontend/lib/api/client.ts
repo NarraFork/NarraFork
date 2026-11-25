@@ -90,9 +90,10 @@ export function getAuthSnapshot(): AuthSnapshot {
 	return authSnapshot;
 }
 
-function getTokenGeneration(token: string | null): number | undefined {
+function getSessionRequestGeneration(token: string | null, headers: Headers): number | undefined {
 	observeToken(token || null);
-	return token ? authSnapshot.generation : undefined;
+	const sent = headers.get("Authorization")?.match(/^Bearer\s+(.+)$/i)?.[1];
+	return token && token === sent ? authSnapshot.generation : undefined;
 }
 
 function publishTokenChange(token: string | null): void {
@@ -263,9 +264,7 @@ export async function authorizedFetch(input: string | URL, init?: RequestInit): 
 	if (token && !headers.has("Authorization")) {
 		headers.set("Authorization", `Bearer ${token}`);
 	}
-	const generation = getTokenGeneration(token);
-	const sessionGeneration =
-		token && headers.get("Authorization") === `Bearer ${token}` ? generation : undefined;
+	const sessionGeneration = getSessionRequestGeneration(token, headers);
 	const response = await businessTransport.request(String(input), { ...init, headers });
 	return recordResponseGeneration(response, sessionGeneration);
 }
@@ -494,15 +493,18 @@ export async function request<T>(
 	},
 ): Promise<T> {
 	const { maxResponseBytes, onResponseBytes, ...fetchOptions } = options ?? {};
-	const headers: Record<string, string> = { ...(options?.headers as Record<string, string>) };
+	const headers: Record<string, string> =
+		options?.headers instanceof Headers || Array.isArray(options?.headers)
+			? Object.fromEntries(new Headers(options.headers))
+			: { ...options?.headers };
 	if (options?.body) {
 		headers["Content-Type"] = "application/json";
 	}
 	const token = getToken();
-	if (token) {
+	if (token && !new Headers(headers).has("Authorization")) {
 		headers.Authorization = `Bearer ${token}`;
 	}
-	const generation = getTokenGeneration(token);
+	const generation = getSessionRequestGeneration(token, new Headers(headers));
 	const response = await businessTransport.request(apiUrl(path), { ...fetchOptions, headers });
 	// Apply the same byte budget before parsing either success or error bodies.
 	const boundedText =
@@ -551,12 +553,7 @@ function postWithProgress(
 	body: Blob | FormData,
 	options?: UploadProgressOptions,
 ): Promise<Response> {
-	const token = getToken();
-	const generation = getTokenGeneration(token);
-	const sessionGeneration =
-		token && new Headers(options?.headers).get("Authorization") === `Bearer ${token}`
-			? generation
-			: undefined;
+	const sessionGeneration = getSessionRequestGeneration(getToken(), new Headers(options?.headers));
 	return businessTransport
 		.upload(String(resolveApiInput(url)), body, options)
 		.then((response) => recordResponseGeneration(response, sessionGeneration))

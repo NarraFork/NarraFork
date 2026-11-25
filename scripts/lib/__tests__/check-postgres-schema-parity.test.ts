@@ -523,8 +523,8 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 147 tables and 1962 columns", () => {
-		expect(target.tables.length).toBe(147);
+	test("covers 149 tables and 1974 columns", () => {
+		expect(target.tables.length).toBe(149);
 		// 1714 SQLite-derived columns include disk_outcome and the two editor recovery columns,
 		// plus the three PG-only insert_seq identity columns.
 		// The numeric context stats replace the 5-column page cache with pins (3) and stats (4).
@@ -575,7 +575,25 @@ describe("real schema parity", () => {
 		// Ask-in-passing groups add two nullable narrator links.
 		// Watch registrants add background_tasks.principal_json (nullable).
 		// Team tabs in the sidebar add user_recent_tabs.project_id (nullable).
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1962);
+		// Communication inheritance adds 4 node columns and exact contacts add 8 peer columns.
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1974);
+		expect(
+			target.tables.find((table) => table.name === "narrator_communication_nodes")?.columns,
+		).toHaveLength(4);
+		expect(
+			target.tables
+				.find((table) => table.name === "narrator_communication_peers")
+				?.columns.map((column) => column.name),
+		).toEqual([
+			"id",
+			"endpoint_lo",
+			"endpoint_hi",
+			"created_by",
+			"source",
+			"admission_id",
+			"message_id",
+			"created_at",
+		]);
 		expect(
 			target.tables
 				.find((table) => table.name === "user_recent_tabs")

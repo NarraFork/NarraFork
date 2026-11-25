@@ -27,7 +27,7 @@ keywords:
   - 自动
   - 例程
 status: draft
-verified_at: 9400a828b
+verified_at: 4d59774711a51a9ac966794090c8b3a04d549048
 ---
 # 例程与可选工具
 

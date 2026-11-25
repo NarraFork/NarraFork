@@ -8,7 +8,6 @@ import {
 	IconFolder,
 	IconPaperclip,
 } from "@tabler/icons-react";
-import { useQuery } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -20,6 +19,7 @@ import {
 } from "../../hooks/usePlatform";
 import { useProjectDirStatus } from "../../hooks/useProjectDirStatus";
 import { addRecentTab } from "../../hooks/useRecentTabs";
+import { useRuntimeSettings } from "../../hooks/useRuntimeSettings";
 import { useWorkspaceDevices } from "../../hooks/useWorkspaceContext";
 import { api, isAbortError } from "../../lib/api";
 import { getAuthSnapshot } from "../../lib/api/client";
@@ -132,13 +132,8 @@ export function DashboardComposer() {
 	const [startInPlanModeOverride, setStartInPlanModeOverride] = useState<boolean | null>(
 		prefs.startInPlanMode ?? null,
 	);
-	// Same query key as the model menus, so this shares their cache entry instead of
-	// issuing its own request; only the instance defaults are read from it.
-	const { data: settingsData } = useQuery({
-		queryKey: ["settings"],
-		queryFn: api.getSettings,
-		staleTime: 30_000,
-	});
+	// Share the bounded instance-default projection with the draft model controls.
+	const { data: settingsData } = useRuntimeSettings();
 	const draftReasoning = useDraftReasoningEffort(model);
 	// Show what the created session will actually get: the user's choice clamped
 	// onto the selected model's tiers, or the instance default when untouched.

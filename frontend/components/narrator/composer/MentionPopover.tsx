@@ -7,8 +7,13 @@ import {
 	UnstyledButton,
 	useComputedColorScheme,
 } from "@mantine/core";
-import { foldHandle, HANDLE_CHAR_RE, HANDLE_START_RE } from "@shared/narrator-handle";
-import { type RefObject, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import {
+	foldHandle,
+	HANDLE_CHAR_RE,
+	HANDLE_START_RE,
+	MAX_HANDLE_LENGTH,
+} from "@shared/narrator-handle";
+import { type RefObject, useCallback, useEffect, useId, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Z } from "../../../lib/z-index";
 import { composerPopoverOffset, useComposerPopoverSide } from "./composer-popover-placement";
@@ -40,8 +45,13 @@ export function getMentionQuery(value: string, caret: number): string | null {
 	if (at === -1 || (at > 0 && !MENTION_BOUNDARY_RE.test(upto[at - 1]))) return null;
 	const partial = upto.slice(at + 1);
 	if (partial === "") return "";
-	const chars = [...partial];
-	if (!HANDLE_START_RE.test(chars[0]) || chars.some((ch) => !HANDLE_CHAR_RE.test(ch))) return null;
+	const chars = [...partial.normalize("NFC")];
+	if (
+		chars.length > MAX_HANDLE_LENGTH ||
+		!HANDLE_START_RE.test(chars[0]) ||
+		chars.some((ch) => !HANDLE_CHAR_RE.test(ch))
+	)
+		return null;
 	return foldHandle(partial);
 }
 
@@ -60,17 +70,9 @@ export function MentionPopover({
 	const [selectedId, setSelectedId] = useState<string | null>(null);
 	const listRef = useRef<HTMLDivElement>(null);
 	const listId = useId();
-	const filtered = useMemo(() => {
-		const q = query ?? "";
-		return candidates
-			.filter((c) =>
-				foldHandle(`${c.title ?? ""} ${c.handle ?? ""} ${c.parentTitle ?? ""} ${c.id}`).includes(q),
-			)
-			.slice(0, 50);
-	}, [candidates, query]);
-	const selected = filtered.find((c) => c.id === selectedId) ?? filtered[0];
+	// The unified reader already filters local rows and bounds the merged page.
+	const selected = candidates.find((c) => c.id === selectedId) ?? candidates[0];
 	const optionId = useCallback((id: string) => `${listId}-${encodeURIComponent(id)}`, [listId]);
-	// A changed query starts at its first result; enrichment/reordering preserves the stable id.
 	// biome-ignore lint/correctness/useExhaustiveDependencies: A new typed token resets selection; result enrichment must not.
 	useEffect(() => {
 		setSelectedId(null);
@@ -113,11 +115,11 @@ export function MentionPopover({
 			if (event.key === "ArrowDown" || event.key === "ArrowUp") {
 				event.preventDefault();
 				event.stopPropagation();
-				if (!filtered.length) return;
-				const index = filtered.findIndex((c) => c.id === selected?.id);
+				if (!candidates.length) return;
+				const index = candidates.findIndex((c) => c.id === selected?.id);
 				setSelectedId(
-					filtered[
-						(index + (event.key === "ArrowDown" ? 1 : -1) + filtered.length) % filtered.length
+					candidates[
+						(index + (event.key === "ArrowDown" ? 1 : -1) + candidates.length) % candidates.length
 					].id,
 				);
 			} else if ((event.key === "Enter" && !event.shiftKey) || event.key === "Tab") {
@@ -131,7 +133,7 @@ export function MentionPopover({
 				onClose();
 			}
 		},
-		[visible, anchorRef, filtered, selected, onSelect, onClose],
+		[visible, anchorRef, candidates, selected, onSelect, onClose],
 	);
 	useEffect(() => {
 		if (!visible) return;
@@ -158,9 +160,9 @@ export function MentionPopover({
 			}}
 		>
 			<Box id={listId} role="listbox" aria-label={t("mentionPopoverTitle")} aria-busy={loading}>
-				{filtered.map((candidate, index) => (
+				{candidates.map((candidate, index) => (
 					<Box key={candidate.id}>
-						{(index === 0 || filtered[index - 1].isRecent !== candidate.isRecent) && (
+						{(index === 0 || candidates[index - 1].isRecent !== candidate.isRecent) && (
 							<Text size="xs" c="dimmed" px={10} py={4}>
 								{t(candidate.isRecent ? "mentionRecentSessions" : "mentionMoreSessions")}
 							</Text>
@@ -211,7 +213,7 @@ export function MentionPopover({
 					</Box>
 				))}
 			</Box>
-			{(loading || error || !filtered.length) && (
+			{(loading || error || !candidates.length) && (
 				<Text role="status" size="xs" c="dimmed" px={10} py={6}>
 					{t(loading ? "mentionSearching" : error ? "mentionSearchError" : "mentionNoResults")}
 				</Text>

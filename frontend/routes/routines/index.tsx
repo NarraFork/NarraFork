@@ -111,7 +111,10 @@ import {
 	useToggleGlobalSkill,
 	useUpdateGlobalSkill,
 } from "../../hooks/useSkills";
-import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
+import {
+	useUpdateUserPreferencesDetail as useUpdateUserPreferences,
+	useUserPreferencesDetail as useUserPreferences,
+} from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
 import { filterUnsupportedMcpImportTransports } from "../../lib/mcp-import";
 import {
