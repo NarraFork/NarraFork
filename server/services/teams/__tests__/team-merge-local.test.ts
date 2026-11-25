@@ -29,10 +29,11 @@ import {
 	setMergeDeadlineForTests,
 	settleMergeJobs,
 } from "../team-merge";
-import { isMerging, resetMergingForTests } from "../team-merge-guard";
+import { claimMerging, isMerging, releaseMerging, resetMergingForTests } from "../team-merge-guard";
 import { resetOverlapStateForTests, runChangedPathsPass } from "../team-overlap";
 import {
 	cancelWorkItem,
+	markReady,
 	recordReview,
 	returnWorkItem,
 	setMergeNoteDeliveryForTests,
@@ -711,5 +712,40 @@ describe("local merge", () => {
 		});
 		expect(await pruneProjectMergeRefs(PROJECT)).toBe(PRIVATE_REFS_PAGE * 2 + 5);
 		expect(await git(["for-each-ref", "refs/narrafork/"])).toBe("");
+	});
+
+	test("a merge that takes the item during review, ready or sync's reads refuses them (review 9)", async () => {
+		const a = await readyItem("rho");
+		sqlite.run(
+			`INSERT INTO narrators (id, type, title, status, parent_narrator_id, created_at, updated_at)
+			VALUES ('mg-rho-worker', 'subagent', 'w', 'idle', ?, ?, ?)`,
+			[LEAD, NOW, NOW],
+		);
+		sqlite.run("UPDATE team_work_items SET worker_narrator_id = 'mg-rho-worker' WHERE id = ?", [
+			a.id,
+		]);
+		const actor = { kind: "agent" as const, id: LEAD };
+		const calls = [
+			() =>
+				recordReview({
+					coordinatorId: LEAD,
+					itemId: a.id,
+					verdict: "clear",
+					findings: 0,
+					reviewer: null,
+					actor,
+				}),
+			() => markReady({ coordinatorId: LEAD, itemId: a.id, actor }),
+			() => syncWorkItem({ coordinatorId: LEAD, itemId: a.id, actor }),
+		];
+		for (const call of calls) {
+			// Passes the first check, then a merge takes the item while it awaits git.
+			const pending = call();
+			expect(claimMerging(a.id)).toBe(true);
+			await expect(pending).rejects.toMatchObject({ code: "TEAM_WORK_ITEM_MERGING" });
+			releaseMerging(a.id);
+		}
+		expect(item(a.id)).toMatchObject({ state: "ready", reviewRounds: 1 });
+		expect(events(a.id, "work.sync")).toHaveLength(0);
 	});
 });

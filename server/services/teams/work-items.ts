@@ -801,6 +801,8 @@ export async function recordReview(
 				.resolveCommit("HEAD")
 				.catch(() => null)
 		: null;
+	// A merge may have taken the item while HEAD was read.
+	assertNotMerging(item.id);
 	const round = item.reviewRounds + 1;
 	const now = new Date().toISOString();
 	const state: TeamWorkItemState = input.verdict === "blocker" ? "in_progress" : "in_review";
@@ -942,6 +944,8 @@ export async function markReady(input: {
 			409,
 			"TEAM_WORK_ITEM_HEAD_MOVED",
 		);
+	// A merge may have taken the item during the reads above.
+	assertNotMerging(item.id);
 	const now = new Date().toISOString();
 	try {
 		db.transaction((tx) => {
@@ -1500,7 +1504,10 @@ export async function syncWorkItem(input: {
 	if (!head)
 		throw new AppError("The work item's branch has no commit", 409, "TEAM_HEAD_UNRESOLVED");
 	let result: SyncOutcome;
-	if (await git.isAncestor(baseSha, head)) result = { outcome: "up_to_date", baseSha, head };
+	const upToDate = await git.isAncestor(baseSha, head);
+	// A merge may have taken the item during the reads above: nothing is handed to the worker.
+	assertNotMerging(item.id);
+	if (upToDate) result = { outcome: "up_to_date", baseSha, head };
 	else {
 		const instruction = syncInstruction({
 			itemId: item.id,
