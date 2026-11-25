@@ -120,4 +120,4 @@ verified_at: 3588311eac166b9c044478105016c59ebd95688b
 - [工作项](work-items.md)：状态机、`markMerged` 唯一写入者、守卫的各入口。
 - [团队页与审批](page.md)：抽屉与「等你处理」。
 - [外部进程加固](../../security/hardening.md)：合并驱动、hook 与签名程序的覆盖。
-- 历史可信：合并、快进与每次祖先判断（`isAncestor`：`runMerge` 的“已在基线”、`mergeIfLanded`、依赖可达）前先 `assertTrueHistory`——浅克隆或有 `info/grafts` 就拒绝，`TEAM_GIT_HISTORY_ALTERED`（依赖可达把它当“不在”，`mergeIfLanded` 不记已合并）；检出检查对此给 `altered_history`。替换引用由加固环境的 `GIT_NO_REPLACE_OBJECTS=1` 忽略，复制的命令也带 `--no-replace-objects`。
+- 历史可信：合并、快进与每次祖先判断（`isAncestor`：`runMerge` 的“已在基线”、`mergeIfLanded`、依赖可达）前先 `assertTrueHistory`——浅克隆或有 `info/grafts` 就拒绝，`TEAM_GIT_HISTORY_ALTERED`（依赖可达把它当“不在”，`mergeIfLanded` 不记已合并）；检出检查对此给 `altered_history`。替换引用由团队 git 的 `GIT_NO_REPLACE_OBJECTS=1`（`TRUE_HISTORY_ENV`）忽略，复制的命令也带 `--no-replace-objects`；但团队不在被替换的历史上建东西：`assertNoReplacedHistory`（`team-git.ts`）在合并（基线与工作项头）、快进（合并提交）、检出检查（给 `altered_history`）和新建工作项（起点，`assertStartNotReplaced`）前，若某个 `refs/replace/<oid>` 替换了这些提交历史里的提交、或它们文件里的树/blob，就拒绝 `TEAM_GIT_REPLACED_HISTORY`；与之无关的替换不影响。没有替换引用时只是一次 `for-each-ref`；超过 20 个或文件列表超上限则直接拒绝。

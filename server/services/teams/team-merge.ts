@@ -69,7 +69,7 @@ import { hotSafe } from "../../lib/hot-safe";
 import { getUserLanguage, type Locale } from "../../lib/i18n";
 import { logger } from "../../lib/logger";
 import { oneLine } from "../../lib/prompts/team-coordinator-notes";
-import { teamGit } from "./team-git";
+import { assertNoReplacedHistory, teamGit } from "./team-git";
 import {
 	canonicalCheckout,
 	fastForwardCheckout,
@@ -441,9 +441,22 @@ async function inspectPrepared(
 	const key = `${prepared.mergeCommit}:${prepared.baseSha}:${prepared.checkedOutAt}`;
 	const cached = state.inspections.get(itemId);
 	if (cached && cached.key === key && Date.now() - cached.at < INSPECTION_TTL_MS) return cached;
-	const blocker = repo
+	const checked = repo
 		? await inspectCheckout(prepared.checkedOutAt, base, prepared.baseSha, { repo })
 		: ("unreadable" as const);
+	// A replacement in the merge commit's history or files: the command would leave the
+	// person's git showing changes nobody made.
+	const blocker =
+		checked ??
+		(repo
+			? await assertNoReplacedHistory(repo, [prepared.mergeCommit]).then(
+					() => null,
+					(error: unknown) =>
+						error instanceof AppError && error.code === "TEAM_GIT_REPLACED_HISTORY"
+							? ("altered_history" as const)
+							: ("unreadable" as const),
+				)
+			: null);
 	const activity = await checkoutActivity(prepared.checkedOutAt, { backgroundTasks: false }).catch(
 		() => ({ running: 0, terminals: 0, incomplete: true }),
 	);
@@ -926,13 +939,16 @@ async function landed(
 async function runMerge(context: JobContext, signal: AbortSignal): Promise<void> {
 	setPhase(context.itemId, "checking");
 	const facts = await jobFacts(context, signal);
-	const { item, head, branch, base, git } = facts;
+	const { item, head, branch, base, git, repo } = facts;
 	const title = item.title;
 	// Merge bases and "already in the base" are only answered over the real, full history.
 	await git.assertTrueHistory();
 	for (let attempt = 0; attempt < 2; attempt++) {
 		const old = await git.resolve(`refs/heads/${base}`);
 		if (!old) throw new MergeFailure("TEAM_BASE_UNRESOLVED", `The base ${base} is gone`);
+		// Nothing replaced in the base's or the item's history or files: the merge (computed without
+		// replacements) is what the person's own git will see there.
+		await assertNoReplacedHistory(repo, [old, head]);
 		if (await git.isAncestor(head, old)) {
 			await assertTipStill(git, branch, head);
 			await landed(context, { item, head, base, title, branch }, null, old, {
@@ -1023,6 +1039,8 @@ async function runFastForward(context: JobContext, signal: AbortSignal): Promise
 	const outcome = readMergeOutcome(item.id);
 	if (outcome?.kind !== "prepared")
 		throw new MergeFailure("TEAM_MERGE_NOT_PREPARED", "There is no prepared merge any more");
+	// The checkout gets the merge commit's real files: nothing in it may be replaced.
+	await assertNoReplacedHistory(repo, [outcome.mergeCommit]);
 	const privateRef = `${TEAM_MERGE_REF_PREFIX}${item.id}`;
 	if ((await git.resolve(privateRef)) !== outcome.mergeCommit)
 		throw new MergeFailure(

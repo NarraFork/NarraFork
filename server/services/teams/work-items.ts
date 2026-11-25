@@ -81,7 +81,7 @@ import {
 	readChangedPaths,
 	storeChangedPaths,
 } from "./team-overlap";
-import { compareRefFor, workStartPoint } from "./team-work-start";
+import { assertStartNotReplaced, compareRefFor, workStartPoint } from "./team-work-start";
 import {
 	assertWorkItemStartable,
 	checkDependencies,
@@ -533,6 +533,7 @@ export async function createWorkItem(input: CreateWorkItemInput): Promise<WorkIt
 		baseBranch: team.baseBranch,
 		settings: team.settings,
 	});
+	await assertStartNotReplaced(team.projectId, start);
 	const port = await ports();
 	const created = await port.createWorktree({
 		coordinatorId: team.teamId,

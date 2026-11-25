@@ -619,7 +619,7 @@
 					"local_config": "那个检出有自己的过滤器或 hooks 目录：请自己运行命令。",
 					"unreadable": "无法检查那个目录。",
 					"other_repository": "那个目录不是本项目仓库的检出：请自己运行命令。",
-					"altered_history": "那里的历史被截断（浅克隆）或被 graft 文件改写：不提供命令。",
+					"altered_history": "那里的历史被截断（浅克隆）或被改写（graft 文件，或合并里有替换引用）：不提供命令。",
 					"unsafe_path": "那个目录的路径含换行或控制字符：不提供命令，也不在这里快进。"
 				},
 				"errors": {
@@ -642,6 +642,7 @@
 					"GIT_WORKSPACE_BUSY": "那个目录里的 git 正忙，请稍后再试。",
 					"TEAM_MERGE_FAST_FORWARD_INCOMPLETE": "快进后那个目录需要检查（有未合并文件、多了一个 stash，或 HEAD 不在合并结果上）。请到那里看一下；这一项没有标为已合并。",
 					"TEAM_MERGE_HOSTING_UNKNOWN": "读不出 origin 托管在哪里，请稍后再试；origin 在 GitHub 上时绝不会在本地合并。",
+					"TEAM_GIT_REPLACED_HISTORY": "替换引用（refs/replace/*）改写了基线或本工作项的历史或文件：团队不合并被替换的历史。请先删除替换（git replace -d）。",
 					"TEAM_GIT_HISTORY_ALTERED": "仓库是浅克隆或带 graft 文件（info/grafts）：无法判断合并了什么。请先取回完整历史或删除 graft 文件。",
 					"TEAM_MERGE_TIMEOUT": "合并耗时太久，已在不会留下半截改动的地方停下。"
 				},

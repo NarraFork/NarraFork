@@ -37,6 +37,7 @@ import {
 	noExternalDiffArgs,
 	PROGRAM_CONFIG_QUERY,
 	parseProgramConfig,
+	TRUE_HISTORY_ENV,
 	untrustedProgramOverrides,
 } from "../../lib/git-exec-hardening";
 import { safeSpawn } from "../../lib/spawn";
@@ -85,6 +86,8 @@ async function spawnGit(
 			GIT_TERMINAL_PROMPT: "0",
 			LC_ALL: "C",
 			...gitConfigEnv(config),
+			// Replacement refs and grafts are never read (`TRUE_HISTORY_ENV`).
+			...TRUE_HISTORY_ENV,
 		},
 		timeout,
 		maxOutputBytes,
@@ -131,6 +134,103 @@ export async function assertTrueHistory(cwd: string): Promise<void> {
 			409,
 			"TEAM_GIT_HISTORY_ALTERED",
 		);
+}
+
+/** Most replacement refs looked at; with more the history is refused without looking. */
+export const REPLACE_REFS_CHECKED_MAX = 20;
+/** Tree listing read to find a replaced tree or blob in a commit's files (over it: refused). */
+const REPLACED_TREE_LISTING_MAX_BYTES = READ_MAX_OUTPUT_BYTES;
+
+/**
+ * Refuse to build on history a replacement ref (`refs/replace/<oid>`) rewrites: one that replaces
+ * any of `commits`, a commit in their history, or a tree or blob in their files. Team commands
+ * never read replacements (`TRUE_HISTORY_ENV`), but the person's own git — and the narrator's
+ * worktree — do, so a worktree made from such a commit, or a fast-forward to it, would show
+ * changes nobody made. Replacements elsewhere (unrelated objects) do not matter. Without
+ * replacement refs this is one `for-each-ref`; with more than {@link REPLACE_REFS_CHECKED_MAX},
+ * or files too many to list, it refuses rather than guess. `TEAM_GIT_REPLACED_HISTORY` (409).
+ */
+export async function assertNoReplacedHistory(
+	cwd: string,
+	commits: readonly string[],
+): Promise<void> {
+	for (const commit of commits)
+		if (!SHA.test(commit)) throw new GitError("Expected a full commit id");
+	const listed = await spawnGit(
+		cwd,
+		[
+			"for-each-ref",
+			`--count=${REPLACE_REFS_CHECKED_MAX + 1}`,
+			"--format=%(refname)",
+			"refs/replace/",
+		],
+		GIT_NO_EXEC_CONFIG,
+		64 * 1024,
+	);
+	if (listed.exitCode !== 0 || listed.truncated)
+		throw new GitError("git for-each-ref could not list the replacement refs");
+	const refs = listed.stdout.split("\n").filter(Boolean);
+	if (refs.length === 0) return;
+	const refuse = (why: string): never => {
+		throw new AppError(
+			`${why}: a team does not build on replaced history, which the person's own git would show differently. Remove the replacement (git replace -d <oid>) or merge outside the team`,
+			409,
+			"TEAM_GIT_REPLACED_HISTORY",
+		);
+	};
+	if (refs.length > REPLACE_REFS_CHECKED_MAX)
+		refuse(`The repository has more than ${REPLACE_REFS_CHECKED_MAX} replacement refs`);
+	const run: GitQueryRunner = (args, options) =>
+		spawnGit(
+			cwd,
+			args,
+			GIT_NO_EXEC_CONFIG,
+			Math.min(options?.maxOutputBytes ?? READ_MAX_OUTPUT_BYTES, READ_MAX_OUTPUT_BYTES),
+		);
+	const inFiles: string[] = [];
+	for (const ref of refs) {
+		const oid = ref.slice("refs/replace/".length);
+		if (!SHA.test(oid)) refuse(`The replacement ref ${ref} does not name an object id`);
+		const type = await spawnGit(cwd, ["cat-file", "-t", oid], GIT_NO_EXEC_CONFIG, 1024);
+		// Replacing an object this repository does not have changes nothing here.
+		if (type.exitCode !== 0) continue;
+		const kind = type.stdout.trim();
+		if (kind === "commit") {
+			for (const commit of commits)
+				if (await isAncestor(run, oid, commit))
+					refuse(`${ref} replaces commit ${oid}, which is in the history of ${commit}`);
+		} else if (kind === "tree" || kind === "blob") inFiles.push(oid);
+	}
+	if (inFiles.length === 0) return;
+	const wanted = new Set(inFiles);
+	for (const commit of commits) {
+		// `<mode> <type> <oid>\t<path>\0` for every entry, trees included, and the root tree.
+		const root = await spawnGit(
+			cwd,
+			["rev-parse", "--verify", "--quiet", `${commit}^{tree}`],
+			GIT_NO_EXEC_CONFIG,
+			1024,
+		);
+		if (root.exitCode !== 0) throw new GitError(`git rev-parse could not read ${commit}'s tree`);
+		if (wanted.has(root.stdout.trim()))
+			refuse(`A replacement ref replaces the root tree of ${commit}`);
+		const listing = await spawnGit(
+			cwd,
+			["ls-tree", "-r", "-t", "-z", "--full-tree", commit],
+			GIT_NO_EXEC_CONFIG,
+			REPLACED_TREE_LISTING_MAX_BYTES,
+		);
+		if (listing.exitCode !== 0) throw new GitError(`git ls-tree could not list ${commit}`);
+		if (listing.truncated)
+			refuse(
+				`The repository has replacement refs for trees or blobs, and ${commit} has too many files to check them against`,
+			);
+		for (const entry of listing.stdout.split("\0")) {
+			const oid = entry.split("\t", 1)[0]?.split(" ")[2];
+			if (oid && wanted.has(oid))
+				refuse(`A replacement ref replaces ${oid}, which is among the files of ${commit}`);
+		}
+	}
 }
 
 /** The filters and configuration-defined hooks a checkout's configuration names (all scopes). */

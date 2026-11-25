@@ -382,6 +382,26 @@ describe("where work starts", () => {
 		);
 	});
 
+	test("new work never starts from a base whose files a replacement ref rewrites (Devin 4)", async () => {
+		setTeamSettings({ workStart: "local" });
+		const local = await git(["rev-parse", "main"]);
+		const blob = await git(["rev-parse", "main:a.txt"]);
+		const fake = join(repo, ".git", "fake-blob");
+		await writeFile(fake, "fake\n");
+		await git(["replace", blob, await git(["hash-object", "-w", "--", fake])]);
+		const before = await git(["worktree", "list", "--porcelain"]);
+		await expect(create("On replaced files")).rejects.toMatchObject({
+			code: "TEAM_GIT_REPLACED_HISTORY",
+		});
+		// Nothing was made: no worktree, no item.
+		expect(await git(["worktree", "list", "--porcelain"])).toBe(before);
+		expect(db.select().from(teamWorkItems).all()).toHaveLength(0);
+		// Without the replacement it starts as usual.
+		await git(["replace", "-d", blob]);
+		const item = await create("On real files");
+		expect(await git(["rev-parse", "HEAD"], worktreePathOf(item) ?? "")).toBe(local);
+	});
+
 	test("an unreachable origin starts from the remote-tracking ref as it is, or refuses", async () => {
 		setTeamSettings({ workStart: "remote" });
 		await git(["remote", "set-url", "origin", join(temporary, "missing.git")]);

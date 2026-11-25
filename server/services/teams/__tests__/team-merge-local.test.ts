@@ -167,6 +167,7 @@ async function replaceWithExtraParent(commit: string, parent: string) {
 	await writeFile(path, `${fake}\n`);
 	const replacement = await git(["hash-object", "-t", "commit", "-w", "--", path]);
 	await git(["replace", commit, replacement]);
+	return replacement;
 }
 
 beforeAll(async () => {
@@ -648,26 +649,89 @@ describe("local merge", () => {
 		const a = await readyItem("replaced");
 		await git(["checkout", "-q", "--detach"]);
 		const old = await git(["rev-parse", "main"]);
-		await replaceWithExtraParent(old, a.head);
+		const replacement = await replaceWithExtraParent(old, a.head);
 		// The repository's own git (replacements honoured) now calls the item part of main.
 		await git(["merge-base", "--is-ancestor", a.head, "main"]);
 		// Ancestry detection is not fooled: the item stays ready.
 		await runChangedPathsPass({ sweep: true });
 		expect(item(a.id)?.state).toBe("ready");
 		expect(events(a.id, "work.merged")).toHaveLength(0);
-		// The merge integrates it for real: main is a merge commit of the true base and the head.
+		// The merge refuses to build on the replaced base; nothing changes, nothing is recorded.
 		merge(a.id);
 		await settleMergeJobs();
-		const now = await git(["--no-replace-objects", "rev-parse", "main"]);
-		expect(now).not.toBe(old);
-		expect(await git(["--no-replace-objects", "log", "-1", "--format=%P", "main"])).toBe(
-			`${old} ${a.head}`,
-		);
-		await git(["--no-replace-objects", "merge-base", "--is-ancestor", a.head, "main"]);
+		expect(await git(["--no-replace-objects", "rev-parse", "main"])).toBe(old);
+		expect(await git(["rev-parse", `${old}^{commit}`])).toBe(old);
+		expect(item(a.id)?.state).toBe("ready");
+		expect(events(a.id, "work.merged")).toHaveLength(0);
+		expect(readMergeOutcome(a.id)).toMatchObject({
+			kind: "failed",
+			code: "TEAM_GIT_REPLACED_HISTORY",
+		});
+		// Without the replacement it merges, for real.
+		await git(["replace", "-d", old]);
+		expect(replacement).toMatch(/^[0-9a-f]{40}$/);
+		merge(a.id);
+		await settleMergeJobs();
+		expect(await git(["log", "-1", "--format=%P", "main"])).toBe(`${old} ${a.head}`);
 		expect(item(a.id)?.state).toBe("merged");
-		const merged = events(a.id, "work.merged")[0]?.detail;
-		expect(merged).toMatchObject({ detectedBy: "local_merge", mergeCommit: now });
-		expect(merged?.alreadyInBase).toBeUndefined();
+		expect(events(a.id, "work.merged")[0]?.detail?.alreadyInBase).toBeUndefined();
+	});
+
+	test("a replacement elsewhere does not matter; one in the item's files or the prepared merge does (Devin 4)", async () => {
+		// An unrelated replacement (a commit in no branch's history) changes nothing.
+		const old = await git(["rev-parse", "main"]);
+		const tree = await git(["rev-parse", `${old}^{tree}`]);
+		const loose = await git(["commit-tree", tree, "-m", "loose"]);
+		const other = await git(["commit-tree", tree, "-m", "other"]);
+		await git(["replace", loose, other]);
+		const a = await readyItem("elsewhere");
+		await git(["checkout", "-q", "--detach"]);
+		merge(a.id);
+		await settleMergeJobs();
+		expect(item(a.id)?.state).toBe("merged");
+		// A blob in the item's files replaced: refused, the base untouched.
+		await git(["checkout", "-q", "main"]);
+		const b = await readyItem("blob", "blob.txt", "real\n");
+		const blob = await git(["rev-parse", `${b.head}:blob.txt`]);
+		const fake = join(temporary, `fake-blob-${b.id}`);
+		await writeFile(fake, "fake\n");
+		await git(["replace", "-f", blob, await git(["hash-object", "-w", "--", fake])]);
+		await git(["checkout", "-q", "--detach"]);
+		const before = await git(["rev-parse", "main"]);
+		merge(b.id);
+		await settleMergeJobs();
+		expect(await git(["rev-parse", "main"])).toBe(before);
+		expect(readMergeOutcome(b.id)).toMatchObject({ code: "TEAM_GIT_REPLACED_HISTORY" });
+		await git(["replace", "-d", blob]);
+		// Prepared on the checked-out base, then a replacement lands in its files: no command, no
+		// fast-forward.
+		await git(["checkout", "-q", "main"]);
+		merge(b.id);
+		await settleMergeJobs();
+		const outcome = readMergeOutcome(b.id);
+		expect(outcome?.kind).toBe("prepared");
+		await git(["replace", "-f", blob, await git(["hash-object", "-w", "--", fake])]);
+		const view = await mergeViewOf({
+			item: item(b.id) as NonNullable<ReturnType<typeof item>>,
+			baseBranch: "main",
+			teamActive: true,
+			workerRunning: false,
+			member: true,
+		});
+		expect(view.fastForward).toMatchObject({
+			available: false,
+			blocker: "altered_history",
+			command: null,
+		});
+		requestFastForward({ teamId: LEAD, itemId: b.id, userId: USER });
+		await settleMergeJobs();
+		expect(await git(["--no-replace-objects", "rev-parse", "main"])).toBe(before);
+		expect(item(b.id)?.state).toBe("ready");
+		// The prepared merge is kept, with why the fast-forward was refused.
+		expect(readMergeOutcome(b.id)).toMatchObject({
+			kind: "prepared",
+			fastForwardFailure: { code: "TEAM_GIT_REPLACED_HISTORY" },
+		});
 	});
 
 	test("a shallow repository or a graft file is refused: nothing merged, the base untouched (Devin 4)", async () => {

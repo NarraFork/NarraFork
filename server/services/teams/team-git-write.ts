@@ -36,6 +36,7 @@ import {
 	ensureConfigOverridesHonored,
 	GIT_NO_EXEC_CONFIG,
 	gitConfigEnv,
+	TRUE_HISTORY_ENV,
 	untrustedProgramOverrides,
 } from "../../lib/git-exec-hardening";
 import type { GitIdentityEnv } from "../../lib/git-identity";
@@ -101,6 +102,8 @@ async function run(
 			LANG: "C",
 			...(options.env ?? {}),
 			...gitConfigEnv(options.config),
+			// Replacement refs and grafts are never read (`TRUE_HISTORY_ENV`).
+			...TRUE_HISTORY_ENV,
 		},
 		timeout: options.timeout ?? SHORT_TIMEOUT_MS,
 		maxOutputBytes: options.maxOutputBytes ?? SMALL_OUTPUT_BYTES,

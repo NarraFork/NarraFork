@@ -25,6 +25,7 @@ import { projects, teamWorkEvents } from "../../db/schema";
 import { AppError } from "../../lib/errors";
 import { hotSafe } from "../../lib/hot-safe";
 import { logger } from "../../lib/logger";
+import { assertNoReplacedHistory } from "./team-git";
 import { teamRepoGit } from "./team-git-write";
 import { defaultWorkStart, hostingOf, peekHosting } from "./team-hosting";
 
@@ -192,6 +193,24 @@ export async function workStartPoint(input: {
 			"TEAM_WORK_START_UNAVAILABLE",
 		);
 	return { mode, label, ref, commit, fetched: fetch.ok };
+}
+
+/**
+ * Refuse to start work from a commit whose history or files a replacement ref rewrites
+ * (`TEAM_GIT_REPLACED_HISTORY`): the worktree would hold the files the person's git sees, while
+ * every team command reads the real ones. Nothing to check without a repository or a commit (the
+ * worktree creation then fails on its own).
+ */
+export async function assertStartNotReplaced(projectId: string, start: WorkStartPoint) {
+	const { repo } = projectStartFacts(projectId);
+	if (!repo) return;
+	// An unreadable start is left to the worktree creation, which cannot start from it either.
+	const commit =
+		start.commit ??
+		(await teamRepoGit(repo)
+			.resolve(start.ref)
+			.catch(() => null));
+	if (commit) await assertNoReplacedHistory(repo, [commit]);
 }
 
 /**

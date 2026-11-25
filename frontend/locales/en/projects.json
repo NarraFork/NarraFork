@@ -619,7 +619,7 @@
 					"local_config": "That checkout has filters or a hooks directory of its own: run the command yourself.",
 					"unreadable": "That directory could not be checked.",
 					"other_repository": "That directory is not a checkout of this project's repository: run the command yourself.",
-					"altered_history": "History there is cut (shallow) or rewritten by a graft file: no command is offered.",
+					"altered_history": "History there is cut (shallow) or rewritten (a graft file, or a replacement ref in the merge): no command is offered.",
 					"unsafe_path": "That directory's path contains a line break or control character: no command is offered for it, and it is not fast-forwarded here."
 				},
 				"errors": {
@@ -642,6 +642,7 @@
 					"GIT_WORKSPACE_BUSY": "git is busy in that directory. Try again shortly.",
 					"TEAM_MERGE_FAST_FORWARD_INCOMPLETE": "The fast-forward left that directory needing a look (unmerged files, a new stash, or HEAD not at the merge). Check it there; the item is not marked merged.",
 					"TEAM_MERGE_HOSTING_UNKNOWN": "Where origin is hosted could not be read. Try again shortly; a GitHub origin is never merged locally.",
+					"TEAM_GIT_REPLACED_HISTORY": "A replacement ref (refs/replace/*) rewrites history or files of the base or this item: a team does not merge replaced history. Remove the replacement (git replace -d) first.",
 					"TEAM_GIT_HISTORY_ALTERED": "The repository is shallow or has a graft file (info/grafts): what is merged cannot be told. Fetch the full history or remove the graft file first.",
 					"TEAM_MERGE_TIMEOUT": "The merge took too long and was stopped before it changed anything it could not finish."
 				},
