@@ -49,6 +49,8 @@ keywords:
   - work.unblocked
   - TEAM_WORK_ITEM_BLOCKED
   - TEAM_WORK_ITEM_NOT_QUEUED
+  - TEAM_WORK_ITEM_NOT_STARTED
+  - settleFailedStart
   - TEAM_WORK_ITEM_DEPENDENCY_CYCLE
   - TEAM_WORK_ITEM_DEPENDENCY_NOT_FOUND
   - TEAM_WORK_ITEM_DEPENDENCY_CANCELLED
@@ -56,7 +58,7 @@ keywords:
   - team_unblocked
   - 依赖
 status: draft
-verified_at: cbf0722e0
+verified_at: 4cc3bdf8b
 ---
 # 工作项
 
@@ -71,18 +73,19 @@ verified_at: cbf0722e0
   - slug 只取 ASCII 单词（`workBranchSlug`：NFKD 去重音、全角折半，其余文字不音译，最多 40 字符），先取协调者给的 `branchHint`，再取标题，都没有就是 `work`；全 ASCII 是为了过 `gitBranchName`、worktree 服务的 ref 检查和 `git check-ref-format`，哈希保证唯一。`Agent({ isolation })` 的标题没有 ASCII 单词时用 description 当 hint。已有分支不改名；
   - 再写行与 `work.created` 事件，初始 `queued`。
 - `Agent({ isolation: "worktree" })` 建的是 kind=`isolated` 的项，初始 `in_progress`。子代理结束时若没有提交也没有未提交改动，就清理 worktree 并取消该项（`settleIsolatedWorkItem`）。
-- 第一层子代理经 `attachWorker` 记为工作者，queued 的项随之开始。开始 queued 项的只有协调者自己的 `Agent({ workdir: <它的 worktree> })`（`tools/task.ts` 找到项后在创建钩子里 `attachWorker`），没有调度器，也没有任何自动开始。
+- 第一层子代理经 `attachWorker` 记为工作者，queued 的项随之开始。开始 queued 项的只有协调者自己的 `Agent({ workdir: <它的 worktree> })`（`tools/task.ts` 找到还没有工作者的项后在创建钩子里 `attachWorker`），没有调度器，也没有任何自动开始。同一个工作者再记一次什么都不变；已有别的工作者（并发的另一次调用先记上）时 409 `TEAM_WORK_ITEM_CHANGED`。创建钩子里的拒绝让这次 `Agent` 调用失败：`subagent-runner.ts` 把还没运行的子代理归档（`archiveUnstartedSubagent`），`task.ts` 再调 `settleFailedStart`；后者不碰已由别的工作者持有的项（不退回队列、不清理 worktree），所以被拒的一方既不会留下没人记录、仍在 worktree 里干活的子代理，也不会动赢的一方的项。
 
 依赖（D，`teams/work-item-dependencies.ts`，表 `team_work_item_dependencies`，迁移 SQLite 0266、PG 0083）：
 - 一项可以等同团队的其他项**合并**后才开始。表的主键 `(item_id, depends_on_item_id)`，另有 `(depends_on_item_id, item_id)` 与 `team_id` 索引；两端都外键到 `team_work_items` 并级联删除，`team_id` 外键到团队（级联）；`check item_id <> depends_on_item_id`。同团队不靠复合外键（PG 转译器不支持复合目标），由服务判定。
-- 设置：`Team` 的 `work.create` 与 `work.update` 带 `dependsOn`（工作项 id，不收标题），整组替换（`[]` 清空），最多 `TEAM_WORK_DEPENDENCIES_MAX` = 20（多了 400），重复去掉。只能在项 queued 且没有工作者时改（否则 409 `TEAM_WORK_ITEM_NOT_QUEUED`）。每个目标都必须是本团队的项（别的团队的、不存在的都是 404 `TEAM_WORK_ITEM_DEPENDENCY_NOT_FOUND`，不说属于谁）；不能是已取消的（409 `TEAM_WORK_ITEM_DEPENDENCY_CANCELLED`）；不能是自己或成环（409 `TEAM_WORK_ITEM_DEPENDENCY_CYCLE`，`details.cycle` 是环路）。查环是从新目标沿已有边广度优先，每层一次 `IN` 索引读，最多访问 500 项，超了 409 `TEAM_WORK_ITEM_DEPENDENCY_GRAPH_TOO_LARGE`。`work.create` 在建 worktree 之前就查，被拒不留 worktree；写入与 `work.dependencies_changed` 事件（`dependsOn/added/removed`）同事务，事务内再查一次。`work.update` 还按「状态 + `updated_at`」条件更新项。
-- 开始的闸：只有 `merged` 的依赖算满足（`dependencySatisfied`），`ready` 不算（分支会从不含它的基线出发），已取消的依赖一直挡着，直到协调者去掉或换掉。`assertWorkItemStartable` 抛 409 `TEAM_WORK_ITEM_BLOCKED`，`details.blockers` 列出 `{ id, title, state }`，消息点名已取消的那个让协调者用 `work.update` 处理。`Agent({ workdir })` 进 queued 项时在创建子代理之前查（被拒什么都不建，工具结果带错误码），`attachWorker` 在事务内再查一次。
-- 解锁：`merged` 的唯一写入者 `markMergedByAncestry` 在同一事务里调 `recordUnblocked`：按反向索引读被它挡着的项（最多 200），对仍 queued 且没有工作者、依赖全部已合并的项写一条 `work.unblocked`（system，`detail: { mergedItem, dependsOn }`）。`merged` 只写一次且不可逆，所以每项只解锁一次。事务后每个解锁项给协调者投一条说明（来源 `team_unblocked`，`wakeIfIdle`，与 `team_return` 同一条路；`createdBy`/执行主体是建这一项的人；按协调者会话的语言，`lib/prompts/team-lead.ts:unblockedNote`，首行「「X」现在可以开始了」，第二行让它先 `work.sync` 再派工人）。投递经 check-in 的生命周期排空跟踪，失败只记日志，事件照样成立。测试接缝 `setUnblockDeliveryForTests`。不会自动开始。
+- 设置：`Team` 的 `work.create` 与 `work.update` 带 `dependsOn`（工作项 id，不收标题），整组替换（`[]` 清空），最多 `TEAM_WORK_DEPENDENCIES_MAX` = 20（多了 400），重复去掉。只能在项 queued 且没有工作者时改（否则 409 `TEAM_WORK_ITEM_NOT_QUEUED`）；改了（`changed`）就在事务后发 `team:communication_changed` 刷新团队页。每个目标都必须是本团队的项（别的团队的、不存在的都是 404 `TEAM_WORK_ITEM_DEPENDENCY_NOT_FOUND`，不说属于谁）；不能是已取消的（409 `TEAM_WORK_ITEM_DEPENDENCY_CANCELLED`）；不能是自己或成环（409 `TEAM_WORK_ITEM_DEPENDENCY_CYCLE`，`details.cycle` 是环路）。查环是从新目标沿已有边广度优先，每层一次 `IN` 索引读，最多访问 500 项，超了 409 `TEAM_WORK_ITEM_DEPENDENCY_GRAPH_TOO_LARGE`。`work.create` 在建 worktree 之前就查，被拒不留 worktree；写入与 `work.dependencies_changed` 事件（`dependsOn/added/removed`）同事务，事务内再查一次。`work.update` 还按「状态 + `updated_at`」条件更新项。
+- 开始的闸：只有 `merged` 的依赖算满足（`dependencySatisfied`），`ready` 不算（分支会从不含它的基线出发），已取消的依赖一直挡着，直到协调者去掉或换掉。`assertWorkItemStartable` 抛 409 `TEAM_WORK_ITEM_BLOCKED`，`details.blockers` 列出 `{ id, title, state }`，消息点名已取消的那个让协调者用 `work.update` 处理。只要项还没有工作者，不论状态，`Agent({ workdir })` 都在创建子代理之前查（被拒什么都不建，工具结果带错误码），`attachWorker` 在事务内再查一次。
+- 解锁：`merged` 的唯一写入者 `markMergedByAncestry` 在同一事务里调 `recordUnblocked`：按反向索引读被它挡着、仍 queued 且没有工作者的项（这两个条件在查询里过滤，再取最多 200，已开始的项挤不掉排队的），对依赖全部已合并的项写一条 `work.unblocked`（system，`detail: { mergedItem, dependsOn }`）。`merged` 只写一次且不可逆，所以每项只解锁一次。事务后每个解锁项给协调者投一条说明（来源 `team_unblocked`，`wakeIfIdle`，与 `team_return` 同一条路；`createdBy`/执行主体是建这一项的人；按协调者会话的语言，`lib/prompts/team-lead.ts:unblockedNote`，首行「「X」现在可以开始了」，标题经 `team-coordinator-notes.ts:oneLine` 压成一行（最多 80 字，与重叠提醒相同），第二行让它先 `work.sync` 再派工人）。投递经 check-in 的生命周期排空跟踪，失败只记日志，事件照样成立。测试接缝 `setUnblockDeliveryForTests`。不会自动开始。
 - 基线：worktree 在 `work.create` 时就从本地基线分支当时的提交建出（不 fetch），所以依赖合并前建的项分支是旧基线。不挪动建 worktree 的时机：说明和提示词让协调者先 `work.sync`（还没有工作者时返回确定的合并指令），把指令放在工人简报最前面。
 - `work.list` 与工具返回的项带 `dependsOn`（id）与 `blockedBy`（未合并的 id），整页一次读（`readDependencies`）。`work.cancel` 的结果列出依赖它、仍在排队的项（`dependents`，最多 20，状态在查询里过滤，`queuedDependentsOf`）并提示用 `work.update` 处理。
 - 人不能在团队页改依赖（这一轮只读展示，见[团队页与审批](page.md)）。
 
 评审与就绪：
+- `work.review` 与 `work.ready` 只收已开始的项：queued 或没有工作者时 409 `TEAM_WORK_ITEM_NOT_STARTED`（否则一次评审会把 queued 项挪出队列，绕过开始的闸）。工作者会话被删（外键置空）的项要先用 `Agent({ workdir })` 派一个新工作者。
 - `work.review`：blocker 把项退回 `in_progress`，clear 留在 `in_review`。
 - `work.ready` 需要最新一轮评审为 clear，否则 409 `TEAM_WORK_ITEM_NOT_REVIEWED`。
 - `work.ready` 还要 worktree 无未提交改动，否则 409 `TEAM_WORK_ITEM_DIRTY`。
@@ -133,7 +136,7 @@ verified_at: cbf0722e0
 - `teams/work-item-ports.ts`：与 worktree 服务的端口；`teams/team-git.ts`：只读 git。
 - `teams/team-knowledge.ts`：ready 的知识检查与它的上限。
 - `teams/work-item-dependencies.ts`：依赖的读写、查环、开始的闸、解锁与说明投递。
-- 测试：`work-item-lifecycle.test.ts`、`work-item-knowledge.test.ts`、`team-checkin-brief.test.ts`、`work-item-dependencies.test.ts`（设置/清空、各拒绝码、409 闸、解锁只写一次、已取消的依赖）；`tools/__tests__/agent-team-worktree.test.ts` 覆盖 Agent 进被挡的项。
+- 测试：`work-item-lifecycle.test.ts`、`work-item-knowledge.test.ts`、`team-checkin-brief.test.ts`、`work-item-dependencies.test.ts`（设置/清空、各拒绝码、409 闸、未开始的项不能评审或就绪、没有工作者的项不论状态都查闸、刷新事件、解锁只写一次且不被已开始的项挤掉、已取消的依赖）；`tools/__tests__/agent-team-worktree.test.ts` 覆盖 Agent 进被挡的项和创建钩子里被拒的记录（别的工作者先记上、查完后才加的依赖）。
 
 ## 改它时
 - 加一个 `Team` 工具动作：`shared/project-teams.ts:TEAM_TOOL_ACTIONS`、`tools/team.ts` 的参数与分发、`narrator-permission.ts` 的逐动作分类（`isTeamReadAction`/`isTeamCleanupCall`，漏了会被当成写动作或绕过批准）、`team-status.ts` 与前端 `team-page-model.ts` 里对事件种类的文案。
