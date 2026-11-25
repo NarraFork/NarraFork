@@ -49,7 +49,7 @@ import {
 	getToolMessage,
 	type Locale,
 } from "../prompt-i18n";
-import { streamQuotaIdentityForPrefix } from "../provider-key-subjects";
+import { streamQuotaIdentityForRequest } from "../provider-key-subjects";
 import { resolveProviderQuotaWait } from "../provider-quota-wait";
 import { createRequestRecording } from "../request-recorder";
 import {
@@ -85,6 +85,11 @@ import { isMalformedRequestBodyError, summarizeRequestBody } from "./malformed-r
 import { rememberModelTraceRequest } from "./modeltrace-request";
 import { assertNativeMediaPayload, splitNativeMediaReferences } from "./native-media";
 import { type ContentLane, OutputContentAccumulator } from "./output-content";
+import {
+	type PendingPlanReflectionGateResult,
+	type PendingPlanReflectionRunner,
+	registerPendingPlanReflectionRunner,
+} from "./pending-plan-reflection";
 import { type DbMessage, type ParsedStreamEvent, resolveProviderAndModel } from "./provider";
 import { projectQuestionModelInput } from "./question-model-input";
 import {
@@ -136,6 +141,7 @@ import {
 	cancelExitPlanReflection,
 	cleanupExitPlanReflection,
 	createExitPlanReflectionDecision,
+	discardExitPlanReflection,
 	EXIT_PLAN_CONFIRM_COMPACT_TOOL_NAME,
 	EXIT_PLAN_REFLECTION_TOOLS,
 	type ExitPlanReflectionDecision,
@@ -2150,6 +2156,135 @@ export async function resolveExitPlanModeReflection(
 	};
 }
 
+/**
+ * Run plan reflection for an ExitPlanMode whose approval is ALREADY waiting for a person.
+ *
+ * The run is started from outside the agent loop (the manual 计划反思 button, or the switch
+ * being turned on while the plan waits), so the loop is suspended inside its permission handler;
+ * `config`/`rows` are captured by the runner's closure and stay valid for the whole wait.
+ *
+ * Deliberately not `resolveExitPlanModeReflection`:
+ *  - the input is the pending request's resolved input — the text the card shows — instead of a
+ *    second resolution of the raw model input, which could read a plan file that changed since;
+ *  - there is nothing to restore: the wait belongs to the real permission, not to a synthetic gate;
+ *  - a review that cannot decide HANDS THE PLAN BACK (handover) instead of failing closed. The
+ *    approver is already in front of the card, so a provider failure must never deny a plan they
+ *    were about to read. `cancelExitPlanReflection` would additionally mark the row `fail` and
+ *    drop the card from the pending list while the loop stays blocked;
+ *  - when the wait ends under the review (decided first, or the pass aborted), the gate is
+ *    discarded without persisting: the real row then belongs to whoever ended the wait.
+ */
+async function runPendingExitPlanReflection(args: {
+	config: AgentConfig;
+	rows: readonly DbMessage[];
+	toolUse: AgentToolUse;
+	input: Record<string, unknown>;
+	toolCallId: string | null;
+	signal?: AbortSignal;
+}): Promise<PendingPlanReflectionGateResult> {
+	const { rows, toolUse, input, toolCallId } = args;
+	// A review whose request was decided meanwhile has nothing left to answer, so the gate's
+	// caller can cut it short. `config.signal` still belongs to the parent pass.
+	const config: AgentConfig = args.signal
+		? { ...args.config, signal: AbortSignal.any([args.config.signal, args.signal]) }
+		: args.config;
+	const requestId = `exit_plan_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+	const reflectionAbort = new AbortController();
+	const decisionPromise = createExitPlanReflectionDecision(requestId, {
+		narratorId: config.narratorId,
+		broadcastTargetId: config.parentNarratorId ?? config.narratorId,
+		parentToolUseId: config.parentToolUseId,
+		toolUseId: toolUse.toolUseId,
+		toolName: toolUse.name,
+		inputJson: input,
+		toolCallId: toolCallId ?? undefined,
+		abortController: reflectionAbort,
+		onDemand: true,
+	});
+	// The wait this review answers can end under it: the person decides first (`args.signal`) or
+	// the pass is aborted. The real tool-call row then belongs to whoever ended the wait, so the
+	// gate is discarded WITHOUT persisting a status over that decision — unlike the pre-permission
+	// gate, which owns the row while it runs (`cancelExitPlanReflection` would write `fail`).
+	const onWaitEnded = () => {
+		discardExitPlanReflection(requestId, "Plan approval ended before the reflection finished");
+		reflectionAbort.abort(config.signal.reason);
+	};
+	if (config.signal.aborted) onWaitEnded();
+	else config.signal.addEventListener("abort", onWaitEnded, { once: true });
+	await markExitPlanReflectionStarted(requestId);
+	let reflectionDone = false;
+	const reflectionPromise = runExitPlanModeReflectionLoop(
+		config,
+		rows,
+		requestId,
+		toolUse,
+		input,
+		reflectionAbort,
+	).finally(() => {
+		reflectionDone = true;
+	});
+	const decision = await Promise.race([
+		decisionPromise.finally(() => reflectionAbort.abort()),
+		reflectionPromise
+			.catch((err) => {
+				const crashMessage = extractErrorMessage(err);
+				logger.warn("Pending ExitPlanMode reflection loop ended unexpectedly", {
+					err: crashMessage,
+				});
+				return crashMessage;
+			})
+			.then(async (outcome) => {
+				if (isExitPlanReflectionWaitingForUser(requestId)) {
+					return { action: "manual" as const };
+				}
+				const failureSummary =
+					typeof outcome === "string"
+						? `the reflection loop crashed before producing a decision: ${outcome}`
+						: outcome.failureSummary;
+				const reason = `Plan reflection could not finish (${failureSummary ?? "no decision"}); awaiting user decision`;
+				// A review never holds a plan back: the waiting approval keeps its card.
+				if (await handOverExitPlanReflection(requestId, { reason })) return decisionPromise;
+				const alreadySettled = await Promise.race<ExitPlanReflectionDecision | null>([
+					decisionPromise,
+					Promise.resolve(null),
+				]);
+				return alreadySettled ?? { action: "human" as const, reason };
+			}),
+	]);
+	if (!reflectionDone) {
+		reflectionPromise.catch((err) => {
+			logger.warn("Pending ExitPlanMode reflection loop cleanup failed", { err: String(err) });
+		});
+	}
+	config.signal.removeEventListener("abort", onWaitEnded);
+	cleanupExitPlanReflection(requestId);
+	return { decision, input };
+}
+
+/**
+ * Build the on-demand runner for one ExitPlanMode call. Registered for the length of its
+ * approval wait (see `pending-plan-reflection.ts`), then dropped — the closure holds `config`
+ * and `rows`, so it must not outlive the wait.
+ */
+export function createPendingPlanReflectionRunner(
+	config: AgentConfig,
+	rows: readonly DbMessage[],
+	toolUse: AgentToolUse,
+): PendingPlanReflectionRunner {
+	// Resolved at call time: the tool-call binding is assigned by `executeTool`, which has not
+	// run yet when the runner is registered.
+	const toolCallId = () => config.toolExecutionBindings?.get(toolUse)?.toolCallId ?? null;
+	return (input, options) =>
+		runPendingExitPlanReflection({
+			config,
+			rows,
+			toolUse,
+			input,
+			toolCallId: toolCallId(),
+			signal: options?.signal,
+		});
+}
+
 function resolvePlanReflectionAutoApprove(
 	config: Pick<AgentConfig, "planReflectionAutoApprove" | "planReflectionAutoApproveOverride">,
 ): boolean {
@@ -2870,6 +3005,22 @@ async function executeToolAfterReflections(
 						error: err instanceof Error ? err.message : String(err),
 					});
 				}
+			}
+		}
+		// A plan that reaches here blocks on its approval card, and the gate above already
+		// declined the review. Publish a runner for exactly that wait so the request can still
+		// be reflected on demand (the 计划反思 button, or the switch turned on while it waits).
+		// Unregistered once the wait ends — the closure holds this pass's `config` and `rows`.
+		if (tu.name === "ExitPlanMode" && !config.reflectionLoop) {
+			const unregister = registerPendingPlanReflectionRunner(
+				config.narratorId,
+				tu.toolUseId,
+				createPendingPlanReflectionRunner(config, rows, tu),
+			);
+			try {
+				return await executeAfterPreAdmission();
+			} finally {
+				unregister();
 			}
 		}
 		return executeAfterPreAdmission();
@@ -4302,11 +4453,18 @@ async function* agentLoopInMetadataSnapshot(
 			let requestStartPending = false;
 			let startFirstTokenTimerForAttempt: (() => void) | undefined;
 
-			const markRequestStarted = (info?: { credentialId?: string }) => {
+			const markRequestStarted = (info?: {
+				credentialId?: string;
+				validateDiagnosticCredential?: () => boolean;
+			}) => {
 				if (info?.credentialId) {
 					credentialId = info.credentialId;
 				}
-				requestQuotaProviderIdentity ??= streamQuotaIdentityForPrefix(effectiveProvider);
+				// A pooled retry can start on a different key before yielding output.
+				requestQuotaProviderIdentity = streamQuotaIdentityForRequest(effectiveProvider, {
+					...info,
+					credentialId,
+				});
 				if (requestStarted) return;
 				requestStarted = true;
 				requestStartPending = true;

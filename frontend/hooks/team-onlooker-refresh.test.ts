@@ -86,9 +86,12 @@ describe("installTeamOnlookerRefresh", () => {
 		source.emit({ type: "narrator_access_changed", narratorId: "lead", reason: "unshared" });
 		source.emit({ type: "project_access_changed", projectId: "p", reason: "visibility_changed" });
 		expect(refreshes).toBe(3);
+		// That session was just turned into a team (or its team disbanded): always re-read.
+		source.emit({ type: "narrator_access_changed", narratorId: "lead", reason: "team_changed" });
+		expect(refreshes).toBe(4);
 		remove();
 		expect(source.listeners.size).toBe(0);
 		source.emit({ type: "project_access_changed", projectId: "p" });
-		expect(refreshes).toBe(3);
+		expect(refreshes).toBe(4);
 	});
 });

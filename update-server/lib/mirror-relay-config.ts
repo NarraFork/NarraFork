@@ -8,6 +8,7 @@ export interface MirrorRelaySettings {
 	/** Internal authentication only. Never log or persist resolved settings. */
 	signingKey: string;
 	pollIntervalMs: number;
+	downloadConcurrency: number;
 	totalTimeoutMs?: number;
 	products: { product: string; repository: string }[];
 }
@@ -41,6 +42,7 @@ export function resolveMirrorRelaySettings(
 					"bearerTokenEnv",
 					"signingKeyEnv",
 					"pollIntervalSeconds",
+					"downloadConcurrency",
 					"downloadRedirectHosts",
 					"totalTimeoutMinutes",
 					"transferTimeoutMinutes",
@@ -51,6 +53,14 @@ export function resolveMirrorRelaySettings(
 	for (const minutes of [relay.totalTimeoutMinutes, relay.transferTimeoutMinutes])
 		if (minutes !== undefined && typeof minutes !== "number")
 			throw new Error("Mirror relay timeouts must be numeric whole minutes");
+	const downloadConcurrency =
+		relay.downloadConcurrency === undefined ? 8 : relay.downloadConcurrency;
+	if (
+		!Number.isSafeInteger(downloadConcurrency) ||
+		downloadConcurrency < 1 ||
+		downloadConcurrency > 8
+	)
+		throw new Error("Mirror relay download concurrency must be an integer between 1 and 8");
 	const pollSeconds = relay.pollIntervalSeconds ?? 60;
 	if (!Number.isSafeInteger(pollSeconds) || pollSeconds < 10 || pollSeconds > 3600)
 		throw new Error("Mirror relay poll interval must be between 10 and 3600 seconds");
@@ -99,6 +109,7 @@ export function resolveMirrorRelaySettings(
 		throw new Error("Mirror relay signing key must encode exactly 32 random bytes");
 	const settings = {
 		pollIntervalMs: pollSeconds * 1000,
+		downloadConcurrency,
 		products,
 		...(relay.totalTimeoutMinutes === undefined
 			? {}

@@ -4,6 +4,7 @@ import { requestSourceName } from "../../request-source";
 import { saveSettings, settings } from "../../settings";
 import {
 	classifyKeyFault,
+	keyCooldown,
 	PooledProvider,
 	reportKeyFault,
 	resetProviderKeyRuntimeForTests,
@@ -161,6 +162,98 @@ describe("pooled provider", () => {
 		).rejects.toThrow("cancelled");
 		expect(calls).toEqual(["sk-one"]);
 		expect(store().get(PROVIDER)?.disabled).not.toBe(true);
+	});
+
+	test("synchronously prepares each selected adapter on first use, model change and key/network replacement", async () => {
+		const second = store().add(PROVIDER, { apiKey: "sk-two" });
+		const order: string[] = [];
+		const { build } = fakeBuild({
+			"sk-one": [new ApiError(402, "exhausted")],
+			"sk-two": [{ text: "ok" } as ParsedStreamEvent],
+		});
+		const pool = new PooledProvider(PROVIDER, (key) => {
+			const adapter = build(key);
+			let prepared: string | undefined;
+			adapter.prepareForModel = (model) => {
+				order.push(`prepare:${key.apiKey}:${model}`);
+				prepared = model;
+			};
+			const chat = adapter.chat.bind(adapter);
+			adapter.chat = async function* (params) {
+				expect(prepared).toBe(params.model);
+				order.push(`chat:${key.apiKey}`);
+				yield* chat(params);
+			};
+			adapter.generateWithMeta = async (_text, model) => {
+				expect(prepared).toBe(model);
+				return { text: key.apiKey };
+			};
+			return adapter;
+		});
+		pool.prepareForModel("pooltest:m");
+		await drain(pool.chat({ ...params("prepared"), model: "pooltest:m" }));
+		expect(order).toEqual([
+			"prepare:sk-one:pooltest:m",
+			"chat:sk-one",
+			"prepare:sk-two:pooltest:m",
+			"chat:sk-two",
+		]);
+		store().update(second.id, { network: { extraHeaders: { "X-Key": "replacement" } } });
+		expect((await pool.generateWithMeta("hi", "pooltest:m")).credentialId).toBe(second.id);
+		expect(order.at(-1)).toBe("prepare:sk-two:pooltest:m");
+		const preparations = order.length;
+		await pool.generateWithMeta("hi", "pooltest:m");
+		expect(order).toHaveLength(preparations);
+		await pool.generateWithMeta("hi", "pooltest:other");
+		expect(order.at(-1)).toBe("prepare:sk-two:pooltest:other");
+		store().update(second.id, { apiKey: "sk-replaced" });
+		await pool.generateWithMeta("hi", "pooltest:other");
+		expect(order.at(-1)).toBe("prepare:sk-replaced:pooltest:other");
+	});
+
+	test("a synchronous preparation error prevents resolution and upstream requests", async () => {
+		const { build, calls } = fakeBuild({ "sk-one": [] });
+		const pool = new PooledProvider(PROVIDER, (key) => ({
+			...build(key),
+			prepareForModel: () => {
+				throw new Error("model preparation failed");
+			},
+		}));
+		expect(() => pool.prepareForModel("m")).toThrow("model preparation failed");
+		await expect(pool.generateWithMeta("hi", "m")).rejects.toThrow("model preparation failed");
+		expect(calls).toEqual([]);
+	});
+
+	test("a diagnostic fork prepares only its pinned key without affinity changes or fault penalties", async () => {
+		const second = store().add(PROVIDER, { apiKey: "sk-two" });
+		const { build, calls } = fakeBuild({ "sk-two": [new ApiError(402, "diagnostic failure")] });
+		const prepared: string[] = [];
+		const pool = new PooledProvider(PROVIDER, (key) => {
+			const adapter = build(key);
+			let model: string | undefined;
+			adapter.prepareForModel = (value) => {
+				model = value;
+				prepared.push(key.id);
+			};
+			adapter.supportsDiagnosticFork = (value, id) => model === value && id === key.id;
+			return adapter;
+		});
+		expect(selectProviderKey(PROVIDER, "parent")?.id).toBe(PROVIDER);
+		expect(pool.supportsDiagnosticFork("m", second.id)).toBe(true);
+		await expect(
+			drain(
+				pool.chat({
+					...params("parent"),
+					model: "m",
+					diagnosticFork: { suffix: "probe", credentialId: second.id },
+				}),
+			),
+		).rejects.toThrow("diagnostic failure");
+		expect(prepared).toEqual([second.id]);
+		expect(calls).toEqual(["sk-two"]);
+		expect(selectProviderKey(PROVIDER, "parent")?.id).toBe(PROVIDER);
+		expect(keyCooldown(second.id)).toBeUndefined();
+		expect(store().get(second.id)?.disabled).not.toBe(true);
 	});
 
 	test("server errors say nothing about the key", () => {

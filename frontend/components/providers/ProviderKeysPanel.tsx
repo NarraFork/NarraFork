@@ -28,7 +28,7 @@ import {
 	IconWorld,
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ApiError } from "../../lib/api/client";
 import { type ProviderKeyInfo, providerKeysApi } from "../../lib/api/provider-keys";
@@ -110,7 +110,17 @@ function KeyUsage({ usage }: { usage: NonNullable<ProviderKeyInfo["usage"]> }) {
 	);
 }
 
-export function ProviderKeysPanel({ providerId }: { providerId: string }) {
+export function ProviderKeysPanel({
+	providerId,
+	onFirstKeyChanged,
+	showSingleKey = false,
+}: {
+	providerId: string;
+	/** OAuth-only sections have no separate first-key editor. */
+	showSingleKey?: boolean;
+	/** Keep the settings draft aligned with this immediately persisted pool. */
+	onFirstKeyChanged?: (maskedApiKey: string) => void;
+}) {
 	const { t } = useTranslation("settings");
 	const qc = useQueryClient();
 	const queryKey = ["provider-keys", providerId];
@@ -126,17 +136,27 @@ export function ProviderKeysPanel({ providerId }: { providerId: string }) {
 	const [error, setError] = useState<string | null>(null);
 	const [networkFor, setNetworkFor] = useState<ProviderKeyInfo | null>(null);
 
-	const changed = (data?: { keys?: ProviderKeyInfo[] }) => {
-		if (data?.keys) qc.setQueryData(queryKey, { keys: data.keys });
-		else void qc.invalidateQueries({ queryKey });
-		// The first key is also the provider's API key in settings.
-		void qc.invalidateQueries({ queryKey: ["settings"] });
+	const onFirstKeyChangedRef = useRef(onFirstKeyChanged);
+	onFirstKeyChangedRef.current = onFirstKeyChanged;
+	const changed = async (data?: { keys?: ProviderKeyInfo[] }) => {
+		// Add/update/remove return one key (or ok), not the final order. While the
+		// final read is pending (or fails), '*' tells settings PATCH to preserve the
+		// current server secret instead of deleting it from a stale empty draft.
+		if (!data?.keys) onFirstKeyChangedRef.current?.("*");
+		try {
+			const result = data?.keys ? { keys: data.keys } : await providerKeysApi.list(providerId);
+			qc.setQueryData(queryKey, result);
+			onFirstKeyChangedRef.current?.(result.keys[0]?.masked ?? "");
+		} finally {
+			void qc.invalidateQueries({ queryKey: ["admin", "settings"] });
+			void qc.invalidateQueries({ queryKey: ["settings"] });
+		}
 	};
 	const run = useMutation({
 		mutationFn: (action: () => Promise<{ keys?: ProviderKeyInfo[] } | unknown>) => action(),
-		onSuccess: (data) => {
+		onSuccess: async (data) => {
+			await changed(data as { keys?: ProviderKeyInfo[] });
 			setError(null);
-			changed(data as { keys?: ProviderKeyInfo[] });
 		},
 		onError: (err) => setError(describeApiError(err, t).message),
 	});
@@ -149,7 +169,10 @@ export function ProviderKeysPanel({ providerId }: { providerId: string }) {
 		);
 	}
 	const list = keys.data?.keys ?? [];
-	const showList = list.length > 1 || list.some((k) => k.usage || k.cooldown || k.disabled);
+	const showList =
+		(showSingleKey && list.length > 0) ||
+		list.length > 1 ||
+		list.some((k) => k.usage || k.cooldown || k.disabled);
 
 	const move = (index: number, delta: number) => {
 		const ids = list.map((k) => k.id);
@@ -172,6 +195,7 @@ export function ProviderKeysPanel({ providerId }: { providerId: string }) {
 								size="sm"
 								variant="subtle"
 								loading={run.isPending}
+								aria-label={t("providerKeys.refreshUsage")}
 								onClick={() => run.mutate(() => providerKeysApi.refreshUsage(providerId))}
 							>
 								<IconRefresh size={14} />
@@ -197,8 +221,8 @@ export function ProviderKeysPanel({ providerId }: { providerId: string }) {
 				list.map((entry, index) => (
 					<Paper key={entry.id} withBorder p="xs" radius="sm">
 						<Stack gap={6}>
-							<Group justify="space-between" wrap="nowrap" gap="xs">
-								<Group gap={6} wrap="nowrap" style={{ minWidth: 0 }}>
+							<Group justify="space-between" wrap="wrap" gap="xs">
+								<Group gap={6} wrap="wrap" style={{ minWidth: 0, flex: "1 1 240px" }}>
 									<Text size="xs" c="dimmed">
 										{index + 1}
 									</Text>
@@ -217,12 +241,13 @@ export function ProviderKeysPanel({ providerId }: { providerId: string }) {
 										</Badge>
 									)}
 								</Group>
-								<Group gap={2} wrap="nowrap">
+								<Group gap={2} wrap="nowrap" style={{ flexShrink: 0, marginLeft: "auto" }}>
 									<Tooltip label={t("credentialNetwork.button")}>
 										<ActionIcon
 											size="sm"
 											variant={Object.keys(entry.network).length ? "light" : "subtle"}
 											color={Object.keys(entry.network).length ? "indigo" : "gray"}
+											aria-label={t("credentialNetwork.button")}
 											onClick={() => setNetworkFor(entry)}
 										>
 											<IconWorld size={14} />
@@ -326,7 +351,7 @@ export function ProviderKeysPanel({ providerId }: { providerId: string }) {
 				onSave={async (network) => {
 					if (!networkFor) return;
 					await providerKeysApi.update(networkFor.id, { network });
-					changed();
+					await changed();
 				}}
 			/>
 		</Stack>

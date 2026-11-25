@@ -37,6 +37,28 @@ function group(
 	});
 }
 
+/**
+ * A view of the caller's current connection, without the global settings snapshot.
+ * Management reads also need disabled connections and drafts that were not saved yet.
+ */
+export function sourceGroupForConnection(
+	config: { id: string; name: string; prefix: string; baseUrl?: string; disabled?: boolean },
+	protocol: SourceProtocol | "nug",
+): SourceGroupView {
+	const { templateId, region } = identifyService({ baseUrl: config.baseUrl, protocol });
+	return group(templateId, {
+		id: config.id,
+		prefix: config.prefix,
+		name: config.name,
+		disabled: !!config.disabled,
+		endpoint: {
+			...(config.baseUrl !== undefined ? { baseUrl: config.baseUrl } : {}),
+			...(protocol !== "nug" ? { protocol } : {}),
+			...(region ? { region } : {}),
+		},
+	});
+}
+
 /** Singletons, then connections, then plugins; a plugin never wins a shared prefix. */
 function buildSourceGroups(): readonly SourceGroupView[] {
 	const groups: SourceGroupView[] = [

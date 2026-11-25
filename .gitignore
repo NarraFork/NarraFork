@@ -42,9 +42,14 @@ analyze2/
 script/
 scripts/*
 !scripts/check-style-tokens.ts
+!scripts/summarize-ci-tests.py
+!scripts/ci-native-diagnostics.ts
+!scripts/ci-stage.ts
 !scripts/build-alpha.ts
 !scripts/benchmark-token-repair-bulk.ts
 !scripts/benchmark-token-recalculation.ts
+# Repository knowledge tree tool (knowledge/): find, affected, stale, coverage, check.
+!scripts/knowledge.ts
 !scripts/lib/
 scripts/lib/*
 !scripts/lib/latest-yml.ts

@@ -26,6 +26,7 @@ import type {
 	NUGProviderConfig,
 	TokenDanceSettings,
 } from "../settings/types";
+import { readTemplateModelList } from "./model-list-readers";
 import type { SourceGroupView } from "./source-groups";
 
 export type { ServiceTemplateId } from "@shared/sourcing/identify";
@@ -76,6 +77,12 @@ export interface ServiceTemplate {
 	) => Promise<QuotaSnapshot>;
 	/** A read-only projection when another canonical store owns the usage (Codex). */
 	projectQuota?: (credentialId: string) => QuotaSnapshot | undefined;
+	/** Existing cached upstream ids. Explicit refresh stays with the catalog owner. */
+	listModels: (
+		group: SourceGroupView,
+		credential?: Credential,
+		signal?: AbortSignal,
+	) => Promise<string[]>;
 }
 
 type ProbeQuota = NonNullable<ServiceTemplate["probeQuota"]>;
@@ -112,7 +119,7 @@ const KIMI_CODE = (host: string): ProtocolEndpoints => ({
 	"openai-responses": `https://${host}/coding/v1`,
 });
 
-const TEMPLATES: readonly Omit<ServiceTemplate, "dedupeKeys">[] = [
+const TEMPLATES: readonly Omit<ServiceTemplate, "listModels" | "dedupeKeys">[] = [
 	{
 		id: "codex",
 		kind: "known",
@@ -201,22 +208,20 @@ const TEMPLATES: readonly Omit<ServiceTemplate, "dedupeKeys">[] = [
 		personal: true,
 	},
 	{
-		// Prepaid balance. One key until TokenDance joins the credential pool (S2 PR 7).
 		id: "tokendance",
 		kind: "known",
 		preferredPrefix: "tokendance",
 		authKinds: ["api_key"],
-		multiCredential: false,
+		multiCredential: true,
 		subscription: false,
 		personal: false,
 	},
 	{
-		// Routed as pay-per-use today; one key until the credential pool takes it (S2 PR 7).
 		id: "command-code",
 		kind: "known",
 		preferredPrefix: "CommandCode",
 		authKinds: ["api_key"],
-		multiCredential: false,
+		multiCredential: true,
 		subscription: false,
 		personal: false,
 	},
@@ -245,12 +250,11 @@ const TEMPLATES: readonly Omit<ServiceTemplate, "dedupeKeys">[] = [
 		personal: true,
 	},
 	{
-		// NUG is excluded from the key pool until S2 PR 7.
 		id: "nug",
 		kind: "api",
 		preferredPrefix: "nug",
 		authKinds: ["api_key"],
-		multiCredential: false,
+		multiCredential: true,
 		subscription: false,
 		personal: true,
 	},
@@ -312,6 +316,14 @@ const byId = new Map<ServiceTemplateId, ServiceTemplate>(
 				...template,
 				...(probeQuota ? { probeQuota } : {}),
 				dedupeKeys: templateDedupeKeys(template),
+				listModels: async (
+					group: SourceGroupView,
+					_credential?: Credential,
+					signal?: AbortSignal,
+				) => {
+					signal?.throwIfAborted();
+					return readTemplateModelList(group);
+				},
 			}),
 		];
 	}),
@@ -324,4 +336,20 @@ export function listServiceTemplates(): readonly ServiceTemplate[] {
 /** Every id in `SERVICE_TEMPLATE_IDS` has a template (asserted by the tests). */
 export function getServiceTemplate(id: ServiceTemplateId): ServiceTemplate {
 	return byId.get(id) as ServiceTemplate;
+}
+
+/**
+ * Management model GETs retain the owner's full metadata and order, selecting ids via
+ * the template. The reader executes synchronously before the Promise resolves, so both
+ * reads see the same in-memory catalog; no second catalog or last-result cache exists.
+ */
+export async function listCachedTemplateModels<T extends { id?: unknown }>(
+	group: SourceGroupView,
+	models: T[],
+	signal?: AbortSignal,
+): Promise<T[]> {
+	const ids = new Set(
+		await getServiceTemplate(group.templateId).listModels(group, undefined, signal),
+	);
+	return models.filter((model) => ids.has(String(model.id ?? "")));
 }

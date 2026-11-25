@@ -1872,6 +1872,34 @@ export function createPostgresRuntimeQueue(
 				.limit(1);
 			return rows.length > 0;
 		},
+		/**
+		 * Startup reconciliation page over queued actionable task notices (same
+		 * predicate as `hasActionableTaskNotice`), id-ordered on the claim-recovery
+		 * index. Only recipient ids leave the database.
+		 */
+		async listQueuedTaskNoticeRecipients(input: {
+			afterId?: string;
+			limit: number;
+		}): Promise<{ recipientIds: string[]; nextAfterId?: string }> {
+			const rows = await db
+				.select({ id: mailbox.id, narratorId: mailbox.narratorId })
+				.from(mailbox)
+				.where(
+					and(
+						eq(mailbox.state, "queued"),
+						eq(mailbox.kind, "task_notice"),
+						input.afterId ? gt(mailbox.id, input.afterId) : undefined,
+						sql`(${mailbox.metadataJson}::jsonb ->> 'eventKind') NOT IN ('started', 'cancelled')`,
+					),
+				)
+				.orderBy(asc(mailbox.id))
+				.limit(input.limit + 1);
+			const page = rows.slice(0, input.limit);
+			return {
+				recipientIds: [...new Set(page.map((row) => row.narratorId))],
+				...(rows.length > input.limit ? { nextAfterId: page.at(-1)?.id } : {}),
+			};
+		},
 		/** Named, indexed four-column receipt read; never load payloads while polling. */
 		async readUserBufferedDeliveryReceipt(
 			narratorId: string,

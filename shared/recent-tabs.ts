@@ -18,6 +18,10 @@ export interface NarratorWsSubscriptionLimitError {
 /**
  * `workspace`, `group` and `chapter` are retired: they still decode from historical
  * data, but the sidebar never stores them any more (workspace groups became folders).
+ *
+ * `team` is a project team, pinned by hand: its id is the team id, which is the coordinator
+ * narrator's id. It does NOT represent the coordinator session (no `represented_narrator_id`),
+ * so holding one never makes anybody a recipient of the coordinator's notifications.
  */
 export type RecentTabType =
 	| "chapter"
@@ -26,8 +30,15 @@ export type RecentTabType =
 	| "workspace"
 	| "subagent"
 	| "group"
-	| "folder";
+	| "folder"
+	| "team";
 
+/**
+ * Every tab the sidebar stores today lives in `work`, the sidebar's one list. `projects` is
+ * where project tabs used to be kept, in a list the sidebar stopped rendering; such rows are
+ * converted once per user (pinned ones join `work`, the rest are dropped) and the section is
+ * kept only so old cursors and clients still decode.
+ */
 export type RecentTabsSection = "projects" | "work";
 
 /** Members shown by an open-but-not-expanded folder when the user never chose a number. */
@@ -103,6 +114,11 @@ export interface PersistedRecentTab {
 	folderColor?: RecentTabFolderColor;
 	/** Folder tabs only; absent means {@link RECENT_TAB_FOLDER_DEFAULT_PREVIEW}. */
 	folderPreviewCount?: number;
+	/**
+	 * Team tabs only: the project the team belongs to, for the team page's link. Set by the
+	 * server from `project_teams`, never taken from the client.
+	 */
+	projectId?: string;
 }
 
 /** Incremental operations used by mutation responses and user-scoped WebSocket deltas. */
@@ -127,6 +143,15 @@ export interface RecentTabsPageResult {
 	revision: number;
 	hasMore: boolean;
 	nextCursor: string | null;
+}
+
+/**
+ * One tab's place in a user's sidebar, wherever it sits in the list
+ * (`GET /api/user-preferences/recent-tabs/state`).
+ */
+export interface RecentTabStateResult {
+	present: boolean;
+	pinned: boolean;
 }
 
 export interface RecentTabsMutationResult {

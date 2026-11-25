@@ -144,6 +144,11 @@ mock.module("../outline/task-board/TaskBoardViews", () => ({
 }));
 mock.module("../../lib/outline-router", () => ({ useOpenOutlinePage: () => () => {} }));
 mock.module("../teams/ProjectTeamsList", () => ({ ProjectTeamsList: () => null }));
+mock.module("../nav/PinToSidebarButton", () => ({
+	PinToSidebarButton: ({ type, id }: { type: string; id: string }) => (
+		<span data-pin-to-sidebar={`${type}:${id}`} />
+	),
+}));
 mock.module("./ProjectSettingsPanel", () => ({
 	ProjectSettingsPanel: () => {
 		if (settingsError) throw new Error("optional settings failed");
@@ -236,6 +241,10 @@ test("project shows directory and sessions, but does not mount tools on read", a
 	expect(container.textContent).toContain("My project");
 	expect(container.textContent).toContain("/project-directory");
 	expect(container.textContent).toContain("Description");
+	// "Pin to sidebar" sits beside the title.
+	expect(
+		container.querySelector('[data-pin-to-sidebar="project:original-project"]'),
+	).not.toBeNull();
 	expect(container.querySelector('a[href="/narrators/old-session"]')).not.toBeNull();
 	expect(container.querySelector('a[href="/narrators/new-session"]')).not.toBeNull();
 	expect(container.textContent).not.toContain("compatibility.retirement");
@@ -255,6 +264,7 @@ test("project and sessions start together while the loading shell stays visible"
 	projectLoading = true;
 	await act(async () => root.render(<Page />));
 	expect(container.querySelector("[data-skeleton]")).not.toBeNull();
+	expect(container.querySelector("[data-pin-to-sidebar]")).toBeNull();
 	expect(container.textContent).toContain("compatibility.sessions");
 	expect(list).toHaveBeenCalledWith({
 		projectId: "original-project",

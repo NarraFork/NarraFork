@@ -16,6 +16,7 @@ import { useCallback } from "react";
 import { useTranslation } from "react-i18next";
 import { useNarratorIsOptimizingPrompt } from "../../../hooks/usePromptOptimizeTask";
 import { FOLLOW_DEFAULT_MODEL, FOLLOW_PARENT_MODEL } from "../../../lib/constants";
+import { followDefaultLabel } from "../../../lib/follow-model-label";
 import { formatSmartTime } from "../../../lib/format";
 import { startPointerDrag } from "../../../lib/panel-drag";
 import { highlightSearchText } from "../../../lib/search-utils";
@@ -142,9 +143,10 @@ function NarratorMeta({
 		narrator.model === FOLLOW_PARENT_MODEL
 			? t("narrator:followParent")
 			: narrator.model === FOLLOW_DEFAULT_MODEL
-				? t("followDefault", {
-						model: clampNarratorListText(defaultModelValue, MAX_NARRATOR_LIST_META_CHARS),
-					})
+				? followDefaultLabel(
+						t,
+						clampNarratorListText(defaultModelValue, MAX_NARRATOR_LIST_META_CHARS),
+					)
 				: narrator.model,
 		MAX_NARRATOR_LIST_META_CHARS,
 	);

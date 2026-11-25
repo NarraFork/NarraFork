@@ -87,6 +87,31 @@ describe("response quota_balance snapshots", () => {
 		expect(existsSync(getNarraforkPath("custom-api-quotas.json"))).toBe(false);
 	});
 
+	test("stream balances remain on the selected key after reorder and never replace its probe", () => {
+		useProvider();
+		const store = getProviderKeyStore();
+		const first = store.list(providerId)[0];
+		if (!first) throw new Error("Missing first test key");
+		const second = store.add(providerId, { apiKey: "key-two" });
+		const identity = streamQuotaIdentityForPrefix("custom-quota", second.id);
+		const reset = Date.now() + 60_000;
+		quotaStore.set(second.id, "probe", {
+			fetchedAt: Date.now(),
+			scope: "key",
+			balances: [],
+			windows: [{ kind: "weekly", usedRatio: 1, resetsAt: reset }],
+		});
+		store.reorder(providerId, [second.id, first.id]);
+		store.reorder(providerId, [first.id, second.id]);
+		reportQuota("custom-quota", "7", null, identity);
+		expect(quotaStore.peek(second.id, STREAM_QUOTA_SOURCE)?.balances[0]?.remaining).toBe(7);
+		expect(quotaStore.peek(first.id, STREAM_QUOTA_SOURCE)).toBeUndefined();
+		expect(keyQuotaBlockedUntil(second.id)).toBe(reset);
+		store.update(second.id, { apiKey: "key-replaced" });
+		reportQuota("custom-quota", "99", null, identity);
+		expect(quotaStore.peek(second.id, STREAM_QUOTA_SOURCE)?.balances[0]?.remaining).toBe(7);
+	});
+
 	test("the first credential owns the snapshot and key changes withdraw it", () => {
 		useProvider();
 		const second = getProviderKeyStore().add(providerId, { apiKey: "key-two" });

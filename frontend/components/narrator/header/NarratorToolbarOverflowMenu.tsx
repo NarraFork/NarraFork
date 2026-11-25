@@ -53,6 +53,7 @@ import {
 	IconDotsVertical,
 	IconGripVertical,
 	IconListTree,
+	IconUsersGroup,
 } from "@tabler/icons-react";
 import { Fragment, type ReactNode, useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -294,6 +295,11 @@ export interface NarratorToolbarOverflowMenuProps {
 	onOpenSavedRecordings?: () => void;
 	/** Opens the session's outline space; absent while the outline is switched off. */
 	onOpenOutline?: () => void;
+	/**
+	 * Opens the "upgrade to a team" dialog, which the caller renders outside this dropdown.
+	 * Absent when the session cannot become a team.
+	 */
+	onUpgradeToTeam?: () => void;
 }
 
 export function NarratorToolbarOverflowMenu({
@@ -310,6 +316,7 @@ export function NarratorToolbarOverflowMenu({
 	onOpenCompatibility,
 	onOpenSavedRecordings,
 	onOpenOutline,
+	onUpgradeToTeam,
 }: NarratorToolbarOverflowMenuProps) {
 	const { t } = useTranslation("narrator");
 	const { t: tp } = useTranslation("projects");
@@ -542,6 +549,18 @@ export function NarratorToolbarOverflowMenu({
 						}}
 					>
 						{t("saveDump.history")}
+					</Menu.Item>
+				)}
+				{onUpgradeToTeam && (
+					<Menu.Item
+						leftSection={<IconUsersGroup size={14} />}
+						onClick={() => {
+							closeMenu();
+							onUpgradeToTeam();
+						}}
+						data-testid="narrator-upgrade-to-team"
+					>
+						{tp("teams.upgrade.menu")}
 					</Menu.Item>
 				)}
 				{onArchive ? (
