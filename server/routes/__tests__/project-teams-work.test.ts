@@ -1010,6 +1010,36 @@ describe("merge (M)", () => {
 		}
 	});
 
+	test("a read-only project member with coordinator write can neither merge nor fast-forward", async () => {
+		const { item } = await readyItem("Reader merges", { "merge/reader.txt": "reader\n" });
+		const grantId = generateId();
+		await db.insert(aclGrants).values({
+			id: grantId,
+			scopeType: "narrator",
+			scopeId: teamId,
+			principalType: "user",
+			principalId: READER,
+			capability: "write",
+			createdAt: new Date().toISOString(),
+		});
+		try {
+			// The coordinator grant makes them a member: they may return the item, as before.
+			const drawer = await call(READER, teamPath(`work/${item.id}`));
+			expect(drawer.body.canReturn).toBe(true);
+			// The drawer does not offer them the merge either.
+			expect(drawer.body.merge).toMatchObject({ canMerge: false });
+			for (const suffix of ["merge", "merge/fast-forward"]) {
+				const response = await call(READER, teamPath(`work/${item.id}/${suffix}`), {
+					method: "POST",
+				});
+				expect({ suffix, status: response.status }).toEqual({ suffix, status: 403 });
+			}
+			expect(work.requireWorkItem(teamId, item.id).state).toBe("ready");
+		} finally {
+			await db.delete(aclGrants).where(eq(aclGrants.id, grantId));
+		}
+	});
+
 	test("a fast-forward without a prepared merge is refused", async () => {
 		const { item } = await readyItem("Nothing prepared", { "merge/none.txt": "none\n" });
 		const response = await call(MEMBER, teamPath(`work/${item.id}/merge/fast-forward`), {

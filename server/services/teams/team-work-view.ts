@@ -49,7 +49,7 @@ import {
 	reviewHeadColumns,
 } from "./team-board";
 import { teamGit } from "./team-git";
-import { mergeViewOf, requestFastForward, requestMerge } from "./team-merge";
+import { canMergeInProject, mergeViewOf, requestFastForward, requestMerge } from "./team-merge";
 import { loadTeamForAccess } from "./team-service";
 import { readDependents } from "./work-item-dependencies";
 import { diffStatOf, returnWorkItem, worktreePathOf } from "./work-items";
@@ -474,7 +474,7 @@ export async function readWorkItemDetail(
 					baseBranch: team.baseBranch,
 					teamActive,
 					workerRunning: item.worker?.status === "working" || item.worker?.status === "waiting",
-					member: access === "write",
+					member: access === "write" && (await canMergeInProject(team.projectId, principal)),
 				})
 			: undefined;
 	return {

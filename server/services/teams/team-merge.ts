@@ -250,6 +250,22 @@ function repositoryOf(projectId: string): string | null {
 	);
 }
 
+/** Whether a person may write in a project (merging moves its base: members need it too). */
+export async function canMergeInProject(
+	projectId: string,
+	principal: { userId: string; isAdmin: boolean },
+): Promise<boolean> {
+	const row = db
+		.select({ id: projects.id, ownerUserId: projects.ownerUserId, visibility: projects.visibility })
+		.from(projects)
+		.where(eq(projects.id, projectId))
+		.limit(1)
+		.get();
+	if (!row) return false;
+	const { canWriteProject } = await import("../project-acl");
+	return canWriteProject(row, principal);
+}
+
 /** How the item would be merged now, from the cached hosting (never waits). */
 export function mergeModeOf(projectId: string): TeamMergeMode {
 	const repo = repositoryOf(projectId);

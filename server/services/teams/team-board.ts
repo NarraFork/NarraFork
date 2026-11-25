@@ -63,7 +63,7 @@ import { ValidationError } from "../../lib/errors";
 import { canManageNarratorAcl, type NarratorPrincipal } from "../narrator-acl";
 import { shouldHidePendingPermission } from "../pending-permission-visibility";
 import { readTeamMembers } from "./team-members";
-import { mergeSummaryOf } from "./team-merge";
+import { canMergeInProject, mergeSummaryOf } from "./team-merge";
 import { loadTeamForAccess } from "./team-service";
 import { readDependencies } from "./work-item-dependencies";
 
@@ -721,10 +721,16 @@ export async function readTeamBoardColumn(
 		.all();
 	const page = rows.slice(0, options.limit);
 	const teamActive = team.status === "active" && coordinator.status !== "archived";
+	const cards = withDependencies(page.map(boardItemOf));
+	// Merging also needs project write: asked only when the page has a ready card.
+	const mayMerge =
+		access === "write" &&
+		cards.some((card) => card.state === "ready") &&
+		(await canMergeInProject(team.projectId, principal));
 	const items: TeamBoardItem[] = withMerge(
-		withDependencies(page.map(boardItemOf)),
+		cards,
 		() => ({ teamActive, baseBranch: team.baseBranch, projectId: team.projectId }),
-		access === "write",
+		mayMerge,
 	);
 	const last = page.at(-1);
 	return {
