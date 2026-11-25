@@ -78,9 +78,10 @@ type execProcess struct {
 	closeOnce sync.Once
 	deadline  *time.Timer
 
-	mu       sync.Mutex
-	reaped   bool
-	timedOut bool
+	mu            sync.Mutex
+	reaped        bool
+	deadlineFired bool
+	signaled      bool
 }
 
 // startExecProcess starts cmdArgs with stdin from /dev/null. A positive timeout
@@ -108,9 +109,7 @@ func startExecProcess(cmdArgs []string, cwd string, env []string, timeout time.D
 	if timeout > 0 {
 		p.deadline = time.AfterFunc(timeout, func() {
 			p.mu.Lock()
-			if !p.reaped {
-				p.timedOut = true
-			}
+			p.deadlineFired = true
 			p.mu.Unlock()
 			_ = p.Kill()
 		})
@@ -141,8 +140,15 @@ func (p *execProcess) Kill() error {
 
 func (p *execProcess) Wait() int {
 	err := p.cmd.Wait()
+	// A command that exited on its own just as the deadline fired is not a timeout:
+	// only a signal ending it after the deadline counts.
+	signaled := false
+	if ws, ok := p.cmd.ProcessState.Sys().(syscall.WaitStatus); ok {
+		signaled = ws.Signaled()
+	}
 	p.mu.Lock()
 	p.reaped = true
+	p.signaled = signaled
 	p.mu.Unlock()
 	if p.deadline != nil {
 		p.deadline.Stop()
@@ -150,11 +156,12 @@ func (p *execProcess) Wait() int {
 	return exitCodeFromError(err, p.cmd)
 }
 
-// TimedOut reports whether the deadline stopped the command (session.DeadlineReporter).
+// TimedOut reports whether the deadline stopped the command (session.DeadlineReporter):
+// the deadline fired and the command ended by a signal, not by exiting itself.
 func (p *execProcess) TimedOut() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.timedOut
+	return p.deadlineFired && p.signaled
 }
 
 func (p *execProcess) Close() error {

@@ -5,6 +5,7 @@ package handlers
 import (
 	"context"
 	"encoding/base64"
+	"fmt"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -151,4 +152,22 @@ func TestExecSessionKillReachesOtherProcessGroups(t *testing.T) {
 		_, err := h.SessionInfo(map[string]any{"sessionId": "exec-4"})
 		return err != nil
 	})
+}
+
+// A command that exits on its own as the deadline fires is not a timeout: only a
+// command the deadline actually stopped reports one.
+func TestExecSessionNaturalExitAtTheDeadlineIsNotATimeout(t *testing.T) {
+	h, root := newSessionHandlers(t)
+	for i := 0; i < 20; i++ {
+		id := fmt.Sprintf("exec-race-%d", i)
+		if _, err := h.SessionOpen(map[string]any{
+			"sessionId": id, "kind": "exec", "command": "exit 0", "cwd": root, "timeoutMs": float64(1),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		_, result := attachAll(t, h, id, 0)
+		if result.ExitCode == 0 && result.TimedOut {
+			t.Fatalf("a command that exited 0 was reported as timed out: %+v", result)
+		}
+	}
 }
