@@ -3,7 +3,9 @@ import {
 	TEAM_BOARD_COLUMNS,
 	TEAM_BOARD_PAGE_LIMIT,
 	TEAM_EVENTS_PAGE_LIMIT,
+	TEAM_RETURN_REASON_MAX_LENGTH,
 	TEAM_SETTINGS_MAX_BYTES,
+	TEAM_WORK_STATS_IDS_MAX,
 } from "@shared/project-teams";
 import { z } from "zod";
 
@@ -106,5 +108,28 @@ export const releaseTeamLockSchema = z
 	.object({
 		workItemId: z.string().min(1).max(200),
 		reason: z.string().max(500).optional(),
+	})
+	.strict();
+
+// ── R: the redesigned team page ─────────────────────────────────────────────
+
+/** `GET …/work-stats?ids=a,b,c`: up to the limit, comma-separated. */
+export const teamWorkStatsQuerySchema = z.object({
+	ids: z
+		.string()
+		.max(TEAM_WORK_STATS_IDS_MAX * 201)
+		.transform((value) => value.split(",").filter(Boolean))
+		.pipe(z.array(z.string().min(1).max(200)).max(TEAM_WORK_STATS_IDS_MAX)),
+});
+
+/** `GET …/work/:itemId/diff?path=`: a repository-relative path the branch changed. */
+export const teamWorkDiffQuerySchema = z.object({
+	path: z.string().min(1).max(4096),
+});
+
+/** `POST …/work/:itemId/return`: the reason the worker gets. */
+export const returnTeamWorkItemSchema = z
+	.object({
+		reason: z.string().trim().min(1).max(TEAM_RETURN_REASON_MAX_LENGTH),
 	})
 	.strict();

@@ -276,6 +276,8 @@ describe("board", () => {
 			exclusiveKey: "migrations",
 			createdAt: expect.any(String),
 			updatedAt: expect.any(String),
+			// The worker runs but has made no tool call yet.
+			activity: null,
 		});
 		expect(JSON.stringify(progress)).not.toContain("src/file-");
 		expect((await column("review")).items.map((card: { id: string }) => card.id).sort()).toEqual(
@@ -295,7 +297,8 @@ describe("board", () => {
 			cancelled: 1,
 		});
 		expect(summary.runningAgents).toEqual([
-			{ id: workerId, title: "worker one", status: "working" },
+			// What the worker did last (none yet): the rows' "doing now" stays live from here.
+			{ id: workerId, title: "worker one", status: "working", activity: null },
 		]);
 		expect(summary.runningCount).toBe(1);
 		await db.update(narrators).set({ status: "idle" }).where(eq(narrators.id, workerId));

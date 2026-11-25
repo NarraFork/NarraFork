@@ -228,7 +228,13 @@ describe("a tree of hundreds of finished subagents", () => {
 		const summary = (await call(MEMBER, teamPath("summary"))).body;
 		expect(summary.runningCount).toBe(1);
 		expect(summary.runningAgents).toEqual([
-			{ id: workerId, title: "new worker", status: "waiting" },
+			{
+				id: workerId,
+				title: "new worker",
+				status: "waiting",
+				// What it is doing now: the call waiting for a person.
+				activity: { toolName: "Bash", preview: "rm -rf build", at: expect.any(String) },
+			},
 		]);
 		expect(summary.pendingApprovalCount).toBe(1);
 		const approvals = (await call(MEMBER, teamPath("approvals"))).body;
