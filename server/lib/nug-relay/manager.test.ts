@@ -40,7 +40,9 @@ const { resolveProviderAndModel } = await import("../agent/provider");
 afterEach(() => {
 	stopAllNugRelayClients();
 	getProviderKeyStore().removeProvider(nugKeyOwner("relay-owner-test"));
+	getProviderKeyStore().removeProvider(nugKeyOwner("relay-slow-models"));
 	setNugCachedModels("relay-owner-test", []);
+	setNugCachedModels("relay-slow-models", []);
 	saveSettings(structuredClone(saved));
 	clients.length = 0;
 	automaticReady = true;
@@ -131,6 +133,7 @@ for (const edit of ["remove", "rotate", "disable"] as const) {
 		hotAutoAvailable(true);
 		// Only after owner → socket-ready → pure Auto succeeds may a lazy adapter be built.
 		// It must reuse B, not restore the still-projected disabled A.
+		if (edit === "disable") expect(settings.nugProviders?.[0]?.apiKey).not.toBe(backup.apiKey);
 		resolveProviderAndModel("relay-test:upstream:gpt-5.5");
 		expect(clients).toHaveLength(2);
 		const selected = edit === "rotate" ? store.get(first.id) : store.get(backup.id);
@@ -168,6 +171,112 @@ for (const edit of ["remove", "rotate", "disable"] as const) {
 	});
 }
 
+test.each([
+	"settings-first",
+	"keys-first",
+] as const)("late bulk refresh %s cannot send live B to a captured old gateway or stop the new relay", async (commitOrder) => {
+	const { Hono } = await import("hono");
+	const { nugRoutes } = await import("../../routes/nug");
+	const { setOutboundFetchOverrideForTest } = await import("../net/outbound-fetch");
+	const { store, first, backup } = ownerFixture();
+	store.update(backup.id, { disabled: true });
+	const captured = settings.nugProviders?.[0];
+	if (!captured) throw new Error("missing captured bulk connection");
+	saveSettings({
+		...settings,
+		nugProviders: [
+			{
+				...connection({
+					id: "relay-slow-models",
+					prefix: "relay-slow",
+					apiKey: "slow-models-key",
+					baseUrl: "https://slow-models.example",
+					egressMode: "nug",
+				}),
+			},
+			captured,
+		],
+	});
+	startNugRelayOwner();
+	await Promise.resolve();
+	clients[0]?.ready();
+	const started = Promise.withResolvers<void>();
+	const finish = Promise.withResolvers<void>();
+	const http: Array<{ url: string; auth: string | null }> = [];
+	setOutboundFetchOverrideForTest(async (input, init) => {
+		const url = String(input);
+		http.push({ url, auth: new Headers(init?.headers).get("Authorization") });
+		if (url.startsWith("https://slow-models.example")) {
+			started.resolve();
+			await finish.promise;
+		}
+		return Response.json({ models: [] });
+	});
+	const app = new Hono();
+	app.route("/", nugRoutes);
+	const pending = app.request("/models/refresh", { method: "POST" });
+	const settled = Promise.allSettled([pending]);
+	try {
+		await started.promise;
+		// The actual bulk route retains its old array while awaiting the first gateway.
+		// In keys-first order, projection even mutates that captured entry's secret to B.
+		const publishGateway = () =>
+			saveSettings({
+				...settings,
+				nugProviders: settings.nugProviders?.map((config) =>
+					config.id === captured.id
+						? { ...config, baseUrl: "https://new-gateway.example" }
+						: config,
+				),
+			});
+		const promoteBackup = () => {
+			store.remove(first.id);
+			store.update(backup.id, { disabled: false });
+		};
+		if (commitOrder === "settings-first") {
+			publishGateway();
+			promoteBackup();
+		} else {
+			promoteBackup();
+			publishGateway();
+		}
+		await Promise.resolve();
+		const live = clients.at(-1);
+		if (!live) throw new Error("missing live new-gateway relay");
+		expect(live.options).toMatchObject({
+			apiKey: backup.apiKey,
+			baseUrl: "https://new-gateway.example",
+		});
+		live.ready();
+		hotAutoAvailable(true);
+		finish.resolve();
+		const response = await pending;
+		expect(response.status).toBe(200);
+		const body = await response.json();
+		expect(
+			body.results.find((result: { providerId: string }) => result.providerId === captured.id)
+				?.error,
+		).toContain("connection changed");
+		expect(http).toEqual([
+			{ url: "https://slow-models.example/v1/models", auth: "Bearer slow-models-key" },
+		]);
+		// Even the compatibility ensure entrypoint must ignore a stale direct-egress snapshot.
+		ensureNugRelayClient({ ...captured, egressMode: "nug" });
+		expect(
+			clients
+				.filter((client) => client.options.apiKey === backup.apiKey)
+				.map((client) => client.options.baseUrl),
+		).toEqual(["https://new-gateway.example"]);
+		expect(live.status).toBe("online");
+		expect(getNugRelayChannelId(captured.id)).toBe(live.currentChannelId);
+		hotAutoAvailable(true);
+	} finally {
+		finish.resolve();
+		await settled;
+		setOutboundFetchOverrideForTest(null);
+	}
+});
+
 test("startup promotes an enabled backup and stop cancels queued work and both subscriptions", async () => {
 	const { store, first, backup } = ownerFixture();
 	store.update(first.id, { disabled: true });
@@ -197,11 +306,18 @@ test("startup promotes an enabled backup and stop cancels queued work and both s
 	hotAutoAvailable(false);
 });
 
+function publishRelay(config: NUGProviderConfig) {
+	saveSettings({ ...settings, nugProviders: [structuredClone(config)] });
+	ensureNugRelayClient(config);
+}
+
 test("only the exact live credential and endpoint may use a connection relay", () => {
 	const config = connection();
-	ensureNugRelayClient(config);
+	publishRelay(config);
 	const channel = getNugRelayChannelId(config.id);
 	expect(channel).toBeTruthy();
+	ensureNugRelayClient({ ...config, id: "not-committed", baseUrl: "https://discarded.example" });
+	expect(clients).toHaveLength(1);
 	expect(getNugRelayChannelIdForCredential(config)).toBe(channel);
 	expect(getNugRelayChannelIdForCredential({ ...config, apiKey: "secret-b" })).toBeNull();
 	expect(
@@ -215,14 +331,14 @@ test("only the exact live credential and endpoint may use a connection relay", (
 
 test("relogin, reorder, and endpoint changes invalidate an old adapter at send time", () => {
 	const old = connection();
-	ensureNugRelayClient(old);
+	publishRelay(old);
 	const oldChannel = getNugRelayChannelIdForCredential(old);
 	const updated = connection({ apiKey: "secret-b" });
-	ensureNugRelayClient(updated);
+	publishRelay(updated);
 	expect(getNugRelayChannelIdForCredential(old)).toBeNull();
 	expect(getNugRelayChannelIdForCredential(updated)).not.toBe(oldChannel);
 	const moved = { ...updated, baseUrl: "https://new.example" };
-	ensureNugRelayClient(moved);
+	publishRelay(moved);
 	expect(getNugRelayChannelIdForCredential(updated)).toBeNull();
 	expect(getNugRelayChannelIdForCredential(moved)).toBeTruthy();
 	expect(clients).toHaveLength(3);
@@ -230,15 +346,15 @@ test("relogin, reorder, and endpoint changes invalidate an old adapter at send t
 
 test("egress mode or proxy changes restart the relay, while direct mode removes it", () => {
 	const old = connection();
-	ensureNugRelayClient(old);
+	publishRelay(old);
 	const proxied = connection({
 		egressMode: "local-proxy",
 		egressProxyUrl: "http://127.0.0.1:8123",
 	});
-	ensureNugRelayClient(proxied);
+	publishRelay(proxied);
 	expect(getNugRelayChannelIdForCredential(old)).toBeNull();
 	expect(getNugRelayChannelIdForCredential(proxied)).toBeTruthy();
 	expect(clients).toHaveLength(2);
-	ensureNugRelayClient({ ...proxied, egressMode: "nug" });
+	publishRelay({ ...proxied, egressMode: "nug" });
 	expect(getNugRelayChannelIdForCredential(proxied)).toBeNull();
 });

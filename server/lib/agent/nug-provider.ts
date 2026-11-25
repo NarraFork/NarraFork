@@ -9,6 +9,7 @@ import {
 } from "../nug-model-cache";
 import { applyNugModelCatalogUpdate } from "../nug-model-sync";
 import {
+	assertNugConnectionCurrent,
 	getNugRelayChannelIdForCredential,
 	reconcileNugRelayProvider,
 	usesLocalEgress,
@@ -168,12 +169,15 @@ export class NugProvider implements ProviderAdapter {
 	private activeDelegate: ProviderAdapter | null = null;
 
 	constructor(config: NUGProviderConfig, relayConfig: NUGProviderConfig = config) {
-		this.config = config;
+		assertNugConnectionCurrent(config);
+		assertNugConnectionCurrent(relayConfig);
+		// Provider-key projection mutates settings entries in place; keep the attempted secret fixed.
+		this.config = { ...config };
 		// Client-egress relay lifecycle follows provider construction: with
 		// egressMode local-* a relay channel to the gateway is established (or
 		// reused); reverting to "nug" tears it down. Idempotent per provider id.
-		// Share the owner's live credential selection, never restore a disabled projected key.
-		reconcileNugRelayProvider(relayConfig);
+		// A captured request owns its inference config, not live relay credentials or endpoints.
+		reconcileNugRelayProvider(relayConfig.id);
 	}
 
 	/**
