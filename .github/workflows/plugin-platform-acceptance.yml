@@ -20,6 +20,7 @@ on:
       - "tests/frontend/plugins/**"
       - "tests/fixtures/plugins/e2e/**"
       - "examples/plugins/**"
+      - "scripts/install-ci-chrome.ts"
       - "scripts/drill-plugin-rollback.ts"
       - "scripts/smoke-plugin-ui.ts"
       - "scripts/smoke-narrator-dock.ts"
@@ -46,6 +47,7 @@ on:
       - "tests/frontend/plugins/**"
       - "tests/fixtures/plugins/e2e/**"
       - "examples/plugins/**"
+      - "scripts/install-ci-chrome.ts"
       - "scripts/drill-plugin-rollback.ts"
       - "scripts/smoke-plugin-ui.ts"
       - "scripts/smoke-narrator-dock.ts"
@@ -110,14 +112,8 @@ jobs:
       - name: Check TypeScript
         run: bunx tsgo --noEmit
 
-      - name: Locate and verify Chrome
-        shell: bash
-        run: |
-          CHROME_PATH="$(command -v google-chrome || command -v google-chrome-stable || command -v chromium)"
-          test -n "$CHROME_PATH"
-          "$CHROME_PATH" --version
-          printf 'NF_TEST_CHROMIUM_PATH=%s\n' "$CHROME_PATH" >> "$GITHUB_ENV"
-          printf 'PUPPETEER_EXECUTABLE_PATH=%s\n' "$CHROME_PATH" >> "$GITHUB_ENV"
+      - name: Install and verify pinned Chrome
+        run: bun scripts/install-ci-chrome.ts
 
       - name: Probe headless Chrome
         shell: bash
@@ -127,6 +123,7 @@ jobs:
             const browser = await puppeteer.launch({
               executablePath: process.env.NF_TEST_CHROMIUM_PATH,
               headless: true,
+              dumpio: true,
               args: ["--no-sandbox", "--disable-setuid-sandbox"],
               timeout: 15000,
             });
@@ -264,14 +261,8 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      - name: Locate and verify Chrome
-        shell: bash
-        run: |
-          CHROME_PATH="$(command -v google-chrome || command -v google-chrome-stable || command -v chromium)"
-          test -n "$CHROME_PATH"
-          "$CHROME_PATH" --version
-          printf 'NF_TEST_CHROMIUM_PATH=%s\n' "$CHROME_PATH" >> "$GITHUB_ENV"
-          printf 'PUPPETEER_EXECUTABLE_PATH=%s\n' "$CHROME_PATH" >> "$GITHUB_ENV"
+      - name: Install and verify pinned Chrome
+        run: bun scripts/install-ci-chrome.ts
 
       - name: Probe headless Chrome
         shell: bash
@@ -281,6 +272,7 @@ jobs:
             const browser = await puppeteer.launch({
               executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
               headless: true,
+              dumpio: true,
               args: ["--no-sandbox", "--disable-setuid-sandbox"],
               timeout: 15000,
             });
