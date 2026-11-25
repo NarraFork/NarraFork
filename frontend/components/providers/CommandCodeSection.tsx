@@ -238,6 +238,7 @@ export function CommandCodeSection({
 				<ProviderKeysPanel
 					key="CommandCode"
 					providerId="CommandCode"
+					showSingleKey
 					onFirstKeyChanged={onPersistedKeyChanged}
 				/>
 				<Anchor

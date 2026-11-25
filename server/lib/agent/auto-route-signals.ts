@@ -3,9 +3,9 @@
  *
  * - Codex: a subscription; available while some enabled account is not resting on a used-up
  *   window.
- * - Custom API providers with keys (Kimi Code, OpenCode Go and other relays): available while
+ * - Managed API key pools (custom APIs, TokenDance, Command Code and NUG): available while
  *   some enabled key is neither out of allowance nor resting after a 403; a short 429 rest does
- *   not count. A subscription when it is a Kimi Code or OpenCode Go plan.
+ *   not count. Custom APIs are subscriptions for Kimi Code or OpenCode Go plans.
  * - NUG: unavailable while the gateway model is recorded as down (nug-model-availability).
  * - Everything else: available, pay-per-use. Their own errors still surface on the request.
  *
@@ -15,7 +15,12 @@ import { getCodexManager } from "../codex-manager";
 import { isKimiCustomApiProvider } from "../kimi-usage-cache";
 import { resolveKnownUnavailableNugModel } from "../nug-model-availability";
 import { isOpencodeCustomApiProvider } from "../opencode-usage-cache";
-import { getProviderKeyStore } from "../provider-keys";
+import {
+	COMMAND_CODE_KEY_OWNER,
+	getProviderKeyStore,
+	nugKeyOwner,
+	TOKENDANCE_KEY_OWNER,
+} from "../provider-keys";
 import { registerAutoSourceProbe, settings } from "../settings";
 import { keyCooldown, selectProviderKey, usableProviderKeys } from "./pooled-provider";
 
@@ -23,6 +28,13 @@ import { keyCooldown, selectProviderKey, usableProviderKeys } from "./pooled-pro
 function keyCanServe(keyId: string, now: number): boolean {
 	const reason = keyCooldown(keyId, now)?.reason;
 	return reason === undefined || reason === "rate_limited";
+}
+
+/** A stored but disabled/exhausted pool must not fall back to a projected key or CLI auth. */
+function poolCanServe(owner: string, fallback: boolean, now: number): boolean {
+	return getProviderKeyStore().list(owner).length === 0
+		? fallback
+		: usableProviderKeys(owner).some((key) => keyCanServe(key.id, now));
 }
 
 /**
@@ -42,19 +54,30 @@ export function autoSourceFacts(
 		// accounts and rewrite the credentials file, which must not happen while routing.
 		return { available: getCodexManager().availableCount > 0, subscription: true };
 	}
+	if (provider === "tokendance") {
+		return {
+			available: poolCanServe(TOKENDANCE_KEY_OWNER, !!settings.tokendance?.apiKey, now),
+			subscription: false,
+		};
+	}
+	if (provider === "CommandCode") {
+		// Only a connection with no managed credentials may use its existing CLI-auth path.
+		return { available: poolCanServe(COMMAND_CODE_KEY_OWNER, true, now), subscription: false };
+	}
+	const nug = settings.nugProviders?.find((p) => p.prefix === provider);
+	if (nug) {
+		return { available: poolCanServe(nugKeyOwner(nug.id), !!nug.apiKey, now), subscription: false };
+	}
 	const config = settings.customApiProviders?.find((p) => p.prefix === provider);
 	if (!config) return { available: true, subscription: false };
 	const subscription = isKimiCustomApiProvider(config) || isOpencodeCustomApiProvider(config);
-	const stored = getProviderKeyStore().list(config.id);
-	const keys = usableProviderKeys(config.id);
 	// No stored keys at all (unreadable key file): the provider's own key is all we know about.
 	// Stored keys that are all disabled mean it cannot serve, even though settings still shows
 	// the first (rejected) one.
 	// A short rate-limit rest is not "cannot serve": moving a session to another service for a
 	// one-minute 429 would cost its cache and then keep it there. Only a used-up allowance, a
 	// 403 rest, or a key the upstream rejected (disabled, so not in `keys`) count.
-	const available =
-		stored.length === 0 ? !!config.apiKey : keys.some((key) => keyCanServe(key.id, now));
+	const available = poolCanServe(config.id, !!config.apiKey, now);
 	return { available, subscription };
 }
 
