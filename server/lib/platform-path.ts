@@ -93,6 +93,23 @@ export function pathsEqualForOS(a: string, b: string, os: string): boolean {
 }
 
 /**
+ * Whether the default filesystem of `platform` compares file names case-insensitively: NTFS on
+ * Windows, APFS/HFS+ on macOS. Linux (and every other POSIX platform) is case-sensitive.
+ */
+export function caseInsensitiveFileNames(platform: string = process.platform): boolean {
+	return platform === "win32" || platform === "darwin";
+}
+
+/**
+ * Identity key of a local absolute path on `platform`: its OS grammar ({@link normalizePathForOS}),
+ * case-folded where the default filesystem ignores case ({@link caseInsensitiveFileNames}).
+ */
+export function localPathIdentityKey(path: string, platform: string = process.platform): string {
+	const key = normalizePathForOS(path, platform);
+	return caseInsensitiveFileNames(platform) ? key.toLowerCase() : key;
+}
+
+/**
  * Check whether `child` is equal to or nested inside `parent`.
  * Both paths are resolved & normalised with forward slashes first.
  */

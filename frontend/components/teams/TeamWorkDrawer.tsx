@@ -5,6 +5,10 @@
  * (agents' reviews and people's returns); this item's own timeline; and a fixed bottom bar with
  * 退回 / 合并到 <base>.
  *
+ * D: when the item waits for others, a 「依赖」 list (each with its state; a title opens that item
+ * here) and a warning when one was cancelled; items waiting for this one are listed under
+ * 「被依赖」. Read-only: only the coordinator changes dependencies.
+ *
  * 退回 expands in place into a required one-line reason: the item goes back to in progress and
  * the coordinator relays the reason to the worker. The server never merges, so 合并 is disabled
  * and the bar says how an item becomes merged (its branch landing in the base is noticed).
@@ -31,8 +35,14 @@ import {
 	UnstyledButton,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
-import type { TeamWorkFileChange, TeamWorkItemDetail } from "@shared/project-teams";
 import {
+	dependencyBlockers,
+	type TeamWorkDependencyRef,
+	type TeamWorkFileChange,
+	type TeamWorkItemDetail,
+} from "@shared/project-teams";
+import {
+	IconAlertTriangle,
 	IconArrowBackUp,
 	IconArrowRight,
 	IconCheck,
@@ -261,16 +271,129 @@ function SectionTitle({ children, right }: { children: ReactNode; right?: ReactN
 	);
 }
 
+const DEPENDENCY_STATE_COLOR: Record<TeamWorkDependencyRef["state"], string> = {
+	queued: "gray",
+	in_progress: "blue",
+	in_review: "blue",
+	ready: "green",
+	merged: "gray",
+	cancelled: "red",
+};
+
+/** One dependency or dependent: its state, and its title opening it in this drawer. */
+function DependencyRow({
+	entry,
+	onOpenItem,
+}: {
+	entry: TeamWorkDependencyRef;
+	onOpenItem?: (itemId: string) => void;
+}) {
+	const { t } = useTranslation("projects");
+	return (
+		<Group gap={8} wrap="nowrap" data-testid="team-dependency" data-state={entry.state}>
+			<Badge
+				size="sm"
+				radius="sm"
+				variant="light"
+				tt="none"
+				color={DEPENDENCY_STATE_COLOR[entry.state]}
+				style={{ flexShrink: 0 }}
+			>
+				{t(`teams.page.drawer.dependencyState.${entry.state}`)}
+			</Badge>
+			{onOpenItem ? (
+				<Anchor
+					component="button"
+					size="sm"
+					onClick={() => onOpenItem(entry.id)}
+					style={{ minWidth: 0, textAlign: "left", overflowWrap: "anywhere" }}
+					td={entry.state === "cancelled" ? "line-through" : undefined}
+				>
+					{entry.title}
+				</Anchor>
+			) : (
+				<Text size="sm" style={{ minWidth: 0, overflowWrap: "anywhere" }}>
+					{entry.title}
+				</Text>
+			)}
+		</Group>
+	);
+}
+
+/** The drawer's 「依赖」 and 「被依赖」 sections (exported for the component tests). */
+export function DependencySections({
+	detail,
+	onOpenItem,
+}: {
+	detail: TeamWorkItemDetail;
+	onOpenItem?: (itemId: string) => void;
+}) {
+	const { t } = useTranslation("projects");
+	const dependsOn = detail.item.dependsOn ?? [];
+	const dependents = detail.dependents ?? [];
+	if (dependsOn.length === 0 && dependents.length === 0) return null;
+	const cancelled = dependencyBlockers(dependsOn).filter((entry) => entry.state === "cancelled");
+	const waits = detail.item.state === "queued";
+	return (
+		<Stack gap="md">
+			{dependsOn.length > 0 && (
+				<Box data-testid="team-drawer-dependencies">
+					<SectionTitle>{t("teams.page.drawer.dependenciesTitle")}</SectionTitle>
+					<Stack gap={6}>
+						{waits &&
+							cancelled.map((entry) => (
+								<Alert
+									key={entry.id}
+									color="yellow"
+									p="xs"
+									icon={<IconAlertTriangle size={16} />}
+									data-testid="team-dependency-cancelled"
+								>
+									{t("teams.page.drawer.dependencyCancelled", { title: entry.title })}
+								</Alert>
+							))}
+						{dependsOn.map((entry) => (
+							<DependencyRow key={entry.id} entry={entry} onOpenItem={onOpenItem} />
+						))}
+						{waits && cancelled.length === 0 && dependencyBlockers(dependsOn).length > 0 && (
+							<Text size="xs" c="dimmed">
+								{t("teams.page.drawer.dependencyNote", { base: detail.base })}
+							</Text>
+						)}
+					</Stack>
+				</Box>
+			)}
+			{dependents.length > 0 && (
+				<Box data-testid="team-drawer-dependents">
+					<SectionTitle>{t("teams.page.drawer.dependentsTitle")}</SectionTitle>
+					<Stack gap={6}>
+						{dependents.map((entry) => (
+							<DependencyRow key={entry.id} entry={entry} onOpenItem={onOpenItem} />
+						))}
+						{detail.dependentsMore && (
+							<Text size="xs" c="dimmed">
+								{t("teams.page.drawer.dependentsMore")}
+							</Text>
+						)}
+					</Stack>
+				</Box>
+			)}
+		</Stack>
+	);
+}
+
 function DrawerBody({
 	projectId,
 	teamId,
 	detail,
 	onOpenSession,
+	onOpenItem,
 }: {
 	projectId: string;
 	teamId: string;
 	detail: TeamWorkItemDetail;
 	onOpenSession?: (narratorId: string) => void;
+	onOpenItem?: (itemId: string) => void;
 }) {
 	const { t } = useTranslation("projects");
 	const { item } = detail;
@@ -357,6 +480,8 @@ function DrawerBody({
 					)}
 				</Field>
 			</Stack>
+
+			<DependencySections detail={detail} onOpenItem={onOpenItem} />
 
 			<Box data-testid="team-drawer-files">
 				<SectionTitle>{t("teams.page.drawer.filesTitle")}</SectionTitle>
@@ -612,6 +737,7 @@ export function TeamWorkDrawer({
 	phone,
 	onClose,
 	onOpenSession,
+	onOpenItem,
 }: {
 	projectId: string;
 	teamId: string;
@@ -621,6 +747,8 @@ export function TeamWorkDrawer({
 	phone: boolean;
 	onClose: () => void;
 	onOpenSession?: (narratorId: string) => void;
+	/** D: open another item of the team in this drawer (a dependency's link). */
+	onOpenItem?: (itemId: string) => void;
 }) {
 	const { t } = useTranslation("projects");
 	const detail = useTeamWorkItem(projectId, teamId, itemId);
@@ -722,6 +850,7 @@ export function TeamWorkDrawer({
 							teamId={teamId}
 							detail={data}
 							onOpenSession={onOpenSession}
+							onOpenItem={onOpenItem}
 						/>
 					)}
 				</Box>

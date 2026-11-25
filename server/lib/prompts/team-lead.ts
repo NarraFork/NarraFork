@@ -1,4 +1,5 @@
 import { type Locale, type LocalizedValue, pickLocalizedValue } from "@shared/i18n-locales";
+import { oneLine } from "./team-coordinator-notes";
 
 // ─── Team coordinator ───
 //
@@ -35,6 +36,7 @@ Work items (the Team tool):
 - work.ready also refuses while the worktree has uncommitted changes and, in a repository with knowledge/index.md, while the branch changed code a knowledge node anchors without updating that node, or added a source file no node anchors; the refusal lists them, and you send the worker back to fix them. So when the repository has knowledge/, tell each worker in its brief: before reporting done, run bun scripts/knowledge.ts affected in the worktree and update the nodes it lists.
 - work.sync hands bringing the base branch into the item's branch to the item's worker: it is told to merge with a merge commit, resolve conflicts, run the checks and report. Never rebase or force-push.
 - work.cancel stops tracking an item; cleanup removes a cancelled or merged item's worktree (the branch is kept) and always waits for a person's approval.
+- When one item can only start after others land, create it with Team({ action: "work.create", title, dependsOn: [item ids] }), or set its list later with work.update while it is still queued. Only a merged dependency counts: ready is not enough, and a cancelled one blocks until you remove or replace it. Starting the item before then is refused with TEAM_WORK_ITEM_BLOCKED, which names the blockers. When the last one merges, a note tells you the item can start: run work.sync on it first, since its branch was made from the base before its dependencies landed, and put the instruction it returns at the start of the worker's brief.
 - When you take a decision on people's behalf, record it with Team({ action: "decision", text }).
 - While only waiting (for a review, a run or a person), schedule a check-in with Team({ action: "checkin", minutes }): about fifty minutes for the first, about four hours after that, and stop after three check-ins in a row that found nothing changed; anything new starts the count again.
 
@@ -70,6 +72,7 @@ People and permissions:
 - worktree 有未提交改动时 work.ready 会拒绝；仓库有 knowledge/index.md 时，分支改了某个知识节点锚定的代码却没改这个节点，或新增了没有任何节点锚定的源文件，work.ready 也会拒绝，拒绝结果会列出它们，你把工人派回去补。所以仓库有 knowledge/ 时，在每个工人的简报里写上：汇报完成前，在 worktree 里跑 bun scripts/knowledge.ts affected，更新它列出的节点。
 - work.sync 把「把基线分支合进工作项分支」交给工作项的工人：让它用合并提交合进来、解冲突、跑检查、汇报。永远不 rebase、不强推。
 - work.cancel 不再跟踪一个工作项；cleanup 删掉已取消或已合回的工作项的 worktree（分支保留），每次都要等人批准。
+- 某个工作项要等别的工作项落地才能开始时，用 Team({ action: "work.create", title, dependsOn: [工作项 id] }) 建它，或在它还在排队时用 work.update 设置依赖列表。只有已合并的依赖才算数：ready 不够，已取消的依赖会一直挡着，直到你把它去掉或换掉。在那之前开始这一项会被拒绝（TEAM_WORK_ITEM_BLOCKED，并列出挡着的工作项）。最后一个依赖合并后，会有一条说明告诉你这一项可以开始了：先对它跑 work.sync（它的分支是在依赖落地前从基线开出的），把返回的指令放在工人简报的最前面。
 - 替人做了决定时，用 Team({ action: "decision", text }) 记一笔。
 - 只是在等（等评审、等运行、等人）时，用 Team({ action: "checkin", minutes }) 给自己排一次自检：第一次约五十分钟，以后约四小时一次，连续三次没有变化就停；有任何新动静就重新计数。
 
@@ -152,6 +155,21 @@ export function returnedNote(locale: Locale, input: ReturnedNoteInput): string {
 		? `Send the reason unchanged to its worker (${input.worker}) and have it fix and commit on the same branch; then review again, and only a clear review allows work.ready.`
 		: "It has no worker yet: delegate the fix to a worker in its worktree; then review again, and only a clear review allows work.ready.";
 	return `${who} returned work item "${input.title}"${branch} (${input.itemId}) from the team page; it is in_progress again.\nReason: ${input.reason}\n${next}`;
+}
+
+// ─── A queued item can start ───
+
+/**
+ * The note a coordinator gets when the last dependency of a queued work item merged (source
+ * `team_unblocked`, woken when idle): the item can start now, after a base sync. The title is put
+ * on one line (as in the overlap notice), so it cannot forge lines of its own. Deterministic for
+ * the same inputs.
+ */
+export function unblockedNote(locale: Locale, input: { itemId: string; title: string }): string {
+	const title = oneLine(input.title);
+	if (locale === "zh-CN")
+		return `「${title}」现在可以开始了\n它依赖的工作项都已合并（${input.itemId}）。先对它跑 Team work.sync，再用 Agent({ workdir: <它的 worktree> }) 派工人，把 work.sync 返回的指令放在简报最前面。`;
+	return `"${title}" can start now\nEvery item it depends on is merged (${input.itemId}). Run Team work.sync on it first, then delegate it with Agent({ workdir: <its worktree> }), the instruction work.sync returns first in the brief.`;
 }
 
 // ─── Upgrade and disband notes ───

@@ -672,6 +672,14 @@
 			"prevId": "abeafedc-f054-41e8-b9a0-edc89be12b9b",
 			"version": "7",
 			"snapshotDigest": "6661e27969be1e613d16658d42d6eb0412cfa2dc32409a247f09ce8121c2a7b1"
+		},
+		{
+			"idx": 84,
+			"tag": "0084_team_work_item_dependencies",
+			"id": "33f56901-d084-4512-a9c0-d4eb2669d3a3",
+			"prevId": "8c8f8481-5557-4bd2-b492-a30ef8532e5d",
+			"version": "7",
+			"snapshotDigest": "587f742578638aba9cd456d8611d49ce08927ae0e36528af3de49aeb25890933"
 		}
 	]
 }

@@ -137,11 +137,22 @@ async function newItem(title: string) {
 	});
 }
 
+/** Only a started item is reviewed: give it a worker of its own, as an Agent call attaches. */
+async function startItem(item: { id: string }, title: string) {
+	const worker = await narratorService.create({ title: `${title} worker`, cwd: repo });
+	await db
+		.update(narrators)
+		.set({ type: "subagent", aclRootNarratorId: teamId, parentNarratorId: teamId })
+		.where(eq(narrators.id, worker.id));
+	work.attachWorker(teamId, item.id, worker.id, { kind: "agent", id: teamId });
+}
+
 async function readyItem(title: string, files: Record<string, string>) {
 	const item = await newItem(title);
 	const path = work.worktreePathOf(item) ?? "";
 	commitIn(path, files, title);
 	const actor = { kind: "agent" as const, id: teamId };
+	await startItem(item, title);
 	await work.recordReview({
 		coordinatorId: teamId,
 		itemId: item.id,
@@ -323,6 +334,7 @@ describe("the drawer", () => {
 		expect(detail.body.reviews[0]).toMatchObject({ round: 1, verdict: "clear", by: "agent" });
 		expect(detail.body.events.map((event: { kind: string }) => event.kind)).toEqual([
 			"work.created",
+			"work.started",
 			"work.review",
 			"work.ready",
 		]);
@@ -488,6 +500,35 @@ describe("board and summary", () => {
 		expect(summary.body.coordinatorStopReason).toBeNull();
 		expect(db.select().from(teamWorkItems).where(eq(teamWorkItems.id, item.id)).get()?.state).toBe(
 			"in_progress",
+		);
+	});
+});
+
+describe("dependencies (D)", () => {
+	test("the board carries each card's dependencies; the drawer lists the dependents", async () => {
+		const first = await newItem("Dependency first");
+		const second = await work.createWorkItem({
+			coordinatorId: teamId,
+			title: "Dependency second",
+			dependsOn: [first.id],
+			actor: { ...agent, id: teamId },
+			principal: { userId: OWNER, isAdmin: false },
+			signal: new AbortController().signal,
+		});
+		const board = await call(READER, teamPath("board?column=queued"));
+		const card = board.body.items.find((entry: { id: string }) => entry.id === second.id);
+		expect(card.dependsOn).toEqual([{ id: first.id, title: "Dependency first", state: "queued" }]);
+		expect(
+			board.body.items.find((entry: { id: string }) => entry.id === first.id).dependsOn,
+		).toEqual([]);
+		const detail = await call(READER, teamPath(`work/${first.id}`));
+		expect(detail.body.dependents).toEqual([
+			{ id: second.id, title: "Dependency second", state: "queued" },
+		]);
+		expect(detail.body.dependentsMore).toBe(false);
+		const events = await call(READER, teamPath("events"));
+		expect(events.body.events.map((event: { kind: string }) => event.kind)).toContain(
+			"work.dependencies_changed",
 		);
 	});
 });
@@ -702,6 +743,7 @@ describe("review findings in the drawer", () => {
 		resetWorkStatCacheForTests();
 		const item = await newItem("Findings item");
 		commitIn(work.worktreePathOf(item) ?? "", { "src/f.ts": "f\n" }, "findings work");
+		await startItem(item, "Findings");
 		const actor = { kind: "agent" as const, id: teamId };
 		const short = "缺少跨日边界用例：UTC 16:00 之后下的订单，在东八区应算到第二天。";
 		await work.recordReview({
@@ -791,6 +833,7 @@ describe("review findings in the drawer", () => {
 		resetWorkStatCacheForTests();
 		const item = await newItem("Many findings item");
 		commitIn(work.worktreePathOf(item) ?? "", { "src/many.ts": "m\n" }, "many findings work");
+		await startItem(item, "Findings");
 		const actor = { kind: "agent" as const, id: teamId };
 		// Each findings text is the longest allowed and escapes past the event preview.
 		const findings = (round: number) => `${round}`.padEnd(2, "-") + "\u0001".repeat(998);

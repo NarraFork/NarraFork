@@ -7337,6 +7337,37 @@ export const teamWorkItems = sqliteTable(
 	],
 );
 
+/**
+ * D: a work item waits for another item of the same team to merge before it may start. Deleting
+ * either item (or the team) deletes the edge. The coordinator sets an item's whole set at once
+ * (`Team` `dependsOn`): at most 20, both ends in `team_id`, no cycles — checked by the service
+ * (`teams/work-item-dependencies.ts`), since a composite key across teams does not transpile to
+ * PostgreSQL here.
+ */
+export const teamWorkItemDependencies = sqliteTable(
+	"team_work_item_dependencies",
+	{
+		itemId: text("item_id")
+			.notNull()
+			.references(() => teamWorkItems.id, { onDelete: "cascade" }),
+		dependsOnItemId: text("depends_on_item_id")
+			.notNull()
+			.references(() => teamWorkItems.id, { onDelete: "cascade" }),
+		teamId: text("team_id")
+			.notNull()
+			.references(() => projectTeams.narratorId, { onDelete: "cascade" }),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		primaryKey({ columns: [table.itemId, table.dependsOnItemId] }),
+		// Who depends on an item: the unblock check when it merges, and the drawer's dependents.
+		index("idx_team_work_item_dependencies_target").on(table.dependsOnItemId, table.itemId),
+		// FK covering index (CASCADE on team deletion).
+		index("idx_team_work_item_dependencies_team").on(table.teamId),
+		check("ck_team_work_item_dependencies_self", sql`${table.itemId} <> ${table.dependsOnItemId}`),
+	],
+);
+
 /** Append-only log of team changes, each with its person or agent. */
 export const teamWorkEvents = sqliteTable(
 	"team_work_events",

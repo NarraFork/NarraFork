@@ -46,6 +46,7 @@ verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 `server/lib/` 下几个没有业务归属、被很多服务共用的小模块。它们大多是为了避开一个具体的坑而存在，注释里写了坑是什么，改之前先读。
 
 ## 关键规则
+- `platform-path.ts`：跨平台路径比较。`pathsEqualForOS`/`normalizePathForOS` 按目标 OS 的路径语法比（POSIX 保留反斜杠，Windows 折叠分隔符与大小写）；`caseInsensitiveFileNames(platform)` 说默认文件系统是否不分大小写（win32、darwin），`localPathIdentityKey(path, platform)` 在那些平台上再把键折成小写，Linux 保持区分大小写。平台参数让测试在 Linux 上模拟 Windows/macOS。
 - `AsyncMutex`（`async-mutex.ts`）：按 key 的进程内 FIFO 互斥，`acquire(key, fn)` 排队执行；`tryAcquire(key, fn, timeoutMs)` 超时返回 `{ acquired: false, waitedMs }` 而不是执行，且只在真正拿到锁时才入队，超时放弃不会提前放开排在后面的人。仅限单进程。
 - `PathKeyedMutex`：以目录路径为 key，内部用 `normalizePathForComparison` 规范化；调用方传原始路径，规范化后的值只作 key，绝不当 cwd 传给 git（大小写折叠在区分大小写的文件系统上有破坏性）。`worktreeLock` 是 worktree 写操作唯一的互斥，`git-service` 的写方法拿它，调用它们时不得已持有它；锁顺序只允许 `worktreeLock` → 影子仓库锁，没有运行时断言，只靠评审和 `git-service-worktree-lock.test.ts`。`narratorTraitsLock`、`narratorDraftLock` 也在此导出。
 - `hot-safe.ts`：把状态钉在 `globalThis` 的 `Symbol.for(key)` 上，让 `bun --hot` 重新求值模块时不丢状态也不重复：`hotSafe`（惰性创建持久对象）、`hotTimer`/`hotTimerClear`（替换 interval，先清旧的）、`hotOnce`（`process.on("exit")`、事件总线监听这类只能注册一次的动作）。key 全局共享，同名即同一份。

@@ -268,6 +268,7 @@ export function TeamPageView({
 				phone={phone}
 				onClose={() => setDrawer(null)}
 				onOpenSession={onOpenSession ? openSession : undefined}
+				onOpenItem={openItem}
 			/>
 			{canDisband && onDisbanded && (
 				<TeamDisbandDialog

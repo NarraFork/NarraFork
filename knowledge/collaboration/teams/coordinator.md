@@ -26,7 +26,7 @@ keywords:
   - brief
   - sweepOrphanCoordinatorOutputs
 status: draft
-verified_at: 667b6059b
+verified_at: bab02212f403fafc4dd6d6afbecd57bcd761d198
 ---
 # 协调者
 
@@ -35,7 +35,7 @@ verified_at: 667b6059b
 ## 关键规则
 软限制（`coordinator-limits.ts`）：
 - 默认值：编辑行数 30、新文件 60、每轮文件数 3、读 300 行、搜索 100 行、Bash 输出 8KB（`DEFAULT_COORDINATOR_LIMITS`，可被团队设置覆盖）。
-- 超出只给结果追加提醒行并写 `coordinator.overrun.*` 事件，不拒绝；提醒文案在 `lib/prompts/team-coordinator-notes.ts`。
+- 超出只给结果追加提醒行并写 `coordinator.overrun.*` 事件，不拒绝；提醒文案在 `lib/prompts/team-coordinator-notes.ts`；标题和名字进提醒前都过同文件的 `oneLine`（压成一行、最多 80 字，重叠提醒与解锁说明共用）。
 - 每次运行的记账有上界：记住的不同改动文件 500 个、超限事件行 100 条，之后提醒继续但不再写行（`COORDINATOR_LIMIT_BOUNDS`）。
 - 只对协调者本身（主叙述者且有 team trait）生效，子代理不受影响。
 
