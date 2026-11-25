@@ -121,13 +121,15 @@ describe("quota store", () => {
 	test("an unreadable legacy file is discarded rather than blocking startup", async () => {
 		const file = `legacy-broken-${crypto.randomUUID()}.json`;
 		writeFileSync(getNarraforkPath(file), "{broken-json");
+		const store = new QuotaStore();
 		await importLegacyQuotaCache(
 			file,
 			(raw) => raw as never,
-			[],
+			[{ legacyKey: "old-key", id: "new-key", identity: "account" }],
 			() => null,
-			new QuotaStore(),
+			store,
 		);
+		expect(store.peek("new-key")).toBeUndefined();
 		expect(existsSync(getNarraforkPath(file))).toBe(false);
 	});
 });
