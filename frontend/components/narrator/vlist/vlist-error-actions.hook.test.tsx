@@ -17,6 +17,7 @@ mock.module("../../../hooks/useAuth", () => ({
 }));
 mock.module("../../../hooks/useModels", () => ({
 	useAllModels: () => ({ defaultModelValue: "provider:model" }),
+	useModelRuntimeSettings: () => ({ defaultModelValue: "provider:model" }),
 }));
 const { useVListErrorNoticeActions } = await import("./vlist-error-actions");
 const i18n = i18next.createInstance();

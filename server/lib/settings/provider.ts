@@ -17,7 +17,11 @@ import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { selectTokenDanceProtocol } from "@shared/tokendance";
 import { getCodexManager } from "../codex-manager";
 import { resolveCommandCodeToken } from "../commandcode-manager";
-import { getCachedCommandCodeModel, peekCommandCodeModels } from "../commandcode-models";
+import {
+	captureCommandCodeModelOptions,
+	getCachedCommandCodeModel,
+	peekCommandCodeModels,
+} from "../commandcode-models";
 import { COMMAND_CODE_PREFIX } from "../commandcode-protocol";
 import { AppError, ValidationError } from "../errors";
 import {
@@ -27,6 +31,11 @@ import {
 	identifyModelValue,
 	resolveEffectiveModelCard,
 } from "../model-catalog";
+import {
+	captureModelOptionsArray,
+	optionInput,
+	registerModelOptionsCapture,
+} from "../model-options-contract";
 import { isNugCachedModelAvailable, resolveNugModelMeta } from "../nug-model-cache";
 import { registerModelListReader } from "../sourcing/model-list-readers";
 import { getTokenDanceCatalogModels, getTokenDanceRuntimeConfig } from "../tokendance-runtime";
@@ -162,6 +171,26 @@ registerExtraModelSource("tokendance", {
 registerCodexModelChecker((model) => getBuiltinCodexModels().includes(model));
 registerCodexModelLister(() => getBuiltinCodexModels().map((m) => `codex:${m}`));
 
+// The options Worker loads Codex catalog variants itself; only send the tiny compatibility floor.
+registerModelOptionsCapture("codex", (group) =>
+	captureModelOptionsArray(FALLBACK_BUILTIN_CODEX_MODELS, (id) => optionInput(group, id)),
+);
+registerModelOptionsCapture("command-code", (group) =>
+	captureCommandCodeModelOptions(group, s().commandCode?.apiKey, s().commandCode?.baseUrl),
+);
+registerModelOptionsCapture("tokendance", (group) => {
+	const source = getTokenDanceRuntimeConfig() ? s().tokendance?.models : undefined;
+	const capture = captureModelOptionsArray(source, (model) => optionInput(group, model.id));
+	return {
+		...capture,
+		readSlice: (offset, limit) => {
+			const rows = capture.readSlice(offset, limit);
+			return rows.filter((_, index) =>
+				selectTokenDanceProtocol(source?.[offset + index]?.supported_protocols ?? []),
+			);
+		},
+	};
+});
 registerModelListReader("codex", () => getBuiltinCodexModels().map((id) => ({ id })));
 registerModelListReader("tokendance", () => getTokenDanceCatalogModels());
 // Keep Command Code's existing stale-while-revalidate semantics in its catalog owner.

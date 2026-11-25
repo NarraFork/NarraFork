@@ -15,11 +15,12 @@ import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } 
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { cleanDb } from "../../../tests/setup";
 import {
 	backgroundTasks,
 	fileChangeExecutionSegments,
+	narratorBufferedMessages,
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
@@ -44,6 +45,8 @@ const inbox = await import("../agent-runtime/inbox");
 const session = await import("../narrator-session");
 const { activeNarrators } = await import("../narrator-session-state");
 const { createAgentMessageDelivery } = await import("../agent-message-delivery");
+const { getRuntimePublicationService } = await import("../agent-runtime/publication");
+const { publicationDedupeKey } = await import("../agent-runtime/publication-outbox");
 
 const provider: ProviderAdapter = {
 	formatTools: () => [],
@@ -217,13 +220,26 @@ function scriptPasses(
 
 const toolOutput = (id = ORIGIN_ROW) =>
 	db.select().from(narratorToolCalls).where(eq(narratorToolCalls.id, id)).get()?.outputJson;
-const terminalRows = (logicalRunId: string | undefined) =>
+const publicationRows = (logicalRunId: string | undefined) =>
 	db
 		.select()
 		.from(runtimePublicationOutbox)
 		.where(eq(runtimePublicationOutbox.logicalRunId, logicalRunId ?? ""))
+		.all();
+
+/** Inspect every destination for this run, not merely the expected recipient's receipt. */
+const terminalReceipts = (logicalRunId: string | undefined) =>
+	db
+		.select()
+		.from(narratorBufferedMessages)
+		.where(
+			and(
+				eq(narratorBufferedMessages.kind, "task_notice"),
+				sql`json_extract(${narratorBufferedMessages.metadataJson}, '$.logicalRunId') = ${logicalRunId ?? ""}`,
+			),
+		)
 		.all()
-		.filter((row) => row.eventKind !== "started");
+		.filter((row) => JSON.parse(row.metadataJson ?? "{}").eventKind !== "started");
 
 async function settle(condition: () => boolean) {
 	for (let i = 0; i < 300 && !condition(); i++) await new Promise((r) => setTimeout(r, 5));
@@ -407,9 +423,70 @@ for (const shape of shapes) {
 			await settle(() => String(toolOutput()).includes("the answer"));
 			expect(String(toolOutput()).match(/the answer/g)).toHaveLength(1);
 			expect(toolOutput("other-origin-row")).toBe("PENDING");
-			const rows = terminalRows(terminal.logicalRunId);
-			expect(rows.filter((row) => row.state !== "reserved")).toHaveLength(1);
-			expect(rows.filter((row) => row.state === "reserved")).toHaveLength(0);
+			// Tool output/handle.terminal proves the source commit, not the lifetime of
+			// its outbox row. Transfer atomically moves dedupe authority to mailbox and
+			// deletes that row; a fast worker can already have ACKed it at this point.
+			const publication = getRuntimePublicationService();
+			const deadlineAt = Date.now() + 1_500;
+			await publication.flushRecipient(CALLER);
+			await drainRuntimeTestWork({ deadlineAt });
+			const receipts = terminalReceipts(terminal.logicalRunId);
+			expect(receipts).toHaveLength(1);
+			expect(receipts[0]?.deliveryId).toBeTruthy();
+			expect(receipts[0]?.state).not.toBe("cancelled");
+			const resultMessageId = `publication-result:${terminal.logicalRunId}`;
+			expect(receipts[0]).toMatchObject({
+				narratorId: CALLER,
+				kind: "task_notice",
+				noticeKind: "agent",
+				dedupeKey: publicationDedupeKey(
+					{
+						producerKind: "agent",
+						taskId: RUN,
+						logicalRunId: terminal.logicalRunId ?? "",
+						recipientId: CALLER,
+					},
+					"completed",
+				),
+			});
+			expect(JSON.parse(receipts[0]?.metadataJson ?? "{}")).toEqual({
+				producerKind: "agent",
+				taskId: RUN,
+				logicalRunId: terminal.logicalRunId,
+				eventKind: "completed",
+				resultRef: `message-original:${resultMessageId}`,
+			});
+			expect(
+				db.select().from(narratorMessages).where(eq(narratorMessages.id, resultMessageId)).get(),
+			).toMatchObject({
+				narratorId: RUN,
+				contentText: "the answer",
+			});
+			expect(
+				db.select().from(narratorToolCalls).where(eq(narratorToolCalls.id, ORIGIN_ROW)).get(),
+			).toMatchObject({
+				narratorId: CALLER,
+				toolUseId: ORIGIN,
+				executionAttempt: 1,
+				status: "success",
+			});
+			expect(publicationRows(terminal.logicalRunId)).toHaveLength(0);
+			// A retry must not create another receipt, change its identity or append
+			// the answer to either the registered call or an unrelated destination.
+			await publication.flushRecipient(CALLER);
+			await drainRuntimeTestWork({ deadlineAt });
+			expect(terminalReceipts(terminal.logicalRunId)).toEqual([
+				expect.objectContaining({
+					id: receipts[0]?.id,
+					deliveryId: receipts[0]?.deliveryId,
+					dedupeKey: receipts[0]?.dedupeKey,
+					metadataJson: receipts[0]?.metadataJson,
+					narratorId: CALLER,
+				}),
+			]);
+			expect(publicationRows(terminal.logicalRunId)).toHaveLength(0);
+			expect(String(toolOutput()).match(/the answer/g)).toHaveLength(1);
+			expect(toolOutput("other-origin-row")).toBe("PENDING");
 		});
 
 		test("5. recovery re-enters the same logical run with a single execution owner", async () => {

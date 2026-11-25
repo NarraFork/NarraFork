@@ -19,7 +19,7 @@ import {
 import type { NarratorMsg } from "../narrator-panel-types";
 import { onFontRevisionChange } from "./katex-runtime";
 import type { RenderLod } from "./prepared-block";
-import type { PretextDocumentLoadOptions } from "./pretext-document-loader";
+import type { PretextDocumentInput, PretextDocumentLoadOptions } from "./pretext-document-loader";
 import {
 	captureCoordinatorAnchor,
 	type PretextLayoutBuildOptions,
@@ -47,6 +47,8 @@ export interface PretextDocumentView {
 export interface UsePretextDocumentOptions {
 	compactAuxiliaryContent?: boolean;
 	enabled?: boolean;
+	/** Stop all document transport while retaining this coordinator/window/anchor. */
+	suspended?: boolean;
 	/** DOM readiness is separate from coordinator lifetime: parked panes keep their input. */
 	layoutReady?: boolean;
 	/** Keep the trailing empty reasoning live while the narrator is active. */
@@ -166,6 +168,8 @@ export interface UsePretextDocumentOptions {
 
 export interface UsePretextDocumentResult {
 	status: PretextLayoutCoordinatorSnapshot["status"];
+	/** The committed canonical window, for host mirrors (geometry preserves identity). */
+	document?: PretextDocumentInput;
 	/**
 	 * PERSISTED messages of the loaded window (never the live streaming row).
 	 *
@@ -374,6 +378,8 @@ export function usePretextDocument(
 	const latestOptionsRef = useRef(options);
 	latestOptionsRef.current = options;
 	const initialLayoutPendingRef = useRef(true);
+	const resumePendingRef = useRef(false);
+	const sourceRef = useRef(options.loadOptions);
 	const viewRef = useRef({
 		scrollTop: options.scrollTop,
 		viewportHeight: options.viewportHeight,
@@ -532,14 +538,70 @@ export function usePretextDocument(
 		coordinator?.getSnapshot ?? (() => ({ status: "idle" as const })),
 		coordinator?.getSnapshot ?? (() => ({ status: "idle" as const })),
 	);
+	useLayoutEffect(() => {
+		coordinator?.setSuspended(options.suspended === true);
+	}, [coordinator, options.suspended]);
 	useEffect(() => {
 		if (!coordinator) return;
+		const source = sourceRef.current;
+		const sourceChanged =
+			source?.fetchPage !== options.loadOptions?.fetchPage ||
+			source?.locateMessage !== options.loadOptions?.locateMessage ||
+			source?.refreshWindow !== options.loadOptions?.refreshWindow;
+		sourceRef.current = options.loadOptions;
+		coordinator.setLoadOptions(options.loadOptions);
 		if (previousNarratorRef.current !== narratorId) {
 			restoreRevalidationRef.current = null;
 			previousNarratorRef.current = narratorId;
 			coordinator.reset();
 			initialLayoutPendingRef.current = true;
+		} else if (sourceChanged) {
+			restoreRevalidationRef.current = null;
+			coordinator.cancel();
 		}
+		if (options.suspended) {
+			resumePendingRef.current = true;
+			restoreRevalidationRef.current = null;
+			return;
+		}
+		const revalidate = () => {
+			const entry = { coordinator, narratorId, sessionEpoch: pretextSessionEpoch() };
+			restoreRevalidationRef.current = entry;
+			const current = () =>
+				restoreRevalidationRef.current === entry &&
+				previousNarratorRef.current === narratorId &&
+				!latestOptionsRef.current.suspended &&
+				pretextSessionEpoch() === entry.sessionEpoch;
+			const getView = () =>
+				resolvePretextDocumentView(viewRef.current, latestOptionsRef.current.getCurrentView);
+			void (async () => {
+				try {
+					if (await coordinator.refreshCurrentWindow(getView)) return;
+				} catch {
+					// A mutation/session/suspension owns cancellation. Host errors are retained
+					// and observable; never answer either with a destructive tail fallback.
+					return;
+				}
+				if (!current()) return;
+				const loadOptions = latestOptionsRef.current.loadOptions;
+				if (loadOptions?.refreshWindow || loadOptions?.refreshFailurePolicy === "retain") return;
+				const snapshot = coordinator.getSnapshot();
+				const status = (snapshot.error as { status?: number })?.status;
+				if (status === 401 || status === 403) return;
+				const view = getView();
+				const anchor = snapshot.index ? captureAnchor(snapshot.index, view) : undefined;
+				await coordinator.load(
+					narratorId,
+					latestBuildOptionsRef.current,
+					{ ...loadOptions, forceTailReload: true },
+					anchor,
+					view.viewportHeight,
+					{ forceReload: true },
+				);
+			})().catch(() => {
+				// Errors are retained in the coordinator snapshot.
+			});
+		};
 		// A dock portal can be mounted while parked at width zero. Fetch preloading
 		// continues independently, but adopting/measuring must wait for real geometry.
 		// In particular, do not let restore's build failure evict a valid snapshot.
@@ -556,53 +618,14 @@ export function usePretextDocument(
 			// window with a tail would both discard history and duplicate route preloading.
 			// The bounded read owns its lifecycle independently of layout-effect reruns.
 			if (
+				!sourceChanged &&
 				coordinator.restore(narratorId, buildOptions, options.loadOptions, options.viewportHeight)
 			) {
 				const token = narratorLoadingMetrics.current(narratorId);
 				if (token) narratorLoadingMetrics.mark(token, "cache-restored");
 				lastLodRef.current = options.lod;
-				const entry = { coordinator, narratorId, sessionEpoch: pretextSessionEpoch() };
-				restoreRevalidationRef.current = entry;
-				const current = () =>
-					restoreRevalidationRef.current === entry &&
-					previousNarratorRef.current === narratorId &&
-					pretextSessionEpoch() === entry.sessionEpoch;
-				const getView = () =>
-					resolvePretextDocumentView(viewRef.current, latestOptionsRef.current.getCurrentView);
-				const deadline = performance.now() + 10_000;
-				void (async () => {
-					// Header/width commits can supersede one read without changing narrator.
-					// Retry those cancellations at most three times within ONE shared deadline.
-					for (let attempt = 0; attempt < 3 && current(); attempt++) {
-						const remaining = deadline - performance.now();
-						if (remaining <= 0) break;
-						try {
-							if (await coordinator.refreshCurrentWindow(getView, remaining)) return;
-							break;
-						} catch (error) {
-							if (!current()) return;
-							if ((error as { name?: string })?.name === "AbortError") continue;
-							// Authorization/layout failures remain observable in the snapshot.
-							return;
-						}
-					}
-					if (!current()) return;
-					const snapshot = coordinator.getSnapshot();
-					const status = (snapshot.error as { status?: number })?.status;
-					if (status === 401 || status === 403) return;
-					const view = getView();
-					const anchor = snapshot.index ? captureAnchor(snapshot.index, view) : undefined;
-					await coordinator.load(
-						narratorId,
-						latestBuildOptionsRef.current,
-						{ ...latestOptionsRef.current.loadOptions, forceTailReload: true },
-						anchor,
-						view.viewportHeight,
-						{ forceReload: true },
-					);
-				})().catch(() => {
-					// The load/commit published its error; do not turn it into an unhandled rejection.
-				});
+				resumePendingRef.current = false;
+				revalidate();
 				return;
 			}
 		}
@@ -614,13 +637,28 @@ export function usePretextDocument(
 			lodChanged,
 		);
 		const anchor = current.index ? captureAnchor(current.index, currentView) : undefined;
-		const forceReload = shouldForcePretextDocumentLoad(reloadToken, handledReloadTokenRef.current);
+		const forceReload =
+			sourceChanged || shouldForcePretextDocumentLoad(reloadToken, handledReloadTokenRef.current);
 		if (forceReload) {
 			restoreRevalidationRef.current = null;
 			handledReloadTokenRef.current = reloadToken;
 		} else {
 			const status = (current.error as { status?: number })?.status;
 			if (status === 401 || status === 403) return;
+		}
+		const resumed = resumePendingRef.current;
+		resumePendingRef.current = false;
+		if (current.input && (resumed || (forceReload && options.loadOptions?.refreshWindow))) {
+			// Reconnect/retry on host-owned sources must retain the fixed window too.
+			if (forceReload) coordinator.cancel();
+			try {
+				coordinator.finishResize(buildOptions, currentView, heightOverridesReaderRef.current?.());
+			} catch {
+				// Keep the coordinator's layout diagnostic; canonical refresh may repair it.
+			}
+			lastWidthCommitEpochRef.current = options.widthCommitEpoch;
+			revalidate();
+			return;
 		}
 		if (forceReload || current.status === "loading") {
 			let loadAnchor = anchor;
@@ -716,6 +754,7 @@ export function usePretextDocument(
 		options.getCurrentView,
 		options.loadOptions,
 		options.layoutReady,
+		options.suspended,
 		options.viewportHeight,
 		options.widthCommitEpoch,
 		reloadToken,
@@ -769,6 +808,7 @@ export function usePretextDocument(
 	useEffect(() => {
 		if (!coordinator) return;
 		return onFontRevisionChange(() => {
+			if (latestOptionsRef.current.suspended) return;
 			coordinator.invalidateFontDependentLayout(() => {
 				const view = resolvePretextDocumentView(viewRef.current, options.getCurrentView);
 				return {
@@ -790,6 +830,7 @@ export function usePretextDocument(
 	useEffect(() => {
 		if (!coordinator) return;
 		return onTypographyChange(() => {
+			if (latestOptionsRef.current.suspended) return;
 			coordinator.invalidateFontDependentLayout(() => {
 				const view = resolvePretextDocumentView(viewRef.current, options.getCurrentView);
 				return {
@@ -809,7 +850,12 @@ export function usePretextDocument(
 	useLayoutEffect(() => {
 		// The same numeric correction must be re-applied to each new canvas commit.
 		void snapshot.resizeRevision;
-		if (snapshot.scrollTop == null || !snapshot.scrollTopAnchorKind) return;
+		if (
+			latestOptionsRef.current.suspended ||
+			snapshot.scrollTop == null ||
+			!snapshot.scrollTopAnchorKind
+		)
+			return;
 		options.onScrollTopCorrection?.(
 			snapshot.scrollTop,
 			snapshot.scrollTopAnchorKind,
@@ -830,7 +876,7 @@ export function usePretextDocument(
 	// The view is read LIVE at commit time (after the fetch) so scrolling during
 	// a slow request cannot desync the base scrollTop from the correction.
 	const loadOlderAsync = useCallback(async () => {
-		if (!coordinator) return 0;
+		if (!coordinator || latestOptionsRef.current.suspended) return 0;
 		const current = coordinator.getSnapshot();
 		// `loadingOlder` is NOT a rejection here (unlike the other guards): the
 		// coordinator joins an in-flight page, which is exactly what a caller that
@@ -1010,6 +1056,7 @@ export function usePretextDocument(
 	);
 	return {
 		status: snapshot.status,
+		document: snapshot.input,
 		messages: snapshot.input?.messages ?? EMPTY_MESSAGES,
 		streamingMessage: snapshot.streamingMessage ?? null,
 		messageVersion: snapshot.input?.messageVersion,

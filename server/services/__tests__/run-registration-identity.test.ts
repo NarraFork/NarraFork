@@ -55,6 +55,15 @@ const unregister = registerExternalProviderResolver({
 const done = { finalText: "done", hasError: false, shouldUpdateTitle: false };
 const originalAutoContinuation = settings.agent.autoContinuationMode;
 
+function waitForAbort(signal: AbortSignal): Promise<void> {
+	return new Promise<void>((resolve) => {
+		// Worker-backed preparation may outlive the absolute deadline before the
+		// fake executor subscribes. Abort events are not replayed to late listeners.
+		if (signal.aborted) resolve();
+		else signal.addEventListener("abort", () => resolve(), { once: true });
+	});
+}
+
 beforeEach(async () => {
 	backgroundOccupancyStore.resetForTests();
 	await closePrefixSnapshotStore();
@@ -328,6 +337,13 @@ test("S1 real foreground runSubagent uses the caller's principal in its first pa
 	}
 });
 
+test("the executor fixture observes cancellation that preceded listener registration", async () => {
+	const cancel = new AbortController();
+	cancel.abort("deadline already elapsed during preparation");
+	await waitForAbort(cancel.signal);
+	expect(cancel.signal.aborted).toBe(true);
+});
+
 for (const cancellation of ["deadline", "caller"] as const) {
 	test(`A2 no deliverTo persists the binding and is stopped by its ${cancellation}`, async () => {
 		const deadlineAt = new Date(
@@ -340,9 +356,7 @@ for (const cancellation of ["deadline", "caller"] as const) {
 		});
 		const execute = spyOn(executor, "executeAgentLoop").mockImplementation(async ({ config }) => {
 			sawPass();
-			await new Promise<void>((resolve) =>
-				config.signal.addEventListener("abort", () => resolve(), { once: true }),
-			);
+			await waitForAbort(config.signal);
 			return { ...done, aborted: true };
 		});
 		try {
@@ -352,14 +366,20 @@ for (const cancellation of ["deadline", "caller"] as const) {
 				text: "work",
 				binding: { principal: { userId: A }, deadlineAt, cancelWith },
 			});
-			await passStarted;
+			const control = getRunControl(TARGET);
+			expect(control).toBeDefined();
+			// Registration is asynchronous. A deadline may cancel preparation before
+			// any model pass, so inspect its persisted binding after the terminal;
+			// only caller cancellation must wait for the fake executor to start.
+			if (cancellation === "caller") await passStarted;
+			else await handle.terminal;
 			expect(stored().registration?.run).toMatchObject({
 				principal: { userId: A },
 				deadlineAt,
 				cancelWith,
 			});
 			expect(stored().logicalRunId).toBeTruthy();
-			expect(getRunControl(TARGET)?.binding).toEqual(stored().registration?.run);
+			expect(control?.binding).toEqual(stored().registration?.run);
 			if (cancellation === "caller") expect(cancelRunsBoundTo(CALLER, "cancel caller")).toBe(1);
 			expect((await handle.terminal).timedOut).toBe(cancellation === "deadline");
 			expect(db.select().from(runtimePublicationOutbox).all()).toEqual([]);

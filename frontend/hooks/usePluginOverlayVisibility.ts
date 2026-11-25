@@ -7,27 +7,21 @@
  * across devices, and it never affects anyone else.
  */
 
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useMemo } from "react";
 import { api } from "../lib/api";
 
-type Preferences = Awaited<ReturnType<typeof api.getUserPreferences>>;
+import { getToken } from "../lib/api/client";
+import { useUserPreferences } from "./useUserPreferences";
 
-const QUERY_KEY = ["user-preferences"] as const;
+type Preferences = Awaited<ReturnType<typeof api.getUIPreferences>>;
 const EMPTY: ReadonlySet<string> = new Set();
 
 export function usePluginOverlayVisibility(options: { enabled?: boolean } = {}) {
 	const enabled = options.enabled ?? true;
 	const queryClient = useQueryClient();
-	// Same key and fetcher as `useUserPreferences`, so this shares that cache entry. The
-	// `enabled` gate lets the always-mounted overlay host skip the request while no
-	// overlay exists (including before sign-in).
-	const query = useQuery({
-		queryKey: QUERY_KEY,
-		queryFn: api.getUserPreferences,
-		staleTime: 60_000,
-		enabled,
-	});
+	const query = useUserPreferences({ enabled });
+	const queryKey = query.queryKey;
 
 	const hiddenIds = query.data?.hiddenPluginOverlays;
 	const hidden = useMemo<ReadonlySet<string>>(
@@ -39,27 +33,33 @@ export function usePluginOverlayVisibility(options: { enabled?: boolean } = {}) 
 		mutationFn: ({ pluginId, hidden: nextHidden }: { pluginId: string; hidden: boolean }) =>
 			api.setPluginOverlayHidden(pluginId, nextHidden),
 		onMutate: async ({ pluginId, hidden: nextHidden }) => {
-			await queryClient.cancelQueries({ queryKey: QUERY_KEY });
-			const previous = queryClient.getQueryData<Preferences>(QUERY_KEY);
+			const token = getToken();
+			await queryClient.cancelQueries({ queryKey });
+			if (getToken() !== token) throw new Error("Session changed");
+			const previous = queryClient.getQueryData<Preferences>(queryKey);
 			// Optimistic: hiding must take effect on click, not after a round trip, or a
 			// covering overlay keeps blocking the app while the request is in flight.
 			if (previous) {
 				const current = previous.hiddenPluginOverlays ?? [];
 				const others = current.filter((id) => id !== pluginId);
-				queryClient.setQueryData<Preferences>(QUERY_KEY, {
+				queryClient.setQueryData<Preferences>(queryKey, {
 					...previous,
 					hiddenPluginOverlays: nextHidden ? [pluginId, ...others] : others,
 				});
 			}
-			return { previous };
+			return { previous, queryKey, token };
 		},
 		onError: (_error, _variables, context) => {
-			if (context?.previous) queryClient.setQueryData(QUERY_KEY, context.previous);
+			if (context?.previous && getToken() === context.token)
+				queryClient.setQueryData(context.queryKey, context.previous);
 		},
-		onSuccess: (result) => {
-			const latest = queryClient.getQueryData<Preferences>(QUERY_KEY);
+		onSuccess: (result, _variables, context) => {
+			if (!context || getToken() !== context.token) return;
+			const queryKey = context.queryKey;
+			void queryClient.invalidateQueries({ queryKey: ["user-preferences", "detail"] });
+			const latest = queryClient.getQueryData<Preferences>(queryKey);
 			if (latest) {
-				queryClient.setQueryData<Preferences>(QUERY_KEY, {
+				queryClient.setQueryData<Preferences>(queryKey, {
 					...latest,
 					hiddenPluginOverlays: result.hiddenPluginOverlays,
 				});

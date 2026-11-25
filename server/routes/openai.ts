@@ -3,6 +3,12 @@ import { resolve } from "node:path";
 import { Hono } from "hono";
 import { buildOpencodeSessionHeader } from "../lib/agent/opencode-session";
 import { logger } from "../lib/logger";
+import {
+	captureModelOptionsArray,
+	ModelOptionsCacheMap,
+	optionInput,
+	registerModelOptionsCapture,
+} from "../lib/model-options-contract";
 import { getNarraforkHome } from "../lib/narrafork-home";
 import { resolveProxyForUrl } from "../lib/net/proxy";
 import {
@@ -30,7 +36,7 @@ export interface OpenAIModelInfo {
 }
 
 /** Per-provider cached model lists. Key = provider id. */
-const cachedModelsByProvider = new Map<string, OpenAIModelInfo[]>();
+const cachedModelsByProvider = new ModelOptionsCacheMap<string, OpenAIModelInfo[]>();
 
 // Load legacy flat cache and per-provider cache on startup
 loadAllCachedModels();
@@ -87,6 +93,13 @@ export function getOpenaiCachedModelsByProvider(providerId: string): OpenAIModel
 }
 
 for (const protocol of ["openai-responses", "completions-compatible"] as const) {
+	registerModelOptionsCapture(protocol, (group) =>
+		captureModelOptionsArray(
+			cachedModelsByProvider.get(group.id),
+			(model) => optionInput(group, model.id),
+			cachedModelsByProvider.generation,
+		),
+	);
 	registerModelListReader(protocol, (group) => getOpenaiCachedModelsByProvider(group.id));
 }
 

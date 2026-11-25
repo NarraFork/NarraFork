@@ -12,12 +12,16 @@ const originalAuth = { ...(await import("../hooks/useAuth")) };
 const originalI18n = { ...(await import("react-i18next")) };
 let admin = false;
 let cancels = 0;
+let statusCalls = 0;
 let cancelError: Error | null = null;
 let status: UnattendedStatus;
+let statusResponse: Promise<UnattendedStatus> | null = null;
 let onStatusChanged: () => void;
 
 mock.module("../lib/narrator-ws-manager", () => ({
 	narratorWSManager: {
+		connected: true,
+		onControlPlaneRecovery: () => () => {},
 		addListener: ({ types }: { types: string[] }, listener: () => void) => {
 			expect(types).toEqual([UNATTENDED_CHANGED_WS_TYPE]);
 			onStatusChanged = listener;
@@ -62,7 +66,10 @@ mock.module("../lib/api", () => ({
 	...originalApi,
 	api: {
 		...originalApi.api,
-		getUnattendedStatus: async () => status,
+		getUnattendedStatus: async () => {
+			statusCalls++;
+			return statusResponse ?? status;
+		},
 		cancelUnattendedMode: async () => {
 			cancels++;
 			if (cancelError) throw cancelError;
@@ -87,6 +94,8 @@ function install(key: string, value: unknown) {
 beforeEach(() => {
 	admin = false;
 	cancels = 0;
+	statusCalls = 0;
+	statusResponse = null;
 	cancelError = null;
 	status = fixture();
 	const { window } = parseHTML("<!doctype html><html><body></body></html>");
@@ -217,6 +226,36 @@ describe("UnattendedModeBanner", () => {
 		}
 	});
 
+	test("the one-second countdown ticker is local and never requests status", async () => {
+		let now = Date.now();
+		const clock = spyOn(Date, "now").mockImplementation(() => now);
+		let tick: (() => void) | undefined;
+		const interval = spyOn(globalThis, "setInterval").mockImplementation(((
+			callback: () => void,
+			ms: number,
+		) => {
+			expect(ms).toBe(1_000);
+			tick = callback;
+			return 123_456;
+		}) as typeof setInterval);
+		const clear = spyOn(globalThis, "clearInterval").mockImplementation(() => {});
+		try {
+			status = fixture({ shutdownAt: new Date(now + 70_000).toISOString() });
+			await render();
+			const initial = statusCalls;
+			expect(tick).toBeDefined();
+			expect(banner()?.textContent).toContain('"remaining":"1:10"');
+			now += 1_000;
+			await act(async () => tick?.());
+			expect(banner()?.textContent).toContain('"remaining":"1:09"');
+			expect(statusCalls).toBe(initial);
+		} finally {
+			interval.mockRestore();
+			clear.mockRestore();
+			clock.mockRestore();
+		}
+	});
+
 	test("every signed-in user gets the kill switch, and it cancels the mode", async () => {
 		await render();
 		const button = [...container.querySelectorAll("button")].find(
@@ -228,6 +267,24 @@ describe("UnattendedModeBanner", () => {
 		expect(cancels).toBe(1);
 		expect(banner()).toBeNull();
 		expect(container.textContent).not.toContain("unattendedBannerOn");
+	});
+
+	test("a stale GET cannot restore the banner after a successful cancellation", async () => {
+		await render();
+		const old = Promise.withResolvers<UnattendedStatus>();
+		statusResponse = old.promise;
+		await act(async () => onStatusChanged());
+		await flush();
+		const button = [...container.querySelectorAll("button")].find(
+			(entry) => entry.textContent === "unattendedBannerDisable",
+		) as HTMLButtonElement | undefined;
+		await act(async () => button?.click());
+		await flush();
+		expect(cancels).toBe(1);
+		expect(banner()).toBeNull();
+		await act(async () => old.resolve(fixture()));
+		await flush();
+		expect(banner()).toBeNull();
 	});
 
 	test("explains what it is waiting for instead of counting down", async () => {

@@ -25,7 +25,7 @@ import {
 	useNarratorInfiniteScroll,
 	validateNarratorListSearch,
 } from "../../components/narrator/list/narrator-list-utils";
-import { useAllModels } from "../../hooks/useModels";
+import { useModelRuntimeSettings } from "../../hooks/useModels";
 import {
 	useDeleteNarrator,
 	useNarratorsPaginated,
@@ -74,7 +74,7 @@ function ArchivedNarratorsPage() {
 	const deleteNarrator = useDeleteNarrator();
 	const { t } = useTranslation("narrators");
 	const { t: tc } = useTranslation("common");
-	const { defaultModelValue } = useAllModels();
+	const { defaultModelValue } = useModelRuntimeSettings();
 	const narratorDeleteCapability = useNarratorDeleteCapability();
 	const deleteSupported = narratorDeleteCapability.supported;
 	const deleteUnsupportedReason = narratorDeleteCapability.reason ?? t("deleteNarratorUnsupported");

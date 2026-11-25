@@ -46,6 +46,12 @@ Object.defineProperty(window, "localStorage", {
 	configurable: true,
 });
 mock.module("@frontend/hooks/useAuth", () => ({ useCurrentUser: () => ({ data: activeUser }) }));
+mock.module("@frontend/lib/narrator-ws-manager", () => ({
+	narratorWSManager: {
+		onCredentialChange: () => () => {},
+		getCredentialIdentity: () => 1,
+	},
+}));
 const switched = mock(async (_input: unknown) => ({
 	current: context,
 	previous: context,
@@ -106,8 +112,15 @@ let extraPages: WorktreeEntry[][] = [];
 let nextPageError: Error | null = null;
 let hasNextPage = false;
 let observedQuery: { search: string; sort: string; order: string };
+const listClient = {
+	resetQueries,
+	cancelQueries: async () => {},
+	invalidateQueries: async () => {},
+	getQueryState: () => undefined,
+	getQueryCache: () => ({ find: () => undefined }),
+};
 mock.module("@tanstack/react-query", () => ({
-	useQueryClient: () => ({ resetQueries }),
+	useQueryClient: () => listClient,
 	useInfiniteQuery: (options: { queryKey: unknown[] }) => {
 		observedQuery = options.queryKey[3] as typeof observedQuery;
 		return {

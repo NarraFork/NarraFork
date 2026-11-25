@@ -1,6 +1,6 @@
 import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { notifications } from "@mantine/notifications";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -108,12 +108,9 @@ export function useModelMenuRefreshProps(nugProviderIdByPrefix: Record<string, s
 	const navigate = useNavigate();
 	const { data: user } = useCurrentUser();
 	const isAdmin = user?.role === "admin";
-	// Same cache entry as useAllModels, so this never adds a request of its own.
-	const { data: settingsData } = useQuery({
-		queryKey: ["settings"],
-		queryFn: api.getSettings,
-		staleTime: 30_000,
-	});
+	// Management views may already have this detail cached. Never fetch the complete
+	// settings merely to paint a closed session model menu.
+	const settingsData = qc.getQueryData<Awaited<ReturnType<typeof api.getSettings>>>(["settings"]);
 	const nugModelRefreshCapability = useProviderModelRefreshCapability("nug");
 	const nugRuntimeCapability = useProviderRuntimeCapability("nug");
 	const canRefreshNugModels =
