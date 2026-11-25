@@ -42,6 +42,21 @@ export interface ProjectListSummaryResponse {
 	summaries: ProjectListSummary[];
 }
 
+// ── The project page: 「N 位成员」 ───────────────────────────────────────────
+
+/** Members the header counts at most (one more means "more"). */
+export const PROJECT_MEMBER_COUNT_LIMIT = 999;
+
+/**
+ * `GET /api/projects/:id/members/count`: how many people are members of the project — its owner
+ * and everyone holding a project grant — without the list (the settings page reads that).
+ */
+export interface ProjectMemberCount {
+	count: number;
+	/** More than {@link PROJECT_MEMBER_COUNT_LIMIT}: `count` is the limit. */
+	more: boolean;
+}
+
 // ── The project page: 「等你处理」 ───────────────────────────────────────────
 
 /** Pending calls the project's 「等你处理」 lists (one more means "more"). */

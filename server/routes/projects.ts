@@ -34,6 +34,7 @@ import {
 	scheduleProjectIndexRebuild,
 } from "../services/project-index";
 import {
+	countProjectMembers,
 	getProjectAccess,
 	removeProjectMember,
 	setProjectMembers,
@@ -369,6 +370,13 @@ projectRoutes.get("/:id/access", async (c) => {
 	const id = c.req.param("id");
 	await requireProjectAccess(c, id, "read");
 	return c.json(await getProjectAccess(id, projectPrincipalOf(c)));
+});
+
+// The header's 「N 位成员」: a count only, for anyone who can read the project (404 otherwise).
+projectRoutes.get("/:id/members/count", async (c) => {
+	const id = c.req.param("id");
+	await requireProjectAccess(c, id, "read");
+	return c.json(await countProjectMembers(id));
 });
 
 projectRoutes.patch("/:id/visibility", async (c) => {

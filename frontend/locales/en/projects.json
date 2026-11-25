@@ -514,6 +514,10 @@
 		}
 	},
 	"page": {
+		"members_one": "{{count}} member",
+		"members_other": "{{count}} members",
+		"membersMore": "999+ members",
+		"membersHint": "Members and visibility",
 		"newTeam": "New team",
 		"more": "More",
 		"showSessions": "Teams and sessions",

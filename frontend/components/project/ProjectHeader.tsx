@@ -1,6 +1,7 @@
 /**
  * The project page's header (R2): the project's name with 「固定到侧栏」, then the repository path
- * (its tail; the whole path on hover) and the default branch; on the right 「新团队」 (secondary),
+ * (its tail; the whole path on hover), the default branch and 「N 位成员」 (a count from the server;
+ * it opens the settings page's 成员与可见性); on the right 「新团队」 (secondary),
  * 「新会话」 (primary) and the 「…」 menu (项目设置, and with the outline on: open the outline, the
  * task board).
  *
@@ -20,7 +21,9 @@ import {
 	Text,
 	Title,
 	Tooltip,
+	UnstyledButton,
 } from "@mantine/core";
+import type { ProjectMemberCount } from "@shared/project-overview";
 import {
 	IconDots,
 	IconEdit,
@@ -29,6 +32,7 @@ import {
 	IconListTree,
 	IconMessages,
 	IconSettings,
+	IconUsers,
 	IconUsersGroup,
 } from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
@@ -48,6 +52,10 @@ export interface ProjectHeaderProps {
 	onNewSession: () => void;
 	onNewTeam: () => void;
 	onOpenSettings: () => void;
+	/** 「N 位成员」; nothing while unknown (or when the count could not be read). */
+	memberCount?: ProjectMemberCount | null;
+	/** Opens the settings page at 成员与可见性. */
+	onOpenMembers?: () => void;
 	outline?: {
 		pending: boolean;
 		showingTasks: boolean;
@@ -68,6 +76,8 @@ export function ProjectHeader({
 	onNewSession,
 	onNewTeam,
 	onOpenSettings,
+	memberCount,
+	onOpenMembers,
 	outline,
 }: ProjectHeaderProps) {
 	const { t } = useTranslation("projects");
@@ -102,6 +112,25 @@ export function ProjectHeader({
 						{defaultBranch}
 					</Text>
 				</Group>
+			)}
+			{memberCount && (
+				<Tooltip label={t("page.membersHint")} withinPortal openDelay={300}>
+					<UnstyledButton
+						onClick={onOpenMembers}
+						disabled={!onOpenMembers}
+						data-testid="project-member-count"
+						data-count={memberCount.count}
+					>
+						<Group gap={4} wrap="nowrap">
+							<IconUsers size={13} aria-hidden style={{ opacity: 0.6 }} />
+							<Text size="xs" c="dimmed" style={{ fontVariantNumeric: "tabular-nums" }}>
+								{memberCount.more
+									? t("page.membersMore")
+									: t("page.members", { count: memberCount.count })}
+							</Text>
+						</Group>
+					</UnstyledButton>
+				</Tooltip>
 			)}
 		</Group>
 	);
