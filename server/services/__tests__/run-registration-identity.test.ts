@@ -346,9 +346,31 @@ test("the executor fixture observes cancellation that preceded listener registra
 
 for (const cancellation of ["deadline", "caller"] as const) {
 	test(`A2 no deliverTo persists the binding and is stopped by its ${cancellation}`, async () => {
-		const deadlineAt = new Date(
-			Date.now() + (cancellation === "deadline" ? 200 : 30_000),
-		).toISOString();
+		const deadlineAt = new Date(Date.now() + 30_000).toISOString();
+		const realSetTimeout = globalThis.setTimeout;
+		let fireDeadline: (() => void) | undefined;
+		// Preparation uses real workers and must not race a 200ms wall-clock budget.
+		// Capture only the runtime's actual deadline callback; fire it after the pass
+		// starts, leaving all other timers and the production cancellation path real.
+		const timer =
+			cancellation === "deadline"
+				? spyOn(globalThis, "setTimeout").mockImplementation(((
+						callback: (...args: unknown[]) => void,
+						delay?: number,
+						...args: unknown[]
+					) => {
+						const handle = realSetTimeout(callback, delay, ...args);
+						if (callback.name === "onDeadline") {
+							expect(delay).toBeGreaterThan(0);
+							expect(delay).toBeLessThanOrEqual(30_000);
+							fireDeadline = () => {
+								clearTimeout(handle);
+								callback(...args);
+							};
+						}
+						return handle;
+					}) as typeof setTimeout)
+				: undefined;
 		const cancelWith = { narratorId: CALLER, toolCallId: "identity-bound-call", attempt: 1 };
 		let sawPass!: () => void;
 		const passStarted = new Promise<void>((resolve) => {
@@ -368,11 +390,9 @@ for (const cancellation of ["deadline", "caller"] as const) {
 			});
 			const control = getRunControl(TARGET);
 			expect(control).toBeDefined();
-			// Registration is asynchronous. A deadline may cancel preparation before
-			// any model pass, so inspect its persisted binding after the terminal;
-			// only caller cancellation must wait for the fake executor to start.
-			if (cancellation === "caller") await passStarted;
-			else await handle.terminal;
+			// Both cancellation branches are controlled after the model pass starts.
+			// Waiting for terminal here would deadlock the deadline callback below.
+			await passStarted;
 			expect(stored().registration?.run).toMatchObject({
 				principal: { userId: A },
 				deadlineAt,
@@ -381,9 +401,14 @@ for (const cancellation of ["deadline", "caller"] as const) {
 			expect(stored().logicalRunId).toBeTruthy();
 			expect(control?.binding).toEqual(stored().registration?.run);
 			if (cancellation === "caller") expect(cancelRunsBoundTo(CALLER, "cancel caller")).toBe(1);
+			else {
+				if (!fireDeadline) throw new Error("Run did not schedule its absolute deadline");
+				fireDeadline();
+			}
 			expect((await handle.terminal).timedOut).toBe(cancellation === "deadline");
 			expect(db.select().from(runtimePublicationOutbox).all()).toEqual([]);
 		} finally {
+			timer?.mockRestore();
 			execute.mockRestore();
 		}
 	});
