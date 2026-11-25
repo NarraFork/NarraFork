@@ -159,6 +159,7 @@ const entryOwners: Record<(typeof COMPILED_WORKER_ENTRIES)[number], readonly str
 	"lib/request-recorder-worker.ts": ["lib/request-recorder.ts"],
 	"lib/startup-status/worker.ts": ["lib/startup-status/index.ts"],
 	"lib/agent/request-json-worker.ts": ["lib/agent/request-json.ts"],
+	"lib/agent/structural/worker-entry.ts": ["lib/agent/structural/worker-client.ts"],
 	"lib/agent/image-generation-response-worker.ts": ["lib/agent/image-generation-response.ts"],
 	"lib/document-preview/worker.ts": ["lib/document-preview/client.ts"],
 	"lib/modeltrace/worker.ts": ["lib/modeltrace/worker-client.ts"],

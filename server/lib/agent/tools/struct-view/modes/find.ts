@@ -28,6 +28,7 @@ import {
 	type StructDocument,
 	type StructKind,
 } from "../../../structural";
+import { StructuralWorkerError } from "../../../structural/worker-protocol";
 import type { ToolResult } from "../../../types";
 import { decodeFileBytes } from "../../encoding";
 import {
@@ -190,7 +191,9 @@ export async function runFind(
 			for (const found of collectMatches(outline, name, [])) {
 				declarations.push({ path: relPath, ...found });
 			}
-		} catch {
+		} catch (err) {
+			// Unreadable candidates stay partial; parser failures must not become missing declarations.
+			if (err instanceof StructuralWorkerError) throw err;
 			skipped++;
 		}
 	}
