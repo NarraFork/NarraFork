@@ -135,6 +135,7 @@ function sandbox(options: {
 		markUpdateRestarting: nothing,
 		stopSessionCleanupTimer: settled,
 		gateway: { shutdown: settled },
+		stopAllNugRelayClients: () => trace.push("nugRelays.stop"),
 		stopPrefixSnapshotMaintenance: settled,
 		stopInboxWakes: () => {
 			trace.push("inbox.stop");
@@ -741,6 +742,8 @@ test("late teardown buffered writes and communication reads finish before reader
 		expect(runtime.tracker?.summary().clean).toBe(true);
 		expect(runtime.cleanMarkers).toBe(1);
 		const closed = trace.indexOf("reader.close.begin");
+		expect(trace.indexOf("nugRelays.stop")).toBeGreaterThan(trace.indexOf("http.drained"));
+		expect(trace.indexOf("nugRelays.stop")).toBeLessThan(closed);
 		expect(trace.indexOf("commandCode.models.stop")).toBeGreaterThan(
 			trace.indexOf("plugin.shutdown"),
 		);

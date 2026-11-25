@@ -193,6 +193,44 @@ test("create A then reorder B keeps poll and repay on A; two accounts' colliding
 	);
 });
 
+test("billing config and creation both skip disabled A for enabled B without rebinding an existing order", async () => {
+	store.update(first.id, { disabled: true });
+	expect(settings.nugProviders?.[0]?.apiKey).toBe(A);
+	gateway = (call) =>
+		call.url.endsWith("/billing/config")
+			? Response.json({
+					enabled: true,
+					providers: [{ name: "mockpay", displayName: "Mock" }],
+					unitName: "credits",
+					quotaRate: 1,
+					orderMinAmount: 1,
+					orderMaxAmount: 100,
+					balance: 12,
+					totalGranted: 20,
+				})
+			: order();
+	const config = await app().request(`/api/nug/providers/${ID}/billing/config`);
+	expect(config.status).toBe(200);
+	expect(await config.json()).toMatchObject({ enabled: true, balance: 12 });
+	const bound = await created();
+	expect(calls.map((call) => call.authorization)).toEqual([`Bearer ${B}`, `Bearer ${B}`]);
+	store.update(first.id, { disabled: false });
+	store.reorder(nugKeyOwner(ID), [first.id, second.id]);
+	expect((await query(bound)).status).toBe(200);
+	expect(calls[2]?.authorization).toBe(`Bearer ${B}`);
+	store.update(second.id, { disabled: true });
+	expect((await query(bound)).status).toBe(409);
+	expect(calls).toHaveLength(3);
+});
+
+test("managed but entirely disabled billing keys never fall back to the projected inline secret", async () => {
+	store.update(first.id, { disabled: true });
+	store.update(second.id, { disabled: true });
+	expect((await app().request(`/api/nug/providers/${ID}/billing/config`)).status).toBe(409);
+	expect((await create()).status).toBe(409);
+	expect(calls).toEqual([]);
+});
+
 test.each([
 	"deleted",
 	"replaced",
