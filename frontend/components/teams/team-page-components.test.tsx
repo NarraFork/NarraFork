@@ -13,7 +13,6 @@ import type {
 	TeamMembersResponse,
 	TeamPageSummary,
 	TeamPendingApproval,
-	TeamSummary,
 } from "@shared/project-teams";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createInstance } from "i18next";
@@ -24,7 +23,6 @@ import { RECENT_TABS_QUERY_KEY } from "../../hooks/useRecentTabs";
 import { teamKeys } from "../../hooks/useTeams";
 import en from "../../locales/en/projects.json";
 import zh from "../../locales/zh-CN/projects.json";
-import { ProjectTeamsList } from "./ProjectTeamsList";
 import { ActivityLine, TeamActivity } from "./TeamActivity";
 import { TeamAttention } from "./TeamAttention";
 import { TeamHeader } from "./TeamHeader";
@@ -511,52 +509,6 @@ describe("members (M1)", () => {
 		expect(zhHtml).toContain("旁观者");
 		expect(zhHtml).toContain("所有者");
 		expect(zhHtml).toContain("最近没有发言");
-	});
-});
-
-describe("project teams list", () => {
-	test("an archived team's row offers no pin; an active team's row does", async () => {
-		const row = (id: string, patch: Partial<TeamSummary> = {}): TeamSummary => ({
-			id,
-			projectId: "p",
-			name: id,
-			baseBranch: "main",
-			status: "active",
-			coordinatorStatus: "idle",
-			createdBy: null,
-			createdAt: "2026-11-18T00:00:00.000Z",
-			updatedAt: "2026-11-18T00:00:00.000Z",
-			access: "write",
-			briefBytes: 0,
-			...patch,
-		});
-		const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-		// A cached page that outlived an archive (the list asks for active teams only).
-		client.setQueryData(teamKeys.list("p"), {
-			pages: [
-				{
-					teams: [
-						row("live"),
-						row("gone", { status: "archived", coordinatorStatus: "archived" }),
-						row("going", { coordinatorStatus: "archived" }),
-					],
-					nextCursor: null,
-				},
-			],
-			pageParams: [undefined],
-		});
-		const html = await render(
-			<ProjectTeamsList projectId="p" canCreate={false} onOpenTeam={() => {}} />,
-			client,
-		);
-		const rows = [...html.matchAll(/data-team-id="([^"]+)"(.*?)(?=data-team-id=|$)/gs)].map(
-			(match) => [match[1], match[2].includes('data-testid="pin-to-sidebar"')],
-		);
-		expect(rows).toEqual([
-			["live", true],
-			["gone", false],
-			["going", false],
-		]);
 	});
 });
 

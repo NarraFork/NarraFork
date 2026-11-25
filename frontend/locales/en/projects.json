@@ -5,7 +5,6 @@
 		"manage": "You can manage this configuration.",
 		"readOnly": "Read-only: managing this configuration requires project management permission.",
 		"accessUnavailable": "Could not verify management permission. Editing is disabled.",
-		"settingsTraits": "Settings, permission rules and traits",
 		"workspaceContainers": "Workspace and container settings",
 		"devices": "Devices",
 		"knowledge": "Knowledge",
@@ -14,7 +13,6 @@
 		"instanceSettings": "Instance settings and traits",
 		"routinesSkills": "Routines and skills",
 		"unavailable": "Configuration is unavailable: it may be inaccessible, missing, or temporarily unable to load.",
-		"retirement": "The canvas entry point has retired. Existing configuration, sessions and resources remain here; no data has been moved or deleted.",
 		"sessions": "Sessions",
 		"sessionsUnavailable": "Could not load sessions.",
 		"openSession": "Open session",
@@ -25,7 +23,6 @@
 	"newSession": "New session",
 	"openOutline": "Outline",
 	"outlineNotCreated": "This project has no outline yet. Someone who can edit the project creates it by opening it.",
-	"advancedSettings": "Advanced project settings",
 	"projectDescription": "Description",
 	"defaultDirectoryHint": "Default directory for new sessions only. Existing session directories stay unchanged.",
 	"newProject": "New Project",
@@ -64,9 +61,6 @@
 	"deleteProject": "Delete Project",
 	"deleteProjectTypeName": "Type the project name to confirm:",
 	"projectDeleted": "Project deleted",
-	"commandsButton": "Commands",
-	"commandsTitle": "Project Commands",
-	"commandsDesc": "Define slash commands available to all narrators in this project. Project commands override user commands with the same name.",
 	"commandRunBashFirst": "Run Bash first",
 	"commandRunBashFirstDesc": "When enabled, using this command runs the Bash command below via the /bash flow before sending the prompt to AI. The Bash result is included in the same AI turn context.",
 	"commandRunBashFirstBadge": "Bash first",
@@ -85,21 +79,12 @@
 	"commandEmpty": "No project commands. Add one to get started.",
 	"commandDuplicateName": "A command with this name already exists",
 	"commandInvalidName": "Command name can only contain letters, numbers, hyphens and underscores",
-	"skillsButton": "Skills",
-	"routinesButton": "Routines",
-	"routinesTitle": "Built-in Routines",
-	"routinesDesc": "Enable or disable built-in commands and skills for this project. Override the global setting per routine.",
 	"routinesUnsupportedTitle": "Project routines are unavailable",
 	"routinesUnsupportedDesc": "This backend runtime does not support project-level routine overrides.",
-	"routineFollowGlobal": "Global",
-	"skillsTitle": "Project Skills",
-	"skillsDesc": "Skills are reusable instruction sets that provide domain-specific knowledge to narrators. Create and edit project skills here; new skills are saved to .narrafork/skills/<name>/SKILL.md by default.",
 	"skillsEmpty": "No skills found. Create a project skill to get started.",
 	"skillsFiles": "files",
 	"skillsLocation": "Location",
 	"skillsCompanionFiles": "Companion files",
-	"settingsButton": "Settings",
-	"settingsTitle": "Project Settings",
 	"projectWhitelistDirs": "Whitelist Directories",
 	"projectWhitelistDirsDesc": "Directories auto-allowed for narrators in this project.",
 	"projectBlacklistDirs": "Blacklist Directories",
@@ -143,11 +128,8 @@
 	},
 	"teams": {
 		"title": "Teams",
-		"newTeam": "New team",
-		"noTeams": "No teams yet.",
 		"loadFailed": "Could not load the teams.",
 		"loadMore": "Load more",
-		"open": "Open",
 		"onlooker": "Read only",
 		"archived": "Archived",
 		"pageTitle": "Team",
@@ -516,7 +498,106 @@
 			"coordinator": "Coordinator"
 		}
 	},
-	"skills": "Skills",
-	"routines": "Routines",
-	"commands": "Commands"
+	"page": {
+		"newTeam": "New team",
+		"more": "More",
+		"showSessions": "Teams and sessions",
+		"waitingBadge": "{{count}} waiting",
+		"attention": {
+			"ownersSession": "{{name}}'s session",
+			"more": "More are waiting than listed here: open their sessions and teams to see them.",
+			"unscanned": "Some waiting calls may not be listed here: open their sessions and teams to see them."
+		},
+		"teams": {
+			"empty": "No teams yet. A team splits a goal into work items that run side by side.",
+			"newHint": "Let a coordinator split the work and run it in parallel",
+			"numbers": {
+				"inProgress": "In progress",
+				"ready": "Ready",
+				"done": "Done"
+			}
+		},
+		"sessions": {
+			"views": {
+				"active": "Active",
+				"all": "All",
+				"mine": "Mine"
+			},
+			"recent": "Last 7 days",
+			"empty": {
+				"active": "Nothing running and nothing changed in the last 7 days.",
+				"all": "No sessions in this project yet.",
+				"mine": "You have no sessions in this project."
+			}
+		}
+	},
+	"list": {
+		"subtitle": "Projects with something waiting on you come first, the rest by recent activity. Sessions join a project by their working directory.",
+		"runningSessions_one": "{{count}}{{more}} active session",
+		"runningSessions_other": "{{count}}{{more}} active sessions",
+		"noRunningSessions": "No active sessions",
+		"teams_one": "{{count}}{{more}} team",
+		"teams_other": "{{count}}{{more}} teams",
+		"archived": "Archived",
+		"activity": {
+			"justNow": "Active just now",
+			"minutes": "{{count}} min ago",
+			"hours": "{{count}} h ago",
+			"yesterday": "Yesterday",
+			"days": "{{count}} days ago",
+			"never": "No activity yet"
+		}
+	},
+	"settingsPage": {
+		"title": "Project settings",
+		"open": "Open project settings",
+		"back": "Back to the project",
+		"autosave": "Changes save automatically",
+		"loading": "Loading…",
+		"saving": "Saving…",
+		"saveFailed": "Could not save: {{message}}",
+		"rulesCount_one": "{{count}} rule",
+		"rulesCount_other": "{{count}} rules",
+		"openDevices": "Device settings",
+		"openKnowledge": "Open the knowledge base",
+		"knowledgeNote": "The knowledge base has its own levels and tags for who may read what; it is shared across projects.",
+		"groups": {
+			"members": {
+				"title": "Members and visibility",
+				"description": "Who can see this project, and who can start sessions and approve actions in it."
+			},
+			"skills": {
+				"title": "Skills",
+				"description": "Skills the sessions of this project can use when they need them."
+			},
+			"routines": {
+				"title": "Routines",
+				"description": "\"Loaded in new sessions\" routines are available in every new session; \"load in a session\" ones are loaded by typing /load there."
+			},
+			"commands": {
+				"title": "Commands",
+				"description": "Shortcuts sessions can run by typing /, and which shell commands they may or may not run."
+			},
+			"workspace": {
+				"title": "Workspace and containers",
+				"description": "The project directory, and which directories its sessions may or may not touch."
+			},
+			"devices": {
+				"title": "Devices",
+				"description": "Which machines sessions can run tools on."
+			},
+			"knowledge": {
+				"title": "Knowledge base",
+				"description": "What the team knows, for sessions to look up."
+			}
+		},
+		"routines": {
+			"modes": {
+				"resident": "Loaded in new sessions",
+				"manual": "Load in a session",
+				"auto": "Automatic"
+			},
+			"followGlobal": "Follow global: {{mode}}"
+		}
+	}
 }

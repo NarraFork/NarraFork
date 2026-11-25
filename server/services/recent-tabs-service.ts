@@ -1770,6 +1770,7 @@ export async function getRuntimePatches(
 				? {
 						pendingApprovalCount:
 							typeof tab.pendingApprovalCount === "number" ? tab.pendingApprovalCount : null,
+						readyItemCount: numberOrNull(tab.readyItemCount),
 					}
 				: {}),
 			// Project tabs: the hover card's path and counts (`recent-tab-projects.ts`); null when

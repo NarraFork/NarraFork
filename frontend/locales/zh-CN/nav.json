@@ -185,6 +185,6 @@
 	"unpinFromSidebar": "从侧栏取消固定",
 	"pinToSidebarFailed": "固定到侧栏失败",
 	"unpinFromSidebarFailed": "从侧栏取消固定失败",
-	"teamTabPendingApprovals": "{{count}} 项待批",
-	"recentTabCoordinatorLabel": "协调者"
+	"recentTabCoordinatorLabel": "协调者",
+	"teamTabWaiting": "{{count}} 项等你处理"
 }

@@ -33,6 +33,8 @@ export interface RecentTab extends PersistedRecentTab {
 	 * (null for an onlooker, who cannot decide them).
 	 */
 	pendingApprovalCount?: number | null;
+	/** Team tabs only, runtime-enriched for members: work items ready to accept (R2). */
+	readyItemCount?: number | null;
 	/**
 	 * Project tabs only, runtime-enriched for the hover card (`recent-tab-projects.ts`): the
 	 * repository directory, this user's readable sessions running or waiting now, and readable
@@ -226,6 +228,7 @@ const RECENT_TAB_RUNTIME_KEYS = [
 	"viewerCount",
 	"hasDraft",
 	"pendingApprovalCount",
+	"readyItemCount",
 	"teamSession",
 	"projectPath",
 	"activeSessionCount",

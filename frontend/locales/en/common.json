@@ -807,6 +807,7 @@
 	"botBadge": "Bot",
 	"swipeMenu": "Menu",
 	"recentTabTeamPendingApprovals": "{{count}} pending approval(s)",
+	"recentTabTeamReadyItems": "{{count}} item(s) ready to merge",
 	"recentTabProjectActiveSessions": "{{countLabel}} session(s) running",
 	"recentTabProjectNoActiveSessions": "No sessions running",
 	"recentTabProjectWaitingSessions": "{{countLabel}} waiting for input or approval",

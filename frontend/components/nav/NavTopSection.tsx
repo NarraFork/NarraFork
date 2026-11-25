@@ -8,7 +8,7 @@
  */
 
 import { Group, Kbd, NavLink, Stack, Text, Tooltip } from "@mantine/core";
-import { IconEdit, IconSearch } from "@tabler/icons-react";
+import { IconEdit, IconFolders, IconSearch } from "@tabler/icons-react";
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
 import {
 	type ReactNode,
@@ -148,6 +148,34 @@ export function NewSessionLink({ onNavigate }: { onNavigate?: () => void }) {
 	);
 }
 
+/**
+ * 「项目」: the project list, and the way to every project page and team (R2: the third row of
+ * the top section, as the redesign's sidebar has it). Active on the list and on any project's
+ * pages, unless one of the project's own pinned tabs below is the active row.
+ */
+export function NavProjectsLink({ onNavigate }: { onNavigate?: () => void }) {
+	const { t } = useTranslation("nav");
+	const navigate = useNavigate();
+	const pathname = useRouterState({ select: (state) => state.location.pathname });
+	return (
+		<NavLink
+			label={
+				<Text size="sm" truncate>
+					{t("projects")}
+				</Text>
+			}
+			active={pathname === "/projects" || pathname === "/projects/"}
+			leftSection={<IconFolders size={16} />}
+			onClick={() => {
+				navigate({ to: "/projects" });
+				onNavigate?.();
+			}}
+			aria-label={t("projects")}
+			data-testid="nav-projects"
+		/>
+	);
+}
+
 /** Cmd/Ctrl+K: the search page, with the cursor in its box (already there: just focuses it). */
 function isSearchShortcut(e: KeyboardEvent): boolean {
 	return (
@@ -267,6 +295,7 @@ export function NavTopSection({
 			<Stack gap={0} mt={NAV_ACTIONS_GAP_ABOVE}>
 				<NavSearchLink onNavigate={onNavigate} />
 				<NewSessionLink onNavigate={onNavigate} />
+				<NavProjectsLink onNavigate={onNavigate} />
 			</Stack>
 		</Stack>
 	);

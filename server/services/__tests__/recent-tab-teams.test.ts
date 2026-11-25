@@ -30,6 +30,7 @@ const {
 	narratorToolCalls,
 	projects,
 	projectTeams,
+	teamWorkItems,
 	userPreferences,
 	userRecentTabs,
 	userRecentTabsMeta,
@@ -461,6 +462,16 @@ describe("team tabs follow the team", () => {
 			status: "pending",
 			createdAt: now(),
 		});
+		// R2: an item ready to accept counts beside the calls (the tab's badge sums both).
+		await db.insert(teamWorkItems).values({
+			id: generateId(),
+			teamId,
+			projectId,
+			title: "Ready",
+			state: "ready",
+			createdAt: now(),
+			updatedAt: now(),
+		});
 		await upsertRecentTab(member, teamTab(teamId));
 		await upsertRecentTab(onlooker, teamTab(teamId));
 
@@ -470,12 +481,14 @@ describe("team tabs follow the team", () => {
 			substatus: ["unread"],
 			teamOnlooker: false,
 			pendingApprovalCount: 1,
+			readyItemCount: 1,
 		});
 		const [onlookerPatch] = (await getRuntimePatches(onlooker, [`team:${teamId}`])).patches;
 		expect(onlookerPatch.patch).toMatchObject({
 			status: "waiting",
 			teamOnlooker: true,
 			pendingApprovalCount: null,
+			readyItemCount: null,
 		});
 
 		// Lost access: the tab still exists until the prune, but it reads no state.

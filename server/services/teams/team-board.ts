@@ -302,6 +302,16 @@ export function teamPendingApprovalCount(teamId: string): number {
 	return pendingCount(teamId);
 }
 
+/** Items waiting to be accepted (`ready`), counted up to 51 by `(team_id, state, id)` (R2). */
+export function teamReadyItemCount(teamId: string): number {
+	return db
+		.select({ id: teamWorkItems.id })
+		.from(teamWorkItems)
+		.where(and(eq(teamWorkItems.teamId, teamId), eq(teamWorkItems.state, "ready")))
+		.limit(TEAM_APPROVALS_LIMIT + 1)
+		.all().length;
+}
+
 /** The top bar: running agents, pending approvals (members only), column counts, last event. */
 export async function readTeamPageSummary(
 	teamId: string,

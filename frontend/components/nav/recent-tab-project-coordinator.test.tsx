@@ -135,3 +135,32 @@ describe("a coordinator's session tab", () => {
 		expect(html).toContain("The coordinator session of a team.");
 	});
 });
+
+describe("a team tab (R2)", () => {
+	const team: RecentTab = {
+		type: "team",
+		id: "t1",
+		title: "发布小组",
+		lastVisitedAt: 1,
+		status: "working",
+		pendingApprovalCount: 2,
+		readyItemCount: 1,
+	};
+
+	test("an amber count at the row's end sums the calls and the items to accept", async () => {
+		const html = await render(<RecentTabTitle tab={team} />, "zh-CN");
+		expect(html).toContain('data-testid="team-tab-pending"');
+		expect(html).toContain('aria-label="3 项等你处理"');
+		expect(html).toMatch(/data-testid="team-tab-pending"[^>]*>3</);
+		const none = await render(
+			<RecentTabTitle tab={{ ...team, pendingApprovalCount: null, readyItemCount: null }} />,
+		);
+		expect(none).not.toContain("team-tab-pending");
+	});
+
+	test("its card lists the calls and the items ready to merge apart", async () => {
+		const html = await render(<RecentTabDetails tab={team} />, "zh-CN");
+		expect(html).toContain("2 项待批");
+		expect(html).toContain("1 项可以合并");
+	});
+});

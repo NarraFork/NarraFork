@@ -269,12 +269,21 @@ export function itemOfApproval(
 	return items.find((item) => item.worker && sessions.has(item.worker.id)) ?? null;
 }
 
+/**
+ * Where a card comes from when 「等你处理」 sums up more than one team (R2: the project page): the
+ * team it belongs to, or an ordinary session and whose it is. The team page leaves it out.
+ */
+export type AttentionSource =
+	| { kind: "team"; teamId: string; name: string }
+	| { kind: "session"; narratorId: string; title: string | null; ownerName: string | null };
+
 /** One card of 「等你处理」: a pending call of the tree, or a ready item to accept. */
 interface ApprovalEntry<K extends TeamPendingApproval["kind"]> {
 	kind: K;
 	id: string;
 	approval: TeamPendingApproval;
 	item: TeamBoardItem | null;
+	source?: AttentionSource;
 }
 
 export type AttentionEntry =
@@ -282,7 +291,14 @@ export type AttentionEntry =
 	| ApprovalEntry<"question">
 	| ApprovalEntry<"plan">
 	| ApprovalEntry<"rule">
-	| { kind: "merge"; id: string; item: TeamBoardItem };
+	| {
+			kind: "merge";
+			id: string;
+			item: TeamBoardItem;
+			source?: AttentionSource;
+			/** The branch it merges into, when the cards come from several teams. */
+			base?: string;
+	  };
 
 const isOpen = (item: TeamBoardItem) => item.state !== "merged" && item.state !== "cancelled";
 

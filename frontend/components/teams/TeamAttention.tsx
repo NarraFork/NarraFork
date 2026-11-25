@@ -52,7 +52,7 @@ import {
 import { lazy, type ReactNode, Suspense, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { AskUserQuestionBanner, coerceQuestions } from "../narrator/question/AskUserQuestionBanner";
-import { type AttentionEntry, attentionView } from "./team-page-model";
+import { type AttentionEntry, type AttentionSource, attentionView } from "./team-page-model";
 import {
 	ATTENTION_BG,
 	ATTENTION_BORDER,
@@ -99,6 +99,10 @@ export interface AttentionActions {
 	onHover?: (itemId: string | null) => void;
 	onOpenItem: (itemId: string, options?: { returning?: boolean }) => void;
 	onOpenSession?: (narratorId: string) => void;
+	/** R2 (the project page): open the team a card comes from. */
+	onOpenTeam?: (teamId: string) => void;
+	/** Called after a decision is sent (the project page refetches its own list). */
+	onDecided?: () => void;
 }
 
 const KIND_ICON = {
@@ -109,29 +113,68 @@ const KIND_ICON = {
 	merge: IconGitBranch,
 } as const;
 
-/** Who asks: the work item's title (its worker asks), or the coordinator, or the session. */
+/** The team a card comes from on the project page: its name, which opens the team. */
+function SourceTeam({
+	source,
+	onOpenTeam,
+}: {
+	source: Extract<AttentionSource, { kind: "team" }>;
+	onOpenTeam?: (teamId: string) => void;
+}) {
+	return (
+		<>
+			<UnstyledButton
+				onClick={() => onOpenTeam?.(source.teamId)}
+				disabled={!onOpenTeam}
+				data-testid="attention-source-team"
+				style={{ fontWeight: 700 }}
+			>
+				{source.name}
+			</UnstyledButton>
+			<Text component="span" inherit c="dimmed">
+				{" · "}
+			</Text>
+		</>
+	);
+}
+
+/**
+ * Who asks: the work item's title (its worker asks), or the coordinator, or the session. On the
+ * project page a team's card starts with the team's name, a session's ends with whose it is.
+ */
 function Asker({
 	entry,
 	onOpenSession,
+	onOpenTeam,
 }: {
 	entry: Exclude<AttentionEntry, { kind: "merge" }>;
 	onOpenSession?: (narratorId: string) => void;
+	onOpenTeam?: (teamId: string) => void;
 }) {
 	const { t } = useTranslation("projects");
+	const source = entry.source;
+	// An ordinary session asks for itself (or its helper does): no coordinator, no worker.
+	const plain = source?.kind === "session";
 	const coordinator = entry.approval.depth === 0;
-	const who = coordinator
-		? t("teams.page.attention.coordinator")
-		: (entry.item?.title ?? entry.approval.agent.title ?? entry.approval.agent.id);
+	const who = plain
+		? coordinator
+			? (source.title ?? entry.approval.agent.title ?? entry.approval.agent.id)
+			: (entry.approval.agent.title ?? entry.approval.agent.id)
+		: coordinator
+			? t("teams.page.attention.coordinator")
+			: (entry.item?.title ?? entry.approval.agent.title ?? entry.approval.agent.id);
+	const generic = plain || coordinator;
 	const verb = {
-		tool: coordinator ? "coordinatorAsksTool" : "asksTool",
-		question: coordinator ? "coordinatorAsksQuestion" : "asksQuestion",
-		plan: coordinator ? "coordinatorAsksPlan" : "asksPlan",
-		rule: coordinator ? "coordinatorAsksRule" : "asksRule",
+		tool: generic ? "coordinatorAsksTool" : "asksTool",
+		question: generic ? "coordinatorAsksQuestion" : "asksQuestion",
+		plan: generic ? "coordinatorAsksPlan" : "asksPlan",
+		rule: generic ? "coordinatorAsksRule" : "asksRule",
 	}[entry.kind];
 	const reason = entry.approval.decisionReason;
 	return (
 		<>
 			<Text size="sm" style={{ overflowWrap: "anywhere" }}>
+				{source?.kind === "team" && <SourceTeam source={source} onOpenTeam={onOpenTeam} />}
 				{/* The name opens the asking session (the coordinator's is this page's conversation). */}
 				<UnstyledButton
 					onClick={() => onOpenSession?.(entry.approval.agent.id)}
@@ -148,6 +191,9 @@ function Asker({
 				{t(`teams.page.attention.${verb}`, { tool: entry.approval.toolName })}{" "}
 				<Text component="span" size="xs" c="dimmed" title={entry.approval.createdAt}>
 					{formatSmartTime(entry.approval.createdAt)}
+					{plain &&
+						source.ownerName &&
+						` · ${t("page.attention.ownersSession", { name: source.ownerName })}`}
 				</Text>
 			</Text>
 			{reason && entry.kind === "tool" && (
@@ -164,7 +210,11 @@ function Asker({
 	);
 }
 
-function useDecision(teamId: string, approval: TeamPendingApproval) {
+function useDecision(
+	teamId: string,
+	approval: TeamPendingApproval,
+	onDecided: (() => void) | undefined,
+) {
 	const { t } = useTranslation("projects");
 	const decide = useDecideApproval(teamId);
 	const [sent, setSent] = useState(false);
@@ -176,6 +226,7 @@ function useDecision(teamId: string, approval: TeamPendingApproval) {
 				onSuccess: () => {
 					setSent(true);
 					setFailed(false);
+					onDecided?.();
 				},
 				onError: () => setFailed(true),
 			},
@@ -200,14 +251,18 @@ function ToolCard({
 	actions: AttentionActions;
 }) {
 	const { t } = useTranslation("projects");
-	const decision = useDecision(actions.teamId, entry.approval);
+	const decision = useDecision(actions.teamId, entry.approval, actions.onDecided);
 	return (
 		<CardFrame
 			entry={entry}
 			actions={actions}
 			body={
 				<>
-					<Asker entry={entry} onOpenSession={actions.onOpenSession} />
+					<Asker
+						entry={entry}
+						onOpenSession={actions.onOpenSession}
+						onOpenTeam={actions.onOpenTeam}
+					/>
 					{entry.approval.preview && (
 						<Code
 							block
@@ -255,7 +310,7 @@ function QuestionCard({
 	actions: AttentionActions;
 }) {
 	const { t } = useTranslation("projects");
-	const decision = useDecision(actions.teamId, entry.approval);
+	const decision = useDecision(actions.teamId, entry.approval, actions.onDecided);
 	const [writing, setWriting] = useState(false);
 	const [own, setOwn] = useState("");
 	const [formOpen, setFormOpen] = useState(false);
@@ -395,7 +450,11 @@ function QuestionCard({
 				actions={actions}
 				body={
 					<>
-						<Asker entry={entry} onOpenSession={actions.onOpenSession} />
+						<Asker
+							entry={entry}
+							onOpenSession={actions.onOpenSession}
+							onOpenTeam={actions.onOpenTeam}
+						/>
 						{context ??
 							(asked && (
 								<Text
@@ -465,7 +524,7 @@ function PlanCard({
 	actions: AttentionActions;
 }) {
 	const { t } = useTranslation("projects");
-	const decision = useDecision(actions.teamId, entry.approval);
+	const decision = useDecision(actions.teamId, entry.approval, actions.onDecided);
 	const [open, setOpen] = useState(false);
 	const detail = useApprovalDetail(actions.teamId, entry.approval.id, open);
 	const plan = detail.data?.permission?.inputJson?.plan;
@@ -476,7 +535,11 @@ function PlanCard({
 				actions={actions}
 				body={
 					<>
-						<Asker entry={entry} onOpenSession={actions.onOpenSession} />
+						<Asker
+							entry={entry}
+							onOpenSession={actions.onOpenSession}
+							onOpenTeam={actions.onOpenTeam}
+						/>
 						{entry.approval.preview && (
 							<Text
 								size="sm"
@@ -560,7 +623,13 @@ function RuleCard({
 		<CardFrame
 			entry={entry}
 			actions={actions}
-			body={<Asker entry={entry} onOpenSession={actions.onOpenSession} />}
+			body={
+				<Asker
+					entry={entry}
+					onOpenSession={actions.onOpenSession}
+					onOpenTeam={actions.onOpenTeam}
+				/>
+			}
 			buttons={
 				<Button
 					size="xs"
@@ -586,7 +655,7 @@ function MergeCard({
 	const { t } = useTranslation("projects");
 	const { item } = entry;
 	const stat = actions.stats?.[item.id];
-	const base = item.baseRef ?? actions.base;
+	const base = item.baseRef ?? entry.base ?? actions.base;
 	return (
 		<CardFrame
 			entry={entry}
@@ -594,6 +663,9 @@ function MergeCard({
 			body={
 				<>
 					<Text size="sm" style={{ overflowWrap: "anywhere" }}>
+						{entry.source?.kind === "team" && (
+							<SourceTeam source={entry.source} onOpenTeam={actions.onOpenTeam} />
+						)}
 						<Text component="span" inherit fw={700}>
 							{item.title}
 						</Text>{" "}
@@ -755,16 +827,32 @@ const PHONE_CSS = `
 [data-attention-layout="phone"] .nf-attention-buttons > * { flex: 1; }
 `;
 
+/** A narrow list: the buttons go under the text, full width, so each card stays usable. */
+const COMPACT_CSS = `
+[data-attention-layout="compact"] .nf-attention-card { flex-wrap: wrap !important; }
+[data-attention-layout="compact"] .nf-attention-card > .mantine-Stack-root { flex-basis: calc(100% - 44px); }
+[data-attention-layout="compact"] .nf-attention-buttons { max-width: none !important; width: 100%; padding-left: 42px; justify-content: flex-end; }
+`;
+
 export function TeamAttention({
 	entries,
 	phone,
 	more: moreCalls = false,
 	unscanned = false,
 	onOpenCoordinatorSession,
+	flush = false,
+	compact = false,
+	beyondKeys,
 	...actions
 }: AttentionActions & {
+	/** A narrow column with the cards listed (the project page on a phone): buttons wrap below. */
+	compact?: boolean;
+	/** The wording of the "more than listed" line (default: open the coordinator's session). */
+	beyondKeys?: { more: string; unscanned: string };
 	entries: AttentionEntry[];
 	phone: boolean;
+	/** No outer padding: the host page lays the block out (the project page). */
+	flush?: boolean;
 	/** More calls wait than the list holds (50). */
 	more?: boolean;
 	/** The scan stopped before reading every pending call. */
@@ -782,7 +870,11 @@ export function TeamAttention({
 		moreCalls || unscanned ? (
 			<Group gap="xs" wrap="nowrap" justify="space-between" data-testid="team-attention-beyond">
 				<Text size="xs" c="dimmed">
-					{t(moreCalls ? "teams.page.attention.moreInSession" : "teams.page.attention.unscanned")}
+					{t(
+						moreCalls
+							? (beyondKeys?.more ?? "teams.page.attention.moreInSession")
+							: (beyondKeys?.unscanned ?? "teams.page.attention.unscanned"),
+					)}
 				</Text>
 				{onOpenCoordinatorSession && (
 					<Button size="compact-xs" variant="subtle" onClick={onOpenCoordinatorSession}>
@@ -844,7 +936,12 @@ export function TeamAttention({
 
 	if (phone)
 		return (
-			<Box px="sm" pt="sm" data-testid="team-attention" data-attention-layout="phone">
+			<Box
+				px={flush ? 0 : "sm"}
+				pt={flush ? 0 : "sm"}
+				data-testid="team-attention"
+				data-attention-layout="phone"
+			>
 				<style>{PHONE_CSS}</style>
 				<Stack gap={8}>
 					{header}
@@ -911,7 +1008,13 @@ export function TeamAttention({
 		);
 
 	return (
-		<Box px="md" pt="md" data-testid="team-attention" data-attention-layout="desktop">
+		<Box
+			px={flush ? 0 : "md"}
+			pt={flush ? 0 : "md"}
+			data-testid="team-attention"
+			data-attention-layout={compact ? "compact" : "desktop"}
+		>
+			{compact && <style>{COMPACT_CSS}</style>}
 			<Box
 				style={{
 					background: ATTENTION_BG,

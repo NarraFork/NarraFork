@@ -9,10 +9,12 @@ const input = ({
 	label,
 	value,
 	onChange,
+	onBlur,
 }: {
 	label: string;
 	value?: string;
 	onChange?: (event: ChangeEvent<HTMLInputElement>) => void;
+	onBlur?: () => void;
 }) => (
 	<div data-input={label} data-value={value}>
 		<button
@@ -25,9 +27,15 @@ const input = ({
 		>
 			{label}
 		</button>
+		{onBlur && (
+			<button type="button" onClick={onBlur}>
+				{`leave:${label}`}
+			</button>
+		)}
 	</div>
 );
 let edits: Record<string, string> = {};
+mock.module("../common/CommandsEditor", () => ({ CommandsEditor: box }));
 mock.module("@mantine/core", () => ({
 	Alert: box,
 	Badge: box,
@@ -89,6 +97,7 @@ mock.module("@mantine/hooks", () => ({
 mock.module("react-i18next", () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
 mock.module("@tanstack/react-query", () => ({
 	useMutation: () => mutation,
+	useInfiniteQuery: () => ({ data: undefined }),
 	useQuery: () => ({ data: { paths: { defaultProjectDir: "/instance" }, agent: {} } }),
 	useQueryClient: () => ({ invalidateQueries: () => {} }),
 }));
@@ -154,7 +163,19 @@ mock.module("../../lib/api", () => ({
 	// accessor at import time.
 	getToken: () => null,
 }));
-mock.module("../permissions/PermissionRuleEditor", () => ({ PermissionRuleEditor: box }));
+mock.module("../permissions/PermissionRuleEditor", () => ({
+	PermissionRuleEditor: ({
+		kind,
+		onCreate,
+	}: {
+		kind: string;
+		onCreate: (rule: Record<string, unknown>) => void;
+	}) => (
+		<button type="button" onClick={() => onCreate({ pattern: "/tmp/**" })}>
+			{`add-rule:${kind}`}
+		</button>
+	),
+}));
 mock.module("../settings/TraitLayerEditor", () => ({ TraitLayerEditor: box }));
 mock.module("./ProjectAccessPanel", () => ({ ProjectAccessPanel: box }));
 mock.module("../common/DirectoryPicker", () => ({
@@ -169,7 +190,7 @@ mock.module("../common/DirectoryPicker", () => ({
 	}) => input({ label, value, onChange: (event) => onChange(event.currentTarget.value) }),
 }));
 const { CreateNarratorModal } = await import("../narrator/CreateNarratorModal");
-const { ProjectSettingsModal } = await import("./ProjectSettingsModal");
+const { ProjectBasicsForm, ProjectRuleList } = await import("./ProjectSettingsForms");
 const { Route } = await import("../../routes/projects/index");
 const ProjectListPage = Route.options.component as ComponentType;
 let root: Root;
@@ -295,51 +316,59 @@ test("closing the dialog clears a typed session title", async () => {
 	await click("createNarrator");
 	expect(create.mock.calls[0]?.[0]).not.toHaveProperty("title");
 });
-test("metadata edits submit only this form's settings, not stale commands, routines or unknown keys", async () => {
-	const chapterSettings = {
-		whitelistDirs: [],
-		blacklistDirs: [],
-		commandWhitelist: [],
-		commandBlacklist: [],
-		traits: { existing: true },
-		commands: [{ name: "old-command", prompt: "old prompt" }],
-		routines: { toolModes: { example: "resident" } },
-		futureSetting: { retain: true },
+test("the settings page saves a field when it is left, only that field, never a blank name", async () => {
+	const project = {
+		id: "original-id",
+		name: "Original project",
+		description: "Original description",
+		gitPath: "/original",
+		chapterSettings: { commands: [{ name: "old", prompt: "x" }], futureSetting: { retain: true } },
+	};
+	await act(async () => root.render(<ProjectBasicsForm project={project} canManage />));
+	edits = { projectName: "New name" };
+	await click("projectName");
+	await click("leave:projectName");
+	expect(update.mock.calls[0]?.[0]).toEqual({ id: "original-id", data: { name: "New name" } });
+	// Unchanged: nothing is sent.
+	await click("leave:projectDescription");
+	expect(update).toHaveBeenCalledTimes(1);
+	edits = { repositoryPath: "   " };
+	await click("repositoryPath");
+	await click("leave:repositoryPath");
+	expect(update).toHaveBeenCalledTimes(1);
+});
+test("a rule list saves on every change and sends only its own key", async () => {
+	const project = {
+		id: "original-id",
+		name: "p",
+		chapterSettings: { whitelistDirs: [], commands: [{ name: "old", prompt: "x" }] },
 	};
 	await act(async () =>
+		root.render(<ProjectRuleList project={project} ruleKey="whitelistDirs" canManage />),
+	);
+	await click("add-rule:directoryWhitelist");
+	const sent = update.mock.calls[0]?.[0] as {
+		id: string;
+		data: { chapterSettings: Record<string, unknown[]> };
+	};
+	expect(sent.id).toBe("original-id");
+	expect(Object.keys(sent.data)).toEqual(["chapterSettings"]);
+	expect(Object.keys(sent.data.chapterSettings)).toEqual(["whitelistDirs"]);
+	expect(sent.data.chapterSettings.whitelistDirs).toHaveLength(1);
+	expect(create).not.toHaveBeenCalled();
+});
+test("a reader sees the rules but no editor", async () => {
+	await act(async () =>
 		root.render(
-			<ProjectSettingsModal
-				projectId="original-id"
-				chapterSettings={chapterSettings}
-				opened
-				onClose={() => {}}
+			<ProjectRuleList
+				project={{ id: "p", chapterSettings: { commandBlacklist: [{ pattern: "rm" }] } }}
+				ruleKey="commandBlacklist"
+				canManage={false}
 			/>,
 		),
 	);
-	edits = {
-		projectName: "New name",
-		projectDescription: "New description",
-		repositoryPath: "/new-default",
-	};
-	await click("projectName");
-	await click("projectDescription");
-	await click("repositoryPath");
-	await click("save");
-	expect(update.mock.calls[0]?.[0]).toEqual({
-		id: "original-id",
-		data: {
-			name: "New name",
-			description: "New description",
-			gitPath: "/new-default",
-			chapterSettings: {
-				whitelistDirs: [],
-				blacklistDirs: [],
-				commandWhitelist: [],
-				commandBlacklist: [],
-			},
-		},
-	});
-	expect(create).not.toHaveBeenCalled();
+	expect(container.textContent).toContain("settingsPage.rulesCount");
+	expect(container.textContent).not.toContain("add-rule");
 });
 test("existing-directory project create sends no deprecated flow selector or git-init fallback", async () => {
 	await act(async () => root.render(<ProjectListPage />));

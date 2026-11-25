@@ -1644,12 +1644,10 @@ function TabIcon({ tab, size, iconColor }: { tab: RecentTab; size: number; iconC
 
 /**
  * A pinned team: its coordinator's status bubble (the team list and the team page's top bar
- * show the same), a group marker so it does not read as a session, and the tree's pending
- * approvals for members.
+ * show the same) and a group marker so it does not read as a session. What waits for a member
+ * is the amber count at the row's end (`TeamWaitingBadge`).
  */
 function TeamTabIcon({ tab, size }: { tab: RecentTab; size: number }) {
-	const { t } = useTranslation("nav");
-	const pending = tab.pendingApprovalCount ?? 0;
 	return (
 		<Box component="span" pos="relative" style={{ display: "inline-flex", lineHeight: 0 }}>
 			<NarratorStatusIcon size={size} status={tab.status} substatus={tab.substatus} />
@@ -1673,33 +1671,6 @@ function TeamTabIcon({ tab, size }: { tab: RecentTab; size: number }) {
 			>
 				<IconUsersGroup size={7} stroke={2.5} />
 			</Box>
-			{pending > 0 && (
-				<Box
-					component="span"
-					role="img"
-					aria-label={t("teamTabPendingApprovals", { count: pending })}
-					data-testid="team-tab-pending"
-					style={{
-						position: "absolute",
-						right: -6,
-						top: -5,
-						minWidth: 12,
-						height: 12,
-						padding: "0 2px",
-						borderRadius: 6,
-						background: "var(--mantine-color-orange-6)",
-						border: "1px solid var(--mantine-color-body)",
-						color: "var(--mantine-color-white)",
-						fontSize: 8,
-						fontWeight: 700,
-						lineHeight: "10px",
-						textAlign: "center",
-						pointerEvents: "none",
-					}}
-				>
-					{pending > 9 ? "9+" : pending}
-				</Box>
-			)}
 		</Box>
 	);
 }
@@ -1724,12 +1695,56 @@ function DragOverlayTabItem({ tab, active }: { tab: RecentTab; active: boolean }
 }
 
 /** Shared by normal rows and the drag overlay so the optional cwd stays consistent. */
+/**
+ * A team tab's amber count at the row's end (R2): what waits for this member in the team — the
+ * tree's pending calls and the items ready to accept, as the team page's 「等你处理」 lists them.
+ */
+function TeamWaitingBadge({ tab }: { tab: RecentTab }) {
+	const { t } = useTranslation("nav");
+	const waiting = (tab.pendingApprovalCount ?? 0) + (tab.readyItemCount ?? 0);
+	if (tab.type !== "team" || waiting <= 0) return null;
+	return (
+		<Box
+			component="span"
+			role="img"
+			aria-label={t("teamTabWaiting", { count: waiting })}
+			data-testid="team-tab-pending"
+			style={{
+				flexShrink: 0,
+				minWidth: 18,
+				height: 18,
+				padding: "0 5px",
+				borderRadius: 9,
+				background: "var(--mantine-color-yellow-6)",
+				color: "var(--mantine-color-dark-9)",
+				fontSize: 11,
+				fontWeight: 700,
+				lineHeight: "18px",
+				textAlign: "center",
+				fontVariantNumeric: "tabular-nums",
+			}}
+		>
+			{waiting > 99 ? "99+" : waiting}
+		</Box>
+	);
+}
+
 export function RecentTabTitle({ tab }: { tab: RecentTab }) {
 	const { t } = useTranslation("nav");
 	const { data: userPrefs } = useUserPreferences();
 	const showDirectory = userPrefs?.recentTabsShowDirectory ?? false;
 	// A coordinator's session sits next to its team's tab with the same title: label it.
 	const coordinator = isCoordinatorSessionTab(tab);
+	const waiting = (tab.pendingApprovalCount ?? 0) + (tab.readyItemCount ?? 0);
+	if (tab.type === "team" && waiting > 0)
+		return (
+			<Group gap={6} wrap="nowrap" justify="space-between" style={{ minWidth: 0 }}>
+				<Text size="sm" truncate style={{ minWidth: 0 }}>
+					{tab.title}
+				</Text>
+				<TeamWaitingBadge tab={tab} />
+			</Group>
+		);
 	return (
 		<Stack gap={0} style={{ minWidth: 0 }}>
 			{coordinator ? (
