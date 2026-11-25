@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
+import { withRuntimePolicyTrait } from "../../lib/runtime-policy-trait";
 
 const previousHome = process.env.NARRAFORK_HOME;
 const home = mkdtempSync(join(tmpdir(), "narrafork-communication-races-"));
@@ -11,9 +12,11 @@ const { db, sqlite } = await import("../../db");
 const { narrators, userRecentTabs } = await import("../../db/schema");
 const core = await import("../narrator-communication/index");
 const { eventBus } = await import("../../lib/event-bus");
-const { searchCommunicationCandidates, createCommunicationCandidateSearcher } = await import(
-	"../search/communication-candidates"
-);
+const {
+	searchCommunicationCandidates,
+	createCommunicationCandidateSearcher,
+	getCommunicationAccessEpoch,
+} = await import("../search/communication-candidates");
 const { shutdownDbWorkerPool } = await import("../../lib/db-worker/pool");
 const now = "2026-11-24T00:00:00.000Z";
 const actor = { userId: "writer", isAdmin: false };
@@ -162,6 +165,17 @@ test("canConnect candidates require both the submitting viewer and persistent ac
 		[now],
 	);
 	expect((await searchCommunicationCandidates("source", actor)).items).toEqual([]);
+	expect(await searchCommunicationCandidates("source", actor, { targetId: "readonly" })).toEqual({
+		items: [],
+		hasMore: false,
+	});
+});
+test("exact candidate lookup still enforces the source runtime ceiling", async () => {
+	seed("source", null, { traits: withRuntimePolicyTrait([], { version: 1, tools: ["Read"] }) });
+	seed("target");
+	await expect(
+		searchCommunicationCandidates("source", actor, { targetId: "target" }),
+	).rejects.toMatchObject({ code: "COMMUNICATION_DENIED" });
 });
 test("candidate SQL applies ACL before LIMIT and short Chinese matches beyond any recent-N preselection", async () => {
 	seed("source");
@@ -268,22 +282,163 @@ test("stored team bookmarks count as recent only for their owner and never overr
 	]);
 	expect(all.hasMore).toBe(false);
 });
-test("candidate search returns only the top 50 and an overflow flag without a cursor", async () => {
+test("candidate search caps ranked results at 50 but exact lookup ignores ranking and text", async () => {
 	seed("source");
+	const targetId = "candidate-01";
+	const query = "searchable alias";
 	for (let i = 1; i <= 55; i++) {
 		const sequence = String(i).padStart(2, "0");
+		const title = i === 1 ? "候选会话" : `候选会话 ${targetId}`;
 		seed(`candidate-${sequence}`, null, {
-			title: "候选会话",
+			title: i === 55 ? `${title} ${query}` : title,
 			lastMessageAt: `2026-11-24T00:00:${sequence}Z`,
 		});
 	}
-	seed("blocked", null, { title: "候选会话", ownerUserId: "other", lastMessageAt: "2030-01-01" });
-	const result = await searchCommunicationCandidates("source", actor, { query: "候选", limit: 50 });
+	seed("blocked", null, { title: targetId, ownerUserId: "other", lastMessageAt: "2030-01-01" });
+	const result = await searchCommunicationCandidates("source", actor, {
+		query: targetId,
+		limit: 50,
+	});
 	expect(result).toEqual({ items: expect.any(Array), hasMore: true });
 	expect(result.items.map((item) => item.id)).toEqual(
 		Array.from({ length: 50 }, (_, i) => `candidate-${String(55 - i).padStart(2, "0")}`),
 	);
+	const text = await searchCommunicationCandidates("source", actor, { query });
+	expect(text.items.map((item) => item.id)).toEqual(["candidate-55"]);
+	const exact = await searchCommunicationCandidates("source", actor, {
+		query,
+		limit: 50,
+		targetId,
+	});
+	expect(exact.items.map((item) => item.id)).toEqual([targetId]);
+	expect(exact.hasMore).toBe(false);
 });
+function pauseExactCandidateSearch() {
+	const pending = pausedReader((text) => text.includes("), eligible AS ("));
+	const search = createCommunicationCandidateSearcher({
+		execute: pending.read,
+		authorize: core.communicationCandidateSearchGuard,
+	});
+	return { ...pending, result: search("source", actor, { targetId: "target" }) };
+}
+
+test.each([
+	["archive", "source"],
+	["archive", "target"],
+	["delete", "source"],
+	["delete", "target"],
+] as const)("stale exact results are rejected after %s of the %s", async (transition, endpoint) => {
+	seed("source");
+	seed("target");
+	const pending = pauseExactCandidateSearch();
+	await pending.started; // The eligible SQL result has already been read.
+	const epoch = getCommunicationAccessEpoch();
+	try {
+		if (transition === "archive") {
+			db.update(narrators).set({ status: "archived" }).where(eq(narrators.id, endpoint)).run();
+			eventBus.emit({ type: "narrator:status_changed", narratorId: endpoint, status: "archived" });
+		} else {
+			db.delete(narrators).where(eq(narrators.id, endpoint)).run();
+			eventBus.emit({ type: "narrator:deleted", narratorId: endpoint, title: endpoint });
+		}
+		expect(getCommunicationAccessEpoch()).toBe(epoch + 1);
+	} finally {
+		pending.release();
+	}
+	await expect(pending.result).rejects.toMatchObject({
+		statusCode: transition === "delete" && endpoint === "source" ? 404 : 403,
+	});
+});
+
+test.each([
+	"source",
+	"target",
+] as const)("exact search rereads the %s after a committed archive cascade even before notifications", async (child) => {
+	seed("parent");
+	seed(child, "parent", { type: "primary", aclRootNarratorId: null });
+	seed(child === "source" ? "target" : "source");
+	const pending = pauseExactCandidateSearch();
+	await pending.started;
+	const epoch = getCommunicationAccessEpoch();
+	// Model the real archive transaction's single commit for parent and child. Do not let
+	// status notifications mask the gap between durable status and event publication.
+	db.transaction((tx) => {
+		for (const id of ["parent", child])
+			tx.update(narrators).set({ status: "archived" }).where(eq(narrators.id, id)).run();
+	});
+	pending.release();
+	await expect(pending.result).rejects.toMatchObject({ code: "COMMUNICATION_DENIED" });
+	expect(getCommunicationAccessEpoch()).toBe(epoch);
+	for (const id of ["parent", child])
+		eventBus.emit({ type: "narrator:status_changed", narratorId: id, status: "archived" });
+});
+
+test("ordinary active status changes do not invalidate pending exact lookups", async () => {
+	seed("source");
+	seed("target");
+	const pending = pauseExactCandidateSearch();
+	await pending.started;
+	const epoch = getCommunicationAccessEpoch();
+	db.update(narrators).set({ status: "working" }).where(eq(narrators.id, "target")).run();
+	eventBus.emit({ type: "narrator:status_changed", narratorId: "target", status: "working" });
+	pending.release();
+	expect(getCommunicationAccessEpoch()).toBe(epoch);
+	expect((await pending.result).items.map(({ id }) => id)).toEqual(["target"]);
+});
+
+test("an archive epoch rejects a stale result even if the endpoint is active again at reread", async () => {
+	seed("source");
+	seed("target");
+	const pending = pauseExactCandidateSearch();
+	await pending.started;
+	for (const status of ["archived", "idle"] as const) {
+		db.update(narrators).set({ status }).where(eq(narrators.id, "target")).run();
+		eventBus.emit({ type: "narrator:status_changed", narratorId: "target", status });
+	}
+	pending.release();
+	await expect(pending.result).rejects.toMatchObject({ code: "COMMUNICATION_ACCESS_CHANGED" });
+});
+
+test.each([
+	["same", "source"],
+	["same", "target"],
+	["different", "source"],
+	["different", "target"],
+] as const)("manual connect rejects archived %s-group endpoints (%s) after a positive lookup", async (group, endpoint) => {
+	const sameGroup = group === "same";
+	seed("source");
+	seed("target", sameGroup ? "source" : null, { type: "primary", aclRootNarratorId: null });
+	const candidate = (await searchCommunicationCandidates("source", actor, { targetId: "target" }))
+		.items[0];
+	expect(candidate).toMatchObject({ id: "target", canConnect: true, sameGroup });
+	db.update(narrators).set({ status: "archived" }).where(eq(narrators.id, endpoint)).run();
+	await expect(
+		core.mutateCommunication("source", actor, { kind: "connect", targetNarratorId: "target" }),
+	).rejects.toMatchObject({ code: "COMMUNICATION_DENIED" });
+	expect(sqlite.query("SELECT id FROM narrator_communication_peers").all()).toEqual([]);
+});
+
+test("archiving preserves an existing peer and either endpoint's writer can still disconnect", async () => {
+	seed("source");
+	seed("target");
+	await expect(
+		core.mutateCommunication("source", actor, { kind: "connect", targetNarratorId: "target" }),
+	).resolves.toEqual({ changed: true });
+	const peer = sqlite
+		.query<{ id: string }, []>("SELECT id FROM narrator_communication_peers")
+		.get();
+	if (!peer) throw new Error("Missing live peer");
+	db.update(narrators).set({ status: "archived" }).where(eq(narrators.id, "target")).run();
+	await expect(
+		core.mutateCommunication("source", actor, { kind: "connect", targetNarratorId: "target" }),
+	).rejects.toMatchObject({ code: "COMMUNICATION_DENIED" });
+	expect(sqlite.query("SELECT id FROM narrator_communication_peers").all()).toEqual([peer]);
+	await expect(
+		core.mutateCommunication("target", actor, { kind: "disconnect", peerId: peer.id }),
+	).resolves.toEqual({ changed: true });
+	expect(sqlite.query("SELECT id FROM narrator_communication_peers").all()).toEqual([]);
+});
+
 test.each([
 	"acl",
 	"role",

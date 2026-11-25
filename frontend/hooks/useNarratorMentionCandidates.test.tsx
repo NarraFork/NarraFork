@@ -45,6 +45,19 @@ function seed(...items: PersistedRecentTab[]) {
 }
 const candidateIds = () => result.candidates.map(({ id }) => id);
 const signIn = (token: string, user: string) => confirmAuthUser(setToken(token), user);
+const eligible = (id: string): CommunicationCandidates => ({
+	items: [
+		{
+			id,
+			title: "Server title",
+			status: "idle",
+			isRecent: true,
+			lastActivityAt: null,
+			canConnect: true,
+		},
+	],
+	hasMore: false,
+});
 
 beforeEach(() => {
 	const { window } = parseHTML("<html><body></body></html>");
@@ -212,4 +225,64 @@ test("access changes immediately hide local pages and cancel old remote search; 
 	expect(candidateIds()).toEqual([]);
 	await act(async () => seed(recent("still-visible")));
 	expect(candidateIds()).toEqual(["still-visible"]);
+});
+
+test("only a selection checks an unknown candidate, and an eligible search hit is reusable", async () => {
+	seed(recent("local"));
+	search.mockImplementation(async (_source, _query, options) =>
+		eligible(options?.targetId ?? "remote"),
+	);
+	await render();
+	expect(result.candidates.find(({ id }) => id === "local")?.canConnect).toBeUndefined();
+	expect(search).toHaveBeenCalledTimes(1);
+	const activate = mock();
+	await act(async () => result.verifyCandidate("remote", activate));
+	expect(activate).toHaveBeenLastCalledWith(
+		expect.objectContaining({ id: "remote", canConnect: true }),
+	);
+	expect(search).toHaveBeenCalledTimes(1);
+	await act(async () => result.verifyCandidate("local", activate));
+	expect(search).toHaveBeenCalledTimes(2);
+	expect(search.mock.calls[1]).toEqual([
+		"source",
+		"",
+		{ targetId: "local", signal: expect.any(AbortSignal) },
+	]);
+	expect(activate).toHaveBeenLastCalledWith(
+		expect.objectContaining({ id: "local", title: "local", canConnect: true }),
+	);
+});
+
+test.each([
+	"account round trip",
+	"access revoked",
+	"changed source",
+	"changed query",
+] as const)("a late exact result cannot activate across %s", async (boundary) => {
+	seed(recent("target"));
+	const pending = Promise.withResolvers<CommunicationCandidates>();
+	search.mockImplementation(async (_source, _query, options) =>
+		options?.targetId ? pending.promise : { items: [], hasMore: false },
+	);
+	await render();
+	const activate = mock();
+	await act(async () => result.verifyCandidate("target", activate));
+	expect(result.verification).toEqual({ targetId: "target", status: "checking" });
+	const signal = search.mock.calls[1][2]?.signal;
+	if (boundary === "account round trip") {
+		await act(async () => {
+			signIn("credential-b", "user-b");
+			signIn("credential-a", "user-a");
+			seed(recent("target"));
+		});
+	} else if (boundary === "access revoked") {
+		await act(async () => onAccess({ type: "narrator_access_changed", narratorId: "target" }));
+		await act(async () => seed(recent("target"))); // Still readable, not known writable.
+	} else if (boundary === "changed source") await render("", "another-source");
+	else await render("tar");
+	expect(signal?.aborted).toBe(true);
+	await act(async () => pending.resolve(eligible("target")));
+	expect(activate).not.toHaveBeenCalled();
+	expect(result.verification).toBeUndefined();
+	expect(result.candidates.find(({ id }) => id === "target")?.canConnect).toBeUndefined();
 });

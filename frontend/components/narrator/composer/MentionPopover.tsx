@@ -15,6 +15,7 @@ import {
 } from "@shared/narrator-handle";
 import { type RefObject, useCallback, useEffect, useId, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import type { CandidateVerificationStatus } from "../../../hooks/useNarratorMentionCandidates";
 import { Z } from "../../../lib/z-index";
 import { composerPopoverOffset, useComposerPopoverSide } from "./composer-popover-placement";
 
@@ -33,6 +34,7 @@ interface MentionPopoverProps {
 	visible: boolean;
 	loading?: boolean;
 	error?: boolean;
+	verification?: CandidateVerificationStatus;
 	anchorRef?: RefObject<HTMLElement | null>;
 	onSelect: (candidate: MentionCandidate) => void;
 	onClose: () => void;
@@ -61,6 +63,7 @@ export function MentionPopover({
 	visible,
 	loading = false,
 	error = false,
+	verification,
 	anchorRef,
 	onSelect,
 	onClose,
@@ -70,6 +73,7 @@ export function MentionPopover({
 	const [selectedId, setSelectedId] = useState<string | null>(null);
 	const listRef = useRef<HTMLDivElement>(null);
 	const listId = useId();
+	const checking = verification === "checking";
 	// The unified reader already filters local rows and bounds the merged page.
 	const selected = candidates.find((c) => c.id === selectedId) ?? candidates[0];
 	const optionId = useCallback((id: string) => `${listId}-${encodeURIComponent(id)}`, [listId]);
@@ -115,7 +119,7 @@ export function MentionPopover({
 			if (event.key === "ArrowDown" || event.key === "ArrowUp") {
 				event.preventDefault();
 				event.stopPropagation();
-				if (!candidates.length) return;
+				if (checking || !candidates.length) return;
 				const index = candidates.findIndex((c) => c.id === selected?.id);
 				setSelectedId(
 					candidates[
@@ -126,14 +130,14 @@ export function MentionPopover({
 				// Empty/loading/error states still own confirmation; never leak Enter into send.
 				event.preventDefault();
 				event.stopPropagation();
-				if (selected && selected.canConnect !== false) onSelect(selected);
+				if (!checking && selected && selected.canConnect !== false) onSelect(selected);
 			} else if (event.key === "Escape") {
 				event.preventDefault();
 				event.stopPropagation();
 				onClose();
 			}
 		},
-		[visible, anchorRef, candidates, selected, onSelect, onClose],
+		[visible, anchorRef, candidates, selected, checking, onSelect, onClose],
 	);
 	useEffect(() => {
 		if (!visible) return;
@@ -159,7 +163,12 @@ export function MentionPopover({
 				zIndex: Z.dropdown,
 			}}
 		>
-			<Box id={listId} role="listbox" aria-label={t("mentionPopoverTitle")} aria-busy={loading}>
+			<Box
+				id={listId}
+				role="listbox"
+				aria-label={t("mentionPopoverTitle")}
+				aria-busy={loading || checking}
+			>
 				{candidates.map((candidate, index) => (
 					<Box key={candidate.id}>
 						{(index === 0 || candidates[index - 1].isRecent !== candidate.isRecent) && (
@@ -171,14 +180,16 @@ export function MentionPopover({
 							id={optionId(candidate.id)}
 							role="option"
 							aria-selected={selected?.id === candidate.id}
-							aria-disabled={candidate.canConnect === false}
+							aria-disabled={checking || candidate.canConnect === false}
 							data-mention-item
 							onPointerDown={(event) => event.preventDefault()}
 							onMouseDown={(event) => event.preventDefault()}
 							onClick={() => {
-								if (candidate.canConnect !== false) onSelect(candidate);
+								if (!checking && candidate.canConnect !== false) onSelect(candidate);
 							}}
-							onMouseEnter={() => setSelectedId(candidate.id)}
+							onMouseEnter={() => {
+								if (!checking) setSelectedId(candidate.id);
+							}}
 							style={{
 								display: "flex",
 								width: "100%",
@@ -203,6 +214,11 @@ export function MentionPopover({
 										</Text>
 									)}
 								</Box>
+								{candidate.canConnect === undefined && (
+									<Text size="xs" c="dimmed">
+										{t("mentionVerifyRequired")}
+									</Text>
+								)}
 								{candidate.status && candidate.status !== "idle" && (
 									<Badge size="xs" variant="light" color="blue">
 										{t(`status_${candidate.status}`, candidate.status)}
@@ -213,7 +229,18 @@ export function MentionPopover({
 					</Box>
 				))}
 			</Box>
-			{(loading || error || !candidates.length) && (
+			{verification && (
+				<Text role={checking ? "status" : "alert"} size="xs" px={10} py={6}>
+					{t(
+						checking
+							? "mentionVerifyChecking"
+							: verification === "denied"
+								? "mentionVerifyDenied"
+								: "mentionVerifyError",
+					)}
+				</Text>
+			)}
+			{!verification && (loading || error || !candidates.length) && (
 				<Text role="status" size="xs" c="dimmed" px={10} py={6}>
 					{t(loading ? "mentionSearching" : error ? "mentionSearchError" : "mentionNoResults")}
 				</Text>

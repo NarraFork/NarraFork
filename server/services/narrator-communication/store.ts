@@ -2,6 +2,7 @@ import { COMMUNICATION_LIMITS, canonicalCommunicationPair } from "@shared/narrat
 import { and, eq, or, sql } from "drizzle-orm";
 import type { db } from "../../db";
 import {
+	narrators,
 	narratorCommunicationNodes as nodes,
 	narratorCommunicationPeers as peers,
 } from "../../db/schema";
@@ -108,6 +109,20 @@ export function assertCommunicationReachableTx(
 }
 export const assertReachableTx = assertCommunicationReachableTx;
 
+/** Live connection admission is narrower than access for managing historical peers. */
+export function assertLiveCommunicationEndpointTx(
+	tx: Pick<CommunicationExecutor, "select">,
+	id: string,
+): void {
+	const endpoint = tx
+		.select({ status: narrators.status })
+		.from(narrators)
+		.where(eq(narrators.id, id))
+		.limit(1)
+		.get();
+	if (!endpoint || endpoint.status === "archived") communicationDenied();
+}
+
 export function insertCommunicationPeerTx(
 	tx: CommunicationExecutor,
 	source: string,
@@ -120,7 +135,9 @@ export function insertCommunicationPeerTx(
 		now?: string;
 	},
 ): boolean {
+	assertLiveCommunicationEndpointTx(tx, source);
 	if (source === target) return false;
+	assertLiveCommunicationEndpointTx(tx, target);
 	// Invalid forests must not masquerade as same-group. Their exact peer can still be managed.
 	if (communicationRootTx(tx, source) === communicationRootTx(tx, target)) return false;
 	const [endpointLo, endpointHi] = canonicalCommunicationPair(source, target);

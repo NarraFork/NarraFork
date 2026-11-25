@@ -1028,14 +1028,32 @@ function ConnectDialog({
 	const [query, setQuery] = useState("");
 	const [selected, setSelected] = useState<string | null>(null);
 	const [composing, setComposing] = useState(false);
-	const { candidates, loading, error, hasMore } = useNarratorMentionCandidates(
-		sourceId,
-		query,
-		live,
-	);
-	const valid = candidates.find(
-		(node) => node.id === selected && node.canConnect && !node.connected && !node.sameGroup,
-	);
+	const [alreadyRelated, setAlreadyRelated] = useState<"sameGroup" | "connected">();
+	const { candidates, loading, error, hasMore, verification, verifyCandidate, cancelVerification } =
+		useNarratorMentionCandidates(sourceId, query, live);
+	const checking = verification?.status === "checking";
+	const connectionRejection = (candidate: (typeof candidates)[number]) =>
+		candidate.sameGroup
+			? "sameGroup"
+			: candidate.connected
+				? "connected"
+				: candidate.canConnect === false
+					? "readonly"
+					: undefined;
+	const valid = candidates.find((node) => node.id === selected && !connectionRejection(node));
+	const confirm = () => {
+		if (!valid || !live || composing || checking) return;
+		setAlreadyRelated(undefined);
+		verifyCandidate(valid.id, (eligible) => {
+			if (eligible.sameGroup || eligible.connected) {
+				setAlreadyRelated(eligible.sameGroup ? "sameGroup" : "connected");
+			} else onConnect(eligible.id);
+		});
+	};
+	const close = () => {
+		cancelVerification();
+		onClose();
+	};
 	const recent = candidates.filter((node) => node.isRecent);
 	const more = candidates.filter((node) => !node.isRecent);
 	return (
@@ -1047,9 +1065,11 @@ function ConnectDialog({
 				aria-modal="true"
 				aria-label={t("communicationConnect")}
 				onKeyDown={(event) => {
+					if (composing || event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229)
+						return;
 					if (event.key === "Escape") {
 						event.stopPropagation();
-						onClose();
+						close();
 					}
 					if (
 						event.key === "Enter" &&
@@ -1057,14 +1077,16 @@ function ConnectDialog({
 							event.target.getAttribute("role") === "option")
 					) {
 						event.preventDefault();
-						if (!composing && !event.nativeEvent.isComposing && valid && live) onConnect(valid.id);
+						confirm();
 					}
 					if (event.key === "ArrowDown" || event.key === "ArrowUp") {
 						event.preventDefault();
+						if (checking) return;
 						const index = candidates.findIndex((node) => node.id === selected);
 						const next =
 							(index + (event.key === "ArrowDown" ? 1 : -1) + candidates.length) %
 							candidates.length;
+						setAlreadyRelated(undefined);
 						setSelected(candidates[next]?.id ?? null);
 					}
 				}}
@@ -1075,7 +1097,7 @@ function ConnectDialog({
 						size={44}
 						variant="subtle"
 						aria-label={t("communicationClose")}
-						onClick={onClose}
+						onClick={close}
 					>
 						<IconX size={18} />
 					</ActionIcon>
@@ -1086,11 +1108,24 @@ function ConnectDialog({
 					placeholder={t("communicationSearch")}
 					aria-label={t("communicationSearch")}
 					value={query}
-					onChange={(event) => setQuery(event.currentTarget.value)}
-					onCompositionStart={() => setComposing(true)}
+					onChange={(event) => {
+						cancelVerification();
+						setSelected(null);
+						setAlreadyRelated(undefined);
+						setQuery(event.currentTarget.value);
+					}}
+					onCompositionStart={() => {
+						cancelVerification();
+						setComposing(true);
+					}}
 					onCompositionEnd={() => setComposing(false)}
 				/>
-				<div className={styles.candidates} role="listbox" aria-label={t("communicationCandidates")}>
+				<div
+					className={styles.candidates}
+					role="listbox"
+					aria-label={t("communicationCandidates")}
+					aria-busy={loading || checking}
+				>
 					{(
 						[
 							["mentionRecentSessions", recent],
@@ -1102,52 +1137,47 @@ function ConnectDialog({
 								<section key={String(key)}>
 									<small>{t(String(key))}</small>
 									{items.map((candidate) => {
-										const item = candidates.find((node) => node.id === candidate.id);
-										const disabled = !item?.canConnect || item.connected || item.sameGroup;
+										const rejection = connectionRejection(candidate);
 										return (
 											<button
 												type="button"
 												key={candidate.id}
 												role="option"
 												aria-selected={selected === candidate.id}
-												disabled={disabled}
+												disabled={checking || !!rejection}
 												className={styles.candidate}
-												onClick={() => setSelected(candidate.id)}
+												onClick={() => {
+													setAlreadyRelated(undefined);
+													setSelected(candidate.id);
+												}}
 											>
 												<span>{candidate.title || t("communicationUntitled")}</span>
-												{disabled && (
-													<small>
-														{t(
-															item?.sameGroup
-																? "communicationReject_sameGroup"
-																: item?.connected
-																	? "communicationReject_connected"
-																	: "communicationReject_readonly",
-														)}
-													</small>
-												)}
+												{rejection ? (
+													<small>{t(`communicationReject_${rejection}`)}</small>
+												) : candidate.canConnect === undefined ? (
+													<small>{t("mentionVerifyRequired")}</small>
+												) : null}
 											</button>
 										);
 									})}
 								</section>
 							),
 					)}
-					{loading && <p role="status">{t("mentionSearching")}</p>}
-					{error && <p role="alert">{t("mentionSearchError")}</p>}
+					{alreadyRelated && <p role="alert">{t(`communicationReject_${alreadyRelated}`)}</p>}
+					{checking && <p role="status">{t("mentionVerifyChecking")}</p>}
+					{verification?.status === "denied" && <p role="alert">{t("mentionVerifyDenied")}</p>}
+					{verification?.status === "error" && <p role="alert">{t("mentionVerifyError")}</p>}
+					{!verification && loading && <p role="status">{t("mentionSearching")}</p>}
+					{!verification && error && <p role="alert">{t("mentionSearchError")}</p>}
 					{!loading && !candidates.length && <p>{t("mentionNoResults")}</p>}
 					{hasMore && <small>{t("communicationMoreSearch")}</small>}
 				</div>
 				<p className={styles.explanation}>{t("communicationExactPeer")}</p>
 				<div className={styles.confirmActions}>
-					<Button variant="default" onClick={onClose}>
+					<Button variant="default" onClick={close}>
 						{t("communicationCancel")}
 					</Button>
-					<Button
-						disabled={!valid || !live}
-						onClick={() => {
-							if (valid) onConnect(valid.id);
-						}}
-					>
+					<Button disabled={!valid || !live || composing || checking} onClick={confirm}>
 						{t("communicationConnect")}
 					</Button>
 				</div>

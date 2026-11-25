@@ -7,12 +7,18 @@ import { foldHandle } from "@shared/narrator-handle";
 import type { PersistedRecentTab } from "@shared/recent-tabs";
 import { recentTabLiveNarratorId } from "./recent-tabs-utils";
 
+// A loaded recent tab proves visibility, not write eligibility for this source. A missing
+// candidate in the bounded search page must stay unknown, not become false (or true).
+export type NarratorMentionCandidate = Omit<CommunicationCandidate, "canConnect"> & {
+	canConnect?: boolean;
+};
+
 /** Flat recent-tab pages include members of collapsed folders; never use visual row order. */
 export function localNarratorMentionCandidates(
 	tabs: readonly PersistedRecentTab[],
 	sourceId: string | undefined,
-): CommunicationCandidate[] {
-	const byId = new Map<string, { item: CommunicationCandidate; fromTeam: boolean }>();
+): NarratorMentionCandidate[] {
+	const byId = new Map<string, { item: NarratorMentionCandidate; fromTeam: boolean }>();
 	for (const tab of tabs) {
 		const id = recentTabLiveNarratorId(tab);
 		if (!id || id === sourceId) continue;
@@ -41,7 +47,6 @@ export function localNarratorMentionCandidates(
 				status: tab.status ?? "idle",
 				lastActivityAt: previousTime > time ? previousTime : time,
 				isRecent: true,
-				canConnect: true,
 			},
 		});
 	}
@@ -49,11 +54,11 @@ export function localNarratorMentionCandidates(
 }
 
 export function mergeNarratorMentionCandidates(
-	local: readonly CommunicationCandidate[],
+	local: readonly NarratorMentionCandidate[],
 	remote: readonly CommunicationCandidate[],
 	query: string,
 	sourceId?: string,
-): CommunicationCandidate[] {
+): NarratorMentionCandidate[] {
 	const byId = new Map(local.map((item) => [item.id, item]));
 	const remoteMatches = new Set<string>();
 	for (const item of remote) {

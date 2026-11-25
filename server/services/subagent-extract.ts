@@ -40,6 +40,7 @@ import {
 } from "./narrator-block-sync";
 import { bodyColumns, fillBodies } from "./narrator-body-reads";
 import { insertEnvelope, insertEnvelopeQueued } from "./narrator-body-writes";
+import { ensureCommunicationNodeTx } from "./narrator-communication/store";
 import {
 	claimNextRefSeq,
 	initializeRefSeqFloor,
@@ -336,6 +337,7 @@ export async function extractSubagentToPrimary(
 						})
 						.returning()
 						.get();
+					ensureCommunicationNodeTx(tx, id, null);
 
 					if (inheritMode === "full") {
 						for (const msg of orderedSourceMessages) {

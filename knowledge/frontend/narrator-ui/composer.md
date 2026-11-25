@@ -54,7 +54,7 @@ keywords:
   - QueuedMessagesPanel
   - PendingAgentMessagesPanel
 status: draft
-verified_at: fac3988333435e3fc3b5a4a6ace226c72ce14745
+verified_at: 52a564b2489f924b2a125974a710237252114925
 ---
 # 输入框与交互
 
@@ -84,6 +84,8 @@ verified_at: fac3988333435e3fc3b5a4a6ace226c72ce14745
 - Enter 归属（`interaction/enter-ownership.ts`）：输入框、按钮、链接、菜单、对话框、终端等自己的 Enter 不被面板级快捷键（等待中的权限、Enter 回到输入框）抢走；权限按钮条例外（`data-perm-button-bar`）。
 - 会话引用是绑定稳定 `narratorId` 的 `narratorReference` 文档 atom。RecentTabs 拖入与 @ 选择共用插入事务，贯通草稿、历史、队列编辑、undo 与失败恢复；无需 handle。规范文本投影使用带精确 ID 的 agent 链接，即使同名或动态名单截断，模型输入也保留本次选择的身份。内部文档 MIME 可保留引用，普通文本/HTML 不会升级为引用或连接授权；插入草稿本身不建立联系，只有服务端接受（accepted）该次消息提交时才将引用端点建连；拒绝或仅编辑草稿、队列、历史不建连。
 - @ 候选先筛当前账号查询作用域内已加载的 recentTabs，再以 250ms leading/trailing throttle 搜索服务器；最近会话优先、组内活动时间降序，按 ID 去重和保持键盘选中。账号/token/访问代际/查询/源会话变化立即使旧请求失效；本地归属不依赖逐对象 Symbol 或公开字段 proof，合法改名/副标题/运行态 patch 不会抹掉本地候选。远端只返回授权后的有界 top-N 与 hasMore，提示缩小搜索范围，不维护无消费者的游标翻页。
+- RecentTabs 可读不代表可连接。本地候选保持可见但权限未知；未验证候选选择、直接拖入引用和手动连接通过同一候选 API 的精确 `targetId` 查询确认当前源/目标资格，不把目标缺席 top-N 当作拒绝。已验证的远端 @ 候选不重复查询；异步确认期间不改稿，编辑、选区、焦点或作用域变化取消旧结果，成功后才在原书签位置插入。最终消息准入仍由服务端复核。
+- 内部语义剪贴板只携带附件元数据，不携带文件。粘贴只复用目标草稿中元数据匹配且资源可解析的附件；缺失或冲突附件降为预算内文件名文本，不覆盖现有资源绑定，并独立保留其他语义引用。降级后没有可插入内容时不提交空替换，保留原选区与撤销历史。
 - 每个发送快照有 `clientSubmissionId`；结果未知时保存 ID、时间与摘要并先查 receipt，不保存正文/凭据到这份对账记录。相关 ID 和有界元数据 SHA256 不依赖安全上下文限定的 randomUUID/subtle，因此局域网 HTTP 也能首发和对账；不全局伪造 secure API，附件大文件摘要仍由服务端 Worker 处理。仅明确未接收且仍在七天窗口内才以同 ID 重试；过期必须显式作为新消息发送，已接受的提交不因重新点击而再发送。队列/历史编辑不自动新增或解除联系。
 - `PendingAgentMessagesPanel`：显示其他 Agent 发给本会话、尚未被任何一轮读取的消息，用户选择恢复或丢弃（失败/被停止的会话不会被 Agent 消息自动重启）。`interaction/use-pending-agent-messages.ts` 保留服务端的 `running/blockedReason` 为权威；收 `agent_inbox_changed`、连接建立与控制面恢复时读快照，`status_change` 仅在运行/非运行边界、不同非运行终态或缺少基线时读，`working ↔ waiting` 不反复拉取。刷新先取消旧快照，合并同批通知并为读中发生的新变化补尾读；没有周期性收件箱 timer。
 - 没有会话写权限的查看者（`NarratorPanel` 从 ui-summary 得到 `canWrite: false`）看不到可编辑的输入框：`NarratorInteractionArea` 的 `readOnly` 把输入行换成一条只读提示（`composerReadOnly`；`NarratorPanel` 的 `readOnlyNotice` 可换掉这句，团队页传「你是只读成员」）。服务端 `POST /narrators/:id/messages` 本来就要求写权限；团队页中间栏嵌的是同一个面板。状态栏模型选择器的「默认（模型）」经 `lib/follow-model-label.ts:followDefaultLabel`，没配置默认模型时显示未配置文案。

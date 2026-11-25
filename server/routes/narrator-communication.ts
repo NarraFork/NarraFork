@@ -16,6 +16,7 @@ const mutationSchema = z.discriminatedUnion("kind", [
 const querySchema = z.strictObject({
 	q: z.string().max(COMMUNICATION_LIMITS.searchQueryChars).optional(),
 	limit: z.coerce.number().int().min(1).max(COMMUNICATION_LIMITS.searchMaxLimit).optional(),
+	targetId: id.optional(),
 });
 const searches = new Map<string, { at: number; count: number }>();
 function admitSearch(userId: string): void {
@@ -82,6 +83,7 @@ export function registerNarratorCommunicationRoutes(
 					query: query.data.q,
 					limit: query.data.limit,
 					signal: c.req.raw.signal,
+					...(query.data.targetId !== undefined && { targetId: query.data.targetId }),
 				},
 			),
 		);

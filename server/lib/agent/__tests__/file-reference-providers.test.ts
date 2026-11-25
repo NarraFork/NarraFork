@@ -35,6 +35,7 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "providers") {
 		db,
 		sqlite,
 		activeDatabaseBackend: "sqlite",
+		postgresRuntime: null,
 		databaseMaintenance: createSqliteMaintenance(() => sqlite),
 	}));
 	const { buildHistory } = await import("../index");

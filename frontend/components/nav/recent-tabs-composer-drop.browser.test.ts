@@ -2,7 +2,10 @@ import { afterAll, beforeAll, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { basename } from "node:path";
 import { fileURLToPath } from "node:url";
-import puppeteer, { type Browser, type Page } from "puppeteer-core";
+import type { CommunicationCandidates } from "@shared/narrator-communication";
+import type { RuntimeSettings } from "@shared/settings-runtime";
+import puppeteer, { type Browser, type HTTPRequest, type Page } from "puppeteer-core";
+import type { UIPreferences } from "../../lib/api/settings";
 import type * as Fixture from "./recent-tabs-composer-drop.browser-fixture";
 
 type FixtureWindow = Window & { fixture: typeof Fixture };
@@ -12,6 +15,30 @@ const executablePath =
 let browser: Browser | undefined;
 let server: ReturnType<typeof Bun.serve> | undefined;
 const errors = new WeakMap<Page, string[]>();
+const candidateRequests = new WeakMap<Page, Array<string | null>>();
+const candidatesPath = "/api/narrators/fixture-narrator/communication/candidates";
+const allowedDrops = [
+	{ key: "narrator:recent-session", narratorId: "recent-session", label: "Recent session" },
+	{ key: "subagent:subagent-tab-id", narratorId: "stable-subagent-id", label: "Worker session" },
+	{ key: "subagent:legacy-child", narratorId: "legacy-child", label: "Legacy worker" },
+];
+const candidates = new Map(
+	[
+		...allowedDrops.map(({ narratorId, label }) => ({ narratorId, label, canConnect: true })),
+		{ narratorId: "read-only-session", label: "Read-only session", canConnect: false },
+	].map(({ narratorId, label, canConnect }) => [narratorId, { label, canConnect }]),
+);
+let heldExact: { id: string; release(): void; promise: Promise<void> } | undefined;
+
+function holdExact(id: string) {
+	const { promise, resolve } = Promise.withResolvers<void>();
+	const release = () => {
+		if (heldExact?.release === release) heldExact = undefined;
+		resolve();
+	};
+	heldExact = { id, release, promise };
+	return release;
+}
 
 beforeAll(async () => {
 	if (!existsSync(executablePath)) throw new Error(`Chromium unavailable: ${executablePath}`);
@@ -35,8 +62,46 @@ beforeAll(async () => {
 		hostname: "127.0.0.1",
 		port: 0,
 		async fetch(request) {
-			const path = new URL(request.url).pathname;
-			if (path.endsWith("/panel-state")) {
+			const url = new URL(request.url);
+			const path = url.pathname;
+			if (path === candidatesPath && request.method === "GET") {
+				const id = url.searchParams.get("targetId");
+				const candidate = id && candidates.get(id);
+				const held = heldExact;
+				if (held?.id === id) await held.promise;
+				return Response.json({
+					items:
+						id && candidate
+							? [
+									{
+										id,
+										title: candidate.label,
+										status: "idle",
+										lastActivityAt: null,
+										isRecent: true,
+										canConnect: candidate.canConnect,
+									},
+								]
+							: [],
+					hasMore: false,
+				} satisfies CommunicationCandidates);
+			}
+			if (path === "/api/settings/runtime") {
+				return Response.json({
+					revision: 1,
+					agent: { defaultModel: "", summaryModel: "" },
+					outline: { enabled: false },
+					requestEvidence: { autoPin: "off" },
+					summaryModelAvailable: false,
+				} satisfies RuntimeSettings);
+			}
+			if (path === "/api/auth/me") {
+				return Response.json({ id: "fixture-user" });
+			}
+			if (path === "/api/user-preferences/ui") {
+				return Response.json({ appearancePreferences: {} } satisfies Partial<UIPreferences>);
+			}
+			if (path === "/api/narrators/fixture-narrator/panel-state") {
 				return Response.json({
 					permissions: [],
 					buffer: [],
@@ -82,6 +147,7 @@ beforeAll(async () => {
 }, 60_000);
 
 afterAll(async () => {
+	heldExact?.release();
 	try {
 		await browser?.close();
 	} finally {
@@ -95,16 +161,41 @@ async function open() {
 	page.setDefaultTimeout(5000);
 	await page.setViewport({ width: 1000, height: 700 });
 	const captured: string[] = [];
+	const targets: Array<string | null> = [];
 	errors.set(page, captured);
+	candidateRequests.set(page, targets);
 	page.on("pageerror", (error) => captured.push(String(error)));
-	const hydrated = page.waitForResponse(
-		(response) =>
-			response.url().endsWith("/draft") && response.request().method() === "GET" && response.ok(),
-	);
-	await page.goto(server.url.origin);
-	await hydrated;
-	await page.waitForFunction(() => (window as unknown as FixtureWindow).fixture?.ready());
-	return page;
+	page.on("request", (request) => {
+		const url = new URL(request.url());
+		if (url.pathname === candidatesPath) targets.push(url.searchParams.get("targetId"));
+	});
+	try {
+		// Empty draft metadata is authoritative; the composer does not fetch the draft body.
+		await Promise.all([
+			page.waitForResponse(
+				(response) =>
+					response.url().endsWith("/fixture-narrator/panel-state") &&
+					response.request().method() === "GET" &&
+					response.ok(),
+			),
+			page.goto(server.url.origin),
+		]);
+		await page.waitForFunction(() => {
+			const editor = document.querySelector<HTMLElement>('[role="textbox"]');
+			return (
+				(window as unknown as FixtureWindow).fixture?.ready() &&
+				editor?.isContentEditable &&
+				editor.getAttribute("aria-disabled") !== "true"
+			);
+		});
+		return page;
+	} catch (error) {
+		await page.close();
+		if (!captured.length) throw error;
+		throw new Error(`Composer drop fixture did not initialize: ${captured.join("; ")}`, {
+			cause: error,
+		});
+	}
 }
 async function snapshot(page: Page) {
 	return page.evaluate(() => (window as unknown as FixtureWindow).fixture.snapshot());
@@ -121,22 +212,58 @@ async function beginDrag(page: Page, key: string) {
 	expect((await snapshot(page)).sorting).toBe(true);
 	return { x: x + 10, y };
 }
-async function overComposer(page: Page) {
+async function overComposer(page: Page, textOffset?: number) {
+	if (textOffset !== undefined) {
+		const { x, y } = await page.evaluate(
+			(offset) => (window as unknown as FixtureWindow).fixture.composerDropPoint(offset),
+			textOffset,
+		);
+		await page.mouse.move(x, y, { steps: 5 });
+		return;
+	}
 	const editor = await page.waitForSelector('[role="textbox"]');
 	const box = await editor?.boundingBox();
 	if (!box) throw new Error("Missing composer hit rectangle");
 	await page.mouse.move(box.x + Math.min(40, box.width / 2), box.y + box.height / 2, { steps: 5 });
+}
+function isExact(request: HTTPRequest, id: string) {
+	const url = new URL(request.url());
+	return (
+		request.method() === "GET" &&
+		url.pathname === candidatesPath &&
+		url.searchParams.get("q") === "" &&
+		url.searchParams.get("targetId") === id
+	);
+}
+async function releaseDrag(page: Page, id: string) {
+	const [request] = await Promise.all([
+		page.waitForRequest((request) => isExact(request, id)),
+		page.mouse.up(),
+	]);
+	return request;
+}
+async function waitForNarratorReference(page: Page) {
+	await page.waitForFunction(() =>
+		(window as unknown as FixtureWindow).fixture
+			.snapshot()
+			.document?.paragraphs.some((paragraph) =>
+				paragraph.children.some((node) => node.type === "narratorReference"),
+			),
+	);
+}
+async function writeDraft(page: Page) {
+	await page.click('[role="textbox"]');
+	await page.keyboard.type("LEFTtail");
+	const state = await snapshot(page);
+	expect(state.document?.paragraphs[0]?.children).toEqual([{ type: "text", text: "LEFTtail" }]);
+	return state;
 }
 async function close(page: Page) {
 	await page.close();
 	expect(errors.get(page)).toEqual([]);
 }
 
-for (const { key, narratorId, label } of [
-	{ key: "narrator:recent-session", narratorId: "recent-session", label: "Recent session" },
-	{ key: "subagent:subagent-tab-id", narratorId: "stable-subagent-id", label: "Worker session" },
-	{ key: "subagent:legacy-child", narratorId: "legacy-child", label: "Legacy worker" },
-]) {
+for (const { key, narratorId, label } of allowedDrops) {
 	test(`real MouseSensor → RecentTabs bridge → composer inserts ${key} once`, async () => {
 		const page = await open();
 		try {
@@ -146,20 +273,15 @@ for (const { key, narratorId, label } of [
 				id: narratorId,
 				subjectKind: "narrator",
 			});
-			await page.mouse.up();
-			await page.waitForFunction(() =>
-				(window as unknown as FixtureWindow).fixture
-					.snapshot()
-					.document?.paragraphs.some((paragraph) =>
-						paragraph.children.some((node) => node.type === "narratorReference"),
-					),
-			);
+			await releaseDrag(page, narratorId);
+			await waitForNarratorReference(page);
 			const state = await snapshot(page);
 			const references = state.document?.paragraphs
 				.flatMap((paragraph) => paragraph.children)
 				.filter((node) => node.type === "narratorReference");
 			expect(references).toHaveLength(1);
 			expect(references?.[0]).toMatchObject({ narratorId, label });
+			expect(candidateRequests.get(page)).toEqual([narratorId]);
 			expect(state.fallbacks).toEqual([]);
 			expect(state.moves).toEqual([]);
 			expect(state.drag).toBeNull();
@@ -170,6 +292,79 @@ for (const { key, narratorId, label } of [
 		}
 	});
 }
+
+test("a readable but not connectable recent tab leaves the original draft intact", async () => {
+	const page = await open();
+	try {
+		const initial = await writeDraft(page);
+		await beginDrag(page, "narrator:read-only-session");
+		await overComposer(page, 4);
+		await releaseDrag(page, "read-only-session");
+		await page.waitForFunction(() =>
+			(window as unknown as FixtureWindow).fixture
+				.snapshot()
+				.notices.includes("This session cannot be connected from the current session."),
+		);
+		const state = await snapshot(page);
+		expect(state.document).toEqual(initial.document);
+		expect(state.text).toBe(initial.text);
+		expect(state.fallbacks).toEqual([]);
+		expect(state.moves).toEqual([]);
+		expect(state.nativeDrops).toBe(0);
+		expect(candidateRequests.get(page)).toEqual(["read-only-session"]);
+	} finally {
+		await close(page);
+	}
+});
+
+test("delayed exact verification inserts once at the original mouse drop point", async () => {
+	const page = await open();
+	const release = holdExact("recent-session");
+	try {
+		const initial = await writeDraft(page);
+		await beginDrag(page, "narrator:recent-session");
+		await overComposer(page, 4);
+		await releaseDrag(page, "recent-session");
+		expect((await snapshot(page)).document).toEqual(initial.document);
+		release();
+		await waitForNarratorReference(page);
+		const state = await snapshot(page);
+		expect(state.document?.paragraphs[0]?.children).toEqual([
+			{ type: "text", text: "LEFT" },
+			expect.objectContaining({ type: "narratorReference", narratorId: "recent-session" }),
+			{ type: "text", text: " tail" },
+		]);
+		expect(candidateRequests.get(page)).toEqual(["recent-session"]);
+	} finally {
+		release();
+		await close(page);
+	}
+});
+
+test("changing focus cancels the pending exact drop without modifying the draft", async () => {
+	const page = await open();
+	const release = holdExact("recent-session");
+	try {
+		const initial = await writeDraft(page);
+		await beginDrag(page, "narrator:recent-session");
+		await overComposer(page, 4);
+		const pending = await releaseDrag(page, "recent-session");
+		expect((await snapshot(page)).document).toEqual(initial.document);
+		// The MouseSensor's source may still have focus: click a different focusable row.
+		await page.click('[data-tab-sort-id="project:project-id"]');
+		// The server is still holding the response, so only cancellation can settle the request.
+		await page.waitForNetworkIdle({ idleTime: 1, timeout: 2000 });
+		expect(pending.failure()?.errorText).toBe("net::ERR_ABORTED");
+		release();
+		const state = await snapshot(page);
+		expect(state.document).toEqual(initial.document);
+		expect(state.notices).toEqual([]);
+		expect(candidateRequests.get(page)).toEqual(["recent-session"]);
+	} finally {
+		release();
+		await close(page);
+	}
+});
 
 for (const key of ["project:project-id", "folder:folder-id"]) {
 	test(`real ${key} drag never becomes a composer narrator reference`, async () => {
@@ -183,6 +378,7 @@ for (const key of ["project:project-id", "folder:folder-id"]) {
 			const state = await snapshot(page);
 			expect(state.document).toEqual(initial.document);
 			expect(state.text).toBe(initial.text);
+			expect(candidateRequests.get(page)).toEqual([]);
 			expect(state.fallbacks).toEqual([]);
 			expect(state.moves).toEqual([]);
 			expect(state.sorting).toBe(false);
@@ -202,6 +398,7 @@ test("real in-sidebar no-op release cannot reach the composer or dock fallback",
 		const state = await snapshot(page);
 		expect(state.document).toEqual(initial.document);
 		expect(state.text).toBe(initial.text);
+		expect(candidateRequests.get(page)).toEqual([]);
 		expect(state.fallbacks).toEqual([]);
 		expect(state.moves).toEqual([]);
 		expect(state.drag).toBeNull();

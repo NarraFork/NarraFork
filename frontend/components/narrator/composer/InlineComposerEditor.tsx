@@ -8,7 +8,9 @@ import type {
 } from "@shared/composer-document";
 import {
 	composerNarratorReferenceText,
+	legacyComposerDocumentText,
 	MAX_COMPOSER_DOCUMENT_BYTES,
+	MAX_COMPOSER_DOCUMENT_TEXT,
 	parseComposerDocument,
 } from "@shared/composer-document";
 import type { FileReference } from "@shared/file-reference";
@@ -270,32 +272,60 @@ function clipboardText(slice: Slice, assets: ReadonlyMap<string, ComposerAsset>)
 	});
 }
 
-/** Copying creates new atom identities, never another occurrence of the same editor node. */
+/** Re-key occurrences without letting clipboard metadata create or modify any resource binding. */
 function rekeyClipboardDocument(
 	document: ComposerDocument,
 	knownAssets: ReadonlyMap<string, ComposerAsset>,
+	resources: InlineComposerEditorProps["resources"],
+	includeFilenames = true,
 ): ComposerDocument {
-	// Existing resource identities may be reused, but clipboard metadata cannot overwrite them.
-	const assetIds = new Map(
-		document.assets.map((asset) => [
-			asset.id,
-			knownAssets.has(asset.id) &&
-			JSON.stringify(knownAssets.get(asset.id)) !== JSON.stringify(asset)
-				? composerNodeId()
-				: asset.id,
-		]),
-	);
+	const available: ComposerAsset[] = [];
+	const unavailable = new Map<string, string>();
+	for (const asset of document.assets) {
+		const known = knownAssets.get(asset.id);
+		const resource = resources?.get(asset.id);
+		if (
+			known &&
+			known.kind === asset.kind &&
+			known.name === asset.name &&
+			known.size === asset.size &&
+			known.mimeType === asset.mimeType &&
+			resource &&
+			// Message edits also expose already-bound server resources as strings, not Files.
+			(typeof resource === "string" ||
+				(resource.name === asset.name &&
+					resource.size === asset.size &&
+					resource.type === asset.mimeType &&
+					((asset.kind !== "audio" && asset.kind !== "video") ||
+						resource.type.startsWith(`${asset.kind}/`))))
+		) {
+			available.push(known);
+		} else {
+			unavailable.set(asset.id, asset.name);
+		}
+	}
+	// A repeated attachment can expand into far more text than the source budget allows.
+	let remainingText =
+		includeFilenames && unavailable.size
+			? MAX_COMPOSER_DOCUMENT_TEXT - legacyComposerDocumentText(document).text.length
+			: 0;
 	return {
 		...document,
-		assets: document.assets.map((asset) => ({ ...asset, id: assetIds.get(asset.id) ?? asset.id })),
+		assets: available,
 		paragraphs: document.paragraphs.map((paragraph) => ({
 			children: paragraph.children.map((node): ComposerInlineNode => {
 				if (node.type === "text" || node.type === "break") return node;
+				if (node.type === "attachment") {
+					const name = unavailable.get(node.assetId);
+					if (name !== undefined) {
+						const text = name.length <= remainingText ? name : "";
+						remainingText -= text.length;
+						return { type: "text", text };
+					}
+				}
 				const id = composerNodeId();
 				if (node.type === "fileReference")
 					return { ...node, id, reference: { ...node.reference, id: composerNodeId() } };
-				if (node.type === "attachment")
-					return { ...node, id, assetId: assetIds.get(node.assetId) ?? node.assetId };
 				return { ...node, id };
 			}),
 		})),
@@ -750,23 +780,36 @@ export const InlineComposerEditor = forwardRef<
 				const semantic = event.clipboardData?.getData(COMPOSER_CLIPBOARD_MIME);
 				if (semantic && semantic.length <= MAX_COMPOSER_DOCUMENT_BYTES) {
 					try {
-						const document = rekeyClipboardDocument(
-							parseComposerDocument(JSON.parse(semantic)),
-							assetsRef.current,
-						);
-						const assets = new Map(assetsRef.current);
-						for (const asset of document.assets) assets.set(asset.id, asset);
-						const doc = view.state.schema.nodeFromJSON(composerDocumentToEditorJSON(document));
-						const transaction = closeHistory(view.state.tr)
-							.replaceSelection(new Slice(doc.content, 1, 1))
-							.scrollIntoView();
-						// Validate the resulting whole document before allocating metadata or dispatching.
-						parseComposerDocument(readEditorDocument(transaction.doc, assets));
-						assetsRef.current = assets;
+						const source = parseComposerDocument(JSON.parse(semantic));
+						const resources = propsRef.current.resources;
+						const document = rekeyClipboardDocument(source, assetsRef.current, resources);
+						const buildTransaction = (insert: ComposerDocument) => {
+							const doc = view.state.schema.nodeFromJSON(composerDocumentToEditorJSON(insert));
+							const slice = new Slice(doc.content, 1, 1);
+							// A fully degraded paste is a no-op, not a deletion of the selection.
+							if (slice.size <= 0) return;
+							const transaction = closeHistory(view.state.tr)
+								.replaceSelection(slice)
+								.scrollIntoView();
+							// All pasted resources are already bound; validate the whole document before dispatch.
+							parseComposerDocument(readEditorDocument(transaction.doc, assetsRef.current));
+							return transaction;
+						};
+						let transaction: ReturnType<typeof buildTransaction>;
+						try {
+							transaction = buildTransaction(document);
+						} catch (error) {
+							if (document.assets.length === source.assets.length) throw error;
+							// If filenames exhausted the target's budget, keep the remaining semantics.
+							transaction = buildTransaction(
+								rekeyClipboardDocument(source, assetsRef.current, resources, false),
+							);
+						}
 						event.preventDefault();
-						view.dispatch(transaction);
-						view.dispatch(closeHistory(view.state.tr));
-						setAssetGeneration((generation) => generation + 1);
+						if (transaction) {
+							view.dispatch(transaction);
+							view.dispatch(closeHistory(view.state.tr));
+						}
 						return true;
 					} catch {
 						// Invalid/custom editor JSON never grants reference authority; fall back to text.

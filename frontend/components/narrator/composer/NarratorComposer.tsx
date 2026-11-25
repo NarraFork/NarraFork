@@ -41,7 +41,11 @@ import { listenComposerAppend } from "../../../lib/composer-append-queue";
 import { useFullscreenEscape } from "../../../lib/fullscreen-escape";
 import { formatLocaleNumber } from "../../../lib/intl-format";
 import { shouldFallbackPanelState } from "../../../lib/narrator-panel-state";
-import { PANEL_DROP_PRIORITY, registerPanelDropTarget } from "../../../lib/panel-drag";
+import {
+	PANEL_DROP_PRIORITY,
+	type PanelDragState,
+	registerPanelDropTarget,
+} from "../../../lib/panel-drag";
 import { Z } from "../../../lib/z-index";
 import { useImageViewer } from "../../common/image-viewer-context";
 import { useNarratorDockContext } from "../dock/NarratorDockContext";
@@ -78,7 +82,11 @@ import {
 	rememberFileReference,
 	sameFileReferenceInput,
 } from "./file-reference-input";
-import { InlineComposerEditor, type InlineComposerEditorHandle } from "./InlineComposerEditor";
+import {
+	InlineComposerEditor,
+	type InlineComposerEditorHandle,
+	type InlineComposerTextContext,
+} from "./InlineComposerEditor";
 import { getMentionQuery, type MentionCandidate, MentionPopover } from "./MentionPopover";
 import classes from "./NarratorComposer.module.css";
 import {
@@ -99,6 +107,28 @@ import { type QuoteCandidate, useQuoteCandidate } from "./use-quote-candidate";
 
 const INPUT_DRAFT_SYNC_DEBOUNCE_MS = 800;
 const EMPTY_FILES: File[] = [];
+
+function sameTextContext(a: InlineComposerTextContext | null, b: InlineComposerTextContext | null) {
+	return a?.text === b?.text && a?.start === b?.start && a?.end === b?.end && a?.caret === b?.caret;
+}
+
+// A native selection may move before ProseMirror consumes selectionchange.
+function captureNativeSelectionCheck(doc: Document) {
+	const selection = doc.getSelection();
+	const anchor = selection?.anchorNode;
+	const anchorOffset = selection?.anchorOffset;
+	const focus = selection?.focusNode;
+	const focusOffset = selection?.focusOffset;
+	return () => {
+		const current = doc.getSelection();
+		return (
+			current?.anchorNode === anchor &&
+			current?.anchorOffset === anchorOffset &&
+			current?.focusNode === focus &&
+			current?.focusOffset === focusOffset
+		);
+	};
+}
 
 function createDraftSourceId(): string {
 	return (
@@ -1497,26 +1527,9 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		// === Authored narrator references (ordinary @text is never promoted) =========
 		const composerVisible = useEditorPanelVisible();
 		const [mentionCaret, setMentionCaret] = useState<number | null>(null);
-		const [queryContext, setQueryContext] =
-			useState<ReturnType<InlineComposerEditorHandle["getTextContext"]>>(null);
-		const handleComposerSelection = useCallback((selection: { start: number; end: number }) => {
-			const input = editorRef.current?.getElement();
-			if (!input?.contains(input.ownerDocument.activeElement)) {
-				setMentionCaret(null);
-				setQueryContext(null);
-				return;
-			}
-			setMentionCaret(selection.start);
-			const next = editorRef.current?.getTextContext() ?? null;
-			setQueryContext((current) =>
-				current?.text === next?.text &&
-				current?.start === next?.start &&
-				current?.end === next?.end &&
-				current?.caret === next?.caret
-					? current
-					: next,
-			);
-		}, []);
+		const [queryContext, setQueryContext] = useState<InlineComposerTextContext | null>(null);
+		const mentionContextRef = useRef<InlineComposerTextContext | null>(null);
+		const mentionComposing = useRef(false);
 		const mentionQuery = useMemo(() => {
 			if (mentionCaret === null || !queryContext) return null;
 			// Atom boundaries must never be joined into a mention token.
@@ -1533,7 +1546,47 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			candidates: mentionCandidates,
 			loading: mentionLoading,
 			error: mentionError,
-		} = useNarratorMentionCandidates(narratorId, mentionQuery, mentionPopoverVisible);
+			verification: mentionVerification,
+			verifyCandidate: verifyMentionCandidate,
+			verifyExactCandidate,
+			cancelVerification: cancelMentionVerification,
+		} = useNarratorMentionCandidates(
+			narratorId,
+			mentionQuery,
+			mentionPopoverVisible,
+			composerVisible && !draft,
+		);
+		const handleComposerSelection = useCallback(
+			(selection: { start: number; end: number }) => {
+				const input = editorRef.current?.getElement();
+				const focused = input?.contains(input.ownerDocument.activeElement);
+				const next = focused ? (editorRef.current?.getTextContext() ?? null) : null;
+				if (!sameTextContext(mentionContextRef.current, next)) {
+					mentionContextRef.current = next;
+					cancelMentionVerification();
+					setQueryContext(next);
+				}
+				setMentionCaret(focused ? selection.start : null);
+			},
+			[cancelMentionVerification],
+		);
+		useEffect(() => {
+			if (!editorElement) return;
+			const start = () => {
+				mentionComposing.current = true;
+				cancelMentionVerification();
+			};
+			const end = () => {
+				mentionComposing.current = false;
+			};
+			editorElement.addEventListener("compositionstart", start, true);
+			editorElement.addEventListener("compositionend", end, true);
+			return () => {
+				editorElement.removeEventListener("compositionstart", start, true);
+				editorElement.removeEventListener("compositionend", end, true);
+				end();
+			};
+		}, [editorElement, cancelMentionVerification]);
 		const insertNarratorReference = useCallback(
 			(candidate: MentionCandidate) => {
 				if (candidate.id === narratorId || candidate.canConnect === false) return;
@@ -1553,6 +1606,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					},
 					{ type: "text", text: " " },
 				]);
+				mentionContextRef.current = null;
 				setMentionCaret(null);
 				setQueryContext(null);
 			},
@@ -1560,15 +1614,128 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		);
 		const handleMentionSelect = useCallback(
 			(candidate: MentionCandidate) => {
-				if (!queryContext || mentionCaret === null) return;
+				const editor = editorRef.current;
+				const input = editor?.getElement();
+				if (
+					!editor ||
+					!input?.contains(input.ownerDocument.activeElement) ||
+					!queryContext ||
+					mentionComposing.current ||
+					sendingRef.current ||
+					!sameTextContext(queryContext, editor.getTextContext())
+				)
+					return;
 				const at = queryContext.text
 					.slice(0, queryContext.caret - queryContext.start)
 					.lastIndexOf("@");
 				if (at < 0) return;
-				editorRef.current?.setSelection(queryContext.start + at, queryContext.caret);
-				insertNarratorReference(candidate);
+				const stillSelected = captureNativeSelectionCheck(input.ownerDocument);
+				verifyMentionCandidate(candidate.id, (eligible) => {
+					// Leave the token and caret untouched until authorized.
+					if (
+						editorRef.current?.getElement() !== input ||
+						!input.contains(input.ownerDocument.activeElement) ||
+						mentionComposing.current ||
+						sendingRef.current ||
+						!input.ownerDocument.hasFocus() ||
+						!stillSelected() ||
+						!sameTextContext(queryContext, editor.getTextContext())
+					)
+						return;
+					editor.setSelection(queryContext.start + at, queryContext.caret);
+					insertNarratorReference(eligible);
+				});
 			},
-			[queryContext, mentionCaret, insertNarratorReference],
+			[queryContext, sendingRef, verifyMentionCandidate, insertNarratorReference],
+		);
+		const handleNarratorDrop = useCallback(
+			(hit: PanelDragState) => {
+				if (sendingRef.current || mentionComposing.current || hit.id === narratorId) return;
+				const editor = editorRef.current;
+				const input = editor?.getElement();
+				if (!editor || !input) return;
+				cancelMentionVerification();
+				// Capture the precise drop point without moving the original selection while
+				// permissions are pending (or at all if the target is rejected).
+				const previous = editor.captureSelectionBookmark();
+				if (!editor.setSelectionAtPoint(hit.x, hit.y)) {
+					previous.cancel();
+					return;
+				}
+				const droppedAt = editor.captureSelectionBookmark();
+				if (!previous.restore()) {
+					droppedAt.cancel();
+					return;
+				}
+				const doc = input.ownerDocument;
+				const view = doc.defaultView;
+				const focusedBefore = doc.activeElement;
+				const stillSelected = captureNativeSelectionCheck(doc);
+				const onKey = (event: KeyboardEvent) => {
+					if (event.isComposing || event.keyCode === 229) return;
+					if (event.key === "Escape") cancelMentionVerification();
+					if (
+						event.key === "Enter" &&
+						!event.shiftKey &&
+						(event.target as Node | null)?.nodeType &&
+						input.contains(event.target as Node)
+					) {
+						event.preventDefault();
+						event.stopPropagation();
+					}
+				};
+				const stopWatching = () => {
+					doc.removeEventListener("focusin", cancelMentionVerification, true);
+					doc.removeEventListener("keydown", onKey, true);
+					view?.removeEventListener("blur", cancelMentionVerification);
+				};
+				const discard = () => {
+					stopWatching();
+					droppedAt.cancel();
+				};
+				const signal = verifyExactCandidate(
+					hit.id,
+					(eligible) => {
+						stopWatching();
+						if (
+							editorRef.current?.getElement() !== input ||
+							doc.activeElement !== focusedBefore ||
+							!doc.hasFocus() ||
+							!stillSelected() ||
+							mentionComposing.current ||
+							sendingRef.current
+						) {
+							droppedAt.cancel();
+							return;
+						}
+						if (droppedAt.restore())
+							insertNarratorReference({ ...eligible, title: hit.title || eligible.title });
+					},
+					(status) => {
+						discard();
+						notifications.show({
+							color: "red",
+							message: t(status === "denied" ? "mentionVerifyDenied" : "mentionVerifyError"),
+						});
+					},
+				);
+				if (!signal) {
+					droppedAt.cancel();
+					return;
+				}
+				signal.addEventListener("abort", discard, { once: true });
+				doc.addEventListener("focusin", cancelMentionVerification, true);
+				doc.addEventListener("keydown", onKey, true);
+				view?.addEventListener("blur", cancelMentionVerification);
+			},
+			[
+				narratorId,
+				sendingRef,
+				cancelMentionVerification,
+				verifyExactCandidate,
+				insertNarratorReference,
+				t,
+			],
 		);
 		useEffect(
 			() =>
@@ -1589,15 +1756,14 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 							? state
 							: null;
 					},
-					onDrop: (_state, hit) => {
-						if (sendingRef.current || hit.id === narratorId) return;
-						if (!editorRef.current?.setSelectionAtPoint(hit.x, hit.y)) return;
-						insertNarratorReference({ id: hit.id, title: hit.title });
-					},
+					onDrop: (_state, hit) => handleNarratorDrop(hit),
 				}),
-			[narratorId, dropTargetId, composerVisible, draft, sendingRef, insertNarratorReference],
+			[narratorId, dropTargetId, composerVisible, draft, handleNarratorDrop],
 		);
-		const closeMentionPopover = useCallback(() => setMentionCaret(null), []);
+		const closeMentionPopover = useCallback(() => {
+			cancelMentionVerification();
+			setMentionCaret(null);
+		}, [cancelMentionVerification]);
 
 		const [dismissedFileQuery, setDismissedFileQuery] = useState<string | null>(null);
 		const fileQuery = useMemo(() => {
@@ -2041,6 +2207,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					visible={mentionPopoverVisible}
 					loading={mentionLoading}
 					error={mentionError}
+					verification={mentionVerification?.status}
 					onSelect={handleMentionSelect}
 					onClose={closeMentionPopover}
 				/>
@@ -2128,7 +2295,10 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					value={document}
 					adaptive={adaptive && !fullscreenOpened}
 					leadingControls={controls}
-					onChange={applyDocument}
+					onChange={(next) => {
+						cancelMentionVerification();
+						applyDocument(next);
+					}}
 					resources={resources}
 					attachmentsHydrating={attachmentsHydrating}
 					attachmentsRestoreFailed={attachmentsRestoreFailed}
@@ -2137,6 +2307,9 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					onSelectionChange={handleComposerSelection}
 					onFocus={() => setEditorFocused(true)}
 					onBlur={() => {
+						cancelMentionVerification();
+						mentionContextRef.current = null;
+						mentionComposing.current = false;
 						setEditorFocused(false);
 						setMentionCaret(null);
 						setQueryContext(null);

@@ -125,8 +125,11 @@ test("invalid wire scopes are rejected before creating subscriptions; revoked se
 			scope: { kind: "all" },
 		}),
 	);
-	await settle(() => frames.length === 1);
-	expect(frames[0].type).toBe("error");
+	// The shared socket also emits legitimate startup projection frames.
+	await settle(() =>
+		frames.some((frame) => frame.type === "error" && frame.message === "Invalid message format"),
+	);
+	expect(frames).toContainEqual({ type: "error", message: "Invalid message format" });
 	expect(communicationSubscriptionStats().total).toBe(0);
 	wsHandlers.message(
 		ws,

@@ -221,6 +221,35 @@ describe("user submission acceptance", () => {
 		await enqueue(document());
 		expect(db.select().from(peers).all()).toHaveLength(0);
 	});
+	test.each([
+		["same", source],
+		["same", target],
+		["different", source],
+		["different", target],
+	] as const)("typed references to %s-group endpoints fail atomically after archiving %s", async (group, endpoint) => {
+		if (group === "same")
+			db.update(nodes).set({ parentNarratorId: source }).where(eq(nodes.narratorId, target)).run();
+		const { prepareUserCommunicationAdmission } = await import("../narrator-communication/service");
+		await expect(
+			prepareUserCommunicationAdmission({
+				sourceNarratorId: source,
+				userId: owner,
+				targetNarratorIds: [target],
+			}),
+		).resolves.toMatchObject({ targetNarratorIds: [target] });
+		db.update(narrators).set({ status: "archived" }).where(eq(narrators.id, endpoint)).run();
+		await expect(enqueue(document())).rejects.toMatchObject({ code: "COMMUNICATION_DENIED" });
+		expect(db.select().from(peers).all()).toEqual([]);
+		expect(await readUserSubmission(source, owner, "submission-one")).toBeUndefined();
+		expect(db.select().from(mailbox).all()).toEqual([]);
+		expect(
+			db
+				.select({ sequence: narrators.inboxSequence })
+				.from(narrators)
+				.where(eq(narrators.id, source))
+				.get()?.sequence,
+		).toBe(0);
+	});
 	test("cancelled receipt retains fingerprint; old submission cannot resurrect it or peer", async () => {
 		const first = await enqueue(document());
 		const row = db.select().from(mailbox).where(eq(mailbox.id, first.id)).get();

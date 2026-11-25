@@ -214,6 +214,9 @@ export function hydrating(value: boolean) {
 export function resources(entries: [string, string][]) {
 	updateResources(new Map(entries));
 }
+export function fileResource(asset: ComposerAsset, content: string) {
+	updateResources(new Map([[asset.id, new File([content], asset.name, { type: asset.mimeType })]]));
+}
 const trackedURLs = new Set<string>();
 const revokedURLs = new Set<string>();
 export async function fileImageResource() {

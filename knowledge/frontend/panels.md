@@ -12,7 +12,7 @@ anchors:
   - frontend/components/narrator/communication/topology-model.ts
   - frontend/components/narrator/communication/use-topology-gestures.ts
   - frontend/components/narrator/communication/topology-fixture-data.ts
-  - frontend/components/narrator/communication/topology-fixture-server.ts
+  - frontend/components/narrator/communication/topology-server.browser-fixture.ts
   - frontend/components/narrator/communication/topology.browser-fixture.tsx
   - frontend/hooks/useCommunicationTopology.ts
   - frontend/lib/communication-subscription.ts

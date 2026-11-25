@@ -448,14 +448,23 @@ export function clear() {
 	composer.current?.clearTextAndDraft();
 }
 export async function mentionCandidates(
-	candidates: { id: string; handle?: string; title?: string; isRecent?: boolean }[],
+	candidates: {
+		id: string;
+		handle?: string;
+		title?: string;
+		isRecent?: boolean;
+		readOnly?: boolean;
+		outsideSearchPage?: boolean;
+		verificationFails?: boolean;
+	}[],
 	holdRemote = false,
+	holdExact = false,
 ) {
 	// Keep the communication reader on the real HTTP stack, independently of loaded recent tabs.
 	const response = await fetch("/__fixture/mention-candidates", {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({ candidates, holdRemote }),
+		body: JSON.stringify({ candidates, holdRemote, holdExact }),
 	});
 	if (!response.ok) throw new Error("Unable to seed mention candidates");
 	const scope = getRecentTabsScope();

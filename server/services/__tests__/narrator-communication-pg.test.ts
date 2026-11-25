@@ -10,6 +10,7 @@ import {
 	assertUserCommunicationAdmissionPg,
 	type CommunicationPgTx,
 	commitUserCommunicationAdmissionPg,
+	communicationCandidateSearchGuardPg,
 	withCommunicationPgTransaction,
 } from "../narrator-communication/postgres";
 
@@ -171,6 +172,55 @@ test("PG peer admission writes a fresh relation ID when the same endpoints recon
 	expect(second).not.toBeNull();
 	expect(second?.id).not.toBe(first?.id);
 });
+test.each([
+	["same", "source"],
+	["same", "target"],
+	["different", "source"],
+	["different", "target"],
+] as const)("PG SQL rejects a %s-group admission after %s archives, before examining topology", async (group, endpoint) => {
+	grant("target");
+	if (group === "different")
+		sqlite.run(
+			"UPDATE narrator_communication_nodes SET parent_narrator_id=NULL WHERE narrator_id='target'",
+		);
+	const prepared = { sourceNarratorId: "source", userId: "writer", targetNarratorIds: ["target"] };
+	await assertUserCommunicationAdmissionPg(adapter(sqlite), prepared);
+	sqlite.run("UPDATE narrators SET status='archived' WHERE id=?", [endpoint]);
+	const queries: string[] = [];
+	await expect(
+		commitUserCommunicationAdmissionPg(
+			adapter(sqlite, (sql) => queries.push(sql)),
+			prepared,
+			{ admissionId: "stale" },
+		),
+	).rejects.toMatchObject({ code: "COMMUNICATION_DENIED" });
+	expect(queries.filter((sql) => sql.startsWith("SELECT n.id FROM narrators n"))).toHaveLength(
+		endpoint === "source" ? 1 : 2,
+	);
+	expect(
+		queries
+			.filter((sql) => sql.startsWith("SELECT n.id FROM narrators n"))
+			.every((sql) => sql.includes("n.status <> 'archived'") && sql.endsWith("FOR SHARE")),
+	).toBe(true);
+	expect(queries.some((sql) => sql.includes("narrator_communication_"))).toBe(false);
+	expect(sqlite.query("SELECT id FROM narrator_communication_peers").all()).toEqual([]);
+});
+
+test.each([
+	"source",
+	"target",
+] as const)("PG exact candidate guard rereads persisted status of %s", async (endpoint) => {
+	grant("target");
+	const tx = adapter(sqlite);
+	await expect(
+		communicationCandidateSearchGuardPg(tx, "source", "writer", "target"),
+	).resolves.toMatchObject({ backend: "postgres" });
+	sqlite.run("UPDATE narrators SET status='archived' WHERE id=?", [endpoint]);
+	await expect(
+		communicationCandidateSearchGuardPg(tx, "source", "writer", "target"),
+	).rejects.toMatchObject({ code: "COMMUNICATION_DENIED" });
+});
+
 test("PG serializable helper retries whole sections on 40001 with a bounded four attempts", async () => {
 	let attempts = 0;
 	const error = Object.assign(new Error("serialization failure"), { code: "40001" });

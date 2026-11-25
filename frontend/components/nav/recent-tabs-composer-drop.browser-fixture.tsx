@@ -1,4 +1,5 @@
 import { DndContext, useDraggable } from "@dnd-kit/core";
+import { notificationsStore } from "@mantine/notifications";
 import { QueryClient } from "@tanstack/react-query";
 import { useEffect, useRef } from "react";
 import { createRoot } from "react-dom/client";
@@ -20,6 +21,7 @@ const tabs: RecentTab[] = [
 		lastVisitedAt: 1,
 	},
 	{ type: "subagent", id: "legacy-child", title: "Legacy worker", lastVisitedAt: 1 },
+	{ type: "narrator", id: "read-only-session", title: "Read-only session", lastVisitedAt: 1 },
 	{ type: "project", id: "project-id", title: "Project", lastVisitedAt: 1 },
 	{ type: "folder", id: "folder-id", title: "Folder", lastVisitedAt: 1 },
 ];
@@ -104,9 +106,19 @@ createRoot(document.getElementById("sidebar") as HTMLElement).render(<Sidebar />
 export function ready() {
 	return mounted && composer.ready();
 }
+export function composerDropPoint(offset: number) {
+	const text = document.querySelector('[role="textbox"] p')?.firstChild;
+	if (!(text instanceof Text)) throw new Error("Missing drop-point text");
+	const range = document.createRange();
+	range.setStart(text, offset);
+	range.collapse(true);
+	const rect = range.getBoundingClientRect();
+	return { x: rect.left, y: rect.top + rect.height / 2 };
+}
 export function snapshot() {
 	return {
 		...composer.snapshot(),
+		notices: notificationsStore.getState().notifications.map((notice) => notice.message),
 		drag: getPanelDrag(),
 		sorting: dragging?.current ?? false,
 		nativeDrops,

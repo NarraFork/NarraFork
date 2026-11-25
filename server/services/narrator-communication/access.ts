@@ -14,6 +14,7 @@ import {
 } from "./predicates";
 import {
 	assertCommunicationReachableTx,
+	assertLiveCommunicationEndpointTx,
 	type CommunicationExecutor,
 	communicationDenied,
 } from "./store";
@@ -135,7 +136,12 @@ export function originalCommunicationDelegator(row: {
 export async function communicationCandidateSearchGuard(
 	sourceNarratorId: string,
 	principal: NarratorPrincipal,
-	options: { signal?: AbortSignal; deadlineAt: number; backend?: "sqlite" | "postgres" },
+	options: {
+		signal?: AbortSignal;
+		deadlineAt: number;
+		backend?: "sqlite" | "postgres";
+		liveTargetId?: string;
+	},
 ): Promise<{
 	sql: string;
 	params: Array<string | number | null>;
@@ -154,12 +160,21 @@ export async function communicationCandidateSearchGuard(
 			"./postgres"
 		);
 		return withCommunicationPgTransaction(postgresRuntime.client.db, (tx) =>
-			communicationCandidateSearchGuardPg(tx, sourceNarratorId, principal.userId),
+			communicationCandidateSearchGuardPg(
+				tx,
+				sourceNarratorId,
+				principal.userId,
+				options.liveTargetId,
+			),
 		);
 	}
 	return db.transaction((tx) => {
 		const viewer = currentCommunicationPrincipalTx(tx, principal.userId);
 		assertCommunicationAccessTx(tx, sourceNarratorId, viewer, "write");
+		if (options.liveTargetId !== undefined) {
+			assertLiveCommunicationEndpointTx(tx, sourceNarratorId);
+			assertLiveCommunicationEndpointTx(tx, options.liveTargetId);
+		}
 		const [row] = tx.all<{ ownerUserId: string | null; registration: unknown }>(
 			sql`SELECT owner_user_id AS ownerUserId, runtime_registration_json AS registration FROM narrators WHERE id = ${sourceNarratorId} LIMIT 1`,
 		);

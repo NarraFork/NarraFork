@@ -1,5 +1,5 @@
 /** Standalone, loopback-only interactive fixture. No NarraFork service or database is opened.
- * bun frontend/components/narrator/communication/topology-fixture-server.ts
+ * bun frontend/components/narrator/communication/topology-server.browser-fixture.ts
  * http://127.0.0.1:41738/?width=360&height=820&lang=zh-CN&team=1&readonly=1
  */
 import { basename } from "node:path";

@@ -53,12 +53,17 @@ async function principal(tx: CommunicationPgTx, userId: string): Promise<Narrato
 	if (!row) deny();
 	return { userId: String(row.id), isAdmin: row.role === "admin" };
 }
-async function write(tx: CommunicationPgTx, id: string, actor: NarratorPrincipal): Promise<void> {
+async function write(
+	tx: CommunicationPgTx,
+	id: string,
+	actor: NarratorPrincipal,
+	liveEndpoint = false,
+): Promise<void> {
 	if (
 		!(
 			await rows(
 				tx,
-				sql`SELECT n.id FROM narrators n WHERE n.id = ${id} AND ${actor.isAdmin ? sql`1=1` : bindPlaceholders(communicationWritableText("n"), actor.userId)} FOR SHARE`,
+				sql`SELECT n.id FROM narrators n WHERE n.id = ${id} ${liveEndpoint ? sql`AND n.status <> 'archived'` : sql``} AND ${actor.isAdmin ? sql`1=1` : bindPlaceholders(communicationWritableText("n"), actor.userId)} FOR SHARE`,
 			)
 		).length
 	)
@@ -152,10 +157,21 @@ export async function communicationCandidateSearchGuardPg(
 	tx: CommunicationPgTx,
 	source: string,
 	userId: string,
+	liveTargetId?: string,
 ) {
 	const viewer = await principal(tx, userId);
 	await write(tx, source, viewer);
-	const actor = await executionActor(tx, source);
+	const actor = await executionActor(tx, source); // Also locks and checks the source is live.
+	if (
+		liveTargetId !== undefined &&
+		!(
+			await rows(
+				tx,
+				sql`SELECT id FROM narrators WHERE id = ${liveTargetId} AND status <> 'archived' FOR SHARE`,
+			)
+		).length
+	)
+		deny();
 	const predicate = communicationWritePredicate("n", actor);
 	const viewerWrite =
 		viewer.userId === actor.userId
@@ -206,10 +222,11 @@ export async function commitUserCommunicationAdmissionPg(
 	);
 	if (targets.length > COMMUNICATION_LIMITS.maxReferences) deny();
 	const actor = await principal(tx, prepared.userId);
-	await write(tx, prepared.sourceNarratorId, actor);
+	// Read and lock live statuses in the existing endpoint ACL queries before any no-op.
+	await write(tx, prepared.sourceNarratorId, actor, targets.length > 0);
 	const dirty = new Set<string>();
 	for (const target of targets) {
-		await write(tx, target, actor);
+		await write(tx, target, actor, true);
 		if ((await root(tx, prepared.sourceNarratorId)) === (await root(tx, target))) continue;
 		const [lo, hi] = canonicalCommunicationPair(prepared.sourceNarratorId, target);
 		const inserted = await rows(

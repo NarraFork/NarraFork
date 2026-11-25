@@ -26,6 +26,8 @@ if (hotOnce("narrafork.communicationAccessEpoch.listener"))
 		if (
 			event.type === "auth:changed" ||
 			event.type === "narrator:execution_principal_changed" ||
+			event.type === "narrator:deleted" ||
+			(event.type === "narrator:status_changed" && event.status === "archived") ||
 			event.type.endsWith(":access_changed") ||
 			event.type === "trait-layer:changed" ||
 			event.type.startsWith("integration:")
@@ -42,6 +44,7 @@ export interface CommunicationCandidateSearchOptions {
 	query?: string;
 	limit?: number;
 	signal?: AbortSignal;
+	targetId?: string;
 }
 
 /** Trusted SQL only: aliases n (candidate) and source, with bound ? parameters. */
@@ -57,7 +60,12 @@ export interface CommunicationCandidateSearchPredicate {
 export type CommunicationCandidateSearchGuard = (
 	sourceNarratorId: string,
 	principal: CommunicationCandidatePrincipal,
-	options: { signal?: AbortSignal; deadlineAt: number; backend: "sqlite" | "postgres" },
+	options: {
+		signal?: AbortSignal;
+		deadlineAt: number;
+		backend: "sqlite" | "postgres";
+		liveTargetId?: string;
+	},
 ) => Promise<CommunicationCandidateSearchPredicate>;
 
 const MAX_ID_CHARS = 128;
@@ -82,11 +90,11 @@ function validId(value: unknown): value is string {
 function buildQuery(
 	source: string,
 	principal: CommunicationCandidatePrincipal,
-	query: string,
-	limit: number,
+	{ query, limit, targetId }: { query: string; limit: number; targetId?: string },
 	guard: CommunicationCandidateSearchPredicate,
 	backend: "sqlite" | "postgres",
 ): { sql: string; params: Array<string | number | null> } {
+	const exact = targetId !== undefined;
 	const parentReadable = communicationReadPredicate("parent", principal);
 	const params: Array<string | number | null> = [
 		source,
@@ -113,7 +121,10 @@ function buildQuery(
 	}
 	clauses.push(`(${guard.sql})`);
 	params.push(...guard.params);
-	if (query) {
+	if (exact) {
+		clauses.push("n.id = ?");
+		params.push(targetId);
+	} else if (query) {
 		// Search the entire authorized scope, including one- and two-character CJK.
 		// There is deliberately no recent-N preselection or FTS minimum-length gate.
 		const pattern = `%${query.toLowerCase().replace(/[\\%_]/g, (ch) => `\\${ch}`)}%`;
@@ -129,7 +140,8 @@ function buildQuery(
 			params.push(pattern, pattern, query);
 		}
 	}
-	params.push(limit + 1);
+	params.push(exact ? limit : limit + 1);
+	const ordering = exact ? "" : "ORDER BY is_recent DESC, last_activity_at DESC, id DESC ";
 	return {
 		sql: `WITH RECURSIVE source_ancestors(id,parent,depth) AS (
  SELECT narrator_id,parent_narrator_id,1 FROM narrator_communication_nodes WHERE narrator_id=?
@@ -154,7 +166,7 @@ function buildQuery(
 			WHERE ${clauses.join(" AND ")}
 		)
 		SELECT id, title, handle, status, last_activity_at, is_recent, parent_title, same_group, connected FROM eligible
-		ORDER BY is_recent DESC, last_activity_at DESC, id DESC LIMIT ?`,
+		${ordering}LIMIT ?`,
 		params,
 	};
 }
@@ -181,8 +193,10 @@ export function createCommunicationCandidateSearcher(dependencies: {
 		principal: CommunicationCandidatePrincipal,
 		options: CommunicationCandidateSearchOptions = {},
 	): Promise<CommunicationCandidates> => {
+		const { targetId } = options;
 		if (
 			!validId(sourceNarratorId) ||
+			(targetId !== undefined && !validId(targetId)) ||
 			!validId(principal?.userId) ||
 			typeof principal.isAdmin !== "boolean" ||
 			(options.query !== undefined &&
@@ -191,11 +205,14 @@ export function createCommunicationCandidateSearcher(dependencies: {
 			(options.limit !== undefined && (!Number.isInteger(options.limit) || options.limit < 1))
 		)
 			invalidInput();
-		const query = (options.query ?? "").normalize("NFC").trim();
-		const limit = Math.min(
-			options.limit ?? COMMUNICATION_LIMITS.searchDefaultLimit,
-			COMMUNICATION_LIMITS.searchMaxLimit,
-		);
+		const exact = targetId !== undefined;
+		const query = exact ? "" : (options.query ?? "").normalize("NFC").trim();
+		const limit = exact
+			? 1
+			: Math.min(
+					options.limit ?? COMMUNICATION_LIMITS.searchDefaultLimit,
+					COMMUNICATION_LIMITS.searchMaxLimit,
+				);
 		if (options.signal?.aborted)
 			throw new AppError("Search was cancelled", 499, "SEARCH_QUERY_CANCELLED");
 		if (outstanding >= SEARCH_MAX_OUTSTANDING)
@@ -232,8 +249,7 @@ export function createCommunicationCandidateSearcher(dependencies: {
 					const statement = buildQuery(
 						sourceNarratorId,
 						{ ...principal, isAdmin: guard.viewerIsAdmin ?? principal.isAdmin },
-						query,
-						limit,
+						{ query, limit, targetId },
 						guard,
 						guard.backend ?? dependencies.backend ?? "sqlite",
 					);
@@ -246,6 +262,8 @@ export function createCommunicationCandidateSearcher(dependencies: {
 						signal: controller.signal,
 						deadlineAt: startedAt + timeoutMs,
 						backend: dependencies.backend ?? "sqlite",
+						// A cascade can commit the target's archive before its status event is emitted.
+						liveTargetId: rows.length ? targetId : undefined,
 					});
 					controller.signal.throwIfAborted();
 					if (

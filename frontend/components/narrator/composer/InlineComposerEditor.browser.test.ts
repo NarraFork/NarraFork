@@ -2,8 +2,15 @@ import { afterAll, beforeAll, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { basename } from "node:path";
 import { fileURLToPath } from "node:url";
-import { type ComposerDocument, composerNarratorReferenceText } from "@shared/composer-document";
+import {
+	type ComposerDocument,
+	composerNarratorReferenceText,
+	legacyComposerDocumentText,
+	MAX_COMPOSER_DOCUMENT_TEXT,
+} from "@shared/composer-document";
 import puppeteer, { type Browser, type Page } from "puppeteer-core";
+import { snapshotComposerFiles } from "../interaction/use-narrator-send";
+import { setComposerAssetId } from "./draft-image-attachments";
 import type * as Fixture from "./InlineComposerEditor.browser-fixture";
 
 type FixtureWindow = Window & { fixture: typeof Fixture };
@@ -140,7 +147,11 @@ async function focusedEditor(page: Page) {
 			document.hasFocus() && document.activeElement === document.querySelector('[role="textbox"]'),
 	);
 }
-async function chord(page: Page, key: "z" | "Z" | "Enter", ...modifiers: ("Control" | "Shift")[]) {
+async function chord(
+	page: Page,
+	key: "a" | "z" | "Z" | "Enter",
+	...modifiers: ("Control" | "Shift")[]
+) {
 	for (const modifier of modifiers) await page.keyboard.down(modifier);
 	await page.keyboard.press(key);
 	for (const modifier of [...modifiers].reverse()) await page.keyboard.up(modifier);
@@ -229,6 +240,248 @@ test("narrator atom preserves identity and undo without secure crypto APIs; HTML
 		await close(page);
 	}
 });
+
+test("semantic attachment paste uses only matching target resources and preserves mixed references and undo", async () => {
+	const source = await open();
+	const asset = {
+		id: "clipboard-file",
+		kind: "textFile",
+		name: "source.txt",
+		size: 6,
+		mimeType: "text/plain",
+	} as const;
+	const quote = { type: "quote", id: "clipboard-quote", label: "Source", text: "Quote" } as const;
+	const fileReference = {
+		type: "fileReference",
+		id: "clipboard-file-ref",
+		reference: { id: "original-ref", deviceId: "local", path: "/test.ts", label: "test.ts" },
+	} as const;
+	const narratorReference = {
+		type: "narratorReference",
+		id: "clipboard-narrator-ref",
+		narratorId: "stable-target",
+		label: "Target",
+	} as const;
+	const attachment = { type: "attachment", id: "clipboard-node", assetId: asset.id } as const;
+	const mixed: ComposerDocument = {
+		...empty,
+		assets: [asset],
+		paragraphs: [
+			{
+				children: [
+					{ type: "text", text: "See " },
+					quote,
+					fileReference,
+					narratorReference,
+					{ type: "text", text: " and " },
+					attachment,
+					{ type: "text", text: "!" },
+				],
+			},
+		],
+	};
+	const mime = "application/x-narrafork-composer-document";
+	const cutAll = async (page: Page) => {
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.selection(0));
+		await focusedEditor(page);
+		await chord(page, "a", "Control");
+		await settle(page);
+		return page.evaluate(() => (window as unknown as FixtureWindow).fixture.copy(true));
+	};
+	const paste = async (page: Page, data: Record<string, string>) => {
+		await page.evaluate((payload) => {
+			const fixture = (window as unknown as FixtureWindow).fixture;
+			// The pasted atoms still get fresh IDs on LAN HTTP.
+			Object.defineProperty(crypto, "randomUUID", { value: undefined, configurable: true });
+			fixture.selection(0);
+			fixture.paste(payload);
+		}, data);
+		await settle(page);
+		return snapshot(page);
+	};
+	const undo = async (page: Page) => {
+		await focusedEditor(page);
+		await chord(page, "z", "Control");
+		await settle(page);
+		return (await snapshot(page)).document;
+	};
+	const expectReferences = (document: ComposerDocument) => {
+		const [, pastedQuote, pastedFile, pastedNarrator] = document.paragraphs[0].children;
+		expect(pastedQuote).toMatchObject({ type: "quote", label: quote.label, text: quote.text });
+		expect(pastedFile).toMatchObject({ type: "fileReference", reference: { path: "/test.ts" } });
+		expect(pastedNarrator).toMatchObject({
+			type: "narratorReference",
+			narratorId: narratorReference.narratorId,
+			label: narratorReference.label,
+		});
+		if (
+			pastedQuote.type !== "quote" ||
+			pastedFile.type !== "fileReference" ||
+			pastedNarrator.type !== "narratorReference"
+		)
+			throw new Error("Missing semantic clipboard references");
+		expect(pastedQuote.id).not.toBe(quote.id);
+		expect(pastedFile.id).not.toBe(fileReference.id);
+		expect(pastedFile.reference.id).not.toBe(fileReference.reference.id);
+		expect(pastedNarrator.id).not.toBe(narratorReference.id);
+	};
+	try {
+		await source.evaluate(
+			(metadata) => (window as unknown as FixtureWindow).fixture.fileResource(metadata, "source"),
+			asset,
+		);
+		await load(source, mixed);
+		const copied = await cutAll(source);
+		expect(JSON.parse(copied[mime])).toEqual(mixed);
+		expect((await snapshot(source)).document).toEqual(empty);
+
+		// The source draft still owns its cached File and metadata after the cut.
+		const same = await paste(source, copied);
+		if (!same.document) throw new Error("Missing same-draft paste");
+		expectReferences(same.document);
+		expect(same.document.assets).toEqual([asset]);
+		expect(same.document.paragraphs[0].children[5]).toMatchObject({
+			type: "attachment",
+			assetId: asset.id,
+		});
+		expect(same.document.paragraphs[0].children[5]).not.toEqual(attachment);
+		expect(same.atoms.at(-1)).toMatchObject({ type: "attachment", missing: false });
+		expect(await undo(source)).toEqual(empty);
+		expect(await undo(source)).toEqual(mixed);
+
+		const target = await open();
+		try {
+			// A different draft gets the same custom MIME, but none of the source's File data.
+			const cross = await paste(target, copied);
+			if (!cross.document) throw new Error("Missing cross-draft paste");
+			expectReferences(cross.document);
+			expect(cross.document.assets).toEqual([]);
+			expect(cross.document.paragraphs[0].children.slice(4)).toEqual([
+				{ type: "text", text: " and source.txt!" },
+			]);
+			expect(cross.atoms.map(({ type }) => type)).toEqual([
+				"quote",
+				"fileReference",
+				"narratorReference",
+			]);
+			expect(snapshotComposerFiles(cross.document, [], [])).toEqual({
+				images: [],
+				textFiles: [],
+				media: [],
+			});
+			expect(await undo(target)).toEqual(empty);
+
+			// A fallback filename may not fit the destination even though all authored content does.
+			const nearLimit: ComposerDocument = {
+				...empty,
+				paragraphs: [
+					{
+						children: [
+							{
+								type: "text",
+								text: "x".repeat(
+									MAX_COMPOSER_DOCUMENT_TEXT - legacyComposerDocumentText(mixed).text.length,
+								),
+							},
+						],
+					},
+				],
+			};
+			await load(target, nearLimit);
+			const bounded = await paste(target, copied);
+			if (!bounded.document) throw new Error("Missing paste at the text budget");
+			expectReferences(bounded.document);
+			expect(bounded.document.assets).toEqual([]);
+			expect(legacyComposerDocumentText(bounded.document).text.length).toBe(
+				MAX_COMPOSER_DOCUMENT_TEXT,
+			);
+			expect(await undo(target)).toEqual(nearLimit);
+
+			// Same ID, filename and size are insufficient when the target metadata differs.
+			const collision = { ...asset, mimeType: "text/markdown" };
+			await target.evaluate(
+				(metadata) => (window as unknown as FixtureWindow).fixture.fileResource(metadata, "target"),
+				collision,
+			);
+			const original: ComposerDocument = {
+				...empty,
+				paragraphs: [{ children: [{ ...attachment, id: "target-node" }] }],
+				assets: [collision],
+			};
+			await load(target, original);
+			const collided = await paste(target, copied);
+			expect(collided.document?.assets).toEqual([collision]);
+			expect(collided.document?.paragraphs[0].children).toContainEqual({
+				type: "text",
+				text: " and source.txt!",
+			});
+			expect(collided.atoms.filter(({ type }) => type === "attachment")).toEqual([
+				expect.objectContaining({ missing: false }),
+			]);
+			const targetFile = new File(["target"], collision.name, { type: collision.mimeType });
+			setComposerAssetId(targetFile, collision.id);
+			expect(snapshotComposerFiles(collided.document, [], [targetFile])?.textFiles).toEqual([
+				targetFile,
+			]);
+			expect(await undo(target)).toEqual(original);
+		} finally {
+			await close(target);
+		}
+	} finally {
+		await close(source);
+	}
+}, 15_000);
+
+test("attachment-only paste preserves the selection and undo when the fallback filename does not fit", async () => {
+	const page = await open();
+	try {
+		const nearLimit: ComposerDocument = {
+			...empty,
+			paragraphs: [
+				{ children: [{ type: "text", text: "x".repeat(MAX_COMPOSER_DOCUMENT_TEXT - 1) }] },
+			],
+		};
+		const full: ComposerDocument = {
+			...empty,
+			paragraphs: [
+				{ children: [{ type: "text", text: `A${"x".repeat(MAX_COMPOSER_DOCUMENT_TEXT - 1)}` }] },
+			],
+		};
+		await load(page, nearLimit);
+		await page.evaluate(
+			(value) => (window as unknown as FixtureWindow).fixture.replaceUndoable(value),
+			full,
+		);
+		await focusedEditor(page);
+		await settle(page);
+		const before = await snapshot(page);
+		expect(before.document).toEqual(full);
+		await page.evaluate((asset) => {
+			const fixture = (window as unknown as FixtureWindow).fixture;
+			fixture.selection(0, 1);
+			fixture.paste({
+				"text/plain": asset.name,
+				"application/x-narrafork-composer-document": JSON.stringify({
+					version: 1,
+					assets: [asset],
+					paragraphs: [
+						{ children: [{ type: "attachment", id: "attachment-only", assetId: asset.id }] },
+					],
+				}),
+			});
+		}, imageAsset);
+		await settle(page);
+		const after = await snapshot(page);
+		expect(after.document).toEqual(full);
+		expect(after.selection).toEqual({ start: 0, end: 1 });
+		expect(after.changes).toBe(before.changes);
+		await chord(page, "z", "Control");
+		await settle(page);
+		expect((await snapshot(page)).document).toEqual(nearLimit);
+	} finally {
+		await close(page);
+	}
+}, 15_000);
 
 test("empty insert deletes a selected suffix once but remains a noop for a collapsed cursor", async () => {
 	const page = await open();

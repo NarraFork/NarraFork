@@ -37,6 +37,22 @@ test("candidate search encodes scope and query and propagates cancellation", asy
 	expect(signal).toBe(controller.signal);
 });
 
+test("exact candidate lookup sends targetId separately from the query", async () => {
+	let requested: URL | undefined;
+	globalThis.fetch = (async (url: string | URL | Request) => {
+		requested = new URL(String(url), "http://test");
+		return Response.json({ items: [], hasMore: false });
+	}) as unknown as typeof fetch;
+	await narratorCommunicationApi.searchCommunicationCandidates("source", "", {
+		targetId: "old-narrator_1",
+	});
+	expect(requested?.pathname).toBe("/api/narrators/source/communication/candidates");
+	expect(Object.fromEntries(requested?.searchParams ?? [])).toEqual({
+		q: "",
+		targetId: "old-narrator_1",
+	});
+});
+
 test("management preserves the exact relation identity without adding an inbox send", async () => {
 	const requests: Array<{ path: string; method?: string; body: unknown }> = [];
 	globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
