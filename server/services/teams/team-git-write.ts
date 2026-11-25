@@ -24,7 +24,7 @@
 import { realpath, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { TEAM_MERGE_CONFLICTS_MAX, TEAM_MERGE_REF_PREFIX } from "@shared/project-teams";
-import { GitError } from "../../lib/errors";
+import { AppError, GitError } from "../../lib/errors";
 import {
 	ensureConfigOverridesHonored,
 	GIT_NO_EXEC_CONFIG,
@@ -387,6 +387,15 @@ export function teamRepoGit(repo: string): TeamRepoGit {
 				{ config: [...base, ...signing.overrides], env: identity ?? undefined },
 			);
 			const commit = result.stdout.trim();
+			if (
+				result.exitCode !== 0 &&
+				/identity unknown|tell me who you are|empty ident/i.test(result.stderr)
+			)
+				throw new AppError(
+					"No git identity to commit the merge with: set yours in NarraFork (Settings, Git identities) or the host's git user.name and user.email",
+					409,
+					"TEAM_MERGE_IDENTITY_UNKNOWN",
+				);
 			if (result.exitCode !== 0 || !SHA.test(commit))
 				throw new GitError(`git commit-tree failed: ${complaint(result)}`);
 			return commit;
