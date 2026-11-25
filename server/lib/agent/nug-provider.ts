@@ -9,8 +9,8 @@ import {
 } from "../nug-model-cache";
 import { applyNugModelCatalogUpdate } from "../nug-model-sync";
 import {
-	ensureNugRelayClient,
 	getNugRelayChannelIdForCredential,
+	reconcileNugRelayProvider,
 	usesLocalEgress,
 } from "../nug-relay/manager";
 import { shouldUseNativeSearch } from "../search/native";
@@ -172,8 +172,8 @@ export class NugProvider implements ProviderAdapter {
 		// Client-egress relay lifecycle follows provider construction: with
 		// egressMode local-* a relay channel to the gateway is established (or
 		// reused); reverting to "nug" tears it down. Idempotent per provider id.
-		// Inference keys may rotate without replacing the connection's egress relay.
-		ensureNugRelayClient(relayConfig);
+		// Share the owner's live credential selection, never restore a disabled projected key.
+		reconcileNugRelayProvider(relayConfig);
 	}
 
 	/**

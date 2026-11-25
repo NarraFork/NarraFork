@@ -58,8 +58,10 @@ import type {
 
 function nugPaymentBinding(binding: unknown): string {
 	if (typeof binding !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(binding)) {
-		throw new Error(
+		throw new ApiError(
 			"NUG payment context is unavailable; update the backend and create a new order",
+			409,
+			{ code: "NUG_PAYMENT_CONTEXT" },
 		);
 	}
 	return binding;
@@ -76,7 +78,9 @@ function requireNugPaymentOrder<T extends { order: { id: string; binding: string
 		(orderId !== undefined && data.order.id !== orderId) ||
 		(binding !== undefined && received !== binding)
 	) {
-		throw new Error("NUG payment response does not match this order");
+		throw new ApiError("NUG payment response does not match this order", 409, {
+			code: "NUG_PAYMENT_RESPONSE",
+		});
 	}
 	return data;
 }
@@ -860,7 +864,9 @@ export const miscApi = {
 			pickRequestOptions(options),
 		).then((data) => {
 			if (payment && typeof data.paymentCredentialIsPrimary !== "boolean") {
-				throw new Error("NUG payment balance context is unavailable; update the backend");
+				throw new ApiError("NUG payment balance context is unavailable; update the backend", 409, {
+					code: "NUG_PAYMENT_CONTEXT",
+				});
 			}
 			return data;
 		}),

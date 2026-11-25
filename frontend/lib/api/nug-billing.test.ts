@@ -13,7 +13,15 @@ mock.module("./client", () => ({
 		throw new Error("Unexpected transport");
 	},
 	readFetchError: async () => "failed",
-	ApiError: class ApiError extends Error {},
+	ApiError: class ApiError extends Error {
+		constructor(
+			message: string,
+			public status: number,
+			public data?: Record<string, unknown>,
+		) {
+			super(message);
+		}
+	},
 }));
 mock.module("./narrators", () => ({ parseContentDispositionFileName: () => undefined }));
 const { miscApi } = await import("./misc");
@@ -61,9 +69,12 @@ test("create, poll, repay and the post-payment balance retain the opaque order c
 
 test("an old backend without a binding cannot expose a payment QR and missing client contexts never issue RPCs", async () => {
 	response = { order: { id: orderId, pay_url: "https://pay.example/unsafe-old-context" } };
-	await expect(
-		miscApi.nugCreateBillingOrder("gateway", { amount: 10, provider: "mockpay" }),
-	).rejects.toThrow("payment context");
+	const pending = miscApi.nugCreateBillingOrder("gateway", { amount: 10, provider: "mockpay" });
+	await expect(pending).rejects.toThrow("payment context");
+	await expect(pending).rejects.toMatchObject({
+		status: 409,
+		data: { code: "NUG_PAYMENT_CONTEXT" },
+	});
 	calls.length = 0;
 	expect(() => miscApi.nugGetBillingOrder("gateway", orderId, "")).toThrow("payment context");
 	expect(() => miscApi.nugRepayBillingOrder("gateway", orderId, "invalid")).toThrow(
@@ -89,6 +100,10 @@ test.each([
 				? miscApi.nugGetBillingOrder("gateway", orderId, binding)
 				: miscApi.nugRepayBillingOrder("gateway", orderId, binding);
 		await expect(task).rejects.toThrow("does not match");
+		await expect(task).rejects.toMatchObject({
+			status: 409,
+			data: { code: "NUG_PAYMENT_RESPONSE" },
+		});
 	}
 });
 

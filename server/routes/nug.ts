@@ -102,7 +102,7 @@ function nugBillingSubject(providerId: string, binding?: NugBillingBinding) {
 		? binding.storedCredential
 			? keys.find((entry) => entry.id === binding.credentialId)
 			: undefined
-		: keys[0];
+		: keys.find((entry) => !entry.disabled);
 	if (
 		(binding?.storedCredential && !key) ||
 		(binding && !binding.storedCredential && keys.length) ||
@@ -827,17 +827,28 @@ nugRoutes.use("/providers/:id/billing/orders/*", requireSessionAuth);
 /** Proxy billing config from NUG service. */
 nugRoutes.get("/providers/:id/billing/config", async (c) => {
 	const id = c.req.param("id");
-	const entry = getNugProvider(id);
-	if (!entry) return c.json({ error: `Provider "${id}" not found` }, 404);
 	try {
-		const data = (await entry.provider.getBillingConfig()) as unknown as Record<string, unknown>;
-		const responseData = normalizeNugQuotaResponse(data);
-		setNugCachedQuota(id, buildNugQuotaCache(data, getNugCachedQuota(id)), entry.quotaSubject);
-		return c.json(responseData);
+		// The config and a new order must speak for the same first enabled credential.
+		const subject = nugBillingSubject(id);
+		const identity = nugQuotaIdentity(subject.config);
+		const provider = new NugProvider(subject.config, subject.connection);
+		const data = (await provider.getBillingConfig()) as unknown as Record<string, unknown>;
+		const primary = captureNugQuotaSubject(subject.connection);
+		const existing =
+			primary.id === subject.credentialId && primary.identity === identity
+				? getNugCachedQuota(id)
+				: undefined;
+		setNugCachedQuota(id, buildNugQuotaCache(data, existing), {
+			id: subject.credentialId,
+			providerId: id,
+			config: subject.config,
+			identity,
+		});
+		return c.json(normalizeNugQuotaResponse(data));
 	} catch (err: unknown) {
-		const msg = err instanceof Error ? err.message : "Unknown error";
-		logger.error("NUG billing config fetch failed", { error: msg, provider: entry.config.name });
-		return c.json({ error: msg }, 502);
+		if (err instanceof AppError) throw err;
+		logger.error("NUG billing config fetch failed", { providerId: id });
+		return c.json({ error: "NUG billing config fetch failed" }, 502);
 	}
 });
 
