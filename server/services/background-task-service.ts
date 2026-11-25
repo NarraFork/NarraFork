@@ -47,7 +47,7 @@ import { hotSafe } from "../lib/hot-safe";
 import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { parseSubstatus, parseTraits } from "../lib/narrator-utils";
-import { teamMembersWhere } from "../lib/runtime-source";
+import { addressableTeamMembersWhere, teamMembersWhere } from "../lib/runtime-source";
 import { escapeLikeNeedle } from "../lib/sql-like";
 import type { RunBindingInput, RunDeliverTo } from "../lib/validators/runtime-registration";
 import type { RuntimeTx } from "./agent-runtime/mailbox-types";
@@ -2216,7 +2216,7 @@ class BackgroundTaskService {
 		const target = selector.trim();
 		if (!target || target.length > 512) return null;
 		const limit = OUTPUT_TAIL_MAX_CHARS;
-		const row = await readQueryFirst(
+		const snapshotOf = (where: ReturnType<typeof and>) =>
 			db
 				.select({
 					id: backgroundTasks.id,
@@ -2233,20 +2233,46 @@ class BackgroundTaskService {
 					outputTruncated: backgroundTasks.outputTruncated,
 				})
 				.from(backgroundTasks)
-				.where(
+				.where(where)
+				.orderBy(desc(backgroundTasks.createdAt), desc(backgroundTasks.id))
+				.limit(1);
+		const readOne = (where: ReturnType<typeof and>) =>
+			readQueryFirst(snapshotOf(where), taskReadOptions(options, 1));
+		// An exact task id is that row, even when a newer task still stores the same
+		// alias. An alias names the current addressable owner before any archived
+		// history, so a restored agent is not hidden by a later archived task.
+		let row = await readOne(
+			and(eq(backgroundTasks.parentNarratorId, parentNarratorId), eq(backgroundTasks.id, target)),
+		);
+		if (!row) {
+			const owner = await readQueryFirst(
+				db
+					.select({ id: narrators.id })
+					.from(narrators)
+					.where(
+						and(addressableTeamMembersWhere(parentNarratorId), eq(narrators.aliasSelector, target)),
+					)
+					.limit(1),
+				taskReadOptions(options, 1),
+			);
+			if (owner) {
+				row = await readOne(
 					and(
 						eq(backgroundTasks.parentNarratorId, parentNarratorId),
-						or(
-							eq(backgroundTasks.id, target),
-							eq(backgroundTasks.alias, target),
-							eq(backgroundTasks.transferTaskId, target),
-						),
+						eq(backgroundTasks.type, "agent"),
+						or(eq(backgroundTasks.subagentNarratorId, owner.id), eq(backgroundTasks.id, owner.id)),
 					),
-				)
-				.orderBy(desc(backgroundTasks.createdAt), desc(backgroundTasks.id))
-				.limit(1),
-			taskReadOptions(options, 1),
-		);
+				);
+			}
+		}
+		if (!row) {
+			row = await readOne(
+				and(
+					eq(backgroundTasks.parentNarratorId, parentNarratorId),
+					or(eq(backgroundTasks.alias, target), eq(backgroundTasks.transferTaskId, target)),
+				),
+			);
+		}
 
 		if (row && row.type !== "transfer") {
 			const buffered =

@@ -674,6 +674,70 @@ test("restore suffixes the narrator and the owned agent task", async () => {
 	expect(snapshot?.id).toBe("restored-audit-task");
 });
 
+test("get_task prefers a restored owner over a newer archived task with the same alias", async () => {
+	seedMember({
+		id: "live-review",
+		title: "Review",
+		titleSlug: "review",
+		aliasSelector: "review",
+		traits: ["subagent-alias:review"],
+	});
+	seedMember({
+		id: "restored-review",
+		title: "Review",
+		titleSlug: "review",
+		aliasSelector: "review",
+		traits: ["subagent-alias:review"],
+	});
+	seedMember({
+		id: "archived-review-2",
+		status: "archived",
+		title: "Review two",
+		titleSlug: "review-2",
+		aliasSelector: "review-2",
+		traits: ["subagent-alias:review-2"],
+		createdAt: "2026-04-01T00:00:00.000Z",
+	});
+	db.insert(backgroundTasks)
+		.values([
+			{
+				id: "restored-review-task",
+				parentNarratorId: PARENT,
+				type: "agent",
+				status: "completed",
+				alias: "review",
+				output: "restored output",
+				subagentNarratorId: "restored-review",
+				startedAt: "2026-03-01T00:00:00.000Z",
+				createdAt: "2026-03-01T00:00:00.000Z",
+				updatedAt: "2026-03-01T00:00:00.000Z",
+			},
+			{
+				id: "archived-review-2-task",
+				parentNarratorId: PARENT,
+				type: "agent",
+				status: "completed",
+				alias: "review-2",
+				output: "archived output",
+				subagentNarratorId: "archived-review-2",
+				startedAt: "2026-04-02T00:00:00.000Z",
+				createdAt: "2026-04-02T00:00:00.000Z",
+				updatedAt: "2026-04-02T00:00:00.000Z",
+			},
+		])
+		.run();
+
+	await aliases.reconcileRestoredSubagentAlias("restored-review");
+
+	const { backgroundTaskService } = await import("../background-task-service");
+	const byAlias = await backgroundTaskService.readTaskSnapshot(PARENT, "review-2");
+	expect(byAlias?.id).toBe("restored-review-task");
+	expect(byAlias?.output).toBe("restored output");
+	const byExactId = await backgroundTaskService.readTaskSnapshot(PARENT, "archived-review-2-task");
+	expect(byExactId?.id).toBe("archived-review-2-task");
+	expect(byExactId?.output).toBe("archived output");
+});
+
 test("restoring a primary fork does not persist a subagent alias", async () => {
 	db.insert(narrators)
 		.values({

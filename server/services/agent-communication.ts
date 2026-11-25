@@ -1378,9 +1378,14 @@ export async function sendSubagentMessageDetailed(
 	// Reaching a target (step 4 owns that rule) is not control: an interrupt additionally
 	// needs the target's registered controller grant for "steer".
 	const targets = await resolveSendTargets(input, scope);
+	// An exact archived id is already a per-recipient failure. Checking its steer
+	// grant or model pool here would abort the live recipients before any delivery.
+	const deliverable = targets.filter(
+		(target) => target.status !== "archived" || target.id === scope.teamParentId,
+	);
 	const modelRequest = input.model?.trim() ? input.model : undefined;
 	if (input.doInterrupt || input.resume || modelRequest !== undefined) {
-		for (const target of targets)
+		for (const target of deliverable)
 			await authorizeAgentControl({
 				callerNarratorId: scope.caller.id,
 				targetNarratorId: target.id,
@@ -1388,10 +1393,10 @@ export async function sendSubagentMessageDetailed(
 				userId: input.userId ?? null,
 			});
 	}
-	// Validated for every target before anything is written, like the grant above.
+	// Validated for every deliverable target before anything is written, like the grant above.
 	const modelPlans = new Map<string, SubagentModelSwitchPlan>();
 	if (modelRequest !== undefined) {
-		for (const target of targets) {
+		for (const target of deliverable) {
 			if (isTakenOver(target.id))
 				throw new Error(
 					`Agent ${agentLabelFromNarrator(target, teamRootOf(target))} is taken over by the user; its model cannot be changed now.`,

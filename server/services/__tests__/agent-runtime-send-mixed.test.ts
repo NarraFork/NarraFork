@@ -582,6 +582,43 @@ test("an unknown or out-of-pool model rejects the whole call before any write", 
 	}
 });
 
+test("an archived child's rejected model does not drop the live recipient", async () => {
+	db.update(narrators)
+		.set({
+			status: "archived",
+			runtimeRegistrationJson: delegationRegistration("parent-root", "explore"),
+		})
+		.where(eq(narrators.id, "sibling-b"))
+		.run();
+	const visible = spyOn(settingsModule, "getSubagentVisibleModels").mockReturnValue([
+		"test:live-only",
+		"test:explore-only",
+	]);
+	const pools = settingsModule.settings.agent.subagentAllowedModels;
+	settingsModule.settings.agent.subagentAllowedModels = {
+		explore: ["test:explore-only"],
+		plan: [],
+		general: ["test:live-only"],
+	};
+	try {
+		const result = await sendSubagentMessageDetailed({
+			...input("parent-root", ["sibling-a", "sibling-b"]),
+			model: "test:live-only",
+		});
+		expect(result.targets.map((target) => [target.id, target.status])).toEqual([
+			["sibling-a", "queued"],
+			["sibling-b", "failed"],
+		]);
+		expect(result.targets[1]?.error).toContain("archived");
+		expect(result.targets[0]).toMatchObject({ model: "test:live-only" });
+		expect(rows("sibling-a")).toHaveLength(1);
+		expect(rows("sibling-b")).toHaveLength(0);
+	} finally {
+		settingsModule.settings.agent.subagentAllowedModels = pools;
+		visible.mockRestore();
+	}
+});
+
 test("model cannot change a child the user has taken over", async () => {
 	setRunHold("sibling-a", { released: false });
 	await expect(
