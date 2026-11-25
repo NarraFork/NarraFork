@@ -18,7 +18,7 @@ keywords:
   - chapterSettings
   - work.exclusive_released
 status: draft
-verified_at: 12e8a02d8
+verified_at: bab02212f403fafc4dd6d6afbecd57bcd761d198
 ---
 # 重叠与独占路径
 
@@ -41,7 +41,7 @@ verified_at: 12e8a02d8
 - 重叠查询走 `GET /api/projects/:projectId/team-overlaps`（`server/routes/project-teams.ts`）；二者与团队路由一样在 PG 上返回 503 `POSTGRES_UNSUPPORTED`。
 
 ## 从哪读起
-- `server/services/teams/team-overlap.ts`：刷新循环、重叠比较、独占锁判定。
+- `server/services/teams/team-overlap.ts`：刷新循环、重叠比较、独占锁判定；重叠提醒里的标题经 `team-coordinator-notes.ts:oneLine` 压成一行。
 - `__tests__/team-overlap.test.ts`：行为的守卫测试。
 - 重叠结果如何进入协调者历史，见 [协调者](coordinator.md) 的 `team_status`。
 

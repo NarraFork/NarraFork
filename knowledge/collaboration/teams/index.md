@@ -16,7 +16,7 @@ keywords:
   - requireSqliteProjectMutation
   - TeamStatus
 status: draft
-verified_at: cbf0722e0
+verified_at: bab02212f403fafc4dd6d6afbecd57bcd761d198
 ---
 # 团队
 
@@ -28,7 +28,7 @@ verified_at: cbf0722e0
 
 ## 几部分怎么配合
 1. 先有团队：创建时同事务建协调者叙述者和 `project_teams` 行；也可以把已有的空闲会话升级为团队（同事务加 `team` trait 和团队行），或解散团队、保留会话（同事务删团队行和 trait）；成员不另存，全部取自协调者的叙述者 ACL（团队与成员）。
-2. 协调者用 `Team` 工具建工作项；工作项有自己的分支与 worktree，子代理（工作者）在里面干活，经评审、`ready`、合并判定走完状态机（工作项）。
+2. 协调者用 `Team` 工具建工作项；工作项有自己的分支与 worktree，子代理（工作者）在里面干活，经评审、`ready`、合并判定走完状态机（工作项）。工作项可以依赖同团队的其他工作项（`dependsOn`，最多 `TEAM_WORK_DEPENDENCIES_MAX`=20，只有 `merged` 算满足，`shared/project-teams.ts:dependencySatisfied`）：依赖未合并时不能开工，最后一个依赖合并时协调者收到 `team_unblocked` 说明（工作项）。
 3. 活动工作项的改动路径被后台定期刷新，跨团队比较重叠；项目设了独占路径时，`ready` 要抢独占锁（重叠与独占路径）。
 4. 协调者被软限制约束，超大输出落盘，`team_status` 行把团队全貌注入它的历史（协调者）。
 5. 团队页（页头状态句、「等你处理」就地批准/回答/验收、对话旁的工作列表与动态、工作项抽屉与退回、成员、「全部暂停」）由团队页读模型和前端提供；任何成员可批团队树里的待决调用（团队页与审批）。

@@ -47,7 +47,7 @@ keywords:
   - side-car
   - InjectionCadence
 status: draft
-verified_at: cbf0722e0
+verified_at: bab02212f403fafc4dd6d6afbecd57bcd761d198
 ---
 # 提示词与注入
 
