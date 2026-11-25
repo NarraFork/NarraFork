@@ -77,7 +77,7 @@ keywords:
   - auto 参与
   - settings.agent.modelProtocols
 status: draft
-verified_at: 9bba5f6cdfe1f1a3602e12806eb8129c34d61716
+verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 ---
 # 来源组与模型列表
 
@@ -106,7 +106,7 @@ verified_at: 9bba5f6cdfe1f1a3602e12806eb8129c34d61716
 ## 从哪读起
 - `server/lib/sourcing/source-groups.ts`、`model-list-readers.ts`、`templates.ts`。
 - 前端：设置页 `routes/settings/models.tsx` 由 `ModelsSection`、`ModelAggregationsSection`（只读，旧聚合）等组成（目录更新与覆盖见 [模型目录](catalog.md)）；提供商页里的模型行 `ModelRow`/`ModelList`、逐模型协议 `ModelProtocolSelect`（写 `settings.agent.modelProtocols`）、`AutoParticipationSwitch`（是否参与 `auto:` 路由）；hooks `useModels.ts`，`lib/model-search.ts` 是所有模型选择器共用的搜索规则。
-- 迁移：改前缀 `provider-prefix-migration-service.ts`、旧 `__agg__:` 聚合值 `aggregation-migration-service.ts`（启动时后台运行一次）、模型已不可用的叙述者批量修复 `broken-model-migration-service.ts`（`provider_missing` 默认勾选，`model_not_listed` 默认不勾，规则在前端 `broken-model-selection.ts`）。
+- 迁移：改前缀 `provider-prefix-migration-service.ts`、旧 `__agg__:` 聚合值 `aggregation-migration-service.ts`（启动时后台运行一次）、模型已不可用的叙述者批量修复 `broken-model-migration-service.ts`（扫描 `scanBrokenModelNarrators` 按 id 键集每批 250 行在读 Worker 上执行，`worker-required`、30s 超时；`provider_missing` 默认勾选，`model_not_listed` 默认不勾，规则在前端 `broken-model-selection.ts`）。
 
 ## 改它时
 - 加一类来源：`sourcing/templates.ts` 描述它（每个模板都带 `listModels`，由 `byId` 统一补上），目录持有者要 `registerModelListReader` 注册读取器，`source-groups.ts` 派生视图，`presets.ts` 经 `GET /api/sourcing/templates` 给前端；设置或插件注册表修订号变化才重建来源组。

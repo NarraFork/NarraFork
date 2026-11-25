@@ -38,7 +38,7 @@ keywords:
   - getToolMessage
   - 服务端文案
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 ---
 
 # 后端通用工具
@@ -55,7 +55,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - `slug.ts:slugify`：NFKD 去变音符，保留 Unicode 字母和数字（CJK 保留），其余折成 `-`，小写，截 30 字符，空则 `entry`。
 - `words.ts:generateWordSlug`：形容词-动名词-名词随机组合（用 `randomBytes` 取随机数），用于计划文件 ID（`narrator-plan-mode.ts`、`narrator-service.ts` 在 plan 模式起会话时、`narrator-session.ts` 切入 plan 权限模式时）。
 - `avatar-colors.ts:randomAvatarColor`：十二色调色板里随机取一，所有账号创建路径（注册、SSO、管理员创建）共用。
-- `i18n.ts`：服务端文案表，key 带命名空间 `tool.*`、`gateway.*`、`sidecar.*`；`t(key, locale, params)` 缺 key 原样返回 key，缺语言回落英文，占位符 `{name}` 逐个替换。`getToolMessage*` 是 `tool.*` 的类型化入口，`getUserLanguage`/`getUserReplyInLanguage` 读 `user_preferences`（懒加载数据库依赖）。这是后端写进对话或网关的文案，不是前端 i18n 命名空间。
+- `i18n.ts`：服务端文案表，key 带命名空间 `tool.*`、`gateway.*`、`sidecar.*`；`t(key, locale, params)` 缺 key 原样返回 key，缺语言回落英文，占位符 `{name}` 逐个替换。`getToolMessage*` 是 `tool.*` 的类型化入口，`getUserLanguage`/`getUserReplyInLanguage` 在读 Worker 上读 `user_preferences`（懒加载数据库依赖，`worker-required`，Worker 不可用时抛错而不回主线程）。这是后端写进对话或网关的文案，不是前端 i18n 命名空间。
 
 ## 从哪读起
 - `server/lib/async-mutex.ts` 末尾的锁层级注释。

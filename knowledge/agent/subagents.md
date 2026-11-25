@@ -77,7 +77,7 @@ keywords:
   - subagent_nested_changed
   - FORK_NARRATOR_MAX_DEPTH
 status: draft
-verified_at: 9f8180cd471d62003e8cfe666b3802a4277ead46
+verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 ---
 # 子代理
 
@@ -87,7 +87,7 @@ verified_at: 9f8180cd471d62003e8cfe666b3802a4277ead46
 - 模板名只在 `agent-runtime/policy.ts:compileDelegationPolicy` 里有含义，结果是写进新叙述者 traits 的能力上限。内置模板：`general`（完整写权限）、`worker`（general 加 Terminal、Browser，并可自己启动并等待下一层 helper）、`explore` 与 `plan`（只读）、`review`（只读 + 同步查看 Git + Browser，不能控制运行中的任务）、`search`（仅 WebSearch/WebFetch 等，无 MCP，只读）；其他名字视为自定义定义，缺失或无效的定义按只读处理（失败即收紧）。
 - 被委派者默认不能：再启动代理、等待代理、向用户提问、批准计划、切换工作目录（`DELEGATED_DENY`）。worker 的拒绝列表去掉了启动与等待代理，所以只有 worker 能向下嵌套。
 - 嵌套深度：`MAX_DELEGATION_DEPTH = 2`——主叙述者为 0 层，其子代理 1 层，再下一层 helper 为 2 层，2 层的子代理不能启动或控制其他代理。创建时给能力上限打深度戳（`withDelegationDepth`，深度达上限时同时去掉 spawn/await 能力和对应工具）；兜底校验不信任戳，`delegation-depth.ts:delegationDepthOf` 沿 `parent_narrator_id` 向上数 `subagent` 类型的层数，环或过深的链直接报错。
-- ForkNarrator 是另一条递归通道：fork 链最多 8 层祖先（`FORK_NARRATOR_MAX_DEPTH`），沿父链遍历有步数上限（`fork-narrator-depth.ts`）。
+- ForkNarrator 是另一条递归通道：fork 链最多 8 层祖先（`FORK_NARRATOR_MAX_DEPTH`），沿父链遍历有步数上限，每步在读 Worker 上查一行（`worker-required`，30s 超时）（`fork-narrator-depth.ts:narratorForkDepth`）。
 - 自定义子代理：`~/.narrafork/subagents/<name>/SUBAGENT.md`，frontmatter 加 markdown 正文；字段含描述、`toolAccess`（`readOnly` / `general` / `custom`）、自定义工具列表、默认模型（空串表示继承父级）、提示词（`custom-subagent-service.ts`）。
 - Agent 工具参数：`subagent_type`（缺省为 `general`；创建团队工作项时缺省 `worker`）、`model`、`reasoning_effort`、`workdir`、`alias`（会话内唯一，缺省由描述生成）、`run_in_background`、`isolation: "worktree"`（仅团队协调者，为工作项建分支与 worktree）。
 - 资源回收（`subagent-resources.ts`）：子代理被归档或删除时，关闭它创建的所有运行中终端和启动的浏览器会话；一次运行结束且没有待处理工作（helper 仍在工作、或已排队的输入）时，关闭此刻打开的浏览器会话，终端保留（dev server、REPL 可跨轮使用）。主叙述者不受影响，所有函数尽力而为、不抛错；单次最多关闭 50 个终端。

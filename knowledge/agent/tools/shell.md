@@ -50,7 +50,7 @@ keywords:
   - terminal watch
   - [watch]
 status: draft
-verified_at: 2c639f086aef21d60357f1e002e62767938833e8
+verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 ---
 # 命令与终端工具
 
@@ -84,7 +84,7 @@ verified_at: 2c639f086aef21d60357f1e002e62767938833e8
   - terminal：先等 `terminalService.whenStartupRecoverySettled()`，在后台挂接，不拖慢叙述者恢复；终端已退出或已脱离，由 Watch 自己报告。
   - 挂接复用原行 id 与精确句柄（`restoreTaskAlias`）；重复遗留行并入先挂接的观察时，只有持有活观察的那一行算挂接成功。
   - 挂接失败：行被标为失败并带 `TERMINAL_WATCH_RESTART_NOTICE`（只声称 Watch 没有停止目标，重启本身可能已停止）。
-- Terminal（可选工具）：动作 `create` / `rename` / `read` / `write` / `list`。`read` 默认增量，只给上次读/写之后的新输出，`last_n_lines` 覆盖增量；`write` 的 `notify_on` 在发送前先建立 Watch 并排除输入回显。终端是不受逐行检查的 shell，是否可用由会话权限模式整体决定。Terminal 不做一次性命令。
+- Terminal（可选工具）：动作 `create` / `rename` / `read` / `write` / `list`。`read` 默认增量，只给上次读/写之后的新输出，`last_n_lines` 覆盖增量；`write` 的 `notify_on` 在发送前先建立 Watch 并排除输入回显。终端是不受逐行检查的 shell，是否可用由会话权限模式整体决定。Terminal 不做一次性命令。终端行的查找（按 id、再按名字先 running 后 exited）、访问检查、`list` 与 Watch 的状态读取都在读 Worker 上（`terminal.ts:resolveTerminalId`/`assertTerminalAccess`/`listTerminals`，`worker-required`、30s 超时），Worker 不可用时该动作失败。
 - Terminal 的输入转义：模型把回车写成字面 `\n`、控制键写成 `\x03`，`terminal-escapes.ts:processTerminalEscapes` 转成发给 PTY 的字节。
 - `tools/pipeline.ts` 的 `StartPipeline` / `ExtractPipeline`（可选工具）：开启后，后续可能很长的工具输出按短别名（p1、p2…）捕获，模型只收到 ≤100 字符预览；`ExtractPipeline` 用受限的类 shell 规则（`from`、`cat`、`grep`、`head`、`tail`、`sort`、`uniq`、`cut`）反复查询同一批捕获，连续若干次未使用的工具调用后捕获自动清除。规则引擎见 [Agent Loop](../loop.md) 的流水线一条。
 - Bash 命令的自动放行判断由 `bash-analyze.ts` 完成：用 tree-sitter bash 语法解析出子命令与文件路径，再按白名单加危险模式检测决定。杀进程树见 `shell.ts:killTree`（Unix 先对进程组发 SIGTERM，稍后升级 SIGKILL；Windows 用 taskkill 兜底）。

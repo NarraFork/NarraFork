@@ -36,7 +36,7 @@ keywords:
   - agent.defaultNarratorWriteAudience
   - terminalAccessAllowed
 status: draft
-verified_at: 4606114a5848dc45cd5cea3ab355234d43e11ccd
+verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 ---
 # 访问控制
 
@@ -63,7 +63,8 @@ verified_at: 4606114a5848dc45cd5cea3ab355234d43e11ccd
 - 单主体与批量判断共用 `readVerdict`/`writeVerdict`，有一致性测试 `services/__tests__/narrator-acl-batch-parity.test.ts`。
 - 终端权限（`services/terminal-access.ts`）：叙述者的终端跟随该叙述者 ACL，子代理用其根叙述者；`read` 只看元数据，`write` 覆盖开启、看输出和滚动缓冲、输入、改名、关闭、读进程列表，因为终端等同于在会话工作区的 shell。
 - 无叙述者的独立终端只属于创建者加管理员；创建者只记在内存里（上限 1000 条，超出丢最旧），重启后只有管理员可用。未知 id 与被拒绝给同样答案，防止探测 id。
-- REST（`routes/terminals.ts`）与终端 WebSocket（`websocket/terminal-ws.ts`）都调 `terminalAccessAllowed`；WebSocket 在连接期间还会重新校验。
+- REST（`routes/terminals.ts`）与终端 WebSocket（`websocket/terminal-ws.ts`）都调 `terminalAccessAllowed`；WebSocket 在连接期间还会重新校验。订阅后滚动缓冲回放是不等待的链（`terminal-ws.ts:subscribeToTerminal`）：attach 被拒、终端消失或读失败时只记 debug 日志、不回放，不成为未处理的 rejection；回放前若订阅已因复查被撤，也不发送。
+- `narrator-sharing.ts` 的读（`loadNarrator`、`getNarratorAccess` 的授权与 owner、转让 owner 时查目标用户、`announceAccessChange` 的子代理订阅清扫）都在读 Worker 上（`worker-required`，30s 超时），Worker 不可用时该操作失败。
 
 ## 从哪读起
 - `server/services/acl/acl-core.ts:resolveCaps`：内核。
