@@ -89,6 +89,34 @@ export {
 	snapshotRecentTabRuntimeVersions,
 } from "./recent-tabs-utils";
 
+/** One-tab pin reads are separate from page queries but share their complete access scope. */
+const recentTabStateScopeKey = (scope: RecentTabsScope | null) =>
+	[
+		"user-preferences",
+		"recent-tab-state",
+		scope?.userId ?? null,
+		scope?.authGeneration ?? null,
+		scope?.accessGeneration ?? null,
+	] as const;
+export const recentTabStateQueryKey = (scope: RecentTabsScope | null, key: string) =>
+	[...recentTabStateScopeKey(scope), key] as const;
+
+/** Mark touched pin states stale, or all current-scope pin states after a gap/reconnect. */
+export function invalidateRecentTabStates(
+	qc: QueryClient,
+	scope: RecentTabsScope | null,
+	keys?: readonly string[],
+): void {
+	if (!isRecentTabsScopeCurrent(scope) || keys?.length === 0) return;
+	const queryKey = recentTabStateScopeKey(scope);
+	const touched = keys ? new Set(keys) : undefined;
+	void qc.invalidateQueries({
+		queryKey,
+		predicate: touched
+			? (query) => touched.has(String(query.queryKey[queryKey.length]))
+			: undefined,
+	});
+}
 const RECENT_TABS_QUERY_GC_TIME_MS = 60_000;
 const RECENT_TABS_REFRESH_DEDUPE_MS = 500;
 const loadedWindowRefreshes = new WeakMap<
@@ -205,12 +233,17 @@ function tabKey(tab: Pick<RecentTab, "type" | "id">): string {
 	return `${tab.type}:${tab.id}`;
 }
 
-export function recentTabSection(tab: Pick<RecentTab, "type">): RecentTabsSection {
-	return tab.type === "project" ? "projects" : "work";
+/**
+ * Every tab lives in the sidebar's one list, `work`: sessions, folders, and pinned projects and
+ * teams alike (the server converts what the retired `projects` section held). The `projects`
+ * window is still read, and stays empty.
+ */
+export function recentTabSection(_tab: Pick<RecentTab, "type">): RecentTabsSection {
+	return "work";
 }
 
-function sectionFromKey(key: string): RecentTabsSection {
-	return key.startsWith("project:") ? "projects" : "work";
+function sectionFromKey(_key: string): RecentTabsSection {
+	return "work";
 }
 
 function flattenPages(data: RecentTabsInfiniteData | undefined): RecentTab[] {
@@ -548,6 +581,58 @@ export function applyRecentTabsRuntimePatches(
 	syncCompatibilityCache(qc, scope);
 }
 
+/** How long a project card's own read of its details counts as fresh. */
+const PROJECT_TAB_DETAILS_FRESH_MS = 10_000;
+const projectTabDetailReads = new WeakMap<
+	QueryClient,
+	{ scope: RecentTabsScope; reads: Map<string, number> }
+>();
+
+/**
+ * Read one project tab's runtime details now (its hover card or touch details just opened) and
+ * merge them into the tab cache: the sidebar's own runtime request refreshes them only when its
+ * targets change. One key, at most once per {@link PROJECT_TAB_DETAILS_FRESH_MS} per key.
+ * Returns the cancel for the opener's cleanup; a cancelled or failed read does not count.
+ */
+export function refreshProjectTabDetails(
+	qc: QueryClient,
+	projectId: string,
+	scope = getRecentTabsScope(),
+): (() => void) | undefined {
+	if (!isRecentTabsScopeCurrent(scope)) return;
+	const key = `project:${projectId}`;
+	let entry = projectTabDetailReads.get(qc);
+	if (entry?.scope !== scope) {
+		entry = { scope, reads: new Map() };
+		projectTabDetailReads.set(qc, entry);
+	}
+	const { reads } = entry;
+	const startedAt = Date.now();
+	// Only fresh entries help dedupe; visiting many projects must not grow the map forever.
+	for (const [readKey, readAt] of reads) {
+		if (startedAt - readAt >= PROJECT_TAB_DETAILS_FRESH_MS) reads.delete(readKey);
+	}
+	if (reads.has(key)) return;
+	reads.set(key, startedAt);
+	const controller = new AbortController();
+	let fulfilled = false;
+	const forget = () => {
+		if (reads.get(key) === startedAt) reads.delete(key);
+	};
+	api
+		.getRecentTabsRuntime([key], controller.signal)
+		.then(({ patches }) => {
+			if (controller.signal.aborted || !isRecentTabsScopeCurrent(scope)) return;
+			fulfilled = true;
+			applyRecentTabsRuntimePatches(qc, patches, scope);
+		})
+		.catch(forget);
+	return () => {
+		controller.abort();
+		if (!fulfilled) forget();
+	};
+}
+
 function applyFolderPatch(
 	tab: RecentTab,
 	folderId: string,
@@ -580,6 +665,7 @@ function toPersistedRecentTab(tab: RecentTab): PersistedRecentTab {
 	if (tab.folderIcon !== undefined) persisted.folderIcon = tab.folderIcon;
 	if (tab.folderColor !== undefined) persisted.folderColor = tab.folderColor;
 	if (tab.folderPreviewCount !== undefined) persisted.folderPreviewCount = tab.folderPreviewCount;
+	if (tab.projectId !== undefined) persisted.projectId = tab.projectId;
 	return persisted;
 }
 
@@ -610,7 +696,10 @@ export function clearLoadedTabs(
 		!!tab.folderId;
 	if (scope === "all") return tabs.filter(isKept);
 	if (scope === "projects") return tabs.filter((tab) => tab.type !== "project" || isKept(tab));
-	return tabs.filter((tab) => isKept(tab) || tab.type === "project" || isAttentionTab(tab));
+	// Projects and teams are not sessions: never "inactive".
+	return tabs.filter(
+		(tab) => isKept(tab) || tab.type === "project" || tab.type === "team" || isAttentionTab(tab),
+	);
 }
 
 function snapshotSections(
@@ -663,11 +752,11 @@ export async function removeRecentTabCascade(
 	scope = getRecentTabsScope(),
 ): Promise<void> {
 	if (!isRecentTabsScopeCurrent(scope)) return;
-	const section = recentTabsSectionQueryKey(scope, type === "project" ? "projects" : "work");
-	await qc.cancelQueries({ queryKey: section });
+	const section = recentTabSection({ type });
+	await qc.cancelQueries({ queryKey: recentTabsSectionQueryKey(scope, section) });
 	if (!isRecentTabsScopeCurrent(scope)) return;
 	const snapshots = snapshotSections(qc, scope);
-	updateSectionData(qc, scope, type === "project" ? "projects" : "work", (current) =>
+	updateSectionData(qc, scope, section, (current) =>
 		applyOperation(current, { type: "remove", key: `${type}:${id}` }),
 	);
 	syncCompatibilityCache(qc, scope);
@@ -779,6 +868,8 @@ export async function refreshRecentTabsAfterReconnect(
 	scope = getRecentTabsScope(),
 ): Promise<void> {
 	if (!isRecentTabsScopeCurrent(scope)) return;
+	// Frames may have been missed while the socket was down.
+	invalidateRecentTabStates(qc, scope);
 	try {
 		await refreshRecentTabsLoadedWindow(qc, {}, scope);
 	} finally {
@@ -800,6 +891,8 @@ export function refreshRecentTabsLoadedWindow(
 	scope = getRecentTabsScope(),
 ): Promise<void> {
 	if (!isRecentTabsScopeCurrent(scope)) return Promise.resolve();
+	// A reset after missed deltas also invalidates the current scope's pin states.
+	if (options.reset) invalidateRecentTabStates(qc, scope);
 	const now = Date.now();
 	const minimumRevision = options.minimumRevision ?? 0;
 	const existing = loadedWindowRefreshes.get(qc);
@@ -908,6 +1001,14 @@ export function applyRecentTabsDeltaAndFollowUp(
 	scope = getRecentTabsScope(),
 ): Promise<void> {
 	const { gaps, backfill } = applyRecentTabsDelta(qc, delta, scope);
+	// A gap reloads page one and invalidates all pin-state reads; otherwise touch only delta keys.
+	if (gaps.length === 0) {
+		invalidateRecentTabStates(
+			qc,
+			scope,
+			delta.operations.map((operation) => operation.key),
+		);
+	}
 	if (gaps.length === 0 && backfill.length === 0) return Promise.resolve();
 	return refreshRecentTabsLoadedWindow(
 		qc,
@@ -1075,8 +1176,7 @@ export function useRecentTabs() {
 			await qc.cancelQueries({ queryKey: recentTabsScopeKey(scope) });
 			requireRecentTabsScope(scope);
 			const snapshots = snapshotSections(qc, scope);
-			const section = type === "project" ? "projects" : "work";
-			updateSectionData(qc, scope, section, (current) =>
+			updateSectionData(qc, scope, recentTabSection({ type }), (current) =>
 				applyRecentTabRemove(current, `${type}:${id}`),
 			);
 			syncCompatibilityCache(qc, scope);
@@ -1454,6 +1554,21 @@ export function addRecentTabsBatch(
 	});
 }
 
+/** Pin from the page in one revision; unpin keeps the row, like the sidebar menu does. */
+export async function setRecentTabPinnedFromPage(
+	tab: { type: "project" | "team"; id: string; title: string },
+	pinned: boolean,
+	scope = getRecentTabsScope(),
+): Promise<void> {
+	requireRecentTabsScope(scope);
+	return applyGlobalRecentTabsMutation(
+		scope,
+		pinned
+			? api.upsertRecentTab({ ...buildRecentTabUpsert(tab), pin: true })
+			: api.pinRecentTab(`${tab.type}:${tab.id}`, false),
+	);
+}
+
 export function addSubagentRecentTab(
 	input: SubagentRecentTabInput,
 	scope = getRecentTabsScope(),
@@ -1471,7 +1586,7 @@ export function updateRecentTabLocal(
 	const normalizedPatch = { ...patch };
 	if ("title" in patch) normalizedPatch.title = clampRecentTabText(patch.title);
 	if ("subtitle" in patch) normalizedPatch.subtitle = clampRecentTabText(patch.subtitle);
-	updateSectionData(globalQC, scope, type === "project" ? "projects" : "work", (tabs) => {
+	updateSectionData(globalQC, scope, recentTabSection({ type }), (tabs) => {
 		let changed = false;
 		const next = tabs.map((tab) => {
 			if (tab.type !== type || tab.id !== id) return tab;

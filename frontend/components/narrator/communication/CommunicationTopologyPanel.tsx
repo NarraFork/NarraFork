@@ -737,7 +737,12 @@ export function CommunicationTopologyView({
 														size={16}
 														tab={{
 															id: placed.node.id,
-															type: placed.node.delegated ? "subagent" : "narrator",
+															type:
+																placed.node.team?.id === placed.node.id
+																	? "team"
+																	: placed.node.delegated
+																		? "subagent"
+																		: "narrator",
 															status: placed.node.status,
 															substatus: placed.node.substatus,
 														}}
@@ -899,7 +904,12 @@ export function CommunicationTopologyView({
 														size={16}
 														tab={{
 															id: node.id,
-															type: node.delegated ? "subagent" : "narrator",
+															type:
+																node.team?.id === node.id
+																	? "team"
+																	: node.delegated
+																		? "subagent"
+																		: "narrator",
 															status: node.status,
 															substatus: node.substatus,
 														}}

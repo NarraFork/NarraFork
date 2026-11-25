@@ -27,7 +27,7 @@ keywords:
   - db 句柄
   - bun:sqlite
 status: draft
-verified_at: 2e6441ad0
+verified_at: 7a8bdfb90
 ---
 # 表结构与 Drizzle
 

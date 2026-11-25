@@ -2,7 +2,11 @@ import { DndContext, DragOverlay, useDraggable } from "@dnd-kit/core";
 import type { RecentTabRow } from "@frontend/hooks/recent-tab-folders";
 import {
 	hasDirectorySubtitle,
+	isCoordinatorSessionTab,
 	isTeamOnlookerTab,
+	recentTabHref,
+	recentTabLiveNarratorId,
+	selectProjectRuntimeTabs,
 	statusAttention,
 } from "@frontend/hooks/recent-tabs-utils";
 import { canRevealFromBrowser } from "@frontend/lib/local-origin";
@@ -22,6 +26,7 @@ import {
 import { notifications } from "@mantine/notifications";
 import {
 	RECENT_TAB_FOLDER_DEFAULT_PREVIEW,
+	RECENT_TABS_LIVE_LIMIT,
 	type RecentTabsDelta as RecentTabsDeltaFrame,
 } from "@shared/recent-tabs";
 import { useQueryClient } from "@tanstack/react-query";
@@ -107,6 +112,7 @@ import { createRecentTabHoverStore, type RecentTabHoverStore } from "./recent-ta
  * reload. Importers must reach the logic module directly.
  */
 import { stripKey } from "./recent-tab-keyboard-nav";
+import { recentTabMenuKey, useRecentTabMenuTarget } from "./recent-tab-menu-target";
 import { newSessionTargetFor } from "./recent-tab-new-session";
 import { isBackgroundWorkSilencedStatus, isTabActive } from "./recent-tabs-logic";
 import { useRecentTabExternalDrop } from "./useRecentTabExternalDrop";
@@ -114,11 +120,11 @@ import { useRecentTabsDrag } from "./useRecentTabsDrag";
 import { SwipeMenuHint, useRowSwipe } from "./useRowSwipe";
 
 const PREFETCH_QUERY_GC_TIME_MS = 5 * 60_000;
+const TEAM_RUNTIME_REFRESH_DELAY_MS = 2_000;
 
 function getRecentTabNarratorId(tab: RecentTab): string | null {
-	if (tab.type === "narrator" || tab.type === "subagent") return tab.id;
-	// group tabs have no single narrator (multi-party)
-	return null;
+	// Team rows may reference their coordinator, but only session rows receive session attention.
+	return tab.type === "team" ? null : recentTabLiveNarratorId(tab);
 }
 
 // Each list owns its click guard and pending submission state.
@@ -140,6 +146,15 @@ function tabSortId(tab: RecentTab) {
 
 interface RecentTabsWSProviderProps {
 	onNavigate?: () => void;
+}
+
+/** The part of a coordinator's socket patch a team tab shows. */
+function teamTabPatch(patch: Partial<RecentTab>): Partial<RecentTab> {
+	const picked: Partial<RecentTab> = {};
+	if (patch.title !== undefined) picked.title = patch.title;
+	if (patch.status !== undefined) picked.status = patch.status;
+	if (patch.substatus !== undefined) picked.substatus = patch.substatus;
+	return picked;
 }
 
 /** Invisible root component that maintains the bounded RecentTabs live window. */
@@ -169,18 +184,35 @@ function RecentTabsLiveWindow({ scope, tabs }: { scope: RecentTabsScope; tabs: R
 	userPrefsRef.current = userPrefs;
 	const deltaBatchesRef = useRef<Parameters<typeof collectRecentTabsDeltaFrame>[0]>(new Map());
 
-	const liveTabs = useMemo(() => selectRecentTabsLiveWindow(tabs, pathname), [tabs, pathname]);
+	// Project tabs have no narrator socket; their hover-card details still come with the
+	// runtime patches, within the same per-request key budget.
+	const projectRuntimeTabs = useMemo(
+		() => selectProjectRuntimeTabs(tabs, pathname),
+		[tabs, pathname],
+	);
+	const liveTabs = useMemo(
+		() =>
+			selectRecentTabsLiveWindow(
+				tabs,
+				pathname,
+				RECENT_TABS_LIVE_LIMIT - projectRuntimeTabs.length,
+			),
+		[tabs, pathname, projectRuntimeTabs.length],
+	);
+	// A team tab follows its coordinator, so the socket subscribes to it as well.
 	const narratorIds = useMemo(
-		() => liveTabs.map(getRecentTabNarratorId).filter((id): id is string => !!id),
+		() => [...new Set(liveTabs.map(recentTabLiveNarratorId).filter((id): id is string => !!id))],
 		[liveTabs],
 	);
 	// Snapshot membership is independent of display and subscription order.
 	const runtimeTargetsKey = useMemo(
 		() =>
 			JSON.stringify(
-				liveTabs.map((tab) => [tabSortId(tab), getRecentTabNarratorId(tab)] as const).sort(),
+				[...liveTabs, ...projectRuntimeTabs]
+					.map((tab) => [tabSortId(tab), recentTabLiveNarratorId(tab)] as const)
+					.sort(),
 			),
-		[liveTabs],
+		[liveTabs, projectRuntimeTabs],
 	);
 	const runtimeTargets = useMemo(
 		() => JSON.parse(runtimeTargetsKey) as Array<[string, string | null]>,
@@ -256,14 +288,27 @@ function RecentTabsLiveWindow({ scope, tabs }: { scope: RecentTabsScope; tabs: R
 		return request.promise;
 	}, [qc, runtimeKeys, runtimeNarratorIds, runtimeNarratorIdsByKey, scope]);
 
+	const teamRuntimeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	useEffect(() => {
 		pruneRecentTabsRuntimeVersions(runtimeVersionsRef.current, runtimeNarratorIds);
 		void refreshRuntime().catch(() => {});
 		return () => {
 			runtimeRequestRef.current?.controller.abort();
 			runtimeRequestRef.current = null;
+			if (teamRuntimeTimerRef.current) clearTimeout(teamRuntimeTimerRef.current);
+			teamRuntimeTimerRef.current = null;
 		};
 	}, [refreshRuntime, runtimeNarratorIds]);
+
+	// Access changes remount this window. Coordinator status frames also coalesce a one-shot
+	// refresh: the team's pending-approval count has no socket frame of its own.
+	const scheduleTeamRuntimeRefresh = useCallback(() => {
+		if (teamRuntimeTimerRef.current) return;
+		teamRuntimeTimerRef.current = setTimeout(() => {
+			teamRuntimeTimerRef.current = null;
+			void refreshRuntime().catch(() => {});
+		}, TEAM_RUNTIME_REFRESH_DELAY_MS);
+	}, [refreshRuntime]);
 
 	const pendingTabPatchesRef = useRef(new Map<string, Partial<RecentTab>>());
 	const tabPatchRafRef = useRef(0);
@@ -282,9 +327,12 @@ function RecentTabsLiveWindow({ scope, tabs }: { scope: RecentTabsScope; tabs: R
 		if (pending.size === 0) return;
 		pendingTabPatchesRef.current = new Map();
 		const patches = tabsRef.current.flatMap((tab) => {
-			const narratorId = getRecentTabNarratorId(tab);
+			const narratorId = recentTabLiveNarratorId(tab);
 			const patch = narratorId ? pending.get(narratorId) : undefined;
-			return patch ? [{ key: tabSortId(tab), patch }] : [];
+			if (!patch) return [];
+			// A team tab shows its coordinator's name and state, not the session's own terminals,
+			// viewers or draft.
+			return [{ key: tabSortId(tab), patch: tab.type === "team" ? teamTabPatch(patch) : patch }];
 		});
 		applyRecentTabsRuntimePatches(qc, patches, scope);
 	}, [qc, scope]);
@@ -329,6 +377,8 @@ function RecentTabsLiveWindow({ scope, tabs }: { scope: RecentTabsScope; tabs: R
 				// The subscription reconciles caches for ALL changes before this callback.
 				// Attention is separate: no synthetic status patch or urgency-gated refetch.
 				const tab = tabsRef.current.find((item) => getRecentTabNarratorId(item) === narratorId);
+				// Only a session tab alerts; a pinned team's coordinator does not (see below).
+				if (!tab) return;
 				updateAsyncQuestionAttention(
 					narratorId,
 					event.questionId,
@@ -344,7 +394,21 @@ function RecentTabsLiveWindow({ scope, tabs }: { scope: RecentTabsScope; tabs: R
 			// response must not roll them back (icon colour / filled state lag).
 			bumpRecentTabRuntimeVersions(runtimeVersionsRef.current, narratorId, Object.keys(patch));
 
-			if (event.type === "status") {
+			// The socket also follows the coordinators of pinned teams. Their status reaches the
+			// team tab below, but alerts belong to session tabs: pinning a team is not a request
+			// to be told each time its coordinator waits.
+			const hasSessionTab = tabsRef.current.some(
+				(tab) => getRecentTabNarratorId(tab) === narratorId,
+			);
+			if (
+				event.type === "status" &&
+				tabsRef.current.some((tab) => tab.type === "team" && tab.id === narratorId)
+			) {
+				// The tree's pending approvals may have moved with it; read them again.
+				scheduleTeamRuntimeRefresh();
+			}
+
+			if (event.type === "status" && hasSessionTab) {
 				const isReflecting = event.substatus?.includes("reflecting");
 				/*
 				 * A narrator parked until an unavailable model recovers is also
@@ -412,7 +476,7 @@ function RecentTabsLiveWindow({ scope, tabs }: { scope: RecentTabsScope; tabs: R
 			pendingTabPatchesRef.current.set(narratorId, existing ? { ...existing, ...patch } : patch);
 			scheduleTabPatchFlush();
 		},
-		[qc, scheduleTabPatchFlush, scope],
+		[qc, scheduleTabPatchFlush, scheduleTeamRuntimeRefresh, scope],
 	);
 
 	const handleGlobalEvent = useCallback(
@@ -568,11 +632,9 @@ function ScopedRecentTabList({
 		[qc],
 	);
 
-	const [ctxMenu, setCtxMenu] = useState<{
-		x: number;
-		y: number;
-		tab: RecentTab;
-	} | null>(null);
+	// The menu holds the row's key; the tab is read from the live list on each render, so its
+	// details follow runtime patches and a row that leaves the list closes it.
+	const [ctxMenu, ctxTab, setCtxMenu] = useRecentTabMenuTarget(tabs);
 
 	// Rename / archive-from-context-menu modal state
 	const [renameTab, setRenameTab] = useState<{ id: string; title: string } | null>(null);
@@ -652,6 +714,7 @@ function ScopedRecentTabList({
 	const hasClearableTabs = tabs.some(
 		(tab) =>
 			tab.type !== "project" &&
+			tab.type !== "team" &&
 			tab.type !== "folder" &&
 			!tab.folderId &&
 			!tab.pinned &&
@@ -690,36 +753,42 @@ function ScopedRecentTabList({
 		[removeTab, navigate],
 	);
 
-	const handleContextMenu = useCallback((e: React.MouseEvent, tab: RecentTab) => {
-		e.preventDefault();
-		e.stopPropagation();
-		setCtxMenu({ x: e.clientX, y: e.clientY, tab });
-	}, []);
+	const handleContextMenu = useCallback(
+		(e: React.MouseEvent, tab: RecentTab) => {
+			e.preventDefault();
+			e.stopPropagation();
+			setCtxMenu({ x: e.clientX, y: e.clientY, key: recentTabMenuKey(tab) });
+		},
+		[setCtxMenu],
+	);
 
 	/** Touch: a left swipe opens the same menu at the release point. */
-	const handleSwipeMenu = useCallback((tab: RecentTab, x: number, y: number) => {
-		setCtxMenu({ x, y, tab });
-	}, []);
+	const handleSwipeMenu = useCallback(
+		(tab: RecentTab, x: number, y: number) => {
+			setCtxMenu({ x, y, key: recentTabMenuKey(tab) });
+		},
+		[setCtxMenu],
+	);
 
 	const handleMoveToTop = useCallback(() => {
-		if (!ctxMenu) return;
-		moveTab(tabSortId(ctxMenu.tab), { position: "top" });
+		if (!ctxMenu || !ctxTab) return;
+		moveTab(tabSortId(ctxTab), { position: "top" });
 		setCtxMenu(null);
-	}, [ctxMenu, moveTab]);
+	}, [ctxMenu, ctxTab, moveTab, setCtxMenu]);
 
 	const pinTabToggle = useCallback(
 		(tab: RecentTab) => pinTab(tabSortId(tab), !tab.pinned),
 		[pinTab],
 	);
 	const handlePin = useCallback(() => {
-		if (!ctxMenu) return;
+		if (!ctxMenu || !ctxTab) return;
 		setCtxMenu(null);
-		pinTabToggle(ctxMenu.tab);
-	}, [ctxMenu, pinTabToggle]);
+		pinTabToggle(ctxTab);
+	}, [ctxMenu, ctxTab, pinTabToggle, setCtxMenu]);
 
 	const handleLeaveFolder = useCallback(() => {
-		if (!ctxMenu) return;
-		const { tab } = ctxMenu;
+		if (!ctxMenu || !ctxTab) return;
+		const tab = ctxTab;
 		setCtxMenu(null);
 		if (!tab.folderId) return;
 		const folder = tabsRef.current.find(
@@ -732,21 +801,21 @@ function ScopedRecentTabList({
 			tabSortId(tab),
 			folder?.pinned ? { folderId: null } : { afterKey: `folder:${tab.folderId}`, folderId: null },
 		);
-	}, [ctxMenu, moveTab]);
+	}, [ctxMenu, ctxTab, moveTab, setCtxMenu]);
 
 	const handleEditFolder = useCallback(() => {
-		if (!ctxMenu) return;
-		setEditFolder(ctxMenu.tab);
+		if (!ctxMenu || !ctxTab) return;
+		setEditFolder(ctxTab);
 		setCtxMenu(null);
-	}, [ctxMenu]);
+	}, [ctxMenu, ctxTab, setCtxMenu]);
 
 	const handleDissolveFolder = useCallback(() => {
-		if (!ctxMenu) return;
-		const { tab } = ctxMenu;
+		if (!ctxMenu || !ctxTab) return;
+		const tab = ctxTab;
 		setCtxMenu(null);
 		setFolderDisplay(tab.id, null);
 		void dissolveFolder(tab.id).catch(() => {});
-	}, [ctxMenu, dissolveFolder, setFolderDisplay]);
+	}, [ctxMenu, ctxTab, dissolveFolder, setFolderDisplay, setCtxMenu]);
 
 	const toggleFolderCollapsed = useCallback(
 		(folder: RecentTab) => {
@@ -757,20 +826,20 @@ function ScopedRecentTabList({
 	);
 
 	const handleCtxFolderToggle = useCallback(() => {
-		if (!ctxMenu) return;
-		toggleFolderCollapsed(ctxMenu.tab);
+		if (!ctxMenu || !ctxTab) return;
+		toggleFolderCollapsed(ctxTab);
 		setCtxMenu(null);
-	}, [ctxMenu, toggleFolderCollapsed]);
+	}, [ctxMenu, ctxTab, toggleFolderCollapsed, setCtxMenu]);
 
 	const closeTabRow = useCallback(
 		(tab: RecentTab) => handleRemove(tab.type, tab.id),
 		[handleRemove],
 	);
 	const handleCtxClose = useCallback(() => {
-		if (!ctxMenu) return;
+		if (!ctxMenu || !ctxTab) return;
 		setCtxMenu(null);
-		closeTabRow(ctxMenu.tab);
-	}, [ctxMenu, closeTabRow]);
+		closeTabRow(ctxTab);
+	}, [ctxMenu, ctxTab, closeTabRow, setCtxMenu]);
 
 	/**
 	 * Resolve the on-disk directory a tab points at: its narrator's cwd. Returns null
@@ -841,10 +910,10 @@ function ScopedRecentTabList({
 		[requireSetup, resolveTabDirectory, closeNewNarratorHere, t],
 	);
 	const handleNewNarratorHere = useCallback(() => {
-		if (!ctxMenu) return;
+		if (!ctxMenu || !ctxTab) return;
 		setCtxMenu(null);
-		void newNarratorHereFor(ctxMenu.tab);
-	}, [ctxMenu, newNarratorHereFor]);
+		void newNarratorHereFor(ctxTab);
+	}, [ctxMenu, ctxTab, newNarratorHereFor, setCtxMenu]);
 
 	const handleNewNarratorHereCreated = useCallback(
 		// The modal closes (clearing `newNarratorTarget`) before it reports creation, so the
@@ -889,8 +958,8 @@ function ScopedRecentTabList({
 	const revealAvailable = fsRevealCapability.supported && canRevealFromThisBrowser;
 
 	const handleReveal = useCallback(async () => {
-		if (!ctxMenu) return;
-		const { tab } = ctxMenu;
+		if (!ctxMenu || !ctxTab) return;
+		const tab = ctxTab;
 		setCtxMenu(null);
 		if (!revealAvailable) return;
 		try {
@@ -904,7 +973,7 @@ function ScopedRecentTabList({
 		} catch {
 			// ignore
 		}
-	}, [ctxMenu, revealAvailable]);
+	}, [ctxMenu, ctxTab, revealAvailable, setCtxMenu]);
 
 	/** 复制工作目录到剪贴板（narrator/subagent） */
 	const copyTabCwd = useCallback(
@@ -926,10 +995,10 @@ function ScopedRecentTabList({
 		[resolveTabDirectory, t],
 	);
 	const handleCopyCwd = useCallback(() => {
-		if (!ctxMenu) return;
+		if (!ctxMenu || !ctxTab) return;
 		setCtxMenu(null);
-		void copyTabCwd(ctxMenu.tab);
-	}, [ctxMenu, copyTabCwd]);
+		void copyTabCwd(ctxTab);
+	}, [ctxMenu, ctxTab, copyTabCwd, setCtxMenu]);
 
 	/** 在外部窗口打开该标签（叙述者 → chat 面板窗口；project → 主应用窗口） */
 	const openTabInWindow = useCallback((tab: RecentTab) => {
@@ -937,10 +1006,10 @@ function ScopedRecentTabList({
 		if (href) window.open(href, "_blank", PANEL_WINDOW_FEATURES);
 	}, []);
 	const handleOpenInWindow = useCallback(() => {
-		if (!ctxMenu) return;
+		if (!ctxMenu || !ctxTab) return;
 		setCtxMenu(null);
-		openTabInWindow(ctxMenu.tab);
-	}, [ctxMenu, openTabInWindow]);
+		openTabInWindow(ctxTab);
+	}, [ctxMenu, ctxTab, openTabInWindow, setCtxMenu]);
 
 	/** 打开重命名对话框 */
 	const renameTabRow = useCallback((tab: RecentTab) => {
@@ -949,10 +1018,10 @@ function ScopedRecentTabList({
 		setRenameTab({ id: tab.id, title: tab.title || "" });
 	}, []);
 	const handleRename = useCallback(() => {
-		if (!ctxMenu) return;
+		if (!ctxMenu || !ctxTab) return;
 		setCtxMenu(null);
-		renameTabRow(ctxMenu.tab);
-	}, [ctxMenu, renameTabRow]);
+		renameTabRow(ctxTab);
+	}, [ctxMenu, ctxTab, renameTabRow, setCtxMenu]);
 
 	/** 提交重命名 */
 	const handleRenameSubmit = useCallback(async () => {
@@ -986,10 +1055,10 @@ function ScopedRecentTabList({
 		setArchiveConfirmTab({ id: tab.id });
 	}, []);
 	const handleArchive = useCallback(() => {
-		if (!ctxMenu) return;
+		if (!ctxMenu || !ctxTab) return;
 		setCtxMenu(null);
-		archiveTabRow(ctxMenu.tab);
-	}, [ctxMenu, archiveTabRow]);
+		archiveTabRow(ctxTab);
+	}, [ctxMenu, ctxTab, archiveTabRow, setCtxMenu]);
 
 	/** 执行归档 */
 	const handleArchiveConfirm = useCallback(() => {
@@ -1269,7 +1338,6 @@ function ScopedRecentTabList({
 		],
 	);
 
-	const ctxTab = ctxMenu?.tab;
 	const ctxIsFolder = ctxTab?.type === "folder";
 	const ctxInFolder = !!ctxTab?.folderId;
 	const ctxUnitKey = ctxTab ? (ctxInFolder ? `folder:${ctxTab.folderId}` : tabSortId(ctxTab)) : "";
@@ -1364,7 +1432,12 @@ function ScopedRecentTabList({
 								pinScope={ctxInFolder ? "folder" : "list"}
 								onRemove={handleCtxClose}
 								onReveal={handleReveal}
-								canReveal={revealAvailable && ctxTab.type !== "project" && !ctxIsFolder}
+								canReveal={
+									revealAvailable &&
+									ctxTab.type !== "project" &&
+									ctxTab.type !== "team" &&
+									!ctxIsFolder
+								}
 								onNewNarratorHere={handleNewNarratorHere}
 								canNewNarratorHere={newSessionTargetFor(ctxTab) !== null}
 								newNarratorHereLabel={ctxIsFolder ? t("newNarratorInFolder") : t("newNarratorHere")}
@@ -1492,14 +1565,33 @@ function DragOverlayTabItem({ tab, active }: { tab: RecentTab; active: boolean }
 }
 
 /** Shared by normal rows and the drag overlay so the optional cwd stays consistent. */
-function RecentTabTitle({ tab }: { tab: RecentTab }) {
+export function RecentTabTitle({ tab }: { tab: RecentTab }) {
+	const { t } = useTranslation("nav");
 	const { data: userPrefs } = useUserPreferences();
 	const showDirectory = userPrefs?.recentTabsShowDirectory ?? false;
+	// A coordinator's session sits next to its team's tab with the same title: label it.
+	const coordinator = isCoordinatorSessionTab(tab);
 	return (
 		<Stack gap={0} style={{ minWidth: 0 }}>
-			<Text size="sm" truncate>
-				{tab.title}
-			</Text>
+			{coordinator ? (
+				<Group gap={6} wrap="nowrap" style={{ minWidth: 0 }}>
+					<Text size="sm" truncate style={{ minWidth: 0 }}>
+						{tab.title}
+					</Text>
+					<Text
+						size="xs"
+						c="dimmed"
+						style={{ flexShrink: 0, whiteSpace: "nowrap" }}
+						data-testid="recent-tab-coordinator-label"
+					>
+						{t("recentTabCoordinatorLabel")}
+					</Text>
+				</Group>
+			) : (
+				<Text size="sm" truncate>
+					{tab.title}
+				</Text>
+			)}
 			{showDirectory && hasDirectorySubtitle(tab) && tab.subtitle && (
 				<LeftTruncatedPathText path={tab.subtitle} size="xs" c="dimmed" />
 			)}
@@ -1563,7 +1655,8 @@ function TabItemBody({
 	const drag = useContext(RecentTabsDragContext);
 	const hover = useContext(RecentTabHoverContext);
 	const { t } = useTranslation("common");
-	const to = tab.type === "project" ? `/projects/${tab.id}` : `/narrators/${tab.id}`;
+	// A team tab without a project yet (never the case for a stored one) stays put.
+	const href = recentTabHref(tab);
 	const iconColor = getNarratorStatusIconColor(tab);
 	const rowKey = tabSortId(tab);
 
@@ -1573,10 +1666,11 @@ function TabItemBody({
 	const handleClick = useCallback(() => {
 		if (drag.consumeClick()) return;
 		hover?.hide();
+		if (!href) return;
 		handlePrefetch();
-		navigate({ to });
+		navigate({ to: href });
 		onNavigate?.();
-	}, [drag.consumeClick, hover, handlePrefetch, navigate, to, onNavigate]);
+	}, [drag.consumeClick, hover, handlePrefetch, navigate, href, onNavigate]);
 
 	// Mouse only: touch has no hover, its details live at the top of the row menu.
 	const handlePointerEnter = useCallback(
@@ -1640,7 +1734,7 @@ function TabItemBody({
 	);
 
 	// Icon and body use the same sensors and cross-surface drag bridge.
-	const dragNarratorId = getRecentTabNarratorId(tab);
+	const dragNarratorId = recentTabLiveNarratorId(tab);
 	return (
 		<div
 			ref={outerRef}
@@ -1653,6 +1747,8 @@ function TabItemBody({
 				position: "relative",
 			}}
 			data-tab-sort-id={tabSortId(tab)}
+			// Where Enter leads from the keyboard: a team page's path needs its project.
+			data-tab-href={href ?? undefined}
 		>
 			<SwipeMenuHint swipeX={swipe.swipeX} label={t("swipeMenu")} />
 			<div style={swipe.style}>

@@ -5,16 +5,17 @@ import {
 } from "@shared/narrator-communication";
 import { foldHandle } from "@shared/narrator-handle";
 import type { PersistedRecentTab } from "@shared/recent-tabs";
+import { recentTabLiveNarratorId } from "./recent-tabs-utils";
 
 /** Flat recent-tab pages include members of collapsed folders; never use visual row order. */
 export function localNarratorMentionCandidates(
 	tabs: readonly PersistedRecentTab[],
 	sourceId: string | undefined,
 ): CommunicationCandidate[] {
-	const byId = new Map<string, CommunicationCandidate>();
+	const byId = new Map<string, { item: CommunicationCandidate; fromTeam: boolean }>();
 	for (const tab of tabs) {
-		const id = tab.type === "subagent" ? (tab.narratorId ?? tab.id) : tab.id;
-		if ((tab.type !== "narrator" && tab.type !== "subagent") || id === sourceId) continue;
+		const id = recentTabLiveNarratorId(tab);
+		if (!id || id === sourceId) continue;
 		const activity =
 			(tab as PersistedRecentTab & { lastMessageAt?: string; lastActivityAt?: string })
 				.lastMessageAt ?? (tab as { lastActivityAt?: string }).lastActivityAt;
@@ -24,17 +25,27 @@ export function localNarratorMentionCandidates(
 				? activity
 				: new Date(visited).toISOString();
 		const previous = byId.get(id);
-		if (previous && (previous.lastActivityAt ?? "") >= time) continue;
+		const previousTime = previous?.item.lastActivityAt ?? "";
+		const fromTeam = tab.type === "team";
+		// If both tabs exist, prefer the coordinator's session title/status (including local
+		// renames), but keep the newer activity of either tab for ordering.
+		if (previous && (fromTeam !== previous.fromTeam ? fromTeam : previousTime >= time)) {
+			if (time > previousTime) previous.item.lastActivityAt = time;
+			continue;
+		}
 		byId.set(id, {
-			id,
-			title: tab.title || null,
-			status: tab.status ?? "idle",
-			lastActivityAt: time,
-			isRecent: true,
-			canConnect: true,
+			fromTeam,
+			item: {
+				id,
+				title: tab.title || null,
+				status: tab.status ?? "idle",
+				lastActivityAt: previousTime > time ? previousTime : time,
+				isRecent: true,
+				canConnect: true,
+			},
 		});
 	}
-	return [...byId.values()];
+	return [...byId.values()].map(({ item }) => item);
 }
 
 export function mergeNarratorMentionCandidates(

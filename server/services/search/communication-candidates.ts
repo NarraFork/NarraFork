@@ -142,7 +142,10 @@ function buildQuery(
 				substr(${ACTIVITY}, 1, 64) AS last_activity_at,
 				CASE WHEN EXISTS (
 					SELECT 1 FROM user_recent_tabs recent
-					WHERE recent.user_id = ? AND recent.represented_narrator_id = n.id
+					WHERE recent.user_id = ? AND (
+						recent.represented_narrator_id = n.id
+						OR (recent.type = 'team' AND recent.entity_id = n.id)
+					)
 				) THEN 1 ELSE 0 END AS is_recent,
  (SELECT substr(parent.title,1,512) FROM narrators parent WHERE parent.id=n.parent_narrator_id AND NOT parent.hidden_from_lists AND ${parentReadable.sql} LIMIT 1) AS parent_title,
  CASE WHEN EXISTS(SELECT 1 FROM source_members m WHERE m.id=n.id) THEN 1 ELSE 0 END AS same_group,

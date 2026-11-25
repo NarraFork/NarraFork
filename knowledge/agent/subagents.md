@@ -77,7 +77,7 @@ keywords:
   - subagent_nested_changed
   - FORK_NARRATOR_MAX_DEPTH
 status: draft
-verified_at: 2c639f086aef21d60357f1e002e62767938833e8
+verified_at: 4606114a5848dc45cd5cea3ab355234d43e11ccd
 ---
 # 子代理
 
@@ -96,6 +96,7 @@ verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 - 普通 Send 的可达性单独由通讯森林和精确 peer 决定：同一通讯根下的主代理、子代理和二级助手可互发；不同组只有两个精确端点的 peer 可达，不沿 peer 传递。每次重连分配新关系 ID，断连按此身份且以任一实际可管理端点发起，不另维护固定代际。名单和投影有展示上限，精确 ID 的授权不依赖截断名单。ContextAsk、Watch、Stop、TeamStatus 的原控制/读取范围不因此扩大。
 - “移出通讯组”仅清所选节点的通讯父边，后代仍随该节点组成一组；恢复只接回持久保存的原通讯父边。controller、policy source、ACL root、工作项和自动结果回传保持不变。普通 Send(parent)、TeamStatus.send/broadcast 与 work.sync 都受普通消息最终准入 gate 约束，注册的任务结果通知不借此重建 peer。
 - 子代理出生同事务写通讯节点；普通 fork 创建独立通讯根。旧数据初始化只补缺失节点，显式 NULL 不再推导为继承；坏链/环/超深拒绝域授权。发送时重新读取源会话持久执行身份和当前权限，不能借消息作者覆盖接收会话身份。
+- `isolation: "worktree"` 建的工作项分支名取标题的 ASCII 单词；标题里没有（中文标题）时改用 `description` 的英文单词作 `branchHint`（`task.ts`），规则见[工作项](../collaboration/teams/work-items.md)。
 
 ## 从哪读起
 - `server/lib/agent/tools/task.ts`：工具入口与参数。

@@ -29,6 +29,7 @@ import {
 	type RecentTabFolderColor,
 	type RecentTabFolderIcon,
 	type RecentTabRuntimePatch,
+	type RecentTabStateResult,
 	type RecentTabsDelta,
 	type RecentTabsMutationResult,
 	type RecentTabsOperation,
@@ -37,11 +38,12 @@ import {
 	type RecentTabsSection,
 	type RecentTabType,
 } from "@shared/recent-tabs";
-import { and, asc, desc, eq, gt, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, ne, notInArray, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
 	narrators,
 	projects,
+	projectTeams,
 	recentTabArchiveMarks,
 	userPreferences,
 	userRecentTabs,
@@ -87,6 +89,11 @@ interface MutationOptions {
 	 * one-time workspace→folder conversion commits together with its flag.
 	 */
 	markFoldersMigrated?: boolean;
+	/**
+	 * Write the row diff even when the visible list did not change, for a one-time conversion
+	 * of a column the list does not show (`section`).
+	 */
+	forceRowSync?: boolean;
 }
 
 interface MutationState {
@@ -114,11 +121,16 @@ function tabKey(tab: Pick<PersistedRecentTab, "type" | "id">): string {
 	return `${tab.type}:${tab.id}`;
 }
 
-function tabSection(type: RecentTabType): RecentTabsSection {
-	return type === "project" ? "projects" : "work";
+/**
+ * Every tab the sidebar stores lives in its one list, `work`: sessions, folders, and the projects
+ * and teams pinned there. `projects` only holds rows written before project tabs moved into the
+ * list; `convertLegacyProjectSectionLocked` empties it once per user.
+ */
+function tabSection(_type: RecentTabType): RecentTabsSection {
+	return "work";
 }
 
-function getTabNarratorId(tab: PersistedRecentTab): string | undefined {
+function getTabNarratorId(tab: Pick<PersistedRecentTab, "type" | "id">): string | undefined {
 	if (tab.type === "narrator" || tab.type === "subagent") return tab.id;
 	return undefined;
 }
@@ -128,7 +140,10 @@ function cloneTab(tab: PersistedRecentTab): PersistedRecentTab {
 }
 
 /** Recheck only the bounded IDs already collected for a user-facing read or delta. */
-function readableRecentTabKeys(userId: string, tabs: readonly PersistedRecentTab[]): Set<string> {
+function readableRecentTabKeys(
+	userId: string,
+	tabs: readonly Pick<PersistedRecentTab, "type" | "id">[],
+): Set<string> {
 	const readableKeys = new Set<string>();
 	if (tabs.length === 0) return readableKeys;
 	const user = db.select({ role: users.role }).from(users).where(eq(users.id, userId)).get();
@@ -166,11 +181,33 @@ function readableRecentTabKeys(userId: string, tabs: readonly PersistedRecentTab
 					.map((row) => row.id)
 			: [],
 	);
+	// A team is a bookmark, not a represented narrator. It must still exist as a team,
+	// and its coordinator's ACL (not the project's ACL by itself) controls the tab.
+	const teamIds = [...new Set(tabs.filter((tab) => tab.type === "team").map((tab) => tab.id))];
+	const readableTeams = new Set(
+		teamIds.length
+			? db
+					.select({ id: projectTeams.narratorId })
+					.from(projectTeams)
+					.innerJoin(narrators, eq(narrators.id, projectTeams.narratorId))
+					.where(
+						and(
+							inArray(projectTeams.narratorId, teamIds),
+							ne(narrators.status, "archived"),
+							narratorReadableWhere(principal),
+						),
+					)
+					.limit(teamIds.length)
+					.all()
+					.map((row) => row.id)
+			: [],
+	);
 	for (const tab of tabs) {
 		const narratorId = getTabNarratorId(tab);
 		if (
 			tab.type === "folder" ||
 			(tab.type === "project" && readableProjects.has(tab.id)) ||
+			(tab.type === "team" && readableTeams.has(tab.id)) ||
 			(narratorId !== undefined && readableNarrators.has(narratorId))
 		) {
 			readableKeys.add(tabKey(tab));
@@ -179,10 +216,20 @@ function readableRecentTabKeys(userId: string, tabs: readonly PersistedRecentTab
 	return readableKeys;
 }
 
-function projectVisibleRecentTabs(tabs: PersistedRecentTab[], readableKeys: ReadonlySet<string>) {
+function projectVisibleRecentTabs<T extends Pick<PersistedRecentTab, "type" | "id" | "folderId">>(
+	tabs: T[],
+	readableKeys: ReadonlySet<string>,
+): T[] {
 	const visible = tabs.filter((tab) => readableKeys.has(tabKey(tab)));
 	const foldersWithVisibleMembers = new Set(visible.map((tab) => tab.folderId));
 	return visible.filter((tab) => tab.type !== "folder" || foldersWithVisibleMembers.has(tab.id));
+}
+
+/** Recheck a bounded legacy snapshot immediately before sending it, after any async enrichment. */
+export function filterReadableRecentTabs<
+	T extends Pick<PersistedRecentTab, "type" | "id" | "folderId">,
+>(userId: string, tabs: T[]): T[] {
+	return projectVisibleRecentTabs(tabs, readableRecentTabKeys(userId, tabs));
 }
 
 function normalizeLegacyTab(value: unknown): PersistedRecentTab | null {
@@ -261,6 +308,7 @@ function normalizeTab(tab: PersistedRecentTab): PersistedRecentTab {
 	if (tab.subtitle !== undefined) {
 		normalized.subtitle = tab.subtitle.slice(0, RECENT_TAB_TEXT_MAX_CHARS);
 	}
+	if (tab.projectId && tab.type === "team") normalized.projectId = tab.projectId;
 	if (tab.status !== undefined) normalized.status = tab.status;
 	if (tab.pinned) normalized.pinned = true;
 	if (tab.isScheduled) normalized.isScheduled = true;
@@ -403,7 +451,9 @@ function parseLegacyTabs(recentTabsJson: string | null | undefined): PersistedRe
 	}
 	const tabs = values
 		.map(normalizeLegacyTab)
-		.filter((tab): tab is PersistedRecentTab => tab !== null);
+		.filter((tab): tab is PersistedRecentTab => tab !== null)
+		// Old automatic project visits must not take capacity from tabs we actually migrate.
+		.filter((tab) => tab.type !== "project" || tab.pinned === true);
 	return normalizeAndLimitTabs(tabs).tabs;
 }
 
@@ -424,6 +474,7 @@ function rowToTab(row: RecentTabRow): PersistedRecentTab {
 	if (row.folderIcon) tab.folderIcon = row.folderIcon as RecentTabFolderIcon;
 	if (row.folderColor) tab.folderColor = row.folderColor as RecentTabFolderColor;
 	if (row.folderPreviewCount != null) tab.folderPreviewCount = row.folderPreviewCount;
+	if (row.projectId) tab.projectId = row.projectId;
 	return tab;
 }
 
@@ -453,13 +504,13 @@ function legacyRowToTab(row: RecentTabRow): PersistedRecentTab {
  */
 const EXCLUDE_REMOVED_TAB_TYPES = notInArray(userRecentTabs.type, ["group", "chapter"]);
 
-function readRows(userId: string): RecentTabRow[] {
+function readRows(userId: string, limit = RECENT_TABS_STORAGE_LIMIT + 1): RecentTabRow[] {
 	return db
 		.select()
 		.from(userRecentTabs)
 		.where(and(eq(userRecentTabs.userId, userId), EXCLUDE_REMOVED_TAB_TYPES))
 		.orderBy(asc(userRecentTabs.sortOrder), asc(userRecentTabs.tabKey))
-		.limit(RECENT_TABS_STORAGE_LIMIT + 1)
+		.limit(limit)
 		.all();
 }
 
@@ -489,6 +540,7 @@ function buildRowValue(
 		folderIcon: tab.folderIcon ?? null,
 		folderColor: tab.folderColor ?? null,
 		folderPreviewCount: tab.folderPreviewCount ?? null,
+		projectId: tab.projectId ?? null,
 		title: tab.title,
 		subtitle: tab.subtitle ?? null,
 		status: tab.status ?? null,
@@ -616,6 +668,7 @@ function rowNeedsUpdate(row: RecentTabRow, desired: RecentTabInsert): boolean {
 		(row.folderIcon ?? null) !== (desired.folderIcon ?? null) ||
 		(row.folderColor ?? null) !== (desired.folderColor ?? null) ||
 		(row.folderPreviewCount ?? null) !== (desired.folderPreviewCount ?? null) ||
+		(row.projectId ?? null) !== (desired.projectId ?? null) ||
 		row.title !== desired.title ||
 		row.subtitle !== desired.subtitle ||
 		row.status !== desired.status ||
@@ -667,6 +720,7 @@ function applyRowDiffInTransaction(
 				folderIcon: desired.folderIcon ?? null,
 				folderColor: desired.folderColor ?? null,
 				folderPreviewCount: desired.folderPreviewCount ?? null,
+				projectId: desired.projectId ?? null,
 				title: desired.title,
 				subtitle: desired.subtitle,
 				status: desired.status,
@@ -729,17 +783,67 @@ function readMeta(userId: string): { revision: number; foldersMigrated: boolean 
 function convertLegacyWorkspaceRowsLocked(userId: string, revision: number): number {
 	const oldRows = readRows(userId);
 	const before = oldRows.map(rowToTab);
-	const after = normalizeAndLimitTabs(oldRows.map(legacyRowToTab)).tabs;
+	// Every row it keeps is rewritten into `work`, so the retired `projects` rule has to be
+	// applied here, while the rows still carry their old section (see `isRetiredProjectVisit`).
+	const after = normalizeAndLimitTabs(
+		oldRows.filter((row) => !isRetiredProjectVisit(row)).map(legacyRowToTab),
+	).tabs;
 	return persistMutationLocked(userId, oldRows, before, after, revision, {
 		markFoldersMigrated: true,
 	}).revision;
 }
 
+/**
+ * One-time move of a user's project tabs out of the retired `projects` section.
+ *
+ * The sidebar stopped rendering that section, so its rows were invisible: tabs recorded by
+ * visiting project pages back then. Now that project tabs share the sidebar's one list, a pinned
+ * one (a deliberate choice) joins the list, and the rest are dropped rather than surfacing
+ * long-forgotten visits in it.
+ *
+ * Runs under the user's lock. The probe is one indexed `LIMIT 1` read
+ * (`idx_user_recent_tabs_user_section_order`), so after the conversion it costs nearly nothing.
+ * The rewrite is forced even when the visible list stays the same (only pinned rows), because
+ * the rows' `section` still has to change.
+ */
+/**
+ * The one rule for rows of the retired `projects` section: an unpinned one is an old automatic
+ * visit and is dropped; a pinned one was a deliberate choice and joins `work`. Both one-time
+ * conversions below apply it, and the pin-state read answers as if it had already run.
+ */
+function isRetiredProjectVisit(row: Pick<RecentTabRow, "section" | "pinned">): boolean {
+	return row.section === "projects" && !row.pinned;
+}
+
+function convertLegacyProjectSectionLocked(userId: string, revision: number): number {
+	const legacy = db
+		.select({ id: userRecentTabs.id })
+		.from(userRecentTabs)
+		.where(and(eq(userRecentTabs.userId, userId), eq(userRecentTabs.section, "projects")))
+		.limit(1)
+		.get();
+	if (!legacy) return revision;
+	const oldRows = readRows(userId);
+	const before = oldRows.map(rowToTab);
+	const dropped = new Set(oldRows.filter(isRetiredProjectVisit).map((row) => row.tabKey));
+	const after = normalizeAndLimitTabs(before.filter((tab) => !dropped.has(tabKey(tab)))).tabs;
+	return persistMutationLocked(userId, oldRows, before, after, revision, { forceRowSync: true })
+		.revision;
+}
+
+/**
+ * Bring one user's rows to the current shape, under the user's lock. Idempotent: each
+ * conversion records that it ran (the `folders_migrated` flag; no row left in `projects`).
+ * The workspace conversion drops retired project visits itself (it rewrites every row into
+ * `work`, which would otherwise hide them from the project conversion that follows).
+ */
 function ensureMigratedLocked(userId: string): number {
 	const meta = readMeta(userId);
 	if (meta) {
-		if (meta.foldersMigrated) return meta.revision;
-		return convertLegacyWorkspaceRowsLocked(userId, meta.revision);
+		const revision = meta.foldersMigrated
+			? meta.revision
+			: convertLegacyWorkspaceRowsLocked(userId, meta.revision);
+		return convertLegacyProjectSectionLocked(userId, revision);
 	}
 
 	const legacy = db
@@ -747,7 +851,7 @@ function ensureMigratedLocked(userId: string): number {
 		.from(userPreferences)
 		.where(eq(userPreferences.userId, userId))
 		.get();
-	// `parseLegacyTabs` already converts workspace groups, so the flag starts set.
+	// `parseLegacyTabs` already converts workspace groups and drops unpinned project visits.
 	const tabs = parseLegacyTabs(legacy?.recentTabs);
 	const now = new Date().toISOString();
 
@@ -923,7 +1027,7 @@ function persistMutationLocked(
 	options: MutationOptions = {},
 ): RecentTabsMutationResult {
 	const now = new Date().toISOString();
-	if (tabsEqual(before, after)) {
+	if (!options.forceRowSync && tabsEqual(before, after)) {
 		// Nothing visible changed, but the one-time folder conversion still has to record
 		// that it ran — otherwise a user with no workspace groups would re-run it forever.
 		if (options.markFoldersMigrated) {
@@ -1017,6 +1121,11 @@ function findRepresentedTabIndex(
 export type RecentTabUpsertInput = PersistedRecentTab & {
 	updateOnly?: boolean;
 	/**
+	 * Pin (true) or unpin (false) the tab in the same revision that creates or updates it: the
+	 * "pin to sidebar" action of a project or team page. Omitted, the stored pin is kept.
+	 */
+	pin?: boolean;
+	/**
 	 * Position the tab relative to an existing one, in the same revision that creates
 	 * or updates it. Mutually exclusive; see `upsertRecentTabSchema`.
 	 */
@@ -1042,7 +1151,7 @@ function applyRecentTabUpsert(
 	current: PersistedRecentTab[],
 	input: RecentTabUpsertInput,
 ): PersistedRecentTab[] {
-	const { updateOnly, beforeKey, afterKey, ...tabInput } = input;
+	const { updateOnly, beforeKey, afterKey, pin, ...tabInput } = input;
 	if (tabInput.type === "folder" || tabInput.type === "workspace") return current;
 	const tab = normalizeTab(stripStructuralFields(tabInput));
 	const key = tabKey(tab);
@@ -1094,7 +1203,8 @@ function applyRecentTabUpsert(
 	} else if (!updateOnly) {
 		insertNewTab(tabs, tab, anchor);
 	}
-	const normalized = normalizeAndLimitTabs(tabs, key);
+	const placed = pin === undefined ? tabs : applyRecentTabPin(tabs, key, pin);
+	const normalized = normalizeAndLimitTabs(placed, key);
 	return normalized.protectedGroupTooLarge ? before : normalized.tabs;
 }
 
@@ -1106,6 +1216,20 @@ function insertNewTab(
 ): void {
 	if (anchor && tryInsertRelativeToKey(tabs, [tab], anchor.key, anchor.position)) return;
 	tabs.splice(getPinnedSectionEndIndex(tabs), 0, tab);
+}
+
+/**
+ * Team tabs only for teams the user may hold, with the team's own title and project (see
+ * `recent-tab-teams.ts`). Loaded lazily, like the ACL modules elsewhere in this file: most writes
+ * carry no team tab, and the ACL graph is heavy.
+ */
+async function authorizeTeams<T extends PersistedRecentTab>(
+	userId: string,
+	tabs: T[],
+): Promise<T[]> {
+	if (!tabs.some((tab) => tab.type === "team")) return tabs;
+	const { authorizeTeamTabs } = await import("./recent-tab-teams");
+	return authorizeTeamTabs(userId, tabs);
 }
 
 /** 列表里看不见的叙述者（ModelTrace 舱）也不进侧边栏。 */
@@ -1128,6 +1252,9 @@ function withoutHiddenNarratorTabs(inputs: RecentTabUpsertInput[]): RecentTabUps
 	);
 }
 
+/** The code of a single upsert the server refuses (see `upsertRecentTab`). */
+export const RECENT_TAB_REFUSED_CODE = "RECENT_TAB_REFUSED";
+
 export async function upsertRecentTabsBatch(
 	userId: string,
 	inputs: RecentTabUpsertInput[],
@@ -1135,7 +1262,14 @@ export async function upsertRecentTabsBatch(
 	if (inputs.length === 0 || inputs.length > RECENT_TABS_WS_BATCH_SIZE) {
 		throw new ValidationError(`Recent-tabs batch must contain 1-${RECENT_TABS_WS_BATCH_SIZE} tabs`);
 	}
-	const visible = withoutHiddenNarratorTabs(inputs);
+	return upsertVisibleTabs(userId, await authorizeTeams(userId, withoutHiddenNarratorTabs(inputs)));
+}
+
+/** Apply upserts already filtered to the tabs this user may hold. */
+function upsertVisibleTabs(
+	userId: string,
+	visible: RecentTabUpsertInput[],
+): Promise<RecentTabsMutationResult> {
 	return userPreferencesLock.acquire(userId, async () => {
 		const baseRevision = ensureMigratedLocked(userId);
 		if (visible.length === 0) {
@@ -1149,19 +1283,59 @@ export async function upsertRecentTabsBatch(
 	});
 }
 
+/**
+ * Upsert one tab.
+ *
+ * A tab the user may not hold is filtered out like in a batch, but when it was asked for on
+ * purpose (a team tab, or any `pin`: the "pin to sidebar" of a project or team page) the
+ * refusal is an error (409 `RECENT_TAB_REFUSED`), so the page can say so instead of doing
+ * nothing. A page visit of a hidden session stays a silent no-op.
+ */
 export async function upsertRecentTab(
 	userId: string,
 	tabInput: PersistedRecentTab,
-	options: { updateOnly?: boolean; beforeKey?: string; afterKey?: string } = {},
+	options: { updateOnly?: boolean; beforeKey?: string; afterKey?: string; pin?: boolean } = {},
 ): Promise<RecentTabsMutationResult> {
-	return upsertRecentTabsBatch(userId, [
-		{
-			...tabInput,
-			updateOnly: options.updateOnly,
-			...(options.beforeKey ? { beforeKey: options.beforeKey } : {}),
-			...(options.afterKey ? { afterKey: options.afterKey } : {}),
-		},
-	]);
+	const input: RecentTabUpsertInput = {
+		...tabInput,
+		updateOnly: options.updateOnly,
+		...(options.pin !== undefined ? { pin: options.pin } : {}),
+		...(options.beforeKey ? { beforeKey: options.beforeKey } : {}),
+		...(options.afterKey ? { afterKey: options.afterKey } : {}),
+	};
+	const visible = await authorizeTeams(userId, withoutHiddenNarratorTabs([input]));
+	if (visible.length === 0 && (input.type === "team" || input.pin !== undefined)) {
+		throw new AppError("This tab cannot be kept in the sidebar", 409, RECENT_TAB_REFUSED_CODE);
+	}
+	return upsertVisibleTabs(userId, visible);
+}
+
+/**
+ * Whether one tab is in the user's sidebar and pinned, wherever it sits in the list (the page
+ * buttons cannot rely on the sidebar's loaded pages). An indexed lookup and a current ACL check
+ * for one tab, no lock. A row of the retired `projects` section reads as the one-time conversion
+ * will leave it (`isRetiredProjectVisit`).
+ */
+export function getRecentTabState(
+	userId: string,
+	type: RecentTabType,
+	id: string,
+): RecentTabStateResult {
+	const row = db
+		.select({ section: userRecentTabs.section, pinned: userRecentTabs.pinned })
+		.from(userRecentTabs)
+		.where(and(eq(userRecentTabs.userId, userId), eq(userRecentTabs.tabKey, tabKey({ type, id }))))
+		.limit(1)
+		.get();
+	const tab = { type, id };
+	if (
+		!row ||
+		isRetiredProjectVisit(row) ||
+		!readableRecentTabKeys(userId, [tab]).has(tabKey(tab))
+	) {
+		return { present: false, pinned: false };
+	}
+	return { present: true, pinned: row.pinned };
 }
 
 /**
@@ -1441,9 +1615,10 @@ export async function clearRecentTabs(
 			const unit = before.slice(range.start, range.end + 1);
 			let keep =
 				isKeepUnit(before, index, keepTabKey) || unit[0].pinned === true || isFolderTab(unit[0]);
-			if (!keep && scope === "projects") keep = tabSection(unit[0].type) !== "projects";
+			if (!keep && scope === "projects") keep = unit[0].type !== "project";
 			if (!keep && scope === "inactive_narrators") {
-				if (unit[0].type === "project") keep = true;
+				// Not sessions: a project or team tab is never "inactive".
+				if (unit[0].type === "project" || unit[0].type === "team") keep = true;
 				else {
 					keep = unit
 						.map(getTabNarratorId)
@@ -1484,14 +1659,17 @@ export async function restoreRecentTabs(
 			}
 			const oldRows = readRows(userId);
 			const before = oldRows.map(rowToTab);
-			const after = normalizeAndLimitTabs(entry.tabs.map(cloneTab)).tabs;
+			// A close/clear undo must not resurrect a team that was lost while its tab was absent.
+			const authorized = await authorizeTeams(userId, entry.tabs.map(cloneTab));
+			const after = normalizeAndLimitTabs(authorized).tabs;
 			const result = persistMutationLocked(userId, oldRows, before, after, baseRevision);
 			undoByUser.delete(userId);
 			return result;
 		});
 	}
 	if (!input.tabs) throw new ValidationError("tabs or token required");
-	const normalized = normalizeAndLimitTabs(input.tabs.map(cloneTab)).tabs;
+	const authorized = await authorizeTeams(userId, input.tabs.map(cloneTab));
+	const normalized = normalizeAndLimitTabs(authorized).tabs;
 	return mutate(userId, () => ({ tabs: normalized }));
 }
 
@@ -1504,7 +1682,9 @@ interface CursorPayload {
 	r: number;
 	p?: 0 | 1;
 	o: number;
-	k: string;
+	/** Older cursors carry the tab key; new cursors carry the non-entity row ID instead. */
+	k?: string;
+	i?: string;
 }
 
 function encodeCursor(row: RecentTabRow, section: RecentTabsSection, revision: number): string {
@@ -1513,7 +1693,7 @@ function encodeCursor(row: RecentTabRow, section: RecentTabsSection, revision: n
 		r: revision,
 		p: row.pinned ? 1 : 0,
 		o: row.sortOrder,
-		k: row.tabKey,
+		i: row.id,
 	};
 	return Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
 }
@@ -1529,7 +1709,7 @@ function decodeCursor(cursor: string | undefined): CursorPayload | null {
 			(parsed?.p !== undefined && parsed.p !== 0 && parsed.p !== 1) ||
 			typeof parsed?.o !== "number" ||
 			!Number.isInteger(parsed.o) ||
-			typeof parsed?.k !== "string"
+			(parsed.i === undefined ? typeof parsed.k !== "string" : typeof parsed.i !== "string")
 		) {
 			throw new Error("invalid cursor");
 		}
@@ -1540,7 +1720,7 @@ function decodeCursor(cursor: string | undefined): CursorPayload | null {
 }
 
 /** Rows strictly after `cursor` in the `(pinned DESC, sort_order, tab_key)` page order. */
-function afterCursorWhere(cursor: CursorPayload & { p: 0 | 1 }) {
+function afterCursorWhere(cursor: { p: 0 | 1; o: number; k: string }) {
 	const laterInZone = or(
 		gt(userRecentTabs.sortOrder, cursor.o),
 		and(eq(userRecentTabs.sortOrder, cursor.o), gt(userRecentTabs.tabKey, cursor.k)),
@@ -1559,13 +1739,6 @@ export async function listPage(
 	return userPreferencesLock.acquire(userId, async () => {
 		const revision = ensureMigratedLocked(userId);
 		const decoded = decodeCursor(cursor);
-		if (decoded && (decoded.s !== section || decoded.r !== revision || decoded.p === undefined)) {
-			throw new AppError(
-				"Recent-tabs cursor is stale; reload the section from the first page",
-				409,
-				RECENT_TABS_STALE_CURSOR_CODE,
-			);
-		}
 		const pageLimit = Math.max(1, Math.min(limit, RECENT_TABS_PAGE_SIZE));
 		const baseWhere = and(
 			eq(userRecentTabs.userId, userId),
@@ -1573,9 +1746,36 @@ export async function listPage(
 			isNull(userRecentTabs.folderId),
 			EXCLUDE_REMOVED_TAB_TYPES,
 		);
-		const cursorWhere = decoded
-			? afterCursorWhere(decoded as CursorPayload & { p: 0 | 1 })
-			: undefined;
+		let cursorWhere: ReturnType<typeof afterCursorWhere>;
+		if (decoded) {
+			const staleCursor = () =>
+				new AppError(
+					"Recent-tabs cursor is stale; reload the section from the first page",
+					409,
+					RECENT_TABS_STALE_CURSOR_CODE,
+				);
+			const { p, o, i } = decoded;
+			if (decoded.s !== section || decoded.r !== revision || p === undefined) throw staleCursor();
+			// The cursor must be able to cross ACL-hidden rows without disclosing their entity
+			// keys. Resolve its row ID inside this user's section, keeping the original tie-break.
+			const key =
+				i === undefined
+					? decoded.k
+					: db
+							.select({ key: userRecentTabs.tabKey })
+							.from(userRecentTabs)
+							.where(
+								and(
+									baseWhere,
+									eq(userRecentTabs.id, i),
+									eq(userRecentTabs.sortOrder, o),
+									eq(userRecentTabs.pinned, p === 1),
+								),
+							)
+							.get()?.key;
+			if (key === undefined) throw staleCursor();
+			cursorWhere = afterCursorWhere({ p, o, k: key });
+		}
 		// The pinned block is the head of the list by definition, so the page order says so
 		// directly instead of trusting every stored sort key to agree. `regroupFolders` keeps
 		// the stored order in the same shape, which makes this the stored order whenever the
@@ -1646,8 +1846,10 @@ export async function listPage(
 export async function listLegacyTabs(userId: string): Promise<PersistedRecentTab[]> {
 	return userPreferencesLock.acquire(userId, async () => {
 		ensureMigratedLocked(userId);
-		const tabs = readRows(userId).slice(0, RECENT_TABS_LEGACY_LIMIT).map(rowToTab);
-		return projectVisibleRecentTabs(tabs, readableRecentTabKeys(userId, tabs));
+		return filterReadableRecentTabs(
+			userId,
+			readRows(userId, RECENT_TABS_LEGACY_LIMIT).map(rowToTab),
+		);
 	});
 }
 
@@ -1659,7 +1861,7 @@ export async function listAllRecentTabs(
 	return userPreferencesLock.acquire(userId, async () => {
 		ensureMigratedLocked(userId);
 		const boundedLimit = Math.max(1, Math.min(limit, RECENT_TABS_STORAGE_LIMIT));
-		return readRows(userId).slice(0, boundedLimit).map(rowToTab);
+		return readRows(userId, boundedLimit).map(rowToTab);
 	});
 }
 
@@ -1686,11 +1888,15 @@ export async function getRuntimePatches(
 	if (snapshot.tabs.length === 0) return { revision: snapshot.revision, patches: [] };
 	const tabs = snapshot.tabs;
 	const { enrichTabs } = await import("./user-preferences-service");
-	const enriched = await enrichTabs(
-		tabs.map((tab) => ({ ...tab })) as Record<string, unknown>[],
-		userId,
-	);
-	// Runtime enrichment awaits other services; use the current ACL again before returning.
+	const candidates = tabs.map((tab) => ({ ...tab }));
+	// Project paths and live counts are runtime-only, with their own bounded reads. Do this
+	// before loading narrator and member-only team state, which should not wait on the worker.
+	if (tabs.some((tab) => tab.type === "project")) {
+		const { enrichProjectTabs } = await import("./recent-tab-projects");
+		await enrichProjectTabs(candidates, userId);
+	}
+	const enriched = await enrichTabs(candidates, userId);
+	// Enrichment awaits other services; recheck current access before returning any patch.
 	const readableKeys = readableRecentTabKeys(userId, tabs);
 	const patches: RecentTabRuntimePatch[] = enriched
 		.filter((tab) => readableKeys.has(`${String(tab.type)}:${String(tab.id)}`))
@@ -1707,12 +1913,28 @@ export async function getRuntimePatches(
 				viewers: tab.viewers ?? [],
 				viewerCount: tab.viewerCount ?? 0,
 				containerStatus: tab.containerStatus ?? null,
-				// M1: a team session this user can only read (no "waiting for you" alerts).
+				// A team session this user can only read has no "waiting for you" alerts.
 				teamOnlooker: tab.teamOnlooker === true,
 				teamSession: tab.teamSession === true,
+				...(tab.type === "team"
+					? { pendingApprovalCount: numberOrNull(tab.pendingApprovalCount) }
+					: {}),
+				...(tab.type === "project"
+					? {
+							projectPath: typeof tab.projectPath === "string" ? tab.projectPath : null,
+							activeSessionCount: numberOrNull(tab.activeSessionCount),
+							waitingSessionCount: numberOrNull(tab.waitingSessionCount),
+							teamCount: numberOrNull(tab.teamCount),
+							projectCountsCapped: tab.projectCountsCapped === true,
+						}
+					: {}),
 			},
 		}));
 	return { revision: snapshot.revision, patches };
+}
+
+function numberOrNull(value: unknown): number | null {
+	return typeof value === "number" ? value : null;
 }
 
 /** Move the unit containing `index` to the top of the non-pinned section. */
@@ -1850,17 +2072,25 @@ export async function getRecentTabUserIdsForNarratorByRecency(
 	return rows.map((row) => row.userId);
 }
 
-/** Update only users indexed as members of this narrator tab. */
+/**
+ * Update only users indexed as members of this narrator tab, and the holders of the team tab it
+ * names when it is a coordinator (a team's name is its coordinator's title).
+ */
 export async function syncNarratorTitleToRecentTabs(
 	narratorId: string,
 	title: string,
 ): Promise<void> {
-	for (const userId of await getRecentTabUserIdsForNarrator(narratorId)) {
+	const nextTitle = title.slice(0, RECENT_TAB_TEXT_MAX_CHARS);
+	const named = (tab: PersistedRecentTab) =>
+		getTabNarratorId(tab) === narratorId || (tab.type === "team" && tab.id === narratorId);
+	const userIds = new Set([
+		...(await getRecentTabUserIdsForNarrator(narratorId)),
+		...(await getRecentTabUserIds("team", narratorId)),
+	]);
+	for (const userId of userIds) {
 		await mutate(userId, (tabs) => ({
 			tabs: tabs.map((tab) =>
-				getTabNarratorId(tab) === narratorId && tab.title !== title
-					? { ...tab, title: title.slice(0, RECENT_TAB_TEXT_MAX_CHARS) }
-					: tab,
+				named(tab) && tab.title !== nextTitle ? { ...tab, title: nextTitle } : tab,
 			),
 		}));
 	}
@@ -1910,6 +2140,7 @@ export async function pruneUnreadableProjectTabs(userId: string, projectId: stri
 
 	const rows = readRows(userId).map(rowToTab);
 	const doomed: { type: RecentTabType; id: string }[] = [];
+	const teamTabs: string[] = [];
 	for (const tab of rows) {
 		let owningProject: string | null = null;
 		if (tab.type === "project") {
@@ -1920,10 +2151,26 @@ export async function pruneUnreadableProjectTabs(userId: string, projectId: stri
 				columns: { id: true, contextProjectId: true },
 			});
 			owningProject = narrator ? await resolveNarratorProjectId(narrator) : null;
+		} else if (tab.type === "team") {
+			teamTabs.push(tab.id);
+			continue;
 		}
 		// `folder` tabs are user-scoped containers, not project resources.
 		if (owningProject !== projectId) continue;
 		if (!(await canStillRead(owningProject))) doomed.push({ type: tab.type, id: tab.id });
+	}
+	// A team is read through its coordinator's ACL, not the project gate: ask that, for the
+	// teams of this project.
+	if (teamTabs.length > 0) {
+		const { loadTeamTabTargets, teamVerdicts } = await import("./recent-tab-teams");
+		const targets = await loadTeamTabTargets(teamTabs);
+		const inProject = [...targets.values()].filter((target) => target.projectId === projectId);
+		const verdicts = await teamVerdicts(principal, inProject);
+		for (const target of inProject) {
+			if (verdicts.get(target.teamId)?.read !== true) {
+				doomed.push({ type: "team", id: target.teamId });
+			}
+		}
 	}
 
 	for (const tab of doomed) await removeRecentTab(userId, tab.type, tab.id);
@@ -1931,11 +2178,26 @@ export async function pruneUnreadableProjectTabs(userId: string, projectId: stri
 
 /** Remove an entity only from users selected by the authoritative membership index. */
 export async function removeTabFromAllUsers(
-	tabType: "narrator" | "project",
+	tabType: "narrator" | "project" | "team",
 	tabId: string,
 ): Promise<void> {
 	for (const userId of await getRecentTabUserIds(tabType, tabId)) {
 		await removeRecentTab(userId, tabType, tabId);
+	}
+}
+
+/**
+ * Drop this team's tab from every holder who may no longer have it: the team was archived or
+ * deleted, or they lost read access to its coordinator. The holders come from the
+ * `(type, entity_id)` index; each one's access is judged again, so a holder who can still read
+ * the team keeps the tab. Cascade cleanup: no undo token.
+ */
+export async function pruneTeamTabs(teamId: string): Promise<void> {
+	const holders = await getRecentTabUserIds("team", teamId);
+	if (holders.length === 0) return;
+	const { usersWhoLostTeam } = await import("./recent-tab-teams");
+	for (const userId of await usersWhoLostTeam(teamId, holders)) {
+		await removeRecentTab(userId, "team", teamId);
 	}
 }
 

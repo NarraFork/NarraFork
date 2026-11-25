@@ -2907,6 +2907,14 @@ export const narratorService = {
 				error: err instanceof Error ? err.message : String(err),
 			});
 		});
+		// A coordinator's delete took its team with it: a pinned team tab goes too. One indexed
+		// read of `(type, entity_id)`, empty for every narrator that never led a team.
+		await removeTabFromAllUsers("team", narratorId).catch((err) => {
+			logger.warn("Failed to clean up team tabs after narrator delete", {
+				narratorId,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		});
 
 		if (preserveUploads) {
 			logger.info("Preserving narrator uploads for shared images or retained media", {

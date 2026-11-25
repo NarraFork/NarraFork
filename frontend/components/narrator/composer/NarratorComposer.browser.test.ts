@@ -1558,8 +1558,13 @@ for (const target of ["search", "monaco"] as const) {
 				await page.$eval("#other-input", (element) => element.getAttribute("data-tab-native")),
 			).toBe("true");
 			expect((await snapshot(page)).text).toBe("@fo");
-			await page.evaluate(() => (window as unknown as FixtureWindow).fixture.nativeSelection(4));
-			await page.waitForSelector("[data-mention-item]");
+			// Native Tab can leave the document. Re-enter through a browser click rather
+			// than scheduling an editor focus command against an inactive document.
+			await page.bringToFront();
+			await page.click('[role="textbox"]');
+			await focusedComposer(page);
+			await page.keyboard.press("End");
+			await page.waitForSelector("[data-mention-item]", { visible: true });
 			await page.keyboard.press("Tab");
 			await settle(page);
 			expect((await snapshot(page)).text).toBe("[@foo](nf-agent://open?id=named) ");

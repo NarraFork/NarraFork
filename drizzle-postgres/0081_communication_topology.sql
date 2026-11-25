@@ -11,14 +11,12 @@ CREATE TABLE "narrator_communication_peers" (
 	"id" text PRIMARY KEY NOT NULL,
 	"endpoint_lo" text NOT NULL,
 	"endpoint_hi" text NOT NULL,
-	"generation" integer NOT NULL,
 	"created_by" text,
 	"source" text NOT NULL,
 	"admission_id" text,
 	"message_id" text,
 	"created_at" text NOT NULL,
-	CONSTRAINT "ck_communication_peers_canonical" CHECK ("endpoint_lo" < "endpoint_hi"),
-	CONSTRAINT "ck_communication_peers_generation" CHECK ("generation" >= 1)
+	CONSTRAINT "ck_communication_peers_canonical" CHECK (("endpoint_lo" COLLATE "C") < ("endpoint_hi" COLLATE "C"))
 );
 --> statement-breakpoint
 ALTER TABLE "narrator_communication_nodes" ADD CONSTRAINT "narrator_communication_nodes_narrator_id_narrators_id_fk" FOREIGN KEY ("narrator_id") REFERENCES "public"."narrators"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint

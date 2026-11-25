@@ -4,6 +4,7 @@ import { isAbsolute } from "node:path";
 import { encodeToolOutput } from "@shared/agent-protocol/tool-output";
 import { resolveBufferQueueMode } from "@shared/buffer-queue-mode";
 import type { ComposerDocument } from "@shared/composer-document";
+import { isNonTurnHostRow } from "@shared/continue-tail";
 import { serializeCatalogErrorMessage } from "@shared/error-catalog";
 import { resolveMcpLoadingMode } from "@shared/mcp-loading-mode";
 import {
@@ -3076,6 +3077,14 @@ export async function drainInjectionsIntoHistory(
 	};
 }
 
+/**
+ * A host-written row that is nobody's turn (team conversion note, tool-declaration rebaseline
+ * notice): the same predicate the composer uses (`shared/continue-tail.ts:isNonTurnHostRow`).
+ */
+function isNonTurnHostMessage(msg: { role: string; contentJson?: unknown }): boolean {
+	return isNonTurnHostRow(msg.role, Array.isArray(msg.contentJson) ? msg.contentJson : []);
+}
+
 interface ContinuableTopLevelMessage {
 	id?: string;
 	role: string;
@@ -3107,6 +3116,8 @@ export function resolveContinuationTail<T extends ContinuableTopLevelMessage>(
 		const msg = messages[i];
 		if (!msg || msg.parentToolUseId) continue;
 		if (msg.role !== "user" && msg.role !== "assistant") continue;
+		// The rebaseline notice is a user-role row nobody wrote: not a turn to build on.
+		if (isNonTurnHostMessage(msg)) continue;
 		if (isDanglingReasoningOnlyAssistantMessage(msg)) {
 			if (msg.id) danglingReasoningIds.push(msg.id);
 			continue;
@@ -3146,6 +3157,9 @@ export function hasTrailingInjectionRow(messages: readonly ContinuableTopLevelMe
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const msg = messages[i];
 		if (!msg || msg.parentToolUseId) continue;
+		// A conversion note or rebaseline notice is no input to answer: look past it, so
+		// Continue resumes the reply underneath instead of answering the note.
+		if (isNonTurnHostMessage(msg)) continue;
 		if (msg.role === "sys") return true;
 		if (msg.role === "user" || msg.role === "assistant") return false;
 	}
@@ -6088,7 +6102,7 @@ const RETRY_TAIL_SCAN_LIMIT = 10;
  * row-for-row identical results on the three largest narrators.
  */
 function messageRefExists(opts: {
-	roles?: readonly ("user" | "assistant")[];
+	roles?: readonly ("user" | "assistant" | "sys")[];
 	/**
 	 * Restrict to the session's own turns: no placement, or under its durable historical
 	 * transcript mount. Same rule for every session.
@@ -6107,6 +6121,54 @@ function messageRefExists(opts: {
 			.from(narratorMessages)
 			.where(and(...conditions)),
 	);
+}
+
+/** How many rows after the retried message `retryKeptHostRowIds` inspects. */
+const RETRY_KEEP_SCAN_LIMIT = 200;
+
+/**
+ * The rows after the retried message that Retry keeps: host-written rows that are nobody's
+ * turn (`isNonTurnHostRow`: a team conversion note, the tool-declaration rebaseline notice).
+ * The discarded output goes; these stay, because what they record (the session became or
+ * stopped being a team, `Team` must be declared) still holds. A bounded indexed read of the
+ * `sys`/`user` rows after the target, then their bodies.
+ */
+async function retryKeptHostRowIds(narratorId: string, targetMessageId: string): Promise<string[]> {
+	const target = await db
+		.select({ seq: narratorMessageRefs.seq })
+		.from(narratorMessageRefs)
+		.where(
+			and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, targetMessageId),
+			),
+		)
+		.limit(1)
+		.get();
+	if (!target) return [];
+	const refs = await db
+		.select({ messageId: narratorMessageRefs.messageId })
+		.from(narratorMessageRefs)
+		.where(
+			and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				gt(narratorMessageRefs.seq, target.seq),
+				messageRefExists({ roles: ["sys", "user"] }),
+			),
+		)
+		.orderBy(narratorMessageRefs.seq)
+		.limit(RETRY_KEEP_SCAN_LIMIT);
+	if (refs.length === 0) return [];
+	const rows = fillBodies(
+		await db.query.narratorMessages.findMany({
+			where: inArray(
+				narratorMessages.id,
+				refs.map((ref) => ref.messageId),
+			),
+			...bodyColumns(),
+		}),
+	);
+	return rows.filter(isNonTurnHostMessage).map((row) => row.id);
 }
 
 /** Minimal message shape needed to pick the retry target. */
@@ -6152,6 +6214,8 @@ export function resolveRetryTarget<T extends RetryCandidateMessage>(
 	const emptyAssistantIds: string[] = [];
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const msg = messages[i];
+		// The rebaseline notice is host-written: never re-run it as the person's message.
+		if (isNonTurnHostMessage(msg)) continue;
 		if (msg.role === "user") return { target: msg, emptyAssistantIds };
 		if (!isEmptyAssistantPlaceholder(msg)) return { target: null, reason: "not_user" };
 		emptyAssistantIds.push(msg.id);
@@ -6172,22 +6236,12 @@ export async function retryLastMessage(
 	return withNarratorStartAdmission(args[0], () => retryLastMessageUnlocked(...args));
 }
 
-async function retryLastMessageUnlocked(
-	narratorId: string,
-	locale: Locale = "en",
-	replyInUserLanguage = false,
-	userId?: string | null,
-	humanReplyContext?: ReplyContext,
-): Promise<{ ok: boolean }> {
-	// Guard before any destructive work (deleteMessagesAfter below): if a loop is
-	// already running, refuse rather than mutate history under a live session.
-	if (isLoopRunning(narratorId)) {
-		logger.warn("retryLastMessage blocked: loop already running", { narratorId });
-		// Correct a stale idle status so the user regains the interrupt button.
-		await reconcileRunningStatus(narratorId);
-		return { ok: false };
-	}
-
+/**
+ * Retry's history step: find the person's last message (past empty placeholders and host rows
+ * that are nobody's turn), check it has text, and delete what followed it, keeping those host
+ * rows (`retryKeptHostRowIds`). Exported for tests; `retryLastMessage` runs the loop after it.
+ */
+export async function rewindHistoryForRetry(narratorId: string) {
 	// Read a short tail of top-level messages (newest first) so the retry target
 	// can be resolved past empty assistant placeholders. A handful of rows is
 	// enough: a real assistant reply stops the walk immediately, and consecutive
@@ -6271,8 +6325,12 @@ async function retryLastMessageUnlocked(
 			});
 		}
 	}
+	// Host rows after the target (a conversion note, the rebaseline notice) stay: the team
+	// change and the tool declaration they record outlive the discarded reply.
+	const keepMessageIds = await retryKeptHostRowIds(narratorId, lastMsg.id);
 	const { deletedMessageIds } = await narratorService.deleteMessagesAfter(narratorId, lastMsg.id, {
 		skipRevert: true,
+		...(keepMessageIds.length > 0 ? { keepMessageIds } : {}),
 	});
 	if (deletedMessageIds.length > 0) {
 		broadcastToNarrator(narratorId, {
@@ -6281,6 +6339,27 @@ async function retryLastMessageUnlocked(
 			deletedMessageIds,
 		});
 	}
+
+	return { lastMsg, prompt };
+}
+
+async function retryLastMessageUnlocked(
+	narratorId: string,
+	locale: Locale = "en",
+	replyInUserLanguage = false,
+	userId?: string | null,
+	humanReplyContext?: ReplyContext,
+): Promise<{ ok: boolean }> {
+	// Guard before any destructive work (deleteMessagesAfter below): if a loop is
+	// already running, refuse rather than mutate history under a live session.
+	if (isLoopRunning(narratorId)) {
+		logger.warn("retryLastMessage blocked: loop already running", { narratorId });
+		// Correct a stale idle status so the user regains the interrupt button.
+		await reconcileRunningStatus(narratorId);
+		return { ok: false };
+	}
+
+	const { lastMsg, prompt } = await rewindHistoryForRetry(narratorId);
 
 	const imageRefs = extractImageRefs(lastMsg.contentJson, lastMsg.narratorId);
 	const mediaRefs = (Array.isArray(lastMsg.contentJson) ? lastMsg.contentJson : [])

@@ -1,5 +1,6 @@
 import { Box, Button, Group, Loader, Text } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
+import { IconLock } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import type React from "react";
 import { useRef, useState } from "react";
@@ -45,6 +46,14 @@ export interface NarratorInteractionAreaProps {
 	common: NarratorInteractionCommon;
 	/** Model traces expose read-only sampling/retry controls, never the composer. */
 	onModelTraceReturn?: () => void;
+	/**
+	 * The viewer may read but not write this session (no write access to the narrator). The
+	 * composer is replaced by a read-only notice: the server refuses their messages anyway, so
+	 * an editable box and send button would only invite a failed send.
+	 */
+	readOnly?: boolean;
+	/** Replaces the read-only notice's text (the team page's 「你是只读成员」). */
+	readOnlyNotice?: string;
 
 	// ── Attachments ──
 	// imagePreviewUrls, formatFileSize and openImageViewer are no longer passed in:
@@ -172,6 +181,32 @@ function ModelTraceInteraction({
 	);
 }
 
+/** Stands where the composer would be for a viewer without write access to the session. */
+function ReadOnlyComposerNotice({ text }: { text?: string }) {
+	const { t } = useTranslation("narrator");
+	return (
+		<Box
+			data-region="composer-read-only"
+			role="note"
+			style={{
+				flexShrink: 0,
+				margin: "var(--mantine-spacing-xs) var(--mantine-spacing-sm)",
+				padding: "var(--mantine-spacing-xs) var(--mantine-spacing-sm)",
+				border: "1px dashed var(--mantine-color-default-border)",
+				borderRadius: "var(--mantine-radius-md)",
+				color: "var(--mantine-color-dimmed)",
+			}}
+		>
+			<Group gap={6} wrap="nowrap">
+				<IconLock size={14} aria-hidden style={{ flexShrink: 0 }} />
+				<Text size="sm" c="dimmed">
+					{text ?? t("composerReadOnly")}
+				</Text>
+			</Group>
+		</Box>
+	);
+}
+
 function NarratorEditableInteractionArea(props: NarratorInteractionAreaProps) {
 	const { t } = useTranslation("narrator");
 	const retainWorktreeRequirement = (text: string) =>
@@ -293,7 +328,9 @@ function NarratorEditableInteractionArea(props: NarratorInteractionAreaProps) {
 			{/* Upload / send progress while attachments upload. */}
 			<UploadProgressBar sendingState={props.sendingState} cancelSending={props.cancelSending} />
 			{/* Input */}
-			{props.common.isWorkspacePreview ? null : (
+			{props.common.isWorkspacePreview ? null : props.readOnly ? (
+				<ReadOnlyComposerNotice text={props.readOnlyNotice} />
+			) : (
 				<NarratorComposerRow
 					{...props.composerRowProps}
 					attachedImages={props.attachedImages}

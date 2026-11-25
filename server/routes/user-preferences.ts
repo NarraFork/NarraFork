@@ -24,6 +24,7 @@ import {
 	moveRecentTabSchema,
 	pinRecentTabSchema,
 	pluginOverlayVisibilityPatchSchema,
+	recentTabStateQuerySchema,
 	recentTabsPageQuerySchema,
 	recentTabsRuntimeSchema,
 	removeRecentTabSchema,
@@ -44,6 +45,8 @@ import {
 	clearRecentTabs,
 	createRecentTabFolder,
 	dissolveRecentTabFolder,
+	filterReadableRecentTabs,
+	getRecentTabState,
 	getRuntimePatches,
 	listLegacyTabs,
 	listPage,
@@ -369,8 +372,10 @@ function serializeUserPreferences(
 	pref: typeof userPreferences.$inferSelect,
 	recentTabs?: Record<string, unknown>[],
 ): Record<string, unknown> {
+	// The compatibility shadow is not ACL-filtered storage. Never serialize it directly.
+	const { recentTabs: _shadow, ...preferences } = pref;
 	return {
-		...pref,
+		...preferences,
 		narratorLineHeightV2Percent: lineHeightPercentFromStored(
 			pref.narratorLineHeightV2Percent,
 			pref.narratorLineHeightScalePercent,
@@ -401,14 +406,12 @@ function parseHiddenPluginOverlays(value: unknown): string[] {
 
 userPreferencesRoutes.get("/", async (c) => {
 	const userId = c.get("user").sub;
-	const legacyTabs = await listLegacyTabs(userId);
-	const recentTabs = await enrichTabs(
-		legacyTabs.map((tab) => ({ ...tab })) as Record<string, unknown>[],
-		userId,
-	);
+	const legacyTabs = (await listLegacyTabs(userId)).map((tab) => ({ ...tab }));
 	const pref = await db.query.userPreferences.findFirst({
 		where: eq(userPreferences.userId, userId),
 	});
+	await enrichTabs(legacyTabs, userId);
+	const recentTabs = filterReadableRecentTabs(userId, legacyTabs);
 	if (!pref) {
 		return c.json({
 			...DEFAULTS,
@@ -701,7 +704,7 @@ userPreferencesRoutes.put("/git-identity/folders/:folderId", async (c) => {
 
 // === Recent Tabs endpoints ===
 
-/** Cursor-paginated authoritative recent tabs, split into project/work sections. */
+/** Cursor-paginated work list; `projects` remains an empty compatibility section. */
 userPreferencesRoutes.get("/recent-tabs", async (c) => {
 	const userId = c.get("user").sub;
 	const parsed = recentTabsPageQuerySchema.safeParse({
@@ -711,6 +714,20 @@ userPreferencesRoutes.get("/recent-tabs", async (c) => {
 	});
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	return c.json(await listPage(userId, parsed.data.section, parsed.data.cursor, parsed.data.limit));
+});
+
+/**
+ * Whether one tab is in the sidebar and pinned, wherever it sits in the list: the "pin to
+ * sidebar" buttons of project and team pages read it for a tab outside the loaded pages.
+ */
+userPreferencesRoutes.get("/recent-tabs/state", (c) => {
+	const userId = c.get("user").sub;
+	const parsed = recentTabStateQuerySchema.safeParse({
+		type: c.req.query("type"),
+		id: c.req.query("id"),
+	});
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return c.json(getRecentTabState(userId, parsed.data.type, parsed.data.id));
 });
 
 /** Fetch bounded live-only patches for currently rendered tabs. */
@@ -726,8 +743,8 @@ userPreferencesRoutes.put("/recent-tabs", async (c) => {
 	const userId = c.get("user").sub;
 	const parsed = upsertRecentTabSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const { updateOnly, beforeKey, afterKey, ...tab } = parsed.data;
-	return c.json(await upsertRecentTab(userId, tab, { updateOnly, beforeKey, afterKey }));
+	const { updateOnly, beforeKey, afterKey, pin, ...tab } = parsed.data;
+	return c.json(await upsertRecentTab(userId, tab, { updateOnly, beforeKey, afterKey, pin }));
 });
 
 /** Atomically upsert several tabs with one revision. */

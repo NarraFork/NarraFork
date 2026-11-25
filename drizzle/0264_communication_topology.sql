@@ -20,7 +20,6 @@ CREATE TABLE `narrator_communication_peers` (
 	`id` text PRIMARY KEY NOT NULL,
 	`endpoint_lo` text NOT NULL,
 	`endpoint_hi` text NOT NULL,
-	`generation` integer NOT NULL,
 	`created_by` text,
 	`source` text NOT NULL,
 	`admission_id` text,
@@ -29,8 +28,7 @@ CREATE TABLE `narrator_communication_peers` (
 	FOREIGN KEY (`endpoint_lo`) REFERENCES `narrators`(`id`) ON UPDATE no action ON DELETE cascade,
 	FOREIGN KEY (`endpoint_hi`) REFERENCES `narrators`(`id`) ON UPDATE no action ON DELETE cascade,
 	FOREIGN KEY (`created_by`) REFERENCES `users`(`id`) ON UPDATE no action ON DELETE set null,
-	CONSTRAINT "ck_communication_peers_canonical" CHECK("narrator_communication_peers"."endpoint_lo" < "narrator_communication_peers"."endpoint_hi"),
-	CONSTRAINT "ck_communication_peers_generation" CHECK("narrator_communication_peers"."generation" >= 1)
+	CONSTRAINT "ck_communication_peers_canonical" CHECK("narrator_communication_peers"."endpoint_lo" < "narrator_communication_peers"."endpoint_hi")
 );
 --> statement-breakpoint
 CREATE UNIQUE INDEX `uq_communication_peers_pair` ON `narrator_communication_peers` (`endpoint_lo`,`endpoint_hi`);

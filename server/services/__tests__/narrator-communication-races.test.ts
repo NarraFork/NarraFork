@@ -221,6 +221,53 @@ test("recent membership uses complete stored EXISTS and within-section real last
 	]);
 	expect(all.hasMore).toBe(false);
 });
+test("stored team bookmarks count as recent only for their owner and never override candidate ACL", async () => {
+	seed("source");
+	const bookmarks = [
+		{ id: "own-team", userId: "writer", type: "team", lastMessageAt: "2020-01-01" },
+		{ id: "other-team", userId: "other", type: "team", lastMessageAt: "2024-01-01" },
+		{ id: "project", userId: "writer", type: "project", lastMessageAt: "2023-01-01" },
+		{ id: "folder", userId: "writer", type: "folder", lastMessageAt: "2022-01-01" },
+		{ id: "denied-team", userId: "writer", type: "team", lastMessageAt: "2025-01-01" },
+	] as const;
+	for (const { id, lastMessageAt } of bookmarks)
+		seed(id, null, {
+			title: `协调候选 ${id}`,
+			lastMessageAt,
+			ownerUserId: id === "denied-team" ? "other" : "writer",
+		});
+	db.insert(userRecentTabs)
+		.values(
+			bookmarks.map(({ id, userId, type }) => ({
+				id: `recent-${id}`,
+				userId,
+				tabKey: `${type}:${id}`,
+				section: "work" as const,
+				type,
+				entityId: id,
+				title: id,
+				// Team bookmarks do not occupy the session notification index.
+				representedNarratorId: null,
+				lastVisitedAt: 1,
+				sortOrder: 999,
+				createdAt: now,
+				updatedAt: now,
+			})),
+		)
+		.run();
+	const query = "协调";
+	const top = await searchCommunicationCandidates("source", actor, { query, limit: 1 });
+	expect(top.items.map(({ id, isRecent }) => [id, isRecent])).toEqual([["own-team", true]]);
+	expect(top.hasMore).toBe(true);
+	const all = await searchCommunicationCandidates("source", actor, { query, limit: 4 });
+	expect(all.items.map(({ id, isRecent }) => [id, isRecent])).toEqual([
+		["own-team", true],
+		["other-team", false],
+		["project", false],
+		["folder", false],
+	]);
+	expect(all.hasMore).toBe(false);
+});
 test("candidate search returns only the top 50 and an overflow flag without a cursor", async () => {
 	seed("source");
 	for (let i = 1; i <= 55; i++) {

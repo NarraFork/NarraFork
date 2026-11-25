@@ -1261,7 +1261,9 @@ export type NarratorServerMessage =
 				| "shared"
 				| "unshared"
 				| "grant_changed"
-				| "owner_changed";
+				| "owner_changed"
+				/** The session became a team coordinator or its team was disbanded. */
+				| "team_changed";
 	  }
 	| {
 			type: "team_message";

@@ -1,8 +1,11 @@
 import { expect, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
+import { createInstance } from "i18next";
 import { parseHTML } from "linkedom";
 import type { ComponentProps } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
+import { I18nextProvider } from "react-i18next";
+import navEn from "../../locales/en/nav.json";
 import { NarratorStatusIcon } from "./NarratorStatusIcon";
 import { getNarratorStatusIconColor } from "./narrator-status-icon-logic";
 import { RecentTabIcon } from "./RecentTabIcon";
@@ -89,4 +92,32 @@ test("project tabs remain folders", () => {
 	expect(
 		renderIcon({ id: "project", type: "project" }).querySelector(".tabler-icon-folder"),
 	).not.toBeNull();
+});
+
+test("a team icon shows the coordinator status and only badges known pending approvals", async () => {
+	const i18n = createInstance();
+	await i18n.init({ lng: "en", resources: { en: { nav: navEn } } });
+	for (const pendingApprovalCount of [undefined, null, 2]) {
+		const { document } = parseHTML(
+			renderToStaticMarkup(
+				<I18nextProvider i18n={i18n}>
+					<MantineProvider>
+						<RecentTabIcon
+							tab={{ id: "coordinator", type: "team", status: "waiting", pendingApprovalCount }}
+							size={16}
+						/>
+					</MantineProvider>
+				</I18nextProvider>,
+			),
+		);
+		expect(document.querySelector(".tabler-icon-users-group")).not.toBeNull();
+		expect(document.querySelector("[data-tab-shape]")?.getAttribute("data-tab-shape")).toBe(
+			renderIcon({ id: "coordinator", type: "narrator", status: "waiting" })
+				.querySelector("[data-tab-shape]")
+				?.getAttribute("data-tab-shape"),
+		);
+		const pending = document.querySelector('[data-testid="team-tab-pending"]');
+		if (pendingApprovalCount === 2) expect(pending?.textContent).toBe("2");
+		else expect(pending).toBeNull();
+	}
 });

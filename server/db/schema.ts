@@ -2650,7 +2650,7 @@ export const userRecentTabs = sqliteTable(
 		tabKey: text("tab_key").notNull(),
 		section: text("section", { enum: ["projects", "work"] }).notNull(),
 		type: text("type", {
-			enum: ["chapter", "narrator", "project", "workspace", "subagent", "group", "folder"],
+			enum: ["chapter", "narrator", "project", "workspace", "subagent", "group", "folder", "team"],
 		}).notNull(),
 		entityId: text("entity_id").notNull(),
 		narratorId: text("narrator_id"),
@@ -2679,6 +2679,11 @@ export const userRecentTabs = sqliteTable(
 		 * not fully expanded. NULL means the client default.
 		 */
 		folderPreviewCount: integer("folder_preview_count"),
+		/**
+		 * `type = "team"` rows only: the team's project, for the team page's link. Written by the
+		 * server from `project_teams` (a team never changes project); NULL for every other type.
+		 */
+		projectId: text("project_id"),
 		title: text("title").notNull(),
 		subtitle: text("subtitle"),
 		status: text("status"),

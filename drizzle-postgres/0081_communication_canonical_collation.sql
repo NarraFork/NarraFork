@@ -1,2 +1,0 @@
-ALTER TABLE "narrator_communication_peers" DROP CONSTRAINT "ck_communication_peers_canonical";--> statement-breakpoint
-ALTER TABLE "narrator_communication_peers" ADD CONSTRAINT "ck_communication_peers_canonical" CHECK (("endpoint_lo" COLLATE "C") < ("endpoint_hi" COLLATE "C"));

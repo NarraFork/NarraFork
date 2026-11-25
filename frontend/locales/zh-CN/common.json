@@ -805,5 +805,11 @@
 	"imageViewer_copyFailed": "复制图片失败",
 	"imageViewer_downloadFailed": "下载图片失败",
 	"botBadge": "Bot",
-	"swipeMenu": "菜单"
+	"swipeMenu": "菜单",
+	"recentTabTeamPendingApprovals": "{{count}} 项待批",
+	"recentTabProjectActiveSessions": "{{countLabel}} 个会话进行中",
+	"recentTabProjectNoActiveSessions": "没有进行中的会话",
+	"recentTabProjectWaitingSessions": "{{countLabel}} 个等待输入或审批",
+	"recentTabProjectTeams": "{{countLabel}} 个团队",
+	"recentTabCoordinatorSession": "团队的协调者会话；团队自己的标签打开团队页。"
 }

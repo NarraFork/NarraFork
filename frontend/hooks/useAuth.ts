@@ -25,7 +25,7 @@ export async function applySession(qc: QueryClient, data: LoginSession): Promise
 	}
 	const auth = getAuthSnapshot();
 	if (!auth.hasToken || auth.generation !== generation) return;
-	// Never let a new account hydrate from the preceding account's raw preference cache.
+	// Never hydrate from the preceding session's preferences, including tab pages and pin states.
 	qc.removeQueries({ queryKey: ["user-preferences"] });
 	appearanceStore.activate(data.user.id);
 	// Seed the user cache immediately so AuthenticatedLayout won't flash.

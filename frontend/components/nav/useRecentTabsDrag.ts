@@ -10,8 +10,11 @@ import {
 import type { QueryClient } from "@tanstack/react-query";
 import { type RefObject, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { invalidateNarratorGitIdentities } from "../../hooks/git-identity-query-keys";
-import type { RecentTab } from "../../hooks/recent-tabs-utils";
-import { applyRecentTabsDelta, refreshRecentTabsLoadedWindow } from "../../hooks/useRecentTabs";
+import { type RecentTab, recentTabLiveNarratorId } from "../../hooks/recent-tabs-utils";
+import {
+	applyRecentTabsDeltaAndFollowUp,
+	refreshRecentTabsLoadedWindow,
+} from "../../hooks/useRecentTabs";
 import { api } from "../../lib/api";
 import {
 	cancelDrag,
@@ -346,7 +349,7 @@ export function useRecentTabsDrag(options: UseRecentTabsDragOptions) {
 	}, []);
 	const onDragStart = useCallback(
 		(event: DragStartEvent) => {
-			if (pendingRef.current || activeRef.current) return;
+			if (pendingRef.current || activeRef.current || !isRecentTabsScopeCurrent(scope)) return;
 			const key = String(event.active.id);
 			const entry = modelRef.current.entries.get(key);
 			if (!entry) return;
@@ -359,12 +362,7 @@ export function useRecentTabsDrag(options: UseRecentTabsDragOptions) {
 			capturedRef.current = false;
 			setDraggingId(key);
 			const tab = entry.tab;
-			const narratorId =
-				tab?.type === "subagent"
-					? (tab.narratorId ?? tab.id)
-					: tab?.type === "narrator"
-						? tab.id
-						: null;
+			const narratorId = tab && recentTabLiveNarratorId(tab);
 			if (narratorId && tab && pointer) {
 				startDragManual(narratorId, tab.title, pointer.x, pointer.y, "narrator");
 				ownedRef.current = getPanelDrag();
@@ -372,7 +370,7 @@ export function useRecentTabsDrag(options: UseRecentTabsDragOptions) {
 			armReleaseWatch();
 			updateIndicator();
 		},
-		[armReleaseWatch, updateIndicator],
+		[armReleaseWatch, scope, updateIndicator],
 	);
 	const updatePointer = useCallback((event: DragMoveEvent | DragEndEvent) => {
 		if (!activeRef.current) return;
@@ -421,22 +419,10 @@ export function useRecentTabsDrag(options: UseRecentTabsDragOptions) {
 					signal,
 				);
 				if (!isRecentTabsScopeCurrent(scope)) return;
-				const applied = applyRecentTabsDelta(qc, result, scope);
+				const followUp = applyRecentTabsDeltaAndFollowUp(qc, result, scope);
 				// Folder membership may have changed, and with it the git identity a session follows.
 				void invalidateNarratorGitIdentities(qc);
-				if (applied.gaps.length > 0 || applied.backfill.length > 0) {
-					await awaitSubmission(
-						refreshRecentTabsLoadedWindow(
-							qc,
-							{
-								reset: applied.gaps.length > 0,
-								minimumRevision: result.revision,
-							},
-							scope,
-						),
-						signal,
-					);
-				}
+				await awaitSubmission(followUp, signal);
 			} catch {
 				if (!isRecentTabsScopeCurrent(scope)) return;
 				try {
@@ -505,6 +491,10 @@ export function useRecentTabsDrag(options: UseRecentTabsDragOptions) {
 	const onDragEnd = useCallback(
 		async (event: DragEndEvent) => {
 			if (!activeRef.current) return;
+			if (!isRecentTabsScopeCurrent(scope)) {
+				onDragCancel();
+				return;
+			}
 			updatePointer(event);
 			suppressClick();
 			let task: Promise<void> | null = null;
@@ -528,7 +518,7 @@ export function useRecentTabsDrag(options: UseRecentTabsDragOptions) {
 			}
 			if (task) await task;
 		},
-		[clear, resolveSidebarDrop, submitPlan, suppressClick, updatePointer],
+		[clear, onDragCancel, resolveSidebarDrop, scope, submitPlan, suppressClick, updatePointer],
 	);
 
 	const autoScrollOptions = useMemo(

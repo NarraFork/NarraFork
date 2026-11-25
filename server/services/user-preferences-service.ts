@@ -1,4 +1,4 @@
-import { and, count as countFn, eq, inArray, isNull } from "drizzle-orm";
+import { and, count as countFn, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { narrators, projectTeams, terminals, users } from "../db/schema";
 import { logger } from "../lib/logger";
@@ -142,6 +142,15 @@ export async function enrichTabs(
 		}
 	}
 
+	// Team approval counts are members-only: compute them after the other async reads.
+	if (tabs.some((tab) => tab.type === "team")) {
+		try {
+			const { enrichTeamTabs } = await import("./recent-tab-teams");
+			await enrichTeamTabs(tabs, userId);
+		} catch (err) {
+			logger.warn("Failed to enrich team tabs", { error: String(err) });
+		}
+	}
 	return tabs;
 }
 

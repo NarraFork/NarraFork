@@ -204,12 +204,16 @@ export {
 	createProjectTeamSchema,
 	listProjectTeamsQuerySchema,
 	releaseTeamLockSchema,
+	returnTeamWorkItemSchema,
 	teamActivityQuerySchema,
 	teamBaseBranchSchema,
 	teamBoardQuerySchema,
 	teamBriefSchema,
 	teamSettingsSchema,
+	teamWorkDiffQuerySchema,
+	teamWorkStatsQuerySchema,
 	updateProjectTeamSchema,
+	upgradeProjectTeamSchema,
 } from "./project-teams";
 export {
 	createProjectSchema,
@@ -217,6 +221,7 @@ export {
 	projectMembersSchema,
 	projectTransferOwnerSchema,
 	projectVisibilitySchema,
+	resolveProjectDirectorySchema,
 	updateProjectSchema,
 } from "./projects";
 export {
@@ -243,6 +248,7 @@ export {
 	pinRecentTabSchema,
 	pluginOverlayVisibilityPatchSchema,
 	recentTabSchema,
+	recentTabStateQuerySchema,
 	recentTabsPageQuerySchema,
 	recentTabsRuntimeSchema,
 	removeRecentTabSchema,

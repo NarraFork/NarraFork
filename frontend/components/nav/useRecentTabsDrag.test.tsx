@@ -233,6 +233,27 @@ it("outside release only notifies panels, never sorts", async () => {
 	expect(result.pending).toBe(false);
 	expect(getPanelDrag()).toBeNull();
 });
+it("a team row bridges its coordinator as a narrator and does not reorder outside", async () => {
+	const move = spyOn(api, "moveRecentTab");
+	spies.push(move);
+	options = {
+		...options,
+		tabs: [
+			tab("coordinator", { type: "team", title: "Release crew", projectId: "project" }),
+			...options.tabs,
+		],
+	};
+	render();
+	start("team:coordinator");
+	expect(getPanelDrag()).toMatchObject({
+		id: "coordinator",
+		title: "Release crew",
+		subjectKind: "narrator",
+	});
+	await end(0, 300);
+	expect(move).not.toHaveBeenCalled();
+	expect(getPanelDrag()).toBeNull();
+});
 it("source removal and grouping changes cancel, while unmount does not cancel another owner", () => {
 	start();
 	options = { ...options, tabs: options.tabs.filter((item) => item.id !== "a") };

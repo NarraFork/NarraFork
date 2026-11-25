@@ -51,6 +51,38 @@ describe("mention candidate local model", () => {
 			"old",
 		]);
 	});
+	test("a pinned team references its coordinator and keeps a local session rename", () => {
+		const team: PersistedRecentTab = {
+			type: "team",
+			id: "coordinator",
+			projectId: "project",
+			title: "Old team name",
+			lastVisitedAt: 5,
+		};
+		const session: PersistedRecentTab = {
+			type: "narrator",
+			id: "coordinator",
+			title: "New coordinator name",
+			lastVisitedAt: 1,
+		};
+		expect(localNarratorMentionCandidates([team], undefined)).toMatchObject([
+			{ id: "coordinator", title: "Old team name", isRecent: true },
+		]);
+		expect(localNarratorMentionCandidates([team], "coordinator")).toEqual([]);
+		for (const tabs of [
+			[team, session],
+			[session, team],
+		]) {
+			expect(localNarratorMentionCandidates(tabs, undefined)).toMatchObject([
+				{
+					id: "coordinator",
+					title: "New coordinator name",
+					lastActivityAt: new Date(5).toISOString(),
+				},
+			]);
+		}
+	});
+
 	test("server recent membership wins even for unloaded tabs and dedupes by stable id", () => {
 		const local = [candidate("local", { isRecent: true, lastActivityAt: "2026-01-01" })];
 		const remote = [

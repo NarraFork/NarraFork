@@ -27,6 +27,7 @@ import {
 	straddlingDeclarations,
 	type UsageConfidence,
 } from "../../../structural";
+import { StructuralWorkerError } from "../../../structural/worker-protocol";
 import type { ToolResult } from "../../../types";
 import { decodeFileBytes } from "../../encoding";
 import { normalizeNumber } from "../../number-param";
@@ -230,7 +231,8 @@ export async function runInterface(
 			for (const imp of info.imports) {
 				for (const named of imp.names ?? []) imported.add(named.local);
 			}
-		} catch {
+		} catch (err) {
+			if (err instanceof StructuralWorkerError) throw err;
 			// A provider that cannot report imports only costs the finer grouping; the names
 			// still appear, just under the ambient heading.
 		}
@@ -326,8 +328,9 @@ export async function runInterface(
 /**
  * Whether a candidate file imports `name` from the file that declares it.
  *
- * Any failure resolves to `unverified`, never to "not a usage": a language with no import
- * support, a dynamic import or a path alias this heuristic cannot follow all leave a
+ * Ordinary resolution failures yield `unverified`, never "not a usage"; worker failures
+ * propagate because parsing did not complete. A language with no import support,
+ * a dynamic import or a path alias this heuristic cannot follow all leave a
  * genuine reference that must still be reported. The label describes what could be PROVEN,
  * not what exists.
  *
@@ -376,7 +379,8 @@ async function classifyImport(
 			if (forwarded) return { confidence: "confirmed", viaBarrel: specifier };
 		}
 		return { confidence: "unverified" };
-	} catch {
+	} catch (err) {
+		if (err instanceof StructuralWorkerError) throw err;
 		return { confidence: "unverified" };
 	}
 }
@@ -427,7 +431,8 @@ async function barrelForwards(
 			if (entry.name === "*" || entry.name === name) return true;
 		}
 		return false;
-	} catch {
+	} catch (err) {
+		if (err instanceof StructuralWorkerError) throw err;
 		return false;
 	}
 }
@@ -463,7 +468,8 @@ async function resolveModuleFile(
 		try {
 			const stat = await io.backend.statFile(candidate);
 			if (stat && !stat.isDirectory) return candidate;
-		} catch {
+		} catch (err) {
+			if (err instanceof StructuralWorkerError) throw err;
 			// Try the next spelling.
 		}
 	}
@@ -599,7 +605,9 @@ export async function runUsages(
 				...(verdict.alias ? { alias: verdict.alias } : {}),
 				...(verdict.viaBarrel ? { viaBarrel: verdict.viaBarrel } : {}),
 			});
-		} catch {
+		} catch (err) {
+			// Missing files may produce partial results; a failed parser cannot prove absence.
+			if (err instanceof StructuralWorkerError) throw err;
 			skipped++;
 		}
 	}

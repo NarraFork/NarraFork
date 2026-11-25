@@ -825,6 +825,11 @@ export const narratorsApi = {
 		request<{ id: string }>(`/narrators/${encodeURIComponent(narratorId)}/modeltrace/retry`, {
 			method: "POST",
 		}),
+	calibrateModelTrace: (narratorId: string, resultId: string) =>
+		request<{ id: string }>(`/narrators/${encodeURIComponent(narratorId)}/modeltrace/calibrate`, {
+			method: "POST",
+			body: JSON.stringify({ resultId }),
+		}),
 	/** 该模型是否已经有 ModelTrace 舱；没有跑过时为 null。 */
 	getModelTraceNarrator: (model: string) =>
 		request<{ narratorId: string | null }>(

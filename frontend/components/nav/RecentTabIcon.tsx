@@ -1,8 +1,16 @@
 import type { RecentTab } from "@frontend/hooks/recent-tabs-utils";
 import { useNarratorIsOptimizingPrompt } from "@frontend/hooks/usePromptOptimizeTask";
 import { Box } from "@mantine/core";
-import { IconBrain, IconClock, IconFolder, IconPencil, IconRobot } from "@tabler/icons-react";
+import {
+	IconBrain,
+	IconClock,
+	IconFolder,
+	IconPencil,
+	IconRobot,
+	IconUsersGroup,
+} from "@tabler/icons-react";
 import type { ReactNode } from "react";
+import { useTranslation } from "react-i18next";
 import { NarratorStatusIcon } from "./NarratorStatusIcon";
 import { getNarratorStatusIconColor } from "./narrator-status-icon-logic";
 
@@ -16,6 +24,7 @@ type RecentTabIconSource = Pick<
 	| "activeBackgroundTaskCount"
 	| "hasDraft"
 	| "isScheduled"
+	| "pendingApprovalCount"
 >;
 
 /** The same session/project icon for RecentTabs and communication cards; no duplicate status rules. */
@@ -51,6 +60,8 @@ export function RecentTabIcon({
 			/>
 		);
 	}
+
+	if (tab.type === "team") return <TeamTabIcon tab={tab} size={size} />;
 
 	let icon: ReactNode;
 	if (tab.type === "project") icon = <IconFolder size={size} />;
@@ -133,6 +144,68 @@ export function RecentTabIcon({
 					}}
 				>
 					<IconPencil size={7} stroke={2.5} />
+				</Box>
+			)}
+		</Box>
+	);
+}
+
+/**
+ * A pinned team: its coordinator's status bubble (the team list and the team page's top bar
+ * show the same), a group marker so it does not read as a session, and the tree's pending
+ * approvals for members.
+ */
+function TeamTabIcon({ tab, size }: { tab: RecentTabIconSource; size: number }) {
+	const { t } = useTranslation("nav");
+	const pending = tab.pendingApprovalCount ?? 0;
+	return (
+		<Box component="span" pos="relative" style={{ display: "inline-flex", lineHeight: 0 }}>
+			<NarratorStatusIcon size={size} status={tab.status} substatus={tab.substatus} />
+			<Box
+				component="span"
+				style={{
+					position: "absolute",
+					left: -4,
+					bottom: -4,
+					width: 11,
+					height: 11,
+					borderRadius: "50%",
+					background: "var(--mantine-color-indigo-6)",
+					border: "1px solid var(--mantine-color-body)",
+					display: "inline-flex",
+					alignItems: "center",
+					justifyContent: "center",
+					color: "var(--mantine-color-white)",
+					pointerEvents: "none",
+				}}
+			>
+				<IconUsersGroup size={7} stroke={2.5} />
+			</Box>
+			{pending > 0 && (
+				<Box
+					component="span"
+					role="img"
+					aria-label={t("teamTabPendingApprovals", { count: pending })}
+					data-testid="team-tab-pending"
+					style={{
+						position: "absolute",
+						right: -6,
+						top: -5,
+						minWidth: 12,
+						height: 12,
+						padding: "0 2px",
+						borderRadius: 6,
+						background: "var(--mantine-color-orange-6)",
+						border: "1px solid var(--mantine-color-body)",
+						color: "var(--mantine-color-white)",
+						fontSize: 8,
+						fontWeight: 700,
+						lineHeight: "10px",
+						textAlign: "center",
+						pointerEvents: "none",
+					}}
+				>
+					{pending > 9 ? "9+" : pending}
 				</Box>
 			)}
 		</Box>

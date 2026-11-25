@@ -18,7 +18,7 @@ import {
 /** Only fields the header actually paints; unused per-pixel slack is not state. */
 export type NarratorHeaderLayoutSnapshot = Pick<
 	HeaderAfterTitleLayout,
-	"titleWidth" | "visibleToolCount" | "unmeasured"
+	"titleWidth" | "visibleToolCount" | "showTitleBadge" | "unmeasured"
 >;
 
 type Props = Omit<HeaderAfterTitleInput, "rowWidth" | "showPin"> & {
@@ -27,14 +27,16 @@ type Props = Omit<HeaderAfterTitleInput, "rowWidth" | "showPin"> & {
 };
 
 function snapshot(input: HeaderAfterTitleInput): NarratorHeaderLayoutSnapshot {
-	const { titleWidth, visibleToolCount, unmeasured } = resolveHeaderLayoutAfterTitle(input);
-	return { titleWidth, visibleToolCount, unmeasured };
+	const { titleWidth, visibleToolCount, showTitleBadge, unmeasured } =
+		resolveHeaderLayoutAfterTitle(input);
+	return { titleWidth, visibleToolCount, showTitleBadge, unmeasured };
 }
 
 function sameLayout(a: NarratorHeaderLayoutSnapshot, b: NarratorHeaderLayoutSnapshot): boolean {
 	return (
 		a.titleWidth === b.titleWidth &&
 		a.visibleToolCount === b.visibleToolCount &&
+		a.showTitleBadge === b.showTitleBadge &&
 		a.unmeasured === b.unmeasured
 	);
 }
@@ -53,6 +55,7 @@ export function NarratorHeaderLayout({
 	showBack = false,
 	showMenu = false,
 	showTitleActions = false,
+	titleBadgeWidth = 0,
 	showClose = false,
 	onHeaderPointerDown,
 	children,
@@ -72,6 +75,7 @@ export function NarratorHeaderLayout({
 			showBack,
 			showMenu,
 			showTitleActions,
+			titleBadgeWidth,
 			showClose,
 			showPin,
 		}),
@@ -99,13 +103,23 @@ export function NarratorHeaderLayout({
 			showBack,
 			showMenu,
 			showTitleActions,
+			titleBadgeWidth,
 			showClose,
 			showPin,
 		});
 		if (sameLayout(published.current, next)) return;
 		published.current = next;
 		setLayout(next);
-	}, [titleFullWidth, surfacedToolCount, showBack, showMenu, showTitleActions, showClose, showPin]);
+	}, [
+		titleFullWidth,
+		surfacedToolCount,
+		showBack,
+		showMenu,
+		showTitleActions,
+		titleBadgeWidth,
+		showClose,
+		showPin,
+	]);
 
 	useLayoutEffect(() => {
 		const row = rowRef.current;

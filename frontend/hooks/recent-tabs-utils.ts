@@ -28,6 +28,22 @@ export interface RecentTab extends PersistedRecentTab {
 	teamOnlooker?: boolean;
 	/** Runtime-enriched marker: a team session (coordinator or one of its subagents). M1. */
 	teamSession?: boolean;
+	/**
+	 * Team tabs only, runtime-enriched: the team tree's visible pending approvals, for members
+	 * (null for an onlooker, who cannot decide them).
+	 */
+	pendingApprovalCount?: number | null;
+	/**
+	 * Project tabs only, runtime-enriched for the hover card (`recent-tab-projects.ts`): the
+	 * repository directory, this user's readable sessions running or waiting now, and readable
+	 * active teams. Null when the project can no longer be read; `projectCountsCapped` means a
+	 * read hit its cap, so the counts are lower bounds.
+	 */
+	projectPath?: string | null;
+	activeSessionCount?: number | null;
+	waitingSessionCount?: number | null;
+	teamCount?: number | null;
+	projectCountsCapped?: boolean;
 	/** Persisted marker (see `PersistedRecentTab`): this narrator was spawned by a scheduled task. */
 	isScheduled?: boolean;
 }
@@ -40,6 +56,14 @@ export function isTeamOnlookerTab(tabs: readonly RecentTab[], narratorId: string
 			tab.id === narratorId &&
 			tab.teamOnlooker === true,
 	);
+}
+
+/**
+ * A coordinator's session can sit beside a team tab with the same title. Only a session tab
+ * drives notification recipients, and this label distinguishes it from the team tab.
+ */
+export function isCoordinatorSessionTab(tab: Pick<RecentTab, "type" | "teamSession">): boolean {
+	return tab.type === "narrator" && tab.teamSession === true;
 }
 
 /**
@@ -157,6 +181,14 @@ const RECENT_TAB_RUNTIME_KEYS = [
 	"viewers",
 	"viewerCount",
 	"hasDraft",
+	"pendingApprovalCount",
+	"teamOnlooker",
+	"teamSession",
+	"projectPath",
+	"activeSessionCount",
+	"waitingSessionCount",
+	"teamCount",
+	"projectCountsCapped",
 ] as const satisfies ReadonlyArray<keyof RecentTab>;
 
 function asFields(tab: RecentTab): Record<string, unknown> {
@@ -235,8 +267,30 @@ export function mergeRecentTabRuntime(tab: PersistedRecentTab, previous?: Recent
 	return isSameRecentTab(merged, previous) ? previous : merged;
 }
 
-function recentTabNarratorId(tab: RecentTab): string | null {
-	if (tab.type === "narrator" || tab.type === "subagent") return tab.id;
+/**
+ * The narrator whose live state a tab shows: its own session, or a team tab's coordinator (the
+ * team id is the coordinator's id). The narrator socket and the runtime endpoint follow this id.
+ * Attention (sounds, favicon, PWA notifications) stays with session tabs: a pinned team is not
+ * a subscription to its coordinator's alerts.
+ */
+export function recentTabLiveNarratorId(
+	tab: Pick<RecentTab, "type" | "id" | "narratorId">,
+): string | null {
+	if (tab.type === "subagent") return tab.narratorId ?? tab.id;
+	if (tab.type === "narrator" || tab.type === "team") return tab.id;
+	return null;
+}
+
+/**
+ * Where a tab leads: a session page, a project page or a team page. Null for a folder (not a
+ * page), and for a team tab whose project is not known yet.
+ */
+export function recentTabHref(tab: Pick<RecentTab, "type" | "id" | "projectId">): string | null {
+	if (tab.type === "narrator" || tab.type === "subagent") return `/narrators/${tab.id}`;
+	if (tab.type === "project") return `/projects/${tab.id}`;
+	if (tab.type === "team") {
+		return tab.projectId ? `/projects/${tab.projectId}/teams/${tab.id}` : null;
+	}
 	return null;
 }
 
@@ -316,9 +370,32 @@ export function reconcileRecentTabsRuntimePatches(
 }
 
 function recentTabMatchesPath(tab: RecentTab, pathname: string): boolean {
-	if (tab.type === "project") return pathname === `/projects/${tab.id}`;
-	if (tab.type === "folder") return false;
-	return pathname === `/narrators/${tab.id}`;
+	const href = recentTabHref(tab);
+	return href !== null && pathname === href;
+}
+
+/**
+ * Project tabs whose runtime details (path and counts for the hover card,
+ * `recent-tab-projects.ts`) the sidebar requests with the rest of its runtime patches. They have
+ * no narrator socket, so they are chosen apart from the live window: the current page's first,
+ * then pinned ones, then the rest, at most the server's per-request cap
+ * (`PROJECT_TAB_DETAIL_LIMIT`). The sidebar takes their slots out of the live window's budget so
+ * one request stays within `RECENT_TABS_LIVE_LIMIT` keys.
+ */
+export const PROJECT_TAB_RUNTIME_LIMIT = 20;
+
+export function selectProjectRuntimeTabs(
+	tabs: readonly RecentTab[],
+	pathname: string,
+	limit = PROJECT_TAB_RUNTIME_LIMIT,
+): RecentTab[] {
+	const projects = tabs.filter((tab) => tab.type === "project");
+	const ordered = [
+		...projects.filter((tab) => recentTabMatchesPath(tab, pathname)),
+		...projects.filter((tab) => tab.pinned),
+		...projects,
+	];
+	return [...new Map(ordered.map((tab) => [tab.id, tab])).values()].slice(0, limit);
 }
 
 export function selectRecentTabsLiveWindow(
@@ -329,9 +406,12 @@ export function selectRecentTabsLiveWindow(
 	const selected: RecentTab[] = [];
 	const narratorIds = new Set<string>();
 	const add = (tab: RecentTab) => {
-		const narratorId = recentTabNarratorId(tab);
-		if (!narratorId || narratorIds.has(narratorId) || selected.length >= limit) return;
-		narratorIds.add(narratorId);
+		const narratorId = recentTabLiveNarratorId(tab);
+		// A team tab shares its coordinator's id with the coordinator's own session tab; both
+		// are live, each under its own key.
+		const slot = tab.type === "team" ? `team:${narratorId}` : narratorId;
+		if (!narratorId || !slot || narratorIds.has(slot) || selected.length >= limit) return;
+		narratorIds.add(slot);
 		selected.push(tab);
 	};
 	for (const tab of tabs) {

@@ -36,7 +36,7 @@ keywords:
   - inlineFallback
   - Worker 隔离不可降级
 status: draft
-verified_at: 2c639f086aef21d60357f1e002e62767938833e8
+verified_at: 4606114a5848dc45cd5cea3ab355234d43e11ccd
 ---
 # Worker 隔离
 

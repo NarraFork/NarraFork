@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import type { CommunicationScope } from "@shared/narrator-communication";
+import type { TeamPageSummary } from "@shared/project-teams";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import * as router from "@tanstack/react-router";
 import type { IDockviewPanelProps } from "dockview-react";
@@ -9,8 +10,11 @@ import { parseHTML } from "linkedom";
 import { act, type ReactNode, useEffect } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider } from "react-i18next";
+import { teamKeys } from "../../hooks/useTeams";
 import enNarrator from "../../locales/en/narrator.json";
 import enProjects from "../../locales/en/projects.json";
+import zhNarrator from "../../locales/zh-CN/narrator.json";
+import zhProjects from "../../locales/zh-CN/projects.json";
 import { useNarratorPanelVisible } from "./narrator-panel-visibility";
 
 let scopes: CommunicationScope[];
@@ -52,7 +56,7 @@ const { workspacePanelComponents } = await import("./workspace/panels");
 const { createWorkspaceDockStore, WorkspaceDockProvider } = await import(
 	"./workspace/workspace-dock"
 );
-const { TeamTopBar } = await import("../teams/TeamTopBar");
+const { TeamHeader } = await import("../teams/TeamHeader");
 
 let root: Root;
 let client: QueryClient;
@@ -105,7 +109,10 @@ beforeEach(async () => {
 	i18n = createInstance();
 	await i18n.init({
 		lng: "en",
-		resources: { en: { narrator: enNarrator, projects: enProjects } },
+		resources: {
+			en: { narrator: enNarrator, projects: enProjects },
+			"zh-CN": { narrator: zhNarrator, projects: zhProjects },
+		},
 		interpolation: { escapeValue: false },
 	});
 	scopes = [];
@@ -275,24 +282,52 @@ describe("communication topology hosts", () => {
 		expect(subscriptions).toBe(0);
 	});
 
-	test("team onlookers open team scope and session navigation unmounts it", async () => {
-		const openSession = mock(() => {});
-		await render(
-			<TeamTopBar
-				projectId="project"
-				teamId="team"
-				title="Team"
-				summary={undefined}
-				onOpenSession={openSession}
-			/>,
-		);
-		expect(subscriptions).toBe(0);
-		await click('[data-testid="team-communication-button"]');
-		expect(scopes.at(-1)).toEqual({ kind: "team", projectId: "project", teamId: "team" });
-		expect(subscriptions).toBe(1);
-		await click("[data-topology]");
-		expect(openSession).toHaveBeenCalledWith("target");
-		expect(subscriptions).toBe(0);
-		expect(document.querySelector("[data-topology]")).toBeNull();
-	});
+	for (const [access, phone, locale, title] of [
+		["write", false, "en", enNarrator.communicationTitle],
+		["read", true, "zh-CN", zhNarrator.communicationTitle],
+	] as const) {
+		test(`team ${access} opens team scope from the menu and releases it on session navigation`, async () => {
+			await i18n.changeLanguage(locale);
+			const openSession = mock(() => {});
+			client.setQueryData(teamKeys.members("team"), { members: [] });
+			const summary: TeamPageSummary = {
+				teamId: "team",
+				access,
+				coordinatorStatus: "idle",
+				coordinatorMessageCount: 0,
+				coordinatorStopReason: null,
+				runningAgents: [],
+				runningCount: 0,
+				pendingApprovalCount: access === "write" ? 0 : null,
+				columnCounts: { queued: 0, in_progress: 0, review: 0, done: 0, cancelled: 0 },
+				lastEventId: null,
+				lastEventAt: null,
+			};
+			await render(
+				<TeamHeader
+					projectId="project"
+					teamId="team"
+					projectName="Project"
+					title="Team"
+					summary={summary}
+					status={null}
+					phone={phone}
+					onBack={() => {}}
+					onOpenSession={openSession}
+				/>,
+			);
+			expect(subscriptions).toBe(0);
+			await click('[data-testid="team-more-menu"]');
+			const entry = '[role="menuitem"][data-testid="team-communication-button"]';
+			expect(document.querySelector(entry)?.textContent).toBe(title);
+			expect(subscriptions).toBe(0);
+			await click(entry);
+			expect(scopes.at(-1)).toEqual({ kind: "team", projectId: "project", teamId: "team" });
+			expect(subscriptions).toBe(1);
+			await click("[data-topology]");
+			expect(openSession).toHaveBeenCalledWith("target");
+			expect(subscriptions).toBe(0);
+			expect(document.querySelector("[data-topology]")).toBeNull();
+		});
+	}
 });

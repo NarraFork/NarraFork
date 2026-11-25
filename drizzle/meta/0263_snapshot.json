@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "1581f2d2-b1e3-4e0f-8544-bd2fd49fbef0",
+  "id": "8df2e944-dc76-4ebd-a0d1-3da5b55cbffe",
   "prevId": "1af88311-6357-4ccf-bdf9-5481b48cb401",
   "tables": {
     "acl_events": {
@@ -8978,254 +8978,6 @@
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "checkConstraints": {}
-    },
-    "narrator_communication_nodes": {
-      "name": "narrator_communication_nodes",
-      "columns": {
-        "narrator_id": {
-          "name": "narrator_id",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "parent_narrator_id": {
-          "name": "parent_narrator_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "original_parent_narrator_id": {
-          "name": "original_parent_narrator_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "version": {
-          "name": "version",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false,
-          "default": 1
-        }
-      },
-      "indexes": {
-        "idx_communication_nodes_parent": {
-          "name": "idx_communication_nodes_parent",
-          "columns": [
-            "parent_narrator_id"
-          ],
-          "isUnique": false
-        },
-        "idx_communication_nodes_original_parent": {
-          "name": "idx_communication_nodes_original_parent",
-          "columns": [
-            "original_parent_narrator_id"
-          ],
-          "isUnique": false
-        }
-      },
-      "foreignKeys": {
-        "narrator_communication_nodes_narrator_id_narrators_id_fk": {
-          "name": "narrator_communication_nodes_narrator_id_narrators_id_fk",
-          "tableFrom": "narrator_communication_nodes",
-          "tableTo": "narrators",
-          "columnsFrom": [
-            "narrator_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
-        },
-        "narrator_communication_nodes_parent_narrator_id_narrators_id_fk": {
-          "name": "narrator_communication_nodes_parent_narrator_id_narrators_id_fk",
-          "tableFrom": "narrator_communication_nodes",
-          "tableTo": "narrators",
-          "columnsFrom": [
-            "parent_narrator_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "set null",
-          "onUpdate": "no action"
-        },
-        "narrator_communication_nodes_original_parent_narrator_id_narrators_id_fk": {
-          "name": "narrator_communication_nodes_original_parent_narrator_id_narrators_id_fk",
-          "tableFrom": "narrator_communication_nodes",
-          "tableTo": "narrators",
-          "columnsFrom": [
-            "original_parent_narrator_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "set null",
-          "onUpdate": "no action"
-        }
-      },
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "checkConstraints": {
-        "ck_communication_nodes_not_self": {
-          "name": "ck_communication_nodes_not_self",
-          "value": "\"narrator_communication_nodes\".\"parent_narrator_id\" is null or \"narrator_communication_nodes\".\"parent_narrator_id\" <> \"narrator_communication_nodes\".\"narrator_id\""
-        },
-        "ck_communication_nodes_version": {
-          "name": "ck_communication_nodes_version",
-          "value": "\"narrator_communication_nodes\".\"version\" >= 1"
-        }
-      }
-    },
-    "narrator_communication_peers": {
-      "name": "narrator_communication_peers",
-      "columns": {
-        "id": {
-          "name": "id",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "endpoint_lo": {
-          "name": "endpoint_lo",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "endpoint_hi": {
-          "name": "endpoint_hi",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "generation": {
-          "name": "generation",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "created_by": {
-          "name": "created_by",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "source": {
-          "name": "source",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "admission_id": {
-          "name": "admission_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "message_id": {
-          "name": "message_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "created_at": {
-          "name": "created_at",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        }
-      },
-      "indexes": {
-        "uq_communication_peers_pair": {
-          "name": "uq_communication_peers_pair",
-          "columns": [
-            "endpoint_lo",
-            "endpoint_hi"
-          ],
-          "isUnique": true
-        },
-        "idx_communication_peers_hi": {
-          "name": "idx_communication_peers_hi",
-          "columns": [
-            "endpoint_hi"
-          ],
-          "isUnique": false
-        },
-        "idx_communication_peers_created_by": {
-          "name": "idx_communication_peers_created_by",
-          "columns": [
-            "created_by"
-          ],
-          "isUnique": false
-        }
-      },
-      "foreignKeys": {
-        "narrator_communication_peers_endpoint_lo_narrators_id_fk": {
-          "name": "narrator_communication_peers_endpoint_lo_narrators_id_fk",
-          "tableFrom": "narrator_communication_peers",
-          "tableTo": "narrators",
-          "columnsFrom": [
-            "endpoint_lo"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
-        },
-        "narrator_communication_peers_endpoint_hi_narrators_id_fk": {
-          "name": "narrator_communication_peers_endpoint_hi_narrators_id_fk",
-          "tableFrom": "narrator_communication_peers",
-          "tableTo": "narrators",
-          "columnsFrom": [
-            "endpoint_hi"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
-        },
-        "narrator_communication_peers_created_by_users_id_fk": {
-          "name": "narrator_communication_peers_created_by_users_id_fk",
-          "tableFrom": "narrator_communication_peers",
-          "tableTo": "users",
-          "columnsFrom": [
-            "created_by"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "set null",
-          "onUpdate": "no action"
-        }
-      },
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "checkConstraints": {
-        "ck_communication_peers_canonical": {
-          "name": "ck_communication_peers_canonical",
-          "value": "\"narrator_communication_peers\".\"endpoint_lo\" < \"narrator_communication_peers\".\"endpoint_hi\""
-        },
-        "ck_communication_peers_generation": {
-          "name": "ck_communication_peers_generation",
-          "value": "\"narrator_communication_peers\".\"generation\" >= 1"
-        }
-      }
     },
     "narrator_context_pins": {
       "name": "narrator_context_pins",
@@ -22182,6 +21934,13 @@
         "folder_preview_count": {
           "name": "folder_preview_count",
           "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "project_id": {
+          "name": "project_id",
+          "type": "text",
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false
