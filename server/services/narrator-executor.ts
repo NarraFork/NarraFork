@@ -1,4 +1,5 @@
 import type { MediaRef, NativeMediaInput } from "@shared/media-attachments";
+import { isNugPaymentContext } from "@shared/nug-payment";
 import { type AgentConfig, type AgentLoopHistory, agentLoop } from "../lib/agent";
 import type { AgentEvent, ApiRequestDiagnostics } from "../lib/agent/types";
 import { logger } from "../lib/logger";
@@ -42,6 +43,7 @@ export interface ExecuteLoopResult {
 	/** Set when the provider rejected the request because the user's NUG balance is exhausted. */
 	paymentRequired?: {
 		message: string;
+		paymentContext?: string;
 		providerId?: string;
 		providerPrefix?: string;
 		balance?: number;
@@ -265,6 +267,9 @@ export async function executeAgentLoop(
 			if (event.type === "payment_required") {
 				paymentRequired = {
 					message: event.message,
+					...(isNugPaymentContext(event.paymentContext)
+						? { paymentContext: event.paymentContext }
+						: {}),
 					providerId: event.providerId,
 					providerPrefix: event.providerPrefix,
 					balance: event.balance,

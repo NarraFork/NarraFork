@@ -43,6 +43,8 @@ import {
 	providerSecretKey,
 	savePluginProviderSecrets,
 } from "@server/lib/plugin-credentials";
+import { declaredProviderSecretFields } from "./plugin-provider-config-service";
+import { pluginProviderRegistry } from "./plugin-provider-registry";
 
 const FILE_MODE = 0o600;
 const DIR_MODE = 0o700;
@@ -146,10 +148,9 @@ export class PluginSecretVault {
 	 * field still does, so a plugin that drops a field from its schema can read and clear
 	 * the value it already saved.
 	 */
-	private providerSecret(pluginId: string, key: string) {
+	private providerRef(pluginId: string, key: string): ProviderSecretRef | undefined {
 		const store = this.providerStore();
-		if (!store) return undefined;
-		const stored = pluginProviderSecrets(store, pluginId);
+		const stored = store ? pluginProviderSecrets(store, pluginId) : new Map();
 		let ref = this.declaredRef(pluginId, key);
 		if (!ref) {
 			for (const [contributionId, fields] of stored) {
@@ -162,13 +163,127 @@ export class PluginSecretVault {
 				}
 			}
 		}
+		return ref;
+	}
+
+	private providerSecret(pluginId: string, key: string) {
+		const store = this.providerStore();
+		if (!store) return undefined;
+		const ref = this.providerRef(pluginId, key);
 		if (!ref) return undefined;
-		const fields = stored.get(ref.contributionId) ?? {};
+		const fields = pluginProviderSecrets(store, pluginId).get(ref.contributionId) ?? {};
 		const save = (next: Record<string, string>) =>
 			savePluginProviderSecrets(store, [
 				{ pluginId, contributionId: ref.contributionId, fields: next },
 			]);
 		return { field: ref.field, fields, save };
+	}
+
+	/** Declared or already-stored fields only; never split a dotted vault key into an identity. */
+	private providerRefs(pluginId: string, contributionId: string): ProviderSecretRef[] {
+		const names = new Set(
+			[...(this.providerSecretFields?.(pluginId) ?? [])]
+				.filter((ref) => ref.contributionId === contributionId)
+				.map((ref) => ref.field),
+		);
+		const store = this.providerStore();
+		if (store) {
+			for (const field of Object.keys(
+				pluginProviderSecrets(store, pluginId).get(contributionId) ?? {},
+			)) {
+				names.add(field);
+			}
+		}
+		return [...names].map((field) => ({ contributionId, field }));
+	}
+
+	/** Whether every field routes to this exact provider, including ambiguous dotted keys. */
+	supportsProviderSecrets(
+		pluginId: string,
+		contributionId: string,
+		fields: Record<string, string>,
+	): boolean {
+		return Object.entries(fields).every(([field, value]) => {
+			const key = providerSecretKey({ contributionId, field });
+			const ref = this.providerRef(pluginId, key);
+			return (
+				ref?.contributionId === contributionId &&
+				ref.field === field &&
+				key.length <= MAX_KEY_LENGTH &&
+				!["__proto__", "constructor", "prototype"].includes(field) &&
+				typeof value === "string" &&
+				value.length > 0 &&
+				Buffer.byteLength(value, "utf8") <= MAX_VALUE_BYTES
+			);
+		});
+	}
+
+	/** One provider field bag, in either storage mode; unrelated plugin secrets are excluded. */
+	async getProviderSecrets(
+		pluginId: string,
+		contributionId: string,
+	): Promise<Record<string, string>> {
+		const fields: Record<string, string> = {};
+		for (const ref of this.providerRefs(pluginId, contributionId)) {
+			const routed = this.providerRef(pluginId, providerSecretKey(ref));
+			if (routed?.contributionId !== contributionId || routed.field !== ref.field) continue;
+			const value = await this.getSecret({ pluginId, key: providerSecretKey(ref) });
+			if (value !== undefined)
+				Object.defineProperty(fields, ref.field, { value, enumerable: true });
+		}
+		return fields;
+	}
+
+	/** Replace a provider's whole field bag atomically, serialized with normal vault writes. */
+	async replaceProviderSecrets(
+		pluginId: string,
+		contributionId: string,
+		fields: Record<string, string>,
+		options: { overwrite?: boolean } = {},
+	): Promise<boolean> {
+		return this.enqueue(async () => {
+			if (!this.supportsProviderSecrets(pluginId, contributionId, fields)) {
+				throw new ValidationError("Unsupported provider secret fields");
+			}
+			const document = await this.load();
+			const old = await this.getProviderSecrets(pluginId, contributionId);
+			if (options.overwrite === false && Object.keys(old).length) return false;
+			const refs = [
+				...new Set([
+					...this.providerRefs(pluginId, contributionId).map((ref) => ref.field),
+					...Object.keys(old),
+					...Object.keys(fields),
+				]),
+			]
+				.map((field) => ({ contributionId, field }))
+				.filter((ref) => {
+					const routed = this.providerRef(pluginId, providerSecretKey(ref));
+					return routed?.contributionId === contributionId && routed.field === ref.field;
+				});
+			const keys = refs.map(providerSecretKey);
+			const retained = this.keysOf(pluginId, document).filter((key) => !keys.includes(key));
+			if (retained.length + Object.keys(fields).length > MAX_ENTRIES) {
+				throw new ValidationError("Too many secrets for this plugin");
+			}
+			const store = this.providerStore();
+			if (store) {
+				savePluginProviderSecrets(store, [{ pluginId, contributionId, fields }]);
+				await this.removeVaultKeys(document, pluginId, keys);
+				return true;
+			}
+			const bucket = { ...(document.secrets[pluginId] ?? {}) };
+			for (const key of keys) delete bucket[key];
+			for (const [field, value] of Object.entries(fields)) {
+				bucket[providerSecretKey({ contributionId, field })] = value;
+			}
+			const next: VaultDocument = {
+				version: 1,
+				secrets: { ...document.secrets, [pluginId]: bucket },
+			};
+			await this.persist(next);
+			this.document = next;
+			return true;
+		});
 	}
 
 	/** Remove the credentials of a plugin's providers that `keep` rejects; returns the fields removed. */
@@ -484,4 +599,8 @@ export class PluginSecretVault {
 }
 
 /** Shared vault instance used by the platform services graph. */
-export const pluginSecretVault = new PluginSecretVault({ credentials: () => getCredentialStore() });
+export const pluginSecretVault = new PluginSecretVault({
+	credentials: () => getCredentialStore(),
+	providerSecretFields: (pluginId) =>
+		declaredProviderSecretFields(pluginProviderRegistry, pluginId),
+});

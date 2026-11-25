@@ -138,10 +138,16 @@ function current(): Snapshot {
 	const groups = buildSourceGroups();
 	const byId = new Map<string, SourceGroupView>();
 	const byPrefix = new Map<string, SourceGroupView>();
-	// A duplicate id or prefix keeps the first group.
+	// Match provider resolution: a disconnected TokenDance singleton yields its legacy prefix.
 	for (const entry of groups) {
 		if (!byId.has(entry.id)) byId.set(entry.id, entry);
-		if (!byPrefix.has(entry.prefix)) byPrefix.set(entry.prefix, entry);
+		const previous = byPrefix.get(entry.prefix);
+		const legacyTokenDance =
+			entry.prefix === TOKENDANCE_PREFIX &&
+			previous?.templateId === "tokendance" &&
+			!settings.tokendance?.apiKey &&
+			entry.templateId !== "plugin";
+		if (!previous || legacyTokenDance) byPrefix.set(entry.prefix, entry);
 	}
 	snapshot = { settingsRevision, pluginRevision, groups, byId, byPrefix };
 	return snapshot;

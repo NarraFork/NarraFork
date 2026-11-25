@@ -12,7 +12,7 @@ import {
 } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
-import type { TokenDancePublicConnection } from "@shared/tokendance";
+import type { TokenDanceLoginChoice, TokenDancePublicConnection } from "@shared/tokendance";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
 	createFileRoute,
@@ -54,9 +54,11 @@ import {
 	createSnapshot,
 	initialProvidersState,
 	isPlatformProviderPrefix,
+	type ProviderKeyTarget,
 	type ProvidersState,
 	providersReducer,
 	providersStateFromSettings,
+	rebasePersistedProviderKeySnapshot,
 	useIsDirty,
 	useProvidersDispatch,
 } from "../../components/providers/providers-reducer";
@@ -189,6 +191,16 @@ function SettingsProvidersPage() {
 	}, [isAddingProvider]);
 
 	const savedSnapshot = useRef(createSnapshot(initialProvidersState));
+	const syncPersistedProviderKey = useCallback((target: ProviderKeyTarget, apiKey: string) => {
+		const rebased = rebasePersistedProviderKeySnapshot(savedSnapshot.current, target, apiKey);
+		savedSnapshot.current = rebased.snapshot;
+		dispatch({
+			type: "SYNC_PERSISTED_PROVIDER_KEY",
+			target,
+			apiKey,
+			previousApiKey: rebased.previousApiKey,
+		});
+	}, []);
 
 	useEffect(() => {
 		if (settings && !state.initialized) {
@@ -287,9 +299,10 @@ function SettingsProvidersPage() {
 		};
 	}, [state.initialized, isTokenDanceCallback, user?.role, user?.id, navigate, qc, returnEpoch, t]);
 	const tokenDanceLogin = useCallback(
-		(addPage?: Record<string, unknown>) =>
+		(addPage?: Record<string, unknown>, loginChoice?: TokenDanceLoginChoice) =>
 			startTokenDanceLogin(
 				tokenDanceDraftSnapshot(stateRef.current, savedSnapshot.current, addPage),
+				loginChoice,
 			),
 		[],
 	);
@@ -1282,7 +1295,7 @@ function SettingsProvidersPage() {
 							modelProtocols={state.modelProtocols}
 							onModelProtocolChange={dispatchers.setModelProtocol}
 							onTestModel={setTestingModel}
-							onLogin={() => tokenDanceLogin()}
+							onLogin={(choice) => tokenDanceLogin(undefined, choice)}
 							onChanged={refreshTokenDanceSettings}
 							onDeleted={() => setSelectedProvider(null)}
 						/>
@@ -1292,6 +1305,7 @@ function SettingsProvidersPage() {
 							pluginProvider={selectedPluginProvider}
 							state={state}
 							dispatchers={dispatchers}
+							onPersistedKeyChanged={syncPersistedProviderKey}
 							providerModelsMap={providerModelsMap}
 							commandcodeModels={commandcodeModels}
 							pluginModelsByPrefix={pluginModelsByPrefix}
@@ -1447,6 +1461,7 @@ interface ProviderSectionContentProps {
 	pluginProvider?: { pluginId: string; contributionId: string };
 	state: ProvidersState;
 	dispatchers: ReturnType<typeof useProvidersDispatch>;
+	onPersistedKeyChanged: (target: ProviderKeyTarget, apiKey: string) => void;
 	providerModelsMap: Record<string, ModelOption[]>;
 	/** Command Code 的模型（已带 `CommandCode:` 前缀），由后端从 Provider API 拉取并缓存。 */
 	commandcodeModels: ModelOption[];
@@ -1472,6 +1487,7 @@ function ProviderSectionContent({
 	pluginProvider,
 	state,
 	dispatchers,
+	onPersistedKeyChanged,
 	providerModelsMap,
 	commandcodeModels,
 	pluginModelsByPrefix,
@@ -1494,6 +1510,7 @@ function ProviderSectionContent({
 			<CommandCodeSection
 				value={state.commandCode}
 				onChange={dispatchers.setCommandCode}
+				onPersistedKeyChanged={(apiKey) => onPersistedKeyChanged({ kind: "command-code" }, apiKey)}
 				onToggleDisabled={() =>
 					dispatchers.setPlatformDisabled("CommandCode", !state.commandCode.disabled)
 				}
@@ -1562,6 +1579,9 @@ function ProviderSectionContent({
 			<CustomApiProviderSection
 				provider={customApiMatch}
 				onProvidersChange={dispatchers.setCustomApiProviders}
+				onPersistedKeyChanged={(apiKey) =>
+					onPersistedKeyChanged({ kind: "custom", id: customApiMatch.id }, apiKey)
+				}
 				openAIProviderModelsMap={providerModelsMap}
 				anthropicProviderModelsMap={anthropicModelsMap}
 				geminiProviderModelsMap={geminiModelsMap}
@@ -1587,6 +1607,7 @@ function ProviderSectionContent({
 			<NUGProvidersSection
 				providers={[nugMatch]}
 				onProvidersChange={dispatchers.setNugProviders}
+				onPersistedKeyChanged={(id, apiKey) => onPersistedKeyChanged({ kind: "nug", id }, apiKey)}
 				providerModelsMap={nugModelsMap}
 				hiddenModels={state.hiddenModels}
 				onToggleHidden={dispatchers.toggleHidden}

@@ -10,6 +10,7 @@ import {
 	type TokenDanceCatalogModel,
 	type TokenDanceDraftRestore,
 	type TokenDanceDraftSnapshot,
+	type TokenDanceLoginChoice,
 	type TokenDanceOAuthComplete,
 	type TokenDanceOAuthStart,
 	type TokenDancePaymentCreate,
@@ -18,15 +19,28 @@ import {
 	type TokenDanceRecoveryAction,
 } from "@shared/tokendance";
 import type { ToolResultImagesMode } from "@shared/tool-result-images";
+import { clearKeyCooldown } from "../lib/agent/pooled-provider";
 import { maskSecretValues } from "../lib/agent/request-dump";
 import { normalizeConfiguredOrigins, resolveAllowedCorsOrigin } from "../lib/cors-origin";
+import type { Credential } from "../lib/credential-store";
 import { AppError } from "../lib/errors";
 import { rewriteConnectionOverrides } from "../lib/model-catalog";
 import type { UsageSubject } from "../lib/provider-key-subjects";
-import { getProviderKeyStore, TOKENDANCE_KEY_OWNER, withProviderKey } from "../lib/provider-keys";
+import {
+	getProviderKeyStore,
+	isTokenDanceLoginKey,
+	TOKENDANCE_KEY_OWNER,
+	tokenDanceLoginAccount,
+	withProviderKey,
+} from "../lib/provider-keys";
 import { saveSettings, settings, type TokenDanceSettings } from "../lib/settings";
 import { settingsUpdateLock } from "../lib/settings/write-lock";
-import { importLegacyQuotaCache, quotaStore } from "../lib/sourcing/quota-store";
+import { legacyQuotaNetworkCompatible, quotaNetworkIdentity } from "../lib/sourcing/quota-identity";
+import {
+	importLegacyQuotaCache,
+	quotaStore,
+	STREAM_QUOTA_SOURCE,
+} from "../lib/sourcing/quota-store";
 import { registerTokenDanceRuntime } from "../lib/tokendance-runtime";
 
 registerTokenDanceRuntime({
@@ -43,11 +57,14 @@ const PAYMENT_TTL = 24 * 60 * 60_000;
 const PAYMENT_FINAL_QUERY_GRACE = 10 * 60_000;
 interface BalanceCache {
 	generation: number;
+	identity: string;
 	attemptedAt: number;
 	task?: Promise<TokenDanceBalance>;
 }
 interface PaymentEntry {
 	owner: string;
+	/** Immutable portal identity captured before the create request. */
+	config: NonNullable<ReturnType<typeof getTokenDanceRuntimeConfig>>;
 	generation: number;
 	amount: number;
 	retireAt: number;
@@ -58,7 +75,7 @@ interface PaymentEntry {
 	finalChecked?: boolean;
 	finalError?: boolean;
 }
-let balanceCache: BalanceCache | undefined;
+const balanceCaches = new Map<string, BalanceCache>();
 type PersistedBalance = Pick<
 	TokenDanceBalance,
 	"credits" | "creditsUsed" | "balance" | "updatedAt"
@@ -84,16 +101,26 @@ function parsePersistedBalance(raw: unknown): PersistedBalance | null {
 
 export type TokenDanceSubject = UsageSubject<TokenDanceSettings>;
 
-function balanceSubject(config = getTokenDanceRuntimeConfig()): TokenDanceSubject | undefined {
+function balanceSubject(credentialId?: string): TokenDanceSubject | undefined {
+	const config = getTokenDanceRuntimeConfig();
 	if (!config) return undefined;
-	const key = getProviderKeyStore().list(TOKENDANCE_KEY_OWNER)[0];
-	return key
+	const keys = getProviderKeyStore().list(TOKENDANCE_KEY_OWNER);
+	const login = credentialId === undefined ? loginConfig() : undefined;
+	const key =
+		credentialId === undefined
+			? keys.find((entry) => entry.apiKey === login?.apiKey)
+			: keys.find((entry) => entry.id === credentialId);
+	return key && !key.disabled
 		? { id: key.id, providerId: TOKENDANCE_PREFIX, config: withProviderKey(config, key) }
-		: { id: TOKENDANCE_PREFIX, providerId: TOKENDANCE_PREFIX, config };
+		: undefined;
 }
 
-function balanceIdentity(config: TokenDanceSettings): string {
-	return JSON.stringify([config.apiKey, config.generation]);
+export function tokenDanceQuotaIdentity(config: TokenDanceSettings): string {
+	return JSON.stringify([
+		config.apiKey,
+		config.generation,
+		quotaNetworkIdentity(config, settings.proxy),
+	]);
 }
 
 function tokenDanceSnapshot(
@@ -140,18 +167,39 @@ function restoreSnapshot(snapshot: QuotaSnapshot): QuotaSnapshot | null {
 }
 
 let legacyImported = false;
-function importLegacyBalance(subject: TokenDanceSubject): void {
+function importLegacyBalance(): void {
 	if (legacyImported) return;
+	const config = getTokenDanceRuntimeConfig();
+	if (!config) return;
+	const subjects = getProviderKeyStore()
+		.list(TOKENDANCE_KEY_OWNER)
+		.map((key) => ({
+			id: key.id,
+			config: withProviderKey(config, key),
+		}));
+	if (!subjects.length) return;
 	legacyImported = true;
-	const identity = balanceIdentity(subject.config);
+	// The old file names one balance, not a portal login. Check all actual secrets
+	// before consuming it so a different/manual key's first read cannot discard it.
+	const compatible = subjects.filter((subject) =>
+		legacyQuotaNetworkCompatible(subject.config, {
+			proxyAndTlsCovered: false,
+			globalProxy: settings.proxy,
+		}),
+	);
 	void importLegacyQuotaCache(
 		"tokendance-balance.json",
 		parsePersistedBalance,
-		[{ legacyKey: TOKENDANCE_PREFIX, id: subject.id, identity }],
+		compatible.map((subject) => ({
+			legacyKey: TOKENDANCE_PREFIX,
+			id: subject.id,
+			identity: JSON.stringify([subject.config.apiKey, subject.config.generation]),
+			storeIdentity: tokenDanceQuotaIdentity(subject.config),
+		})),
 		(value) =>
 			tokenDanceSnapshot(
 				{
-					generation: subject.config.generation,
+					generation: config.generation,
 					...value,
 					loading: false,
 					hasError: false,
@@ -174,6 +222,9 @@ interface Flow {
 	snapshot?: TokenDanceDraftSnapshot;
 	bytes: number;
 	controller?: AbortController;
+	loginChoice?: TokenDanceLoginChoice;
+	/** Detect an edited/deleted/reassigned chosen slot before changing any credential. */
+	replacementFingerprint?: string;
 }
 const flows = new Map<string, Flow>();
 const requests = new Set<AbortController>();
@@ -315,11 +366,19 @@ export function getTokenDanceCatalogModels(): TokenDanceCatalogModel[] {
 export function setTokenDanceRecoveryAction(
 	action: TokenDanceRecoveryAction | undefined,
 	expected: number,
-): void {
-	if (settings.tokendance?.apiKey && generation() === expected)
-		recoveryAction = parseTokenDanceRecoveryAction(action);
+	apiKey?: string,
+): boolean {
+	const login = loginConfig();
+	if (!login || generation() !== expected || (apiKey && apiKey !== login.apiKey)) return false;
+	recoveryAction = parseTokenDanceRecoveryAction(action);
+	return true;
 }
 export function getTokenDanceConnection(): TokenDancePublicConnection {
+	const keys = getProviderKeyStore().list(TOKENDANCE_KEY_OWNER);
+	const unboundKeys =
+		keys.length && !keys.some(isTokenDanceLoginKey)
+			? keys.map((key) => ({ id: key.id, label: key.label || key.id }))
+			: undefined;
 	return {
 		connected: !!settings.tokendance?.apiKey,
 		toolResultImages: settings.tokendance?.toolResultImages,
@@ -328,20 +387,32 @@ export function getTokenDanceConnection(): TokenDancePublicConnection {
 		disabled: settings.tokendance?.disabled ?? false,
 		generation: generation(),
 		models: getTokenDanceCatalogModels(),
-		...(recoveryAction && settings.tokendance?.apiKey ? { recoveryAction } : {}),
+		...(recoveryAction && loginConfig() ? { recoveryAction } : {}),
+		...(unboundKeys ? { unboundKeys } : {}),
 	};
 }
-export function assertTokenDanceConnection(expected: number): void {
+export function assertTokenDanceConnection(expected: number, apiKey?: string): void {
 	const config = getTokenDanceRuntimeConfig();
 	if (!config || config.disabled || config.generation !== expected) {
 		throw fail("TokenDance connection changed or is disabled", 409);
+	}
+	if (apiKey) {
+		const keys = getProviderKeyStore().list(TOKENDANCE_KEY_OWNER);
+		if (
+			keys.length
+				? !keys.some((key) => key.apiKey === apiKey && !key.disabled)
+				: config.apiKey !== apiKey
+		) {
+			throw fail("TokenDance credential changed or is disabled", 409);
+		}
 	}
 }
 export function registerTokenDanceRequest(
 	controller: AbortController,
 	expected: number,
+	apiKey?: string,
 ): () => void {
-	assertTokenDanceConnection(expected);
+	assertTokenDanceConnection(expected, apiKey);
 	requests.add(controller);
 	return () => requests.delete(controller);
 }
@@ -519,9 +590,25 @@ export function startTokenDanceOAuth(
 	owner: string,
 	callback: URL,
 	draftSnapshot?: unknown,
+	loginChoice?: TokenDanceLoginChoice,
 ): TokenDanceOAuthStart {
 	cleanup();
 	assertNoPrefixConflict();
+	const keys = getProviderKeyStore().list(TOKENDANCE_KEY_OWNER);
+	const needsChoice = keys.length > 0 && !keys.some(isTokenDanceLoginKey);
+	if (needsChoice && !loginChoice) {
+		throw fail("Choose an old login key to replace, or explicitly keep all existing keys", 409);
+	}
+	if (loginChoice && (!needsChoice || !["add", "replace"].includes(loginChoice.mode))) {
+		throw fail("TokenDance login choice is no longer applicable", 409);
+	}
+	const replacement =
+		loginChoice?.mode === "replace"
+			? keys.find((key) => key.id === loginChoice.credentialId)
+			: undefined;
+	if (loginChoice?.mode === "replace" && !replacement) {
+		throw fail("The selected TokenDance key no longer belongs to this connection", 409);
+	}
 	const snapshot = validateTokenDanceSnapshot(draftSnapshot);
 	const bytes = snapshot ? Buffer.byteLength(JSON.stringify(snapshot)) : 0;
 	if (
@@ -544,6 +631,10 @@ export function startTokenDanceOAuth(
 		status: "pending",
 		snapshot,
 		bytes,
+		...(loginChoice ? { loginChoice: structuredClone(loginChoice) } : {}),
+		...(replacement
+			? { replacementFingerprint: tokenDanceLoginAccount(replacement.apiKey).sub }
+			: {}),
 	});
 	const returnUrl = new URL(callback);
 	returnUrl.searchParams.set("state", flowId);
@@ -623,10 +714,52 @@ export async function completeTokenDanceOAuth(
 			}
 			assertNoPrefixConflict();
 			const latest = structuredClone(settings);
+			const store = getProviderKeyStore();
+			// Claim an existing returned key before rotating the login slot, so one secret
+			// never gains two credential/quota identities. Otherwise replace the old login
+			// in place, keeping independent manual credentials and their network/order intact.
+			const keys = store.list(TOKENDANCE_KEY_OWNER);
+			const replacementId =
+				flow.loginChoice?.mode === "replace" ? flow.loginChoice.credentialId : undefined;
+			const replacement = keys.find((entry) => entry.id === replacementId);
+			if (
+				flow.loginChoice?.mode === "replace" &&
+				(!replacement ||
+					tokenDanceLoginAccount(replacement.apiKey).sub !== flow.replacementFingerprint)
+			) {
+				throw fail("The selected TokenDance key changed during authorization", 409);
+			}
+			const login =
+				keys.find((entry) => entry.apiKey === key) ??
+				replacement ??
+				keys.find(isTokenDanceLoginKey) ??
+				store.add(TOKENDANCE_KEY_OWNER, { apiKey: key });
+			const secretChanged = login.apiKey !== key;
+			store.update(login.id, {
+				apiKey: key,
+				account: tokenDanceLoginAccount(key),
+				disabled: false,
+			});
+			clearKeyCooldown(login.id);
+			if (secretChanged) {
+				quotaStore.remove(login.id);
+				quotaStore.remove(login.id, STREAM_QUOTA_SOURCE);
+			}
+			for (const previous of keys) {
+				if (
+					previous.id !== login.id &&
+					(isTokenDanceLoginKey(previous) || previous.id === replacement?.id)
+				) {
+					store.update(previous.id, { account: null, disabled: true });
+					clearKeyCooldown(previous.id);
+					quotaStore.remove(previous.id);
+					quotaStore.remove(previous.id, STREAM_QUOTA_SOURCE);
+				}
+			}
 			latest.tokendance = {
 				toolResultImages: latest.tokendance?.toolResultImages,
 				modelCollectionInitialized: latest.tokendance?.modelCollectionInitialized,
-				apiKey: key,
+				apiKey: store.firstKey(TOKENDANCE_KEY_OWNER) ?? key,
 				disabled: false,
 				generation: generation() + 1,
 				models: [],
@@ -660,7 +793,7 @@ export async function completeTokenDanceOAuth(
 export async function refreshTokenDanceModels(
 	signal?: AbortSignal,
 ): Promise<TokenDanceCatalogModel[]> {
-	const config = getTokenDanceRuntimeConfig();
+	const config = balanceConfig();
 	if (!config) throw fail("TokenDance is not connected", 409);
 	const controller = new AbortController();
 	// Catalog management remains available while the runtime provider is disabled.
@@ -683,8 +816,8 @@ export async function refreshTokenDanceModels(
 		if (controller.signal.aborted) throw fail("TokenDance request cancelled", 409);
 		const body = record(response.body);
 		if (!response.ok) {
-			recoveryAction = response.action;
-			throw fail("TokenDance model refresh failed", 502, recoveryAction);
+			setTokenDanceRecoveryAction(response.action, config.generation, config.apiKey);
+			throw fail("TokenDance model refresh failed", 502, response.action);
 		}
 		const entries = body?.data;
 		if (!Array.isArray(entries)) throw fail("Invalid TokenDance model catalog", 502);
@@ -699,7 +832,7 @@ export async function refreshTokenDanceModels(
 		});
 		models = next;
 		modelsGeneration = config.generation;
-		recoveryAction = undefined;
+		setTokenDanceRecoveryAction(undefined, config.generation, config.apiKey);
 		return structuredClone(next);
 	} finally {
 		unregister();
@@ -739,14 +872,69 @@ export async function setTokenDanceDisabled(
 	});
 }
 function invalidateBilling(): void {
-	balanceCache = undefined;
+	balanceCaches.clear();
 	for (const entry of payments.values()) {
 		if (entry.session?.status === "pending") entry.session.status = "closed";
 	}
 }
-function billingConfig() {
+/** Restore one portable login claim without letting an added backup replace the local portal account. */
+export function restoreTokenDanceLoginAccount(
+	credentialId: string,
+	account: Credential["account"] | null,
+	replace = false,
+): void {
+	const store = getProviderKeyStore();
+	const keys = store.list(TOKENDANCE_KEY_OWNER);
+	const key = keys.find((entry) => entry.id === credentialId);
+	if (!key) return;
+	const before = keys.filter(isTokenDanceLoginKey);
+	// Older packages omitted account metadata. Absence cannot revoke provenance already
+	// established locally for this exact secret, even when other metadata is replaced.
+	if (!account && isTokenDanceLoginKey(key)) return;
+	const claimed = tokenDanceLoginAccount(key.apiKey);
+	const valid =
+		!!account && account.accountId === "tokendance-login" && account.sub === claimed.sub;
+	const bind = valid && (replace || !before.some((entry) => entry.id !== key.id));
+	store.update(key.id, { account: bind ? claimed : null });
+	if (bind && replace) {
+		for (const previous of before) {
+			if (previous.id === key.id) continue;
+			store.update(previous.id, { account: null, disabled: true });
+			clearKeyCooldown(previous.id);
+			quotaStore.remove(previous.id);
+			quotaStore.remove(previous.id, STREAM_QUOTA_SOURCE);
+		}
+	}
+	const after = store.list(TOKENDANCE_KEY_OWNER).filter(isTokenDanceLoginKey);
+	if (
+		JSON.stringify(before.map((entry) => [entry.id, entry.apiKey])) !==
+		JSON.stringify(after.map((entry) => [entry.id, entry.apiKey]))
+	) {
+		const next = structuredClone(settings);
+		if (next.tokendance) {
+			next.tokendance.generation = generation() + 1;
+			saveSettings(next);
+		}
+		recoveryAction = undefined;
+		invalidateRequests();
+	}
+}
+
+function loginConfig() {
 	const config = getTokenDanceRuntimeConfig();
-	if (!config || config.disabled) throw fail("TokenDance is not connected or is disabled", 409);
+	if (!config) return undefined;
+	const logins = getProviderKeyStore().list(TOKENDANCE_KEY_OWNER).filter(isTokenDanceLoginKey);
+	// Ambiguous or unmarked credentials must never choose a payment account by pool order.
+	return logins.length === 1 && logins[0] ? withProviderKey(config, logins[0]) : undefined;
+}
+function balanceConfig() {
+	return loginConfig() ?? getTokenDanceRuntimeConfig();
+}
+function billingConfig() {
+	const config = loginConfig();
+	if (!config || config.disabled)
+		throw fail("TokenDance login is unavailable; sign in again before portal operations", 409);
+	assertTokenDanceConnection(config.generation, config.apiKey);
 	return config;
 }
 async function billingRequest(
@@ -759,7 +947,7 @@ async function billingRequest(
 	const abort = () => controller.abort();
 	signal?.addEventListener("abort", abort, { once: true });
 	if (signal?.aborted) controller.abort();
-	const unregister = registerTokenDanceRequest(controller, config.generation);
+	const unregister = registerTokenDanceRequest(controller, config.generation, config.apiKey);
 	const startedAt = performance.now();
 	const operation =
 		path === "/portal/api/v1/user/balance"
@@ -782,10 +970,10 @@ async function billingRequest(
 			64 * 1024,
 			controller,
 		);
-		assertTokenDanceConnection(config.generation);
+		assertTokenDanceConnection(config.generation, config.apiKey);
 		if (controller.signal.aborted) throw fail("TokenDance request cancelled", 409);
 		if (!response.ok) {
-			setTokenDanceRecoveryAction(response.action, config.generation);
+			setTokenDanceRecoveryAction(response.action, config.generation, config.apiKey);
 			throw fail("TokenDance billing request failed", 502, response.action);
 		}
 		return response.body;
@@ -801,49 +989,63 @@ async function billingRequest(
 			});
 	}
 }
-function currentBalanceCache(): BalanceCache {
-	const subject = balanceSubject();
-	if (
-		!balanceCache ||
-		balanceCache.generation !== generation() ||
-		(subject && balanceIdentity(subject.config) !== balanceCacheIdentity)
-	) {
-		balanceCache = { generation: generation(), attemptedAt: -Infinity };
-		balanceCacheIdentity = subject ? balanceIdentity(subject.config) : undefined;
+function currentBalanceCache(subject: TokenDanceSubject): BalanceCache {
+	const identity = tokenDanceQuotaIdentity(subject.config);
+	let cache = balanceCaches.get(subject.id);
+	if (!cache || cache.generation !== generation() || cache.identity !== identity) {
+		cache = { generation: generation(), identity, attemptedAt: -Infinity };
+		balanceCaches.set(subject.id, cache);
 	}
-	if (subject) importLegacyBalance(subject);
-	return balanceCache;
+	importLegacyBalance();
+	return cache;
 }
-let balanceCacheIdentity: string | undefined;
-function balanceSummary(cache: BalanceCache): TokenDanceBalance {
-	const subject = balanceSubject();
+
+export function getTokenDanceQuotaSnapshot(
+	credentialId?: string,
+): { credentialId: string; snapshot: QuotaSnapshot | undefined } | undefined {
+	const subject = balanceSubject(credentialId);
+	if (!subject) return undefined;
+	importLegacyBalance();
+	return {
+		credentialId: subject.id,
+		snapshot: quotaStore.get(subject.id, tokenDanceQuotaIdentity(subject.config), restoreSnapshot),
+	};
+}
+
+export function isTokenDanceQuotaRefreshing(credentialId?: string): boolean {
+	const subject = balanceSubject(credentialId);
+	const cache = subject ? balanceCaches.get(subject.id) : undefined;
+	return !!(cache?.task && subject && cache.identity === tokenDanceQuotaIdentity(subject.config));
+}
+
+function balanceSummary(cache?: BalanceCache, subject = balanceSubject()): TokenDanceBalance {
 	const snapshot = subject
-		? quotaStore.get(subject.id, balanceIdentity(subject.config), restoreSnapshot)
+		? quotaStore.get(subject.id, tokenDanceQuotaIdentity(subject.config), restoreSnapshot)
 		: undefined;
 	const { recoveryAction: _storedAction, ...stored } = (snapshot?.detail ??
 		{}) as Partial<TokenDanceBalance>;
 	return {
-		generation: cache.generation,
+		generation: cache?.generation ?? generation(),
 		credits: stored.credits ?? null,
 		creditsUsed: stored.creditsUsed ?? null,
 		balance: stored.balance ?? null,
 		updatedAt: stored.updatedAt ?? null,
-		loading: !!cache.task,
+		loading: !!cache?.task,
 		hasError: stored.hasError ?? false,
-		...(recoveryAction ? { recoveryAction } : {}),
+		...(recoveryAction && subject?.config.apiKey === loginConfig()?.apiKey
+			? { recoveryAction }
+			: {}),
 	};
 }
 /** Stale-while-revalidate: never waits on the upstream in ordinary user requests. */
 export function getTokenDanceBalance(): TokenDanceBalance {
-	const cache = currentBalanceCache();
-	if (
-		getTokenDanceRuntimeConfig() &&
-		!settings.tokendance?.disabled &&
-		Date.now() - cache.attemptedAt >= BALANCE_TTL
-	) {
+	const subject = balanceSubject();
+	if (!subject) return balanceSummary();
+	const cache = currentBalanceCache(subject);
+	if (!subject.config.disabled && Date.now() - cache.attemptedAt >= BALANCE_TTL) {
 		void refreshTokenDanceBalance(false).catch(() => {});
 	}
-	return balanceSummary(cache);
+	return balanceSummary(cache, subject);
 }
 function parseBalance(body: unknown, config: TokenDanceSettings): TokenDanceBalance {
 	const value = record(record(body)?.balance);
@@ -863,7 +1065,7 @@ function parseBalance(body: unknown, config: TokenDanceSettings): TokenDanceBala
 		updatedAt: Date.now(),
 		loading: false,
 		hasError: false,
-		...(recoveryAction ? { recoveryAction } : {}),
+		...(recoveryAction && config.apiKey === loginConfig()?.apiKey ? { recoveryAction } : {}),
 	};
 }
 
@@ -879,26 +1081,39 @@ export async function probeTokenDanceQuota(
 	return tokenDanceSnapshot(value, value.updatedAt ?? Date.now());
 }
 
-export async function refreshTokenDanceBalance(force = true): Promise<TokenDanceBalance> {
-	const config = billingConfig();
-	const cache = currentBalanceCache();
+export async function refreshTokenDanceBalance(
+	force = true,
+	credentialId?: string,
+): Promise<TokenDanceBalance> {
+	const subject = balanceSubject(credentialId);
+	if (!subject || subject.config.disabled)
+		throw fail("TokenDance login or selected credential is unavailable", 409);
+	assertTokenDanceConnection(subject.config.generation, subject.config.apiKey);
+	const cache = currentBalanceCache(subject);
 	if (cache.task) return cache.task;
-	if (!force && Date.now() - cache.attemptedAt < BALANCE_TTL) return balanceSummary(cache);
+	if (!force && Date.now() - cache.attemptedAt < BALANCE_TTL) return balanceSummary(cache, subject);
 	cache.attemptedAt = Date.now();
-	const subject = balanceSubject(config);
-	if (!subject) throw fail("TokenDance is not connected", 409);
-	const identity = balanceIdentity(config);
+	const identity = tokenDanceQuotaIdentity(subject.config);
+	const current = () => {
+		const live = balanceSubject(credentialId);
+		return (
+			balanceCaches.get(subject.id) === cache &&
+			live?.id === subject.id &&
+			tokenDanceQuotaIdentity(live.config) === identity &&
+			!live.config.disabled
+		);
+	};
 	let task: Promise<TokenDanceBalance> | undefined;
 	task = (async () => {
 		try {
 			const snapshot = await probeTokenDanceQuota(subject, new AbortController().signal);
-			if (balanceCache !== cache || balanceCacheIdentity !== identity) {
+			if (!current()) {
 				throw fail("TokenDance connection changed", 409);
 			}
 			quotaStore.set(subject.id, identity, snapshot);
 		} catch {
-			if (balanceCache === cache && balanceCacheIdentity === identity) {
-				const previous = balanceSummary({ ...cache, task: undefined });
+			if (current()) {
+				const previous = balanceSummary({ ...cache, task: undefined }, subject);
 				quotaStore.set(
 					subject.id,
 					identity,
@@ -911,9 +1126,19 @@ export async function refreshTokenDanceBalance(force = true): Promise<TokenDance
 				);
 			}
 		} finally {
-			if (balanceCache === cache && cache.task === task) cache.task = undefined;
+			if (balanceCaches.get(subject.id) === cache && cache.task === task) cache.task = undefined;
 		}
-		return balanceSummary(cache);
+		return current()
+			? balanceSummary(cache, subject)
+			: {
+					generation: generation(),
+					credits: null,
+					creditsUsed: null,
+					balance: null,
+					updatedAt: null,
+					loading: false,
+					hasError: true,
+				};
 	})();
 	cache.task = task;
 	return task;
@@ -1021,7 +1246,8 @@ function refreshBalanceAfterPayment(expected: number): void {
 	if (recoveryAction === "top_up_balance") recoveryAction = undefined;
 	// Start immediately under the confirmed generation; existing request/cache identity
 	// guards discard late results after another payment or a connection change.
-	balanceCache = undefined;
+	const subject = balanceSubject();
+	if (subject) balanceCaches.delete(subject.id);
 	void refreshTokenDanceBalance().catch(() => {});
 }
 async function pollPayment(entry: PaymentEntry): Promise<void> {
@@ -1039,7 +1265,8 @@ async function pollPayment(entry: PaymentEntry): Promise<void> {
 	entry.polledAt = Date.now();
 	const task = (async () => {
 		try {
-			const config = billingConfig();
+			const config = entry.config;
+			assertTokenDanceConnection(config.generation, config.apiKey);
 			const next = parsePayment(
 				await billingRequest(paymentPath(session.id), config),
 				entry,
@@ -1094,6 +1321,7 @@ export async function createTokenDancePaymentSession(
 		throw fail("Too many TokenDance payment requests", 429);
 	const entry: PaymentEntry = {
 		owner,
+		config: { ...config },
 		generation: input.generation,
 		amount: input.amount,
 		retireAt: Date.now() + PAYMENT_TTL,
@@ -1139,7 +1367,9 @@ export async function getTokenDancePaymentSession(
 
 export async function deleteTokenDanceConnection(): Promise<void> {
 	await settingsUpdateLock.acquire("settings", async () => {
-		const credentialId = balanceSubject()?.id ?? TOKENDANCE_PREFIX;
+		const store = getProviderKeyStore();
+		const credentialIds = store.list(TOKENDANCE_KEY_OWNER).map((key) => key.id);
+		credentialIds.push(TOKENDANCE_PREFIX);
 		const latest = structuredClone(settings);
 		latest.tokendance = { apiKey: "", disabled: false, generation: generation() + 1 };
 		// Only model-reference fields belong to this connection. Prompts, permission
@@ -1195,6 +1425,7 @@ export async function deleteTokenDanceConnection(): Promise<void> {
 		models = [];
 		modelsGeneration = -1;
 		recoveryAction = undefined;
-		quotaStore.remove(credentialId);
+		store.removeProvider(TOKENDANCE_KEY_OWNER);
+		for (const credentialId of credentialIds) quotaStore.remove(credentialId);
 	});
 }

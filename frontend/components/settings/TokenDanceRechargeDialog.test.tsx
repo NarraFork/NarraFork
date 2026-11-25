@@ -1,11 +1,16 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
-import type { TokenDancePaymentSession, TokenDancePublicConnection } from "@shared/tokendance";
+import type {
+	TokenDanceLoginChoice,
+	TokenDancePaymentSession,
+	TokenDancePublicConnection,
+} from "@shared/tokendance";
 import type { QueryClient as QueryClientType } from "@tanstack/react-query";
 import { createInstance } from "i18next";
 import { parseHTML } from "linkedom";
 import { act, StrictMode } from "react";
 import type { Root } from "react-dom/client";
 import { api } from "../../lib/api";
+import { providerKeysApi } from "../../lib/api/provider-keys";
 import { openTokenDanceRecharge, TOKENDANCE_RECOVERY_EVENT } from "../../lib/tokendance-recovery";
 import errors from "../../locales/en/errors.json";
 import narratorEn from "../../locales/en/narrator.json";
@@ -39,6 +44,7 @@ const globals = {
 	ShadowRoot: window.ShadowRoot ?? class {},
 	getComputedStyle: () => ({ getPropertyValue: () => "", overflow: "visible" }),
 	matchMedia: window.matchMedia,
+	MutationObserver: window.MutationObserver,
 	ResizeObserver: class {
 		observe() {}
 		unobserve() {}
@@ -53,6 +59,7 @@ for (const [key, value] of Object.entries(globals)) {
 	Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
 }
 (window.document as unknown as Record<string, unknown>).oninput = null;
+Object.assign(window.document, { fonts: { addEventListener() {}, removeEventListener() {} } });
 const { QueryClient, QueryClientProvider } = await import("@tanstack/react-query");
 const { formatTokenDanceMoney, useTokenDanceBalance } = await import(
 	"../../hooks/useTokenDanceBalance"
@@ -111,6 +118,7 @@ let poll: ReturnType<typeof spyOn<typeof api, "tokenDancePaymentSession">>;
 let refresh: ReturnType<typeof spyOn<typeof api, "tokenDanceRefreshBalance">>;
 let getBalance: ReturnType<typeof spyOn<typeof api, "tokenDanceBalance">>;
 let getConnection: ReturnType<typeof spyOn<typeof api, "tokenDanceConnection">>;
+let getKeys: ReturnType<typeof spyOn<typeof providerKeysApi, "list">>;
 let timers: Map<number, { callback: () => void; delay: number }>;
 let nextTimer: number;
 let intervals: Map<number, { callback: () => void; delay: number }>;
@@ -138,6 +146,7 @@ beforeEach(() => {
 	refresh = spyOn(api, "tokenDanceRefreshBalance").mockResolvedValue(balance);
 	getBalance = spyOn(api, "tokenDanceBalance").mockResolvedValue(balance);
 	getConnection = spyOn(api, "tokenDanceConnection").mockResolvedValue(connection);
+	getKeys = spyOn(providerKeysApi, "list").mockResolvedValue({ keys: [] });
 	timers = new Map();
 	intervals = new Map();
 	nextTimer = 100000;
@@ -180,6 +189,7 @@ afterEach(async () => {
 		refresh,
 		getBalance,
 		getConnection,
+		getKeys,
 		timerSpy,
 		clearSpy,
 		fetchSpy,
@@ -243,7 +253,12 @@ async function tick(delay: number) {
 	});
 	await settle();
 }
-async function renderSection() {
+async function renderSection(
+	options: {
+		connection?: TokenDancePublicConnection;
+		onLogin?: (choice?: TokenDanceLoginChoice) => Promise<void>;
+	} = {},
+) {
 	await act(async () =>
 		root.render(
 			<QueryClientProvider client={qc}>
@@ -251,11 +266,11 @@ async function renderSection() {
 					<MantineProvider env="test">
 						<ConfirmDialogContext.Provider value={{ confirm: async () => true }}>
 							<TokenDanceSection
-								connection={connection}
+								connection={options.connection ?? connection}
 								enabled
 								onToggleEnabled={() => {}}
 								onToolResultImagesChange={() => {}}
-								onLogin={async () => {}}
+								onLogin={options.onLogin ?? (async () => {})}
 								onChanged={async () => {}}
 								onDeleted={() => {}}
 								hiddenModels={new Set()}
@@ -319,6 +334,72 @@ async function recovery(action = "top_up_balance") {
 	await settle();
 }
 describe("TokenDance recharge behavior", () => {
+	it.each([
+		"replace",
+		"add",
+	] as const)("an unmarked connection requires an explicit %s choice before OAuth", async (mode) => {
+		const choices: Array<TokenDanceLoginChoice | undefined> = [];
+		await renderSection({
+			connection: { ...connection, unboundKeys: [{ id: "old-slot", label: "Old login" }] },
+			onLogin: async (choice) => {
+				choices.push(choice);
+			},
+		});
+		expect(button(settings.tokendance.reauthorize).disabled).toBe(true);
+		const select = container.querySelector(
+			`input[placeholder="${settings.tokendance.loginChoicePlaceholder}"]`,
+		);
+		if (!select) throw new Error("Missing login slot choice");
+		await act(async () => {
+			select.dispatchEvent(new window.Event("click", { bubbles: true }));
+		});
+		await settle();
+		const label =
+			mode === "add"
+				? settings.tokendance.loginKeepKeys
+				: settings.tokendance.loginReplaceKey.replace("{{key}}", "Old login");
+		const option = [...document.querySelectorAll('[role="option"]')].find(
+			(entry) => entry.textContent === label,
+		);
+		if (!option) throw new Error(`Missing option ${label}: ${document.body.textContent}`);
+		await act(async () => {
+			option.dispatchEvent(new window.Event("click", { bubbles: true }));
+		});
+		await settle();
+		expect(button(settings.tokendance.reauthorize).disabled).toBe(false);
+		await act(async () => {
+			button(settings.tokendance.reauthorize).click();
+		});
+		expect(choices).toEqual([mode === "replace" ? { mode, credentialId: "old-slot" } : { mode }]);
+	});
+	it("a single ready TokenDance key exposes its working network editor", async () => {
+		getKeys.mockResolvedValue({
+			keys: [
+				{
+					id: "login-key",
+					label: null,
+					masked: "********login",
+					priority: 0,
+					disabled: false,
+					disabledReason: null,
+					network: {},
+					cooldown: null,
+					usage: null,
+				},
+			],
+		});
+		await renderSection();
+		const network = container.querySelector(`[aria-label="${settings.credentialNetwork.button}"]`);
+		if (!network) throw new Error("Missing single ready key network entry");
+		await act(async () => {
+			network.dispatchEvent(new window.Event("click", { bubbles: true }));
+		});
+		await settle();
+		expect(document.querySelector('[role="dialog"]')?.textContent).toContain(
+			settings.credentialNetwork.description,
+		);
+	});
+
 	it.each([
 		undefined,
 		"invalid",

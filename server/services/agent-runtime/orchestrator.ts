@@ -2951,6 +2951,7 @@ export async function runAgentLoopUnlocked(
 							providerPrefix: payment.providerPrefix,
 							balance: payment.balance,
 							required: payment.required,
+							...(payment.paymentContext ? { paymentContext: payment.paymentContext } : {}),
 							resumeAction: payment.resumeAction,
 							...(isParentCopy && { isSubagent: true }),
 						});

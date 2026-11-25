@@ -14,16 +14,19 @@ import {
 	Text,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
+import { isNugPaymentContext, type NugPaymentIntent } from "@shared/nug-payment";
 import { IconCheck, IconExternalLink } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { useTranslation } from "react-i18next";
-import { api } from "../../../lib/api";
+import { ApiError, api } from "../../../lib/api";
+import { getAuthSnapshot, subscribeAuth } from "../../../lib/api/client";
 import { createQrDataUrl } from "../../../lib/qr";
 import type { PaymentRequiredInfo } from "../useNarratorPanelWS";
 
 interface NugBillingOrder {
 	id: string;
+	binding: string;
 	amount: string;
 	quota_amount: string;
 	provider: string;
@@ -32,6 +35,18 @@ interface NugBillingOrder {
 	pay_url?: string;
 	paid_at?: string;
 	created_at: string;
+}
+
+interface ScopedNugOrder {
+	scope: string;
+	order: NugBillingOrder;
+}
+interface NugCreateSubmission {
+	scope: string;
+	authGeneration: number;
+	providerId: string;
+	intent: NugPaymentIntent;
+	body: Parameters<typeof api.nugCreateBillingOrder>[1];
 }
 
 interface NugRechargeDialogProps {
@@ -47,6 +62,25 @@ interface NugRechargeDialogProps {
 		totalGranted?: number | null,
 		detailedQuotaBalance?: string | null,
 	) => void;
+}
+
+const MAX_NUG_FAILED_POLLS = 6;
+const MIN_NUG_POLL_MS = 3000;
+const MAX_NUG_POLL_MS = 30_000;
+
+function terminalNugPaymentError(error: unknown): boolean {
+	return (
+		error instanceof ApiError &&
+		(error.data?.code === "NUG_PAYMENT_CONTEXT" ||
+			error.data?.code === "NUG_PAYMENT_RESPONSE" ||
+			[401, 403, 404, 409, 410].includes(error.status))
+	);
+}
+
+function nugPollDelay(value: number | undefined): number {
+	return Number.isFinite(value)
+		? Math.max(MIN_NUG_POLL_MS, Math.min(value ?? MIN_NUG_POLL_MS, MAX_NUG_POLL_MS))
+		: MIN_NUG_POLL_MS;
 }
 
 function parseAmount(value: string | number | undefined): number {
@@ -92,28 +126,74 @@ export function NugRechargeDialog({
 }: NugRechargeDialogProps) {
 	const { t } = useTranslation("narrator");
 	const qc = useQueryClient();
+	const auth = useSyncExternalStore(subscribeAuth, getAuthSnapshot, getAuthSnapshot);
+	const authGeneration = auth.generation;
 	const [amount, setAmount] = useState<number | string>(10);
 	const [paymentProvider, setPaymentProvider] = useState("");
 	const [channel, setChannel] = useState("alipay");
-	const [order, setOrder] = useState<NugBillingOrder | null>(null);
-	const resumedRef = useRef(false);
+	const [scopedOrder, setScopedOrder] = useState<ScopedNugOrder | null>(null);
+	const resumedRef = useRef<string | null>(null);
+	const paymentIntent: NugPaymentIntent = paymentRequired
+		? { mode: "request", narratorId, paymentContext: paymentRequired.paymentContext ?? "" }
+		: { mode: "standalone" };
+	const paymentScope = JSON.stringify([
+		authGeneration,
+		narratorId,
+		providerId,
+		paymentIntent.mode,
+		paymentRequired?.paymentContext ?? null,
+	]);
+	const scopeRef = useRef<string | null>(null);
+	// 在 render 层立即隔离旧订单，不能等 effect 才隐藏另一个钱包的二维码。
+	scopeRef.current = opened ? paymentScope : null;
+	const order = opened && scopedOrder?.scope === paymentScope ? scopedOrder.order : null;
+	const isCurrentScope = useCallback((scope: string, generation: number) => {
+		const current = getAuthSnapshot();
+		return scopeRef.current === scope && current.generation === generation && current.hasToken;
+	}, []);
+	useEffect(() => {
+		scopeRef.current = opened ? paymentScope : null;
+		return () => {
+			if (scopeRef.current === paymentScope) scopeRef.current = null;
+		};
+	}, [opened, paymentScope]);
+	const missingRequestContext =
+		!!paymentRequired && !isNugPaymentContext(paymentRequired.paymentContext);
+	const requireRequestContext = () => {
+		if (missingRequestContext)
+			throw new ApiError("失败请求缺少有效的充值上下文，请重新发起该请求", 409, {
+				code: "NUG_PAYMENT_CONTEXT",
+			});
+	};
 
 	const configQuery = useQuery({
-		queryKey: ["nug", "billing", "config", providerId],
-		queryFn: () => api.nugGetBillingConfig(providerId ?? ""),
-		enabled: opened && !!providerId,
+		queryKey: ["nug", "billing", "config", paymentScope],
+		queryFn: () => {
+			requireRequestContext();
+			return api.nugGetBillingConfig(providerId ?? "", paymentIntent);
+		},
+		retry: (attempt, error) => !terminalNugPaymentError(error) && attempt < 2,
+		enabled: opened && !!providerId && auth.hasToken,
 	});
 	const config = configQuery.data;
+	const selectedPaymentProvider = config?.providers.some(
+		(provider) => provider.name === paymentProvider,
+	)
+		? paymentProvider
+		: (config?.providers[0]?.name ?? "");
 
 	useEffect(() => {
 		if (!opened) return;
-		resumedRef.current = false;
-		setOrder(null);
+		resumedRef.current = null;
+		setScopedOrder(null);
 	}, [opened]);
 
 	useEffect(() => {
 		if (!config) return;
-		if (!paymentProvider && config.providers[0]?.name) {
+		if (
+			!config.providers.some((provider) => provider.name === paymentProvider) &&
+			config.providers[0]?.name
+		) {
 			setPaymentProvider(config.providers[0].name);
 		}
 		if (config.orderMinAmount > 0 && parseAmount(amount) < config.orderMinAmount) {
@@ -122,19 +202,23 @@ export function NugRechargeDialog({
 	}, [config, paymentProvider, amount]);
 
 	const createOrder = useMutation({
-		mutationFn: async () => {
-			if (!providerId || !paymentProvider) throw new Error(t("recharge.providerNotReady"));
-			const currentAmount = parseAmount(amount);
-			return api.nugCreateBillingOrder(providerId, {
-				amount: currentAmount,
-				provider: paymentProvider,
-				channel,
-			});
+		mutationFn: async (input: NugCreateSubmission) => {
+			if (!isCurrentScope(input.scope, input.authGeneration))
+				throw new ApiError("充值范围已变化", 409, { code: "NUG_PAYMENT_CONTEXT" });
+			if (!input.providerId || !input.body.provider)
+				throw new Error(t("recharge.providerNotReady"));
+			if (input.intent.mode === "request" && !isNugPaymentContext(input.intent.paymentContext))
+				throw new ApiError("失败请求缺少有效的充值上下文，请重新发起该请求", 409, {
+					code: "NUG_PAYMENT_CONTEXT",
+				});
+			return api.nugCreateBillingOrder(input.providerId, input.body, input.intent);
 		},
-		onSuccess: (data) => {
-			setOrder(data.order);
+		onSuccess: (data, input) => {
+			if (isCurrentScope(input.scope, input.authGeneration))
+				setScopedOrder({ scope: input.scope, order: data.order });
 		},
-		onError: (err) => {
+		onError: (err, input) => {
+			if (!isCurrentScope(input.scope, input.authGeneration)) return;
 			notifications.show({
 				color: "red",
 				title: t("recharge.createOrderFailed"),
@@ -144,47 +228,91 @@ export function NugRechargeDialog({
 	});
 
 	const orderQuery = useQuery({
-		queryKey: ["nug", "billing", "order", providerId, order?.id],
-		queryFn: () => api.nugGetBillingOrder(providerId ?? "", order?.id ?? ""),
-		enabled: opened && !!providerId && !!order?.id && order.status === "pending",
+		queryKey: ["nug", "billing", "order", paymentScope, order?.id, order?.binding],
+		queryFn: () => api.nugGetBillingOrder(providerId ?? "", order?.id ?? "", order?.binding ?? ""),
+		retry: (attempt, error) => !terminalNugPaymentError(error) && attempt < 2,
+		retryDelay: (attempt) => nugPollDelay(MIN_NUG_POLL_MS * 2 ** attempt),
+		retryOnMount: false,
+		refetchOnWindowFocus: false,
+		refetchOnReconnect: false,
+		enabled: (query) =>
+			opened &&
+			!!providerId &&
+			!!order?.id &&
+			order.status === "pending" &&
+			!terminalNugPaymentError(query.state.error),
 		refetchInterval: (query) => {
+			const error = query.state.error;
+			if (
+				terminalNugPaymentError(error) ||
+				(error && query.state.errorUpdateCount >= MAX_NUG_FAILED_POLLS)
+			)
+				return false;
 			const status = query.state.data?.order.status ?? order?.status;
-			return status === "pending" ? (config?.pollIntervalMs ?? 3000) : false;
+			if (status !== "pending") return false;
+			return error
+				? nugPollDelay(MIN_NUG_POLL_MS * 2 ** query.state.errorUpdateCount)
+				: nugPollDelay(config?.pollIntervalMs);
 		},
 	});
+	const orderContextInvalid = terminalNugPaymentError(orderQuery.error);
 
 	useEffect(() => {
-		if (orderQuery.data?.order) setOrder(orderQuery.data.order);
-	}, [orderQuery.data]);
+		const received = orderQuery.data?.order;
+		if (!received || !isCurrentScope(paymentScope, authGeneration)) return;
+		setScopedOrder((current) =>
+			current?.scope === paymentScope &&
+			current.order.id === received.id &&
+			current.order.binding === received.binding &&
+			current.order !== received
+				? { scope: paymentScope, order: received }
+				: current,
+		);
+	}, [orderQuery.data, paymentScope, authGeneration, isCurrentScope]);
 
 	useEffect(() => {
-		if (!providerId || !order || order.status !== "paid" || resumedRef.current) return;
-		resumedRef.current = true;
+		if (
+			!providerId ||
+			!order ||
+			order.status !== "paid" ||
+			!isCurrentScope(paymentScope, authGeneration)
+		)
+			return;
+		const resumeScope = JSON.stringify([paymentScope, order.binding]);
+		if (resumedRef.current === resumeScope) return;
+		resumedRef.current = resumeScope;
 		void (async () => {
 			try {
-				const quota = await api.nugGetQuota(providerId);
-				onQuotaUpdated?.(
-					String(quota.balance),
-					quota.totalGranted,
-					quota.detailedQuotaBalance ?? null,
-				);
-				qc.setQueryData(["nug", "quotas"], (old: unknown) => {
-					const quotas = old && typeof old === "object" ? (old as Record<string, unknown>) : {};
-					const existing =
-						quotas[providerId] && typeof quotas[providerId] === "object"
-							? (quotas[providerId] as Record<string, unknown>)
-							: {};
-					return {
-						...quotas,
-						[providerId]: {
-							...existing,
-							balance: quota.balance,
-							totalGranted: quota.totalGranted,
-							detailedQuotaBalance: quota.detailedQuotaBalance ?? null,
-							...(quota.extra !== undefined ? { extra: quota.extra } : {}),
-						},
-					};
+				const quota = await api.nugGetQuota(providerId, undefined, {
+					orderId: order.id,
+					binding: order.binding,
 				});
+				if (!isCurrentScope(paymentScope, authGeneration)) return;
+				if (quota.paymentCredentialIsPrimary !== false) {
+					onQuotaUpdated?.(
+						String(quota.balance),
+						quota.totalGranted,
+						quota.detailedQuotaBalance ?? null,
+					);
+					qc.setQueryData(["nug", "quotas"], (old: unknown) => {
+						const quotas = old && typeof old === "object" ? (old as Record<string, unknown>) : {};
+						const existing =
+							quotas[providerId] && typeof quotas[providerId] === "object"
+								? (quotas[providerId] as Record<string, unknown>)
+								: {};
+						return {
+							...quotas,
+							[providerId]: {
+								...existing,
+								balance: quota.balance,
+								totalGranted: quota.totalGranted,
+								detailedQuotaBalance: quota.detailedQuotaBalance ?? null,
+								...(quota.extra !== undefined ? { extra: quota.extra } : {}),
+							},
+						};
+					});
+				}
+				qc.invalidateQueries({ queryKey: ["nug", "quotas"] });
 				qc.invalidateQueries({ queryKey: ["nug", "quota", providerId] });
 				qc.invalidateQueries({ queryKey: ["settings"] });
 				qc.invalidateQueries({ queryKey: ["admin", "settings"] });
@@ -194,16 +322,19 @@ export function NugRechargeDialog({
 					message: t("recharge.currentBalance", { balance: quota.balance }),
 					icon: <IconCheck size={16} />,
 				});
+				if (!isCurrentScope(paymentScope, authGeneration)) return;
 				if (paymentRequired) {
 					if (paymentRequired.resumeAction === "continue") {
 						await api.continueNarrator(narratorId);
 					} else {
 						await api.retryLastMessage(narratorId);
 					}
+					if (!isCurrentScope(paymentScope, authGeneration)) return;
 					onPaymentRequiredChange(null);
 				}
-				onClose();
+				if (isCurrentScope(paymentScope, authGeneration)) onClose();
 			} catch (err) {
+				if (!isCurrentScope(paymentScope, authGeneration)) return;
 				notifications.show({
 					color: "red",
 					title: t("recharge.resumeFailed"),
@@ -218,6 +349,9 @@ export function NugRechargeDialog({
 		onQuotaUpdated,
 		order,
 		paymentRequired,
+		paymentScope,
+		authGeneration,
+		isCurrentScope,
 		providerId,
 		qc,
 		t,
@@ -307,7 +441,7 @@ export function NugRechargeDialog({
 							/>
 							<NativeSelect
 								label={t("recharge.paymentService")}
-								value={paymentProvider}
+								value={selectedPaymentProvider}
 								onChange={(e) => setPaymentProvider(e.currentTarget.value)}
 								data={providerOptions}
 							/>
@@ -323,15 +457,37 @@ export function NugRechargeDialog({
 							</Group>
 						</Paper>
 						<Button
-							onClick={() => createOrder.mutate()}
-							loading={createOrder.isPending}
-							disabled={amountInvalid || !paymentProvider}
+							onClick={() =>
+								createOrder.mutate({
+									scope: paymentScope,
+									authGeneration,
+									providerId: providerId ?? "",
+									intent: paymentIntent,
+									body: { amount: amountNumber, provider: selectedPaymentProvider, channel },
+								})
+							}
+							loading={createOrder.isPending && createOrder.variables?.scope === paymentScope}
+							disabled={amountInvalid || !selectedPaymentProvider}
 						>
 							{t("recharge.createOrder")}
 						</Button>
 					</Stack>
 				)}
 
+				{orderQuery.error && (
+					<Alert color="red">
+						{orderQuery.error.message}
+						{!orderContextInvalid && (
+							<Button
+								variant="subtle"
+								loading={orderQuery.isFetching}
+								onClick={() => void orderQuery.refetch()}
+							>
+								{t("retry")}
+							</Button>
+						)}
+					</Alert>
+				)}
 				{order && (
 					<Stack align="center">
 						<Group gap="xs">
@@ -346,7 +502,7 @@ export function NugRechargeDialog({
 								{t(`recharge.status_${order.status}`, { defaultValue: order.status })}
 							</Badge>
 						</Group>
-						{order.status === "pending" && payUrl && (
+						{order.status === "pending" && payUrl && !orderContextInvalid && (
 							<>
 								{isEmbeddableImageUrl(payUrl) ? (
 									<Box component="img" src={payUrl} alt="payment" maw={260} mah={260} />
@@ -391,9 +547,23 @@ export function NugRechargeDialog({
 							<Button
 								variant="light"
 								onClick={async () => {
-									if (!providerId) return;
-									const data = await api.nugRepayBillingOrder(providerId, order.id);
-									setOrder(data.order);
+									if (!providerId || !isCurrentScope(paymentScope, authGeneration)) return;
+									try {
+										const data = await api.nugRepayBillingOrder(
+											providerId,
+											order.id,
+											order.binding,
+										);
+										if (isCurrentScope(paymentScope, authGeneration))
+											setScopedOrder({ scope: paymentScope, order: data.order });
+									} catch (err) {
+										if (!isCurrentScope(paymentScope, authGeneration)) return;
+										notifications.show({
+											color: "red",
+											title: t("recharge.createOrderFailed"),
+											message: err instanceof Error ? err.message : "",
+										});
+									}
 								}}
 							>
 								{t("recharge.repay")}

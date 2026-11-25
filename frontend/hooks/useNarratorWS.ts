@@ -5,6 +5,7 @@ import {
 	type SubagentModelInheritance,
 } from "@shared/model-inheritance";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
+import { isNugPaymentContext } from "@shared/nug-payment";
 import type { TextDocumentStreamUpdate } from "@shared/pretext-layout/text-document";
 import { coerceProgressSnapshot, type ProgressSnapshot } from "@shared/progress-phase";
 import {
@@ -789,6 +790,7 @@ export interface NarratorWSCallbacks {
 	onMetering?: (unit: string, unitPlural: string, usage: number) => void;
 	onQuotaBalance?: (quotaBalance: string | null, detailedQuotaBalance?: string | null) => void;
 	onPaymentRequired?: (info: {
+		paymentContext?: string;
 		providerId?: string;
 		providerPrefix?: string;
 		balance?: number;
@@ -1619,6 +1621,9 @@ export function useNarratorWS(
 						// parent page open its own recharge dialog.
 						if (data.isSubagent) break;
 						callbackOwner.callbacks.onPaymentRequired?.({
+							...(isNugPaymentContext(data.paymentContext)
+								? { paymentContext: data.paymentContext }
+								: {}),
 							providerId: data.providerId as string | undefined,
 							providerPrefix: data.providerPrefix as string | undefined,
 							balance: data.balance as number | undefined,

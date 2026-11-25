@@ -3277,6 +3277,53 @@ describe("quota and payment frames stay with their own session", () => {
 		expect(self).not.toHaveProperty("isSubagent");
 	});
 
+	test("private attempt identity reaches both cache updaters but never public frames", async () => {
+		const { streamQuotaIdentity } = await import("../../lib/provider-key-subjects");
+		const privateIdentity = streamQuotaIdentity(
+			{ id: "quota-test", baseUrl: "https://quota.test", apiKey: "private-api-key" },
+			"actual-B",
+		);
+		const customQuota = await import("../../lib/custom-api-quota-cache");
+		const nugQuota = await import("../../routes/nug");
+		const customUpdate = spyOn(customQuota, "updateCustomApiQuotaByPrefix").mockImplementation(
+			() => {},
+		);
+		const nugUpdate = spyOn(nugQuota, "updateNugQuotaByPrefix").mockImplementation(() => {});
+		try {
+			await processEvent(
+				{
+					type: "quota_balance",
+					quotaBalance: "0",
+					detailedQuotaBalance: "actual account",
+					providerIdentity: privateIdentity,
+				},
+				{ ...makeMainContext(), providerPrefix: "quota-test" },
+			);
+			expect(customUpdate).toHaveBeenCalledWith(
+				"quota-test",
+				"0",
+				"actual account",
+				privateIdentity,
+			);
+			expect(nugUpdate).toHaveBeenCalledWith(
+				"quota-test",
+				0,
+				"actual account",
+				undefined,
+				privateIdentity,
+			);
+			for (const frame of framesOf("quota_balance")) {
+				expect(frame).not.toHaveProperty("providerIdentity");
+				expect(frame).not.toHaveProperty("credentialId");
+				expect(JSON.stringify(frame)).not.toContain("private-api-key");
+				expect(JSON.stringify(frame)).not.toContain("actual-B");
+			}
+		} finally {
+			customUpdate.mockRestore();
+			nugUpdate.mockRestore();
+		}
+	});
+
 	test("a primary narrator quota frame carries no subagent marker", async () => {
 		await processEvent({ type: "quota_balance", quotaBalance: "12.5" }, makeMainContext());
 		const [frame] = framesOf("quota_balance");
@@ -3294,6 +3341,42 @@ describe("quota and payment frames stay with their own session", () => {
 			narratorId: PARENT_NARRATOR_ID,
 			isSubagent: true,
 		});
+	});
+
+	test("公开付款帧只携带专用opaque context，不泄露CID或私有STREAM identity", async () => {
+		const paymentContext = `npc1.${(Date.now() + 900000).toString(36)}.${"n".repeat(22)}.${"m".repeat(43)}`;
+		const event = {
+			type: "payment_required" as const,
+			message: "private-secret",
+			providerId: "nug-1",
+			providerPrefix: "nug",
+			paymentContext,
+			credentialId: "private-cid-B",
+			providerIdentity: '["private-secret","private-cid-B"]',
+			resumeAction: "retry" as const,
+		};
+		await processEvent(event, makeMainContext());
+		const [frame] = framesOf("payment_required");
+		expect(frame).toMatchObject({ narratorId: PARENT_NARRATOR_ID, paymentContext });
+		expect(frame).not.toHaveProperty("credentialId");
+		expect(frame).not.toHaveProperty("providerIdentity");
+		expect(JSON.stringify(frame)).not.toContain("private-cid-B");
+		expect(JSON.stringify(frame)).not.toContain("private-secret");
+	});
+
+	test("错误地填入私有identity的付款context在公开边界被丢弃", async () => {
+		await processEvent(
+			{
+				type: "payment_required",
+				message: "private-secret",
+				paymentContext: '["private-cid","private-secret"]',
+				resumeAction: "retry",
+			},
+			makeMainContext(),
+		);
+		const [frame] = framesOf("payment_required");
+		expect(frame).not.toHaveProperty("paymentContext");
+		expect(JSON.stringify(frame)).not.toContain("private-secret");
 	});
 
 	test("a subagent payment_required is tagged for the parent and stripped for its own page", async () => {

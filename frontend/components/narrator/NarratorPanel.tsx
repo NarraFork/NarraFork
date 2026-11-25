@@ -3190,8 +3190,8 @@ function NarratorPanelBody({
 						<NugRechargeDialog
 							opened={nugRechargeOpened}
 							narratorId={narratorId}
-							providerId={nugProviderInfo?.providerId ?? paymentRequired?.providerId ?? null}
-							providerName={nugProviderInfo?.name ?? paymentRequired?.providerPrefix ?? null}
+							providerId={paymentRequired?.providerId ?? nugProviderInfo?.providerId ?? null}
+							providerName={paymentRequired?.providerPrefix ?? nugProviderInfo?.name ?? null}
 							paymentRequired={paymentRequired}
 							onClose={closeNugRecharge}
 							onPaymentRequiredChange={setPaymentRequired}
