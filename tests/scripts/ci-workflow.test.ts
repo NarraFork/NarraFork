@@ -43,7 +43,7 @@ type Job = {
 	"timeout-minutes": number;
 	needs?: string[];
 	if?: string;
-	strategy?: { "fail-fast": boolean; matrix: { shard: number[] } };
+	strategy?: { "fail-fast": boolean; matrix: Record<string, number[] | string[]> };
 	steps: Step[];
 	"continue-on-error"?: boolean;
 	env?: Record<string, string>;
@@ -412,7 +412,7 @@ describe("generic CI workflow", () => {
 	});
 
 	test("every auxiliary root typecheck prepares generated routes and extension types first", () => {
-		let checked = 0;
+		const checked: string[] = [];
 		for (const name of [
 			"remote-executor.yml",
 			"file-revert-cross-platform.yml",
@@ -426,7 +426,7 @@ describe("generic CI workflow", () => {
 					(entry) => entry.run?.trim() === "bunx tsgo --noEmit",
 				);
 				if (typecheck < 0) continue;
-				checked++;
+				checked.push(`${name}:${id}`);
 				const before = value.steps.slice(0, typecheck);
 				const install = before.findIndex(
 					(entry) => entry.run?.trim() === "bun install --frozen-lockfile",
@@ -444,7 +444,11 @@ describe("generic CI workflow", () => {
 				}
 			}
 		}
-		expect(checked).toBe(4);
+		expect(checked).toEqual([
+			"remote-executor.yml:integration-typescript",
+			"file-revert-cross-platform.yml:file-revert",
+			"plugin-platform-acceptance.yml:contract-tests",
+		]);
 	});
 	test("enforces migration assets, whole-repository lint, translation and knowledge tree checks", () => {
 		for (const run of [
@@ -611,6 +615,70 @@ describe("generic CI workflow", () => {
 				expect(probe?.run).toContain(required);
 			expect(probe?.if).toBeUndefined();
 			expect(steps.map((value) => value.run).join("\n")).not.toContain("command -v google-chrome");
+		}
+	});
+
+	test("plugin types have a required owner while every native security platform remains mandatory", () => {
+		const plugin = Bun.YAML.parse(
+			readFileSync(join(repository, ".github/workflows/plugin-platform-acceptance.yml"), "utf8"),
+		) as Workflow;
+		const contract = plugin.jobs["contract-tests"];
+		const typecheck = contract.steps.find((value) => value.name === "Check TypeScript");
+		expect(typecheck?.run).toBe("bunx tsgo --noEmit");
+		expect(typecheck?.if).toBeUndefined();
+		expect(typecheck?.["continue-on-error"]).toBeUndefined();
+		expect(contract.if).toBeUndefined();
+		expect(contract["continue-on-error"]).toBeUndefined();
+		const native = plugin.jobs["cross-platform-security"];
+		expect(native.strategy).toEqual({
+			"fail-fast": false,
+			matrix: { os: ["ubuntu-latest", "macos-latest", "windows-latest"] },
+		});
+		expect(native["runs-on"]).toBe(expression("matrix.os"));
+		expect(native["timeout-minutes"]).toBe(20);
+		expect(native.if).toBeUndefined();
+		expect(native["continue-on-error"]).toBeUndefined();
+		expect(native.steps.some((value) => value.run?.includes("tsgo --noEmit"))).toBe(false);
+		const security = native.steps.find(
+			(value) => value.name === "Run path and runner security tests",
+		);
+		expect(security?.if).toBeUndefined();
+		expect(security?.["continue-on-error"]).toBeUndefined();
+		expect(security?.run).toContain("bun test --isolate");
+		for (const path of [
+			"server/lib/agent/execution/__tests__/local-backend-read.test.ts",
+			"tests/server/services/plugin-manager.test.ts",
+			"tests/server/services/plugin-runtime-windows-job.test.ts",
+			"server/lib/plugins/windows-plugin-launcher.compiled.test.ts",
+			"server/services/__tests__/plugin-podman-runner.test.ts",
+			"server/services/__tests__/plugin-process-runner.test.ts",
+			"server/services/__tests__/plugin-signature.test.ts",
+			"server/services/__tests__/plugin-sbom.test.ts",
+		])
+			expect(security?.run).toContain(path);
+		const gate = plugin.jobs["plugin-platform-gate"];
+		expect(gate.if).toBe("always()");
+		expect(gate.needs).toContain("contract-tests");
+		expect(gate.needs).toContain("cross-platform-security");
+		const script = gate.steps.find(
+			(value) => value.name === "Require every acceptance lane to pass",
+		)?.run;
+		expect(script).toBeDefined();
+		for (const [change, success] of [
+			[{}, true],
+			[{ CONTRACT: "failure" }, false],
+			[{ CROSS_PLATFORM: "skipped" }, false],
+		] as const) {
+			const result = shell(script ?? "", {
+				CONTRACT: "success",
+				HARDENING: "success",
+				CROSS_PLATFORM: "success",
+				RELEASE: "success",
+				BROWSER: "success",
+				...change,
+			});
+			expect(result.error).toBeUndefined();
+			expect(result.status === 0).toBe(success);
 		}
 	});
 

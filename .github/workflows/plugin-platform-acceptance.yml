@@ -200,12 +200,8 @@ jobs:
       - name: Build frontend
         run: bun run build
 
-      - name: Install VS Code extension type dependencies
-        run: bun install --cwd vscode-extension --frozen-lockfile
-
-      - name: Check TypeScript
-        run: bunx tsgo --noEmit
-
+      # Full-project types are required by contract-tests and the generic CI gate.
+      # This matrix owns actual native platform security, not duplicate typechecks.
       - name: Run path and runner security tests
         run: >-
           bun test --isolate
