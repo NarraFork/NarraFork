@@ -16,7 +16,7 @@ keywords:
   - requireSqliteProjectMutation
   - TeamStatus
 status: draft
-verified_at: 412d79d6a
+verified_at: 8dcb0ba3a
 ---
 # 团队
 
@@ -31,7 +31,7 @@ verified_at: 412d79d6a
 2. 协调者用 `Team` 工具建工作项；工作项有自己的分支与 worktree，子代理（工作者）在里面干活，经评审、`ready`、合并判定走完状态机（工作项）。
 3. 活动工作项的改动路径被后台定期刷新，跨团队比较重叠；项目设了独占路径时，`ready` 要抢独占锁（重叠与独占路径）。
 4. 协调者被软限制约束，超大输出落盘，`team_status` 行把团队全貌注入它的历史（协调者）。
-5. 看板、活动、待批抽屉、成员、「全部暂停」都由团队页读模型和前端提供；任何成员可批团队树里的待决调用（团队页与审批）。
+5. 团队页（页头状态句、「等你处理」就地批准/回答/验收、对话旁的工作列表与动态、工作项抽屉与退回、成员、「全部暂停」）由团队页读模型和前端提供；任何成员可批团队树里的待决调用（团队页与审批）。
 6. 团队可以固定到侧栏（`team:<id>` 标签，显示协调者状态与待批数）；归档、删除或失去读权限时标签被移除（团队与成员、[最近标签页](../recent-tabs.md)）。
 
 ## 读哪个子节点
@@ -39,7 +39,7 @@ verified_at: 412d79d6a
 - 工作项状态、`Team` 工具动作、`work.sync`、cleanup、check-in → [工作项](work-items.md)。
 - 改动路径、重叠提醒、`exclusive_key`、`TEAM_EXCLUSIVE_LOCK_HELD`、强制释放 → [重叠与独占路径](overlap.md)。
 - 协调者超限提醒、`coordinator-outputs/`、`team_status` 行 → [协调者](coordinator.md)。
-- 看板、动态、审批、谁批的、暂停全部、前端组件与轮询 → [团队页与审批](page.md)。
+- 团队页布局、等你处理、工作列表、抽屉与退回、动态、审批、谁批的、暂停全部、前端组件与轮询 → [团队页与审批](page.md)。
 
 ## 从哪读起
 - `server/routes/project-teams.ts`：所有团队路由，每条都先过 SQLite 守卫；读模型在 `teams/team-board.ts`。
@@ -66,4 +66,4 @@ verified_at: 412d79d6a
 - [工作项](work-items.md)：工作项状态机、Team 工具、worktree 端口、检查提醒、合并判定与清理。
 - [重叠与独占路径](overlap.md)：工作项的改动路径、跨团队重叠提醒、独占路径锁与强制释放。
 - [协调者](coordinator.md)：协调者的软限制、保存的输出、团队状态行与提示词。
-- [团队页与审批](page.md)：看板、活动、待批抽屉、谁批的记录、暂停全部与团队页前端。
+- [团队页与审批](page.md)：团队页（页头、等你处理、对话与工作列表、工作项抽屉、起步与收尾）、就地审批与退回、谁批的记录、暂停全部。

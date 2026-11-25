@@ -49,7 +49,7 @@ keywords:
   - QueuedMessagesPanel
   - PendingAgentMessagesPanel
 status: draft
-verified_at: 69715f280
+verified_at: 8dcb0ba3a
 ---
 # 输入框与交互
 
@@ -75,7 +75,7 @@ verified_at: 69715f280
 - 停止按钮长按 600ms 才触发打断，提前松开只提示（`use-interrupt-long-press.ts`）。
 - Enter 归属（`interaction/enter-ownership.ts`）：输入框、按钮、链接、菜单、对话框、终端等自己的 Enter 不被面板级快捷键（等待中的权限、Enter 回到输入框）抢走；权限按钮条例外（`data-perm-button-bar`）。
 - `PendingAgentMessagesPanel`：显示其他 Agent 发给本会话、尚未被任何一轮读取的消息，用户选择恢复或丢弃（失败/被停止的会话不会被 Agent 消息自动重启）。
-- 没有会话写权限的查看者（`NarratorPanel` 经 `useCanOpenTerminals` 读到的叙述者写权限为 false）看不到可编辑的输入框：`NarratorInteractionArea` 的 `readOnly` 把输入行换成一条只读提示（`composerReadOnly`）。服务端 `POST /narrators/:id/messages` 本来就要求写权限；团队页中间栏嵌的是同一个面板。状态栏模型选择器的「默认（模型）」经 `lib/follow-model-label.ts:followDefaultLabel`，没配置默认模型时显示未配置文案。
+- 没有会话写权限的查看者（`NarratorPanel` 经 `useCanOpenTerminals` 读到的叙述者写权限为 false）看不到可编辑的输入框：`NarratorInteractionArea` 的 `readOnly` 把输入行换成一条只读提示（`composerReadOnly`；`NarratorPanel` 的 `readOnlyNotice` 可换掉这句，团队页传「你是只读成员」）。服务端 `POST /narrators/:id/messages` 本来就要求写权限；团队页中间栏嵌的是同一个面板。状态栏模型选择器的「默认（模型）」经 `lib/follow-model-label.ts:followDefaultLabel`，没配置默认模型时显示未配置文案。
 
 ## 从哪读起
 - `composer/NarratorComposer.tsx`（约 2000 行）：草稿同步、附件、发送入口；`composer/InlineComposerEditor.tsx`：编辑器。

@@ -35,10 +35,13 @@ keywords:
   - recordWorkEvent
   - confirmedLoss
   - team.checkin
+  - work.returned
+  - returnWorkItem
+  - TEAM_WORK_ITEM_NOT_RETURNABLE
   - Team 工具
   - Agent isolation worktree
 status: draft
-verified_at: 69715f280
+verified_at: 8dcb0ba3a
 ---
 # 工作项
 
@@ -59,6 +62,8 @@ verified_at: 69715f280
 - `work.review`：blocker 把项退回 `in_progress`，clear 留在 `in_review`。
 - `work.ready` 需要最新一轮评审为 clear，否则 409 `TEAM_WORK_ITEM_NOT_REVIEWED`。
 - `work.ready` 还要 worktree 无未提交改动，否则 409 `TEAM_WORK_ITEM_DIRTY`。
+- `work.ready` 事件除 `head`、`changedPathCount` 外还记 `mergeBase` 与 `diffStat`（钉住 head 时的 `+/-` 与文件数，best-effort，读不出为 null），已合并的项（head 已在基线里）靠它们在团队页显示大小和改动文件。
+- 人从团队页退回（`returnWorkItem`，见[团队页与审批](page.md)）：只能从 in_review / ready（否则 409 `TEAM_WORK_ITEM_NOT_RETURNABLE`），记 `work.returned`（actor 为那个人，带理由），回 in_progress、`reviewRounds+1`、`lastReview = blocker`，所以再 ready 前要重新评审；持有的独占锁同事务释放。服务端只把理由作为 `team_return` 注入给协调者，由它转给工作者。
 - 评审之后的新提交不拦，只在结果里计数。
 - DIRTY 之后钉住一个 head 提交（读不出：409 `TEAM_WORK_ITEM_HEAD_UNAVAILABLE`）。知识检查、改动路径、独占路径判定、评审后提交计数都按它读，记录的 `headSha` 与 `work.ready` 事件的 `head` 也是它。按别的提交读出的改动路径算读不出。
 - 知识检查排在钉住 head 之后、独占路径之前（`teams/team-knowledge.ts:assertKnowledgeFresh`），见下一节。
@@ -92,7 +97,7 @@ verified_at: 69715f280
 事件与 check-in：
 - 每次状态变更、评审、同步、清理、check-in、决策都追加一行 `team_work_events`（`recordWorkEvent`）。actor 为 person / agent / system，详情上限 8KB。
 - check-in 是一个团队只保留一个的定时唤醒（5 分钟到 1 天），记为 `team.checkin` 事件，重启与取消归档时重新装填。
-- 服务端读 git 只经 `teams/team-git.ts`：禁用 hook、fsmonitor、外部 diff/textconv、写 index，读上限沿用 `gitService`（60s、1MB；`readBlob` 按 blob 大小限输出）。`changedPaths`、`branchFileChanges`、`treeEntry`、`treeBlobs`、`readBlob` 只读提交与对象，不读工作区；前两者可传入钉住的提交。同一文件的 `isGitWorkTree`（10s 超时）供建团队和 `resolve-directory` 判断项目目录是否 git 工作树。
+- 服务端读 git 只经 `teams/team-git.ts`：禁用 hook、fsmonitor、外部 diff/textconv、写 index，读上限沿用 `gitService`（60s、1MB；`readBlob` 按 blob 大小限输出）。`changedPaths`、`branchFileChanges`、`treeEntry`、`treeBlobs`、`readBlob`、`mergeBase`、`numstat`（`diff --numstat -z`，512KB 上限，超出标 `truncated`）、`fileDiff`（单个路径的 `diff -U3`，经 `stdoutStream` 读到上限 +1 字节即停）只读提交与对象，不读工作区；前两者可传入钉住的提交。团队页的大小、抽屉与 diff 都经它们（`team-work-view.ts`）。同一文件的 `isGitWorkTree`（10s 超时）供建团队和 `resolve-directory` 判断项目目录是否 git 工作树。
 
 `Team` 工具（`server/lib/agent/tools/team.ts`，仅 team trait 会话提供）：
 - 动作：work.list/create/review/ready/sync/cancel、brief、checkin、cleanup、decision；`work.list` 最多 30 项。
