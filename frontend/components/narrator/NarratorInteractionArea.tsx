@@ -52,6 +52,8 @@ export interface NarratorInteractionAreaProps {
 	 * an editable box and send button would only invite a failed send.
 	 */
 	readOnly?: boolean;
+	/** Replaces the read-only notice's text (the team page's 「你是只读成员」). */
+	readOnlyNotice?: string;
 
 	// ── Attachments ──
 	// imagePreviewUrls, formatFileSize and openImageViewer are no longer passed in:
@@ -180,7 +182,7 @@ function ModelTraceInteraction({
 }
 
 /** Stands where the composer would be for a viewer without write access to the session. */
-function ReadOnlyComposerNotice() {
+function ReadOnlyComposerNotice({ text }: { text?: string }) {
 	const { t } = useTranslation("narrator");
 	return (
 		<Box
@@ -198,7 +200,7 @@ function ReadOnlyComposerNotice() {
 			<Group gap={6} wrap="nowrap">
 				<IconLock size={14} aria-hidden style={{ flexShrink: 0 }} />
 				<Text size="sm" c="dimmed">
-					{t("composerReadOnly")}
+					{text ?? t("composerReadOnly")}
 				</Text>
 			</Group>
 		</Box>
@@ -327,7 +329,7 @@ function NarratorEditableInteractionArea(props: NarratorInteractionAreaProps) {
 			<UploadProgressBar sendingState={props.sendingState} cancelSending={props.cancelSending} />
 			{/* Input */}
 			{props.common.isWorkspacePreview ? null : props.readOnly ? (
-				<ReadOnlyComposerNotice />
+				<ReadOnlyComposerNotice text={props.readOnlyNotice} />
 			) : (
 				<NarratorComposerRow
 					{...props.composerRowProps}

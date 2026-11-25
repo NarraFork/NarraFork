@@ -321,6 +321,7 @@ function NarratorPanelBody({
 	onDetailsPropsChange,
 	specPanelOpen,
 	onToggleSpecPanel,
+	readOnlyNotice,
 }: Omit<NarratorPanelProps, "compact">) {
 	const navigate = useNavigate();
 	const fileDrawerVisible = useNarratorPanelVisible();
@@ -3702,6 +3703,7 @@ function NarratorPanelBody({
 						onModelTraceReturn={isModelTrace ? handleModelTraceReturn : undefined}
 						// Write access to the narrator (the terminal access read answers exactly that).
 						readOnly={canOpenTerminals === false}
+						readOnlyNotice={readOnlyNotice}
 						common={{ narratorId, narrator, isWorkspacePreview, isMobileViewport }}
 						attachedImages={attachedImages}
 						attachedTextFiles={attachedTextFiles}
