@@ -46,7 +46,7 @@ keywords:
   - DependencySections
   - 被依赖
 status: draft
-verified_at: db0b59bfcea0ccf12bdffd1bc8cf85fb7e077c24
+verified_at: cbf0722e0
 ---
 # 团队页与审批
 
@@ -100,7 +100,7 @@ verified_at: db0b59bfcea0ccf12bdffd1bc8cf85fb7e077c24
 ## 从哪读起
 - `team-board.ts`：看板、动态、审批的读模型；`team-work-view.ts`：大小、抽屉、diff、退回入口；`team-decisions.ts`：决定记录。
 - `frontend/components/teams/TeamPageView.tsx`，再到 `TeamWorkspace.tsx`、`TeamHeader.tsx`、`TeamAttention.tsx`、`TeamWorkList.tsx`、`TeamWorkDrawer.tsx`。
-- 测试：`team-page-model.test.ts`、`team-page-components.test.tsx`、`team-page.browser.test.ts`（Chromium，`NF_TEST_CHROMIUM_PATH`）、`server/routes/__tests__/project-teams-work.test.ts`。
+- 测试：`team-page-model.test.ts`、`team-page-components.test.tsx`（含依赖行文案、`DependencySections`、动态）、`team-page.browser.test.ts`（Chromium，`NF_TEST_CHROMIUM_PATH`；依赖一例用单独的团队，放在文件最后，不影响前面按数量断言的用例）、`server/routes/__tests__/project-teams-work.test.ts`。
 
 ## 改它时
 - 看板列与状态：`TEAM_BOARD_COLUMN_STATES`、`team-board.ts` 与 `team-page-model.ts:workGroups` 一起改；页大小保持 50。

@@ -66,7 +66,7 @@ keywords:
   - team_upgrade
   - team_disband
 status: draft
-verified_at: db0b59bfcea0ccf12bdffd1bc8cf85fb7e077c24
+verified_at: cbf0722e0
 ---
 # 团队与成员
 

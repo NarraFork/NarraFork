@@ -23,7 +23,7 @@ keywords:
   - subagent_conclusion_updated
   - takeover_by_user
 status: draft
-verified_at: 27bdc3eb5
+verified_at: cbf0722e0
 ---
 # 一次子代理委派
 

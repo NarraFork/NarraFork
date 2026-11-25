@@ -56,7 +56,7 @@ keywords:
   - team_unblocked
   - 依赖
 status: draft
-verified_at: 27bdc3eb5
+verified_at: cbf0722e0
 ---
 # 工作项
 
@@ -73,13 +73,13 @@ verified_at: 27bdc3eb5
 - `Agent({ isolation: "worktree" })` 建的是 kind=`isolated` 的项，初始 `in_progress`。子代理结束时若没有提交也没有未提交改动，就清理 worktree 并取消该项（`settleIsolatedWorkItem`）。
 - 第一层子代理经 `attachWorker` 记为工作者，queued 的项随之开始。开始 queued 项的只有协调者自己的 `Agent({ workdir: <它的 worktree> })`（`tools/task.ts` 找到项后在创建钩子里 `attachWorker`），没有调度器，也没有任何自动开始。
 
-依赖（D，`teams/work-item-dependencies.ts`，表 `team_work_item_dependencies`）：
+依赖（D，`teams/work-item-dependencies.ts`，表 `team_work_item_dependencies`，迁移 SQLite 0266、PG 0083）：
 - 一项可以等同团队的其他项**合并**后才开始。表的主键 `(item_id, depends_on_item_id)`，另有 `(depends_on_item_id, item_id)` 与 `team_id` 索引；两端都外键到 `team_work_items` 并级联删除，`team_id` 外键到团队（级联）；`check item_id <> depends_on_item_id`。同团队不靠复合外键（PG 转译器不支持复合目标），由服务判定。
 - 设置：`Team` 的 `work.create` 与 `work.update` 带 `dependsOn`（工作项 id，不收标题），整组替换（`[]` 清空），最多 `TEAM_WORK_DEPENDENCIES_MAX` = 20（多了 400），重复去掉。只能在项 queued 且没有工作者时改（否则 409 `TEAM_WORK_ITEM_NOT_QUEUED`）。每个目标都必须是本团队的项（别的团队的、不存在的都是 404 `TEAM_WORK_ITEM_DEPENDENCY_NOT_FOUND`，不说属于谁）；不能是已取消的（409 `TEAM_WORK_ITEM_DEPENDENCY_CANCELLED`）；不能是自己或成环（409 `TEAM_WORK_ITEM_DEPENDENCY_CYCLE`，`details.cycle` 是环路）。查环是从新目标沿已有边广度优先，每层一次 `IN` 索引读，最多访问 500 项，超了 409 `TEAM_WORK_ITEM_DEPENDENCY_GRAPH_TOO_LARGE`。`work.create` 在建 worktree 之前就查，被拒不留 worktree；写入与 `work.dependencies_changed` 事件（`dependsOn/added/removed`）同事务，事务内再查一次。`work.update` 还按「状态 + `updated_at`」条件更新项。
 - 开始的闸：只有 `merged` 的依赖算满足（`dependencySatisfied`），`ready` 不算（分支会从不含它的基线出发），已取消的依赖一直挡着，直到协调者去掉或换掉。`assertWorkItemStartable` 抛 409 `TEAM_WORK_ITEM_BLOCKED`，`details.blockers` 列出 `{ id, title, state }`，消息点名已取消的那个让协调者用 `work.update` 处理。`Agent({ workdir })` 进 queued 项时在创建子代理之前查（被拒什么都不建，工具结果带错误码），`attachWorker` 在事务内再查一次。
 - 解锁：`merged` 的唯一写入者 `markMergedByAncestry` 在同一事务里调 `recordUnblocked`：按反向索引读被它挡着的项（最多 200），对仍 queued 且没有工作者、依赖全部已合并的项写一条 `work.unblocked`（system，`detail: { mergedItem, dependsOn }`）。`merged` 只写一次且不可逆，所以每项只解锁一次。事务后每个解锁项给协调者投一条说明（来源 `team_unblocked`，`wakeIfIdle`，与 `team_return` 同一条路；`createdBy`/执行主体是建这一项的人；按协调者会话的语言，`lib/prompts/team-lead.ts:unblockedNote`，首行「「X」现在可以开始了」，第二行让它先 `work.sync` 再派工人）。投递经 check-in 的生命周期排空跟踪，失败只记日志，事件照样成立。测试接缝 `setUnblockDeliveryForTests`。不会自动开始。
 - 基线：worktree 在 `work.create` 时就从本地基线分支当时的提交建出（不 fetch），所以依赖合并前建的项分支是旧基线。不挪动建 worktree 的时机：说明和提示词让协调者先 `work.sync`（还没有工作者时返回确定的合并指令），把指令放在工人简报最前面。
-- `work.list` 与工具返回的项带 `dependsOn`（id）与 `blockedBy`（未合并的 id），整页一次读（`readDependencies`）。`work.cancel` 的结果列出依赖它、仍在排队的项（`dependents`）并提示用 `work.update` 处理。
+- `work.list` 与工具返回的项带 `dependsOn`（id）与 `blockedBy`（未合并的 id），整页一次读（`readDependencies`）。`work.cancel` 的结果列出依赖它、仍在排队的项（`dependents`，最多 20，状态在查询里过滤，`queuedDependentsOf`）并提示用 `work.update` 处理。
 - 人不能在团队页改依赖（这一轮只读展示，见[团队页与审批](page.md)）。
 
 评审与就绪：
