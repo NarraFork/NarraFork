@@ -126,7 +126,10 @@ describe("team git writes", () => {
 	});
 
 	test("conflicts list at most 50 files and say there are more, leaving no state behind", async () => {
-		const files = Array.from({ length: 60 }, (_, index) => `f${String(index).padStart(2, "0")}.txt`);
+		const files = Array.from(
+			{ length: 60 },
+			(_, index) => `f${String(index).padStart(2, "0")}.txt`,
+		);
 		for (const file of files) await writeFile(join(repo, file), "base\n");
 		await git(["add", "."]);
 		await git(["commit", "-qm", "base"]);
@@ -263,7 +266,10 @@ describe("team git writes", () => {
 		await writeFile(repoSigner, `#!/bin/sh\ntouch ${evil}\nexit 1\n`);
 		await chmod(hostSigner, 0o755);
 		await chmod(repoSigner, 0o755);
-		await writeFile(globalConfig, `${HOST_USER}[commit]\n\tgpgsign = true\n[gpg]\n\tprogram = ${hostSigner}\n`);
+		await writeFile(
+			globalConfig,
+			`${HOST_USER}[commit]\n\tgpgsign = true\n[gpg]\n\tprogram = ${hostSigner}\n`,
+		);
 		await git(["config", "gpg.program", repoSigner]);
 		const write = teamRepoGit(repo);
 		const config = await signingConfig(repo, []);

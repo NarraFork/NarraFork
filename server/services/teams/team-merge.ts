@@ -95,6 +95,8 @@ const RUNNING = new Set(["working", "waiting"]);
 
 /** Escape LIKE metacharacters for a prefix bound with `ESCAPE '\'`. */
 const escapeLike = (value: string) => value.replace(/[\\%_]/g, (match) => `\\${match}`);
+/** Outcome events read at once (fast-forward requests in between are skipped). */
+const OUTCOME_SCAN = 8;
 /** Events after which an earlier merge outcome no longer applies. */
 const OUTCOME_KINDS = [
 	"work.ready",
@@ -165,7 +167,7 @@ const str = (value: unknown): string | null => (typeof value === "string" ? valu
  * asked for): one indexed read of its events, newest first, at most one row.
  */
 export function readMergeOutcome(itemId: string): TeamWorkMergeOutcome | null {
-	const row = db
+	const rows = db
 		.select({
 			kind: teamWorkEvents.kind,
 			detail: teamWorkEvents.detailJson,
@@ -176,8 +178,13 @@ export function readMergeOutcome(itemId: string): TeamWorkMergeOutcome | null {
 			and(eq(teamWorkEvents.workItemId, itemId), inArray(teamWorkEvents.kind, [...OUTCOME_KINDS])),
 		)
 		.orderBy(desc(teamWorkEvents.createdAt), desc(teamWorkEvents.id))
-		.limit(1)
-		.get();
+		.limit(OUTCOME_SCAN)
+		.all();
+	// A fast-forward request keeps the prepared merge it acts on.
+	const row = rows.find(
+		(candidate) =>
+			candidate.kind !== "work.merge_requested" || candidate.detail?.job !== "fast_forward",
+	);
 	if (!row) return null;
 	const detail = row.detail ?? {};
 	if (row.kind === "work.merge_failed") {
@@ -307,7 +314,15 @@ async function checkoutActivity(
 		}
 		if (options.backgroundTasks) {
 			const { backgroundTaskService } = await import("../background-task-service");
-			if ((await backgroundTaskService.countActiveByParent(row.id)) > 0) running++;
+			// No background task store (nothing was ever started in this process): none run.
+			const active = await backgroundTaskService.countActiveByParent(row.id).catch((error) => {
+				logger.debug("Background tasks of a session could not be counted", {
+					narratorId: row.id,
+					error: error instanceof Error ? error.message : String(error),
+				});
+				return 0;
+			});
+			if (active > 0) running++;
 		}
 	}
 	const open = db
@@ -386,6 +401,13 @@ interface JobContext extends Requester {
 	itemId: string;
 	teamId: string;
 	projectId: string;
+	/** When `work.merge_requested` was recorded (ms): outcomes are recorded strictly after it. */
+	requestedAt?: number;
+}
+
+/** An outcome's timestamp: never in the same millisecond as its request, so it reads as newer. */
+function outcomeAt(context: JobContext): string {
+	return new Date(Math.max(Date.now(), (context.requestedAt ?? 0) + 1)).toISOString();
 }
 
 function teamRow(teamId: string) {
@@ -474,6 +496,7 @@ function startJob(
 		startedAt: Date.now(),
 	};
 	state.jobs.set(context.itemId, entry);
+	context.requestedAt = Date.now();
 	try {
 		recordWorkEvent(db, {
 			teamId: context.teamId,
@@ -481,6 +504,7 @@ function startJob(
 			kind: "work.merge_requested",
 			actor: { kind: "person", id: context.userId },
 			detail: { job, mode: "local" },
+			at: new Date(context.requestedAt).toISOString(),
 		});
 	} catch (error) {
 		state.jobs.delete(context.itemId);
@@ -555,6 +579,7 @@ function recordFailure(context: JobContext, error: unknown): void {
 			kind: "work.merge_failed",
 			actor: { kind: "person", id: context.userId },
 			detail: { code: failure.code, message: failure.message.slice(0, 500), ...failure.extra },
+			at: outcomeAt(context),
 		});
 	} catch (recordError) {
 		logger.warn("Team merge failure could not be recorded", { error: String(recordError) });
@@ -789,6 +814,7 @@ async function runMerge(context: JobContext): Promise<void> {
 				kind: "work.merge_prepared",
 				actor: { kind: "person", id: context.userId },
 				detail: { mergeCommit, baseSha: old, checkedOutAt, head, base },
+				at: outcomeAt(context),
 			});
 			return;
 		}
