@@ -511,9 +511,11 @@
 			},
 			"coordinatorHeader": {
 				"title": "协调者",
-				"following_one": "在跟进 {{count}} 个工作者",
-				"following_other": "在跟进 {{count}} 个工作者",
-				"followingMore": "在跟进 {{count}}+ 个工作者",
+				"running_one": "{{count}} 个会话在运行",
+				"running_other": "{{count}} 个会话在运行",
+				"runningMore": "{{count}}+ 个会话在运行",
+				"disconnected": "连接断开",
+				"reconnect": "点击重新连接",
 				"status": {
 					"working": "工作中",
 					"waiting": "在等人处理",

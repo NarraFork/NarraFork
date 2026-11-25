@@ -751,16 +751,31 @@ describe("the coordinator's line", () => {
 		runningCount: 0,
 	};
 	const agent = (id: string) => ({ id, title: null, status: "working" });
-	test("the other running sessions it follows; more when the list was cut", () => {
+	test("the other running sessions; a lower bound when the list was cut", () => {
 		expect(
 			coordinatorLine({
 				...base,
 				runningAgents: [agent("lead"), agent("w1"), agent("w2")],
 				runningCount: 3,
 			}),
-		).toEqual({ kind: "following", count: 2, more: false });
-		expect(coordinatorLine({ ...base, runningAgents: [agent("w1")], runningCount: 21 })).toEqual({
-			kind: "following",
+		).toEqual({ kind: "running", count: 2, more: false });
+		// One listed, more beyond it: at least two.
+		expect(coordinatorLine({ ...base, runningAgents: [agent("w1")], runningCount: 2 })).toEqual({
+			kind: "running",
+			count: 2,
+			more: true,
+		});
+		// The full list (the coordinator and 19 others) and one past it: 20+.
+		const full = [agent("lead"), ...Array.from({ length: 19 }, (_, i) => agent(`w${i}`))];
+		expect(coordinatorLine({ ...base, runningAgents: full, runningCount: 21 })).toEqual({
+			kind: "running",
+			count: 20,
+			more: true,
+		});
+	});
+	test("a list cut down to the coordinator: 1+, never 0+", () => {
+		expect(coordinatorLine({ ...base, runningAgents: [agent("lead")], runningCount: 2 })).toEqual({
+			kind: "running",
 			count: 1,
 			more: true,
 		});

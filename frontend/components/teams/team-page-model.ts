@@ -52,18 +52,21 @@ export function liveWorkerStatus(
 }
 
 /**
- * The coordinator column's header line: how many other sessions of the tree are running (the
- * workers it follows, their reviewers among them), `more` when the summary's list was cut; and
- * the coordinator's own state when nothing else runs.
+ * The coordinator column's header line: how many other sessions of the tree are running, and the
+ * coordinator's own state when nothing else runs. The summary's running list does not say which
+ * sessions are work-item workers (reviewers and nested subagents run in the same tree), so the
+ * line counts sessions, not workers. When the list was cut (`more`) the count is a lower bound,
+ * shown as 「N+」: the listed others plus at least one unlisted, so it is never 「0+」.
  */
 export function coordinatorLine(
 	summary: Pick<TeamPageSummary, "teamId" | "coordinatorStatus" | "runningAgents" | "runningCount">,
 ):
-	| { kind: "following"; count: number; more: boolean }
+	| { kind: "running"; count: number; more: boolean }
 	| { kind: "status"; status: "working" | "waiting" | "idle" | "archived" } {
 	const others = summary.runningAgents.filter((agent) => agent.id !== summary.teamId).length;
 	const more = summary.runningCount > summary.runningAgents.length;
-	if (others > 0 || more) return { kind: "following", count: others, more };
+	if (more) return { kind: "running", count: others + 1, more };
+	if (others > 0) return { kind: "running", count: others, more };
 	const status = summary.coordinatorStatus;
 	return {
 		kind: "status",

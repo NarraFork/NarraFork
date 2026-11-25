@@ -921,23 +921,24 @@ describe("review findings", () => {
 
 describe("the coordinator's column header", () => {
 	const agent = (id: string, status = "working") => ({ id, title: id, status });
-	test("协调者 · 在跟进 N 个工作者 · 完整会话, in place of the session toolbar", async () => {
-		const following = summary({
+	test("协调者 · N 个会话在运行 · 完整会话, in place of the session toolbar", async () => {
+		const running = summary({
 			coordinatorStatus: "working",
 			runningAgents: [agent("lead"), agent("w1"), agent("w2"), agent("w3"), agent("w4")],
 			runningCount: 5,
 		});
 		const zhHtml = await render(
-			<TeamCoordinatorHeader summary={following} onOpenCoordinatorSession={() => {}} />,
+			<TeamCoordinatorHeader summary={running} onOpenCoordinatorSession={() => {}} />,
 			undefined,
 			"zh-CN",
 		);
 		expect(zhHtml).toContain("协调者");
-		expect(zhHtml).toContain("在跟进 4 个工作者");
+		expect(zhHtml).toContain("4 个会话在运行");
+		expect(zhHtml).not.toContain("工作者");
 		expect(zhHtml).toContain("完整会话");
 		expect(zhHtml).toContain('data-tone="blue"');
-		const html = await render(<TeamCoordinatorHeader summary={following} />);
-		expect(html).toContain("following 4 workers");
+		const html = await render(<TeamCoordinatorHeader summary={running} />);
+		expect(html).toContain("4 sessions running");
 		// No way to the full session given: no link.
 		expect(html).not.toContain("team-coordinator-full-session");
 		const idle = await render(
@@ -949,6 +950,34 @@ describe("the coordinator's column header", () => {
 		expect(idle).toContain('data-kind="status"');
 	});
 
+	test("a list cut down to the coordinator still reads 1+, never 0+", async () => {
+		const cut = summary({ runningAgents: [agent("lead")], runningCount: 2 });
+		const zhHtml = await render(<TeamCoordinatorHeader summary={cut} />, undefined, "zh-CN");
+		expect(zhHtml).toContain("1+ 个会话在运行");
+		expect(zhHtml).not.toContain("0+");
+		expect(await render(<TeamCoordinatorHeader summary={cut} />)).toContain("1+ sessions running");
+	});
+
+	test("连接断开 while the panel's socket is down, nothing while it is up", async () => {
+		const down = { disconnected: true, reconnect: () => {} };
+		const zhHtml = await render(
+			<TeamCoordinatorHeader summary={summary()} connection={down} />,
+			undefined,
+			"zh-CN",
+		);
+		expect(zhHtml).toContain("team-coordinator-disconnected");
+		expect(zhHtml).toContain("连接断开");
+		expect(zhHtml).toContain('title="点击重新连接"');
+		const html = await render(<TeamCoordinatorHeader summary={summary()} connection={down} />);
+		expect(html).toContain("Disconnected");
+		for (const connection of [undefined, null, { ...down, disconnected: false }]) {
+			const upHtml = await render(
+				<TeamCoordinatorHeader summary={summary()} connection={connection} />,
+			);
+			expect(upHtml).not.toContain("team-coordinator-disconnected");
+		}
+	});
+
 	test("the session page keeps its toolbar: only the team route leaves it out", () => {
 		const panel = readFileSync(new URL("../narrator/NarratorPanel.tsx", import.meta.url), "utf8");
 		expect(panel).toContain("hideHeader = false,");
@@ -958,6 +987,13 @@ describe("the coordinator's column header", () => {
 			"utf8",
 		);
 		expect(route).toMatch(/\bhideHeader\b/);
+		// The hidden header's 「连接断开」 reaches the coordinator line through the panel's report.
+		expect(route).toMatch(/onConnectionChange=\{onConnectionChange\}/);
+		expect(route).toMatch(/onConnectionChange=\{setConnection\}/);
+		expect(route).toMatch(/conversationConnection=\{connection\}/);
+		expect(panel).toContain(
+			"useReportPanelConnection(onConnectionChange, disconnected && !isWorkspacePreview, reconnect);",
+		);
 		const session = readFileSync(
 			new URL("../../routes/narrators/$narratorId.tsx", import.meta.url),
 			"utf8",

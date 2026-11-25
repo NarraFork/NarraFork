@@ -218,6 +218,7 @@ import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
 import type { NarratorPanelProps } from "./narrator-panel-types";
 import { useNarratorPanelVisible } from "./narrator-panel-visibility";
 import { OutlineDrawerHost } from "./OutlineDrawerHost";
+import { useReportPanelConnection } from "./panel-connection";
 import {
 	createResponsiveNarratorPanel,
 	NarratorPanelCompactContext,
@@ -322,6 +323,7 @@ function NarratorPanelBody({
 	onToggleSpecPanel,
 	readOnlyNotice,
 	hideHeader = false,
+	onConnectionChange,
 }: Omit<NarratorPanelProps, "compact">) {
 	const navigate = useNavigate();
 	const fileDrawerVisible = useNarratorPanelVisible();
@@ -1316,6 +1318,9 @@ function NarratorPanelBody({
 		viewers,
 	} = wsState;
 	setUnreadCountRef.current = setUnreadCount;
+	// A host that hides the header (the team page) shows the 「连接断开」 badge's state itself and
+	// reconnects through the panel: the same socket, no second connection logic.
+	useReportPanelConnection(onConnectionChange, disconnected && !isWorkspacePreview, reconnect);
 	// Quota display + NUG recharge derivations (flags, dialog disclosure, and the
 	// payment-required reconstruction / auto-open effects) live in useNarratorQuota.
 	const {

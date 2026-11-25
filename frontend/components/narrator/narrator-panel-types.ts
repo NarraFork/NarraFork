@@ -215,6 +215,18 @@ export interface NarratorPanelProps {
 	 * toolbar (the team page's coordinator column). The session's own page always has them.
 	 */
 	hideHeader?: boolean;
+	/**
+	 * Called with the panel's connection state whenever it changes, so a host that hides the
+	 * header (and with it the 「断开连接」 badge) can show it and offer the same reconnect.
+	 */
+	onConnectionChange?: (connection: NarratorPanelConnection) => void;
+}
+
+/** The narrator socket's state as the panel reports it to a host (`onConnectionChange`). */
+export interface NarratorPanelConnection {
+	disconnected: boolean;
+	/** The panel's own reconnect (the badge's click). */
+	reconnect: () => void;
 }
 
 export const MAX_IMAGE_SIZE = 20 * 1024 * 1024; // 20MB

@@ -11,6 +11,7 @@
  * header's avatars) and the sizes of the items shown (`work-stats`, at most 50).
  */
 
+import type { NarratorPanelConnection } from "@frontend/components/narrator/narrator-panel-types";
 import { useProject } from "@frontend/hooks/useProjects";
 import {
 	teamsUnavailable,
@@ -55,10 +56,16 @@ export function TeamPageView({
 	onOpenCoordinatorSession,
 	onBack,
 	onDisbanded,
+	conversationConnection,
 }: {
 	projectId: string;
 	teamId: string;
 	conversation: ReactNode;
+	/**
+	 * The conversation panel's socket state (the panel's `onConnectionChange`): its header is
+	 * hidden, so the coordinator line shows 「断开连接」 and reconnects through the panel.
+	 */
+	conversationConnection?: NarratorPanelConnection | null;
 	onOpenSession?: (narratorId: string) => void;
 	/** The coordinator's own session page (the 「…」 menu's 协调者完整会话). */
 	onOpenCoordinatorSession?: () => void;
@@ -204,6 +211,7 @@ export function TeamPageView({
 					<TeamCoordinatorHeader
 						summary={summary.data}
 						onOpenCoordinatorSession={onOpenCoordinatorSession}
+						connection={conversationConnection}
 					/>
 				}
 				conversationOverlay={

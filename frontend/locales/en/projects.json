@@ -511,9 +511,11 @@
 			},
 			"coordinatorHeader": {
 				"title": "Coordinator",
-				"following_one": "following {{count}} worker",
-				"following_other": "following {{count}} workers",
-				"followingMore": "following {{count}}+ workers",
+				"running_one": "{{count}} session running",
+				"running_other": "{{count}} sessions running",
+				"runningMore": "{{count}}+ sessions running",
+				"disconnected": "Disconnected",
+				"reconnect": "Click to reconnect",
 				"status": {
 					"working": "working",
 					"waiting": "waiting on someone",
