@@ -1,5 +1,7 @@
+import { createHash, randomBytes } from "node:crypto";
 import { Hono } from "hono";
-import { NugProvider } from "../lib/agent/nug-provider";
+import { type NugBillingOrderResponse, NugProvider } from "../lib/agent/nug-provider";
+import { AppError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import {
 	deleteNugCachedModels,
@@ -20,11 +22,13 @@ import {
 	getAllNugCachedQuotas,
 	getNugCachedQuota,
 	normalizeNugQuotaResponse,
+	nugQuotaIdentity,
 	purgeNugQuotaCache,
 	setNugCachedQuota,
 	updateNugQuotaByPrefix,
 } from "../lib/nug-quota-cache";
 import { getNugRelayStatus } from "../lib/nug-relay/manager";
+import { getProviderKeyStore, nugKeyOwner, withProviderKey } from "../lib/provider-keys";
 import {
 	getSettingsRevision,
 	type NUGProviderConfig,
@@ -38,6 +42,7 @@ import { registerModelListReader } from "../lib/sourcing/model-list-readers";
 import { sourceGroupForConnection } from "../lib/sourcing/source-groups";
 import { getServiceTemplate } from "../lib/sourcing/templates";
 import { spaRedirectLocation } from "../lib/spa-base-href";
+import { requireSessionAuth } from "../middleware/auth";
 
 export const nugRoutes = new Hono();
 export { getAllNugCachedQuotas, getNugCachedQuota, updateNugQuotaByPrefix };
@@ -64,6 +69,164 @@ function getNugProvider(id: string): {
 		provider: new NugProvider(quotaSubject.config),
 		quotaSubject,
 	};
+}
+
+const NUG_BILLING_BINDING_TTL = 24 * 60 * 60_000;
+const MAX_NUG_BILLING_BINDINGS = 500;
+const MAX_NUG_BILLING_BINDINGS_PER_USER = 50;
+interface NugBillingBinding {
+	owner: string;
+	providerId: string;
+	credentialId: string;
+	storedCredential: boolean;
+	/** Hash only: never retain another long-lived copy of a secret or config. */
+	identityHash: string;
+	orderId?: string;
+	expiresAt: number;
+}
+const nugBillingBindings = new Map<string, NugBillingBinding>();
+
+function nugBillingSubject(providerId: string, binding?: NugBillingBinding) {
+	const connection = (settings.nugProviders ?? []).find((provider) => provider.id === providerId);
+	if (!connection)
+		throw new AppError(
+			"NUG payment connection is unavailable",
+			binding ? 409 : 404,
+			"NUG_PAYMENT_CONTEXT",
+		);
+	if (connection.disabled)
+		throw new AppError("NUG payment connection is disabled", 409, "NUG_PAYMENT_CONTEXT");
+	const keys = getProviderKeyStore().list(nugKeyOwner(providerId));
+	const key = binding
+		? binding.storedCredential
+			? keys.find((entry) => entry.id === binding.credentialId)
+			: undefined
+		: keys[0];
+	if (
+		(binding?.storedCredential && !key) ||
+		(binding && !binding.storedCredential && keys.length) ||
+		key?.disabled ||
+		(!key && keys.length)
+	) {
+		throw new AppError(
+			"NUG payment credential changed or is unavailable",
+			409,
+			"NUG_PAYMENT_CONTEXT",
+		);
+	}
+	const config = structuredClone(key ? withProviderKey(connection, key) : connection);
+	if (!config.apiKey?.trim())
+		throw new AppError("NUG payment credential is unavailable", 409, "NUG_PAYMENT_CONTEXT");
+	return {
+		config,
+		connection,
+		credentialId: key?.id ?? providerId,
+		storedCredential: !!key,
+		identityHash: createHash("sha256").update(nugQuotaIdentity(config)).digest("hex"),
+	};
+}
+
+function pruneNugBillingBindings(): void {
+	const now = Date.now();
+	for (const [token, binding] of nugBillingBindings) {
+		if (binding.expiresAt <= now) nugBillingBindings.delete(token);
+	}
+}
+
+function reserveNugBillingBinding(
+	owner: string,
+	providerId: string,
+	subject: ReturnType<typeof nugBillingSubject>,
+) {
+	pruneNugBillingBindings();
+	if (
+		nugBillingBindings.size >= MAX_NUG_BILLING_BINDINGS ||
+		[...nugBillingBindings.values()].filter((binding) => binding.owner === owner).length >=
+			MAX_NUG_BILLING_BINDINGS_PER_USER
+	) {
+		throw new AppError(
+			"Too many NUG payment sessions; try again after older sessions expire",
+			429,
+			"NUG_PAYMENT_LIMIT",
+		);
+	}
+	let token = randomBytes(32).toString("base64url");
+	while (nugBillingBindings.has(token)) token = randomBytes(32).toString("base64url");
+	const binding: NugBillingBinding = {
+		owner,
+		providerId,
+		credentialId: subject.credentialId,
+		storedCredential: subject.storedCredential,
+		identityHash: subject.identityHash,
+		expiresAt: Date.now() + NUG_BILLING_BINDING_TTL,
+	};
+	nugBillingBindings.set(token, binding);
+	return { token, binding };
+}
+
+function currentNugBillingSubject(token: string, binding: NugBillingBinding) {
+	if (nugBillingBindings.get(token) !== binding || binding.expiresAt <= Date.now()) {
+		nugBillingBindings.delete(token);
+		throw new AppError(
+			"NUG payment session expired or is unavailable; create a new order",
+			409,
+			"NUG_PAYMENT_CONTEXT",
+		);
+	}
+	try {
+		const subject = nugBillingSubject(binding.providerId, binding);
+		if (subject.identityHash !== binding.identityHash) throw new Error("changed");
+		return subject;
+	} catch {
+		nugBillingBindings.delete(token);
+		throw new AppError(
+			"NUG payment credential or connection changed; create a new order",
+			409,
+			"NUG_PAYMENT_CONTEXT",
+		);
+	}
+}
+
+function ownedNugBillingBinding(
+	owner: string,
+	providerId: string,
+	orderId: string,
+	token: string | undefined,
+) {
+	if (!token || !/^[A-Za-z0-9_-]{43}$/.test(token))
+		throw new AppError(
+			"NUG payment binding is required; create a new order",
+			409,
+			"NUG_PAYMENT_CONTEXT",
+		);
+	pruneNugBillingBindings();
+	const binding = nugBillingBindings.get(token);
+	if (
+		!binding ||
+		binding.owner !== owner ||
+		binding.providerId !== providerId ||
+		binding.orderId !== orderId
+	) {
+		throw new AppError("NUG payment session not found or expired", 404, "NUG_PAYMENT_CONTEXT");
+	}
+	return { binding, token, subject: currentNugBillingSubject(token, binding) };
+}
+
+function boundNugBillingResponse(
+	data: NugBillingOrderResponse,
+	token: string,
+	expectedOrderId?: string,
+) {
+	if (
+		!data?.order ||
+		typeof data.order.id !== "string" ||
+		!data.order.id ||
+		data.order.id.length > 300 ||
+		(expectedOrderId !== undefined && data.order.id !== expectedOrderId)
+	) {
+		throw new AppError("Invalid NUG billing order response", 502, "NUG_PAYMENT_RESPONSE");
+	}
+	return { ...data, order: { ...data.order, binding: token } };
 }
 
 type NugUsageRecord = Record<string, unknown>;
@@ -593,6 +756,41 @@ nugRoutes.get("/providers/:id/channels/health", async (c) => {
 /** Proxy quota balance from NUG service (updates cache). */
 nugRoutes.get("/providers/:id/quota", async (c) => {
 	const id = c.req.param("id");
+	if (c.req.query("binding") !== undefined || c.req.query("orderId") !== undefined) {
+		await requireSessionAuth(c, async () => {});
+		try {
+			const bound = ownedNugBillingBinding(
+				c.get("user").sub,
+				id,
+				c.req.query("orderId") ?? "",
+				c.req.query("binding"),
+			);
+			const provider = new NugProvider(bound.subject.config, bound.subject.connection);
+			const data = (await provider.getQuota()) as unknown as Record<string, unknown>;
+			const current = currentNugBillingSubject(bound.token, bound.binding);
+			const primary = captureNugQuotaSubject(current.connection);
+			const paymentCredentialIsPrimary =
+				primary.id === bound.binding.credentialId &&
+				createHash("sha256").update(primary.identity).digest("hex") === bound.binding.identityHash;
+			// Route through the source owner with A's captured CID even when B is now primary.
+			// Never merge B's previous balance or legacy-normalized zeroes into A's probe.
+			setNugCachedQuota(
+				id,
+				buildNugQuotaCache(data, paymentCredentialIsPrimary ? getNugCachedQuota(id) : undefined),
+				{
+					id: bound.binding.credentialId,
+					providerId: id,
+					config: bound.subject.config,
+					identity: nugQuotaIdentity(bound.subject.config),
+				},
+			);
+			return c.json({ ...normalizeNugQuotaResponse(data), paymentCredentialIsPrimary });
+		} catch (err) {
+			if (err instanceof AppError) throw err;
+			logger.error("NUG payment balance fetch failed", { providerId: id });
+			return c.json({ error: "NUG payment balance fetch failed" }, 502);
+		}
+	}
 	const entry = getNugProvider(id);
 	if (!entry) return c.json({ error: `Provider "${id}" not found` }, 404);
 	try {
@@ -606,6 +804,11 @@ nugRoutes.get("/providers/:id/quota", async (c) => {
 		return c.json({ error: msg }, 502);
 	}
 });
+
+// Match the application's first-party gate even when this router is mounted alone.
+// Keep ordinary session users' existing payment access; do not add an admin-only gate.
+nugRoutes.use("/providers/:id/billing/orders", requireSessionAuth);
+nugRoutes.use("/providers/:id/billing/orders/*", requireSessionAuth);
 
 /** Proxy billing config from NUG service. */
 nugRoutes.get("/providers/:id/billing/config", async (c) => {
@@ -624,59 +827,72 @@ nugRoutes.get("/providers/:id/billing/config", async (c) => {
 	}
 });
 
-/** Create a NUG billing order using the configured provider API key. */
+/** Create under one captured CID; only the random binding leaves this server. */
 nugRoutes.post("/providers/:id/billing/orders", async (c) => {
-	const entry = getNugProvider(c.req.param("id"));
-	if (!entry) return c.json({ error: `Provider "${c.req.param("id")}" not found` }, 404);
+	const id = c.req.param("id");
+	let token: string | undefined;
 	try {
 		const body = (await c.req.json()) as { amount?: number; provider?: string; channel?: string };
 		const amount = Number(body.amount);
-		if (!Number.isFinite(amount) || amount <= 0) {
+		if (!Number.isFinite(amount) || amount <= 0)
 			return c.json({ error: "amount must be greater than 0" }, 400);
-		}
-		if (!body.provider) {
+		if (typeof body.provider !== "string" || !body.provider.trim())
 			return c.json({ error: "provider is required" }, 400);
-		}
-		const data = await entry.provider.createBillingOrder({
+		if (body.channel !== undefined && typeof body.channel !== "string")
+			return c.json({ error: "invalid channel" }, 400);
+		const subject = nugBillingSubject(id);
+		const reserved = reserveNugBillingBinding(c.get("user").sub, id, subject);
+		token = reserved.token;
+		const provider = new NugProvider(subject.config, subject.connection);
+		const data = await provider.createBillingOrder({
 			amount,
 			provider: body.provider,
 			channel: body.channel,
 		});
-		return c.json(data, 201);
+		// Never publish a QR/URL for a subject that changed during the gateway call.
+		currentNugBillingSubject(token, reserved.binding);
+		const response = boundNugBillingResponse(data, token);
+		reserved.binding.orderId = response.order.id;
+		return c.json(response, 201);
 	} catch (err: unknown) {
-		const msg = err instanceof Error ? err.message : "Unknown error";
-		logger.error("NUG billing order create failed", { error: msg, provider: entry.config.name });
-		return c.json({ error: msg }, 502);
+		if (token) nugBillingBindings.delete(token);
+		if (err instanceof AppError) throw err;
+		logger.error("NUG billing order create failed", { providerId: id });
+		return c.json({ error: "NUG billing order create failed" }, 502);
 	}
 });
 
-/** Fetch a NUG billing order owned by the configured API-key user. */
+/** Poll only the creating user's live CID, never today's first key. */
 nugRoutes.get("/providers/:id/billing/orders/:orderId", async (c) => {
 	const id = c.req.param("id");
-	const entry = getNugProvider(id);
-	if (!entry) return c.json({ error: `Provider "${id}" not found` }, 404);
+	const orderId = c.req.param("orderId");
 	try {
-		const data = await entry.provider.getBillingOrder(c.req.param("orderId"));
-		return c.json(data);
+		const bound = ownedNugBillingBinding(c.get("user").sub, id, orderId, c.req.query("binding"));
+		const provider = new NugProvider(bound.subject.config, bound.subject.connection);
+		const data = await provider.getBillingOrder(orderId);
+		currentNugBillingSubject(bound.token, bound.binding);
+		return c.json(boundNugBillingResponse(data, bound.token, orderId));
 	} catch (err: unknown) {
-		const msg = err instanceof Error ? err.message : "Unknown error";
-		logger.error("NUG billing order fetch failed", { error: msg, provider: entry.config.name });
-		return c.json({ error: msg }, 502);
+		if (err instanceof AppError) throw err;
+		logger.error("NUG billing order fetch failed", { providerId: id });
+		return c.json({ error: "NUG billing order fetch failed" }, 502);
 	}
 });
 
-/** Refresh a pending NUG billing order pay URL. */
+/** Refresh a pay URL under the same creating subject and local session owner. */
 nugRoutes.post("/providers/:id/billing/orders/:orderId/repay", async (c) => {
 	const id = c.req.param("id");
-	const entry = getNugProvider(id);
-	if (!entry) return c.json({ error: `Provider "${id}" not found` }, 404);
+	const orderId = c.req.param("orderId");
 	try {
-		const data = await entry.provider.repayBillingOrder(c.req.param("orderId"));
-		return c.json(data);
+		const bound = ownedNugBillingBinding(c.get("user").sub, id, orderId, c.req.query("binding"));
+		const provider = new NugProvider(bound.subject.config, bound.subject.connection);
+		const data = await provider.repayBillingOrder(orderId);
+		currentNugBillingSubject(bound.token, bound.binding);
+		return c.json(boundNugBillingResponse(data, bound.token, orderId));
 	} catch (err: unknown) {
-		const msg = err instanceof Error ? err.message : "Unknown error";
-		logger.error("NUG billing order repay failed", { error: msg, provider: entry.config.name });
-		return c.json({ error: msg }, 502);
+		if (err instanceof AppError) throw err;
+		logger.error("NUG billing order repay failed", { providerId: id });
+		return c.json({ error: "NUG billing order repay failed" }, 502);
 	}
 });
 

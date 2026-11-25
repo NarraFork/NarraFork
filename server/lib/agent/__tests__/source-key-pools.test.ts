@@ -1,10 +1,12 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import * as fs from "node:fs";
 import type { CredentialNetwork } from "@shared/credential-network";
 import {
 	getCustomApiCachedQuota,
 	updateCustomApiQuotaByPrefix,
 } from "../../custom-api-quota-cache";
 import { setNugCachedModels } from "../../nug-model-cache";
+import { nugQuotaIdentity, updateNugQuotaByPrefix } from "../../nug-quota-cache";
 import {
 	streamQuotaIdentityForPrefix,
 	streamQuotaIdentityForRequest,
@@ -13,9 +15,16 @@ import {
 	COMMAND_CODE_KEY_OWNER,
 	getProviderKeyStore,
 	nugKeyOwner,
+	type ProviderKey,
 	TOKENDANCE_KEY_OWNER,
+	withProviderKey,
 } from "../../provider-keys";
-import { saveSettings, settings } from "../../settings";
+import {
+	registerAutoSourceProbe,
+	resolveEffectiveModel,
+	saveSettings,
+	settings,
+} from "../../settings";
 import { quotaStore, STREAM_QUOTA_SOURCE } from "../../sourcing/quota-store";
 import { registerTokenDanceRuntime } from "../../tokendance-runtime";
 import type {
@@ -192,8 +201,11 @@ mock.module("../../commandcode-manager", () => ({
 	},
 }));
 const { buildCommandCodeProvider } = await import("../commandcode-provider");
-const { PooledProvider, resetProviderKeyRuntimeForTests } = await import("../pooled-provider");
+const { PooledProvider, resetProviderKeyRuntimeForTests, keyCooldown } = await import(
+	"../pooled-provider"
+);
 const { resolveProviderAndModel } = await import("../provider");
+const { autoSourceFacts } = await import("../auto-route-signals");
 const network = spyOn(globalThis, "fetch").mockRejectedValue(
 	new Error("Unexpected external fetch"),
 );
@@ -274,6 +286,11 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+	registerAutoSourceProbe(null);
+	for (const key of store().list(nugKeyOwner(NUG_ID))) {
+		quotaStore.forget(key.id);
+		quotaStore.forget(key.id, STREAM_QUOTA_SOURCE);
+	}
 	for (const family of families) store().removeProvider(family.owner);
 	for (const key of store().list(CUSTOM_ID)) quotaStore.remove(key.id, STREAM_QUOTA_SOURCE);
 	quotaStore.remove(CUSTOM_ID, STREAM_QUOTA_SOURCE);
@@ -729,10 +746,8 @@ for (const variant of ["plain NUG", "pooled NUG", "pooled custom"] as const) {
 						}
 						const live = streamQuotaIdentityForPrefix(prefix, credentialId);
 						expect(live).toBeString();
-						// Proxy-only edits leave the quota identity tuple unchanged, but
-						// still invalidate the prepared transport's request-time guard.
-						if (edit === "globalProxy") expect(live).toBe(before);
-						else expect(live).not.toBe(before);
+						// The opaque identity tracks the effective transport as well as its credential.
+						expect(live).not.toBe(before);
 						expect(info?.validateDiagnosticCredential?.()).toBe(false);
 						expect(streamQuotaIdentityForRequest(prefix, info)).toBeUndefined();
 					},
@@ -742,6 +757,12 @@ for (const variant of ["plain NUG", "pooled NUG", "pooled custom"] as const) {
 			expect(events).toEqual([{ text: "request-selected-old-key", credentialId }]);
 			expect(requests).toEqual([{ apiKey: "request-selected-old-key", operation: "chat" }]);
 			expect(streamQuotaIdentityForRequest(prefix, delivered)).toBeUndefined();
+			// Even a delayed writer holding the original capture must not relabel its balance.
+			if (custom) updateCustomApiQuotaByPrefix(prefix, "999", "stale balance", before);
+			else updateNugQuotaByPrefix(prefix, 999, "stale balance", undefined, before);
+			for (const key of store().list(owner))
+				expect(quotaStore.peek(key.id, STREAM_QUOTA_SOURCE)).toBeUndefined();
+			expect(quotaStore.peek(group, STREAM_QUOTA_SOURCE)).toBeUndefined();
 		});
 	});
 }
@@ -764,8 +785,13 @@ test("promoted plain custom backup bills the group but publishes its balance onl
 	});
 	const first = store().add(CUSTOM_ID, { apiKey: "old-key-A" });
 	const backup = store().add(CUSTOM_ID, { apiKey: "promoted-key-B" });
+	const oldIdentity = streamQuotaIdentityForPrefix("poolcustom", first.id);
+	expect(oldIdentity).toBeString();
 	store().update(first.id, { disabled: true });
 	store().reorder(CUSTOM_ID, [backup.id, first.id]);
+	updateCustomApiQuotaByPrefix("poolcustom", "999", "stale A balance", oldIdentity);
+	for (const key of [first, backup])
+		expect(quotaStore.peek(key.id, STREAM_QUOTA_SOURCE)).toBeUndefined();
 	const { adapter, model } = resolveProviderAndModel("poolcustom:m");
 	expect(adapter).not.toBeInstanceOf(PooledProvider);
 	let publishedIdentity: string | undefined;
@@ -775,9 +801,8 @@ test("promoted plain custom backup bills the group but publishes its balance onl
 			onRequestStart: (info) => {
 				expect(info?.credentialId).toBe(CUSTOM_ID);
 				publishedIdentity = streamQuotaIdentityForRequest("poolcustom", info);
-				expect(publishedIdentity).toBe(
-					JSON.stringify([CUSTOM_ID, "https://promoted-custom.invalid/v1", backup.apiKey]),
-				);
+				expect(publishedIdentity).toBeString();
+				expect(publishedIdentity).toBe(streamQuotaIdentityForPrefix("poolcustom", backup.id));
 				updateCustomApiQuotaByPrefix("poolcustom", "73.5", "backup balance", publishedIdentity);
 			},
 		}),
@@ -873,11 +898,164 @@ function expectRelayResult(
 	expect(requests[0]?.apiKey).toBe(apiKey);
 }
 
+const RELAY_AUTO_VALUE = "poolnug:upstream:gpt-5.5";
+const RELAY_AUTO_BACKUP = "poolcustom:gpt-5.5";
+const RELAY_AUTO_SESSION = "relay-auto-existing-session";
+function autoRelayPool() {
+	const fixture = relayPool(false);
+	const connection = settings.nugProviders?.[0];
+	if (!connection) throw new Error("missing relay Auto connection");
+	saveSettings({
+		...settings,
+		nugProviders: [{ ...connection, defaultModel: "upstream:gpt-5.5" }],
+		customApiProviders: [
+			{
+				id: CUSTOM_ID,
+				name: "Auto alternative",
+				prefix: "poolcustom",
+				apiKey: "auto-alternative-key",
+				baseUrl: "https://alternative.invalid/v1",
+				defaultModel: "gpt-5.5",
+				protocol: "completions-compatible",
+			},
+		],
+		agent: {
+			...settings.agent,
+			hiddenModels: [],
+			disabledProviders: [],
+			autoExcludedProviders: [
+				"codex",
+				"openai",
+				"anthropic",
+				"gemini",
+				"tokendance",
+				"CommandCode",
+			],
+			customModels: [RELAY_AUTO_VALUE, RELAY_AUTO_BACKUP].map((value) => ({
+				value,
+				label: value,
+				provider: value.slice(0, value.indexOf(":")),
+			})),
+		},
+	});
+	setNugCachedModels(NUG_ID, [
+		{ id: "upstream:gpt-5.5", channel: "upstream", channelType: "codex", model: "gpt-5.5" },
+	]);
+	registerAutoSourceProbe((provider, value) => autoSourceFacts(provider, Date.now(), value));
+	return { ...fixture, ...resolveProviderAndModel(RELAY_AUTO_VALUE) };
+}
+function nugBalance(key: ProviderKey, remaining: number) {
+	const config = settings.nugProviders?.[0];
+	if (!config) throw new Error("missing balance connection");
+	quotaStore.set(
+		key.id,
+		nugQuotaIdentity(withProviderKey(config, key)),
+		{ fetchedAt: Date.now(), scope: "key", windows: [], balances: [{ unit: "USD", remaining }] },
+		false,
+	);
+}
+function hotRelayAuto(available: boolean): string {
+	const read = spyOn(fs, "readFileSync").mockImplementation(() => {
+		throw new Error("relay eligibility must stay memory-only");
+	});
+	try {
+		expect(autoSourceFacts("poolnug", Date.now(), RELAY_AUTO_VALUE).available).toBe(available);
+		const chosen = resolveEffectiveModel("auto:gpt-5.5", "poolnug");
+		expect(read).not.toHaveBeenCalled();
+		return chosen;
+	} finally {
+		read.mockRestore();
+	}
+}
+
+describe("strict NUG relay candidates shared by real Auto and request selection", () => {
+	test("A's relay and B's money cannot combine into an available sticky source", async () => {
+		const { adapter, model, first, backup } = autoRelayPool();
+		expect(hotRelayAuto(true)).toBe(RELAY_AUTO_VALUE);
+		await drain(adapter.chat(chatParams(model, RELAY_AUTO_SESSION)));
+		requests.length = 0;
+		nugBalance(first, 0);
+		nugBalance(backup, 10);
+		const chosen = hotRelayAuto(false);
+		expect(chosen).toBe(RELAY_AUTO_BACKUP);
+		const alternative = resolveProviderAndModel(chosen);
+		await drain(alternative.adapter.chat(chatParams(alternative.model, RELAY_AUTO_SESSION)));
+		expect(requests.map((request) => request.apiKey)).toEqual(["auto-alternative-key"]);
+		store().update(first.id, { disabled: true });
+		expect(hotRelayAuto(false)).toBe(RELAY_AUTO_BACKUP);
+		await expect(drain(adapter.chat(chatParams(model, RELAY_AUTO_SESSION)))).rejects.toThrow(
+			/no usable API key or eligible transport/,
+		);
+		expect(requests).toHaveLength(1);
+		expect(store().get(backup.id)?.disabled).not.toBe(true);
+		expect(keyCooldown(backup.id)).toBeUndefined();
+	});
+
+	test("an online B excludes the session's old A and sends only through B's matched channel", async () => {
+		const fixture = autoRelayPool();
+		await drain(fixture.adapter.chat(chatParams(fixture.model, RELAY_AUTO_SESSION)));
+		store().reorder(nugKeyOwner(NUG_ID), [fixture.backup.id, fixture.first.id]);
+		saveSettings({ ...settings });
+		const { adapter, model } = resolveProviderAndModel(RELAY_AUTO_VALUE);
+		const live = relayClients.at(-1);
+		if (!live) throw new Error("missing B relay socket");
+		expect(live.options.apiKey).toBe(fixture.backup.apiKey);
+		live.status = "online";
+		live.currentChannelId = "online-B-channel";
+		requests.length = 0;
+		expect(hotRelayAuto(true)).toBe(RELAY_AUTO_VALUE);
+		const events = await drain(adapter.chat(chatParams(model, RELAY_AUTO_SESSION)));
+		expect(events).toEqual([{ text: fixture.backup.apiKey, credentialId: fixture.backup.id }]);
+		expect(requests).toHaveLength(1);
+		expect(new Headers(requests[0]?.headers).get("X-NUG-Relay-Channel")).toBe("online-B-channel");
+		expect(relayClients).toHaveLength(2);
+	});
+
+	test("explicit direct fallback and non-Codex channels keep a funded B usable", async () => {
+		const { first, backup } = autoRelayPool();
+		store().update(first.id, { disabled: true });
+		nugBalance(backup, 10);
+		expect(hotRelayAuto(false)).toBe(RELAY_AUTO_BACKUP);
+		saveSettings({
+			...settings,
+			nugProviders: settings.nugProviders?.map((config) => ({
+				...config,
+				egressAllowDirectFallback: true,
+			})),
+		});
+		let selected = resolveProviderAndModel(RELAY_AUTO_VALUE);
+		expect(hotRelayAuto(true)).toBe(RELAY_AUTO_VALUE);
+		await drain(selected.adapter.chat(chatParams(selected.model, RELAY_AUTO_SESSION)));
+		expect(requests[0]?.apiKey).toBe(backup.apiKey);
+		expect(new Headers(requests[0]?.headers).has("X-NUG-Relay-Channel")).toBe(false);
+		saveSettings({
+			...settings,
+			nugProviders: settings.nugProviders?.map((config) => ({
+				...config,
+				egressAllowDirectFallback: false,
+			})),
+		});
+		setNugCachedModels(NUG_ID, [
+			{ id: "upstream:gpt-5.5", channel: "upstream", channelType: "openai", model: "gpt-5.5" },
+		]);
+		selected = resolveProviderAndModel(RELAY_AUTO_VALUE);
+		expect(hotRelayAuto(true)).toBe(RELAY_AUTO_VALUE);
+		const events = await drain(
+			selected.adapter.chat(chatParams(selected.model, RELAY_AUTO_SESSION)),
+		);
+		expect(events).toEqual([{ text: backup.apiKey, credentialId: backup.id }]);
+		expect(requests.map((request) => request.apiKey)).toEqual([backup.apiKey, backup.apiKey]);
+		expect(store().get(backup.id)?.disabled).not.toBe(true);
+	});
+});
+
 describe("real NUG codex pool relay credential and final transport matching", () => {
 	test("an unavailable relay rejects by default without penalizing its key", async () => {
 		const { adapter, model, first } = relayPool();
 		stopAllNugRelayClients();
-		await expect(relayRequest(adapter, model, "chat")).rejects.toThrow(/no online relay matches/);
+		await expect(relayRequest(adapter, model, "chat")).rejects.toThrow(
+			/no usable API key or eligible transport/,
+		);
 		expect(requests).toEqual([]);
 		expect(store().get(first.id)?.disabled).not.toBe(true);
 	});
@@ -950,16 +1128,28 @@ describe("real NUG codex pool relay credential and final transport matching", ()
 						"forged-A-channel",
 					);
 					expect(constructed.at(-1)?.config.proxy).toEqual(keyNetwork("second").proxy);
+				} else if (select === "reorder B") {
+					// B's priority cannot make it borrow A's relay; keep the eligible A instead.
+					expectRelayResult(
+						await relayRequest(adapter, model, "chat"),
+						"chat",
+						first.apiKey,
+						first.id,
+					);
+					expect(new Headers(requests[0]?.headers).get("X-NUG-Relay-Channel")).toBe(
+						"online-A-channel",
+					);
 				} else {
 					await expect(relayRequest(adapter, model, "chat")).rejects.toThrow(
-						/no online relay matches/,
+						/no usable API key or eligible transport/,
 					);
 					expect(requests).toEqual([]);
 				}
 				expect(store().get(backup.id)?.disabled).not.toBe(true);
-				expect(relayClients).toHaveLength(select === "disable A" ? 1 : 2);
+				expect(relayClients).toHaveLength(select === "reorder B" && fallback ? 2 : 1);
 				expect(relayClients[0]?.options.apiKey).toBe(first.apiKey);
-				if (select === "reorder B") expect(relayClients.at(-1)?.options.apiKey).toBe(backup.apiKey);
+				if (select === "reorder B" && fallback)
+					expect(relayClients.at(-1)?.options.apiKey).toBe(backup.apiKey);
 			});
 		}
 	}

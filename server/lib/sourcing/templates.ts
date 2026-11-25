@@ -15,6 +15,7 @@ import {
 	tokenDanceQuotaIdentity,
 } from "../../services/tokendance-service";
 import type { CommandCodeProviderSettings } from "../agent/commandcode-provider";
+import { isNugRelayEligible } from "../agent/nug-delegate-config";
 import { getCodexCredentialDedupeKeys } from "../codex-credential-dedupe";
 import { getCodexManager, peekCodexManager } from "../codex-manager";
 import { projectCodexUsageSnapshot } from "../codex-usage";
@@ -168,7 +169,7 @@ const ROUTING: Partial<Record<ServiceTemplateId, RoutingBehavior>> = {
 		...keyRouting(
 			(group) => settings.nugProviders?.find((provider) => provider.id === group.id),
 			nugQuotaIdentity,
-			{ streamIdentity: nugQuotaIdentity },
+			{ streamIdentity: nugQuotaIdentity, isEligible: isNugRelayEligible },
 		),
 		isModelAvailable: (group, value) => !resolveKnownUnavailableNugModel(value, group.prefix),
 	},

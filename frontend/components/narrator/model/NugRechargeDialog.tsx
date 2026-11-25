@@ -24,6 +24,7 @@ import type { PaymentRequiredInfo } from "../useNarratorPanelWS";
 
 interface NugBillingOrder {
 	id: string;
+	binding: string;
 	amount: string;
 	quota_amount: string;
 	provider: string;
@@ -144,10 +145,12 @@ export function NugRechargeDialog({
 	});
 
 	const orderQuery = useQuery({
-		queryKey: ["nug", "billing", "order", providerId, order?.id],
-		queryFn: () => api.nugGetBillingOrder(providerId ?? "", order?.id ?? ""),
+		queryKey: ["nug", "billing", "order", providerId, order?.id, order?.binding],
+		queryFn: () => api.nugGetBillingOrder(providerId ?? "", order?.id ?? "", order?.binding ?? ""),
+		retry: false,
 		enabled: opened && !!providerId && !!order?.id && order.status === "pending",
 		refetchInterval: (query) => {
+			if (query.state.error) return false;
 			const status = query.state.data?.order.status ?? order?.status;
 			return status === "pending" ? (config?.pollIntervalMs ?? 3000) : false;
 		},
@@ -162,29 +165,35 @@ export function NugRechargeDialog({
 		resumedRef.current = true;
 		void (async () => {
 			try {
-				const quota = await api.nugGetQuota(providerId);
-				onQuotaUpdated?.(
-					String(quota.balance),
-					quota.totalGranted,
-					quota.detailedQuotaBalance ?? null,
-				);
-				qc.setQueryData(["nug", "quotas"], (old: unknown) => {
-					const quotas = old && typeof old === "object" ? (old as Record<string, unknown>) : {};
-					const existing =
-						quotas[providerId] && typeof quotas[providerId] === "object"
-							? (quotas[providerId] as Record<string, unknown>)
-							: {};
-					return {
-						...quotas,
-						[providerId]: {
-							...existing,
-							balance: quota.balance,
-							totalGranted: quota.totalGranted,
-							detailedQuotaBalance: quota.detailedQuotaBalance ?? null,
-							...(quota.extra !== undefined ? { extra: quota.extra } : {}),
-						},
-					};
+				const quota = await api.nugGetQuota(providerId, undefined, {
+					orderId: order.id,
+					binding: order.binding,
 				});
+				if (quota.paymentCredentialIsPrimary !== false) {
+					onQuotaUpdated?.(
+						String(quota.balance),
+						quota.totalGranted,
+						quota.detailedQuotaBalance ?? null,
+					);
+					qc.setQueryData(["nug", "quotas"], (old: unknown) => {
+						const quotas = old && typeof old === "object" ? (old as Record<string, unknown>) : {};
+						const existing =
+							quotas[providerId] && typeof quotas[providerId] === "object"
+								? (quotas[providerId] as Record<string, unknown>)
+								: {};
+						return {
+							...quotas,
+							[providerId]: {
+								...existing,
+								balance: quota.balance,
+								totalGranted: quota.totalGranted,
+								detailedQuotaBalance: quota.detailedQuotaBalance ?? null,
+								...(quota.extra !== undefined ? { extra: quota.extra } : {}),
+							},
+						};
+					});
+				}
+				qc.invalidateQueries({ queryKey: ["nug", "quotas"] });
 				qc.invalidateQueries({ queryKey: ["nug", "quota", providerId] });
 				qc.invalidateQueries({ queryKey: ["settings"] });
 				qc.invalidateQueries({ queryKey: ["admin", "settings"] });
@@ -332,6 +341,7 @@ export function NugRechargeDialog({
 					</Stack>
 				)}
 
+				{orderQuery.error && <Alert color="red">{orderQuery.error.message}</Alert>}
 				{order && (
 					<Stack align="center">
 						<Group gap="xs">
@@ -346,7 +356,7 @@ export function NugRechargeDialog({
 								{t(`recharge.status_${order.status}`, { defaultValue: order.status })}
 							</Badge>
 						</Group>
-						{order.status === "pending" && payUrl && (
+						{order.status === "pending" && payUrl && !orderQuery.error && (
 							<>
 								{isEmbeddableImageUrl(payUrl) ? (
 									<Box component="img" src={payUrl} alt="payment" maw={260} mah={260} />
@@ -392,8 +402,20 @@ export function NugRechargeDialog({
 								variant="light"
 								onClick={async () => {
 									if (!providerId) return;
-									const data = await api.nugRepayBillingOrder(providerId, order.id);
-									setOrder(data.order);
+									try {
+										const data = await api.nugRepayBillingOrder(
+											providerId,
+											order.id,
+											order.binding,
+										);
+										setOrder(data.order);
+									} catch (err) {
+										notifications.show({
+											color: "red",
+											title: t("recharge.createOrderFailed"),
+											message: err instanceof Error ? err.message : "",
+										});
+									}
 								}}
 							>
 								{t("recharge.repay")}

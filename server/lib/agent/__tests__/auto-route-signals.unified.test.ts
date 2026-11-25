@@ -1,35 +1,58 @@
-import { afterAll, expect, test } from "bun:test";
+import { afterAll, expect, spyOn, test } from "bun:test";
+import * as fs from "node:fs";
 import { seedUnifiedCredentials } from "../../../../tests/unified-credentials";
-import { getProviderKeyStore, resetProviderKeyStoreForTests } from "../../provider-keys";
-import { settings } from "../../settings";
+import {
+	getProviderKeyStore,
+	peekProviderKeyStore,
+	resetProviderKeyStoreForTests,
+} from "../../provider-keys";
+import { saveSettings, settings } from "../../settings";
+import { getSourceGroupByPrefix } from "../../sourcing/source-groups";
 import { autoSourceFacts } from "../auto-route-signals";
 
 const credentials = seedUnifiedCredentials();
-const saved = settings.customApiProviders;
+const saved = structuredClone(settings.customApiProviders);
 const owner = "unified-auto-route";
 afterAll(() => {
-	settings.customApiProviders = saved;
 	getProviderKeyStore().removeProvider(owner);
+	saveSettings({ ...settings, customApiProviders: saved });
 });
 
-test("auto routing observes persisted disabled state after rebuilding the unified store", () => {
-	settings.customApiProviders = [
-		{
-			id: owner,
-			name: "Unified auto",
-			prefix: "unified-auto",
-			apiKey: "",
-			baseUrl: "https://relay.invalid/v1",
-			defaultModel: "m",
-			protocol: "completions-compatible",
-		},
-	];
+test("unified disabled state survives rebuild and Auto reads only the warmed owner view", () => {
+	saveSettings({
+		...settings,
+		customApiProviders: [
+			{
+				id: owner,
+				name: "Unified auto",
+				prefix: "unified-auto",
+				apiKey: "",
+				baseUrl: "https://relay.invalid/v1",
+				defaultModel: "m",
+				protocol: "completions-compatible",
+			},
+		],
+	});
 	const key = getProviderKeyStore().add(owner, { apiKey: "unified-auto-key" });
-	getProviderKeyStore().update(key.id, { disabled: true });
-	resetProviderKeyStoreForTests();
-	expect(autoSourceFacts("unified-auto").available).toBe(false);
-	getProviderKeyStore().update(key.id, { disabled: false });
-	resetProviderKeyStoreForTests();
-	expect(autoSourceFacts("unified-auto").available).toBe(true);
+	for (const disabled of [true, false]) {
+		getProviderKeyStore().update(key.id, { disabled });
+		resetProviderKeyStoreForTests();
+		expect(peekProviderKeyStore()).toBeUndefined();
+		// Startup owns disk reads and warms credentials before the pure routing hot path.
+		const restored = getProviderKeyStore().listGroup(owner);
+		expect(restored).toHaveLength(1);
+		expect(restored[0]?.id).toBe(key.id);
+		expect(!!restored[0]?.disabled).toBe(disabled);
+		expect(getSourceGroupByPrefix("unified-auto")?.id).toBe(owner);
+		const read = spyOn(fs, "readFileSync").mockImplementation(() => {
+			throw new Error("Auto routing must not read credential files");
+		});
+		try {
+			expect(autoSourceFacts("unified-auto").available).toBe(!disabled);
+			expect(read).not.toHaveBeenCalled();
+		} finally {
+			read.mockRestore();
+		}
+	}
 	expect(credentials.written()).toBe(true);
 });
