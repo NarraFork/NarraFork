@@ -43,7 +43,7 @@ type Job = {
 	"timeout-minutes": number;
 	needs?: string[];
 	if?: string;
-	strategy?: { "fail-fast": boolean; matrix: { shard: number[] } };
+	strategy?: { "fail-fast": boolean; matrix: Record<string, number[] | string[]> };
 	steps: Step[];
 	"continue-on-error"?: boolean;
 	env?: Record<string, string>;
@@ -412,7 +412,7 @@ describe("generic CI workflow", () => {
 	});
 
 	test("every auxiliary root typecheck prepares generated routes and extension types first", () => {
-		let checked = 0;
+		const checked: string[] = [];
 		for (const name of [
 			"remote-executor.yml",
 			"file-revert-cross-platform.yml",
@@ -426,7 +426,7 @@ describe("generic CI workflow", () => {
 					(entry) => entry.run?.trim() === "bunx tsgo --noEmit",
 				);
 				if (typecheck < 0) continue;
-				checked++;
+				checked.push(`${name}:${id}`);
 				const before = value.steps.slice(0, typecheck);
 				const install = before.findIndex(
 					(entry) => entry.run?.trim() === "bun install --frozen-lockfile",
@@ -444,7 +444,11 @@ describe("generic CI workflow", () => {
 				}
 			}
 		}
-		expect(checked).toBe(4);
+		expect(checked).toEqual([
+			"remote-executor.yml:integration-typescript",
+			"file-revert-cross-platform.yml:file-revert",
+			"plugin-platform-acceptance.yml:contract-tests",
+		]);
 	});
 	test("enforces migration assets, whole-repository lint, translation and knowledge tree checks", () => {
 		for (const run of [
@@ -540,6 +544,8 @@ describe("generic CI workflow", () => {
 
 	test("installs the exact official Chrome146 build and probes a real headless launch before tests", () => {
 		const install = step("tests", (value) => value.name === "Install and verify pinned Chrome");
+		const installer = readFileSync(join(repository, "scripts/install-ci-chrome.ts"), "utf8");
+		expect(install.run).toBe("bun scripts/install-ci-chrome.ts");
 		for (const required of [
 			'from "@puppeteer/browsers"',
 			'const buildId = "146.0.7680.31"',
@@ -553,13 +559,13 @@ describe("generic CI workflow", () => {
 			"Google Chrome for Testing",
 			"process.env.GITHUB_ENV",
 		])
-			expect(install.run).toContain(required);
+			expect(installer).toContain(required);
 		for (const variable of ["NF_TEST_CHROMIUM_PATH", "PUPPETEER_EXECUTABLE_PATH"])
-			expect(install.run).toContain(`${variable}=\${executablePath}`);
-		expect(install.run?.indexOf("version.stdout.trim() !== expectedVersion")).toBeLessThan(
-			install.run?.indexOf("appendFileSync(environmentFile") ?? -1,
+			expect(installer).toContain(`${variable}=\${executablePath}`);
+		expect(installer.indexOf("version.stdout.trim() !== expectedVersion")).toBeLessThan(
+			installer.indexOf("appendFileSync("),
 		);
-		expect(install.run).not.toMatch(/command -v|latest|buildIdAlias|forceFallback|providers:/);
+		expect(installer).not.toMatch(/command -v|latest|buildIdAlias|forceFallback|providers:/);
 		expect(install.if).toBeUndefined();
 		const probe = step("tests", (value) => !!value.run?.includes("puppeteer.launch"));
 		expect(probe.run).toContain("process.env.PUPPETEER_EXECUTABLE_PATH");
@@ -571,6 +577,8 @@ describe("generic CI workflow", () => {
 			"devtools.timeline",
 			"disabled-by-default-v8.gc",
 			"blink.user_timing",
+			"dumpio: true",
+			"timeout: 15000",
 		])
 			expect(probe.run).toContain(required);
 		expect(probe.run).toContain("await page.goto(");
@@ -584,6 +592,94 @@ describe("generic CI workflow", () => {
 		expect(steps.indexOf(probe)).toBeLessThan(
 			steps.indexOf(command("tests", "bun test --isolate tests/preload-isolation.test.ts")),
 		);
+		const plugin = Bun.YAML.parse(
+			readFileSync(join(repository, ".github/workflows/plugin-platform-acceptance.yml"), "utf8"),
+		) as Workflow;
+		for (const event of ["push", "pull_request"])
+			expect(plugin.on[event]?.paths).toContain("scripts/install-ci-chrome.ts");
+		for (const id of ["contract-tests", "browser-smoke"]) {
+			const steps = plugin.jobs[id].steps;
+			const setup = steps.find((value) => value.name === "Install and verify pinned Chrome");
+			const probe = steps.find((value) => value.name === "Probe headless Chrome");
+			expect(setup?.run).toBe(install.run);
+			expect(setup?.if).toBeUndefined();
+			expect(
+				steps.findIndex((value) => value.name === "Install and verify pinned Chrome"),
+			).toBeLessThan(steps.findIndex((value) => value.name === "Probe headless Chrome"));
+			for (const required of [
+				"dumpio: true",
+				"timeout: 15000",
+				"await page.goto(",
+				"await browser.close()",
+			])
+				expect(probe?.run).toContain(required);
+			expect(probe?.if).toBeUndefined();
+			expect(steps.map((value) => value.run).join("\n")).not.toContain("command -v google-chrome");
+		}
+	});
+
+	test("plugin types have a required owner while every native security platform remains mandatory", () => {
+		const plugin = Bun.YAML.parse(
+			readFileSync(join(repository, ".github/workflows/plugin-platform-acceptance.yml"), "utf8"),
+		) as Workflow;
+		const contract = plugin.jobs["contract-tests"];
+		const typecheck = contract.steps.find((value) => value.name === "Check TypeScript");
+		expect(typecheck?.run).toBe("bunx tsgo --noEmit");
+		expect(typecheck?.if).toBeUndefined();
+		expect(typecheck?.["continue-on-error"]).toBeUndefined();
+		expect(contract.if).toBeUndefined();
+		expect(contract["continue-on-error"]).toBeUndefined();
+		const native = plugin.jobs["cross-platform-security"];
+		expect(native.strategy).toEqual({
+			"fail-fast": false,
+			matrix: { os: ["ubuntu-latest", "macos-latest", "windows-latest"] },
+		});
+		expect(native["runs-on"]).toBe(expression("matrix.os"));
+		expect(native["timeout-minutes"]).toBe(20);
+		expect(native.if).toBeUndefined();
+		expect(native["continue-on-error"]).toBeUndefined();
+		expect(native.steps.some((value) => value.run?.includes("tsgo --noEmit"))).toBe(false);
+		const security = native.steps.find(
+			(value) => value.name === "Run path and runner security tests",
+		);
+		expect(security?.if).toBeUndefined();
+		expect(security?.["continue-on-error"]).toBeUndefined();
+		expect(security?.run).toContain("bun test --isolate");
+		for (const path of [
+			"server/lib/agent/execution/__tests__/local-backend-read.test.ts",
+			"tests/server/services/plugin-manager.test.ts",
+			"tests/server/services/plugin-runtime-windows-job.test.ts",
+			"server/lib/plugins/windows-plugin-launcher.compiled.test.ts",
+			"server/services/__tests__/plugin-podman-runner.test.ts",
+			"server/services/__tests__/plugin-process-runner.test.ts",
+			"server/services/__tests__/plugin-signature.test.ts",
+			"server/services/__tests__/plugin-sbom.test.ts",
+		])
+			expect(security?.run).toContain(path);
+		const gate = plugin.jobs["plugin-platform-gate"];
+		expect(gate.if).toBe("always()");
+		expect(gate.needs).toContain("contract-tests");
+		expect(gate.needs).toContain("cross-platform-security");
+		const script = gate.steps.find(
+			(value) => value.name === "Require every acceptance lane to pass",
+		)?.run;
+		expect(script).toBeDefined();
+		for (const [change, success] of [
+			[{}, true],
+			[{ CONTRACT: "failure" }, false],
+			[{ CROSS_PLATFORM: "skipped" }, false],
+		] as const) {
+			const result = shell(script ?? "", {
+				CONTRACT: "success",
+				HARDENING: "success",
+				CROSS_PLATFORM: "success",
+				RELEASE: "success",
+				BROWSER: "success",
+				...change,
+			});
+			expect(result.error).toBeUndefined();
+			expect(result.status === 0).toBe(success);
+		}
 	});
 
 	test("a missing or failing pinned Chrome installer cannot export a browser environment", () => {
@@ -602,6 +698,55 @@ describe("generic CI workflow", () => {
 		expect(broken.error).toBeUndefined();
 		expect(broken.status).toBe(42);
 		expect(existsSync(githubEnv)).toBe(false);
+		for (const [name, status, stdout] of [
+			["failed-version", 1, ""],
+			["wrong-version", 0, "Google Chrome 158.0.8127.36\n"],
+			["verified-version", 0, "Google Chrome for Testing 146.0.7680.31\n"],
+		] as const) {
+			const environmentFile = join(root, name);
+			const executablePath = join(root, `${name}-chrome`);
+			writeFileSync(
+				executablePath,
+				`#!${process.execPath}\nprocess.stdout.write(${JSON.stringify(stdout)}); process.exit(${status});\n`,
+				{ mode: 0o700 },
+			);
+			const result = spawnSync(
+				process.execPath,
+				[
+					"--eval",
+					`
+				import { mock } from "bun:test";
+				mock.module("@puppeteer/browsers", () => ({
+					Browser: { CHROME: "chrome" },
+					install: async () => ({ executablePath: ${JSON.stringify(executablePath)} }),
+				}));
+				await import(${JSON.stringify(join(repository, "scripts/install-ci-chrome.ts"))});
+			`,
+				],
+				{
+					cwd: repository,
+					env: { ...process.env, RUNNER_TEMP: root, GITHUB_ENV: environmentFile },
+					encoding: "utf8",
+					timeout: 5000,
+					maxBuffer: 8192,
+				},
+			);
+			expect(result.error).toBeUndefined();
+			if (name === "verified-version") {
+				expect(result.status).toBe(0);
+				expect(readFileSync(environmentFile, "utf8")).toBe(
+					`NF_TEST_CHROMIUM_PATH=${executablePath}\nPUPPETEER_EXECUTABLE_PATH=${executablePath}\n`,
+				);
+			} else {
+				expect(result.status).not.toBe(0);
+				expect(result.stderr).toContain(
+					name === "failed-version"
+						? "Chrome version command failed"
+						: "Expected Google Chrome for Testing",
+				);
+				expect(existsSync(environmentFile)).toBe(false);
+			}
+		}
 	});
 
 	test("covers all four native shards without fail-fast or artifact name collisions", () => {

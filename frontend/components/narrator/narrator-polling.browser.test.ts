@@ -1,10 +1,11 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
+import { createServer, type Socket } from "node:net";
 import { basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { BackgroundTaskListItem } from "@shared/background-task-list";
 import type { RuntimeSettings } from "@shared/settings-runtime";
-import puppeteer, { type Browser, type Page } from "puppeteer-core";
+import puppeteer, { type Browser, type HTTPRequest, type Page } from "puppeteer-core";
 import type { UIPreferences } from "../../lib/api/settings";
 import type * as Fixture from "./narrator-polling.browser-fixture";
 
@@ -219,6 +220,84 @@ function counts() {
 			.map((path) => [path, requests.filter((item) => item === path).length]),
 	);
 }
+const requestDrains = new WeakMap<Page, () => Promise<void>>();
+function observeNetwork(page: Page, origin: string) {
+	const errors: string[] = [];
+	const network: string[] = [];
+	const finished: string[] = [];
+	const failed: Array<{ request: string; error: string | undefined }> = [];
+	const cached: string[] = [];
+	const outside: string[] = [];
+	const pending = new Map<HTTPRequest, ReturnType<typeof Promise.withResolvers<void>>>();
+	const key = (request: HTTPRequest) => `${request.method()} ${new URL(request.url()).pathname}`;
+	page.on("pageerror", (error) => errors.push(String(error)));
+	page.on("request", (request) => {
+		const url = new URL(request.url());
+		if (url.origin !== origin) outside.push(url.href);
+		if (url.pathname.startsWith("/api/")) {
+			network.push(key(request));
+			pending.set(request, Promise.withResolvers<void>());
+		}
+	});
+	const complete = (request: HTTPRequest, didFail: boolean) => {
+		if (!new URL(request.url()).pathname.startsWith("/api/")) return;
+		const completion = pending.get(request);
+		if (!completion) {
+			errors.push(`Request terminal event without a start: ${key(request)}`);
+			return;
+		}
+		if (didFail) failed.push({ request: key(request), error: request.failure()?.errorText });
+		else finished.push(key(request));
+		pending.delete(request);
+		completion.resolve();
+	};
+	page.on("requestfinished", (request) => complete(request, false));
+	page.on("requestfailed", (request) => complete(request, true));
+	page.on("requestservedfromcache", (request) => {
+		if (new URL(request.url()).pathname.startsWith("/api/")) cached.push(key(request));
+	});
+	const drain = async () => {
+		if (!pending.size) return;
+		let deadline: ReturnType<typeof setTimeout> | undefined;
+		try {
+			await Promise.race([
+				(async () => {
+					while (pending.size)
+						await Promise.all([...pending.values()].map(({ promise }) => promise));
+				})(),
+				new Promise<never>((_, reject) => {
+					deadline = setTimeout(
+						() => reject(new Error("Browser API requests did not finish")),
+						5_000,
+					);
+				}),
+			]);
+		} finally {
+			clearTimeout(deadline);
+		}
+	};
+	requestDrains.set(page, drain);
+	return { network, finished, failed, cached, outside, errors, drain };
+}
+
+function assertCrossPlaneTraffic(traffic: ReturnType<typeof observeNetwork>, arrivals: string[]) {
+	const { network, finished, failed, cached } = traffic;
+	expect([...network].sort()).toEqual(
+		[...finished, ...failed.map(({ request }) => request)].sort(),
+	);
+	expect(cached).toEqual([]);
+	expect(failed.filter(({ error }) => error !== "net::ERR_ABORTED")).toEqual([]);
+	// CDP counts logical requests, not wire attempts: Chromium can transparently
+	// retry a GET on a closed keep-alive connection. An aborted read may never
+	// reach the server. Keep exact endpoint coverage and require every completed,
+	// non-cached GET to have a real arrival; do not equate those two multisets.
+	expect([...new Set(network)].sort()).toEqual([...new Set(arrivals)].sort());
+	for (const request of new Set(finished))
+		expect(arrivals.filter((arrival) => arrival === request).length).toBeGreaterThanOrEqual(
+			finished.filter((completed) => completed === request).length,
+		);
+}
+
 async function openPage() {
 	if (!server || !browser) throw new Error("Browser fixture not initialized");
 	requests.length = 0;
@@ -227,23 +306,19 @@ async function openPage() {
 	phase = "off";
 	status = "working";
 	const page = await browser.newPage();
-	const errors: string[] = [];
-	const network: string[] = [];
-	const outside: string[] = [];
-	page.on("pageerror", (error) => errors.push(String(error)));
-	page.on("request", (request) => {
-		const url = new URL(request.url());
-		if (url.origin !== server?.url.origin) outside.push(url.href);
-		if (url.pathname.startsWith("/api/")) network.push(`${request.method()} ${url.pathname}`);
-	});
+	await page.setCacheEnabled(false);
+	const traffic = observeNetwork(page, server.url.origin);
 	await page.goto(server.url.origin, { waitUntil: "networkidle0", timeout: 30_000 });
 	await page.evaluate(() => (window as unknown as FixtureWindow).fixture.start("fixture"));
 	await page.waitForSelector('[data-ready="true"]');
 	await settle(page);
-	return { page, errors, network, outside };
+	return { page, ...traffic };
 }
 async function settle(page: Page) {
 	await page.evaluate(() => (window as unknown as FixtureWindow).fixture.settle());
+	// Query cancellation can settle before the real transport's aborted/completed
+	// events arrive. Drain those existing events, not an additional fixed sleep.
+	await requestDrains.get(page)?.();
 }
 async function emit(page: Page, frame: Record<string, unknown>) {
 	await page.evaluate(
@@ -252,12 +327,92 @@ async function emit(page: Page, frame: Record<string, unknown>) {
 	);
 }
 
+test("Chromium transparently retries a keep-alive GET without another logical request", async () => {
+	if (!browser) throw new Error("Browser fixture not initialized");
+	const arrivals: string[] = [];
+	const ports: Array<number | undefined> = [];
+	const sockets = new Set<Socket>();
+	const tcp = createServer((socket) => {
+		sockets.add(socket);
+		socket.on("close", () => sockets.delete(socket));
+		let buffered = "";
+		socket.on("data", (data) => {
+			buffered += data.toString();
+			if (buffered.length > 8192) return socket.destroy();
+			while (buffered.includes("\r\n\r\n")) {
+				const end = buffered.indexOf("\r\n\r\n");
+				const [line] = buffered.slice(0, end).split("\r\n");
+				buffered = buffered.slice(end + 4);
+				const [method, path] = line.split(" ");
+				if (path.startsWith("/api/")) {
+					arrivals.push(`${method} ${path}`);
+					ports.push(socket.remotePort);
+					// Close a reused connection after receiving GET but before headers.
+					// Chromium retries this idempotent request below the CDP start layer.
+					if (arrivals.length === 2) return socket.destroy();
+				}
+				const body = path === "/" ? "<!doctype html><body>retry fixture</body>" : "{}";
+				socket.write(
+					`HTTP/1.1 200 OK\r\nContent-Length: ${Buffer.byteLength(body)}\r\nContent-Type: ${path === "/" ? "text/html" : "application/json"}\r\nCache-Control: no-store\r\nConnection: keep-alive\r\n\r\n${body}`,
+				);
+			}
+		});
+	});
+	await new Promise<void>((resolve) => tcp.listen(0, "127.0.0.1", resolve));
+	let page: Page | undefined;
+	try {
+		const address = tcp.address();
+		if (!address || typeof address === "string") throw new Error("Missing retry fixture address");
+		const origin = `http://127.0.0.1:${address.port}`;
+		page = await browser.newPage();
+		await page.setCacheEnabled(false);
+		const traffic = observeNetwork(page, origin);
+		await page.goto(origin, { waitUntil: "networkidle0", timeout: 5_000 });
+		const values = await page.evaluate(async () => {
+			const values: string[] = [];
+			for (let i = 0; i < 2; i++)
+				values.push(
+					await (
+						await fetch("/api/system/unattended", { signal: AbortSignal.timeout(5_000) })
+					).text(),
+				);
+			return values;
+		});
+		await traffic.drain();
+		expect(values).toEqual(["{}", "{}"]);
+		expect(traffic.network).toHaveLength(2);
+		expect(traffic.finished).toHaveLength(2);
+		expect(traffic.failed).toEqual([]);
+		expect(arrivals).toHaveLength(3);
+		expect(ports[1]).not.toBe(ports[2]);
+		assertCrossPlaneTraffic(traffic, arrivals);
+		expect(traffic.errors).toEqual([]);
+		expect(traffic.outside).toEqual([]);
+		console.info("polling keep-alive retry evidence", {
+			logicalStarts: traffic.network.length,
+			finished: traffic.finished.length,
+			wireArrivals: arrivals.length,
+		});
+	} finally {
+		try {
+			await page?.close();
+		} finally {
+			for (const socket of sockets) socket.destroy();
+			await new Promise<void>((resolve, reject) =>
+				tcp.close((error) => (error ? reject(error) : resolve())),
+			);
+		}
+	}
+}, 15_000);
+
 // No production hook is mocked: this includes the real panel subscription, detail
 // observer, actual inbox component and two device/global observers sharing a cache.
 test("online narrator has no API polling across 120s of interval time and status/reasoning noise", async () => {
-	const { page, errors, network, outside } = await openPage();
+	const traffic = await openPage();
+	const { page, errors, network, outside } = traffic;
 	try {
 		const baseline = counts();
+		const browserBaseline = [...network];
 		expect(Object.keys(baseline).sort()).toEqual([
 			"GET /api/auth/me",
 			"GET /api/narrators/fixture",
@@ -301,7 +456,8 @@ test("online narrator has no API polling across 120s of interval time and status
 		expect(report.clock).toBe(120_000);
 		expect(report.canaries).toEqual({ fiveSeconds: 24, sixtySeconds: 2 });
 		expect(counts()).toEqual(baseline);
-		expect([...network].sort()).toEqual([...requests].sort());
+		expect(network).toEqual(browserBaseline);
+		assertCrossPlaneTraffic(traffic, requests);
 		expect(errors).toEqual([]);
 		expect(unexpected).toEqual([]);
 		expect(outside).toEqual([]);
@@ -310,6 +466,8 @@ test("online narrator has no API polling across 120s of interval time and status
 			baseline,
 			"canaries:",
 			report.canaries,
+			"browser:",
+			{ starts: network.length, finished: traffic.finished.length, failed: traffic.failed },
 		);
 	} finally {
 		try {
@@ -321,7 +479,8 @@ test("online narrator has no API polling across 120s of interval time and status
 }, 30_000);
 
 test("real control-plane changes, reconnect and foreground trigger bounded HTTP reads", async () => {
-	const { page, errors, network, outside } = await openPage();
+	const traffic = await openPage();
+	const { page, errors, network, outside } = traffic;
 	try {
 		const baseline = counts();
 		devices = 1;
@@ -403,12 +562,14 @@ test("real control-plane changes, reconnect and foreground trigger bounded HTTP 
 		]) {
 			expect(afterForeground[path] - afterReconnect[path]).toBe(1);
 		}
+		const browserBeforeIdle = [...network];
 		await page.evaluate(() =>
 			(window as unknown as FixtureWindow).fixture.advanceIntervals(120_000),
 		);
 		await settle(page);
 		expect(counts()).toEqual(afterForeground);
-		expect([...network].sort()).toEqual([...requests].sort());
+		expect(network).toEqual(browserBeforeIdle);
+		assertCrossPlaneTraffic(traffic, requests);
 		expect(errors).toEqual([]);
 		expect(unexpected).toEqual([]);
 		expect(outside).toEqual([]);

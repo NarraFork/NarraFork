@@ -1,7 +1,6 @@
 // Codex Credential Manager — multi-account support with failover and load balancing
 // Manages ChatGPT Pro/Plus OAuth tokens for the codex provider
 
-import { createHash } from "node:crypto";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { resolve } from "node:path";
 import {
@@ -38,6 +37,7 @@ import {
 	startBrowserOAuth,
 	startDeviceCodeFlow,
 } from "./codex-auth";
+import { getCodexCredentialDedupeKeys as getCredentialDedupeKeys } from "./codex-credential-dedupe";
 import { isCodexPersonalAccessToken } from "./codex-pat";
 import {
 	CodexUsageFetchError,
@@ -526,10 +526,6 @@ export function codexFromCredential(c: Credential): CodexCredential {
 
 // === Helpers ===
 
-function sha256Hex(input: string): string {
-	return createHash("sha256").update(input).digest("hex");
-}
-
 const EMAIL_SEARCH_PATTERN = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i;
 const AT_MARKER_DISPLAY_PATTERN = /(?:^|-{4,})\s*at\s*(?:-{4,}|$)/i;
 const REFRESH_TOKEN_DISPLAY_PATTERN = /rt_[A-Za-z0-9._-]+/;
@@ -608,24 +604,6 @@ function normalizeExpiresAt(value: unknown): number | undefined {
 	if (Number.isFinite(numeric)) return normalizeExpiresAt(numeric);
 	const parsed = Date.parse(value);
 	return Number.isFinite(parsed) ? parsed : undefined;
-}
-
-function getCredentialDedupeKeys(
-	cred: Pick<
-		CodexCredential,
-		"refreshToken" | "accessToken" | "accountId" | "email" | "sub" | "agentRuntimeId"
-	>,
-): string[] {
-	const keys: string[] = [];
-	const refreshToken = getRefreshToken(cred);
-	const accessToken = getAccessToken(cred);
-	const agentRuntimeId = normalizeOptionalString(cred.agentRuntimeId);
-	if (agentRuntimeId) keys.push(`agent:${agentRuntimeId}`);
-	if (refreshToken) keys.push(`rt:${sha256Hex(refreshToken)}`);
-	if (cred.sub) keys.push(`sub:${cred.sub}`);
-	if (cred.accountId && cred.email) keys.push(`account-email:${cred.accountId}:${cred.email}`);
-	if (accessToken) keys.push(`at:${sha256Hex(accessToken)}`);
-	return keys;
 }
 
 function isExpired(cred: CodexCredential): boolean {
@@ -2739,6 +2717,11 @@ export class CodexManager {
 
 	// ==================== Accessors ====================
 
+	/** Read-only credential ids for quota projection; never builds status/forecast state. */
+	get quotaCredentialIds(): string[] {
+		return this.poolEntries.map((entry) => entry.id);
+	}
+
 	/** The live usage projection's source; no forecast, network request or write. */
 	usageOf(id: string): CodexUsageResult | undefined {
 		return this.entries.find((entry) => entry.id === id)?.usage;
@@ -2821,6 +2804,11 @@ export class CodexManager {
 // === Singleton ===
 
 let _instance: CodexManager | undefined;
+
+/** Routing reads only an already-loaded manager, never credentials from disk. */
+export function peekCodexManager(): CodexManager | undefined {
+	return _instance;
+}
 
 export function getCodexManager(): CodexManager {
 	if (!_instance) {

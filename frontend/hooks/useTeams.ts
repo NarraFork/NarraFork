@@ -12,6 +12,7 @@ import type { CreateTeamPayload, UpgradeToTeamPayload } from "@frontend/lib/api/
 import {
 	TEAM_WORK_STATS_IDS_MAX,
 	type TeamBoardColumn,
+	type TeamSettingsPatch,
 	type TeamWorkStatsResponse,
 } from "@shared/project-teams";
 import {
@@ -34,6 +35,7 @@ import {
 } from "../components/teams/team-page-model";
 import { api } from "../lib/api";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
+import { projectOverviewKeys } from "./useProjectOverview";
 
 const TEAM_GC_TIME_MS = 60_000;
 
@@ -353,7 +355,13 @@ export function useTeamWorkStats(projectId: string, teamId: string, ids: readonl
 	});
 }
 
-/** The work item drawer's detail; read only while the drawer shows that item. */
+/** How often the drawer reads again while a merge job runs. */
+const MERGE_POLL_MS = 1_500;
+
+/**
+ * The work item drawer's detail; read only while the drawer shows that item. While a merge job
+ * runs it is read again every {@link MERGE_POLL_MS} until the job is done.
+ */
 export function useTeamWorkItem(projectId: string, teamId: string, itemId: string | null) {
 	return useQuery({
 		queryKey: teamKeys.workItem(teamId, itemId ?? ""),
@@ -361,6 +369,30 @@ export function useTeamWorkItem(projectId: string, teamId: string, itemId: strin
 		enabled: !!projectId && !!teamId && !!itemId,
 		gcTime: TEAM_GC_TIME_MS,
 		refetchOnWindowFocus: false,
+		refetchInterval: (query) => (query.state.data?.merge?.phase ? MERGE_POLL_MS : false),
+	});
+}
+
+/**
+ * Merge a ready item, or fast-forward its prepared merge (members). Both answer at once (202);
+ * the drawer and the board follow the job.
+ */
+export function useMergeWorkItem(projectId: string, teamId: string) {
+	const queryClient = useQueryClient();
+	return useMutation({
+		mutationFn: ({ itemId, fastForward }: { itemId: string; fastForward?: boolean }) =>
+			fastForward
+				? api.fastForwardTeamWorkItem(projectId, teamId, itemId)
+				: api.mergeTeamWorkItem(projectId, teamId, itemId),
+		meta: { suppressErrorToast: true },
+		onSettled: () => {
+			void queryClient.invalidateQueries({ queryKey: teamKeys.summary(teamId) });
+			void queryClient.invalidateQueries({ queryKey: [...teamKeys.page(teamId), "board"] });
+			void queryClient.invalidateQueries({ queryKey: teamKeys.work(teamId) });
+			void queryClient.invalidateQueries({ queryKey: teamKeys.activity(teamId) });
+			// The project page's 等你处理 carries ready items of every team.
+			void queryClient.invalidateQueries({ queryKey: projectOverviewKeys.attention(projectId) });
+		},
 	});
 }
 
@@ -417,7 +449,7 @@ export function useArchiveTeam(projectId: string, teamId: string) {
 export function useUpdateTeam(projectId: string, teamId: string) {
 	const queryClient = useQueryClient();
 	return useMutation({
-		mutationFn: (patch: { baseBranch?: string; brief?: string }) =>
+		mutationFn: (patch: { baseBranch?: string; brief?: string; settings?: TeamSettingsPatch }) =>
 			api.updateProjectTeam(projectId, teamId, patch),
 		meta: { suppressErrorToast: true },
 		onSuccess: (team) => {

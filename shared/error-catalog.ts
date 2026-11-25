@@ -215,6 +215,15 @@ export const ERROR_CATALOG = {
 		code: "GIT_AUTH_REQUIRED",
 		en: "Git authentication required",
 	},
+	/**
+	 * A partial clone or promisor remote on a git that cannot be kept from fetching missing
+	 * objects through it (`GIT_NO_LAZY_FETCH` needs git 2.45): teams refuse the repository.
+	 */
+	GIT_TOO_OLD_FOR_PARTIAL_CLONE: {
+		status: 409,
+		code: "GIT_TOO_OLD_FOR_PARTIAL_CLONE",
+		en: "This repository is a partial clone (or names a promisor remote) and this git cannot be kept from fetching missing objects through it (GIT_NO_LAZY_FETCH needs git 2.45); update git to use it with teams",
+	},
 	GIT_REQUEST_CANCELLED: {
 		status: 499,
 		code: "GIT_REQUEST_CANCELLED",

@@ -9,8 +9,10 @@ import type {
 	TeamMembersResponse,
 	TeamPageSummary,
 	TeamRunningResponse,
+	TeamSettingsPatch,
 	TeamWorkFileDiff,
 	TeamWorkItemDetail,
+	TeamWorkMergeResponse,
 	TeamWorkReturnResponse,
 	TeamWorkStatsResponse,
 } from "@shared/project-teams";
@@ -108,7 +110,7 @@ export const teamsApi = {
 	updateProjectTeam: (
 		projectId: string,
 		teamId: string,
-		patch: { baseBranch?: string; brief?: string },
+		patch: { baseBranch?: string; brief?: string; settings?: TeamSettingsPatch },
 	) =>
 		request<TeamDetail>(teamBase(projectId, teamId), {
 			method: "PATCH",
@@ -137,5 +139,17 @@ export const teamsApi = {
 		request<TeamWorkReturnResponse>(
 			`${teamBase(projectId, teamId)}/work/${encodeURIComponent(itemId)}/return`,
 			{ method: "POST", body: JSON.stringify({ reason }) },
+		),
+	/** Merge a ready work item into its base (members): accepted, runs in the background. */
+	mergeTeamWorkItem: (projectId: string, teamId: string, itemId: string) =>
+		request<TeamWorkMergeResponse>(
+			`${teamBase(projectId, teamId)}/work/${encodeURIComponent(itemId)}/merge`,
+			{ method: "POST" },
+		),
+	/** Fast-forward a prepared merge in the checkout its base is checked out in (members). */
+	fastForwardTeamWorkItem: (projectId: string, teamId: string, itemId: string) =>
+		request<TeamWorkMergeResponse>(
+			`${teamBase(projectId, teamId)}/work/${encodeURIComponent(itemId)}/merge/fast-forward`,
+			{ method: "POST" },
 		),
 };

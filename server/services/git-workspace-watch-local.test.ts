@@ -1,4 +1,4 @@
-import { Database } from "bun:sqlite";
+import { Database, SQLiteError } from "bun:sqlite";
 import { expect, mock, test } from "bun:test";
 import { execFile } from "node:child_process";
 import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -159,19 +159,55 @@ test("WAL-only external transactions refresh all affected groups and carry the p
 	const f = await fixture();
 	const observe = observer(f);
 	let db: Database | undefined;
+	let blocker: Database | undefined;
 	try {
 		await waitFor(() => observe.probes() >= 2);
 		await settleGitStagingWatch(f.root);
+		const before = await f.service.summary();
 		db = new Database(join(f.directory, "changelists.sqlite"));
-		db.exec("PRAGMA wal_autocheckpoint=0");
+		const external = db;
+		external.exec("PRAGMA wal_autocheckpoint=0");
 		const main = await readFile(join(f.directory, "changelists.sqlite"));
-		db.transaction(() => {
-			db?.query("UPDATE change_lists SET name='external name'").run();
-			db?.query("UPDATE workspace_state SET generation=generation+1").run();
-		})();
+		const tryWrite = (write: () => void) => {
+			try {
+				write();
+				return true;
+			} catch (error) {
+				if (!(error instanceof SQLiteError) || error.code !== "SQLITE_BUSY") throw error;
+				return false;
+			}
+		};
+		blocker = new Database(join(f.directory, "changelists.sqlite"));
+		const lock = blocker;
+		await waitFor(() => tryWrite(() => lock.exec("BEGIN IMMEDIATE")));
+		const firstBusy = Promise.withResolvers<void>();
+		// Release only after a real lock conflict; waitFor yields before retrying the whole transaction.
+		const released = firstBusy.promise.then(() => lock.exec("ROLLBACK"));
+		let busyRetries = 0;
+		let transactionRuns = 0;
+		const update = external.transaction(() => {
+			transactionRuns++;
+			external.query("UPDATE change_lists SET name='external name'").run();
+			external.query("UPDATE workspace_state SET generation=generation+1").run();
+		});
+		await waitFor(() => {
+			const committed = tryWrite(() => update.immediate());
+			if (!committed) {
+				expect(external.inTransaction).toBe(false);
+				busyRetries++;
+				firstBusy.resolve();
+			}
+			return committed;
+		});
+		expect(busyRetries).toBeGreaterThan(0);
+		await released;
+		expect(transactionRuns).toBe(1);
+		expect(external.inTransaction).toBe(false);
 		expect(await readFile(join(f.directory, "changelists.sqlite"))).toEqual(main);
 		await waitFor(() => observe.events.some((event) => event.generation !== undefined));
 		const latest = await f.service.summary();
+		expect(latest.generation).toBe(before.generation + 1);
+		expect(latest.lists.map((list) => list.name)).toEqual(before.lists.map(() => "external name"));
 		expect(observe.events.at(-1)).toMatchObject({
 			metadataChanged: true,
 			generation: latest.generation,
@@ -179,6 +215,8 @@ test("WAL-only external transactions refresh all affected groups and carry the p
 			affectedListIds: latest.lists.map((list) => list.id),
 		});
 	} finally {
+		if (blocker?.inTransaction) blocker.exec("ROLLBACK");
+		blocker?.close();
 		await observe.close();
 		db?.close();
 		await f.close();

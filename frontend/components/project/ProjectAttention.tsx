@@ -34,6 +34,7 @@ export function ProjectAttention({
 		<TeamAttention
 			// Query keys of the detail reads and decisions: scoped to the project page.
 			teamId={`project:${projectId}`}
+			projectId={projectId}
 			base="main"
 			stats={undefined}
 			entries={entries}

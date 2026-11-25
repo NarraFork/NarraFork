@@ -25,7 +25,7 @@ export const credentialTransferRoutes = new Hono();
 credentialTransferRoutes.use("*", requireAdmin);
 
 const selectionSchema = z
-	.array(z.object({ kind: z.string().min(1).max(40), id: z.string().min(1).max(100) }))
+	.array(z.object({ kind: z.string().min(1).max(40), id: z.string().min(1).max(300) }))
 	.max(2000);
 const exportSchema = z.object({
 	stepUpToken: z.string().min(1).max(200),
@@ -52,8 +52,8 @@ async function withBundleErrors<T>(run: () => Promise<T>): Promise<T> {
 	}
 }
 
-credentialTransferRoutes.get("/credentials", (c) =>
-	c.json({ credentials: listTransferableCredentials() }),
+credentialTransferRoutes.get("/credentials", async (c) =>
+	c.json({ credentials: await listTransferableCredentials() }),
 );
 
 credentialTransferRoutes.post("/export", async (c) => {

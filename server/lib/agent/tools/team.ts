@@ -193,7 +193,7 @@ export function syncNextAction(
 	switch (delivery) {
 		case "started":
 		case "queued":
-			return `The worker ("${label}") was told to merge the base into its branch and report; nothing was merged on the server. Wait for its report.`;
+			return `The worker ("${label}") was told to merge the base into its branch and report; the server did not touch the branch. Wait for its report.`;
 		case "blocked":
 			return `The worker ("${label}") is stopped (a person stopped its last turn, or it ended with an error): the instruction is stored but it will not act on it. A person must resume it, or delegate the sync to another worker with Agent({ workdir: <the item's worktree>, prompt: instruction }).`;
 		case "wake_failed":
@@ -416,8 +416,9 @@ export const teamTool: ToolDefinition = {
 		"work.update replaces a queued item's dependsOn; " +
 		"work.review records one review round (verdict, findings, a short summary of them, reviewer); work.ready marks an item done after a clear review " +
 		"(refused while its worktree has uncommitted changes, or, in a repository with knowledge/index.md, while the branch changed code a knowledge node anchors without updating that node, or added a source file no node anchors: details lists them for the worker to fix); " +
-		"work.sync tells the item's worker to merge the base into its branch with a merge commit (never on the server, never a rebase); " +
+		"work.sync tells the item's worker to merge the base into its branch with a merge commit (never on the server, never a rebase); it brings in origin/<base> or the local base, as the team's settings say; " +
 		"work.cancel stops tracking an item; cleanup removes a cancelled or merged item's worktree (never its branch) and always asks a person; " +
+		"merging a ready item into the base is a member's action on the team page, never this tool's: you get a note when it lands or conflicts, and review, ready, sync and cancel are refused with TEAM_WORK_ITEM_MERGING while it runs; " +
 		"brief reads or replaces the team brief every subagent follows; decision records a decision taken on people's behalf; " +
 		"checkin schedules one wake-up of this session after N minutes.",
 	parameters: teamToolParameters,

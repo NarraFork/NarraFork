@@ -73,7 +73,10 @@ function manifestInput(): ManifestInput {
 	};
 }
 
-function snapshotFor(manifest: Manifest): PluginCatalogSnapshot {
+function snapshotFor(
+	manifest: Manifest,
+	contributions?: PluginContributionSummary[],
+): PluginCatalogSnapshot {
 	const contribution: PluginContributionSummary = {
 		pluginId,
 		version: manifest.version,
@@ -104,7 +107,7 @@ function snapshotFor(manifest: Manifest): PluginCatalogSnapshot {
 			server: { entry: manifest.server?.entry ?? "server/index.js", protocol: "narrafork.rpc/1" },
 			activationEvents: [...manifest.activationEvents],
 		},
-		contributions: [contribution],
+		contributions: contributions ?? [contribution],
 		diagnostics: [],
 	};
 	const plugin: PluginCatalogPlugin = {
@@ -112,7 +115,7 @@ function snapshotFor(manifest: Manifest): PluginCatalogSnapshot {
 		status: "compatible",
 		current: { version: packageSummary.version, hash },
 		packages: [packageSummary],
-		contributions: [contribution],
+		contributions: contributions ?? [contribution],
 		diagnostics: [],
 	};
 	return {
@@ -143,6 +146,103 @@ function state(
 }
 
 describe("PluginContributionCoordinator", () => {
+	test.each([
+		"command",
+		"view",
+		"theme",
+	] as const)("%s lazy activation only reports changes when contribution availability changes", async (kind) => {
+		const input = manifestInput();
+		input.activationEvents = [];
+		input.contributes = {
+			tools: [],
+			...(kind === "command"
+				? { commands: [{ id: "echo", title: "Echo", handler: "server" as const }] }
+				: kind === "view"
+					? {
+							views: [
+								{
+									id: "echo",
+									title: "Echo",
+									entry: "ui/echo.js",
+									surfaces: ["overlay" as const],
+									scope: "global" as const,
+									instance: "singleton" as const,
+								},
+							],
+						}
+					: {
+							themes: [
+								{
+									id: "echo",
+									title: "Echo",
+									colorScheme: "both" as const,
+									tokens: { fontFamily: "system-ui" },
+								},
+							],
+						}),
+		};
+		if (kind === "view")
+			input.ui = { entry: "ui/echo.js", format: "iife", shell: "host-controlled" };
+		const manifest = parseManifest(input);
+		const snapshot = snapshotFor(manifest, [
+			{
+				pluginId,
+				version: manifest.version,
+				hash,
+				id: "echo",
+				fullId: `${pluginId}/echo`,
+				kind,
+				title: "Echo",
+				hasSchema: false,
+				...(kind === "view" ? { entryPath: "ui/echo.js", surfaces: ["overlay" as const] } : {}),
+				...(kind === "theme"
+					? { colorScheme: "both" as const, themeCss: ":root { font-family: system-ui; }" }
+					: {}),
+			},
+		]);
+		let lifecycle = state("enabled");
+		const contributionRegistry = new PluginContributionRegistry();
+		const coordinator = new PluginContributionCoordinator({
+			contributionRegistry,
+			toolRegistry: new PluginToolRegistry({ capabilityBroker: broker() }),
+			manifestLoader: async () => manifest,
+			lifecycleStates: () => [lifecycle],
+		});
+		const entry = () => contributionRegistry.get(`${pluginId}/echo`);
+		expect((await coordinator.initialize(snapshot)).changed).toBe(true);
+		const revision = coordinator.revision;
+		for (const runtimeState of ["starting", "active", "degraded", "inactive"]) {
+			lifecycle = { ...lifecycle, runtimeState };
+			expect((await coordinator.refresh(snapshot)).changed).toBe(false);
+			expect(coordinator.revision).toBe(revision);
+			expect(entry()?.status).toBe("available");
+		}
+		for (const runtimeState of ["crashed", "failed", "quarantine", "draining", "deactivating"]) {
+			lifecycle = { ...lifecycle, runtimeState };
+			expect((await coordinator.refresh(snapshot)).changed).toBe(true);
+			expect(entry()).toMatchObject({
+				status: "unavailable",
+				unavailableReason: `Plugin runtime is ${runtimeState}`,
+			});
+		}
+		lifecycle = state("enabled");
+		expect((await coordinator.refresh(snapshot)).changed).toBe(true);
+		expect(entry()?.status).toBe("available");
+		lifecycle = state("disabled");
+		expect((await coordinator.disable(snapshot)).changed).toBe(true);
+		expect(entry()?.unavailableReason).toBe("Plugin is disabled");
+		lifecycle = { ...state("enabled"), compatibility: "incompatible" };
+		expect((await coordinator.refresh(snapshot)).changed).toBe(true);
+		expect(entry()?.unavailableReason).toBe("Plugin is incompatible");
+		lifecycle = state("enabled");
+		expect((await coordinator.enable(snapshot)).changed).toBe(true);
+		expect(entry()?.status).toBe("available");
+		expect((await coordinator.uninstall(emptySnapshot())).changed).toBe(true);
+		expect(entry()).toBeUndefined();
+		expect((await coordinator.install(snapshot)).changed).toBe(true);
+		expect(entry()?.status).toBe("available");
+	});
+
 	test("atomically follows initialize/install/enable/disable/uninstall registry states", async () => {
 		const manifest = parseManifest(manifestInput());
 		const snapshot = snapshotFor(manifest);

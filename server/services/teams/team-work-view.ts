@@ -29,6 +29,7 @@ import {
 	type TeamWorkFileChange,
 	type TeamWorkFileDiff,
 	type TeamWorkItemDetail,
+	type TeamWorkMergeResponse,
 	type TeamWorkReturnResponse,
 	type TeamWorkReviewRound,
 	type TeamWorkStatsResponse,
@@ -48,7 +49,9 @@ import {
 	reviewHeadColumns,
 } from "./team-board";
 import { teamGit } from "./team-git";
+import { canMergeInProject, mergeViewOf, requestFastForward, requestMerge } from "./team-merge";
 import { loadTeamForAccess } from "./team-service";
+import { compareRefFor } from "./team-work-start";
 import { readDependents } from "./work-item-dependencies";
 import { diffStatOf, returnWorkItem, worktreePathOf } from "./work-items";
 
@@ -95,7 +98,10 @@ async function diffTarget(
 	if (worktree) {
 		const git = teamGit(worktree);
 		const head = await git.resolveCommit("HEAD");
-		const base = await git.resolveCommit(item.baseRef ?? baseBranch);
+		// W: an item started from origin/<base> is compared with it (only its own commits count).
+		const base = await git.resolveCommit(
+			await compareRefFor(item.id, item.baseRef ?? baseBranch, (ref) => git.resolveCommit(ref)),
+		);
 		if (head && base) {
 			const fork = await git.mergeBase(head, base);
 			if (fork) return { cwd: worktree, from: fork, to: head };
@@ -463,6 +469,18 @@ export async function readWorkItemDetail(
 	const { events, more, unreadSummaries } = itemEvents(itemId);
 	const files = stat.files;
 	const dependents = readDependents(teamId, itemId);
+	const teamActive = team.status === "active" && coordinator.status !== "archived";
+	// M: a ready item's merge (job phase, newest outcome, the prepared checkout's state).
+	const merge =
+		row.state === "ready"
+			? await mergeViewOf({
+					item: row,
+					baseBranch: team.baseBranch,
+					teamActive,
+					workerRunning: item.worker?.status === "working" || item.worker?.status === "waiting",
+					member: access === "write" && (await canMergeInProject(team.projectId, principal)),
+				})
+			: undefined;
 	return {
 		item,
 		base,
@@ -474,11 +492,8 @@ export async function readWorkItemDetail(
 		reviews: capReviewSummaries(markUnreadSummaries(reviewRounds(events), unreadSummaries)),
 		events: events.map(withoutSummary),
 		eventsMore: more,
-		canReturn:
-			access === "write" &&
-			team.status === "active" &&
-			coordinator.status !== "archived" &&
-			TEAM_RETURNABLE_STATES.includes(row.state),
+		canReturn: access === "write" && teamActive && TEAM_RETURNABLE_STATES.includes(row.state),
+		...(merge ? { merge } : {}),
 		dependents: dependents.items,
 		dependentsMore: dependents.more,
 	};
@@ -543,4 +558,34 @@ export async function returnWorkItemAsPerson(
 	const item = readBoardItem(teamId, result.item.id);
 	if (!item) throw new NotFoundError("Work item", itemId);
 	return { item, delivered: result.delivered };
+}
+
+// ── Merge ───────────────────────────────────────────────────────────────────
+
+/**
+ * A member merges a ready item into its base (`team-merge.ts`): the same access as 退回 (write
+ * on the coordinator; an onlooker gets 403, a stranger 404). Accepted at once; the git runs in a
+ * background job whose phase and outcome the drawer reads.
+ */
+export async function requestMergeAsPerson(
+	teamId: string,
+	principal: NarratorPrincipal,
+	projectId: string,
+	itemId: string,
+): Promise<TeamWorkMergeResponse> {
+	await loadTeamForAccess(teamId, principal, "write", projectId);
+	const result = requestMerge({ teamId, itemId, userId: principal.userId || null });
+	statCache.delete(itemId);
+	return result;
+}
+
+/** A member fast-forwards a prepared merge in the checkout its base is checked out in. */
+export async function requestFastForwardAsPerson(
+	teamId: string,
+	principal: NarratorPrincipal,
+	projectId: string,
+	itemId: string,
+): Promise<TeamWorkMergeResponse> {
+	await loadTeamForAccess(teamId, principal, "write", projectId);
+	return requestFastForward({ teamId, itemId, userId: principal.userId || null });
 }

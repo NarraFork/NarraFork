@@ -54,6 +54,8 @@ export interface SafeSpawnOptions {
 	cmd: string[];
 	/** Working directory. */
 	cwd?: string;
+	/** Bytes written to the child's stdin (closed after); omitted: no stdin. */
+	stdin?: Uint8Array;
 	/** Environment variables. */
 	env?: Record<string, string | undefined>;
 	/**
@@ -182,6 +184,7 @@ export async function safeSpawn(opts: SafeSpawnOptions): Promise<SafeSpawnResult
 		proc = Bun.spawn(opts.cmd, {
 			cwd: opts.cwd,
 			env: opts.env,
+			...(opts.stdin ? { stdin: opts.stdin } : {}),
 			stdout: "pipe",
 			stderr: "pipe",
 			// Windows 上不隐藏会让每个子进程弹出控制台窗口（GUI 模式运行的服务尤其明显）。

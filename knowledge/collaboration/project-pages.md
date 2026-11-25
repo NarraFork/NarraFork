@@ -42,7 +42,7 @@ keywords:
   - scanPendingCalls
   - TeamCard
 status: draft
-verified_at: 0baba9c1a
+verified_at: 3586b5dd803f5035f610fc36d2c7d0245a2cd8e9
 ---
 # 项目页、项目列表与项目设置页
 
@@ -64,7 +64,7 @@ verified_at: 0baba9c1a
 - 团队卡片（`ProjectTeamCards`，缓存里已归档的团队不显示，`liveTeamCards`）：状态句用团队页的 `statusSentence`（`teamCardStatus`），数字为进行中（排队+进行+评审中）/就绪/完成，成员看到「N 等你」（待批+就绪）；末尾虚线「新团队」卡；没有团队时一行说明加按钮。
 - 会话（`ProjectSessions`）：三个标签带计数（`999+`）。「进行中」先是运行中与等待中的会话，用首页的会话卡片（`dashboard/DashboardSessions.tsx:SessionCard`，同样的网格 `SESSION_CARD_GRID_COLS`，`dashboard-sessions.ts:toSession` 叠加实时活动），最近工具调用来自 `useNarratorActivity` 的 activity 订阅；最多 12 张卡片（`PROJECT_RUNNING_CARDS_SHOWN`）再「显示全部」，展开后也不超过首页的订阅上限 40；卡片不再另写「在做什么」。其后是「最近 7 天」的紧凑行（`sessionSections`）；「全部」「我的」都是紧凑行。
 - 项目列表（`routes/projects/index.tsx` + `ProjectListCard`）：排序有等你处理的在前，再按最近活动（`sortProjects`）；搜索框常驻。
-- 设置页 `/projects/$projectId/settings`（`ProjectSettingsPage`）七组：成员与可见性（`ProjectAccessPanel`）、技能（`ProjectSkillsManager`）、例程（`ProjectRoutinesList`，模式写成「新会话默认加载 / 会话内手动加载」，加项目特质层）、命令（命令编辑器、命令白/黑名单）、工作区与容器（名称、说明、项目目录、目录白/黑名单）、设备、知识库（链接到实例设置）。改动即存（`ProjectSettingsForms`）：名称与说明离开输入框时存；项目目录只在点「保存目录」并确认（说明会话会按目录重新归属）后存，与已存值比较时忽略末尾的 `/`，保存后显示服务端存的解析后路径；保存失败时输入保留并标「未保存」。规则每次增删改只发那一个 `chapterSettings` 键（服务端浅合并）：显示的是这个人最新的列表，直到已存列表越过他开始改时的样子（`useUpdateProject` 成功后把返回的行写进 `["projects", id]` 缓存，再刷新），每次修改都在显示的列表上做，所以连删两条不会把第一条带回来；保存串行，进行中时的修改等它完成后只发最新的一份（排队由 `mutateAsync` 的 promise 推进，不靠单次调用的回调，所以保存中离开设置页，排队的列表仍会发出）；失败则回到已存列表并显示错误。名称与说明每次编辑记一个版本号，旧的保存晚到时只在之后没有再输入才收回草稿。只有核实过的 `canManage` 才可编辑。会话菜单的项目设置弹窗（`ProjectSettingsPanel`）现在只是去设置页的入口。
+- 设置页 `/projects/$projectId/settings`（`ProjectSettingsPage`）七组：成员与可见性（`ProjectAccessPanel`）、技能（`ProjectSkillsManager`）、例程（`ProjectRoutinesList`，模式写成「新会话默认加载 / 会话内手动加载」，加项目特质层）、命令（命令编辑器、命令白/黑名单）、工作区与容器（名称、说明、项目目录、团队默认设置 `ProjectTeamDefaults`——新团队的基线分支 `defaultBranch` 离开输入框时存、新工作项的起点 `chapterSettings.teams.workStart` 选「自动 / origin / 本地」即存，只发 `teams` 键并保留独占路径，`teamsWithWorkStart`——目录白/黑名单）、设备、知识库（链接到实例设置）。改动即存（`ProjectSettingsForms`）：名称与说明离开输入框时存；项目目录只在点「保存目录」并确认（说明会话会按目录重新归属）后存，与已存值比较时忽略末尾的 `/`，保存后显示服务端存的解析后路径；保存失败时输入保留并标「未保存」。规则每次增删改只发那一个 `chapterSettings` 键（服务端浅合并）：显示的是这个人最新的列表，直到已存列表越过他开始改时的样子（`useUpdateProject` 成功后把返回的行写进 `["projects", id]` 缓存，再刷新），每次修改都在显示的列表上做，所以连删两条不会把第一条带回来；保存串行，进行中时的修改等它完成后只发最新的一份（排队由 `mutateAsync` 的 promise 推进，不靠单次调用的回调，所以保存中离开设置页，排队的列表仍会发出）；失败则回到已存列表并显示错误。名称与说明每次编辑记一个版本号，旧的保存晚到时只在之后没有再输入才收回草稿。只有核实过的 `canManage` 才可编辑。会话菜单的项目设置弹窗（`ProjectSettingsPanel`）现在只是去设置页的入口。
 
 ## 从哪读起
 - `server/services/project-overview.ts`，再到 `teams/team-board.ts` 的 `scanPendingCalls`、`pendingApprovalsOf`、`readTeamCards`。

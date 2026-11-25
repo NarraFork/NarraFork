@@ -705,6 +705,8 @@ export type AgentEvent =
 	| {
 			type: "payment_required";
 			message: string;
+			/** 专用于该失败请求的钱包证明；不含公开 CID/私有 identity。 */
+			paymentContext?: string;
 			providerId?: string;
 			providerPrefix?: string;
 			balance?: number;
@@ -792,7 +794,7 @@ export type AgentEvent =
 			type: "quota_balance";
 			quotaBalance: string | null;
 			detailedQuotaBalance?: string | null;
-			/** Request-start provider identity; stale events must not write a replacement's cache. */
+			/** Request-start credential identity; stale events cannot update a replacement key/network. */
 			providerIdentity?: string;
 	  }
 	| {

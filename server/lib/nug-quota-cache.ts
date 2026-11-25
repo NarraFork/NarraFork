@@ -2,10 +2,11 @@ import { unlink } from "node:fs/promises";
 import type { QuotaSnapshot } from "@shared/quota-snapshot";
 import { NugProvider } from "./agent/nug-provider";
 import { getNarraforkPath } from "./narrafork-home";
-import { streamQuotaIdentity, type UsageSubject } from "./provider-key-subjects";
+import { credentialForStream, type UsageSubject } from "./provider-key-subjects";
 import { getProviderKeyStore, nugKeyOwner, withProviderKey } from "./provider-keys";
 import { type NUGProviderConfig, settings } from "./settings";
-import { quotaStore } from "./sourcing/quota-store";
+import { quotaNetworkIdentity } from "./sourcing/quota-identity";
+import { quotaStore, STREAM_QUOTA_SOURCE } from "./sourcing/quota-store";
 
 export interface NugQuotaCache {
 	balance: number | null;
@@ -13,6 +14,9 @@ export interface NugQuotaCache {
 	detailedQuotaBalance: string | null;
 	extra?: unknown;
 	fetchedAt: number;
+	/** Private host observation times: null = never observed; absent = legacy fetchedAt. */
+	_remainingObservedAt?: number | null;
+	_totalObservedAt?: number | null;
 }
 
 export type NugQuotaSubject = UsageSubject<NUGProviderConfig>;
@@ -21,9 +25,36 @@ export type NugQuotaSubject = UsageSubject<NUGProviderConfig>;
 void unlink(getNarraforkPath("nug-quotas.json")).catch(() => {});
 
 function normalizeNullableNumber(value: unknown): number | null {
-	if (value == null) return null;
+	if (typeof value !== "number" && (typeof value !== "string" || !value.trim())) return null;
 	const numericValue = typeof value === "number" ? value : Number(value);
 	return Number.isFinite(numericValue) ? numericValue : null;
+}
+
+type AmountField = "remaining" | "total";
+function observationMetadata(value: unknown): number | null | undefined {
+	return value === null
+		? null
+		: typeof value === "number" && Number.isFinite(value) && value >= 0
+			? value
+			: undefined;
+}
+function amountTime(cache: NugQuotaCache, field: AmountField): number | null {
+	const held = observationMetadata(
+		field === "remaining" ? cache._remainingObservedAt : cache._totalObservedAt,
+	);
+	return held === undefined ? cache.fetchedAt : held;
+}
+function amountFields(remaining: number | null, total: number | null, fetchedAt: number) {
+	return {
+		...(remaining !== fetchedAt ? { _remainingObservedAt: remaining } : {}),
+		...(total !== fetchedAt ? { _totalObservedAt: total } : {}),
+	};
+}
+/** Presence is separate from value: explicit null/invalid is authoritative unknown, not fallback. */
+function observedNumber(data: object, names: readonly string[]): number | null | undefined {
+	const record = data as Record<string, unknown>;
+	const field = names.find((name) => Object.hasOwn(record, name));
+	return field === undefined ? undefined : normalizeNullableNumber(record[field]);
 }
 
 function normalizeNullableString(value: unknown): string | null {
@@ -83,28 +114,47 @@ export function normalizeNugQuotaResponse<T extends Record<string, unknown>>(
 export function buildNugQuotaCache(
 	data: {
 		balance?: unknown;
+		quotaBalance?: unknown;
+		remaining?: unknown;
 		totalGranted?: unknown;
+		quotaTotalGranted?: unknown;
+		total_granted?: unknown;
+		total?: unknown;
 		detailedQuotaBalance?: unknown;
 		extra?: unknown;
 	},
 	existing?: NugQuotaCache,
 ): NugQuotaCache {
 	const detailedQuotaBalance = nugQuotaDetailsFrom(data) ?? existing?.detailedQuotaBalance ?? null;
+	const fetchedAt = Date.now();
+	const balance = observedNumber(data, ["balance", "quotaBalance", "remaining"]);
+	const total = observedNumber(data, [
+		"totalGranted",
+		"quotaTotalGranted",
+		"total_granted",
+		"total",
+	]);
+	const remainingAt =
+		balance !== undefined ? fetchedAt : existing ? amountTime(existing, "remaining") : null;
+	const totalAt = total !== undefined ? fetchedAt : existing ? amountTime(existing, "total") : null;
 	return {
-		balance: normalizeNullableNumber(data.balance) ?? existing?.balance ?? null,
-		totalGranted: normalizeNullableNumber(data.totalGranted) ?? existing?.totalGranted ?? null,
+		balance: balance !== undefined ? balance : (existing?.balance ?? null),
+		totalGranted: total !== undefined ? total : (existing?.totalGranted ?? null),
 		detailedQuotaBalance,
 		...(data.extra !== undefined
 			? { extra: data.extra }
 			: existing?.extra !== undefined
 				? { extra: existing.extra }
 				: {}),
-		fetchedAt: Date.now(),
+		fetchedAt,
+		...amountFields(remainingAt, totalAt, fetchedAt),
 	};
 }
 
 function nugQuotaSnapshot(cache: NugQuotaCache): QuotaSnapshot {
 	const { fetchedAt, ...detail } = cache;
+	const remainingObservedAt = observationMetadata(cache._remainingObservedAt);
+	const totalObservedAt = observationMetadata(cache._totalObservedAt);
 	return {
 		fetchedAt,
 		scope: "wallet",
@@ -114,6 +164,8 @@ function nugQuotaSnapshot(cache: NugQuotaCache): QuotaSnapshot {
 				unit: "",
 				remaining: cache.balance,
 				...(cache.totalGranted !== null ? { total: cache.totalGranted } : {}),
+				...(remainingObservedAt !== undefined ? { remainingObservedAt } : {}),
+				...(totalObservedAt !== undefined ? { totalObservedAt } : {}),
 			},
 		],
 		detail,
@@ -123,48 +175,289 @@ function nugQuotaSnapshot(cache: NugQuotaCache): QuotaSnapshot {
 function restoreSnapshot(snapshot: QuotaSnapshot): QuotaSnapshot | null {
 	if (!snapshot.detail || typeof snapshot.detail !== "object") return null;
 	const detail = snapshot.detail as Record<string, unknown>;
-	return nugQuotaSnapshot({
-		balance: normalizeNullableNumber(detail.balance),
-		totalGranted: normalizeNullableNumber(detail.totalGranted),
-		detailedQuotaBalance: normalizeNullableString(detail.detailedQuotaBalance),
-		...(detail.extra !== undefined ? { extra: detail.extra } : {}),
-		fetchedAt: snapshot.fetchedAt,
-	});
+	const remainingAt = observationMetadata(detail._remainingObservedAt);
+	const totalAt = observationMetadata(detail._totalObservedAt);
+	return {
+		...snapshot,
+		...nugQuotaSnapshot({
+			balance: normalizeNullableNumber(detail.balance),
+			totalGranted: normalizeNullableNumber(detail.totalGranted),
+			detailedQuotaBalance: normalizeNullableString(detail.detailedQuotaBalance),
+			...(detail.extra !== undefined ? { extra: detail.extra } : {}),
+			fetchedAt: snapshot.fetchedAt,
+			...(remainingAt !== undefined ? { _remainingObservedAt: remainingAt } : {}),
+			...(totalAt !== undefined ? { _totalObservedAt: totalAt } : {}),
+		}),
+	};
 }
 
-function subject(config: NUGProviderConfig): NugQuotaSubject {
-	const key = getProviderKeyStore().list(nugKeyOwner(config.id))[0];
+function subject(config: NUGProviderConfig): NugQuotaSubject;
+function subject(
+	config: NUGProviderConfig,
+	credentialId: string | undefined,
+): NugQuotaSubject | undefined;
+function subject(config: NUGProviderConfig, credentialId?: string): NugQuotaSubject | undefined {
+	const keys = getProviderKeyStore().list(nugKeyOwner(config.id));
+	const key =
+		credentialId === undefined ? keys[0] : keys.find((entry) => entry.id === credentialId);
 	return key
 		? { id: key.id, providerId: config.id, config: withProviderKey(config, key) }
-		: { id: config.id, providerId: config.id, config };
+		: keys.length === 0 && (credentialId === undefined || credentialId === config.id)
+			? { id: config.id, providerId: config.id, config }
+			: undefined;
 }
 
-const identity = (config: NUGProviderConfig) => JSON.stringify([config.baseUrl, config.apiKey]);
-const knownCredentialIds = new Map<string, string>();
+export const nugQuotaIdentity = (config: NUGProviderConfig): string =>
+	JSON.stringify([config.baseUrl, config.apiKey, quotaNetworkIdentity(config, settings.proxy)]);
+export type CapturedNugQuotaSubject = NugQuotaSubject & { identity: string };
 
-function snapshotOf(config: NUGProviderConfig): QuotaSnapshot | undefined {
+/** Capture the actual first-key route before the legacy request awaits its response. */
+export function captureNugQuotaSubject(config: NUGProviderConfig): CapturedNugQuotaSubject {
 	const credential = subject(config);
-	knownCredentialIds.set(config.id, credential.id);
-	return quotaStore.get(credential.id, identity(credential.config), restoreSnapshot);
+	return {
+		...credential,
+		config: structuredClone(credential.config),
+		identity: nugQuotaIdentity(credential.config),
+	};
+}
+
+const knownCredentialIds = new Map<string, Set<string>>();
+function rememberCredential(providerId: string, credentialId: string): void {
+	const ids = knownCredentialIds.get(providerId) ?? new Set<string>();
+	ids.add(credentialId);
+	knownCredentialIds.set(providerId, ids);
+}
+
+function snapshotAmountTime(snapshot: QuotaSnapshot, field: AmountField): number | null {
+	return amountTime(cacheFromSnapshot(snapshot), field);
+}
+function expired(snapshot: QuotaSnapshot, now: number): boolean {
+	const expiresAt = (snapshot as QuotaSnapshot & { expiresAt?: number }).expiresAt;
+	return typeof expiresAt === "number" && Number.isFinite(expiresAt) && expiresAt <= now;
+}
+function comparableWallets(probe: QuotaSnapshot, stream: QuotaSnapshot, now: number): boolean {
+	return (
+		probe.scope === "wallet" &&
+		stream.scope === "wallet" &&
+		!probe.error &&
+		!stream.error &&
+		!expired(probe, now) &&
+		!expired(stream, now) &&
+		Number.isFinite(probe.fetchedAt) &&
+		probe.fetchedAt > 0 &&
+		Number.isFinite(stream.fetchedAt) &&
+		stream.fetchedAt > 0 &&
+		probe.balances.length === 1 &&
+		stream.balances.length === 1 &&
+		probe.balances[0]?.unit === stream.balances[0]?.unit &&
+		!probe.balances[0]?.unlimited &&
+		!stream.balances[0]?.unlimited
+	);
+}
+function amountSource(
+	probe: QuotaSnapshot,
+	stream: QuotaSnapshot,
+	field: AmountField,
+): "probe" | "stream" {
+	const probeAt = snapshotAmountTime(probe, field);
+	const streamAt = snapshotAmountTime(stream, field);
+	return streamAt !== null && (probeAt === null || streamAt > probeAt) ? "stream" : "probe";
+}
+/** A read-only view, never a write into either source slot. */
+function quotaView(
+	probe: QuotaSnapshot | undefined,
+	stream: QuotaSnapshot | undefined,
+): QuotaSnapshot | undefined {
+	const latest = stream && (!probe || stream.fetchedAt >= probe.fetchedAt) ? stream : probe;
+	if (!probe || !stream || !latest || !comparableWallets(probe, stream, Date.now())) return latest;
+	const remaining = amountSource(probe, stream, "remaining") === "stream" ? stream : probe;
+	const total = amountSource(probe, stream, "total") === "stream" ? stream : probe;
+	const {
+		_remainingObservedAt: _remaining,
+		_totalObservedAt: _total,
+		...base
+	} = cacheFromSnapshot(latest);
+	const fallback = cacheFromSnapshot(latest === probe ? stream : probe);
+	const projected = nugQuotaSnapshot({
+		...base,
+		detailedQuotaBalance:
+			normalizeNullableString(base.detailedQuotaBalance) ??
+			normalizeNullableString(fallback.detailedQuotaBalance),
+		...(base.extra === undefined && fallback.extra !== undefined ? { extra: fallback.extra } : {}),
+		balance: normalizeNullableNumber(remaining.balances[0]?.remaining),
+		totalGranted: normalizeNullableNumber(total.balances[0]?.total),
+		...amountFields(
+			snapshotAmountTime(remaining, "remaining"),
+			snapshotAmountTime(total, "total"),
+			latest.fetchedAt,
+		),
+	});
+	return {
+		...latest,
+		balances: [{ ...projected.balances[0], unit: latest.balances[0]?.unit ?? "" }],
+		detail: projected.detail,
+	};
+}
+
+/** Same owner clock policy for Auto; keep independent windows/error/unknown checks intact. */
+export function nugQuotaBalanceSources(
+	probe: QuotaSnapshot | undefined,
+	stream: QuotaSnapshot | undefined,
+	now: number,
+	streamMaxAgeMs: number,
+): { probe: boolean; stream: boolean } {
+	const streamAt = stream ? snapshotAmountTime(stream, "remaining") : null;
+	const base = {
+		probe: !probe || !expired(probe, now),
+		stream:
+			!!stream && !expired(stream, now) && streamAt !== null && now - streamAt < streamMaxAgeMs,
+	};
+	if (!probe || !stream || !base.stream || !comparableWallets(probe, stream, now)) return base;
+	const remaining = probe.balances[0]?.remaining;
+	const reported = stream.balances[0]?.remaining;
+	if (
+		typeof remaining !== "number" ||
+		!Number.isFinite(remaining) ||
+		typeof reported !== "number" ||
+		!Number.isFinite(reported)
+	)
+		return base;
+	const selected = amountSource(probe, stream, "remaining");
+	return { probe: selected === "probe", stream: selected === "stream" };
+}
+
+function snapshotOf(
+	config: NUGProviderConfig,
+	credentialId?: string,
+	source?: typeof STREAM_QUOTA_SOURCE,
+): QuotaSnapshot | undefined {
+	const credential = subject(config, credentialId);
+	if (!credential) return;
+	rememberCredential(config.id, credential.id);
+	const key = nugQuotaIdentity(credential.config);
+	if (source === STREAM_QUOTA_SOURCE)
+		return quotaStore.get(credential.id, key, restoreSnapshot, STREAM_QUOTA_SOURCE);
+	const probe = quotaStore.get(credential.id, key, restoreSnapshot);
+	if (credentialId !== undefined) return probe;
+	// Only the legacy source-level view merges the current first key's two slots.
+	const stream = quotaStore.get(credential.id, key, restoreSnapshot, STREAM_QUOTA_SOURCE);
+	return quotaView(probe, stream);
+}
+
+/** Cached credential/source reads never poll; refresh is explicit and identity-bound. */
+export function getNugQuotaSnapshot(
+	providerId: string,
+	credentialId?: string,
+	source?: typeof STREAM_QUOTA_SOURCE,
+): { credentialId: string; snapshot: QuotaSnapshot | undefined } | undefined {
+	const config = (settings.nugProviders ?? []).find((provider) => provider.id === providerId);
+	const credential = config && subject(config, credentialId);
+	return credential && config
+		? { credentialId: credential.id, snapshot: snapshotOf(config, credentialId, source) }
+		: undefined;
+}
+
+const refreshes = new Map<
+	string,
+	{ identity: string; controller: AbortController; task: Promise<void> }
+>();
+
+export function isNugQuotaRefreshing(providerId: string, credentialId?: string): boolean {
+	const config = settings.nugProviders?.find((provider) => provider.id === providerId);
+	const credential = config && subject(config, credentialId);
+	return (
+		!!credential && refreshes.get(credential.id)?.identity === nugQuotaIdentity(credential.config)
+	);
+}
+
+/** Explicit refresh, bounded and coalesced by the live credential identity. */
+export function refreshNugQuota(providerId: string, credentialId?: string): Promise<void> {
+	const config = (settings.nugProviders ?? []).find((provider) => provider.id === providerId);
+	if (!config || config.disabled) return Promise.resolve();
+	const credential = subject(config, credentialId);
+	if (!credential?.config.apiKey) return Promise.resolve();
+	const key = nugQuotaIdentity(credential.config);
+	const previous = refreshes.get(credential.id);
+	if (previous?.identity === key) return previous.task;
+	previous?.controller.abort();
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), 15_000);
+	const current = () => {
+		const liveConfig = (settings.nugProviders ?? []).find((p) => p.id === providerId);
+		const live =
+			liveConfig && !liveConfig.disabled ? subject(liveConfig, credential.id) : undefined;
+		return (
+			refreshes.get(credential.id)?.controller === controller &&
+			!!live &&
+			nugQuotaIdentity(live.config) === key
+		);
+	};
+	const cancelled = new Promise<never>((_resolve, reject) => {
+		controller.signal.addEventListener("abort", () => reject(new Error("quota_cancelled")), {
+			once: true,
+		});
+	});
+	const task = Promise.race([probeNugQuota(credential, controller.signal), cancelled])
+		.then((snapshot) => {
+			if (!controller.signal.aborted && current()) quotaStore.set(credential.id, key, snapshot);
+		})
+		.catch(() => {
+			if (current()) {
+				const old = quotaStore.get(credential.id, key, restoreSnapshot);
+				// Freeze legacy field times before stamping the failed attempt's fetchedAt.
+				const retained = nugQuotaSnapshot(
+					buildNugQuotaCache({}, old ? cacheFromSnapshot(old) : undefined),
+				);
+				quotaStore.set(
+					credential.id,
+					key,
+					{
+						...retained,
+						...old,
+						balances: retained.balances,
+						detail: retained.detail,
+						fetchedAt: retained.fetchedAt,
+						error: "quota_unavailable",
+					},
+					false,
+				);
+			}
+		})
+		.finally(() => {
+			clearTimeout(timer);
+			if (refreshes.get(credential.id)?.controller === controller) refreshes.delete(credential.id);
+		});
+	refreshes.set(credential.id, { identity: key, controller, task });
+	return task;
+}
+
+function matchingSubject(
+	config: NUGProviderConfig,
+	expectedConfig?: NUGProviderConfig | CapturedNugQuotaSubject,
+): NugQuotaSubject | undefined {
+	const captured = expectedConfig !== undefined && "config" in expectedConfig;
+	const credential = subject(config, captured ? expectedConfig.id : undefined);
+	if (!credential) return;
+	if (expectedConfig) {
+		const expectedId = captured ? expectedConfig.id : subject(expectedConfig).id;
+		const expectedIdentity = captured ? expectedConfig.identity : nugQuotaIdentity(expectedConfig);
+		if (credential.id !== expectedId || nugQuotaIdentity(credential.config) !== expectedIdentity) {
+			return;
+		}
+	}
+	return credential;
 }
 
 export function setNugCachedQuota(
 	providerId: string,
 	cache: NugQuotaCache,
-	expectedConfig?: NUGProviderConfig,
+	expectedConfig?: NUGProviderConfig | CapturedNugQuotaSubject,
 ): void {
 	const config = (settings.nugProviders ?? []).find((provider) => provider.id === providerId);
-	if (!config) return;
-	const credential = subject(config);
-	if (expectedConfig) {
-		const expectedId =
-			getProviderKeyStore().list(nugKeyOwner(expectedConfig.id))[0]?.id ?? expectedConfig.id;
-		if (credential.id !== expectedId || identity(credential.config) !== identity(expectedConfig)) {
-			return;
-		}
-	}
-	knownCredentialIds.set(providerId, credential.id);
-	quotaStore.set(credential.id, identity(credential.config), nugQuotaSnapshot(cache));
+	const credential = config && matchingSubject(config, expectedConfig);
+	if (!credential) return;
+	rememberCredential(providerId, credential.id);
+	quotaStore.set(credential.id, nugQuotaIdentity(credential.config), nugQuotaSnapshot(cache));
 }
 
 /** Fetch quota from a single NUG provider. */
@@ -191,10 +484,12 @@ export async function probeNugQuota(
 	credential: NugQuotaSubject,
 	signal: AbortSignal,
 ): Promise<QuotaSnapshot> {
-	const data = await new NugProvider(credential.config).getQuota(signal);
-	return nugQuotaSnapshot(
-		buildNugQuotaCache(normalizeNugQuotaResponse(data as unknown as Record<string, unknown>)),
+	const connection = settings.nugProviders?.find((entry) => entry.id === credential.providerId);
+	const data = await new NugProvider(credential.config, connection ?? credential.config).getQuota(
+		signal,
 	);
+	// Unlike the legacy HTTP response, a routing snapshot must not turn unknown into zero.
+	return nugQuotaSnapshot(buildNugQuotaCache(data));
 }
 
 /** Update cached quota balance for a provider identified by prefix. */
@@ -208,28 +503,53 @@ export function updateNugQuotaByPrefix(
 	const config = (settings.nugProviders ?? []).find(
 		(provider) => provider.prefix === prefix || provider.id === prefix,
 	);
-	if (!config || streamQuotaIdentity(config) !== expectedProviderIdentity) return;
-	setNugCachedQuota(
-		config.id,
-		buildNugQuotaCache(
-			{
-				balance: quotaBalance,
-				detailedQuotaBalance,
-				...(extra !== undefined ? { extra } : {}),
-			},
-			getNugCachedQuota(config.id),
-		),
+	if (!config) return;
+	const credential = credentialForStream(config, expectedProviderIdentity, nugKeyOwner(config.id));
+	if (!credential) return;
+	const identity = nugQuotaIdentity(credential.config);
+	const probe = quotaStore.get(credential.id, identity, restoreSnapshot);
+	const stream = quotaStore.get(credential.id, identity, restoreSnapshot, STREAM_QUOTA_SOURCE);
+	const previous = quotaView(probe, stream);
+	const cache = buildNugQuotaCache(
+		{
+			balance: quotaBalance,
+			detailedQuotaBalance,
+			...(extra !== undefined ? { extra } : {}),
+		},
+		previous ? cacheFromSnapshot(previous) : undefined,
 	);
+	rememberCredential(config.id, credential.id);
+	quotaStore.set(credential.id, identity, nugQuotaSnapshot(cache), true, STREAM_QUOTA_SOURCE);
 }
 
-export function getNugCachedQuota(providerId: string): NugQuotaCache | undefined {
-	const config = (settings.nugProviders ?? []).find((provider) => provider.id === providerId);
-	const snapshot = config && snapshotOf(config);
-	if (!snapshot) return undefined;
+function cacheFromSnapshot(snapshot: QuotaSnapshot): NugQuotaCache {
+	const { _remainingObservedAt, _totalObservedAt, ...values } = (snapshot.detail ?? {}) as Record<
+		string,
+		unknown
+	>;
+	const remainingAt = observationMetadata(_remainingObservedAt);
+	const totalAt = observationMetadata(_totalObservedAt);
 	return {
-		...(snapshot.detail as Omit<NugQuotaCache, "fetchedAt">),
+		...(values as Omit<NugQuotaCache, "fetchedAt">),
 		fetchedAt: snapshot.fetchedAt,
+		...(remainingAt !== undefined ? { _remainingObservedAt: remainingAt } : {}),
+		...(totalAt !== undefined ? { _totalObservedAt: totalAt } : {}),
 	};
+}
+
+/** Captured reads use that live identity's probe slot; omitted keeps the legacy first-key view. */
+export function getNugCachedQuota(
+	providerId: string,
+	expectedSubject?: CapturedNugQuotaSubject,
+): NugQuotaCache | undefined {
+	const config = (settings.nugProviders ?? []).find((provider) => provider.id === providerId);
+	if (!config || (expectedSubject && !matchingSubject(config, expectedSubject))) return;
+	const snapshot = snapshotOf(config, expectedSubject?.id);
+	if (!snapshot) return;
+	const cache = cacheFromSnapshot(snapshot);
+	if (expectedSubject) return cache;
+	const { _remainingObservedAt: _remaining, _totalObservedAt: _total, ...legacy } = cache;
+	return legacy;
 }
 
 export function getAllNugCachedQuotas(): Record<
@@ -257,9 +577,20 @@ export function getAllNugCachedQuotas(): Record<
 
 export function purgeNugQuotaCache(removedIds: string[]): void {
 	for (const id of removedIds) {
-		const credentialId =
-			knownCredentialIds.get(id) ?? getProviderKeyStore().list(nugKeyOwner(id))[0]?.id ?? id;
+		const ids = new Set([
+			...(knownCredentialIds.get(id) ?? []),
+			id,
+			...getProviderKeyStore()
+				.list(nugKeyOwner(id))
+				.map((key) => key.id),
+		]);
 		knownCredentialIds.delete(id);
-		quotaStore.remove(credentialId);
+		for (const credentialId of ids) {
+			const pending = refreshes.get(credentialId);
+			refreshes.delete(credentialId);
+			pending?.controller.abort();
+			quotaStore.remove(credentialId);
+			quotaStore.remove(credentialId, STREAM_QUOTA_SOURCE);
+		}
 	}
 }

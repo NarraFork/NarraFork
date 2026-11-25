@@ -9,6 +9,7 @@ import {
 	type ProvidersState,
 	providersReducer,
 	providersStateFromSettings,
+	rebasePersistedProviderKeySnapshot,
 	type SavedSnapshot,
 	useIsDirty,
 } from "./providers-reducer";
@@ -29,6 +30,77 @@ const provider = {
 	protocol: "gemini-compatible" as const,
 	codexAccountId: "",
 };
+
+describe("persisted provider keys rebase the baseline without erasing drafts", () => {
+	for (const target of [
+		{ kind: "command-code" },
+		{ kind: "custom", id: "api" },
+		{ kind: "nug", id: "nug" },
+	] as const) {
+		const readKey = (state: ProvidersState | SavedSnapshot) =>
+			target.kind === "command-code"
+				? state.commandCode.apiKey
+				: (target.kind === "custom" ? state.customApiProviders : state.nugProviders).find(
+						(p) => p.id === target.id,
+					)?.apiKey;
+		const initial = () =>
+			providersStateFromSettings({
+				customApiProviders: [
+					{ ...provider, id: "api", apiKey: "********old", protocol: "completions-compatible" },
+				],
+				nugProviders: [{ ...provider, id: "nug", apiKey: "********old" }],
+				commandCode: { apiKey: "********old" },
+			});
+		test(`${target.kind}: a pool write advances untouched state and discard baseline together`, () => {
+			const state = initial();
+			const baseline = createSnapshot(state);
+			const rebased = rebasePersistedProviderKeySnapshot(baseline, target, "********new");
+			const synced = providersReducer(state, {
+				type: "SYNC_PERSISTED_PROVIDER_KEY",
+				target,
+				apiKey: "********new",
+				previousApiKey: rebased.previousApiKey,
+			});
+			expect(readKey(synced)).toBe("********new");
+			expect(readKey(baseline)).toBe("********old");
+			expect(dirtyLabel(synced, rebased.snapshot)).toContain("false");
+			const discarded = providersReducer(synced, {
+				type: "RESTORE_FROM_SNAPSHOT",
+				snapshot: rebased.snapshot,
+			});
+			expect(readKey(discarded)).toBe("********new");
+			if (target.kind === "custom")
+				expect(discarded.openaiProviders[0]?.apiKey).toBe("********new");
+		});
+		for (const pending of ["typed-replacement", ""]) {
+			test(`${target.kind}: a deliberate ${pending ? "replacement" : "clear"} survives provisional and final pool projections`, () => {
+				const state = initial();
+				let baseline = createSnapshot(state);
+				let edited = structuredClone(state);
+				if (target.kind === "command-code") edited.commandCode.apiKey = pending;
+				else {
+					const list = target.kind === "custom" ? edited.customApiProviders : edited.nugProviders;
+					for (const p of list) if (p.id === target.id) p.apiKey = pending;
+				}
+				for (const apiKey of ["*", "********new"]) {
+					const rebased = rebasePersistedProviderKeySnapshot(baseline, target, apiKey);
+					baseline = rebased.snapshot;
+					edited = providersReducer(edited, {
+						type: "SYNC_PERSISTED_PROVIDER_KEY",
+						target,
+						apiKey,
+						previousApiKey: rebased.previousApiKey,
+					});
+					expect(readKey(edited)).toBe(pending);
+				}
+				expect(dirtyLabel(edited, baseline)).toContain("true");
+				expect(
+					readKey(providersReducer(edited, { type: "RESTORE_FROM_SNAPSHOT", snapshot: baseline })),
+				).toBe("********new");
+			});
+		}
+	}
+});
 
 describe("providers reducer server synchronization", () => {
 	for (const invalid of [null, "invalid", 42]) {

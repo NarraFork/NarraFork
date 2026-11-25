@@ -36,6 +36,7 @@ Work items (the Team tool):
 - work.ready also refuses while the worktree has uncommitted changes and, in a repository with knowledge/index.md, while the branch changed code a knowledge node anchors without updating that node, or added a source file no node anchors; the refusal lists them, and you send the worker back to fix them. So when the repository has knowledge/, tell each worker in its brief: before reporting done, run bun scripts/knowledge.ts affected in the worktree and update the nodes it lists.
 - work.sync hands bringing the base branch into the item's branch to the item's worker: it is told to merge with a merge commit, resolve conflicts, run the checks and report. Never rebase or force-push.
 - work.cancel stops tracking an item; cleanup removes a cancelled or merged item's worktree (the branch is kept) and always waits for a person's approval.
+- Merging a ready item into the base is a member's decision on the team page. NarraFork then merges it with a merge commit without touching anyone's working tree, or, when the base is checked out somewhere, prepares the merge for a person to fast-forward there. You get a note when it lands, and when it conflicts with the base: then run work.sync on it, send the instruction to its worker, review again and mark it ready. Never merge an item yourself.
 - When one item can only start after others land, create it with Team({ action: "work.create", title, dependsOn: [item ids] }), or set its list later with work.update while it is still queued. Only a merged dependency counts: ready is not enough, and a cancelled one blocks until you remove or replace it. Starting the item before then is refused with TEAM_WORK_ITEM_BLOCKED, which names the blockers. When the last one merges, a note tells you the item can start: run work.sync on it first, since its branch was made from the base before its dependencies landed, and put the instruction it returns at the start of the worker's brief.
 - When you take a decision on people's behalf, record it with Team({ action: "decision", text }).
 - While only waiting (for a review, a run or a person), schedule a check-in with Team({ action: "checkin", minutes }): about fifty minutes for the first, about four hours after that, and stop after three check-ins in a row that found nothing changed; anything new starts the count again.
@@ -72,6 +73,7 @@ People and permissions:
 - worktree 有未提交改动时 work.ready 会拒绝；仓库有 knowledge/index.md 时，分支改了某个知识节点锚定的代码却没改这个节点，或新增了没有任何节点锚定的源文件，work.ready 也会拒绝，拒绝结果会列出它们，你把工人派回去补。所以仓库有 knowledge/ 时，在每个工人的简报里写上：汇报完成前，在 worktree 里跑 bun scripts/knowledge.ts affected，更新它列出的节点。
 - work.sync 把「把基线分支合进工作项分支」交给工作项的工人：让它用合并提交合进来、解冲突、跑检查、汇报。永远不 rebase、不强推。
 - work.cancel 不再跟踪一个工作项；cleanup 删掉已取消或已合回的工作项的 worktree（分支保留），每次都要等人批准。
+- 把可合并的工作项合回基线由成员在团队页决定。NarraFork 随后用合并提交替他合并，不碰任何人的工作区；基线在某处被检出时，则把合并结果准备好，由人在那里快进。合并落地、或与基线冲突时你会收到一条说明：冲突时对它跑 work.sync，把指令发给它的工人，再评审一轮、重新 work.ready。不要自己去合并工作项。
 - 某个工作项要等别的工作项落地才能开始时，用 Team({ action: "work.create", title, dependsOn: [工作项 id] }) 建它，或在它还在排队时用 work.update 设置依赖列表。只有已合并的依赖才算数：ready 不够，已取消的依赖会一直挡着，直到你把它去掉或换掉。在那之前开始这一项会被拒绝（TEAM_WORK_ITEM_BLOCKED，并列出挡着的工作项）。最后一个依赖合并后，会有一条说明告诉你这一项可以开始了：先对它跑 work.sync（它的分支是在依赖落地前从基线开出的），把返回的指令放在工人简报的最前面。
 - 替人做了决定时，用 Team({ action: "decision", text }) 记一笔。
 - 只是在等（等评审、等运行、等人）时，用 Team({ action: "checkin", minutes }) 给自己排一次自检：第一次约五十分钟，以后约四小时一次，连续三次没有变化就停；有任何新动静就重新计数。
@@ -170,6 +172,62 @@ export function unblockedNote(locale: Locale, input: { itemId: string; title: st
 	if (locale === "zh-CN")
 		return `「${title}」现在可以开始了\n它依赖的工作项都已合并（${input.itemId}）。先对它跑 Team work.sync，再用 Agent({ workdir: <它的 worktree> }) 派工人，把 work.sync 返回的指令放在简报最前面。`;
 	return `"${title}" can start now\nEvery item it depends on is merged (${input.itemId}). Run Team work.sync on it first, then delegate it with Agent({ workdir: <its worktree> }), the instruction work.sync returns first in the brief.`;
+}
+
+// ─── A member merged a work item ───
+
+export interface MergeNoteInput {
+	itemId: string;
+	title: string;
+	branch: string | null;
+	base: string;
+	/** The person's username, or null when not known. */
+	by: string | null;
+}
+
+/**
+ * The note a coordinator gets when a member's merge landed in the base (source `team_merge`,
+ * woken when idle): the item is merged; its worktree can be cleaned. Deterministic.
+ */
+export function mergedNote(
+	locale: Locale,
+	input: MergeNoteInput & { mergeCommit: string | null },
+): string {
+	const title = oneLine(input.title);
+	const branch = input.branch ? ` (${input.branch})` : "";
+	const commit = input.mergeCommit ? input.mergeCommit.slice(0, 12) : null;
+	if (locale === "zh-CN") {
+		const who = input.by ?? "一位成员";
+		const at = commit ? `，基线现在是 ${commit}` : "";
+		return `「${title}」已合并到 ${input.base}\n${who} 在团队页合并了工作项 ${input.itemId}${branch}${at}。它的 worktree 可以用 Team cleanup 清理（需要人批准）。`;
+	}
+	const who = input.by ?? "A member";
+	const at = commit ? `; the base is now ${commit}` : "";
+	return `"${title}" was merged into ${input.base}\n${who} merged work item ${input.itemId}${branch} from the team page${at}. Its worktree can be cleaned up with Team cleanup (a person approves it).`;
+}
+
+/**
+ * The note a coordinator gets when a member's merge conflicted with the base (source
+ * `team_merge`): the worker brings the base in (work.sync), then a new review and ready.
+ * File names are put on one line each, so they cannot forge lines of their own.
+ */
+export function mergeConflictNote(
+	locale: Locale,
+	input: MergeNoteInput & { conflicts: readonly string[]; more: boolean },
+): string {
+	const title = oneLine(input.title);
+	const branch = input.branch ? ` (${input.branch})` : "";
+	const shown = input.conflicts.slice(0, 20).map((file) => oneLine(file));
+	const more = input.more || input.conflicts.length > shown.length;
+	if (locale === "zh-CN") {
+		const who = input.by ?? "一位成员";
+		const list = shown.length > 0 ? `冲突的文件：${shown.join("、")}${more ? " 等" : ""}。` : "";
+		return `「${title}」无法合并到 ${input.base}：有冲突\n${who} 在团队页合并工作项 ${input.itemId}${branch} 时与基线冲突，什么都没有改动。${list}对它跑 Team work.sync，把指令发给它的工人解决冲突，再评审一轮、重新 work.ready。`;
+	}
+	const who = input.by ?? "A member";
+	const list =
+		shown.length > 0 ? ` Conflicting files: ${shown.join(", ")}${more ? ", and more" : ""}.` : "";
+	return `"${title}" could not be merged into ${input.base}: it conflicts\n${who} tried to merge work item ${input.itemId}${branch} from the team page; it conflicts with the base and nothing was changed.${list} Run Team work.sync on it and send the instruction to its worker to resolve them, then review again and mark it ready.`;
 }
 
 // ─── Upgrade and disband notes ───

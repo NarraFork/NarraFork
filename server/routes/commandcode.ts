@@ -48,8 +48,8 @@ commandCodeRoutes.get("/status", (c) => {
 	});
 });
 
-/** GET /api/commandcode/usage — 额度；同时回报登录状态，让前端一次请求就能渲染。 */
-commandCodeRoutes.get("/usage", async (c) => {
+/** Request/token/success statistics only; allowance lives at /api/quota-snapshots. */
+commandCodeRoutes.get("/usage-summary", async (c) => {
 	// 与 /status 同理：额度面板上的登录状态必须是当前的真实状态。
 	const auth = resolveCommandCodeToken(settings.commandCode?.apiKey, { fresh: true });
 	if (!auth.credential) {
@@ -61,7 +61,7 @@ commandCodeRoutes.get("/usage", async (c) => {
 				? await getCommandCodeUsageFromSettings()
 				: // CLI auth has no unified credential: keep the original uncached path.
 					await fetchCommandCodeUsage(auth.credential.token, settings.commandCode?.baseUrl);
-		return c.json({ loggedIn: true, ...usage });
+		return c.json({ loggedIn: true, summary: usage?.summary });
 	} catch (error) {
 		const code = error instanceof CommandCodeUsageError ? error.message : "usage_unavailable";
 		const upstreamStatus = error instanceof CommandCodeUsageError ? error.status : 0;

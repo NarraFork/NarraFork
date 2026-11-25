@@ -2503,6 +2503,7 @@
 			"team_disband": "团队已解散",
 			"team_return": "工作项被退回",
 			"team_unblocked": "工作项可以开始了",
+			"team_merge": "工作项合并",
 			"outline_team": "与本会话有关的任务事件",
 			"outline_task_brief": "开工说明",
 			"spec_import": "Dynamic Spec 已搬进大纲",
@@ -3174,6 +3175,20 @@
 		"resetTime": "重置时间",
 		"resetUnavailable": "接口未提供重置时间。",
 		"refreshFailed": "无法确认当前订阅额度，缓存数据可能已过时。"
+	},
+	"quotaSnapshot": {
+		"unknown": "额度未知",
+		"pluginDisabled": "额度插件已停用",
+		"unlimited": "无限",
+		"balance": "余额",
+		"plan": "套餐",
+		"total": "总量",
+		"used": "已用",
+		"resetsAt": "重置于 {{time}}",
+		"expired": "订阅已过期",
+		"expiresAt": "到期时间",
+		"remainingAmount": "剩余 {{amount}}",
+		"window": { "5h": "5小时", "daily": "日", "weekly": "周", "monthly": "月", "other": "额度" }
 	},
 	"quotaPanel": {
 		"short5h": "5h",

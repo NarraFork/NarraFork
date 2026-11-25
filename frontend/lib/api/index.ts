@@ -18,6 +18,7 @@ import { outlineApi } from "./outline";
 import { pluginsApi } from "./plugins";
 import { projectsApi } from "./projects";
 import { providerImportApi } from "./provider-import";
+import { quotaSnapshotsApi } from "./quota-snapshots";
 import { scheduledTasksApi } from "./scheduled-tasks";
 import { sessionInterchangeApi } from "./session-interchange";
 import { settingsApi } from "./settings";
@@ -86,6 +87,7 @@ export const api = {
 	...storageTransferApi,
 	...providerImportApi,
 	...teamsApi,
+	...quotaSnapshotsApi,
 };
 
 export {

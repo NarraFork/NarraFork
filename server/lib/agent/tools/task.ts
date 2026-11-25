@@ -579,11 +579,14 @@ export const agentTool: ToolDefinition = {
 					// D: an item with no worker starts only once every dependency merged, whatever its
 					// state; nothing is created when it cannot (409 TEAM_WORK_ITEM_BLOCKED, naming the
 					// blockers). `attachWorker` checks it again when the subagent exists.
-					const { assertWorkItemStartable } = await import(
+					const { assertDependenciesReachStart, assertWorkItemStartable } = await import(
 						"@server/services/teams/work-item-dependencies"
 					);
 					try {
 						assertWorkItemStartable(item.id);
+						// Merged where this item's work starts (origin/<base> or the local base), not
+						// merely merged somewhere: bounded git, outside any transaction.
+						await assertDependenciesReachStart(item.id);
 					} catch (err) {
 						const code = (err as { code?: unknown }).code;
 						return {

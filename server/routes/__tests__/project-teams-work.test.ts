@@ -937,3 +937,119 @@ describe("review findings in the drawer", () => {
 		expect(capped[1]?.summary?.endsWith("…")).toBe(true);
 	});
 });
+
+describe("merge (M)", () => {
+	test("members only (as 退回); 202 with the phase; the drawer and the board read it back", async () => {
+		const { settleMergeJobs } = await import("../../services/teams/team-merge");
+		const merged: string[] = [];
+		work.setMergeNoteDeliveryForTests(async ({ text }) => {
+			merged.push(text);
+			return true;
+		});
+		try {
+			// The member's own NarraFork git identity commits the merge.
+			const { userGitIdentities } = await import("../../db/schema");
+			await db.insert(userGitIdentities).values({
+				id: generateId(),
+				userId: MEMBER,
+				name: "Member Person",
+				email: "member@example.com",
+				isDefault: true,
+				createdAt: new Date().toISOString(),
+			});
+			const { item } = await readyItem("Merge me", { "merge/me.txt": "merge\n" });
+			const path = teamPath(`work/${item.id}/merge`);
+			expect((await call(READER, path, { method: "POST" })).status).toBe(403);
+			expect((await call(OUTSIDER, path, { method: "POST" })).status).toBe(404);
+			const accepted = await call(MEMBER, path, { method: "POST" });
+			expect(accepted.status).toBe(202);
+			expect(accepted.body).toEqual({ itemId: item.id, job: "merge", phase: "queued" });
+			await settleMergeJobs();
+			// main is checked out in the project's directory: the merge is prepared, not applied.
+			const before = git(repo, "rev-parse", "main");
+			const drawer = await call(MEMBER, teamPath(`work/${item.id}`));
+			expect(drawer.status).toBe(200);
+			expect(drawer.body.merge).toMatchObject({
+				mode: "local",
+				phase: null,
+				outcome: "prepared",
+				canMerge: true,
+				disabledReason: null,
+				detail: { kind: "prepared", baseSha: before },
+				fastForward: {
+					available: true,
+					command: {
+						sh: expect.stringContaining("merge --ff-only --no-autostash --no-overwrite-ignore"),
+						powershell: expect.stringContaining("-ceq 'refs/heads/main'"),
+						preferred: "sh",
+					},
+				},
+			});
+			const onlooker = await call(READER, teamPath(`work/${item.id}`));
+			expect(onlooker.body.merge).toMatchObject({ outcome: "prepared", canMerge: false });
+			const column = await call(MEMBER, teamPath("board?column=review"));
+			const card = column.body.items.find((entry: { id: string }) => entry.id === item.id);
+			expect(card.merge).toMatchObject({ mode: "local", outcome: "prepared", canMerge: true });
+
+			// 「在该目录中快进」: the same access; then the item is merged.
+			const forward = teamPath(`work/${item.id}/merge/fast-forward`);
+			expect((await call(READER, forward, { method: "POST" })).status).toBe(403);
+			const fastForward = await call(MEMBER, forward, { method: "POST" });
+			expect(fastForward.status).toBe(202);
+			expect(fastForward.body).toEqual({ itemId: item.id, job: "fast_forward", phase: "queued" });
+			await settleMergeJobs();
+			expect(work.requireWorkItem(teamId, item.id).state).toBe("merged");
+			expect(git(repo, "rev-parse", "main")).not.toBe(before);
+			expect(git(repo, "log", "-1", "--format=%an <%ae>|%P", "main")).toBe(
+				`Member Person <member@example.com>|${before} ${item.headSha}`,
+			);
+			expect(git(repo, "status", "--porcelain", "--untracked-files=no")).toBe("");
+			expect(merged).toHaveLength(1);
+			// No longer ready: refused.
+			const again = await call(MEMBER, path, { method: "POST" });
+			expect(again.status).toBe(409);
+			expect(again.body.code).toBe("TEAM_WORK_ITEM_NOT_READY");
+		} finally {
+			work.setMergeNoteDeliveryForTests(null);
+		}
+	});
+
+	test("a read-only project member with coordinator write can neither merge nor fast-forward", async () => {
+		const { item } = await readyItem("Reader merges", { "merge/reader.txt": "reader\n" });
+		const grantId = generateId();
+		await db.insert(aclGrants).values({
+			id: grantId,
+			scopeType: "narrator",
+			scopeId: teamId,
+			principalType: "user",
+			principalId: READER,
+			capability: "write",
+			createdAt: new Date().toISOString(),
+		});
+		try {
+			// The coordinator grant makes them a member: they may return the item, as before.
+			const drawer = await call(READER, teamPath(`work/${item.id}`));
+			expect(drawer.body.canReturn).toBe(true);
+			// The drawer does not offer them the merge either.
+			expect(drawer.body.merge).toMatchObject({ canMerge: false });
+			for (const suffix of ["merge", "merge/fast-forward"]) {
+				const response = await call(READER, teamPath(`work/${item.id}/${suffix}`), {
+					method: "POST",
+				});
+				expect({ suffix, status: response.status }).toEqual({ suffix, status: 403 });
+			}
+			expect(work.requireWorkItem(teamId, item.id).state).toBe("ready");
+		} finally {
+			await db.delete(aclGrants).where(eq(aclGrants.id, grantId));
+		}
+	});
+
+	test("a fast-forward without a prepared merge is refused", async () => {
+		const { item } = await readyItem("Nothing prepared", { "merge/none.txt": "none\n" });
+		const response = await call(MEMBER, teamPath(`work/${item.id}/merge/fast-forward`), {
+			method: "POST",
+		});
+		expect(response.status).toBe(409);
+		expect(response.body.code).toBe("TEAM_MERGE_NOT_PREPARED");
+	});
+});

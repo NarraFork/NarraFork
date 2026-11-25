@@ -46,6 +46,9 @@ export interface QuotaWindowView {
 	/** Absolute amounts, only when upstream reported both. */
 	used: number | null;
 	limit: number | null;
+	/** Optional period-specific amount and currency; never an unlabeled wallet balance. */
+	remainingAmount?: number | null;
+	unit?: string;
 	/** Epoch ms the window refills, or null when unknown. */
 	resetAt: number | null;
 	/** Translation key for the reset caption (takes `time`); defaults to `quotaPanel.resetsIn`. */
@@ -68,6 +71,8 @@ export interface QuotaPanelView {
 	level: QuotaLevel;
 	/** Extra label/value rows under the windows (balance, monthly credits …). */
 	rows: Array<{ label: string; value: string }>;
+	/** A known validity deadline passed; this is not a missing or zero-valued allowance. */
+	expired?: boolean;
 	/** The last refresh failed; any numbers shown are from an earlier fetch. */
 	failed: boolean;
 	/** Why it failed, when the viewer may see it (admins only). */
@@ -190,6 +195,14 @@ export function formatQuotaAmount(value: number): string {
 		: rounded;
 }
 
+/** Preserve monetary precision and keep each absolute amount attached to its period unit. */
+export function formatQuotaWindowAmount(value: number, unit?: string): string {
+	const amount = unit
+		? formatLocaleNumber(value, { maximumSignificantDigits: 12 })
+		: formatQuotaAmount(value);
+	return unit ? `${amount} ${unit}` : amount;
+}
+
 /**
  * Compact badge text: the limiting window and what is left of it ("5h 63%"),
  * "exhausted" once spent, or the provider's unavailable placeholder.
@@ -224,7 +237,15 @@ export function formatQuotaSummaryLines(
 			window.resetAt == null
 				? ""
 				: ` · ${t("quotaPanel.resetsIn", { time: formatQuotaCountdown(window.resetAt - now, t) })}`;
-		return `${window.label}: ${remaining}${reset}`;
+		const amounts =
+			window.used != null && window.limit != null
+				? ` · ${t("quotaPanel.usedOfLimit", { used: formatQuotaWindowAmount(window.used, window.unit), limit: formatQuotaWindowAmount(window.limit, window.unit) })}`
+				: "";
+		const amountLeft =
+			window.remainingAmount != null
+				? ` · ${t("quotaSnapshot.remainingAmount", { amount: formatQuotaWindowAmount(window.remainingAmount, window.unit) })}`
+				: "";
+		return `${window.label}: ${remaining}${amounts}${amountLeft}${reset}`;
 	});
 	for (const row of view.rows) lines.push(`${row.label}: ${row.value}`);
 	if (view.failed) lines.push(t("quotaPanel.staleHint"));

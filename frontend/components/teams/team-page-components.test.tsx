@@ -1,7 +1,7 @@
 /**
  * The team page's components rendered with the real Mantine and both locales (the redesign R):
  * the header's status sentence, people and 全部暂停 (members only, kept while an archived team's
- * workers run); 「等你处理」 cards of each kind, folded past three, 合并 shown disabled; the work
+ * workers run); 「等你处理」 cards of each kind, folded past three, 合并 with its states (M); the work
  * list's groups and rows, its starting and wrap-up states, read-only 「等成员处理」; the activity
  * words each event; every `teams` string exists in both languages.
  */
@@ -239,6 +239,14 @@ describe("等你处理", () => {
 			reviewRounds: 2,
 			title: "Fix the CSV time zone",
 			branch: "team/csv-tz",
+			merge: {
+				mode: "github",
+				phase: null,
+				job: null,
+				outcome: null,
+				canMerge: false,
+				disabledReason: "github_pending",
+			},
 		}),
 	];
 	const attention = (approvals: TeamPendingApproval[], lng: "en" | "zh-CN" = "en", phone = false) =>
@@ -247,6 +255,7 @@ describe("等你处理", () => {
 				entries={attentionEntries({ member: true, approvals, items })}
 				phone={phone}
 				teamId="lead"
+				projectId="p"
 				base="main"
 				stats={{ r: { added: 42, removed: 11, files: 5, binaryFiles: 0, truncated: false } }}
 				onOpenItem={noop}
@@ -270,7 +279,7 @@ describe("等你处理", () => {
 		expect(html).not.toContain("team-attention");
 	});
 
-	test("a tool call: who, the command, deny / approve; a ready item: +/-, files, verdict, branch, merge disabled", async () => {
+	test("a tool call: who, the command, deny / approve; a ready item: +/-, files, verdict, branch, merge disabled on GitHub", async () => {
 		const html = await attention([call()]);
 		expect(html).toContain('data-kind="tool"');
 		expect(html).toContain("Add the board");
@@ -286,7 +295,9 @@ describe("等你处理", () => {
 		expect(html).toContain("team/csv-tz → main");
 		expect(html).toContain('data-testid="team-merge-view"');
 		expect(html).toContain('data-testid="team-merge-return"');
-		expect(html).toMatch(/<button[^>]*disabled=""[^>]*data-testid="team-merge"/);
+		expect(html).toMatch(/<button[^>]*disabled=""[^>]*data-testid="team-merge-button"/);
+		expect(html).toContain('data-reason="github_pending"');
+		expect(html).toContain("Merge into main");
 		expect(html).toContain('data-testid="team-attention-count"');
 	});
 
@@ -884,7 +895,10 @@ describe("questions keep their context", () => {
 	});
 
 	test("a refused base branch has its own words in both languages", async () => {
-		const { settingsErrorKey } = await import("./TeamSettingsModal");
+		const { settingsErrorKey, workStartPatch } = await import("./TeamSettingsModal");
+		// W: only the work start key is sent; the default removes it (the server merges).
+		expect(workStartPatch("remote")).toEqual({ workStart: "remote" });
+		expect(workStartPatch("default")).toEqual({ workStart: null });
 		const key = settingsErrorKey({ data: { code: "TEAM_BASE_BRANCH_UNRESOLVED" } });
 		expect(key).toBe("teams.page.settings.errors.TEAM_BASE_BRANCH_UNRESOLVED");
 		expect(settingsErrorKey({ data: { code: "OTHER" } })).toBeNull();
@@ -1149,5 +1163,257 @@ describe("the coordinator's column header", () => {
 			"utf8",
 		);
 		expect(session).not.toMatch(/\bhideHeader\b/);
+	});
+});
+
+describe("merge (M)", () => {
+	const ready = (merge: TeamBoardItem["merge"]) =>
+		item({
+			id: "r",
+			state: "ready",
+			lastReview: "clear",
+			reviewRounds: 1,
+			title: "Ship it",
+			branch: "team/ship",
+			worker: null,
+			merge,
+		});
+	const card = (merge: TeamBoardItem["merge"], lng: "en" | "zh-CN" = "en") =>
+		render(
+			<TeamAttention
+				entries={attentionEntries({ member: true, approvals: [], items: [ready(merge)] })}
+				phone={false}
+				teamId="lead"
+				projectId="p"
+				base="main"
+				stats={undefined}
+				onOpenItem={noop}
+			/>,
+			new QueryClient(),
+			lng,
+		);
+	const idle = {
+		mode: "local" as const,
+		phase: null,
+		job: null,
+		outcome: null,
+		canMerge: true,
+		disabledReason: null,
+	};
+
+	test("the card: 合并到 base enabled; 正在合并… while a job runs; outcomes as badges", async () => {
+		const enabled = await card(idle, "zh-CN");
+		expect(enabled).toContain("合并到 main");
+		expect(enabled).not.toMatch(/<button[^>]*disabled=""[^>]*data-testid="team-merge-button"/);
+		const running = await card(
+			{ ...idle, phase: "merging", job: "merge", canMerge: false, disabledReason: "merging" },
+			"zh-CN",
+		);
+		expect(running).toContain("正在合并…");
+		expect(running).toContain('data-merge-label="merging"');
+		const conflict = await card({ ...idle, outcome: "conflict" }, "zh-CN");
+		expect(conflict).toContain('data-outcome="conflict"');
+		expect(conflict).toContain("与 main 有冲突");
+		const prepared = await card({ ...idle, outcome: "prepared" }, "zh-CN");
+		expect(prepared).toContain('data-outcome="prepared"');
+		expect(prepared).toContain('data-testid="team-merge-open-prepared"');
+		expect(prepared).toContain("重新准备");
+	});
+
+	test("disabled reasons say why, in both languages", async () => {
+		for (const reason of [
+			"worker_running",
+			"github_pending",
+			"git_too_old",
+			"base_remote",
+			"checking",
+		] as const) {
+			const html = await card({ ...idle, canMerge: false, disabledReason: reason }, "zh-CN");
+			expect(html).toContain(`data-reason="${reason}"`);
+			expect(html).toMatch(/<button[^>]*disabled=""[^>]*data-testid="team-merge-button"/);
+		}
+		expect(zh.teams.page.merge.disabled.github_pending).toContain("GitHub PR 流程即将提供");
+	});
+
+	test("the drawer's outcome: conflicts with 退回, a failure in words, a prepared merge with its command", async () => {
+		const { MergeOutcome } = await import("./TeamMerge");
+		const view = (detail: NonNullable<TeamWorkItemDetail["merge"]>["detail"], extra = {}) => ({
+			...idle,
+			outcome: detail?.kind === "prepared" ? ("prepared" as const) : ("conflict" as const),
+			detail,
+			...extra,
+		});
+		const outcome = (
+			merge: NonNullable<TeamWorkItemDetail["merge"]>,
+			lng: "en" | "zh-CN" = "zh-CN",
+		) =>
+			render(
+				<MergeOutcome
+					projectId="p"
+					teamId="lead"
+					itemId="r"
+					base="main"
+					merge={merge}
+					canReturn
+					onReturn={noop}
+				/>,
+				new QueryClient(),
+				lng,
+			);
+		const conflict = await outcome(
+			view({
+				kind: "failed",
+				code: "conflict",
+				message: null,
+				conflicts: ["src/a.ts", "src/b.ts"],
+				more: true,
+				at: "2026-11-25T00:00:00.000Z",
+			}),
+		);
+		expect(conflict).toContain('data-testid="team-merge-conflicts"');
+		expect(conflict).toContain("src/b.ts");
+		expect(conflict).toContain("冲突的文件比这里列出的多");
+		expect(conflict).toContain('data-testid="team-merge-conflict-return"');
+		const failed = await outcome(
+			view({
+				kind: "failed",
+				code: "TEAM_MERGE_BASE_MOVED",
+				message: "main kept moving",
+				at: "2026-11-25T00:00:00.000Z",
+			}),
+			"en",
+		);
+		expect(failed).toContain('data-code="TEAM_MERGE_BASE_MOVED"');
+		expect(failed).toContain("The base kept moving");
+		const prepared = await outcome(
+			view(
+				{
+					kind: "prepared",
+					mergeCommit: "a".repeat(40),
+					baseSha: "b".repeat(40),
+					checkedOutAt: "/home/alice/app",
+					at: "2026-11-25T00:00:00.000Z",
+				},
+				{
+					fastForward: {
+						available: true,
+						blocker: null,
+						runningSessions: 0,
+						terminals: 1,
+						command: {
+							sh: "git -C /home/alice/app merge --ff-only --no-autostash --no-overwrite-ignore abc",
+							powershell:
+								"if ((git -C '/home/alice/app' symbolic-ref --quiet HEAD) -ceq 'refs/heads/main') { git -C '/home/alice/app' merge --ff-only abc }",
+							preferred: "powershell",
+						},
+						files: ["src/a.ts", "upstream/u.ts"],
+						filesMore: false,
+					},
+				},
+			),
+		);
+		expect(prepared).toContain(
+			"合并结果已准备好。main 检出在 /home/alice/app，NarraFork 不改动那里的文件。",
+		);
+		expect(prepared).toContain('data-testid="team-merge-fast-forward"');
+		expect(prepared).toContain("在该目录中快进");
+		// The server's platform picks the shell shown first (PowerShell here); both are labelled.
+		expect(prepared).toContain('data-shell="powershell"');
+		expect(prepared).toContain("-ceq &#x27;refs/heads/main&#x27;");
+		expect(prepared).toContain("Git Bash / sh");
+		expect(prepared).toContain("PowerShell");
+		expect(prepared).toContain('data-testid="team-merge-copy"');
+		const blocked = await outcome(
+			view(
+				{
+					kind: "prepared",
+					mergeCommit: "a".repeat(40),
+					baseSha: "b".repeat(40),
+					checkedOutAt: "/home/alice/app",
+					at: "2026-11-25T00:00:00.000Z",
+				},
+				{
+					fastForward: {
+						available: false,
+						blocker: "sessions_running",
+						runningSessions: 2,
+						terminals: 0,
+						command: {
+							sh: "git -C /home/alice/app merge --ff-only --no-autostash --no-overwrite-ignore abc",
+							powershell:
+								"if ((git -C '/home/alice/app' symbolic-ref --quiet HEAD) -ceq 'refs/heads/main') { git -C '/home/alice/app' merge --ff-only abc }",
+							preferred: "powershell",
+						},
+						files: ["src/a.ts", "upstream/u.ts"],
+						filesMore: false,
+					},
+				},
+			),
+		);
+		expect(blocked).toMatch(/<button[^>]*disabled=""[^>]*data-testid="team-merge-fast-forward"/);
+		// A refused fast-forward keeps the prepared merge, with git's files and the command (review 11).
+		const refused = await outcome(
+			view(
+				{
+					kind: "prepared",
+					mergeCommit: "a".repeat(40),
+					baseSha: "b".repeat(40),
+					checkedOutAt: "/home/alice/app",
+					at: "2026-11-25T00:00:00.000Z",
+					fastForwardFailure: {
+						code: "TEAM_MERGE_FAST_FORWARD_REFUSED",
+						message: "error: Your local changes would be overwritten",
+						files: ["src/a.ts", "src/b.ts"],
+						at: "2026-11-25T00:01:00.000Z",
+					},
+				},
+				{
+					fastForward: {
+						available: true,
+						blocker: null,
+						runningSessions: 0,
+						terminals: 0,
+						command: {
+							sh: "git -C /home/alice/app merge --ff-only --no-autostash --no-overwrite-ignore abc",
+							powershell:
+								"if ((git -C '/home/alice/app' symbolic-ref --quiet HEAD) -ceq 'refs/heads/main') { git -C '/home/alice/app' merge --ff-only abc }",
+							preferred: "powershell",
+						},
+						files: ["src/a.ts", "upstream/u.ts"],
+						filesMore: false,
+					},
+				},
+			),
+		);
+		expect(refused).toContain('data-code="TEAM_MERGE_FAST_FORWARD_REFUSED"');
+		expect(refused).toContain("src/b.ts");
+		expect(refused).toContain('data-testid="team-merge-fast-forward"');
+		expect(refused).toContain('data-testid="team-merge-command"');
+		expect(blocked).toContain("那里有 2 个会话在运行");
+		// Off the base the blocker shows and no command is offered (Devin 2).
+		const offBase = await outcome(
+			view(
+				{
+					kind: "prepared",
+					mergeCommit: "a".repeat(40),
+					baseSha: "b".repeat(40),
+					checkedOutAt: "/home/alice/app",
+					at: "2026-11-25T00:00:00.000Z",
+				},
+				{
+					fastForward: {
+						available: false,
+						blocker: "not_on_base",
+						runningSessions: 0,
+						terminals: 0,
+						command: null,
+						files: [],
+						filesMore: false,
+					},
+				},
+			),
+		);
+		expect(offBase).toContain('data-testid="team-merge-blocker"');
+		expect(offBase).not.toContain('data-testid="team-merge-command"');
 	});
 });

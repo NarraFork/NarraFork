@@ -414,7 +414,13 @@ export class PluginContributionCoordinator {
 				.map((state) => [
 					state.pluginId,
 					state.desiredState ?? null,
-					state.runtimeState ?? null,
+					// Lazy activation's inactive → starting → active edges do not
+					// change any contribution's availability. Fingerprint the same
+					// fail-closed projection the registries apply below instead.
+					lifecycleUnavailableReason(
+						state,
+						prepared.find((item) => item.plugin.pluginId === state.pluginId)?.packageSummary,
+					) ?? null,
 					state.compatibility ?? null,
 				])
 				.sort(([a], [b]) => String(a).localeCompare(String(b))),

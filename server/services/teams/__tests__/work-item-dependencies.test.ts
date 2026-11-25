@@ -29,6 +29,7 @@ import {
 	assertWorkItemStartable,
 	readDependencies,
 	readDependents,
+	setDependencyReachForTests,
 	setUnblockDeliveryForTests,
 } from "../work-item-dependencies";
 import {
@@ -56,6 +57,9 @@ let temporary: string;
 const delivered: { teamId: string; itemId: string; text: string; userId: string | null }[] = [];
 
 beforeEach(async () => {
+	// No git here: every merged dependency counts as inside the dependent's start ref (the git
+	// check itself is covered in team-work-start.test.ts).
+	setDependencyReachForTests(async () => ({ label: "main", missing: [] }));
 	temporary = await mkdtemp(join(tmpdir(), "nf-team-deps-"));
 	delivered.length = 0;
 	sqlite.run(
@@ -125,7 +129,10 @@ afterEach(async () => {
 	await rm(temporary, { recursive: true, force: true });
 });
 
-afterAll(() => setWorkItemPortsForTests(null));
+afterAll(() => {
+	setWorkItemPortsForTests(null);
+	setDependencyReachForTests(null);
+});
 
 const create = (title: string, dependsOn?: string[], coordinatorId = LEAD) =>
 	createWorkItem({
