@@ -3,7 +3,7 @@ import crypto from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CodexManager } from "../codex-manager";
+import { type CodexImportCredentialInput, CodexManager } from "../codex-manager";
 
 function agentPrivateKeyBase64(): string {
 	const kp = crypto.generateKeyPairSync("ed25519");
@@ -140,6 +140,53 @@ describe("CodexManager import auth modes", () => {
 				},
 			]);
 			expect(second.duplicates).toBe(1);
+			const id = manager.snapshot().entries[0]?.id;
+			expect(id).toBeDefined();
+			expect(
+				manager.matchForTransfer([
+					{
+						id: "incoming-agent",
+						authMode: "agent_identity",
+						agentRuntimeId: "rt-dup",
+						agentPrivateKey: key,
+						accountId: "different-account",
+					},
+				])[0]?.existingId,
+			).toBe(id);
+		} finally {
+			manager.dispose();
+		}
+	});
+
+	test.each([
+		["refresh token", { refreshToken: " refresh-shared " }, { refreshToken: "refresh-shared" }],
+		["access token", { accessToken: " at-shared " }, { accessToken: "at-shared" }],
+		[
+			"subject",
+			{ refreshToken: "refresh-first", sub: "shared-subject" },
+			{ refreshToken: "refresh-second", sub: "shared-subject" },
+		],
+		[
+			"account and email",
+			{ refreshToken: "refresh-first", accountId: "account", email: "user@example.com" },
+			{ refreshToken: "refresh-second", accountId: "account", email: "user@example.com" },
+		],
+	] satisfies Array<
+		[string, CodexImportCredentialInput, CodexImportCredentialInput]
+	>)("import and transfer still dedupe by %s", (_kind, first, second) => {
+		const { manager, tmpHome } = createManager();
+		cleanup.push(tmpHome);
+		try {
+			expect(manager.importCredentials([first])).toEqual({ added: 1, duplicates: 0, skipped: 0 });
+			const id = manager.snapshot().entries[0]?.id;
+			expect(id).toBeDefined();
+			expect(manager.importCredentials([second])).toEqual({
+				added: 0,
+				duplicates: 1,
+				skipped: 0,
+			});
+			expect(manager.matchForTransfer([{ ...second, id: "incoming" }])[0]?.existingId).toBe(id);
+			expect(manager.snapshot().entries).toHaveLength(1);
 		} finally {
 			manager.dispose();
 		}

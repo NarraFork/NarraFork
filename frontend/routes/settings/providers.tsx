@@ -12,7 +12,7 @@ import {
 } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
-import type { TokenDancePublicConnection } from "@shared/tokendance";
+import type { TokenDanceLoginChoice, TokenDancePublicConnection } from "@shared/tokendance";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
 	createFileRoute,
@@ -300,9 +300,10 @@ function SettingsProvidersPage() {
 		};
 	}, [state.initialized, isTokenDanceCallback, user?.role, user?.id, navigate, qc, returnEpoch, t]);
 	const tokenDanceLogin = useCallback(
-		(addPage?: Record<string, unknown>) =>
+		(addPage?: Record<string, unknown>, loginChoice?: TokenDanceLoginChoice) =>
 			startTokenDanceLogin(
 				tokenDanceDraftSnapshot(stateRef.current, savedSnapshot.current, addPage),
+				loginChoice,
 			),
 		[],
 	);
@@ -1296,7 +1297,7 @@ function SettingsProvidersPage() {
 							modelProtocols={state.modelProtocols}
 							onModelProtocolChange={dispatchers.setModelProtocol}
 							onTestModel={setTestingModel}
-							onLogin={() => tokenDanceLogin()}
+							onLogin={(choice) => tokenDanceLogin(undefined, choice)}
 							onChanged={refreshTokenDanceSettings}
 							onDeleted={() => setSelectedProvider(null)}
 						/>

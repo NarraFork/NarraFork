@@ -14,9 +14,13 @@ import {
 import { applyNugModelCatalogUpdate } from "../lib/nug-model-sync";
 import {
 	buildNugQuotaCache,
+	type CapturedNugQuotaSubject,
+	captureNugQuotaSubject,
 	fetchNugQuota,
 	getAllNugCachedQuotas,
 	getNugCachedQuota,
+	getNugQuotaSnapshot,
+	type NugQuotaCache,
 	normalizeNugQuotaResponse,
 	purgeNugQuotaCache,
 	setNugCachedQuota,
@@ -24,7 +28,6 @@ import {
 } from "../lib/nug-quota-cache";
 import { getNugRelayStatus } from "../lib/nug-relay/manager";
 import {
-	getSettingsRevision,
 	type NUGProviderConfig,
 	nugProviderPrefix,
 	registerNugModelChecker,
@@ -49,11 +52,19 @@ function normalizeNugBaseUrl(baseUrl: string | undefined): string {
 		.replace(/\/(?:api\/v1|api|v1)$/i, "");
 }
 
-function getNugProvider(id: string): { config: NUGProviderConfig; provider: NugProvider } | null {
-	const providers = settings.nugProviders ?? [];
-	const config = providers.find((p) => p.id === id);
-	if (!config) return null;
-	return { config, provider: new NugProvider(config) };
+function getNugProvider(id: string): {
+	config: NUGProviderConfig;
+	provider: NugProvider;
+	quotaSubject: CapturedNugQuotaSubject;
+} | null {
+	const configured = (settings.nugProviders ?? []).find((p) => p.id === id);
+	if (!configured) return null;
+	const quotaSubject = captureNugQuotaSubject(configured);
+	return {
+		config: quotaSubject.config,
+		provider: new NugProvider(quotaSubject.config),
+		quotaSubject,
+	};
 }
 
 type NugUsageRecord = Record<string, unknown>;
@@ -343,9 +354,10 @@ export async function fetchAllNugQuotas(): Promise<void> {
 	const providers = settings.nugProviders ?? [];
 	await Promise.allSettled(
 		providers.map(async (p) => {
-			const data = await fetchNugQuota(p);
+			const quotaSubject = captureNugQuotaSubject(p);
+			const data = await fetchNugQuota(quotaSubject.config);
 			if (data) {
-				setNugCachedQuota(p.id, buildNugQuotaCache(data, getNugCachedQuota(p.id)), p);
+				setNugCachedQuota(p.id, buildNugQuotaCache(data, getNugCachedQuota(p.id)), quotaSubject);
 				logger.debug("NUG quota fetched on startup", {
 					provider: p.name,
 					balance: data.balance,
@@ -593,8 +605,11 @@ nugRoutes.get("/providers/:id/quota", async (c) => {
 			string,
 			unknown
 		>;
+		const previous = getNugQuotaSnapshot(id, entry.quotaSubject.id)?.snapshot?.detail as
+			| NugQuotaCache
+			| undefined;
+		setNugCachedQuota(id, buildNugQuotaCache(data, previous), entry.quotaSubject);
 		const response = normalizeNugQuotaResponse(data);
-		setNugCachedQuota(id, buildNugQuotaCache(response, getNugCachedQuota(id)), entry.config);
 		// Keep the payment consumer's contract, not the template-private upstream payload.
 		return c.json({
 			balance: response.balance,
@@ -614,7 +629,7 @@ nugRoutes.get("/providers/:id/billing/config", async (c) => {
 	try {
 		const data = (await entry.provider.getBillingConfig()) as unknown as Record<string, unknown>;
 		const responseData = normalizeNugQuotaResponse(data);
-		setNugCachedQuota(id, buildNugQuotaCache(responseData, getNugCachedQuota(id)), entry.config);
+		setNugCachedQuota(id, buildNugQuotaCache(data, getNugCachedQuota(id)), entry.quotaSubject);
 		return c.json(responseData);
 	} catch (err: unknown) {
 		const msg = err instanceof Error ? err.message : "Unknown error";

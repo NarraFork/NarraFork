@@ -21,7 +21,6 @@ import {
 	quotaKeyOwner,
 	searchKeyOwner,
 	TOKENDANCE_KEY_OWNER,
-	tokenDanceLoginAccount,
 } from "../provider-keys";
 import { normalizeCustomApiProviderSettings } from "./custom-api-providers";
 import type { NarraForkSettings } from "./types";
@@ -131,15 +130,9 @@ export function absorbProviderKeys(settings: NarraForkSettings): boolean {
 	const store = getProviderKeyStore();
 	const slots = keySlots(settings);
 	const hadKeys = slots.some((slot) => !!slot.holder[slot.field]?.trim());
-	// Only the pre-pool settings secret identifies a legacy browser-login credential.
-	// Never infer login identity from a projected first key in a multi-key pool.
-	const legacyLoginKey = settings.tokendance?.apiKey?.trim();
-	const canIdentifyLegacyLogin = !!legacyLoginKey && store.list(TOKENDANCE_KEY_OWNER).length <= 1;
+	// Neither a legacy singleton id nor a projected/inline secret records OAuth provenance.
+	// Preserve real account metadata; unmarked upgrades choose a slot during OAuth instead.
 	store.syncFirstKeys(asStoreEntries(slots), { clearOnEmpty: false });
-	if (canIdentifyLegacyLogin && store.readable) {
-		const key = store.list(TOKENDANCE_KEY_OWNER).find((key) => key.apiKey === legacyLoginKey);
-		if (key && !key.account) store.update(key.id, { account: tokenDanceLoginAccount(key.apiKey) });
-	}
 	hydrateProviderKeys(settings);
 	return hadKeys && store.readable;
 }

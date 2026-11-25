@@ -19,7 +19,7 @@ mock.module("../net/outbound-fetch", () => ({
 
 const { getNarraforkPath } = await import("../narrafork-home");
 const { createPersistedCredentialCache } = await import("../persisted-credential-cache");
-const { getProviderKeyStore } = await import("../provider-keys");
+const { getProviderKeyStore, withProviderKey } = await import("../provider-keys");
 const { keyCooldown, resetProviderKeyRuntimeForTests, selectProviderKey } = await import(
 	"../agent/pooled-provider"
 );
@@ -37,6 +37,7 @@ const {
 } = await import("../opencode-usage-cache");
 const {
 	getDeepSeekQuotaSnapshot,
+	deepSeekQuotaIdentity,
 	isDeepSeekQuotaRefreshing,
 	refreshDeepSeekBalance,
 	syncDeepSeekBalanceCache,
@@ -74,6 +75,9 @@ let ids: string[] = [];
 function useProvider(config: ReturnType<typeof provider>) {
 	ids.push(config.id);
 	saveSettings({ ...settings, customApiProviders: [config] });
+	const keys = getProviderKeyStore();
+	if (!keys.listGroup(config.id).length)
+		keys.add(config.id, { id: config.id, apiKey: config.apiKey });
 	return config;
 }
 
@@ -234,6 +238,34 @@ describe("Kimi Code quota probe", () => {
 			});
 		const refresh = refreshKimiKeyUsage(config.id);
 		getProviderKeyStore().update(config.id, { apiKey: "sk-replacement" });
+		settle(Response.json(body));
+		await refresh;
+		expect(getKimiCachedUsage(config.id)).toBeUndefined();
+		expect(quotaStore.peek(config.id)).toBeUndefined();
+	});
+
+	test("a network-only key edit withdraws the cached allowance", async () => {
+		useProvider(provider("kimi-network", "https://api.kimi.com/coding/v1"));
+		const config = saved("kimi-network");
+		respond = async () => Response.json(body);
+		await refreshKimiKeyUsage(config.id);
+		expect(getKimiCachedUsage(config.id)).toBeDefined();
+		getProviderKeyStore().update(config.id, {
+			network: { extraHeaders: { "X-Account": "network-two" } },
+		});
+		expect(getKimiCachedUsage(config.id)).toBeUndefined();
+	});
+
+	test("a late answer from the old global proxy is not relabeled as the new network", async () => {
+		useProvider(provider("kimi-late-network", "https://api.kimi.com/coding/v1"));
+		const config = saved("kimi-late-network");
+		let settle!: (response: Response) => void;
+		respond = () =>
+			new Promise<Response>((done) => {
+				settle = done;
+			});
+		const refresh = refreshKimiKeyUsage(config.id);
+		settings.proxy = { mode: "custom", url: "http://replacement-proxy.example:8080" };
 		settle(Response.json(body));
 		await refresh;
 		expect(getKimiCachedUsage(config.id)).toBeUndefined();
@@ -425,6 +457,13 @@ describe("DeepSeek quota probe", () => {
 		gate.resolve(balance("20"));
 		await probing;
 		expect(getDeepSeekQuotaSnapshot(config.id)?.balances[0]?.remaining).toBe(9);
+		// Match the canonical fingerprint used by the template's Auto routing reader.
+		expect(
+			quotaStore.peekForIdentity(
+				second.id,
+				deepSeekQuotaIdentity(withProviderKey(saved(config.id), second)),
+			)?.balances[0]?.remaining,
+		).toBe(20);
 		expect(
 			readQuotaSnapshots(true, false).entries.find((entry) => entry.credentialId === second.id)
 				?.snapshot?.balances[0]?.remaining,

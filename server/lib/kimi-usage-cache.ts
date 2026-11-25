@@ -6,7 +6,8 @@ import { getNarraforkPath } from "./narrafork-home";
 import { outboundFetch } from "./net/outbound-fetch";
 import { resolveProxyForUrl } from "./net/proxy";
 import { shownSubjectId, type UsageSubject, usageSubjects } from "./provider-key-subjects";
-import type { CustomApiProviderConfig } from "./settings";
+import { type CustomApiProviderConfig, settings } from "./settings";
+import { quotaNetworkIdentity } from "./sourcing/quota-identity";
 import { quotaStore } from "./sourcing/quota-store";
 
 /**
@@ -370,9 +371,9 @@ function restoreSnapshot(snapshot: QuotaSnapshot): QuotaSnapshot {
 	);
 }
 
-/** The usage endpoint answers for (baseUrl, apiKey) and nothing else. */
-const identity = (config: CustomApiProviderConfig) =>
-	JSON.stringify([config.baseUrl, config.apiKey]);
+/** The account and effective network whose allowance a new request would use. */
+export const kimiQuotaIdentity = (config: CustomApiProviderConfig): string =>
+	JSON.stringify([config.baseUrl, config.apiKey, quotaNetworkIdentity(config, settings.proxy)]);
 
 /** One quota probe: fetch, then the shared snapshot shape. Throws on failure. */
 export async function probeKimiQuota(
@@ -383,7 +384,7 @@ export async function probeKimiQuota(
 }
 
 function usageOf(subject: UsageSubject): KimiUsageCache | undefined {
-	const snapshot = quotaStore.get(subject.id, identity(subject.config), restoreSnapshot);
+	const snapshot = quotaStore.get(subject.id, kimiQuotaIdentity(subject.config), restoreSnapshot);
 	if (!snapshot) return undefined;
 	knownIds.add(subject.id);
 	const { fiveHour, weekly, monthly, extraWindows } = snapshot.detail as KimiUsagePayload;
@@ -399,7 +400,7 @@ function usageOf(subject: UsageSubject): KimiUsageCache | undefined {
 
 function setUsage(subject: UsageSubject, snapshot: QuotaSnapshot): void {
 	knownIds.add(subject.id);
-	quotaStore.set(subject.id, identity(subject.config), snapshot);
+	quotaStore.set(subject.id, kimiQuotaIdentity(subject.config), snapshot);
 }
 
 // ---------------------------------------------------------------------------
@@ -417,12 +418,13 @@ function refreshSubject(subject: UsageSubject): Promise<KimiUsageCache | null> {
 	const inFlight = refreshInFlightByProvider.get(id);
 	if (inFlight) return inFlight;
 	const run = (async (): Promise<KimiUsageCache | null> => {
+		const expectedIdentity = kimiQuotaIdentity(subject.config);
 		const existing = usageOf(subject);
 		// A provider can be edited or re-purposed while the request is out; its late answer
 		// must not publish into the snapshot another source now reads for this credential.
 		const current = () =>
 			kimiSubjects().some(
-				(s) => s.id === subject.id && identity(s.config) === identity(subject.config),
+				(s) => s.id === subject.id && kimiQuotaIdentity(s.config) === expectedIdentity,
 			);
 		try {
 			const fresh = await probeKimiQuota(subject);
@@ -505,7 +507,7 @@ export const isKimiQuotaRefreshing = (keyId: string): boolean =>
 export function getKimiQuotaSnapshot(keyId: string): QuotaSnapshot | undefined {
 	const subject = kimiSubjects().find((s) => s.id === keyId);
 	return subject
-		? quotaStore.get(subject.id, identity(subject.config), restoreSnapshot)
+		? quotaStore.get(subject.id, kimiQuotaIdentity(subject.config), restoreSnapshot)
 		: undefined;
 }
 

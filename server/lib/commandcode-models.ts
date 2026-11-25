@@ -5,7 +5,7 @@
  * 那样硬编码，而是拉取后缓存。设置读取只看缓存并在后台补拉，不把上游延迟算进这次响应。
  */
 
-import { resolveCommandCodeToken } from "./commandcode-manager";
+import { type CommandCodeCredential, resolveCommandCodeToken } from "./commandcode-manager";
 import {
 	type CommandCodeModelInfo,
 	commandCodeProviderBase,
@@ -25,6 +25,7 @@ interface ModelCache {
 	fetchedAt: number;
 	token: string;
 	base: string;
+	source: CommandCodeCredential["source"];
 	/** 上游失败。短时间内不再打，避免设置页每次读取都等满超时。 */
 	negative: boolean;
 }
@@ -39,11 +40,7 @@ export function captureCommandCodeModelOptions(
 	apiKey?: string,
 	baseUrl?: string,
 ) {
-	const credential = resolveCommandCodeToken(apiKey).credential;
-	const pinned =
-		credential && cache && sameSlot(cache, credential.token, commandCodeProviderBase(baseUrl))
-			? cache.models
-			: undefined;
+	const pinned = getCachedCommandCodeModels(apiKey, baseUrl);
 	return captureModelOptionsArray(
 		pinned,
 		(model) => optionInput(group, model.id),
@@ -57,8 +54,8 @@ export interface CommandCodeModelSnapshot {
 	pending: boolean;
 }
 
-function cacheKey(token: string, base: string): string {
-	return `${base}\n${token}`;
+function cacheKey(token: string, base: string, source: CommandCodeCredential["source"]): string {
+	return `${source}\n${base}\n${token}`;
 }
 
 function sameSlot(entry: ModelCache, token: string, base: string): boolean {
@@ -82,18 +79,36 @@ export function getCachedCommandCodeModel(modelId: string): CommandCodeModelInfo
 	return cache?.models.find((model) => model.id === modelId);
 }
 
+/** Published directory only: no auth-file reads, TTL revalidation or background refresh. */
+export function getCachedCommandCodeModels(
+	apiKey?: string,
+	baseUrl?: string,
+): readonly CommandCodeModelInfo[] {
+	if (!cache || cache.base !== commandCodeProviderBase(baseUrl)) return [];
+	const token = apiKey?.trim();
+	// A cleared settings key must not turn its old directory into a CLI publication.
+	return (token ? cache.token === token : cache.source === "cli") ? cache.models : [];
+}
+
 /**
  * 设置响应用：有新鲜缓存就返回，否则启动一次去重的后台拉取并立刻返回已有结果（可能为空）。
  */
 export function peekCommandCodeModels(apiKey?: string, baseUrl?: string): CommandCodeModelSnapshot {
 	const auth = resolveCommandCodeToken(apiKey);
-	if (!auth.credential) return { models: [], pending: false };
-	const token = auth.credential.token;
+	if (!auth.credential) {
+		if (cache?.source === "cli") invalidateCommandCodeModelsCache();
+		return { models: [], pending: false };
+	}
+	const { token, source } = auth.credential;
 	const base = commandCodeProviderBase(baseUrl);
 	if (cache && sameSlot(cache, token, base) && fresh(cache)) {
+		if (cache.source !== source) {
+			cache.source = source;
+			publicationGeneration++;
+		}
 		return { models: cache.models.map((model) => model.id), pending: false };
 	}
-	void loadCommandCodeModels(token, base);
+	void loadCommandCodeModels(token, base, source);
 	const stale = cache && sameSlot(cache, token, base) ? cache.models.map((model) => model.id) : [];
 	return { models: stale, pending: true };
 }
@@ -104,29 +119,45 @@ export async function listCommandCodeModels(
 	baseUrl?: string,
 ): Promise<{ models: string[]; ok: boolean }> {
 	const auth = resolveCommandCodeToken(apiKey);
-	if (!auth.credential) return { models: [], ok: false };
-	const token = auth.credential.token;
+	if (!auth.credential) {
+		if (cache?.source === "cli") invalidateCommandCodeModelsCache();
+		return { models: [], ok: false };
+	}
+	const { token, source } = auth.credential;
 	const base = commandCodeProviderBase(baseUrl);
 	if (cache && sameSlot(cache, token, base) && fresh(cache)) {
+		if (cache.source !== source) {
+			cache.source = source;
+			publicationGeneration++;
+		}
 		return { models: cache.models.map((model) => model.id), ok: !cache.negative };
 	}
-	await loadCommandCodeModels(token, base);
+	await loadCommandCodeModels(token, base, source);
 	if (!cache || !sameSlot(cache, token, base)) return { models: [], ok: false };
 	return { models: cache.models.map((model) => model.id), ok: !cache.negative };
 }
 
-function loadCommandCodeModels(token: string, base: string): Promise<void> {
-	const key = cacheKey(token, base);
+function loadCommandCodeModels(
+	token: string,
+	base: string,
+	source: CommandCodeCredential["source"],
+): Promise<void> {
+	const key = cacheKey(token, base, source);
 	if (inflight?.key === key) return inflight.task;
 	const gen = generation;
-	const task = fetchCommandCodeModels(token, base, gen).finally(() => {
+	const task = fetchCommandCodeModels(token, base, gen, source).finally(() => {
 		if (inflight?.task === task) inflight = undefined;
 	});
 	inflight = { key, task };
 	return task;
 }
 
-async function fetchCommandCodeModels(token: string, base: string, gen: number): Promise<void> {
+async function fetchCommandCodeModels(
+	token: string,
+	base: string,
+	gen: number,
+	source: CommandCodeCredential["source"],
+): Promise<void> {
 	const previous = cache && sameSlot(cache, token, base) ? cache.models : [];
 	try {
 		const response = await fetch(`${base}/models`, {
@@ -135,26 +166,32 @@ async function fetchCommandCodeModels(token: string, base: string, gen: number):
 		});
 		if (gen !== generation) return;
 		if (!response.ok) {
-			rememberFailure(token, base, previous);
+			rememberFailure(token, base, previous, source);
 			return;
 		}
 		const models = parseCommandCodeModels(await readResponseJsonLimited(response, MAX_BODY_BYTES));
 		if (gen !== generation) return;
 		publicationGeneration++;
-		cache = { models, fetchedAt: Date.now(), token, base, negative: false };
+		cache = { models, fetchedAt: Date.now(), token, base, source, negative: false };
 	} catch {
 		if (gen !== generation) return;
-		rememberFailure(token, base, previous);
+		rememberFailure(token, base, previous, source);
 	}
 }
 
-function rememberFailure(token: string, base: string, previous: CommandCodeModelInfo[]): void {
+function rememberFailure(
+	token: string,
+	base: string,
+	previous: CommandCodeModelInfo[],
+	source: CommandCodeCredential["source"],
+): void {
 	publicationGeneration++;
 	cache = {
 		models: previous,
 		fetchedAt: Date.now(),
 		token,
 		base,
+		source,
 		negative: true,
 	};
 }

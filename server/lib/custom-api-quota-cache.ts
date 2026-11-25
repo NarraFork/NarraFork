@@ -4,6 +4,7 @@ import { getNarraforkPath } from "./narrafork-home";
 import { credentialForStream, firstCredential } from "./provider-key-subjects";
 import { getProviderKeyStore, withProviderKey } from "./provider-keys";
 import { type CustomApiProviderConfig, settings } from "./settings";
+import { quotaNetworkIdentity } from "./sourcing/quota-identity";
 import { quotaStore, STREAM_QUOTA_SOURCE } from "./sourcing/quota-store";
 
 export interface CustomApiQuotaCache {
@@ -25,9 +26,18 @@ function normalizeDetailedQuotaBalance(value: unknown): string | null {
 	return normalizeQuotaBalance(value);
 }
 
-const identity = (config: CustomApiProviderConfig) =>
-	JSON.stringify([config.baseUrl, config.apiKey]);
-const knownCredentialIds = new Map<string, string>();
+/** Store identity for stream snapshots, distinct from the request-time stale-event guard. */
+export const customApiStreamQuotaIdentity = (config: CustomApiProviderConfig): string =>
+	JSON.stringify([config.baseUrl, config.apiKey, quotaNetworkIdentity(config, settings.proxy)]);
+const knownCredentialIds = new Map<string, Set<string>>();
+function rememberCredential(providerId: string, credentialId: string): void {
+	let ids = knownCredentialIds.get(providerId);
+	if (!ids) {
+		ids = new Set();
+		knownCredentialIds.set(providerId, ids);
+	}
+	ids.add(credentialId);
+}
 
 function customApiQuotaSnapshot(cache: CustomApiQuotaCache): QuotaSnapshot {
 	const remaining = cache.quotaBalance === null ? null : Number(cache.quotaBalance);
@@ -75,10 +85,10 @@ export function updateCustomApiQuotaByPrefix(
 	if (!config) return;
 	const credential = credentialForStream(config, expectedProviderIdentity);
 	if (!credential) return;
-	knownCredentialIds.set(config.id, credential.id);
+	rememberCredential(config.id, credential.id);
 	quotaStore.set(
 		credential.id,
-		identity(credential.config),
+		customApiStreamQuotaIdentity(credential.config),
 		customApiQuotaSnapshot({
 			quotaBalance: normalizeQuotaBalance(quotaBalance),
 			detailedQuotaBalance: normalizeDetailedQuotaBalance(detailedQuotaBalance),
@@ -104,7 +114,12 @@ export function getCustomApiQuotaSnapshot(
 			? config
 			: undefined;
 	return effective
-		? quotaStore.get(credentialId, identity(effective), restoreSnapshot, STREAM_QUOTA_SOURCE)
+		? quotaStore.get(
+				credentialId,
+				customApiStreamQuotaIdentity(effective),
+				restoreSnapshot,
+				STREAM_QUOTA_SOURCE,
+			)
 		: undefined;
 }
 
@@ -112,10 +127,10 @@ export function getCustomApiCachedQuota(providerId: string): CustomApiQuotaCache
 	const config = provider(providerId);
 	if (!config) return undefined;
 	const credential = firstCredential(config);
-	knownCredentialIds.set(providerId, credential.id);
+	rememberCredential(providerId, credential.id);
 	const snapshot = quotaStore.get(
 		credential.id,
-		identity(credential.config),
+		customApiStreamQuotaIdentity(credential.config),
 		restoreSnapshot,
 		STREAM_QUOTA_SOURCE,
 	);
@@ -142,8 +157,9 @@ export function getAllCustomApiCachedQuotas(): Record<
 export function purgeCustomApiQuotaCache(removedIds: string[]): void {
 	for (const id of removedIds) {
 		const config = provider(id);
-		const credentialId = knownCredentialIds.get(id) ?? (config ? firstCredential(config).id : id);
+		const credentialIds = knownCredentialIds.get(id) ?? new Set<string>();
+		credentialIds.add(config ? firstCredential(config).id : id);
 		knownCredentialIds.delete(id);
-		quotaStore.remove(credentialId, STREAM_QUOTA_SOURCE);
+		for (const credentialId of credentialIds) quotaStore.remove(credentialId, STREAM_QUOTA_SOURCE);
 	}
 }

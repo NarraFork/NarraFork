@@ -20,6 +20,7 @@ import { resolveCommandCodeToken } from "../commandcode-manager";
 import {
 	captureCommandCodeModelOptions,
 	getCachedCommandCodeModel,
+	getCachedCommandCodeModels,
 	peekCommandCodeModels,
 } from "../commandcode-models";
 import { COMMAND_CODE_PREFIX } from "../commandcode-protocol";
@@ -891,16 +892,12 @@ export function resolveEffectiveModel(
 	return raw;
 }
 
-/**
- * Command Code 的模型来自上游目录（`GET /provider/v1/models`），这里只读它已有的缓存：
- * `peekCommandCodeModels` 立刻返回（命中、过期旧值或空），并在需要时补一次去重的后台拉取，
- * 所以这条同步路径不会被上游延迟拖住。未启用或没有凭据时没有模型。
- */
+/** Published directory only; settings/model-list management owns auth checks and refreshes. */
 function listCommandCodeModelValues(): string[] {
 	const config = s().commandCode;
 	if (config?.disabled) return [];
-	return peekCommandCodeModels(config?.apiKey, config?.baseUrl).models.map(
-		(model) => `${COMMAND_CODE_PREFIX}:${model}`,
+	return getCachedCommandCodeModels(config?.apiKey, config?.baseUrl).map(
+		(model) => `${COMMAND_CODE_PREFIX}:${model.id}`,
 	);
 }
 

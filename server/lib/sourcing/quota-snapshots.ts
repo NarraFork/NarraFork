@@ -128,10 +128,8 @@ function directSnapshot(group: SourceGroupView, id: string): QuotaSnapshot | und
 			const quota = getNugQuotaSnapshot(group.id, id);
 			return quota?.credentialId === id ? quota.snapshot : undefined;
 		}
-		case "tokendance": {
-			const quota = getTokenDanceQuotaSnapshot();
-			return quota?.credentialId === id ? quota.snapshot : undefined;
-		}
+		case "tokendance":
+			return getTokenDanceQuotaSnapshot(id)?.snapshot;
 		case "command-code":
 			return getCommandCodeQuotaSnapshot(id)?.snapshot;
 		default: {
@@ -153,7 +151,7 @@ function sourceRefreshing(group: SourceGroupView, id: string | null): boolean {
 		case "nug":
 			return isNugQuotaRefreshing(group.id, id ?? undefined);
 		case "tokendance":
-			return isTokenDanceQuotaRefreshing();
+			return isTokenDanceQuotaRefreshing(id ?? undefined);
 		case "command-code":
 			return isCommandCodeQuotaRefreshing(id ?? undefined);
 		default:
@@ -347,6 +345,7 @@ export function refreshQuotaSnapshots(
 		const probe = getServiceTemplate(group.templateId).probeQuota;
 		if (!probe) continue;
 		for (const id of credentialIds(group)) {
+			if (getProviderKeyStore().get(id)?.disabled) continue;
 			if (!filter.credentialId || filter.credentialId === id) jobs.push(probe(group, id));
 		}
 	}

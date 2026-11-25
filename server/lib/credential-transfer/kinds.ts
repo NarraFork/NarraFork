@@ -1,15 +1,27 @@
 /** The single credential format shared by credential transfer and data exports. */
 import { SERVICE_TEMPLATE_IDS } from "@shared/sourcing/identify";
-import { codexFromCredential, codexToCredential, getCodexManager } from "../codex-manager";
+import { restoreTokenDanceLoginAccount } from "../../services/tokendance-service";
+import {
+	codexFromCredential,
+	codexToCredential,
+	getCodexManager,
+	parseStoredCodexCredentials,
+} from "../codex-manager";
 import type { Credential, GroupSecrets } from "../credential-store";
 import { generateShortId } from "../id";
-import { getProviderKeyStore } from "../provider-keys";
+import { getProviderKeyStore, keyPartOf } from "../provider-keys";
 import { saveSettings, settings } from "../settings";
 import type { CustomApiProviderConfig, NUGProviderConfig } from "../settings/types";
 import { createGroupAllocator } from "../sourcing/allocate-group";
 import { getSourceGroup, listSourceGroups, type SourceGroupView } from "../sourcing/source-groups";
-import type { ServiceTemplateId } from "../sourcing/templates";
+import { getServiceTemplate, type ServiceTemplateId } from "../sourcing/templates";
 import type { BundleItem } from "./bundle";
+import {
+	asPluginTransferData,
+	importPluginCredential,
+	matchPluginCredential,
+	pluginCredentialItems,
+} from "./plugin";
 
 export interface TransferableCredential {
 	kind: "credential";
@@ -19,18 +31,6 @@ export interface TransferableCredential {
 }
 
 export type ImportDecision = "add" | "replace" | "skip";
-
-export interface TransferKind {
-	kind: "credential";
-	list(): TransferableCredential[];
-	export(ids: readonly string[] | undefined): BundleItem[];
-	/** Aligned with `data`; null marks an item this instance cannot use. */
-	match(data: readonly unknown[]): Array<{ label: string; existingId?: string } | null>;
-	import(
-		data: readonly unknown[],
-		decide: (index: number, existingId: string | undefined) => ImportDecision,
-	): { added: number; replaced: number; skipped: number };
-}
 
 export type TransferGroup = Record<string, unknown> & {
 	id: string;
@@ -175,6 +175,7 @@ function groupItems(
 									}
 								: {}),
 							...(key.network ? { network: structuredClone(key.network) } : {}),
+							...(key.account ? { account: structuredClone(key.account) } : {}),
 							auth: { kind: "api_key", apiKey: key.apiKey },
 						}),
 					);
@@ -190,8 +191,14 @@ function groupItems(
 }
 
 /** All credentials for the credential-transfer card. Codex accounts are included here only. */
-function allCredentialItems(): BundleItem[] {
-	return listSourceGroups().flatMap((view) => groupItems(view, true, false));
+async function allCredentialItems(): Promise<BundleItem[]> {
+	// Plugin bags use stable contribution identities and the Vault in either storage mode.
+	return [
+		...listSourceGroups()
+			.filter((view) => view.templateId !== "plugin")
+			.flatMap((view) => groupItems(view, true, false)),
+		...(await pluginCredentialItems()),
+	];
 }
 
 /** Credentials for provider groups present in providers.json (never Codex accounts). */
@@ -234,6 +241,7 @@ export function asCredentialTransferData(raw: unknown): CredentialTransferData |
 	) {
 		return null;
 	}
+	if (item.templateId === "plugin") return asPluginTransferData(item as CredentialTransferData);
 	if (item.credential) {
 		if (!item.credential.auth || typeof item.credential.auth !== "object") return null;
 		if (item.templateId === "codex" && item.credential.auth.kind === "api_key") return null;
@@ -241,6 +249,16 @@ export function asCredentialTransferData(raw: unknown): CredentialTransferData |
 		if (item.credential.auth.kind === "api_key" && !item.credential.auth.apiKey.trim()) return null;
 	}
 	if (!item.credential && !item.groupSecrets) return null;
+	if (item.templateId === "codex" && item.credential) {
+		// The old matcher normalized JWT/display-name identity before computing dedupe keys.
+		// Keep that pure normalization so a rotated token still replaces the same account.
+		const normalized = parseStoredCodexCredentials([
+			codexFromCredential({ ...item.credential, id: "transfer" }),
+		])[0];
+		if (!normalized) return null;
+		const { id: _id, ...credential } = codexToCredential(normalized);
+		return { ...structuredClone(item), credential } as CredentialTransferData;
+	}
 	return structuredClone(item) as CredentialTransferData;
 }
 
@@ -265,17 +283,29 @@ export function targetTransferGroup(item: CredentialTransferData): SourceGroupVi
 	);
 }
 
-function existingApiKey(groupId: string, credential: Omit<Credential, "id">): string | undefined {
-	if (credential.auth.kind !== "api_key") return undefined;
-	const apiKey = credential.auth.apiKey;
-	return getProviderKeyStore()
-		.listGroup(groupId)
-		.find((key) => key.apiKey === apiKey)?.id;
+function existingCredential(
+	templateId: ServiceTemplateId,
+	groupId: string,
+	credential: Omit<Credential, "id">,
+): string | undefined {
+	const template = getServiceTemplate(templateId);
+	const keys = new Set(template.dedupeKeys({ ...credential, target: { groupId } }));
+	const candidates =
+		templateId === "codex"
+			? getCodexManager()
+					.exportForTransfer()
+					.map((entry) => codexToCredential(entry))
+			: keyPartOf(getProviderKeyStore().listGroup(groupId)).credentials;
+	return candidates.find((candidate) =>
+		template.dedupeKeys({ ...candidate, target: { groupId } }).some((key) => keys.has(key)),
+	)?.id;
 }
 
-function matchItem(item: CredentialTransferData): { label: string; existingId?: string } | null {
+async function matchItem(
+	item: CredentialTransferData,
+): Promise<{ label: string; existingId?: string } | null> {
+	if (item.templateId === "plugin") return matchPluginCredential(item);
 	const target = targetTransferGroup(item);
-	if (item.templateId === "plugin") return null;
 	if (!item.credential) {
 		const hasSecrets =
 			target && Object.values(getProviderKeyStore().groupSecrets(target.id)).some(Boolean);
@@ -285,14 +315,11 @@ function matchItem(item: CredentialTransferData): { label: string; existingId?: 
 		};
 	}
 	const label = credentialLabel(item.group, item.credential);
-	if (item.templateId === "codex") {
-		const raw = codexFromCredential({ ...item.credential, id: generateShortId() });
-		return getCodexManager().matchForTransfer([raw])[0];
-	}
 	if (!target) return { label };
+	if (getServiceTemplate(item.templateId).dedupeKeys(item.credential).length === 0) return null;
 	return {
 		label: `${target.name} · ${label.split(" · ").slice(1).join(" · ")}`,
-		existingId: existingApiKey(target.id, item.credential),
+		existingId: existingCredential(item.templateId, target.id, item.credential),
 	};
 }
 
@@ -333,115 +360,137 @@ function importGroupSecrets(groupId: string, secrets: GroupSecrets): void {
 	getProviderKeyStore().setGroupSecrets(groupId, secrets);
 }
 
-const credentialKind: TransferKind = {
-	kind: "credential",
-	list: () =>
-		allCredentialItems().map((item) => ({
-			kind: "credential",
-			id: item.id,
-			label: item.label,
-			...((item.data as CredentialTransferData).credential?.archivedAt ? { archived: true } : {}),
-		})),
-	export: (ids) => {
-		const wanted = ids ? new Set(ids) : null;
-		return allCredentialItems().filter((item) => !wanted || wanted.has(item.id));
-	},
-	match: (data) =>
-		data.map((raw) => {
-			const item = asCredentialTransferData(raw);
-			return item ? matchItem(item) : null;
-		}),
-	import: (data, decide) => {
-		const result = { added: 0, replaced: 0, skipped: 0 };
-		const allocator = createGroupAllocator();
-		const targets = new Map<string, SourceGroupView>();
-		const createdIds = new Set<string>();
-		data.forEach((raw, index) => {
-			const item = asCredentialTransferData(raw);
-			if (!item || item.templateId === "plugin") {
-				result.skipped++;
-				return;
-			}
-			const key = transferGroupKey(item.templateId, item.group.id);
-			const cached = targets.get(key);
-			let target = cached ?? targetTransferGroup(item);
-			// Endpoint matching is for groups that already existed locally. A distinct incoming
-			// group must not collapse into another group created earlier in this same bundle.
-			if (!cached && target && createdIds.has(target.id)) target = undefined;
-			const store = getProviderKeyStore();
-			const existing =
-				item.credential && target
-					? item.templateId === "codex"
-						? matchItem(item)?.existingId
-						: existingApiKey(target.id, item.credential)
-					: target && !item.credential && Object.values(store.groupSecrets(target.id)).some(Boolean)
-						? target.id
-						: undefined;
-			const action = decide(index, existing);
-			if (action === "skip" || (action === "add" && existing)) {
-				result.skipped++;
-				return;
-			}
+export async function listCredentialSummaries(): Promise<TransferableCredential[]> {
+	return (await allCredentialItems()).map((item) => ({
+		kind: "credential",
+		id: item.id,
+		label: item.label,
+		...((item.data as CredentialTransferData).credential?.archivedAt ? { archived: true } : {}),
+	}));
+}
+
+export async function exportCredentialItems(ids?: readonly string[]): Promise<BundleItem[]> {
+	const wanted = ids ? new Set(ids) : null;
+	return (await allCredentialItems()).filter((item) => !wanted || wanted.has(item.id));
+}
+
+export async function matchCredentialItem(raw: unknown) {
+	const item = asCredentialTransferData(raw);
+	return item ? matchItem(item) : null;
+}
+
+/** Process the bundle in wire order so decisions use its original item indices. */
+export async function importCredentialItems(
+	items: readonly BundleItem[],
+	decide: (index: number, existingId: string | undefined) => ImportDecision,
+): Promise<{ added: number; replaced: number; skipped: number }> {
+	const result = { added: 0, replaced: 0, skipped: 0 };
+	const allocator = createGroupAllocator();
+	const targets = new Map<string, SourceGroupView>();
+	const createdIds = new Set<string>();
+	for (const [index, raw] of items.entries()) {
+		const item = raw.kind === "credential" ? asCredentialTransferData(raw.data) : null;
+		if (!item) {
+			result.skipped++;
+			continue;
+		}
+		if (item.templateId === "plugin") {
+			const outcome = await importPluginCredential(item, (existingId) => decide(index, existingId));
+			result[outcome]++;
+			continue;
+		}
+		const key = transferGroupKey(item.templateId, item.group.id);
+		const cached = targets.get(key);
+		let target = cached ?? targetTransferGroup(item);
+		// Endpoint matching is for groups that already existed locally. A distinct incoming
+		// group must not collapse into another group created earlier in this same bundle.
+		if (!cached && target && createdIds.has(target.id)) target = undefined;
+		const store = getProviderKeyStore();
+		const existing =
+			item.credential && target
+				? existingCredential(item.templateId, target.id, item.credential)
+				: target && !item.credential && Object.values(store.groupSecrets(target.id)).some(Boolean)
+					? target.id
+					: undefined;
+		const action = decide(index, existing);
+		if (action === "skip" || (action === "add" && existing)) {
+			result.skipped++;
+			continue;
+		}
+		if (!target) {
+			target = createGroup(item, allocator);
 			if (!target) {
-				target = createGroup(item, allocator);
-				if (!target) {
-					result.skipped++;
-					return;
-				}
-				createdIds.add(target.id);
-			}
-			targets.set(key, target);
-			if (item.groupSecrets) importGroupSecrets(target.id, item.groupSecrets);
-			if (!item.credential) {
-				if (existing) result.replaced++;
-				else result.added++;
-				return;
-			}
-			if (item.templateId === "codex") {
-				const rawCredential = codexFromCredential({
-					...item.credential,
-					id: generateShortId(),
-					target: { groupId: "codex" },
-				});
-				const imported = getCodexManager().importFromTransfer([rawCredential], () => action);
-				result.added += imported.added;
-				result.replaced += imported.replaced;
-				result.skipped += imported.skipped;
-				return;
-			}
-			if (item.credential.auth.kind !== "api_key") {
 				result.skipped++;
-				return;
+				continue;
 			}
-			const fields = {
-				label: item.credential.label ?? "",
-				disabled: !!item.credential.disabled,
-				...(item.credential.disabledReason === "manual" ||
-				item.credential.disabledReason === "invalid"
-					? { disabledReason: item.credential.disabledReason }
-					: {}),
-				network: item.credential.network ?? null,
-			};
-			if (existing) {
-				store.update(existing, fields);
-				result.replaced++;
-				return;
+			createdIds.add(target.id);
+		}
+		targets.set(key, target);
+		if (item.groupSecrets) importGroupSecrets(target.id, item.groupSecrets);
+		if (!item.credential) {
+			if (existing) result.replaced++;
+			else result.added++;
+			continue;
+		}
+		if (item.templateId === "codex") {
+			const rawCredential = codexFromCredential({
+				...item.credential,
+				id: generateShortId(),
+				target: { groupId: "codex" },
+			});
+			const imported = getCodexManager().importFromTransfer([rawCredential], () => action);
+			result.added += imported.added;
+			result.replaced += imported.replaced;
+			result.skipped += imported.skipped;
+			continue;
+		}
+		if (item.credential.auth.kind !== "api_key") {
+			result.skipped++;
+			continue;
+		}
+		const fields = {
+			label: item.credential.label ?? "",
+			...(item.templateId === "tokendance" ? {} : { account: item.credential.account ?? null }),
+			disabled: !!item.credential.disabled,
+			...(item.credential.disabledReason === "manual" ||
+			item.credential.disabledReason === "invalid"
+				? { disabledReason: item.credential.disabledReason }
+				: {}),
+			network: item.credential.network ?? null,
+		};
+		if (existing) {
+			store.update(existing, fields);
+			if (item.templateId === "tokendance") {
+				restoreTokenDanceLoginAccount(
+					existing,
+					item.credential.account ?? null,
+					action === "replace",
+				);
 			}
-			const added = store.addGroupCredential(
-				target.id,
-				item.templateId === "nug" ||
-					item.templateId === "tokendance" ||
-					item.templateId === "command-code"
-					? item.templateId
-					: undefined,
-				{ apiKey: item.credential.auth.apiKey },
+			result.replaced++;
+			continue;
+		}
+		const added = store.addGroupCredential(
+			target.id,
+			item.templateId === "nug" ||
+				item.templateId === "tokendance" ||
+				item.templateId === "command-code"
+				? item.templateId
+				: undefined,
+			{ apiKey: item.credential.auth.apiKey },
+		);
+		store.update(added.id, fields);
+		if (item.templateId === "tokendance") {
+			restoreTokenDanceLoginAccount(
+				added.id,
+				item.credential.account ?? null,
+				action === "replace",
 			);
-			store.update(added.id, fields);
-			result.added++;
-		});
-		return result;
-	},
-};
+		}
+		result.added++;
+	}
+	return result;
+}
 
 /** Restore only groups that a data import actually added; merged local groups keep their keys. */
 export function restoreProviderTransferItems(
@@ -451,6 +500,7 @@ export function restoreProviderTransferItems(
 	const store = getProviderKeyStore();
 	const result = { imported: 0, failed: 0 };
 	const secrets = new Map<string, { id: string; values: GroupSecrets }>();
+	const restored = new Set<string>();
 	for (const item of data) {
 		const target = added.get(transferGroupKey(item.templateId, item.group.id));
 		if (!target) continue;
@@ -462,25 +512,36 @@ export function restoreProviderTransferItems(
 		if (!item.credential || item.credential.auth.kind !== "api_key") continue;
 		try {
 			const apiKey = item.credential.auth.apiKey;
-			if (store.listGroup(target.id).some((key) => key.apiKey === apiKey)) continue;
-			const key = store.addGroupCredential(
-				target.id,
-				item.templateId === "nug" ||
-					item.templateId === "tokendance" ||
-					item.templateId === "command-code"
-					? item.templateId
-					: undefined,
-				{ apiKey },
-			);
-			store.update(key.id, {
+			const existingId = existingCredential(item.templateId, target.id, item.credential);
+			if (existingId && restored.has(existingId)) continue;
+			// Settings may already have recreated the first key. Restore its metadata too,
+			// notably TokenDance's login marker, without moving it to a different key.
+			const id =
+				existingId ??
+				store.addGroupCredential(
+					target.id,
+					item.templateId === "nug" ||
+						item.templateId === "tokendance" ||
+						item.templateId === "command-code"
+						? item.templateId
+						: undefined,
+					{ apiKey },
+				).id;
+			const fields = {
 				label: item.credential.label ?? "",
+				...(item.templateId === "tokendance" ? {} : { account: item.credential.account ?? null }),
 				disabled: !!item.credential.disabled,
 				...(item.credential.disabledReason === "manual" ||
 				item.credential.disabledReason === "invalid"
 					? { disabledReason: item.credential.disabledReason }
 					: {}),
 				network: item.credential.network ?? null,
-			});
+			};
+			store.update(id, fields);
+			if (item.templateId === "tokendance") {
+				restoreTokenDanceLoginAccount(id, item.credential.account ?? null);
+			}
+			restored.add(id);
 			result.imported++;
 		} catch {
 			result.failed++;
@@ -496,5 +557,3 @@ export function restoreProviderTransferItems(
 	}
 	return result;
 }
-
-export const KINDS: readonly TransferKind[] = [credentialKind];

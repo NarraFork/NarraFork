@@ -6,6 +6,7 @@ import {
 	getProviderKeyStore,
 	TOKENDANCE_KEY_OWNER,
 	tokenDanceLoginAccount,
+	withProviderKey,
 } from "../lib/provider-keys";
 import { isLegacyTokenDancePrefixAllowed } from "../lib/settings/tokendance-prefix";
 import type { NarraForkSettings } from "../lib/settings/types";
@@ -109,7 +110,8 @@ describe("TokenDance billing", () => {
 		const generation = connectBilling();
 		const updatedAt = Date.now() - 1000;
 		const legacy = createPersistedCredentialCache("tokendance-balance.json", (raw) => raw);
-		legacy.save("tokendance", JSON.stringify(["billing-secret-key", generation]), {
+		if (!fakeSettings.tokendance) throw new Error("billing fixture is not connected");
+		legacy.save("tokendance", JSON.stringify([fakeSettings.tokendance.apiKey, generation]), {
 			credits: 8_000_000,
 			creditsUsed: 3_000_000,
 			balance: 5_000_000,
@@ -210,6 +212,104 @@ describe("TokenDance billing", () => {
 		).rejects.toThrow("sign in again");
 	});
 
+	test("a manual second key refreshes its own balance, TTL and task without changing portal state", async () => {
+		const generation = connectBilling();
+		const store = getProviderKeyStore();
+		const login = bindLogin("billing-secret-key");
+		const manual = store.add(TOKENDANCE_KEY_OWNER, { apiKey: "second-manual-quota-key" });
+		const auth: string[] = [];
+		let finish!: (response: Response) => void;
+		fetchMock((url, init) => {
+			const bearer = new Headers(init?.headers).get("Authorization") ?? "";
+			auth.push(bearer);
+			if (url.includes("/payment/")) return json(paymentFixture());
+			if (bearer === "Bearer billing-secret-key")
+				return json({ balance: { credits: 10, credits_used: 3, balance: 7 } });
+			return new Promise<Response>((resolve) => {
+				finish = resolve;
+			});
+		});
+		expect(service.getTokenDanceQuotaSnapshot()).toEqual({
+			credentialId: login.id,
+			snapshot: undefined,
+		});
+		expect(service.getTokenDanceQuotaSnapshot(manual.id)).toEqual({
+			credentialId: manual.id,
+			snapshot: undefined,
+		});
+		await service.refreshTokenDanceBalance();
+		service.setTokenDanceRecoveryAction("top_up_balance", generation, login.apiKey);
+		const streamed = {
+			fetchedAt: Date.now(),
+			scope: "wallet" as const,
+			windows: [],
+			balances: [{ unit: "CNY", remaining: 99 }],
+		};
+		quotaStore.set(manual.id, "stream", streamed, false, STREAM_QUOTA_SOURCE);
+		store.reorder(TOKENDANCE_KEY_OWNER, [manual.id, login.id]);
+		fakeSettings.tokendance = {
+			...fakeSettings.tokendance,
+			apiKey: manual.apiKey,
+			generation,
+			disabled: false,
+		};
+		const task = service.refreshTokenDanceBalance(true, manual.id);
+		expect(service.isTokenDanceQuotaRefreshing(manual.id)).toBe(true);
+		expect(service.isTokenDanceQuotaRefreshing()).toBe(false);
+		expect(service.getTokenDanceBalance().balance).toBe(7);
+		const joined = service.refreshTokenDanceBalance(false, manual.id);
+		finish(json({ balance: { credits: 80, credits_used: 20, balance: 60 } }));
+		expect((await task).balance).toBe(60);
+		expect((await joined).balance).toBe(60);
+		expect(service.isTokenDanceQuotaRefreshing(manual.id)).toBe(false);
+		expect(service.getTokenDanceQuotaSnapshot(manual.id)?.snapshot?.detail).toMatchObject({
+			balance: 60,
+		});
+		expect(service.getTokenDanceQuotaSnapshot()?.snapshot?.detail).toMatchObject({ balance: 7 });
+		expect(service.getTokenDanceQuotaSnapshot()?.credentialId).toBe(login.id);
+		expect(service.getTokenDanceQuotaSnapshot(manual.id)?.credentialId).toBe(manual.id);
+		expect(quotaStore.peek(manual.id, STREAM_QUOTA_SOURCE)).toEqual(streamed);
+		await service.refreshTokenDanceBalance(false, manual.id);
+		expect(auth).toEqual(["Bearer billing-secret-key", "Bearer second-manual-quota-key"]);
+		expect(service.getTokenDanceConnection().recoveryAction).toBe("top_up_balance");
+		await createPayment("manual-quota-keeps-portal", {
+			amount: 10,
+			generation,
+			requestId: "m".repeat(43),
+		});
+		expect(auth[2]).toBe("Bearer billing-secret-key");
+		const failed = service
+			.refreshTokenDanceBalance(true, manual.id)
+			.catch((error: unknown) => error);
+		finish(json({ recoveryAction: "reauthorize_api_key" }, 401));
+		expect(await failed).toBeInstanceOf(Error);
+		const failedQuota = service.getTokenDanceQuotaSnapshot(manual.id);
+		expect(failedQuota?.credentialId).toBe(manual.id);
+		expect(failedQuota?.snapshot?.detail).toMatchObject({ balance: 60, hasError: true });
+		expect(failedQuota?.snapshot?.error).toBe("TokenDance balance request failed");
+		expect(service.getTokenDanceConnection().recoveryAction).toBe("top_up_balance");
+		expect(service.getTokenDanceBalance().balance).toBe(7);
+		const late = service.refreshTokenDanceBalance(true, manual.id).catch((error: unknown) => error);
+		const edited = store.update(manual.id, { apiKey: "edited-manual-identity" });
+		const config = fakeSettings.tokendance;
+		if (!config) throw new Error("TokenDance test connection missing");
+		const updated = { ...streamed, balances: [{ unit: "CNY", remaining: 44 }] };
+		quotaStore.set(
+			manual.id,
+			service.tokenDanceQuotaIdentity(withProviderKey(config, edited)),
+			updated,
+			false,
+		);
+		finish(json({ balance: { credits: 999, credits_used: 0, balance: 999 } }));
+		expect(await late).toBeInstanceOf(Error);
+		expect(service.getTokenDanceQuotaSnapshot(manual.id)?.snapshot).toEqual(updated);
+		expect(quotaStore.peek(manual.id)).toEqual(updated);
+		expect(quotaStore.peek(manual.id, STREAM_QUOTA_SOURCE)).toEqual(streamed);
+		store.update(manual.id, { disabled: true });
+		await expect(service.refreshTokenDanceBalance(true, manual.id)).rejects.toThrow("unavailable");
+		expect(service.getTokenDanceQuotaSnapshot(manual.id)).toBeUndefined();
+	});
+
 	test("recovery acceptance reports only the bound login credential and current generation", () => {
 		const generation = connectBilling();
 		const manual = getProviderKeyStore().add(TOKENDANCE_KEY_OWNER, {
@@ -246,7 +346,12 @@ describe("TokenDance billing", () => {
 		});
 		await service.refreshTokenDanceBalance();
 		expect(
-			quotaStore.get(login.id, JSON.stringify([login.apiKey, generation]))?.detail,
+			quotaStore.get(
+				login.id,
+				service.tokenDanceQuotaIdentity(
+					withProviderKey({ apiKey: login.apiKey, generation, disabled: false }, login),
+				),
+			)?.detail,
 		).toMatchObject({
 			balance: 7,
 		});
@@ -574,11 +679,12 @@ describe("TokenDance billing", () => {
 		"payment_status",
 	] as const)("slow %s logs only fixed operation, duration and generation", async (operation) => {
 		const generation = connectBilling();
-		const now = Date.now();
 		const input = { amount: 10, generation, requestId: "w".repeat(43) };
 		if (operation === "payment_status") {
 			fetchMock(() => json(paymentFixture()));
 			await createPayment(`slow-${generation}`, input);
+			// Start after creation: sampling before it races the 3s polling throttle.
+			const now = Date.now();
 			Date.now = () => now + 3001;
 		}
 		let clock = 0;
@@ -709,6 +815,36 @@ describe("TokenDance billing", () => {
 		expect(await task).toBeInstanceOf(Error);
 		expect(service.getTokenDanceBalance()).toMatchObject({ balance: null, loading: false });
 	});
+	test("balance publication and reads share the selected credential's effective network identity", async () => {
+		connectBilling();
+		const config = fakeSettings.tokendance;
+		if (!config) throw new Error("billing fixture is not connected");
+		const keys = getProviderKeyStore();
+		const key = bindLogin(config.apiKey);
+		keys.update(key.id, {
+			network: { proxy: { mode: "custom", url: "http://billing-proxy.example:8080" } },
+		});
+		try {
+			fetchMock(() => json({ balance: { credits: 10, credits_used: 4, balance: 6 } }));
+			const balance = await service.refreshTokenDanceBalance();
+			expect(balance.balance).toBe(6);
+			expect(
+				quotaStore.peekForIdentity(
+					key.id,
+					service.tokenDanceQuotaIdentity(withProviderKey(config, key)),
+				)?.balances[0]?.remaining,
+			).toBe(0.000006);
+			keys.update(key.id, { network: { userAgentMode: "codex" } });
+			// A failed SWR refresh must not make the previous network's balance visible again.
+			fetchMock(() => json(null, 503));
+			expect(service.getTokenDanceBalance().balance).toBeNull();
+		} finally {
+			await service.deleteTokenDanceConnection();
+			quotaStore.remove(key.id);
+			keys.remove(key.id);
+		}
+	});
+
 	test("replacing only the key withdraws the old balance and rejects its late answer", async () => {
 		connectBilling();
 		let finishOld!: (value: Response) => void;
@@ -726,15 +862,19 @@ describe("TokenDance billing", () => {
 		getProviderKeyStore().update(original.id, { apiKey: "replacement-secret-key" });
 		fakeSettings.tokendance = { ...current, apiKey: "replacement-secret-key" };
 		fetchMock(() => json({ balance: { credits: 20, credits_used: 0, balance: 20 } }));
-		expect(service.getTokenDanceBalance()).toMatchObject({ balance: null, loading: true });
-		expect(await service.refreshTokenDanceBalance()).toMatchObject({ balance: 20 });
+		expect(service.getTokenDanceBalance()).toMatchObject({ balance: null, loading: false });
+		expect(await service.refreshTokenDanceBalance(true, original.id)).toMatchObject({
+			balance: 20,
+		});
 		finishOld(json({ balance: { credits: 1, credits_used: 0, balance: 1 } }));
 		expect(await oldTask).toBeInstanceOf(Error);
-		expect(service.getTokenDanceBalance()).toMatchObject({
+		expect(service.getTokenDanceQuotaSnapshot(original.id)?.snapshot?.detail).toMatchObject({
 			balance: 20,
 			hasError: false,
 			loading: false,
 		});
+		// Editing an inference secret removes its login provenance; the portal must stay unbound.
+		expect(service.getTokenDanceBalance()).toMatchObject({ balance: null, loading: false });
 	});
 	test("confirmed payment is deduplicated including concurrent and conflicting retries", async () => {
 		const generation = connectBilling();
@@ -1022,13 +1162,18 @@ describe("TokenDance backend", () => {
 			auth.push(new Headers(init?.headers).get("Authorization") ?? "");
 			return url.endsWith("/models") ? json({ data: [] }) : json(paymentFixture());
 		});
-		const flow = start();
-		expect(await service.completeTokenDanceOAuth(flow.owner, flow.flowId, "one-time-code")).toEqual(
-			{
-				connected: true,
-				modelsRefreshed: true,
-			},
+		const flow = service.startTokenDanceOAuth(
+			"manual-login",
+			new URL("https://ui.example/base/settings/providers/tokendance/callback"),
+			undefined,
+			{ mode: "add" },
 		);
+		expect(
+			await service.completeTokenDanceOAuth("manual-login", flow.flowId, "one-time-code"),
+		).toEqual({
+			connected: true,
+			modelsRefreshed: true,
+		});
 		expect(store.get(manual.id)?.apiKey).toBe("manual-other-user");
 		expect(fakeSettings.tokendance.apiKey).toBe("manual-other-user");
 		await createPayment("oauth-login", {

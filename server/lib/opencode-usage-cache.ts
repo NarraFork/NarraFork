@@ -5,6 +5,8 @@ import { outboundFetch } from "./net/outbound-fetch";
 import { resolveProxyForUrl } from "./net/proxy";
 import { shownSubjectId, type UsageSubject, usageSubjects } from "./provider-key-subjects";
 import { type CustomApiProviderConfig, settings } from "./settings";
+import { defaultUserAgentModeForProtocol } from "./settings/custom-api-providers";
+import { legacyQuotaNetworkCompatible, quotaNetworkIdentity } from "./sourcing/quota-identity";
 import { importLegacyQuotaCache, quotaStore } from "./sourcing/quota-store";
 
 /**
@@ -233,7 +235,16 @@ export function opencodeUsageUrl(baseUrl: string): string {
  * to Kimi usage in `getCustomApiProviderIdsWithKimiIdentityChanges`
  * (`routes/settings.ts`).
  */
-function identity(config: CustomApiProviderConfig): string {
+export function opencodeQuotaIdentity(config: CustomApiProviderConfig): string {
+	return JSON.stringify([
+		config.baseUrl,
+		config.apiKey,
+		quotaNetworkIdentity(config, settings.proxy),
+	]);
+}
+
+/** Byte-for-byte serializer used to fingerprint opencode-usages.json before the quota store. */
+function legacyOpencodeQuotaIdentity(config: CustomApiProviderConfig): string {
 	return JSON.stringify([
 		config.baseUrl,
 		config.apiKey,
@@ -256,14 +267,25 @@ export function syncOpencodeUsageCache(): void {
 		void importLegacyQuotaCache(
 			LEGACY_FILE,
 			parsePersistedUsage,
-			subjects.map((s) => ({ legacyKey: s.id, id: s.id, identity: identity(s.config) })),
+			subjects
+				.filter((s) =>
+					legacyQuotaNetworkCompatible(s.config, {
+						defaultUserAgentMode: defaultUserAgentModeForProtocol(s.config.protocol),
+					}),
+				)
+				.map((s) => ({
+					legacyKey: s.id,
+					id: s.id,
+					identity: legacyOpencodeQuotaIdentity(s.config),
+					storeIdentity: opencodeQuotaIdentity(s.config),
+				})),
 			opencodeSnapshot,
 		);
 	}
 	const providers = new Map(subjects.map((s) => [s.id, s.config]));
 	for (const [id, entry] of entries) {
 		const config = providers.get(id);
-		if (!config || identity(config) !== entry.identity) {
+		if (!config || opencodeQuotaIdentity(config) !== entry.identity) {
 			entries.delete(id);
 			entry.controller?.abort();
 			clearTimeout(entry.activityTimer);
@@ -275,9 +297,13 @@ export function syncOpencodeUsageCache(): void {
 	}
 	for (const [id, config] of providers) {
 		if (!entries.has(id)) {
-			entries.set(id, { identity: identity(config), generation: crypto.randomUUID(), failures: 0 });
+			entries.set(id, {
+				identity: opencodeQuotaIdentity(config),
+				generation: crypto.randomUUID(),
+				failures: 0,
+			});
 			// Restore synchronously: the pool reads the snapshot before any refresh finishes.
-			quotaStore.get(id, identity(config), restoreSnapshot);
+			quotaStore.get(id, opencodeQuotaIdentity(config), restoreSnapshot);
 		}
 	}
 }
@@ -520,7 +546,7 @@ export function peekOpencodeUsageGeneration(providerId: string): string | undefi
 	const id = shownSubjectId(subjects, providerId);
 	const current = subjects.find((subject) => subject.id === id);
 	const entry = id ? entries.get(id) : undefined;
-	return entry && current && entry.identity === identity(current.config)
+	return entry && current && entry.identity === opencodeQuotaIdentity(current.config)
 		? entry.generation
 		: undefined;
 }

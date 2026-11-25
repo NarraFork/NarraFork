@@ -122,6 +122,21 @@ export class QuotaStore {
 		return this.held.get(this.heldKey(id, source))?.snapshot;
 	}
 
+	/**
+	 * Read a snapshot only when its live credential identity matches.
+	 *
+	 * Hot routing must not restore persisted data or evict another identity's snapshot.
+	 * A cold or mismatched entry is simply unknown; source namespaces stay independent.
+	 */
+	peekForIdentity(
+		id: string,
+		identity: string,
+		source = DEFAULT_QUOTA_SOURCE,
+	): QuotaSnapshot | undefined {
+		const held = this.held.get(this.heldKey(id, source));
+		return held?.identity === identity ? held.snapshot : undefined;
+	}
+
 	/** `persist: false` keeps the disk copy as it is (in-progress or never-fetched states). */
 	set(
 		id: string,

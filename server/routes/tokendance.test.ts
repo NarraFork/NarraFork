@@ -19,6 +19,13 @@ const connection = {
 	billingInstance: "a".repeat(32),
 };
 const updateConnection = mock((_disabled: boolean, _mode?: string) => connection);
+const startOAuth = mock(
+	(_owner: string, _callback: URL, _snapshot?: unknown, _choice?: unknown) => ({
+		flowId: "x".repeat(43),
+		authorizeUrl: "https://tokendance.space/auth",
+		expiresAt: Date.now() + 600000,
+	}),
+);
 mock.module("../services/tokendance-service", () => ({
 	getTokenDanceConnection: () => connection,
 	getTokenDanceBalance: () => ({
@@ -44,11 +51,7 @@ mock.module("../services/tokendance-service", () => ({
 		if (owner !== "test-owner") throw new AppError("Not found", 404, "TOKENDANCE_ERROR");
 		return { id: "payment-1", status: "pending" };
 	},
-	startTokenDanceOAuth: () => ({
-		flowId: "x".repeat(43),
-		authorizeUrl: "https://tokendance.space/auth",
-		expiresAt: Date.now() + 600000,
-	}),
+	startTokenDanceOAuth: startOAuth,
 	validateTokenDanceCallback: validateCallback,
 	completeTokenDanceOAuth: () => ({ connected: true, modelsRefreshed: true }),
 	cancelTokenDanceOAuth: () => {},
@@ -153,6 +156,35 @@ describe("TokenDance first-party admin boundary", () => {
 				)
 			).status,
 		).toBe(404);
+	});
+	test.each([
+		{ mode: "add" },
+		{ mode: "replace", credentialId: "migrated-login-slot" },
+	] as const)("OAuth start forwards an explicit $mode choice without a second flow", async (loginChoice) => {
+		startOAuth.mockClear();
+		const callbackUrl = "https://public.example/settings/providers/tokendance/callback";
+		const response = await app({ type: "session", user }).request("/api/tokendance/oauth/start", {
+			method: "POST",
+			body: JSON.stringify({ callbackUrl, loginChoice }),
+		});
+		expect(response.status).toBe(200);
+		expect(startOAuth).toHaveBeenCalledWith(
+			"test-owner",
+			new URL(callbackUrl),
+			undefined,
+			loginChoice,
+		);
+		for (const invalid of [
+			{ mode: "replace" },
+			{ mode: "add", credentialId: "unexpected" },
+			{ mode: "first" },
+		]) {
+			const rejected = await app({ type: "session", user }).request("/api/tokendance/oauth/start", {
+				method: "POST",
+				body: JSON.stringify({ callbackUrl, loginChoice: invalid }),
+			});
+			expect(rejected.status).toBe(400);
+		}
 	});
 	test("OAuth start forwards actual browser Fetch Metadata without trusting forwarded hosts", async () => {
 		validateCallback.mockClear();

@@ -6,10 +6,15 @@ import * as commandAuth from "../../lib/commandcode-manager";
 import * as customQuota from "../../lib/custom-api-quota-cache";
 import { updateCustomApiQuotaByPrefix } from "../../lib/custom-api-quota-cache";
 import { AppError } from "../../lib/errors";
+import { kimiQuotaIdentity } from "../../lib/kimi-usage-cache";
 import * as outbound from "../../lib/net/outbound-fetch";
 import { providerBalanceCache } from "../../lib/provider-balance-cache";
 import { streamQuotaIdentity } from "../../lib/provider-key-subjects";
-import { getProviderKeyStore, TOKENDANCE_KEY_OWNER } from "../../lib/provider-keys";
+import {
+	getProviderKeyStore,
+	TOKENDANCE_KEY_OWNER,
+	withProviderKey,
+} from "../../lib/provider-keys";
 import { type CustomApiProviderConfig, saveSettings, settings } from "../../lib/settings";
 import {
 	publicQuotaSnapshot,
@@ -148,11 +153,18 @@ describe("unified quota API", () => {
 		const keys = getProviderKeyStore();
 		const first = keys.list("quota-kimi")[0];
 		const second = keys.add("quota-kimi", { apiKey: "second-secret" });
+		const provider = settings.customApiProviders?.find((entry) => entry.id === "quota-kimi");
+		if (!provider) throw new Error("missing fixture");
 		try {
-			quotaStore.set(first.id, JSON.stringify([config().baseUrl, first.apiKey]), snap(0.25), false);
+			quotaStore.set(
+				first.id,
+				kimiQuotaIdentity(withProviderKey(provider, first)),
+				snap(0.25),
+				false,
+			);
 			quotaStore.set(
 				second.id,
-				JSON.stringify([config().baseUrl, second.apiKey]),
+				kimiQuotaIdentity(withProviderKey(provider, second)),
 				snap(0.9),
 				false,
 			);
@@ -180,8 +192,9 @@ describe("unified quota API", () => {
 			(provider) => provider.id === "quota-stream",
 		);
 		if (!provider) throw new Error("missing fixture");
-		const id = getProviderKeyStore().list(provider.id)[0].id;
-		quotaStore.set(id, JSON.stringify([provider.baseUrl, provider.apiKey]), snap(), false);
+		const key = getProviderKeyStore().list(provider.id)[0];
+		const id = key.id;
+		quotaStore.set(id, kimiQuotaIdentity(withProviderKey(provider, key)), snap(), false);
 		updateCustomApiQuotaByPrefix(
 			provider.prefix,
 			"12.5",
@@ -219,10 +232,13 @@ describe("unified quota API", () => {
 	});
 	test("all roles receive safe fixed errors and no upstream payload", async () => {
 		saveSettings({ ...settings, customApiProviders: [config("quota-error")] });
-		const id = getProviderKeyStore().list("quota-error")[0].id;
+		const key = getProviderKeyStore().list("quota-error")[0];
+		const provider = settings.customApiProviders?.find((entry) => entry.id === "quota-error");
+		if (!provider) throw new Error("missing fixture");
+		const id = key.id;
 		quotaStore.set(
 			id,
-			JSON.stringify([config().baseUrl, "quota-secret"]),
+			kimiQuotaIdentity(withProviderKey(provider, key)),
 			{
 				...snap(),
 				error:
@@ -245,10 +261,13 @@ describe("unified quota API", () => {
 	});
 	test("both roles receive the fixed plugin-disabled code without private quota detail", async () => {
 		saveSettings({ ...settings, customApiProviders: [config("quota-plugin-code")] });
-		const id = getProviderKeyStore().list("quota-plugin-code")[0].id;
+		const key = getProviderKeyStore().list("quota-plugin-code")[0];
+		const provider = settings.customApiProviders?.find((entry) => entry.id === "quota-plugin-code");
+		if (!provider) throw new Error("missing fixture");
+		const id = key.id;
 		quotaStore.set(
 			id,
-			JSON.stringify([config().baseUrl, "quota-secret"]),
+			kimiQuotaIdentity(withProviderKey(provider, key)),
 			{ ...snap(), error: "plugin_not_enabled" },
 			false,
 		);

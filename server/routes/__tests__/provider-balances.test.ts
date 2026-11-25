@@ -360,7 +360,7 @@ describe("relay balance through the unified quota API", () => {
 			await providerBalanceCache.request(config().id);
 			const body = await (await appForRole("user").request("/api/quota-snapshots")).json();
 			expect(findRelay(body)?.snapshot).toMatchObject({
-				error: "quota_unavailable",
+				error: "plugin_not_enabled",
 				hasError: true,
 				balances: [],
 			});

@@ -2,6 +2,7 @@ import type {
 	TokenDanceCatalogModel,
 	TokenDanceDraftRestore,
 	TokenDanceDraftSnapshot,
+	TokenDanceLoginChoice,
 	TokenDanceOAuthComplete,
 	TokenDanceOAuthStart,
 	TokenDancePaymentCreate,
@@ -42,7 +43,11 @@ export const tokendanceApi = {
 			transport(options, 32_768),
 		),
 	tokenDanceOAuthStart: (
-		data: { callbackUrl: string; draftSnapshot?: TokenDanceDraftSnapshot },
+		data: {
+			callbackUrl: string;
+			draftSnapshot?: TokenDanceDraftSnapshot;
+			loginChoice?: TokenDanceLoginChoice;
+		},
 		options?: RequestOptions,
 	) => post<TokenDanceOAuthStart>("oauth/start", data, options),
 	tokenDanceOAuthComplete: (data: { flowId: string; code: string }, options?: RequestOptions) =>

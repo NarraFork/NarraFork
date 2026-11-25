@@ -3276,6 +3276,53 @@ describe("quota and payment frames stay with their own session", () => {
 		expect(self).not.toHaveProperty("isSubagent");
 	});
 
+	test("private attempt identity reaches both cache updaters but never public frames", async () => {
+		const { streamQuotaIdentity } = await import("../../lib/provider-key-subjects");
+		const privateIdentity = streamQuotaIdentity(
+			{ id: "quota-test", baseUrl: "https://quota.test", apiKey: "private-api-key" },
+			"actual-B",
+		);
+		const customQuota = await import("../../lib/custom-api-quota-cache");
+		const nugQuota = await import("../../routes/nug");
+		const customUpdate = spyOn(customQuota, "updateCustomApiQuotaByPrefix").mockImplementation(
+			() => {},
+		);
+		const nugUpdate = spyOn(nugQuota, "updateNugQuotaByPrefix").mockImplementation(() => {});
+		try {
+			await processEvent(
+				{
+					type: "quota_balance",
+					quotaBalance: "0",
+					detailedQuotaBalance: "actual account",
+					providerIdentity: privateIdentity,
+				},
+				{ ...makeMainContext(), providerPrefix: "quota-test" },
+			);
+			expect(customUpdate).toHaveBeenCalledWith(
+				"quota-test",
+				"0",
+				"actual account",
+				privateIdentity,
+			);
+			expect(nugUpdate).toHaveBeenCalledWith(
+				"quota-test",
+				0,
+				"actual account",
+				undefined,
+				privateIdentity,
+			);
+			for (const frame of framesOf("quota_balance")) {
+				expect(frame).not.toHaveProperty("providerIdentity");
+				expect(frame).not.toHaveProperty("credentialId");
+				expect(JSON.stringify(frame)).not.toContain("private-api-key");
+				expect(JSON.stringify(frame)).not.toContain("actual-B");
+			}
+		} finally {
+			customUpdate.mockRestore();
+			nugUpdate.mockRestore();
+		}
+	});
+
 	test("a primary narrator quota frame carries no subagent marker", async () => {
 		await processEvent({ type: "quota_balance", quotaBalance: "12.5" }, makeMainContext());
 		const [frame] = framesOf("quota_balance");

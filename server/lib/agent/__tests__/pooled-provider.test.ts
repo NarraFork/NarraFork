@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { getProviderKeyStore, type ProviderKey } from "../../provider-keys";
 import { requestSourceName } from "../../request-source";
 import { saveSettings, settings } from "../../settings";
@@ -163,6 +163,107 @@ describe("pooled provider", () => {
 		expect(calls).toEqual(["sk-one"]);
 		expect(store().get(PROVIDER)?.disabled).not.toBe(true);
 	});
+
+	for (const operation of ["chat", "generateWithMeta"] as const) {
+		for (const lateOutcome of ["401", "success"] as const) {
+			test(`${operation}: concurrent 401 disable allows the other ${lateOutcome} attempt to finish without rewriting A`, async () => {
+				const first = store().list(PROVIDER)[0];
+				const backup = store().add(PROVIDER, { apiKey: "sk-backup" });
+				const started = Promise.withResolvers<void>();
+				const finish = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+				const calls: string[] = [];
+				let attempts = 0;
+				let lateDiagnosticValid: (() => boolean) | undefined;
+				const { build } = fakeBuild({});
+				const pool = new PooledProvider(PROVIDER, (key) => {
+					const secret = key.apiKey;
+					const result = async () => {
+						calls.push(secret);
+						if (key.id === first.id) {
+							const index = attempts++;
+							if (attempts === 2) started.resolve();
+							await finish[index].promise;
+							if (index === 0 || lateOutcome === "401") throw new ApiError(401, "A rejected");
+						}
+						return { text: secret };
+					};
+					return {
+						...build(key),
+						generateWithMeta: result,
+						async *chat(params: ChatParams) {
+							params.onRequestStart?.();
+							yield await result();
+						},
+					};
+				});
+				const update = spyOn(store(), "update");
+				const run = () =>
+					operation === "chat"
+						? drain(
+								pool.chat({
+									...params("concurrent"),
+									model: "m",
+									onRequestStart: (info) => {
+										lateDiagnosticValid = info?.validateDiagnosticCredential;
+									},
+								}),
+							)
+						: pool.generateWithMeta("hello", "m");
+				const firstRequest = run();
+				const lateRequest = run();
+				const settled = Promise.allSettled([firstRequest, lateRequest]);
+				try {
+					await started.promise;
+					reportKeyFault(first, new ApiError(429, "retry-after: 7"));
+					const cooldown = keyCooldown(first.id);
+					expect(cooldown).toBeDefined();
+					const validateA = lateDiagnosticValid;
+					finish[0].resolve();
+					expect(await firstRequest).toEqual(
+						operation === "chat"
+							? [{ text: "sk-backup", credentialId: backup.id }]
+							: { text: "sk-backup", credentialId: backup.id },
+					);
+					expect(store().get(first.id)?.disabledReason).toBe("invalid");
+					if (operation === "chat") {
+						expect(validateA?.()).toBe(false);
+						await expect(
+							drain(
+								pool.chat({
+									...params("diagnostic"),
+									model: "m",
+									diagnosticFork: { suffix: "probe", credentialId: first.id },
+								}),
+							),
+						).rejects.toThrow("parent diagnostic credential is unavailable");
+					}
+					finish[1].resolve();
+					const selected = lateOutcome === "401" ? backup : first;
+					expect(await lateRequest).toEqual(
+						operation === "chat"
+							? [{ text: selected.apiKey, credentialId: selected.id }]
+							: { text: selected.apiKey, credentialId: selected.id },
+					);
+					expect(update).toHaveBeenCalledTimes(1);
+					expect(update).toHaveBeenCalledWith(first.id, {
+						disabled: true,
+						disabledReason: "invalid",
+					});
+					expect(keyCooldown(first.id)).toEqual(cooldown);
+					expect(calls).toEqual([
+						"sk-one",
+						"sk-one",
+						"sk-backup",
+						...(lateOutcome === "401" ? ["sk-backup"] : []),
+					]);
+				} finally {
+					for (const gate of finish) gate.resolve();
+					await settled;
+					update.mockRestore();
+				}
+			});
+		}
+	}
 
 	for (const operation of ["chat", "generateWithMeta"] as const) {
 		for (const replacement of ["secret", "network"] as const) {

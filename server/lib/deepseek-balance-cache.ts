@@ -5,6 +5,8 @@ import { resolveProxyForUrl } from "./net/proxy";
 import { firstCredential, type UsageSubject } from "./provider-key-subjects";
 import { getProviderKeyStore, withProviderKey } from "./provider-keys";
 import { type CustomApiProviderConfig, settings } from "./settings";
+import { defaultUserAgentModeForProtocol } from "./settings/custom-api-providers";
+import { legacyQuotaNetworkCompatible, quotaNetworkIdentity } from "./sourcing/quota-identity";
 import { importLegacyQuotaCache, quotaStore } from "./sourcing/quota-store";
 
 /**
@@ -166,8 +168,17 @@ export function isDeepSeekCustomApiProvider(config: {
 	return !config.disabled && identifyService(config).templateId === "deepseek";
 }
 
-function identity(config: CustomApiProviderConfig, credentialId?: string): string {
-	const network = credentialId ? getProviderKeyStore().get(credentialId)?.network : undefined;
+export function deepSeekQuotaIdentity(config: CustomApiProviderConfig): string {
+	return JSON.stringify([
+		config.baseUrl,
+		config.protocol,
+		config.apiKey,
+		quotaNetworkIdentity(config, settings.proxy),
+	]);
+}
+
+/** Byte-for-byte serializer used to fingerprint deepseek-balances.json before the quota store. */
+function legacyDeepSeekQuotaIdentity(config: CustomApiProviderConfig): string {
 	return JSON.stringify([
 		config.baseUrl,
 		config.protocol,
@@ -175,7 +186,6 @@ function identity(config: CustomApiProviderConfig, credentialId?: string): strin
 		config.proxy,
 		config.tlsRejectUnauthorized,
 		settings.proxy,
-		...(network ? [network] : []),
 	]);
 }
 
@@ -207,15 +217,26 @@ export function syncDeepSeekBalanceCache(): void {
 			parsePersistedBalance,
 			providers
 				.filter((provider) => provider.apiKey)
-				.map((provider) => {
+				.flatMap((provider) => {
 					const first = firstCredential(provider);
-					return {
-						legacyKey: provider.id,
-						id: first.id,
-						// Legacy files belong only to the historical first credential.
-						identity: identity(provider),
-						storeIdentity: identity(first.config, first.id),
-					};
+					const identity = legacyDeepSeekQuotaIdentity(provider);
+					// Import only the historical first credential, and only fields the old
+					// serializer can prove belong to its current effective network.
+					if (
+						!legacyQuotaNetworkCompatible(first.config, {
+							defaultUserAgentMode: defaultUserAgentModeForProtocol(first.config.protocol),
+						}) ||
+						legacyDeepSeekQuotaIdentity(first.config) !== identity
+					)
+						return [];
+					return [
+						{
+							legacyKey: provider.id,
+							id: first.id,
+							identity,
+							storeIdentity: deepSeekQuotaIdentity(first.config),
+						},
+					];
 				}),
 			(balance) => (balance.isAvailable === null ? null : deepseekSnapshot(balance)),
 		);
@@ -224,7 +245,7 @@ export function syncDeepSeekBalanceCache(): void {
 		const subject = subjects.get(id);
 		if (
 			!subject ||
-			identity(subject.config, subject.id) !== entry.identity ||
+			deepSeekQuotaIdentity(subject.config) !== entry.identity ||
 			subject.providerId !== entry.providerId
 		) {
 			entries.delete(id);
@@ -236,13 +257,13 @@ export function syncDeepSeekBalanceCache(): void {
 	for (const [id, subject] of subjects) {
 		if (!entries.has(id)) {
 			entries.set(id, {
-				identity: identity(subject.config, subject.id),
+				identity: deepSeekQuotaIdentity(subject.config),
 				generation: crypto.randomUUID(),
 				providerId: subject.providerId,
 				credentialId: subject.id,
 			});
 			// Restore synchronously, as the old entry-creation did.
-			quotaStore.get(id, identity(subject.config, subject.id), restoreSnapshot);
+			quotaStore.get(id, deepSeekQuotaIdentity(subject.config), restoreSnapshot);
 		}
 	}
 }
@@ -384,7 +405,7 @@ export function peekDeepSeekBalanceGeneration(providerId: string): string | unde
 	if (!config || !isDeepSeekCustomApiProvider(config)) return undefined;
 	const credential = firstCredential(config);
 	const entry = entries.get(credential.id);
-	return entry?.identity === identity(credential.config, credential.id)
+	return entry?.identity === deepSeekQuotaIdentity(credential.config)
 		? entry.generation
 		: undefined;
 }
