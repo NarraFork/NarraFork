@@ -13,6 +13,7 @@ import { PROJECT_TEAM_CARDS_LIMIT } from "@shared/project-overview";
 import type {
 	TeamListResponse,
 	TeamOverlapResponse,
+	TeamWorkMergeResponse,
 	TeamWorkReturnResponse,
 } from "@shared/project-teams";
 import { Hono } from "hono";
@@ -55,6 +56,8 @@ import {
 	readWorkFileDiff,
 	readWorkItemDetail,
 	readWorkStats,
+	requestFastForwardAsPerson,
+	requestMergeAsPerson,
 	returnWorkItemAsPerson,
 } from "../services/teams/team-work-view";
 import { requireSqliteProjectMutation } from "./projects";
@@ -325,6 +328,37 @@ projectTeamRoutes.post("/:projectId/teams/:teamId/work/:itemId/return", async (c
 		parsed.data.reason,
 	);
 	return c.json(result);
+});
+
+/**
+ * A member merges a ready item into its base (M): the same access as 退回. Only cheap checks run
+ * here; the merge itself is a background job (202 with its phase), read back from the drawer.
+ * 409: `TEAM_WORK_ITEM_NOT_READY`, `TEAM_WORK_ITEM_MERGING`, `TEAM_WORK_ITEM_WORKER_RUNNING`,
+ * `TEAM_MERGE_GITHUB_PENDING`, `TEAM_MERGE_BASE_REMOTE`, `TEAM_ARCHIVED`.
+ */
+projectTeamRoutes.post("/:projectId/teams/:teamId/work/:itemId/merge", async (c) => {
+	const result: TeamWorkMergeResponse = await requestMergeAsPerson(
+		c.req.param("teamId"),
+		narratorPrincipalOf(c),
+		c.req.param("projectId"),
+		c.req.param("itemId"),
+	);
+	return c.json(result, 202);
+});
+
+/**
+ * 「在该目录中快进」: fast-forward a prepared merge in the checkout its base is checked out in,
+ * after the person confirmed. A background job like the merge (202); 409
+ * `TEAM_MERGE_NOT_PREPARED` without a prepared merge.
+ */
+projectTeamRoutes.post("/:projectId/teams/:teamId/work/:itemId/merge/fast-forward", async (c) => {
+	const result: TeamWorkMergeResponse = await requestFastForwardAsPerson(
+		c.req.param("teamId"),
+		narratorPrincipalOf(c),
+		c.req.param("projectId"),
+		c.req.param("itemId"),
+	);
+	return c.json(result, 202);
 });
 
 /**

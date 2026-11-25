@@ -15,9 +15,10 @@
  *   command starts itself (`git worktree remove` runs `git status`);
  * - `GIT_OPTIONAL_LOCKS=0`, so a status never writes the index (index writes fire
  *   `post-index-change`);
- * - every configured filter emptied and every configuration-defined hook disabled by name
- *   (`untrustedProgramOverrides`, names read with `PROGRAM_CONFIG_QUERY`; reading configuration
- *   runs nothing).
+ * - every configured filter emptied, every configuration-defined hook disabled by name, and every
+ *   custom merge driver emptied (`merge-tree` runs them; an empty driver runs nothing and the
+ *   file counts as a conflict) — `untrustedProgramOverrides`, names read with
+ *   `PROGRAM_CONFIG_QUERY`; reading configuration runs nothing.
  *
  * Git older than 2.31 silently ignores `GIT_CONFIG_COUNT`. `ensureConfigOverridesHonored` reads
  * a sentinel back through the same environment once per process and refuses otherwise.
@@ -42,31 +43,45 @@ export const GIT_NO_EXEC_CONFIG: ReadonlyArray<readonly [string, string]> = [
 	["core.askPass", ""],
 ];
 
-/** Lists configured filters and configuration-defined hooks: `key\nvalue\0` records. */
+/**
+ * Lists configured filters, configuration-defined hooks and custom merge drivers: `key\nvalue\0`
+ * records.
+ */
 export const PROGRAM_CONFIG_QUERY = [
 	"config",
 	"-z",
 	"--get-regexp",
-	"^(filter\\..+\\.(clean|smudge|process)|hook\\..+\\.(command|event))$",
+	"^(filter\\..+\\.(clean|smudge|process)|hook\\..+\\.(command|event)|merge\\..+\\.driver)$",
 ] as const;
 
 export interface GitConfiguredPrograms {
 	filters: string[];
 	hooks: string[];
+	/** Custom merge drivers (`merge.<name>.driver`); absent when none was read. */
+	drivers?: string[];
 }
 
 /** Parse {@link PROGRAM_CONFIG_QUERY} output (exit 1 with no output means none). */
 export function parseProgramConfig(stdout: string): GitConfiguredPrograms {
 	const filters = new Set<string>();
 	const hooks = new Set<string>();
+	const drivers = new Set<string>();
 	for (const record of stdout.split("\0")) {
 		const key = record.split("\n", 1)[0] ?? "";
 		const last = key.lastIndexOf(".");
 		if (last <= 0) continue;
 		if (key.startsWith("filter.")) filters.add(key.slice("filter.".length, last));
 		else if (key.startsWith("hook.")) hooks.add(key.slice("hook.".length, last));
+		else if (key.startsWith("merge.") && key.slice(last + 1).toLowerCase() === "driver")
+			drivers.add(key.slice("merge.".length, last));
 	}
-	return { filters: [...filters].filter(Boolean), hooks: [...hooks].filter(Boolean) };
+	const programs: GitConfiguredPrograms = {
+		filters: [...filters].filter(Boolean),
+		hooks: [...hooks].filter(Boolean),
+	};
+	const named = [...drivers].filter(Boolean);
+	if (named.length > 0) programs.drivers = named;
+	return programs;
 }
 
 /** Overrides that empty every named filter and disable every configuration-defined hook. */
@@ -81,6 +96,8 @@ export function untrustedProgramOverrides(
 			[`filter.${name}.required`, "false"] as const,
 		]),
 		...programs.hooks.map((name) => [`hook.${name}.enabled`, "false"] as const),
+		// An empty driver runs no program: git reports the file as a conflict instead.
+		...(programs.drivers ?? []).map((name) => [`merge.${name}.driver`, ""] as const),
 	];
 }
 

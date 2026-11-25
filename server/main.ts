@@ -1617,6 +1617,12 @@ async function initializeDatabaseStartup(): Promise<void> {
 				({ startTeamOverlapJob }) => startTeamOverlapJob,
 			),
 		);
+		// Prune private merge refs of work items no longer ready (a crash mid-merge leaves them).
+		startTeamDatabaseMaintenance("merge", () =>
+			import("./services/teams/team-merge").then(
+				({ startTeamMergeMaintenance }) => startTeamMergeMaintenance,
+			),
+		);
 		// Stop containers and release ports that removed chapters left behind.
 		retireLegacyChapterResources().catch((err) => {
 			logger.warn("Legacy chapter resource cleanup failed", { error: String(err) });

@@ -101,6 +101,7 @@ import { getTeamOverlapLabels, oneLine } from "../../lib/prompts/team-coordinato
 import { canReadNarrator, canWriteNarrator, type NarratorPrincipal } from "../narrator-acl";
 import { canReadProject } from "../project-acl";
 import { type ChangedPaths, teamGit } from "./team-git";
+import { isMerging } from "./team-merge-guard";
 import { markMergedByAncestry, recordWorkEvent, type WorkActor } from "./work-items";
 
 const FINISHED = [...TEAM_WORK_ITEM_FINISHED_STATES];
@@ -644,6 +645,8 @@ export type RefreshOutcome = "updated" | "unchanged" | "merged" | "failed";
  * Then it is merged, if it is still exactly what was read (checked in the transaction).
  */
 async function mergeIfLanded(target: RefreshTarget, git: ChangedPathsGit): Promise<boolean> {
+	// M: a member's merge job holds the item; it records the merge itself.
+	if (isMerging(target.id)) return false;
 	const item = db
 		.select({
 			state: teamWorkItems.state,

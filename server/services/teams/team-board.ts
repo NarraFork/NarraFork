@@ -53,6 +53,7 @@ import { db } from "../../db";
 import {
 	narrators,
 	narratorToolCalls,
+	projectTeams,
 	teamWorkEvents,
 	teamWorkItems,
 	users,
@@ -62,6 +63,7 @@ import { ValidationError } from "../../lib/errors";
 import { canManageNarratorAcl, type NarratorPrincipal } from "../narrator-acl";
 import { shouldHidePendingPermission } from "../pending-permission-visibility";
 import { readTeamMembers } from "./team-members";
+import { mergeSummaryOf } from "./team-merge";
 import { loadTeamForAccess } from "./team-service";
 import { readDependencies } from "./work-item-dependencies";
 
@@ -447,6 +449,57 @@ function withDependencies<T extends TeamBoardItem>(items: T[]): T[] {
 	return items.map((item) => ({ ...item, dependsOn: dependencies.get(item.id) ?? [] }));
 }
 
+/**
+ * M: the ready cards with their merge state (job phase, newest outcome, whether this caller may
+ * merge): one indexed outcome read per ready card, no git. Other cards are left as they are.
+ */
+function withMerge<T extends TeamBoardItem>(
+	items: T[],
+	teamOf: (item: T) => { teamActive: boolean; baseBranch: string; projectId: string } | null,
+	member: boolean,
+): T[] {
+	return items.map((item) => {
+		if (item.state !== "ready") return item;
+		const team = teamOf(item);
+		if (!team) return item;
+		return {
+			...item,
+			merge: mergeSummaryOf({
+				item: { id: item.id, state: item.state, baseRef: item.baseRef, projectId: team.projectId },
+				baseBranch: team.baseBranch,
+				teamActive: team.teamActive,
+				workerRunning: item.worker?.status === "working" || item.worker?.status === "waiting",
+				member,
+			}),
+		};
+	});
+}
+
+/** The teams of some items: active (and coordinator not archived), base, project. */
+function teamFacts(teamIds: readonly string[]) {
+	const facts = new Map<string, { teamActive: boolean; baseBranch: string; projectId: string }>();
+	if (teamIds.length === 0) return facts;
+	for (const row of db
+		.select({
+			id: projectTeams.narratorId,
+			status: projectTeams.status,
+			baseBranch: projectTeams.baseBranch,
+			projectId: projectTeams.projectId,
+			coordinator: narrators.status,
+		})
+		.from(projectTeams)
+		.innerJoin(narrators, eq(narrators.id, projectTeams.narratorId))
+		.where(inArray(projectTeams.narratorId, [...new Set(teamIds)]))
+		.limit(teamIds.length)
+		.all())
+		facts.set(row.id, {
+			teamActive: row.status === "active" && row.coordinator !== "archived",
+			baseBranch: row.baseBranch,
+			projectId: row.projectId,
+		});
+	return facts;
+}
+
 /** One work item of a team as its card shows it (primary key), or null when it is not there. */
 export function readBoardItem(teamId: string, itemId: string): TeamBoardItem | null {
 	const row = db
@@ -484,10 +537,13 @@ export function readReadyItems(
 		.orderBy(asc(teamWorkItems.updatedAt), asc(teamWorkItems.id))
 		.limit(limit + 1)
 		.all();
+	const items = withDependencies(
+		rows.slice(0, limit).map(({ teamId, ...row }) => ({ ...boardItemOf(row), teamId })),
+	);
+	const facts = teamFacts(items.map((item) => item.teamId));
+	// The caller lists the teams the person is a member of.
 	return {
-		items: withDependencies(
-			rows.slice(0, limit).map(({ teamId, ...row }) => ({ ...boardItemOf(row), teamId })),
-		),
+		items: withMerge(items, (item) => facts.get(item.teamId) ?? null, true),
 		more: rows.length > limit,
 	};
 }
@@ -631,7 +687,12 @@ export async function readTeamBoardColumn(
 	projectId: string,
 	options: { column: TeamBoardColumn; limit: number; cursor?: string },
 ): Promise<TeamBoardColumnPage> {
-	await loadTeamForAccess(teamId, principal, "read", projectId);
+	const { team, coordinator, access } = await loadTeamForAccess(
+		teamId,
+		principal,
+		"read",
+		projectId,
+	);
 	const states = [...TEAM_BOARD_COLUMN_STATES[options.column]];
 	const finished = boardColumnIsFinished(options.column);
 	const sortColumn = finished ? teamWorkItems.updatedAt : teamWorkItems.createdAt;
@@ -659,7 +720,12 @@ export async function readTeamBoardColumn(
 		.limit(options.limit + 1)
 		.all();
 	const page = rows.slice(0, options.limit);
-	const items: TeamBoardItem[] = withDependencies(page.map(boardItemOf));
+	const teamActive = team.status === "active" && coordinator.status !== "archived";
+	const items: TeamBoardItem[] = withMerge(
+		withDependencies(page.map(boardItemOf)),
+		() => ({ teamActive, baseBranch: team.baseBranch, projectId: team.projectId }),
+		access === "write",
+	);
 	const last = page.at(-1);
 	return {
 		column: options.column,
