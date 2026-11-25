@@ -9,6 +9,7 @@
  * narrator surface the team rides on and the project mutations.
  */
 
+import { PROJECT_TEAM_CARDS_LIMIT } from "@shared/project-overview";
 import type {
 	TeamListResponse,
 	TeamOverlapResponse,
@@ -35,6 +36,7 @@ import {
 	readTeamActivity,
 	readTeamApprovals,
 	readTeamBoardColumn,
+	readTeamCards,
 	readTeamMembersPage,
 	readTeamPageSummary,
 	readTeamRunning,
@@ -91,14 +93,24 @@ projectTeamRoutes.get("/:projectId/teams", async (c) => {
 		status: c.req.query("status") ?? undefined,
 		limit: c.req.query("limit") ?? undefined,
 		cursor: c.req.query("cursor") ?? undefined,
+		counts: c.req.query("counts") ?? undefined,
 	});
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const result: TeamListResponse = await listProjectTeams(
-		projectId,
-		narratorPrincipalOf(c),
-		parsed.data,
+	const { counts, ...options } = parsed.data;
+	const result: TeamListResponse = await listProjectTeams(projectId, narratorPrincipalOf(c), {
+		...options,
+		// Card numbers cost a few indexed reads per team: a page of them is at most 24 teams.
+		limit: counts ? Math.min(options.limit, PROJECT_TEAM_CARDS_LIMIT) : options.limit,
+	});
+	if (!counts) return c.json(result);
+	const cards = await readTeamCards(
+		result.teams.map((team) => ({ id: team.id, member: team.access === "write" })),
+		c.req.raw.signal,
 	);
-	return c.json(result);
+	return c.json({
+		...result,
+		teams: result.teams.map((team) => ({ ...team, card: cards.get(team.id) })),
+	});
 });
 
 /**

@@ -51,7 +51,7 @@ import { type ReadQueryOptions, readQuery, readQueryFirst } from "../db/worker-r
 import { NotFoundError } from "../lib/errors";
 import type { AclPrincipal, GrantRow } from "./acl/acl-core";
 import { applyGrant, resolveCaps } from "./acl/acl-core";
-import { resolveProjectIdForNarratorId } from "./narrator-project";
+import { narratorProjectIdColumn, resolveProjectIdForNarratorId } from "./narrator-project";
 import { projectReadVerdict, projectWriteVerdict, resolveProjectGate } from "./project-acl";
 import {
 	bindPlaceholders,
@@ -532,6 +532,170 @@ export async function judgeNarratorAccessBatch(
 		});
 	}
 	return verdicts;
+}
+
+/** Narrators per statement of {@link judgeNarratorsWriteForPrincipal}. */
+const BATCH_NARRATOR_CHUNK = 400;
+
+/**
+ * Write access of ONE principal on MANY narrators, in a fixed handful of statements per
+ * {@link BATCH_NARRATOR_CHUNK} judged rows: the judged rows (each subagent's root) with their
+ * project (`narratorProjectIdColumn`, the same rule as `resolveNarratorProjectId`), the projects
+ * once, then the principal's user and role grants on those narrators and projects in one
+ * statement. Decides with the SAME rule as {@link canWriteNarrator} ({@link writeVerdict} and
+ * the project gate's `projectReadVerdict` / `projectWriteVerdict`), only with the facts read in
+ * bulk; the parity test checks them against each other.
+ *
+ * Returns the verdict per input row id, and the number of distinct judged rows (roots) it
+ * decided, so callers that page can account for the work. For lists of calls across many
+ * sessions (the project page's 「等你处理」), where one check per call would be a query each.
+ * SQLite only (the link table), like its callers.
+ */
+export async function judgeNarratorsWriteForPrincipal(
+	rows: readonly NarratorAclRow[],
+	principal: NarratorPrincipal,
+): Promise<{ verdicts: Map<string, boolean>; judged: number }> {
+	const verdicts = new Map<string, boolean>();
+	if (rows.length === 0) return { verdicts, judged: 0 };
+	const judgedIdOf = (row: NarratorAclRow) =>
+		row.type === "subagent" ? row.aclRootNarratorId : row.id;
+	const judgedIds = [
+		...new Set(rows.map(judgedIdOf).filter((id): id is string => typeof id === "string")),
+	];
+	if (principal.isAdmin) {
+		for (const row of rows) verdicts.set(row.id, true);
+		return { verdicts, judged: judgedIds.length };
+	}
+	const judgedRows = new Map<string, NarratorAclRow & { projectId: string | null }>();
+	for (let start = 0; start < judgedIds.length; start += BATCH_NARRATOR_CHUNK) {
+		const chunk = judgedIds.slice(start, start + BATCH_NARRATOR_CHUNK);
+		const loaded = await readQuery(
+			db
+				.select({
+					id: narrators.id,
+					ownerUserId: narrators.ownerUserId,
+					visibility: narrators.visibility,
+					writeAudience: narrators.writeAudience,
+					type: narrators.type,
+					aclRootNarratorId: narrators.aclRootNarratorId,
+					contextProjectId: narrators.contextProjectId,
+					projectId: narratorProjectIdColumn,
+				})
+				.from(narrators)
+				.where(inArray(narrators.id, chunk)),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000, maxRows: chunk.length },
+		);
+		for (const row of loaded) judgedRows.set(row.id, row);
+	}
+	const projectIds = [
+		...new Set(
+			[...judgedRows.values()]
+				.map((row) => row.projectId)
+				.filter((id): id is string => typeof id === "string"),
+		),
+	];
+	const projectRows = new Map<
+		string,
+		{ id: string; ownerUserId: string | null; visibility: string }
+	>();
+	for (let start = 0; start < projectIds.length; start += BATCH_NARRATOR_CHUNK) {
+		const chunk = projectIds.slice(start, start + BATCH_NARRATOR_CHUNK);
+		const loaded = await readQuery(
+			db
+				.select({
+					id: projects.id,
+					ownerUserId: projects.ownerUserId,
+					visibility: projects.visibility,
+				})
+				.from(projects)
+				.where(inArray(projects.id, chunk)),
+			{ executionPolicy: "worker-required", timeoutMs: 30_000, maxRows: chunk.length },
+		);
+		for (const row of loaded) projectRows.set(row.id, row);
+	}
+	const role = principal.isAdmin ? "admin" : "user";
+	const byScope = new Map<string, GrantRow[]>();
+	const scopeLists: Array<["narrator" | "project", string[]]> = [
+		["narrator", [...judgedRows.keys()]],
+		["project", projectIds],
+	];
+	for (const [scopeType, ids] of scopeLists)
+		for (let start = 0; start < ids.length; start += BATCH_NARRATOR_CHUNK) {
+			const chunk = ids.slice(start, start + BATCH_NARRATOR_CHUNK);
+			const grants = await readQuery(
+				db
+					.select({
+						scopeType: aclGrants.scopeType,
+						scopeId: aclGrants.scopeId,
+						capability: aclGrants.capability,
+						domainKind: aclGrants.domainKind,
+						domainValue: aclGrants.domainValue,
+					})
+					.from(aclGrants)
+					.where(
+						and(
+							or(
+								and(
+									eq(aclGrants.principalType, "user"),
+									eq(aclGrants.principalId, principal.userId),
+								),
+								and(eq(aclGrants.principalType, "role"), eq(aclGrants.principalId, role)),
+							),
+							eq(aclGrants.scopeType, scopeType),
+							inArray(aclGrants.scopeId, chunk),
+						),
+					),
+				{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+			);
+			for (const grant of grants) {
+				const key = `${grant.scopeType}:${grant.scopeId}`;
+				const list = byScope.get(key);
+				if (list) list.push(grant);
+				else byScope.set(key, [grant]);
+			}
+		}
+	const capsOf = (scopeType: string, scopeId: string) => {
+		const caps = { read: false, write: false, manage: false };
+		const domain = {
+			clearance: new Set<string>(),
+			tags: new Set<string>(),
+			review: new Set<string>(),
+		};
+		for (const grant of byScope.get(`${scopeType}:${scopeId}`) ?? [])
+			applyGrant(caps, domain, grant);
+		return caps;
+	};
+	const byJudged = new Map<string, boolean>();
+	for (const [id, judged] of judgedRows) {
+		const projectId = judged.projectId;
+		const project = projectId ? projectRows.get(projectId) : undefined;
+		const facts: NarratorAccessFacts = {
+			async gateAndProject() {
+				// Mirrors `gateAndProjectFor` → `resolveProjectGate`, answered from the loaded rows.
+				if (!projectId) return { gate: { read: true, write: true }, projectId };
+				if (!project) return { gate: { read: false, write: false }, projectId };
+				const own = () => capsOf("project", project.id);
+				return {
+					gate: {
+						read: await projectReadVerdict(project, principal, own),
+						write: await projectWriteVerdict(project, principal, own),
+					},
+					projectId,
+				};
+			},
+			async own() {
+				const caps = capsOf("narrator", id);
+				return { read: caps.read, write: caps.write };
+			},
+		};
+		byJudged.set(id, await writeVerdict(judged, principal, facts));
+	}
+	// A subagent whose root is missing or undeterminable is denied, as `resolveJudgedRow` does.
+	for (const row of rows) {
+		const judgedId = judgedIdOf(row);
+		verdicts.set(row.id, judgedId ? (byJudged.get(judgedId) ?? false) : false);
+	}
+	return { verdicts, judged: judgedRows.size };
 }
 
 /**

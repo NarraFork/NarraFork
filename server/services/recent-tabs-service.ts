@@ -1937,7 +1937,10 @@ export async function getRuntimePatches(
 				teamOnlooker: tab.teamOnlooker === true,
 				teamSession: tab.teamSession === true,
 				...(tab.type === "team"
-					? { pendingApprovalCount: numberOrNull(tab.pendingApprovalCount) }
+					? {
+							pendingApprovalCount: numberOrNull(tab.pendingApprovalCount),
+							readyItemCount: numberOrNull(tab.readyItemCount),
+						}
 					: {}),
 				...(tab.type === "project"
 					? {

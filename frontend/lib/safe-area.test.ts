@@ -1270,7 +1270,7 @@ describe("mobile safe-area layout contract", () => {
 		// full-bleed height is named exactly once and both layouts inherit it.
 		expect(workspaceRoute.match(/APP_SHELL_FULL_BLEED_HEIGHT/g)?.length).toBeGreaterThanOrEqual(1);
 		// The project page uses natural document flow inside Main instead of a fixed canvas.
-		expect(projectRoute).toContain("<ProjectSettingsPanel");
+		expect(projectRoute).toContain("<ProjectSessions");
 		expect(projectRoute).not.toContain("APP_SHELL_FULL_BLEED_HEIGHT");
 		for (const route of [narratorRoute, workspaceRoute, projectRoute]) {
 			expect(route).not.toContain("APP_SHELL_SAFE_VIEWPORT_HEIGHT");

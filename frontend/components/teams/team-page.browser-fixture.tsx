@@ -33,7 +33,8 @@ import navZh from "../../locales/zh-CN/nav.json";
 import projectsZh from "../../locales/zh-CN/projects.json";
 import { MobileNavFallback } from "../nav/MobileNavButton";
 import { MobileNavContext } from "../nav/nav-render-context";
-import { ProjectTeamsList } from "./ProjectTeamsList";
+import { ProjectTeamCards } from "../project/ProjectTeamCards";
+import { CreateTeamModal } from "./CreateTeamModal";
 import { TeamPageView } from "./TeamPageView";
 
 const instance = i18next.createInstance();
@@ -160,16 +161,34 @@ export function openTeam(projectId: string, teamId: string, sidebarWidth = 250):
 }
 
 /** Mount the project page's teams section. */
-export function openProjectTeams(projectId: string, canCreate: boolean): void {
-	mount(
+/** The project page's team cards with its 「新团队」 dialog (R2), as the project page wires them. */
+function ProjectTeamsSection({ projectId, canCreate }: { projectId: string; canCreate: boolean }) {
+	const [creating, setCreating] = useState(false);
+	return (
 		<div style={{ padding: 12 }}>
-			<ProjectTeamsList
+			<ProjectTeamCards
 				projectId={projectId}
 				canCreate={canCreate}
 				onOpenTeam={(id) => opened.push(`team:${id}`)}
+				onCreate={() => setCreating(true)}
 			/>
-		</div>,
+			{creating && (
+				<CreateTeamModal
+					projectId={projectId}
+					opened
+					onClose={() => setCreating(false)}
+					onCreated={(team) => {
+						setCreating(false);
+						opened.push(`team:${team.id}`);
+					}}
+				/>
+			)}
+		</div>
 	);
+}
+
+export function openProjectTeams(projectId: string, canCreate: boolean): void {
+	mount(<ProjectTeamsSection projectId={projectId} canCreate={canCreate} />);
 }
 
 export function setScheme(next: "light" | "dark"): void {

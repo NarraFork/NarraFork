@@ -10,7 +10,6 @@ import {
 	IconUsersGroup,
 } from "@tabler/icons-react";
 import type { ReactNode } from "react";
-import { useTranslation } from "react-i18next";
 import { NarratorStatusIcon } from "./NarratorStatusIcon";
 import { getNarratorStatusIconColor } from "./narrator-status-icon-logic";
 
@@ -152,12 +151,10 @@ export function RecentTabIcon({
 
 /**
  * A pinned team: its coordinator's status bubble (the team list and the team page's top bar
- * show the same), a group marker so it does not read as a session, and the tree's pending
- * approvals for members.
+ * show the same) and a group marker so it does not read as a session. What waits for a member
+ * is the amber count at the sidebar row's end (`TeamWaitingBadge` in `RecentTabs.tsx`).
  */
 function TeamTabIcon({ tab, size }: { tab: RecentTabIconSource; size: number }) {
-	const { t } = useTranslation("nav");
-	const pending = tab.pendingApprovalCount ?? 0;
 	return (
 		<Box component="span" pos="relative" style={{ display: "inline-flex", lineHeight: 0 }}>
 			<NarratorStatusIcon size={size} status={tab.status} substatus={tab.substatus} />
@@ -181,33 +178,6 @@ function TeamTabIcon({ tab, size }: { tab: RecentTabIconSource; size: number }) 
 			>
 				<IconUsersGroup size={7} stroke={2.5} />
 			</Box>
-			{pending > 0 && (
-				<Box
-					component="span"
-					role="img"
-					aria-label={t("teamTabPendingApprovals", { count: pending })}
-					data-testid="team-tab-pending"
-					style={{
-						position: "absolute",
-						right: -6,
-						top: -5,
-						minWidth: 12,
-						height: 12,
-						padding: "0 2px",
-						borderRadius: 6,
-						background: "var(--mantine-color-orange-6)",
-						border: "1px solid var(--mantine-color-body)",
-						color: "var(--mantine-color-white)",
-						fontSize: 8,
-						fontWeight: 700,
-						lineHeight: "10px",
-						textAlign: "center",
-						pointerEvents: "none",
-					}}
-				>
-					{pending > 9 ? "9+" : pending}
-				</Box>
-			)}
 		</Box>
 	);
 }

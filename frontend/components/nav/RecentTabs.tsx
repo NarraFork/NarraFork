@@ -1585,12 +1585,56 @@ function DragOverlayTabItem({ tab, active }: { tab: RecentTab; active: boolean }
 }
 
 /** Shared by normal rows and the drag overlay so the optional cwd stays consistent. */
+/**
+ * A team tab's amber count at the row's end (R2): what waits for this member in the team — the
+ * tree's pending calls and the items ready to accept, as the team page's 「等你处理」 lists them.
+ */
+function TeamWaitingBadge({ tab }: { tab: RecentTab }) {
+	const { t } = useTranslation("nav");
+	const waiting = (tab.pendingApprovalCount ?? 0) + (tab.readyItemCount ?? 0);
+	if (tab.type !== "team" || waiting <= 0) return null;
+	return (
+		<Box
+			component="span"
+			role="img"
+			aria-label={t("teamTabWaiting", { count: waiting })}
+			data-testid="team-tab-pending"
+			style={{
+				flexShrink: 0,
+				minWidth: 18,
+				height: 18,
+				padding: "0 5px",
+				borderRadius: 9,
+				background: "var(--mantine-color-yellow-6)",
+				color: "var(--mantine-color-dark-9)",
+				fontSize: 11,
+				fontWeight: 700,
+				lineHeight: "18px",
+				textAlign: "center",
+				fontVariantNumeric: "tabular-nums",
+			}}
+		>
+			{waiting > 99 ? "99+" : waiting}
+		</Box>
+	);
+}
+
 export function RecentTabTitle({ tab }: { tab: RecentTab }) {
 	const { t } = useTranslation("nav");
 	const { data: userPrefs } = useUserPreferences();
 	const showDirectory = userPrefs?.recentTabsShowDirectory ?? false;
 	// A coordinator's session sits next to its team's tab with the same title: label it.
 	const coordinator = isCoordinatorSessionTab(tab);
+	const waiting = (tab.pendingApprovalCount ?? 0) + (tab.readyItemCount ?? 0);
+	if (tab.type === "team" && waiting > 0)
+		return (
+			<Group gap={6} wrap="nowrap" justify="space-between" style={{ minWidth: 0 }}>
+				<Text size="sm" truncate style={{ minWidth: 0 }}>
+					{tab.title}
+				</Text>
+				<TeamWaitingBadge tab={tab} />
+			</Group>
+		);
 	return (
 		<Stack gap={0} style={{ minWidth: 0 }}>
 			{coordinator ? (

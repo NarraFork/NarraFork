@@ -1,3 +1,4 @@
+import { PROJECT_TEAM_CARDS_LIMIT, type TeamCard } from "@shared/project-overview";
 import type {
 	TeamActivityPage,
 	TeamApprovalsResponse,
@@ -52,6 +53,16 @@ export const teamsApi = {
 				status: options.status,
 				cursor: options.cursor,
 				limit: options.limit,
+			})}`,
+		),
+	/** The project page's team cards (R2): at most 24 teams a page, each with its numbers. */
+	listProjectTeamCards: (projectId: string, options: { cursor?: string } = {}) =>
+		request<{ teams: TeamCard[]; nextCursor: string | null }>(
+			`/projects/${encodeURIComponent(projectId)}/teams${query({
+				status: "active",
+				counts: "true",
+				cursor: options.cursor,
+				limit: PROJECT_TEAM_CARDS_LIMIT,
 			})}`,
 		),
 	createProjectTeam: (projectId: string, payload: CreateTeamPayload) =>

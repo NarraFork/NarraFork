@@ -5,7 +5,6 @@
 		"manage": "你可以管理这份配置。",
 		"readOnly": "只读：管理这份配置需要项目管理权限。",
 		"accessUnavailable": "无法核实管理权限，编辑已禁用。",
-		"settingsTraits": "设置、权限规则与特质",
 		"workspaceContainers": "工作区与容器设置",
 		"devices": "设备",
 		"knowledge": "知识库",
@@ -14,7 +13,6 @@
 		"instanceSettings": "实例设置与特质",
 		"routinesSkills": "例程与技能",
 		"unavailable": "配置暂不可用：可能无权访问、已不存在，或加载失败。",
-		"retirement": "画布入口已退场。原有配置、会话和资源保留在此，未迁移或删除任何数据。",
 		"sessions": "会话",
 		"sessionsUnavailable": "会话加载失败。",
 		"openSession": "打开会话",
@@ -25,7 +23,6 @@
 	"newSession": "新建会话",
 	"openOutline": "大纲",
 	"outlineNotCreated": "这个项目还没有大纲。能编辑项目的人打开它时会创建。",
-	"advancedSettings": "项目高级设置",
 	"projectDescription": "说明",
 	"defaultDirectoryHint": "仅作为新会话的默认目录，不会修改已有会话的工作目录。",
 	"newProject": "新建项目",
@@ -64,9 +61,6 @@
 	"deleteProject": "删除项目",
 	"deleteProjectTypeName": "输入项目名称以确认：",
 	"projectDeleted": "项目已删除",
-	"commandsButton": "命令",
-	"commandsTitle": "项目命令",
-	"commandsDesc": "定义此项目所有叙述者可用的斜杠命令。同名时项目命令优先于用户命令。",
 	"commandRunBashFirst": "先执行 Bash",
 	"commandRunBashFirstDesc": "开启后，使用此命令时会先按 /bash 流程执行下方指令，再把提示词发送给 AI。Bash 结果会进入同一轮 AI 上下文。",
 	"commandRunBashFirstBadge": "先 Bash",
@@ -85,21 +79,12 @@
 	"commandEmpty": "暂无项目命令，添加一个以开始使用。",
 	"commandDuplicateName": "已存在同名命令",
 	"commandInvalidName": "命令名称只能包含字母、数字、连字符和下划线",
-	"skillsButton": "技能",
-	"routinesButton": "套路",
-	"routinesTitle": "内置套路",
-	"routinesDesc": "为此项目启用或禁用内置命令和技能。可逐个覆盖全局设置。",
 	"routinesUnsupportedTitle": "项目级例程不可用",
 	"routinesUnsupportedDesc": "当前后端运行时不支持项目级例程覆盖。",
-	"routineFollowGlobal": "全局",
-	"skillsTitle": "项目技能",
-	"skillsDesc": "技能是为叙述者提供特定领域知识的可复用指令集。你可以在这里创建和编辑项目技能，默认写入 .narrafork/skills/<name>/SKILL.md。",
 	"skillsEmpty": "未找到技能。创建一个项目技能以开始使用。",
 	"skillsFiles": "个文件",
 	"skillsLocation": "位置",
 	"skillsCompanionFiles": "附属文件",
-	"settingsButton": "设置",
-	"settingsTitle": "项目设置",
 	"projectWhitelistDirs": "白名单目录",
 	"projectWhitelistDirsDesc": "对本项目叙述者自动放行的目录。",
 	"projectBlacklistDirs": "黑名单目录",
@@ -143,11 +128,8 @@
 	},
 	"teams": {
 		"title": "团队",
-		"newTeam": "新建团队",
-		"noTeams": "还没有团队。",
 		"loadFailed": "无法加载团队。",
 		"loadMore": "加载更多",
-		"open": "打开",
 		"onlooker": "只读",
 		"archived": "已归档",
 		"pageTitle": "团队",
@@ -334,8 +316,6 @@
 				"more": "还有 {{count}} 条",
 				"less": "收起",
 				"coordinator": "协调者",
-				"asksTool": "的工作者请求运行 {{tool}}",
-				"coordinatorAsksTool": "请求运行 {{tool}}",
 				"asksQuestion": "的工作者在问",
 				"coordinatorAsksQuestion": "在问",
 				"asksPlan": "的工作者提交了计划",
@@ -368,7 +348,15 @@
 				"moreInSession": "还有更多待处理没有列在这里，打开协调者会话查看。",
 				"unscanned": "可能还有待处理没有读到，打开协调者会话查看。",
 				"openFull": "打开会话",
-				"openAsker": "打开这个会话"
+				"openAsker": "打开这个会话",
+				"toolVerbs": {
+					"editFile": "请求编辑文件",
+					"runCommand": "请求运行命令",
+					"readFile": "请求读取文件",
+					"fetchWeb": "请求访问网页",
+					"useTool": "请求使用 {{tool}}"
+				},
+				"workerAsksAction": "的工作者{{action}}"
 			},
 			"work": {
 				"work": "工作",
@@ -386,7 +374,6 @@
 				"loadFailed": "读不到工作项。"
 			},
 			"row": {
-				"waitingTool": "等批准 {{tool}}",
 				"waitingAnswer": "等回答",
 				"waitingPlan": "等批准计划",
 				"waitingRule": "等权限规则",
@@ -414,7 +401,14 @@
 					"AskUserQuestion": "提问",
 					"ExitPlanMode": "提交计划"
 				},
-				"waitingPerson": "等人处理"
+				"waitingPerson": "等人处理",
+				"waitingTools": {
+					"editFile": "等批准编辑文件",
+					"runCommand": "等批准运行命令",
+					"readFile": "等批准读取文件",
+					"fetchWeb": "等批准访问网页",
+					"useTool": "等批准使用 {{tool}}"
+				}
 			},
 			"empty": {
 				"title": "工作项会出现在这里",
@@ -516,7 +510,112 @@
 			"coordinator": "协调者"
 		}
 	},
-	"skills": "技能",
-	"routines": "例程",
-	"commands": "命令"
+	"page": {
+		"newTeam": "新团队",
+		"more": "更多",
+		"showSessions": "团队与会话",
+		"waitingBadge": "{{count}} 等你",
+		"attention": {
+			"ownersSession": "{{name}}的会话",
+			"more": "还有更多待处理没有列在这里，打开对应的会话或团队查看。",
+			"unscanned": "可能还有待处理没有读到，打开对应的会话或团队查看。"
+		},
+		"teams": {
+			"empty": "还没有团队。团队由协调者把目标拆成工作项，并行推进。",
+			"newHint": "交给协调者拆分并行做",
+			"numbers": {
+				"inProgress": "进行中",
+				"ready": "就绪",
+				"done": "完成"
+			}
+		},
+		"sessions": {
+			"views": {
+				"active": "进行中",
+				"all": "全部",
+				"mine": "我的"
+			},
+			"recent": "最近 7 天",
+			"empty": {
+				"active": "没有运行中的会话，最近 7 天也没有更新。",
+				"all": "这个项目还没有会话。",
+				"mine": "你在这个项目里还没有会话。"
+			},
+			"showAll": "显示全部 {{count}} 个"
+		},
+		"newSession": "新会话",
+		"waitingBadgeMore": "{{count}}+ 等你"
+	},
+	"list": {
+		"subtitle": "有事等你处理的排在前面，其余按最近活动。会话按工作目录自动归入项目。",
+		"runningSessions": "{{count}}{{more}} 个进行中会话",
+		"noRunningSessions": "没有进行中的会话",
+		"teams": "{{count}}{{more}} 个团队",
+		"archived": "已归档",
+		"activity": {
+			"justNow": "刚刚有活动",
+			"minutes": "{{count}} 分钟前",
+			"hours": "{{count}} 小时前",
+			"yesterday": "昨天",
+			"days": "{{count}} 天前",
+			"never": "还没有活动"
+		}
+	},
+	"settingsPage": {
+		"title": "项目设置",
+		"open": "打开项目设置",
+		"back": "返回项目",
+		"autosave": "更改会自动保存",
+		"loading": "加载中…",
+		"saving": "保存中…",
+		"saveFailed": "保存失败：{{message}}",
+		"rulesCount": "{{count}} 条规则",
+		"openDevices": "设备设置",
+		"openKnowledge": "打开知识库",
+		"knowledgeNote": "知识库按分级和标签决定谁能读什么，在各项目间共享。",
+		"groups": {
+			"members": {
+				"title": "成员与可见性",
+				"description": "谁能看到这个项目，谁能在里面开会话、批准操作。"
+			},
+			"skills": {
+				"title": "技能",
+				"description": "本项目会话可用的技能，会话按需调用。"
+			},
+			"routines": {
+				"title": "例程",
+				"description": "「新会话默认加载」的例程在每个新会话里都可用；「会话内手动加载」需要在会话里输入 /load。"
+			},
+			"commands": {
+				"title": "命令",
+				"description": "会话里输入 / 可以调用的快捷命令，以及会话能或不能运行哪些命令。"
+			},
+			"workspace": {
+				"title": "工作区与容器",
+				"description": "项目目录，以及会话能或不能动哪些目录。"
+			},
+			"devices": {
+				"title": "设备",
+				"description": "会话可以在哪些机器上运行工具。"
+			},
+			"knowledge": {
+				"title": "知识库",
+				"description": "团队积累的知识，供会话查阅。"
+			}
+		},
+		"routines": {
+			"modes": {
+				"resident": "新会话默认加载",
+				"manual": "会话内手动加载",
+				"auto": "自动"
+			},
+			"followGlobal": "跟随全局：{{mode}}"
+		},
+		"unsaved": "未保存：{{message}}",
+		"pathSave": "保存目录",
+		"pathCancel": "取消",
+		"pathConfirmTitle": "更改项目目录？",
+		"pathConfirm": "项目目录将从 {{from}} 改为 {{to}}。会话会按工作目录重新归属：新目录下的会话归入本项目，原目录下、不在新目录里的会话离开本项目。",
+		"pathConfirmButton": "更改并重新归属"
+	}
 }
