@@ -43,7 +43,7 @@ keywords:
   - permission_decided_by
   - answerForm
 status: draft
-verified_at: 7d5423c07
+verified_at: ef28ecaaf
 ---
 # 团队页与审批
 
@@ -73,7 +73,7 @@ verified_at: 7d5423c07
 
 前端（`frontend/components/teams/`）：
 - 路由 `frontend/routes/projects/$projectId_.teams.$teamId.tsx`（不嵌在项目页下，占满外壳内容区）→ `TeamPageView.tsx`。对话是普通叙述者面板，只读成员的输入区换成「你是只读成员」（`NarratorPanel` 的 `readOnlyNotice`）。「…」菜单的协调者完整会话走 `onOpenCoordinatorSession`。
-- 团队页只讲一个团队：没有项目团队列表、没有「新建团队」、没有左侧团队切换。切换走侧栏固定的团队标签和项目页团队列表；新建走项目页或新建会话弹窗的「以团队开始」。
+- 团队页只讲一个团队：没有项目团队列表、没有「新建团队」、没有左侧团队切换。切换走侧栏固定的团队标签和项目页的团队卡片；新建走项目页或新建会话弹窗的「以团队开始」。
 - `TeamWorkspace.tsx`：页头、等你处理、两栏（对话约 60%，右栏约 40%，最小 320、最大 560，右栏顶部「工作 | 动态」切换与「N 项未完成」）；按自身宽度（不是视口）在 `split` 与 `tabs`（帧宽 < `TEAM_SPLIT_MIN_WIDTH` 860）之间选，`tabs` 是「对话 | 工作 (N)」，工作页里仍有同一个切换。对话在各布局里挂在 React 树的同一位置，换布局不重挂；从别处要求聚焦对话时先切到对话标签，渲染后再聚焦输入框。
 - `TeamHeader.tsx`：一行（手机两行）：返回、项目名、团队名、状态句（`team-page-model.ts:statusSentence`：「N 项进行中 · M 项等你」，旁观者是「等成员处理」，「空闲 · 还没有工作项 / N 项已完成」，「已暂停」= 有未完成项、没有在跑的会话且协调者上一轮被人停下，「已归档」）；等待数在审批列表 `more` 时写成「N+ 项等你」；右侧成员头像（最多 3 个加 +N，点开成员抽屉 `TeamMembers.tsx`）、固定到侧栏、「全部暂停」（普通按钮；手机上在「…」里）、「…」菜单（运行中的会话列表，取自摘要，点开会话；团队设置 `TeamSettingsModal.tsx` 改基线分支与简报、协调者完整会话、解散团队 `TeamDisbandDialog.tsx`）。手机上两行，第一行仍有返回箭头。「全部暂停」只给成员，协调者已归档时只在还有会话在跑时出现；协调者先停（`pauseOrder`），一次最多读 500 个运行中会话，结果分 paused / pausedSomeIdle / pausePartial / pauseNothing / pauseMore。
 - `TeamAttention.tsx`「等你处理」：只给成员，没有就不显示，琥珀色是全页唯一高饱和色。条目（`attentionEntries`）先是待决调用（按提出顺序），再是 ready 项（按更新时间）。工具调用：谁、命令或路径、拒绝/批准；提问：标题、完整提问、各选项的说明（灰字，截成两行）、选项按钮和「自己写…」（`answerForm`）；提问超过 600 字或某个选项说明超过 300 字时不在卡片上一键回答（`fitsInPlace`），和多问题、多选一样点「回答」开对话框，经 human-attention 详情读取完整表单（`AskUserQuestionBanner`）；计划：标题、「看计划」（同样经详情读计划正文）与「批准」；规则请求：去会话里处理；卡片上的会话/工作项名点开提问的会话，有 `decisionReason` 时显示成一行灰字；列表有 `more` 或 `unscanned` 时底部说明还有没列出的并可打开协调者会话；可合并：+/-、文件数、评审结论、分支 → 基线、查看改动/退回/合并（禁用）。多于 3 条折成「还有 N 条」；悬停卡片高亮右栏对应的工作项；手机上卡片横向滑动并显示「1 / N」。
@@ -81,7 +81,8 @@ verified_at: 7d5423c07
 - `TeamActivity.tsx`「动态」：安静的按时间列表（时间、谁、什么、哪一项、说明），标题与说明用 `eventLabelKey`/`eventNote`，未知种类显示 `teams.event.other`，种类名只在 tooltip 里；`work.returned` 的说明是理由原文。
 - `TeamWorkDrawer.tsx`：标题与结论徽标、分支 → 基线与领先提交数、工作者会话链接、改动文件（展开某个文件才读它的 diff）、评审记录（人退回的那轮带理由）、这一项的时间线；底栏（`canReturn` 时）退回 / 合并到基线（禁用），退回就地展开成必填理由，拒绝码 `TEAM_WORK_ITEM_NOT_RETURNABLE` / `TEAM_WORK_ITEM_CHANGED` / `TEAM_ARCHIVED` 有自己的中英文（`returnErrorKey`）。时间线与评审记录里协调者签作「协调者」（`isCoordinator`），不用团队名。
 - `TeamStart.tsx` 起步状态（没有工作项且协调者还没有消息、未归档；只给成员，只读成员看到一行 `TeamReadOnlyStart`）：盖在对话的消息区上（不挡头部与输入框），一句话、一行说明、3 个示例，点击经 `lib/composer-append-queue.ts` 填入协调者的输入框。
-- 固定到侧栏：页头和项目页 `ProjectTeamsList.tsx` 每行都有 `PinToSidebarButton`（`team-page-model.ts:teamPinTitle`：团队未载入、非 active 或协调者已归档就不给）；侧栏团队标签显示协调者状态和成员的待批数（`team-board.ts:teamPendingApprovalCount`），见[最近标签页](../recent-tabs.md)。
+- 固定到侧栏：页头有 `PinToSidebarButton`（`team-page-model.ts:teamPinTitle`：团队未载入、非 active 或协调者已归档就不给）；侧栏团队标签显示协调者状态和成员的待批数加可合并数（`team-board.ts:teamPendingApprovalCount`、`teamReadyItemCount`），见[最近标签页](../recent-tabs.md)。
+- 项目页（R2，见[项目页](../project-pages.md)）复用这里的读模型和组件：待决调用的扫描是 `team-board.ts:scanPendingCalls`（团队树用 `visiblePendingCalls`，项目用根会话链接范围加 `accept`），预览用 `pendingApprovalsOf`，团队卡片的数字用 `readTeamCards`；「等你处理」用同一个 `TeamAttention`，条目可带 `source`（团队名或会话与所有者），`onOpenTeam`、`onDecided`、`flush`、`compact`、`beyondKeys` 只给项目页用。
 - 「升级为团队」不在团队页上：入口是会话溢出菜单（见[会话外框](../../frontend/narrator-ui/session-chrome.md)），对话框 `UpgradeToTeamModal.tsx` 用与新建团队相同的 `TeamCreateFields`/`useTeamDraft`；菜单项只给 `team-upgrade-eligibility.ts:canOfferTeamUpgrade` 为真的会话。
 - `team-page-model.ts` 是纯规则：等你处理与折叠、分组、状态句、起步/收尾、行文案、退回理由、diff 行分类、布局、轮询退避、套接字推送合并（400ms 去抖、最长 2s）、暂停顺序。
 - `hooks/useTeams.ts`：摘要在叙述者 socket 的相关帧上合并重取，同时带退避轮询（变化后 4s，翻倍到 60s，标签页隐藏时暂停）；看板（`lastEventId` 与各列计数变了才重取，连同 `work-stats`、抽屉、diff 一起失效）、动态、审批各自按变化重取。`useDecideApproval` 批准时可带 `answers`；`useApprovalDetail` 读 `permission:<id>` 的 human-attention 详情。`lib/api/teams.ts` 是客户端。
@@ -98,7 +99,7 @@ verified_at: 7d5423c07
 - 新增审批类型：`teamApprovalKind`（`shared/project-teams.ts`）、`TeamAttention.tsx` 的卡片与 `rowLine`。
 - 新读接口必须带 LIMIT、走索引，并保持 SQLite 专用；git 读必须有超时与输出上限，diff 正文只在抽屉里按文件读。
 - 加合并：现在服务端从不合并，「合并」按钮是禁用的。要接上需要新的写 git 路径与冲突处理，属于产品决定。
-- 改待批计数的规则：页头状态句与侧栏团队标签共用 `pendingCount`；`ProjectTeamsList` 的 `data-testid="project-team-row"` 是每个团队一行。
+- 改待批计数的规则：页头状态句、侧栏团队标签、项目页团队卡片共用 `pendingCount`；项目页 `ProjectTeamCards` 的 `data-testid="project-team-card"` 是每个团队一张（浏览器测试 `team-page.browser.test.ts` 按它数）。
 
 ## 相关
 - [团队与成员](records.md)：成员列表的来源。

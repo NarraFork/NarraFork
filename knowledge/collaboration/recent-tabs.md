@@ -63,7 +63,7 @@ keywords:
   - pendingApprovalCount
   - project_id
 status: draft
-verified_at: 99e33f8fc
+verified_at: ef28ecaaf
 ---
 # 最近标签页
 
@@ -85,7 +85,7 @@ verified_at: 99e33f8fc
   - 不代表协调者会话：`represented_narrator_id`、`narrator_id` 都是 NULL，所以 `getRecentTabUserIdsFor*` 看不到它，持有它不会收到协调者的通知；
   - 标题与 `project_id`（新列，只有团队标签有值）由服务端从 `project_teams` 和协调者标题写入，客户端传的不算；upsert 和整表恢复都先过 `authorizeTeamTabs`：团队不存在、已归档、或用户读不了协调者，就不写（`upsertRecentTabsBatch`、`restoreRecentTabs`）；
   - 协调者改名时持有者的团队标签跟着改（`syncNarratorTitleToRecentTabs` 另按 `(type, entity_id)` 索引找团队标签持有者）；
-  - 运行时补丁（`enrichTeamTabs`）：读得了才给协调者的 `status/substatus`；只读者加 `teamOnlooker`；成员加 `pendingApprovalCount`（团队页顶栏同一个计数 `teamPendingApprovalCount`，每次请求最多算 20 个团队，`TEAM_TAB_PENDING_COUNT_LIMIT`），其他人为 null；读不了的团队补丁为空状态；
+  - 运行时补丁（`enrichTeamTabs`）：读得了才给协调者的 `status/substatus`；只读者加 `teamOnlooker`；成员加 `pendingApprovalCount`（团队页顶栏同一个计数 `teamPendingApprovalCount`）和 `readyItemCount`（待验收的 ready 工作项，`team-board.ts:teamReadyItemCount`，`(team_id, state, id)` 数到 51），每次请求最多算 20 个团队（`TEAM_TAB_PENDING_COUNT_LIMIT`），其他人为 null；读不了的团队补丁为空状态；
   - 何时移除：团队归档（`startTeamStatusSync` 发现归档后调 `pruneTeamTabs`，取消归档不恢复）、删除协调者（`narrator-service` 删除时 `removeTabFromAllUsers("team", id)`）、解散团队（`team-conversion.ts:disbandTeam` 提交后同样调用，会话自己的标签保留）、协调者共享变化后读不了（`narrator-sharing.ts:announceAccessChange` 调 `pruneTeamTabs`，逐个持有者重新判读）、失去项目（`pruneUnreadableProjectTabs` 对该项目的团队标签按协调者 ACL 判读，`usersWithTabsInProject` 也把团队标签持有者算进去）。
 - 每次写入都在用户级锁内进行：读行 → 变换 → 去重加限额 → 在一个事务里只更新有差异的行并把 `user_recent_tabs_meta.revision` +1，再向该用户广播 `user:recent_tabs_delta`（每批 100 个操作）（`persistMutationLocked`、`broadcastDelta`）。无变化不增版本。
 - 读取走游标分页：每页最多 50 行，游标绑定分区和版本，版本变了返回 409 `stale cursor`，客户端须从第一页重载（`listPage`）；文件夹成员不在顶层分页里。
@@ -103,8 +103,8 @@ verified_at: 99e33f8fc
 - `frontend/hooks/useRecentTabs.ts`（分页读、乐观更新、撤销提示、`user:recent_tabs_delta` 帧的合并）与 `useRecentTabsWS.ts`（订阅叙述者状态/标题等列表事件）；`recent-tabs-utils.ts`、`recent-tab-folders.ts`（把平铺列表按文件夹分组成渲染行；排布规则本身在 `shared/recent-tab-layout.ts`，前后端共用）。
 - 去哪：`recent-tabs-utils.ts:recentTabHref`（会话 `/narrators/:id`、项目 `/projects/:id`、团队 `/projects/:projectId/teams/:id`），`isTabActive`、行的点击、键盘 Enter（行上的 `data-tab-href`，`navRowHref`）和「在窗口中打开」（`recentTabWindowHref`）都按它。
 - 实时：`recentTabLiveNarratorId` 让团队标签跟随协调者，套接字订阅和运行时读取都带上它（同一个协调者的会话标签与团队标签各占一个键）；套接字补丁对团队标签只取标题和状态（`teamTabPatch`）；协调者状态一变，2 秒后合并重读一次运行时以刷新待批数。提醒（声音、favicon、PWA、`above_idle` 提前）只认会话标签：只固定了团队的人不会因协调者等待而被提醒。
-- 固定按钮：`PinToSidebarButton.tsx`（项目页标题旁、团队页顶栏标题旁、项目团队列表每行；团队只在活跃时给，见[团队页与审批](teams/page.md)）。是否已置顶：标签在侧栏已载入的行里就直接用那一行（`recent-tab-page-pin.ts:loadedSidebarPin`，跟着侧栏即时变）；不在（可能排在第 50 行之后）就用 React Query 读 `GET /recent-tabs/state`（键 `recentTabStateQueryKey(userId, key)`，根 `RECENT_TAB_STATE_QUERY_ROOT` = `["user-preferences", "recent-tab-state"]`，60 秒内算新鲜）。这是按用户的数据：键里带用户 id，且挂在 `["user-preferences"]` 下，换账号时 `useAuth.ts:applySession` 与 `useUserPreferences.ts` 的 token 观察者整体移除这一前缀，新账号不会看到上一个账号的置顶状态（测试见 `PinToSidebarButton.test.tsx` 的换账号用例），读到之前按钮禁用，免得把已置顶的再置顶一次（`resolvePagePin`）。这个读在三种时候被标为过期（`useRecentTabs.ts:invalidateRecentTabStates`）：任何 delta（本页的写入或别的客户端的 `user:recent_tabs_delta` 帧，都经 `applyRecentTabsDeltaAndFollowUp`）碰到该键；列表因缺口或重连从第一页重载（`refreshRecentTabsLoadedWindow` 的 `reset`、`refreshRecentTabsAfterReconnect`）；按钮自己点完。点了走 `useRecentTabs.ts:setRecentTabPinnedFromPage`（置顶 = 带 `pin: true` 的 upsert，取消 = 普通 unpin，标签留着），失败（含 409 `RECENT_TAB_REFUSED`）弹红色提示。测试 `PinToSidebarButton.test.tsx`。项目列表卡片没有菜单，没加。
-- 团队标签的图标：协调者的 `NarratorStatusIcon` 加团队角标，成员有待批时右上角显示数量（`RecentTabs.tsx:TeamTabIcon`）；悬停卡片显示同样的状态和待批数。
+- 固定按钮：`PinToSidebarButton.tsx`（项目页标题旁、团队页顶栏标题旁；项目页的团队卡片不带固定按钮；团队只在活跃时给，见[团队页与审批](teams/page.md)）。是否已置顶：标签在侧栏已载入的行里就直接用那一行（`recent-tab-page-pin.ts:loadedSidebarPin`，跟着侧栏即时变）；不在（可能排在第 50 行之后）就用 React Query 读 `GET /recent-tabs/state`（键 `recentTabStateQueryKey(userId, key)`，根 `RECENT_TAB_STATE_QUERY_ROOT` = `["user-preferences", "recent-tab-state"]`，60 秒内算新鲜）。这是按用户的数据：键里带用户 id，且挂在 `["user-preferences"]` 下，换账号时 `useAuth.ts:applySession` 与 `useUserPreferences.ts` 的 token 观察者整体移除这一前缀，新账号不会看到上一个账号的置顶状态（测试见 `PinToSidebarButton.test.tsx` 的换账号用例），读到之前按钮禁用，免得把已置顶的再置顶一次（`resolvePagePin`）。这个读在三种时候被标为过期（`useRecentTabs.ts:invalidateRecentTabStates`）：任何 delta（本页的写入或别的客户端的 `user:recent_tabs_delta` 帧，都经 `applyRecentTabsDeltaAndFollowUp`）碰到该键；列表因缺口或重连从第一页重载（`refreshRecentTabsLoadedWindow` 的 `reset`、`refreshRecentTabsAfterReconnect`）；按钮自己点完。点了走 `useRecentTabs.ts:setRecentTabPinnedFromPage`（置顶 = 带 `pin: true` 的 upsert，取消 = 普通 unpin，标签留着），失败（含 409 `RECENT_TAB_REFUSED`）弹红色提示。测试 `PinToSidebarButton.test.tsx`。项目列表卡片没有菜单，没加。
+- 团队标签的图标：协调者的 `NarratorStatusIcon` 加团队角标（`RecentTabs.tsx:TeamTabIcon`）；成员有等待的事时，行尾是琥珀色数字 = 待批 + 可合并（`RecentTabs.tsx:TeamWaitingBadge`，与团队页「等你处理」同一口径）；悬停卡片显示状态、待批数与「N 项可以合并」（`RecentTabDetailCard.tsx`）。测试 `recent-tab-project-coordinator.test.tsx`、`recent-tab-teams.test.ts`。
 - 协调者的会话标签和团队标签可能并排、同名：会话标签保持原样（它的 `represented_narrator_id` 决定通知收件人，不能去掉或合并），行标题后加一个暗色「协调者」小字（`RecentTabs.tsx:RecentTabTitle`，判定 `recent-tabs-utils.ts:isCoordinatorSessionTab` = `narrator` 类型且运行时补丁的 `teamSession` 为真；团队里只有协调者是 primary），悬停卡片多一行说明。`teamSession` 列入 `RECENT_TAB_RUNTIME_KEYS`，列表重取时沿用，标签不闪。
 - `frontend/components/nav/RecentTabs.tsx` 是侧栏主体；拖拽模型 `recent-tab-drag-model.ts`/`recent-tab-drop-target.ts`/`useRecentTabsDrag.ts`，外部拖入 `useRecentTabExternalDrop.ts`，键盘导航 `recent-tab-keyboard-nav.ts`，触摸滑动 `useRowSwipe.tsx`（右滑关闭、左滑开菜单）。
 - 文件夹的折叠/预览/展开是每台设备的显示状态，存 localStorage，不上服务器（`useFolderDisplay.ts`）；预览条数才是文件夹行上的设置（`RECENT_TAB_FOLDER_DEFAULT_PREVIEW` = 3）。
