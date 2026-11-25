@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, expect, spyOn, test } from "bun:test";
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { cleanDb } from "../../../tests/setup";
 import { db, sqlite } from "../../db";
 import {
@@ -21,6 +21,7 @@ import {
 import * as inbox from "../agent-runtime/inbox";
 import * as communication from "../narrator-communication";
 import { authorizeAgentControl } from "../narrator-control";
+import { registerTaskAlias, unregisterTaskAlias } from "../subagent-alias";
 import { captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 async function expectRejected(work: PromiseLike<unknown>, message?: string) {
@@ -231,7 +232,7 @@ test("ambiguous titles are rejected with full stable IDs instead of choosing the
 	).toBe("grandchild-b");
 });
 
-test("names match before the display limit and a current alias outranks title-only matches", async () => {
+function seedPastDisplayLimit() {
 	const fillers = Array.from({ length: 205 }, (_, index) => ({
 		id: `a-filler-${index}`,
 		title: "Some other title",
@@ -244,6 +245,59 @@ test("names match before the display limit and a current alias outranks title-on
 	db.insert(narratorCommunicationNodes)
 		.values(fillers.map(({ id }) => ({ narratorId: id, parentNarratorId: "root", version: 1 })))
 		.run();
+}
+
+test("a bare handle and title conflict before any delivery even beyond the prompt listing", async () => {
+	seedPastDisplayLimit();
+	const titled = "grandchild-a";
+	const named = "peer"; // Different execution user; exactly connected and publicly writable.
+	db.update(narrators)
+		.set({ title: "release", titleSlug: "release" })
+		.where(eq(narrators.id, titled))
+		.run();
+	db.update(narrators)
+		.set({ handle: "Release", handleFold: "release" })
+		.where(eq(narrators.id, named))
+		.run();
+	db.update(narrators).set({ title: "@release" }).where(eq(narrators.id, "grandchild-b")).run();
+	const display = await communication.listCommunicationTargets("root", { limit: 200 });
+	expect(display).toHaveLength(200);
+	expect(display.some(({ id }) => id === titled || id === named)).toBe(false);
+
+	const state = () =>
+		db
+			.select({ id: narrators.id, inboxSequence: narrators.inboxSequence, model: narrators.model })
+			.from(narrators)
+			.where(inArray(narrators.id, [titled, named]))
+			.orderBy(narrators.id)
+			.all();
+	const before = state();
+	const onDeliveryResolved = spyOn({ capture: () => undefined }, "capture");
+	await expectRejected(
+		sendSubagentMessageDetailed({ ...request("root", []), name: "release", onDeliveryResolved }),
+		"Ambiguous communication target",
+	);
+	expect(state()).toEqual(before);
+	expect(queued()).toHaveLength(0);
+	for (const id of [titled, named])
+		expect(await inbox.listInboxRows(id, ["agent_message"])).toEqual([]);
+	expect(onDeliveryResolved).not.toHaveBeenCalled();
+	expect(wake).not.toHaveBeenCalled();
+
+	const explicit = await sendSubagentMessageDetailed({ ...request("root", []), name: "@release" });
+	expect(explicit.targets.map(({ id, status }) => [id, status])).toEqual([[named, "queued"]]);
+	expect(queued().map(({ narratorId }) => narratorId)).toEqual([named]);
+	const byId = await sendSubagentMessageDetailed(request("root", [titled]));
+	expect(byId.targets.map(({ id, status }) => [id, status])).toEqual([[titled, "queued"]]);
+	expect(
+		queued()
+			.map(({ narratorId }) => narratorId)
+			.sort(),
+	).toEqual([titled, named]);
+});
+
+test("names match before the display limit and a current alias outranks title-only matches", async () => {
+	seedPastDisplayLimit();
 	db.update(narrators)
 		.set({ title: "Previously shared", titleSlug: "shared" })
 		.where(eq(narrators.id, "grandchild-a"))
@@ -257,6 +311,12 @@ test("names match before the display limit and a current alias outranks title-on
 	expect(display.some(({ id }) => id === "grandchild-b")).toBe(false);
 	const resolve = async (name: string) =>
 		(await resolveCommunicationSendTargets({ callerNarratorId: "root", name }))[0]?.id;
+	expect(registerTaskAlias("root", "branch-a", "shared").alias).toBe("shared");
+	try {
+		expect(await resolve("shared")).toBe("branch-a");
+	} finally {
+		unregisterTaskAlias("root", "branch-a");
+	}
 	expect(await resolve("shared")).toBe("grandchild-b");
 	expect(await resolve("Previously shared")).toBe("grandchild-a");
 

@@ -47,6 +47,7 @@ import {
 	withSeqFloorRaiseScope,
 } from "./narrator-refs/seq-store";
 import { narratorCreationWorkspaceTarget } from "./narrator-service";
+import { storedTitleSlug } from "./subagent-alias";
 import { resolveSubagentModelForRun } from "./subagent-model";
 import { withWorkspaceAdmission } from "./worktree-lifecycle-guard";
 
@@ -330,6 +331,7 @@ export async function extractSubagentToPrimary(
 							contextToolsChars: 0,
 							status: "idle",
 							title,
+							titleSlug: storedTitleSlug(title),
 							cwd: workspace.cwd,
 							defaultDeviceId: source.defaultDeviceId ?? null,
 							createdAt: now,

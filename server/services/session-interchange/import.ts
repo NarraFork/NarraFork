@@ -67,6 +67,7 @@ import { bumpNarratorMessageVersion } from "../narrator-persistence";
 import { dbTransactionWithSeqFloor } from "../narrator-refs/seq-floor-tx";
 import { claimNextRefSeq } from "../narrator-refs/seq-store";
 import { narratorService } from "../narrator-service";
+import { storedTitleSlug } from "../subagent-alias";
 
 /** Messages per insert transaction. Small enough that one batch never stalls the loop. */
 export const IMPORT_BATCH_MESSAGES = 200;
@@ -458,6 +459,7 @@ function createImportedSubagent(input: {
 				variant: subagentVariant(input.subagentType),
 				traits: withRuntimePolicyTrait(["standalone", IMPORTED_TRAIT], input.ceiling),
 				title: input.title ?? null,
+				titleSlug: storedTitleSlug(input.title),
 				// Same as a live subagent: follow the parent's model rather than freezing it.
 				model: FOLLOW_PARENT_MODEL,
 				permissionMode: input.parent.permissionMode ?? "default",

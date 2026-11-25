@@ -312,25 +312,32 @@ export function createCommunicationTargetReader(
 				: `(SELECT substr(value,16,128) FROM jsonb_array_elements_text(n.traits::jsonb) AS value WHERE value LIKE 'subagent-alias:%' LIMIT 1)`;
 		const { selector } = options;
 		const activeAliasIds = selector?.activeAliasIds ?? [];
+		const explicitHandle = selector?.name.startsWith("@");
+		const handle = selector ? foldHandle(selector.name.replace(/^@/, "")) : "";
 		const legacyAliasMatch =
 			guard.backend === "sqlite"
 				? "EXISTS (SELECT 1 FROM json_each(n.traits) WHERE value = ?)"
 				: "EXISTS (SELECT 1 FROM jsonb_array_elements_text(n.traits::jsonb) AS value WHERE value = ?)";
+		// Only @handle explicitly chooses the handle namespace. A bare handle is
+		// another ordinary match, so it cannot silently outrank someone else's title.
 		const rank = selector
-			? `CASE ${activeAliasIds.length ? `WHEN n.id IN (${placeholders(activeAliasIds)}) THEN 0` : ""}
-      WHEN n.alias_selector = ? OR ${legacyAliasMatch} OR n.handle_fold = ? THEN 1
-      WHEN n.title_slug = ? OR n.title = ? OR substr(n.id,1,length(?)) = ? THEN 2 ELSE NULL END`
+			? `CASE ${explicitHandle ? "WHEN n.handle_fold = ? THEN -1" : ""}
+      ${activeAliasIds.length ? `WHEN n.id IN (${placeholders(activeAliasIds)}) THEN 0` : ""}
+      WHEN n.alias_selector = ? OR ${legacyAliasMatch} THEN 1
+      WHEN n.title_slug = ? OR n.title = ? OR substr(n.id,1,length(?)) = ?
+      ${explicitHandle ? "" : "OR n.handle_fold = ?"} THEN 2 ELSE NULL END`
 			: "0";
 		const selectorParams = selector
 			? [
+					...(explicitHandle ? [handle] : []),
 					...activeAliasIds,
 					selector.name,
 					`subagent-alias:${selector.name}`,
-					foldHandle(selector.name.replace(/^@/, "")),
 					selector.name,
 					selector.name,
 					selector.name,
 					selector.name,
+					...(explicitHandle ? [] : [handle]),
 				]
 			: [];
 		const rows = await execute(

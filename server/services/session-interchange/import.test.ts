@@ -5,11 +5,12 @@
  * them, a subagent attaches to its call, compaction limits what the model sees, and
  * the imported history builds a provider request without dangling tool calls.
  */
-import { beforeAll, describe, expect, test } from "bun:test";
+import { beforeAll, describe, expect, spyOn, test } from "bun:test";
 import type { InterchangeSession } from "@shared/session-interchange/model";
 import { and, asc, eq } from "drizzle-orm";
 import { db } from "../../db";
 import {
+	narratorBufferedMessages,
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
@@ -19,7 +20,10 @@ import {
 import { AnthropicProvider } from "../../lib/agent/anthropic-provider";
 import { OpenAIProvider } from "../../lib/agent/openai-provider";
 import { eventBus } from "../../lib/event-bus";
+import { generateId } from "../../lib/id";
 import { parseRuntimePolicyTraits } from "../../lib/runtime-policy-trait";
+import { sendSubagentMessageDetailed } from "../agent-communication";
+import * as inbox from "../agent-runtime/inbox";
 import { compileDelegationPolicy, withDelegationDepth } from "../agent-runtime/policy";
 import { getCommunicationTopology } from "../narrator-communication/reader";
 import { mutateCommunication } from "../narrator-communication/service";
@@ -117,6 +121,77 @@ async function refsOf(narratorId: string) {
 		.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
 		.where(eq(narratorMessageRefs.narratorId, narratorId))
 		.orderBy(asc(narratorMessageRefs.seq));
+}
+
+async function expectSendByTitleSlug(callerNarratorId: string, slug: string, recipientId: string) {
+	const messageId = generateId();
+	const toolCallId = generateId();
+	const toolUseId = `send-${toolCallId}`;
+	const message = `Message to ${slug}`;
+	const now = new Date().toISOString();
+	db.transaction((tx) => {
+		tx.insert(narratorMessages)
+			.values({
+				id: messageId,
+				narratorId: callerNarratorId,
+				role: "assistant",
+				contentJson: [],
+				createdAt: now,
+			})
+			.run();
+		tx.insert(narratorToolCalls)
+			.values({
+				id: toolCallId,
+				narratorId: callerNarratorId,
+				messageId,
+				toolUseId,
+				toolName: "Send",
+				executionAttempt: 1,
+				executionIdentityVersion: 1,
+				status: "running",
+				createdAt: now,
+			})
+			.run();
+	});
+	// Only suppress model wake-up. Name lookup, ACL, receipt validation and enqueue are real.
+	const wake = spyOn(inbox, "wakeInboxIfEligible").mockResolvedValue(false);
+	try {
+		const result = await sendSubagentMessageDetailed({
+			callerNarratorId,
+			id: slug,
+			message,
+			toolUseId,
+			toolCallBinding: { toolCallId, attempt: 1 },
+			signal: new AbortController().signal,
+			locale: "en",
+		});
+		expect(result.targets).toEqual([
+			expect.objectContaining({
+				id: recipientId,
+				status: "queued",
+				deliveryMessageId: expect.any(String),
+			}),
+		]);
+		expect(
+			db
+				.select()
+				.from(narratorBufferedMessages)
+				.where(eq(narratorBufferedMessages.sourceToolCallId, toolCallId))
+				.all(),
+		).toEqual([
+			expect.objectContaining({
+				narratorId: recipientId,
+				sourceNarratorId: callerNarratorId,
+				recipientMessageId: result.targets[0]?.deliveryMessageId,
+				kind: "agent_message",
+				state: "queued",
+				text: message,
+				createdBy: USER,
+			}),
+		]);
+	} finally {
+		wake.mockRestore();
+	}
 }
 
 describe("importInterchangeSession", () => {
@@ -312,7 +387,7 @@ describe("importInterchangeSession", () => {
 						ref: "ext-sub",
 						parentToolUseId: callId,
 						subagentType: "Explore",
-						title: "Look around",
+						title: "Review API",
 						messages: [
 							{
 								role: "user",
@@ -386,6 +461,8 @@ describe("importInterchangeSession", () => {
 			expect.objectContaining({ id: result.narratorId, parentNarratorId: null }),
 		]);
 		expect(graph.peers).toEqual([]);
+		await expectSendByTitleSlug(result.narratorId, "review-api", subId);
+		expect(sub).toMatchObject({ title: "Review API", titleSlug: "review-api" });
 		const peer = await narratorService.create({ ownerUserId: USER });
 		expect(
 			await mutateCommunication(subId, owner, { kind: "connect", targetNarratorId: peer.id }),
@@ -428,6 +505,7 @@ describe("importInterchangeSession", () => {
 		const source = await narratorService.createSubagent({
 			parentNarratorId: parent.id,
 			subagentType: "general",
+			title: "Original Research",
 			subagentOriginKind: "standalone",
 			cwd: "/tmp",
 			runtimePolicy: { version: 1 },
@@ -442,8 +520,27 @@ describe("importInterchangeSession", () => {
 			taskUri,
 			JSON.stringify({ tasks: [{ text: "Preserve this task", status: "todo" }] }),
 		);
+		const historyId = generateId();
+		db.transaction((tx) => {
+			tx.insert(narratorMessages)
+				.values({
+					id: historyId,
+					narratorId: source.id,
+					role: "assistant",
+					contentJson: [{ type: "text", text: "Keep the original research history" }],
+					createdAt: new Date().toISOString(),
+				})
+				.run();
+			tx.insert(narratorMessageRefs)
+				.values({ id: generateId(), narratorId: source.id, messageId: historyId, seq: 0 })
+				.run();
+		});
+		const originalRefs = await refsOf(source.id);
+		expect(originalRefs).toHaveLength(1);
 		const originalGraph = await topologyOf(source.id);
-		const extracted = await narratorService.extractSubagentToPrimary(source.id);
+		const extracted = await narratorService.extractSubagentToPrimary(source.id, {
+			title: "Release Review Notes",
+		});
 
 		const graph = await topologyOf(extracted.id);
 		expect(graph.nodes).toEqual([
@@ -462,8 +559,16 @@ describe("importInterchangeSession", () => {
 				targetNarratorId: peer.id,
 			}),
 		).toEqual({ changed: true });
+		await expectSendByTitleSlug(peer.id, "release-review-notes", extracted.id);
+		expect(db.select().from(narrators).where(eq(narrators.id, extracted.id)).get()).toMatchObject({
+			title: "Release Review Notes",
+			titleSlug: "release-review-notes",
+		});
 		expect(await topologyOf(source.id)).toEqual(originalGraph);
+		expect(await refsOf(source.id)).toEqual(originalRefs);
 		expect(await narratorService.getById(source.id)).toMatchObject({
+			title: "Original Research",
+			titleSlug: "original-research",
 			type: "subagent",
 			parentNarratorId: parent.id,
 			aclRootNarratorId: parent.id,
