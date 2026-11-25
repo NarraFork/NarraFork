@@ -249,6 +249,31 @@ describe("ModelTrace HTTP entry", () => {
 		expect(start.mock.calls[0]?.[3]).toEqual({});
 	});
 
+	test("supplemental calibration requires write access and a bounded result token", async () => {
+		await source(false, { visibility: "public", traits: ["modeltrace"] });
+		const service = await import("../modeltrace-service");
+		const calibrate = spyOn(service, "calibrateModelTrace").mockResolvedValue({ id: "source" });
+		spies.push(calibrate);
+		const request = (app: ReturnType<typeof appFor>, body: unknown) =>
+			app.request("/narrators/source/modeltrace/calibrate", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify(body),
+			});
+		expect((await request(appFor("reader"), { resultId: "sample-token" })).status).toBe(404);
+		expect((await request(appFor(), { resultId: "bad token" })).status).toBe(400);
+		expect((await request(appFor(), { resultId: "x".repeat(1024) })).status).toBe(413);
+		expect(calibrate).not.toHaveBeenCalled();
+		const response = await request(appFor(), { resultId: "sample-token" });
+		expect(response.status).toBe(202);
+		expect(await response.json()).toEqual({ id: "source" });
+		expect(calibrate.mock.calls[0]?.slice(0, 3)).toEqual([
+			"source",
+			"sample-token",
+			{ userId: "owner", isAdmin: false },
+		]);
+	});
+
 	test("retry requires write access to the diagnostic child", async () => {
 		await source(false, { visibility: "public", traits: ["modeltrace"] });
 		const service = await import("../modeltrace-service");

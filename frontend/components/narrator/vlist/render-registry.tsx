@@ -441,7 +441,12 @@ export function renderElement(
 		case "knowledge-hint":
 			return <RenderSystemList measured={m} onOpenEntry={extra.onOpenEntry as never} />;
 		case "modeltrace-result":
-			return <RenderModelTraceResult measured={m} />;
+			return (
+				<RenderModelTraceResult
+					measured={m}
+					calibrationNarratorId={extra.modelTraceCalibrationNarratorId as string | undefined}
+				/>
+			);
 		case "plan-card":
 			return (
 				<RenderPlanCard

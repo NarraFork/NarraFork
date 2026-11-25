@@ -26,7 +26,7 @@ async function rank(outputs: ModelTraceOutput[]): Promise<WorkerReply> {
 	const directory = dirname(bankPath);
 	if (directory !== dirname(detectorAsset)) return { type: "unavailable" };
 	const detector = await loadDetector({ source: directory });
-	const { decision, results } = detector.analyze(outputs);
+	const { decision, results, diagnostics } = detector.analyze(outputs);
 	// Single-sample SDK scores are not calibrated probabilities. Convert the full
 	// ranking to relative weights (temperature 1) before limiting the UI to five rows.
 	const relativeWeights = decision === "partial" ? uncalibratedWeights(results) : undefined;
@@ -34,6 +34,9 @@ async function rank(outputs: ModelTraceOutput[]): Promise<WorkerReply> {
 		type: "ranked",
 		ranking: {
 			decision,
+			acceptedSampleIndexes: diagnostics
+				.filter(({ accepted }) => accepted)
+				.map(({ index }) => index),
 			results: results
 				.slice(0, MODELTRACE_RESULT_LIMIT)
 				.map(({ model, display_name, probability }, index) => ({
