@@ -1,4 +1,5 @@
 import type { ModelCard } from "@shared/model-catalog/card";
+import type { RuntimeModelSummary } from "@shared/model-runtime";
 import type { TFunction } from "i18next";
 import type React from "react";
 import { FOLLOW_PARENT_MODEL, type ModelOption } from "../../../lib/constants";
@@ -55,7 +56,8 @@ export interface UseStatusBarPropsOptions {
 	resolvedModelOption: ModelOption | undefined;
 	narratorReasoningEffort: string | null | undefined;
 	settingsData: ModelSelectionSettings | undefined;
-	modelCard: ModelCard | null | undefined;
+	modelCard?: ModelCard | null;
+	modelSummary?: RuntimeModelSummary;
 	reasoningEffortMutation: PendingMutate<{ id: string; reasoningEffort: string | null }>;
 	updateSettingsMutation: {
 		mutate: (data: Record<string, unknown>, options?: { onSuccess?: () => void }) => void;
@@ -118,6 +120,7 @@ export function useStatusBarProps(
 				: undefined,
 		settingsData: options.settingsData,
 		modelCard: options.modelCard,
+		modelSummary: options.modelSummary,
 		reasoningEffortMutation: options.reasoningEffortMutation,
 		updateSettingsMutation: options.updateSettingsMutation,
 	});
@@ -174,7 +177,7 @@ export function useStatusBarProps(
 		workIndicator: options.workIndicator,
 		queue: options.queue,
 		tasks: options.tasks,
-		model: options.model,
+		model: { ...options.model, summary: options.modelSummary },
 		reasoning: {
 			supported: modelSelection.supportsReasoningEffort,
 			displayed: modelSelection.displayedReasoningEffort,

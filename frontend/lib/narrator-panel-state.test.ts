@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { api } from "./api";
-import type { NarratorPanelStateOptions, NarratorPanelStateResponse } from "./api/narrators";
+import {
+	createNarratorPanelReadScope,
+	type NarratorPanelStateOptions,
+	type NarratorPanelStateResponse,
+} from "./api/narrators";
 import {
 	createPanelReconcileRestartScheduler,
 	panelConnectionRead,
@@ -45,6 +49,22 @@ describe("live panel-state read sharing", () => {
 			return 2;
 		});
 		expect(calls).toBe(2);
+	});
+
+	test("all readers cancelling before the microtask never starts transport", async () => {
+		const share = createSharedInflight<number>();
+		const firstController = new AbortController();
+		const secondController = new AbortController();
+		let calls = 0;
+		const read = async () => ++calls;
+		const first = share("key", read, { signal: firstController.signal });
+		const second = share("key", read, { signal: secondController.signal });
+		firstController.abort();
+		secondController.abort();
+		await expect(first).rejects.toMatchObject({ name: "AbortError" });
+		await expect(second).rejects.toMatchObject({ name: "AbortError" });
+		expect(calls).toBe(0);
+		expect(await share("key", read)).toBe(1);
 	});
 
 	test("one observer cancelling does not abort another observer's read", async () => {
@@ -114,9 +134,9 @@ describe("panel connection lifecycle", () => {
 		expect(disconnected.read).toBeNull();
 		const reconnected = panelConnectionRead(disconnected.state, "u1:n1", true);
 		expect(reconnected.read).toBe("fresh");
-		expect(panelConnectionRead(reconnected.state, "u2:n1", true).read).toBe("fresh");
-		expect(panelConnectionRead(reconnected.state, "u1:n2", true).read).toBe("fresh");
-		expect(panelConnectionRead(null, "u1:n1", true).read).toBe("fresh");
+		expect(panelConnectionRead(reconnected.state, "u2:n1", true).read).toBe("initial");
+		expect(panelConnectionRead(reconnected.state, "u1:n2", true).read).toBe("initial");
+		expect(panelConnectionRead(null, "u1:n1", true).read).toBe("initial");
 	});
 });
 
@@ -198,6 +218,7 @@ describe("independent bounded panel pages", () => {
 	test("shows initial permissions immediately and drains both cursors without truncating", async () => {
 		const calls: NarratorPanelStateOptions[] = [];
 		const seen: NarratorPanelStateResponse[] = [];
+		const readScope = createNarratorPanelReadScope();
 		const pages = [
 			page({
 				permissions: [permission("p1")],
@@ -221,8 +242,9 @@ describe("independent bounded panel pages", () => {
 				return pages[calls.length - 1];
 			},
 			(snapshot) => seen.push(snapshot),
-			{ fresh: true },
+			{ fresh: true, readScope },
 		);
+		expect(calls.every((options) => options.readScope === readScope)).toBe(true);
 		expect(
 			calls.map(({ fresh, permissionsCursor, bufferCursor }) => ({
 				fresh,
@@ -304,25 +326,85 @@ describe("panel-state API scope and endpoint contracts", () => {
 				return calls.length === 1 ? pending.promise : Response.json(page());
 			},
 		});
-		const first = api.getNarratorPanelState("n/1");
-		const composer = api.getNarratorPanelState("n/1");
+		const readScope = createNarratorPanelReadScope();
+		const first = api.getNarratorPanelState("n/1", { readScope });
+		const composer = api.getNarratorPanelState("n/1", { readScope });
+		const oldReads = Promise.allSettled([first, composer]);
 		await Promise.resolve();
 		expect(calls).toHaveLength(1);
-		await api.getNarratorPanelState("n/1", { fresh: true });
+		await api.getNarratorPanelState("n/1", { readScope, fresh: true });
 		token = "u2-token";
-		await api.getNarratorPanelState("n/1");
+		await expect(api.getNarratorPanelState("n/1", { readScope })).rejects.toMatchObject({
+			name: "AbortError",
+		});
+		const nextScope = createNarratorPanelReadScope();
+		await api.getNarratorPanelState("n/1", { readScope: nextScope });
 		await api.getNarratorPanelState("n/1", {
+			readScope: nextScope,
 			permissionsCursor: "end",
 			bufferCursor: "opaque/token",
 		});
 		pending.resolve(Response.json(page()));
-		await Promise.all([first, composer]);
+		expect(await oldReads).toMatchObject([
+			{ status: "rejected", reason: { name: "AbortError" } },
+			{ status: "rejected", reason: { name: "AbortError" } },
+		]);
 		expect(calls).toEqual([
 			"/api/narrators/n%2F1/panel-state",
 			"/api/narrators/n%2F1/panel-state",
 			"/api/narrators/n%2F1/panel-state",
 			"/api/narrators/n%2F1/panel-state?permissionsCursor=end&bufferCursor=opaque%2Ftoken",
 		]);
+	});
+
+	test("distinct mounts and implicit scopes never adopt another subscription's old read", async () => {
+		Object.defineProperty(globalThis, "localStorage", {
+			configurable: true,
+			value: { getItem: () => "token" },
+		});
+		const pending = deferred<void>();
+		let calls = 0;
+		Object.defineProperty(globalThis, "fetch", {
+			configurable: true,
+			value: async () => {
+				calls++;
+				await pending.promise;
+				return Response.json(page());
+			},
+		});
+		const readScope = createNarratorPanelReadScope();
+		const reads = [
+			api.getNarratorPanelState("n1", { readScope }),
+			api.getNarratorPanelState("n1", { readScope }),
+			api.getNarratorPanelState("n1", { readScope: createNarratorPanelReadScope() }),
+			api.getNarratorPanelState("n1"),
+		];
+		await Promise.resolve();
+		expect(calls).toBe(3);
+		pending.resolve();
+		await Promise.all(reads);
+		await api.getNarratorPanelState("n1", { readScope });
+		expect(calls).toBe(4);
+	});
+
+	test("token replacement before deferred start prevents any transport", async () => {
+		let token = "old";
+		let calls = 0;
+		Object.defineProperty(globalThis, "localStorage", {
+			configurable: true,
+			value: { getItem: () => token },
+		});
+		Object.defineProperty(globalThis, "fetch", {
+			configurable: true,
+			value: async () => {
+				calls++;
+				return Response.json(page());
+			},
+		});
+		const read = api.getNarratorPanelState("n1", { readScope: createNarratorPanelReadScope() });
+		token = "new";
+		await expect(read).rejects.toMatchObject({ name: "AbortError" });
+		expect(calls).toBe(0);
 	});
 
 	test("Git summary endpoint preserves null and the caller's abort signal", async () => {

@@ -46,7 +46,7 @@ keywords:
   - build:remote
   - pion
 status: draft
-verified_at: 878917e97
+verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 ---
 # 远程访问
 
@@ -56,6 +56,7 @@ verified_at: 878917e97
 - 远程访问由 `RemoteAccessRuntime` 管理（`remote-access-runtime.ts`）：读 `settings.remoteAccess`（默认 `enabled: false`），启用且已安装组件时，拉起 Go 子进程 `remote-peer`（pion/webrtc），经管道 IPC 通讯；设置变化触发重新对账。组件未安装时状态为 `needs-install`，`POST /component/install` 下载安装（超时 130s）。
 - 状态：`disabled` / `needs-install` / `starting` / `ready` / `backoff` / `failed`（`shared/remote-access/management.ts`）；失败后按 1s 起翻倍、上限 30s 退避重试，满 5 次进 `failed`。`status()` 只读磁盘，不会安装或启动。
 - 远程请求不直接进入应用：对端请求经本机回环 bridge 校验后交给服务端分发器；bridge 只放行 `REMOTE_REQUEST_POLICY` 里**逐条枚举**的方法加路径（登录、健康检查、设置读取、项目和叙述者读写若干等），不是整个 `/api` 命名空间（`shared/remote-access/request-policy.ts`，`remote-access-bridge.ts`）。WebSocket 也只转发白名单消息类型（`REMOTE_SOCKET_MESSAGES`）。
+- 新轻投影逐条放行：GET `/api/settings/runtime`（8 KiB）、`/api/model-catalog/runtime`（4 KiB）、`/api/model-catalog/options`（64 KiB）、`/api/narrators/:id/ui-summary`（2 KiB）；`/api/user-preferences/ui` 与 `/api/user-preferences/spec-tab-layout` 仅 GET/PATCH（请求/响应 64 KiB）。不因本地支持 view 查询就开放基础 `/user-preferences` PATCH，`/settings` PATCH 仍禁，named（含 suggestions）仍禁；规则不得扩成整个 settings/narrators 通配（`request-policy.test.ts`）。
 - 管理接口 `/api/remote-access/*` 全部 `requireAdmin`，且不在远程请求策略内，即不能被远程对端调用：状态、组件安装、创建/取消邀请（配对）、列出/吊销授权（`routes/remote-access.ts`）。
 - 对端会话由 `RemoteAccessRegistry` 持有，带 capability、会话投影与登录期限；密钥用常量时间比较（`equalRemoteSecret`）。后端能力集合在 `shared/remote-access/application.ts:REMOTE_CAPABILITY_NAMES`。
 - 仓库里另有 `remote-coordinator/`（TypeScript，导出 `startCoordinator`；仓库内只被 `tests/remote-access/` 里的测试运行时启动）与 `remote-host/`（远程前端静态资源托管，校验前端制品清单；CLI 是 `scripts/remote-host.ts`：`import/bootstrap/disable/catalog/serve`，公网监听要求 TLS 证书和 `--instance-domain`，不提供 API、WebSocket 或业务中继）；二者在线上的部署角色未核实。`remote-prototype/` 是原型，未查看。

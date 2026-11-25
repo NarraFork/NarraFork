@@ -15,7 +15,6 @@ import { useHotkeys } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import type { OutlineBoardTask } from "@shared/outline-task-board";
 import { IconChecklist, IconInfoCircle, IconLock, IconX } from "@tabler/icons-react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
@@ -23,6 +22,7 @@ import {
 	useUpdateBehaviorFence,
 	useUpdateReflectionOverrides,
 } from "../../../hooks/useNarrator";
+import { useRuntimeSettings } from "../../../hooks/useRuntimeSettings";
 import {
 	useSpecFile,
 	useSpecFiles,
@@ -33,7 +33,7 @@ import {
 } from "../../../hooks/useSpec";
 import { useSpecImportStatus } from "../../../hooks/useSpecImport";
 import { useNarratorCurrentTask } from "../../../hooks/useTaskBoard";
-import { api } from "../../../lib/api";
+import { useUpdateRuntimeSettings } from "../../../hooks/useUpdateRuntimeSettings";
 import type { SpecOutlineBehavior, SpecTaskItem } from "../../../lib/api/spec";
 import { outlineTargetHref } from "../../../lib/outline-href";
 import { isOpenClick, useOutlineOpener, wantsNewPanel } from "../../../lib/outline-opener";
@@ -803,11 +803,7 @@ function resolveAutoContinuationMode(
 
 function AutoContinuationControl({ narratorId }: { narratorId: string }) {
 	const { t } = useTranslation("narrator");
-	const qc = useQueryClient();
-	const { data: settingsData } = useQuery<Record<string, unknown>>({
-		queryKey: ["settings"],
-		queryFn: () => api.getSettings(),
-	});
+	const { data: settingsData } = useRuntimeSettings();
 	const { data: narrator } = useNarrator(narratorId);
 
 	const agentSettings = settingsData?.agent as Record<string, unknown> | undefined;
@@ -826,12 +822,7 @@ function AutoContinuationControl({ narratorId }: { narratorId: string }) {
 	const effectiveInterval = intervalOverride ?? globalInterval;
 
 	const reflectionOverridesMutation = useUpdateReflectionOverrides();
-	const updateSettingsMutation = useMutation({
-		mutationFn: api.updateSettings,
-		onSuccess: (data) => {
-			qc.setQueryData(["settings"], data);
-		},
-	});
+	const updateSettingsMutation = useUpdateRuntimeSettings();
 
 	const handleChange = useCallback(
 		(value: string) => {
@@ -1050,11 +1041,7 @@ function resolveFenceAttach(override: FenceAttachOverride, globalDefault: boolea
  */
 function BehaviorFenceControl({ narratorId }: { narratorId: string }) {
 	const { t } = useTranslation("narrator");
-	const qc = useQueryClient();
-	const { data: settingsData } = useQuery<Record<string, unknown>>({
-		queryKey: ["settings"],
-		queryFn: () => api.getSettings(),
-	});
+	const { data: settingsData } = useRuntimeSettings();
 	const { data: narrator } = useNarrator(narratorId);
 
 	const agentSettings = settingsData?.agent as Record<string, unknown> | undefined;
@@ -1073,12 +1060,7 @@ function BehaviorFenceControl({ narratorId }: { narratorId: string }) {
 	const effectiveAttach = resolveFenceAttach(attachOverride, globalAttach);
 
 	const fenceMutation = useUpdateBehaviorFence();
-	const updateSettingsMutation = useMutation({
-		mutationFn: api.updateSettings,
-		onSuccess: (data) => {
-			qc.setQueryData(["settings"], data);
-		},
-	});
+	const updateSettingsMutation = useUpdateRuntimeSettings();
 	const isPending = fenceMutation.isPending || updateSettingsMutation.isPending;
 
 	const handleIntervalChange = useCallback(

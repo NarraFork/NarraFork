@@ -2512,6 +2512,58 @@ for (const profile of profiles) {
 	});
 }
 
+describe("run release inbox reconciliation", () => {
+	for (const reason of ["normal", "error", "user_interrupt"] as const) {
+		test(`${reason} notifies only after the real loop finalizer and successful owner release`, async () => {
+			const inbox = await import("../agent-runtime/inbox");
+			const id = "contract-primary";
+			const session = active(id);
+			activeNarrators.set(id, session);
+			const observed: Array<{
+				id: string;
+				owner: boolean;
+				loopRunning: boolean;
+				lastStopReason: string | null | undefined;
+			}> = [];
+			spyOn(inbox, "notifyAgentInboxChanged").mockImplementation((notifiedId) => {
+				observed.push({
+					id: notifiedId,
+					owner: !!getExecutionOwner(notifiedId),
+					loopRunning: session._loopRunning === true,
+					lastStopReason: db
+						.select({ reason: narrators.lastStopReason })
+						.from(narrators)
+						.where(eq(narrators.id, notifiedId))
+						.get()?.reason,
+				});
+			});
+			const wake = spyOn(inbox, "wakeInboxIfEligible").mockResolvedValue(false);
+			spyOn(executor, "executeAgentLoop").mockImplementation(async () => {
+				if (reason === "user_interrupt") {
+					const { interruptNarrator } = await import("../narrator-session");
+					expect(interruptNarrator(id)).toBe(true);
+				}
+				return {
+					...finished,
+					hasError: reason === "error",
+					aborted: reason === "user_interrupt",
+					completedNaturally: reason === "normal",
+				};
+			});
+			const handle = await startNarratorRun({
+				narratorId: id,
+				locale: "en",
+				text: "finish and reconcile inbox",
+				principal: null,
+				active: session,
+			});
+			await handle.completion;
+			expect(observed).toEqual([{ id, owner: false, loopRunning: false, lastStopReason: reason }]);
+			if (reason !== "normal") expect(wake).not.toHaveBeenCalled();
+		});
+	}
+});
+
 describe("foreground run failure status", () => {
 	function tags(id: string): string[] {
 		const row = db.select().from(narrators).where(eq(narrators.id, id)).get();

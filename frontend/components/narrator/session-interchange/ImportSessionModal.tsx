@@ -220,7 +220,7 @@ export function ImportSessionModal({ opened, onClose, onImported }: ImportSessio
 	const qc = useQueryClient();
 	const targets = useSessionTargets(opened);
 	const fileResetRef = useRef<() => void>(null);
-	const { groupedModels, modelOptionsFilter } = useAllModels();
+	const { groupedModels, modelOptionsFilter } = useAllModels(opened);
 
 	const [requestedTab, setTab] = useState<SourceTab>("upload");
 	const [format, setFormat] = useState<SessionFormat>("claude-code");

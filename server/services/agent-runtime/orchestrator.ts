@@ -1339,6 +1339,8 @@ export async function runAgentLoopUnlocked(
 				active._modelSelectionRef ?? active._modelRef ?? FOLLOW_DEFAULT_MODEL,
 				resolved.provider,
 				resolved.model,
+				turnEffectiveModel,
+				getSettingsRevision(),
 			);
 
 			// Resolve behavior-fence injection settings for this turn (narrator override → global default).
@@ -3980,13 +3982,17 @@ export async function runAgentLoopUnlocked(
 				);
 			} else {
 				try {
-					const substatus =
-						await createRuntimeFinalizationReads(db).clearTransientSubstatus(narratorId);
-					if (substatus) {
+					const statusPatch =
+						await createRuntimeFinalizationReads(db).clearTransientStatusPatch(narratorId);
+					if (statusPatch) {
 						(
 							await import("../background-occupancy-store")
 						).backgroundOccupancyStore.refreshNarrator(narratorId);
-						broadcastToNarrator(narratorId, { type: "substatus_change", narratorId, substatus });
+						broadcastToNarrator(narratorId, {
+							type: "substatus_change",
+							narratorId,
+							...statusPatch,
+						});
 					}
 				} catch (err) {
 					logger.warn("Failed to clear stale transient substatus after narrator loop", {

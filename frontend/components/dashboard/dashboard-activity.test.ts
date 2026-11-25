@@ -1,5 +1,10 @@
 import { describe, expect, it } from "bun:test";
-import { ACTIVITY_TOOL_ROWS, type ActivityState, applyActivityEvent } from "./dashboard-activity";
+import {
+	ACTIVITY_TOOL_ROWS,
+	ACTIVITY_UNMATCHED_TOOL_LIMIT,
+	type ActivityState,
+	applyActivityEvent,
+} from "./dashboard-activity";
 
 function run(events: Record<string, unknown>[], state: ActivityState = new Map()): ActivityState {
 	return events.reduce((current, event) => applyActivityEvent(current, event), state);
@@ -93,6 +98,131 @@ describe("applyActivityEvent", () => {
 			title: "Fix CI",
 			activeBackgroundWorkCount: 2,
 		});
+	});
+
+	it("distinguishes parsed input from execution and ignores late starts", () => {
+		const start = { type: "tool_started", narratorId: "n", toolUseId: "t", toolName: "Read" };
+		const parsed = run([start]);
+		expect(parsed.get("n")?.tools[0]?.status).toBe("initializing");
+		const executing = run([{ type: "tool_executing", narratorId: "n", toolUseId: "t" }], parsed);
+		expect(executing.get("n")?.tools[0]?.status).toBe("running");
+		expect(run([start], executing).get("n")?.tools[0]?.status).toBe("running");
+		for (const status of ["pending", "success", "fail", "cancelled"]) {
+			const snapshot = run([
+				{
+					type: "activity_snapshot",
+					narratorId: "n",
+					toolCalls: [{ toolUseId: "t", toolName: "Read", status }],
+				},
+			]);
+			expect(run([start], snapshot).get("n")?.tools[0]?.status).toBe(status);
+		}
+	});
+
+	it("keeps an execution that arrives before the tool name, even if it finishes first", () => {
+		const executing = { type: "tool_executing", narratorId: "n", toolUseId: "t" };
+		const started = {
+			type: "tool_started",
+			narratorId: "n",
+			toolUseId: "t",
+			toolName: "Read",
+			inputSummary: { file_path: "a.ts" },
+		};
+		const eager = run([executing]);
+		expect(eager.get("n")?.tools).toEqual([]);
+		expect(eager.get("n")?.unmatchedToolStatuses?.get("t")).toBe("running");
+		expect(run([started], eager).get("n")?.tools).toEqual([
+			{ toolUseId: "t", toolName: "Read", status: "running", inputSummary: { file_path: "a.ts" } },
+		]);
+		const completed = {
+			type: "tool_completed",
+			narratorId: "n",
+			toolUseId: "t",
+			status: "success",
+		};
+		expect(run([completed, started], eager).get("n")?.tools[0]?.status).toBe("success");
+		expect(run([started], eager).get("n")?.unmatchedToolStatuses).toBeUndefined();
+		const bounded = run(
+			Array.from({ length: ACTIVITY_UNMATCHED_TOOL_LIMIT + 3 }, (_, i) => ({
+				...executing,
+				toolUseId: `t${i}`,
+			})),
+		);
+		expect(bounded.get("n")?.tools).toHaveLength(0);
+		expect(bounded.get("n")?.unmatchedToolStatuses?.size).toBe(ACTIVITY_UNMATCHED_TOOL_LIMIT);
+		expect(bounded.get("n")?.unmatchedToolStatuses?.has("t0")).toBe(false);
+	});
+
+	it("does not resurrect evicted executions or displace newer started calls", () => {
+		const starts = Array.from({ length: ACTIVITY_TOOL_ROWS + 1 }, (_, i) => ({
+			type: "tool_started",
+			narratorId: "n",
+			toolUseId: `t${i}`,
+			toolName: "Bash",
+			inputSummary: { command: `build-${i}` },
+		}));
+		const state = run(starts);
+		const tools = state.get("n")?.tools;
+		const updated = run(
+			[
+				{ type: "tool_executing", narratorId: "n", toolUseId: "t0" },
+				{
+					type: "tool_completed",
+					narratorId: "n",
+					toolUseId: "t0",
+					status: "success",
+					toolName: "Bash",
+				},
+			],
+			state,
+		);
+		expect(updated.get("n")?.tools).toBe(tools);
+		expect(updated.get("n")?.tools.map((tool) => tool.toolUseId)).toEqual(["t1", "t2", "t3", "t4"]);
+		expect(
+			updated.get("n")?.tools.every((tool) => tool.inputSummary?.command?.startsWith("build-")),
+		).toBe(true);
+	});
+
+	it("merges early lifecycle facts into snapshots without regressing or reordering rows", () => {
+		const eager = run([
+			{ type: "tool_executing", narratorId: "n", toolUseId: "t" },
+			{ type: "tool_completed", narratorId: "n", toolUseId: "t", status: "success" },
+			{ type: "tool_executing", narratorId: "n", toolUseId: "t" },
+		]);
+		const state = run(
+			[
+				{
+					type: "activity_snapshot",
+					narratorId: "n",
+					toolCalls: [
+						{
+							toolUseId: "t",
+							toolName: "Read",
+							status: "initializing",
+							inputSummary: { file_path: "a.ts" },
+						},
+						{ toolUseId: "later", toolName: "Read", status: "running" },
+					],
+				},
+			],
+			eager,
+		);
+		expect(state.get("n")?.tools.map((tool) => [tool.toolUseId, tool.status])).toEqual([
+			["t", "success"],
+			["later", "running"],
+		]);
+		expect(state.get("n")?.unmatchedToolStatuses).toBeUndefined();
+		const discarded = run(
+			[{ type: "tool_use_discarded", narratorId: "n", toolUseIds: ["t"] }],
+			eager,
+		);
+		expect(discarded.get("n")?.unmatchedToolStatuses).toBeUndefined();
+		expect(
+			run(
+				[{ type: "tool_started", narratorId: "n", toolUseId: "t", toolName: "Read" }],
+				discarded,
+			).get("n")?.tools[0]?.status,
+		).toBe("initializing");
 	});
 
 	it("returns the same state for frames that change nothing", () => {

@@ -7,6 +7,8 @@ anchors:
   - server/services/narrator-persistence.ts
   - server/services/narrator-display-page-reader.ts
   - server/services/narrator-message-count.ts
+  - server/services/narrator-status-version.ts
+  - server/services/__tests__/narrator-persistence-background-attention.test.ts
   - server/services/narrator-turns.ts
   - server/services/narrator-turn-timing.ts
   - server/services/narrator-timeline.ts
@@ -46,7 +48,7 @@ keywords:
   - partitionTimeline
   - resolveLazyLineage
 status: draft
-verified_at: 776dbf07e
+verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 ---
 # 消息与引用
 
@@ -62,7 +64,8 @@ verified_at: 776dbf07e
 - 引用存储有 SQLite 与 PostgreSQL 两种实现：`narrator-refs/store.ts:getNarratorMessageRefsPort` 在绑定了 PG 端口时返回它，否则为 `undefined` 走 SQLite 路径（`assertSqliteNarratorOperation` 在 PG 下拒绝仅 SQLite 的操作）。
 - 写入层：生产者经 `narrator-store.ts:narratorStore`（`appendInput`、`appendNotice`、`openStep`、`writeStepItem`、`appendStep`、`settleTool`、`patchState` 等）写模型可见的历史，每个操作一个事务；它转调 `narrator-persistence.ts:narratorPersistence`（实现所在，体量很大）。
 - 展示页读取：`narrator-display-page-reader.ts:readNarratorDisplayMessages` 只走 worker（SQLite 路径或 PG 端口），不可用时报 `DISPLAY_PAGE_READER_UNAVAILABLE`（503，“不允许主线程原始 JSON 回退”），并发 2、排队上限 32，满则 `DISPLAY_PAGE_READER_BUSY`（503）；单次最多 10000 行、原始 16 MiB、输出 4 MiB、10 秒（`DISPLAY_PAGE_LIMITS`，`lib/db-worker/display-page-protocol.ts`）。
-- 消息数：展示的数字都现算——详情数单个叙述者的引用数，列表只数当前页的 id（一条分组查询）；`narrators.message_count` 只是只增不减的上界，仅供 `sortBy=messageCount` 排序，不回填（`narrator-message-count.ts`）。
+- 消息数：展示值来自精确引用数，详情数单个叙述者，列表只数当前页的 id（一条分组查询）；`narrators.message_count` 只是只增不减的上界，仅供 `sortBy=messageCount` 排序，不回填，更不能冒充 UI 精确计数（`narrator-message-count.ts`）。`readNarratorMessageRefCountSnapshot` 用 worker-required 的单 SQL 同时观察 `{version,count}`；精确版本缓存最多 256 个会话，旧的 number 返回 API 仍保留。
+- 状态帧计数（`narrator-status-version.ts:committedNarratorStatusPatch`）：提交投影内部取 `messageVersion`，不取上界 `messageCount` 列；按会话 id + 提交版本合并在途精确计数，settled 即删除在途项。只有 worker 快照版本与提交版本相等才附可选 `messageCount`；缺行、版本错配或读取失败省略字段，保留客户端原值，禁止回退主线程计数或上界列。完整 status/substatus 与 panel 快照共用此发布路径，list 快照不新增计数；内部 `messageVersion` 不进入状态帧。
 - 回合行：每次 run 一行 `narrator_turns`，开始时插入 `running`，结束时更新为 completed / interrupted / failed；步数、工具调用、用量只在内存累积，运行期间写入的信封带 `turn_id`（`narrator-turns.ts`）。回合暂停时长以 `turn_paused_ms:` / `turn_pause_started_ms:` 前缀的 substatus 标签记录（`narrator-turn-timing.ts`）。
 - 时间线（只读）：`GET /api/narrators/:id/timeline/turns`（最新在前，`before` 为 startedAt 游标，单页最多 50 回合）与 `GET /:id/timeline?turnId=`（缺省取最新回合）；每个 agent 每回合一条连续泳道，分段数上限 2000，每源行数 2000，泳道 16，每泳道子代理 20，深度 2；工具/模型耗时行走 worker 池，按 `(narrator_id, created_at)` 键集分页；大输入（> 16 KiB）不解析摘要。读权限在路由自带的闸门里检查（`narrator-timeline.ts`、`routes/narrator-timeline.ts`、`shared/narrator-timeline.ts:partitionTimeline`）。
 - 导出：`GET /api/narrators/:id/export`（Markdown 或 JSON，可选回合范围）流式分页输出，每页一条带索引的范围查询，字节预算由 SQL 强制；懒分叉的祖先历史用 `resolveLazyLineage` 联合读取，不触发回填写；每处截断都在输出里标注，JSON 以 `"complete": true` 收尾，没有它就是不完整（`narrator-export.ts`、`narrators.ts` 的 `/export`、`/export-turns`）。
@@ -81,6 +84,7 @@ verified_at: 776dbf07e
 - 新增变更类方法：包 `admittedMutation`。
 - 改分页或压缩点查询：`narrator-messages-history.test.ts` 覆盖；保持 `limit+1` 判断，不要先 `COUNT(*)`。
 - 新增列表/导出/时间线类读取：必须有字节与行数上限并走 worker；展示页读取不得回退主线程（`DISPLAY_PAGE_READER_UNAVAILABLE`）。
+- 改状态帧消息计数：`narrator-persistence-background-attention.test.ts` 覆盖同版本 singleflight、settled 后重试、不同版本隔离、错配/Worker 故障省略字段及不上界列 fallback；计数必须与观测版本同行，不能拿新计数冒充旧提交。
 - 加新的消息来源标记：只存机器标记，文案放前端 i18n。
 
 ## 相关

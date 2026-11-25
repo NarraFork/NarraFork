@@ -42,9 +42,11 @@ const { appearanceStore } = await import("../lib/appearance-preference-store");
 const { applySession } = await import("./useAuth");
 const { useAppearanceSync } = await import("./useAppearanceSync");
 const { useLocalPref } = await import("./useLocalPref");
-const { useUpdateUserPreferences, useUserPreferences } = await import("./useUserPreferences");
+const { useUpdateUserPreferences, useUserPreferences, useUserPreferencesDetail } = await import(
+	"./useUserPreferences"
+);
 
-type Preferences = Awaited<ReturnType<typeof api.getUserPreferences>>;
+type Preferences = Awaited<ReturnType<typeof api.getUIPreferences>>;
 type Patch = Parameters<typeof api.updateUserPreferences>[0];
 type PatchResponse = Awaited<ReturnType<typeof api.updateUserPreferences>>;
 type Write = { token: string | null; patch: Patch; signal?: AbortSignal };
@@ -104,6 +106,11 @@ function Probe() {
 			{String(preferences.data?.wordWrapCode)}:{String(oled[0])}
 		</output>
 	);
+}
+let detailView: ReturnType<typeof useUserPreferencesDetail>;
+function DetailConsumer() {
+	detailView = useUserPreferencesDetail();
+	return null;
 }
 function Consumer() {
 	const preferences = useUserPreferences();
@@ -173,8 +180,8 @@ beforeEach(() => {
 	spyOn(api, "me").mockImplementation(async () => ({
 		id: getToken() === "token-b" ? "b" : "a",
 	}));
-	spyOn(api, "getUserPreferences").mockImplementation(() => getPreferences(requireToken()));
-	spyOn(api, "updateUserPreferences").mockImplementation(async (patch, options) => {
+	spyOn(api, "getUIPreferences").mockImplementation(() => getPreferences(requireToken()));
+	spyOn(api, "updateUIPreferences").mockImplementation(async (patch, options) => {
 		const write = { token: getToken(), patch: structuredClone(patch), signal: options?.signal };
 		writes.push(write);
 		const response = await respondToWrite(write);
@@ -185,7 +192,7 @@ beforeEach(() => {
 			...patch,
 			appearancePreferences: { ...previous.appearancePreferences, ...patch.appearancePreferences },
 		});
-		return response;
+		return response as Preferences;
 	});
 	spyOn(globalThis, "fetch").mockRejectedValue(
 		new Error("Unexpected real network request in appearance hook integration test"),
@@ -209,6 +216,38 @@ afterAll(() => {
 		if (descriptor) Object.defineProperty(globalThis, key, descriptor);
 		else Reflect.deleteProperty(globalThis, key);
 	}
+});
+
+test("lightweight and full-detail observers share UI reads but never cache partial detail", async () => {
+	const full = {
+		...preferences(),
+		commands: [{ name: "private", prompt: "full command body" }],
+		outlineDigestTime: "08:00",
+		outlineDigestTimeZone: "UTC",
+	};
+	const getDetail = spyOn(api, "getUserPreferences").mockResolvedValue(full as never);
+	await mount();
+	expect(getDetail).not.toHaveBeenCalled();
+	await act(async () => {
+		root?.render(
+			<QueryClientProvider client={client}>
+				<Probe />
+				<DetailConsumer />
+			</QueryClientProvider>,
+		);
+	});
+	await settle();
+	expect(getDetail).toHaveBeenCalledTimes(1);
+	expect(view.preferences.queryKey).toEqual(["user-preferences", "ui", "a", "token-a"]);
+	expect(detailView.data?.commands).toEqual(full.commands);
+	expect(client.getQueryData(["user-preferences", "detail", "a", "token-a"])).toEqual(full);
+	expect(client.getQueryData(view.preferences.queryKey)).not.toHaveProperty("commands");
+	await act(async () => {
+		await view.update.mutateAsync({ fastModeDefault: true });
+	});
+	await settle();
+	expect(getDetail).toHaveBeenCalledTimes(2);
+	expect(detailView.data?.commands).toEqual(full.commands);
 });
 
 test("defaults retain account fields and legacy local OLED without uploading hydration", async () => {
@@ -238,7 +277,7 @@ test("account-to-local mutations change real consumers, not raw cache, and custo
 	expect(writes).toEqual([]);
 	expect(view.preferences.data?.wordWrapCode).toBe(false);
 	expect(container.querySelector("[data-consumer]")?.textContent).toBe("false:false");
-	expect(client.getQueryData<Preferences>(["user-preferences"])?.wordWrapCode).toBe(true);
+	expect(client.getQueryData<Preferences>(view.preferences.queryKey)?.wordWrapCode).toBe(true);
 
 	await change(() => view.sync.setCustomEnabled(false));
 	expect(view.preferences.data?.wordWrapCode).toBe(true);
@@ -503,7 +542,7 @@ test("a GET begun before an account edit cannot roll back the completed mutation
 	});
 	await settle();
 	expect(writes.map(({ patch }) => patch)).toEqual([{ wordWrapCode: false }]);
-	expect(client.getQueryData<Preferences>(["user-preferences"])?.wordWrapCode).toBe(false);
+	expect(client.getQueryData<Preferences>(view.preferences.queryKey)?.wordWrapCode).toBe(false);
 	expect(view.preferences.data?.wordWrapCode).toBe(false);
 	expect(container.querySelector("[data-consumer]")?.textContent).toBe("false:false");
 });
@@ -626,12 +665,18 @@ test("a token replacement during initial identity loading still starts the new a
 });
 
 test("an old preference GET resolving after account switch cannot hydrate the new account", async () => {
+	const signals: AbortSignal[] = [];
+	spyOn(api, "getUIPreferences").mockImplementation((options) => {
+		if (options?.signal) signals.push(options.signal);
+		return getPreferences(requireToken());
+	});
 	const oldGet = deferred<Preferences>();
 	getPreferences = async (token) =>
 		token === "token-a" ? oldGet.promise : structuredClone(account(token));
 	await mount();
 	expect(view.sync.ready).toBe(false);
 	await login("b");
+	expect(signals[0]?.aborted).toBe(true);
 	expect(appearanceStore.getUserId()).toBe("b");
 	expect(view.preferences.data?.wordWrapCode).toBe(false);
 	await act(async () => {
@@ -643,6 +688,6 @@ test("an old preference GET resolving after account switch cannot hydrate the ne
 	expect(appearanceStore.getUserId()).toBe("b");
 	expect(view.preferences.data?.wordWrapCode).toBe(false);
 	expect(view.oled[0]).toBe(false);
-	expect(client.getQueryData<Preferences>(["user-preferences"])?.wordWrapCode).toBe(false);
+	expect(client.getQueryData<Preferences>(view.preferences.queryKey)?.wordWrapCode).toBe(false);
 	expect(writes).toEqual([]);
 });

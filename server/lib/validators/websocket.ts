@@ -152,6 +152,7 @@ export const narratorWsMessageSchema = z.discriminatedUnion("type", [
 	z.object({
 		type: z.literal("chat_subscribe"),
 		roomIds: z.array(z.string().min(1)).max(50),
+		requestId: z.string().min(1).max(128).optional(),
 	}),
 	z.object({
 		type: z.literal("chat_unsubscribe"),
