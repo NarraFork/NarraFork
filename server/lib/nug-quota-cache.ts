@@ -2,15 +2,11 @@ import { unlink } from "node:fs/promises";
 import type { QuotaSnapshot } from "@shared/quota-snapshot";
 import { NugProvider } from "./agent/nug-provider";
 import { getNarraforkPath } from "./narrafork-home";
-import {
-	streamQuotaCredential,
-	streamQuotaIdentity,
-	type UsageSubject,
-} from "./provider-key-subjects";
+import { credentialForStream, type UsageSubject } from "./provider-key-subjects";
 import { getProviderKeyStore, nugKeyOwner, withProviderKey } from "./provider-keys";
 import { type NUGProviderConfig, settings } from "./settings";
 import { quotaNetworkIdentity } from "./sourcing/quota-identity";
-import { quotaStore } from "./sourcing/quota-store";
+import { quotaStore, STREAM_QUOTA_SOURCE } from "./sourcing/quota-store";
 
 export interface NugQuotaCache {
 	balance: number | null;
@@ -181,7 +177,10 @@ function rememberCredential(providerId: string, credentialId: string): void {
 function snapshotOf(config: NUGProviderConfig): QuotaSnapshot | undefined {
 	const credential = subject(config);
 	rememberCredential(config.id, credential.id);
-	return quotaStore.get(credential.id, nugQuotaIdentity(credential.config), restoreSnapshot);
+	const identity = nugQuotaIdentity(credential.config);
+	const probe = quotaStore.get(credential.id, identity, restoreSnapshot);
+	const stream = quotaStore.get(credential.id, identity, restoreSnapshot, STREAM_QUOTA_SOURCE);
+	return stream && (!probe || stream.fetchedAt >= probe.fetchedAt) ? stream : probe;
 }
 
 export function setNugCachedQuota(
@@ -228,7 +227,10 @@ export async function probeNugQuota(
 	credential: NugQuotaSubject,
 	signal: AbortSignal,
 ): Promise<QuotaSnapshot> {
-	const data = await new NugProvider(credential.config).getQuota(signal);
+	const connection = settings.nugProviders?.find((entry) => entry.id === credential.providerId);
+	const data = await new NugProvider(credential.config, connection ?? credential.config).getQuota(
+		signal,
+	);
 	// Unlike the legacy HTTP response, a routing snapshot must not turn unknown into zero.
 	return nugQuotaSnapshot(buildNugQuotaCache(data));
 }
@@ -240,27 +242,27 @@ export function updateNugQuotaByPrefix(
 	detailedQuotaBalance?: string | null,
 	extra?: unknown,
 	expectedProviderIdentity?: string,
-	credentialId?: string,
 ): void {
 	const config = (settings.nugProviders ?? []).find(
 		(provider) => provider.prefix === prefix || provider.id === prefix,
 	);
-	if (!config || streamQuotaIdentity(config, credentialId) !== expectedProviderIdentity) return;
-	const credential = streamQuotaCredential(config, credentialId);
+	if (!config) return;
+	const credential = credentialForStream(config, expectedProviderIdentity, nugKeyOwner(config.id));
 	if (!credential) return;
 	const identity = nugQuotaIdentity(credential.config);
-	const snapshot = quotaStore.get(credential.id, identity, restoreSnapshot);
-	const previous = snapshot && cacheFromSnapshot(snapshot);
+	const probe = quotaStore.get(credential.id, identity, restoreSnapshot);
+	const stream = quotaStore.get(credential.id, identity, restoreSnapshot, STREAM_QUOTA_SOURCE);
+	const previous = stream && (!probe || stream.fetchedAt >= probe.fetchedAt) ? stream : probe;
 	const cache = buildNugQuotaCache(
 		{
 			balance: quotaBalance,
 			detailedQuotaBalance,
 			...(extra !== undefined ? { extra } : {}),
 		},
-		previous,
+		previous ? cacheFromSnapshot(previous) : undefined,
 	);
 	rememberCredential(config.id, credential.id);
-	quotaStore.set(credential.id, identity, nugQuotaSnapshot(cache));
+	quotaStore.set(credential.id, identity, nugQuotaSnapshot(cache), true, STREAM_QUOTA_SOURCE);
 }
 
 function cacheFromSnapshot(snapshot: QuotaSnapshot): NugQuotaCache {
@@ -309,6 +311,9 @@ export function purgeNugQuotaCache(removedIds: string[]): void {
 			id,
 		]);
 		knownCredentialIds.delete(id);
-		for (const credentialId of credentialIds) quotaStore.remove(credentialId);
+		for (const credentialId of credentialIds) {
+			quotaStore.remove(credentialId);
+			quotaStore.remove(credentialId, STREAM_QUOTA_SOURCE);
+		}
 	}
 }

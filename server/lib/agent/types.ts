@@ -792,8 +792,6 @@ export type AgentEvent =
 			type: "quota_balance";
 			quotaBalance: string | null;
 			detailedQuotaBalance?: string | null;
-			/** Actual request-attempt key, not the group's settings/first-key projection. */
-			credentialId?: string;
 			/** Request-start credential identity; stale events cannot update a replacement key/network. */
 			providerIdentity?: string;
 	  }

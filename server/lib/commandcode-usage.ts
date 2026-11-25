@@ -318,14 +318,24 @@ export const commandCodeQuotaIdentity = (config: CommandCodeUsageSubject["config
 		quotaNetworkIdentity(config, settings.proxy),
 	]);
 
-function settingsSubject(): CommandCodeUsageSubject | undefined {
+/** Each managed key owns its window; the legacy endpoint still shows the first one. */
+export function listCommandCodeUsageSubjects(): CommandCodeUsageSubject[] {
 	const configured = settings.commandCode;
-	if (!configured?.apiKey) return undefined;
-	const config = { ...configured, apiKey: configured.apiKey };
-	const key = getProviderKeyStore().list(COMMAND_CODE_KEY_OWNER)[0];
-	return key
-		? { id: key.id, providerId: COMMAND_CODE_PREFIX, config: withProviderKey(config, key) }
-		: { id: COMMAND_CODE_PREFIX, providerId: COMMAND_CODE_PREFIX, config };
+	if (configured?.disabled) return [];
+	const config = { ...configured, apiKey: configured?.apiKey ?? "" };
+	const stored = getProviderKeyStore().list(COMMAND_CODE_KEY_OWNER);
+	if (stored.length > 0) {
+		return stored
+			.filter((key) => !key.disabled)
+			.map((key) => ({
+				id: key.id,
+				providerId: COMMAND_CODE_PREFIX,
+				config: withProviderKey(config, key),
+			}));
+	}
+	return config.apiKey
+		? [{ id: COMMAND_CODE_PREFIX, providerId: COMMAND_CODE_PREFIX, config }]
+		: [];
 }
 
 function restoreSnapshot(snapshot: QuotaSnapshot): QuotaSnapshot {
@@ -349,7 +359,9 @@ async function refreshUsage(subject: CommandCodeUsageSubject): Promise<CommandCo
 	if (existing) return existing;
 	const task = probeCommandCodeQuota(subject, new AbortController().signal)
 		.then((snapshot) => {
-			const current = settingsSubject();
+			const current = listCommandCodeUsageSubjects().find(
+				(candidate) => candidate.id === subject.id,
+			);
 			if (current?.id === subject.id && commandCodeQuotaIdentity(current.config) === key) {
 				quotaStore.set(subject.id, key, snapshot);
 			}
@@ -362,7 +374,15 @@ async function refreshUsage(subject: CommandCodeUsageSubject): Promise<CommandCo
 
 /** Request-driven 60-second cache for a settings key; there is no polling timer. */
 export async function getCommandCodeUsageFromSettings(): Promise<CommandCodeUsage | undefined> {
-	const subject = settingsSubject();
+	return getCommandCodeUsageForCredential();
+}
+
+export async function getCommandCodeUsageForCredential(
+	credentialId?: string,
+): Promise<CommandCodeUsage | undefined> {
+	const subjects = listCommandCodeUsageSubjects();
+	const subject =
+		credentialId === undefined ? subjects[0] : subjects.find((item) => item.id === credentialId);
 	if (!subject) return undefined;
 	const cached = cachedSnapshot(subject);
 	if (cached && Date.now() - cached.fetchedAt < COMMAND_CODE_USAGE_STALE_MS) {

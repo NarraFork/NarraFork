@@ -6,6 +6,7 @@ import { parseHTML } from "linkedom";
 import { act, StrictMode } from "react";
 import type { Root } from "react-dom/client";
 import { api } from "../../lib/api";
+import { providerKeysApi } from "../../lib/api/provider-keys";
 import { openTokenDanceRecharge, TOKENDANCE_RECOVERY_EVENT } from "../../lib/tokendance-recovery";
 import errors from "../../locales/en/errors.json";
 import narratorEn from "../../locales/en/narrator.json";
@@ -39,6 +40,7 @@ const globals = {
 	ShadowRoot: window.ShadowRoot ?? class {},
 	getComputedStyle: () => ({ getPropertyValue: () => "", overflow: "visible" }),
 	matchMedia: window.matchMedia,
+	MutationObserver: window.MutationObserver,
 	ResizeObserver: class {
 		observe() {}
 		unobserve() {}
@@ -53,6 +55,7 @@ for (const [key, value] of Object.entries(globals)) {
 	Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
 }
 (window.document as unknown as Record<string, unknown>).oninput = null;
+Object.assign(window.document, { fonts: { addEventListener() {}, removeEventListener() {} } });
 const { QueryClient, QueryClientProvider } = await import("@tanstack/react-query");
 const { formatTokenDanceMoney, useTokenDanceBalance } = await import(
 	"../../hooks/useTokenDanceBalance"
@@ -111,6 +114,7 @@ let poll: ReturnType<typeof spyOn<typeof api, "tokenDancePaymentSession">>;
 let refresh: ReturnType<typeof spyOn<typeof api, "tokenDanceRefreshBalance">>;
 let getBalance: ReturnType<typeof spyOn<typeof api, "tokenDanceBalance">>;
 let getConnection: ReturnType<typeof spyOn<typeof api, "tokenDanceConnection">>;
+let getKeys: ReturnType<typeof spyOn<typeof providerKeysApi, "list">>;
 let timers: Map<number, { callback: () => void; delay: number }>;
 let nextTimer: number;
 let intervals: Map<number, { callback: () => void; delay: number }>;
@@ -138,6 +142,7 @@ beforeEach(() => {
 	refresh = spyOn(api, "tokenDanceRefreshBalance").mockResolvedValue(balance);
 	getBalance = spyOn(api, "tokenDanceBalance").mockResolvedValue(balance);
 	getConnection = spyOn(api, "tokenDanceConnection").mockResolvedValue(connection);
+	getKeys = spyOn(providerKeysApi, "list").mockResolvedValue({ keys: [] });
 	timers = new Map();
 	intervals = new Map();
 	nextTimer = 100000;
@@ -180,6 +185,7 @@ afterEach(async () => {
 		refresh,
 		getBalance,
 		getConnection,
+		getKeys,
 		timerSpy,
 		clearSpy,
 		fetchSpy,
@@ -319,6 +325,34 @@ async function recovery(action = "top_up_balance") {
 	await settle();
 }
 describe("TokenDance recharge behavior", () => {
+	it("a single ready TokenDance key exposes its working network editor", async () => {
+		getKeys.mockResolvedValue({
+			keys: [
+				{
+					id: "login-key",
+					label: null,
+					masked: "********login",
+					priority: 0,
+					disabled: false,
+					disabledReason: null,
+					network: {},
+					cooldown: null,
+					usage: null,
+				},
+			],
+		});
+		await renderSection();
+		const network = container.querySelector(`[aria-label="${settings.credentialNetwork.button}"]`);
+		if (!network) throw new Error("Missing single ready key network entry");
+		await act(async () => {
+			network.dispatchEvent(new window.Event("click", { bubbles: true }));
+		});
+		await settle();
+		expect(document.querySelector('[role="dialog"]')?.textContent).toContain(
+			settings.credentialNetwork.description,
+		);
+	});
+
 	it.each([
 		undefined,
 		"invalid",

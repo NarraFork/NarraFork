@@ -17,11 +17,11 @@ describe("service templates", () => {
 		expect(subscribed).toEqual(["codex", "kimi-code", "opencode-go"]);
 	});
 
-	test("only sources that already pool several credentials are multi-credential", () => {
+	test("all model sources except opaque plugins support credential pools", () => {
 		const single = listServiceTemplates()
 			.filter((template) => !template.multiCredential)
 			.map((template) => template.id);
-		expect(single).toEqual(["tokendance", "command-code", "nug", "plugin"]);
+		expect(single).toEqual(["plugin"]);
 	});
 
 	test("API templates have no official endpoints; Kimi Code has one per region", () => {

@@ -149,6 +149,51 @@ beforeEach(() => {
 });
 
 describe("provider keys in a data export", () => {
+	test("v3 multi-key NUG, TokenDance and Command Code pools survive settings saves and reload", async () => {
+		setProviders({
+			nugProviders: [nug("multi-nug", "multi-nug", "nug-first", "oauth-multi")],
+			tokendance: "td-first",
+		});
+		saveSettings({ ...settings, commandCode: { apiKey: "cc-first" } });
+		const store = getProviderKeyStore();
+		const groups = [
+			["multi-nug", "nug", "nug-first", "nug-second"],
+			["tokendance", "tokendance", "td-first", "td-second"],
+			["CommandCode", "command-code", "cc-first", "cc-second"],
+		] as const;
+		for (const [groupId, templateId, , second] of groups) {
+			const key = store.addGroupCredential(groupId, templateId, {
+				apiKey: second,
+				label: "backup",
+			});
+			store.update(key.id, { disabled: true, network: { proxy: { mode: "direct" } } });
+		}
+		const zip = await readFile(
+			(await exportData(providersOnly, { passphrase: PASSPHRASE })).zipPath,
+		);
+		setProviders({});
+		const preview = await previewImport(toArrayBuffer(zip), "multi-key-v3.zip");
+		expect(preview.version).toBe(3);
+		await applyImport(preview.token, { conflictDefault: "skip", passphrase: PASSPHRASE });
+		const assertPools = () => {
+			for (const [groupId, , first, second] of groups) {
+				const keys = store.listGroup(groupId);
+				expect(keys.map((key) => key.apiKey)).toEqual([first, second]);
+				expect(keys[1]?.label).toBe("backup");
+				expect(keys[1]?.disabled).toBe(true);
+				expect(keys[1]?.network).toEqual({ proxy: { mode: "direct" } });
+			}
+		};
+		assertPools();
+		for (let i = 0; i < 2; i++) {
+			saveSettings(structuredClone(settings));
+			assertPools();
+			reloadSettings();
+			assertPools();
+		}
+		expect(settings.nugProviders?.[0]?.oauthClientSecret).toBe("oauth-multi");
+	});
+
 	test("old v1/v2 archives with inline NUG OAuth secrets remain importable", async () => {
 		for (const version of [1, 2]) {
 			setProviders({});

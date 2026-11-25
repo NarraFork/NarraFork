@@ -3276,7 +3276,12 @@ describe("quota and payment frames stay with their own session", () => {
 		expect(self).not.toHaveProperty("isSubagent");
 	});
 
-	test("actual stream credential and private identity reach both cache updaters but never public frames", async () => {
+	test("private attempt identity reaches both cache updaters but never public frames", async () => {
+		const { streamQuotaIdentity } = await import("../../lib/provider-key-subjects");
+		const privateIdentity = streamQuotaIdentity(
+			{ id: "quota-test", baseUrl: "https://quota.test", apiKey: "private-api-key" },
+			"actual-B",
+		);
 		const customQuota = await import("../../lib/custom-api-quota-cache");
 		const nugQuota = await import("../../routes/nug");
 		const customUpdate = spyOn(customQuota, "updateCustomApiQuotaByPrefix").mockImplementation(
@@ -3289,8 +3294,7 @@ describe("quota and payment frames stay with their own session", () => {
 					type: "quota_balance",
 					quotaBalance: "0",
 					detailedQuotaBalance: "actual account",
-					credentialId: "actual-B",
-					providerIdentity: "private-connection-identity",
+					providerIdentity: privateIdentity,
 				},
 				{ ...makeMainContext(), providerPrefix: "quota-test" },
 			);
@@ -3298,20 +3302,20 @@ describe("quota and payment frames stay with their own session", () => {
 				"quota-test",
 				"0",
 				"actual account",
-				"private-connection-identity",
-				"actual-B",
+				privateIdentity,
 			);
 			expect(nugUpdate).toHaveBeenCalledWith(
 				"quota-test",
 				0,
 				"actual account",
 				undefined,
-				"private-connection-identity",
-				"actual-B",
+				privateIdentity,
 			);
 			for (const frame of framesOf("quota_balance")) {
 				expect(frame).not.toHaveProperty("providerIdentity");
 				expect(frame).not.toHaveProperty("credentialId");
+				expect(JSON.stringify(frame)).not.toContain("private-api-key");
+				expect(JSON.stringify(frame)).not.toContain("actual-B");
 			}
 		} finally {
 			customUpdate.mockRestore();

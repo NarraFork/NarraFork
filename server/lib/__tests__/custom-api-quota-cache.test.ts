@@ -10,7 +10,7 @@ import {
 } from "../custom-api-quota-cache";
 import { getNarraforkPath } from "../narrafork-home";
 import { keyQuotaBlockedUntil } from "../provider-key-quota";
-import { streamQuotaIdentity, streamQuotaIdentityForPrefix } from "../provider-key-subjects";
+import { streamQuotaIdentityForRequest } from "../provider-key-subjects";
 import { getProviderKeyStore, withProviderKey } from "../provider-keys";
 import { saveSettings, settings } from "../settings";
 import { quotaStore, STREAM_QUOTA_SOURCE } from "../sourcing/quota-store";
@@ -39,7 +39,9 @@ function reportQuota(
 	prefix: string,
 	balance: string | null,
 	detail?: string | null,
-	identity = streamQuotaIdentityForPrefix(prefix),
+	identity = streamQuotaIdentityForRequest(prefix, {
+		credentialId: getProviderKeyStore().listGroup(providerId)[0]?.id,
+	}),
 ): void {
 	updateCustomApiQuotaByPrefix(prefix, balance, detail, identity);
 }
@@ -49,7 +51,9 @@ function expectLateQuotaRejected(expectedIdentity: string): void {
 	if (!config) throw new Error("custom quota test provider missing");
 	const key = getProviderKeyStore().listGroup(config.id)[0];
 	const effectiveConfig = key ? withProviderKey(config, key) : config;
-	expect(streamQuotaIdentity(config)).not.toBe(expectedIdentity);
+	expect(streamQuotaIdentityForRequest("custom-quota", { credentialId: key?.id })).not.toBe(
+		expectedIdentity,
+	);
 	reportQuota("custom-quota", "99", null, expectedIdentity);
 	expect(
 		quotaStore.peekForIdentity(
@@ -110,6 +114,31 @@ describe("response quota_balance snapshots", () => {
 		expect(existsSync(getNarraforkPath("custom-api-quotas.json"))).toBe(false);
 	});
 
+	test("stream balances remain on the selected key after reorder and never replace its probe", () => {
+		useProvider();
+		const store = getProviderKeyStore();
+		const first = store.list(providerId)[0];
+		if (!first) throw new Error("Missing first test key");
+		const second = store.add(providerId, { apiKey: "key-two" });
+		const identity = streamQuotaIdentityForRequest("custom-quota", { credentialId: second.id });
+		const reset = Date.now() + 60_000;
+		quotaStore.set(second.id, "probe", {
+			fetchedAt: Date.now(),
+			scope: "key",
+			balances: [],
+			windows: [{ kind: "weekly", usedRatio: 1, resetsAt: reset }],
+		});
+		store.reorder(providerId, [second.id, first.id]);
+		store.reorder(providerId, [first.id, second.id]);
+		reportQuota("custom-quota", "7", null, identity);
+		expect(quotaStore.peek(second.id, STREAM_QUOTA_SOURCE)?.balances[0]?.remaining).toBe(7);
+		expect(quotaStore.peek(first.id, STREAM_QUOTA_SOURCE)).toBeUndefined();
+		expect(keyQuotaBlockedUntil(second.id)).toBe(reset);
+		store.update(second.id, { apiKey: "key-replaced" });
+		reportQuota("custom-quota", "99", null, identity);
+		expect(quotaStore.peek(second.id, STREAM_QUOTA_SOURCE)?.balances[0]?.remaining).toBe(7);
+	});
+
 	test("the first credential owns the snapshot and key changes withdraw it", () => {
 		useProvider();
 		const second = getProviderKeyStore().add(providerId, { apiKey: "key-two" });
@@ -128,8 +157,8 @@ describe("response quota_balance snapshots", () => {
 		useProvider();
 		reportQuota("custom-quota", "11", "first account");
 		const second = getProviderKeyStore().add(providerId, { apiKey: "key-two" });
-		const identity = streamQuotaIdentityForPrefix("custom-quota", second.id);
-		updateCustomApiQuotaByPrefix("custom-quota", "0", "second account", identity, second.id);
+		const identity = streamQuotaIdentityForRequest("custom-quota", { credentialId: second.id });
+		updateCustomApiQuotaByPrefix("custom-quota", "0", "second account", identity);
 		expect(quotaStore.peek(second.id, STREAM_QUOTA_SOURCE)?.balances).toEqual([
 			{ unit: "", remaining: 0 },
 		]);
@@ -137,8 +166,10 @@ describe("response quota_balance snapshots", () => {
 		expect(getAllCustomApiCachedQuotas()[providerId]?.detailedQuotaBalance).toBe("first account");
 		// Rotating A does not change B's effective request identity.
 		getProviderKeyStore().update(providerId, { apiKey: "first-replaced" });
-		expect(streamQuotaIdentityForPrefix("custom-quota", second.id)).toBe(identity);
-		updateCustomApiQuotaByPrefix("custom-quota", "2", null, identity, second.id);
+		expect(streamQuotaIdentityForRequest("custom-quota", { credentialId: second.id })).toBe(
+			identity,
+		);
+		updateCustomApiQuotaByPrefix("custom-quota", "2", null, identity);
 		expect(quotaStore.peek(second.id, STREAM_QUOTA_SOURCE)?.balances[0]?.remaining).toBe(2);
 	});
 
@@ -146,14 +177,14 @@ describe("response quota_balance snapshots", () => {
 		test(`a secondary credential's late quota after ${change} never reaches either key`, () => {
 			useProvider();
 			const second = getProviderKeyStore().add(providerId, { apiKey: "key-two" });
-			const identity = streamQuotaIdentityForPrefix("custom-quota", second.id);
+			const identity = streamQuotaIdentityForRequest("custom-quota", { credentialId: second.id });
 			if (change === "key") getProviderKeyStore().update(second.id, { apiKey: "changed" });
 			else if (change === "network")
 				getProviderKeyStore().update(second.id, {
 					network: { userAgentMode: "custom", customUserAgent: "changed-agent" },
 				});
 			else getProviderKeyStore().remove(second.id);
-			updateCustomApiQuotaByPrefix("custom-quota", "0", null, identity, second.id);
+			updateCustomApiQuotaByPrefix("custom-quota", "0", null, identity);
 			expect(quotaStore.peek(providerId, STREAM_QUOTA_SOURCE)).toBeUndefined();
 			expect(quotaStore.peek(second.id, STREAM_QUOTA_SOURCE)).toBeUndefined();
 		});
@@ -170,9 +201,9 @@ describe("response quota_balance snapshots", () => {
 			throw new Error("stream attribution restored quota");
 		});
 		try {
-			const identity = streamQuotaIdentityForPrefix("custom-quota", second.id);
+			const identity = streamQuotaIdentityForRequest("custom-quota", { credentialId: second.id });
 			expect(identity).toBeDefined();
-			updateCustomApiQuotaByPrefix("custom-quota", "2", null, identity, second.id);
+			updateCustomApiQuotaByPrefix("custom-quota", "2", null, identity);
 			expect(quotaStore.peek(second.id, STREAM_QUOTA_SOURCE)?.balances[0]?.remaining).toBe(2);
 			expect(initialize).not.toHaveBeenCalled();
 			expect(restore).not.toHaveBeenCalled();
@@ -184,10 +215,10 @@ describe("response quota_balance snapshots", () => {
 
 	test("an explicit foreign or unknown id cannot fall back to the first credential", () => {
 		useProvider();
-		const identity = streamQuotaIdentityForPrefix("custom-quota");
 		for (const credentialId of ["unknown-key", "", "another-provider-key"]) {
-			expect(streamQuotaIdentityForPrefix("custom-quota", credentialId)).toBeUndefined();
-			updateCustomApiQuotaByPrefix("custom-quota", "0", null, identity, credentialId);
+			const identity = streamQuotaIdentityForRequest("custom-quota", { credentialId });
+			expect(identity).toBeUndefined();
+			updateCustomApiQuotaByPrefix("custom-quota", "0", null, identity);
 			expect(quotaStore.peek(providerId, STREAM_QUOTA_SOURCE)).toBeUndefined();
 		}
 	});
@@ -200,8 +231,7 @@ describe("response quota_balance snapshots", () => {
 			"custom-quota",
 			"2",
 			null,
-			streamQuotaIdentityForPrefix("custom-quota", second.id),
-			second.id,
+			streamQuotaIdentityForRequest("custom-quota", { credentialId: second.id }),
 		);
 		quotaStore.set(
 			second.id,
@@ -251,7 +281,9 @@ describe("response quota_balance snapshots", () => {
 			const key = getProviderKeyStore().listGroup(providerId)[0];
 			if (!key) throw new Error("custom quota test key missing");
 			reportQuota("custom-quota", "12");
-			const expectedIdentity = streamQuotaIdentityForPrefix("custom-quota");
+			const expectedIdentity = streamQuotaIdentityForRequest("custom-quota", {
+				credentialId: getProviderKeyStore().listGroup(providerId)[0]?.id,
+			});
 			if (!expectedIdentity) throw new Error("custom stream identity missing");
 			getProviderKeyStore().update(key.id, { network });
 			expectLateQuotaRejected(expectedIdentity);
@@ -262,7 +294,9 @@ describe("response quota_balance snapshots", () => {
 		useProvider();
 		settings.proxy = { mode: "direct" };
 		reportQuota("custom-quota", "12");
-		const expectedIdentity = streamQuotaIdentityForPrefix("custom-quota");
+		const expectedIdentity = streamQuotaIdentityForRequest("custom-quota", {
+			credentialId: getProviderKeyStore().listGroup(providerId)[0]?.id,
+		});
 		if (!expectedIdentity) throw new Error("custom stream identity missing");
 		settings.proxy = { mode: "custom", url: "http://new-global-proxy.example:8080" };
 		expectLateQuotaRejected(expectedIdentity);
@@ -271,7 +305,9 @@ describe("response quota_balance snapshots", () => {
 	test("a late event cannot follow a same-secret replacement of the first credential", () => {
 		useProvider();
 		reportQuota("custom-quota", "12");
-		const expectedIdentity = streamQuotaIdentityForPrefix("custom-quota");
+		const expectedIdentity = streamQuotaIdentityForRequest("custom-quota", {
+			credentialId: getProviderKeyStore().listGroup(providerId)[0]?.id,
+		});
 		if (!expectedIdentity) throw new Error("custom stream identity missing");
 		const replacement = getProviderKeyStore().add(providerId, { apiKey: "key-one" });
 		getProviderKeyStore().reorder(providerId, [replacement.id]);
@@ -283,7 +319,9 @@ describe("response quota_balance snapshots", () => {
 		const key = getProviderKeyStore().listGroup(providerId)[0];
 		if (!key) throw new Error("custom quota test key missing");
 		reportQuota("custom-quota", "12");
-		const expectedIdentity = streamQuotaIdentityForPrefix("custom-quota");
+		const expectedIdentity = streamQuotaIdentityForRequest("custom-quota", {
+			credentialId: getProviderKeyStore().listGroup(providerId)[0]?.id,
+		});
 		if (!expectedIdentity) throw new Error("custom stream identity missing");
 		getProviderKeyStore().update(key.id, { apiKey: "key-secret-edited" });
 		expectLateQuotaRejected(expectedIdentity);
@@ -293,7 +331,9 @@ describe("response quota_balance snapshots", () => {
 		useProvider();
 		const current = settings.customApiProviders?.[0];
 		if (!current) throw new Error("custom quota test provider missing");
-		const expectedIdentity = streamQuotaIdentity(current);
+		const expectedIdentity = streamQuotaIdentityForRequest("custom-quota", {
+			credentialId: getProviderKeyStore().listGroup(providerId)[0]?.id,
+		});
 		saveSettings({
 			...settings,
 			customApiProviders: [{ ...current, apiKey: "key-replacement" }],

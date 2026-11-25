@@ -47,16 +47,21 @@ export interface CommandCodeProviderSettings {
 export function buildCommandCodeProvider(
 	model: string,
 	config?: CommandCodeProviderSettings,
+	/** A pool-selected key never consults settings or CLI authentication. */
+	apiKey?: string,
 ): ProviderAdapter | undefined {
 	if (config?.disabled) return undefined;
-	const auth = resolveCommandCodeToken(config?.apiKey);
-	if (!auth.credential) return undefined;
+	const token =
+		apiKey === undefined
+			? resolveCommandCodeToken(config?.apiKey).credential?.token
+			: apiKey.trim();
+	if (!token) return undefined;
 	const bare = bareCommandCodeModelId(model);
 	const shared = {
 		id: "CommandCode",
 		name: "Command Code",
 		prefix: COMMAND_CODE_PREFIX,
-		apiKey: auth.credential.token,
+		apiKey: token,
 		defaultModel: bare || model,
 		baseUrl: commandCodeProviderBase(config?.baseUrl),
 		proxy: config?.proxy,

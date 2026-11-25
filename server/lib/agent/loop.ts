@@ -49,7 +49,7 @@ import {
 	getToolMessage,
 	type Locale,
 } from "../prompt-i18n";
-import { streamQuotaIdentityForPrefix } from "../provider-key-subjects";
+import { streamQuotaIdentityForRequest } from "../provider-key-subjects";
 import { resolveProviderQuotaWait } from "../provider-quota-wait";
 import { createRequestRecording } from "../request-recorder";
 import {
@@ -4449,22 +4449,22 @@ async function* agentLoopInMetadataSnapshot(
 			const requestUserId = config.userId ?? null;
 			let requestStarted = false;
 			let requestQuotaProviderIdentity: string | undefined;
-			let requestQuotaCredentialId: string | undefined;
 			let requestFinished = false;
 			let requestStartPending = false;
 			let startFirstTokenTimerForAttempt: (() => void) | undefined;
 
-			const markRequestStarted = (info?: { credentialId?: string }) => {
+			const markRequestStarted = (info?: {
+				credentialId?: string;
+				validateDiagnosticCredential?: () => boolean;
+			}) => {
 				if (info?.credentialId) {
 					credentialId = info.credentialId;
 				}
-				// A pooled adapter may start another key before producing any visible output.
-				// Capture each attempt, not only the first request-level start notification.
-				requestQuotaCredentialId = info?.credentialId ?? credentialId;
-				requestQuotaProviderIdentity = streamQuotaIdentityForPrefix(
-					effectiveProvider,
-					requestQuotaCredentialId,
-				);
+				// A pooled retry can start on a different key before yielding output.
+				requestQuotaProviderIdentity = streamQuotaIdentityForRequest(effectiveProvider, {
+					...info,
+					credentialId,
+				});
 				if (requestStarted) return;
 				requestStarted = true;
 				requestStartPending = true;
@@ -5087,7 +5087,6 @@ async function* agentLoopInMetadataSnapshot(
 				messageId = undefined;
 				credentialId = undefined;
 				requestQuotaProviderIdentity = undefined;
-				requestQuotaCredentialId = undefined;
 				earlyExecMap.clear();
 				settledResults.clear();
 				streamReadyTools.clear();
@@ -6096,7 +6095,6 @@ async function* agentLoopInMetadataSnapshot(
 								quotaBalance: parsed.quotaBalance,
 								detailedQuotaBalance: parsed.detailedQuotaBalance,
 								providerIdentity: requestQuotaProviderIdentity,
-								credentialId: requestQuotaCredentialId,
 							};
 						}
 						// Billing updates can be output-only; occupancy still requires a real prompt.

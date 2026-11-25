@@ -3,7 +3,7 @@ import {
 	getCustomApiCachedQuota,
 	updateCustomApiQuotaByPrefix,
 } from "../../custom-api-quota-cache";
-import { streamQuotaIdentityForPrefix } from "../../provider-key-subjects";
+import { streamQuotaIdentityForRequest } from "../../provider-key-subjects";
 import { getProviderKeyStore, type ProviderKey } from "../../provider-keys";
 import { saveSettings, settings } from "../../settings";
 import { quotaStore, STREAM_QUOTA_SOURCE } from "../../sourcing/quota-store";
@@ -31,7 +31,10 @@ function build(key: ProviderKey): ProviderAdapter {
 		injectSystemPrompt: () => {},
 		async *chat(params) {
 			params.onRequestStart?.();
-			starts.push({ id: key.id, identity: streamQuotaIdentityForPrefix(prefix, key.id) });
+			starts.push({
+				id: key.id,
+				identity: streamQuotaIdentityForRequest(prefix, { credentialId: key.id }),
+			});
 			afterStart?.(key);
 			for (const step of steps[key.id] ?? []) {
 				if (step instanceof Error) throw step;
@@ -107,7 +110,6 @@ async function run() {
 				event.quotaBalance,
 				event.detailedQuotaBalance,
 				event.providerIdentity,
-				event.credentialId,
 			);
 		}
 	}
@@ -127,7 +129,6 @@ test("a real pool selecting B while A is first attributes the stream quota only 
 	expect(starts.map((start) => start.id)).toEqual([second.id]);
 	expect(quotas).toMatchObject([
 		{
-			credentialId: second.id,
 			providerIdentity: starts[0]?.identity,
 			quotaBalance: "0",
 		},
@@ -154,7 +155,9 @@ test("a direct single-plain-key adapter's group-id report maps to its distinct s
 	);
 	try {
 		const quotas = await run();
-		expect(quotas[0]?.credentialId).toBe(id);
+		expect(quotas[0]?.providerIdentity).toBe(
+			streamQuotaIdentityForRequest(prefix, { credentialId: id }),
+		);
 		expect(quotaStore.peek(key.id, STREAM_QUOTA_SOURCE)?.balances[0]?.remaining).toBe(3);
 		expect(quotaStore.peek(id, STREAM_QUOTA_SOURCE)).toBeUndefined();
 	} finally {
@@ -170,13 +173,36 @@ test("in-pool failover refreshes both the credential id and identity on every at
 	steps[second.id] = [{ quotaBalance: "7" }, done];
 	const quotas = await run();
 	expect(starts.map((start) => start.id)).toEqual([first.id, second.id]);
-	expect(quotas.map((event) => [event.credentialId, event.providerIdentity])).toEqual(
-		starts.map((start) => [start.id, start.identity]),
+	expect(quotas.map((event) => event.providerIdentity)).toEqual(
+		starts.map((start) => start.identity),
 	);
 	expect(starts[0]?.identity).not.toBe(starts[1]?.identity);
 	expect(quotaStore.peek(first.id, STREAM_QUOTA_SOURCE)?.balances[0]?.remaining).toBe(1);
 	expect(quotaStore.peek(second.id, STREAM_QUOTA_SOURCE)?.balances[0]?.remaining).toBe(7);
 	expect(getCustomApiCachedQuota(id)?.quotaBalance).toBe("1");
+});
+
+test("a late stream cannot follow a deleted CID onto a newly created same-secret key", async () => {
+	const first = store.listGroup(id)[0];
+	if (!first) throw new Error("missing first key");
+	const second = store.add(id, { apiKey: "key-B" });
+	reportKeyFault(first, new ApiError(429, "rate limited"));
+	steps[second.id] = [{ quotaBalance: "99" }, done];
+	afterStart = (key) => {
+		store.remove(key.id);
+		store.add(id, { apiKey: key.apiKey });
+	};
+	const [event] = await run();
+	const replacement = store.listGroup(id).find((key) => key.id !== first.id);
+	if (!replacement) throw new Error("replacement key was not created");
+	expect(replacement.id).not.toBe(second.id);
+	expect(event?.providerIdentity).toBe(starts[0]?.identity);
+	expect(event?.providerIdentity).not.toBe(
+		streamQuotaIdentityForRequest(prefix, { credentialId: replacement.id }),
+	);
+	expect(quotaStore.peek(second.id, STREAM_QUOTA_SOURCE)).toBeUndefined();
+	expect(quotaStore.peek(replacement.id, STREAM_QUOTA_SOURCE)).toBeUndefined();
+	expect(quotaStore.peek(first.id, STREAM_QUOTA_SOURCE)).toBeUndefined();
 });
 
 for (const change of ["key", "network"] as const) {
@@ -191,9 +217,10 @@ for (const change of ["key", "network"] as const) {
 			else store.update(key.id, { network: { extraHeaders: { "X-Account": "replacement" } } });
 		};
 		const [event] = await run();
-		expect(event?.credentialId).toBe(second.id);
 		expect(event?.providerIdentity).toBe(starts[0]?.identity);
-		expect(event?.providerIdentity).not.toBe(streamQuotaIdentityForPrefix(prefix, second.id));
+		expect(event?.providerIdentity).not.toBe(
+			streamQuotaIdentityForRequest(prefix, { credentialId: second.id }),
+		);
 		expect(quotaStore.peek(first.id, STREAM_QUOTA_SOURCE)).toBeUndefined();
 		expect(quotaStore.peek(second.id, STREAM_QUOTA_SOURCE)).toBeUndefined();
 	});
