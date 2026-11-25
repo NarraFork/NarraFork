@@ -22,7 +22,7 @@ keywords:
   - 子进程超时
   - 输出上限
 status: draft
-verified_at: 7d5423c07
+verified_at: 6f73805a43fba25c5ee36fc0c483f8f0e49d75ec
 ---
 # 外部进程加固
 
@@ -30,7 +30,8 @@ verified_at: 7d5423c07
 
 ## 关键规则
 - 只读/维护类 git 命令（status、rev-list、diff --name-only、worktree list/remove）带命令级配置覆盖 `GIT_NO_EXEC_CONFIG`：`core.hooksPath` 指向空设备、关闭 fsmonitor 与 untrackedCache、清空 `diff.external`、`core.sshCommand`、`credential.helper`、`core.askPass`；同时设 `GIT_OPTIONAL_LOCKS=0` 避免状态查询写索引（`lib/git-exec-hardening.ts:gitConfigEnv`）。
-- 读工作树的命令（`status`、`worktree remove`）额外把配置里所有 filter 的 clean/smudge/process 清空，并按名字禁用配置定义的 hook；名字来自先跑一次只读的 `git config --get-regexp`（`PROGRAM_CONFIG_QUERY`、`untrustedProgramOverrides`，`narrator-worktree-service.ts:hardenedConfig`）。读不出来就失败（`WORKTREE_GIT_CONFIG_UNREADABLE`），不降级。
+- 读工作树的命令（`status`、`worktree remove`）额外把配置里所有 filter 的 clean/smudge/process 清空，并按名字禁用配置定义的 hook、清空自定义合并驱动（`merge.<名>.driver` 置空：git 不运行任何程序，那个文件按冲突算）；名字来自先跑一次只读的 `git config --get-regexp`（`PROGRAM_CONFIG_QUERY`、`untrustedProgramOverrides`，`narrator-worktree-service.ts:hardenedConfig`）。
+- 团队合并的写 git（`services/teams/team-git-write.ts`：`merge-tree`、`commit-tree`、`update-ref`、`fetch . M:refs/heads/<基线>`、显式的 `merge --ff-only`）同样套这份覆盖；签名程序只用 system/global 配置的，仓库自己配的 `gpg.*program` 改回主机值或默认值；拉 origin 时保留主机的凭证助手与 ssh 命令，但禁 `ext::`、本地 upload-pack 与 git proxy（见[合并工作项与基线配置](../collaboration/teams/merge.md)）。读不出来就失败（`WORKTREE_GIT_CONFIG_UNREADABLE`），不降级。
 - `worktree add` 不加固，保留仓库自己的检出 hook 与 filter（`hardenedConfig` 开头）。
 - git 低于 2.31 会静默忽略 `GIT_CONFIG_COUNT`，所以每进程探测一次哨兵配置，不通过就拒绝并报 `GIT_TOO_OLD_FOR_HARDENING`（409，失败不缓存）（`ensureConfigOverridesHonored`）。团队 worktree 的 git 同样套用（`services/teams/team-git.ts`，含建团队前对项目目录的 `isGitWorkTree` 与基线分支解析；它读 blob 用 `cat-file blob`，不走 filter 与 textconv，经 `safeSpawn` 的 `stdoutStream` 按 blob 大小 +1 字节限额；团队页读单个文件的 diff 同样用 `stdoutStream` 读到 64KB+1 字节即停，`diff --numstat` 输出上限 512KB）。
 - `diff` 用 `noExternalDiffArgs` 加 `--no-ext-diff --no-textconv`。

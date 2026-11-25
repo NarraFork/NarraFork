@@ -1,7 +1,9 @@
 /**
  * Every git command the team lifecycle runs inside a work item's worktree (P3). All read-only:
  * the server never merges, commits or checks out there — a base sync is handed to the item's
- * worker, whose own git calls go through the ordinary permissions.
+ * worker, whose own git calls go through the ordinary permissions. (A member's merge of a ready
+ * item into its base is computed in the object store by `team-git-write.ts`, never in a
+ * worktree.)
  *
  * The worktree is a directory agents write to without a person's approval, so its git
  * configuration is untrusted input: each command runs with the overrides of

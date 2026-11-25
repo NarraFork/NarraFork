@@ -47,7 +47,7 @@ keywords:
   - side-car
   - InjectionCadence
 status: draft
-verified_at: 66bc772cb8dbb321753b7f326178e78e513230f1
+verified_at: 6f73805a43fba25c5ee36fc0c483f8f0e49d75ec
 ---
 # 提示词与注入
 
@@ -77,7 +77,7 @@ verified_at: 66bc772cb8dbb321753b7f326178e78e513230f1
 - 当前输入归属：`sender-projection.ts:findCurrentSenderMessage` 从末尾找最后一条顶层 `user` 行，跳过 `sys`/`disp`/`system` 和宿主写的非回合行（重建工具声明通知，`continue-tail.ts:isNonTurnHostRow`）；`agent-runtime/history.ts:projectCurrentInput` 拿它和本次输入文本对上就算已持久化，不再作为单独的 system 输入重发。重试保留通知在被重试消息之后，若不跳过，原提示会在历史里一次、又作为当前输入再发一次（`project-teams-upgrade.test.ts` 断言重试后的模型输入里提示只出现一次、通知仍在）。
 - 注入块的结构：持久化为自包含的原生块，`modelText` 为模型文本、`body` 为结构化展示体，旧行可能带相邻文本块并经 `normalizeLegacyInjectionBlock` 归一（`shared/native-injection.ts`）；`shared/sidecar-body.ts:renderSideCarBodyToText` 决定结构化体怎样拼成文本，文案由 `lib/sidecar-templates.ts:getSideCarModelTemplates(locale)` 提供。
 - 提示词库：每条一个 markdown 文件 `~/.narrafork/prompt-library/<id>.md`，正文上限 `MAX_PROMPT_CHARS` = 10000（与 `createNarratorSchema.systemPrompt` 上限对齐）、名称 ≤ 100、描述 ≤ 500；路由 `/api/prompt-library`（列表、`POST /summarize` 无状态摘要、`/:id` 读写删，只要求登录）与 `/api/prompt-optimize/draft`（无会话时的提示词优化）；前端 `usePromptLibrary` 共用查询键 `["prompt-library"]`。
-- 团队协调者提示词（`team-lead.ts`，en / zh-CN）让协调者每轮评审都带 `summary`（几行评审意见，给团队页上的人看），并说明分支名只取英文单词：中文标题要给 `Team` work.create 一个 `branchHint`，或给 `Agent` 一个英文 description。
+- 团队协调者提示词（`team-lead.ts`，en / zh-CN）让协调者每轮评审都带 `summary`（几行评审意见，给团队页上的人看），并说明分支名只取英文单词：中文标题要给 `Team` work.create 一个 `branchHint`，或给 `Agent` 一个英文 description。合并由成员在团队页决定，协调者自己不合并；合并落地或冲突时它收到一条 `team_merge` 注入（`mergedNote` / `mergeConflictNote`，`wakeIfIdle`，按点击者的语言），冲突时它先 work.sync 再评审、重新 ready（见[合并工作项与基线配置](../collaboration/teams/merge.md)）。
 
 ## 从哪读起
 - `server/services/narrator-prompt.ts:buildEffectiveSystemPrompt`。
