@@ -259,6 +259,7 @@ import {
 	createRevertActionPreviewSchema,
 	createRevertPlanSchema,
 	deleteBlocksSchema,
+	modelTraceCalibrationSchema,
 	modelTraceOptionsSchema,
 	optimizePromptSchema,
 	revertPlanFilesQuerySchema,
@@ -343,6 +344,7 @@ import {
 import {
 	canWriteNarrator,
 	filterReadableNarrators,
+	loadNarratorForAccess,
 	NARRATOR_ACL_COLUMNS,
 	type NarratorPrincipal,
 	narratorReadableWhere,
@@ -394,8 +396,11 @@ import {
 	deferPendingQuestion,
 	disarmQuestionReflection,
 	getQuestionReflectionDeadline,
+	isPendingPlanReflectionAvailable,
 	reflectPendingAskUserQuestion,
+	reflectPendingExitPlanMode,
 	resolveDecisionNarratorId,
+	startAutomaticPlanReflectionForNarrator,
 	stopDangerReflectionLoop,
 	takeOverQuestionReflection,
 } from "../services/narrator-permission";
@@ -6192,6 +6197,19 @@ narratorRoutes.patch("/:id/reflection-overrides", async (c) => {
 	await narratorService.getById(id, undefined, { signal: c.req.raw.signal });
 	await narratorService.updateReflectionOverrides(id, updates);
 	broadcastToNarrator(id, { type: "reflection_overrides_changed", narratorId: id, ...updates });
+	// A plan that blocked earlier did so because this switch was off, and only a review can
+	// release it without a click: turning it on is this session asking for exactly that.
+	// Fire-and-forget — a review takes minutes and must not hold the settings write open.
+	if (updates.planReflectionAutoApproveOverride === "on") {
+		// Whoever turned the switch on must still be allowed to drive this session when a review's
+		// verdict lands, minutes later.
+		const principal = narratorPrincipalOf(c);
+		startAutomaticPlanReflectionForNarrator(id, {
+			assertStillAllowed: async () => {
+				await loadNarratorForAccess(id, principal, "write");
+			},
+		});
+	}
 	return c.json({ ok: true });
 });
 
@@ -6456,6 +6474,46 @@ narratorRoutes.post("/:id/modeltrace/retry", async (c) => {
 		await getUserLanguage(userId),
 	);
 	return c.json(result);
+});
+
+// Reuse the sample associated with an eligible result in the diagnostic narrator.
+narratorRoutes.post("/:id/modeltrace/calibrate", async (c) => {
+	const userId = c.get("user").sub;
+	const bytes = new Uint8Array(512);
+	let length = 0;
+	const reader = c.req.raw.body?.getReader();
+	if (reader) {
+		try {
+			while (true) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				if (length + value.byteLength > bytes.byteLength) {
+					void reader.cancel().catch(() => {});
+					return c.json({ error: "ModelTrace calibration request is too large" }, 413);
+				}
+				bytes.set(value, length);
+				length += value.byteLength;
+			}
+		} finally {
+			reader.releaseLock();
+		}
+	}
+	let body: unknown;
+	try {
+		body = JSON.parse(new TextDecoder().decode(bytes.subarray(0, length)));
+	} catch {
+		throw new ValidationError("Invalid ModelTrace calibration JSON");
+	}
+	const parsed = modelTraceCalibrationSchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const { calibrateModelTrace } = await import("../services/modeltrace-service");
+	const result = await calibrateModelTrace(
+		c.req.param("id"),
+		parsed.data.resultId,
+		narratorPrincipalOf(c),
+		await getUserLanguage(userId),
+	);
+	return c.json(result, 202);
 });
 
 // Start: create a persistent pending message in the source narrator's chat
@@ -6768,7 +6826,12 @@ narratorRoutes.get("/:id/permissions", async (c) => {
 	return c.json(
 		permissions.map((p) => {
 			const reflectionDeadline = getQuestionReflectionDeadline(p.id);
-			return reflectionDeadline !== null ? { ...p, reflectionDeadline } : p;
+			const withDeadline = reflectionDeadline !== null ? { ...p, reflectionDeadline } : p;
+			// Only a plan approval carries 计划反思, and only while the loop that raised it still
+			// holds a reflection runner (in-memory, so it does not survive a restart by itself).
+			return p.toolName === "ExitPlanMode"
+				? { ...withDeadline, planReflectionAvailable: isPendingPlanReflectionAvailable(p.id) }
+				: withDeadline;
 		}),
 	);
 });
@@ -7169,6 +7232,37 @@ narratorRoutes.post("/permissions/:requestId/reflect-question", async (c) => {
 			kind: "question.answered_by_ai",
 		});
 	return c.json({ ok: true, answers: result.answers ?? {} });
+});
+
+/**
+ * Run one plan reflection for a plan that is ALREADY waiting for approval, then apply its
+ * decision to that request: confirm approves it (skipping the person), revise sends the feedback
+ * back to the model, an undecidable review leaves the card with the person.
+ *
+ * Answers as soon as the review is STARTED. A review takes minutes and must not hold an HTTP
+ * request open; the card follows it through the ordinary `plan_reflection_*` frames.
+ */
+narratorRoutes.post("/permissions/:requestId/reflect-plan", async (c) => {
+	const requestId = c.req.param("requestId");
+	if (!isPendingPlanReflectionAvailable(requestId)) {
+		return c.json({ error: "Plan reflection is not available for this request" }, 409);
+	}
+	// The middleware above checked write access when the review STARTED; its verdict lands
+	// minutes later, so the same check runs again right before it is applied. The principal is
+	// captured now: this request has long been answered by then.
+	const principal = narratorPrincipalOf(c);
+	const assertStillAllowed = async () => {
+		const narratorId = await resolveDecisionNarratorId(requestId);
+		if (!narratorId) throw new NotFoundError("Narrator", "unknown");
+		await loadNarratorForAccess(narratorId, principal, "write");
+	};
+	void reflectPendingExitPlanMode(requestId, { assertStillAllowed }).catch((err) => {
+		logger.warn("Plan reflection request failed", {
+			requestId,
+			error: err instanceof Error ? err.message : String(err),
+		});
+	});
+	return c.json({ ok: true, started: true });
 });
 
 // Silently cancel the automatic AskUserQuestion reflection countdown (e.g. the

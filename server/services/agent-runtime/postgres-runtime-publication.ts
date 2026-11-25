@@ -456,6 +456,34 @@ export interface PgRecoverStaleTaskInput {
 	readonly text: string;
 	readonly eventKind: "failed" | "cancelled";
 	readonly now: string;
+	/**
+	 * The row as the restart scan saw it. When present, the terminal CAS also
+	 * requires every identity column to be unchanged, so a row that was re-run,
+	 * re-owned or re-bound after the scan is left alone instead of receiving a
+	 * synthetic restart terminal (the SQLite path's `assertRestartTask`).
+	 */
+	readonly expected?: PgStaleTaskRow;
+}
+
+/** Identity columns the restart CAS compares against the scanned row. */
+function staleTaskIdentityMatches(expected: PgStaleTaskRow) {
+	const same = <T>(column: Parameters<typeof eq>[0], value: T | null | undefined) =>
+		value === null || value === undefined ? isNull(column) : eq(column, value);
+	return and(
+		eq(backgroundTasks.type, expected.type as BackgroundTaskRecord["type"]),
+		eq(backgroundTasks.parentNarratorId, expected.parentNarratorId),
+		same(backgroundTasks.subagentNarratorId, expected.subagentNarratorId),
+		same(backgroundTasks.logicalRunId, expected.logicalRunId),
+		same(backgroundTasks.toolCallId, expected.toolCallId),
+		same(backgroundTasks.executionAttempt, expected.executionAttempt),
+		expected.backgroundKind === undefined
+			? undefined
+			: eq(
+					backgroundTasks.backgroundKind,
+					expected.backgroundKind as BackgroundTaskRecord["backgroundKind"],
+				),
+		expected.command === undefined ? undefined : same(backgroundTasks.command, expected.command),
+	);
 }
 
 export interface PgPauseStaleTransferInput {
@@ -1932,7 +1960,13 @@ export function createPostgresRuntimePublication(
 						completedAt: input.now,
 						updatedAt: input.now,
 					})
-					.where(and(eq(backgroundTasks.id, input.taskId), eq(backgroundTasks.status, "running")))
+					.where(
+						and(
+							eq(backgroundTasks.id, input.taskId),
+							eq(backgroundTasks.status, "running"),
+							input.expected ? staleTaskIdentityMatches(input.expected) : undefined,
+						),
+					)
 					.returning({
 						id: backgroundTasks.id,
 						type: backgroundTasks.type,

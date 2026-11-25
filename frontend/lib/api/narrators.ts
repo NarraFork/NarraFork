@@ -817,6 +817,11 @@ export const narratorsApi = {
 		request<{ id: string }>(`/narrators/${encodeURIComponent(narratorId)}/modeltrace/retry`, {
 			method: "POST",
 		}),
+	calibrateModelTrace: (narratorId: string, resultId: string) =>
+		request<{ id: string }>(`/narrators/${encodeURIComponent(narratorId)}/modeltrace/calibrate`, {
+			method: "POST",
+			body: JSON.stringify({ resultId }),
+		}),
 	/** 该模型是否已经有 ModelTrace 舱；没有跑过时为 null。 */
 	getModelTraceNarrator: (model: string) =>
 		request<{ narratorId: string | null }>(
@@ -1644,6 +1649,15 @@ export const narratorsApi = {
 				method: "POST",
 			},
 		),
+	/**
+	 * Run one plan reflection for a plan that is already waiting for approval. Answers as soon
+	 * as the review starts; its outcome arrives through the `plan_reflection_*` WS frames and
+	 * the permission resolution that follows them.
+	 */
+	reflectPlan: (requestId: string) =>
+		request<{ ok: boolean; started: boolean }>(`/narrators/permissions/${requestId}/reflect-plan`, {
+			method: "POST",
+		}),
 	disarmQuestionReflection: (requestId: string) =>
 		request<{ ok: boolean; disarmed: boolean }>(
 			`/narrators/permissions/${requestId}/disarm-question-reflection`,

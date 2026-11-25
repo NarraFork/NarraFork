@@ -932,7 +932,9 @@ describe("silent observation completion", () => {
 		expect((await backgroundTaskService.getById(id))?.status).toBe("running");
 		await backgroundTaskService.recoverStaleTasksAfterRestart();
 		expect((await backgroundTaskService.getById(id))?.output).toContain("Observation interrupted");
-		expect((await backgroundTaskService.getById(id))?.output).toContain("target was not stopped");
+		expect((await backgroundTaskService.getById(id))?.output).toContain(
+			"The watch did not stop the target, but the restart may have",
+		);
 		await runtimePublication.flushRecipient(PARENT);
 		const messages = await db.select().from(narratorBufferedMessages);
 		expect(messages).toHaveLength(1);

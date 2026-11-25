@@ -221,6 +221,38 @@ describe("Agent with a team work item", () => {
 		expect(path && existsSync(path)).toBe(true);
 	});
 
+	test("a title without English words names the branch from the description or branchHint", async () => {
+		const result = await agentTool.execute(
+			{
+				isolation: "worktree",
+				title: "补充登录页单元测试",
+				description: "Login page tests",
+				prompt: "do it",
+				run_in_background: true,
+			},
+			ctx(),
+		);
+		expect(result.isError).toBeFalsy();
+		const isolated = only();
+		expect(isolated.title).toBe("补充登录页单元测试");
+		expect(isolated.branchName).toMatch(/^team\/login-page-tests-[a-f0-9]{8}$/);
+
+		const { teamTool } = await import("../team");
+		const created = JSON.parse(
+			(
+				await teamTool.execute(
+					{ action: "work.create", title: "升级依赖版本", branchHint: "Upgrade dependencies" },
+					ctx(),
+				)
+			).output,
+		);
+		expect(created.item.branch).toMatch(/^team\/upgrade-dependencies-[a-f0-9]{8}$/);
+		const plain = JSON.parse(
+			(await teamTool.execute({ action: "work.create", title: "升级依赖版本" }, ctx())).output,
+		);
+		expect(plain.item.branch).toMatch(/^team\/work-[a-f0-9]{8}$/);
+	});
+
 	test("a workdir that is a queued item's worktree attaches the subagent to it", async () => {
 		const queued = await items.createWorkItem({
 			coordinatorId: LEAD,

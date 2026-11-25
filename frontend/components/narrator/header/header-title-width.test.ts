@@ -1,6 +1,7 @@
 import { beforeAll, describe, expect, test } from "bun:test";
 import { installCanvasStub } from "../vlist/measure/test-canvas-stub";
 import {
+	HEADER_BADGE_CHROME_PX,
 	HEADER_CLOSE_WIDTH_PX,
 	HEADER_LEADING_GAP_PX,
 	HEADER_PIN_WIDTH_PX,
@@ -9,6 +10,8 @@ import {
 	HEADER_TITLE_TEXT_MAX_PX,
 	HEADER_TITLE_TEXT_MIN_PX,
 	HEADER_TOOLBAR_GAP_PX,
+	headerBadgeFont,
+	headerBadgeLayoutWidth,
 	headerTitleFont,
 	headerTitleLayoutWidth,
 	measureHeaderTitleTextWidth,
@@ -153,6 +156,64 @@ describe("resolveHeaderLayoutAfterTitle — tools fit AFTER full title", () => {
 		expect(narrow.titleWidth).toBeLessThanOrEqual(titleFullWidth);
 		expect(narrow.titleWidth).toBeGreaterThan(titleFullWidth * 0.7);
 		expect(narrow.visibleToolCount).toBeLessThanOrEqual(2);
+	});
+
+	test("a title badge is budgeted with its gap, collapsing tools instead of clipping close", () => {
+		const input = {
+			rowWidth: 520,
+			titleFullWidth,
+			showBack: true,
+			showTitleActions: true,
+			surfacedToolCount: 10,
+			showClose: true,
+		};
+		// Without badge: chrome168, remaining 152 → 4 tools, slack 24 (see above).
+		// Badge 62 + gap8 = 70 → remaining 82 → 2 tools, slack 18.
+		const badged = resolveHeaderLayoutAfterTitle({ ...input, titleBadgeWidth: 62 });
+		expect(badged.titleWidth).toBe(titleFullWidth);
+		expect(badged.visibleToolCount).toBe(2);
+		expect(badged.overflowToolCount).toBe(8);
+		expect(badged.slackPx).toBe(18);
+		expect(resolveHeaderLayoutAfterTitle({ ...input, titleBadgeWidth: 0 })).toEqual(
+			resolveHeaderLayoutAfterTitle(input),
+		);
+		expect(badged.showTitleBadge).toBe(true);
+		expect(resolveHeaderLayoutAfterTitle(input).showTitleBadge).toBe(false);
+		// Narrow: the badge never costs overflow / close. Base chrome 168 + badge 70 needs a
+		// title floor of 80 beside it (318); below that the badge is not painted.
+		for (let rowWidth = 200; rowWidth <= 520; rowWidth += 2) {
+			const narrow = resolveHeaderLayoutAfterTitle({ ...input, rowWidth, titleBadgeWidth: 62 });
+			const plain = resolveHeaderLayoutAfterTitle({ ...input, rowWidth });
+			expect(narrow.showTitleBadge).toBe(rowWidth >= 318);
+			const used =
+				168 + (narrow.showTitleBadge ? 70 : 0) + narrow.titleWidth + narrow.visibleToolCount * 32;
+			// Never wider than the same row without a badge would be.
+			expect(used).toBeLessThanOrEqual(Math.max(rowWidth, 168 + plain.titleWidth));
+		}
+		// Unmeasured: shown optimistically, like the tools.
+		expect(
+			resolveHeaderLayoutAfterTitle({ ...input, rowWidth: 0, titleBadgeWidth: 62 }).showTitleBadge,
+		).toBe(true);
+		// A host-owned (empty) title still leaves room for the badge.
+		expect(
+			resolveHeaderLayoutAfterTitle({
+				...input,
+				titleFullWidth: 0,
+				showTitleActions: false,
+				rowWidth: 250,
+				titleBadgeWidth: 62,
+			}).showTitleBadge,
+		).toBe(true);
+	});
+
+	test("badge width = measured complete label + fixed sm badge chrome", () => {
+		expect(headerBadgeFont()).toContain("700");
+		expect(headerBadgeFont()).toContain("10px");
+		expect(headerBadgeLayoutWidth("")).toBe(0);
+		// Stub: 0.6 × 10px per char → "Team" 24 + tracking 4×0.25; icon 12 + section gap 5; slack 2.
+		expect(headerBadgeLayoutWidth("Team", 12)).toBe(24 + 1 + 12 + 5 + HEADER_BADGE_CHROME_PX + 2);
+		expect(headerBadgeLayoutWidth("团队", 12)).toBe(12 + 1 + 12 + 5 + HEADER_BADGE_CHROME_PX + 2);
+		expect(headerBadgeLayoutWidth("Team")).toBe(24 + 1 + HEADER_BADGE_CHROME_PX + 2);
 	});
 
 	test("chrome constants stay unique enough for answers-style layout math", () => {

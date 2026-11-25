@@ -21,7 +21,7 @@ export async function analyzeModelTrace(
 	outputs: ModelTraceOutput[],
 	locale = "zh-CN",
 	signal?: AbortSignal,
-): Promise<ModelTraceResultBlock> {
+): Promise<ModelTraceResultBlock & { acceptedSampleIndexes?: number[] }> {
 	const zh = locale.toLowerCase().startsWith("zh");
 	const unavailable = (error: string): ModelTraceResultBlock => ({
 		type: "modeltrace_result",

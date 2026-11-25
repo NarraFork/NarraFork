@@ -1,5 +1,7 @@
 import { existsSync, rmSync } from "node:fs";
+import { stat } from "node:fs/promises";
 import { resolve } from "node:path";
+import type { ResolveProjectDirectoryResponse } from "@shared/project-directory";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { type SSEStreamingApi, streamSSE } from "hono/streaming";
@@ -17,13 +19,18 @@ import {
 	projectMembersSchema,
 	projectTransferOwnerSchema,
 	projectVisibilitySchema,
+	resolveProjectDirectorySchema,
 	updateProjectSchema,
 } from "../lib/validators";
 import { executionPolicyEngine } from "../services/execution-policy/engine";
 import { gitService } from "../services/git-service";
 import { propagateOAuthProjectRemoval } from "../services/oauth-runtime-revocation";
-import { canWriteProject, type ProjectAclRow } from "../services/project-acl";
-import { assignProjectRootKey, scheduleProjectIndexRebuild } from "../services/project-index";
+import { canReadProject, canWriteProject, type ProjectAclRow } from "../services/project-acl";
+import {
+	assignProjectRootKey,
+	resolveProjectForDirectory,
+	scheduleProjectIndexRebuild,
+} from "../services/project-index";
 import {
 	getProjectAccess,
 	removeProjectMember,
@@ -33,6 +40,7 @@ import {
 } from "../services/project-membership";
 import { projectReadAdapter } from "../services/read";
 import { collectAllPages, parseLimitQuery, singlePage } from "../services/read/read-collect";
+import { isGitWorkTree } from "../services/teams/team-git";
 import { projectHasTeams } from "../services/teams/team-records";
 import { removeTabFromAllUsers } from "../services/user-preferences-service";
 import { withProjectRetirement } from "../services/worktree-lifecycle-guard";
@@ -137,6 +145,65 @@ projectRoutes.get("/hidden-existence", async (c) => {
 	// Only meaningful when the caller sees nothing; a non-empty list needs no hint.
 	if (visible.rows.length > 0) return c.json({ hasHidden: false });
 	return c.json({ hasHidden: await adapter.anyProjectExists() });
+});
+
+/**
+ * Which project a local directory belongs to, before any session exists there: the
+ * new-session dialog's "start as a team" option needs a project id for the team route.
+ *
+ * Same rules and same gate as starting a session in that directory: any signed-in user may
+ * start a local session anywhere, and the session would put the directory into a project
+ * through the project index (`resolveProjectForDirectory`), creating the project of a git
+ * repository that has none, owned by the caller. `create: false` only looks; `create: true`
+ * makes that project. A non-git directory never gets one. A directory covered by a project
+ * the caller cannot read is answered exactly like a non-git directory (`not_git`), so the
+ * lookup cannot be used to find where private projects live. `gitWorkTree` says whether a
+ * readable project's directory is a local git work tree (a project may be associated with any
+ * existing folder, and a team needs git). Shape: `shared/project-directory.ts`.
+ *
+ * SQLite only, like the project index and the team routes it leads to: 503 on PostgreSQL
+ * before anything else.
+ */
+projectRoutes.post("/resolve-directory", async (c) => {
+	requireSqliteProjectMutation("Resolving a directory's project");
+	const principal = projectPrincipalOf(c);
+	if (!principal.userId) throw new AppError("Unauthorized", 401, "UNAUTHORIZED");
+	let body: unknown;
+	try {
+		body = await c.req.json();
+	} catch {
+		throw new ValidationError("Request body must be JSON");
+	}
+	const parsed = resolveProjectDirectorySchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const reply = (response: ResolveProjectDirectoryResponse) => c.json(response);
+
+	const directory = resolveProjectDirectory(parsed.data.cwd);
+	const info = await stat(directory).catch(() => null);
+	if (!info?.isDirectory()) return reply({ status: "not_directory" });
+
+	const found = await resolveProjectForDirectory(directory, principal.userId, {
+		create: parsed.data.create,
+	});
+	// One answer for "no git repository" and "a project you cannot see": nothing in the
+	// response may tell the two apart.
+	const notGit = () => reply({ status: "not_git" });
+	if (found.kind === "none") return notGit();
+	if (found.kind === "repository") return reply({ status: "repository", root: found.root });
+
+	const row = await db.query.projects.findFirst({ where: eq(projects.id, found.projectId) });
+	if (!row || !(await canReadProject(row as ProjectAclRow, principal))) return notGit();
+	return reply({
+		status: "project",
+		project: {
+			id: row.id,
+			name: row.name,
+			gitPath: row.gitPath ?? null,
+			archived: row.status === "archived",
+			canWrite: await canWriteProject(row as ProjectAclRow, principal),
+			gitWorkTree: row.gitPath ? await isGitWorkTree(row.gitPath) : false,
+		},
+	});
 });
 
 projectRoutes.post("/", async (c) => {

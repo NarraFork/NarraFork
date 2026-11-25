@@ -1,6 +1,6 @@
 {
-  "id": "f040e99e-e551-4687-99f8-ee370353a9c1",
-  "prevId": "8d1462cb-1880-4184-bc64-7d1df44424c3",
+  "id": "c07b4921-245c-4e69-b29f-01132e3f6156",
+  "prevId": "c9d8eed4-015f-4e6c-9274-610534f33c08",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -1150,6 +1150,12 @@
         },
         "title": {
           "name": "title",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "principal_json": {
+          "name": "principal_json",
           "type": "text",
           "primaryKey": false,
           "notNull": false
@@ -26212,6 +26218,12 @@
         "folder_preview_count": {
           "name": "folder_preview_count",
           "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "project_id": {
+          "name": "project_id",
+          "type": "text",
           "primaryKey": false,
           "notNull": false
         },

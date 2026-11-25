@@ -2650,7 +2650,7 @@ export const userRecentTabs = sqliteTable(
 		tabKey: text("tab_key").notNull(),
 		section: text("section", { enum: ["projects", "work"] }).notNull(),
 		type: text("type", {
-			enum: ["chapter", "narrator", "project", "workspace", "subagent", "group", "folder"],
+			enum: ["chapter", "narrator", "project", "workspace", "subagent", "group", "folder", "team"],
 		}).notNull(),
 		entityId: text("entity_id").notNull(),
 		narratorId: text("narrator_id"),
@@ -2679,6 +2679,11 @@ export const userRecentTabs = sqliteTable(
 		 * not fully expanded. NULL means the client default.
 		 */
 		folderPreviewCount: integer("folder_preview_count"),
+		/**
+		 * `type = "team"` rows only: the team's project, for the team page's link. Written by the
+		 * server from `project_teams` (a team never changes project); NULL for every other type.
+		 */
+		projectId: text("project_id"),
 		title: text("title").notNull(),
 		subtitle: text("subtitle"),
 		status: text("status"),
@@ -4259,6 +4264,12 @@ export const backgroundTasks = sqliteTable(
 		executionAttempt: integer("execution_attempt"),
 		alias: text("alias"),
 		title: text("title"),
+		/**
+		 * Watch rows: the execution principal that registered the observation. Restart
+		 * re-attachment re-authorizes as this identity; NULL (legacy or unknown) never
+		 * re-attaches.
+		 */
+		principalJson: text("principal_json", { mode: "json" }).$type<{ userId: string | null }>(),
 		output: text("output"),
 		outputBytes: integer("output_bytes").notNull().default(0),
 		outputTruncated: integer("output_truncated", { mode: "boolean" }).notNull().default(false),

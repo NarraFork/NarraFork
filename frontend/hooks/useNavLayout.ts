@@ -8,7 +8,7 @@ import {
 	NAV_DIVIDER_ID,
 	type NavLayoutEntry,
 	projectNavLayout,
-	restoreRetiredNavEntries,
+	restoreWithheldNavEntries,
 	toPersistedNavLayout,
 } from "./nav-layout";
 import { useOutlineEnabled } from "./useOutlineEnabled";
@@ -69,7 +69,7 @@ export function useNavLayout() {
 	const saveLayout = useCallback(
 		(nextEntries: NavLayoutEntry[]) => {
 			const persisted = toPersistedNavLayout(
-				restoreRetiredNavEntries(nextEntries, storedEntries, hidden),
+				restoreWithheldNavEntries(nextEntries, storedEntries, hidden),
 			);
 			const previous = queryClient.getQueryData<Preferences>(["user-preferences"]);
 			// Optimistic update
