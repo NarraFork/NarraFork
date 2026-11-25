@@ -81,7 +81,7 @@ import {
 	readChangedPaths,
 	storeChangedPaths,
 } from "./team-overlap";
-import { workStartPoint } from "./team-work-start";
+import { compareRefFor, workStartPoint } from "./team-work-start";
 import {
 	assertWorkItemStartable,
 	checkDependencies,
@@ -897,15 +897,20 @@ export async function markReady(input: {
 			409,
 			"TEAM_WORK_ITEM_HEAD_UNAVAILABLE",
 		);
+	// W: an item that started from origin/<base> is compared with it, not with a local base that
+	// may be behind.
+	const compareRef = await compareRefFor(item.id, item.baseRef ?? team.baseBranch, (ref) =>
+		git.resolveCommit(ref),
+	);
 	await assertKnowledgeFresh({
 		itemId: item.id,
 		worktree: path,
 		head,
-		baseRef: item.baseRef ?? team.baseBranch,
+		baseRef: compareRef,
 	});
 	const reviewed = lastReviewedHead(item.id);
 	// Commits made after the review, not counting what a base sync brought in from the base.
-	const baseSha = await git.resolveCommit(item.baseRef ?? team.baseBranch).catch(() => null);
+	const baseSha = await git.resolveCommit(compareRef).catch(() => null);
 	let commitsSinceReview: number | null = null;
 	if (reviewed && head !== reviewed)
 		commitsSinceReview = await git
@@ -915,9 +920,7 @@ export async function markReady(input: {
 	// X: the paths this item changed at the pinned head, and the project's exclusive lock when
 	// they touch it. Paths read at any other commit count as unreadable.
 	const globs = projectExclusivePaths(team.projectId);
-	const read = await readChangedPaths(path, item.baseRef ?? team.baseBranch, head).catch(
-		() => null,
-	);
+	const read = await readChangedPaths(path, compareRef, head).catch(() => null);
 	const changed = read?.head === head ? read : null;
 	if (!changed && globs.length > 0)
 		throw new AppError(
@@ -1766,7 +1769,11 @@ async function settleItem(
 		const path = worktreePathOf(item);
 		if (!path) return "none";
 		const git = teamGit(path);
-		const baseSha = await git.resolveCommit(item.baseRef ?? "HEAD");
+		const baseSha = await git.resolveCommit(
+			item.baseRef
+				? await compareRefFor(item.id, item.baseRef, (ref) => git.resolveCommit(ref))
+				: "HEAD",
+		);
 		if (signal.aborted) return "kept";
 		const head = await git.resolveCommit("HEAD");
 		if (signal.aborted || !baseSha || !head) return "kept";

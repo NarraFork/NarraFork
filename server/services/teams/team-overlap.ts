@@ -102,6 +102,7 @@ import { canReadNarrator, canWriteNarrator, type NarratorPrincipal } from "../na
 import { canReadProject } from "../project-acl";
 import { type ChangedPaths, teamGit } from "./team-git";
 import { isMerging } from "./team-merge-guard";
+import { compareRefFor, remoteTrackingRef } from "./team-work-start";
 import { markMergedByAncestry, recordWorkEvent, type WorkActor } from "./work-items";
 
 const FINISHED = [...TEAM_WORK_ITEM_FINISHED_STATES];
@@ -639,7 +640,7 @@ export type RefreshOutcome = "updated" | "unchanged" | "merged" | "failed";
  *  2. the evidence recorded at `work.ready`: its head there is the item's recorded head, and the
  *     changed paths computed there were not empty (never derived again later);
  *  3. its worker is not running;
- *  4. that head is an ancestor of the base, and the item's BRANCH (`refs/heads/<branch>`, never
+ *  4. that head is an ancestor of the base (the local one, or `refs/remotes/origin/<base>`), and the item's BRANCH (`refs/heads/<branch>`, never
  *     the worktree's HEAD) is that head or also inside the base — commits made after ready are
  *     never dropped.
  * Then it is merged, if it is still exactly what was read (checked in the transaction).
@@ -689,9 +690,16 @@ async function mergeIfLanded(target: RefreshTarget, git: ChangedPathsGit): Promi
 			.get();
 		if (worker && worker.status !== "idle" && worker.status !== "archived") return false;
 	}
-	const base = await git.resolve(target.baseRef);
-	if (!base || !(await git.isAncestor(item.headSha, base))) return false;
-	if (tip !== item.headSha && !(await git.isAncestor(tip, base))) return false;
+	// Landed in the local base, or in origin's (merged elsewhere and fetched): either counts.
+	let base: string | null = null;
+	for (const ref of [target.baseRef, remoteTrackingRef(target.baseRef)]) {
+		const candidate = await git.resolve(ref).catch(() => null);
+		if (!candidate || !(await git.isAncestor(item.headSha, candidate))) continue;
+		if (tip !== item.headSha && !(await git.isAncestor(tip, candidate))) continue;
+		base = candidate;
+		break;
+	}
+	if (!base) return false;
 	return markMergedByAncestry({
 		itemId: target.id,
 		head: item.headSha,
@@ -708,7 +716,9 @@ async function refreshTarget(target: RefreshTarget): Promise<RefreshOutcome> {
 		if (!head) return "failed";
 		let outcome: RefreshOutcome = "unchanged";
 		if (head !== target.atSha) {
-			const changed = await git.changed(target.baseRef);
+			// W: an item started from origin/<base> is compared with it, not a local base behind it.
+			const compare = await compareRefFor(target.id, target.baseRef, (ref) => git.resolve(ref));
+			const changed = await git.changed(compare);
 			if (!changed) return "failed";
 			if (storeChangedPaths(db, target.id, changed)) outcome = "updated";
 		}

@@ -51,6 +51,7 @@ import {
 import { teamGit } from "./team-git";
 import { canMergeInProject, mergeViewOf, requestFastForward, requestMerge } from "./team-merge";
 import { loadTeamForAccess } from "./team-service";
+import { compareRefFor } from "./team-work-start";
 import { readDependents } from "./work-item-dependencies";
 import { diffStatOf, returnWorkItem, worktreePathOf } from "./work-items";
 
@@ -97,7 +98,10 @@ async function diffTarget(
 	if (worktree) {
 		const git = teamGit(worktree);
 		const head = await git.resolveCommit("HEAD");
-		const base = await git.resolveCommit(item.baseRef ?? baseBranch);
+		// W: an item started from origin/<base> is compared with it (only its own commits count).
+		const base = await git.resolveCommit(
+			await compareRefFor(item.id, item.baseRef ?? baseBranch, (ref) => git.resolveCommit(ref)),
+		);
 		if (head && base) {
 			const fork = await git.mergeBase(head, base);
 			if (fork) return { cwd: worktree, from: fork, to: head };

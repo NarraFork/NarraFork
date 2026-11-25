@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { db, sqlite } from "../../../db";
-import { narratorWorktreeResources, teamWorkEvents } from "../../../db/schema";
+import { narratorWorktreeResources, teamWorkEvents, teamWorkItems } from "../../../db/schema";
 import { generateId } from "../../../lib/id";
 import { safeSpawn } from "../../../lib/spawn";
 import { teamSettingsSchema } from "../../../lib/validators/project-teams";
@@ -23,7 +23,15 @@ import {
 	peekHosting,
 	setHostingSourceForTests,
 } from "../team-hosting";
-import { peekWorkStartDefault, projectWorkStartOf, resolveWorkStart } from "../team-work-start";
+import { resetOverlapStateForTests, runChangedPathsPass } from "../team-overlap";
+import {
+	compareRefFor,
+	itemStartedFrom,
+	peekWorkStartDefault,
+	projectWorkStartOf,
+	resolveWorkStart,
+} from "../team-work-start";
+import { readWorkStats, resetWorkStatCacheForTests } from "../team-work-view";
 import {
 	attachWorker,
 	createWorkItem,
@@ -363,5 +371,54 @@ describe("where work starts", () => {
 		if (remote.outcome !== "handed_off") return;
 		expect(remote.instruction).toContain(`the base origin/main (commit ${upstream})`);
 		expect(remote.instruction).toContain(`git merge --no-ff ${upstream}`);
+	});
+
+	test("an item started from origin counts only its own commits, and lands when origin has it (review 5)", async () => {
+		setTeamSettings({ workStart: "remote" });
+		const local = await git(["rev-parse", "main"]);
+		const item = await create("Own commits only");
+		const path = worktreePathOf(item) ?? "";
+		expect(itemStartedFrom(item.id)).toBe("origin/main");
+		const own = await commitFile(path, "own.txt", "own\n", "the item's own work");
+		const resolve = (ref: string) =>
+			git(["rev-parse", "--verify", "--quiet", ref]).catch(() => null);
+		expect(await compareRefFor(item.id, "main", resolve)).toBe("refs/remotes/origin/main");
+		// The local main is still behind origin: it must not count b.txt as the item's.
+		expect(await git(["rev-parse", "main"])).toBe(local);
+		resetWorkStatCacheForTests();
+		const stats = await readWorkStats(LEAD, { userId: USER, isAdmin: true }, PROJECT, [item.id]);
+		expect(stats.stats[item.id]).toMatchObject({ files: 1, added: 1, removed: 0 });
+		resetOverlapStateForTests();
+		await runChangedPathsPass({ sweep: true });
+		const stored = db.select().from(teamWorkItems).where(eq(teamWorkItems.id, item.id)).get();
+		expect(stored?.changedPathsJson).toEqual(["own.txt"]);
+		// Ready, then merged on origin (and fetched): ancestry finds it there, local main behind.
+		sqlite.run("UPDATE team_work_items SET state = 'ready', head_sha = ? WHERE id = ?", [
+			own,
+			item.id,
+		]);
+		db.insert(teamWorkEvents)
+			.values({
+				id: generateId(),
+				teamId: LEAD,
+				workItemId: item.id,
+				kind: "work.ready",
+				actorKind: "agent",
+				actorId: LEAD,
+				detailJson: { head: own, changedPathCount: 1 },
+				createdAt: new Date().toISOString(),
+			})
+			.run();
+		await git(["push", "-q", "origin", `${own}:refs/heads/main`]);
+		await git(["fetch", "-q", "origin", "+refs/heads/main:refs/remotes/origin/main"]);
+		resetOverlapStateForTests();
+		await runChangedPathsPass({ sweep: true });
+		const merged = db.select().from(teamWorkItems).where(eq(teamWorkItems.id, item.id)).get();
+		expect(merged?.state).toBe("merged");
+		expect(await git(["rev-parse", "main"])).toBe(local);
+		// An item started locally is compared with the local base.
+		setTeamSettings({ workStart: "local" });
+		const localItem = await create("Local start");
+		expect(await compareRefFor(localItem.id, "main", resolve)).toBe("main");
 	});
 });

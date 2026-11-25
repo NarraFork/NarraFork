@@ -19,9 +19,9 @@ import {
 	type TeamSettings,
 	type TeamWorkStart,
 } from "@shared/project-teams";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { db } from "../../db";
-import { projects } from "../../db/schema";
+import { projects, teamWorkEvents } from "../../db/schema";
 import { AppError } from "../../lib/errors";
 import { logger } from "../../lib/logger";
 import { teamRepoGit } from "./team-git-write";
@@ -138,4 +138,38 @@ export async function workStartPoint(input: {
 			"TEAM_WORK_START_UNAVAILABLE",
 		);
 	return { mode, label, ref, commit, fetched: fetch.ok };
+}
+
+// ── What an item's branch is compared against ───────────────────────────────
+
+/** Where an item started (`work.created`'s `startFrom`), or null for items made before it. */
+export function itemStartedFrom(itemId: string): string | null {
+	const row = db
+		.select({ detail: teamWorkEvents.detailJson })
+		.from(teamWorkEvents)
+		.where(and(eq(teamWorkEvents.workItemId, itemId), eq(teamWorkEvents.kind, "work.created")))
+		.limit(1)
+		.get();
+	const from = row?.detail?.startFrom;
+	return typeof from === "string" ? from : null;
+}
+
+/** The remote-tracking ref of a base (`refs/remotes/origin/<base>`). */
+export const remoteTrackingRef = (base: string) => `refs/remotes/origin/${base}`;
+
+/**
+ * The ref an item's branch is compared against — its changed paths, size, diff, commits since
+ * review, the knowledge check: `refs/remotes/origin/<base>` for an item that started from
+ * `origin/<base>` (while that ref resolves), else the base itself. Comparing such an item with a
+ * local base that is behind origin would count origin's commits as the item's own. The local base
+ * stays what a local merge moves.
+ */
+export async function compareRefFor(
+	itemId: string,
+	base: string,
+	resolve: (ref: string) => Promise<string | null>,
+): Promise<string> {
+	if (itemStartedFrom(itemId) !== `origin/${base}`) return base;
+	const remote = remoteTrackingRef(base);
+	return (await resolve(remote).catch(() => null)) ? remote : base;
 }
