@@ -278,6 +278,8 @@ describe("board", () => {
 			updatedAt: expect.any(String),
 			// The worker runs but has made no tool call yet.
 			activity: null,
+			// D: the card's dependencies (none here).
+			dependsOn: [],
 		});
 		expect(JSON.stringify(progress)).not.toContain("src/file-");
 		expect((await column("review")).items.map((card: { id: string }) => card.id).sort()).toEqual(

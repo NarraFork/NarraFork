@@ -16,7 +16,7 @@ keywords:
   - requireSqliteProjectMutation
   - TeamStatus
 status: draft
-verified_at: 0baba9c1a
+verified_at: 66bc772cb8dbb321753b7f326178e78e513230f1
 ---
 # 团队
 
@@ -28,7 +28,7 @@ verified_at: 0baba9c1a
 
 ## 几部分怎么配合
 1. 先有团队：创建时同事务建协调者叙述者和 `project_teams` 行；也可以把已有的空闲会话升级为团队（同事务加 `team` trait 和团队行），或解散团队、保留会话（同事务删团队行和 trait）；成员不另存，全部取自协调者的叙述者 ACL（团队与成员）。
-2. 协调者用 `Team` 工具建工作项；工作项有自己的分支与 worktree，子代理（工作者）在里面干活，经评审、`ready`、合并判定走完状态机（工作项）。
+2. 协调者用 `Team` 工具建工作项；工作项有自己的分支与 worktree，子代理（工作者）在里面干活，经评审、`ready`、合并判定走完状态机（工作项）。工作项可以依赖同团队的其他工作项（`dependsOn`，最多 `TEAM_WORK_DEPENDENCIES_MAX`=20，只有 `merged` 算满足，`shared/project-teams.ts:dependencySatisfied`）：依赖未合并时不能开工，最后一个依赖合并时协调者收到 `team_unblocked` 说明（工作项）。
 3. 活动工作项的改动路径被后台定期刷新，跨团队比较重叠；项目设了独占路径时，`ready` 要抢独占锁（重叠与独占路径）。
 4. 协调者被软限制约束，超大输出落盘，`team_status` 行把团队全貌注入它的历史（协调者）。
 5. 团队页（页头状态句、「等你处理」就地批准/回答/验收、对话旁的工作列表与动态、工作项抽屉与退回、成员、「全部暂停」）由团队页读模型和前端提供；任何成员可批团队树里的待决调用（团队页与审批）。
@@ -49,7 +49,7 @@ verified_at: 0baba9c1a
 - `shared/project-teams.ts` 也定义 `TEAM_TRAIT` 与 `hasTeamTrait`（服务端 `narrator-utils.ts` 原样转出，前端会话头部的团队标记靠它），以及事件种类的运行时列表 `TEAM_LEVEL_EVENT_KINDS`、`TEAM_WORK_EVENT_KINDS`、`TEAM_OVERLAP_EVENT_KINDS`、`TEAM_PERSON_DECISION_EVENT_KINDS`（对应类型由它们推出），团队页活动据此给每种事件配文案。
 
 ## 改它时
-- 团队三张表（`project_teams`、`team_work_items`、`team_work_events`）改动要同步 SQLite 与 PG schema，细节见团队与成员、工作项。
+- 团队四张表（`project_teams`、`team_work_items`、`team_work_item_dependencies`、`team_work_events`）改动要同步 SQLite 与 PG schema，细节见团队与成员、工作项。
 - 新增团队写路由：沿用 `project-teams.ts` 顶部的 `requireSqliteProjectMutation`，再做 `loadTeamForAccess` 访问判定（升级与解散在 `teams/team-conversion.ts`，另要求会话 owner 或管理员）。
 - 不变量：成员关系永远取自协调者的叙述者 ACL，不要加团队成员表；服务端不合并、不删分支、不直接跑 `git worktree`；所有团队读取必须带 LIMIT 并且 SQLite 专用；IM 网关不得驱动团队会话（见 [IM 网关](../gateway.md)）。
 

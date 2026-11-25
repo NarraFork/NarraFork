@@ -40,6 +40,7 @@ import {
 	onlookerSeesWaiting,
 	pauseNotice,
 	pauseOrder,
+	queuedLine,
 	returnErrorKey,
 	returnReason,
 	rowLine,
@@ -731,6 +732,63 @@ describe("review fixes", () => {
 		expect(isCoordinator({ actorKind: "agent", actorId: "lead" }, "lead")).toBe(true);
 		expect(isCoordinator({ actorKind: "agent", actorId: "w" }, "lead")).toBe(false);
 		expect(isCoordinator({ actorKind: "person", actorId: "lead" }, "lead")).toBe(false);
+	});
+});
+
+describe("dependencies (D)", () => {
+	const dep = (id: string, state: TeamBoardItem["state"]) => ({ id, title: `Item ${id}`, state });
+
+	test("a queued row says what it waits for: one or two by title, more by count", () => {
+		expect(queuedLine(undefined)).toEqual({
+			key: "queued",
+			values: {},
+			detail: null,
+			tone: "hollow",
+		});
+		expect(queuedLine([dep("a", "merged")]).key).toBe("queued");
+		expect(queuedLine([dep("a", "ready"), dep("b", "merged")])).toEqual({
+			key: "queuedWaitingOne",
+			values: { first: "Item a" },
+			detail: null,
+			tone: "hollow",
+		});
+		expect(queuedLine([dep("a", "in_progress"), dep("b", "queued")]).values).toEqual({
+			first: "Item a",
+			second: "Item b",
+		});
+		expect(
+			queuedLine([dep("a", "queued"), dep("b", "queued"), dep("c", "in_review")]),
+		).toMatchObject({ key: "queuedWaitingMany", values: { count: 3 } });
+		// A cancelled dependency never merges: said first, whatever else waits.
+		expect(queuedLine([dep("a", "queued"), dep("b", "cancelled")])).toMatchObject({
+			key: "queuedBlockedCancelled",
+			values: { title: "Item b" },
+		});
+		// rowLine uses it for queued items only.
+		const row = {
+			item: item({ state: "queued", worker: null, dependsOn: [dep("a", "queued")] }),
+			approval: null,
+		};
+		expect(rowLine(row, null, "main").key).toBe("queuedWaitingOne");
+		const started = { item: item({ dependsOn: [dep("a", "merged")] }), approval: null };
+		expect(rowLine(started, "working", "main").key.startsWith("queued")).toBe(false);
+	});
+
+	test("dependency events have headlines and notes", () => {
+		expect(eventLabelKey("work.dependencies_changed")).toBe("work_dependencies_changed");
+		expect(eventLabelKey("work.unblocked")).toBe("work_unblocked");
+		expect(
+			eventNote({ kind: "work.dependencies_changed", detail: { dependsOn: ["a", "b"] } }),
+		).toEqual({ key: "dependencies", values: { count: 2 } });
+		expect(eventNote({ kind: "work.dependencies_changed", detail: { dependsOn: [] } })).toEqual({
+			key: "dependenciesCleared",
+			values: {},
+		});
+		expect(eventNote({ kind: "work.dependencies_changed", detail: {} })).toBeNull();
+		expect(eventNote({ kind: "work.unblocked", detail: { mergedItem: "a" } })).toEqual({
+			key: "unblocked",
+			values: {},
+		});
 	});
 });
 

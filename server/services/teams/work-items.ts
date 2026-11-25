@@ -17,8 +17,10 @@
  */
 
 import { createHash } from "node:crypto";
+import { realpath, stat } from "node:fs/promises";
 import type { WorktreeRemovalPlan, WorktreeRemovalResult } from "@shared/narrator-worktrees";
 import {
+	dependencyBlockers,
 	TEAM_BRIEF_MAX_BYTES,
 	TEAM_CHECKIN_MAX_MINUTES,
 	TEAM_CHECKIN_MIN_MINUTES,
@@ -38,6 +40,7 @@ import {
 	type TeamEventKind,
 	type TeamOverlapEventKind,
 	type TeamReviewVerdict,
+	type TeamWorkDependencyRef,
 	type TeamWorkDiffStat,
 	type TeamWorkEventKind,
 	type TeamWorkItemState,
@@ -56,6 +59,11 @@ import { eventBus } from "../../lib/event-bus";
 import { hotSafe } from "../../lib/hot-safe";
 import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
+import {
+	caseInsensitiveFileNames,
+	localPathIdentityKey,
+	normalizeRealpathResult,
+} from "../../lib/platform-path";
 import type { NarratorPrincipal } from "../narrator-acl";
 import { type BranchNumstat, teamGit } from "./team-git";
 import { assertKnowledgeFresh } from "./team-knowledge";
@@ -68,6 +76,16 @@ import {
 	readChangedPaths,
 	storeChangedPaths,
 } from "./team-overlap";
+import {
+	assertWorkItemStartable,
+	checkDependencies,
+	deliverUnblockedNotes,
+	normalizeDependencyIds,
+	readDependencies,
+	recordUnblocked,
+	type UnblockedItem,
+	writeDependencies,
+} from "./work-item-dependencies";
 
 type WorkItemRow = typeof teamWorkItems.$inferSelect;
 type Executor = Pick<typeof db, "insert" | "select" | "update">;
@@ -257,6 +275,21 @@ function requireLive(item: WorkItemRow): void {
 		);
 }
 
+/**
+ * A review round or readiness needs an item a worker started: a queued item, or one with no
+ * worker, never went through the start (`attachWorker`, which checks its dependencies, D), and a
+ * review would otherwise move it out of the queue past that check (409 `TEAM_WORK_ITEM_NOT_STARTED`).
+ */
+function requireStarted(item: WorkItemRow, action: "review" | "ready"): void {
+	if (item.state !== "queued" && item.workerNarratorId) return;
+	throw new AppError(
+		`Work item ${item.id} has not started (${item.state === "queued" ? "it is queued" : "no worker is attached"}); ` +
+			`start it with Agent({ workdir }) before ${action === "review" ? "recording a review" : "marking it ready"}`,
+		409,
+		"TEAM_WORK_ITEM_NOT_STARTED",
+	);
+}
+
 /** The recorded worktree path of an item, or null when none is recorded. */
 export function worktreePathOf(item: Pick<WorkItemRow, "worktreeResourceId">): string | null {
 	if (!item.worktreeResourceId) return null;
@@ -348,9 +381,20 @@ export interface WorkItemView {
 	worker: string | null;
 	reviewRounds: number;
 	lastReview: TeamReviewVerdict | null;
+	/** D: the items this one waits for to merge (ids, oldest first). */
+	dependsOn: string[];
+	/** D: those of them not merged yet; the item cannot start while any is left. */
+	blockedBy: string[];
 }
 
-export function viewWorkItem(item: WorkItemRow): WorkItemView {
+/**
+ * The item as the tool returns it. `dependencies` is its dependency list when the caller read it
+ * for a whole page ({@link readDependencies}); otherwise it is read here (one indexed query).
+ */
+export function viewWorkItem(
+	item: WorkItemRow,
+	dependencies: readonly TeamWorkDependencyRef[] = readDependencies([item.id]).get(item.id) ?? [],
+): WorkItemView {
 	return {
 		id: item.id,
 		title: item.title,
@@ -363,6 +407,8 @@ export function viewWorkItem(item: WorkItemRow): WorkItemView {
 		worker: item.workerNarratorId,
 		reviewRounds: item.reviewRounds,
 		lastReview: item.lastReview,
+		dependsOn: dependencies.map((dependency) => dependency.id),
+		blockedBy: dependencyBlockers(dependencies).map((dependency) => dependency.id),
 	};
 }
 
@@ -392,8 +438,9 @@ export function listWorkItems(coordinatorId: string): {
 					.all()
 			: [];
 	const rows = [...open.slice(0, TEAM_WORK_LIST_LIMIT), ...done.slice(0, room)];
+	const dependencies = readDependencies(rows.map((row) => row.id));
 	return {
-		items: rows.map(viewWorkItem),
+		items: rows.map((row) => viewWorkItem(row, dependencies.get(row.id) ?? [])),
 		more: open.length > TEAM_WORK_LIST_LIMIT || done.length > room,
 	};
 }
@@ -442,6 +489,8 @@ export interface CreateWorkItemInput {
 	branchHint?: string;
 	/** `isolated` for `Agent({ isolation: "worktree" })`; default kind otherwise. */
 	kind?: string;
+	/** D: ids of items of the same team this one waits for to merge before it may start. */
+	dependsOn?: readonly string[];
 	/** Who asked: the coordinator agent (its id) — the person behind its turn is `principal`. */
 	actor: WorkActor;
 	principal: NarratorPrincipal;
@@ -464,6 +513,11 @@ export async function createWorkItem(input: CreateWorkItemInput): Promise<WorkIt
 	const id = generateId();
 	const branchName = workItemBranchName(id, title, input.branchHint);
 	const kind = input.kind ?? TEAM_DEFAULT_WORK_KIND;
+	// D: checked before anything is made, so a refused set leaves no worktree behind.
+	const dependsOn = normalizeDependencyIds(input.dependsOn ?? []);
+	if (dependsOn.length > 0 && kind === TEAM_ISOLATED_WORK_KIND)
+		throw new ValidationError("An isolated work item starts at once; it cannot wait for others");
+	checkDependencies(db, team.teamId, null, team.baseBranch, dependsOn);
 	const port = await ports();
 	const created = await port.createWorktree({
 		coordinatorId: team.teamId,
@@ -527,6 +581,15 @@ export async function createWorkItem(input: CreateWorkItemInput): Promise<WorkIt
 			},
 			at: now,
 		});
+		if (dependsOn.length > 0)
+			writeDependencies(tx, {
+				teamId: team.teamId,
+				itemId: id,
+				// Again inside the transaction: a target may have been cancelled meanwhile.
+				refs: checkDependencies(tx, team.teamId, null, team.baseBranch, dependsOn),
+				actor: input.actor,
+				at: now,
+			});
 	});
 	eventBus.emit({ type: "team:communication_changed", teamId: team.teamId });
 	logger.info("Team work item created", { teamId: team.teamId, workItemId: id, branchName });
@@ -535,7 +598,12 @@ export async function createWorkItem(input: CreateWorkItemInput): Promise<WorkIt
 
 /**
  * Record the first-level subagent working on an item (the one an `Agent` call just created in
- * its worktree). An item already worked on keeps its worker; a queued one starts.
+ * its worktree); a queued item starts. Attaching the same worker again changes nothing. Refused
+ * (the `Agent` call then fails and its subagent is archived before it runs, `subagent-runner.ts`):
+ * - another worker is attached already (409 `TEAM_WORK_ITEM_CHANGED`: a concurrent call won);
+ * - a dependency has not merged (D: 409 `TEAM_WORK_ITEM_BLOCKED`, checked in the transaction
+ *   whenever the item has no worker yet, whatever its state; the `Agent` tool checks it before
+ *   creating the subagent as well).
  */
 export function attachWorker(
 	teamId: string,
@@ -545,9 +613,16 @@ export function attachWorker(
 ): void {
 	const item = requireWorkItem(teamId, itemId);
 	requireLive(item);
-	if (item.workerNarratorId) return;
+	if (item.workerNarratorId === workerNarratorId) return;
+	if (item.workerNarratorId)
+		throw new AppError(
+			`Work item ${item.id} already has a worker (${item.workerNarratorId}); this agent was not attached`,
+			409,
+			"TEAM_WORK_ITEM_CHANGED",
+		);
 	const now = new Date().toISOString();
 	db.transaction((tx) => {
+		assertWorkItemStartable(item.id, tx);
 		updateItem(
 			tx,
 			item,
@@ -570,26 +645,100 @@ export function attachWorker(
 	eventBus.emit({ type: "team:communication_changed", teamId });
 }
 
-/** The live item whose recorded worktree is exactly `path`, for an `Agent({ workdir })`. */
-export function workItemAtWorktree(teamId: string, path: string): WorkItemRow | null {
-	const row = db
+/** How long resolving an `Agent` workdir's real path may take before its spelling alone is used. */
+const WORKDIR_REALPATH_TIMEOUT_MS = 2_000;
+/** Most live items of a team compared by a case-folded key when the filesystem ignores case. */
+const WORKTREE_CASE_SCAN_MAX = 500;
+
+/** The real path of `path`, or null when it cannot be read within the timeout. */
+async function realWorkdir(path: string, platform: NodeJS.Platform): Promise<string | null> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			realpath(path).then((real) => normalizeRealpathResult(real, platform)),
+			new Promise<null>((resolve) => {
+				timer = setTimeout(() => resolve(null), WORKDIR_REALPATH_TIMEOUT_MS);
+			}),
+		]);
+	} catch {
+		return null;
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+/**
+ * The live item whose recorded worktree is the directory `path` names, for an
+ * `Agent({ workdir })`: the path as spelled or its real path (a symlink, `..`, or the case the
+ * filesystem stores), else — on a platform whose filesystem ignores case (`platform`, Windows and
+ * macOS) — a recorded path equal to either once case-folded. Linux stays case-sensitive. Missing
+ * it would start the agent in the worktree without the item's start gate.
+ */
+export async function workItemAtWorktree(
+	teamId: string,
+	path: string,
+	platform: NodeJS.Platform = process.platform,
+	sameDirectory: (a: string, b: string) => Promise<boolean> = sameDirectoryOnDisk,
+): Promise<WorkItemRow | null> {
+	const real = await realWorkdir(path, platform);
+	const candidates = [...new Set(real ? [path, real] : [path])];
+	const live = and(
+		eq(teamWorkItems.teamId, teamId),
+		notInArray(teamWorkItems.state, [...TEAM_WORK_ITEM_FINISHED_STATES]),
+		eq(narratorWorktreeResources.deviceId, "local"),
+	);
+	const exact = db
 		.select({ item: teamWorkItems })
 		.from(teamWorkItems)
 		.innerJoin(
 			narratorWorktreeResources,
 			eq(narratorWorktreeResources.id, teamWorkItems.worktreeResourceId),
 		)
-		.where(
-			and(
-				eq(teamWorkItems.teamId, teamId),
-				notInArray(teamWorkItems.state, [...TEAM_WORK_ITEM_FINISHED_STATES]),
-				eq(narratorWorktreeResources.deviceId, "local"),
-				eq(narratorWorktreeResources.worktreePath, path),
-			),
-		)
+		.where(and(live, inArray(narratorWorktreeResources.worktreePath, candidates)))
 		.limit(1)
 		.get();
-	return row?.item ?? null;
+	if (exact) return exact.item;
+	if (!caseInsensitiveFileNames(platform)) return null;
+	const keys = new Set(candidates.map((candidate) => localPathIdentityKey(candidate, platform)));
+	const rows = db
+		.select({ item: teamWorkItems, path: narratorWorktreeResources.worktreePath })
+		.from(teamWorkItems)
+		.innerJoin(
+			narratorWorktreeResources,
+			eq(narratorWorktreeResources.id, teamWorkItems.worktreeResourceId),
+		)
+		.where(live)
+		.orderBy(asc(teamWorkItems.createdAt), asc(teamWorkItems.id))
+		.limit(WORKTREE_CASE_SCAN_MAX)
+		.all();
+	// The folded key only shortlists: a case-sensitive volume on Windows or macOS can hold two
+	// distinct directories whose names differ only by case, so a match must be the same directory
+	// on disk (device and inode) as the one asked for.
+	for (const row of rows) {
+		if (!keys.has(localPathIdentityKey(row.path, platform))) continue;
+		if (await sameDirectory(path, row.path)) return row.item;
+	}
+	return null;
+}
+
+/** Whether two paths name the same directory on disk (device and inode); false when unsure. */
+async function sameDirectoryOnDisk(a: string, b: string): Promise<boolean> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		const both = await Promise.race([
+			Promise.all([stat(a, { bigint: true }), stat(b, { bigint: true })]),
+			new Promise<null>((resolve) => {
+				timer = setTimeout(() => resolve(null), WORKDIR_REALPATH_TIMEOUT_MS);
+			}),
+		]);
+		if (!both) return false;
+		const [left, right] = both;
+		return left.isDirectory() && left.dev === right.dev && left.ino === right.ino;
+	} catch {
+		return false;
+	} finally {
+		clearTimeout(timer);
+	}
 }
 
 // ── Review, ready, cancel ───────────────────────────────────────────────────
@@ -620,6 +769,7 @@ export async function recordReview(
 	const team = requireActiveTeam(input.coordinatorId);
 	const item = requireWorkItem(team.teamId, input.itemId);
 	requireLive(item);
+	requireStarted(item, "review");
 	if (!Number.isSafeInteger(input.findings) || input.findings < 0)
 		throw new ValidationError("findings must be a non-negative integer");
 	const summary = input.summary?.trim() || null;
@@ -700,6 +850,7 @@ export async function markReady(input: {
 	const team = requireActiveTeam(input.coordinatorId);
 	const item = requireWorkItem(team.teamId, input.itemId);
 	requireLive(item);
+	requireStarted(item, "ready");
 	if (item.lastReview !== "clear")
 		throw new AppError(
 			item.reviewRounds === 0
@@ -1011,6 +1162,45 @@ export function cancelWorkItem(input: {
 }
 
 /**
+ * Replace a queued item's dependencies (D, `Team` `work.update`; `[]` clears them). Only while
+ * it has not started (409 `TEAM_WORK_ITEM_NOT_QUEUED`): a started item already passed the gate.
+ * The set is checked (same team and base, not cancelled, no cycle, at most 20) and written with its
+ * `work.dependencies_changed` event in one transaction that also bumps the item's `updated_at`
+ * under the usual state + `updated_at` condition.
+ */
+export function setWorkItemDependencies(input: {
+	coordinatorId: string;
+	itemId: string;
+	dependsOn: readonly string[];
+	actor: WorkActor;
+}): { item: WorkItemRow; changed: boolean } {
+	const team = requireActiveTeam(input.coordinatorId);
+	const item = requireWorkItem(team.teamId, input.itemId);
+	if (item.state !== "queued" || item.workerNarratorId !== null)
+		throw new AppError(
+			`Work item ${item.id} is ${item.state}${item.workerNarratorId ? " with a worker" : ""}; dependencies change only while an item is queued and not started`,
+			409,
+			"TEAM_WORK_ITEM_NOT_QUEUED",
+		);
+	const ids = normalizeDependencyIds(input.dependsOn);
+	const now = new Date().toISOString();
+	let changed = false;
+	db.transaction((tx) => {
+		const refs = checkDependencies(tx, team.teamId, item.id, item.baseRef, ids);
+		changed = writeDependencies(tx, {
+			teamId: team.teamId,
+			itemId: item.id,
+			refs,
+			actor: input.actor,
+			at: now,
+		});
+		if (changed) updateItem(tx, item, {}, now);
+	});
+	if (changed) eventBus.emit({ type: "team:communication_changed", teamId: team.teamId });
+	return { item: requireWorkItem(team.teamId, item.id), changed };
+}
+
+/**
  * The background pass found an item's head inside its base branch (X): the work landed, so the
  * item is merged — its exclusive lock is released (in `updateItem`), its stored changed paths
  * cleared, and `work.merged` recorded as the system's with `detectedBy: "ancestry"`. The caller
@@ -1028,6 +1218,7 @@ export function markMergedByAncestry(input: {
 }): boolean {
 	const now = new Date().toISOString();
 	let merged = false;
+	let unblocked: UnblockedItem[] = [];
 	let changedTeamId: string | null = null;
 	try {
 		db.transaction((tx) => {
@@ -1067,6 +1258,8 @@ export function markMergedByAncestry(input: {
 				detail: { head: input.head, base: input.base, detectedBy: "ancestry", from: item.state },
 				at: now,
 			});
+			// D: the queued items that waited for this one and now wait for nothing.
+			unblocked = recordUnblocked(tx, item.id, now);
 		});
 	} catch (error) {
 		if (error instanceof AppError && error.code === "TEAM_WORK_ITEM_CHANGED") return false;
@@ -1075,6 +1268,10 @@ export function markMergedByAncestry(input: {
 	if (changedTeamId) eventBus.emit({ type: "team:communication_changed", teamId: changedTeamId });
 	if (merged)
 		logger.info("Team work item merged (its head is in the base)", { workItemId: input.itemId });
+	if (unblocked.length > 0)
+		void trackTeamLifecycleWork(deliverUnblockedNotes(unblocked)).catch((error) =>
+			logger.warn("Team unblock notes failed", { error: String(error) }),
+		);
 	return merged;
 }
 
@@ -1375,7 +1572,8 @@ export async function settleIsolatedWorkItem(
  * existed). An isolated item is settled like any isolated item — an untouched worktree is
  * removed and the item cancelled — and otherwise stays in progress with a `work.start_failed`
  * event. An item the call only attached to (an `Agent({ workdir })` into a queued item) drops
- * that worker and goes back to the queue.
+ * that worker and goes back to the queue. An item another worker holds (the call's attach was
+ * refused because a concurrent call attached first) is left alone.
  */
 export async function settleFailedStart(
 	teamId: string,
@@ -1391,6 +1589,8 @@ export async function settleFailedStart(
 		.limit(1)
 		.get();
 	if (!item || isFinished(item.state)) return "none";
+	// Another worker holds the item (this call's attach was refused): it is that worker's now.
+	if (item.workerNarratorId && item.workerNarratorId !== subagentId) return "none";
 	if (item.kind === TEAM_ISOLATED_WORK_KIND) {
 		const settled = item.worktreeResourceId ? await settleItem(item, { retry: false }) : "kept";
 		if (settled !== "cleaned")

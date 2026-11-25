@@ -171,7 +171,9 @@ export interface RunSubagentInput {
 	) => void;
 	/**
 	 * Told the subagent's id as soon as it exists, before its run starts (a team work item records
-	 * its worker here, so the run's end can find the item). A failure is logged, never fatal.
+	 * its worker here, so the run's end can find the item). A throw refuses the run: the subagent
+	 * is archived before it ever runs and the error is the call's (a refused worker attach must
+	 * never leave a subagent working unrecorded in the item's worktree).
 	 */
 	onCreated?: (subagentId: string) => void;
 }
@@ -309,16 +311,8 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 		const subagentId = subagent.id;
 		unstartedSubagentId = subagentId;
 		updateLease.setNarratorId(subagentId);
-		if (input.onCreated) {
-			try {
-				input.onCreated(subagentId);
-			} catch (error) {
-				logger.warn("Subagent creation hook failed", {
-					subagentId,
-					error: error instanceof Error ? error.message : String(error),
-				});
-			}
-		}
+		// A refusal propagates: the catch below archives the unstarted subagent.
+		input.onCreated?.(subagentId);
 		// Validates the pool now (a refused model fails the call before any run starts).
 		const { inheritance } = await resolveSubagentModelForRun(subagent, userId, undefined, {
 			signal: input.signal,

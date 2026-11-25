@@ -16,7 +16,9 @@
  *     remounted; the page is about one team; on a phone the header carries the menu button so
  *     nothing floats over it;
  *   - an archived team says so and offers no "pause all"; at 360 px nothing scrolls sideways, in
- *     light and dark; the project page's teams section creates a team.
+ *     light and dark; the project page's teams section creates a team;
+ *   - dependencies (D): a blocked queued row names what it waits for, the drawer lists the
+ *     dependencies (a title opens that item) and its dependents, and warns about a cancelled one.
  *
  * Set `TEAMS_P4_SHOTS` to a directory to keep screenshots.
  */
@@ -35,6 +37,7 @@ import {
 	narratorToolCalls,
 	projects,
 	teamWorkEvents,
+	teamWorkItemDependencies,
 	teamWorkItems,
 	users,
 } from "../../../server/db/schema";
@@ -1143,5 +1146,104 @@ test("the project page's teams section creates a team", async () => {
 		expect(await call(reader.page, (f) => f.count("[data-testid=new-team]"))).toBe(0);
 	} finally {
 		await reader.page.close();
+	}
+}, 60_000);
+
+test("dependencies: blocked rows say what they wait for; the drawer lists and links them", async () => {
+	const plan = await createTeam(
+		{ projectId, name: "Plan crew" },
+		{ userId: alice, isAdmin: false },
+	);
+	const seed = async (title: string, state: string) => {
+		const id = generateId();
+		const at = tick();
+		await db.insert(teamWorkItems).values({
+			id,
+			teamId: plan.id,
+			projectId,
+			title,
+			state: state as "queued",
+			createdAt: at,
+			updatedAt: at,
+		});
+		return id;
+	};
+	const depend = (itemId: string, dependsOnItemId: string) =>
+		db
+			.insert(teamWorkItemDependencies)
+			.values({ itemId, dependsOnItemId, teamId: plan.id, createdAt: tick() });
+	const schemaId = await seed("Schema", "in_progress");
+	const apiId = await seed("API", "queued");
+	const oldId = await seed("Old plan", "cancelled");
+	const pageId = await seed("Page", "queued");
+	await depend(apiId, schemaId);
+	await depend(pageId, oldId);
+	const row = (id: string) => `[data-testid=team-work-row][data-item-id="${id}"]`;
+	const { page, errors } = await openPage(alice, { width: 1440, height: 900 });
+	try {
+		await call(page, (f, p: string, t: string) => f.openTeam(p, t), projectId, plan.id);
+		await until(page, "rows", (f, r: string) => f.count(r) === 1, 10_000, row(pageId));
+		expect(
+			await call(page, (f, r: string) => f.text(`${r} [data-testid=team-work-line]`), row(apiId)),
+		).toBe("Queued · waiting for “Schema” to merge");
+		expect(
+			await call(
+				page,
+				(f, r: string) => f.attr(`${r} [data-testid=team-work-line]`, "data-line"),
+				row(pageId),
+			),
+		).toBe("queuedBlockedCancelled");
+
+		// The drawer of a blocked item: its dependency with its state, and when it starts.
+		await call(page, (f, r: string) => f.click(r), row(apiId));
+		await until(page, "API drawer", (f) => f.text("[data-testid=team-drawer-title]") === "API");
+		await until(
+			page,
+			"dependencies",
+			(f) => f.count("[data-testid=team-drawer-dependencies]") === 1,
+		);
+		expect(
+			await call(page, (f) =>
+				f.attr(
+					"[data-testid=team-drawer-dependencies] [data-testid=team-dependency]",
+					"data-state",
+				),
+			),
+		).toBe("in_progress");
+		expect(await call(page, (f) => f.count("[data-testid=team-dependency-cancelled]"))).toBe(0);
+		await shot(page, "desktop-light-dependencies");
+		// A dependency's title opens that item, which lists API under 被依赖.
+		await call(page, (f) =>
+			f.click("[data-testid=team-drawer-dependencies] [data-testid=team-dependency] button"),
+		);
+		await until(
+			page,
+			"Schema drawer",
+			(f) => f.text("[data-testid=team-drawer-title]") === "Schema",
+		);
+		await until(page, "dependents", (f) => f.count("[data-testid=team-drawer-dependents]") === 1);
+		expect(await call(page, (f) => f.text("[data-testid=team-drawer-dependents]"))).toContain(
+			"API",
+		);
+		expect(await call(page, (f) => f.count("[data-testid=team-drawer-dependencies]"))).toBe(0);
+
+		// A cancelled dependency never merges: the drawer says so, in either language.
+		await call(page, (f, r: string) => f.click(r), row(pageId));
+		await until(page, "Page drawer", (f) => f.text("[data-testid=team-drawer-title]") === "Page");
+		await until(page, "warning", (f) => f.count("[data-testid=team-dependency-cancelled]") === 1);
+		expect(await call(page, (f) => f.text("[data-testid=team-dependency-cancelled]"))).toContain(
+			"“Old plan” was cancelled",
+		);
+		await call(page, (f) => f.setLanguage("zh-CN"));
+		await until(page, "Chinese", (f) =>
+			(f.text("[data-testid=team-dependency-cancelled]") ?? "").includes("「Old plan」已取消"),
+		);
+		expect(
+			await call(page, (f, r: string) => f.text(`${r} [data-testid=team-work-line]`), row(apiId)),
+		).toBe("排队 · 等「Schema」合并");
+		await call(page, (f) => f.setLanguage("en"));
+		expect(errors).toEqual([]);
+	} finally {
+		await page.close();
 	}
 }, 60_000);

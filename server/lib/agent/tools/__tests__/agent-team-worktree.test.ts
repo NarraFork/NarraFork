@@ -7,9 +7,9 @@
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { eq } from "drizzle-orm";
 import { db, sqlite } from "../../../../db";
 import { narratorWorktreeResources, teamWorkEvents, teamWorkItems } from "../../../../db/schema";
@@ -21,6 +21,10 @@ const runCalls: Array<Record<string, unknown>> = [];
 let failRun = false;
 /** Fail after the subagent row exists (model or alias resolution failing late). */
 let failAfterCreate = false;
+/** Runs once the subagent row exists, before the creation hook (a concurrent change). */
+let beforeCreated: (() => void) | null = null;
+/** Subagents the stubbed runner archived because the creation hook refused them. */
+const archived: string[] = [];
 let agentTool: typeof import("../task").agentTool;
 let realNarratorSubagent: typeof import("@server/services/narrator-subagent");
 let realCommunication: typeof import("@server/services/agent-communication");
@@ -57,7 +61,15 @@ beforeAll(async () => {
 				VALUES (?, 'subagent', ?, ?, ?, ?, ?)`,
 				[id, id, LEAD, LEAD, NOW, NOW],
 			);
-			(input.onCreated as ((id: string) => void) | undefined)?.(id);
+			beforeCreated?.();
+			// As the runner does: a refusing creation hook archives the unstarted subagent and
+			// fails the call.
+			try {
+				(input.onCreated as ((id: string) => void) | undefined)?.(id);
+			} catch (error) {
+				archived.push(id);
+				throw error;
+			}
 			if (failAfterCreate) throw new Error("alias registration failed");
 			return `<background_task_id>${id}</background_task_id>`;
 		}),
@@ -89,6 +101,8 @@ beforeEach(async () => {
 	sendStatus = "started";
 	failRun = false;
 	failAfterCreate = false;
+	beforeCreated = null;
+	archived.length = 0;
 	temporary = await mkdtemp(join(tmpdir(), "nf-agent-team-"));
 	source = join(temporary, "repo");
 	await mkdir(join(source, ".worktrees"), { recursive: true });
@@ -162,6 +176,7 @@ beforeEach(async () => {
 afterEach(async () => {
 	for (const table of [
 		"team_work_events",
+		"team_work_item_dependencies",
 		"team_work_items",
 		"project_teams",
 		"narrator_worktree_resources",
@@ -267,6 +282,127 @@ describe("Agent with a team work item", () => {
 		expect(only()).toMatchObject({ state: "in_progress", workerNarratorId: "p3a-worker-1" });
 	});
 
+	test("D: a queued item whose dependency has not merged does not start (409 TEAM_WORK_ITEM_BLOCKED)", async () => {
+		const { teamTool } = await import("../team");
+		const first = JSON.parse(
+			(await teamTool.execute({ action: "work.create", title: "Schema" }, ctx())).output,
+		);
+		const second = JSON.parse(
+			(
+				await teamTool.execute(
+					{ action: "work.create", title: "API", dependsOn: [first.item.id] },
+					ctx(),
+				)
+			).output,
+		);
+		expect(second.item.dependsOn).toEqual([first.item.id]);
+		expect(second.item.blockedBy).toEqual([first.item.id]);
+		expect(second.nextAction).toContain("stays queued");
+
+		const refused = await agentTool.execute(
+			{ workdir: second.item.worktree, prompt: "go", subagent_type: "worker" },
+			ctx(),
+		);
+		expect(refused.isError).toBe(true);
+		expect(refused.output).toContain("TEAM_WORK_ITEM_BLOCKED");
+		expect(refused.output).toContain('"Schema"');
+		// Nothing was created or started.
+		expect(runCalls).toHaveLength(0);
+		const blocked = db
+			.select()
+			.from(teamWorkItems)
+			.where(eq(teamWorkItems.id, second.item.id))
+			.get();
+		expect(blocked).toMatchObject({ state: "queued", workerNarratorId: null });
+		// The service gate itself says 409 (the tool reports its code).
+		let status: number | undefined;
+		try {
+			items.attachWorker(LEAD, second.item.id, "p3a-nobody", { kind: "agent", id: LEAD });
+		} catch (error) {
+			status = (error as { statusCode?: number }).statusCode;
+		}
+		expect(status).toBe(409);
+		// Out of the queue with no worker, it is checked all the same.
+		sqlite.run("UPDATE team_work_items SET state = 'in_review' WHERE id = ?", [second.item.id]);
+		const unqueued = await agentTool.execute(
+			{ workdir: second.item.worktree, prompt: "go", subagent_type: "worker" },
+			ctx(),
+		);
+		expect(unqueued.output).toContain("TEAM_WORK_ITEM_BLOCKED");
+		expect(runCalls).toHaveLength(0);
+		sqlite.run("UPDATE team_work_items SET state = 'queued' WHERE id = ?", [second.item.id]);
+
+		// Once the dependency is merged, the same call starts it.
+		sqlite.run("UPDATE team_work_items SET state = 'merged' WHERE id = ?", [first.item.id]);
+		await agentTool.execute(
+			{ workdir: second.item.worktree, prompt: "go", subagent_type: "worker" },
+			ctx(),
+		);
+		expect(runCalls).toHaveLength(1);
+		expect(
+			db.select().from(teamWorkItems).where(eq(teamWorkItems.id, second.item.id)).get(),
+		).toMatchObject({ state: "in_progress", workerNarratorId: "p3a-worker-1" });
+	});
+
+	test("D: another spelling of an item's worktree reaches the same start gate", async () => {
+		const { teamTool } = await import("../team");
+		const first = JSON.parse(
+			(await teamTool.execute({ action: "work.create", title: "Schema" }, ctx())).output,
+		);
+		const second = JSON.parse(
+			(
+				await teamTool.execute(
+					{ action: "work.create", title: "API", dependsOn: [first.item.id] },
+					ctx(),
+				)
+			).output,
+		);
+		const recorded: string = second.item.worktree;
+		// A symlink to the worktree names the same directory: refused at the gate like the path.
+		const alias = join(temporary, "alias");
+		await symlink(recorded, alias, "dir");
+		for (const workdir of [recorded, alias, `${alias}/`]) {
+			const refused = await agentTool.execute(
+				{ workdir, prompt: "go", subagent_type: "worker" },
+				ctx(),
+			);
+			expect(refused.output).toContain("TEAM_WORK_ITEM_BLOCKED");
+		}
+		expect(runCalls).toHaveLength(0);
+		// Another case finds the item where the filesystem ignores case and both spellings are the
+		// same directory on disk; never on Linux.
+		const upper = recorded.toUpperCase();
+		const sameDirectory = async () => true;
+		for (const platform of ["win32", "darwin"] as const)
+			expect((await items.workItemAtWorktree(LEAD, upper, platform, sameDirectory))?.id).toBe(
+				second.item.id,
+			);
+		expect(await items.workItemAtWorktree(LEAD, upper, "linux", sameDirectory)).toBeNull();
+		// A case-sensitive volume on Windows or macOS can hold a different directory whose name
+		// differs only by case: the folded key alone is not enough.
+		const distinct = async () => false;
+		for (const platform of ["win32", "darwin"] as const)
+			expect(await items.workItemAtWorktree(LEAD, upper, platform, distinct)).toBeNull();
+		// The real check: a separate directory with the same name in another case is not the
+		// worktree (this runner's filesystem is case-sensitive).
+		const sibling = join(dirname(recorded), basename(recorded).toUpperCase());
+		await mkdir(sibling, { recursive: true });
+		for (const platform of ["win32", "darwin"] as const)
+			expect(await items.workItemAtWorktree(LEAD, sibling, platform)).toBeNull();
+
+		// Once it may start, the worker runs in the worktree as recorded.
+		sqlite.run("UPDATE team_work_items SET state = 'merged' WHERE id = ?", [first.item.id]);
+		const started = await agentTool.execute(
+			{ workdir: alias, prompt: "go", subagent_type: "worker" },
+			ctx(),
+		);
+		expect(started.isError).toBeFalsy();
+		expect(runCalls[0]?.cwd).toBe(recorded);
+		expect(
+			db.select().from(teamWorkItems).where(eq(teamWorkItems.id, second.item.id)).get(),
+		).toMatchObject({ state: "in_progress", workerNarratorId: "p3a-worker-1" });
+	});
+
 	test("refused for other sessions and with a workdir; a failed start leaves nothing behind", async () => {
 		const other = await agentTool.execute(
 			{ isolation: "worktree", title: "x", prompt: "p" },
@@ -330,6 +466,78 @@ describe("an Agent start that fails after its subagent exists", () => {
 			.all()
 			.map((row) => row.kind);
 		expect(kinds).toEqual(["work.created", "work.started", "work.start_failed"]);
+	});
+});
+
+describe("an Agent start whose worker attach is refused", () => {
+	const rival = () =>
+		sqlite.run(
+			`INSERT INTO narrators (id, type, title, parent_narrator_id, acl_root_narrator_id, created_at, updated_at)
+			VALUES ('p3a-rival', 'subagent', 'rival', ?, ?, ?, ?)`,
+			[LEAD, LEAD, NOW, NOW],
+		);
+	const create = (title: string, kind?: string) =>
+		items.createWorkItem({
+			coordinatorId: LEAD,
+			title,
+			kind,
+			actor: { kind: "agent", id: LEAD },
+			principal: { userId: "p3a-user", isAdmin: false },
+			signal: new AbortController().signal,
+		});
+
+	test("another worker attached first: the call fails and leaves that worker's item alone", async () => {
+		const { TEAM_ISOLATED_WORK_KIND } = await import("@shared/project-teams");
+		// A queued item, and an isolated one whose first start failed (kept, no worker).
+		for (const kind of [undefined, TEAM_ISOLATED_WORK_KIND]) {
+			const item = await create(`Contested ${kind ?? "queued"}`, kind);
+			const path = items.worktreePathOf(item) ?? "";
+			rival();
+			beforeCreated = () =>
+				items.attachWorker(LEAD, item.id, "p3a-rival", { kind: "agent", id: LEAD });
+			const refused = await agentTool.execute({ workdir: path, prompt: "go" }, ctx());
+			expect(refused.isError).toBe(true);
+			expect(refused.output).toContain("already has a worker");
+			expect(archived).toEqual([`p3a-worker-${runCalls.length}`]);
+			const row = db.select().from(teamWorkItems).where(eq(teamWorkItems.id, item.id)).get();
+			expect(row).toMatchObject({ state: "in_progress", workerNarratorId: "p3a-rival" });
+			// Not settled as a failed start: the worktree stays for the rival.
+			expect(row?.worktreeResourceId).not.toBeNull();
+			expect(existsSync(path)).toBe(true);
+			const kinds = sqlite
+				.query<{ kind: string }, [string]>(
+					"SELECT kind FROM team_work_events WHERE work_item_id = ? ORDER BY rowid",
+				)
+				.all(item.id)
+				.map((event) => event.kind);
+			expect(kinds).toEqual(["work.created", "work.started"]);
+			sqlite.run("DELETE FROM team_work_events");
+			sqlite.run("DELETE FROM team_work_items");
+			sqlite.run("DELETE FROM narrators WHERE id LIKE 'p3a-worker-%' OR id = 'p3a-rival'");
+			archived.length = 0;
+		}
+	});
+
+	test("a dependency added after the call's check: the call fails, the item stays queued", async () => {
+		const first = await create("Schema");
+		const second = await create("API");
+		beforeCreated = () =>
+			items.setWorkItemDependencies({
+				coordinatorId: LEAD,
+				itemId: second.id,
+				dependsOn: [first.id],
+				actor: { kind: "agent", id: LEAD },
+			});
+		const refused = await agentTool.execute(
+			{ workdir: items.worktreePathOf(second) ?? "", prompt: "go" },
+			ctx(),
+		);
+		expect(refused.isError).toBe(true);
+		expect(refused.output).toContain('"Schema"');
+		expect(archived).toEqual(["p3a-worker-1"]);
+		expect(
+			db.select().from(teamWorkItems).where(eq(teamWorkItems.id, second.id)).get(),
+		).toMatchObject({ state: "queued", workerNarratorId: null });
 	});
 });
 

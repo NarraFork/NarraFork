@@ -14,6 +14,7 @@ import type {
 	TeamMembersResponse,
 	TeamPageSummary,
 	TeamPendingApproval,
+	TeamWorkItemDetail,
 } from "@shared/project-teams";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
@@ -38,7 +39,7 @@ import { TeamCoordinatorHeader } from "./TeamCoordinatorHeader";
 import { TeamHeader } from "./TeamHeader";
 import { TeamMembersPanel } from "./TeamMembers";
 import { TeamReadOnlyStart, TeamStart } from "./TeamStart";
-import { ReviewFindings } from "./TeamWorkDrawer";
+import { DependencySections, ReviewFindings } from "./TeamWorkDrawer";
 import { TeamWorkList } from "./TeamWorkList";
 import { attentionEntries, statusSentence, teamPageMode } from "./team-page-model";
 
@@ -893,6 +894,155 @@ describe("questions keep their context", () => {
 			expect(text).toContain("mian");
 			expect(text).not.toContain("teams.page");
 		}
+	});
+});
+
+describe("dependencies (D)", () => {
+	const dep = (id: string, title: string, state: TeamBoardItem["state"]) => ({ id, title, state });
+	const rows = (items: TeamBoardItem[], lng: "en" | "zh-CN") =>
+		render(
+			<TeamWorkList
+				projectId="p"
+				teamId="lead"
+				summary={summary()}
+				items={items}
+				approvals={[]}
+				stats={{}}
+				base="main"
+				loading={false}
+				failed={false}
+				hasMore={false}
+				onLoadMore={noop}
+				highlightId={null}
+				mode={teamPageMode(summary())}
+				archiving={false}
+				onArchive={noop}
+				onDisband={noop}
+				onOpenItem={noop}
+			/>,
+			new QueryClient(),
+			lng,
+		);
+
+	test("a blocked queued row names what it waits for, or how many; a cancelled one says so", async () => {
+		const queued = (id: string, dependsOn: TeamBoardItem["dependsOn"]) =>
+			item({ id, state: "queued", worker: null, dependsOn });
+		const zhHtml = await rows(
+			[
+				queued("one", [dep("a", "数据表", "in_progress")]),
+				queued("two", [dep("a", "数据表", "ready"), dep("b", "接口", "queued")]),
+				queued("many", [
+					dep("a", "A", "queued"),
+					dep("b", "B", "queued"),
+					dep("c", "C", "queued"),
+					dep("d", "D", "merged"),
+				]),
+				queued("gone", [dep("x", "旧方案", "cancelled")]),
+				queued("free", [dep("d", "D", "merged")]),
+			],
+			"zh-CN",
+		);
+		expect(zhHtml).toContain("排队 · 等「数据表」合并");
+		expect(zhHtml).toContain("排队 · 等「数据表」「接口」合并");
+		expect(zhHtml).toContain("排队 · 等 3 项合并");
+		expect(zhHtml).toContain("排队 · 依赖「旧方案」已取消");
+		const enHtml = await rows(
+			[queued("two", [dep("a", "Schema", "queued"), dep("b", "API", "queued")])],
+			"en",
+		);
+		expect(enHtml).toContain("Queued · waiting for “Schema” and “API” to merge");
+	});
+
+	const detail = (patch: Partial<TeamWorkItemDetail> = {}): TeamWorkItemDetail => ({
+		item: item({
+			id: "w2",
+			state: "queued",
+			worker: null,
+			dependsOn: [dep("a", "数据表", "merged"), dep("b", "旧方案", "cancelled")],
+		}),
+		base: "main",
+		aheadBy: 0,
+		stat: null,
+		files: [],
+		filesMore: false,
+		diffAvailable: false,
+		reviews: [],
+		events: [],
+		eventsMore: false,
+		canReturn: false,
+		dependents: [dep("c", "页面", "queued")],
+		dependentsMore: true,
+		...patch,
+	});
+
+	test("the drawer lists dependencies with their state, warns about a cancelled one, and lists dependents", async () => {
+		const opened: string[] = [];
+		const html = await render(
+			<DependencySections detail={detail()} onOpenItem={(id) => opened.push(id)} />,
+			new QueryClient(),
+			"zh-CN",
+		);
+		expect(html).toContain('data-testid="team-drawer-dependencies"');
+		expect(html).toContain("依赖");
+		expect(html).toContain('data-state="merged"');
+		expect(html).toContain("已合并");
+		expect(html).toContain('data-testid="team-dependency-cancelled"');
+		expect(html).toContain("「旧方案」已取消，永远不会合并");
+		expect(html).toContain('data-testid="team-drawer-dependents"');
+		expect(html).toContain("被依赖");
+		expect(html).toContain("页面");
+		expect(html).toContain("依赖它的工作项比这里列出的多");
+		// Titles are buttons that open the item in the drawer.
+		expect(html.match(/<button/g)?.length).toBe(3);
+
+		const waiting = await render(
+			<DependencySections
+				detail={detail({
+					item: item({ state: "queued", worker: null, dependsOn: [dep("a", "Schema", "ready")] }),
+					dependents: [],
+					dependentsMore: false,
+				})}
+			/>,
+			new QueryClient(),
+			"en",
+		);
+		expect(waiting).toContain("Ready to merge");
+		expect(waiting).toContain("Starts once every item here is merged into main.");
+		expect(waiting).not.toContain("team-dependency-cancelled");
+		expect(waiting).not.toContain("team-drawer-dependents");
+		const none = await render(
+			<DependencySections detail={detail({ item: item(), dependents: [] })} />,
+		);
+		expect(none).not.toContain("data-testid");
+	});
+
+	test("the activity words dependency changes and unblocks", async () => {
+		const event = (kind: string, detailValue: Record<string, unknown>) => ({
+			id: kind,
+			kind,
+			workItemId: "w2",
+			workItemTitle: "API",
+			actorKind: "agent" as const,
+			actorId: "lead",
+			actorName: "Release crew",
+			detail: detailValue,
+			detailOmitted: false,
+			createdAt: "2026-11-18T00:00:01.000Z",
+		});
+		const html = await render(
+			<>
+				<ActivityLine event={event("work.dependencies_changed", { dependsOn: ["a", "b"] })} />
+				<ActivityLine event={event("work.unblocked", { mergedItem: "a", dependsOn: ["a"] })} />
+			</>,
+			new QueryClient(),
+			"zh-CN",
+		);
+		expect(html).toContain("修改依赖");
+		// The event keeps only ids, not which were merged then: the count is worded neutrally.
+		expect(html).toContain("依赖 2 项");
+		expect(html).not.toContain("项合并");
+		expect(html).toContain("可以开始了");
+		expect(html).toContain("依赖的工作项都已合并");
 	});
 });
 
