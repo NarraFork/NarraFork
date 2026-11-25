@@ -103,8 +103,9 @@ projectTeamRoutes.get("/:projectId/teams", async (c) => {
 		limit: counts ? Math.min(options.limit, PROJECT_TEAM_CARDS_LIMIT) : options.limit,
 	});
 	if (!counts) return c.json(result);
-	const cards = readTeamCards(
+	const cards = await readTeamCards(
 		result.teams.map((team) => ({ id: team.id, member: team.access === "write" })),
+		c.req.raw.signal,
 	);
 	return c.json({
 		...result,

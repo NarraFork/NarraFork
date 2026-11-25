@@ -540,7 +540,8 @@
 				"active": "Nothing running and nothing changed in the last 7 days.",
 				"all": "No sessions in this project yet.",
 				"mine": "You have no sessions in this project."
-			}
+			},
+			"showAll": "Show all {{count}}"
 		},
 		"newSession": "New session",
 		"waitingBadgeMore": "{{count}}+ waiting"

@@ -12,7 +12,7 @@
  *    members only.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
@@ -520,5 +520,40 @@ describe("bounded work", () => {
 				(entry: { item?: { title: string } }) => entry.item?.title === "Ready in an archived team",
 			),
 		).toBe(false);
+	});
+});
+
+describe("bounded reads", () => {
+	test("a team card counts finished items up to 1,000; open ones exactly", async () => {
+		const at = new Date().toISOString();
+		const rows = Array.from({ length: 1_005 }, (_, index) => ({
+			id: generateId(),
+			teamId,
+			projectId,
+			title: `merged ${index}`,
+			state: "merged" as const,
+			createdAt: at,
+			updatedAt: at,
+		}));
+		for (let index = 0; index < rows.length; index += 200)
+			await db.insert(teamWorkItems).values(rows.slice(index, index + 200));
+		const card = (await call(MEMBER, `/projects/${projectId}/teams?counts=true`)).body.teams.find(
+			(team: { id: string }) => team.id === teamId,
+		).card;
+		expect(card.columnCounts.done).toBe(1_000);
+		expect(card.readyCount).toBe(1);
+		expect(card.lastEventAt).toBeString();
+	});
+
+	test("the overview reads never load whole project rows (chapter settings)", () => {
+		const source = readFileSync(
+			new URL("../../services/project-overview.ts", import.meta.url),
+			"utf8",
+		);
+		// The shared loaders select every column, command prompts included.
+		expect(source).not.toContain("loadProjectForAccess(");
+		expect(source).not.toContain(".listProjects(");
+		expect(source).not.toContain("chapterSettings");
+		expect(source).not.toContain("db.query.projects");
 	});
 });

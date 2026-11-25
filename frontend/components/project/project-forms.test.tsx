@@ -170,18 +170,25 @@ mock.module("../permissions/PermissionRuleEditor", () => ({
 		kind,
 		rules,
 		onCreate,
+		onDelete,
 	}: {
 		kind: string;
-		rules: unknown[];
+		rules: Array<{ pattern?: string }>;
 		onCreate: (rule: Record<string, unknown>) => void;
+		onDelete: (index: number) => void;
 	}) => (
-		<button
-			type="button"
-			data-rule-count={rules.length}
-			onClick={() => onCreate({ pattern: "/tmp/**" })}
-		>
-			{`add-rule:${kind}`}
-		</button>
+		<div data-rules={rules.map((rule) => rule.pattern).join(",")}>
+			<button
+				type="button"
+				data-rule-count={rules.length}
+				onClick={() => onCreate({ pattern: "/tmp/**" })}
+			>
+				{`add-rule:${kind}`}
+			</button>
+			<button type="button" onClick={() => onDelete(0)}>
+				delete-first-rule
+			</button>
+		</div>
 	),
 }));
 mock.module("../settings/TraitLayerEditor", () => ({ TraitLayerEditor: box }));
@@ -431,8 +438,74 @@ test("a rule list saves on every change and sends only its own key", async () =>
 	const editor = () => container.querySelector("[data-rule-count]");
 	expect(editor()?.getAttribute("data-rule-count")).toBe("1");
 	// A failed save puts the stored list back instead of showing the unsaved rule as saved.
-	await act(async () => callbacks(0).onSettled?.());
+	await act(async () => callbacks(0).onError?.(new Error("offline")));
 	expect(editor()?.getAttribute("data-rule-count")).toBe("0");
+});
+test("name: a late success after more typing keeps the newer edit, saved when left", async () => {
+	await act(async () => root.render(<ProjectBasicsForm project={settingsProject} canManage />));
+	edits = { projectName: "First" };
+	await click("projectName");
+	await click("leave:projectName");
+	edits = { projectName: "Second" };
+	await click("projectName");
+	// The first save answers after the second edit, before the field is left again.
+	await act(async () => callbacks(0).onSuccess?.());
+	expect(field("projectName")?.getAttribute("data-value")).toBe("Second");
+	await click("leave:projectName");
+	expect(update.mock.calls[1]?.[0]).toEqual({ id: "original-id", data: { name: "Second" } });
+	// And a late failure of the first save does not mark the newer edit.
+	await act(async () => callbacks(0).onError?.(new Error("late")));
+	expect(field("projectName")?.getAttribute("data-error")).toBe("");
+});
+const twoRules = {
+	id: "original-id",
+	name: "p",
+	chapterSettings: { blacklistDirs: [{ pattern: "/a" }, { pattern: "/b" }] },
+};
+const shownRules = () => container.querySelector("[data-rules]")?.getAttribute("data-rules");
+const sentRules = (call: number) =>
+	(
+		(update.mock.calls[call]?.[0] as { data: { chapterSettings: Record<string, unknown[]> } }).data
+			.chapterSettings.blacklistDirs as Array<{ pattern: string }>
+	).map((rule) => rule.pattern);
+test("a second deletion while the refetch is still out never brings the first back", async () => {
+	await act(async () =>
+		root.render(<ProjectRuleList project={twoRules} ruleKey="blacklistDirs" canManage />),
+	);
+	await click("delete-first-rule");
+	expect(sentRules(0)).toEqual(["/b"]);
+	// Saved, but the cached project is still the old one (the refetch is held open).
+	await act(async () => callbacks(0).onSuccess?.());
+	await act(async () =>
+		root.render(<ProjectRuleList project={twoRules} ruleKey="blacklistDirs" canManage />),
+	);
+	expect(shownRules()).toBe("/b");
+	await click("delete-first-rule");
+	expect(sentRules(1)).toEqual([]);
+	// Once the cache holds the saved list, the form follows it again.
+	await act(async () => callbacks(1).onSuccess?.());
+	await act(async () =>
+		root.render(
+			<ProjectRuleList
+				project={{ ...twoRules, chapterSettings: { blacklistDirs: [] } }}
+				ruleKey="blacklistDirs"
+				canManage
+			/>,
+		),
+	);
+	expect(shownRules()).toBe("");
+});
+test("rule saves are serialized: an edit made while one is in flight is sent after it", async () => {
+	await act(async () =>
+		root.render(<ProjectRuleList project={twoRules} ruleKey="blacklistDirs" canManage />),
+	);
+	await click("delete-first-rule");
+	await click("delete-first-rule");
+	expect(update).toHaveBeenCalledTimes(1);
+	expect(shownRules()).toBe("");
+	await act(async () => callbacks(0).onSuccess?.());
+	expect(update).toHaveBeenCalledTimes(2);
+	expect(sentRules(1)).toEqual([]);
 });
 test("a reader sees the rules but no editor", async () => {
 	await act(async () =>

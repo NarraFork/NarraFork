@@ -36,11 +36,18 @@ import {
 	type ProjectSessionRow,
 	type ProjectSessionView,
 } from "@shared/project-overview";
-import { and, desc, eq, inArray, lt, ne, notInArray, or, type SQL, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, lt, ne, notInArray, or, type SQL, sql } from "drizzle-orm";
 import { db } from "../db";
-import { narratorProjectLinks, narrators, projectTeams, teamWorkItems, users } from "../db/schema";
+import {
+	narratorProjectLinks,
+	narrators,
+	projects,
+	projectTeams,
+	teamWorkItems,
+	users,
+} from "../db/schema";
 import { readQuery } from "../db/worker-read";
-import { ForbiddenError, ValidationError } from "../lib/errors";
+import { ForbiddenError, NotFoundError, ValidationError } from "../lib/errors";
 import {
 	judgeNarratorsWriteForPrincipal,
 	type NarratorAclRow,
@@ -48,13 +55,14 @@ import {
 	narratorReadableWhere,
 } from "./narrator-acl";
 import {
+	assertProjectAccess,
 	canWriteProject,
-	loadProjectForAccess,
 	type ProjectAclRow,
 	type ProjectPrincipal,
+	projectReadableWhere,
 	projectsWritableBy,
 } from "./project-acl";
-import { projectReadAdapter } from "./read";
+import { isReadablePrincipal } from "./read/project-read-adapter";
 import {
 	depthOf,
 	type PendingRow,
@@ -193,6 +201,33 @@ const coordinatorAclColumns = {
 /** An active team whose coordinator is not archived: the only teams that count anywhere here. */
 const liveTeam = and(eq(projectTeams.status, "active"), ne(narrators.status, "archived"));
 
+/**
+ * The project's access columns only (id, owner, visibility), then the ordinary access rule
+ * (`assertProjectAccess`: unreadable and missing are both 404). The shared `loadProjectForAccess`
+ * reads the whole row, `chapter_settings` included, which these polled reads never need.
+ */
+async function loadProjectAclRow(
+	projectId: string,
+	principal: ProjectPrincipal,
+	signal?: AbortSignal,
+): Promise<ProjectAclRow> {
+	const [row] = await readQuery(
+		db
+			.select({
+				id: projects.id,
+				ownerUserId: projects.ownerUserId,
+				visibility: projects.visibility,
+			})
+			.from(projects)
+			.where(eq(projects.id, projectId))
+			.limit(1),
+		workerRead(1, "projects.overview.project", signal),
+	);
+	if (!row) throw new NotFoundError("Project", projectId);
+	await assertProjectAccess(row, principal, "read");
+	return row;
+}
+
 // ── The project list ────────────────────────────────────────────────────────
 
 function add(map: Map<string, Set<string>>, key: string, value: string): void {
@@ -214,10 +249,24 @@ export async function readProjectSummaries(
 	principal: ProjectPrincipal,
 	signal?: AbortSignal,
 ): Promise<ProjectListSummary[]> {
-	const page = await projectReadAdapter().listProjects(principal, {
-		limit: PROJECT_SUMMARY_PROJECTS_LIMIT,
-	});
-	const rows = page.rows as (ProjectAclRow & { updatedAt: string })[];
+	// The caller's readable projects in the list's order (newest update first, id tiebreak), only
+	// the columns used here: never `chapter_settings` (command prompts can be very large).
+	const rows: (ProjectAclRow & { updatedAt: string })[] = isReadablePrincipal(principal)
+		? await readQuery(
+				db
+					.select({
+						id: projects.id,
+						ownerUserId: projects.ownerUserId,
+						visibility: projects.visibility,
+						updatedAt: projects.updatedAt,
+					})
+					.from(projects)
+					.where(projectReadableWhere(principal))
+					.orderBy(desc(projects.updatedAt), asc(projects.id))
+					.limit(PROJECT_SUMMARY_PROJECTS_LIMIT),
+				workerRead(PROJECT_SUMMARY_PROJECTS_LIMIT, "projects.summaries.projects", signal),
+			)
+		: [];
 	if (rows.length === 0) return [];
 	const ids = rows.map((row) => row.id);
 	const readable = narratorReadableWhere(principal);
@@ -450,7 +499,7 @@ export async function readProjectAttention(
 	principal: ProjectPrincipal,
 	signal?: AbortSignal,
 ): Promise<ProjectAttentionResponse> {
-	const project = await loadProjectForAccess(projectId, principal, "read");
+	const project = await loadProjectAclRow(projectId, principal, signal);
 	if (!(await canWriteProject(project, principal)))
 		throw new ForbiddenError("Only project members see what waits for them here");
 
@@ -550,6 +599,19 @@ export async function readProjectAttention(
 
 // ── The project page: sessions ──────────────────────────────────────────────
 
+/** A narrator's stored substatus list (JSON text), or none when it does not parse whole. */
+function parseSubstatus(text: string | null): string[] {
+	if (!text) return [];
+	try {
+		const value = JSON.parse(text) as unknown;
+		return Array.isArray(value)
+			? value.filter((item): item is string => typeof item === "string")
+			: [];
+	} catch {
+		return [];
+	}
+}
+
 type SessionCursor = { phase: "running" | "recent" | "all"; at: string; id: string };
 
 function encodeSessionCursor(cursor: SessionCursor): string {
@@ -582,6 +644,8 @@ const sessionColumns = {
 	id: narrators.id,
 	title: sql<string | null>`substr(${narrators.title}, 1, 200)`,
 	status: narrators.status,
+	substatus: sql<string | null>`substr(${narrators.substatus}, 1, 2048)`,
+	cwd: sql<string | null>`substr(${narrators.cwd}, 1, 512)`,
 	updatedAt: narrators.updatedAt,
 	ownerUserId: narrators.ownerUserId,
 	username: users.username,
@@ -635,7 +699,7 @@ export async function readProjectSessions(
 	options: { view: ProjectSessionView; cursor?: string; limit?: number; now?: Date },
 	signal?: AbortSignal,
 ): Promise<ProjectSessionPage> {
-	await loadProjectForAccess(projectId, principal, "read");
+	await loadProjectAclRow(projectId, principal, signal);
 	const limit = Math.min(Math.max(options.limit ?? PROJECT_SESSIONS_PAGE_LIMIT, 1), 100);
 	const cursor = decodeSessionCursor(options.cursor);
 	const since = new Date(
@@ -705,6 +769,8 @@ export async function readProjectSessions(
 			id: row.id,
 			title: row.title,
 			status: row.status,
+			cwd: row.cwd,
+			substatus: parseSubstatus(row.substatus),
 			group: live ? "running" : "recent",
 			updatedAt: row.updatedAt,
 			owner:
