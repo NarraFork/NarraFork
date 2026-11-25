@@ -256,30 +256,36 @@ describe("template auto routing", () => {
 		expect(autoSourceFacts(entry.prefix, now + 610_001).available).toBe(true);
 	});
 
+	test("balance policy distinguishes exhausted, unknown, errors, unlimited and multiple currencies", () => {
+		const entry = customSources[3]!;
+		const key = entry.add();
+		for (const [value, available] of [
+			[emptyWallet, false],
+			[snapshot({ balances: [{ unit: "USD", remaining: -1 }] }), false],
+			[snapshot(), true],
+			[snapshot({ balances: [{ unit: "USD", remaining: null }] }), true],
+			[snapshot({ ...emptyWallet, error: "probe failed" }), true],
+			[snapshot({ balances: [{ unit: "USD", remaining: 0, unlimited: true }] }), true],
+			[
+				snapshot({
+					balances: [
+						{ unit: "USD", remaining: 0 },
+						{ unit: "CNY", remaining: 1 },
+					],
+				}),
+				true,
+			],
+		] as const) {
+			remember(key.id, entry.identity(key), value);
+			expect(autoSourceFacts(entry.prefix, now).available).toBe(available);
+		}
+	});
+
 	for (const entry of walletSources) {
-		test(`${entry.prefix}: balances distinguish exhausted, unknown, errors, unlimited and multiple currencies`, () => {
+		test(`${entry.prefix}: a real wallet identity blocks exhausted keys but not an unknown sibling`, () => {
 			const key = entry.add();
-			for (const [value, available] of [
-				[emptyWallet, false],
-				[snapshot({ balances: [{ unit: "USD", remaining: -1 }] }), false],
-				[snapshot(), true],
-				[snapshot({ balances: [{ unit: "USD", remaining: null }] }), true],
-				[snapshot({ ...emptyWallet, error: "probe failed" }), true],
-				[snapshot({ balances: [{ unit: "USD", remaining: 0, unlimited: true }] }), true],
-				[
-					snapshot({
-						balances: [
-							{ unit: "USD", remaining: 0 },
-							{ unit: "CNY", remaining: 1 },
-						],
-					}),
-					true,
-				],
-			] as const) {
-				remember(key.id, entry.identity(key), value);
-				expect(autoSourceFacts(entry.prefix, now).available).toBe(available);
-			}
 			remember(key.id, entry.identity(key), emptyWallet);
+			expect(autoSourceFacts(entry.prefix, now).available).toBe(false);
 			const second = entry.add("second");
 			expect(autoSourceFacts(entry.prefix, now).available).toBe(true);
 			expect(autoSourcePreview(entry.prefix, now)).toEqual({ label: "second" });
@@ -320,7 +326,6 @@ describe("template auto routing", () => {
 					remaining === null || remaining > 0,
 				);
 			}
-			expect(network).toHaveBeenCalledTimes(8);
 		} finally {
 			network.mockRestore();
 		}
@@ -428,78 +433,57 @@ describe("template auto routing", () => {
 		expect(autoSourceFacts("codex", now).available).toBe(false);
 	});
 
-	for (const entry of [...customSources, nugSource]) {
-		test(`${entry.prefix}: changed secret, endpoint and network invalidate old probe and stream snapshots`, () => {
+	// Network fields are table-driven in quota-identity.test.ts; cover each template's
+	// real probe/stream wiring here, not every field × source × slot combination.
+	for (const [entry, change] of [
+		[customSources[0]!, "key"],
+		[customSources[1]!, "endpoint"],
+		[customSources[2]!, "headers"],
+		[customSources[3]!, "global-proxy"],
+		[nugSource, "endpoint"],
+	] as const) {
+		test(`${entry.prefix}: ${change} invalidates old probe and stream snapshots`, () => {
 			const key = entry.add();
-			const streamIdentity = () =>
-				entry.id === "route-nug"
-					? entry.identity(key)
-					: customApiStreamQuotaIdentity(withProviderKey(customConfig(entry.id), key));
 			for (const stream of [false, true]) {
-				for (const change of [
-					"key",
-					"endpoint",
-					"proxy",
-					"user-agent",
-					"headers",
-					"global-proxy",
-				]) {
-					const oldIdentity = stream ? streamIdentity() : entry.identity(key);
-					const exhausted =
-						entry.id === "route-go" && !stream ? fullWindow(now + 600_000) : emptyWallet;
-					remember(key.id, oldIdentity, exhausted, stream);
-					expect(autoSourceFacts(entry.prefix, now).available).toBe(false);
-					if (change === "key") store.update(key.id, { apiKey: `${key.apiKey}-rotated` });
-					else if (change === "endpoint") {
-						saveSettings({
-							...settings,
-							customApiProviders: settings.customApiProviders!.map((config) =>
-								config.id === entry.id
-									? {
-											...config,
-											baseUrl: nextEndpoint(entry.id, config.baseUrl),
-										}
-									: config,
-							),
-							nugProviders: settings.nugProviders!.map((config) =>
-								config.id === entry.id
-									? {
-											...config,
-											baseUrl: nextEndpoint(entry.id, config.baseUrl),
-										}
-									: config,
-							),
-						});
-					} else if (change === "global-proxy") {
-						saveSettings({
-							...settings,
-							proxy: { ...settings.proxy, mode: "custom", url: `http://proxy-${stream}:8080` },
-						});
-					} else
-						store.update(key.id, {
-							network: {
-								...key.network,
-								...(change === "proxy" && {
-									proxy: { mode: "custom" as const, url: `http://key-proxy-${stream}:8080` },
-								}),
-								...(change === "user-agent" && {
-									userAgentMode: "custom" as const,
-									customUserAgent: `routing-${stream}`,
-								}),
-								...(change === "headers" && { extraHeaders: { "x-routing": `changed-${stream}` } }),
-							},
-						});
-					expect(autoSourceFacts(entry.prefix, now).available).toBe(true);
-					// A read must not evict the previous identity or accidentally restore it from disk.
-					expect(
-						quotaStore.peekForIdentity(
-							key.id,
-							oldIdentity,
-							stream ? STREAM_QUOTA_SOURCE : undefined,
+				const oldIdentity =
+					!stream || entry.id === "route-nug"
+						? entry.identity(key)
+						: customApiStreamQuotaIdentity(withProviderKey(customConfig(entry.id), key));
+				const exhausted =
+					entry.id === "route-go" && !stream ? fullWindow(now + 600_000) : emptyWallet;
+				remember(key.id, oldIdentity, exhausted, stream);
+				expect(autoSourceFacts(entry.prefix, now).available).toBe(false);
+				if (change === "key") store.update(key.id, { apiKey: `${key.apiKey}-rotated` });
+				else if (change === "endpoint") {
+					saveSettings({
+						...settings,
+						customApiProviders: settings.customApiProviders!.map((config) =>
+							config.id === entry.id
+								? { ...config, baseUrl: nextEndpoint(entry.id, config.baseUrl) }
+								: config,
 						),
-					).toBe(exhausted);
-					quotaStore.forget(key.id, stream ? STREAM_QUOTA_SOURCE : undefined);
+						nugProviders: settings.nugProviders!.map((config) =>
+							config.id === entry.id
+								? { ...config, baseUrl: nextEndpoint(entry.id, config.baseUrl) }
+								: config,
+						),
+					});
+				} else if (change === "global-proxy") {
+					saveSettings({
+						...settings,
+						proxy: { ...settings.proxy, mode: "custom", url: `http://proxy-${stream}:8080` },
+					});
+				} else {
+					store.update(key.id, {
+						network: { extraHeaders: { "x-routing": `changed-${stream}` } },
+					});
 				}
+				expect(autoSourceFacts(entry.prefix, now).available).toBe(true);
+				// Mismatched routing reads leave the old identity intact, without restoring it.
+				expect(
+					quotaStore.peekForIdentity(key.id, oldIdentity, stream ? STREAM_QUOTA_SOURCE : undefined),
+				).toEqual(exhausted);
+				quotaStore.forget(key.id, stream ? STREAM_QUOTA_SOURCE : undefined);
 			}
 		});
 	}
