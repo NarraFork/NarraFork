@@ -138,6 +138,8 @@ import { MobileNavButton } from "../nav/MobileNavButton";
 import { buildPluginDockPanelOpenRequest } from "../plugins/PluginContributionPicker";
 import { usePluginUiSurface } from "../plugins/PluginUiSurfaceContext";
 import { NarratorProjectSettingsModal } from "../project/NarratorProjectSettings";
+import { canOfferTeamUpgrade } from "../teams/team-upgrade-eligibility";
+import { UpgradeToTeamModal } from "../teams/UpgradeToTeamModal";
 import {
 	BackgroundTasksDrawerHost,
 	useBackgroundTasksButton,
@@ -161,6 +163,7 @@ import { showHeaderLeadingChrome } from "./header/header-leading-chrome";
 import { HEADER_LEADING_GAP_PX, headerTitleLayoutWidth } from "./header/header-title-width";
 import { NarratorHeaderLayout } from "./header/NarratorHeaderLayout";
 import { NarratorPanelHeaderTitle } from "./header/NarratorPanelHeaderTitle";
+import { NarratorTeamBadge, useNarratorTeamBadge } from "./header/NarratorTeamBadge";
 import { buildBottomToolbarActions } from "./header/NarratorToolbarItem";
 import {
 	getNarratorStatusBarDisplay,
@@ -2079,8 +2082,32 @@ function NarratorPanelBody({
 	 * is just a directory of links, which is noise in the toolbar menu.
 	 */
 	const compatibilityProjectId = workspaceContext?.contextProjectId ?? projectId;
+	/**
+	 * Coordinator → team page link after the title. Decided here (not inside the badge) because
+	 * the header budgets its fixed width. Not in the Remote Access build: its router has no
+	 * team page.
+	 */
+	const teamBadge = useNarratorTeamBadge({
+		narratorId,
+		narrator,
+		projectId: compatibilityProjectId,
+		enabled: !REMOTE_BUILD && !isWorkspacePreview,
+	});
 	/** Stable identity so HeaderToolbar's memo is not busted every render. */
 	const openCompatibility = useCallback(() => setCompatibilityOpen(true), []);
+	/**
+	 * "Upgrade to a team" (the overflow menu): offered for an ordinary session of a known project
+	 * (its resolved primary project, from the detail read). The dialog lives here, outside the
+	 * menu's dropdown, for the same reason as the project settings modal above.
+	 */
+	const [upgradeToTeamOpen, setUpgradeToTeamOpen] = useState(false);
+	const teamUpgradeProjectId =
+		(fetchedNarrator?.navigationSummary?.projectId as string | null | undefined) ??
+		compatibilityProjectId ??
+		null;
+	const teamUpgradeOffered =
+		!isWorkspacePreview && canOfferTeamUpgrade(narrator, teamUpgradeProjectId);
+	const openUpgradeToTeam = useCallback(() => setUpgradeToTeamOpen(true), []);
 	/**
 	 * Outline places this session opens (its menu, its tool cards' addresses and commits, links in
 	 * its messages): in the surrounding dock when there is one (the session page's side dock, the
@@ -3237,6 +3264,7 @@ function NarratorPanelBody({
 						showBack={showLeadingChrome}
 						showMenu={showMobileNav}
 						showTitleActions={!hostOwnsTitle && !isWorkspacePreview}
+						titleBadgeWidth={teamBadge?.width ?? 0}
 						surfacedToolCount={toolbarController.toolbarSurfacedDefs.length}
 						showClose={!!onClose}
 						onHeaderPointerDown={onHeaderPointerDown}
@@ -3327,6 +3355,9 @@ function NarratorPanelBody({
 										isWorkspacePreview={isWorkspacePreview}
 										titleFullWidth={headerLayout.titleWidth}
 									/>
+									{teamBadge && headerLayout.showTitleBadge && (
+										<NarratorTeamBadge target={teamBadge} />
+									)}
 									{disconnected && !isWorkspacePreview && (
 										<Badge
 											size="xs"
@@ -3354,6 +3385,7 @@ function NarratorPanelBody({
 										mockStreamEnabled={mockStreamEnabled}
 										onOpenCompatibility={compatibilityProjectId ? openCompatibility : undefined}
 										onOpenOutline={outlineEnabled ? openOutline : undefined}
+										onUpgradeToTeam={teamUpgradeOffered ? openUpgradeToTeam : undefined}
 										onClose={onClose}
 										visibleToolCount={headerLayout.visibleToolCount}
 										unmeasured={headerLayout.unmeasured}
@@ -3425,6 +3457,23 @@ function NarratorPanelBody({
 						target={compactSummaryModalTarget}
 						onClose={closeCompactSummaryModal}
 					/>
+
+					{upgradeToTeamOpen && teamUpgradeProjectId && (
+						<UpgradeToTeamModal
+							projectId={teamUpgradeProjectId}
+							narratorId={narratorId}
+							title={typeof narrator?.title === "string" ? narrator.title : null}
+							opened={upgradeToTeamOpen}
+							onClose={() => setUpgradeToTeamOpen(false)}
+							onUpgraded={(team) => {
+								setUpgradeToTeamOpen(false);
+								void navigate({
+									to: "/projects/$projectId/teams/$teamId",
+									params: { projectId: team.projectId, teamId: team.id },
+								});
+							}}
+						/>
+					)}
 
 					{!REMOTE_BUILD && (
 						<NarratorProjectSettingsModal
@@ -3651,6 +3700,8 @@ function NarratorPanelBody({
 					{/* ═══════════════════ Bottom Interaction Area ═══════════════════ */}
 					<NarratorInteractionArea
 						onModelTraceReturn={isModelTrace ? handleModelTraceReturn : undefined}
+						// Write access to the narrator (the terminal access read answers exactly that).
+						readOnly={canOpenTerminals === false}
 						common={{ narratorId, narrator, isWorkspacePreview, isMobileViewport }}
 						attachedImages={attachedImages}
 						attachedTextFiles={attachedTextFiles}

@@ -3,9 +3,16 @@
  * columns, the state icons, card marks, activity wording, the poll backoff and the pause order.
  */
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { OUTLINE_STATUS_KEYS } from "@shared/outline-status";
 import {
+	COORDINATOR_OVERRUN_EVENT_PREFIX,
+	COORDINATOR_OVERRUN_KINDS,
 	TEAM_BOARD_COLUMN_STATES,
+	TEAM_LEVEL_EVENT_KINDS,
+	TEAM_OVERLAP_EVENT_KINDS,
+	TEAM_PERSON_DECISION_EVENT_KINDS,
+	TEAM_WORK_EVENT_KINDS,
 	TEAM_WORK_ITEM_STATES,
 	type TeamBoardItem,
 	type TeamPageSummary,
@@ -32,6 +39,7 @@ import {
 	summarySignature,
 	TEAM_BOARD_COLUMNS,
 	TEAM_CONVERSATION_MIN_WIDTH,
+	teamPinTitle,
 	teamWorkspaceLayout,
 	WORK_ITEM_STATUS_ICON,
 } from "./team-page-model";
@@ -112,7 +120,8 @@ describe("board mapping", () => {
 		expect(teamWorkspaceLayout(TEAM_CONVERSATION_MIN_WIDTH + 380)).toBe("split");
 		// 1280 px window, 250 px sidebar.
 		expect(teamWorkspaceLayout(1030)).toBe("split");
-		expect(teamWorkspaceLayout(232 + TEAM_CONVERSATION_MIN_WIDTH + 380)).toBe("columns");
+		// No third column: the page is about one team, never a list of the project's teams.
+		expect(teamWorkspaceLayout(1600)).toBe("split");
 		expect(TEAM_CONVERSATION_MIN_WIDTH).toBeGreaterThanOrEqual(480);
 	});
 
@@ -140,6 +149,39 @@ describe("activity wording", () => {
 		expect(eventLabelKey("team.decision")).toBe("team_decision");
 		expect(eventLabelKey("coordinator.overrun.readLines")).toBe("overrun");
 		expect(eventLabelKey("x.future")).toBe("other");
+	});
+
+	test("every recorded kind has a headline in both locales, and unknown kinds a generic one", () => {
+		const kinds = [
+			...TEAM_LEVEL_EVENT_KINDS,
+			...TEAM_WORK_EVENT_KINDS,
+			...TEAM_OVERLAP_EVENT_KINDS,
+			...TEAM_PERSON_DECISION_EVENT_KINDS,
+			...COORDINATOR_OVERRUN_KINDS.map((kind) => `${COORDINATOR_OVERRUN_EVENT_PREFIX}${kind}`),
+		];
+		expect(kinds).toContain("work.merged");
+		for (const locale of ["en", "zh-CN"]) {
+			const labels = JSON.parse(
+				readFileSync(new URL(`../../locales/${locale}/projects.json`, import.meta.url), "utf8"),
+			).teams.event as Record<string, string>;
+			for (const kind of kinds) {
+				const key = eventLabelKey(kind);
+				expect({ locale, kind, key: key === "other" ? null : key }).toEqual({
+					locale,
+					kind,
+					key: expect.any(String),
+				});
+				expect({ locale, kind, label: labels[key] }).toEqual({
+					locale,
+					kind,
+					label: expect.any(String),
+				});
+				expect(labels[key]).not.toContain(kind);
+			}
+			// The fallback is readable text with no interpolation of the raw kind.
+			expect(labels.other).toBeString();
+			expect(labels.other).not.toContain("{{");
+		}
 	});
 
 	test("notes from the details", () => {
@@ -315,5 +357,24 @@ describe("people (M1)", () => {
 		expect(audienceNotes("project", "owner")).toEqual(["projectRead"]);
 		expect(audienceNotes("public", "public")).toEqual(["publicWrite", "publicRead"]);
 		expect(audienceNotes("private", "owner")).toEqual([]);
+	});
+});
+
+describe("pin to sidebar", () => {
+	const team = {
+		id: "lead",
+		name: "Release crew",
+		status: "active" as const,
+		coordinatorStatus: "idle",
+	};
+	test("an active team offers its name (or id); an archived or unloaded one offers no pin", () => {
+		expect(teamPinTitle(team)).toBe("Release crew");
+		expect(teamPinTitle({ ...team, name: "" })).toBe("lead");
+		expect(teamPinTitle(undefined)).toBeUndefined();
+		expect(teamPinTitle({ ...team, status: "archived" })).toBeUndefined();
+		expect(teamPinTitle({ ...team, coordinatorStatus: "archived" })).toBeUndefined();
+		// The page's live summary can see the archive before the team detail does.
+		expect(teamPinTitle(team, "archived")).toBeUndefined();
+		expect(teamPinTitle(team, "working")).toBe("Release crew");
 	});
 });

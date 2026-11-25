@@ -394,21 +394,46 @@ export function listWorkItems(coordinatorId: string): {
 
 // ── Create ──────────────────────────────────────────────────────────────────
 
-/** A branch name for an item: `team/<title slug>-<8 hex of the item id>`. */
-export function workItemBranchName(itemId: string, title: string): string {
-	const slug =
-		title
-			.toLowerCase()
-			.replace(/[^a-z0-9]+/g, "-")
-			.replace(/^-+|-+$/g, "")
-			.slice(0, 40)
-			.replace(/-+$/g, "") || "work";
+/** Longest slug part of a work item branch (before `-<8 hex>`). */
+const WORK_BRANCH_SLUG_MAX = 40;
+
+/**
+ * The ASCII words of `text`, lower-case and joined by `-`, at most 40 characters; "" when it has
+ * none. Accents are dropped (`Résumé` → `resume`) and full-width letters folded (`ＡＰＩ` → `api`);
+ * no other script is transliterated.
+ */
+export function workBranchSlug(text: string): string {
+	return text
+		.normalize("NFKD")
+		.replace(/\p{M}+/gu, "")
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, "-")
+		.replace(/^-+|-+$/g, "")
+		.slice(0, WORK_BRANCH_SLUG_MAX)
+		.replace(/-+$/g, "");
+}
+
+/**
+ * A branch name for an item: `team/<slug>-<8 hex of the item id>`.
+ *
+ * The slug is ASCII on purpose, so the name passes every branch check the app has: the
+ * ASCII-only `gitBranchName` (shared/project-team-draft.ts) that a team's base branch goes
+ * through, the worktree service's ref checks and `git check-ref-format`, and shells and
+ * file systems that handle non-ASCII refs badly. A title in a script without ASCII words (a
+ * Chinese title) has no slug of its own, so the coordinator's `branchHint` — a few English
+ * words it chose — names the branch first; without either the slug is `work`. The hash keeps
+ * names unique whatever the slug.
+ */
+export function workItemBranchName(itemId: string, title: string, branchHint?: string): string {
+	const slug = workBranchSlug(branchHint ?? "") || workBranchSlug(title) || "work";
 	return `team/${slug}-${createHash("sha256").update(itemId).digest("hex").slice(0, 8)}`;
 }
 
 export interface CreateWorkItemInput {
 	coordinatorId: string;
 	title: string;
+	/** A few English words for the branch, when the title has no ASCII words of its own. */
+	branchHint?: string;
 	/** `isolated` for `Agent({ isolation: "worktree" })`; default kind otherwise. */
 	kind?: string;
 	/** Who asked: the coordinator agent (its id) — the person behind its turn is `principal`. */
@@ -431,7 +456,7 @@ export async function createWorkItem(input: CreateWorkItemInput): Promise<WorkIt
 			`A work item title is at most ${TEAM_WORK_TITLE_MAX_LENGTH} characters`,
 		);
 	const id = generateId();
-	const branchName = workItemBranchName(id, title);
+	const branchName = workItemBranchName(id, title, input.branchHint);
 	const kind = input.kind ?? TEAM_DEFAULT_WORK_KIND;
 	const port = await ports();
 	const created = await port.createWorktree({

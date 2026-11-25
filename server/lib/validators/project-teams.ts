@@ -52,6 +52,23 @@ export const createProjectTeamSchema = z
 	})
 	.strict();
 
+/**
+ * `POST /api/projects/:projectId/teams` with `fromNarratorId`: turn an existing session into the
+ * team's coordinator. Strict and separate from creation: the session keeps its audiences, which
+ * change only through the sharing routes, so `visibility` / `writeAudience` are refused here.
+ */
+export const upgradeProjectTeamSchema = z
+	.object({
+		/** The session that becomes the coordinator. */
+		fromNarratorId: z.string().min(1).max(200),
+		/** The team name; omitted keeps the session's title. */
+		name: teamNameSchema.optional(),
+		baseBranch: teamBaseBranchSchema.optional(),
+		brief: teamBriefSchema.optional(),
+		settings: teamSettingsSchema.optional(),
+	})
+	.strict();
+
 export const updateProjectTeamSchema = z
 	.object({
 		baseBranch: teamBaseBranchSchema.optional(),

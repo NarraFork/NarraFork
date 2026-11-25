@@ -30,6 +30,7 @@ import {
 	parseAggModelValue,
 	statusRegistry,
 } from "../../../lib/constants";
+import { followDefaultLabel } from "../../../lib/follow-model-label";
 import { TruncatedText } from "../../common/TruncatedText";
 import {
 	AwaitingConfirmationBadge,
@@ -737,9 +738,7 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 																					value: m.value,
 																					label:
 																						m.value === FOLLOW_DEFAULT_MODEL
-																							? t("followDefault", {
-																									model: model.defaultModelValue,
-																								})
+																							? followDefaultLabel(t, model.defaultModelValue)
 																							: m.provider === "__agg__"
 																								? `⚡ ${m.label}`
 																								: m.provider === "__auto__"

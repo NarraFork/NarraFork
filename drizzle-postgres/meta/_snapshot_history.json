@@ -643,11 +643,19 @@
 		},
 		{
 			"idx": 80,
-			"tag": "0080_terminal_executor_session",
-			"id": "2d01d23f-bef1-494b-9f01-397c4ed461aa",
+			"tag": "0080_recent_tab_team_project",
+			"id": "c07b4921-245c-4e69-b29f-01132e3f6156",
 			"prevId": "c9d8eed4-015f-4e6c-9274-610534f33c08",
 			"version": "7",
-			"snapshotDigest": "6333c0c33902a7d0cae1a231be1006d366be62421aace0b9af27ad6e4dc89f98"
+			"snapshotDigest": "8748e2df5e280195b6f16925413c3586a2bc211ff10e4797aff075cf9f80ab87"
+		},
+		{
+			"idx": 81,
+			"tag": "0081_terminal_executor_session",
+			"id": "b5a314e1-8774-4197-8446-afb244ed863f",
+			"prevId": "c07b4921-245c-4e69-b29f-01132e3f6156",
+			"version": "7",
+			"snapshotDigest": "6d4ad82d81f6c8b387e6d05537f642b8310edf8e0c66e977aa4a14680a31b01f"
 		}
 	]
 }

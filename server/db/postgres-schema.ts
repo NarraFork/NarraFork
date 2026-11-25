@@ -1487,6 +1487,7 @@ export const userRecentTabs = pgTable(
 		folderIcon: text("folder_icon"),
 		folderColor: text("folder_color"),
 		folderPreviewCount: integer("folder_preview_count"),
+		projectId: text("project_id"),
 		title: text("title").notNull(),
 		subtitle: text("subtitle"),
 		status: text("status"),
@@ -4601,7 +4602,7 @@ export const teamWorkEvents = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 147,
-  "columnCount": 1962,
+  "columnCount": 1963,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -13111,6 +13112,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "folder_preview_count",
           "kind": "integer",
           "pgType": "integer",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "projectId",
+          "name": "project_id",
+          "kind": "text",
+          "pgType": "text",
           "notNull": false,
           "primary": false,
           "unique": false

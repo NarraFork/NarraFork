@@ -48,8 +48,11 @@ export const HEADER_PIN_WIDTH_PX = 28;
 /** Header `padding: "8px 16px"` → 16×2. */
 export const HEADER_ROW_PADDING_PX = 16 * 2;
 
-export function estimateTitleWidthFallback(text: string): number {
-	const sm = typographyMetrics().size.sm;
+export function estimateTitleWidthFallback(
+	text: string,
+	fontSizePx = typographyMetrics().size.sm,
+): number {
+	const sm = fontSizePx;
 	let units = 0;
 	for (const ch of text) {
 		units +=
@@ -98,18 +101,21 @@ export function headerTitleFont(): string {
  * Callers must pass the full title — never an already-truncated display string.
  */
 export function measureHeaderTitleTextWidth(text: string): number {
-	const trimmed = text ?? "";
-	if (!trimmed) return 0;
+	return measureTextWidth(text ?? "", headerTitleFont(), typographyMetrics().size.sm);
+}
+
+function measureTextWidth(text: string, font: string, fallbackSizePx: number): number {
+	if (!text) return 0;
 	const ctx = getMeasureCtx();
-	if (!ctx) return estimateTitleWidthFallback(trimmed);
+	if (!ctx) return estimateTitleWidthFallback(text, fallbackSizePx);
 	try {
-		ctx.font = headerTitleFont();
-		const width = ctx.measureText(trimmed).width;
+		ctx.font = font;
+		const width = ctx.measureText(text).width;
 		if (Number.isFinite(width) && width > 0) return Math.ceil(width);
 	} catch {
 		// fall through
 	}
-	return estimateTitleWidthFallback(trimmed);
+	return estimateTitleWidthFallback(text, fallbackSizePx);
 }
 
 /**
@@ -123,6 +129,38 @@ export function headerTitleLayoutWidth(text: string): number {
 	return Math.min(w, HEADER_TITLE_TEXT_MAX_PX);
 }
 
+/**
+ * `<Badge size="sm">` metrics, from Mantine v9 `Badge.css`: fixed 10px bold text with
+ * 0.25px tracking (not scaled by reader typography), 8px inline padding, a 1px border,
+ * and a left section followed by `--mantine-spacing-xs / 2`.
+ */
+const HEADER_BADGE_FONT_PX = 10;
+const HEADER_BADGE_FONT_WEIGHT = 700;
+const HEADER_BADGE_LETTER_SPACING_PX = 0.25;
+export const HEADER_BADGE_CHROME_PX = 8 * 2 + 1 * 2;
+const HEADER_BADGE_SECTION_GAP_PX = 10 / 2;
+/** Sub-pixel rounding headroom so the painted label never ellipsizes inside its box. */
+const HEADER_BADGE_SLACK_PX = 2;
+
+export function headerBadgeFont(): string {
+	return `${HEADER_BADGE_FONT_WEIGHT} ${HEADER_BADGE_FONT_PX}px ${SANS_FAMILY}`;
+}
+
+/**
+ * Fixed box width of a `size="sm"` header badge, measured the same way as the title:
+ * canvas text width of the COMPLETE label plus the badge's fixed chrome. The badge is
+ * rendered at exactly this width, so the header budget and the painted box agree.
+ */
+export function headerBadgeLayoutWidth(label: string, leftSectionPx = 0): number {
+	const text = label ?? "";
+	if (!text) return 0;
+	const textWidth =
+		measureTextWidth(text, headerBadgeFont(), HEADER_BADGE_FONT_PX) +
+		HEADER_BADGE_LETTER_SPACING_PX * [...text].length;
+	const section = leftSectionPx > 0 ? leftSectionPx + HEADER_BADGE_SECTION_GAP_PX : 0;
+	return Math.ceil(textWidth + section + HEADER_BADGE_CHROME_PX + HEADER_BADGE_SLACK_PX);
+}
+
 export interface HeaderAfterTitleInput {
 	/** Header row border-box width. 0 = not measured yet. */
 	rowWidth: number;
@@ -132,6 +170,11 @@ export interface HeaderAfterTitleInput {
 	/** Phone menu button before everything else. */
 	showMenu?: boolean;
 	showTitleActions?: boolean;
+	/**
+	 * Fixed-width badge after the title slot in the leading block (the team link), from
+	 * {@link headerBadgeLayoutWidth}. 0 / omitted = none to place.
+	 */
+	titleBadgeWidth?: number;
 	surfacedToolCount: number;
 	showClose?: boolean;
 	/** Host pin is only rendered alongside the close control. */
@@ -145,6 +188,12 @@ export interface HeaderAfterTitleLayout {
 	overflowToolCount: number;
 	slackPx: number;
 	/**
+	 * Whether the title badge is painted. It is budgeted like fixed chrome (tools collapse
+	 * first, then the title shrinks), and dropped only when even the floored title would
+	 * leave no room for it — never at the cost of overflow / close.
+	 */
+	showTitleBadge: boolean;
+	/**
 	 * `rowWidth` unknown: tools shown optimistically; MUST NOT say "空间不足".
 	 */
 	unmeasured: boolean;
@@ -155,7 +204,7 @@ export interface HeaderAfterTitleLayout {
  *
  * DOM (NarratorPanel header row + NarratorPanelHeaderTitle + HeaderToolbar):
  *
- *   [pad16][back? gap8][title+actions][row-gap8][tools… overflow][gap10 pin?][gap10 close?][pad16]
+ *   [pad16][back? gap8][title+actions][gap8 badge?][row-gap8][tools… overflow][gap10 pin?][gap10 close?][pad16]
  *
  * `HEADER_TITLE_ACTIONS_PX` already includes the title-slot gaps after the text
  * (edit + 4 + generate + 4). The leading↔toolbar gap is charged once as
@@ -173,6 +222,7 @@ export function resolveHeaderLayoutAfterTitle(
 		showBack = false,
 		showMenu = false,
 		showTitleActions = false,
+		titleBadgeWidth = 0,
 		surfacedToolCount,
 		showClose = false,
 		showPin = false,
@@ -188,6 +238,7 @@ export function resolveHeaderLayoutAfterTitle(
 			visibleToolCount: toolsTotal,
 			overflowToolCount: 0,
 			slackPx: 0,
+			showTitleBadge: titleBadgeWidth > 0,
 			unmeasured: true,
 		};
 	}
@@ -204,6 +255,14 @@ export function resolveHeaderLayoutAfterTitle(
 		chrome += HEADER_TOOLBAR_GAP_PX + HEADER_CLOSE_WIDTH_PX;
 		if (showPin) chrome += HEADER_TOOLBAR_GAP_PX + HEADER_PIN_WIDTH_PX;
 	}
+	// A badge after the title is a fixed box behind the leading block's gap. Left out of
+	// the budget it pushes overflow and close past the row edge instead of tools into the
+	// menu; where it cannot fit beside the floored title it is not painted at all.
+	const badgeCost = titleBadgeWidth > 0 ? HEADER_LEADING_GAP_PX + titleBadgeWidth : 0;
+	const showTitleBadge =
+		badgeCost > 0 &&
+		rowWidth - chrome - badgeCost >= Math.min(titleFullWidth, HEADER_TITLE_TEXT_MIN_PX);
+	if (showTitleBadge) chrome += badgeCost;
 
 	// Complete title first.
 	let titleWidth = titleFullWidth;
@@ -228,6 +287,7 @@ export function resolveHeaderLayoutAfterTitle(
 		visibleToolCount,
 		overflowToolCount: toolsTotal - visibleToolCount,
 		slackPx: Math.max(0, remaining),
+		showTitleBadge,
 		unmeasured: false,
 	};
 }

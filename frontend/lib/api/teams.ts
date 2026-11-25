@@ -28,6 +28,15 @@ export interface CreateTeamPayload {
 	brief?: string;
 }
 
+/** Turn an existing session into a team's coordinator; its audiences stay as they are. */
+export interface UpgradeToTeamPayload {
+	fromNarratorId: string;
+	/** Omitted keeps the session's title. */
+	name?: string;
+	baseBranch?: string;
+	brief?: string;
+}
+
 /** Project teams (docs/PROJECT_TEAMS-PLAN.md P1) and the team page's reads (P4). */
 export const teamsApi = {
 	listProjectTeams: (
@@ -45,6 +54,17 @@ export const teamsApi = {
 		request<TeamDetail>(`/projects/${encodeURIComponent(projectId)}/teams`, {
 			method: "POST",
 			body: JSON.stringify(payload),
+		}),
+	upgradeSessionToTeam: (projectId: string, payload: UpgradeToTeamPayload) =>
+		request<TeamDetail>(`/projects/${encodeURIComponent(projectId)}/teams`, {
+			method: "POST",
+			body: JSON.stringify(payload),
+		}),
+	/** Disband the team and keep its coordinator as an ordinary session. */
+	disbandTeam: (projectId: string, teamId: string) =>
+		request<{ narratorId: string }>(`${teamBase(projectId, teamId)}/disband`, {
+			method: "POST",
+			body: "{}",
 		}),
 	getProjectTeam: (projectId: string, teamId: string) =>
 		request<TeamDetail>(teamBase(projectId, teamId)),

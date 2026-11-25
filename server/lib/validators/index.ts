@@ -209,6 +209,7 @@ export {
 	teamBriefSchema,
 	teamSettingsSchema,
 	updateProjectTeamSchema,
+	upgradeProjectTeamSchema,
 } from "./project-teams";
 export {
 	createProjectSchema,
@@ -243,6 +244,7 @@ export {
 	pinRecentTabSchema,
 	pluginOverlayVisibilityPatchSchema,
 	recentTabSchema,
+	recentTabStateQuerySchema,
 	recentTabsPageQuerySchema,
 	recentTabsRuntimeSchema,
 	removeRecentTabSchema,
