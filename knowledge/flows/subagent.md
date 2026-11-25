@@ -23,7 +23,7 @@ keywords:
   - subagent_conclusion_updated
   - takeover_by_user
 status: draft
-verified_at: 4d59774711a51a9ac966794090c8b3a04d549048
+verified_at: b3a48662f
 ---
 # 一次子代理委派
 
@@ -50,6 +50,7 @@ verified_at: 4d59774711a51a9ac966794090c8b3a04d549048
 - 改嵌套深度：`MAX_DELEGATION_DEPTH` 同时作用于深度戳（`withDelegationDepth`）和兜底校验（`delegationDepthOf`，`createSubagent` 与 `narrator-control.ts` 都用），ForkNarrator 另有独立的 fork 深度。
 - 改结果回传：前台看 `finishRun` 的 foreground 分支，后台看 `deliverDetachedResult` 与 `backgroundTaskService`，崩溃恢复看 [中断与恢复](../narrator/recovery.md) 的子代理接续——三处契约要一起对齐。
 - 改子代理的资源回收：`subagent-resources.ts` 的归档路径与一次运行结束路径是两个入口。
+- 进团队 queued 工作项的 `workdir`：依赖还没全部合并时步骤 1 就返回错误（`TEAM_WORK_ITEM_BLOCKED`），不调 `runSubagent`。
 - 团队工作项（`isolation: "worktree"`）的分支名：标题没有英文单词时用 `description` 作 hint，见[工作项](../collaboration/teams/work-items.md)。
 
 ## 相关

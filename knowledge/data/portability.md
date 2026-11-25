@@ -33,7 +33,7 @@ keywords:
   - MAX_IMPORT_BYTES
   - 4 GB
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: b3a48662f
 ---
 # 数据导入导出
 
@@ -46,8 +46,8 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 导入只合并 `applyImport` 里显式 `copyTable` 的表；`copyTable` 用「两库列交集」做 `INSERT OR IGNORE ... SELECT`（`data-portability.ts:copyTable`）。因此快照新增的列会丢，目标库新增的 NOT NULL 无默认值列会让旧快照导入失败。
 - 会话 id 冲突在预览阶段联查检出，由调用方选 `overwrite` / `skip`（`ConflictDecision`）；跳过的会话连同其消息、引用、工具调用、块一起不导入（`copyTable` 的 `excludeNarrators`）。
 - 版本：manifest `version` 1=无密钥、3=带 sealed 密钥；高于导入端支持版本抛 `IMPORT_VERSION_TOO_NEW`（`assertVersion`）。供应商密钥不进 `providers.json`，用口令封进 `provider-keys.sealed.json`（`data-portability-keys.ts`）。
-- `clearData`（requests / sessions / providers / all）在一个事务内执行；清 sessions 要先断开 terminals、benchmark 结果等对会话的引用，并先删 team 三表（它们不导出）。清空前由路由校验当前用户密码（`storage-transfer.ts` 的 `/clear`）。
-- 不导出的会话附属表：`outline_spec_imports`、`outline_spec_loss_*`、team 三表；导入后 `reconcileImportedTeamTraits` 按本机有无 team 行修正 `team` trait。
+- `clearData`（requests / sessions / providers / all）在一个事务内执行；清 sessions 要先断开 terminals、benchmark 结果等对会话的引用，并先删 team 四表（含 `team_work_item_dependencies`，它们不导出）。清空前由路由校验当前用户密码（`storage-transfer.ts` 的 `/clear`）。
+- 不导出的会话附属表：`outline_spec_imports`、`outline_spec_loss_*`、team 四表；导入后 `reconcileImportedTeamTraits` 按本机有无 team 行修正 `team` trait。
 - 导入大小上限 `MAX_IMPORT_BYTES`=4GB（预览与执行都按它流式累计校验），快照解压后上限 `MAX_SNAPSHOT_UNCOMPRESSED_BYTES`=16GB，常量在 `shared/storage-transfer.ts`；前端用同一常量本地预检。
 - 路由全部 `requireAdmin`（导出含供应商时 `GET` 直接拒绝 `STEP_UP_REQUIRED`，要走 `POST` 带 `stepUpToken` 和封存口令）：`GET/POST /api/storage/export`、`POST /export/ticket`、`POST /import/preview`、`POST /import`、`POST /clear`；票据下载 `GET /api/storage/export/download` 不走 `requireAdmin`（凭票据）。
 - 无 File System Access API 的浏览器走短期导出票据：2 分钟 TTL、一次有效、最多 32 张（`EXPORT_TICKET_TTL_MS`、`consumeExportTicket`）。

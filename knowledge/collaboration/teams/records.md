@@ -66,7 +66,7 @@ keywords:
   - team_upgrade
   - team_disband
 status: draft
-verified_at: ef28ecaaf
+verified_at: b3a48662f
 ---
 # 团队与成员
 
@@ -146,17 +146,17 @@ verified_at: ef28ecaaf
   - 否则在同一事务内连带删除团队行（`deleteTeamOfNarratorInTransaction`）。
 - 团队行 RESTRICT 叙述者与项目删除，删团队级联删工作项与事件（`team-tables-contract.test.ts`）。
 - 侧栏的团队标签（`team:<id>`）跟着生命周期走：归档时 `startTeamStatusSync` 从所有持有者的侧栏移除（取消归档不放回），删除协调者或解散团队时一并移除，失去协调者读权限的持有者也会被移除（见[最近标签页](../recent-tabs.md)）。
-- 数据导入/导出：三张团队表不导出，导入后会话的 `team` trait 以本机有没有团队行为准（`data-portability.ts:reconcileImportedTeamTraits`）。
+- 数据导入/导出：四张团队表（含工作项依赖）不导出，导入后会话的 `team` trait 以本机有没有团队行为准（`data-portability.ts:reconcileImportedTeamTraits`）。
 - IM 网关永远不能驱动团队会话，也不能做团队树里的批准决定。
 
 ## 从哪读起
 - `server/services/teams/team-service.ts`：团队创建、读取、访问判定（本节点的入口，锚在总览）。
 - `team-members.ts`：成员拼装；`team-membership.ts`：会话归属；`team-records.ts`：删除前检查。
 - `server/lib/validators/project-teams.ts`：团队路由的 Zod 校验。
-- `server/db/schema.ts`：`project_teams`、`team_work_items`、`team_work_events` 三张表。
+- `server/db/schema.ts`：`project_teams`、`team_work_items`、`team_work_item_dependencies`、`team_work_events` 四张表。
 
 ## 改它时
-- 动团队三张表：`server/db/schema.ts` 与 `postgres-schema.ts` 同步，再按流程生成 SQLite 与 PG 迁移；`team-tables-contract.test.ts` 在两边对同一组约束，漏一边会失败。
+- 动团队的表：`server/db/schema.ts` 与 `postgres-schema.ts` 同步，再按流程生成 SQLite 与 PG 迁移；`team-tables-contract.test.ts` 在两边对同一组约束，漏一边会失败。
 - 它们不在数据导出清单里：保持 `reconcileImportedTeamTraits` 与清空会话时先删团队表的顺序（团队行 RESTRICT 叙述者删除）。
 - 不要加团队成员表；成员判定变化要同步 `team-members.ts` 的拼装来源与 `team-status-members.test.ts`。
 - 改团队路由入参：`validators/project-teams.ts` 与前端 `lib/api/teams.ts` 一起改；两个创建入口共用 `TeamCreateFields.tsx`，新字段加在那里。人填的字段规则改在 `shared/project-team-draft.ts`，不要在前端另写一份正则（`team-draft.test.ts` 用路由校验器对照）。

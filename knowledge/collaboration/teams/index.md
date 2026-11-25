@@ -16,7 +16,7 @@ keywords:
   - requireSqliteProjectMutation
   - TeamStatus
 status: draft
-verified_at: ef28ecaaf
+verified_at: b3a48662f
 ---
 # 团队
 
@@ -49,7 +49,7 @@ verified_at: ef28ecaaf
 - `shared/project-teams.ts` 也定义 `TEAM_TRAIT` 与 `hasTeamTrait`（服务端 `narrator-utils.ts` 原样转出，前端会话头部的团队标记靠它），以及事件种类的运行时列表 `TEAM_LEVEL_EVENT_KINDS`、`TEAM_WORK_EVENT_KINDS`、`TEAM_OVERLAP_EVENT_KINDS`、`TEAM_PERSON_DECISION_EVENT_KINDS`（对应类型由它们推出），团队页活动据此给每种事件配文案。
 
 ## 改它时
-- 团队三张表（`project_teams`、`team_work_items`、`team_work_events`）改动要同步 SQLite 与 PG schema，细节见团队与成员、工作项。
+- 团队四张表（`project_teams`、`team_work_items`、`team_work_item_dependencies`、`team_work_events`）改动要同步 SQLite 与 PG schema，细节见团队与成员、工作项。
 - 新增团队写路由：沿用 `project-teams.ts` 顶部的 `requireSqliteProjectMutation`，再做 `loadTeamForAccess` 访问判定（升级与解散在 `teams/team-conversion.ts`，另要求会话 owner 或管理员）。
 - 不变量：成员关系永远取自协调者的叙述者 ACL，不要加团队成员表；服务端不合并、不删分支、不直接跑 `git worktree`；所有团队读取必须带 LIMIT 并且 SQLite 专用；IM 网关不得驱动团队会话（见 [IM 网关](../gateway.md)）。
 

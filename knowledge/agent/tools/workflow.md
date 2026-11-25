@@ -43,7 +43,7 @@ keywords:
   - expectedRevision
   - missing_working_directory
 status: draft
-verified_at: 69715f280
+verified_at: b3a48662f
 ---
 # 流程与协作工具
 
@@ -55,12 +55,13 @@ verified_at: 69715f280
 - `ScheduledTask`：actions 为 list/get/create/update/enable/disable/delete/run_now/runs，`runs` 单页最多 50 条、默认 10；create 必填 name/cronExpr/prompt，校验 cron 与项目上下文，任务以当前用户身份创建。读动作只有 list/get/runs，其余一律视为写：判定在 `narrator-permission.ts`，位于 bypassPermissions 快捷路径之上，所以绕过模式也要确认，readOnly/dontAsk 直接拒绝。
 - `Skill`：按名字（`skill` 或 `name`）加载技能全文，返回 `<skill_content>`、技能目录与附带文件列表；被 trait 屏蔽（`blockedSkills`）的技能报错。可用技能清单以 `<available_skills>` 注入提示词，不含 disabled 与 `allowImplicitInvocation: false` 的技能；清单缓存按技能上下文键存放，会话创建时预热。
 - 知识包 `PackList`/`PackActivate`/`PackDeactivate`：激活把包解压到隔离目录并作为读写白名单登记，与激活记录在同一次存储操作里完成；`settings.knowledge.packActivateRequiresPermission`（默认 true）为真时激活要用户批准。停用删除目录并撤销白名单，没激活也安全。
-- `Team`：仅团队协调者会话可见（`agent-runtime/orchestrator.ts` 过滤）。actions 为 work.list/create/review/ready/sync/cancel、brief、checkin、cleanup、decision。权限逐动作判定，位于绕过与 dontAsk 快捷路径之上：读动作放行；`cleanup` 删除目录，永远要人批准，readOnly、dontAsk、计划模式下直接拒绝；其余写动作在 readOnly 下拒绝，其他模式放行（审查只读会话另有拦截，未逐项核实）。出错时结果是 `{ error: { code, message }, details? }`，`details` 照搬 `AppError.details`（例如 `work.ready` 被知识检查拒绝时列出的节点与文件），见 [工作项](../../collaboration/teams/work-items.md)。
+- `Team`：仅团队协调者会话可见（`agent-runtime/orchestrator.ts` 过滤）。actions 为 work.list/create/update/review/ready/sync/cancel、brief、checkin、cleanup、decision（`work.update` 只替换 queued 项的 `dependsOn`）。权限逐动作判定，位于绕过与 dontAsk 快捷路径之上：读动作放行；`cleanup` 删除目录，永远要人批准，readOnly、dontAsk、计划模式下直接拒绝；其余写动作在 readOnly 下拒绝，其他模式放行（审查只读会话另有拦截，未逐项核实）。出错时结果是 `{ error: { code, message }, details? }`，`details` 照搬 `AppError.details`（例如 `work.ready` 被知识检查拒绝时列出的节点与文件），见 [工作项](../../collaboration/teams/work-items.md)。
 - worktree：当前面向模型的是 `ListWorktrees`、`CreateWorktree`（新分支）、`AttachWorktree`（已有分支）、`GetWorktreeOperation`；旧的 `Worktree` 工具 `isAvailable` 恒为 false，只保留历史执行与恢复。创建返回 operationId，结果未知时只能用 `GetWorktreeOperation` 对账，不可重建或清理；`switchToWorktree` 可顺带切换工作目录，成功切换会结束当前这一轮。
 - `SwitchDevice`：改变文件与命令工具的默认执行设备，未知设备或离线设备报错；运行策略禁止本机执行时拒绝切到 `local`；设备还没有工作目录时拒绝，并指向 `SwitchWorkingDirectory`。
 - `Recall`：默认只搜索与读取当前叙述者；`all_narrators: true` 跨全部叙述者，权限层要求批准（bypass 模式直接放行）。search 默认 20 条、上限 50，单次最多 10 个查询；读取默认 20 条、上限 50；搜索走搜索端口，会话读取走 SQLite Worker 快照。
 - `SwitchWorkingDirectory`：切换普通主叙述者的工作目录，参数必须带当前工作区修订号 `expectedRevision`、唯一 `requestId` 和目标 `{deviceId, cwd}`（严格对象，多余字段被拒，`validators/workspace-context.ts`）；运行时不支持切换时报错。会话自己的目录不存在时由 `working-directory-recovery.ts` 生成 `missing_working_directory` 致命结果并带建议目录，而工具入参里错误的 `workdir` 只是模型的错，会话继续、让模型重试。
 - `ImageGen`：必须显式给出生图模型 ID，不会用对话模型替代；提供商需实现 `generateImage`。已付费的响应在本地处理失败时，仅传 `response_id` 恢复，不会再发起生成请求。
+- `Team` 的 `work.create` 与 `work.update` 带 `dependsOn`（本团队工作项 id，最多 20）：依赖合并前开始这一项会被拒（`TEAM_WORK_ITEM_BLOCKED`），见[工作项](../../collaboration/teams/work-items.md)。
 - `Team` 的 `work.create` 可带 `branchHint`（几个英文单词，最多 80 字符，`TEAM_WORK_BRANCH_HINT_MAX_LENGTH`），优先于标题给工作项分支命名；分支名只取 ASCII 单词，见[工作项](../../collaboration/teams/work-items.md)。
 
 ## 从哪读起

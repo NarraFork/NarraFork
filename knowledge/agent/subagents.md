@@ -66,7 +66,7 @@ keywords:
   - subagent_nested_changed
   - FORK_NARRATOR_MAX_DEPTH
 status: draft
-verified_at: 69715f280
+verified_at: b3a48662f
 ---
 # 子代理
 
@@ -82,6 +82,7 @@ verified_at: 69715f280
 - 资源回收（`subagent-resources.ts`）：子代理被归档或删除时，关闭它创建的所有运行中终端和启动的浏览器会话；一次运行结束且没有待处理工作（helper 仍在工作、或已排队的输入）时，关闭此刻打开的浏览器会话，终端保留（dev server、REPL 可跨轮使用）。主叙述者不受影响，所有函数尽力而为、不抛错；单次最多关闭 50 个终端。
 - `subagent-lifecycle.ts:interruptAndArchiveSubagent`：先取消运行再标记归档，不抛错，保证删除历史不会因副作用失败。
 - 与子代理通信：Send（异步）与 Watch（观察）；运行时策略不含 `watchAgent` 能力时 Watch agent 被拒（`subagent-communication-policy.ts`）。
+- `workdir` 是团队里一个 queued 工作项的 worktree 时，子代理成为它的工作者；这一项还有未合并的依赖就在创建子代理前拒绝（`Agent error (TEAM_WORK_ITEM_BLOCKED)`，什么都不建），见[工作项](../collaboration/teams/work-items.md)。
 - `isolation: "worktree"` 建的工作项分支名取标题的 ASCII 单词；标题里没有（中文标题）时改用 `description` 的英文单词作 `branchHint`（`task.ts`），规则见[工作项](../collaboration/teams/work-items.md)。
 
 ## 从哪读起

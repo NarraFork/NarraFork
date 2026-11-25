@@ -42,8 +42,11 @@ keywords:
   - /teams/:teamId/work/:itemId
   - permission_decided_by
   - answerForm
+  - queuedLine
+  - DependencySections
+  - 被依赖
 status: draft
-verified_at: 15e7759dc
+verified_at: b3a48662f
 ---
 # 团队页与审批
 
@@ -54,8 +57,9 @@ verified_at: 15e7759dc
 - 路由挂在 `/api/projects/:projectId/teams...`：列表/创建/详情/修改/归档/取消归档、`summary`、`board`（每列每页 50）、`events`、`approvals`、`members`、`running`，以及重设计（R）加的 `work-stats`、`work/:itemId`、`work/:itemId/diff`、`work/:itemId/return`。
 - 每条读都是带 LIMIT 的主键/索引读。看板项多一个 `activity`：工作者在 working/waiting 时它最近一次工具调用（`(narrator_id, created_at)` 索引一行，输入取 4KB 前缀，预览 ≤120 字）。摘要多 `coordinatorMessageCount`（判起步状态）、`coordinatorStopReason`（判「已暂停」）、运行中会话（最多 20 个）各自的 `activity`（每个一次索引探测，行的「在做什么」随摘要刷新而不必重读看板）和 `heldWorktreeCount`（已结束但仍记录 worktree 的项，数到 51 为止）。
 - 待批列表每项多 `parentId`（子代理的上级，用来把助手的调用挂到工作者的工作项上）、计划的 `preview` 是计划首行标题（`planTitle`），提问在输入前缀能完整解析、只有一个问题且选项 1–6 个时带 `answerForm`（答案键 = 规范化后的 header，同时是标题；`description` 是完整提问；选项是完整标题，即发给模型的答案值，从不截断，页面只截显示；`optionDescriptions` 是每个选项的说明；同 `shared/ask-user-question-shape.ts`，与会话里的 `AskUserQuestionBanner` 一致），供就地回答。`questions` 预览也按规范化形状取（`description`，没有就标题；旧形状的 `question` 正文同样读得到）。审批接口不再算「最近的决定」（`recent`）：谁批的在动态里。
+- D：看板卡片（`readTeamBoardColumn`、`readBoardItem`、`readReadyItems`）多 `dependsOn: { id, title, state }[]`，整页一次 `IN` 读（`team-board.ts:withDependencies`），没有依赖时是空数组。
 - `work-stats?ids=`（读者可读，最多 50 个，逗号分隔）：每项 `+/-`、文件数、二进制数、`truncated`。活的项在其 worktree 里按 HEAD 与基线的合并基 `diff --numstat` 读；已结束或 worktree 没了的项用最近一次 `work.ready` 事件记下的 `head` 与 `mergeBase`，在项目仓库（协调者 cwd）里读；都没有就是 null。结果按项缓存 20 秒、项的 `updated_at` 一变就重读，最多 200 条，每条只留总数和前 300 个文件，同一请求并发 4 个。前端按 50 个一组分批请求，每一行都有大小；没有改动（+0 −0 且 0 个文件）时不显示。
-- `work/:itemId`（读者可读）：卡片、基线、领先几个提交（`rev-list --count`）、大小、改动文件（最多 300，`filesMore`）、能否读 diff、评审轮次（`work.review` 与 `work.returned` 事件）、这一项最近 100 条事件（详情 ≤2304 字才带）、`canReturn`（成员、团队活跃、状态 in_review/ready）。不带 diff 正文。
+- `work/:itemId`（读者可读）：卡片、基线、领先几个提交（`rev-list --count`）、大小、改动文件（最多 300，`filesMore`）、能否读 diff、评审轮次（`work.review` 与 `work.returned` 事件）、这一项最近 100 条事件（详情 ≤2304 字才带）、`canReturn`（成员、团队活跃、状态 in_review/ready）、依赖它的项 `dependents`（最多 50，`dependentsMore`）。不带 diff 正文。
 - `work/:itemId/diff?path=`：路径按字面、从仓库根算（`:(top,literal)`，`*.txt` 就是那个文件，不是通配；已结束的项在协调者工作目录里读，它可能是子目录），只读合并基 → head 的改动，没改过的路径 diff 为空即 404；`diff -U3` 经 `stdoutStream` 读到 64KB+1 字节即停，`truncated` 标出。
 - git 只经 `teams/team-git.ts`（`mergeBase`、`numstat`、`fileDiff`，见[工作项](work-items.md)）：全部只读提交，60s 超时、输出有上限。
 
@@ -78,6 +82,7 @@ verified_at: 15e7759dc
 - `TeamHeader.tsx`：一行（手机两行）：返回、项目名、团队名、状态句（`team-page-model.ts:statusSentence`：「N 项进行中 · M 项等你」，旁观者是「等成员处理」，「空闲 · 还没有工作项 / N 项已完成」，「已暂停」= 有未完成项、没有在跑的会话且协调者上一轮被人停下，「已归档」）；等待数在审批列表 `more` 时写成「N+ 项等你」；右侧成员头像（最多 3 个加 +N，点开成员抽屉 `TeamMembers.tsx`）、固定到侧栏、「全部暂停」（普通按钮；手机上在「…」里）、「…」菜单（运行中的会话列表，取自摘要，点开会话；团队设置 `TeamSettingsModal.tsx` 改基线分支与简报、协调者完整会话、解散团队 `TeamDisbandDialog.tsx`）。手机上两行，第一行仍有返回箭头。「全部暂停」只给成员，协调者已归档时只在还有会话在跑时出现；协调者先停（`pauseOrder`），一次最多读 500 个运行中会话，结果分 paused / pausedSomeIdle / pausePartial / pauseNothing / pauseMore。
 - `TeamAttention.tsx`「等你处理」：只给成员，没有就不显示，琥珀色是全页唯一高饱和色。条目（`attentionEntries`）先是待决调用（按提出顺序），再是 ready 项（按更新时间）。工具调用：谁、命令或路径、拒绝/批准；提问：标题、完整提问、各选项的说明（灰字，截成两行）、选项按钮和「自己写…」（`answerForm`）；提问超过 600 字或某个选项说明超过 300 字时不在卡片上一键回答（`fitsInPlace`），和多问题、多选一样点「回答」开对话框，经 human-attention 详情读取完整表单（`AskUserQuestionBanner`）；计划：标题、「看计划」（同样经详情读计划正文）与「批准」；规则请求：去会话里处理；卡片上的会话/工作项名点开提问的会话，有 `decisionReason` 时显示成一行灰字；列表有 `more` 或 `unscanned` 时底部说明还有没列出的并可打开协调者会话；可合并：+/-、文件数、评审结论、分支 → 基线、查看改动/退回/合并（禁用）。多于 3 条折成「还有 N 条」；悬停卡片高亮右栏对应的工作项；手机上卡片横向滑动并显示「1 / N」。
 - `TeamWorkList.tsx`「工作」（`workGroups`）：需要你（等人决定或可合并；旁观者看不到调用，用工作者的 waiting 状态代替，标题叫「等成员处理」）、进行中（先 in_progress 后排队）、评审 · 就绪，已完成和已取消折叠成数量，展开才读那一列；每行状态点、标题、标记（`itemMarks`：持有独占路径锁、已结束但仍保留 worktree）、一行在做什么（`rowLine`，活动取摘要里的 `liveActivity`，工具名经 `teams.page.row.tools.*` 译成动词；旁观者看到等待中的工作者时，按其最近一次工具调用写「等批准 X / 等回答」，不知道时写「等人处理」）、+/-。没有工作项时是虚线说明；全部结束时（`teamPageMode.wrapUp`）顶部建议归档或解散，已完成默认展开；还有已结束项保留 worktree 时不提供解散（服务端会以 `TEAM_HAS_LIVE_WORK` 拒绝），改为说明让协调者清理（每次清理都要人批准）或先归档。
+- 依赖（D）：排队的行按 `team-page-model.ts:queuedLine` 写——等一两项时点名「排队 · 等「A」合并」/「排队 · 等「A」「B」合并」，更多时「排队 · 等 N 项合并」，有已取消的依赖时「排队 · 依赖「A」已取消」（只算未合并的依赖，`dependencyBlockers`）。抽屉在字段下面有「依赖」（每项状态徽标，标题点开那一项，排队且有已取消依赖时一条黄色警告，否则一行「都合并到 <基线> 后才能开始」）与「被依赖」（`TeamWorkDrawer.tsx:DependencySections`，`onOpenItem` 由 `TeamPageView` 传入）。人不能在这里改依赖。动态里 `work.dependencies_changed`（「等 N 项合并」/「不再依赖」）与 `work.unblocked`（「依赖的工作项都已合并」）有自己的文案。
 - `TeamActivity.tsx`「动态」：安静的按时间列表（时间、谁、什么、哪一项、说明），标题与说明用 `eventLabelKey`/`eventNote`，未知种类显示 `teams.event.other`，种类名只在 tooltip 里；`work.returned` 的说明是理由原文。
 - `TeamWorkDrawer.tsx`：标题与结论徽标、分支 → 基线与领先提交数、工作者会话链接、改动文件（展开某个文件才读它的 diff）、评审记录（人退回的那轮带理由）、这一项的时间线；底栏（`canReturn` 时）退回 / 合并到基线（禁用），退回就地展开成必填理由，拒绝码 `TEAM_WORK_ITEM_NOT_RETURNABLE` / `TEAM_WORK_ITEM_CHANGED` / `TEAM_ARCHIVED` 有自己的中英文（`returnErrorKey`）。时间线与评审记录里协调者签作「协调者」（`isCoordinator`），不用团队名。
 - `TeamStart.tsx` 起步状态（没有工作项且协调者还没有消息、未归档；只给成员，只读成员看到一行 `TeamReadOnlyStart`）：盖在对话的消息区上（不挡头部与输入框），一句话、一行说明、3 个示例，点击经 `lib/composer-append-queue.ts` 填入协调者的输入框。

@@ -42,7 +42,7 @@ keywords:
   - __agg__
   - auto: 前缀
 status: draft
-verified_at: 7a8bdfb90
+verified_at: b3a48662f
 ---
 # 迁移（SQLite 与 PostgreSQL）
 
