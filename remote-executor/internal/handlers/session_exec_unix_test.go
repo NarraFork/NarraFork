@@ -171,3 +171,22 @@ func TestExecSessionNaturalExitAtTheDeadlineIsNotATimeout(t *testing.T) {
 		}
 	}
 }
+
+// A command that catches SIGHUP and exits 0 is still reported as stopped by its
+// deadline: an exec session is stopped with SIGKILL, never a catchable hangup.
+func TestExecSessionDeadlineIsNotHiddenByAHangupTrap(t *testing.T) {
+	h, root := newSessionHandlers(t)
+	if _, err := h.SessionOpen(map[string]any{
+		"sessionId": "exec-trap",
+		"kind":      "exec",
+		"command":   "trap 'exit 0' HUP TERM; sleep 300 & wait",
+		"cwd":       root,
+		"timeoutMs": float64(200),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, result := attachAll(t, h, "exec-trap", 0)
+	if result.ExitCode == 0 || !result.TimedOut {
+		t.Fatalf("a deadline stop was hidden by the trap: %+v", result)
+	}
+}

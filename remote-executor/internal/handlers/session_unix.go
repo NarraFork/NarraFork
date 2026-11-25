@@ -133,7 +133,7 @@ func (p *execProcess) Kill() error {
 	if p.reaped || p.cmd.Process == nil {
 		return nil
 	}
-	killPtySession(p.cmd.Process.Pid)
+	killExecSession(p.cmd.Process.Pid)
 	_ = p.cmd.Process.Kill()
 	return nil
 }
