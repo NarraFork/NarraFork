@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -14,12 +14,54 @@ const previousHome = process.env.NARRAFORK_HOME;
 process.env.NARRAFORK_HOME = home;
 const { ModelOptionsClient, captureModelOptionsSnapshot } = await import("./model-options");
 const { settings, saveSettings } = await import("./settings");
-const { getCodexManager } = await import("./codex-manager");
+const { CodexManager, __setCodexManagerForTests } = await import("./codex-manager");
+const { runtimeModelReadiness } = await import("./settings/runtime-readiness");
 const saved = structuredClone(settings);
-const codex = getCodexManager();
-const originalAvailable = Object.getOwnPropertyDescriptor(codex, "availableCount");
-let credentials = 0;
-Object.defineProperty(codex, "availableCount", { configurable: true, get: () => credentials });
+const originalFetch = globalThis.fetch;
+let codex: InstanceType<typeof CodexManager>;
+function installCodexFixture() {
+	const managerHome = mkdtempSync(join(home, "codex-"));
+	const directory = join(managerHome, ".narrafork");
+	mkdirSync(directory, { recursive: true });
+	writeFileSync(
+		join(directory, "codex-credentials.json"),
+		JSON.stringify(
+			["a", "b"].map((id) => ({
+				id,
+				refreshToken: `rt-${id}`,
+				accessToken: `at-${id}`,
+				accountId: `account-${id}`,
+				expiresAt: Date.now() + 60 * 60_000,
+				priority: 0,
+				disabled: true,
+				disabledReason: "manual",
+			})),
+		),
+	);
+	codex = new CodexManager({ homeDir: managerHome, registerProcessHooks: false });
+	__setCodexManagerForTests(codex);
+}
+function mockUsage(usedPercent: number) {
+	globalThis.fetch = (async () =>
+		new Response(
+			JSON.stringify({
+				plan_type: "plus",
+				rate_limit: {
+					allowed: usedPercent < 100,
+					limit_reached: usedPercent >= 100,
+					primary_window: {
+						used_percent: usedPercent,
+						limit_window_seconds: 18_000,
+						reset_after_seconds: 3600,
+						reset_at: Math.floor(Date.now() / 1000) + 3600,
+					},
+					secondary_window: null,
+				},
+				additional_rate_limits: [],
+			}),
+			{ status: 200, headers: { "Content-Type": "application/json" } },
+		)) as unknown as typeof fetch;
+}
 const cache = new Map<string, string[]>();
 const disposeCaptures = (
 	["completions-compatible", "openai-responses", "anthropic-messages", "gemini-compatible"] as const
@@ -74,17 +116,17 @@ function client() {
 }
 const query = { q: "", scope: "concrete" as const, limit: 100 };
 beforeEach(() => {
-	credentials = 0;
+	installCodexFixture();
 	cache.clear();
 	configure([]);
 });
 afterEach(async () => {
 	await Promise.all(clients.splice(0).map((value) => value.close()));
+	globalThis.fetch = originalFetch;
+	__setCodexManagerForTests(undefined);
 });
 afterAll(() => {
 	for (const dispose of disposeCaptures) dispose();
-	if (originalAvailable) Object.defineProperty(codex, "availableCount", originalAvailable);
-	else Reflect.deleteProperty(codex, "availableCount");
 	saveSettings(saved);
 	if (previousHome === undefined) delete process.env.NARRAFORK_HOME;
 	else process.env.NARRAFORK_HOME = previousHome;
@@ -244,19 +286,77 @@ test("aggregation Codex pins cannot bypass the credential gate", async () => {
 	expect(page.items[0]?.available).toBe(false);
 });
 
+test("real quota exhaustion and recovery preserve configured readiness and the same client index", async () => {
+	codex.setDisabled("a", false);
+	const { connectCompiledWorker } = await import("./compiled-worker");
+	let starts = 0;
+	const instance = new ModelOptionsClient({
+		capture: captureModelOptionsSnapshot,
+		connect: (...args) => {
+			starts++;
+			return connectCompiledWorker(...args);
+		},
+	});
+	clients.push(instance);
+	const initial = captureModelOptionsSnapshot();
+	const first = await instance.query({ ...query, q: "codex", limit: 1 });
+	expect(first.items).toHaveLength(1);
+	mockUsage(100);
+	await codex.getUsage("a");
+	expect(codex.availableCount).toBe(0);
+	expect(runtimeModelReadiness(settings, "codex:gpt-6-astra")).toBe(true);
+	expect(captureModelOptionsSnapshot().revision).toBe(initial.revision);
+	expect((await instance.query({ ...query, q: "codex", limit: 1 })).items).toHaveLength(1);
+	mockUsage(20);
+	await codex.getUsage("a");
+	expect(codex.availableCount).toBe(1);
+	expect(runtimeModelReadiness(settings, "codex:gpt-6-astra")).toBe(true);
+	expect(captureModelOptionsSnapshot().revision).toBe(initial.revision);
+	const continued = await instance.query({
+		...query,
+		q: "codex",
+		limit: 1,
+		cursor: first.nextCursor ?? undefined,
+	});
+	expect(continued.items).toHaveLength(1);
+	expect(starts).toBe(1);
+});
+
+test("real manual stops and archival update configured presence for the same client", async () => {
+	codex.setDisabled("a", false);
+	const instance = client();
+	const initial = captureModelOptionsSnapshot();
+	expect((await instance.query({ ...query, q: "codex", limit: 1 })).items).toHaveLength(1);
+	codex.setDisabled("a", true);
+	expect(runtimeModelReadiness(settings, "codex:gpt-6-astra")).toBe(false);
+	expect(captureModelOptionsSnapshot().revision).not.toBe(initial.revision);
+	expect((await instance.query({ ...query, q: "codex", limit: 1 })).items).toEqual([]);
+	codex.setDisabled("a", false);
+	expect(captureModelOptionsSnapshot().revision).toBe(initial.revision);
+	expect((await instance.query({ ...query, q: "codex", limit: 1 })).items).toHaveLength(1);
+	codex.archiveCredential("a");
+	expect(runtimeModelReadiness(settings, "codex:gpt-6-astra")).toBe(false);
+	expect((await instance.query({ ...query, q: "codex", limit: 1 })).items).toEqual([]);
+	codex.unarchiveCredential("a");
+	expect(runtimeModelReadiness(settings, "codex:gpt-6-astra")).toBe(true);
+	expect(captureModelOptionsSnapshot().revision).toBe(initial.revision);
+	expect((await instance.query({ ...query, q: "codex", limit: 1 })).items).toHaveLength(1);
+});
+
 test("enabled credential presence updates before paging; positive count fluctuations keep a stable generation", async () => {
 	configure([provider()]);
 	const instance = client();
 	const absent = await instance.query({ ...query, q: "codex", limit: 1 });
 	expect(absent.items).toEqual([]);
 	expect(absent.hasMore).toBe(false);
-	credentials = 1;
+	codex.setDisabled("a", false);
 	const available = captureModelOptionsSnapshot();
 	expect(available.codex).toBe(true);
-	credentials = 2;
+	codex.setDisabled("b", false);
 	expect(captureModelOptionsSnapshot().revision).toBe(available.revision);
 	expect((await instance.query({ ...query, q: "codex", limit: 1 })).items).toHaveLength(1);
-	credentials = 0;
+	codex.setDisabled("a", true);
+	codex.setDisabled("b", true);
 	expect(captureModelOptionsSnapshot().revision).not.toBe(available.revision);
 	const codexPage = await instance.query({ ...query, q: "codex", limit: 1 });
 	expect(codexPage.items).toEqual([]);

@@ -350,6 +350,9 @@ test("paginated aggregation members preserve pins and never mix their cursors wi
 	const calls: URL[] = [];
 	const choices: string[] = [];
 	const promoted: string[] = [];
+	const defaulted: string[] = [];
+	const summarized: string[] = [];
+	const details: ModelOption[] = [];
 	localStorage.getItem = (key: string) => (key === "narrafork_token" ? "menu-actor" : null);
 	globalThis.fetch = (async (url: unknown) => {
 		const parsed = new URL(String(url), "http://test");
@@ -362,7 +365,8 @@ test("paginated aggregation members preserve pins and never mix their cursors wi
 			items: agg
 				? [
 						{
-							value: `__agg__:${agg}:${next ? "b:two" : "a:one"}`,
+							value: `__agg__:${agg}:${next ? "b:two" : "relay:model"}`,
+							concreteValue: next ? "b:two" : "relay:model",
 							label: next ? "Two" : "One",
 							provider: next ? "b" : "a",
 						},
@@ -373,6 +377,12 @@ test("paginated aggregation members preserve pins and never mix their cursors wi
 										label: "Locked",
 										provider: "codex",
 										available: false,
+									},
+									{
+										value: `__agg__:${agg}:auto:nested`,
+										concreteValue: "auto:nested",
+										label: "Nested",
+										provider: "auto",
 									},
 								]
 							: []),
@@ -388,6 +398,7 @@ test("paginated aggregation members preserve pins and never mix their cursors wi
 								memberCount: 2,
 							},
 							{ value: "auto:x", label: "X", modelId: "x", sourceCount: 1 },
+							{ value: "plain:model", label: "Plain", provider: "plain" },
 						],
 			nextCursor: agg && !next ? "group-next" : null,
 			hasMore: !!agg && !next,
@@ -410,8 +421,15 @@ test("paginated aggregation members preserve pins and never mix their cursors wi
 									opened={opened}
 									currentModel="__agg__:group:hidden:pin"
 									onSelect={(value) => choices.push(value)}
-									onSetAsDefaultModel={(value) => promoted.push(value)}
-									onSetAsSummaryModel={(value) => promoted.push(value)}
+									onSetAsDefaultModel={(value) => {
+										promoted.push(value);
+										defaulted.push(value);
+									}}
+									onSetAsSummaryModel={(value) => {
+										promoted.push(value);
+										summarized.push(value);
+									}}
+									onShowPrice={(model) => details.push(model)}
 								/>
 							</Menu>
 						</I18nextProvider>
@@ -429,11 +447,38 @@ test("paginated aggregation members preserve pins and never mix their cursors wi
 		await act(async () => target.click());
 		await flush();
 	};
+	const openActions = async (text: string) => {
+		const row = Array.from(host.querySelectorAll<HTMLButtonElement>("[data-menu-item]")).find(
+			(item) => item.textContent === text,
+		);
+		const toggle = row?.parentElement?.parentElement?.querySelector<HTMLButtonElement>(
+			`[aria-label="${narratorLocale.modelActions}"]`,
+		);
+		if (!toggle) throw new Error(`Missing actions: ${text}`);
+		await act(async () => toggle.click());
+		await flush();
+	};
 	try {
 		await mount(false);
 		expect(calls).toHaveLength(0);
 		await mount(true);
 		expect(calls).toHaveLength(1);
+		await openActions("Plainplain");
+		await click(narratorLocale.modelTooltip);
+		expect(details.map((row) => row.value)).toEqual(["plain:model"]);
+		await openActions("Group__agg__");
+		expect(
+			Array.from(host.querySelectorAll("button")).some(
+				(row) => row.textContent === narratorLocale.modelTooltip,
+			),
+		).toBe(false);
+		expect(
+			Array.from(host.querySelectorAll("button")).filter(
+				(row) =>
+					row.textContent === narratorLocale.setAsDefaultModel ||
+					row.textContent === narratorLocale.setAsSummaryModel,
+			),
+		).toHaveLength(2);
 		await click("Group__agg__");
 		expect(choices).toEqual(["__agg__:group"]);
 		await click("2");
@@ -464,12 +509,30 @@ test("paginated aggregation members preserve pins and never mix their cursors wi
 			await act(async () => promote.click());
 		}
 		expect(promoted).toEqual([]);
+		await openActions("Nestedauto");
+		expect(
+			Array.from(host.querySelectorAll("button")).some(
+				(row) => row.textContent === narratorLocale.modelTooltip,
+			),
+		).toBe(false);
 		await click("Onea");
-		expect(choices.at(-1)).toBe("__agg__:group:a:one");
+		expect(choices.at(-1)).toBe("__agg__:group:relay:model");
+		await openActions("Onea");
+		await click(narratorLocale.setAsDefaultModel);
+		await click(narratorLocale.setAsSummaryModel);
+		await click(narratorLocale.modelTooltip);
+		expect(defaulted).toEqual(["__agg__:group:relay:model"]);
+		expect(summarized).toEqual(["__agg__:group:relay:model"]);
+		expect(details.map((row) => row.value)).toEqual(["plain:model", "relay:model"]);
 		await click(narratorLocale.contextComposition.loadMore);
 		expect(calls).toHaveLength(3);
 		expect(calls[2].searchParams.get("aggregationId")).toBe("group");
 		expect(calls[2].searchParams.get("cursor")).toBe("group-next");
+		// An unchanged empty filter must not schedule a later cursor reset.
+		await act(async () => {
+			await new Promise((resolve) => setTimeout(resolve, 200));
+		});
+		await flush();
 		await click("Twob");
 		expect(choices.at(-1)).toBe("__agg__:group:b:two");
 		await click("back");
@@ -480,6 +543,9 @@ test("paginated aggregation members preserve pins and never mix their cursors wi
 		expect(calls[3].searchParams.has("cursor")).toBe(false);
 		await click("Source Xc");
 		expect(choices.at(-1)).toBe("c:x");
+		await openActions("Source Xc");
+		await click(narratorLocale.modelTooltip);
+		expect(details.map((row) => row.value)).toEqual(["plain:model", "relay:model", "c:x"]);
 		await click("back");
 		await click("2");
 		expect(calls).toHaveLength(4); // independently cached first aggregation page

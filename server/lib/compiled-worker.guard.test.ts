@@ -24,8 +24,11 @@ test("production compile spreads the worker registry instead of listing worker p
 	}
 });
 
-test("local and release builds share all 23 unique, existing worker entries", () => {
-	expect(COMPILED_WORKER_ENTRIES).toHaveLength(23);
+test("local and release builds share the same unique, explicitly covered worker entries", () => {
+	// Concurrent additions must each have a named owner, rather than accidentally
+	// agreeing on a stale numeric total after their branches merge.
+	const registeredEntries: string[] = [...COMPILED_WORKER_ENTRIES];
+	expect(registeredEntries.sort()).toEqual(Object.keys(entryOwners).sort());
 	expect(new Set(COMPILED_WORKER_ENTRIES).size).toBe(COMPILED_WORKER_ENTRIES.length);
 	expect(compiledWorkerBuildEntrypoints()).toEqual(
 		COMPILED_WORKER_ENTRIES.map((entry) => `./server/${entry}`),
@@ -228,11 +231,16 @@ function ownerText(paths: readonly string[]): string {
 }
 const admission = /\bnew\s+(?:WorkerPool|TaskQueue)\s*\(/;
 
-test("all 34 families have explicit common-runtime coverage: 23 entries, 6 trusted evals, 5 processes", () => {
-	expect(Object.keys(entryOwners)).toHaveLength(23);
+test("all registered entry, trusted-eval and process families have explicit common-runtime coverage", () => {
+	expect(Object.keys(entryOwners).sort()).toEqual([...COMPILED_WORKER_ENTRIES].sort());
 	expect(evalOwners).toHaveLength(6);
 	expect(processOwners).toHaveLength(5);
-	expect(COMPILED_WORKER_ENTRIES.length + evalOwners.length + processOwners.length).toBe(34);
+	const families = [
+		...COMPILED_WORKER_ENTRIES.map((entry) => `entry:${entry}`),
+		...evalOwners.map(({ kind }) => `eval:${kind}`),
+		...processOwners.map(({ kind }) => `process:${kind}`),
+	];
+	expect(new Set(families).size).toBe(families.length);
 	for (const entry of COMPILED_WORKER_ENTRIES) {
 		const text = ownerText(entryOwners[entry]);
 		expect(text.includes(entry), entry).toBe(true);

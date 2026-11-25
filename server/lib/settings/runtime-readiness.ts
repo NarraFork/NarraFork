@@ -36,7 +36,7 @@ export function runtimeModelReadiness(
 	const prefix = value.slice(0, colon);
 	if (!value.slice(colon + 1)) return false;
 	if (source.agent.disabledProviders?.includes(prefix)) return false;
-	if (prefix === "codex") return getCodexManager().availableCount > 0;
+	if (prefix === "codex") return getCodexManager().hasConfiguredCredentials;
 	if (prefix === "tokendance") return !source.tokendance?.disabled && !!source.tokendance?.apiKey;
 	if (prefix === "CommandCode" || prefix === "commandcode" || prefix === "command-code")
 		return source.commandCode?.disabled ? false : source.commandCode?.apiKey ? true : null;

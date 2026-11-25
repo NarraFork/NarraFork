@@ -292,6 +292,7 @@ export class ModelOptionsIndex {
 				const label = known?.label ?? member;
 				return {
 					value: `__agg__:${query.aggregationId}:${member}`,
+					concreteValue: member,
 					label,
 					provider: known?.provider ?? provider,
 					...(provider === "codex" && !current.codexConfigured && { available: false }),

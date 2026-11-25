@@ -67,8 +67,8 @@ export function captureModelOptionsSnapshot(): ModelOptionsSnapshot {
 	boundedStrings(settings.agent.disabledProviders ?? []);
 	const disabled = new Set(settings.agent.disabledProviders ?? []);
 	for (const group of groups) if (group.disabled) disabled.add(group.prefix);
-	// availableCount is a pure enabled-credential count, not quota/cooldown availability.
-	const codexConfigured = getCodexManager().availableCount > 0;
+	// Runtime quota/failure blocks do not remove a configured credential from the catalog.
+	const codexConfigured = getCodexManager().hasConfiguredCredentials;
 	if (!codexConfigured) disabled.add("codex");
 	const fallbackConfig = new Map<string, { defaultModel?: string }>();
 	for (const [providers, requireBaseUrl] of [

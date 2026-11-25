@@ -57,13 +57,13 @@ export function PaginatedModelMenuItems({
 	const composing = useRef(false);
 	const [composition, setComposition] = useState(false);
 	useEffect(() => {
-		if (!opened || composition) return;
+		if (!opened || composition || input === q) return;
 		const timer = setTimeout(() => {
 			setQ(input);
 			setCursor(undefined);
 		}, 180);
 		return () => clearTimeout(timer);
-	}, [input, opened, composition]);
+	}, [input, q, opened, composition]);
 	useEffect(() => {
 		if (opened) return;
 		setCursor(undefined);
@@ -85,7 +85,21 @@ export function PaginatedModelMenuItems({
 	);
 	const rows = pendingSearch ? [] : (query.data?.items ?? []);
 	const select = (value: string) => onSelect(value);
-	const details = (row: ModelCatalogOption) => onShowPrice?.({ ...row });
+	const canShowDetails = (row: ModelCatalogOption) => {
+		if (!onShowPrice) return false;
+		if (!aggregationId) return row.provider !== "__agg__" && !row.aggregationId;
+		// Nested references have no proven provider identity. Never guess a member's
+		// routing destination for a card lookup or a protocol override write.
+		const concrete = row.concreteValue;
+		return (
+			!!concrete &&
+			concrete.includes(":") &&
+			!concrete.startsWith("__") &&
+			!concrete.startsWith("auto:")
+		);
+	};
+	const details = (row: ModelCatalogOption) =>
+		onShowPrice?.({ ...row, value: row.concreteValue ?? row.value });
 	return (
 		<Stack gap={4} miw={280} maw={480}>
 			{label && <Menu.Label>{label}</Menu.Label>}
@@ -202,7 +216,7 @@ export function PaginatedModelMenuItems({
 								{row.memberCount}
 							</Button>
 						)}
-						{(onShowPrice || onSetAsDefaultModel || onSetAsSummaryModel) && (
+						{(canShowDetails(row) || onSetAsDefaultModel || onSetAsSummaryModel) && (
 							<ActionIcon
 								variant="subtle"
 								aria-label={t("modelActions")}
@@ -214,7 +228,7 @@ export function PaginatedModelMenuItems({
 					</Group>
 					{actions === row.value && (
 						<Group gap={4} pl="sm">
-							{onShowPrice && (
+							{canShowDetails(row) && (
 								<Button size="compact-xs" variant="subtle" onClick={() => details(row)}>
 									{t("modelTooltip")}
 								</Button>

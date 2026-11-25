@@ -46,6 +46,8 @@ export interface ModelOptionRow {
 	sourceCount?: number;
 	aggregationId?: string;
 	memberCount?: number;
+	/** Unwrapped member reference for catalog/protocol details, never the selection pin. */
+	concreteValue?: string;
 	available?: boolean;
 	subscription?: boolean;
 	referencePrice?: number;

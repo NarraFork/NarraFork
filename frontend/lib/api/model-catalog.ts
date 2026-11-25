@@ -19,6 +19,8 @@ export interface ModelCatalogOption {
 	aggregationId?: string;
 	memberCount?: number;
 	available?: boolean;
+	/** Raw configured member, distinct from the aggregation pin used for selection. */
+	concreteValue?: string;
 }
 export interface ModelCatalogOptionsPage {
 	revision: string;

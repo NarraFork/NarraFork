@@ -108,7 +108,9 @@ describe("bounded model options index", () => {
 		});
 		expect(JSON.stringify(group)).not.toContain("p:a");
 		const first = index.query("r1", { ...query, aggregationId: "group", limit: 1 });
-		expect(first.items).toEqual([{ value: "__agg__:group:p:a", label: "Member A", provider: "p" }]);
+		expect(first.items).toEqual([
+			{ value: "__agg__:group:p:a", concreteValue: "p:a", label: "Member A", provider: "p" },
+		]);
 		expect(first.hasMore).toBe(true);
 		const next = index.query("r1", {
 			...query,

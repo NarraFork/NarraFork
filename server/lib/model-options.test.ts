@@ -1,6 +1,6 @@
 import { afterAll, afterEach, expect, spyOn, test } from "bun:test";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ConnectedWorker } from "./compiled-worker";
@@ -18,7 +18,7 @@ const previousHome = process.env.NARRAFORK_HOME;
 process.env.NARRAFORK_HOME = home;
 const { ModelOptionsClient, captureModelOptionsSnapshot } = await import("./model-options");
 const { decodeBundledCatalog } = await import("./model-catalog/source");
-const { getCodexManager } = await import("./codex-manager");
+const { CodexManager, __setCodexManagerForTests } = await import("./codex-manager");
 const clients: InstanceType<typeof ModelOptionsClient>[] = [];
 afterEach(async () => {
 	await Promise.all(clients.splice(0).map((client) => client.close()));
@@ -118,9 +118,26 @@ test("no startup/capture before actual demand; real worker builds 10k rows once 
 }, 20_000);
 
 test("production cache captures are stable and Codex catalog variants load inside the real Worker", async () => {
-	const manager = getCodexManager();
-	const previous = Object.getOwnPropertyDescriptor(manager, "availableCount");
-	Object.defineProperty(manager, "availableCount", { configurable: true, get: () => 1 });
+	const managerHome = join(home, "production-codex-fixture");
+	const directory = join(managerHome, ".narrafork");
+	mkdirSync(directory, { recursive: true });
+	writeFileSync(
+		join(directory, "codex-credentials.json"),
+		JSON.stringify([
+			{
+				id: "production-codex",
+				refreshToken: "fixture-refresh",
+				accessToken: "fixture-access",
+				accountId: "fixture-account",
+				expiresAt: Date.now() + 60 * 60_000,
+				priority: 0,
+				disabled: false,
+			},
+		]),
+	);
+	__setCodexManagerForTests(
+		new CodexManager({ homeDir: managerHome, registerProcessHooks: false }),
+	);
 	try {
 		const before = captureModelOptionsSnapshot();
 		const again = captureModelOptionsSnapshot();
@@ -161,8 +178,7 @@ test("production cache captures are stable and Codex catalog variants load insid
 			restore();
 		}
 	} finally {
-		if (previous) Object.defineProperty(manager, "availableCount", previous);
-		else Reflect.deleteProperty(manager, "availableCount");
+		__setCodexManagerForTests(undefined);
 	}
 });
 
