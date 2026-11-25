@@ -617,7 +617,8 @@
 					"index_locked": "git is busy there (index.lock).",
 					"sessions_running": "{{count}} session(s) are running there.",
 					"local_config": "That checkout has filters or a hooks directory of its own: run the command yourself.",
-					"unreadable": "That directory could not be checked."
+					"unreadable": "That directory could not be checked.",
+					"other_repository": "That directory is not a checkout of this project's repository: run the command yourself."
 				},
 				"errors": {
 					"TEAM_WORK_ITEM_NOT_READY": "Only a ready item can be merged; it changed meanwhile.",
@@ -636,7 +637,10 @@
 					"TEAM_MERGE_CHECKOUT_BUSY": "Sessions are running in that directory. Try again once they stop.",
 					"TEAM_MERGE_FAST_FORWARD_REFUSED": "git refused to fast-forward there because of local changes; nothing changed.",
 					"TEAM_MERGE_IDENTITY_UNKNOWN": "No git identity to commit the merge with: set yours in Settings, or the host's git user.name and user.email.",
-					"GIT_WORKSPACE_BUSY": "git is busy in that directory. Try again shortly."
+					"GIT_WORKSPACE_BUSY": "git is busy in that directory. Try again shortly.",
+					"TEAM_MERGE_FAST_FORWARD_INCOMPLETE": "The fast-forward left that directory needing a look (unmerged files, a new stash, or HEAD not at the merge). Check it there; the item is not marked merged.",
+					"TEAM_MERGE_HOSTING_UNKNOWN": "Where origin is hosted could not be read. Try again shortly; a GitHub origin is never merged locally.",
+					"TEAM_MERGE_TIMEOUT": "The merge took too long and was stopped before it changed anything it could not finish."
 				}
 			}
 		}

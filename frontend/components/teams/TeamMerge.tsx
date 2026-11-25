@@ -323,6 +323,26 @@ export function MergeOutcome({
 		<Alert color="blue" p="xs" data-testid="team-merge-prepared">
 			<Stack gap={6}>
 				<Text size="sm">{t("teams.page.merge.prepared", { base, path: detail.checkedOutAt })}</Text>
+				{detail.fastForwardFailure && (
+					<Box
+						data-testid="team-merge-ff-failed"
+						data-code={detail.fastForwardFailure.code}
+						style={{ color: "var(--mantine-color-red-text)" }}
+					>
+						<Text size="sm" inherit>
+							{errorText(detail.fastForwardFailure.code, detail.fastForwardFailure.message)}
+						</Text>
+						{(detail.fastForwardFailure.files?.length ?? 0) > 0 && (
+							<List size="xs" spacing={1} data-testid="team-merge-ff-files">
+								{detail.fastForwardFailure.files?.map((file) => (
+									<List.Item key={file} style={{ ...MONO, overflowWrap: "anywhere" }}>
+										{file}
+									</List.Item>
+								))}
+							</List>
+						)}
+					</Box>
+				)}
 				{merge.fastForward && (
 					<>
 						<FastForward

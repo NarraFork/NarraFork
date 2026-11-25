@@ -1337,6 +1337,37 @@ describe("merge (M)", () => {
 			),
 		);
 		expect(blocked).toMatch(/<button[^>]*disabled=""[^>]*data-testid="team-merge-fast-forward"/);
+		// A refused fast-forward keeps the prepared merge, with git's files and the command (review 11).
+		const refused = await outcome(
+			view(
+				{
+					kind: "prepared",
+					mergeCommit: "a".repeat(40),
+					baseSha: "b".repeat(40),
+					checkedOutAt: "/home/alice/app",
+					at: "2026-11-25T00:00:00.000Z",
+					fastForwardFailure: {
+						code: "TEAM_MERGE_FAST_FORWARD_REFUSED",
+						message: "error: Your local changes would be overwritten",
+						files: ["src/a.ts", "src/b.ts"],
+						at: "2026-11-25T00:01:00.000Z",
+					},
+				},
+				{
+					fastForward: {
+						available: true,
+						blocker: null,
+						runningSessions: 0,
+						terminals: 0,
+						command: "git -C /home/alice/app merge --ff-only refs/narrafork/team-merges/r",
+					},
+				},
+			),
+		);
+		expect(refused).toContain('data-code="TEAM_MERGE_FAST_FORWARD_REFUSED"');
+		expect(refused).toContain("src/b.ts");
+		expect(refused).toContain('data-testid="team-merge-fast-forward"');
+		expect(refused).toContain("git -C /home/alice/app merge --ff-only");
 		expect(blocked).toContain("那里有 2 个会话在运行");
 	});
 });

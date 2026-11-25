@@ -617,7 +617,8 @@
 					"index_locked": "那里的 git 正忙（index.lock）。",
 					"sessions_running": "那里有 {{count}} 个会话在运行。",
 					"local_config": "那个检出有自己的过滤器或 hooks 目录：请自己运行命令。",
-					"unreadable": "无法检查那个目录。"
+					"unreadable": "无法检查那个目录。",
+					"other_repository": "那个目录不是本项目仓库的检出：请自己运行命令。"
 				},
 				"errors": {
 					"TEAM_WORK_ITEM_NOT_READY": "只有可以合并的工作项能合并；它刚刚变了。",
@@ -636,7 +637,10 @@
 					"TEAM_MERGE_CHECKOUT_BUSY": "那个目录里有会话在运行，等它们停下再试。",
 					"TEAM_MERGE_FAST_FORWARD_REFUSED": "那里的本地改动挡住了快进，git 拒绝了，什么都没有改。",
 					"TEAM_MERGE_IDENTITY_UNKNOWN": "没有可用来提交合并的 git 身份：请在设置里配置你的身份，或配置主机的 git user.name 和 user.email。",
-					"GIT_WORKSPACE_BUSY": "那个目录里的 git 正忙，请稍后再试。"
+					"GIT_WORKSPACE_BUSY": "那个目录里的 git 正忙，请稍后再试。",
+					"TEAM_MERGE_FAST_FORWARD_INCOMPLETE": "快进后那个目录需要检查（有未合并文件、多了一个 stash，或 HEAD 不在合并结果上）。请到那里看一下；这一项没有标为已合并。",
+					"TEAM_MERGE_HOSTING_UNKNOWN": "读不出 origin 托管在哪里，请稍后再试；origin 在 GitHub 上时绝不会在本地合并。",
+					"TEAM_MERGE_TIMEOUT": "合并耗时太久，已在不会留下半截改动的地方停下。"
 				}
 			}
 		}
