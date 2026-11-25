@@ -414,16 +414,29 @@ export interface GitDiffResult {
 // rpc_result. See docs/GENERAL_EXECUTOR-DESIGN.md.
 
 export const SESSION_DURABLE_FEATURE = "session.durable.v1";
+/**
+ * `kind: "exec"` sessions: a shell command without a terminal. stdout and
+ * stderr share the journal, stdin is empty (session.write fails), and the
+ * executor enforces `timeoutMs` itself, attached or not.
+ */
+export const SESSION_EXEC_FEATURE = "session.exec.v1";
 
 export interface SessionOpenParams {
 	/** Caller-chosen id, [A-Za-z0-9_-]{1,128}; rejected if already registered. */
 	sessionId: string;
-	kind?: "pty";
+	kind?: "pty" | "exec";
+	/** pty: argv (default the login shell). */
 	cmd?: string[];
+	/** exec: run with the login shell's `-c`. */
+	command?: string;
 	cwd: string;
 	cols?: number;
 	rows?: number;
 	env?: Record<string, string>;
+	/** exec: minimal environment instead of the executor's own. */
+	freshEnv?: boolean;
+	/** exec: stop the command after this long; 0 or absent means no deadline. */
+	timeoutMs?: number;
 }
 
 export interface SessionInfo {

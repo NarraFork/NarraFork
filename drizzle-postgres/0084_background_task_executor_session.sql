@@ -1,0 +1,1 @@
+ALTER TABLE "background_tasks" ADD COLUMN "executor_session_json" text;

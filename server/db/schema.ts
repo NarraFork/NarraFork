@@ -4317,6 +4317,18 @@ export const backgroundTasks = sqliteTable(
 		 * re-attaches.
 		 */
 		principalJson: text("principal_json", { mode: "json" }).$type<{ userId: string | null }>(),
+		/**
+		 * A remote background Bash running in a durable executor session
+		 * (`session.exec.v1`). Written before the session is opened, so a restarted
+		 * server can re-attach to it (or stop it) instead of reporting it lost.
+		 */
+		executorSessionJson: text("executor_session_json", { mode: "json" }).$type<{
+			deviceId: string;
+			sessionId: string;
+			/** Wall-clock budget from `startedAt`; absent means none. */
+			timeoutMs?: number;
+			startedAt: string;
+		}>(),
 		output: text("output"),
 		outputBytes: integer("output_bytes").notNull().default(0),
 		outputTruncated: integer("output_truncated", { mode: "boolean" }).notNull().default(false),

@@ -1,6 +1,6 @@
 {
-  "id": "8c8f8481-5557-4bd2-b492-a30ef8532e5d",
-  "prevId": "abeafedc-f054-41e8-b9a0-edc89be12b9b",
+  "id": "4e8f1864-9940-4d8d-b3bf-e89b3c68f67a",
+  "prevId": "8c8f8481-5557-4bd2-b492-a30ef8532e5d",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -1156,6 +1156,12 @@
         },
         "principal_json": {
           "name": "principal_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "executor_session_json": {
+          "name": "executor_session_json",
           "type": "text",
           "primaryKey": false,
           "notNull": false

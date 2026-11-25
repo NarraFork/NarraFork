@@ -672,6 +672,14 @@
 			"prevId": "abeafedc-f054-41e8-b9a0-edc89be12b9b",
 			"version": "7",
 			"snapshotDigest": "6661e27969be1e613d16658d42d6eb0412cfa2dc32409a247f09ce8121c2a7b1"
+		},
+		{
+			"idx": 84,
+			"tag": "0084_background_task_executor_session",
+			"id": "4e8f1864-9940-4d8d-b3bf-e89b3c68f67a",
+			"prevId": "8c8f8481-5557-4bd2-b492-a30ef8532e5d",
+			"version": "7",
+			"snapshotDigest": "4a01668a06262eca2465e039cd5a9c410863e89fa8d055052256ed839f4e63c5"
 		}
 	]
 }

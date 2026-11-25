@@ -69,7 +69,7 @@ Go 执行器（远端设备上的常驻服务 / 本地脱离进程）
 | 字段 | 说明 |
 |---|---|
 | `sessionId` | 由调用方提供（与旧 `ptyId` 一样），执行器拒绝重复；格式 `[A-Za-z0-9_-]{1,128}` |
-| `kind` | `pty`（第一期）；`exec`（后台 Bash，第一期第三步） |
+| `kind` | `pty`（终端）；`exec`（后台 Bash：无终端，stdout/stderr 同一管道，stdin 为空，特性 `session.exec.v1`） |
 | `cmd` / `cwd` / `env` / `cols` / `rows` | 同 `pty.open`，`cwd` 仍经 PathGuard 校验 |
 | `state` | `running` → `exited`；不可逆 |
 | `exitCode` / `exitedAt` | 退出事实，进程退出后写入一次 |
@@ -97,11 +97,11 @@ Go 执行器（远端设备上的常驻服务 / 本地脱离进程）
 
 ## 5. 协议
 
-所有新方法通过 capability 特性 `session.durable.v1` 协商；不支持时 NarraFork 继续用旧 `pty.*`。
+所有新方法通过 capability 特性 `session.durable.v1` 协商；不支持时 NarraFork 继续用旧 `pty.*`。`kind:"exec"` 另需 `session.exec.v1`（同一执行器同时声明；只有 `session.durable.v1` 的执行器仍走 `exec.start`）。
 
 | 方法 | 参数 | 结果 | 说明 |
 |---|---|---|---|
-| `session.open` | `sessionId, kind:"pty", cmd?, cwd, env?, cols?, rows?` | `{sessionId, startedAt}` | 启动后立即返回，不再阻塞到退出 |
+| `session.open` | `sessionId, kind:"pty", cmd?, cwd, env?, cols?, rows?`；或 `kind:"exec", command, cwd, env?, freshEnv?, timeoutMs?` | `{sessionId, startedAt}` | 启动后立即返回，不再阻塞到退出；`exec` 的 `timeoutMs` 由执行器自己计时 |
 | `session.attach` | `sessionId, since` | 流：`session.gap` / `session.data` / `session.exit`；结果 `{exitCode, endSeq}` | 见 §4.3 |
 | `session.write` | `sessionId, dataB64, writeId?` | `{duplicate: bool}` | `writeId` 在每会话最近 256 个内去重 |
 | `session.resize` | `sessionId, cols, rows` | `{}` | |
@@ -160,6 +160,13 @@ NarraFork 侧对应展示：缺口在终端里显示为一行提示（"有 N 字
 - 缺口先通知文本 Watch（缺口前已有输出照常匹配，未匹配的报告"可能错过"），期间后续输出暂存。
 - NarraFork 关闭时只脱离、不杀；启动时 `recoverOnStartup` 恢复这些终端（设备不在线也恢复，等设备上线）。
 
+**远端后台 Bash**（第一期第三步，已实现）
+- 设备同时声明 `session.durable.v1` 与 `session.exec.v1` 时，后台 Bash（`task` 与 `service`）改用 `session.open { kind:"exec" }`；前台 Bash 仍走 `exec.start`。旧路径的超时是 RPC 超时（默认 120 秒），会话路径用后台任务自己的超时，执行器端同时强制。
+- 会话 ID 固定为 `nf-bash-<taskId>`；打开前把 `{deviceId, sessionId, timeoutMs, startedAt}` 写进 `background_tasks.executor_session_json`（SQLite 0267、PG 0084）。
+- 输出只在内存里，所以重启接管时从序号 0 重放执行器仍保留的部分（最多 4 MiB，更早的以缺口提示标明）；剩余超时按 `startedAt + timeoutMs` 计算。
+- 停止与释放复用终端的持久清理记录（`executor_session_cleanups`）：取消/超时先写记录再停止读取，不等设备；自然结束在任务终态写入后才释放。
+- 执行器已没有该会话（执行器重启）时任务以失败结束，并在输出里说明原因。
+
 **本地终端**（第二期）
 - NarraFork 启动时查找/拉起本地执行器（决策 1），通过本机回环 + 一次性令牌连接。
 - 本地终端与后台 Bash 走执行器会话；dtach 降级为不可用时的兜底，最终移除。
@@ -173,7 +180,7 @@ NarraFork 侧对应展示：缺口在终端里显示为一行提示（"有 N 字
 **第一期：远端执行器的持久会话**
 1. ✅ 执行器端会话核心：进程级会话管理器、内存输出日志与序号、`session.*` 方法、`session.durable.v1` 特性、Go 单元与集成测试。旧方法不动。实现见 `remote-executor/internal/session/`、`remote-executor/internal/handlers/session*.go`；TS 侧协议类型已同步到 `server/lib/agent/execution/rpc-types.ts`。
 2. ✅ NarraFork 远端终端改用会话协议：断线/重启后补齐输出；终端行记录会话 ID，续读位置随缓冲快照保存。
-3. 后台 Bash（`kind:"exec"`）走同一会话核心，替换 `exec.start` 的长 RPC。
+3. ✅ 后台 Bash（`kind:"exec"`）走同一会话核心，替换 `exec.start` 的长 RPC：断线不中断，重启后重新附着。
 4. 日志落盘（§7）。
 
 **第二期：本地模式**——拉起本地执行器，本地终端与后台 Bash 迁移，替代 dtach。

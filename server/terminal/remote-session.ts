@@ -31,6 +31,8 @@ import type { TerminalRuntime } from "./runtime";
  */
 export const SESSION_DURABLE_FEATURE: typeof RpcTypes.SESSION_DURABLE_FEATURE =
 	"session.durable.v1";
+/** `session.open { kind: "exec" }`: a command without a terminal (see rpc-types). */
+export const SESSION_EXEC_FEATURE: typeof RpcTypes.SESSION_EXEC_FEATURE = "session.exec.v1";
 
 const DEFAULT_MAX_QUEUED_WRITE_BYTES = 1024 * 1024;
 const DEFAULT_OPEN_TIMEOUT_MS = 15_000;
@@ -58,23 +60,51 @@ export interface RemoteSessionDependencies {
 export class RemoteSessionOpenUnknownError extends Error {
 	constructor(sessionId: string, cause: string) {
 		super(
-			`Remote terminal session ${sessionId} may have started, but its start was not confirmed: ${cause}`,
+			`Remote session ${sessionId} may have started, but its start was not confirmed: ${cause}`,
 		);
 		this.name = "RemoteSessionOpenUnknownError";
 	}
 }
 
+/** A terminal: a shell on a PTY that takes input. */
+export interface RemotePtyOpen {
+	kind?: "pty";
+	cmd: string[];
+	cwd: string;
+	env: Record<string, string>;
+	cols: number;
+	rows: number;
+}
+
+/** A command without a terminal: stdout and stderr, no input, optional executor-side deadline. */
+export interface RemoteExecOpen {
+	kind: "exec";
+	command: string;
+	cwd: string;
+	env?: Record<string, string>;
+	freshEnv?: boolean;
+	timeoutMs?: number;
+}
+
 export interface RemoteSessionOptions {
 	/** Present to start a new session; absent to resume an existing one. */
-	open?: { cmd: string[]; cwd: string; env: Record<string, string>; cols: number; rows: number };
+	open?: RemotePtyOpen | RemoteExecOpen;
 	/** First unseen output byte when resuming (0 for a new session). */
 	since: number;
-	onData: (data: string, streamSeq: number) => void;
+	/** Output as text; a character split across chunks is held until complete. */
+	onData?: (data: string, streamSeq: number) => void;
+	/** Output as raw bytes, used instead of onData. */
+	onBytes?: (bytes: Uint8Array, streamSeq: number) => void;
 	/**
 	 * Output was lost before `streamSeq`. Called before the visible notice and
-	 * any later output are delivered through onData.
+	 * any later output are delivered.
 	 */
 	onGap?: (missingBytes: number, streamSeq: number) => void;
+	/**
+	 * The session ended without an exit from the executor (unknown session,
+	 * revoked device, failed open). Not called for detach or kill.
+	 */
+	onLost?: (reason: string) => void;
 }
 
 export interface RemoteSessionRuntime extends TerminalRuntime {
@@ -169,7 +199,10 @@ export function spawnRemoteSession(
 		stopListening();
 		writeQueue.length = 0;
 		queuedBytes = 0;
-		if (reason) logger.info("Remote terminal session ended", { deviceId, sessionId, reason });
+		if (reason) {
+			logger.info("Remote session ended", { deviceId, sessionId, reason });
+			opts.onLost?.(reason);
+		}
 		exitedResolve(code);
 	}
 
@@ -181,7 +214,17 @@ export function spawnRemoteSession(
 		});
 	}
 
+	function deliverText(text: string, seq: number) {
+		if (opts.onBytes) opts.onBytes(new TextEncoder().encode(text), seq);
+		else opts.onData?.(text, seq);
+	}
+
 	function emitData(chunk: Uint8Array) {
+		if (opts.onBytes) {
+			consumed += chunk.length;
+			opts.onBytes(chunk, consumed);
+			return;
+		}
 		const joined = new Uint8Array(carry.length + chunk.length);
 		joined.set(carry);
 		joined.set(chunk, carry.length);
@@ -189,7 +232,7 @@ export function spawnRemoteSession(
 		const tail = utf8IncompleteTail(joined);
 		carry = joined.slice(joined.length - tail);
 		const text = decoder.decode(joined.subarray(0, joined.length - tail));
-		if (text) opts.onData(text, consumed - carry.length);
+		if (text) opts.onData?.(text, consumed - carry.length);
 	}
 
 	function onStream(channel: string, chunk: Uint8Array) {
@@ -211,8 +254,10 @@ export function spawnRemoteSession(
 			carry = new Uint8Array(0);
 			consumed = gap.to;
 			opts.onGap?.(missing, consumed);
-			opts.onData(
-				`\r\n\x1b[2m[NarraFork: ${missing} bytes of output were not retained by the device]\x1b[0m\r\n`,
+			deliverText(
+				opts.onBytes
+					? `\n[NarraFork: ${missing} bytes of output were not retained by the device]\n`
+					: `\r\n\x1b[2m[NarraFork: ${missing} bytes of output were not retained by the device]\x1b[0m\r\n`,
 				consumed,
 			);
 		}
@@ -232,7 +277,7 @@ export function spawnRemoteSession(
 				)) as { exitCode?: number };
 				if (stopped) return;
 				const tail = decoder.decode();
-				if (tail) opts.onData(tail, consumed);
+				if (tail) opts.onData?.(tail, consumed);
 				// Not released here: the owner releases after persisting the final state.
 				finish(typeof result?.exitCode === "number" ? result.exitCode : null);
 				return;
@@ -327,7 +372,14 @@ export function spawnRemoteSession(
 		let sent = false;
 		for (;;) {
 			try {
-				await sendRpc(deviceId, "session.open", { sessionId, kind: "pty", ...open }, rpcOpts);
+				await sendRpc(
+					deviceId,
+					"session.open",
+					{ sessionId, ...open, kind: open.kind ?? "pty" },
+					open.kind === "exec"
+						? { requiredFeatures: [SESSION_DURABLE_FEATURE, SESSION_EXEC_FEATURE] }
+						: rpcOpts,
+				);
 				return;
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);

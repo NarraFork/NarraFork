@@ -379,6 +379,63 @@ describe("spawnRemoteSession", () => {
 		runtime.detach();
 	});
 
+	test("an exec session opens with its command and delivers raw bytes with positions", async () => {
+		const exec = fakeExecutor(4);
+		const chunks: { bytes: Uint8Array; seq: number }[] = [];
+		const lost: string[] = [];
+		const runtime = spawnRemoteSession(
+			DEVICE,
+			"nf-bash-1",
+			{
+				open: { kind: "exec", command: "make", cwd: "/w", timeoutMs: 5_000 },
+				since: 0,
+				onBytes: (bytes, seq) => chunks.push({ bytes, seq }),
+				onLost: (reason) => lost.push(reason),
+			},
+			exec,
+		);
+		await runtime.ready;
+		expect(exec.state.calls[0]).toEqual({
+			method: "session.open",
+			params: {
+				sessionId: "nf-bash-1",
+				kind: "exec",
+				command: "make",
+				cwd: "/w",
+				timeoutMs: 5_000,
+			},
+		});
+		// A split character is passed through untouched: bytes are not decoded here.
+		exec.emit(new Uint8Array([0xe4, 0xb8]));
+		await until(() => chunks.length === 1);
+		expect([...chunks[0].bytes]).toEqual([0xe4, 0xb8]);
+		expect(chunks[0].seq).toBe(2);
+		exec.disconnect();
+		exec.emit("0123456789");
+		exec.reconnect();
+		exec.exit(3);
+		expect(await runtime.exited).toBe(3);
+		const text = new TextDecoder().decode(
+			Buffer.concat(chunks.slice(1).map((chunk) => Buffer.from(chunk.bytes))),
+		);
+		expect(text).toBe("\n[NarraFork: 6 bytes of output were not retained by the device]\n6789");
+		expect(chunks.at(-1)?.seq).toBe(12);
+		expect(lost).toEqual([]);
+	});
+
+	test("a session the executor no longer has is reported as lost", async () => {
+		const exec = fakeExecutor();
+		const lost: string[] = [];
+		const runtime = spawnRemoteSession(
+			DEVICE,
+			"s1",
+			{ since: 0, onBytes: () => {}, onLost: (reason) => lost.push(reason) },
+			exec,
+		);
+		expect(await runtime.exited).toBeNull();
+		expect(lost).toEqual(["session not found"]);
+	});
+
 	test("terminal session ids are stable and valid executor ids", () => {
 		expect(terminalSessionId("abc_DEF-123")).toBe("nf-term-abc_DEF-123");
 		expect(terminalSessionId("abc_DEF-123")).toMatch(/^[A-Za-z0-9_-]{1,128}$/);

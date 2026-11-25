@@ -523,7 +523,7 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 150 tables and 1980 columns", () => {
+	test("covers 150 tables and 1981 columns", () => {
 		expect(target.tables.length).toBe(150);
 		// 1714 SQLite-derived columns include disk_outcome and the two editor recovery columns,
 		// plus the three PG-only insert_seq identity columns.
@@ -579,7 +579,8 @@ describe("real schema parity", () => {
 		// Communication inheritance adds 4 node columns and exact contacts add 8 peer columns.
 		// Durable executor-session terminals add terminals.executor_session_id (nullable) and
 		// executor_session_cleanups (3).
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1980);
+		// Background Bash on executor sessions adds background_tasks.executor_session_json (nullable).
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1981);
 		expect(
 			target.tables
 				.find((table) => table.name === "user_recent_tabs")

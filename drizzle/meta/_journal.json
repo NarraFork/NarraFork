@@ -1870,6 +1870,13 @@
       "when": 1795622204759,
       "tag": "0266_faulty_vector",
       "breakpoints": true
+    },
+    {
+      "idx": 267,
+      "version": "6",
+      "when": 1795622838267,
+      "tag": "0267_quiet_warbird",
+      "breakpoints": true
     }
   ]
 }
