@@ -17,6 +17,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { realpath } from "node:fs/promises";
 import type { WorktreeRemovalPlan, WorktreeRemovalResult } from "@shared/narrator-worktrees";
 import {
 	dependencyBlockers,
@@ -57,6 +58,11 @@ import { eventBus } from "../../lib/event-bus";
 import { hotSafe } from "../../lib/hot-safe";
 import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
+import {
+	caseInsensitiveFileNames,
+	localPathIdentityKey,
+	normalizeRealpathResult,
+} from "../../lib/platform-path";
 import type { NarratorPrincipal } from "../narrator-acl";
 import { type BranchNumstat, teamGit } from "./team-git";
 import { assertKnowledgeFresh } from "./team-knowledge";
@@ -638,26 +644,72 @@ export function attachWorker(
 	eventBus.emit({ type: "team:communication_changed", teamId });
 }
 
-/** The live item whose recorded worktree is exactly `path`, for an `Agent({ workdir })`. */
-export function workItemAtWorktree(teamId: string, path: string): WorkItemRow | null {
-	const row = db
+/** How long resolving an `Agent` workdir's real path may take before its spelling alone is used. */
+const WORKDIR_REALPATH_TIMEOUT_MS = 2_000;
+/** Most live items of a team compared by a case-folded key when the filesystem ignores case. */
+const WORKTREE_CASE_SCAN_MAX = 500;
+
+/** The real path of `path`, or null when it cannot be read within the timeout. */
+async function realWorkdir(path: string, platform: NodeJS.Platform): Promise<string | null> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			realpath(path).then((real) => normalizeRealpathResult(real, platform)),
+			new Promise<null>((resolve) => {
+				timer = setTimeout(() => resolve(null), WORKDIR_REALPATH_TIMEOUT_MS);
+			}),
+		]);
+	} catch {
+		return null;
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+/**
+ * The live item whose recorded worktree is the directory `path` names, for an
+ * `Agent({ workdir })`: the path as spelled or its real path (a symlink, `..`, or the case the
+ * filesystem stores), else — on a platform whose filesystem ignores case (`platform`, Windows and
+ * macOS) — a recorded path equal to either once case-folded. Linux stays case-sensitive. Missing
+ * it would start the agent in the worktree without the item's start gate.
+ */
+export async function workItemAtWorktree(
+	teamId: string,
+	path: string,
+	platform: NodeJS.Platform = process.platform,
+): Promise<WorkItemRow | null> {
+	const real = await realWorkdir(path, platform);
+	const candidates = [...new Set(real ? [path, real] : [path])];
+	const live = and(
+		eq(teamWorkItems.teamId, teamId),
+		notInArray(teamWorkItems.state, [...TEAM_WORK_ITEM_FINISHED_STATES]),
+		eq(narratorWorktreeResources.deviceId, "local"),
+	);
+	const exact = db
 		.select({ item: teamWorkItems })
 		.from(teamWorkItems)
 		.innerJoin(
 			narratorWorktreeResources,
 			eq(narratorWorktreeResources.id, teamWorkItems.worktreeResourceId),
 		)
-		.where(
-			and(
-				eq(teamWorkItems.teamId, teamId),
-				notInArray(teamWorkItems.state, [...TEAM_WORK_ITEM_FINISHED_STATES]),
-				eq(narratorWorktreeResources.deviceId, "local"),
-				eq(narratorWorktreeResources.worktreePath, path),
-			),
-		)
+		.where(and(live, inArray(narratorWorktreeResources.worktreePath, candidates)))
 		.limit(1)
 		.get();
-	return row?.item ?? null;
+	if (exact) return exact.item;
+	if (!caseInsensitiveFileNames(platform)) return null;
+	const keys = new Set(candidates.map((candidate) => localPathIdentityKey(candidate, platform)));
+	const rows = db
+		.select({ item: teamWorkItems, path: narratorWorktreeResources.worktreePath })
+		.from(teamWorkItems)
+		.innerJoin(
+			narratorWorktreeResources,
+			eq(narratorWorktreeResources.id, teamWorkItems.worktreeResourceId),
+		)
+		.where(live)
+		.orderBy(asc(teamWorkItems.createdAt), asc(teamWorkItems.id))
+		.limit(WORKTREE_CASE_SCAN_MAX)
+		.all();
+	return rows.find((row) => keys.has(localPathIdentityKey(row.path, platform)))?.item ?? null;
 }
 
 // ── Review, ready, cancel ───────────────────────────────────────────────────

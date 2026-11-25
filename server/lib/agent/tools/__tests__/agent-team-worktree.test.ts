@@ -7,7 +7,7 @@
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
@@ -339,6 +339,50 @@ describe("Agent with a team work item", () => {
 			ctx(),
 		);
 		expect(runCalls).toHaveLength(1);
+		expect(
+			db.select().from(teamWorkItems).where(eq(teamWorkItems.id, second.item.id)).get(),
+		).toMatchObject({ state: "in_progress", workerNarratorId: "p3a-worker-1" });
+	});
+
+	test("D: another spelling of an item's worktree reaches the same start gate", async () => {
+		const { teamTool } = await import("../team");
+		const first = JSON.parse(
+			(await teamTool.execute({ action: "work.create", title: "Schema" }, ctx())).output,
+		);
+		const second = JSON.parse(
+			(
+				await teamTool.execute(
+					{ action: "work.create", title: "API", dependsOn: [first.item.id] },
+					ctx(),
+				)
+			).output,
+		);
+		const recorded: string = second.item.worktree;
+		// A symlink to the worktree names the same directory: refused at the gate like the path.
+		const alias = join(temporary, "alias");
+		await symlink(recorded, alias, "dir");
+		for (const workdir of [recorded, alias, `${alias}/`]) {
+			const refused = await agentTool.execute(
+				{ workdir, prompt: "go", subagent_type: "worker" },
+				ctx(),
+			);
+			expect(refused.output).toContain("TEAM_WORK_ITEM_BLOCKED");
+		}
+		expect(runCalls).toHaveLength(0);
+		// Another case finds the item where the filesystem ignores case, never on Linux.
+		const upper = recorded.toUpperCase();
+		for (const platform of ["win32", "darwin"] as const)
+			expect((await items.workItemAtWorktree(LEAD, upper, platform))?.id).toBe(second.item.id);
+		expect(await items.workItemAtWorktree(LEAD, upper, "linux")).toBeNull();
+
+		// Once it may start, the worker runs in the worktree as recorded.
+		sqlite.run("UPDATE team_work_items SET state = 'merged' WHERE id = ?", [first.item.id]);
+		const started = await agentTool.execute(
+			{ workdir: alias, prompt: "go", subagent_type: "worker" },
+			ctx(),
+		);
+		expect(started.isError).toBeFalsy();
+		expect(runCalls[0]?.cwd).toBe(recorded);
 		expect(
 			db.select().from(teamWorkItems).where(eq(teamWorkItems.id, second.item.id)).get(),
 		).toMatchObject({ state: "in_progress", workerNarratorId: "p3a-worker-1" });

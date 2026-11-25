@@ -26,6 +26,7 @@ mock.module("@server/services/teams/work-items", () => ({
 		branchName: "checkpoint-branch",
 		workerNarratorId: null,
 	}),
+	worktreePathOf: () => null,
 	attachWorker,
 	settleFailedStart,
 }));

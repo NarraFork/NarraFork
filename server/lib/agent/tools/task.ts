@@ -570,8 +570,11 @@ export const agentTool: ToolDefinition = {
 					};
 				}
 			} else if (teamId) {
-				const { workItemAtWorktree } = await import("@server/services/teams/work-items");
-				const item = workItemAtWorktree(teamId, resolvedWorkdir);
+				const { workItemAtWorktree, worktreePathOf } = await import(
+					"@server/services/teams/work-items"
+				);
+				// However the workdir is spelled (a symlink, another case on Windows or macOS).
+				const item = await workItemAtWorktree(teamId, resolvedWorkdir);
 				if (item && !item.workerNarratorId) {
 					// D: an item with no worker starts only once every dependency merged, whatever its
 					// state; nothing is created when it cannot (409 TEAM_WORK_ITEM_BLOCKED, naming the
@@ -588,6 +591,8 @@ export const agentTool: ToolDefinition = {
 							isError: true,
 						};
 					}
+					// The worker runs in the worktree as recorded, so later path checks match it.
+					resolvedWorkdir = worktreePathOf(item) ?? resolvedWorkdir;
 					workItem = { teamId, id: item.id, branch: item.branchName, created: false };
 				}
 			}
