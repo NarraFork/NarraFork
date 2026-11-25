@@ -195,6 +195,7 @@ let saveCalls = 0;
 let confirmAnswer = false;
 let serverSettings: Record<string, unknown>;
 let savedPayloads: Record<string, unknown>[];
+let onSettingsSave: ((payload: Record<string, unknown>) => void) | undefined;
 let refreshCalls: Array<{ method: string; id: string }>;
 let requestOptions: unknown[];
 let warnings: Array<{ color?: string; title?: unknown }>;
@@ -264,6 +265,7 @@ beforeEach(() => {
 	confirmAnswer = false;
 	serverSettings = clone(initialSettings);
 	savedPayloads = [];
+	onSettingsSave = undefined;
 	refreshCalls = [];
 	requestOptions = [];
 	warnings = [];
@@ -309,7 +311,10 @@ beforeEach(() => {
 		savedPayloads.push(clone(payload));
 		requestOptions.push(options);
 		if (saveGate) await saveGate;
-		if (!saveError || persistBeforeError) serverSettings = { ...serverSettings, ...clone(payload) };
+		if (!saveError || persistBeforeError) {
+			onSettingsSave?.(payload as Record<string, unknown>);
+			serverSettings = { ...serverSettings, ...clone(payload) };
+		}
 		if (saveError) throw saveError;
 		return clone(serverSettings);
 	});
@@ -491,12 +496,76 @@ describe("immediate key pool changes keep the real settings draft safe", () => {
 		cooldown: null,
 		usage: null,
 	});
+	test("a delayed empty response from A cannot clear B after same-page deep-link navigation", async () => {
+		useRealProviderDetails = true;
+		const template = initialSettings.customApiProviders[0];
+		if (!template) throw new Error("Missing provider fixture");
+		serverSettings.customApiProviders = [
+			{ ...template, apiKey: "********keyA" },
+			{ ...template, id: "second", prefix: "second", name: "Provider B", apiKey: "********keyB" },
+		];
+		queryClient.setQueryData(["admin", "settings"], clone(serverSettings));
+		const keyA = { ...entry("key-A", "********keyA"), disabled: true };
+		const keyB = entry("key-B", "********keyB");
+		let deletedA = false;
+		let pendingARead = false;
+		let storedB = true;
+		const readGate = Promise.withResolvers<void>();
+		const list = spyOn(providerKeysApi, "list").mockImplementation(async (providerId) => {
+			if (providerId === "second") return { keys: [keyB] };
+			if (!deletedA) return { keys: [keyA] };
+			pendingARead = true;
+			await readGate.promise;
+			return { keys: [] };
+		});
+		const remove = spyOn(providerKeysApi, "remove").mockImplementation(async (id) => {
+			expect(id).toBe(keyA.id);
+			deletedA = true;
+			serverSettings.customApiProviders = persistedProviders().map((p) =>
+				p.id === "existing" ? { ...p, apiKey: "" } : p,
+			);
+			return { ok: true };
+		});
+		for (const mock of [list, remove]) restorers.push(() => mock.mockRestore());
+		onSettingsSave = (payload) => {
+			const b = (payload.customApiProviders as Array<{ id: string; apiKey: string }>).find(
+				(p) => p.id === "second",
+			);
+			// Model the server's clear-on-empty first-key behavior for B.
+			if (b?.apiKey === "") storedB = false;
+		};
+		await mount("/settings/providers?provider=existing");
+		const originalEditor = container.querySelector('input[type="password"]');
+		const removeButton = container.querySelector(`[aria-label="${text("providerKeys.remove")}"]`);
+		if (!removeButton) throw new Error("Missing A's last-key delete button");
+		await click(removeButton);
+		expect(pendingARead).toBe(true);
+		await act(async () => {
+			await router.navigate({ to: "/settings/providers", search: { provider: "second" } });
+		});
+		expect(currentCustomDetail()?.provider.id).toBe("second");
+		// The parent editor is reused, while its keyed pool must be a new instance.
+		expect(container.querySelector('input[type="password"]')).toBe(originalEditor);
+		await act(async () => {
+			readGate.resolve();
+			await readGate.promise;
+			await new Promise((resolve) => setTimeout(resolve, 0));
+		});
+		expect(currentCustomDetail()?.provider.apiKey).toBe("********keyB");
+		await type("customApiProviderName", "Unsaved B name");
+		await click(button("unsavedSave"));
+		const saved = savedPayloads[0]?.customApiProviders as Array<{ id: string; apiKey: string }>;
+		expect(saved.find((p) => p.id === "existing")?.apiKey).toBe("");
+		expect(saved.find((p) => p.id === "second")?.apiKey).toBe("********keyB");
+		expect(storedB).toBe(true);
+	});
+
 	for (const [groupId, section] of [
 		["CommandCode", "command-code"],
 		["pool-nug", "nug"],
 		["existing", "custom"],
 	] as const) {
-		test(`${section}: an empty draft adds a first key and saves its mask without dropping pending edits`, async () => {
+		test(`${section}: Add → Discard → unrelated Save preserves the persisted first key`, async () => {
 			useRealProviderDetails = true;
 			serverSettings.nugProviders = [
 				{
@@ -539,6 +608,20 @@ describe("immediate key pool changes keep the real settings draft safe", () => {
 				}
 				return { key };
 			});
+			onSettingsSave = (payload) => {
+				const apiKey =
+					section === "command-code"
+						? (payload.commandCode as { apiKey: string }).apiKey
+						: (
+								payload[section === "nug" ? "nugProviders" : "customApiProviders"] as Array<{
+									id: string;
+									apiKey: string;
+								}>
+							).find((p) => p.id === groupId)?.apiKey;
+				// Mirror syncFirstKeys: an empty projected field removes the first
+				// credential, while a stars-prefixed placeholder keeps the stored secret.
+				if (apiKey === "") pool.shift();
+			};
 			const usage = spyOn(api, "commandCodeUsage").mockResolvedValue({ loggedIn: false });
 			const quota = spyOn(api, "nugGetQuota").mockResolvedValue({ balance: 0, totalGranted: 0 });
 			const channels = spyOn(api, "nugGetChannelsHealth").mockResolvedValue({ channels: [] });
@@ -578,7 +661,18 @@ describe("immediate key pool changes keep the real settings draft safe", () => {
 						}>
 					).find((p) => p.id === groupId)?.apiKey,
 				).toBe(masked);
+			await click(button("unsavedDiscard"));
+			if (section === "command-code") {
+				const enabled = container.querySelector(`[aria-label="${text("commandcode.enabled")}"]`);
+				if (!enabled) throw new Error("Missing Command Code enable switch after discard");
+				await click(enabled);
+			} else
+				await type(
+					section === "nug" ? "nugProviderName" : "customApiProviderName",
+					"Unsaved local name",
+				);
 			await click(button("unsavedSave"));
+			expect(pool).toHaveLength(1);
 			expect(savedPayloads).toHaveLength(1);
 			const payload = savedPayloads[0];
 			if (section === "command-code")
@@ -603,6 +697,106 @@ describe("immediate key pool changes keep the real settings draft safe", () => {
 			);
 		});
 	}
+	for (const [groupId, section, keyLabel] of [
+		["CommandCode", "command-code", "commandcode.apiKeyLabel"],
+		["pool-nug", "nug", "nugApiKey"],
+		["existing", "custom", "customApiKey"],
+	] as const) {
+		for (const operation of ["disable", "network", "usage"]) {
+			test(`${section}: typed replacement survives backup ${operation} before Save`, async () => {
+				useRealProviderDetails = true;
+				serverSettings.commandCode = { apiKey: "********old" };
+				serverSettings.customApiProviders = persistedProviders().map((p) => ({
+					...p,
+					apiKey: "********old",
+				}));
+				serverSettings.nugProviders = [
+					{
+						id: "pool-nug",
+						name: "NUG",
+						prefix: "pool-nug",
+						apiKey: "********old",
+						baseUrl: "https://nug.example",
+						defaultModel: "",
+					},
+				];
+				queryClient.setQueryData(["admin", "settings"], clone(serverSettings));
+				let pool: ProviderKeyInfo[] = [
+					{ ...entry("first", "********old"), usage: { fetchedAt: 1, error: null, windows: [] } },
+					{ ...entry("backup", "********back", 1), network: { proxy: { mode: "direct" } } },
+				];
+				const list = spyOn(providerKeysApi, "list").mockImplementation(async () => ({
+					keys: clone(pool),
+				}));
+				const update = spyOn(providerKeysApi, "update").mockImplementation(async (id, fields) => {
+					pool = pool.map((key) =>
+						key.id === id
+							? {
+									...key,
+									...fields,
+									network: fields.network === undefined ? key.network : (fields.network ?? {}),
+								}
+							: key,
+					);
+					const key = pool.find((key) => key.id === id);
+					if (!key) throw new Error("Unknown pool key");
+					return { key };
+				});
+				const refresh = spyOn(providerKeysApi, "refreshUsage").mockImplementation(async () => ({
+					keys: clone(pool),
+				}));
+				const usage = spyOn(api, "commandCodeUsage").mockResolvedValue({ loggedIn: false });
+				const quota = spyOn(api, "nugGetQuota").mockResolvedValue({ balance: 0, totalGranted: 0 });
+				const channels = spyOn(api, "nugGetChannelsHealth").mockResolvedValue({ channels: [] });
+				for (const mock of [list, update, refresh, usage, quota, channels])
+					restorers.push(() => mock.mockRestore());
+				await mount(`/settings/providers?provider=${groupId}`);
+				await type(keyLabel, "typed-new-secret");
+				if (operation === "disable") {
+					const toggle = container.querySelectorAll<HTMLInputElement>(
+						`[aria-label="${text("providerKeys.enabled")}"]`,
+					)[1];
+					if (!toggle) throw new Error("Missing backup enable switch");
+					// linkedom dispatches clicks without the browser's default checkbox toggle.
+					toggle.checked = false;
+					await click(toggle);
+					expect(update).toHaveBeenCalledWith("backup", { disabled: true });
+				} else if (operation === "network") {
+					const network = container.querySelectorAll(
+						`[aria-label="${text("credentialNetwork.button")}"]`,
+					)[1];
+					if (!network) throw new Error("Missing backup network button");
+					await click(network);
+					const reset = [...document.querySelectorAll("button")].find(
+						(b) => b.textContent?.trim() === text("credentialNetwork.reset"),
+					);
+					if (!reset) throw new Error("Missing network reset button");
+					await click(reset);
+					expect(update).toHaveBeenCalledWith("backup", { network: null });
+				} else {
+					const refreshButton = container.querySelector(
+						`[aria-label="${text("providerKeys.refreshUsage")}"]`,
+					);
+					if (!refreshButton) throw new Error("Missing pool usage refresh");
+					await click(refreshButton);
+					expect(refresh).toHaveBeenCalledWith(groupId);
+				}
+				await click(button("unsavedSave"));
+				const payload = savedPayloads[0];
+				const savedKey =
+					section === "command-code"
+						? (payload?.commandCode as { apiKey: string }).apiKey
+						: (
+								payload?.[section === "nug" ? "nugProviders" : "customApiProviders"] as Array<{
+									id: string;
+									apiKey: string;
+								}>
+							).find((p) => p.id === groupId)?.apiKey;
+				expect(savedKey).toBe("typed-new-secret");
+			});
+		}
+	}
+
 	for (const readPhase of ["pending", "failed"]) {
 		test(`a successful add preserves the server key when the final key-list read is ${readPhase}`, async () => {
 			useRealProviderDetails = true;
@@ -626,6 +820,7 @@ describe("immediate key pool changes keep the real settings draft safe", () => {
 			});
 			for (const mock of [list, add]) restorers.push(() => mock.mockRestore());
 			await mount("/settings/providers?provider=existing");
+			await type("customApiProviderName", "Unrelated edit during key read");
 			await click(button("providerKeys.add"));
 			await type("providerKeys.key", "new-live-pool-key", true);
 			await click(button("providerKeys.addButton"));
@@ -676,6 +871,7 @@ describe("immediate key pool changes keep the real settings draft safe", () => {
 		});
 		for (const mock of [list, reorder, remove]) restorers.push(() => mock.mockRestore());
 		await mount("/settings/providers?provider=existing");
+		await type("customApiProviderName", "Unrelated order edit");
 		const up = container.querySelectorAll(`[aria-label="${text("providerKeys.moveUp")}"]`)[1];
 		if (!up) throw new Error("Missing second key's reorder button");
 		const listsBeforeOrder = list.mock.calls.length;
@@ -686,6 +882,7 @@ describe("immediate key pool changes keep the real settings draft safe", () => {
 			const removeButton = container.querySelector(`[aria-label="${text("providerKeys.remove")}"]`);
 			if (!removeButton) throw new Error("Missing key remove button");
 			await click(removeButton);
+			await type("customApiProviderName", `Unrelated removal edit ${_remaining}`);
 			await click(button("unsavedSave"));
 		}
 		expect(

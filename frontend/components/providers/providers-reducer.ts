@@ -86,9 +86,17 @@ export interface SavedSnapshot {
 // Functional updater types
 type Updater<T> = T | ((prev: T) => T);
 
+export type ProviderKeyTarget = { kind: "command-code" } | { kind: "custom" | "nug"; id: string };
+
 export type ProvidersAction =
 	| { type: "INIT_FROM_SETTINGS"; settings: Record<string, unknown> }
 	| { type: "SYNC_FROM_SETTINGS"; settings: Record<string, unknown> }
+	| {
+			type: "SYNC_PERSISTED_PROVIDER_KEY";
+			target: ProviderKeyTarget;
+			apiKey: string;
+			previousApiKey: string | undefined;
+	  }
 	| { type: "SET_CUSTOM_API_PROVIDERS"; providers: Updater<CustomApiProviderState[]> }
 	| { type: "SET_OPENAI_PROVIDERS"; providers: Updater<OpenAIProviderState[]> }
 	| { type: "SET_ANTHROPIC_PROVIDERS"; providers: Updater<AnthropicProviderState[]> }
@@ -321,6 +329,30 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 	switch (action.type) {
 		case "SYNC_FROM_SETTINGS":
 			return providersStateFromSettings(action.settings);
+
+		case "SYNC_PERSISTED_PROVIDER_KEY": {
+			const { target, apiKey, previousApiKey } = action;
+			// Pool writes are already saved. Follow them only if this particular field
+			// still matches its old baseline; a typed replacement/clear remains a draft.
+			if (target.kind === "command-code") {
+				if (state.commandCode.apiKey !== previousApiKey) return state;
+				return { ...state, commandCode: { ...state.commandCode, apiKey } };
+			}
+			if (target.kind === "nug") {
+				return {
+					...state,
+					nugProviders: state.nugProviders.map((p) =>
+						p.id === target.id && p.apiKey === previousApiKey ? { ...p, apiKey } : p,
+					),
+				};
+			}
+			return withDerivedCustomApiProviders(
+				state,
+				state.customApiProviders.map((p) =>
+					p.id === target.id && p.apiKey === previousApiKey ? { ...p, apiKey } : p,
+				),
+			);
+		}
 
 		case "INIT_FROM_SETTINGS": {
 			if (state.initialized) return state;
@@ -708,6 +740,37 @@ export function useIsDirty(state: ProvidersState, savedSnapshot: SavedSnapshot):
 
 		return false;
 	}, [state, savedSnapshot]);
+}
+
+/** Advance only an immediately persisted key in the discard/dirty baseline. */
+export function rebasePersistedProviderKeySnapshot(
+	snapshot: SavedSnapshot,
+	target: ProviderKeyTarget,
+	apiKey: string,
+): { snapshot: SavedSnapshot; previousApiKey: string | undefined } {
+	if (target.kind === "command-code") {
+		return {
+			previousApiKey: snapshot.commandCode.apiKey,
+			snapshot: { ...snapshot, commandCode: { ...snapshot.commandCode, apiKey } },
+		};
+	}
+	const update = <T extends { id: string; apiKey: string }>(providers: T[]) =>
+		providers.map((p) => (p.id === target.id ? { ...p, apiKey } : p));
+	if (target.kind === "nug") {
+		return {
+			previousApiKey: snapshot.nugProviders.find((p) => p.id === target.id)?.apiKey,
+			snapshot: { ...snapshot, nugProviders: update(snapshot.nugProviders) },
+		};
+	}
+	return {
+		previousApiKey: snapshot.customApiProviders.find((p) => p.id === target.id)?.apiKey,
+		snapshot: {
+			...snapshot,
+			customApiProviders: update(snapshot.customApiProviders),
+			openaiProviders: update(snapshot.openaiProviders),
+			anthropicProviders: update(snapshot.anthropicProviders),
+		},
+	};
 }
 
 /** Create a snapshot of the current state for dirty detection. */

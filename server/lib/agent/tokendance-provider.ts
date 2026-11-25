@@ -323,7 +323,7 @@ export class TokenDanceProvider implements ProviderAdapter {
 		const scope = (value: string | undefined) =>
 			value ? `${value}:tokendance:${this.sessionScope}` : value;
 		const delegate = this.active(params.model);
-		await delegate.prepareForModel?.(params.model);
+		delegate.prepareForModel?.(params.model);
 		yield* delegate.chat({
 			...params,
 			conversationId: `${params.conversationId}:tokendance:${this.sessionScope}`,
@@ -341,7 +341,7 @@ export class TokenDanceProvider implements ProviderAdapter {
 		options?: GenerateOptions,
 	): Promise<GenerateMetaResult> {
 		const delegate = this.active(model);
-		await delegate.prepareForModel?.(model);
+		delegate.prepareForModel?.(model);
 		return delegate.generateWithMeta(text, model, system, options);
 	}
 	async generateWithHistory(
@@ -361,7 +361,7 @@ export class TokenDanceProvider implements ProviderAdapter {
 		options?: GenerateOptions,
 	): Promise<GenerateMetaResult> {
 		const delegate = this.active(model);
-		await delegate.prepareForModel?.(model);
+		delegate.prepareForModel?.(model);
 		return delegate.generateWithHistoryWithMeta
 			? delegate.generateWithHistoryWithMeta(system, content, model, locale, options)
 			: { text: await delegate.generateWithHistory(system, content, model, locale, options) };

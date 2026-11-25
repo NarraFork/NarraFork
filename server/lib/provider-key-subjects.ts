@@ -41,7 +41,10 @@ export function streamQuotaIdentityForPrefix(
 	// Plain single-key adapters preserve the historical connection id for accounting.
 	const first = keys[0];
 	if (
-		keys.length === 1 &&
+		(keys.length === 1 ||
+			(custom &&
+				keys.filter((entry) => !entry.disabled).length === 1 &&
+				first?.apiKey === config.apiKey)) &&
 		credentialId === config.id &&
 		first &&
 		!first.disabled &&

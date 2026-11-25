@@ -113,8 +113,11 @@ function KeyUsage({ usage }: { usage: NonNullable<ProviderKeyInfo["usage"]> }) {
 export function ProviderKeysPanel({
 	providerId,
 	onFirstKeyChanged,
+	showSingleKey = false,
 }: {
 	providerId: string;
+	/** OAuth-only sections have no separate first-key editor. */
+	showSingleKey?: boolean;
 	/** Keep the settings draft aligned with this immediately persisted pool. */
 	onFirstKeyChanged?: (maskedApiKey: string) => void;
 }) {
@@ -166,7 +169,10 @@ export function ProviderKeysPanel({
 		);
 	}
 	const list = keys.data?.keys ?? [];
-	const showList = list.length > 1 || list.some((k) => k.usage || k.cooldown || k.disabled);
+	const showList =
+		(showSingleKey && list.length > 0) ||
+		list.length > 1 ||
+		list.some((k) => k.usage || k.cooldown || k.disabled);
 
 	const move = (index: number, delta: number) => {
 		const ids = list.map((k) => k.id);
@@ -189,6 +195,7 @@ export function ProviderKeysPanel({
 								size="sm"
 								variant="subtle"
 								loading={run.isPending}
+								aria-label={t("providerKeys.refreshUsage")}
 								onClick={() => run.mutate(() => providerKeysApi.refreshUsage(providerId))}
 							>
 								<IconRefresh size={14} />
@@ -240,6 +247,7 @@ export function ProviderKeysPanel({
 											size="sm"
 											variant={Object.keys(entry.network).length ? "light" : "subtle"}
 											color={Object.keys(entry.network).length ? "indigo" : "gray"}
+											aria-label={t("credentialNetwork.button")}
 											onClick={() => setNetworkFor(entry)}
 										>
 											<IconWorld size={14} />

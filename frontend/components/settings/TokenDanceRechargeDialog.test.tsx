@@ -40,6 +40,7 @@ const globals = {
 	ShadowRoot: window.ShadowRoot ?? class {},
 	getComputedStyle: () => ({ getPropertyValue: () => "", overflow: "visible" }),
 	matchMedia: window.matchMedia,
+	MutationObserver: window.MutationObserver,
 	ResizeObserver: class {
 		observe() {}
 		unobserve() {}
@@ -54,6 +55,7 @@ for (const [key, value] of Object.entries(globals)) {
 	Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
 }
 (window.document as unknown as Record<string, unknown>).oninput = null;
+Object.assign(window.document, { fonts: { addEventListener() {}, removeEventListener() {} } });
 const { QueryClient, QueryClientProvider } = await import("@tanstack/react-query");
 const { formatTokenDanceMoney, useTokenDanceBalance } = await import(
 	"../../hooks/useTokenDanceBalance"
@@ -323,6 +325,34 @@ async function recovery(action = "top_up_balance") {
 	await settle();
 }
 describe("TokenDance recharge behavior", () => {
+	it("a single ready TokenDance key exposes its working network editor", async () => {
+		getKeys.mockResolvedValue({
+			keys: [
+				{
+					id: "login-key",
+					label: null,
+					masked: "********login",
+					priority: 0,
+					disabled: false,
+					disabledReason: null,
+					network: {},
+					cooldown: null,
+					usage: null,
+				},
+			],
+		});
+		await renderSection();
+		const network = container.querySelector(`[aria-label="${settings.credentialNetwork.button}"]`);
+		if (!network) throw new Error("Missing single ready key network entry");
+		await act(async () => {
+			network.dispatchEvent(new window.Event("click", { bubbles: true }));
+		});
+		await settle();
+		expect(document.querySelector('[role="dialog"]')?.textContent).toContain(
+			settings.credentialNetwork.description,
+		);
+	});
+
 	it.each([
 		undefined,
 		"invalid",

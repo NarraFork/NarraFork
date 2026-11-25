@@ -104,6 +104,8 @@ export function isGeminiProtocol(protocol: CustomApiProtocol): boolean {
 interface CustomApiProviderSectionProps {
 	provider: CustomApiProviderState;
 	onProvidersChange: (updater: ProvidersUpdater) => void;
+	/** The page rebases this immediately persisted field into its discard baseline. */
+	onPersistedKeyChanged?: (apiKey: string) => void;
 	openAIProviderModelsMap: Record<string, ModelOption[]>;
 	anthropicProviderModelsMap: Record<string, ModelOption[]>;
 	geminiProviderModelsMap: Record<string, ModelOption[]>;
@@ -131,6 +133,7 @@ function sanitizePrefix(value: string): string {
 export const CustomApiProviderSection = React.memo(function CustomApiProviderSection({
 	provider,
 	onProvidersChange,
+	onPersistedKeyChanged,
 	openAIProviderModelsMap,
 	anthropicProviderModelsMap,
 	geminiProviderModelsMap,
@@ -459,8 +462,9 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 					onChange={(e) => updateProvider("apiKey", e.currentTarget.value)}
 				/>
 				<ProviderKeysPanel
+					key={provider.id}
 					providerId={provider.id}
-					onFirstKeyChanged={(apiKey) => updateProvider("apiKey", apiKey)}
+					onFirstKeyChanged={onPersistedKeyChanged}
 				/>
 				<TextInput
 					label={t("customApiBaseUrl")}

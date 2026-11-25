@@ -9,7 +9,7 @@ import {
 } from "../lib/provider-keys";
 import { isLegacyTokenDancePrefixAllowed } from "../lib/settings/tokendance-prefix";
 import type { NarraForkSettings } from "../lib/settings/types";
-import { quotaStore } from "../lib/sourcing/quota-store";
+import { quotaStore, STREAM_QUOTA_SOURCE } from "../lib/sourcing/quota-store";
 
 const fakeSettings = {
 	server: { allowedOrigins: ["https://ui.example"] },
@@ -931,6 +931,88 @@ describe("TokenDance billing", () => {
 });
 
 describe("TokenDance backend", () => {
+	test.each([
+		false,
+		true,
+	])("reauthorizing A to B reuses existing secrets and preserves manual identity (manual=B: %s)", async (manualMatchesNewLogin) => {
+		const { keyCooldown, reportKeyFault, selectProviderKey, usableProviderKeys } = await import(
+			"../lib/agent/pooled-provider"
+		);
+		const { ApiError } = await import("../lib/agent/types");
+		const store = getProviderKeyStore();
+		const oldSecret = "still-valid-oauth-user-A";
+		const newSecret = "still-valid-oauth-user-B";
+		let returnedSecret = oldSecret;
+		const auth: string[] = [];
+		fetchMock((url, init) => {
+			if (url.endsWith("/auth/keys")) return json({ key: returnedSecret });
+			auth.push(new Headers(init?.headers).get("Authorization") ?? "");
+			return url.endsWith("/models") ? json({ data: [] }) : json(paymentFixture());
+		});
+		const firstFlow = start();
+		await service.completeTokenDanceOAuth(firstFlow.owner, firstFlow.flowId, "first-code");
+		const original = selectProviderKey(TOKENDANCE_KEY_OWNER, "reauthorization-existing-session");
+		if (!original) throw new Error("missing original login");
+		const originalIdentity = { id: original.id, priority: original.priority };
+		expect(original.apiKey).toBe(oldSecret);
+		const manual = store.add(TOKENDANCE_KEY_OWNER, {
+			apiKey: manualMatchesNewLogin ? newSecret : "independent-manual-user-key",
+			label: "Keep this manual credential",
+			network: { extraHeaders: { "X-Manual-Network": "preserved" } },
+		});
+		const manualBefore = structuredClone(manual);
+		const exhausted = {
+			fetchedAt: Date.now(),
+			scope: "wallet" as const,
+			windows: [],
+			balances: [{ unit: "CNY", remaining: 0, total: 10 }],
+		};
+		quotaStore.set(original.id, oldSecret, exhausted);
+		quotaStore.set(original.id, oldSecret, exhausted, false, STREAM_QUOTA_SOURCE);
+		reportKeyFault(original, new ApiError(402, "old account allowance exhausted"));
+		expect(keyCooldown(original.id)).toBeDefined();
+		returnedSecret = newSecret;
+		const secondFlow = start();
+		await service.completeTokenDanceOAuth(secondFlow.owner, secondFlow.flowId, "second-code");
+		expect(keyCooldown(original.id)).toBeUndefined();
+		expect(quotaStore.peek(original.id)).toBeUndefined();
+		expect(quotaStore.peek(original.id, STREAM_QUOTA_SOURCE)).toBeUndefined();
+		const expectedIdentity = manualMatchesNewLogin
+			? { id: manualBefore.id, priority: manualBefore.priority }
+			: originalIdentity;
+		for (const session of ["reauthorization-existing-session", "reauthorization-new-session"]) {
+			expect(selectProviderKey(TOKENDANCE_KEY_OWNER, session)).toMatchObject({
+				...expectedIdentity,
+				apiKey: newSecret,
+				account: tokenDanceLoginAccount(newSecret),
+			});
+		}
+		expect(usableProviderKeys(TOKENDANCE_KEY_OWNER).some((key) => key.apiKey === oldSecret)).toBe(
+			false,
+		);
+		expect(store.get(manual.id)).toEqual({
+			...manualBefore,
+			...(manualMatchesNewLogin ? { account: tokenDanceLoginAccount(newSecret) } : {}),
+		});
+		if (manualMatchesNewLogin) {
+			expect(store.get(original.id)).toMatchObject({ apiKey: oldSecret, disabled: true });
+			expect(store.get(original.id)?.account).toBeUndefined();
+		}
+		expect(store.list(TOKENDANCE_KEY_OWNER)).toHaveLength(2);
+		expect(store.list(TOKENDANCE_KEY_OWNER).filter((key) => key.apiKey === newSecret)).toHaveLength(
+			1,
+		);
+		expect(
+			usableProviderKeys(TOKENDANCE_KEY_OWNER).filter((key) => key.apiKey === newSecret),
+		).toHaveLength(1);
+		const generation = service.getTokenDanceConnection().generation;
+		await createPayment(`reauthorization-${manual.id}`, {
+			amount: 10,
+			generation,
+			requestId: "v".repeat(43),
+		});
+		expect(auth).toEqual([`Bearer ${oldSecret}`, `Bearer ${newSecret}`, `Bearer ${newSecret}`]);
+	});
 	test("OAuth preserves a manual first key and binds portal operations to the returned login", async () => {
 		const store = getProviderKeyStore();
 		const manual = store.add(TOKENDANCE_KEY_OWNER, { apiKey: "manual-other-user" });

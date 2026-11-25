@@ -17,7 +17,12 @@ interface ManagedRelay {
 const managed = new Map<string, ManagedRelay>();
 
 function relaySignature(config: NUGProviderConfig): string {
-	return JSON.stringify([config.baseUrl, config.apiKey, config.egressProxyUrl ?? ""]);
+	return JSON.stringify([
+		config.baseUrl,
+		config.apiKey,
+		config.egressMode,
+		config.egressProxyUrl ?? "",
+	]);
 }
 
 export function usesLocalEgress(config: NUGProviderConfig): boolean {
@@ -60,6 +65,12 @@ export function getNugRelayChannelId(providerId: string): string | null {
 		return null;
 	}
 	return entry.client.currentChannelId;
+}
+
+/** Only the credential and endpoint that own the live channel may send through it. */
+export function getNugRelayChannelIdForCredential(config: NUGProviderConfig): string | null {
+	const entry = managed.get(config.id);
+	return entry?.signature === relaySignature(config) ? getNugRelayChannelId(config.id) : null;
 }
 
 export function getNugRelayStatus(providerId: string): NugRelayStatus | "disabled" {

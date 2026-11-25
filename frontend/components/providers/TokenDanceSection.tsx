@@ -199,7 +199,7 @@ export function TokenDanceSection({
 					{t("tokendance.delete")}
 				</Button>
 			</Group>
-			{isAdmin && <ProviderKeysPanel providerId="tokendance" />}
+			{isAdmin && <ProviderKeysPanel key="tokendance" providerId="tokendance" showSingleKey />}
 			<ModelList
 				{...modelListProps}
 				models={connection.models.map((model) => ({

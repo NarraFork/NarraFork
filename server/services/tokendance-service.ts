@@ -18,6 +18,7 @@ import {
 	type TokenDanceRecoveryAction,
 } from "@shared/tokendance";
 import type { ToolResultImagesMode } from "@shared/tool-result-images";
+import { clearKeyCooldown } from "../lib/agent/pooled-provider";
 import { maskSecretValues } from "../lib/agent/request-dump";
 import { normalizeConfiguredOrigins, resolveAllowedCorsOrigin } from "../lib/cors-origin";
 import { AppError } from "../lib/errors";
@@ -32,7 +33,11 @@ import {
 } from "../lib/provider-keys";
 import { saveSettings, settings, type TokenDanceSettings } from "../lib/settings";
 import { settingsUpdateLock } from "../lib/settings/write-lock";
-import { importLegacyQuotaCache, quotaStore } from "../lib/sourcing/quota-store";
+import {
+	importLegacyQuotaCache,
+	quotaStore,
+	STREAM_QUOTA_SOURCE,
+} from "../lib/sourcing/quota-store";
 import { registerTokenDanceRuntime } from "../lib/tokendance-runtime";
 
 registerTokenDanceRuntime({
@@ -648,15 +653,33 @@ export async function completeTokenDanceOAuth(
 			assertNoPrefixConflict();
 			const latest = structuredClone(settings);
 			const store = getProviderKeyStore();
-			// Re-login adds/claims the returned credential, never overwrites a manual first key.
+			// Claim an existing returned key before rotating the login slot, so one secret
+			// never gains two credential/quota identities. Otherwise replace the old login
+			// in place, keeping independent manual credentials and their network/order intact.
+			const keys = store.list(TOKENDANCE_KEY_OWNER);
 			const login =
-				store.list(TOKENDANCE_KEY_OWNER).find((entry) => entry.apiKey === key) ??
+				keys.find((entry) => entry.apiKey === key) ??
+				keys.find(isTokenDanceLoginKey) ??
 				store.add(TOKENDANCE_KEY_OWNER, { apiKey: key });
-			for (const previous of store.list(TOKENDANCE_KEY_OWNER)) {
-				if (previous.id !== login.id && previous.account?.accountId === "tokendance-login")
-					store.update(previous.id, { account: null });
+			const secretChanged = login.apiKey !== key;
+			store.update(login.id, {
+				apiKey: key,
+				account: tokenDanceLoginAccount(key),
+				disabled: false,
+			});
+			clearKeyCooldown(login.id);
+			if (secretChanged) {
+				quotaStore.remove(login.id);
+				quotaStore.remove(login.id, STREAM_QUOTA_SOURCE);
 			}
-			store.update(login.id, { account: tokenDanceLoginAccount(key), disabled: false });
+			for (const previous of keys) {
+				if (previous.id !== login.id && isTokenDanceLoginKey(previous)) {
+					store.update(previous.id, { account: null, disabled: true });
+					clearKeyCooldown(previous.id);
+					quotaStore.remove(previous.id);
+					quotaStore.remove(previous.id, STREAM_QUOTA_SOURCE);
+				}
+			}
 			latest.tokendance = {
 				toolResultImages: latest.tokendance?.toolResultImages,
 				modelCollectionInitialized: latest.tokendance?.modelCollectionInitialized,

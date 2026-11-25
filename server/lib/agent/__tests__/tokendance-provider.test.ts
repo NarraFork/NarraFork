@@ -294,37 +294,29 @@ describe("credential-isolated TokenDance providers", () => {
 		expect(provider.getActiveReasoningSource()).toBe("tokendance:completions-compatible");
 	});
 
-	test("chat and generation await asynchronous delegate preparation", async () => {
+	test("chat and generation synchronously prepare the selected delegate", async () => {
 		catalog("openai:chat-completions");
 		const provider = new TokenDanceProvider();
 		provider.prepareForModel(params().model);
 		const delegate = (provider as unknown as { delegate: import("../provider").ProviderAdapter })
 			.delegate;
 		let prepared = false;
-		let release!: () => void;
-		delegate.prepareForModel = async () => {
-			await new Promise<void>((resolve) => {
-				release = resolve;
-			});
+		delegate.prepareForModel = () => {
 			prepared = true;
 		};
 		delegate.chat = async function* () {
 			expect(prepared).toBe(true);
 			yield* [];
 		};
-		const chat = provider.chat(params()).next();
-		expect(prepared).toBe(false);
-		release();
-		await chat;
+		await provider.chat(params()).next();
+		expect(prepared).toBe(true);
 		prepared = false;
 		delegate.generateWithMeta = async () => {
 			expect(prepared).toBe(true);
 			return { text: "ready" };
 		};
-		const generated = provider.generateWithMeta("hello", params().model);
-		expect(prepared).toBe(false);
-		release();
-		expect(await generated).toEqual({ text: "ready" });
+		expect(await provider.generateWithMeta("hello", params().model)).toEqual({ text: "ready" });
+		expect(prepared).toBe(true);
 	});
 });
 

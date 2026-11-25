@@ -1,5 +1,9 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import type { CredentialNetwork } from "@shared/credential-network";
+import {
+	getCustomApiCachedQuota,
+	updateCustomApiQuotaByPrefix,
+} from "../../custom-api-quota-cache";
 import { setNugCachedModels } from "../../nug-model-cache";
 import {
 	streamQuotaIdentityForPrefix,
@@ -11,7 +15,8 @@ import {
 	nugKeyOwner,
 	TOKENDANCE_KEY_OWNER,
 } from "../../provider-keys";
-import { type NUGProviderConfig, saveSettings, settings } from "../../settings";
+import { saveSettings, settings } from "../../settings";
+import { quotaStore, STREAM_QUOTA_SOURCE } from "../../sourcing/quota-store";
 import { registerTokenDanceRuntime } from "../../tokendance-runtime";
 import type {
 	ChatParams,
@@ -19,6 +24,7 @@ import type {
 	ParsedStreamEvent,
 	ProviderAdapter,
 } from "../provider";
+import { type ProviderTransport, runProviderTransport } from "../provider-transport";
 import { ApiError } from "../types";
 
 // Keep the real resolver, Command Code factory, NUG adapter and credential stores.
@@ -27,7 +33,7 @@ import { ApiError } from "../types";
 const realAnthropic = { ...(await import("../anthropic-provider")) };
 const realOpenai = { ...(await import("../openai-provider")) };
 const realTokenDance = { ...(await import("../tokendance-provider")) };
-const realRelay = { ...(await import("../../nug-relay/manager")) };
+const realRelayClient = { ...(await import("../../nug-relay/relay-client")) };
 const realCommandCodeAuth = { ...(await import("../../commandcode-manager")) };
 
 type AdapterConfig = {
@@ -40,22 +46,43 @@ type AdapterConfig = {
 	userAgentMode?: string;
 	customUserAgent?: string;
 	extraHeaders?: Record<string, string>;
+	dynamicHeaders?: () => Record<string, string>;
 };
+function snapshotConfig(config: AdapterConfig): AdapterConfig {
+	const { dynamicHeaders, ...data } = config;
+	return { ...structuredClone(data), ...(dynamicHeaders ? { dynamicHeaders } : {}) };
+}
 const constructed: Array<{ kind: string; config: AdapterConfig }> = [];
-const requests: Array<{ apiKey: string; operation: string }> = [];
+const requests: Array<{ apiKey: string; operation: string; headers?: Record<string, string> }> = [];
 const imageRequests: Array<{ config: AdapterConfig; params: ImageGenerationRequest }> = [];
-const relayConfigs: NUGProviderConfig[] = [];
+const relayClients: StubRelayClient[] = [];
 const failingKeys = new Set<string>();
 const authCalls: Array<string | undefined> = [];
 let cliToken: string | undefined;
+let beforeTransport: (() => void) | undefined;
+
+// Stub only the socket. Credential/endpoint/egress matching belongs to the real manager.
+class StubRelayClient {
+	status = "connecting";
+	currentChannelId: string | null = null;
+	constructor(readonly options: import("../../nug-relay/relay-client").NugRelayClientOptions) {
+		relayClients.push(this);
+	}
+	start() {}
+	stop() {
+		this.status = "offline";
+		this.currentChannelId = null;
+	}
+}
 
 class FakeAdapter implements ProviderAdapter {
 	private reasoningSource?: string;
 	constructor(
 		readonly config: AdapterConfig,
 		kind: string,
+		private readonly transport?: ProviderTransport,
 	) {
-		constructed.push({ kind, config: structuredClone(config) });
+		constructed.push({ kind, config: snapshotConfig(config) });
 	}
 	formatTools() {
 		return [];
@@ -70,39 +97,59 @@ class FakeAdapter implements ProviderAdapter {
 	getActiveReasoningSource() {
 		return this.reasoningSource;
 	}
-	protected request(operation: string) {
-		requests.push({ apiKey: this.config.apiKey, operation });
-		if (failingKeys.has(this.config.apiKey)) throw new ApiError(401, "invalid test key");
+	protected async request(operation: string, afterAssembly?: () => void | Promise<void>) {
+		const dynamicHeaders = this.config.dynamicHeaders?.();
+		const headers = new Headers({ ...this.config.extraHeaders, ...dynamicHeaders });
+		await afterAssembly?.();
+		const change = beforeTransport;
+		beforeTransport = undefined;
+		change?.();
+		await runProviderTransport(
+			this.transport,
+			"https://stub-transport.invalid",
+			{ headers },
+			async (_input, init) => {
+				requests.push({
+					apiKey: this.config.apiKey,
+					operation,
+					...(dynamicHeaders || this.transport?.transportHeaders
+						? { headers: Object.fromEntries(new Headers(init?.headers)) }
+						: {}),
+				});
+				if (failingKeys.has(this.config.apiKey)) throw new ApiError(401, "invalid test key");
+				return new Response();
+			},
+		);
 	}
 	async *chat(params: ChatParams) {
 		params.onRequestStart?.({ credentialId: "inner-connection" });
-		this.request("chat");
+		await this.request("chat", () => params.onInputCharacters?.(null));
 		yield { text: this.config.apiKey, credentialId: "inner-connection" };
 	}
 	async generate() {
-		this.request("generate");
+		await this.request("generate");
 		return this.config.apiKey;
 	}
 	async generateWithMeta() {
-		this.request("meta");
+		await this.request("meta");
 		return { text: this.config.apiKey, credentialId: "inner-connection" };
 	}
 	async generateWithHistory() {
-		this.request("history");
+		await this.request("history");
 		return this.config.apiKey;
 	}
 	async generateWithHistoryWithMeta() {
-		this.request("history-meta");
+		await this.request("history-meta");
 		return { text: this.config.apiKey, credentialId: "inner-connection" };
 	}
 }
 class FakeOpenAI extends FakeAdapter {
-	constructor(config: AdapterConfig) {
-		super(config, "openai");
+	constructor(config: AdapterConfig, _state?: unknown, transport?: ProviderTransport) {
+		super(config, "openai", transport);
 	}
 	async generateImage(params: ImageGenerationRequest) {
-		imageRequests.push({ config: structuredClone(this.config), params });
-		this.request("image");
+		imageRequests.push({ config: snapshotConfig(this.config), params });
+		await this.request("image");
 		return {
 			response: Response.json({ apiKey: this.config.apiKey, model: params.model }),
 			credentialId: "inner-connection",
@@ -129,11 +176,11 @@ mock.module("../tokendance-provider", () => ({
 	...realTokenDance,
 	TokenDanceProvider: FakeTokenDance,
 }));
-mock.module("../../nug-relay/manager", () => ({
-	...realRelay,
-	ensureNugRelayClient: (config: NUGProviderConfig) => relayConfigs.push(structuredClone(config)),
-	getNugRelayChannelId: () => "test-relay-channel",
+mock.module("../../nug-relay/relay-client", () => ({
+	...realRelayClient,
+	NugRelayClient: StubRelayClient,
 }));
+const { ensureNugRelayClient, stopAllNugRelayClients } = await import("../../nug-relay/manager");
 mock.module("../../commandcode-manager", () => ({
 	...realCommandCodeAuth,
 	resolveCommandCodeToken: (configuredApiKey?: string) => {
@@ -189,12 +236,16 @@ const unregisterRuntime = registerTokenDanceRuntime({
 
 beforeEach(() => {
 	for (const family of families) store().removeProvider(family.owner);
+	for (const key of store().list(CUSTOM_ID)) quotaStore.remove(key.id, STREAM_QUOTA_SOURCE);
+	quotaStore.remove(CUSTOM_ID, STREAM_QUOTA_SOURCE);
 	store().removeProvider(CUSTOM_ID);
 	resetProviderKeyRuntimeForTests();
 	constructed.length = 0;
 	requests.length = 0;
 	imageRequests.length = 0;
-	relayConfigs.length = 0;
+	stopAllNugRelayClients();
+	relayClients.length = 0;
+	beforeTransport = undefined;
 	failingKeys.clear();
 	authCalls.length = 0;
 	cliToken = "test-cli-fallback";
@@ -224,6 +275,8 @@ beforeEach(() => {
 
 afterEach(() => {
 	for (const family of families) store().removeProvider(family.owner);
+	for (const key of store().list(CUSTOM_ID)) quotaStore.remove(key.id, STREAM_QUOTA_SOURCE);
+	quotaStore.remove(CUSTOM_ID, STREAM_QUOTA_SOURCE);
 	store().removeProvider(CUSTOM_ID);
 	resetProviderKeyRuntimeForTests();
 	expect(network).not.toHaveBeenCalled();
@@ -235,7 +288,8 @@ afterAll(() => {
 	mock.module("../anthropic-provider", () => realAnthropic);
 	mock.module("../openai-provider", () => realOpenai);
 	mock.module("../tokendance-provider", () => realTokenDance);
-	mock.module("../../nug-relay/manager", () => realRelay);
+	stopAllNugRelayClients();
+	mock.module("../../nug-relay/relay-client", () => realRelayClient);
 	mock.module("../../commandcode-manager", () => realCommandCodeAuth);
 	mock.restore();
 });
@@ -488,13 +542,13 @@ describe("real NUG preparation and relay ownership through pools", () => {
 		expect(await adapter.generateWithMeta("test", model)).toMatchObject({
 			credentialId: second.id,
 		});
-		expect(relayConfigs).toHaveLength(2);
-		for (const config of relayConfigs) expect(config).toEqual(original);
-		expect(relayConfigs.map((config) => config.apiKey)).toEqual([
-			"relay-connection-key",
-			"relay-connection-key",
-		]);
-		expect(relayConfigs.every((config) => config.proxy?.mode === "direct")).toBe(true);
+		expect(relayClients).toHaveLength(1);
+		expect(relayClients[0]?.options).toEqual({
+			providerId: original.id,
+			baseUrl: original.baseUrl,
+			apiKey: "relay-connection-key",
+			egressProxyUrl: original.egressProxyUrl,
+		});
 	});
 });
 
@@ -691,3 +745,267 @@ for (const variant of ["plain NUG", "pooled NUG", "pooled custom"] as const) {
 		});
 	});
 }
+
+test("promoted plain custom backup bills the group but publishes its balance only to key B", async () => {
+	saveSettings({
+		...settings,
+		customApiProviders: [
+			{
+				...providerNetwork,
+				id: CUSTOM_ID,
+				name: "Promoted custom backup",
+				prefix: "poolcustom",
+				apiKey: "",
+				baseUrl: "https://promoted-custom.invalid/v1",
+				defaultModel: "m",
+				protocol: "completions-compatible",
+			},
+		],
+	});
+	const first = store().add(CUSTOM_ID, { apiKey: "old-key-A" });
+	const backup = store().add(CUSTOM_ID, { apiKey: "promoted-key-B" });
+	store().update(first.id, { disabled: true });
+	store().reorder(CUSTOM_ID, [backup.id, first.id]);
+	const { adapter, model } = resolveProviderAndModel("poolcustom:m");
+	expect(adapter).not.toBeInstanceOf(PooledProvider);
+	let publishedIdentity: string | undefined;
+	const events = await drain(
+		adapter.chat({
+			...chatParams(model, "promoted-backup"),
+			onRequestStart: (info) => {
+				expect(info?.credentialId).toBe(CUSTOM_ID);
+				publishedIdentity = streamQuotaIdentityForRequest("poolcustom", info);
+				expect(publishedIdentity).toBe(
+					JSON.stringify([CUSTOM_ID, "https://promoted-custom.invalid/v1", backup.apiKey]),
+				);
+				updateCustomApiQuotaByPrefix("poolcustom", "73.5", "backup balance", publishedIdentity);
+			},
+		}),
+	);
+	expect(events).toEqual([{ text: backup.apiKey, credentialId: CUSTOM_ID }]);
+	expect(quotaStore.peek(backup.id, STREAM_QUOTA_SOURCE)?.detail).toEqual({
+		quotaBalance: "73.5",
+		detailedQuotaBalance: "backup balance",
+	});
+	expect(getCustomApiCachedQuota(CUSTOM_ID)).toMatchObject({
+		quotaBalance: "73.5",
+		detailedQuotaBalance: "backup balance",
+	});
+	expect(quotaStore.peek(first.id, STREAM_QUOTA_SOURCE)).toBeUndefined();
+	expect(quotaStore.peek(CUSTOM_ID, STREAM_QUOTA_SOURCE)).toBeUndefined();
+});
+
+const relayOperations = ["chat", "generate", "meta", "history", "history-meta", "image"] as const;
+type RelayOperation = (typeof relayOperations)[number];
+async function relayRequest(
+	adapter: ProviderAdapter,
+	model: string,
+	operation: RelayOperation,
+	afterAssembly?: () => void,
+) {
+	if (operation === "chat") {
+		const events = await drain(
+			adapter.chat({
+				...chatParams(model, "relay-session"),
+				onInputCharacters: afterAssembly,
+			}),
+		);
+		return events[0];
+	}
+	beforeTransport = afterAssembly;
+	if (operation === "generate") return { text: await adapter.generate("test", model) };
+	if (operation === "meta") return adapter.generateWithMeta("test", model);
+	if (operation === "history")
+		return { text: await adapter.generateWithHistory("system", "test", model) };
+	if (operation === "history-meta")
+		return adapter.generateWithHistoryWithMeta?.("system", "test", model);
+	if (!adapter.generateImage) throw new Error("missing NUG pooled image generation");
+	const image = await adapter.generateImage({
+		prompt: "test image",
+		model: "future-image-model",
+		chatModel: model,
+		conversationId: "relay-image-session",
+		signal: new AbortController().signal,
+	});
+	return { text: (await image.response.json()).apiKey as string, credentialId: image.credentialId };
+}
+function relayPool(fallback?: boolean) {
+	const first = store().add(nugKeyOwner(NUG_ID), {
+		apiKey: "relay-key-A",
+		network: {
+			...keyNetwork("first"),
+			extraHeaders: { "X-Identity": "first", "X-NUG-Relay-Channel": "forged-A-channel" },
+		},
+	});
+	const backup = store().add(nugKeyOwner(NUG_ID), {
+		apiKey: "backup-key-B",
+		network: {
+			...keyNetwork("second"),
+			extraHeaders: { "X-Identity": "second", "X-NUG-Relay-Channel": "forged-A-channel" },
+		},
+	});
+	const connection = settings.nugProviders?.[0];
+	if (!connection) throw new Error("missing relay matching fixture");
+	connection.egressMode = "local-proxy";
+	connection.egressAllowDirectFallback = fallback;
+	const relayConfig = structuredClone(connection);
+	setNugCachedModels(NUG_ID, [
+		{ id: "upstream:m", channel: "upstream", channelType: "codex", model: "m" },
+	]);
+	const { adapter, model } = resolveProviderAndModel("poolnug:upstream:m");
+	expect(adapter).toBeInstanceOf(PooledProvider);
+	const client = relayClients.at(-1);
+	if (!client) throw new Error("missing relay socket");
+	client.status = "online";
+	client.currentChannelId = "online-A-channel";
+	return { adapter, model, first, backup, relayConfig };
+}
+function expectRelayResult(
+	result: Awaited<ReturnType<typeof relayRequest>>,
+	operation: RelayOperation,
+	apiKey: string,
+	credentialId: string,
+) {
+	expect(result?.text).toBe(apiKey);
+	if (operation !== "generate" && operation !== "history")
+		expect(result?.credentialId).toBe(credentialId);
+	expect(requests).toHaveLength(1);
+	expect(requests[0]?.apiKey).toBe(apiKey);
+}
+
+describe("real NUG codex pool relay credential and final transport matching", () => {
+	test("an unavailable relay rejects by default without penalizing its key", async () => {
+		const { adapter, model, first } = relayPool();
+		stopAllNugRelayClients();
+		await expect(relayRequest(adapter, model, "chat")).rejects.toThrow(/no online relay matches/);
+		expect(requests).toEqual([]);
+		expect(store().get(first.id)?.disabled).not.toBe(true);
+	});
+
+	for (const mode of ["non-codex", "nug-egress"] as const) {
+		test(`${mode} does not require an online local relay`, async () => {
+			const first = store().add(nugKeyOwner(NUG_ID), {
+				apiKey: "no-local-relay-key",
+				network: keyNetwork("first"),
+			});
+			const connection = settings.nugProviders?.[0];
+			if (!connection) throw new Error("missing NUG fixture");
+			connection.egressMode = mode === "non-codex" ? "local-proxy" : "nug";
+			setNugCachedModels(NUG_ID, [
+				{
+					id: "upstream:m",
+					channel: "upstream",
+					channelType: mode === "non-codex" ? "openai" : "codex",
+					model: "m",
+				},
+			]);
+			const { adapter, model } = resolveProviderAndModel("poolnug:upstream:m");
+			expectRelayResult(await relayRequest(adapter, model, "chat"), "chat", first.apiKey, first.id);
+			expect(new Headers(requests[0]?.headers).has("X-NUG-Relay-Channel")).toBe(false);
+		});
+	}
+
+	// Each public operation must reach the shared final-boundary guard. The policy
+	// matrix below runs once, rather than multiplying it by all six entry points.
+	for (const operation of relayOperations) {
+		test(`${operation}: matching relay is sent, a post-assembly credential change is rejected`, async () => {
+			const { adapter, model, first, relayConfig } = relayPool(false);
+			expectRelayResult(
+				await relayRequest(adapter, model, operation),
+				operation,
+				first.apiKey,
+				first.id,
+			);
+			expect(new Headers(requests[0]?.headers).get("X-NUG-Relay-Channel")).toBe("online-A-channel");
+			requests.length = 0;
+			await expect(
+				relayRequest(adapter, model, operation, () => {
+					ensureNugRelayClient({ ...relayConfig, apiKey: "reconnected-key-C" });
+					const client = relayClients.at(-1);
+					if (!client) throw new Error("missing rebound relay socket");
+					client.status = "online";
+					client.currentChannelId = "other-key-channel";
+				}),
+			).rejects.toThrow(/no online relay matches/);
+			expect(requests).toEqual([]);
+			expect(store().get(first.id)?.disabled).not.toBe(true);
+		});
+	}
+
+	for (const select of ["disable A", "reorder B"] as const) {
+		for (const fallback of [false, true]) {
+			test(`${select}, fallback=${fallback} never borrows A's channel for B`, async () => {
+				const { adapter, model, first, backup } = relayPool(fallback);
+				if (select === "disable A") store().update(first.id, { disabled: true });
+				else store().reorder(nugKeyOwner(NUG_ID), [backup.id, first.id]);
+				if (fallback) {
+					expectRelayResult(
+						await relayRequest(adapter, model, "chat"),
+						"chat",
+						backup.apiKey,
+						backup.id,
+					);
+					expect(new Headers(requests[0]?.headers).has("X-NUG-Relay-Channel")).toBe(false);
+					expect(constructed.at(-1)?.config.extraHeaders?.["X-NUG-Relay-Channel"]).toBe(
+						"forged-A-channel",
+					);
+					expect(constructed.at(-1)?.config.proxy).toEqual(keyNetwork("second").proxy);
+				} else {
+					await expect(relayRequest(adapter, model, "chat")).rejects.toThrow(
+						/no online relay matches/,
+					);
+					expect(requests).toEqual([]);
+				}
+				expect(store().get(backup.id)?.disabled).not.toBe(true);
+				expect(relayClients).toHaveLength(select === "disable A" ? 1 : 2);
+				expect(relayClients[0]?.options.apiKey).toBe(first.apiKey);
+				if (select === "reorder B") expect(relayClients.at(-1)?.options.apiKey).toBe(backup.apiKey);
+			});
+		}
+	}
+
+	for (const change of ["apiKey", "baseUrl", "egressMode", "egressProxyUrl", "offline"] as const) {
+		for (const fallback of [false, true]) {
+			test(`relay ${change} changes after headers assembled, fallback=${fallback}`, async () => {
+				const { adapter, model, first, relayConfig } = relayPool(fallback);
+				let mutations = 0;
+				const rebind = () => {
+					mutations++;
+					if (change === "offline") {
+						const client = relayClients.at(-1);
+						if (!client) throw new Error("missing relay socket");
+						client.status = "connecting";
+						return;
+					}
+					ensureNugRelayClient({
+						...relayConfig,
+						...(change === "apiKey" ? { apiKey: "reconnected-key-C" } : {}),
+						...(change === "baseUrl" ? { baseUrl: "https://different-gateway.invalid" } : {}),
+						...(change === "egressMode" ? { egressMode: "local-direct" as const } : {}),
+						...(change === "egressProxyUrl" ? { egressProxyUrl: "http://other-proxy:8080" } : {}),
+					});
+					const client = relayClients.at(-1);
+					if (!client) throw new Error("missing rebound relay socket");
+					client.status = "online";
+					client.currentChannelId = "other-connection-channel";
+				};
+				if (fallback) {
+					expectRelayResult(
+						await relayRequest(adapter, model, "chat", rebind),
+						"chat",
+						first.apiKey,
+						first.id,
+					);
+					expect(new Headers(requests[0]?.headers).has("X-NUG-Relay-Channel")).toBe(false);
+				} else {
+					await expect(relayRequest(adapter, model, "chat", rebind)).rejects.toThrow(
+						/no online relay matches/,
+					);
+					expect(requests).toEqual([]);
+				}
+				expect(mutations).toBe(1);
+				expect(store().get(first.id)?.disabled).not.toBe(true);
+			});
+		}
+	}
+});

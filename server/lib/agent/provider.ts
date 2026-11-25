@@ -251,8 +251,8 @@ export interface GenerateMetaResult {
 // === The adapter interface ===
 
 export interface ProviderAdapter {
-	/** Prepare model-dependent routing. Request methods must await asynchronous preparation. */
-	prepareForModel?(model: string): void | Promise<void>;
+	/** Synchronously prepare model-dependent routing before formatting or sending a request. */
+	prepareForModel?(model: string): void;
 	/** This adapter can append the diagnostic suffix without replacing the request prefix. */
 	supportsDiagnosticFork?(model: string, credentialId?: string): boolean;
 	/** Production configured adapters carry a read-only check against live settings. */
