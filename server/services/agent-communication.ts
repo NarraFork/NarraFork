@@ -73,6 +73,11 @@ export interface ResolveTargetsInput {
 	 * Unarchive. Only archived members match. An ambiguous historical name throws.
 	 */
 	archivedOnly?: boolean;
+	/**
+	 * Resolve names in this team only. Lifecycle passes the caller's own id
+	 * (its children). TeamStatus file reports pass the reporting team's root.
+	 */
+	teamId?: string;
 }
 
 export interface SendSubagentInput extends ResolveTargetsInput {
@@ -277,6 +282,8 @@ interface CommunicationScope {
 	callerIsSubagent: boolean;
 	/** Await only: restrict targets to the caller's own children. */
 	ownChildrenOnly?: boolean;
+	/** This call resolves in one team, not every team the caller can reach. */
+	teamId?: string;
 }
 
 async function getCommunicationScope(callerNarratorId: string): Promise<CommunicationScope> {
@@ -287,6 +294,7 @@ async function getCommunicationScope(callerNarratorId: string): Promise<Communic
 
 /** Teams a selector is resolved in: the caller's own team, then the one it leads. */
 function reachableTeamIds(scope: CommunicationScope): string[] {
+	if (scope.teamId) return [scope.teamId];
 	if (scope.ownChildrenOnly) return [scope.caller.id];
 	return scope.teamParentId === scope.caller.id
 		? [scope.caller.id]
@@ -362,7 +370,10 @@ async function findArchivedMatches(
 ): Promise<Narrator[]> {
 	const ids = new Set<string>();
 	for (const teamId of reachableTeamIds(scope)) {
-		for (const id of await findSubagentIdsBySelector(teamId, selector)) ids.add(id);
+		for (const id of await findSubagentIdsBySelector(teamId, selector, {
+			membership: "archived",
+		}))
+			ids.add(id);
 	}
 	const matches: Narrator[] = [];
 	for (const id of ids) {
@@ -401,7 +412,15 @@ async function resolveHistoricalTarget(
 	const trimmed = selector.trim();
 	const byId = await narratorService.getById(trimmed).catch(() => null);
 	if (byId?.id === trimmed) {
-		assertTargetAllowed(byId, scope);
+		const root = teamRootOf(byId);
+		// A foreign id is the same answer as a missing one. Naming the session
+		// would tell the caller that the id exists and what it is called.
+		if (root === byId.id || !reachableTeamIds(scope).includes(root)) {
+			throw new Error(`No accessible subagent found for "${selector}"`);
+		}
+		if (scope.callerIsSubagent && byId.id === scope.caller.id) {
+			throw new Error("Subagents cannot target themselves");
+		}
 		return byId;
 	}
 	const live = await addressableMatches(selector, scope);
@@ -487,6 +506,7 @@ export async function resolveSubagentTargets(input: ResolveTargetsInput): Promis
 	}
 
 	const scope = await getCommunicationScope(input.callerNarratorId);
+	if (input.teamId) scope.teamId = input.teamId;
 	const resolved: Narrator[] = [];
 	const seen = new Set<string>();
 	for (const selector of selectors) {
@@ -505,6 +525,8 @@ export async function resolveSubagentTargets(input: ResolveTargetsInput): Promis
 /**
  * Archive names the addressable owner. Unarchive names the archived candidate.
  * An exact narrator id wins either way. An ambiguous name throws.
+ * Names resolve among the caller's own children, not a sibling team that
+ * happens to reuse the alias.
  */
 export async function resolveAgentLifecycleTarget(
 	callerNarratorId: string,
@@ -518,6 +540,7 @@ export async function resolveAgentLifecycleTarget(
 		callerNarratorId,
 		id: trimmed,
 		archivedOnly: action === "unarchive",
+		teamId: callerNarratorId,
 	});
 	return targets[0].id;
 }
@@ -1277,6 +1300,24 @@ async function deliverSubagentMessageToParent(
 	};
 }
 
+/**
+ * An exact narrator id that is archived and still on this team. Send names it so
+ * the per-recipient loop can fail that one delivery. A reused name stays
+ * addressable-only and is not accepted here.
+ */
+async function exactArchivedTeamMember(
+	selector: string,
+	scope: CommunicationScope,
+): Promise<Narrator | null> {
+	const trimmed = selector.trim();
+	const row = await narratorService.getById(trimmed).catch(() => null);
+	if (!row || row.id !== trimmed || row.status !== "archived") return null;
+	const root = teamRootOf(row);
+	if (root === row.id || !reachableTeamIds(scope).includes(root)) return null;
+	if (scope.callerIsSubagent && row.id === scope.caller.id) return null;
+	return row;
+}
+
 /** Resolve every Send destination before delivery; parent/main are reserved, not sibling aliases. */
 async function resolveSendTargets(
 	input: SendSubagentInput,
@@ -1290,9 +1331,18 @@ async function resolveSendTargets(
 			scope.callerIsSubagent && (isParentSelector(selector) || selector === scope.teamParentId);
 		// The parent is the caller's controller: a primary, or for a helper the subagent
 		// that launched it.
-		const target = targetsParent
-			? await narratorService.getById(scope.teamParentId)
-			: await resolveOneTarget(selector, scope);
+		let target: Narrator;
+		if (targetsParent) {
+			target = await narratorService.getById(scope.teamParentId);
+		} else {
+			try {
+				target = await resolveOneTarget(selector, scope);
+			} catch (error) {
+				const archived = await exactArchivedTeamMember(selector, scope);
+				if (!archived) throw error;
+				target = archived;
+			}
+		}
 		targets.set(target.id, target);
 	}
 	return [...targets.values()];

@@ -55,6 +55,7 @@ function seedMember(row: {
 	aliasSelector?: string | null;
 	traits?: string[];
 	controller?: string;
+	createdAt?: string;
 }) {
 	const parent = row.parent ?? PARENT;
 	db.insert(narrators)
@@ -70,8 +71,8 @@ function seedMember(row: {
 			aliasSelector: row.aliasSelector ?? null,
 			traits: row.traits,
 			runtimeRegistrationJson: delegationRegistration(row.controller ?? parent, "general"),
-			createdAt: NOW,
-			updatedAt: NOW,
+			createdAt: row.createdAt ?? NOW,
+			updatedAt: row.createdAt ?? NOW,
 		})
 		.run();
 }
@@ -573,4 +574,160 @@ test("recompute replaces selectors an overwrite left behind", () => {
 		.get() as { title_slug: string; alias_selector: string };
 	expect(skipped.title_slug).toBe("stale-keep");
 	expect(skipped.alias_selector).toBe("stale-keep");
+});
+
+test("unarchive still finds an archived title outside the live match window", async () => {
+	for (let i = 0; i < 6; i++) {
+		seedMember({
+			id: `live-window-${i}`,
+			title: "Review",
+			titleSlug: "review",
+			aliasSelector: "review",
+			traits: ["subagent-alias:review"],
+			createdAt: `2026-06-0${i + 1}T00:00:00.000Z`,
+		});
+	}
+	seedMember({
+		id: "archived-window",
+		status: "archived",
+		title: "Review",
+		titleSlug: "review",
+		aliasSelector: "review",
+		traits: ["subagent-alias:review"],
+		createdAt: "2026-01-01T00:00:00.000Z",
+	});
+
+	expect(await resolveAgentLifecycleTarget(PARENT, "review", "unarchive")).toBe("archived-window");
+});
+
+test("lifecycle and file reports stay inside the operation's team", async () => {
+	seedMember({ id: "worker" });
+	seedMember({
+		id: "sibling-review",
+		title: "Review",
+		titleSlug: "review",
+		aliasSelector: "review",
+		traits: ["subagent-alias:review"],
+	});
+	seedMember({
+		id: "helper-review",
+		parent: "worker",
+		controller: "worker",
+		status: "archived",
+		title: "Review",
+		titleSlug: "review",
+		aliasSelector: "review",
+		traits: ["subagent-alias:review"],
+	});
+
+	expect(await resolveAgentLifecycleTarget("worker", "review", "unarchive")).toBe("helper-review");
+	const report = await resolveSubagentTargets({
+		callerNarratorId: "worker",
+		id: "review",
+		historical: true,
+		teamId: PARENT,
+	});
+	expect(report.map((target) => target.id)).toEqual(["sibling-review"]);
+});
+
+test("restore suffixes the narrator and the owned agent task", async () => {
+	seedMember({
+		id: "live-audit",
+		title: "Audit",
+		titleSlug: "audit",
+		aliasSelector: "audit",
+		traits: ["subagent-alias:audit"],
+	});
+	seedMember({
+		id: "restored-audit",
+		title: "Audit",
+		titleSlug: "audit",
+		aliasSelector: "audit",
+		traits: ["subagent-alias:audit"],
+	});
+	db.insert(backgroundTasks)
+		.values({
+			id: "restored-audit-task",
+			parentNarratorId: PARENT,
+			type: "agent",
+			status: "completed",
+			alias: "audit",
+			subagentNarratorId: "restored-audit",
+			startedAt: NOW,
+			createdAt: "2026-03-01T00:00:00.000Z",
+			updatedAt: NOW,
+		})
+		.run();
+
+	await aliases.reconcileRestoredSubagentAlias("restored-audit");
+
+	const stored = db.select().from(narrators).where(eq(narrators.id, "restored-audit")).get();
+	expect(stored?.aliasSelector).toBe("audit-2");
+	const task = db
+		.select()
+		.from(backgroundTasks)
+		.where(eq(backgroundTasks.id, "restored-audit-task"))
+		.get();
+	expect(task?.alias).toBe("audit-2");
+	const { backgroundTaskService } = await import("../background-task-service");
+	const snapshot = await backgroundTaskService.readTaskSnapshot(PARENT, "audit-2");
+	expect(snapshot?.id).toBe("restored-audit-task");
+});
+
+test("restoring a primary fork does not persist a subagent alias", async () => {
+	db.insert(narrators)
+		.values({
+			id: "primary-fork",
+			type: "primary",
+			variant: "primary",
+			parentNarratorId: PARENT,
+			status: "idle",
+			title: "Forked Session",
+			createdAt: NOW,
+			updatedAt: NOW,
+		})
+		.run();
+	seedMember({
+		id: "delegated-restored",
+		title: "Audit",
+		titleSlug: "audit",
+		aliasSelector: "audit",
+		traits: ["subagent-alias:audit"],
+	});
+
+	await aliases.reconcileRestoredSubagentAlias("primary-fork");
+	await aliases.reconcileRestoredSubagentAlias("delegated-restored");
+
+	const fork = db.select().from(narrators).where(eq(narrators.id, "primary-fork")).get();
+	expect(fork?.aliasSelector ?? null).toBeNull();
+	expect(JSON.stringify(fork?.traits ?? [])).not.toContain("subagent-alias:");
+	const restored = db.select().from(narrators).where(eq(narrators.id, "delegated-restored")).get();
+	expect(restored?.aliasSelector).toBe("audit");
+});
+
+test("historical lookup of a foreign archived id matches a missing session", async () => {
+	seedMember({
+		id: "foreign-archived",
+		parent: OTHER,
+		controller: OTHER,
+		status: "archived",
+		title: "Secret Title",
+		titleSlug: "secret-title",
+		aliasSelector: "secret-title",
+		traits: ["subagent-alias:secret-title"],
+	});
+	const { contextAskTool } = await import("../../lib/agent/tools/context-ask");
+	const ctx = { narratorId: PARENT } as Parameters<typeof contextAskTool.execute>[1];
+	const missing = await contextAskTool.execute(
+		{ id: "missing-session", questions: ["What changed?"] },
+		ctx,
+	);
+	const foreign = await contextAskTool.execute(
+		{ id: "foreign-archived", questions: ["What changed?"] },
+		ctx,
+	);
+	expect(foreign.output).toBe(
+		String(missing.output).replaceAll("missing-session", "foreign-archived"),
+	);
+	expect(String(foreign.output)).not.toContain("Secret Title");
 });

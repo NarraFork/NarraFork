@@ -41,7 +41,7 @@ keywords:
   - archivedWithNarratorId
   - narrator:status_changed
 status: draft
-verified_at: bfb277f05
+verified_at: d8fe2a5ad
 ---
 # 运行与停止
 
@@ -57,7 +57,7 @@ verified_at: bfb277f05
 - 文本/推理块的落库点是 `block_complete`，不是流式增量：`processEvent` 的 `stream_text` 分支只更新内存快照并广播 `stream_event`；`block_complete` 分支先 `openStep` 保证存在部分消息，再经 `persistContentCheckpoint`（调用 `narratorStore.writeStepItem`）写入 text / reasoning 块。`executeAgentLoop` 里“文本块不在流式期间增量落库、只在内存里等到回合末”的注释已过时，以此为准。
 - 中断后的排空：`config.signal` 已 abort 时，executor 仍继续处理 `tool_result`、`block_complete`、`error` 三类事件，其余事件丢弃（`executeAgentLoop`）；`block_complete` / `assistant_message` 处理抛错则升级为 `CriticalEventPersistenceError` 中止循环，其他事件只记日志（`tool_result` 失败另向前端发 `warning`）。
 - 控制：叙述者对另一叙述者的 stop / steer / archive 必须持有目标登记的 controller 授权，且调用方上限允许编排、未到最大委派深度、其执行用户当前对目标有写权限；用户正接管（run hold）时 stop/archive 被拒（`narrator-control.ts:authorizeAgentControl`）。人通过 HTTP 的操作走普通写 ACL，不经此处。
-- 归档：`narrator-archive.ts:transitionNarratorArchiveGroup` 对父会话和满足条件的“顺带提问”子会话（`isAskInPassing`，最多 200 个，超出报错）成组切换 `archived` / `idle`。先做运行时取消（`prepareNarratorArchive`），再在单个事务内改状态，仅提交后才发 `narrator:status_changed` 和 WS `status_change`；归档子会话记 `archivedWithNarratorId`，只有它们会随父会话一起恢复。恢复提交后 `reconcileRestoredSubagentAlias` 给重新可寻址的子代理登记空闲别名，已占用的名字留给当前的活成员。
+- 归档：`narrator-archive.ts:transitionNarratorArchiveGroup` 对父会话和满足条件的“顺带提问”子会话（`isAskInPassing`，最多 200 个，超出报错）成组切换 `archived` / `idle`。先做运行时取消（`prepareNarratorArchive`），再在单个事务内改状态，仅提交后才发 `narrator:status_changed` 和 WS `status_change`；归档子会话记 `archivedWithNarratorId`，只有它们会随父会话一起恢复。恢复提交后 `reconcileRestoredSubagentAlias` 只给真正的团队成员登记空闲别名（主会话分叉有 parent 也不写），已占用的名字留给当前的活成员，同一笔写入更新它拥有的 agent 任务别名。
 - 所属项目、权限等不在此展开，见各自节点。
 - `TEAM_TRAIT` 定义在无依赖的叶子模块 `shared/team-trait.ts`，`narrator-utils.ts` 与 `shared/project-teams.ts` 都原样转出，`isTeamNarrator` 的判断不变。`narrator-utils.ts` 在 DB 读 worker 的模块图里，不能改从 `shared/project-teams.ts` 导入（`db-worker/__tests__/module-boundary.test.ts` 的白名单只收这个叶子）。
 

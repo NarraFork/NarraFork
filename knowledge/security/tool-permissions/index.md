@@ -15,14 +15,14 @@ keywords:
   - bypassPermissions
   - permission_request
 status: draft
-verified_at: 001ccbf7d
+verified_at: d8fe2a5ad
 ---
 # 工具调用审批
 
 Agent 每次调用工具前都经过 `narrator-permission.ts:handlePermission`：先由纯函数 `resolvePermissionDecision` 判出 allow / deny / ask / fatal，需要人决定时挂起，等用户审批。这是应用层护栏，不是操作系统沙箱（`RequestPermissionRule` 工具的描述里也这样声明）。
 
 ## 由哪几部分组成
-- **审批流程**：权限模式（`default`、`acceptEdits`、`bypassPermissions`、`readOnly`、`dontAsk`；plan 是 trait，不是模式）与判定顺序；请求挂起后写进 `narrator_tool_calls`（不另设表）；用户经 HTTP 路由或 WebSocket 批准/拒绝；受保护路径和 OAuth 硬上限也在这条线上。
+- **审批流程**：权限模式（`default`、`acceptEdits`、`bypassPermissions`、`readOnly`、`dontAsk`；plan 是 trait，不是模式）与判定顺序；请求挂起后写进 `narrator_tool_calls`（不另设表）；用户经 HTTP 路由或 WebSocket 批准/拒绝；受保护路径和 OAuth 硬上限也在这条线上。Send 的同范围自动放行与投递解析同一个目标。
 - **规则与执行策略**：目录/命令的白黑名单（来源 global/project/narrator，带目标选择器）如何存储、编译、改动后失效；Agent 用 `RequestPermissionRule` 为自己申请规则；预置规则；规则管理页。
 - **反思门**：把“先让模型自己复核再打扰人”做成暂停点，有危险反思、任务反思、问题反思三种，另含评审边界；挂在审批卡上的 `ExitPlanMode` 还可按需触发计划反思（「计划反思」按钮）。
 

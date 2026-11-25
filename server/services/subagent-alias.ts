@@ -248,14 +248,31 @@ export async function persistSubagentAlias(
 				}
 				if (currentAlias !== expected.alias) throw new RuntimeReadConflictError();
 			}
+			const updatedAt = new Date().toISOString();
 			tx.update(narrators)
 				.set({
 					traits: nextTraits,
 					aliasSelector: alias,
 					titleSlug: storedTitleSlug(current.title),
-					updatedAt: new Date().toISOString(),
+					updatedAt,
 				})
 				.where(eq(narrators.id, subagentId))
+				.run();
+			// The name printed at restore is the narrator alias. TeamStatus get_task
+			// looks up the owned agent task by that same string, so the task row
+			// changes in this write.
+			tx.update(backgroundTasks)
+				.set({ alias, updatedAt })
+				.where(
+					and(
+						eq(backgroundTasks.parentNarratorId, parentNarratorId),
+						eq(backgroundTasks.type, "agent"),
+						or(
+							eq(backgroundTasks.subagentNarratorId, subagentId),
+							eq(backgroundTasks.id, subagentId),
+						),
+					),
+				)
 				.run();
 		});
 	});
@@ -644,51 +661,71 @@ async function getPersistedTakenAliases(
 
 /**
  * Narrators under this parent whose stored id, alias or title slug equals
- * `selector`, including archived rows. Used when archive/unarchive must still
- * name a finished member. Each lookup is an equality (or an id prefix) so it
- * does not scan the parent's history.
+ * `selector`. Each lookup is an equality (or an id prefix) so it does not scan
+ * the parent's history.
+ *
+ * `membership` is applied before the row limit. Filtering after the limit lets
+ * live title matches fill the window and hide an archived sibling.
  */
 export async function findSubagentIdsBySelector(
 	parentNarratorId: string,
 	selector: string,
-	options: AliasReadOptions = {},
+	options: AliasReadOptions & { membership?: "archived" | "addressable" } = {},
 ): Promise<string[]> {
 	const normalized = selector.trim();
 	if (!normalized) return [];
+	const { membership, ...read } = options;
 	const { db, narrators } = await loadAliasDb();
 	const scope = teamMembersWhere(parentNarratorId);
-	const readOptions = { ...options, executionPolicy: "worker-required" as const, maxRows: 5 };
+	const statusWhere =
+		membership === "archived"
+			? eq(narrators.status, "archived")
+			: membership === "addressable"
+				? inArray(narrators.status, [...ADDRESSABLE_NARRATOR_STATUSES])
+				: undefined;
+	const readOptions = { ...read, executionPolicy: "worker-required" as const, maxRows: 5 };
 	const ids = new Set<string>();
 	const collect = async (query: Parameters<typeof readQuery>[0]) => {
 		const rows = (await readQuery(query, readOptions)) as { id: string }[];
 		for (const row of rows) ids.add(row.id);
 	};
+	const newest = [desc(narrators.createdAt), desc(narrators.id)] as const;
 	await collect(
 		db
 			.select({ id: narrators.id })
 			.from(narrators)
-			.where(and(eq(narrators.parentNarratorId, parentNarratorId), eq(narrators.id, normalized)))
+			.where(
+				and(
+					eq(narrators.parentNarratorId, parentNarratorId),
+					eq(narrators.id, normalized),
+					statusWhere,
+				),
+			)
+			.orderBy(...newest)
 			.limit(1),
 	);
 	await collect(
 		db
 			.select({ id: narrators.id })
 			.from(narrators)
-			.where(and(scope, eq(narrators.aliasSelector, normalized)))
+			.where(and(scope, eq(narrators.aliasSelector, normalized), statusWhere))
+			.orderBy(...newest)
 			.limit(5),
 	);
 	await collect(
 		db
 			.select({ id: narrators.id })
 			.from(narrators)
-			.where(and(scope, eq(narrators.titleSlug, normalized)))
+			.where(and(scope, eq(narrators.titleSlug, normalized), statusWhere))
+			.orderBy(...newest)
 			.limit(5),
 	);
 	await collect(
 		db
 			.select({ id: narrators.id })
 			.from(narrators)
-			.where(and(scope, eq(narrators.title, normalized)))
+			.where(and(scope, eq(narrators.title, normalized), statusWhere))
+			.orderBy(...newest)
 			.limit(5),
 	);
 	const like = escapeLikeNeedle(normalized);
@@ -697,7 +734,8 @@ export async function findSubagentIdsBySelector(
 			db
 				.select({ id: narrators.id })
 				.from(narrators)
-				.where(and(scope, sql`${narrators.id} LIKE ${`${like}%`} ESCAPE '\\'`))
+				.where(and(scope, sql`${narrators.id} LIKE ${`${like}%`} ESCAPE '\\'`, statusWhere))
+				.orderBy(...newest)
 				.limit(5),
 		);
 	}
@@ -799,7 +837,9 @@ export async function registerAndPersistSubagentAlias(
 /**
  * After an archived subagent becomes addressable again, give it a free alias
  * when a sibling already holds the one it had. The live owner keeps that name.
- * Primary sessions have no parent and are left unchanged.
+ *
+ * Membership is the team grant, not `parentNarratorId`: a primary session fork
+ * also stores a parent and must not gain a subagent alias.
  */
 export async function reconcileRestoredSubagentAlias(narratorId: string): Promise<void> {
 	const { db, narrators } = await loadAliasDb();
@@ -809,6 +849,7 @@ export async function reconcileRestoredSubagentAlias(narratorId: string): Promis
 				id: narrators.id,
 				parentNarratorId: narrators.parentNarratorId,
 				status: narrators.status,
+				runtimeRegistrationJson: narrators.runtimeRegistrationJson,
 			})
 			.from(narrators)
 			.where(eq(narrators.id, narratorId))
@@ -816,6 +857,7 @@ export async function reconcileRestoredSubagentAlias(narratorId: string): Promis
 		{ executionPolicy: "worker-required", maxRows: 1 },
 	);
 	if (!row?.parentNarratorId) return;
+	if (!isTeamMember(row, row.parentNarratorId)) return;
 	if (!(ADDRESSABLE_NARRATOR_STATUSES as readonly string[]).includes(row.status)) return;
 	await registerAndPersistSubagentAlias(row.parentNarratorId, narratorId);
 }

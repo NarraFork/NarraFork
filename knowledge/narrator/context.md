@@ -48,7 +48,7 @@ keywords:
   - api_conversation_id
   - model_history_revision
 status: draft
-verified_at: bfb277f05c7b0a32b49bd41592180451e0fb79c6
+verified_at: d8fe2a5ad009f649ad24ded2b0baa89eef7f02d3
 ---
 # 上下文与压缩
 
@@ -74,7 +74,7 @@ verified_at: bfb277f05c7b0a32b49bd41592180451e0fb79c6
 - 对话身份：`narrators.api_conversation_id` 由 `claimConversationIdentity` 以 `model_history_revision` 做乐观比对后写入，比对失败报 409 `CONVERSATION_IDENTITY_CHANGED`；须在叙述者变更准入内、任何 provider 请求之前完成，不轮换前缀纪元（`narrator-conversation-identity.ts`）。
 - 压缩后的占用估计：`estimateNarratorBuildHistoryTokens` 用与主循环相同的构建历史与系统提示路径估算下一次请求的 prompt 规模，仅作显示用的临时值，超时 10 秒（`narrator-history-token-estimate.ts`）。
 - 摘要模型不可用：设置接口的 `summaryModelAvailable === false` 且已配置摘要模型时，管理员会看到摘要模型选择弹窗；非管理员或向导未完成时不弹（`frontend/components/settings/SummaryModelPickerHost.tsx`、`SummaryModelPickerModal.tsx`）。
-- `ContextAsk` 工具：只读，`id` 指向可访问的子代理（主叙述者查子代理，子代理查同队兄弟），最多 8 个问题、每个 ≤ 2000 字符，不传问题则给状态摘要（`lib/agent/tools/context-ask.ts`）。查找是历史的：精确 id 能点到已归档成员；名字同时命中活着的和已归档的成员时报歧义，不猜。
+- `ContextAsk` 工具：只读，`id` 指向可访问的子代理（主叙述者查子代理，子代理查同队兄弟），最多 8 个问题、每个 ≤ 2000 字符，不传问题则给状态摘要（`lib/agent/tools/context-ask.ts`）。查找是历史的：精确 id 能点到已归档成员；名字同时命中活着的和已归档的成员时报歧义，不猜。团队外的精确 id 与不存在的会话同一句回复，不带对方标题。
 
 ## 从哪读起
 - `server/services/narrator-compact.ts:runCustomCompact`：主压缩流程与锁。

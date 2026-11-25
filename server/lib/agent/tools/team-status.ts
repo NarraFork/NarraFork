@@ -110,7 +110,7 @@ function bashLabel(title: string | null, command: string | null): string {
 async function resolveTeamMemberId(
 	callerNarratorId: string,
 	selector: string,
-	options?: { historical?: boolean },
+	options?: { historical?: boolean; teamId?: string },
 ): Promise<string> {
 	const { resolveSubagentTargets } = await import("@server/services/agent-communication");
 	try {
@@ -118,6 +118,7 @@ async function resolveTeamMemberId(
 			callerNarratorId,
 			id: selector,
 			historical: options?.historical,
+			teamId: options?.teamId,
 		});
 		return targets.length === 1 ? targets[0].id : selector;
 	} catch (err) {
@@ -365,7 +366,10 @@ export const teamStatusTool: ToolDefinition = {
 				// Resolve a target BEFORE querying; it must not be constrained by the
 				// whole-team page budget or an empty first-page aggregate.
 				const resolvedId = target_id
-					? await resolveTeamMemberId(ctx.narratorId, target_id, { historical: true })
+					? await resolveTeamMemberId(ctx.narratorId, target_id, {
+							historical: true,
+							teamId: parentNarratorId,
+						})
 					: undefined;
 				const changes = await getPersistedTeamFileChanges(parentNarratorId, resolvedId, {
 					signal: ctx.signal,

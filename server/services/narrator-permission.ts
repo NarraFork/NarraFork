@@ -204,14 +204,17 @@ import {
 import { broadcastReflectionFrame } from "./reflection-broadcast";
 import { SPEC_TASKS_PATH } from "./spec-task-service";
 import { specVfsService } from "./spec-vfs-service";
+import {
+	getPersistedSubagentAliases,
+	resolveTaskAlias,
+	subagentMatchesSelector,
+} from "./subagent-alias";
 
 // An exact tool-call attempt owns this receipt. Never use the generic danger cache.
 const permissionRuleRequestPauses = new Map<
 	string,
 	{ requestId: string; automatic: boolean; settling: boolean }
 >();
-
-import { resolveTaskAlias, subagentMatchesSelector } from "./subagent-alias";
 
 // Preserve the original execution receipt and ACL ceiling while the SAME prompt is reprocessed.
 const pendingPermissionContexts = new WeakMap<
@@ -3790,18 +3793,33 @@ async function resolveSendTargetsForPermission(
 			continue;
 		}
 		const target = byId.get(alias);
-		// Archived members are not Send targets. Fall through so a live member with
-		// the same selector can still match; if nobody addressable matches, this Send
-		// is not auto-allowed.
-		if (target && target.status !== "archived") {
+		// A task row can still name the agent who used to hold this alias. Delivery
+		// ignores that row unless the agent still owns the name; this check must too.
+		const remembered = [callerId, parentId].some((ownerId) => {
+			const hit = resolveTaskAlias(ownerId, selector);
+			return hit !== selector && hit === target?.id;
+		});
+		const stillOwns =
+			target != null &&
+			(alias === selector ||
+				target.id === selector ||
+				remembered ||
+				getPersistedSubagentAliases(target.traits).includes(selector));
+		if (target && target.status !== "archived" && stillOwns) {
 			if (!isTeamMember(target, parentId) || target.id === callerId) return [];
 			selected.push(target.id);
 			continue;
 		}
 		siblings ??= await narratorService.listTeamMembers(parentId, readBudget);
-		const matches = siblings.filter(
+		let matches = siblings.filter(
 			(row) => !(callerIsSubagent && row.id === callerId) && subagentMatchesSelector(row, selector),
 		);
+		if (matches.length > 1) {
+			const exact = matches.filter(
+				(row) => row.id === selector || getPersistedSubagentAliases(row.traits).includes(selector),
+			);
+			if (exact.length === 1) matches = exact;
+		}
 		if (matches.length !== 1) return [];
 		selected.push(matches[0].id);
 	}
