@@ -591,10 +591,12 @@ export async function createWorkItem(input: CreateWorkItemInput): Promise<WorkIt
 
 /**
  * Record the first-level subagent working on an item (the one an `Agent` call just created in
- * its worktree); a queued item starts. An item already worked on keeps its worker. Refused when a
- * dependency of the item has not merged (D: 409 `TEAM_WORK_ITEM_BLOCKED`, checked in the
- * transaction whenever the item has no worker yet, whatever its state; the `Agent` tool checks it
- * before creating the subagent as well).
+ * its worktree); a queued item starts. Attaching the same worker again changes nothing. Refused
+ * (the `Agent` call then fails and its subagent is archived before it runs, `subagent-runner.ts`):
+ * - another worker is attached already (409 `TEAM_WORK_ITEM_CHANGED`: a concurrent call won);
+ * - a dependency has not merged (D: 409 `TEAM_WORK_ITEM_BLOCKED`, checked in the transaction
+ *   whenever the item has no worker yet, whatever its state; the `Agent` tool checks it before
+ *   creating the subagent as well).
  */
 export function attachWorker(
 	teamId: string,
@@ -604,7 +606,13 @@ export function attachWorker(
 ): void {
 	const item = requireWorkItem(teamId, itemId);
 	requireLive(item);
-	if (item.workerNarratorId) return;
+	if (item.workerNarratorId === workerNarratorId) return;
+	if (item.workerNarratorId)
+		throw new AppError(
+			`Work item ${item.id} already has a worker (${item.workerNarratorId}); this agent was not attached`,
+			409,
+			"TEAM_WORK_ITEM_CHANGED",
+		);
 	const now = new Date().toISOString();
 	db.transaction((tx) => {
 		assertWorkItemStartable(item.id, tx);
@@ -1471,7 +1479,8 @@ export async function settleIsolatedWorkItem(
  * existed). An isolated item is settled like any isolated item — an untouched worktree is
  * removed and the item cancelled — and otherwise stays in progress with a `work.start_failed`
  * event. An item the call only attached to (an `Agent({ workdir })` into a queued item) drops
- * that worker and goes back to the queue.
+ * that worker and goes back to the queue. An item another worker holds (the call's attach was
+ * refused because a concurrent call attached first) is left alone.
  */
 export async function settleFailedStart(
 	teamId: string,
@@ -1487,6 +1496,8 @@ export async function settleFailedStart(
 		.limit(1)
 		.get();
 	if (!item || isFinished(item.state)) return "none";
+	// Another worker holds the item (this call's attach was refused): it is that worker's now.
+	if (item.workerNarratorId && item.workerNarratorId !== subagentId) return "none";
 	if (item.kind === TEAM_ISOLATED_WORK_KIND) {
 		const settled = item.worktreeResourceId ? await settleItem(item, { retry: false }) : "kept";
 		if (settled !== "cleaned")

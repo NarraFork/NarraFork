@@ -21,6 +21,10 @@ const runCalls: Array<Record<string, unknown>> = [];
 let failRun = false;
 /** Fail after the subagent row exists (model or alias resolution failing late). */
 let failAfterCreate = false;
+/** Runs once the subagent row exists, before the creation hook (a concurrent change). */
+let beforeCreated: (() => void) | null = null;
+/** Subagents the stubbed runner archived because the creation hook refused them. */
+const archived: string[] = [];
 let agentTool: typeof import("../task").agentTool;
 let realNarratorSubagent: typeof import("@server/services/narrator-subagent");
 let realCommunication: typeof import("@server/services/agent-communication");
@@ -57,7 +61,15 @@ beforeAll(async () => {
 				VALUES (?, 'subagent', ?, ?, ?, ?, ?)`,
 				[id, id, LEAD, LEAD, NOW, NOW],
 			);
-			(input.onCreated as ((id: string) => void) | undefined)?.(id);
+			beforeCreated?.();
+			// As the runner does: a refusing creation hook archives the unstarted subagent and
+			// fails the call.
+			try {
+				(input.onCreated as ((id: string) => void) | undefined)?.(id);
+			} catch (error) {
+				archived.push(id);
+				throw error;
+			}
 			if (failAfterCreate) throw new Error("alias registration failed");
 			return `<background_task_id>${id}</background_task_id>`;
 		}),
@@ -89,6 +101,8 @@ beforeEach(async () => {
 	sendStatus = "started";
 	failRun = false;
 	failAfterCreate = false;
+	beforeCreated = null;
+	archived.length = 0;
 	temporary = await mkdtemp(join(tmpdir(), "nf-agent-team-"));
 	source = join(temporary, "repo");
 	await mkdir(join(source, ".worktrees"), { recursive: true });
@@ -393,6 +407,78 @@ describe("an Agent start that fails after its subagent exists", () => {
 			.all()
 			.map((row) => row.kind);
 		expect(kinds).toEqual(["work.created", "work.started", "work.start_failed"]);
+	});
+});
+
+describe("an Agent start whose worker attach is refused", () => {
+	const rival = () =>
+		sqlite.run(
+			`INSERT INTO narrators (id, type, title, parent_narrator_id, acl_root_narrator_id, created_at, updated_at)
+			VALUES ('p3a-rival', 'subagent', 'rival', ?, ?, ?, ?)`,
+			[LEAD, LEAD, NOW, NOW],
+		);
+	const create = (title: string, kind?: string) =>
+		items.createWorkItem({
+			coordinatorId: LEAD,
+			title,
+			kind,
+			actor: { kind: "agent", id: LEAD },
+			principal: { userId: "p3a-user", isAdmin: false },
+			signal: new AbortController().signal,
+		});
+
+	test("another worker attached first: the call fails and leaves that worker's item alone", async () => {
+		const { TEAM_ISOLATED_WORK_KIND } = await import("@shared/project-teams");
+		// A queued item, and an isolated one whose first start failed (kept, no worker).
+		for (const kind of [undefined, TEAM_ISOLATED_WORK_KIND]) {
+			const item = await create(`Contested ${kind ?? "queued"}`, kind);
+			const path = items.worktreePathOf(item) ?? "";
+			rival();
+			beforeCreated = () =>
+				items.attachWorker(LEAD, item.id, "p3a-rival", { kind: "agent", id: LEAD });
+			const refused = await agentTool.execute({ workdir: path, prompt: "go" }, ctx());
+			expect(refused.isError).toBe(true);
+			expect(refused.output).toContain("already has a worker");
+			expect(archived).toEqual([`p3a-worker-${runCalls.length}`]);
+			const row = db.select().from(teamWorkItems).where(eq(teamWorkItems.id, item.id)).get();
+			expect(row).toMatchObject({ state: "in_progress", workerNarratorId: "p3a-rival" });
+			// Not settled as a failed start: the worktree stays for the rival.
+			expect(row?.worktreeResourceId).not.toBeNull();
+			expect(existsSync(path)).toBe(true);
+			const kinds = sqlite
+				.query<{ kind: string }, [string]>(
+					"SELECT kind FROM team_work_events WHERE work_item_id = ? ORDER BY rowid",
+				)
+				.all(item.id)
+				.map((event) => event.kind);
+			expect(kinds).toEqual(["work.created", "work.started"]);
+			sqlite.run("DELETE FROM team_work_events");
+			sqlite.run("DELETE FROM team_work_items");
+			sqlite.run("DELETE FROM narrators WHERE id LIKE 'p3a-worker-%' OR id = 'p3a-rival'");
+			archived.length = 0;
+		}
+	});
+
+	test("a dependency added after the call's check: the call fails, the item stays queued", async () => {
+		const first = await create("Schema");
+		const second = await create("API");
+		beforeCreated = () =>
+			items.setWorkItemDependencies({
+				coordinatorId: LEAD,
+				itemId: second.id,
+				dependsOn: [first.id],
+				actor: { kind: "agent", id: LEAD },
+			});
+		const refused = await agentTool.execute(
+			{ workdir: items.worktreePathOf(second) ?? "", prompt: "go" },
+			ctx(),
+		);
+		expect(refused.isError).toBe(true);
+		expect(refused.output).toContain('"Schema"');
+		expect(archived).toEqual(["p3a-worker-1"]);
+		expect(
+			db.select().from(teamWorkItems).where(eq(teamWorkItems.id, second.id)).get(),
+		).toMatchObject({ state: "queued", workerNarratorId: null });
 	});
 });
 

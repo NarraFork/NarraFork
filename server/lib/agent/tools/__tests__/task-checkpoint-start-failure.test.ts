@@ -29,6 +29,10 @@ mock.module("@server/services/teams/work-items", () => ({
 	attachWorker,
 	settleFailedStart,
 }));
+// The item has no worker, so the Agent call checks its dependencies first (none here).
+mock.module("@server/services/teams/work-item-dependencies", () => ({
+	assertWorkItemStartable: () => {},
+}));
 
 const { agentTool } = await import("../task");
 
