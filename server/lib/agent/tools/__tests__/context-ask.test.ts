@@ -214,6 +214,8 @@ describe("ContextAsk tool", () => {
 
 		const outside = await contextAskTool.execute({ id: outsideChildId }, makeCtx(parentId));
 		expect(outside.isError).toBe(true);
-		expect(outside.output).toContain("does not belong to this narrator's subagent team");
+		// A foreign exact id is the same reply as a missing session, with no title.
+		expect(outside.output).toContain(`No accessible subagent found for "${outsideChildId}"`);
+		expect(outside.output).not.toContain("Outside child");
 	});
 });

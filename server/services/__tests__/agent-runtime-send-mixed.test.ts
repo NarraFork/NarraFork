@@ -247,10 +247,22 @@ test("whole-call selector authorization rejects foreign or missing targets befor
 	}
 });
 
-test("an already archived recipient rejects whole-call preflight before any enqueue", async () => {
+test("a reachable archived exact ID fails individually, but an archived alias is not addressable", async () => {
 	db.update(narrators).set({ status: "archived" }).where(eq(narrators.id, "sibling-a")).run();
-	expect(await captureWorkerRejectionThrower(sendSubagentMessageDetailed(input()))).toThrow();
+	expect(
+		await captureWorkerRejectionThrower(
+			sendSubagentMessageDetailed(input("sender-child", ["parent", "alpha"])),
+		),
+	).toThrow("No accessible communication target");
 	expect(rows()).toHaveLength(0);
+	const result = await sendSubagentMessageDetailed(input());
+	expect(result.targets.map((target) => [target.id, target.status])).toEqual([
+		["parent-root", "queued"],
+		["sibling-a", "failed"],
+	]);
+	expect(result.targets[1]?.error).toContain("archived");
+	expect(rows("sibling-a")).toHaveLength(0);
+	expect(rows("parent-root")).toHaveLength(1);
 });
 
 test("a target archived after preflight retains earlier parent and later sibling successes", async () => {
@@ -699,6 +711,72 @@ test("an unknown or out-of-pool model rejects the whole call before any write", 
 			model: "test:pooled",
 		});
 		expect(allowed.targets[0]).toMatchObject({ status: "queued", model: "test:pooled" });
+	} finally {
+		settingsModule.settings.agent.subagentAllowedModels = pools;
+		visible.mockRestore();
+	}
+});
+
+test("restoring an archived target before delivery still requires steer", async () => {
+	db.update(narrators).set({ status: "archived" }).where(eq(narrators.id, "sibling-b")).run();
+	const turn = new AbortController();
+	liveTurn("sibling-b", turn);
+	tryClaimExecution("sibling-b", "run");
+	const restore = () => {
+		db.update(narrators).set({ status: "working" }).where(eq(narrators.id, "sibling-b")).run();
+	};
+	const denied = await sendSubagentMessageDetailed({
+		...input("sender-child", ["sibling-b"]),
+		doInterrupt: true,
+		onTargetsResolved: restore,
+	});
+	expect(denied.targets.map((target) => target.status)).toEqual(["failed"]);
+	expect(denied.targets[0]?.error).toContain("not a direct child");
+	expect(turn.signal.aborted).toBe(false);
+	expect(rows("sibling-b")).toHaveLength(0);
+
+	db.update(narrators).set({ status: "archived" }).where(eq(narrators.id, "sibling-b")).run();
+	const allowed = await sendSubagentMessageDetailed({
+		...input("parent-root", ["sibling-b"]),
+		doInterrupt: true,
+		onTargetsResolved: restore,
+	});
+	expect(allowed.targets[0]?.status).toBe("queued");
+	expect(turn.signal.aborted).toBe(true);
+	expect(rows("sibling-b")).toHaveLength(1);
+});
+
+test("an archived child's rejected model does not drop the live recipient", async () => {
+	db.update(narrators)
+		.set({
+			status: "archived",
+			runtimeRegistrationJson: delegationRegistration("parent-root", "explore"),
+		})
+		.where(eq(narrators.id, "sibling-b"))
+		.run();
+	const visible = spyOn(settingsModule, "getSubagentVisibleModels").mockReturnValue([
+		"test:live-only",
+		"test:explore-only",
+	]);
+	const pools = settingsModule.settings.agent.subagentAllowedModels;
+	settingsModule.settings.agent.subagentAllowedModels = {
+		explore: ["test:explore-only"],
+		plan: [],
+		general: ["test:live-only"],
+	};
+	try {
+		const result = await sendSubagentMessageDetailed({
+			...input("parent-root", ["sibling-a", "sibling-b"]),
+			model: "test:live-only",
+		});
+		expect(result.targets.map((target) => [target.id, target.status])).toEqual([
+			["sibling-a", "queued"],
+			["sibling-b", "failed"],
+		]);
+		expect(result.targets[1]?.error).toContain("archived");
+		expect(result.targets[0]).toMatchObject({ model: "test:live-only" });
+		expect(rows("sibling-a")).toHaveLength(1);
+		expect(rows("sibling-b")).toHaveLength(0);
 	} finally {
 		settingsModule.settings.agent.subagentAllowedModels = pools;
 		visible.mockRestore();

@@ -31,9 +31,13 @@ mock.module("../../db", () => ({ db, sqlite }));
 const { resolveSubagentTargets, awaitAgentResultDetailed } = await import("../agent-communication");
 const { agentLabelFromNarrator } = await import("../subagent-label");
 const { clearAgentLabelMemo } = await import("../subagent-label");
-const { clearAliasRegistry, registerTaskAlias, registerAndPersistSubagentAlias } = await import(
-	"../subagent-alias"
-);
+const {
+	SUBAGENT_ALIAS_TRAIT_PREFIX,
+	clearAliasRegistry,
+	registerTaskAlias,
+	registerAndPersistSubagentAlias,
+	storedTitleSlug,
+} = await import("../subagent-alias");
 
 afterAll(() => {
 	mock.module("../../db", () => realDbModule);
@@ -62,6 +66,9 @@ async function seed(
 		.insert(narrators)
 		.values({ id: PARENT, type: "primary", variant: "primary", createdAt: now, updatedAt: now })
 		.onConflictDoNothing();
+	const persistedAlias = over.traits
+		?.find((trait) => trait.startsWith(SUBAGENT_ALIAS_TRAIT_PREFIX))
+		?.slice(SUBAGENT_ALIAS_TRAIT_PREFIX.length);
 	await db.insert(narrators).values({
 		id,
 		type: "subagent",
@@ -70,6 +77,10 @@ async function seed(
 		policySourceNarratorId: PARENT,
 		runtimeRegistrationJson: delegationRegistration(PARENT, "general"),
 		title: over.title ?? null,
+		titleSlug: storedTitleSlug(over.title),
+		// Occupancy reads the stored selector, which persist and the startup
+		// backfill keep equal to the trait.
+		aliasSelector: persistedAlias ?? "",
 		...(over.traits ? { traits: over.traits } : {}),
 		createdAt: now,
 		updatedAt: now,

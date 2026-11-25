@@ -93,22 +93,34 @@ export function commitUserCommunicationAdmissionTx(
 	return [...new Set(dirty)];
 }
 export const commitUserConnections = commitUserCommunicationAdmissionTx;
-export async function assertCommunicationSendAuthorized(
+async function assertCommunicationEndpointAuthorized(
 	source: string,
 	target: string,
+	allowArchivedForFailure: boolean,
 ): Promise<void> {
 	if (activeDatabaseBackend === "postgres") {
 		if (!postgresRuntime || postgresRuntime.closed)
 			throw new AppError("Communication unavailable", 503, "COMMUNICATION_UNAVAILABLE");
 		await withCommunicationPgTransaction(postgresRuntime.client.db, (tx) =>
-			assertCommunicationSendAuthorizedPg(tx, source, target),
+			assertCommunicationSendAuthorizedPg(tx, source, target, allowArchivedForFailure),
 		);
 		return;
 	}
-	db.transaction((tx) => {
-		const authorized = assertCommunicationSendAuthorizedTx(tx, source, target);
-		return authorized;
-	});
+	db.transaction((tx) =>
+		assertCommunicationSendAuthorizedTx(tx, source, target, allowArchivedForFailure),
+	);
+}
+
+export function assertCommunicationSendAuthorized(source: string, target: string): Promise<void> {
+	return assertCommunicationEndpointAuthorized(source, target, false);
+}
+
+/** An exact archived ID may be reported as a per-target failure, never enqueued. */
+export function assertArchivedCommunicationTargetVisible(
+	source: string,
+	target: string,
+): Promise<void> {
+	return assertCommunicationEndpointAuthorized(source, target, true);
 }
 
 export async function mutateCommunication(

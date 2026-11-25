@@ -651,11 +651,19 @@
 		},
 		{
 			"idx": 81,
-			"tag": "0081_communication_topology",
-			"id": "b4e7353a-9589-4a99-b35f-4286a9164a4c",
+			"tag": "0081_subagent-alias-addressable-scope",
+			"id": "ff0d57da-e8d7-48db-88a7-1e3066eaae33",
 			"prevId": "c07b4921-245c-4e69-b29f-01132e3f6156",
 			"version": "7",
-			"snapshotDigest": "649cb9c2aed0e5a491d2001f9ebff30158fa9389931eb6b776aa14449051bee9"
+			"snapshotDigest": "e83c4ffd33b7c9b6347b41369135b22413c697523ec468a84144e96005a0a95b"
+		},
+		{
+			"idx": 82,
+			"tag": "0082_communication_topology",
+			"id": "abeafedc-f054-41e8-b9a0-edc89be12b9b",
+			"prevId": "ff0d57da-e8d7-48db-88a7-1e3066eaae33",
+			"version": "7",
+			"snapshotDigest": "5988cdbd02f574a70bd00e258f910cd54341bd2480df10735d1b513262a7f12e"
 		}
 	]
 }

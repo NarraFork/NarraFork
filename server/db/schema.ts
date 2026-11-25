@@ -337,6 +337,19 @@ export const narrators = sqliteTable(
 		/** ModelTrace 舱的不透明绑定键；NULL 表示还没有收编。 */
 		modeltraceKey: text("modeltrace_key"),
 		title: text("title"),
+		/**
+		 * `slugifyTaskAlias(title)`, stored so alias occupancy can probe one candidate
+		 * name with an index. Null when the title has no slug. Writes and the startup
+		 * backfill keep it equal to the slug the resolver computes in JS, including
+		 * titles that were stored before this column existed.
+		 */
+		titleSlug: text("title_slug"),
+		/**
+		 * The persisted `subagent-alias:` selector, copied out of `traits` so a
+		 * candidate lookup is an index equality. Empty string means the row was
+		 * checked and has no alias. Null means not backfilled yet.
+		 */
+		aliasSelector: text("alias_selector"),
 		inheritMode: text("inherit_mode", { enum: ["full", "compressed", "fresh"] })
 			.notNull()
 			.default("fresh"),
@@ -764,6 +777,17 @@ export const narrators = sqliteTable(
 		index("idx_narrators_background_parent_created")
 			.on(table.parentNarratorId, table.createdAt, table.id)
 			.where(sql`"is_background" = 1`),
+		// Candidate alias lookup: one parent + one slug, not a scan of every child.
+		index("idx_narrators_parent_title_slug")
+			.on(table.parentNarratorId, table.titleSlug)
+			.where(sql`"parent_narrator_id" IS NOT NULL AND "title_slug" IS NOT NULL`),
+		index("idx_narrators_parent_alias_selector")
+			.on(table.parentNarratorId, table.aliasSelector)
+			.where(sql`"parent_narrator_id" IS NOT NULL AND "alias_selector" IS NOT NULL`),
+		// Send/Await/Watch page only the addressable team, skipping archived history.
+		index("idx_narrators_addressable_parent_created")
+			.on(table.parentNarratorId, table.createdAt, table.id)
+			.where(sql`"parent_narrator_id" IS NOT NULL AND "status" IN ('idle', 'working', 'waiting')`),
 	],
 );
 
@@ -4293,6 +4317,14 @@ export const backgroundTasks = sqliteTable(
 		// Without it a parent with hundreds of tasks sorts its whole history on every
 		// page request.
 		index("idx_bg_tasks_parent_created").on(table.parentNarratorId, table.createdAt, table.id),
+		// Latest task for one alias: occupancy reads that single row, not the alias's history.
+		index("idx_bg_tasks_parent_alias")
+			.on(table.parentNarratorId, table.alias, table.createdAt)
+			.where(sql`"alias" IS NOT NULL`),
+		// In-progress aliases only, so a candidate probe never walks finished rows.
+		index("idx_bg_tasks_parent_live_alias")
+			.on(table.parentNarratorId, table.alias)
+			.where(sql`"alias" IS NOT NULL AND "status" IN ('running', 'paused')`),
 	],
 );
 

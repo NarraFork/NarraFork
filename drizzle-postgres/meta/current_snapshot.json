@@ -1,6 +1,6 @@
 {
-  "id": "b4e7353a-9589-4a99-b35f-4286a9164a4c",
-  "prevId": "c07b4921-245c-4e69-b29f-01132e3f6156",
+  "id": "abeafedc-f054-41e8-b9a0-edc89be12b9b",
+  "prevId": "ff0d57da-e8d7-48db-88a7-1e3066eaae33",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -1341,6 +1341,56 @@
             }
           ],
           "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_bg_tasks_parent_alias": {
+          "name": "idx_bg_tasks_parent_alias",
+          "columns": [
+            {
+              "expression": "parent_narrator_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "alias",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "created_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"alias\" IS NOT NULL",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_bg_tasks_parent_live_alias": {
+          "name": "idx_bg_tasks_parent_live_alias",
+          "columns": [
+            {
+              "expression": "parent_narrator_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "alias",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"alias\" IS NOT NULL AND \"status\" IN ('running', 'paused')",
           "concurrently": false,
           "method": "btree",
           "with": {}
@@ -15183,6 +15233,18 @@
           "primaryKey": false,
           "notNull": false
         },
+        "title_slug": {
+          "name": "title_slug",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "alias_selector": {
+          "name": "alias_selector",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
         "inherit_mode": {
           "name": "inherit_mode",
           "type": "text",
@@ -16078,6 +16140,78 @@
           ],
           "isUnique": false,
           "where": "\"is_background\" = TRUE",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_narrators_parent_title_slug": {
+          "name": "idx_narrators_parent_title_slug",
+          "columns": [
+            {
+              "expression": "parent_narrator_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "title_slug",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"parent_narrator_id\" IS NOT NULL AND \"title_slug\" IS NOT NULL",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_narrators_parent_alias_selector": {
+          "name": "idx_narrators_parent_alias_selector",
+          "columns": [
+            {
+              "expression": "parent_narrator_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "alias_selector",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"parent_narrator_id\" IS NOT NULL AND \"alias_selector\" IS NOT NULL",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_narrators_addressable_parent_created": {
+          "name": "idx_narrators_addressable_parent_created",
+          "columns": [
+            {
+              "expression": "parent_narrator_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "created_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"parent_narrator_id\" IS NOT NULL AND \"status\" IN ('idle', 'working', 'waiting')",
           "concurrently": false,
           "method": "btree",
           "with": {}

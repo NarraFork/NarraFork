@@ -166,13 +166,17 @@ describe("data portability · communication forest", () => {
 		).not.toBe("peer-a-b");
 	});
 
-	test("an imported peer can be disconnected through the real HTTP mutation route", async () => {
+	test("the disconnect route accepts newly allocated peer IDs even with a shadowed snapshot rowid", async () => {
 		narrator("a");
 		narrator("b");
 		communicationNode("a", null);
 		communicationNode("b", null);
 		peer("a", "b");
 		const preview = await archive();
+		alterSnapshot(preview.snapshotPath, (snapshot) => {
+			snapshot.run("ALTER TABLE narrator_communication_peers ADD COLUMN rowid TEXT");
+			snapshot.run("UPDATE narrator_communication_peers SET rowid = 'archive supplied/rowid'");
+		});
 		await clearData("sessions");
 		const result = await applyImport(preview.token, { include, importingUserId: "importer" });
 		expect(result.communication.peersRestored).toBe(1);
@@ -207,6 +211,32 @@ describe("data portability · communication forest", () => {
 			sqlite.query("SELECT id FROM narrator_communication_peers WHERE id = ?").get(imported.id),
 		).toBeNull();
 		expect(count("narrator_communication_peers")).toBe(0);
+	});
+
+	test("a current snapshot recomputes archived aliases while preserving the communication forest", async () => {
+		pairFixture();
+		sqlite.run(
+			`UPDATE narrators SET type = 'subagent', status = 'archived', parent_narrator_id = 'a',
+			 acl_root_narrator_id = 'a', title = 'Archived Helper', traits = ?,
+			 title_slug = 'stale-title', alias_selector = 'stale-alias' WHERE id = 'b'`,
+			[JSON.stringify(["subagent-alias:helper-v2"])],
+		);
+		const preview = await archive();
+		const aliasSql = "SELECT title_slug, alias_selector FROM narrators WHERE id = 'b'";
+		alterSnapshot(preview.snapshotPath, (snapshot) => {
+			expect(snapshot.query(aliasSql).get()).toEqual({
+				title_slug: "stale-title",
+				alias_selector: "stale-alias",
+			});
+		});
+		await clearData("sessions");
+		const result = await applyImport(preview.token, { include, importingUserId: "importer" });
+		expect(sqlite.query(aliasSql).get()).toEqual({
+			title_slug: "archived-helper",
+			alias_selector: "helper-v2",
+		});
+		expect(node("b")).toMatchObject({ parent_narrator_id: "a" });
+		expect(result.communication.peersRestored).toBe(1);
 	});
 
 	test("overwrite cannot resurrect an existing explicit split or replace immutable original NULL", async () => {
@@ -271,6 +301,32 @@ describe("data portability · communication forest", () => {
 		const result = await applyImport(preview.token, { include, importingUserId: "writer" });
 		expect(result.communication.parentsDetachedUnauthorized).toBe(1);
 		expect(result.communication.peersUnauthorized).toBe(1);
+	});
+
+	test("snapshot ownership cannot authorize overwrite or restore links to a private local endpoint", async () => {
+		pairFixture();
+		const preview = await archive();
+		await clearData("sessions");
+		narrator("a", "other");
+		communicationNode("a", null, null, 7);
+		const result = await applyImport(preview.token, {
+			include,
+			conflictDefault: "overwrite",
+			importingUserId: "writer",
+		});
+		expect(result.sessionsSkipped).toBe(1);
+		expect(result.sessionsOverwritten).toBe(0);
+		expect(sqlite.query("SELECT owner_user_id FROM narrators WHERE id = 'a'").get()).toEqual({
+			owner_user_id: "other",
+		});
+		expect(node("a")).toMatchObject({ version: 7 });
+		expect(node("b")).toMatchObject({
+			parent_narrator_id: null,
+			original_parent_narrator_id: null,
+		});
+		expect(result.communication.parentsDetachedMissingEndpoints).toBe(1);
+		expect(result.communication.peersMissingEndpoints).toBe(1);
+		expect(count("narrator_communication_peers")).toBe(0);
 	});
 
 	test("read grants do not count as write access in the target environment", async () => {

@@ -231,28 +231,49 @@ test("ambiguous titles are rejected with full stable IDs instead of choosing the
 	).toBe("grandchild-b");
 });
 
-test("full IDs bypass a truncated display index but names cannot assume uniqueness", async () => {
-	const list = spyOn(communication, "listCommunicationTargets").mockResolvedValue(
-		Array.from({ length: 200 }, (_, index) => ({
-			id: `bounded-${index}`,
-			title: "Repeated title",
-			handle: null,
-			status: "idle",
-		})),
+test("names match before the display limit and a current alias outranks title-only matches", async () => {
+	const fillers = Array.from({ length: 205 }, (_, index) => ({
+		id: `a-filler-${index}`,
+		title: "Some other title",
+		ownerUserId: "sender-user",
+		status: "idle" as const,
+		createdAt: time,
+		updatedAt: time,
+	}));
+	db.insert(narrators).values(fillers).run();
+	db.insert(narratorCommunicationNodes)
+		.values(fillers.map(({ id }) => ({ narratorId: id, parentNarratorId: "root", version: 1 })))
+		.run();
+	db.update(narrators)
+		.set({ title: "Previously shared", titleSlug: "shared" })
+		.where(eq(narrators.id, "grandchild-a"))
+		.run();
+	db.update(narrators)
+		.set({ traits: ["subagent-alias:shared"], aliasSelector: "shared" })
+		.where(eq(narrators.id, "grandchild-b"))
+		.run();
+	const display = await communication.listCommunicationTargets("root", { limit: 200 });
+	expect(display).toHaveLength(200);
+	expect(display.some(({ id }) => id === "grandchild-b")).toBe(false);
+	const resolve = async (name: string) =>
+		(await resolveCommunicationSendTargets({ callerNarratorId: "root", name }))[0]?.id;
+	expect(await resolve("shared")).toBe("grandchild-b");
+	expect(await resolve("Previously shared")).toBe("grandchild-a");
+
+	db.update(narrators).set({ status: "archived" }).where(eq(narrators.id, "grandchild-b")).run();
+	expect(await resolve("shared")).toBe("grandchild-a");
+});
+
+test("disconnected archived IDs and historical parent names never gain Send authority", async () => {
+	db.update(narrators).set({ status: "archived" }).where(eq(narrators.id, "independent")).run();
+	await expectRejected(sendSubagentMessageDetailed(request("root", ["branch-a", "independent"])));
+	expect(queued()).toHaveLength(0);
+
+	db.update(narrators).set({ status: "archived" }).where(eq(narrators.id, "root")).run();
+	await expectRejected(
+		resolveCommunicationSendTargets({ callerNarratorId: "branch-a", id: "main" }),
 	);
-	try {
-		expect(
-			(await resolveCommunicationSendTargets({ callerNarratorId: "root", id: "grandchild-b" }))[0]
-				?.id,
-		).toBe("grandchild-b");
-		expect(list).not.toHaveBeenCalled();
-		await expectRejected(
-			resolveCommunicationSendTargets({ callerNarratorId: "root", name: "Repeated title" }),
-			"truncated",
-		);
-	} finally {
-		list.mockRestore();
-	}
+	await expectRejected(resolveCommunicationSendTargets({ callerNarratorId: "root", name: "peer" }));
 });
 
 test("parent aliases name the original delegator, never a different run result recipient", async () => {

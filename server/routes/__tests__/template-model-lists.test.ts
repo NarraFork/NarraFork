@@ -21,7 +21,7 @@ const fixtures = {
 };
 let app: Hono;
 let settings: typeof import("../../lib/settings").settings;
-let cachedByFamily: Record<keyof typeof fixtures, (id: string) => Array<{ id?: unknown }>>;
+let cachedByFamily: Record<keyof typeof fixtures, (id: string) => Array<{ id: string }>>;
 
 beforeAll(async () => {
 	process.env.NARRAFORK_HOME = home;
@@ -157,36 +157,24 @@ describe("per-connection cached model GETs through templates", () => {
 	});
 });
 
-test.each([
-	["openai", "completions-compatible"],
-	["anthropic", "anthropic-messages"],
-	["gemini", "gemini-compatible"],
-	["nug", "nug"],
-] as const)("%s GET actually consults the frozen template's current reader", async (family, source) => {
+test("management GET returns the template's complete catalog without filtering it through an older list", async () => {
 	const { registerModelListReader } = await import("../../lib/sourcing/model-list-readers");
-	const seen: string[] = [];
-	const dispose = registerModelListReader(source, (group) => {
-		seen.push(group.id);
-		return [];
-	});
+	const models = [{ id: "only-in-template", contextWindow: 256_000, metadata: { tools: true } }];
+	const dispose = registerModelListReader("completions-compatible", () => models);
 	try {
-		expect(cachedByFamily[family](family).length).toBeGreaterThan(0);
-		const res = await app.request(`/${family}/providers/${family}/models`);
+		const res = await app.request("/openai/providers/openai/models");
 		expect(res.status).toBe(200);
-		expect(await res.json()).toEqual({ models: [], fromCache: true });
-		expect(seen).toEqual([family]);
+		expect(await res.json()).toEqual({ models, fromCache: true });
 	} finally {
 		dispose();
-		registerModelListReader(source, (group) =>
-			cachedByFamily[family](group.id).map((model) => String(model.id ?? "")),
-		);
+		registerModelListReader("completions-compatible", (group) => cachedByFamily.openai(group.id));
 	}
 });
 
 test.each([
 	"openai-responses",
 	"completions-compatible",
-] as const)("canonical OpenAI %s selects its matching reader after legacy projection", async (protocol) => {
+] as const)("canonical OpenAI %s returns the matching catalog after legacy projection", async (protocol) => {
 	const configured = settings.customApiProviders?.find((config) => config.id === "openai");
 	if (!configured) throw new Error("fixture missing");
 	configured.protocol = protocol;
@@ -194,28 +182,21 @@ test.each([
 		"../../lib/settings/custom-api-providers"
 	);
 	normalizeCustomApiProviderSettings(settings);
-	expect(settings.openaiProviders?.[0]?.apiMode).toBe(
-		protocol === "openai-responses" ? "codex" : "completions",
-	);
 	const { registerModelListReader } = await import("../../lib/sourcing/model-list-readers");
-	const reads: string[] = [];
 	const sources = ["openai-responses", "completions-compatible"] as const;
 	const disposers = sources.map((source) =>
-		registerModelListReader(source, () => {
-			reads.push(source);
-			return fixtures.openai.map((model) => model.id);
-		}),
+		registerModelListReader(source, () => [{ id: `${source}-model`, owned_by: source }]),
 	);
 	try {
 		const res = await app.request("/openai/providers/openai/models");
 		expect(res.status).toBe(200);
-		expect(await res.json()).toEqual({ models: fixtures.openai, fromCache: true });
-		expect(reads).toEqual([protocol]);
+		expect(await res.json()).toEqual({
+			models: [{ id: `${protocol}-model`, owned_by: protocol }],
+			fromCache: true,
+		});
 	} finally {
 		for (const dispose of disposers) dispose();
 		for (const source of sources)
-			registerModelListReader(source, (group) =>
-				cachedByFamily.openai(group.id).map((model) => String(model.id ?? "")),
-			);
+			registerModelListReader(source, (group) => cachedByFamily.openai(group.id));
 	}
 });

@@ -11,7 +11,6 @@ import {
 	teamRootOf,
 } from "@server/lib/runtime-source";
 import { isParentSelector, type SendDeliveryTarget } from "@shared/communication-tool";
-import { foldHandle } from "@shared/narrator-handle";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import { narratorBufferedMessages } from "../db/schema";
@@ -28,6 +27,7 @@ import { getRuntimePublicationService, type PublicationRun } from "./agent-runti
 import { controlRun, wakeHeldRun } from "./agent-runtime/run";
 import { backgroundTaskService } from "./background-task-service";
 import {
+	assertArchivedCommunicationTargetVisible,
 	assertCommunicationSendAuthorized,
 	listCommunicationTargets,
 } from "./narrator-communication";
@@ -35,7 +35,12 @@ import { authorizeAgentControl } from "./narrator-control";
 import { narratorService } from "./narrator-service";
 import { getSubagentFinalText } from "./narrator-session";
 import { formatRecentSubagentActivity, getRecentSubagentToolActivity } from "./subagent-activity";
-import { resolveTaskAlias, subagentMatchesSelector } from "./subagent-alias";
+import {
+	findSubagentIdsBySelector,
+	getPersistedSubagentAliases,
+	resolveTaskAlias,
+	subagentMatchesSelector,
+} from "./subagent-alias";
 import { assertRuntimeCanAwaitAgent } from "./subagent-communication-policy";
 import {
 	agentLabelFromNarrator,
@@ -65,6 +70,25 @@ export interface ResolveTargetsInput {
 	ids?: string[];
 	name?: string;
 	names?: string[];
+	/**
+	 * When no addressable member matches, also accept one archived member.
+	 * Send, Await and Watch leave this unset.
+	 */
+	includeArchived?: boolean;
+	/**
+	 * ContextAsk and TeamStatus file changes. Exact id finds an archived member.
+	 * A name that matches both a live member and an archived one is ambiguous.
+	 */
+	historical?: boolean;
+	/**
+	 * Unarchive. Only archived members match. An ambiguous historical name throws.
+	 */
+	archivedOnly?: boolean;
+	/**
+	 * Resolve names in this team only. Lifecycle passes the caller's own id
+	 * (its children). TeamStatus file reports pass the reporting team's root.
+	 */
+	teamId?: string;
 }
 
 export interface SendSubagentInput extends ResolveTargetsInput {
@@ -266,16 +290,22 @@ interface CommunicationScope {
 	callerIsSubagent: boolean;
 	/** Await only: restrict targets to the caller's own children. */
 	ownChildrenOnly?: boolean;
+	/** This call resolves in one team, not every team the caller can reach. */
+	teamId?: string;
 }
 
-async function getCommunicationScope(callerNarratorId: string): Promise<CommunicationScope> {
-	const caller = await narratorService.getById(callerNarratorId);
+async function getCommunicationScope(
+	callerNarratorId: string,
+	signal?: AbortSignal,
+): Promise<CommunicationScope> {
+	const caller = await narratorService.getById(callerNarratorId, undefined, { signal });
 	const teamParentId = teamRootOf(caller);
 	return { caller, teamParentId, callerIsSubagent: teamParentId !== caller.id };
 }
 
 /** Teams a selector is resolved in: the caller's own team, then the one it leads. */
 function reachableTeamIds(scope: CommunicationScope): string[] {
+	if (scope.teamId) return [scope.teamId];
 	if (scope.ownChildrenOnly) return [scope.caller.id];
 	return scope.teamParentId === scope.caller.id
 		? [scope.caller.id]
@@ -318,36 +348,160 @@ async function resolveAliasCandidate(selector: string, scope: CommunicationScope
 	return selector;
 }
 
-async function resolveOneTarget(selector: string, scope: CommunicationScope): Promise<Narrator> {
-	const aliasCandidate = await resolveAliasCandidate(selector, scope);
-	const direct = await narratorService.getById(aliasCandidate).catch(() => null);
-	if (direct) {
-		assertTargetAllowed(direct, scope);
-		return direct;
-	}
+function ambiguousTargetError(
+	selector: string,
+	candidates: Array<{ id: string; title?: string | null; traits?: unknown }>,
+	scope: CommunicationScope,
+): Error {
+	const lines = candidates
+		.map(
+			(c) =>
+				`- ${agentLabelFromNarrator(c, scope.teamParentId)} | ${c.title ?? "(untitled)"} ` +
+				`(id: ${shortAgentId(c.id)})`,
+		)
+		.join("\n");
+	return new Error(`Ambiguous subagent target "${selector}". Candidates:\n${lines}`);
+}
 
+function matchesExactAliasOrId(
+	candidate: { id: string; traits?: unknown },
+	selector: string,
+): boolean {
+	const normalized = selector.trim();
+	return (
+		candidate.id === normalized ||
+		getPersistedSubagentAliases(candidate.traits).includes(normalized)
+	);
+}
+
+async function findArchivedMatches(
+	selector: string,
+	scope: CommunicationScope,
+): Promise<Narrator[]> {
+	const ids = new Set<string>();
+	for (const teamId of reachableTeamIds(scope)) {
+		for (const id of await findSubagentIdsBySelector(teamId, selector, {
+			membership: "archived",
+		}))
+			ids.add(id);
+	}
+	const matches: Narrator[] = [];
+	for (const id of ids) {
+		if (scope.callerIsSubagent && id === scope.caller.id) continue;
+		const row = await narratorService.getById(id).catch(() => null);
+		if (row?.status === "archived") matches.push(row);
+	}
+	return matches;
+}
+
+async function resolveArchivedTarget(
+	selector: string,
+	scope: CommunicationScope,
+): Promise<Narrator | undefined> {
+	const matches = await findArchivedMatches(selector, scope);
+	if (matches.length === 0) return;
+	if (matches.length > 1) throw ambiguousTargetError(selector, matches, scope);
+	assertTargetAllowed(matches[0], scope);
+	return matches[0];
+}
+
+async function addressableMatches(selector: string, scope: CommunicationScope) {
 	const siblings: Awaited<ReturnType<typeof narratorService.listTeamMembers>> = [];
 	for (const teamId of reachableTeamIds(scope))
 		siblings.push(...(await narratorService.listTeamMembers(teamId)));
-	const candidates = siblings.filter((s) => {
+	return siblings.filter((s) => {
 		if (scope.callerIsSubagent && s.id === scope.caller.id) return false;
 		return subagentMatchesSelector(s, selector);
 	});
+}
+
+async function resolveHistoricalTarget(
+	selector: string,
+	scope: CommunicationScope,
+): Promise<Narrator> {
+	const trimmed = selector.trim();
+	const byId = await narratorService.getById(trimmed).catch(() => null);
+	if (byId?.id === trimmed) {
+		const root = teamRootOf(byId);
+		// A foreign id is the same answer as a missing one. Naming the session
+		// would tell the caller that the id exists and what it is called.
+		if (root === byId.id || !reachableTeamIds(scope).includes(root)) {
+			throw new Error(`No accessible subagent found for "${selector}"`);
+		}
+		if (scope.callerIsSubagent && byId.id === scope.caller.id) {
+			throw new Error("Subagents cannot target themselves");
+		}
+		return byId;
+	}
+	const live = await addressableMatches(selector, scope);
+	const archived = await findArchivedMatches(selector, scope);
+	if (live.length === 1 && archived.length === 0) {
+		const target = await narratorService.getById(live[0].id);
+		assertTargetAllowed(target, scope);
+		return target;
+	}
+	if (live.length === 0 && archived.length === 1) {
+		assertTargetAllowed(archived[0], scope);
+		return archived[0];
+	}
+	if (live.length + archived.length === 0) {
+		throw new Error(`No accessible subagent found for "${selector}"`);
+	}
+	throw ambiguousTargetError(selector, [...live, ...archived], scope);
+}
+
+async function resolveOneTarget(
+	selector: string,
+	scope: CommunicationScope,
+	options: { includeArchived?: boolean; historical?: boolean; archivedOnly?: boolean } = {},
+): Promise<Narrator> {
+	if (options.historical) return resolveHistoricalTarget(selector, scope);
+	if (options.archivedOnly) {
+		const archived = await resolveArchivedTarget(selector, scope);
+		if (!archived) throw new Error(`No accessible subagent found for "${selector}"`);
+		return archived;
+	}
+
+	const aliasCandidate = await resolveAliasCandidate(selector, scope);
+	const direct = await narratorService.getById(aliasCandidate).catch(() => null);
+	// A task row keeps the alias printed at launch. After a restore gives that
+	// agent a suffix, the row must not hide the member who still holds the name.
+	// An in-memory registry entry is the current claim and still wins.
+	if (direct && direct.status !== "archived") {
+		const normalized = selector.trim();
+		const redirected = aliasCandidate !== normalized;
+		const remembered = [scope.caller.id, ...reachableTeamIds(scope)].some((ownerId) => {
+			const hit = resolveTaskAlias(ownerId, normalized);
+			return hit !== normalized && hit === direct.id;
+		});
+		const stillOwns =
+			!redirected ||
+			direct.id === normalized ||
+			remembered ||
+			getPersistedSubagentAliases(direct.traits).includes(normalized);
+		if (stillOwns) {
+			assertTargetAllowed(direct, scope);
+			return direct;
+		}
+	}
+
+	let candidates = await addressableMatches(selector, scope);
 
 	if (candidates.length === 0) {
+		if (options.includeArchived) {
+			const archived = await resolveArchivedTarget(selector, scope);
+			if (archived) return archived;
+		}
 		throw new Error(`No accessible subagent found for "${selector}"`);
+	}
+	if (candidates.length > 1) {
+		const exact = candidates.filter((candidate) => matchesExactAliasOrId(candidate, selector));
+		if (exact.length === 1) candidates = exact;
 	}
 	if (candidates.length > 1) {
 		// Lead with the label so the model's next attempt can disambiguate with an
 		// alias instead of copying a nanoid back.
-		const lines = candidates
-			.map(
-				(c) =>
-					`- ${agentLabelFromNarrator(c, scope.teamParentId)} | ${c.title ?? "(untitled)"} ` +
-					`(id: ${shortAgentId(c.id)})`,
-			)
-			.join("\n");
-		throw new Error(`Ambiguous subagent target "${selector}". Candidates:\n${lines}`);
+		throw ambiguousTargetError(selector, candidates, scope);
 	}
 
 	const target = await narratorService.getById(candidates[0].id);
@@ -362,15 +516,43 @@ export async function resolveSubagentTargets(input: ResolveTargetsInput): Promis
 	}
 
 	const scope = await getCommunicationScope(input.callerNarratorId);
+	if (input.teamId) scope.teamId = input.teamId;
 	const resolved: Narrator[] = [];
 	const seen = new Set<string>();
 	for (const selector of selectors) {
-		const target = await resolveOneTarget(selector, scope);
+		const target = await resolveOneTarget(selector, scope, {
+			includeArchived: input.includeArchived,
+			historical: input.historical,
+			archivedOnly: input.archivedOnly,
+		});
 		if (seen.has(target.id)) continue;
 		seen.add(target.id);
 		resolved.push(target);
 	}
 	return resolved;
+}
+
+/**
+ * Archive names the addressable owner. Unarchive names the archived candidate.
+ * An exact narrator id wins either way. An ambiguous name throws.
+ * Names resolve among the caller's own children, not a sibling team that
+ * happens to reuse the alias.
+ */
+export async function resolveAgentLifecycleTarget(
+	callerNarratorId: string,
+	selector: string,
+	action: "archive" | "unarchive",
+): Promise<string> {
+	const trimmed = selector.trim();
+	const byId = await narratorService.getById(trimmed).catch(() => null);
+	if (byId?.id === trimmed) return byId.id;
+	const targets = await resolveSubagentTargets({
+		callerNarratorId,
+		id: trimmed,
+		archivedOnly: action === "unarchive",
+		teamId: callerNarratorId,
+	});
+	return targets[0].id;
 }
 
 function formatSubagentResult(label: string, finalText: string | null | undefined): string {
@@ -1070,18 +1252,10 @@ function withSenderPrefix(
 async function deliverSubagentMessageToParent(
 	input: SendSubagentInput,
 	scope: CommunicationScope,
-	parentId: string,
+	parent: Narrator,
 ): Promise<SendTargetResult> {
 	// A manual progress report is an ordinary message, not an automatic task result.
-	await assertCommunicationSendAuthorized(scope.caller.id, parentId);
-	const parent = await narratorService.getById(parentId).catch(() => null);
-	if (!parent) {
-		return { id: parentId, status: "failed", error: "Parent narrator not found" };
-	}
-	if (parent.status === "archived") {
-		return { id: parentId, title: parent.title, status: "failed", error: "Parent is archived" };
-	}
-
+	const parentId = parent.id;
 	// Send is an addressable tool row. The latest text message may be several
 	// calls earlier (or absent entirely), so preserve the exact invocation instead.
 	const delivery = createAgentMessageDelivery(
@@ -1131,15 +1305,46 @@ function sendParentId(scope: CommunicationScope): string | null {
 	return scope.caller.type === "subagent" ? scope.caller.parentNarratorId : null;
 }
 
-const SEND_TARGET_LIST_LIMIT = 200;
-type CommunicationTarget = Awaited<ReturnType<typeof listCommunicationTargets>>[number] & {
-	/** Lightweight aliases, when supplied by the communication projection. */
-	aliases?: readonly string[];
-};
+async function resolveSendName(
+	selector: string,
+	scope: CommunicationScope,
+	signal?: AbortSignal,
+): Promise<Narrator> {
+	// The local registry can supply candidate IDs, not authority. Persisted names
+	// are matched against current narrator selectors, not historical task aliases.
+	const activeAliasIds = uniqueStrings(
+		[...new Set([scope.caller.id, ...reachableTeamIds(scope)])]
+			.map((ownerId) => resolveTaskAlias(ownerId, selector))
+			.filter((id) => id !== selector),
+	);
+	const matches = await listCommunicationTargets(scope.caller.id, {
+		limit: 5,
+		signal,
+		selector: { name: selector, activeAliasIds },
+	});
+	const best = matches[0];
+	if (!best) {
+		throw new Error(
+			`No accessible communication target found for "${selector}"; use a full narrator ID`,
+		);
+	}
+	// Rows are ranked before the limit. The first two prove whether the strongest
+	// match is unique, regardless of how many other sessions share the forest.
+	if (matches.length > 1 && matches[1].selectorRank === best.selectorRank) {
+		const lines = matches
+			.filter((candidate) => candidate.selectorRank === best.selectorRank)
+			.map((candidate) => `- ${candidate.title ?? "(untitled)"} (id: ${candidate.id})`)
+			.join("\n");
+		throw new Error(
+			`Ambiguous communication target "${selector}". Use a full narrator ID:\n${lines}`,
+		);
+	}
+	return narratorService.getById(best.id, undefined, { signal });
+}
 
 /**
- * Send-only resolution. The legacy team resolver above remains the authority for
- * ContextAsk, observation and control; a communication peer grants none of those.
+ * Resolve and authorize the whole Send before delivery. The legacy team selector
+ * above still serves observation and control; a communication peer grants neither.
  */
 async function resolveSendTargets(
 	input: ResolveTargetsInput & { signal?: AbortSignal },
@@ -1147,62 +1352,30 @@ async function resolveSendTargets(
 ): Promise<Narrator[]> {
 	const selectors = getSelectors(input);
 	if (!selectors.length) throw new Error("At least one target id/name is required");
-	let candidates: CommunicationTarget[] | undefined;
 	const targets = new Map<string, Narrator>();
 	for (const selector of selectors) {
 		input.signal?.throwIfAborted();
-		let target: Narrator | null;
+		let target: Narrator;
+		let exactArchived = false;
 		if (isParentSelector(selector)) {
 			const parentId = sendParentId(scope);
 			if (!parentId) throw new Error("This narrator has no parent destination");
-			target = await narratorService.getById(parentId);
+			target = await narratorService.getById(parentId, undefined, { signal: input.signal });
 		} else {
-			// An exact ID never depends on a truncated display/name index. Do not
-			// swallow read failures and turn them into a different selector.
-			target = await narratorService.getById(selector).catch((error) => {
-				if (error instanceof NotFoundError) return null;
-				throw error;
-			});
-			if (!target) {
-				candidates ??= await listCommunicationTargets(scope.caller.id, {
-					limit: SEND_TARGET_LIST_LIMIT,
-					signal: input.signal,
+			// IDs are authoritative; only a not-found result may fall through to names.
+			const byId = await narratorService
+				.getById(selector, undefined, { signal: input.signal })
+				.catch((error) => {
+					if (error instanceof NotFoundError) return null;
+					throw error;
 				});
-				// A name cannot be proven unique outside this bounded projection.
-				// Fail closed rather than choosing the first visible match.
-				if (candidates.length >= SEND_TARGET_LIST_LIMIT)
-					throw new Error("Communication target list may be truncated; use the full narrator ID");
-				const handle = foldHandle(selector.replace(/^@/, ""));
-				const matches = new Map(
-					candidates
-						.filter(
-							(candidate) =>
-								candidate.id !== scope.caller.id &&
-								(subagentMatchesSelector(candidate, selector) ||
-									(candidate.handle != null && foldHandle(candidate.handle) === handle) ||
-									candidate.aliases?.includes(selector)),
-						)
-						.map((candidate) => [candidate.id, candidate]),
-				);
-				if (matches.size === 0)
-					throw new Error(
-						`No accessible communication target found for "${selector}"; use a full narrator ID`,
-					);
-				if (matches.size > 1) {
-					const lines = [...matches.values()]
-						.map((candidate) => `- ${candidate.title ?? "(untitled)"} (id: ${candidate.id})`)
-						.join("\n");
-					throw new Error(
-						`Ambiguous communication target "${selector}". Use a full narrator ID:\n${lines}`,
-					);
-				}
-				const [candidate] = matches.values();
-				target = await narratorService.getById(candidate.id);
-			}
+			exactArchived = byId?.status === "archived";
+			target = byId ?? (await resolveSendName(selector, scope, input.signal));
 		}
 		if (target.id === scope.caller.id) throw new Error("Narrators cannot send to themselves");
 		input.signal?.throwIfAborted();
-		await assertCommunicationSendAuthorized(scope.caller.id, target.id);
+		if (exactArchived) await assertArchivedCommunicationTargetVisible(scope.caller.id, target.id);
+		else await assertCommunicationSendAuthorized(scope.caller.id, target.id);
 		input.signal?.throwIfAborted();
 		targets.set(target.id, target);
 	}
@@ -1213,7 +1386,10 @@ async function resolveSendTargets(
 export async function resolveCommunicationSendTargets(
 	input: ResolveTargetsInput & { signal?: AbortSignal },
 ): Promise<Narrator[]> {
-	return resolveSendTargets(input, await getCommunicationScope(input.callerNarratorId));
+	return resolveSendTargets(
+		input,
+		await getCommunicationScope(input.callerNarratorId, input.signal),
+	);
 }
 
 function blockedSendNote(
@@ -1240,15 +1416,18 @@ function blockedSendNote(
 export async function sendSubagentMessageDetailed(
 	input: SendSubagentInput,
 ): Promise<SendSubagentResult> {
-	const scope = await getCommunicationScope(input.callerNarratorId);
+	const scope = await getCommunicationScope(input.callerNarratorId, input.signal);
 
 	// Resolve and authorize the WHOLE call before any enqueue or interrupt.
-	// Reaching a target (step 4 owns that rule) is not control: an interrupt additionally
-	// needs the target's registered controller grant for "steer".
+	// Reaching a target is not control: an interrupt additionally needs the
+	// target's registered controller grant for "steer".
 	const targets = await resolveSendTargets(input, scope);
+	// Exact archived IDs can fail individually without aborting live recipients.
+	const deliverable = targets.filter((target) => target.status !== "archived");
 	const modelRequest = input.model?.trim() ? input.model : undefined;
-	if (input.doInterrupt || input.resume || modelRequest !== undefined) {
-		for (const target of targets)
+	const wantsControl = !!(input.doInterrupt || input.resume || modelRequest);
+	if (wantsControl) {
+		for (const target of deliverable)
 			await authorizeAgentControl({
 				callerNarratorId: scope.caller.id,
 				targetNarratorId: target.id,
@@ -1256,10 +1435,10 @@ export async function sendSubagentMessageDetailed(
 				userId: input.userId ?? null,
 			});
 	}
-	// Validated for every target before anything is written, like the grant above.
+	// Validated for every deliverable target before anything is written, like the grant above.
 	const modelPlans = new Map<string, SubagentModelSwitchPlan>();
 	if (modelRequest !== undefined) {
-		for (const target of targets) {
+		for (const target of deliverable) {
 			if (isTakenOver(target.id))
 				throw new Error(
 					`Agent ${agentLabelFromNarrator(target, teamRootOf(target))} is taken over by the user; its model cannot be changed now.`,
@@ -1281,32 +1460,48 @@ export async function sendSubagentMessageDetailed(
 	for (const target of targets) {
 		// Readable name for every message about this target, refreshed from `fresh`
 		// below once it is loaded.
-		let label = agentLabelFromNarrator(target, teamRootOf(target));
+		const toParent = target.id === sendParentId(scope);
+		let label = toParent ? "parent" : agentLabelFromNarrator(target, teamRootOf(target));
 		try {
 			input.signal.throwIfAborted();
-			if (target.id === sendParentId(scope)) {
-				label = "parent";
-				const delivered = await deliverSubagentMessageToParent(input, scope, target.id);
+			const fresh = await narratorService.getById(target.id, undefined, { signal: input.signal });
+			if (fresh.status === "archived") throw new Error("Target narrator is archived");
+			await assertCommunicationSendAuthorized(scope.caller.id, fresh.id);
+			if (!toParent) label = agentLabelFromNarrator(fresh, teamRootOf(fresh));
+			// Preflight skipped control for an archived ID. A restored target must
+			// pass the live Send gate and the same steer checks as any recipient.
+			if (wantsControl && target.status === "archived") {
+				await authorizeAgentControl({
+					callerNarratorId: scope.caller.id,
+					targetNarratorId: fresh.id,
+					action: "steer",
+					userId: input.userId ?? null,
+				});
+				if (modelRequest !== undefined && !modelPlans.has(fresh.id)) {
+					if (isTakenOver(fresh.id))
+						throw new Error(
+							`Agent ${label} is taken over by the user; its model cannot be changed now.`,
+						);
+					modelPlans.set(
+						fresh.id,
+						await planSubagentModelSwitch(fresh, modelRequest, input.userId ?? null),
+					);
+				}
+			}
+
+			if (toParent) {
+				const delivered = await deliverSubagentMessageToParent(input, scope, fresh);
 				targetResults.push({ ...delivered, label });
 				sections.push(
-					delivered.status === "failed"
-						? `Failed to send to parent: ${delivered.error}`
-						: delivered.status === "started"
-							? "Sent to parent; its next eligible turn was scheduled."
-							: "Sent to parent; queued at a safe input boundary (reading not guaranteed).",
+					delivered.status === "started"
+						? "Sent to parent; its next eligible turn was scheduled."
+						: "Sent to parent; queued at a safe input boundary (reading not guaranteed).",
 				);
 				continue;
 			}
 
-			const fresh = await narratorService.getById(target.id);
-			await assertCommunicationSendAuthorized(scope.caller.id, fresh.id);
-			label = agentLabelFromNarrator(fresh, teamRootOf(fresh));
 			// Only the recipient's explicit controller is displayed as its parent.
 			const asParent = isOwnChild(fresh, scope);
-			if (fresh.status === "archived") {
-				throw new Error("Target narrator is archived");
-			}
-
 			// A taken-over subagent is driven by the user like an independent narrator, and
 			// an independent narrator still receives its team's messages. Rejecting the Send
 			// here (the old behaviour) silently dropped the parent's instruction: the model

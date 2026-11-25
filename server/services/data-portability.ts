@@ -55,6 +55,7 @@ import {
 	sealProviderTransferItems,
 	withoutKeys,
 } from "@server/services/data-portability-keys";
+import type { NarratorPrincipal } from "@server/services/narrator-acl";
 import {
 	communicationWritePredicate,
 	currentCommunicationPrincipalTx,
@@ -74,6 +75,10 @@ import {
 } from "@shared/storage-transfer";
 import archiver from "archiver";
 import { db, sqlite } from "../db";
+import {
+	backfillNarratorAliasSelectors,
+	recomputeNarratorAliasSelectors,
+} from "../db/alias-selector-backfill";
 import { getDbPath } from "../db/connection";
 import { buildSnapshotInSubprocess } from "../db/snapshot-build";
 import { SNAPSHOT_TABLES } from "../db/snapshot-protocol";
@@ -1095,6 +1100,18 @@ function invalidCommunicationImport(): never {
 	);
 }
 
+function resolveCommunicationImportPrincipal(userId: string | undefined): NarratorPrincipal | null {
+	if (!userId) return null;
+	try {
+		// Drizzle shares sqlite's active transaction. Never use the role cached at preview time.
+		return currentCommunicationPrincipalTx(db, userId);
+	} catch (error) {
+		// A deleted caller fails closed; operational/SQL failures still roll back the import.
+		if (!(error instanceof AppError) || ![403, 404].includes(error.statusCode)) throw error;
+		return null;
+	}
+}
+
 /**
  * Runs on the same connection and inside the session import transaction. Only successfully
  * imported sessions are mapped: a coincidentally existing/skipped target id is NOT an endpoint.
@@ -1104,7 +1121,7 @@ function invalidCommunicationImport(): never {
 function restoreImportedCommunication(
 	attachName: string,
 	excludedNarrators: string[],
-	importingUserId?: string,
+	principal: NarratorPrincipal | null,
 ): CommunicationImportResult {
 	const report = emptyCommunicationImportResult();
 	const mapping = `${attachName}_communication_map`;
@@ -1139,23 +1156,14 @@ function restoreImportedCommunication(
 		);
 		enforceBudget(`temp.${mapping}`, MAX_COMMUNICATION_IMPORT_NODES);
 
-		if (importingUserId) {
-			try {
-				// Drizzle shares sqlite's active transaction. The current role and ACL are read
-				// synchronously here, not cached/preflight permissions from before the import.
-				const principal = currentCommunicationPrincipalTx(db, importingUserId);
-				const writable = communicationWritePredicate("n", principal);
-				sqlite.run(
-					`UPDATE temp.${mapping} SET can_write = EXISTS (
-					 SELECT 1 FROM main.narrators n WHERE n.id = ${mapping}.narrator_id AND (${writable.sql})
-					)`,
-					writable.params,
-				);
-			} catch (error) {
-				// A deleted/missing caller fails closed. Operational/SQL errors must roll back,
-				// not masquerade as an otherwise successful permission-filtered import.
-				if (!(error instanceof AppError) || ![403, 404].includes(error.statusCode)) throw error;
-			}
+		if (principal) {
+			const writable = communicationWritePredicate("n", principal);
+			sqlite.run(
+				`UPDATE temp.${mapping} SET can_write = EXISTS (
+				 SELECT 1 FROM main.narrators n WHERE n.id = ${mapping}.narrator_id AND (${writable.sql})
+				)`,
+				writable.params,
+			);
 		}
 
 		const nodeColumns = tableColumns(attachName, "narrator_communication_nodes");
@@ -1244,7 +1252,8 @@ function restoreImportedCommunication(
 			return report;
 		}
 		const optional = (name: string) => (peerColumns.includes(name) ? `i.${name}` : "NULL");
-		sqlite.run(`CREATE TEMP TABLE ${candidates} AS SELECT i.rowid AS incoming_rowid,
+		// The archive can even define a column named rowid; use a local, numeric ordinal.
+		sqlite.run(`CREATE TEMP TABLE ${candidates} AS SELECT ROW_NUMBER() OVER () AS local_ordinal,
 		 i.endpoint_lo, i.endpoint_hi, i.source, i.created_at,
 		 ${optional("admission_id")} AS admission_id, ${optional("message_id")} AS message_id,
 		 CASE WHEN typeof(i.endpoint_lo) <> 'text' OR typeof(i.endpoint_hi) <> 'text'
@@ -1262,10 +1271,10 @@ function restoreImportedCommunication(
 			sqlite.run(
 				`INSERT OR IGNORE INTO main.narrator_communication_peers
 				 (id, endpoint_lo, endpoint_hi, created_by, source, admission_id, message_id, created_at)
-				 SELECT ? || '_' || incoming_rowid, endpoint_lo, endpoint_hi, ?, source, admission_id, message_id, created_at
+				 SELECT ? || '_' || local_ordinal, endpoint_lo, endpoint_hi, ?, source, admission_id, message_id, created_at
 				 FROM temp.${candidates} WHERE reason = 'eligible'`,
 				// Never reuse a source relation ID for an imported peer.
-				[generateId(), importingUserId ?? null],
+				[generateId(), principal?.userId ?? null],
 			),
 		);
 		report.peersAlreadyPresent =
@@ -1395,7 +1404,25 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 
 			const rejected: string[] = [];
 			const skipped: string[] = [];
+			const touchedNarratorIds: string[] = [];
+			const principal = include.sessions
+				? resolveCommunicationImportPrincipal(options.importingUserId)
+				: null;
 			if (include.sessions) {
+				const writable =
+					principal && !principal.isAdmin ? communicationWritePredicate("n", principal) : null;
+				// Evaluate all colliding rows against the original ACL; an earlier overwrite must
+				// not change the ACL root used to authorize a later subagent overwrite.
+				const writableBeforeImport = writable
+					? new Set(
+							(
+								sqlite
+									.prepare(`SELECT n.id FROM main.narrators n
+									 WHERE n.id IN (SELECT id FROM ${attachName}.narrators) AND (${writable.sql})`)
+									.all(...writable.params) as Array<{ id: string }>
+							).map(({ id }) => id),
+						)
+					: null;
 				const existing = new Set(
 					(sqlite.prepare(`SELECT id FROM main.narrators`).all() as Array<{ id: string }>).map(
 						(row) => row.id,
@@ -1411,12 +1438,17 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 						// 仍被其它唯一约束挡住时，会话进不来，它的子行必须一起跳过。
 						if (sqlite.prepare(`SELECT 1 FROM main.narrators WHERE id = ?`).get(id)) {
 							counts.sessionsInserted += 1;
+							touchedNarratorIds.push(id);
 						} else {
 							rejected.push(id);
 						}
 						continue;
 					}
-					if (decision === "skip") {
+					if (
+						decision === "skip" ||
+						(options.importingUserId !== undefined &&
+							(!principal || (writableBeforeImport && !writableBeforeImport.has(id))))
+					) {
 						counts.sessionsSkipped += 1;
 						skipped.push(id);
 						continue;
@@ -1446,6 +1478,7 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 						[id],
 					);
 					counts.sessionsOverwritten += 1;
+					touchedNarratorIds.push(id);
 				}
 				counts.sessionsRejected = rejected.length;
 				if (rejected.length > 0) {
@@ -1476,6 +1509,11 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 					excludeNarrators: excludedNarrators,
 				});
 				reconcileImportedTeamTraits(attachName);
+				// Overwrite keeps destination selector columns when the snapshot predates
+				// them. Recompute from the title and traits just written; skip leaves
+				// those rows alone. The null-only backfill still fills every other row.
+				recomputeNarratorAliasSelectors(sqlite, touchedNarratorIds);
+				backfillNarratorAliasSelectors(sqlite, { ownTransaction: false });
 				copyTable(attachName, "folder_git_identity_bindings");
 				removeInvalidFolderIdentityBindings(baselines.get("folder_git_identity_bindings") ?? 0);
 				if (
@@ -1512,7 +1550,7 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 				counts.communication = restoreImportedCommunication(
 					attachName,
 					excludedNarrators,
-					options.importingUserId,
+					principal,
 				);
 			}
 			// 本次新增的请求计入用量日账本（按 rowid 基线，重复导入被主键跳过的行不会重复计数）

@@ -58,6 +58,7 @@ export function assertCommunicationSendAuthorizedTx(
 	tx: CommunicationExecutor,
 	sourceId: string,
 	targetId: string,
+	allowArchivedForFailure = false,
 ): void {
 	const [source] = tx.all<{ ownerUserId: string | null; runtimeRegistrationJson: unknown }>(
 		sql`SELECT owner_user_id AS ownerUserId, runtime_registration_json AS runtimeRegistrationJson FROM narrators WHERE id = ${sourceId} AND status <> 'archived' AND hidden_from_lists = 0 LIMIT 1`,
@@ -74,7 +75,7 @@ export function assertCommunicationSendAuthorizedTx(
 	assertCommunicationCeilingTx(tx, sourceId, principal.userId);
 	if (
 		!tx.all(
-			sql`SELECT n.id FROM narrators n WHERE n.id = ${targetId} AND n.status <> 'archived' AND n.hidden_from_lists = 0 AND ${sql.raw(communicationAuthorityText("n"))} LIMIT 1`,
+			sql`SELECT n.id FROM narrators n WHERE n.id = ${targetId} ${allowArchivedForFailure ? sql`` : sql`AND n.status <> 'archived'`} AND n.hidden_from_lists = 0 AND ${sql.raw(communicationAuthorityText("n"))} LIMIT 1`,
 		)[0]
 	)
 		communicationDenied();

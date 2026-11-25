@@ -196,6 +196,7 @@ export async function assertCommunicationSendAuthorizedPg(
 	tx: CommunicationPgTx,
 	source: string,
 	target: string,
+	allowArchivedForFailure = false,
 ): Promise<void> {
 	const actor = await executionActor(tx, source);
 	await write(tx, target, actor);
@@ -203,7 +204,7 @@ export async function assertCommunicationSendAuthorizedPg(
 		!(
 			await rows(
 				tx,
-				sql`SELECT n.id FROM narrators n WHERE n.id = ${target} AND n.status <> 'archived' AND NOT n.hidden_from_lists AND ${sql.raw(communicationAuthorityText("n"))} FOR SHARE`,
+				sql`SELECT n.id FROM narrators n WHERE n.id = ${target} ${allowArchivedForFailure ? sql`` : sql`AND n.status <> 'archived'`} AND NOT n.hidden_from_lists AND ${sql.raw(communicationAuthorityText("n"))} FOR SHARE`,
 			)
 		).length
 	)

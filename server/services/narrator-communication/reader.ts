@@ -4,6 +4,7 @@ import {
 	type CommunicationScope,
 	type CommunicationTopology,
 } from "@shared/narrator-communication";
+import { foldHandle } from "@shared/narrator-handle";
 import { activeDatabaseBackend, postgresRuntime } from "../../db";
 import { getDbPath } from "../../db/connection";
 import { AppError, NotFoundError } from "../../lib/errors";
@@ -271,6 +272,13 @@ export interface CommunicationTarget {
 	handle: string | null;
 	status: string;
 	aliases?: string[];
+	selectorRank?: number;
+}
+interface CommunicationTargetReadOptions {
+	limit?: number;
+	signal?: AbortSignal;
+	/** Lookup matches before applying the row limit; the prompt listing omits this. */
+	selector?: { name: string; activeAliasIds: readonly string[] };
 }
 export function createCommunicationTargetReader(
 	execute: SearchQueryExecutor,
@@ -278,11 +286,11 @@ export function createCommunicationTargetReader(
 ) {
 	return async (
 		source: string,
-		options: { limit?: number; signal?: AbortSignal } = {},
+		options: CommunicationTargetReadOptions = {},
 	): Promise<CommunicationTarget[]> => {
 		const accessEpoch = getCommunicationAccessEpoch();
 		const [row] = await execute(
-			"SELECT owner_user_id, runtime_registration_json FROM narrators WHERE id = ? LIMIT 1",
+			"SELECT owner_user_id, runtime_registration_json FROM narrators WHERE id = ? AND status <> 'archived' AND NOT hidden_from_lists LIMIT 1",
 			[source],
 			options,
 		);
@@ -302,6 +310,29 @@ export function createCommunicationTargetReader(
 			activeDatabaseBackend === "sqlite"
 				? `(SELECT substr(value,16,128) FROM json_each(n.traits) WHERE value LIKE 'subagent-alias:%' LIMIT 1)`
 				: `(SELECT substr(value,16,128) FROM jsonb_array_elements_text(n.traits::jsonb) AS value WHERE value LIKE 'subagent-alias:%' LIMIT 1)`;
+		const { selector } = options;
+		const activeAliasIds = selector?.activeAliasIds ?? [];
+		const legacyAliasMatch =
+			guard.backend === "sqlite"
+				? "EXISTS (SELECT 1 FROM json_each(n.traits) WHERE value = ?)"
+				: "EXISTS (SELECT 1 FROM jsonb_array_elements_text(n.traits::jsonb) AS value WHERE value = ?)";
+		const rank = selector
+			? `CASE ${activeAliasIds.length ? `WHEN n.id IN (${placeholders(activeAliasIds)}) THEN 0` : ""}
+      WHEN n.alias_selector = ? OR ${legacyAliasMatch} OR n.handle_fold = ? THEN 1
+      WHEN n.title_slug = ? OR n.title = ? OR substr(n.id,1,length(?)) = ? THEN 2 ELSE NULL END`
+			: "0";
+		const selectorParams = selector
+			? [
+					...activeAliasIds,
+					selector.name,
+					`subagent-alias:${selector.name}`,
+					foldHandle(selector.name.replace(/^@/, "")),
+					selector.name,
+					selector.name,
+					selector.name,
+					selector.name,
+				]
+			: [];
 		const rows = await execute(
 			`WITH RECURSIVE ancestors(id,parent,depth) AS (
  SELECT narrator_id,parent_narrator_id,1 FROM narrator_communication_nodes WHERE narrator_id = ? UNION ALL SELECT c.narrator_id,c.parent_narrator_id,a.depth+1 FROM narrator_communication_nodes c JOIN ancestors a ON c.narrator_id=a.parent WHERE a.depth<16
@@ -309,8 +340,12 @@ export function createCommunicationTargetReader(
  SELECT id,1 FROM ancestors WHERE parent IS NULL UNION ALL SELECT c.narrator_id,m.depth+1 FROM narrator_communication_nodes c JOIN members m ON c.parent_narrator_id=m.id WHERE m.depth<16
  ), targets(id) AS (
  SELECT id FROM members UNION SELECT endpoint_hi FROM narrator_communication_peers WHERE endpoint_lo=? UNION SELECT endpoint_lo FROM narrator_communication_peers WHERE endpoint_hi=?
- ) SELECT n.id, substr(n.title,1,512) AS title,substr(n.handle,1,128) AS handle,n.status,${alias} AS alias FROM narrators n JOIN targets t ON t.id=n.id WHERE n.id<>? AND n.status<>'archived' AND NOT n.hidden_from_lists AND (${guard.sql}) ORDER BY n.id LIMIT ?`,
-			[source, source, source, source, ...guard.params, limit],
+ ), candidates AS (
+ SELECT n.id,substr(n.title,1,512) AS title,substr(n.handle,1,128) AS handle,n.status,${alias} AS alias,${rank} AS selector_rank
+ FROM narrators n JOIN targets t ON t.id=n.id JOIN narrator_communication_nodes c ON c.narrator_id=n.id
+ WHERE n.id<>? AND n.status<>'archived' AND NOT n.hidden_from_lists AND (${guard.sql})
+ ) SELECT * FROM candidates WHERE selector_rank IS NOT NULL ORDER BY selector_rank,id LIMIT ?`,
+			[source, source, source, ...selectorParams, source, ...guard.params, limit],
 			options,
 		);
 		const currentGuard = await authorize(
@@ -329,6 +364,7 @@ export function createCommunicationTargetReader(
 			handle: row.handle == null ? null : String(row.handle),
 			status: String(row.status),
 			...(row.alias ? { aliases: [String(row.alias)] } : {}),
+			...(selector ? { selectorRank: Number(row.selector_rank) } : {}),
 		}));
 	};
 }
