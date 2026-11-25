@@ -480,7 +480,7 @@ export function buildPretextDocumentLayout(
 	 * 展开身份 —— 「点开 pill 能看到这一轮干了什么，并能逐张展开」才成立。
 	 * 代价只在**点开的那一刻**：折叠着的时候成本与以前完全一样（都是一行常量高度）。
 	 */
-	const roundFoldingActive = options.roundFold?.enabled !== false;
+	const roundFoldingActive = options.roundFold?.enabled === true;
 	const activityGroupingEnabled = options.lod <= 2 && !roundFoldingActive;
 	const renderUnits = groupRenderUnits(segments, activityGroupingEnabled, groupingOptions);
 	const adapterUnits: AdapterRenderUnit[] = renderUnits.map((unit, index) =>

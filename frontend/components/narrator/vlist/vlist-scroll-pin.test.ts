@@ -382,6 +382,9 @@ describe("loaded-history scroll-to-top action", () => {
 				},
 				narratorId: "loaded-top",
 				dataSource: undefined,
+				onPromoteRound: () => {},
+				PAGE_PADDING: 16,
+				renderItemsRef: { current: [] },
 				t: (key: string) => key,
 			});
 			const pendingJump = jump({ domIds: ["missing"], targetIds: ["missing"] });
@@ -498,6 +501,9 @@ describe("loaded-history scroll-to-top action", () => {
 					messageIdFromTarget: (id: string) => id,
 					resolveJumpTargetSeq: async () => null,
 					dataSource: undefined,
+					onPromoteRound: () => {},
+					PAGE_PADDING: 16,
+					renderItemsRef: { current: [] },
 					t: (key: string) => key,
 				});
 				expect(await jump({ domIds: ["missing"], targetIds: ["missing"] })).toBe(false);
@@ -1020,7 +1026,9 @@ describe("upward scroll intent loads older history without a wheel event", () =>
 			source.indexOf("const revealMounted = () =>"),
 			source.indexOf("const revealByLayout = async"),
 		);
-		expect(reveal).toContain("writeScrollTop(jumpTargetScrollTop(node, element))");
+		expect(reveal).toContain(
+			"writeScrollTop(jumpTargetScrollTop(node, element, { align, topPadding: PAGE_PADDING }))",
+		);
 		expect(reveal).not.toContain("element.scrollIntoView(");
 	});
 });

@@ -1,6 +1,7 @@
 import { narratorsApi } from "@frontend/lib/api/narrators";
 import type { PretextDocumentPageResult, TreeMessage } from "@frontend/lib/api/types";
 import { narratorLoadingMetrics } from "@frontend/lib/narrator-loading-metrics";
+import type { NarratorRoundsPage } from "@shared/narrator-rounds";
 import { isNestedRow } from "../message/nested-rows";
 import { peekCachedPretextDocument } from "./pretext-document-cache";
 import { onPretextSessionChange, pretextSessionEpoch } from "./pretext-session-scope";
@@ -63,6 +64,8 @@ export interface PretextDocumentInput {
 	oldestLoadedSeq: number | null;
 	/** More (older) top-level messages exist above the loaded window. */
 	hasPrev: boolean;
+	/** Optional initial round index piggybacked on tail load to avoid an extra cold-start HTTP request. */
+	rounds?: NarratorRoundsPage;
 }
 
 const DEFAULT_PAGE_SIZE = 100;
@@ -247,6 +250,7 @@ function sharedTail(
 					messageVersion: page.messageVersion,
 					oldestLoadedSeq: oldestSeqOf(page.messages),
 					hasPrev: page.hasPrev,
+					...(page.rounds ? { rounds: page.rounds } : {}),
 				};
 			} catch (error) {
 				dropTail(request);

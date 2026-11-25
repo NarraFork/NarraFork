@@ -31,10 +31,10 @@ describe("整轮折叠 vs activity 分组", () => {
 		expect(source).toMatch(/groupRenderUnits\(segments,\s*activityGroupingEnabled/);
 	});
 
-	it("折叠是否生效只看开关，不看档位（档位不影响折叠）", async () => {
+	it("折叠是否生效只看显式传入的开关，不看档位（未传 roundFold 的调用方保持原有 L1/L2 分组）", async () => {
 		const source = await readLayoutSource();
-		// enabled === false 才是「读者关掉了」；缺省（undefined）按开启处理。
-		expect(source).toMatch(/roundFoldingActive\s*=\s*options\.roundFold\?\.enabled\s*!==\s*false/);
+		// 只有显式传了 `roundFold: { enabled: true }` 才算折叠生效；缺省 = 不折叠。
+		expect(source).toMatch(/roundFoldingActive\s*=\s*options\.roundFold\?\.enabled\s*===\s*true/);
 	});
 });
 

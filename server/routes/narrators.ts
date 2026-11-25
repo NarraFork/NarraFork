@@ -425,6 +425,7 @@ import {
 	requireSqliteLazyRefsBackfill,
 	resolveLazyLineage,
 } from "../services/narrator-refs-backfill";
+import { listNarratorRounds } from "../services/narrator-rounds";
 import { previewNarratorScopedForToolUses } from "../services/narrator-scoped-revert";
 import {
 	handleBashCommand,
@@ -4511,8 +4512,15 @@ narratorRoutes.get("/:id/pretext-document", async (c) => {
 		narratorSurfaceReadOptions({ signal: c.req.raw.signal }),
 	);
 	if (!narratorMeta) throw new NotFoundError("Narrator", id);
+	const isInitialTail = beforeSeq === undefined && afterSeq === undefined;
+	const rounds = isInitialTail
+		? await listNarratorRounds(id, { limit: 200, signal: c.req.raw.signal })
+		: undefined;
 	// Envelopes + blocks (§8.1); the page says so (`protocol: 2`).
-	return c.json(toBlockPage(result));
+	return c.json({
+		...toBlockPage(result),
+		...(rounds ? { rounds } : {}),
+	});
 });
 
 // Resolve a message id to the document coordinate the exact-layout list jumps to.

@@ -183,34 +183,39 @@ export function RoundRail({
 	const containerRef = React.useRef<HTMLDivElement>(null);
 	const railRef = React.useRef<HTMLButtonElement>(null);
 	const viewportRef = React.useRef<HTMLSpanElement>(null);
+	const pickerListRef = React.useRef<HTMLDivElement>(null);
 	const tickRefs = React.useRef<Array<HTMLSpanElement | null>>([]);
 
-	// 无悬停形态（触屏 / 极窄）：点开就地展开的列表。
+	// 无悬停形态（触屏 / 极窄 / 键盘）：点开就地展开的列表。
 	const [open, setOpen] = React.useState(false);
 	const [hoverSeq, setHoverSeq] = React.useState<number | null>(null);
+	const [hoverPos, setHoverPos] = React.useState<{ left: number; top: number }>({
+		left: 22,
+		top: 0,
+	});
 	const [capacity, setCapacity] = React.useState(24);
 	const [railStart, setRailStart] = React.useState(Number.MAX_SAFE_INTEGER);
 	const closeTimerRef = React.useRef<number | null>(null);
 	const wheelAccumRef = React.useRef(0);
+	const wasOpenRef = React.useRef(false);
 
 	const hasRounds = rounds.length > 0;
 
 	// ── 可用高度 → 容量 ──
+	// 观测外层 `[data-round-rail-bounds]`（滚动视口）的高度，而不是观测轨体自身：
+	// 轨体垂直居中（`translateY(-50%)`），用 `bottom - rect.top` 观测自身会造成
+	// 扩容 → `rect.top` 上移 → 可用高度变大的正反馈循环，也会在分屏下窗格溢出。
 	React.useLayoutEffect(() => {
 		if (!hasRounds) return;
+		const bounds = containerRef.current?.closest<HTMLElement>("[data-round-rail-bounds]");
 		const measure = () => {
-			const viewport = viewportRef.current;
-			if (!viewport) return;
-			const rect = viewport.getBoundingClientRect();
-			const bounds = containerRef.current?.closest<HTMLElement>("[data-round-rail-bounds]");
-			const bottom = bounds ? bounds.getBoundingClientRect().bottom : window.innerHeight;
-			const available = bottom - rect.top;
+			const available = bounds ? bounds.clientHeight : window.innerHeight;
 			const next = railCapacity(available);
 			setCapacity((current) => (current === next ? current : next));
 		};
 		measure();
 		const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(measure);
-		if (observer && viewportRef.current) observer.observe(viewportRef.current);
+		if (observer && bounds) observer.observe(bounds);
 		window.addEventListener("resize", measure);
 		return () => {
 			observer?.disconnect();
@@ -246,17 +251,39 @@ export function RoundRail({
 	}, [cancelHoverClose]);
 	React.useEffect(() => cancelHoverClose, [cancelHoverClose]);
 
+	const closePicker = React.useCallback((restoreFocus: boolean) => {
+		setOpen(false);
+		setHoverSeq(null);
+		if (restoreFocus) {
+			window.requestAnimationFrame(() => railRef.current?.focus());
+		}
+	}, []);
+
 	React.useEffect(() => {
 		if (!open && hoverSeq === null) return;
 		const onKey = (event: KeyboardEvent) => {
 			if (event.key === "Escape") {
-				setOpen(false);
-				setHoverSeq(null);
+				closePicker(open);
 			}
 		};
 		window.addEventListener("keydown", onKey);
 		return () => window.removeEventListener("keydown", onKey);
-	}, [open, hoverSeq]);
+	}, [open, hoverSeq, closePicker]);
+
+	// 打开选择器时一次性把当前轮滚进视野并移交焦点；不放到内联 ref 回调里，
+	// 避免在弹层内点收藏触发重渲染时把滚动位置拉回当前轮。
+	React.useEffect(() => {
+		const prevOpen = wasOpenRef.current;
+		wasOpenRef.current = open;
+		if (!open || prevOpen) return;
+		const list = pickerListRef.current;
+		if (!list) return;
+		const target =
+			list.querySelector<HTMLButtonElement>("[data-round-card-active='1']") ??
+			list.querySelector<HTMLButtonElement>("[data-round-card-select='1']");
+		target?.scrollIntoView({ block: "center" });
+		target?.focus();
+	}, [open]);
 
 	/** 指针 y → 窗口内哪一轮（只看露出的横条）。 */
 	const nearestTickAt = React.useCallback(
@@ -296,6 +323,14 @@ export function RoundRail({
 	const hoverIndex = hoverSeq === null ? -1 : rounds.findIndex((r) => r.seq === hoverSeq);
 	const shownHover = hoverIndex >= 0 ? rounds[hoverIndex] : undefined;
 
+	// 在 layout effect 中测量悬停卡片位置，避免在 render 期调用 getBoundingClientRect 触发同步回流。
+	React.useLayoutEffect(() => {
+		if (!shownHover || open) return;
+		const left = railRef.current ? railRef.current.getBoundingClientRect().width + 6 : 22;
+		const top = pickerCardTopForRow(containerRef.current, tickRefs.current[hoverIndex], 60);
+		setHoverPos((prev) => (prev.left === left && prev.top === top ? prev : { left, top }));
+	}, [shownHover, hoverIndex, open]);
+
 	if (!shouldShowRoundRail(rounds.length)) return null;
 
 	return (
@@ -304,6 +339,8 @@ export function RoundRail({
 				ref={railRef}
 				type="button"
 				aria-label={labels.rail}
+				aria-expanded={open}
+				aria-haspopup="listbox"
 				title={hoverSeq === null ? labels.railTitle(rounds.length) : undefined}
 				onPointerMove={(event) => {
 					if (event.pointerType !== "mouse" || open) return;
@@ -316,14 +353,15 @@ export function RoundRail({
 					if (event.pointerType === "mouse") scheduleHoverClose();
 				}}
 				onClick={(event) => {
-					// 触屏 / 窄屏：点轨道任何位置都弹滚动列表，不再按落点直接跳——
-					// 细横条指头点不准，而且触摸没有 hover 先看清再跳的机会。
-					if (tapToOpen) {
+					// 触屏 / 窄屏，或键盘/辅助技术激活（`event.detail === 0` 且无指针坐标）：
+					// 先走选择器弹层，绝不能把无坐标激活送进 `nearestTickAt(0)` 误跳第一根刻度。
+					if (tapToOpen || event.detail === 0) {
+						cancelHoverClose();
 						setHoverSeq(null);
-						setOpen(true);
+						setOpen((value) => !value);
 						return;
 					}
-					// 桌面：点哪根跳哪轮，落点只认指针位置（不读 hover —— 它可能还是
+					// 桌面指针点击：点哪根跳哪轮，落点只认指针位置（不读 hover —— 它可能还是
 					// 上一次渲染的值，快速移过来点会跳到上一个悬停的轮）。
 					const tick = nearestTickAt(event.clientY);
 					if (tick >= 0) {
@@ -335,7 +373,6 @@ export function RoundRail({
 						jumpTo(shownHover);
 						return;
 					}
-					// 触屏 / 键盘：展开列表。
 					setHoverSeq(null);
 					setOpen((value) => !value);
 				}}
@@ -347,7 +384,6 @@ export function RoundRail({
 					border: "none",
 					background: "transparent",
 					cursor: "pointer",
-					outline: "none",
 					visibility: open ? "hidden" : "visible",
 				}}
 			>
@@ -388,9 +424,6 @@ export function RoundRail({
 										style={{
 											height: TICK_HEIGHT_PX,
 											borderRadius: 999,
-											// 三态宽度：普通 / 指着 / 当前轮。上限 14px 是因为轨道
-											// 现在内置在对话列左槽里（gutter 只有 16px），再宽就会
-											// 压到正文。Vantaloom 那边左槽更宽所以能到 20px。
 											width: active ? 14 : pointed ? 12 : 8,
 											background: active
 												? "var(--mantine-color-text)"
@@ -419,7 +452,7 @@ export function RoundRail({
 				</span>
 			</button>
 
-			{/* 悬停摘要卡：中线对准指着的那根横条，到屏幕边缘夹住。 */}
+			{/* 悬停摘要卡：中线对准指着的那根横条，到屏幕边缘夹住，点击直接跳转到该轮。 */}
 			{shownHover && !open ? (
 				<div
 					onPointerEnter={cancelHoverClose}
@@ -436,8 +469,8 @@ export function RoundRail({
 					}}
 					style={{
 						position: "absolute",
-						left: railRef.current ? railRef.current.getBoundingClientRect().width + 6 : 22,
-						top: pickerCardTopForRow(containerRef.current, tickRefs.current[hoverIndex], 60),
+						left: hoverPos.left,
+						top: hoverPos.top,
 						width: 280,
 						zIndex: 50,
 					}}
@@ -448,6 +481,7 @@ export function RoundRail({
 						ordinal={hoverIndex + 1}
 						total={rounds.length}
 						favorited={favorites.has(shownHover.seq)}
+						onSelect={() => jumpTo(shownHover)}
 						onToggleFavorite={onToggleFavorite}
 						labels={labels}
 					/>
@@ -459,21 +493,20 @@ export function RoundRail({
 					<div
 						style={{ position: "fixed", inset: 0, zIndex: 40 }}
 						aria-hidden="true"
-						onClick={() => setOpen(false)}
+						onClick={() => closePicker(true)}
 					/>
 					<div
-						ref={(el) => {
-							// 打开就把当前轮滚进视野：这弹层不是焦点陷阱，mount 即滚安全。
-							el?.querySelector("[data-round-card-active='1']")?.scrollIntoView({
-								block: "center",
-							});
-						}}
+						ref={pickerListRef}
+						role="listbox"
+						aria-label={labels.rail}
 						style={{
 							position: "absolute",
-							left: 0,
-							top: 0,
+							left: 6,
+							top: "50%",
+							transform: "translateY(-50%)",
 							zIndex: 50,
 							width: 300,
+							maxWidth: "calc(100vw - 24px)",
 							maxHeight: RAIL_LIST_MAX_HEIGHT_PX,
 							overflowY: "auto",
 							overflowX: "hidden",
@@ -489,31 +522,17 @@ export function RoundRail({
 						}}
 					>
 						{rounds.map((round, index) => (
-							<button
+							<RoundCard
 								key={round.seq}
-								type="button"
-								data-round-card-active={index === activeIndex ? "1" : undefined}
-								onClick={() => jumpTo(round)}
-								style={{
-									display: "block",
-									width: "100%",
-									padding: 0,
-									border: "none",
-									background: "transparent",
-									textAlign: "left",
-									cursor: "pointer",
-								}}
-							>
-								<RoundCard
-									round={round}
-									active={index === activeIndex}
-									ordinal={index + 1}
-									total={rounds.length}
-									favorited={favorites.has(round.seq)}
-									onToggleFavorite={onToggleFavorite}
-									labels={labels}
-								/>
-							</button>
+								round={round}
+								active={index === activeIndex}
+								ordinal={index + 1}
+								total={rounds.length}
+								favorited={favorites.has(round.seq)}
+								onSelect={() => jumpTo(round)}
+								onToggleFavorite={onToggleFavorite}
+								labels={labels}
+							/>
 						))}
 					</div>
 				</>
@@ -522,13 +541,14 @@ export function RoundRail({
 	);
 }
 
-/** 单个轮次条目：原话（加粗）+ 时长/token + 收藏。窄屏抽屉列表同样复用它。 */
+/** 单个轮次条目：原话（加粗）+ 时长/token + 收藏。避免嵌套 `<button>`，主操作与收藏按钮平级。 */
 export function RoundCard({
 	round,
 	active,
 	ordinal,
 	total,
 	favorited,
+	onSelect,
 	onToggleFavorite,
 	labels,
 }: {
@@ -537,29 +557,13 @@ export function RoundCard({
 	ordinal: number;
 	total: number;
 	favorited: boolean;
+	onSelect?: () => void;
 	onToggleFavorite?: (seq: number) => void;
 	labels: RoundRailLabels;
 }) {
 	const summary = formatRoundMeta(round, labels.pendingReply);
-	return (
-		<div
-			style={{
-				display: "flex",
-				alignItems: "center",
-				gap: 8,
-				padding: "6px 8px",
-				minWidth: 0,
-				// ⚠️ 必须有**不透明**背景：卡片浮在正文之上，纯透明会让文字和下面的
-				// 消息正文叠在一起完全看不清（实测就是这样）。`body` 是主题里
-				// 不透明的那一档，`default` / `default-hover` 都带透明通道。
-				background: "var(--mantine-color-body)",
-				border: "1px solid var(--mantine-color-default-border)",
-				borderRadius: 8,
-				boxShadow: "0 6px 20px rgba(0, 0, 0, 0.28)",
-				...(active ? { borderColor: "var(--mantine-color-text)" } : {}),
-				cursor: "pointer",
-			}}
-		>
+	const bodyContent = (
+		<>
 			<span
 				aria-hidden="true"
 				style={{
@@ -591,8 +595,7 @@ export function RoundCard({
 				>
 					{round.userText || labels.emptyRound}
 				</span>
-				{/* 回复缩略：与 Vantaloom 一致地给出「AI 答了什么」的那一眼。
-				    只有两行 —— 它是确认用的，不是用来读的。 */}
+				{/* 回复缩略：给出「AI 答了什么」的那一眼。只有两行 —— 它是确认用的，不是用来读的。 */}
 				{round.replyPreview ? (
 					<span
 						style={{
@@ -622,10 +625,64 @@ export function RoundCard({
 					</span>
 				) : null}
 			</span>
+		</>
+	);
+	return (
+		<div
+			style={{
+				display: "flex",
+				alignItems: "center",
+				gap: 8,
+				padding: "6px 8px",
+				minWidth: 0,
+				// ⚠️ 必须有**不透明**背景：卡片浮在正文之上，纯透明会让文字和下面的
+				// 消息正文叠在一起完全看不清（实测就是这样）。`body` 是主题里
+				// 不透明的那一档，`default` / `default-hover` 都带透明通道。
+				background: "var(--mantine-color-body)",
+				border: "1px solid var(--mantine-color-default-border)",
+				borderRadius: 8,
+				boxShadow: "0 6px 20px rgba(0, 0, 0, 0.28)",
+				...(active ? { borderColor: "var(--mantine-color-text)" } : {}),
+			}}
+		>
+			{onSelect ? (
+				<button
+					type="button"
+					data-round-card-select="1"
+					data-round-card-active={active ? "1" : undefined}
+					onClick={onSelect}
+					style={{
+						display: "flex",
+						alignItems: "center",
+						gap: 8,
+						flex: 1,
+						minWidth: 0,
+						padding: 0,
+						border: "none",
+						background: "transparent",
+						color: "inherit",
+						textAlign: "left",
+						cursor: "pointer",
+					}}
+				>
+					{bodyContent}
+				</button>
+			) : (
+				<div
+					style={{
+						display: "flex",
+						alignItems: "center",
+						gap: 8,
+						flex: 1,
+						minWidth: 0,
+					}}
+				>
+					{bodyContent}
+				</div>
+			)}
 			{onToggleFavorite ? (
 				<button
 					type="button"
-					tabIndex={-1}
 					aria-pressed={favorited}
 					aria-label={favorited ? labels.unfavorite : labels.favorite}
 					onClick={(event) => {

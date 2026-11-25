@@ -69,40 +69,13 @@ export function buildPretextLayoutManifest(
 ): BuiltPretextLayoutManifest {
 	const computed = computeVListLayout(options.renderUnits, options);
 
-	// 整轮折叠（运行期合成）：把已完成的轮里「轮首之后 → 最终回复之前」的元素序列
-	// 换成一个 `round-group` 元素。
-	//
-	// 放在这里而不是 adapter 里，是因为这是唯一既能看见全部已测元素、又还在
-	// geometry 之前的位置：折叠条的高度是常量（measure 层给出），不会改变任何
-	// 其他元素的高度，因此后面的 key 去重 / 间隙 / 引擎布局全部照常进行。
-	//
-	// 关闭时（L6 / 设置关掉 / 没有任何可折的轮）`composeRoundGroups` 返回原数组
-	// 引用，本步骤零成本。
-	let foldedItems: typeof computed.items = computed.items;
-	if (options.roundFold) {
-		foldedItems = composeRoundGroups(
-			computed.items,
-			options.roundFold,
-		) as unknown as typeof computed.items;
-	}
-	const computedWithFolds = { ...computed, items: foldedItems };
-
-	// Deduplicate item keys: provider retries can produce identical tool_use IDs
-	// across adjacent assistant messages, leading to duplicate spec.key values.
-	// We disambiguate in-place so both sources[].itemKey and item.spec.key stay in sync.
-	//
-	// `unitId` is suffixed with the SAME index, because it is the cross-level morph
-	// identity (`unitId ?? key`, see vlist-lod-morph.ts) and the low-LOD side already
-	// disambiguates a retry on its own: the activity fold appends `#<n>` via
-	// `dedupeSuffix` (segment-adapter), giving rows `tool-x` and `tool-x#1`. Leaving
-	// the two cards here both claiming a bare `tool-x` made the retry's SECOND call
-	// unpairable — the planner keys on a Map, so the duplicate collapsed and one card
-	// silently lost its animation. Suffixing keeps the two sides symmetric.
-	//
-	// The suffix must match the fold's (`#1` for the second copy), not `#dup1`: these
-	// are two renderings of one call and the strings have to be equal to pair.
+	// Deduplicate item keys BEFORE round folding: provider retries can produce
+	// identical tool_use IDs across adjacent assistant messages, leading to duplicate
+	// spec.key values. Doing this before `composeRoundGroups` ensures folded children
+	// inside a `round-group` preview also have unique React keys and distinct toggle
+	// identities, while keeping top-level items symmetric with the activity fold's `#n`.
 	const keyCounts = new Map<string, number>();
-	for (const item of computedWithFolds.items) {
+	for (const item of computed.items) {
 		const key = item.spec.key;
 		const prev = keyCounts.get(key) ?? 0;
 		if (prev > 0) {
@@ -114,6 +87,65 @@ export function buildPretextLayoutManifest(
 		keyCounts.set(key, prev + 1);
 	}
 
+	// Resolve source metadata (sourceMessageIds, firstSeq, lastSeq) BEFORE round
+	// folding, in original item order. Otherwise a synthesized `round-group` key
+	// (`roundgroup-*`) misses `resolveSource` and falls back to an unrelated message
+	// by folded array index, corrupting `firstSeq` and losing search targets inside
+	// the folded range.
+	const resolvedSourceByItem = new Map<VListItem, PretextLayoutSource>();
+	for (let index = 0; index < computed.items.length; index++) {
+		const item = computed.items[index];
+		if (!item) throw new Error(`pretext produced an empty layout item at index ${index}`);
+		resolvedSourceByItem.set(item, options.resolveSource(item.spec, index, item));
+	}
+
+	// 整轮折叠（运行期合成）：把已完成的轮里「轮首之后 → 最终回复之前」的元素序列
+	// 换成一个 `round-group` 元素。
+	//
+	// 关闭时（设置关掉 / 没有任何可折的轮）`composeRoundGroups` 返回原数组引用，零成本。
+	let foldedItems: typeof computed.items = computed.items;
+	if (options.roundFold) {
+		foldedItems = composeRoundGroups(
+			computed.items,
+			options.roundFold,
+		) as unknown as typeof computed.items;
+	}
+	const computedWithFolds = { ...computed, items: foldedItems };
+
+	const resolveFoldedSource = (item: VListItem, index: number): PretextLayoutSource => {
+		const preResolved = resolvedSourceByItem.get(item);
+		if (preResolved) return preResolved;
+		if (item.spec.kind === "round-group") {
+			const folded = (item.spec.data as { folded?: readonly VListItem[] } | undefined)?.folded;
+			if (Array.isArray(folded) && folded.length > 0) {
+				const seenIds = new Set<string>();
+				const sourceMessageIds: string[] = [];
+				let firstSeq = Number.POSITIVE_INFINITY;
+				let lastSeq = Number.NEGATIVE_INFINITY;
+				for (const child of folded) {
+					const childSource = resolvedSourceByItem.get(child);
+					if (!childSource) continue;
+					if (Number.isFinite(childSource.firstSeq) && childSource.firstSeq < firstSeq) {
+						firstSeq = childSource.firstSeq;
+					}
+					if (Number.isFinite(childSource.lastSeq) && childSource.lastSeq > lastSeq) {
+						lastSeq = childSource.lastSeq;
+					}
+					for (const id of childSource.sourceMessageIds) {
+						if (!seenIds.has(id)) {
+							seenIds.add(id);
+							sourceMessageIds.push(id);
+						}
+					}
+				}
+				if (sourceMessageIds.length > 0 && Number.isFinite(firstSeq) && Number.isFinite(lastSeq)) {
+					return { firstSeq, lastSeq, sourceMessageIds };
+				}
+			}
+		}
+		return options.resolveSource(item.spec, index, item);
+	};
+
 	// A wider gap is applied only at top-level boundaries: the boundary AFTER an
 	// item whose NEXT item begins a new render unit (spec.unitStart). Intra-unit
 	// boundaries (content blocks within a message, cards within a tool-run) keep
@@ -123,7 +155,7 @@ export function buildPretextLayoutManifest(
 	const widenBoundaries = segmentGap !== undefined && segmentGap !== baseGap;
 	const sources: MeasuredPretextSource[] = computedWithFolds.items.map((item, index) => {
 		if (!item) throw new Error(`pretext produced an empty layout item at index ${index}`);
-		const source = options.resolveSource(item.spec, index, item);
+		const source = resolveFoldedSource(item, index);
 		const nextItem = computedWithFolds.items[index + 1];
 		// A visual card run wins over a logical segment boundary: native search /
 		// generation split tool segments, but their cards share the same surface.

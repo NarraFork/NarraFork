@@ -696,7 +696,7 @@ describe("groupRenderUnits (L1/L2 unified activity fold)", () => {
 					createdAt: "2026-07-19T00:00:00.000Z",
 				},
 				[{ type: "reasoning", text: "weighing the options" }],
-		) as unknown as NarratorMsg;
+			) as unknown as NarratorMsg;
 
 		const liveUnits = groupRenderUnits(segmentMessages([reasoningMessage("__streaming__")]), true);
 		const persistedUnits = groupRenderUnits(segmentMessages([reasoningMessage("real-id")]), true);
@@ -978,9 +978,13 @@ describe("轮首保持独立 segment（整轮折叠前提）", () => {
 		) as unknown as NarratorMsg;
 
 	test("user 消息在 compactAuxiliaryContent 下仍是独立 segment", () => {
-		const units = groupRenderUnits(segmentMessages([taskRow()], { compactAuxiliaryContent: true }), true, {
-			compactAuxiliaryContent: true,
-		});
+		const units = groupRenderUnits(
+			segmentMessages([taskRow()], { compactAuxiliaryContent: true }),
+			true,
+			{
+				compactAuxiliaryContent: true,
+			},
+		);
 		expect(units.map((unit) => unit.kind)).toEqual(["segment"]);
 	});
 

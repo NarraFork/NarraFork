@@ -997,11 +997,13 @@ export const ExactRow = memo(
 				| undefined;
 			const roundKey = specData?.roundKey ?? "";
 			const folded = specData?.folded;
-			extra.roundGroupOpen = roundPreviewOpen?.has(roundKey) === true;
+			const isPreviewOpen = roundPreviewOpen?.has(roundKey) === true;
+			extra.roundGroupOpen = isPreviewOpen;
 			extra.onToggle =
 				roundKey && onToggleRoundPreview ? () => onToggleRoundPreview(roundKey) : undefined;
 			extra.onPromote = roundKey && onPromoteRound ? () => onPromoteRound(roundKey) : undefined;
-			if (Array.isArray(folded) && folded.length > 0) {
+			// 收起态不遍历、不重测、不构建子树：折叠的开销只在点开预览的那一刻发生。
+			if (isPreviewOpen && Array.isArray(folded) && folded.length > 0) {
 				extra.children = (
 					<>
 						{(folded as Array<{ spec: ElementSpec; measured: MeasuredElement }>).map((child) => {
@@ -1010,6 +1012,11 @@ export const ExactRow = memo(
 							// 子卡片看起来完全没反应（实测：工具卡点不开）。
 							const childToggles = getTogglesForKey?.(child.spec.key);
 							const childExtra = resolveRenderExtra(child.spec);
+							injectRenderLabels(child.spec.kind, childExtra, renderLabels);
+							childExtra.narratorId = narratorId;
+							if (child.spec.kind === "communication-bubble" && resolveToolDetailStatus) {
+								childExtra.resolveToolDetailStatus = resolveToolDetailStatus;
+							}
 							if (childToggles) {
 								// 与主路径一致：可折叠卡片种类才接 onToggle（见
 								// `TOGGLEABLE_CARD_KINDS` 的绑定）。其余种类不吃这个键，
@@ -1020,24 +1027,19 @@ export const ExactRow = memo(
 								if (TRACE_KINDS.has(child.spec.kind)) {
 									childExtra.onToggleItems = childToggles.onToggleItems;
 									childExtra.onToggleEarlier = childToggles.onToggleEarlier;
+									const foldByKey = traceRowFoldChannel(child.spec.kind) === "key";
+									childExtra.onToggleRow = foldByKey
+										? (rowIndex: number, rowKey?: string) =>
+												childToggles.onToggleRow(rowIndex, rowKey)
+										: (rowIndex: number) => childToggles.onToggleRow(rowIndex);
 								}
 								if (child.spec.kind === "reasoning") {
 									childExtra.onToggleTranslation = childToggles.onToggleTranslation;
 								}
 							}
 							// ⚠️ 几何必须按**当前**展开态重算，不能用 `folded` 里的快照。
-							//
-							// 折进 `spec.data.folded` 的是折叠那一刻的 `measured` —— 那时读者
-							// 还没打开这张卡，所以它是收起态。渲染层（`RenderToolCall` 等）从
-							// `measured.expanded` 取形态，快照不变就永远画收起态：点击让
-							// `aria-expanded` 翻转了，卡片却纹丝不动（实测就是这样）。
-							//
-							// 顶层元素没有这个问题，因为它们每次交互变化都会走
-							// 「重建 → 重测」链路；折叠内的元素已从顶层序列移走，那条链路
-							// 不再覆盖它们，只能在这里补一次。
 							const remeasured = remeasureFoldedChild?.(child.spec, child.measured);
-							// 登记必须在渲染期同步完成：`onToggle` 是点击时才跑的，
-							// 那时再登记就已经晚了一步（它要读的正是这张表）。
+							// 登记必须在渲染期同步完成：`onToggle` / `onToggleItems` 在点击时读取。
 							registerFoldedChild?.(
 								child.spec.key,
 								remeasured ?? child.measured,
@@ -1228,6 +1230,9 @@ export const ExactRow = memo(
 		prev.getTogglesForKey === next.getTogglesForKey &&
 		prev.remeasureFoldedChild === next.remeasureFoldedChild &&
 		prev.registerFoldedChild === next.registerFoldedChild &&
+		prev.roundPreviewOpen === next.roundPreviewOpen &&
+		prev.onToggleRoundPreview === next.onToggleRoundPreview &&
+		prev.onPromoteRound === next.onPromoteRound &&
 		prev.renderLabels === next.renderLabels &&
 		prev.resolveToolDetailStatus === next.resolveToolDetailStatus &&
 		prev.interaction === next.interaction &&

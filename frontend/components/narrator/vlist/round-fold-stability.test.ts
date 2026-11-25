@@ -60,7 +60,7 @@ describe("折叠配置的引用必须稳定", () => {
 		// 用量表变了但 useMemo 不重算，折叠条就会停在旧时长 / 旧 token 上。
 		// isSubagent 同在依赖里：它决定切轮判据，切换会话类型必须重建。
 		expect(source).toMatch(
-			/\[roundFoldingEnabled, isSubagent, roundPinnedOpen, roundPreviewOpen, roundUsageByMessageId\]/,
+			/\[\s*roundFoldingEnabled,\s*isSubagent,\s*roundPinnedOpen,\s*roundPreviewOpen,\s*roundUsageByMessageId,\s*t,?\s*\]/,
 		);
 	});
 });

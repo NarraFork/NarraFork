@@ -14,7 +14,7 @@
  */
 
 import { narratorRoundsApi } from "@frontend/lib/api/narrator-rounds";
-import type { NarratorRound } from "@shared/narrator-rounds";
+import type { NarratorRound, NarratorRoundsPage } from "@shared/narrator-rounds";
 import { useQuery } from "@tanstack/react-query";
 import * as React from "react";
 
@@ -33,18 +33,38 @@ export const narratorRoundsQueryKey = (narratorId: string) =>
  */
 const EMPTY_ROUNDS: NarratorRound[] = [];
 
+export interface UseNarratorRoundsOptions {
+	/** 门控：聊天室 / 公开分享页 / 挂起态（suspended）必须传 false，绝不发无关请求。 */
+	enabled?: boolean;
+	/** 随首屏 `pretext-document` 搭便车带回的轮次索引，避免冷启动多一次 HTTP 请求。 */
+	seedPage?: NarratorRoundsPage;
+	/** 首屏 `pretext-document` 仍在加载时暂缓独立 `/rounds` 请求，等搭便车结果落地。 */
+	waitForSeed?: boolean;
+}
+
 /**
  * 拉取轮次索引。
  *
- * `staleTime: Infinity` + 显式 invalidate：轮次集合只在「有新的一轮」或「有轮
- * 收尾（拿到回复时间）」时变，那两件事由调用方在合适时机 invalidate，比每次
- * 挂载都重取更省。
+ * `staleTime: Infinity` + 显式 invalidate：轮次集合只在「有新的一轮 / 编辑 / 删除 /
+ * 回复收尾」时变，由调用方在合适时机 invalidate，比每次挂载都重取更省。
  */
-export function useNarratorRounds(narratorId: string | undefined) {
+export function useNarratorRounds(
+	narratorId: string | undefined,
+	options?: UseNarratorRoundsOptions,
+) {
+	const enabledFlag = options?.enabled ?? true;
+	const seedPage = options?.seedPage;
+	const waitForSeed = options?.waitForSeed === true;
+	const seedUpdatedAt = React.useMemo(() => (seedPage ? Date.now() : undefined), [seedPage]);
+	const queryEnabled =
+		Boolean(narratorId) && enabledFlag && (!waitForSeed || seedPage !== undefined);
+
 	const query = useQuery({
 		queryKey: narratorRoundsQueryKey(narratorId ?? ""),
 		queryFn: () => narratorRoundsApi.rounds(narratorId!, { limit: ROUNDS_PAGE_SIZE }),
-		enabled: Boolean(narratorId),
+		enabled: queryEnabled,
+		initialData: seedPage,
+		initialDataUpdatedAt: seedUpdatedAt,
 		staleTime: Number.POSITIVE_INFINITY,
 		// 索引取不到不该把轨道变成错误态：空轮次表让轨道自己隐藏。
 		retry: false,

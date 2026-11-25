@@ -496,4 +496,118 @@ describe("listNarratorRounds", () => {
 		expect(rounds).toHaveLength(1);
 		expect(rounds[0]!.messageId).not.toBe("other_msg");
 	});
+
+	test("超长会话触达 maxReplyRowsScanned 上限时：最新轮完整，截断的旧轮省略不完整 token", async () => {
+		insertMessage({
+			role: "user",
+			origin: "user",
+			text: "第一轮",
+			createdAt: "2026-01-01T00:00:00.000Z",
+			seq: 1,
+		});
+		insertMessage({
+			role: "assistant",
+			text: "旧轮中间步",
+			createdAt: "2026-01-01T00:01:00.000Z",
+			seq: 2,
+			tokensIn: 500,
+			outputTokens: 100,
+		});
+		insertMessage({
+			role: "assistant",
+			text: "旧轮结论",
+			createdAt: "2026-01-01T00:02:00.000Z",
+			seq: 3,
+			tokensIn: 600,
+			outputTokens: 150,
+		});
+		insertMessage({
+			role: "user",
+			origin: "user",
+			text: "第二轮",
+			createdAt: "2026-01-01T00:10:00.000Z",
+			seq: 4,
+		});
+		insertMessage({
+			role: "assistant",
+			text: "最新轮结论",
+			createdAt: "2026-01-01T00:11:00.000Z",
+			seq: 5,
+			tokensIn: 200,
+			outputTokens: 50,
+		});
+
+		// 只允许扫 2 条 assistant（倒序扫到 seq 5 和 seq 3，seq 2 被截断）
+		const { rounds } = await listNarratorRounds(NARRATOR, {
+			limit: 50,
+			maxReplyRowsScanned: 2,
+		});
+		expect(rounds).toHaveLength(2);
+		// 第二轮完整
+		expect(rounds[1]!.replyPreview).toBe("最新轮结论");
+		expect(rounds[1]!.tokens).toBe(250);
+		// 第一轮拿到了最新回复时间与缩略，但因 seq 2 未扫到而省略不完整的 token
+		expect(rounds[0]!.replyPreview).toBe("旧轮结论");
+		expect(rounds[0]!.repliedAt).toBe(Date.parse("2026-01-01T00:02:00.000Z"));
+		expect(rounds[0]!.tokens).toBeUndefined();
+	});
+
+	test("纯空白超长回复不会被误判为省略号缩略", async () => {
+		insertMessage({
+			role: "user",
+			origin: "user",
+			text: "提问",
+			createdAt: "2026-01-01T00:00:00.000Z",
+			seq: 1,
+		});
+		insertMessage({
+			role: "assistant",
+			text: "真正的回复内容",
+			createdAt: "2026-01-01T00:01:00.000Z",
+			seq: 2,
+		});
+		insertMessage({
+			role: "assistant",
+			text: "   \n\t ".repeat(40),
+			createdAt: "2026-01-01T00:02:00.000Z",
+			seq: 3,
+		});
+
+		const { rounds } = await listNarratorRounds(NARRATOR, { limit: 50 });
+		expect(rounds).toHaveLength(1);
+		expect(rounds[0]!.replyPreview).toBe("真正的回复内容");
+	});
+
+	test("请求被 AbortSignal 取消时立即拒绝", async () => {
+		insertMessage({
+			role: "user",
+			origin: "user",
+			text: "提问",
+			createdAt: "2026-01-01T00:00:00.000Z",
+			seq: 1,
+		});
+		const controller = new AbortController();
+		controller.abort(new Error("cancelled"));
+		await expect(
+			listNarratorRounds(NARRATOR, { limit: 50, signal: controller.signal }),
+		).rejects.toThrow();
+	});
+
+	test("narrator-rounds 路由在 PostgreSQL 准入门前拒绝（与 narrators 路由一致）", async () => {
+		const { readFileSync } = await import("node:fs");
+		const { join } = await import("node:path");
+		const routeSource = readFileSync(
+			join(import.meta.dir, "..", "..", "routes", "narrator-rounds.ts"),
+			"utf8",
+		);
+		const pgGateIndex = routeSource.indexOf("requireSqliteNarratorSurface()");
+		const aclIndex = routeSource.indexOf("requireNarratorAccess(");
+		expect(pgGateIndex).toBeGreaterThan(-1);
+		expect(aclIndex).toBeGreaterThan(pgGateIndex);
+
+		const { requireSqliteNarratorSurface } = await import("../../routes/narrators");
+		expect(() => requireSqliteNarratorSurface("postgres")).toThrow(
+			/not yet supported on the PostgreSQL backend/i,
+		);
+	});
 });

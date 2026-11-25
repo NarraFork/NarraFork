@@ -2503,6 +2503,7 @@ function adaptMessageSpecs(
 				// Only these existing bodies seal on late mount; a new post-catch-up
 				// text lane still gets its ordinary live first-chunk animation.
 				const snapshotBody = streamingMessage && typeof block._streamAnimSnapshotEpoch === "number";
+				const liveMarkdown = isLiveStreamingBlock(streamingMessage, msg, bi);
 				const lifecycleId = contentBlockLifecycleId(block);
 				specs.push({
 					kind,
@@ -2512,7 +2513,10 @@ function adaptMessageSpecs(
 
 					// Missing provenance retains the legacy shape. The render boundary maps
 					// it to explicit null, never inheriting the live narrator's current cwd.
-					...(fileReferenceContext || typeof block.revision === "number" || snapshotBody
+					...(fileReferenceContext ||
+					typeof block.revision === "number" ||
+					snapshotBody ||
+					liveMarkdown
 						? {
 								opts: {
 									...(snapshotBody ? { sealOnMount: true } : {}),
@@ -2520,9 +2524,7 @@ function adaptMessageSpecs(
 									...(typeof block.revision === "number"
 										? { contentRevision: block.revision }
 										: {}),
-									...(isLiveStreamingBlock(streamingMessage, msg, bi)
-										? { streamingContent: true }
-										: {}),
+									...(liveMarkdown ? { streamingContent: true } : {}),
 								},
 							}
 						: {}),

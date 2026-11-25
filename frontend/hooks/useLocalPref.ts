@@ -31,8 +31,7 @@ type Key =
 	// toolbar's detail-level menu (`lodlevel`) is the remaining click entry point.
 	| "narrafork_lod_alt_gesture"
 	// 整轮折叠：一轮拿到最终回复后，把中间的过程折成一条「已处理 2m 14s」。
-	// 默认 ON —— 这是让长会话不冗余的主要来源。关掉之后整轮内联，
-	// 与把详细程度调到 L6 的效果一致（但后者是临时档位，这个是长期偏好）。
+	// 默认 ON —— 与渲染详细程度（LOD 1..5）正交的独立开关。
 	| "narrafork_round_folding"
 	// Unified morph driver (visual-state + single rAF loop) instead of the keyframe
 	// planners. Now DEFAULT ON, after the browser comparison this gate existed for: the

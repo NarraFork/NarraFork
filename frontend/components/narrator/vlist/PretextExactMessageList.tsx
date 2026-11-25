@@ -28,6 +28,7 @@ import { registerIOSScrollToTopTarget } from "@frontend/lib/ios-scroll-to-top";
 import {
 	NARRATOR_COLUMN_GUTTER_PX,
 	NARRATOR_MOBILE_GUTTER_PX,
+	NARRATOR_ROW_GUTTER_PX,
 	narratorColumnPlaceholderStyle,
 	resolveNarratorColumnWidth,
 } from "@frontend/lib/narrator-content-column";
@@ -40,7 +41,7 @@ import {
 import { Anchor, Box, Group, Loader, Text } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import { messageBody } from "@shared/narrator-blocks/message-blocks";
-import type { NarratorRound } from "@shared/narrator-rounds";
+import type { NarratorRound, NarratorRoundsPage } from "@shared/narrator-rounds";
 import { resolveVisibleWindow } from "@shared/pretext-layout";
 import type { MeasuredElement } from "@shared/pretext-layout/prepared-block";
 import { liveTailSignature } from "@shared/pretext-layout/reasoning-live-tail";
@@ -112,6 +113,7 @@ import type { InlinePermissionData } from "./measure/measure-permission";
 import type { MeasuredSubagent } from "./measure/measure-subagent";
 import { type MeasuredToolCall, toolCardInnerWidth } from "./measure/measure-tool-call";
 import type { MeasuredCollapsibleTrace } from "./measure/measure-tool-run";
+import { isStreamingKey } from "./measure-cache";
 import type { RenderLod } from "./prepared-block";
 import {
 	ReasoningTranslationVisibilityContext,
@@ -270,6 +272,7 @@ import {
 	type VListInteractionState,
 } from "./vlist-interaction-state";
 import {
+	type JumpScrollAlign,
 	jumpTargetItemIndex,
 	jumpTargetMessageId,
 	jumpTargetScrollTop,
@@ -603,7 +606,19 @@ export const PretextExactMessageList = memo(
 			 *
 			 * 后端已经算好了每一轮的 `startedAt / repliedAt`（一条聚合 SQL），直接用它。
 			 */
-			const { rounds: indexedRounds } = useNarratorRounds(narratorId);
+			const [roundsSeed, setRoundsSeed] = useState<{
+				narratorId: string;
+				ready: boolean;
+				page?: NarratorRoundsPage;
+			}>(() => ({ narratorId: narratorId ?? "", ready: false }));
+			const activeRoundsSeed =
+				roundsSeed.narratorId === (narratorId ?? "") ? roundsSeed : undefined;
+			const roundIndexEnabled = Boolean(narratorId) && !suspended && !dataSource;
+			const { rounds: indexedRounds } = useNarratorRounds(narratorId, {
+				enabled: roundIndexEnabled,
+				seedPage: activeRoundsSeed?.page,
+				waitForSeed: !activeRoundsSeed?.ready,
+			});
 			/** 轮首消息 id → 本轮用量（时长 + token）。按 messageId 对：spec 上没有 seq。 */
 			const roundUsageByMessageId = useMemo(() => {
 				const map = new Map<string, { durationMs?: number; tokens?: number }>();
@@ -1065,6 +1080,13 @@ export const PretextExactMessageList = memo(
 			 * 交互与虚拟化。它是 buildOptions 的输入（会重建文档）。
 			 */
 			const [roundPinnedOpen, setRoundPinnedOpen] = useState<ReadonlySet<string>>(() => new Set());
+			// 换会话时清空折叠展开态与子元素元数据缓存，避免跨会话残留。
+			// biome-ignore lint/correctness/useExhaustiveDependencies: narratorId is the switch signal
+			useEffect(() => {
+				setRoundPreviewOpen(new Set());
+				setRoundPinnedOpen(new Set());
+				foldedChildMetaRef.current.clear();
+			}, [narratorId]);
 			const onToggleRoundPreview = useCallback((roundKey: string) => {
 				if (!roundKey) return;
 				setRoundPreviewOpen((prev) => {
@@ -1101,12 +1123,25 @@ export const PretextExactMessageList = memo(
 					isSubagent,
 					expandedRoundKeys: roundPinnedOpen,
 					previewRoundKeys: roundPreviewOpen,
-					isLiveSpec: (spec: { data?: unknown }) => {
+					isLiveSpec: (spec: {
+						key?: string;
+						opts?: { streamingContent?: unknown };
+						data?: unknown;
+					}) => {
+						// 流式正文（markdown）的 data 是纯字符串，流式状态记在 opts.streamingContent
+						// 或合成流式行 key 上；必须先检查这两者，否则工具跑完刚出正文就被折起。
+						if (spec.opts?.streamingContent === true) return true;
+						if (typeof spec.key === "string" && isStreamingKey(spec.key)) return true;
 						const data = spec.data as { isStreaming?: unknown; status?: unknown } | null;
 						if (!data || typeof data !== "object") return false;
 						if (data.isStreaming === true) return true;
 						const status = data.status;
-						return status === "running" || status === "pending" || status === "queued";
+						return (
+							status === "running" ||
+							status === "pending" ||
+							status === "queued" ||
+							status === "initializing"
+						);
 					},
 					readDuration: (spec: { key?: string }) => {
 						const messageId = roundHeadMessageId(spec.key);
@@ -1222,6 +1257,8 @@ export const PretextExactMessageList = memo(
 					}
 					const opened = state.expanded.get(key);
 					const lodUserOverride = state.lodUserOverrides.has(key);
+					const showEarlier = state.showEarlier.has(key);
+					const expandedIndices = state.expandedRows.get(key);
 					// 宽度必须用**内容列宽**——`measured` 上没有它（它在 item 层），传 0
 					// 会让换行计算全部退化，测出来的高度是错的。
 					const width = committedContentWidthRef.current;
@@ -1230,6 +1267,8 @@ export const PretextExactMessageList = memo(
 						...(spec.opts ?? {}),
 						...(opened === undefined ? {} : { opened }),
 						lodUserOverride,
+						...(showEarlier ? { showEarlier: true } : {}),
+						...(expandedIndices && expandedIndices.size > 0 ? { expandedIndices } : {}),
 					};
 					try {
 						const result = measureElement(spec.kind, spec.data, width, lod, opts);
@@ -1779,9 +1818,8 @@ export const PretextExactMessageList = memo(
 							}
 						},
 						onToggleItems: () => {
-							const measured = measuredByKeyRef.current.get(key) as
-								| { header?: { opened?: boolean } }
-								| undefined;
+							const measured = (foldedChildMetaRef.current.get(key)?.measured ??
+								measuredByKeyRef.current.get(key)) as { header?: { opened?: boolean } } | undefined;
 							captureFoldBefore(key);
 							setInteraction((prev) =>
 								setVListExpanded(prev, key, !(measured?.header?.opened ?? false)),
@@ -2552,6 +2590,16 @@ export const PretextExactMessageList = memo(
 				isSubagent,
 			});
 			useEffect(() => {
+				if (pretextDocument.status !== "ready" && pretextDocument.status !== "error") return;
+				const currentId = narratorId ?? "";
+				const page = pretextDocument.document?.rounds;
+				setRoundsSeed((prev) =>
+					prev.narratorId === currentId && prev.ready && prev.page === page
+						? prev
+						: { narratorId: currentId, ready: true, page },
+				);
+			}, [narratorId, pretextDocument.status, pretextDocument.document?.rounds]);
+			useEffect(() => {
 				if (!dataSource?.onWindowChange) return;
 				if (pretextDocument.document) {
 					dataSource.onWindowChange(pretextDocument.document);
@@ -2697,6 +2745,10 @@ export const PretextExactMessageList = memo(
 			// New mid-window rows fall back to the structural reload; compact markers keep
 			// their existing exact insert fast path.
 			const queryClient = useQueryClient();
+			const invalidateNarratorRounds = useCallback(() => {
+				if (!narratorId || dataSource) return;
+				void queryClient.invalidateQueries({ queryKey: narratorRoundsQueryKey(narratorId) });
+			}, [narratorId, dataSource, queryClient]);
 			const upsertOrReload = useCallback(
 				(message: TreeMessage | undefined) => {
 					// A subagent's row is dual-broadcast here too, but it is never a row of
@@ -2705,10 +2757,9 @@ export const PretextExactMessageList = memo(
 					// inflated the "new messages" badge of a parent panel that nothing was
 					// arriving in. Its card is maintained by the live-patch channel instead.
 					if (isForeignSubagentRow(message, !!isSubagent)) return;
-					// 轮次索引随消息追加而变：user 开头一轮、assistant 收尾一轮、compact 标记
-					// 会切走轮首判据。索引查询是 staleTime: Infinity 的缓存快照，全靠这里
-					// 显式失效 —— 查询本身有索引 + 上限，代价可控。
-					queryClient.invalidateQueries({ queryKey: narratorRoundsQueryKey(narratorId ?? "") });
+					// 轮次索引随消息追加、编辑、删除而变：索引查询是 staleTime: Infinity
+					// 的缓存快照，由 append / delete / update 三条路径统一显式失效。
+					invalidateNarratorRounds();
 					if (message && upsertMessageRef.current(message)) {
 						appliedMessageRevisionRef.current += 1;
 					} else if (message && askInPassingBlock(message)) {
@@ -2723,7 +2774,7 @@ export const PretextExactMessageList = memo(
 					}
 					bumpMessageRevision();
 				},
-				[bumpMessageRevision, refreshAskInPassingWindow, isSubagent, narratorId, queryClient],
+				[bumpMessageRevision, refreshAskInPassingWindow, isSubagent, invalidateNarratorRounds],
 			);
 
 			// A deletion is applied to the loaded window IN PLACE for the same reason an
@@ -2737,6 +2788,7 @@ export const PretextExactMessageList = memo(
 			const removeOrReload = useCallback(
 				(deletedMessageIds: string[]) => {
 					for (const id of deletedMessageIds) forgetAskInPassingRef.current?.(id);
+					invalidateNarratorRounds();
 					if (removeMessagesRef.current(deletedMessageIds)) {
 						// Keep the applied revision in step so the reload gate does not treat this
 						// as still pending — that would surface a false "new messages" affordance
@@ -2745,7 +2797,7 @@ export const PretextExactMessageList = memo(
 					}
 					bumpMessageRevision();
 				},
-				[bumpMessageRevision],
+				[bumpMessageRevision, invalidateNarratorRounds],
 			);
 
 			// The other half of a rollback: the boundary message keeps its blocks up to the
@@ -2773,6 +2825,7 @@ export const PretextExactMessageList = memo(
 					// document's business, and every one of them used to leave the applied
 					// revision behind the structural one.
 					if (isForeignSubagentRow(message, !!isSubagent)) return;
+					invalidateNarratorRounds();
 					// Same-id updates (including queued → claimed/materialized/failed and
 					// canonical user edits) use the id+seq upsert path. Alias-bearing COW
 					// replacements still use the legacy replacement guard below.
@@ -2798,7 +2851,7 @@ export const PretextExactMessageList = memo(
 					}
 					bumpMessageRevision();
 				},
-				[bumpMessageRevision, refreshAskInPassingWindow, isSubagent],
+				[bumpMessageRevision, refreshAskInPassingWindow, isSubagent, invalidateNarratorRounds],
 			);
 
 			// The exact shell is stable-state only. Subscribe to the existing message
@@ -3568,9 +3621,13 @@ export const PretextExactMessageList = memo(
 			useEffect(() => {
 				const manifestItems = pretextDocument.manifest?.items ?? [];
 				const firstItem = manifestItems[seenWindow.start];
-				const seq = firstItem?.firstSeq;
+				// 贴底时高亮最后一轮：最后一轮很短时，视口顶部仍落在倒数第二轮上，
+				// 但读者实际正在看最底部这一轮。
+				const seq = pinnedToBottom
+					? (manifestItems[manifestItems.length - 1]?.lastSeq ?? firstItem?.firstSeq)
+					: firstItem?.firstSeq;
 				reportTopSeq(typeof seq === "number" ? seq : null);
-			}, [seenWindow.start, pretextDocument.manifest, reportTopSeq]);
+			}, [seenWindow.start, pinnedToBottom, pretextDocument.manifest, reportTopSeq]);
 
 			/**
 			 * `manifest.documentRevision` advances on every structural change — a new message,
@@ -4448,6 +4505,7 @@ export const PretextExactMessageList = memo(
 			// Freeze row wrapping during resize; only the outer viewport follows the host.
 			// Commit final geometry once after the gesture/quiet period ends.
 			// The observer follows the actual node, not a ref captured once on mount.
+			const hasCustomDataSource = Boolean(dataSource);
 			useLayoutEffect(() => {
 				const node = viewportNode;
 				if (!node) return;
@@ -4456,9 +4514,11 @@ export const PretextExactMessageList = memo(
 				// native-drag slot that dragend will never clear.
 				const stopTextDrag = installVListTextDragGuard(node);
 				const pointerTracker = createPointerDragTracker(() => controller.release());
-				// 窄屏把左右槽加宽到 30px：轮轨的触控带（28px）在 16px 槽里会压到正文。
-				const horizontalGutterPx = () =>
-					mobileViewportRef.current ? NARRATOR_MOBILE_GUTTER_PX : PAGE_PADDING;
+				// 桌面叙述者左槽留 32px 给轮轨（窄屏 30px）；聊天室 / 分享页无轮轨仍用 16px。
+				const horizontalGutterPx = () => {
+					if (hasCustomDataSource) return PAGE_PADDING;
+					return mobileViewportRef.current ? NARRATOR_MOBILE_GUTTER_PX : NARRATOR_ROW_GUTTER_PX;
+				};
 				const canMeasure = () => {
 					return (
 						panelVisible &&
@@ -4539,6 +4599,7 @@ export const PretextExactMessageList = memo(
 				viewportNode,
 				centeredColumn,
 				panelVisible,
+				hasCustomDataSource,
 				readViewportView,
 				writeScrollTop,
 				morphScrollOrigin,
@@ -5011,11 +5072,13 @@ export const PretextExactMessageList = memo(
 					targetIds,
 					highlightId,
 					needle,
+					align = "center",
 				}: {
 					domIds: string[];
 					targetIds: string[];
 					highlightId?: string;
 					needle?: string;
+					align?: JumpScrollAlign;
 				}) => {
 					// One jump at a time. A second jump (another search hit clicked while the
 					// first is still paging through history) invalidates the first, which must
@@ -5042,7 +5105,7 @@ export const PretextExactMessageList = memo(
 						setPinnedToBottom(false);
 						// Restrict the reveal to this list, including repeated jumps to a mounted
 						// row. Native scrollIntoView can also scroll the panel/page ancestors.
-						writeScrollTop(jumpTargetScrollTop(node, element));
+						writeScrollTop(jumpTargetScrollTop(node, element, { align, topPadding: PAGE_PADDING }));
 						// Highlight the exact tool row, not its message's earlier text/alias.
 						if (highlightId) highlightRef.current.flash(element);
 						return true;
@@ -5052,18 +5115,39 @@ export const PretextExactMessageList = memo(
 					const revealByLayout = async (messageIds: readonly string[]) => {
 						for (const messageId of messageIds) {
 							if (!messageId) continue;
-							const index = pretextDocumentRef.current.readWindow().index;
+							let index = pretextDocumentRef.current.readWindow().index;
 							const node = viewportRef.current;
 							if (!index || !node) return false;
-							const itemIndex = jumpTargetItemIndex(index, messageId);
+							let itemIndex = jumpTargetItemIndex(index, messageId);
 							if (itemIndex == null) continue;
+							// 若目标消息当前被折进 `round-group`，先将该轮提升为完整行，
+							// 等重建完成后再定位到真正的目标行。
+							if (index.manifest.items[itemIndex]?.kind === "round-group") {
+								const foldedItem = renderItemsRef.current[itemIndex];
+								const roundKey = (foldedItem?.spec.data as { roundKey?: string } | undefined)
+									?.roundKey;
+								if (roundKey) {
+									onPromoteRound(roundKey);
+									await waitAnimationFrame();
+									if (cancelled()) return false;
+									await waitAnimationFrame();
+									if (cancelled()) return false;
+									index = pretextDocumentRef.current.readWindow().index;
+									if (!index) return false;
+									itemIndex = jumpTargetItemIndex(index, messageId);
+									if (itemIndex == null) continue;
+								}
+							}
 							// Already mounted: reveal in place, no intermediate scroll write.
 							const itemKey = index.manifest.items[itemIndex]?.itemKey;
 							const mounted =
 								itemKey &&
 								node.querySelector(`[data-nf-row-key="${CSS.escape(itemKey)}"]`) !== null;
 							if (!mounted) {
-								const targetTop = index.itemStart(itemIndex) - Math.max(0, node.clientHeight / 2);
+								const targetTop =
+									align === "top"
+										? Math.max(0, index.itemStart(itemIndex) - PAGE_PADDING)
+										: index.itemStart(itemIndex) - Math.max(0, node.clientHeight / 2);
 								interactionAdmissionRef.current?.markHistoryIntent();
 								pinnedToBottomRef.current = false;
 								visibleViewportRef.current.setPinned(false);
@@ -5168,6 +5252,7 @@ export const PretextExactMessageList = memo(
 					t,
 					getSmoothFollower,
 					writeScrollTop,
+					onPromoteRound,
 					dataSource?.fetchToolDetail,
 					dataSource?.locateMessage,
 				],
@@ -5865,6 +5950,7 @@ export const PretextExactMessageList = memo(
 						overflowAnchor: "none",
 					}}
 					data-pretext-exact-message-list
+					data-round-rail-bounds=""
 					data-vlist-resize-preview={pretextDocument.resizePreview || undefined}
 					data-vlist-resize-measured={pretextDocument.resizeMeasuredCount || undefined}
 					data-vlist-resize-revision={pretextDocument.resizeRevision}
@@ -5876,32 +5962,22 @@ export const PretextExactMessageList = memo(
 			    focus back to the top of the history (same root cause as the
 			    inter-row gaps — see resolveRowHitHeight). */}
 					<div ref={assignContent} style={{ position: "relative", width: "100%" }}>
-						{/* 轮次导航轨：内置在对话列左槽里（与 Vantaloom 同形态），不浮在
-						    视口右侧。放在滚动容器内用 `sticky`，于是它跟着阅读位置走而不
-						    是钉死在屏幕上 —— 轨道是「在这段对话的哪里」，属于内容而不是
-						    悬浮控件。
-						    ⚠️ 不能用 `height: 100%`（滚动容器里百分比高度塌成 0，轨道完全
-						    不显示），也不能 `float`（整页布局卡死，实测浏览器脚本超时）。
-						    `sticky` + 固定像素高度两者都避开；宽度只占 gutter 的一段，
-						    正文列自身有 padding，不会压到文字。
-						    垂直默认居中：宿钉在视口中线（top:50%，宿主本身 0 高），轨体再
-						    用 translateY(-50%) 上移半高。轮数超容量时轨道窗口跟随当前轮，
-						    两端渐隐表示上下还有更多轮（见 RoundRail 的 railCapacity）。 */}
+						{/* 轮次导航轨：内置在对话列左槽里，放在滚动容器内用 `sticky` + 0 宽 0 高，
+						    不用 `float` 也不外推负 margin（避免被外层 `overflow: hidden` 裁掉），
+						    靠加宽正文左槽（NARRATOR_ROW_GUTTER_PX = 32）给轨道让位。 */}
 						<div
 							data-nf-round-rail-host=""
 							data-nf-round-count={roundRailRounds.length}
 							style={{ display: "none" }}
 						/>
-						{roundRailRounds.length >= 2 ? (
+						{!dataSource && roundRailRounds.length >= 2 ? (
 							<div
 								data-nf-round-rail=""
 								style={{
 									position: "sticky",
 									top: "50%",
 									left: 0,
-									float: "left",
-									marginLeft: -16,
-									width: 16,
+									width: 0,
 									height: 0,
 									overflow: "visible",
 									zIndex: 30,
@@ -5913,12 +5989,12 @@ export const PretextExactMessageList = memo(
 										rounds={roundRailRounds}
 										activeIndex={activeRoundIndex}
 										onJumpToRound={(round) => {
-											// 跳到该轮首条消息。domId 规则见 domIdForItem（`msg-<id>`）；
-											// targetIds 让跳转在「那一段还没加载」时向前补页。
+											// 跳到该轮首条消息并对齐视口顶部，与「当前轮」的顶部判据一致。
 											void scrollToMessageTarget({
 												domIds: [`msg-${round.messageId}`],
 												targetIds: [round.messageId],
 												highlightId: round.messageId,
+												align: "top",
 											});
 										}}
 										favorites={roundFavorites}

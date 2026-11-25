@@ -10,6 +10,7 @@ import type { LocalizedValue } from "@shared/i18n-locales";
 import type { SubagentModelInheritance } from "@shared/model-inheritance";
 import type { NarratorVisibility, NarratorWriteAudience } from "@shared/narrator-access";
 import type { RowBlock } from "@shared/narrator-blocks/message-blocks";
+import type { NarratorRoundsPage } from "@shared/narrator-rounds";
 import type { ReasoningTranslationFields } from "@shared/reasoning-translation";
 import type { StorageCategoryKey } from "@shared/storage-categories";
 import type { SubagentNestedSummary } from "@shared/subagent-nested";
@@ -1198,6 +1199,8 @@ export interface PretextDocumentPageResult {
 	/** More rows exist older than this page (drives reverse infinite scroll). */
 	hasPrev: boolean;
 	messageVersion: number;
+	/** Initial round index included on tail loads (beforeSeq/afterSeq omitted). */
+	rounds?: NarratorRoundsPage;
 }
 
 export interface HistoryRecoveryCandidate {

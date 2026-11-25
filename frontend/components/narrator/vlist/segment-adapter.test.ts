@@ -5200,10 +5200,9 @@ describe("roundStart labelling (整轮折叠)", () => {
 		const specs = adaptSegment(
 			{
 				kind: "message",
-				msg: rowWithElements(
-					{ id: "reply", role: "assistant" },
-					[{ type: "text", text: "调查完成" }] as never,
-				),
+				msg: rowWithElements({ id: "reply", role: "assistant" }, [
+					{ type: "text", text: "调查完成" },
+				] as never),
 			},
 			{ lod: 5, isSubagent: true },
 		);

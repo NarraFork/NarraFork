@@ -53,9 +53,7 @@ export interface AppearanceSectionProps {
 	setCenteredColumn: (v: boolean) => void;
 	lodAltGesture: boolean;
 	setLodAltGesture: (v: boolean) => void;
-	/**
-	 * 整轮折叠（已完成的轮折成一条「已处理 Xm Ys」）。开启时 LOD 6 仍可临时全展开。
-	 */
+	/** 整轮折叠（已完成的轮折成一条「已处理 Xm Ys」），与详细程度档位独立。 */
 	roundFolding: boolean;
 	setRoundFolding: (v: boolean) => void;
 }

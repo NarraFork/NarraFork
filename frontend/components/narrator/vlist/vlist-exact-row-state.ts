@@ -410,8 +410,23 @@ export function foldedChildInteractionSig(spec: ElementSpec, state: VListInterac
 		// 只累计「会改变几何」的那几个通道，与 rowInteractionSig 保持一致。
 		const expanded = state.expanded.get(key);
 		const lodOverride = state.lodUserOverrides.has(key) ? 1 : 0;
-		if (expanded === undefined && lodOverride === 0) continue;
-		parts.push(`${key}:${expanded === undefined ? "u" : expanded ? "1" : "0"}:${lodOverride}`);
+		const showEarlier = state.showEarlier.has(key) ? 1 : 0;
+		const rows = state.expandedRows.get(key);
+		const traceRows = state.expandedTraceRows.get(key);
+		if (
+			expanded === undefined &&
+			lodOverride === 0 &&
+			showEarlier === 0 &&
+			(!rows || rows.size === 0) &&
+			(!traceRows || traceRows.size === 0)
+		) {
+			continue;
+		}
+		const rowList = rows && rows.size > 0 ? [...rows].sort((a, b) => a - b).join(",") : "";
+		const traceRowList = traceRows && traceRows.size > 0 ? [...traceRows].sort().join(",") : "";
+		parts.push(
+			`${key}:${expanded === undefined ? "u" : expanded ? "1" : "0"}:${lodOverride}:${showEarlier}:${rowList}:${traceRowList}`,
+		);
 	}
 	if (parts.length === 0) return "";
 	parts.sort();

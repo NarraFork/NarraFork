@@ -33,10 +33,19 @@ export const NARRATOR_CENTERED_COLUMN_MAX_WIDTH = 860;
 export const NARRATOR_COLUMN_GUTTER_PX = 16;
 
 /**
+ * Horizontal gutter (px) per side on desktop narrator viewports with the left round rail.
+ *
+ * The round rail button renders ~26px wide (tick visuals ≤14px + padding). Pushing it out
+ * with negative margins clips it behind outer `overflow: hidden` ancestors, so the text
+ * column gives it 32px on each side while vertical spacing stays on NARRATOR_COLUMN_GUTTER_PX.
+ */
+export const NARRATOR_ROW_GUTTER_PX = 32;
+
+/**
  * Horizontal gutter (px) per side on narrow/mobile viewports (width < 48em).
  *
- * Bigger than the desktop gutter on purpose: the round rail's touch strip is
- * 28px wide (tick visuals ≤14px + tap padding), so the 16px desktop gutter
+ * Bigger than the base gutter on purpose: the round rail's touch strip is
+ * 28px wide (tick visuals ≤14px + tap padding), so the 16px base gutter
  * leaves the last ~12px of the strip sitting on top of message text. At 30px
  * the whole strip fits inside the gutter and the text column still keeps a
  * couple of pixels of air. Only the WIDTH measurement uses this — vertical
