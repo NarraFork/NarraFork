@@ -618,7 +618,8 @@
 					"sessions_running": "{{count}} session(s) are running there.",
 					"local_config": "That checkout has filters or a hooks directory of its own: run the command yourself.",
 					"unreadable": "That directory could not be checked.",
-					"other_repository": "That directory is not a checkout of this project's repository: run the command yourself."
+					"other_repository": "That directory is not a checkout of this project's repository: run the command yourself.",
+					"unsafe_path": "That directory's path contains a line break or control character: no command is offered for it, and it is not fast-forwarded here."
 				},
 				"errors": {
 					"TEAM_WORK_ITEM_NOT_READY": "Only a ready item can be merged; it changed meanwhile.",

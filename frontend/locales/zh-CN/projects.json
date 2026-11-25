@@ -618,7 +618,8 @@
 					"sessions_running": "那里有 {{count}} 个会话在运行。",
 					"local_config": "那个检出有自己的过滤器或 hooks 目录：请自己运行命令。",
 					"unreadable": "无法检查那个目录。",
-					"other_repository": "那个目录不是本项目仓库的检出：请自己运行命令。"
+					"other_repository": "那个目录不是本项目仓库的检出：请自己运行命令。",
+					"unsafe_path": "那个目录的路径含换行或控制字符：不提供命令，也不在这里快进。"
 				},
 				"errors": {
 					"TEAM_WORK_ITEM_NOT_READY": "只有可以合并的工作项能合并；它刚刚变了。",

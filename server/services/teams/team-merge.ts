@@ -416,6 +416,7 @@ const NO_COMMAND_BLOCKERS: ReadonlySet<TeamFastForwardBlocker> = new Set([
 	"other_repository",
 	"stale",
 	"unreadable",
+	"unsafe_path",
 ]);
 
 interface PreparedInspection {

@@ -928,6 +928,7 @@ export const TEAM_FAST_FORWARD_BLOCKERS = [
 	"sessions_running",
 	"local_config",
 	"other_repository",
+	"unsafe_path",
 	"unreadable",
 ] as const;
 export type TeamFastForwardBlocker = (typeof TEAM_FAST_FORWARD_BLOCKERS)[number];

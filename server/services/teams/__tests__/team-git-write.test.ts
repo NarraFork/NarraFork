@@ -15,6 +15,7 @@ import { GIT_NO_EXEC_CONFIG, setNoLazyFetchSupportForTests } from "../../../lib/
 import { safeSpawn } from "../../../lib/spawn";
 import { configuredPrograms, teamGit } from "../team-git";
 import {
+	type FastForwardCommands,
 	fastForwardCheckout,
 	fastForwardCommand,
 	gitVersion,
@@ -35,6 +36,37 @@ let globalConfig: string;
 const HOST_USER = "[user]\n\tname = Host\n\temail = host@e.test\n";
 const savedGlobal = process.env.GIT_CONFIG_GLOBAL;
 const savedNoSystem = process.env.GIT_CONFIG_NOSYSTEM;
+
+/** The commands for a path that has them (fails the test otherwise). */
+function commandsFor(...args: Parameters<typeof fastForwardCommand>): FastForwardCommands {
+	const commands = fastForwardCommand(...args);
+	if (!commands) throw new Error(`no command for ${JSON.stringify(args[0])}`);
+	return commands;
+}
+
+/**
+ * The value of the PowerShell single-quoted string starting at `start`, read as PowerShell's
+ * tokenizer does: any of ' U+2018 U+2019 U+201A U+201B ends it, two in a row are one literal
+ * quote (the second). Returns where the string ended.
+ */
+function readPowerShellQuoted(source: string, start: number): { value: string; end: number } {
+	const quote = (c: string | undefined) => c !== undefined && /['‘-‛]/.test(c);
+	if (!quote(source[start])) throw new Error(`no quoted string at ${start}`);
+	let value = "";
+	let i = start + 1;
+	while (i < source.length) {
+		const c = source[i] as string;
+		if (quote(c)) {
+			if (!quote(source[i + 1])) return { value, end: i + 1 };
+			value += source[i + 1];
+			i += 2;
+			continue;
+		}
+		value += c;
+		i++;
+	}
+	throw new Error("unterminated string");
+}
 
 async function git(args: string[], cwd = repo) {
 	const result = await safeSpawn({
@@ -343,7 +375,7 @@ describe("team git writes", () => {
 			preferred: "sh",
 		});
 		// Spaces and quotes: one word each way (sh closes and reopens the quote, PowerShell doubles it).
-		const quoted = fastForwardCommand("C:\\My Repo\\it's", "main", sha, "win32");
+		const quoted = commandsFor("C:\\My Repo\\it's", "main", sha, "win32");
 		expect(quoted.preferred).toBe("powershell");
 		expect(quoted.powershell).toContain("git -C 'C:\\My Repo\\it''s' symbolic-ref");
 		expect(quoted.sh).toContain("git -C 'C:\\My Repo\\it'\\''s' symbolic-ref");
@@ -363,7 +395,7 @@ describe("team git writes", () => {
 			message: "m",
 			identity: null,
 		});
-		const command = fastForwardCommand(repo, "main", commit).sh;
+		const command = commandsFor(repo, "main", commit).sh;
 		await git(["checkout", "-q", "-b", "elsewhere"]);
 		const off = await safeSpawn({
 			cmd: ["sh", "-c", command],
@@ -384,7 +416,7 @@ describe("team git writes", () => {
 		const pwsh = Bun.which("pwsh");
 		if (pwsh) {
 			await git(["reset", "-q", "--hard", base]);
-			const ps = fastForwardCommand(repo, "main", commit).powershell;
+			const ps = commandsFor(repo, "main", commit).powershell;
 			const run = await safeSpawn({
 				cmd: [pwsh, "-NoProfile", "-Command", ps],
 				timeout: 30_000,
@@ -393,6 +425,86 @@ describe("team git writes", () => {
 			expect(run.exitCode).toBe(0);
 			expect(await git(["rev-parse", "main"])).toBe(commit);
 		}
+	});
+
+	test("every PowerShell quote is doubled: a path's quotes never end its string (Devin 3)", async () => {
+		const sha = "b".repeat(40);
+		// The exact escaping, for the plain quote and a typographic one.
+		expect(commandsFor("/srv/';Remove-Item x;'", "main", sha, "win32").powershell).toBe(
+			`if ((git -C '/srv/'';Remove-Item x;''' symbolic-ref --quiet HEAD) -ceq 'refs/heads/main') { git -C '/srv/'';Remove-Item x;''' merge --ff-only --no-autostash --no-overwrite-ignore ${sha} } else { Write-Error 'Not on main: nothing was changed' }`,
+		);
+		expect(commandsFor("/srv/a\u2019;Remove-Item x;\u2018", "main", sha).powershell).toContain(
+			"git -C '/srv/a\u2019\u2019;Remove-Item x;\u2018\u2018' symbolic-ref",
+		);
+		const paths = ["'", "\u2018", "\u2019", "\u201a", "\u201b"].flatMap((q) => [
+			`/srv/${q};Remove-Item x;${q}`,
+			`C:\\it${q}s ${q}${q} $(evil) \`$x`,
+		]);
+		paths.push("/srv/\u2018';\u201b\u2019Remove-Item x;\u201a'");
+		for (const path of paths) {
+			const ps = commandsFor(path, "main", sha).powershell;
+			let at = ps.indexOf("git -C ");
+			let words = 0;
+			while (at !== -1) {
+				const word = readPowerShellQuoted(ps, at + "git -C ".length);
+				expect(word.value).toBe(path);
+				// The string ends exactly where the argument does: the subcommand follows.
+				expect(ps.slice(word.end)).toMatch(/^ (symbolic-ref|merge) /);
+				words++;
+				at = ps.indexOf("git -C ", word.end);
+			}
+			expect(words).toBe(2);
+		}
+		// PowerShell itself, where this host has it: the argument it passes is the path.
+		const pwsh = Bun.which("pwsh");
+		if (pwsh) {
+			for (const path of paths) {
+				const ps = `Write-Output ${commandsFor(path, "main", sha).powershell.split("git -C ")[1]?.split(" symbolic-ref")[0]}`;
+				const run = await safeSpawn({
+					cmd: [pwsh, "-NoProfile", "-Command", ps],
+					timeout: 30_000,
+					maxOutputBytes: 4096,
+				});
+				expect(run.stdout.split(/\r?\n/)[0]).toBe(path);
+			}
+		}
+	});
+
+	test("the sh form passes such a path to git as one inert argument (Devin 3)", async () => {
+		const sha = "c".repeat(40);
+		const bin = join(temporary, `fake-git-${Math.random().toString(36).slice(2)}`);
+		await mkdir(bin, { recursive: true });
+		const log = join(bin, "args.log");
+		const marker = join(bin, "PWNED");
+		// A git that records the directory it was given and fails (so nothing else runs).
+		await writeFile(join(bin, "git"), `#!/bin/sh\nprintf '%s\\n' "$2" >> '${log}'\nexit 1\n`);
+		await chmod(join(bin, "git"), 0o755);
+		const paths = ["'", "\u2018", "\u2019", "\u201a", "\u201b"].map(
+			(q) => `/srv/${q};touch ${marker};${q} $(touch ${marker}) \`touch ${marker}\``,
+		);
+		for (const path of paths) {
+			await rm(log, { force: true });
+			const run = await safeSpawn({
+				cmd: ["sh", "-c", commandsFor(path, "main", sha, "linux").sh],
+				env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ""}` },
+				timeout: 20_000,
+				maxOutputBytes: 4096,
+			});
+			expect(run.exitCode).not.toBe(0);
+			expect((await readFile(log, "utf8")).split("\n").filter(Boolean)).toEqual([path]);
+			expect(existsSync(marker)).toBe(false);
+		}
+	});
+
+	test("a path with a line break or control character gets no command and is not fast-forwarded (Devin 3)", async () => {
+		const sha = "d".repeat(40);
+		for (const bad of ["\n", "\r", "\0", "\t", "\u001b", "\u007f", "\u0085", "\u2028", "\u2029"]) {
+			const path = `/srv/repo${bad}Remove-Item x`;
+			expect(fastForwardCommand(path, "main", sha, "linux")).toBeNull();
+			expect(fastForwardCommand(path, "main", sha, "win32")).toBeNull();
+			expect(await inspectCheckout(path, "main", sha)).toBe("unsafe_path");
+		}
+		expect(fastForwardCommand("/srv/r\u00e9po \u2019x", "main", sha)).not.toBeNull();
 	});
 });
 
@@ -959,7 +1071,7 @@ describe("the copyable command and a same-named tag (Devin)", () => {
 			message: "m",
 			identity: null,
 		});
-		const command = fastForwardCommand(repo, "release", commit);
+		const command = commandsFor(repo, "release", commit);
 		expect(command.sh).toContain("= refs/heads/release ]");
 		expect(command.powershell).toContain("-ceq 'refs/heads/release'");
 		const run = await safeSpawn({

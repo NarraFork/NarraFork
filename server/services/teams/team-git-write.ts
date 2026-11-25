@@ -873,6 +873,7 @@ export type CheckoutBlocker =
 	| "index_locked"
 	| "local_config"
 	| "other_repository"
+	| "unsafe_path"
 	| "unreadable";
 
 /**
@@ -922,6 +923,8 @@ export async function inspectCheckout(
 ): Promise<CheckoutBlocker | null> {
 	assertBranch(base);
 	assertSha(baseSha);
+	// No command can be offered for it, and nothing here acts on a path like that either.
+	if (unsafeForCommand(dir)) return "unsafe_path";
 	const { signal } = options;
 	try {
 		const config = [...GIT_NO_EXEC_CONFIG];
@@ -1113,7 +1116,11 @@ export async function fastForwardCheckout(
 	return { ok: false, kind: "refused", files, message: complaint(result) };
 }
 
-/** A value as one POSIX shell word. */
+/**
+ * A value as one POSIX shell word: bare when it has only safe characters, otherwise
+ * single-quoted, a quote closing, escaping and reopening (`'\\''`). Inside single quotes sh
+ * expands nothing, so only the quote itself needs care.
+ */
 const shellWord = (value: string) =>
 	/^[A-Za-z0-9_./:@%+=,-]+$/.test(value) ? value : `'${value.replaceAll("'", `'\\''`)}'`;
 
@@ -1127,23 +1134,44 @@ export interface FastForwardCommands {
 	preferred: "sh" | "powershell";
 }
 
-/** A value as one PowerShell single-quoted string (a quote is doubled). */
-const powershellWord = (value: string) => `'${value.replaceAll("'", "''")}'`;
+/**
+ * A value as one PowerShell single-quoted string. PowerShell ends such a string at any
+ * single-quote-class character — `'` and the typographic U+2018 ‘ U+2019 ’ U+201A ‚ U+201B ‛ —
+ * and reads two in a row as one literal quote (the second), so each is doubled.
+ */
+const powershellWord = (value: string) => `'${value.replace(/['\u2018-\u201b]/g, "$&$&")}'`;
+
+/**
+ * Characters no copyable command may carry: C0/C1 controls (newline, carriage return, NUL…),
+ * DEL and the Unicode line/paragraph separators. A pasted line break ends a command early in
+ * either shell, whatever the quoting.
+ */
+const unsafeCommandCharacter = (code: number) =>
+	code <= 0x1f || (code >= 0x7f && code <= 0x9f) || code === 0x2028 || code === 0x2029;
+
+/** Whether a path cannot be put in a copyable command (see {@link unsafeCommandCharacter}). */
+export const unsafeForCommand = (value: string) => {
+	for (let i = 0; i < value.length; i++)
+		if (unsafeCommandCharacter(value.charCodeAt(i))) return true;
+	return false;
+};
 
 /**
  * What a person runs instead of 「在该目录中快进」: it does nothing unless that checkout's HEAD is
  * exactly `refs/heads/<base>`, then fast-forwards to the prepared merge commit itself, never
  * stashing and never overwriting an ignored file. A POSIX shell form and a PowerShell form (the
- * default follows the server's platform). Offered only while the checkout is on the base.
+ * default follows the server's platform). Offered only while the checkout is on the base, and
+ * never for a directory whose path carries a control character or line break (null).
  */
 export function fastForwardCommand(
 	dir: string,
 	base: string,
 	mergeCommit: string,
 	platform: NodeJS.Platform = process.platform,
-): FastForwardCommands {
+): FastForwardCommands | null {
 	assertBranch(base);
 	assertSha(mergeCommit);
+	if (unsafeForCommand(dir) || unsafeForCommand(base)) return null;
 	const merge = `merge --ff-only --no-autostash --no-overwrite-ignore ${mergeCommit}`;
 	const sh = `git -C ${shellWord(dir)}`;
 	const ps = `git -C ${powershellWord(dir)}`;
