@@ -629,6 +629,7 @@
 					"TEAM_ARCHIVED": "The team is archived. Unarchive it first.",
 					"TEAM_MERGE_BASE_MOVED": "The base kept moving while the merge was computed. Try again.",
 					"TEAM_WORK_ITEM_HEAD_MOVED": "The branch moved after the item was marked ready. Have the coordinator review it and mark it ready again.",
+					"TEAM_WORK_ITEM_HEAD_UNAVAILABLE": "The item has no recorded branch or head to merge. Have the coordinator mark it ready again.",
 					"TEAM_MERGE_GIT_TOO_OLD": "git 2.38 or newer is needed to merge without touching a working tree.",
 					"TEAM_MERGE_STALE": "The base moved since the merge was prepared: prepare it again.",
 					"TEAM_MERGE_CHECKOUT_BLOCKED": "That directory cannot be fast-forwarded now: run the command yourself, or try again.",

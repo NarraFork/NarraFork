@@ -647,10 +647,15 @@ async function jobFacts(context: JobContext) {
 		throw new MergeFailure("TEAM_ARCHIVED", "The team was archived");
 	const item = itemRow(context.teamId, context.itemId);
 	if (!item) throw new MergeFailure("TEAM_WORK_ITEM_CHANGED", "The work item is gone");
-	if (item.state !== "ready" || !item.headSha || !item.branchName)
+	if (item.state !== "ready")
 		throw new MergeFailure(
 			"TEAM_WORK_ITEM_NOT_READY",
 			`The work item is ${item.state}; only a ready item can be merged`,
+		);
+	if (!item.headSha || !item.branchName)
+		throw new MergeFailure(
+			"TEAM_WORK_ITEM_HEAD_UNAVAILABLE",
+			"The work item has no recorded branch or head to merge; mark it ready again",
 		);
 	if (workerRunning(item))
 		throw new MergeFailure(

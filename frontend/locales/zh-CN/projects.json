@@ -629,6 +629,7 @@
 					"TEAM_ARCHIVED": "团队已归档，先恢复团队。",
 					"TEAM_MERGE_BASE_MOVED": "计算合并期间基线一直在动，请再试一次。",
 					"TEAM_WORK_ITEM_HEAD_MOVED": "标为可合并之后分支又动了。请让协调者重新评审并标为可合并。",
+					"TEAM_WORK_ITEM_HEAD_UNAVAILABLE": "这一项没有记录分支或 head，无法合并。请让协调者重新标为可合并。",
 					"TEAM_MERGE_GIT_TOO_OLD": "需要 git 2.38 或更新版本，才能不碰工作区地合并。",
 					"TEAM_MERGE_STALE": "准备合并后基线又动了：请重新准备。",
 					"TEAM_MERGE_CHECKOUT_BLOCKED": "现在不能在那个目录中快进：请自己运行命令，或稍后再试。",

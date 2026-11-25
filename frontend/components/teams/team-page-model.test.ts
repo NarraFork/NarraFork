@@ -9,7 +9,9 @@ import { readFileSync } from "node:fs";
 import {
 	COORDINATOR_OVERRUN_EVENT_PREFIX,
 	COORDINATOR_OVERRUN_KINDS,
+	TEAM_FAST_FORWARD_BLOCKERS,
 	TEAM_LEVEL_EVENT_KINDS,
+	TEAM_MERGE_DISABLED_REASONS,
 	TEAM_OVERLAP_EVENT_KINDS,
 	TEAM_PERSON_DECISION_EVENT_KINDS,
 	TEAM_WORK_EVENT_KINDS,
@@ -25,6 +27,7 @@ import {
 	boardSignature,
 	cappedCount,
 	chunkIds,
+	conflictReasonFiles,
 	coordinatorLine,
 	diffLineKind,
 	eventLabelKey,
@@ -35,6 +38,10 @@ import {
 	itemOfApproval,
 	liveActivity,
 	liveWorkerStatus,
+	MERGE_CONFLICT_REASON_FILES,
+	mergeControl,
+	mergeErrorKey,
+	mergeRequestCode,
 	nextPollDelay,
 	nudgeDelay,
 	onlookerSeesWaiting,
@@ -852,5 +859,139 @@ describe("the coordinator's line", () => {
 			kind: "status",
 			status: "idle",
 		});
+	});
+});
+
+describe("merge (M)", () => {
+	const summary = {
+		mode: "local" as const,
+		phase: null,
+		job: null,
+		outcome: null,
+		canMerge: true,
+		disabledReason: null,
+	};
+
+	test("the control: merge, a running job, prepare again, disabled with its reason", () => {
+		expect(mergeControl(undefined)).toBeNull();
+		expect(mergeControl(summary)).toEqual({
+			label: "merge",
+			busy: false,
+			enabled: true,
+			disabledKey: null,
+			panel: null,
+		});
+		expect(mergeControl({ ...summary, phase: "updating", job: "merge", canMerge: false })).toEqual({
+			label: "merging",
+			busy: true,
+			enabled: false,
+			disabledKey: null,
+			panel: null,
+		});
+		expect(mergeControl({ ...summary, phase: "fast_forwarding", job: "fast_forward" })?.label).toBe(
+			"fastForwarding",
+		);
+		expect(mergeControl({ ...summary, outcome: "prepared" })).toMatchObject({
+			label: "prepareAgain",
+			panel: "prepared",
+		});
+		expect(
+			mergeControl({
+				...summary,
+				canMerge: false,
+				disabledReason: "github_pending",
+				mode: "github",
+			}),
+		).toMatchObject({
+			enabled: false,
+			disabledKey: "teams.page.merge.disabled.github_pending",
+		});
+		expect(mergeControl({ ...summary, outcome: "conflict" })?.panel).toBe("conflict");
+	});
+
+	test("every disabled reason, blocker and known error code has words in both locales", () => {
+		for (const locale of ["en", "zh-CN"]) {
+			const merge = JSON.parse(
+				readFileSync(new URL(`../../locales/${locale}/projects.json`, import.meta.url), "utf8"),
+			).teams.page.merge;
+			for (const reason of TEAM_MERGE_DISABLED_REASONS)
+				expect({ locale, reason, text: typeof merge.disabled[reason] }).toEqual({
+					locale,
+					reason,
+					text: "string",
+				});
+			for (const blocker of TEAM_FAST_FORWARD_BLOCKERS)
+				expect({ locale, blocker, text: typeof merge.blocker[blocker] }).toEqual({
+					locale,
+					blocker,
+					text: "string",
+				});
+			for (const code of Object.keys(merge.errors))
+				expect(mergeErrorKey(code)).toBe(`teams.page.merge.errors.${code}`);
+		}
+		expect(mergeErrorKey("SOMETHING_ELSE")).toBeNull();
+		expect(mergeErrorKey(null)).toBeNull();
+		expect(mergeRequestCode({ data: { code: "TEAM_WORK_ITEM_MERGING" } })).toBe(
+			"TEAM_WORK_ITEM_MERGING",
+		);
+		expect(mergeRequestCode(new Error("x"))).toBeNull();
+	});
+
+	test("a conflict's prefilled 退回 names at most 20 files and says when there are more", () => {
+		expect(conflictReasonFiles(["a.ts", "b.ts"], false)).toEqual({
+			files: "- a.ts\n- b.ts",
+			more: false,
+		});
+		const many = Array.from({ length: 30 }, (_, index) => `f${index}.ts`);
+		const cut = conflictReasonFiles(many, false);
+		expect(cut.files.split("\n")).toHaveLength(MERGE_CONFLICT_REASON_FILES);
+		expect(cut.more).toBe(true);
+		expect(conflictReasonFiles(["a.ts"], true).more).toBe(true);
+		expect(conflictReasonFiles(undefined, undefined)).toEqual({ files: "", more: false });
+	});
+
+	test("the activity words merge requests, failures, prepared merges and how an item merged", () => {
+		const note = (kind: string, detail: Record<string, unknown>) => eventNote({ kind, detail });
+		expect(note("work.merge_requested", { job: "merge" })).toEqual({
+			key: "mergeRequested",
+			values: {},
+		});
+		expect(note("work.merge_requested", { job: "fast_forward" })?.key).toBe("mergeFastForward");
+		expect(note("work.merge_failed", { code: "conflict", conflicts: ["a", "b"] })).toEqual({
+			key: "mergeConflict",
+			values: { count: 2 },
+		});
+		expect(note("work.merge_failed", { code: "conflict", conflicts: ["a"], more: true })?.key).toBe(
+			"mergeConflictMore",
+		);
+		expect(note("work.merge_failed", { code: "X", message: "base moved" })).toEqual({
+			key: "text",
+			values: { text: "base moved" },
+		});
+		expect(note("work.merge_prepared", { checkedOutAt: "/repo" })).toEqual({
+			key: "mergePrepared",
+			values: { path: "/repo" },
+		});
+		expect(note("work.merged", { detectedBy: "local_merge" })?.key).toBe("mergedLocal");
+		expect(note("work.merged", { detectedBy: "local_merge", fastForwarded: "checkout" })?.key).toBe(
+			"mergedFastForward",
+		);
+		expect(note("work.merged", { detectedBy: "ancestry" })?.key).toBe("mergedAncestry");
+		for (const locale of ["en", "zh-CN"]) {
+			const notes = JSON.parse(
+				readFileSync(new URL(`../../locales/${locale}/projects.json`, import.meta.url), "utf8"),
+			).teams.eventNote as Record<string, string>;
+			for (const key of [
+				"mergeRequested",
+				"mergeFastForward",
+				"mergeConflict_other",
+				"mergeConflictMore",
+				"mergePrepared",
+				"mergedLocal",
+				"mergedFastForward",
+				"mergedAncestry",
+			])
+				expect({ locale, key, text: typeof notes[key] }).toEqual({ locale, key, text: "string" });
+		}
 	});
 });
