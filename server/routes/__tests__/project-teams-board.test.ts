@@ -276,6 +276,8 @@ describe("board", () => {
 			exclusiveKey: "migrations",
 			createdAt: expect.any(String),
 			updatedAt: expect.any(String),
+			// The worker runs but has made no tool call yet.
+			activity: null,
 		});
 		expect(JSON.stringify(progress)).not.toContain("src/file-");
 		expect((await column("review")).items.map((card: { id: string }) => card.id).sort()).toEqual(

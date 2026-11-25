@@ -205,6 +205,33 @@ export interface TeamGit {
 	 * the blob's size from a listing: reading stops past it, and any other length throws.
 	 */
 	readBlob(oid: string, size: number): Promise<string>;
+	/** The best common ancestor of two full commit SHAs, or null when they share no history. */
+	mergeBase(a: string, b: string): Promise<string | null>;
+	/**
+	 * Lines added and removed per file between two full commit SHAs (`diff --numstat
+	 * --no-renames`), in git's order. The listing is capped: past it `truncated` is set and the
+	 * counts cover the files read. Throws when git fails.
+	 */
+	numstat(from: string, to: string): Promise<BranchNumstat>;
+	/**
+	 * The unified diff of one repository-relative path between two full commit SHAs, cut off at
+	 * `maxBytes` (reading stops there). Throws when git fails.
+	 */
+	fileDiff(
+		from: string,
+		to: string,
+		path: string,
+		maxBytes: number,
+	): Promise<{ text: string; truncated: boolean }>;
+}
+
+/** {@link TeamGit.numstat}: per-file counts (null for a binary file) and the totals. */
+export interface BranchNumstat {
+	files: { path: string; added: number | null; removed: number | null }[];
+	added: number;
+	removed: number;
+	binaryFiles: number;
+	truncated: boolean;
 }
 
 const utf8Bytes = (value: string) => Buffer.byteLength(value, "utf8");
@@ -382,6 +409,80 @@ async function readBlobOf(
 	return bytes.toString("utf8");
 }
 
+/** Numstat listing cap: some thousands of files; past it the counts are a lower bound. */
+const NUMSTAT_MAX_BYTES = 512 * 1024;
+
+async function numstatOf(run: GitQueryRunner, from: string, to: string): Promise<BranchNumstat> {
+	if (!SHA.test(from) || !SHA.test(to)) throw new GitError("Expected full commit SHAs");
+	const listing = await run(["diff", "--numstat", "--no-renames", "-z", from, to], {
+		maxOutputBytes: NUMSTAT_MAX_BYTES,
+	});
+	const truncated = listing.truncated === true;
+	if (listing.exitCode !== 0 && !truncated)
+		throw new GitError("git diff could not count the changed lines");
+	// `-z --numstat --no-renames`: `<added>\t<removed>\t<path>` records, NUL-terminated.
+	const files: BranchNumstat["files"] = [];
+	let added = 0;
+	let removed = 0;
+	let binaryFiles = 0;
+	for (const record of nulRecords(listing.stdout, truncated)) {
+		const first = record.indexOf("\t");
+		const second = first < 0 ? -1 : record.indexOf("\t", first + 1);
+		if (second < 0) continue;
+		const plus = record.slice(0, first);
+		const minus = record.slice(first + 1, second);
+		const path = record.slice(second + 1);
+		if (!path) continue;
+		if (plus === "-" || minus === "-") {
+			binaryFiles++;
+			files.push({ path, added: null, removed: null });
+			continue;
+		}
+		const a = Number(plus);
+		const r = Number(minus);
+		if (!Number.isSafeInteger(a) || !Number.isSafeInteger(r)) continue;
+		added += a;
+		removed += r;
+		files.push({ path, added: a, removed: r });
+	}
+	return { files, added, removed, binaryFiles, truncated };
+}
+
+async function fileDiffOf(
+	cwd: string,
+	config: ReadonlyArray<readonly [string, string]>,
+	from: string,
+	to: string,
+	path: string,
+	maxBytes: number,
+): Promise<{ text: string; truncated: boolean }> {
+	if (!SHA.test(from) || !SHA.test(to)) throw new GitError("Expected full commit SHAs");
+	assertRelativePath(path);
+	const chunks: Buffer[] = [];
+	let size = 0;
+	// Raw bytes, at most one past the budget: reading stops there and the text is cut off.
+	const result = await spawnGit(
+		cwd,
+		["diff", "--no-renames", "--no-color", "-U3", from, to, "--", path],
+		config,
+		0,
+		READ_TIMEOUT_MS,
+		{
+			maxBytes: maxBytes + 1,
+			onChunk: (chunk) => {
+				chunks.push(Buffer.from(chunk));
+				size += chunk.byteLength;
+				return true;
+			},
+		},
+	);
+	const truncated = size > maxBytes || result.truncated;
+	if (result.exitCode !== 0 && !truncated) throw new GitError(`git diff could not read ${path}`);
+	const bytes = Buffer.concat(chunks).subarray(0, maxBytes);
+	// A cut may split a UTF-8 sequence: the decoder replaces the broken tail.
+	return { text: bytes.toString("utf8"), truncated };
+}
+
 export function teamGit(cwd: string): TeamGit {
 	let overrides: Promise<Array<readonly [string, string]>> | null = null;
 	const config = () => {
@@ -408,6 +509,10 @@ export function teamGit(cwd: string): TeamGit {
 		treeEntry: (commit, path) => treeEntryAt(run, commit, path),
 		treeBlobs: (commit, dir) => treeBlobsOf(run, commit, dir),
 		readBlob: async (oid, size) => readBlobOf(cwd, await config(), oid, size),
+		mergeBase: (a, b) => mergeBase(run, a, b),
+		numstat: (from, to) => numstatOf(run, from, to),
+		fileDiff: async (from, to, path, maxBytes) =>
+			fileDiffOf(cwd, await config(), from, to, path, maxBytes),
 	};
 }
 

@@ -16,6 +16,7 @@
 
 import {
 	boardColumnIsFinished,
+	TEAM_ACTIVITY_PREVIEW_CHARS,
 	TEAM_APPROVAL_PREVIEW_CHARS,
 	TEAM_APPROVALS_LIMIT,
 	TEAM_BOARD_COLUMN_STATES,
@@ -39,6 +40,7 @@ import {
 	type TeamPersonDecisionEventKind,
 	type TeamRecentDecision,
 	type TeamRunningResponse,
+	type TeamWorkerActivity,
 	teamApprovalKind,
 } from "@shared/project-teams";
 import { and, asc, desc, eq, gt, inArray, isNotNull, lt, or, sql } from "drizzle-orm";
@@ -245,6 +247,12 @@ export async function readTeamPageSummary(
 ): Promise<TeamPageSummary> {
 	const { coordinator, access } = await loadTeamForAccess(teamId, principal, "read", projectId);
 	const running = runningTreeSessions(teamId, TEAM_RUNNING_AGENTS_LIMIT);
+	const conversation = db
+		.select({ messageCount: narrators.messageCount, stopReason: narrators.lastStopReason })
+		.from(narrators)
+		.where(eq(narrators.id, teamId))
+		.limit(1)
+		.get();
 	const lastEvent = db
 		.select({ id: teamWorkEvents.id, createdAt: teamWorkEvents.createdAt })
 		.from(teamWorkEvents)
@@ -262,12 +270,88 @@ export async function readTeamPageSummary(
 		columnCounts: columnCounts(teamId),
 		lastEventId: lastEvent?.id ?? null,
 		lastEventAt: lastEvent?.createdAt ?? null,
+		coordinatorMessageCount: conversation?.messageCount ?? 0,
+		coordinatorStopReason: conversation?.stopReason ?? null,
 	};
 }
 
 // ── Board ───────────────────────────────────────────────────────────────────
 
 const shortSha = (sha: string | null) => (sha ? sha.slice(0, 12) : null);
+
+const BOARD_ITEM_COLUMNS = {
+	id: teamWorkItems.id,
+	title: teamWorkItems.title,
+	kind: teamWorkItems.kind,
+	state: teamWorkItems.state,
+	branch: teamWorkItems.branchName,
+	baseRef: teamWorkItems.baseRef,
+	headSha: teamWorkItems.headSha,
+	reviewRounds: teamWorkItems.reviewRounds,
+	lastReview: teamWorkItems.lastReview,
+	worktreeResourceId: teamWorkItems.worktreeResourceId,
+	exclusiveKey: teamWorkItems.exclusiveKey,
+	createdAt: teamWorkItems.createdAt,
+	updatedAt: teamWorkItems.updatedAt,
+	worker: {
+		id: narrators.id,
+		title: narrators.title,
+		status: narrators.status,
+	},
+};
+
+type BoardItemRow = {
+	id: string;
+	title: string;
+	kind: string;
+	state: TeamBoardItem["state"];
+	branch: string | null;
+	baseRef: string | null;
+	headSha: string | null;
+	reviewRounds: number;
+	lastReview: TeamBoardItem["lastReview"];
+	worktreeResourceId: string | null;
+	exclusiveKey: string | null;
+	createdAt: string;
+	updatedAt: string;
+	worker: { id: string; title: string | null; status: string } | null;
+};
+
+/** A card from its row; a working or waiting worker's newest tool call is read here (R). */
+function boardItemOf(row: BoardItemRow): TeamBoardItem {
+	return {
+		id: row.id,
+		title: row.title,
+		kind: row.kind,
+		state: row.state,
+		branch: row.branch,
+		baseRef: row.baseRef,
+		headSha: shortSha(row.headSha),
+		worker: row.worker?.id ? agentRef(row.worker) : null,
+		reviewRounds: row.reviewRounds,
+		lastReview: row.lastReview,
+		hasWorktree: row.worktreeResourceId !== null,
+		exclusiveKey: row.exclusiveKey,
+		createdAt: row.createdAt,
+		updatedAt: row.updatedAt,
+		activity:
+			row.worker?.id && RUNNING_STATUSES.includes(row.worker.status as "working" | "waiting")
+				? workerActivity(row.worker.id)
+				: null,
+	};
+}
+
+/** One work item of a team as its card shows it (primary key), or null when it is not there. */
+export function readBoardItem(teamId: string, itemId: string): TeamBoardItem | null {
+	const row = db
+		.select(BOARD_ITEM_COLUMNS)
+		.from(teamWorkItems)
+		.leftJoin(narrators, eq(narrators.id, teamWorkItems.workerNarratorId))
+		.where(and(eq(teamWorkItems.id, itemId), eq(teamWorkItems.teamId, teamId)))
+		.limit(1)
+		.get();
+	return row ? boardItemOf(row) : null;
+}
 
 /**
  * One page of one board column. Open columns run oldest first (their queue order), finished
@@ -296,26 +380,7 @@ export async function readTeamBoardColumn(
 				)
 		: undefined;
 	const rows = db
-		.select({
-			id: teamWorkItems.id,
-			title: teamWorkItems.title,
-			kind: teamWorkItems.kind,
-			state: teamWorkItems.state,
-			branch: teamWorkItems.branchName,
-			baseRef: teamWorkItems.baseRef,
-			headSha: teamWorkItems.headSha,
-			reviewRounds: teamWorkItems.reviewRounds,
-			lastReview: teamWorkItems.lastReview,
-			worktreeResourceId: teamWorkItems.worktreeResourceId,
-			exclusiveKey: teamWorkItems.exclusiveKey,
-			createdAt: teamWorkItems.createdAt,
-			updatedAt: teamWorkItems.updatedAt,
-			worker: {
-				id: narrators.id,
-				title: narrators.title,
-				status: narrators.status,
-			},
-		})
+		.select(BOARD_ITEM_COLUMNS)
 		.from(teamWorkItems)
 		.leftJoin(narrators, eq(narrators.id, teamWorkItems.workerNarratorId))
 		.where(and(eq(teamWorkItems.teamId, teamId), inArray(teamWorkItems.state, states), keyset))
@@ -326,22 +391,7 @@ export async function readTeamBoardColumn(
 		.limit(options.limit + 1)
 		.all();
 	const page = rows.slice(0, options.limit);
-	const items: TeamBoardItem[] = page.map((row) => ({
-		id: row.id,
-		title: row.title,
-		kind: row.kind,
-		state: row.state,
-		branch: row.branch,
-		baseRef: row.baseRef,
-		headSha: shortSha(row.headSha),
-		worker: row.worker?.id ? agentRef(row.worker) : null,
-		reviewRounds: row.reviewRounds,
-		lastReview: row.lastReview,
-		hasWorktree: row.worktreeResourceId !== null,
-		exclusiveKey: row.exclusiveKey,
-		createdAt: row.createdAt,
-		updatedAt: row.updatedAt,
-	}));
+	const items: TeamBoardItem[] = page.map(boardItemOf);
 	const last = page.at(-1);
 	return {
 		column: options.column,
@@ -352,6 +402,40 @@ export async function readTeamBoardColumn(
 				: null,
 	};
 }
+
+/**
+ * What a running worker did last (R): its newest tool call, by the `(narrator_id, created_at)`
+ * index, one row, the input read as a bounded prefix.
+ */
+export function workerActivity(narratorId: string): TeamWorkerActivity | null {
+	const row = db
+		.select({
+			toolName: narratorToolCalls.toolName,
+			input: sql<string | null>`substr(${narratorToolCalls.inputJson}, 1, ${PREVIEW_SOURCE_CHARS})`,
+			createdAt: narratorToolCalls.createdAt,
+		})
+		.from(narratorToolCalls)
+		.where(eq(narratorToolCalls.narratorId, narratorId))
+		.orderBy(desc(narratorToolCalls.createdAt))
+		.limit(1)
+		.get();
+	if (!row) return null;
+	const kind = teamApprovalKind(row.toolName);
+	const preview =
+		kind === "question"
+			? (questionPreview(row.input)[0] ?? "")
+			: kind === "plan"
+				? planTitle(row.input)
+				: approvalPreview(row.input);
+	return {
+		toolName: row.toolName,
+		preview: clipText(preview.replace(/\s+/g, " "), TEAM_ACTIVITY_PREVIEW_CHARS),
+		at: row.createdAt,
+	};
+}
+
+const clipText = (value: string, max: number) =>
+	value.length > max ? `${value.slice(0, max - 1)}…` : value;
 
 // ── Activity ────────────────────────────────────────────────────────────────
 
@@ -509,6 +593,38 @@ export function approvalPreview(prefix: string | null): string {
 	}
 }
 
+/**
+ * The title of a plan (ExitPlanMode) from a bounded prefix of its input: the first non-empty
+ * line of `plan`, without its heading marks.
+ */
+export function planTitle(prefix: string | null): string {
+	if (!prefix) return "";
+	let plan = "";
+	try {
+		const parsed = JSON.parse(prefix) as { plan?: unknown };
+		if (typeof parsed.plan === "string") plan = parsed.plan;
+	} catch {
+		const match = /"plan"\s*:\s*"((?:[^"\\]|\\.)*)/.exec(prefix);
+		if (match?.[1]) {
+			try {
+				plan = JSON.parse(`"${match[1]}"`) as string;
+			} catch {
+				// A string cut off mid-escape: drop the broken tail.
+				try {
+					plan = JSON.parse(`"${match[1].replace(/\\[^"]*$/, "")}"`) as string;
+				} catch {
+					plan = "";
+				}
+			}
+		}
+	}
+	const line = plan
+		.split("\n")
+		.map((text) => text.replace(/^#+\s*/, "").trim())
+		.find(Boolean);
+	return line ? clipText(line, TEAM_APPROVAL_PREVIEW_CHARS) : "";
+}
+
 /** Questions shown per AskUserQuestion call, and characters per question. */
 const QUESTIONS_SHOWN = 3;
 const QUESTION_CHARS = 200;
@@ -592,7 +708,13 @@ export async function readTeamApprovals(
 			depth: depthOf(teamId, { id: row.narratorId, parentNarratorId: row.parentNarratorId }),
 			toolName: row.toolName,
 			kind,
-			preview: kind === "question" ? "" : approvalPreview(detail?.input ?? null),
+			parentId: row.parentNarratorId,
+			preview:
+				kind === "question"
+					? ""
+					: kind === "plan"
+						? planTitle(detail?.input ?? null)
+						: approvalPreview(detail?.input ?? null),
 			questions: kind === "question" ? questionPreview(detail?.input ?? null) : [],
 			decisionReason: detail?.reason ?? null,
 			createdAt: row.createdAt,
