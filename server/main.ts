@@ -77,7 +77,7 @@ import { mcpManager } from "./lib/mcp/manager";
 import { prepareMcpTools } from "./lib/mcp/tool-bridge";
 import { getNarraforkHome } from "./lib/narrafork-home";
 import { listenWithLanFallback, resolveListenHost } from "./lib/net/listen-host";
-import { reconcileNugRelayClients } from "./lib/nug-relay/manager";
+import { startNugRelayOwner, stopAllNugRelayClients } from "./lib/nug-relay/manager";
 import { openFrontendOnce } from "./lib/open-frontend";
 import { IS_WINDOWS, initWslFlag } from "./lib/platform";
 import { runPostShutdownHooks } from "./lib/post-shutdown-hooks";
@@ -183,6 +183,7 @@ import { scheduleProjectIndexRebuild, stopProjectIndexRebuild } from "./services
 import "./services/attention-hook-bridge"; // Bridge attention events into the hook system
 import { installAutoRouteSignals } from "./lib/agent/auto-route-signals";
 import { killAllBashProcesses } from "./lib/agent/tools/bash";
+import { startCommandCodeModelCatalog } from "./lib/commandcode-models";
 import { migrateAggregationsOnStartup } from "./services/aggregation-migration-service";
 import { initChatNotify } from "./services/chat-notify";
 import { initDeviceConnectionService } from "./services/device-connection-service";
@@ -257,6 +258,8 @@ await recoverProviderPrefixMigrationOnStartup().catch((error) => {
 });
 // auto:<model> routing reads live source availability (Codex accounts, key cooldowns).
 installAutoRouteSignals();
+// Publish the real Command Code directory before unattended/recovered Auto work can run.
+const stopCommandCodeModelCatalog = await startCommandCodeModelCatalog();
 // `auto` is reserved for auto:<model>; an older provider using it is renamed. A failure is
 // logged and leaves it working as an ordinary prefix, so startup never depends on it.
 // Runs on both backends (services/migration-db.ts picks the active handle).
@@ -1235,7 +1238,7 @@ async function initializeDatabaseStartup(): Promise<void> {
 
 	try {
 		// One-shot warmup when Kimi providers exist; no periodic timer — refresh is
-		// demand-driven (stale-while-revalidate on GET /api/kimi/usages, plus a
+		// demand-driven (stale-while-revalidate on GET /api/quota-snapshots, plus a
 		// refresh when provider settings change).
 		const { refreshAllKimiUsages } = await import("./lib/kimi-usage-cache");
 		void refreshAllKimiUsages().catch(() => {});
@@ -1649,10 +1652,9 @@ const databaseStartup = createDatabaseReaderStartup({
 });
 const databaseStartupPromise = databaseStartup.start();
 
-// Establish client-egress relay channels for NUG providers configured with
-// local egress (docs/CODEX_CLIENT_RELAY.md). Idempotent; also reconciled after
-// every settings save.
-reconcileNugRelayClients(settings.nugProviders ?? []);
+// Own client-egress relay channels before Auto routing can select NUG. Committed
+// settings and key edits are coalesced by this same owner, outside the read path.
+startNugRelayOwner();
 
 type GracefulShutdownOptions = {
 	reason: string;
@@ -2152,6 +2154,7 @@ async function performGracefulShutdown(
 		await step("teamMaintenance.stop", () => teamMaintenanceStop, budget.businessRemaining());
 		await step("authSessions.stop", () => {});
 		await step("gateway.stop", () => gateway.shutdown());
+		await step("nugRelays.stop", () => stopAllNugRelayClients());
 		await step("prefixSnapshots.stop", () => prefixSnapshotsStop);
 		await step("notificationFanout.stop", () => fanoutStop);
 		await step("notificationMaintenance.stop", () => notificationMaintenanceStop);
@@ -2199,6 +2202,7 @@ async function performGracefulShutdown(
 			),
 		);
 		await step("pluginManager.shutdown", () => pluginManager.shutdown(), 125_000);
+		await step("commandCode.models.stop", stopCommandCodeModelCatalog);
 		unregisterExternalProviderResolver();
 		await step("mcpManager.shutdown", () => mcpManager.shutdown());
 		// Checkpoint-backed update/system shutdown: persist active browser sessions and flip the

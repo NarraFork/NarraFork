@@ -3,7 +3,8 @@
  * no work yet, so the middle of the conversation says what to do — 「告诉协调者这个团队要完成什么」,
  * one line on what happens next, and three example goals that fill the composer when clicked
  * (`lib/composer-append-queue.ts`: the coordinator's composer takes the text once its draft has
- * loaded). Drawn over the empty message area only; the header and the composer stay usable.
+ * loaded). Drawn over the empty message area only (the coordinator's header sits above it, outside
+ * the panel); the composer stays usable.
  */
 import { requestComposerAppend } from "@frontend/lib/composer-append-queue";
 import { Box, Stack, Text, ThemeIcon, UnstyledButton } from "@mantine/core";
@@ -20,7 +21,7 @@ export function TeamStart({ teamId, onPick }: { teamId: string; onPick?: () => v
 				position: "absolute",
 				left: 0,
 				right: 0,
-				top: 56,
+				top: 0,
 				bottom: 150,
 				display: "flex",
 				alignItems: "center",
@@ -86,7 +87,7 @@ export function TeamReadOnlyStart() {
 				position: "absolute",
 				left: 0,
 				right: 0,
-				top: 56,
+				top: 0,
 				bottom: 150,
 				display: "flex",
 				alignItems: "center",

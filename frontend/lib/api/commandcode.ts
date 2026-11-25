@@ -16,28 +16,6 @@ export interface CommandCodeStatus {
 	reason?: string;
 }
 
-export interface CommandCodeCredits {
-	monthlyCredits: number;
-	purchasedCredits: number;
-	freeCredits: number;
-	creditThreshold: number;
-	belowThreshold: boolean;
-}
-
-export interface CommandCodeWindow {
-	used: number;
-	cap: number;
-	exceeded: boolean;
-	/** 窗口重置时间（毫秒时间戳）。 */
-	resetAt?: number;
-}
-
-export interface CommandCodeWindowLimits {
-	limited: boolean;
-	fiveHour?: CommandCodeWindow;
-	weekly?: CommandCodeWindow;
-}
-
 export interface CommandCodeUsageSummary {
 	totalCount: number;
 	totalTokens: number;
@@ -51,13 +29,10 @@ export interface CommandCodeUsageSummary {
 	periodStart?: string;
 }
 
-export interface CommandCodeUsageResponse {
+export interface CommandCodeUsageSummaryResponse {
 	loggedIn: boolean;
 	reason?: string;
 	error?: string;
-	credits?: CommandCodeCredits;
-	windowLimits?: CommandCodeWindowLimits;
-	sandboxAccess?: boolean;
 	summary?: CommandCodeUsageSummary;
 }
 
@@ -72,9 +47,11 @@ export const commandCodeApi = {
 		return (await response.json()) as CommandCodeStatus;
 	},
 
-	async commandCodeUsage(): Promise<CommandCodeUsageResponse> {
-		const response = await fetch(`${apiBase()}/commandcode/usage`, { headers: authHeaders() });
-		return (await response.json()) as CommandCodeUsageResponse;
+	async commandCodeUsageSummary(): Promise<CommandCodeUsageSummaryResponse> {
+		const response = await fetch(`${apiBase()}/commandcode/usage-summary`, {
+			headers: authHeaders(),
+		});
+		return (await response.json()) as CommandCodeUsageSummaryResponse;
 	},
 
 	/**

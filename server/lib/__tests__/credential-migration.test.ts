@@ -144,6 +144,42 @@ const UNDECRYPTABLE = JSON.stringify({
 });
 
 describe("credential migration", () => {
+	for (const [owner, groupId] of [
+		["builtin:tokendance", "tokendance"],
+		["builtin:CommandCode", "CommandCode"],
+		["nug:pool-gw", "pool-gw"],
+	] as const) {
+		for (const [scenario, extras] of [
+			["single plain", [{}]],
+			["second disabled", [{}, { disabled: true }]],
+			["first disabled", [{ disabled: true }, {}]],
+			["single network", [{ network: { userAgentMode: "claude-code" } }]],
+			["all disabled", [{ disabled: true }, { disabled: true }]],
+		] as const) {
+			test(`${owner} ${scenario} preserves pre-restart pool accounting and disabled keys`, () => {
+				const keys = extras.map((extra, index) =>
+					key(owner, `pooled-key-${index}`, `secret-${index}`, { priority: index, ...extra }),
+				);
+				const { dir } = legacyHome({ accounts: [], keys });
+				const legacy = new ProviderKeyStore(join(dir, "provider-keys.json"));
+				const before = legacy.list(owner);
+				const pooled = before.length > 1 || !!before[0]?.network;
+				const expected = before.map((item) => (pooled ? item.id : groupId));
+				expect(migrateCredentialFiles(dir)).toBe("migrated");
+				const file = credentialsOf(dir);
+				expect(file.credentials.map((item) => item.id)).toEqual(expected);
+				expect(file.credentials.every((item) => item.target.groupId === groupId)).toBe(true);
+				expect(new Set(file.credentials.map((item) => item.id)).size).toBe(keys.length);
+				const restarted = new ProviderKeyStore(join(dir, "provider-keys.json"));
+				expect(
+					restarted.list(owner).map((item) => ({ id: item.id, disabled: !!item.disabled })),
+				).toEqual(
+					before.map((item, index) => ({ id: expected[index], disabled: !!item.disabled })),
+				);
+				expect(migrateCredentialFiles(dir)).toBe("unified");
+			});
+		}
+	}
 	test("each kind gets the id its requests are billed to", () => {
 		const { dir } = legacyHome();
 		expect(migrateCredentialFiles(dir)).toBe("migrated");

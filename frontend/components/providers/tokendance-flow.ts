@@ -1,4 +1,8 @@
-import type { TokenDanceDraftRestore, TokenDanceDraftSnapshot } from "@shared/tokendance";
+import type {
+	TokenDanceDraftRestore,
+	TokenDanceDraftSnapshot,
+	TokenDanceLoginChoice,
+} from "@shared/tokendance";
 import { api } from "../../lib/api";
 import { onTokenChange } from "../../lib/api/client";
 import { getAppBase } from "../../lib/base-path";
@@ -105,12 +109,16 @@ export function clearTokenDanceFlow(flowId: string) {
 	for (const key of restoreClaims.keys())
 		if (key.endsWith(`\u0000${flowId}`)) restoreClaims.delete(key);
 }
-export async function startTokenDanceLogin(snapshot: TokenDanceDraftSnapshot) {
+export async function startTokenDanceLogin(
+	snapshot: TokenDanceDraftSnapshot,
+	loginChoice?: TokenDanceLoginChoice,
+) {
 	callbackCapture = undefined;
 	callbackCompletion = undefined;
 	const flow = await api.tokenDanceOAuthStart({
 		callbackUrl: tokenDanceCallbackUrl(),
 		draftSnapshot: snapshot,
+		...(loginChoice ? { loginChoice } : {}),
 	});
 	try {
 		sessionStorage.setItem(TOKENDANCE_FLOW_MARKER, flow.flowId);

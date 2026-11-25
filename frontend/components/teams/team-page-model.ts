@@ -8,6 +8,7 @@
  * Pure: no DOM, no React.
  */
 import {
+	dependencyBlockers,
 	TEAM_LEVEL_EVENT_KINDS,
 	TEAM_OVERLAP_EVENT_KINDS,
 	TEAM_PERSON_DECISION_EVENT_KINDS,
@@ -18,6 +19,7 @@ import {
 	type TeamPageSummary,
 	type TeamPendingApproval,
 	type TeamSummary,
+	type TeamWorkDependencyRef,
 } from "@shared/project-teams";
 
 /**
@@ -49,6 +51,29 @@ export function liveWorkerStatus(
 	const complete = summary.runningCount <= summary.runningAgents.length;
 	if (complete && (worker.status === "working" || worker.status === "waiting")) return "idle";
 	return worker.status;
+}
+
+/**
+ * The coordinator column's header line: how many other sessions of the tree are running, and the
+ * coordinator's own state when nothing else runs. The summary's running list does not say which
+ * sessions are work-item workers (reviewers and nested subagents run in the same tree), so the
+ * line counts sessions, not workers. When the list was cut (`more`) the count is a lower bound,
+ * shown as 「N+」: the listed others plus at least one unlisted, so it is never 「0+」.
+ */
+export function coordinatorLine(
+	summary: Pick<TeamPageSummary, "teamId" | "coordinatorStatus" | "runningAgents" | "runningCount">,
+):
+	| { kind: "running"; count: number; more: boolean }
+	| { kind: "status"; status: "working" | "waiting" | "idle" | "archived" } {
+	const others = summary.runningAgents.filter((agent) => agent.id !== summary.teamId).length;
+	const more = summary.runningCount > summary.runningAgents.length;
+	if (more) return { kind: "running", count: others + 1, more };
+	if (others > 0) return { kind: "running", count: others, more };
+	const status = summary.coordinatorStatus;
+	return {
+		kind: "status",
+		status: status === "working" || status === "waiting" || status === "archived" ? status : "idle",
+	};
 }
 
 /** "50+" past a capped count (the server counts one past its limit). */
@@ -129,6 +154,16 @@ export function eventNote(
 			const reason = text(detail.reason, 600);
 			return reason ? { key: "text", values: { text: reason } } : null;
 		}
+		case "work.dependencies_changed": {
+			// The whole set, merged ones included (the event keeps no states): never "waits for N".
+			const count = Array.isArray(detail.dependsOn) ? detail.dependsOn.length : null;
+			if (count === null) return null;
+			return count === 0
+				? { key: "dependenciesCleared", values: {} }
+				: { key: "dependencies", values: { count } };
+		}
+		case "work.unblocked":
+			return { key: "unblocked", values: {} };
 		case "approval.allowed":
 		case "approval.denied":
 		case "question.answered":
@@ -589,7 +624,7 @@ export function rowLine(row: WorkRow, workerStatus: string | null, base: string)
 						tone: "blue",
 					};
 		case "queued":
-			return { key: "queued", values: {}, detail: null, tone: "hollow" };
+			return queuedLine(item.dependsOn);
 		case "merged":
 			return { key: "merged", values: { base }, detail: null, tone: "gray" };
 		case "cancelled":
@@ -613,10 +648,61 @@ export function rowLine(row: WorkRow, workerStatus: string | null, base: string)
 	}
 }
 
+/**
+ * D: a queued row's line. Waiting on dependencies it reads 「排队 · 等「A」「B」合并」 (the
+ * titles when one or two, else 「等 N 项合并」); a cancelled dependency, which never merges,
+ * reads 「排队 · 依赖「A」已取消」 until the coordinator removes or replaces it (the drawer warns).
+ */
+export function queuedLine(dependsOn: readonly TeamWorkDependencyRef[] | undefined): RowLine {
+	const blockers = dependencyBlockers(dependsOn);
+	const cancelled = blockers.find((blocker) => blocker.state === "cancelled");
+	if (cancelled)
+		return {
+			key: "queuedBlockedCancelled",
+			values: { title: cancelled.title },
+			detail: null,
+			tone: "hollow",
+		};
+	const [first, second] = blockers;
+	if (!first) return { key: "queued", values: {}, detail: null, tone: "hollow" };
+	if (blockers.length === 1)
+		return {
+			key: "queuedWaitingOne",
+			values: { first: first.title },
+			detail: null,
+			tone: "hollow",
+		};
+	if (blockers.length === 2 && second)
+		return {
+			key: "queuedWaitingTwo",
+			values: { first: first.title, second: second.title },
+			detail: null,
+			tone: "hollow",
+		};
+	return {
+		key: "queuedWaitingMany",
+		values: { count: blockers.length },
+		detail: null,
+		tone: "hollow",
+	};
+}
+
 /** A return reason a person typed, trimmed; null when it cannot be sent. */
 export function returnReason(text: string): string | null {
 	const trimmed = text.trim();
 	return trimmed && trimmed.length <= TEAM_RETURN_REASON_MAX_LENGTH ? trimmed : null;
+}
+
+/** Lines a review round's findings show before 「展开」. */
+export const REVIEW_FINDINGS_CLAMP_LINES = 3;
+
+/**
+ * Whether a round's findings may run past {@link REVIEW_FINDINGS_CLAMP_LINES} lines in the drawer
+ * and so get 「展开 / 收起」: more lines than that, or more text than fits them at the drawer's
+ * narrowest width (an estimate; a short text never gets the toggle).
+ */
+export function findingsNeedToggle(text: string): boolean {
+	return text.split("\n").length > REVIEW_FINDINGS_CLAMP_LINES || text.length > 140;
 }
 
 /** How one line of a unified diff is drawn. */

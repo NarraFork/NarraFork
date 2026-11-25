@@ -78,8 +78,8 @@ export function getCredentialMigrationConflicts(): readonly CredentialIdConflict
 const SECRET_OWNER = /^(quota|nug-oauth):/;
 
 /**
- * Billing ids, by §15.3: Codex accounts and pooled keys keep theirs; a NUG, TokenDance or
- * Command Code key takes its group id; a connection whose requests are billed to the
+ * Billing ids, by §15.3: Codex accounts and pooled keys keep theirs; a single plain NUG,
+ * TokenDance or Command Code key takes its group id; a connection whose requests are billed to the
  * connection itself (one enabled key, the first, without its own network identity — see
  * `registerCredentialProviderSource` in agent/provider.ts) gives that key the connection id,
  * unless another credential already has it.
@@ -90,9 +90,13 @@ export function assignCredentialIds(
 ): ProviderKey[] {
 	const inference = keys.filter((k) => !SECRET_OWNER.test(k.providerId));
 	const ids = new Map<ProviderKey, string>();
+	const groups = Map.groupBy(inference, (key) => key.providerId);
 	for (const key of inference) {
 		const group = keyOwnerGroup(key.providerId);
-		ids.set(key, group === key.providerId ? key.id : group);
+		// Builtins and NUG now pool keys too. Only a single plain key has ever
+		// been billed to the group; multi-key/network identities must survive restart.
+		const plain = groups.get(key.providerId)?.length === 1 && !key.network;
+		ids.set(key, group !== key.providerId && plain ? group : key.id);
 	}
 	const connections = Map.groupBy(
 		inference.filter((k) => keyOwnerGroup(k.providerId) === k.providerId),

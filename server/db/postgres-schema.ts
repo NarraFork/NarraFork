@@ -4656,6 +4656,34 @@ export const teamWorkItems = pgTable(
 	],
 );
 
+export const teamWorkItemDependencies = pgTable(
+	"team_work_item_dependencies",
+	{
+		itemId: text("item_id")
+			.notNull()
+			.references((): PgColumn => teamWorkItems.id, { onDelete: "cascade" }),
+		dependsOnItemId: text("depends_on_item_id").notNull(),
+		teamId: text("team_id").notNull(),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		index("idx_team_work_item_dependencies_target").on(table.dependsOnItemId, table.itemId),
+		index("idx_team_work_item_dependencies_team").on(table.teamId),
+		check("ck_team_work_item_dependencies_self", sql.raw('"item_id" <> "depends_on_item_id"')),
+		foreignKey({
+			name: "team_work_item_dependencies_depends_on_item_id_te_69b44cd09b_fk",
+			columns: [table.dependsOnItemId],
+			foreignColumns: [teamWorkItems.id],
+		}).onDelete("cascade"),
+		foreignKey({
+			name: "team_work_item_dependencies_team_id_project_teams_94291c95ba_fk",
+			columns: [table.teamId],
+			foreignColumns: [projectTeams.narratorId],
+		}).onDelete("cascade"),
+		primaryKey({ columns: [table.itemId, table.dependsOnItemId] }),
+	],
+);
+
 export const teamWorkEvents = pgTable(
 	"team_work_events",
 	{
@@ -4687,8 +4715,8 @@ export const teamWorkEvents = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 150,
-  "columnCount": 1981,
+  "tableCount": 151,
+  "columnCount": 1985,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -31376,6 +31404,105 @@ export const POSTGRES_SCHEMA_COVERAGE = {
       "foreignKeys": [],
       "uniqueConstraints": [],
       "primaryKeys": []
+    },
+    {
+      "exportName": "teamWorkItemDependencies",
+      "name": "team_work_item_dependencies",
+      "columns": [
+        {
+          "property": "itemId",
+          "name": "item_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "teamWorkItems",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "team_work_item_dependencies_item_id_team_work_items_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "dependsOnItemId",
+          "name": "depends_on_item_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "teamWorkItems",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "team_work_item_dependencies_depends_on_item_id_te_69b44cd09b_fk"
+          },
+          "emitAsTableConstraint": true
+        },
+        {
+          "property": "teamId",
+          "name": "team_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "projectTeams",
+            "column": "narratorId",
+            "onDelete": "cascade",
+            "constraintName": "team_work_item_dependencies_team_id_project_teams_94291c95ba_fk"
+          },
+          "emitAsTableConstraint": true
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_team_work_item_dependencies_target",
+          "columns": [
+            "dependsOnItemId",
+            "itemId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_team_work_item_dependencies_team",
+          "columns": [
+            "teamId"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [
+        "ck_team_work_item_dependencies_self"
+      ],
+      "checkDefinitions": [
+        {
+          "name": "ck_team_work_item_dependencies_self",
+          "expression": "\"item_id\" <> \"depends_on_item_id\""
+        }
+      ],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": [
+        {
+          "columns": [
+            "itemId",
+            "dependsOnItemId"
+          ]
+        }
+      ]
     },
     {
       "exportName": "teamWorkEvents",

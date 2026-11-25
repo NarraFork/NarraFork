@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { selectProviderKey } from "../agent/pooled-provider";
 import {
 	COMMAND_CODE_PROVIDER_BASE,
 	commandCodeApiOrigin,
@@ -9,13 +10,71 @@ import {
 } from "../commandcode-protocol";
 import {
 	commandCodeUsageSnapshot,
+	getCommandCodeUsageForCredential,
+	listCommandCodeUsageSubjects,
 	parseCommandCodeCredits,
 	parseCommandCodeSummary,
 	probeCommandCodeQuota,
 	readResponseJsonLimited,
 } from "../commandcode-usage";
 import { keyQuotaBlockedUntil } from "../provider-key-quota";
+import { COMMAND_CODE_KEY_OWNER, getProviderKeyStore } from "../provider-keys";
+import { saveSettings, settings } from "../settings";
 import { quotaStore } from "../sourcing/quota-store";
+
+test("Command Code windows belong to the probed key, including after reorder", async () => {
+	const saved = structuredClone(settings.commandCode);
+	const store = getProviderKeyStore();
+	const realFetch = globalThis.fetch;
+	try {
+		saveSettings({
+			...settings,
+			commandCode: { apiKey: "cc-window-first", baseUrl: "https://cc.example/provider" },
+		});
+		const first = store.list(COMMAND_CODE_KEY_OWNER)[0];
+		if (!first) throw new Error("Missing first Command Code key");
+		const second = store.add(COMMAND_CODE_KEY_OWNER, { apiKey: "cc-window-second" });
+		globalThis.fetch = (async (input, init) => {
+			const exhausted = new Headers(init?.headers).get("Authorization")?.endsWith("first");
+			return Response.json(
+				String(input).endsWith("/credits")
+					? {
+							credits: { monthlyCredits: exhausted ? 0 : 10 },
+							windowLimits: {
+								limited: true,
+								fiveHour: {
+									used: exhausted ? 10 : 1,
+									cap: 10,
+									exceeded: exhausted,
+									resetAt: Date.now() + 60_000,
+								},
+							},
+						}
+					: {},
+			);
+		}) as typeof fetch;
+		await getCommandCodeUsageForCredential(first.id);
+		await getCommandCodeUsageForCredential(second.id);
+		expect(keyQuotaBlockedUntil(first.id)).toBeGreaterThan(Date.now());
+		expect(keyQuotaBlockedUntil(second.id)).toBeUndefined();
+		expect(selectProviderKey(COMMAND_CODE_KEY_OWNER)?.id).toBe(second.id);
+		store.reorder(COMMAND_CODE_KEY_OWNER, [second.id, first.id]);
+		expect(listCommandCodeUsageSubjects().map((subject) => subject.id)).toEqual([
+			second.id,
+			first.id,
+		]);
+		expect((await getCommandCodeUsageForCredential(first.id))?.credits.monthlyCredits).toBe(0);
+		expect((await getCommandCodeUsageForCredential(second.id))?.credits.monthlyCredits).toBe(10);
+		store.update(first.id, { disabled: true });
+		expect(await getCommandCodeUsageForCredential(first.id)).toBeUndefined();
+		quotaStore.remove(first.id);
+		quotaStore.remove(second.id);
+	} finally {
+		globalThis.fetch = realFetch;
+		store.removeProvider(COMMAND_CODE_KEY_OWNER);
+		saveSettings({ ...settings, commandCode: saved });
+	}
+});
 
 describe("Command Code 端点选择（规则与实测 supported_endpoints 一致）", () => {
 	test("claude 系只支持 /messages", () => {

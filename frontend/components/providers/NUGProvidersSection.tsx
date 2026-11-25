@@ -40,17 +40,20 @@ import {
 	useProviderQuotaCapability,
 	useProviderRuntimeCapability,
 } from "../../hooks/usePlatform";
+import { useQuotaSnapshot, useRefreshQuotaSnapshots } from "../../hooks/useQuotaSnapshots";
 import { api } from "../../lib/api";
 import type { ModelOption } from "../../lib/constants";
 import { formatLocaleNumber, formatLocaleTime } from "../../lib/intl-format";
 import type { ProxyOverride } from "../../lib/proxy";
 import { extractPrimaryDomainLabel } from "../../lib/url";
 import { ProxyOverrideField } from "../common/ProxyOverrideField";
+import { QuotaSnapshotIndicator } from "../narrator/model/QuotaSnapshotIndicator";
 import { ContextWindowField } from "./ContextWindowField";
 import type { ChannelHealth } from "./channel-health";
 import { channelHealthKey, normalizeChannelHealth } from "./channel-health";
 import type { CustomModelEntry } from "./InlineCustomModels";
 import { InlineCustomModels } from "./InlineCustomModels";
+import { ProviderKeysPanel } from "./ProviderKeysPanel";
 
 /* ── Types ─────────────────────────────────────────────── */
 
@@ -76,15 +79,6 @@ export interface NUGProviderState {
 }
 
 type ProvidersUpdater = NUGProviderState[] | ((prev: NUGProviderState[]) => NUGProviderState[]);
-
-interface QuotaInfo {
-	balance: number;
-	totalGranted: number;
-	detailedQuotaBalance?: string | null;
-	extra?: unknown;
-	username?: string;
-	role?: string;
-}
 
 interface UsageEvent {
 	id: string;
@@ -118,6 +112,8 @@ interface UsageSummary {
 interface NUGProvidersSectionProps {
 	providers: NUGProviderState[];
 	onProvidersChange: (updater: ProvidersUpdater) => void;
+	/** The page rebases this immediately persisted field into its discard baseline. */
+	onPersistedKeyChanged?: (providerId: string, apiKey: string) => void;
 	providerModelsMap: Record<string, ModelOption[]>;
 	hiddenModels: Set<string>;
 	onToggleHidden: (modelVal: string) => void;
@@ -390,50 +386,13 @@ function NUGAccountInfo({
 	quotaRouteUnsupportedReason: string;
 }) {
 	const { t } = useTranslation("settings");
-	const qc = useQueryClient();
 	const quotaCapability = useProviderQuotaCapability("nug");
 	const canReadQuota = quotaCapability.supported && quotaRouteSupported;
 	const quotaUnsupportedReason = quotaCapability.supported
 		? quotaRouteUnsupportedReason
 		: (quotaCapability.reason ?? t("providerQuotaUnsupported"));
-	const [quota, setQuota] = useState<QuotaInfo | null>(null);
-	const [loading, setLoading] = useState(false);
-
-	const fetchQuota = useCallback(async () => {
-		if (!canReadQuota) return;
-		setLoading(true);
-		try {
-			const res = await api.nugGetQuota(providerId);
-			setQuota(res);
-			qc.setQueryData(["nug", "quotas"], (old: unknown) => {
-				const quotas = old && typeof old === "object" ? (old as Record<string, unknown>) : {};
-				const existing =
-					quotas[providerId] && typeof quotas[providerId] === "object"
-						? (quotas[providerId] as Record<string, unknown>)
-						: {};
-				return {
-					...quotas,
-					[providerId]: {
-						...existing,
-						balance: res.balance,
-						totalGranted: res.totalGranted,
-						detailedQuotaBalance: res.detailedQuotaBalance ?? null,
-						...(res.extra !== undefined ? { extra: res.extra } : {}),
-					},
-				};
-			});
-		} catch {
-			/* ignore */
-		} finally {
-			setLoading(false);
-		}
-	}, [providerId, canReadQuota, qc]);
-
-	useEffect(() => {
-		if (canReadQuota) fetchQuota();
-	}, [fetchQuota, canReadQuota]);
-
-	if (!nugUsername && !quota) return null;
+	const quota = useQuotaSnapshot(providerId, undefined, canReadQuota);
+	const refresh = useRefreshQuotaSnapshots();
 
 	return (
 		<Paper withBorder p="xs">
@@ -441,32 +400,18 @@ function NUGAccountInfo({
 				<Group gap="xs">
 					<IconUser size={16} />
 					<Text size="sm" fw={500}>
-						{nugUsername ?? quota?.username ?? "—"}
+						{nugUsername ?? "—"}
 					</Text>
-					{quota?.role && (
-						<Badge size="xs" variant="light" color={quota.role === "admin" ? "violet" : "blue"}>
-							{quota.role}
-						</Badge>
-					)}
 				</Group>
 				<Group gap="xs">
-					{quota && (
-						<>
-							<Badge size="xs" variant="light" color="teal">
-								{t("nugQuotaBalance", { balance: quota.balance.toFixed(2) })}
-							</Badge>
-							<Badge size="xs" variant="light" color="gray">
-								{t("nugQuotaGranted", { total: quota.totalGranted.toFixed(2) })}
-							</Badge>
-						</>
-					)}
+					<QuotaSnapshotIndicator snapshot={quota.data} title="NUG" />
 					<ActionIcon
 						variant="subtle"
 						size="sm"
-						loading={loading}
+						loading={refresh.isPending}
 						disabled={!canReadQuota}
 						title={!canReadQuota ? quotaUnsupportedReason : undefined}
-						onClick={fetchQuota}
+						onClick={() => refresh.mutate({ groupId: providerId })}
 					>
 						<IconRefresh size={14} />
 					</ActionIcon>
@@ -824,6 +769,7 @@ function NUGUsageRecords({ providerId }: { providerId: string }) {
 export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 	providers,
 	onProvidersChange,
+	onPersistedKeyChanged,
 	providerModelsMap,
 	hiddenModels,
 	onToggleHidden,
@@ -1227,6 +1173,13 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 									</Tooltip>
 								)}
 							</Group>
+
+							<ProviderKeysPanel
+								key={p.id}
+								providerId={p.id}
+								showSingleKey
+								onFirstKeyChanged={(apiKey) => onPersistedKeyChanged?.(p.id, apiKey)}
+							/>
 
 							{/* OAuth config (collapsible) */}
 							<Group gap="xs">

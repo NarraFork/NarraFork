@@ -16,7 +16,16 @@ export function reportCredentialId<T extends ProviderAdapter>(adapter: T, creden
 		const onRequestStart = params.onRequestStart;
 		for await (const event of chat({
 			...params,
-			onRequestStart: onRequestStart && ((info) => onRequestStart({ ...info, credentialId })),
+			onRequestStart:
+				onRequestStart &&
+				((info) =>
+					onRequestStart({
+						...info,
+						credentialId,
+						validateDiagnosticCredential: () =>
+							adapter.isDiagnosticConnectionCurrent?.() !== false &&
+							info?.validateDiagnosticCredential?.() !== false,
+					})),
 		})) {
 			yield { ...event, credentialId };
 		}

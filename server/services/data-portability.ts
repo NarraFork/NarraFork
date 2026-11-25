@@ -20,7 +20,8 @@
  * - 不导出的会话附属表（如 `outline_spec_imports`）：覆盖会话改了 task_backend 时删掉它的行，清空会话时一起清；
  * - 被吞内容排查的两张表（`outline_spec_loss_findings` / `outline_spec_loss_scans`，12c）也不导出：
  *   说的是本机 spec 修订的事（spec 表不导出），覆盖会话不动它们，清空会话时一起清；
- * - team 的三张表（`project_teams` / `team_work_items` / `team_work_events`）不导出：它们记的是
+ * - team 的四张表（`project_teams` / `team_work_items` / `team_work_item_dependencies` /
+ *   `team_work_events`）不导出：它们记的是
  *   本机的 git 分支和 worktree。导入后会话的 `team` trait 以本机有没有 team 行为准
  *   （`reconcileImportedTeamTraits`）；清空会话时先删 team 表（team 行 RESTRICT 会话删除）；
  * - 改完跑 `bun test --isolate server/services/__tests__/data-portability*.test.ts`。
@@ -2071,6 +2072,7 @@ export async function clearData(target: ClearTarget): Promise<ClearResult> {
 				// Teams are their coordinator sessions: the team row restricts the session delete, and
 				// its work items and events cascade with it. Children first, explicitly.
 				sqlite.run(`DELETE FROM team_work_events`);
+				sqlite.run(`DELETE FROM team_work_item_dependencies`);
 				sqlite.run(`DELETE FROM team_work_items`);
 				sqlite.run(`DELETE FROM project_teams`);
 				// Exact peers first, then inheritance nodes; never reconnect children during clear.
@@ -2128,6 +2130,9 @@ export async function clearData(target: ClearTarget): Promise<ClearResult> {
 			}
 		});
 		transaction();
+		if (clearProviders) {
+			await (await import("@server/lib/credential-transfer/plugin")).clearPluginCredentialSecrets();
+		}
 		if (clearSessions) {
 			invalidateGitIdentityCache();
 			invalidateTaskBackend();

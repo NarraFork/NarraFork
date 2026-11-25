@@ -136,7 +136,7 @@ function usageResponses() {
 	};
 }
 
-test("settings-key usage is a 60-second snapshot cache with the exact legacy response", async () => {
+test("usage summary preserves statistics and omits quota while reusing the settings-key cache", async () => {
 	const originalFetch = globalThis.fetch;
 	const originalNow = Date.now;
 	const original = structuredClone(settings);
@@ -156,17 +156,14 @@ test("settings-key usage is a 60-second snapshot cache with the exact legacy res
 			commandCode: { ...settings.commandCode, apiKey: "usage-settings-key" },
 		});
 		const app = appForRole("user");
-		const first = await app.request("/commandcode/usage");
+		const first = await app.request("/commandcode/usage-summary");
 		expect(first.status).toBe(200);
 		const body = (await first.json()) as Record<string, unknown>;
 		expect(body).toEqual({
 			loggedIn: true,
-			credits: bodies.credits.credits,
-			windowLimits: bodies.credits.windowLimits,
-			sandboxAccess: true,
 			summary: bodies.summary,
 		});
-		const second = await app.request("/commandcode/usage");
+		const second = await app.request("/commandcode/usage-summary");
 		expect(await second.json()).toEqual(body);
 		expect(calls).toBe(2);
 		credentialId = getProviderKeyStore().list(COMMAND_CODE_KEY_OWNER)[0]?.id ?? "CommandCode";
@@ -176,11 +173,12 @@ test("settings-key usage is a 60-second snapshot cache with the exact legacy res
 			{ kind: "weekly", usedRatio: 0.1, resetsAt: null },
 		]);
 		expect(snapshot?.balances).toEqual([{ unit: "credits", remaining: 25, total: 28 }]);
-		const { loggedIn: _loggedIn, ...usage } = body;
-		expect(snapshot?.detail).toEqual(usage);
+		expect(snapshot?.detail).toEqual({ ...bodies.credits, summary: bodies.summary });
+		expect(body).not.toHaveProperty("credits");
+		expect(body).not.toHaveProperty("windowLimits");
 
 		Date.now = () => now + COMMAND_CODE_USAGE_STALE_MS + 1;
-		expect((await app.request("/commandcode/usage")).status).toBe(200);
+		expect((await app.request("/commandcode/usage-summary")).status).toBe(200);
 		expect(calls).toBe(4);
 	} finally {
 		Date.now = originalNow;
@@ -217,19 +215,19 @@ test("a late old-key refresh cannot overwrite the current key's snapshot", async
 	try {
 		saveSettings({ ...settings, commandCode: { ...settings.commandCode, apiKey: "key-a" } });
 		const app = appForRole("user");
-		const oldRequest = app.request("/commandcode/usage");
+		const oldRequest = app.request("/commandcode/usage-summary");
 		saveSettings({ ...settings, commandCode: { ...settings.commandCode, apiKey: "key-b" } });
 		credentialId = getProviderKeyStore().list(COMMAND_CODE_KEY_OWNER)[0]?.id ?? "CommandCode";
-		expect((await app.request("/commandcode/usage")).status).toBe(200);
+		expect((await app.request("/commandcode/usage-summary")).status).toBe(200);
 		const callsAfterFresh = calls;
 		expect(quotaStore.peek(credentialId)?.detail).toMatchObject({
 			credits: { monthlyCredits: 30 },
 		});
 		finishOldCredits();
 		expect((await oldRequest).status).toBe(200);
-		const current = await app.request("/commandcode/usage");
+		const current = await app.request("/commandcode/usage-summary");
 		expect(current.status).toBe(200);
-		expect(await current.json()).toMatchObject({ credits: { monthlyCredits: 30 } });
+		expect(await current.json()).toEqual({ loggedIn: true, summary: bodies.summary });
 		expect(quotaStore.peek(credentialId)?.detail).toMatchObject({
 			credits: { monthlyCredits: 30 },
 		});
@@ -260,8 +258,8 @@ test("CLI auth falls back to the original uncached requests and writes no snapsh
 	try {
 		saveSettings({ ...settings, commandCode: { ...settings.commandCode, apiKey: "" } });
 		const app = appForRole("user");
-		const first = await app.request("/commandcode/usage");
-		const second = await app.request("/commandcode/usage");
+		const first = await app.request("/commandcode/usage-summary");
+		const second = await app.request("/commandcode/usage-summary");
 		expect(first.status).toBe(200);
 		expect(await second.json()).toEqual(await first.json());
 		expect(calls).toBe(4);

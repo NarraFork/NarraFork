@@ -23,11 +23,13 @@ import {
 	TEAM_APPROVALS_LIMIT,
 	TEAM_BOARD_COLUMN_STATES,
 	TEAM_BOARD_COLUMNS,
+	TEAM_EVENT_DETAIL_MAX_BYTES,
 	TEAM_EVENT_DETAIL_PREVIEW_CHARS,
 	TEAM_HELD_WORKTREES_LIMIT,
 	TEAM_PAUSE_LIMIT,
 	TEAM_QUESTION_OPTIONS_MAX,
 	TEAM_RETURN_REASON_MAX_LENGTH,
+	TEAM_REVIEW_SUMMARY_MAX_LENGTH,
 	TEAM_RUNNING_AGENTS_LIMIT,
 	TEAM_WORK_RETURNED_EVENT_KIND,
 	type TeamActivityEvent,
@@ -61,6 +63,7 @@ import { canManageNarratorAcl, type NarratorPrincipal } from "../narrator-acl";
 import { shouldHidePendingPermission } from "../pending-permission-visibility";
 import { readTeamMembers } from "./team-members";
 import { loadTeamForAccess } from "./team-service";
+import { readDependencies } from "./work-item-dependencies";
 
 const RUNNING_STATUSES: ("working" | "waiting")[] = ["working", "waiting"];
 
@@ -435,6 +438,15 @@ function boardItemOf(row: BoardItemRow): TeamBoardItem {
 	};
 }
 
+/**
+ * D: the cards with their dependencies, read for the whole page in one query (never per card).
+ * A card without dependencies carries an empty list.
+ */
+function withDependencies<T extends TeamBoardItem>(items: T[]): T[] {
+	const dependencies = readDependencies(items.map((item) => item.id));
+	return items.map((item) => ({ ...item, dependsOn: dependencies.get(item.id) ?? [] }));
+}
+
 /** One work item of a team as its card shows it (primary key), or null when it is not there. */
 export function readBoardItem(teamId: string, itemId: string): TeamBoardItem | null {
 	const row = db
@@ -444,7 +456,7 @@ export function readBoardItem(teamId: string, itemId: string): TeamBoardItem | n
 		.where(and(eq(teamWorkItems.id, itemId), eq(teamWorkItems.teamId, teamId)))
 		.limit(1)
 		.get();
-	return row ? boardItemOf(row) : null;
+	return row ? (withDependencies([boardItemOf(row)])[0] ?? null) : null;
 }
 
 /**
@@ -473,7 +485,9 @@ export function readReadyItems(
 		.limit(limit + 1)
 		.all();
 	return {
-		items: rows.slice(0, limit).map(({ teamId, ...row }) => ({ ...boardItemOf(row), teamId })),
+		items: withDependencies(
+			rows.slice(0, limit).map(({ teamId, ...row }) => ({ ...boardItemOf(row), teamId })),
+		),
 		more: rows.length > limit,
 	};
 }
@@ -645,7 +659,7 @@ export async function readTeamBoardColumn(
 		.limit(options.limit + 1)
 		.all();
 	const page = rows.slice(0, options.limit);
-	const items: TeamBoardItem[] = page.map(boardItemOf);
+	const items: TeamBoardItem[] = withDependencies(page.map(boardItemOf));
 	const last = page.at(-1);
 	return {
 		column: options.column,
@@ -771,11 +785,67 @@ export const returnedReasonColumns = {
 	>`case when ${teamWorkEvents.kind} = ${TEAM_WORK_RETURNED_EVENT_KIND} then substr(${teamWorkEvents.detailJson}, 1, ${TEAM_RETURN_DETAIL_MAX_CHARS}) end`,
 };
 
-/** An event's detail as sent: whole when small, else omitted, but a return keeps its reason. */
+/**
+ * Longest `work.review` detail read for its findings: a stored detail is at most
+ * {@link TEAM_EVENT_DETAIL_MAX_BYTES} UTF-8 bytes, so never more characters than that.
+ */
+const TEAM_REVIEW_DETAIL_MAX_CHARS = TEAM_EVENT_DETAIL_MAX_BYTES;
+
+/**
+ * Characters of a long review's detail read with every row: enough for the fields `recordReview`
+ * writes ahead of the findings (`{"round":N,"verdict":"…","findings":N,`), so a round whose
+ * findings were not read still has its verdict and count.
+ */
+const TEAM_REVIEW_HEAD_CHARS = 96;
+
+/**
+ * A long review's head: for a `work.review` whose detail is past
+ * {@link TEAM_EVENT_DETAIL_PREVIEW_CHARS} (long findings), only its first few characters are read
+ * with the page; the findings are read row by row with {@link readReviewDetailText} until the
+ * drawer has enough. Plain `case`/`substr`, like the return's column, so the query stays
+ * dialect-portable.
+ */
+export const reviewHeadColumns = {
+	reviewHead: sql<
+		string | null
+	>`case when ${teamWorkEvents.kind} = ${"work.review"} and length(${teamWorkEvents.detailJson}) > ${TEAM_EVENT_DETAIL_PREVIEW_CHARS} then substr(${teamWorkEvents.detailJson}, 1, ${TEAM_REVIEW_HEAD_CHARS}) end`,
+};
+
+/** One long review's detail, by primary key, at most {@link TEAM_REVIEW_DETAIL_MAX_CHARS}. */
+export function readReviewDetailText(eventId: string): string | null {
+	const row = db
+		.select({
+			text: sql<
+				string | null
+			>`substr(${teamWorkEvents.detailJson}, 1, ${TEAM_REVIEW_DETAIL_MAX_CHARS})`,
+		})
+		.from(teamWorkEvents)
+		.where(and(eq(teamWorkEvents.id, eventId), eq(teamWorkEvents.kind, "work.review")))
+		.limit(1)
+		.get();
+	return row?.text ?? null;
+}
+
+const REVIEW_HEAD = /^\{"round":(\d+),"verdict":"(clear|blocker)","findings":(\d+)[,}]/;
+
+/** The round, verdict and findings count at the start of a review's detail, or null. */
+export function reviewHeadDetail(head: string | null | undefined): Record<string, unknown> | null {
+	const match = head ? REVIEW_HEAD.exec(head) : null;
+	if (!match) return null;
+	return { round: Number(match[1]), verdict: match[2], findings: Number(match[3]) };
+}
+
+/**
+ * An event's detail as sent: whole when small, else omitted, but a return keeps its reason and,
+ * where the read asked for it, a review keeps its findings (`reviewDetail`, read on its own) or
+ * at least its round, verdict and count (`reviewHead`, {@link reviewHeadColumns}).
+ */
 export function eventDetail(row: {
 	detail: string | null;
 	detailLength: number | null;
 	returnDetail: string | null;
+	reviewDetail?: string | null;
+	reviewHead?: string | null;
 }): { detail: Record<string, unknown> | null; detailOmitted: boolean } {
 	const detail = parseDetail(row.detail);
 	if (detail || row.detailLength === null) return { detail, detailOmitted: false };
@@ -789,6 +859,18 @@ export function eventDetail(row: {
 			},
 			detailOmitted: false,
 		};
+	const review = parseDetail(row.reviewDetail ?? null);
+	if (review) {
+		const kept: Record<string, unknown> = {};
+		for (const key of ["round", "verdict", "findings", "from", "to"])
+			if (typeof review[key] === "number" || typeof review[key] === "string")
+				kept[key] = review[key];
+		if (typeof review.summary === "string")
+			kept.summary = review.summary.slice(0, TEAM_REVIEW_SUMMARY_MAX_LENGTH);
+		return { detail: kept, detailOmitted: false };
+	}
+	const head = reviewHeadDetail(row.reviewHead);
+	if (head) return { detail: head, detailOmitted: false };
 	return { detail: null, detailOmitted: true };
 }
 
