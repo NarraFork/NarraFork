@@ -49,8 +49,11 @@ keywords:
   - TEAM_REMOTE_CONFIG_UNSAFE
   - fastForwardFailure
   - compareRefFor
+  - baseBranchOf
+  - assertTipStill
+  - GIT_TOO_OLD_FOR_PARTIAL_CLONE
 status: draft
-verified_at: 3586b5dd803f5035f610fc36d2c7d0245a2cd8e9
+verified_at: 97b9e9b25d1b2f28ba63045fad160395493c430d
 ---
 # 合并工作项与基线配置
 
@@ -64,6 +67,7 @@ verified_at: 3586b5dd803f5035f610fc36d2c7d0245a2cd8e9
 - 守卫：任务持有期间，退回、协调者的 review / ready / sync / cancel 都 409 `TEAM_WORK_ITEM_MERGING`（`work-items.ts` 各入口 `assertNotMerging`），后台祖先检测跳过它（`team-overlap.ts:mergeIfLanded`）。重启后守卫随任务消失，不留状态列。
 
 本地合并（`runMerge`，git 都经 `team-git-write.ts`，在项目 `gitPath` 里跑）：
+- 分支尖端在动基线之前、记下合并之前各再查一次（`assertTipStill`，快进同样）：worker 在这期间的提交让任务失败（`TEAM_WORK_ITEM_HEAD_MOVED`），不动基线；基线已动了也不标合并（祖先检测也要尖端在基线里才认）。测试接缝 `setMergeStepHookForTests`。
 - 先复核：团队活跃、项 ready、有记录的分支与 head（否则 `TEAM_WORK_ITEM_HEAD_UNAVAILABLE`）、工作者没在跑、hosting 读得出（`unknown` → `TEAM_MERGE_HOSTING_UNKNOWN`，绝不当作非 GitHub）且不是 GitHub、git ≥ 2.38（`TEAM_MERGE_GIT_TOO_OLD`）、`refs/heads/<基线>` 存在、分支尖端仍是 ready 时的 head（否则 `TEAM_WORK_ITEM_HEAD_MOVED`）。不重跑知识检查。
 - OLD = 基线；head 已在 OLD 里就直接记合并（`alreadyInBase: true`，`mergeCommit: null`）。
 - `merge-tree --write-tree -z --name-only --no-messages OLD head`（120s、1MB）：冲突 → `work.merge_failed {code: "conflict", conflicts ≤50, more}`，给协调者 `mergeConflictNote`，什么都没写。
@@ -77,8 +81,8 @@ verified_at: 3586b5dd803f5035f610fc36d2c7d0245a2cd8e9
 
 「在该目录中快进」（`runFastForward`）：
 - 私有 ref 仍是 prepared 的 M；基线已含 M（人自己跑了命令）就直接记合并（`fastForwarded: "outside"`）。
-- 检出前提（`team-git-write.ts:inspectCheckout`，只读）：检出与项目仓库是同一个公共 git 目录（`rev-parse --git-common-dir`，否则 `other_repository`；抽屉提供快进前也查）、HEAD 在基线上（`not_on_base`）、基线仍是 OLD（否则 `TEAM_MERGE_STALE`，要「重新准备」）、没有进行中的 merge/rebase/cherry-pick/revert/bisect、没有 `index.lock`、检出自己的 local/worktree 配置里没有 filter 和 `core.hooksPath`（`local_config`，只给命令）；不满足 → `TEAM_MERGE_CHECKOUT_BLOCKED`（`detail.blocker`）。那个目录（不含其 `.worktrees/`）里有 working/waiting 或运行时忙的会话、或有后台任务 → `TEAM_MERGE_CHECKOUT_BUSY`；开着的 NarraFork 终端只提醒。这些检查都在下一步的锁里、紧挨着合并做。
-- 在 `worktreeLock.tryAcquire(目录, 500ms)` 里：合并前再确认 HEAD 仍在基线上，然后 `git merge --ff-only --no-edit --no-autostash --no-verify-signatures <私有 ref>`，命令级覆盖 `merge.autoStash=false`、`merge.verifySignatures=false`、`submodule.recurse=false`、所有 hook 关掉（`core.hooksPath`、按名禁用配置 hook，名字紧挨着命令重读）、fsmonitor 与外部 diff 关掉、签名程序只用主机的；主机自己的 filter 照常（如 LFS）。拿不到锁 `GIT_WORKSPACE_BUSY`；git 拒绝（本地改动会被覆盖）→ `TEAM_MERGE_FAST_FORWARD_REFUSED`，列出文件，什么都没改。合并后核对：没有未合并条目、没有新 stash、HEAD 仍在基线上且正是 M，否则 `TEAM_MERGE_FAST_FORWARD_INCOMPLETE`（列出未合并文件，不标合并）。成功后记 `work.merged {fastForwarded: "checkout", checkedOutAt}`。
+- 检出前提（`team-git-write.ts:inspectCheckout`，只读）：检出与项目仓库是同一个公共 git 目录（`rev-parse --git-common-dir`，否则 `other_repository`；抽屉提供快进前也查）、HEAD 在基线上（`not_on_base`）、基线仍是 OLD（否则 `TEAM_MERGE_STALE`，要「重新准备」）、没有进行中的 merge/rebase/cherry-pick/revert/bisect、没有 `index.lock`、检出自己的 local/worktree 配置里没有 filter、`core.hooksPath` 与 `core.worktree`，且 git 的工作区（`rev-parse --show-toplevel`）就是这个目录（`local_config`，只给命令）；不满足 → `TEAM_MERGE_CHECKOUT_BLOCKED`（`detail.blocker`）。那个目录（不含其 `.worktrees/`）里有 working/waiting 或运行时忙的会话、或有后台任务 → `TEAM_MERGE_CHECKOUT_BUSY`；开着的 NarraFork 终端只提醒。这些检查都在下一步的锁里、紧挨着合并做。 会话检查（`checkoutActivity`）先按状态索引读 working/waiting 的会话再按目录筛，加上运行时登记为忙的会话、以及目录下任何会话的后台任务（目录读走读 worker）；任一扫描到上限就算没查完，同样拒绝。
+- 在 `worktreeLock.tryAcquire(目录, 500ms)` 里：合并前再确认 HEAD 仍在基线上、分支尖端仍是记录的 head，并紧挨着命令重读检出自己的配置——filter、hooks 目录或 `core.worktree` 一出现就拒绝（`kind: "unsafe"` → `TEAM_MERGE_CHECKOUT_BLOCKED`/`local_config`；不清空 filter，那会让 LFS 之类检出错误），它自己的 diff 驱动清空；然后 `git merge --ff-only --no-edit --no-autostash --no-verify-signatures --no-overwrite-ignore --no-stat <私有 ref>`，命令级覆盖 `merge.autoStash=false`、`merge.verifySignatures=false`、`submodule.recurse=false`、所有 hook 关掉、fsmonitor、外部 diff、自动维护关掉、签名程序只用主机的；主机自己的 filter 照常。被忽略的本地文件永不被同名的跟踪文件覆盖。拿不到锁 `GIT_WORKSPACE_BUSY`；git 拒绝 → `TEAM_MERGE_FAST_FORWARD_REFUSED`，列出文件，什么都没改。合并后核对：没有未合并条目、没有新 stash、HEAD 仍在基线上且正是 M，否则 `TEAM_MERGE_FAST_FORWARD_INCOMPLETE`。成功后记 `work.merged {fastForwarded: "checkout", checkedOutAt}`。
 - 抽屉另给可复制的命令 `git -C <目录> merge --ff-only refs/narrafork/team-merges/<id>`（`fastForwardCommand`，路径按需单引号）；人自己跑后祖先检测会标为已合并。
 
 崩溃与清理：
@@ -87,14 +91,14 @@ verified_at: 3586b5dd803f5035f610fc36d2c7d0245a2cd8e9
 
 读模型（`mergeSummaryOf`、`mergeViewOf`）：
 - 看板卡片（`team-board.ts:withMerge`，含项目页的 `readReadyItems`）的 ready 项带 `merge: {mode, phase, job, outcome, canMerge, disabledReason}`：不跑 git，读任务表、一条最新结果事件、缓存的 hosting 与 git 版本。
-- 抽屉 `work/:itemId` 的 ready 项带 `merge`（再加 `detail` 与 prepared 时的 `fastForward: {available, blocker, runningSessions, terminals, command}`，检出检查缓存 15 秒）。
+- 抽屉 `work/:itemId` 的 ready 项带 `merge`（再加 `detail` 与 prepared 时的 `fastForward: {available, blocker, runningSessions, terminals, command, files, filesMore}`，检出检查缓存 15 秒）。`files` 是快进会写进那个检出的文件（prepared 的 `baseSha` → M，`numstat`，最多 300，含上游改动，不是评审 diff），确认框列的就是它。`command` 只在检出在基线上时给：`[ "$(git -C <目录> symbolic-ref --quiet --short HEAD)" = <基线> ] && git -C <目录> merge --ff-only --no-autostash --no-overwrite-ignore <M>`（`fastForwardCommand`，POSIX shell，路径与分支加引号）；`not_on_base`、`other_repository`、`stale`、`unreadable` 时为 null，只显示原因。
 - 禁用原因按序：`not_ready`、`team_archived`、`merging`、`worker_running`、`checking`（hosting 还在读，或读失败为 `unknown`）、`github_pending`、`base_remote`、`git_too_old`；`canMerge` 还要求调用者是成员且有项目写权限。
 
 基线与新工作的起点（W，`team-work-start.ts`、`team-hosting.ts`）：
 - 基线分支按团队存（`project_teams.base_branch`），新团队取项目 `projects.default_branch`（项目设置页「工作区与容器」组的「团队默认设置」可改），再缺省 `main`。
 - 起点模式（`TeamWorkStart`）：团队 `settings.workStart`（团队设置里改），否则项目 `chapter_settings.teams.workStart`，否则 origin 在 github.com 上为 `remote`、其余为 `local`。`TeamDetail.workStartDefault` 是团队不设时的值（hosting 未读出时 null）。没有新列。
-- `remote`：`git fetch … origin +refs/heads/<基线>:refs/remotes/origin/<基线>`（只动远程跟踪 ref，120s），同一仓库与基线同时只跑一次（`fetchOnce`），再以读到的提交建 worktree（传 SHA，不给分支设上游）；拉取失败但远程跟踪 ref 在就用它（事件 `fetched: false`），没有就 409 `TEAM_WORK_START_UNAVAILABLE`，绝不悄悄改用本地基线。`work.created` 记 `startFrom`。
-- 拉取的凭证与传输只听主机（`networkOverrides`，用 `--show-scope` 读）：凭证助手一旦仓库配了就整表重置再按顺序加回主机的；仓库的其他 `credential.*`、`core.askPass` 取主机值或空；仓库的 `http.*` 取主机值，否则 `sslVerify` 为 true、代理为服务端环境的、`extraHeader`/`cookieFile` 为空、`saveCookies` 为 false，其余（如 `sslCAInfo`）拒绝；仓库的 `remote.origin.vcs`、改写 origin URL 的仓库 `url.*.insteadOf` 也拒绝（`TEAM_REMOTE_CONFIG_UNSAFE`，当作拉取失败）。传输只许 https/http/ssh/git/本地路径，`ext::` 永远不许；`remote.origin.uploadpack` 固定、`core.gitProxy` 置空。ssh：服务端环境里运维设的 `GIT_SSH_COMMAND`/`GIT_SSH` 优先，否则主机的 `core.sshCommand`，否则 `ssh -o BatchMode=yes`（`sshSettings`）。
+- `remote`：`git fetch … origin +refs/heads/<基线>:refs/remotes/origin/<基线>`（只动这一条 refspec：`--refmap=` 不让配置的 `remote.origin.fetch` 映射跟着动、`--no-prune`/`--no-prune-tags` 与 prune 配置关掉，`--upload-pack=git-upload-pack` 写在命令行上；120s），同一仓库与基线同时只跑一次（`fetchOnce`），再以读到的提交建 worktree（传 SHA，不给分支设上游）；拉取失败但远程跟踪 ref 在就用它（事件 `fetched: false`），没有就 409 `TEAM_WORK_START_UNAVAILABLE`，绝不悄悄改用本地基线。`work.created` 记 `startFrom`。 基线写成 `origin/<b>` 或 `refs/remotes/origin/<b>` 的团队（`baseBranchOf`）：`remote` 拉 `<b>` 到 `refs/remotes/origin/<b>`、标签 `origin/<b>`，`local` 按它的提交原样用，本地合并照旧拒绝（`TEAM_MERGE_BASE_REMOTE`）。
+- 拉取的凭证与传输只听主机（`networkOverrides`，用 `--show-scope` 读）：凭证助手一旦仓库配了就整表重置再按顺序加回主机的；仓库的其他 `credential.*`、`core.askPass` 取主机值或空（`protectProtocol`、`sanitizePrompt` 取主机值或 true）；`http.*.extraHeader` 同凭证助手：整表重置再加回主机的；仓库的 `http.*` 取主机值，否则 `sslVerify` 为 true、代理为服务端环境的、`extraHeader`/`cookieFile` 为空、`saveCookies` 为 false，其余（如 `sslCAInfo`）拒绝；仓库的 `remote.origin.vcs`、`core.gitProxy`（先匹配的生效，命令级盖不住）、改写 origin URL 的仓库 `url.*.insteadOf` 也拒绝（`TEAM_REMOTE_CONFIG_UNSAFE`，当作拉取失败）。传输只许 https/http/ssh/git/本地路径，`ext::` 永远不许；`remote.origin.uploadpack` 固定、`core.gitProxy` 置空。ssh：服务端环境里运维设的 `GIT_SSH_COMMAND` 优先，只设了 `GIT_SSH` 时把它加引号作为 `GIT_SSH_COMMAND` 传下去，否则主机的 `core.sshCommand`，否则 `ssh -o BatchMode=yes`（`sshSettings`）。
 - 起点为 `origin/<基线>` 的项按 `refs/remotes/origin/<基线>` 比较（`compareRefFor`：知识检查、评审后提交数、改动路径、大小、diff、重叠、隔离项清理），祖先检测本地基线与它都看；本地基线仍是本地合并的目标。
 - `work.sync` 同样按起点模式取要合进来的基线（`origin/<基线>` 或本地基线），指令里写的就是它。
 - hosting：`git remote get-url --push origin`（应用 pushurl 与 insteadOf），解析 scp / ssh / https（去掉 userinfo，不记日志），主机小写，路径必须正好 owner/repo；只有 github.com（含 ssh.github.com）算 GitHub，GHE 要等 PR 流程的 gh 探测。读失败是 `unknown`（合并按 `checking` 禁用，绝不退到本地合并；起点默认按本地）。缓存按仓库：成功 5 分钟、失败 60 秒，单飞，请求只读缓存（`peekHosting`）。

@@ -22,14 +22,14 @@ keywords:
   - 子进程超时
   - 输出上限
 status: draft
-verified_at: 3586b5dd803f5035f610fc36d2c7d0245a2cd8e9
+verified_at: 97b9e9b25d1b2f28ba63045fad160395493c430d
 ---
 # 外部进程加固
 
 服务端在 agent 可写的检出里跑 git 时，要避免执行没人批准过的代码。这里是这一处的具体防线，加上子进程统一封装。终端的访问控制（谁能进哪个终端）不在这里，见 [访问控制](acl.md)。
 
 ## 关键规则
-- 只读/维护类 git 命令（status、rev-list、diff --name-only、worktree list/remove）带命令级配置覆盖 `GIT_NO_EXEC_CONFIG`：`core.hooksPath` 指向空设备、关闭 fsmonitor 与 untrackedCache、清空 `diff.external`、`core.sshCommand`、`credential.helper`、`core.askPass`；同时设 `GIT_OPTIONAL_LOCKS=0` 避免状态查询写索引（`lib/git-exec-hardening.ts:gitConfigEnv`）。
+- 只读/维护类 git 命令（status、rev-list、diff --name-only、worktree list/remove）带命令级配置覆盖 `GIT_NO_EXEC_CONFIG`：`core.hooksPath` 指向空设备、关闭 fsmonitor 与 untrackedCache、清空 `diff.external`、`core.sshCommand`、`credential.helper`、`core.askPass`、`core.alternateRefsCommand`（有 alternates 时 fetch 会跑它），`maintenance.auto=false`、`gc.auto=0`（不起后台维护）；同时设 `GIT_OPTIONAL_LOCKS=0` 避免状态查询写索引、`GIT_NO_LAZY_FETCH=1`（部分克隆缺对象时不经仓库配的 promisor remote 去拉，那会运行它的 upload-pack；git < 2.44 不认它，配置查询里看到 `extensions.partialClone` 就拒绝，`GIT_TOO_OLD_FOR_PARTIAL_CLONE`）（`lib/git-exec-hardening.ts:gitConfigEnv`）。
 - 读工作树的命令（`status`、`worktree remove`）额外把配置里所有 filter 的 clean/smudge/process 清空，并按名字禁用配置定义的 hook、清空自定义合并驱动（`merge.<名>.driver` 置空：git 不运行任何程序，那个文件按冲突算）；名字来自先跑一次只读的 `git config --get-regexp`（`PROGRAM_CONFIG_QUERY`、`untrustedProgramOverrides`，`narrator-worktree-service.ts:hardenedConfig`）。
 - 团队合并与起点拉取的 git（`services/teams/team-git-write.ts`）多一条规则：仓库自己的配置（local/worktree，agent 可写）不能运行程序，也不能选凭证、传输或身份。敏感键用 `git config --show-scope` 读（`scopedConfig`），只认 system/global，仓库值在命令级改回主机值或中性值，没有中性值就拒绝。落到：凭证助手、askpass、http 与代理、ssh 命令（`networkOverrides`、`sshSettings`）；签名程序与 `commit.gpgsign`（`signingConfig`）；提交身份（`hostIdentity`）；`fetch .` 只许本地传输（`ext::` 的 insteadOf 跑不起来）；在人的检出里快进时关 autostash、签名校验、子模块递归。可运行程序的配置（filter、配置 hook、合并驱动）在每条可能运行它们的命令前重读。见[合并工作项与基线配置](../collaboration/teams/merge.md)。
 - `worktree add` 不加固，保留仓库自己的检出 hook 与 filter（`hardenedConfig` 开头）。
