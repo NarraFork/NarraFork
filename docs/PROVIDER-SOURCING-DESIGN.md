@@ -443,7 +443,7 @@ resolveRoute({ modelValue, billingOwner, narratorId, epoch, caps }) →
 | 统一额度 API / Query | [quota-snapshots 路由](../server/routes/quota-snapshots.ts) 提供 GET 与 POST `/refresh`；[API 包装](../frontend/lib/api/quota-snapshots.ts) 只转发请求，[useQuotaSnapshots](../frontend/hooks/useQuotaSnapshots.ts) 由 React Query 管缓存、取消、失效、重取与 GC，不在 API 层另放 pending 表。 |
 | NUG 轻量头部 | [use-nug-quota.ts](../frontend/components/narrator/model/use-nug-quota.ts) 使用同一 API 的标准 scoped Query：`groupId`、`cachedOnly: true`、`expectedGeneration`，按会话与模型运行时代次隔离；保留 64 KiB / 15s 预算、隐藏时停发与停用后台轮询。 |
 | Auto | [auto-route-signals.ts](../server/lib/agent/auto-route-signals.ts) 按模板读取订阅、模型可用性与凭据状态。旧 `tokendance` 前缀 precedence 保留；[catalog 身份识别](../server/lib/model-catalog/index.ts) 与 [候选枚举](../server/lib/settings/provider.ts) 已纳入已配置 TD / CC、已发布的 CLI 模型目录，未配置 CC 不用静态兜底抢路由。 |
-| CC 模型 owner | [startCommandCodeModelCatalog](../server/lib/commandcode-models.ts) 在 [main.ts](../server/main.ts) 中先完成真实目录 prime，再继续恢复 / 定时工作；settings 与 KeyStore 的提交事件触发刷新，关闭时退订。冷启动不依赖访问 settings 页面，Auto 热路径仍纯读内存；失败保留同槽已知目录，不伪造 CLI 元数据。 |
+| CC 模型 owner | [startCommandCodeModelCatalog](../server/lib/commandcode-models.ts) 在 [main.ts](../server/main.ts) 中先完成真实目录 prime，再继续恢复 / 定时工作；settings / KeyStore 提交及原生 CLI 认证目录监听触发刷新，CLI 登录、原子切号与退出会发布或撤回目录，关闭时统一退订。冷启动和后续登录不依赖访问 settings 页面，Auto 热路径仍纯读内存；失败保留同身份已知目录，不伪造 CLI 元数据。 |
 | NUG relay owner | [startNugRelayOwner](../server/lib/nug-relay/manager.ts) 订阅 settings 与 KeyStore，提交后以微任务合并 `reconcileNugRelayClients`，按有效启用 Key 建链，不把新 Key 配给旧 endpoint。`stopAllNugRelayClients` 退订、阻止排队的 reconcile 再执行并关闭连接；Auto 只读已有 channel registry。 |
 | 同步准备 | [PooledProvider.prepareForModel](../server/lib/agent/pooled-provider.ts) 同步准备实际选中的适配器；不增加 Promise / WeakMap 准备屏障，后续切 Key 仍要准备对应模型。 |
 | 迁移与旧包 | [credential-transfer](../server/lib/credential-transfer/index.ts) 已直接调用统一凭据实现，移除单元素 `KINDS` 分派。[legacy-transfer.ts](../server/lib/sourcing/legacy-transfer.ts) 继续兼容 v1 明文 / v2 密封旧包、Codex 各登录方式与账号字段及插件字段。 |
@@ -454,7 +454,7 @@ resolveRoute({ modelValue, billingOwner, narratorId, epoch, caps }) →
 
 **NUG 出口不可静默降级**：[NugProvider](../server/lib/agent/nug-provider.ts) 只有 `egressAllowDirectFallback === true` 才允许直连；relay 不匹配或不可用时不能默认把 false / 未设置当成同意。
 
-**NUG 订单与付款额度固定身份**：[billing binding](../server/routes/nug.ts) 以不透明 `binding` 绑定用户、订单、CID 与连接身份；后续请求复核同一身份，重排不会改绑新首 Key。付款确认按捕获 CID 写入 per-Key 快照，只在仍为 primary 时更新该摘要，不把 A 的余额或旧值合并进重排后的 B。[NugRechargeDialog](../frontend/components/narrator/model/NugRechargeDialog.tsx) 对订单查询的瞬时失败作有界退避 / 重试，身份或权限失效立即停止；普通额度展示仍走统一 Query。
+**NUG 订单与付款额度固定身份**：失败请求经 [opaque context](../server/lib/nug-payment-context.ts) 绑定实际请求的 Key，配置与下单先核验叙述者写权限及 live 身份，不公开 CID / 私有请求身份 / secret；重排仍选择原 Key，只有显式 standalone 充值才选首个启用 Key。创建后的 [billing binding](../server/routes/nug.ts) 继续绑定用户、订单、CID 与连接身份，后续请求不改绑新首 Key。付款确认按捕获 CID 写入 per-Key 快照，只在仍为 primary 时更新该摘要，不把 A 的余额或旧值合并进重排后的 B。[NugRechargeDialog](../frontend/components/narrator/model/NugRechargeDialog.tsx) 对订单查询的瞬时失败作有界退避 / 重试，身份或权限失效立即停止；普通额度展示仍走统一 Query。同身份、同单位的 NUG 单钱包只在展示层选择较新余额，probe 窗口、有效期及错误边界仍保留，两个存储槽不互写。
 
 ### 14.3 下一步与保留约定
 

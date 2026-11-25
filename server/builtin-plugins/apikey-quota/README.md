@@ -42,14 +42,17 @@
   保留 **64 KiB / 15s** 读取预算、generation 不匹配拒绝复用、隐藏时停发与不在后台轮询。
   该预算不替换本插件下文的单次出站 **64 KiB / 8s** 约束。
 - [CC 模型 owner](../../lib/commandcode-models.ts) 在冷启动 prime 真实目录，订阅 settings / KeyStore
-  的提交变化并在关闭时退订；不依赖管理页读取。Auto 热路径在 auth / 模型 TTL 之后仍纯读内存，
-  显式刷新和真正请求的 CLI auth 读取保留，不伪造静态 CLI 目录。
+  提交，并原生监听 CLI 认证目录，覆盖后续登录、原子切号与退出；关闭时统一退订，不依赖管理页读取。
+  Auto 热路径在 auth / 模型 TTL 之后仍纯读内存，显式刷新和真正请求的 CLI auth 读取保留，不伪造静态目录。
 - [NUG relay owner](../../lib/nug-relay/manager.ts) 在启动及 settings / KeyStore 提交后用微任务合并
   reconcile，采用有效启用 Key 与最终 endpoint；关停退订、阻止排队 reconcile 再执行并关闭连接。
   只有 `egressAllowDirectFallback === true` 才允许直连，Auto 只读已有 channel registry。
-- [NUG 订单 binding](../../routes/nug.ts) 固定用户、订单、CID 与连接身份；付款额度按捕获 CID
+- [NUG 请求 context](../../lib/nug-payment-context.ts) 以不透明引用绑定实际失败 Key，配置 / 下单核验叙述者
+  写权限与 live 身份，不公开 CID / 私有请求身份 / secret；重排仍为原 Key，显式 standalone 才选首个启用项。
+  创建后的 [订单 binding](../../routes/nug.ts) 固定用户、订单、CID 与连接身份；付款额度按捕获 CID
   回写 per-Key 快照，不污染重排后的首 Key 摘要。[付款界面](../../../frontend/components/narrator/model/NugRechargeDialog.tsx)
-  对订单查询的瞬时失败有界退避 / 重试，身份或权限失效则停止；该付款确认路径不替代普通额度 Query。
+  对瞬时失败有界退避 / 重试，身份或权限失效则停止；该路径不替代普通额度 Query。展示层可取较新的同身份、
+  同单位 NUG 单钱包余额，probe 的窗口 / 有效期 / 错误仍权威，存储槽不互写。
 
 ## 命令契约
 
