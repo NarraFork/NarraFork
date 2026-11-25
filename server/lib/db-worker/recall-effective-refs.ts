@@ -9,6 +9,8 @@ export interface RecallEffectiveRefs {
 	/** effective_recall_refs has message_id and seq. Across snapshots use the guard wrapper. */
 	cte: string;
 	params: RecallQuery["params"];
+	/** Captured standalone/materialized state: direct indexed refs need no ancestry union. */
+	ownOnly?: boolean;
 }
 const MAX_LINEAGE_DEPTH = 32;
 
@@ -125,5 +127,6 @@ export function* recallEffectiveRefsQueries(
 			)
 		)`,
 		params,
+		ownOnly: sources.length === 1,
 	};
 }

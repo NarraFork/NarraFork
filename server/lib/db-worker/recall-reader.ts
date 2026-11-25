@@ -197,8 +197,11 @@ export function* recallConversationQueries(
 	if (!narrator) return result;
 	budget(Buffer.byteLength(JSON.stringify(narrator)), 256 * 1024);
 	const refs = yield* recallEffectiveRefsQueries(input.narratorId, postgres);
-	const params: RecallQuery["params"] = [];
-	const where = ["1 = 1"];
+	const params: RecallQuery["params"] = refs.ownOnly ? [input.narratorId] : [];
+	const where = refs.ownOnly
+		? ["r.narrator_id = ?", "(SELECT valid FROM recall_lineage_guard)"]
+		: ["1 = 1"];
+	const refSource = refs.ownOnly ? "narrator_message_refs" : "effective_recall_refs";
 	if (input.roles) {
 		where.push(`m.role IN (${input.roles.map(() => "?").join(",")})`);
 		params.push(...input.roles);
@@ -218,7 +221,7 @@ export function* recallConversationQueries(
 		where.push("m.created_at <= ?");
 		params.push(input.createdTo);
 	}
-	const scope = `FROM effective_recall_refs r JOIN narrator_messages m ON m.id = r.message_id WHERE ${where.join(" AND ")}`;
+	const scope = `FROM ${refSource} r JOIN narrator_messages m ON m.id = r.message_id WHERE ${where.join(" AND ")}`;
 	const columns = `m.id, m.role, m.origin, ${postgres ? "substr(m.content_text, 1, 501)" : "substr(CAST(m.content_text AS BLOB), 1, 2004)"} AS content_prefix, ${postgres ? "length(m.content_text) > 500" : "length(CAST(m.content_text AS BLOB)) > 2004"} AS truncated, m.created_at, r.seq`;
 	function* effectiveQuery(
 		selectSql: string,
@@ -235,7 +238,7 @@ export function* recallConversationQueries(
 		values: RecallQuery["params"] = [],
 	) =>
 		effectiveQuery(
-			`SELECT ${columns} ${scope} ${extra} ORDER BY r.seq ${order}, m.id ${order} LIMIT ?`,
+			`SELECT ${columns} ${scope} ${extra} ORDER BY r.seq ${order}, r.message_id ${order} LIMIT ?`,
 			[...params, ...values, count],
 			`seq ${order}, id ${order}`,
 		);
@@ -251,18 +254,18 @@ export function* recallConversationQueries(
 	let rows: QueryRows;
 	if (direction === "around") {
 		const anchor = (yield* effectiveQuery(
-			"SELECT seq, message_id AS id FROM effective_recall_refs WHERE message_id = ? LIMIT 1",
-			[input.messageId],
+			`SELECT seq, message_id AS id FROM ${refSource} WHERE ${refs.ownOnly ? "narrator_id = ? AND (SELECT valid FROM recall_lineage_guard) AND " : ""}message_id = ? LIMIT 1`,
+			refs.ownOnly ? [input.narratorId, input.messageId] : [input.messageId],
 		))[0];
 		if (!anchor) return { ...result, messageMissing: true };
 		const before = yield* select(
-			"AND (r.seq, m.id) < (?, ?)",
+			"AND (r.seq, r.message_id) < (?, ?)",
 			"DESC",
 			Math.floor(input.limit / 2),
 			tuple(anchor),
 		);
 		const after = yield* select(
-			"AND (r.seq, m.id) >= (?, ?)",
+			"AND (r.seq, r.message_id) >= (?, ?)",
 			"ASC",
 			input.limit - before.length,
 			tuple(anchor),
@@ -271,7 +274,7 @@ export function* recallConversationQueries(
 			const tail = before.length ? before[before.length - 1] : anchor;
 			before.push(
 				...(yield* select(
-					"AND (r.seq, m.id) < (?, ?)",
+					"AND (r.seq, r.message_id) < (?, ?)",
 					"DESC",
 					input.limit - before.length - after.length,
 					tuple(tail),
@@ -287,7 +290,7 @@ export function* recallConversationQueries(
 				? ""
 				: typeof cursor === "number"
 					? `AND r.seq ${newer ? ">" : "<"} ?`
-					: `AND (r.seq, m.id) ${newer ? ">" : "<"} (?, ?)`,
+					: `AND (r.seq, r.message_id) ${newer ? ">" : "<"} (?, ?)`,
 			newer ? "ASC" : "DESC",
 			input.limit,
 			cursor === undefined
@@ -319,12 +322,12 @@ export function* recallConversationQueries(
 		last = rows[rows.length - 1];
 	result.pagination = {
 		hasOlder:
-			(yield* effectiveQuery(`SELECT 1 ${scope} AND (r.seq, m.id) < (?, ?) LIMIT 1`, [
+			(yield* effectiveQuery(`SELECT 1 ${scope} AND (r.seq, r.message_id) < (?, ?) LIMIT 1`, [
 				...params,
 				...tuple(first),
 			])).length > 0,
 		hasNewer:
-			(yield* effectiveQuery(`SELECT 1 ${scope} AND (r.seq, m.id) > (?, ?) LIMIT 1`, [
+			(yield* effectiveQuery(`SELECT 1 ${scope} AND (r.seq, r.message_id) > (?, ?) LIMIT 1`, [
 				...params,
 				...tuple(last),
 			])).length > 0,

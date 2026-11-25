@@ -137,8 +137,8 @@ test("PG conversation uses shared filter-before-limit plan and normalized page m
 			return [{ id: "pg", refs_inherited_from: null, refs_backfill_cursor: null }];
 		if (sql.includes("FROM narrators WHERE"))
 			return [{ id: "pg", title: "PG", model: "model", source_bytes: 7 }];
-		if (sql.includes("SELECT 1 FROM effective_recall_refs"))
-			return sql.includes("(r.seq, m.id) <") ? [{}] : [];
+		if (/SELECT 1 FROM (?:effective_recall_refs|narrator_message_refs)/.test(sql))
+			return sql.includes("(r.seq, r.message_id) <") ? [{}] : [];
 		return [
 			{
 				id: "m",
@@ -173,11 +173,12 @@ test("PG conversation uses shared filter-before-limit plan and normalized page m
 		newerCursor: { seq: 400, messageId: "m" },
 	});
 	const select = calls.find((call) => call.sql.includes("content_prefix"));
-	expect(select?.sql).toContain("m.role IN ($5)");
+	expect(select?.sql).toContain("r.narrator_id = $5");
+	expect(select?.sql).toContain("m.role IN ($6)");
 	expect(select?.sql).toContain("m.origin IS NULL");
-	expect(select?.sql).toContain("m.created_at >= $6");
-	expect(select?.sql).toContain("r.seq < $7 ORDER BY r.seq DESC, m.id DESC LIMIT $8");
-	expect(select?.params).toEqual(["pg", null, null, null, "user", "2026-01-01", 500, 1]);
+	expect(select?.sql).toContain("m.created_at >= $7");
+	expect(select?.sql).toContain("r.seq < $8 ORDER BY r.seq DESC, r.message_id DESC LIMIT $9");
+	expect(select?.params).toEqual(["pg", null, null, null, "pg", "user", "2026-01-01", 500, 1]);
 	expect(calls.every((call) => !call.sql.includes("narrator_tool_calls"))).toBe(true);
 });
 
@@ -190,7 +191,7 @@ test("PG tool summaries are fetched in 128-row keyset batches with bounded Ask h
 			return [{ id: "pg", refs_inherited_from: null, refs_backfill_cursor: null }];
 		if (sql.includes("FROM narrators WHERE"))
 			return [{ id: "pg", title: "PG", model: "model", source_bytes: 7 }];
-		if (sql.includes("SELECT 1 FROM effective_recall_refs")) return [];
+		if (/SELECT 1 FROM (?:effective_recall_refs|narrator_message_refs)/.test(sql)) return [];
 		if (sql.includes("content_prefix"))
 			return [
 				{

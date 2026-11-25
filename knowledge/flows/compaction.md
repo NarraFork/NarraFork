@@ -5,6 +5,7 @@ summary: 什么时候触发、压缩消息怎么插入、之后的请求从哪�
 anchors:
   - server/services/narrator-compact.ts
   - server/services/narrator-persistence.ts
+  - server/services/narrator-refs-backfill.ts
   - server/services/narrator-session.ts
   - server/services/agent-runtime/orchestrator.ts
   - server/services/agent-runtime/model-history-query.ts
@@ -46,6 +47,12 @@ verified_at: 4d59774711a51a9ac966794090c8b3a04d549048
 10. 运行中的循环：下一次请求前，`rebuildRequestHistory` / `onBeforeTurn` 钩子重建历史与系统提示词（并 `clearActiveHistoryCompactPending`）；本轮已发出的请求不受影响。
 11. 排队消息：压缩期间用户输入只入队；每次压缩退出（成功、失败、取消、超时）都调 `drainQueuedMessagesAfterCompact` 重查队列并唤醒，见 [一轮对话](turn.md) 的排队分支。
 12. 撤回或编辑：`DELETE /:id/compact/:messageId` 只删本叙述者对该标记的引用；编辑摘要后 `refreshCompactContextPercentAfter` 重新测占用。
+
+## 清除上下文与懒继承历史
+
+- `clearContextBefore` 不调用摘要模型，而是在目标消息前插入空压缩标记并顺延本会话之后的 refs.seq；这不应改变已有 fork 的原消息身份和历史顺序。
+- 整段操作使用现有 narrator work-admission。写事务外先确保目标引用已覆盖，并为受 seq 移动影响的 lazy 子树准备原前缀；事务内重查目标 seq、当前本地继承边界与 lazy 子依赖，再插入标记和移动序号。
+- 准备失败或期间依赖变化时明确失败，不留下部分标记/序号移动；子 fork 不继承父会话后来插入的清除标记或新消息。对应准备/复核沿用 `narrator-refs-backfill.ts`，不让 Recall 读路径代为物化历史。
 
 ## 改它时
 - 改触发条件：阈值在 `provider.ts:getContextThresholds`，三个自动触发点（轮内、轮后、错误恢复）各有自己的判断，别只改其一；跳过逻辑（步骤 2）同时防止重复压缩。
