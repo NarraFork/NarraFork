@@ -16,7 +16,7 @@ anchors:
   - frontend/components/narrator/knowledge/
   - frontend/components/narrator/mock/
 status: draft
-verified_at: 8dcb0ba3a
+verified_at: 3a43303a2
 keywords:
   - NarratorPanel
   - useNarratorPanelWS
