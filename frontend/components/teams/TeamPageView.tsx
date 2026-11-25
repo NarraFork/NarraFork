@@ -36,6 +36,7 @@ import { TeamWorkList } from "./TeamWorkList";
 import { TeamWorkspace } from "./TeamWorkspace";
 import {
 	attentionEntries,
+	onlookerSeesWaiting,
 	statusSentence,
 	teamPageMode,
 	teamPinTitle,
@@ -132,7 +133,11 @@ export function TeamPageView({
 
 	const pendingCalls = member ? (approvals.data?.approvals ?? []) : [];
 	const entries = attentionEntries({ member, approvals: pendingCalls, items });
-	const groups = workGroups(items, pendingCalls);
+	const groups = workGroups(
+		items,
+		pendingCalls,
+		member ? undefined : (item) => onlookerSeesWaiting(item, summary.data),
+	);
 	const mode = teamPageMode(summary.data);
 	const archived = summary.data?.coordinatorStatus === "archived";
 	const base = team.data?.baseBranch ?? "main";

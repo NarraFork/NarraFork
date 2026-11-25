@@ -26,6 +26,7 @@ import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
 	liveWorkerStatus,
+	onlookerSeesWaiting,
 	type RowLine,
 	rowLine,
 	WORK_GROUPS,
@@ -97,7 +98,11 @@ export function WorkItemRow({
 							fw={line.tone === "amber" || line.tone === "green" ? 600 : undefined}
 							style={{ color: TONE_TEXT[line.tone] }}
 						>
-							{t(`teams.page.row.${line.key}`, line.values)}
+							{line.key === "activity"
+								? t(`teams.page.row.tools.${line.values.tool}`, {
+										defaultValue: String(line.values.tool),
+									})
+								: t(`teams.page.row.${line.key}`, line.values)}
 						</Text>
 						{line.detail && (
 							<>
@@ -158,7 +163,9 @@ function FinishedGroup({
 	onVisibleIds?: (column: "done" | "cancelled", ids: string[]) => void;
 }) {
 	const { t } = useTranslation("projects");
-	const [open, setOpen] = useState(initiallyOpen);
+	// Follows `initiallyOpen` (the wrap-up opens 已完成) until the person toggles it.
+	const [toggled, setOpen] = useState<boolean | null>(null);
+	const open = toggled ?? initiallyOpen;
 	const pages = useTeamBoardColumn(projectId, teamId, column, open && count > 0);
 	const items = pages.data?.pages.flatMap((page) => page.items) ?? [];
 	const label = t(`teams.page.work.groups.${column}`);
@@ -170,7 +177,7 @@ function FinishedGroup({
 	return (
 		<Box data-testid={`team-finished-${column}`} data-open={open ? "true" : "false"}>
 			<UnstyledButton
-				onClick={() => setOpen((value) => !value)}
+				onClick={() => setOpen(!open)}
 				aria-expanded={open}
 				disabled={count === 0}
 				style={{ width: "100%", padding: "8px 10px" }}
@@ -381,7 +388,11 @@ export function TeamWorkList({
 	const { t } = useTranslation("projects");
 	const member = summary?.access === "write";
 	if (mode.emptyWork) return <TeamWorkEmpty />;
-	const groups = workGroups(items, approvals);
+	const groups = workGroups(
+		items,
+		approvals,
+		member ? undefined : (item) => onlookerSeesWaiting(item, summary),
+	);
 	const counts = summary?.columnCounts;
 	const labelOf = (group: WorkGroup) =>
 		group === "needsYou" && !member

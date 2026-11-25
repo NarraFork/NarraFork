@@ -486,7 +486,20 @@
 				"fixing": "Fixing review round {{round}}",
 				"noWorker": "No worker yet",
 				"working": "Working",
-				"workerIdle": "Worker idle"
+				"workerIdle": "Worker idle",
+				"tools": {
+					"Bash": "Running",
+					"Edit": "Editing",
+					"MultiEdit": "Editing",
+					"Write": "Writing",
+					"Read": "Reading",
+					"Grep": "Searching",
+					"Glob": "Searching",
+					"WebFetch": "Fetching",
+					"Agent": "Delegating",
+					"AskUserQuestion": "Asking",
+					"ExitPlanMode": "Proposing a plan"
+				}
 			},
 			"empty": {
 				"title": "Work items show up here",

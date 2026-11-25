@@ -486,7 +486,20 @@
 				"fixing": "按第 {{round}} 轮评审修改",
 				"noWorker": "还没有工作者",
 				"working": "工作中",
-				"workerIdle": "工作者空闲"
+				"workerIdle": "工作者空闲",
+				"tools": {
+					"Bash": "运行",
+					"Edit": "编辑",
+					"MultiEdit": "编辑",
+					"Write": "写入",
+					"Read": "读",
+					"Grep": "搜索",
+					"Glob": "搜索",
+					"WebFetch": "抓取",
+					"Agent": "派出",
+					"AskUserQuestion": "提问",
+					"ExitPlanMode": "提交计划"
+				}
 			},
 			"empty": {
 				"title": "工作项会出现在这里",

@@ -357,6 +357,11 @@ export function attentionView<T>(
 export interface WorkRow {
 	item: TeamBoardItem;
 	approval: TeamPendingApproval | null;
+	/**
+	 * An onlooker's view: the worker is waiting on a person (its status) though the call itself
+	 * is for members only; the row says what it waits on from the worker's last tool call.
+	 */
+	waiting?: boolean;
 }
 
 /** The work list's open groups, in the order they show. */
@@ -372,6 +377,8 @@ export type WorkGroup = (typeof WORK_GROUPS)[number];
 export function workGroups(
 	items: readonly TeamBoardItem[],
 	approvals: readonly TeamPendingApproval[],
+	/** Onlookers see no calls: a worker whose status is `waiting` stands for one. */
+	workerWaiting?: (item: TeamBoardItem) => boolean,
 ): Record<WorkGroup, WorkRow[]> {
 	const groups: Record<WorkGroup, WorkRow[]> = { needsYou: [], inProgress: [], review: [] };
 	const waiting = new Map<string, TeamPendingApproval>();
@@ -389,6 +396,8 @@ export function workGroups(
 	for (const item of byCreated) {
 		const approval = waiting.get(item.id) ?? null;
 		if (approval) asked.push({ item, approval });
+		else if (workerWaiting?.(item) && item.state !== "ready")
+			asked.push({ item, approval: null, waiting: true });
 		else if (item.state === "ready") ready.push({ item, approval: null });
 		else if (item.state === "in_review") groups.review.push({ item, approval: null });
 		else if (item.state === "queued") queued.push({ item, approval: null });
@@ -527,6 +536,17 @@ export function rowLine(row: WorkRow, workerStatus: string | null, base: string)
 						: "waitingRule";
 		return { key, values: { tool: approval.toolName }, detail, tone: "amber" };
 	}
+	if (row.waiting) {
+		const tool = item.activity?.toolName ?? "";
+		const kind =
+			tool === "AskUserQuestion" ? "question" : tool === "ExitPlanMode" ? "plan" : "tool";
+		return {
+			key: kind === "question" ? "waitingAnswer" : kind === "plan" ? "waitingPlan" : "waitingTool",
+			values: { tool },
+			detail: item.activity?.preview || null,
+			tone: "amber",
+		};
+	}
 	switch (item.state) {
 		case "ready":
 			return {
@@ -608,3 +628,11 @@ export function teamWorkspaceLayout(width: number): "split" | "tabs" {
 
 /** Example goals the starting state offers (keys under `teams.page.start.examples.`). */
 export const TEAM_START_EXAMPLES = ["upgrade", "issues", "tests"] as const;
+
+/** For an onlooker: the item's worker is waiting on a person (its live status). */
+export function onlookerSeesWaiting(
+	item: TeamBoardItem,
+	summary: Pick<TeamPageSummary, "runningAgents" | "runningCount"> | undefined,
+): boolean {
+	return !!item.worker && liveWorkerStatus(item.worker, summary) === "waiting";
+}

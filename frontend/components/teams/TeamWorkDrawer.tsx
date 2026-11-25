@@ -470,8 +470,8 @@ function ReturnBar({
 						{teamErrorMessage(send.error, t, "disband") || t("teams.page.drawer.returnFailed")}
 					</Alert>
 				)}
-				<Group justify="space-between" wrap="nowrap" gap="sm">
-					<Text size="xs" c="dimmed">
+				<Group justify="space-between" wrap="wrap" gap="sm" style={{ rowGap: 6 }}>
+					<Text size="xs" c="dimmed" style={{ flex: "1 1 220px" }}>
 						{t("teams.page.drawer.returnHint")}
 					</Text>
 					<Group gap="xs" wrap="nowrap" style={{ flexShrink: 0 }}>
@@ -498,8 +498,8 @@ function ReturnBar({
 			</Stack>
 		);
 	return (
-		<Group justify="space-between" wrap="nowrap" gap="sm">
-			<Text size="xs" c="dimmed" style={{ minWidth: 0 }}>
+		<Group justify="space-between" wrap="wrap" gap="sm" style={{ rowGap: 6 }}>
+			<Text size="xs" c="dimmed" style={{ minWidth: 0, flex: "1 1 220px" }}>
 				{t("teams.page.drawer.barNote", { base })}
 			</Text>
 			<Group gap="xs" wrap="nowrap" style={{ flexShrink: 0 }}>
