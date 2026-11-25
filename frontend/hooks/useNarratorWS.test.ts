@@ -182,6 +182,8 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 		const warnings: unknown[] = [];
 		const subagentWarnings: unknown[] = [];
 		const errors: unknown[] = [];
+		const statusUpdates: unknown[] = [];
+		const substatusUpdates: unknown[] = [];
 		narratorWSManager.addListener = ((_opts, listener) => {
 			sourceListeners.push(listener);
 			return { _id: nextHandleId++ };
@@ -206,6 +208,8 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 					onNarratorWarning: (info) => warnings.push(info),
 					onSubagentWarning: (id, info) => subagentWarnings.push({ id, ...info }),
 					onNarratorError: (...args) => errors.push(args),
+					onStatusChange: (...args) => statusUpdates.push(args),
+					onSubstatusChange: (substatus) => substatusUpdates.push(substatus),
 					onToolUseChunk: (...args) => sourceUpdates.push(args[10]),
 					onToolStarted: (...args) => sourceUpdates.push(args[8]),
 					onToolOutput: (_id, _output, _parent, meta) =>
@@ -235,6 +239,36 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 		try {
 			root.render(createElement(Harness));
 			await settle();
+			const statusPatch = {
+				status: "idle",
+				statusEpoch: "server-process",
+				statusRevision: 1,
+				messageCount: 17,
+				substatus: [],
+				turnStartedAt: null,
+				updatedAt: "2026-11-24T01:00:00.000Z",
+				errorMessage: null,
+				errorRetryable: null,
+				archivedWithNarratorId: null,
+			};
+			const substatusPatch = {
+				...statusPatch,
+				status: "waiting",
+				substatus: ["reflecting"],
+				statusRevision: 2,
+			};
+			for (const listener of sourceListeners) {
+				listener({ type: "status_change", narratorId: "n1", ...statusPatch });
+				listener({ type: "status_change", narratorId: "n1", status: "working" });
+				listener({ type: "substatus_change", narratorId: "n1", ...substatusPatch });
+				listener({ type: "substatus_change", narratorId: "n1", substatus: ["reasoning"] });
+			}
+			expect(statusUpdates).toEqual([
+				["idle", undefined, [], statusPatch],
+				["working", undefined, undefined, { status: "working" }],
+				["waiting", undefined, ["reflecting"], substatusPatch],
+			]);
+			expect(substatusUpdates).toEqual([["reasoning"]]);
 			const inputDocument = {
 				ref: {
 					id: "source",

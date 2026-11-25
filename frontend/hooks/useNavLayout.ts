@@ -2,6 +2,7 @@ import type { CustomizableNavId } from "@shared/nav-layout";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useMemo } from "react";
 import type { api } from "../lib/api";
+import { getToken } from "../lib/api/client";
 import {
 	DEFAULT_NAV_ENTRIES,
 	mergeNavLayout,
@@ -29,7 +30,7 @@ export interface NavLayout {
 	items: NavLayoutEntry[];
 }
 
-type Preferences = Awaited<ReturnType<typeof api.getUserPreferences>>;
+type Preferences = Awaited<ReturnType<typeof api.getUIPreferences>>;
 
 /**
  * Read and write the user's customizable sidebar navigation layout.
@@ -37,7 +38,7 @@ type Preferences = Awaited<ReturnType<typeof api.getUserPreferences>>;
  * follows the user across devices.
  */
 export function useNavLayout() {
-	const { data: prefs } = useUserPreferences();
+	const { data: prefs, queryKey } = useUserPreferences();
 	const updatePrefs = useUpdateUserPreferences();
 	const queryClient = useQueryClient();
 
@@ -72,10 +73,10 @@ export function useNavLayout() {
 			const persisted = toPersistedNavLayout(
 				restoreWithheldNavEntries(nextEntries, storedEntries, hidden),
 			);
-			const previous = queryClient.getQueryData<Preferences>(["user-preferences"]);
+			const previous = queryClient.getQueryData<Preferences>(queryKey);
 			// Optimistic update
 			if (previous) {
-				queryClient.setQueryData<Preferences>(["user-preferences"], {
+				queryClient.setQueryData<Preferences>(queryKey, {
 					...previous,
 					navLayout: persisted,
 				});
@@ -84,14 +85,14 @@ export function useNavLayout() {
 				{ navLayout: persisted },
 				{
 					onError: () => {
-						if (previous) {
-							queryClient.setQueryData(["user-preferences"], previous);
+						if (previous && getToken() === queryKey[3]) {
+							queryClient.setQueryData(queryKey, previous);
 						}
 					},
 				},
 			);
 		},
-		[queryClient, updatePrefs, storedEntries, hidden],
+		[queryClient, updatePrefs, storedEntries, hidden, queryKey],
 	);
 
 	return { entries, visibleItems, dividerIndex, saveLayout };

@@ -37,7 +37,7 @@ keywords:
   - 拖放分区
   - swapPanels
 status: draft
-verified_at: 7a8bdfb90
+verified_at: 4d59774711a51a9ac966794090c8b3a04d549048
 ---
 # 面板与布局
 
@@ -51,6 +51,7 @@ verified_at: 7a8bdfb90
 - 工作区 dock：布局信封 `WORKSPACE_LAYOUT_VERSION = 2`，含 dockview 序列化布局与 `director` 状态（`grid|director`、主面板、主比例，范围 0.55–0.85，默认 0.72，`director-constants.ts:normalizeDirectorPrimaryRatio`）。存储位置、版本号与 409 规则在服务端，见 [工作区布局](../narrator/workspaces.md)。客户端侧：`DockviewWorkspace.tsx` 防抖 500ms 调 `saveWorkspaceLayout(id, layout, expectedRevision)`；遇 409 取回 `currentRevision` 只重试一次，再冲突则放弃本次保存。
 - 成员与位置分离（服务端规则见 [工作区布局](../narrator/workspaces.md)）：客户端用 `workspace-panel-set.ts:reconcileLayoutWithPanels` 裁掉非成员条目、把布局没放置的成员追加进去。新增/关闭/拖入面板必须写成员行，`workspace-membership-wiring.guard.test.ts` 扫源码守这条。
 - 终端面板（`terminal/`）：`NarratorTerminal` 管一个叙述者的多个终端（标签 + `TerminalGrid` 的 single/split-h/split-v/triple/quad 布局，换布局时按需创建终端），视图状态经 `useTerminalViewState` 乐观更新后防抖写服务端；`WorkspaceTerminalPanel` 是工作区里带头部的包装；`TerminalPanel` 才是 xterm 实例。
+- dock 通过真实面板可见性（不是焦点）传给讨论室与终端。`NarratorTerminal` 隐藏、document 不可见或权限未确认为可写时卸载内容，释放 xterm/WS/在途实体读，服务端 PTY 不因此结束；讨论室则保持 `ChatRoomView`/coordinator 挂载，只 suspended 传输以保留输入与锚点（见[聊天](../collaboration/chat.md)）。
 - `TerminalPanel` 的输出先攒进缓冲，同时挂 rAF 与 250ms 定时器两路冲刷（先到先执行），待写缓冲超过 1,000,000 字符就丢最旧部分；scrollback 2000 行；`terminal-reply.ts:isHeadlessTerminalReply` 把服务端无头缓冲已回写的设备报告（CPR、DA 等）在浏览器侧丢弃，避免重复应答；`osc52-handler.ts` 拦截 OSC 52，读请求与写请求都只吞掉，不写剪贴板。
 - 终端 WebSocket 是 `useTerminalWS.ts:TerminalWSManager` 单例，订阅/退订多个终端；重连指数退避 1s→30s，连续失败 3 次起标记断开，50 次后放弃；收到 1001 不再重连；60s 内没收到服务端 ping 就断开重连；页面隐藏 ≥30s 回来强制重连。
 

@@ -13,6 +13,8 @@ anchors:
   - server/lib/deepseek-balance-cache.ts
   - server/lib/kimi-quota-wait.ts
   - server/lib/nug-quota-cache.ts
+  - server/routes/nug.ts
+  - server/routes/nug-runtime.test.ts
   - server/lib/opencode-quota-wait.ts
   - server/lib/provider-balance-adapters.ts
   - server/lib/provider-balance-cache.ts
@@ -69,7 +71,7 @@ keywords:
   - /api/opencode/usages
   - /api/deepseek/balances
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 ---
 
 # 供应商余额与额度
@@ -92,6 +94,8 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
   - TokenDance（`tokendance-service.ts:getTokenDanceBalance`，`/api/tokendance/balance`）：缓存 30s，快照为 CNY 钱包。
   - Command Code（`commandcode-usage.ts`，`/api/commandcode/usage`）：`/alpha/billing/credits`，5 小时与每周窗口加月度点数；CLI 登录没有对应凭证，不缓存。
   - Codex（`codex-usage.ts`）：`chatgpt.com/backend-api/wham/usage`，超时 20s、响应 ≤256KB；窗口按 `limit_window_seconds` 判定（18000 → 5h，604800 → weekly，28–31 天 → monthly，其余 unknown）；`projectCodexUsageSnapshot` 转成统一快照；`consumeCodexResetCredit` 消耗一次重置额度。用量由 `codex-manager` 调度（TTL 5 分钟，重置时刻后补刷），批量排队走 `codex-usage-queue.ts`（串行，任务间隔 500ms）；套餐档位汇总与预测在 `codex-usage-summary.ts`。公开概览 `GET /api/codex/quota-overview` 登录即可，其余 Codex 路由要管理员。
+- 会话首屏只从当前 `modelSummary.provider` 取必要 quotaKind/generation；provider/DeepSeek/OpenCode 的 peekGeneration 只读对应已发布项并核对当前配置/credential identity，不匹配就不返回 generation，外改凭据不能复活旧账户；不为了一个会话构造所有 provider 身份/额度图，NUG 只请求当前显示 provider。`useProviderBalanceCapability` 只读已有完整设置缓存，不额外 GET 完整 settings；额度路由仍独立授权，未知来源不伪造额度提供商。
+- NUG 标题栏的 `GET /api/nug/quotas?providerId=&expectedGeneration=` 仅取该 provider 的已有身份保护缓存，返回 `{generation,quota|null}`，去除 `extra`、≤64 KiB，不发上游 RPC；可选 expectedGeneration 与设置 revision 不符返回 409 `MODEL_RUNTIME_STALE`。前端只在 provider generation 已知时读并核对返回 generation，409 只使 runtime 设置/模型摘要失效，不调用原 `/providers/:id/quota` 的显式刷新 RPC；无 providerId 的原管理全量视图仍保留（`nug-runtime.test.ts`）。
 - 额度墙等待（`provider-quota-wait.ts`）：Kimi 与 OpenCode Go 的额度拒绝按已知重置时刻等待，其余错误返回 `none`。决定三种：`wait`（重置在预算内，挂起到 `resumeAt`）、`refuse`（等不起或重置未知，报告并附 `resetAt`）、`none`。`loop.ts:tryQuotaSuspension` 产出 `model_unavailable` 事件，orchestrator 负责等待。Kimi：重置后加 5s 偏差，单次最长 24h，每次运行最多等 3 次（`MAX_QUOTA_WAITS_PER_RUN`）；OpenCode Go 的额度墙按 retry-after 头、`/usage` 窗口、文本、文档窗口规则顺序取重置时刻，短于下限的限速不挂起，计费类拒绝（402、余额不足）不等待。共享标识在 `shared/agent-protocol/quota-exhausted.ts`。
 - 模板上的 `probeQuota`（`probeKimiQuota`、`probeDeepSeekQuota` 等）在运行时没有调用方，只有测试用到（未核实是否仍在接入）。
 

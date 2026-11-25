@@ -8,8 +8,14 @@
 
 import { describe, expect, it } from "bun:test";
 import type { TreeMessage } from "@frontend/lib/api/types";
+import { invalidateCachedPretextDocument } from "@frontend/lib/pretext-document-cache-invalidation";
 import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
-import { createPretextDocumentCache } from "./pretext-document-cache";
+import {
+	clearPretextDocumentCache,
+	createPretextDocumentCache,
+	peekCachedPretextDocument,
+	writeCachedPretextDocument,
+} from "./pretext-document-cache";
 import type { PretextDocumentInput } from "./pretext-document-loader";
 
 function message(seq: number): TreeMessage {
@@ -43,6 +49,19 @@ function input(
 }
 
 describe("createPretextDocumentCache", () => {
+	it("lets the lightweight facade synchronously invalidate only the loaded room", () => {
+		clearPretextDocumentCache();
+		try {
+			writeCachedPretextDocument({ narratorId: "n1", input: input([1, 2]) });
+			writeCachedPretextDocument({ narratorId: "n2", input: input([3]) });
+			invalidateCachedPretextDocument("n1");
+			expect(peekCachedPretextDocument("n1")).toBeNull();
+			expect(peekCachedPretextDocument("n2")?.messages.map((row) => row.seq)).toEqual([3]);
+		} finally {
+			clearPretextDocumentCache();
+		}
+	});
+
 	it("round-trips a written document by narrator", () => {
 		const cache = createPretextDocumentCache();
 		const document = input([1, 2, 3]);

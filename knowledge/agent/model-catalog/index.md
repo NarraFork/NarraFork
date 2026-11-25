@@ -18,7 +18,7 @@ keywords:
   - modelProtocols
   - catalog.json
 status: draft
-verified_at: 776dbf07e
+verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 ---
 # 模型目录与来源
 

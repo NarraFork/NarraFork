@@ -1,27 +1,9 @@
-import {
-	Button,
-	Code,
-	type ComboboxItemGroup,
-	Group,
-	Modal,
-	Select,
-	Stack,
-	Text,
-} from "@mantine/core";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { useCallback, useMemo, useState } from "react";
+import { Code, Stack, Text } from "@mantine/core";
 import { useTranslation } from "react-i18next";
-import { useAllModels } from "../../hooks/useModels";
-import { api } from "../../lib/api";
-import { FOLLOW_SUMMARY_MODEL } from "../../lib/constants";
-
-const MODEL_SELECT_OPTION_LIMIT = 100;
-
-type ModelComboboxItem = string | { value: string; label: string };
-type ModelComboboxItemGroup = ComboboxItemGroup<ModelComboboxItem, string>;
+import { useUpdateRuntimeSettings } from "../../hooks/useUpdateRuntimeSettings";
+import { SetGlobalModelModal } from "../narrator/interaction/SetGlobalModelModal";
 
 export type SummaryModelPickerErrorKind = "unavailable" | "error";
-
 export interface SummaryModelPickerModalProps {
 	opened: boolean;
 	unavailableModel: string;
@@ -31,12 +13,7 @@ export interface SummaryModelPickerModalProps {
 	onSaved: () => void;
 }
 
-/**
- * UI-only summary model picker.
- *
- * The host mounts this component only while opened, so model queries and the
- * save mutation are created after the modal is needed.
- */
+/** Shares the on-demand paginated directory, not the complete management settings. */
 export function SummaryModelPickerModal({
 	opened,
 	unavailableModel,
@@ -46,77 +23,46 @@ export function SummaryModelPickerModal({
 	onSaved,
 }: SummaryModelPickerModalProps) {
 	const { t } = useTranslation("settings");
-	const qc = useQueryClient();
-	const { groupedModels, modelOptionsFilter } = useAllModels();
-	const [selected, setSelected] = useState<string | null>(null);
-
-	// Exclude the "follow summary" sentinel — it would be self-referential here.
-	const summaryModelOptions = useMemo(
-		() =>
-			(groupedModels as ModelComboboxItemGroup[]).filter(
-				(g) =>
-					!g.items?.some?.((i) => (typeof i === "string" ? i : i.value) === FOLLOW_SUMMARY_MODEL),
-			),
-		[groupedModels],
-	);
-
-	const save = useMutation({
-		mutationFn: (summaryModel: string) => api.updateSettings({ agent: { summaryModel } }),
-		onSuccess: (data) => {
-			// PATCH returns the updated settings; avoid an extra GET before closing.
-			qc.setQueryData(["settings"], data);
-			setSelected(null);
-			onSaved();
-		},
-	});
-
-	const handleConfirm = useCallback(() => {
-		if (selected) {
-			save.mutate(selected);
-		}
-	}, [selected, save]);
-
-	const title =
-		errorKind === "unavailable" ? t("summaryModelUnavailableTitle") : t("summaryModelErrorTitle");
-
+	const save = useUpdateRuntimeSettings();
 	return (
-		<Modal opened={opened} onClose={onClose} title={title} centered size="md">
-			<Stack gap="md">
-				<Stack gap="xs">
+		<SetGlobalModelModal
+			opened={opened}
+			mode="summary"
+			groupedModels={[]}
+			currentValue={null}
+			saving={save.isPending}
+			onClose={onClose}
+			onConfirm={(summaryModel) => save.mutate({ agent: { summaryModel } }, { onSuccess: onSaved })}
+			title={
+				errorKind === "unavailable"
+					? t("summaryModelUnavailableTitle")
+					: t("summaryModelErrorTitle")
+			}
+			confirmLabel={t("summaryModelUnavailableConfirm")}
+		>
+			<Stack gap="xs">
+				<Text size="sm" c="dimmed">
+					{errorKind === "unavailable"
+						? t("summaryModelUnavailableDesc")
+						: t("summaryModelErrorDescIntro")}
+				</Text>
+				{(unavailableModel || errorMessage) && (
+					<Code block style={{ whiteSpace: "pre-wrap", wordBreak: "break-all" }}>
+						{unavailableModel}
+						{errorMessage ? `${unavailableModel ? "\n" : ""}${errorMessage}` : ""}
+					</Code>
+				)}
+				{errorKind === "unavailable" && (
 					<Text size="sm" c="dimmed">
-						{errorKind === "unavailable"
-							? t("summaryModelUnavailableDesc")
-							: t("summaryModelErrorDescIntro")}
+						{t("summaryModelUnavailableHint")}
 					</Text>
-					{/* The model may be empty when the summary model is simply unset —
-					    render the block only when there is something to show. */}
-					{(unavailableModel || errorMessage) && (
-						<Code block style={{ whiteSpace: "pre-wrap", wordBreak: "break-all" }}>
-							{unavailableModel}
-							{errorMessage ? `${unavailableModel ? "\n" : ""}${errorMessage}` : ""}
-						</Code>
-					)}
-					{errorKind === "unavailable" && (
-						<Text size="sm" c="dimmed">
-							{t("summaryModelUnavailableHint")}
-						</Text>
-					)}
-				</Stack>
-				<Select
-					label={t("summaryModel")}
-					data={summaryModelOptions}
-					searchable
-					filter={modelOptionsFilter}
-					limit={MODEL_SELECT_OPTION_LIMIT}
-					value={selected}
-					onChange={setSelected}
-				/>
-				<Group justify="flex-end">
-					<Button onClick={handleConfirm} disabled={!selected} loading={save.isPending}>
-						{t("summaryModelUnavailableConfirm")}
-					</Button>
-				</Group>
+				)}
+				{save.error && (
+					<Text size="sm" c="red" role="alert">
+						{save.error.message}
+					</Text>
+				)}
 			</Stack>
-		</Modal>
+		</SetGlobalModelModal>
 	);
 }

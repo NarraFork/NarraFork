@@ -1,26 +1,53 @@
 import { notifications } from "@mantine/notifications";
-import { useQueryClient } from "@tanstack/react-query";
-import { useCallback, useMemo, useRef } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useCallback, useMemo, useRef, useSyncExternalStore } from "react";
 import { useTranslation } from "react-i18next";
-import { useUserPreferences } from "../../../hooks/useUserPreferences";
+import { useCurrentUser } from "../../../hooks/useCurrentUser";
 import { api } from "../../../lib/api";
-import { readSpecTabLayout, type SpecTabLayout } from "./spec-tab-order";
-import { createSpecTabLayoutSaver, patchNarratorSpecTabLayout } from "./spec-tab-save";
+import { getToken, onTokenChange } from "../../../lib/api/client";
+import { EMPTY_SPEC_TAB_LAYOUT, type SpecTabLayout } from "./spec-tab-order";
+import { createSpecTabLayoutSaver } from "./spec-tab-save";
 
-type Preferences = Awaited<ReturnType<typeof api.getUserPreferences>>;
+function subscribeToken(listener: () => void) {
+	const off = onTokenChange(listener);
+	const onStorage = (event: StorageEvent) => {
+		if (event.key === "narrafork_token" || event.key === null) listener();
+	};
+	if (typeof window !== "undefined") window.addEventListener("storage", onStorage);
+	return () => {
+		off();
+		if (typeof window !== "undefined") window.removeEventListener("storage", onStorage);
+	};
+}
 
-const USER_PREFERENCES_KEY = ["user-preferences"] as const;
-
-/**
- * 读取并保存某个叙述者的大纲标签排布。
- *
- * 排布持久化在 user_preferences.spec_tab_layout，跟随用户跨设备生效。
- * 连续拖拽或置顶会立刻反映到缓存，网络写入则串行提交最新排布；
- * 失败时只回滚这一位叙述者，不清掉缓存里的其他偏好。
- */
+/** A current-narrator point read; historical layout maps never enter the UI cache. */
 export function useSpecTabLayout(narratorId: string) {
-	const { data: prefs } = useUserPreferences();
 	const queryClient = useQueryClient();
+	const { data: user } = useCurrentUser();
+	const token = useSyncExternalStore(subscribeToken, getToken, () => null);
+	const queryKey = useMemo(
+		() => ["user-preferences", "spec-tab-layout", token, user?.id, narratorId] as const,
+		[token, user?.id, narratorId],
+	);
+	// biome-ignore lint/correctness/useExhaustiveDependencies: writes are scoped to this exact account/narrator key.
+	const writes = useMemo(() => ({ epoch: 0, pending: 0 }), [queryKey]);
+	const query = useQuery({
+		queryKey,
+		queryFn: async ({ signal }) => {
+			if (getToken() !== token) throw new Error("Session changed");
+			const epoch = writes.epoch;
+			const result = await api.getSpecTabLayout(narratorId, { signal });
+			if (getToken() !== token) throw new Error("Session changed");
+			// Account events may refetch while a newer local gesture is being saved.
+			if (writes.pending || writes.epoch !== epoch) {
+				return queryClient.getQueryData<SpecTabLayout>(queryKey) ?? result;
+			}
+			return result;
+		},
+		enabled: !!token && !!user?.id && !!narratorId,
+		staleTime: 30_000,
+		gcTime: 60_000,
+	});
 	const { t } = useTranslation("narrator");
 	const reportError = useRef<() => void>(() => {});
 	reportError.current = () => {
@@ -30,38 +57,43 @@ export function useSpecTabLayout(narratorId: string) {
 			message: t("spec.tabLayoutSaveError"),
 		});
 	};
-
-	const layout = useMemo(
-		() => readSpecTabLayout(prefs?.specTabLayout, narratorId),
-		[prefs, narratorId],
-	);
-
 	const saver = useMemo(
 		() =>
 			createSpecTabLayoutSaver({
-				readLoadedLayout: () => {
-					const previous = queryClient.getQueryData<Preferences>(USER_PREFERENCES_KEY);
-					if (!previous) return null;
-					return readSpecTabLayout(previous.specTabLayout, narratorId);
-				},
+				readLoadedLayout: () => queryClient.getQueryData<SpecTabLayout>(queryKey) ?? null,
 				writeLayout: (next) => {
-					queryClient.setQueryData<Preferences>(USER_PREFERENCES_KEY, (current) => {
-						if (!current) return current;
-						return patchNarratorSpecTabLayout(current, narratorId, next);
-					});
+					if (getToken() !== token) return;
+					writes.epoch++;
+					queryClient.setQueryData<SpecTabLayout>(queryKey, next);
 				},
-				persist: (next) => api.saveSpecTabLayout(narratorId, next),
-				onPersistError: () => reportError.current(),
+				persist: async (next) => {
+					if (getToken() !== token) throw new Error("Session changed");
+					writes.pending++;
+					const controller = new AbortController();
+					const offToken = subscribeToken(() => {
+						if (getToken() !== token) controller.abort(new Error("Session changed"));
+					});
+					try {
+						await api.saveSpecTabLayout(narratorId, next, { signal: controller.signal });
+						if (getToken() !== token) return;
+						void queryClient.invalidateQueries({ queryKey: ["user-preferences", "detail"] });
+					} finally {
+						offToken();
+						writes.pending--;
+					}
+				},
+				onPersistError: () => {
+					if (getToken() === token) reportError.current();
+				},
 			}),
-		[narratorId, queryClient],
+		[narratorId, queryClient, queryKey, token, writes],
 	);
-
 	const save = useCallback(
 		(mutate: (current: SpecTabLayout) => SpecTabLayout) => {
+			void queryClient.cancelQueries({ queryKey, exact: true }, { revert: false });
 			saver.save(mutate);
 		},
-		[saver],
+		[saver, queryClient, queryKey],
 	);
-
-	return { layout, save };
+	return { layout: query.data ?? EMPTY_SPEC_TAB_LAYOUT, save };
 }

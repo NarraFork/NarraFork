@@ -419,6 +419,73 @@ export interface NarratorWarningInfo {
 	diagnostics?: Record<string, unknown>;
 }
 
+export interface NarratorStatusPatch {
+	status: string;
+	statusEpoch?: string;
+	statusRevision?: number;
+	substatus?: string[];
+	turnStartedAt?: string | null;
+	updatedAt?: string;
+	messageCount?: number;
+	errorMessage?: string | null;
+	errorRetryable?: boolean | null;
+	archivedWithNarratorId?: string | null;
+	backgroundWorkActive?: boolean;
+}
+
+/** Whitelist status fields without turning omitted legacy fields into clears. */
+export function coerceNarratorStatusPatch(
+	data: Record<string, unknown>,
+): NarratorStatusPatch | null {
+	if (!Object.hasOwn(data, "status") || typeof data.status !== "string") return null;
+	const patch: NarratorStatusPatch = { status: data.status };
+	if (Object.hasOwn(data, "statusEpoch") && typeof data.statusEpoch === "string") {
+		patch.statusEpoch = data.statusEpoch;
+	}
+	if (
+		Object.hasOwn(data, "statusRevision") &&
+		typeof data.statusRevision === "number" &&
+		Number.isSafeInteger(data.statusRevision) &&
+		data.statusRevision >= 0
+	) {
+		patch.statusRevision = data.statusRevision;
+	}
+	if (
+		Object.hasOwn(data, "substatus") &&
+		Array.isArray(data.substatus) &&
+		data.substatus.every((item) => typeof item === "string")
+	) {
+		patch.substatus = data.substatus;
+	}
+	if (Object.hasOwn(data, "updatedAt") && typeof data.updatedAt === "string") {
+		patch.updatedAt = data.updatedAt;
+	}
+	if (
+		Object.hasOwn(data, "messageCount") &&
+		typeof data.messageCount === "number" &&
+		Number.isSafeInteger(data.messageCount) &&
+		data.messageCount >= 0
+	) {
+		patch.messageCount = data.messageCount;
+	}
+	for (const field of ["turnStartedAt", "errorMessage", "archivedWithNarratorId"] as const) {
+		if (Object.hasOwn(data, field) && isNullableString(data[field])) patch[field] = data[field];
+	}
+	if (
+		Object.hasOwn(data, "errorRetryable") &&
+		(typeof data.errorRetryable === "boolean" || data.errorRetryable === null)
+	) {
+		patch.errorRetryable = data.errorRetryable;
+	}
+	if (
+		Object.hasOwn(data, "backgroundWorkActive") &&
+		typeof data.backgroundWorkActive === "boolean"
+	) {
+		patch.backgroundWorkActive = data.backgroundWorkActive;
+	}
+	return patch;
+}
+
 export interface NarratorWSCallbacks {
 	onMessage?: (data: { message?: TreeMessage; [key: string]: unknown }) => void;
 	onUserMessage?: (data: { message?: TreeMessage; [key: string]: unknown }) => void;
@@ -555,7 +622,12 @@ export interface NarratorWSCallbacks {
 	 * rebuild would re-layout the list several times per second.
 	 */
 	onReflectionProgress?: (data: ReflectionProgressEvent) => void;
-	onStatusChange?: (status: string, turnStartedAt?: string, substatus?: string[]) => void;
+	onStatusChange?: (
+		status: string,
+		turnStartedAt?: string,
+		substatus?: string[],
+		patch?: NarratorStatusPatch,
+	) => void;
 	onSubstatusChange?: (substatus: string[]) => void;
 	onToolStarted?: (
 		toolUseId: string,
@@ -1242,15 +1314,22 @@ export function useNarratorWS(
 						break;
 					}
 					case "status_change":
-						callbackOwner.callbacks.onStatusChange?.(
-							data.status as string,
-							data.turnStartedAt as string | undefined,
-							data.substatus as string[] | undefined,
-						);
+					case "substatus_change": {
+						const patch = coerceNarratorStatusPatch(data);
+						if (patch) {
+							callbackOwner.callbacks.onStatusChange?.(
+								patch.status,
+								patch.turnStartedAt ?? undefined,
+								patch.substatus,
+								patch,
+							);
+						} else if (data.type === "substatus_change") {
+							// Older producers send only the label array. Versioned frames
+							// carry the complete committed patch and use the status path.
+							callbackOwner.callbacks.onSubstatusChange?.(data.substatus as string[]);
+						}
 						break;
-					case "substatus_change":
-						callbackOwner.callbacks.onSubstatusChange?.(data.substatus as string[]);
-						break;
+					}
 					case "tool_started":
 						callbackOwner.callbacks.onToolStarted?.(
 							data.toolUseId as string,
@@ -2062,6 +2141,10 @@ export interface NarratorListWSEvent {
 		| "awaitedQuestion";
 	status?: string;
 	substatus?: string[];
+	/** Authoritative state reconciliation, not a new completion notification intent. */
+	stateOnly?: boolean;
+	/** A late completion intent; never apply it to cached state or the favicon. */
+	notificationOnly?: boolean;
 	/** Execution generation for the current/last turn — used to dedup notifications per turn. */
 	turnStartedAt?: string;
 	/**
@@ -2150,12 +2233,18 @@ export function useNarratorsListWS(
 			},
 			(data) => {
 				const nId = data.narratorId as string | undefined;
-				if (data.type === "status_change") {
+				if (
+					data.type === "status_change" ||
+					(data.type === "substatus_change" && typeof data.status === "string")
+				) {
 					if (nId)
 						onUpdateRef.current(nId, {
 							type: "status",
 							status: data.status as string,
 							substatus: data.substatus as string[] | undefined,
+							...(data.type === "substatus_change" ? { stateOnly: true } : {}),
+							turnStartedAt:
+								typeof data.turnStartedAt === "string" ? data.turnStartedAt : undefined,
 							...(data.backgroundWorkActive === true ? { backgroundWorkActive: true } : {}),
 						});
 				} else if (data.type === "substatus_change") {

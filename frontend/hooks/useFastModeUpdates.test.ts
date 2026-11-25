@@ -112,7 +112,7 @@ describe("authenticated fast-mode invalidation", () => {
 		const disabled = watch(["narrators", "disabled"], false);
 		const body = watch(["narrators", "child", "messages"]);
 		const list = watch(["narrators", { standalone: true }]);
-		const preferences = watch(["user-preferences"]);
+		const preferences = watch(["user-preferences", "ui", "a", "token-a"]);
 		client.setQueryData(["narrators", "hidden"], { revision: 0 });
 		const subscribe = spyOn(narratorWSManager, "subscribe");
 		await mount();
@@ -133,7 +133,7 @@ describe("authenticated fast-mode invalidation", () => {
 	});
 	test("targeted preferences hints merge with the global hint and only literal true refreshes preferences", async () => {
 		const detail = watch(["narrators", "child"]);
-		const preferences = watch(["user-preferences"]);
+		const preferences = watch(["user-preferences", "ui", "a", "token-a"]);
 		await mount();
 		narratorWSManager.dispatchLocalFrame({ type: "fast_mode_changed" });
 		narratorWSManager.dispatchLocalFrame({ type: "fast_mode_changed", refreshPreferences: true });
@@ -148,7 +148,7 @@ describe("authenticated fast-mode invalidation", () => {
 	});
 	test("first connection and reconnect repair missed detail and preference changes; disconnect alone does not read", async () => {
 		const detail = watch(["narrators", "child"]);
-		const preferences = watch(["user-preferences"]);
+		const preferences = watch(["user-preferences", "ui", "a", "token-a"]);
 		await mount();
 		connection(false, false);
 		expect(scheduled.size).toBe(0);
@@ -184,7 +184,9 @@ describe("authenticated fast-mode invalidation", () => {
 		expect(listen).not.toHaveBeenCalled();
 	});
 	test("successful default mutations invalidate details without requiring WS, unrelated or failed patches do not", async () => {
-		const update = spyOn(api, "updateUserPreferences").mockResolvedValue({});
+		const update = spyOn(api, "updateUIPreferences").mockResolvedValue(
+			{} as Awaited<ReturnType<typeof api.getUIPreferences>>,
+		);
 		await mount(false);
 		const key = ["narrators", "child"];
 		client.setQueryData(key, { revision: 0 });

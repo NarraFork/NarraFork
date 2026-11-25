@@ -43,12 +43,23 @@ export async function countNarratorMessageRefs(
 	messageVersion?: number,
 	options: Pick<ReadQueryOptions, "deadlineAt" | "signal"> = {},
 ): Promise<number> {
+	return (
+		(await readNarratorMessageRefCountSnapshot(narratorId, messageVersion, options))?.count ?? 0
+	);
+}
+
+/** Count and its observed version travel together; callers must not relabel a newer count. */
+export async function readNarratorMessageRefCountSnapshot(
+	narratorId: string,
+	messageVersion?: number,
+	options: Pick<ReadQueryOptions, "deadlineAt" | "signal"> = {},
+): Promise<{ version: number; count: number } | undefined> {
 	options.signal?.throwIfAborted();
 	const cached = exactRefCounts.get(narratorId);
 	if (messageVersion !== undefined && cached?.version === messageVersion) {
 		exactRefCounts.delete(narratorId);
 		exactRefCounts.set(narratorId, cached);
-		return cached.count;
+		return { version: cached.version, count: cached.count };
 	}
 	// Count and version are observed in one statement; never seed a cache under
 	// a pre-await version or use the insert-only messageCount high-water mark.
@@ -75,7 +86,7 @@ export async function countNarratorMessageRefs(
 		if (exactRefCounts.size > EXACT_COUNT_CACHE_LIMIT)
 			exactRefCounts.delete(exactRefCounts.keys().next().value as string);
 	}
-	return row?.count ?? 0;
+	return row;
 }
 
 /**

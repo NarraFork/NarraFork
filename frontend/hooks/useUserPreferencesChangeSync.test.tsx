@@ -77,11 +77,17 @@ afterAll(() => {
 
 test("invalidates only preferences on the account's data-free WS hint", async () => {
 	const invalidate = spyOn(client, "invalidateQueries");
+	const uiKey = ["user-preferences", "ui", "a", "token-a"];
+	const detailKey = ["user-preferences", "detail", "a", "token-a"];
+	client.setQueryData(uiKey, { language: "en" });
+	client.setQueryData(detailKey, { commands: [] });
 	await mount();
 	expect(listeners.map(({ opts }) => opts)).toEqual([{ types: ["user_preferences_changed"] }]);
 	expect(invalidate).not.toHaveBeenCalled();
 	listeners[0]?.cb();
 	expect(invalidate).toHaveBeenCalledWith({ queryKey: ["user-preferences"] });
+	expect(client.getQueryState(uiKey)?.isInvalidated).toBe(true);
+	expect(client.getQueryState(detailKey)?.isInvalidated).toBe(true);
 });
 
 test("recovers missed changes on reconnect and removes both listeners on unmount", async () => {
