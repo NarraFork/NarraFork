@@ -1120,14 +1120,39 @@ export async function fastForwardCheckout(
 const shellWord = (value: string) =>
 	/^[A-Za-z0-9_./:@%+=,-]+$/.test(value) ? value : `'${value.replaceAll("'", `'\\''`)}'`;
 
+/** The command a person runs instead of 「在该目录中快进」, for each shell. */
+export interface FastForwardCommands {
+	/** POSIX sh / Git Bash. */
+	sh: string;
+	/** Windows PowerShell / pwsh. */
+	powershell: string;
+	/** The shell to show first: the server's platform's. */
+	preferred: "sh" | "powershell";
+}
+
+/** A value as one PowerShell single-quoted string (a quote is doubled). */
+const powershellWord = (value: string) => `'${value.replaceAll("'", "''")}'`;
+
 /**
- * The command a person runs instead of 「在该目录中快进」 (POSIX shell): it does nothing unless
- * that checkout is on `base`, then fast-forwards to exactly the prepared merge commit, never
- * stashing and never overwriting an ignored file. Offered only while the checkout is on the base.
+ * What a person runs instead of 「在该目录中快进」: it does nothing unless that checkout's HEAD is
+ * exactly `refs/heads/<base>`, then fast-forwards to the prepared merge commit itself, never
+ * stashing and never overwriting an ignored file. A POSIX shell form and a PowerShell form (the
+ * default follows the server's platform). Offered only while the checkout is on the base.
  */
-export function fastForwardCommand(dir: string, base: string, mergeCommit: string): string {
+export function fastForwardCommand(
+	dir: string,
+	base: string,
+	mergeCommit: string,
+	platform: NodeJS.Platform = process.platform,
+): FastForwardCommands {
 	assertBranch(base);
 	assertSha(mergeCommit);
-	const at = `git -C ${shellWord(dir)}`;
-	return `[ "$(${at} symbolic-ref --quiet --short HEAD)" = ${shellWord(base)} ] && ${at} merge --ff-only --no-autostash --no-overwrite-ignore ${mergeCommit}`;
+	const merge = `merge --ff-only --no-autostash --no-overwrite-ignore ${mergeCommit}`;
+	const sh = `git -C ${shellWord(dir)}`;
+	const ps = `git -C ${powershellWord(dir)}`;
+	return {
+		sh: `[ "$(${sh} symbolic-ref --quiet HEAD)" = ${shellWord(`refs/heads/${base}`)} ] && ${sh} ${merge}`,
+		powershell: `if ((${ps} symbolic-ref --quiet HEAD) -ceq ${powershellWord(`refs/heads/${base}`)}) { ${ps} ${merge} } else { Write-Error ${powershellWord(`Not on ${base}: nothing was changed`)} }`,
+		preferred: platform === "win32" ? "powershell" : "sh",
+	};
 }

@@ -641,6 +641,10 @@
 					"TEAM_MERGE_FAST_FORWARD_INCOMPLETE": "快进后那个目录需要检查（有未合并文件、多了一个 stash，或 HEAD 不在合并结果上）。请到那里看一下；这一项没有标为已合并。",
 					"TEAM_MERGE_HOSTING_UNKNOWN": "读不出 origin 托管在哪里，请稍后再试；origin 在 GitHub 上时绝不会在本地合并。",
 					"TEAM_MERGE_TIMEOUT": "合并耗时太久，已在不会留下半截改动的地方停下。"
+				},
+				"shell": {
+					"sh": "Git Bash / sh",
+					"powershell": "PowerShell"
 				}
 			}
 		}

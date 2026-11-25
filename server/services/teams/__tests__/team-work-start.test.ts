@@ -36,6 +36,7 @@ import {
 import { readWorkStats, resetWorkStatCacheForTests } from "../team-work-view";
 import {
 	assertDependenciesReachStart,
+	reconcileUnblocks,
 	setUnblockDeliveryForTests,
 } from "../work-item-dependencies";
 import {
@@ -578,5 +579,31 @@ describe("where work starts", () => {
 			expect(sync.instruction).toContain(`the base origin/main (commit ${upstream})`);
 			expect(sync.instruction).not.toContain("origin/origin");
 		}
+	});
+
+	test("a dependency reaching origin later unblocks once, after the fetch that brings it (Devin)", async () => {
+		const notes: string[] = [];
+		setUnblockDeliveryForTests(async ({ itemId }) => {
+			notes.push(itemId);
+			return true;
+		});
+		setTeamSettings({ workStart: "remote" });
+		const schema = await create("Schema");
+		const api = await create("API", [schema.id]);
+		const head = await commitFile(worktreePathOf(schema) ?? "", "schema.txt", "s\n", "schema");
+		await git(["merge", "-q", "--ff-only", head]);
+		await mergedAt(schema.id, head);
+		expect(unblocks(api.id)).toBe(0);
+		expect(notes).toEqual([]);
+		// Origin gets it; the next work-start fetch brings it into refs/remotes/origin/main.
+		await git(["push", "-q", "origin", "main"]);
+		await create("Something else");
+		await Bun.sleep(400);
+		expect(unblocks(api.id)).toBe(1);
+		expect(notes).toEqual([api.id]);
+		// Looked at again (the periodic sweep): nothing more.
+		expect(await reconcileUnblocks({ projectId: PROJECT })).toBe(0);
+		expect(unblocks(api.id)).toBe(1);
+		expect(notes).toEqual([api.id]);
 	});
 });

@@ -626,6 +626,57 @@ export async function confirmUnblocks(
 	return confirmed;
 }
 
+/** Queued items one reconcile looks at. */
+const RECONCILE_SCAN_MAX = 200;
+
+/**
+ * Unblocks that a merge could not confirm then: a dependency merged into the local base while its
+ * dependent starts from `origin/<base>` (or the other way round) reaches the dependent's start ref
+ * only later, through a fetch. Called after a work-start fetch and by the periodic refresh: the
+ * queued, workerless items of a project (or of all projects) that have dependencies — an indexed
+ * read, at most {@link RECONCILE_SCAN_MAX} — whose dependencies are all merged go through
+ * {@link confirmUnblocks} (the same git check and the same once-only recording), and the
+ * coordinators of the newly unblocked ones are told. Returns how many were unblocked.
+ */
+export async function reconcileUnblocks(options: { projectId?: string } = {}): Promise<number> {
+	const rows = db
+		.selectDistinct({
+			id: teamWorkItems.id,
+			teamId: teamWorkItems.teamId,
+			title: teamWorkItems.title,
+			createdBy: teamWorkItems.createdBy,
+		})
+		.from(teamWorkItems)
+		.innerJoin(teamWorkItemDependencies, eq(teamWorkItemDependencies.itemId, teamWorkItems.id))
+		.where(
+			and(
+				eq(teamWorkItems.state, "queued"),
+				isNull(teamWorkItems.workerNarratorId),
+				...(options.projectId ? [eq(teamWorkItems.projectId, options.projectId)] : []),
+			),
+		)
+		.orderBy(asc(teamWorkItems.id))
+		.limit(RECONCILE_SCAN_MAX)
+		.all();
+	if (rows.length === 0) return 0;
+	const all = readDependencies(rows.map((row) => row.id));
+	const candidates: UnblockCandidate[] = [];
+	for (const row of rows) {
+		const dependsOn = all.get(row.id) ?? [];
+		if (dependsOn.length === 0 || !dependsOn.every((dependency) => dependencyResolved(dependency)))
+			continue;
+		candidates.push({
+			...row,
+			dependsOn: dependsOn.map((dependency) => dependency.id),
+			mergedItem: dependsOn.at(-1)?.id ?? "",
+		});
+	}
+	if (candidates.length === 0) return 0;
+	const unblocked = await confirmUnblocks(candidates);
+	await deliverUnblockedNotes(unblocked);
+	return unblocked.length;
+}
+
 /** How a coordinator hears that an item can start (one `sys` row, woken when idle). */
 export type UnblockDelivery = (input: {
 	teamId: string;

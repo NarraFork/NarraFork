@@ -106,6 +106,18 @@ export function fetchOnce(
 	return started;
 }
 
+/** Re-check a project's queued items after a fetch moved origin's base (background). */
+function scheduleUnblockReconcile(projectId: string): void {
+	void import("./work-item-dependencies")
+		.then(({ reconcileUnblocks }) => reconcileUnblocks({ projectId }))
+		.catch((error) =>
+			logger.warn("Team unblocks could not be reconciled", {
+				projectId,
+				error: error instanceof Error ? error.message : String(error),
+			}),
+		);
+}
+
 /** Where one item starts or syncs from. */
 export interface WorkStartPoint {
 	mode: TeamWorkStart;
@@ -167,6 +179,9 @@ export async function workStartPoint(input: {
 			base: input.baseBranch,
 			error: fetch.message,
 		});
+	// D: origin may now hold a dependency that merged elsewhere: queued items waiting on it
+	// are looked at again (in the background; notes go out once).
+	if (fetch.ok) scheduleUnblockReconcile(input.projectId);
 	const commit = await git.resolve(ref).catch(() => null);
 	if (!commit)
 		throw new AppError(

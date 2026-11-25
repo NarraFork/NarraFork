@@ -1300,7 +1300,12 @@ describe("merge (M)", () => {
 						blocker: null,
 						runningSessions: 0,
 						terminals: 1,
-						command: "git -C /home/alice/app merge --ff-only refs/narrafork/team-merges/r",
+						command: {
+							sh: "git -C /home/alice/app merge --ff-only --no-autostash --no-overwrite-ignore abc",
+							powershell:
+								"if ((git -C '/home/alice/app' symbolic-ref --quiet HEAD) -ceq 'refs/heads/main') { git -C '/home/alice/app' merge --ff-only abc }",
+							preferred: "powershell",
+						},
 						files: ["src/a.ts", "upstream/u.ts"],
 						filesMore: false,
 					},
@@ -1312,9 +1317,11 @@ describe("merge (M)", () => {
 		);
 		expect(prepared).toContain('data-testid="team-merge-fast-forward"');
 		expect(prepared).toContain("在该目录中快进");
-		expect(prepared).toContain(
-			"git -C /home/alice/app merge --ff-only refs/narrafork/team-merges/r",
-		);
+		// The server's platform picks the shell shown first (PowerShell here); both are labelled.
+		expect(prepared).toContain('data-shell="powershell"');
+		expect(prepared).toContain("-ceq &#x27;refs/heads/main&#x27;");
+		expect(prepared).toContain("Git Bash / sh");
+		expect(prepared).toContain("PowerShell");
 		expect(prepared).toContain('data-testid="team-merge-copy"');
 		const blocked = await outcome(
 			view(
@@ -1331,7 +1338,12 @@ describe("merge (M)", () => {
 						blocker: "sessions_running",
 						runningSessions: 2,
 						terminals: 0,
-						command: "git -C /home/alice/app merge --ff-only refs/narrafork/team-merges/r",
+						command: {
+							sh: "git -C /home/alice/app merge --ff-only --no-autostash --no-overwrite-ignore abc",
+							powershell:
+								"if ((git -C '/home/alice/app' symbolic-ref --quiet HEAD) -ceq 'refs/heads/main') { git -C '/home/alice/app' merge --ff-only abc }",
+							preferred: "powershell",
+						},
 						files: ["src/a.ts", "upstream/u.ts"],
 						filesMore: false,
 					},
@@ -1361,7 +1373,12 @@ describe("merge (M)", () => {
 						blocker: null,
 						runningSessions: 0,
 						terminals: 0,
-						command: "git -C /home/alice/app merge --ff-only refs/narrafork/team-merges/r",
+						command: {
+							sh: "git -C /home/alice/app merge --ff-only --no-autostash --no-overwrite-ignore abc",
+							powershell:
+								"if ((git -C '/home/alice/app' symbolic-ref --quiet HEAD) -ceq 'refs/heads/main') { git -C '/home/alice/app' merge --ff-only abc }",
+							preferred: "powershell",
+						},
 						files: ["src/a.ts", "upstream/u.ts"],
 						filesMore: false,
 					},
@@ -1371,7 +1388,7 @@ describe("merge (M)", () => {
 		expect(refused).toContain('data-code="TEAM_MERGE_FAST_FORWARD_REFUSED"');
 		expect(refused).toContain("src/b.ts");
 		expect(refused).toContain('data-testid="team-merge-fast-forward"');
-		expect(refused).toContain("git -C /home/alice/app merge --ff-only");
+		expect(refused).toContain('data-testid="team-merge-command"');
 		expect(blocked).toContain("那里有 2 个会话在运行");
 		// Off the base the blocker shows and no command is offered (Devin 2).
 		const offBase = await outcome(

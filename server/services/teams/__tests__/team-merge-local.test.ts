@@ -313,9 +313,10 @@ describe("local merge", () => {
 		expect(view.outcome).toBe("prepared");
 		expect(view.canMerge).toBe(true);
 		expect(view.fastForward).toMatchObject({ available: true, blocker: null });
-		expect(view.fastForward?.command).toBe(
-			`[ "$(git -C ${repo} symbolic-ref --quiet --short HEAD)" = main ] && git -C ${repo} merge --ff-only --no-autostash --no-overwrite-ignore ${outcome.mergeCommit}`,
+		expect(view.fastForward?.command?.sh).toBe(
+			`[ "$(git -C ${repo} symbolic-ref --quiet HEAD)" = refs/heads/main ] && git -C ${repo} merge --ff-only --no-autostash --no-overwrite-ignore ${outcome.mergeCommit}`,
 		);
+		expect(view.fastForward?.command?.powershell).toContain(outcome.mergeCommit);
 
 		// 「在该目录中快进」: only now does that checkout change, keeping the person's own edits.
 		expect(requestFastForward({ teamId: LEAD, itemId: a.id, userId: USER }).job).toBe(
@@ -440,7 +441,7 @@ describe("local merge", () => {
 			member: true,
 		});
 		expect(refusedView.outcome).toBe("prepared");
-		expect(refusedView.fastForward?.command).toContain("merge --ff-only");
+		expect(refusedView.fastForward?.command?.sh).toContain("merge --ff-only");
 		expect(await git(["rev-parse", "main"])).toBe(before);
 		expect(await readFile(join(repo, "delta.txt"), "utf8")).toBe("mine\n");
 	});
@@ -877,7 +878,7 @@ describe("local merge", () => {
 		});
 		expect(view.fastForward?.files).toEqual(["chi.txt", "upstream.txt"]);
 		expect(view.fastForward?.filesMore).toBe(false);
-		expect(view.fastForward?.command).toContain(prepared.mergeCommit);
+		expect(view.fastForward?.command?.sh).toContain(prepared.mergeCommit);
 		// Off the base, the blocker shows and no command is offered.
 		resetMergeJobsForTests();
 		await git(["checkout", "-q", "-b", "elsewhere"]);

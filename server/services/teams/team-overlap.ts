@@ -1016,6 +1016,18 @@ async function passOnce(sweep: boolean): Promise<BatchResult> {
 		}
 	}
 	await flushNotices();
+	// D: a sweep also re-checks queued items whose dependencies merged but had not reached their
+	// start ref yet (bounded; recorded and told once). Within what is left of the deadline.
+	if (sweep && activeDatabaseBackend === "sqlite") {
+		const remaining = deadlineAt - job.clock.now();
+		if (remaining > 0)
+			await withinDeadline(
+				import("./work-item-dependencies").then(({ reconcileUnblocks }) => reconcileUnblocks()),
+				remaining,
+			).catch((error) =>
+				logger.warn("Team unblocks could not be reconciled", { error: String(error) }),
+			);
+	}
 	return result;
 }
 

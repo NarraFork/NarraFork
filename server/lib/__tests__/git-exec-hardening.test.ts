@@ -9,7 +9,9 @@ import {
 	gitConfigEnv,
 	PROGRAM_CONFIG_QUERY,
 	parseProgramConfig,
+	probeLazyFetchHonoured,
 	setGitHardeningProbeForTests,
+	setNoLazyFetchSupportForTests,
 	untrustedProgramOverrides,
 } from "../git-exec-hardening";
 
@@ -65,5 +67,35 @@ describe("git exec hardening", () => {
 		await ensureConfigOverridesHonored();
 		await ensureConfigOverridesHonored();
 		expect(asked).toBe(3);
+	});
+
+	test("lazy fetching: this git honours GIT_NO_LAZY_FETCH by behaviour; promisor settings are seen", async () => {
+		// git 2.45 is the first with it ("git --no-lazy-fetch", RelNotes 2.45.0); probed, not parsed.
+		expect(await probeLazyFetchHonoured()).toBe(true);
+		for (const record of [
+			"extensions.partialclone\norigin\0",
+			"remote.evil.promisor\ntrue\0",
+			"remote.evil.partialclonefilter\nblob:none\0",
+		])
+			expect(parseProgramConfig(record).partialClone).toBe(true);
+		expect(parseProgramConfig("remote.origin.url\nx\0").partialClone).toBeUndefined();
+		// A git that does not honour it: any promisor setting refuses the repository.
+		setNoLazyFetchSupportForTests(false);
+		try {
+			expect(() =>
+				untrustedProgramOverrides(parseProgramConfig("remote.evil.promisor\ntrue\0")),
+			).toThrow(expect.objectContaining({ code: "GIT_TOO_OLD_FOR_PARTIAL_CLONE" }));
+			expect(() => untrustedProgramOverrides(parseProgramConfig(""))).not.toThrow();
+		} finally {
+			setNoLazyFetchSupportForTests(null);
+		}
+		setNoLazyFetchSupportForTests(true);
+		try {
+			expect(() =>
+				untrustedProgramOverrides(parseProgramConfig("remote.evil.promisor\ntrue\0")),
+			).not.toThrow();
+		} finally {
+			setNoLazyFetchSupportForTests(null);
+		}
 	});
 });

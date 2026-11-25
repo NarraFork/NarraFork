@@ -23,7 +23,9 @@
  * Git older than 2.31 silently ignores `GIT_CONFIG_COUNT`. `ensureConfigOverridesHonored` reads
  * a sentinel back through the same environment once per process and refuses otherwise.
  */
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { AppError } from "./errors";
 import { DEV_NULL } from "./platform";
 import { safeSpawn } from "./spawn";
@@ -56,7 +58,7 @@ export const PROGRAM_CONFIG_QUERY = [
 	"config",
 	"-z",
 	"--get-regexp",
-	"^(filter\\..+\\.(clean|smudge|process)|hook\\..+\\.(command|event)|merge\\..+\\.driver|extensions\\.partialclone)$",
+	"^(filter\\..+\\.(clean|smudge|process)|hook\\..+\\.(command|event)|merge\\..+\\.driver|extensions\\.partialclone|remote\\..+\\.(promisor|partialclonefilter))$",
 ] as const;
 
 export interface GitConfiguredPrograms {
@@ -65,9 +67,10 @@ export interface GitConfiguredPrograms {
 	/** Custom merge drivers (`merge.<name>.driver`); absent when none was read. */
 	drivers?: string[];
 	/**
-	 * The repository is a partial clone (`extensions.partialClone`): a missing object would be
-	 * fetched lazily, running the promisor remote's upload-pack, which `GIT_NO_LAZY_FETCH`
-	 * forbids (git ≥ 2.44; older git is refused).
+	 * The repository is (or names) a partial clone (`extensions.partialClone`, a
+	 * `remote.*.promisor` or `remote.*.partialCloneFilter`): a missing object would be fetched
+	 * lazily, running the promisor remote's upload-pack, which `GIT_NO_LAZY_FETCH` forbids where
+	 * this git honours it (git 2.45, checked by behaviour); otherwise the repository is refused.
 	 */
 	partialClone?: true;
 }
@@ -86,7 +89,11 @@ export function parseProgramConfig(stdout: string): GitConfiguredPrograms {
 		else if (key.startsWith("hook.")) hooks.add(key.slice("hook.".length, last));
 		else if (key.startsWith("merge.") && key.slice(last + 1).toLowerCase() === "driver")
 			drivers.add(key.slice("merge.".length, last));
-		else if (key.toLowerCase() === "extensions.partialclone") partialClone = true;
+		else if (
+			key.toLowerCase() === "extensions.partialclone" ||
+			(key.toLowerCase().startsWith("remote.") && /\.(promisor|partialclonefilter)$/i.test(key))
+		)
+			partialClone = true;
 	}
 	const programs: GitConfiguredPrograms = {
 		filters: [...filters].filter(Boolean),
@@ -104,7 +111,7 @@ export function untrustedProgramOverrides(
 ): Array<readonly [string, string]> {
 	if (programs.partialClone && !noLazyFetchSupported)
 		throw new AppError(
-			"This repository is a partial clone and this git (older than 2.44) cannot be kept from fetching missing objects through its promisor remote; update git to use it with teams",
+			"This repository is a partial clone (or names a promisor remote) and this git cannot be kept from fetching missing objects through it (GIT_NO_LAZY_FETCH needs git 2.45); update git to use it with teams",
 			409,
 			"GIT_TOO_OLD_FOR_PARTIAL_CLONE",
 		);
@@ -162,22 +169,76 @@ async function defaultProbe(): Promise<boolean> {
 let probe: HardeningProbe = defaultProbe;
 let verdict: Promise<boolean> | null = null;
 
-/** `GIT_NO_LAZY_FETCH` arrived in git 2.44 (known once the version was read; false until then). */
+/**
+ * Whether this git honours `GIT_NO_LAZY_FETCH` (git 2.45, "git --no-lazy-fetch"): known once the
+ * behaviour probe ran (false until then, and when it could not tell).
+ */
 let noLazyFetchSupported = false;
 let lazyFetchProbe: Promise<void> | null = null;
 
+const PROBE_TIMEOUT_MS = 10_000;
+
+/**
+ * Probe the behaviour itself, once per process: a scratch partial clone whose promisor remote
+ * (a scratch repository next to it) holds a blob the clone lacks. With `GIT_NO_LAZY_FETCH=1`
+ * `cat-file -e` must fail; without it, the same command must fetch the blob and succeed (the
+ * control: otherwise the setup proves nothing and the answer is "not honoured"). Bounded: a
+ * handful of git commands with a timeout each, in a temporary directory removed afterwards.
+ */
+export async function probeLazyFetchHonoured(): Promise<boolean> {
+	const dir = await mkdtemp(join(tmpdir(), "nf-lazy-fetch-"));
+	const git = (cwd: string, args: string[], env: Record<string, string> = {}) =>
+		safeSpawn({
+			cmd: ["git", "-C", cwd, ...args],
+			env: {
+				...process.env,
+				LC_ALL: "C",
+				GIT_TERMINAL_PROMPT: "0",
+				GIT_CONFIG_NOSYSTEM: "1",
+				GIT_CONFIG_GLOBAL: DEV_NULL,
+				...env,
+			},
+			timeout: PROBE_TIMEOUT_MS,
+			maxOutputBytes: 4096,
+			killProcessTree: true,
+		});
+	try {
+		const source = join(dir, "source");
+		const clone = join(dir, "clone");
+		await mkdir(source);
+		await mkdir(clone);
+		if ((await git(source, ["init", "-q"])).exitCode !== 0) return false;
+		await writeFile(join(source, "blob"), "narrafork lazy fetch probe\n");
+		const blob = await git(source, ["hash-object", "-w", "blob"]);
+		const oid = blob.stdout.trim();
+		if (blob.exitCode !== 0 || !/^[a-f0-9]{40,64}$/.test(oid)) return false;
+		for (const args of [
+			["config", "uploadpack.allowAnySHA1InWant", "true"],
+			["config", "uploadpack.allowFilter", "true"],
+		])
+			await git(source, args);
+		if ((await git(clone, ["init", "-q"])).exitCode !== 0) return false;
+		for (const args of [
+			["config", "core.repositoryformatversion", "1"],
+			["config", "extensions.partialClone", "probe"],
+			["config", "remote.probe.url", source],
+			["config", "remote.probe.promisor", "true"],
+		])
+			await git(clone, args);
+		const lookup = ["-c", "protocol.file.allow=always", "cat-file", "-e", oid];
+		const refused = await git(clone, lookup, { GIT_NO_LAZY_FETCH: "1" });
+		if (refused.exitCode === 0) return false;
+		const control = await git(clone, lookup);
+		return control.exitCode === 0;
+	} catch {
+		return false;
+	} finally {
+		await rm(dir, { recursive: true, force: true }).catch(() => {});
+	}
+}
+
 async function probeLazyFetchSupport(): Promise<void> {
-	const result = await safeSpawn({
-		cmd: ["git", "--version"],
-		cwd: tmpdir(),
-		env: { ...process.env, LC_ALL: "C" },
-		timeout: 10_000,
-		maxOutputBytes: 1024,
-	}).catch(() => null);
-	const match = /git version (\d+)\.(\d+)/.exec(result?.stdout ?? "");
-	const major = Number(match?.[1] ?? 0);
-	const minor = Number(match?.[2] ?? 0);
-	noLazyFetchSupported = major > 2 || (major === 2 && minor >= 44);
+	noLazyFetchSupported = await probeLazyFetchHonoured();
 }
 
 /** Force the `GIT_NO_LAZY_FETCH` support verdict (tests); null reads git again. */

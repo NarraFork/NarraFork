@@ -334,15 +334,25 @@ describe("team git writes", () => {
 		await rm(origin, { recursive: true, force: true });
 	});
 
-	test("the copyable command asserts the branch and names the prepared commit (Devin 2, 4)", async () => {
+	test("the copyable command asserts the branch and names the prepared commit, for sh and PowerShell (Devin 2, 4)", async () => {
 		const sha = "a".repeat(40);
-		expect(fastForwardCommand("/repo/main", "main", sha)).toBe(
-			`[ "$(git -C /repo/main symbolic-ref --quiet --short HEAD)" = main ] && git -C /repo/main merge --ff-only --no-autostash --no-overwrite-ignore ${sha}`,
-		);
-		expect(fastForwardCommand("/my repo/it's", "main", sha)).toContain(
-			"git -C '/my repo/it'\\''s' symbolic-ref",
-		);
-		// Run for real: off the base it does nothing; on it, it fast-forwards to the commit.
+		const plain = fastForwardCommand("/repo/main", "main", sha, "linux");
+		expect(plain).toEqual({
+			sh: `[ "$(git -C /repo/main symbolic-ref --quiet HEAD)" = refs/heads/main ] && git -C /repo/main merge --ff-only --no-autostash --no-overwrite-ignore ${sha}`,
+			powershell: `if ((git -C '/repo/main' symbolic-ref --quiet HEAD) -ceq 'refs/heads/main') { git -C '/repo/main' merge --ff-only --no-autostash --no-overwrite-ignore ${sha} } else { Write-Error 'Not on main: nothing was changed' }`,
+			preferred: "sh",
+		});
+		// Spaces and quotes: one word each way (sh closes and reopens the quote, PowerShell doubles it).
+		const quoted = fastForwardCommand("C:\\My Repo\\it's", "main", sha, "win32");
+		expect(quoted.preferred).toBe("powershell");
+		expect(quoted.powershell).toContain("git -C 'C:\\My Repo\\it''s' symbolic-ref");
+		expect(quoted.sh).toContain("git -C 'C:\\My Repo\\it'\\''s' symbolic-ref");
+		// Run the sh form for real, from a directory with a space and a quote in its name.
+		const spaced = join(temporary, `my repo it's ${Math.random().toString(36).slice(2)}`);
+		await rm(repo, { recursive: true, force: true });
+		repo = spaced;
+		await mkdir(repo, { recursive: true });
+		await git(["init", "-q", "-b", "main"]);
 		const { head, base } = await forkedRepo();
 		const write = teamRepoGit(repo);
 		const merged = await write.mergeTree(base, head);
@@ -353,7 +363,7 @@ describe("team git writes", () => {
 			message: "m",
 			identity: null,
 		});
-		const command = fastForwardCommand(repo, "main", commit);
+		const command = fastForwardCommand(repo, "main", commit).sh;
 		await git(["checkout", "-q", "-b", "elsewhere"]);
 		const off = await safeSpawn({
 			cmd: ["sh", "-c", command],
@@ -370,6 +380,19 @@ describe("team git writes", () => {
 		});
 		expect(on.exitCode).toBe(0);
 		expect(await git(["rev-parse", "main"])).toBe(commit);
+		// PowerShell, where this host has it.
+		const pwsh = Bun.which("pwsh");
+		if (pwsh) {
+			await git(["reset", "-q", "--hard", base]);
+			const ps = fastForwardCommand(repo, "main", commit).powershell;
+			const run = await safeSpawn({
+				cmd: [pwsh, "-NoProfile", "-Command", ps],
+				timeout: 30_000,
+				maxOutputBytes: 4096,
+			});
+			expect(run.exitCode).toBe(0);
+			expect(await git(["rev-parse", "main"])).toBe(commit);
+		}
 	});
 });
 
@@ -802,6 +825,33 @@ describe("programs a repository can name (security 1, 2)", () => {
 		expect(existsSync(ran)).toBe(false);
 	});
 
+	test("a promisor remote without extensions.partialClone is refused on a git that cannot stop lazy fetching", async () => {
+		await commitFile("a.txt", "base\n", "base");
+		await git(["checkout", "-qb", "feature"]);
+		const head = await commitFile("a.txt", "feature\n", "feature");
+		const blob = await git(["rev-parse", `${head}:a.txt`]);
+		await git(["checkout", "-q", "main"]);
+		const base = await commitFile("a.txt", "main\n", "main");
+		await rm(join(repo, ".git", "objects", blob.slice(0, 2), blob.slice(2)));
+		const ran = marker("promisor-only");
+		await git(["config", "remote.evil.url", repo]);
+		await git(["config", "remote.evil.promisor", "true"]);
+		await git(["config", "remote.evil.partialclonefilter", "blob:none"]);
+		await git(["config", "remote.evil.uploadpack", await script("up", `touch ${ran}; exit 1`)]);
+		setNoLazyFetchSupportForTests(false);
+		try {
+			await expect(teamRepoGit(repo).mergeTree(base, head)).rejects.toMatchObject({
+				code: "GIT_TOO_OLD_FOR_PARTIAL_CLONE",
+			});
+			await expect(teamGit(repo).readBlob(blob, 8)).rejects.toMatchObject({
+				code: "GIT_TOO_OLD_FOR_PARTIAL_CLONE",
+			});
+		} finally {
+			setNoLazyFetchSupportForTests(null);
+		}
+		expect(existsSync(ran)).toBe(false);
+	});
+
 	test("core.alternateRefsCommand never runs on a fetch", async () => {
 		const { base } = await forkedRepo();
 		const head = await git(["commit-tree", `${base}^{tree}`, "-p", base, "-m", "next"]);
@@ -886,5 +936,38 @@ describe("the work-start fetch, second round (Devin 3; security 3, 5)", () => {
 		expect(() => networkOverrides([entry("local", "core.gitproxy", "evil")], {})).toThrow(
 			UnsafeRemoteConfigError,
 		);
+	});
+});
+
+describe("the copyable command and a same-named tag (Devin)", () => {
+	test("a branch named like a tag still fast-forwards: the full ref is compared", async () => {
+		await commitFile("a.txt", "a\n", "base");
+		await git(["branch", "-m", "release"]);
+		await git(["tag", "release"]);
+		await git(["checkout", "-qb", "feature"]);
+		const head = await commitFile("b.txt", "b\n", "feature");
+		await git(["checkout", "-q", "release"]);
+		const base = await git(["rev-parse", "HEAD"]);
+		// What --short would have printed: an ambiguous name.
+		expect(await git(["symbolic-ref", "--short", "HEAD"])).toBe("heads/release");
+		const write = teamRepoGit(repo);
+		const merged = await write.mergeTree(base, head);
+		if (!merged.clean) throw new Error("expected a clean merge");
+		const commit = await write.commitTree({
+			tree: merged.tree,
+			parents: [base, head],
+			message: "m",
+			identity: null,
+		});
+		const command = fastForwardCommand(repo, "release", commit);
+		expect(command.sh).toContain("= refs/heads/release ]");
+		expect(command.powershell).toContain("-ceq 'refs/heads/release'");
+		const run = await safeSpawn({
+			cmd: ["sh", "-c", command.sh],
+			timeout: 20_000,
+			maxOutputBytes: 4096,
+		});
+		expect(run.exitCode).toBe(0);
+		expect(await git(["rev-parse", "refs/heads/release"])).toBe(commit);
 	});
 });

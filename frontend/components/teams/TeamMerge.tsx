@@ -23,6 +23,7 @@ import {
 	Group,
 	List,
 	Modal,
+	SegmentedControl,
 	Stack,
 	Text,
 	Tooltip,
@@ -109,33 +110,63 @@ export function MergeButton({
 	);
 }
 
-/** The command a person can run in the checkout, with a copy button. */
-function CopyCommand({ command }: { command: string }) {
+type CommandShell = "sh" | "powershell";
+
+/**
+ * The command a person can run in the checkout, with a copy button: a Git Bash / sh form and a
+ * PowerShell form, labelled; the server's platform picks the first shown, and the person can
+ * switch.
+ */
+function CopyCommand({
+	commands,
+}: {
+	commands: { sh: string; powershell: string; preferred: CommandShell };
+}) {
 	const { t } = useTranslation("projects");
+	const [shell, setShell] = useState<CommandShell>(commands.preferred);
+	const command = commands[shell];
 	return (
-		<Group gap={4} wrap="nowrap" align="flex-start" data-testid="team-merge-command">
-			<Code
-				block
-				style={{ ...MONO, flex: 1, minWidth: 0, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}
-			>
-				{command}
-			</Code>
-			<CopyButton value={command}>
-				{({ copied, copy }) => (
-					<Tooltip label={copied ? t("teams.page.merge.copied") : t("teams.page.merge.copy")}>
-						<ActionIcon
-							variant="subtle"
-							color={copied ? "teal" : "gray"}
-							onClick={copy}
-							aria-label={t("teams.page.merge.copy")}
-							data-testid="team-merge-copy"
-						>
-							{copied ? <IconCheck size={16} /> : <IconCopy size={16} />}
-						</ActionIcon>
-					</Tooltip>
-				)}
-			</CopyButton>
-		</Group>
+		<Stack gap={4} data-testid="team-merge-command" data-shell={shell}>
+			<SegmentedControl
+				size="xs"
+				value={shell}
+				onChange={(value) => setShell(value === "powershell" ? "powershell" : "sh")}
+				data={[
+					{ value: "sh", label: t("teams.page.merge.shell.sh") },
+					{ value: "powershell", label: t("teams.page.merge.shell.powershell") },
+				]}
+				data-testid="team-merge-command-shell"
+			/>
+			<Group gap={4} wrap="nowrap" align="flex-start">
+				<Code
+					block
+					style={{
+						...MONO,
+						flex: 1,
+						minWidth: 0,
+						whiteSpace: "pre-wrap",
+						overflowWrap: "anywhere",
+					}}
+				>
+					{command}
+				</Code>
+				<CopyButton value={command}>
+					{({ copied, copy }) => (
+						<Tooltip label={copied ? t("teams.page.merge.copied") : t("teams.page.merge.copy")}>
+							<ActionIcon
+								variant="subtle"
+								color={copied ? "teal" : "gray"}
+								onClick={copy}
+								aria-label={t("teams.page.merge.copy")}
+								data-testid="team-merge-copy"
+							>
+								{copied ? <IconCheck size={16} /> : <IconCopy size={16} />}
+							</ActionIcon>
+						</Tooltip>
+					)}
+				</CopyButton>
+			</Group>
+		</Stack>
 	);
 }
 
@@ -351,7 +382,7 @@ export function MergeOutcome({
 								<Text size="xs" c="dimmed">
 									{t("teams.page.merge.commandHint")}
 								</Text>
-								<CopyCommand command={merge.fastForward.command} />
+								<CopyCommand commands={merge.fastForward.command} />
 							</>
 						)}
 					</>
