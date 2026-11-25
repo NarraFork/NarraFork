@@ -71,6 +71,23 @@ export function teamMembersWhere(rootId: string): SQL | undefined {
 }
 
 /**
+ * Narrator statuses Send, Await and Watch can still address.
+ *
+ * `idle` is finished with its last turn but still addressable. `working` and
+ * `waiting` are in progress. `archived` is finished and is not part of this set.
+ * There is no time cutoff: an old idle member stays, an archived one does not.
+ */
+export const ADDRESSABLE_NARRATOR_STATUSES = ["idle", "working", "waiting"] as const;
+
+/** Team members the caller can still address. Archived history is excluded. */
+export function addressableTeamMembersWhere(rootId: string): SQL | undefined {
+	return and(
+		teamMembersWhere(rootId),
+		inArray(narrators.status, [...ADDRESSABLE_NARRATOR_STATUSES]),
+	);
+}
+
+/**
  * Model pool a narrator follows its source within, fixed at creation. Null means no
  * pool: following a source then simply uses the source's model.
  */

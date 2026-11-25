@@ -63,7 +63,7 @@ for (const [key, value] of Object.entries(globals)) {
 Object.assign(window.document, { fonts: { addEventListener() {}, removeEventListener() {} } });
 const { QueryClient, QueryClientProvider } = await import("@tanstack/react-query");
 const { formatTokenDanceMoney } = await import("../../lib/tokendance-money");
-const { useQuotaSnapshot, quotaSnapshotsKey } = await import("../../hooks/useQuotaSnapshots");
+const { useQuotaSnapshot, quotaSnapshotsReadKey } = await import("../../hooks/useQuotaSnapshots");
 const { createRoot } = await import("react-dom/client");
 const { MantineProvider } = await import("@mantine/core");
 const { I18nextProvider } = await import("react-i18next");
@@ -1032,7 +1032,7 @@ describe("TokenDance recharge behavior", () => {
 		await tick(3000);
 		expect(refresh).toHaveBeenCalledTimes(1);
 		expect(paid).toBe(1);
-		expect(qc.getQueryData<typeof balance>(quotaSnapshotsKey)).toEqual(balance);
+		expect(qc.getQueryData<typeof balance>(quotaSnapshotsReadKey())).toEqual(balance);
 		expect([...timers.values()].some((timer) => timer.delay === 3000)).toBe(false);
 	});
 	it.each([

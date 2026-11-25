@@ -8,12 +8,24 @@ import {
 	useSensors,
 } from "@dnd-kit/core";
 import type { QueryClient } from "@tanstack/react-query";
-import { type RefObject, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type RefObject, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { invalidateNarratorGitIdentities } from "../../hooks/git-identity-query-keys";
-import type { RecentTab } from "../../hooks/recent-tabs-utils";
-import { applyRecentTabsDelta, refreshRecentTabsLoadedWindow } from "../../hooks/useRecentTabs";
+import { type RecentTab, recentTabLiveNarratorId } from "../../hooks/recent-tabs-utils";
+import {
+	applyRecentTabsDeltaAndFollowUp,
+	refreshRecentTabsLoadedWindow,
+} from "../../hooks/useRecentTabs";
 import { api } from "../../lib/api";
-import { cancelDrag, endDrag, getPanelDrag, moveDrag, startDragManual } from "../../lib/panel-drag";
+import {
+	cancelDrag,
+	endDrag,
+	getPanelDrag,
+	moveDrag,
+	PANEL_DROP_PRIORITY,
+	registerPanelDropTarget,
+	startDragManual,
+} from "../../lib/panel-drag";
+import { isRecentTabsScopeCurrent, type RecentTabsScope } from "../../lib/recent-tabs-owner";
 import {
 	createRecentTabDragModel,
 	type FolderViewOptions,
@@ -32,6 +44,7 @@ import {
 import { autoScrollAllowedForPointer } from "./recent-tabs-logic";
 
 export interface UseRecentTabsDragOptions {
+	scope: RecentTabsScope;
 	/** Latest section tabs; project/narrator filtering belongs to the caller. */
 	tabs: RecentTab[];
 	/** How each folder is shown; decides which members are rows. */
@@ -105,7 +118,9 @@ function eventPointer(event: Event): { x: number; y: number } | null {
 }
 
 export function useRecentTabsDrag(options: UseRecentTabsDragOptions) {
-	const { tabs, folderOptions, containerRef } = options;
+	const { scope, tabs, folderOptions, containerRef } = options;
+	const targetId = useId();
+	const dropTaskRef = useRef<Promise<void> | null>(null);
 	const [draggingId, setDraggingId] = useState<string | null>(null);
 	const [pending, setPending] = useState(false);
 	const [optimistic, setOptimistic] = useState<RecentTab[] | null>(null);
@@ -334,7 +349,7 @@ export function useRecentTabsDrag(options: UseRecentTabsDragOptions) {
 	}, []);
 	const onDragStart = useCallback(
 		(event: DragStartEvent) => {
-			if (pendingRef.current || activeRef.current) return;
+			if (pendingRef.current || activeRef.current || !isRecentTabsScopeCurrent(scope)) return;
 			const key = String(event.active.id);
 			const entry = modelRef.current.entries.get(key);
 			if (!entry) return;
@@ -347,15 +362,15 @@ export function useRecentTabsDrag(options: UseRecentTabsDragOptions) {
 			capturedRef.current = false;
 			setDraggingId(key);
 			const tab = entry.tab;
-			const narratorId = tab?.type === "narrator" || tab?.type === "subagent" ? tab.id : null;
+			const narratorId = tab && recentTabLiveNarratorId(tab);
 			if (narratorId && tab && pointer) {
-				startDragManual(narratorId, tab.title, pointer.x, pointer.y);
+				startDragManual(narratorId, tab.title, pointer.x, pointer.y, "narrator");
 				ownedRef.current = getPanelDrag();
 			}
 			armReleaseWatch();
 			updateIndicator();
 		},
-		[armReleaseWatch, updateIndicator],
+		[armReleaseWatch, scope, updateIndicator],
 	);
 	const updatePointer = useCallback((event: DragMoveEvent | DragEndEvent) => {
 		if (!activeRef.current) return;
@@ -379,103 +394,131 @@ export function useRecentTabsDrag(options: UseRecentTabsDragOptions) {
 	 * Persist a drop. Also used by external drops (a narrator dragged in from the list
 	 * page), so both paths share the optimistic render, timeout and failure resync.
 	 */
-	const submitPlan = useCallback(async (plan: RecentTabDragPlan): Promise<void> => {
-		if (pendingRef.current) return;
-		pendingRef.current = true;
-		setPending(true);
-		setOptimistic(plan.finalTabs);
-		const { qc, onError, newFolderTitle } = optionsRef.current;
-		const controller = new AbortController();
-		submissionRef.current = controller;
-		const timeout = setTimeout(
-			() => controller.abort(new Error("Recent tab reorder timed out")),
-			SUBMISSION_TIMEOUT_MS,
-		);
-		const { signal } = controller;
-		try {
-			const result = await awaitSubmission(
-				plan.kind === "merge"
-					? api.createRecentTabFolder(
-							{ targetKey: plan.targetKey, sourceKey: plan.sourceKey, title: newFolderTitle },
-							signal,
-						)
-					: api.moveRecentTab(plan.key, plan.target, signal),
-				signal,
+	const submitPlan = useCallback(
+		async (plan: RecentTabDragPlan): Promise<void> => {
+			if (pendingRef.current || !isRecentTabsScopeCurrent(scope)) return;
+			pendingRef.current = true;
+			setPending(true);
+			setOptimistic(plan.finalTabs);
+			const { qc, onError, newFolderTitle } = optionsRef.current;
+			const controller = new AbortController();
+			submissionRef.current = controller;
+			const timeout = setTimeout(
+				() => controller.abort(new Error("Recent tab reorder timed out")),
+				SUBMISSION_TIMEOUT_MS,
 			);
-			const applied = applyRecentTabsDelta(qc, result);
-			// Folder membership may have changed, and with it the git identity a session follows.
-			void invalidateNarratorGitIdentities(qc);
-			if (applied.gaps.length > 0 || applied.backfill.length > 0) {
-				await awaitSubmission(
-					refreshRecentTabsLoadedWindow(qc, {
-						reset: applied.gaps.length > 0,
-						minimumRevision: result.revision,
-					}),
+			const { signal } = controller;
+			try {
+				const result = await awaitSubmission(
+					plan.kind === "merge"
+						? api.createRecentTabFolder(
+								{ targetKey: plan.targetKey, sourceKey: plan.sourceKey, title: newFolderTitle },
+								signal,
+							)
+						: api.moveRecentTab(plan.key, plan.target, signal),
 					signal,
 				);
-			}
-		} catch {
-			try {
-				if (mountedRef.current) onError();
+				if (!isRecentTabsScopeCurrent(scope)) return;
+				const followUp = applyRecentTabsDeltaAndFollowUp(qc, result, scope);
+				// Folder membership may have changed, and with it the git identity a session follows.
+				void invalidateNarratorGitIdentities(qc);
+				await awaitSubmission(followUp, signal);
+			} catch {
+				if (!isRecentTabsScopeCurrent(scope)) return;
+				try {
+					if (mountedRef.current) onError();
+				} finally {
+					// Resync partial commits, but never keep a cancelled submission locked on a hung refresh.
+					await awaitSubmission(
+						refreshRecentTabsLoadedWindow(qc, { reset: true }, scope),
+						signal,
+					).catch(() => {});
+				}
 			} finally {
-				// Resync partial commits, but never keep a cancelled submission locked on a hung refresh.
-				await awaitSubmission(refreshRecentTabsLoadedWindow(qc, { reset: true }), signal).catch(
-					() => {},
-				);
+				clearTimeout(timeout);
+				if (submissionRef.current === controller) submissionRef.current = null;
+				pendingRef.current = false;
+				if (mountedRef.current) {
+					setPending(false);
+					setOptimistic(null);
+				}
 			}
-		} finally {
-			clearTimeout(timeout);
-			if (submissionRef.current === controller) submissionRef.current = null;
-			pendingRef.current = false;
-			if (mountedRef.current) {
-				setPending(false);
-				setOptimistic(null);
-			}
-		}
-	}, []);
+		},
+		[scope],
+	);
+	const resolveSidebarDrop = useCallback(
+		(pointer: { x: number; y: number }): { plan: RecentTabDragPlan | null } | null => {
+			const source = activeRef.current;
+			const el = optionsRef.current.containerRef.current;
+			if (!source || !el) return null;
+			const rect = el.getBoundingClientRect();
+			if (
+				pointer.x < rect.left ||
+				pointer.x > rect.right ||
+				pointer.y < rect.top ||
+				pointer.y > rect.bottom
+			)
+				return null;
+			const target = resolveInternalDrop(
+				modelRef.current,
+				source,
+				measureRows(),
+				pointer,
+				rect,
+				el.querySelector("[data-recent-tab-pin-divider]")?.getBoundingClientRect() ?? null,
+			);
+			// A no-op is still a sidebar hit, not permission for a lower-priority consumer.
+			return {
+				plan: target
+					? planRecentTabDrop(modelRef.current, source, target, optionsRef.current.newFolderTitle)
+					: null,
+			};
+		},
+		[measureRows],
+	);
+	useEffect(
+		() =>
+			registerPanelDropTarget({
+				id: `sidebar-internal:${targetId}`,
+				priority: PANEL_DROP_PRIORITY.sidebar,
+				hitTest: (state) => (ownedRef.current === state ? resolveSidebarDrop(state) : null),
+				onDrop: (_state, { plan }) => {
+					if (plan) dropTaskRef.current = submitPlan(plan);
+				},
+			}),
+		[resolveSidebarDrop, submitPlan, targetId],
+	);
 	const onDragEnd = useCallback(
 		async (event: DragEndEvent) => {
-			const source = activeRef.current;
-			if (!source) return;
+			if (!activeRef.current) return;
+			if (!isRecentTabsScopeCurrent(scope)) {
+				onDragCancel();
+				return;
+			}
 			updatePointer(event);
-			const pointer = pointerRef.current;
-			const el = optionsRef.current.containerRef.current;
-			const target =
-				pointer && el
-					? resolveInternalDrop(
-							modelRef.current,
-							source,
-							measureRows(),
-							pointer,
-							el.getBoundingClientRect(),
-							el.querySelector("[data-recent-tab-pin-divider]")?.getBoundingClientRect() ?? null,
-						)
-					: null;
-			const plan = target
-				? planRecentTabDrop(modelRef.current, source, target, optionsRef.current.newFolderTitle)
-				: null;
 			suppressClick();
-			// A sidebar release belongs only to sorting, even if another surface still
-			// holds an earlier hover target. Keep sidebar subscribers suspended until broadcast ends.
+			let task: Promise<void> | null = null;
 			try {
-				if (ownedRef.current && getPanelDrag() === ownedRef.current) {
-					const rect = el?.getBoundingClientRect();
-					const inside =
-						pointer &&
-						rect &&
-						pointer.x >= rect.left &&
-						pointer.x <= rect.right &&
-						pointer.y >= rect.top &&
-						pointer.y <= rect.bottom;
-					if (inside) cancelDrag();
-					else endDrag();
+				if (ownedRef.current) {
+					if (getPanelDrag() === ownedRef.current) {
+						dropTaskRef.current = null;
+						// @dnd-kit owns release; bridge it once into the shared arbiter.
+						endDrag();
+						task = dropTaskRef.current;
+						dropTaskRef.current = null;
+					}
+				} else {
+					// Projects/folders are sortable but never become global narrator subjects.
+					const pointer = pointerRef.current;
+					const plan = pointer ? resolveSidebarDrop(pointer)?.plan : null;
+					if (plan) task = submitPlan(plan);
 				}
 			} finally {
 				clear();
 			}
-			if (plan) await submitPlan(plan);
+			if (task) await task;
 		},
-		[clear, measureRows, submitPlan, suppressClick, updatePointer],
+		[clear, onDragCancel, resolveSidebarDrop, scope, submitPlan, suppressClick, updatePointer],
 	);
 
 	const autoScrollOptions = useMemo(

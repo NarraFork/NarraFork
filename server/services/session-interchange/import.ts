@@ -39,7 +39,8 @@ import {
 	WarningCollector,
 	withFreshToolUseIds,
 } from "@shared/session-interchange/model";
-import { eq, sql } from "drizzle-orm";
+import { NARRAFORK_AGENT_TOOL } from "@shared/session-interchange/tool-mapping";
+import { and, eq, sql } from "drizzle-orm";
 import { db } from "../../db";
 import {
 	narratorMessageRefs,
@@ -60,10 +61,13 @@ import {
 import { withDelegationDepth } from "../agent-runtime/policy";
 import { backgroundOccupancyStore } from "../background-occupancy-store";
 import { compileDelegationCeiling } from "../custom-subagent-service";
+import { publishCommunicationChanged } from "../narrator-communication/service";
+import { ensureCommunicationNodeTx } from "../narrator-communication/store";
 import { bumpNarratorMessageVersion } from "../narrator-persistence";
 import { dbTransactionWithSeqFloor } from "../narrator-refs/seq-floor-tx";
 import { claimNextRefSeq } from "../narrator-refs/seq-store";
 import { narratorService } from "../narrator-service";
+import { storedTitleSlug } from "../subagent-alias";
 
 /** Messages per insert transaction. Small enough that one batch never stalls the loop. */
 export const IMPORT_BATCH_MESSAGES = 200;
@@ -446,42 +450,59 @@ function createImportedSubagent(input: {
 }): string {
 	const id = generateId();
 	const now = new Date().toISOString();
-	db.insert(narrators)
-		.values({
-			id,
-			type: "subagent",
-			subagentType: input.subagentType,
-			variant: subagentVariant(input.subagentType),
-			traits: withRuntimePolicyTrait(["standalone", IMPORTED_TRAIT], input.ceiling),
-			title: input.title ?? null,
-			// Same as a live subagent: follow the parent's model rather than freezing it.
-			model: FOLLOW_PARENT_MODEL,
-			permissionMode: input.parent.permissionMode ?? "default",
-			parentNarratorId: input.parent.id,
-			// Same relationships a live delegation registers: the parent is source + controller.
-			policySourceNarratorId: input.parent.id,
-			runtimeRegistrationJson: parseRuntimeRegistration({
-				...delegationRegistration(input.parent.id, input.subagentType),
-				historyPlacement: { toolUseId: input.historyToolUseId },
-			}),
-			originToolCallId: input.originToolCallId,
-			subagentOriginKind: "tool",
-			cwd: input.parent.cwd,
-			// Its session's task backend (D31), as for a live subagent.
-			taskBackend: input.parent.taskBackend,
-			// A resumed child must run where its parent does, not fall back to the server.
-			defaultDeviceId: input.parent.defaultDeviceId ?? null,
-			// Access is delegated to the root, exactly as for a live subagent.
-			aclRootNarratorId: input.parent.aclRootNarratorId ?? input.parent.id,
-			ownerUserId: input.parent.ownerUserId,
-			visibility: "private",
-			writeAudience: "owner",
-			inheritMode: "fresh",
-			status: "idle",
-			createdAt: now,
-			updatedAt: now,
-		})
-		.run();
+	db.transaction((tx) => {
+		tx.insert(narrators)
+			.values({
+				id,
+				type: "subagent",
+				subagentType: input.subagentType,
+				variant: subagentVariant(input.subagentType),
+				traits: withRuntimePolicyTrait(["standalone", IMPORTED_TRAIT], input.ceiling),
+				title: input.title ?? null,
+				titleSlug: storedTitleSlug(input.title),
+				// Same as a live subagent: follow the parent's model rather than freezing it.
+				model: FOLLOW_PARENT_MODEL,
+				permissionMode: input.parent.permissionMode ?? "default",
+				parentNarratorId: input.parent.id,
+				// Same relationships a live delegation registers: the parent is source + controller.
+				policySourceNarratorId: input.parent.id,
+				runtimeRegistrationJson: parseRuntimeRegistration({
+					...delegationRegistration(input.parent.id, input.subagentType),
+					historyPlacement: { toolUseId: input.historyToolUseId },
+				}),
+				originToolCallId: input.originToolCallId,
+				subagentOriginKind: "tool",
+				cwd: input.parent.cwd,
+				// Its session's task backend (D31), as for a live subagent.
+				taskBackend: input.parent.taskBackend,
+				// A resumed child must run where its parent does, not fall back to the server.
+				defaultDeviceId: input.parent.defaultDeviceId ?? null,
+				// Access is delegated to the root, exactly as for a live subagent.
+				aclRootNarratorId: input.parent.aclRootNarratorId ?? input.parent.id,
+				ownerUserId: input.parent.ownerUserId,
+				visibility: "private",
+				writeAudience: "owner",
+				inheritMode: "fresh",
+				status: "idle",
+				createdAt: now,
+				updatedAt: now,
+			})
+			.run();
+		// A historical reference is not enough: only this import's own Agent call is a delegator.
+		const delegation = tx
+			.select({ id: narratorToolCalls.id })
+			.from(narratorToolCalls)
+			.where(
+				and(
+					eq(narratorToolCalls.id, input.originToolCallId),
+					eq(narratorToolCalls.narratorId, input.parent.id),
+					eq(narratorToolCalls.toolUseId, input.historyToolUseId),
+					eq(narratorToolCalls.toolName, NARRAFORK_AGENT_TOOL),
+				),
+			)
+			.get();
+		ensureCommunicationNodeTx(tx, id, delegation ? input.parent.id : null);
+	});
 	backgroundOccupancyStore.refreshNarrator(id);
 	return id;
 }
@@ -570,6 +591,8 @@ export async function importInterchangeSession(
 		}
 
 		await bumpNarratorMessageVersion(narrator.id);
+		// Primary creation already notified; publish the completed child topology once.
+		if (subagentIds.length) publishCommunicationChanged([narrator.id, ...subagentIds]);
 		logger.info("Session imported", {
 			narratorId: narrator.id,
 			format: options.source.format,

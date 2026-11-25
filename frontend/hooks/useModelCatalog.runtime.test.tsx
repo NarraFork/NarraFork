@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import type { RuntimeModelSummary } from "@shared/model-runtime";
 import type { QuotaSnapshotsResponse } from "@shared/quota-snapshot";
 import {
@@ -11,10 +11,14 @@ import { parseHTML } from "linkedom";
 import { act, StrictMode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { useNugQuota } from "../components/narrator/model/use-nug-quota";
-import { setToken } from "../lib/api/client";
+import { confirmAuthUser, getAuthSnapshot, setToken } from "../lib/api/client";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
 import { modelCatalogKeys, useModelOptions, useRuntimeModel } from "./useModelCatalog";
-import { invalidateQuotaSnapshotRead, quotaSnapshotsReadKey } from "./useQuotaSnapshots";
+import {
+	invalidateQuotaSnapshotRead,
+	quotaSnapshotsOptions,
+	quotaSnapshotsReadKey,
+} from "./useQuotaSnapshots";
 import {
 	createRuntimeProjectionInvalidator,
 	useRuntimeProjectionSync,
@@ -134,7 +138,7 @@ beforeEach(() => {
 		});
 	});
 	const { window } = parseHTML("<!doctype html><html><body></body></html>");
-	const values = new Map<string, string>([["narrafork_token", "actor-one"]]);
+	const values = new Map<string, string>();
 	model = undefined;
 	narratorSummary = undefined;
 	revision = undefined;
@@ -190,6 +194,7 @@ beforeEach(() => {
 		originals.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
 		Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
 	}
+	setToken("actor-one");
 	qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 	root = createRoot(document.createElement("div"));
 });
@@ -292,7 +297,7 @@ test("reconnect resets revision floors so a restarted server may publish revisio
 	runtimeSettingsEnabled = true;
 	await render();
 	qc.setQueryData(runtimeSettingsQueryOptions().queryKey, { ...settingsProjection, revision: 100 });
-	const invalidator = createRuntimeProjectionInvalidator(qc, "actor-one");
+	const invalidator = createRuntimeProjectionInvalidator(qc, getAuthSnapshot().generation);
 	invalidator.schedule(true, 100, true);
 	let serverRevision = 0;
 	globalThis.fetch = (async (url: unknown) => {
@@ -311,12 +316,13 @@ test("reconnect resets revision floors so a restarted server may publish revisio
 	invalidator.dispose();
 });
 test("disposed or replaced-principal invalidation queues cannot start a read", async () => {
-	const first = createRuntimeProjectionInvalidator(qc, "actor-one");
+	const first = createRuntimeProjectionInvalidator(qc, getAuthSnapshot().generation);
 	first.schedule(true, 2);
 	first.dispose();
-	const second = createRuntimeProjectionInvalidator(qc, "actor-one");
+	const second = createRuntimeProjectionInvalidator(qc, getAuthSnapshot().generation);
 	second.schedule(true, 3);
 	setToken("actor-two");
+	setToken("actor-one");
 	await flush();
 	second.dispose();
 	expect(calls).toHaveLength(0);
@@ -434,15 +440,17 @@ test("one quota marker during the hook's initial read waits and performs one fre
 	nugModel = "b:x";
 	await render();
 	expect(requests).toHaveLength(1);
-	const refreshed = invalidateQuotaSnapshotRead(qc, nugScope(), "actor-one");
+	const refreshed = invalidateQuotaSnapshotRead(qc, nugScope(), getAuthSnapshot().generation);
 	await flush();
 	expect(requests).toHaveLength(1);
 	expect(requests[0].signal?.aborted).toBe(false);
-	requests[0].finish(Response.json(nugResult(1)));
+	await act(async () => requests[0].finish(Response.json(nugResult(1))));
 	await flush();
 	expect(requests).toHaveLength(2);
-	requests[1].finish(Response.json(nugResult(7)));
-	await refreshed;
+	await act(async () => {
+		requests[1].finish(Response.json(nugResult(7)));
+		await refreshed;
+	});
 	await flush();
 	expect(currentNugQuota?.entries[0]?.snapshot?.balances[0]?.remaining).toBe(7);
 	expect(requests).toHaveLength(2);
@@ -456,22 +464,27 @@ test("quota push bursts share bounded cached HTTP reads without cancelling the a
 		new Promise<Response>((finish) => {
 			requests.push({ finish, signal: init?.signal });
 		})) as unknown as typeof fetch;
-	const first = invalidateQuotaSnapshotRead(qc, nugScope(), "actor-one");
-	const duplicate = invalidateQuotaSnapshotRead(qc, nugScope(), "actor-one");
+	const authGeneration = getAuthSnapshot().generation;
+	const first = invalidateQuotaSnapshotRead(qc, nugScope(), authGeneration);
+	const duplicate = invalidateQuotaSnapshotRead(qc, nugScope(), authGeneration);
 	await flush();
 	expect(requests).toHaveLength(1);
 	expect(requests[0].signal?.aborted).toBe(false);
-	requests[0].finish(Response.json(nugResult(6)));
+	await act(async () => requests[0].finish(Response.json(nugResult(6))));
 	await flush();
 	expect(requests).toHaveLength(2);
-	requests[1].finish(Response.json(nugResult(7)));
-	await Promise.all([first, duplicate]);
+	await act(async () => {
+		requests[1].finish(Response.json(nugResult(7)));
+		await Promise.all([first, duplicate]);
+	});
 	await flush();
 	expect(currentNugQuota?.entries[0]?.snapshot?.balances[0]?.remaining).toBe(7);
 	expect(requests.every((request) => !request.signal?.aborted)).toBe(true);
 });
-test("a late settings PATCH cannot write administrator data into the replacement token cache", async () => {
+test("a late settings PATCH cannot write administrator data or notify callbacks after A→B→A", async () => {
 	await render();
+	const oldKey = runtimeSettingsQueryOptions().queryKey;
+	const onSettled = spyOn({ callback() {} }, "callback");
 	let finish!: (response: Response) => void;
 	let sentSignal: AbortSignal | null | undefined;
 	globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
@@ -480,34 +493,97 @@ test("a late settings PATCH cannot write administrator data into the replacement
 			finish = resolve;
 		});
 	}) as unknown as typeof fetch;
-	const pending = updateRuntimeSettings
-		.mutateAsync({ agent: { defaultModel: "admin:x" } })
-		.catch((error: unknown) => error);
+	let pending!: Promise<unknown>;
+	await act(async () => {
+		pending = updateRuntimeSettings
+			.mutateAsync({ agent: { defaultModel: "admin:x" } }, { onSettled })
+			.catch((error: unknown) => error);
+	});
 	await flush();
-	await act(async () => setToken("actor-two"));
-	finish(Response.json({ ...settingsProjection, update: { serverUrl: "admin-only" } }));
-	await pending;
+	await act(async () => {
+		confirmAuthUser(getAuthSnapshot().generation, "user-one");
+		expect(sentSignal?.aborted).toBe(false);
+		setToken("actor-two");
+		setToken("actor-one");
+	});
+	await act(async () => {
+		finish(Response.json({ ...settingsProjection, update: { serverUrl: "admin-only" } }));
+		await pending;
+	});
 	await flush();
 	expect(sentSignal?.aborted).toBe(true);
-	expect(qc.getQueryData(runtimeSettingsQueryOptions().queryKey)).toBeUndefined();
+	expect(onSettled).not.toHaveBeenCalled();
+	const currentKey = runtimeSettingsQueryOptions().queryKey;
+	expect(currentKey).not.toEqual(oldKey);
+	expect(qc.getQueryData(oldKey)).toBeUndefined();
+	expect(qc.getQueryData(currentKey)).toBeUndefined();
 	expect(qc.getQueryData(["settings"])).toBeUndefined();
 });
-test("quota invalidation cannot touch another token or generation", async () => {
-	const older = quotaSnapshotsReadKey(nugScope(1), "actor-one");
-	const current = quotaSnapshotsReadKey(nugScope(2), "actor-one");
-	qc.setQueryData(older, { balance: 1 });
-	qc.setQueryData(current, { balance: 2 });
-	await invalidateQuotaSnapshotRead(qc, nugScope(1), "actor-one");
+test("quota invalidation cannot touch another auth or provider generation after A→B→A", async () => {
+	const firstAuthGeneration = getAuthSnapshot().generation;
+	const older = quotaSnapshotsReadKey(nugScope(1), firstAuthGeneration);
+	const current = quotaSnapshotsReadKey(nugScope(2), firstAuthGeneration);
+	qc.setQueryData(older, nugResult(1));
+	qc.setQueryData(current, nugResult(2));
+	await invalidateQuotaSnapshotRead(qc, nugScope(1), firstAuthGeneration);
 	expect(qc.getQueryState(older)?.isInvalidated).toBe(true);
 	expect(qc.getQueryState(current)?.isInvalidated).toBe(false);
 	setToken("actor-two");
-	const otherActor = quotaSnapshotsReadKey(nugScope(2), "actor-two");
-	qc.setQueryData(otherActor, { balance: 3 });
-	await invalidateQuotaSnapshotRead(qc, nugScope(2), "actor-one");
+	const nextAuthGeneration = setToken("actor-one");
+	const otherActor = quotaSnapshotsReadKey(nugScope(2), nextAuthGeneration);
+	qc.setQueryData(otherActor, nugResult(3));
+	await invalidateQuotaSnapshotRead(qc, nugScope(2), firstAuthGeneration);
 	expect(qc.getQueryState(otherActor)?.isInvalidated).toBe(false);
 	expect(qc.getQueryState(current)?.isInvalidated).toBe(false);
-	await invalidateQuotaSnapshotRead(qc, nugScope(2), "actor-two");
+	await invalidateQuotaSnapshotRead(qc, nugScope(2), nextAuthGeneration);
 	expect(qc.getQueryState(otherActor)?.isInvalidated).toBe(true);
+});
+test.each([
+	200, 409,
+])("a late scoped quota HTTP %s after A→B→A cannot populate data or invalidate runtime projections", async (status) => {
+	await render();
+	const oldGeneration = getAuthSnapshot().generation;
+	const oldKey = quotaSnapshotsReadKey(nugScope(), oldGeneration);
+	const oldSettings = runtimeSettingsQueryOptions(oldGeneration).queryKey;
+	qc.setQueryData(oldSettings, settingsProjection);
+	let finish!: (response: Response) => void;
+	let sentSignal: AbortSignal | null | undefined;
+	globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+		sentSignal = init?.signal;
+		return new Promise<Response>((resolve) => {
+			finish = resolve;
+		});
+	}) as unknown as typeof fetch;
+	// No observer cancellation: exercise the generation guard on the real HTTP path.
+	const pending = qc
+		.fetchQuery(quotaSnapshotsOptions(true, qc, nugScope()))
+		.catch((error: unknown) => error);
+	await flush();
+	await act(async () => {
+		setToken("actor-two");
+		setToken("actor-one");
+	});
+	const currentSettings = runtimeSettingsQueryOptions().queryKey;
+	const currentRuntime = modelCatalogKeys.runtime(getAuthSnapshot().generation, "auto:x");
+	await act(async () => {
+		qc.setQueryData(currentSettings, settingsProjection);
+		qc.setQueryData(currentRuntime, summary);
+	});
+	expect(sentSignal?.aborted).toBe(false);
+	await act(async () => {
+		finish(
+			Response.json(
+				status === 200 ? nugResult(99) : { error: "stale", code: "MODEL_RUNTIME_STALE" },
+				{ status },
+			),
+		);
+		await pending;
+	});
+	await flush();
+	expect(qc.getQueryData(oldKey)).toBeUndefined();
+	expect(currentNugQuota).toBeNull();
+	for (const key of [oldSettings, currentSettings, currentRuntime])
+		expect(qc.getQueryState(key)?.isInvalidated).toBe(false);
 });
 test("an unloaded narrator and closed menu cause no model requests", async () => {
 	await render();
@@ -621,5 +697,16 @@ test("changing identity hides and aborts the old options response", async () => 
 	);
 	await flush();
 	expect(options.data).toBeUndefined();
-	expect(modelCatalogKeys.options("actor-two", { q: "x" }).length).toBeLessThan(10);
+	const authGeneration = getAuthSnapshot().generation;
+	expect(modelCatalogKeys.options(authGeneration, { q: "x" })).toEqual([
+		"model-catalog",
+		"options",
+		authGeneration,
+		"all",
+		"x",
+		"",
+		"",
+		"",
+		40,
+	]);
 });

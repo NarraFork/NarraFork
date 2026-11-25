@@ -71,7 +71,11 @@ export const contextAskTool: ToolDefinition = {
 
 		try {
 			const { resolveSubagentTargets } = await import("@server/services/agent-communication");
-			const targets = await resolveSubagentTargets({ callerNarratorId: ctx.narratorId, id });
+			const targets = await resolveSubagentTargets({
+				callerNarratorId: ctx.narratorId,
+				id,
+				historical: true,
+			});
 			if (targets.length !== 1) {
 				throw new Error("ContextAsk requires exactly one accessible subagent target");
 			}

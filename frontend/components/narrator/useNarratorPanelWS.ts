@@ -23,7 +23,7 @@ import { type NarratorWarningInfo, useNarratorWS } from "../../hooks/useNarrator
 import { useNarratorPermissionsCapability } from "../../hooks/usePlatform";
 import { invalidateQuotaSnapshotRead } from "../../hooks/useQuotaSnapshots";
 import { ApiError, api, type BufferMessageSummary } from "../../lib/api";
-import { getToken, onTokenChange } from "../../lib/api/client";
+import { getAuthSnapshot, subscribeAuth } from "../../lib/api/client";
 import { createNarratorPanelReadScope, type NarratorPanelReadScope } from "../../lib/api/narrators";
 import { formatFullLocaleDateTime } from "../../lib/format";
 import {
@@ -368,8 +368,18 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	const { t, i18n } = useTranslation("narrator");
 	const qc = useQueryClient();
 	const { data: currentUser } = useCurrentUser();
-	const token = useSyncExternalStore(onTokenChange, getToken, () => null);
-	const panelScope = JSON.stringify([token, currentUser?.id ?? null, narratorId]);
+	const { generation: authGeneration } = useSyncExternalStore(
+		subscribeAuth,
+		getAuthSnapshot,
+		getAuthSnapshot,
+	);
+	const panelScope = JSON.stringify([authGeneration, currentUser?.id ?? null, narratorId]);
+	const quotaScope = JSON.stringify([
+		panelScope,
+		quotaProviderKey ?? null,
+		quotaReadScope?.groupId ?? null,
+		quotaReadScope?.expectedGeneration ?? null,
+	]);
 	// Each mount owns its own pool, even when another panel reads the same narrator.
 	// biome-ignore lint/correctness/useExhaustiveDependencies: identity changes retire the scope.
 	const readScope = useMemo(() => createNarratorPanelReadScope(), [panelScope]);
@@ -648,14 +658,14 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		sessionId: string;
 		seq: number;
 	} | null>(null);
-	// Payment state belongs to the current narrator/provider, unlike the shared quota query.
-	// biome-ignore lint/correctness/useExhaustiveDependencies: identity changes must reset payment state.
-	useEffect(() => {
-		setPaymentRequired(null);
-	}, [narratorId, quotaProviderKey, token]);
 	const [retryInfo, setRetryInfo] = useState<RetryInfo | null>(null);
 	const [quotaWaitInfo, setQuotaWaitInfo] = useState<QuotaWaitInfo | null>(null);
 	const [paymentRequired, setPaymentRequired] = useState<PaymentRequiredInfo | null>(null);
+	// Only identity changes retire payment state; ordinary quota updates must preserve it.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: quotaScope is the identity reset trigger.
+	useEffect(() => {
+		setPaymentRequired(null);
+	}, [quotaScope]);
 	const [leakedToolEvent, setLeakedToolEvent] = useState<LeakedToolEvent | null>(null);
 	const retryInfoRef = useRef<RetryInfo | null>(null);
 	const clearRetryIfActive = useCallback(() => {
@@ -1360,7 +1370,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				});
 			},
 			onQuotaBalance: () => {
-				if (getToken() !== token) return;
+				if (getAuthSnapshot().generation !== authGeneration) return;
 				const connectionIdentity = narratorWSManager.getConnectionCredentialIdentity();
 				if (
 					connectionIdentity !== undefined &&
@@ -1369,9 +1379,16 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					return;
 				// WS has no credential identity: re-read the server projection, never inject
 				// a request's stream text into another credential or overwrite a quota probe.
-				void invalidateQuotaSnapshotRead(qc, quotaReadScope, token);
+				void invalidateQuotaSnapshotRead(qc, quotaReadScope, authGeneration);
 			},
 			onPaymentRequired: (info) => {
+				if (getAuthSnapshot().generation !== authGeneration) return;
+				const connectionIdentity = narratorWSManager.getConnectionCredentialIdentity();
+				if (
+					connectionIdentity !== undefined &&
+					connectionIdentity !== narratorWSManager.getCredentialIdentity()
+				)
+					return;
 				setPaymentRequired(info);
 			},
 			onModelUnavailableWaiting: (info) => {
@@ -1673,6 +1690,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		{
 			kind: "panel",
 			excludeTypes: PANEL_EXCLUDED_EVENT_TYPES,
+			callbackScope: quotaScope,
 		},
 	);
 
@@ -1689,7 +1707,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		(fresh = false) => {
 			// Principal hydration owns this boundary; do not read once anonymously and
 			// repeat the entire snapshot when auth/me supplies the actual owner.
-			if (!currentUser?.id || getToken() !== token) return Promise.resolve();
+			if (!currentUser?.id || getAuthSnapshot().generation !== authGeneration)
+				return Promise.resolve();
 			if (!fresh && activeReconcileRef.current) return activeReconcileRef.current.promise;
 			reconcileRestartSchedulerRef.current?.cancel();
 			if (fresh) activeReconcileRef.current?.controller.abort();
@@ -1702,7 +1721,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			const lifecycle = permissionLifecycleRef.current;
 			const bufferEpoch = bufferEpochRef.current;
 			const isCurrent = () =>
-				getToken() === token &&
+				getAuthSnapshot().generation === authGeneration &&
 				permissionLifecycleRef.current === lifecycle &&
 				(qc.getQueryData<{ id?: string }>(["auth", "me"])?.id ?? null) ===
 					(currentUser?.id ?? null);
@@ -1775,7 +1794,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			activeReconcileRef.current = { controller, promise, generation, lifecycle, bufferEpoch };
 			return promise;
 		},
-		[narratorId, replacePendingPermissions, qc, currentUser?.id, token, readScope],
+		[narratorId, replacePendingPermissions, qc, currentUser?.id, authGeneration, readScope],
 	);
 	reconcilePanelStateRef.current = reconcilePanelState;
 	requestPanelReconcileRef.current = () => {

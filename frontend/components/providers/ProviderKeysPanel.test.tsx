@@ -4,7 +4,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createInstance } from "i18next";
 import { renderToStaticMarkup } from "react-dom/server";
 import { I18nextProvider } from "react-i18next";
-import { quotaSnapshotsKey } from "../../hooks/useQuotaSnapshots";
+import { quotaSnapshotsReadKey } from "../../hooks/useQuotaSnapshots";
 import narrator from "../../locales/en/narrator.json";
 import settings from "../../locales/en/settings.json";
 import { CommandCodeSection } from "./CommandCodeSection";
@@ -42,7 +42,7 @@ test("a single key's public snapshot is shown independently of the retired embed
 			},
 		],
 	});
-	qc.setQueryData(quotaSnapshotsKey, {
+	qc.setQueryData(quotaSnapshotsReadKey(), {
 		entries: [
 			{
 				groupId: "group",
@@ -72,7 +72,7 @@ test("Command Code keeps usage-summary and model-management controls alongside p
 		loggedIn: true,
 		summary: { totalCount: 123, totalTokens: 456, successRate: 97 },
 	});
-	qc.setQueryData(quotaSnapshotsKey, {
+	qc.setQueryData(quotaSnapshotsReadKey(), {
 		entries: [
 			{
 				groupId: "CommandCode",

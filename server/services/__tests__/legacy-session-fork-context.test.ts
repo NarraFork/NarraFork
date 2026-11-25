@@ -62,6 +62,7 @@ mock.module("../../db", () => ({
 	db,
 	sqlite,
 	activeDatabaseBackend: "sqlite",
+	postgresRuntime: null,
 	databaseMaintenance: createSqliteMaintenance(() => sqlite),
 }));
 const { canReadNarrator, canWriteNarrator } = await import("../narrator-acl");

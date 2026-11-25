@@ -12,6 +12,7 @@ let failInstall = false;
 const findRow = async () => row;
 mock.module("@server/db", () => ({
 	activeDatabaseBackend: "sqlite",
+	postgresRuntime: null,
 	sqlite: {},
 	db: {
 		$client: {},

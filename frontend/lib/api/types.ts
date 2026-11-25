@@ -970,6 +970,7 @@ export interface BufferedMessageEditLease {
 }
 
 export interface BufferMessageSummary {
+	hasComposerDocument?: boolean;
 	/** Content-only revision, when supplied by a revision-aware server. */
 	contentRevision?: number;
 	/** Mailbox control row id; this remains the id used by edit/remove/retry APIs. */

@@ -1,18 +1,27 @@
-import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import type { PublicQuotaSnapshot } from "@shared/quota-snapshot";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { parseHTML } from "linkedom";
 import { act, useState } from "react";
 import type { Root } from "react-dom/client";
+import { api } from "../../../lib/api";
+import { clearToken, setToken } from "../../../lib/api/client";
 import type { PaymentRequiredInfo } from "../useNarratorPanelWS";
 import { useNarratorQuota } from "./use-narrator-quota";
 import { useNugQuota } from "./use-nug-quota";
 
 const { window } = parseHTML("<html><body></body></html>");
 const originals = new Map<string, PropertyDescriptor | undefined>();
+const tokens = new Map<string, string>();
 for (const [key, value] of Object.entries({
 	window,
 	document: window.document,
 	navigator: window.navigator,
+	localStorage: {
+		getItem: (key: string) => tokens.get(key) ?? null,
+		setItem: (key: string, value: string) => tokens.set(key, value),
+		removeItem: (key: string) => tokens.delete(key),
+	},
 	IS_REACT_ACT_ENVIRONMENT: true,
 })) {
 	originals.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
@@ -23,7 +32,9 @@ let root: Root;
 let host: HTMLElement;
 let current: ReturnType<typeof useNarratorQuota>;
 let payment: PaymentRequiredInfo | null;
-const providers = [{ id: "gateway", prefix: "nug", name: "Gateway" }];
+let qc: QueryClient;
+let read: ReturnType<typeof spyOn<typeof api, "quotaSnapshots">>;
+const providers = [{ id: "gateway", prefix: "nug", name: "Gateway", generation: 1 }];
 const noSubstatus: string[] = [];
 function Harness({
 	snapshot,
@@ -57,14 +68,27 @@ const snapshot = (remaining: number | null, unlimited = false): PublicQuotaSnaps
 	balances: [{ unit: "USD", remaining, unlimited }],
 });
 const render = (props: Parameters<typeof Harness>[0] = {}) =>
-	act(() => root.render(<Harness {...props} />));
+	act(async () => {
+		root.render(
+			<QueryClientProvider client={qc}>
+				<Harness {...props} />
+			</QueryClientProvider>,
+		);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+	});
 beforeEach(() => {
+	setToken("quota-session");
+	qc = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: Infinity } } });
+	read = spyOn(api, "quotaSnapshots").mockResolvedValue({ entries: [] });
 	host = document.createElement("div");
 	document.body.appendChild(host);
 	root = createRoot(host);
 });
 afterEach(async () => {
 	await act(() => root.unmount());
+	qc.clear();
+	read.mockRestore();
+	clearToken();
 	host.remove();
 });
 afterAll(() => {

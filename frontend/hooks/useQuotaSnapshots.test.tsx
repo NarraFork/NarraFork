@@ -7,6 +7,7 @@ import { api } from "../lib/api";
 import {
 	quotaSnapshotsKey,
 	quotaSnapshotsOptions,
+	quotaSnapshotsReadKey,
 	selectQuotaEntries,
 	useQuotaSnapshot,
 	useRefreshQuotaSnapshots,
@@ -54,7 +55,8 @@ test("all consumers share one query key and one simultaneous read", async () => 
 		expect(first).toEqual(second);
 		expect(read).toHaveBeenCalledTimes(1);
 		expect(read.mock.calls[0]?.[0]?.signal).toBeInstanceOf(AbortSignal);
-		expect([...quotaSnapshotsOptions().queryKey]).toEqual(["quota-snapshots"]);
+		expect([...quotaSnapshotsOptions().queryKey]).toEqual([...quotaSnapshotsReadKey()]);
+		expect(quotaSnapshotsOptions().queryKey).not.toEqual(quotaSnapshotsKey);
 	} finally {
 		read.mockRestore();
 	}
@@ -62,7 +64,7 @@ test("all consumers share one query key and one simultaneous read", async () => 
 
 test("a selected credential never borrows another group's or key's quota", () => {
 	const qc = client();
-	qc.setQueryData(quotaSnapshotsKey, {
+	qc.setQueryData(quotaSnapshotsReadKey(), {
 		entries: [entry("other"), entry("group", "second"), entry()],
 	});
 	let selected: unknown;
@@ -172,7 +174,7 @@ test("refreshing polls quickly and settled data retains the thirty-second interv
 
 test("refresh mutation is bounded and replaces the cache with the authoritative response", async () => {
 	const qc = client();
-	qc.setQueryData(quotaSnapshotsKey, { entries: [entry("other")] });
+	qc.setQueryData(quotaSnapshotsReadKey(), { entries: [entry("other")] });
 	const refresh = spyOn(api, "refreshQuotaSnapshots").mockResolvedValue({ entries: [entry()] });
 	let mutate: ReturnType<typeof useRefreshQuotaSnapshots>["mutateAsync"] | undefined;
 	function Harness() {
@@ -189,7 +191,9 @@ test("refresh mutation is bounded and replaces the cache with the authoritative 
 		await mutate({ groupId: "group", credentialId: "key" });
 		expect(refresh.mock.calls[0]?.[0]).toEqual({ groupId: "group", credentialId: "key" });
 		expect(refresh.mock.calls[0]?.[1]?.signal).toBeInstanceOf(AbortSignal);
-		expect(qc.getQueryData<QuotaSnapshotsResponse>(quotaSnapshotsKey)?.entries).toEqual([entry()]);
+		expect(qc.getQueryData<QuotaSnapshotsResponse>(quotaSnapshotsReadKey())?.entries).toEqual([
+			entry(),
+		]);
 	} finally {
 		refresh.mockRestore();
 	}

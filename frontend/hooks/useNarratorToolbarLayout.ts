@@ -15,7 +15,6 @@ import type {
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useMemo } from "react";
 import type { api } from "../lib/api";
-import { getToken } from "../lib/api/client";
 import {
 	DEFAULT_TOOLBAR_ENTRIES,
 	mergeToolbarLayout,
@@ -23,7 +22,11 @@ import {
 	partitionToolbar,
 	toPersistedToolbarLayout,
 } from "./narrator-toolbar-layout";
-import { useUpdateUserPreferences, useUserPreferences } from "./useUserPreferences";
+import {
+	isUserPreferencesScopeCurrent,
+	useUpdateUserPreferences,
+	useUserPreferences,
+} from "./useUserPreferences";
 
 type Preferences = Awaited<ReturnType<typeof api.getUIPreferences>>;
 
@@ -75,6 +78,7 @@ export function useNarratorToolbarLayout({
 
 	const saveLayout = useCallback(
 		(nextEntries: readonly NarratorToolbarEntry[]) => {
+			if (!isUserPreferencesScopeCurrent(queryKey)) return;
 			const persisted = toPersistedToolbarLayout(nextEntries);
 			const previous = queryClient.getQueryData<Preferences>(queryKey);
 			// Optimistic update: dragging a row must feel immediate, and the drag
@@ -89,7 +93,7 @@ export function useNarratorToolbarLayout({
 				{ narratorToolbarLayout: persisted },
 				{
 					onError: () => {
-						if (previous && getToken() === queryKey[3])
+						if (previous && isUserPreferencesScopeCurrent(queryKey))
 							queryClient.setQueryData(queryKey, previous);
 					},
 				},

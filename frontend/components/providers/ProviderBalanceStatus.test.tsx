@@ -6,7 +6,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createInstance } from "i18next";
 import { renderToStaticMarkup } from "react-dom/server";
 import { I18nextProvider } from "react-i18next";
-import { quotaSnapshotsKey } from "../../hooks/useQuotaSnapshots";
+import { quotaSnapshotsReadKey } from "../../hooks/useQuotaSnapshots";
 import narrator from "../../locales/en/narrator.json";
 import en from "../../locales/en/settings.json";
 import { ProviderBalanceStatus } from "./ProviderBalanceStatus";
@@ -43,7 +43,7 @@ function render(
 			? {}
 			: { providerBalanceCapability: { enabled: capabilityEnabled } }),
 	});
-	client.setQueryData(quotaSnapshotsKey, {
+	client.setQueryData(quotaSnapshotsReadKey(), {
 		entries: entries ?? [
 			{
 				groupId: "p",
@@ -61,11 +61,11 @@ function render(
 			},
 		],
 	} satisfies QuotaSnapshotsResponse);
-	if (queryState === "loading") client.removeQueries({ queryKey: quotaSnapshotsKey });
+	if (queryState === "loading") client.removeQueries({ queryKey: quotaSnapshotsReadKey() });
 	if (queryState === "error")
 		client
 			.getQueryCache()
-			.find({ queryKey: quotaSnapshotsKey })
+			.find({ queryKey: quotaSnapshotsReadKey() })
 			?.setState({ status: "error", error: new Error("private transport exception") });
 	try {
 		return renderToStaticMarkup(

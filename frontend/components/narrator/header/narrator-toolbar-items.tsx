@@ -32,6 +32,7 @@ import {
 	IconPuzzle,
 	IconRobot,
 	IconSearch,
+	IconSitemap,
 	IconTerminal,
 	IconTextSize,
 	IconTimeline,
@@ -164,6 +165,11 @@ const TOOLBAR_ITEM_DETAILS: Record<NarratorToolbarId, Omit<NarratorToolbarItemDe
 		labelKey: "timeline.title",
 		icon: IconTimeline,
 		// Dock panel on desktop; a full-screen drawer on mobile (MobileToolPanelHost).
+		hosts: ["dock", "drawer"],
+	},
+	communication: {
+		labelKey: "communicationTitle",
+		icon: IconSitemap,
 		hosts: ["dock", "drawer"],
 	},
 	lodlevel: {

@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 
 const clear = mock(async () => {});
-mock.module("../../lib/api", () => ({
+const authGeneration = 7;
+mock.module("../../lib/api/client", () => ({
 	getToken: () => "session-token",
+	getAuthSnapshot: () => ({ generation: authGeneration, hasToken: true, userId: "session-user" }),
 	clearTokenOnSessionFailure: clear,
 }));
 mock.module("../../lib/base-path", () => ({ apiUrl: (path: string) => `/api${path}` }));
@@ -55,7 +57,7 @@ describe("chat attachment authorized download", () => {
 	test("failed authorization reports failure instead of clicking an inert endpoint link", async () => {
 		response = new Response("denied", { status: 401 });
 		expect(await downloadChatAttachment("/chat/attachments/a", "notes.txt")).toBe(false);
-		expect(clear).toHaveBeenCalledWith(response);
+		expect(clear).toHaveBeenCalledWith(response, authGeneration);
 		expect(clicked).toBe(0);
 	});
 });

@@ -152,6 +152,8 @@ const WS_TYPES = new Map<string, ReadonlySet<string>>([
 			"git_workspace_refresh",
 			"outline_page_subscribe",
 			"outline_page_unsubscribe",
+			"communication_subscribe",
+			"communication_unsubscribe",
 			"permission_decision",
 			"buffer_message",
 			"cancel_buffer",

@@ -1,5 +1,7 @@
 {
 	"title": "Settings",
+	"dataImportCommunication": "Communication: restored {{restored}} links, skipped {{skipped}}, preserved {{preserved}} existing nodes.",
+	"dataImportCommunicationDetached": "{{count}} communication parent links were safely detached because endpoints or permissions were missing.",
 	"remoteAccessSection": "WebRTC remote access",
 	"remoteAccess": {
 		"description": "Connect a paired browser directly to this instance using the matching hosted remote frontend. Pairing does not replace administrator login. No business traffic is relayed through the signaling server.",

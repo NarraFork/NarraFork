@@ -17,7 +17,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { chatKeys, useNarratorChatRoom } from "../../hooks/useChat";
-import { ApiError, getToken } from "../../lib/api/client";
+import { ApiError, getAuthSnapshot } from "../../lib/api/client";
 import { invalidateCachedPretextDocument } from "../../lib/pretext-document-cache-invalidation";
 import { useNarratorDockContext } from "../narrator/dock/NarratorDockContext";
 import { useEditorPanelVisible } from "../narrator/narrator-panel-visibility";
@@ -51,28 +51,30 @@ export function NarratorUserChatPanel({
 		isFetching,
 		refetch,
 	} = useNarratorChatRoom(narratorId, active);
-	// The room hook subscribes to token changes; keep denial state in that same scope.
-	const scope = JSON.stringify([narratorId, getToken()]);
+	// The room hook subscribes to auth changes; keep denial state in that same generation.
+	const { generation } = getAuthSnapshot();
+	const scope = JSON.stringify([narratorId, generation]);
 	const [revokedScope, setRevokedScope] = useState<string | null>(null);
 	// This resolver deliberately uses 404 for both missing narrators and denied canRead.
 	const denied =
 		error instanceof ApiError &&
 		(error.status === 401 || error.status === 403 || error.status === 404);
 	useEffect(() => {
+		if (getAuthSnapshot().generation !== generation) return;
 		if (denied) setRevokedScope(scope);
 		else if (isSuccess) setRevokedScope(null);
-	}, [denied, isSuccess, scope]);
+	}, [denied, generation, isSuccess, scope]);
 	// Once denied, another transient failure must not resurrect cached private content.
-	// Only a successful resolver for the hook's current token-scoped key restores access.
+	// Only a successful resolver for the current generation restores access.
 	const authorizationLost = denied || (revokedScope === scope && !isSuccess);
 	const roomId = room?.id;
 	useEffect(() => {
-		if (!authorizationLost || !roomId) return;
+		if (!authorizationLost || !roomId || getAuthSnapshot().generation !== generation) return;
 		// Passive child teardown can publish its last window on unmount. Purge after
 		// that cleanup, not during render or a layout effect that it could overwrite.
 		invalidateCachedPretextDocument(roomId);
 		queryClient.removeQueries({ queryKey: chatKeys.messages(roomId) });
-	}, [authorizationLost, roomId, queryClient]);
+	}, [authorizationLost, generation, roomId, queryClient]);
 
 	const submitToNarrator = onForwardToNarrator ?? dock?.submitToNarrator;
 	const forward = useCallback(

@@ -392,6 +392,28 @@ async function seedAwaitReexecution(recovery: boolean, suffix = "") {
 
 for (const recovery of [false, true]) {
 	test(`${recovery ? "recovery" : "denied retry"} Await releases the start mutex for independent child Send(parent)`, async () => {
+		const { users } = await import("../../db/schema");
+		const { ensureCommunicationNodeTx, grantFixtureNarratorWrite } = await import(
+			"./runtime-communication-fixtures"
+		);
+		const userId = "revert-send-principal";
+		db.transaction((tx) => {
+			tx.insert(users)
+				.values({
+					id: userId,
+					username: userId,
+					passwordHash: "test",
+					createdAt: new Date().toISOString(),
+				})
+				.run();
+			tx.update(narrators)
+				.set({ ownerUserId: userId, aclRootNarratorId: ROOT })
+				.where(eq(narrators.id, CHILD))
+				.run();
+			grantFixtureNarratorWrite(tx, ROOT, userId);
+			ensureCommunicationNodeTx(tx, ROOT, null);
+			ensureCommunicationNodeTx(tx, CHILD, ROOT);
+		});
 		const row = await seedAwaitReexecution(recovery);
 		const childSendBinding = { toolCallId: "child-send-row", attempt: 1 };
 		await db.insert(narratorMessages).values({

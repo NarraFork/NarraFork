@@ -3,6 +3,7 @@ import type { NativeInjectionBlock } from "@shared/native-injection";
 import type { SideCarBody } from "@shared/sidecar-body";
 import { cleanDb, readTestMessageContent } from "../../../tests/setup";
 import * as pool from "../../lib/db-worker/pool";
+import { delegationRegistration } from "../../lib/validators/runtime-registration";
 import {
 	agentMessageDeliveryBody,
 	consumeAgentMessageHistory,
@@ -117,7 +118,7 @@ const now = "2026-09-08T12:00:00.000Z";
 function seed(id: string, parent: string | null, status = "working") {
 	sqlite
 		.prepare(
-			"INSERT INTO narrators (id, type, variant, parent_narrator_id, status, is_background, runtime_registration_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			"INSERT INTO narrators (id, type, variant, parent_narrator_id, status, is_background, owner_user_id, acl_root_narrator_id, policy_source_narrator_id, runtime_registration_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 		)
 		.run(
 			id,
@@ -126,19 +127,28 @@ function seed(id: string, parent: string | null, status = "working") {
 			parent,
 			status,
 			parent ? 1 : 0,
-			// A delegated run delivers to its creating Agent call (registered at run start).
+			"fixture-principal",
+			parent,
+			parent,
+			// A real delegation registers its controller, result recipient and run principal.
 			parent
 				? JSON.stringify({
-						version: 1,
+						...delegationRegistration(parent, "general"),
 						run: {
 							logicalRunId: `${id}-run`,
 							deliverTo: { narratorId: parent, toolUseId: "origin" },
+							principal: { userId: "fixture-principal" },
 						},
 					})
 				: null,
 			now,
 			now,
 		);
+	sqlite
+		.prepare(
+			"INSERT INTO narrator_communication_nodes (narrator_id, parent_narrator_id, original_parent_narrator_id, version) VALUES (?, ?, ?, 1)",
+		)
+		.run(id, parent, parent);
 }
 let sourceSerial = 0;
 function sourceBinding(
@@ -267,6 +277,11 @@ beforeEach(async () => {
 	clearTeamInbox("sibling");
 	broadcasts.length = 0;
 	runStarts.length = 0;
+	sqlite
+		.prepare(
+			"INSERT INTO users (id, username, password_hash, created_at) VALUES ('fixture-principal', 'delivery-fixture', 'unused', ?)",
+		)
+		.run(now);
 	seed("parent", null);
 	seed("child", "parent");
 	seed("sibling", "parent");

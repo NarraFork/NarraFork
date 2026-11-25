@@ -2,7 +2,7 @@
  * Project and team tabs on the client: they live in the sidebar's one list (`work`), lead to
  * their pages, show their own titles, and join the live window under their own key.
  */
-import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { QueryClient } from "@tanstack/react-query";
 import { parseHTML } from "linkedom";
 import { navRowHref } from "../components/nav/recent-tab-keyboard-nav";
@@ -10,9 +10,10 @@ import { loadedSidebarPin, resolvePagePin } from "../components/nav/recent-tab-p
 import { isTabActive } from "../components/nav/recent-tabs-logic";
 import { recentTabWindowHref } from "../components/window/panel-window";
 import { api } from "../lib/api";
+import { clearToken, confirmAuthUser, setToken } from "../lib/api/client";
+import { getRecentTabsScope } from "../lib/recent-tabs-owner";
 import {
-	accessChangeNeedsRuntimeRefresh,
-	projectAccessChangeNeedsRuntimeRefresh,
+	mergeRecentTabRuntime,
 	type RecentTab,
 	recentTabHref,
 	recentTabLiveNarratorId,
@@ -44,7 +45,25 @@ const session: RecentTab = {
 	lastVisitedAt: 1,
 };
 
-afterEach(() => mock.restore());
+const storageDescriptor = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+beforeEach(() => {
+	const storage = new Map<string, string>();
+	Object.defineProperty(globalThis, "localStorage", {
+		configurable: true,
+		value: {
+			getItem: (key: string) => storage.get(key) ?? null,
+			setItem: (key: string, value: string) => storage.set(key, value),
+			removeItem: (key: string) => storage.delete(key),
+		},
+	});
+	confirmAuthUser(setToken("test-team-token"), "test-team-user");
+});
+afterEach(() => {
+	clearToken();
+	if (storageDescriptor) Object.defineProperty(globalThis, "localStorage", storageDescriptor);
+	else Reflect.deleteProperty(globalThis, "localStorage");
+	mock.restore();
+});
 
 describe("sections", () => {
 	test("project and team tabs are in the sidebar's list, like sessions", () => {
@@ -61,7 +80,8 @@ describe("sections", () => {
 
 	test("a delta's project and team upserts land in the loaded work window", () => {
 		const qc = new QueryClient();
-		qc.setQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("work"), {
+		const workKey = recentTabsSectionQueryKey(getRecentTabsScope(), "work");
+		qc.setQueryData<RecentTabsInfiniteData>(workKey, {
 			pages: [{ items: [session], revision: 1, hasMore: false, nextCursor: undefined }],
 			pageParams: [undefined],
 		});
@@ -85,8 +105,7 @@ describe("sections", () => {
 				},
 			],
 		});
-		const items = qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("work"))
-			?.pages[0]?.items;
+		const items = qc.getQueryData<RecentTabsInfiniteData>(workKey)?.pages[0]?.items;
 		expect(items?.map((tab) => `${tab.type}:${tab.id}`)).toEqual([
 			"team:coord",
 			"project:proj",
@@ -156,10 +175,35 @@ describe("live window", () => {
 		expect(selectProjectRuntimeTabs([session, team], "/")).toEqual([]);
 	});
 
-	test("access changes re-read a team tab's runtime", () => {
-		expect(accessChangeNeedsRuntimeRefresh([team], "coord")).toBe(true);
-		expect(accessChangeNeedsRuntimeRefresh([team], "other")).toBe(false);
-		expect(projectAccessChangeNeedsRuntimeRefresh([team])).toBe(true);
+	test("persisted deltas keep enriched team and project fields within the same scope", () => {
+		expect(
+			mergeRecentTabRuntime(
+				{ ...team, pinned: true },
+				{
+					...team,
+					teamSession: true,
+					teamOnlooker: true,
+					pendingApprovalCount: null,
+				},
+			),
+		).toMatchObject({
+			projectId: "proj",
+			pinned: true,
+			teamSession: true,
+			teamOnlooker: true,
+			pendingApprovalCount: null,
+		});
+		expect(
+			mergeRecentTabRuntime(
+				{ ...project, pinned: true },
+				{
+					...project,
+					projectPath: "/repo",
+					activeSessionCount: 2,
+					teamCount: 1,
+				},
+			),
+		).toMatchObject({ pinned: true, projectPath: "/repo", activeSessionCount: 2, teamCount: 1 });
 	});
 });
 

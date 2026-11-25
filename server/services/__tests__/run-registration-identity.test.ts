@@ -245,6 +245,14 @@ test("S3 a pre-registration session wakes as its own owner", async () => {
 });
 
 test("S3 Send to an ownerless unregistered session leaves input queued and makes no model request", async () => {
+	const { ensureCommunicationNodeTx, grantFixtureNarratorWrite, seedFixtureCommunicationPeer } =
+		await import("./runtime-communication-fixtures");
+	db.transaction((tx) => {
+		ensureCommunicationNodeTx(tx, CALLER, null);
+		ensureCommunicationNodeTx(tx, TARGET, null);
+		grantFixtureNarratorWrite(tx, TARGET, A);
+		seedFixtureCommunicationPeer(tx, CALLER, TARGET, A);
+	});
 	const call = callerTool("Send", "identity-send");
 	db.insert(fileChangeExecutionSegments)
 		.values({
@@ -262,9 +270,9 @@ test("S3 Send to an ownerless unregistered session leaves input queued and makes
 		"keep this queued",
 		call,
 	);
-	await enqueueInboxAgent(delivery, delivery.text, { userId: B, createdBy: B });
 	const execute = spyOn(executor, "executeAgentLoop").mockResolvedValue(done);
 	try {
+		await enqueueInboxAgent(delivery, delivery.text, { userId: B, createdBy: B });
 		expect(await startParentInboundContinuationIfPossible(TARGET)).toEqual({ started: false });
 		expect(execute).not.toHaveBeenCalled();
 		expect(
@@ -274,7 +282,10 @@ test("S3 Send to an ownerless unregistered session leaves input queued and makes
 				.where(eq(narratorBufferedMessages.narratorId, TARGET))
 				.get(),
 		).toMatchObject({ kind: "agent_message", state: "queued" });
-		expect(stored().registration).toBeNull();
+		expect(db.select().from(narrators).where(eq(narrators.id, TARGET)).get()).toMatchObject({
+			ownerUserId: null,
+			runtimeRegistrationJson: null,
+		});
 	} finally {
 		execute.mockRestore();
 	}

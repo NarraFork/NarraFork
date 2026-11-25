@@ -3,7 +3,7 @@ import { useDocumentVisibility } from "@mantine/hooks";
 import { type QueryClient, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect } from "react";
 import { api } from "../lib/api";
-import { request } from "../lib/api/client";
+import { getAuthSnapshot, request } from "../lib/api/client";
 import type { ApiEntity } from "../lib/api/types";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
 import { useNarratorUiScope, useNarratorUiSummary } from "./useNarratorUiSummary";
@@ -22,7 +22,7 @@ function appendTerminalToCache(qc: QueryClient, queryKey: readonly unknown[], te
 
 export function useNarratorTerminals(narratorId: string, visible = true) {
 	const qc = useQueryClient();
-	const { userId, token } = useNarratorUiScope();
+	const { generation, hasToken } = useNarratorUiScope();
 	const canOpen = useCanOpenTerminals(narratorId);
 	const documentVisibility = useDocumentVisibility();
 	const documentVisible =
@@ -30,19 +30,13 @@ export function useNarratorTerminals(narratorId: string, visible = true) {
 		typeof document !== "undefined" &&
 		document.visibilityState === "visible";
 	const enabled =
-		!REMOTE_BUILD &&
-		visible &&
-		documentVisible &&
-		!!narratorId &&
-		!!token &&
-		!!userId &&
-		canOpen === true;
-	const queryKey = ["terminals", { narratorId }, userId, token] as const;
+		!REMOTE_BUILD && visible && documentVisible && !!narratorId && hasToken && canOpen === true;
+	const queryKey = ["terminals", { narratorId }, generation] as const;
 
 	// Invalidate only an actually visible list; do not keep hidden entity reads alive.
 	useEffect(() => {
 		if (!enabled) {
-			const key = ["terminals", { narratorId }, userId, token] as const;
+			const key = ["terminals", { narratorId }, generation] as const;
 			// QueryObserver applies enabled in its own effect, after this hook's effect.
 			queueMicrotask(() => {
 				if (!qc.getQueryCache().find({ queryKey: key, exact: true })?.isActive())
@@ -53,19 +47,32 @@ export function useNarratorTerminals(narratorId: string, visible = true) {
 		const handle = narratorWSManager.addListener(
 			{ narratorIds: [narratorId], types: ["terminal_count_changed"] },
 			() => {
-				qc.invalidateQueries({ queryKey: ["terminals", { narratorId }] });
+				if (getAuthSnapshot().generation === generation)
+					void qc.invalidateQueries({ queryKey: ["terminals", { narratorId }, generation] });
 			},
 		);
 		return () => narratorWSManager.removeListener(handle);
-	}, [narratorId, qc, enabled, userId, token]);
+	}, [narratorId, qc, enabled, generation]);
 
 	return useQuery({
 		queryKey,
-		queryFn: ({ signal }) =>
-			request<ApiEntity[]>(`/terminals?${new URLSearchParams({ narratorId })}`, {
-				signal,
-				maxResponseBytes: 512 * 1024,
-			}),
+		queryFn: async ({ signal }) => {
+			const requireCurrentGeneration = () => {
+				if (getAuthSnapshot().generation !== generation)
+					throw new DOMException("Session changed", "AbortError");
+			};
+			requireCurrentGeneration();
+			const result = await request<ApiEntity[]>(
+				`/terminals?${new URLSearchParams({ narratorId })}`,
+				{
+					signal,
+					maxResponseBytes: 512 * 1024,
+				},
+			);
+			signal.throwIfAborted();
+			requireCurrentGeneration();
+			return result;
+		},
 		enabled,
 		gcTime: TERMINALS_QUERY_GC_TIME_MS,
 		staleTime: 30_000,
@@ -103,8 +110,8 @@ export function useTreeTerminals(narratorId: string) {
 export function useCreateNarratorTerminal(narratorId: string) {
 	const qc = useQueryClient();
 	const terminalCapability = useTerminalCapability();
-	const { userId, token } = useNarratorUiScope();
-	const queryKey = ["terminals", { narratorId }, userId, token] as const;
+	const { generation } = useNarratorUiScope();
+	const queryKey = ["terminals", { narratorId }, generation] as const;
 	return useMutation({
 		mutationFn: (data?: { name?: string; cols?: number; rows?: number; deviceId?: string }) => {
 			if (!terminalCapability.supported) {
@@ -112,12 +119,17 @@ export function useCreateNarratorTerminal(narratorId: string) {
 					new Error(terminalCapability.reason ?? "Terminal runtime is not supported"),
 				);
 			}
+			if (getAuthSnapshot().generation !== generation) {
+				return Promise.reject(new DOMException("Session changed", "AbortError"));
+			}
 			return api.createTerminal({ narratorId, ...data });
 		},
-		onSuccess: (terminal) => {
-			appendTerminalToCache(qc, queryKey, terminal);
-			qc.invalidateQueries({ queryKey });
-			qc.invalidateQueries({ queryKey: ["narrator-ui-summary", narratorId] });
+		onMutate: () => queryKey,
+		onSuccess: (terminal, _data, key) => {
+			if (!key || getAuthSnapshot().generation !== key[2]) return;
+			appendTerminalToCache(qc, key, terminal);
+			void qc.invalidateQueries({ queryKey: key });
+			void qc.invalidateQueries({ queryKey: ["narrator-ui-summary", key[1].narratorId, key[2]] });
 		},
 	});
 }

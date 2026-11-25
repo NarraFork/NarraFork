@@ -1,8 +1,8 @@
 import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import type { QuotaSnapshotEntry } from "@shared/quota-snapshot";
-import { useMemo } from "react";
+import { useMemo, useSyncExternalStore } from "react";
 import { selectQuotaEntries, useQuotaSnapshots } from "../../../hooks/useQuotaSnapshots";
-import { getToken } from "../../../lib/api/client";
+import { getAuthSnapshot, subscribeAuth } from "../../../lib/api/client";
 
 export interface NugProviderSetting {
 	id: string;
@@ -19,12 +19,13 @@ export interface NugProviderInfo {
 	entries: QuotaSnapshotEntry[];
 }
 
-/** One cached-only group projection, isolated by the model-runtime generation and session. */
+/** One cached-only group projection, isolated by the model-runtime and auth generations. */
 export function useNugQuota(
 	resolvedModel: string | undefined,
 	nugProviders: NugProviderSetting[] | undefined,
 	enabled = true,
 ): NugProviderInfo | null {
+	const { hasToken } = useSyncExternalStore(subscribeAuth, getAuthSnapshot, getAuthSnapshot);
 	const provider = useMemo(() => {
 		const prefix = resolvedModel?.split(":")[0];
 		return prefix
@@ -34,10 +35,10 @@ export function useNugQuota(
 			: undefined;
 	}, [resolvedModel, nugProviders]);
 	const query = useQuotaSnapshots(
-		!REMOTE_BUILD && enabled && !!getToken() && !!provider && provider.generation !== undefined,
+		!REMOTE_BUILD && enabled && hasToken && !!provider && provider.generation !== undefined,
 		{ groupId: provider?.id, cachedOnly: true, expectedGeneration: provider?.generation },
 	);
-	if (REMOTE_BUILD || !enabled || !provider) return null;
+	if (REMOTE_BUILD || !enabled || !hasToken || !provider) return null;
 	return {
 		providerId: provider.id,
 		providerPrefix: provider.prefix,
