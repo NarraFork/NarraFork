@@ -64,7 +64,7 @@ keywords:
   - installationId
   - UPDATE_SOURCE_CHANGED
 status: draft
-verified_at: 776dbf07e
+verified_at: 009a3f4f7
 ---
 # 设置与数据目录
 

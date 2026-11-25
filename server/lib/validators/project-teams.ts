@@ -1,38 +1,16 @@
+import { teamBaseBranchSchema, teamBriefSchema, teamNameSchema } from "@shared/project-team-draft";
 import {
 	TEAM_BOARD_COLUMNS,
 	TEAM_BOARD_PAGE_LIMIT,
-	TEAM_BRANCH_MAX_LENGTH,
-	TEAM_BRIEF_MAX_BYTES,
 	TEAM_EVENTS_PAGE_LIMIT,
-	TEAM_NAME_MAX_LENGTH,
 	TEAM_SETTINGS_MAX_BYTES,
 } from "@shared/project-teams";
 import { z } from "zod";
-import { gitBranchName } from "./common";
 
 const utf8Bytes = (value: string) => new TextEncoder().encode(value).byteLength;
 
-/** The team brief: plain text, at most 4 KB of UTF-8. */
-export const teamBriefSchema = z
-	.string()
-	.refine((value) => utf8Bytes(value) <= TEAM_BRIEF_MAX_BYTES, {
-		message: `The team brief is limited to ${TEAM_BRIEF_MAX_BYTES} bytes`,
-	});
-
-/** A git branch name that cannot be read as an option, a range or a reflog expression. */
-export const teamBaseBranchSchema = gitBranchName
-	.max(TEAM_BRANCH_MAX_LENGTH)
-	.refine(
-		(value) =>
-			!value.startsWith("-") &&
-			!value.startsWith("/") &&
-			!value.endsWith("/") &&
-			!value.endsWith(".") &&
-			!value.endsWith(".lock") &&
-			!value.includes("..") &&
-			!value.includes("//"),
-		{ message: "Invalid branch name" },
-	);
+// The fields a person types live in `shared/` so the dialogs check a draft by the same rules.
+export { teamBaseBranchSchema, teamBriefSchema };
 
 const positiveLimit = (max: number) => z.number().int().min(1).max(max);
 
@@ -63,7 +41,7 @@ export const teamSettingsSchema = z
 export const createProjectTeamSchema = z
 	.object({
 		/** The team name, which is the coordinator session's title. */
-		name: z.string().trim().min(1).max(TEAM_NAME_MAX_LENGTH),
+		name: teamNameSchema,
 		/** Defaults to the project's default branch. */
 		baseBranch: teamBaseBranchSchema.optional(),
 		brief: teamBriefSchema.optional(),
@@ -71,6 +49,23 @@ export const createProjectTeamSchema = z
 		/** The coordinator's audiences; omitted follows the project-session defaults. */
 		visibility: z.enum(["private", "project", "public"]).optional(),
 		writeAudience: z.enum(["owner", "project", "public"]).optional(),
+	})
+	.strict();
+
+/**
+ * `POST /api/projects/:projectId/teams` with `fromNarratorId`: turn an existing session into the
+ * team's coordinator. Strict and separate from creation: the session keeps its audiences, which
+ * change only through the sharing routes, so `visibility` / `writeAudience` are refused here.
+ */
+export const upgradeProjectTeamSchema = z
+	.object({
+		/** The session that becomes the coordinator. */
+		fromNarratorId: z.string().min(1).max(200),
+		/** The team name; omitted keeps the session's title. */
+		name: teamNameSchema.optional(),
+		baseBranch: teamBaseBranchSchema.optional(),
+		brief: teamBriefSchema.optional(),
+		settings: teamSettingsSchema.optional(),
 	})
 	.strict();
 

@@ -67,6 +67,7 @@ const APPROVED_WORKER_MODULES = new Set([
 	"shared/file-reference.ts",
 	"server/services/agent-runtime/model-history-json.ts",
 	"server/lib/narrator-utils.ts",
+	"shared/team-trait.ts",
 	"shared/storage-retention.ts",
 	"shared/subagent-tool-summary.ts",
 	"shared/narrator-blocks/storage.ts",

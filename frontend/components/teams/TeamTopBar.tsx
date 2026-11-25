@@ -6,6 +6,7 @@
  * session's turn, coordinator first).
  */
 import { NarratorStatusIcon } from "@frontend/components/nav/NarratorStatusIcon";
+import { PinToSidebarButton } from "@frontend/components/nav/PinToSidebarButton";
 import { useDecideApproval, usePauseTeam, useTeamApprovals } from "@frontend/hooks/useTeams";
 import { formatSmartTime } from "@frontend/lib/format";
 import {
@@ -47,6 +48,7 @@ import {
 } from "@tabler/icons-react";
 import { type ReactNode, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { TeamDisbandMenu } from "./TeamDisbandMenu";
 import { TeamMembersPanel } from "./TeamMembers";
 import {
 	cappedCount,
@@ -315,17 +317,26 @@ export function TeamTopBar({
 	projectId,
 	teamId,
 	title,
+	teamName,
 	summary,
 	leading,
 	onOpenSession,
+	onDisbanded,
 }: {
 	projectId: string;
 	teamId: string;
 	title: ReactNode;
+	/**
+	 * The team's name once known and the team is active (`teamPinTitle`): shows "pin to sidebar"
+	 * beside the title. An archived team offers no pin.
+	 */
+	teamName?: string;
 	summary: TeamPageSummary | undefined;
 	/** Before the title (a back link on narrow screens). */
 	leading?: ReactNode;
 	onOpenSession?: (narratorId: string) => void;
+	/** After the team was disbanded (its session kept): members get the menu with 解散团队. */
+	onDisbanded?: (narratorId: string) => void;
 }) {
 	const { t } = useTranslation("projects");
 	const [approvalsOpen, setApprovalsOpen] = useState(false);
@@ -333,6 +344,9 @@ export function TeamTopBar({
 	const [confirmPause, setConfirmPause] = useState(false);
 	const pause = usePauseTeam(projectId, teamId);
 	const member = summary?.access === "write";
+	// The coordinator is archived: its work items cannot change until it is restored. Background
+	// workers it started may still be running, so 全部暂停 stays while any session runs.
+	const archived = summary?.coordinatorStatus === "archived";
 	const pending = summary?.pendingApprovalCount ?? 0;
 	const running = summary?.runningCount ?? 0;
 	const pauseAll = () => {
@@ -369,6 +383,23 @@ export function TeamTopBar({
 				<Text fw={600} truncate data-testid="team-title">
 					{title}
 				</Text>
+				{teamName !== undefined && (
+					<PinToSidebarButton type="team" id={teamId} title={teamName} size="sm" />
+				)}
+				{archived && (
+					<Tooltip label={t("teams.top.archivedHint")} withinPortal multiline maw={280}>
+						<Badge
+							size="sm"
+							variant="light"
+							color="gray"
+							tt="none"
+							style={{ flexShrink: 0 }}
+							data-testid="team-archived"
+						>
+							{t("teams.archived")}
+						</Badge>
+					</Tooltip>
+				)}
 			</Group>
 			<Group gap={6} wrap="wrap" justify="flex-end" style={{ rowGap: 6 }}>
 				{member && (
@@ -445,7 +476,7 @@ export function TeamTopBar({
 						</Stack>
 					</Popover.Dropdown>
 				</Popover>
-				{member && (
+				{member && (!archived || running > 0) && (
 					<Button
 						size="xs"
 						variant="light"
@@ -456,6 +487,9 @@ export function TeamTopBar({
 					>
 						{t("teams.top.pauseAll")}
 					</Button>
+				)}
+				{member && onDisbanded && (
+					<TeamDisbandMenu projectId={projectId} teamId={teamId} onDisbanded={onDisbanded} />
 				)}
 			</Group>
 			<Drawer

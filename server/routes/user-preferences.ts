@@ -24,6 +24,7 @@ import {
 	moveRecentTabSchema,
 	pinRecentTabSchema,
 	pluginOverlayVisibilityPatchSchema,
+	recentTabStateQuerySchema,
 	recentTabsPageQuerySchema,
 	recentTabsRuntimeSchema,
 	removeRecentTabSchema,
@@ -44,6 +45,7 @@ import {
 	clearRecentTabs,
 	createRecentTabFolder,
 	dissolveRecentTabFolder,
+	getRecentTabState,
 	getRuntimePatches,
 	listLegacyTabs,
 	listPage,
@@ -713,6 +715,20 @@ userPreferencesRoutes.get("/recent-tabs", async (c) => {
 	return c.json(await listPage(userId, parsed.data.section, parsed.data.cursor, parsed.data.limit));
 });
 
+/**
+ * Whether one tab is in the sidebar and pinned, wherever it sits in the list: the "pin to
+ * sidebar" buttons of project and team pages read it for a tab outside the loaded pages.
+ */
+userPreferencesRoutes.get("/recent-tabs/state", (c) => {
+	const userId = c.get("user").sub;
+	const parsed = recentTabStateQuerySchema.safeParse({
+		type: c.req.query("type"),
+		id: c.req.query("id"),
+	});
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return c.json(getRecentTabState(userId, parsed.data.type, parsed.data.id));
+});
+
 /** Fetch bounded live-only patches for currently rendered tabs. */
 userPreferencesRoutes.post("/recent-tabs/runtime", async (c) => {
 	const userId = c.get("user").sub;
@@ -726,8 +742,8 @@ userPreferencesRoutes.put("/recent-tabs", async (c) => {
 	const userId = c.get("user").sub;
 	const parsed = upsertRecentTabSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const { updateOnly, beforeKey, afterKey, ...tab } = parsed.data;
-	return c.json(await upsertRecentTab(userId, tab, { updateOnly, beforeKey, afterKey }));
+	const { updateOnly, beforeKey, afterKey, pin, ...tab } = parsed.data;
+	return c.json(await upsertRecentTab(userId, tab, { updateOnly, beforeKey, afterKey, pin }));
 });
 
 /** Atomically upsert several tabs with one revision. */

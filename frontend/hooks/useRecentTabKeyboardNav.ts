@@ -6,7 +6,7 @@ import { useEffect, useRef, useSyncExternalStore } from "react";
 import {
 	activeNavRowKey,
 	navRowElement,
-	navRowUrl,
+	navRowHref,
 	nextNavRow,
 	readNavRows,
 } from "../components/nav/recent-tab-keyboard-nav";
@@ -101,7 +101,7 @@ export function useRecentTabKeyboardNav() {
 		const open = (key: string) => {
 			cancelDebounce();
 			setPendingKey(null);
-			const url = navRowUrl(key);
+			const url = navRowHref(list(), key);
 			if (url) navigateRef.current({ to: url });
 		};
 
@@ -132,7 +132,7 @@ export function useRecentTabKeyboardNav() {
 					e.preventDefault();
 					const key = pendingKey;
 					const el = list() && navRowElement(list() as Element, key);
-					if (navRowUrl(key)) open(key);
+					if (navRowHref(list(), key)) open(key);
 					// A folder header or "N more": the row's own click toggles it.
 					else if (el instanceof HTMLElement) {
 						cancelDebounce();

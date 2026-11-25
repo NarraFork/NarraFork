@@ -8,6 +8,10 @@
  *   - a member opens the pending approvals and approves one through the ordinary permission
  *     route; an onlooker sees no approvals and no "pause all";
  *   - "pause all" stops the tree's running sessions through the ordinary Stop route;
+ *   - the page is about one team: no list of the project's teams and no "new team", at desktop
+ *     and phone widths; on a phone the top bar carries the menu button, so nothing floats over
+ *     the back arrow;
+ *   - an archived team says so in the top bar and offers no "pause all";
  *   - at 360 px the page is conversation / board / activity tabs without sideways scrolling, in
  *     light and dark; the project page's teams section creates a team.
  *
@@ -38,7 +42,8 @@ import { projectTeamRoutes } from "../../../server/routes/project-teams";
 import { projectRoutes } from "../../../server/routes/projects";
 import { narratorService } from "../../../server/services/narrator-service";
 import { pendingPermissions } from "../../../server/services/narrator-session-state";
-import { createTeam } from "../../../server/services/teams/team-service";
+import { initTeamRepo } from "../../../server/services/teams/__tests__/team-repo.fixture";
+import { archiveTeam, createTeam } from "../../../server/services/teams/team-service";
 import type * as Fixture from "./team-page.browser-fixture";
 
 type FixtureWindow = Window & { fixture: typeof Fixture };
@@ -153,8 +158,7 @@ beforeAll(async () => {
 
 	alice = await person(`alice${Date.now()}`);
 	bob = await person(`bob${Date.now()}`);
-	const repo = mkdtempSync(join(tmpdir(), "nf-team-page-"));
-	mkdirSync(repo, { recursive: true });
+	const repo = initTeamRepo(mkdtempSync(join(tmpdir(), "nf-team-page-")));
 	projectId = generateId();
 	const now = new Date().toISOString();
 	await db.insert(projects).values({
@@ -331,10 +335,10 @@ test("the board reflects work item state changes", async () => {
 		if (url.pathname.endsWith("/board")) boardReads.push(url.searchParams.get("column") ?? "");
 	});
 	try {
-		await call(page, (f, p: string, t: string) => f.openTeam(p, t, true), projectId, teamId);
+		await call(page, (f, p: string, t: string) => f.openTeam(p, t), projectId, teamId);
 		await until(page, "the board", (f) => f.count("[data-testid=team-card]") === 2);
 		expect(await call(page, (f) => f.attr("[data-testid=team-workspace]", "data-layout"))).toBe(
-			"columns",
+			"split",
 		);
 		// Folded columns (done, cancelled) read nothing.
 		expect([...new Set(boardReads)].sort()).toEqual(["in_progress", "queued", "review"]);
@@ -427,7 +431,7 @@ test("a member approves a pending tool call; questions open their session; onloo
 	});
 	const { page, errors } = await openPage(alice, { width: 1600, height: 900 });
 	try {
-		await call(page, (f, p: string, t: string) => f.openTeam(p, t, true), projectId, teamId);
+		await call(page, (f, p: string, t: string) => f.openTeam(p, t), projectId, teamId);
 		await until(
 			page,
 			"approvals count",
@@ -486,12 +490,7 @@ test("a member approves a pending tool call; questions open their session; onloo
 	await seedApproval("echo hidden");
 	const reader = await openPage(bob, { width: 1600, height: 900 });
 	try {
-		await call(
-			reader.page,
-			(f, p: string, t: string) => f.openTeam(p, t, false),
-			projectId,
-			teamId,
-		);
+		await call(reader.page, (f, p: string, t: string) => f.openTeam(p, t), projectId, teamId);
 		await until(reader.page, "board", (f) => f.count("[data-testid=team-card]") === 2);
 		await until(reader.page, "top bar", (f) => f.count("[data-testid=team-running-button]") === 1);
 		expect(await call(reader.page, (f) => f.count("[data-testid=team-approvals-button]"))).toBe(0);
@@ -507,7 +506,7 @@ test("pause all reads the running sessions now and stops every one", async () =>
 	await db.update(narrators).set({ status: "working" }).where(eq(narrators.id, workerId));
 	const { page, errors } = await openPage(alice, { width: 1600, height: 900 });
 	try {
-		await call(page, (f, p: string, t: string) => f.openTeam(p, t, true), projectId, teamId);
+		await call(page, (f, p: string, t: string) => f.openTeam(p, t), projectId, teamId);
 		await until(
 			page,
 			"running",
@@ -545,16 +544,16 @@ test("the layout follows the room beside the app sidebar; the conversation keeps
 		{ viewport: 992, sidebar: 250, layout: "tabs" },
 		{ viewport: 1280, sidebar: 250, layout: "split" },
 		{ viewport: 1280, sidebar: 480, layout: "tabs" },
-		{ viewport: 1600, sidebar: 250, layout: "columns" },
+		{ viewport: 1600, sidebar: 250, layout: "split" },
 		{ viewport: 1400, sidebar: 480, layout: "split" },
-		{ viewport: 1600, sidebar: 480, layout: "columns" },
+		{ viewport: 1600, sidebar: 480, layout: "split" },
 	];
 	for (const { viewport, sidebar, layout } of cases) {
 		const { page, errors } = await openPage(alice, { width: viewport, height: 800 });
 		try {
 			await call(
 				page,
-				(f, p: string, t: string, w: number) => f.openTeam(p, t, true, w),
+				(f, p: string, t: string, w: number) => f.openTeam(p, t, w),
 				projectId,
 				teamId,
 				sidebar,
@@ -574,10 +573,12 @@ test("the layout follows the room beside the app sidebar; the conversation keeps
 			if (layout !== "tabs") {
 				const conversation = await call(page, (f) => f.widthOf("[data-testid=team-conversation]"));
 				expect(conversation).toBeGreaterThanOrEqual(480);
-				expect(await call(page, (f) => f.count("[data-testid=project-teams]"))).toBe(
-					layout === "columns" ? 1 : 0,
-				);
+				// The conversation and the side panel share the whole frame: no empty gutter.
+				const side = await call(page, (f) => f.widthOf("[data-testid=team-side]"));
+				const frame = await call(page, (f) => f.widthOf("[data-testid=team-workspace]"));
+				expect(Math.abs(conversation + side - frame)).toBeLessThanOrEqual(1);
 			}
+			expect(await call(page, (f) => f.count("[data-testid=project-teams]"))).toBe(0);
 			const fit = await call(page, (f) => f.fitsWidth("[data-testid=team-top-bar]"));
 			expect(fit).toEqual({ found: true, inside: true, scrolls: false });
 			if (viewport === 1280 && sidebar === 250) await shot(page, "laptop-sidebar-split");
@@ -588,17 +589,17 @@ test("the layout follows the room beside the app sidebar; the conversation keeps
 	}
 }, 90_000);
 
-test("the conversation is never remounted across columns, split and tabs", async () => {
+test("the conversation is never remounted across split and tabs", async () => {
 	const { page, errors } = await openPage(alice, { width: 1300, height: 800 });
 	try {
 		await call(
 			page,
-			(f, p: string, t: string, w: number) => f.openTeam(p, t, true, w),
+			(f, p: string, t: string, w: number) => f.openTeam(p, t, w),
 			projectId,
 			teamId,
 			250,
 		);
-		// The frame is the viewport less the 250 px sidebar: split from 860, columns from 1,092.
+		// The frame is the viewport less the 250 px sidebar: split from 860.
 		await until(
 			page,
 			"split",
@@ -606,13 +607,12 @@ test("the conversation is never remounted across columns, split and tabs", async
 		);
 		await call(page, (f) => f.markConversation());
 		const steps: Array<[number, string]> = [
-			[1342, "columns"],
-			[1341, "split"],
+			[1600, "split"],
 			[1109, "split"],
 			[1100, "tabs"],
 			[1300, "split"],
 			[900, "tabs"],
-			[1600, "columns"],
+			[1600, "split"],
 			[1000, "tabs"],
 		];
 		for (const [width, layout] of steps) {
@@ -650,7 +650,7 @@ test("opening the coordinator's own question brings its conversation forward", a
 	);
 	const { page, errors } = await openPage(alice, { width: 360, height: 780 });
 	try {
-		await call(page, (f, p: string, t: string) => f.openTeam(p, t, true), projectId, teamId);
+		await call(page, (f, p: string, t: string) => f.openTeam(p, t), projectId, teamId);
 		await until(
 			page,
 			"tabs",
@@ -686,10 +686,95 @@ test("opening the coordinator's own question brings its conversation forward", a
 	}
 }, 60_000);
 
+test("the page is about one team: no teams list, no new team, at desktop and phone widths", async () => {
+	for (const viewport of [
+		{ width: 1440, height: 900 },
+		{ width: 390, height: 844 },
+		{ width: 360, height: 780 },
+	]) {
+		const { page, errors } = await openPage(alice, viewport);
+		try {
+			await call(page, (f, p: string, t: string) => f.openTeam(p, t), projectId, teamId);
+			await until(
+				page,
+				"board",
+				(f) =>
+					f.count("[data-testid=team-card]") > 0 || f.count("[data-testid=team-tab-board]") === 1,
+			);
+			await until(page, "title", (f) => f.text("[data-testid=team-title]") === "Release crew");
+			const seen = {
+				width: viewport.width,
+				lists: await call(page, (f) => f.count("[data-testid=project-teams]")),
+				rows: await call(page, (f) => f.count("[data-testid=project-team-row]")),
+				newTeam: await call(page, (f) => f.count("[data-testid=new-team]")),
+				newTeamText: await call(page, () => document.body.innerText.includes("New team")),
+			};
+			expect(seen).toEqual({
+				width: viewport.width,
+				lists: 0,
+				rows: 0,
+				newTeam: 0,
+				newTeamText: false,
+			});
+			await call(page, (f) => f.setLanguage("zh-CN"));
+			await until(page, "Chinese", (f) => f.text("[data-testid=team-title]") === "Release crew");
+			expect(await call(page, () => document.body.innerText.includes("新建团队"))).toBe(false);
+			await call(page, (f) => f.setLanguage("en"));
+			// The back arrow is never covered: on a phone the top bar carries the menu button and
+			// the floating fallback stays away; on a desktop neither shows.
+			const phone = viewport.width < 768;
+			expect(await call(page, (f) => f.tappable("[data-testid=team-back]"))).toBe(true);
+			expect(await call(page, (f) => f.count("[data-mobile-nav-fallback]"))).toBe(0);
+			expect(await call(page, (f) => !f.gone("[data-mobile-nav-button]"))).toBe(phone);
+			if (phone) {
+				const menu = await call(page, (f) =>
+					f.fitsWidth("[data-testid=team-top-bar] [data-mobile-nav-button]"),
+				);
+				expect(menu).toEqual({ found: true, inside: true, scrolls: false });
+				expect(await call(page, (f) => f.tappable("[data-mobile-nav-button]"))).toBe(true);
+				await call(page, (f) => f.click("[data-testid=team-back]"));
+				expect(await call(page, (f) => f.openedTargets())).toContain("back");
+			}
+			expect(errors).toEqual([]);
+		} finally {
+			await page.close();
+		}
+	}
+}, 60_000);
+
+test("an archived team says so in the top bar and offers no pause all", async () => {
+	const owner = { userId: alice, isAdmin: false };
+	const old = await createTeam({ projectId, name: "Old crew" }, owner);
+	await archiveTeam(old.id, owner, projectId);
+	for (const viewport of [
+		{ width: 1440, height: 900 },
+		{ width: 360, height: 780 },
+	]) {
+		const { page, errors } = await openPage(alice, viewport);
+		try {
+			await call(page, (f, p: string, t: string) => f.openTeam(p, t), projectId, old.id);
+			await until(page, "archived", (f) => f.count("[data-testid=team-archived]") === 1);
+			expect(await call(page, (f) => f.text("[data-testid=team-archived]"))).toBe("Archived");
+			expect(await call(page, (f) => f.text("[data-testid=team-title]"))).toBe("Old crew");
+			expect(await call(page, (f) => f.count("[data-testid=team-pause-all]"))).toBe(0);
+			// The people list stays (the owner still manages access).
+			expect(await call(page, (f) => f.count("[data-testid=team-members-button]"))).toBe(1);
+			const fit = await call(page, (f) => f.fitsWidth("[data-testid=team-archived]"));
+			expect(fit).toEqual({ found: true, inside: true, scrolls: false });
+			await call(page, (f) => f.setLanguage("zh-CN"));
+			await until(page, "Chinese", (f) => f.text("[data-testid=team-archived]") === "已归档");
+			await shot(page, `archived-${viewport.width}`);
+			expect(errors).toEqual([]);
+		} finally {
+			await page.close();
+		}
+	}
+}, 60_000);
+
 test("360 px: tabs without sideways scrolling, light and dark, English and Chinese", async () => {
 	const { page, errors } = await openPage(alice, { width: 360, height: 780 });
 	try {
-		await call(page, (f, p: string, t: string) => f.openTeam(p, t, true), projectId, teamId);
+		await call(page, (f, p: string, t: string) => f.openTeam(p, t), projectId, teamId);
 		await until(
 			page,
 			"tabs",
