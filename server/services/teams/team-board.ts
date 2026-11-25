@@ -14,6 +14,7 @@
  * SQLite only, like the rest of the team surface; the routes refuse PostgreSQL with 503.
  */
 
+import { coerceAskQuestionShape } from "@shared/ask-user-question-shape";
 import {
 	boardColumnIsFinished,
 	TEAM_ACTIVITY_PREVIEW_CHARS,
@@ -24,6 +25,7 @@ import {
 	TEAM_EVENT_DETAIL_PREVIEW_CHARS,
 	TEAM_PAUSE_LIMIT,
 	TEAM_PERSON_DECISION_EVENT_KINDS,
+	TEAM_QUESTION_OPTIONS_MAX,
 	TEAM_RECENT_DECISIONS_LIMIT,
 	TEAM_RUNNING_AGENTS_LIMIT,
 	type TeamActivityEvent,
@@ -38,6 +40,7 @@ import {
 	type TeamPageSummary,
 	type TeamPendingApproval,
 	type TeamPersonDecisionEventKind,
+	type TeamQuestionForm,
 	type TeamRecentDecision,
 	type TeamRunningResponse,
 	type TeamWorkerActivity,
@@ -625,6 +628,34 @@ export function planTitle(prefix: string | null): string {
 	return line ? clipText(line, TEAM_APPROVAL_PREVIEW_CHARS) : "";
 }
 
+/** Characters of one option title an in-place question carries. */
+const OPTION_CHARS = 80;
+
+/**
+ * The in-place answer form of an AskUserQuestion call (R): only when the bounded prefix is the
+ * whole input and it asks exactly one question with options; the same normalization as the
+ * session's form, so the answer key is the header that form would send.
+ */
+export function questionForm(prefix: string | null): TeamQuestionForm | null {
+	if (!prefix) return null;
+	let parsed: { questions?: unknown };
+	try {
+		parsed = JSON.parse(prefix) as { questions?: unknown };
+	} catch {
+		return null;
+	}
+	const questions = coerceAskQuestionShape(parsed.questions);
+	const only = questions.length === 1 ? questions[0] : undefined;
+	if (!only || only.options.length === 0) return null;
+	return {
+		header: only.header,
+		options: only.options
+			.slice(0, TEAM_QUESTION_OPTIONS_MAX)
+			.map((option) => clipText(option.header, OPTION_CHARS)),
+		multiSelect: only.multiSelect === true,
+	};
+}
+
 /** Questions shown per AskUserQuestion call, and characters per question. */
 const QUESTIONS_SHOWN = 3;
 const QUESTION_CHARS = 200;
@@ -716,6 +747,7 @@ export async function readTeamApprovals(
 						? planTitle(detail?.input ?? null)
 						: approvalPreview(detail?.input ?? null),
 			questions: kind === "question" ? questionPreview(detail?.input ?? null) : [],
+			answerForm: kind === "question" ? questionForm(detail?.input ?? null) : null,
 			decisionReason: detail?.reason ?? null,
 			createdAt: row.createdAt,
 		};

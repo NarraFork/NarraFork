@@ -363,6 +363,18 @@ export function teamApprovalKind(toolName: string): TeamApprovalKind {
 	return (TEAM_SESSION_DECIDED_TOOLS as Record<string, TeamApprovalKind>)[toolName] ?? "tool";
 }
 
+/** One question answered in place on the team page (`TeamPendingApproval.answerForm`). */
+export interface TeamQuestionForm {
+	/** The answers key the session's own form sends (the question's header). */
+	header: string;
+	/** Option titles, at most {@link TEAM_QUESTION_OPTIONS_MAX}. */
+	options: string[];
+	multiSelect: boolean;
+}
+
+/** Options of an in-place question the approvals list carries. */
+export const TEAM_QUESTION_OPTIONS_MAX = 6;
+
 /** A tool call of the team tree waiting for a person. */
 export interface TeamPendingApproval {
 	/** The permission request id (the tool call id) the approve / deny routes take. */
@@ -379,6 +391,12 @@ export interface TeamPendingApproval {
 	preview: string;
 	/** For a question: the questions asked (at most three, each clipped). */
 	questions: string[];
+	/**
+	 * R: a call asking exactly one question, read whole from its input's bounded prefix: the
+	 * answer key (its header) and its options, so it can be answered in place. Absent otherwise
+	 * (several questions, or an input too long to read here: its session has the full form).
+	 */
+	answerForm?: TeamQuestionForm | null;
 	decisionReason: string | null;
 	createdAt: string;
 }
