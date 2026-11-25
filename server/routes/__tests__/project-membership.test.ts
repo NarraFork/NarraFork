@@ -28,7 +28,7 @@ process.env.NARRAFORK_ALLOW_MULTIPLE = "1";
 const { projectRoutes } = await import("../projects");
 const { narratorRoutes } = await import("../narrators");
 const { db } = await import("../../db");
-const { knowledgeCollections, projects, users } = await import("../../db/schema");
+const { aclGrants, knowledgeCollections, projects, users } = await import("../../db/schema");
 const { eventBus } = await import("../../lib/event-bus");
 const { generateId } = await import("../../lib/id");
 
@@ -581,5 +581,80 @@ describe("distinguishing an empty project list from a filtered one", () => {
 		const res = await request(OUTSIDER, "/projects/hidden-existence");
 		expect(res.status).toBe(200);
 		expect(await res.json()).toHaveProperty("hasHidden");
+	});
+});
+
+describe("the header's member count", () => {
+	test("owner plus grantees, once each; readers see it, strangers 404; no list", async () => {
+		const id = await makeProject();
+		const count = async (userId: string, role: "admin" | "user" = "user") => {
+			const res = await request(userId, `/projects/${id}/members/count`, { role });
+			return { status: res.status, body: res.status === 200 ? await res.json() : null };
+		};
+		expect(await count(OWNER)).toEqual({ status: 200, body: { count: 1, more: false } });
+		expect((await count(OUTSIDER)).status).toBe(404);
+		expect((await count("no-such-user")).status).toBe(404);
+		await request(OWNER, `/projects/${id}/members`, {
+			method: "POST",
+			body: { userIds: [READER], role: "read" },
+		});
+		await request(OWNER, `/projects/${id}/members`, {
+			method: "POST",
+			body: { userIds: [WRITER, MANAGER], role: "write" },
+		});
+		// A role change keeps one person one member.
+		await request(OWNER, `/projects/${id}/members`, {
+			method: "POST",
+			body: { userIds: [MANAGER], role: "manage" },
+		});
+		for (const user of [OWNER, READER, WRITER])
+			expect(await count(user)).toEqual({ status: 200, body: { count: 4, more: false } });
+		expect((await count("mem-admin", "admin")).body).toEqual({ count: 4, more: false });
+		expect((await count(OUTSIDER)).status).toBe(404);
+		// A public project: anyone who can read it sees the count of its actual members.
+		await request(OWNER, `/projects/${id}/visibility`, {
+			method: "PATCH",
+			body: { visibility: "public" },
+		});
+		expect(await count(OUTSIDER)).toEqual({ status: 200, body: { count: 4, more: false } });
+		// Removing a member counts them out; an ownerless project counts its grantees only.
+		await request(OWNER, `/projects/${id}/members/${READER}`, { method: "DELETE" });
+		expect((await count(OWNER)).body).toEqual({ count: 3, more: false });
+		expect((await request("no-such-user", `/projects/nope/members/count`)).status).toBe(404);
+	});
+
+	test("an ownerless project counts its grantees", async () => {
+		const id = await makeProject({ ownerUserId: null });
+		const now = new Date().toISOString();
+		await db.insert(aclGrants).values({
+			id: generateId(),
+			scopeType: "project",
+			scopeId: id,
+			principalType: "user",
+			principalId: READER,
+			capability: "read",
+			createdAt: now,
+		});
+		const res = await request(READER, `/projects/${id}/members/count`);
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({ count: 1, more: false });
+	});
+
+	test("past 999 members it says more, without reading them all", async () => {
+		const id = await makeProject();
+		const now = new Date().toISOString();
+		await db.insert(aclGrants).values(
+			Array.from({ length: 1000 }, (_, index) => ({
+				id: generateId(),
+				scopeType: "project" as const,
+				scopeId: id,
+				principalType: "user" as const,
+				principalId: `crowd-${index}`,
+				capability: "read" as const,
+				createdAt: now,
+			})),
+		);
+		const res = await request(OWNER, `/projects/${id}/members/count`);
+		expect(await res.json()).toEqual({ count: 999, more: true });
 	});
 });

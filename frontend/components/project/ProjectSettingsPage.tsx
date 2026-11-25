@@ -37,7 +37,7 @@ import {
 	IconUsersGroup,
 } from "@tabler/icons-react";
 import { Link, useNavigate } from "@tanstack/react-router";
-import { type ComponentType, type ReactNode, useState } from "react";
+import { type ComponentType, type ReactNode, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useProjectAccess } from "../../hooks/useProjectAccess";
 import { useProject } from "../../hooks/useProjects";
@@ -58,6 +58,14 @@ export const PROJECT_SETTINGS_GROUPS = [
 	"knowledge",
 ] as const;
 export type ProjectSettingsGroup = (typeof PROJECT_SETTINGS_GROUPS)[number];
+
+/** The group a `#settings-<group>` hash names, if any. */
+export function groupOfHash(hash: string): ProjectSettingsGroup | null {
+	const key = hash.replace(/^#/, "").replace(/^settings-/, "");
+	return (PROJECT_SETTINGS_GROUPS as readonly string[]).includes(key)
+		? (key as ProjectSettingsGroup)
+		: null;
+}
 
 const GROUP_ICON: Record<ProjectSettingsGroup, ComponentType<{ size?: number }>> = {
 	members: IconUsersGroup,
@@ -106,10 +114,20 @@ export function ProjectSettingsPage({ projectId }: { projectId: string }) {
 	const navigate = useNavigate();
 	const project = useProject(projectId);
 	const access = useProjectAccess(projectId, !project.isError);
-	const [active, setActive] = useState<ProjectSettingsGroup>("members");
+	const [active, setActive] = useState<ProjectSettingsGroup>(
+		() => groupOfHash(typeof window === "undefined" ? "" : window.location.hash) ?? "members",
+	);
 	// Only a verified permission enables editing: a failed refresh never keeps stale controls.
 	const canManage = !access.isError && access.data?.canManage === true;
 	const back = () => void navigate({ to: "/projects/$projectId", params: { projectId } });
+	const loaded = !!project.data;
+	// Opened at a group (`#settings-members`, the project header's 「N 位成员」): go there once
+	// the groups are drawn.
+	useEffect(() => {
+		if (!loaded) return;
+		const group = groupOfHash(window.location.hash);
+		if (group) document.getElementById(`settings-${group}`)?.scrollIntoView({ block: "start" });
+	}, [loaded]);
 
 	if (project.isError || (!project.isLoading && !project.data))
 		return <Alert color="red">{t("compatibility.unavailable")}</Alert>;

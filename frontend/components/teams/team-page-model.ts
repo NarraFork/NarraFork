@@ -53,6 +53,29 @@ export function liveWorkerStatus(
 	return worker.status;
 }
 
+/**
+ * The coordinator column's header line: how many other sessions of the tree are running, and the
+ * coordinator's own state when nothing else runs. The summary's running list does not say which
+ * sessions are work-item workers (reviewers and nested subagents run in the same tree), so the
+ * line counts sessions, not workers. When the list was cut (`more`) the count is a lower bound,
+ * shown as 「N+」: the listed others plus at least one unlisted, so it is never 「0+」.
+ */
+export function coordinatorLine(
+	summary: Pick<TeamPageSummary, "teamId" | "coordinatorStatus" | "runningAgents" | "runningCount">,
+):
+	| { kind: "running"; count: number; more: boolean }
+	| { kind: "status"; status: "working" | "waiting" | "idle" | "archived" } {
+	const others = summary.runningAgents.filter((agent) => agent.id !== summary.teamId).length;
+	const more = summary.runningCount > summary.runningAgents.length;
+	if (more) return { kind: "running", count: others + 1, more };
+	if (others > 0) return { kind: "running", count: others, more };
+	const status = summary.coordinatorStatus;
+	return {
+		kind: "status",
+		status: status === "working" || status === "waiting" || status === "archived" ? status : "idle",
+	};
+}
+
 /** "50+" past a capped count (the server counts one past its limit). */
 export function cappedCount(count: number, limit: number): string {
 	return count > limit ? `${limit}+` : String(count);
@@ -668,6 +691,18 @@ export function queuedLine(dependsOn: readonly TeamWorkDependencyRef[] | undefin
 export function returnReason(text: string): string | null {
 	const trimmed = text.trim();
 	return trimmed && trimmed.length <= TEAM_RETURN_REASON_MAX_LENGTH ? trimmed : null;
+}
+
+/** Lines a review round's findings show before 「展开」. */
+export const REVIEW_FINDINGS_CLAMP_LINES = 3;
+
+/**
+ * Whether a round's findings may run past {@link REVIEW_FINDINGS_CLAMP_LINES} lines in the drawer
+ * and so get 「展开 / 收起」: more lines than that, or more text than fits them at the drawer's
+ * narrowest width (an estimate; a short text never gets the toggle).
+ */
+export function findingsNeedToggle(text: string): boolean {
+	return text.split("\n").length > REVIEW_FINDINGS_CLAMP_LINES || text.length > 140;
 }
 
 /** How one line of a unified diff is drawn. */

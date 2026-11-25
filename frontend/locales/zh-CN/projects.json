@@ -474,6 +474,9 @@
 				"round": "第 {{round}} 轮 · {{who}}",
 				"reviewer": "评审者",
 				"findings": "{{count}} 个问题",
+				"findingsMore": "展开",
+				"findingsLess": "收起",
+				"findingsClipped": "评审意见合计太长，这一轮没有全部显示",
 				"verdictClear": "通过",
 				"verdictBlocker": "需修改",
 				"verdictReturned": "退回",
@@ -529,11 +532,30 @@
 				"title": "运行中的会话",
 				"none": "没有运行中的会话"
 			},
+			"coordinatorHeader": {
+				"title": "协调者",
+				"running_one": "{{count}} 个会话在运行",
+				"running_other": "{{count}} 个会话在运行",
+				"runningMore": "{{count}}+ 个会话在运行",
+				"disconnected": "连接断开",
+				"reconnect": "点击重新连接",
+				"status": {
+					"working": "工作中",
+					"waiting": "在等人处理",
+					"idle": "空闲",
+					"archived": "已归档"
+				},
+				"fullSession": "完整会话"
+			},
 			"readOnlyStart": "还没有人给协调者布置任务。",
 			"coordinator": "协调者"
 		}
 	},
 	"page": {
+		"members_one": "{{count}} 位成员",
+		"members_other": "{{count}} 位成员",
+		"membersMore": "{{count}}+ 位成员",
+		"membersHint": "成员与可见性",
 		"newTeam": "新团队",
 		"more": "更多",
 		"showSessions": "团队与会话",

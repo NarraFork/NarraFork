@@ -92,7 +92,7 @@ const { ProjectTeamCards } = await import("./ProjectTeamCards");
 const { ProjectSessions } = await import("./ProjectSessions");
 const { ProjectAttention } = await import("./ProjectAttention");
 const { ProjectListCard } = await import("./ProjectListCard");
-const { ProjectSettingsPage } = await import("./ProjectSettingsPage");
+const { groupOfHash, ProjectSettingsPage } = await import("./ProjectSettingsPage");
 const { projectOverviewKeys } = await import("../../hooks/useProjectOverview");
 
 async function render(node: ReactNode, client = new QueryClient(), lng: "en" | "zh-CN" = "zh-CN") {
@@ -463,6 +463,15 @@ describe("settings page", () => {
 		expect(editable.match(/data-rule-editor/g)).toHaveLength(4);
 		expect(editable).toContain("data-commands-editor");
 		expect(editable).toContain("data-trait-layer");
+	});
+});
+
+describe("settings page anchors", () => {
+	test("#settings-<group> names a group; anything else names none", () => {
+		expect(groupOfHash("#settings-members")).toBe("members");
+		expect(groupOfHash("settings-knowledge")).toBe("knowledge");
+		expect(groupOfHash("#settings-nope")).toBeNull();
+		expect(groupOfHash("")).toBeNull();
 	});
 });
 

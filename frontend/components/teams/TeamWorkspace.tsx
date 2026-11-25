@@ -7,8 +7,10 @@
  * The layout follows the frame's own width, not the viewport's (the app sidebar takes some). The
  * conversation sits at ONE place in the React tree in every layout; only CSS and the tab bar
  * change around it, so a resize never remounts the session view (which would reload it and lose
- * its scroll position). An overlay (the starting state's prompt) can sit over the conversation's
- * empty message area without covering its header or composer.
+ * its scroll position). A compact header (`conversationHeader`, the coordinator's line) sits above
+ * the conversation, whose own toolbar the page leaves out; an overlay (the starting state's prompt)
+ * can sit over the conversation's empty message area without covering that header or the
+ * composer.
  *
  * Layout only: the page fills the slots, so the browser fixture can render the frame without a
  * live session.
@@ -27,6 +29,7 @@ export function TeamWorkspace({
 	header,
 	attention,
 	conversation,
+	conversationHeader,
 	conversationOverlay,
 	work,
 	activity,
@@ -38,6 +41,8 @@ export function TeamWorkspace({
 	header: (layout: "split" | "tabs") => ReactNode;
 	attention: (layout: "split" | "tabs") => ReactNode;
 	conversation: ReactNode;
+	/** Above the conversation: the coordinator's compact header. */
+	conversationHeader?: ReactNode;
 	/** Drawn over the conversation's message area (the starting state). */
 	conversationOverlay?: ReactNode;
 	work: ReactNode;
@@ -145,19 +150,22 @@ export function TeamWorkspace({
 				<Box
 					ref={conversationRef}
 					style={{
-						display: conversationShown ? undefined : "none",
+						display: conversationShown ? "flex" : "none",
+						flexDirection: "column",
 						flex: tabs ? 1 : "3 1 0",
 						minWidth: 0,
 						minHeight: 0,
-						position: "relative",
 					}}
 					data-testid="team-conversation"
 				>
-					{/* Hidden but mounted: the session stops what only a visible panel needs. */}
-					<NarratorPanelVisibilityProvider value={conversationShown}>
-						{conversation}
-					</NarratorPanelVisibilityProvider>
-					{conversationOverlay}
+					{conversationHeader}
+					<Box style={{ flex: 1, minHeight: 0, position: "relative" }}>
+						{/* Hidden but mounted: the session stops what only a visible panel needs. */}
+						<NarratorPanelVisibilityProvider value={conversationShown}>
+							{conversation}
+						</NarratorPanelVisibilityProvider>
+						{conversationOverlay}
+					</Box>
 				</Box>
 				<Stack
 					gap={0}

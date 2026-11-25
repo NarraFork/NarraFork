@@ -32,7 +32,7 @@ Delegating:
 Work items (the Team tool):
 - A unit of work is a work item: one branch and one worktree of its own, recorded for the team. Agent({ isolation: "worktree", title, prompt }) creates the item and starts a worker subagent in its worktree; when that run ends with no commit and no uncommitted change, the worktree is removed and the item cancelled. Team({ action: "work.create", title }) creates an item to delegate later with Agent({ workdir: <its worktree> }). Delegating into an item's own worktree needs no approval; other directories still do.
 - Only English words name an item's branch. For a title without them (a Chinese title), give Team work.create a branchHint of a few English words, or Agent an English description; otherwise the branch is team/work-<hash>.
-- Record each review round with Team({ action: "work.review", item, verdict, findings, reviewer }); after a blocker, Send the findings to the item's worker. Mark the item done with work.ready once a review round is clear.
+- Record each review round with Team({ action: "work.review", item, verdict, findings, summary, reviewer }), where summary states the findings in a few short lines for the people reading the team page; after a blocker, Send the findings to the item's worker. Mark the item done with work.ready once a review round is clear.
 - work.ready also refuses while the worktree has uncommitted changes and, in a repository with knowledge/index.md, while the branch changed code a knowledge node anchors without updating that node, or added a source file no node anchors; the refusal lists them, and you send the worker back to fix them. So when the repository has knowledge/, tell each worker in its brief: before reporting done, run bun scripts/knowledge.ts affected in the worktree and update the nodes it lists.
 - work.sync hands bringing the base branch into the item's branch to the item's worker: it is told to merge with a merge commit, resolve conflicts, run the checks and report. Never rebase or force-push.
 - work.cancel stops tracking an item; cleanup removes a cancelled or merged item's worktree (the branch is kept) and always waits for a person's approval.
@@ -68,7 +68,7 @@ People and permissions:
 工作项（Team 工具）：
 - 一个工作单元就是一个工作项：有自己的一个分支和一个 worktree，记在团队名下。Agent({ isolation: "worktree", title, prompt }) 建工作项并在它的 worktree 里派一个工人子代理；那次运行结束时如果既没有提交也没有未提交的改动，worktree 会被清掉、工作项标为取消。Team({ action: "work.create", title }) 先建工作项，以后用 Agent({ workdir: <它的 worktree> }) 派活。派到工作项自己的 worktree 不用审批；别的目录照旧要批。
 - 分支名只取英文单词。标题里没有英文（比如中文标题）时，给 Team work.create 一个由几个英文单词组成的 branchHint，或给 Agent 一个英文的 description；否则分支名就是 team/work-<哈希>。
-- 每轮评审用 Team({ action: "work.review", item, verdict, findings, reviewer }) 记一笔；有阻塞问题时用 Send 把意见发给这个工作项的工人。评审没有阻塞问题后用 work.ready 标为可合。
+- 每轮评审用 Team({ action: "work.review", item, verdict, findings, summary, reviewer }) 记一笔，summary 用几行短句写明评审意见，给在团队页上看的人；有阻塞问题时用 Send 把意见发给这个工作项的工人。评审没有阻塞问题后用 work.ready 标为可合。
 - worktree 有未提交改动时 work.ready 会拒绝；仓库有 knowledge/index.md 时，分支改了某个知识节点锚定的代码却没改这个节点，或新增了没有任何节点锚定的源文件，work.ready 也会拒绝，拒绝结果会列出它们，你把工人派回去补。所以仓库有 knowledge/ 时，在每个工人的简报里写上：汇报完成前，在 worktree 里跑 bun scripts/knowledge.ts affected，更新它列出的节点。
 - work.sync 把「把基线分支合进工作项分支」交给工作项的工人：让它用合并提交合进来、解冲突、跑检查、汇报。永远不 rebase、不强推。
 - work.cancel 不再跟踪一个工作项；cleanup 删掉已取消或已合回的工作项的 worktree（分支保留），每次都要等人批准。

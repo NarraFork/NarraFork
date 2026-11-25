@@ -32,6 +32,7 @@ import {
 	TEAM_ISOLATED_WORK_KIND,
 	TEAM_RETURN_REASON_MAX_LENGTH,
 	TEAM_RETURNABLE_STATES,
+	TEAM_REVIEW_SUMMARY_MAX_LENGTH,
 	TEAM_WORK_ITEM_FINISHED_STATES,
 	TEAM_WORK_LIST_LIMIT,
 	TEAM_WORK_RETURNED_EVENT_KIND,
@@ -747,6 +748,11 @@ export interface RecordReviewInput {
 	itemId: string;
 	verdict: TeamReviewVerdict;
 	findings: number;
+	/**
+	 * The findings themselves, as people read them in the work item drawer (at most
+	 * {@link TEAM_REVIEW_SUMMARY_MAX_LENGTH} characters; blank is left out).
+	 */
+	summary?: string | null;
 	/** The reviewing subagent (narrator id when it resolved, else the selector given). */
 	reviewer: string | null;
 	actor: WorkActor;
@@ -766,6 +772,11 @@ export async function recordReview(
 	requireStarted(item, "review");
 	if (!Number.isSafeInteger(input.findings) || input.findings < 0)
 		throw new ValidationError("findings must be a non-negative integer");
+	const summary = input.summary?.trim() || null;
+	if (summary && summary.length > TEAM_REVIEW_SUMMARY_MAX_LENGTH)
+		throw new ValidationError(
+			`summary must be at most ${TEAM_REVIEW_SUMMARY_MAX_LENGTH} characters`,
+		);
 	const path = worktreePathOf(item);
 	const head = path
 		? await teamGit(path)
@@ -791,6 +802,7 @@ export async function recordReview(
 				round,
 				verdict: input.verdict,
 				findings: input.findings,
+				...(summary ? { summary } : {}),
 				reviewer: input.reviewer,
 				head,
 				from: item.state,

@@ -55,7 +55,7 @@ keywords:
   - expectedRevision
   - missing_working_directory
 status: draft
-verified_at: cbf0722e0
+verified_at: 66bc772cb8dbb321753b7f326178e78e513230f1
 ---
 # 流程与协作工具
 
@@ -79,6 +79,7 @@ verified_at: cbf0722e0
 - `SwitchWorkingDirectory`：切换普通主叙述者的工作目录，参数必须带当前工作区修订号 `expectedRevision`、唯一 `requestId` 和目标 `{deviceId, cwd}`（严格对象，多余字段被拒，`validators/workspace-context.ts`）；运行时不支持切换时报错。会话自己的目录不存在时由 `working-directory-recovery.ts` 生成 `missing_working_directory` 致命结果并带建议目录，而工具入参里错误的 `workdir` 只是模型的错，会话继续、让模型重试。
 - `ImageGen`：必须显式给出生图模型 ID，不会用对话模型替代；提供商需实现 `generateImage`。已付费的响应在本地处理失败时，仅传 `response_id` 恢复，不会再发起生成请求。
 - `Team` 的 `work.create` 与 `work.update` 带 `dependsOn`（本团队工作项 id，最多 20）：依赖合并前开始这一项会被拒（`TEAM_WORK_ITEM_BLOCKED`），见[工作项](../../collaboration/teams/work-items.md)。
+- `Team` 的 `work.review` 可带 `summary`（几行评审意见，最多 1000 字，给团队页上的人看，见[工作项](../../collaboration/teams/work-items.md)）。
 - `Team` 的 `work.create` 可带 `branchHint`（几个英文单词，最多 80 字符，`TEAM_WORK_BRANCH_HINT_MAX_LENGTH`），优先于标题给工作项分支命名；分支名只取 ASCII 单词，见[工作项](../../collaboration/teams/work-items.md)。
 
 ## 从哪读起

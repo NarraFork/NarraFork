@@ -15,6 +15,7 @@ let projectError = false;
 let teamsRefused = false;
 let outlineEnabled = false;
 let phone = false;
+let memberCount: { count: number; more: boolean } | undefined = { count: 4, more: false };
 const openOutline = mock((_kind: string, _id: string) => {});
 const navigate = mock(async (_value: unknown) => {});
 const invalidate = mock(async (_value: unknown) => {});
@@ -25,13 +26,21 @@ const button = ({
 	onClick,
 	disabled,
 	"data-testid": testId,
+	"data-count": dataCount,
 }: {
 	children?: ReactNode;
 	onClick?: () => void;
 	disabled?: boolean;
 	"data-testid"?: string;
+	"data-count"?: number;
 }) => (
-	<button type="button" disabled={disabled} onClick={onClick} data-testid={testId}>
+	<button
+		type="button"
+		disabled={disabled}
+		onClick={onClick}
+		data-testid={testId}
+		data-count={dataCount}
+	>
 		{children}
 	</button>
 );
@@ -55,6 +64,7 @@ mock.module("@mantine/core", () => ({
 		<span data-path={path}>{children}</span>
 	),
 	Title: ({ children }: { children?: ReactNode }) => <h2>{children}</h2>,
+	UnstyledButton: button,
 	Tooltip: ({ children, label }: { children?: ReactNode; label?: string }) => (
 		<span data-tooltip={label}>{children}</span>
 	),
@@ -93,6 +103,9 @@ mock.module("../../hooks/useProjectAccess", () => ({
 		throw new Error("The project page must not load every member");
 	},
 	installProjectAccessListener: installAccessListener,
+	useProjectMemberCount: (projectId: string) => ({
+		data: projectId === "original-project" ? memberCount : undefined,
+	}),
 }));
 mock.module("../../hooks/useProjectOverview", () => ({
 	useProjectTeamCards: () => ({
@@ -177,6 +190,7 @@ beforeEach(() => {
 	teamsRefused = false;
 	outlineEnabled = false;
 	phone = false;
+	memberCount = { count: 4, more: false };
 	parts.length = 0;
 	for (const fn of [navigate, invalidate, installAccessListener, openOutline]) fn.mockClear();
 	const { window } = parseHTML("<!doctype html><html><body></body></html>");
@@ -288,6 +302,26 @@ test("「…」 → 项目设置 opens the settings page", async () => {
 		to: "/projects/$projectId/settings",
 		params: { projectId: "original-project" },
 	});
+});
+
+test("「N 位成员」 is a count from the server; it opens 成员与可见性", async () => {
+	await act(async () => root.render(<Page />));
+	const count = byTestId("project-member-count");
+	expect(count?.getAttribute("data-count")).toBe("4");
+	expect(count?.textContent).toBe("page.members");
+	await click(count);
+	expect(navigate).toHaveBeenCalledWith({
+		to: "/projects/$projectId/settings",
+		params: { projectId: "original-project" },
+		hash: "settings-members",
+	});
+	// Past the server's limit it says 999+; unknown, it says nothing.
+	memberCount = { count: 999, more: true };
+	await act(async () => root.render(<Page key="more" />));
+	expect(byTestId("project-member-count")?.textContent).toBe("page.membersMore");
+	memberCount = undefined;
+	await act(async () => root.render(<Page key="none" />));
+	expect(byTestId("project-member-count")).toBeNull();
 });
 
 test("without teams on this deployment there is no 新团队", async () => {

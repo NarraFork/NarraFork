@@ -6,6 +6,7 @@
  * words each event; every `teams` string exists in both languages.
  */
 import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { MantineProvider } from "@mantine/core";
 import type {
 	TeamActivityPage,
@@ -34,10 +35,11 @@ import zhNarrator from "../../locales/zh-CN/narrator.json";
 import zh from "../../locales/zh-CN/projects.json";
 import { ActivityLine, TeamActivity } from "./TeamActivity";
 import { TeamAttention } from "./TeamAttention";
+import { TeamCoordinatorHeader } from "./TeamCoordinatorHeader";
 import { TeamHeader } from "./TeamHeader";
 import { TeamMembersPanel } from "./TeamMembers";
 import { TeamReadOnlyStart, TeamStart } from "./TeamStart";
-import { DependencySections } from "./TeamWorkDrawer";
+import { DependencySections, ReviewFindings } from "./TeamWorkDrawer";
 import { TeamWorkList } from "./TeamWorkList";
 import { attentionEntries, statusSentence, teamPageMode } from "./team-page-model";
 
@@ -1041,5 +1043,111 @@ describe("dependencies (D)", () => {
 		expect(html).not.toContain("项合并");
 		expect(html).toContain("可以开始了");
 		expect(html).toContain("依赖的工作项都已合并");
+	});
+});
+
+describe("review findings", () => {
+	test("muted text clamped to three lines, 展开 when long, a note when cut", async () => {
+		const short = await render(
+			<ReviewFindings text="缺少跨日边界用例" clipped={false} />,
+			undefined,
+			"zh-CN",
+		);
+		expect(short).toContain("缺少跨日边界用例");
+		expect(short).toContain("--text-line-clamp:3");
+		expect(short).not.toContain("team-review-findings-toggle");
+		const long = await render(
+			<ReviewFindings text={"x".repeat(300)} clipped />,
+			undefined,
+			"zh-CN",
+		);
+		expect(long).toContain("team-review-findings-toggle");
+		expect(long).toContain("展开");
+		expect(long).toContain("评审意见合计太长");
+		const gone = await render(<ReviewFindings text={null} clipped />);
+		expect(gone).toContain("The findings are too long in all");
+	});
+});
+
+describe("the coordinator's column header", () => {
+	const agent = (id: string, status = "working") => ({ id, title: id, status });
+	test("协调者 · N 个会话在运行 · 完整会话, in place of the session toolbar", async () => {
+		const running = summary({
+			coordinatorStatus: "working",
+			runningAgents: [agent("lead"), agent("w1"), agent("w2"), agent("w3"), agent("w4")],
+			runningCount: 5,
+		});
+		const zhHtml = await render(
+			<TeamCoordinatorHeader summary={running} onOpenCoordinatorSession={() => {}} />,
+			undefined,
+			"zh-CN",
+		);
+		expect(zhHtml).toContain("协调者");
+		expect(zhHtml).toContain("4 个会话在运行");
+		expect(zhHtml).not.toContain("工作者");
+		expect(zhHtml).toContain("完整会话");
+		expect(zhHtml).toContain('data-tone="blue"');
+		const html = await render(<TeamCoordinatorHeader summary={running} />);
+		expect(html).toContain("4 sessions running");
+		// No way to the full session given: no link.
+		expect(html).not.toContain("team-coordinator-full-session");
+		const idle = await render(
+			<TeamCoordinatorHeader summary={summary()} onOpenCoordinatorSession={() => {}} />,
+			undefined,
+			"zh-CN",
+		);
+		expect(idle).toContain("空闲");
+		expect(idle).toContain('data-kind="status"');
+	});
+
+	test("a list cut down to the coordinator still reads 1+, never 0+", async () => {
+		const cut = summary({ runningAgents: [agent("lead")], runningCount: 2 });
+		const zhHtml = await render(<TeamCoordinatorHeader summary={cut} />, undefined, "zh-CN");
+		expect(zhHtml).toContain("1+ 个会话在运行");
+		expect(zhHtml).not.toContain("0+");
+		expect(await render(<TeamCoordinatorHeader summary={cut} />)).toContain("1+ sessions running");
+	});
+
+	test("连接断开 while the panel's socket is down, nothing while it is up", async () => {
+		const down = { disconnected: true, reconnect: () => {} };
+		const zhHtml = await render(
+			<TeamCoordinatorHeader summary={summary()} connection={down} />,
+			undefined,
+			"zh-CN",
+		);
+		expect(zhHtml).toContain("team-coordinator-disconnected");
+		expect(zhHtml).toContain("连接断开");
+		expect(zhHtml).toContain('title="点击重新连接"');
+		const html = await render(<TeamCoordinatorHeader summary={summary()} connection={down} />);
+		expect(html).toContain("Disconnected");
+		for (const connection of [undefined, null, { ...down, disconnected: false }]) {
+			const upHtml = await render(
+				<TeamCoordinatorHeader summary={summary()} connection={connection} />,
+			);
+			expect(upHtml).not.toContain("team-coordinator-disconnected");
+		}
+	});
+
+	test("the session page keeps its toolbar: only the team route leaves it out", () => {
+		const panel = readFileSync(new URL("../narrator/NarratorPanel.tsx", import.meta.url), "utf8");
+		expect(panel).toContain("hideHeader = false,");
+		expect(panel).toMatch(/\{!hideHeader && \(\s*<NarratorHeaderLayout/);
+		const route = readFileSync(
+			new URL("../../routes/projects/$projectId_.teams.$teamId.tsx", import.meta.url),
+			"utf8",
+		);
+		expect(route).toMatch(/\bhideHeader\b/);
+		// The hidden header's 「连接断开」 reaches the coordinator line through the panel's report.
+		expect(route).toMatch(/onConnectionChange=\{onConnectionChange\}/);
+		expect(route).toMatch(/onConnectionChange=\{setConnection\}/);
+		expect(route).toMatch(/conversationConnection=\{connection\}/);
+		expect(panel).toContain(
+			"useReportPanelConnection(onConnectionChange, disconnected && !isWorkspacePreview, reconnect);",
+		);
+		const session = readFileSync(
+			new URL("../../routes/narrators/$narratorId.tsx", import.meta.url),
+			"utf8",
+		);
+		expect(session).not.toMatch(/\bhideHeader\b/);
 	});
 });

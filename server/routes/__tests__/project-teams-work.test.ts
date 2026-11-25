@@ -14,7 +14,7 @@
  *  - the board names what a running worker did last, and the summary says whether anyone spoke
  *    to the coordinator yet.
  */
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -45,8 +45,15 @@ const {
 const { generateId } = await import("../../lib/id");
 const { narratorService } = await import("../../services/narrator-service");
 const work = await import("../../services/teams/work-items");
-const { resetWorkStatCacheForTests } = await import("../../services/teams/team-work-view");
-const { TEAM_WORK_DIFF_MAX_BYTES } = await import("@shared/project-teams");
+const { capReviewSummaries, resetWorkStatCacheForTests } = await import(
+	"../../services/teams/team-work-view"
+);
+const board = await import("../../services/teams/team-board");
+const {
+	TEAM_EVENT_DETAIL_PREVIEW_CHARS,
+	TEAM_REVIEW_SUMMARIES_TOTAL_CHARS,
+	TEAM_WORK_DIFF_MAX_BYTES,
+} = await import("@shared/project-teams");
 
 const OWNER = "work-owner";
 const MEMBER = "work-member";
@@ -130,18 +137,22 @@ async function newItem(title: string) {
 	});
 }
 
-async function readyItem(title: string, files: Record<string, string>) {
-	const item = await newItem(title);
-	const path = work.worktreePathOf(item) ?? "";
-	commitIn(path, files, title);
-	const actor = { kind: "agent" as const, id: teamId };
-	// Only a started item is reviewed: a worker of its own, as an Agent call attaches.
+/** Only a started item is reviewed: give it a worker of its own, as an Agent call attaches. */
+async function startItem(item: { id: string }, title: string) {
 	const worker = await narratorService.create({ title: `${title} worker`, cwd: repo });
 	await db
 		.update(narrators)
 		.set({ type: "subagent", aclRootNarratorId: teamId, parentNarratorId: teamId })
 		.where(eq(narrators.id, worker.id));
-	work.attachWorker(teamId, item.id, worker.id, actor);
+	work.attachWorker(teamId, item.id, worker.id, { kind: "agent", id: teamId });
+}
+
+async function readyItem(title: string, files: Record<string, string>) {
+	const item = await newItem(title);
+	const path = work.worktreePathOf(item) ?? "";
+	commitIn(path, files, title);
+	const actor = { kind: "agent" as const, id: teamId };
+	await startItem(item, title);
 	await work.recordReview({
 		coordinatorId: teamId,
 		itemId: item.id,
@@ -724,5 +735,205 @@ describe("review fixes (PR review)", () => {
 				JSON.stringify({ questions: [{ question: "Ship today?", header: "When", options: [] }] }),
 			),
 		).toEqual(["Ship today?"]);
+	});
+});
+
+describe("review findings in the drawer", () => {
+	test("each round's findings, long ones too, as far as the drawer is readable", async () => {
+		resetWorkStatCacheForTests();
+		const item = await newItem("Findings item");
+		commitIn(work.worktreePathOf(item) ?? "", { "src/f.ts": "f\n" }, "findings work");
+		await startItem(item, "Findings");
+		const actor = { kind: "agent" as const, id: teamId };
+		const short = "缺少跨日边界用例：UTC 16:00 之后下的订单，在东八区应算到第二天。";
+		await work.recordReview({
+			coordinatorId: teamId,
+			itemId: item.id,
+			verdict: "blocker",
+			findings: 1,
+			summary: `  ${short}\n`,
+			reviewer: null,
+			actor,
+		});
+		// Quotes and newlines escape past the event preview: read on its own, still whole.
+		const long = `"\u0001`.repeat(500);
+		await work.recordReview({
+			coordinatorId: teamId,
+			itemId: item.id,
+			verdict: "clear",
+			findings: 0,
+			summary: long,
+			reviewer: null,
+			actor,
+		});
+		await work.recordReview({
+			coordinatorId: teamId,
+			itemId: item.id,
+			verdict: "clear",
+			findings: 0,
+			summary: "   ",
+			reviewer: null,
+			actor,
+		});
+		for (const user of [OWNER, MEMBER, READER]) {
+			const detail = await call(user, teamPath(`work/${item.id}`));
+			expect(detail.status).toBe(200);
+			expect(
+				detail.body.reviews.map((round: { summary: string | null; verdict: string }) => [
+					round.verdict,
+					round.summary,
+				]),
+			).toEqual([
+				["blocker", short],
+				["clear", long],
+				["clear", null],
+			]);
+			expect(
+				detail.body.reviews.some((round: { summaryClipped?: boolean }) => round.summaryClipped),
+			).toBe(false);
+			// The timeline does not repeat the text the rounds carry.
+			const reviews = detail.body.events.filter(
+				(event: { kind: string }) => event.kind === "work.review",
+			);
+			expect(reviews).toHaveLength(3);
+			for (const event of reviews) {
+				expect(event.detailOmitted).toBe(false);
+				expect("summary" in event.detail).toBe(false);
+			}
+			expect(reviews[1].detail).toMatchObject({ round: 2, verdict: "clear", findings: 0 });
+		}
+		// Findings are only as visible as the events: a stranger reads nothing.
+		expect((await call(OUTSIDER, teamPath(`work/${item.id}`))).status).toBe(404);
+		expect((await call(OUTSIDER, teamPath("events"))).status).toBe(404);
+		// A blank summary is not stored; a too-long one is refused.
+		const stored = db
+			.select({ kind: teamWorkEvents.kind, detail: teamWorkEvents.detailJson })
+			.from(teamWorkEvents)
+			.where(eq(teamWorkEvents.workItemId, item.id))
+			.all()
+			.filter((row) => row.kind === "work.review");
+		expect(JSON.stringify(stored[1]?.detail).length).toBeGreaterThan(
+			TEAM_EVENT_DETAIL_PREVIEW_CHARS,
+		);
+		expect(stored.map((row) => row.detail && "summary" in row.detail)).toEqual([true, true, false]);
+		await expect(
+			work.recordReview({
+				coordinatorId: teamId,
+				itemId: item.id,
+				verdict: "clear",
+				findings: 0,
+				summary: "x".repeat(1001),
+				reviewer: null,
+				actor,
+			}),
+		).rejects.toThrow("summary must be at most 1000 characters");
+	});
+
+	test("long findings are read row by row, newest first, only until the drawer has enough", async () => {
+		resetWorkStatCacheForTests();
+		const item = await newItem("Many findings item");
+		commitIn(work.worktreePathOf(item) ?? "", { "src/many.ts": "m\n" }, "many findings work");
+		await startItem(item, "Findings");
+		const actor = { kind: "agent" as const, id: teamId };
+		// Each findings text is the longest allowed and escapes past the event preview.
+		const findings = (round: number) => `${round}`.padEnd(2, "-") + "\u0001".repeat(998);
+		const rounds = 15;
+		for (let round = 1; round <= rounds; round++)
+			await work.recordReview({
+				coordinatorId: teamId,
+				itemId: item.id,
+				verdict: round % 2 ? "blocker" : "clear",
+				findings: round,
+				summary: findings(round),
+				reviewer: null,
+				actor,
+			});
+		const reads = spyOn(board, "readReviewDetailText");
+		try {
+			for (const user of [OWNER, READER]) {
+				reads.mockClear();
+				const detail = await call(user, teamPath(`work/${item.id}`));
+				expect(detail.status).toBe(200);
+				// 6000 characters of findings is six rounds: the older nine are never read.
+				const kept = TEAM_REVIEW_SUMMARIES_TOTAL_CHARS / 1000;
+				expect(reads).toHaveBeenCalledTimes(kept);
+				const reviews = detail.body.reviews as {
+					round: number;
+					verdict: string;
+					findings: number | null;
+					summary: string | null;
+					summaryClipped?: boolean;
+				}[];
+				expect(reviews).toHaveLength(rounds);
+				reviews.forEach((review, index) => {
+					const round = index + 1;
+					// Every round keeps its verdict and count, read or not.
+					expect([review.round, review.verdict, review.findings]).toEqual([
+						round,
+						round % 2 ? "blocker" : "clear",
+						round,
+					]);
+					if (round > rounds - kept) {
+						expect(review.summary).toBe(findings(round));
+						expect(review.summaryClipped ?? false).toBe(false);
+					} else {
+						expect(review.summary).toBeNull();
+						expect(review.summaryClipped).toBe(true);
+					}
+				});
+				const timeline = detail.body.events.filter(
+					(event: { kind: string }) => event.kind === "work.review",
+				);
+				for (const event of timeline) expect(event.detailOmitted).toBe(false);
+			}
+		} finally {
+			reads.mockRestore();
+		}
+		expect((await call(OUTSIDER, teamPath(`work/${item.id}`))).status).toBe(404);
+	});
+
+	test("a long review's head gives its round, verdict and count", () => {
+		expect(
+			board.reviewHeadDetail('{"round":3,"verdict":"clear","findings":0,"summary":"\\u0001'),
+		).toEqual({ round: 3, verdict: "clear", findings: 0 });
+		expect(board.reviewHeadDetail('{"round":2,"verdict":"blocker","findings":4}')).toEqual({
+			round: 2,
+			verdict: "blocker",
+			findings: 4,
+		});
+		for (const head of [null, undefined, "", '{"verdict":"clear"}', '{"round":1,"verdict":"maybe"'])
+			expect(board.reviewHeadDetail(head)).toBeNull();
+	});
+
+	test("the findings one drawer sends are capped in all, newest rounds first", () => {
+		const round = (eventId: string, summary: string | null) => ({
+			eventId,
+			round: 1,
+			actorId: null,
+			verdict: "blocker" as const,
+			findings: 1,
+			by: "agent" as const,
+			actorName: null,
+			reason: null,
+			summary,
+			at: "2026-01-01T00:00:00.000Z",
+		});
+		const capped = capReviewSummaries(
+			[
+				round("a", "a".repeat(400)),
+				round("b", "b".repeat(400)),
+				round("c", null),
+				round("d", "d".repeat(700)),
+			],
+			1000,
+		);
+		expect(capped.map((entry) => entry.summary?.length ?? null)).toEqual([null, 300, null, 700]);
+		expect(capped.map((entry) => entry.summaryClipped ?? false)).toEqual([
+			true,
+			true,
+			false,
+			false,
+		]);
+		expect(capped[1]?.summary?.endsWith("…")).toBe(true);
 	});
 });

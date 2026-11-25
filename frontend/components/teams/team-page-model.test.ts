@@ -25,9 +25,11 @@ import {
 	boardSignature,
 	cappedCount,
 	chunkIds,
+	coordinatorLine,
 	diffLineKind,
 	eventLabelKey,
 	eventNote,
+	findingsNeedToggle,
 	isCoordinator,
 	itemMarks,
 	itemOfApproval,
@@ -786,6 +788,69 @@ describe("dependencies (D)", () => {
 		expect(eventNote({ kind: "work.unblocked", detail: { mergedItem: "a" } })).toEqual({
 			key: "unblocked",
 			values: {},
+		});
+	});
+});
+
+describe("review findings", () => {
+	test("a short text never gets 展开; many lines or a long text does", () => {
+		expect(findingsNeedToggle("缺少跨日边界用例。")).toBe(false);
+		expect(findingsNeedToggle("a\nb\nc")).toBe(false);
+		expect(findingsNeedToggle("a\nb\nc\nd")).toBe(true);
+		expect(findingsNeedToggle("x".repeat(141))).toBe(true);
+	});
+});
+
+describe("the coordinator's line", () => {
+	const base = {
+		teamId: "lead",
+		coordinatorStatus: "working",
+		runningAgents: [] as { id: string; title: string | null; status: string }[],
+		runningCount: 0,
+	};
+	const agent = (id: string) => ({ id, title: null, status: "working" });
+	test("the other running sessions; a lower bound when the list was cut", () => {
+		expect(
+			coordinatorLine({
+				...base,
+				runningAgents: [agent("lead"), agent("w1"), agent("w2")],
+				runningCount: 3,
+			}),
+		).toEqual({ kind: "running", count: 2, more: false });
+		// One listed, more beyond it: at least two.
+		expect(coordinatorLine({ ...base, runningAgents: [agent("w1")], runningCount: 2 })).toEqual({
+			kind: "running",
+			count: 2,
+			more: true,
+		});
+		// The full list (the coordinator and 19 others) and one past it: 20+.
+		const full = [agent("lead"), ...Array.from({ length: 19 }, (_, i) => agent(`w${i}`))];
+		expect(coordinatorLine({ ...base, runningAgents: full, runningCount: 21 })).toEqual({
+			kind: "running",
+			count: 20,
+			more: true,
+		});
+	});
+	test("a list cut down to the coordinator: 1+, never 0+", () => {
+		expect(coordinatorLine({ ...base, runningAgents: [agent("lead")], runningCount: 2 })).toEqual({
+			kind: "running",
+			count: 1,
+			more: true,
+		});
+	});
+	test("nothing else running: the coordinator's own state", () => {
+		expect(coordinatorLine({ ...base, runningAgents: [agent("lead")], runningCount: 1 })).toEqual({
+			kind: "status",
+			status: "working",
+		});
+		expect(coordinatorLine({ ...base, coordinatorStatus: "waiting" })).toEqual({
+			kind: "status",
+			status: "waiting",
+		});
+		expect(coordinatorLine({ ...base, coordinatorStatus: "archived" }).kind).toBe("status");
+		expect(coordinatorLine({ ...base, coordinatorStatus: "something" })).toEqual({
+			kind: "status",
+			status: "idle",
 		});
 	});
 });
