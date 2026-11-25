@@ -53,7 +53,7 @@ keywords:
   - assertTipStill
   - GIT_TOO_OLD_FOR_PARTIAL_CLONE
 status: draft
-verified_at: 97b9e9b25d1b2f28ba63045fad160395493c430d
+verified_at: 3588311eac166b9c044478105016c59ebd95688b
 ---
 # 合并工作项与基线配置
 
@@ -91,7 +91,7 @@ verified_at: 97b9e9b25d1b2f28ba63045fad160395493c430d
 
 读模型（`mergeSummaryOf`、`mergeViewOf`）：
 - 看板卡片（`team-board.ts:withMerge`，含项目页的 `readReadyItems`）的 ready 项带 `merge: {mode, phase, job, outcome, canMerge, disabledReason}`：不跑 git，读任务表、一条最新结果事件、缓存的 hosting 与 git 版本。
-- 抽屉 `work/:itemId` 的 ready 项带 `merge`（再加 `detail` 与 prepared 时的 `fastForward: {available, blocker, runningSessions, terminals, command, files, filesMore}`，检出检查缓存 15 秒）。`files` 是快进会写进那个检出的文件（prepared 的 `baseSha` → M，`numstat`，最多 300，含上游改动，不是评审 diff），确认框列的就是它。`command` 只在检出在基线上时给：`[ "$(git -C <目录> symbolic-ref --quiet --short HEAD)" = <基线> ] && git -C <目录> merge --ff-only --no-autostash --no-overwrite-ignore <M>`（`fastForwardCommand`，POSIX shell，路径与分支加引号）；`not_on_base`、`other_repository`、`stale`、`unreadable` 时为 null，只显示原因。
+- 抽屉 `work/:itemId` 的 ready 项带 `merge`（再加 `detail` 与 prepared 时的 `fastForward: {available, blocker, runningSessions, terminals, command, files, filesMore}`，检出检查缓存 15 秒）。`files` 是快进会写进那个检出的文件（prepared 的 `baseSha` → M，`numstat`，最多 300，含上游改动，不是评审 diff），确认框列的就是它。`command` 只在检出在基线上时给，有两种写法（`fastForwardCommand`）：sh/Git Bash 的 `[ "$(git -C <目录> symbolic-ref --quiet HEAD)" = refs/heads/<基线> ] && git -C <目录> merge --ff-only --no-autostash --no-overwrite-ignore <M>`，和 PowerShell 的 `if ((git -C '<目录>' symbolic-ref --quiet HEAD) -ceq 'refs/heads/<基线>') { … } else { Write-Error … }`；都比较完整 ref（同名 tag 不会让它跳过），路径各按自己的规则加引号；`preferred` 按服务端平台（Windows 先给 PowerShell），抽屉里可以切换；`not_on_base`、`other_repository`、`stale`、`unreadable` 时为 null，只显示原因。
 - 禁用原因按序：`not_ready`、`team_archived`、`merging`、`worker_running`、`checking`（hosting 还在读，或读失败为 `unknown`）、`github_pending`、`base_remote`、`git_too_old`；`canMerge` 还要求调用者是成员且有项目写权限。
 
 基线与新工作的起点（W，`team-work-start.ts`、`team-hosting.ts`）：

@@ -59,12 +59,13 @@ keywords:
   - assertDependenciesReachStart
   - unreachedDependencies
   - confirmUnblocks
+  - reconcileUnblocks
   - markMergedByLocalMerge
   - startFrom
   - team_unblocked
   - 依赖
 status: draft
-verified_at: 97b9e9b25d1b2f28ba63045fad160395493c430d
+verified_at: 3588311eac166b9c044478105016c59ebd95688b
 ---
 # 工作项
 
@@ -86,6 +87,7 @@ verified_at: 97b9e9b25d1b2f28ba63045fad160395493c430d
 - 设置：`Team` 的 `work.create` 与 `work.update` 带 `dependsOn`（工作项 id，不收标题），整组替换（`[]` 清空），最多 `TEAM_WORK_DEPENDENCIES_MAX` = 20（多了 400），重复去掉。只能在项 queued 且没有工作者时改（否则 409 `TEAM_WORK_ITEM_NOT_QUEUED`）；改了（`changed`）就在事务后发 `team:communication_changed` 刷新团队页。每个目标都必须是本团队的项（别的团队的、不存在的都是 404 `TEAM_WORK_ITEM_DEPENDENCY_NOT_FOUND`，不说属于谁）；不能是已取消的（409 `TEAM_WORK_ITEM_DEPENDENCY_CANCELLED`）；必须和这一项从同一条基线建出（409 `TEAM_WORK_DEPENDENCY_BASE_MISMATCH`，消息点名两条基线，`details: { base, mismatched: [{ id, base }] }`；基线是项的 `base_ref`，为空时取团队当前基线。项建时钉住团队当时的基线，团队基线之后能改，而 `work.sync` 只拉这一项自己的基线，合进别的基线的依赖永远到不了它）；不能是自己或成环（409 `TEAM_WORK_ITEM_DEPENDENCY_CYCLE`，`details.cycle` 是环路）。查环是从新目标沿已有边广度优先，每层一次 `IN` 索引读，最多访问 500 项，超了 409 `TEAM_WORK_ITEM_DEPENDENCY_GRAPH_TOO_LARGE`。`work.create` 在建 worktree 之前就查，被拒不留 worktree；写入与 `work.dependencies_changed` 事件（`dependsOn/added/removed`）同事务，事务内再查一次。`work.update` 还按「状态 + `updated_at`」条件更新项。
 - 开始的闸：只有合并进这一项自己基线的依赖算满足（`dependencyResolved`：`merged`（`dependencySatisfied`）且没有 `baseMismatch`），`ready` 不算（分支会从不含它的基线出发），已取消的依赖一直挡着，直到协调者去掉或换掉。加基线检查之前写下的跨基线边由 `readDependencies` 标上 `baseMismatch: { dependencyBase, dependentBase }`，不论状态都算挡着（`blockersOf`、`blockedBy`、解锁扫描同一规则）。`assertWorkItemStartable` 抛 409 `TEAM_WORK_ITEM_BLOCKED`，`details.blockers` 列出 `{ id, title, state }`（跨基线的另带 `baseMismatch`），消息点名已取消的与跨基线的（两条基线都写出）那些，让协调者用 `work.update` 处理。只要项还没有工作者，不论状态，`Agent({ workdir })` 都在创建子代理之前查（被拒什么都不建，工具结果带错误码），`attachWorker` 在事务内再查一次。
 - 解锁：`merged` 的唯一写入者 `markMerged` 在同一事务里只挑候选（`unblockCandidates`：按反向索引读被它挡着、仍 queued 且没有工作者的项，这两个条件在查询里过滤，再取最多 200；依赖全部满足、跨基线的永不满足）。事务后（不在事务里跑 git）`confirmUnblocks` 逐个核对：每个已合并依赖的记录 head 在不在被挡项的起点 ref 里（`unreachedDependencies`：团队当前起点模式下的 `refs/remotes/origin/<b>` 或本地基线，不拉取；一次 resolve 加每个依赖一次 `merge-base --is-ancestor`，最多 20 个，读不出就算不在）——在才在一个短事务里复读（仍 queued、无工作者、自上次依赖变更后没记过）后写 `work.unblocked`（system，`detail: { mergedItem, dependsOn }`），所以两次合并同时发生也只记一次。合并在本地基线而工作从 origin 开始（或反过来）的项不解锁。然后给协调者投一条说明（来源 `team_unblocked`，`wakeIfIdle`，与 `team_return` 同一条路；`createdBy`/执行主体是建这一项的人；按协调者会话的语言，`lib/prompts/team-lead.ts:unblockedNote`，首行「「X」现在可以开始了」，标题经 `team-coordinator-notes.ts:oneLine` 压成一行（最多 80 字，与重叠提醒相同），第二行让它先 `work.sync` 再派工人）。投递经 check-in 的生命周期排空跟踪，失败只记日志，事件照样成立。测试接缝 `setUnblockDeliveryForTests`、`setDependencyReachForTests`。不会自动开始。
+- 依赖之后才到起点 ref（例如合并在本地基线、工作从 origin 开始，之后 push 再 fetch）：每次起点拉取成功后（`workStartPoint` 在后台调）与后台刷新的每次扫一遍时，`reconcileUnblocks` 读 queued、无工作者、有依赖的项（索引读，最多 200），依赖全部已合并的再走 `confirmUnblocks`（同一个 git 核对与只记一次），新解锁的给协调者投说明。
 - 开始时同样核对：`Agent({ workdir })` 在 `assertWorkItemStartable` 之后再 `await assertDependenciesReachStart`，已合并却不在起点 ref 里的依赖让开始 409 `TEAM_WORK_ITEM_BLOCKED`（`details.blockers[].notInStart` 是起点名，消息说明合并到了别处）。
 - 基线：worktree 在 `work.create` 时就从起点当时的提交建出（本地基线，或刚拉取的 `origin/<基线>`），所以依赖合并前建的项分支是旧基线。不挪动建 worktree 的时机：说明和提示词让协调者先 `work.sync`（还没有工作者时返回确定的合并指令），把指令放在工人简报最前面。
 - `work.list` 与工具返回的项带 `dependsOn`（id）与 `blockedBy`（未合并的 id），整页一次读（`readDependencies`）。`work.cancel` 的结果列出依赖它、仍在排队的项（`dependents`，最多 20，状态在查询里过滤，`queuedDependentsOf`）并提示用 `work.update` 处理。
