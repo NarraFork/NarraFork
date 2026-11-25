@@ -498,20 +498,6 @@ export function getKimiCachedUsage(providerId: string): KimiUsageCache | undefin
 	return subject ? usageOf(subject) : undefined;
 }
 
-/** Provider id → the usage it reports (status bar). */
-export function getAllKimiCachedUsages(): Record<string, KimiUsageCache> {
-	const result: Record<string, KimiUsageCache> = {};
-	const seen = new Set<string>();
-	for (const subject of kimiSubjects()) {
-		// A provider reports its first subject, cached or not.
-		if (seen.has(subject.providerId)) continue;
-		seen.add(subject.providerId);
-		const cache = usageOf(subject);
-		if (cache) result[subject.providerId] = cache;
-	}
-	return result;
-}
-
 export const isKimiQuotaRefreshing = (keyId: string): boolean =>
 	refreshInFlightByProvider.has(keyId);
 

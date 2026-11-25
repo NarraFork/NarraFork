@@ -9,11 +9,10 @@ import { importLegacyQuotaCache, quotaStore } from "./sourcing/quota-store";
 /**
  * DeepSeek account balance. One balance per provider, kept in the shared quota store under
  * the provider's first credential (the key settings shows), as §15.4 places provider-level
- * quotas; this module keeps the scheduling and the runtime `generation`.
+ * quotas; this module owns scheduling and identity-checked publication.
  */
 
 export interface DeepSeekBalanceCache {
-	generation: string;
 	isAvailable: boolean | null;
 	balanceInfos: Array<{
 		currency: string;
@@ -34,7 +33,6 @@ interface Entry {
 	identity: string;
 	/** Where the snapshot is stored: the provider's first credential. */
 	credentialId: string;
-	generation: string;
 	inFlight?: Promise<DeepSeekBalanceCache | null>;
 	controller?: AbortController;
 }
@@ -103,7 +101,6 @@ function cacheOf(entry: Entry): DeepSeekBalanceCache {
 	const snapshot = quotaStore.get(entry.credentialId, entry.identity, restoreSnapshot);
 	const detail = snapshot?.detail as Pick<DeepSeekBalanceCache, "isAvailable" | "balanceInfos">;
 	return {
-		generation: entry.generation,
 		isAvailable: detail?.isAvailable ?? null,
 		balanceInfos: detail?.balanceInfos ?? [],
 		fetchedAt: snapshot?.fetchedAt ?? 0,
@@ -211,7 +208,6 @@ export function syncDeepSeekBalanceCache(): void {
 			entries.set(id, {
 				identity: identity(config),
 				credentialId,
-				generation: crypto.randomUUID(),
 			});
 			// Restore synchronously, as the old entry-creation did.
 			quotaStore.get(credentialId, identity(config), restoreSnapshot);
@@ -335,7 +331,7 @@ export function refreshDeepSeekBalance(providerId: string): Promise<DeepSeekBala
 			syncDeepSeekBalanceCache();
 			if (entries.get(providerId) !== entry) return null;
 			// Never copy transport exceptions, response text, or credentials to logs/API.
-			const { generation: _generation, ...previous } = cacheOf(entry);
+			const previous = cacheOf(entry);
 			store(entry, {
 				...previous,
 				fetchedAt: Date.now(),
@@ -349,17 +345,6 @@ export function refreshDeepSeekBalance(providerId: string): Promise<DeepSeekBala
 		return cacheOf(entry);
 	})();
 	return entry.inFlight;
-}
-
-export function getAllDeepSeekCachedBalances(): Record<string, DeepSeekBalanceCache> {
-	syncDeepSeekBalanceCache();
-	return Object.fromEntries([...entries].map(([id, entry]) => [id, cacheOf(entry)]));
-}
-
-/** Opaque, random runtime tokens only; never expose or derive them from credentials. */
-export function getDeepSeekBalanceGenerations(): Record<string, string> {
-	syncDeepSeekBalanceCache();
-	return Object.fromEntries([...entries].map(([id, entry]) => [id, entry.generation]));
 }
 
 export async function refreshAllDeepSeekBalances(): Promise<void> {

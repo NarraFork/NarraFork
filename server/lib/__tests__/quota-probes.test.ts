@@ -26,23 +26,18 @@ const { keyCooldown, resetProviderKeyRuntimeForTests, selectProviderKey } = awai
 const { keyQuotaBlockedUntil } = await import("../provider-key-quota");
 const { saveSettings, settings } = await import("../settings");
 const { quotaStore } = await import("../sourcing/quota-store");
-const { getServiceTemplate } = await import("../sourcing/templates");
+const { refreshQuotaSnapshots } = await import("../sourcing/quota-snapshots");
+const { getKimiKeyUsages, getKimiCachedUsage, parseKimiUsagesResponse, refreshKimiKeyUsage } =
+	await import("../kimi-usage-cache");
 const {
-	getAllKimiCachedUsages,
-	getKimiCachedUsage,
-	parseKimiUsagesResponse,
-	probeKimiQuota,
-	refreshKimiKeyUsage,
-} = await import("../kimi-usage-cache");
-const {
-	getAllOpencodeCachedUsages,
 	getOpencodeKeyUsages,
 	parseOpencodeUsageResponse,
 	refreshOpencodeKeyUsage,
 	syncOpencodeUsageCache,
 } = await import("../opencode-usage-cache");
-const { getAllDeepSeekCachedBalances, refreshDeepSeekBalance, syncDeepSeekBalanceCache } =
-	await import("../deepseek-balance-cache");
+const { getDeepSeekQuotaSnapshot, refreshDeepSeekBalance, syncDeepSeekBalanceCache } = await import(
+	"../deepseek-balance-cache"
+);
 const { probeRelayQuota } = await import("../provider-balance-cache");
 const { firstCredential } = await import("../provider-key-subjects");
 
@@ -153,7 +148,7 @@ describe("legacy cache files", () => {
 		syncDeepSeekBalanceCache();
 		await quotaStore.flush();
 		expect(quotaStore.peek(config.id)?.balances[0]?.remaining).toBe(3.25);
-		expect(getAllDeepSeekCachedBalances()[config.id]?.balanceInfos[0]?.totalBalance).toBe("3.25");
+		expect(getDeepSeekQuotaSnapshot(config.id, config.id)?.balances[0]?.remaining).toBe(3.25);
 		expect(existsSync(getNarraforkPath("deepseek-balances.json"))).toBe(false);
 	});
 });
@@ -193,7 +188,7 @@ describe("Kimi Code quota probe", () => {
 		expect(snapshot?.balances).toEqual([]);
 		expect(snapshot?.detail).toEqual(parseKimiUsagesResponse(body));
 		// Field for field what the old cache served.
-		expect(getAllKimiCachedUsages()[config.id]).toEqual({
+		expect(getKimiKeyUsages()[config.id]).toEqual({
 			...parseKimiUsagesResponse(body),
 			fetchedAt: snapshot?.fetchedAt ?? 0,
 			error: null,
@@ -242,19 +237,24 @@ describe("Kimi Code quota probe", () => {
 		expect(quotaStore.peek(config.id)).toBeUndefined();
 	});
 
-	test("the probe itself is what the kimi-code template exposes", async () => {
+	test("the production template refresh returns a standard snapshot from its source owner", async () => {
 		const config = useProvider(provider("kimi-template", "https://api.kimi.com/coding/v1"));
 		respond = async () => Response.json(body);
-		const template = getServiceTemplate("kimi-code");
-		const snapshot = await template.probeQuota?.(
-			// The probe needs the credential only.
-			{} as never,
-			{ id: config.id, providerId: config.id, config },
-			AbortSignal.timeout(5_000),
-		);
-		expect(snapshot?.windows).toEqual(
-			(await probeKimiQuota({ id: config.id, providerId: config.id, config })).windows,
-		);
+		const [snapshot] = await refreshQuotaSnapshots({ groupId: config.id, credentialId: config.id });
+		expect(snapshot).toMatchObject({
+			scope: "subscription",
+			balances: [],
+			windows: [
+				{ kind: "5h", usedRatio: 1, resetsAt: Date.parse(RESET_5H) },
+				{ kind: "weekly", usedRatio: 0.55, resetsAt: Date.parse(RESET_WEEK) },
+				{ kind: "monthly", usedRatio: 0.1, resetsAt: Date.parse(RESET_MONTH) },
+				{ kind: "other", label: "1d", usedRatio: 0.5, resetsAt: Date.parse(RESET_WEEK) },
+			],
+		});
+		expect(Number.isFinite(snapshot?.fetchedAt)).toBe(true);
+		expect(snapshot).not.toHaveProperty("fiveHour");
+		expect(quotaStore.peek(config.id)?.windows[0]?.usedRatio).toBe(1);
+		expect(keyQuotaBlockedUntil(config.id)).toBe(Date.parse(RESET_5H));
 	});
 });
 
@@ -281,9 +281,8 @@ describe("OpenCode Go quota probe", () => {
 		]);
 		expect(snapshot?.balances).toEqual([{ unit: "USD", remaining: 4.5 }]);
 		expect(snapshot?.detail).toEqual(parseOpencodeUsageResponse(body));
-		expect(getAllOpencodeCachedUsages()[config.id]).toEqual({
+		expect(getOpencodeKeyUsages()[config.id]).toEqual({
 			...parseOpencodeUsageResponse(body),
-			generation: expect.any(String),
 			fetchedAt: snapshot?.fetchedAt ?? 0,
 			error: null,
 		});
@@ -356,13 +355,12 @@ describe("DeepSeek quota probe", () => {
 	test("balances by currency; the legacy cache keeps the exact balance strings", async () => {
 		const config = useProvider(provider("ds-probe", "https://api.deepseek.com/v1"));
 		respond = async () => Response.json(body);
-		await refreshDeepSeekBalance(config.id);
+		const cache = await refreshDeepSeekBalance(config.id);
 		const snapshot = quotaStore.peek(config.id);
 		expect(snapshot?.scope).toBe("wallet");
 		expect(snapshot?.windows).toEqual([]);
 		expect(snapshot?.balances).toEqual([{ unit: "CNY", remaining: 12.5 }]);
-		expect(getAllDeepSeekCachedBalances()[config.id]).toEqual({
-			generation: expect.any(String),
+		expect(cache).toEqual({
 			isAvailable: true,
 			balanceInfos: body.balance_infos.map((info) => ({
 				currency: info.currency,
@@ -381,10 +379,10 @@ describe("DeepSeek quota probe", () => {
 		getProviderKeyStore().reorder(config.id, [second.id]);
 		expect(firstCredential(saved(config.id)).id).toBe(second.id);
 		respond = async () => Response.json(body);
-		await refreshDeepSeekBalance(config.id);
+		await refreshQuotaSnapshots({ groupId: config.id, credentialId: second.id });
 		expect(quotaStore.peek(second.id)?.balances[0]?.remaining).toBe(12.5);
 		expect(quotaStore.peek(config.id)).toBeUndefined();
-		expect(getAllDeepSeekCachedBalances()[config.id]?.balanceInfos).toHaveLength(1);
+		expect(getDeepSeekQuotaSnapshot(config.id, second.id)?.balances).toHaveLength(1);
 	});
 
 	test("the balance request uses the first key's own proxy", async () => {

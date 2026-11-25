@@ -44,8 +44,6 @@ const provider = (): CustomApiProviderConfig => ({
 });
 let respond: () => Promise<Response> = async () => Response.json(body);
 const {
-	getAllDeepSeekCachedBalances,
-	getDeepSeekBalanceGenerations,
 	isDeepSeekCustomApiProvider,
 	parseDeepSeekBalanceResponse,
 	refreshAllDeepSeekBalances,
@@ -190,8 +188,8 @@ describe("DeepSeek balances", () => {
 			throw new Error("secret-test-key upstream private error");
 		};
 		await refreshStaleDeepSeekBalances();
-		const cache = getAllDeepSeekCachedBalances()["deepseek-test"];
-		expect(cache?.balanceInfos).toHaveLength(2);
+		const cache = getDeepSeekQuotaSnapshot("deepseek-test", "deepseek-test");
+		expect(cache?.balances).toHaveLength(2);
 		expect(cache?.error).toBe("DeepSeek balance request failed");
 		expect(cache?.fetchedAt).toBe(now);
 		await refreshStaleDeepSeekBalances();
@@ -212,7 +210,6 @@ describe("DeepSeek balances", () => {
 			const pending = deferred();
 			respond = () => pending.promise;
 			const first = refreshDeepSeekBalance("deepseek-test");
-			const oldGeneration = getDeepSeekBalanceGenerations()["deepseek-test"];
 			const config = settings.customApiProviders?.[0];
 			if (!config) throw new Error("missing fixture");
 			if (change === "apiKey") config.apiKey = "new-account";
@@ -224,42 +221,29 @@ describe("DeepSeek balances", () => {
 			if (change === "globalProxy")
 				settings.proxy = { mode: "custom", url: "http://localhost:4321" };
 			if (change === "remove") settings.customApiProviders = [];
-			const current = getAllDeepSeekCachedBalances();
-			expect(getDeepSeekBalanceGenerations()["deepseek-test"]).not.toBe(oldGeneration);
-			expect(current["deepseek-test"]?.generation).toBe(
-				getDeepSeekBalanceGenerations()["deepseek-test"],
-			);
-			expect(current["deepseek-test"]?.balanceInfos ?? []).toEqual([]);
+			expect(getDeepSeekQuotaSnapshot("deepseek-test", "deepseek-test")).toBeUndefined();
 			pending.resolve(Response.json(body));
 			expect(await first).toBeNull();
-			expect(getAllDeepSeekCachedBalances()["deepseek-test"]?.balanceInfos ?? []).toEqual([]);
+			expect(getDeepSeekQuotaSnapshot("deepseek-test", "deepseek-test")?.balances ?? []).toEqual(
+				[],
+			);
 		});
 	}
 
-	test("random generations are stable across reads, refreshes and unrelated edits, not restored by key reuse", async () => {
-		const original = getDeepSeekBalanceGenerations()["deepseek-test"];
-		expect(original).toMatch(/^[\da-f-]{36}$/);
+	test("unrelated display edits retain the existing balance", async () => {
 		await refreshDeepSeekBalance("deepseek-test");
 		settings.customApiProviders = [{ ...provider(), name: "Renamed" }];
-		expect(getDeepSeekBalanceGenerations()["deepseek-test"]).toBe(original);
-		settings.customApiProviders = [{ ...provider(), apiKey: "second-account" }];
-		const second = getDeepSeekBalanceGenerations()["deepseek-test"];
-		expect(second).not.toBe(original);
-		settings.customApiProviders = [provider()];
-		const third = getDeepSeekBalanceGenerations()["deepseek-test"];
-		expect(third).not.toBe(original);
-		expect(third).not.toBe(second);
-		expect(JSON.stringify(getDeepSeekBalanceGenerations())).not.toContain(provider().apiKey);
+		expect(getDeepSeekQuotaSnapshot("deepseek-test", "deepseek-test")?.balances).toHaveLength(2);
 	});
 
 	test("completed balances disappear on credential changes, disable and removal", async () => {
 		await refreshDeepSeekBalance("deepseek-test");
-		expect(getAllDeepSeekCachedBalances()["deepseek-test"]?.balanceInfos).toHaveLength(2);
+		expect(getDeepSeekQuotaSnapshot("deepseek-test", "deepseek-test")?.balances).toHaveLength(2);
 		settings.customApiProviders = [{ ...provider(), apiKey: "other-account" }];
-		expect(getAllDeepSeekCachedBalances()["deepseek-test"]?.balanceInfos).toEqual([]);
+		expect(getDeepSeekQuotaSnapshot("deepseek-test", "deepseek-test")).toBeUndefined();
 		await refreshDeepSeekBalance("deepseek-test");
 		settings.customApiProviders = [{ ...provider(), disabled: true }];
-		expect(getAllDeepSeekCachedBalances()).toEqual({});
+		expect(getDeepSeekQuotaSnapshot("deepseek-test", "deepseek-test")).toBeUndefined();
 		settings.customApiProviders = [];
 		expect(await refreshDeepSeekBalance("deepseek-test")).toBeNull();
 	});
@@ -303,7 +287,7 @@ describe("DeepSeek balances", () => {
 		];
 		const fetchSpy = spyOn(outbound, "outboundFetch").mockImplementation(async () => respond());
 		await refreshAllDeepSeekBalances();
-		expect(getAllDeepSeekCachedBalances()).toEqual({});
+		expect(getDeepSeekQuotaSnapshot("deepseek-test", "deepseek-test")).toBeUndefined();
 		expect(fetchSpy).not.toHaveBeenCalled();
 	});
 

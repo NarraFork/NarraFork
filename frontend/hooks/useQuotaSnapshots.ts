@@ -2,71 +2,50 @@ import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import type { QuotaSnapshotEntry, QuotaSnapshotsResponse } from "@shared/quota-snapshot";
 import {
 	type QueryClient,
+	QueryObserver,
 	queryOptions,
 	useMutation,
 	useQuery,
 	useQueryClient,
 } from "@tanstack/react-query";
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useId, useMemo, useSyncExternalStore } from "react";
 import { api } from "../lib/api";
 import type { QuotaSnapshotRefreshTarget } from "../lib/api/quota-snapshots";
 
 export const quotaSnapshotsKey = ["quota-snapshots"] as const;
-
-interface QuotaClientState {
-	epoch: number;
-	controllers: Set<AbortController>;
-	cliReaders: Set<symbol>;
-	cliAttempted: boolean;
-	cliGeneration?: string;
-	cliFreshUntil?: number;
-	cliController?: AbortController;
+const cliQuotaKey = ["command-code-cli-quota"] as const;
+const refreshQuotaKey = ["quota-refresh"] as const;
+const quotaEditKey = ["quota-edit-generation"] as const;
+const quotaEditGeneration = (client: QueryClient) => client.getQueryData<number>(quotaEditKey) ?? 0;
+function advanceQuotaEditGeneration(client: QueryClient) {
+	client.setQueryDefaults(quotaEditKey, { gcTime: Infinity });
+	client.setQueryData(quotaEditKey, quotaEditGeneration(client) + 1);
 }
-const clientStates = new WeakMap<QueryClient, QuotaClientState>();
-function quotaClientState(client: QueryClient): QuotaClientState {
-	let state = clientStates.get(client);
-	if (!state) {
-		state = { epoch: 0, controllers: new Set(), cliReaders: new Set(), cliAttempted: false };
-		clientStates.set(client, state);
-	}
-	return state;
-}
+export const commandCodeCliQuotaKey = (entry?: QuotaSnapshotEntry) =>
+	[...cliQuotaKey, entry?.groupId, entry?.generation] as const;
 
-function advanceQuotaIdentity(state: QuotaClientState) {
-	state.epoch += 1;
-	state.cliAttempted = false;
-	state.cliGeneration = undefined;
-	state.cliFreshUntil = 0;
-	state.cliController = undefined;
-	for (const controller of state.controllers) controller.abort();
-	state.controllers.clear();
+function cliEntry(data?: QuotaSnapshotsResponse) {
+	return data?.entries.find(
+		(entry) => entry.templateId === "command-code" && entry.refreshOnRead && entry.generation,
+	);
+}
+function cliIdentity(data?: QuotaSnapshotsResponse) {
+	const entry = cliEntry(data);
+	return JSON.stringify([entry?.groupId, entry?.generation]);
 }
 
-/** Every authoritative response can discover an external CLI identity change. */
-function observeQuotaIdentity(client: QueryClient, incoming: QuotaSnapshotsResponse) {
-	const previous = client.getQueryData<QuotaSnapshotsResponse>(quotaSnapshotsKey);
-	const generations = (data: QuotaSnapshotsResponse | undefined) =>
-		new Map(
-			(data?.entries ?? [])
-				.filter((entry) => entry.refreshOnRead && entry.generation)
-				.map((entry) => [entry.groupId, entry.generation]),
-		);
-	const before = generations(previous);
-	const after = generations(incoming);
-	if (
-		before.size !== after.size ||
-		[...before].some(([groupId, generation]) => after.get(groupId) !== generation)
-	) {
-		advanceQuotaIdentity(quotaClientState(client));
-	}
-}
-
-/** Credential edits invalidate every in-flight reader and refresh, not just the GET. */
+/** Credential edits cancel framework-owned GET, ephemeral and manual requests together. */
 export async function invalidateQuotaSnapshots(client: QueryClient): Promise<void> {
-	advanceQuotaIdentity(quotaClientState(client));
-	await client.cancelQueries({ queryKey: quotaSnapshotsKey });
+	advanceQuotaEditGeneration(client);
+	await Promise.all(
+		[quotaSnapshotsKey, cliQuotaKey, refreshQuotaKey].map((queryKey) =>
+			client.cancelQueries({ queryKey }),
+		),
+	);
+	client.removeQueries({ queryKey: cliQuotaKey, type: "inactive" });
 	client.setQueryData<QuotaSnapshotsResponse>(quotaSnapshotsKey, { entries: [] });
 	await client.invalidateQueries({ queryKey: quotaSnapshotsKey });
+	await client.invalidateQueries({ queryKey: cliQuotaKey });
 }
 
 /** Select numerical data per credential, retaining the direct probe's validity and window metadata. */
@@ -114,61 +93,39 @@ export function selectQuotaEntries(entries: QuotaSnapshotEntry[]): QuotaSnapshot
 	});
 }
 
-/** Keep only an authenticated CLI identity's ephemeral value, never deleted credentials. */
-export function retainCommandCodeCliSnapshots(
-	previous: QuotaSnapshotsResponse | undefined,
+/** Pure display projection: CLI values never enter the authoritative GET cache. */
+export function mergeCommandCodeCliQuota(
 	incoming: QuotaSnapshotsResponse,
+	cli: QuotaSnapshotEntry | undefined,
 ): QuotaSnapshotsResponse {
 	return {
-		entries: incoming.entries.map((entry) => {
-			if (!entry.refreshOnRead || !entry.generation || entry.snapshot) return entry;
-			const cached = previous?.entries.find(
-				(old) =>
-					old.refreshOnRead &&
-					old.generation === entry.generation &&
-					old.groupId === entry.groupId &&
-					old.credentialId === entry.credentialId &&
-					(old.source ?? "probe") === (entry.source ?? "probe"),
-			);
-			return cached?.snapshot ? { ...entry, snapshot: cached.snapshot } : entry;
-		}),
-	};
-}
-
-function acceptQuotaSnapshots(
-	client: QueryClient,
-	incoming: QuotaSnapshotsResponse,
-): QuotaSnapshotsResponse {
-	observeQuotaIdentity(client, incoming);
-	const state = quotaClientState(client);
-	const completed = incoming.entries.find(
-		(entry) =>
-			entry.templateId === "command-code" &&
+		entries: incoming.entries.map((entry) =>
 			entry.refreshOnRead &&
-			entry.snapshot &&
-			!entry.snapshot.error &&
-			!entry.snapshot.hasError,
-	);
-	if (completed) {
-		// A real successful probe (automatic or manual) recovers a failed active reader.
-		// A GET merely retaining an old snapshot must not extend this freshness deadline.
-		state.cliAttempted = false;
-		state.cliGeneration = completed.generation;
-		state.cliFreshUntil = Date.now() + 60_000;
-	}
-	return retainCommandCodeCliSnapshots(client.getQueryData(quotaSnapshotsKey), incoming);
+			entry.generation &&
+			entry.groupId === cli?.groupId &&
+			entry.generation === cli.generation &&
+			entry.credentialId === cli.credentialId
+				? { ...entry, snapshot: cli.snapshot }
+				: entry,
+		),
+	};
 }
 
 export function quotaSnapshotsOptions(enabled = true, client?: QueryClient) {
 	return queryOptions({
 		queryKey: quotaSnapshotsKey,
 		queryFn: async ({ signal }) => {
-			const state = client ? quotaClientState(client) : undefined;
-			const epoch = state?.epoch;
 			const data = await api.quotaSnapshots({ signal });
-			if (state && state.epoch !== epoch)
-				throw new DOMException("Quota identity changed", "AbortError");
-			return client ? acceptQuotaSnapshots(client, data) : data;
+			signal.throwIfAborted();
+			if (client && cliIdentity(client.getQueryData(quotaSnapshotsKey)) !== cliIdentity(data)) {
+				advanceQuotaEditGeneration(client);
+				await client.cancelQueries({ queryKey: refreshQuotaKey });
+				await client.cancelQueries({
+					queryKey: cliQuotaKey,
+					predicate: (query) => query.queryKey[2] !== cliEntry(data)?.generation,
+				});
+			}
+			return data;
 		},
 		enabled: !REMOTE_BUILD && enabled,
 		staleTime: 30_000,
@@ -182,7 +139,21 @@ export function quotaSnapshotsOptions(enabled = true, client?: QueryClient) {
 }
 
 export function useQuotaSnapshots(enabled = true) {
-	return useQuery(quotaSnapshotsOptions(enabled, useQueryClient()));
+	const client = useQueryClient();
+	const query = useQuery(quotaSnapshotsOptions(enabled, client));
+	const cli = cliEntry(query.data);
+	// Subscribe to data, not as a Query observer: passive displays must not retain a probe.
+	const subscribe = useCallback(
+		(onChange: () => void) => client.getQueryCache().subscribe(onChange),
+		[client],
+	);
+	const read = () => client.getQueryData<QuotaSnapshotEntry>(commandCodeCliQuotaKey(cli));
+	const ephemeral = useSyncExternalStore(subscribe, read, read);
+	const data = useMemo(
+		() => (query.data ? mergeCommandCodeCliQuota(query.data, ephemeral) : undefined),
+		[query.data, ephemeral],
+	);
+	return { ...query, data };
 }
 
 export function useQuotaSnapshot(
@@ -190,127 +161,109 @@ export function useQuotaSnapshot(
 	credentialId?: string | null,
 	enabled = true,
 ) {
-	return useQuery({
-		...quotaSnapshotsOptions(enabled && !!groupId, useQueryClient()),
-		select: (data) =>
-			selectQuotaEntries(data.entries).find(
-				(entry) =>
-					entry.groupId === groupId &&
-					(credentialId === undefined || entry.credentialId === credentialId),
-			)?.snapshot ?? null,
-	});
+	const query = useQuotaSnapshots(enabled && !!groupId);
+	return {
+		...query,
+		data: query.data
+			? (selectQuotaEntries(query.data.entries).find(
+					(entry) =>
+						entry.groupId === groupId &&
+						(credentialId === undefined || entry.credentialId === credentialId),
+				)?.snapshot ?? null)
+			: undefined,
+	};
 }
 
-/** Explicitly opt into the nonpersistent Command Code CLI probe on an active surface. */
+/** Only active surfaces subscribe as Query observers; the last unsubscribe cancels work. */
 export function useCommandCodeCliQuota(enabled: boolean) {
 	const client = useQueryClient();
-	const state = quotaClientState(client);
-	const reader = useRef(Symbol("command-code-cli"));
-	const query = useQuotaSnapshots(enabled);
+	const query = useQuery(quotaSnapshotsOptions(enabled, client));
+	const cli = cliEntry(query.data);
+	const groupId = cli?.groupId;
+	const generation = cli?.generation;
 	useEffect(() => {
-		if (!enabled || REMOTE_BUILD) return;
-		const id = reader.current;
-		state.cliReaders.add(id);
-		return () => {
-			state.cliReaders.delete(id);
-			queueMicrotask(() => {
-				// StrictMode effect replay is still one activation, not a second probe.
-				if (state.cliReaders.size > 0) return;
-				state.cliController?.abort();
-				state.cliController = undefined;
-				state.cliAttempted = false;
-			});
-		};
-	}, [enabled, state]);
-	useEffect(() => {
-		if (REMOTE_BUILD || !enabled) return;
-		void query.dataUpdatedAt; // A structurally equal GET still advances the CLI refresh clock.
-		const cli = query.data?.entries.find(
-			(entry) => entry.templateId === "command-code" && entry.refreshOnRead,
-		);
-		if (!cli) return;
-		const sameGeneration = state.cliGeneration === cli.generation;
-		const freshUntil = Math.max(
-			sameGeneration ? (state.cliFreshUntil ?? 0) : 0,
-			(cli.snapshot?.fetchedAt ?? 0) + 60_000,
-		);
-		if (cli.snapshot && Date.now() < freshUntil) return;
-		if (sameGeneration && (state.cliAttempted || state.cliController)) return;
-		if (!sameGeneration) state.cliFreshUntil = 0;
-		state.cliAttempted = true;
-		state.cliGeneration = cli.generation;
-		const epoch = state.epoch;
-		state.cliController?.abort();
-		const controller = new AbortController();
-		state.cliController = controller;
-		state.controllers.add(controller);
-		const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(20_000)]);
-		void api
-			.refreshQuotaSnapshots({ groupId: cli.groupId }, { signal })
-			.then(async (data) => {
-				if (signal.aborted || state.epoch !== epoch) return;
-				await client.cancelQueries({ queryKey: quotaSnapshotsKey });
-				if (signal.aborted || state.epoch !== epoch) return;
-				client.setQueryData<QuotaSnapshotsResponse>(
-					quotaSnapshotsKey,
-					acceptQuotaSnapshots(client, data),
+		if (REMOTE_BUILD || !enabled || !groupId || !generation) return;
+		const observer = new QueryObserver(client, {
+			queryKey: [...cliQuotaKey, groupId, generation],
+			queryFn: async ({ signal: querySignal }) => {
+				const signal = AbortSignal.any([querySignal, AbortSignal.timeout(20_000)]);
+				const response = await api.refreshQuotaSnapshots({ groupId }, { signal });
+				signal.throwIfAborted();
+				return (
+					response.entries.find(
+						(entry) => entry.groupId === groupId && entry.generation === generation,
+					) ?? null
 				);
-			})
-			.catch(() => {
-				// Unknown remains unknown. No retry loop on a failed CLI read.
-			})
-			.finally(() => {
-				state.controllers.delete(controller);
-				if (state.cliController === controller) state.cliController = undefined;
-			});
-	}, [client, enabled, query.data, query.dataUpdatedAt, state]);
+			},
+			staleTime: 60_000,
+			refetchInterval: (state) =>
+				state.state.status === "error" ||
+				state.state.data?.snapshot?.error ||
+				state.state.data?.snapshot?.hasError
+					? false
+					: 60_000,
+			refetchOnWindowFocus: false,
+			refetchOnReconnect: false,
+			retry: false,
+		});
+		return observer.subscribe(() => {});
+	}, [client, enabled, groupId, generation]);
 }
 
 export function useRefreshQuotaSnapshots(identity?: unknown) {
 	const client = useQueryClient();
-	const controllers = useRef(new Set<AbortController>());
-	const state = quotaClientState(client);
+	const owner = useId();
 	useEffect(() => {
-		// A credential identity change cancels the previous account's refresh.
 		void identity;
-		const pending = controllers.current;
 		return () => {
-			for (const controller of pending) {
-				controller.abort();
-				state.controllers.delete(controller);
-			}
-			pending.clear();
+			void client.cancelQueries({
+				queryKey: refreshQuotaKey,
+				predicate: (query) => query.meta?.quotaRefreshOwner === owner,
+			});
 		};
-	}, [identity, state]);
+	}, [client, identity, owner]);
 	return useMutation({
 		mutationFn: async (target: QuotaSnapshotRefreshTarget = {}) => {
-			const controller = new AbortController();
-			controllers.current.add(controller);
-			state.controllers.add(controller);
-			try {
-				const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(60_000)]);
-				const result = await api.refreshQuotaSnapshots(target, { signal });
-				signal.throwIfAborted();
-				return result;
-			} finally {
-				controllers.current.delete(controller);
-				state.controllers.delete(controller);
-			}
+			const queryKey = [...refreshQuotaKey, target.groupId, target.credentialId];
+			await client.cancelQueries({ queryKey });
+			return client.fetchQuery({
+				queryKey,
+				meta: { quotaRefreshOwner: owner },
+				queryFn: async ({ signal: querySignal }) => {
+					const signal = AbortSignal.any([querySignal, AbortSignal.timeout(60_000)]);
+					const data = await api.refreshQuotaSnapshots(target, { signal });
+					signal.throwIfAborted();
+					return data;
+				},
+				staleTime: 0,
+				gcTime: 0,
+				retry: false,
+			});
 		},
 		onMutate: async () => {
-			const epoch = state.epoch;
+			// Capture before awaiting: an edit can happen between cancellation and query startup.
+			const generation = quotaEditGeneration(client);
 			await client.cancelQueries({ queryKey: quotaSnapshotsKey });
-			return { epoch };
+			return { generation };
 		},
 		onSuccess: async (data, _target, context) => {
-			if (context.epoch !== state.epoch) return;
+			// Ordinary GET updates are not credential edits and must not discard a real refresh.
+			if (context.generation !== quotaEditGeneration(client)) return;
 			await client.cancelQueries({ queryKey: quotaSnapshotsKey });
-			if (context.epoch !== state.epoch) return;
-			// The server returns the authoritative full list, including explicit CLI results.
-			client.setQueryData<QuotaSnapshotsResponse>(
-				quotaSnapshotsKey,
-				acceptQuotaSnapshots(client, data),
-			);
+			if (context.generation !== quotaEditGeneration(client)) return;
+			const cli = cliEntry(data);
+			if (cli?.snapshot) {
+				await client.cancelQueries({ queryKey: commandCodeCliQuotaKey(cli) });
+				if (context.generation !== quotaEditGeneration(client)) return;
+				client.setQueryData(commandCodeCliQuotaKey(cli), cli);
+			}
+			if (cliIdentity(client.getQueryData(quotaSnapshotsKey)) !== cliIdentity(data))
+				advanceQuotaEditGeneration(client);
+			client.setQueryData<QuotaSnapshotsResponse>(quotaSnapshotsKey, {
+				entries: data.entries.map((entry) =>
+					entry.refreshOnRead ? { ...entry, snapshot: null } : entry,
+				),
+			});
 		},
 	});
 }

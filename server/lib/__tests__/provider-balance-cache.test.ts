@@ -182,7 +182,7 @@ describe("provider balance discovery lifecycle", () => {
 					daily_limit_usd: 10,
 					daily_usage_usd: 2,
 					weekly_limit_usd: 50,
-					weekly_usage_usd: 4,
+					weekly_usage_usd: 50,
 					monthly_limit_usd: 0,
 					monthly_usage_usd: 0,
 					weekly_window_start: "2026-10-19T00:00:00Z",
@@ -209,28 +209,37 @@ describe("provider balance discovery lifecycle", () => {
 				{
 					kind: "weekly",
 					label: "weekly",
-					usedRatio: 0.08,
+					usedRatio: 1,
 					resetsAt: null,
-					used: 4,
+					used: 50,
 					total: 50,
-					remaining: 46,
-					unit: "USD",
-				},
-				{
-					kind: "monthly",
-					label: "monthly",
-					usedRatio: null,
-					resetsAt: null,
-					used: 0,
-					total: 0,
 					remaining: 0,
 					unit: "USD",
 				},
 			],
 		};
 		expect(f.cache.quotaSnapshot("relay-test")?.snapshot).toMatchObject(expected);
+		// Older cache/plugin versions retained unconfigured periods in raw detail.
+		const detail = stored?.detail as { balance: { amounts: unknown[] } };
+		detail.balance.amounts.push({
+			unit: "USD",
+			remaining: 0,
+			total: 0,
+			used: 0,
+			window: "monthly",
+		});
 		const restarted = fixture(new QuotaStore(persistence));
 		expect(restarted.cache.quotaSnapshot("relay-test")?.snapshot).toMatchObject(expected);
+		const restoredDetail = restarted.cache.quotaSnapshot("relay-test")?.snapshot?.detail as {
+			balance: { amounts: unknown[] };
+		};
+		expect(restoredDetail.balance.amounts.at(-1)).toEqual({
+			unit: "USD",
+			remaining: 0,
+			total: 0,
+			used: 0,
+			window: "monthly",
+		});
 		expect(restarted.cache.peek("relay-test")?.balance?.expiresAt).toBe("2026-11-19T00:00:00.000Z");
 		expect(restarted.fetch).not.toHaveBeenCalled();
 	});

@@ -176,13 +176,13 @@ describe("TokenDance billing", () => {
 			]);
 			expect(result.status).toBe("paid");
 			expect(service.getTokenDanceBalance()).toMatchObject({ loading: true, balance: null });
-			const oldBalance = service.refreshTokenDanceBalance();
+			const oldBalance = service.refreshTokenDanceBalance().catch((error: unknown) => error);
 			await service.deleteTokenDanceConnection();
 			connectBilling();
 			fetchMock(() => json({ balance: { credits: 99, credits_used: 0, balance: 99 } }));
 			await service.refreshTokenDanceBalance();
 			finish(json({ balance: { credits: 1, credits_used: 0, balance: 1 } }));
-			await oldBalance;
+			expect(await oldBalance).toBeInstanceOf(Error);
 			expect(service.getTokenDanceBalance()).toMatchObject({ balance: 99, hasError: false });
 		} finally {
 			clearTimeout(timeout);
@@ -246,7 +246,7 @@ describe("TokenDance billing", () => {
 				? await createPayment(owner, input)
 				: await service.getTokenDancePaymentSession(owner, "pay-1");
 		expect(result.status).toBe("paid");
-		await service.refreshTokenDanceBalance();
+		await expect(service.refreshTokenDanceBalance()).rejects.toThrow("TokenDance");
 		expect(service.getTokenDanceBalance()).toMatchObject({ hasError: true, loading: false });
 		expect((await service.getTokenDancePaymentSession(owner, "pay-1")).status).toBe("paid");
 	});
@@ -430,7 +430,7 @@ describe("TokenDance billing", () => {
 			}
 			return json(paymentFixture({ status: paid ? "paid" : "pending" }));
 		});
-		const stale = service.refreshTokenDanceBalance();
+		const stale = service.refreshTokenDanceBalance().catch((error: unknown) => error);
 		await createPayment("fresh-balance-owner", {
 			amount: 10,
 			generation,
@@ -445,7 +445,7 @@ describe("TokenDance billing", () => {
 		await service.refreshTokenDanceBalance();
 		expect(service.getTokenDanceBalance()).toMatchObject({ balance: 99, hasError: false });
 		finish(json({ balance: { credits: 1, credits_used: 1, balance: 0 } }));
-		await stale;
+		expect(await stale).toBeInstanceOf(Error);
 		expect(service.getTokenDanceBalance()).toMatchObject({
 			balance: 99,
 			hasError: false,
@@ -477,7 +477,8 @@ describe("TokenDance billing", () => {
 				clock = 2500;
 				return json({ error: "billing-secret-key" }, 500);
 			});
-			if (operation === "balance") await service.refreshTokenDanceBalance();
+			if (operation === "balance")
+				await expect(service.refreshTokenDanceBalance()).rejects.toThrow("TokenDance");
 			else if (operation === "payment_create")
 				await expect(createPayment(`slow-${generation}`, input)).rejects.toThrow("TokenDance");
 			else await service.getTokenDancePaymentSession(`slow-${generation}`, "pay-1");
@@ -499,10 +500,10 @@ describe("TokenDance billing", () => {
 		});
 		try {
 			fetchMock(() => new Promise(() => {}));
-			const task = service.refreshTokenDanceBalance();
+			const task = service.refreshTokenDanceBalance().catch((error: unknown) => error);
 			clock = 2500;
 			await service.deleteTokenDanceConnection();
-			await task;
+			expect(await task).toBeInstanceOf(Error);
 			expect(warnings).toHaveLength(1);
 			expect(warnings[0]?.[1]).toMatchObject({ operation: "balance", elapsedMs: 2500 });
 			expect(JSON.stringify(warnings)).not.toContain("billing-secret-key");
@@ -556,10 +557,8 @@ describe("TokenDance billing", () => {
 	])("invalid balance stays null and failures are rate limited (%j)", async (balance) => {
 		connectBilling();
 		fetchMock(() => json({ balance }));
-		expect(await service.refreshTokenDanceBalance()).toMatchObject({
-			balance: null,
-			hasError: true,
-		});
+		await expect(service.refreshTokenDanceBalance()).rejects.toThrow("Invalid TokenDance balance");
+		expect(service.getTokenDanceBalance()).toMatchObject({ balance: null, hasError: true });
 		for (let i = 0; i < 10; i++) service.getTokenDanceBalance();
 		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
 	});
@@ -572,7 +571,7 @@ describe("TokenDance billing", () => {
 		Date.now = () => now + 30001;
 		fetchMock(() => json({ error: "billing-secret-key" }, 500));
 		expect(service.getTokenDanceBalance()).toMatchObject({ balance: 10, loading: true });
-		await service.refreshTokenDanceBalance();
+		await expect(service.refreshTokenDanceBalance()).rejects.toThrow("TokenDance");
 		expect(service.getTokenDanceBalance()).toMatchObject({
 			balance: 10,
 			loading: false,
@@ -589,10 +588,10 @@ describe("TokenDance billing", () => {
 					finish = resolve;
 				}),
 		);
-		const task = service.refreshTokenDanceBalance();
+		const task = service.refreshTokenDanceBalance().catch((error: unknown) => error);
 		await service.deleteTokenDanceConnection();
 		finish(json({ balance: { credits: 1, credits_used: 0, balance: 1 } }));
-		await task;
+		expect(await task).toBeInstanceOf(Error);
 		expect(service.getTokenDanceBalance()).toMatchObject({ balance: null, loading: false });
 	});
 	test("replacing only the key withdraws the old balance and rejects its late answer", async () => {
@@ -604,7 +603,7 @@ describe("TokenDance billing", () => {
 					finishOld = resolve;
 				}),
 		);
-		const oldTask = service.refreshTokenDanceBalance();
+		const oldTask = service.refreshTokenDanceBalance().catch((error: unknown) => error);
 		const current = fakeSettings.tokendance;
 		if (!current) throw new Error("TokenDance test connection missing");
 		fakeSettings.tokendance = { ...current, apiKey: "replacement-secret-key" };
@@ -612,7 +611,7 @@ describe("TokenDance billing", () => {
 		expect(service.getTokenDanceBalance()).toMatchObject({ balance: null, loading: true });
 		expect(await service.refreshTokenDanceBalance()).toMatchObject({ balance: 20 });
 		finishOld(json({ balance: { credits: 1, credits_used: 0, balance: 1 } }));
-		await oldTask;
+		expect(await oldTask).toBeInstanceOf(Error);
 		expect(service.getTokenDanceBalance()).toMatchObject({
 			balance: 20,
 			hasError: false,

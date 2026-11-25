@@ -7,23 +7,21 @@
  */
 import type { QuotaSnapshot } from "@shared/quota-snapshot";
 import type { ServiceTemplateId, SourceProtocol, SourceRegion } from "@shared/sourcing/identify";
-import { probeTokenDanceQuota, type TokenDanceSubject } from "../../services/tokendance-service";
-import type { CommandCodeProviderSettings } from "../agent/commandcode-provider";
+import {
+	getTokenDanceQuotaSnapshot,
+	refreshTokenDanceBalance,
+} from "../../services/tokendance-service";
 import { getCodexManager } from "../codex-manager";
 import { projectCodexUsageSnapshot } from "../codex-usage";
-import { type CommandCodeUsageSubject, probeCommandCodeQuota } from "../commandcode-usage";
+import { getCommandCodeQuotaSnapshot, refreshCommandCodeQuota } from "../commandcode-usage";
 import type { CredentialAuth } from "../credential-store";
-import { probeDeepSeekQuota } from "../deepseek-balance-cache";
-import { probeKimiQuota } from "../kimi-usage-cache";
-import { type NugQuotaSubject, probeNugQuota } from "../nug-quota-cache";
-import { probeOpencodeQuota } from "../opencode-usage-cache";
-import { probeRelayQuota } from "../provider-balance-cache";
-import type { UsageSubject } from "../provider-key-subjects";
-import type {
-	CustomApiProviderConfig,
-	NUGProviderConfig,
-	TokenDanceSettings,
-} from "../settings/types";
+import { getDeepSeekQuotaSnapshot, refreshDeepSeekBalance } from "../deepseek-balance-cache";
+import { getKimiQuotaSnapshot, refreshKimiKeyUsage } from "../kimi-usage-cache";
+import { getNugQuotaSnapshot, refreshNugQuota } from "../nug-quota-cache";
+import { getOpencodeQuotaSnapshot, refreshOpencodeKeyUsage } from "../opencode-usage-cache";
+import { providerBalanceCache } from "../provider-balance-cache";
+import { getProviderKeyStore } from "../provider-keys";
+import type { CustomApiProviderConfig } from "../settings/types";
 import type { SourceGroupView } from "./source-groups";
 
 export type { ServiceTemplateId } from "@shared/sourcing/identify";
@@ -35,13 +33,6 @@ export type ServiceTemplateKind = "known" | "api";
 export type AuthKind = CredentialAuth["kind"] | "opaque";
 
 export type ProtocolEndpoints = Partial<Record<SourceProtocol, string>>;
-
-type QuotaSubject = UsageSubject<
-	| CustomApiProviderConfig
-	| NUGProviderConfig
-	| TokenDanceSettings
-	| (CommandCodeProviderSettings & { apiKey: string })
->;
 
 export interface ServiceTemplate {
 	id: ServiceTemplateId;
@@ -61,15 +52,8 @@ export interface ServiceTemplate {
 	defaults?: Partial<Pick<CustomApiProviderConfig, "userAgentMode">>;
 	/** A user may add a personal credential here (S4). */
 	personal: boolean;
-	/**
-	 * Read one credential's allowance (sourcing/quota-store.ts keeps the result). Templates
-	 * without it have no quota to show. Throws when the upstream cannot answer.
-	 */
-	probeQuota?: (
-		group: SourceGroupView,
-		credential: QuotaSubject,
-		signal: AbortSignal,
-	) => Promise<QuotaSnapshot>;
+	/** Delegate to the source owner, preserving its cache, in-flight work and identity checks. */
+	probeQuota?: (group: SourceGroupView, credentialId: string) => Promise<QuotaSnapshot | undefined>;
 	/** A read-only projection when another canonical store owns the usage (Codex). */
 	projectQuota?: (credentialId: string) => QuotaSnapshot | undefined;
 }
@@ -81,19 +65,44 @@ type ProbeQuota = NonNullable<ServiceTemplate["probeQuota"]>;
  * their caches probe the group's first credential (§15.4). Relays are probed on every
  * endpoint that is not a dedicated service, official APIs included, as before.
  */
-// The template id on each caller determines which member of QuotaSubject it supplies.
-const custom = (credential: QuotaSubject): UsageSubject => credential as UsageSubject;
-const relay: ProbeQuota = (_group, credential, signal) =>
-	probeRelayQuota(custom(credential), signal);
+const relay: ProbeQuota = async (group, credentialId) => {
+	if (credentialId !== providerBalanceCache.quotaSnapshot(group.id)?.credentialId) return;
+	await providerBalanceCache.request(group.id, "refresh");
+	const quota = providerBalanceCache.quotaSnapshot(group.id);
+	return quota?.credentialId === credentialId ? quota.snapshot : undefined;
+};
 const QUOTA_PROBES: Partial<Record<ServiceTemplateId, ProbeQuota>> = {
-	"kimi-code": (_group, credential, signal) => probeKimiQuota(custom(credential), signal),
-	"opencode-go": (_group, credential, signal) => probeOpencodeQuota(custom(credential), signal),
-	deepseek: (_group, credential, signal) => probeDeepSeekQuota(custom(credential), signal),
-	tokendance: (_group, credential, signal) =>
-		probeTokenDanceQuota(credential as TokenDanceSubject, signal),
-	"command-code": (_group, credential, signal) =>
-		probeCommandCodeQuota(credential as CommandCodeUsageSubject, signal),
-	nug: (_group, credential, signal) => probeNugQuota(credential as NugQuotaSubject, signal),
+	"kimi-code": async (_group, credentialId) => {
+		await refreshKimiKeyUsage(credentialId);
+		return getKimiQuotaSnapshot(credentialId);
+	},
+	"opencode-go": async (_group, credentialId) => {
+		await refreshOpencodeKeyUsage(credentialId);
+		return getOpencodeQuotaSnapshot(credentialId);
+	},
+	deepseek: async (group, credentialId) => {
+		if (credentialId !== (getProviderKeyStore().list(group.id)[0]?.id ?? group.id)) return;
+		await refreshDeepSeekBalance(group.id);
+		return getDeepSeekQuotaSnapshot(group.id, credentialId);
+	},
+	tokendance: async (_group, credentialId) => {
+		if (credentialId !== getTokenDanceQuotaSnapshot()?.credentialId) return;
+		await refreshTokenDanceBalance();
+		const quota = getTokenDanceQuotaSnapshot();
+		return quota?.credentialId === credentialId ? quota.snapshot : undefined;
+	},
+	"command-code": async (_group, credentialId) => {
+		if (credentialId !== getCommandCodeQuotaSnapshot()?.credentialId) return;
+		await refreshCommandCodeQuota(true);
+		const quota = getCommandCodeQuotaSnapshot();
+		return quota?.credentialId === credentialId ? quota.snapshot : undefined;
+	},
+	nug: async (group, credentialId) => {
+		if (credentialId !== getNugQuotaSnapshot(group.id)?.credentialId) return;
+		await refreshNugQuota(group.id);
+		const quota = getNugQuotaSnapshot(group.id);
+		return quota?.credentialId === credentialId ? quota.snapshot : undefined;
+	},
 	openai: relay,
 	anthropic: relay,
 	gemini: relay,

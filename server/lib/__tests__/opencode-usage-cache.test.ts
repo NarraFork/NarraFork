@@ -49,9 +49,8 @@ const provider = (): CustomApiProviderConfig => ({
 let respond: () => Promise<Response> = async () => Response.json(body);
 
 const {
-	getAllOpencodeCachedUsages,
+	getOpencodeKeyUsages,
 	getOpencodeCachedUsage,
-	getOpencodeUsageGenerations,
 	isOpencodeCustomApiProvider,
 	isOpencodeUsageDue,
 	noteOpencodeUsageActivity,
@@ -235,7 +234,7 @@ describe("OpenCode Go usage", () => {
 			throw new Error("secret-test-key upstream private error");
 		};
 		await refreshStaleOpencodeUsages();
-		const cache = getAllOpencodeCachedUsages()["opencode-test"];
+		const cache = getOpencodeKeyUsages()["opencode-test"];
 		expect(cache?.rolling?.percent).toBe(37);
 		// Never copy transport exceptions, response text, or credentials to the API.
 		expect(cache?.error).toBe("OpenCode usage request failed");
@@ -257,7 +256,6 @@ describe("OpenCode Go usage", () => {
 			const pending = deferred();
 			respond = () => pending.promise;
 			const first = refreshOpencodeUsage("opencode-test");
-			const oldGeneration = getOpencodeUsageGenerations()["opencode-test"];
 			const config = settings.customApiProviders?.[0];
 			if (!config) throw new Error("missing fixture");
 			if (change === "apiKey") config.apiKey = "new-account";
@@ -268,21 +266,16 @@ describe("OpenCode Go usage", () => {
 			if (change === "globalProxy")
 				settings.proxy = { mode: "custom", url: "http://localhost:4321" };
 			if (change === "remove") settings.customApiProviders = [];
-			const current = getAllOpencodeCachedUsages();
-			expect(getOpencodeUsageGenerations()["opencode-test"]).not.toBe(oldGeneration);
-			expect(current["opencode-test"]?.generation).toBe(
-				getOpencodeUsageGenerations()["opencode-test"],
-			);
+			const current = getOpencodeKeyUsages();
 			expect(current["opencode-test"]?.rolling ?? null).toBeNull();
 			pending.resolve(Response.json(body));
 			expect(await first).toBeNull();
-			expect(getAllOpencodeCachedUsages()["opencode-test"]?.rolling ?? null).toBeNull();
+			expect(getOpencodeKeyUsages()["opencode-test"]?.rolling ?? null).toBeNull();
 		});
 	}
 
 	test("switching protocol keeps the allowance: it does not change what the endpoint returns", async () => {
 		await refreshOpencodeUsage("opencode-test");
-		const generation = getOpencodeUsageGenerations()["opencode-test"];
 		const fetchSpy = spyOn(outbound, "outboundFetch").mockImplementation(async () => respond());
 		// Count relative to here: `beforeEach` installs a spy and the refresh above ran
 		// through it, so an absolute call count would be pre-loaded.
@@ -292,36 +285,25 @@ describe("OpenCode Go usage", () => {
 		// `protocol` part of the identity, this would rotate the generation, reset the entry
 		// to `fetchedAt: 0`, and make the stale sweep below re-fetch it.
 		settings.customApiProviders = [{ ...provider(), protocol: "anthropic-messages" }];
-		expect(getOpencodeUsageGenerations()["opencode-test"]).toBe(generation);
-		expect(getAllOpencodeCachedUsages()["opencode-test"]?.rolling?.percent).toBe(37);
+		expect(getOpencodeKeyUsages()["opencode-test"]?.rolling?.percent).toBe(37);
 		await refreshStaleOpencodeUsages();
 		expect(fetchSpy.mock.calls.length).toBe(callsSoFar);
 	});
 
-	test("generations stay stable across reads and unrelated edits, and never encode credentials", async () => {
-		const original = getOpencodeUsageGenerations()["opencode-test"];
-		expect(original).toMatch(/^[\da-f-]{36}$/);
+	test("unrelated display edits retain the existing allowance", async () => {
 		await refreshOpencodeUsage("opencode-test");
 		settings.customApiProviders = [{ ...provider(), name: "Renamed" }];
-		expect(getOpencodeUsageGenerations()["opencode-test"]).toBe(original);
-		settings.customApiProviders = [{ ...provider(), apiKey: "second-account" }];
-		const second = getOpencodeUsageGenerations()["opencode-test"];
-		expect(second).not.toBe(original);
-		settings.customApiProviders = [provider()];
-		const third = getOpencodeUsageGenerations()["opencode-test"];
-		expect(third).not.toBe(original);
-		expect(third).not.toBe(second);
-		expect(JSON.stringify(getOpencodeUsageGenerations())).not.toContain(provider().apiKey);
+		expect(getOpencodeCachedUsage("opencode-test")?.rolling?.percent).toBe(37);
 	});
 
 	test("a completed allowance disappears on credential change, disable and removal", async () => {
 		await refreshOpencodeUsage("opencode-test");
-		expect(getAllOpencodeCachedUsages()["opencode-test"]?.rolling?.percent).toBe(37);
+		expect(getOpencodeKeyUsages()["opencode-test"]?.rolling?.percent).toBe(37);
 		settings.customApiProviders = [{ ...provider(), apiKey: "other-account" }];
-		expect(getAllOpencodeCachedUsages()["opencode-test"]?.rolling ?? null).toBeNull();
+		expect(getOpencodeKeyUsages()["opencode-test"]?.rolling ?? null).toBeNull();
 		await refreshOpencodeUsage("opencode-test");
 		settings.customApiProviders = [{ ...provider(), disabled: true }];
-		expect(getAllOpencodeCachedUsages()).toEqual({});
+		expect(getOpencodeKeyUsages()).toEqual({});
 		settings.customApiProviders = [];
 		expect(await refreshOpencodeUsage("opencode-test")).toBeNull();
 	});
@@ -334,7 +316,7 @@ describe("OpenCode Go usage", () => {
 		];
 		const fetchSpy = spyOn(outbound, "outboundFetch").mockImplementation(async () => respond());
 		await refreshAllOpencodeUsages();
-		expect(getAllOpencodeCachedUsages()).toEqual({});
+		expect(getOpencodeKeyUsages()).toEqual({});
 		expect(fetchSpy).not.toHaveBeenCalled();
 	});
 
@@ -380,7 +362,7 @@ describe("OpenCode Go usage", () => {
 	 */
 	test("rejects an oversized declared length and an oversized streamed body", async () => {
 		await refreshOpencodeUsage("opencode-test");
-		expect(getAllOpencodeCachedUsages()["opencode-test"]?.rolling?.percent).toBe(37);
+		expect(getOpencodeKeyUsages()["opencode-test"]?.rolling?.percent).toBe(37);
 
 		// A small, valid body that LIES about its length: only the declared-length branch
 		// can refuse it, since the body itself would parse fine.
@@ -412,7 +394,7 @@ describe("OpenCode Go usage", () => {
 		respond = async () => streamed;
 		await refreshOpencodeUsage("opencode-test");
 
-		const cache = getAllOpencodeCachedUsages()["opencode-test"];
+		const cache = getOpencodeKeyUsages()["opencode-test"];
 		expect(cache?.error).toBe("OpenCode usage request failed");
 		// The oversized body was never applied: the previous allowance survived, so an
 		// under-reported length cannot smuggle a truncated reading into the display.

@@ -159,7 +159,10 @@ export function parseSub2ApiBalance(body) {
 			const total = subscription[`${window}_limit_usd`];
 			const used = subscription[`${window}_usage_usd`];
 			if (total === undefined || total === null) continue;
-			if (!finite(total) || total < 0 || !finite(used) || used < 0) return null;
+			if (!finite(total) || total < 0) return null;
+			// Zero means no period cap was configured, not a zero-dollar allowance.
+			if (total === 0) continue;
+			if (!finite(used) || used < 0) return null;
 			const remaining = total - used;
 			if (!finite(remaining)) return null;
 			const amount = { unit: "USD", remaining, used, total, window };

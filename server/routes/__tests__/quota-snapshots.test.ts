@@ -14,6 +14,7 @@ import {
 	publicQuotaSnapshot,
 	readQuotaSnapshots,
 	refreshCommandCodeCliQuota,
+	waitForTokenDanceQuotaRefresh,
 } from "../../lib/sourcing/quota-snapshots";
 import { quotaStore, STREAM_QUOTA_SOURCE } from "../../lib/sourcing/quota-store";
 import * as templates from "../../lib/sourcing/templates";
@@ -313,6 +314,42 @@ describe("unified quota API", () => {
 		const response = await request;
 		expect(response.status).toBe(200);
 		expect(byGroup(await response.json(), "tokendance")[0].snapshot?.hasError).toBe(false);
+	});
+	test("explicit TokenDance refresh propagates a source failure instead of succeeding with stale balance", async () => {
+		saveSettings({
+			...settings,
+			tokendance: { apiKey: "td-private", generation: 0, disabled: false },
+		});
+		spyOn(tokenDance, "refreshTokenDanceBalance").mockRejectedValue(
+			new AppError("Balance unavailable", 502, "BALANCE_UNAVAILABLE"),
+		);
+		const response = await refresh("admin", { groupId: "tokendance" });
+		expect(response.status).toBe(502);
+		expect(await response.json()).toEqual({ error: "BALANCE_UNAVAILABLE" });
+	});
+	test("TokenDance waiting can be cancelled without waiting for a stalled source", async () => {
+		const controller = new AbortController();
+		const waiting = waitForTokenDanceQuotaRefresh(new Promise(() => {}), controller.signal);
+		controller.abort();
+		await expect(waiting).rejects.toHaveProperty("code", "QUOTA_REFRESH_CANCELLED");
+	});
+	test("TokenDance waiting has a controlled deadline even when the source never settles", async () => {
+		let expire: (() => void) | undefined;
+		const nativeTimeout = globalThis.setTimeout;
+		const timer = spyOn(globalThis, "setTimeout").mockImplementation(((
+			callback: () => void,
+			ms: number,
+		) => {
+			if (ms === 15_000) expire = callback;
+			return nativeTimeout(callback, ms);
+		}) as typeof setTimeout);
+		try {
+			const waiting = waitForTokenDanceQuotaRefresh(new Promise(() => {}));
+			expire?.();
+			await expect(waiting).rejects.toHaveProperty("code", "QUOTA_REFRESH_TIMEOUT");
+		} finally {
+			timer.mockRestore();
+		}
 	});
 	test("ordinary Codex API aggregates Plus five-hour and Team monthly plans by applicable window", async () => {
 		const manager = getCodexManager();

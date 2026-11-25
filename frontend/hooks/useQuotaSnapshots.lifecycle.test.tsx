@@ -1,17 +1,10 @@
 import { afterAll, afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import type { QuotaSnapshotEntry, QuotaSnapshotsResponse } from "@shared/quota-snapshot";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { QueryClient } from "@tanstack/react-query";
 import { parseHTML } from "linkedom";
 import { act, StrictMode } from "react";
 import type { Root } from "react-dom/client";
 import { api } from "../lib/api";
-import {
-	invalidateQuotaSnapshots,
-	quotaSnapshotsKey,
-	quotaSnapshotsOptions,
-	useCommandCodeCliQuota,
-	useRefreshQuotaSnapshots,
-} from "./useQuotaSnapshots";
 
 const originals = new Map<string, PropertyDescriptor | undefined>();
 const { window } = parseHTML("<!doctype html><html><body></body></html>");
@@ -27,11 +20,22 @@ for (const [key, value] of Object.entries({
 	originals.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
 	Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
 }
+const { QueryClient: Client, QueryClientProvider } = await import("@tanstack/react-query");
+const {
+	commandCodeCliQuotaKey,
+	invalidateQuotaSnapshots,
+	quotaSnapshotsKey,
+	quotaSnapshotsOptions,
+	useCommandCodeCliQuota,
+	useQuotaSnapshots,
+	useRefreshQuotaSnapshots,
+} = await import("./useQuotaSnapshots");
 const { createRoot } = await import("react-dom/client");
 let root: Root;
 let container: HTMLElement;
 let qc: QueryClient;
 let mutation: ReturnType<typeof useRefreshQuotaSnapshots>;
+let visible: QuotaSnapshotsResponse | undefined;
 let read: ReturnType<typeof spyOn<typeof api, "quotaSnapshots">>;
 let refresh: ReturnType<typeof spyOn<typeof api, "refreshQuotaSnapshots">>;
 function cli(
@@ -58,31 +62,47 @@ const known = {
 function Harness({ enabled, identity = "A" }: { enabled: boolean; identity?: string }) {
 	mutation = useRefreshQuotaSnapshots(identity);
 	useCommandCodeCliQuota(enabled);
+	visible = useQuotaSnapshots(false).data;
 	return null;
 }
-async function settle() {
-	await act(async () => {
-		await new Promise((resolve) => setTimeout(resolve, 5));
-	});
+async function waitFor(condition: () => boolean) {
+	for (let attempt = 0; attempt < 100; attempt++) {
+		await act(async () => {
+			await new Promise((resolve) => setTimeout(resolve, 0));
+		});
+		if (condition()) return;
+	}
+	throw new Error("Quota state did not settle");
 }
-async function mount(enabled: boolean, readers = 1) {
+async function mount(enabled: boolean, readers = 1, identity = "A") {
 	await act(() =>
 		root.render(
 			<QueryClientProvider client={qc}>
 				<StrictMode>
-					<Harness enabled={enabled} />
-					{readers > 1 && <Harness enabled={enabled} />}
+					<Harness enabled={enabled} identity={identity} />
+					{readers > 1 && <Harness enabled={enabled} identity={identity} />}
 				</StrictMode>
 			</QueryClientProvider>,
 		),
 	);
-	await settle();
 }
+function deferredRefresh() {
+	const requests: { signal?: AbortSignal; complete: (value: QuotaSnapshotsResponse) => void }[] =
+		[];
+	refresh.mockImplementation(
+		(_target, options) =>
+			new Promise((complete) => {
+				requests.push({ signal: options?.signal, complete });
+			}),
+	);
+	return requests;
+}
+const displayed = () => visible?.entries.find((entry) => entry.groupId === "CommandCode");
 beforeEach(() => {
 	container = document.createElement("div");
 	document.body.appendChild(container);
 	root = createRoot(container);
-	qc = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: Infinity } } });
+	qc = new Client({ defaultOptions: { queries: { retry: false, gcTime: Infinity } } });
 	qc.setQueryData(quotaSnapshotsKey, { entries: [cli()] });
 	read = spyOn(api, "quotaSnapshots").mockResolvedValue({ entries: [cli()] });
 	refresh = spyOn(api, "refreshQuotaSnapshots").mockResolvedValue({ entries: [cli("A", known)] });
@@ -101,18 +121,17 @@ afterAll(() => {
 	}
 });
 
-test("only an explicitly active CLI surface refreshes, sharing one request across readers and StrictMode", async () => {
+test("active surfaces share an ephemeral result without writing it into GET", async () => {
 	await mount(false, 2);
 	expect(refresh).not.toHaveBeenCalled();
 	await mount(true, 2);
-	expect(refresh).toHaveBeenCalledTimes(1);
-	expect(refresh.mock.calls[0]?.[0]).toEqual({ groupId: "CommandCode" });
-	expect(qc.getQueryData<QuotaSnapshotsResponse>(quotaSnapshotsKey)?.entries[0]?.snapshot).toEqual(
-		known,
-	);
+	await waitFor(() => displayed()?.snapshot?.balances[0]?.remaining === 3);
+	expect(qc.getQueryData<QuotaSnapshotsResponse>(quotaSnapshotsKey)?.entries).toEqual([cli()]);
+	await mount(true, 1);
+	expect(displayed()?.snapshot).toEqual(known);
 });
 
-test("an ordinary anonymous account is not mistaken for a CLI identity", async () => {
+test("anonymous non-CLI accounts never initiate a CLI probe", async () => {
 	qc.setQueryData(quotaSnapshotsKey, {
 		entries: [{ ...cli(), refreshOnRead: undefined, generation: undefined }],
 	});
@@ -120,233 +139,317 @@ test("an ordinary anonymous account is not mistaken for a CLI identity", async (
 	expect(refresh).not.toHaveBeenCalled();
 });
 
-test("CLI failure does not retry on a poll, but a new activation can retry once", async () => {
+test("failed CLI reads do not retry on ordinary polling; reactivation may recover", async () => {
 	refresh.mockRejectedValue(new Error("offline"));
 	await mount(true);
-	expect(refresh).toHaveBeenCalledTimes(1);
+	await waitFor(() => qc.getQueryState(commandCodeCliQuotaKey(cli()))?.status === "error");
+	refresh.mockResolvedValue({ entries: [cli("A", known)] });
 	await act(async () => {
 		await qc.invalidateQueries({ queryKey: quotaSnapshotsKey });
 	});
-	await settle();
-	expect(refresh).toHaveBeenCalledTimes(1);
+	expect(displayed()?.snapshot).toBeNull();
+	expect(qc.getQueryState(commandCodeCliQuotaKey(cli()))?.status).toBe("error");
 	await mount(false);
 	await mount(true);
-	expect(refresh).toHaveBeenCalledTimes(2);
+	await waitFor(() => displayed()?.snapshot?.balances[0]?.remaining === 3);
 });
 
-test("same-generation CLI snapshots survive GET while changed identities drop their old balance", async () => {
-	qc.setQueryData(quotaSnapshotsKey, { entries: [cli("A", known)] });
-	let result = await qc.fetchQuery({ ...quotaSnapshotsOptions(true, qc), staleTime: 0 });
-	expect(result.entries[0]?.snapshot).toEqual(known);
-	read.mockResolvedValue({ entries: [cli("B")] });
-	result = await qc.fetchQuery({ ...quotaSnapshotsOptions(true, qc), staleTime: 0 });
-	expect(result.entries[0]?.snapshot).toBeNull();
-});
-
-test("CLI generation changes cancel the old probe and ignore a late response", async () => {
-	const completions: ((value: QuotaSnapshotsResponse) => void)[] = [];
-	refresh.mockImplementation(() => new Promise((resolve) => completions.push(resolve)));
-	await mount(true);
-	const oldSignal = refresh.mock.calls[0]?.[1]?.signal;
-	await act(() => {
-		qc.setQueryData(quotaSnapshotsKey, { entries: [cli("B")] });
-	});
-	await settle();
-	expect(refresh).toHaveBeenCalledTimes(2);
-	expect(oldSignal?.aborted).toBe(true);
-	await act(() => {
-		completions[0]?.({ entries: [cli("A", known)] });
-	});
-	await settle();
-	expect(qc.getQueryData<QuotaSnapshotsResponse>(quotaSnapshotsKey)?.entries[0]?.generation).toBe(
-		"B",
-	);
-	await act(() => {
-		completions[1]?.({ entries: [cli("B", known)] });
-	});
-	await settle();
-	expect(qc.getQueryData<QuotaSnapshotsResponse>(quotaSnapshotsKey)?.entries[0]?.snapshot).toEqual(
-		known,
-	);
-});
-
-test("active CLI quota refreshes after sixty seconds even when GET data is structurally unchanged", async () => {
-	let clock = Date.now();
-	const now = spyOn(Date, "now").mockImplementation(() => clock);
-	try {
-		refresh.mockResolvedValueOnce({ entries: [cli("A", { ...known, fetchedAt: clock })] });
-		await mount(true);
-		expect(refresh).toHaveBeenCalledTimes(1);
-		clock += 61_000;
-		refresh.mockResolvedValueOnce({
-			entries: [
-				cli("A", { ...known, fetchedAt: clock, balances: [{ unit: "credits", remaining: 7 }] }),
-			],
-		});
-		await act(async () => {
-			await qc.invalidateQueries({ queryKey: quotaSnapshotsKey });
-		});
-		await settle();
-		expect(refresh).toHaveBeenCalledTimes(2);
-		expect(
-			qc.getQueryData<QuotaSnapshotsResponse>(quotaSnapshotsKey)?.entries[0]?.snapshot?.balances[0]
-				?.remaining,
-		).toBe(7);
-		clock += 61_000;
-		refresh.mockRejectedValue(new Error("offline"));
-		await act(async () => {
-			await qc.invalidateQueries({ queryKey: quotaSnapshotsKey });
-		});
-		await settle();
-		expect(refresh).toHaveBeenCalledTimes(3);
-		clock += 61_000;
-		await act(async () => {
-			await qc.invalidateQueries({ queryKey: quotaSnapshotsKey });
-		});
-		await settle();
-		expect(refresh).toHaveBeenCalledTimes(3);
-	} finally {
-		now.mockRestore();
-	}
-});
-
-test("closing the final CLI surface aborts pending work and ignores a late result", async () => {
-	let complete: ((value: QuotaSnapshotsResponse) => void) | undefined;
-	refresh.mockImplementation(
-		() =>
-			new Promise((resolve) => {
-				complete = resolve;
-			}),
-	);
-	await mount(true);
-	const signal = refresh.mock.calls[0]?.[1]?.signal;
-	await mount(false);
-	expect(signal?.aborted).toBe(true);
-	await act(() => {
-		complete?.({ entries: [cli("A", known)] });
-	});
-	await settle();
-	expect(
-		qc.getQueryData<QuotaSnapshotsResponse>(quotaSnapshotsKey)?.entries[0]?.snapshot,
-	).toBeNull();
-});
-
-test("refreshing another group preserves only the same-generation CLI result and removes deleted keys", async () => {
-	qc.setQueryData(quotaSnapshotsKey, {
-		entries: [cli("A", known), { ...cli("deleted"), groupId: "deleted", refreshOnRead: false }],
-	});
-	refresh.mockResolvedValue({ entries: [cli("A")] });
+test("server polls retain same-generation display and remove changed identities", async () => {
+	qc.setQueryData(commandCodeCliQuotaKey(cli()), cli("A", known));
 	await mount(false);
 	await act(async () => {
-		await mutation.mutateAsync({ groupId: "tokendance" });
+		await qc.fetchQuery({ ...quotaSnapshotsOptions(true, qc), staleTime: 0 });
 	});
-	expect(qc.getQueryData<QuotaSnapshotsResponse>(quotaSnapshotsKey)?.entries).toEqual([
-		cli("A", known),
-	]);
-	refresh.mockResolvedValue({ entries: [cli("B")] });
-	await act(async () => {
-		await mutation.mutateAsync({ groupId: "tokendance" });
-	});
-	expect(qc.getQueryData<QuotaSnapshotsResponse>(quotaSnapshotsKey)?.entries).toEqual([cli("B")]);
-});
-
-test("a GET observing a changed CLI generation cancels a delayed manual refresh from the old identity", async () => {
-	let complete: ((value: QuotaSnapshotsResponse) => void) | undefined;
-	refresh.mockImplementation(
-		() =>
-			new Promise((resolve) => {
-				complete = resolve;
-			}),
+	await waitFor(
+		() => displayed()?.snapshot === known || displayed()?.snapshot?.balances[0]?.remaining === 3,
 	);
-	await mount(false);
-	const pending = mutation.mutateAsync({ groupId: "CommandCode" }).catch((error: unknown) => error);
-	await settle();
-	const signal = refresh.mock.calls[0]?.[1]?.signal;
 	read.mockResolvedValue({ entries: [cli("B")] });
 	await act(async () => {
 		await qc.fetchQuery({ ...quotaSnapshotsOptions(true, qc), staleTime: 0 });
 	});
-	expect(signal?.aborted).toBe(true);
-	await act(() => {
-		complete?.({ entries: [cli("A", known)] });
-	});
-	await pending;
-	await settle();
-	expect(qc.getQueryData<QuotaSnapshotsResponse>(quotaSnapshotsKey)?.entries).toEqual([cli("B")]);
+	await waitFor(() => displayed()?.generation === "B");
+	expect(displayed()?.snapshot).toBeNull();
 });
 
-test.each([
-	true,
-	false,
-])("a newer-identity manual POST fences a delayed older POST (prior cache=%s)", async (priorCache) => {
-	if (!priorCache) qc.setQueryData(quotaSnapshotsKey, { entries: [] });
-	const completions: ((value: QuotaSnapshotsResponse) => void)[] = [];
-	refresh.mockImplementation(() => new Promise((resolve) => completions.push(resolve)));
-	await mount(false);
-	const older = mutation.mutateAsync({ groupId: "CommandCode" }).catch((error: unknown) => error);
-	await settle();
-	const newer = mutation.mutateAsync({ groupId: "CommandCode" });
-	await settle();
-	expect(refresh).toHaveBeenCalledTimes(2);
+test("generation changes cancel old probes and late responses cannot cross accounts", async () => {
+	const requests = deferredRefresh();
+	await mount(true);
+	await waitFor(() => requests.some((request) => !request.signal?.aborted));
+	const old = requests.find((request) => !request.signal?.aborted);
 	await act(() => {
-		completions[1]?.({ entries: [cli("B", known)] });
+		qc.setQueryData(quotaSnapshotsKey, { entries: [cli("B")] });
 	});
-	await newer;
-	expect(qc.getQueryData<QuotaSnapshotsResponse>(quotaSnapshotsKey)?.entries).toEqual([
-		cli("B", known),
-	]);
+	await waitFor(
+		() => old?.signal?.aborted === true && requests.some((request) => !request.signal?.aborted),
+	);
+	const current = requests.find((request) => !request.signal?.aborted);
 	await act(() => {
-		completions[0]?.({ entries: [cli("A", known)] });
+		old?.complete({ entries: [cli("A", known)] });
 	});
-	await older;
-	await settle();
-	expect(qc.getQueryData<QuotaSnapshotsResponse>(quotaSnapshotsKey)?.entries).toEqual([
-		cli("B", known),
-	]);
+	expect(displayed()?.generation).toBe("B");
+	expect(displayed()?.snapshot).toBeNull();
+	await act(() => {
+		current?.complete({ entries: [cli("B", known)] });
+	});
+	await waitFor(() => displayed()?.snapshot?.balances[0]?.remaining === 3);
 });
 
-test("a successful manual CLI refresh recovers the automatic reader after an earlier failure", async () => {
+test("Query freshness reuses sixty-second data and refreshes stale data on activation", async () => {
 	let clock = Date.now();
 	const now = spyOn(Date, "now").mockImplementation(() => clock);
 	try {
-		refresh.mockRejectedValueOnce(new Error("offline"));
 		await mount(true);
-		expect(refresh).toHaveBeenCalledTimes(1);
-		await act(async () => {
-			await mutation.mutateAsync({ groupId: "CommandCode" });
+		await waitFor(() => displayed()?.snapshot?.balances[0]?.remaining === 3);
+		await mount(false);
+		refresh.mockResolvedValue({
+			entries: [cli("A", { ...known, balances: [{ unit: "credits", remaining: 7 }] })],
 		});
-		expect(refresh).toHaveBeenCalledTimes(2);
+		await mount(true);
+		expect(displayed()?.snapshot?.balances[0]?.remaining).toBe(3);
+		await mount(false);
 		clock += 61_000;
-		await act(async () => {
-			await qc.invalidateQueries({ queryKey: quotaSnapshotsKey });
-		});
-		await settle();
-		expect(refresh).toHaveBeenCalledTimes(3);
+		await mount(true);
+		await waitFor(() => displayed()?.snapshot?.balances[0]?.remaining === 7);
 	} finally {
 		now.mockRestore();
 	}
 });
 
-test("credential invalidation cancels every old refresh and cannot resurrect deleted entries", async () => {
-	let complete: ((value: QuotaSnapshotsResponse) => void) | undefined;
-	refresh.mockImplementation(
+test("active Query polling stops on failure and manual recovery restarts it", async () => {
+	let clock = Date.now();
+	const now = spyOn(Date, "now").mockImplementation(() => clock);
+	const intervals = new Map<ReturnType<typeof setInterval>, () => void>();
+	const nativeInterval = globalThis.setInterval;
+	const nativeClear = globalThis.clearInterval;
+	const timer = spyOn(globalThis, "setInterval").mockImplementation(((
+		callback: () => void,
+		ms: number,
+	) => {
+		const id = nativeInterval(callback, ms);
+		if (ms === 60_000) intervals.set(id, callback);
+		return id;
+	}) as typeof setInterval);
+	const clear = spyOn(globalThis, "clearInterval").mockImplementation((id) => {
+		intervals.delete(id as ReturnType<typeof setInterval>);
+		nativeClear(id as ReturnType<typeof setInterval>);
+	});
+	const tick = async () => {
+		clock += 61_000;
+		await act(() => {
+			for (const callback of [...intervals.values()]) callback();
+		});
+	};
+	try {
+		await mount(true);
+		await waitFor(() => displayed()?.snapshot?.balances[0]?.remaining === 3);
+		refresh.mockResolvedValue({
+			entries: [cli("A", { ...known, balances: [{ unit: "credits", remaining: 7 }] })],
+		});
+		await tick();
+		await waitFor(() => displayed()?.snapshot?.balances[0]?.remaining === 7);
+		refresh.mockRejectedValue(new Error("offline"));
+		await tick();
+		await waitFor(() => qc.getQueryState(commandCodeCliQuotaKey(cli()))?.status === "error");
+		expect(intervals.size).toBe(0);
+		await act(async () => {
+			await qc.invalidateQueries({ queryKey: quotaSnapshotsKey });
+		});
+		expect(qc.getQueryState(commandCodeCliQuotaKey(cli()))?.status).toBe("error");
+		refresh.mockResolvedValue({ entries: [cli("A", known)] });
+		await act(async () => {
+			await mutation.mutateAsync({ groupId: "CommandCode" });
+		});
+		await waitFor(() => displayed()?.snapshot?.balances[0]?.remaining === 3);
+		expect(intervals.size).toBeGreaterThan(0);
+	} finally {
+		for (const id of intervals.keys()) nativeClear(id);
+		timer.mockRestore();
+		clear.mockRestore();
+		now.mockRestore();
+	}
+});
+
+test("the last active reader cancels even while passive quota displays remain mounted", async () => {
+	const requests = deferredRefresh();
+	await mount(true, 2);
+	await waitFor(() => requests.some((request) => !request.signal?.aborted));
+	const pending = requests.find((request) => !request.signal?.aborted);
+	await mount(true, 1);
+	expect(pending?.signal?.aborted).toBe(false);
+	await mount(false);
+	expect(pending?.signal?.aborted).toBe(true);
+	await act(() => {
+		pending?.complete({ entries: [cli("A", known)] });
+	});
+	expect(displayed()?.snapshot).toBeNull();
+});
+
+test("another group's refresh removes deleted entries but retains only matching CLI data", async () => {
+	qc.setQueryData(commandCodeCliQuotaKey(cli()), cli("A", known));
+	qc.setQueryData(quotaSnapshotsKey, {
+		entries: [cli(), { ...cli(), groupId: "deleted", refreshOnRead: false }],
+	});
+	refresh.mockResolvedValue({ entries: [cli()] });
+	await mount(false);
+	await act(async () => {
+		await mutation.mutateAsync({ groupId: "tokendance" });
+	});
+	await waitFor(() => visible?.entries.length === 1);
+	expect(displayed()?.snapshot).toEqual(known);
+	refresh.mockResolvedValue({ entries: [cli("B")] });
+	await act(async () => {
+		await mutation.mutateAsync({ groupId: "tokendance" });
+	});
+	await waitFor(() => displayed()?.generation === "B");
+	expect(displayed()?.snapshot).toBeNull();
+});
+
+test("a normal GET updating another source does not discard the pending manual refresh", async () => {
+	const source: QuotaSnapshotEntry = {
+		...cli(),
+		groupId: "tokendance",
+		templateId: "tokendance",
+		credentialId: "td-key",
+		refreshOnRead: false,
+		generation: undefined,
+		snapshot: known,
+	};
+	qc.setQueryData(quotaSnapshotsKey, { entries: [cli(), source] });
+	const requests = deferredRefresh();
+	await mount(false);
+	const pending = mutation.mutateAsync({ groupId: "tokendance" });
+	await waitFor(() => requests.length > 0);
+	read.mockResolvedValue({ entries: [cli(), { ...source, refreshing: true }] });
+	await act(async () => {
+		await qc.fetchQuery({ ...quotaSnapshotsOptions(true, qc), staleTime: 0 });
+	});
+	await waitFor(
 		() =>
-			new Promise((resolve) => {
-				complete = resolve;
-			}),
+			visible?.entries.some((entry) => entry.groupId === "tokendance" && entry.refreshing) === true,
 	);
+	expect(requests[0]?.signal?.aborted).toBe(false);
+	const refreshed = {
+		...source,
+		snapshot: { ...known, balances: [{ unit: "credits", remaining: 9 }] },
+	};
+	await act(async () => {
+		requests[0]?.complete({ entries: [cli(), refreshed] });
+		await pending;
+	});
+	await waitFor(
+		() =>
+			visible?.entries.find((entry) => entry.groupId === "tokendance")?.snapshot?.balances[0]
+				?.remaining === 9,
+	);
+});
+
+test.each([
+	"generation",
+	"credentials",
+	"component",
+])("%s changes cancel delayed manual refreshes", async (change) => {
+	const requests = deferredRefresh();
 	await mount(false);
 	const pending = mutation.mutateAsync({ groupId: "CommandCode" }).catch((error: unknown) => error);
-	await settle();
-	const signal = refresh.mock.calls[0]?.[1]?.signal;
+	await waitFor(() => requests.length > 0);
+	if (change === "generation") {
+		read.mockResolvedValue({ entries: [cli("B")] });
+		await act(async () => {
+			await qc.fetchQuery({ ...quotaSnapshotsOptions(true, qc), staleTime: 0 });
+		});
+	} else if (change === "credentials") {
+		await act(async () => {
+			await invalidateQuotaSnapshots(qc);
+		});
+	} else await mount(false, 1, "B");
+	expect(requests[0]?.signal?.aborted).toBe(true);
+	await act(async () => {
+		requests[0]?.complete({ entries: [cli("A", known)] });
+		await pending;
+	});
+	expect(displayed()?.snapshot ?? null).toBeNull();
+});
+
+test("closing an unrelated refresh surface does not cancel the request owner", async () => {
+	const requests = deferredRefresh();
+	await mount(false);
+	const pending = mutation.mutateAsync({ groupId: "CommandCode" });
+	await waitFor(() => requests.length > 0);
+	await mount(false, 2);
+	await mount(false, 1);
+	expect(requests[0]?.signal?.aborted).toBe(false);
+	await act(async () => {
+		requests[0]?.complete({ entries: [cli("A", known)] });
+		await pending;
+	});
+	await waitFor(() => displayed()?.snapshot?.balances[0]?.remaining === 3);
+});
+
+test("a newer manual refresh supersedes a delayed older request", async () => {
+	const requests = deferredRefresh();
+	await mount(false);
+	const older = mutation.mutateAsync({ groupId: "CommandCode" }).catch((error: unknown) => error);
+	await waitFor(() => requests.length > 0);
+	const newer = mutation.mutateAsync({ groupId: "CommandCode" });
+	await waitFor(() => requests.length > 1);
+	expect(requests[0]?.signal?.aborted).toBe(true);
+	await act(async () => {
+		requests[1]?.complete({ entries: [cli("B", known)] });
+		await newer;
+	});
+	await waitFor(() => displayed()?.generation === "B" && !!displayed()?.snapshot);
+	await act(async () => {
+		requests[0]?.complete({ entries: [cli("A", known)] });
+		await older;
+	});
+	expect(displayed()?.generation).toBe("B");
+	expect(displayed()?.snapshot).toEqual(known);
+});
+
+test("credential invalidation does not detach a still-active same-generation CLI observer", async () => {
+	await mount(true);
+	await waitFor(() => displayed()?.snapshot?.balances[0]?.remaining === 3);
+	refresh.mockResolvedValue({
+		entries: [cli("A", { ...known, balances: [{ unit: "credits", remaining: 9 }] })],
+	});
 	await act(async () => {
 		await invalidateQuotaSnapshots(qc);
 	});
-	expect(signal?.aborted).toBe(true);
-	await act(() => {
-		complete?.({ entries: [cli("old-identity", known)] });
+	await waitFor(() => displayed()?.snapshot?.balances[0]?.remaining === 9);
+});
+
+test("credential invalidation also fences manual results without a CLI generation", async () => {
+	const entry = {
+		...cli(),
+		groupId: "plain",
+		credentialId: "old-key",
+		refreshOnRead: false,
+		generation: undefined,
+	};
+	qc.setQueryData(quotaSnapshotsKey, { entries: [entry] });
+	const requests = deferredRefresh();
+	await mount(false);
+	const pending = mutation.mutateAsync({ groupId: "plain" }).catch((error: unknown) => error);
+	await waitFor(() => requests.length > 0);
+	await act(async () => {
+		await invalidateQuotaSnapshots(qc);
 	});
-	await pending;
-	await settle();
+	await act(async () => {
+		requests[0]?.complete({ entries: [{ ...entry, snapshot: known }] });
+		await pending;
+	});
+	expect(requests[0]?.signal?.aborted).toBe(true);
 	expect(qc.getQueryData(quotaSnapshotsKey)).toEqual({ entries: [] });
+});
+
+test("manual refresh recovers a failed active CLI Query and restores its freshness", async () => {
+	refresh.mockRejectedValueOnce(new Error("offline"));
+	await mount(true);
+	await waitFor(() => qc.getQueryState(commandCodeCliQuotaKey(cli()))?.status === "error");
+	await act(async () => {
+		await mutation.mutateAsync({ groupId: "CommandCode" });
+	});
+	await waitFor(() => displayed()?.snapshot?.balances[0]?.remaining === 3);
+	expect(qc.getQueryState(commandCodeCliQuotaKey(cli()))?.status).toBe("success");
+	expect(qc.getQueryData<QuotaSnapshotsResponse>(quotaSnapshotsKey)?.entries).toEqual([cli()]);
 });

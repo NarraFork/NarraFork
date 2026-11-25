@@ -119,18 +119,16 @@ describe("NUG quota snapshots", () => {
 	});
 
 	test("the nug template probes into the shared shape", async () => {
-		const config = useProvider();
+		useProvider();
 		globalThis.fetch = (async () =>
 			Response.json({
 				balance: 4,
 				totalGranted: 9,
 				detailedQuotaBalance: "details",
 			})) as unknown as typeof fetch;
-		const snapshot = await getServiceTemplate("nug").probeQuota?.(
-			{} as never,
-			{ id: providerId, providerId, config },
-			AbortSignal.timeout(1000),
-		);
+		const credentialId = getProviderKeyStore().list(nugKeyOwner(providerId))[0]?.id ?? providerId;
+		await getServiceTemplate("nug").probeQuota?.({ id: providerId } as never, credentialId);
+		const snapshot = quotaStore.peek(credentialId);
 		expect(snapshot?.scope).toBe("wallet");
 		expect(snapshot?.windows).toEqual([]);
 		expect(snapshot?.balances).toEqual([{ unit: "", remaining: 4, total: 9 }]);

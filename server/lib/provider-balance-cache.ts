@@ -231,7 +231,14 @@ function relayPeriod(amount: ProviderBalanceAmount): QuotaWindow {
 function relaySnapshot(state: BalanceState, endpoint?: Endpoint): QuotaSnapshot {
 	const { status, adapter, balance, fetchedAt, attemptedAt, error } = state;
 	const unlimited = balance?.unlimited ? { unlimited: true } : {};
-	const periods = (balance?.amounts ?? []).filter((amount) => !!amount.window).map(relayPeriod);
+	const periods = (balance?.amounts ?? [])
+		.filter(
+			(amount) =>
+				!!amount.window &&
+				// Also normalize old persisted/plugin results; detail retains their raw amounts.
+				!(adapter === "sub2api" && balance?.scope === "subscription" && amount.total === 0),
+		)
+		.map(relayPeriod);
 	const windows =
 		balance?.unlimited && !periods.some((period) => period.usedRatio !== null) ? [] : periods;
 	const balances = (balance?.amounts ?? [])

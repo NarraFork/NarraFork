@@ -73,8 +73,10 @@ quotaSnapshotRoutes.post(
 				"Balance probe requested too frequently",
 			);
 		}
-		refreshQuotaSnapshots(filter);
-		if (filter.groupId === "tokendance") await waitForTokenDanceQuotaRefresh(c.req.raw.signal);
+		const refresh = refreshQuotaSnapshots(filter);
+		if (filter.groupId === "tokendance")
+			await waitForTokenDanceQuotaRefresh(refresh, c.req.raw.signal);
+		else void refresh.catch(() => {});
 		const cliIdentity = cliOnly ? currentCommandCodeCliIdentity() : undefined;
 		const cli = cliOnly ? await refreshCommandCodeCliQuota(c.req.raw.signal) : undefined;
 		const response = readQuotaSnapshots(isAdmin, false);

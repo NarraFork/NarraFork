@@ -9,7 +9,6 @@ import {
 	getTokenDanceBalance,
 	getTokenDanceQuotaSnapshot,
 	isTokenDanceQuotaRefreshing,
-	refreshTokenDanceBalance,
 } from "../../services/tokendance-service";
 import { getCodexManager } from "../codex-manager";
 import { resolveCommandCodeToken } from "../commandcode-manager";
@@ -24,7 +23,6 @@ import { getCustomApiQuotaSnapshot } from "../custom-api-quota-cache";
 import {
 	getDeepSeekQuotaSnapshot,
 	isDeepSeekQuotaRefreshing,
-	refreshDeepSeekBalance,
 	refreshStaleDeepSeekBalances,
 } from "../deepseek-balance-cache";
 import { AppError } from "../errors";
@@ -32,14 +30,12 @@ import {
 	getKimiQuotaSnapshot,
 	isKimiQuotaRefreshing,
 	KIMI_USAGES_STALE_MS,
-	refreshKimiKeyUsage,
 	refreshStaleKimiUsages,
 } from "../kimi-usage-cache";
-import { getNugQuotaSnapshot, isNugQuotaRefreshing, refreshNugQuota } from "../nug-quota-cache";
+import { getNugQuotaSnapshot, isNugQuotaRefreshing } from "../nug-quota-cache";
 import {
 	getOpencodeQuotaSnapshot,
 	isOpencodeQuotaRefreshing,
-	refreshOpencodeKeyUsage,
 	refreshStaleOpencodeUsages,
 } from "../opencode-usage-cache";
 import { providerBalanceCache } from "../provider-balance-cache";
@@ -215,17 +211,6 @@ function codexOverview(): PublicQuotaSnapshot | null {
 	};
 }
 
-const pending = new Map<string, Promise<unknown>>();
-function start(key: string, job: () => Promise<unknown>): void {
-	if (pending.has(key)) return;
-	const task = job()
-		.catch(() => {})
-		.finally(() => {
-			if (pending.get(key) === task) pending.delete(key);
-		});
-	pending.set(key, task);
-}
-
 /** Preserve the sources' own TTL/backoff/concurrency budgets. Never await an upstream. */
 function revalidate(): void {
 	void refreshStaleKimiUsages(KIMI_USAGES_STALE_MS).catch(() => {});
@@ -294,10 +279,7 @@ export function readQuotaSnapshots(
 							? { supported: false }
 							: {}
 					: { supported: !!(template.probeQuota || template.projectQuota) }),
-				refreshing:
-					pending.has(`${group.id}:${id}`) ||
-					sourceRefreshing(group, id) ||
-					relay?.status === "pending",
+				refreshing: sourceRefreshing(group, id) || relay?.status === "pending",
 			});
 			// Use the stream's identity-checked accessor, never quotaStore.peek or the probe slot.
 			const streamId = id;
@@ -334,55 +316,27 @@ export function quotaRefreshRetryAfterMs(filter: QuotaRefreshFilter): number {
 	return delay;
 }
 
-/** Fire the original source-specific refreshers, never a new unthrottled probe loop. */
-export function refreshQuotaSnapshots(filter: QuotaRefreshFilter): void {
+/** Templates delegate to the existing source owners; no second task registry. */
+export function refreshQuotaSnapshots(
+	filter: QuotaRefreshFilter,
+): Promise<(QuotaSnapshot | undefined)[]> {
+	const jobs: Promise<QuotaSnapshot | undefined>[] = [];
 	for (const group of listSourceGroups()) {
 		if (group.disabled || (filter.groupId && filter.groupId !== group.id)) continue;
-		const ids = credentialIds(group).filter(
-			(id) => !filter.credentialId || filter.credentialId === id,
-		);
-		for (const id of ids) {
-			start(`${group.id}:${id}`, () => {
-				switch (group.templateId) {
-					case "kimi-code":
-						return refreshKimiKeyUsage(id);
-					case "opencode-go":
-						return refreshOpencodeKeyUsage(id);
-					case "deepseek":
-						return id === credentialIds(group)[0]
-							? refreshDeepSeekBalance(group.id)
-							: Promise.resolve();
-					case "nug":
-						return id === getNugQuotaSnapshot(group.id)?.credentialId
-							? refreshNugQuota(group.id)
-							: Promise.resolve();
-					case "tokendance":
-						return id === getTokenDanceQuotaSnapshot()?.credentialId
-							? refreshTokenDanceBalance()
-							: Promise.resolve();
-					case "command-code":
-						return id === getCommandCodeQuotaSnapshot()?.credentialId
-							? refreshCommandCodeQuota(true)
-							: Promise.resolve();
-					case "codex":
-					case "plugin":
-						return Promise.resolve();
-					default:
-						return id === providerBalanceCache.quotaSnapshot(group.id)?.credentialId
-							? providerBalanceCache.request(group.id, "refresh")
-							: Promise.resolve();
-				}
-			});
+		const probe = getServiceTemplate(group.templateId).probeQuota;
+		if (!probe) continue;
+		for (const id of credentialIds(group)) {
+			if (!filter.credentialId || filter.credentialId === id) jobs.push(probe(group, id));
 		}
 	}
+	return Promise.all(jobs);
 }
 
-/** Payment flows need a settled balance, not the stale value returned by SWR. */
-export async function waitForTokenDanceQuotaRefresh(signal?: AbortSignal): Promise<void> {
-	const jobs = [...pending]
-		.filter(([key]) => key.startsWith("tokendance:"))
-		.map(([, task]) => task);
-	if (!jobs.length) return;
+/** Payment flows await this request's real source work, with a bounded waiting budget. */
+export async function waitForTokenDanceQuotaRefresh(
+	task: Promise<unknown>,
+	signal?: AbortSignal,
+): Promise<void> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	let abort: (() => void) | undefined;
 	const cancelled = new Promise<never>((_resolve, reject) => {
@@ -395,7 +349,7 @@ export async function waitForTokenDanceQuotaRefresh(signal?: AbortSignal): Promi
 		);
 	});
 	try {
-		await Promise.race([Promise.allSettled(jobs), cancelled]);
+		await Promise.race([task, cancelled]);
 	} finally {
 		clearTimeout(timer);
 		if (abort) signal?.removeEventListener("abort", abort);

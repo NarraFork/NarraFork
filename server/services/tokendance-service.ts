@@ -912,7 +912,7 @@ export async function refreshTokenDanceBalance(force = true): Promise<TokenDance
 				throw fail("TokenDance connection changed", 409);
 			}
 			quotaStore.set(subject.id, identity, snapshot);
-		} catch {
+		} catch (error) {
 			if (balanceCache === cache && balanceCacheIdentity === identity) {
 				const previous = balanceSummary({ ...cache, task: undefined });
 				quotaStore.set(
@@ -926,6 +926,7 @@ export async function refreshTokenDanceBalance(force = true): Promise<TokenDance
 					false,
 				);
 			}
+			throw error;
 		} finally {
 			if (balanceCache === cache && cache.task === task) cache.task = undefined;
 		}
