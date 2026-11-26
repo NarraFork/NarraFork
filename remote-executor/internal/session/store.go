@@ -51,6 +51,10 @@ type storedMeta struct {
 	// Lost: the executor stopped while the process was running, so its outcome
 	// was never observed. Written when a restarted executor first finds it.
 	Lost bool `json:"lost,omitempty"`
+	// OutputIncomplete: recording the output failed at some point (write, sync
+	// or close), so the stored output may be missing bytes. The exit is still
+	// recorded.
+	OutputIncomplete bool `json:"outputIncomplete,omitempty"`
 }
 
 const metaVersion = 1
@@ -111,7 +115,7 @@ func listSegments(dir string) ([]segment, error) {
 	var segs []segment
 	for _, e := range entries {
 		name := e.Name()
-		if !strings.HasPrefix(name, "seg-") || !strings.HasSuffix(name, ".log") {
+		if !e.Type().IsRegular() || !strings.HasPrefix(name, "seg-") || !strings.HasSuffix(name, ".log") {
 			continue
 		}
 		var first int64
@@ -139,6 +143,8 @@ type sessionLog struct {
 	f            *os.File
 	segFirst     int64
 	segLen       int64
+	// failed: output recording stopped after an error; the exit is still recorded.
+	failed bool
 }
 
 // Create starts a fresh record for a session, replacing any leftover one.
@@ -156,8 +162,21 @@ func (st *DiskStore) Create(meta storedMeta, retain int) (*sessionLog, error) {
 	return &sessionLog{dir: dir, segmentBytes: st.segmentBytes, retain: int64(retain), meta: meta}, nil
 }
 
-// Append records p, whose first byte has sequence number seq.
+// Append records p, whose first byte has sequence number seq. After the first
+// failure the output is no longer recorded (the session itself is unaffected)
+// and the error is returned once.
 func (l *sessionLog) Append(seq int64, p []byte) error {
+	if l.failed {
+		return nil
+	}
+	err := l.append(seq, p)
+	if err != nil {
+		l.fail()
+	}
+	return err
+}
+
+func (l *sessionLog) append(seq int64, p []byte) error {
 	if l.f == nil || l.segLen >= l.segmentBytes {
 		if err := l.rotate(seq); err != nil {
 			return err
@@ -168,16 +187,32 @@ func (l *sessionLog) Append(seq int64, p []byte) error {
 	return err
 }
 
+// fail stops output recording and closes the open segment.
+func (l *sessionLog) fail() {
+	l.failed = true
+	if l.f != nil {
+		_ = l.f.Close()
+		l.f = nil
+	}
+}
+
+// closeSegment syncs and closes the open segment, reporting either failure: a
+// deferred write error may only surface here.
+func (l *sessionLog) closeSegment() error {
+	if l.f == nil {
+		return nil
+	}
+	syncErr := l.f.Sync()
+	closeErr := l.f.Close()
+	l.f = nil
+	return errors.Join(syncErr, closeErr)
+}
+
 // rotate closes the current segment durably, opens one starting at seq, and
 // deletes segments that lie entirely before the retention window.
 func (l *sessionLog) rotate(seq int64) error {
-	if l.f != nil {
-		_ = l.f.Sync()
-		if err := l.f.Close(); err != nil {
-			l.f = nil
-			return err
-		}
-		l.f = nil
+	if err := l.closeSegment(); err != nil {
+		return err
 	}
 	f, err := os.OpenFile(filepath.Join(l.dir, segmentName(seq)), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
@@ -197,15 +232,17 @@ func (l *sessionLog) rotate(seq int64) error {
 	return nil
 }
 
-// Exit closes the output durably and records how the session ended.
+// Exit closes the output durably and records how the session ended. The exit
+// is recorded even when the output could not be: that is marked instead, and
+// the output error is returned alongside any error writing the exit itself.
 func (l *sessionLog) Exit(code int, at time.Time, timedOut bool) error {
-	if l.f != nil {
-		_ = l.f.Sync()
-		_ = l.f.Close()
-		l.f = nil
+	outputErr := l.closeSegment()
+	if outputErr != nil {
+		l.failed = true
 	}
 	l.meta.Exited, l.meta.ExitCode, l.meta.ExitedAt, l.meta.TimedOut = true, code, at, timedOut
-	return writeMeta(l.dir, l.meta)
+	l.meta.OutputIncomplete = l.failed
+	return errors.Join(outputErr, writeMeta(l.dir, l.meta))
 }
 
 // Remove deletes a session's record.
@@ -216,6 +253,8 @@ type restoredSession struct {
 	meta     storedMeta
 	firstSeq int64
 	data     []byte // bytes [firstSeq, firstSeq+len(data))
+	// storageErr: the record was read but could not be updated (it is restored anyway).
+	storageErr error
 }
 
 // Load reads every recorded session. Running sessions recorded by an executor
@@ -240,9 +279,9 @@ func (st *DiskStore) Load(retain int, now time.Time) ([]restoredSession, error) 
 		}
 		if !r.meta.Exited {
 			r.meta.Exited, r.meta.Lost, r.meta.ExitCode, r.meta.ExitedAt = true, true, -1, now
-			if err := writeMeta(dir, r.meta); err != nil {
-				return nil, err
-			}
+			// A store that can no longer be written (read-only, full) still serves what
+			// it holds; only the found time may then be renewed by a later restart.
+			r.storageErr = writeMeta(dir, r.meta)
 		}
 		out = append(out, r)
 	}

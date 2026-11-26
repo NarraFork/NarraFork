@@ -214,6 +214,12 @@ func (m *Manager) UseStore(st *DiskStore) error {
 			lost:      r.meta.Lost,
 			seen:      make(map[string]struct{}),
 		}
+		switch {
+		case r.storageErr != nil:
+			m.sessions[r.meta.SessionID].storageErr = r.storageErr
+		case r.meta.OutputIncomplete:
+			m.sessions[r.meta.SessionID].storageErr = errors.New("the recorded output is incomplete")
+		}
 	}
 	return nil
 }
@@ -320,10 +326,11 @@ func (m *Manager) run(s *Session) {
 			if n > 0 {
 				seq := s.journal.Append(buf[:n])
 				if s.log != nil {
+					// The log stops recording output after a failure but stays, so the
+					// exit is still recorded.
 					if werr := s.log.Append(seq, buf[:n]); werr != nil {
 						s.mu.Lock()
 						s.storageErr = werr
-						s.log = nil
 						s.mu.Unlock()
 					}
 				}

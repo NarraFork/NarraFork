@@ -170,3 +170,62 @@ func TestUnreadableRecordsAreDropped(t *testing.T) {
 		t.Fatalf("unreadable record kept: %v", err)
 	}
 }
+
+// A failure recording output must not cost the exit: the restored session keeps
+// its exit code and reports that its recorded output is incomplete.
+func TestOutputFailureStillRecordsTheExit(t *testing.T) {
+	dir := t.TempDir()
+	before := newStoreManager(t, dir, testLimits())
+	p := open(t, before, "s1")
+	p.emit("12345678")
+	waitFor(t, func() bool { return endSeq(t, before, "s1") == 8 })
+	// The next segment cannot be created (a directory has its name).
+	if err := os.Mkdir(filepath.Join(dir, "s1", segmentName(8)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	p.emit("more output")
+	waitFor(t, func() bool { return mustInfo(t, before, "s1").StorageError != "" })
+	p.finish(0)
+	waitFor(t, func() bool { return mustInfo(t, before, "s1").State == "exited" })
+
+	after := newStoreManager(t, dir, testLimits())
+	info := mustInfo(t, after, "s1")
+	if info.State != "exited" || info.ExitCode == nil || *info.ExitCode != 0 || info.StorageError == "" {
+		t.Fatalf("restored = %+v", info)
+	}
+	text, result, _ := attachText(t, after, "s1", 0)
+	if text != "12345678" || result.Lost {
+		t.Fatalf("restored output = %q %+v", text, result)
+	}
+}
+
+// One record that cannot be updated does not stop the others from being
+// restored, and is itself restored with a storage error.
+func TestRestoreSurvivesARecordThatCannotBeUpdated(t *testing.T) {
+	dir := t.TempDir()
+	before := newStoreManager(t, dir, testLimits())
+	done := open(t, before, "done")
+	done.emit("ok")
+	done.finish(0)
+	waitFor(t, func() bool { return mustInfo(t, before, "done").State == "exited" })
+	running := open(t, before, "running")
+	running.emit("half")
+	waitFor(t, func() bool { return endSeq(t, before, "running") == 4 })
+	// Writing the lost marker fails: its temporary file name is taken.
+	if err := os.Mkdir(filepath.Join(dir, "running", "meta.json.tmp"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	after := newStoreManager(t, dir, testLimits())
+	if info := mustInfo(t, after, "done"); info.State != "exited" || *info.ExitCode != 0 {
+		t.Fatalf("exited session = %+v", info)
+	}
+	info := mustInfo(t, after, "running")
+	if info.State != "lost" || info.StorageError == "" {
+		t.Fatalf("running session = %+v", info)
+	}
+	text, result, _ := attachText(t, after, "running", 0)
+	if text != "half" || !result.Lost {
+		t.Fatalf("running session output = %q %+v", text, result)
+	}
+}

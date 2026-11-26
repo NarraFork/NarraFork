@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"log"
 	"os"
@@ -222,8 +223,10 @@ func shellPath() string {
 }
 
 // sessionStateDir is where this executor keeps its session records: one
-// directory per device, so several executors for different devices on one
-// machine never share (or restore) each other's sessions.
+// directory per registration (server and device), so executors that share an
+// account and a state directory never restore, and so never serve, each
+// other's sessions — not even for two servers that both call the device by the
+// same name. The readable device prefix only helps an operator find it.
 func sessionStateDir(cfg *config.Config) (string, error) {
 	base := cfg.StateDir
 	if base == "" {
@@ -239,8 +242,12 @@ func sessionStateDir(cfg *config.Config) (string, error) {
 		}
 		return '_'
 	}, cfg.DeviceRef)
+	if len(device) > 64 {
+		device = device[:64]
+	}
 	if device == "" {
 		device = "default"
 	}
-	return filepath.Join(base, device, "sessions"), nil
+	registration := sha256.Sum256([]byte(strings.Join([]string{cfg.ServerURL, cfg.ListenAddr, cfg.DeviceRef}, "\n")))
+	return filepath.Join(base, fmt.Sprintf("%s-%x", device, registration[:8]), "sessions"), nil
 }

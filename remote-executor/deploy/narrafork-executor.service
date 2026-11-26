@@ -22,6 +22,11 @@ ProtectKernelTunables=true
 LockPersonality=true
 RestrictSUIDSGID=true
 UMask=0077
+# The service account has no home directory: keep session records (output and
+# exits that outlive an executor restart) in a systemd-managed state directory.
+StateDirectory=narrafork-executor
+StateDirectoryMode=0700
+Environment=NARRAFORK_EXECUTOR_STATE_DIR=/var/lib/narrafork-executor
 
 [Install]
 WantedBy=multi-user.target
