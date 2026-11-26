@@ -523,7 +523,7 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 151 tables and 1984 columns", () => {
+	test("covers 151 tables and 1985 columns", () => {
 		expect(target.tables.length).toBe(151);
 		// 1714 SQLite-derived columns include disk_outcome and the two editor recovery columns,
 		// plus the three PG-only insert_seq identity columns.
@@ -580,7 +580,8 @@ describe("real schema parity", () => {
 		// Durable executor-session terminals add terminals.executor_session_id (nullable) and
 		// executor_session_cleanups (3).
 		// Work item dependencies (D) add team_work_item_dependencies (4).
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1984);
+		// Background Bash on executor sessions adds background_tasks.executor_session_json (nullable).
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1985);
 		expect(
 			target.tables
 				.find((table) => table.name === "user_recent_tabs")

@@ -24,7 +24,7 @@ keywords:
   - 撤销修改
   - modifications
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 ---
 # 一次文件修改与回退
 

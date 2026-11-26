@@ -56,7 +56,7 @@ keywords:
   - 原生媒体
   - 快速模式
 status: draft
-verified_at: 2c639f086aef21d60357f1e002e62767938833e8
+verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 ---
 # 适配器与历史构造
 
@@ -82,7 +82,7 @@ verified_at: 2c639f086aef21d60357f1e002e62767938833e8
   - 顶层联合类型的工具 schema 在提供商边界处展平，嵌套组合保持；展平会丢失属性间关联，不支持的约束只留诊断不猜测（`tool-schema-compat.ts`）；Gemini 另有 schema 清洗（`gemini-tool-schema.ts`）。
 - 响应体：非 JSON 响应（如 2xx 下的 HTML 挑战页）抛 `NonJsonResponseError`，JSON 上限 2MB、预览 4000 字符（`response-body.ts`）；用户内容里图片占位符 `[image #N: name]` 之后紧跟对应图片（`user-content-order.ts`）。
 - Anthropic 请求的 3 字符归因指纹在 `server/lib/fingerprint.ts`，UA 与 originator 在 `user-agent.ts`。
-- 快速模式（priority service tier）：`narrators.fastModeOverride` 为准，`inherit` 时请求时刻再取用户默认，`on`/`off` 钉死；旧布尔列只是镜像（`server/lib/fast-mode.ts`）。
+- 快速模式（priority service tier）：`narrators.fastModeOverride` 为准，`inherit` 时请求时刻再取用户默认（`getUserFastModeDefault` 在读 Worker 上读 `user_preferences`，`worker-required`），`on`/`off` 钉死；旧布尔列只是镜像（`server/lib/fast-mode.ts`）。
 - 引用模型却解析不出提供商时（PROVIDER_NOT_FOUND / PROVIDER_UNAVAILABLE / PROVIDER_CONFIG_INVALID）是不可重试的注册表错误，与瞬时上游失败区分（`provider-availability-error.ts`）。
 
 ## 从哪读起

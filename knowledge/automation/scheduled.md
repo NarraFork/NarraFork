@@ -31,7 +31,7 @@ keywords:
   - runContext
   - 定时
 status: draft
-verified_at: cbf0722e0
+verified_at: b32cbeb47a03646544a39986dbca4282162d63e4
 ---
 # 定时任务
 
@@ -39,9 +39,12 @@ verified_at: cbf0722e0
 
 ## 关键规则
 - 存储：cron（5 或 6 段）、可选 IANA 时区（空则服务器本地时间）、`prompt`/`systemPrompt`/`model`、`permissionMode`（默认 `bypassPermissions`）、`runContext`（`standalone | project`）、`narratorMode`（`new | reuse`）、`cleanupPolicy`（默认 `{mode:"none"}`）、`lastStatus`（`success | failed | skipped`）（`schema.ts:scheduledTasks`）。
-- 调度器每 30s 轮询一次到期任务（`enabled` 且 `nextRunAt <= now`），并发触发各任务；上一轮未结束或关机围栏生效时跳过本轮（`scheduled-task-scheduler.ts:tick`）。
+- 调度器每 30s 轮询一次到期任务（`enabled` 且 `nextRunAt <= now`），并发触发各任务；上一轮未结束、已停止或关机围栏生效时跳过本轮（`scheduled-task-scheduler.ts:tick`）。`stopScheduledTaskScheduler` 是 async：等启动恢复和进行中的 tick 结束。
+- 任务读取（`get`、`list`、`listRuns`、`principalForTask`、`launchNarrator` 查项目）走读 Worker（`readQuery`，`worker-required`，不回退主线程）；`listDue` 按 id keyset 分页（每页 100），`recoverOnStartup` 每页 200（`collectKeysetRows`）。
 - 启动时只重新计算下次触发时间，不补跑错过的任务（`recoverOnStartup`）。
-- `runTask` 按任务 id 加锁；先把 `nextRunAt` 重新排好（失败也不会卡住计划），手动触发不改动 cron 节奏（`runTask`）。
+- `runTask` 按任务 id 加锁；自动运行先在一条写里认领：`UPDATE ... SET nextRunAt=下次 WHERE enabled=1 AND next_run_at<=now`，没认领到行（期间被禁用或改了计划）就直接返回、不记运行（`runTask`）。
+- 手动运行不认领、不改 `nextRunAt`；运行结束写结果时也不再写 `nextRunAt`，运行中做的编辑不会被覆盖（`runTask`）。
+- `update` 只在 cron、时区或 `enabled` 变了时才写 `nextRunAt`，否则不写，避免拿 Worker 读到的旧值盖掉运行的认领（`update`）。
 - “成功”仅表示已派发，不代表 loop 结束；目标叙述者已在运行则记 `skipped`；project 模式缺 projectId 或项目不存在也是 `skipped`（`launchNarrator`）。
 - 断路器：同一任务连续失败 5 次自动置 `enabled=false`；计数在内存中，重启清零（`CIRCUIT_BREAKER_THRESHOLD`）。
 - 运行身份是创建者，按其当前角色实时判定权限；无创建者则按最小权限（`principalForTask`）。reuse 模式只在叙述者对该身份可写且未归档时复用，否则新建。
@@ -61,7 +64,7 @@ verified_at: cbf0722e0
 ## 改它时
 - 加任务字段：`schema.ts:scheduledTasks` → `bun run db:generate`，`validators/scheduled-tasks.ts`、`routes/scheduled-tasks.ts`、前端 `lib/api/scheduled-tasks.ts` 与创建/详情页一起改；表要进数据导入导出时看 `data-portability.ts`（是否包含这两张表：未核实）。
 - 改调度节奏（30s 轮询）、断路器阈值（5 次）或启动恢复：`scheduled-task-scheduler.ts`、`scheduled-task-service.ts`；`scheduled-task-principal.test.ts`、`scheduled-task-cleanup.test.ts`、`scheduled-task-list-cap.test.ts` 会断言身份判定、清理和列表上限。
-- 不变量：错过的任务启动时不补跑；`runTask` 按任务 id 加锁；“成功”只代表已派发；清理策略默认 `none`，只有创建者或管理员能设。
+- 不变量：错过的任务启动时不补跑；`runTask` 按任务 id 加锁；自动运行必须靠认领写判定是否执行；“成功”只代表已派发；清理策略默认 `none`，只有创建者或管理员能设。
 
 ## 相关
 - 插件有自己的调度（`server/services/plugin-scheduler.ts`），见[插件系统](plugins/index.md)；不要与这里混淆。

@@ -45,7 +45,7 @@ keywords:
   - /admin/storage
   - invalidateStorageCache
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 ---
 # 存储管理与清理
 
@@ -59,6 +59,8 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - `toolCallPayloads` 走 `storage-history-service`：预览缓存 5 分钟（`PREVIEW_TTL_MS`），执行是异步作业（`/database/cleanup` 返回 202 与 job），而不是在请求里同步删。
 - `POST /api/storage/database/vacuum` 是显式的服务级维护窗口：同步执行，期间普通 HTTP/WS/Agent 活动可能暂停。`vacuumDatabase` 在进程内维护锁下先暂停 token 重算与 model-history worker、排空读 worker 池，截断式 checkpoint，再 VACUUM，之后恢复。后端不支持回收时抛 501 `DATABASE_VACUUM_UNSUPPORTED`。
 - 变更类操作之后调用 `storageService.invalidateStorageCache()`。
+- 孤儿上传目录清理（`storage-service.ts:cleanupOrphanedUploads`）：会话 ID 与“哪些会话的消息引用了图片”都在读 Worker 上按 ID 分页读取（每页 256，`worker-required`）；引用判断在 SQL 里做（`storage/upload-reference-predicate.ts:uploadReferencePredicate`，SQLite 用 json1、PG 用 jsonb），只有 owner ID 越过 Worker 边界。删目录前再按主键查一次会话是否存在（`narratorExistsNow`），分页读之后新建的会话保留目录。
+- 聊天附件清理（`storage-service.ts:cleanupOrphanedChatAttachments`）：过期草稿的删除语句自带草稿条件（`message_id IS NULL` 且超期），读之后被消息认领的草稿不删，只删实际删掉的行对应的文件；房间目录删除前按主键复查房间（`chatRoomExistsNow`）；没有行的附件文件若仍在发布中（`isChatAttachmentPublishing`）或删除前查到已入库（`chatAttachmentRecordedNow`）则保留。
 - 历史保留策略（`/api/storage/database/history`：`jobs`、`preview`、`cleanup`、`cancel`，请求体上限 8192 字节）有两个目标 `toolCallPayloads` 与 `messageHistory`（`shared/storage-retention.ts`），规则存 `settings.storageRetention.<target>`（`retentionDays` 1..36500 或 null，`autoCleanup` 默认关）；`storage-history-runtime.ts:startStorageHistoryRetention` 启动自动清理并在设置变化时重新对账；实际改写在 `storage-history-mutations.ts`，不删除 refs 和执行回执，`Write/Edit/StructSed/GenUI` 的输入不被清除，因为旧版首次触碰文件的重建还要用（`retainsStorageReplayInput`）。
 - 旧的 `/database/preview`、`/database/cleanup` 在 `target=toolCallPayloads` 时转入同一套历史作业（`routes/storage.ts`），所以旧客户端也不会同步删。
 - 区块回填：`GET /blocks/backfill`、`POST /blocks/backfill/pause`、`POST /blocks/projection`；前端 `BlockBackfillCard` 只在回填进行时显示。

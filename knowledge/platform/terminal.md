@@ -39,7 +39,7 @@ keywords:
   - 孤儿终端
   - /api/admin/terminals
 status: draft
-verified_at: 2c639f086aef21d60357f1e002e62767938833e8
+verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 ---
 # 终端运行时
 
@@ -51,7 +51,7 @@ verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 - 执行器会话终端：会话 ID 固定为 `nf-term-<终端id>`（`remote-session.ts:terminalSessionId`），存进 `terminals.executor_session_id`（旧 `pty.open` 远程终端和本地终端为 NULL）。shell 属于执行器进程，不随连接或 NarraFork 进程结束：
   - 设备断线（`DeviceOfflineError` / `DeviceConnectionChangedError`）时运行时等 `device:status` 上线事件，再以已消费的字节数 `session.attach { since }` 续读；其他错误（会话不存在、执行器缺特性、序号越界）和 `device:revoked` 结束终端。
   - 输入按顺序逐条发送，每条带固定 `writeId`，断线重发由执行器去重；设备不在时排队，上限 1 MiB，超出的输入丢弃并记警告。
-  - 停止和释放执行器会话不是运行时的事（运行时的 `kill()` 只停止读取），由 `terminal-service` 从持久记录做：终端关闭（`kill`）时在拆除缓冲、标记已退出之前，shell 自然退出（`monitorShellExit`）时在最终缓冲和退出码落盘之后，往 `executor_session_cleanups`（`device_id`+`session_id`）写一行，再发 `session.kill { release: true }`；执行器确认或回复 "session not found" 才删这行，其他错误（离线、断线、缺特性）保留。每次 `device:status` 上线按设备分页（每页 100）重试；设备在线期间若还有没送达的（读 Worker 拒绝、RPC 超时等临时失败），按 0.5 秒、5 秒、30 秒、之后每 2 分钟退避重试，确实掉线（不在线）才停、再上线重新开始；旧连接迟到的 offline 事件不取消重试（`EXECUTOR_CLEANUP_RETRY_MS`）。这张表与终端行无关，删终端行、重启、设备离线都不会丢掉停止。
+  - 停止和释放执行器会话不是运行时的事（运行时的 `kill()` 只停止读取），由 `terminal-service` 从持久记录做：终端关闭（`kill`）时在拆除缓冲、标记已退出之前，shell 自然退出（`monitorShellExit`）时在最终缓冲和退出码落盘之后，往 `executor_session_cleanups`（`device_id`+`session_id`）写一行，再发 `session.kill { release: true }`；执行器确认或回复 "session not found" 才删这行，其他错误（离线、断线、缺特性）保留。每次 `device:status` 上线按设备分页（每页 100）重试；设备在线期间若还有没送达的（读 Worker 拒绝、RPC 超时等临时失败），按 0.5 秒、5 秒、30 秒、之后每 2 分钟退避重试，确实掉线（不在线）才停、再上线重新开始；旧连接迟到的 offline 事件不取消重试（`EXECUTOR_CLEANUP_RETRY_MS`）。这张表与终端行无关，删终端行、重启、设备离线都不会丢掉停止。这套记录与重试在 `services/executor-session-cleanup.ts`，远端后台 Bash 也用它。
   - 新建时 `session.open` 的回复因断线丢失：等设备回来（最多 15 秒）重发，执行器回 "already exists" 就接管；仍不确定时创建失败并写清理记录（`RemoteSessionOpenUnknownError`）。
   - 执行器报告的缺口（`session.gap`）：先调 `interruptTextWatchesForGap`，期间这个终端后续输出（含缺口提示）暂存在 `heldOutput`，所以提示和缺口后的输出不会参与缺口前的匹配；然后在终端里显示一行"N bytes of output were not retained"，不静默跳过。暂存期间 shell 退出时，`monitorShellExit` 先等暂存输出写回缓冲（`drainHeldOutput`）再落盘；`kill` 删除缓冲时丢弃暂存。
 - `BufferManager.append(data, streamSeq?)`：带编号的来源（执行器会话）在 xterm 解析完一批后记下位置，落盘快照写 `streamSeq`，`loadFromDisk` 读回为 `restoredStreamSeq`；不带编号的来源不写这个字段（`buffer-manager.ts`）。
@@ -60,10 +60,12 @@ verified_at: 2c639f086aef21d60357f1e002e62767938833e8
   - 有 `deviceId` 且有 `executor_session_id` 的 `running` 行：从快照的 `restoredStreamSeq` 续读（`resumeExecutorSession`）；快照没有这个字段时丢弃快照、从 0 重放设备保留的输出；设备不在线也照样恢复为已附着，等设备上线。
   - 其余行按 dtach 处理：探测 socket 并重新 attach，探测失败则保留状态而不是删除；没有 dtach socket 的（含旧 `pty.open` 远程终端）标记已退出（`terminal-service.ts`、`dtach-recovery-probe.ts`）。`terminalService.whenStartupRecoverySettled()` 在最近一次启动恢复结束（成败皆算，无恢复则立即）后 resolve；`watch-service.ts` 靠它在 dtach 恢复完成后再重新挂接终端 Watch。
 - 因此「生命周期绑定服务器进程」只对直连终端和旧 `pty.open` 远程终端成立；dtach 终端和执行器会话终端可存活于重启。
-- 滚动缓冲由 `BufferManager` 维护（默认 80x24、scrollback 5000 行），周期性落盘，订阅时以 `scrollback` 消息回放，并有读取游标/布局快照的数量与字节上限（`terminal/buffer-manager.ts` 顶部常量如 `MAX_BUFFER_READ_CURSORS`、`MAX_LAYOUT_SNAPSHOT_BYTES`）。
+- 滚动缓冲由 `BufferManager` 维护（默认 80x24、scrollback 5000 行），周期性落盘，订阅时以 `scrollback` 消息回放（回放链路失败——attach 被拒、终端消失、读取已关闭——只记 debug 日志、不回放，不成为未处理拒绝：`terminal-ws.ts:subscribeToTerminal`），并有读取游标/布局快照的数量与字节上限（`terminal/buffer-manager.ts` 顶部常量如 `MAX_BUFFER_READ_CURSORS`、`MAX_LAYOUT_SNAPSHOT_BYTES`）。
 - WebSocket 协议：客户端 `subscribe/unsubscribe/input/resize/create/kill/rename`，服务端 `output/exit/error/scrollback/bufferState/created/killed/renamed`，消息体经 `terminalWsMessageSchema` 校验，订阅和创建都要通过 `terminal-access` 的权限判断（`websocket/terminal-ws.ts`）。
 - 谁能使用某个终端（跟随叙述者 ACL、独立终端只属创建者与管理员）由 `terminal-access.ts` 判断，规则见 [访问控制](../security/acl.md)。
 - 终端的 REST 管理在 `routes/terminals.ts`（列表、树、创建、改名、删除、进程列表、视图状态）。
+- `terminal-service.ts` 的数据库读取都经读 Worker（`readQuery`，`worker-required`），Worker 不可用时这些调用直接失败，不回退主线程；写入仍在主线程。
+- worktree 移除时 `cleanupForWorktree` 按 id 分页扫描全部无 owner 终端（每页 500、最多 40 页），扫不完报 409 `WORKTREE_REMOVAL_TERMINAL_SCAN_INCOMPLETE`，见 [会话 worktree](../git/worktrees.md)。
 - 用户终端的 shell 环境会恢复被 NarraFork 清空的环境代理变量（`envWithAmbientProxy`）。
 
 - 前端：`useCanOpenTerminals` 复用会话 ui-summary 的 `canWrite`，不为首屏额外读 `/access`；未知/失败不允许打开。`useNarratorTerminals` 只有真实可见、document 可见且写权限已知为 true 才拉实体，key 包含 narrator/user/token，AbortSignal 贯通（单次 512 KiB，30 秒 stale/60 秒 GC）；`useTreeTerminals` 仍为详情树按需读取。ui-summary 与 WS `terminal_count_changed`、普通终端实体列表统一排除 `worktreeResourceId` 非空的资源终端。管理员页 `/settings/terminals`（`routes/settings/terminals.tsx`）管理全部终端与孤儿 dtach socket（`/api/admin/terminals/*`：列表、终止、批量终止、`kill-orphan`、`reattach-orphan`），`/admin/terminals` 只是重定向到它。

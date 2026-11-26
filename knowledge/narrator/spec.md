@@ -39,7 +39,7 @@ keywords:
   - team-sop
   - /api/narrators/:id/spec
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 ---
 # 动态 Spec
 
@@ -48,6 +48,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 ## 关键规则
 - 路径：`spec://` 加相对路径，每段只许字母数字 `.` `_` `-`，总长 ≤ 240，不许空段、`.`、`..`、空白、反斜杠，不做自动纠正；含 `spec:/` 样子却不是规范 `spec://` 写法的路径（如带盘符、空白、反斜杠）一律判为畸形并报错（`lib/spec-uri.ts:normalizeSpecPath`、`assertSpecPath`）。支持 `spec://` 的工具只有 Read、Write、Edit、ExitPlanMode（`file_path`）与 Grep（`path`，可为根）；Glob、StructView、StructSed 遇到 `spec://` 报错；只检查路径字段，内容与正则里提到 URI 不算（`assertToolSpecPaths`）。
 - 存储：每个叙述者一个 namespace（`spec_namespaces`），当前文件指针在 `spec_namespace_files`，每次写入新增一行 `spec_file_revisions` 并切换指针，写入按 `namespaceId:path` 串行；单文件 ≤ 200000 字符，`index.md` 不许写空；内置文件不能删除；分叉时 `forkSpecNamespace` 原子复制命名空间、文件指针与保护锁（`spec-vfs-service.ts`）。
+- 读取走读 Worker（`worker-required`，失败即报错、不回退主线程）：当前文件、修订、命名空间、文件列表（`spec-vfs-service.ts:getCurrentFile`、`getRevision`、`readSpecFileContentIfExists`、`listSpecFiles`）与保护锁列表（`spec-task-service.ts:listProtectedLocks`，供写前预检 `analyzeSpecTasksCandidate`/`validateSpecTasksWrite`）。`syncProtectedLocks` 对每条锁的查与写保持同一轮内联读，避免同一文档的并发同步争抢 `(namespace, hash)` 唯一插入；写入时的保护检测仍在 `writeSpecFileRevision` 段内读锁。
 - 写权限两条独立的轴：`agentReadonly`（Agent 的 Write/Edit 不能改）与 `uiEditable`（人能否经面板改）；`behavior_fence` 对 Agent 只读、对人可编辑；Agent 只有在一个用户回合的第一次工具调用里才有一次性写授权（`grantBehaviorFenceEdit` → `consumeBehaviorFenceEditGrant`，第一个工具调用结束即 `clear`，续跑/后台/子代理回合从不授予）（`lib/agent/tools/behavior-fence-grant.ts`、`spec-vfs-service.ts:writeSpecFile`）。第三种写者 `system` 不受这两条轴限制，只用于 outline 导入后只留插件 SOP 的围栏。
 - 任务文件：`tasks.json` 只许顶层 `tasks` 数组（≤ 100 项），每项只许 `text`（≤ 1000 码点）、`status`（`todo` / `doing` / `done` / `blocked`，`pending`、`in_progress`、`completed` 等别名会被归一）、`protected: true`；写前解析校验，非法即抛错（`spec-task-service.ts:parseSpecTasksDocument`）。`compileSpecTasks` 取第一个 `doing` 为当前任务、第一个 `todo` 为下一个，有 `blocked` 则标 blocked，统计开放的受保护任务数。
 - 受保护任务：`protected` 任务在 `spec_protected_tasks` 里按文本哈希留锁；写入若修改、删除、去掉保护标记或把它标成 done，且没有 `allowProtectedTaskMutation`，抛 409 `SPEC_PROTECTED_TASK`（要求先过 `taskReflection`）；检测发生在写入存储的同一事务段内（`detectProtectedMutations`、`knowledgeWriteStore.writeSpecFileRevision`）。人通过面板写（`actor: "user"`）与系统的任务晋升允许改保护任务。

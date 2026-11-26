@@ -27,7 +27,7 @@ keywords:
   - 自动
   - 例程
 status: draft
-verified_at: 4d59774711a51a9ac966794090c8b3a04d549048
+verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 ---
 # 例程与可选工具
 
@@ -40,6 +40,9 @@ verified_at: 4d59774711a51a9ac966794090c8b3a04d549048
 - 写入同步旧列表：`resident` 进 enabled 列表，`manual` 进 disabled 列表，`auto` 两个都不进（旧读者视为“未启用”）（`applyToolRoutineMode`）。项目层 `global` 表示清除项目意见（`clearToolRoutineMode`）。
 - 对 tool 例程调用 toggle 等价于设为 `resident`/`manual`（`enableRoutineGlobal`）；设置模式时必须是 tool 例程，否则拒绝（`requireToolRoutine`）。
 - 启用 command 例程会写入全局命令，skill 例程写入全局技能目录；禁用时移除（`enableRoutineGlobal/disableRoutineGlobal`）。
+- 全局命令列表（`user_preferences.commands`）的读-改-写持 `userPreferencesLock`，读走 Worker（`routine-service.ts:addGlobalCommand`、`removeGlobalCommand`）。
+- 项目层写 `chapterSettings` 的读-改-写故意保留主线程同轮点读，不经 Worker，避免覆盖并发的项目设置保存（`setToolRoutineModeForProject`、`enable/disable/resetRoutineForProject`）。
+- 只读路径走读 Worker（`worker-required`）：`GET /api/routines/project/:projectId`、`command-service.ts` 读用户/项目命令与斜杠菜单的叙述者行。
 - 路由 `/api/routines`：`GET /`、`POST /:id/toggle`、`POST /:id/mode`（值只能是 manual/auto/resident）、`/project/:projectId...`（项目 mode 额外允许 `global`，需项目 manage 权限）、`/global-prompt`（读取上限 200000 字节，写入需管理员）。
 - 会话级临时装载（`narrators.enabledTools`）与此正交，由 `command-service.ts` 的 `/load <toolName>` 触发。
 

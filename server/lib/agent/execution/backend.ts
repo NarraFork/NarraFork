@@ -265,6 +265,25 @@ export interface ExecParams {
 	 * Only the local Unix backend honours it; other backends ignore it and run normally.
 	 */
 	durableService?: { taskId: string; timeoutMs?: number };
+	/**
+	 * A background command. A remote backend whose executor offers durable exec sessions
+	 * runs it in one, so losing the device connection or restarting NarraFork only
+	 * detaches; `bind` persists the session before it is opened. Other backends ignore it.
+	 */
+	backgroundSession?: {
+		taskId: string;
+		/** Wall-clock budget; absent means none. */
+		timeoutMs?: number;
+		bind(binding: ExecutorSessionBinding): Promise<void>;
+	};
+}
+
+/** Where a background command's durable executor session lives. */
+export interface ExecutorSessionBinding {
+	deviceId: string;
+	sessionId: string;
+	timeoutMs?: number;
+	startedAt: string;
 }
 
 /**
@@ -294,6 +313,22 @@ export interface ExecHandle {
 	outputIncomplete?(): boolean;
 	/** Terminate the process (and its process group, when supported). */
 	kill(): Promise<void>;
+	/**
+	 * Called once the owner has committed the command's terminal state; a handle that
+	 * keeps output elsewhere (an executor session) releases it here, not before.
+	 */
+	afterTerminalCommitted?(): Promise<void>;
+	/**
+	 * Present when the process enforces the timeout itself (an executor session): after
+	 * `exited`, true when that deadline stopped it. The owner then waits a grace period
+	 * past its own deadline so the process's verdict, and its final output, wins.
+	 */
+	timedOut?(): boolean;
+	/**
+	 * Present when the process outlives this server (an executor session): stop
+	 * observing on shutdown without stopping it, so a restarted server re-attaches.
+	 */
+	detachForShutdown?(): void;
 }
 
 /** Parameters for git diff. */

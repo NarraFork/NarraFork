@@ -36,7 +36,7 @@ keywords:
   - agent.defaultNarratorWriteAudience
   - terminalAccessAllowed
 status: draft
-verified_at: 0baba9c1a
+verified_at: 66bc772cb8dbb321753b7f326178e78e513230f1
 ---
 # 访问控制
 
@@ -64,7 +64,8 @@ verified_at: 0baba9c1a
 - 两个批量入口：`judgeNarratorAccessBatch`（一个叙述者 × 多个主体，团队成员列表）和 `judgeNarratorsWriteForPrincipal`（一个主体 × 多个叙述者，只判写；按被判行即子代理的根去重，根行连同 `narratorProjectIdColumn`、项目行、该主体的用户与角色授权各一条语句，每 400 个一批；没有根的子代理拒绝）。项目侧对应 `project-acl.ts:projectsWritableBy`（一个主体 × 多个项目，授权一条语句）。项目页的「等你处理」和项目列表汇总用后两者（见[项目页](../collaboration/project-pages.md)）。一致性测试同上，`projectsWritableBy` 在 `server/routes/__tests__/projects-overview.test.ts` 对照 `canWriteProject`。
 - 终端权限（`services/terminal-access.ts`）：叙述者的终端跟随该叙述者 ACL，子代理用其根叙述者；`read` 只看元数据，`write` 覆盖开启、看输出和滚动缓冲、输入、改名、关闭、读进程列表，因为终端等同于在会话工作区的 shell。
 - 无叙述者的独立终端只属于创建者加管理员；创建者只记在内存里（上限 1000 条，超出丢最旧），重启后只有管理员可用。未知 id 与被拒绝给同样答案，防止探测 id。
-- REST（`routes/terminals.ts`）与终端 WebSocket（`websocket/terminal-ws.ts`）都调 `terminalAccessAllowed`；WebSocket 在连接期间还会重新校验。
+- REST（`routes/terminals.ts`）与终端 WebSocket（`websocket/terminal-ws.ts`）都调 `terminalAccessAllowed`；WebSocket 在连接期间还会重新校验。订阅后滚动缓冲回放是不等待的链（`terminal-ws.ts:subscribeToTerminal`）：attach 被拒、终端消失或读失败时只记 debug 日志、不回放，不成为未处理的 rejection；回放前若订阅已因复查被撤，也不发送。
+- `narrator-sharing.ts` 的读（`loadNarrator`、`getNarratorAccess` 的授权与 owner、转让 owner 时查目标用户、`announceAccessChange` 的子代理订阅清扫）都在读 Worker 上（`worker-required`，30s 超时），Worker 不可用时该操作失败。
 
 ## 从哪读起
 - `server/services/acl/acl-core.ts:resolveCaps`：内核。

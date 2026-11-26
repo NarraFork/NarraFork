@@ -4,6 +4,7 @@ import { AppError } from "../../errors";
 import { resolveNarratorGitIdentityEnv } from "../../git-identity";
 import { hotSafe } from "../../hot-safe";
 import { generateShortId } from "../../id";
+import { logger } from "../../logger";
 import { getHome } from "../../platform";
 import type { ExecHandle, ExecParams, ExecutionBackend } from "../execution/backend";
 import { withDeviceParam } from "../execution/device-schema";
@@ -184,7 +185,10 @@ export const REVIEW_READ_ONLY_BASH_DESCRIPTION =
 	"commands.";
 
 interface BashExecution {
-	start(signal: AbortSignal, options?: Pick<ExecParams, "durableService">): Promise<ExecHandle>;
+	start(
+		signal: AbortSignal,
+		options?: Pick<ExecParams, "durableService" | "backgroundSession">,
+	): Promise<ExecHandle>;
 	cancelUndispatched(): void;
 }
 
@@ -232,6 +236,7 @@ async function prepareBashExecution(
 				signal,
 				env: env ?? undefined,
 				...(options?.durableService ? { durableService: options.durableService } : {}),
+				...(options?.backgroundSession ? { backgroundSession: options.backgroundSession } : {}),
 			});
 		},
 		cancelUndispatched() {
@@ -1106,10 +1111,16 @@ async function startBackgroundBash(
 			// supports it, it writes to a log file and leaves a manifest so a restarted server
 			// can re-attach instead of reporting it failed.
 			const handle = await backgroundTaskService.runBashStartup(() =>
-				execution.start(
-					bgAbort.signal,
-					backgroundKind === "service" ? { durableService: { taskId, timeoutMs } } : undefined,
-				),
+				execution.start(bgAbort.signal, {
+					...(backgroundKind === "service" ? { durableService: { taskId, timeoutMs } } : {}),
+					// On a remote device with durable exec sessions, the command outlives a lost
+					// connection or a restart of this server either way.
+					backgroundSession: {
+						taskId,
+						...(timeoutMs !== undefined ? { timeoutMs } : {}),
+						bind: (binding) => backgroundTaskService.bindExecutorSession(taskId, binding),
+					},
+				}),
 			);
 			monitoringStarted = true;
 			// Settled beside monitoring, not before it: output must not wait for the check.
@@ -1173,7 +1184,13 @@ export interface MonitorBackgroundBashOptions {
  * Shared by fresh launches and by services a restarted server re-attached to.
  */
 export async function monitorBackgroundBash(opts: MonitorBackgroundBashOptions): Promise<void> {
-	const { taskId, handle, bgAbort, backgroundKind, timeoutMs } = opts;
+	const { taskId, handle, bgAbort, backgroundKind } = opts;
+	// A process that enforces the deadline itself (an executor session) reports whether it
+	// hit it; this side only steps in after a grace period, e.g. when the device is away.
+	const timeoutMs =
+		opts.timeoutMs !== undefined && handle.timedOut
+			? Math.max(opts.timeoutMs, 0) + EXECUTOR_DEADLINE_GRACE_MS
+			: opts.timeoutMs;
 	let timedOut = false;
 	let terminalStarted = false;
 	try {
@@ -1181,6 +1198,10 @@ export async function monitorBackgroundBash(opts: MonitorBackgroundBashOptions):
 		let outputTruncated = false;
 		const killFn = () => handle.kill();
 		backgroundTaskService.registerKillHandler(taskId, () => void killFn());
+		if (handle.detachForShutdown) {
+			const detach = handle.detachForShutdown.bind(handle);
+			backgroundTaskService.registerShutdownDetach(taskId, detach);
+		}
 
 		const bgDecoder = createStreamDecoder();
 		const appendOutput = (raw: Uint8Array) => {
@@ -1270,6 +1291,13 @@ export async function monitorBackgroundBash(opts: MonitorBackgroundBashOptions):
 		}
 
 		const exitCode = resolvedExitCode ?? 1;
+		if (!timedOut && (handle as ExecHandle).timedOut?.()) {
+			timedOut = true;
+			backgroundTaskService.appendOutput(
+				taskId,
+				"\n\n<bash_metadata>\nBackground command timed out\n</bash_metadata>",
+			);
+		}
 		if (watchdogKilled) {
 			backgroundTaskService.appendOutput(
 				taskId,
@@ -1321,6 +1349,7 @@ export async function monitorBackgroundBash(opts: MonitorBackgroundBashOptions):
 		// Preserved collectors leave their task and manifest for the next server to recover.
 		if (terminalCommitted && handle instanceof DurableServiceHandle)
 			await removeServiceArtifacts(taskId);
+		if (terminalCommitted) await releaseAfterTerminal(taskId, handle);
 	} catch (err) {
 		// Persistence failure is a lifecycle failure, not a second terminal outcome to retry.
 		if (terminalStarted) throw err;
@@ -1345,5 +1374,18 @@ export async function monitorBackgroundBash(opts: MonitorBackgroundBashOptions):
 		}
 		if (terminalCommitted && handle instanceof DurableServiceHandle)
 			await removeServiceArtifacts(taskId);
+		if (terminalCommitted) await releaseAfterTerminal(taskId, handle);
+	}
+}
+
+/** How long past the deadline this server waits for an executor's own timeout verdict. */
+export const EXECUTOR_DEADLINE_GRACE_MS = 30_000;
+
+/** Let a handle that keeps output outside this process release it; never fails the task. */
+async function releaseAfterTerminal(taskId: string, handle: ExecHandle): Promise<void> {
+	try {
+		await handle.afterTerminalCommitted?.();
+	} catch (error) {
+		logger.warn("Background command release failed", { taskId, error: String(error) });
 	}
 }

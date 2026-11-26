@@ -483,3 +483,65 @@ func TestKillWithReleaseForgetsTheSessionOnceExitIsRecorded(t *testing.T) {
 		t.Fatalf("killing an unknown session err = %v", err)
 	}
 }
+
+// A kill that arrives while Open is still starting the process must not be
+// answered "not found" (the caller would drop its stop): the process is
+// stopped, and with release forgotten, as soon as it exists.
+func TestKillWhileStartingStopsTheProcessOnceItExists(t *testing.T) {
+	m := NewManager(testLimits())
+	defer m.Shutdown()
+	p := newFake()
+	starting := make(chan struct{})
+	proceed := make(chan struct{})
+	opened := make(chan error, 1)
+	go func() {
+		_, err := m.Open("s1", "exec", func() (Process, error) {
+			close(starting)
+			<-proceed
+			return p, nil
+		})
+		opened <- err
+	}()
+	<-starting
+	if err := m.Kill("s1", true); err != nil {
+		t.Fatalf("kill while starting = %v", err)
+	}
+	close(proceed)
+	if err := <-opened; err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.killed
+	})
+	waitFor(t, func() bool {
+		_, err := m.Info("s1")
+		return errors.Is(err, ErrNotFound)
+	})
+}
+
+type deadlineFake struct{ *fakeProcess }
+
+func (deadlineFake) TimedOut() bool { return true }
+
+// A process that enforces its own deadline reports it with the exit, so a
+// reader that attaches afterwards can tell a timeout from an ordinary failure.
+func TestExitReportsTheProcessDeadline(t *testing.T) {
+	m := NewManager(testLimits())
+	defer m.Shutdown()
+	p := newFake()
+	if _, err := m.Open("s1", "exec", func() (Process, error) { return deadlineFake{p}, nil }); err != nil {
+		t.Fatal(err)
+	}
+	p.finish(137)
+	var rec recorder
+	result, err := m.Attach(context.Background(), "s1", 0, rec.send)
+	if err != nil || !result.TimedOut || result.ExitCode != 137 {
+		t.Fatalf("attach = %+v, %v", result, err)
+	}
+	info, _ := m.Info("s1")
+	if !info.TimedOut {
+		t.Fatalf("info = %+v", info)
+	}
+}

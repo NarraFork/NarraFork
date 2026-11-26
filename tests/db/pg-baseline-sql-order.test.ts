@@ -509,11 +509,12 @@ describe("bounds, real committed assets, and source AST guard", () => {
 		]);
 		expect(narrators?.indexOf("next_seq")).toBeLessThan(narrators?.indexOf("insert_seq") ?? -1);
 		// The main-branch 0010 migration appends background_kind after insert_seq;
-		// 0079 later appends the watch registrant.
-		expect(result.order.get("background_tasks")?.slice(-3)).toEqual([
+		// 0079 later appends the watch registrant and 0085 the executor session binding.
+		expect(result.order.get("background_tasks")?.slice(-4)).toEqual([
 			"insert_seq",
 			"background_kind",
 			"principal_json",
+			"executor_session_json",
 		]);
 	});
 

@@ -36,7 +36,7 @@ keywords:
   - 分支列表
   - git 身份
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 ---
 # 分支与引用查询
 

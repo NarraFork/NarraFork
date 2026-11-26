@@ -37,7 +37,7 @@ keywords:
   - 叙事线遗留
   - worktree 删除
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 ---
 # 会话 worktree
 
@@ -50,6 +50,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 工具：现用的是 `ListWorktrees`、`CreateWorktree`、`AttachWorktree`、`GetWorktreeOperation`；旧的 `Worktree` 工具 `isAvailable: () => false`。工具声明远程执行、删除和 prune 均不支持（`lib/agent/tools/worktree.ts`）。
 - 删除只有一条通道：`NarratorWorktreeService.remove` → `applyGuardedRemoval` 里的 `git worktree remove`，在整个 `server/` 非测试代码中没有其他调用点。先 `removal/plan` 预检，列出阻塞项（主工作区、已锁定、有容器或卷快照在用、依赖会话在运行、依赖无处迁移、依赖枚举无界等，错误码形如 `WORKTREE_REMOVAL_*`）。
 - 保护声明是 `narrators.cwd` / `workspace_context.cwd`，不是状态：归档的会话仍占着目录，所以移除时要把它们迁到别处（`relocate`）；终端先于所有者行关闭（`onDelete: restrict`），后台任务先取消并确认停止才动 git（`narrator-worktree-retirement.ts` 文件头）。
+- 移除时关闭终端（`narrator-worktree-retirement.ts` 调 `terminal-service.ts:cleanupForWorktree`）：按 `worktreeResourceId` 取登记终端，另外把所有无 owner 的终端按 id 顺序分页读出（读 Worker，每页 500，最多 40 页）在 JS 里判断 cwd 是否在被删目录内；40 页内扫不完就抛 409 `WORKTREE_REMOVAL_TERMINAL_SCAN_INCOMPLETE`，让这次退役失败，而不是留下跑在已删目录里的 shell。
 - 会丢什么（`measureLoss`）：未提交文件按 git 默认读；游离 HEAD 上只有它能到达的提交（`countCommitsOnlyReachableFrom`，`rev-list <head> --not --branches --remotes --tags`）带 `TRUE_HISTORY_ENV` 算——替换引用或 graft 文件（仓库内容）声称某分支到达它时，仍算丢失、要求 force 确认。worktree 创建与状态查询不带它，保持人自己 git 看到的历史。
 - 删除执行前在保护预留里重新检查所有声明，重新被占用的目录会被拒绝而不是被删；一旦分发，客户端断开不会中断 git（用独立的超时信号）。重试是幂等的，已不存在的目录走 `already_absent`。
 - 既不在 git 列表、也没有登记过的路径，只有位于 `<仓库根>/.worktrees/` 下才能进入删除流程，否则 `WORKTREE_REMOVAL_UNKNOWN_PATH`（`narrator-worktree-service.ts` 约 1360–1380 行）。叙事线时代遗留在 `.worktrees/` 下的目录没有记录；任何自动清理逻辑都不应删除它们，状态/树快照也把 `.worktrees` 排除在外（`worktree-tree-snapshot.ts:WORKTREES_DIR_NAME`）。本节后半「不应自动清理」来自项目约定，代码里只确认了删除必须由显式请求触发。
@@ -57,7 +58,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 创建回执用 journal 持久化，单条记录上限 32 KiB；未知、畸形或矛盾的证据一律按「有资源效果」保护（`narrator-worktree-journal.ts:worktreeReceiptHasResourceEffect`）。
 
 - 资源 id 是 `sha256(JSON[deviceId, worktreePath])`（`narrator-worktree-resource-store.ts:worktreeResourceId`）；注册表经注入的 admission 提交，生产环境必须提供生命周期准入，没有隐式清理接口。`worktree-resource-owner.ts:resolveWorktreeResourceOwner` 把所有者选择器解析为 worktreeResource / legacyNarrator / legacyStandalone，缺失或混用选择器（`OWNER_SELECTOR_INVALID`/`OWNER_SELECTOR_MIXED`）一律报错，不退回旧所有者；终端服务按它判断归属。
-- 生命周期保护（`worktree-lifecycle-guard.ts`）：删除前预留目标，同时检查新工作目录的准入声明；声明冲突报 409 `RESOURCE_PROTECTED`，无法完整验证报 409 `RESOURCE_PROTECTION_UNAVAILABLE`，不放行。检查预算 256 KiB、5 秒、128 个目标；删除只在被删目录包含声明时才冲突，新 cwd 在被删目录之上不算被删。声明索引在 `resource-protection-index.ts`（SQLite 索引加回执目录，启动时 `startProtectionIndexMaintenance` 后台维护，`db/resource-protection-index.ts` 负责启动期初始化）。
+- 生命周期保护（`worktree-lifecycle-guard.ts`）：删除前预留目标，同时检查新工作目录的准入声明；声明冲突报 409 `RESOURCE_PROTECTED`，无法完整验证报 409 `RESOURCE_PROTECTION_UNAVAILABLE`，不放行。检查预算 256 KiB、5 秒、128 个目标；删除只在被删目录包含声明时才冲突，新 cwd 在被删目录之上不算被删。声明索引在 `resource-protection-index.ts`（SQLite 索引加回执目录，启动时 `startProtectionIndexMaintenance` 后台维护，`db/resource-protection-index.ts` 负责启动期初始化）。索引的读取（进度行、候选路径、脏源、源表事实）都经读 Worker（`readNativeRows`，`worker-required`，超时取检查剩余预算），按 16 条一批取事实；检查前后比较各来源的修订号，检查期间数据变了就抛错。`inspect` 把读失败、清单不完整、数据中途变化都归为 `unavailable`，即 409 `RESOURCE_PROTECTION_UNAVAILABLE`。删项目时 `withProjectRetirement` 查是否还有该项目作用域的 worktree 资源，也在读 Worker 上执行。
 - 运行时装配：`narrator-worktree-runtime.ts` 导出带主体授权的 `narratorWorktreeService` 单例与 `narratorWorktreePrincipalForTool`，HTTP 路由与 Agent 工具共用；跨设备目标要求运行时代数一致。
 - 叙事线遗留：`legacy-chapter-resource-cleanup.ts:retireLegacyChapterResources` 启动时后台一次（`main.ts`），按 200 条一批停掉无 worktree 资源归属的容器、释放端口、删除无人可达的终端布局与卷快照应用行；它清理的是运行时行，不碰 `.worktrees/` 下的目录。
 - `worktree-resource-metadata-store.ts`（配置、终端、容器、端口、布局五类动作，请求 16 KiB、摘要 256 KiB、每页 128）目前只有测试引用，没有生产调用点。

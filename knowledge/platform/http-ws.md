@@ -40,7 +40,7 @@ keywords:
   - /api/health
   - 503 Retry-After
 status: draft
-verified_at: 4d59774711a51a9ac966794090c8b3a04d549048
+verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 ---
 # HTTP 路由与 WebSocket
 
@@ -59,6 +59,7 @@ verified_at: 4d59774711a51a9ac966794090c8b3a04d549048
 - 其他 WebSocket 能力复用叙述者通道：`narrator-ws.ts` 里分派 `editor-file-ws`、`git-workspace-ws`、`outline-page-ws`、`outline-live-ws` 的消息和订阅释放，不是各自独立的路径；外部 OAuth 叙述者通道 `/ws/external/v1/narrators` 用一次性 ticket 升级，并复核令牌的 `narrator.read`、`event.subscribe` 范围与来源 Origin（`http-dispatcher.ts`）。
 - 升级后 `wsHandlers` 按 `channel` 分派到 `narrator-ws.ts`、`terminal-ws.ts` 等；叙述者通道是订阅模型（`subscribe`/`unsubscribe`，拒绝时回 `subscribe_denied`）。
 - 状态投影：`narrator-status-version.ts` 定义固定小列（状态/子状态、回合开始/更新时间、错误与可重试标记、联动归档 id），不广播完整叙述者。SQLite `updateStatus/compareAndSetStatus/writeSubstatus` 在同步 `UPDATE RETURNING` 成功点分配版本，保留其已提交投影再广播；`substatus_change` 同样带完整主状态，避免新子状态压掉旧主状态后丢失最终主状态。归档、错误通知 dismiss、循环终态清理也复用该小列投影，不在异步副作用结束后回读最新状态冒充原事务。
+- `updateStatus` 的 `keepIdleError`（需同时给 `substatus`，调用方在 `narrator-session.ts`）：读到会话已是 `idle` 且子状态含 `error` 时，只在事务里复核观测行（`assertNarratorRead`）后返回 `false`，不写库、不分配版本、不广播；并发变化让复核冲突而不是被覆盖（`narrator-persistence.ts:updateStatus`）。
 - 状态版本：一个进程级、热重载保留的 `statusEpoch` + 单调 `statusRevision`，无按会话增长的后端版本缓存；事务回滚留下 revision 空隙允许。panel 与 list 快照在同步读状态之前分配版本，不能等占用索引等异步读取完成后才编号，否则旧快照会冒充新状态；panel 取详情小列，list 仍只取轻量列。
 - 完整状态帧与 panel 快照经 `committedNarratorStatusPatch` 异步附可选精确 `messageCount`：用提交时内部 `messageVersion` 与 worker 单 SQL 计数快照版本对齐，同会话/同版本在途共享，错配或失败省略计数，不回退主线程或上界列。list 快照不加此计数；错误提示另行落库导致消息版本变化时，为该后续提交重新分配状态版本，不能提升原旧状态补丁。
 - 公开分享的 `status_change/substatus_change`（含快照）只保留 `type/narratorId/status/substatus/turnStartedAt/updatedAt/messageCount/statusEpoch/statusRevision/backgroundWorkActive`；精确计数与状态版本可见，但内部 `messageVersion`、错误详情和联动归档信息不可见（`narrator-ws.ts:projectPublicNarratorEvent`）。

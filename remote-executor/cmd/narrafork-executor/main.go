@@ -142,7 +142,7 @@ func run(ctx context.Context, ready func()) error {
 	if caps.Pty {
 		sessions := session.NewManager(session.DefaultLimits())
 		h.SetSessionManager(sessions)
-		caps.Features = append(caps.Features, handlers.FeatureSessionDurableV1)
+		caps.Features = append(caps.Features, handlers.FeatureSessionDurableV1, handlers.FeatureSessionExecV1)
 		defer sessions.Shutdown()
 	}
 

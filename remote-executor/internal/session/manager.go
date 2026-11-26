@@ -26,6 +26,12 @@ type Process interface {
 	Close() error
 }
 
+// DeadlineReporter is implemented by a Process that enforces its own deadline;
+// TimedOut, read after Wait, reports whether the deadline stopped it.
+type DeadlineReporter interface {
+	TimedOut() bool
+}
+
 // Limits bounds what the manager keeps in memory.
 type Limits struct {
 	RetainBytes   int           // output kept per session
@@ -70,8 +76,10 @@ type Info struct {
 	ExitCode  *int   `json:"exitCode,omitempty"`
 	StartedAt string `json:"startedAt"`
 	ExitedAt  string `json:"exitedAt,omitempty"`
-	FirstSeq  int64  `json:"firstSeq"`
-	EndSeq    int64  `json:"endSeq"`
+	// TimedOut: the process's own deadline stopped it (see DeadlineReporter).
+	TimedOut bool  `json:"timedOut,omitempty"`
+	FirstSeq int64 `json:"firstSeq"`
+	EndSeq   int64 `json:"endSeq"`
 }
 
 // Session is one long-lived process with its output journal.
@@ -87,7 +95,11 @@ type Session struct {
 	exited        bool
 	exitCode      int
 	exitedAt      time.Time
+	timedOut      bool
 	releaseOnExit bool
+	// killRequested: a kill arrived while the process was still starting; it is
+	// stopped as soon as it exists.
+	killRequested bool
 
 	writeMu  sync.Mutex
 	seen     map[string]struct{}
@@ -111,6 +123,7 @@ func (s *Session) info() Info {
 		info.State = "exited"
 		info.ExitCode = &code
 		info.ExitedAt = s.exitedAt.UTC().Format(time.RFC3339Nano)
+		info.TimedOut = s.timedOut
 	}
 	return info
 }
@@ -202,6 +215,12 @@ func (m *Manager) Open(id, kind string, start func() (Process, error)) (Info, er
 	s.proc = proc
 	m.mu.Unlock()
 	m.run(s)
+	s.mu.Lock()
+	killNow := s.killRequested
+	s.mu.Unlock()
+	if killNow {
+		_ = proc.Kill()
+	}
 	return s.info(), nil
 }
 
@@ -232,9 +251,14 @@ func (m *Manager) run(s *Session) {
 			<-readDone
 		}
 		_ = s.proc.Close()
+		timedOut := false
+		if r, ok := s.proc.(DeadlineReporter); ok {
+			timedOut = r.TimedOut()
+		}
 		s.mu.Lock()
 		s.exited = true
 		s.exitCode = code
+		s.timedOut = timedOut
 		s.exitedAt = m.now()
 		release := s.releaseOnExit
 		s.mu.Unlock()
@@ -341,9 +365,24 @@ func (m *Manager) Resize(id string, cols, rows uint16) error {
 // it needs never races the exit with a separate Release. Killing an exited
 // session is a no-op (and, with release, releases it now).
 func (m *Manager) Kill(id string, release bool) error {
-	s, err := m.get(id)
-	if err != nil {
-		return err
+	m.mu.Lock()
+	s, ok := m.sessions[id]
+	starting := ok && s.proc == nil
+	m.mu.Unlock()
+	if !ok {
+		return ErrNotFound
+	}
+	if starting {
+		// Reserved by an Open still starting the process: answering "not found"
+		// would let the caller drop its stop while the process comes up. Open
+		// stops it as soon as it exists.
+		s.mu.Lock()
+		s.killRequested = true
+		if release {
+			s.releaseOnExit = true
+		}
+		s.mu.Unlock()
+		return nil
 	}
 	s.mu.Lock()
 	exited := s.exited
@@ -415,6 +454,7 @@ const (
 type AttachResult struct {
 	ExitCode int   `json:"exitCode"`
 	EndSeq   int64 `json:"endSeq"`
+	TimedOut bool  `json:"timedOut,omitempty"`
 }
 
 // Attach streams output from since until the session ends or ctx is done.
@@ -453,7 +493,10 @@ func (m *Manager) Attach(
 		}
 		if res.EOF {
 			_, code, _ := s.exitState()
-			result := AttachResult{ExitCode: code, EndSeq: pos}
+			s.mu.Lock()
+			timedOut := s.timedOut
+			s.mu.Unlock()
+			result := AttachResult{ExitCode: code, EndSeq: pos, TimedOut: timedOut}
 			payload, _ := json.Marshal(result)
 			send(ChannelExit, payload)
 			return result, nil

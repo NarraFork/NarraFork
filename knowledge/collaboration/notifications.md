@@ -42,7 +42,7 @@ keywords:
   - Notification 工具
   - test-dingtalk
 status: draft
-verified_at: 2c639f086aef21d60357f1e002e62767938833e8
+verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 ---
 # 通知与注意力
 
@@ -51,6 +51,7 @@ verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 ## 关键规则
 - 通知中心（`notifications` 表）只有两种 kind：`chat_message` 与 `permission_request`（`shared/notification-center.ts:NotificationKind`）；`(user_id, kind, source_key)` 唯一用于去重；历史有界，保留最多 500 行、30 天（`NOTIFICATION_RETENTION_*`，清理见 `notification-center-maintenance.ts`）。
 - 扇出：`notification-fanout.ts:initNotificationFanout` 监听事件总线：`chat:message_created` 为符合条件的成员写行（成员、非发送者、未静音、未读、仍可读房间；已软删除消息跳过；只对 dm/bot 会话，narrator 讨论室不进通知中心），收件人上限 200；`narrator:permission_request` 同理；`chat:room_read` 同步已读。扇出独立于 WebSocket，失败只记日志、不回滚源写入。
+- 读取走读 Worker（`readQuery`/`readQueryFirst`/`readDbAll`，`worker-required`，不回退主线程）：扇出时的消息/房间/成员/发送者、通知列表与来源、维护轮选用户、注意力收件箱的叙述者/工具调用/问题查询、外部提醒的叙述者与偏好。写在主线程：新行用 `INSERT ... ON CONFLICT DO NOTHING RETURNING id` 判定是否真插入（只有插入了才广播未读变化），已读与删除也用 `RETURNING` 计数，不再读 `changes()`（`notification-center-service.ts:recordNotifications`、`updateReadIds`）。
 - 与角标不同，通知中心不排除正在查看的人，它是事件历史而不是实时角标。
 - 路由 `/api/notifications`：列表（游标分页）、unread-count、read、`:id/delete`，均按当前用户限定；另有 `test-dingtalk`/`test-feishu`。
 - 人类注意力（`human-attention-service.ts`）：把待处理的决策投影成一个收件箱，来源分别是：进行中的工具审批闸门（按工具名分 `permission` / `blocking_question`（`AskUserQuestion`）/ `plan_approval`（`ExitPlanMode`））、等待用户的危险操作反思与任务反思（`reflection`）、被等待与未被等待的异步问题（`async_question`）、大纲里要你决定的问题和待确认变更（`outline_decision`）与大纲汇报（`outline_digest`，来自 `outline/inbox.ts`）；`plan_approval` 的权限详情带 `planReflectionAvailable`（`isPendingPlanReflectionAvailable`，收件箱里才有「计划反思」按钮）；按调用者的叙述者 ACL 过滤；单次最多检查 400 个候选、2 秒协作式时间预算，因此一页可能很短或为空却仍带 `nextCursor`；游标不是快照。它只是投影，决策仍走各自原有的受保护端点；暴露在 `GET /api/narrators/human-attention[/:id]`。变更通过 `human_attention:changed` 事件（不带数据，观察者按自己的 ACL 重取）通知。
