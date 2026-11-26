@@ -20,7 +20,8 @@
  *   ref moves (git updates the "tracking" refs of a configured remote whose push URL is the one
  *   pushed to, through that remote's fetch refspecs) — never forced, no hook, no signing, no
  *   submodule recursion, no push option, the receive-pack program pinned, and refused where the
- *   work-start fetch refuses the repository's configuration.
+ *   work-start fetch refuses the repository's configuration. A password in origin's URL is taken
+ *   out of it and given to git by environment only, never on a command line.
  * - `inspectCheckout` / `fastForwardCheckout`: the explicit fast-forward of a person's checkout
  *   (`merge --ff-only`), refused unless the checkout is exactly where the merge was prepared, and
  *   checked afterwards (no unmerged entry, no new stash, HEAD still on the base at the merge).
@@ -473,12 +474,7 @@ export function networkOverrides(
 	// shares it), then the host's helpers are added back in the order git read them.
 	const helpers: Array<readonly [string, string]> = [];
 	if (repositoryKeys(entries).some((key) => isHelperKey(key.toLowerCase())))
-		helpers.push(
-			["credential.helper", ""],
-			...entries
-				.filter((entry) => HOST_SCOPES.has(entry.scope) && isHelperKey(entry.key.toLowerCase()))
-				.map((entry) => [entry.key, entry.value] as const),
-		);
+		helpers.push(["credential.helper", ""], ...hostHelpers(entries));
 	// Extra headers accumulate the same way: reset, then the host's again, in order.
 	if (repositoryKeys(entries).some((key) => isExtraHeaderKey(key.toLowerCase())))
 		helpers.push(
@@ -615,6 +611,110 @@ export function redactUserinfo(text: string): string {
 	return text.replace(/([a-z][a-z0-9+.-]*:\/\/)[^/@\s'"]+@/gi, "$1");
 }
 
+/** The login a URL's userinfo carries (`user:password@`), decoded as git decodes it. */
+export interface UrlCredentials {
+	protocol: string;
+	/** As git's credential protocol names it: everything between `@` and the first `/`. */
+	host: string;
+	username: string;
+	password: string;
+}
+
+/** `%XX` decoded to bytes, the rest kept (git's `url_decode`: a malformed escape stays as is). */
+function percentDecode(text: string): string {
+	if (!text.includes("%")) return text;
+	const bytes = new TextEncoder().encode(text);
+	const out: number[] = [];
+	const hex = (byte: number | undefined) =>
+		byte === undefined ? -1 : Number.parseInt(String.fromCharCode(byte), 16);
+	for (let i = 0; i < bytes.length; i++) {
+		const high = hex(bytes[i + 1]);
+		const low = hex(bytes[i + 2]);
+		if (bytes[i] === 0x25 && high >= 0 && low >= 0) {
+			out.push(high * 16 + low);
+			i += 2;
+		} else out.push(bytes[i] as number);
+	}
+	return new TextDecoder().decode(Uint8Array.from(out));
+}
+
+/**
+ * A push URL with its password taken out, so that it never reaches a command line (git hands the
+ * URL to `git-remote-https` as an argument too, and every process's argv is world-readable):
+ * `https://user:token@host/o/r` becomes `https://user@host/o/r` (the user kept, credential helpers
+ * match on it) and the login is returned for {@link credentialFromEnvironment}. Parsed as git's
+ * `credential_from_url` parses it (the first `@` before the first `/`, the first `:` before it).
+ * Null when the URL carries a password that cannot be handed over that way: a transport other than
+ * http(s), or a value with a newline or NUL.
+ */
+export function splitUrlCredentials(
+	url: string,
+): { url: string; credentials: UrlCredentials | null } | null {
+	const scheme = /^([a-z][a-z0-9+.-]*):\/\//i.exec(url);
+	if (!scheme) return { url, credentials: null };
+	const rest = url.slice(scheme[0].length);
+	const slash = rest.indexOf("/");
+	const end = slash < 0 ? rest.length : slash;
+	const at = rest.indexOf("@");
+	if (at < 0 || at >= end) return { url, credentials: null };
+	const colon = rest.slice(0, at).indexOf(":");
+	if (colon < 0) return { url, credentials: null };
+	const protocol = scheme[1] as string;
+	if (!/^https?$/i.test(protocol)) return null;
+	const user = rest.slice(0, colon);
+	const username = percentDecode(user);
+	const password = percentDecode(rest.slice(colon + 1, at));
+	if (/[\n\0]/.test(username) || /[\n\0]/.test(password)) return null;
+	return {
+		url: `${scheme[0]}${user ? `${user}@` : ""}${rest.slice(at + 1)}`,
+		credentials: { protocol, host: rest.slice(at + 1, end), username, password },
+	};
+}
+
+/**
+ * The credential helper that answers with a URL's login from the environment only: it prints
+ * `NARRAFORK_PUSH_USERNAME` / `NARRAFORK_PUSH_PASSWORD` for a `get` of exactly the URL's protocol
+ * and host, and nothing otherwise (no `store`, no `erase`). Its command line names the variables,
+ * never their values; a process's environment is readable by its owner only.
+ */
+const ENV_CREDENTIAL_HELPER = [
+	"!f() {",
+	'test "$1" = get || return 0;',
+	"p=; h=;",
+	'while IFS= read -r l && test -n "$l"; do',
+	// biome-ignore lint/suspicious/noTemplateCurlyInString: the shell's own parameter expansion
+	'case "$l" in protocol=*) p="${l#protocol=}" ;; host=*) h="${l#host=}" ;; esac;',
+	"done;",
+	'test "$p" = "$NARRAFORK_PUSH_PROTOCOL" && test "$h" = "$NARRAFORK_PUSH_HOST" || return 0;',
+	'printf \'username=%s\\npassword=%s\\n\' "$NARRAFORK_PUSH_USERNAME" "$NARRAFORK_PUSH_PASSWORD";',
+	"}; f",
+].join(" ");
+
+/**
+ * Command-scope settings and environment that give git a URL's login without any command line
+ * carrying it: the helper list reset, {@link ENV_CREDENTIAL_HELPER} first (as the login in the URL
+ * came first before), then the host's own helpers again in their order. Goes after every other
+ * override (its reset clears any list before it).
+ */
+export function credentialFromEnvironment(
+	credentials: UrlCredentials,
+	entries: readonly ScopedConfigEntry[],
+): { overrides: Array<readonly [string, string]>; env: Record<string, string> } {
+	return {
+		overrides: [
+			["credential.helper", ""],
+			["credential.helper", ENV_CREDENTIAL_HELPER],
+			...hostHelpers(entries),
+		],
+		env: {
+			NARRAFORK_PUSH_PROTOCOL: credentials.protocol,
+			NARRAFORK_PUSH_HOST: credentials.host,
+			NARRAFORK_PUSH_USERNAME: credentials.username,
+			NARRAFORK_PUSH_PASSWORD: credentials.password,
+		},
+	};
+}
+
 /** The outcome of a push of one branch. */
 export type PushBranchResult =
 	| { outcome: "pushed" }
@@ -639,6 +739,11 @@ export function parsePushPorcelain(
 }
 
 const isHelperKey = (lower: string) => lower.startsWith("credential.") && lower.endsWith(".helper");
+/** The host's (system/global) credential helpers, in the order git read them. */
+const hostHelpers = (entries: readonly ScopedConfigEntry[]) =>
+	entries
+		.filter((entry) => HOST_SCOPES.has(entry.scope) && isHelperKey(entry.key.toLowerCase()))
+		.map((entry) => [entry.key, entry.value] as const);
 const isExtraHeaderKey = (lower: string) =>
 	lower.startsWith("http.") && lower.endsWith(".extraheader");
 
@@ -711,7 +816,9 @@ export interface TeamRepoGit {
 	 * G: push `head` to `refs/heads/<branch>` at `url` (origin's push URL as read): no `+`, no
 	 * lease, so a remote branch with commits the head lacks is rejected. Refused before anything
 	 * runs (`TEAM_REMOTE_CONFIG_UNSAFE`) when the repository's own configuration would choose the
-	 * transport, credentials or a program, or rewrite the URL.
+	 * transport, credentials or a program, or rewrite the URL. A password in the URL never reaches a
+	 * command line: git gets the URL without it and the login through the environment only
+	 * (`splitUrlCredentials`, `credentialFromEnvironment`).
 	 */
 	pushBranch(input: { url: string; head: string; branch: string }): Promise<PushBranchResult>;
 }
@@ -1009,15 +1116,28 @@ export function teamRepoGit(repo: string, options: { signal?: AbortSignal } = {}
 				? { ok: true }
 				: { ok: false, message: redactUserinfo(complaint(result)) };
 		},
-		async pushBranch({ url, head, branch }) {
+		async pushBranch({ url: configured, head, branch }) {
 			assertSha(head);
 			assertBranch(branch);
-			if (!url || url.startsWith("-") || unsafeForCommand(url))
+			if (!configured || configured.startsWith("-") || unsafeForCommand(configured))
 				throw new GitError("Not a URL to push to");
+			// A password in the URL never reaches argv: the URL without it, the login by environment.
+			const split = splitUrlCredentials(configured);
+			if (!split)
+				return {
+					outcome: "failed",
+					message:
+						"Origin's URL carries a password NarraFork cannot hand to git without putting it on a command line; use a credential helper of the host instead",
+				};
+			const url = split.url;
 			const entries = await scopedConfig(repo, NETWORK_PATTERN, signal);
 			const pushEntries = await scopedConfig(repo, PUSH_PATTERN, signal);
+			assertPushUrlUntouched(pushEntries, configured);
 			assertPushUrlUntouched(pushEntries, url);
 			const network = networkOverrides(entries, envWithAmbientProxy());
+			const login = split.credentials
+				? credentialFromEnvironment(split.credentials, entries)
+				: { overrides: [], env: {} };
 			// As for the fetch: the host's credentials and ssh, never the hardening's emptied ones.
 			const hardened = (await programConfig()).filter(
 				([key]) =>
@@ -1042,11 +1162,11 @@ export function teamRepoGit(repo: string, options: { signal?: AbortSignal } = {}
 					`${head}:${destination}`,
 				],
 				{
-					config: [...hardened, ...network.overrides, ...PUSH_NEUTRAL],
+					config: [...hardened, ...network.overrides, ...PUSH_NEUTRAL, ...login.overrides],
 					network: true,
 					timeout: PUSH_TIMEOUT_MS,
 					maxOutputBytes: PUSH_OUTPUT_BYTES,
-					env: network.env,
+					env: { ...network.env, ...login.env },
 					signal,
 				},
 			).finally(() => borrowed.remove());

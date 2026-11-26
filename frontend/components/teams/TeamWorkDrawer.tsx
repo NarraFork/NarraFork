@@ -62,6 +62,7 @@ import { ActivityLine } from "./TeamActivity";
 import { MergeButton, MergeOutcome } from "./TeamMerge";
 import {
 	conflictReasonFiles,
+	currentPullRequest,
 	diffLineKind,
 	findingsNeedToggle,
 	itemMarks,
@@ -807,7 +808,7 @@ export function TeamWorkDrawer({
 	// the server keeps a read 20 s).
 	const refresh = useRefreshPullRequest(projectId, teamId);
 	// Only when the route would allow it (a member with project write), never a silent 403.
-	const hasPr = !!data?.merge?.pr?.canRefresh;
+	const hasPr = !!currentPullRequest(data?.merge)?.canRefresh;
 	const refreshed = useRef<string | null>(null);
 	useEffect(() => {
 		if (!itemId) refreshed.current = null;

@@ -79,6 +79,7 @@ import {
 	hostingOf,
 	type ProjectHosting,
 	parseRemoteUrl,
+	peekHosting,
 	readOriginTarget,
 } from "./team-hosting";
 import {
@@ -104,10 +105,12 @@ import {
 	type PrStatus,
 	type PullRequestRecord,
 	peekPrStatus,
+	prClosedForItem,
 	prStatusFresh,
 	prStatusOf,
 	storePrStatus,
 	summarizeChecks,
+	timeAfter,
 } from "./team-pr-state";
 import { baseBranchOf, fetchOnce, remoteTrackingRef } from "./team-work-start";
 import { markMergedByPullRequest, recordWorkEvent } from "./work-items";
@@ -128,6 +131,12 @@ const POLL_BATCH = 20;
 const POLL_PROJECTS_MAX = 200;
 const POLL_ITEMS_PER_PROJECT = 100;
 const READS_AT_ONCE = 2;
+/**
+ * How often the background pass looks again at a pull request it took as closed for the item
+ * (closed, or retargeted to another base): reopened or retargeted back on GitHub, it recovers.
+ * One merged at an older head is never read again (a merge is final).
+ */
+const CLOSED_RECHECK_MS = 5 * 60_000;
 
 const githubTarget = (hosting: GithubHosting): GhRepo => ({
 	host: hosting.host,
@@ -428,7 +437,7 @@ export async function runPullRequest(
 		throw ghFailure("TEAM_PR_OPEN_FAILED", error);
 	});
 	const open = found.find((entry) => entry.state === "OPEN");
-	const recorded = latestPullRequest(item.id);
+	const recorded = latestPullRequest(item.id, target);
 	if (!open) {
 		// Merged on GitHub at this very head already: nothing to open.
 		const merged = found.find(
@@ -488,11 +497,15 @@ export async function runPullRequest(
 	recordOpened(context, item.id, target, opened, prBase, head, recorded, !open);
 	forgetPrStatus(item.id);
 	// Its state right away (best effort; the drawer and the background pass read it again).
-	const record = latestPullRequest(item.id);
+	const record = latestPullRequest(item.id, target);
 	if (record) await readPullRequest(target, record, item.id, signal).catch(() => null);
 }
 
-/** `work.pr_opened`, unless that pull request is the one recorded already. */
+/**
+ * `work.pr_opened`, unless that pull request is the one recorded already and not closed for the
+ * item. One taken as closed (and found open again by 「重新发起 PR」) is recorded opened again,
+ * after its closing, so it recovers.
+ */
 function recordOpened(
 	context: JobContext,
 	itemId: string,
@@ -503,8 +516,10 @@ function recordOpened(
 	recorded: PullRequestRecord | null,
 	created: boolean,
 ): void {
+	const closed = prClosedForItem(itemId, { ...target, number: pr.number });
 	if (
 		!created &&
+		!closed &&
 		recorded?.number === pr.number &&
 		sameRepository(recorded, target) &&
 		recorded.url === pr.url
@@ -522,8 +537,9 @@ function recordOpened(
 			base,
 			head,
 			created,
+			...(closed && !created ? { reopened: true } : {}),
 		},
-		at: outcomeAt(context),
+		at: timeAfter(closed?.at, Date.parse(outcomeAt(context))),
 	});
 }
 
@@ -547,13 +563,13 @@ export async function runPrMerge(context: JobContext, signal: AbortSignal): Prom
 	const facts = await githubFacts(context, signal);
 	const { item, head, branch, base, git, repo, hosting } = facts;
 	const target = githubTarget(hosting);
-	const record = latestPullRequest(item.id);
+	// Only a pull request in the repository pull requests go to now: one left in a repository
+	// origin pointed to before is not the item's (「发起 PR」 opens one here).
+	const record = latestPullRequest(item.id, target);
 	if (!record)
-		throw new MergeFailure("TEAM_PR_NONE", "The item has no pull request yet: open one first");
-	if (!sameRepository(record, target))
 		throw new MergeFailure(
-			"TEAM_PR_REMOTE_CHANGED",
-			`The pull request is on ${repositoryName(record)}, but origin is ${repositoryName(target)} now; open it again`,
+			"TEAM_PR_NONE",
+			`The item has no pull request in ${repositoryName(target)} yet: open one first`,
 		);
 	const methods = hosting.gh?.ok ? hosting.gh.methods : [];
 	const method = context.method ?? methods[0];
@@ -659,7 +675,13 @@ export async function runPrMerge(context: JobContext, signal: AbortSignal): Prom
 		workItemId: item.id,
 		kind: "work.pr_queued",
 		actor: { kind: "person", id: context.userId },
-		detail: { pr: record.number, url: record.url, method, head },
+		detail: {
+			pr: record.number,
+			url: record.url,
+			repository: repositoryName(record),
+			method,
+			head,
+		},
 		at: outcomeAt(context),
 	});
 }
@@ -843,7 +865,7 @@ async function mergedPullRequest(input: {
 			method: input.method,
 			userId: input.userId,
 		});
-	if (!latestPrEvent(input.item.id, "work.pr_closed", input.record.number))
+	if (!prClosedForItem(input.item.id, input.record))
 		recordWorkEvent(db, {
 			teamId: input.teamId,
 			workItemId: input.item.id,
@@ -852,6 +874,7 @@ async function mergedPullRequest(input: {
 			detail: {
 				pr: input.record.number,
 				url: input.record.url,
+				repository: repositoryName(input.record),
 				merged: true,
 				reason: verdict,
 				head: input.status.headSha,
@@ -1018,7 +1041,7 @@ async function readPullRequest(
 						.catch(() => null)
 				: null;
 		const status = prStatusOf(view, record.number, checks);
-		storePrStatus(itemId, record.number, { status });
+		storePrStatus(itemId, record, { status });
 		return status;
 	});
 }
@@ -1062,34 +1085,39 @@ async function refreshNow(
 	if (isMerging(itemId)) return null;
 	const facts = itemFacts(itemId);
 	if (!facts) return null;
-	const record = latestPullRequest(itemId);
-	if (!record) return null;
-	if (!options.force && prStatusFresh(itemId, record.number))
-		return peekPrStatus(itemId, record.number)?.status ?? null;
-	// The pass does not keep reading a pull request it already took as closed for this item.
-	if (options.poll && latestPrEvent(itemId, "work.pr_closed", record.number)) return null;
 	const repo = repositoryOf(facts.item.projectId);
 	if (!repo) return null;
 	const hosting = await hostingOf(repo);
 	if (hosting.kind !== "github" || !hosting.gh?.ok) return null;
 	const target = githubTarget(hosting);
+	// Only the item's pull request in the repository origin resolves to now.
+	const record = latestPullRequest(itemId, target);
+	if (!record) return null;
+	if (!options.force && prStatusFresh(itemId, record))
+		return peekPrStatus(itemId, record)?.status ?? null;
+	// The pass reads a pull request it took as closed for this item only now and then (reopened or
+	// retargeted back, it recovers), and one merged at an older head never again.
+	const closed = options.poll ? prClosedForItem(itemId, record) : null;
+	if (
+		closed &&
+		(closed.detail.merged === true || prStatusFresh(itemId, record, Date.now(), CLOSED_RECHECK_MS))
+	)
+		return null;
 	// gh only ever reads the repository a person confirmed, while origin still resolves to it.
 	const pin = githubPinCheck(facts.item.projectId, hosting);
-	if (pin.refusal || !isGhRepo(record) || !sameRepository(record, target)) {
-		storePrStatus(itemId, record.number, {
-			error:
-				pin.refusal?.message ??
-				`origin is ${repositoryName(target)} now, not ${repositoryName(record)}`,
+	if (pin.refusal || !isGhRepo(record)) {
+		storePrStatus(itemId, record, {
+			error: pin.refusal?.message ?? `${repositoryName(record)} is not a repository gh can name`,
 		});
 		return null;
 	}
-	markPrRefreshing(itemId, record.number, true);
+	markPrRefreshing(itemId, record, true);
 	eventBus.emit({ type: "team:communication_changed", teamId: facts.item.teamId });
 	let status: PrStatus;
 	try {
 		status = await readPullRequest(target, record, itemId, signal);
 	} catch (error) {
-		storePrStatus(itemId, record.number, {
+		storePrStatus(itemId, record, {
 			error: error instanceof Error ? error.message : String(error),
 		});
 		eventBus.emit({ type: "team:communication_changed", teamId: facts.item.teamId });
@@ -1143,30 +1171,61 @@ async function applyTransitions(
 		return;
 	}
 	const now = new Date().toISOString();
+	const repository = repositoryName(record);
+	const closed = prClosedForItem(item.id, record);
 	if (status.state === "CLOSED") {
-		if (!latestPrEvent(item.id, "work.pr_closed", record.number))
+		if (!closed)
 			recordWorkEvent(db, {
 				teamId: item.teamId,
 				workItemId: item.id,
 				kind: "work.pr_closed",
 				actor: { kind: "system", id: null },
-				detail: { pr: record.number, url: record.url },
+				detail: { pr: record.number, url: record.url, repository },
 				at: now,
 			});
 		return;
 	}
 	// Retargeted to another base on GitHub: no longer this item's pull request.
-	if (status.baseRef !== baseBranchOf(facts.base).branch) {
-		if (!latestPrEvent(item.id, "work.pr_closed", record.number))
+	const prBase = baseBranchOf(facts.base).branch;
+	if (status.baseRef !== prBase) {
+		if (!closed)
 			recordWorkEvent(db, {
 				teamId: item.teamId,
 				workItemId: item.id,
 				kind: "work.pr_closed",
 				actor: { kind: "system", id: null },
-				detail: { pr: record.number, url: record.url, reason: "other_base", base: status.baseRef },
+				detail: {
+					pr: record.number,
+					url: record.url,
+					repository,
+					reason: "other_base",
+					base: status.baseRef,
+				},
 				at: now,
 			});
 		return;
+	}
+	// Open on the item's base again after it was taken as closed (reopened, or retargeted back, on
+	// GitHub): the item's pull request again, recorded after its closing so the newer one wins.
+	if (closed) {
+		recordWorkEvent(db, {
+			teamId: item.teamId,
+			workItemId: item.id,
+			kind: "work.pr_opened",
+			actor: { kind: "system", id: null },
+			detail: {
+				pr: record.number,
+				url: status.url || record.url,
+				repository,
+				base: prBase,
+				head: status.headSha,
+				created: false,
+				reopened: true,
+			},
+			at: timeAfter(closed.at),
+		});
+		forgetPrStatus(item.id);
+		storePrStatus(item.id, record, { status });
 	}
 	// Open, and carrying the ready head: only its own checks and review matter.
 	if (status.headSha !== head) return;
@@ -1188,7 +1247,7 @@ async function applyTransitions(
 		return;
 	}
 	const checks = status.checks?.state;
-	const last = latestPrEvent(item.id, "work.pr_checks", record.number);
+	const last = latestPrEvent(item.id, "work.pr_checks", record);
 	const sameHead = last?.head === head;
 	const lastChecks = sameHead ? str(last?.checks) : null;
 	const lastReview = sameHead ? str(last?.review) : null;
@@ -1205,6 +1264,7 @@ async function applyTransitions(
 		detail: {
 			pr: record.number,
 			url: record.url,
+			repository,
 			head,
 			checks: checksTurned ? checks : lastChecks,
 			review: status.review,
@@ -1260,7 +1320,11 @@ export function requestPrRefresh(input: {
 	if (team.status !== "active" || team.coordinator === "archived")
 		throw new AppError("This team is archived; nothing can change", 409, "TEAM_ARCHIVED");
 	const item = db
-		.select({ id: teamWorkItems.id, state: teamWorkItems.state })
+		.select({
+			id: teamWorkItems.id,
+			state: teamWorkItems.state,
+			projectId: teamWorkItems.projectId,
+		})
 		.from(teamWorkItems)
 		.where(and(eq(teamWorkItems.id, input.itemId), eq(teamWorkItems.teamId, input.teamId)))
 		.limit(1)
@@ -1272,12 +1336,18 @@ export function requestPrRefresh(input: {
 			409,
 			"TEAM_WORK_ITEM_NOT_READY",
 		);
-	const record = latestPullRequest(item.id);
+	// The pull request in the repository origin resolves to now (as cached; any while unread).
+	const repo = repositoryOf(item.projectId);
+	const hosting = repo ? peekHosting(repo) : null;
+	const record = latestPullRequest(
+		item.id,
+		hosting?.kind === "github" ? githubTarget(hosting) : null,
+	);
 	if (!record)
 		throw new AppError(`Work item ${item.id} has no pull request to read`, 409, "TEAM_PR_NONE");
-	if (prStatusFresh(item.id, record.number)) return { itemId: item.id, refreshing: false };
+	if (prStatusFresh(item.id, record)) return { itemId: item.id, refreshing: false };
 	// Marked before the answer, so the drawer's next read already polls.
-	markPrRefreshing(item.id, record.number, true);
+	markPrRefreshing(item.id, record, true);
 	void refreshPullRequest(item.id);
 	return { itemId: item.id, refreshing: true };
 }

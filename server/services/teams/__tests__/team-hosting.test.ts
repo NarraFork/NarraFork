@@ -11,7 +11,13 @@ import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { safeSpawn } from "../../../lib/spawn";
-import { ghNoRepository, ghVersion, ghWorkDir, setGhTimeoutScaleForTests } from "../team-gh";
+import {
+	ghNoRepository,
+	ghVersion,
+	ghWorkDir,
+	readAuthStatusText,
+	setGhTimeoutScaleForTests,
+} from "../team-gh";
 import { teamRepoGit } from "../team-git-write";
 import {
 	hostingOf,
@@ -26,6 +32,7 @@ import {
 	type FakeGh,
 	type FakeGhPlan,
 	installFakeGh,
+	olderGh,
 	repoViewJson,
 	usableGh,
 } from "./fake-gh.fixture";
@@ -273,6 +280,87 @@ describe.skipIf(!posix)("gh (a fake on PATH)", () => {
 			kind: "other",
 			host: "ghe.acme.test",
 		});
+	});
+
+	test("an older gh without `auth status --json`: its text answer is read instead (Devin 2)", async () => {
+		await fake.setPlan(olderGh());
+		expect(await resolveHosting("git@github.com:acme/app.git")).toEqual({
+			kind: "github",
+			host: "github.com",
+			owner: "acme",
+			repo: "app",
+			gh: { ok: true, methods: ["squash", "merge"] },
+		});
+		expect((await fake.calls()).map((call) => call.args.slice(0, 4))).toEqual([
+			["--version"],
+			["auth", "status", "--hostname=github.com", "--json"],
+			["auth", "status", "--hostname=github.com"],
+			["repo", "view", "github.com/acme/app", "--json"],
+		]);
+		// Logged out there, or gh does not know the host at all: disabled with the reason.
+		await fake.setPlan(olderGh("github.com", "error"));
+		expect(await resolveHosting("git@github.com:acme/app.git")).toMatchObject({
+			kind: "github",
+			gh: { ok: false, reason: "gh_logged_out" },
+		});
+		await fake.setPlan({
+			...olderGh(),
+			"auth status": {
+				rejects: ["--json"],
+				stderr: "You are not logged into any accounts on github.com\n",
+				exit: 1,
+			},
+		});
+		expect(await resolveHosting("git@github.com:acme/app.git")).toMatchObject({
+			kind: "github",
+			gh: { ok: false, reason: "gh_logged_out" },
+		});
+		// GitHub Enterprise still needs gh to know the host: listed when logged in or failing there.
+		await fake.setPlan(olderGh("ghe.acme.test"));
+		expect(await resolveHosting("git@ghe.acme.test:team/app.git")).toMatchObject({
+			kind: "github",
+			host: "ghe.acme.test",
+			gh: { ok: true },
+		});
+		await fake.setPlan(olderGh("ghe.acme.test", "error"));
+		expect(await resolveHosting("git@ghe.acme.test:team/app.git")).toMatchObject({
+			kind: "github",
+			gh: { ok: false, reason: "gh_logged_out" },
+		});
+		await fake.setPlan({
+			...olderGh(),
+			"auth status": {
+				rejects: ["--json"],
+				stderr: "You are not logged into any accounts on gitlab.example\n",
+				exit: 1,
+			},
+		});
+		expect(await resolveHosting("git@gitlab.example:team/app.git")).toEqual({
+			kind: "other",
+			host: "gitlab.example",
+		});
+	});
+
+	test("the text answer is read defensively", () => {
+		const read = (text: string, exitCode = 0, host = "ghe.acme.test") =>
+			readAuthStatusText(host, { stdout: text, stderr: "", exitCode });
+		// The pre-2.40 form.
+		expect(read("ghe.acme.test\n  ✓ Logged in to ghe.acme.test as octo (oauth_token)\n")).toEqual({
+			listed: true,
+			loggedIn: true,
+		});
+		// Another host's login is not this host's (a longer name that starts with it).
+		expect(read("ghe.acme.test.evil\n  ✓ Logged in to ghe.acme.test.evil account o\n", 1)).toEqual({
+			listed: false,
+			loggedIn: false,
+		});
+		expect(read("Timeout trying to log in to ghe.acme.test account o\n", 1)).toEqual({
+			listed: true,
+			loggedIn: false,
+		});
+		expect(
+			read('hostname "ghe.acme.test" not found among authenticated GitHub hosts\n', 1),
+		).toEqual({ listed: false, loggedIn: false });
 	});
 
 	test("gh runs in NarraFork's own empty directory, never a repository, with a cleaned environment", async () => {

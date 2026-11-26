@@ -55,7 +55,7 @@ keywords:
   - MergeButton
   - MergeOutcome
 status: draft
-verified_at: 29a63ae6cf12cd6b8ac56e38da9fa769d9bc7b23
+verified_at: 29d55c316f16e6318f2f09e77f4f8b573466c236
 ---
 # 团队页与审批
 
@@ -121,7 +121,7 @@ verified_at: 29a63ae6cf12cd6b8ac56e38da9fa769d9bc7b23
 - 新读接口必须带 LIMIT、走索引，并保持 SQLite 专用；git 读必须有超时与输出上限，diff 正文只在抽屉里按文件读。
 - 改合并的按钮与结果：`TeamMerge.tsx` 与 `team-page-model.ts:mergeControl` 同时用于抽屉和卡片；规则见[合并](merge.md)。
 - 确认 GitHub 仓库（G）：摘要的 `github {target, pinned, canConfirm}`；没确认时管理员点「发起 PR」先弹确认框（`githubConfirmation`，「将推送到 … 并在那里开 PR」），确认（`useSetTeamGithub`，`PUT …/team-github`）后接着发起；非管理员禁用（`github_unconfirmed`）；origin 指向别处时禁用（`github_target_changed`）并给项目设置的链接。按钮写着 `owner/repo`（`pullRequestRepo`）。抽屉只在 `pr.canRefresh` 时读 PR。看板与卡片的 head 是缩写的，PR 的 head 按前缀比较（`team-pr-state.ts:sameHead`）。
-- PR 的按钮与标签（G）：`team-page-model.ts:mergeControl` 在 GitHub 模式下给「发起 PR」（无 PR、或已合并）/「更新 PR」（PR 上不是 ready 的 head）/「重新发起 PR」（已关闭），PR 正好是 ready 的 head 时返回 null，由 `pullRequestControl` 给「查看 PR #N」（只用 http(s) 链接，`safeHref`）、标签（CI：通过 / N 项失败 / N 项进行中 / 无检查；评审：需要评审 / 已批准 / 要求修改；有冲突 / 落后于基线 / 被阻止 / 草稿；已加入合并队列；检查中）与「合并 PR」（只在 `canMergePr`，即 CLEAN、HAS_HOOKS、UNSTABLE；仓库允许多种方式时旁边一个菜单，默认的排第一；禁用时 tooltip 说 `prBlocker` 或整项的禁用原因）。抽屉打开、有 PR 且是成员时调一次 `pr/refresh`（`useRefreshPullRequest`），`pr.refreshing` 时与任务在跑时一样每 1.5 秒重读；失败的检查列在 `MergeOutcome` 上方（带链接）；底栏说明在 GitHub 模式换成 `barNotePr`。
+- PR 的按钮与标签（G）：只认仓库（`pr.repository`）与确认的（没确认时 origin 的）一致的 PR（`currentPullRequest`），换了仓库后旧仓库的 PR 不算，按钮回到「发起 PR」，抽屉也不为它读取。`team-page-model.ts:mergeControl` 在 GitHub 模式下给「发起 PR」（无 PR、或已合并）/「更新 PR」（PR 上不是 ready 的 head）/「重新发起 PR」（已关闭），PR 正好是 ready 的 head 时返回 null，由 `pullRequestControl` 给「查看 PR #N」（只用 http(s) 链接，`safeHref`）、标签（CI：通过 / N 项失败 / N 项进行中 / 无检查；评审：需要评审 / 已批准 / 要求修改；有冲突 / 落后于基线 / 被阻止 / 草稿；已加入合并队列；检查中）与「合并 PR」（只在 `canMergePr`，即 CLEAN、HAS_HOOKS、UNSTABLE；仓库允许多种方式时旁边一个菜单，默认的排第一；禁用时 tooltip 说 `prBlocker` 或整项的禁用原因）。抽屉打开、有 PR 且是成员时调一次 `pr/refresh`（`useRefreshPullRequest`），`pr.refreshing` 时与任务在跑时一样每 1.5 秒重读；失败的检查列在 `MergeOutcome` 上方（带链接）；底栏说明在 GitHub 模式换成 `barNotePr`。
 - 改待批计数的规则：页头状态句、侧栏团队标签、项目页团队卡片共用 `pendingCount`；项目页 `ProjectTeamCards` 的 `data-testid="project-team-card"` 是每个团队一张（浏览器测试 `team-page.browser.test.ts` 按它数）。
 
 ## 相关

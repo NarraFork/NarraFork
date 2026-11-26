@@ -12,7 +12,8 @@
  *   `GITHUB_ENTERPRISE_TOKEN`, `GH_HOST`, `GH_CONFIG_DIR`); the editor, browser, pager, debug and
  *   forced-terminal variables are dropped, and prompts, the update notifiers, colour, the pager
  *   and the spinner are off.
- * - **Which subcommands.** `--version`, `auth status --json hosts`, `repo view --json`, `pr list
+ * - **Which subcommands.** `--version`, `auth status --json hosts` (plain `auth status` on a gh
+ *   older than its `--json`), `repo view --json`, `pr list
  *   --head --json`, `pr create --head --base --title --body-file -`, `pr view --json`, `pr checks
  *   --json`, `pr merge --<method> --match-head-commit` and `api --hostname H
  *   repos/<o>/<r>/compare/<a>...<b>` (an explicit path, never a `{owner}` placeholder, which
@@ -295,27 +296,69 @@ const authSchema = z.object({
 	),
 });
 
+/** An older gh refused a flag it does not have (cobra's `unknown flag: --json`). */
+const unknownJsonFlag = (result: GhResult) =>
+	result.exitCode !== 0 && !result.stdout.trim() && /unknown flag:? --json\b/i.test(result.stderr);
+
 /**
  * Whether gh knows the host (`listed`) and is logged in there (`loggedIn`): `gh auth status
- * --hostname H --json hosts`, which exits 0 and lists nothing for a host it does not know.
+ * --hostname H --json hosts`, which exits 0 and lists nothing for a host it does not know. A gh
+ * without `auth status --json` (an older one: `unknown flag: --json`) is asked `gh auth status --hostname H` and read by
+ * {@link readAuthStatusText}.
  */
 export async function ghAuthStatus(
 	host: string,
 	signal?: AbortSignal,
 ): Promise<{ listed: boolean; loggedIn: boolean }> {
 	if (!isGhHost(host)) throw new GhError("invalid", "Not a host name");
-	const result = await runGh(["auth", "status", `--hostname=${host}`, "--json", "hosts"], {
+	const options = {
 		timeout: PROBE_TIMEOUT_MS,
 		maxOutputBytes: SMALL_BYTES,
 		okExitCodes: [1],
 		signal,
-	});
+	};
+	const result = await runGh(["auth", "status", `--hostname=${host}`, "--json", "hosts"], options);
+	if (unknownJsonFlag(result))
+		return readAuthStatusText(host, await runGh(["auth", "status", `--hostname=${host}`], options));
 	const parsed = parseJson(authSchema, result.stdout, "auth status");
 	const accounts = parsed.hosts[host] ?? [];
 	return {
 		listed: accounts.length > 0,
 		loggedIn: accounts.some((account) => account.state === "success"),
 	};
+}
+
+/**
+ * `gh auth status --hostname H` as text (stdout or, in older gh, stderr), read defensively: gh
+ * lists a host it knows under a line that is the host name alone, and says `Logged in to H` for an
+ * account that works there (`Failed to log in to H` / `Timeout trying to log in to H` for one that
+ * does not). A host it does not know gets a sentence and exit 1. An exit 0 with nothing
+ * recognisable counts as logged in (gh exits 1 for a host with no working account); the
+ * repository's own `gh repo view` permission is the real gate either way.
+ */
+export function readAuthStatusText(
+	host: string,
+	result: { stdout: string; stderr: string; exitCode: number },
+): { listed: boolean; loggedIn: boolean } {
+	const lines = `${result.stdout}\n${result.stderr}`.split("\n").map((line) => line.trim());
+	const named = (line: string, phrase: string) => {
+		const at = line.indexOf(`${phrase} ${host}`);
+		if (at < 0) return false;
+		const next = line[at + phrase.length + 1 + host.length];
+		return next === undefined || /[\s:,(]/.test(next);
+	};
+	const loggedIn =
+		lines.some((line) => named(line, "Logged in to")) ||
+		(result.exitCode === 0 && !lines.some((line) => named(line, "Failed to log in to")));
+	const listed =
+		loggedIn ||
+		lines.some(
+			(line) =>
+				line === host ||
+				named(line, "Failed to log in to") ||
+				named(line, "Timeout trying to log in to"),
+		);
+	return { listed, loggedIn };
 }
 
 const permissionSchema = z

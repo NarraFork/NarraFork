@@ -1431,6 +1431,7 @@ describe("pull requests (G)", () => {
 	const pr = (over: Partial<TeamWorkPullRequest> = {}): TeamWorkPullRequest => ({
 		number: 7,
 		url: "https://github.com/acme/app/pull/7",
+		repository: "github.com/acme/app",
 		state: "OPEN",
 		isDraft: false,
 		headMatches: true,

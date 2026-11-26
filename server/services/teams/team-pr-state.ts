@@ -1,9 +1,14 @@
 /**
  * What NarraFork knows about a ready item's pull request (G), without running gh: the record (the
- * newest `work.pr_opened`: number, URL, repository, base; no columns), the last state read from
- * GitHub (an in-memory cache per item, 20 s fresh, filled by `team-merge-pr.ts`), and the
- * summary cards and the drawer show. A leaf module so `team-merge.ts` can build summaries without
- * importing the PR jobs.
+ * newest `work.pr_opened` in the repository pull requests go to now: number, URL, repository,
+ * base; no columns), the last state read from GitHub (an in-memory cache per item, 20 s fresh,
+ * filled by `team-merge-pr.ts`), and the summary cards and the drawer show. A pull request is
+ * named by its repository and number together ({@link PrRef}): the record, the cache and every
+ * transition event (`work.pr_closed`, `work.pr_checks`, `work.pr_queued`) are matched on both, so
+ * a same-numbered pull request of another repository never inherits their state. Whether one is
+ * closed for the item is the newer of its `work.pr_opened` / `work.pr_closed`: a pull request
+ * reopened (or retargeted back) on GitHub is recorded opened again and recovers. A leaf module so
+ * `team-merge.ts` can build summaries without importing the PR jobs.
  */
 import {
 	TEAM_PR_CHECK_FAILURES_MAX,
@@ -14,15 +19,26 @@ import {
 	type TeamPrMergeState,
 	type TeamWorkPullRequest,
 } from "@shared/project-teams";
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, inArray } from "drizzle-orm";
 import { db } from "../../db";
 import { teamWorkEvents } from "../../db/schema";
 import { hotSafe } from "../../lib/hot-safe";
-import type { GhCheck, GhPrView } from "./team-gh";
+import type { GhCheck, GhPrView, GhRepo } from "./team-gh";
 
 /** How long a read pull request state is fresh. */
 export const PR_STATUS_TTL_MS = 20_000;
 const CACHE_MAX = 500;
+/** Events of one kind (or the opened/closed pair) one lookup reads, newest first. */
+const EVENTS_SCANNED = 20;
+
+/** A pull request as GitHub names it: its repository and its number there. */
+export interface PrRef extends GhRepo {
+	number: number;
+}
+
+/** `host/owner/repo` lowercased (GitHub names are case-insensitive). */
+export const repositoryKey = (target: GhRepo) =>
+	`${target.host}/${target.owner}/${target.repo}`.toLowerCase();
 
 /** The pull request an item has, from its newest `work.pr_opened`. */
 export interface PullRequestRecord {
@@ -39,17 +55,37 @@ export interface PullRequestRecord {
 
 const str = (value: unknown): string | null => (typeof value === "string" ? value : null);
 
-/** The item's pull request record (one indexed read), or null when none was opened. */
-export function latestPullRequest(itemId: string): PullRequestRecord | null {
-	const row = db
-		.select({ detail: teamWorkEvents.detailJson })
+/** The newest events of `kinds` of an item (one indexed, bounded read). */
+function newestEvents(itemId: string, kinds: readonly string[]) {
+	return db
+		.select({
+			kind: teamWorkEvents.kind,
+			detail: teamWorkEvents.detailJson,
+			createdAt: teamWorkEvents.createdAt,
+		})
 		.from(teamWorkEvents)
-		.where(and(eq(teamWorkEvents.workItemId, itemId), eq(teamWorkEvents.kind, "work.pr_opened")))
+		.where(and(eq(teamWorkEvents.workItemId, itemId), inArray(teamWorkEvents.kind, [...kinds])))
 		.orderBy(desc(teamWorkEvents.createdAt), desc(teamWorkEvents.id))
-		.limit(1)
-		.get();
-	const detail = row?.detail;
-	if (!detail) return null;
+		.limit(EVENTS_SCANNED)
+		.all();
+}
+
+/**
+ * The item's pull request record in `target` (the repository pull requests go to now; any
+ * repository when null), or null when none was opened there.
+ */
+export function latestPullRequest(
+	itemId: string,
+	target: GhRepo | null = null,
+): PullRequestRecord | null {
+	for (const row of newestEvents(itemId, ["work.pr_opened"])) {
+		const record = row.detail ? recordOf(row.detail) : null;
+		if (record && (!target || repositoryKey(record) === repositoryKey(target))) return record;
+	}
+	return null;
+}
+
+function recordOf(detail: Record<string, unknown>): PullRequestRecord | null {
 	const number = detail.pr;
 	const url = str(detail.url);
 	const repository = str(detail.repository);
@@ -60,23 +96,59 @@ export function latestPullRequest(itemId: string): PullRequestRecord | null {
 	return { number, url, host, owner, repo, base: str(detail.base), head: str(detail.head) };
 }
 
-/** The newest event of `kind` about pull request `pr` of an item (its detail), or null. */
+/**
+ * The repository an event's detail is about: its `repository`, else (events recorded before they
+ * carried one) the `host/owner/repo` of its pull request URL.
+ */
+function eventRepository(detail: Record<string, unknown>): string | null {
+	const repository = str(detail.repository);
+	if (repository) return repository.toLowerCase();
+	const url = str(detail.url);
+	if (!url) return null;
+	try {
+		const parsed = new URL(url);
+		const [owner, repo] = parsed.pathname.split("/").filter(Boolean);
+		return owner && repo ? `${parsed.hostname}/${owner}/${repo}`.toLowerCase() : null;
+	} catch {
+		return null;
+	}
+}
+
+/** Whether an event's detail is about pull request `ref` (its repository and number). */
+export function aboutPullRequest(detail: Record<string, unknown>, ref: PrRef): boolean {
+	return detail.pr === ref.number && eventRepository(detail) === repositoryKey(ref);
+}
+
+/** The newest event of `kind` about pull request `ref` of an item (its detail), or null. */
 export function latestPrEvent(
 	itemId: string,
 	kind: "work.pr_checks" | "work.pr_queued" | "work.pr_closed" | "work.pr_pushed",
-	pr?: number,
+	ref: PrRef,
 ): Record<string, unknown> | null {
-	const row = db
-		.select({ detail: teamWorkEvents.detailJson })
-		.from(teamWorkEvents)
-		.where(and(eq(teamWorkEvents.workItemId, itemId), eq(teamWorkEvents.kind, kind)))
-		.orderBy(desc(teamWorkEvents.createdAt), desc(teamWorkEvents.id))
-		.limit(1)
-		.get();
-	const detail = row?.detail ?? null;
-	if (!detail) return null;
-	if (pr !== undefined && detail.pr !== pr) return null;
-	return detail;
+	for (const row of newestEvents(itemId, [kind]))
+		if (row.detail && aboutPullRequest(row.detail, ref)) return row.detail;
+	return null;
+}
+
+/**
+ * Whether pull request `ref` is closed for the item: its newest `work.pr_closed` is newer than its
+ * newest `work.pr_opened` (a reopen recorded since recovers it). The closing event, or null.
+ */
+export function prClosedForItem(
+	itemId: string,
+	ref: PrRef,
+): { detail: Record<string, unknown>; at: string } | null {
+	for (const row of newestEvents(itemId, ["work.pr_opened", "work.pr_closed"])) {
+		if (!row.detail || !aboutPullRequest(row.detail, ref)) continue;
+		return row.kind === "work.pr_closed" ? { detail: row.detail, at: row.createdAt } : null;
+	}
+	return null;
+}
+
+/** A time to record an event at that sorts after `after` (an ISO time), now or later. */
+export function timeAfter(after: string | null | undefined, now = Date.now()): string {
+	const floor = after ? Date.parse(after) + 1 : 0;
+	return new Date(Math.max(now, Number.isFinite(floor) ? floor : 0)).toISOString();
 }
 
 // ── The read state ──────────────────────────────────────────────────────────
@@ -97,7 +169,8 @@ export interface PrStatus {
 }
 
 interface CacheEntry {
-	pr: number;
+	/** The pull request read: `host/owner/repo#number` ({@link refKey}). */
+	key: string;
 	status: PrStatus | null;
 	error: string | null;
 	at: number;
@@ -106,16 +179,23 @@ interface CacheEntry {
 
 const cache = hotSafe("narrafork.teams.prStatus", () => new Map<string, CacheEntry>());
 
-/** The cached state of an item's pull request `pr` (any age), or null. */
-export function peekPrStatus(itemId: string, pr: number): Readonly<CacheEntry> | null {
+const refKey = (ref: PrRef) => `${repositoryKey(ref)}#${ref.number}`;
+
+/** The cached state of an item's pull request `ref` (any age), or null. */
+export function peekPrStatus(itemId: string, ref: PrRef): Readonly<CacheEntry> | null {
 	const entry = cache.get(itemId);
-	return entry && entry.pr === pr ? entry : null;
+	return entry && entry.key === refKey(ref) ? entry : null;
 }
 
-/** Whether the cached state of `pr` is fresh (read less than 20 s ago). */
-export function prStatusFresh(itemId: string, pr: number, now = Date.now()): boolean {
-	const entry = peekPrStatus(itemId, pr);
-	return !!entry && entry.at > 0 && now - entry.at < PR_STATUS_TTL_MS;
+/** Whether the cached state of `ref` was read less than `ttl` (20 s) ago. */
+export function prStatusFresh(
+	itemId: string,
+	ref: PrRef,
+	now = Date.now(),
+	ttl = PR_STATUS_TTL_MS,
+): boolean {
+	const entry = peekPrStatus(itemId, ref);
+	return !!entry && entry.at > 0 && now - entry.at < ttl;
 }
 
 function put(itemId: string, entry: CacheEntry): void {
@@ -131,12 +211,12 @@ function put(itemId: string, entry: CacheEntry): void {
 /** Record a read (or its failure) of an item's pull request. */
 export function storePrStatus(
 	itemId: string,
-	pr: number,
+	ref: PrRef,
 	value: { status: PrStatus } | { error: string },
 ): void {
-	const previous = peekPrStatus(itemId, pr);
+	const previous = peekPrStatus(itemId, ref);
 	put(itemId, {
-		pr,
+		key: refKey(ref),
 		status: "status" in value ? value.status : (previous?.status ?? null),
 		error: "error" in value ? value.error.slice(0, 300) : null,
 		at: Date.now(),
@@ -145,10 +225,10 @@ export function storePrStatus(
 }
 
 /** Mark a read of `pr` as running (or done) for the drawer. */
-export function markPrRefreshing(itemId: string, pr: number, refreshing: boolean): void {
-	const previous = peekPrStatus(itemId, pr);
+export function markPrRefreshing(itemId: string, ref: PrRef, refreshing: boolean): void {
+	const previous = peekPrStatus(itemId, ref);
 	put(itemId, {
-		pr,
+		key: refKey(ref),
 		status: previous?.status ?? null,
 		error: previous?.error ?? null,
 		at: previous?.at ?? 0,
@@ -280,10 +360,15 @@ export function sameHead(a: unknown, b: unknown): boolean {
 	return a.length <= b.length ? b.startsWith(a) : a.startsWith(b);
 }
 
-export function prQueued(itemId: string, status: PrStatus | null, headSha: string | null) {
+export function prQueued(
+	itemId: string,
+	ref: PrRef,
+	status: PrStatus | null,
+	headSha: string | null,
+) {
 	if (!status || status.state !== "OPEN") return false;
 	if (status.autoMerge) return true;
-	const queued = latestPrEvent(itemId, "work.pr_queued", status.number);
+	const queued = latestPrEvent(itemId, "work.pr_queued", ref);
 	return !!queued && sameHead(queued.head, headSha) && sameHead(status.headSha, headSha);
 }
 
@@ -299,17 +384,25 @@ export function pullRequestSummary(input: {
 	mayMerge: boolean;
 	/** The caller may ask for a read (a member with project write). */
 	member?: boolean;
+	/**
+	 * The repository pull requests go to now: only a pull request there is the item's (one of a
+	 * repository origin pointed to before is not; 「发起 PR」 opens one in this one). Null: none.
+	 */
+	target: GhRepo | null;
 	record?: PullRequestRecord | null;
 }): TeamWorkPullRequest | null {
-	const record = input.record === undefined ? latestPullRequest(input.itemId) : input.record;
-	if (!record) return null;
-	const entry = peekPrStatus(input.itemId, record.number);
+	if (!input.target) return null;
+	const record =
+		input.record === undefined ? latestPullRequest(input.itemId, input.target) : input.record;
+	if (!record || repositoryKey(record) !== repositoryKey(input.target)) return null;
+	const entry = peekPrStatus(input.itemId, record);
 	const read = entry?.status ?? null;
-	// Taken as closed for this item (merged at an older head, retargeted, closed): 「重新发起 PR」.
-	const closedForItem = !!latestPrEvent(input.itemId, "work.pr_closed", record.number);
+	// Taken as closed for this item (merged at an older head, retargeted, closed), until GitHub
+	// shows it open on the item's base again (recorded opened again): 「重新发起 PR」.
+	const closedForItem = !!prClosedForItem(input.itemId, record);
 	const status: PrStatus | null =
 		read && closedForItem && read.state !== "CLOSED" ? { ...read, state: "CLOSED" } : read;
-	const queued = prQueued(input.itemId, status, input.headSha);
+	const queued = prQueued(input.itemId, record, status, input.headSha);
 	const blocker = prMergeBlocker({
 		status,
 		headSha: input.headSha,
@@ -322,6 +415,7 @@ export function pullRequestSummary(input: {
 	return {
 		number: record.number,
 		url: status?.url ?? record.url,
+		repository: `${record.host}/${record.owner}/${record.repo}`,
 		state: status?.state ?? (closedForItem ? "CLOSED" : null),
 		isDraft: status?.isDraft ?? false,
 		headMatches,

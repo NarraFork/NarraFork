@@ -59,8 +59,12 @@ keywords:
   - TEAM_PR_MERGE_FAILED
   - GH_PROMPT_DISABLED
   - setGhProbeForTests
+  - splitUrlCredentials
+  - readAuthStatusText
+  - prClosedForItem
+  - currentPullRequest
 status: draft
-verified_at: 29a63ae6cf12cd6b8ac56e38da9fa769d9bc7b23
+verified_at: 29d55c316f16e6318f2f09e77f4f8b573466c236
 ---
 # GitHub PR 流程
 
@@ -83,18 +87,22 @@ origin 从原始配置读（`team-git-write.ts:originTarget`，见[合并](merge
 「发起 PR」（`team-merge-pr.ts:runPullRequest`）：
 - 复核同本地合并的 `jobFacts`（团队活跃、ready、工作者没在跑、分支尖端仍是 ready 时的 head，否则 `TEAM_WORK_ITEM_HEAD_MOVED`）；只推真实完整的历史（`assertTrueHistory`、`assertNoReplacedHistory`）。
 - 推送前重读 origin（`readOriginTarget`，与 hosting 同一来源），解析出的主机/owner/repo 必须正是确认过、gh 用的那个，否则 `TEAM_PR_REMOTE_CHANGED`，什么都不推（`pushUrlFor`）；推到配置的 origin URL 本身。
-- `team-git-write.ts:pushBranch`：`git push --porcelain --no-verify --no-signed --no-recurse-submodules --no-follow-tags --receive-pack=git-receive-pack <URL> <head>:refs/heads/<分支>`，不带 `+`、不带 lease，120 秒、64KB。远端分支有 head 没有的提交 → `TEAM_PR_PUSH_REJECTED`（抽屉给「退回给工作者」，理由预填 `pushRejectedReason`）；其他失败 `TEAM_PR_PUSH_FAILED`（消息去掉 URL 里的 userinfo，`redactUserinfo`）；分支真的动了才记 `work.pr_pushed {head, branch, repository}`。
+- `team-git-write.ts:pushBranch`：`git push --porcelain --no-verify --no-signed --no-recurse-submodules --no-follow-tags --receive-pack=git-receive-pack <URL> <head>:refs/heads/<分支>`，不带 `+`、不带 lease，120 秒、64KB。origin 的 URL 带密码（`https://user:token@host/…`）时，密码永不进任何命令行（git 也把 URL 当参数交给 `git-remote-https`，而 argv 谁都能读）：`splitUrlCredentials` 按 git 的 `credential_from_url` 拆出登录（第一个 `/` 前的第一个 `@`，它前面的第一个 `:`；`%XX` 解码），推送用去掉密码、保留用户名的 URL；`credentialFromEnvironment` 在命令范围把凭据助手列表清空、先放一个只从环境变量 `NARRAFORK_PUSH_*` 读的助手（只回答协议与主机都对上的 `get`，不 store/erase），再按原顺序加回主机自己的助手——登录仍优先于主机助手，与写在 URL 里时一样；只有用户名的 URL 照旧由主机助手回答。非 http(s) 的 URL 带密码、或密码里有换行/NUL，直接失败不推送。远端分支有 head 没有的提交 → `TEAM_PR_PUSH_REJECTED`（抽屉给「退回给工作者」，理由预填 `pushRejectedReason`）；其他失败 `TEAM_PR_PUSH_FAILED`（消息去掉 URL 里的 userinfo，`redactUserinfo`）；分支真的动了才记 `work.pr_pushed {head, branch, repository}`。
 - `gh pr list -R … --head=<分支> --state=all --limit=5`，只认本仓库同名分支（`isCrossRepository` 为真的 fork 分支不算）：有 OPEN 的就复用（基线不同 `TEAM_PR_BASE_MISMATCH`）；没有 OPEN、但有在这个 head 上、合进这个基线的 MERGED 的，直接记合并（是发现的，actor 为 system）；否则 `gh pr create -R … --head=<分支> --base=<基线> --title=<标题> --body-file=-`（不是草稿），失败 `TEAM_PR_OPEN_FAILED`。PR 的基线是 `baseBranchOf(基线).branch`：团队基线写成 `origin/main` 时 PR 指向 `main`。
-- `work.pr_opened {pr, url, repository: host/owner/repo, base, head, created}` 只在新建或换了一个 PR 时记；PR 号与 URL 只存在这里（没有新列，`team-pr-state.ts:latestPullRequest`）。
+- `work.pr_opened {pr, url, repository: host/owner/repo, base, head, created}` 只在新建、换了一个 PR、或找到的 OPEN PR 正是已被当作关闭的那个时记（「重新发起 PR」时 `reopened: true`，时间排在那条关闭之后）；PR 号与 URL 只存在这里（没有新列，`team-pr-state.ts:latestPullRequest`）。
+- PR 由仓库加号码一起确定（`PrRef`）：项的 PR 是现在 origin 解析到（也就是确认过）的仓库里最新的 `work.pr_opened`（`latestPullRequest(itemId, target)`，最多看最新 20 条）；管理员改确认到别的仓库后，旧仓库的 PR 不再是这一项的，摘要 `pr` 为 null、按钮回到「发起 PR」，「合并 PR」409 `TEAM_PR_NONE`。状态缓存、`work.pr_closed`/`work.pr_checks`/`work.pr_queued` 都按仓库加号码匹配（事件 detail 带 `repository`，旧事件从 `url` 推出），新仓库同号的 PR 继承不到旧的读取或关闭。摘要多了 `pr.repository`，`team-page-model.ts:currentPullRequest` 只认仓库与确认的（或 origin 的）一致的 PR。
 - 正文（`pullRequestBody`）：发起人（「由 NarraFork 用户 X 发起」/ `Opened by NarraFork user X`，按发起人语言）、大小（最近 `work.ready` 的 `diffStat`）、评审轮次（结论、评审者、发现数、意见原文）与退回理由；任何人或 agent 写的文字都放进代码块（多行的进围栏代码块，单行的进行内代码，`inlineCode`：分隔符比文字里最长的反引号串多一个，以反引号或空格开头结尾时两边各加一个空格），并把 `@`、`#` 换成全角、`GH-<数字>` 的连字符换掉、`://` 中间插入 U+2060，提及不到人、关不了 issue；栅栏比文字里最长的反引号串长；总长 ≤16KB，放不下时保留最新的轮次并说明。标题同样处理（`pullRequestTitle`）。
 
 「合并 PR」（`runPrMerge`）：
 - 先读 PR（`gh pr view`）：已 MERGED → 按下面「合并落地」的规则判断（点之前就合并了，记为 system）；基线不是这一项的基线 → `TEAM_PR_BASE_MISMATCH`，不合并；CLOSED → `TEAM_PR_CLOSED`；PR 上的 head 不是 ready 的 head → `TEAM_PR_HEAD_STALE`（先「更新 PR」）；草稿 → `TEAM_PR_DRAFT`；`BLOCKED` → `TEAM_PR_BLOCKED`；`BEHIND` → `TEAM_PR_BEHIND`；`UNKNOWN` 或空 → `TEAM_PR_STATE_UNKNOWN`；`DIRTY` → 冲突（见下）；只有 `CLEAN`、`HAS_HOOKS`、`UNSTABLE` 才合并。消息都带 PR 链接。
+- PR 只在当前仓库里找（见上），找不到 `TEAM_PR_NONE`。
 - `gh pr merge N -R … --<merge|squash|rebase> --match-head-commit=<head>`，从不带 `--delete-branch`（会删本地分支）、`--admin`、`--auto`；gh 说 head 变了 → `TEAM_PR_HEAD_STALE`，其他失败 `TEAM_PR_MERGE_FAILED`。
 - 合并后再读：MERGED → 记合并；仍 OPEN（合并队列或自动合并接手）→ `work.pr_queued {pr, url, method, head}`，界面显示「已加入合并队列」。
 - 冲突（`recordConflict`）：同一 PR 同一 head 已记过、又不是成员点的（后台一轮）就直接返回，不拉取也不算；否则先尽力拉取 `origin/<基线>`（`fetchBaseFromOrigin`，只动远程跟踪 ref），再用加固的 `merge-tree` 算 head 与它的冲突文件（git ≥2.38，最多 50），冲突列表按（仓库、head、基线提交）缓存，最多 200 条；记 `work.merge_failed {code: "conflict", job: "pr_merge", pr, url, conflicts, more, base, head}`；同一 PR 同一 head 只通知协调者一次（`pullRequestConflictNote`），成员再点「合并 PR」仍记一条结果。
 
-合并落地先判断这次合并是不是这一项的（`mergedPullRequest`）：PR 合进的基线必须是这一项的基线；GitHub 合并的 head 正是 ready 的 head，或 ready 的 head 在它里面（`gh api --hostname=H --method=GET repos/<o>/<r>/compare/<ready head>...<PR head>?per_page=1 --jq=.status` 为 `ahead`/`identical`，64KB 以内、Zod 校验；GitHub 上没有 ready 的 head 时 404，算不在）。不是的——在旧 head 上合并的（这一项退回后重新 ready 了）或合进别的基线的——记 `work.pr_closed {pr, url, merged: true, reason: "older_head" | "other_base", head, base}`（每个 PR 一次），项仍 ready，摘要把这个 PR 当作已关闭，按钮是「重新发起 PR」，再发起时为新 head 开新的 PR（`pr list` 里旧的 MERGED 不在新 head 上，不复用）。OPEN 的 PR 被改了基线同样记 `work.pr_closed {reason: "other_base"}`。
+合并落地先判断这次合并是不是这一项的（`mergedPullRequest`）：PR 合进的基线必须是这一项的基线；GitHub 合并的 head 正是 ready 的 head，或 ready 的 head 在它里面（`gh api --hostname=H --method=GET repos/<o>/<r>/compare/<ready head>...<PR head>?per_page=1 --jq=.status` 为 `ahead`/`identical`，64KB 以内、Zod 校验；GitHub 上没有 ready 的 head 时 404，算不在）。不是的——在旧 head 上合并的（这一项退回后重新 ready 了）或合进别的基线的——记 `work.pr_closed {pr, url, repository, merged: true, reason: "older_head" | "other_base", head, base}`（已当作关闭时不再记），项仍 ready，摘要把这个 PR 当作已关闭，按钮是「重新发起 PR」，再发起时为新 head 开新的 PR（`pr list` 里旧的 MERGED 不在新 head 上，不复用）。OPEN 的 PR 被改了基线同样记 `work.pr_closed {reason: "other_base"}`。
+
+「当作关闭」看这个 PR 最新的 `work.pr_opened` 与 `work.pr_closed` 谁更新（`team-pr-state.ts:prClosedForItem`）：在 GitHub 上重新打开、或改回这一项的基线后，读取发现它 OPEN 在这一项的基线上，就记 `work.pr_opened {…, created: false, reopened: true}`（时间排在关闭之后，`timeAfter`），它恢复为这一项的 PR；之后再关闭会再记一条 `work.pr_closed`。合并了的（`merged: true`）是终态，不会恢复。
 
 是的才记合并（`landed`，唯一写入者 `work-items.ts:markMergedByPullRequest` → `markMerged`，事务内复核 ready、head、`updated_at`）：
 - `work.merged {detectedBy: "pull_request", pr, url, mergeCommit, method, headMatches, baseBranch}`，squash、rebase 也认；成员合并时 actor 是那个人，读取发现的是 system，`method` 为 null。
@@ -102,9 +110,10 @@ origin 从原始配置读（`team-git-write.ts:originTarget`，见[合并](merge
 - 只在这次真的记下时通知协调者（`pullRequestMergedNote`：成员合并写「X merged it from the team page」，否则「It was merged on GitHub」）。worktree 由已有的人批准清理处理。
 
 读取与转变（`refreshPullRequest`，不在任何 SQLite 事务里跑 gh）：
-- 每项一次只读一个，结果缓存 20 秒；后台一轮不再读这一项已当作关闭的 PR（有它的 `work.pr_closed`）（`team-pr-state.ts`，内存，最多 500 项）；全进程最多 2 个读同时跑（`withReadSlot`：放出的名额直接交给下一个等待者，计数不变，中间插不进新来的）。`gh pr view N --json …`（64KB）；OPEN 时再 `gh pr checks N --json name,bucket,state,link,workflow`（256KB，退出码 1、8 仍带 JSON，没有检查算空），汇总为各桶计数与最多 10 个失败（名字与 http(s) 链接，`summarizeChecks`）。
-- 合并任务持有该项时不读、不写事件。只在转变时写：MERGED → 记合并；CLOSED → `work.pr_closed`（同一 PR 一次）；OPEN 且是 ready 的 head 时，`DIRTY` → 冲突（同上，只一次），检查变成 failing/passing 或评审变成 `CHANGES_REQUESTED`/`APPROVED` → `work.pr_checks {pr, url, head, checks, review, failed, failures}`，其中变成 failing 或要求修改时通知协调者（`pullRequestBlockedNote`）。
+- 每项一次只读一个，结果缓存 20 秒（`team-pr-state.ts`，内存，按仓库加号码，最多 500 项）；后台一轮对已当作关闭的 PR 每 5 分钟才读一次（`CLOSED_RECHECK_MS`，看它是否被重新打开或改回基线），在旧 head 上合并了的永不再读；全进程最多 2 个读同时跑（`withReadSlot`：放出的名额直接交给下一个等待者，计数不变，中间插不进新来的）。`gh pr view N --json …`（64KB）；OPEN 时再 `gh pr checks N --json name,bucket,state,link,workflow`（256KB，退出码 1、8 仍带 JSON，没有检查算空），汇总为各桶计数与最多 10 个失败（名字与 http(s) 链接，`summarizeChecks`）。
+- 合并任务持有该项时不读、不写事件。只在转变时写：MERGED → 记合并；CLOSED → `work.pr_closed`（已当作关闭时不再记）；当作关闭后又 OPEN 在这一项的基线上 → 再记 `work.pr_opened {reopened: true}`；OPEN 且是 ready 的 head 时，`DIRTY` → 冲突（同上，只一次），检查变成 failing/passing 或评审变成 `CHANGES_REQUESTED`/`APPROVED` → `work.pr_checks {pr, url, repository, head, checks, review, failed, failures}`，其中变成 failing 或要求修改时通知协调者（`pullRequestBlockedNote`）。
 - 读、读出的冲突拉取与合并后的拉取都带后台一轮的 `AbortController`；停下时先 abort（gh 与 git 进程树被杀），再最多等 5 秒（`STOP_WAIT_MS`）。抽屉的读取同样只给有项目写权限的成员（`pr.canRefresh`），团队归档时 `pr/refresh` 409 `TEAM_ARCHIVED`。
+- 主机是 github.com 之外的、以及 gh 登录状态：`ghAuthStatus` 先用 `gh auth status --hostname=H --json hosts`；老版本 gh 没有这个 `--json`（`unknown flag: --json`，如 2.72）时改跑 `gh auth status --hostname=H`，从文本（新版写 stdout、旧版写 stderr，两个都读）里认：单独一行是主机名 → gh 认识它，`Logged in to H` → 登录了，`Failed to log in to H`/`Timeout trying to log in to H` → 认识但没登录；退出码 0 又认不出任何一行也算登录（主机没有能用的账号时 gh 退出 1）。真正的关卡仍是 `gh repo view` 的写权限（`readAuthStatusText`）。
 - 后台每 60 秒一轮（`startTeamPrPoller`，`main.ts` 的 `startTeamDatabaseMaintenance("pull-requests")`）：最多 200 个有活跃团队的项目、每项目最多 100 个 ready 项，挑出有 `work.pr_opened` 的，每轮从上次之后取 20 个（到头回绕）。
 - 手工在 GitHub 上合并的 PR 由这一轮发现；合并提交式的合并也会被本地基线或 `refs/remotes/origin/<基线>` 的祖先检测认出（[工作项](work-items.md)）。
 
@@ -118,7 +127,7 @@ gh 的隔离（`team-gh.ts`）：
 - `server/services/teams/team-merge-pr.ts`：两个任务、正文、读取与转变、后台一轮。
 - `server/services/teams/team-gh.ts`：gh 的唯一入口。
 - `server/services/teams/team-pr-state.ts`：PR 记录、状态缓存、卡片的 `pr` 摘要（`pullRequestSummary`、`prMergeBlocker`）。
-- 测试：`team-merge-pr.test.ts`（裸仓库当作 GitHub：hosting 经测试接缝读成 `https://github.com/acme/app.git`，主机自己的 `insteadOf` 把它指向裸仓库，推送是真的；假 gh 回放 JSON）、`team-hosting.test.ts`、`fake-gh.fixture.ts`（记录 argv、目录、环境、stdin）。
+- 测试：`team-merge-pr.test.ts`（裸仓库当作 GitHub：hosting 经测试接缝读成 `https://github.com/acme/app.git`，主机自己的 `insteadOf` 把它指向裸仓库，推送是真的；假 gh 回放 JSON）、`team-hosting.test.ts`、`fake-gh.fixture.ts`（记录 argv、目录、环境、stdin；`rejects` 模拟不认识某个参数的老 gh，`olderGh`）。假 gh 只往 PATH 前面加，「完全没有 gh」把含 gh 的目录换成去掉 gh 的镜像目录——直接删掉那个目录会把同目录的 git 一起删掉（CI 上 gh 与 git 都在 `/usr/bin`）。
 
 ## 改它时
 - 加 gh 子命令：只进 `team-gh.ts`，带超时、输出上限、Zod；先用 PATH 垫片或 `GH_DEBUG` 确认它不推送、不碰本地仓库。

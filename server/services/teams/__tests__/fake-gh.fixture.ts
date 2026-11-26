@@ -3,12 +3,18 @@
  * environment, stdin) and replays the answer the test planned for that subcommand. A subcommand is
  * keyed by its first two words (`pr view`, `auth status`, `repo view`, …; `--version` alone).
  * A planned answer is `{ stdout?, stderr?, exit?, sleepMs? }`, or a list of them used in turn (the
- * last one repeats). Nothing is planned: exit 99 and say so on stderr.
+ * last one repeats). Nothing is planned: exit 99 and say so on stderr. `rejects` names flags this
+ * gh does not have (an older gh: `["--json"]`): a call with one gets cobra's `unknown flag` and
+ * exit 1, as a real older gh answers.
  *
  * The script runs under this very Bun (its absolute path is the shebang), reads its plan from a
  * file next to it, and appends one JSON line per call to its log. POSIX only (a shebang script).
+ *
+ * PATH is only ever extended, never cut: the fake goes first (shadowing any real gh), and "no gh
+ * at all" swaps each directory holding a gh for a mirror of it without one. Dropping such a
+ * directory would drop whatever else it holds — on CI gh and git are both in `/usr/bin`.
  */
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, symlinkSync } from "node:fs";
 import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { delimiter, join } from "node:path";
 
@@ -17,6 +23,8 @@ export interface FakeGhAnswer {
 	stderr?: string;
 	exit?: number;
 	sleepMs?: number;
+	/** Flags this gh does not know: a call with one is refused (`unknown flag: <flag>`, exit 1). */
+	rejects?: string[];
 }
 
 export type FakeGhPlan = Record<string, FakeGhAnswer | FakeGhAnswer[]>;
@@ -34,9 +42,9 @@ export interface FakeGh {
 	setPlan(plan: FakeGhPlan): Promise<void>;
 	calls(): Promise<FakeGhCall[]>;
 	clearCalls(): Promise<void>;
-	/** Put the fake first on PATH. */
+	/** Put the fake first on PATH (it shadows any real gh; nothing is removed). */
 	activate(): void;
-	/** A PATH with no gh at all (the real one's directory left out too). */
+	/** A PATH with no gh at all (each real gh's directory mirrored without it; nothing else lost). */
 	hideAll(): void;
 	/** PATH as it was. */
 	restore(): void;
@@ -64,6 +72,13 @@ if (!answer) {
 	process.stderr.write("fake gh: nothing planned for " + key + "\\n");
 	process.exit(99);
 }
+const rejected = (answer.rejects ?? []).find((flag) =>
+	args.some((arg) => arg === flag || arg.startsWith(flag + "=")),
+);
+if (rejected) {
+	process.stderr.write("unknown flag: " + rejected + "\\n\\nUsage:  gh " + key + " [flags]\\n");
+	process.exit(1);
+}
 const finish = () => {
 	if (answer.stdout) process.stdout.write(answer.stdout);
 	if (answer.stderr) process.stderr.write(answer.stderr);
@@ -85,10 +100,28 @@ export async function installFakeGh(root: string): Promise<FakeGh> {
 	await writeFile(plan, "{}");
 	await writeFile(log, "");
 	const original = process.env.PATH ?? "";
-	const withoutGh = original
-		.split(delimiter)
-		.filter((entry) => entry && !existsSync(join(entry, "gh")))
-		.join(delimiter);
+	let withoutGh: string | null = null;
+	/** PATH with every directory holding a gh replaced by a mirror of it without gh (built once). */
+	const pathWithoutGh = () => {
+		withoutGh ??= original
+			.split(delimiter)
+			.map((entry, index) => {
+				if (!entry || !existsSync(join(entry, "gh"))) return entry;
+				const mirror = join(root, `no-gh-${index}`);
+				mkdirSync(mirror, { recursive: true });
+				for (const name of readdirSync(entry)) {
+					if (name === "gh") continue;
+					try {
+						symlinkSync(join(entry, name), join(mirror, name));
+					} catch {
+						// Already mirrored (another fake in the same root).
+					}
+				}
+				return mirror;
+			})
+			.join(delimiter);
+		return withoutGh;
+	};
 	return {
 		dir,
 		async setPlan(next) {
@@ -106,10 +139,10 @@ export async function installFakeGh(root: string): Promise<FakeGh> {
 			await writeFile(log, "");
 		},
 		activate() {
-			process.env.PATH = `${dir}${delimiter}${withoutGh}`;
+			process.env.PATH = `${dir}${delimiter}${original}`;
 		},
 		hideAll() {
-			process.env.PATH = withoutGh;
+			process.env.PATH = pathWithoutGh();
 		},
 		restore() {
 			process.env.PATH = original;
@@ -133,6 +166,29 @@ export function repoViewJson(overrides: Record<string, unknown> = {}): string {
 /** `gh auth status --json hosts` logged in to `host`. */
 export function authJson(host: string, state = "success"): string {
 	return JSON.stringify({ hosts: { [host]: [{ state, active: true, host, login: "octo" }] } });
+}
+
+/**
+ * `gh auth status --hostname H` as an older gh prints it (no `--json`): logged in, or an account
+ * whose token fails there.
+ */
+export function authText(host: string, state: "success" | "error" = "success"): string {
+	return state === "success"
+		? `${host}\n  ✓ Logged in to ${host} account octo (keyring)\n  - Active account: true\n`
+		: `${host}\n  X Failed to log in to ${host} account octo (keyring)\n  - Active account: true\n`;
+}
+
+/** An older gh (2.72) for `host`: no `auth status --json`; its text answer on stderr. */
+export function olderGh(host = "github.com", state: "success" | "error" = "success"): FakeGhPlan {
+	return {
+		"--version": { stdout: "gh version 2.72.0 (2025-04-30)\n" },
+		"auth status": {
+			rejects: ["--json"],
+			stderr: authText(host, state),
+			exit: state === "success" ? 0 : 1,
+		},
+		"repo view": { stdout: repoViewJson() },
+	};
 }
 
 /** The answers of a usable gh for github.com/acme/app. */

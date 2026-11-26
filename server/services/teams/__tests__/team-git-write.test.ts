@@ -41,6 +41,7 @@ import {
 	redactUserinfo,
 	type ScopedConfigEntry,
 	signingConfig,
+	splitUrlCredentials,
 	sshSettings,
 	supportsMergeTree,
 	teamRepoGit,
@@ -1347,6 +1348,90 @@ describe("the pull request push (G: security as the work-start fetch)", () => {
 			if (saved.command !== undefined) process.env.GIT_SSH_COMMAND = saved.command;
 			if (saved.ssh !== undefined) process.env.GIT_SSH = saved.ssh;
 		}
+	});
+
+	test("a password in origin's URL never reaches a command line, and still logs in (Devin 1)", async () => {
+		const canScan = existsSync("/proc/self/cmdline");
+		/** Every process's argv that carries the secret, while git is talking to the server. */
+		const leaks: string[] = [];
+		let port = 0;
+		const scan = async () => {
+			if (!canScan) return;
+			for (const pid of await readdir("/proc").catch(() => [] as string[])) {
+				if (!/^\d+$/.test(pid)) continue;
+				const argv = await readFile(`/proc/${pid}/cmdline`, "utf8").catch(() => "");
+				// Only processes that talk to this server (not, say, a grep for the word elsewhere).
+				if (argv.includes("s3cr3t") && argv.includes(`:${port}`))
+					leaks.push(argv.replaceAll("\0", " "));
+			}
+		};
+		const logins: string[] = [];
+		const server = Bun.serve({
+			port: 0,
+			hostname: "127.0.0.1",
+			fetch: async (request) => {
+				await scan();
+				const auth = request.headers.get("authorization");
+				if (auth?.startsWith("Basic ")) logins.push(atob(auth.slice("Basic ".length)));
+				return new Response("no", {
+					status: 401,
+					headers: { "WWW-Authenticate": 'Basic realm="x"' },
+				});
+			},
+		});
+		port = server.port ?? 0;
+		try {
+			const { head } = await pushable();
+			// The host's helper keeps working: it answers when the URL has no password.
+			await writeFile(
+				globalConfig,
+				`${HOST_USER}[credential]\n\thelper = "!f() { test \\"$1\\" = get && echo password=from-host; }; f"\n`,
+			);
+			const at = `127.0.0.1:${server.port}/o/r.git`;
+			const withPassword = await teamRepoGit(repo).pushBranch({
+				url: `http://alice:s3cr3t%2Fx@${at}`,
+				head,
+				branch: "team/x",
+			});
+			expect(withPassword.outcome).toBe("failed");
+			if (withPassword.outcome === "failed") expect(withPassword.message).not.toContain("s3cr3t");
+			// It logged in with the URL's login (decoded as git decodes it), ahead of the host's helper.
+			expect(logins).toContain("alice:s3cr3t/x");
+			expect(logins).not.toContain("alice:from-host");
+			if (canScan) expect(leaks).toEqual([]);
+			logins.length = 0;
+			const userOnly = await teamRepoGit(repo).pushBranch({
+				url: `http://alice@${at}`,
+				head,
+				branch: "team/x",
+			});
+			expect(userOnly.outcome).toBe("failed");
+			expect(logins).toContain("alice:from-host");
+		} finally {
+			server.stop(true);
+		}
+	});
+
+	test("the login is split from the URL as git reads it", () => {
+		expect(splitUrlCredentials("https://u:p%40ss@github.com/a/b.git")).toEqual({
+			url: "https://u@github.com/a/b.git",
+			credentials: { protocol: "https", host: "github.com", username: "u", password: "p@ss" },
+		});
+		expect(splitUrlCredentials("https://:tok@ghe.test:8443/a/b")).toEqual({
+			url: "https://ghe.test:8443/a/b",
+			credentials: { protocol: "https", host: "ghe.test:8443", username: "", password: "tok" },
+		});
+		for (const plain of [
+			"https://github.com/a/b.git",
+			"https://u@github.com/a/b.git",
+			"https://github.com/a/b@c:d",
+			"git@github.com:a/b.git",
+			"/srv/git/r.git",
+		])
+			expect(splitUrlCredentials(plain)).toEqual({ url: plain, credentials: null });
+		// A password git cannot be handed without a command line: refused.
+		expect(splitUrlCredentials("ssh://u:p@host/a/b")).toBeNull();
+		expect(splitUrlCredentials("https://u:a%0Ab@host/a/b")).toBeNull();
 	});
 
 	test("a URL's userinfo never reaches a message", () => {

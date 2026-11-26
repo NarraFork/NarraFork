@@ -910,7 +910,7 @@ export interface MergeControlView {
 export function mergeControl(merge: TeamWorkMergeSummary | undefined): MergeControlView | null {
 	if (!merge) return null;
 	// G: merging the pull request shows on 「合并 PR」 itself.
-	if (merge.mode === "github" && merge.job === "pr_merge" && merge.pr) return null;
+	if (merge.mode === "github" && merge.job === "pr_merge" && currentPullRequest(merge)) return null;
 	if (merge.phase !== null || merge.job !== null)
 		return {
 			label: busyLabel(merge),
@@ -920,7 +920,7 @@ export function mergeControl(merge: TeamWorkMergeSummary | undefined): MergeCont
 			panel: null,
 		};
 	if (merge.mode === "github") {
-		const pr = merge.pr ?? null;
+		const pr = currentPullRequest(merge);
 		const open = pr && pr.state !== "CLOSED" && pr.state !== "MERGED";
 		if (open && pr.headMatches) return null;
 		return {
@@ -953,6 +953,20 @@ function busyLabel(merge: TeamWorkMergeSummary): MergeControlView["label"] {
 	if (merge.job === "pull_request" || merge.mode === "github")
 		return merge.phase === "opening" ? "opening" : "pushing";
 	return "merging";
+}
+
+/**
+ * G: the item's pull request, only when it is in the repository pull requests go to now (the
+ * confirmed one, else origin's): one left in a repository origin pointed to before is not, and
+ * 「发起 PR」 opens one in the new one. Null when there is none.
+ */
+export function currentPullRequest(
+	merge: TeamWorkMergeSummary | undefined,
+): NonNullable<TeamWorkMergeSummary["pr"]> | null {
+	const pr = merge?.mode === "github" ? (merge.pr ?? null) : null;
+	if (!pr) return null;
+	const target = merge?.github?.pinned ?? merge?.github?.target ?? null;
+	return !target || pr.repository.toLowerCase() === target.toLowerCase() ? pr : null;
 }
 
 /**
@@ -1021,7 +1035,7 @@ export interface PullRequestControlView {
 export function pullRequestControl(
 	merge: TeamWorkMergeSummary | undefined,
 ): PullRequestControlView | null {
-	const pr = merge?.mode === "github" ? merge.pr : null;
+	const pr = currentPullRequest(merge);
 	if (!merge || !pr) return null;
 	const labels: PullRequestLabel[] = [];
 	if (pr.state === "CLOSED")

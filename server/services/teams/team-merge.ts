@@ -455,6 +455,10 @@ export function mergeSummaryOf(input: {
 					methods: github?.gh?.ok ? github.gh.methods : [],
 					mayMerge: input.member && reason === null && pinned,
 					member: input.member,
+					// Only a pull request in the repository origin resolves to now (the confirmed one
+					// whenever anything may run) is the item's; one left in a repository origin
+					// pointed to before is not, and 「发起 PR」 opens one here.
+					target: github ? { host: github.host, owner: github.owner, repo: github.repo } : null,
 				})
 			: null;
 	return {

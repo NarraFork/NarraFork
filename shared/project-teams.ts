@@ -1092,6 +1092,8 @@ export const TEAM_PR_CHECK_FAILURES_MAX = 10;
 export interface TeamWorkPullRequest {
 	number: number;
 	url: string;
+	/** The repository it is in (`host/owner/repo`): always the one pull requests go to now. */
+	repository: string;
 	/** Null until its state was read. */
 	state: "OPEN" | "CLOSED" | "MERGED" | null;
 	isDraft: boolean;

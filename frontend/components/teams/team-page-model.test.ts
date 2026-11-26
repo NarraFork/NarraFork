@@ -33,6 +33,7 @@ import {
 	chunkIds,
 	conflictReasonFiles,
 	coordinatorLine,
+	currentPullRequest,
 	diffLineKind,
 	eventLabelKey,
 	eventNote,
@@ -1010,6 +1011,7 @@ describe("pull requests (G)", () => {
 	const pr = (over: Partial<TeamWorkPullRequest> = {}): TeamWorkPullRequest => ({
 		number: 7,
 		url: "https://github.com/acme/app/pull/7",
+		repository: "github.com/acme/app",
 		state: "OPEN",
 		isDraft: false,
 		headMatches: true,
@@ -1035,6 +1037,26 @@ describe("pull requests (G)", () => {
 		disabledReason: null,
 		pr: null,
 		...over,
+	});
+
+	test("a pull request of the repository origin pointed to before: 发起 PR in the new one (Devin 4)", () => {
+		const moved = (pin: string | null, target = "github.com/acme/app2") =>
+			github({
+				pr: pr(),
+				github: { target, pinned: pin, canConfirm: true },
+			});
+		const old = moved("github.com/acme/app2");
+		expect(currentPullRequest(old)).toBeNull();
+		expect(mergeControlOf(old)).toMatchObject({ label: "openPr", enabled: true });
+		expect(pullRequestControl(old)).toBeNull();
+		// The same repository (any case) is the item's: 查看 PR / 合并 PR.
+		const same = moved("GitHub.com/Acme/App", "github.com/acme/app");
+		expect(currentPullRequest(same)?.number).toBe(7);
+		expect(mergeControlOf(same)).toBeNull();
+		expect(pullRequestControl(same)?.showMerge).toBe(true);
+		// Nothing confirmed yet: origin's repository decides.
+		expect(currentPullRequest(moved(null))).toBeNull();
+		expect(currentPullRequest(moved(null, "github.com/acme/app"))?.number).toBe(7);
 	});
 
 	test("the main button: 发起 PR, 更新 PR after a re-ready, 重新发起 PR when closed, hidden while the PR is current", () => {

@@ -65,6 +65,8 @@ const USER = "gp-user";
 const NOW = "2026-11-25T00:00:00.000Z";
 const GITHUB_URL = "https://github.com/acme/app.git";
 const PR_URL = "https://github.com/acme/app/pull/7";
+/** Pull request 7 of the repository origin stands for. */
+const PR_7 = { host: "github.com", owner: "acme", repo: "app", number: 7 };
 const ACME = { host: "github.com", owner: "acme", repo: "app" };
 
 let temporary: string;
@@ -763,7 +765,7 @@ describe.skipIf(process.platform === "win32")("the pull request flow", () => {
 		setHostingSourceForTests(async () => "git@gitlab.example:acme/app.git");
 		requestPrRefresh({ teamId: LEAD, itemId: a.id });
 		await settle();
-		expect(peekPrStatus(a.id, 7)?.refreshing).toBe(false);
+		expect(peekPrStatus(a.id, PR_7)?.refreshing).toBe(false);
 	});
 
 	test("closed on GitHub: recorded once; the next action is 「重新发起 PR」", async () => {
@@ -1067,6 +1069,161 @@ describe.skipIf(process.platform === "win32")("review fixes (G)", () => {
 		expect(() => requestPrRefresh({ teamId: LEAD, itemId: b.id })).toThrow(
 			expect.objectContaining({ code: "TEAM_ARCHIVED" }),
 		);
+	});
+});
+
+describe.skipIf(process.platform === "win32")("review fixes, second round (Devin 3, 4)", () => {
+	const views = async () => (await ghCalls("pr view")).length;
+
+	test("3: reopened on GitHub, the pass records it opened again and it recovers", async () => {
+		const a = await readyItem("reopen");
+		await github(a.head);
+		open(a.id);
+		await settle();
+		await fake.setPlan(
+			plan(a.head, { "pr view": { stdout: prView(a.head, { state: "CLOSED" }) } }),
+		);
+		await refreshPullRequest(a.id, { force: true });
+		expect((await summary(a.id)).pr).toMatchObject({ state: "CLOSED", mergeBlocker: "closed" });
+		// Reopened on GitHub. Read a moment ago: the pass leaves it for now.
+		await fake.setPlan(plan(a.head));
+		await fake.clearCalls();
+		await runPrPollPass();
+		await settle();
+		expect(await views()).toBe(0);
+		// A while later (the read forgotten): the pass reads it again and it recovers.
+		resetPrStatusForTests();
+		await runPrPollPass();
+		await settle();
+		expect(await views()).toBe(1);
+		expect(events(a.id, "work.pr_opened").map((event) => event.detail)).toEqual([
+			expect.objectContaining({ pr: 7, created: true }),
+			expect.objectContaining({ pr: 7, reopened: true, repository: "github.com/acme/app" }),
+		]);
+		expect((await summary(a.id)).pr).toMatchObject({
+			state: "OPEN",
+			canMergePr: true,
+			mergeBlocker: null,
+		});
+		// Closed once more: recorded again (the newest event wins).
+		await fake.setPlan(
+			plan(a.head, { "pr view": { stdout: prView(a.head, { state: "CLOSED" }) } }),
+		);
+		await refreshPullRequest(a.id, { force: true });
+		expect(events(a.id, "work.pr_closed")).toHaveLength(2);
+		expect((await summary(a.id)).pr).toMatchObject({ state: "CLOSED" });
+	});
+
+	test("3: retargeted back to the item's base, it recovers; 「合并 PR」 works again", async () => {
+		const a = await readyItem("back");
+		await github(a.head);
+		open(a.id);
+		await settle();
+		await fake.setPlan(
+			plan(a.head, { "pr view": { stdout: prView(a.head, { baseRefName: "develop" }) } }),
+		);
+		await refreshPullRequest(a.id, { force: true });
+		expect(events(a.id, "work.pr_closed")[0]?.detail).toMatchObject({ reason: "other_base" });
+		expect((await summary(a.id)).pr).toMatchObject({ state: "CLOSED" });
+		await fake.setPlan(plan(a.head));
+		await refreshPullRequest(a.id, { force: true });
+		expect((await summary(a.id)).pr).toMatchObject({ state: "OPEN", canMergePr: true });
+		mergePr(a.id, "squash");
+		await settle();
+		expect(await ghCalls("pr merge")).toHaveLength(1);
+	});
+
+	test("3: 「重新发起 PR」 finding the same pull request open records it opened again", async () => {
+		const a = await readyItem("again");
+		await github(a.head);
+		open(a.id);
+		await settle();
+		await fake.setPlan(
+			plan(a.head, { "pr view": { stdout: prView(a.head, { state: "CLOSED" }) } }),
+		);
+		await refreshPullRequest(a.id, { force: true });
+		expect((await summary(a.id)).pr).toMatchObject({ state: "CLOSED" });
+		// Reopened by hand; 「重新发起 PR」 finds #7 open again.
+		const listed = JSON.stringify([
+			{
+				number: 7,
+				url: PR_URL,
+				state: "OPEN",
+				headRefOid: a.head,
+				headRefName: "team/again",
+				baseRefName: "main",
+				isCrossRepository: false,
+			},
+		]);
+		await fake.setPlan(plan(a.head, { "pr list": { stdout: listed } }));
+		await fake.clearCalls();
+		open(a.id);
+		await settle();
+		expect(await ghCalls("pr create")).toEqual([]);
+		expect(events(a.id, "work.pr_opened").at(-1)?.detail).toMatchObject({
+			pr: 7,
+			created: false,
+			reopened: true,
+		});
+		expect((await summary(a.id)).pr).toMatchObject({ state: "OPEN", canMergePr: true });
+	});
+
+	test("4: a pull request of the repository origin pointed to before is not the item's", async () => {
+		const a = await readyItem("moved");
+		await github(a.head);
+		open(a.id);
+		await settle();
+		// Closed in the old repository, and its state read.
+		await fake.setPlan(
+			plan(a.head, { "pr view": { stdout: prView(a.head, { state: "CLOSED" }) } }),
+		);
+		await refreshPullRequest(a.id, { force: true });
+		// A manager confirms another repository origin points to now.
+		const APP2 = { host: "github.com", owner: "acme", repo: "app2" };
+		pushUrl = "https://github.com/acme/app2.git";
+		setHostingSourceForTests(async () => pushUrl);
+		await fake.setPlan(plan(a.head));
+		await hostingOf(repo);
+		setPinnedGithubTarget(PROJECT, APP2, USER);
+		await fake.clearCalls();
+		// No pull request there yet: 「发起 PR」 is offered, 「合并 PR」 is not.
+		const moved = await summary(a.id);
+		expect(moved).toMatchObject({ canMerge: true, disabledReason: null, pr: null });
+		mergePr(a.id);
+		await settle();
+		expect(readMergeOutcome(a.id)).toMatchObject({ code: "TEAM_PR_NONE" });
+		expect(await ghCalls("pr merge")).toEqual([]);
+		expect(() => requestPrRefresh({ teamId: LEAD, itemId: a.id })).toThrow(
+			expect.objectContaining({ code: "TEAM_PR_NONE" }),
+		);
+		// #7 in the new repository inherits nothing of the old #7: not its read, not its closing.
+		db.insert(teamWorkEvents)
+			.values({
+				id: generateId(),
+				teamId: LEAD,
+				workItemId: a.id,
+				kind: "work.pr_opened",
+				actorKind: "person",
+				actorId: USER,
+				detailJson: {
+					pr: 7,
+					url: "https://github.com/acme/app2/pull/7",
+					repository: "github.com/acme/app2",
+					base: "main",
+					head: a.head,
+					created: true,
+				},
+				createdAt: new Date().toISOString(),
+			})
+			.run();
+		expect((await summary(a.id)).pr).toMatchObject({
+			number: 7,
+			repository: "github.com/acme/app2",
+			state: null,
+			mergeBlocker: "checking",
+		});
+		expect(peekPrStatus(a.id, { ...APP2, number: 7 })).toBeNull();
+		expect(peekPrStatus(a.id, PR_7)?.status?.state).toBe("CLOSED");
 	});
 });
 
