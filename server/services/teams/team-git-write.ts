@@ -1223,7 +1223,8 @@ export function teamRepoGit(repo: string, options: { signal?: AbortSignal } = {}
 }
 
 /**
- * The URL a fetch from origin is given: `remote.origin.url` as configured (exactly one), its login
+ * The URL a fetch from origin is given: `remote.origin.url` as configured (the first of several,
+ * as `git fetch origin` takes it; every check applies to it), its login
  * split off (`splitUrlCredentials`). The fetch runs in the project's repository, so a repository
  * `url.*.insteadOf` that starts the URL (with or without its login) or a `remote.<URL>.*` refuses
  * it (`UnsafeRemoteConfigError`); a password on a transport that cannot take it by environment, or
@@ -1236,7 +1237,7 @@ async function fetchSource(
 	const urls = (await scopedConfig(repo, ORIGIN_PATTERN, signal)).filter(
 		(entry) => entry.key.toLowerCase() === "remote.origin.url",
 	);
-	if (urls.length > 1) throw new UnsafeRemoteConfigError("remote.origin.url");
+	// Several URLs: `git fetch origin` fetches from the first (in configuration order), so does this.
 	const configured = urls[0]?.value.trim() ?? "";
 	if (!configured) return { message: "origin has no URL to fetch from" };
 	const split = splitUrlCredentials(configured);

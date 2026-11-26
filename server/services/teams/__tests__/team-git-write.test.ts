@@ -1502,6 +1502,44 @@ describe("the fetch of origin's base (review 5)", () => {
 		}
 	});
 
+	test("origin with several URLs: the first is fetched from, as git fetch origin does", async () => {
+		const { server, logins, leaks } = loginServer();
+		try {
+			await commitFile("a.txt", "a\n", "base");
+			const unused = join(temporary, `unused-${Math.random().toString(36).slice(2)}.git`);
+			await git(["init", "-q", "--bare", "-b", "main", unused], temporary);
+			await git([
+				"remote",
+				"add",
+				"origin",
+				`http://alice:s3cr3t@127.0.0.1:${server.port}/o/r.git`,
+			]);
+			await git(["config", "--add", "remote.origin.url", unused]);
+			const result = await teamRepoGit(repo).fetchBaseFromOrigin("main");
+			// The first URL was asked (and refused the login); never refused for having two.
+			expect(result.ok).toBe(false);
+			if (!result.ok) {
+				expect(result.message).not.toContain("remote.origin.url");
+				expect(result.message).not.toContain("s3cr3t");
+			}
+			expect(logins).toEqual(["-", "alice:s3cr3t"]);
+			expect(leaks).toEqual([]);
+			// The first one reachable: fetched from it.
+			const first = join(temporary, `first-${Math.random().toString(36).slice(2)}.git`);
+			await git(["init", "-q", "--bare", "-b", "main", first], temporary);
+			await git(["push", "-q", first, "main"]);
+			await git(["config", "--unset-all", "remote.origin.url"]);
+			await git(["config", "--add", "remote.origin.url", first]);
+			await git(["config", "--add", "remote.origin.url", unused]);
+			expect(await teamRepoGit(repo).fetchBaseFromOrigin("main")).toEqual({ ok: true });
+			expect(await git(["rev-parse", "refs/remotes/origin/main"])).toBe(
+				await git(["rev-parse", "main"]),
+			);
+		} finally {
+			server.stop(true);
+		}
+	});
+
 	test("only refs/remotes/origin/<base> moves, whatever origin's fetch refspecs say", async () => {
 		await commitFile("a.txt", "a\n", "base");
 		const origin = join(temporary, `origin-${Math.random().toString(36).slice(2)}.git`);
