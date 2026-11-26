@@ -807,6 +807,7 @@
 	"botBadge": "Bot",
 	"swipeMenu": "菜单",
 	"recentTabTeamPendingApprovals": "{{count}} 项待批",
+	"recentTabTeamReadyItems": "{{count}} 项可以合并",
 	"recentTabProjectActiveSessions": "{{countLabel}} 个会话进行中",
 	"recentTabProjectNoActiveSessions": "没有进行中的会话",
 	"recentTabProjectWaitingSessions": "{{countLabel}} 个等待输入或审批",

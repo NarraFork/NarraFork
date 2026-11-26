@@ -33,7 +33,7 @@ anchors:
   - server/services/postgres-file-change-blob-catalog.ts
   - server/services/postgres-file-change-evidence-store.ts
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 ---
 # 文件变更证据
 
@@ -48,10 +48,10 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 保留清单（`FileChangeRetentionInventory.listPage`）按 digest 游标分页，只给出“被哪些外键根引用”，故意不产出任何删除候选；无引用宽限 7 天（`unreferencedGraceMs`）。同样没有非测试调用方。整库审计、物理枚举与 GC 必须放进 worker，这里不做。
 - 谁真正写 blob（与旧说法相反）：工具写入的远程设备分支不经过这里，它只用 `file-snapshot-service.ts:ensureFileSnapshot` 存写前原文，结果带 `fileChangeEvidence.grade: "legacy_unverified"`；`executeLocalFileChange` 对非本机后端返回 `undefined`。本机后端进入运行时，但 `historyEnabled=false`：不初始化 blob 命名空间，只写 scope/operation/effect 元数据行，前后状态记为 `unknown/history_unavailable`，历史状态 `disabled`。blob 只在 `executeEditorFileChange` 的远程分支（`request.remote`）发布。分支逐条见 [文件写入与变更记录](write-queue.md)（`file-change-runtime.ts:executeBound`、`publish`）。
 - 证据的读取方：编辑预览（`tool-edit-preview.ts`）对带 `fileChangeOperationId` 的非本机工具调用读 effect 的写前/实测写后 blob（`FileChangeBlobStore.readBytes`，单侧上限 `FILE_CHANGE_LIMITS.previewFileBytes`）；回退计划读 effect 与 blob 重建恢复内容（见 [回退与文件历史](revert.md)）。
-- 归属时间线（`FileAttributionService.recordAttribution`，表 `file_attributions`）与证据是两套记录：工具写完后 `trackFileChange` 若发现证据已记（`evidenceRecorded`）就不重复记；写入 fire-and-forget、失败不挡工具；AI 归属会在 15s 内“遮住”同一路径，避免被监视器归为外部改动（`RECENT_ATTRIBUTION_TTL_MS`）。操作者身份统一由 `attribution-actors.ts` 解析（含 `narrator_unknown`），前端标签由 `attribution-label.ts:attributionLabelKind` 按最新事件自己的操作者决定。
+- 归属时间线（`FileAttributionService.recordAttribution`，表 `file_attributions`）与证据是两套记录：工具写完后 `trackFileChange` 若发现证据已记（`evidenceRecorded`）就不重复记；写入 fire-and-forget、失败不挡工具；未给出 `subagentType` 时在读 Worker 上查一次会话补全（`recordAttribution`/`recordAttributions`）；AI 归属会在 15s 内“遮住”同一路径，避免被监视器归为外部改动（`RECENT_ATTRIBUTION_TTL_MS`）。操作者身份统一由 `attribution-actors.ts` 解析（含 `narrator_unknown`），前端标签由 `attribution-label.ts:attributionLabelKind` 按最新事件自己的操作者决定。
 - `shared/file-change-protocol.ts` 定义共享协议：证据版本 `FILE_CHANGE_EVIDENCE_VERSION = 3`、结果/历史枚举、`FILE_CHANGE_LIMITS`；`shared/streaming-edit-origin.ts` 是流式 Edit 的固定大小来源指纹，不属于存储层（属于哪一节：未核实）。
 - PostgreSQL 的 blob 目录与证据存储（`postgres-file-change-blob-catalog.ts`、`postgres-file-change-evidence-store.ts`）是元数据 SQL 的异步对应实现；仓库内除测试外没有构造它们的调用方（未接入生产路径）。
-- 改动归属视图 `getWorkspaceModificationView`：读 `file_attributions` 表，返回历史观测而非净差异；默认 500 条、上限 2000，每个路径最多 10 条，最多查询 400 个路径、附加 cwd 范围 32 个；`completeness`/`baselineStatus: "unverified"` 明说只覆盖已记录的行；`findImpreciseChanges` 是有上限的警告扫描，触顶不会变成“无风险”。HTTP 入口是 `routes/git.ts` 里的 `/modifications`。
+- 改动归属视图 `getWorkspaceModificationView`：读 `file_attributions` 表，返回历史观测而非净差异；默认 500 条、上限 2000，每个路径最多 10 条，最多查询 400 个路径、附加 cwd 范围 32 个；`completeness`/`baselineStatus: "unverified"` 明说只覆盖已记录的行；`findImpreciseChanges` 是有上限的警告扫描，触顶不会变成“无风险”。HTTP 入口是 `routes/git.ts` 里的 `/modifications`。视图与 `findImpreciseChanges` 的查询全部经读 Worker 执行（`readQuery`/`readDbAll`，`executionPolicy: "worker-required"`，带 `maxRows` 与取消 `signal`），Worker 不可用时直接失败，不回退主线程。
 
 ## 从哪读起
 - `server/services/file-change-evidence.ts`：元数据状态机。

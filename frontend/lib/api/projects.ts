@@ -2,6 +2,13 @@ import type {
 	ResolveProjectDirectoryRequest,
 	ResolveProjectDirectoryResponse,
 } from "@shared/project-directory";
+import type {
+	ProjectAttentionResponse,
+	ProjectListSummaryResponse,
+	ProjectMemberCount,
+	ProjectSessionPage,
+	ProjectSessionView,
+} from "@shared/project-overview";
 import {
 	ApiError,
 	apiBase,
@@ -21,6 +28,28 @@ import type {
 export const projectsApi = {
 	listProjects: (status?: string) =>
 		request<ApiEntity[]>(`/projects${status ? `?status=${status}` : ""}`),
+	/** The project list's card numbers (R2), one request for all cards. */
+	getProjectSummaries: (signal?: AbortSignal) =>
+		request<ProjectListSummaryResponse>("/projects/summaries", { signal }),
+	/** The project page's 「等你处理」 (members only: 403 for readers). */
+	getProjectAttention: (projectId: string, signal?: AbortSignal) =>
+		request<ProjectAttentionResponse>(`/projects/${encodeURIComponent(projectId)}/attention`, {
+			signal,
+		}),
+	/** One page of the project page's session list. */
+	listProjectSessions: (
+		projectId: string,
+		options: { view: ProjectSessionView; cursor?: string; limit?: number },
+		signal?: AbortSignal,
+	) => {
+		const search = new URLSearchParams({ view: options.view });
+		if (options.cursor) search.set("cursor", options.cursor);
+		if (options.limit) search.set("limit", String(options.limit));
+		return request<ProjectSessionPage>(
+			`/projects/${encodeURIComponent(projectId)}/sessions?${search.toString()}`,
+			{ signal },
+		);
+	},
 	getProject: (id: string) => request<ApiEntity>(`/projects/${id}`),
 	/**
 	 * Which project a local directory belongs to (`create: true` makes the project of a git
@@ -152,6 +181,10 @@ export const projectsApi = {
 	getHiddenProjectExistence: () => request<{ hasHidden: boolean }>("/projects/hidden-existence"),
 
 	getProjectAccess: (projectId: string) => request<ProjectAccess>(`/projects/${projectId}/access`),
+
+	/** The header's 「N 位成员」: a count, never the list. */
+	getProjectMemberCount: (projectId: string, signal?: AbortSignal) =>
+		request<ProjectMemberCount>(`/projects/${projectId}/members/count`, { signal }),
 
 	setProjectVisibility: (projectId: string, visibility: ProjectVisibility) =>
 		request<ProjectAccess>(`/projects/${projectId}/visibility`, {

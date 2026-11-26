@@ -9,6 +9,7 @@ import {
 } from "@shared/text-file-types";
 import { Hono } from "hono";
 import { buildAppErrorResponse } from "../../lib/app-error-response";
+import { digestAttachment } from "../../lib/attachment-digest";
 import {
 	bindComposerDocumentReferences,
 	bindComposerMediaProjection,
@@ -20,7 +21,16 @@ import {
 import { DbReadTaskOverloadedError } from "../../lib/db-worker/pool";
 import { AppError, catalogError, ValidationError } from "../../lib/errors";
 import { parseFileReferenceInput } from "../../lib/file-reference-input";
-import { bufferQueueModeSchema, sendMessageSchema } from "../../lib/validators/narrators";
+import {
+	bufferQueueModeSchema,
+	clientSubmissionIdSchema,
+	sendMessageSchema,
+} from "../../lib/validators/narrators";
+import {
+	assertUserSubmissionReplay,
+	submissionFingerprint,
+	USER_SUBMISSION_WINDOW_MS,
+} from "../../services/agent-runtime/user-submission";
 import { narratorSurfaceReadOptions } from "../../services/narrator-surface-reads";
 
 // Run the real parser/HTTP handler with injected service boundaries, without
@@ -36,6 +46,7 @@ const compiled = new Bun.Transpiler({ loader: "ts" }).transformSync(
 	[
 		section("function parseNewCommand(", "export const narratorRoutes"),
 		section('narratorRoutes.post("/:id/messages"', "// Retry last user message"),
+		section('narratorRoutes.get("/:id/submissions/', 'narratorRoutes.route("/:id/file-references"'),
 	]
 		.join("\n")
 		.replaceAll("export async function", "async function")
@@ -58,6 +69,11 @@ function fixture(
 		languageReadError?: Error;
 		replyInUserLanguage?: boolean;
 		canonicalPrefix?: string;
+		lookupSubmission?: (
+			narratorId: string,
+			userId: string,
+			submissionId: string,
+		) => Promise<unknown>;
 		/** The session's task backend (outline P2). */
 		taskBackend?: "spec" | "outline";
 	} = {},
@@ -118,6 +134,11 @@ function fixture(
 		validateComposerAssets,
 		sendMessageSchema,
 		bufferQueueModeSchema,
+		clientSubmissionIdSchema,
+		submissionFingerprint,
+		USER_SUBMISSION_WINDOW_MS,
+		assertUserSubmissionReplay,
+		readUserSubmission: options.lookupSubmission ?? (async () => undefined),
 		MAX_MEDIA_ATTACHMENTS,
 		MAX_EDIT_IMAGES_PER_MESSAGE,
 		MAX_EDIT_TEXT_FILES_PER_MESSAGE,
@@ -125,6 +146,8 @@ function fixture(
 		// Staged attachments need a real store; these tests never send any, so the
 		// bindings only have to exist for the helper's code path to be reachable.
 		findStagedAttachment: () => null,
+		discardStagedAttachment: () => {},
+		digestAttachment,
 		stagedAttachmentAsFile: () => {
 			throw new Error("no staged attachments in this fixture");
 		},
@@ -252,6 +275,8 @@ function fixture(
 		modelBroadcast,
 		restoreModel,
 		broadcast,
+		receipt: (submissionId = "snapshot") =>
+			app.request(`http://localhost/narrators/session/submissions/${submissionId}`),
 		post: (body: FormData | Record<string, unknown>, signal?: AbortSignal) =>
 			app.request("http://localhost/narrators/session/messages", {
 				method: "POST",
@@ -766,5 +791,182 @@ describe("subagent HTTP compatibility", () => {
 			expect(f.accept.mock.calls[0]?.[2]).toMatchObject({ queueOnly: !interrupt });
 			expect(f.accept.mock.calls[0]?.[2].interrupt).toBe(interrupt);
 		}
+	});
+});
+
+describe("submission receipt HTTP contract", () => {
+	test("200 exposes exactly the accepted receipt and not internal fingerprint or attachment metadata", async () => {
+		const receipt = {
+			status: "accepted",
+			id: "mailbox-id",
+			bufferedAt: "2026-11-24T00:00:00.000Z",
+			state: "queued",
+			messageId: null,
+			dedupeExpiresAt: "2026-12-01T00:00:00.000Z",
+		};
+		const f = fixture({
+			lookupSubmission: async () => ({
+				...receipt,
+				metadataJson: JSON.stringify({
+					submissionFingerprint: "private",
+					submissionAttachments: [],
+				}),
+			}),
+		});
+		const response = await f.receipt();
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual(receipt);
+	});
+	test("unseen IDs are 404 with the known dedupe window, not guessed expired", async () => {
+		const response = await fixture().receipt("random-unseen-id");
+		expect(response.status).toBe(404);
+		expect(await response.json()).toEqual({ status: "not_found", dedupeWindowMs: 604800000 });
+	});
+	test("proven expiry is a 410 without automatic resubmission", async () => {
+		const f = fixture({
+			lookupSubmission: async () => {
+				throw new AppError(
+					"Submission receipt expired; explicitly send again with a new ID",
+					410,
+					"SUBMISSION_EXPIRED",
+				);
+			},
+		});
+		const response = await f.receipt();
+		expect(response.status).toBe(410);
+		expect(await response.json()).toMatchObject({ code: "SUBMISSION_EXPIRED" });
+		expect(f.accept).not.toHaveBeenCalled();
+	});
+});
+
+describe("client submission replay", () => {
+	test("multipart upload retry returns old 202 receipt before creating another upload or readmitting", async () => {
+		let fingerprint: string | undefined;
+		const f = fixture({
+			buffered: true,
+			lookupSubmission: async () =>
+				fingerprint
+					? {
+							id: "old-admission",
+							bufferedAt: "original-time",
+							metadataJson: JSON.stringify({ submissionFingerprint: fingerprint }),
+							dedupeExpiresAt: new Date(Date.now() + 100_000).toISOString(),
+						}
+					: undefined,
+		});
+		const first = multipart("true");
+		first.set("clientSubmissionId", "stable-upload-snapshot");
+		expect((await f.post(first)).status).toBe(202);
+		fingerprint = (f.accept.mock.calls[0]?.[2].submission as { fingerprint: string }).fingerprint;
+		const replay = multipart("true");
+		replay.set("clientSubmissionId", "stable-upload-snapshot");
+		const response = await f.post(replay);
+		expect(response.status).toBe(202);
+		expect(await response.json()).toEqual({
+			buffered: true,
+			id: "old-admission",
+			bufferedAt: "original-time",
+		});
+		expect(f.accept).toHaveBeenCalledTimes(1);
+		expect(f.deletedImages).toEqual([]);
+	});
+	test.each([
+		"different-bytes",
+		"different-channel",
+	] as const)("same attachment metadata with %s conflicts before new admission", async (change) => {
+		let fingerprint: string | undefined;
+		const f = fixture({
+			buffered: true,
+			lookupSubmission: async () =>
+				fingerprint
+					? {
+							id: "old",
+							bufferedAt: "then",
+							metadataJson: JSON.stringify({ submissionFingerprint: fingerprint }),
+							dedupeExpiresAt: new Date(Date.now() + 100_000).toISOString(),
+						}
+					: undefined,
+		});
+		const first = new FormData();
+		first.set("message", "hello");
+		first.set("clientSubmissionId", "attachment-identity");
+		first.append("images", new File(["bytes-a"], "same.png", { type: "image/png" }));
+		expect((await f.post(first)).status).toBe(202);
+		fingerprint = (f.accept.mock.calls[0]?.[2].submission as { fingerprint: string }).fingerprint;
+		const replay = new FormData();
+		replay.set("message", "hello");
+		replay.set("clientSubmissionId", "attachment-identity");
+		replay.append(
+			change === "different-channel" ? "textFiles" : "images",
+			new File([change === "different-bytes" ? "bytes-b" : "bytes-a"], "same.png", {
+				type: "image/png",
+			}),
+		);
+		const response = await f.post(replay);
+		expect(response.status).toBe(409);
+		expect(await response.json()).toMatchObject({ code: "SUBMISSION_CONFLICT" });
+		expect(f.accept).toHaveBeenCalledTimes(1);
+		expect(f.deletedImages).toEqual([]);
+	});
+	test("a consumed stage retries using its own immutable receipt digest instead of missing upload bytes", async () => {
+		const content = {
+			channel: "textFiles",
+			name: "large.txt",
+			size: 7,
+			type: "text/plain",
+			digest: await digestAttachment(new Blob(["bytes-a"])),
+		};
+		const fingerprint = submissionFingerprint({
+			message: "hello",
+			composerDocument: undefined,
+			fileReferences: undefined,
+			queueMode: undefined,
+			priority: null,
+			interrupt: null,
+			attachments: [content],
+		});
+		const f = fixture({
+			lookupSubmission: async () => ({
+				id: "old-stage",
+				bufferedAt: "then",
+				metadataJson: JSON.stringify({
+					submissionFingerprint: fingerprint,
+					submissionAttachments: [{ ...content, uploadId: "consumed-stage" }],
+				}),
+				dedupeExpiresAt: new Date(Date.now() + 100_000).toISOString(),
+			}),
+		});
+		const replay = new FormData();
+		replay.set("message", "hello");
+		replay.set("clientSubmissionId", "stage-snapshot");
+		replay.set("stagedAttachments", JSON.stringify([{ uploadId: "consumed-stage", index: 0 }]));
+		const response = await f.post(replay);
+		expect(response.status).toBe(202);
+		expect(await response.json()).toEqual({ buffered: true, id: "old-stage", bufferedAt: "then" });
+		expect(f.accept).not.toHaveBeenCalled();
+	});
+	test("same submission with different message or interrupt mode conflicts before admission", async () => {
+		const fingerprint = submissionFingerprint({ message: "hello", queueMode: "turn" });
+		const f = fixture({
+			lookupSubmission: async () => ({
+				id: "old",
+				bufferedAt: "then",
+				metadataJson: JSON.stringify({ submissionFingerprint: fingerprint }),
+				dedupeExpiresAt: new Date(Date.now() + 100_000).toISOString(),
+			}),
+		});
+		for (const message of ["changed", "hello"]) {
+			const response = await f.post({
+				message,
+				clientSubmissionId: "stable",
+				queueMode: "interrupt",
+			});
+			expect(response.status).toBe(409);
+			expect(await response.json()).toMatchObject({
+				error: "Client submission ID was already used for different content",
+				code: "SUBMISSION_CONFLICT",
+			});
+		}
+		expect(f.accept).not.toHaveBeenCalled();
 	});
 });

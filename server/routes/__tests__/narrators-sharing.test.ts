@@ -25,6 +25,7 @@ process.env.NARRAFORK_ALLOW_MULTIPLE = "1";
 
 const { narratorRoutes } = await import("../narrators");
 const { db } = await import("../../db");
+const workerRead = await import("../../db/worker-read");
 const { aclGrants, narrators, users } = await import("../../db/schema");
 const { generateId } = await import("../../lib/id");
 const narratorWs = await import("../../websocket/narrator-ws");
@@ -99,31 +100,26 @@ function pauseTransferTargetLookups(targets: readonly string[], expectedArrivals
 	const ready = new Promise<void>((resolve) => {
 		signalReady = resolve;
 	});
-	const original = db.query.users.findFirst.bind(db.query.users);
+	// The transfer's target lookup runs through the Worker read bridge; pause it there,
+	// after the real read returned, keeping every other read untouched.
+	const original = workerRead.readQuery;
 	const restoreExecutions: Array<() => void> = [];
-	const read = spyOn(db.query.users, "findFirst").mockImplementation((options) => {
-		const query = original(options);
-		const execute = query.execute.bind(query);
-		const delayed = spyOn(query, "execute").mockImplementation(async () => {
-			const row = await execute();
-			// Retain the real query builder/SQL read, pausing only the transfer's
-			// id-only target lookup after authorization. Other reads remain real.
-			if (
-				!released &&
-				options?.columns?.id === true &&
-				Object.keys(options.columns).length === 1 &&
-				row &&
-				targets.includes(row.id)
-			) {
-				arrivals++;
-				if (arrivals === expectedArrivals) signalReady();
-				await gate;
-			}
-			return row;
-		});
-		restoreExecutions.push(() => delayed.mockRestore());
-		return query;
-	});
+	const read = spyOn(workerRead, "readQuery").mockImplementation((async (query, options) => {
+		const row = (await original(query as never, options)) as unknown;
+		const single = Array.isArray(row) ? undefined : (row as { id?: string } | undefined);
+		if (
+			!released &&
+			single &&
+			Object.keys(single).length === 1 &&
+			typeof single.id === "string" &&
+			targets.includes(single.id)
+		) {
+			arrivals++;
+			if (arrivals === expectedArrivals) signalReady();
+			await gate;
+		}
+		return row;
+	}) as typeof workerRead.readQuery);
 	const release = () => {
 		released = true;
 		releaseGate();

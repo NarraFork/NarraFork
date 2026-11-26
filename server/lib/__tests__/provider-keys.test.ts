@@ -2,10 +2,11 @@ import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import * as ids from "../id";
 import { getNarraforkPath } from "../narrafork-home";
 import * as providerKeys from "../provider-keys";
 import { getProviderKeyStore, ProviderKeyStore } from "../provider-keys";
-import { readSecretJSON } from "../secret-store";
+import { readSecretJSON, writeSecretJSON } from "../secret-store";
 import { reloadSettings, saveSettings, settings } from "../settings";
 import {
 	absorbProviderKeys,
@@ -31,10 +32,26 @@ afterEach(() => {
 	for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-function freshStore() {
+function freshStore(unified = false) {
 	const dir = mkdtempSync(join(tmpdir(), "narrafork-provider-keys-"));
 	dirs.push(dir);
 	const path = join(dir, "provider-keys.json");
+	if (unified) {
+		writeSecretJSON(join(dir, "credentials.json"), {
+			version: 1,
+			credentials: [
+				{
+					id: "occupied-by-codex",
+					target: { groupId: "codex" },
+					ownerUserId: null,
+					priority: 0,
+					createdAt: 0,
+					auth: { kind: "oauth", refreshToken: "test-refresh" },
+				},
+			],
+			groupSecrets: {},
+		});
+	}
 	return { path, store: new ProviderKeyStore(path) };
 }
 
@@ -89,6 +106,53 @@ describe("provider key store", () => {
 		expect(store.get(a.id)?.disabled).toBeUndefined();
 	});
 
+	for (const unified of [false, true]) {
+		test(`${unified ? "unified" : "legacy"}: group APIs and facade owners keep every key together`, () => {
+			const { path, store } = freshStore(unified);
+			for (const [groupId, templateId, owner] of [
+				["gateway", "nug", nugKeyOwner("gateway")],
+				["tokendance", "tokendance", TOKENDANCE_KEY_OWNER],
+				["CommandCode", "command-code", COMMAND_CODE_KEY_OWNER],
+				["custom", undefined, "custom"],
+			] as const) {
+				store.syncFirstKeys([{ id: owner, apiKey: `${groupId}-first` }], { clearOnEmpty: true });
+				const backup = store.addGroupCredential(groupId, templateId, {
+					apiKey: `${groupId}-second`,
+				});
+				expect(backup.id).toHaveLength(21);
+				expect(store.listGroup(groupId)).toEqual(store.list(owner));
+				expect(store.firstGroupKey(groupId)).toBe(`${groupId}-first`);
+				store.reorder(owner, [backup.id]);
+				expect(store.firstGroupKey(groupId)).toBe(`${groupId}-second`);
+				store.update(backup.id, { disabled: true });
+				expect(new ProviderKeyStore(path).listGroup(groupId)).toEqual(store.list(owner));
+				store.remove(backup.id);
+				expect(store.firstGroupKey(groupId)).toBe(`${groupId}-first`);
+			}
+		});
+
+		test(`${unified ? "unified" : "legacy"}: fresh ids avoid all existing credentials, including collisions`, () => {
+			const { store } = freshStore(unified);
+			store.add("other", { id: "occupied-key", apiKey: "other-key" });
+			const generated = spyOn(ids, "generateId");
+			try {
+				generated.mockReturnValueOnce("occupied-key");
+				if (unified) generated.mockReturnValueOnce("occupied-by-codex");
+				generated.mockReturnValueOnce("new-add-key");
+				expect(store.add("new", { id: "occupied-key", apiKey: "new-key" }).id).toBe("new-add-key");
+				generated.mockReturnValueOnce("occupied-key").mockReturnValueOnce("new-sync-key");
+				store.syncFirstKeys(
+					[{ id: unified ? "occupied-by-codex" : "occupied-key", apiKey: "sync-key" }],
+					{ clearOnEmpty: true },
+				);
+				expect(store.get("new-sync-key")?.apiKey).toBe("sync-key");
+				expect(store.get("occupied-key")?.providerId).toBe("other");
+			} finally {
+				generated.mockRestore();
+			}
+		});
+	}
+
 	test("persists encrypted, reloads, and never overwrites a file it cannot read", () => {
 		const { path, store } = freshStore();
 		store.add("p", { apiKey: "sk-secret" });
@@ -112,6 +176,82 @@ describe("provider key store", () => {
 });
 
 describe("settings projection", () => {
+	for (const unified of [false, true]) {
+		test(`${unified ? "unified" : "legacy"}: clearing a first key keeps backups; only deleting a connection prunes its pool`, () => {
+			const { store } = freshStore(unified);
+			const projectionStore = spyOn(providerKeys, "getProviderKeyStore").mockReturnValue(store);
+			const previous = {
+				nugProviders: [nug("pool-nug", "nug-first")],
+				tokendance: { apiKey: "td-first", disabled: false, generation: 1 },
+				commandCode: { apiKey: "cc-first" },
+			} as NarraForkSettings;
+			const groups = [
+				["pool-nug", "nug"],
+				["tokendance", "tokendance"],
+				["CommandCode", "command-code"],
+			] as const;
+			try {
+				syncProviderKeys(previous);
+				for (const [groupId, templateId] of groups) {
+					store.addGroupCredential(groupId, templateId, { apiKey: `${groupId}-backup` });
+				}
+				const next = {
+					...structuredClone(previous),
+					nugProviders: [nug("pool-nug", "")],
+					tokendance: { apiKey: "", disabled: false, generation: 1 },
+					commandCode: {},
+				};
+				syncProviderKeys(next);
+				hydrateProviderKeys(next);
+				pruneProviderKeys(previous, next);
+				for (const [groupId] of groups) {
+					expect(store.listGroup(groupId).map((key) => key.apiKey)).toEqual([`${groupId}-backup`]);
+				}
+				syncProviderKeys(structuredClone(next));
+				pruneProviderKeys(next, structuredClone(next));
+				for (const [groupId] of groups) expect(store.listGroup(groupId)).toHaveLength(1);
+				pruneProviderKeys(next, {
+					...next,
+					nugProviders: [],
+					tokendance: undefined,
+					commandCode: undefined,
+				});
+				for (const [groupId] of groups) expect(store.listGroup(groupId)).toEqual([]);
+			} finally {
+				projectionStore.mockRestore();
+			}
+		});
+
+		test(`${unified ? "unified" : "legacy"}: neither inline nor migrated TokenDance keys imply login provenance`, () => {
+			const { store } = freshStore(unified);
+			const projectionStore = spyOn(providerKeys, "getProviderKeyStore").mockReturnValue(store);
+			try {
+				const legacy = {
+					tokendance: { apiKey: "legacy-login", disabled: false, generation: 1 },
+				} as NarraForkSettings;
+				absorbProviderKeys(legacy);
+				const login = store.list(TOKENDANCE_KEY_OWNER)[0];
+				if (!login) throw new Error("Expected migrated login");
+				expect(providerKeys.isTokenDanceLoginKey(login)).toBe(false);
+				const edited = structuredClone(legacy);
+				if (!edited.tokendance) throw new Error("Expected connection");
+				edited.tokendance.apiKey = "manually-replaced";
+				syncProviderKeys(edited);
+				expect(store.get(login.id)?.account).toBeUndefined();
+				store.addGroupCredential("tokendance", "tokendance", { apiKey: "manual-backup" });
+				absorbProviderKeys(edited);
+				expect(store.listGroup("tokendance").some(providerKeys.isTokenDanceLoginKey)).toBe(false);
+				const disk = {
+					tokendance: { apiKey: "", disabled: false, generation: 1 },
+				} as NarraForkSettings;
+				absorbProviderKeys(disk);
+				expect(store.listGroup("tokendance").some(providerKeys.isTokenDanceLoginKey)).toBe(false);
+			} finally {
+				projectionStore.mockRestore();
+			}
+		});
+	}
+
 	test("NUG OAuth secrets migrate, clone-save, reload and follow encryption without joining API keys", () => {
 		const saved = structuredClone(settings);
 		const id = "nugOAuth";

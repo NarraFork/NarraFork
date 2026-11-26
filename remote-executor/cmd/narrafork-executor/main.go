@@ -22,6 +22,7 @@ import (
 	"github.com/narrafork/remote-executor/internal/config"
 	"github.com/narrafork/remote-executor/internal/handlers"
 	"github.com/narrafork/remote-executor/internal/rpc"
+	"github.com/narrafork/remote-executor/internal/session"
 	"github.com/narrafork/remote-executor/internal/transport"
 )
 
@@ -134,6 +135,15 @@ func run(ctx context.Context, ready func()) error {
 
 	if h.EditorEnabled() {
 		caps.Features = append(caps.Features, handlers.FeatureEditorDurableWriteV1, handlers.FeatureEditorTargetQueueV1)
+	}
+
+	// Durable sessions belong to this process, not to a connection: they keep
+	// running across reconnects and end only when killed or when we exit.
+	if caps.Pty {
+		sessions := session.NewManager(session.DefaultLimits())
+		h.SetSessionManager(sessions)
+		caps.Features = append(caps.Features, handlers.FeatureSessionDurableV1, handlers.FeatureSessionExecV1)
+		defer sessions.Shutdown()
 	}
 
 	// Signal handling belongs to the console path only. Under the SCM, shutdown

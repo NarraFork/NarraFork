@@ -8,6 +8,7 @@
  * Pure: no DOM, no React.
  */
 import {
+	dependencyBlockers,
 	TEAM_LEVEL_EVENT_KINDS,
 	TEAM_OVERLAP_EVENT_KINDS,
 	TEAM_PERSON_DECISION_EVENT_KINDS,
@@ -18,6 +19,8 @@ import {
 	type TeamPageSummary,
 	type TeamPendingApproval,
 	type TeamSummary,
+	type TeamWorkDependencyRef,
+	type TeamWorkMergeSummary,
 } from "@shared/project-teams";
 
 /**
@@ -49,6 +52,29 @@ export function liveWorkerStatus(
 	const complete = summary.runningCount <= summary.runningAgents.length;
 	if (complete && (worker.status === "working" || worker.status === "waiting")) return "idle";
 	return worker.status;
+}
+
+/**
+ * The coordinator column's header line: how many other sessions of the tree are running, and the
+ * coordinator's own state when nothing else runs. The summary's running list does not say which
+ * sessions are work-item workers (reviewers and nested subagents run in the same tree), so the
+ * line counts sessions, not workers. When the list was cut (`more`) the count is a lower bound,
+ * shown as 「N+」: the listed others plus at least one unlisted, so it is never 「0+」.
+ */
+export function coordinatorLine(
+	summary: Pick<TeamPageSummary, "teamId" | "coordinatorStatus" | "runningAgents" | "runningCount">,
+):
+	| { kind: "running"; count: number; more: boolean }
+	| { kind: "status"; status: "working" | "waiting" | "idle" | "archived" } {
+	const others = summary.runningAgents.filter((agent) => agent.id !== summary.teamId).length;
+	const more = summary.runningCount > summary.runningAgents.length;
+	if (more) return { kind: "running", count: others + 1, more };
+	if (others > 0) return { kind: "running", count: others, more };
+	const status = summary.coordinatorStatus;
+	return {
+		kind: "status",
+		status: status === "working" || status === "waiting" || status === "archived" ? status : "idle",
+	};
 }
 
 /** "50+" past a capped count (the server counts one past its limit). */
@@ -129,6 +155,44 @@ export function eventNote(
 			const reason = text(detail.reason, 600);
 			return reason ? { key: "text", values: { text: reason } } : null;
 		}
+		case "work.dependencies_changed": {
+			// The whole set, merged ones included (the event keeps no states): never "waits for N".
+			const count = Array.isArray(detail.dependsOn) ? detail.dependsOn.length : null;
+			if (count === null) return null;
+			return count === 0
+				? { key: "dependenciesCleared", values: {} }
+				: { key: "dependencies", values: { count } };
+		}
+		case "work.unblocked":
+			return { key: "unblocked", values: {} };
+		case "work.merge_requested":
+			return {
+				key: detail.job === "fast_forward" ? "mergeFastForward" : "mergeRequested",
+				values: {},
+			};
+		case "work.merge_failed": {
+			if (detail.code === "conflict") {
+				const count = Array.isArray(detail.conflicts) ? detail.conflicts.length : 0;
+				return {
+					key: detail.more === true ? "mergeConflictMore" : "mergeConflict",
+					values: { count },
+				};
+			}
+			const message = text(detail.message, 280);
+			return message ? { key: "text", values: { text: message } } : null;
+		}
+		case "work.merge_prepared": {
+			const path = text(detail.checkedOutAt, 300);
+			return path ? { key: "mergePrepared", values: { path } } : null;
+		}
+		case "work.merged":
+			if (detail.detectedBy === "local_merge")
+				return {
+					key: detail.fastForwarded === "checkout" ? "mergedFastForward" : "mergedLocal",
+					values: {},
+				};
+			if (detail.detectedBy === "ancestry") return { key: "mergedAncestry", values: {} };
+			return null;
 		case "approval.allowed":
 		case "approval.denied":
 		case "question.answered":
@@ -269,12 +333,21 @@ export function itemOfApproval(
 	return items.find((item) => item.worker && sessions.has(item.worker.id)) ?? null;
 }
 
+/**
+ * Where a card comes from when 「等你处理」 sums up more than one team (R2: the project page): the
+ * team it belongs to, or an ordinary session and whose it is. The team page leaves it out.
+ */
+export type AttentionSource =
+	| { kind: "team"; teamId: string; name: string }
+	| { kind: "session"; narratorId: string; title: string | null; ownerName: string | null };
+
 /** One card of 「等你处理」: a pending call of the tree, or a ready item to accept. */
 interface ApprovalEntry<K extends TeamPendingApproval["kind"]> {
 	kind: K;
 	id: string;
 	approval: TeamPendingApproval;
 	item: TeamBoardItem | null;
+	source?: AttentionSource;
 }
 
 export type AttentionEntry =
@@ -282,7 +355,14 @@ export type AttentionEntry =
 	| ApprovalEntry<"question">
 	| ApprovalEntry<"plan">
 	| ApprovalEntry<"rule">
-	| { kind: "merge"; id: string; item: TeamBoardItem };
+	| {
+			kind: "merge";
+			id: string;
+			item: TeamBoardItem;
+			source?: AttentionSource;
+			/** The branch it merges into, when the cards come from several teams. */
+			base?: string;
+	  };
 
 const isOpen = (item: TeamBoardItem) => item.state !== "merged" && item.state !== "cancelled";
 
@@ -487,6 +567,31 @@ export function teamPageMode(
 /** The tint of a row's status dot. */
 export type RowTone = "amber" | "green" | "blue" | "hollow" | "gray";
 
+/**
+ * What a tool call asks for, in words (R2: 「请求编辑文件」, 「等批准运行命令」): editing a file,
+ * running a command, reading a file, opening a web page, or (any other tool) using it by name.
+ */
+export type ToolVerb = "editFile" | "runCommand" | "readFile" | "fetchWeb" | "useTool";
+
+const TOOL_VERBS: Readonly<Record<string, ToolVerb>> = {
+	Edit: "editFile",
+	Write: "editFile",
+	MultiEdit: "editFile",
+	NotebookEdit: "editFile",
+	Bash: "runCommand",
+	Read: "readFile",
+	WebFetch: "fetchWeb",
+};
+
+export function toolVerb(toolName: string): ToolVerb {
+	return TOOL_VERBS[toolName] ?? "useTool";
+}
+
+/** The i18n key (under `teams.page.row.`) of a row waiting for approval of this tool. */
+export function waitingToolKey(toolName: string): string {
+	return `waitingTools.${toolVerb(toolName)}`;
+}
+
 /** A row's second line: an i18n key under `teams.page.row.` and its values. */
 export interface RowLine {
 	key: string;
@@ -504,7 +609,7 @@ export function rowLine(row: WorkRow, workerStatus: string | null, base: string)
 			approval.kind === "question" ? (approval.questions[0] ?? null) : approval.preview || null;
 		const key =
 			approval.kind === "tool"
-				? "waitingTool"
+				? waitingToolKey(approval.toolName)
 				: approval.kind === "question"
 					? "waitingAnswer"
 					: approval.kind === "plan"
@@ -519,7 +624,12 @@ export function rowLine(row: WorkRow, workerStatus: string | null, base: string)
 		const kind =
 			tool === "AskUserQuestion" ? "question" : tool === "ExitPlanMode" ? "plan" : "tool";
 		return {
-			key: kind === "question" ? "waitingAnswer" : kind === "plan" ? "waitingPlan" : "waitingTool",
+			key:
+				kind === "question"
+					? "waitingAnswer"
+					: kind === "plan"
+						? "waitingPlan"
+						: waitingToolKey(tool),
 			values: { tool },
 			detail: item.activity?.preview || null,
 			tone: "amber",
@@ -543,7 +653,7 @@ export function rowLine(row: WorkRow, workerStatus: string | null, base: string)
 						tone: "blue",
 					};
 		case "queued":
-			return { key: "queued", values: {}, detail: null, tone: "hollow" };
+			return queuedLine(item.dependsOn);
 		case "merged":
 			return { key: "merged", values: { base }, detail: null, tone: "gray" };
 		case "cancelled":
@@ -567,10 +677,61 @@ export function rowLine(row: WorkRow, workerStatus: string | null, base: string)
 	}
 }
 
+/**
+ * D: a queued row's line. Waiting on dependencies it reads 「排队 · 等「A」「B」合并」 (the
+ * titles when one or two, else 「等 N 项合并」); a cancelled dependency, which never merges,
+ * reads 「排队 · 依赖「A」已取消」 until the coordinator removes or replaces it (the drawer warns).
+ */
+export function queuedLine(dependsOn: readonly TeamWorkDependencyRef[] | undefined): RowLine {
+	const blockers = dependencyBlockers(dependsOn);
+	const cancelled = blockers.find((blocker) => blocker.state === "cancelled");
+	if (cancelled)
+		return {
+			key: "queuedBlockedCancelled",
+			values: { title: cancelled.title },
+			detail: null,
+			tone: "hollow",
+		};
+	const [first, second] = blockers;
+	if (!first) return { key: "queued", values: {}, detail: null, tone: "hollow" };
+	if (blockers.length === 1)
+		return {
+			key: "queuedWaitingOne",
+			values: { first: first.title },
+			detail: null,
+			tone: "hollow",
+		};
+	if (blockers.length === 2 && second)
+		return {
+			key: "queuedWaitingTwo",
+			values: { first: first.title, second: second.title },
+			detail: null,
+			tone: "hollow",
+		};
+	return {
+		key: "queuedWaitingMany",
+		values: { count: blockers.length },
+		detail: null,
+		tone: "hollow",
+	};
+}
+
 /** A return reason a person typed, trimmed; null when it cannot be sent. */
 export function returnReason(text: string): string | null {
 	const trimmed = text.trim();
 	return trimmed && trimmed.length <= TEAM_RETURN_REASON_MAX_LENGTH ? trimmed : null;
+}
+
+/** Lines a review round's findings show before 「展开」. */
+export const REVIEW_FINDINGS_CLAMP_LINES = 3;
+
+/**
+ * Whether a round's findings may run past {@link REVIEW_FINDINGS_CLAMP_LINES} lines in the drawer
+ * and so get 「展开 / 收起」: more lines than that, or more text than fits them at the drawer's
+ * narrowest width (an estimate; a short text never gets the toggle).
+ */
+export function findingsNeedToggle(text: string): boolean {
+	return text.split("\n").length > REVIEW_FINDINGS_CLAMP_LINES || text.length > 140;
 }
 
 /** How one line of a unified diff is drawn. */
@@ -682,4 +843,94 @@ export function isCoordinator(
 	teamId: string,
 ): boolean {
 	return actor.actorKind === "agent" && actor.actorId === teamId;
+}
+
+// ── M: merging a ready item ─────────────────────────────────────────────────
+
+/** What the merge control of the drawer's bottom bar and the 等你处理 card shows. */
+export interface MergeControlView {
+	/** The button's label key under `teams.page.merge.`. */
+	label: "merge" | "merging" | "fastForwarding" | "prepareAgain";
+	/** A job runs: the button shows its progress. */
+	busy: boolean;
+	enabled: boolean;
+	/** Why the button is disabled (an i18n key), or null. */
+	disabledKey: string | null;
+	/** The newest outcome to show beside it. */
+	panel: TeamWorkMergeSummary["outcome"];
+}
+
+/** The merge control for an item's merge state; null when the item carries none (not ready). */
+export function mergeControl(merge: TeamWorkMergeSummary | undefined): MergeControlView | null {
+	if (!merge) return null;
+	if (merge.phase !== null || merge.job !== null)
+		return {
+			label: merge.job === "fast_forward" ? "fastForwarding" : "merging",
+			busy: true,
+			enabled: false,
+			disabledKey: null,
+			panel: null,
+		};
+	return {
+		label: merge.outcome === "prepared" ? "prepareAgain" : "merge",
+		busy: false,
+		enabled: merge.canMerge,
+		disabledKey: merge.disabledReason ? `teams.page.merge.disabled.${merge.disabledReason}` : null,
+		panel: merge.outcome,
+	};
+}
+
+/** Refusals of a merge request the page words itself (others show the server's text). */
+const MERGE_ERROR_CODES = new Set([
+	"TEAM_WORK_ITEM_NOT_READY",
+	"TEAM_WORK_ITEM_MERGING",
+	"TEAM_WORK_ITEM_WORKER_RUNNING",
+	"TEAM_MERGE_GITHUB_PENDING",
+	"TEAM_MERGE_BASE_REMOTE",
+	"TEAM_MERGE_NOT_PREPARED",
+	"TEAM_ARCHIVED",
+	"TEAM_MERGE_BASE_MOVED",
+	"TEAM_WORK_ITEM_HEAD_MOVED",
+	"TEAM_WORK_ITEM_HEAD_UNAVAILABLE",
+	"TEAM_MERGE_GIT_TOO_OLD",
+	"TEAM_MERGE_STALE",
+	"TEAM_MERGE_CHECKOUT_BLOCKED",
+	"TEAM_MERGE_CHECKOUT_BUSY",
+	"TEAM_MERGE_FAST_FORWARD_REFUSED",
+	"TEAM_MERGE_IDENTITY_UNKNOWN",
+	"TEAM_MERGE_FAST_FORWARD_INCOMPLETE",
+	"TEAM_MERGE_HOSTING_UNKNOWN",
+	"TEAM_MERGE_TIMEOUT",
+	"TEAM_GIT_HISTORY_ALTERED",
+	"TEAM_GIT_REPLACED_HISTORY",
+	"GIT_WORKSPACE_BUSY",
+]);
+
+/** The i18n key of a merge refusal or failure code, or null for the server's own words. */
+export function mergeErrorKey(code: string | null | undefined): string | null {
+	return code && MERGE_ERROR_CODES.has(code) ? `teams.page.merge.errors.${code}` : null;
+}
+
+/** The code of a failed merge request (an API error), if any. */
+export function mergeRequestCode(error: unknown): string | null {
+	const code = (error as { data?: { code?: unknown } } | null)?.data?.code;
+	return typeof code === "string" ? code : null;
+}
+
+/** Most conflicting files a prefilled 退回 reason names. */
+export const MERGE_CONFLICT_REASON_FILES = 20;
+
+/**
+ * The files a prefilled 退回 reason names after a conflict: at most
+ * {@link MERGE_CONFLICT_REASON_FILES}, one per line, and whether more were left out.
+ */
+export function conflictReasonFiles(
+	conflicts: readonly string[] | undefined,
+	more: boolean | undefined,
+): { files: string; more: boolean } {
+	const list = (conflicts ?? []).slice(0, MERGE_CONFLICT_REASON_FILES);
+	return {
+		files: list.map((file) => `- ${file}`).join("\n"),
+		more: more === true || (conflicts?.length ?? 0) > list.length,
+	};
 }

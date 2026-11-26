@@ -1,7 +1,7 @@
 /**
  * 数据可移植性 · 项目 team（docs/PROJECT_TEAMS-PLAN.md P1）。
  *
- * team 的三张表不导出（记的是本机的 git 分支和 worktree）：
+ * team 的四张表（含工作项依赖）不导出（记的是本机的 git 分支和 worktree）：
  * - 导出的快照里没有它们；
  * - 导入后会话的 `team` trait 以本机有没有 team 行为准：新会话去掉、覆盖本机协调者时保留；
  * - 清空会话先清 team 表（team 行 RESTRICT 会话删除），不报外键错。
@@ -69,12 +69,24 @@ function insertTeam(id: string, withLiveItem = false) {
 		VALUES (?, ?, 'team.created', 'system', ?)`,
 		[`ev-${id}`, id, NOW],
 	);
-	if (withLiveItem)
+	if (withLiveItem) {
 		sqlite.run(
 			`INSERT INTO team_work_items (id, team_id, project_id, title, state, created_at, updated_at)
 			VALUES (?, ?, ?, 'work', 'in_progress', ?, ?)`,
 			[`wi-${id}`, id, PROJECT, NOW, NOW],
 		);
+		// D: a queued item waiting for it.
+		sqlite.run(
+			`INSERT INTO team_work_items (id, team_id, project_id, title, state, created_at, updated_at)
+			VALUES (?, ?, ?, 'next', 'queued', ?, ?)`,
+			[`wi-next-${id}`, id, PROJECT, NOW, NOW],
+		);
+		sqlite.run(
+			`INSERT INTO team_work_item_dependencies (item_id, depends_on_item_id, team_id, created_at)
+			VALUES (?, ?, ?, ?)`,
+			[`wi-next-${id}`, `wi-${id}`, id, NOW],
+		);
+	}
 }
 
 async function exportZip(): Promise<ArrayBuffer> {
@@ -83,6 +95,7 @@ async function exportZip(): Promise<ArrayBuffer> {
 
 beforeEach(() => {
 	sqlite.run("DELETE FROM team_work_events");
+	sqlite.run("DELETE FROM team_work_item_dependencies");
 	sqlite.run("DELETE FROM team_work_items");
 	sqlite.run("DELETE FROM project_teams");
 	sqlite.run("DELETE FROM narrator_message_refs");
@@ -98,7 +111,12 @@ beforeEach(() => {
 describe("data portability · project teams", () => {
 	test("team 表不在快照里", async () => {
 		const exported = Object.values(SNAPSHOT_TABLES).flat() as string[];
-		for (const table of ["project_teams", "team_work_items", "team_work_events"])
+		for (const table of [
+			"project_teams",
+			"team_work_items",
+			"team_work_item_dependencies",
+			"team_work_events",
+		])
 			expect(exported).not.toContain(table);
 		insertNarrator("n-lead", ["team"]);
 		insertTeam("n-lead", true);
@@ -113,6 +131,7 @@ describe("data portability · project teams", () => {
 		expect(tables).toContain("narrators");
 		expect(tables).not.toContain("project_teams");
 		expect(tables).not.toContain("team_work_items");
+		expect(tables).not.toContain("team_work_item_dependencies");
 	});
 
 	test("导入的新会话没有本机 team 行：去掉 team trait，其它 trait 保留", async () => {
@@ -140,7 +159,8 @@ describe("data portability · project teams", () => {
 		expect(result.sessionsOverwritten).toBe(1);
 		expect(traitsOf("n-local")).toEqual(["standalone", "team"]);
 		expect(count("project_teams")).toBe(1);
-		expect(count("team_work_items")).toBe(1);
+		expect(count("team_work_items")).toBe(2);
+		expect(count("team_work_item_dependencies")).toBe(1);
 		expect(count("team_work_events")).toBe(1);
 	});
 
@@ -158,9 +178,16 @@ describe("data portability · project teams", () => {
 	test("清空会话一起清掉 team 表（含进行中的工作项），没有外键错误", async () => {
 		insertNarrator("n-clear", ["team"]);
 		insertTeam("n-clear", true);
+		expect(count("team_work_item_dependencies")).toBe(1);
 		const result = await clearData("sessions");
 		expect(result.deleted.sessions).toBe(1);
-		for (const table of ["narrators", "project_teams", "team_work_items", "team_work_events"])
+		for (const table of [
+			"narrators",
+			"project_teams",
+			"team_work_items",
+			"team_work_item_dependencies",
+			"team_work_events",
+		])
 			expect(count(table)).toBe(0);
 		// The project itself is not session data.
 		expect(count("projects")).toBe(1);

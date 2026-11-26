@@ -53,9 +53,11 @@ function fakeDb(options: {
 	errors: unknown[];
 	selectRows?: unknown[];
 	attempts: { count: number };
+	transactionConfigs?: unknown[];
 }): BunSQLDatabase {
 	return {
-		transaction: () => {
+		transaction: (_work: unknown, config: unknown) => {
+			options.transactionConfigs?.push(config);
 			options.attempts.count += 1;
 			const error = options.errors[Math.min(options.attempts.count - 1, options.errors.length - 1)];
 			return Promise.reject(error);
@@ -474,6 +476,32 @@ describe("postgres runtime queue: producer-half admission/read surface (P2)", ()
 		);
 		expect(attempts.count).toBe(4);
 		expect(failure).toBe(error);
+	});
+
+	test("every ordinary-message and connection admission retries the whole serializable snapshot", async () => {
+		for (const operation of ["enqueue", "agent", "user"] as const) {
+			const attempts = { count: 0 };
+			const transactionConfigs: unknown[] = [];
+			const error = pgError("40001", "authorization snapshot changed");
+			const store = createPostgresRuntimeQueue(
+				fakeDb({ errors: [error], attempts, transactionConfigs }),
+			);
+			const result = await captureInvoke(() =>
+				operation === "enqueue"
+					? store.mailbox.enqueue(agentInput)
+					: operation === "agent"
+						? store.mailbox.admitAgentMessage(agentInput, receipt)
+						: store.mailbox.admitUserBuffered(
+								{ kind: "user_input", narratorId: "n1", text: "hello", projectedByteSize: 5 },
+								{ position: "back", frontOrder: "fifo" },
+							),
+			);
+			expect(result).toBe(error);
+			expect(attempts.count).toBe(4);
+			expect(transactionConfigs).toEqual(
+				Array.from({ length: 4 }, () => ({ isolationLevel: "serializable" })),
+			);
+		}
 	});
 
 	test("admitUserBuffered shares the enqueue conflict vocabulary (23505 → duplicate)", async () => {

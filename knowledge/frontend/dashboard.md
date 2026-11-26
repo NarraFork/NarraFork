@@ -25,7 +25,7 @@ keywords:
   - getDashboardSummary
   - dashboard 命名空间
 status: draft
-verified_at: 2c639f086aef21d60357f1e002e62767938833e8
+verified_at: 5d8877414a1141e8ce4d70cc3bb970a48645a2cc
 ---
 # 首页
 
@@ -38,8 +38,9 @@ verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 - 侧栏“新会话”用 `lib/dashboard-composer-focus.ts` 请求聚焦：请求先挂起，已挂载的输入框立即取走，之后才挂载的在挂载时取走（`NavTopSection.tsx` 发起、`DashboardComposer` 消费）。
 - 分组在 `dashboard-sessions.ts:buildDashboardSessions`（纯函数）：数据来自三条列表查询（working、waiting 各最多 30 条，最近 50 条，按 `updatedAt` 降序，分别每 15s/15s/60s 轮询）与 `useHumanAttention` 的待办项。有待办的会话归“需要你处理”，其归属是待办的 `rootNarratorId ?? narratorId`（同一会话多项合并计数，只要有一项 `blocking` 就升级为阻塞）；其余无待办的会话按这个顺序判断：`archived` 不显示；状态为 `working`/`waiting` → 正在运行；子状态含 `error` → 需要你处理（`errored`）；有后台任务 → 正在运行；子状态含 `unread` → 需要你处理（`unread`）；否则 → 最近，只留 `RECENT_SESSION_LIMIT = 6` 条。需要你处理内排序：有决定 > 阻塞 > 出错 > 时间。
 - 实时活动：`useDashboardSessions` 先用静态数据算出一遍分组，取其中需要处理（未读放最后）与运行中的会话，最多 `MAX_ACTIVITY_SUBSCRIPTIONS = 40` 个，经 `narratorWSManager.subscribe(ids, {kind: "activity"})` 订阅，再用 `dashboard-activity.ts:applyActivityEvent` 把 `activity_snapshot`、`tool_started/executing/completed`、`tool_use_discarded`、`status_change`、`substatus_change`、`title_updated`、`background_task_count_changed` 折进状态；每个会话只保留最近 `ACTIVITY_TOOL_ROWS = 4` 个顶层工具（带 `parentToolUseId` 的子代理事件被忽略），迟到的 `tool_started` 不会把已结束的行拉回运行中（`isLiveToolStatusRegression`）。实时状态再回灌，决定会话落在哪一组。
+- 会话卡片 `DashboardSessions.tsx:SessionCard`、网格列数 `SESSION_CARD_GRID_COLS`、`MAX_ACTIVITY_SUBSCRIPTIONS` 与 `dashboard-sessions.ts:toSession` 是导出的：项目页「进行中」用同一张卡片和同一个网格展示运行中与等待中的会话（见[项目页](../collaboration/project-pages.md)），改卡片时两处一起变。
 - 工具行 `ActivityToolCallRow.tsx` 用 `@shared/tool-row-status` 的标记规则和图标，自己画一份：`vlist/` 之外不允许静态 import vlist（见[消息列表](narrator-ui/message-list.md)）。
-- 服务端 `GET /api/dashboard/summary`（`server/routes/dashboard.ts`）返回项目数、工作中/等待中叙述者数、运行中终端与容器数、启用的定时任务数、今日花费与 token、待处理权限数与出错叙述者数。项目与叙述者计数都按调用者可读范围过滤（`projectReadableWhere`、`narratorReadableWhere`，只数 primary、未隐藏、未归档），花费与 token 只统计该用户自己的请求；终端、容器、定时任务计数没有按用户过滤。待处理权限数是对至多 50 个 `waiting` 叙述者逐个 `getPendingPermissions` 求和。查询都经 `readQuery` 走读 worker，请求中止会传到 worker 池。前端 `lib/api/misc.ts` 里有 `getDashboardSummary`，但首页组件没有调用它（`frontend/` 内未找到其他调用者）。
+- 服务端 `GET /api/dashboard/summary`（`server/routes/dashboard.ts`）返回项目数、工作中/等待中叙述者数、运行中终端与容器数、启用的定时任务数、今日花费与 token、待处理权限数与出错叙述者数。项目与叙述者计数都按调用者可读范围过滤（`projectReadableWhere`、`narratorReadableWhere`，只数 primary、未隐藏、未归档），花费与 token 只统计该用户自己的请求；终端、容器、定时任务计数没有按用户过滤。待处理权限数是对至多 50 个 `waiting` 叙述者逐个 `getPendingPermissions` 求和。查询都经 `readQuery` 走读 worker（`executionPolicy: "worker-required"`，不回主连接），请求中止会传到 worker 池。前端 `lib/api/misc.ts` 里有 `getDashboardSummary`，但首页组件没有调用它（`frontend/` 内未找到其他调用者）。
 
 ## 从哪读起
 - `frontend/routes/index.tsx`：页面装配。

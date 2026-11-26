@@ -161,7 +161,7 @@ beforeEach(async () => {
 			},
 			save: async () => undefined,
 		},
-		runGit: (workspace, args, abort, writing, scope) => {
+		runGit: (workspace, args, abort, writing, scope, env) => {
 			if (writing) calls.push(`git:${args.join(" ")}`);
 			if (failGit && writing)
 				return Promise.resolve({ stdout: "", stderr: "fatal: nope", exitCode: 1 });
@@ -173,6 +173,8 @@ beforeEach(async () => {
 						: (workspace.workspace.rootPath ?? source);
 			return safeSpawn({
 				cmd: ["git", "--no-optional-locks", "-C", cwd, ...args],
+				// As the production runner: the service's extra environment on top of the host's.
+				...(env ? { env: { ...process.env, ...env } } : {}),
 				timeout: 10_000,
 				maxOutputBytes: WORKTREE_MAX_OUTPUT_BYTES,
 				signal: abort,
@@ -747,6 +749,39 @@ describe("worktree removal hardening", () => {
 			),
 		);
 		expect(result.outcome).toBe("removed");
+	});
+
+	test("a replacement ref claiming a branch reaches the detached commit still needs confirmation", async () => {
+		await git(["checkout", "-q", "--detach"], worktreePath);
+		await writeFile(join(worktreePath, "only-here.txt"), "x\n");
+		await git(["add", "only-here.txt"], worktreePath);
+		await git(
+			["-c", "user.name=F", "-c", "user.email=f@e.test", "commit", "-qm", "detached"],
+			worktreePath,
+		);
+		const head = await git(["rev-parse", "HEAD"], worktreePath);
+		// main's tip replaced by a copy that also lists the detached commit as a parent: git with
+		// replacements would say a branch keeps it.
+		const tip = await git(["rev-parse", "main"]);
+		const body = await git(["cat-file", "commit", tip]);
+		const fake = join(temporary, "replacement-commit");
+		await writeFile(fake, `${body.replace(/^(tree [0-9a-f]+)$/m, `$1\nparent ${head}`)}\n`);
+		await git(["replace", tip, await git(["hash-object", "-t", "commit", "-w", "--", fake])]);
+		expect(await git(["rev-list", "--count", head, "--not", "--branches"])).toBe("0");
+		const plan = await run(() =>
+			service.planRemoval(
+				"actor",
+				"narrator",
+				{ workspaceKey: "workspace", path: worktreePath },
+				signal(),
+			),
+		);
+		expect(plan.worktree).toMatchObject({ detached: true, unreachableCommits: 1 });
+		expect(plan.confirmations).toContain("force");
+		await expect(
+			run(() => service.remove("actor", "narrator", removeRequest(), signal())),
+		).rejects.toMatchObject({ code: "WORKTREE_REMOVAL_FORCE_REQUIRED" });
+		expect(await lstat(worktreePath).then(() => true)).toBe(true);
 	});
 
 	test("commits a branch still holds are not a loss", async () => {

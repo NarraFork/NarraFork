@@ -9,13 +9,15 @@
  * narrator surface the team rides on and the project mutations.
  */
 
+import { PROJECT_TEAM_CARDS_LIMIT } from "@shared/project-overview";
 import type {
 	TeamListResponse,
 	TeamOverlapResponse,
+	TeamWorkMergeResponse,
 	TeamWorkReturnResponse,
 } from "@shared/project-teams";
-import { Hono } from "hono";
-import { ValidationError } from "../lib/errors";
+import { type Context, Hono } from "hono";
+import { ForbiddenError, ValidationError } from "../lib/errors";
 import { narratorPrincipalOf } from "../lib/narrator-access";
 import { projectPrincipalOf, requireProjectAccess } from "../lib/project-access";
 import {
@@ -35,6 +37,7 @@ import {
 	readTeamActivity,
 	readTeamApprovals,
 	readTeamBoardColumn,
+	readTeamCards,
 	readTeamMembersPage,
 	readTeamPageSummary,
 	readTeamRunning,
@@ -53,6 +56,8 @@ import {
 	readWorkFileDiff,
 	readWorkItemDetail,
 	readWorkStats,
+	requestFastForwardAsPerson,
+	requestMergeAsPerson,
 	returnWorkItemAsPerson,
 } from "../services/teams/team-work-view";
 import { requireSqliteProjectMutation } from "./projects";
@@ -91,14 +96,24 @@ projectTeamRoutes.get("/:projectId/teams", async (c) => {
 		status: c.req.query("status") ?? undefined,
 		limit: c.req.query("limit") ?? undefined,
 		cursor: c.req.query("cursor") ?? undefined,
+		counts: c.req.query("counts") ?? undefined,
 	});
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const result: TeamListResponse = await listProjectTeams(
-		projectId,
-		narratorPrincipalOf(c),
-		parsed.data,
+	const { counts, ...options } = parsed.data;
+	const result: TeamListResponse = await listProjectTeams(projectId, narratorPrincipalOf(c), {
+		...options,
+		// Card numbers cost a few indexed reads per team: a page of them is at most 24 teams.
+		limit: counts ? Math.min(options.limit, PROJECT_TEAM_CARDS_LIMIT) : options.limit,
+	});
+	if (!counts) return c.json(result);
+	const cards = await readTeamCards(
+		result.teams.map((team) => ({ id: team.id, member: team.access === "write" })),
+		c.req.raw.signal,
 	);
-	return c.json(result);
+	return c.json({
+		...result,
+		teams: result.teams.map((team) => ({ ...team, card: cards.get(team.id) })),
+	});
 });
 
 /**
@@ -313,6 +328,50 @@ projectTeamRoutes.post("/:projectId/teams/:teamId/work/:itemId/return", async (c
 		parsed.data.reason,
 	);
 	return c.json(result);
+});
+
+/**
+ * Moving the project's base branch needs project write as well as team membership: a coordinator
+ * write grant held by a read-only project member is not enough (403; strangers still get 404).
+ */
+async function requireProjectWriteForMerge(c: Context): Promise<void> {
+	const project = await requireProjectAccess(c, c.req.param("projectId") ?? "", "read");
+	if (!(await hasProjectAccess(project, projectPrincipalOf(c), "write")))
+		throw new ForbiddenError("Merging into the project's base branch needs project write access");
+}
+
+/**
+ * A member merges a ready item into its base (M): the same access as 退回, plus project write (a
+ * read-only project member never moves the base, whatever their coordinator grant). Only cheap checks run
+ * here; the merge itself is a background job (202 with its phase), read back from the drawer.
+ * 409: `TEAM_WORK_ITEM_NOT_READY`, `TEAM_WORK_ITEM_MERGING`, `TEAM_WORK_ITEM_WORKER_RUNNING`,
+ * `TEAM_MERGE_GITHUB_PENDING`, `TEAM_MERGE_BASE_REMOTE`, `TEAM_ARCHIVED`.
+ */
+projectTeamRoutes.post("/:projectId/teams/:teamId/work/:itemId/merge", async (c) => {
+	await requireProjectWriteForMerge(c);
+	const result: TeamWorkMergeResponse = await requestMergeAsPerson(
+		c.req.param("teamId"),
+		narratorPrincipalOf(c),
+		c.req.param("projectId"),
+		c.req.param("itemId"),
+	);
+	return c.json(result, 202);
+});
+
+/**
+ * 「在该目录中快进」: fast-forward a prepared merge in the checkout its base is checked out in,
+ * after the person confirmed. A background job like the merge (202); 409
+ * `TEAM_MERGE_NOT_PREPARED` without a prepared merge.
+ */
+projectTeamRoutes.post("/:projectId/teams/:teamId/work/:itemId/merge/fast-forward", async (c) => {
+	await requireProjectWriteForMerge(c);
+	const result: TeamWorkMergeResponse = await requestFastForwardAsPerson(
+		c.req.param("teamId"),
+		narratorPrincipalOf(c),
+		c.req.param("projectId"),
+		c.req.param("itemId"),
+	);
+	return c.json(result, 202);
 });
 
 /**

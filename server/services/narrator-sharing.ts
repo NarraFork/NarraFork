@@ -21,6 +21,7 @@ import {
 import { and, eq, inArray, isNull } from "drizzle-orm";
 import { db } from "../db";
 import { aclGrants, narrators, users } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
@@ -130,10 +131,13 @@ function narratorUserGrantScope(narratorId: string) {
 
 /** Load the narrator or 404. Callers have already passed the route access gate. */
 async function loadNarrator(narratorId: string): Promise<NarratorRow> {
-	const row = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: NARRATOR_ACL_COLUMNS,
-	});
+	const row = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: NARRATOR_ACL_COLUMNS,
+		}),
+		{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000 },
+	);
 	if (!row) throw new NotFoundError("Narrator", narratorId);
 	return row;
 }
@@ -181,25 +185,31 @@ export async function getNarratorAccess(
 	const row = await loadNarrator(narratorId);
 	const governingId = (await resolveAclRootId(row)) ?? narratorId;
 	const governing = governingId === narratorId ? row : await loadNarrator(governingId);
-	const grants = await db
-		.select({
-			id: aclGrants.id,
-			userId: aclGrants.principalId,
-			access: aclGrants.capability,
-			createdAt: aclGrants.createdAt,
-			username: users.username,
-			avatarColor: users.avatarColor,
-			avatarImageId: users.avatarImageId,
-		})
-		.from(aclGrants)
-		.leftJoin(users, eq(users.id, aclGrants.principalId))
-		.where(narratorUserGrantScope(governingId));
+	const grants = await readQuery(
+		db
+			.select({
+				id: aclGrants.id,
+				userId: aclGrants.principalId,
+				access: aclGrants.capability,
+				createdAt: aclGrants.createdAt,
+				username: users.username,
+				avatarColor: users.avatarColor,
+				avatarImageId: users.avatarImageId,
+			})
+			.from(aclGrants)
+			.leftJoin(users, eq(users.id, aclGrants.principalId))
+			.where(narratorUserGrantScope(governingId)),
+		{ executionPolicy: "worker-required", maxRows: 10_000, timeoutMs: 30_000 },
+	);
 
 	const owner = governing.ownerUserId
-		? ((await db.query.users.findFirst({
-				where: eq(users.id, governing.ownerUserId),
-				columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
-			})) ?? null)
+		? ((await readQuery(
+				db.query.users.findFirst({
+					where: eq(users.id, governing.ownerUserId),
+					columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
+				}),
+				{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000 },
+			)) ?? null)
 		: null;
 
 	return {
@@ -520,10 +530,13 @@ export async function transferNarratorOwner(
 		throw new ValidationError("Only an administrator can leave a narrator without an owner");
 	}
 	if (newOwnerUserId !== null) {
-		const target = await db.query.users.findFirst({
-			where: eq(users.id, newOwnerUserId),
-			columns: { id: true },
-		});
+		const target = await readQuery(
+			db.query.users.findFirst({
+				where: eq(users.id, newOwnerUserId),
+				columns: { id: true },
+			}),
+			{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000 },
+		);
 		if (!target) throw new NotFoundError("User", newOwnerUserId);
 	}
 
@@ -638,11 +651,18 @@ async function announceAccessChange(
 		// theirs too — but their subscriptions are keyed by their own ids and would keep
 		// streaming to someone who just lost access. Bounded and id-only: a sharing
 		// change must not turn into an unbounded scan on a session with many subtasks.
-		const subagents = await db
-			.select({ id: narrators.id })
-			.from(narrators)
-			.where(eq(narrators.aclRootNarratorId, narratorId))
-			.limit(SUBAGENT_SUBSCRIPTION_SWEEP_LIMIT);
+		const subagents = await readQuery(
+			db
+				.select({ id: narrators.id })
+				.from(narrators)
+				.where(eq(narrators.aclRootNarratorId, narratorId))
+				.limit(SUBAGENT_SUBSCRIPTION_SWEEP_LIMIT),
+			{
+				executionPolicy: "worker-required",
+				maxRows: SUBAGENT_SUBSCRIPTION_SWEEP_LIMIT,
+				timeoutMs: 30_000,
+			},
+		);
 		for (const subagent of subagents) {
 			await dropNarratorSubscriptionsForUnauthorizedUsers(subagent.id);
 		}

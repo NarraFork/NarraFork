@@ -19,6 +19,7 @@
  *
  * Leaf module: it must not import settings, which depends on it.
  */
+import { createHash } from "node:crypto";
 import { existsSync, unlinkSync } from "node:fs";
 import { dirname } from "node:path";
 import type { CredentialNetwork } from "@shared/credential-network";
@@ -30,7 +31,7 @@ import {
 	type KeyPart,
 	resetCredentialStoresForTests,
 } from "./credential-store";
-import { generateShortId } from "./id";
+import { generateId } from "./id";
 import { logger } from "./logger";
 import { getNarraforkPath } from "./narrafork-home";
 import {
@@ -81,7 +82,24 @@ export interface ProviderKey {
 	disabledReason?: ProviderKeyDisabledReason;
 	/** Proxy, client fingerprint and headers for this key; absent fields follow the provider. */
 	network?: CredentialNetwork;
+	/** Login identity metadata; manual inference keys have none. */
+	account?: Credential["account"];
 	createdAt: number;
+}
+
+/** Bind portal operations to the login secret, not its mutable position or label. */
+export function tokenDanceLoginAccount(apiKey: string): NonNullable<Credential["account"]> {
+	return {
+		accountId: "tokendance-login",
+		sub: createHash("sha256").update(apiKey).digest("hex"),
+	};
+}
+
+export function isTokenDanceLoginKey(key: ProviderKey): boolean {
+	return (
+		key.account?.accountId === "tokendance-login" &&
+		key.account.sub === tokenDanceLoginAccount(key.apiKey).sub
+	);
 }
 
 function normalize(raw: unknown): ProviderKey | null {
@@ -99,6 +117,7 @@ function normalize(raw: unknown): ProviderKey | null {
 		...(k.disabled ? { disabled: true } : {}),
 		...(k.disabled && k.disabledReason ? { disabledReason: k.disabledReason } : {}),
 		...(k.network && typeof k.network === "object" ? { network: k.network } : {}),
+		...(k.account && typeof k.account === "object" ? { account: k.account } : {}),
 		createdAt: Number.isFinite(k.createdAt) ? Number(k.createdAt) : Date.now(),
 	};
 }
@@ -131,6 +150,7 @@ function keyToCredential(key: ProviderKey, groupId = key.providerId): Credential
 		...(key.disabled ? { disabled: true } : {}),
 		...(key.disabled && key.disabledReason ? { disabledReason: key.disabledReason } : {}),
 		...(key.network ? { network: key.network } : {}),
+		...(key.account ? { account: key.account } : {}),
 		auth: { kind: "api_key", apiKey: key.apiKey },
 	};
 }
@@ -151,6 +171,7 @@ function keysFromPart(part: KeyPart): ProviderKey[] {
 				? { disabledReason: c.disabledReason }
 				: {}),
 			...(c.network ? { network: c.network } : {}),
+			...(c.account ? { account: c.account } : {}),
 			createdAt: c.createdAt,
 		});
 	}
@@ -334,7 +355,7 @@ export class ProviderKeyStore {
 		const apiKey = input.apiKey.trim();
 		if (!apiKey) throw new Error("API key is empty");
 		const existing = this.list(providerId);
-		const id = input.id && !this.taken(input.id) ? input.id : generateShortId();
+		const id = input.id && !this.taken(input.id) ? input.id : this.freshId();
 		const key: ProviderKey = {
 			id,
 			providerId: this.group(providerId),
@@ -358,6 +379,7 @@ export class ProviderKeyStore {
 			disabledReason?: ProviderKeyDisabledReason;
 			/** `null` clears it. */
 			network?: CredentialNetwork | null;
+			account?: Credential["account"] | null;
 		},
 	): ProviderKey {
 		this.assertWritable();
@@ -371,6 +393,7 @@ export class ProviderKeyStore {
 				key.disabled = undefined;
 				key.disabledReason = undefined;
 			}
+			if (apiKey !== key.apiKey) key.account = undefined;
 			key.apiKey = apiKey;
 		}
 		if (fields.label !== undefined) key.label = fields.label.trim() || undefined;
@@ -379,6 +402,7 @@ export class ProviderKeyStore {
 			key.disabledReason = fields.disabled ? (fields.disabledReason ?? "manual") : undefined;
 		}
 		if (fields.network !== undefined) key.network = fields.network ?? undefined;
+		if (fields.account !== undefined) key.account = fields.account ?? undefined;
 		this.commit();
 		return key;
 	}
@@ -435,13 +459,14 @@ export class ProviderKeyStore {
 			if (!first) {
 				const group = this.group(provider.id);
 				this.keys.push({
-					id: this.taken(group) ? generateShortId() : group,
+					id: this.taken(group) ? this.freshId() : group,
 					providerId: group,
 					apiKey,
 					priority: 0,
 					createdAt: Date.now(),
 				});
 			} else if (apiKey) {
+				delete first.account;
 				first.apiKey = apiKey;
 				if (first.disabledReason === "invalid") {
 					first.disabled = undefined;
@@ -499,6 +524,12 @@ export class ProviderKeyStore {
 		return !!this.get(id) || (this.unified && this.credentials.hasId(id));
 	}
 
+	private freshId(): string {
+		let id = generateId();
+		while (this.taken(id)) id = generateId();
+		return id;
+	}
+
 	private assertWritable(): void {
 		if (this.unreadable) {
 			throw new SecretStoreError(
@@ -523,6 +554,11 @@ export class ProviderKeyStore {
 
 let store: ProviderKeyStore | undefined;
 let stopRewrite: (() => void) | undefined;
+
+/** Routing never initializes a store (which would synchronously read credentials). */
+export function peekProviderKeyStore(): ProviderKeyStore | undefined {
+	return store;
+}
 
 export function getProviderKeyStore(): ProviderKeyStore {
 	if (!store) {

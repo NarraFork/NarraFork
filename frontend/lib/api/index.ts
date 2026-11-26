@@ -9,6 +9,7 @@ import { grammarsApi } from "./grammars";
 import { integrationsApi } from "./integrations";
 import { knowledgeApi } from "./knowledge";
 import { miscApi } from "./misc";
+import { narratorCommunicationApi } from "./narrator-communication";
 import { narratorsApi } from "./narrators";
 import { notificationsApi } from "./notifications";
 import { oauthAppsApi } from "./oauth-apps";
@@ -17,6 +18,7 @@ import { outlineApi } from "./outline";
 import { pluginsApi } from "./plugins";
 import { projectsApi } from "./projects";
 import { providerImportApi } from "./provider-import";
+import { quotaSnapshotsApi } from "./quota-snapshots";
 import { scheduledTasksApi } from "./scheduled-tasks";
 import { sessionInterchangeApi } from "./session-interchange";
 import { settingsApi } from "./settings";
@@ -59,6 +61,7 @@ export const api = {
 	...containersApi,
 	...chatApi,
 	...narratorsApi,
+	...narratorCommunicationApi,
 	...notificationsApi,
 	...terminalsApi,
 	...settingsApi,
@@ -84,6 +87,7 @@ export const api = {
 	...storageTransferApi,
 	...providerImportApi,
 	...teamsApi,
+	...quotaSnapshotsApi,
 };
 
 export {

@@ -2145,6 +2145,19 @@ describe("real shared orchestrator profile contract", () => {
 		const ws = await import("../../websocket/narrator-ws");
 		const broadcast = spyOn(ws, "broadcastToNarrator").mockImplementation(() => {});
 		const text = "same principal after-tools input";
+		const { ensureCommunicationNodeTx } = await import("./runtime-communication-fixtures");
+		db.transaction((tx) => {
+			ensureCommunicationNodeTx(tx, "contract-parent", null);
+			ensureCommunicationNodeTx(tx, "contract-child", "contract-parent");
+			tx.update(narrators)
+				.set({ ownerUserId: "principal-a" })
+				.where(eq(narrators.id, "contract-parent"))
+				.run();
+			tx.update(narrators)
+				.set({ aclRootNarratorId: "contract-parent" })
+				.where(eq(narrators.id, "contract-child"))
+				.run();
+		});
 		const h = fixture(profiles[1], [
 			async (options) => {
 				// Direct human input has an explicit queue mode and restarts a pass.

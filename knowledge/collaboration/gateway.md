@@ -25,7 +25,7 @@ keywords:
   - /new
   - /approve
 status: draft
-verified_at: 4d59774711a51a9ac966794090c8b3a04d549048
+verified_at: b32cbeb47a03646544a39986dbca4282162d63e4
 ---
 # IM 网关
 
@@ -48,7 +48,7 @@ verified_at: 4d59774711a51a9ac966794090c8b3a04d549048
   - 出站：团队会话的流式回复、工具/权限消息、错误和最近标签页状态提醒一律不发（`isTeamSession`）；唯一例外是 `notification-service.ts` 的"等待成员"提醒（见[通知与注意力](notifications.md)）。
 - 配置：来自第一个管理员用户的偏好 `user_preferences.gateway_config`，与环境变量合并，环境变量优先（`server/gateway/config.ts`：各平台 `TELEGRAM_BOT_TOKEN`、`DISCORD_BOT_TOKEN`、`SLACK_BOT_TOKEN`+`SLACK_APP_TOKEN`、`FEISHU_APP_ID/SECRET`、`GATEWAY_WEBHOOK_SECRET`、`WEIXIN_TOKEN`、`QQ_APP_ID` 等，以及 `GATEWAY_ENABLED`、`GATEWAY_RATE_LIMIT_PER_MINUTE`、`GATEWAY_SESSION_IDLE_MINUTES`、`GATEWAY_STREAMING`、`GATEWAY_DEFAULT_PERMISSION_MODE`、`GATEWAY_DEFAULT_PROJECT_ID`）；`reload` 可只重载指定平台。
 - 流式回发：`stream-consumer.ts` 监听该叙述者的 `narrator:ws_broadcast` 事件，累积文本增量，周期性编辑同一条 IM 消息，工具边界处收尾并另起一条，带限流自适应退避；只在 `streaming` 不为 false（默认开）且平台适配器支持编辑（`supportsEdit`）时启用。
-- 路由：`/api/gateway` 的 `status`、`reload`、`sessions`（GET 列表、DELETE `:id`）、`weixin/qr-start`、`weixin/qr-poll`；webhook 入口 `POST /api/gateway/webhook` 在 `app.ts` 中公开挂载，靠 HMAC-SHA256 签名校验而非会话令牌（`platforms/webhook.ts`）。路由文件内没有单独的管理员检查：是否需要登录取决于 `app.ts` 的全局挂载（未逐项核实）。
+- 路由：`/api/gateway` 的 `status`、`reload`、`sessions`（GET 列表、DELETE `:id`）、`weixin/qr-start`、`weixin/qr-poll`；webhook 入口 `POST /api/gateway/webhook` 在 `app.ts` 中公开挂载，靠 HMAC-SHA256 签名校验而非会话令牌（`platforms/webhook.ts`）。`GET /sessions` 与 webhook 入口查映射走读 Worker（`worker-required`，带请求 signal；`routes/gateway.ts:handleWebhookRequest`）；webhook 映射指向团队叙述者时返回 409 `TEAM_SESSION_NOT_FROM_IM`。路由文件内没有单独的管理员检查：是否需要登录取决于 `app.ts` 的全局挂载（未逐项核实）。
 
 ## 从哪读起
 - `server/gateway/gateway.ts`：单例 `gateway`，启动/停止/重载、入站、命令、出站。

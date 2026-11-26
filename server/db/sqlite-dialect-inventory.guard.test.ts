@@ -490,9 +490,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"blobFn",
 	],
 	"server/db/schema.ts": ["drizzleDialect", "json1"],
-	// Recall's FTS5/rowid statements moved to `services/search/sqlite-store.ts`; what remains is
-	// the raw-handle access path for its non-search reads.
-	"server/lib/agent/tools/recall.ts": ["handle"],
+	// Recall dispatches through the search/read ports; dialect-specific access stays there.
 	"server/lib/db-worker/recall-conversation-query.ts": ["driver"],
 	"server/lib/db-resilience.ts": ["driver", "sqliteCli", "pragma", "sqliteCatalog", "errorCode"],
 	// Finite diagnostic categories still depend on the engine's error identity, never driver text.
@@ -511,7 +509,12 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/lib/db-worker/select-digest-batch.ts": ["driver"],
 	"server/lib/db-worker/select-extended.ts": ["driver"],
 	"server/services/search/sqlite-worker-runner.ts": ["connectionModule"],
+	// These dual-backend readers dispatch the SQLite branch through the bounded Worker only.
+	"server/services/narrator-communication/reader.ts": ["connectionModule", "json1"],
+	"server/services/search/communication-candidates.ts": ["connectionModule", "rowid", "fts5"],
+	"server/services/agent-runtime/mailbox.ts": ["json1"],
 	"server/lib/db-worker/recall-tool-call-query.ts": ["driver"],
+	"server/lib/db-worker/recall-tool-page.ts": ["driver"],
 	"server/lib/runtime-source.ts": ["json1"],
 	"server/routes/storage.ts": ["vacuum"],
 	// 固定表清单的导入/导出走的是 SQLite 专属路径：快照由 snapshot-builder-worker 子进程生成
@@ -670,7 +673,6 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// The dependent scan reads a narrator's committed directory out of the JSON context column.
 	"server/services/narrator-worktree-retirement.ts": ["json1"],
 	"server/services/notification-center-maintenance.ts": ["sessionFn"],
-	"server/services/notification-center-service.ts": ["sessionFn"],
 	"server/services/oauth-grant-service.ts": ["errorCode"],
 	// The SQLite side of `outline/store/read-port.ts`: FTS5 search, and cached raw statements for
 	// the reads on every page read's path. The PostgreSQL store answers the same port (search
@@ -731,7 +733,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/token-recalculation-sqlite.ts": ["driver"],
 	"server/lib/db-worker/knowledge-entry-query.ts": ["driver"],
 	"server/lib/db-worker/knowledge-entry-reader.ts": ["driver"],
-	"server/lib/db-worker/recall-reader.ts": ["driver"],
+	"server/lib/db-worker/recall-reader.ts": ["driver", "json1"],
 	"server/services/knowledge/sqlite-read-store.ts": ["handle", "json1"],
 	"server/services/search/recall-store.ts": ["handle"],
 	"server/services/token-recalculation-worker.ts": ["connectionModule", "pragma"],
@@ -774,6 +776,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"sessionFn",
 	],
 	"server/services/storage-history-service.ts": ["rowid"],
+	// Exact upload-reference check; the PostgreSQL branch is written out beside it.
+	"server/services/storage/upload-reference-predicate.ts": ["json1"],
 	"shared/storage-retention.ts": ["rowid"],
 	"shared/subagent-tool-summary.ts": ["json1"],
 };

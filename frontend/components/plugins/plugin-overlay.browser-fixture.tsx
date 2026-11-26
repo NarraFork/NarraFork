@@ -5,6 +5,7 @@ import { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import { usePluginOverlayVisibility } from "../../hooks/usePluginOverlayVisibility";
+import { pluginKeys } from "../../hooks/usePlugins";
 import { setToken } from "../../lib/api/client";
 import i18n from "../../lib/i18n";
 import { mantineTheme } from "../../lib/mantine-theme";
@@ -108,12 +109,19 @@ await i18n.use(initReactI18next).init({
 });
 const root = document.getElementById("root");
 if (!root) throw new Error("Missing overlay fixture root");
+const queryClient = new QueryClient({
+	defaultOptions: { queries: { staleTime: 5_000, retry: false } },
+});
+// This fixture supplies a ready contribution snapshot, unlike the cold-start suite.
+// Seed its Query owner too; the real overlay no longer has a separate fetch path.
+queryClient.setQueryData(
+	pluginKeys.uiContributions,
+	records.map(({ availability, ...record }) => ({ ...record, status: availability })),
+);
 createRoot(root).render(
 	<I18nextProvider i18n={i18n}>
 		<MantineProvider theme={mantineTheme} defaultColorScheme="dark">
-			<QueryClientProvider
-				client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
-			>
+			<QueryClientProvider client={queryClient}>
 				<PluginUiRuntimeProvider
 					resolveContribution={resolvePluginUiContribution}
 					defaultTimeoutMs={3_000}

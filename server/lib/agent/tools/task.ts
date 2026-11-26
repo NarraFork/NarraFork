@@ -570,10 +570,34 @@ export const agentTool: ToolDefinition = {
 					};
 				}
 			} else if (teamId) {
-				const { workItemAtWorktree } = await import("@server/services/teams/work-items");
-				const item = workItemAtWorktree(teamId, resolvedWorkdir);
-				if (item && !item.workerNarratorId)
+				const { workItemAtWorktree, worktreePathOf } = await import(
+					"@server/services/teams/work-items"
+				);
+				// However the workdir is spelled (a symlink, another case on Windows or macOS).
+				const item = await workItemAtWorktree(teamId, resolvedWorkdir);
+				if (item && !item.workerNarratorId) {
+					// D: an item with no worker starts only once every dependency merged, whatever its
+					// state; nothing is created when it cannot (409 TEAM_WORK_ITEM_BLOCKED, naming the
+					// blockers). `attachWorker` checks it again when the subagent exists.
+					const { assertDependenciesReachStart, assertWorkItemStartable } = await import(
+						"@server/services/teams/work-item-dependencies"
+					);
+					try {
+						assertWorkItemStartable(item.id);
+						// Merged where this item's work starts (origin/<base> or the local base), not
+						// merely merged somewhere: bounded git, outside any transaction.
+						await assertDependenciesReachStart(item.id);
+					} catch (err) {
+						const code = (err as { code?: unknown }).code;
+						return {
+							output: `Agent error (${typeof code === "string" ? code : "TEAM_REQUEST_FAILED"}): ${err instanceof Error ? err.message : String(err)}`,
+							isError: true,
+						};
+					}
+					// The worker runs in the worktree as recorded, so later path checks match it.
+					resolvedWorkdir = worktreePathOf(item) ?? resolvedWorkdir;
 					workItem = { teamId, id: item.id, branch: item.branchName, created: false };
+				}
 			}
 		}
 		// Imported before the run so the creation hook below stays synchronous.

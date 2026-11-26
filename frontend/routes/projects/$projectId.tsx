@@ -1,26 +1,33 @@
-import { PinToSidebarButton } from "@frontend/components/nav/PinToSidebarButton";
-import { ProjectSessionList } from "@frontend/components/project/ProjectSessionList";
-import { ProjectTeamsList } from "@frontend/components/teams/ProjectTeamsList";
-import {
-	Alert,
-	Button,
-	Group,
-	Loader,
-	SegmentedControl,
-	Skeleton,
-	Stack,
-	Text,
-	Title,
-} from "@mantine/core";
+/**
+ * The project page `/projects/$projectId` (R2): one repository's home — who is doing what, what
+ * waits for me, and where new work starts.
+ *
+ *  - the header (`ProjectHeader`): name, path tail, default branch, 「N 位成员」 (a count; opens
+ *    the settings page at 成员与可见性), pin, 「新团队」, 「新会话」 and the 「…」 menu (项目设置 →
+ *    `/projects/$projectId/settings`);
+ *  - 「等你处理」 (`ProjectAttention`, members only, hidden when empty);
+ *  - 团队 (`ProjectTeamCards`) and 会话 (`ProjectSessions`);
+ *  - with the outline on, the 「…」 menu opens the outline and switches the body to the project's
+ *    task board.
+ *
+ * Optional parts never take the page down: each sits behind its own error boundary.
+ */
+import { ProjectAttention } from "@frontend/components/project/ProjectAttention";
+import { ProjectHeader } from "@frontend/components/project/ProjectHeader";
+import { ProjectSessions } from "@frontend/components/project/ProjectSessions";
+import { ProjectTeamCards } from "@frontend/components/project/ProjectTeamCards";
+import { Alert, Loader, Stack } from "@mantine/core";
+import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
-import { IconListTree } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { Component, lazy, type ReactNode, Suspense, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useOpenOutlineSpace, useOutlineEnabled } from "../../hooks/useOutline";
-import { installProjectAccessListener } from "../../hooks/useProjectAccess";
+import { installProjectAccessListener, useProjectMemberCount } from "../../hooks/useProjectAccess";
+import { useProjectTeamCards } from "../../hooks/useProjectOverview";
 import { useProject } from "../../hooks/useProjects";
+import { teamsUnavailable } from "../../hooks/useTeams";
 import { describeApiError } from "../../lib/api-error";
 import { useOpenOutlinePage } from "../../lib/outline-router";
 
@@ -29,22 +36,22 @@ const CreateNarratorModal = lazy(() =>
 		default: m.CreateNarratorModal,
 	})),
 );
+const CreateTeamModal = lazy(() =>
+	import("../../components/teams/CreateTeamModal").then((m) => ({
+		default: m.CreateTeamModal,
+	})),
+);
 // The project's task board (outline P2 PR 5): the project space and its sessions' spaces.
 const ProjectTaskBoard = lazy(() =>
 	import("../../components/outline/task-board/TaskBoardViews").then((m) => ({
 		default: m.ProjectTaskBoard,
 	})),
 );
-const ProjectSettingsPanel = lazy(() =>
-	import("../../components/project/ProjectSettingsPanel").then((m) => ({
-		default: m.ProjectSettingsPanel,
-	})),
-);
 
 export const Route = createFileRoute("/projects/$projectId")({ component: ProjectPage });
 
-// Optional project tools must never take down the directory and session list.
-class ProjectToolsBoundary extends Component<
+// Optional project parts must never take down the header and the session list.
+class ProjectPartBoundary extends Component<
 	{ children: ReactNode; fallback: ReactNode },
 	{ failed: boolean }
 > {
@@ -60,17 +67,20 @@ class ProjectToolsBoundary extends Component<
 function ProjectPage() {
 	const { projectId } = Route.useParams();
 	const { t } = useTranslation("projects");
+	const { t: tOutline } = useTranslation("outline");
 	const navigate = useNavigate();
 	const queryClient = useQueryClient();
 	const project = useProject(projectId);
 	useEffect(installProjectAccessListener, []);
+	const phone = useMediaQuery("(max-width: 48em)") ?? false;
 	const canWrite = !project.isError && project.data?.canWrite === true;
-	const [creating, setCreating] = useState(false);
-	const [settingsOpen, setSettingsOpen] = useState(false);
+	// The team cards' own read (same query): it also tells whether teams exist here (503 on PG).
+	const teamProbe = useProjectTeamCards(projectId, !project.isError);
+	const teamsAvailable = !(teamProbe.isError && teamsUnavailable(teamProbe.error));
+	const memberCount = useProjectMemberCount(projectId, !project.isError);
+	const [creating, setCreating] = useState<"session" | "team" | null>(null);
 	const outline = useOutlineEnabled();
-	const { t: tOutline } = useTranslation("outline");
-	const [view, setView] = useState<"sessions" | "tasks">("sessions");
-	const showTasks = outline.enabled && view === "tasks";
+	const [showTasks, setShowTasks] = useState(false);
 	const openOutlinePage = useOpenOutlinePage();
 	const openOutline = useOpenOutlineSpace({
 		onMissing: () => notifications.show({ color: "gray", message: t("outlineNotCreated") }),
@@ -79,58 +89,50 @@ function ProjectPage() {
 	});
 	if (project.isError || (!project.isLoading && !project.data))
 		return <Alert color="red">{t("compatibility.unavailable")}</Alert>;
+	const data = project.data;
+	const tasks = outline.enabled && showTasks;
+	const openTeam = (teamId: string) =>
+		void navigate({ to: "/projects/$projectId/teams/$teamId", params: { projectId, teamId } });
 	return (
-		<Stack>
-			<Group justify="space-between">
-				{project.data ? (
-					<Group gap="xs" wrap="nowrap" style={{ minWidth: 0 }}>
-						<Title order={3}>{project.data.name}</Title>
-						<PinToSidebarButton type="project" id={projectId} title={project.data.name} />
-					</Group>
-				) : (
-					<Skeleton height={28} width={220} />
-				)}
-				<Group gap="xs">
-					{outline.enabled && (
-						<Button
-							variant="light"
-							leftSection={<IconListTree size={16} />}
-							loading={openOutline.pending}
-							onClick={() => openOutline.open("project", projectId)}
-						>
-							{t("openOutline")}
-						</Button>
-					)}
-					<Button disabled={!canWrite} onClick={() => setCreating(true)}>
-						{t("newSession")}
-					</Button>
-				</Group>
-			</Group>
-			{project.data ? (
-				<>
-					<Text size="sm" c="dimmed">
-						{project.data.gitPath}
-					</Text>
-					{project.data.description && <Text>{project.data.description}</Text>}
-				</>
-			) : (
-				<Skeleton height={18} width="70%" />
-			)}
-			{outline.enabled && (
-				<SegmentedControl
-					size="xs"
-					style={{ alignSelf: "flex-start" }}
-					value={view}
-					onChange={(value) => setView(value as "sessions" | "tasks")}
-					data={[
-						{ value: "sessions", label: t("compatibility.sessions") },
-						{ value: "tasks", label: tOutline("board.projectTitle") },
-					]}
-					data-testid="project-view-switch"
-				/>
-			)}
-			{showTasks && (
-				<ProjectToolsBoundary fallback={<Alert color="red">{tOutline("board.loadFailed")}</Alert>}>
+		<Stack gap={phone ? "lg" : 28} pb="xl" data-testid="project-page">
+			<ProjectHeader
+				projectId={projectId}
+				name={data ? String(data.name ?? "") : null}
+				gitPath={data?.gitPath ? String(data.gitPath) : null}
+				defaultBranch={data?.defaultBranch ? String(data.defaultBranch) : null}
+				description={data?.description ? String(data.description) : null}
+				phone={phone}
+				canWrite={canWrite}
+				teamsAvailable={teamsAvailable}
+				onNewSession={() => setCreating("session")}
+				onNewTeam={() => setCreating("team")}
+				onOpenSettings={() =>
+					void navigate({ to: "/projects/$projectId/settings", params: { projectId } })
+				}
+				memberCount={memberCount.data ?? null}
+				onOpenMembers={() =>
+					void navigate({
+						to: "/projects/$projectId/settings",
+						params: { projectId },
+						hash: "settings-members",
+					})
+				}
+				outline={
+					outline.enabled
+						? {
+								pending: openOutline.pending,
+								showingTasks: showTasks,
+								onOpen: () => openOutline.open("project", projectId),
+								onToggleTasks: () => setShowTasks((value) => !value),
+							}
+						: undefined
+				}
+			/>
+			<ProjectPartBoundary fallback={null}>
+				<ProjectAttention projectId={projectId} enabled={canWrite} phone={phone} />
+			</ProjectPartBoundary>
+			{tasks ? (
+				<ProjectPartBoundary fallback={<Alert color="red">{tOutline("board.loadFailed")}</Alert>}>
 					<Suspense fallback={<Loader size="sm" />}>
 						<ProjectTaskBoard
 							projectId={projectId}
@@ -147,44 +149,32 @@ function ProjectPage() {
 							}
 						/>
 					</Suspense>
-				</ProjectToolsBoundary>
-			)}
-			{!showTasks && (
-				<ProjectToolsBoundary fallback={<Alert color="red">{t("teams.loadFailed")}</Alert>}>
-					<ProjectTeamsList
-						projectId={projectId}
-						canCreate={canWrite}
-						onOpenTeam={(teamId) =>
-							void navigate({
-								to: "/projects/$projectId/teams/$teamId",
-								params: { projectId, teamId },
-							})
-						}
-					/>
-				</ProjectToolsBoundary>
-			)}
-			{!showTasks && <Title order={4}>{t("compatibility.sessions")}</Title>}
-			{!showTasks && <ProjectSessionList projectId={projectId} enabled={!project.isError} />}
-			<details onToggle={(event) => setSettingsOpen(event.currentTarget.open)}>
-				<summary>{t("advancedSettings")}</summary>
-				{settingsOpen && (
-					<ProjectToolsBoundary
-						fallback={<Alert color="red">{t("compatibility.unavailable")}</Alert>}
+				</ProjectPartBoundary>
+			) : (
+				<>
+					<ProjectPartBoundary fallback={<Alert color="red">{t("teams.loadFailed")}</Alert>}>
+						<ProjectTeamCards
+							projectId={projectId}
+							canCreate={canWrite}
+							onOpenTeam={openTeam}
+							onCreate={() => setCreating("team")}
+						/>
+					</ProjectPartBoundary>
+					<ProjectPartBoundary
+						fallback={<Alert color="red">{t("compatibility.sessionsUnavailable")}</Alert>}
 					>
-						<Suspense fallback={<Loader size="sm" />}>
-							<ProjectSettingsPanel projectId={projectId} />
-						</Suspense>
-					</ProjectToolsBoundary>
-				)}
-			</details>
-			{creating && canWrite && project.data && (
-				<ProjectToolsBoundary fallback={<Alert color="red">{t("createFailed")}</Alert>}>
+						<ProjectSessions projectId={projectId} phone={phone} />
+					</ProjectPartBoundary>
+				</>
+			)}
+			{creating === "session" && canWrite && data && (
+				<ProjectPartBoundary fallback={<Alert color="red">{t("createFailed")}</Alert>}>
 					<Suspense fallback={<Loader size="sm" />}>
 						<CreateNarratorModal
 							opened
-							onClose={() => setCreating(false)}
+							onClose={() => setCreating(null)}
 							contextProjectId={projectId}
-							initialCwd={project.data.gitPath}
+							initialCwd={String(data.gitPath ?? "")}
 							onCreated={(session) => {
 								void queryClient.invalidateQueries({
 									queryKey: ["narrators", "project", projectId],
@@ -193,7 +183,22 @@ function ProjectPage() {
 							}}
 						/>
 					</Suspense>
-				</ProjectToolsBoundary>
+				</ProjectPartBoundary>
+			)}
+			{creating === "team" && canWrite && (
+				<ProjectPartBoundary fallback={<Alert color="red">{t("createFailed")}</Alert>}>
+					<Suspense fallback={<Loader size="sm" />}>
+						<CreateTeamModal
+							projectId={projectId}
+							opened
+							onClose={() => setCreating(null)}
+							onCreated={(team) => {
+								setCreating(null);
+								openTeam(team.id);
+							}}
+						/>
+					</Suspense>
+				</ProjectPartBoundary>
 			)}
 		</Stack>
 	);

@@ -52,7 +52,7 @@ keywords:
   - startAutomaticPlanReflectionForNarrator
   - planReflectionAutoApproveOverride
 status: draft
-verified_at: 878917e97
+verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 ---
 # 反思门
 
@@ -63,7 +63,7 @@ verified_at: 878917e97
 - 暂停期间 Agent 只能调用 `DangerConfirm` 或 `DangerCancel`（`reflectionOnly` 工具，`lib/agent/tools/danger-reflection.ts`）；确认令牌 TTL 5 分钟（`narrator-permission.ts:DANGER_CONFIRMATION_TTL_MS`）。没有活跃暂停时调用这两个工具只返回错误提示。
 - 取值：`lib/boolean-override.ts` 的 `DANGER_REFLECTION_LEVEL_VALUES`（off/light/standard/strict）与叙述者覆盖值（inherit/on/及各等级）。
 - 危险说明文字：服务端写英文，前端用 `shared/danger-copy.ts` 查表、`frontend/lib/localize-danger-copy.ts` 按 i18n 键显示，未知文本原样显示。
-- 任务反思（`lib/agent/tools/task-reflection.ts`）：受保护的任务改动同样挂起一个反思门，只有 `TaskReflectConfirm`（证据至少 20 字符）与 `TaskReflectRevise` 两个 `reflectionOnly` 工具可用。用户接管后走同一个 approve/deny：allow 即确认、deny 即退回修改（`narrator-permission.ts:resolvePermissionOrDangerReflection` 末段）。状态有 running / awaiting_user / confirmed / cancelled / failed / aborted。
+- 任务反思（`lib/agent/tools/task-reflection.ts`）：受保护的任务改动同样挂起一个反思门，只有 `TaskReflectConfirm`（证据至少 20 字符）与 `TaskReflectRevise` 两个 `reflectionOnly` 工具可用。用户接管后走同一个 approve/deny：allow 即确认、deny 即退回修改（`narrator-permission.ts:resolvePermissionOrDangerReflection` 末段）。状态有 running / awaiting_user / confirmed / cancelled / failed / aborted。任务反思与计划反思把状态写回工具调用行前，若 pending 上没有行 id，就在读 Worker 上按 (narratorId, toolUseId) 查（`task-reflection.ts:resolveTaskReflectionToolCallId`、`exit-plan-reflection.ts:resolveExitPlanReflectionToolCallId`，`worker-required`、30s 超时）；查不到或读失败时不写库，只靠 WebSocket 帧更新在线客户端。
 - 问题反思：`AskUserQuestion` 始终要问人，但在 `bypassPermissions` 且 `agent.questionReflectionEnabled`（可被叙述者的 `questionReflectionOverride` 覆盖，默认关）时，倒计时到期后由模型自动作答。倒计时取 `agent.questionReflectionTimeoutMs`，默认 300000，下限 10000（`getQuestionReflectionTimeoutMs`、`shouldScheduleQuestionReflection`）。用户也可经 `reflect-question` 路由手动触发；用户接管后自动作答会放弃（`reflectPendingAskUserQuestion`）。
 - 按需计划反思（计划已挂起等人时再触发）：循环里的计划反思门在 `executeTool` 请求权限之前运行；门没触发（开关关或模式不是 `acceptEdits`/`bypassPermissions`）的 `ExitPlanMode` 会挂在审批卡上，此时循环悬在权限处理器里，只有这一栈帧持有 `AgentConfig` 与历史。所以 `loop.ts:executeToolAfterReflections` 在等待期间用 `registerPendingPlanReflectionRunner(narratorId, toolUseId, runner)` 登记一个运行器（`lib/agent/pending-plan-reflection.ts`，内存表，`hotSafe` 挂在 globalThis；注册返回的注销函数只删自己那一条），`handlePermission` 把它挂到待批请求的 `planReflection` 上。反思嵌套循环里（`config.reflectionLoop`）不登记。
   - 谁能触发：

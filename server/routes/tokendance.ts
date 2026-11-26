@@ -9,10 +9,8 @@ import {
 	completeTokenDanceOAuth,
 	createTokenDancePaymentSession,
 	deleteTokenDanceConnection,
-	getTokenDanceBalance,
 	getTokenDanceConnection,
 	getTokenDancePaymentSession,
-	refreshTokenDanceBalance,
 	refreshTokenDanceModels,
 	restoreTokenDanceDraft,
 	setTokenDanceDisabled,
@@ -43,10 +41,7 @@ tokendanceRoutes.onError((error, c) => {
 // Explicit session gate remains necessary when this router is mounted independently.
 // External OAuth admin principals must never reach credential management.
 tokendanceRoutes.use("*", requireSessionAuth);
-// Register the ordinary-user summary before the administrator gate.
-tokendanceRoutes.get("/balance", (c) => c.json(getTokenDanceBalance()));
 tokendanceRoutes.use("*", requireAdmin);
-tokendanceRoutes.post("/balance/refresh", async (c) => c.json(await refreshTokenDanceBalance()));
 tokendanceRoutes.post("/payment/sessions", async (c) => {
 	const input = await body(
 		c.req.raw,
@@ -73,7 +68,16 @@ const completeSchema = flowSchema.extend({
 		.regex(/^[!-~]+$/),
 });
 const startSchema = z
-	.object({ callbackUrl: z.string().min(1).max(2048), draftSnapshot: z.unknown().optional() })
+	.object({
+		callbackUrl: z.string().min(1).max(2048),
+		draftSnapshot: z.unknown().optional(),
+		loginChoice: z
+			.discriminatedUnion("mode", [
+				z.object({ mode: z.literal("add") }).strict(),
+				z.object({ mode: z.literal("replace"), credentialId: z.string().min(1).max(300) }).strict(),
+			])
+			.optional(),
+	})
 	.strict();
 async function body<T>(request: Request, schema: z.ZodType<T>): Promise<T> {
 	// Bound before parsing; drafts contain potentially sensitive unsaved credentials.
@@ -114,7 +118,9 @@ tokendanceRoutes.post("/oauth/start", async (c) => {
 		c.req.header("Origin"),
 		c.req.header("Sec-Fetch-Site"),
 	);
-	return c.json(startTokenDanceOAuth(c.get("user").sub, callback, input.draftSnapshot));
+	return c.json(
+		startTokenDanceOAuth(c.get("user").sub, callback, input.draftSnapshot, input.loginChoice),
+	);
 });
 tokendanceRoutes.post("/oauth/complete", async (c) => {
 	const input = await body(c.req.raw, completeSchema);

@@ -37,14 +37,19 @@ const { act } = await import("react");
 const { QueryClient, QueryClientProvider } = await import("@tanstack/react-query");
 const { createRoot } = await import("react-dom/client");
 const { api } = await import("../lib/api");
-const { clearToken, getToken, setToken } = await import("../lib/api/client");
+const { clearToken, confirmAuthUser, getAuthSnapshot, getToken, setToken } = await import(
+	"../lib/api/client"
+);
 const { appearanceStore } = await import("../lib/appearance-preference-store");
 const { applySession } = await import("./useAuth");
 const { useAppearanceSync } = await import("./useAppearanceSync");
 const { useLocalPref } = await import("./useLocalPref");
-const { useUpdateUserPreferences, useUserPreferences, useUserPreferencesDetail } = await import(
-	"./useUserPreferences"
-);
+const {
+	useUpdateUserPreferences,
+	useUserPreferences,
+	useUserPreferencesDetail,
+	userPreferencesQueryKey,
+} = await import("./useUserPreferences");
 
 type Preferences = Awaited<ReturnType<typeof api.getUIPreferences>>;
 type Patch = Parameters<typeof api.updateUserPreferences>[0];
@@ -93,6 +98,11 @@ function requireToken(): string {
 	const token = getToken();
 	if (!token) throw new Error("Missing test session token");
 	return token;
+}
+
+function confirmedUser(id: string) {
+	confirmAuthUser(getAuthSnapshot().generation, id);
+	return { id };
 }
 
 function Probe() {
@@ -177,9 +187,9 @@ beforeEach(() => {
 	container = document.createElement("div");
 	document.body.appendChild(container);
 	setToken("token-a");
-	spyOn(api, "me").mockImplementation(async () => ({
-		id: getToken() === "token-b" ? "b" : "a",
-	}));
+	spyOn(api, "me").mockImplementation(async () =>
+		confirmedUser(getToken() === "token-b" ? "b" : "a"),
+	);
 	spyOn(api, "getUIPreferences").mockImplementation(() => getPreferences(requireToken()));
 	spyOn(api, "updateUIPreferences").mockImplementation(async (patch, options) => {
 		const write = { token: getToken(), patch: structuredClone(patch), signal: options?.signal };
@@ -218,6 +228,21 @@ afterAll(() => {
 	}
 });
 
+test("applySession confirms its login result even with no me or preferences mounted", async () => {
+	const initial = getAuthSnapshot();
+	await login("a");
+	expect(getAuthSnapshot()).toEqual({ ...initial, hasToken: true, userId: "a" });
+	await login("b");
+	const b = getAuthSnapshot();
+	expect(b.generation).toBeGreaterThan(initial.generation);
+	expect(b.userId).toBe("b");
+	await login("a");
+	const a = getAuthSnapshot();
+	expect(a.generation).toBeGreaterThan(b.generation);
+	expect(a.userId).toBe("a");
+	expect(client.getQueryData(["auth", "me"])).toEqual({ id: "a" });
+});
+
 test("lightweight and full-detail observers share UI reads but never cache partial detail", async () => {
 	const full = {
 		...preferences(),
@@ -238,9 +263,14 @@ test("lightweight and full-detail observers share UI reads but never cache parti
 	});
 	await settle();
 	expect(getDetail).toHaveBeenCalledTimes(1);
-	expect(view.preferences.queryKey).toEqual(["user-preferences", "ui", "a", "token-a"]);
+	expect(view.preferences.queryKey).toEqual([
+		"user-preferences",
+		"ui",
+		"a",
+		getAuthSnapshot().generation,
+	]);
 	expect(detailView.data?.commands).toEqual(full.commands);
-	expect(client.getQueryData(["user-preferences", "detail", "a", "token-a"])).toEqual(full);
+	expect(client.getQueryData(userPreferencesQueryKey("detail"))).toEqual(full);
 	expect(client.getQueryData(view.preferences.queryKey)).not.toHaveProperty("commands");
 	await act(async () => {
 		await view.update.mutateAsync({ fastModeDefault: true });
@@ -397,6 +427,8 @@ test("an explicit local hook edit before user identity resolves survives restori
 	root = undefined;
 	client.clear();
 	appearanceStore.activate(null);
+	clearToken();
+	setToken("token-a");
 	const user = deferred<Awaited<ReturnType<typeof api.me>>>();
 	spyOn(api, "me").mockImplementation(() => user.promise);
 	const response = deferred<Preferences>();
@@ -406,7 +438,7 @@ test("an explicit local hook edit before user identity resolves survives restori
 	await change(() => view.oled[1](true));
 	expect(view.oled[0]).toBe(true);
 	expect(writes).toEqual([]);
-	await act(async () => user.resolve({ id: "a" }));
+	await act(async () => user.resolve(confirmedUser("a")));
 	await settle();
 	expect(appearanceStore.getUserId()).toBe("a");
 	expect(view.oled[0]).toBe(true);
@@ -426,10 +458,12 @@ test.each([
 		root = undefined;
 		client.clear();
 		appearanceStore.activate(null);
+		clearToken();
+		setToken("token-a");
 	}
 	const oldUser = deferred<Awaited<ReturnType<typeof api.me>>>();
 	spyOn(api, "me").mockImplementation(async () =>
-		getToken() === "token-a" ? oldUser.promise : { id: "b" },
+		getToken() === "token-a" ? oldUser.promise : confirmedUser("b"),
 	);
 	await mount();
 	expect(appearanceStore.getUserId()).toBe(null);
@@ -645,7 +679,7 @@ test("a token replacement during initial identity loading still starts the new a
 	const oldMe = deferred<Awaited<ReturnType<typeof api.me>>>();
 	const oldPreferences = deferred<Preferences>();
 	spyOn(api, "me").mockImplementation(async () =>
-		getToken() === "token-a" ? oldMe.promise : { id: "b" },
+		getToken() === "token-a" ? oldMe.promise : confirmedUser("b"),
 	);
 	getPreferences = async (token) =>
 		token === "token-a" ? oldPreferences.promise : structuredClone(account(token));

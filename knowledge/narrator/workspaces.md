@@ -31,7 +31,7 @@ keywords:
   - /narrators/workspace/$workspaceId
   - /windows/workspaces/$workspaceId
 status: draft
-verified_at: 2c639f086aef21d60357f1e002e62767938833e8
+verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 ---
 # 工作区布局
 
@@ -44,7 +44,8 @@ verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 - 上限：每个工作区最多 64 个成员（`WORKSPACE_PANEL_MAX`），面板配置 16KiB，布局 `tree` 2MiB；路由用 `bodyLimit` 在解析前拦截，超限 413（`routes/workspaces.ts`、`lib/validators/workspaces.ts`）。列表接口最多 200 条，且不返回 `tree`，只返回 `treeBytes`，完整布局只在 `GET /:id` 读取。
 - 布局保存是乐观并发：`PUT /:id/layout` 带 `expectedRevision`，用 `UPDATE ... WHERE layout_revision = ?` 守卫，失败抛 409 `WORKSPACE_LAYOUT_CONFLICT` 并带当前版本号；丢失一次布局写入只丢面板位置，不丢成员（`workspace-panel-service.ts:saveWorkspaceLayout`）。
 - 布局保存成功后向该用户广播 workspace 变更（`broadcastWorkspaceChanged`）；成员新增、移除、配置更新（`addWorkspacePanel`、`removeWorkspacePanel`、`updateWorkspacePanelConfig`）都会调用 `workspaceTitleInputsChanged(…, "membership")`。三处成员变更都经 `workspaceTitleInputsChanged`：它把 `titleRevision` 加 1、向该用户广播 `workspace_changed`（`reason: "membership"`；广播抛错只记 warn）并重新排期自动命名（`workspace-title.ts`）。删除工作区时路由直接广播 `reason: "deleted"`（`routes/workspaces.ts`）。叙述者面板没有 config，更新它报 `WORKSPACE_PANEL_NOT_CONFIGURABLE`。
-- 所有操作先校验工作区归属当前用户（`requireOwnedWorkspace`）。
+- 所有操作先校验工作区归属当前用户（`requireOwnedWorkspace`）；删除工作区把归属条件写进删除语句本身（`DELETE … WHERE id = ? AND user_id = ?`，没删到行报 404），不先读布局（`routes/workspaces.ts` 的 `DELETE /:id`）。
+- 读取走读 Worker（`worker-required`，不回退主线程）：列表、`GET /:id`（2MiB 布局在 Worker 上序列化）、归属检查和成员行查询（`routes/workspaces.ts`、`workspace-panel-service.ts:requireOwnedWorkspace`）。
 - 标题：`titleSource` 为 `default | auto | manual`；成员变化触发防抖（750ms）后调用摘要模型自动命名，最多取 32 个面板、输入 8KiB、超时 30s；URL 只保留主机名；手动命名不会被自动覆盖（`workspace-title.ts`）。
 - 成员与布局分离的后果：布局里出现的非成员条目、或布局没放置的成员，由客户端在读取时对账（见 [面板与布局](../frontend/panels.md)）；服务端只保证成员行与布局版本各自一致。
 - 变更事件是失效信号不是载荷：`workspace_changed` 只带 `workspaceId`、`reason`（layout / membership / title / deleted）和可选 `layoutRevision`，客户端收到后重新 GET，避免把可达数 MB 的布局推给每个连接（`shared/workspace-events.ts`）。

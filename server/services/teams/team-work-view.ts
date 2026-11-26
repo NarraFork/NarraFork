@@ -16,6 +16,7 @@
 import {
 	TEAM_EVENT_DETAIL_PREVIEW_CHARS,
 	TEAM_RETURNABLE_STATES,
+	TEAM_REVIEW_SUMMARIES_TOTAL_CHARS,
 	TEAM_WORK_DIFF_MAX_BYTES,
 	TEAM_WORK_EVENTS_LIMIT,
 	TEAM_WORK_FILES_LIMIT,
@@ -28,6 +29,7 @@ import {
 	type TeamWorkFileChange,
 	type TeamWorkFileDiff,
 	type TeamWorkItemDetail,
+	type TeamWorkMergeResponse,
 	type TeamWorkReturnResponse,
 	type TeamWorkReviewRound,
 	type TeamWorkStatsResponse,
@@ -39,9 +41,18 @@ import { GitError, NotFoundError, ValidationError } from "../../lib/errors";
 import { getUserLanguage } from "../../lib/i18n";
 import { logger } from "../../lib/logger";
 import type { NarratorPrincipal } from "../narrator-acl";
-import { eventDetail, readBoardItem, returnedReasonColumns } from "./team-board";
+import {
+	eventDetail,
+	readBoardItem,
+	readReviewDetailText,
+	returnedReasonColumns,
+	reviewHeadColumns,
+} from "./team-board";
 import { teamGit } from "./team-git";
+import { canMergeInProject, mergeViewOf, requestFastForward, requestMerge } from "./team-merge";
 import { loadTeamForAccess } from "./team-service";
+import { compareRefFor } from "./team-work-start";
+import { readDependents } from "./work-item-dependencies";
 import { diffStatOf, returnWorkItem, worktreePathOf } from "./work-items";
 
 type WorkItemRow = typeof teamWorkItems.$inferSelect;
@@ -87,7 +98,10 @@ async function diffTarget(
 	if (worktree) {
 		const git = teamGit(worktree);
 		const head = await git.resolveCommit("HEAD");
-		const base = await git.resolveCommit(item.baseRef ?? baseBranch);
+		// W: an item started from origin/<base> is compared with it (only its own commits count).
+		const base = await git.resolveCommit(
+			await compareRefFor(item.id, item.baseRef ?? baseBranch, (ref) => git.resolveCommit(ref)),
+		);
 		if (head && base) {
 			const fork = await git.mergeBase(head, base);
 			if (fork) return { cwd: worktree, from: fork, to: head };
@@ -254,8 +268,26 @@ function requireItem(teamId: string, itemId: string): WorkItemRow {
 const num = (value: unknown): number | null =>
 	typeof value === "number" && Number.isFinite(value) ? value : null;
 
-/** The item's newest events (index `(work_item_id, created_at, id)`), returned oldest first. */
-function itemEvents(itemId: string): { events: TeamActivityEvent[]; more: boolean } {
+/**
+ * Characters of long review details one drawer read reads past the page: about what
+ * {@link TEAM_REVIEW_SUMMARIES_TOTAL_CHARS} of findings take when every character JSON-escapes
+ * to six. Past it (or once that many findings are collected) older long reviews keep only their
+ * round, verdict and count.
+ */
+export const TEAM_REVIEW_DETAILS_READ_CHARS = TEAM_REVIEW_SUMMARIES_TOTAL_CHARS * 6;
+
+/**
+ * The item's newest events (index `(work_item_id, created_at, id)`), returned oldest first.
+ * A review whose detail is past the preview (long findings) comes with its head only; its
+ * findings are then read by primary key, newest first, until the drawer has
+ * {@link TEAM_REVIEW_SUMMARIES_TOTAL_CHARS} of findings or {@link TEAM_REVIEW_DETAILS_READ_CHARS}
+ * were read. `unreadSummaries` names the reviews whose findings were left unread.
+ */
+function itemEvents(itemId: string): {
+	events: TeamActivityEvent[];
+	more: boolean;
+	unreadSummaries: ReadonlySet<string>;
+} {
 	const rows = db
 		.select({
 			id: teamWorkEvents.id,
@@ -267,6 +299,7 @@ function itemEvents(itemId: string): { events: TeamActivityEvent[]; more: boolea
 				string | null
 			>`case when length(${teamWorkEvents.detailJson}) <= ${TEAM_EVENT_DETAIL_PREVIEW_CHARS} then ${teamWorkEvents.detailJson} end`,
 			...returnedReasonColumns,
+			...reviewHeadColumns,
 			createdAt: teamWorkEvents.createdAt,
 		})
 		.from(teamWorkEvents)
@@ -297,20 +330,53 @@ function itemEvents(itemId: string): { events: TeamActivityEvent[]; more: boolea
 			.where(inArray(narrators.id, [...agents]))
 			.all())
 			if (agent.title) names.set(`agent:${agent.id}`, agent.title);
-	return {
-		events: page.map((row) => ({
-			id: row.id,
-			kind: row.kind,
-			workItemId: itemId,
-			workItemTitle: null,
-			actorKind: row.actorKind as TeamEventActorKind,
-			actorId: row.actorId,
-			actorName: row.actorId ? (names.get(`${row.actorKind}:${row.actorId}`) ?? null) : null,
-			...eventDetail(row),
-			createdAt: row.createdAt,
-		})),
-		more: rows.length > TEAM_WORK_EVENTS_LIMIT,
-	};
+	const events: TeamActivityEvent[] = page.map((row) => ({
+		id: row.id,
+		kind: row.kind,
+		workItemId: itemId,
+		workItemTitle: null,
+		actorKind: row.actorKind as TeamEventActorKind,
+		actorId: row.actorId,
+		actorName: row.actorId ? (names.get(`${row.actorKind}:${row.actorId}`) ?? null) : null,
+		...eventDetail(row),
+		createdAt: row.createdAt,
+	}));
+	// Newest first, as the drawer spends its findings budget (`capReviewSummaries`).
+	const unreadSummaries = new Set<string>();
+	let collected = 0;
+	let read = 0;
+	for (let index = page.length - 1; index >= 0; index--) {
+		const row = page[index];
+		const event = events[index];
+		if (!row || !event || event.kind !== "work.review") continue;
+		if (row.reviewHead === null) {
+			const summary = event.detail?.summary;
+			if (typeof summary === "string") collected += summary.length;
+			continue;
+		}
+		if (collected >= TEAM_REVIEW_SUMMARIES_TOTAL_CHARS || read >= TEAM_REVIEW_DETAILS_READ_CHARS) {
+			unreadSummaries.add(event.id);
+			continue;
+		}
+		const text = readReviewDetailText(row.id);
+		read += text?.length ?? 0;
+		const full = eventDetail({ ...row, reviewDetail: text });
+		events[index] = { ...event, ...full };
+		const summary = full.detail?.summary;
+		if (typeof summary === "string") collected += summary.length;
+	}
+	return { events, more: rows.length > TEAM_WORK_EVENTS_LIMIT, unreadSummaries };
+}
+
+/** Rounds whose findings the read left unread lost them to the drawer's total cap. */
+function markUnreadSummaries(
+	rounds: TeamWorkReviewRound[],
+	unread: ReadonlySet<string>,
+): TeamWorkReviewRound[] {
+	if (unread.size === 0) return rounds;
+	return rounds.map((round) =>
+		unread.has(round.eventId) ? { ...round, summary: null, summaryClipped: true } : round,
+	);
 }
 
 /** The review rounds among an item's events: agents' reviews and people's returns. */
@@ -330,10 +396,45 @@ export function reviewRounds(events: readonly TeamActivityEvent[]): TeamWorkRevi
 			actorId: event.actorId,
 			actorName: event.actorName,
 			reason: event.kind === TEAM_WORK_RETURNED_EVENT_KIND ? reason : null,
+			summary:
+				event.kind === "work.review" && typeof detail.summary === "string" && detail.summary
+					? detail.summary
+					: null,
 			at: event.createdAt,
 		});
 	}
 	return rounds;
+}
+
+/**
+ * Keep the findings text one drawer sends within `budget` characters: the newest rounds keep
+ * theirs whole, the first that does not fit is cut, older ones go without (`summaryClipped`).
+ */
+export function capReviewSummaries(
+	rounds: TeamWorkReviewRound[],
+	budget = TEAM_REVIEW_SUMMARIES_TOTAL_CHARS,
+): TeamWorkReviewRound[] {
+	let left = budget;
+	const capped = [...rounds];
+	for (let index = capped.length - 1; index >= 0; index--) {
+		const round = capped[index];
+		if (!round?.summary) continue;
+		if (round.summary.length <= left) {
+			left -= round.summary.length;
+			continue;
+		}
+		const cut = left > 1 ? `${round.summary.slice(0, left - 1)}…` : null;
+		left = 0;
+		capped[index] = { ...round, summary: cut, summaryClipped: true };
+	}
+	return capped;
+}
+
+/** The timeline does not repeat the findings the review rounds already carry. */
+function withoutSummary(event: TeamActivityEvent): TeamActivityEvent {
+	if (event.kind !== "work.review" || !event.detail || !("summary" in event.detail)) return event;
+	const { summary: _summary, ...detail } = event.detail;
+	return { ...event, detail };
 }
 
 /**
@@ -365,8 +466,21 @@ export async function readWorkItemDetail(
 			.countCommitsNotIn(target.to, [target.from])
 			.catch(() => null);
 	}
-	const { events, more } = itemEvents(itemId);
+	const { events, more, unreadSummaries } = itemEvents(itemId);
 	const files = stat.files;
+	const dependents = readDependents(teamId, itemId);
+	const teamActive = team.status === "active" && coordinator.status !== "archived";
+	// M: a ready item's merge (job phase, newest outcome, the prepared checkout's state).
+	const merge =
+		row.state === "ready"
+			? await mergeViewOf({
+					item: row,
+					baseBranch: team.baseBranch,
+					teamActive,
+					workerRunning: item.worker?.status === "working" || item.worker?.status === "waiting",
+					member: access === "write" && (await canMergeInProject(team.projectId, principal)),
+				})
+			: undefined;
 	return {
 		item,
 		base,
@@ -375,14 +489,13 @@ export async function readWorkItemDetail(
 		files,
 		filesMore: stat.filesMore,
 		diffAvailable: stat.target !== null,
-		reviews: reviewRounds(events),
-		events,
+		reviews: capReviewSummaries(markUnreadSummaries(reviewRounds(events), unreadSummaries)),
+		events: events.map(withoutSummary),
 		eventsMore: more,
-		canReturn:
-			access === "write" &&
-			team.status === "active" &&
-			coordinator.status !== "archived" &&
-			TEAM_RETURNABLE_STATES.includes(row.state),
+		canReturn: access === "write" && teamActive && TEAM_RETURNABLE_STATES.includes(row.state),
+		...(merge ? { merge } : {}),
+		dependents: dependents.items,
+		dependentsMore: dependents.more,
 	};
 }
 
@@ -445,4 +558,34 @@ export async function returnWorkItemAsPerson(
 	const item = readBoardItem(teamId, result.item.id);
 	if (!item) throw new NotFoundError("Work item", itemId);
 	return { item, delivered: result.delivered };
+}
+
+// ── Merge ───────────────────────────────────────────────────────────────────
+
+/**
+ * A member merges a ready item into its base (`team-merge.ts`): the same access as 退回 (write
+ * on the coordinator; an onlooker gets 403, a stranger 404). Accepted at once; the git runs in a
+ * background job whose phase and outcome the drawer reads.
+ */
+export async function requestMergeAsPerson(
+	teamId: string,
+	principal: NarratorPrincipal,
+	projectId: string,
+	itemId: string,
+): Promise<TeamWorkMergeResponse> {
+	await loadTeamForAccess(teamId, principal, "write", projectId);
+	const result = requestMerge({ teamId, itemId, userId: principal.userId || null });
+	statCache.delete(itemId);
+	return result;
+}
+
+/** A member fast-forwards a prepared merge in the checkout its base is checked out in. */
+export async function requestFastForwardAsPerson(
+	teamId: string,
+	principal: NarratorPrincipal,
+	projectId: string,
+	itemId: string,
+): Promise<TeamWorkMergeResponse> {
+	await loadTeamForAccess(teamId, principal, "write", projectId);
+	return requestFastForward({ teamId, itemId, userId: principal.userId || null });
 }

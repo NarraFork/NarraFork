@@ -12,6 +12,7 @@
  * otherwise left holding a UI full of things that will 404 on the next click.
  */
 
+import { PROJECT_MEMBER_COUNT_LIMIT, type ProjectMemberCount } from "@shared/project-overview";
 import { and, asc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import { activeDatabaseBackend, db } from "../db";
 import { aclGrants, narrators, projects, projectTeams, users } from "../db/schema";
@@ -223,6 +224,30 @@ export async function getProjectAccess(
 		members: [...byUser.values()],
 		canWrite: await canWriteProject(row, principal),
 		canManage: await canManageProject(row, principal),
+	};
+}
+
+/**
+ * How many people are members of a project: its owner and everyone holding a project grant,
+ * counted, not listed. One indexed read (`idx_acl_grant_scope`) of at most
+ * {@link PROJECT_MEMBER_COUNT_LIMIT} + 1 distinct grantees; the caller has already checked read
+ * access.
+ */
+export async function countProjectMembers(projectId: string): Promise<ProjectMemberCount> {
+	const row = await loadProject(projectId);
+	const grantees = await readQuery(
+		db
+			.selectDistinct({ userId: aclGrants.principalId })
+			.from(aclGrants)
+			.where(projectMemberScope(projectId))
+			.limit(PROJECT_MEMBER_COUNT_LIMIT + 1),
+		{ executionPolicy: "worker-required" },
+	);
+	const people = new Set(grantees.map((grantee) => grantee.userId));
+	if (row.ownerUserId) people.add(row.ownerUserId);
+	return {
+		count: Math.min(people.size, PROJECT_MEMBER_COUNT_LIMIT),
+		more: people.size > PROJECT_MEMBER_COUNT_LIMIT,
 	};
 }
 

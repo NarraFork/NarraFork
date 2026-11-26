@@ -50,7 +50,12 @@ db.insert(backgroundTasks)
 		},
 	])
 	.run();
-mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
+mock.module("../../db", () => ({
+	db,
+	sqlite,
+	activeDatabaseBackend: "sqlite",
+	postgresRuntime: null,
+}));
 const { backgroundTaskService: tasks } = await import("../background-task-service");
 const { runtimePublication: publisher } = await import("../agent-runtime/publication");
 publisher.stop();

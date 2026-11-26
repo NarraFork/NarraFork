@@ -5,6 +5,7 @@ import {
 	TEAM_EVENTS_PAGE_LIMIT,
 	TEAM_RETURN_REASON_MAX_LENGTH,
 	TEAM_SETTINGS_MAX_BYTES,
+	TEAM_WORK_START_MODES,
 	TEAM_WORK_STATS_IDS_MAX,
 } from "@shared/project-teams";
 import { z } from "zod";
@@ -34,6 +35,20 @@ export const teamSettingsSchema = z
 	.object({
 		coordinatorLimits: coordinatorLimitsSchema.optional(),
 		mergeNeedsPerson: z.boolean().optional(),
+		/** Where new work items start: `origin/<base>` or the local base (absent: the default). */
+		workStart: z.enum(TEAM_WORK_START_MODES).optional(),
+	})
+	.strict()
+	.refine((value) => utf8Bytes(JSON.stringify(value)) <= TEAM_SETTINGS_MAX_BYTES, {
+		message: `Team settings are limited to ${TEAM_SETTINGS_MAX_BYTES} bytes`,
+	});
+
+/** A settings change: the keys given replace the stored ones, `null` removes one. */
+export const teamSettingsPatchSchema = z
+	.object({
+		coordinatorLimits: coordinatorLimitsSchema.nullable().optional(),
+		mergeNeedsPerson: z.boolean().nullable().optional(),
+		workStart: z.enum(TEAM_WORK_START_MODES).nullable().optional(),
 	})
 	.strict()
 	.refine((value) => utf8Bytes(JSON.stringify(value)) <= TEAM_SETTINGS_MAX_BYTES, {
@@ -75,7 +90,7 @@ export const updateProjectTeamSchema = z
 	.object({
 		baseBranch: teamBaseBranchSchema.optional(),
 		brief: teamBriefSchema.optional(),
-		settings: teamSettingsSchema.optional(),
+		settings: teamSettingsPatchSchema.optional(),
 	})
 	.strict()
 	.refine((value) => Object.values(value).some((field) => field !== undefined), {
@@ -86,6 +101,11 @@ export const listProjectTeamsQuerySchema = z.object({
 	status: z.enum(["active", "archived", "all"]).default("active"),
 	limit: z.coerce.number().int().min(1).max(100).default(50),
 	cursor: z.string().max(200).optional(),
+	/** R2: each team carries its card's numbers; the page is then at most 24 teams. */
+	counts: z
+		.enum(["true", "false"])
+		.optional()
+		.transform((value) => value === "true"),
 });
 
 // ── P4: the team page ────────────────────────────────────────────────────────

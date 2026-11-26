@@ -73,6 +73,8 @@ import {
 	resolveNarratorRoom,
 	softDeleteMessage,
 } from "../chat-service";
+// Rejections settle natively before matching: Bun's `.rejects` stalls on a reused read Worker.
+import { captureWorkerRejection, captureWorkerRejectionThrower } from "./narrator-worker-fixture";
 
 const TAG = Date.now();
 
@@ -146,7 +148,7 @@ describe("DM room resolution", () => {
 	});
 
 	test("refuses a DM with yourself", async () => {
-		expect(resolveDmRoom(alice, alice)).rejects.toThrow();
+		expect(await captureWorkerRejectionThrower(resolveDmRoom(alice, alice))).toThrow();
 	});
 
 	test("peer resolution returns the other participant, per viewer", async () => {
@@ -246,14 +248,16 @@ describe("assertCanRead", () => {
 
 	test("a non-member is refused a DM", async () => {
 		const room = await resolveDmRoom(alice, bob);
-		expect(assertCanRead(room.id, carol)).rejects.toThrow();
+		expect(await captureWorkerRejectionThrower(assertCanRead(room.id, carol))).toThrow();
 	});
 
 	test("a non-member cannot post into a DM", async () => {
 		const room = await resolveDmRoom(alice, bob);
 		expect(
-			postMessage({ roomId: room.id, senderUserId: carol, text: "intruding" }),
-		).rejects.toThrow();
+			await captureWorkerRejectionThrower(
+				postMessage({ roomId: room.id, senderUserId: carol, text: "intruding" }),
+			),
+		).toThrow();
 	});
 
 	test("a narrator room is readable without a pre-existing member row", async () => {
@@ -308,7 +312,9 @@ describe("assertCanRead", () => {
 			updatedAt: new Date().toISOString(),
 		});
 
-		expect(resolveNarratorRoom(privateNarratorId, carol)).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(resolveNarratorRoom(privateNarratorId, carol)),
+		).toThrow();
 		const room = await db.query.chatRooms.findFirst({
 			where: eq(chatRooms.narratorId, privateNarratorId),
 		});
@@ -676,7 +682,9 @@ describe("room list and deletion", () => {
 		const row = await postMessage({ roomId: room.id, senderUserId: alice, text: "mine" });
 		// The status matters: a client cannot distinguish "fix your input" from
 		// "this was never yours" if both surface as a validation error.
-		expect(softDeleteMessage(room.id, row.id, bob, false)).rejects.toBeInstanceOf(ForbiddenError);
+		expect(
+			await captureWorkerRejection(softDeleteMessage(room.id, row.id, bob, false)),
+		).toBeInstanceOf(ForbiddenError);
 		try {
 			await softDeleteMessage(room.id, row.id, bob, false);
 			throw new Error("expected a refusal");
@@ -698,21 +706,29 @@ describe("room list and deletion", () => {
 		const roomB = await resolveDmRoom(alice, carol);
 		const inA = await postMessage({ roomId: roomA.id, senderUserId: alice, text: "in A" });
 		expect(
-			postMessage({
-				roomId: roomB.id,
-				senderUserId: alice,
-				text: "cross-room reply",
-				replyToMessageId: inA.id,
-			}),
-		).rejects.toThrow();
+			await captureWorkerRejectionThrower(
+				postMessage({
+					roomId: roomB.id,
+					senderUserId: alice,
+					text: "cross-room reply",
+					replyToMessageId: inA.id,
+				}),
+			),
+		).toThrow();
 	});
 
 	test("empty and oversized bodies are refused", async () => {
 		const room = await resolveDmRoom(alice, bob);
-		expect(postMessage({ roomId: room.id, senderUserId: alice, text: "   " })).rejects.toThrow();
 		expect(
-			postMessage({ roomId: room.id, senderUserId: alice, text: "x".repeat(8_001) }),
-		).rejects.toThrow();
+			await captureWorkerRejectionThrower(
+				postMessage({ roomId: room.id, senderUserId: alice, text: "   " }),
+			),
+		).toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				postMessage({ roomId: room.id, senderUserId: alice, text: "x".repeat(8_001) }),
+			),
+		).toThrow();
 	});
 
 	test("posting into a room that vanished is a 404, not a TypeError", async () => {
@@ -722,7 +738,11 @@ describe("room list and deletion", () => {
 		// Simulates the room being deleted between the access check and the write
 		// transaction: the `UPDATE ... RETURNING` matches nothing.
 		await db.delete(chatRooms).where(eq(chatRooms.id, room.id));
-		expect(postMessage({ roomId: room.id, senderUserId: a, text: "orphan" })).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				postMessage({ roomId: room.id, senderUserId: a, text: "orphan" }),
+			),
+		).toThrow();
 	});
 });
 
@@ -946,7 +966,9 @@ describe("attachments", () => {
 		});
 		// Fail-closed matters more here than for narrator uploads: this file would be
 		// served back to other members of the room under an image content type.
-		await expect(createChatAttachment(room.id, alice, spoofed)).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(createChatAttachment(room.id, alice, spoofed)),
+		).toThrow();
 	});
 
 	test("a non-image is stored as an opaque file, never under an image type", async () => {
@@ -982,22 +1004,26 @@ describe("attachments", () => {
 		// Inside the SUPPORTED image set the pipeline fails closed: the user's intent
 		// was "an image", so silently storing it as a download would hide a corrupt or
 		// deliberately disguised file.
-		await expect(
-			createChatAttachment(
-				room.id,
-				alice,
-				new File([rawBytes([1, 2, 3, 4, 5, 6, 7, 8])], "not-really.png", {
-					type: "image/png",
-				}),
+		expect(
+			await captureWorkerRejectionThrower(
+				createChatAttachment(
+					room.id,
+					alice,
+					new File([rawBytes([1, 2, 3, 4, 5, 6, 7, 8])], "not-really.png", {
+						type: "image/png",
+					}),
+				),
 			),
-		).rejects.toThrow();
+		).toThrow();
 	});
 
 	test("a non-member cannot upload into a DM", async () => {
 		const room = await resolveDmRoom(alice, bob);
 		// Checked BEFORE the disk write, so an unauthorized upload cannot consume
 		// storage on its way to being rejected.
-		await expect(createChatAttachment(room.id, carol, pngFile())).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(createChatAttachment(room.id, carol, pngFile())),
+		).toThrow();
 	});
 
 	test("posting claims the attachment and returns it with the message", async () => {
@@ -1034,9 +1060,11 @@ describe("attachments", () => {
 
 	test("a message with neither text nor attachments is refused", async () => {
 		const room = await resolveDmRoom(alice, bob);
-		await expect(
-			postMessage({ roomId: room.id, senderUserId: alice, text: "  ", attachmentIds: [] }),
-		).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				postMessage({ roomId: room.id, senderUserId: alice, text: "  ", attachmentIds: [] }),
+			),
+		).toThrow();
 	});
 
 	test("claiming someone else's draft is refused and posts nothing", async () => {
@@ -1044,14 +1072,16 @@ describe("attachments", () => {
 		const draft = await createChatAttachment(room.id, alice, pngFile("alices.png"));
 		const before = await listMessages({ roomId: room.id, userId: bob });
 
-		await expect(
-			postMessage({
-				roomId: room.id,
-				senderUserId: bob,
-				text: "stealing",
-				attachmentIds: [draft.id],
-			}),
-		).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				postMessage({
+					roomId: room.id,
+					senderUserId: bob,
+					text: "stealing",
+					attachmentIds: [draft.id],
+				}),
+			),
+		).toThrow();
 
 		// The whole write is rolled back, not just the claim: a message that posted
 		// without its attachments would be worse than a failed send.
@@ -1070,14 +1100,16 @@ describe("attachments", () => {
 
 		// Without the room predicate this would smuggle content from a conversation
 		// `bob` cannot read into one he can.
-		await expect(
-			postMessage({
-				roomId: roomA.id,
-				senderUserId: alice,
-				text: "cross-room",
-				attachmentIds: [foreign.id],
-			}),
-		).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				postMessage({
+					roomId: roomA.id,
+					senderUserId: alice,
+					text: "cross-room",
+					attachmentIds: [foreign.id],
+				}),
+			),
+		).toThrow();
 	});
 
 	test("an attachment cannot be claimed twice", async () => {
@@ -1089,14 +1121,16 @@ describe("attachments", () => {
 			text: "first",
 			attachmentIds: [attachment.id],
 		});
-		await expect(
-			postMessage({
-				roomId: room.id,
-				senderUserId: alice,
-				text: "second",
-				attachmentIds: [attachment.id],
-			}),
-		).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(
+				postMessage({
+					roomId: room.id,
+					senderUserId: alice,
+					text: "second",
+					attachmentIds: [attachment.id],
+				}),
+			),
+		).toThrow();
 	});
 
 	test("a soft delete removes the attachment rows and the files", async () => {
@@ -1118,7 +1152,9 @@ describe("attachments", () => {
 			where: eq(chatAttachments.id, attachment.id),
 		});
 		expect(row).toBeUndefined();
-		await expect(loadChatAttachmentForRead(attachment.id, bob)).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(loadChatAttachmentForRead(attachment.id, bob)),
+		).toThrow();
 	});
 
 	test("a soft-deleted message reports no attachments", async () => {
@@ -1151,13 +1187,17 @@ describe("attachments", () => {
 		expect((await loadChatAttachmentForRead(attachment.id, bob)).filename).toBe("private.png");
 		// An outsider may not — and is told "not found", not "forbidden", which would
 		// confirm the attachment (and thus the conversation) exists.
-		await expect(loadChatAttachmentForRead(attachment.id, carol)).rejects.toThrow();
+		expect(
+			await captureWorkerRejectionThrower(loadChatAttachmentForRead(attachment.id, carol)),
+		).toThrow();
 	});
 
 	test("only the uploader can discard a draft, and only before it is claimed", async () => {
 		const room = await resolveDmRoom(alice, bob);
 		const draft = await createChatAttachment(room.id, alice, pngFile("draft.png"));
-		await expect(discardChatAttachment(draft.id, bob)).rejects.toBeInstanceOf(ForbiddenError);
+		expect(await captureWorkerRejection(discardChatAttachment(draft.id, bob))).toBeInstanceOf(
+			ForbiddenError,
+		);
 		await discardChatAttachment(draft.id, alice);
 		expect(
 			await db.query.chatAttachments.findFirst({ where: eq(chatAttachments.id, draft.id) }),
@@ -1172,7 +1212,7 @@ describe("attachments", () => {
 		});
 		// Once a message owns it, removal is that message's delete — not a separate
 		// operation that would leave the message referencing a missing file.
-		await expect(discardChatAttachment(claimed.id, alice)).rejects.toThrow();
+		expect(await captureWorkerRejectionThrower(discardChatAttachment(claimed.id, alice))).toThrow();
 	});
 
 	test("two files with the same name do not overwrite each other", async () => {

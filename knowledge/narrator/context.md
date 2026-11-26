@@ -48,7 +48,7 @@ keywords:
   - api_conversation_id
   - model_history_revision
 status: draft
-verified_at: 2c639f086aef21d60357f1e002e62767938833e8
+verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 ---
 # 上下文与压缩
 

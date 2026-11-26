@@ -2166,6 +2166,23 @@ export const narratorToolContinuations = sqliteTable(
 );
 
 // === terminals ===
+/**
+ * Executor sessions NarraFork still has to stop and release on a device
+ * (`session.kill { release: true }`): written before a remote terminal's local
+ * close or exit is final, and removed only once the executor confirms (or reports
+ * the session unknown). Independent of the terminal row, so deleting a terminal,
+ * restarting NarraFork or an offline device can never orphan a remote shell.
+ */
+export const executorSessionCleanups = sqliteTable(
+	"executor_session_cleanups",
+	{
+		deviceId: text("device_id").notNull(),
+		sessionId: text("session_id").notNull(),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [primaryKey({ columns: [table.deviceId, table.sessionId] })],
+);
+
 export const terminals = sqliteTable(
 	"terminals",
 	{
@@ -2185,6 +2202,12 @@ export const terminals = sqliteTable(
 		dtachSocket: text("dtach_socket"),
 		/** Remote executor device this terminal runs on. null → local server. */
 		deviceId: text("device_id"),
+		/**
+		 * Durable executor session (`session.durable.v1`) backing a remote terminal.
+		 * Set: the shell outlives NarraFork and device reconnects, and is resumed by
+		 * id. NULL: a local terminal or a legacy `pty.open` remote terminal.
+		 */
+		executorSessionId: text("executor_session_id"),
 		status: text("status", { enum: ["running", "exited"] })
 			.notNull()
 			.default("running"),
@@ -4294,6 +4317,18 @@ export const backgroundTasks = sqliteTable(
 		 * re-attaches.
 		 */
 		principalJson: text("principal_json", { mode: "json" }).$type<{ userId: string | null }>(),
+		/**
+		 * A remote background Bash running in a durable executor session
+		 * (`session.exec.v1`). Written before the session is opened, so a restarted
+		 * server can re-attach to it (or stop it) instead of reporting it lost.
+		 */
+		executorSessionJson: text("executor_session_json", { mode: "json" }).$type<{
+			deviceId: string;
+			sessionId: string;
+			/** Wall-clock budget from `startedAt`; absent means none. */
+			timeoutMs?: number;
+			startedAt: string;
+		}>(),
 		output: text("output"),
 		outputBytes: integer("output_bytes").notNull().default(0),
 		outputTruncated: integer("output_truncated", { mode: "boolean" }).notNull().default(false),
@@ -7190,6 +7225,58 @@ export const projectTeams = sqliteTable(
  * One unit of team work: one branch and one worktree (P3 creates them). PR / CI / integration
  * columns are deferred with the hosting and integration PRs.
  */
+/** Communication inheritance is separate from historical parent/controller/ACL. */
+export const narratorCommunicationNodes = sqliteTable(
+	"narrator_communication_nodes",
+	{
+		narratorId: text("narrator_id")
+			.primaryKey()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		parentNarratorId: text("parent_narrator_id").references(() => narrators.id, {
+			onDelete: "set null",
+		}),
+		/** Immutable birth delegator; NULL for ordinary forks and standalone primary sessions. */
+		originalParentNarratorId: text("original_parent_narrator_id").references(() => narrators.id, {
+			onDelete: "set null",
+		}),
+		version: integer("version").notNull().default(1),
+	},
+	(table) => [
+		index("idx_communication_nodes_parent").on(table.parentNarratorId),
+		index("idx_communication_nodes_original_parent").on(table.originalParentNarratorId),
+		check(
+			"ck_communication_nodes_not_self",
+			sql`${table.parentNarratorId} is null or ${table.parentNarratorId} <> ${table.narratorId}`,
+		),
+		check("ck_communication_nodes_version", sql`${table.version} >= 1`),
+	],
+);
+
+/** One exact undirected contact; it never merges or transitively connects domains. */
+export const narratorCommunicationPeers = sqliteTable(
+	"narrator_communication_peers",
+	{
+		id: text("id").primaryKey(),
+		endpointLo: text("endpoint_lo")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		endpointHi: text("endpoint_hi")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		createdBy: text("created_by").references(() => users.id, { onDelete: "set null" }),
+		source: text("source", { enum: ["manual", "admission"] }).notNull(),
+		admissionId: text("admission_id"),
+		messageId: text("message_id"),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("uq_communication_peers_pair").on(table.endpointLo, table.endpointHi),
+		index("idx_communication_peers_hi").on(table.endpointHi),
+		index("idx_communication_peers_created_by").on(table.createdBy),
+		check("ck_communication_peers_canonical", sql`${table.endpointLo} < ${table.endpointHi}`),
+	],
+);
+
 export const teamWorkItems = sqliteTable(
 	"team_work_items",
 	{
@@ -7259,6 +7346,37 @@ export const teamWorkItems = sqliteTable(
 			"ck_team_work_items_changed_paths_bytes",
 			sql`${table.changedPathsJson} is null or length(cast(${table.changedPathsJson} as blob)) <= 131072`,
 		),
+	],
+);
+
+/**
+ * D: a work item waits for another item of the same team to merge before it may start. Deleting
+ * either item (or the team) deletes the edge. The coordinator sets an item's whole set at once
+ * (`Team` `dependsOn`): at most 20, both ends in `team_id`, no cycles — checked by the service
+ * (`teams/work-item-dependencies.ts`), since a composite key across teams does not transpile to
+ * PostgreSQL here.
+ */
+export const teamWorkItemDependencies = sqliteTable(
+	"team_work_item_dependencies",
+	{
+		itemId: text("item_id")
+			.notNull()
+			.references(() => teamWorkItems.id, { onDelete: "cascade" }),
+		dependsOnItemId: text("depends_on_item_id")
+			.notNull()
+			.references(() => teamWorkItems.id, { onDelete: "cascade" }),
+		teamId: text("team_id")
+			.notNull()
+			.references(() => projectTeams.narratorId, { onDelete: "cascade" }),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		primaryKey({ columns: [table.itemId, table.dependsOnItemId] }),
+		// Who depends on an item: the unblock check when it merges, and the drawer's dependents.
+		index("idx_team_work_item_dependencies_target").on(table.dependsOnItemId, table.itemId),
+		// FK covering index (CASCADE on team deletion).
+		index("idx_team_work_item_dependencies_team").on(table.teamId),
+		check("ck_team_work_item_dependencies_self", sql`${table.itemId} <> ${table.dependsOnItemId}`),
 	],
 );
 

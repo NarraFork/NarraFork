@@ -7,6 +7,12 @@ import type { CoordinatorOverrunKind, TeamWorkItemState } from "@shared/project-
 // computed here, no relative times, so the same state always gives the same bytes (the rows
 // stay in the history and a rebuilt request sends what the first one sent).
 
+/** A title or name on one line, at most `max` characters (an ellipsis marks a cut). */
+export function oneLine(value: string, max = 80): string {
+	const flat = value.replace(/\s+/g, " ").trim();
+	return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
+}
+
 interface ReminderFacts {
 	kind: CoordinatorOverrunKind;
 	tool: string;

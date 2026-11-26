@@ -26,32 +26,20 @@ import { isValidTrustedProxyCidr } from "../lib/client-ip";
 import { getCodexManager } from "../lib/codex-manager";
 import { peekCommandCodeModels } from "../lib/commandcode-models";
 import { getCredentialMigrationConflicts } from "../lib/credential-migration";
+import { purgeCustomApiQuotaCache } from "../lib/custom-api-quota-cache";
 import {
-	getAllCustomApiCachedQuotas,
-	purgeCustomApiQuotaCache,
-} from "../lib/custom-api-quota-cache";
-import {
-	getDeepSeekBalanceGenerations,
 	refreshAllDeepSeekBalances,
 	syncDeepSeekBalanceCache,
 } from "../lib/deepseek-balance-cache";
 import { ValidationError } from "../lib/errors";
 import { generateShortId } from "../lib/id";
-import {
-	getAllKimiCachedUsages,
-	purgeKimiUsageCache,
-	refreshAllKimiUsages,
-} from "../lib/kimi-usage-cache";
+import { purgeKimiUsageCache, refreshAllKimiUsages } from "../lib/kimi-usage-cache";
 import { logger } from "../lib/logger";
 import { redactDiagnosticText } from "../lib/net/diagnostic-redaction";
 import { getLanAddresses } from "../lib/net/lan-addresses";
 import { getNugCachedModelsGrouped } from "../lib/nug-model-cache";
 import { reconcileNugRelayClients } from "../lib/nug-relay/manager";
-import {
-	getOpencodeUsageGenerations,
-	refreshAllOpencodeUsages,
-	syncOpencodeUsageCache,
-} from "../lib/opencode-usage-cache";
+import { refreshAllOpencodeUsages, syncOpencodeUsageCache } from "../lib/opencode-usage-cache";
 import { legacyPermissionModeSchema } from "../lib/permission-modes";
 import { getHome } from "../lib/platform";
 import {
@@ -1002,7 +990,6 @@ async function buildSettingsResponse(
 		providerReadiness: await listProviderReadiness(),
 		// Explicit override prevents backend credentials leaking through the spread.
 		tokendance: getTokenDanceConnection(),
-		deepseekBalanceGenerations: getDeepSeekBalanceGenerations(),
 		providerBalanceGenerations: getProviderBalanceGenerations(),
 		// The capability itself is owned by the apikey-quota plugin, so the provider page needs to
 		// know whether it is on before rendering the site-quota inputs and the balance row.
@@ -1068,12 +1055,6 @@ async function buildSettingsResponse(
 		anthropicModelsGrouped: getAnthropicCachedModelsGrouped(),
 		nugModelsGrouped: getNugCachedModelsGrouped(source.nugProviders ?? []),
 		geminiModelsGrouped: getGeminiCachedModelsGrouped(),
-		customApiQuotas: getAllCustomApiCachedQuotas(),
-		kimiUsages: getAllKimiCachedUsages(),
-		// Opaque runtime tokens for the OpenCode Go usage cache. The panel compares
-		// them so an allowance fetched for a replaced account is never rendered
-		// under the new one.
-		opencodeUsageGenerations: getOpencodeUsageGenerations(),
 		codexAvailable: codexManager.hasAvailableCredentials,
 		codexModels: getBuiltinCodexModels(),
 		commandcodeAvailable: hasConfiguredCommandCodeProvider(),

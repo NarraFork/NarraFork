@@ -45,6 +45,7 @@ import {
 	narratorToolCalls,
 	projects,
 } from "../db/schema";
+import { readNativeRows, readQuery, readQueryFirst } from "../db/worker-read";
 import type { ReasoningEffort } from "../lib/agent";
 import { diagnosticsFromError } from "../lib/agent/error-diagnostics";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
@@ -180,6 +181,7 @@ import {
 	preparePrefixRequest,
 	type RequestModelIdentity,
 } from "./agent-runtime/prepare-prefix-request";
+import { RuntimeReadConflictError } from "./agent-runtime/read-conflict";
 import {
 	type RuntimeMailboxRow,
 	resolveRuntimeQueueBackend,
@@ -449,6 +451,10 @@ import {
 	type ScopedRevertOptions,
 } from "./narrator-scoped-revert";
 import { narratorStore } from "./narrator-store";
+import {
+	type NarratorSurfaceReadBudget,
+	narratorSurfaceReadOptions,
+} from "./narrator-surface-reads";
 import { recoverInterruptedTurns } from "./narrator-turns";
 import { invalidateRecoveryTarget } from "./recovery-handoff";
 import {
@@ -596,6 +602,14 @@ export function resolveNarratorDefaultDeviceRequest(
 	return match.id;
 }
 
+/**
+ * Metadata reads of the session layer run on the database Worker with the caller's budget.
+ * Payload (message body / tool input-output) reads stay with their dedicated readers.
+ */
+function sessionReadOptions(budget?: NarratorSurfaceReadBudget, maxRows = 1) {
+	return { ...narratorSurfaceReadOptions(budget), maxRows };
+}
+
 async function persistNarratorDefaultDevice(
 	narratorId: string,
 	deviceId: string | null,
@@ -662,10 +676,14 @@ export async function applySessionDefaultDevice(
  * lives in `narrator-project.ts` (single source of truth).
  */
 async function resolveNarratorProjectId(narratorId: string): Promise<string | null> {
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { id: true, contextProjectId: true },
-	});
+	const narrator = await readQueryFirst(
+		db.query.narrators.findMany({
+			where: eq(narrators.id, narratorId),
+			columns: { id: true, contextProjectId: true },
+			limit: 1,
+		}),
+		sessionReadOptions(),
+	);
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
 	return await resolveSharedNarratorProjectId(narrator);
 }
@@ -680,10 +698,14 @@ export async function getNarratorExecutionDeviceState(narratorId: string): Promi
 	 */
 	directories: import("@shared/workspace-directories").WorkspaceDirectoryMap;
 }> {
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { defaultDeviceId: true },
-	});
+	const narrator = await readQueryFirst(
+		db.query.narrators.findMany({
+			where: eq(narrators.id, narratorId),
+			columns: { defaultDeviceId: true },
+			limit: 1,
+		}),
+		sessionReadOptions(),
+	);
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
 	const projectId = await resolveNarratorProjectId(narratorId);
 	const runtime = await assertOAuthNarratorRuntimeActive(narratorId);
@@ -1505,6 +1527,8 @@ export async function buildSystemPrompt(
 		| "taskSection"
 		| "contextParts"
 		| "outlinePlan"
+		| "communicationSourceNarratorId"
+		| "communicationSignal"
 	>,
 ): Promise<import("./narrator-prompt").BuildPromptResult> {
 	return buildEffectiveSystemPrompt({
@@ -1595,9 +1619,14 @@ async function createNarrator(
 	await syncNarratorProjectLinksSafely(narrator.id);
 	const resolvedProjectId = await resolveSharedNarratorProjectId(narrator);
 	if (resolvedProjectId) {
-		const project = await db.query.projects.findFirst({
-			where: eq(projects.id, resolvedProjectId),
-		});
+		const project = await readQueryFirst(
+			db.query.projects.findMany({
+				where: eq(projects.id, resolvedProjectId),
+				columns: { id: true, gitPath: true, chapterSettings: true },
+				limit: 1,
+			}),
+			sessionReadOptions(),
+		);
 		if (!project) throw new NotFoundError("Project", resolvedProjectId);
 		narratorProjectId = project.id;
 		projectGitPath = project.gitPath;
@@ -1852,13 +1881,17 @@ async function broadcastInterruptedPartialMessage(
 		);
 		if (!fullMessage) return;
 
-		const ref = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, partialId),
-			),
-			columns: { seq: true },
-		});
+		const ref = await readQueryFirst(
+			db.query.narratorMessageRefs.findMany({
+				where: and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, partialId),
+				),
+				columns: { seq: true },
+				limit: 1,
+			}),
+			sessionReadOptions(),
+		);
 
 		const processed = enrichToolUseBlocks(truncateToolIO([{ ...fullMessage, seq: ref?.seq }]))[0];
 
@@ -1870,10 +1903,14 @@ async function broadcastInterruptedPartialMessage(
 				deliverTo?.toolUseId === fullMessage.parentToolUseId
 					? deliverTo.narratorId
 					: (
-							await db.query.narrators.findFirst({
-								where: eq(narrators.id, narratorId),
-								columns: { parentNarratorId: true },
-							})
+							await readQueryFirst(
+								db.query.narrators.findMany({
+									where: eq(narrators.id, narratorId),
+									columns: { parentNarratorId: true },
+									limit: 1,
+								}),
+								sessionReadOptions(),
+							)
 						)?.parentNarratorId;
 			if (recipientId && recipientId !== narratorId) {
 				broadcastToNarrator(recipientId, {
@@ -1951,17 +1988,13 @@ export async function finalizeInterruptedRun(
 	}
 
 	try {
-		const current = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { status: true, substatus: true },
+		// An error already recorded on an idle session outranks "interrupted". The check runs
+		// on updateStatus's own observation, so a concurrent transition is never overwritten.
+		await narratorService.updateStatus(narratorId, "idle", {
+			substatus: ["interrupted"],
+			unlessArchived: true,
+			keepIdleError: true,
 		});
-		const currentSubstatus = parseSubstatus(current?.substatus);
-		if (!(current?.status === "idle" && currentSubstatus.includes("error"))) {
-			await narratorService.updateStatus(narratorId, "idle", {
-				substatus: ["interrupted"],
-				unlessArchived: true,
-			});
-		}
 	} catch (err) {
 		logger.warn("Failed to update narrator status after interrupt", {
 			narratorId,
@@ -2665,21 +2698,32 @@ async function deliverPendingInjectionsInOrder(
 					// A person's answer: the run that takes it up is theirs too (outline P2 PR 10c-2).
 					if (active) active._runPersonActed = true;
 					// Adopt the already persisted user receipt, never create a second message.
-					const ref = db
-						.select({ id: narratorMessageRefs.id })
-						.from(narratorMessageRefs)
-						.where(
-							and(
-								eq(narratorMessageRefs.narratorId, narratorId),
-								eq(narratorMessageRefs.messageId, questionAnswer.messageId),
-							),
-						)
-						.get();
+					const refWhere = (id?: string) =>
+						and(
+							eq(narratorMessageRefs.narratorId, narratorId),
+							eq(narratorMessageRefs.messageId, questionAnswer.messageId),
+							id === undefined ? undefined : eq(narratorMessageRefs.id, id),
+						);
+					const ref = await readQueryFirst(
+						db
+							.select({ id: narratorMessageRefs.id })
+							.from(narratorMessageRefs)
+							.where(refWhere())
+							.limit(1),
+						sessionReadOptions(),
+					);
 					if (!ref) throw new Error("Question answer history reference no longer exists");
-					const adopted = runtimeInbox.materialize(inboxClaim(row), () => ({
-						messageId: questionAnswer.messageId,
-						refId: ref.id,
-					}));
+					const adopted = runtimeInbox.materialize(inboxClaim(row), (tx) => {
+						// The reference was observed off-thread; a rollback in between must not
+						// leave the receipt bound to a ref that no longer exists.
+						const current = tx
+							.select({ id: narratorMessageRefs.id })
+							.from(narratorMessageRefs)
+							.where(refWhere(ref.id))
+							.get();
+						if (!current) throw new RuntimeReadConflictError();
+						return { messageId: questionAnswer.messageId, refId: ref.id };
+					});
 					if (active?._questionAnswerAdoptedMessageIds?.has(questionAnswer.messageId)) {
 						// It arrived between the pre-pass drain and history read. The model
 						// already saw it; acknowledge the receipt, do not add a second copy.
@@ -3745,10 +3789,14 @@ export async function drainNarratorSessionTails(options: {
 export async function readSessionDeliverTo(
 	narratorId: string,
 ): Promise<import("../lib/validators/runtime-registration").RunDeliverTo | undefined> {
-	const row = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { runtimeRegistrationJson: true },
-	});
+	const row = await readQueryFirst(
+		db.query.narrators.findMany({
+			where: eq(narrators.id, narratorId),
+			columns: { runtimeRegistrationJson: true },
+			limit: 1,
+		}),
+		sessionReadOptions(),
+	);
 	return row ? runDeliverToOf(row) : undefined;
 }
 
@@ -4395,12 +4443,15 @@ async function updateToolCallConclusionUnlocked(opts: {
 		refreshTiming = false,
 	} = opts;
 	// Scope metadata only: do not load the child's transcript or file-tool payloads.
-	const attributionTurn = await db.query.narrators
-		.findFirst({
+	// An unreadable scope must fail the conclusion, not widen attribution to "since ever".
+	const attributionTurn = await readQueryFirst(
+		db.query.narrators.findMany({
 			where: eq(narrators.id, subagentId),
 			columns: { turnStartedAt: true, title: true },
-		})
-		.catch(() => undefined);
+			limit: 1,
+		}),
+		sessionReadOptions(),
+	);
 	const resultPrefix = agentResultTag(
 		await resolveAgentLabel(parentNarratorId, subagentId),
 		subagentId,
@@ -4419,23 +4470,27 @@ async function updateToolCallConclusionUnlocked(opts: {
 		},
 		resultPrefix + (finalText || "(no output)"),
 	);
-	const resultRows = await db.query.narratorToolCalls.findMany({
-		where: and(
-			eq(narratorToolCalls.narratorId, parentNarratorId),
-			eq(narratorToolCalls.toolUseId, toolUseId),
-			messageId ? eq(narratorToolCalls.messageId, messageId) : undefined,
-			opts.toolCallId ? eq(narratorToolCalls.id, opts.toolCallId) : undefined,
-		),
-		columns: {
-			id: true,
-			createdAt: true,
-			streamStartedAt: true,
-			permissionStartedAt: true,
-			executionStartedAt: true,
-			status: true,
-		},
-		limit: 2,
-	});
+	// Status is re-checked by settleTool's own onlyIfActive guard inside its write.
+	const resultRows = await readQuery(
+		db.query.narratorToolCalls.findMany({
+			where: and(
+				eq(narratorToolCalls.narratorId, parentNarratorId),
+				eq(narratorToolCalls.toolUseId, toolUseId),
+				messageId ? eq(narratorToolCalls.messageId, messageId) : undefined,
+				opts.toolCallId ? eq(narratorToolCalls.id, opts.toolCallId) : undefined,
+			),
+			columns: {
+				id: true,
+				createdAt: true,
+				streamStartedAt: true,
+				permissionStartedAt: true,
+				executionStartedAt: true,
+				status: true,
+			},
+			limit: 2,
+		}),
+		sessionReadOptions(undefined, 2),
+	);
 	if (resultRows.length !== 1) {
 		if (opts.onlyIfActive) return;
 		throw new ValidationError("Subagent conclusion requires an exact parent tool-call row");
@@ -4479,6 +4534,7 @@ export interface UserMessageAdmissionOptions {
 	/** Set only by authenticated human input endpoints; absent for agent/plugin traffic. */
 	humanReplyContext?: ReplyContext;
 	composerDocument?: import("@shared/composer-document").ComposerDocument;
+	submission?: import("./agent-runtime/user-submission").UserSubmission;
 	images?: ImageRef[];
 	media?: MediaRef[];
 	locale?: Locale;
@@ -4499,7 +4555,7 @@ export interface UserMessageAdmissionOptions {
 }
 
 export type UserMessageAdmissionResult =
-	| { buffered: true; id: string; bufferedAt: string }
+	| { buffered: true; id: string; bufferedAt: string; duplicate?: boolean }
 	| { buffered: false; userMsg: typeof narratorMessages.$inferSelect };
 
 /** Execute a materialized control under its own execution epoch, never the old loop's. */
@@ -4563,8 +4619,7 @@ export async function acceptUserMessage(
 			const oldController = activeNarrators.get(narratorId)?.abortController;
 			const oldRecovery = plannedUpdateRecoveryControls.get(narratorId);
 			const busy = isNarratorRuntimeBusy(narratorId) || isLoopRunning(narratorId);
-			const inputOwner =
-				!busy && !options.queueOnly ? tryClaimExecution(narratorId, "tool-replay") : undefined;
+			let inputOwner: ReturnType<typeof tryClaimExecution> | undefined;
 			try {
 				const accepted = await enqueueBufferedMessage(
 					narratorId,
@@ -4583,17 +4638,24 @@ export async function acceptUserMessage(
 					options.composerDocument,
 					options.media,
 					humanReplyContext,
+					options.submission,
 				);
 				if (!accepted.ok) throw new ValidationError("Message queue is full");
 				const queued = {
 					buffered: true as const,
 					id: accepted.id,
 					bufferedAt: accepted.bufferedAt,
+					...(accepted.duplicate ? { duplicate: true } : {}),
 				};
+				// A replay is only its old receipt: never claim, interrupt or wake again.
+				if (accepted.duplicate) return queued;
 				// From here onward the mailbox owns the payload. Dispatch/notification failure
 				// must not make HTTP callers retry the same input or discard its attachments.
 				let claimed: RuntimeMailboxRow | undefined;
 				try {
+					// Only new accepted work can claim execution; duplicates have no runtime effects.
+					inputOwner =
+						!busy && !options.queueOnly ? tryClaimExecution(narratorId, "tool-replay") : undefined;
 					if (queueMode === "interrupt" && busy) {
 						const ownerUnchanged = getExecutionOwner(narratorId) === oldOwner;
 						const controllerUnchanged =
@@ -4690,7 +4752,7 @@ export async function acceptUserMessage(
 			}
 		},
 	);
-	if (result.buffered) {
+	if (result.buffered && !result.duplicate) {
 		// Outside start admission: waking takes the same lock, so awaiting it inside
 		// would deadlock. The wake rechecks compactLocks too: compaction may have
 		// finished while an attachment was staging, before there was anything to drain.
@@ -5602,18 +5664,26 @@ export async function recoverPendingQuestionAnswerDeliveries(
 	);
 	const narratorRowid = sql<number>`${narrators}.rowid`;
 	const questionRowid = sql<number>`${narratorQuestions}.rowid`;
-	const narratorEnd = db
-		.select({ cursor: narratorRowid })
-		.from(narrators)
-		.orderBy(desc(narratorRowid))
-		.limit(1)
-		.get()?.cursor;
-	const questionEnd = db
-		.select({ cursor: questionRowid })
-		.from(narratorQuestions)
-		.orderBy(desc(questionRowid))
-		.limit(1)
-		.get()?.cursor;
+	// Startup recovery: every page is a Worker read under the caller's signal. Scheduling is
+	// idempotent per delivery identity, so a page observed slightly stale only re-schedules
+	// what scheduleQuestionAnswerDelivery itself deduplicates.
+	const pageRead = (maxRows = 1) => sessionReadOptions({ signal: options.signal }, maxRows);
+	const narratorEnd = (
+		await readQueryFirst(
+			db.select({ cursor: narratorRowid }).from(narrators).orderBy(desc(narratorRowid)).limit(1),
+			pageRead(),
+		)
+	)?.cursor;
+	const questionEnd = (
+		await readQueryFirst(
+			db
+				.select({ cursor: questionRowid })
+				.from(narratorQuestions)
+				.orderBy(desc(questionRowid))
+				.limit(1),
+			pageRead(),
+		)
+	)?.cursor;
 	if (!narratorEnd || !questionEnd) return 0;
 	let cursor = 0;
 	let scheduled = 0;
@@ -5621,19 +5691,21 @@ export async function recoverPendingQuestionAnswerDeliveries(
 	// page is small and yields before continuing, including a single busy narrator.
 	while (cursor < narratorEnd) {
 		options.signal?.throwIfAborted();
-		const recipients = db
-			.select({
-				cursor: narratorRowid,
-				id: narrators.id,
-				status: narrators.status,
-				lastStopReason: narrators.lastStopReason,
-				substatus: narrators.substatus,
-			})
-			.from(narrators)
-			.where(and(gt(narratorRowid, cursor), sql`${narratorRowid} <= ${narratorEnd}`))
-			.orderBy(asc(narratorRowid))
-			.limit(32)
-			.all();
+		const recipients = await readQuery(
+			db
+				.select({
+					cursor: narratorRowid,
+					id: narrators.id,
+					status: narrators.status,
+					lastStopReason: narrators.lastStopReason,
+					substatus: narrators.substatus,
+				})
+				.from(narrators)
+				.where(and(gt(narratorRowid, cursor), sql`${narratorRowid} <= ${narratorEnd}`))
+				.orderBy(asc(narratorRowid))
+				.limit(32),
+			pageRead(32),
+		);
 		if (!recipients.length) break;
 		for (const recipient of recipients) {
 			options.signal?.throwIfAborted();
@@ -5643,25 +5715,27 @@ export async function recoverPendingQuestionAnswerDeliveries(
 				options.signal?.throwIfAborted();
 				// idx_narrator_questions_narrator_status also carries SQLite rowid,
 				// so equality on its two columns supports ordered cursor pagination.
-				const pending = db
-					.select({
-						cursor: questionRowid,
-						id: narratorQuestions.id,
-						messageId: narratorQuestions.answerMessageId,
-					})
-					.from(narratorQuestions)
-					.where(
-						and(
-							eq(narratorQuestions.narratorId, recipient.id),
-							eq(narratorQuestions.status, "answered"),
-							isNull(narratorQuestions.resolutionJson),
-							gt(questionRowid, answerCursor),
-							sql`${questionRowid} <= ${questionEnd}`,
-						),
-					)
-					.orderBy(asc(questionRowid))
-					.limit(32)
-					.all();
+				const pending = await readQuery(
+					db
+						.select({
+							cursor: questionRowid,
+							id: narratorQuestions.id,
+							messageId: narratorQuestions.answerMessageId,
+						})
+						.from(narratorQuestions)
+						.where(
+							and(
+								eq(narratorQuestions.narratorId, recipient.id),
+								eq(narratorQuestions.status, "answered"),
+								isNull(narratorQuestions.resolutionJson),
+								gt(questionRowid, answerCursor),
+								sql`${questionRowid} <= ${questionEnd}`,
+							),
+						)
+						.orderBy(asc(questionRowid))
+						.limit(32),
+					pageRead(32),
+				);
 				if (!pending.length) break;
 				for (const question of pending) {
 					options.signal?.throwIfAborted();
@@ -5671,17 +5745,19 @@ export async function recoverPendingQuestionAnswerDeliveries(
 						// refs 里、并且后面有一次真正的 assistant 回复，才说明会话继续过。
 						// 没有 ref 时仍交给下面的 schedule：它会抛出并记
 						// "Pending question recovery deferred"，下一次启动再试。
-						const answerRef = db
-							.select({ seq: narratorMessageRefs.seq })
-							.from(narratorMessageRefs)
-							.where(
-								and(
-									eq(narratorMessageRefs.narratorId, recipient.id),
-									eq(narratorMessageRefs.messageId, question.messageId),
-								),
-							)
-							.limit(1)
-							.get();
+						const answerRef = await readQueryFirst(
+							db
+								.select({ seq: narratorMessageRefs.seq })
+								.from(narratorMessageRefs)
+								.where(
+									and(
+										eq(narratorMessageRefs.narratorId, recipient.id),
+										eq(narratorMessageRefs.messageId, question.messageId),
+									),
+								)
+								.limit(1),
+							pageRead(),
+						);
 						if (answerRef && assistantReplyFollowsAnswer(recipient.id, answerRef.seq)) continue;
 						const principal = await getAsyncQuestionExecutionPrincipal(question.id, recipient.id);
 						if (!principal) continue;
@@ -5721,16 +5797,20 @@ export async function getQuestionAnswerFallbackText(
 	const { getBoundedQuestionReceipt } = await import("./narrator-question-service");
 	const text = await getBoundedQuestionReceipt(messageId, narratorId);
 	if (!text) return null;
-	const source = db
-		.select({
-			id: narratorMessages.id,
-			narratorId: narratorMessages.narratorId,
-			createdBy: narratorMessages.createdBy,
-			origin: narratorMessages.origin,
-		})
-		.from(narratorMessages)
-		.where(eq(narratorMessages.id, messageId))
-		.get();
+	// Sender metadata only; the receipt text above is the bounded body.
+	const source = await readQueryFirst(
+		db
+			.select({
+				id: narratorMessages.id,
+				narratorId: narratorMessages.narratorId,
+				createdBy: narratorMessages.createdBy,
+				origin: narratorMessages.origin,
+			})
+			.from(narratorMessages)
+			.where(eq(narratorMessages.id, messageId))
+			.limit(1),
+		sessionReadOptions(),
+	);
 	if (!source) return null;
 	return projectMessageSenderText(
 		{
@@ -5752,25 +5832,28 @@ export async function consumeQuestionAnswerModelReceipts(
 ): Promise<void> {
 	if (getNarratorMessageRefsPort()) return;
 	for (const messageId of eventIds) {
-		const row = db
-			.select({
-				deliveryId: narratorBufferedMessages.deliveryId,
-				recipientRefId: narratorBufferedMessages.recipientRefId,
-				revision: narratorBufferedMessages.contentRevision,
-			})
-			.from(narratorBufferedMessages)
-			.where(
-				and(
-					eq(narratorBufferedMessages.narratorId, narratorId),
-					eq(narratorBufferedMessages.sourceKey, `question-answer:${messageId}`),
-					eq(narratorBufferedMessages.recipientMessageId, messageId),
-					eq(narratorBufferedMessages.state, "materialized"),
-					eq(narratorBufferedMessages.receiptDisposition, "active"),
-					isNull(narratorBufferedMessages.currentAdoptedAt),
-				),
-			)
-			.limit(1)
-			.get();
+		// consumeMailboxDelivery re-checks delivery, ref and revision in its own write.
+		const row = await readQueryFirst(
+			db
+				.select({
+					deliveryId: narratorBufferedMessages.deliveryId,
+					recipientRefId: narratorBufferedMessages.recipientRefId,
+					revision: narratorBufferedMessages.contentRevision,
+				})
+				.from(narratorBufferedMessages)
+				.where(
+					and(
+						eq(narratorBufferedMessages.narratorId, narratorId),
+						eq(narratorBufferedMessages.sourceKey, `question-answer:${messageId}`),
+						eq(narratorBufferedMessages.recipientMessageId, messageId),
+						eq(narratorBufferedMessages.state, "materialized"),
+						eq(narratorBufferedMessages.receiptDisposition, "active"),
+						isNull(narratorBufferedMessages.currentAdoptedAt),
+					),
+				)
+				.limit(1),
+			sessionReadOptions(),
+		);
 		if (row?.deliveryId && row.recipientRefId)
 			await consumeMailboxDelivery({
 				deliveryId: row.deliveryId,
@@ -5799,20 +5882,22 @@ export async function retryDeferredQuestionAnswerDeliveries(
 	const { getAsyncQuestionExecutionPrincipal, getBoundedQuestionReceipt } = await import(
 		"./narrator-question-service"
 	);
-	const pending = db
-		.select({ id: narratorQuestions.id, messageId: narratorQuestions.answerMessageId })
-		.from(narratorQuestions)
-		.where(
-			and(
-				eq(narratorQuestions.narratorId, narratorId),
-				eq(narratorQuestions.status, "answered"),
-				isNull(narratorQuestions.resolutionJson),
-				isNotNull(narratorQuestions.answerMessageId),
-				sql`NOT EXISTS (SELECT 1 FROM ${narratorBufferedMessages} WHERE ${narratorBufferedMessages.narratorId} = ${narratorQuestions.narratorId} AND ${narratorBufferedMessages.recipientMessageId} = ${narratorQuestions.answerMessageId})`,
-			),
-		)
-		.limit(16)
-		.all();
+	const pending = await readQuery(
+		db
+			.select({ id: narratorQuestions.id, messageId: narratorQuestions.answerMessageId })
+			.from(narratorQuestions)
+			.where(
+				and(
+					eq(narratorQuestions.narratorId, narratorId),
+					eq(narratorQuestions.status, "answered"),
+					isNull(narratorQuestions.resolutionJson),
+					isNotNull(narratorQuestions.answerMessageId),
+					sql`NOT EXISTS (SELECT 1 FROM ${narratorBufferedMessages} WHERE ${narratorBufferedMessages.narratorId} = ${narratorQuestions.narratorId} AND ${narratorBufferedMessages.recipientMessageId} = ${narratorQuestions.answerMessageId})`,
+				),
+			)
+			.limit(16),
+		sessionReadOptions(undefined, 16),
+	);
 	let accepted = 0;
 	for (const question of pending) {
 		if (!question.messageId) continue;
@@ -5999,11 +6084,16 @@ export async function startInjectionContinuationIfPossible(
 		if (active._loopRunning || getExecutionOwner(narratorId)) return { started: false };
 		if (
 			executionPrincipal &&
-			db
-				.select({ reason: narrators.lastStopReason })
-				.from(narrators)
-				.where(eq(narrators.id, narratorId))
-				.get()?.reason !== "normal"
+			(
+				await readQueryFirst(
+					db
+						.select({ reason: narrators.lastStopReason })
+						.from(narrators)
+						.where(eq(narrators.id, narratorId))
+						.limit(1),
+					sessionReadOptions(),
+				)
+			)?.reason !== "normal"
 		)
 			return { started: false };
 
@@ -9005,140 +9095,151 @@ async function finalizeOrCleanupPartialMessageUnlocked(
 	narratorId: string,
 ): Promise<boolean> {
 	try {
-		const toolCalls = await db.query.narratorToolCalls.findMany({
-			where: eq(narratorToolCalls.messageId, partialId),
-			columns: { id: true, toolUseId: true, status: true },
-		});
-
 		// Statuses that indicate the tool was actually executed (side effects occurred)
 		const executedStatuses = new Set(["success", "fail", "running"]);
-		const executed = toolCalls.filter((tc) => executedStatuses.has(tc.status));
+		// The tool ledger is read inside the same transaction that rewrites it: deleting
+		// "unexecuted" calls must never act on a status that changed after it was observed.
+		const outcome = db.transaction(
+			(
+				tx,
+			):
+				| { kind: "empty" }
+				| { kind: "content"; blockCount: number; removedToolCalls: number }
+				| { kind: "executed"; executedCount: number; removedCount: number } => {
+				const toolCalls = tx
+					.select({
+						id: narratorToolCalls.id,
+						toolUseId: narratorToolCalls.toolUseId,
+						status: narratorToolCalls.status,
+					})
+					.from(narratorToolCalls)
+					.where(eq(narratorToolCalls.messageId, partialId))
+					.all();
+				const executed = toolCalls.filter((tc) => executedStatuses.has(tc.status));
 
-		if (executed.length === 0) {
-			// No tool was actually executed — but check if the message has
-			// meaningful text/reasoning content that should be preserved
-			// (e.g. user interrupted while the model was streaming a long text block).
-			const hasContent = db.transaction((tx) => {
-				const msg = fillBody(
-					tx.query.narratorMessages
-						.findFirst({
-							where: eq(narratorMessages.id, partialId),
-							...bodyColumns({ id: true, contentJson: true }),
+				if (executed.length === 0) {
+					// No tool was actually executed — but check if the message has
+					// meaningful text/reasoning content that should be preserved
+					// (e.g. user interrupted while the model was streaming a long text block).
+					const msg = fillBody(
+						tx.query.narratorMessages
+							.findFirst({
+								where: eq(narratorMessages.id, partialId),
+								...bodyColumns({ id: true, contentJson: true }),
+							})
+							.sync(),
+					);
+					const blocks = Array.isArray(msg?.contentJson)
+						? (msg.contentJson as Array<Record<string, unknown>>)
+						: [];
+					const meaningful = blocks.some(
+						(b) =>
+							(b.type === "text" && typeof b.text === "string" && b.text.length > 0) ||
+							(b.type === "reasoning" && typeof b.text === "string" && b.text.length > 0),
+					);
+
+					if (!meaningful) return { kind: "empty" };
+
+					// Has streamed content worth keeping — remove any unexecuted tool_call
+					// records and their corresponding tool_use blocks from contentJson,
+					// but preserve the message itself.
+					// Note: since executed.length === 0, toolCalls here are all unexecuted.
+					if (toolCalls.length > 0) {
+						const toolUseIds = new Set(toolCalls.map((tc) => tc.toolUseId));
+						const filtered = blocks.filter(
+							(block) => block.type !== "tool_use" || !toolUseIds.has(block.id as string),
+						);
+						writeEnvelopeBody(tx, partialId, filtered, {
+							set: { contextCharsJson: measureMessageCharacters("assistant", filtered) },
+							rows: () =>
+								tx
+									.delete(narratorToolCalls)
+									.where(
+										inArray(
+											narratorToolCalls.id,
+											toolCalls.map((tc) => tc.id),
+										),
+									)
+									.run(),
+						});
+					}
+					return { kind: "content", blockCount: blocks.length, removedToolCalls: toolCalls.length };
+				}
+
+				// Some tools were executed — keep the message, clean up the rest
+				const unexecuted = toolCalls.filter((tc) => !executedStatuses.has(tc.status));
+				const unexecutedToolUseIds = new Set(unexecuted.map((tc) => tc.toolUseId));
+				// The body is read before the ledger writes, which queue the envelope for a sync.
+				const body = unexecutedToolUseIds.size > 0 ? readEnvelopeBody(tx, partialId) : undefined;
+				// Delete unexecuted tool_call records
+				if (unexecuted.length > 0) {
+					tx.delete(narratorToolCalls)
+						.where(
+							inArray(
+								narratorToolCalls.id,
+								unexecuted.map((tc) => tc.id),
+							),
+						)
+						.run();
+				}
+
+				// Mark running tool_calls as fail (interrupted by retry)
+				const running = executed.filter((tc) => tc.status === "running");
+				if (running.length > 0) {
+					tx.update(narratorToolCalls)
+						.set({
+							status: "fail",
+							errorMessage: "Interrupted by API error during retry",
 						})
-						.sync(),
-				);
-				const blocks = Array.isArray(msg?.contentJson)
-					? (msg.contentJson as Array<Record<string, unknown>>)
-					: [];
-				const meaningful = blocks.some(
-					(b) =>
-						(b.type === "text" && typeof b.text === "string" && b.text.length > 0) ||
-						(b.type === "reasoning" && typeof b.text === "string" && b.text.length > 0),
-				);
+						.where(
+							inArray(
+								narratorToolCalls.id,
+								running.map((tc) => tc.id),
+							),
+						)
+						.run();
+				}
 
-				if (!meaningful) return false;
-
-				// Has streamed content worth keeping — remove any unexecuted tool_call
-				// records and their corresponding tool_use blocks from contentJson,
-				// but preserve the message itself.
-				// Note: since executed.length === 0, toolCalls here are all unexecuted.
-				if (toolCalls.length > 0) {
-					const toolUseIds = new Set(toolCalls.map((tc) => tc.toolUseId));
-					const filtered = blocks.filter(
-						(block) => block.type !== "tool_use" || !toolUseIds.has(block.id as string),
+				// Remove unexecuted tool_use blocks from the body
+				if (Array.isArray(body)) {
+					const filtered = (body as Array<Record<string, unknown>>).filter(
+						(block) => block.type !== "tool_use" || !unexecutedToolUseIds.has(block.id as string),
 					);
 					writeEnvelopeBody(tx, partialId, filtered, {
 						set: { contextCharsJson: measureMessageCharacters("assistant", filtered) },
-						rows: () =>
-							tx
-								.delete(narratorToolCalls)
-								.where(
-									inArray(
-										narratorToolCalls.id,
-										toolCalls.map((tc) => tc.id),
-									),
-								)
-								.run(),
 					});
 				}
+				return {
+					kind: "executed",
+					executedCount: executed.length,
+					removedCount: unexecuted.length,
+				};
+			},
+		);
 
-				logger.info("Preserved partial message with streamed content (no tool execution)", {
-					narratorId,
-					partialId,
-					blockCount: blocks.length,
-					removedToolCalls: toolCalls.length,
-				});
-				return true;
-			});
-
-			if (hasContent) {
-				// The kept partial is a finished step whose incomplete items were interrupted.
-				narratorStore.sealStep(partialId);
-				queueContextCharacterRefresh(narratorId, partialId);
-			}
-			if (!hasContent) {
-				// Truly empty — safe to delete
-				await cleanupPartialMessage(partialId, narratorId);
-				return false;
-			}
-			return true;
+		if (outcome.kind === "empty") {
+			// Truly empty — safe to delete
+			await cleanupPartialMessage(partialId, narratorId);
+			return false;
 		}
-
-		// Some tools were executed — keep the message, clean up the rest
-		const unexecuted = toolCalls.filter((tc) => !executedStatuses.has(tc.status));
-		const unexecutedToolUseIds = new Set(unexecuted.map((tc) => tc.toolUseId));
-
-		db.transaction((tx) => {
-			// The body is read before the ledger writes, which queue the envelope for a sync.
-			const body = unexecutedToolUseIds.size > 0 ? readEnvelopeBody(tx, partialId) : undefined;
-			// Delete unexecuted tool_call records
-			if (unexecuted.length > 0) {
-				tx.delete(narratorToolCalls)
-					.where(
-						inArray(
-							narratorToolCalls.id,
-							unexecuted.map((tc) => tc.id),
-						),
-					)
-					.run();
-			}
-
-			// Mark running tool_calls as fail (interrupted by retry)
-			const running = executed.filter((tc) => tc.status === "running");
-			if (running.length > 0) {
-				tx.update(narratorToolCalls)
-					.set({
-						status: "fail",
-						errorMessage: "Interrupted by API error during retry",
-					})
-					.where(
-						inArray(
-							narratorToolCalls.id,
-							running.map((tc) => tc.id),
-						),
-					)
-					.run();
-			}
-
-			// Remove unexecuted tool_use blocks from the body
-			if (Array.isArray(body)) {
-				const filtered = (body as Array<Record<string, unknown>>).filter(
-					(block) => block.type !== "tool_use" || !unexecutedToolUseIds.has(block.id as string),
-				);
-				writeEnvelopeBody(tx, partialId, filtered, {
-					set: { contextCharsJson: measureMessageCharacters("assistant", filtered) },
-				});
-			}
-		});
-
+		// The kept partial is a finished step whose incomplete items were interrupted.
 		narratorStore.sealStep(partialId);
 		queueContextCharacterRefresh(narratorId, partialId);
-		logger.info("Finalized partial message with executed tool calls", {
-			narratorId,
-			partialId,
-			executedCount: executed.length,
-			removedCount: unexecuted.length,
-		});
+		if (outcome.kind === "content") {
+			logger.info("Preserved partial message with streamed content (no tool execution)", {
+				narratorId,
+				partialId,
+				blockCount: outcome.blockCount,
+				removedToolCalls: outcome.removedToolCalls,
+			});
+		} else {
+			logger.info("Finalized partial message with executed tool calls", {
+				narratorId,
+				partialId,
+				executedCount: outcome.executedCount,
+				removedCount: outcome.removedCount,
+			});
+		}
 		return true;
 	} catch (err) {
 		logger.warn("Failed to finalize partial message, falling back to cleanup", {
@@ -9356,6 +9457,8 @@ export async function acquireNarratorRevertAdmission(
 ): Promise<() => void> {
 	const { signal, interrupt } = options;
 	signal.throwIfAborted();
+	// Stays an inline indexed point read: it belongs to the admission protocol together
+	// with resolveNarratorAdmissionRoot, whose ordering against reservations is synchronous.
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
 		columns: { id: true, variant: true, parentNarratorId: true },
@@ -9572,10 +9675,15 @@ export async function reconcileRunningStatus(narratorId: string): Promise<boolea
 
 	if (isNarratorRuntimeBusy(narratorId)) return false;
 
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { status: true, substatus: true },
-	});
+	// compareAndSetStatus re-checks the status inside its write.
+	const narrator = await readQueryFirst(
+		db.query.narrators.findMany({
+			where: eq(narrators.id, narratorId),
+			columns: { status: true, substatus: true },
+			limit: 1,
+		}),
+		sessionReadOptions(),
+	);
 	if (narrator?.status !== "working" && narrator?.status !== "waiting") return false;
 
 	const changed = await narratorService.compareAndSetStatus(
@@ -9915,10 +10023,14 @@ export const inheritedModelRuntime = createInheritedModelRuntime({
 	getActive: (id) => activeNarrators.get(id),
 	activeValues: () => activeNarrators.values(),
 	readNarrator: (id) =>
-		db.query.narrators.findFirst({
-			where: eq(narrators.id, id),
-			columns: { ...RUNTIME_SOURCE_COLUMNS, model: true, reasoningEffort: true },
-		}),
+		readQueryFirst(
+			db.query.narrators.findMany({
+				where: eq(narrators.id, id),
+				columns: { ...RUNTIME_SOURCE_COLUMNS, model: true, reasoningEffort: true },
+				limit: 1,
+			}),
+			sessionReadOptions(),
+		),
 	resolve: async (narrator, actingUserId, stickyProvider) => {
 		const settingsRevision = getSettingsRevision();
 		return {
@@ -10094,26 +10206,42 @@ export async function setTemporaryModelRestore(
  * Called once at server startup to recover from unclean shutdowns.
  */
 export async function restorePendingModelOverrides(): Promise<void> {
-	const pending = await db.query.narrators.findMany({
-		where: isNotNull(narrators.pendingModelRestore),
-		columns: { id: true, pendingModelRestore: true },
-	});
-	if (pending.length === 0) return;
-
 	const now = new Date().toISOString();
-	for (const n of pending) {
-		await db
-			.update(narrators)
-			.set({
-				model: n.pendingModelRestore,
-				pendingModelRestore: null,
-				updatedAt: now,
-			})
-			.where(eq(narrators.id, n.id));
-		logger.info("Restored model from pending temporary override on startup", {
-			narratorId: n.id,
-			restoreModel: n.pendingModelRestore,
-		});
+	let cursor = "";
+	for (;;) {
+		const pending = await readQuery(
+			db.query.narrators.findMany({
+				where: and(isNotNull(narrators.pendingModelRestore), gt(narrators.id, cursor)),
+				columns: { id: true, pendingModelRestore: true },
+				orderBy: asc(narrators.id),
+				limit: STARTUP_RECOVERY_PAGE,
+			}),
+			sessionReadOptions(undefined, STARTUP_RECOVERY_PAGE),
+		);
+		for (const n of pending) {
+			// Restore only the override that was observed; a newer one belongs to its own run.
+			const restored = await db
+				.update(narrators)
+				.set({
+					model: n.pendingModelRestore,
+					pendingModelRestore: null,
+					updatedAt: now,
+				})
+				.where(
+					and(
+						eq(narrators.id, n.id),
+						eq(narrators.pendingModelRestore, n.pendingModelRestore as string),
+					),
+				)
+				.returning({ id: narrators.id });
+			if (!restored.length) continue;
+			logger.info("Restored model from pending temporary override on startup", {
+				narratorId: n.id,
+				restoreModel: n.pendingModelRestore,
+			});
+		}
+		if (pending.length < STARTUP_RECOVERY_PAGE) break;
+		cursor = pending[pending.length - 1].id;
 	}
 }
 
@@ -10176,11 +10304,11 @@ function abortActiveReflectionSuggestions(
 	return changed ? next : undefined;
 }
 
-function logNarratorIntegrityDiagnostics(): void {
+async function logNarratorIntegrityDiagnostics(): Promise<void> {
 	try {
-		const fullForkEmptyRefs = sqlite
-			.prepare(
-				`SELECT n.id, n.parent_narrator_id AS parentNarratorId,
+		const fullForkEmptyRefs = await readNativeRows(
+			sqlite,
+			`SELECT n.id, n.parent_narrator_id AS parentNarratorId,
 					(SELECT count(*) FROM narrator_message_refs pr WHERE pr.narrator_id = n.parent_narrator_id) AS parentRefCount
 				 FROM narrators n
 				 WHERE n.inherit_mode = 'full'
@@ -10188,8 +10316,9 @@ function logNarratorIntegrityDiagnostics(): void {
 				   AND NOT EXISTS (SELECT 1 FROM narrator_message_refs r WHERE r.narrator_id = n.id)
 				   AND EXISTS (SELECT 1 FROM narrator_message_refs pr WHERE pr.narrator_id = n.parent_narrator_id)
 				 LIMIT 20`,
-			)
-			.all();
+			[],
+			sessionReadOptions(undefined, 20),
+		);
 		if (fullForkEmptyRefs.length > 0) {
 			logger.warn("Narrator integrity diagnostic: full forks with empty local refs", {
 				count: fullForkEmptyRefs.length,
@@ -10197,9 +10326,9 @@ function logNarratorIntegrityDiagnostics(): void {
 			});
 		}
 
-		const missingForkRefs = sqlite
-			.prepare(
-				`SELECT n.id, n.parent_narrator_id AS parentNarratorId, n.fork_message_id AS forkMessageId, n.inherit_mode AS inheritMode
+		const missingForkRefs = await readNativeRows(
+			sqlite,
+			`SELECT n.id, n.parent_narrator_id AS parentNarratorId, n.fork_message_id AS forkMessageId, n.inherit_mode AS inheritMode
 				 FROM narrators n
 				 WHERE n.fork_message_id IS NOT NULL
 				   AND n.parent_narrator_id IS NOT NULL
@@ -10209,8 +10338,9 @@ function logNarratorIntegrityDiagnostics(): void {
 				       AND r.message_id = n.fork_message_id
 				   )
 				 LIMIT 20`,
-			)
-			.all();
+			[],
+			sessionReadOptions(undefined, 20),
+		);
 		if (missingForkRefs.length > 0) {
 			logger.warn("Narrator integrity diagnostic: fork messages missing from parent refs", {
 				count: missingForkRefs.length,
@@ -10234,7 +10364,7 @@ export async function recoverPermissionRuleRequestAuditsOnStartup(): Promise<voi
 	const { recoverPermissionRuleRequests } = await import("./permission-rule-request-service");
 	let after: string | undefined;
 	do {
-		const page = recoverPermissionRuleRequests({
+		const page = await recoverPermissionRuleRequests({
 			after,
 			limit: 100,
 			reason: "Interrupted by server restart",
@@ -10242,6 +10372,113 @@ export async function recoverPermissionRuleRequestAuditsOnStartup(): Promise<voi
 		after = page.nextCursor;
 		if (after) await new Promise<void>((resolve) => setTimeout(resolve, 0));
 	} while (after);
+}
+
+const STARTUP_RECOVERY_PAGE = 128;
+
+/**
+ * Fail tool calls a previous process left pending/running/initializing. Each page is a
+ * Worker read; each row is rewritten only if its status and attempt still match.
+ */
+export async function recoverStaleToolCallsOnStartup(
+	protection: NarratorStartupProtectionSets,
+	now: string,
+): Promise<void> {
+	const restartMessage = "Interrupted by server restart";
+	for (const status of ["pending", "running", "initializing"] as const) {
+		let cursor = "";
+		let count = 0;
+		let staleReflectionCount = 0;
+		for (;;) {
+			const rows = await readQuery(
+				db
+					.select({
+						id: narratorToolCalls.id,
+						narratorId: narratorToolCalls.narratorId,
+						messageId: narratorToolCalls.messageId,
+						attempt: narratorToolCalls.executionAttempt,
+					})
+					.from(narratorToolCalls)
+					.where(and(eq(narratorToolCalls.status, status), gt(narratorToolCalls.id, cursor)))
+					.orderBy(asc(narratorToolCalls.id))
+					.limit(STARTUP_RECOVERY_PAGE),
+				sessionReadOptions(undefined, STARTUP_RECOVERY_PAGE),
+			);
+			for (const row of rows) {
+				if (protection.toolCallIds?.has(row.id)) continue;
+				const changed = db.transaction((tx) => {
+					// Revalidate status/attempt, and read reflection state, in the final write.
+					const current = tx
+						.select({
+							status: narratorToolCalls.status,
+							attempt: narratorToolCalls.executionAttempt,
+							permissionSuggestions: narratorToolCalls.permissionSuggestions,
+						})
+						.from(narratorToolCalls)
+						.where(eq(narratorToolCalls.id, row.id))
+						.get();
+					if (!current || current.status !== status || current.attempt !== row.attempt)
+						return false;
+					const aborted =
+						status === "pending"
+							? abortActiveReflectionSuggestions(current.permissionSuggestions, restartMessage, now)
+							: undefined;
+					const fields =
+						status === "pending"
+							? {
+									status: "fail" as const,
+									errorMessage: restartMessage,
+									permissionDecidedBy: "server_restart",
+									permissionDecidedAt: now,
+									...(aborted
+										? { permissionDecisionReason: restartMessage, permissionSuggestions: aborted }
+										: {}),
+								}
+							: {
+									status: "fail" as const,
+									errorMessage: restartMessage,
+									outputJson: getToolMessage("interruptedByServerRestart"),
+									outputChars: measureSerializedCharacters(
+										getToolMessage("interruptedByServerRestart"),
+									),
+								};
+					const applied =
+						tx
+							.update(narratorToolCalls)
+							.set(fields)
+							.where(
+								and(
+									eq(narratorToolCalls.id, row.id),
+									eq(narratorToolCalls.status, status),
+									eq(narratorToolCalls.executionAttempt, row.attempt),
+								),
+							)
+							.returning({ id: narratorToolCalls.id })
+							.all().length > 0;
+					if (applied && aborted) staleReflectionCount++;
+					return applied;
+				});
+				if (!changed) continue;
+				count++;
+				if (status !== "pending") queueContextCharacterRefresh(row.narratorId, row.messageId);
+			}
+			if (rows.length < STARTUP_RECOVERY_PAGE) break;
+			cursor = rows[rows.length - 1].id;
+		}
+		if (count === 0) continue;
+		if (status === "pending")
+			logger.info("Stale pending tool calls auto-denied on startup", {
+				count,
+				staleReflectionCount,
+			});
+		else
+			logger.info(
+				status === "running"
+					? "Stale running tool calls marked as failed on startup"
+					: "Stale initializing tool calls marked as failed on startup",
+				{ count },
+			);
+	}
 }
 
 export async function recoverOnStartup(
@@ -10280,23 +10517,43 @@ export async function recoverOnStartup(
 	}
 
 	// Legacy plan permission mode migration: plan is now a narrator trait.
-	const legacyPlanRows = sqlite
-		.prepare(
-			"SELECT id, traits, previous_permission_mode FROM narrators WHERE permission_mode = 'plan'",
-		)
-		.all() as Array<{ id: string; traits: string | null; previous_permission_mode: string | null }>;
-	for (const row of legacyPlanRows) {
-		const traits = addTrait(parseTraits(row.traits), "plan");
-		const permissionMode = normalizeLegacyPlanPreviousPermissionMode(row.previous_permission_mode);
-		sqlite
-			.prepare(
-				"UPDATE narrators SET permission_mode = ?, traits = ?, plan_mode = 1, previous_permission_mode = ?, plan_file_id = ?, updated_at = ? WHERE id = ?",
-			)
-			.run(permissionMode, JSON.stringify(traits), permissionMode, generateWordSlug(), now, row.id);
+	let legacyPlanCursor = "";
+	let legacyPlanCount = 0;
+	const legacyPlanUpdate = sqlite.prepare(
+		"UPDATE narrators SET permission_mode = ?, traits = ?, plan_mode = 1, previous_permission_mode = ?, plan_file_id = ?, updated_at = ? WHERE id = ? AND permission_mode = 'plan' AND traits IS ? AND previous_permission_mode IS ?",
+	);
+	for (;;) {
+		const rows = await readNativeRows<{
+			id: string;
+			traits: string | null;
+			previous_permission_mode: string | null;
+		}>(
+			sqlite,
+			`SELECT id, traits, previous_permission_mode FROM narrators WHERE permission_mode = 'plan' AND id > ? ORDER BY id LIMIT ${STARTUP_RECOVERY_PAGE}`,
+			[legacyPlanCursor],
+			sessionReadOptions(undefined, STARTUP_RECOVERY_PAGE),
+		);
+		for (const row of rows) {
+			const traits = addTrait(parseTraits(row.traits), "plan");
+			const mode = normalizeLegacyPlanPreviousPermissionMode(row.previous_permission_mode);
+			// The observed traits/previous mode are part of the write's predicate.
+			legacyPlanCount += legacyPlanUpdate.run(
+				mode,
+				JSON.stringify(traits),
+				mode,
+				generateWordSlug(),
+				now,
+				row.id,
+				row.traits,
+				row.previous_permission_mode,
+			).changes;
+		}
+		if (rows.length < STARTUP_RECOVERY_PAGE) break;
+		legacyPlanCursor = rows[rows.length - 1].id;
 	}
-	if (legacyPlanRows.length > 0) {
+	if (legacyPlanCount > 0) {
 		logger.info("Legacy plan permission mode migrated to narrator trait", {
-			count: legacyPlanRows.length,
+			count: legacyPlanCount,
 		});
 	}
 
@@ -10318,31 +10575,48 @@ export async function recoverOnStartup(
 	// Active narrators interrupted by an ordinary restart are marked interrupted. Narrators
 	// covered by the planned-update manifest stay active until their continuations reattach.
 	for (const activeStatus of ["working", "waiting"] as const) {
-		const activeRows = await db.query.narrators.findMany({
-			where: eq(narrators.status, activeStatus),
-			columns: { id: true },
-		});
-		const interruptedIds = activeRows
-			.map((row) => row.id)
-			.filter((id) => !protection.narratorIds?.has(id));
-		const heldIds = interruptedIds.filter((id) => held.has(id));
-		const plainIds = interruptedIds.filter((id) => !held.has(id));
-		if (heldIds.length > 0)
-			await db
-				.update(narrators)
-				.set({ status: "idle", substatus: '["interrupted","taken_over"]', updatedAt: now })
-				.where(inArray(narrators.id, heldIds));
-		if (interruptedIds.length > 0) {
+		let activeCursor = "";
+		let migrated = 0;
+		for (;;) {
+			const activeRows = await readQuery(
+				db.query.narrators.findMany({
+					where: and(eq(narrators.status, activeStatus), gt(narrators.id, activeCursor)),
+					columns: { id: true },
+					orderBy: asc(narrators.id),
+					limit: STARTUP_RECOVERY_PAGE,
+				}),
+				sessionReadOptions(undefined, STARTUP_RECOVERY_PAGE),
+			);
+			const interruptedIds = activeRows
+				.map((row) => row.id)
+				.filter((id) => !protection.narratorIds?.has(id));
+			const heldIds = interruptedIds.filter((id) => held.has(id));
+			const plainIds = interruptedIds.filter((id) => !held.has(id));
+			// The status predicate keeps a row that already moved on untouched.
+			const changedIds: string[] = [];
+			if (heldIds.length > 0)
+				for (const row of await db
+					.update(narrators)
+					.set({ status: "idle", substatus: '["interrupted","taken_over"]', updatedAt: now })
+					.where(and(inArray(narrators.id, heldIds), eq(narrators.status, activeStatus)))
+					.returning({ id: narrators.id }))
+					changedIds.push(row.id);
 			if (plainIds.length > 0)
-				await db
+				for (const row of await db
 					.update(narrators)
 					.set({ status: "idle", substatus: '["interrupted"]', updatedAt: now })
-					.where(inArray(narrators.id, plainIds));
-			backgroundOccupancyStore.refreshNarrators(interruptedIds);
-			logger.info(`Narrator status migrated: ${activeStatus} → idle [interrupted]`, {
-				count: interruptedIds.length,
-			});
+					.where(and(inArray(narrators.id, plainIds), eq(narrators.status, activeStatus)))
+					.returning({ id: narrators.id }))
+					changedIds.push(row.id);
+			if (changedIds.length > 0) backgroundOccupancyStore.refreshNarrators(changedIds);
+			migrated += changedIds.length;
+			if (activeRows.length < STARTUP_RECOVERY_PAGE) break;
+			activeCursor = activeRows[activeRows.length - 1].id;
 		}
+		if (migrated > 0)
+			logger.info(`Narrator status migrated: ${activeStatus} → idle [interrupted]`, {
+				count: migrated,
+			});
 	}
 	await backgroundTaskService.recoverStaleTasksAfterRestart(protection.backgroundTaskIds);
 	// After adoption: anything left in the service directory belongs to no running row.
@@ -10357,22 +10631,31 @@ export async function recoverOnStartup(
 	// loop; a swallowed clear (DB lock) or a status-drift CAS no-op could otherwise
 	// pin the sidebar tab icon purple across restarts. The interrupt migration above
 	// already reset working/waiting narrators, so only idle/archived rows remain.
-	const staleTransientRows = sqlite
-		.prepare(
-			"SELECT id, substatus FROM narrators WHERE substatus LIKE '%reflecting%' OR substatus LIKE '%reasoning%'",
-		)
-		.all() as Array<{ id: string; substatus: string | null }>;
 	let clearedTransient = 0;
+	let transientCursor = "";
 	const clearTransientStmt = sqlite.prepare(
-		"UPDATE narrators SET substatus = ?, updated_at = ? WHERE id = ?",
+		"UPDATE narrators SET substatus = ?, updated_at = ? WHERE id = ? AND substatus IS ?",
 	);
-	for (const row of staleTransientRows) {
-		const tags = parseSubstatus(row.substatus);
-		const kept = tags.filter((t) => t !== "reflecting" && t !== "reasoning");
-		if (kept.length !== tags.length) {
-			clearTransientStmt.run(JSON.stringify(kept), now, row.id);
-			clearedTransient++;
+	for (;;) {
+		const rows = await readNativeRows<{ id: string; substatus: string | null }>(
+			sqlite,
+			`SELECT id, substatus FROM narrators WHERE id > ? AND (substatus LIKE '%reflecting%' OR substatus LIKE '%reasoning%') ORDER BY id LIMIT ${STARTUP_RECOVERY_PAGE}`,
+			[transientCursor],
+			sessionReadOptions(undefined, STARTUP_RECOVERY_PAGE),
+		);
+		for (const row of rows) {
+			const tags = parseSubstatus(row.substatus);
+			const kept = tags.filter((t) => t !== "reflecting" && t !== "reasoning");
+			if (kept.length === tags.length) continue;
+			clearedTransient += clearTransientStmt.run(
+				JSON.stringify(kept),
+				now,
+				row.id,
+				row.substatus,
+			).changes;
 		}
+		if (rows.length < STARTUP_RECOVERY_PAGE) break;
+		transientCursor = rows[rows.length - 1].id;
 	}
 	if (clearedTransient > 0) {
 		logger.info("Cleared stale transient substatus tags on startup", {
@@ -10380,98 +10663,9 @@ export async function recoverOnStartup(
 		});
 	}
 
-	logNarratorIntegrityDiagnostics();
+	await logNarratorIntegrityDiagnostics();
 
-	const stalePermissions = await db.query.narratorToolCalls.findMany({
-		where: eq(narratorToolCalls.status, "pending"),
-	});
-	if (stalePermissions.length > 0) {
-		let staleReflectionCount = 0;
-		const restartMessage = "Interrupted by server restart";
-		for (const toolCall of stalePermissions) {
-			if (protection.toolCallIds?.has(toolCall.id)) continue;
-			const abortedSuggestions = abortActiveReflectionSuggestions(
-				toolCall.permissionSuggestions,
-				restartMessage,
-				now,
-			);
-			if (abortedSuggestions) staleReflectionCount++;
-			await db
-				.update(narratorToolCalls)
-				.set({
-					status: "fail",
-					errorMessage: restartMessage,
-					permissionDecidedBy: "server_restart",
-					permissionDecidedAt: now,
-					...(abortedSuggestions
-						? {
-								permissionDecisionReason: restartMessage,
-								permissionSuggestions: abortedSuggestions,
-							}
-						: {}),
-				})
-				.where(eq(narratorToolCalls.id, toolCall.id));
-		}
-		logger.info("Stale pending tool calls auto-denied on startup", {
-			count: stalePermissions.length,
-			staleReflectionCount,
-		});
-	}
-
-	const staleToolCalls = (
-		await db.query.narratorToolCalls.findMany({
-			where: eq(narratorToolCalls.status, "running"),
-		})
-	).filter((toolCall) => !protection.toolCallIds?.has(toolCall.id));
-	if (staleToolCalls.length > 0) {
-		await db
-			.update(narratorToolCalls)
-			.set({
-				status: "fail",
-				errorMessage: "Interrupted by server restart",
-				outputJson: getToolMessage("interruptedByServerRestart"),
-				outputChars: measureSerializedCharacters(getToolMessage("interruptedByServerRestart")),
-			})
-			.where(
-				inArray(
-					narratorToolCalls.id,
-					staleToolCalls.map((toolCall) => toolCall.id),
-				),
-			);
-		for (const call of staleToolCalls)
-			queueContextCharacterRefresh(call.narratorId, call.messageId);
-		logger.info("Stale running tool calls marked as failed on startup", {
-			count: staleToolCalls.length,
-		});
-	}
-
-	// Also recover tool calls stuck in "initializing" (permission check never started)
-	const staleInitializing = (
-		await db.query.narratorToolCalls.findMany({
-			where: eq(narratorToolCalls.status, "initializing"),
-		})
-	).filter((toolCall) => !protection.toolCallIds?.has(toolCall.id));
-	if (staleInitializing.length > 0) {
-		await db
-			.update(narratorToolCalls)
-			.set({
-				status: "fail",
-				errorMessage: "Interrupted by server restart",
-				outputJson: getToolMessage("interruptedByServerRestart"),
-				outputChars: measureSerializedCharacters(getToolMessage("interruptedByServerRestart")),
-			})
-			.where(
-				inArray(
-					narratorToolCalls.id,
-					staleInitializing.map((toolCall) => toolCall.id),
-				),
-			);
-		for (const call of staleInitializing)
-			queueContextCharacterRefresh(call.narratorId, call.messageId);
-		logger.info("Stale initializing tool calls marked as failed on startup", {
-			count: staleInitializing.length,
-		});
-	}
+	await recoverStaleToolCallsOnStartup(protection, now);
 
 	// Preserve modern compact lifecycle records across restarts. Running attempts
 	// become failed audit entries; only legacy placeholders with no attempt/retry
@@ -10488,20 +10682,35 @@ export async function recoverOnStartup(
 			count: interruptedTurns,
 		});
 
-	const transientCompactRows = await db.query.narrators.findMany({
-		columns: { id: true, substatus: true },
-	});
-	for (const row of transientCompactRows) {
-		const current = parseSubstatus(row.substatus);
-		const next = current.filter((tag) => tag !== "compacting" && tag !== "background_compacting");
-		if (next.length !== current.length) {
-			await narratorService.updateSubstatus(row.id, next).catch((err) => {
-				logger.warn("Failed to clear stale compact substatus on startup", {
-					narratorId: row.id,
-					error: String(err),
+	let compactCursor = "";
+	for (;;) {
+		// Only rows that can carry a compact tag; updateSubstatus re-checks under its own lock.
+		const transientCompactRows = await readQuery(
+			db.query.narrators.findMany({
+				where: and(
+					gt(narrators.id, compactCursor),
+					sql`${narrators.substatus} LIKE '%compacting%'`,
+				),
+				columns: { id: true, substatus: true },
+				orderBy: asc(narrators.id),
+				limit: STARTUP_RECOVERY_PAGE,
+			}),
+			sessionReadOptions(undefined, STARTUP_RECOVERY_PAGE),
+		);
+		for (const row of transientCompactRows) {
+			const current = parseSubstatus(row.substatus);
+			const next = current.filter((tag) => tag !== "compacting" && tag !== "background_compacting");
+			if (next.length !== current.length) {
+				await narratorService.updateSubstatus(row.id, next).catch((err) => {
+					logger.warn("Failed to clear stale compact substatus on startup", {
+						narratorId: row.id,
+						error: String(err),
+					});
 				});
-			});
+			}
 		}
+		if (transientCompactRows.length < STARTUP_RECOVERY_PAGE) break;
+		compactCursor = transientCompactRows[transientCompactRows.length - 1].id;
 	}
 
 	// Mailbox rows are authoritative and loaded per narrator on demand. Startup must not
@@ -10564,16 +10773,20 @@ export async function resolveOptionalToolState(
 		return { state: "unknown_tool", globallyEnabled: false };
 	}
 
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: {
-			id: true,
-			enabledTools: true,
-			traits: true,
-			contextProjectId: true,
-			...RUNTIME_SOURCE_COLUMNS,
-		},
-	});
+	const narrator = await readQueryFirst(
+		db.query.narrators.findMany({
+			where: eq(narrators.id, narratorId),
+			columns: {
+				id: true,
+				enabledTools: true,
+				traits: true,
+				contextProjectId: true,
+				...RUNTIME_SOURCE_COLUMNS,
+			},
+			limit: 1,
+		}),
+		sessionReadOptions(),
+	);
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
 
 	// Layered, so the UI reports a project/user-level deny as disabled_by_trait
@@ -10587,10 +10800,14 @@ export async function resolveOptionalToolState(
 	// next turn would contradict.
 	let projectRoutineConfig: RoutineModeConfig | undefined;
 	if (narratorProjectId) {
-		const project = await db.query.projects.findFirst({
-			where: eq(projects.id, narratorProjectId),
-			columns: { chapterSettings: true },
-		});
+		const project = await readQueryFirst(
+			db.query.projects.findMany({
+				where: eq(projects.id, narratorProjectId),
+				columns: { chapterSettings: true },
+				limit: 1,
+			}),
+			sessionReadOptions(),
+		);
 		projectRoutineConfig = parseProjectRoutineConfig(project?.chapterSettings);
 	}
 

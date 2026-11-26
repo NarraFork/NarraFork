@@ -38,7 +38,7 @@ keywords:
   - getToolMessage
   - 服务端文案
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 ---
 
 # 后端通用工具
@@ -46,6 +46,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 `server/lib/` 下几个没有业务归属、被很多服务共用的小模块。它们大多是为了避开一个具体的坑而存在，注释里写了坑是什么，改之前先读。
 
 ## 关键规则
+- `platform-path.ts`：跨平台路径比较。`pathsEqualForOS`/`normalizePathForOS` 按目标 OS 的路径语法比（POSIX 保留反斜杠，Windows 折叠分隔符与大小写）；`caseInsensitiveFileNames(platform)` 说默认文件系统是否不分大小写（win32、darwin），`localPathIdentityKey(path, platform)` 在那些平台上再把键折成小写，Linux 保持区分大小写。平台参数让测试在 Linux 上模拟 Windows/macOS。
 - `AsyncMutex`（`async-mutex.ts`）：按 key 的进程内 FIFO 互斥，`acquire(key, fn)` 排队执行；`tryAcquire(key, fn, timeoutMs)` 超时返回 `{ acquired: false, waitedMs }` 而不是执行，且只在真正拿到锁时才入队，超时放弃不会提前放开排在后面的人。仅限单进程。
 - `PathKeyedMutex`：以目录路径为 key，内部用 `normalizePathForComparison` 规范化；调用方传原始路径，规范化后的值只作 key，绝不当 cwd 传给 git（大小写折叠在区分大小写的文件系统上有破坏性）。`worktreeLock` 是 worktree 写操作唯一的互斥，`git-service` 的写方法拿它，调用它们时不得已持有它；锁顺序只允许 `worktreeLock` → 影子仓库锁，没有运行时断言，只靠评审和 `git-service-worktree-lock.test.ts`。`narratorTraitsLock`、`narratorDraftLock` 也在此导出。
 - `hot-safe.ts`：把状态钉在 `globalThis` 的 `Symbol.for(key)` 上，让 `bun --hot` 重新求值模块时不丢状态也不重复：`hotSafe`（惰性创建持久对象）、`hotTimer`/`hotTimerClear`（替换 interval，先清旧的）、`hotOnce`（`process.on("exit")`、事件总线监听这类只能注册一次的动作）。key 全局共享，同名即同一份。
@@ -55,7 +56,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - `slug.ts:slugify`：NFKD 去变音符，保留 Unicode 字母和数字（CJK 保留），其余折成 `-`，小写，截 30 字符，空则 `entry`。
 - `words.ts:generateWordSlug`：形容词-动名词-名词随机组合（用 `randomBytes` 取随机数），用于计划文件 ID（`narrator-plan-mode.ts`、`narrator-service.ts` 在 plan 模式起会话时、`narrator-session.ts` 切入 plan 权限模式时）。
 - `avatar-colors.ts:randomAvatarColor`：十二色调色板里随机取一，所有账号创建路径（注册、SSO、管理员创建）共用。
-- `i18n.ts`：服务端文案表，key 带命名空间 `tool.*`、`gateway.*`、`sidecar.*`；`t(key, locale, params)` 缺 key 原样返回 key，缺语言回落英文，占位符 `{name}` 逐个替换。`getToolMessage*` 是 `tool.*` 的类型化入口，`getUserLanguage`/`getUserReplyInLanguage` 读 `user_preferences`（懒加载数据库依赖）。这是后端写进对话或网关的文案，不是前端 i18n 命名空间。
+- `i18n.ts`：服务端文案表，key 带命名空间 `tool.*`、`gateway.*`、`sidecar.*`；`t(key, locale, params)` 缺 key 原样返回 key，缺语言回落英文，占位符 `{name}` 逐个替换。`getToolMessage*` 是 `tool.*` 的类型化入口，`getUserLanguage`/`getUserReplyInLanguage` 在读 Worker 上读 `user_preferences`（懒加载数据库依赖，`worker-required`，Worker 不可用时抛错而不回主线程）。这是后端写进对话或网关的文案，不是前端 i18n 命名空间。
 
 ## 从哪读起
 - `server/lib/async-mutex.ts` 末尾的锁层级注释。

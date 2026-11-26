@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, expect, mock, test } from "bun:test";
+import { afterAll, beforeAll, expect, mock, spyOn, test } from "bun:test";
 import { resolveBufferQueueMode } from "@shared/buffer-queue-mode";
 import { asc, eq } from "drizzle-orm";
 import { Hono } from "hono";
@@ -458,14 +458,35 @@ test("receipt timeout retains the urgent payload and staged attachment ownership
 		.from(narratorBufferedMessages)
 		.where(eq(narratorBufferedMessages.id, input.id))
 		.get();
-	expect(
-		await captureWorkerRejection(
-			waitForBufferedMessageDelivery(parent, input.id, {
-				timeoutMs: 60,
-				wake: async () => false,
-			}),
-		),
-	).toMatchObject({ statusCode: 504, code: "BUFFER_DELIVERY_TIMEOUT" });
+	// Expire the delivery deadline only after a real receipt read was admitted.
+	// A 60ms wall-clock race can expire the database admission budget instead on CI.
+	const nativeSetTimeout = globalThis.setTimeout;
+	let expireDelivery: (() => void) | undefined;
+	const timer = spyOn(globalThis, "setTimeout").mockImplementation(((
+		...parameters: Parameters<typeof setTimeout>
+	) => {
+		const [callback, delay, ...args] = parameters;
+		if (!expireDelivery && delay === 60_000 && typeof callback === "function") {
+			expireDelivery = () => callback(...args);
+		}
+		return nativeSetTimeout(...parameters);
+	}) as typeof setTimeout);
+	try {
+		expect(
+			await captureWorkerRejection(
+				waitForBufferedMessageDelivery(parent, input.id, {
+					timeoutMs: 60_000,
+					wake: async () => {
+						expect(expireDelivery).toBeDefined();
+						expireDelivery?.();
+						return false;
+					},
+				}),
+			),
+		).toMatchObject({ statusCode: 504, code: "BUFFER_DELIVERY_TIMEOUT" });
+	} finally {
+		timer.mockRestore();
+	}
 	const after = db
 		.select()
 		.from(narratorBufferedMessages)

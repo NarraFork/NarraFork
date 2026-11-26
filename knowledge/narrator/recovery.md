@@ -3,6 +3,7 @@ id: narrator.recovery
 title: 中断与恢复
 summary: 上下文超长与瞬时错误的重试、半截输出清理、子代理接续。
 anchors:
+  - server/services/narrator-session.ts#recoverStaleToolCallsOnStartup
   - server/services/narrator-recovery.ts
   - server/services/narrator-output-recovery.ts
   - server/services/narrator-subagent-recovery.ts
@@ -50,6 +51,7 @@ verified_at: 4ab684e28
 - 子代理恢复两条路径（`narrator-subagent-recovery.ts` 文件头）：A，最后一个顶层助手回合里含未完成的 `Agent`（前台）或 `Await({type:"agent"})` 调用时，点“继续”重建“父在等子代理”的状态，前台子代理仍为前台，结束后把结果写回原工具调用（`selectRecoverableToolCalls`、`resumeIncompleteAgentWorkForContinue`）；B，叙述者出错时插入一张仅 UI 的恢复卡，列出 A 不覆盖的失败子代理（后台的、更早回合的前台的），用户勾选后恢复，更早回合的前台子代理先转为后台（`persistSubagentRecoveryCard`、`resumeRecoverySubagents`）。
 - 候选筛选刻意宽松：因为三种出错路径留下的工具调用状态不同（成功但输出含 "Subagent error:"、用户中断后 fail、叙述者自身出错留下 initializing/pending/running）；子代理 substatus 含 error / interrupted / timeout 视为未完成。卡片通过 `recovery-offered:` trait 前缀记录已提供过的失败时间，避免重复提示（`buildRecoveryOfferedTrait`）。
 
+- 重启时的陈旧工具行：`narrator-session.ts:recoverStaleToolCallsOnStartup` 按状态（pending / running / initializing）在 Worker 上按 id 分页读取（每页 128，`STARTUP_RECOVERY_PAGE`），逐行在写事务内用状态与 `executionAttempt` 做比较交换后置为 fail（`Interrupted by server restart`；pending 行同时记 `permissionDecidedBy: "server_restart"` 并中止进行中的反思），读取后已被改动的行跳过；受启动保护的工具调用不碰。
 - 废弃的未启动工具行：非终态（initializing / pending / running）且 `execution_started_at` 为空、创建超过 30 分钟（`ABANDONED_TOOL_CALL_TTL_MS`）的 `narrator_tool_calls` 行被置为 fail（`Tool call abandoned: execution never started…`）；本进程里仍有待决权限的行跳过，一次最多处理 5000 行；只在启动后台跑一次（`main.ts` 调 `cleanupAbandonedToolCalls`，`abandoned-tool-cleanup.ts`）。已开始执行的 running 行不碰。
 - “继续”按钮与接口共用判定：末尾一行角色为 `assistant` 或 `sys`（服务端注入）时才允许继续（`shared/continue-tail.ts:tailRoleAllowsContinue`，前端 `NarratorPanel` 与服务端都用它）。
   - 例外：宿主写的、不是任何人回合的行（`continue-tail.ts:isNonTurnHostRow`）——只含团队升级/解散说明的 `sys` 行（`team_upgrade`/`team_disband`，不唤醒，`isNonTurnInjectionRow`），以及重建工具声明的通知（`user` 角色、`tool_loaded` 带 `rebaseline: true`、origin `system`，`requestToolDeclarationRebaseline` 写，`isRebaselineNoticeRow`）。两边用同一个判定：

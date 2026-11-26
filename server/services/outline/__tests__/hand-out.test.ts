@@ -27,6 +27,7 @@ import { generateId } from "../../../lib/id";
 import { settings } from "../../../lib/settings";
 import "../../../lib/agent/tools";
 import { ValidationError } from "../../../lib/errors";
+import { settleWorkerRead } from "../../__tests__/file-worker-database";
 import { invalidateTaskBackend } from "../../task-source";
 import { summarizeSpaceWindow } from "../digest";
 import { stopEditTextWorker } from "../edit-text-runner";
@@ -652,12 +653,16 @@ describe("on the board", () => {
 
 		// The team target on a project task is refused.
 		await expect(
-			changePersonTask({
-				principal: { userId: owner.id, isAdmin: false },
-				blockId: toTeam.handedOut?.copy.id as string,
-				baseVersionSeq: await version(toTeam.handedOut?.copy.id as string),
-				assign: { kind: "team" },
-			}),
+			(
+				await settleWorkerRead(
+					changePersonTask({
+						principal: { userId: owner.id, isAdmin: false },
+						blockId: toTeam.handedOut?.copy.id as string,
+						baseVersionSeq: await version(toTeam.handedOut?.copy.id as string),
+						assign: { kind: "team" },
+					}),
+				)
+			).result(),
 		).rejects.toThrow(/Only a session's task goes to the team/);
 
 		// The board: the owner may hand out, someone else who may write the session may not.
@@ -1015,21 +1020,29 @@ describe("in place when the target can work in the session's space (owner decisi
 		const outsider = await person("outsider");
 		await grant(projectId, outsider.id, "write");
 		await expect(
-			changePersonTask({
-				principal: { userId: cowriter.id, isAdmin: false },
-				blockId: one,
-				baseVersionSeq: await version(one),
-				assign: { kind: "user", username: outsider.username },
-			}),
+			(
+				await settleWorkerRead(
+					changePersonTask({
+						principal: { userId: cowriter.id, isAdmin: false },
+						blockId: one,
+						baseVersionSeq: await version(one),
+						assign: { kind: "user", username: outsider.username },
+					}),
+				)
+			).result(),
 		).rejects.toThrow(/can work on this task/);
 		// 「交给团队」 stays the owner's.
 		await expect(
-			changePersonTask({
-				principal: { userId: cowriter.id, isAdmin: false },
-				blockId: one,
-				baseVersionSeq: await version(one),
-				assign: { kind: "team" },
-			}),
+			(
+				await settleWorkerRead(
+					changePersonTask({
+						principal: { userId: cowriter.id, isAdmin: false },
+						blockId: one,
+						baseVersionSeq: await version(one),
+						assign: { kind: "team" },
+					}),
+				)
+			).result(),
 		).rejects.toThrow(/Only the session's owner/);
 		expect(await copiesOn(projectId)).toHaveLength(0);
 	});
@@ -1224,7 +1237,11 @@ describe("review round 1", () => {
 			{ op: "setTask", block: { id: first.copy.id }, task: { status: "doing" } },
 		]);
 		await expect(
-			handOutTask({ taskId: task.blockId, by: person_(owner), target: { kind: "team" } }),
+			(
+				await settleWorkerRead(
+					handOutTask({ taskId: task.blockId, by: person_(owner), target: { kind: "team" } }),
+				)
+			).result(),
 		).rejects.toThrow(/handed out already/);
 		expect((await outlineStore.getBlock(first.copy.id))?.taskJson?.assignee).toBe(
 			`human:${peer.username}`,
@@ -1238,12 +1255,16 @@ describe("review round 1", () => {
 			throw new OutlineBusyError(sessionSpace.id, 1);
 		}) as unknown as typeof writeOutline;
 		await expect(
-			handOutTask({
-				taskId: task.blockId,
-				by: person_(owner),
-				target: { kind: "team" },
-				writeOriginal: failing,
-			}),
+			(
+				await settleWorkerRead(
+					handOutTask({
+						taskId: task.blockId,
+						by: person_(owner),
+						target: { kind: "team" },
+						writeOriginal: failing,
+					}),
+				)
+			).result(),
 		).rejects.toThrow(/could not be set to wait/);
 		const [stray] = await copiesOn(projectId);
 		await asAgent(sessionSpace, main, owner.id, [
@@ -1365,18 +1386,26 @@ describe("review round 1", () => {
 		]);
 		const anotherId = another.results[0]?.blockId as string;
 		await expect(
-			handOutTask({
-				taskId: anotherId,
-				by: person_(owner),
-				target: { kind: "session", narratorId: spec },
-			}),
+			(
+				await settleWorkerRead(
+					handOutTask({
+						taskId: anotherId,
+						by: person_(owner),
+						target: { kind: "session", narratorId: spec },
+					}),
+				)
+			).result(),
 		).rejects.toThrow(/This session cannot work on this task/);
 		await expect(
-			handOutTask({
-				taskId: anotherId,
-				by: person_(owner),
-				target: { kind: "person", userId: owner.id, username: "bad name!" },
-			}),
+			(
+				await settleWorkerRead(
+					handOutTask({
+						taskId: anotherId,
+						by: person_(owner),
+						target: { kind: "person", userId: owner.id, username: "bad name!" },
+					}),
+				)
+			).result(),
 		).rejects.toThrow(/cannot be named as an assignee/);
 	});
 });
@@ -1389,12 +1418,16 @@ describe("review round 2", () => {
 			throw new OutlineBusyError(sessionSpace.id, 1);
 		}) as unknown as typeof writeOutline;
 		await expect(
-			handOutTask({
-				taskId: task.blockId,
-				by: person_(owner),
-				target: { kind: "team" },
-				writeOriginal: failing,
-			}),
+			(
+				await settleWorkerRead(
+					handOutTask({
+						taskId: task.blockId,
+						by: person_(owner),
+						target: { kind: "team" },
+						writeOriginal: failing,
+					}),
+				)
+			).result(),
 		).rejects.toThrow(/could not be set to wait/);
 		// The session itself retrying for someone else: refused, the copy as it was.
 		const bySession = {
@@ -1403,11 +1436,15 @@ describe("review round 2", () => {
 			principal: { userId: owner.id, isAdmin: false },
 		};
 		await expect(
-			handOutTask({
-				taskId: task.blockId,
-				by: bySession,
-				target: { kind: "person", userId: peer.id, username: peer.username },
-			}),
+			(
+				await settleWorkerRead(
+					handOutTask({
+						taskId: task.blockId,
+						by: bySession,
+						target: { kind: "person", userId: peer.id, username: peer.username },
+					}),
+				)
+			).result(),
 		).rejects.toThrow(/handed out already/);
 		const [stray] = await copiesOn(projectId);
 		expect(stray?.taskJson).toMatchObject({ assignee: null, claimable: true });
@@ -1464,11 +1501,15 @@ describe("review round 2", () => {
 		const open = await session(peer.id, projectId, { title: "Open", visibility: "public" });
 		const task = await sessionTask(sessionSpace, main, owner.id);
 		await expect(
-			handOutTask({
-				taskId: task.blockId,
-				by: person_(owner),
-				target: { kind: "session", narratorId: open },
-			}),
+			(
+				await settleWorkerRead(
+					handOutTask({
+						taskId: task.blockId,
+						by: person_(owner),
+						target: { kind: "session", narratorId: open },
+					}),
+				)
+			).result(),
 		).rejects.toThrow(/This session cannot work on this task/);
 		expect(await copiesOn(projectId)).toHaveLength(0);
 	});

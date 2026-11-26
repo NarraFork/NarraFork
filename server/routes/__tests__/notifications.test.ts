@@ -1,9 +1,17 @@
 import { afterAll, beforeEach, expect, mock, test } from "bun:test";
 import { Hono } from "hono";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { AppError } from "../../lib/errors";
+import {
+	closeRuntimeTestDb,
+	getRuntimeTestDb,
+} from "../../services/__tests__/agent-runtime-test-database";
+// Rejections settle natively before matching: Bun's `.rejects` stalls on a reused read Worker.
+import { captureWorkerRejectionThrower } from "../../services/__tests__/narrator-worker-fixture";
 
-const { db, sqlite } = getTestDb();
+// Reads run on the database Worker, which needs a file-backed WAL database.
+const { db, sqlite, ready } = getRuntimeTestDb();
+await ready;
 const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const { notificationRoutes, NOTIFICATION_READ_BODY_MAX_BYTES, readMarkReadBody } = await import(
@@ -43,10 +51,11 @@ beforeEach(() => {
 		);
 	}
 });
-afterAll(() => {
+afterAll(async () => {
 	mock.restore();
 	mock.module("../../db", () => realDb);
 	cleanDb(sqlite);
+	await closeRuntimeTestDb(sqlite);
 });
 
 function read(body?: string) {
@@ -149,7 +158,7 @@ test("slow request bodies are cancelled within a total budget", async () => {
 		},
 	});
 	const request = new Request("http://localhost/api/notifications/read", { method: "POST", body });
-	await expect(readMarkReadBody(request, 10)).rejects.toThrow("timed out");
+	expect(await captureWorkerRejectionThrower(readMarkReadBody(request, 10))).toThrow("timed out");
 	expect(cancelled).toBe(true);
 	expectUnchanged();
 });
@@ -169,7 +178,7 @@ test("aborting an in-flight body cancels the reader without acknowledging anythi
 	});
 	const reading = readMarkReadBody(request);
 	controller.abort();
-	await expect(reading).rejects.toThrow("aborted");
+	expect(await captureWorkerRejectionThrower(reading)).toThrow("aborted");
 	expect(cancelled).toBe(true);
 	expectUnchanged();
 });

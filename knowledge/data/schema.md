@@ -28,11 +28,11 @@ keywords:
   - db 句柄
   - bun:sqlite
 status: draft
-verified_at: bfb277f05
+verified_at: cbf0722e0
 ---
 # 表结构与 Drizzle
 
-SQLite 表结构的唯一来源是 `server/db/schema.ts`（Drizzle `sqliteTable`，目前约 147 张表）；关系在 `relations.ts`；`db/index.ts` 把两者交给 `drizzle({ client, schema })`，导出 `db`（Drizzle）和 `sqlite`（原生 `bun:sqlite` 句柄）。
+SQLite 表结构的唯一来源是 `server/db/schema.ts`（Drizzle `sqliteTable`，目前 150 张表）；关系在 `relations.ts`；`db/index.ts` 把两者交给 `drizzle({ client, schema })`，导出 `db`（Drizzle）和 `sqlite`（原生 `bun:sqlite` 句柄）。
 
 ## 关键规则
 - 主键是文本：多数表 `id: text("id").primaryKey()`，值来自 `server/lib/id.ts:generateId`（nanoid，默认 21 字符）；`generateShortId` 默认 8 字符。部分关联表用复合主键（`primaryKey({ columns: [...] })`）。
@@ -41,6 +41,7 @@ SQLite 表结构的唯一来源是 `server/db/schema.ts`（Drizzle `sqliteTable`
 - `ensure-columns.ts:ensureColumns` 在迁移后按 schema 补缺失列，兜底迁移历史与实际库分叉的情况。
 - 改 schema 必须同步 `data-portability`（`SNAPSHOT_TABLES` / `copyTable` / `clearData`），见 [数据导入导出](portability.md)。
 - `narrators.title_slug` 存 `slugifyTaskAlias(title)`，`alias_selector` 存持久化的 `subagent-alias:`。两列可空；空字符串表示已检查且没有值。旧行由 `alias-selector-backfill.ts` 在启动时补上。导入时插入和覆盖的行按当前 title 与 traits 重算，其余 NULL 行再补。
+- `narrator_communication_nodes` 单独记录通讯父节点、原始父节点和版本，不改写会话的历史父节点或生命周期控制者；`narrator_communication_peers` 以规范排序的端点对记录一条精确的双向联系，不传递可达性，也不授予 ACL。
 - PG 的 `server/db/postgres-schema.ts` 是由 `scripts/generate-postgres-schema.ts` 从本文件转译出的生成物，文件头写明不可手改；`scripts/check-postgres-schema-parity.ts` 检查两边一致。
 - 迁移文件不手写，流程见 [迁移](migrations.md)。
 - `type-level-claims.probe.ts` 是一份纯类型层面的反例（异步回调能通过 `=> T` / `=> void` 的包装签名），配合 `transaction-atomicity-contract.test.ts` 说明类型系统挡不住事务回调里的 async，该约束靠 `transaction-atomicity-contract.test.ts` 守。

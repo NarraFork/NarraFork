@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { existsSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { COMMUNICATION_LIMITS, type CommunicationCandidates } from "@shared/narrator-communication";
 import puppeteer, { type HTTPRequest, type Page } from "puppeteer-core";
 import { APP_VERSION, GIT_COMMIT } from "../../../server/lib/version";
 import { appVersionsMatch } from "../../lib/version-match";
@@ -32,6 +33,7 @@ function assertClosedPanelContract(requests: Array<{ path: string }>) {
 			pathname === "/api/settings" ||
 			pathname === "/api/model-catalog/auto" ||
 			pathname === "/api/narrators/named" ||
+			/^\/api\/narrators\/[^/]+\/communication\/candidates$/.test(pathname) ||
 			/\/model-catalog\/(card|options)(\/|$)/.test(pathname) ||
 			/\/terminals(\/|$)/.test(pathname) ||
 			/\/git\/worktrees(\/|$)/.test(pathname) ||
@@ -457,27 +459,36 @@ test("real Chromium full SPA cold A → sidebar B → warm A has bounded request
 		expect(menuRequests[0].bytes).toBeLessThanOrEqual(65536);
 		await page.keyboard.press("Escape");
 		const beforeMention = fixture.requests.length;
-		const namedResponse = page.waitForResponse(
-			(response) => new URL(response.url()).pathname === "/api/narrators/named",
+		const candidatePath = `/api/narrators/${fixture.ids[0]}/communication/candidates`;
+		const candidateResponse = page.waitForResponse(
+			(response) =>
+				response.request().method() === "GET" && new URL(response.url()).pathname === candidatePath,
 			{ timeout: 15_000 },
 		);
 		await page.click('[contenteditable="true"]');
 		await page.keyboard.type("@");
-		const named = await namedResponse;
-		expect(named.status()).toBe(200);
-		const suggestions = await named.json();
+		const candidates = await candidateResponse;
+		expect(candidates.status()).toBe(200);
+		const suggestions = (await candidates.json()) as CommunicationCandidates;
 		expect(suggestions.items.length).toBeGreaterThan(0);
-		expect(suggestions.items.length).toBeLessThanOrEqual(20);
+		expect(suggestions.items.length).toBeLessThanOrEqual(COMMUNICATION_LIMITS.searchMaxLimit);
+		expect(suggestions.items.map(({ id, canConnect }) => ({ id, canConnect }))).toEqual([
+			{ id: fixture.ids[1], canConnect: true },
+		]);
 		await page.waitForNetworkIdle({ idleTime: 200 });
-		const namedRequests = fixture.requests
-			.slice(beforeMention)
-			.filter((row) => pathOf(row) === "/api/narrators/named");
-		expect(namedRequests).toHaveLength(1);
-		expect(namedRequests[0].bytes).toBeLessThanOrEqual(48 * 1024);
-		expect(namedRequests[0].path).toContain("view=suggestions");
+		const candidateRequests = fixture.requests.filter((row) =>
+			pathOf(row).endsWith("/communication/candidates"),
+		);
+		expect(candidateRequests).toHaveLength(1);
+		expect(fixture.requests.slice(beforeMention)).toContain(candidateRequests[0]);
+		expect(candidateRequests[0].bytes).toBeLessThanOrEqual(48 * 1024);
+		const searchParams = new URL(candidates.url()).searchParams;
+		expect(searchParams.get("q")).toBe("");
+		expect(searchParams.get("limit")).toBe(String(COMMUNICATION_LIMITS.searchMaxLimit));
+		expect(fixture.requests.filter((row) => pathOf(row) === "/api/narrators/named")).toEqual([]);
 		console.info("switch-budget gesture pages", {
 			options: { rows: optionPage.items.length, bytes: menuRequests[0].bytes },
-			named: { rows: suggestions.items.length, bytes: namedRequests[0].bytes },
+			candidates: { rows: suggestions.items.length, bytes: candidateRequests[0].bytes },
 		});
 		expect(wsConnected).toHaveLength(1);
 		expect(

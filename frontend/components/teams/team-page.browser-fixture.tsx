@@ -13,6 +13,12 @@ import "../../styles/nav-collapsed.css";
 import { AppShell, MantineProvider } from "@mantine/core";
 import { Notifications } from "@mantine/notifications";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import {
+	createBrowserHistory,
+	createRootRoute,
+	createRouter,
+	RouterContextProvider,
+} from "@tanstack/react-router";
 import i18next from "i18next";
 import { useEffect, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -27,7 +33,8 @@ import navZh from "../../locales/zh-CN/nav.json";
 import projectsZh from "../../locales/zh-CN/projects.json";
 import { MobileNavFallback } from "../nav/MobileNavButton";
 import { MobileNavContext } from "../nav/nav-render-context";
-import { ProjectTeamsList } from "./ProjectTeamsList";
+import { ProjectTeamCards } from "../project/ProjectTeamCards";
+import { CreateTeamModal } from "./CreateTeamModal";
 import { TeamPageView } from "./TeamPageView";
 
 const instance = i18next.createInstance();
@@ -51,6 +58,8 @@ let navWidth = 250;
 const opened: string[] = [];
 /** The phone drawer's toggle, as the app shell hands it to the menu buttons. */
 const mobileNav = { opened: false, toggle: () => opened.push("menu") };
+// The team communication drawer uses real browser Back without replacing the fixture page.
+const router = createRouter({ routeTree: createRootRoute(), history: createBrowserHistory() });
 
 function render(): void {
 	if (!root || !queryClient) return;
@@ -71,7 +80,7 @@ function render(): void {
 						</AppShell.Navbar>
 						<MobileNavContext.Provider value={mobileNav}>
 							<AppShell.Main data-testid="page-frame" style={{ height: "100dvh" }}>
-								{mounted}
+								<RouterContextProvider router={router}>{mounted}</RouterContextProvider>
 							</AppShell.Main>
 							<MobileNavFallback />
 						</MobileNavContext.Provider>
@@ -152,16 +161,34 @@ export function openTeam(projectId: string, teamId: string, sidebarWidth = 250):
 }
 
 /** Mount the project page's teams section. */
-export function openProjectTeams(projectId: string, canCreate: boolean): void {
-	mount(
+/** The project page's team cards with its 「新团队」 dialog (R2), as the project page wires them. */
+function ProjectTeamsSection({ projectId, canCreate }: { projectId: string; canCreate: boolean }) {
+	const [creating, setCreating] = useState(false);
+	return (
 		<div style={{ padding: 12 }}>
-			<ProjectTeamsList
+			<ProjectTeamCards
 				projectId={projectId}
 				canCreate={canCreate}
 				onOpenTeam={(id) => opened.push(`team:${id}`)}
+				onCreate={() => setCreating(true)}
 			/>
-		</div>,
+			{creating && (
+				<CreateTeamModal
+					projectId={projectId}
+					opened
+					onClose={() => setCreating(false)}
+					onCreated={(team) => {
+						setCreating(false);
+						opened.push(`team:${team.id}`);
+					}}
+				/>
+			)}
+		</div>
 	);
+}
+
+export function openProjectTeams(projectId: string, canCreate: boolean): void {
+	mount(<ProjectTeamsSection projectId={projectId} canCreate={canCreate} />);
 }
 
 export function setScheme(next: "light" | "dark"): void {
@@ -191,6 +218,23 @@ export function attr(selector: string, name: string): string | null {
 
 export function text(selector: string): string | null {
 	return document.querySelector(selector)?.textContent ?? null;
+}
+
+/** The text of every element the selector matches, in document order. */
+export function texts(selector: string): string[] {
+	return [...document.querySelectorAll(selector)].map((element) => element.textContent ?? "");
+}
+
+/** Whether the first element ends at or above where the second starts. */
+export function above(first: string, second: string): boolean {
+	const a = document.querySelector(first)?.getBoundingClientRect();
+	const b = document.querySelector(second)?.getBoundingClientRect();
+	return !!a && !!b && a.height > 0 && a.bottom <= b.top + 0.5;
+}
+
+/** How tall an element is drawn (0 when missing). */
+export function height(selector: string): number {
+	return document.querySelector(selector)?.getBoundingClientRect().height ?? 0;
 }
 
 /** The value of a text field. */

@@ -106,6 +106,20 @@ async function runContract(driver: Driver, prefix: string): Promise<void> {
 	await ok(event("ev1", null));
 	await ok(event("ev2", "a"));
 
+	// D: dependency edges. No self edge, no duplicate, both ends existing items; deleting either
+	// item (or the team, below) deletes the edge.
+	const edge = (from: string, to: string) =>
+		`INSERT INTO team_work_item_dependencies (item_id, depends_on_item_id, team_id, created_at)
+		VALUES (${q(id(from))}, ${q(id(to))}, ${q(id("lead"))}, ${q(NOW)})`;
+	await ok(edge("c", "a"));
+	await refused(edge("c", "a"));
+	await refused(edge("c", "c"));
+	await refused(edge("c", "missing"));
+	await ok(edge("d", "c"));
+	await ok(`DELETE FROM team_work_items WHERE id = ${q(id("d"))}`);
+	expect(await count("team_work_item_dependencies", `item_id = ${q(id("d"))}`)).toBe(0);
+	expect(await count("team_work_item_dependencies", `item_id = ${q(id("c"))}`)).toBe(1);
+
 	// SET NULL references.
 	await ok(`DELETE FROM narrator_worktree_resources WHERE id = ${q(id("wt"))}`);
 	await ok(`DELETE FROM narrators WHERE id = ${q(id("worker"))}`);
@@ -124,6 +138,7 @@ async function runContract(driver: Driver, prefix: string): Promise<void> {
 	await ok(`DELETE FROM project_teams WHERE narrator_id = ${q(id("lead"))}`);
 	expect(await count("team_work_items", `team_id = ${q(id("lead"))}`)).toBe(0);
 	expect(await count("team_work_events", `team_id = ${q(id("lead"))}`)).toBe(0);
+	expect(await count("team_work_item_dependencies", `team_id = ${q(id("lead"))}`)).toBe(0);
 	await ok(`DELETE FROM narrators WHERE id = ${q(id("lead"))}`);
 	expect(await count("team_work_items", `team_id = ${q(id("lead2"))}`)).toBe(1);
 }

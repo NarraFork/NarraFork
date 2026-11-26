@@ -5,6 +5,7 @@ import {
 	type SubagentModelInheritance,
 } from "@shared/model-inheritance";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
+import { isNugPaymentContext } from "@shared/nug-payment";
 import type { TextDocumentStreamUpdate } from "@shared/pretext-layout/text-document";
 import { coerceProgressSnapshot, type ProgressSnapshot } from "@shared/progress-phase";
 import {
@@ -789,6 +790,7 @@ export interface NarratorWSCallbacks {
 	onMetering?: (unit: string, unitPlural: string, usage: number) => void;
 	onQuotaBalance?: (quotaBalance: string | null, detailedQuotaBalance?: string | null) => void;
 	onPaymentRequired?: (info: {
+		paymentContext?: string;
 		providerId?: string;
 		providerPrefix?: string;
 		balance?: number;
@@ -1049,12 +1051,19 @@ export function useNarratorWS(
 	options?: {
 		kind?: NarratorSubscriptionKind;
 		excludeTypes?: readonly string[];
+		/** Retire old listeners when a session/provider changes within the same narrator. */
+		callbackScope?: string;
 	},
 ) {
-	const callbacksOwnerRef = useRef({ narratorId, generation: 0, callbacks });
-	if (callbacksOwnerRef.current.narratorId !== narratorId) {
+	const callbackScope = options?.callbackScope;
+	const callbacksOwnerRef = useRef({ narratorId, callbackScope, generation: 0, callbacks });
+	if (
+		callbacksOwnerRef.current.narratorId !== narratorId ||
+		callbacksOwnerRef.current.callbackScope !== callbackScope
+	) {
 		callbacksOwnerRef.current = {
 			narratorId,
+			callbackScope,
 			generation: callbacksOwnerRef.current.generation + 1,
 			callbacks,
 		};
@@ -1111,10 +1120,11 @@ export function useNarratorWS(
 				...(options?.excludeTypes ? { excludeTypes: options.excludeTypes } : {}),
 			},
 			(data) => {
-				// A narrator can change during render before React runs the previous effect cleanup.
+				// A narrator/session/provider can change before the previous effect cleanup.
 				// Drop that old listener immediately instead of letting it read the new callbacks.
 				if (
 					callbacksOwnerRef.current.narratorId !== subscribedId ||
+					callbacksOwnerRef.current.callbackScope !== callbackScope ||
 					callbacksOwnerRef.current.generation !== callbackOwner.generation
 				)
 					return;
@@ -1619,6 +1629,9 @@ export function useNarratorWS(
 						// parent page open its own recharge dialog.
 						if (data.isSubagent) break;
 						callbackOwner.callbacks.onPaymentRequired?.({
+							...(isNugPaymentContext(data.paymentContext)
+								? { paymentContext: data.paymentContext }
+								: {}),
 							providerId: data.providerId as string | undefined,
 							providerPrefix: data.providerPrefix as string | undefined,
 							balance: data.balance as number | undefined,
@@ -2057,7 +2070,7 @@ export function useNarratorWS(
 			narratorWSManager.leavePresence(subscribedId, subHandle._id);
 			narratorWSManager.unsubscribe(subHandle);
 		};
-	}, [narratorId, options?.excludeTypes, subscriptionKind]);
+	}, [narratorId, options?.excludeTypes, subscriptionKind, callbackScope]);
 
 	const sendPermissionDecision = useCallback(
 		(

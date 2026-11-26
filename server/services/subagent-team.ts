@@ -284,7 +284,11 @@ export async function deliverTeamMessage(
 	}
 	if (accepted.delivery.state === "cancelled" || accepted.delivery.state === "failed")
 		throw new Error(`Previous delivery is ${accepted.delivery.state}; explicit retry is required`);
-	if (!message.isBroadcast && accepted.delivery.state === "queued")
+	if (
+		accepted.status === "accepted" &&
+		!message.isBroadcast &&
+		accepted.delivery.state === "queued"
+	)
 		void wakeInboxIfEligible(targetId);
 	return message.delivery?.recipientMessageId;
 }

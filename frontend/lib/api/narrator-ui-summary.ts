@@ -1,4 +1,4 @@
-import { getToken, onTokenChange, request } from "./client";
+import { getAuthSnapshot, request, subscribeAuth } from "./client";
 
 export interface NarratorUiSummary {
 	narratorId: string;
@@ -14,13 +14,14 @@ export async function getNarratorUiSummary(
 	narratorId: string,
 	options: { signal?: AbortSignal } = {},
 ): Promise<NarratorUiSummary> {
-	const token = getToken();
+	const { generation } = getAuthSnapshot();
+	const sessionChanged = () => new DOMException("Session changed", "AbortError");
 	const controller = new AbortController();
 	const abort = () => controller.abort(options.signal?.reason);
 	if (options.signal?.aborted) abort();
 	else options.signal?.addEventListener("abort", abort, { once: true });
-	const stop = onTokenChange(() => {
-		if (getToken() !== token) controller.abort(new Error("Session changed"));
+	const stop = subscribeAuth(() => {
+		if (getAuthSnapshot().generation !== generation) controller.abort(sessionChanged());
 	});
 	const timeout = setTimeout(
 		() => controller.abort(new Error("UI summary request timed out")),
@@ -33,7 +34,7 @@ export async function getNarratorUiSummary(
 			{ signal: controller.signal, maxResponseBytes: NARRATOR_UI_SUMMARY_MAX_BYTES },
 		);
 		controller.signal.throwIfAborted();
-		if (getToken() !== token) throw new Error("Session changed");
+		if (getAuthSnapshot().generation !== generation) throw sessionChanged();
 		if (
 			result?.narratorId !== narratorId ||
 			typeof result.canWrite !== "boolean" ||

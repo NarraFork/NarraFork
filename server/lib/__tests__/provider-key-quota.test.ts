@@ -31,7 +31,7 @@ mock.module("../net/outbound-fetch", () => ({
 
 const { getProviderKeyStore } = await import("../provider-keys");
 const { saveSettings, settings } = await import("../settings");
-const { getAllKimiCachedUsages, getKimiKeyUsages, refreshAllKimiUsages, purgeKimiUsageCache } =
+const { getKimiCachedUsage, getKimiKeyUsages, refreshAllKimiUsages, purgeKimiUsageCache } =
 	await import("../kimi-usage-cache");
 const { keyCooldown, resetProviderKeyRuntimeForTests, selectProviderKey } = await import(
 	"../agent/pooled-provider"
@@ -77,11 +77,11 @@ describe("usage per key", () => {
 		const perKey = getKimiKeyUsages();
 		expect(perKey[PROVIDER]?.fiveHour?.used).toBe(100);
 		expect(perKey[second.id]?.fiveHour?.used).toBe(20);
-		expect(getAllKimiCachedUsages()[PROVIDER]?.fiveHour?.used).toBe(100);
+		expect(getKimiCachedUsage(PROVIDER)?.fiveHour?.used).toBe(100);
 
 		// Putting the second key first changes what the provider reports.
 		getProviderKeyStore().reorder(PROVIDER, [second.id]);
-		expect(getAllKimiCachedUsages()[PROVIDER]?.fiveHour?.used).toBe(20);
+		expect(getKimiCachedUsage(PROVIDER)?.fiveHour?.used).toBe(20);
 	});
 
 	test("the pool rests a used-up key until its window resets", async () => {

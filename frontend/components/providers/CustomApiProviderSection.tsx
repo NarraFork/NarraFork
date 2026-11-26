@@ -25,7 +25,7 @@ import {
 	useProviderModelRefreshCapability,
 	useProviderRouteCapability,
 } from "../../hooks/usePlatform";
-import { useProviderBalanceCapability } from "../../hooks/useProviderBalance";
+import { useProviderBalanceCapability } from "../../hooks/useProviderBalanceProbe";
 import { api } from "../../lib/api";
 import type { ModelOption } from "../../lib/constants";
 import { extractPrimaryDomainLabel } from "../../lib/url";
@@ -104,6 +104,8 @@ export function isGeminiProtocol(protocol: CustomApiProtocol): boolean {
 interface CustomApiProviderSectionProps {
 	provider: CustomApiProviderState;
 	onProvidersChange: (updater: ProvidersUpdater) => void;
+	/** The page rebases this immediately persisted field into its discard baseline. */
+	onPersistedKeyChanged?: (apiKey: string) => void;
 	openAIProviderModelsMap: Record<string, ModelOption[]>;
 	anthropicProviderModelsMap: Record<string, ModelOption[]>;
 	geminiProviderModelsMap: Record<string, ModelOption[]>;
@@ -131,6 +133,7 @@ function sanitizePrefix(value: string): string {
 export const CustomApiProviderSection = React.memo(function CustomApiProviderSection({
 	provider,
 	onProvidersChange,
+	onPersistedKeyChanged,
 	openAIProviderModelsMap,
 	anthropicProviderModelsMap,
 	geminiProviderModelsMap,
@@ -458,7 +461,11 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 					autoComplete="off"
 					onChange={(e) => updateProvider("apiKey", e.currentTarget.value)}
 				/>
-				<ProviderKeysPanel providerId={provider.id} />
+				<ProviderKeysPanel
+					key={provider.id}
+					providerId={provider.id}
+					onFirstKeyChanged={onPersistedKeyChanged}
+				/>
 				<TextInput
 					label={t("customApiBaseUrl")}
 					placeholder={t("customApiBaseUrlPlaceholder")}

@@ -2,6 +2,7 @@ import { existsSync, rmSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { ResolveProjectDirectoryResponse } from "@shared/project-directory";
+import type { ProjectListSummaryResponse } from "@shared/project-overview";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { type SSEStreamingApi, streamSSE } from "hono/streaming";
@@ -17,6 +18,7 @@ import { projectPrincipalOf, requireProjectAccess } from "../lib/project-access"
 import {
 	createProjectSchema,
 	projectMembersSchema,
+	projectSessionsQuerySchema,
 	projectTransferOwnerSchema,
 	projectVisibilitySchema,
 	resolveProjectDirectorySchema,
@@ -32,12 +34,18 @@ import {
 	scheduleProjectIndexRebuild,
 } from "../services/project-index";
 import {
+	countProjectMembers,
 	getProjectAccess,
 	removeProjectMember,
 	setProjectMembers,
 	setProjectVisibility,
 	transferProjectOwner,
 } from "../services/project-membership";
+import {
+	readProjectAttention,
+	readProjectSessions,
+	readProjectSummaries,
+} from "../services/project-overview";
 import { projectReadAdapter } from "../services/read";
 import { collectAllPages, parseLimitQuery, singlePage } from "../services/read/read-collect";
 import { isGitWorkTree } from "../services/teams/team-git";
@@ -145,6 +153,19 @@ projectRoutes.get("/hidden-existence", async (c) => {
 	// Only meaningful when the caller sees nothing; a non-empty list needs no hint.
 	if (visible.rows.length > 0) return c.json({ hasHidden: false });
 	return c.json({ hasHidden: await adapter.anyProjectExists() });
+});
+
+/**
+ * The project list's card numbers (R2): for the caller's first 200 readable projects (the list's
+ * order), running sessions, teams, what waits for them and the last activity — one bounded read
+ * per kind across all of them, never a request per card (`services/project-overview.ts`). SQLite
+ * only, like the narrator and team surfaces it counts: 503 on PostgreSQL before anything else.
+ */
+projectRoutes.get("/summaries", async (c) => {
+	requireSqliteProjectMutation("Project summaries");
+	c.header("Cache-Control", "no-store");
+	const summaries = await readProjectSummaries(projectPrincipalOf(c), c.req.raw.signal);
+	return c.json({ summaries } satisfies ProjectListSummaryResponse);
 });
 
 /**
@@ -351,6 +372,13 @@ projectRoutes.get("/:id/access", async (c) => {
 	return c.json(await getProjectAccess(id, projectPrincipalOf(c)));
 });
 
+// The header's 「N 位成员」: a count only, for anyone who can read the project (404 otherwise).
+projectRoutes.get("/:id/members/count", async (c) => {
+	const id = c.req.param("id");
+	await requireProjectAccess(c, id, "read");
+	return c.json(await countProjectMembers(id));
+});
+
 projectRoutes.patch("/:id/visibility", async (c) => {
 	requireSqliteProjectMutation("Project visibility changes");
 	const id = c.req.param("id");
@@ -390,6 +418,42 @@ projectRoutes.post("/:id/transfer-owner", async (c) => {
 	return c.json(await transferProjectOwner(id, parsed.data.userId, projectPrincipalOf(c)));
 });
 
+/**
+ * The project page's 「等你处理」 (R2): pending calls across the project's sessions and teams that
+ * the caller may decide, then the ready items of their teams; at most 50 calls and 20 items.
+ * Members (project write) only: a reader gets 403, a stranger 404. SQLite only (503 on PG).
+ */
+projectRoutes.get("/:id/attention", async (c) => {
+	requireSqliteProjectMutation("Project attention");
+	c.header("Cache-Control", "no-store");
+	return c.json(
+		await readProjectAttention(c.req.param("id"), projectPrincipalOf(c), c.req.raw.signal),
+	);
+});
+
+/**
+ * The project page's session list (R2): `view=active|all|mine`, keyset-paged, no coordinators or
+ * subagents, only sessions the caller can read. Readers may list it; others get 404.
+ */
+projectRoutes.get("/:id/sessions", async (c) => {
+	requireSqliteProjectMutation("Project sessions");
+	const parsed = projectSessionsQuerySchema.safeParse({
+		view: c.req.query("view") ?? undefined,
+		cursor: c.req.query("cursor") ?? undefined,
+		limit: c.req.query("limit") ?? undefined,
+	});
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	c.header("Cache-Control", "no-store");
+	return c.json(
+		await readProjectSessions(
+			c.req.param("id"),
+			projectPrincipalOf(c),
+			parsed.data,
+			c.req.raw.signal,
+		),
+	);
+});
+
 projectRoutes.get("/:id", async (c) => {
 	const id = c.req.param("id");
 	// Denial and absence are both NotFoundError, so this cannot be used to discover
@@ -416,37 +480,42 @@ projectRoutes.patch("/:id", async (c) => {
 
 	const now = new Date().toISOString();
 
-	const existingProject = await db.query.projects.findFirst({
-		where: eq(projects.id, id),
-		columns: { chapterSettings: true },
-	});
-	if (!existingProject) throw new NotFoundError("Project", id);
-
-	// Merge chapterSettings with existing values instead of overwriting
-	let mergedSettings: Record<string, unknown> | undefined;
-	if (incomingSettings) {
-		let current: Record<string, unknown> = {};
-		try {
-			current =
-				typeof existingProject.chapterSettings === "string"
-					? JSON.parse(existingProject.chapterSettings)
-					: (existingProject.chapterSettings ?? {});
-		} catch {
-			// corrupted JSON — start fresh
+	const gitPath = rest.gitPath !== undefined ? resolveProjectDirectory(rest.gitPath) : undefined;
+	// Merge chapterSettings with existing values instead of overwriting. The settings are
+	// read in the same transaction as the update, so a concurrent PATCH is never lost.
+	const { updated, mergedSettings } = db.transaction((tx) => {
+		const existingProject = tx
+			.select({ chapterSettings: projects.chapterSettings })
+			.from(projects)
+			.where(eq(projects.id, id))
+			.get();
+		if (!existingProject) throw new NotFoundError("Project", id);
+		let merged: Record<string, unknown> | undefined;
+		if (incomingSettings) {
+			let current: Record<string, unknown> = {};
+			try {
+				current =
+					typeof existingProject.chapterSettings === "string"
+						? JSON.parse(existingProject.chapterSettings)
+						: ((existingProject.chapterSettings as Record<string, unknown> | null) ?? {});
+			} catch {
+				// corrupted JSON — start fresh
+			}
+			merged = { ...current, ...incomingSettings };
 		}
-		mergedSettings = { ...current, ...incomingSettings };
-	}
-
-	const [updated] = await db
-		.update(projects)
-		.set({
-			...rest,
-			...(rest.gitPath !== undefined ? { gitPath: resolveProjectDirectory(rest.gitPath) } : {}),
-			...(mergedSettings !== undefined ? { chapterSettings: mergedSettings } : {}),
-			updatedAt: now,
-		})
-		.where(eq(projects.id, id))
-		.returning();
+		const row = tx
+			.update(projects)
+			.set({
+				...rest,
+				...(gitPath !== undefined ? { gitPath } : {}),
+				...(merged !== undefined ? { chapterSettings: merged } : {}),
+				updatedAt: now,
+			})
+			.where(eq(projects.id, id))
+			.returning()
+			.get();
+		return { updated: row, mergedSettings: merged };
+	});
 	if (!updated) throw new NotFoundError("Project", id);
 	if (mergedSettings !== undefined || rest.gitPath !== undefined) {
 		executionPolicyEngine.invalidateProject(id);

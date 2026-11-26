@@ -7,6 +7,7 @@ import { logger } from "@server/lib/logger";
 import { isPlanModeTrait } from "@server/lib/narrator-utils";
 import { resolveEffectiveRelaxedPlan } from "@server/lib/permission-modes";
 import { and, eq, inArray, sql } from "drizzle-orm";
+import { readQuery } from "../db/worker-read";
 import {
 	judgeNarratorAccessBatch,
 	listNarratorAudience,
@@ -32,31 +33,34 @@ async function findNotificationUser(target: NotificationTarget, credentials: boo
 		throw new Error("Specify exactly one of user_id or username");
 	}
 	if (!(target.user_id ?? target.username)?.trim()) throw new Error("User identifier is required");
-	const [user] = await db
-		.select({
-			user_id: users.id,
-			username: users.username,
-			dingtalkEnabled: userPreferences.notifyDingtalkEnabled,
-			dingtalkConfigured: sql<boolean>`coalesce(length(trim(${userPreferences.notifyDingtalkWebhook})), 0) > 0`,
-			feishuEnabled: userPreferences.notifyFeishuEnabled,
-			feishuConfigured: sql<boolean>`coalesce(length(trim(${userPreferences.notifyFeishuWebhook})), 0) > 0`,
-			...(credentials
-				? {
-						dingtalkWebhook: userPreferences.notifyDingtalkWebhook,
-						dingtalkSecret: userPreferences.notifyDingtalkSecret,
-						feishuWebhook: userPreferences.notifyFeishuWebhook,
-						feishuSecret: userPreferences.notifyFeishuSecret,
-					}
-				: {}),
-		})
-		.from(users)
-		.leftJoin(userPreferences, eq(users.id, userPreferences.userId))
-		.where(
-			target.user_id !== undefined
-				? eq(users.id, target.user_id)
-				: eq(users.username, target.username as string),
-		)
-		.limit(1);
+	const [user] = await readQuery(
+		db
+			.select({
+				user_id: users.id,
+				username: users.username,
+				dingtalkEnabled: userPreferences.notifyDingtalkEnabled,
+				dingtalkConfigured: sql<boolean>`coalesce(length(trim(${userPreferences.notifyDingtalkWebhook})), 0) > 0`,
+				feishuEnabled: userPreferences.notifyFeishuEnabled,
+				feishuConfigured: sql<boolean>`coalesce(length(trim(${userPreferences.notifyFeishuWebhook})), 0) > 0`,
+				...(credentials
+					? {
+							dingtalkWebhook: userPreferences.notifyDingtalkWebhook,
+							dingtalkSecret: userPreferences.notifyDingtalkSecret,
+							feishuWebhook: userPreferences.notifyFeishuWebhook,
+							feishuSecret: userPreferences.notifyFeishuSecret,
+						}
+					: {}),
+			})
+			.from(users)
+			.leftJoin(userPreferences, eq(users.id, userPreferences.userId))
+			.where(
+				target.user_id !== undefined
+					? eq(users.id, target.user_id)
+					: eq(users.username, target.username as string),
+			)
+			.limit(1),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!user) throw new Error("User not found");
 	return user;
 }
@@ -88,15 +92,18 @@ export class NotificationSendForbiddenError extends ForbiddenError {
 async function assertNotificationSendAllowed(narratorId: string): Promise<void> {
 	// Explicit retry approval can bypass permissionHandler. Re-read the live hard
 	// ceiling here instead of trusting the authorization or mode of the first attempt.
-	const [narrator] = await db
-		.select({
-			permissionMode: narrators.permissionMode,
-			traits: narrators.traits,
-			relaxedPlan: narrators.relaxedPlan,
-		})
-		.from(narrators)
-		.where(eq(narrators.id, narratorId))
-		.limit(1);
+	const [narrator] = await readQuery(
+		db
+			.select({
+				permissionMode: narrators.permissionMode,
+				traits: narrators.traits,
+				relaxedPlan: narrators.relaxedPlan,
+			})
+			.from(narrators)
+			.where(eq(narrators.id, narratorId))
+			.limit(1),
+		{ executionPolicy: "worker-required" },
+	);
 	if (
 		!narrator ||
 		narrator.permissionMode === "readOnly" ||
@@ -259,10 +266,13 @@ async function filterUsersWhoCanRead(
 	const audience = await listNarratorAudience(narrator);
 	if (audience.everyone) return candidateUserIds;
 	const allowed = new Set(audience.userIds);
-	const admins = await db
-		.select({ id: users.id })
-		.from(users)
-		.where(and(eq(users.role, "admin"), inArray(users.id, candidateUserIds)));
+	const admins = await readQuery(
+		db
+			.select({ id: users.id })
+			.from(users)
+			.where(and(eq(users.role, "admin"), inArray(users.id, candidateUserIds))),
+		{ executionPolicy: "worker-required" },
+	);
 	for (const admin of admins) allowed.add(admin.id);
 	return candidateUserIds.filter((userId) => allowed.has(userId));
 }
@@ -275,10 +285,13 @@ async function filterUsersWhoCanWrite(
 	if (candidateUserIds.length === 0) return [];
 	const admins = new Set(
 		(
-			await db
-				.select({ id: users.id })
-				.from(users)
-				.where(and(eq(users.role, "admin"), inArray(users.id, candidateUserIds)))
+			await readQuery(
+				db
+					.select({ id: users.id })
+					.from(users)
+					.where(and(eq(users.role, "admin"), inArray(users.id, candidateUserIds))),
+				{ executionPolicy: "worker-required", maxRows: candidateUserIds.length },
+			)
 		).map((admin) => admin.id),
 	);
 	const verdicts = await judgeNarratorAccessBatch(
@@ -298,9 +311,12 @@ export async function handleAttention(narratorId: string, reason: AttentionReaso
 	// surfaced elsewhere (in-app + gateway); keep behavior as before and skip.
 	if (reason === "error") return;
 
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-	});
+	const narrator = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+		}),
+		{ executionPolicy: "worker-required" },
+	);
 	if (!narrator) return;
 
 	const narratorTitle = narrator.title || narratorId;
@@ -352,20 +368,23 @@ export async function handleAttention(narratorId: string, reason: AttentionReaso
 	}> = [];
 	for (let offset = 0; offset < relevantUserIds.length; offset += 500) {
 		notificationPrefs.push(
-			...(await db
-				.select({
-					userId: userPreferences.userId,
-					notifyOnDone: userPreferences.notifyOnDone,
-					notifyOnWaiting: userPreferences.notifyOnWaiting,
-					notifyDingtalkEnabled: userPreferences.notifyDingtalkEnabled,
-					notifyDingtalkWebhook: userPreferences.notifyDingtalkWebhook,
-					notifyDingtalkSecret: userPreferences.notifyDingtalkSecret,
-					notifyFeishuEnabled: userPreferences.notifyFeishuEnabled,
-					notifyFeishuWebhook: userPreferences.notifyFeishuWebhook,
-					notifyFeishuSecret: userPreferences.notifyFeishuSecret,
-				})
-				.from(userPreferences)
-				.where(inArray(userPreferences.userId, relevantUserIds.slice(offset, offset + 500)))),
+			...(await readQuery(
+				db
+					.select({
+						userId: userPreferences.userId,
+						notifyOnDone: userPreferences.notifyOnDone,
+						notifyOnWaiting: userPreferences.notifyOnWaiting,
+						notifyDingtalkEnabled: userPreferences.notifyDingtalkEnabled,
+						notifyDingtalkWebhook: userPreferences.notifyDingtalkWebhook,
+						notifyDingtalkSecret: userPreferences.notifyDingtalkSecret,
+						notifyFeishuEnabled: userPreferences.notifyFeishuEnabled,
+						notifyFeishuWebhook: userPreferences.notifyFeishuWebhook,
+						notifyFeishuSecret: userPreferences.notifyFeishuSecret,
+					})
+					.from(userPreferences)
+					.where(inArray(userPreferences.userId, relevantUserIds.slice(offset, offset + 500))),
+				{ executionPolicy: "worker-required" },
+			)),
 		);
 	}
 

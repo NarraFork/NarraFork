@@ -8,6 +8,7 @@ import {
 	type FileChangeState,
 	fileChangeStatesEqual,
 	hasSettledMeasuredFileEffect,
+	isFileHistoryEnabledForDevice,
 } from "../../shared/file-change-protocol";
 import { db } from "../db";
 import {
@@ -366,6 +367,7 @@ export async function getGitCurrentDiffView(
 	const paths = [...new Set(options.filePaths ?? [])];
 	if ((options.deviceId ?? LOCAL_DEVICE_ID) !== LOCAL_DEVICE_ID)
 		return empty(paths, "unsupported", "unsupported");
+	const historyEnabled = isFileHistoryEnabledForDevice(options.deviceId ?? LOCAL_DEVICE_ID);
 	const started = performance.now();
 	const signal = AbortSignal.any([
 		...(options.signal ? [options.signal] : []),
@@ -412,6 +414,12 @@ export async function getGitCurrentDiffView(
 					Object.assign(entry[name], { status: "clean", reason: null, historyComplete: true });
 			}
 			if (!staged && !unstaged) continue;
+			if (!historyEnabled) {
+				// Live Git fingerprints remain valid; disabled history cannot prove an actor.
+				for (const result of [entry.index, entry.worktree])
+					if (result.status !== "clean") result.reason = "history_incomplete";
+				continue;
+			}
 			if (!scope) {
 				for (const result of [entry.index, entry.worktree])
 					if (result.status !== "clean") result.reason = "scope_unknown";

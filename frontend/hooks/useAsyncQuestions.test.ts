@@ -16,9 +16,11 @@ import { parseHTML } from "linkedom";
 import { act, createElement } from "react";
 import { createRoot } from "react-dom/client";
 import { api } from "../lib/api";
+import { clearToken, confirmAuthUser, setToken } from "../lib/api/client";
 import { clearFaviconAlert } from "../lib/favicon";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
 import { updateAsyncQuestionAttention } from "../lib/notification";
+import { getRecentTabsScope } from "../lib/recent-tabs-owner";
 import type { AsyncQuestion } from "../types/narrator";
 import {
 	applyAsyncQuestionChangeToList,
@@ -55,7 +57,13 @@ async function withHook<T>(
 	check: (hook: () => T, qc: QueryClient) => Promise<void>,
 ) {
 	const { window } = parseHTML("<!doctype html><html><body></body></html>");
+	const storage = new Map<string, string>();
 	const globals = {
+		localStorage: {
+			getItem: (key: string) => storage.get(key) ?? null,
+			setItem: (key: string, value: string) => storage.set(key, value),
+			removeItem: (key: string) => storage.delete(key),
+		},
 		window,
 		document: window.document,
 		navigator: window.navigator,
@@ -70,6 +78,11 @@ async function withHook<T>(
 	for (const [key, value] of Object.entries(globals)) {
 		Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
 	}
+	const generation = setToken("fixture-auth");
+	confirmAuthUser(generation, "fixture-user");
+	const connectionAuth = spyOn(narratorWSManager, "getConnectionAuthGeneration").mockReturnValue(
+		generation,
+	);
 	const qc = new QueryClient({
 		defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
 	});
@@ -96,6 +109,8 @@ async function withHook<T>(
 			await new Promise((resolve) => setTimeout(resolve, 0));
 		});
 		qc.clear();
+		connectionAuth.mockRestore();
+		clearToken();
 		for (const [key, descriptor] of previous) {
 			if (descriptor) Object.defineProperty(globalThis, key, descriptor);
 			else Reflect.deleteProperty(globalThis, key);
@@ -203,11 +218,20 @@ describe("async-question real hook caches", () => {
 	}
 });
 
+function useScopedRecentTabsWS(
+	ids: string[],
+	callback: (id: string, event: NarratorListWSEvent) => void,
+) {
+	const scope = getRecentTabsScope();
+	if (!scope) throw Error("Missing async question fixture scope");
+	useRecentTabsWS(scope, ids, callback);
+}
+
 // dispatchLocalFrame runs the manager's REAL listener filters. Capturing and calling
 // a callback directly would miss the omitted event type that caused this regression.
 for (const [name, useList] of [
 	["narrator list", useNarratorsListWS],
-	["recent tabs", useRecentTabsWS],
+	["recent tabs", useScopedRecentTabsWS],
 ] as const) {
 	describe(`${name} actual async-question subscription`, () => {
 		it("terminal frames clear the favicon through the real notification callback", async () => {

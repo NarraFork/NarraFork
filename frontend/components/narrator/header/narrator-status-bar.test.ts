@@ -289,7 +289,16 @@ describe("status bar layout contract (NarratorInteractionStatusBar)", () => {
 		expect(source).toMatch(
 			/<TruncatedText\b(?=[^>]*\bsize="xs")(?=[^>]*\bc="dimmed")(?=[^>]*\btext=\{t\(workIndicator\.statusBarDisplay\.labelKey\)\})[^>]*\/>/,
 		);
-		expect(source).toContain("text={quota.balance}");
+		// Quota text now belongs to the shared snapshot indicator. It exposes a full
+		// accessible label and a click/touch details popover instead of clipping text here.
+		expect(source).toContain("<QuotaSnapshotIndicator");
+		expect(source).not.toContain("text={quota.balance}");
+		const quota = await Bun.file(
+			new URL("../model/QuotaPanelIndicator.tsx", import.meta.url),
+		).text();
+		expect(quota).toContain("aria-label={ariaLabel}");
+		expect(quota).toContain("<Popover.Dropdown");
+		expect(quota).toContain("<QuotaDetails view={view}");
 
 		// text is repeated inside the dropdown; without one it falls back to TruncatedText.
 		const elapsed = await turnElapsed();
@@ -299,6 +308,34 @@ describe("status bar layout contract (NarratorInteractionStatusBar)", () => {
 		);
 		expect(body).toContain("<TruncatedText");
 		expect(body).toMatch(/Popover\.Dropdown[\s\S]*\{text\}[\s\S]*\{startedAtLabel\}/);
+	});
+
+	test("generic quotas share snapshot indicators and keep recharge plus Codex details", async () => {
+		const source = await statusBar();
+		expect(source).toContain("quota.entries.map((entry, index)");
+		expect(source).toContain("snapshot={entry.snapshot}");
+		expect(source).toContain("waitingForQuota={quota.waitingForQuota}");
+		expect(source).toContain("detailsFooter={");
+		expect(source).toContain("recharge.showInDetails");
+		expect(source).toContain("onClick={recharge.onOpen}");
+		expect(source).toMatch(/<CodexQuotaIndicator\s+detailsOnly/);
+		for (const retired of [
+			"OpencodeQuotaIndicator",
+			"Sub2ApiSubscriptionQuotaIndicator",
+			"quota.balance",
+			"quota.panel",
+		]) {
+			expect(source).not.toContain(retired);
+		}
+	});
+
+	test("only an active CommandCode narrator explicitly requests CLI-only quota", async () => {
+		const source = await Bun.file(new URL("../NarratorPanel.tsx", import.meta.url)).text();
+		// General reads are scoped by runtime provider; this guard covers only explicit CLI work.
+		expect(source).toContain(
+			'useCommandCodeCliQuota(firstScreenActivity && resolvedModel?.split(":")[0] === "CommandCode")',
+		);
+		expect(source).not.toContain("api.commandCodeUsage");
 	});
 
 	test("desktop and compact toolbars both budget the reflection action", async () => {

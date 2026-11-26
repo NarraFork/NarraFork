@@ -1613,6 +1613,26 @@ describe("local worktree list/create fixtures", () => {
 		}
 	});
 
+	test("a worktree made from a replaced commit matches the person's git: a clean index", async () => {
+		delete ports.runGit;
+		// main's commit replaced by one with different files (a replacement ref is repository
+		// content); the person's git, and so the narrator's worktree, see the replacement.
+		const fixture = ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.test"];
+		const original = await git(["rev-parse", "HEAD"]);
+		await git(["checkout", "-q", "--detach"]);
+		await writeFile(join(source, "tracked.txt"), "replaced\n");
+		await git(["add", "tracked.txt"]);
+		await git([...fixture, "commit", "-qm", "replacement"]);
+		const replacement = await git(["rev-parse", "HEAD"]);
+		await git(["checkout", "-q", "main"]);
+		await git(["replace", original, replacement]);
+		const request = proposal("request-replaced", "replaced");
+		const result = await service.create("actor", "narrator", request, signal());
+		expect(result.outcome).toBe("created");
+		expect(await git(["status", "--porcelain"], request.destinationPath)).toBe("");
+		expect(await readFile(join(request.destinationPath, "tracked.txt"), "utf8")).toBe("replaced\n");
+	});
+
 	test("lost final receipt write leaves a recoverable pending receipt, never re-adds", async () => {
 		const save = ports.journal.save.bind(ports.journal);
 		ports.journal.save = async (...args) => {

@@ -38,10 +38,27 @@ export function parseQuotaSnapshot(raw: unknown): QuotaSnapshot | null {
 	if (typeof value.fetchedAt !== "number" || !Number.isFinite(value.fetchedAt)) return null;
 	if (!SCOPES.has(value.scope as string)) return null;
 	if (!Array.isArray(value.windows) || !Array.isArray(value.balances)) return null;
-	const windows = value.windows.filter(
-		(w): w is QuotaSnapshot["windows"][number] =>
-			!!w && WINDOW_KINDS.has(w.kind) && finiteOrNull(w.usedRatio) && finiteOrNull(w.resetsAt),
-	);
+	const windows = value.windows
+		.filter(
+			(w): w is QuotaSnapshot["windows"][number] =>
+				!!w && WINDOW_KINDS.has(w.kind) && finiteOrNull(w.usedRatio) && finiteOrNull(w.resetsAt),
+		)
+		.map((window) => ({
+			kind: window.kind,
+			...(typeof window.label === "string" ? { label: window.label } : {}),
+			usedRatio: window.usedRatio,
+			resetsAt: window.resetsAt,
+			...(typeof window.used === "number" && Number.isFinite(window.used)
+				? { used: window.used }
+				: {}),
+			...(typeof window.total === "number" && Number.isFinite(window.total)
+				? { total: window.total }
+				: {}),
+			...(typeof window.remaining === "number" && Number.isFinite(window.remaining)
+				? { remaining: window.remaining }
+				: {}),
+			...(typeof window.unit === "string" ? { unit: window.unit } : {}),
+		}));
 	const balances = value.balances.filter(
 		(b): b is QuotaSnapshot["balances"][number] =>
 			!!b && typeof b.unit === "string" && finiteOrNull(b.remaining),
@@ -53,6 +70,9 @@ export function parseQuotaSnapshot(raw: unknown): QuotaSnapshot | null {
 		windows,
 		balances,
 		...(typeof value.plan === "string" ? { plan: value.plan } : {}),
+		...(typeof value.expiresAt === "number" && Number.isFinite(value.expiresAt)
+			? { expiresAt: value.expiresAt }
+			: {}),
 		...(value.detail !== undefined ? { detail: value.detail } : {}),
 	};
 }
@@ -100,6 +120,21 @@ export class QuotaStore {
 	/** The snapshot in memory, whatever identity it was saved under (key pool). */
 	peek(id: string, source = DEFAULT_QUOTA_SOURCE): QuotaSnapshot | undefined {
 		return this.held.get(this.heldKey(id, source))?.snapshot;
+	}
+
+	/**
+	 * Read a snapshot only when its live credential identity matches.
+	 *
+	 * Hot routing must not restore persisted data or evict another identity's snapshot.
+	 * A cold or mismatched entry is simply unknown; source namespaces stay independent.
+	 */
+	peekForIdentity(
+		id: string,
+		identity: string,
+		source = DEFAULT_QUOTA_SOURCE,
+	): QuotaSnapshot | undefined {
+		const held = this.held.get(this.heldKey(id, source));
+		return held?.identity === identity ? held.snapshot : undefined;
 	}
 
 	/** `persist: false` keeps the disk copy as it is (in-progress or never-fetched states). */

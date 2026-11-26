@@ -44,8 +44,6 @@ const provider = (): CustomApiProviderConfig => ({
 });
 let respond: () => Promise<Response> = async () => Response.json(body);
 const {
-	getAllDeepSeekCachedBalances,
-	getDeepSeekBalanceGenerations,
 	isDeepSeekCustomApiProvider,
 	parseDeepSeekBalanceResponse,
 	refreshAllDeepSeekBalances,
@@ -53,7 +51,9 @@ const {
 	refreshStaleDeepSeekBalances,
 	syncDeepSeekBalanceCache,
 } = await import("../deepseek-balance-cache");
-const { deepseekRoutes, redactBalancesForRole } = await import("../../routes/deepseek");
+const { quotaSnapshotRoutes } = await import("../../routes/quota-snapshots");
+const { publicQuotaSnapshot } = await import("../sourcing/quota-snapshots");
+const { getDeepSeekQuotaSnapshot } = await import("../deepseek-balance-cache");
 
 beforeEach(() => {
 	settings.customApiProviders = [];
@@ -84,13 +84,14 @@ function appForRole(role: "admin" | "user") {
 	app.use("*", async (c, next) => {
 		const sub = role === "admin" ? DEEPSEEK_ADMIN_ID : DEEPSEEK_USER_ID;
 		c.set("user", { sub, role, iat: 0, exp: Number.MAX_SAFE_INTEGER });
+		c.set("auth", { type: "session", user: c.get("user") });
 		await next();
 	});
 	app.onError((error) => {
 		const status = (error as { statusCode?: number }).statusCode;
 		return new Response("denied", { status: status ?? 500 });
 	});
-	app.route("/api/deepseek", deepseekRoutes);
+	app.route("/api/quota-snapshots", quotaSnapshotRoutes);
 	return app;
 }
 
@@ -187,8 +188,8 @@ describe("DeepSeek balances", () => {
 			throw new Error("secret-test-key upstream private error");
 		};
 		await refreshStaleDeepSeekBalances();
-		const cache = getAllDeepSeekCachedBalances()["deepseek-test"];
-		expect(cache?.balanceInfos).toHaveLength(2);
+		const cache = getDeepSeekQuotaSnapshot("deepseek-test", "deepseek-test");
+		expect(cache?.balances).toHaveLength(2);
 		expect(cache?.error).toBe("DeepSeek balance request failed");
 		expect(cache?.fetchedAt).toBe(now);
 		await refreshStaleDeepSeekBalances();
@@ -209,7 +210,6 @@ describe("DeepSeek balances", () => {
 			const pending = deferred();
 			respond = () => pending.promise;
 			const first = refreshDeepSeekBalance("deepseek-test");
-			const oldGeneration = getDeepSeekBalanceGenerations()["deepseek-test"];
 			const config = settings.customApiProviders?.[0];
 			if (!config) throw new Error("missing fixture");
 			if (change === "apiKey") config.apiKey = "new-account";
@@ -221,47 +221,34 @@ describe("DeepSeek balances", () => {
 			if (change === "globalProxy")
 				settings.proxy = { mode: "custom", url: "http://localhost:4321" };
 			if (change === "remove") settings.customApiProviders = [];
-			const current = getAllDeepSeekCachedBalances();
-			expect(getDeepSeekBalanceGenerations()["deepseek-test"]).not.toBe(oldGeneration);
-			expect(current["deepseek-test"]?.generation).toBe(
-				getDeepSeekBalanceGenerations()["deepseek-test"],
-			);
-			expect(current["deepseek-test"]?.balanceInfos ?? []).toEqual([]);
+			expect(getDeepSeekQuotaSnapshot("deepseek-test", "deepseek-test")).toBeUndefined();
 			pending.resolve(Response.json(body));
 			expect(await first).toBeNull();
-			expect(getAllDeepSeekCachedBalances()["deepseek-test"]?.balanceInfos ?? []).toEqual([]);
+			expect(getDeepSeekQuotaSnapshot("deepseek-test", "deepseek-test")?.balances ?? []).toEqual(
+				[],
+			);
 		});
 	}
 
-	test("random generations are stable across reads, refreshes and unrelated edits, not restored by key reuse", async () => {
-		const original = getDeepSeekBalanceGenerations()["deepseek-test"];
-		expect(original).toMatch(/^[\da-f-]{36}$/);
+	test("unrelated display edits retain the existing balance", async () => {
 		await refreshDeepSeekBalance("deepseek-test");
 		settings.customApiProviders = [{ ...provider(), name: "Renamed" }];
-		expect(getDeepSeekBalanceGenerations()["deepseek-test"]).toBe(original);
-		settings.customApiProviders = [{ ...provider(), apiKey: "second-account" }];
-		const second = getDeepSeekBalanceGenerations()["deepseek-test"];
-		expect(second).not.toBe(original);
-		settings.customApiProviders = [provider()];
-		const third = getDeepSeekBalanceGenerations()["deepseek-test"];
-		expect(third).not.toBe(original);
-		expect(third).not.toBe(second);
-		expect(JSON.stringify(getDeepSeekBalanceGenerations())).not.toContain(provider().apiKey);
+		expect(getDeepSeekQuotaSnapshot("deepseek-test", "deepseek-test")?.balances).toHaveLength(2);
 	});
 
 	test("completed balances disappear on credential changes, disable and removal", async () => {
 		await refreshDeepSeekBalance("deepseek-test");
-		expect(getAllDeepSeekCachedBalances()["deepseek-test"]?.balanceInfos).toHaveLength(2);
+		expect(getDeepSeekQuotaSnapshot("deepseek-test", "deepseek-test")?.balances).toHaveLength(2);
 		settings.customApiProviders = [{ ...provider(), apiKey: "other-account" }];
-		expect(getAllDeepSeekCachedBalances()["deepseek-test"]?.balanceInfos).toEqual([]);
+		expect(getDeepSeekQuotaSnapshot("deepseek-test", "deepseek-test")).toBeUndefined();
 		await refreshDeepSeekBalance("deepseek-test");
 		settings.customApiProviders = [{ ...provider(), disabled: true }];
-		expect(getAllDeepSeekCachedBalances()).toEqual({});
+		expect(getDeepSeekQuotaSnapshot("deepseek-test", "deepseek-test")).toBeUndefined();
 		settings.customApiProviders = [];
 		expect(await refreshDeepSeekBalance("deepseek-test")).toBeNull();
 	});
 
-	test("settings projects the same opaque generations for users and admins without persisting them", async () => {
+	test("settings retires legacy quota generations for users and admins without exposing credentials", async () => {
 		const { settingsRoutes } = await import("../../routes/settings");
 		for (const role of ["user", "admin"] as const) {
 			const app = appForRole(role);
@@ -269,7 +256,8 @@ describe("DeepSeek balances", () => {
 			const response = await app.request("/api/settings");
 			expect(response.status).toBe(200);
 			const projection = await response.json();
-			expect(projection.deepseekBalanceGenerations).toEqual(getDeepSeekBalanceGenerations());
+			expect(projection).not.toHaveProperty("deepseekBalanceGenerations");
+			expect(projection).not.toHaveProperty("opencodeUsageGenerations");
 			expect(projection.customApiProviders[0].apiKey).not.toBe(provider().apiKey);
 		}
 		expect(settings).not.toHaveProperty("deepseekBalanceGenerations");
@@ -279,13 +267,14 @@ describe("DeepSeek balances", () => {
 	test("cold GET returns a loading snapshot without waiting on upstream", async () => {
 		const pending = deferred();
 		respond = () => pending.promise;
-		const response = await appForRole("user").request("/api/deepseek/balances");
-		expect((await response.json())["deepseek-test"]).toEqual({
-			isAvailable: null,
-			balanceInfos: [],
-			fetchedAt: 0,
-			hasError: false,
-			generation: getDeepSeekBalanceGenerations()["deepseek-test"],
+		const response = await appForRole("user").request("/api/quota-snapshots");
+		expect(
+			(await response.json()).entries.find(
+				(entry: { groupId: string }) => entry.groupId === "deepseek-test",
+			),
+		).toMatchObject({
+			credentialId: null,
+			snapshot: null,
 		});
 		pending.resolve(Response.json(body));
 		await refreshAllDeepSeekBalances();
@@ -298,7 +287,7 @@ describe("DeepSeek balances", () => {
 		];
 		const fetchSpy = spyOn(outbound, "outboundFetch").mockImplementation(async () => respond());
 		await refreshAllDeepSeekBalances();
-		expect(getAllDeepSeekCachedBalances()).toEqual({});
+		expect(getDeepSeekQuotaSnapshot("deepseek-test", "deepseek-test")).toBeUndefined();
 		expect(fetchSpy).not.toHaveBeenCalled();
 	});
 
@@ -366,27 +355,32 @@ describe("DeepSeek balances", () => {
 		};
 		await refreshDeepSeekBalance("deepseek-test");
 		const user = appForRole("user");
-		const response = await user.request("/api/deepseek/balances");
+		const response = await user.request("/api/quota-snapshots");
 		const data = await response.json();
 		expect(response.status).toBe(200);
-		expect(data["deepseek-test"].hasError).toBe(true);
-		expect(data["deepseek-test"].error).toBeUndefined();
-		expect((await user.request("/api/deepseek/balances/refresh", { method: "POST" })).status).toBe(
+		const entry = data.entries.find(
+			(entry: { groupId: string }) => entry.groupId === "deepseek-test",
+		);
+		expect(entry.snapshot.hasError).toBe(true);
+		expect(entry.snapshot.error).toBe("quota_unavailable");
+		expect((await user.request("/api/quota-snapshots/refresh", { method: "POST" })).status).toBe(
 			403,
 		);
 		const admin = appForRole("admin");
 		expect(
-			(await (await admin.request("/api/deepseek/balances")).json())["deepseek-test"].error,
-		).toBe("DeepSeek balance request failed");
+			(await (await admin.request("/api/quota-snapshots")).json()).entries.find(
+				(entry: { groupId: string }) => entry.groupId === "deepseek-test",
+			).snapshot.error,
+		).toBe("quota_unavailable");
 		const pending = deferred();
 		respond = () => pending.promise;
-		expect((await admin.request("/api/deepseek/balances/refresh", { method: "POST" })).status).toBe(
+		expect((await admin.request("/api/quota-snapshots/refresh", { method: "POST" })).status).toBe(
 			200,
 		);
 		pending.resolve(Response.json(body));
 		await refreshAllDeepSeekBalances();
 		expect(
-			redactBalancesForRole(getAllDeepSeekCachedBalances(), false)["deepseek-test"],
+			publicQuotaSnapshot(getDeepSeekQuotaSnapshot("deepseek-test", "deepseek-test")),
 		).toHaveProperty("hasError", false);
 	});
 });

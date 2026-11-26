@@ -22,12 +22,14 @@ import { addRecentTab } from "../../hooks/useRecentTabs";
 import { useRuntimeSettings } from "../../hooks/useRuntimeSettings";
 import { useWorkspaceDevices } from "../../hooks/useWorkspaceContext";
 import { api, isAbortError } from "../../lib/api";
+import { getAuthSnapshot } from "../../lib/api/client";
 import { REMOTE_BUILD } from "../../lib/build-target";
 import { FOLLOW_DEFAULT_MODEL } from "../../lib/constants";
 import {
 	subscribeDashboardComposerFocus,
 	takeDashboardComposerFocusRequest,
 } from "../../lib/dashboard-composer-focus";
+import { getRecentTabsScope, type RecentTabsScope } from "../../lib/recent-tabs-owner";
 import { DeviceDirectoryModal } from "../common/DeviceDirectoryPicker";
 import { deviceSelectData, LOCAL_DEVICE } from "../common/device-directory-options";
 import {
@@ -191,6 +193,7 @@ export function DashboardComposer() {
 	const deviceUnavailable =
 		isRemoteDevice && devicesQuery.isSuccess === true && !selectedDevice?.online;
 	const [advancedOpen, setAdvancedOpen] = useState(false);
+	const advancedScope = useRef<RecentTabsScope | null>(null);
 	const [hasText, setHasText] = useState(false);
 	const [sendingState, setSendingState] = useState<NarratorSendingState | null>(null);
 	const composerRef = useRef<NarratorComposerHandle>(null);
@@ -207,7 +210,10 @@ export function DashboardComposer() {
 	const sendAbortRef = useRef<AbortController | null>(null);
 	// A session created by a send whose message then failed. Retrying reuses it
 	// instead of leaving an empty session behind per attempt.
-	const pendingSessionRef = useRef<CreateNarratorResult | null>(null);
+	const pendingSessionRef = useRef<{
+		session: CreateNarratorResult;
+		authGeneration: number;
+	} | null>(null);
 
 	const {
 		attachedImages,
@@ -311,14 +317,17 @@ export function DashboardComposer() {
 
 	const openDirectoryChooser = () => setBrowseOpen(true);
 
-	const openSession = (session: CreateNarratorResult) => {
-		void addRecentTab({
-			type: "narrator",
-			id: session.id,
-			title: session.title,
-			subtitle: session.cwd,
-			status: session.status,
-		});
+	const openSession = (session: CreateNarratorResult, scope: RecentTabsScope | null) => {
+		void addRecentTab(
+			{
+				type: "narrator",
+				id: session.id,
+				title: session.title,
+				subtitle: session.cwd,
+				status: session.status,
+			},
+			scope,
+		);
 		navigate({ to: "/narrators/$narratorId", params: { narratorId: session.id } });
 	};
 
@@ -370,6 +379,8 @@ export function DashboardComposer() {
 		)
 			return;
 
+		const recentTabsScope = getRecentTabsScope();
+		const { generation: authGeneration } = getAuthSnapshot();
 		sendingRef.current = true;
 		const attachmentCount = files.images.length + files.textFiles.length + files.media.length;
 		const abort = new AbortController();
@@ -381,7 +392,10 @@ export function DashboardComposer() {
 		});
 		let lastPercent = -1;
 		try {
-			let session = pendingSessionRef.current;
+			let session =
+				pendingSessionRef.current?.authGeneration === authGeneration
+					? pendingSessionRef.current.session
+					: undefined;
 			if (!session) {
 				// Unchosen → the server uses the default project directory, which exists
 				// (`directoryRequired` stops the send otherwise). A remote device always
@@ -407,7 +421,8 @@ export function DashboardComposer() {
 					cwd: data.cwd || cwd,
 					status: data.status || "idle",
 				};
-				pendingSessionRef.current = session;
+				if (getAuthSnapshot().generation !== authGeneration) return;
+				pendingSessionRef.current = { session, authGeneration };
 			}
 			const args: Parameters<typeof api.sendNarratorMessage> = [
 				session.id,
@@ -428,11 +443,12 @@ export function DashboardComposer() {
 			if (composerDocument) args[10] = { composerDocument };
 			if (files.media.length) args[11] = files.media;
 			await api.sendNarratorMessage(...args);
+			if (getAuthSnapshot().generation !== authGeneration) return;
 			composer.noteSent(text, fileReferences, composerDocument);
 			composer.clearTextAndDraft();
 			clearAttachedFilesAndDraft();
 			pendingSessionRef.current = null;
-			openSession(session);
+			openSession(session, recentTabsScope);
 		} catch (error) {
 			if (isAbortError(error)) {
 				notifications.show({ message: tn("sendCancelled"), color: "gray", autoClose: 2000 });
@@ -601,7 +617,10 @@ export function DashboardComposer() {
 						onPointerEnter={preloadCreateNarratorModal}
 						onFocus={preloadCreateNarratorModal}
 						onPointerDown={preloadCreateNarratorModal}
-						onClick={() => setAdvancedOpen(true)}
+						onClick={() => {
+							advancedScope.current = getRecentTabsScope();
+							setAdvancedOpen(true);
+						}}
 					>
 						<IconAdjustmentsHorizontal size={16} />
 					</ActionIcon>
@@ -656,7 +675,7 @@ export function DashboardComposer() {
 				onClose={() => setAdvancedOpen(false)}
 				initialCwd={cwd || undefined}
 				initialDeviceId={isRemoteDevice ? chosenDeviceId : undefined}
-				onCreated={openSession}
+				onCreated={(session) => openSession(session, advancedScope.current)}
 			/>
 		</Box>
 	);

@@ -1457,6 +1457,8 @@ export async function runAgentLoopUnlocked(
 					// Legacy resumed plan paths cannot be reconstructed from the identity.
 					active._planFilePath,
 					{
+						communicationSourceNarratorId: narratorId,
+						communicationSignal: active.abortController.signal,
 						taskSection: taskSectionFor(taskBackend, current.type),
 						...(contextParts ? { contextParts } : {}),
 						...(outlinePlan ? { outlinePlan } : {}),
@@ -2959,6 +2961,7 @@ export async function runAgentLoopUnlocked(
 							providerPrefix: payment.providerPrefix,
 							balance: payment.balance,
 							required: payment.required,
+							...(payment.paymentContext ? { paymentContext: payment.paymentContext } : {}),
 							resumeAction: payment.resumeAction,
 							...(isParentCopy && { isSubagent: true }),
 						});

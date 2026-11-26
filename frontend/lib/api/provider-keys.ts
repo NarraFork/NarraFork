@@ -2,12 +2,6 @@
 import type { CredentialNetwork } from "@shared/credential-network";
 import { request } from "./client";
 
-export interface ProviderKeyUsageWindow {
-	label: string;
-	usedRatio: number | null;
-	resetsAt: string | null;
-}
-
 export interface ProviderKeyInfo {
 	id: string;
 	label: string | null;
@@ -17,7 +11,6 @@ export interface ProviderKeyInfo {
 	disabledReason: "manual" | "invalid" | null;
 	network: CredentialNetwork;
 	cooldown: { until: number; reason: "rate_limited" | "quota" | "forbidden" } | null;
-	usage: { fetchedAt: number; error: string | null; windows: ProviderKeyUsageWindow[] } | null;
 }
 
 const base = (providerId: string) => `/provider-keys/${encodeURIComponent(providerId)}`;
@@ -44,6 +37,4 @@ export const providerKeysApi = {
 			method: "PUT",
 			body: JSON.stringify({ ids }),
 		}),
-	refreshUsage: (providerId: string) =>
-		request<{ keys: ProviderKeyInfo[] }>(`${base(providerId)}/usage/refresh`, { method: "POST" }),
 };

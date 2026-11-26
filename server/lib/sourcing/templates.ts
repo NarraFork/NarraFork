@@ -5,26 +5,49 @@
  * The behaviours (quota probe, then model list, availability, import dedupe) are attached
  * by the S2 PRs as each caller moves onto templates.
  */
+import { createHash } from "node:crypto";
 import type { QuotaSnapshot } from "@shared/quota-snapshot";
 import type { ServiceTemplateId, SourceProtocol, SourceRegion } from "@shared/sourcing/identify";
-import { probeTokenDanceQuota, type TokenDanceSubject } from "../../services/tokendance-service";
-import type { CommandCodeProviderSettings } from "../agent/commandcode-provider";
-import { getCodexManager } from "../codex-manager";
+import { pluginProviderRegistry } from "../../services/plugin-provider-registry";
+import {
+	getTokenDanceQuotaSnapshot,
+	refreshTokenDanceBalance,
+	tokenDanceQuotaIdentity,
+} from "../../services/tokendance-service";
+import { isNugRelayEligible } from "../agent/nug-delegate-config";
+import { getCodexCredentialDedupeKeys } from "../codex-credential-dedupe";
+import { getCodexManager, peekCodexManager } from "../codex-manager";
 import { projectCodexUsageSnapshot } from "../codex-usage";
-import { type CommandCodeUsageSubject, probeCommandCodeQuota } from "../commandcode-usage";
+import {
+	commandCodeQuotaIdentity,
+	getCommandCodeQuotaSnapshot,
+	refreshCommandCodeQuota,
+} from "../commandcode-usage";
 import type { Credential, CredentialAuth } from "../credential-store";
-import { probeDeepSeekQuota } from "../deepseek-balance-cache";
-import { probeKimiQuota } from "../kimi-usage-cache";
-import { type NugQuotaSubject, probeNugQuota } from "../nug-quota-cache";
-import { probeOpencodeQuota } from "../opencode-usage-cache";
-import { probeRelayQuota } from "../provider-balance-cache";
-import type { UsageSubject } from "../provider-key-subjects";
-import type {
-	CustomApiProviderConfig,
-	NUGProviderConfig,
-	TokenDanceSettings,
-} from "../settings/types";
+import { customApiStreamQuotaIdentity } from "../custom-api-quota-cache";
+import {
+	deepSeekQuotaIdentity,
+	getDeepSeekQuotaSnapshot,
+	refreshDeepSeekBalance,
+} from "../deepseek-balance-cache";
+import { getKimiQuotaSnapshot, kimiQuotaIdentity, refreshKimiKeyUsage } from "../kimi-usage-cache";
+import { resolveKnownUnavailableNugModel } from "../nug-model-availability";
+import {
+	getNugQuotaSnapshot,
+	nugQuotaBalanceSources,
+	nugQuotaIdentity,
+	refreshNugQuota,
+} from "../nug-quota-cache";
+import {
+	getOpencodeQuotaSnapshot,
+	opencodeQuotaIdentity,
+	refreshOpencodeKeyUsage,
+} from "../opencode-usage-cache";
+import { providerBalanceCache, providerBalanceQuotaIdentity } from "../provider-balance-cache";
+import { settings } from "../settings";
+import type { CustomApiProviderConfig } from "../settings/types";
 import { readTemplateModelList, type SourceModel } from "./model-list-readers";
+import { type CredentialRouting, keyRouting, type RoutingPreview } from "./routing";
 import type { SourceGroupView } from "./source-groups";
 
 export type { ServiceTemplateId } from "@shared/sourcing/identify";
@@ -37,13 +60,6 @@ export type AuthKind = CredentialAuth["kind"] | "opaque";
 
 export type ProtocolEndpoints = Partial<Record<SourceProtocol, string>>;
 
-type QuotaSubject = UsageSubject<
-	| CustomApiProviderConfig
-	| NUGProviderConfig
-	| TokenDanceSettings
-	| (CommandCodeProviderSettings & { apiKey: string })
->;
-
 export interface ServiceTemplate {
 	id: ServiceTemplateId;
 	kind: ServiceTemplateKind;
@@ -54,6 +70,8 @@ export interface ServiceTemplate {
 	/** Regional endpoints; keys from different regions are not interchangeable. */
 	regions?: Partial<Record<SourceRegion, ProtocolEndpoints>>;
 	authKinds: readonly AuthKind[];
+	/** Import identity keys; unsupported auth has no identity in this template. */
+	dedupeKeys(credential: Omit<Credential, "id">): readonly string[];
 	/** Several credentials can share the group's pool. */
 	multiCredential: boolean;
 	/** Plan allowance windows rather than pay-per-use. */
@@ -62,17 +80,15 @@ export interface ServiceTemplate {
 	defaults?: Partial<Pick<CustomApiProviderConfig, "userAgentMode">>;
 	/** A user may add a personal credential here (S4). */
 	personal: boolean;
-	/**
-	 * Read one credential's allowance (sourcing/quota-store.ts keeps the result). Templates
-	 * without it have no quota to show. Throws when the upstream cannot answer.
-	 */
-	probeQuota?: (
-		group: SourceGroupView,
-		credential: QuotaSubject,
-		signal: AbortSignal,
-	) => Promise<QuotaSnapshot>;
+	/** Delegate to the source owner, preserving its cache, in-flight work and identity checks. */
+	probeQuota?: (group: SourceGroupView, credentialId: string) => Promise<QuotaSnapshot | undefined>;
 	/** A read-only projection when another canonical store owns the usage (Codex). */
 	projectQuota?: (credentialId: string) => QuotaSnapshot | undefined;
+	/** Pure memory only: an explicit false rules out this model, unknown does not. */
+	isModelAvailable?: (group: SourceGroupView, value?: string) => boolean;
+	/** Whether any credential can serve; specialised pools retain their own policies. */
+	hasAvailableCredentials?: CredentialRouting["hasAvailableCredentials"];
+	routingPreview?: (group: SourceGroupView, now: number) => RoutingPreview | null;
 	/** Complete cached model entries. Explicit refresh stays with the catalog owner. */
 	listModels: (
 		group: SourceGroupView,
@@ -84,23 +100,42 @@ export interface ServiceTemplate {
 type ProbeQuota = NonNullable<ServiceTemplate["probeQuota"]>;
 
 /**
- * Kimi Code and OpenCode Go answer per key; DeepSeek and relay balances per provider, so
- * their caches probe the group's first credential (§15.4). Relays are probed on every
+ * Sources own credential-specific probes and retain their legacy first-key views.
+ * Relay balances still follow their selected credential. Relays are probed on every
  * endpoint that is not a dedicated service, official APIs included, as before.
  */
-// The template id on each caller determines which member of QuotaSubject it supplies.
-const custom = (credential: QuotaSubject): UsageSubject => credential as UsageSubject;
-const relay: ProbeQuota = (_group, credential, signal) =>
-	probeRelayQuota(custom(credential), signal);
+const relay: ProbeQuota = async (group, credentialId) => {
+	if (credentialId !== providerBalanceCache.quotaSnapshot(group.id)?.credentialId) return;
+	await providerBalanceCache.request(group.id, "refresh");
+	const quota = providerBalanceCache.quotaSnapshot(group.id);
+	return quota?.credentialId === credentialId ? quota.snapshot : undefined;
+};
 const QUOTA_PROBES: Partial<Record<ServiceTemplateId, ProbeQuota>> = {
-	"kimi-code": (_group, credential, signal) => probeKimiQuota(custom(credential), signal),
-	"opencode-go": (_group, credential, signal) => probeOpencodeQuota(custom(credential), signal),
-	deepseek: (_group, credential, signal) => probeDeepSeekQuota(custom(credential), signal),
-	tokendance: (_group, credential, signal) =>
-		probeTokenDanceQuota(credential as TokenDanceSubject, signal),
-	"command-code": (_group, credential, signal) =>
-		probeCommandCodeQuota(credential as CommandCodeUsageSubject, signal),
-	nug: (_group, credential, signal) => probeNugQuota(credential as NugQuotaSubject, signal),
+	"kimi-code": async (_group, credentialId) => {
+		await refreshKimiKeyUsage(credentialId);
+		return getKimiQuotaSnapshot(credentialId);
+	},
+	"opencode-go": async (_group, credentialId) => {
+		await refreshOpencodeKeyUsage(credentialId);
+		return getOpencodeQuotaSnapshot(credentialId);
+	},
+	deepseek: async (group, credentialId) => {
+		await refreshDeepSeekBalance(group.id, credentialId);
+		return getDeepSeekQuotaSnapshot(group.id, credentialId);
+	},
+	tokendance: async (_group, credentialId) => {
+		await refreshTokenDanceBalance(true, credentialId);
+		return getTokenDanceQuotaSnapshot(credentialId)?.snapshot;
+	},
+	"command-code": async (_group, credentialId) => {
+		await refreshCommandCodeQuota(true, credentialId);
+		return getCommandCodeQuotaSnapshot(credentialId)?.snapshot;
+	},
+	nug: async (group, credentialId) => {
+		await refreshNugQuota(group.id, credentialId);
+		const quota = getNugQuotaSnapshot(group.id, credentialId);
+		return quota?.credentialId === credentialId ? quota.snapshot : undefined;
+	},
 	openai: relay,
 	anthropic: relay,
 	gemini: relay,
@@ -109,13 +144,70 @@ const QUOTA_PROBES: Partial<Record<ServiceTemplateId, ProbeQuota>> = {
 	"gemini-compatible": relay,
 };
 
+type RoutingBehavior = Pick<
+	ServiceTemplate,
+	"isModelAvailable" | "hasAvailableCredentials" | "routingPreview"
+>;
+const customConfig = (group: SourceGroupView) =>
+	settings.customApiProviders?.find((provider) => provider.id === group.id);
+const relayRouting = keyRouting(
+	customConfig,
+	(config) => providerBalanceQuotaIdentity(config, settings.proxy),
+	{ streamIdentity: customApiStreamQuotaIdentity },
+);
+const ROUTING: Partial<Record<ServiceTemplateId, RoutingBehavior>> = {
+	// Codex's manager owns credits continuation and window policy, not the generic quota filter.
+	codex: {
+		hasAvailableCredentials: () => (peekCodexManager()?.availableCount ?? 0) > 0,
+		routingPreview: () => peekCodexManager()?.routingPreview ?? null,
+	},
+	"kimi-code": keyRouting(customConfig, kimiQuotaIdentity, {
+		streamIdentity: customApiStreamQuotaIdentity,
+	}),
+	"opencode-go": keyRouting(customConfig, opencodeQuotaIdentity, {
+		probeBalanceIsFallback: true,
+		streamIdentity: customApiStreamQuotaIdentity,
+	}),
+	deepseek: keyRouting(customConfig, deepSeekQuotaIdentity, {
+		streamIdentity: customApiStreamQuotaIdentity,
+	}),
+	tokendance: keyRouting(() => settings.tokendance, tokenDanceQuotaIdentity),
+	"command-code": keyRouting(
+		() => ({ ...settings.commandCode, apiKey: settings.commandCode?.apiKey ?? "" }),
+		commandCodeQuotaIdentity,
+		{ allowUnconfigured: true },
+	),
+	nug: {
+		...keyRouting(
+			(group) => settings.nugProviders?.find((provider) => provider.id === group.id),
+			nugQuotaIdentity,
+			{
+				streamIdentity: nugQuotaIdentity,
+				isEligible: isNugRelayEligible,
+				balanceSources: nugQuotaBalanceSources,
+			},
+		),
+		isModelAvailable: (group, value) => !resolveKnownUnavailableNugModel(value, group.prefix),
+	},
+	plugin: {
+		hasAvailableCredentials: (group) =>
+			pluginProviderRegistry.get(group.id)?.status === "available",
+	},
+	openai: relayRouting,
+	anthropic: relayRouting,
+	gemini: relayRouting,
+	"openai-compatible": relayRouting,
+	"anthropic-compatible": relayRouting,
+	"gemini-compatible": relayRouting,
+};
+
 const KIMI_CODE = (host: string): ProtocolEndpoints => ({
 	"anthropic-messages": `https://${host}/coding/v1`,
 	"completions-compatible": `https://${host}/coding/v1`,
 	"openai-responses": `https://${host}/coding/v1`,
 });
 
-const TEMPLATES: readonly Omit<ServiceTemplate, "listModels">[] = [
+const TEMPLATES: readonly Omit<ServiceTemplate, "listModels" | "dedupeKeys">[] = [
 	{
 		id: "codex",
 		kind: "known",
@@ -204,22 +296,20 @@ const TEMPLATES: readonly Omit<ServiceTemplate, "listModels">[] = [
 		personal: true,
 	},
 	{
-		// Prepaid balance. One key until TokenDance joins the credential pool (S2 PR 7).
 		id: "tokendance",
 		kind: "known",
 		preferredPrefix: "tokendance",
 		authKinds: ["api_key"],
-		multiCredential: false,
+		multiCredential: true,
 		subscription: false,
 		personal: false,
 	},
 	{
-		// Routed as pay-per-use today; one key until the credential pool takes it (S2 PR 7).
 		id: "command-code",
 		kind: "known",
 		preferredPrefix: "CommandCode",
 		authKinds: ["api_key"],
-		multiCredential: false,
+		multiCredential: true,
 		subscription: false,
 		personal: false,
 	},
@@ -248,12 +338,11 @@ const TEMPLATES: readonly Omit<ServiceTemplate, "listModels">[] = [
 		personal: true,
 	},
 	{
-		// NUG is excluded from the key pool until S2 PR 7.
 		id: "nug",
 		kind: "api",
 		preferredPrefix: "nug",
 		authKinds: ["api_key"],
-		multiCredential: false,
+		multiCredential: true,
 		subscription: false,
 		personal: true,
 	},
@@ -277,6 +366,35 @@ function deepFreeze<T>(value: T): T {
 	return value;
 }
 
+const fingerprint = (kind: string, value: unknown): string =>
+	`${kind}:${createHash("sha256").update(JSON.stringify(value)).digest("hex")}`;
+
+function templateDedupeKeys(
+	template: Pick<ServiceTemplate, "authKinds">,
+): ServiceTemplate["dedupeKeys"] {
+	return (credential) => {
+		const { auth, target } = credential;
+		if (!template.authKinds.includes(auth.kind)) return [];
+		switch (auth.kind) {
+			case "oauth":
+			case "pat":
+			case "agent_identity":
+				return getCodexCredentialDedupeKeys({ ...credential.account, ...auth });
+			case "api_key": {
+				const key = auth.apiKey.trim();
+				return key && target.groupId ? [fingerprint("api_key", [target.groupId, key])] : [];
+			}
+			case "opaque": {
+				if (!target.pluginContributionId) return [];
+				const fields = Object.keys(auth.fields)
+					.sort()
+					.map((name) => [name, auth.fields[name]]);
+				return [fingerprint("opaque", [target.pluginContributionId, fields])];
+			}
+		}
+	};
+}
+
 const byId = new Map<ServiceTemplateId, ServiceTemplate>(
 	TEMPLATES.map((template) => {
 		const probeQuota = QUOTA_PROBES[template.id];
@@ -285,6 +403,8 @@ const byId = new Map<ServiceTemplateId, ServiceTemplate>(
 			deepFreeze({
 				...template,
 				...(probeQuota ? { probeQuota } : {}),
+				dedupeKeys: templateDedupeKeys(template),
+				...ROUTING[template.id],
 				listModels: async (
 					group: SourceGroupView,
 					_credential?: Credential,

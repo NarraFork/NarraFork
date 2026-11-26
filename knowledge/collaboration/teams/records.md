@@ -66,7 +66,7 @@ keywords:
   - team_upgrade
   - team_disband
 status: draft
-verified_at: d723c61fe
+verified_at: 3586b5dd803f5035f610fc36d2c7d0245a2cd8e9
 ---
 # 团队与成员
 
@@ -84,11 +84,13 @@ verified_at: d723c61fe
   - 基线分支（给定的，或项目 `defaultBranch`，再缺省 `main`）必须解析到提交（`teamGit(gitPath).resolveCommit`，即工作项建 worktree 时用的同一个 `rev-parse --verify ...^{commit}`），否则 409 `TEAM_BASE_BRANCH_UNRESOLVED`，消息里带分支名；git 读不成单个修订的项目默认值同样按这个码拒绝。
   - 测试：`projects-resolve-directory.test.ts`（拒绝后叙述者与团队行数不变）；其他团队测试用 `__tests__/team-repo.fixture.ts:initTeamRepo` 给项目目录建真实仓库。
 - 协调者的 cwd 永远是项目的 `gitPath`，不是用户选的子目录（`createTeam`）。
+- 团队列表 `GET /api/projects/:projectId/teams`（`listProjectTeamsQuerySchema`：`status`、`limit` ≤100、`cursor`）；带 `counts=true` 时每页最多 24 个团队，每个团队多一个 `card`（项目页团队卡片的数字，`team-board.ts:readTeamCards`，见[项目页](../project-pages.md)）。
 - 改基线分支（`PATCH …/teams/:teamId`，`updateTeam`）同样先过 `assertTeamProjectUsable`（事务外的异步 git，`team-git` 的超时），解析不到 → 409 `TEAM_BASE_BRANCH_UNRESOLVED`，原基线不变；事务内项目 `gitPath` 变了 → 409 `TEAM_PROJECT_CHANGED`。只改简报或设置不跑 git。团队页设置对话框把拒绝写在基线分支字段上（`TeamSettingsModal.tsx:settingsErrorKey`，中英文）。
+- 设置（`TeamSettings`，`validators/project-teams.ts:teamSettingsSchema`，严格、≤16KB）可带 `workStart`（`remote` / `local`）：新工作项从 `origin/<基线>` 还是本地基线开始。创建时整份给；`PATCH` 只给要改的键（`teamSettingsPatchSchema`，`null` 删掉一个键），事务里与已存的合并（`team-service.ts:applySettingsPatch`），两个人同时改不同的键不会互相覆盖；设置对话框只发 `workStart`（`workStartPatch`）。团队详情另带 `workStartDefault`（团队不设时的值：项目默认，否则按 origin 是否在 GitHub；还没读出时 null），见[合并工作项与基线配置](merge.md)。
 
 两个创建入口，都调同一条 `POST /api/projects/:projectId/teams`，字段都来自 `components/teams/TeamCreateFields.tsx`（名称、基线分支、说明；「升级为团队」的对话框也用它，见[团队页](page.md)）：
 - 名称、基线分支、说明的 Zod 规则只有一份，在 `shared/project-team-draft.ts`（`teamNameSchema`、`teamBaseBranchSchema`、`teamBriefSchema`，`gitBranchName` 也在这里，`validators/common.ts` 转出）；路由校验器 `validators/project-teams.ts` 与前端 `teams/team-draft.ts:checkTeamDraft` 都用它。`useTeamDraft().submit()` 在草稿不合规时返回 null 并在对应字段显示错误，两个入口都因此不发请求。
-- 项目页团队区块的「新建团队」弹窗（`ProjectTeamsList.tsx:CreateTeamModal`）。
+- 项目页的「新团队」弹窗（`frontend/components/teams/CreateTeamModal.tsx`，页头按钮和团队卡片末尾的虚线卡都打开它，见[项目页](../project-pages.md)）。
 - 新建会话弹窗的「会话 / 以团队开始」切换（`narrator/CreateNarratorModal.tsx`）：
   - 选目录与建会话完全一样；`create-narrator-team.ts:useTeamStartEligibility` 防抖 300ms 后用 `resolve-directory`（`create: false`，见[项目](../projects.md)）查目录，不写库。
   - 选项始终可见；不可用时禁用并写明原因（`teamStartEligibility`），每个原因一行：
@@ -145,17 +147,17 @@ verified_at: d723c61fe
   - 否则在同一事务内连带删除团队行（`deleteTeamOfNarratorInTransaction`）。
 - 团队行 RESTRICT 叙述者与项目删除，删团队级联删工作项与事件（`team-tables-contract.test.ts`）。
 - 侧栏的团队标签（`team:<id>`）跟着生命周期走：归档时 `startTeamStatusSync` 从所有持有者的侧栏移除（取消归档不放回），删除协调者或解散团队时一并移除，失去协调者读权限的持有者也会被移除（见[最近标签页](../recent-tabs.md)）。
-- 数据导入/导出：三张团队表不导出，导入后会话的 `team` trait 以本机有没有团队行为准（`data-portability.ts:reconcileImportedTeamTraits`）。
+- 数据导入/导出：四张团队表（含工作项依赖）不导出，导入后会话的 `team` trait 以本机有没有团队行为准（`data-portability.ts:reconcileImportedTeamTraits`）。
 - IM 网关永远不能驱动团队会话，也不能做团队树里的批准决定。
 
 ## 从哪读起
 - `server/services/teams/team-service.ts`：团队创建、读取、访问判定（本节点的入口，锚在总览）。
 - `team-members.ts`：成员拼装；`team-membership.ts`：会话归属；`team-records.ts`：删除前检查。
 - `server/lib/validators/project-teams.ts`：团队路由的 Zod 校验。
-- `server/db/schema.ts`：`project_teams`、`team_work_items`、`team_work_events` 三张表。
+- `server/db/schema.ts`：`project_teams`、`team_work_items`、`team_work_item_dependencies`、`team_work_events` 四张表。
 
 ## 改它时
-- 动团队三张表：`server/db/schema.ts` 与 `postgres-schema.ts` 同步，再按流程生成 SQLite 与 PG 迁移；`team-tables-contract.test.ts` 在两边对同一组约束，漏一边会失败。
+- 动团队的表：`server/db/schema.ts` 与 `postgres-schema.ts` 同步，再按流程生成 SQLite 与 PG 迁移；`team-tables-contract.test.ts` 在两边对同一组约束，漏一边会失败。
 - 它们不在数据导出清单里：保持 `reconcileImportedTeamTraits` 与清空会话时先删团队表的顺序（团队行 RESTRICT 叙述者删除）。
 - 不要加团队成员表；成员判定变化要同步 `team-members.ts` 的拼装来源与 `team-status-members.test.ts`。
 - 改团队路由入参：`validators/project-teams.ts` 与前端 `lib/api/teams.ts` 一起改；两个创建入口共用 `TeamCreateFields.tsx`，新字段加在那里。人填的字段规则改在 `shared/project-team-draft.ts`，不要在前端另写一份正则（`team-draft.test.ts` 用路由校验器对照）。
