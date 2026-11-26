@@ -1092,7 +1092,7 @@ export function teamRepoGit(repo: string, options: { signal?: AbortSignal } = {}
 			const entries = await scopedConfig(repo, NETWORK_PATTERN, signal);
 			const env = envWithAmbientProxy();
 			let network: ReturnType<typeof networkOverrides>;
-			let source: { url: string; credentials: UrlCredentials | null };
+			let source: FetchSource;
 			try {
 				network = networkOverrides(entries, env);
 				// Fetched from origin's URL itself, never by the name: a password in it goes by
@@ -1140,6 +1140,9 @@ export function teamRepoGit(repo: string, options: { signal?: AbortSignal } = {}
 						["fetch.pruneTags", "false"],
 						["remote.origin.prune", "false"],
 						["remote.origin.pruneTags", "false"],
+						// The host's own `remote.origin.proxy` (what `git fetch origin` applied), by
+						// environment like every override (a proxy URL may carry a login).
+						...source.transport,
 						...login.overrides,
 					],
 					network: true,
@@ -1222,25 +1225,52 @@ export function teamRepoGit(repo: string, options: { signal?: AbortSignal } = {}
 	};
 }
 
+/** Origin's URL, its rewrites, and the transport settings of origin a named fetch applies. */
+const FETCH_ORIGIN_PATTERN =
+	"^(remote\\.origin\\.(url|proxy|proxyauthmethod)|url\\..*\\.insteadof)$";
+
+/** What a fetch from origin's URL is given (see {@link fetchSource}). */
+interface FetchSource {
+	url: string;
+	credentials: UrlCredentials | null;
+	/** Command-scope settings standing in for the host's `remote.origin.*` transport keys. */
+	transport: Array<readonly [string, string]>;
+}
+
 /**
  * The URL a fetch from origin is given: `remote.origin.url` as configured (the first of several,
- * as `git fetch origin` takes it; every check applies to it; a bare name as `./<name>`), its login
- * split off (`splitUrlCredentials`). The fetch runs in the project's repository, so a repository
- * `url.*.insteadOf` that starts the URL (with or without its login) or a `remote.<URL>.*` refuses
- * it (`UnsafeRemoteConfigError`); a password on a transport that cannot take it by environment, or
- * a URL that is not safe on a command line, is a failure (`message`).
+ * as `git fetch origin` takes it; every check applies to it), its login split off
+ * (`splitUrlCredentials`). A bare name (no `/`, `\`, `:` or scheme) is what `git fetch origin`
+ * would make of it: rewritten by the host's `insteadOf` when one matches (the result then checked
+ * like any URL), else a path, given as `./<name>` — `git fetch <bare name>` would take it as a
+ * remote's nickname (the configuration, `.git/remotes/`, `.git/branches/`). The fetch runs in the
+ * project's repository, so a repository `url.*.insteadOf` that starts the given URL or a
+ * `remote.<URL>.*` refuses it (`UnsafeRemoteConfigError`); a password on a transport that cannot
+ * take it by environment, or a URL that is not safe on a command line, is a failure (`message`).
+ *
+ * A fetch by URL reads no `remote.origin.*`, so the host's (system/global; never the repository's)
+ * `remote.origin.proxy` and `remote.origin.proxyAuthMethod` are carried over as `http.proxy` /
+ * `http.proxyAuthMethod`, also for the URL itself (which outranks a host `http.<url>.proxy`, as
+ * the remote's own setting does). Its other keys are not: `fetch`, `tagOpt`, `prune*` and
+ * `uploadpack` are overridden on purpose, `vcs` is refused, and `serverOption` /
+ * `followRemoteHEAD` do not apply to this fetch.
  */
 async function fetchSource(
 	repo: string,
 	signal?: AbortSignal,
-): Promise<{ url: string; credentials: UrlCredentials | null } | { message: string }> {
-	const urls = (await scopedConfig(repo, ORIGIN_PATTERN, signal)).filter(
-		(entry) => entry.key.toLowerCase() === "remote.origin.url",
-	);
+): Promise<FetchSource | { message: string }> {
+	const entries = await scopedConfig(repo, FETCH_ORIGIN_PATTERN, signal);
+	const urls = entries.filter((entry) => entry.key.toLowerCase() === "remote.origin.url");
 	// Several URLs: `git fetch origin` fetches from the first (in configuration order), so does this.
 	const configured = urls[0]?.value.trim() ?? "";
 	if (!configured) return { message: "origin has no URL to fetch from" };
-	const split = splitUrlCredentials(configured);
+	const host = entries.filter((entry) => HOST_SCOPES.has(entry.scope));
+	const isBare = (value: string) => !/[/\\:]/.test(value);
+	// A bare name is rewritten by the host's `insteadOf` first, as a named fetch does.
+	const source = isBare(configured)
+		? (rewritten(configured, host, "insteadof") ?? configured)
+		: configured;
+	const split = splitUrlCredentials(source);
 	if (!split)
 		return {
 			message:
@@ -1248,13 +1278,22 @@ async function fetchSource(
 		};
 	if (split.url.startsWith("-") || unsafeForCommand(split.url))
 		return { message: "origin's URL cannot be fetched from" };
-	// A bare name (no `/`, `\`, `:` or scheme: a sibling path) given to `git fetch` is a remote's
-	// nickname, looked up in the configuration and `.git/remotes/` / `.git/branches/`; as origin's URL
-	// it is a path (what `git fetch origin` fetched from), so it goes as `./<name>`.
-	const url = /[/\\:]/.test(split.url) ? split.url : `./${split.url}`;
+	// Still bare: a path, never a nickname.
+	const url = isBare(split.url) ? `./${split.url}` : split.url;
 	// What git is given is what the repository's own configuration may not rewrite or name.
 	assertPushUrlUntouched(await scopedConfig(repo, PUSH_PATTERN, signal), url, "fetch");
-	return { url, credentials: split.credentials };
+	const transport: Array<readonly [string, string]> = [];
+	const http = /^https?:\/\//i.test(url);
+	for (const [from, to] of [
+		["remote.origin.proxy", "proxy"],
+		["remote.origin.proxyauthmethod", "proxyAuthMethod"],
+	] as const) {
+		const value = hostValue(entries, from);
+		if (value === undefined) continue;
+		transport.push([`http.${to}`, value]);
+		if (http) transport.push([`http.${url}.${to}`, value]);
+	}
+	return { url, credentials: split.credentials, transport };
 }
 
 /**

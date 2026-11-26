@@ -1168,6 +1168,39 @@ describe.skipIf(process.platform === "win32")("review fixes, second round (Devin
 		expect((await summary(a.id)).pr).toMatchObject({ state: "OPEN", canMergePr: true });
 	});
 
+	test("3: queued, closed, reopened at the same head: no longer queued; 「合并 PR」 again (Devin)", async () => {
+		const a = await readyItem("requeue");
+		await github(a.head);
+		open(a.id);
+		await settle();
+		await fake.setPlan(
+			plan(a.head, { "pr view": { stdout: prView(a.head) }, "pr merge": { stdout: "" } }),
+		);
+		mergePr(a.id, "merge");
+		await settle();
+		expect((await summary(a.id)).pr).toMatchObject({ queued: true, mergeBlocker: "queued" });
+		await fake.setPlan(
+			plan(a.head, { "pr view": { stdout: prView(a.head, { state: "CLOSED" }) } }),
+		);
+		await refreshPullRequest(a.id, { force: true });
+		await fake.setPlan(plan(a.head));
+		await refreshPullRequest(a.id, { force: true });
+		expect((await summary(a.id)).pr).toMatchObject({
+			state: "OPEN",
+			queued: false,
+			canMergePr: true,
+			mergeBlocker: null,
+		});
+		// GitHub's own auto-merge still counts.
+		await fake.setPlan(
+			plan(a.head, {
+				"pr view": { stdout: prView(a.head, { autoMergeRequest: { mergeMethod: "MERGE" } }) },
+			}),
+		);
+		await refreshPullRequest(a.id, { force: true });
+		expect((await summary(a.id)).pr).toMatchObject({ queued: true });
+	});
+
 	test("4: a legacy event's repository comes from its URL's host with the port", () => {
 		const ref = { host: "ghe.test:8443", owner: "Acme", repo: "App", number: 7 };
 		expect(aboutPullRequest({ pr: 7, url: "https://ghe.test:8443/acme/app/pull/7" }, ref)).toBe(

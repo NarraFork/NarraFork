@@ -64,7 +64,7 @@ keywords:
   - prClosedForItem
   - currentPullRequest
 status: draft
-verified_at: 99aea0a780019e5df9a0afd6cb4097bccdd31ea4
+verified_at: 0413037ddc607fdf345d4bbac631a8e346a69999
 ---
 # GitHub PR 流程
 
@@ -97,7 +97,7 @@ origin 从原始配置读（`team-git-write.ts:originTarget`，见[合并](merge
 - 先读 PR（`gh pr view`）：已 MERGED → 按下面「合并落地」的规则判断（点之前就合并了，记为 system）；基线不是这一项的基线 → `TEAM_PR_BASE_MISMATCH`，不合并；CLOSED → `TEAM_PR_CLOSED`；PR 上的 head 不是 ready 的 head → `TEAM_PR_HEAD_STALE`（先「更新 PR」）；草稿 → `TEAM_PR_DRAFT`；`BLOCKED` → `TEAM_PR_BLOCKED`；`BEHIND` → `TEAM_PR_BEHIND`；`UNKNOWN` 或空 → `TEAM_PR_STATE_UNKNOWN`；`DIRTY` → 冲突（见下）；只有 `CLEAN`、`HAS_HOOKS`、`UNSTABLE` 才合并。消息都带 PR 链接。
 - PR 只在当前仓库里找（见上），找不到 `TEAM_PR_NONE`。
 - `gh pr merge N -R … --<merge|squash|rebase> --match-head-commit=<head>`，从不带 `--delete-branch`（会删本地分支）、`--admin`、`--auto`；gh 说 head 变了 → `TEAM_PR_HEAD_STALE`，其他失败 `TEAM_PR_MERGE_FAILED`。
-- 合并后再读：MERGED → 记合并；仍 OPEN（合并队列或自动合并接手）→ `work.pr_queued {pr, url, method, head}`，界面显示「已加入合并队列」。
+- 合并后再读：MERGED → 记合并；仍 OPEN（合并队列或自动合并接手）→ `work.pr_queued {pr, url, repository, method, head}`，界面显示「已加入合并队列」。「已加入」只认比这个 PR 最新的 `work.pr_opened`/`work.pr_closed` 更新的 `work.pr_queued`（关闭再重新打开就离开了队列，`team-pr-state.ts:prQueued`），GitHub 上的自动合并（`autoMergeRequest`）照样算。
 - 冲突（`recordConflict`）：同一 PR 同一 head 已记过、又不是成员点的（后台一轮）就直接返回，不拉取也不算；否则先尽力拉取 `origin/<基线>`（`fetchBaseFromOrigin`，只动远程跟踪 ref），再用加固的 `merge-tree` 算 head 与它的冲突文件（git ≥2.38，最多 50），冲突列表按（仓库、head、基线提交）缓存，最多 200 条；记 `work.merge_failed {code: "conflict", job: "pr_merge", pr, url, repository, conflicts, more, base, head}`；「已记过」按仓库加号码加 head 比对（`aboutPullRequest`，旧事件的仓库从 URL 推出，含端口），别的仓库同号的冲突不算；同一 PR 同一 head 只通知协调者一次（`pullRequestConflictNote`），成员再点「合并 PR」仍记一条结果。
 
 合并落地先判断这次合并是不是这一项的（`mergedPullRequest`）：PR 合进的基线必须是这一项的基线；GitHub 合并的 head 正是 ready 的 head，或 ready 的 head 在它里面（`gh api --hostname=H --method=GET repos/<o>/<r>/compare/<ready head>...<PR head>?per_page=1 --jq=.status` 为 `ahead`/`identical`，64KB 以内、Zod 校验；GitHub 上没有 ready 的 head 时 404，算不在）。不是的——在旧 head 上合并的（这一项退回后重新 ready 了）或合进别的基线的——记 `work.pr_closed {pr, url, repository, merged: true, reason: "older_head" | "other_base", head, base}`（已当作关闭时不再记），项仍 ready，摘要把这个 PR 当作已关闭，按钮是「重新发起 PR」，再发起时为新 head 开新的 PR（`pr list` 里旧的 MERGED 不在新 head 上，不复用）。OPEN 的 PR 被改了基线同样记 `work.pr_closed {reason: "other_base"}`。

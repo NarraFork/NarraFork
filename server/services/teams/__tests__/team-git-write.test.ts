@@ -1574,6 +1574,99 @@ describe("the fetch of origin's base (review 5)", () => {
 		expect(upHead).not.toBe(elsewhereHead);
 	});
 
+	test("a bare name the host's insteadOf rewrites is fetched from the rewrite (Devin)", async () => {
+		await commitFile("a.txt", "a\n", "base");
+		const target = join(temporary, `target-${Math.random().toString(36).slice(2)}.git`);
+		await git(["init", "-q", "--bare", "-b", "main", target], temporary);
+		const other = await mkdtemp(join(temporary, "clone-"));
+		await git(["clone", "-q", repo, other], temporary);
+		const targetHead = await commitFile("t.txt", "t\n", "target's", other);
+		await git(["push", "-q", target, "HEAD:main"], other);
+		const elsewhere = join(temporary, `elsewhere-${Math.random().toString(36).slice(2)}.git`);
+		await git(["init", "-q", "--bare", "-b", "main", elsewhere], temporary);
+		await commitFile("e.txt", "e\n", "elsewhere's", other);
+		await git(["push", "-q", elsewhere, "HEAD:main"], other);
+		await git(["remote", "add", "origin", "up"]);
+		// A nickname git would read for `git fetch up` points elsewhere; never read.
+		await mkdir(join(repo, ".git", "remotes"), { recursive: true });
+		await writeFile(join(repo, ".git", "remotes", "up"), `URL: ${elsewhere}\n`);
+		await writeFile(globalConfig, `${HOST_USER}[url "${target}"]\n\tinsteadOf = up\n`);
+		expect(await teamRepoGit(repo).fetchBaseFromOrigin("main")).toEqual({ ok: true });
+		expect(await git(["rev-parse", "refs/remotes/origin/main"])).toBe(targetHead);
+		// Rewritten to a URL with a login: split like any other, the password never on argv.
+		const { server, logins, leaks } = loginServer();
+		try {
+			await writeFile(
+				globalConfig,
+				`${HOST_USER}[url "http://alice:s3cr3t@127.0.0.1:${server.port}/o/r.git"]\n\tinsteadOf = up\n`,
+			);
+			const result = await teamRepoGit(repo).fetchBaseFromOrigin("main");
+			expect(result.ok).toBe(false);
+			expect(logins).toEqual(["-", "alice:s3cr3t"]);
+			expect(leaks).toEqual([]);
+			// And a repository rewrite of the rewritten URL is refused.
+			await git(["config", "url.ext::sh -c false.insteadOf", "http://127.0.0.1:"]);
+			expect(await teamRepoGit(repo).fetchBaseFromOrigin("main")).toMatchObject({
+				ok: false,
+				message: expect.stringContaining(".insteadof"),
+			});
+		} finally {
+			server.stop(true);
+		}
+	});
+
+	test("the host's remote.origin.proxy is used, the repository's never; no login on argv (Devin)", async () => {
+		const keys = ["http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "no_proxy", "NO_PROXY"];
+		const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+		for (const key of keys) delete process.env[key];
+		const proxied = (name: string) => {
+			const seen: string[] = [];
+			const server = Bun.serve({
+				port: 0,
+				hostname: "127.0.0.1",
+				fetch: (request) => {
+					seen.push(`${name} ${request.url}`);
+					return new Response("no", { status: 502 });
+				},
+			});
+			return { server, seen };
+		};
+		const host = proxied("host");
+		const mine = proxied("repo");
+		const leaks: string[] = [];
+		const scan = async () => {
+			for (const pid of await readdir("/proc").catch(() => [] as string[])) {
+				if (!/^\d+$/.test(pid)) continue;
+				const argv = await readFile(`/proc/${pid}/cmdline`, "utf8").catch(() => "");
+				if (argv.includes("pxs3cr3t") || argv.includes("s3cr3t@")) leaks.push(argv);
+			}
+		};
+		const timer = setInterval(() => void scan(), 5);
+		try {
+			await commitFile("a.txt", "a\n", "base");
+			await git(["remote", "add", "origin", "http://alice:s3cr3t@127.0.0.1:1/o/r.git"]);
+			await git(["config", "remote.origin.proxy", `http://127.0.0.1:${mine.server.port}`]);
+			await writeFile(
+				globalConfig,
+				`${HOST_USER}[remote "origin"]\n\tproxy = http://px:pxs3cr3t@127.0.0.1:${host.server.port}\n`,
+			);
+			const result = await teamRepoGit(repo).fetchBaseFromOrigin("main");
+			expect(result.ok).toBe(false);
+			expect(host.seen.length).toBeGreaterThan(0);
+			expect(host.seen[0]).toContain("127.0.0.1:1/o/r.git/info/refs");
+			expect(mine.seen).toEqual([]);
+			await scan();
+			expect(leaks).toEqual([]);
+		} finally {
+			clearInterval(timer);
+			host.server.stop(true);
+			mine.server.stop(true);
+			for (const key of keys)
+				if (saved[key] === undefined) delete process.env[key];
+				else process.env[key] = saved[key];
+		}
+	});
+
 	test("only refs/remotes/origin/<base> moves, whatever origin's fetch refspecs say", async () => {
 		await commitFile("a.txt", "a\n", "base");
 		const origin = join(temporary, `origin-${Math.random().toString(36).slice(2)}.git`);

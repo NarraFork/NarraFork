@@ -122,7 +122,7 @@ export function aboutPullRequest(detail: Record<string, unknown>, ref: PrRef): b
 /** The newest event of `kind` about pull request `ref` of an item (its detail), or null. */
 export function latestPrEvent(
 	itemId: string,
-	kind: "work.pr_checks" | "work.pr_queued" | "work.pr_closed",
+	kind: "work.pr_checks" | "work.pr_closed",
 	ref: PrRef,
 ): Record<string, unknown> | null {
 	for (const row of newestEvents(itemId, [kind]))
@@ -347,10 +347,6 @@ export function prMergeBlocker(input: {
 }
 
 /**
- * Whether GitHub queued the merge of `pr` at `headSha`: auto-merge is on, or a merge NarraFork
- * asked for was accepted at that head (`work.pr_queued`) while the pull request is still open.
- */
-/**
  * Whether two heads are the same commit; a board card carries its head abbreviated (12
  * characters), so a prefix of at least that much counts.
  */
@@ -360,6 +356,24 @@ export function sameHead(a: unknown, b: unknown): boolean {
 	return a.length <= b.length ? b.startsWith(a) : a.startsWith(b);
 }
 
+/**
+ * The `work.pr_queued` of pull request `ref` still in force: only one newer than its newest
+ * `work.pr_opened` / `work.pr_closed` (a pull request closed, and opened again since, left any
+ * queue it was in). Null otherwise.
+ */
+function queuedSinceOpened(itemId: string, ref: PrRef): Record<string, unknown> | null {
+	for (const row of newestEvents(itemId, ["work.pr_queued", "work.pr_opened", "work.pr_closed"])) {
+		if (!row.detail || !aboutPullRequest(row.detail, ref)) continue;
+		return row.kind === "work.pr_queued" ? row.detail : null;
+	}
+	return null;
+}
+
+/**
+ * Whether GitHub queued the merge of `pr` at `headSha`: auto-merge is on (GitHub's live signal),
+ * or a merge NarraFork asked for was accepted at that head (`work.pr_queued`, since the pull
+ * request was last opened or closed) while the pull request is still open.
+ */
 export function prQueued(
 	itemId: string,
 	ref: PrRef,
@@ -368,7 +382,7 @@ export function prQueued(
 ) {
 	if (!status || status.state !== "OPEN") return false;
 	if (status.autoMerge) return true;
-	const queued = latestPrEvent(itemId, "work.pr_queued", ref);
+	const queued = queuedSinceOpened(itemId, ref);
 	return !!queued && sameHead(queued.head, headSha) && sameHead(status.headSha, headSha);
 }
 
