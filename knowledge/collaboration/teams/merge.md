@@ -55,7 +55,7 @@ keywords:
   - assertTipStill
   - GIT_TOO_OLD_FOR_PARTIAL_CLONE
 status: draft
-verified_at: ddc6b6a25ee0907d09b3af062d68f5ce3ee7b31e
+verified_at: 29a63ae6cf12cd6b8ac56e38da9fa769d9bc7b23
 ---
 # 合并工作项与基线配置
 
@@ -103,7 +103,7 @@ verified_at: ddc6b6a25ee0907d09b3af062d68f5ce3ee7b31e
 - 拉取的凭证与传输只听主机（`networkOverrides`，用 `--show-scope` 读）：凭证助手一旦仓库配了就整表重置再按顺序加回主机的；仓库的其他 `credential.*`、`core.askPass` 取主机值或空（`protectProtocol`、`sanitizePrompt` 取主机值或 true）；`http.*.extraHeader` 同凭证助手：整表重置再加回主机的；仓库的 `http.*` 取主机值，否则 `sslVerify` 为 true、代理为服务端环境的、`extraHeader`/`cookieFile` 为空、`saveCookies` 为 false，其余（如 `sslCAInfo`）拒绝；仓库的 `remote.origin.vcs`、`core.gitProxy`（先匹配的生效，命令级盖不住）、改写 origin URL 的仓库 `url.*.insteadOf` 也拒绝（`TEAM_REMOTE_CONFIG_UNSAFE`，当作拉取失败）。传输只许 https/http/ssh/git/本地路径，`ext::` 永远不许；`remote.origin.uploadpack` 固定、`core.gitProxy` 置空。ssh：服务端环境里运维设的 `GIT_SSH_COMMAND` 优先，只设了 `GIT_SSH` 时把它加引号作为 `GIT_SSH_COMMAND` 传下去，否则主机的 `core.sshCommand`，否则 `ssh -o BatchMode=yes`（`sshSettings`）。
 - 起点为 `origin/<基线>` 的项按 `refs/remotes/origin/<基线>` 比较（`compareRefFor`：知识检查、评审后提交数、改动路径、大小、diff、重叠、隔离项清理），祖先检测本地基线与它都看；本地基线仍是本地合并的目标。
 - `work.sync` 同样按起点模式取要合进来的基线（`origin/<基线>` 或本地基线），指令里写的就是它。
-- hosting：`git remote get-url --push origin`（应用 pushurl 与 insteadOf），解析 scp / ssh / https（去掉 userinfo，不记日志），主机小写，路径必须正好 owner/repo。github.com（含 www 与 ssh.github.com）按名字算 GitHub；别的主机只有 gh 认识它（`gh auth status --hostname H --json hosts` 列出它，登录与否）才算 GitHub Enterprise，没有 gh 就是其他主机（`resolveHosting`）。GitHub 再探 gh（`probeGhAccess`：`Bun.which`、`gh --version` 5 秒、`gh auth status` 登录成功、`gh repo view host/owner/repo --json viewerPermission,…` 要 WRITE/MAINTAIN/ADMIN 且未归档），结果放在 hosting 的 `gh` 里，带仓库允许的合并方式（默认的排第一）。读失败是 `unknown`（合并按 `checking` 禁用，绝不退到本地合并；起点默认按本地）。缓存按仓库：成功 5 分钟；失败、或 GitHub 但 gh 用不了，60 秒（主机上 `gh auth login` 后很快生效）；单飞，请求只读缓存（`peekHosting`）。测试接缝 `setHostingSourceForTests`、`setGhProbeForTests`。
+- hosting：origin 从原始配置读（`team-git-write.ts:originTarget`，`--show-scope`）：配置的 `remote.origin.url` 只套主机（system/global）的 `pushInsteadOf`，没有匹配再套 `insteadOf`（最长前缀）；配了 `remote.origin.pushurl`、origin 有多个 URL、或仓库/worktree 自己的 `insteadOf`/`pushInsteadOf` 前缀命中 origin 的 URL，都拒绝 `TEAM_REMOTE_CONFIG_UNSAFE`，hosting 为 `unsafe`（模式按 `checking`，禁用原因 `remote_config_unsafe`，本地合并同样拒绝；60 秒后再读）。不用 git 的 `get-url --push`（它会套仓库自己的 pushurl 与改写）。解析 scp / ssh / https（去掉 userinfo，不记日志），主机小写，路径必须正好 owner/repo。github.com（含 www 与 ssh.github.com）按名字算 GitHub；别的主机只有 gh 认识它（`gh auth status --hostname H --json hosts` 列出它，登录与否）才算 GitHub Enterprise，没有 gh 就是其他主机（`resolveHosting`）。GitHub 再探 gh（`probeGhAccess`：`Bun.which`、`gh --version` 5 秒、`gh auth status` 登录成功、`gh repo view host/owner/repo --json viewerPermission,…` 要 WRITE/MAINTAIN/ADMIN 且未归档），结果放在 hosting 的 `gh` 里，带仓库允许的合并方式（默认的排第一）。读失败是 `unknown`（合并按 `checking` 禁用，绝不退到本地合并；起点默认按本地）。缓存按仓库：成功 5 分钟；失败、或 GitHub 但 gh 用不了，60 秒（主机上 `gh auth login` 后很快生效）；单飞，请求只读缓存（`peekHosting`）。测试接缝 `setHostingSourceForTests`、`setGhProbeForTests`。
 
 前端（`TeamMerge.tsx`，抽屉底栏与「等你处理」卡片共用）：`MergeButton`（合并到 {{base}} → 正在合并… / 正在快进…，prepared 后是「重新准备」，禁用时 tooltip 说原因）；`MergeOutcome`（冲突文件列表与「退回给工作者」，退回理由预填冲突文件最多 20 个；失败原因；prepared 的说明、「在该目录中快进」确认框列出改动文件、可复制命令）。合并任务在跑时抽屉每 1.5 秒重读。
 

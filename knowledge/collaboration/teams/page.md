@@ -55,7 +55,7 @@ keywords:
   - MergeButton
   - MergeOutcome
 status: draft
-verified_at: ddc6b6a25ee0907d09b3af062d68f5ce3ee7b31e
+verified_at: 29a63ae6cf12cd6b8ac56e38da9fa769d9bc7b23
 ---
 # 团队页与审批
 
@@ -69,6 +69,7 @@ verified_at: ddc6b6a25ee0907d09b3af062d68f5ce3ee7b31e
 - D：看板卡片（`readTeamBoardColumn`、`readBoardItem`、`readReadyItems`）多 `dependsOn: { id, title, state }[]`，整页一次 `IN` 读（`team-board.ts:withDependencies`），没有依赖时是空数组。
 - M：`readTeamBoardColumn` 与 `readReadyItems` 的 ready 卡片多 `merge`（模式、任务阶段、最新结果、能否合并与禁用原因；GitHub 模式另带 `pr`：PR 号、链接、状态、CI、评审、能否「合并 PR」与原因；`team-board.ts:withMerge`，不跑 git 也不跑 gh，见[合并](merge.md)）。
 - `work-stats?ids=`（读者可读，最多 50 个，逗号分隔）：每项 `+/-`、文件数、二进制数、`truncated`。活的项在其 worktree 里按 HEAD 与基线的合并基 `diff --numstat` 读；已结束或 worktree 没了的项用最近一次 `work.ready` 事件记下的 `head` 与 `mergeBase`，在项目仓库（协调者 cwd）里读；都没有就是 null。结果按项缓存 20 秒、项的 `updated_at` 一变就重读，最多 200 条，每条只留总数和前 300 个文件，同一请求并发 4 个。前端按 50 个一组分批请求，每一行都有大小；没有改动（+0 −0 且 0 个文件）时不显示。
+- 项目级的 `GET/PUT/DELETE /api/projects/:projectId/team-github`（确认的 GitHub 仓库，见 [GitHub PR 流程](pull-requests.md)）也在 `project-teams.ts`。
 - `work/:itemId`（读者可读）：卡片、基线、领先几个提交（`rev-list --count`）、大小、改动文件（最多 300，`filesMore`）、能否读 diff、评审轮次（`work.review` 与 `work.returned` 事件）、这一项最近 100 条事件（详情 ≤2304 字才带）、`canReturn`（成员、团队活跃、状态 in_review/ready）、依赖它的项 `dependents`（最多 50，`dependentsMore`），ready 项另带 `merge`（`team-merge.ts:mergeViewOf`）。不带 diff 正文。
 - 评审意见（`work.review` 详情里的 `summary`，见[工作项](work-items.md)）：每轮的 `summary` 随轮次返回，读者能读抽屉就能读到，陌生人与抽屉一样 404。详情超过 2304 字的 review 行，分页查询只带头 96 字（`team-board.ts:reviewHeadColumns`：`case`/`substr`，不用 JSON 函数；`reviewHeadDetail` 从 `{"round":N,"verdict":…,"findings":N` 取轮次、结论、问题数），意见原文再按主键逐行读（`readReviewDetailText`，每行最多 8192 字即详情字节上限），从最新往前，攒够 6000 字意见或读满 `TEAM_REVIEW_DETAILS_READ_CHARS`=36000 字详情就停（`team-work-view.ts:itemEvents`）；没读的更早长评审只留轮次、结论、问题数，标 `summaryClipped`。`eventDetail` 解析后留下轮次、结论、问题数与 `summary`。一次抽屉读最多发 `TEAM_REVIEW_SUMMARIES_TOTAL_CHARS`=6000 字意见：从最新一轮往前，装不下的那轮截断，更早的不带，都标 `summaryClipped`（`team-work-view.ts:capReviewSummaries`）；时间线里的 review 事件去掉 `summary`，不重复发。动态（`events`）不读长详情：超过 2304 字的 review 事件照旧 `detailOmitted`。
 - `work/:itemId/diff?path=`：路径按字面、从仓库根算（`:(top,literal)`，`*.txt` 就是那个文件，不是通配；已结束的项在协调者工作目录里读，它可能是子目录），只读合并基 → head 的改动，没改过的路径 diff 为空即 404；`diff -U3` 经 `stdoutStream` 读到 64KB+1 字节即停，`truncated` 标出。
@@ -119,6 +120,7 @@ verified_at: ddc6b6a25ee0907d09b3af062d68f5ce3ee7b31e
 - 新增审批类型：`teamApprovalKind`（`shared/project-teams.ts`）、`TeamAttention.tsx` 的卡片与 `rowLine`。
 - 新读接口必须带 LIMIT、走索引，并保持 SQLite 专用；git 读必须有超时与输出上限，diff 正文只在抽屉里按文件读。
 - 改合并的按钮与结果：`TeamMerge.tsx` 与 `team-page-model.ts:mergeControl` 同时用于抽屉和卡片；规则见[合并](merge.md)。
+- 确认 GitHub 仓库（G）：摘要的 `github {target, pinned, canConfirm}`；没确认时管理员点「发起 PR」先弹确认框（`githubConfirmation`，「将推送到 … 并在那里开 PR」），确认（`useSetTeamGithub`，`PUT …/team-github`）后接着发起；非管理员禁用（`github_unconfirmed`）；origin 指向别处时禁用（`github_target_changed`）并给项目设置的链接。按钮写着 `owner/repo`（`pullRequestRepo`）。抽屉只在 `pr.canRefresh` 时读 PR。看板与卡片的 head 是缩写的，PR 的 head 按前缀比较（`team-pr-state.ts:sameHead`）。
 - PR 的按钮与标签（G）：`team-page-model.ts:mergeControl` 在 GitHub 模式下给「发起 PR」（无 PR、或已合并）/「更新 PR」（PR 上不是 ready 的 head）/「重新发起 PR」（已关闭），PR 正好是 ready 的 head 时返回 null，由 `pullRequestControl` 给「查看 PR #N」（只用 http(s) 链接，`safeHref`）、标签（CI：通过 / N 项失败 / N 项进行中 / 无检查；评审：需要评审 / 已批准 / 要求修改；有冲突 / 落后于基线 / 被阻止 / 草稿；已加入合并队列；检查中）与「合并 PR」（只在 `canMergePr`，即 CLEAN、HAS_HOOKS、UNSTABLE；仓库允许多种方式时旁边一个菜单，默认的排第一；禁用时 tooltip 说 `prBlocker` 或整项的禁用原因）。抽屉打开、有 PR 且是成员时调一次 `pr/refresh`（`useRefreshPullRequest`），`pr.refreshing` 时与任务在跑时一样每 1.5 秒重读；失败的检查列在 `MergeOutcome` 上方（带链接）；底栏说明在 GitHub 模式换成 `barNotePr`。
 - 改待批计数的规则：页头状态句、侧栏团队标签、项目页团队卡片共用 `pendingCount`；项目页 `ProjectTeamCards` 的 `data-testid="project-team-card"` 是每个团队一张（浏览器测试 `team-page.browser.test.ts` 按它数）。
 
