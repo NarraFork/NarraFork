@@ -15,6 +15,7 @@ import type {
 	TeamPageSummary,
 	TeamPendingApproval,
 	TeamWorkItemDetail,
+	TeamWorkPullRequest,
 } from "@shared/project-teams";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
@@ -1423,5 +1424,234 @@ describe("merge (M)", () => {
 		);
 		expect(offBase).toContain('data-testid="team-merge-blocker"');
 		expect(offBase).not.toContain('data-testid="team-merge-command"');
+	});
+});
+
+describe("pull requests (G)", () => {
+	const pr = (over: Partial<TeamWorkPullRequest> = {}): TeamWorkPullRequest => ({
+		number: 7,
+		url: "https://github.com/acme/app/pull/7",
+		state: "OPEN",
+		isDraft: false,
+		headMatches: true,
+		mergeState: "CLEAN",
+		review: null,
+		checks: {
+			state: "passing",
+			pass: 2,
+			fail: 0,
+			pending: 0,
+			skipping: 0,
+			total: 2,
+			failures: [],
+		},
+		queued: false,
+		checkedAt: "2026-11-25T00:00:00.000Z",
+		refreshing: false,
+		error: null,
+		methods: ["squash", "merge"],
+		canMergePr: true,
+		mergeBlocker: null,
+		...over,
+	});
+	const github = (over: Record<string, unknown> = {}) =>
+		({
+			mode: "github" as const,
+			phase: null,
+			job: null,
+			outcome: null,
+			canMerge: true,
+			disabledReason: null,
+			pr: null,
+			...over,
+		}) as NonNullable<TeamBoardItem["merge"]>;
+	const card = (merge: TeamBoardItem["merge"], lng: "en" | "zh-CN" = "zh-CN") =>
+		render(
+			<TeamAttention
+				entries={attentionEntries({
+					member: true,
+					approvals: [],
+					items: [
+						item({
+							id: "r",
+							state: "ready",
+							lastReview: "clear",
+							reviewRounds: 1,
+							title: "Ship it",
+							branch: "team/ship",
+							worker: null,
+							merge,
+						}),
+					],
+				})}
+				phone={false}
+				teamId="lead"
+				projectId="p"
+				base="main"
+				stats={undefined}
+				onOpenItem={noop}
+			/>,
+			new QueryClient(),
+			lng,
+		);
+	const disabled = (testId: string) =>
+		new RegExp(`<button[^>]*disabled=""[^>]*data-testid="${testId}"`);
+
+	test("发起 PR, then 正在推送分支… / 正在创建 PR…; 更新 PR after a re-ready; 重新发起 PR when closed", async () => {
+		const start = await card(github());
+		expect(start).toContain("发起 PR");
+		expect(start).toContain('data-merge-label="openPr"');
+		expect(start).not.toMatch(disabled("team-merge-button"));
+		expect(await card(github({ phase: "pushing", job: "pull_request" }))).toContain(
+			"正在推送分支…",
+		);
+		expect(await card(github({ phase: "opening", job: "pull_request" }))).toContain("正在创建 PR…");
+		const update = await card(github({ pr: pr({ headMatches: false }) }));
+		expect(update).toContain("更新 PR");
+		expect(update).toContain("查看 PR #7");
+		expect(update).not.toContain('data-testid="team-pr-merge"');
+		const closed = await card(github({ pr: pr({ state: "CLOSED" }) }));
+		expect(closed).toContain("重新发起 PR");
+		expect(closed).toContain("已关闭");
+	});
+
+	test("查看 PR #N with its labels; 合并 PR with a menu of methods; enabled only when GitHub can merge", async () => {
+		const html = await card(github({ pr: pr({ review: "APPROVED" }) }));
+		expect(html).toContain("查看 PR #7");
+		expect(html).toContain('href="https://github.com/acme/app/pull/7"');
+		expect(html).toContain('rel="noopener noreferrer"');
+		expect(html).toContain("CI 通过");
+		expect(html).toContain("已批准");
+		expect(html).toContain("合并 PR");
+		expect(html).toContain("压缩合并");
+		expect(html).toContain('data-testid="team-pr-method"');
+		expect(html).toContain('data-method="squash"');
+		expect(html).not.toMatch(disabled("team-pr-merge"));
+		// The main button is gone: the pull request is current.
+		expect(html).not.toContain('data-testid="team-merge-button"');
+		// One method: no menu.
+		const single = await card(github({ pr: pr({ methods: ["merge"] }) }));
+		expect(single).not.toContain('data-testid="team-pr-method"');
+		expect(single).toContain('data-method="merge"');
+		const cases: Array<[Partial<TeamWorkPullRequest>, string, string]> = [
+			[{ mergeState: "BLOCKED", review: "REVIEW_REQUIRED" }, "blocked", "需要评审"],
+			[{ mergeState: "BEHIND" }, "behind", "落后于 main"],
+			[{ mergeState: "DIRTY" }, "dirty", "有冲突"],
+			[{ isDraft: true, mergeState: "DRAFT" }, "draft", "草稿"],
+			[{ mergeState: "UNKNOWN" }, "unknown", "合并 PR"],
+			[{ queued: true }, "queued", "已加入合并队列"],
+			[
+				{
+					checks: {
+						state: "failing",
+						pass: 1,
+						fail: 3,
+						pending: 0,
+						skipping: 0,
+						total: 4,
+						failures: [],
+					},
+					mergeState: "BLOCKED",
+				},
+				"blocked",
+				"3 项失败",
+			],
+			[
+				{
+					checks: {
+						state: "pending",
+						pass: 1,
+						fail: 0,
+						pending: 2,
+						skipping: 0,
+						total: 3,
+						failures: [],
+					},
+					mergeState: "BLOCKED",
+				},
+				"blocked",
+				"2 项进行中",
+			],
+			[{ review: "CHANGES_REQUESTED", mergeState: "BLOCKED" }, "blocked", "要求修改"],
+		];
+		for (const [over, blocker, words] of cases) {
+			const view = await card(
+				github({ pr: pr({ ...over, canMergePr: false, mergeBlocker: blocker as never }) }),
+			);
+			expect({ blocker, disabled: disabled("team-pr-merge").test(view) }).toEqual({
+				blocker,
+				disabled: true,
+			});
+			expect({ blocker, words: view.includes(words) }).toEqual({ blocker, words: true });
+		}
+		expect(await card(github({ pr: pr({ state: null }) }))).toContain("检查中…");
+		const en = await card(github({ pr: pr({ checks: null }) }), "en");
+		expect(en).toContain("View PR #7");
+		expect(en).toContain("Merge the pull request");
+	});
+
+	test("GitHub but gh cannot serve it: 发起 PR disabled with the reason, in both languages", async () => {
+		for (const [reason, words] of [
+			["gh_missing", "主机上没有 gh"],
+			["gh_logged_out", "在主机上运行 gh auth login"],
+			["gh_no_permission", "gh 账号对该仓库没有写权限"],
+			["gh_repo_archived", "已归档"],
+			["gh_unavailable", "gh 读不到这个仓库"],
+		] as const) {
+			const html = await card(github({ canMerge: false, disabledReason: reason }));
+			expect(html).toMatch(disabled("team-merge-button"));
+			expect(html).toContain(`data-reason="${reason}"`);
+			expect(zh.teams.page.merge.disabled[reason]).toContain(words);
+			expect(typeof en.teams.page.merge.disabled[reason]).toBe("string");
+		}
+	});
+
+	test("the drawer: failed checks linked, a rejected push offers 退回", async () => {
+		const { MergeOutcome } = await import("./TeamMerge");
+		const outcome = (merge: NonNullable<TeamWorkItemDetail["merge"]>) =>
+			render(
+				<MergeOutcome
+					projectId="p"
+					teamId="lead"
+					itemId="r"
+					base="main"
+					merge={merge}
+					canReturn
+					onReturn={noop}
+				/>,
+				new QueryClient(),
+				"zh-CN",
+			);
+		const failing = await outcome({
+			...github({
+				pr: pr({
+					checks: {
+						state: "failing",
+						pass: 0,
+						fail: 1,
+						pending: 0,
+						skipping: 0,
+						total: 1,
+						failures: [{ name: "CI / test", link: "https://ci.example/1" }],
+					},
+				}),
+			}),
+			detail: null,
+		});
+		expect(failing).toContain('data-testid="team-pr-failures"');
+		expect(failing).toContain('href="https://ci.example/1"');
+		expect(failing).toContain("失败的检查");
+		const rejected = await outcome({
+			...github({ outcome: "failed" }),
+			detail: {
+				kind: "failed",
+				code: "TEAM_PR_PUSH_REJECTED",
+				message: "rejected",
+				at: "2026-11-25T00:00:00.000Z",
+			},
+		});
+		expect(rejected).toContain('data-code="TEAM_PR_PUSH_REJECTED"');
+		expect(rejected).toContain("GitHub 拒绝了推送");
+		expect(rejected).toContain('data-testid="team-merge-rejected-return"');
 	});
 });
