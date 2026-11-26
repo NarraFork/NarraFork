@@ -36,13 +36,13 @@ import {
 	validateComposerProjection,
 } from "../lib/composer-document";
 import { AppError } from "../lib/errors";
-import { generateShortId } from "../lib/id";
+import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import type { ImageRef } from "../lib/uploads";
 import { MAILBOX_LIMITS } from "./agent-runtime/limits";
-import { createMailboxStore, mailboxDedupeKey } from "./agent-runtime/mailbox";
-import type { MailboxRow } from "./agent-runtime/mailbox-types";
+import { boundedError, createMailboxStore, mailboxDedupeKey } from "./agent-runtime/mailbox";
+import type { MailboxClaim, MailboxRow } from "./agent-runtime/mailbox-types";
 import { RuntimeReadConflictError } from "./agent-runtime/read-conflict";
 import {
 	getRuntimeQueuePort,
@@ -515,6 +515,8 @@ function ensureStagingDirectory(id: string): string {
 	return dir;
 }
 interface StagingMetadata {
+	independentNewNarratorId?: string;
+	independentNewCompleted?: boolean;
 	submissionFingerprint?: string;
 	submissionAttachments?: UserSubmission["attachments"];
 	humanReplyContext?: import("@shared/reply-context").ReplyContext;
@@ -684,7 +686,12 @@ export async function persistAdditionalBufferedTextFiles(
 ): Promise<SavedBufferedFile[]> {
 	assertSqliteBufferRead("persistAdditionalBufferedTextFiles");
 	const row = await rowById(messageId);
-	if (!row || row.kind !== "user_input" || !pending.includes(row.state as "queued" | "failed"))
+	if (
+		!row ||
+		row.kind !== "user_input" ||
+		json<StagingMetadata>(row.metadataJson, {}).independentNewNarratorId ||
+		!pending.includes(row.state as "queued" | "failed")
+	)
 		throw new Error("Buffered message is no longer editable");
 	const id = json<{ stagingId?: string }>(row.metadataJson, {}).stagingId ?? row.id;
 	if (files.length) {
@@ -754,6 +761,8 @@ export function projectMailboxUserMessage(row: RuntimeMailboxRow): BufferedMessa
 	const payload = json<{ path: string } | null>(row.payloadRefJson, null);
 	const metadata = json<StagingMetadata>(row.metadataJson, {});
 	return {
+		_independentNewNarratorId: metadata.independentNewNarratorId,
+		_independentNewCompleted: metadata.independentNewCompleted,
 		executionIntent: metadata.executionIntent,
 		queueMode: resolveBufferQueueMode(metadata.queueMode, row.priority),
 		id: row.id,
@@ -1316,6 +1325,7 @@ async function readBufferedMessageEditRevision(
 		!row ||
 		row.narratorId !== narratorId ||
 		row.kind !== "user_input" ||
+		!!json<StagingMetadata>(row.metadataJson, {}).independentNewNarratorId ||
 		!pending.includes(row.state as "queued" | "failed")
 	)
 		return undefined;
@@ -1353,6 +1363,7 @@ async function updateBufferedMessageUnlocked(
 		!row ||
 		row.narratorId !== narratorId ||
 		row.kind !== "user_input" ||
+		!!json<StagingMetadata>(row.metadataJson, {}).independentNewNarratorId ||
 		!pending.includes(row.state as "queued" | "failed")
 	)
 		return false;
@@ -1569,42 +1580,206 @@ async function removeBufferedMessageUnlocked(
 	await cleanupBufferedTextFiles(id);
 	return true;
 }
-/**
- * Remove a selected UI-only command without claiming the source narrator's runtime.
- * The caller owns staging cleanup AFTER the independent recipient has copied its files.
- * Cancellation is committed before dispatch: errors must not automatically replay creation.
- */
+/** Reserve an independent recipient without acquiring or changing the source execution owner. */
 export async function takeBufferedMessageForIndependentCommand(
 	narratorId: string,
 	messageId: string,
 	accepts: (message: BufferedMessage) => boolean,
+	options: { retry?: boolean; claimed?: MailboxClaim } = {},
 ): Promise<BufferedMessage | undefined> {
-	return bufferEditHolds.mutate(narratorId, messageId, async () => {
+	return bufferEditHolds.mutateDetached(narratorId, messageId, async () => {
 		const row = await rowByIdRuntime(messageId);
+		bufferEditHolds.mutationSignal()?.throwIfAborted();
+		if (!row || row.narratorId !== narratorId || row.kind !== "user_input" || !row.deliveryId)
+			return undefined;
+		const metadata = json<StagingMetadata>(row.metadataJson, {});
+		// A repeated mode/retry request may have lost the successful HTTP response.
 		if (
-			!row ||
-			row.narratorId !== narratorId ||
-			row.kind !== "user_input" ||
-			row.state !== "queued" ||
-			!row.deliveryId
+			row.state === "cancelled" &&
+			metadata.independentNewCompleted === true &&
+			metadata.independentNewNarratorId
+		)
+			return projectMailboxUserMessage(row);
+		const claim = options.claimed;
+		if (
+			!(
+				row.state === "queued" ||
+				(row.state === "failed" && options.retry === true) ||
+				(row.state === "claimed" &&
+					claim?.id === row.id &&
+					claim.narratorId === narratorId &&
+					claim.token === row.claimToken &&
+					claim.epoch === row.claimEpoch)
+			)
 		)
 			return undefined;
 		const message = projectMailboxUserMessage(row);
 		if (!accepts(message)) return undefined;
-		// Resolve lazy metadata while the source staging still belongs to this row.
-		const detached = { ...message };
-		const expected = { state: "queued" as const, revision: row.contentRevision };
-		const reason = "Dispatched independent /new command";
-		const deliveryId = row.deliveryId;
+		const targetNarratorId = message._independentNewNarratorId ?? generateId();
+		const expected = {
+			state: row.state as "queued" | "failed" | "claimed",
+			revision: row.contentRevision,
+			metadataJson: row.metadataJson,
+			claim: row.state === "claimed" ? claim : undefined,
+		};
+		const reason = "Independent /new dispatch incomplete; explicitly retry to finish";
 		const port = pgQueue();
-		const cancelled = port
-			? await port.mailbox.cancel(deliveryId, reason, expected)
-			: db.transaction((tx) => {
-					assertBufferObservation(tx, row, messageId);
-					return store.cancel(deliveryId, reason, expected);
+		const held = port
+			? await port.mailbox.holdIndependentUserCommand(
+					narratorId,
+					messageId,
+					targetNarratorId,
+					expected,
+					reason,
+				)
+			: store.holdIndependentUserCommand(narratorId, messageId, targetNarratorId, expected, reason);
+		if (!held) throw new RuntimeReadConflictError();
+		// Keep payload getters lazy: dispatch must re-read them while holding the edit lock.
+		return projectMailboxUserMessage({
+			...row,
+			state: "failed",
+			lastError: reason,
+			metadataJson: JSON.stringify({
+				...json<StagingMetadata>(row.metadataJson, {}),
+				independentNewNarratorId: targetNarratorId,
+			}),
+			contentRevision: row.contentRevision + 1,
+			claimToken: null,
+			claimEpoch: null,
+			claimedAt: null,
+		});
+	});
+}
+
+/** A terminal receipt is replayable only for its exact source and independent target. */
+function independentCommandCompleted(
+	row: RuntimeMailboxRow | undefined,
+	narratorId: string,
+	targetNarratorId: string,
+): boolean {
+	const metadata = json<StagingMetadata>(row?.metadataJson ?? null, {});
+	return (
+		row?.narratorId === narratorId &&
+		row.kind === "user_input" &&
+		row.state === "cancelled" &&
+		metadata.independentNewCompleted === true &&
+		metadata.independentNewNarratorId === targetNarratorId
+	);
+}
+
+/** Row-only staging hold: independent dispatch never pauses consumption in the source narrator. */
+export async function runIndependentBufferedCommand(
+	narratorId: string,
+	messageId: string,
+	targetNarratorId: string,
+	dispatch: (message: BufferedMessage) => Promise<string>,
+): Promise<string> {
+	return bufferEditHolds.mutateDetached(narratorId, messageId, async () => {
+		const row = await rowByIdRuntime(messageId);
+		bufferEditHolds.mutationSignal()?.throwIfAborted();
+		const completed = independentCommandCompleted(row, narratorId, targetNarratorId);
+		if (
+			!row ||
+			row.narratorId !== narratorId ||
+			row.kind !== "user_input" ||
+			!row.deliveryId ||
+			(!completed && row.state !== "failed") ||
+			json<StagingMetadata>(row.metadataJson, {}).independentNewNarratorId !== targetNarratorId
+		)
+			throw new RuntimeReadConflictError();
+		const port = pgQueue();
+		const message = projectMailboxUserMessage(row);
+		const cleanup = async () => {
+			try {
+				if (port) await cleanupStagingPg(port, message._stagingId ?? row.id);
+				else await cleanupBufferedTextFiles(message._stagingId ?? row.id);
+			} catch (error) {
+				logger.warn("Independent command staging cleanup deferred", {
+					messageId,
+					error: String(error),
 				});
-		if (!cancelled) throw new RuntimeReadConflictError();
-		return detached;
+			}
+		};
+		if (completed) {
+			await cleanup();
+			return targetNarratorId;
+		}
+		try {
+			const result = await dispatch(message);
+			if (result !== targetNarratorId)
+				throw new Error("Independent /new dispatch returned an unexpected narrator id");
+		} catch (error) {
+			// A diagnostic write is best effort and must never replace the dispatch exception.
+			try {
+				const expected = {
+					state: "failed" as const,
+					revision: row.contentRevision,
+					metadataJson: row.metadataJson,
+				};
+				const reason = boundedError(
+					`Independent /new dispatch failed; explicitly retry: ${String(error)}`,
+				);
+				if (port)
+					await port.mailbox.holdIndependentUserCommand(
+						narratorId,
+						messageId,
+						targetNarratorId,
+						expected,
+						reason,
+					);
+				else
+					store.holdIndependentUserCommand(
+						narratorId,
+						messageId,
+						targetNarratorId,
+						expected,
+						reason,
+					);
+			} catch (diagnosticError) {
+				logger.warn("Failed to save independent command error", {
+					messageId,
+					error: String(diagnosticError),
+				});
+			}
+			throw error;
+		}
+		const expected = { revision: row.contentRevision, metadataJson: row.metadataJson };
+		const reason = "Dispatched independent /new command";
+		try {
+			const committed = port
+				? await port.mailbox.completeIndependentUserCommand(
+						narratorId,
+						messageId,
+						targetNarratorId,
+						expected,
+						reason,
+					)
+				: db.transaction(() =>
+						store.completeIndependentUserCommand(
+							narratorId,
+							messageId,
+							targetNarratorId,
+							expected,
+							reason,
+						),
+					);
+			if (!committed) throw new RuntimeReadConflictError();
+		} catch (error) {
+			// A response can fail after commit. Confirm the durable receipt, never redispatch here.
+			let receipt: RuntimeMailboxRow | undefined;
+			try {
+				receipt = await rowByIdRuntime(messageId);
+			} catch (readError) {
+				logger.warn("Independent command completion outcome unknown", {
+					messageId,
+					error: String(readError),
+				});
+				throw error;
+			}
+			if (!independentCommandCompleted(receipt, narratorId, targetNarratorId)) throw error;
+		}
+		await cleanup();
+		return targetNarratorId;
 	});
 }
 
@@ -1754,7 +1929,7 @@ async function updateBufferedMessageModeUnlocked(
 			.limit(MAILBOX_LIMITS.userPending)
 			.all();
 		const row = rows.find((row) => row.id === messageId);
-		if (!row) return false;
+		if (!row || json<StagingMetadata>(row.metadataJson, {}).independentNewNarratorId) return false;
 		return (
 			tx
 				.update(mailbox)
@@ -1952,6 +2127,7 @@ async function retryBufferedMessageUnlocked(
 		row.narratorId !== narratorId ||
 		row.kind !== "user_input" ||
 		row.state !== "failed" ||
+		!!json<StagingMetadata>(row.metadataJson, {}).independentNewNarratorId ||
 		!row.deliveryId
 	)
 		return false;
@@ -2006,7 +2182,6 @@ export async function dropBufferedMessage(
 	narratorId: string,
 	msg: BufferedMessage,
 	reason: string,
-	options: { preserveStaging?: boolean } = {},
 ): Promise<boolean> {
 	const claim = msg._mailboxClaim;
 	if (!claim || claim.narratorId !== narratorId) return false;
@@ -2014,11 +2189,11 @@ export async function dropBufferedMessage(
 	const port = pgQueue();
 	if (port) {
 		if (!(await port.mailbox.cancelClaim(claim, reason))) return false;
-		if (!options.preserveStaging) await cleanupStagingPg(port, stagingId);
+		await cleanupStagingPg(port, stagingId);
 		return true;
 	}
 	if (!store.cancelClaim(claim, reason)) return false;
-	if (!options.preserveStaging) await cleanupBufferedTextFiles(stagingId);
+	await cleanupBufferedTextFiles(stagingId);
 	return true;
 }
 

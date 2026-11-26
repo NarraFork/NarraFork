@@ -238,6 +238,141 @@ test("slow attachment saves pin TTL; failures retain a full retry window and rej
 	expect(holds.held("n")).toBe(false);
 });
 
+test("detached row mutation never holds consumption, allows unrelated edits/claims and blocks selected-row or full clear", async () => {
+	const holds = createBufferEditHolds();
+	const started = gate();
+	const finishing = gate();
+	const changes: string[] = [];
+	holds.setListener((id) => {
+		changes.push(id);
+	});
+	const detached = holds.mutateDetached("n", "message", async () => {
+		const signal = holds.mutationSignal();
+		await holds.mutateDetached("n", "message", async () => {
+			expect(holds.mutationSignal()).toBe(signal);
+		});
+		await holds.mutate("n", "message", async () => {
+			expect(holds.held("n")).toBe(false);
+		});
+		started.release();
+		await finishing.promise;
+	});
+	await started.promise;
+	try {
+		expect(holds.held("n")).toBe(false);
+		expect(await holds.exclusive("n", () => !holds.held("n"))).toBe(true);
+		await expect(holds.mutate("n", "message", async () => {})).rejects.toThrow("being edited");
+		await expect(holds.mutateDetached("n", "message", async () => {})).rejects.toThrow(
+			"being edited",
+		);
+		await expect(holds.mutate("n", undefined, async () => {})).rejects.toThrow("being edited");
+		await expect(holds.begin("n", identity, async () => 0)).rejects.toThrow("being edited");
+		await holds.mutate("n", "other", async () => {});
+		await holds.mutateDetached("n", "other", async () => {
+			expect(holds.held("n")).toBe(false);
+		});
+		const other = { ...identity, messageId: "other" };
+		await holds.begin("n", other, async () => 0);
+		await holds.release("n", other);
+		expect(holds.held("n")).toBe(false);
+	} finally {
+		finishing.release();
+	}
+	await detached;
+	// Only the unrelated editor's explicit begin/release emits control events.
+	expect(changes).toEqual(["n", "n"]);
+	expect(holds.held("n")).toBe(false);
+});
+
+test("detached setup conflicts with a selected save/full mutation but not another row's mutation", async () => {
+	const holds = createBufferEditHolds();
+	for (const messageId of ["message", undefined]) {
+		const entered = gate();
+		const resume = gate();
+		const ordinary = holds.mutate("n", messageId, async () => {
+			entered.release();
+			await resume.promise;
+		});
+		await entered.promise;
+		try {
+			await expect(holds.mutateDetached("n", "message", async () => {})).rejects.toThrow(
+				"being edited",
+			);
+		} finally {
+			resume.release();
+		}
+		await ordinary;
+	}
+	const started = gate();
+	const finishing = gate();
+	const ordinary = holds.mutate("n", "other", async () => {
+		started.release();
+		await finishing.promise;
+	});
+	await started.promise;
+	await holds.mutateDetached("n", "message", async () => {});
+	finishing.release();
+	await ordinary;
+});
+
+test("authorization quiesce aborts and awaits every detached row before clearing without waking the source", async () => {
+	const holds = createBufferEditHolds();
+	const firstReady = gate();
+	const secondReady = gate();
+	const firstFinish = gate();
+	const secondFinish = gate();
+	const stopped = gate();
+	const events: string[] = [];
+	const signals: AbortSignal[] = [];
+	holds.setListener(() => {
+		events.push("wake");
+	});
+	const first = holds.mutateDetached("n", "first", async () => {
+		const signal = holds.mutationSignal();
+		if (!signal) throw new Error("Missing detached abort signal");
+		signals.push(signal);
+		firstReady.release();
+		await firstFinish.promise;
+		await expect(holds.mutate("n", "first", async () => {})).rejects.toMatchObject({
+			code: "AUTHORIZATION_REVOKED",
+		});
+		events.push("first-finished");
+	});
+	const second = holds.mutateDetached("n", "second", async () => {
+		const signal = holds.mutationSignal();
+		if (!signal) throw new Error("Missing detached abort signal");
+		signals.push(signal);
+		secondReady.release();
+		await secondFinish.promise;
+		events.push("second-finished");
+	});
+	await Promise.all([firstReady.promise, secondReady.promise]);
+	expect(holds.held("n")).toBe(false);
+	const revoked = holds.quiesceForAuthorizationLoss(
+		"n",
+		() => {
+			events.push("stop");
+			stopped.release();
+		},
+		async () => {
+			events.push("clear");
+			await holds.mutate("n", undefined, async () => {});
+		},
+	);
+	await stopped.promise;
+	expect(signals.every((signal) => signal.aborted)).toBe(true);
+	expect(holds.held("n")).toBe(true);
+	await expect(holds.mutateDetached("n", "third", async () => {})).rejects.toThrow("being edited");
+	await expect(holds.mutate("n", "other", async () => {})).rejects.toThrow("being edited");
+	firstFinish.release();
+	await first;
+	expect(events).toEqual(["stop", "first-finished"]);
+	secondFinish.release();
+	await Promise.all([second, revoked]);
+	expect(events).toEqual(["stop", "first-finished", "second-finished", "clear"]);
+	expect(holds.held("n")).toBe(false);
+});
+
 test("legacy saves block begin/claim only while saving and wake a deferred consumer", async () => {
 	const holds = createBufferEditHolds();
 	const saving = gate();

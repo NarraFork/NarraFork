@@ -13,6 +13,12 @@ interface Lease extends BufferEditIdentity {
 	expiresAt: number;
 	contentRevision: number;
 }
+interface MutationOperation {
+	messageId?: string;
+	abort: AbortController;
+	done: Promise<void>;
+	finish: () => void;
+}
 interface MutationScope {
 	narratorId: string;
 	messageId?: string;
@@ -28,10 +34,9 @@ export const staleBufferEdit = () =>
 export function createBufferEditHolds(now = Date.now, leaseMs = BUFFER_EDIT_LEASE_MS) {
 	const leases = new Map<string, Lease>();
 	const mutations = new Set<string>();
-	const operations = new Map<
-		string,
-		{ abort: AbortController; done: Promise<void>; finish: () => void }
-	>();
+	const operations = new Map<string, MutationOperation>();
+	// Independent commands own only one row's lazy staging, never narrator consumption.
+	const detachedOperations = new Map<string, Map<string, MutationOperation>>();
 	const maintenance = new Map<string, Promise<void>>();
 	const authorizationBarriers = new Set<string>();
 	const deferred = new Set<string>();
@@ -111,20 +116,23 @@ export function createBufferEditHolds(now = Date.now, leaseMs = BUFFER_EDIT_LEAS
 			const task = exclusive(id, () => {
 				leases.delete(id);
 				deferred.delete(id);
-				const operation = operations.get(id);
-				operation?.abort.abort(
-					new AppError("Narrator authorization revoked", 403, "AUTHORIZATION_REVOKED"),
+				const active = [operations.get(id), ...(detachedOperations.get(id)?.values() ?? [])].filter(
+					(operation): operation is MutationOperation => !!operation,
 				);
-				return operation;
+				for (const operation of active)
+					operation.abort.abort(
+						new AppError("Narrator authorization revoked", 403, "AUTHORIZATION_REVOKED"),
+					);
+				return active;
 			})
-				.then(async (operation) => {
+				.then(async (active) => {
 					let failure: unknown;
 					try {
 						await stop();
 					} catch (error) {
 						failure = error;
 					}
-					await operation?.done;
+					await Promise.all(active.map((operation) => operation.done));
 					const current: MutationScope = { narratorId: id, active: true };
 					try {
 						await scope.run(current, clear);
@@ -153,7 +161,8 @@ export function createBufferEditHolds(now = Date.now, leaseMs = BUFFER_EDIT_LEAS
 		) {
 			return exclusive(id, async () => {
 				expire();
-				if (authorizationBarriers.has(id)) throw conflict();
+				if (authorizationBarriers.has(id) || detachedOperations.get(id)?.has(identity.messageId))
+					throw conflict();
 				const existing = leases.get(id);
 				if (existing ? !matches(existing, identity) : mutations.has(id)) throw conflict();
 				const contentRevision = await readRevision();
@@ -202,6 +211,59 @@ export function createBufferEditHolds(now = Date.now, leaseMs = BUFFER_EDIT_LEAS
 				changed(id);
 			});
 		},
+		/** Row-only staging lifetime: unrelated queued input and urgent consumption stay available. */
+		async mutateDetached<T>(id: string, messageId: string, work: () => Promise<T>): Promise<T> {
+			const parent = scope.getStore();
+			if (
+				parent?.active &&
+				parent.narratorId === id &&
+				(!parent.messageId || parent.messageId === messageId)
+			) {
+				parent.signal?.throwIfAborted();
+				return work();
+			}
+			let finish!: () => void;
+			const operation: MutationOperation = {
+				messageId,
+				abort: new AbortController(),
+				done: new Promise<void>((resolve) => {
+					finish = resolve;
+				}),
+				finish: () => finish(),
+			};
+			await exclusive(id, () => {
+				expire();
+				const ordinary = operations.get(id);
+				if (
+					authorizationBarriers.has(id) ||
+					detachedOperations.get(id)?.has(messageId) ||
+					(ordinary && (!ordinary.messageId || ordinary.messageId === messageId)) ||
+					leases.get(id)?.messageId === messageId
+				)
+					throw conflict();
+				let rows = detachedOperations.get(id);
+				if (!rows) {
+					rows = new Map();
+					detachedOperations.set(id, rows);
+				}
+				rows.set(messageId, operation);
+			});
+			const current: MutationScope = {
+				narratorId: id,
+				messageId,
+				active: true,
+				signal: operation.abort.signal,
+			};
+			try {
+				return await scope.run(current, work);
+			} finally {
+				current.active = false;
+				const rows = detachedOperations.get(id);
+				rows?.delete(messageId);
+				if (!rows?.size) detachedOperations.delete(id);
+				operation.finish();
+			}
+		},
 		async mutate<T>(
 			id: string,
 			messageId: string | undefined,
@@ -220,6 +282,7 @@ export function createBufferEditHolds(now = Date.now, leaseMs = BUFFER_EDIT_LEAS
 			let lease: Lease | undefined;
 			let finish!: () => void;
 			const operation = {
+				messageId,
 				abort: new AbortController(),
 				done: new Promise<void>((resolve) => {
 					finish = resolve;
@@ -232,6 +295,9 @@ export function createBufferEditHolds(now = Date.now, leaseMs = BUFFER_EDIT_LEAS
 				if (
 					authorizationBarriers.has(id) ||
 					mutations.has(id) ||
+					(messageId
+						? detachedOperations.get(id)?.has(messageId)
+						: detachedOperations.get(id)?.size) ||
 					(lease
 						? !identity || identity.messageId !== messageId || !matches(lease, identity)
 						: identity !== undefined)

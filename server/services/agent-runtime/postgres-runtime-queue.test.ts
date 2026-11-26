@@ -113,6 +113,219 @@ describe("postgres queue mode atomic mutations", () => {
 			expect(query.params).toEqual(["delivery", "queued", "failed", "queued", 7]);
 		});
 	}
+	for (const state of ["queued", "failed", "claimed"] as const) {
+		for (const won of [true, false]) {
+			test(`independent command hold retains payload with exact ${state} CAS (won=${won})`, async () => {
+				let predicate: SQL | undefined;
+				let patch: Record<string, unknown> = {};
+				const metadataJson = JSON.stringify({
+					stagingId: "source-staging",
+					executionIntent: { controlCommand: true },
+					independentNewNarratorId: "target",
+				});
+				const claim = { id: "m1", narratorId: "n1", token: "token", epoch: "epoch" };
+				const tx = {
+					update: () => ({
+						set: (value: Record<string, unknown>) => {
+							patch = value;
+							return {
+								where: (condition: SQL) => {
+									predicate = condition;
+									return { returning: async () => (won ? [{ id: "m1" }] : []) };
+								},
+							};
+						},
+					}),
+				};
+				const store = createPostgresRuntimeQueue({
+					transaction: (section: (tx: unknown) => unknown) => section(tx),
+				} as unknown as BunSQLDatabase);
+				expect(
+					await store.mailbox.holdIndependentUserCommand(
+						"n1",
+						"m1",
+						"target",
+						{ state, revision: 7, metadataJson, claim: state === "claimed" ? claim : undefined },
+						"explicit retry required",
+					),
+				).toBe(won);
+				expect(patch).toMatchObject({
+					state: "failed",
+					contentRevision: 8,
+					claimToken: null,
+					claimEpoch: null,
+					claimedAt: null,
+					lastError: "explicit retry required",
+				});
+				expect(JSON.parse(patch.metadataJson as string)).toEqual(JSON.parse(metadataJson));
+				for (const field of [
+					"text",
+					"payloadRefJson",
+					"imagesJson",
+					"mediaJson",
+					"textFilePathsJson",
+					"fileReferencesJson",
+					"commandText",
+					"bashCommand",
+				])
+					expect(patch[field]).toBeUndefined();
+				if (!predicate) throw new Error("Missing independent CAS predicate");
+				const query = new PgDialect().sqlToQuery(predicate);
+				expect(query.params).toEqual([
+					"m1",
+					"n1",
+					"user_input",
+					state,
+					7,
+					metadataJson,
+					...(state === "claimed" ? ["token", "epoch"] : []),
+				]);
+				expect(query.sql).toContain('"content_revision"');
+				if (state === "claimed") {
+					expect(query.sql).toContain('"claim_token"');
+					expect(query.sql).toContain('"claim_epoch"');
+				}
+			});
+		}
+	}
+	test("independent hold rejects a mismatched recipient or claim before touching the database", async () => {
+		const store = createPostgresRuntimeQueue({
+			transaction: () => {
+				throw new Error("Forbidden database access");
+			},
+		} as unknown as BunSQLDatabase);
+		expect(
+			await store.mailbox.holdIndependentUserCommand(
+				"n1",
+				"m1",
+				"new-target",
+				{
+					state: "failed",
+					revision: 7,
+					metadataJson: JSON.stringify({ independentNewNarratorId: "original-target" }),
+				},
+				"retry",
+			),
+		).toBe(false);
+		for (const claim of [
+			undefined,
+			{ id: "wrong", narratorId: "n1", token: "token", epoch: "epoch" },
+			{ id: "m1", narratorId: "wrong", token: "token", epoch: "epoch" },
+		]) {
+			expect(
+				await store.mailbox.holdIndependentUserCommand(
+					"n1",
+					"m1",
+					"target",
+					{ state: "claimed", revision: 7, metadataJson: null, claim },
+					"retry",
+				),
+			).toBe(false);
+		}
+	});
+	for (const won of [true, false]) {
+		test(`independent completion CAS releases payload but retains replay and submission receipts (won=${won})`, async () => {
+			let predicate: SQL | undefined;
+			let patch: Record<string, unknown> = {};
+			const metadataJson = JSON.stringify({
+				stagingId: "source-staging",
+				independentNewNarratorId: "target",
+				commandTextPath: "/no-longer-needed",
+				executionIntent: { controlCommand: true },
+				submissionFingerprint: "fingerprint",
+				submissionAttachments: [],
+			});
+			const tx = {
+				update: () => ({
+					set: (value: Record<string, unknown>) => {
+						patch = value;
+						return {
+							where: (condition: SQL) => {
+								predicate = condition;
+								return { returning: async () => (won ? [{ id: "m1" }] : []) };
+							},
+						};
+					},
+				}),
+			};
+			const store = createPostgresRuntimeQueue({
+				transaction: (section: (tx: unknown) => unknown) => section(tx),
+			} as unknown as BunSQLDatabase);
+			expect(
+				await store.mailbox.completeIndependentUserCommand(
+					"n1",
+					"m1",
+					"target",
+					{ revision: 8, metadataJson },
+					"accepted independent target",
+				),
+			).toBe(won);
+			expect(patch).toMatchObject({
+				state: "cancelled",
+				contentRevision: 9,
+				text: "",
+				payloadRefJson: null,
+				imagesJson: null,
+				mediaJson: null,
+				textFilePathsJson: null,
+				fileReferencesJson: null,
+				commandText: null,
+				bashCommand: null,
+				byteSize: 0,
+				projectedByteSize: 0,
+			});
+			expect(JSON.parse(patch.metadataJson as string)).toEqual({
+				independentNewNarratorId: "target",
+				independentNewCompleted: true,
+				stagingId: "source-staging",
+				submissionFingerprint: "fingerprint",
+				submissionAttachments: [],
+			});
+			if (!predicate) throw new Error("Missing completion predicate");
+			const query = new PgDialect().sqlToQuery(predicate);
+			expect(query.params).toEqual(["m1", "n1", "user_input", "failed", 8, metadataJson]);
+			expect(query.sql).toContain('"content_revision"');
+			expect(query.sql).toContain('"metadata_json"');
+		});
+	}
+	test("independent completion cannot change another reserved target", async () => {
+		const store = createPostgresRuntimeQueue({
+			transaction: () => {
+				throw new Error("Forbidden database access");
+			},
+		} as unknown as BunSQLDatabase);
+		expect(
+			await store.mailbox.completeIndependentUserCommand(
+				"n1",
+				"m1",
+				"wrong-target",
+				{ revision: 8, metadataJson: JSON.stringify({ independentNewNarratorId: "target" }) },
+				"done",
+			),
+		).toBe(false);
+	});
+	test("ordinary failed retry excludes independent commands in the atomic predicate", async () => {
+		let predicate: SQL | undefined;
+		const tx = {
+			update: () => ({
+				set: () => ({
+					where: (condition: SQL) => {
+						predicate = condition;
+						return { returning: async () => [] };
+					},
+				}),
+			}),
+		};
+		const store = createPostgresRuntimeQueue({
+			transaction: (section: (tx: unknown) => unknown) => section(tx),
+		} as unknown as BunSQLDatabase);
+		expect(await store.mailbox.retryFailed("delivery")).toBe(false);
+		if (!predicate) throw new Error("Missing retry predicate");
+		const query = new PgDialect().sqlToQuery(predicate);
+		expect(query.sql).toContain("independentNewNarratorId");
+		expect(query.sql).toContain("IS NULL");
+		expect(query.params).toEqual(["delivery", "failed"]);
+	});
 	test("mode patches preserve payload metadata and return false for a lost CAS", async () => {
 		for (const won of [true, false]) {
 			let selections = 0;

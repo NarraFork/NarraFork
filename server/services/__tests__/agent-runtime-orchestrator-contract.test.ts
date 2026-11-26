@@ -63,6 +63,7 @@ const { settings } = await import("../../lib/settings");
 const { createPublicationOutbox } = await import("../agent-runtime/publication-outbox");
 const { acceptUserMessage } = await import("../narrator-session");
 const { enqueueInboxAgent } = await import("../agent-runtime/inbox");
+const { drainCommunicationWork } = await import("../agent-runtime/async-work");
 const MODEL = "orchestratorfixture:model";
 const adapter: ProviderAdapter = {
 	formatTools: () => [],
@@ -1171,6 +1172,7 @@ describe("native media input transitions follow the unified run control", () => 
 			await resumeNextBufferedMessage(source, "en");
 			const id = await completed.promise;
 			await getRunControl(id)?.terminal;
+			await drainCommunicationWork();
 			expect(
 				db
 					.select()
@@ -1272,7 +1274,160 @@ describe("native media input transitions follow the unified run control", () => 
 			}
 		});
 	}
-	for (const fault of ["cleanup", "notification", "create"] as const) {
+	test("independent /new retries preserve attachments and reuse a created target and accepted first input", async () => {
+		const buffer = await import("../narrator-buffer");
+		const { prepareIndependentQueuedNewCommand } = await import("../narrator-session");
+		const source = active("contract-primary");
+		activeNarrators.set(source.narratorId, source);
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const calls: string[] = [];
+		spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
+			calls.push(options.config.narratorId as string);
+			if (options.config.narratorId === source.narratorId) {
+				started.resolve();
+				await release.promise;
+			} else {
+				expect(modelInputText(options)).toContain("recover these notes");
+			}
+			return finished;
+		});
+		const handle = await startNarratorRun({
+			narratorId: source.narratorId,
+			active: source,
+			locale: "en",
+			text: "original task",
+			principal: "principal-a",
+			deliver: false,
+		});
+		await started.promise;
+		const owner = getExecutionOwner(source.narratorId);
+		const create = spyOn(narratorService, "create").mockRejectedValueOnce(
+			new Error("model unavailable before creation"),
+		);
+		try {
+			const queued = await buffer.enqueueBufferedMessage(
+				source.narratorId,
+				"/new recover these notes",
+				undefined,
+				undefined,
+				"principal-b",
+				undefined,
+				[new File(["durable notes"], "retry-notes.txt")],
+			);
+			const initial = await prepareIndependentQueuedNewCommand(source.narratorId, queued.id);
+			if (!initial) throw new Error("Missing independent dispatch");
+			// Settle worker-backed rejection before matching; pending .rejects can
+			// prevent Bun's test harness from pumping the worker response.
+			const initialError = await initial().then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			expect(String(initialError)).toContain("model unavailable before creation");
+			const [failed] = await buffer.getBufferedMessagesAsync(source.narratorId);
+			expect(failed).toMatchObject({ state: "failed", text: "/new recover these notes" });
+			expect(await failed.textFiles?.[0].text()).toBe("durable notes");
+			const targetId = failed._independentNewNarratorId;
+			if (!targetId) throw new Error("Missing reserved target");
+			const run = buffer.runIndependentBufferedCommand;
+			spyOn(buffer, "runIndependentBufferedCommand").mockImplementationOnce(
+				(id, mid, target, dispatch) =>
+					run(id, mid, target, async (message) => {
+						await dispatch(message);
+						throw new Error("result lost after target input acceptance");
+					}),
+			);
+			const retry = await prepareIndependentQueuedNewCommand(source.narratorId, queued.id, {
+				retry: true,
+			});
+			if (!retry) throw new Error("Missing retry");
+			const retryError = await retry().then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			expect(String(retryError)).toContain("result lost after target input acceptance");
+			await getRunControl(targetId)?.terminal;
+			const [retained] = await buffer.getBufferedMessagesAsync(source.narratorId);
+			expect(retained._independentNewNarratorId).toBe(targetId);
+			expect(await retained.textFiles?.[0].text()).toBe("durable notes");
+			const finish = await prepareIndependentQueuedNewCommand(source.narratorId, queued.id, {
+				retry: true,
+			});
+			if (!finish) throw new Error("Missing recovery dispatch");
+			expect(await finish()).toBe(targetId);
+			expect(create).toHaveBeenCalledTimes(2); // one definite failure, one actual creation
+			expect(calls).toEqual([source.narratorId, targetId]);
+			const inputs = db
+				.select({ id: narratorMessages.id })
+				.from(narratorMessageRefs)
+				.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
+				.where(eq(narratorMessageRefs.narratorId, targetId))
+				.all()
+				.filter(({ id }) =>
+					JSON.stringify(readTestMessageContent(sqlite, id)).includes("recover these notes"),
+				);
+			expect(inputs).toHaveLength(1);
+			expect(JSON.stringify(readTestMessageContent(sqlite, inputs[0].id))).toContain(
+				"retry-notes.txt",
+			);
+			expect(await buffer.getBufferedMessagesAsync(source.narratorId)).toHaveLength(0);
+			expect(getExecutionOwner(source.narratorId)).toBe(owner);
+			expect(source.abortController.signal.aborted).toBe(false);
+			expect(source._currentUserId).toBe("principal-a");
+			activeNarrators.delete(targetId);
+		} finally {
+			release.resolve();
+			await handle.terminal;
+		}
+	});
+	test("queued /new creation cannot delay the source's next queued input", async () => {
+		const { enqueueBufferedMessage } = await import("../narrator-buffer");
+		const release = Promise.withResolvers<void>();
+		let timedOut = false;
+		const create = narratorService.create;
+		spyOn(narratorService, "create").mockImplementation(async (...args) => {
+			await release.promise;
+			return create(...args);
+		});
+		const h = fixture(profiles[0], [
+			async () => {
+				await enqueueBufferedMessage(
+					"contract-primary",
+					"/new",
+					undefined,
+					undefined,
+					"principal-a",
+				);
+				await enqueueBufferedMessage(
+					"contract-primary",
+					"source followup",
+					undefined,
+					undefined,
+					"principal-a",
+				);
+				return finished;
+			},
+			async (options) => {
+				expect(modelInputText(options)).toContain("source followup");
+				return finished;
+			},
+		]);
+		// A guard releases a broken implementation so a failed assertion cannot strand the fixture.
+		const guard = setTimeout(() => {
+			timedOut = true;
+			release.resolve();
+		}, 3000);
+		try {
+			expect((await h.run()).hasError).toBe(false);
+			expect(h.calls).toHaveLength(2);
+			expect(timedOut).toBe(false);
+		} finally {
+			clearTimeout(guard);
+			release.resolve();
+			await drainCommunicationWork();
+		}
+	});
+	for (const fault of ["notification", "create"] as const) {
 		test(`queued /new ${fault} failure cannot fail or restart the source loop`, async () => {
 			const buffer = await import("../narrator-buffer");
 			const ws = await import("../../websocket/narrator-ws");
@@ -1289,12 +1444,7 @@ describe("native media input transitions follow the unified run control", () => 
 					return finished;
 				},
 			]);
-			if (fault === "cleanup") {
-				spyOn(buffer, "cleanupBufferedTextFilesAsync").mockImplementation(async () => {
-					expect(h.session.abortController.signal.aborted).toBe(false);
-					throw new Error("scripted cleanup EACCES");
-				});
-			} else if (fault === "create") {
+			if (fault === "create") {
 				spyOn(narratorService, "create").mockImplementation(async () => {
 					expect(h.session.abortController.signal.aborted).toBe(false);
 					throw new Error("scripted creation failure");
@@ -1310,9 +1460,12 @@ describe("native media input transitions follow the unified run control", () => 
 				});
 			}
 			expect((await h.run()).hasError).toBe(false);
+			await drainCommunicationWork();
 			expect(h.calls).toHaveLength(1);
 			expect((await narratorService.getById("contract-primary")).substatus).not.toContain("error");
-			expect(await buffer.getBufferedMessagesAsync("contract-primary")).toHaveLength(0);
+			const remaining = await buffer.getBufferedMessagesAsync("contract-primary");
+			expect(remaining).toHaveLength(fault === "create" ? 1 : 0);
+			if (fault === "create") expect(remaining[0]).toMatchObject({ state: "failed", text: "/new" });
 			expect(
 				db
 					.select()

@@ -127,11 +127,11 @@ import { injectionKey, knowledgeInjection } from "../knowledge-injection";
 import { knowledgeInjectionReads, knowledgeService } from "../knowledge-service";
 import {
 	cleanupBufferedTextFilesAsync,
-	dropBufferedMessage,
 	getBufferedMessagesAsync,
 	mailboxInputRequiresFreshTurn,
 	projectMailboxUserMessage,
 	restoreBufferedMessage,
+	takeBufferedMessageForIndependentCommand,
 	toBufferSummary,
 } from "../narrator-buffer";
 import { runCustomCompact, runPlanCompact } from "../narrator-compact";
@@ -188,7 +188,6 @@ import {
 	drainInjectionsIntoHistory,
 	ensureSkillCacheFreshForActiveNarrator,
 	executeQueuedGoalCommand,
-	executeQueuedNewCommand,
 	filterOAuthSessionDevices,
 	finalizeInterruptedRun,
 	finalizeOrCleanupPartialMessage,
@@ -202,6 +201,7 @@ import {
 	resolveSessionDevices,
 	setNarratorDefaultDevice,
 	settleNarratorRuntimeModel,
+	startIndependentQueuedNewCommand,
 	updateNarratorModel,
 	urgentActivitySignal,
 } from "../narrator-session";
@@ -723,40 +723,22 @@ export async function runAgentLoopUnlocked(
 				buffered.executionIntent,
 			);
 			if (newCommand) {
-				// A UI command is not a person speaking to this run. Consume it without
-				// persisting source history, changing the principal or ending this loop.
-				const detached = { ...buffered };
-				let consumed = false;
+				// Transfer to a durable failed/independent row, never to source history.
+				let independent: BufferedMessage | undefined;
 				try {
-					consumed = await dropBufferedMessage(
+					independent = await takeBufferedMessageForIndependentCommand(
 						narratorId,
-						buffered,
-						"Dispatched independent /new command",
+						buffered.id,
+						() => true,
 						{
-							preserveStaging: true,
+							claimed: bufferedClaim,
 						},
 					);
-					if (!consumed) throw new Error("Buffered /new claim is no longer current");
-					const newNarratorId = await executeQueuedNewCommand(
-						active,
-						detached,
-						newCommand.initialMessage,
-					);
-					broadcastToNarrator(narratorId, {
-						type: "queued_new_narrator_created",
-						narratorId,
-						messageId: buffered.id,
-						newNarratorId,
-					});
-					broadcastToNarrator(narratorId, {
-						type: "buffer_consumed",
-						narratorId,
-						messageId: buffered.id,
-						remaining: toBufferSummary(await getBufferedMessagesAsync(narratorId)),
-					});
+					if (!independent) throw new Error("Buffered /new claim is no longer current");
+					startIndependentQueuedNewCommand(active, independent, newCommand.initialMessage);
 				} catch (error) {
 					logger.error("Independent queued /new failed", { narratorId, error: String(error) });
-					if (!consumed && bufferedRow) {
+					if (!independent && bufferedRow) {
 						await releaseInboxClaim(bufferedRow, error).catch((releaseError) => {
 							logger.warn("Independent /new claim release failed", {
 								narratorId,
@@ -764,31 +746,9 @@ export async function runAgentLoopUnlocked(
 							});
 						});
 					}
-					try {
-						broadcastToNarrator(narratorId, {
-							type: "narrator_error",
-							narratorId,
-							error: String(error),
-						});
-					} catch (notificationError) {
-						logger.warn("Independent /new error notification failed", {
-							narratorId,
-							error: String(notificationError),
-						});
-					}
-				} finally {
-					if (consumed) {
-						await cleanupBufferedTextFilesAsync(detached._stagingId ?? detached.id).catch(
-							(error) => {
-								logger.warn("Independent /new staging cleanup failed", {
-									narratorId,
-									error: String(error),
-								});
-							},
-						);
-					}
 				}
-				return consumed ? consumeNextInput(options) : "none";
+				// Failure stays explicitly retryable, not queued for this run to adopt.
+				return independent ? consumeNextInput(options) : "none";
 			}
 			personSpoke = true;
 			active._bufferSoftStopTaken = false;

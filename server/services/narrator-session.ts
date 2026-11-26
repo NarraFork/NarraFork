@@ -148,6 +148,7 @@ import {
 	consumeMailboxDelivery,
 	type MailboxDeliveryConsumption,
 } from "./agent-message-delivery";
+import { trackCommunicationWork } from "./agent-runtime/async-work";
 import { isCheckpointStop } from "./agent-runtime/checkpoint-stop";
 import { buildRuntimeHistory } from "./agent-runtime/history";
 import {
@@ -428,6 +429,7 @@ import {
 	projectMailboxUserMessage,
 	removeBufferedMessage,
 	restoreBufferedMessage,
+	runIndependentBufferedCommand,
 	takeBufferedMessageForIndependentCommand,
 	toBufferSummary,
 	withCurrentBufferedGuidance,
@@ -775,72 +777,114 @@ export async function executeQueuedNewCommand(
 	initialMessage: string,
 ): Promise<string> {
 	const sourceNarrator = await narratorService.getById(active.narratorId);
-	// `/new` spawns an independent primary session, so it must never inherit the
-	// `__parent__` sentinel (prepareNarratorCreation rejects it: only subagents may
-	// follow). Materialize the currently effective model, matching the idle route path.
-	const newModel =
-		sourceNarrator.model === FOLLOW_PARENT_MODEL
-			? (
-					await resolveSubagentModelForRun(
-						sourceNarrator,
-						buffered.createdBy ?? sourceNarrator.ownerUserId,
-						undefined,
-						{},
-					)
-				).model
-			: (sourceNarrator.model ?? undefined);
-	const newNarrator = await narratorService.create({
-		model: newModel,
-		systemPrompt: sourceNarrator.systemPrompt ?? undefined,
-		permissionMode: sourceNarrator.permissionMode ?? undefined,
-		reasoningEffort: sourceNarrator.reasoningEffort ?? undefined,
-		fastModeOverride: normalizeBooleanOverride(sourceNarrator.fastModeOverride),
-		relaxedPlan: sourceNarrator.relaxedPlan ?? undefined,
-		planReflectionAutoApproveOverride: normalizeOptionalBooleanOverride(
-			sourceNarrator.planReflectionAutoApproveOverride,
-		),
-		dangerReflectionOverride: normalizeOptionalDangerReflectionOverride(
-			sourceNarrator.dangerReflectionOverride,
-		),
-		questionReflectionOverride: normalizeOptionalBooleanOverride(
-			sourceNarrator.questionReflectionOverride,
-		),
-		cwd: active.cwd,
-		// The person who queued `/new` owns the session it spawns. Falling back to the
-		// source narrator's owner keeps it out of "ownerless" territory when the
-		// buffered message has no recorded author (system-queued paths).
-		ownerUserId: buffered.createdBy ?? sourceNarrator.ownerUserId,
-	});
-
-	if (shouldSendQueuedNewInitialMessage(initialMessage, buffered)) {
-		await sendMessage(
-			newNarrator.id,
-			initialMessage,
-			buffered.images,
-			active.locale,
-			active._replyInUserLanguage ?? false,
-			undefined,
-			buffered.createdBy,
-			buffered.textFiles,
-			undefined,
-			undefined,
-			buffered.fileReferences,
-			// `/new` has been removed from the prompt; its original document no longer projects it.
-			undefined,
-			buffered.media,
-		);
+	const ownerUserId = buffered.createdBy ?? sourceNarrator.ownerUserId;
+	const reservedId = buffered._independentNewNarratorId;
+	const existingTarget = async () => {
+		if (!reservedId) return undefined;
+		try {
+			return await narratorService.getById(reservedId);
+		} catch (error) {
+			if (error instanceof NotFoundError) return undefined;
+			throw error;
+		}
+	};
+	let newNarrator = await existingTarget();
+	if (!newNarrator) {
+		// Resolve inheritance only before creation: retries of a created target must
+		// not depend on later changes to the source's model pool or controller.
+		const newModel =
+			sourceNarrator.model === FOLLOW_PARENT_MODEL
+				? (await resolveSubagentModelForRun(sourceNarrator, ownerUserId, undefined, {})).model
+				: (sourceNarrator.model ?? undefined);
+		try {
+			newNarrator = await narratorService.create(
+				{
+					model: newModel,
+					systemPrompt: sourceNarrator.systemPrompt ?? undefined,
+					permissionMode: sourceNarrator.permissionMode ?? undefined,
+					reasoningEffort: sourceNarrator.reasoningEffort ?? undefined,
+					fastModeOverride: normalizeBooleanOverride(sourceNarrator.fastModeOverride),
+					relaxedPlan: sourceNarrator.relaxedPlan ?? undefined,
+					planReflectionAutoApproveOverride: normalizeOptionalBooleanOverride(
+						sourceNarrator.planReflectionAutoApproveOverride,
+					),
+					dangerReflectionOverride: normalizeOptionalDangerReflectionOverride(
+						sourceNarrator.dangerReflectionOverride,
+					),
+					questionReflectionOverride: normalizeOptionalBooleanOverride(
+						sourceNarrator.questionReflectionOverride,
+					),
+					cwd: active.cwd,
+					ownerUserId,
+				},
+				reservedId ? { reservedId } : undefined,
+			);
+		} catch (error) {
+			// Creation may have committed before a publication/read error surfaced.
+			// The durable reserved ID lets us recover without creating another session.
+			newNarrator = await existingTarget();
+			if (!newNarrator) throw error;
+		}
 	}
-
+	if (
+		reservedId &&
+		(newNarrator.id !== reservedId ||
+			newNarrator.type !== "primary" ||
+			newNarrator.ownerUserId !== ownerUserId)
+	) {
+		throw new ValidationError("Independent /new destination does not match its reserved identity");
+	}
+	if (shouldSendQueuedNewInitialMessage(initialMessage, buffered)) {
+		if (reservedId) {
+			if (!ownerUserId)
+				throw new ValidationError("Independent /new input requires its original author");
+			const { submissionFingerprint } = await import("./agent-runtime/user-submission");
+			await acceptUserMessage(newNarrator.id, initialMessage, {
+				images: buffered.images,
+				media: buffered.media,
+				textFiles: buffered.textFiles,
+				fileReferences: buffered.fileReferences,
+				locale: active.locale,
+				replyInUserLanguage: active._replyInUserLanguage ?? false,
+				userId: ownerUserId,
+				queueMode: "turn",
+				// A command argument is the new session's literal first message.
+				executionIntent: { literal: true },
+				submission: {
+					clientSubmissionId: `queued-new-${buffered.id}`,
+					fingerprint: submissionFingerprint({
+						source: active.narratorId,
+						message: buffered.id,
+						target: reservedId,
+						initialMessage,
+					}),
+				},
+			});
+		} else {
+			await sendMessage(
+				newNarrator.id,
+				initialMessage,
+				buffered.images,
+				active.locale,
+				active._replyInUserLanguage ?? false,
+				undefined,
+				buffered.createdBy,
+				buffered.textFiles,
+				undefined,
+				undefined,
+				buffered.fileReferences,
+				undefined,
+				buffered.media,
+			);
+		}
+	}
 	return newNarrator.id;
 }
 
-/**
- * Prepared under source admission; execute outside it. No source runtime owner,
- * guidance controller, message history or status participates in this dispatch.
- */
 export async function prepareIndependentQueuedNewCommand(
 	narratorId: string,
 	messageId: string,
+	options: { retry?: boolean } = {},
 ): Promise<(() => Promise<string>) | undefined> {
 	let initialMessage = "";
 	const buffered = await takeBufferedMessageForIndependentCommand(
@@ -857,42 +901,103 @@ export async function prepareIndependentQueuedNewCommand(
 			initialMessage = command.initialMessage;
 			return true;
 		},
+		options,
 	);
 	if (!buffered) return undefined;
 	return async () => {
-		try {
-			const source = await narratorService.getById(narratorId);
-			const active = activeNarrators.get(narratorId);
-			const userId = buffered.createdBy ?? source.ownerUserId;
-			const { getUserReplyInLanguage } = await import("../lib/i18n");
-			const newNarratorId = await executeQueuedNewCommand(
-				{
-					narratorId,
-					cwd: source.cwd ?? active?.cwd,
-					locale: userId ? await getUserLanguage(userId) : (active?.locale ?? "en"),
-					_replyInUserLanguage: userId ? await getUserReplyInLanguage(userId) : false,
-				},
-				buffered,
-				initialMessage,
-			);
-			broadcastToNarrator(narratorId, {
-				type: "buffer_consumed",
+		const source = await narratorService.getById(narratorId);
+		const active = activeNarrators.get(narratorId);
+		const userId = buffered.createdBy ?? source.ownerUserId;
+		const { getUserReplyInLanguage } = await import("../lib/i18n");
+		return executeIndependentQueuedNewCommand(
+			{
 				narratorId,
-				messageId: buffered.id,
-				remaining: toBufferSummary(await getBufferedMessagesAsync(narratorId)),
-			});
-			broadcastToNarrator(narratorId, {
-				type: "queued_new_narrator_created",
-				narratorId,
-				messageId: buffered.id,
-				newNarratorId,
-			});
-			return newNarratorId;
-		} finally {
-			// Text-file Blobs are lazy: only clean after the new recipient copied them.
-			await cleanupBufferedTextFilesAsync(buffered._stagingId ?? buffered.id);
-		}
+				cwd: source.cwd ?? active?.cwd,
+				locale: userId ? await getUserLanguage(userId) : (active?.locale ?? "en"),
+				_replyInUserLanguage: userId ? await getUserReplyInLanguage(userId) : false,
+			},
+			buffered,
+			initialMessage,
+		);
 	};
+}
+
+/** A durable retryable handoff; source history/runtime are never its receipt. */
+export async function executeIndependentQueuedNewCommand(
+	context: Parameters<typeof executeQueuedNewCommand>[0],
+	buffered: BufferedMessage,
+	initialMessage: string,
+): Promise<string> {
+	const narratorId = context.narratorId;
+	const targetId = buffered._independentNewNarratorId;
+	if (!targetId) throw new ValidationError("Independent /new destination was not reserved");
+	let newNarratorId: string;
+	try {
+		newNarratorId = await runIndependentBufferedCommand(
+			narratorId,
+			buffered.id,
+			targetId,
+			(message) => executeQueuedNewCommand(context, message, initialMessage),
+		);
+	} catch (error) {
+		try {
+			broadcastToNarrator(narratorId, {
+				type: "buffer_set",
+				narratorId,
+				messages: toBufferSummary(await getBufferedMessagesAsync(narratorId)),
+			});
+		} catch (notificationError) {
+			logger.warn("Independent /new failure notification deferred", {
+				narratorId,
+				error: String(notificationError),
+			});
+		}
+		throw error;
+	}
+	try {
+		broadcastToNarrator(narratorId, {
+			type: "buffer_consumed",
+			narratorId,
+			messageId: buffered.id,
+			remaining: toBufferSummary(await getBufferedMessagesAsync(narratorId)),
+		});
+		broadcastToNarrator(narratorId, {
+			type: "queued_new_narrator_created",
+			narratorId,
+			messageId: buffered.id,
+			newNarratorId,
+		});
+	} catch (error) {
+		// A lost UI notification is not permission to recreate an accepted target.
+		logger.warn("Independent /new success notification deferred", {
+			narratorId,
+			newNarratorId,
+			error: String(error),
+		});
+	}
+	return newNarratorId;
+}
+
+/** Detached queue commands must not hold up the source's next input or continuation. */
+export function startIndependentQueuedNewCommand(
+	context: Parameters<typeof executeQueuedNewCommand>[0],
+	buffered: BufferedMessage,
+	initialMessage: string,
+): void {
+	const snapshot = {
+		narratorId: context.narratorId,
+		cwd: context.cwd,
+		locale: context.locale,
+		_replyInUserLanguage: context._replyInUserLanguage,
+	};
+	void trackCommunicationWork(
+		executeIndependentQueuedNewCommand(snapshot, buffered, initialMessage).catch((error) => {
+			logger.error("Independent queued /new failed", {
+				narratorId: snapshot.narratorId,
+				error: String(error),
+			});
+		}),
+	);
 }
 
 /**
@@ -1188,7 +1293,7 @@ async function resumeNextBufferedMessageUnlocked(
 		}
 		claimedRow = await claimInboxHead(narratorId, (candidate) => candidate.kind === "user_input");
 		if (!claimedRow) return;
-		const first = projectMailboxUserMessage(claimedRow);
+		let first = projectMailboxUserMessage(claimedRow);
 		// Parsed before consuming, because the two kinds of item are consumed
 		// differently: a terminal command owns its attachments from here on, while a
 		// plain message keeps its files on disk until delivery has actually succeeded —
@@ -1207,12 +1312,16 @@ async function resumeNextBufferedMessageUnlocked(
 		);
 		const controlCommand = newCommand ? undefined : first.executionIntent?.controlCommand;
 		if (newCommand) {
-			if (
-				!(await dropBufferedMessage(narratorId, first, "Dispatched independent /new command", {
-					preserveStaging: true,
-				}))
-			)
-				throw new ValidationError("Buffered /new claim is no longer current");
+			const independent = await takeBufferedMessageForIndependentCommand(
+				narratorId,
+				first.id,
+				() => true,
+				{
+					claimed: inboxClaim(claimedRow),
+				},
+			);
+			if (!independent) throw new ValidationError("Buffered /new claim is no longer current");
+			first = independent;
 		}
 		if (controlCommand) {
 			const commandMessage = await withInboxOwner(narratorId, async () => {
@@ -1253,16 +1362,19 @@ async function resumeNextBufferedMessageUnlocked(
 				});
 			}
 		}
-		broadcastToNarrator(narratorId, {
-			type: "buffer_consumed",
-			narratorId,
-			messageId: first.id,
-			remaining: toBufferSummary(await getBufferedMessagesAsync(narratorId)),
-		});
+		if (!newCommand)
+			broadcastToNarrator(narratorId, {
+				type: "buffer_consumed",
+				narratorId,
+				messageId: first.id,
+				remaining: toBufferSummary(await getBufferedMessagesAsync(narratorId)),
+			});
 
 		const settleAfterTerminalCommand = async () => {
 			// More queued behind this terminal command → keep draining; else settle idle.
-			if ((await getBufferedMessagesAsync(narratorId)).length > 0) {
+			if (
+				(await getBufferedMessagesAsync(narratorId)).some((message) => message.state !== "failed")
+			) {
 				// Let this terminal command release its outer admission and wake promise
 				// before scheduling a later command that may run for minutes.
 				setImmediate(() => {
@@ -1335,39 +1447,10 @@ async function resumeNextBufferedMessageUnlocked(
 			};
 		} else if (newCommand) {
 			inputOwner.release();
-			await executeQueuedNewCommand(active, first, newCommand.initialMessage)
-				.then(async (newNarratorId) => {
-					broadcastToNarrator(narratorId, {
-						type: "queued_new_narrator_created",
-						narratorId,
-						messageId: first.id,
-						newNarratorId,
-					});
-				})
-				.catch((err) => {
-					logger.error("Independent queued /new failed", { narratorId, error: String(err) });
-					try {
-						broadcastToNarrator(narratorId, {
-							type: "narrator_error",
-							narratorId,
-							error: String(err),
-						});
-					} catch (error) {
-						logger.warn("Independent /new error notification failed", {
-							narratorId,
-							error: String(error),
-						});
-					}
-				})
-				.finally(async () => {
-					await cleanupBufferedTextFilesAsync(first._stagingId ?? first.id).catch((error) => {
-						logger.warn("Independent /new staging cleanup failed", {
-							narratorId,
-							error: String(error),
-						});
-					});
-					await settleAfterTerminalCommand();
-				});
+			await settleAfterTerminalCommand();
+			return async () => {
+				startIndependentQueuedNewCommand(active, first, newCommand.initialMessage);
+			};
 		} else if (goalCommand) {
 			// Queued /goal: persist its task (Dynamic Spec or the outline), then launch its first
 			// turn. If plan mode or another guard prevents starting, keep draining as before.

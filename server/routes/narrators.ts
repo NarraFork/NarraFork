@@ -4523,6 +4523,11 @@ narratorRoutes.post("/:id/buffer/:mid/retry", async (c) => {
 	await withNarratorStartAdmission(id, async () => {
 		// Retain mode before the transition: the recovered row may be claimed immediately.
 		const previous = (await getBufferedMessagesAsync(id)).find((message) => message.id === mid);
+		if (!previous || previous.state === "failed") {
+			const { prepareIndependentQueuedNewCommand } = await import("../services/narrator-session");
+			independentNew = await prepareIndependentQueuedNewCommand(id, mid, { retry: true });
+			if (independentNew) return;
+		}
 		let retried: boolean;
 		try {
 			retried = await retryBufferedMessage(id, mid);
@@ -4533,11 +4538,6 @@ narratorRoutes.post("/:id/buffer/:mid/retry", async (c) => {
 			);
 		}
 		if (!retried) throw new ValidationError("Only a failed user message can be retried");
-		if (resolveBufferQueueMode(previous?.queueMode, previous?.priority) !== "turn") {
-			const { prepareIndependentQueuedNewCommand } = await import("../services/narrator-session");
-			independentNew = await prepareIndependentQueuedNewCommand(id, mid);
-			if (independentNew) return;
-		}
 		urgentRetry = resolveBufferQueueMode(previous?.queueMode, previous?.priority) === "interrupt";
 		if (urgentRetry && !(await updateBufferedMessageMode(id, mid, "interrupt"))) {
 			const { readBufferedMessageDeliveryReceipt } = await import("../services/narrator-buffer");
