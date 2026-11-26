@@ -137,8 +137,11 @@ func TestSessionOpenGuardsCwdAndKind(t *testing.T) {
 	if _, err := h.SessionOpen(map[string]any{"sessionId": "x", "cwd": "/"}); err == nil {
 		t.Fatal("cwd outside allowed roots must be rejected")
 	}
-	if _, err := h.SessionOpen(map[string]any{"sessionId": "x", "cwd": root, "kind": "exec"}); err == nil {
+	if _, err := h.SessionOpen(map[string]any{"sessionId": "x", "cwd": root, "kind": "bogus"}); err == nil {
 		t.Fatal("unsupported kinds must be rejected")
+	}
+	if _, err := h.SessionOpen(map[string]any{"sessionId": "x", "cwd": root, "kind": "exec"}); err == nil {
+		t.Fatal("an exec session without a command must be rejected")
 	}
 	if _, err := h.SessionOpen(map[string]any{"cwd": root}); err == nil {
 		t.Fatal("missing sessionId must be rejected")

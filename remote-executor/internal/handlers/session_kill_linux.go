@@ -52,3 +52,7 @@ func procSession(pid int) int {
 	}
 	return sid
 }
+
+// killExecSession stops a command without a terminal: on Linux the same SIGKILL
+// of every process in its session.
+func killExecSession(sid int) { killPtySession(sid) }

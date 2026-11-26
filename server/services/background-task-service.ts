@@ -38,6 +38,7 @@ import {
 import { db } from "../db";
 import { backgroundTasks, deviceTransferTasks, narrators, narratorToolCalls } from "../db/schema";
 import { type ReadQueryOptions, readQuery, readQueryFirst } from "../db/worker-read";
+import type { ExecutorSessionBinding } from "../lib/agent/execution/backend";
 import { BASH_TOOL_NAME } from "../lib/agent/tool-name";
 import type { ToolCallBinding, ToolExecutionTarget } from "../lib/agent/types";
 import { narratorTraitsLock } from "../lib/async-mutex";
@@ -581,6 +582,8 @@ class BackgroundTaskService {
 	private abortControllers: Map<string, AbortController>;
 	/** Kill handlers for bash processes (sends SIGTERM/SIGKILL) */
 	private killHandlers: Map<string, () => void>;
+	/** Collectors whose process outlives this server: detached, not killed, on shutdown. */
+	private shutdownDetaches = new Map<string, () => void>();
 	/** In-memory output chunk buffers for streaming bash output (joined on read) */
 	private outputChunks: Map<string, string[]>;
 	/** Accumulated byte length per task (for enforcing MAX_MEMORY_OUTPUT_BYTES) */
@@ -2520,6 +2523,19 @@ class BackgroundTaskService {
 	}
 
 	/**
+	 * Record the durable executor session a remote background command runs in. Written
+	 * before the session is opened, so a restarted server can re-attach to it or stop it.
+	 */
+	async bindExecutorSession(taskId: string, binding: ExecutorSessionBinding): Promise<void> {
+		const bound = await db
+			.update(backgroundTasks)
+			.set({ executorSessionJson: binding, updatedAt: new Date().toISOString() })
+			.where(and(eq(backgroundTasks.id, taskId), eq(backgroundTasks.status, "running")))
+			.returning({ id: backgroundTasks.id });
+		if (bound.length === 0) throw new Error(`Background task ${taskId} is no longer running`);
+	}
+
+	/**
 	 * Persist an alias to the background_tasks table so it survives
 	 * in-memory registry cleanup across agent loop restarts.
 	 */
@@ -3606,6 +3622,17 @@ class BackgroundTaskService {
 	}
 
 	private stopBashProcess(taskId: string, controller?: AbortController): void {
+		const detach = this.shutdownDetaches.get(taskId);
+		if (detach) {
+			// The executor keeps running it; the next server process re-attaches.
+			this.bashLifecycle.preserveTask(taskId);
+			try {
+				detach();
+			} catch (error) {
+				logger.warn("Detach error during Bash shutdown", { taskId, error: String(error) });
+			}
+			return;
+		}
 		controller?.abort();
 		try {
 			this.killHandlers.get(taskId)?.();
@@ -3846,6 +3873,15 @@ class BackgroundTaskService {
 		const updated = await pub.finalizeTakeover({ taskId, hasError, output, now });
 		this.cleanupRuntime(taskId);
 		if (updated) this.queueTaskUpsert(updated.parentNarratorId, taskId);
+	}
+
+	/**
+	 * Register how to stop observing a collector whose process outlives this server (an
+	 * executor session). Shutdown then detaches it instead of killing it, and leaves its
+	 * row running for the next server process.
+	 */
+	registerShutdownDetach(taskId: string, detach: () => void): void {
+		this.shutdownDetaches.set(taskId, detach);
 	}
 
 	registerKillHandler(taskId: string, handler: () => void): void {
@@ -4510,8 +4546,19 @@ class BackgroundTaskService {
 		// and settle the ones that ended while no server was watching from their own exit
 		// file instead of the generic "outcome unknown".
 		const settledServices = new Set<string>();
+		// A remote command in a durable executor session is still the executor's: re-attach
+		// to it (whatever its kind) instead of reporting its outcome unknown. A held narrator's
+		// protection does not apply: re-attaching observes a started command, it never runs it.
+		for (const task of scanned) {
+			if (task.type !== "bash") continue;
+			const row = await this.getById(task.id);
+			if (row?.status !== "running" || !row.executorSessionJson) continue;
+			await this.recoverExecutorSessionTask(task, row.executorSessionJson);
+			settledServices.add(task.id);
+		}
 		for (const task of scanned) {
 			if (task.type !== "bash" || task.backgroundKind !== "service") continue;
+			if (settledServices.has(task.id)) continue;
 			if (await this.recoverDurableService(task.id, task.parentNarratorId, task))
 				settledServices.add(task.id);
 		}
@@ -4871,6 +4918,51 @@ class BackgroundTaskService {
 	}
 
 	/**
+	 * Re-attach to a remote background command a previous server process left running in a
+	 * durable executor session. The device may be offline: the handle waits for it, and the
+	 * executor enforces the command's deadline meanwhile. A session the executor no longer
+	 * has ends the task as failed with that reason, not as a silent success.
+	 */
+	private async recoverExecutorSessionTask(
+		observed: RestartTaskObservation,
+		binding: ExecutorSessionBinding,
+	): Promise<void> {
+		const taskId = observed.id;
+		if (resolveRuntimeQueueBackend() !== "postgres")
+			runAtomicWrite(db, "background-task.adoptExecutorSession", (tx) =>
+				assertRestartTask(tx, observed),
+			);
+		const { RemoteSessionExecHandle } = await import("./remote-session-exec");
+		const handle = new RemoteSessionExecHandle(binding, {});
+		const ctrl = new AbortController();
+		this.outputChunks.set(taskId, []);
+		this.outputByteCounts.set(taskId, 0);
+		this.parentNarratorCache.set(taskId, observed.parentNarratorId);
+		this.registerAbortController(taskId, ctrl);
+		const remaining =
+			binding.timeoutMs === undefined
+				? undefined
+				: Date.parse(binding.startedAt) + binding.timeoutMs - Date.now();
+		const { monitorBackgroundBash } = await import("../lib/agent/tools/bash");
+		const lifecycle = Promise.resolve().then(() =>
+			monitorBackgroundBash({
+				taskId,
+				handle,
+				bgAbort: ctrl,
+				backgroundKind: observed.backgroundKind === "service" ? "service" : "task",
+				timeoutMs: remaining,
+			}),
+		);
+		this.trackBashCollector(taskId, ctrl, lifecycle, false);
+		this.queueTaskUpsert(observed.parentNarratorId, taskId);
+		logger.info("Re-attached remote background command after restart", {
+			taskId,
+			deviceId: binding.deviceId,
+			sessionId: binding.sessionId,
+		});
+	}
+
+	/**
 	 * Remove leftover service directories that no running service row references (the row
 	 * was deleted, or a crash happened between settle and cleanup). Bounded and best effort.
 	 */
@@ -5213,6 +5305,7 @@ class BackgroundTaskService {
 		if (!this.ownsAbortController(taskId, expectedAbortController)) return;
 		this.abortControllers.delete(taskId);
 		this.killHandlers.delete(taskId);
+		this.shutdownDetaches.delete(taskId);
 		this.outputChunks.delete(taskId);
 		this.outputByteCounts.delete(taskId);
 		this.parentNarratorCache.delete(taskId);

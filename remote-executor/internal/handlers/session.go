@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/narrafork/remote-executor/internal/session"
 )
@@ -13,6 +14,12 @@ import (
 // by the executor process rather than by an RPC or connection, with a
 // sequence-numbered output journal that a new connection can resume from.
 const FeatureSessionDurableV1 = "session.durable.v1"
+
+// FeatureSessionExecV1 advertises `session.open { kind: "exec" }`: a shell
+// command without a terminal (output from stdout and stderr, no input) in the
+// same durable session model, for background commands that must outlive a
+// connection or a NarraFork restart.
+const FeatureSessionExecV1 = "session.exec.v1"
 
 var errSessionsUnavailable = errors.New("durable sessions are not available on this executor")
 
@@ -52,12 +59,27 @@ func (h *Handlers) SessionOpen(params map[string]any) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	if kind := stringParam(params, "kind"); kind != "" && kind != "pty" {
+	kind := stringParam(params, "kind")
+	if kind != "" && kind != "pty" && kind != "exec" {
 		return nil, fmt.Errorf("unsupported session kind %q", kind)
 	}
 	cwd, err := h.guardedExistingPath(params, "cwd")
 	if err != nil {
 		return nil, err
+	}
+	if kind == "exec" {
+		command := stringParam(params, "command")
+		if command == "" {
+			return nil, fmt.Errorf("missing command")
+		}
+		shell, shellArgs := loginShell(command)
+		env := commandEnv(boolParam(params, "freshEnv"), params)
+		// The executor enforces the deadline itself, so it holds while NarraFork is
+		// away; 0 means no deadline.
+		timeout := time.Duration(intParam(params, "timeoutMs", 0)) * time.Millisecond
+		return m.Open(id, "exec", func() (session.Process, error) {
+			return startExecProcess(append([]string{shell}, shellArgs...), cwd, env, timeout)
+		})
 	}
 	cmdArgs := stringSliceParam(params, "cmd")
 	if len(cmdArgs) == 0 {

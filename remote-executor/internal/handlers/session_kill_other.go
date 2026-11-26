@@ -17,3 +17,8 @@ func killPtySession(sid int) {
 		_ = syscall.Kill(-sid, syscall.SIGKILL)
 	}()
 }
+
+// killExecSession stops a command without a terminal with SIGKILL to its process
+// group straight away. There is no interactive shell to forward a hangup, and a
+// command that caught SIGHUP could exit 0 and hide that its deadline stopped it.
+func killExecSession(sid int) { _ = syscall.Kill(-sid, syscall.SIGKILL) }
