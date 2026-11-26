@@ -21,6 +21,12 @@ const FeatureSessionDurableV1 = "session.durable.v1"
 // connection or a NarraFork restart.
 const FeatureSessionExecV1 = "session.exec.v1"
 
+// FeatureSessionJournalDiskV1 advertises that session output and exit facts are
+// recorded on disk: after this executor restarts, its sessions are still
+// listed and attachable, and those that were running when it stopped report
+// state "lost" (attach result `lost: true`) after their recorded output.
+const FeatureSessionJournalDiskV1 = "session.journal.disk.v1"
+
 var errSessionsUnavailable = errors.New("durable sessions are not available on this executor")
 
 // SetSessionManager installs the process-wide session manager. It is shared by

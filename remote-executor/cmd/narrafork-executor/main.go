@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 
 	"github.com/narrafork/remote-executor/internal/buildinfo"
@@ -141,6 +142,17 @@ func run(ctx context.Context, ready func()) error {
 	// running across reconnects and end only when killed or when we exit.
 	if caps.Pty {
 		sessions := session.NewManager(session.DefaultLimits())
+		// Records on disk let a restarted executor still serve what its sessions
+		// printed and how they ended. Without them sessions only live in memory.
+		if dir, err := sessionStateDir(cfg); err != nil {
+			log.Printf("WARNING: session records stay in memory only: %v", err)
+		} else if store, err := session.NewDiskStore(dir); err != nil {
+			log.Printf("WARNING: session records stay in memory only: %v", err)
+		} else if err := sessions.UseStore(store); err != nil {
+			log.Printf("WARNING: session records stay in memory only: %v", err)
+		} else {
+			caps.Features = append(caps.Features, handlers.FeatureSessionJournalDiskV1)
+		}
 		h.SetSessionManager(sessions)
 		caps.Features = append(caps.Features, handlers.FeatureSessionDurableV1, handlers.FeatureSessionExecV1)
 		defer sessions.Shutdown()
@@ -207,4 +219,28 @@ func shellPath() string {
 		return s
 	}
 	return "/bin/sh"
+}
+
+// sessionStateDir is where this executor keeps its session records: one
+// directory per device, so several executors for different devices on one
+// machine never share (or restore) each other's sessions.
+func sessionStateDir(cfg *config.Config) (string, error) {
+	base := cfg.StateDir
+	if base == "" {
+		dir, err := config.DefaultStateDir()
+		if err != nil {
+			return "", err
+		}
+		base = dir
+	}
+	device := strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			return r
+		}
+		return '_'
+	}, cfg.DeviceRef)
+	if device == "" {
+		device = "default"
+	}
+	return filepath.Join(base, device, "sessions"), nil
 }

@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { eventBus } from "../lib/event-bus";
 import { DeviceOfflineError, type SendRpcOptions } from "../services/device-connection-service";
 import {
+	LOST_REASON,
 	RemoteSessionOpenUnknownError,
 	spawnRemoteSession,
 	terminalSessionId,
@@ -487,6 +488,55 @@ describe("spawnRemoteSession", () => {
 		);
 		expect(await runtime.exited).toBe(137);
 		expect(exits).toEqual([{ exitCode: 137, timedOut: true }]);
+	});
+
+	test("a session lost to an executor restart delivers its recorded output, then ends", async () => {
+		const exec = fakeExecutor();
+		exec.state.opened = true;
+		const out = capture();
+		const runtime = spawnRemoteSession(
+			DEVICE,
+			"s1",
+			{ since: 0, onData: out.onData },
+			{
+				...exec,
+				sendRpc: (deviceId, method, params, options) => {
+					if (method !== "session.attach") return exec.sendRpc(deviceId, method, params, options);
+					options?.onStream?.("session.data", new TextEncoder().encode("recorded output\r\n"));
+					return Promise.resolve({ exitCode: -1, endSeq: 17, lost: true });
+				},
+			},
+		);
+		expect(await runtime.exited).toBeNull();
+		expect(out.text()).toStartWith("recorded output\r\n");
+		expect(out.text()).toContain("executor restarted while this was running");
+	});
+
+	test("a lost command reports the restart to its owner instead of a terminal notice", async () => {
+		const exec = fakeExecutor();
+		exec.state.opened = true;
+		const chunks: string[] = [];
+		const lost: string[] = [];
+		const runtime = spawnRemoteSession(
+			DEVICE,
+			"nf-bash-5",
+			{
+				since: 0,
+				onBytes: (bytes) => chunks.push(new TextDecoder().decode(bytes)),
+				onLost: (reason) => lost.push(reason),
+			},
+			{
+				...exec,
+				sendRpc: (deviceId, method, params, options) => {
+					if (method !== "session.attach") return exec.sendRpc(deviceId, method, params, options);
+					options?.onStream?.("session.data", new TextEncoder().encode("step 1\n"));
+					return Promise.resolve({ exitCode: -1, endSeq: 7, lost: true });
+				},
+			},
+		);
+		expect(await runtime.exited).toBeNull();
+		expect(chunks.join("")).toBe("step 1\n");
+		expect(lost).toEqual([LOST_REASON]);
 	});
 
 	test("a session the executor no longer has is reported as lost", async () => {

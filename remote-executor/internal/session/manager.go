@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"regexp"
 	"sort"
 	"sync"
@@ -72,14 +73,19 @@ var validID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 type Info struct {
 	SessionID string `json:"sessionId"`
 	Kind      string `json:"kind"`
-	State     string `json:"state"` // "running" | "exited"
+	// "running" | "exited" | "lost" (a previous executor process stopped while
+	// it ran: its output up to then is served, its outcome is unknown)
+	State     string `json:"state"`
 	ExitCode  *int   `json:"exitCode,omitempty"`
 	StartedAt string `json:"startedAt"`
 	ExitedAt  string `json:"exitedAt,omitempty"`
 	// TimedOut: the process's own deadline stopped it (see DeadlineReporter).
 	TimedOut bool  `json:"timedOut,omitempty"`
 	FirstSeq int64 `json:"firstSeq"`
-	EndSeq   int64 `json:"endSeq"`
+	// StorageError: the output stopped being recorded on disk (it is still served
+	// from memory while this executor runs).
+	StorageError string `json:"storageError,omitempty"`
+	EndSeq       int64  `json:"endSeq"`
 }
 
 // Session is one long-lived process with its output journal.
@@ -100,6 +106,10 @@ type Session struct {
 	// killRequested: a kill arrived while the process was still starting; it is
 	// stopped as soon as it exists.
 	killRequested bool
+	// lost: restored from disk after the executor process that ran it stopped.
+	lost       bool
+	log        *sessionLog
+	storageErr error
 
 	writeMu  sync.Mutex
 	seen     map[string]struct{}
@@ -124,6 +134,13 @@ func (s *Session) info() Info {
 		info.ExitCode = &code
 		info.ExitedAt = s.exitedAt.UTC().Format(time.RFC3339Nano)
 		info.TimedOut = s.timedOut
+		if s.lost {
+			info.State = "lost"
+			info.ExitCode = nil
+		}
+	}
+	if s.storageErr != nil {
+		info.StorageError = s.storageErr.Error()
 	}
 	return info
 }
@@ -142,6 +159,7 @@ type Manager struct {
 	mu       sync.Mutex
 	sessions map[string]*Session
 	closed   bool
+	store    *DiskStore
 }
 
 // NewManager returns an empty manager.
@@ -154,10 +172,63 @@ func (m *Manager) sweepLocked() {
 	cutoff := m.now().Add(-m.limits.ExitedTTL)
 	for id, s := range m.sessions {
 		if exited, _, at := s.exitState(); exited && at.Before(cutoff) {
-			delete(m.sessions, id)
+			m.dropLocked(id)
 		}
 	}
 }
+
+// dropLocked forgets a session and deletes its record on disk.
+func (m *Manager) dropLocked(id string) {
+	delete(m.sessions, id)
+	if m.store != nil {
+		_ = m.store.Remove(id)
+	}
+}
+
+// UseStore records sessions in st from now on, and restores the ones a previous
+// executor process left there: exited sessions keep their output and exit, and
+// sessions that were still running come back as lost. Call before serving.
+func (m *Manager) UseStore(st *DiskStore) error {
+	restored, err := st.Load(m.limits.RetainBytes, m.now())
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.store = st
+	for _, r := range restored {
+		if _, ok := m.sessions[r.meta.SessionID]; ok {
+			continue
+		}
+		m.sessions[r.meta.SessionID] = &Session{
+			id:        r.meta.SessionID,
+			kind:      r.meta.Kind,
+			proc:      endedProcess{},
+			journal:   restoredJournal(m.limits.RetainBytes, r.firstSeq, r.data),
+			limits:    m.limits,
+			startedAt: r.meta.StartedAt,
+			exited:    true,
+			exitCode:  r.meta.ExitCode,
+			exitedAt:  r.meta.ExitedAt,
+			timedOut:  r.meta.TimedOut,
+			lost:      r.meta.Lost,
+			seen:      make(map[string]struct{}),
+		}
+	}
+	return nil
+}
+
+// endedProcess stands in for the process of a session restored from disk.
+type endedProcess struct{}
+
+func (endedProcess) Read([]byte) (int, error)  { return 0, io.EOF }
+func (endedProcess) Write([]byte) (int, error) { return 0, ErrExited }
+func (endedProcess) Resize(uint16, uint16) error {
+	return ErrExited
+}
+func (endedProcess) Kill() error  { return nil }
+func (endedProcess) Wait() int    { return -1 }
+func (endedProcess) Close() error { return nil }
 
 // Open registers id, starts its process via start, and returns immediately.
 // The process keeps running until it exits or Kill is called; no connection
@@ -190,13 +261,25 @@ func (m *Manager) Open(id, kind string, start func() (Process, error)) (Info, er
 		seen:      make(map[string]struct{}),
 	}
 	m.sessions[id] = s
+	store := m.store
 	m.mu.Unlock()
+
+	// Recording is best effort: a full or failing disk costs persistence, never
+	// the session.
+	if store != nil {
+		log, err := store.Create(storedMeta{SessionID: id, Kind: kind, StartedAt: s.startedAt}, m.limits.RetainBytes)
+		if err != nil {
+			s.storageErr = err
+		} else {
+			s.log = log
+		}
+	}
 
 	proc, err := start()
 	if err != nil {
 		m.mu.Lock()
 		if m.sessions[id] == s {
-			delete(m.sessions, id)
+			m.dropLocked(id)
 		}
 		m.mu.Unlock()
 		return Info{}, err
@@ -235,7 +318,15 @@ func (m *Manager) run(s *Session) {
 		for {
 			n, err := s.proc.Read(buf)
 			if n > 0 {
-				s.journal.Append(buf[:n])
+				seq := s.journal.Append(buf[:n])
+				if s.log != nil {
+					if werr := s.log.Append(seq, buf[:n]); werr != nil {
+						s.mu.Lock()
+						s.storageErr = werr
+						s.log = nil
+						s.mu.Unlock()
+					}
+				}
 			}
 			if err != nil {
 				return
@@ -255,11 +346,20 @@ func (m *Manager) run(s *Session) {
 		if r, ok := s.proc.(DeadlineReporter); ok {
 			timedOut = r.TimedOut()
 		}
+		exitedAt := m.now()
+		// The record on disk is final before anyone can observe the exit.
+		if s.log != nil {
+			if err := s.log.Exit(code, exitedAt, timedOut); err != nil {
+				s.mu.Lock()
+				s.storageErr = err
+				s.mu.Unlock()
+			}
+		}
 		s.mu.Lock()
 		s.exited = true
 		s.exitCode = code
 		s.timedOut = timedOut
-		s.exitedAt = m.now()
+		s.exitedAt = exitedAt
 		release := s.releaseOnExit
 		s.mu.Unlock()
 		// Exit facts are visible before attachers observe end of output.
@@ -404,7 +504,7 @@ func (m *Manager) forget(s *Session) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.sessions[s.id] == s {
-		delete(m.sessions, s.id)
+		m.dropLocked(s.id)
 	}
 }
 
@@ -420,7 +520,7 @@ func (m *Manager) Release(id string) error {
 	if exited, _, _ := s.exitState(); !exited {
 		return fmt.Errorf("session %q is still running; kill it before releasing", id)
 	}
-	delete(m.sessions, id)
+	m.dropLocked(id)
 	return nil
 }
 
@@ -455,6 +555,10 @@ type AttachResult struct {
 	ExitCode int   `json:"exitCode"`
 	EndSeq   int64 `json:"endSeq"`
 	TimedOut bool  `json:"timedOut,omitempty"`
+	// Lost: the executor process that ran the session stopped while it was
+	// running; the output up to EndSeq is all that was recorded and ExitCode is
+	// meaningless.
+	Lost bool `json:"lost,omitempty"`
 }
 
 // Attach streams output from since until the session ends or ctx is done.
@@ -472,6 +576,17 @@ func (m *Manager) Attach(
 		return AttachResult{}, err
 	}
 	pos := since
+	s.mu.Lock()
+	lost := s.lost
+	s.mu.Unlock()
+	if _, end, _ := s.journal.Bounds(); lost && since > end {
+		// The reader saw output that never reached the disk before the crash:
+		// nothing more is coming, and nothing it has needs replaying.
+		result := AttachResult{ExitCode: -1, EndSeq: end, Lost: true}
+		payload, _ := json.Marshal(result)
+		send(ChannelExit, payload)
+		return result, nil
+	}
 	for {
 		res, ok := s.journal.Read(pos, s.limits.ChunkBytes)
 		if !ok {
@@ -496,7 +611,7 @@ func (m *Manager) Attach(
 			s.mu.Lock()
 			timedOut := s.timedOut
 			s.mu.Unlock()
-			result := AttachResult{ExitCode: code, EndSeq: pos, TimedOut: timedOut}
+			result := AttachResult{ExitCode: code, EndSeq: pos, TimedOut: timedOut, Lost: lost}
 			payload, _ := json.Marshal(result)
 			send(ChannelExit, payload)
 			return result, nil

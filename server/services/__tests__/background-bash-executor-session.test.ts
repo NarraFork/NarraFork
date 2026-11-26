@@ -217,6 +217,17 @@ describe("remote background Bash on durable executor sessions", () => {
 		await until(() => row("bash_held")?.status === "completed");
 	});
 
+	test("a command lost to an executor restart fails with its recorded output and the reason", async () => {
+		await runningTask("bash_crashed");
+		await backgroundTaskService.recoverStaleTasksAfterRestart();
+		await until(() => attach !== undefined);
+		attach?.stream("session.data", encode("migrating 3/10\n"));
+		attach?.end({ exitCode: -1, endSeq: 15, lost: true });
+		await until(() => row("bash_crashed")?.status === "failed");
+		expect(row("bash_crashed")?.output).toContain("migrating 3/10");
+		expect(row("bash_crashed")?.output).toContain("its executor restarted while it was running");
+	});
+
 	test("a session the executor no longer has fails the task with the reason", async () => {
 		await runningTask("bash_lost", "service");
 		attachFailure = new Error("session not found");

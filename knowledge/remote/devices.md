@@ -15,6 +15,7 @@ anchors:
   - remote-executor/cmd/
   - remote-executor/go.mod
   - remote-executor/internal/session/
+  - remote-executor/internal/config/
   - remote-executor/internal/handlers/session.go
   - remote-executor/internal/handlers/session_unix.go
   - remote-executor/internal/handlers/session_windows.go
@@ -97,6 +98,7 @@ verified_at: 8d4bc063
   - `session.attach { since }` 依次发 `session.gap`（可选）、连续的 `session.data`、`session.exit {exitCode,endSeq}`；`since` 超过末尾报错；取消只脱离。
   - `session.write` 在每会话最近 256 个 `writeId` 内去重；会话总数上限 64，已退出的会话 24 小时后自动释放；进程退出后输出最多再排空 2 秒（`internal/session/manager.go:DefaultLimits`）。
   - Windows 不声明此特性（`session_windows.go` 只占位）。
+  - 磁盘记录（特性 `session.journal.disk.v1`，`internal/session/store.go`）：每个会话在 `<stateDir>/<设备>/sessions/<id>/` 下有 `meta.json`（原子替换）和按序号命名、每段 ≤1 MiB 的输出分段，只保留最近 4 MiB；分段在切换时 fsync，不逐次 fsync。执行器启动时 `Manager.UseStore` 读回：已退出的照常可读，仍在运行的恢复为 `lost`（attach 先回放已记录输出，结果带 `lost: true`；读者位置超过记录末尾时直接结束），发现时间写回 `meta.json`；释放/TTL/`kill { release }` 删除目录。写盘失败不影响会话，只在 `info.storageError` 报告。目录默认按平台约定（`config.DefaultStateDir`），`--state-dir` / `NARRAFORK_EXECUTOR_STATE_DIR` / `stateDir` 覆盖，按设备分子目录（`main.go:sessionStateDir`）；不可用时只记日志、退回内存。
   - `session.open { kind: "exec" }`（特性 `session.exec.v1`，与上面同时声明）：不带终端的命令，用登录 shell 的 `-c` 运行，stdout 和 stderr 写进同一个只有命令持有写端的管道，stdin 是 `/dev/null`（`session.write` 报错）；命令是新会话首进程（setsid），`session.kill` 直接 SIGKILL（Linux 杀整个会话，含换了进程组的子孙；其他 Unix 杀命令的进程组；不先发可被捕获的 SIGHUP，`killExecSession`）；`timeoutMs` 由执行器自己计时并停止命令，不论有没有人附着，并在退出结果（attach 结果与 `session.info`）里带 `timedOut: true`（`session_unix.go:startExecProcess`、`manager.go:DeadlineReporter`）。
   - `session.kill` 碰上还在启动（已占位、进程未起）的会话时不回 "session not found"，而是记下，进程一起来就停（带 `release` 时随后释放，`manager.go:Kill`/`Open`）。
 - 远端后台 Bash 走执行器会话（设备同时声明 `session.durable.v1` 和 `session.exec.v1` 时，`device-remote-backend.ts:startBackgroundSession`；否则仍走随请求结束的 `exec.start`，其超时是 RPC 超时，默认 120 秒）：
