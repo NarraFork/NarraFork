@@ -7,7 +7,7 @@
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TEAM_MERGE_CONFLICTS_MAX } from "@shared/project-teams";
@@ -28,6 +28,8 @@ import {
 	inspectCheckout,
 	networkOverrides,
 	PRIVATE_REFS_PAGE,
+	parsePushPorcelain,
+	redactUserinfo,
 	type ScopedConfigEntry,
 	signingConfig,
 	sshSettings,
@@ -1116,5 +1118,208 @@ describe("the copyable command and a same-named tag (Devin)", () => {
 		});
 		expect(run.exitCode).toBe(0);
 		expect(await git(["rev-parse", "refs/heads/release"])).toBe(commit);
+	});
+});
+
+describe("the pull request push (G: security as the work-start fetch)", () => {
+	/** A bare origin with main, the repository's own branch `team/x` one commit ahead. */
+	async function pushable() {
+		await commitFile("a.txt", "a\n", "base");
+		const origin = join(temporary, `origin-${Math.random().toString(36).slice(2)}.git`);
+		await git(["init", "-q", "--bare", "-b", "main", origin], temporary);
+		await git(["push", "-q", origin, "main"]);
+		await git(["checkout", "-qb", "team/x"]);
+		const head = await commitFile("x.txt", "x\n", "work");
+		await git(["checkout", "-q", "main"]);
+		await git(["remote", "add", "origin", origin]);
+		return { origin, head };
+	}
+	const tipAt = (origin: string, ref: string) =>
+		git(["rev-parse", "--verify", "--quiet", ref], origin).catch(() => "");
+
+	test("the pinned head lands without +; again is up to date; a remote branch ahead is rejected", async () => {
+		const { origin, head } = await pushable();
+		const push = (sha = head) =>
+			teamRepoGit(repo).pushBranch({ url: origin, head: sha, branch: "team/x" });
+		expect(await push()).toEqual({ outcome: "pushed" });
+		expect(await tipAt(origin, "refs/heads/team/x")).toBe(head);
+		expect(await push()).toEqual({ outcome: "up_to_date" });
+		// Someone pushed on top there: never forced back.
+		const other = await mkdtemp(join(temporary, "clone-"));
+		await git(["clone", "-q", "-b", "team/x", origin, other], temporary);
+		const theirs = await commitFile("y.txt", "y\n", "theirs", other);
+		await git(["push", "-q", "origin", "team/x"], other);
+		const mine = await commitFile("z.txt", "z\n", "mine");
+		const rejected = await push(mine);
+		expect(rejected.outcome).toBe("rejected");
+		expect(await tipAt(origin, "refs/heads/team/x")).toBe(theirs);
+		// No local ref moved, though origin's push URL is the one pushed to.
+		expect(await git(["for-each-ref", "refs/remotes/"])).toBe("");
+	});
+
+	test("origin's fetch refspecs never move a local ref, not even the checked-out base", async () => {
+		const { origin, head } = await pushable();
+		await git(["config", "--unset-all", "remote.origin.fetch"]);
+		await git(["config", "--add", "remote.origin.fetch", "+refs/heads/team/x:refs/heads/main"]);
+		await git(["config", "--add", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/main"]);
+		const before = await git(["for-each-ref"]);
+		expect(await teamRepoGit(repo).pushBranch({ url: origin, head, branch: "team/x" })).toEqual({
+			outcome: "pushed",
+		});
+		expect(await git(["for-each-ref"])).toBe(before);
+		expect(await git(["status", "--porcelain"])).toBe("");
+		// Nothing of NarraFork's throwaway repository is left behind.
+		expect(
+			(await readdir(join(process.env.NARRAFORK_HOME ?? "", "run")).catch(() => [])).filter(
+				(name) => name.startsWith("push-"),
+			),
+		).toEqual([]);
+	});
+
+	test("hooks and the repository's receive-pack, push URL and signing never run", async () => {
+		const { origin, head } = await pushable();
+		const ran = marker("push-program");
+		const hook = join(repo, ".git", "hooks", "pre-push");
+		await writeFile(hook, `#!/bin/sh\ntouch ${ran}-hook\n`);
+		await chmod(hook, 0o755);
+		await git(["config", "hook.audit.event", "pre-push"]);
+		await git(["config", "hook.audit.command", `touch ${ran}-config-hook`]);
+		await git([
+			"config",
+			"remote.origin.receivepack",
+			await script("rp", `touch ${ran}-rp; exit 1`),
+		]);
+		await git(["config", "remote.origin.pushurl", `ext::sh -c touch% ${ran}-pushurl`]);
+		await git(["config", "push.gpgSign", "true"]);
+		await git(["config", "gpg.program", await script("gpg", `touch ${ran}-gpg; exit 1`)]);
+		await git(["config", "push.recurseSubmodules", "on-demand"]);
+		await git(["config", "push.followTags", "true"]);
+		expect(await teamRepoGit(repo).pushBranch({ url: origin, head, branch: "team/x" })).toEqual({
+			outcome: "pushed",
+		});
+		for (const suffix of ["-hook", "-config-hook", "-rp", "-pushurl", "-gpg"])
+			expect({ suffix, ran: existsSync(`${ran}${suffix}`) }).toEqual({ suffix, ran: false });
+	});
+
+	test("a repository insteadOf or pushInsteadOf on the URL, a git proxy, or a remote named by the URL refuse it", async () => {
+		const { origin, head } = await pushable();
+		const ran = marker("push-refused");
+		const push = () => teamRepoGit(repo).pushBranch({ url: origin, head, branch: "team/x" });
+		const refusals: Array<[string[], string]> = [
+			[["config", `url.ext::sh -c touch% ${ran}.insteadOf`, origin], ".insteadof"],
+			[["config", `url.ext::sh -c touch% ${ran}.pushInsteadOf`, origin], ".pushinsteadof"],
+			[["config", "core.gitProxy", await script("proxy", `touch ${ran}; exit 1`)], "core.gitproxy"],
+			[
+				["config", `remote.${origin}.receivepack`, await script("rp", `touch ${ran}`)],
+				".receivepack",
+			],
+			[["config", `remote.${origin}.vcs`, "evil"], ".vcs"],
+			[["config", "remote.origin.vcs", "evil"], "remote.origin.vcs"],
+		];
+		for (const [setting, key] of refusals) {
+			await git(setting);
+			const error = await push().then(
+				() => null,
+				(caught: unknown) => caught,
+			);
+			expect({ key, error }).toMatchObject({
+				key,
+				error: expect.objectContaining({ code: "TEAM_REMOTE_CONFIG_UNSAFE" }),
+			});
+			expect((error as Error).message.toLowerCase()).toContain(key);
+			await git(["config", "--unset-all", setting[1] ?? ""]);
+		}
+		expect(existsSync(ran)).toBe(false);
+		expect(await tipAt(origin, "refs/heads/team/x")).toBe("");
+		// The host's own rewrite is the operator's: it applies.
+		await writeFile(
+			globalConfig,
+			`${HOST_USER}[url "${origin}"]\n\tinsteadOf = https://github.com/acme/app.git\n`,
+		);
+		expect(
+			await teamRepoGit(repo).pushBranch({
+				url: "https://github.com/acme/app.git",
+				head,
+				branch: "team/x",
+			}),
+		).toEqual({ outcome: "pushed" });
+		expect(await tipAt(origin, "refs/heads/team/x")).toBe(head);
+	});
+
+	test("credentials and ssh come from the host only; ext:: is never a transport", async () => {
+		const saved = { command: process.env.GIT_SSH_COMMAND, ssh: process.env.GIT_SSH };
+		delete process.env.GIT_SSH_COMMAND;
+		delete process.env.GIT_SSH;
+		const server = Bun.serve({
+			port: 0,
+			hostname: "127.0.0.1",
+			fetch: () =>
+				new Response("no", { status: 401, headers: { "WWW-Authenticate": 'Basic realm="x"' } }),
+		});
+		try {
+			const { head } = await pushable();
+			const repoHelper = marker("repo-helper");
+			const repoAskpass = marker("repo-askpass");
+			const hostHelper = marker("host-helper");
+			const repoSsh = marker("repo-ssh");
+			const hostSsh = marker("host-ssh");
+			await git(["config", "credential.helper", `!f() { touch ${repoHelper}; }; f`]);
+			await git([
+				"config",
+				"core.askPass",
+				await script("askpass", `touch ${repoAskpass}; echo x`),
+			]);
+			await git([
+				"config",
+				"core.sshCommand",
+				await script("repo-ssh", `touch ${repoSsh}; exit 1`),
+			]);
+			await writeFile(
+				globalConfig,
+				`${HOST_USER}[credential]\n\thelper = "!f() { touch ${hostHelper}; }; f"\n[core]\n\tsshCommand = ${await script("host-ssh", `touch ${hostSsh}; exit 1`)}\n`,
+			);
+			const http = await teamRepoGit(repo).pushBranch({
+				url: `http://127.0.0.1:${server.port}/o/r.git`,
+				head,
+				branch: "team/x",
+			});
+			expect(http.outcome).toBe("failed");
+			const ssh = await teamRepoGit(repo).pushBranch({
+				url: "ssh://git@127.0.0.1:1/o/r.git",
+				head,
+				branch: "team/x",
+			});
+			expect(ssh.outcome).toBe("failed");
+			expect(existsSync(repoHelper)).toBe(false);
+			expect(existsSync(repoAskpass)).toBe(false);
+			expect(existsSync(repoSsh)).toBe(false);
+			expect(existsSync(hostHelper)).toBe(true);
+			expect(existsSync(hostSsh)).toBe(true);
+			const ext = marker("ext");
+			await git(["config", "protocol.ext.allow", "always"]);
+			const refused = await teamRepoGit(repo).pushBranch({
+				url: `ext::sh -c touch% ${ext}`,
+				head,
+				branch: "team/x",
+			});
+			expect(refused.outcome).toBe("failed");
+			expect(existsSync(ext)).toBe(false);
+		} finally {
+			server.stop(true);
+			if (saved.command !== undefined) process.env.GIT_SSH_COMMAND = saved.command;
+			if (saved.ssh !== undefined) process.env.GIT_SSH = saved.ssh;
+		}
+	});
+
+	test("a URL's userinfo never reaches a message", () => {
+		expect(redactUserinfo("fatal: unable to access 'https://x:s3cr3t@github.com/a/b.git/'")).toBe(
+			"fatal: unable to access 'https://github.com/a/b.git/'",
+		);
+		expect(
+			parsePushPorcelain(
+				"To /o.git\n!\tdeadbeef:refs/heads/team/x\t[rejected] (non-fast-forward)\nDone\n",
+				"refs/heads/team/x",
+			),
+		).toEqual({ flag: "!", summary: "[rejected] (non-fast-forward)" });
 	});
 });

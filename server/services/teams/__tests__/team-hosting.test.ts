@@ -76,7 +76,10 @@ describe("the push URL", () => {
 			["git@github.com:acme/app.git", { host: "github.com", owner: "acme", repo: "app" }],
 			["github.com:acme/app", { host: "github.com", owner: "acme", repo: "app" }],
 			["ssh://git@github.com/acme/app.git", { host: "github.com", owner: "acme", repo: "app" }],
-			["ssh://git@ssh.github.com:443/acme/app.git", { host: "ssh.github.com", owner: "acme", repo: "app" }],
+			[
+				"ssh://git@ssh.github.com:443/acme/app.git",
+				{ host: "ssh.github.com", owner: "acme", repo: "app" },
+			],
 			[
 				"https://x-access-token:s3cr3t@github.com/acme/app.git",
 				{ host: "github.com", owner: "acme", repo: "app" },
@@ -113,7 +116,10 @@ describe("the push URL", () => {
 			const url = await teamRepoGit(repo).originPushUrl();
 			expect(url).toBe("git@github.com:acme/app");
 			expect(hostingOfUrl(url)).toMatchObject({ kind: "github", owner: "acme", repo: "app" });
-			await git(["remote", "set-url", "--push", "origin", "https://ghe.acme.test/team/app.git"], repo);
+			await git(
+				["remote", "set-url", "--push", "origin", "https://ghe.acme.test/team/app.git"],
+				repo,
+			);
 			expect(await teamRepoGit(repo).originPushUrl()).toBe("https://ghe.acme.test/team/app.git");
 			await git(["remote", "remove", "origin"], repo);
 			expect(await teamRepoGit(repo).originPushUrl()).toBeNull();
@@ -162,7 +168,10 @@ describe.skipIf(!posix)("gh (a fake on PATH)", () => {
 			[{ "auth status": { stdout: JSON.stringify({ hosts: {} }) } }, "gh_logged_out"],
 			[{ "auth status": { stdout: authJson("github.com", "error") } }, "gh_logged_out"],
 			[{ "repo view": { stdout: repoViewJson({ viewerPermission: "READ" }) } }, "gh_no_permission"],
-			[{ "repo view": { stdout: repoViewJson({ viewerPermission: "TRIAGE" }) } }, "gh_no_permission"],
+			[
+				{ "repo view": { stdout: repoViewJson({ viewerPermission: "TRIAGE" }) } },
+				"gh_no_permission",
+			],
 			[{ "repo view": { stdout: repoViewJson({ isArchived: true }) } }, "gh_repo_archived"],
 			[{ "repo view": { exit: 1, stderr: "Could not resolve to a Repository" } }, "gh_unavailable"],
 			[{ "repo view": { stdout: "not json" } }, "gh_unavailable"],
@@ -211,7 +220,10 @@ describe.skipIf(!posix)("gh (a fake on PATH)", () => {
 		const repoView = (await fake.calls()).find((call) => call.args[0] === "repo");
 		expect(repoView?.args[2]).toBe("ghe.acme.test/team/app");
 		// Known but logged out there: GitHub, disabled.
-		await fake.setPlan({ ...usableGh(), "auth status": { stdout: authJson("ghe.acme.test", "error") } });
+		await fake.setPlan({
+			...usableGh(),
+			"auth status": { stdout: authJson("ghe.acme.test", "error") },
+		});
 		expect(await resolveHosting("git@ghe.acme.test:team/app.git")).toMatchObject({
 			kind: "github",
 			gh: { ok: false, reason: "gh_logged_out" },
@@ -291,7 +303,10 @@ describe.skipIf(!posix)("gh (a fake on PATH)", () => {
 
 	test("the cache: one probe at a time, 5 minutes when usable, 60 seconds when not", async () => {
 		let now = 1_000_000;
-		setHostingSourceForTests(async () => "git@github.com:acme/app.git", () => now);
+		setHostingSourceForTests(
+			async () => "git@github.com:acme/app.git",
+			() => now,
+		);
 		expect(peekHosting("/repo-a")).toBeNull();
 		expect(peekHosting("/repo-a")).toBeNull();
 		expect(await hostingOf("/repo-a")).toMatchObject({ kind: "github", gh: { ok: true } });
@@ -304,7 +319,9 @@ describe.skipIf(!posix)("gh (a fake on PATH)", () => {
 		// Logged out: kept a minute only, so `gh auth login` on the host shows soon.
 		await fake.setPlan({ ...usableGh(), "auth status": { stdout: JSON.stringify({ hosts: {} }) } });
 		now += 2 * 60_000;
-		expect(await hostingOf("/repo-a")).toMatchObject({ gh: { ok: false, reason: "gh_logged_out" } });
+		expect(await hostingOf("/repo-a")).toMatchObject({
+			gh: { ok: false, reason: "gh_logged_out" },
+		});
 		expect(await versions()).toBe(2);
 		await fake.setPlan(usableGh());
 		now += 30_000;

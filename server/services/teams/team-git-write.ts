@@ -13,10 +13,14 @@
  *   is refused by git itself when the base is checked out in any worktree (never `update-ref` on
  *   a checked-out base: that person's `git status` would show the merge reversed).
  * - `fetchBaseFromOrigin`: `origin/<base>` into the remote-tracking ref only.
- * - `pushBranch` (G): the item's pinned head to `refs/heads/<branch>` at origin's push URL —
- *   named explicitly, so no `remote.*` setting applies — never forced, no hook, no signing, no
- *   submodule recursion, no push option, the receive-pack program pinned, and the same credential
- *   and transport rules as the fetch.
+ * - `pushBranch` (G): the item's pinned head to `refs/heads/<branch>` at origin's push URL, from a
+ *   throwaway bare repository of NarraFork's own that borrows the project's objects
+ *   (`objects/info/alternates`) — so no setting of the repository's own configuration applies to
+ *   the push at all (its remotes, fetch refspecs, hooks, credential helpers, rewrites) and no local
+ *   ref moves (git updates the "tracking" refs of a configured remote whose push URL is the one
+ *   pushed to, through that remote's fetch refspecs) — never forced, no hook, no signing, no
+ *   submodule recursion, no push option, the receive-pack program pinned, and refused where the
+ *   work-start fetch refuses the repository's configuration.
  * - `inspectCheckout` / `fastForwardCheckout`: the explicit fast-forward of a person's checkout
  *   (`merge --ff-only`), refused unless the checkout is exactly where the merge was prepared, and
  *   checked afterwards (no unmerged entry, no new stash, HEAD still on the base at the merge).
@@ -31,7 +35,7 @@
  * configuration-defined hooks or custom merge drivers), re-read right before each command that
  * can run a program, plus a timeout, an output cap and the job's abort signal.
  */
-import { realpath, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { TEAM_MERGE_CONFLICTS_MAX, TEAM_MERGE_REF_PREFIX } from "@shared/project-teams";
 import { AppError, GitError } from "../../lib/errors";
@@ -43,6 +47,7 @@ import {
 	untrustedProgramOverrides,
 } from "../../lib/git-exec-hardening";
 import type { GitIdentityEnv } from "../../lib/git-identity";
+import { getNarraforkPath } from "../../lib/narrafork-home";
 import { envWithAmbientProxy } from "../../lib/net/proxy-env";
 import { DEV_NULL } from "../../lib/platform";
 import { safeSpawn } from "../../lib/spawn";
@@ -961,9 +966,11 @@ export function teamRepoGit(repo: string, options: { signal?: AbortSignal } = {}
 					key !== "credential.helper" && key !== "core.sshCommand" && key !== "core.askPass",
 			);
 			const destination = `refs/heads/${branch}`;
+			const borrowed = await borrowingRepository(repo, signal);
 			const result = await run(
 				repo,
 				[
+					`--git-dir=${borrowed.dir}`,
 					"push",
 					"--porcelain",
 					// No hook (pre-push), on top of the hooks directory and every configured hook off.
@@ -984,7 +991,7 @@ export function teamRepoGit(repo: string, options: { signal?: AbortSignal } = {}
 					env: network.env,
 					signal,
 				},
-			);
+			).finally(() => borrowed.remove());
 			const line = parsePushPorcelain(result.stdout, destination);
 			if (line?.flag === "!")
 				return {
@@ -999,6 +1006,48 @@ export function teamRepoGit(repo: string, options: { signal?: AbortSignal } = {}
 			};
 		},
 	};
+}
+
+/**
+ * A throwaway bare repository of NarraFork's own (`<home>/run/push-*`) whose object store borrows
+ * the project's (`objects/info/alternates`), with the same object format and nothing else: no
+ * remotes, no hooks, no configuration beyond `core.bare`. A push from it reads only the host's
+ * configuration and the command's overrides, and moves no ref of the project. Removed after.
+ */
+async function borrowingRepository(
+	repo: string,
+	signal?: AbortSignal,
+): Promise<{ dir: string; remove: () => Promise<void> }> {
+	const common = await commonGitDir(repo, signal);
+	const objects = join(common, "objects");
+	if (unsafeForCommand(objects)) throw new GitError("The repository's path cannot be borrowed");
+	const format = await run(repo, ["rev-parse", "--show-object-format"], {
+		config: GIT_NO_EXEC_CONFIG,
+		signal,
+	});
+	const objectFormat = format.stdout.trim();
+	if (format.exitCode !== 0 || (objectFormat !== "sha1" && objectFormat !== "sha256"))
+		throw new GitError(`git could not tell the object format: ${complaint(format)}`);
+	const parent = getNarraforkPath("run");
+	await mkdir(parent, { recursive: true, mode: 0o700 });
+	const dir = await mkdtemp(join(parent, "push-"));
+	const remove = () => rm(dir, { recursive: true, force: true }).catch(() => undefined);
+	try {
+		await mkdir(join(dir, "objects", "info"), { recursive: true });
+		await mkdir(join(dir, "refs", "heads"), { recursive: true });
+		await writeFile(join(dir, "HEAD"), "ref: refs/heads/narrafork-push\n");
+		await writeFile(
+			join(dir, "config"),
+			objectFormat === "sha256"
+				? "[core]\n\trepositoryformatversion = 1\n\tbare = true\n[extensions]\n\tobjectformat = sha256\n"
+				: "[core]\n\trepositoryformatversion = 0\n\tbare = true\n",
+		);
+		await writeFile(join(dir, "objects", "info", "alternates"), `${objects}\n`);
+	} catch (error) {
+		await remove();
+		throw error;
+	}
+	return { dir, remove };
 }
 
 // ── A person's checkout: the explicit fast-forward ──────────────────────────

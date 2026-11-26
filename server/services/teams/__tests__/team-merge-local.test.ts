@@ -603,9 +603,7 @@ describe("local merge", () => {
 				disabledReason: "gh_logged_out",
 				pr: null,
 			});
-			expect(() => merge(a.id)).toThrow(
-				expect.objectContaining({ code: "TEAM_PR_GH_LOGGED_OUT" }),
-			);
+			expect(() => merge(a.id)).toThrow(expect.objectContaining({ code: "TEAM_PR_GH_LOGGED_OUT" }));
 			expect(isMerging(a.id)).toBe(false);
 			expect(await git(["rev-parse", "main"])).toBe(await git(["rev-parse", "HEAD"]));
 		} finally {
