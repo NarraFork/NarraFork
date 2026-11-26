@@ -16,7 +16,7 @@ import { narratorWorktreeResources, teamWorkEvents, teamWorkItems } from "../../
 import { generateId } from "../../../lib/id";
 import { safeSpawn } from "../../../lib/spawn";
 import { PRIVATE_REFS_PAGE, setGitVersionForTests } from "../team-git-write";
-import { hostingOf, setHostingSourceForTests } from "../team-hosting";
+import { hostingOf, setGhProbeForTests, setHostingSourceForTests } from "../team-hosting";
 import {
 	mergeJobOf,
 	mergeSummaryOf,
@@ -572,7 +572,7 @@ describe("local merge", () => {
 		expect(isMerging(a.id)).toBe(false);
 	});
 
-	test("a running worker, an item not ready, and a GitHub origin are refused up front", async () => {
+	test("a running worker, an item not ready, and a GitHub origin gh cannot serve are refused up front", async () => {
 		const a = await readyItem("lambda");
 		sqlite.run(
 			`INSERT INTO narrators (id, type, title, status, parent_narrator_id, created_at, updated_at)
@@ -585,22 +585,32 @@ describe("local merge", () => {
 		);
 		sqlite.run("UPDATE narrators SET status = 'idle' WHERE id = 'mg-running'");
 		setHostingSourceForTests(async () => "git@github.com:acme/app.git");
-		await hostingOf(repo);
-		const summary = mergeSummaryOf({
-			item: { id: a.id, state: "ready", baseRef: "main", projectId: PROJECT },
-			baseBranch: "main",
-			teamActive: true,
-			workerRunning: false,
-			member: true,
-		});
-		expect(summary).toMatchObject({
-			mode: "github",
-			canMerge: false,
-			disabledReason: "github_pending",
-		});
-		expect(() => merge(a.id)).toThrow(
-			expect.objectContaining({ code: "TEAM_MERGE_GITHUB_PENDING" }),
-		);
+		// G: GitHub, but gh is not logged in: the PR flow is disabled with the reason, and it never
+		// falls back to a local merge.
+		setGhProbeForTests(async () => ({ ok: false, reason: "gh_logged_out" }));
+		try {
+			await hostingOf(repo);
+			const summary = mergeSummaryOf({
+				item: { id: a.id, state: "ready", baseRef: "main", projectId: PROJECT },
+				baseBranch: "main",
+				teamActive: true,
+				workerRunning: false,
+				member: true,
+			});
+			expect(summary).toMatchObject({
+				mode: "github",
+				canMerge: false,
+				disabledReason: "gh_logged_out",
+				pr: null,
+			});
+			expect(() => merge(a.id)).toThrow(
+				expect.objectContaining({ code: "TEAM_PR_GH_LOGGED_OUT" }),
+			);
+			expect(isMerging(a.id)).toBe(false);
+			expect(await git(["rev-parse", "main"])).toBe(await git(["rev-parse", "HEAD"]));
+		} finally {
+			setGhProbeForTests(null);
+		}
 		sqlite.run("UPDATE team_work_items SET state = 'in_review' WHERE id = ?", [a.id]);
 		expect(() => merge(a.id)).toThrow(
 			expect.objectContaining({ code: "TEAM_WORK_ITEM_NOT_READY" }),
