@@ -26,7 +26,7 @@ import { db, sqlite } from "../../../db";
 import { narratorWorktreeResources, teamWorkEvents, teamWorkItems } from "../../../db/schema";
 import { generateId } from "../../../lib/id";
 import { safeSpawn } from "../../../lib/spawn";
-import { ghWorkDir, setGhTimeoutScaleForTests } from "../team-gh";
+import { ghWorkDir } from "../team-gh";
 import { setPinnedGithubTarget } from "../team-github-pin";
 import { hostingOf, setHostingSourceForTests } from "../team-hosting";
 import {
@@ -54,7 +54,7 @@ import {
 	startTeamPrPoller,
 	withReadSlotForTests,
 } from "../team-merge-pr";
-import { peekPrStatus, resetPrStatusForTests } from "../team-pr-state";
+import { aboutPullRequest, peekPrStatus, resetPrStatusForTests } from "../team-pr-state";
 import { setUnblockDeliveryForTests } from "../work-item-dependencies";
 import { setMergeNoteDeliveryForTests } from "../work-items";
 import { type FakeGh, type FakeGhPlan, installFakeGh, usableGh } from "./fake-gh.fixture";
@@ -1166,6 +1166,60 @@ describe.skipIf(process.platform === "win32")("review fixes, second round (Devin
 			reopened: true,
 		});
 		expect((await summary(a.id)).pr).toMatchObject({ state: "OPEN", canMergePr: true });
+	});
+
+	test("4: a legacy event's repository comes from its URL's host with the port", () => {
+		const ref = { host: "ghe.test:8443", owner: "Acme", repo: "App", number: 7 };
+		expect(aboutPullRequest({ pr: 7, url: "https://ghe.test:8443/acme/app/pull/7" }, ref)).toBe(
+			true,
+		);
+		expect(aboutPullRequest({ pr: 7, url: "https://ghe.test/acme/app/pull/7" }, ref)).toBe(false);
+		expect(aboutPullRequest({ pr: 8, url: "https://ghe.test:8443/acme/app/pull/8" }, ref)).toBe(
+			false,
+		);
+	});
+
+	test("4: a conflict recorded for the same number in another repository is not this one's", async () => {
+		const a = await readyItem("dirty3", "shared.txt", "mine\n");
+		await github(a.head);
+		open(a.id);
+		await settle();
+		await commitOnOrigin("main", "shared.txt", "theirs\n");
+		const conflict = (detail: Record<string, unknown>) =>
+			db
+				.insert(teamWorkEvents)
+				.values({
+					id: generateId(),
+					teamId: LEAD,
+					workItemId: a.id,
+					kind: "work.merge_failed",
+					actorKind: "system",
+					actorId: null,
+					detailJson: { code: "conflict", job: "pr_merge", pr: 7, head: a.head, ...detail },
+					createdAt: new Date().toISOString(),
+				})
+				.run();
+		await fake.setPlan(
+			plan(a.head, { "pr view": { stdout: prView(a.head, { mergeStateStatus: "DIRTY" }) } }),
+		);
+		// A legacy event (no repository) of this very pull request: its URL says which; known.
+		conflict({ url: PR_URL });
+		const notesBefore = notes.length;
+		await refreshPullRequest(a.id, { force: true });
+		expect(events(a.id, "work.merge_failed")).toHaveLength(1);
+		expect(notes).toHaveLength(notesBefore);
+		// #7 of another repository at the same head: this one's conflict is recorded and told.
+		conflict({ url: "https://github.com/acme/app2/pull/7", repository: "github.com/acme/app2" });
+		await refreshPullRequest(a.id, { force: true });
+		const recorded = events(a.id, "work.merge_failed");
+		expect(recorded).toHaveLength(3);
+		expect(recorded.at(-1)?.detail).toMatchObject({
+			code: "conflict",
+			pr: 7,
+			repository: "github.com/acme/app",
+			head: a.head,
+		});
+		expect(notes.length).toBeGreaterThan(notesBefore);
 	});
 
 	test("4: a pull request of the repository origin pointed to before is not the item's", async () => {

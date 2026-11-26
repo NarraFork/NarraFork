@@ -97,6 +97,7 @@ import {
 } from "./team-merge";
 import { isMerging } from "./team-merge-guard";
 import {
+	aboutPullRequest,
 	endPrRefreshing,
 	forgetPrStatus,
 	latestPrEvent,
@@ -719,8 +720,12 @@ async function recordConflict(input: {
 		.orderBy(desc(teamWorkEvents.createdAt), desc(teamWorkEvents.id))
 		.limit(1)
 		.get()?.detail;
+	// The same pull request (its repository and number; a legacy event's repository from its URL)
+	// at the same head.
 	const already =
-		latest?.code === "conflict" && latest.pr === input.record.number && latest.head === input.head;
+		latest?.code === "conflict" &&
+		aboutPullRequest(latest, input.record) &&
+		latest.head === input.head;
 	// Recorded already, and nobody asked: no fetch, no merge-tree on every pass.
 	if (already && !input.always) return;
 	const branchName = baseBranchOf(input.base).branch;
@@ -743,6 +748,7 @@ async function recordConflict(input: {
 				job: "pr_merge",
 				pr: input.record.number,
 				url: input.record.url,
+				repository: repositoryName(input.record),
 				conflicts: listed?.conflicts ?? [],
 				more: listed ? listed.more : true,
 				base: branchName,

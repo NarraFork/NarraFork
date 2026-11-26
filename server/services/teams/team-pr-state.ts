@@ -108,7 +108,7 @@ function eventRepository(detail: Record<string, unknown>): string | null {
 	try {
 		const parsed = new URL(url);
 		const [owner, repo] = parsed.pathname.split("/").filter(Boolean);
-		return owner && repo ? `${parsed.hostname}/${owner}/${repo}`.toLowerCase() : null;
+		return owner && repo ? `${parsed.host}/${owner}/${repo}`.toLowerCase() : null;
 	} catch {
 		return null;
 	}
@@ -122,7 +122,7 @@ export function aboutPullRequest(detail: Record<string, unknown>, ref: PrRef): b
 /** The newest event of `kind` about pull request `ref` of an item (its detail), or null. */
 export function latestPrEvent(
 	itemId: string,
-	kind: "work.pr_checks" | "work.pr_queued" | "work.pr_closed" | "work.pr_pushed",
+	kind: "work.pr_checks" | "work.pr_queued" | "work.pr_closed",
 	ref: PrRef,
 ): Record<string, unknown> | null {
 	for (const row of newestEvents(itemId, [kind]))

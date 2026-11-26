@@ -64,7 +64,7 @@ keywords:
   - prClosedForItem
   - currentPullRequest
 status: draft
-verified_at: 29d55c316f16e6318f2f09e77f4f8b573466c236
+verified_at: 99aea0a780019e5df9a0afd6cb4097bccdd31ea4
 ---
 # GitHub PR 流程
 
@@ -87,10 +87,10 @@ origin 从原始配置读（`team-git-write.ts:originTarget`，见[合并](merge
 「发起 PR」（`team-merge-pr.ts:runPullRequest`）：
 - 复核同本地合并的 `jobFacts`（团队活跃、ready、工作者没在跑、分支尖端仍是 ready 时的 head，否则 `TEAM_WORK_ITEM_HEAD_MOVED`）；只推真实完整的历史（`assertTrueHistory`、`assertNoReplacedHistory`）。
 - 推送前重读 origin（`readOriginTarget`，与 hosting 同一来源），解析出的主机/owner/repo 必须正是确认过、gh 用的那个，否则 `TEAM_PR_REMOTE_CHANGED`，什么都不推（`pushUrlFor`）；推到配置的 origin URL 本身。
-- `team-git-write.ts:pushBranch`：`git push --porcelain --no-verify --no-signed --no-recurse-submodules --no-follow-tags --receive-pack=git-receive-pack <URL> <head>:refs/heads/<分支>`，不带 `+`、不带 lease，120 秒、64KB。origin 的 URL 带密码（`https://user:token@host/…`）时，密码永不进任何命令行（git 也把 URL 当参数交给 `git-remote-https`，而 argv 谁都能读）：`splitUrlCredentials` 按 git 的 `credential_from_url` 拆出登录（第一个 `/` 前的第一个 `@`，它前面的第一个 `:`；`%XX` 解码），推送用去掉密码、保留用户名的 URL；`credentialFromEnvironment` 在命令范围把凭据助手列表清空、先放一个只从环境变量 `NARRAFORK_PUSH_*` 读的助手（只回答协议与主机都对上的 `get`，不 store/erase），再按原顺序加回主机自己的助手——登录仍优先于主机助手，与写在 URL 里时一样；只有用户名的 URL 照旧由主机助手回答。非 http(s) 的 URL 带密码、或密码里有换行/NUL，直接失败不推送。远端分支有 head 没有的提交 → `TEAM_PR_PUSH_REJECTED`（抽屉给「退回给工作者」，理由预填 `pushRejectedReason`）；其他失败 `TEAM_PR_PUSH_FAILED`（消息去掉 URL 里的 userinfo，`redactUserinfo`）；分支真的动了才记 `work.pr_pushed {head, branch, repository}`。
+- `team-git-write.ts:pushBranch`：`git push --porcelain --no-verify --no-signed --no-recurse-submodules --no-follow-tags --receive-pack=git-receive-pack <URL> <head>:refs/heads/<分支>`，不带 `+`、不带 lease，120 秒、64KB。origin 的 URL 带密码（`https://user:token@host/…`）时，密码永不进任何命令行（git 也把 URL 当参数交给 `git-remote-https`，而 argv 谁都能读）：`splitUrlCredentials` 按 git 的 `credential_from_url` 拆出登录（第一个 `/` 前的第一个 `@`，它前面的第一个 `:`；`%XX` 解码），推送用去掉整个登录的 URL（不留用户名：否则 curl 先拿用户名配空密码试一次，多一次 401、算进锁定次数）；`credentialFromEnvironment` 在命令范围把凭据助手列表清空、先放一个只从环境变量 `NARRAFORK_PUSH_*` 读的助手（只回答协议与主机都对上的 `get`，不 store/erase），再按原顺序加回主机自己的助手——第一次 401 就带上用户名与密码，登录仍优先于主机助手，与写在 URL 里时一样；只有用户名、没有密码的 URL 原样不动，照旧由主机助手回答。守卫用的 `originTarget().resolved` 对同一个去掉登录的 URL 套主机改写，所以确认、比对的仓库就是 git 推到的地方。非 http(s) 的 URL 带密码、或密码里有换行/NUL，直接失败不推送。远端分支有 head 没有的提交 → `TEAM_PR_PUSH_REJECTED`（抽屉给「退回给工作者」，理由预填 `pushRejectedReason`）；其他失败 `TEAM_PR_PUSH_FAILED`（消息去掉 URL 里的 userinfo，`redactUserinfo`）；分支真的动了才记 `work.pr_pushed {head, branch, repository}`。
 - `gh pr list -R … --head=<分支> --state=all --limit=5`，只认本仓库同名分支（`isCrossRepository` 为真的 fork 分支不算）：有 OPEN 的就复用（基线不同 `TEAM_PR_BASE_MISMATCH`）；没有 OPEN、但有在这个 head 上、合进这个基线的 MERGED 的，直接记合并（是发现的，actor 为 system）；否则 `gh pr create -R … --head=<分支> --base=<基线> --title=<标题> --body-file=-`（不是草稿），失败 `TEAM_PR_OPEN_FAILED`。PR 的基线是 `baseBranchOf(基线).branch`：团队基线写成 `origin/main` 时 PR 指向 `main`。
 - `work.pr_opened {pr, url, repository: host/owner/repo, base, head, created}` 只在新建、换了一个 PR、或找到的 OPEN PR 正是已被当作关闭的那个时记（「重新发起 PR」时 `reopened: true`，时间排在那条关闭之后）；PR 号与 URL 只存在这里（没有新列，`team-pr-state.ts:latestPullRequest`）。
-- PR 由仓库加号码一起确定（`PrRef`）：项的 PR 是现在 origin 解析到（也就是确认过）的仓库里最新的 `work.pr_opened`（`latestPullRequest(itemId, target)`，最多看最新 20 条）；管理员改确认到别的仓库后，旧仓库的 PR 不再是这一项的，摘要 `pr` 为 null、按钮回到「发起 PR」，「合并 PR」409 `TEAM_PR_NONE`。状态缓存、`work.pr_closed`/`work.pr_checks`/`work.pr_queued` 都按仓库加号码匹配（事件 detail 带 `repository`，旧事件从 `url` 推出），新仓库同号的 PR 继承不到旧的读取或关闭。摘要多了 `pr.repository`，`team-page-model.ts:currentPullRequest` 只认仓库与确认的（或 origin 的）一致的 PR。
+- PR 由仓库加号码一起确定（`PrRef`）：项的 PR 是现在 origin 解析到（也就是确认过）的仓库里最新的 `work.pr_opened`（`latestPullRequest(itemId, target)`，最多看最新 20 条）；管理员改确认到别的仓库后，旧仓库的 PR 不再是这一项的，摘要 `pr` 为 null、按钮回到「发起 PR」，「合并 PR」409 `TEAM_PR_NONE`。状态缓存、`work.pr_closed`/`work.pr_checks`/`work.pr_queued` 都按仓库加号码匹配（事件 detail 带 `repository`，旧事件从 `url` 的 host（含端口）推出），新仓库同号的 PR 继承不到旧的读取或关闭。摘要多了 `pr.repository`，`team-page-model.ts:currentPullRequest` 只认仓库与确认的（或 origin 的）一致的 PR。
 - 正文（`pullRequestBody`）：发起人（「由 NarraFork 用户 X 发起」/ `Opened by NarraFork user X`，按发起人语言）、大小（最近 `work.ready` 的 `diffStat`）、评审轮次（结论、评审者、发现数、意见原文）与退回理由；任何人或 agent 写的文字都放进代码块（多行的进围栏代码块，单行的进行内代码，`inlineCode`：分隔符比文字里最长的反引号串多一个，以反引号或空格开头结尾时两边各加一个空格），并把 `@`、`#` 换成全角、`GH-<数字>` 的连字符换掉、`://` 中间插入 U+2060，提及不到人、关不了 issue；栅栏比文字里最长的反引号串长；总长 ≤16KB，放不下时保留最新的轮次并说明。标题同样处理（`pullRequestTitle`）。
 
 「合并 PR」（`runPrMerge`）：
@@ -98,7 +98,7 @@ origin 从原始配置读（`team-git-write.ts:originTarget`，见[合并](merge
 - PR 只在当前仓库里找（见上），找不到 `TEAM_PR_NONE`。
 - `gh pr merge N -R … --<merge|squash|rebase> --match-head-commit=<head>`，从不带 `--delete-branch`（会删本地分支）、`--admin`、`--auto`；gh 说 head 变了 → `TEAM_PR_HEAD_STALE`，其他失败 `TEAM_PR_MERGE_FAILED`。
 - 合并后再读：MERGED → 记合并；仍 OPEN（合并队列或自动合并接手）→ `work.pr_queued {pr, url, method, head}`，界面显示「已加入合并队列」。
-- 冲突（`recordConflict`）：同一 PR 同一 head 已记过、又不是成员点的（后台一轮）就直接返回，不拉取也不算；否则先尽力拉取 `origin/<基线>`（`fetchBaseFromOrigin`，只动远程跟踪 ref），再用加固的 `merge-tree` 算 head 与它的冲突文件（git ≥2.38，最多 50），冲突列表按（仓库、head、基线提交）缓存，最多 200 条；记 `work.merge_failed {code: "conflict", job: "pr_merge", pr, url, conflicts, more, base, head}`；同一 PR 同一 head 只通知协调者一次（`pullRequestConflictNote`），成员再点「合并 PR」仍记一条结果。
+- 冲突（`recordConflict`）：同一 PR 同一 head 已记过、又不是成员点的（后台一轮）就直接返回，不拉取也不算；否则先尽力拉取 `origin/<基线>`（`fetchBaseFromOrigin`，只动远程跟踪 ref），再用加固的 `merge-tree` 算 head 与它的冲突文件（git ≥2.38，最多 50），冲突列表按（仓库、head、基线提交）缓存，最多 200 条；记 `work.merge_failed {code: "conflict", job: "pr_merge", pr, url, repository, conflicts, more, base, head}`；「已记过」按仓库加号码加 head 比对（`aboutPullRequest`，旧事件的仓库从 URL 推出，含端口），别的仓库同号的冲突不算；同一 PR 同一 head 只通知协调者一次（`pullRequestConflictNote`），成员再点「合并 PR」仍记一条结果。
 
 合并落地先判断这次合并是不是这一项的（`mergedPullRequest`）：PR 合进的基线必须是这一项的基线；GitHub 合并的 head 正是 ready 的 head，或 ready 的 head 在它里面（`gh api --hostname=H --method=GET repos/<o>/<r>/compare/<ready head>...<PR head>?per_page=1 --jq=.status` 为 `ahead`/`identical`，64KB 以内、Zod 校验；GitHub 上没有 ready 的 head 时 404，算不在）。不是的——在旧 head 上合并的（这一项退回后重新 ready 了）或合进别的基线的——记 `work.pr_closed {pr, url, repository, merged: true, reason: "older_head" | "other_base", head, base}`（已当作关闭时不再记），项仍 ready，摘要把这个 PR 当作已关闭，按钮是「重新发起 PR」，再发起时为新 head 开新的 PR（`pr list` 里旧的 MERGED 不在新 head 上，不复用）。OPEN 的 PR 被改了基线同样记 `work.pr_closed {reason: "other_base"}`。
 
