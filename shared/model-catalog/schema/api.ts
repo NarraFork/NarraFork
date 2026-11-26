@@ -1,3 +1,4 @@
+import type { TimeOfUsePriceGroup } from "../card";
 import type { ModelOverride, OverrideField } from "../override";
 import type { MatchedVia } from "./catalog";
 
@@ -47,6 +48,8 @@ export interface ModelDescription {
 	 */
 	modelWideEditable: boolean;
 	effective: EffectiveFields;
+	/** Catalog rates by time of use, separate from standard effective prices. */
+	timeOfUsePrices?: TimeOfUsePriceGroup[];
 	modelOverride?: ModelOverride;
 	connectionOverride?: ModelOverride;
 }

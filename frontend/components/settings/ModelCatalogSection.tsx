@@ -29,7 +29,7 @@ import { useAllModels } from "../../hooks/useModels";
 import { formatCompactNumber } from "../../lib/compact-number";
 import { formatLocaleDate, formatLocaleDateTime } from "../../lib/intl-format";
 import { createModelQueryMatcher, createModelSearchIndex } from "../../lib/model-search";
-import { ModelOverrideEditor, OriginBadge } from "./ModelOverrideEditor";
+import { ModelOverrideEditor, OriginBadge, TimeOfUsePrices } from "./ModelOverrideEditor";
 
 function CatalogStatusCard() {
 	const { t } = useTranslation("settings");
@@ -254,11 +254,12 @@ export function ModelCatalogSection() {
 											</Text>
 										</Table.Td>
 										<Table.Td>
-											<Text size="sm">
-												{prices?.input !== undefined || prices?.output !== undefined
-													? `$${prices?.input ?? "—"} / $${prices?.output ?? "—"}`
-													: "—"}
-											</Text>
+											{prices?.input !== undefined || prices?.output !== undefined ? (
+												<Text size="sm">{`$${prices?.input ?? "—"} / $${prices?.output ?? "—"}`}</Text>
+											) : !info?.timeOfUsePrices?.length ? (
+												<Text size="sm">—</Text>
+											) : null}
+											<TimeOfUsePrices groups={info?.timeOfUsePrices} />
 										</Table.Td>
 										<Table.Td>
 											<Tooltip label={t("catalog.edit")}>

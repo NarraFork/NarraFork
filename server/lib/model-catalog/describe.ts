@@ -5,6 +5,7 @@
  * provider settings, which import the catalog.
  */
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
+import { timeOfUsePriceGroups } from "@shared/model-catalog/card";
 import { PRICE_FIELDS, PRICE_KEYS, type ReasoningLevel } from "@shared/model-catalog/override";
 import type {
 	EffectiveFields,
@@ -108,6 +109,7 @@ export function describeModel(model: string): ModelDescription {
 			priceOrigin = fieldOrigin;
 	}
 	if (Object.keys(prices).length) effective.prices = { value: prices, origin: priceOrigin };
+	const timeOfUsePrices = timeOfUsePriceGroups(card.metadata);
 
 	const strong = card.matchedVia === "exact" || card.matchedVia === "alias";
 	const modelOverride =
@@ -122,6 +124,7 @@ export function describeModel(model: string): ModelDescription {
 		matchedVia: card.matchedVia,
 		modelWideEditable: !!card.modelId && strong,
 		effective,
+		...(timeOfUsePrices.length ? { timeOfUsePrices } : {}),
 		...(modelOverride ? { modelOverride } : {}),
 		...(connectionOverride ? { connectionOverride } : {}),
 	};

@@ -14,8 +14,13 @@
  *      a strict relay can be excluded without waiting for a release.
  */
 
+import type { ModelCard } from "./model-catalog/card";
+import type { ModelReasoning } from "./model-catalog/profile";
+import type { MetadataLayer } from "./model-catalog/schema/catalog";
 import {
 	clampReasoningEffort,
+	isLegacyUltra,
+	normalizeLegacyUltra,
 	REASONING_EFFORT_VALUES,
 	type ReasoningEffort,
 } from "./reasoning-effort";
@@ -217,6 +222,83 @@ export function modelAcceptsReasoningEffort(
 	if (!bare) return false;
 	if (isPreEffortClaudeModel(bare)) return false;
 	return !matchesReasoningEffortBlocklist(bare, blocklist);
+}
+
+const GPT_62_CODEX_REASONING_LEVELS = ["low", "medium", "high", "xhigh", "max"];
+
+const REASONING_EVIDENCE_ORDER: readonly MetadataLayer[] = [
+	"default",
+	"preset-model",
+	"preset-variant",
+	"discovered",
+	"local-model",
+	"local-connection",
+];
+
+export function isGpt62CodexModel(bareModel?: string | null): boolean {
+	const id = bareModel?.toLowerCase();
+	return id === "gpt-6.2-sol" || id === "gpt-6.2-astra";
+}
+
+/** A Responses override on an OpenAI Codex connection keeps the existing Codex adapter. */
+export function isCodexReasoningRoute(
+	provider: string,
+	connectionIsCodex: boolean,
+	channelType?: string | null,
+	protocolOverride?: string,
+): boolean {
+	if (provider === "codex") return true; // Built-in OAuth always uses Codex.
+	if (channelType) return !protocolOverride && channelType.toLowerCase() === "codex";
+	return connectionIsCodex && (!protocolOverride || protocolOverride === "openai-responses");
+}
+
+/** Local overrides > explicit route evidence > inherited base metadata. */
+export function resolveRouteReasoning(
+	declared: ModelReasoning,
+	card?: Readonly<Pick<ModelCard, "metadata" | "provenance">> | null,
+	options?: { codexModel?: string; effortLevels?: string[] | null },
+): ModelReasoning {
+	const rank = (layer?: MetadataLayer) => (layer ? REASONING_EVIDENCE_ORDER.indexOf(layer) : -1);
+	const fieldRank = (field: string) => rank(card?.provenance[field]?.layer);
+	const routeRank = rank("discovered") + 0.5;
+	const variantRank = rank("preset-variant");
+	let levelsRank = fieldRank("reasoning_effort_levels");
+	const result = { ...declared };
+	if (Array.isArray(options?.effortLevels) && levelsRank <= routeRank) {
+		result.levels = options.effortLevels;
+		levelsRank = routeRank;
+	}
+	const knownCodex = isGpt62CodexModel(options?.codexModel);
+	if (knownCodex && (levelsRank < variantRank || result.levels == null)) {
+		result.levels = [...GPT_62_CODEX_REASONING_LEVELS];
+		levelsRank = variantRank;
+	}
+	if (Array.isArray(result.levels)) {
+		result.levels = result.levels
+			.filter((level) => !isLegacyUltra(level))
+			.map((level) => {
+				const normalized = level.trim().toLowerCase() as ReasoningEffort;
+				return REASONING_EFFORT_VALUES.includes(normalized) ? normalized : level;
+			});
+		if (levelsRank >= variantRank) {
+			if (fieldRank("supports_reasoning") < levelsRank) delete result.supported;
+			if (fieldRank("reasoning_mode") < levelsRank) delete result.mode;
+		}
+	}
+	const noneField =
+		fieldRank("can_disable_reasoning") >= fieldRank("supports_none_reasoning_effort")
+			? "can_disable_reasoning"
+			: "supports_none_reasoning_effort";
+	const explicitNone = card?.metadata[noneField];
+	if (typeof explicitNone === "boolean") result.canDisable = explicitNone;
+	if (Array.isArray(result.levels) && levelsRank >= variantRank) {
+		if (result.levels.length === 0) result.canDisable = false;
+		else if (fieldRank(noneField) < levelsRank || result.canDisable == null)
+			result.canDisable = result.levels.includes("none");
+	}
+	if (isLegacyUltra(result.defaultLevel))
+		result.defaultLevel = normalizeLegacyUltra(result.defaultLevel);
+	return result;
 }
 
 /**

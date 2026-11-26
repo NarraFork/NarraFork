@@ -600,6 +600,56 @@ describe("catalog updates", () => {
 });
 
 describe("API", () => {
+	test("time-of-use metadata does not block description or saving a standard price override", async () => {
+		await mockCatalog("time-of-use-metadata", (catalog) => {
+			catalog.models.push({
+				id: "time-of-use-fixture",
+				metadata: {
+					input_cost_per_token: 2e-6,
+					output_cost_per_token: 6e-6,
+					input_cost_per_token_peak: "bad rate",
+					output_cost_per_token_peak: 8e-6,
+					input_cost_per_token_off_peak: 0,
+				},
+			});
+		});
+		const staged = await checkModelCatalogUpdate();
+		expect(staged.lastError).toBeUndefined();
+		expect(applyModelCatalogUpdate().source).toBe("downloaded");
+
+		const model = "openai:time-of-use-fixture";
+		const read = () =>
+			app("user").request("/api/model-catalog/models", json("POST", { models: [model] }));
+		const before = await read();
+		expect(before.status).toBe(200);
+		const {
+			models: [description],
+		} = await before.json();
+		expect(description.effective.prices).toEqual({
+			value: { input: "2", output: "6" },
+			origin: "catalog",
+		});
+		expect(description.timeOfUsePrices).toMatchObject([
+			{ tier: "peak", rows: [{ component: "output", displayRate: "8" }] },
+			{ tier: "off_peak", rows: [{ component: "input", displayRate: "0" }] },
+		]);
+
+		const saved = await app().request(
+			"/api/model-catalog/overrides",
+			json("PUT", { scope: "connection", key: model, fields: { prices: { input: "3" } }, model }),
+		);
+		expect(saved.status).toBe(200);
+		const updated = await saved.json();
+		expect(updated.effective.prices).toEqual({
+			value: { input: "3", output: "6" },
+			origin: "connection",
+		});
+		expect(updated.timeOfUsePrices).toEqual(description.timeOfUsePrices);
+		const after = await read();
+		expect(after.status).toBe(200);
+		expect((await after.json()).models).toEqual([updated]);
+	});
+
 	test("members read; only admins write; a rejected field is reported with its name", async () => {
 		const card = await (
 			await app("user").request("/api/model-catalog/card?model=codex:gpt-5.5")

@@ -1,5 +1,6 @@
 import { FOLLOW_PARENT_MODEL, type SubagentModelInheritance } from "@shared/model-inheritance";
 import { MODEL_RUNTIME_MAX_BYTES, type RuntimeModelSummary } from "@shared/model-runtime";
+import { isCodexReasoningRoute } from "@shared/reasoning-effort-support";
 import { getCustomApiCachedQuota } from "./custom-api-quota-cache";
 import {
 	isDeepSeekCustomApiProvider,
@@ -22,6 +23,7 @@ import {
 	FOLLOW_SUMMARY_MODEL,
 	getSettingsRevision,
 	parseAggModelValue,
+	resolveModelProtocol,
 	settings,
 } from "./settings";
 import { getTokenDanceRuntimeConfig } from "./tokendance-runtime";
@@ -164,41 +166,51 @@ export function buildRuntimeModelSummary(input: {
 		if (summary.state === "observed" && observation) summary.observedAt = observation.resolvedAt;
 		if (provider) summary.provider = runtimeProvider(provider);
 		if (concreteValue) {
-			const profile = getEffectiveModelProfile(concreteValue);
+			let gateway: ReturnType<typeof resolveNugModelMeta> | undefined;
+			const nug = summary.provider?.quotaKind === "nug" ? summary.provider : undefined;
+			if (nug) {
+				try {
+					gateway = resolveNugModelMeta(nug.id, nug.prefix, concreteValue);
+				} catch {
+					/* Unknown gateway channel: keep the concrete source without guessing capabilities. */
+				}
+			}
+			const protocol = provider ? resolveModelProtocol(provider, concreteValue) : undefined;
+			const connectionIsCodex = settings.openaiProviders?.some(
+				(entry) => !entry.disabled && entry.prefix === provider && entry.apiMode === "codex",
+			);
+			const codex = isCodexReasoningRoute(
+				provider ?? "",
+				!!connectionIsCodex,
+				gateway?.channelType,
+				protocol,
+			);
+			const channelType = codex
+				? "codex"
+				: protocol === "openai-responses"
+					? "responses"
+					: protocol === "completions-compatible"
+						? "openai"
+						: protocol === "anthropic-messages"
+							? "anthropic"
+							: protocol === "gemini-compatible"
+								? "gemini"
+								: gateway?.channelType;
+			const profile = getEffectiveModelProfile(concreteValue, { codex });
 			if (selection === concreteValue)
 				summary.selection.label =
 					catalogModelName(profile.card.modelId ?? bareModel ?? "") ?? bareModel ?? selection;
 			summary.reasoning = profile.reasoning;
-			if (Object.hasOwn(profile.reasoning, "levels"))
-				summary.effortLevels = profile.reasoning.levels;
+			summary.effortLevels = profile.reasoning.levels;
 			summary.capabilities = {
-				channelType:
-					provider === "codex" ||
-					settings.openaiProviders?.some(
-						(entry) => !entry.disabled && entry.prefix === provider && entry.apiMode === "codex",
-					)
-						? "codex"
-						: undefined,
-				bareModel: bareModel ?? undefined,
+				channelType,
+				bareModel: gateway?.bareModel ?? bareModel ?? undefined,
 				contextWindow: profile.contextWindow,
 				maxOutputTokens: profile.maxOutputTokens,
 				nativeSearch: profile.nativeSearch,
 				inputModalities: profile.inputModalities,
 				toolLoadingModes: profile.toolLoadingModes,
 			};
-			const nug = summary.provider?.quotaKind === "nug" ? summary.provider : undefined;
-			if (nug) {
-				try {
-					const gateway = resolveNugModelMeta(nug.id, nug.prefix, concreteValue);
-					summary.capabilities.channelType = gateway.channelType;
-					summary.capabilities.bareModel = gateway.bareModel;
-					// Local metadata overrides remain authoritative; retain gateway's absent/[]/tiers.
-					if (gateway.effortLevels !== undefined && !Object.hasOwn(summary.reasoning, "levels"))
-						summary.effortLevels = gateway.effortLevels;
-				} catch {
-					/* Unknown gateway channel: keep the concrete source without guessing capabilities. */
-				}
-			}
 			summary.provenance = {
 				reasoning: profile.card.provenance.reasoning_effort_levels?.layer,
 				contextWindow: profile.contextWindowSource?.layer,

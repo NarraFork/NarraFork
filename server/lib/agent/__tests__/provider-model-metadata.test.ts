@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { RawMetadata } from "@shared/model-catalog/card";
 import { modelProfile } from "@shared/model-catalog/profile";
-import { replaceModelOverridesForTests } from "../../model-catalog";
+import { getEffectiveModelCard, replaceModelOverridesForTests } from "../../model-catalog";
 import { deleteNugCachedModels, setNugCachedModels } from "../../nug-model-cache";
 import { withSearchExecutionScope } from "../../search/execution-scope";
 import {
@@ -152,7 +152,7 @@ describe("metadata policy", () => {
 		expect(resolveMetadataReasoning({ reasoning: { supported: false } }, "max")).toBeUndefined();
 		expect(
 			resolveMetadataReasoning(
-				{ reasoning: { levels: ["low", "high"], canDisable: false } },
+				{ reasoning: { levels: ["high", "low"], canDisable: false, defaultLevel: "high" } },
 				"none",
 			),
 		).toBe("low");
@@ -197,6 +197,60 @@ describe("metadata policy", () => {
 });
 
 describe("actual provider request bodies", () => {
+	test.each([
+		"gpt-6.2-sol",
+		"gpt-6.2-astra",
+	])("Codex %s fallback preserves high tiers, maps ultra and rejects implicit none", async (id) => {
+		const provider = new OpenAIProvider({ ...config, apiMode: "codex", codexWebSocket: false });
+		for (const [reasoningEffort, expected] of [
+			["xhigh", "xhigh"],
+			["max", "max"],
+			["ultra", "xhigh"],
+			["none", "low"],
+		] as const) {
+			const body = await captureChat(provider, {
+				model: `${config.prefix}:${id}`,
+				reasoningEffort: reasoningEffort as ChatParams["reasoningEffort"],
+			});
+			expect(body.reasoning.effort).toBe(expected);
+		}
+	});
+
+	test("GPT-6.2 Codex gateway request follows declared tiers and none independently", async () => {
+		const provider = new NugProvider(config);
+		const id = "account:gpt-6.2-sol";
+		const modelCard = {
+			...getEffectiveModelCard("codex:gpt-6.2-sol"),
+			metadata: {
+				supports_reasoning: false,
+				reasoning_mode: "fixed",
+				reasoning_effort_levels: ["medium"],
+				can_disable_reasoning: true,
+				default_reasoning_effort: "high",
+			},
+		};
+		const capture = (effortLevels: string[], reasoningEffort: string) => {
+			setNugCachedModels(config.id, [{ id, channelType: "codex", effortLevels, modelCard }]);
+			return captureChat(provider, {
+				model: `${config.prefix}:${id}`,
+				reasoningEffort: reasoningEffort as ChatParams["reasoningEffort"],
+			});
+		};
+		expect((await capture(["low", "high", "ultra"], "ultra")).reasoning.effort).toBe("high");
+		expect((await capture(["low", "high"], "max")).reasoning.effort).toBe("high");
+		expect((await capture(["high", "low"], "none")).reasoning.effort).toBe("low");
+		expect((await capture(["none", "high"], "none")).reasoning.effort).toBe("none");
+		expect((await capture(["ultra"], "ultra")).reasoning.effort).toBeUndefined();
+		expect((await capture([], "none")).reasoning.effort).toBeUndefined();
+	});
+
+	test("legacy ultra never reaches generic provider wire parameters", async () => {
+		const body = await captureChat(new OpenAIProvider({ ...config, apiMode: "responses" }), {
+			model: `${config.prefix}:unlisted`,
+			reasoningEffort: "ultra" as ChatParams["reasoningEffort"],
+		});
+		expect(body.reasoning.effort).toBe("xhigh");
+	});
 	for (const apiMode of ["completions", "responses", "codex"] as const) {
 		test(`OpenAI ${apiMode} chat and both utility paths enforce declared output/reasoning`, async () => {
 			const provider = new OpenAIProvider({ ...config, apiMode, codexWebSocket: false });
@@ -363,7 +417,7 @@ describe("actual provider request bodies", () => {
 					channel: "channel",
 					channelType,
 					model: "deepseek-v4-pro",
-					effortLevels: ["low", "medium", "high", "max"],
+					effortLevels: ["none", "low", "medium", "high", "max"],
 				},
 			]);
 			const body = await captureChat(new NugProvider(nugConfig), {
@@ -411,9 +465,8 @@ describe("actual provider request bodies", () => {
 			} else if (channelType === "openai") {
 				expect(body.reasoning_effort).toBeUndefined();
 			} else {
-				// A Codex body must carry an effort value; "no tier" degrades to "none"
-				// rather than naming one the model declared it does not have.
-				expect(body.reasoning.effort).toBe("none");
+				// Keep the Codex summary contract without claiming an unsupported effort.
+				expect(body.reasoning).toEqual({ summary: "auto" });
 			}
 		});
 	}

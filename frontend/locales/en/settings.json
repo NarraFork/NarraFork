@@ -148,7 +148,7 @@
 			"context": "Context",
 			"output": "Max output",
 			"reasoning": "Reasoning",
-			"price": "Price in / out ($/M)"
+			"price": "Reference prices"
 		},
 		"edit": "Edit model parameters",
 		"editParameters": "Edit model parameters",
@@ -207,6 +207,8 @@
 		"details": "Model metadata and prices",
 		"actualPricing": "NUG actual channel quote",
 		"reference": "Reference $/M in / out",
+		"timeOfUseNote": "Catalog reference only. The applicable hours and actual charges depend on the provider.",
+		"aboveTokens": "Above {{count}} tokens",
 		"free": "0 (free)",
 		"unknown": "Unknown",
 		"unreported": "Not reported / inherited",
@@ -265,7 +267,9 @@
 			"standard": "Standard",
 			"batch": "Batch",
 			"flex": "Flex",
-			"priority": "Priority"
+			"priority": "Priority",
+			"peak": "Peak reference prices",
+			"off_peak": "Off-peak reference prices"
 		},
 		"basis": {
 			"full": "Above the threshold the whole request is charged at this tier",
@@ -284,6 +288,7 @@
 			"audio": "Audio",
 			"video": "Video",
 			"media": "Media",
+			"reasoning": "Reasoning",
 			"search_context_size_low": "Low search context",
 			"search_context_size_medium": "Medium search context",
 			"search_context_size_high": "High search context"
