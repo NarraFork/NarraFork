@@ -14,7 +14,12 @@
  * background merge for a ready item: it lands in the base, or is prepared for a person to
  * fast-forward where the base is checked out, or lists its conflicts with 退回 prefilled.
  */
-import { useReturnWorkItem, useTeamWorkDiff, useTeamWorkItem } from "@frontend/hooks/useTeams";
+import {
+	useRefreshPullRequest,
+	useReturnWorkItem,
+	useTeamWorkDiff,
+	useTeamWorkItem,
+} from "@frontend/hooks/useTeams";
 import { describeApiError } from "@frontend/lib/api-error";
 import { formatSmartTime } from "@frontend/lib/format";
 import {
@@ -630,18 +635,24 @@ function ReturnBar({
 	const merge = detail.merge;
 	const conflict =
 		merge?.detail?.kind === "failed" && merge.detail.code === "conflict" ? merge.detail : null;
-	// After a conflict, 退回 starts from the conflicting files (the person may edit it).
+	// G: GitHub's branch has commits the ready head lacks.
+	const rejected =
+		merge?.detail?.kind === "failed" && merge.detail.code === "TEAM_PR_PUSH_REJECTED";
+	const branch = detail.item.branch ?? "";
+	// After a conflict, 退回 starts from the conflicting files (the person may edit it); after a
+	// rejected push, from what the worker brings in.
 	useEffect(() => {
-		if (!returning || !conflict) return;
+		if (!returning || (!conflict && !rejected)) return;
 		setReason((current) => {
 			if (current.trim()) return current;
+			if (!conflict) return t("teams.page.merge.pushRejectedReason", { branch });
 			const { files, more } = conflictReasonFiles(conflict.conflicts, conflict.more);
 			return t(more ? "teams.page.merge.conflictReasonMore" : "teams.page.merge.conflictReason", {
 				base,
 				files,
 			});
 		});
-	}, [returning, conflict, base, t]);
+	}, [returning, conflict, rejected, branch, base, t]);
 	const submit = () => {
 		if (!ready) return;
 		send.mutate(
@@ -728,7 +739,14 @@ function ReturnBar({
 			)}
 			<Group justify="space-between" wrap="wrap" gap="sm" style={{ rowGap: 6 }}>
 				<Text size="xs" c="dimmed" style={{ minWidth: 0, flex: "1 1 220px" }}>
-					{t(merge ? "teams.page.merge.barNote" : "teams.page.drawer.barNote", { base })}
+					{t(
+						merge?.mode === "github"
+							? "teams.page.merge.barNotePr"
+							: merge
+								? "teams.page.merge.barNote"
+								: "teams.page.drawer.barNote",
+						{ base },
+					)}
 				</Text>
 				<Group gap="xs" wrap="nowrap" align="flex-start" style={{ flexShrink: 0 }}>
 					<Button
@@ -785,6 +803,16 @@ export function TeamWorkDrawer({
 	const data = detail.data?.item.id === itemId ? detail.data : undefined;
 	const item = data?.item;
 	const showBar = !!data && data.canReturn;
+	// G: a member opening a ready item with a pull request reads it from GitHub (once per opening;
+	// the server keeps a read 20 s).
+	const refresh = useRefreshPullRequest(projectId, teamId);
+	const hasPr = !!data?.merge?.pr && data.canReturn;
+	const refreshed = useRef<string | null>(null);
+	useEffect(() => {
+		if (!itemId || !hasPr || refreshed.current === itemId) return;
+		refreshed.current = itemId;
+		refresh.mutate({ itemId });
+	}, [itemId, hasPr, refresh.mutate]);
 	return (
 		<Drawer
 			opened={!!itemId}

@@ -8,11 +8,13 @@ import type {
 	TeamListResponse,
 	TeamMembersResponse,
 	TeamPageSummary,
+	TeamPrMergeMethod,
 	TeamRunningResponse,
 	TeamSettingsPatch,
 	TeamWorkFileDiff,
 	TeamWorkItemDetail,
 	TeamWorkMergeResponse,
+	TeamWorkPrRefreshResponse,
 	TeamWorkReturnResponse,
 	TeamWorkStatsResponse,
 } from "@shared/project-teams";
@@ -144,6 +146,23 @@ export const teamsApi = {
 	mergeTeamWorkItem: (projectId: string, teamId: string, itemId: string) =>
 		request<TeamWorkMergeResponse>(
 			`${teamBase(projectId, teamId)}/work/${encodeURIComponent(itemId)}/merge`,
+			{ method: "POST" },
+		),
+	/** G: merge a ready item's pull request on GitHub (members): accepted, runs in the background. */
+	mergeTeamPullRequest: (
+		projectId: string,
+		teamId: string,
+		itemId: string,
+		method: TeamPrMergeMethod | undefined,
+	) =>
+		request<TeamWorkMergeResponse>(
+			`${teamBase(projectId, teamId)}/work/${encodeURIComponent(itemId)}/pr/merge`,
+			{ method: "POST", body: JSON.stringify(method ? { method } : {}) },
+		),
+	/** G: read a ready item's pull request from GitHub now (unless read in the last 20 s). */
+	refreshTeamPullRequest: (projectId: string, teamId: string, itemId: string) =>
+		request<TeamWorkPrRefreshResponse>(
+			`${teamBase(projectId, teamId)}/work/${encodeURIComponent(itemId)}/pr/refresh`,
 			{ method: "POST" },
 		),
 	/** Fast-forward a prepared merge in the checkout its base is checked out in (members). */

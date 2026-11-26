@@ -12,6 +12,7 @@ import type { CreateTeamPayload, UpgradeToTeamPayload } from "@frontend/lib/api/
 import {
 	TEAM_WORK_STATS_IDS_MAX,
 	type TeamBoardColumn,
+	type TeamPrMergeMethod,
 	type TeamSettingsPatch,
 	type TeamWorkStatsResponse,
 } from "@shared/project-teams";
@@ -369,7 +370,11 @@ export function useTeamWorkItem(projectId: string, teamId: string, itemId: strin
 		enabled: !!projectId && !!teamId && !!itemId,
 		gcTime: TEAM_GC_TIME_MS,
 		refetchOnWindowFocus: false,
-		refetchInterval: (query) => (query.state.data?.merge?.phase ? MERGE_POLL_MS : false),
+		// A merge job runs, or (G) the pull request is being read from GitHub.
+		refetchInterval: (query) =>
+			query.state.data?.merge?.phase || query.state.data?.merge?.pr?.refreshing
+				? MERGE_POLL_MS
+				: false,
 	});
 }
 
@@ -380,10 +385,21 @@ export function useTeamWorkItem(projectId: string, teamId: string, itemId: strin
 export function useMergeWorkItem(projectId: string, teamId: string) {
 	const queryClient = useQueryClient();
 	return useMutation({
-		mutationFn: ({ itemId, fastForward }: { itemId: string; fastForward?: boolean }) =>
-			fastForward
-				? api.fastForwardTeamWorkItem(projectId, teamId, itemId)
-				: api.mergeTeamWorkItem(projectId, teamId, itemId),
+		mutationFn: ({
+			itemId,
+			fastForward,
+			pullRequest,
+		}: {
+			itemId: string;
+			fastForward?: boolean;
+			/** G: 「合并 PR」 with this method (absent: the repository's default). */
+			pullRequest?: { method?: TeamPrMergeMethod };
+		}) =>
+			pullRequest
+				? api.mergeTeamPullRequest(projectId, teamId, itemId, pullRequest.method)
+				: fastForward
+					? api.fastForwardTeamWorkItem(projectId, teamId, itemId)
+					: api.mergeTeamWorkItem(projectId, teamId, itemId),
 		meta: { suppressErrorToast: true },
 		onSettled: () => {
 			void queryClient.invalidateQueries({ queryKey: teamKeys.summary(teamId) });
@@ -392,6 +408,22 @@ export function useMergeWorkItem(projectId: string, teamId: string) {
 			void queryClient.invalidateQueries({ queryKey: teamKeys.activity(teamId) });
 			// The project page's 等你处理 carries ready items of every team.
 			void queryClient.invalidateQueries({ queryKey: projectOverviewKeys.attention(projectId) });
+		},
+	});
+}
+
+/**
+ * G: read a ready item's pull request from GitHub when the drawer opens (members; at most once
+ * per 20 s on the server). The drawer polls while the read runs.
+ */
+export function useRefreshPullRequest(projectId: string, teamId: string) {
+	const queryClient = useQueryClient();
+	return useMutation({
+		mutationFn: ({ itemId }: { itemId: string }) =>
+			api.refreshTeamPullRequest(projectId, teamId, itemId),
+		meta: { suppressErrorToast: true },
+		onSuccess: (_result, { itemId }) => {
+			void queryClient.invalidateQueries({ queryKey: teamKeys.workItem(teamId, itemId) });
 		},
 	});
 }

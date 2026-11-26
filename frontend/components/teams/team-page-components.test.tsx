@@ -245,7 +245,8 @@ describe("等你处理", () => {
 				job: null,
 				outcome: null,
 				canMerge: false,
-				disabledReason: "github_pending",
+				disabledReason: "gh_logged_out",
+				pr: null,
 			},
 		}),
 	];
@@ -296,8 +297,9 @@ describe("等你处理", () => {
 		expect(html).toContain('data-testid="team-merge-view"');
 		expect(html).toContain('data-testid="team-merge-return"');
 		expect(html).toMatch(/<button[^>]*disabled=""[^>]*data-testid="team-merge-button"/);
-		expect(html).toContain('data-reason="github_pending"');
-		expect(html).toContain("Merge into main");
+		expect(html).toContain('data-reason="gh_logged_out"');
+		expect(html).toContain('data-merge-label="openPr"');
+		expect(html).toContain("Open a pull request");
 		expect(html).toContain('data-testid="team-attention-count"');
 	});
 
@@ -1223,7 +1225,11 @@ describe("merge (M)", () => {
 	test("disabled reasons say why, in both languages", async () => {
 		for (const reason of [
 			"worker_running",
-			"github_pending",
+			"gh_missing",
+			"gh_logged_out",
+			"gh_no_permission",
+			"gh_repo_archived",
+			"gh_unavailable",
 			"git_too_old",
 			"base_remote",
 			"checking",
@@ -1232,7 +1238,9 @@ describe("merge (M)", () => {
 			expect(html).toContain(`data-reason="${reason}"`);
 			expect(html).toMatch(/<button[^>]*disabled=""[^>]*data-testid="team-merge-button"/);
 		}
-		expect(zh.teams.page.merge.disabled.github_pending).toContain("GitHub PR 流程即将提供");
+		expect(zh.teams.page.merge.disabled.gh_logged_out).toBe("在主机上运行 gh auth login");
+		expect(zh.teams.page.merge.disabled.gh_no_permission).toBe("gh 账号对该仓库没有写权限");
+		expect(JSON.stringify(zh)).not.toContain("PR 流程即将提供");
 	});
 
 	test("the drawer's outcome: conflicts with 退回, a failure in words, a prepared merge with its command", async () => {

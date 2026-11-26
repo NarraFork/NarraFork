@@ -899,12 +899,13 @@ describe("merge (M)", () => {
 			mergeControl({
 				...summary,
 				canMerge: false,
-				disabledReason: "github_pending",
+				disabledReason: "gh_logged_out",
 				mode: "github",
 			}),
 		).toMatchObject({
+			label: "openPr",
 			enabled: false,
-			disabledKey: "teams.page.merge.disabled.github_pending",
+			disabledKey: "teams.page.merge.disabled.gh_logged_out",
 		});
 		expect(mergeControl({ ...summary, outcome: "conflict" })?.panel).toBe("conflict");
 	});

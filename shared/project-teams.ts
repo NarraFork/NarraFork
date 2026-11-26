@@ -208,8 +208,9 @@ export const TEAM_STATUS_CADENCE_MS = 10 * 60_000;
 // ── P3: work item lifecycle ──────────────────────────────────────────────────
 
 /**
- * The coordinator's `Team` tool actions (plan §二.4). PR, CI and integration actions
- * (`integrate`, `pr.*`, `merge.local`) are deferred with the hosting and integration PRs.
+ * The coordinator's `Team` tool actions (plan §二.4). Merging is never the coordinator's: a member
+ * merges a ready item from the team page (locally, or through a GitHub pull request, M and G);
+ * integration actions (`integrate`) are deferred.
  */
 export const TEAM_TOOL_ACTIONS = [
 	"work.list",
