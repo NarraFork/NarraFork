@@ -13,6 +13,10 @@
  *   is refused by git itself when the base is checked out in any worktree (never `update-ref` on
  *   a checked-out base: that person's `git status` would show the merge reversed).
  * - `fetchBaseFromOrigin`: `origin/<base>` into the remote-tracking ref only.
+ * - `pushBranch` (G): the item's pinned head to `refs/heads/<branch>` at origin's push URL —
+ *   named explicitly, so no `remote.*` setting applies — never forced, no hook, no signing, no
+ *   submodule recursion, no push option, the receive-pack program pinned, and the same credential
+ *   and transport rules as the fetch.
  * - `inspectCheckout` / `fastForwardCheckout`: the explicit fast-forward of a person's checkout
  *   (`merge --ff-only`), refused unless the checkout is exactly where the merge was prepared, and
  *   checked afterwards (no unmerged entry, no new stash, HEAD still on the base at the merge).
@@ -52,6 +56,9 @@ const MERGE_TIMEOUT_MS = 120_000;
 const MERGE_OUTPUT_BYTES = 1024 * 1024;
 /** Network fetch from origin. */
 const FETCH_TIMEOUT_MS = 120_000;
+/** G: the push of an item's branch: 120 s, 64 KB. */
+const PUSH_TIMEOUT_MS = 120_000;
+const PUSH_OUTPUT_BYTES = 64 * 1024;
 /** Private refs one listing returns (the rest on the next call). */
 export const PRIVATE_REFS_PAGE = 1000;
 /** Private refs deleted in one `update-ref --stdin` transaction. */
@@ -497,6 +504,77 @@ export function networkOverrides(
 	};
 }
 
+/**
+ * Push-only configuration a repository can set: a `url.*.pushInsteadOf` (and the `insteadOf` the
+ * fetch rules already read), and `remote.<name>.*` of every remote (a remote whose name is the
+ * very URL pushed to applies to an explicit URL too).
+ */
+const PUSH_PATTERN =
+	"^(url\\..*\\.(insteadof|pushinsteadof)|remote\\..*\\.(url|pushurl|receivepack|uploadpack|vcs|proxy|push|mirror))$";
+
+/** Command-scope settings a push always carries: nothing signed, recursed, followed or added. */
+const PUSH_NEUTRAL: ConfigEntries = [
+	["push.gpgSign", "false"],
+	["push.recurseSubmodules", "no"],
+	["push.followTags", "false"],
+	["push.negotiate", "false"],
+	["push.autoSetupRemote", "false"],
+	// One empty value resets the list of push options.
+	["push.pushOption", ""],
+];
+
+/**
+ * Refuse a push whose URL the repository's own configuration would rewrite or reconfigure: a
+ * repository `url.*.insteadOf` / `url.*.pushInsteadOf` whose prefix starts the URL, or a
+ * repository `remote.<URL>.*` (a remote named by the URL itself). The host's own rewrites are the
+ * operator's and apply.
+ */
+export function assertPushUrlUntouched(entries: readonly ScopedConfigEntry[], url: string): void {
+	for (const entry of entries) {
+		if (!isRepositoryScope(entry.scope)) continue;
+		const lower = entry.key.toLowerCase();
+		if (
+			lower.startsWith("url.") &&
+			(lower.endsWith(".insteadof") || lower.endsWith(".pushinsteadof")) &&
+			entry.value &&
+			url.startsWith(entry.value)
+		)
+			throw new UnsafeRemoteConfigError(entry.key);
+		if (lower.startsWith("remote.")) {
+			const name = entry.key.slice("remote.".length, entry.key.lastIndexOf("."));
+			if (name === url) throw new UnsafeRemoteConfigError(entry.key);
+		}
+	}
+}
+
+/** A URL with any userinfo (`user:token@`) removed, for messages. */
+export function redactUserinfo(text: string): string {
+	return text.replace(/([a-z][a-z0-9+.-]*:\/\/)[^/@\s'"]+@/gi, "$1");
+}
+
+/** The outcome of a push of one branch. */
+export type PushBranchResult =
+	| { outcome: "pushed" }
+	| { outcome: "up_to_date" }
+	/** The remote branch has commits the head lacks (or a hook there refused it). */
+	| { outcome: "rejected"; message: string }
+	| { outcome: "failed"; message: string };
+
+/** Read `git push --porcelain` for one destination ref. */
+export function parsePushPorcelain(
+	stdout: string,
+	destination: string,
+): { flag: string; summary: string } | null {
+	for (const line of stdout.split("\n")) {
+		const match = /^([ +\-*=!])\t([^\t]*)\t?(.*)$/.exec(line);
+		if (!match) continue;
+		const refs = match[2] ?? "";
+		const to = refs.slice(refs.lastIndexOf(":") + 1);
+		if (to === destination) return { flag: match[1] ?? "", summary: (match[3] ?? "").trim() };
+	}
+	return null;
+}
+
 const isHelperKey = (lower: string) => lower.startsWith("credential.") && lower.endsWith(".helper");
 const isExtraHeaderKey = (lower: string) =>
 	lower.startsWith("http.") && lower.endsWith(".extraheader");
@@ -559,6 +637,13 @@ export interface TeamRepoGit {
 	commonDir(): Promise<string>;
 	/** `origin/<base>` into `refs/remotes/origin/<base>` only; the error text when it failed. */
 	fetchBaseFromOrigin(base: string): Promise<{ ok: true } | { ok: false; message: string }>;
+	/**
+	 * G: push `head` to `refs/heads/<branch>` at `url` (origin's push URL as read): no `+`, no
+	 * lease, so a remote branch with commits the head lacks is rejected. Refused before anything
+	 * runs (`TEAM_REMOTE_CONFIG_UNSAFE`) when the repository's own configuration would choose the
+	 * transport, credentials or a program, or rewrite the URL.
+	 */
+	pushBranch(input: { url: string; head: string; branch: string }): Promise<PushBranchResult>;
 }
 
 /** The absolute, resolved common git directory of a checkout. */
@@ -857,7 +942,61 @@ export function teamRepoGit(repo: string, options: { signal?: AbortSignal } = {}
 					signal,
 				},
 			);
-			return result.exitCode === 0 ? { ok: true } : { ok: false, message: complaint(result) };
+			return result.exitCode === 0
+				? { ok: true }
+				: { ok: false, message: redactUserinfo(complaint(result)) };
+		},
+		async pushBranch({ url, head, branch }) {
+			assertSha(head);
+			assertBranch(branch);
+			if (!url || url.startsWith("-") || unsafeForCommand(url))
+				throw new GitError("Not a URL to push to");
+			const entries = await scopedConfig(repo, NETWORK_PATTERN, signal);
+			const pushEntries = await scopedConfig(repo, PUSH_PATTERN, signal);
+			assertPushUrlUntouched(pushEntries, url);
+			const network = networkOverrides(entries, envWithAmbientProxy());
+			// As for the fetch: the host's credentials and ssh, never the hardening's emptied ones.
+			const hardened = (await programConfig()).filter(
+				([key]) =>
+					key !== "credential.helper" && key !== "core.sshCommand" && key !== "core.askPass",
+			);
+			const destination = `refs/heads/${branch}`;
+			const result = await run(
+				repo,
+				[
+					"push",
+					"--porcelain",
+					// No hook (pre-push), on top of the hooks directory and every configured hook off.
+					"--no-verify",
+					"--no-signed",
+					"--no-recurse-submodules",
+					"--no-follow-tags",
+					// First value wins: only the command line beats a configured receive-pack.
+					"--receive-pack=git-receive-pack",
+					url,
+					`${head}:${destination}`,
+				],
+				{
+					config: [...hardened, ...network.overrides, ...PUSH_NEUTRAL],
+					network: true,
+					timeout: PUSH_TIMEOUT_MS,
+					maxOutputBytes: PUSH_OUTPUT_BYTES,
+					env: network.env,
+					signal,
+				},
+			);
+			const line = parsePushPorcelain(result.stdout, destination);
+			if (line?.flag === "!")
+				return {
+					outcome: "rejected",
+					message: redactUserinfo(line.summary || complaint(result)).slice(0, 300),
+				};
+			if (result.exitCode === 0 && line?.flag === "=") return { outcome: "up_to_date" };
+			if (result.exitCode === 0 && line && line.flag !== "-") return { outcome: "pushed" };
+			return {
+				outcome: "failed",
+				message: redactUserinfo(result.truncated ? "git push said too much" : complaint(result)),
+			};
 		},
 	};
 }

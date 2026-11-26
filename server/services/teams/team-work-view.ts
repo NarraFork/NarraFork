@@ -24,12 +24,14 @@ import {
 	TEAM_WORK_STATS_IDS_MAX,
 	type TeamActivityEvent,
 	type TeamEventActorKind,
+	type TeamPrMergeMethod,
 	type TeamReviewVerdict,
 	type TeamWorkDiffStat,
 	type TeamWorkFileChange,
 	type TeamWorkFileDiff,
 	type TeamWorkItemDetail,
 	type TeamWorkMergeResponse,
+	type TeamWorkPrRefreshResponse,
 	type TeamWorkReturnResponse,
 	type TeamWorkReviewRound,
 	type TeamWorkStatsResponse,
@@ -49,7 +51,13 @@ import {
 	reviewHeadColumns,
 } from "./team-board";
 import { teamGit } from "./team-git";
-import { canMergeInProject, mergeViewOf, requestFastForward, requestMerge } from "./team-merge";
+import {
+	canMergeInProject,
+	mergeViewOf,
+	requestFastForward,
+	requestMerge,
+	requestPrMerge,
+} from "./team-merge";
 import { loadTeamForAccess } from "./team-service";
 import { compareRefFor } from "./team-work-start";
 import { readDependents } from "./work-item-dependencies";
@@ -577,6 +585,38 @@ export async function requestMergeAsPerson(
 	const result = requestMerge({ teamId, itemId, userId: principal.userId || null });
 	statCache.delete(itemId);
 	return result;
+}
+
+/**
+ * G: a member merges a ready item's pull request on GitHub (`team-merge-pr.ts`): the same access
+ * as the merge; accepted at once, the job runs in the background.
+ */
+export async function requestPrMergeAsPerson(
+	teamId: string,
+	principal: NarratorPrincipal,
+	projectId: string,
+	itemId: string,
+	method: TeamPrMergeMethod | undefined,
+): Promise<TeamWorkMergeResponse> {
+	await loadTeamForAccess(teamId, principal, "write", projectId);
+	const result = requestPrMerge({ teamId, itemId, userId: principal.userId || null, method });
+	statCache.delete(itemId);
+	return result;
+}
+
+/**
+ * G: the drawer opened on a ready item with a pull request: read it from GitHub unless it was
+ * read in the last 20 s (members, as the merge).
+ */
+export async function requestPrRefreshAsPerson(
+	teamId: string,
+	principal: NarratorPrincipal,
+	projectId: string,
+	itemId: string,
+): Promise<TeamWorkPrRefreshResponse> {
+	await loadTeamForAccess(teamId, principal, "write", projectId);
+	const { requestPrRefresh } = await import("./team-merge-pr");
+	return requestPrRefresh({ teamId, itemId });
 }
 
 /** A member fast-forwards a prepared merge in the checkout its base is checked out in. */

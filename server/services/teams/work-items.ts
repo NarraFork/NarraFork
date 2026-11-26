@@ -1281,6 +1281,44 @@ export function markMergedByLocalMerge(input: {
 }
 
 /**
+ * G: the item's pull request was merged on GitHub (by a member's 「合并 PR」, or by hand there,
+ * found by the poller): recorded as `work.merged` with `detectedBy: "pull_request"`, the pull
+ * request, its URL, GitHub's merge commit and method (any method: squash and rebase too, which
+ * ancestry never sees) and whether GitHub merged exactly the ready head. The same in-transaction
+ * check as every other merge (ready, same head, same `updated_at`); false when the item changed.
+ */
+export function markMergedByPullRequest(input: {
+	itemId: string;
+	head: string;
+	expectedUpdatedAt: string;
+	actor: WorkActor;
+	pr: number;
+	url: string;
+	mergeCommit: string | null;
+	method: string | null;
+	headMatches: boolean;
+	baseBranch: string;
+}): boolean {
+	return markMerged({
+		itemId: input.itemId,
+		head: input.head,
+		base: input.mergeCommit ?? `origin/${input.baseBranch}`,
+		expectedHeadSha: input.head,
+		expectedUpdatedAt: input.expectedUpdatedAt,
+		actor: input.actor,
+		detail: {
+			detectedBy: "pull_request",
+			pr: input.pr,
+			url: input.url,
+			mergeCommit: input.mergeCommit,
+			method: input.method,
+			headMatches: input.headMatches,
+			baseBranch: input.baseBranch,
+		},
+	});
+}
+
+/**
  * The one writer of `merged`: in one transaction re-check the item (ready, same head, same
  * `updated_at`, team active), move it, record `work.merged`, and (D) record which queued items it
  * unblocked; their notes are delivered after the transaction.

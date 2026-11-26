@@ -14,6 +14,7 @@ import type {
 	TeamListResponse,
 	TeamOverlapResponse,
 	TeamWorkMergeResponse,
+	TeamWorkPrRefreshResponse,
 	TeamWorkReturnResponse,
 } from "@shared/project-teams";
 import { type Context, Hono } from "hono";
@@ -23,6 +24,7 @@ import { projectPrincipalOf, requireProjectAccess } from "../lib/project-access"
 import {
 	createProjectTeamSchema,
 	listProjectTeamsQuerySchema,
+	mergeTeamPullRequestSchema,
 	releaseTeamLockSchema,
 	returnTeamWorkItemSchema,
 	teamActivityQuerySchema,
@@ -58,6 +60,8 @@ import {
 	readWorkStats,
 	requestFastForwardAsPerson,
 	requestMergeAsPerson,
+	requestPrMergeAsPerson,
+	requestPrRefreshAsPerson,
 	returnWorkItemAsPerson,
 } from "../services/teams/team-work-view";
 import { requireSqliteProjectMutation } from "./projects";
@@ -344,12 +348,59 @@ async function requireProjectWriteForMerge(c: Context): Promise<void> {
  * A member merges a ready item into its base (M): the same access as 退回, plus project write (a
  * read-only project member never moves the base, whatever their coordinator grant). Only cheap checks run
  * here; the merge itself is a background job (202 with its phase), read back from the drawer.
- * 409: `TEAM_WORK_ITEM_NOT_READY`, `TEAM_WORK_ITEM_MERGING`, `TEAM_WORK_ITEM_WORKER_RUNNING`,
- * `TEAM_MERGE_GITHUB_PENDING`, `TEAM_MERGE_BASE_REMOTE`, `TEAM_ARCHIVED`.
+ * When origin is on GitHub (G) the same request pushes the branch and opens or updates its pull
+ * request (job `pull_request`). 409: `TEAM_WORK_ITEM_NOT_READY`, `TEAM_WORK_ITEM_MERGING`,
+ * `TEAM_WORK_ITEM_WORKER_RUNNING`, `TEAM_MERGE_BASE_REMOTE`, `TEAM_ARCHIVED`, and for GitHub
+ * `TEAM_PR_GH_MISSING`, `TEAM_PR_GH_LOGGED_OUT`, `TEAM_PR_GH_NO_PERMISSION`,
+ * `TEAM_PR_REPO_ARCHIVED`, `TEAM_PR_GH_UNAVAILABLE`.
  */
 projectTeamRoutes.post("/:projectId/teams/:teamId/work/:itemId/merge", async (c) => {
 	await requireProjectWriteForMerge(c);
 	const result: TeamWorkMergeResponse = await requestMergeAsPerson(
+		c.req.param("teamId"),
+		narratorPrincipalOf(c),
+		c.req.param("projectId"),
+		c.req.param("itemId"),
+	);
+	return c.json(result, 202);
+});
+
+/**
+ * G: 「合并 PR」: merge a ready item's pull request on GitHub (`{ method? }`: merge, squash or rebase;
+ * absent, the repository's default). The same access as the merge; a background job (202). 409:
+ * those of the merge, `TEAM_PR_NOT_GITHUB`, `TEAM_PR_METHOD_NOT_ALLOWED`.
+ */
+projectTeamRoutes.post("/:projectId/teams/:teamId/work/:itemId/pr/merge", async (c) => {
+	await requireProjectWriteForMerge(c);
+	const raw = await c.req.text();
+	let body: unknown = {};
+	if (raw.trim()) {
+		try {
+			body = JSON.parse(raw);
+		} catch {
+			throw new ValidationError("Request body must be JSON");
+		}
+	}
+	const parsed = mergeTeamPullRequestSchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const result: TeamWorkMergeResponse = await requestPrMergeAsPerson(
+		c.req.param("teamId"),
+		narratorPrincipalOf(c),
+		c.req.param("projectId"),
+		c.req.param("itemId"),
+		parsed.data.method,
+	);
+	return c.json(result, 202);
+});
+
+/**
+ * G: the drawer opened: read the item's pull request from GitHub unless it was read in the last
+ * 20 s (202; the drawer polls while `refreshing`). The same access as the merge; 409
+ * `TEAM_PR_NONE` without a pull request, `TEAM_WORK_ITEM_NOT_READY`.
+ */
+projectTeamRoutes.post("/:projectId/teams/:teamId/work/:itemId/pr/refresh", async (c) => {
+	await requireProjectWriteForMerge(c);
+	const result: TeamWorkPrRefreshResponse = await requestPrRefreshAsPerson(
 		c.req.param("teamId"),
 		narratorPrincipalOf(c),
 		c.req.param("projectId"),

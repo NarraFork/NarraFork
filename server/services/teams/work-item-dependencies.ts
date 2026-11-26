@@ -269,11 +269,31 @@ export async function unreachedDependencies(itemId: string): Promise<UnreachedDe
 	const missing: TeamWorkDependencyRef[] = [];
 	for (const dependency of merged) {
 		const head = heads.get(dependency.id);
-		const inside =
+		let inside =
 			git && target && head ? await git.isAncestor(head, target).catch(() => false) : false;
+		// G: a squash or rebase merge of its pull request never puts the head itself there; the
+		// commit GitHub merged it as does.
+		const landedAs = inside ? null : mergeCommitOf(dependency.id);
+		if (!inside && git && target && landedAs)
+			inside = await git.isAncestor(landedAs, target).catch(() => false);
 		if (!inside) missing.push(dependency);
 	}
 	return { label: start.label, missing };
+}
+
+const FULL_SHA = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
+
+/** The commit a pull request merged an item as (`work.merged` by `pull_request`), or null. */
+function mergeCommitOf(itemId: string): string | null {
+	const detail = db
+		.select({ detail: teamWorkEvents.detailJson })
+		.from(teamWorkEvents)
+		.where(and(eq(teamWorkEvents.workItemId, itemId), eq(teamWorkEvents.kind, "work.merged")))
+		.orderBy(desc(teamWorkEvents.createdAt), desc(teamWorkEvents.id))
+		.limit(1)
+		.get()?.detail;
+	const commit = detail?.detectedBy === "pull_request" ? detail.mergeCommit : null;
+	return typeof commit === "string" && FULL_SHA.test(commit) ? commit : null;
 }
 
 /**

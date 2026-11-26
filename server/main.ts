@@ -1626,6 +1626,10 @@ async function initializeDatabaseStartup(): Promise<void> {
 				({ startTeamMergeMaintenance }) => startTeamMergeMaintenance,
 			),
 		);
+		// Read ready items' pull requests on GitHub: merged by hand, closed, checks and review.
+		startTeamDatabaseMaintenance("pull-requests", () =>
+			import("./services/teams/team-merge-pr").then(({ startTeamPrPoller }) => startTeamPrPoller),
+		);
 		// Stop containers and release ports that removed chapters left behind.
 		retireLegacyChapterResources().catch((err) => {
 			logger.warn("Legacy chapter resource cleanup failed", { error: String(err) });

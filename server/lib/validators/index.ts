@@ -203,6 +203,7 @@ export {
 	coordinatorLimitsSchema,
 	createProjectTeamSchema,
 	listProjectTeamsQuerySchema,
+	mergeTeamPullRequestSchema,
 	releaseTeamLockSchema,
 	returnTeamWorkItemSchema,
 	teamActivityQuerySchema,

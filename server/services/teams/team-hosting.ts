@@ -7,18 +7,32 @@
  * `http(s)://[userinfo@]host/path` (userinfo dropped, never logged). The host is lowercased and
  * the path must be exactly `owner/repo` (a trailing `/` and `.git` removed).
  *
- * This part only tells github.com apart from everything else: GitHub decides the merge flow (a
- * pull request, a later PR) and the default work start (`origin/<base>`). Another host, a GitHub
- * Enterprise host included, counts as "other" until the gh probe of the PR flow can say it is
- * logged in there.
+ * GitHub decides the merge flow (a pull request, `team-merge-pr.ts`) and the default work start
+ * (`origin/<base>`). github.com is GitHub by name; another host (a GitHub Enterprise Server) is
+ * GitHub only when gh is logged in there or at least knows it (`gh auth status --hostname H --json
+ * hosts` lists it). For a GitHub origin the probe then asks, off the request path: is gh installed
+ * (`Bun.which`, `gh --version`, 5 s), logged in to that host, and may its account write to the
+ * repository (`gh repo view host/owner/repo --json viewerPermission,…`: WRITE, MAINTAIN or ADMIN,
+ * not archived) — and which merge methods the repository allows, the viewer's default first. A
+ * GitHub origin whose gh cannot do this keeps the PR flow, disabled with the reason ({@link
+ * GhAccess}); it never falls back to a local merge.
  *
  * Requests only read the cache ({@link peekHosting}); a miss or a stale entry starts one
  * background read per repository (single-flight) and answers null ("checking") meanwhile. A read
- * is kept 5 minutes, a failed one 60 seconds.
+ * is kept 5 minutes; a failed one, or a GitHub origin gh cannot serve, 60 seconds.
  */
-import type { TeamWorkStart } from "@shared/project-teams";
+import type { TeamPrMergeMethod, TeamWorkStart } from "@shared/project-teams";
 import { hotSafe } from "../../lib/hot-safe";
 import { logger } from "../../lib/logger";
+import {
+	GhError,
+	type GhRepo,
+	ghAuthStatus,
+	ghBinary,
+	ghRepoView,
+	ghVersion,
+	isGhRepo,
+} from "./team-gh";
 import { teamRepoGit } from "./team-git-write";
 
 /** A parsed remote URL: lowercased host and its `owner/repo` path. */
@@ -28,8 +42,27 @@ export interface RemoteLocation {
 	repo: string;
 }
 
+/**
+ * What gh can do for a GitHub origin: everything the PR flow needs (with the merge methods the
+ * repository allows, its default first), or why not.
+ */
+export type GhAccess =
+	| { ok: true; methods: TeamPrMergeMethod[] }
+	| {
+			ok: false;
+			reason:
+				| "gh_missing"
+				| "gh_logged_out"
+				| "gh_no_permission"
+				| "gh_repo_archived"
+				| "gh_unavailable";
+			/** gh's own complaint (no secrets: gh prints none), cut short. */
+			message?: string;
+	  };
+
 export type ProjectHosting =
-	| { kind: "github"; host: string; owner: string; repo: string }
+	/** `gh`: what gh can do there (absent only from {@link hostingOfUrl}, which runs nothing). */
+	| { kind: "github"; host: string; owner: string; repo: string; gh?: GhAccess }
 	| { kind: "other"; host: string | null }
 	| { kind: "none" }
 	/** The push URL could not be read: neither GitHub nor not (merging waits; never local). */
@@ -108,6 +141,67 @@ export function defaultWorkStart(hosting: ProjectHosting): TeamWorkStart {
 	return hosting.kind === "github" ? "remote" : "local";
 }
 
+// ── gh ──────────────────────────────────────────────────────────────────────
+
+const WRITERS = new Set(["WRITE", "MAINTAIN", "ADMIN"]);
+
+/** What gh can do for a GitHub repository (never throws). */
+export async function probeGhAccess(target: GhRepo): Promise<GhAccess> {
+	if (state.ghProbe) return state.ghProbe(target);
+	if (!isGhRepo(target))
+		return { ok: false, reason: "gh_unavailable", message: "Not a repository gh can name" };
+	if (!ghBinary()) return { ok: false, reason: "gh_missing" };
+	try {
+		await ghVersion();
+	} catch (error) {
+		return { ok: false, reason: "gh_missing", message: messageOf(error) };
+	}
+	try {
+		const auth = await ghAuthStatus(target.host);
+		if (!auth.loggedIn) return { ok: false, reason: "gh_logged_out" };
+	} catch (error) {
+		return { ok: false, reason: "gh_unavailable", message: messageOf(error) };
+	}
+	try {
+		const facts = await ghRepoView(target);
+		if (facts.archived) return { ok: false, reason: "gh_repo_archived" };
+		if (!facts.permission || !WRITERS.has(facts.permission))
+			return { ok: false, reason: "gh_no_permission" };
+		return { ok: true, methods: facts.methods };
+	} catch (error) {
+		return { ok: false, reason: "gh_unavailable", message: messageOf(error) };
+	}
+}
+
+const messageOf = (error: unknown) =>
+	(error instanceof Error ? error.message : String(error)).slice(0, 300);
+
+/**
+ * Whether a host that is not github.com is a GitHub Enterprise host: gh knows it (logged in or
+ * not). False without gh.
+ */
+async function isEnterpriseHost(host: string): Promise<boolean> {
+	if (state.enterpriseProbe) return state.enterpriseProbe(host);
+	if (!ghBinary()) return false;
+	try {
+		return (await ghAuthStatus(host)).listed;
+	} catch (error) {
+		if (!(error instanceof GhError)) throw error;
+		return false;
+	}
+}
+
+/** The hosting of a push URL with gh asked (GitHub Enterprise, what gh can do there). */
+export async function resolveHosting(url: string | null): Promise<ProjectHosting> {
+	const byName = hostingOfUrl(url);
+	if (byName.kind === "github") return { ...byName, gh: await probeGhAccess(byName) };
+	if (byName.kind !== "other" || !url) return byName;
+	const location = parseRemoteUrl(url);
+	if (!location || !isGhRepo(location) || !(await isEnterpriseHost(location.host))) return byName;
+	const target = { host: location.host, owner: location.owner, repo: location.repo };
+	return { kind: "github", ...target, gh: await probeGhAccess(target) };
+}
+
 // ── The cache ───────────────────────────────────────────────────────────────
 
 const SUCCESS_TTL_MS = 5 * 60_000;
@@ -127,6 +221,8 @@ const state = hotSafe("narrafork.teams.hosting", () => ({
 	entries: new Map<string, Entry>(),
 	source: null as HostingSource | null,
 	now: () => Date.now(),
+	ghProbe: null as ((target: GhRepo) => Promise<GhAccess>) | null,
+	enterpriseProbe: null as ((host: string) => Promise<boolean>) | null,
 }));
 
 const readPushUrl: HostingSource = (repo) => teamRepoGit(repo).originPushUrl();
@@ -141,14 +237,41 @@ export function setHostingSourceForTests(
 	state.entries.clear();
 }
 
+/**
+ * Replace gh's probes (tests): what gh can do for a GitHub repository, and whether a host is a
+ * GitHub Enterprise host. Null restores gh. Clears the cache.
+ */
+export function setGhProbeForTests(
+	probe: ((target: GhRepo) => Promise<GhAccess>) | null,
+	enterprise: ((host: string) => Promise<boolean>) | null = null,
+): void {
+	state.ghProbe = probe;
+	state.enterpriseProbe = enterprise;
+	state.entries.clear();
+}
+
+/** The push URL of a repository's origin now (the same source the hosting is read from). */
+export function readOriginPushUrl(repo: string): Promise<string | null> {
+	return (state.source ?? readPushUrl)(repo);
+}
+
+/** Forget a repository's hosting (a person changed something): the next read asks again. */
+export function forgetHosting(repo: string): void {
+	const entry = state.entries.get(repo);
+	if (entry && !entry.pending) state.entries.delete(repo);
+}
+
+/** Whether a read hosting is one to keep briefly: gh cannot serve a GitHub origin yet. */
+const shortLived = (value: ProjectHosting) => value.kind === "github" && value.gh?.ok === false;
+
 function refresh(repo: string): Promise<ProjectHosting> {
 	const entry = state.entries.get(repo);
 	if (entry?.pending) return entry.pending;
-	const read = (state.source ?? readPushUrl)(repo);
+	const read = readOriginPushUrl(repo).then(resolveHosting);
 	const pending = read
-		.then((url) => {
-			const value = hostingOfUrl(url);
-			store(repo, { value, at: state.now(), ttl: SUCCESS_TTL_MS, pending: null });
+		.then((value) => {
+			const ttl = shortLived(value) ? FAILURE_TTL_MS : SUCCESS_TTL_MS;
+			store(repo, { value, at: state.now(), ttl, pending: null });
 			return value;
 		})
 		.catch((error: unknown) => {
