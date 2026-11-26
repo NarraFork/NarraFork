@@ -647,6 +647,9 @@ export const PretextExactMessageList = memo(
 			 * 第一轮，即使他其实停在别处。
 			 */
 			const [activeRoundSeq, setActiveRoundSeq] = useState<number | null>(null);
+			// 点击导航轨跳转的目标轮 seq：兜底处理贴近底部时 scrollTop 被夹住导致目标轮无法顶到视口顶部的场景，
+			// 一旦用户手动滚动、贴底或切换会话立即清空，交回视口顶部探针。
+			const [jumpedRoundSeq, setJumpedRoundSeq] = useState<number | null>(null);
 			// 视口顶部 seq 的来源有两个：宿主显式给的（只读分享页会传），以及本组件
 			// 自己从 manifest 量的。后者覆盖前者，因为它是本列表真实的可视窗口。
 			const onTopVisibleSeqChangeRef = useRef(onTopVisibleSeqChange);
@@ -677,6 +680,7 @@ export const PretextExactMessageList = memo(
 			// biome-ignore lint/correctness/useExhaustiveDependencies: narratorId is the switch signal
 			useEffect(() => {
 				setRoundFavorites(readRoundFavorites(narratorId));
+				setJumpedRoundSeq(null);
 			}, [narratorId]);
 			const toggleRoundFavorite = useCallback(
 				(seq: number) => {
@@ -3614,20 +3618,35 @@ export const PretextExactMessageList = memo(
 			 * 这与 Vantaloom 的 `activeFlowEventId` 判据一致。用底部会让高亮永远
 			 * 停在最后一行，滚动时整条轨道像没反应。
 			 *
-			 * `seenWindow.start` 是虚拟窗口的起点，`manifest.items[start].firstSeq`
-			 * 是这一行的最小 seq —— 合成行（折叠条）也带 `firstSeq`，所以折叠态下
-			 * 依然能判出所属轮，不需要额外的兜底判据。
+			 * 探针位置取 `scrollTop + PAGE_PADDING + 1`（与 `jumpTargetScrollTop(..., { align: "top", topPadding: PAGE_PADDING })`
+			 * 对齐）：轮次跳转把目标轮首行落到 `scrollTop + PAGE_PADDING`，若直接用 `seenWindow.start`
+			 * （探针在 `scrollTop`），上一轮末尾行往往伸进这段 `PAGE_PADDING` 缝隙里导致高亮仍停在上一轮。
 			 */
+			const activeRoundTopIndex = useMemo(() => {
+				if (!exactLayout || exactLayout.items.length === 0) return seenWindow.start;
+				const probeTop = Math.min(
+					scrollTop + PAGE_PADDING + 1,
+					Math.max(0, exactLayout.totalHeight - 1),
+				);
+				return resolveVisibleWindow(exactLayout, probeTop, Math.max(1, viewportHeight), 0).start;
+			}, [exactLayout, scrollTop, viewportHeight, seenWindow.start]);
 			useEffect(() => {
 				const manifestItems = pretextDocument.manifest?.items ?? [];
-				const firstItem = manifestItems[seenWindow.start];
-				// 贴底时高亮最后一轮：最后一轮很短时，视口顶部仍落在倒数第二轮上，
-				// 但读者实际正在看最底部这一轮。
+				const firstItem = manifestItems[activeRoundTopIndex] ?? manifestItems[seenWindow.start];
+				// 贴底时高亮最后一轮；若是导航轨显式跳转（含贴底被夹住无法顶到视口顶部的短轮），
+				// 在用户下次手动滚动或贴底前保持高亮用户点选的那一轮。
 				const seq = pinnedToBottom
 					? (manifestItems[manifestItems.length - 1]?.lastSeq ?? firstItem?.firstSeq)
-					: firstItem?.firstSeq;
+					: (jumpedRoundSeq ?? firstItem?.firstSeq);
 				reportTopSeq(typeof seq === "number" ? seq : null);
-			}, [seenWindow.start, pinnedToBottom, pretextDocument.manifest, reportTopSeq]);
+			}, [
+				activeRoundTopIndex,
+				seenWindow.start,
+				pinnedToBottom,
+				jumpedRoundSeq,
+				pretextDocument.manifest,
+				reportTopSeq,
+			]);
 
 			/**
 			 * `manifest.documentRevision` advances on every structural change — a new message,
@@ -4791,7 +4810,10 @@ export const PretextExactMessageList = memo(
 					suppressedScrollTopRef.current,
 					nextTop,
 				);
-				if (!isEcho && nextTop !== previousTop) loadedTopNarratorRef.current = null;
+				if (!isEcho && nextTop !== previousTop) {
+					loadedTopNarratorRef.current = null;
+					setJumpedRoundSeq((prev) => (prev === null ? prev : null));
+				}
 				// Classify before React mounts a new band. Only optional cold controllers
 				// subscribe to admission; this never invalidates the body/row element cache.
 				interactionAdmissionRef.current?.observeScroll({
@@ -5989,12 +6011,17 @@ export const PretextExactMessageList = memo(
 										rounds={roundRailRounds}
 										activeIndex={activeRoundIndex}
 										onJumpToRound={(round) => {
+											setJumpedRoundSeq(round.seq);
 											// 跳到该轮首条消息并对齐视口顶部，与「当前轮」的顶部判据一致。
 											void scrollToMessageTarget({
 												domIds: [`msg-${round.messageId}`],
 												targetIds: [round.messageId],
 												highlightId: round.messageId,
 												align: "top",
+											}).then((landed) => {
+												if (!landed) {
+													setJumpedRoundSeq((current) => (current === round.seq ? null : current));
+												}
 											});
 										}}
 										favorites={roundFavorites}

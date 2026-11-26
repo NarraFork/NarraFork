@@ -37,6 +37,8 @@ export interface ListNarratorRoundsOptions {
 	beforeSeq?: number;
 	limit: number;
 	signal?: AbortSignal;
+	/** 单次索引请求总预算（ms）；首屏搭便车调用可传更小预算，避免拖慢会话打开。 */
+	timeoutMs?: number;
 	/** 测试用：覆盖单次请求允许扫描的 assistant 行数上限。 */
 	maxReplyRowsScanned?: number;
 }
@@ -51,11 +53,12 @@ export async function listNarratorRounds(
 		1,
 		Math.trunc(options.maxReplyRowsScanned ?? MAX_ROUND_REPLY_ROWS_SCANNED),
 	);
-	const deadlineAt = Date.now() + ROUND_READ_TIMEOUT_MS;
+	const timeoutMs = Math.max(1, Math.trunc(options.timeoutMs ?? ROUND_READ_TIMEOUT_MS));
+	const deadlineAt = Date.now() + timeoutMs;
 	const baseReadOpts = {
 		signal,
 		deadlineAt,
-		timeoutMs: ROUND_READ_TIMEOUT_MS,
+		timeoutMs,
 		diagnosticSource: "narrator-rounds",
 	} as const;
 	// 多取一条判断是否还有更早的轮，避免额外的 COUNT(*)。

@@ -104,6 +104,7 @@ async function loadedTopHarness(itemCount = 40, narratorId = "loaded-top") {
 		suspendedRef: { current: false },
 		jumpTokenRef,
 		loadedTopNarratorRef,
+		setJumpedRoundSeq: () => {},
 		viewportRef: { current: node },
 		pinnedToBottomRef,
 		textReadingDetachedRef,

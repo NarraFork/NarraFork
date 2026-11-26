@@ -163,6 +163,7 @@ describe("hostsUnpredictableBlock", () => {
 			"plan-card",
 			"reasoning",
 			"reasoning-steps",
+			"round-group",
 		]);
 	});
 });

@@ -104,7 +104,7 @@ describe("parked vlist viewport", () => {
 		expect(readiness).toContain("panelVisible");
 		expect(readiness).toContain("visibleViewportRef.current.isVisible(node)");
 		expect(readiness).toContain("Number.isFinite(node.clientWidth)");
-		expect(readiness).toContain("node.clientWidth > PAGE_PADDING * 2");
+		expect(readiness).toContain("node.clientWidth > horizontalGutterPx() * 2");
 		const measure = region("const measure = () => {");
 		const guard = measure.indexOf("!canMeasure()");
 		expect(guard).toBeGreaterThan(-1);

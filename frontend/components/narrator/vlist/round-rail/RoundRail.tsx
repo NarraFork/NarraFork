@@ -255,7 +255,7 @@ export function RoundRail({
 		setOpen(false);
 		setHoverSeq(null);
 		if (restoreFocus) {
-			window.requestAnimationFrame(() => railRef.current?.focus());
+			window.requestAnimationFrame(() => railRef.current?.focus({ preventScroll: true }));
 		}
 	}, []);
 
@@ -314,10 +314,15 @@ export function RoundRail({
 
 	const jumpTo = (round: NarratorRound | undefined) => {
 		if (!round) return;
+		const wasOpen = open;
 		cancelHoverClose();
 		setHoverSeq(null);
 		setOpen(false);
 		onJumpToRound(round);
+		// 从弹层选中某一轮后，原焦点按钮会被卸载；把焦点无滚动地归还给导航轨，避免键盘焦点落空。
+		if (wasOpen) {
+			railRef.current?.focus({ preventScroll: true });
+		}
 	};
 
 	const hoverIndex = hoverSeq === null ? -1 : rounds.findIndex((r) => r.seq === hoverSeq);

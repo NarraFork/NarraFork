@@ -233,8 +233,10 @@ describe("RoundRail 键盘无障碍与 DOM 结构（Devin #6）", () => {
 		const railBtn = container.querySelector<HTMLButtonElement>("button[aria-haspopup='listbox']");
 		expect(railBtn).not.toBeNull();
 		let railFocusedCount = 0;
-		railBtn!.focus = () => {
+		const focusCalls: Array<FocusOptions | undefined> = [];
+		railBtn!.focus = (options?: FocusOptions) => {
 			railFocusedCount += 1;
+			focusCalls.push(options);
 		};
 		let focusedActive = false;
 		const origFocus = dom.HTMLElement.prototype.focus;
@@ -266,7 +268,7 @@ describe("RoundRail 键盘无障碍与 DOM 结构（Devin #6）", () => {
 		expect(toggledFav).toEqual([1]);
 		expect(jumped).toEqual([]);
 
-		// 按 Escape 关闭选择器并把焦点还给轨道按钮
+		// 按 Escape 关闭选择器并把焦点无滚动地还给轨道按钮
 		act(() => {
 			const esc = Object.assign(new dom.window.Event("keydown", { bubbles: true }), {
 				key: "Escape",
@@ -275,6 +277,22 @@ describe("RoundRail 键盘无障碍与 DOM 结构（Devin #6）", () => {
 		});
 		expect(container.querySelector("[role='listbox']")).toBeNull();
 		expect(railFocusedCount).toBe(1);
+		expect(focusCalls[0]).toEqual({ preventScroll: true });
+
+		// 重新键盘打开并按 Enter/点击选中一轮：选择器关闭、触发跳转，且焦点无滚动地还给轨道按钮
+		act(() => {
+			const evt = Object.assign(new dom.window.Event("click", { bubbles: true }), { detail: 0 });
+			railBtn!.dispatchEvent(evt);
+		});
+		const selectBtn = container.querySelector<HTMLButtonElement>("[data-round-card-select='1']");
+		expect(selectBtn).not.toBeNull();
+		act(() => {
+			selectBtn!.click();
+		});
+		expect(container.querySelector("[role='listbox']")).toBeNull();
+		expect(jumped).toEqual(["m1"]);
+		expect(railFocusedCount).toBe(2);
+		expect(focusCalls[1]).toEqual({ preventScroll: true });
 
 		act(() => {
 			root.unmount();
@@ -282,7 +300,7 @@ describe("RoundRail 键盘无障碍与 DOM 结构（Devin #6）", () => {
 	});
 });
 
-describe("壳层与行组件接线守卫（Devin #4 / #7 与收起态零重测）", () => {
+describe("壳层与行组件接线守卫（Devin #4 / #7 / #8 与收起态零重测）", () => {
 	it("PretextExactMessageList 的 onToggleItems 优先读 foldedChildMetaRef（预览 trace 可收起）", () => {
 		const source = readVlistFile("PretextExactMessageList.tsx");
 		expect(source).toMatch(
@@ -299,5 +317,11 @@ describe("壳层与行组件接线守卫（Devin #4 / #7 与收起态零重测�
 	it("ExactRow 收起态不遍历、不重测 folded 子元素", () => {
 		const source = readVlistFile("ExactRow.tsx");
 		expect(source).toContain("if (isPreviewOpen && Array.isArray(folded) && folded.length > 0)");
+	});
+
+	it("轮次高亮探针按 scrollTop + PAGE_PADDING + 1 与顶对齐跳转口径一致，避免高亮停在上一轮", () => {
+		const source = readVlistFile("PretextExactMessageList.tsx");
+		expect(source).toContain("scrollTop + PAGE_PADDING + 1");
+		expect(source).toContain("setJumpedRoundSeq(round.seq)");
 	});
 });

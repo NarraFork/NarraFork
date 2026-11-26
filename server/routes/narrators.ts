@@ -4513,9 +4513,22 @@ narratorRoutes.get("/:id/pretext-document", async (c) => {
 	);
 	if (!narratorMeta) throw new NotFoundError("Narrator", id);
 	const isInitialTail = beforeSeq === undefined && afterSeq === undefined;
-	const rounds = isInitialTail
-		? await listNarratorRounds(id, { limit: 200, signal: c.req.raw.signal })
-		: undefined;
+	let rounds: Awaited<ReturnType<typeof listNarratorRounds>> | undefined;
+	if (isInitialTail) {
+		try {
+			rounds = await listNarratorRounds(id, {
+				limit: 200,
+				signal: c.req.raw.signal,
+				timeoutMs: 1_500,
+			});
+		} catch (error) {
+			if (c.req.raw.signal.aborted) throw error;
+			logger.warn("Initial pretext-document round index omitted", {
+				narratorId: id,
+				error: String(error),
+			});
+		}
+	}
 	// Envelopes + blocks (§8.1); the page says so (`protocol: 2`).
 	return c.json({
 		...toBlockPage(result),

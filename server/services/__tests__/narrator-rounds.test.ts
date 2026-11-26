@@ -610,4 +610,18 @@ describe("listNarratorRounds", () => {
 			/not yet supported on the PostgreSQL backend/i,
 		);
 	});
+
+	test("首屏 pretext-document 搭便车轮次索引有独立短预算且非取消错误 fail-open，不阻塞会话打开", async () => {
+		const { readFileSync } = await import("node:fs");
+		const { join } = await import("node:path");
+		const routeSource = readFileSync(
+			join(import.meta.dir, "..", "..", "routes", "narrators.ts"),
+			"utf8",
+		);
+		const blockIdx = routeSource.indexOf("Initial pretext-document round index omitted");
+		expect(blockIdx).toBeGreaterThan(-1);
+		const snippet = routeSource.slice(Math.max(0, blockIdx - 400), blockIdx + 120);
+		expect(snippet).toContain("timeoutMs: 1_500");
+		expect(snippet).toContain("if (c.req.raw.signal.aborted) throw error;");
+	});
 });
