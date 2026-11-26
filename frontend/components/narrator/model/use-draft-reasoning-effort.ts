@@ -1,12 +1,15 @@
-import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
+import type { ReasoningEffort } from "@shared/reasoning-effort";
 import { useRuntimeModel } from "../../../hooks/useModelCatalog";
 import { useModelRuntimeSettings } from "../../../hooks/useModels";
-import { runtimeReasoningEffortSupport } from "../interaction/use-model-selection";
+import {
+	displayReasoningEffort,
+	runtimeReasoningEffortSupport,
+} from "../interaction/use-model-selection";
 
 export interface DraftReasoningEffort {
 	supported: boolean;
 	options: readonly ReasoningEffort[];
-	defaultEffort: ReasoningEffort;
+	defaultEffort: string;
 }
 
 /** The draft asks only about its current selection, never the entire model directory. */
@@ -22,7 +25,7 @@ export function useDraftReasoningEffort(model: string): DraftReasoningEffort {
 	return {
 		supported: support?.supportsReasoningEffort ?? false,
 		options,
-		defaultEffort: clampReasoningEffort(
+		defaultEffort: displayReasoningEffort(
 			settingsData?.agent.defaultReasoningEffort || "max",
 			options,
 		),

@@ -118,6 +118,26 @@ describe("model-card reasoning selection", () => {
 		expect(selection.displayedReasoningEffort).toBe("low");
 	});
 
+	test("fixed catalog metadata offers only off and distinguishes enabled/default state", () => {
+		const modelCard = resolveCard(
+			{ upstreamModelId: "opaque-fixed" },
+			{
+				supports_reasoning: true,
+				reasoning_mode: "fixed",
+				can_disable_reasoning: true,
+			},
+		);
+		for (const narratorReasoningEffort of [null, "max", "none"]) {
+			const selection = select("opaque-fixed", { modelCard, narratorReasoningEffort });
+			expect(selection.supportsReasoningEffort).toBe(true);
+			expect(selection.reasoningEffortOptions).toEqual(["none"]);
+			expect(selection.displayedReasoningEffort).toBe(
+				narratorReasoningEffort === "none" ? "none" : "enabled",
+			);
+			expect(selection.reasoningFollowsDefault).toBe(narratorReasoningEffort == null);
+		}
+	});
+
 	test("Haiku 5.5 uses explicit card tiers including xhigh", () => {
 		const selection = select("claude-haiku-5-5", {
 			narratorReasoningEffort: "xhigh",
@@ -201,6 +221,12 @@ describe("model-card reasoning selection", () => {
 		]);
 		const resolveLocal = (q: CatalogQuery) =>
 			resolveModelCard({ catalog, query: q, modelOverrides });
+		expect(select(undefined, { modelCard: resolveLocal(query) }).reasoningEffortOptions).toEqual([
+			"none",
+			"low",
+			"high",
+			"max",
+		]);
 		expect(
 			select(undefined, {
 				modelCard: resolveLocal(query),

@@ -291,10 +291,16 @@ export function resolveRouteReasoning(
 			: "supports_none_reasoning_effort";
 	const explicitNone = card?.metadata[noneField];
 	if (typeof explicitNone === "boolean") result.canDisable = explicitNone;
-	if (Array.isArray(result.levels) && levelsRank >= variantRank) {
-		if (result.levels.length === 0) result.canDisable = false;
-		else if (fieldRank(noneField) < levelsRank || result.canDisable == null)
-			result.canDisable = result.levels.includes("none");
+	// Local tier lists configure intensity, not the independent on/off capability.
+	// Only route declarations (including the known Codex fallback) imply that an
+	// omitted `none` is unavailable. Explicit local canDisable still wins.
+	if (
+		Array.isArray(result.levels) &&
+		levelsRank >= variantRank &&
+		levelsRank < rank("local-model") &&
+		(fieldRank(noneField) < levelsRank || result.canDisable == null)
+	) {
+		result.canDisable = result.levels.includes("none");
 	}
 	if (isLegacyUltra(result.defaultLevel))
 		result.defaultLevel = normalizeLegacyUltra(result.defaultLevel);

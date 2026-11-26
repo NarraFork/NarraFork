@@ -194,17 +194,35 @@ function reasoningMenu(declared: ModelReasoning, hasConcreteModel = true): Reaso
 	const valid = (levels ?? []).filter((level): level is ReasoningEffort =>
 		REASONING_EFFORT_VALUES.includes(level as ReasoningEffort),
 	);
-	const supportsReasoningEffort =
-		hasConcreteModel &&
-		declared.supported !== false &&
-		declared.mode !== "fixed" &&
-		!(Array.isArray(levels) && valid.length === 0);
+	const fixed = declared.mode === "fixed" || (Array.isArray(levels) && valid.length === 0);
+	if (fixed) {
+		// Fixed intensity can still expose an independent off switch. Clearing the
+		// override uses the existing follow-default action, never a fabricated tier.
+		const toggleable =
+			hasConcreteModel && declared.supported !== false && declared.canDisable === true;
+		return {
+			supportsReasoningEffort: toggleable,
+			reasoningEffortOptions: toggleable ? ["none"] : [],
+		};
+	}
+	const supportsReasoningEffort = hasConcreteModel && declared.supported !== false;
 	if (!supportsReasoningEffort) return { supportsReasoningEffort, reasoningEffortOptions: [] };
 	const tiers = valid.length ? valid : GENERIC_REASONING_EFFORT_TIERS;
 	const reasoningEffortOptions = REASONING_EFFORT_VALUES.filter((level) =>
 		level === "none" ? declared.canDisable !== false : tiers.includes(level),
 	);
 	return { supportsReasoningEffort: reasoningEffortOptions.length > 0, reasoningEffortOptions };
+}
+
+/** Display-only enabled state: never send it as a reasoning-effort override. */
+export function displayReasoningEffort(
+	desired: string,
+	options: readonly ReasoningEffort[],
+): string {
+	if (options.length === 1 && options[0] === "none") {
+		return desired === "none" ? "none" : "enabled";
+	}
+	return clampReasoningEffort(desired as ReasoningEffort, options);
 }
 
 function selectionUsesCodex(
@@ -264,7 +282,8 @@ export function resolveReasoningEffortSupport(args: {
 		(codex && isGpt62CodexModel(bareModel)) ||
 		levelsLayer?.startsWith("local-") ||
 		levelsLayer === "discovered" ||
-		levelsLayer === "preset-variant"
+		levelsLayer === "preset-variant" ||
+		(modelCard != null && modelProfile(modelCard).reasoning.mode === "fixed")
 	) {
 		return reasoningMenu(
 			resolveRouteReasoning(modelCard ? modelProfile(modelCard).reasoning : {}, modelCard, {
@@ -484,8 +503,10 @@ export function useModelSelection(options: UseModelSelectionOptions): UseModelSe
 			(source === "preset-model" || source === "preset-variant")
 				? (modelSummary?.resolvedBareModel ?? modelCard?.modelId)
 				: undefined;
-		return clampReasoningEffort(
-			migrateLegacyReasoningEffort(legacyModel, normalizeLegacyUltra(desired), opts),
+		return displayReasoningEffort(
+			opts.length === 1 && opts[0] === "none"
+				? desired
+				: migrateLegacyReasoningEffort(legacyModel, normalizeLegacyUltra(desired), opts),
 			opts,
 		);
 	}, [

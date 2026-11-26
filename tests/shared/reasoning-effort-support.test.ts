@@ -41,6 +41,36 @@ describe("route reasoning precedence", () => {
 		});
 	});
 
+	test.each([
+		"local-model",
+		"local-connection",
+	] as const)("%s tiers preserve independent inherited and explicit off support", (layer) => {
+		for (const levels of [["low", "high", "max"], []]) {
+			const card = {
+				metadata: { supports_none_reasoning_effort: true },
+				provenance: {
+					reasoning_effort_levels: { layer },
+					supports_none_reasoning_effort: { layer: "preset-model" as const },
+				},
+			};
+			expect(
+				resolveRouteReasoning({ levels, canDisable: true }, card, {
+					effortLevels: ["high"],
+					codexModel: "gpt-6.2-sol",
+				}),
+			).toEqual({ levels, canDisable: true });
+			expect(
+				resolveRouteReasoning(
+					{ levels, canDisable: true },
+					{
+						metadata: { can_disable_reasoning: true },
+						provenance: { reasoning_effort_levels: { layer }, can_disable_reasoning: { layer } },
+					},
+				),
+			).toEqual({ levels, canDisable: true });
+		}
+	});
+
 	test("local tiers, flags and fixed mode still take precedence", () => {
 		const layer = { layer: "local-connection" as const };
 		const card = {

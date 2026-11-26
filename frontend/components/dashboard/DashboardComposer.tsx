@@ -1,7 +1,6 @@
 import { ActionIcon, Box, Button, Group, Select, Text, Tooltip } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import { composerDocumentText, parseComposerDocument } from "@shared/composer-document";
-import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
 import {
 	IconAdjustmentsHorizontal,
 	IconDevices,
@@ -48,6 +47,7 @@ import { PermissionModePickerMenu } from "../narrator/interaction/PermissionMode
 import { UploadProgressBar } from "../narrator/interaction/UploadProgressBar";
 import { useComposerAttachments } from "../narrator/interaction/use-composer-attachments";
 import { useComposerFileIngest } from "../narrator/interaction/use-composer-file-ingest";
+import { displayReasoningEffort } from "../narrator/interaction/use-model-selection";
 import {
 	type NarratorSendingState,
 	snapshotComposerFiles,
@@ -138,7 +138,7 @@ export function DashboardComposer() {
 	// Show what the created session will actually get: the user's choice clamped
 	// onto the selected model's tiers, or the instance default when untouched.
 	const reasoningEffort = reasoningEffortOverride
-		? clampReasoningEffort(reasoningEffortOverride as ReasoningEffort, draftReasoning.options)
+		? displayReasoningEffort(reasoningEffortOverride, draftReasoning.options)
 		: draftReasoning.defaultEffort;
 	const permissionModesCapability = useNarratorPermissionsCapability();
 	const availablePermissionModes = permissionModesCapability.supported

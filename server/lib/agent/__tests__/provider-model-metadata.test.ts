@@ -343,6 +343,25 @@ describe("actual provider request bodies", () => {
 		);
 		expect(body.reasoning?.effort).toBeUndefined();
 	});
+	test.each([
+		{ reasoningLevels: ["low", "high", "max"] },
+		{ reasoningLevels: [] },
+	])("local intensity tiers %j do not remove an independent request off switch", async ({
+		reasoningLevels,
+	}) => {
+		setMetadata({ supports_reasoning: true, can_disable_reasoning: true });
+		restoreOverrides = replaceModelOverridesForTests({
+			connections: { [model]: { reasoningLevels } },
+		});
+		const provider = new OpenAIProvider({ ...config, apiMode: "codex", codexWebSocket: false });
+		expect((await captureChat(provider, { reasoningEffort: "none" })).reasoning.effort).toBe(
+			"none",
+		);
+		if (reasoningLevels.length === 0)
+			expect(
+				(await captureChat(provider, { reasoningEffort: "max" })).reasoning?.effort,
+			).toBeUndefined();
+	});
 	test("fixed-but-disableable reasoning preserves an explicit disable", async () => {
 		setMetadata({ supports_reasoning: true, reasoning_mode: "fixed", can_disable_reasoning: true });
 		const body = await captureChat(
@@ -350,6 +369,16 @@ describe("actual provider request bodies", () => {
 			{ reasoningEffort: "none" },
 		);
 		expect(body.reasoning.effort).toBe("none");
+		const enabled = await captureChat(
+			new OpenAIProvider({ ...config, apiMode: "codex", codexWebSocket: false }),
+			{ reasoningEffort: "max" },
+		);
+		expect(enabled.reasoning?.effort).toBeUndefined();
+		const followed = await captureChat(
+			new OpenAIProvider({ ...config, apiMode: "codex", codexWebSocket: false }),
+			{ reasoningEffort: undefined },
+		);
+		expect(followed.reasoning?.effort).toBeUndefined();
 	});
 	test("Gemini disable respects the adapter mapping rather than silently enabling thinking", async () => {
 		setMetadata({

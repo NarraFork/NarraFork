@@ -366,6 +366,9 @@ export function resolveCodexRequestReasoningEffort(
 			"max",
 		model,
 	);
+	// Fixed intensity intentionally resolves an enabled request to no effort.
+	// Do not reinterpret that omission as an explicit off switch.
+	if (profile.reasoning.mode === "fixed") return effort;
 	// Preserve the legacy Codex default only when there is no tier declaration.
 	return Array.isArray(profile.reasoning.levels) ? effort : (effort ?? "none");
 }
