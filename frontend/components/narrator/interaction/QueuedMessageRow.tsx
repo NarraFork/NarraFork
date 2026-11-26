@@ -199,13 +199,18 @@ export function QueuedMessageRow({
 				: "var(--mantine-color-default-border)";
 	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
 		id: msg.id,
-		disabled:
-			msg.retryOnly ||
-			mode !== "turn" ||
-			isEditing ||
-			isStartingEdit ||
-			mutationsLocked ||
-			urgentStatus !== undefined,
+		disabled: {
+			draggable:
+				msg.retryOnly ||
+				mode !== "turn" ||
+				isEditing ||
+				isStartingEdit ||
+				mutationsLocked ||
+				urgentStatus !== undefined,
+			// Boolean disabled only disables dragging in dnd-kit/sortable 10.
+			// Reserved rows must also stay out of closestCenter's drop targets.
+			droppable: !!msg.retryOnly,
+		},
 	});
 	const style = {
 		transform: CSS.Transform.toString(transform),

@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { clearTimeout as clearNativeTimeout, setTimeout as setNativeTimeout } from "node:timers";
+import { closestCenter, DndContext, useDndContext } from "@dnd-kit/core";
+import { SortableContext } from "@dnd-kit/sortable";
 import { Box, MantineProvider } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import {
@@ -35,6 +37,7 @@ import {
 	QueuedMessagesPanel,
 	type QueuedMessagesPanelProps,
 } from "../interaction/QueuedMessagesPanel";
+import { moveQueuedTurn } from "../interaction/queue-message-mode";
 import type { QueuedEditPayload } from "../interaction/queued-attachment-edit";
 import {
 	type UseQueuedMessageActionsOptions,
@@ -1743,6 +1746,112 @@ describe("inline queued message mode actions", () => {
 	});
 });
 describe("retry-only queued control commands", () => {
+	test.each([
+		"turn",
+		"tool",
+		"interrupt",
+	] as const)("%s reserved row is excluded from real dnd registrations' enabled collision targets", async (queueMode) => {
+		let dnd!: ReturnType<typeof useDndContext>;
+		function DndProbe() {
+			dnd = useDndContext();
+			return null;
+		}
+		const messages: BufferMessageSummary[] = [
+			{ id: "A", text: "A", bufferedAt: "now", imageCount: 0, queueMode: "turn" },
+			{
+				id: "R",
+				text: "/new task",
+				bufferedAt: "now",
+				imageCount: 0,
+				queueMode,
+				state: "failed",
+				retryOnly: true,
+			},
+			{ id: "B", text: "B", bufferedAt: "now", imageCount: 0, queueMode: "turn" },
+		];
+		await render(
+			<DndContext collisionDetection={closestCenter}>
+				<SortableContext items={["A", "B"]}>
+					{messages.map((msg) => (
+						<div key={msg.id}>{queueRow({ msg })}</div>
+					))}
+					<DndProbe />
+				</SortableContext>
+			</DndContext>,
+		);
+		// These are the real useSortable/useDroppable registrations, not hook mocks.
+		expect(dnd.droppableContainers.get("R")?.disabled).toBe(true);
+		const enabled = dnd.droppableContainers.getEnabled();
+		expect(enabled.map(({ id }) => id)).toEqual(["A", "B"]);
+		for (const id of ["A", "B"]) {
+			const handle = document.querySelector(
+				`[data-queue-message-row="${id}"] [data-queue-drag-handle]`,
+			);
+			expect(handle?.getAttribute("aria-disabled")).toBe("false");
+		}
+		// linkedom has no layout: inject rectangles into the real collision algorithm.
+		// A overlaps R's lower half, where the old boolean-disabled R wins closestCenter.
+		const rect = (top: number) => ({
+			left: 0,
+			right: 100,
+			top,
+			bottom: top + 40,
+			width: 100,
+			height: 40,
+		});
+		const droppableRects = new Map([
+			["A", rect(0)],
+			["R", rect(80)],
+			["B", rect(160)],
+		]);
+		const collisionArgs = {
+			active: {
+				id: "A",
+				data: { current: {} },
+				rect: { current: { initial: rect(0), translated: rect(90) } },
+			},
+			collisionRect: rect(90),
+			droppableRects,
+			pointerCoordinates: null,
+		};
+		expect(
+			closestCenter({
+				...collisionArgs,
+				droppableContainers: dnd.droppableContainers.toArray(),
+			})[0]?.id,
+		).toBe("R");
+		const collisions = closestCenter({ ...collisionArgs, droppableContainers: enabled });
+		expect(collisions.map(({ id }) => id)).toEqual(["B", "A"]);
+		expect(moveQueuedTurn(messages, "A", String(collisions[0]?.id)).map(({ id }) => id)).toEqual([
+			"B",
+			"R",
+			"A",
+		]);
+	});
+
+	test("edit-lock still disables dragging without disabling ordinary drop targets", async () => {
+		let dnd!: ReturnType<typeof useDndContext>;
+		function DndProbe() {
+			dnd = useDndContext();
+			return null;
+		}
+		await render(
+			<DndContext>
+				<SortableContext items={["locked"]}>
+					{queueRow({
+						msg: { id: "locked", text: "locked", bufferedAt: "now", imageCount: 0 },
+						queueMutationsDisabled: true,
+					})}
+					<DndProbe />
+				</SortableContext>
+			</DndContext>,
+		);
+		expect(dnd.droppableContainers.get("locked")?.disabled).toBe(false);
+		expect(document.querySelector("[data-queue-drag-handle]")?.getAttribute("aria-disabled")).toBe(
+			"true",
+		);
+	});
+
 	test.each([
 		"turn",
 		"tool",
