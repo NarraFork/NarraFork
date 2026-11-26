@@ -24,7 +24,7 @@ keywords:
   - 技能导入
   - $NARRAFORK_HOME/skills
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 ---
 # 技能
 
@@ -35,6 +35,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 每个根下依次扫描 `.narrafork/skills`、`.narrafork/skill`、`.claude/skills`、`.agents/skills`、`.codex/skills`；扫主目录时还加 `$NARRAFORK_HOME/skills` 和 `$CODEX_HOME/skills`（`getSkillSearchDirs`）。同名技能后者覆盖前者，项目层覆盖全局层（`loadAllSkills`）。
 - 禁用靠把文件改名为 `SKILL.md.disabled`（`toggleGlobalSkill`；加载时两种文件名都识别）。
 - 限额：每个根最多 200 个技能，描述截断到 1000 字符，附属文件最多 20 个、深 2 层；摘要刷新 TTL 15s；`skill_directory_caches` 表缓存目录扫描结果，最长保留 7 天，最多 200 个根，每小时清理一次（`SKILL_SUMMARY_REFRESH_TTL_MS`、`cleanupSkillDirectoryCaches`）。
+- 数据库读取（`getRootCache`、`resolveSkillContextForNarrator`、`applyProjectRoutineSkillOverrides`、缓存清理的扫描与计数）走读 Worker（`worker-required`）；清理删除过期行时在 DELETE 里再判一次 `expiresAt < now`，读后续期的不删（`cleanupSkillDirectoryCaches`）。
 - 写入位置：全局技能写 `$NARRAFORK_HOME/skills/`，项目技能写 `<project>/.narrafork/skills/`（`createGlobalSkill`、`createProjectSkill`）。创建通过 `withFileWrite` 的固定本地键串行化，只串行本地提交，不含网络下载（`skill-write-scope.ts`）。
 - 导入：`POST /api/skills/import?projectId=` 与 `/global/import`（后者需管理员）接受 GitHub 目录链接或下载链接；GitHub 导入限额：URL 2048 字符、SKILL.md 200KB、单文件 1MiB、最多 100 个文件、总 10MiB、深度 8、并发 4；整体超时 45s（`GITHUB_SKILL_IMPORT_LIMITS`、`SKILL_IMPORT_TIMEOUT_MS`）。导入路径必须通过 `validateImportedSkillPath`。
 - 路由全部要求登录；项目级接口必须带 `projectId`，读需 read 权限，写需 write 权限；全局技能的导入/按链接更新需管理员（`routes/skills.ts`）。

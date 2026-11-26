@@ -3,6 +3,7 @@ id: platform.main-thread
 title: 主线程性能规则
 summary: SQLite、JSON、同步 IO 都在主线程；列表不读大字段、游标分页、子进程限流、WebSocket 节流。
 anchors:
+  - server/routes/admin.ts#read-fanout
   - server/lib/validators/diagnostics.ts
   - server/lib/db-worker/pool.ts
   - server/lib/db-worker/read-budget.ts
@@ -52,7 +53,7 @@ HTTP/WS、`bun:sqlite`、JSON 序列化与同步 IO 共用一个 JS 线程，任
 - 请求体：普通请求 128MiB 上限（见 [HTTP 路由与 WebSocket](http-ws.md)）。
 - 观测：`startEventLoopMonitor` 每 50ms 采样延迟，滞后 ≥ 1s 时（30s 节流）记警告并附带当时在途请求；保留最近 256 个停顿区间（`lib/event-loop-monitor.ts`）。管理员可调用 `POST /api/diagnostics/cpu-profile` 抓 CPU profile（默认 15s、上限 30s，同一时刻仅一个，`services/cpu-profiler.ts`、`routes/diagnostics.ts`）。
 - SQL 追踪：`NF_SQL_TRACE=summary|full` 时每条经 `instrumentSqliteConnection` 包装的语句按所属跨度（HTTP/WS/agent/tool/worker/job）计时，写 `~/.narrafork/sql-trace/*.ndjson`，不记录绑定参数，缓冲有上限、超限丢弃并计数；`bun run sql:report` 汇总；`dev-all.ts` 默认给后端设 `summary`（`lib/sql-trace.ts`、`app.ts` 的请求跨度）。
-- 读 Worker 扇出观测：`readFanoutHttpMiddleware` 挂在 `/api/*` 上，仅在采集激活（`startReadFanoutCapture`，默认 30 秒）时按路由模板和 WS 消息类型归类读请求；不保留绑定参数和调用方标签，路径只取已注册的路由模板、不用真实 URL（`lib/read-fanout-diagnostics.ts`）。当前只有测试会调用 `startReadFanoutCapture`，生产路径没有触发入口（未找到路由或消息处理器调用它）。
+- 读 Worker 扇出观测：`readFanoutHttpMiddleware` 挂在 `/api/*` 上，仅在采集激活（`startReadFanoutCapture`，默认 30 秒）时按路由模板和 WS 消息类型归类读请求；不保留绑定参数和调用方标签，路径只取已注册的路由模板、不用真实 URL（`lib/read-fanout-diagnostics.ts`）。采集由管理员接口触发：`POST /api/admin/diagnostics/read-fanout/start`（`durationMs` 为 1–60000 的整数，默认 30000，否则 400；已有采集在进行时 409）与 `POST /api/admin/diagnostics/read-fanout/stop`（需 `captureId`），两者都要求管理员、响应 `Cache-Control: no-store`（`routes/admin.ts`）。
 - 有上限的文件读取：`readFileCapped(path, maxBytes)` 只分配并读取上限字节，按 UTF-8 边界截断不留替换字符，不存在返回 `null`（`lib/read-file-capped.ts`）；项目指令文件 `MAX_PROJECT_INSTRUCTIONS_BYTES = 200_000`，调用方有 `instruction-file-cache.ts` 和 `routes/fs.ts`。
 - 管理员确认的 VACUUM 是受控维护窗口，走单独路由 `POST /api/storage/database/vacuum`（`routes/storage.ts`），不是普通 CRUD 路径。
 

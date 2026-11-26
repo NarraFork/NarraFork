@@ -45,7 +45,7 @@ keywords:
   - X-Next-Cursor
   - 章节
 status: draft
-verified_at: 3586b5dd803f5035f610fc36d2c7d0245a2cd8e9
+verified_at: 35942c331661e92be2253f55b4e68e33bf1a5803
 ---
 # 项目
 
@@ -65,7 +65,7 @@ verified_at: 3586b5dd803f5035f610fc36d2c7d0245a2cd8e9
 - 失去项目后清侧栏标签：被移出的成员、以及可见性收紧为 private 时持有项目内标签的人（`usersWithTabsInProject`：项目标签、项目内会话的标签、项目团队的团队标签，各有上限 500）逐个过 `pruneUnreadableProjectTabs`（见[最近标签页](recent-tabs.md)）。
 - 路由层：项目不可见与不存在都返回 NotFound，防止探测；`GET /api/projects/hidden-existence` 只返回是否存在不可见项目（`limit 1` 的有界探测，不泄露名称、id 或数量）；修改设置要 manage。
 - 项目设置里给团队用的两项（`validators/projects.ts:updateProjectSchema`，manage）：`defaultBranch`（`teamBaseBranchSchema`，与团队基线分支同一规则；新团队的基线，不在这里检查能否解析）与 `chapterSettings.teams`（`teamProjectSettingsSchema`：`exclusivePaths` 与 `workStart` = `remote` / `local`，新工作项起点的项目默认；`chapterSettings` 按顶层键浅合并，`teams` 整个替换）。见[合并工作项与基线配置](teams/merge.md)。
-- 列表 `GET /api/projects`：按 `updatedAt` 降序，返回裸数组；不带 `limit`/`cursor` 时返回调用者可读的全部项目（`collectAllPages` 逐页有界地走，单页 200，总量上限 2000）；带 `limit`/`cursor` 才是单页，续页游标在响应头 `X-Next-Cursor`，被截断时 `X-Read-Truncated: 1`（`routes/projects.ts`、`services/read/`）。读取经 `projectReadAdapter()`：默认 SQLite 适配器，PG 模式必须显式注入 PG 适配器，不会静默回落。
+- 列表 `GET /api/projects`：按 `updatedAt` 降序，返回裸数组；不带 `limit`/`cursor` 时返回调用者可读的全部项目（`collectAllPages` 逐页有界地走，单页 200，总量上限 2000）；带 `limit`/`cursor` 才是单页，续页游标在响应头 `X-Next-Cursor`，被截断时 `X-Read-Truncated: 1`（`routes/projects.ts`、`services/read/`）。读取经 `projectReadAdapter()`：默认 SQLite 适配器，PG 模式必须显式注入 PG 适配器，不会静默回落。SQLite 适配器的列表、单读与存在探测都走读 Worker（`readQuery`，`worker-required`，不回退主线程；`read/sqlite-project-read-adapter.ts`）。
 - PG 模式下创建、更新、删除、改可见性、成员变更、转让 owner 一律返回 503 `POSTGRES_UNSUPPORTED`（`requireSqliteProjectMutation`，在权限检查之前）；读取仍可用。
 - 会话之外问"这个目录属于哪个项目"：`POST /api/projects/resolve-directory { cwd, create }`（`routes/projects.ts`，校验 `validators/projects.ts:resolveProjectDirectorySchema`，响应形状 `shared/project-directory.ts`），新建会话弹窗的「以团队开始」用它（见[团队与成员](teams/records.md)）。
   - 与在该目录建本地会话同一道门：登录即可（无用户 401），PG 先 503 `POSTGRES_UNSUPPORTED`。
@@ -74,9 +74,10 @@ verified_at: 3586b5dd803f5035f610fc36d2c7d0245a2cd8e9
   - 非 git 目录 → `not_git`，带不带 `create` 都不建项目。
   - 项目存在但调用者读不到 → 与非 git 目录完全相同的 `not_git`（响应字节一致，测试逐字节比对），不能借此探出私有项目的位置；共享类型里没有单独的"无权限"状态。
   - 读得到 → `project`，带 `canWrite`、`archived`、`gitWorkTree`（项目目录是否本地 git 工作树，`teams/team-git.ts:isGitWorkTree`，10s 超时；项目可以关联任意已有文件夹，团队需要 git）。
+- `PATCH /api/projects/:id` 在一个写事务里读现有 `chapterSettings`、浅合并传入的键并更新，并发 PATCH 不会互相覆盖（`routes/projects.ts`）。
 - 手动指定项目目录会认领 rootKey 并在后台重推全部会话链接（`indexNewProjectRoot`）。
 - 默认项目目录（与项目归属无关的邻近功能）：`settings.paths.defaultProjectDir` 初始不设置、服务端不再创建；`project-dir.ts:getProjectDirStatus` 判 `valid/unset/missing/not_directory`，`/api/fs/project-dir[/candidates]` 暴露，候选扫描有上限（主目录 500 项、最多扫 60 个目录、每目录 200 子项、每候选最多数 50 个仓库、返回 8 个）；设置页 `ProjectDirChooser` 只能从已存在目录里选，前端用 `useProjectDirStatus` 判断是否可用。
-- 收藏目录：`/api/favorites` 的 GET/POST/PATCH/DELETE/PUT reorder 管每个用户自己的目录收藏（`user_favorite_directories`），供目录选择器使用，与项目归属无关。
+- 收藏目录：`/api/favorites` 的 GET/POST/PATCH/DELETE/PUT reorder 管每个用户自己的目录收藏（`user_favorite_directories`），供目录选择器使用，与项目归属无关。列表走读 Worker；POST 在一个事务里查重（重复报 ValidationError）、取 `max(sortOrder)+1` 并插入；PATCH/DELETE 把 `userId` 放进写条件，没命中行即 404（`routes/favorites.ts`）。
 - 旧"章节"路由只剩跳转：`/chapters/$chapterId` 跳 `/projects`，`/settings/chapters` 跳 `/settings/workspace`。
 
 ## 前端

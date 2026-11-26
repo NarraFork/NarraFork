@@ -40,7 +40,7 @@ keywords:
   - compose
   - rootless
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 ---
 # 基准测试与容器
 
@@ -60,7 +60,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 
 - 设置页的安装体验：`WorkspaceContainersSection.tsx`（设置页“工作区与容器”）、`DependencyStatus.tsx`（检测结果）、`DependencyInstallTerminal.tsx` + `dependency-install-progress.ts`（在 xterm 终端里发安装命令，靠提示符规则判断何时发送；漏掉第一个提示符会留下空白终端，所以规则抽成了可单测的纯函数）；API 在 `frontend/lib/api/containers.ts`，管理页 `frontend/routes/admin/containers.tsx`。
 - `benchmark-read.ts` 与 `benchmark-suite-stream.ts`：结果读取走预算（见上），不在主线程一次读完大 suite。
-- 运行时扫描：`runtime-service.ts` 对应 `/api/runtime/scan`、`/cached`（管理员），汇总终端（运行/已退出/孤儿 socket）、容器（按 `containerInstances` 与 `podman --version` 探测）、浏览器进程与会话数，并支持按目标清理；它不是基准测试的一部分，只是与容器检测放在同一管理页。
+- 运行时扫描：`runtime-service.ts` 对应 `/api/runtime/scan`、`/cached`（管理员），汇总终端（运行/已退出/孤儿 socket）、容器（按 `containerInstances` 与 `podman --version` 探测）、浏览器进程与会话数，并支持按目标清理；`containerInstances` 的读取（扫描与清理时列运行中容器）走读 Worker（`worker-required`）；它不是基准测试的一部分，只是与容器检测放在同一管理页。
 
 ## 从哪读起
 - `server/services/benchmark-service.ts`：run 生命周期与任务执行。

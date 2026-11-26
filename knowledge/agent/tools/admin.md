@@ -28,7 +28,7 @@ keywords:
   - 引导设置
   - restricted to administrators
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 ---
 # 管理工具
 
@@ -36,7 +36,7 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 
 ## 关键规则
 - 加载闸：这六个名字在 `tool-load-markers.ts:ADMIN_ONLY_LOAD_TOOLS`，非管理员不能加载（`tool-loading-service.ts`）。
-- 执行闸：每次执行前 `tool-executor.ts` 调 `isAdminToolExecutionAllowed` 重查调用用户的当前角色，非管理员（含他人加载后继续用）得「restricted to administrators」。`NarraForkAdmin` 自身不再查角色，靠这道闸；`McpAdmin`、`HookAdmin`、`ScheduledTaskAdmin`、`PluginInstall` 在写动作前还会自查 `admin-common.ts:isAdminUser`，`KnowledgeAdmin` 查 `knowledgeAcl` 的 `isAdmin`。
+- 执行闸：每次执行前 `tool-executor.ts` 调 `isAdminToolExecutionAllowed` 重查调用用户的当前角色，非管理员（含他人加载后继续用）得「restricted to administrators」。`NarraForkAdmin` 自身不再查角色，靠这道闸；`McpAdmin`、`HookAdmin`、`ScheduledTaskAdmin`、`PluginInstall` 在写动作前还会自查 `admin-common.ts:isAdminUser`（`PluginInstall` 用同样实现的 `plugin-install.ts:defaultIsAdminUser`；都在读 Worker 上查 `users.role`，`worker-required`、30s 超时，读失败即抛错，不回主线程），`KnowledgeAdmin` 查 `knowledgeAcl` 的 `isAdmin`。
 - 写入审批：写动作先 `ctx.requestPermission`（`admin-common.ts:requestWritePermission`），被拒或危险反思未决即返回错误；读动作（list/get 等）直接执行。`KnowledgeAdmin` 的写动作还在 `narrator-permission.ts` 被归为危险，bypass 模式下也触发危险反思；读写动作划分的唯一来源是 `knowledge-actions.ts`。
 - `NarraForkAdmin`：get_settings / get_setting / update_settings / reset_setting。读到的凭据键（`*secret`、`*apiKey`、`*token`、`*password`、敏感请求头等）与 URL 内嵌凭据一律替换为 `***MASKED***`；写回掩码值表示保留已存值，掩码对应的已存值不存在则报错。更新是深度合并，写 `mcpServers` 数组时按 id 做补丁式合并。
 - `NarraForkAdmin` 永远不能改 `agent.permissionRuleAutoApprove`（含整体重置 `agent`）：这个开关只允许管理员在设置页由人改（`isPermissionRuleAutoApproveMutation`）。
