@@ -749,12 +749,133 @@ export function createMailboxStore(db: RuntimeDb) {
 				return rows.length;
 			});
 		},
+		/** Park an independent /new and retain every payload field. Never consult execution ownership. */
+		holdIndependentUserCommand(
+			narratorId: string,
+			id: string,
+			targetNarratorId: string,
+			expected: {
+				state: "queued" | "failed" | "claimed";
+				revision: number;
+				metadataJson: string | null;
+				claim?: MailboxClaim;
+			},
+			reason: string,
+		) {
+			pointer(targetNarratorId);
+			const metadata = JSON.parse(expected.metadataJson ?? "{}");
+			if (
+				metadata.independentNewNarratorId &&
+				metadata.independentNewNarratorId !== targetNarratorId
+			)
+				return false;
+			const claim = expected.claim;
+			if (
+				expected.state === "claimed" &&
+				(!claim || claim.id !== id || claim.narratorId !== narratorId)
+			)
+				return false;
+			return (
+				db
+					.update(mailbox)
+					.set({
+						state: "failed",
+						metadataJson: JSON.stringify({
+							...metadata,
+							independentNewNarratorId: targetNarratorId,
+						}),
+						contentRevision: expected.revision + 1,
+						claimToken: null,
+						claimEpoch: null,
+						claimedAt: null,
+						lastError: boundedError(reason),
+						updatedAt: now(),
+					})
+					.where(
+						and(
+							eq(mailbox.id, id),
+							eq(mailbox.narratorId, narratorId),
+							eq(mailbox.kind, "user_input"),
+							eq(mailbox.state, expected.state),
+							eq(mailbox.contentRevision, expected.revision),
+							expected.metadataJson === null
+								? isNull(mailbox.metadataJson)
+								: eq(mailbox.metadataJson, expected.metadataJson),
+							expected.state === "claimed" && claim
+								? eq(mailbox.claimToken, claim.token)
+								: undefined,
+							expected.state === "claimed" && claim
+								? eq(mailbox.claimEpoch, claim.epoch)
+								: undefined,
+						),
+					)
+					.returning({ id: mailbox.id })
+					.all().length === 1
+			);
+		},
+		/** Durable receipt for an accepted independent target; payload is no longer needed. */
+		completeIndependentUserCommand(
+			narratorId: string,
+			id: string,
+			targetNarratorId: string,
+			expected: { revision: number; metadataJson: string | null },
+			reason: string,
+		) {
+			pointer(targetNarratorId);
+			const metadata = JSON.parse(expected.metadataJson ?? "{}");
+			if (
+				metadata.independentNewNarratorId !== targetNarratorId ||
+				metadata.independentNewCompleted
+			)
+				return false;
+			return (
+				db
+					.update(mailbox)
+					.set({
+						...releasedPayload,
+						metadataJson: JSON.stringify({
+							independentNewNarratorId: targetNarratorId,
+							independentNewCompleted: true,
+							stagingId: metadata.stagingId ?? id,
+							submissionFingerprint: metadata.submissionFingerprint,
+							submissionAttachments: metadata.submissionAttachments,
+						}),
+						state: "cancelled",
+						contentRevision: expected.revision + 1,
+						claimToken: null,
+						claimEpoch: null,
+						claimedAt: null,
+						lastError: boundedError(reason),
+						updatedAt: now(),
+					})
+					.where(
+						and(
+							eq(mailbox.id, id),
+							eq(mailbox.narratorId, narratorId),
+							eq(mailbox.kind, "user_input"),
+							eq(mailbox.state, "failed"),
+							eq(mailbox.contentRevision, expected.revision),
+							expected.metadataJson === null
+								? isNull(mailbox.metadataJson)
+								: eq(mailbox.metadataJson, expected.metadataJson),
+						),
+					)
+					.returning({ id: mailbox.id })
+					.all().length === 1
+			);
+		},
 		retryFailed(deliveryId: string) {
 			return (
 				db
 					.update(mailbox)
 					.set({ state: "queued", claimAttempts: 0, lastError: null, updatedAt: now() })
-					.where(and(eq(mailbox.deliveryId, deliveryId), eq(mailbox.state, "failed")))
+					.where(
+						and(
+							eq(mailbox.deliveryId, deliveryId),
+							eq(mailbox.state, "failed"),
+							sql`json_extract(${mailbox.metadataJson}, '$.independentNewNarratorId') IS NULL`,
+						),
+					)
 					.returning({ id: mailbox.id })
 					.all().length === 1
 			);
@@ -884,6 +1005,7 @@ export function createMailboxStore(db: RuntimeDb) {
 							eq(mailbox.kind, "user_input"),
 							eq(mailbox.state, "queued"),
 							isNull(mailbox.payloadRefJson),
+							sql`json_extract(${mailbox.metadataJson}, '$.independentNewNarratorId') IS NULL`,
 						),
 					)
 					.returning({ id: mailbox.id })

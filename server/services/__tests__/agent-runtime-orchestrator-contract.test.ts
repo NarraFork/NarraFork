@@ -63,6 +63,7 @@ const { settings } = await import("../../lib/settings");
 const { createPublicationOutbox } = await import("../agent-runtime/publication-outbox");
 const { acceptUserMessage } = await import("../narrator-session");
 const { enqueueInboxAgent } = await import("../agent-runtime/inbox");
+const { drainCommunicationWork } = await import("../agent-runtime/async-work");
 const MODEL = "orchestratorfixture:model";
 const adapter: ProviderAdapter = {
 	formatTools: () => [],
@@ -1144,7 +1145,8 @@ describe("native media input transitions follow the unified run control", () => 
 				undefined,
 				undefined,
 				undefined,
-				undefined,
+				// An edited control command may retain this intent; /new must win.
+				rich ? { controlCommand: true } : undefined,
 				undefined,
 				document,
 				rich ? undefined : media,
@@ -1162,9 +1164,22 @@ describe("native media input transitions follow the unified run control", () => 
 				completed.resolve(options.config.narratorId as string);
 				return finished;
 			});
+			const sourceHistory = db
+				.select()
+				.from(narratorMessageRefs)
+				.where(eq(narratorMessageRefs.narratorId, "contract-primary"))
+				.all();
 			await resumeNextBufferedMessage(source, "en");
 			const id = await completed.promise;
 			await getRunControl(id)?.terminal;
+			await drainCommunicationWork();
+			expect(
+				db
+					.select()
+					.from(narratorMessageRefs)
+					.where(eq(narratorMessageRefs.narratorId, "contract-primary"))
+					.all(),
+			).toEqual(sourceHistory);
 			expect(await getBufferedMessages("contract-primary")).toHaveLength(0);
 			expect(await getBufferedMessages(id)).toHaveLength(0);
 			activeNarrators.delete(id);
@@ -1172,6 +1187,294 @@ describe("native media input transitions follow the unified run control", () => 
 			setUploadsDirForTests(null);
 			rmSync(directory, { recursive: true, force: true });
 		});
+	for (const initialMessage of ["", "independent task"]) {
+		test(`promoted /new ${initialMessage || "(empty)"} creates independently while the source request stays in flight`, async () => {
+			const { enqueueBufferedMessage, getBufferedMessagesAsync } = await import(
+				"../narrator-buffer"
+			);
+			const { prepareIndependentQueuedNewCommand } = await import("../narrator-session");
+			const { withNarratorStartAdmission } = await import("../narrator-session-state");
+			const source = active("contract-primary");
+			activeNarrators.set(source.narratorId, source);
+			const started = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const calls: string[] = [];
+			spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
+				const id = options.config.narratorId as string;
+				calls.push(id);
+				if (id === source.narratorId) {
+					started.resolve();
+					await release.promise;
+					expect(source.abortController.signal.aborted).toBe(false);
+				} else {
+					expect(modelInputText(options)).toContain(initialMessage);
+					expect(modelInputText(options)).not.toContain("/new");
+				}
+				return finished;
+			});
+			const handle = await startNarratorRun({
+				narratorId: source.narratorId,
+				active: source,
+				locale: "en",
+				text: "original task",
+				principal: "principal-a",
+				deliver: false,
+			});
+			await started.promise;
+			// The low-level pass is scripted; reproduce the executor's working status.
+			db.update(narrators)
+				.set({ status: "working" })
+				.where(eq(narrators.id, source.narratorId))
+				.run();
+			const owner = getExecutionOwner(source.narratorId);
+			const control = getRunControl(source.narratorId);
+			const history = db
+				.select()
+				.from(narratorMessageRefs)
+				.where(eq(narratorMessageRefs.narratorId, source.narratorId))
+				.all();
+			try {
+				const buffered = await enqueueBufferedMessage(
+					source.narratorId,
+					`/new ${initialMessage}`,
+					undefined,
+					undefined,
+					"principal-b",
+				);
+				expect(buffered.ok).toBe(true);
+				const dispatch = await withNarratorStartAdmission(source.narratorId, () =>
+					prepareIndependentQueuedNewCommand(source.narratorId, buffered.id as string),
+				);
+				expect(dispatch).toBeDefined();
+				const newId = await dispatch?.();
+				expect(newId).toBeDefined();
+				await getRunControl(newId as string)?.terminal;
+				expect(calls).toEqual(
+					initialMessage ? [source.narratorId, newId as string] : [source.narratorId],
+				);
+				expect(getExecutionOwner(source.narratorId)).toBe(owner);
+				expect(getRunControl(source.narratorId)).toBe(control);
+				expect(source.abortController.signal.aborted).toBe(false);
+				expect(source._bufferSoftStop).not.toBe(true);
+				expect(source._bufferGuidancePending).not.toBe(true);
+				expect(source._currentUserId).toBe("principal-a");
+				expect((await narratorService.getById(source.narratorId)).status).toBe("working");
+				expect(
+					db
+						.select()
+						.from(narratorMessageRefs)
+						.where(eq(narratorMessageRefs.narratorId, source.narratorId))
+						.all(),
+				).toEqual(history);
+				expect(await getBufferedMessagesAsync(source.narratorId)).toHaveLength(0);
+				activeNarrators.delete(newId as string);
+			} finally {
+				release.resolve();
+				await handle.terminal;
+			}
+		});
+	}
+	test("independent /new retries preserve attachments and reuse a created target and accepted first input", async () => {
+		const buffer = await import("../narrator-buffer");
+		const { prepareIndependentQueuedNewCommand } = await import("../narrator-session");
+		const source = active("contract-primary");
+		activeNarrators.set(source.narratorId, source);
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const calls: string[] = [];
+		spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
+			calls.push(options.config.narratorId as string);
+			if (options.config.narratorId === source.narratorId) {
+				started.resolve();
+				await release.promise;
+			} else {
+				expect(modelInputText(options)).toContain("recover these notes");
+			}
+			return finished;
+		});
+		const handle = await startNarratorRun({
+			narratorId: source.narratorId,
+			active: source,
+			locale: "en",
+			text: "original task",
+			principal: "principal-a",
+			deliver: false,
+		});
+		await started.promise;
+		const owner = getExecutionOwner(source.narratorId);
+		const create = spyOn(narratorService, "create").mockRejectedValueOnce(
+			new Error("model unavailable before creation"),
+		);
+		try {
+			const queued = await buffer.enqueueBufferedMessage(
+				source.narratorId,
+				"/new recover these notes",
+				undefined,
+				undefined,
+				"principal-b",
+				undefined,
+				[new File(["durable notes"], "retry-notes.txt")],
+			);
+			const initial = await prepareIndependentQueuedNewCommand(source.narratorId, queued.id);
+			if (!initial) throw new Error("Missing independent dispatch");
+			// Settle worker-backed rejection before matching; pending .rejects can
+			// prevent Bun's test harness from pumping the worker response.
+			const initialError = await initial().then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			expect(String(initialError)).toContain("model unavailable before creation");
+			const [failed] = await buffer.getBufferedMessagesAsync(source.narratorId);
+			expect(failed).toMatchObject({ state: "failed", text: "/new recover these notes" });
+			expect(await failed.textFiles?.[0].text()).toBe("durable notes");
+			const targetId = failed._independentNewNarratorId;
+			if (!targetId) throw new Error("Missing reserved target");
+			const run = buffer.runIndependentBufferedCommand;
+			spyOn(buffer, "runIndependentBufferedCommand").mockImplementationOnce(
+				(id, mid, target, dispatch) =>
+					run(id, mid, target, async (message) => {
+						await dispatch(message);
+						throw new Error("result lost after target input acceptance");
+					}),
+			);
+			const retry = await prepareIndependentQueuedNewCommand(source.narratorId, queued.id, {
+				retry: true,
+			});
+			if (!retry) throw new Error("Missing retry");
+			const retryError = await retry().then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			expect(String(retryError)).toContain("result lost after target input acceptance");
+			await getRunControl(targetId)?.terminal;
+			const [retained] = await buffer.getBufferedMessagesAsync(source.narratorId);
+			expect(retained._independentNewNarratorId).toBe(targetId);
+			expect(await retained.textFiles?.[0].text()).toBe("durable notes");
+			const finish = await prepareIndependentQueuedNewCommand(source.narratorId, queued.id, {
+				retry: true,
+			});
+			if (!finish) throw new Error("Missing recovery dispatch");
+			expect(await finish()).toBe(targetId);
+			expect(create).toHaveBeenCalledTimes(2); // one definite failure, one actual creation
+			expect(calls).toEqual([source.narratorId, targetId]);
+			const inputs = db
+				.select({ id: narratorMessages.id })
+				.from(narratorMessageRefs)
+				.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
+				.where(eq(narratorMessageRefs.narratorId, targetId))
+				.all()
+				.filter(({ id }) =>
+					JSON.stringify(readTestMessageContent(sqlite, id)).includes("recover these notes"),
+				);
+			expect(inputs).toHaveLength(1);
+			expect(JSON.stringify(readTestMessageContent(sqlite, inputs[0].id))).toContain(
+				"retry-notes.txt",
+			);
+			expect(await buffer.getBufferedMessagesAsync(source.narratorId)).toHaveLength(0);
+			expect(getExecutionOwner(source.narratorId)).toBe(owner);
+			expect(source.abortController.signal.aborted).toBe(false);
+			expect(source._currentUserId).toBe("principal-a");
+			activeNarrators.delete(targetId);
+		} finally {
+			release.resolve();
+			await handle.terminal;
+		}
+	});
+	test("queued /new creation cannot delay the source's next queued input", async () => {
+		const { enqueueBufferedMessage } = await import("../narrator-buffer");
+		const release = Promise.withResolvers<void>();
+		let timedOut = false;
+		const create = narratorService.create;
+		spyOn(narratorService, "create").mockImplementation(async (...args) => {
+			await release.promise;
+			return create(...args);
+		});
+		const h = fixture(profiles[0], [
+			async () => {
+				await enqueueBufferedMessage(
+					"contract-primary",
+					"/new",
+					undefined,
+					undefined,
+					"principal-a",
+				);
+				await enqueueBufferedMessage(
+					"contract-primary",
+					"source followup",
+					undefined,
+					undefined,
+					"principal-a",
+				);
+				return finished;
+			},
+			async (options) => {
+				expect(modelInputText(options)).toContain("source followup");
+				return finished;
+			},
+		]);
+		// A guard releases a broken implementation so a failed assertion cannot strand the fixture.
+		const guard = setTimeout(() => {
+			timedOut = true;
+			release.resolve();
+		}, 3000);
+		try {
+			expect((await h.run()).hasError).toBe(false);
+			expect(h.calls).toHaveLength(2);
+			expect(timedOut).toBe(false);
+		} finally {
+			clearTimeout(guard);
+			release.resolve();
+			await drainCommunicationWork();
+		}
+	});
+	for (const fault of ["notification", "create"] as const) {
+		test(`queued /new ${fault} failure cannot fail or restart the source loop`, async () => {
+			const buffer = await import("../narrator-buffer");
+			const ws = await import("../../websocket/narrator-ws");
+			let sourceHistory: (typeof narratorMessageRefs.$inferSelect)[] = [];
+			const h = fixture(profiles[0], [
+				async () => {
+					sourceHistory = db
+						.select()
+						.from(narratorMessageRefs)
+						.where(eq(narratorMessageRefs.narratorId, "contract-primary"))
+						.all();
+					const queued = await buffer.enqueueBufferedMessage("contract-primary", "/new");
+					expect(queued.ok).toBe(true);
+					return finished;
+				},
+			]);
+			if (fault === "create") {
+				spyOn(narratorService, "create").mockImplementation(async () => {
+					expect(h.session.abortController.signal.aborted).toBe(false);
+					throw new Error("scripted creation failure");
+				});
+			} else {
+				const broadcast = ws.broadcastToNarrator;
+				spyOn(ws, "broadcastToNarrator").mockImplementation((id, event) => {
+					if (event.type === "queued_new_narrator_created") {
+						expect(h.session.abortController.signal.aborted).toBe(false);
+						throw new Error("scripted notification failure");
+					}
+					return broadcast(id, event);
+				});
+			}
+			expect((await h.run()).hasError).toBe(false);
+			await drainCommunicationWork();
+			expect(h.calls).toHaveLength(1);
+			expect((await narratorService.getById("contract-primary")).substatus).not.toContain("error");
+			const remaining = await buffer.getBufferedMessagesAsync("contract-primary");
+			expect(remaining).toHaveLength(fault === "create" ? 1 : 0);
+			if (fault === "create") expect(remaining[0]).toMatchObject({ state: "failed", text: "/new" });
+			expect(
+				db
+					.select()
+					.from(narratorMessageRefs)
+					.where(eq(narratorMessageRefs.narratorId, "contract-primary"))
+					.all(),
+			).toEqual(sourceHistory);
+		});
+	}
 	for (const transition of ["permission-feedback", "workspace-replay"] as const) {
 		test(`${transition}: committed input does not inherit current native refs`, async () => {
 			const { pendingFeedback } = await import("../narrator-session-state");

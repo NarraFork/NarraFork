@@ -1952,6 +1952,8 @@ export const narratorService = {
 	async create(
 		input: CreateNarratorInput,
 		options?: NarratorSurfaceReadBudget & {
+			/** Internal durable dispatch identity; never supplied by public create input. */
+			reservedId?: string;
 			expectedProject?: CreationProjectObservation;
 			inTransaction?: (
 				tx: NarratorCreationTransaction,
@@ -1960,6 +1962,12 @@ export const narratorService = {
 		},
 	) {
 		const prepared = await prepareNarratorCreation(input, options);
+		if (options?.reservedId) {
+			if (!/^[A-Za-z0-9_-]{21}$/u.test(options.reservedId)) {
+				throw new ValidationError("Invalid reserved narrator ID");
+			}
+			prepared.row.id = options.reservedId;
+		}
 		const insertNarrator = async () => {
 			const target = await narratorCreationWorkspaceTarget(prepared.row, options);
 			preparedWorkspaceAdmissions.set(prepared, {

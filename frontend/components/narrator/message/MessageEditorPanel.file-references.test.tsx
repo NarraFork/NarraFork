@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { clearTimeout as clearNativeTimeout, setTimeout as setNativeTimeout } from "node:timers";
+import { closestCenter, DndContext, useDndContext } from "@dnd-kit/core";
+import { SortableContext } from "@dnd-kit/sortable";
 import { Box, MantineProvider } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import {
@@ -35,6 +37,7 @@ import {
 	QueuedMessagesPanel,
 	type QueuedMessagesPanelProps,
 } from "../interaction/QueuedMessagesPanel";
+import { moveQueuedTurn } from "../interaction/queue-message-mode";
 import type { QueuedEditPayload } from "../interaction/queued-attachment-edit";
 import {
 	type UseQueuedMessageActionsOptions,
@@ -1742,6 +1745,215 @@ describe("inline queued message mode actions", () => {
 		expect(change.mock.calls).toEqual([["queue-message", "tool"]]);
 	});
 });
+describe("retry-only queued control commands", () => {
+	test.each([
+		"turn",
+		"tool",
+		"interrupt",
+	] as const)("%s reserved row is excluded from real dnd registrations' enabled collision targets", async (queueMode) => {
+		let dnd!: ReturnType<typeof useDndContext>;
+		function DndProbe() {
+			dnd = useDndContext();
+			return null;
+		}
+		const messages: BufferMessageSummary[] = [
+			{ id: "A", text: "A", bufferedAt: "now", imageCount: 0, queueMode: "turn" },
+			{
+				id: "R",
+				text: "/new task",
+				bufferedAt: "now",
+				imageCount: 0,
+				queueMode,
+				state: "failed",
+				retryOnly: true,
+			},
+			{ id: "B", text: "B", bufferedAt: "now", imageCount: 0, queueMode: "turn" },
+		];
+		await render(
+			<DndContext collisionDetection={closestCenter}>
+				<SortableContext items={["A", "B"]}>
+					{messages.map((msg) => (
+						<div key={msg.id}>{queueRow({ msg })}</div>
+					))}
+					<DndProbe />
+				</SortableContext>
+			</DndContext>,
+		);
+		// These are the real useSortable/useDroppable registrations, not hook mocks.
+		expect(dnd.droppableContainers.get("R")?.disabled).toBe(true);
+		const enabled = dnd.droppableContainers.getEnabled();
+		expect(enabled.map(({ id }) => id)).toEqual(["A", "B"]);
+		for (const id of ["A", "B"]) {
+			const handle = document.querySelector(
+				`[data-queue-message-row="${id}"] [data-queue-drag-handle]`,
+			);
+			expect(handle?.getAttribute("aria-disabled")).toBe("false");
+		}
+		// linkedom has no layout: inject rectangles into the real collision algorithm.
+		// A overlaps R's lower half, where the old boolean-disabled R wins closestCenter.
+		const rect = (top: number) => ({
+			left: 0,
+			right: 100,
+			top,
+			bottom: top + 40,
+			width: 100,
+			height: 40,
+		});
+		const droppableRects = new Map([
+			["A", rect(0)],
+			["R", rect(80)],
+			["B", rect(160)],
+		]);
+		const collisionArgs = {
+			active: {
+				id: "A",
+				data: { current: {} },
+				rect: { current: { initial: rect(0), translated: rect(90) } },
+			},
+			collisionRect: rect(90),
+			droppableRects,
+			pointerCoordinates: null,
+		};
+		expect(
+			closestCenter({
+				...collisionArgs,
+				droppableContainers: dnd.droppableContainers.toArray(),
+			})[0]?.id,
+		).toBe("R");
+		const collisions = closestCenter({ ...collisionArgs, droppableContainers: enabled });
+		expect(collisions.map(({ id }) => id)).toEqual(["B", "A"]);
+		expect(moveQueuedTurn(messages, "A", String(collisions[0]?.id)).map(({ id }) => id)).toEqual([
+			"B",
+			"R",
+			"A",
+		]);
+	});
+
+	test("edit-lock still disables dragging without disabling ordinary drop targets", async () => {
+		let dnd!: ReturnType<typeof useDndContext>;
+		function DndProbe() {
+			dnd = useDndContext();
+			return null;
+		}
+		await render(
+			<DndContext>
+				<SortableContext items={["locked"]}>
+					{queueRow({
+						msg: { id: "locked", text: "locked", bufferedAt: "now", imageCount: 0 },
+						queueMutationsDisabled: true,
+					})}
+					<DndProbe />
+				</SortableContext>
+			</DndContext>,
+		);
+		expect(dnd.droppableContainers.get("locked")?.disabled).toBe(false);
+		expect(document.querySelector("[data-queue-drag-handle]")?.getAttribute("aria-disabled")).toBe(
+			"true",
+		);
+	});
+
+	test.each([
+		"turn",
+		"tool",
+		"interrupt",
+	] as const)("%s reserved rows expose explicit Retry and Remove without edit, mode or sort controls", async (queueMode) => {
+		const message: BufferMessageSummary = {
+			id: "reserved-new",
+			text: "/new target task",
+			bufferedAt: "now",
+			imageCount: 0,
+			state: "failed",
+			error: "Target initialization failed",
+			retryOnly: true,
+			queueMode,
+		};
+		const retry = mock(async () => ({ ok: true as const, resumed: false }));
+		const remove = mock(() => {});
+		const edit = mock(() => {});
+		const change = mock(async () => true);
+		const move = mock(() => {});
+		await render(
+			queuePanel({
+				queuedMessages: [message],
+				handleRetryQueued: retry,
+				handleRemoveQueued: remove,
+				handleStartEditQueued: edit,
+				handleChangeMode: change,
+				handleMoveQueued: move,
+			}),
+		);
+		expect(button(en.queuedRetry).disabled).toBe(false);
+		expect(button(en.cancelBuffer).disabled).toBe(false);
+		expect(document.querySelector("[data-queue-drag-handle]")).toBeNull();
+		for (const label of [
+			en.queuedActions,
+			en.queuedSwitchToGuidance,
+			en.queuedSwitchToNextStep,
+			en.queuedSendUrgently,
+			en.queuedUrgentRetry,
+		])
+			expect(document.querySelector(`button[aria-label="${label}"]`)).toBeNull();
+		await act(async () =>
+			button(en.queuedExpandText).dispatchEvent(new Event("dblclick", { bubbles: true })),
+		);
+		await click(button(en.queuedRetry));
+		expect(retry).toHaveBeenCalledWith(message.id);
+		await click(button(en.cancelBuffer));
+		expect(remove).toHaveBeenCalledWith(message.id);
+		expect(edit).not.toHaveBeenCalled();
+		expect(change).not.toHaveBeenCalled();
+		expect(move).not.toHaveBeenCalled();
+	});
+
+	test("a stale editing prop cannot render an editor for a retry-only row", async () => {
+		await render(
+			queueRow({
+				msg: {
+					id: "reserved",
+					text: "/new next",
+					bufferedAt: "now",
+					imageCount: 0,
+					retryOnly: true,
+					state: "failed",
+				},
+				isEditing: true,
+			}),
+		);
+		expect(document.querySelector(".ProseMirror")).toBeNull();
+		expect(button(en.queuedRetry).disabled).toBe(false);
+		expect(button("Cancel").disabled).toBe(false);
+	});
+
+	test.each([
+		"turn",
+		"tool",
+	] as const)("ordinary failed %s rows keep edit and mode controls", async (queueMode) => {
+		const message: BufferMessageSummary = {
+			id: "ordinary-failed",
+			text: "Editable failure",
+			bufferedAt: "now",
+			imageCount: 0,
+			state: "failed",
+			queueMode,
+		};
+		const edit = mock(() => {});
+		const change = mock(async () => true);
+		await render(queueRow({ msg: message, onStartEdit: edit, onChangeMode: change }));
+		expect(button(en.queuedRetry).disabled).toBe(false);
+		expect(button(en.queuedSendUrgently).disabled).toBe(true);
+		const toggle = button(
+			queueMode === "turn" ? en.queuedSwitchToGuidance : en.queuedSwitchToNextStep,
+		);
+		expect(toggle.disabled).toBe(false);
+		await click(toggle);
+		expect(change).toHaveBeenCalledWith(message.id, queueMode === "turn" ? "tool" : "turn");
+		await act(async () =>
+			button(en.queuedExpandText).dispatchEvent(new Event("dblclick", { bubbles: true })),
+		);
+		expect(edit).toHaveBeenCalledWith(message);
+	});
+});
+
 describe("failed queued message retry UI", () => {
 	test("failed rows show full reason, input, attachments and explicit retry; queued/legacy rows do not", async () => {
 		await render(queueRow());

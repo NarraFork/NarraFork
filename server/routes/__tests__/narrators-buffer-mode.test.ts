@@ -36,6 +36,9 @@ function fixture(
 		deliveryError?: AppError;
 		deliveryGate?: Promise<void>;
 		receiptState?: "claimed" | "materialized";
+		independentNew?: boolean;
+		independentReceipt?: boolean;
+		independentError?: boolean;
 	} = {},
 ) {
 	let rows = options.rows ?? [{ id: "message", state: "queued", queueMode: "turn" }];
@@ -64,7 +67,34 @@ function fixture(
 		order.push("read");
 		return rows;
 	});
+	const independentDispatch = mock(async () => {
+		expect(locked).toBe(false);
+		order.push("independent-new");
+		if (options.independentError) throw new Error("New narrator failed");
+		rows = rows.filter((row) => row.id !== "message");
+		return "new-narrator";
+	});
+	const prepareIndependentNew = mock(
+		async (_id: string, _mid: string, prepareOptions?: { retry?: boolean }) => {
+			expect(locked).toBe(true);
+			if (options.independentReceipt) {
+				order.push("receipt-new");
+				return independentDispatch;
+			}
+			const target = rows.find((row) => row.id === "message");
+			if (
+				!options.independentNew ||
+				!target ||
+				(target.state === "failed" && !prepareOptions?.retry)
+			)
+				return undefined;
+			order.push("take-new");
+			rows = rows.map((row) => (row.id === "message" ? { ...row, state: "failed" as const } : row));
+			return independentDispatch;
+		},
+	);
 	const services = {
+		prepareIndependentQueuedNewCommand: prepareIndependentNew,
 		withNarratorStartAdmission: async (_id: string, callback: () => Promise<void>) => {
 			locked = true;
 			try {
@@ -139,6 +169,8 @@ function fixture(
 	return {
 		controls,
 		clears,
+		independentDispatch,
+		prepareIndependentNew,
 		order,
 		update,
 		retryMutation,
@@ -402,4 +434,73 @@ describe("buffer mode HTTP mutation", () => {
 			["session", false],
 		]);
 	});
+});
+
+describe("queued /new mode isolation", () => {
+	for (const mode of ["tool", "interrupt"] as const) {
+		test(`${mode} dispatches /new outside source admission without controls, wake or delivery wait`, async () => {
+			const f = fixture({ independentNew: true });
+			const response = await f.mode({ mode });
+			expect(response.status).toBe(200);
+			expect(await response.json()).toEqual({ ok: true, newNarratorId: "new-narrator" });
+			expect(f.update).not.toHaveBeenCalled();
+			expect(f.controls).toEqual([]);
+			expect(f.clears).toEqual([]);
+			expect(f.order).toEqual(["take-new", "independent-new", "broadcast"]);
+			expect(f.independentDispatch).toHaveBeenCalledTimes(1);
+		});
+		test(`failed ${mode} /new retry does not signal the source or wait for source delivery`, async () => {
+			const f = fixture({
+				independentNew: true,
+				rows: [{ id: "message", state: "failed", queueMode: mode }],
+			});
+			const response = await f.retry();
+			expect(response.status).toBe(200);
+			expect(await response.json()).toEqual({
+				ok: true,
+				resumed: false,
+				newNarratorId: "new-narrator",
+			});
+			expect(f.update).not.toHaveBeenCalled();
+			expect(f.controls).toEqual([]);
+			expect(f.retryMutation).not.toHaveBeenCalled();
+			expect(f.order).toEqual(["read", "take-new", "independent-new", "broadcast"]);
+		});
+	}
+	test("turn mode remains queued rather than creating a narrator early", async () => {
+		const f = fixture({ independentNew: true });
+		expect((await f.mode({ mode: "turn" })).status).toBe(200);
+		expect(f.prepareIndependentNew).not.toHaveBeenCalled();
+		expect(f.independentDispatch).not.toHaveBeenCalled();
+		expect(f.rows()).toHaveLength(1);
+	});
+	test("independent creation failure retains retryable input without interrupting or requeueing source", async () => {
+		const f = fixture({ independentNew: true, independentError: true });
+		expect((await f.mode({ mode: "interrupt" })).status).toBe(500);
+		expect(f.controls).toEqual([]);
+		expect(f.update).not.toHaveBeenCalled();
+		expect(f.order).toEqual(["take-new", "independent-new", "broadcast"]);
+		expect(f.rows()).toEqual([{ id: "message", state: "failed", queueMode: "turn" }]);
+		expect(f.independentDispatch).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("independent /new completed receipts", () => {
+	for (const operation of ["mode", "retry"] as const) {
+		test(`${operation} replays the target receipt after source queue removal without signaling its runtime`, async () => {
+			const f = fixture({ rows: [], independentReceipt: true });
+			const response = operation === "mode" ? await f.mode({ mode: "interrupt" }) : await f.retry();
+			expect(response.status).toBe(200);
+			expect(await response.json()).toMatchObject({ ok: true, newNarratorId: "new-narrator" });
+			expect(f.update).not.toHaveBeenCalled();
+			expect(f.retryMutation).not.toHaveBeenCalled();
+			expect(f.controls).toEqual([]);
+			expect(f.order).toEqual([
+				...(operation === "retry" ? ["read"] : []),
+				"receipt-new",
+				"independent-new",
+				"broadcast",
+			]);
+		});
+	}
 });

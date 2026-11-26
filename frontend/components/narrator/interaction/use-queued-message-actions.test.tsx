@@ -10,6 +10,7 @@ import {
 	type UseQueuedMessageActionsOptions,
 	useQueuedMessageActions,
 } from "./use-queued-message-actions";
+import { useQueuedMessageEdit } from "./use-queued-message-edit";
 
 const entry = (id: string, queueMode?: "turn" | "tool" | "interrupt"): BufferMessageSummary => ({
 	id,
@@ -94,6 +95,106 @@ test("ordinary movement preserves guidance and rejects guidance drags", () => {
 	expect(moveQueuedTurn(queue, "a", "b").map((m) => m.id)).toEqual(["b", "guide", "a"]);
 	expect(moveQueuedTurn(queue, "guide", "a")).toBe(queue);
 });
+test.each([
+	"turn",
+	"tool",
+	"interrupt",
+] as const)("retry-only %s rows reject editing, mode changes and movement but allow retry/removal", async (queueMode) => {
+	const reserved: BufferMessageSummary = {
+		...entry("reserved", queueMode),
+		state: "failed",
+		retryOnly: true,
+	};
+	queue = [entry("a"), reserved, entry("b")];
+	options = { ...options, queuedMessages: queue };
+	await act(async () => root.render(<Probe />));
+	const edit = spyOn(api, "beginBufferedMessageEdit");
+	const change = spyOn(api, "setBufferedMessageMode");
+	const reorder = spyOn(api, "reorderBufferedMessages");
+	const retry = spyOn(api, "retryBufferedMessage").mockResolvedValue({ ok: true, resumed: false });
+	const remove = spyOn(api, "removeBufferedMessage").mockResolvedValue({ ok: true });
+	await act(async () => {
+		await actions.handleStartEditQueued(reserved);
+		for (const mode of ["turn", "tool", "interrupt"] as const)
+			expect(await actions.handleChangeMode(reserved.id, mode)).toBe(false);
+		actions.handleMoveQueued(reserved.id, -1);
+		actions.handleMoveQueued(reserved.id, 1);
+		actions.handleDragEndQueued({ active: { id: reserved.id }, over: { id: "a" } } as Parameters<
+			typeof actions.handleDragEndQueued
+		>[0]);
+	});
+	expect(moveQueuedTurn(queue, reserved.id, "a")).toBe(queue);
+	expect(moveQueuedTurn(queue, "a", reserved.id)).toBe(queue);
+	expect(edit).not.toHaveBeenCalled();
+	expect(change).not.toHaveBeenCalled();
+	expect(reorder).not.toHaveBeenCalled();
+	expect(actions.editingQueuedId).toBeNull();
+	await act(async () => {
+		expect(await actions.handleRetryQueued(reserved.id)).toEqual({ ok: true, resumed: false });
+	});
+	expect(retry).toHaveBeenCalledWith("n", reserved.id);
+	await act(async () => actions.handleRemoveQueued(reserved.id));
+	expect(remove).toHaveBeenCalledWith("n", reserved.id);
+	expect(queue.map((message) => message.id)).toEqual(["a", "b"]);
+});
+
+test("retry-only ordinary rows keep fixed slots while reorder sends all ordinary IDs", async () => {
+	const reserved = { ...entry("reserved"), retryOnly: true, state: "failed" as const };
+	queue = [entry("a"), reserved, entry("guide", "tool"), entry("b")];
+	options = { ...options, queuedMessages: queue };
+	await act(async () => root.render(<Probe />));
+	const reorder = spyOn(api, "reorderBufferedMessages").mockResolvedValue({ ok: true });
+	await act(async () => actions.handleMoveQueued("b", -1));
+	expect(queue.map((message) => message.id)).toEqual(["b", "reserved", "guide", "a"]);
+	expect(queue[1]).toBe(reserved);
+	expect(reorder).toHaveBeenCalledWith("n", ["b", "reserved", "a"]);
+});
+
+test("edit hook rejects retry-only admission and saving with stale editable snapshots", async () => {
+	let edit!: ReturnType<typeof useQueuedMessageEdit>;
+	function EditProbe() {
+		edit = useQueuedMessageEdit(options);
+		return null;
+	}
+	const reserved = { ...entry("reserved"), retryOnly: true };
+	options = { ...options, queuedMessages: [reserved] };
+	await act(async () => root.render(<EditProbe />));
+	const begin = spyOn(api, "beginBufferedMessageEdit");
+	const update = spyOn(api, "updateBufferedMessage").mockResolvedValue({ ok: true });
+	await act(async () => {
+		await edit.handleStartEditQueued(reserved);
+		await edit.handleStartEditQueued({ ...reserved, retryOnly: undefined });
+	});
+	expect(begin).not.toHaveBeenCalled();
+	queue = [entry("a")];
+	options = { ...options, queuedMessages: queue };
+	await act(async () => root.render(<EditProbe />));
+	await act(async () => edit.handleStartEditQueued(queue[0]));
+	expect(edit.editingQueuedId).toBe("a");
+	const stale = queue[0];
+	options = { ...options, queuedMessages: [{ ...stale, retryOnly: true }] };
+	await act(async () => root.render(<EditProbe />));
+	await act(async () => {
+		expect(
+			await edit.handleSaveEditQueued(stale, "changed", {
+				keepImageIds: [],
+				keepTextFiles: [],
+				newImages: [],
+				newTextFiles: [],
+			}),
+		).toBe(false);
+	});
+	expect(update).not.toHaveBeenCalled();
+});
+
+test("fresh retry-only edit snapshot releases admission without opening an editor", async () => {
+	spyOn(api, "getBufferedMessages").mockResolvedValue([{ ...queue[0], retryOnly: true }]);
+	await act(async () => actions.handleStartEditQueued(queue[0]));
+	expect(queue[0].retryOnly).toBe(true);
+	expect(actions.editingQueuedId).toBeNull();
+	expect(api.releaseBufferedMessageEdit).toHaveBeenCalledWith("n", "a", expect.any(String));
+});
+
 test("remove and clear never restore input, even on removal failure", async () => {
 	spyOn(api, "removeBufferedMessage").mockRejectedValue(new Error("gone"));
 	await act(async () => actions.handleRemoveQueued("a"));
@@ -251,6 +352,103 @@ test("urgent dispatch hides ordinary rows, requires delivery ACK and suppresses 
 	await act(async () => root.render(<Probe />));
 	expect(actions.visibleQueuedMessages.some((m) => m.id === "a")).toBe(false);
 	expect(actions.urgentDispatches).toEqual([]);
+});
+
+test.each([
+	"tool",
+	"interrupt",
+] as const)("queued /new changed to %s completes without source delivery", async (mode) => {
+	const response = { ok: true as const, newNarratorId: "new-narrator" };
+	const request = spyOn(api, "setBufferedMessageMode").mockResolvedValue(response);
+	options.queuedMessages[0].text = "/new another task";
+	await act(async () => {
+		expect(await actions.handleChangeMode("a", mode)).toBe(true);
+	});
+	expect(request).toHaveBeenCalledWith("n", "a", mode);
+	expect(response).toEqual({ ok: true, newNarratorId: "new-narrator" });
+	expect(queue.map((message) => message.id)).toEqual(["guide", "b"]);
+	expect(actions.urgentDispatches).toEqual([]);
+	expect(options.reconcileBufferedMessages).toHaveBeenCalledTimes(1);
+	expect(notifications.show).not.toHaveBeenCalled();
+	// A delayed buffer snapshot cannot restore the consumed control command.
+	await act(async () => root.render(<Probe />));
+	expect(actions.visibleQueuedMessages.map((message) => message.id)).toEqual(["guide", "b"]);
+	expect(queue.map((message) => message.id)).toEqual(["guide", "b"]);
+});
+
+test("retry-created narrator is terminal even when the source did not resume", async () => {
+	options.queuedMessages[0] = { ...entry("a"), text: "/new another task", state: "failed" };
+	await act(async () => root.render(<Probe />));
+	const response = { ok: true as const, resumed: false, newNarratorId: "new-narrator" };
+	const retry = spyOn(api, "retryBufferedMessage").mockResolvedValue(response);
+	await act(async () => {
+		expect(await actions.handleRetryQueued("a")).toBe(response);
+	});
+	expect(retry).toHaveBeenCalledWith("n", "a");
+	expect(response).toEqual({ ok: true, resumed: false, newNarratorId: "new-narrator" });
+	expect(queue.map((message) => message.id)).toEqual(["guide", "b"]);
+	expect(options.reconcileBufferedMessages).toHaveBeenCalledTimes(1);
+	expect(notifications.show).not.toHaveBeenCalled();
+	await act(async () => root.render(<Probe />));
+	expect(actions.visibleQueuedMessages.map((message) => message.id)).toEqual(["guide", "b"]);
+	expect(actions.urgentDispatches).toEqual([]);
+});
+
+test("ordinary retry without a new narrator refreshes without claiming consumption", async () => {
+	spyOn(api, "retryBufferedMessage").mockResolvedValue({ ok: true, resumed: false });
+	const snapshot = queue;
+	await act(async () => {
+		expect(await actions.handleRetryQueued("a")).toEqual({ ok: true, resumed: false });
+	});
+	expect(queue).toBe(snapshot);
+	expect(actions.urgentDispatches).toEqual([]);
+	expect(options.reconcileBufferedMessages).toHaveBeenCalledTimes(1);
+});
+
+test("failed /new interrupt retry stops before PATCH when retry already created a narrator", async () => {
+	options = {
+		...options,
+		queuedMessages: [{ ...entry("a", "interrupt"), text: "/new another task", state: "failed" }],
+	};
+	await act(async () => root.render(<Probe />));
+	const retry = spyOn(api, "retryBufferedMessage").mockResolvedValue({
+		ok: true,
+		resumed: false,
+		newNarratorId: "new-narrator",
+	});
+	const mode = spyOn(api, "setBufferedMessageMode");
+	await act(async () => {
+		expect(await actions.handleChangeMode("a", "interrupt")).toBe(true);
+	});
+	expect(retry).toHaveBeenCalledWith("n", "a");
+	expect(mode).not.toHaveBeenCalled();
+	expect(queue.map((message) => message.id)).not.toContain("a");
+	expect(actions.urgentDispatches).toEqual([]);
+	expect(options.reconcileBufferedMessages).toHaveBeenCalledTimes(1);
+	expect(notifications.show).not.toHaveBeenCalled();
+});
+
+test("late retry /new receipt cannot consume another narrator's queue", async () => {
+	const receipt = Promise.withResolvers<{
+		ok: true;
+		resumed: boolean;
+		newNarratorId: string;
+	}>();
+	spyOn(api, "retryBufferedMessage").mockReturnValue(receipt.promise);
+	let result: ReturnType<typeof actions.handleRetryQueued> | undefined;
+	await act(async () => {
+		result = actions.handleRetryQueued("a");
+	});
+	options = { ...options, narratorId: "other", queuedMessages: [entry("a")] };
+	await act(async () => root.render(<Probe />));
+	const response = { ok: true as const, resumed: false, newNarratorId: "new-narrator" };
+	await act(async () => {
+		receipt.resolve(response);
+		expect(await result).toBe(response);
+	});
+	expect(queue.map((message) => message.id)).toContain("a");
+	expect(actions.visibleQueuedMessages.map((message) => message.id)).toEqual(["a"]);
+	expect(options.reconcileBufferedMessages).not.toHaveBeenCalled();
 });
 
 test("legacy ok and timeout retain payload for retry rather than claim delivery", async () => {

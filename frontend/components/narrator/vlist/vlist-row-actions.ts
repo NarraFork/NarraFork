@@ -44,7 +44,7 @@ export interface VListRowHandlers {
 	/** Resolve mailbox controls for a canonical queued user message. */
 	resolveQueuedMessage?: (messageId: string) =>
 		| {
-				onEdit: () => void;
+				onEdit?: () => void;
 				onCancel: () => void;
 				onRetry?: () => void;
 		  }
@@ -228,7 +228,7 @@ export interface VListRowActionTarget {
 	messageId: string;
 	/** Mailbox controls for a canonical queued user row, when one is present. */
 	queued?: {
-		onEdit: () => void;
+		onEdit?: () => void;
 		onCancel: () => void;
 		onRetry?: () => void;
 	};

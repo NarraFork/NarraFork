@@ -306,6 +306,86 @@ afterEach(async () => {
 	originals.clear();
 });
 
+test("retry-only summaries survive panel snapshots and every WS buffer update", async () => {
+	const summary = {
+		id: "reserved-new",
+		text: "/new target task",
+		bufferedAt: "now",
+		imageCount: 0,
+		state: "failed" as const,
+		retryOnly: true,
+		queueMode: "turn" as const,
+	};
+	panelSpy.mockResolvedValue(page([], { buffer: [summary] }));
+	await render();
+	expect(current.queuedMessages).toEqual([summary]);
+	for (const type of ["buffer_set", "buffer_preserved", "buffer_consumed"]) {
+		await event({ type: "buffer_set", messages: [] });
+		await event({
+			type,
+			messages: [summary],
+			messageId: "other",
+			remaining: [summary],
+		});
+		expect(current.queuedMessages).toEqual([summary]);
+		expect(current.queuedMessages[0].retryOnly).toBe(true);
+	}
+});
+
+test("queued /new WS receipt refreshes lists and the new detail, then requests navigation only", async () => {
+	const navigated: string[] = [];
+	function QueuedNewHarness() {
+		current = useNarratorPanelWS({
+			narratorId,
+			narratorStatus,
+			isAtBottomRef: { current: true },
+			onQueuedNewNarratorCreated: (id) => navigated.push(id),
+		});
+		return null;
+	}
+	const keys = [
+		["narrators"],
+		["narrators", { archived: false }],
+		["narrators", "paginated"],
+		["narrators", "new-narrator"],
+		["narrators", "n1"],
+		["narrators", "n1", "tasks", "current"],
+		["narrators", "new-narrator", "tasks", "current"],
+	];
+	for (const key of keys) qc.setQueryData(key, {});
+	await act(async () => {
+		root.render(
+			<QueryClientProvider client={qc}>
+				<I18nextProvider i18n={instance}>
+					<QueuedNewHarness />
+				</I18nextProvider>
+			</QueryClientProvider>,
+		);
+	});
+	await event({
+		type: "buffer_set",
+		messages: [{ id: "queued-new", text: "/new next task", bufferedAt: "t", imageCount: 0 }],
+	});
+	expect(current.queuedMessages.map((message) => message.id)).toEqual(["queued-new"]);
+	await event({ type: "buffer_consumed", messageId: "queued-new", remaining: [] });
+	await event({
+		type: "queued_new_narrator_created",
+		messageId: "queued-new",
+		newNarratorId: "new-narrator",
+	});
+	expect(current.queuedMessages).toEqual([]);
+	expect(navigated).toEqual(["new-narrator"]);
+	expect(keys.map((key) => qc.getQueryState(key)?.isInvalidated)).toEqual([
+		true,
+		true,
+		true,
+		true,
+		false,
+		false,
+		false,
+	]);
+});
+
 describe("upstream timed wait notifications with the real WS hook", () => {
 	test.each([
 		["capacity", "capacity"],

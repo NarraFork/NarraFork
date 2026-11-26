@@ -692,9 +692,9 @@ if (process.env[CHILD_ENV] !== "1") {
 			const { executeQueuedNewCommand } = await import("../narrator-session");
 			const active = {
 				narratorId: child.id,
-				abortController: new AbortController(),
+				locale: "en",
 				cwd: process.env.HOME as string,
-			} as Parameters<typeof executeQueuedNewCommand>[0];
+			} satisfies Parameters<typeof executeQueuedNewCommand>[0];
 			const newId = await executeQueuedNewCommand(
 				active,
 				{
@@ -720,9 +720,9 @@ if (process.env[CHILD_ENV] !== "1") {
 			const { executeQueuedNewCommand } = await import("../narrator-session");
 			const active = {
 				narratorId: child.id,
-				abortController: new AbortController(),
+				locale: "en",
 				cwd: process.env.HOME as string,
-			} as Parameters<typeof executeQueuedNewCommand>[0];
+			} satisfies Parameters<typeof executeQueuedNewCommand>[0];
 			const newId = await executeQueuedNewCommand(
 				active,
 				{
@@ -742,9 +742,9 @@ if (process.env[CHILD_ENV] !== "1") {
 			const { executeQueuedNewCommand } = await import("../narrator-session");
 			const active = {
 				narratorId: child.id,
-				abortController: new AbortController(),
+				locale: "en",
 				cwd: process.env.HOME as string,
-			} as Parameters<typeof executeQueuedNewCommand>[0];
+			} satisfies Parameters<typeof executeQueuedNewCommand>[0];
 			const newId = await executeQueuedNewCommand(
 				active,
 				{

@@ -2025,7 +2025,7 @@ export function createPostgresRuntimeQueue(
 					.limit(L.userPending)
 					.for("update");
 				const row = rows.find((row) => row.id === id);
-				if (!row) return false;
+				if (!row || JSON.parse(row.metadataJson ?? "{}").independentNewNarratorId) return false;
 				const updated = await tx
 					.update(mailbox)
 					.set({
@@ -2089,6 +2089,7 @@ export function createPostgresRuntimeQueue(
 							eq(mailbox.kind, "user_input"),
 							inArray(mailbox.state, ["queued", "failed"]),
 							eq(mailbox.contentRevision, expectedContentRevision),
+							sql`(${mailbox.metadataJson}::jsonb ->> 'independentNewNarratorId') IS NULL`,
 						),
 					)
 					.returning({ id: mailbox.id });
@@ -2343,18 +2344,147 @@ export function createPostgresRuntimeQueue(
 				return { recovered, nextAfterId: page.length > limit ? page[limit - 1]?.id : undefined };
 			});
 		},
+		/** Named independent-command CAS; intentionally never reads or changes an execution owner. */
+		holdIndependentUserCommand(
+			narratorId: string,
+			id: string,
+			targetNarratorId: string,
+			expected: {
+				state: "queued" | "failed" | "claimed";
+				revision: number;
+				metadataJson: string | null;
+				claim?: MailboxClaim;
+			},
+			reason: string,
+		): Promise<boolean> {
+			pointer(narratorId);
+			pointer(id);
+			pointer(targetNarratorId);
+			const metadata = JSON.parse(expected.metadataJson ?? "{}");
+			if (
+				metadata.independentNewNarratorId &&
+				metadata.independentNewNarratorId !== targetNarratorId
+			)
+				return Promise.resolve(false);
+			const claim = expected.claim;
+			if (
+				expected.state === "claimed" &&
+				(!claim || claim.id !== id || claim.narratorId !== narratorId)
+			)
+				return Promise.resolve(false);
+			return runSection("mailbox.holdIndependentUserCommand", async (tx) => {
+				const updated = await tx
+					.update(mailbox)
+					.set({
+						state: "failed",
+						metadataJson: JSON.stringify({
+							...metadata,
+							independentNewNarratorId: targetNarratorId,
+						}),
+						contentRevision: expected.revision + 1,
+						claimToken: null,
+						claimEpoch: null,
+						claimedAt: null,
+						lastError: boundedError(reason),
+						updatedAt: now(),
+					})
+					.where(
+						and(
+							eq(mailbox.id, id),
+							eq(mailbox.narratorId, narratorId),
+							eq(mailbox.kind, "user_input"),
+							eq(mailbox.state, expected.state),
+							eq(mailbox.contentRevision, expected.revision),
+							expected.metadataJson === null
+								? isNull(mailbox.metadataJson)
+								: eq(mailbox.metadataJson, expected.metadataJson),
+							expected.state === "claimed" && claim
+								? eq(mailbox.claimToken, claim.token)
+								: undefined,
+							expected.state === "claimed" && claim
+								? eq(mailbox.claimEpoch, claim.epoch)
+								: undefined,
+						),
+					)
+					.returning({ id: mailbox.id });
+				return updated.length === 1;
+			});
+		},
+		/** Accepted-target receipt survives payload cleanup and an ambiguous commit response. */
+		completeIndependentUserCommand(
+			narratorId: string,
+			id: string,
+			targetNarratorId: string,
+			expected: { revision: number; metadataJson: string | null },
+			reason: string,
+		): Promise<boolean> {
+			pointer(narratorId);
+			pointer(id);
+			pointer(targetNarratorId);
+			const metadata = JSON.parse(expected.metadataJson ?? "{}");
+			if (
+				metadata.independentNewNarratorId !== targetNarratorId ||
+				metadata.independentNewCompleted
+			)
+				return Promise.resolve(false);
+			return runSection("mailbox.completeIndependentUserCommand", async (tx) => {
+				const updated = await tx
+					.update(mailbox)
+					.set({
+						...releasedPayload,
+						metadataJson: JSON.stringify({
+							independentNewNarratorId: targetNarratorId,
+							independentNewCompleted: true,
+							stagingId: metadata.stagingId ?? id,
+							submissionFingerprint: metadata.submissionFingerprint,
+							submissionAttachments: metadata.submissionAttachments,
+						}),
+						state: "cancelled",
+						contentRevision: expected.revision + 1,
+						claimToken: null,
+						claimEpoch: null,
+						claimedAt: null,
+						lastError: boundedError(reason),
+						updatedAt: now(),
+					})
+					.where(
+						and(
+							eq(mailbox.id, id),
+							eq(mailbox.narratorId, narratorId),
+							eq(mailbox.kind, "user_input"),
+							eq(mailbox.state, "failed"),
+							eq(mailbox.contentRevision, expected.revision),
+							expected.metadataJson === null
+								? isNull(mailbox.metadataJson)
+								: eq(mailbox.metadataJson, expected.metadataJson),
+						),
+					)
+					.returning({ id: mailbox.id });
+				return updated.length === 1;
+			});
+		},
 		retryFailed(deliveryId: string): Promise<boolean> {
 			return runSection("mailbox.retryFailed", async (tx) => {
 				const updated = await tx
 					.update(mailbox)
 					.set({ state: "queued", claimAttempts: 0, lastError: null, updatedAt: now() })
-					.where(and(eq(mailbox.deliveryId, deliveryId), eq(mailbox.state, "failed")))
+					.where(
+						and(
+							eq(mailbox.deliveryId, deliveryId),
+							eq(mailbox.state, "failed"),
+							sql`(${mailbox.metadataJson}::jsonb ->> 'independentNewNarratorId') IS NULL`,
+						),
+					)
 					.returning({ id: mailbox.id });
 				return updated.length === 1;
 			});
 		},
 		/** Never unlinks files: uploaded/history files may be shared. Claimed payload cannot be cancelled here. */
-		cancel(deliveryId: string, reason: string): Promise<boolean> {
+		cancel(
+			deliveryId: string,
+			reason: string,
+			expected?: { state: PgMailboxRow["state"]; revision: number },
+		): Promise<boolean> {
 			return runSection("mailbox.cancel", async (tx) => {
 				const updated = await tx
 					.update(mailbox)
@@ -2365,7 +2495,12 @@ export function createPostgresRuntimeQueue(
 						updatedAt: now(),
 					})
 					.where(
-						and(eq(mailbox.deliveryId, deliveryId), inArray(mailbox.state, ["queued", "failed"])),
+						and(
+							eq(mailbox.deliveryId, deliveryId),
+							inArray(mailbox.state, ["queued", "failed"]),
+							expected ? eq(mailbox.state, expected.state) : undefined,
+							expected ? eq(mailbox.contentRevision, expected.revision) : undefined,
+						),
 					)
 					.returning({ id: mailbox.id });
 				return updated.length === 1;
@@ -2432,6 +2567,7 @@ export function createPostgresRuntimeQueue(
 							eq(mailbox.kind, "user_input"),
 							eq(mailbox.state, "queued"),
 							isNull(mailbox.payloadRefJson),
+							sql`(${mailbox.metadataJson}::jsonb ->> 'independentNewNarratorId') IS NULL`,
 						),
 					)
 					.returning({ id: mailbox.id });

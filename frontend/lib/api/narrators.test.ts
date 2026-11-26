@@ -105,6 +105,62 @@ describe("narrators API", () => {
 		}
 	});
 
+	test("buffer summaries preserve retry-only capability without internal target metadata", async () => {
+		Object.defineProperty(g, "localStorage", {
+			configurable: true,
+			value: { getItem: () => null },
+		});
+		const summary = {
+			id: "reserved-new",
+			text: "/new task",
+			bufferedAt: "now",
+			imageCount: 0,
+			state: "failed" as const,
+			retryOnly: true,
+		};
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async () => Response.json([summary]),
+		});
+		const messages = await api.getBufferedMessages("source");
+		expect(messages).toEqual([summary]);
+		expect(messages[0].retryOnly).toBe(true);
+	});
+
+	test("buffer mode and retry preserve new-narrator receipts without source delivery", async () => {
+		Object.defineProperty(g, "localStorage", {
+			configurable: true,
+			value: { getItem: () => null },
+		});
+		const calls: { url: string; init: RequestInit }[] = [];
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async (url: unknown, init: RequestInit) => {
+				calls.push({ url: String(url), init });
+				return Response.json({
+					ok: true,
+					...(init.method === "POST" ? { resumed: false } : {}),
+					newNarratorId: "new-narrator",
+				});
+			},
+		});
+		const mode = await api.setBufferedMessageMode("source/id", "buffer/id", "interrupt");
+		expect(mode.newNarratorId).toBe("new-narrator");
+		expect(mode).toEqual({ ok: true, newNarratorId: "new-narrator" });
+		expect(mode.delivered).toBeUndefined();
+		expect(mode.messageId).toBeUndefined();
+		const retry = await api.retryBufferedMessage("source/id", "buffer/id");
+		expect(retry.newNarratorId).toBe("new-narrator");
+		expect(retry).toEqual({ ok: true, resumed: false, newNarratorId: "new-narrator" });
+		expect(calls).toHaveLength(2);
+		expect(calls[0].url).toBe("/api/narrators/source%2Fid/buffer/buffer%2Fid/mode");
+		expect(calls[0].init.method).toBe("PATCH");
+		expect(JSON.parse(String(calls[0].init.body))).toEqual({ mode: "interrupt" });
+		expect(calls[1].url).toBe("/api/narrators/source%2Fid/buffer/buffer%2Fid/retry");
+		expect(calls[1].init.method).toBe("POST");
+		expect(calls[1].init.body).toBeUndefined();
+	});
+
 	test("receipt GET has one canonical encoded endpoint and no send side effects", async () => {
 		Object.defineProperty(g, "localStorage", {
 			configurable: true,

@@ -131,6 +131,7 @@ import {
 	mailboxInputRequiresFreshTurn,
 	projectMailboxUserMessage,
 	restoreBufferedMessage,
+	takeBufferedMessageForIndependentCommand,
 	toBufferSummary,
 } from "../narrator-buffer";
 import { runCustomCompact, runPlanCompact } from "../narrator-compact";
@@ -187,7 +188,6 @@ import {
 	drainInjectionsIntoHistory,
 	ensureSkillCacheFreshForActiveNarrator,
 	executeQueuedGoalCommand,
-	executeQueuedNewCommand,
 	filterOAuthSessionDevices,
 	finalizeInterruptedRun,
 	finalizeOrCleanupPartialMessage,
@@ -201,6 +201,7 @@ import {
 	resolveSessionDevices,
 	setNarratorDefaultDevice,
 	settleNarratorRuntimeModel,
+	startIndependentQueuedNewCommand,
 	updateNarratorModel,
 	urgentActivitySignal,
 } from "../narrator-session";
@@ -713,46 +714,47 @@ export async function runAgentLoopUnlocked(
 			throw error;
 		}
 		if (buffered) {
-			personSpoke = true;
 			const bufferedClaim = buffered._mailboxClaim;
 			if (!bufferedClaim) throw new Error("Claimed buffered input missing mailbox claim");
+			const newCommand = parseQueuedNewCommand(
+				buffered.text,
+				buffered.commandText,
+				buffered.composerDocument,
+				buffered.executionIntent,
+			);
+			if (newCommand) {
+				// Transfer to a durable failed/independent row, never to source history.
+				let independent: BufferedMessage | undefined;
+				try {
+					independent = await takeBufferedMessageForIndependentCommand(
+						narratorId,
+						buffered.id,
+						() => true,
+						{
+							claimed: bufferedClaim,
+						},
+					);
+					if (!independent) throw new Error("Buffered /new claim is no longer current");
+					startIndependentQueuedNewCommand(active, independent, newCommand.initialMessage);
+				} catch (error) {
+					logger.error("Independent queued /new failed", { narratorId, error: String(error) });
+					if (!independent && bufferedRow) {
+						await releaseInboxClaim(bufferedRow, error).catch((releaseError) => {
+							logger.warn("Independent /new claim release failed", {
+								narratorId,
+								error: String(releaseError),
+							});
+						});
+					}
+				}
+				// Failure stays explicitly retryable, not queued for this run to adopt.
+				return independent ? consumeNextInput(options) : "none";
+			}
+			personSpoke = true;
 			active._bufferSoftStopTaken = false;
 			// Keep accepted snapshots and uploaded files recoverable until the
 			// ordinary user message commits, just like the interrupt drain path.
-			const terminalCommand =
-				parseQueuedNewCommand(
-					buffered.text,
-					buffered.commandText,
-					buffered.composerDocument,
-					buffered.executionIntent,
-				) ||
-				parseQueuedGoalCommand(
-					buffered.text,
-					buffered.commandText,
-					buffered.composerDocument,
-					buffered.executionIntent,
-				);
 			pendingBufferedDelivery = buffered;
-			if (
-				terminalCommand &&
-				parseQueuedNewCommand(
-					buffered.text,
-					buffered.commandText,
-					buffered.composerDocument,
-					buffered.executionIntent,
-				)
-			) {
-				await persistClaimedUserInput({
-					claim: bufferedClaim,
-					reservedMessageId: bufferedRow?.recipientMessageId,
-					narratorId,
-					text: buffered.text,
-					contentBlocks: [{ type: "text", text: buffered.text }],
-					commandText: buffered.commandText,
-					createdBy: buffered.createdBy,
-				});
-				pendingBufferedDelivery = undefined;
-			}
 			// Broadcast which message was consumed + remaining queue snapshot
 			const remaining = toBufferSummary(await getBufferedMessagesAsync(narratorId));
 			active._bufferGuidancePending = remaining.some(
@@ -775,38 +777,6 @@ export async function runAgentLoopUnlocked(
 				remaining,
 			});
 			// [continuation-source: queued-command]
-			const newCommand = parseQueuedNewCommand(
-				buffered.text,
-				buffered.commandText,
-				buffered.composerDocument,
-				buffered.executionIntent,
-			);
-			if (newCommand) {
-				const newNarratorId = await executeQueuedNewCommand(
-					active,
-					buffered,
-					newCommand.initialMessage,
-				);
-				broadcastToNarrator(narratorId, {
-					type: "queued_new_narrator_created",
-					narratorId,
-					messageId: buffered.id,
-					newNarratorId,
-				});
-				if ((await getBufferedMessagesAsync(narratorId)).length > 0) {
-					runState.wasInterrupted = true;
-				} else {
-					await narratorService.compareAndSetStatus(
-						narratorId,
-						["working", "waiting"],
-						restingStatus(),
-						{
-							substatus: ["unread"],
-						},
-					);
-				}
-				return "break";
-			}
 			// A queued /goal appends its protected task, then continues this same
 			// loop with an explicit Spec instruction. Later queued messages retain
 			// their order and are consumed after this goal turn.

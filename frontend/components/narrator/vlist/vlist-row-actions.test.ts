@@ -103,6 +103,25 @@ describe("buildRowCtxActions", () => {
 		expect(seen).toEqual(["edit", "cancel", "retry"]);
 	});
 
+	it("retry-only mailbox controls never fall back to generic history editing", () => {
+		const seen: string[] = [];
+		const actions = buildRowCtxActions(
+			{
+				messageId: MSG,
+				blockIndex: 0,
+				queued: {
+					onCancel: () => seen.push("cancel"),
+					onRetry: () => seen.push("retry"),
+				},
+			},
+			{ onEditMessage: () => seen.push("history-edit") },
+		);
+		expect(actions.onEditMessage).toBeUndefined();
+		actions.onCancelQueued?.();
+		actions.onRetryQueued?.();
+		expect(seen).toEqual(["cancel", "retry"]);
+	});
+
 	it("hides onEditMessage when no handler is supplied", () => {
 		expect(
 			buildRowCtxActions({ messageId: MSG, blockIndex: 0, editable: true }, {}).onEditMessage,

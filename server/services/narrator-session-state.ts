@@ -406,6 +406,10 @@ export interface BufferedMessage {
 	_savedFiles?: SavedBufferedFile[];
 	/** Mailbox-owned staging directory identity (not the mailbox row id). */
 	_stagingId?: string;
+	/** Durable independent /new recipient, reused across explicit retries. */
+	_independentNewNarratorId?: string;
+	/** Durable completion receipt: no source payload needs replaying. */
+	_independentNewCompleted?: boolean;
 	_recipientMessageId?: string;
 	state?: "queued" | "failed";
 	error?: string | null;

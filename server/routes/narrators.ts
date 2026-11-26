@@ -4470,7 +4470,13 @@ narratorRoutes.patch("/:id/buffer/:mid/mode", async (c) => {
 	const { withNarratorStartAdmission } = await import("../services/narrator-session-state");
 	let shouldWake = false;
 	let awaitDelivery = false;
+	let independentNew: (() => Promise<string>) | undefined;
 	await withNarratorStartAdmission(id, async () => {
+		if (parsed.data.mode !== "turn") {
+			const { prepareIndependentQueuedNewCommand } = await import("../services/narrator-session");
+			independentNew = await prepareIndependentQueuedNewCommand(id, mid);
+			if (independentNew) return;
+		}
 		if (!(await updateBufferedMessageMode(id, mid, parsed.data.mode))) {
 			if (parsed.data.mode === "interrupt") {
 				const { readBufferedMessageDeliveryReceipt } = await import("../services/narrator-buffer");
@@ -4487,6 +4493,9 @@ narratorRoutes.patch("/:id/buffer/:mid/mode", async (c) => {
 		awaitDelivery = shouldWake && parsed.data.mode === "interrupt";
 	});
 	try {
+		if (independentNew) {
+			return c.json({ ok: true, newNarratorId: await independentNew() });
+		}
 		if (awaitDelivery) {
 			const { waitForBufferedMessageDelivery } = await import("../services/narrator-buffer");
 			const delivered = await waitForBufferedMessageDelivery(id, mid, { signal: c.req.raw.signal });
@@ -4510,9 +4519,15 @@ narratorRoutes.post("/:id/buffer/:mid/retry", async (c) => {
 	const mid = c.req.param("mid");
 	const { withNarratorStartAdmission } = await import("../services/narrator-session-state");
 	let urgentRetry = false;
+	let independentNew: (() => Promise<string>) | undefined;
 	await withNarratorStartAdmission(id, async () => {
 		// Retain mode before the transition: the recovered row may be claimed immediately.
 		const previous = (await getBufferedMessagesAsync(id)).find((message) => message.id === mid);
+		if (!previous || previous.state === "failed") {
+			const { prepareIndependentQueuedNewCommand } = await import("../services/narrator-session");
+			independentNew = await prepareIndependentQueuedNewCommand(id, mid, { retry: true });
+			if (independentNew) return;
+		}
 		let retried: boolean;
 		try {
 			retried = await retryBufferedMessage(id, mid);
@@ -4544,6 +4559,9 @@ narratorRoutes.post("/:id/buffer/:mid/retry", async (c) => {
 		);
 	});
 	try {
+		if (independentNew) {
+			return c.json({ ok: true, resumed: false, newNarratorId: await independentNew() });
+		}
 		if (urgentRetry) {
 			const { waitForBufferedMessageDelivery } = await import("../services/narrator-buffer");
 			const delivered = await waitForBufferedMessageDelivery(id, mid, { signal: c.req.raw.signal });
