@@ -347,7 +347,7 @@ describe("壳层与行组件接线守卫（Devin #4 / #7 / #8 与收起态零重
 		const code = new Bun.Transpiler({ loader: "tsx" }).transformSync(
 			`${region}; return scrollToMessageTarget;`,
 		);
-		let jumpedRoundSeq: number | null = null;
+		const jumpedRoundState: { current: number | null } = { current: null };
 		const jumpTokenRef = { current: 0 };
 		const loadedTopNarratorRef = { current: null as string | null };
 		const fakeEl = {} as HTMLElement;
@@ -360,7 +360,8 @@ describe("壳层与行组件接线守卫（Devin #4 / #7 / #8 与收起态零重
 			jumpTokenRef,
 			loadedTopNarratorRef,
 			setJumpedRoundSeq: (next: number | null | ((c: number | null) => number | null)) => {
-				jumpedRoundSeq = typeof next === "function" ? next(jumpedRoundSeq) : next;
+				jumpedRoundState.current =
+					typeof next === "function" ? next(jumpedRoundState.current) : next;
 			},
 			getSmoothFollower: () => ({ cancel: () => {} }),
 			viewportRef: { current: fakeNode },
@@ -413,7 +414,7 @@ describe("壳层与行组件接线守卫（Devin #4 / #7 / #8 与收起态零重
 				roundSeq: 10,
 			}),
 		).toBe(true);
-		expect(jumpedRoundSeq).toBe(10);
+		expect(jumpedRoundState.current).toBe(10);
 
 		// 2. 不手动滚动，直接执行搜索跳转（不传 roundSeq）
 		expect(
@@ -423,6 +424,6 @@ describe("壳层与行组件接线守卫（Devin #4 / #7 / #8 与收起态零重
 				highlightId: "m30",
 			}),
 		).toBe(true);
-		expect(jumpedRoundSeq).toBeNull();
+		expect(jumpedRoundState.current).toBeNull();
 	});
 });
