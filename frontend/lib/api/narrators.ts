@@ -1546,12 +1546,12 @@ export const narratorsApi = {
 		messageId: string,
 		mode: "turn" | "tool" | "interrupt",
 	) =>
-		request<{ ok: true; delivered?: boolean; messageId?: string }>(
+		request<{ ok: true; delivered?: boolean; messageId?: string; newNarratorId?: string }>(
 			`/narrators/${encodeURIComponent(narratorId)}/buffer/${encodeURIComponent(messageId)}/mode`,
 			{ method: "PATCH", body: JSON.stringify({ mode }) },
 		),
 	retryBufferedMessage: (narratorId: string, messageId: string) =>
-		request<{ ok: true; resumed: boolean }>(
+		request<{ ok: true; resumed: boolean; newNarratorId?: string }>(
 			`/narrators/${encodeURIComponent(narratorId)}/buffer/${encodeURIComponent(messageId)}/retry`,
 			{ method: "POST" },
 		),

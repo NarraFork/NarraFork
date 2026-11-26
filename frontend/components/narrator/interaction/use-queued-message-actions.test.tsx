@@ -253,6 +253,103 @@ test("urgent dispatch hides ordinary rows, requires delivery ACK and suppresses 
 	expect(actions.urgentDispatches).toEqual([]);
 });
 
+test.each([
+	"tool",
+	"interrupt",
+] as const)("queued /new changed to %s completes without source delivery", async (mode) => {
+	const response = { ok: true as const, newNarratorId: "new-narrator" };
+	const request = spyOn(api, "setBufferedMessageMode").mockResolvedValue(response);
+	options.queuedMessages[0].text = "/new another task";
+	await act(async () => {
+		expect(await actions.handleChangeMode("a", mode)).toBe(true);
+	});
+	expect(request).toHaveBeenCalledWith("n", "a", mode);
+	expect(response).toEqual({ ok: true, newNarratorId: "new-narrator" });
+	expect(queue.map((message) => message.id)).toEqual(["guide", "b"]);
+	expect(actions.urgentDispatches).toEqual([]);
+	expect(options.reconcileBufferedMessages).toHaveBeenCalledTimes(1);
+	expect(notifications.show).not.toHaveBeenCalled();
+	// A delayed buffer snapshot cannot restore the consumed control command.
+	await act(async () => root.render(<Probe />));
+	expect(actions.visibleQueuedMessages.map((message) => message.id)).toEqual(["guide", "b"]);
+	expect(queue.map((message) => message.id)).toEqual(["guide", "b"]);
+});
+
+test("retry-created narrator is terminal even when the source did not resume", async () => {
+	options.queuedMessages[0] = { ...entry("a"), text: "/new another task", state: "failed" };
+	await act(async () => root.render(<Probe />));
+	const response = { ok: true as const, resumed: false, newNarratorId: "new-narrator" };
+	const retry = spyOn(api, "retryBufferedMessage").mockResolvedValue(response);
+	await act(async () => {
+		expect(await actions.handleRetryQueued("a")).toBe(response);
+	});
+	expect(retry).toHaveBeenCalledWith("n", "a");
+	expect(response).toEqual({ ok: true, resumed: false, newNarratorId: "new-narrator" });
+	expect(queue.map((message) => message.id)).toEqual(["guide", "b"]);
+	expect(options.reconcileBufferedMessages).toHaveBeenCalledTimes(1);
+	expect(notifications.show).not.toHaveBeenCalled();
+	await act(async () => root.render(<Probe />));
+	expect(actions.visibleQueuedMessages.map((message) => message.id)).toEqual(["guide", "b"]);
+	expect(actions.urgentDispatches).toEqual([]);
+});
+
+test("ordinary retry without a new narrator refreshes without claiming consumption", async () => {
+	spyOn(api, "retryBufferedMessage").mockResolvedValue({ ok: true, resumed: false });
+	const snapshot = queue;
+	await act(async () => {
+		expect(await actions.handleRetryQueued("a")).toEqual({ ok: true, resumed: false });
+	});
+	expect(queue).toBe(snapshot);
+	expect(actions.urgentDispatches).toEqual([]);
+	expect(options.reconcileBufferedMessages).toHaveBeenCalledTimes(1);
+});
+
+test("failed /new interrupt retry stops before PATCH when retry already created a narrator", async () => {
+	options = {
+		...options,
+		queuedMessages: [{ ...entry("a", "interrupt"), text: "/new another task", state: "failed" }],
+	};
+	await act(async () => root.render(<Probe />));
+	const retry = spyOn(api, "retryBufferedMessage").mockResolvedValue({
+		ok: true,
+		resumed: false,
+		newNarratorId: "new-narrator",
+	});
+	const mode = spyOn(api, "setBufferedMessageMode");
+	await act(async () => {
+		expect(await actions.handleChangeMode("a", "interrupt")).toBe(true);
+	});
+	expect(retry).toHaveBeenCalledWith("n", "a");
+	expect(mode).not.toHaveBeenCalled();
+	expect(queue.map((message) => message.id)).not.toContain("a");
+	expect(actions.urgentDispatches).toEqual([]);
+	expect(options.reconcileBufferedMessages).toHaveBeenCalledTimes(1);
+	expect(notifications.show).not.toHaveBeenCalled();
+});
+
+test("late retry /new receipt cannot consume another narrator's queue", async () => {
+	const receipt = Promise.withResolvers<{
+		ok: true;
+		resumed: boolean;
+		newNarratorId: string;
+	}>();
+	spyOn(api, "retryBufferedMessage").mockReturnValue(receipt.promise);
+	let result: ReturnType<typeof actions.handleRetryQueued> | undefined;
+	await act(async () => {
+		result = actions.handleRetryQueued("a");
+	});
+	options = { ...options, narratorId: "other", queuedMessages: [entry("a")] };
+	await act(async () => root.render(<Probe />));
+	const response = { ok: true as const, resumed: false, newNarratorId: "new-narrator" };
+	await act(async () => {
+		receipt.resolve(response);
+		expect(await result).toBe(response);
+	});
+	expect(queue.map((message) => message.id)).toContain("a");
+	expect(actions.visibleQueuedMessages.map((message) => message.id)).toEqual(["a"]);
+	expect(options.reconcileBufferedMessages).not.toHaveBeenCalled();
+});
+
 test("legacy ok and timeout retain payload for retry rather than claim delivery", async () => {
 	const mode = spyOn(api, "setBufferedMessageMode").mockResolvedValue({ ok: true });
 	await act(async () => {

@@ -119,7 +119,7 @@ export function useQueuedMessageActions(options: UseQueuedMessageActionsOptions)
 		}
 	}, [narratorId, queuedMessages, setQueuedMessages]);
 	// Missing raw rows may only be claimed, not materialized: a failed claim can
-	// return to queued/failed. Only an explicit delivery receipt is terminal.
+	// return to queued/failed. Only an explicit delivery or new-narrator receipt is terminal.
 	const urgentDispatches = [...dispatches.values()]
 		.filter(
 			(dispatch) =>
@@ -262,15 +262,46 @@ export function useQueuedMessageActions(options: UseQueuedMessageActionsOptions)
 		[setQueuedMessages, narratorId, reconcileBufferedMessages, t, queueMutationLocked],
 	);
 
+	const finishQueuedMessage = useCallback(
+		(messageId: string, message?: BufferMessageSummary) => {
+			const dispatches = scopeRef.current.dispatches;
+			if (message) {
+				if (!dispatches.has(messageId) && dispatches.size >= 64) {
+					const evict = [...dispatches].find(([, value]) => value.status !== "sending");
+					if (evict) dispatches.delete(evict[0]);
+				}
+				// "sent" marks a terminal buffer action, not delivery into the source
+				// conversation. /new creates no source message; WS owns its navigation.
+				if (dispatches.has(messageId) || dispatches.size < 64)
+					dispatches.set(messageId, { message, status: "sent" });
+			}
+			setQueuedMessages((previous) => previous.filter((row) => row.id !== messageId));
+			refreshDispatches((n) => n + 1);
+		},
+		[setQueuedMessages],
+	);
 	const handleRetryQueued = useCallback(
 		async (messageId: string) => {
 			if (queueMutationLocked()) throw new Error(t("queuedEditPaused"));
+			const scope = scopeRef.current;
+			const message =
+				queuedMessages.find((row) => row.id === messageId) ??
+				scope.dispatches.get(messageId)?.message;
 			const result = await api.retryBufferedMessage(narratorId, messageId);
+			if (scopeRef.current !== scope) return result;
+			if (result.newNarratorId) finishQueuedMessage(messageId, message);
 			// Refresh authoritative state; do not resurrect a row already consumed over WS.
 			reconcileBufferedMessages();
 			return result;
 		},
-		[narratorId, reconcileBufferedMessages, queueMutationLocked, t],
+		[
+			narratorId,
+			queuedMessages,
+			finishQueuedMessage,
+			reconcileBufferedMessages,
+			queueMutationLocked,
+			t,
+		],
 	);
 
 	const reorderQueued = useCallback(
@@ -358,16 +389,21 @@ export function useQueuedMessageActions(options: UseQueuedMessageActionsOptions)
 			try {
 				// Failed admission must be explicitly restored before requesting interruption.
 				if (mode === "interrupt" && message.state === "failed") {
-					await api.retryBufferedMessage(narratorId, id);
+					const retry = await api.retryBufferedMessage(narratorId, id);
 					if (scopeRef.current !== scope) return false;
+					if (retry.newNarratorId) {
+						finishQueuedMessage(id, message);
+						reconcileBufferedMessages();
+						return true;
+					}
 				}
 				const response = await api.setBufferedMessageMode(narratorId, id, mode);
 				if (scopeRef.current !== scope) return false;
-				if (mode === "interrupt") {
+				if (response.newNarratorId) {
+					finishQueuedMessage(id, message);
+				} else if (mode === "interrupt") {
 					if (response.delivered !== true) throw new Error(t("queuedUrgentUnconfirmed"));
-					scope.dispatches.set(id, { message, status: "sent" });
-					setQueuedMessages((prev) => prev.filter((m) => m.id !== id));
-					refreshDispatches((n) => n + 1);
+					finishQueuedMessage(id, message);
 				}
 				reconcileBufferedMessages();
 				return true;
@@ -401,7 +437,7 @@ export function useQueuedMessageActions(options: UseQueuedMessageActionsOptions)
 		[
 			narratorId,
 			queuedMessages,
-			setQueuedMessages,
+			finishQueuedMessage,
 			reconcileBufferedMessages,
 			t,
 			queueMutationLocked,
