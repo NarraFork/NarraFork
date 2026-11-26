@@ -1,7 +1,7 @@
 ---
 id: collaboration.teams.merge
 title: 合并工作项与基线配置
-summary: 成员在团队页把可合并的工作项合回基线（本地合并：对象库里算合并、不碰任何工作区，基线被检出时准备好等人快进）；新工作项从 origin/<基线> 还是本地基线开始。
+summary: 成员在团队页把可合并的工作项合回基线（本地合并：对象库里算合并、不碰任何工作区，基线被检出时准备好等人快进；origin 在 GitHub 上时走 PR）；origin 在哪（含 gh 探测）；新工作项从 origin/<基线> 还是本地基线开始。
 anchors:
   - server/services/teams/team-merge.ts
   - server/services/teams/team-merge-guard.ts
@@ -27,7 +27,9 @@ keywords:
   - TEAM_WORK_ITEM_NOT_READY
   - TEAM_WORK_ITEM_WORKER_RUNNING
   - TEAM_WORK_ITEM_HEAD_UNAVAILABLE
-  - TEAM_MERGE_GITHUB_PENDING
+  - gh_missing
+  - gh_logged_out
+  - gh_no_permission
   - TEAM_MERGE_BASE_REMOTE
   - TEAM_MERGE_BASE_MOVED
   - TEAM_MERGE_NOT_PREPARED
@@ -42,7 +44,7 @@ keywords:
   - workStart
   - workStartDefault
   - merge-tree
-  - GitHub PR 流程即将提供
+  - GitHub Enterprise
   - TEAM_MERGE_FAST_FORWARD_INCOMPLETE
   - TEAM_MERGE_HOSTING_UNKNOWN
   - TEAM_MERGE_TIMEOUT
@@ -53,22 +55,22 @@ keywords:
   - assertTipStill
   - GIT_TOO_OLD_FOR_PARTIAL_CLONE
 status: draft
-verified_at: 3588311eac166b9c044478105016c59ebd95688b
+verified_at: ddc6b6a25ee0907d09b3af062d68f5ce3ee7b31e
 ---
 # 合并工作项与基线配置
 
-可合并（`ready`）的工作项由成员在团队页点「合并到 {{base}}」合回基线。硬约束：不妨碍任何人的工作——不切分支、不碰任何工作区和 index、不在任何检出里留下合并或冲突状态、不对被检出的基线 `update-ref`、不拿任何锁挡别的会话。origin 在 GitHub 上时走 PR 流程（下一个 PR），现在按钮禁用（`github_pending`）。
+可合并（`ready`）的工作项由成员在团队页点「合并到 {{base}}」合回基线。硬约束：不妨碍任何人的工作——不切分支、不碰任何工作区和 index、不在任何检出里留下合并或冲突状态、不对被检出的基线 `update-ref`、不拿任何锁挡别的会话。origin 在 GitHub 上时同一个按钮走 PR 流程（推送分支、发起并在 GitHub 上合并 PR），见 [GitHub PR 流程](pull-requests.md)；gh 不可用时禁用并说明原因，绝不退回本地合并。
 
 ## 关键规则
 请求（`server/routes/project-teams.ts`，`team-work-view.ts:requestMergeAsPerson`/`requestFastForwardAsPerson`，`team-merge.ts`）：
 - `POST …/work/:itemId/merge` 与 `…/merge/fast-forward`：权限同退回（`loadTeamForAccess(…, "write")`，旁观者 403、陌生人 404），另要项目写权限（`routes/project-teams.ts:requireProjectWriteForMerge`：只读项目成员即使有协调者写授权也 403；`canMerge` 同样按项目写权限算，`team-merge.ts:canMergeInProject`）；只做便宜的检查，记 `work.merge_requested`（`detail.job` = `merge` / `fast_forward`），202 返回 `{ itemId, job, phase: "queued" }`。
-- 请求就拒的情形（409）：团队归档 `TEAM_ARCHIVED`；不是 ready `TEAM_WORK_ITEM_NOT_READY`；已有任务在跑 `TEAM_WORK_ITEM_MERGING`；工作者 working/waiting `TEAM_WORK_ITEM_WORKER_RUNNING`；缓存的 hosting 是 GitHub `TEAM_MERGE_GITHUB_PENDING`；基线像远程跟踪分支（`origin/`、`remotes/`、`refs/remotes/` 开头）`TEAM_MERGE_BASE_REMOTE`；快进时最近结果不是 prepared `TEAM_MERGE_NOT_PREPARED`。
+- 请求就拒的情形（409）：团队归档 `TEAM_ARCHIVED`；不是 ready `TEAM_WORK_ITEM_NOT_READY`；已有任务在跑 `TEAM_WORK_ITEM_MERGING`；工作者 working/waiting `TEAM_WORK_ITEM_WORKER_RUNNING`；缓存的 hosting 是 GitHub 时不做本地合并，改起 PR 任务（gh 不可用时 409 `TEAM_PR_GH_*` / `TEAM_PR_REPO_ARCHIVED`，见 PR 节点）；本地合并时基线像远程跟踪分支（`origin/`、`remotes/`、`refs/remotes/` 开头）`TEAM_MERGE_BASE_REMOTE`；快进时最近结果不是 prepared `TEAM_MERGE_NOT_PREPARED`。
 - 任务表在内存（`hotSafe`）：阶段 queued → checking → merging → updating（合并）或 fast_forwarding（快进）。每项一个任务（`team-merge-guard.ts:claimMerging`），每项目一把 `AsyncMutex` 串行（只挡同项目的合并），git 各有超时。总期限 10 分钟（`setMergeDeadlineForTests`）：到点只是 abort 任务的 `AbortSignal`——git 子进程随之被杀，任务在步骤之间、动任何 ref 之前检查它——等任务真的停下后才放守卫和锁，记 `TEAM_MERGE_TIMEOUT`；`fetch . M:refs/heads/<基线>` 之后不再中途放弃，已落地的照常记下。不在任何 SQLite 事务里跑 git。
 - 守卫：任务持有期间，退回、协调者的 review / ready / sync / cancel 都 409 `TEAM_WORK_ITEM_MERGING`（`work-items.ts` 各入口 `assertNotMerging`），后台祖先检测跳过它（`team-overlap.ts:mergeIfLanded`）。重启后守卫随任务消失，不留状态列。
 
 本地合并（`runMerge`，git 都经 `team-git-write.ts`，在项目 `gitPath` 里跑）：
 - 分支尖端在动基线之前、记下合并之前各再查一次（`assertTipStill`，快进同样）：worker 在这期间的提交让任务失败（`TEAM_WORK_ITEM_HEAD_MOVED`），不动基线；基线已动了也不标合并（祖先检测也要尖端在基线里才认）。测试接缝 `setMergeStepHookForTests`。
-- 先复核：团队活跃、项 ready、有记录的分支与 head（否则 `TEAM_WORK_ITEM_HEAD_UNAVAILABLE`）、工作者没在跑、hosting 读得出（`unknown` → `TEAM_MERGE_HOSTING_UNKNOWN`，绝不当作非 GitHub）且不是 GitHub、git ≥ 2.38（`TEAM_MERGE_GIT_TOO_OLD`）、`refs/heads/<基线>` 存在、分支尖端仍是 ready 时的 head（否则 `TEAM_WORK_ITEM_HEAD_MOVED`）。不重跑知识检查。
+- 先复核：团队活跃、项 ready、有记录的分支与 head（否则 `TEAM_WORK_ITEM_HEAD_UNAVAILABLE`）、工作者没在跑、hosting 读得出（`unknown` → `TEAM_MERGE_HOSTING_UNKNOWN`，绝不当作非 GitHub；请求时 hosting 还没读出、任务里读到 GitHub 的，转去 PR 流程，`runMerge` 开头）、git ≥ 2.38（`TEAM_MERGE_GIT_TOO_OLD`）、`refs/heads/<基线>` 存在、分支尖端仍是 ready 时的 head（否则 `TEAM_WORK_ITEM_HEAD_MOVED`）。不重跑知识检查。
 - OLD = 基线；head 已在 OLD 里就直接记合并（`alreadyInBase: true`，`mergeCommit: null`）。
 - `merge-tree --write-tree -z --name-only --no-messages OLD head`（120s、1MB）：冲突 → `work.merge_failed {code: "conflict", conflicts ≤50, more}`，给协调者 `mergeConflictNote`，什么都没写。
 - `commit-tree T -p OLD -p head`（永远是合并提交，消息 `Merge team work item: <标题> (<分支>)`）：身份取点击者的 NarraFork git 身份（`resolveUserGitIdentityEnv`），没有就用主机 system/global 的 `user.*`（`author.*`/`committer.*` 优先，`hostIdentity`），从不用仓库自己配的；都没有 → `TEAM_MERGE_IDENTITY_UNKNOWN`。只有主机的 `commit.gpgsign` 为真才带 `-S`；签名相关键（`gpg.*program`、`gpg.format`、`gpg.ssh.defaultKeyCommand`、`user.signingKey`）仓库自己配的改回主机值或 git 默认值（`signingConfig`）。
@@ -92,7 +94,7 @@ verified_at: 3588311eac166b9c044478105016c59ebd95688b
 读模型（`mergeSummaryOf`、`mergeViewOf`）：
 - 看板卡片（`team-board.ts:withMerge`，含项目页的 `readReadyItems`）的 ready 项带 `merge: {mode, phase, job, outcome, canMerge, disabledReason}`：不跑 git，读任务表、一条最新结果事件、缓存的 hosting 与 git 版本。
 - 抽屉 `work/:itemId` 的 ready 项带 `merge`（再加 `detail` 与 prepared 时的 `fastForward: {available, blocker, runningSessions, terminals, command, files, filesMore}`，检出检查缓存 15 秒）。`files` 是快进会写进那个检出的文件（prepared 的 `baseSha` → M，`numstat`，最多 300，含上游改动，不是评审 diff），确认框列的就是它。`command` 只在检出在基线上时给，有两种写法（`fastForwardCommand`）：sh/Git Bash 的 `[ "$(git --no-replace-objects -C <目录> symbolic-ref --quiet HEAD)" = refs/heads/<基线> ] && git --no-replace-objects -C <目录> merge --ff-only --no-autostash --no-overwrite-ignore <M>`，和 PowerShell 的 `if ((git --no-replace-objects -C '<目录>' symbolic-ref --quiet HEAD) -ceq 'refs/heads/<基线>') { … } else { Write-Error … }`；都比较完整 ref（同名 tag 不会让它跳过），路径各按自己的规则加引号（sh 单引号、`'\''`；PowerShell 单引号串里 `'` 和 U+2018–U+201B 四个排印引号都会结束字符串，所以每个都双写）；路径含换行、NUL 等控制字符或 U+2028/2029 时不给命令，`inspectCheckout` 返回 `unsafe_path`，也不在这里快进；`preferred` 按服务端平台（Windows 先给 PowerShell），抽屉里可以切换；`not_on_base`、`other_repository`、`altered_history`、`stale`、`unreadable`、`unsafe_path` 时为 null，只显示原因。
-- 禁用原因按序：`not_ready`、`team_archived`、`merging`、`worker_running`、`checking`（hosting 还在读，或读失败为 `unknown`）、`github_pending`、`base_remote`、`git_too_old`；`canMerge` 还要求调用者是成员且有项目写权限。
+- 禁用原因按序：`not_ready`、`team_archived`、`merging`、`worker_running`、`checking`（hosting 还在读，或读失败为 `unknown`）；GitHub 模式再看 gh（`ghDisabledReason`：`gh_missing`、`gh_logged_out`、`gh_no_permission`、`gh_repo_archived`、`gh_unavailable`，还没探测为 `checking`），本地模式再看 `base_remote`、`git_too_old`；`canMerge` 还要求调用者是成员且有项目写权限。GitHub 模式的摘要另带 `pr`（`team-pr-state.ts:pullRequestSummary`，只读事件与缓存，不跑 gh）。
 
 基线与新工作的起点（W，`team-work-start.ts`、`team-hosting.ts`）：
 - 基线分支按团队存（`project_teams.base_branch`），新团队取项目 `projects.default_branch`（项目设置页「工作区与容器」组的「团队默认设置」可改），再缺省 `main`。
@@ -101,7 +103,7 @@ verified_at: 3588311eac166b9c044478105016c59ebd95688b
 - 拉取的凭证与传输只听主机（`networkOverrides`，用 `--show-scope` 读）：凭证助手一旦仓库配了就整表重置再按顺序加回主机的；仓库的其他 `credential.*`、`core.askPass` 取主机值或空（`protectProtocol`、`sanitizePrompt` 取主机值或 true）；`http.*.extraHeader` 同凭证助手：整表重置再加回主机的；仓库的 `http.*` 取主机值，否则 `sslVerify` 为 true、代理为服务端环境的、`extraHeader`/`cookieFile` 为空、`saveCookies` 为 false，其余（如 `sslCAInfo`）拒绝；仓库的 `remote.origin.vcs`、`core.gitProxy`（先匹配的生效，命令级盖不住）、改写 origin URL 的仓库 `url.*.insteadOf` 也拒绝（`TEAM_REMOTE_CONFIG_UNSAFE`，当作拉取失败）。传输只许 https/http/ssh/git/本地路径，`ext::` 永远不许；`remote.origin.uploadpack` 固定、`core.gitProxy` 置空。ssh：服务端环境里运维设的 `GIT_SSH_COMMAND` 优先，只设了 `GIT_SSH` 时把它加引号作为 `GIT_SSH_COMMAND` 传下去，否则主机的 `core.sshCommand`，否则 `ssh -o BatchMode=yes`（`sshSettings`）。
 - 起点为 `origin/<基线>` 的项按 `refs/remotes/origin/<基线>` 比较（`compareRefFor`：知识检查、评审后提交数、改动路径、大小、diff、重叠、隔离项清理），祖先检测本地基线与它都看；本地基线仍是本地合并的目标。
 - `work.sync` 同样按起点模式取要合进来的基线（`origin/<基线>` 或本地基线），指令里写的就是它。
-- hosting：`git remote get-url --push origin`（应用 pushurl 与 insteadOf），解析 scp / ssh / https（去掉 userinfo，不记日志），主机小写，路径必须正好 owner/repo；只有 github.com（含 ssh.github.com）算 GitHub，GHE 要等 PR 流程的 gh 探测。读失败是 `unknown`（合并按 `checking` 禁用，绝不退到本地合并；起点默认按本地）。缓存按仓库：成功 5 分钟、失败 60 秒，单飞，请求只读缓存（`peekHosting`）。
+- hosting：`git remote get-url --push origin`（应用 pushurl 与 insteadOf），解析 scp / ssh / https（去掉 userinfo，不记日志），主机小写，路径必须正好 owner/repo。github.com（含 www 与 ssh.github.com）按名字算 GitHub；别的主机只有 gh 认识它（`gh auth status --hostname H --json hosts` 列出它，登录与否）才算 GitHub Enterprise，没有 gh 就是其他主机（`resolveHosting`）。GitHub 再探 gh（`probeGhAccess`：`Bun.which`、`gh --version` 5 秒、`gh auth status` 登录成功、`gh repo view host/owner/repo --json viewerPermission,…` 要 WRITE/MAINTAIN/ADMIN 且未归档），结果放在 hosting 的 `gh` 里，带仓库允许的合并方式（默认的排第一）。读失败是 `unknown`（合并按 `checking` 禁用，绝不退到本地合并；起点默认按本地）。缓存按仓库：成功 5 分钟；失败、或 GitHub 但 gh 用不了，60 秒（主机上 `gh auth login` 后很快生效）；单飞，请求只读缓存（`peekHosting`）。测试接缝 `setHostingSourceForTests`、`setGhProbeForTests`。
 
 前端（`TeamMerge.tsx`，抽屉底栏与「等你处理」卡片共用）：`MergeButton`（合并到 {{base}} → 正在合并… / 正在快进…，prepared 后是「重新准备」，禁用时 tooltip 说原因）；`MergeOutcome`（冲突文件列表与「退回给工作者」，退回理由预填冲突文件最多 20 个；失败原因；prepared 的说明、「在该目录中快进」确认框列出改动文件、可复制命令）。合并任务在跑时抽屉每 1.5 秒重读。
 
@@ -114,9 +116,10 @@ verified_at: 3588311eac166b9c044478105016c59ebd95688b
 - 加合并的拒绝码：`team-merge.ts`、`team-page-model.ts:MERGE_ERROR_CODES` 与 en / zh-CN 的 `teams.page.merge.errors.*`（模型测试核对每个原因与阻碍都有文案）。
 - 加禁用原因或快进阻碍：`shared/project-teams.ts` 的 `TEAM_MERGE_DISABLED_REASONS` / `TEAM_FAST_FORWARD_BLOCKERS` 与两种语言的文案。
 - 新的写 git 只进 `team-git-write.ts`，带超时与输出上限，用 `git-exec-hardening.ts` 的覆盖；不能在任何人的检出里写，除了显式的快进。
-- PR 流程（下一个 PR）接在 `requestMerge` 的 `github` 分支与 `mergeSummaryOf` 的 `github_pending` 上，结果同样记事件，`work.merged.detectedBy` 加 `pull_request`。
+- PR 流程在 [GitHub PR 流程](pull-requests.md)：它共用这里的任务表、守卫、锁与 `work.merge_failed`；改任务表或 `jobFacts` 时两条流程都要看。
 
 ## 相关
+- [GitHub PR 流程](pull-requests.md)：origin 在 GitHub 上时。
 - [工作项](work-items.md)：状态机、`markMerged` 唯一写入者、守卫的各入口。
 - [团队页与审批](page.md)：抽屉与「等你处理」。
 - [外部进程加固](../../security/hardening.md)：合并驱动、hook 与签名程序的覆盖。

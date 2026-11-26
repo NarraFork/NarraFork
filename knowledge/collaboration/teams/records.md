@@ -66,7 +66,7 @@ keywords:
   - team_upgrade
   - team_disband
 status: draft
-verified_at: 3586b5dd803f5035f610fc36d2c7d0245a2cd8e9
+verified_at: ddc6b6a25ee0907d09b3af062d68f5ce3ee7b31e
 ---
 # 团队与成员
 
@@ -153,7 +153,7 @@ verified_at: 3586b5dd803f5035f610fc36d2c7d0245a2cd8e9
 ## 从哪读起
 - `server/services/teams/team-service.ts`：团队创建、读取、访问判定（本节点的入口，锚在总览）。
 - `team-members.ts`：成员拼装；`team-membership.ts`：会话归属；`team-records.ts`：删除前检查。
-- `server/lib/validators/project-teams.ts`：团队路由的 Zod 校验。
+- `server/lib/validators/project-teams.ts`：团队路由的 Zod 校验（含「合并 PR」的 `mergeTeamPullRequestSchema`，见 [GitHub PR 流程](pull-requests.md)）。
 - `server/db/schema.ts`：`project_teams`、`team_work_items`、`team_work_item_dependencies`、`team_work_events` 四张表。
 
 ## 改它时

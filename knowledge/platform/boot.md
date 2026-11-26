@@ -44,7 +44,7 @@ keywords:
   - netsh excluded port
   - IS_WINDOWS
 status: draft
-verified_at: 3586b5dd803f5035f610fc36d2c7d0245a2cd8e9
+verified_at: ddc6b6a25ee0907d09b3af062d68f5ce3ee7b31e
 ---
 # 启动与进程
 
@@ -72,7 +72,7 @@ verified_at: 3586b5dd803f5035f610fc36d2c7d0245a2cd8e9
 - 依赖检测 `GET /api/dependencies` 刻意挂在会话认证之前（缺 git 时登录前也要能看到状态）；`POST /api/dependencies/:name/install` 仅管理员，名称只允许 `git`、`rg`、`dtach`；检测与按包管理器安装在 `services/dependency-service.ts`，缺 sudo 密码不算服务端故障（`routes/dependencies.ts`）。
 - 数据库启动后段（`main.ts:initializeDatabaseStartup`）：恢复发现结束后，仅在 `automaticResumeEnabled()` 时先挂载叙述者续接恢复，再后台调用 `wakeQueuedTaskNoticeRecipientsOnStartup` 补唤醒收件箱里已入队、但唤醒丢失的任务通知（见 [收件箱与唤醒](../narrator/runtime/mailbox.md)）；失败只记警告。
 - 数据库完整性检查在端口绑定后后台执行，细节见 [实例锁、完整性与重启恢复](instance-recovery.md)。
-- SQLite 下团队的后台维护经 `main.ts:startTeamDatabaseMaintenance` 逐个挂上（status、outputs、work、overlap、merge），关闭时统一停；`merge` 在启动 30 秒后清一次不再 ready 的工作项留下的私有合并 ref（`teams/team-merge.ts:startTeamMergeMaintenance`，见[合并工作项与基线配置](../collaboration/teams/merge.md)）。
+- SQLite 下团队的后台维护经 `main.ts:startTeamDatabaseMaintenance` 逐个挂上（status、outputs、work、overlap、merge、pull-requests），关闭时统一停；`merge` 在启动 30 秒后清一次不再 ready 的工作项留下的私有合并 ref（`teams/team-merge.ts:startTeamMergeMaintenance`，见[合并工作项与基线配置](../collaboration/teams/merge.md)）；`pull-requests` 每 60 秒读一轮 ready 项在 GitHub 上的 PR（`teams/team-merge-pr.ts:startTeamPrPoller`，停时等读与合并后的拉取跑完，见 [GitHub PR 流程](../collaboration/teams/pull-requests.md)）。
 - 关闭：SIGINT/SIGTERM/SIGHUP 与 `exit` 钩子在 `main.ts` 末尾注册，`hotOnce` 防热重载重复注册；`performGracefulShutdown` 先 `httpLifecycle.stopAccepting()`，再逐步停各生产者。干净关闭标记与锁释放见 [实例锁、完整性与重启恢复](instance-recovery.md)。
 
 ## 从哪读起
