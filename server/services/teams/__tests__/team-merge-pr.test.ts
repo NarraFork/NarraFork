@@ -482,6 +482,8 @@ describe.skipIf(process.platform === "win32")("the pull request flow", () => {
 			pr: 9,
 			headMatches: true,
 		});
+		expect(events(b.id, "work.merged")[0]?.actorKind).toBe("system");
+		expect(notes.at(-1)).toContain("It was merged on GitHub");
 	});
 
 	test("the branch moved after ready: nothing pushed; GitHub's branch ahead: rejected, never forced, 退回 offered", async () => {

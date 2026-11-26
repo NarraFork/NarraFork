@@ -429,7 +429,8 @@ export async function runPullRequest(
 				mergeCommit: view?.mergeCommit?.oid ?? null,
 				headMatches: true,
 				method: null,
-				userId: context.userId,
+				// Found merged (by someone on GitHub), not merged by this person: the system's.
+				userId: null,
 			});
 			return;
 		}
