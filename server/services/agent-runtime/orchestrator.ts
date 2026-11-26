@@ -127,6 +127,7 @@ import { injectionKey, knowledgeInjection } from "../knowledge-injection";
 import { knowledgeInjectionReads, knowledgeService } from "../knowledge-service";
 import {
 	cleanupBufferedTextFilesAsync,
+	dropBufferedMessage,
 	getBufferedMessagesAsync,
 	mailboxInputRequiresFreshTurn,
 	projectMailboxUserMessage,
@@ -713,46 +714,87 @@ export async function runAgentLoopUnlocked(
 			throw error;
 		}
 		if (buffered) {
-			personSpoke = true;
 			const bufferedClaim = buffered._mailboxClaim;
 			if (!bufferedClaim) throw new Error("Claimed buffered input missing mailbox claim");
+			const newCommand = parseQueuedNewCommand(
+				buffered.text,
+				buffered.commandText,
+				buffered.composerDocument,
+				buffered.executionIntent,
+			);
+			if (newCommand) {
+				// A UI command is not a person speaking to this run. Consume it without
+				// persisting source history, changing the principal or ending this loop.
+				const detached = { ...buffered };
+				let consumed = false;
+				try {
+					consumed = await dropBufferedMessage(
+						narratorId,
+						buffered,
+						"Dispatched independent /new command",
+						{
+							preserveStaging: true,
+						},
+					);
+					if (!consumed) throw new Error("Buffered /new claim is no longer current");
+					const newNarratorId = await executeQueuedNewCommand(
+						active,
+						detached,
+						newCommand.initialMessage,
+					);
+					broadcastToNarrator(narratorId, {
+						type: "queued_new_narrator_created",
+						narratorId,
+						messageId: buffered.id,
+						newNarratorId,
+					});
+					broadcastToNarrator(narratorId, {
+						type: "buffer_consumed",
+						narratorId,
+						messageId: buffered.id,
+						remaining: toBufferSummary(await getBufferedMessagesAsync(narratorId)),
+					});
+				} catch (error) {
+					logger.error("Independent queued /new failed", { narratorId, error: String(error) });
+					if (!consumed && bufferedRow) {
+						await releaseInboxClaim(bufferedRow, error).catch((releaseError) => {
+							logger.warn("Independent /new claim release failed", {
+								narratorId,
+								error: String(releaseError),
+							});
+						});
+					}
+					try {
+						broadcastToNarrator(narratorId, {
+							type: "narrator_error",
+							narratorId,
+							error: String(error),
+						});
+					} catch (notificationError) {
+						logger.warn("Independent /new error notification failed", {
+							narratorId,
+							error: String(notificationError),
+						});
+					}
+				} finally {
+					if (consumed) {
+						await cleanupBufferedTextFilesAsync(detached._stagingId ?? detached.id).catch(
+							(error) => {
+								logger.warn("Independent /new staging cleanup failed", {
+									narratorId,
+									error: String(error),
+								});
+							},
+						);
+					}
+				}
+				return consumed ? consumeNextInput(options) : "none";
+			}
+			personSpoke = true;
 			active._bufferSoftStopTaken = false;
 			// Keep accepted snapshots and uploaded files recoverable until the
 			// ordinary user message commits, just like the interrupt drain path.
-			const terminalCommand =
-				parseQueuedNewCommand(
-					buffered.text,
-					buffered.commandText,
-					buffered.composerDocument,
-					buffered.executionIntent,
-				) ||
-				parseQueuedGoalCommand(
-					buffered.text,
-					buffered.commandText,
-					buffered.composerDocument,
-					buffered.executionIntent,
-				);
 			pendingBufferedDelivery = buffered;
-			if (
-				terminalCommand &&
-				parseQueuedNewCommand(
-					buffered.text,
-					buffered.commandText,
-					buffered.composerDocument,
-					buffered.executionIntent,
-				)
-			) {
-				await persistClaimedUserInput({
-					claim: bufferedClaim,
-					reservedMessageId: bufferedRow?.recipientMessageId,
-					narratorId,
-					text: buffered.text,
-					contentBlocks: [{ type: "text", text: buffered.text }],
-					commandText: buffered.commandText,
-					createdBy: buffered.createdBy,
-				});
-				pendingBufferedDelivery = undefined;
-			}
 			// Broadcast which message was consumed + remaining queue snapshot
 			const remaining = toBufferSummary(await getBufferedMessagesAsync(narratorId));
 			active._bufferGuidancePending = remaining.some(
@@ -775,38 +817,6 @@ export async function runAgentLoopUnlocked(
 				remaining,
 			});
 			// [continuation-source: queued-command]
-			const newCommand = parseQueuedNewCommand(
-				buffered.text,
-				buffered.commandText,
-				buffered.composerDocument,
-				buffered.executionIntent,
-			);
-			if (newCommand) {
-				const newNarratorId = await executeQueuedNewCommand(
-					active,
-					buffered,
-					newCommand.initialMessage,
-				);
-				broadcastToNarrator(narratorId, {
-					type: "queued_new_narrator_created",
-					narratorId,
-					messageId: buffered.id,
-					newNarratorId,
-				});
-				if ((await getBufferedMessagesAsync(narratorId)).length > 0) {
-					runState.wasInterrupted = true;
-				} else {
-					await narratorService.compareAndSetStatus(
-						narratorId,
-						["working", "waiting"],
-						restingStatus(),
-						{
-							substatus: ["unread"],
-						},
-					);
-				}
-				return "break";
-			}
 			// A queued /goal appends its protected task, then continues this same
 			// loop with an explicit Spec instruction. Later queued messages retain
 			// their order and are consumed after this goal turn.

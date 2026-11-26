@@ -2297,7 +2297,11 @@ export function createPostgresRuntimeQueue(
 			});
 		},
 		/** Never unlinks files: uploaded/history files may be shared. Claimed payload cannot be cancelled here. */
-		cancel(deliveryId: string, reason: string): Promise<boolean> {
+		cancel(
+			deliveryId: string,
+			reason: string,
+			expected?: { state: PgMailboxRow["state"]; revision: number },
+		): Promise<boolean> {
 			return runSection("mailbox.cancel", async (tx) => {
 				const updated = await tx
 					.update(mailbox)
@@ -2308,7 +2312,12 @@ export function createPostgresRuntimeQueue(
 						updatedAt: now(),
 					})
 					.where(
-						and(eq(mailbox.deliveryId, deliveryId), inArray(mailbox.state, ["queued", "failed"])),
+						and(
+							eq(mailbox.deliveryId, deliveryId),
+							inArray(mailbox.state, ["queued", "failed"]),
+							expected ? eq(mailbox.state, expected.state) : undefined,
+							expected ? eq(mailbox.contentRevision, expected.revision) : undefined,
+						),
 					)
 					.returning({ id: mailbox.id });
 				return updated.length === 1;

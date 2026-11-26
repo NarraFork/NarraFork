@@ -1419,6 +1419,45 @@ async function removeBufferedMessageUnlocked(
 	await cleanupBufferedTextFiles(id);
 	return true;
 }
+/**
+ * Remove a selected UI-only command without claiming the source narrator's runtime.
+ * The caller owns staging cleanup AFTER the independent recipient has copied its files.
+ * Cancellation is committed before dispatch: errors must not automatically replay creation.
+ */
+export async function takeBufferedMessageForIndependentCommand(
+	narratorId: string,
+	messageId: string,
+	accepts: (message: BufferedMessage) => boolean,
+): Promise<BufferedMessage | undefined> {
+	return bufferEditHolds.mutate(narratorId, messageId, async () => {
+		const row = await rowByIdRuntime(messageId);
+		if (
+			!row ||
+			row.narratorId !== narratorId ||
+			row.kind !== "user_input" ||
+			row.state !== "queued" ||
+			!row.deliveryId
+		)
+			return undefined;
+		const message = projectMailboxUserMessage(row);
+		if (!accepts(message)) return undefined;
+		// Resolve lazy metadata while the source staging still belongs to this row.
+		const detached = { ...message };
+		const expected = { state: "queued" as const, revision: row.contentRevision };
+		const reason = "Dispatched independent /new command";
+		const deliveryId = row.deliveryId;
+		const port = pgQueue();
+		const cancelled = port
+			? await port.mailbox.cancel(deliveryId, reason, expected)
+			: db.transaction((tx) => {
+					assertBufferObservation(tx, row, messageId);
+					return store.cancel(deliveryId, reason, expected);
+				});
+		if (!cancelled) throw new RuntimeReadConflictError();
+		return detached;
+	});
+}
+
 export const BUFFER_INTERRUPT_DELIVERY_TIMEOUT_MS = 5_000;
 
 export async function readBufferedMessageDeliveryReceipt(
@@ -1804,6 +1843,7 @@ export async function dropBufferedMessage(
 	narratorId: string,
 	msg: BufferedMessage,
 	reason: string,
+	options: { preserveStaging?: boolean } = {},
 ): Promise<boolean> {
 	const claim = msg._mailboxClaim;
 	if (!claim || claim.narratorId !== narratorId) return false;
@@ -1811,11 +1851,11 @@ export async function dropBufferedMessage(
 	const port = pgQueue();
 	if (port) {
 		if (!(await port.mailbox.cancelClaim(claim, reason))) return false;
-		await cleanupStagingPg(port, stagingId);
+		if (!options.preserveStaging) await cleanupStagingPg(port, stagingId);
 		return true;
 	}
 	if (!store.cancelClaim(claim, reason)) return false;
-	await cleanupBufferedTextFiles(stagingId);
+	if (!options.preserveStaging) await cleanupBufferedTextFiles(stagingId);
 	return true;
 }
 

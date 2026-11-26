@@ -23,11 +23,14 @@
  */
 
 import { afterAll, afterEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { existsSync } from "node:fs";
 import { eq } from "drizzle-orm";
 import { users as pgUsers } from "../../db/postgres-schema";
 import { narratorBufferedMessages, narrators, users } from "../../db/schema";
 import { MAILBOX_LIMITS } from "../agent-runtime/limits";
+import { getExecutionOwner, tryClaimExecution } from "../agent-runtime/ownership";
 import type { PostgresRuntimeQueue } from "../agent-runtime/postgres-runtime-queue";
+import { RuntimeReadConflictError } from "../agent-runtime/read-conflict";
 import { bindRuntimeQueue } from "../agent-runtime/runtime-queue-port";
 import { getNarratorWorkerTestDb } from "./narrator-worker-fixture";
 
@@ -45,6 +48,8 @@ const {
 	updateBufferedMessageMode,
 	reorderBufferedMessages,
 	toBufferSummary,
+	takeBufferedMessageForIndependentCommand,
+	cleanupBufferedTextFilesAsync,
 } = await import("../narrator-buffer");
 const { activeNarrators, claimNarratorRuntime, pendingDangerReflections, pendingPermissions } =
 	await import("../narrator-session-state");
@@ -413,6 +418,306 @@ describe("durable queue modes", () => {
 			.where(eq(narratorBufferedMessages.id, guide.id))
 			.run();
 		expect(await updateBufferedMessageMode(NARRATOR_ID, guide.id, "turn")).toBe(false);
+	});
+});
+
+describe("takeBufferedMessageForIndependentCommand", () => {
+	function readRow(id: string) {
+		return db
+			.select()
+			.from(narratorBufferedMessages)
+			.where(eq(narratorBufferedMessages.id, id))
+			.get();
+	}
+
+	test("takes the selected non-head row without changing other rows or their order", async () => {
+		const first = await enqueueBufferedMessage(NARRATOR_ID, "older ordinary input");
+		const selected = await enqueueBufferedMessage(NARRATOR_ID, "/new independent task");
+		const last = await enqueueBufferedMessage(NARRATOR_ID, "later ordinary input");
+		const other = await enqueueBufferedMessage(OTHER_ID, "/new another narrator");
+		const untouched = [first, last, other].map(({ id }) => readRow(id));
+		const accepts = mock((message: { id: string; text: string }) => {
+			expect(message.id).toBe(selected.id);
+			expect(message.text).toBe("/new independent task");
+			return true;
+		});
+
+		const message = await takeBufferedMessageForIndependentCommand(
+			NARRATOR_ID,
+			selected.id,
+			accepts,
+		);
+
+		expect(message?.id).toBe(selected.id);
+		expect(message?.text).toBe("/new independent task");
+		expect(message?._mailboxClaim).toBeUndefined();
+		expect(accepts).toHaveBeenCalledTimes(1);
+		expect(readRow(selected.id)).toMatchObject({
+			state: "cancelled",
+			lastError: "Dispatched independent /new command",
+			text: "",
+		});
+		expect([first, last, other].map(({ id }) => readRow(id))).toEqual(untouched);
+		expect((await getBufferedMessagesAsync(NARRATOR_ID)).map((row) => row.id)).toEqual([
+			first.id,
+			last.id,
+		]);
+	});
+
+	test("does not register an execution owner even while accepting an ownerless command", async () => {
+		const selected = await enqueueBufferedMessage(NARRATOR_ID, "/new ownerless");
+		expect(getExecutionOwner(NARRATOR_ID)).toBeUndefined();
+		expect(activeNarrators.has(NARRATOR_ID)).toBe(false);
+		const accepts = mock(() => {
+			expect(getExecutionOwner(NARRATOR_ID)).toBeUndefined();
+			expect(activeNarrators.has(NARRATOR_ID)).toBe(false);
+			return true;
+		});
+		expect(
+			await takeBufferedMessageForIndependentCommand(NARRATOR_ID, selected.id, accepts),
+		).toBeDefined();
+		expect(accepts).toHaveBeenCalledTimes(1);
+		expect(getExecutionOwner(NARRATOR_ID)).toBeUndefined();
+		expect(activeNarrators.has(NARRATOR_ID)).toBe(false);
+	});
+
+	test("leaves the existing execution owner and live loop untouched", async () => {
+		const selected = await enqueueBufferedMessage(NARRATOR_ID, "/new while running");
+		registerLiveLoop(NARRATOR_ID);
+		const session = activeNarrators.get(NARRATOR_ID);
+		if (!session) throw new Error("Expected fixture live session");
+		const owner = tryClaimExecution(NARRATOR_ID, "run");
+		if (!owner) throw new Error("Expected fixture execution owner");
+		const sessionBefore = { ...session };
+		try {
+			const message = await takeBufferedMessageForIndependentCommand(
+				NARRATOR_ID,
+				selected.id,
+				() => {
+					expect(getExecutionOwner(NARRATOR_ID)).toBe(owner);
+					return true;
+				},
+			);
+			expect(message?.id).toBe(selected.id);
+			expect(getExecutionOwner(NARRATOR_ID)).toBe(owner);
+			expect(owner.isCurrent()).toBe(true);
+			expect(activeNarrators.get(NARRATOR_ID)).toBe(session);
+			expect(session).toEqual(sessionBefore);
+		} finally {
+			owner.release();
+		}
+	});
+
+	test("concurrent takes succeed once and never replay the cancelled command", async () => {
+		const selected = await enqueueBufferedMessage(NARRATOR_ID, "/new only once");
+		const accepts = mock(() => true);
+		const results = await Promise.allSettled([
+			takeBufferedMessageForIndependentCommand(NARRATOR_ID, selected.id, accepts),
+			takeBufferedMessageForIndependentCommand(NARRATOR_ID, selected.id, accepts),
+		]);
+		const fulfilled = results.filter((result) => result.status === "fulfilled");
+		const rejected = results.filter((result) => result.status === "rejected");
+		expect(fulfilled.map((result) => result.value?.id)).toEqual([selected.id]);
+		expect(rejected).toHaveLength(1);
+		expect(rejected[0].reason).toMatchObject({ code: "BUFFER_EDIT_CONFLICT" });
+		expect(
+			await takeBufferedMessageForIndependentCommand(NARRATOR_ID, selected.id, accepts),
+		).toBeUndefined();
+		expect(accepts).toHaveBeenCalledTimes(1);
+		expect(readRow(selected.id)?.state).toBe("cancelled");
+	});
+
+	test.each([
+		{ text: "/new quoted literally", literal: true },
+		{ text: "ordinary guidance", literal: false },
+	])("honors injected rejection for $text", async ({ text, literal }) => {
+		const selected = await enqueueBufferedMessage(NARRATOR_ID, text);
+		db.update(narratorBufferedMessages)
+			.set({ metadataJson: JSON.stringify({ executionIntent: { literal } }) })
+			.where(eq(narratorBufferedMessages.id, selected.id))
+			.run();
+		const before = readRow(selected.id);
+		const accepts = mock((message: { text: string; executionIntent?: { literal?: boolean } }) => {
+			expect(message.text).toBe(text);
+			expect(message.executionIntent?.literal).toBe(literal);
+			return false;
+		});
+		expect(
+			await takeBufferedMessageForIndependentCommand(NARRATOR_ID, selected.id, accepts),
+		).toBeUndefined();
+		expect(accepts).toHaveBeenCalledTimes(1);
+		expect(readRow(selected.id)).toEqual(before);
+	});
+
+	test("does not offer failed, claimed, machine, foreign, undeliverable or missing rows", async () => {
+		const ids: string[] = [];
+		for (const state of ["failed", "claimed"] as const) {
+			const selected = await enqueueBufferedMessage(NARRATOR_ID, `/new ${state}`);
+			db.update(narratorBufferedMessages)
+				.set({ state })
+				.where(eq(narratorBufferedMessages.id, selected.id))
+				.run();
+			ids.push(selected.id);
+		}
+		const machine = await enqueueBufferedMessage(NARRATOR_ID, "/new machine");
+		db.update(narratorBufferedMessages)
+			.set({ kind: "agent_message" })
+			.where(eq(narratorBufferedMessages.id, machine.id))
+			.run();
+		const undeliverable = await enqueueBufferedMessage(NARRATOR_ID, "/new no delivery");
+		db.update(narratorBufferedMessages)
+			.set({ deliveryId: null })
+			.where(eq(narratorBufferedMessages.id, undeliverable.id))
+			.run();
+		const foreign = await enqueueBufferedMessage(OTHER_ID, "/new foreign");
+		ids.push(machine.id, undeliverable.id, foreign.id, "missing-independent-command");
+		const before = ids.map(readRow);
+		const accepts = mock(() => true);
+		for (const id of ids) {
+			expect(
+				await takeBufferedMessageForIndependentCommand(NARRATOR_ID, id, accepts),
+			).toBeUndefined();
+		}
+		expect(accepts).not.toHaveBeenCalled();
+		expect(ids.map(readRow)).toEqual(before);
+	});
+
+	test.each([
+		"revision",
+		"state",
+		"metadata",
+	] as const)("rejects a stale SQLite observation after a concurrent %s change", async (change) => {
+		const selected = await enqueueBufferedMessage(NARRATOR_ID, "/new stale");
+		const accepts = mock(() => {
+			db.update(narratorBufferedMessages)
+				.set(
+					change === "revision"
+						? { contentRevision: 7 }
+						: change === "state"
+							? { state: "claimed" }
+							: { metadataJson: JSON.stringify({ executionIntent: { literal: true } }) },
+				)
+				.where(eq(narratorBufferedMessages.id, selected.id))
+				.run();
+			return true;
+		});
+		await expect(
+			takeBufferedMessageForIndependentCommand(NARRATOR_ID, selected.id, accepts),
+		).rejects.toBeInstanceOf(RuntimeReadConflictError);
+		expect(accepts).toHaveBeenCalledTimes(1);
+		expect(readRow(selected.id)?.state).toBe(change === "state" ? "claimed" : "queued");
+		expect(readRow(selected.id)?.text).toBe("/new stale");
+	});
+
+	test("detaches staged body and command metadata, retaining attachments until caller cleanup", async () => {
+		const text = `/new ${"large body ".repeat(Math.ceil(MAILBOX_LIMITS.inlineBytes / 10))}`;
+		const commandText = `/new ${"command ".repeat(MAILBOX_LIMITS.metadataBytes / 8)}`;
+		const attachmentText = "independent recipient must still be able to copy this attachment";
+		const selected = await enqueueBufferedMessage(
+			NARRATOR_ID,
+			text,
+			undefined,
+			commandText,
+			undefined,
+			undefined,
+			[new File([attachmentText], "instructions.txt", { type: "text/plain" })],
+		);
+		const row = readRow(selected.id);
+		if (!row) throw new Error("Expected staged mailbox row");
+		const payload = JSON.parse(row.payloadRefJson ?? "null") as { path: string };
+		const metadata = JSON.parse(row.metadataJson ?? "null") as {
+			stagingId: string;
+			commandTextPath: string;
+		};
+		const saved = JSON.parse(row.textFilePathsJson ?? "null") as Array<{ path: string }>;
+		try {
+			expect(row.text).toBe("");
+			expect(row.commandText).toBeNull();
+			const message = await takeBufferedMessageForIndependentCommand(
+				NARRATOR_ID,
+				selected.id,
+				(projected) => projected.commandText === commandText,
+			);
+			expect(message?.text).toBe(text);
+			expect(message?.commandText).toBe(commandText);
+			expect(Object.getOwnPropertyDescriptor(message, "text")?.get).toBeUndefined();
+			expect(Object.getOwnPropertyDescriptor(message, "commandText")?.get).toBeUndefined();
+			expect(Object.getOwnPropertyDescriptor(message, "textFiles")?.get).toBeUndefined();
+			expect(message?.textFiles?.[0].name).toBe("instructions.txt");
+			expect(await message?.textFiles?.[0].text()).toBe(attachmentText);
+			expect(message?._stagingId).toBe(metadata.stagingId);
+			for (const path of [payload.path, metadata.commandTextPath, saved[0].path]) {
+				expect(existsSync(path)).toBe(true);
+			}
+			expect(readRow(selected.id)).toMatchObject({
+				state: "cancelled",
+				payloadRefJson: null,
+				metadataJson: null,
+				textFilePathsJson: null,
+			});
+			await cleanupBufferedTextFilesAsync(metadata.stagingId);
+			expect(existsSync(saved[0].path)).toBe(false);
+			// Scalars must no longer depend on the now-deleted source staging.
+			expect(message?.text).toBe(text);
+			expect(message?.commandText).toBe(commandText);
+		} finally {
+			await cleanupBufferedTextFilesAsync(metadata.stagingId);
+		}
+	});
+
+	test.each([
+		true,
+		false,
+	])("PG uses named cancellation authority and observed revision without SQLite (cancel=%s)", async (cancelled) => {
+		const selected = await enqueueBufferedMessage(NARRATOR_ID, "/new pg authority");
+		const fixtureRow = readRow(selected.id);
+		if (!fixtureRow) throw new Error("Expected fixture mailbox row");
+		const row = {
+			...fixtureRow,
+			id: "pg-independent-row",
+			deliveryId: "pg-independent-delivery",
+			contentRevision: 7,
+		};
+		const getById = mock(async (id: string) => {
+			expect(id).toBe(row.id);
+			return row;
+		});
+		const cancel = mock(async () => cancelled);
+		bindRuntimeQueue({
+			backend: "postgres",
+			queue: { mailbox: { getById, cancel } } as unknown as PostgresRuntimeQueue,
+		});
+		const forbiddenSqlite = new Proxy(
+			{},
+			{
+				get() {
+					throw new Error("Forbidden SQLite access during independent PG command");
+				},
+			},
+		);
+		mock.module("../../db", () => ({
+			...realDbModule,
+			db: forbiddenSqlite,
+			sqlite: forbiddenSqlite,
+		}));
+		try {
+			const result = takeBufferedMessageForIndependentCommand(NARRATOR_ID, row.id, () => true);
+			if (cancelled) {
+				expect(await result).toMatchObject({ id: row.id, text: "/new pg authority" });
+			} else {
+				await expect(result).rejects.toBeInstanceOf(RuntimeReadConflictError);
+			}
+			expect(getById).toHaveBeenCalledTimes(1);
+			expect(cancel).toHaveBeenCalledTimes(1);
+			expect(cancel).toHaveBeenCalledWith(row.deliveryId, "Dispatched independent /new command", {
+				state: "queued",
+				revision: 7,
+			});
+		} finally {
+			bindRuntimeQueue(undefined);
+			mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
+		}
+		expect(readRow(selected.id)).toEqual(fixtureRow);
 	});
 });
 

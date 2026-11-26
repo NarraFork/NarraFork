@@ -7,7 +7,7 @@ import {
 import type { BufferedMessage } from "../narrator-session-state";
 
 describe("queued /new initial message", () => {
-	test("only media adds a new attachment-only trigger", () => {
+	test("all supported attachments trigger an initial message without command arguments", () => {
 		const buffered: BufferedMessage = {
 			id: "queued",
 			text: "/new",
@@ -15,7 +15,10 @@ describe("queued /new initial message", () => {
 			images: [{ imageId: "image", filename: "image.png", mediaType: "image/png" }],
 			textFiles: [new File(["text"], "note.txt")],
 		};
-		expect(shouldSendQueuedNewInitialMessage("", buffered)).toBe(false);
+		expect(shouldSendQueuedNewInitialMessage("", buffered)).toBe(true);
+		expect(shouldSendQueuedNewInitialMessage("", { images: buffered.images })).toBe(true);
+		expect(shouldSendQueuedNewInitialMessage("", { textFiles: buffered.textFiles })).toBe(true);
+		expect(shouldSendQueuedNewInitialMessage("", {})).toBe(false);
 		expect(shouldSendQueuedNewInitialMessage("hello", buffered)).toBe(true);
 		expect(
 			shouldSendQueuedNewInitialMessage("", {

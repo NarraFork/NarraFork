@@ -12,7 +12,9 @@
  */
 import { afterAll, describe, expect, test } from "bun:test";
 import { WriteConflictError } from "@server/db/backend/write-port";
+import type { SQL } from "drizzle-orm";
 import type { BunSQLDatabase } from "drizzle-orm/bun-sql";
+import { PgDialect } from "drizzle-orm/pg-core";
 import { setKnowledgeWriteStore } from "../knowledge/store";
 import { composePostgresStores } from "../postgres-composition";
 import { setProjectReadAdapter } from "../read";
@@ -80,6 +82,35 @@ describe("postgres queue mode atomic mutations", () => {
 		expect(await store.mailbox.readUserBufferedDeliveryReceipt("n1", "m1")).toEqual(receipt);
 		expect(columns).toEqual(["id", "state", "recipientMessageId", "lastError"]);
 	});
+	for (const won of [true, false]) {
+		test(`independent command cancellation checks observed state and revision (won=${won})`, async () => {
+			let predicate: SQL | undefined;
+			const tx = {
+				update: () => ({
+					set: () => ({
+						where: (condition: SQL) => {
+							predicate = condition;
+							return { returning: async () => (won ? [{ id: "m1" }] : []) };
+						},
+					}),
+				}),
+			};
+			const store = createPostgresRuntimeQueue({
+				transaction: (section: (tx: unknown) => unknown) => section(tx),
+			} as unknown as BunSQLDatabase);
+			expect(
+				await store.mailbox.cancel("delivery", "independent /new", {
+					state: "queued",
+					revision: 7,
+				}),
+			).toBe(won);
+			if (!predicate) throw new Error("Missing cancellation predicate");
+			const query = new PgDialect().sqlToQuery(predicate);
+			expect(query.sql).toContain('"content_revision"');
+			expect(query.sql).toContain('"state"');
+			expect(query.params).toEqual(["delivery", "queued", "failed", "queued", 7]);
+		});
+	}
 	test("mode patches preserve payload metadata and return false for a lost CAS", async () => {
 		for (const won of [true, false]) {
 			let selections = 0;

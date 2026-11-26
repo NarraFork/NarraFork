@@ -426,6 +426,7 @@ import {
 	projectMailboxUserMessage,
 	removeBufferedMessage,
 	restoreBufferedMessage,
+	takeBufferedMessageForIndependentCommand,
 	toBufferSummary,
 	withCurrentBufferedGuidance,
 } from "./narrator-buffer";
@@ -730,13 +731,24 @@ export async function setNarratorDefaultDevice(
 
 export function shouldSendQueuedNewInitialMessage(
 	initialMessage: string,
-	buffered: Pick<BufferedMessage, "fileReferences" | "media">,
+	buffered: Pick<BufferedMessage, "fileReferences" | "media" | "images" | "textFiles">,
 ): boolean {
-	return Boolean(initialMessage || buffered.fileReferences?.length || buffered.media?.length);
+	return Boolean(
+		initialMessage ||
+			buffered.fileReferences?.length ||
+			buffered.media?.length ||
+			buffered.images?.length ||
+			buffered.textFiles?.length,
+	);
 }
 
 export async function executeQueuedNewCommand(
-	active: ActiveNarrator,
+	active: {
+		narratorId: string;
+		cwd?: string;
+		locale: Locale;
+		_replyInUserLanguage?: boolean;
+	},
 	buffered: BufferedMessage,
 	initialMessage: string,
 ): Promise<string> {
@@ -751,7 +763,7 @@ export async function executeQueuedNewCommand(
 						sourceNarrator,
 						buffered.createdBy ?? sourceNarrator.ownerUserId,
 						undefined,
-						{ signal: active.abortController.signal },
+						{},
 					)
 				).model
 			: (sourceNarrator.model ?? undefined);
@@ -798,6 +810,67 @@ export async function executeQueuedNewCommand(
 	}
 
 	return newNarrator.id;
+}
+
+/**
+ * Prepared under source admission; execute outside it. No source runtime owner,
+ * guidance controller, message history or status participates in this dispatch.
+ */
+export async function prepareIndependentQueuedNewCommand(
+	narratorId: string,
+	messageId: string,
+): Promise<(() => Promise<string>) | undefined> {
+	let initialMessage = "";
+	const buffered = await takeBufferedMessageForIndependentCommand(
+		narratorId,
+		messageId,
+		(message) => {
+			const command = parseQueuedNewCommand(
+				message.text,
+				message.commandText,
+				message.composerDocument,
+				message.executionIntent,
+			);
+			if (!command) return false;
+			initialMessage = command.initialMessage;
+			return true;
+		},
+	);
+	if (!buffered) return undefined;
+	return async () => {
+		try {
+			const source = await narratorService.getById(narratorId);
+			const active = activeNarrators.get(narratorId);
+			const userId = buffered.createdBy ?? source.ownerUserId;
+			const { getUserReplyInLanguage } = await import("../lib/i18n");
+			const newNarratorId = await executeQueuedNewCommand(
+				{
+					narratorId,
+					cwd: source.cwd ?? active?.cwd,
+					locale: userId ? await getUserLanguage(userId) : (active?.locale ?? "en"),
+					_replyInUserLanguage: userId ? await getUserReplyInLanguage(userId) : false,
+				},
+				buffered,
+				initialMessage,
+			);
+			broadcastToNarrator(narratorId, {
+				type: "buffer_consumed",
+				narratorId,
+				messageId: buffered.id,
+				remaining: toBufferSummary(await getBufferedMessagesAsync(narratorId)),
+			});
+			broadcastToNarrator(narratorId, {
+				type: "queued_new_narrator_created",
+				narratorId,
+				messageId: buffered.id,
+				newNarratorId,
+			});
+			return newNarratorId;
+		} finally {
+			// Text-file Blobs are lazy: only clean after the new recipient copied them.
+			await cleanupBufferedTextFilesAsync(buffered._stagingId ?? buffered.id);
+		}
+	};
 }
 
 /**
@@ -1110,8 +1183,16 @@ async function resumeNextBufferedMessageUnlocked(
 			first.composerDocument,
 			first.executionIntent,
 		);
-		const controlCommand = first.executionIntent?.controlCommand;
-		if (newCommand || controlCommand) {
+		const controlCommand = newCommand ? undefined : first.executionIntent?.controlCommand;
+		if (newCommand) {
+			if (
+				!(await dropBufferedMessage(narratorId, first, "Dispatched independent /new command", {
+					preserveStaging: true,
+				}))
+			)
+				throw new ValidationError("Buffered /new claim is no longer current");
+		}
+		if (controlCommand) {
 			const commandMessage = await withInboxOwner(narratorId, async () => {
 				const row = claimedRow;
 				if (!row) throw new ValidationError("Buffered command claim missing");
@@ -1240,9 +1321,31 @@ async function resumeNextBufferedMessageUnlocked(
 						messageId: first.id,
 						newNarratorId,
 					});
-					await settleAfterTerminalCommand();
 				})
-				.catch((err) => handleTerminalCommandError("/new", err));
+				.catch((err) => {
+					logger.error("Independent queued /new failed", { narratorId, error: String(err) });
+					try {
+						broadcastToNarrator(narratorId, {
+							type: "narrator_error",
+							narratorId,
+							error: String(err),
+						});
+					} catch (error) {
+						logger.warn("Independent /new error notification failed", {
+							narratorId,
+							error: String(error),
+						});
+					}
+				})
+				.finally(async () => {
+					await cleanupBufferedTextFilesAsync(first._stagingId ?? first.id).catch((error) => {
+						logger.warn("Independent /new staging cleanup failed", {
+							narratorId,
+							error: String(error),
+						});
+					});
+					await settleAfterTerminalCommand();
+				});
 		} else if (goalCommand) {
 			// Queued /goal: persist its task (Dynamic Spec or the outline), then launch its first
 			// turn. If plan mode or another guard prevents starting, keep draining as before.
