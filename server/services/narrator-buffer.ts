@@ -1754,15 +1754,16 @@ export async function runIndependentBufferedCommand(
 						expected,
 						reason,
 					)
-				: db.transaction(() =>
-						store.completeIndependentUserCommand(
+				: db.transaction(() => {
+						const completed: boolean = store.completeIndependentUserCommand(
 							narratorId,
 							messageId,
 							targetNarratorId,
 							expected,
 							reason,
-						),
-					);
+						);
+						return completed;
+					});
 			if (!committed) throw new RuntimeReadConflictError();
 		} catch (error) {
 			// A response can fail after commit. Confirm the durable receipt, never redispatch here.
