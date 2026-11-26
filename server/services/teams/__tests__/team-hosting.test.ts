@@ -21,7 +21,14 @@ import {
 	resolveHosting,
 	setHostingSourceForTests,
 } from "../team-hosting";
-import { authJson, type FakeGh, installFakeGh, repoViewJson, usableGh } from "./fake-gh.fixture";
+import {
+	authJson,
+	type FakeGh,
+	type FakeGhPlan,
+	installFakeGh,
+	repoViewJson,
+	usableGh,
+} from "./fake-gh.fixture";
 
 const posix = process.platform !== "win32";
 let temporary: string;
@@ -158,12 +165,12 @@ describe.skipIf(!posix)("gh (a fake on PATH)", () => {
 
 	test("missing, failing, logged out, read-only, archived, unreadable: each disables with its reason", async () => {
 		fake.hideAll();
-		expect((await resolveHosting("git@github.com:acme/app.git")).gh).toEqual({
-			ok: false,
-			reason: "gh_missing",
+		expect(await resolveHosting("git@github.com:acme/app.git")).toMatchObject({
+			kind: "github",
+			gh: { ok: false, reason: "gh_missing" },
 		});
 		fake.activate();
-		const cases: Array<[Record<string, unknown>, string]> = [
+		const cases: Array<[FakeGhPlan, string]> = [
 			[{ "--version": { exit: 1, stderr: "broken" } }, "gh_missing"],
 			[{ "auth status": { stdout: JSON.stringify({ hosts: {} }) } }, "gh_logged_out"],
 			[{ "auth status": { stdout: authJson("github.com", "error") } }, "gh_logged_out"],
@@ -295,7 +302,7 @@ describe.skipIf(!posix)("gh (a fake on PATH)", () => {
 				"GIT_CONFIG_PARAMETERS",
 				"GIT_SSH_COMMAND",
 			])
-				expect({ key, value: call.env[key] }).toEqual({ key, value: undefined });
+				expect({ key, present: key in call.env }).toEqual({ key, present: false });
 			// Every repository named explicitly.
 			if (call.args[0] === "repo") expect(call.args[2]).toBe("github.com/acme/app");
 		}
