@@ -104,6 +104,12 @@ export interface RemoteSessionOptions {
 	 */
 	onGap?: (missingBytes: number, streamSeq: number) => void;
 	/**
+	 * The executor restarted under the session: `lost` (it was running) or
+	 * `incomplete` (its exit is known, but not all output was recorded). Called
+	 * after the recorded output and before the notice that says so.
+	 */
+	onRestartInterrupted?: (outcome: "lost" | "incomplete", streamSeq: number) => void;
+	/**
 	 * The session ended without an exit from the executor (unknown session,
 	 * revoked device, failed open). Not called for detach or kill.
 	 */
@@ -290,6 +296,7 @@ export function spawnRemoteSession(
 				if (result?.lost === true) {
 					// The executor restarted while this ran (session.journal.disk.v1): the
 					// output it recorded has been delivered, but the outcome was never seen.
+					opts.onRestartInterrupted?.("lost", consumed);
 					if (!opts.onLost)
 						deliverText(
 							"\r\n\x1b[2m[NarraFork: the device's executor restarted while this was running; the output above is all it recorded]\x1b[0m\r\n",
@@ -301,6 +308,7 @@ export function spawnRemoteSession(
 				// Not released here: the owner releases after persisting the final state.
 				const exitCode = typeof result?.exitCode === "number" ? result.exitCode : null;
 				const outputIncomplete = result?.outputIncomplete === true;
+				if (outputIncomplete) opts.onRestartInterrupted?.("incomplete", consumed);
 				if (outputIncomplete)
 					// The device could not record all of it before restarting: say so
 					// rather than present the replay as the whole output.

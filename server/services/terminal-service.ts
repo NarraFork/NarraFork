@@ -41,6 +41,7 @@ import { recordExecutorCleanup, stopExecutorSession } from "./executor-session-c
 import {
 	endWatchesForBuffer,
 	interruptTextWatchesForGap,
+	interruptTextWatchesForRestart,
 	notifyTerminalOutput,
 	suspendTerminalWatchesForShutdown,
 } from "./terminal-watch-service";
@@ -220,12 +221,22 @@ const heldOutput = new Map<string, Array<[string, number | undefined]>>();
 const gapDrains = new Map<string, Promise<void>>();
 
 function onGap(id: string, buffer: BufferManager, missingBytes: number) {
+	holdOutputWhile(id, buffer, () => interruptTextWatchesForGap(id, buffer, missingBytes));
+}
+
+/** The executor restarted under the session: watches settle before its notice lands. */
+function onRestartInterrupted(id: string, buffer: BufferManager, outcome: "lost" | "incomplete") {
+	holdOutputWhile(id, buffer, () => interruptTextWatchesForRestart(id, buffer, outcome));
+}
+
+/** Hold later output (a notice included) back from the buffer while `work` runs. */
+function holdOutputWhile(id: string, buffer: BufferManager, work: () => Promise<void>) {
 	if (heldOutput.has(id)) return;
 	const held: Array<[string, number | undefined]> = [];
 	heldOutput.set(id, held);
-	const drained = interruptTextWatchesForGap(id, buffer, missingBytes)
+	const drained = work()
 		.catch((error) =>
-			logger.warn("Terminal watch gap handling failed", { terminalId: id, error: String(error) }),
+			logger.warn("Terminal watch interruption failed", { terminalId: id, error: String(error) }),
 		)
 		.finally(() => {
 			heldOutput.delete(id);
@@ -309,6 +320,7 @@ async function resumeExecutorSession(
 		since,
 		onData: (data, streamSeq) => onData(terminalId, buffer, data, streamSeq),
 		onGap: (missing) => onGap(terminalId, buffer, missing),
+		onRestartInterrupted: (outcome) => onRestartInterrupted(terminalId, buffer, outcome),
 	});
 	runtime = resumed;
 	activeTerminals.set(terminalId, {
@@ -669,6 +681,7 @@ async function createTerminal(opts: CreateTerminalOptions) {
 			since: 0,
 			onData: (data, streamSeq) => onData(id, buffer, data, streamSeq),
 			onGap: (missing) => onGap(id, buffer, missing),
+			onRestartInterrupted: (outcome) => onRestartInterrupted(id, buffer, outcome),
 		});
 	} else if (useRemote && deviceId && remoteShell) {
 		runtime = spawnRemotePty(deviceId, {

@@ -1052,4 +1052,25 @@ describe("output gaps from a durable executor session", () => {
 		// Lifecycle watches are about the terminal, not its text.
 		expect((await row(lifecycle))?.status).toBe("running");
 	});
+
+	test("an executor restart settles text watches before its notice can match them", async () => {
+		const { interruptTextWatchesForRestart } = await import("../terminal-watch-service");
+		const buffer = newBuffer();
+		output(buffer, "$ ");
+		const replayed = await start(buffer, "step 2 done", { kind: "offset", offset: 0 });
+		// Appears only in the notice that follows the restart, never in the shell's output.
+		const noticeOnly = await start(buffer, "part of it is missing", { kind: "offset", offset: 0 });
+		buffer.append("step 2 done\r\n");
+		await interruptTextWatchesForRestart(TERMINAL, buffer, "incomplete");
+		buffer.append(
+			"\r\n[NarraFork: the device could not record all of this output; part of it is missing]\r\n",
+		);
+
+		const ok = await waitForStatus(replayed);
+		expect(ok?.status).toBe("completed");
+		const ended = await waitForStatus(noticeOnly);
+		expect(ended?.status).toBe("failed");
+		expect(ended?.output).toContain("could not record all output");
+		expect(ended?.output).toContain("may have appeared without being observed");
+	});
 });
