@@ -1742,6 +1742,109 @@ describe("inline queued message mode actions", () => {
 		expect(change.mock.calls).toEqual([["queue-message", "tool"]]);
 	});
 });
+describe("retry-only queued control commands", () => {
+	test.each([
+		"turn",
+		"tool",
+		"interrupt",
+	] as const)("%s reserved rows expose explicit Retry and Remove without edit, mode or sort controls", async (queueMode) => {
+		const message: BufferMessageSummary = {
+			id: "reserved-new",
+			text: "/new target task",
+			bufferedAt: "now",
+			imageCount: 0,
+			state: "failed",
+			error: "Target initialization failed",
+			retryOnly: true,
+			queueMode,
+		};
+		const retry = mock(async () => ({ ok: true as const, resumed: false }));
+		const remove = mock(() => {});
+		const edit = mock(() => {});
+		const change = mock(async () => true);
+		const move = mock(() => {});
+		await render(
+			queuePanel({
+				queuedMessages: [message],
+				handleRetryQueued: retry,
+				handleRemoveQueued: remove,
+				handleStartEditQueued: edit,
+				handleChangeMode: change,
+				handleMoveQueued: move,
+			}),
+		);
+		expect(button(en.queuedRetry).disabled).toBe(false);
+		expect(button(en.cancelBuffer).disabled).toBe(false);
+		expect(document.querySelector("[data-queue-drag-handle]")).toBeNull();
+		for (const label of [
+			en.queuedActions,
+			en.queuedSwitchToGuidance,
+			en.queuedSwitchToNextStep,
+			en.queuedSendUrgently,
+			en.queuedUrgentRetry,
+		])
+			expect(document.querySelector(`button[aria-label="${label}"]`)).toBeNull();
+		await act(async () =>
+			button(en.queuedExpandText).dispatchEvent(new Event("dblclick", { bubbles: true })),
+		);
+		await click(button(en.queuedRetry));
+		expect(retry).toHaveBeenCalledWith(message.id);
+		await click(button(en.cancelBuffer));
+		expect(remove).toHaveBeenCalledWith(message.id);
+		expect(edit).not.toHaveBeenCalled();
+		expect(change).not.toHaveBeenCalled();
+		expect(move).not.toHaveBeenCalled();
+	});
+
+	test("a stale editing prop cannot render an editor for a retry-only row", async () => {
+		await render(
+			queueRow({
+				msg: {
+					id: "reserved",
+					text: "/new next",
+					bufferedAt: "now",
+					imageCount: 0,
+					retryOnly: true,
+					state: "failed",
+				},
+				isEditing: true,
+			}),
+		);
+		expect(document.querySelector(".ProseMirror")).toBeNull();
+		expect(button(en.queuedRetry).disabled).toBe(false);
+		expect(button("Cancel").disabled).toBe(false);
+	});
+
+	test.each([
+		"turn",
+		"tool",
+	] as const)("ordinary failed %s rows keep edit and mode controls", async (queueMode) => {
+		const message: BufferMessageSummary = {
+			id: "ordinary-failed",
+			text: "Editable failure",
+			bufferedAt: "now",
+			imageCount: 0,
+			state: "failed",
+			queueMode,
+		};
+		const edit = mock(() => {});
+		const change = mock(async () => true);
+		await render(queueRow({ msg: message, onStartEdit: edit, onChangeMode: change }));
+		expect(button(en.queuedRetry).disabled).toBe(false);
+		expect(button(en.queuedSendUrgently).disabled).toBe(true);
+		const toggle = button(
+			queueMode === "turn" ? en.queuedSwitchToGuidance : en.queuedSwitchToNextStep,
+		);
+		expect(toggle.disabled).toBe(false);
+		await click(toggle);
+		expect(change).toHaveBeenCalledWith(message.id, queueMode === "turn" ? "tool" : "turn");
+		await act(async () =>
+			button(en.queuedExpandText).dispatchEvent(new Event("dblclick", { bubbles: true })),
+		);
+		expect(edit).toHaveBeenCalledWith(message);
+	});
+});
+
 describe("failed queued message retry UI", () => {
 	test("failed rows show full reason, input, attachments and explicit retry; queued/legacy rows do not", async () => {
 		await render(queueRow());

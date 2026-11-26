@@ -105,6 +105,28 @@ describe("narrators API", () => {
 		}
 	});
 
+	test("buffer summaries preserve retry-only capability without internal target metadata", async () => {
+		Object.defineProperty(g, "localStorage", {
+			configurable: true,
+			value: { getItem: () => null },
+		});
+		const summary = {
+			id: "reserved-new",
+			text: "/new task",
+			bufferedAt: "now",
+			imageCount: 0,
+			state: "failed",
+			retryOnly: true,
+		};
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async () => Response.json([summary]),
+		});
+		const messages = await api.getBufferedMessages("source");
+		expect(messages).toEqual([summary]);
+		expect(messages[0].retryOnly).toBe(true);
+	});
+
 	test("buffer mode and retry preserve new-narrator receipts without source delivery", async () => {
 		Object.defineProperty(g, "localStorage", {
 			configurable: true,

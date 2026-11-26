@@ -1399,3 +1399,28 @@ describe("pushBufferedMessage — an ownerless narrator is refused", () => {
 		expect((await getBufferedMessages(NARRATOR_ID)).map((msg) => msg.text)).toEqual(["during"]);
 	});
 });
+
+describe("independent command queue summaries", () => {
+	for (const queueMode of ["turn", "tool", "interrupt"] as const) {
+		test(`${queueMode} exposes retry-only capability without leaking the reserved narrator ID`, () => {
+			const targetId = "private-reserved-narrator";
+			const input = {
+				id: "failed-input",
+				text: "/new task",
+				bufferedAt: "2026-01-01",
+				state: "failed" as const,
+				queueMode,
+			};
+			const [ordinary, reserved] = toBufferSummary([
+				input,
+				{ ...input, _independentNewNarratorId: targetId },
+			]);
+			expect(ordinary.retryOnly).toBeUndefined();
+			expect(reserved.retryOnly).toBe(true);
+			expect(reserved.state).toBe("failed");
+			expect(reserved.queueMode).toBe(queueMode);
+			expect(reserved).not.toHaveProperty("_independentNewNarratorId");
+			expect(JSON.stringify(reserved)).not.toContain(targetId);
+		});
+	}
+});

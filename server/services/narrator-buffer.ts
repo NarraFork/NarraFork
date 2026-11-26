@@ -2219,6 +2219,8 @@ export interface BufferedTextFileSummary {
 	size: number;
 }
 export interface BufferMessageSummary {
+	/** A reserved independent command can only be retried or removed. */
+	retryOnly?: boolean;
 	hasComposerDocument?: boolean;
 	queueMode?: BufferQueueMode;
 	state?: "queued" | "failed";
@@ -2251,9 +2253,11 @@ export function toBufferSummary(
 		| "queueMode"
 		| "fileReferences"
 		| "hasComposerDocument"
+		| "_independentNewNarratorId"
 	>[],
 ): BufferMessageSummary[] {
 	return msgs.map((m) => ({
+		...(m._independentNewNarratorId ? { retryOnly: true } : {}),
 		hasComposerDocument: m.hasComposerDocument || undefined,
 		id: m.id,
 		state: m.state,

@@ -306,6 +306,32 @@ afterEach(async () => {
 	originals.clear();
 });
 
+test("retry-only summaries survive panel snapshots and every WS buffer update", async () => {
+	const summary = {
+		id: "reserved-new",
+		text: "/new target task",
+		bufferedAt: "now",
+		imageCount: 0,
+		state: "failed" as const,
+		retryOnly: true,
+		queueMode: "turn" as const,
+	};
+	panelSpy.mockResolvedValue(page([], { buffer: [summary] }));
+	await render();
+	expect(current.queuedMessages).toEqual([summary]);
+	for (const type of ["buffer_set", "buffer_preserved", "buffer_consumed"]) {
+		await event({ type: "buffer_set", messages: [] });
+		await event({
+			type,
+			messages: [summary],
+			messageId: "other",
+			remaining: [summary],
+		});
+		expect(current.queuedMessages).toEqual([summary]);
+		expect(current.queuedMessages[0].retryOnly).toBe(true);
+	}
+});
+
 test("queued /new WS receipt refreshes lists and the new detail, then requests navigation only", async () => {
 	const navigated: string[] = [];
 	function QueuedNewHarness() {

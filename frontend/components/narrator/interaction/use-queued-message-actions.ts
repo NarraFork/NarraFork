@@ -361,7 +361,8 @@ export function useQueuedMessageActions(options: UseQueuedMessageActionsOptions)
 	const handleMoveQueued = useCallback(
 		(id: string, direction: -1 | 1) => {
 			const ordinary = queuedMessages.filter(
-				(m) => queuedMessageMode(m) === "turn" && !scopeRef.current.dispatches.has(m.id),
+				(m) =>
+					queuedMessageMode(m) === "turn" && !m.retryOnly && !scopeRef.current.dispatches.has(m.id),
 			);
 			const index = ordinary.findIndex((m) => m.id === id);
 			const target = index >= 0 ? ordinary[index + direction] : undefined;
@@ -376,7 +377,7 @@ export function useQueuedMessageActions(options: UseQueuedMessageActionsOptions)
 			const previous = scope.dispatches.get(id);
 			if (previous?.status === "sending" || previous?.status === "sent") return false;
 			const message = queuedMessages.find((m) => m.id === id) ?? previous?.message;
-			if (!message) return false;
+			if (!message || message.retryOnly) return false;
 			if (mode === "interrupt") {
 				if (!scope.dispatches.has(id) && scope.dispatches.size >= 64) {
 					const evict = [...scope.dispatches].find(([, value]) => value.status !== "sending");
@@ -451,6 +452,7 @@ export function useQueuedMessageActions(options: UseQueuedMessageActionsOptions)
 			const message = queuedMessages.find((message) => message.id === msg.id);
 			if (
 				scopeRef.current.dispatches.has(msg.id) ||
+				message?.retryOnly ||
 				(message && queuedMessageMode(message) === "interrupt")
 			)
 				return Promise.resolve();

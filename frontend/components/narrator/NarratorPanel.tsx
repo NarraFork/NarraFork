@@ -2092,7 +2092,7 @@ function NarratorPanelBody({
 			const queued = queuedMessages.find((item) => item.messageId === messageId);
 			if (!queued) return undefined;
 			return {
-				onEdit: () => queuedEditRef.current(queued.id),
+				onEdit: queued.retryOnly ? undefined : () => queuedEditRef.current(queued.id),
 				onCancel: () => queuedCancelRef.current(queued.id),
 				...(queued.state === "failed" ? { onRetry: () => queuedRetryRef.current(queued.id) } : {}),
 			};

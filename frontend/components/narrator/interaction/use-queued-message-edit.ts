@@ -82,6 +82,13 @@ function releaseLease(edit: EditLease): Promise<boolean> {
 /** The ref is authoritative: React batching must not admit two edits or cancel a pending save. */
 export function useQueuedMessageEdit(options: UseQueuedMessageActionsOptions) {
 	const { narratorId, setQueuedMessages, reconcileBufferedMessages, t } = options;
+	const messagesRef = useRef(options.queuedMessages);
+	messagesRef.current = options.queuedMessages;
+	const isRetryOnly = useCallback(
+		(message: BufferMessageSummary) =>
+			message.retryOnly || messagesRef.current.find((row) => row.id === message.id)?.retryOnly,
+		[],
+	);
 	const scopeRef = useRef<EditScope>({ narratorId, disposed: false, edit: null });
 	if (scopeRef.current.narratorId !== narratorId) {
 		scopeRef.current = { narratorId, disposed: false, edit: null };
@@ -173,7 +180,8 @@ export function useQueuedMessageEdit(options: UseQueuedMessageActionsOptions) {
 
 	const handleStartEditQueued = useCallback(
 		(message: BufferMessageSummary): Promise<void> => {
-			if (scope.disposed || scopeRef.current !== scope) return Promise.resolve();
+			if (scope.disposed || scopeRef.current !== scope || isRetryOnly(message))
+				return Promise.resolve();
 			const previous = scope.edit;
 			if (previous?.saving) return Promise.resolve();
 			if (previous?.message.id === message.id) {
@@ -237,6 +245,15 @@ export function useQueuedMessageEdit(options: UseQueuedMessageActionsOptions) {
 						);
 						if (!live(edit) || edit.retired) return;
 						const latest = messages.find((row) => row.id === message.id);
+						if (latest?.retryOnly) {
+							setQueuedMessages((rows) =>
+								rows.map((row) => (row.id === message.id ? latest : row)),
+							);
+							scope.edit = null;
+							void releaseLease(edit);
+							refresh();
+							return;
+						}
 						if (!latest || edit.expiresAt <= Date.now()) throw new Error(t("queuedEditExpired"));
 						if (
 							latest.contentRevision !== undefined &&
@@ -262,7 +279,17 @@ export function useQueuedMessageEdit(options: UseQueuedMessageActionsOptions) {
 			});
 			return edit.acquiring;
 		},
-		[scope, narratorId, live, refresh, loseProtection, setQueuedMessages, startTimers, t],
+		[
+			scope,
+			narratorId,
+			live,
+			refresh,
+			loseProtection,
+			setQueuedMessages,
+			startTimers,
+			isRetryOnly,
+			t,
+		],
 	);
 
 	const edit = scope.edit;
@@ -286,7 +313,13 @@ export function useQueuedMessageEdit(options: UseQueuedMessageActionsOptions) {
 	const handleSaveEditQueued = useCallback(
 		(message: BufferMessageSummary, text: string, payload: QueuedEditPayload): Promise<boolean> => {
 			const edit = scope.edit;
-			if (!edit || !live(edit) || edit.message.id !== message.id || edit.saving) {
+			if (
+				!edit ||
+				!live(edit) ||
+				edit.message.id !== message.id ||
+				edit.saving ||
+				isRetryOnly(message)
+			) {
 				return Promise.resolve(false);
 			}
 			if (edit.status !== "active" || edit.expiresAt <= Date.now()) {
@@ -295,7 +328,7 @@ export function useQueuedMessageEdit(options: UseQueuedMessageActionsOptions) {
 			}
 			edit.saving = Promise.resolve().then(async () => {
 				try {
-					if (!live(edit) || edit.retired) return false;
+					if (!live(edit) || edit.retired || isRetryOnly(message)) return false;
 					if (edit.status !== "active" || edit.expiresAt <= Date.now()) {
 						loseProtection(edit, t("queuedEditExpired"));
 						return false;
@@ -338,7 +371,7 @@ export function useQueuedMessageEdit(options: UseQueuedMessageActionsOptions) {
 			});
 			return edit.saving;
 		},
-		[scope, live, narratorId, reconcileBufferedMessages, refresh, loseProtection, t],
+		[scope, live, narratorId, reconcileBufferedMessages, refresh, loseProtection, isRetryOnly, t],
 	);
 	return {
 		editingQueuedId: edit?.opened ? edit.message.id : null,

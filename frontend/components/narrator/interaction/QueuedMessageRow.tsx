@@ -200,6 +200,7 @@ export function QueuedMessageRow({
 	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
 		id: msg.id,
 		disabled:
+			msg.retryOnly ||
 			mode !== "turn" ||
 			isEditing ||
 			isStartingEdit ||
@@ -232,6 +233,7 @@ export function QueuedMessageRow({
 	);
 	const changeMode = async (next: QueueMode) => {
 		if (
+			msg.retryOnly ||
 			changingModeRef.current ||
 			retryingRef.current ||
 			urgentRequestedRef.current ||
@@ -265,6 +267,7 @@ export function QueuedMessageRow({
 		}
 	};
 	const canEdit =
+		!msg.retryOnly &&
 		(!queueMutationsDisabled || isEditLocked) &&
 		!editStale &&
 		!isEditing &&
@@ -275,6 +278,7 @@ export function QueuedMessageRow({
 		!urgentOnly;
 	const startEditing = () => {
 		if (
+			msg.retryOnly ||
 			(queueMutationsDisabled && !isEditLocked) ||
 			editStale ||
 			isEditing ||
@@ -311,7 +315,7 @@ export function QueuedMessageRow({
 			changingModeRef.current ||
 			isStartingEdit ||
 			mutationsLocked ||
-			!failed
+			(!failed && !msg.retryOnly)
 		)
 			return;
 		retryingRef.current = true;
@@ -350,6 +354,7 @@ export function QueuedMessageRow({
 	const msgRef = useRef(msg);
 	msgRef.current = msg;
 	const canSubmit =
+		!msg.retryOnly &&
 		editProtected &&
 		!isStartingEdit &&
 		!!snapshot &&
@@ -389,7 +394,7 @@ export function QueuedMessageRow({
 		</div>
 	);
 
-	if (!isEditing) {
+	if (!isEditing || msg.retryOnly) {
 		return (
 			<Group
 				ref={setNodeRef}
@@ -414,6 +419,7 @@ export function QueuedMessageRow({
 				}}
 			>
 				{mode === "turn" &&
+					!msg.retryOnly &&
 					dragHandle(<IconGripVertical size={14} color="var(--mantine-color-dimmed)" />)}
 				<Stack
 					gap={2}
@@ -433,7 +439,7 @@ export function QueuedMessageRow({
 						lineClamp={textExpanded ? undefined : 2}
 						aria-expanded={textExpanded}
 						aria-label={t(textExpanded ? "queuedCollapseText" : "queuedExpandText")}
-						title={t("queuedDoubleClickEdit")}
+						title={msg.retryOnly ? undefined : t("queuedDoubleClickEdit")}
 						onDoubleClick={(event) => {
 							event.preventDefault();
 							event.stopPropagation();
@@ -494,7 +500,7 @@ export function QueuedMessageRow({
 							{t("queuedEditStarting")}
 						</Text>
 					)}
-					{editError && (
+					{editError && !msg.retryOnly && (
 						<Stack gap={2}>
 							<Text size="xs" c="red" role="alert">
 								{editError}
@@ -516,7 +522,7 @@ export function QueuedMessageRow({
 					)}
 					{failureNotice}
 				</Stack>
-				{failed && !urgentOnly && (
+				{(msg.retryOnly || (failed && !urgentOnly)) && (
 					<Button
 						size="compact-xs"
 						color="red"
@@ -528,7 +534,7 @@ export function QueuedMessageRow({
 						{t("queuedRetry")}
 					</Button>
 				)}
-				{!urgentCommitted && !urgentOnly && (
+				{!msg.retryOnly && !urgentCommitted && !urgentOnly && (
 					<Tooltip label={toggleLabel} withinPortal>
 						<ActionIcon
 							size="sm"
@@ -543,84 +549,90 @@ export function QueuedMessageRow({
 						</ActionIcon>
 					</Tooltip>
 				)}
-				<Tooltip
-					label={urgentCommitted ? urgentLabel : `${urgentLabel}. ${t("queuedInterruptWarning")}`}
-					withinPortal
-					multiline
-					maw={260}
-				>
-					<ActionIcon
-						size="sm"
-						variant="subtle"
-						color="orange"
-						aria-label={urgentLabel}
-						disabled={
-							isStartingEdit ||
-							mutationsLocked ||
-							(failed && !urgentOnly) ||
-							retrying ||
-							changingMode !== null ||
-							urgentCommitted
-						}
-						loading={changingMode === "interrupt"}
-						onClick={() => void changeMode("interrupt")}
-					>
-						<IconBolt size={14} />
-					</ActionIcon>
-				</Tooltip>
-				<Menu withinPortal position="top-end">
-					<Menu.Target>
-						<ActionIcon
-							size="sm"
-							variant="subtle"
-							color="gray"
-							disabled={isStartingEdit || mutationsLocked || retrying || changingMode !== null}
-							aria-label={t("queuedActions")}
+				{!msg.retryOnly && (
+					<>
+						<Tooltip
+							label={
+								urgentCommitted ? urgentLabel : `${urgentLabel}. ${t("queuedInterruptWarning")}`
+							}
+							withinPortal
+							multiline
+							maw={260}
 						>
-							<IconDotsVertical size={14} />
-						</ActionIcon>
-					</Menu.Target>
-					<Menu.Dropdown>
-						<Menu.Item
-							leftSection={<IconPencil size={14} />}
-							disabled={!canEdit}
-							onClick={startEditing}
-						>
-							{editLabel}
-						</Menu.Item>
+							<ActionIcon
+								size="sm"
+								variant="subtle"
+								color="orange"
+								aria-label={urgentLabel}
+								disabled={
+									isStartingEdit ||
+									mutationsLocked ||
+									(failed && !urgentOnly) ||
+									retrying ||
+									changingMode !== null ||
+									urgentCommitted
+								}
+								loading={changingMode === "interrupt"}
+								onClick={() => void changeMode("interrupt")}
+							>
+								<IconBolt size={14} />
+							</ActionIcon>
+						</Tooltip>
+						<Menu withinPortal position="top-end">
+							<Menu.Target>
+								<ActionIcon
+									size="sm"
+									variant="subtle"
+									color="gray"
+									disabled={isStartingEdit || mutationsLocked || retrying || changingMode !== null}
+									aria-label={t("queuedActions")}
+								>
+									<IconDotsVertical size={14} />
+								</ActionIcon>
+							</Menu.Target>
+							<Menu.Dropdown>
+								<Menu.Item
+									leftSection={<IconPencil size={14} />}
+									disabled={!canEdit}
+									onClick={startEditing}
+								>
+									{editLabel}
+								</Menu.Item>
 
-						{mode === "turn" && (
-							<>
+								{mode === "turn" && (
+									<>
+										<Menu.Divider />
+										<Menu.Item
+											disabled={mutationsLocked || !canMoveUp}
+											onClick={() => onMove(msg.id, -1)}
+										>
+											{t("queuedMoveUp")}
+										</Menu.Item>
+										<Menu.Item
+											disabled={mutationsLocked || !canMoveDown}
+											onClick={() => onMove(msg.id, 1)}
+										>
+											{t("queuedMoveDown")}
+										</Menu.Item>
+									</>
+								)}
 								<Menu.Divider />
 								<Menu.Item
-									disabled={mutationsLocked || !canMoveUp}
-									onClick={() => onMove(msg.id, -1)}
+									color="red"
+									disabled={isStartingEdit || mutationsLocked}
+									onClick={() => onRemove(msg.id)}
 								>
-									{t("queuedMoveUp")}
+									{cancelBufferLabel}
 								</Menu.Item>
-								<Menu.Item
-									disabled={mutationsLocked || !canMoveDown}
-									onClick={() => onMove(msg.id, 1)}
-								>
-									{t("queuedMoveDown")}
-								</Menu.Item>
-							</>
-						)}
-						<Menu.Divider />
-						<Menu.Item
-							color="red"
-							disabled={isStartingEdit || mutationsLocked}
-							onClick={() => onRemove(msg.id)}
-						>
-							{cancelBufferLabel}
-						</Menu.Item>
-						{onClearAll && (
-							<Menu.Item color="red" disabled={mutationsLocked} onClick={onClearAll}>
-								{t("clearAllQueued")}
-							</Menu.Item>
-						)}
-					</Menu.Dropdown>
-				</Menu>
+								{onClearAll && (
+									<Menu.Item color="red" disabled={mutationsLocked} onClick={onClearAll}>
+										{t("clearAllQueued")}
+									</Menu.Item>
+								)}
+							</Menu.Dropdown>
+						</Menu>
+					</>
+				)}
 				<Tooltip label={cancelBufferLabel} withinPortal>
 					<CloseButton
 						size="sm"

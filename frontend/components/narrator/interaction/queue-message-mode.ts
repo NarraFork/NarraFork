@@ -11,14 +11,14 @@ export function moveQueuedTurn(
 	id: string,
 	targetId: string,
 ): BufferMessageSummary[] {
-	const ordinary = messages.filter((message) => queuedMessageMode(message) === "turn");
+	const movable = (message: BufferMessageSummary) =>
+		queuedMessageMode(message) === "turn" && !message.retryOnly;
+	const ordinary = messages.filter(movable);
 	const from = ordinary.findIndex((message) => message.id === id);
 	const to = ordinary.findIndex((message) => message.id === targetId);
 	if (from < 0 || to < 0 || from === to) return messages;
 	const [moved] = ordinary.splice(from, 1);
 	ordinary.splice(to, 0, moved);
 	let index = 0;
-	return messages.map((message) =>
-		queuedMessageMode(message) === "turn" ? ordinary[index++] : message,
-	);
+	return messages.map((message) => (movable(message) ? ordinary[index++] : message));
 }

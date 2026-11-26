@@ -980,6 +980,8 @@ export interface BufferMessageSummary {
 	/** Optional delivery identity for matching a canonical row. */
 	deliveryId?: string | null;
 	state?: "queued" | "failed";
+	/** Reserved control-command target: only retry or removal is allowed. */
+	retryOnly?: boolean;
 	error?: string | null;
 	text: string;
 	bufferedAt: string;

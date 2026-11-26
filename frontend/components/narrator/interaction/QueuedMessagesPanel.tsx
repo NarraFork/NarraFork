@@ -96,7 +96,7 @@ export function QueuedMessagesPanel(props: QueuedMessagesPanelProps) {
 		}))
 		.filter(({ count }) => count > 0);
 	const ordinaryIds = queuedMessages
-		.filter((message) => queuedMessageMode(message) === "turn")
+		.filter((message) => queuedMessageMode(message) === "turn" && !message.retryOnly)
 		.map((message) => message.id);
 	const single = queuedMessages.length === 1;
 	const hasActiveEditor =
