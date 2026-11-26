@@ -32,6 +32,14 @@ import { findLatestSpecTasksToolUseIdInMessages } from "./vlist-spec-tasks-pin";
 
 export interface BuildPretextDocumentLayoutOptions {
 	compactAuxiliaryContent?: boolean;
+	/**
+	 * 本会话是子代理。
+	 *
+	 * 只为一件事：让 adapter 给「父代理派发任务」那条 user 消息打上 `roundStart`
+	 * 标记 —— 它的呈现形态不固定（用户气泡 / 注入气泡 / 来源卡），下游无法靠
+	 * `kind` 反推它是不是一轮的开始。见 `vlist/round-group.ts`。
+	 */
+	isSubagent?: boolean;
 	/** Transient document-owned caches/providers, not part of the persisted snapshot. */
 	segmentationCache?: MessageSegmentationCache;
 	measure?: MeasureElement;
@@ -67,6 +75,32 @@ export interface BuildPretextDocumentLayoutOptions {
 	planTreeView?: (key: string) => PlanTreeView | undefined;
 	recentMessageIds?: ReadonlySet<string>;
 	resolveRecentMessageIds?: (messages: readonly NarratorMsg[]) => ReadonlySet<string>;
+	/**
+	 * 整轮折叠：读者已展开的轮（按轮首 spec 的 key 记）、折叠开关与标题拼装。
+	 *
+	 * 缺省 = 不折叠。装配层据此组装 `roundFold` 选项传给 manifest builder；
+	 * LOD 6 与「设置里关掉」都会让折叠整体退化为零成本的空操作。
+	 */
+	roundFold?: {
+		/** 读者的「折叠已完成轮次」偏好。 */
+		enabled: boolean;
+		/** 本会话是否子代理（切轮判据不同，见 isRoundStartSpec）。 */
+		isSubagent?: boolean;
+		/** 已被读者「提升为完整行」的轮（轮首 spec 的 key）——整轮内联。 */
+		expandedRoundKeys?: ReadonlySet<string>;
+		/** 已由读者点开做盒内预览的轮（轮首 spec 的 key）。 */
+		previewRoundKeys?: ReadonlySet<string>;
+		/** 判定元素是否还在跑（有则不折该轮）。 */
+		isLiveSpec?: (spec: ElementSpec) => boolean;
+		/** 读元素时间（算一轮跑了多久）。 */
+		readTime?: (spec: ElementSpec) => number | undefined;
+		/** 轮首 spec → 该轮时长（ms）。首选来源（后端轮次索引）。 */
+		readDuration?: (headSpec: ElementSpec) => number | undefined;
+		/** 轮首 spec → 该轮 token 用量。同一来源；查不到则该轮不出 token 段。 */
+		readTokens?: (headSpec: ElementSpec) => number | undefined;
+		/** 拼折叠条标题（宿主负责本地化）。 */
+		buildTitle: (input: { durationMs: number | undefined; tokens: number | undefined }) => string;
+	};
 	labels?: Record<string, string>;
 	/**
 	 * Revision of the injected `labels` (the active UI language). The adapter
@@ -431,7 +465,24 @@ export function buildPretextDocumentLayout(
 		keepToolUseIds:
 			latestSpecTasksToolUseId != null ? new Set([latestSpecTasksToolUseId]) : undefined,
 	};
-	const renderUnits = groupRenderUnits(segments, options.lod <= 2, groupingOptions);
+	/**
+	 * 整轮折叠开着时，**关掉 activity 分组**。
+	 *
+	 * 两层折叠叠在一起会互相吃掉内容：activity 分组先把连续的工具调用打成一个
+	 * trace 单元，整轮折叠再把「轮首之后 → 最终回复之前」的元素收进 pill ——
+	 * 那个 trace 单元本身不在折叠区间里（它有自己的边界），于是读者点开 pill
+	 * 只看到文字，这一轮的工具过程整个消失，也点不开。
+	 *
+	 * 实测就是这样：某轮 pill 的 `folded` 里 5 个元素全是 markdown，零个工具卡，
+	 * 而同一份数据里这一轮有 33 个 tool 块。
+	 *
+	 * 关掉分组后，每张工具卡保持独立元素，于是它既在折叠区间内、也保留自己的
+	 * 展开身份 —— 「点开 pill 能看到这一轮干了什么，并能逐张展开」才成立。
+	 * 代价只在**点开的那一刻**：折叠着的时候成本与以前完全一样（都是一行常量高度）。
+	 */
+	const roundFoldingActive = options.roundFold?.enabled === true;
+	const activityGroupingEnabled = options.lod <= 2 && !roundFoldingActive;
+	const renderUnits = groupRenderUnits(segments, activityGroupingEnabled, groupingOptions);
 	const adapterUnits: AdapterRenderUnit[] = renderUnits.map((unit, index) =>
 		unit.kind === "activity"
 			? {
@@ -512,11 +563,34 @@ export function buildPretextDocumentLayout(
 	const labelRevision = options.labelsRevision
 		? `${options.documentRevision}~l:${options.labelsRevision}`
 		: options.documentRevision;
+	// `isSubagent` 也进修订号：adapter 按它决定要不要给 user 消息打 `roundStart`，
+	// 而 spec.key 与消息版本都区分不出这两种产出。`compactAuxiliaryContent` 就吃过
+	// 同样的亏（见下一行的 `~aux:1`）：不打进修订号，测量缓存会把两种形态当成同一份。
+	const subagentRevision = options.isSubagent ? `${labelRevision}~sub:1` : labelRevision;
 	const documentRevision = options.compactAuxiliaryContent
-		? `${labelRevision}~aux:1`
-		: labelRevision;
+		? `${subagentRevision}~aux:1`
+		: subagentRevision;
 	const built = buildPretextLayoutManifest({
 		...options,
+		// 折叠开启时，低 LOD 的工具调用必须逐张出卡片，不能压成「工具调用 ×N」
+		// 计数行 —— 否则整轮折叠收走的是汇总行，点开 pill 看不到这一轮的工具过程。
+		keepToolCards: roundFoldingActive,
+		// `options.roundFold` 是「读者偏好」形态，manifest 要的是合成选项。
+		// 显式覆盖，避免 ...options 把这个不兼容的形状带进去。
+		roundFold: options.roundFold
+			? {
+					enabled: options.roundFold.enabled,
+					isSubagent: options.roundFold.isSubagent,
+					expandedRoundKeys: options.roundFold.expandedRoundKeys,
+					previewRoundKeys: options.roundFold.previewRoundKeys,
+					isLiveSpec: options.roundFold.isLiveSpec,
+					readTime: options.roundFold.readTime,
+					readDuration: options.roundFold.readDuration,
+					readTokens: options.roundFold.readTokens,
+					buildTitle: ({ durationMs, tokens }) =>
+						options.roundFold?.buildTitle({ durationMs, tokens }) ?? "",
+				}
+			: undefined,
 		documentRevision,
 		recentMessageIds,
 		// Frozen per build: the fold gates above already consumed this same id,

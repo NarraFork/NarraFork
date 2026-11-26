@@ -32,6 +32,7 @@ import type { TextPreview } from "./text-preview";
 // ─────────────────────────────────────────────────────────────────────────────
 // Render LOD (mirrors RenderLodCtx). Height models MUST take LOD as input.
 // L1 (most folded) .. L5 (most detailed). Default L4.
+// Round folding is an independent preference (`narrafork_round_folding`), not a LOD step.
 // ─────────────────────────────────────────────────────────────────────────────
 export type RenderLod = 1 | 2 | 3 | 4 | 5;
 export const DEFAULT_RENDER_LOD: RenderLod = 4;

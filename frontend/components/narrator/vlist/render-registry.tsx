@@ -38,6 +38,7 @@ import { RenderAskUserQuestion, RenderInlinePermission } from "./render/RenderPe
 import { RenderPlanCard } from "./render/RenderPlanCard";
 import { RenderReasoning } from "./render/RenderReasoning";
 import { RenderReviewCard } from "./render/RenderReviewCard";
+import { RenderRoundGroup, type RoundGroupRenderData } from "./render/RenderRoundGroup";
 import { RenderSubagent } from "./render/RenderSubagent";
 import { RenderSubagentRecovery } from "./render/RenderSubagentRecovery";
 import { RenderSystemList } from "./render/RenderSystemList";
@@ -205,6 +206,12 @@ export function resolveRenderExtra(spec: {
 			if (tails) extra.rowLiveTails = tails;
 			break;
 		}
+		case "round-group":
+			// The title is baked at compose time (it embeds a duration/token value that
+			// must stay readable even when the geometry is served from the measure
+			// cache), so it is forwarded verbatim rather than recomposed here.
+			extra.roundGroupData = data as RoundGroupRenderData;
+			break;
 		case "subagent-card":
 			if ("toolUseId" in data) extra.toolUseId = data.toolUseId;
 			if ("toolCallId" in data) extra.toolCallId = data.toolCallId;
@@ -628,5 +635,18 @@ export function renderElement(
 			// paint (composed by the adapter from the shared usage formatter), so this
 			// kind needs no `extra` at all.
 			return <RenderTurnUsage measured={m} />;
+		case "round-group":
+			// 三态两级展开（见 RenderRoundGroup 文件头）：收起 / 盒内预览（高度靠
+			// onUnknownHeight 实测覆盖）/ 提升为完整行（由 shell 重建完成，不在这里）。
+			return (
+				<RenderRoundGroup
+					data={extra.roundGroupData as RoundGroupRenderData}
+					open={extra.roundGroupOpen === true}
+					onToggle={extra.onToggle as (() => void) | undefined}
+					onPromote={extra.onPromote as (() => void) | undefined}
+				>
+					{extra.children as React.ReactNode}
+				</RenderRoundGroup>
+			);
 	}
 }

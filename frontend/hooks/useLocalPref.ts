@@ -30,6 +30,9 @@ type Key =
 	// whole transcript renders. With it off, Alt does nothing for LOD — the
 	// toolbar's detail-level menu (`lodlevel`) is the remaining click entry point.
 	| "narrafork_lod_alt_gesture"
+	// 整轮折叠：一轮拿到最终回复后，把中间的过程折成一条「已处理 2m 14s」。
+	// 默认 ON —— 与渲染详细程度（LOD 1..5）正交的独立开关。
+	| "narrafork_round_folding"
 	// Unified morph driver (visual-state + single rAF loop) instead of the keyframe
 	// planners. Now DEFAULT ON, after the browser comparison this gate existed for: the
 	// keyframe path loses a whole activity group's animation whenever the two levels'

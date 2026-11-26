@@ -167,7 +167,7 @@ describe("production resize handler wiring", () => {
 		expect(effect).toMatch(/const\s+node\s*=\s*viewportNode\s*;/);
 		expect(effect).not.toMatch(/const\s+node\s*=\s*viewportRef\.current\s*;/);
 		expect(effect).toMatch(
-			/\[\s*viewportNode,\s*centeredColumn,\s*panelVisible,\s*readViewportView,\s*writeScrollTop,\s*morphScrollOrigin,?\s*\]/,
+			/\[\s*viewportNode,\s*centeredColumn,\s*panelVisible,\s*hasCustomDataSource,\s*readViewportView,\s*writeScrollTop,\s*morphScrollOrigin,?\s*\]/,
 		);
 	});
 

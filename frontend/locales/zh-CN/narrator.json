@@ -1338,8 +1338,6 @@
 	"contextMenu_rollback": "回退到此处",
 	"contextMenu_edit": "编辑消息",
 	"contextMenu_jumpToSource": "跳转到来源叙述者",
-	"jumpToUserMessage": "跳转到第 {{ordinal}} 条消息",
-	"jumpToCompactMarker": "跳转到压缩标记（{{status}}）",
 	"contextMenu_viewFile": "查看该文件",
 	"contextMenu_openFilePanel": "在面板中查看",
 	"editPreview.open": "查看本次修改",
@@ -3447,5 +3445,16 @@
 	"followSummaryUnset": "摘要模型（未配置）",
 	"composerReadOnly": "只读：你可以查看这个会话，但不能给它发消息。",
 	"teamBadge": "团队",
-	"teamBadgeOpen": "打开团队「{{name}}」的团队页"
+	"teamBadgeOpen": "打开团队「{{name}}」的团队页",
+	"roundRailLabel": "轮次导航",
+	"roundRailTitle": "共 {{count}} 轮",
+	"roundRailPendingReply": "等待回复…",
+	"roundRailFavorite": "收藏这一轮",
+	"roundRailUnfavorite": "取消收藏",
+	"roundRailEmptyRound": "（没有文字，只有附件）",
+	"roundFoldingShort": "折叠已完成的轮次",
+	"roundFoldDone": "已处理",
+	"roundFoldCollapse": "收起预览",
+	"roundFoldExpand": "展开这一轮",
+	"roundFoldPromote": "展开为完整行"
 }

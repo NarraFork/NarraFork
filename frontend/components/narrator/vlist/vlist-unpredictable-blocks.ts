@@ -54,6 +54,14 @@ export function hasUnpredictableBlock(blocks: readonly PreparedBlock[]): boolean
  */
 export function hostsUnpredictableBlock(kind: string, measured: MeasuredElement): boolean {
 	if (!UNKNOWN_HEIGHT_FORWARDING_KINDS.has(kind)) return false;
+	// 整轮折叠条：**盒内预览态**才是动态行。
+	//
+	// 不能走下面那条 `hasUnpredictableBlock(measured.blocks)`：折叠条的 blocks 恒为空
+	// （收起态是一行常量，预览体由被折元素自己渲染），照那条判会恒为 false，
+	// 于是预览体被裁在占位高度里、下方内容不下移。
+	if (kind === "round-group") {
+		return (measured as MeasuredElement & { roundPreviewOpen?: boolean }).roundPreviewOpen === true;
+	}
 	if (kind === "activity-trace" || kind === "reasoning-steps") {
 		// Tool cards deliberately keep their own capped geometry. Only a reader's
 		// explicitly expanded reasoning body can make the trace dynamic.
@@ -100,4 +108,6 @@ export const UNKNOWN_HEIGHT_FORWARDING_KINDS: ReadonlySet<string> = new Set([
 	"communication-bubble",
 	"activity-trace",
 	"reasoning-steps",
+	// 整轮折叠条：盒内预览的高度靠实测覆盖（见上面的专门分支）。
+	"round-group",
 ]);

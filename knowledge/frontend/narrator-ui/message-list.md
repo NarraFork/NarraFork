@@ -13,6 +13,8 @@ anchors:
   - frontend/components/narrator/vlist/{vlist-live,vlist-message,vlist-data,vlist-reload,vlist-pipeline,vlist-persisted,vlist-head,vlist-tail,vlist-tool,streaming,exact-streaming,useVList,useReasoning,reasoning-translation,compact-progress,communication-navigation}*
   - frontend/components/narrator/vlist/{VList,Question,Reminder,auxiliary,markdown-images,outline,permission-textarea,remote-outline,spec-carryover,task-notice}*
   - frontend/components/narrator/vlist/vlist-{ask,compact,content,edit,error,injection,interaction,outline,permission,reflection,spec,subagent,user}*
+  - frontend/components/narrator/vlist/round-*
+  - frontend/components/narrator/vlist/round-rail/
   - frontend/components/narrator/lod/
   - frontend/components/narrator/scroll/
   - frontend/components/narrator/message/
@@ -89,7 +91,11 @@ verified_at: 3586b5dd803f5035f610fc36d2c7d0245a2cd8e9
   - L3：所有工具卡片折叠为头部（lodExempt / lodUserOverride 的卡片除外，恒展开）。
   - L2：推理与已完成工具合并成一条活动轨迹（`trace/render-units.ts`），文本完整。
   - L1：活动轨迹默认折叠；`measure-reasoning.ts` 在 `lod <= 2` 时推理走计数行。RenderLodCtx 注释所说的“L1 长助手文本截断”未核实。
-- LOD 存取（`hooks/useNarratorLod.ts`）：每个叙述者各记一个 `narrafork_lod:<id>`；只有“设为默认”才写 `narrafork_lod_default`；打开时先用叙述者自己的，其次全局默认，再次 4。`narrafork_lod_schema`=2 标记存储档位已从旧 1–6 迁到 1–5（旧值 ≥4 减 1），迁移只做一次。
+- LOD 存取（`hooks/useNarratorLod.ts`）：每个叙述者各记一个 `narrafork_lod:<id>`；只有“设为默认”才写 `narrafork_lod_default`；打开时先用叙述者自己的，其次全局默认，再次 4。`narrafork_lod_schema`=4（v1→v2 把旧 1–6 迁到 1–5，v3→v4 把曾附加的 L6 收回 5，整轮折叠改为独立开关 `narrafork_round_folding`）。
+- 整轮折叠与左侧轮次导航轨（`vlist/round-group*.ts`、`vlist/round-rail/`）：
+  - 开关 `narrafork_round_folding`（默认开）与 LOD 1–5 正交，开启时已完成且无流式/运行中元素的轮在 `pretext-layout-manifest.ts` 合成单条 `round-group`（收起 → 盒内预览 → 提升为完整行）；折叠开启时禁 L1/L2 活动分组并设 `keepToolCards=true`，未传 `roundFold` 的调用方保持原有 L1/L2 分组。
+  - `pretext-layout-manifest.ts` 在折叠前完成 key 去重与来源解析，`round-group` 合并保留子元素的 `sourceMessageIds` 与 `[firstSeq, lastSeq]`；搜索跳转到折叠内消息时先自动提升该轮再定位高亮。
+  - 左侧轮次轨（`round-rail/RoundRail.tsx`）仅在真实叙述者（非自定义 `dataSource` 且非 `suspended`）且 `rounds.length >= 2` 时显示；首屏由 `pretext-document` 搭便车返回初始索引，WS 追加/编辑/删除统一失效刷新；点击跳转按 `align: "top"` 对齐视口顶部，桌面键盘激活（`detail === 0`）打开选择器并管理焦点。
 - LOD 手势（`vlist/vlist-lod-gesture.ts`）：Alt+滚轮（deltaY>0 降一级，否则升一级；`narrafork_lod_alt_gesture` 关闭时返回 null，不拦截滚动）、双指捏合（比例 >1.2 升、<1/1.2 降）；两次步进至少间隔 140ms。指示器 `lod/lod-indicator.ts`：按住 Alt 常驻，手势触发则短暂显示后淡出，指针在其上时不淡出。
 - 结构性变更（新消息、编辑、删除、压缩完成）触发整窗重载，规则在 `vlist-reload-policy.ts`：
   - 读者在底部：重载；合并窗口 `EXACT_RELOAD_COALESCE_MS`=120ms，从第一个待处理修订起最迟 `EXACT_RELOAD_MAX_DELAY_MS`=1000ms 必须提交。

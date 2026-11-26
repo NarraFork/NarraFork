@@ -33,6 +33,7 @@ const ANCILLARY_JUMP_ROW_KINDS: ReadonlySet<string> = new Set([
 	"tool-call-group",
 	"tool-run-count",
 	"activity-trace",
+	"round-group",
 	"turn-usage",
 	"inline-permission",
 	"ask-user-question",
@@ -75,14 +76,31 @@ export function jumpTargetItemIndex(index: PretextLayoutIndex, target: string): 
 	return indices.find((at) => !isAncillaryJumpRowKind(items[at]?.kind)) ?? indices[0];
 }
 
-/** Center inside this viewport only; native scrollIntoView also moves ancestors. */
-export function jumpTargetScrollTop(viewport: HTMLElement, target: HTMLElement): number {
+export type JumpScrollAlign = "center" | "top";
+
+/**
+ * Scroll inside this viewport only; native scrollIntoView also moves ancestors.
+ *
+ * Default `align` is `"center"` (used by search hits). Round-rail jumps pass
+ * `"top"` so the target turn's prompt lands at the top of the viewport, matching
+ * the rail's top-visible-row active-round predicate.
+ */
+export function jumpTargetScrollTop(
+	viewport: HTMLElement,
+	target: HTMLElement,
+	options?: { align?: JumpScrollAlign; topPadding?: number },
+): number {
 	const viewportRect = viewport.getBoundingClientRect();
 	const targetRect = target.getBoundingClientRect();
 	// Rects are visual pixels under classic graph zoom; scroll metrics are layout
 	// pixels. offsetHeight includes borders (and scrollbars), just like the rect.
 	const measuredScale = viewport.offsetHeight ? viewportRect.height / viewport.offsetHeight : 1;
 	const scale = Number.isFinite(measuredScale) && measuredScale > 0 ? measuredScale : 1;
+	const align = options?.align ?? "center";
+	const topOffset =
+		align === "top"
+			? (options?.topPadding ?? 0)
+			: (viewport.clientHeight - targetRect.height / scale) / 2;
 	return Math.max(
 		0,
 		Math.min(
@@ -90,7 +108,7 @@ export function jumpTargetScrollTop(viewport: HTMLElement, target: HTMLElement):
 			viewport.scrollTop +
 				(targetRect.top - viewportRect.top) / scale -
 				viewport.clientTop -
-				(viewport.clientHeight - targetRect.height / scale) / 2,
+				topOffset,
 		),
 	);
 }

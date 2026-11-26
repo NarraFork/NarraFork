@@ -1339,8 +1339,6 @@
 	"contextMenu_rollback": "Rollback to here",
 	"contextMenu_edit": "Edit message",
 	"contextMenu_jumpToSource": "Jump to source narrator",
-	"jumpToUserMessage": "Jump to message #{{ordinal}}",
-	"jumpToCompactMarker": "Jump to compact marker ({{status}})",
 	"contextMenu_viewFile": "View this file",
 	"contextMenu_openFilePanel": "Open in panel",
 	"editPreview.open": "View this edit",
@@ -3456,5 +3454,16 @@
 	"followSummaryUnset": "Summary model (not configured)",
 	"composerReadOnly": "Read-only: you can follow this session but not send it messages.",
 	"teamBadge": "Team",
-	"teamBadgeOpen": "Open the team page of {{name}}"
+	"teamBadgeOpen": "Open the team page of {{name}}",
+	"roundRailLabel": "Round timeline",
+	"roundRailTitle": "{{count}} rounds",
+	"roundRailPendingReply": "Waiting for reply…",
+	"roundRailFavorite": "Bookmark this round",
+	"roundRailUnfavorite": "Remove bookmark",
+	"roundRailEmptyRound": "(no text, attachments only)",
+	"roundFoldingShort": "Fold completed rounds",
+	"roundFoldDone": "Done",
+	"roundFoldCollapse": "Collapse preview",
+	"roundFoldExpand": "Expand this round",
+	"roundFoldPromote": "Expand to full rows"
 }

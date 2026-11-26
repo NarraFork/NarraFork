@@ -15,9 +15,13 @@ const storageKey = (narratorId: string) => `narrafork_lod:${narratorId}`;
  *
  * v1 was a 1..6 scale. v2 dropped the old L3 (the "tool calls ×N summary block"
  * level, which read as neither folded nor detailed) and renumbered to 1..5.
+ * v3 appended an L6 ("all rounds expanded").
+ * v4 removes that appended L6 again: round folding is now an independent switch
+ * (`narrafork_round_folding`) rather than a step on the scale, so the scale is
+ * back to upstream's five steps and a stored 6 has to come down to 5.
  */
 const SCHEMA_KEY = "narrafork_lod_schema";
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 4;
 
 /**
  * Map a v1 (1..6) stored level onto the v2 (1..5) scale, preserving the SHAPE the
@@ -35,6 +39,21 @@ export function migrateStoredLodV1(value: number): number {
 }
 
 /**
+ * Map a v3 (1..6) stored level onto the v4 (1..5) scale.
+ *
+ * Only the appended top step changes: a stored 6 meant "all rounds expanded, all
+ * cards expanded", which is exactly today's L5 plus round folding switched OFF.
+ * The level comes down to 5 and the fold preference keeps its own key, so the
+ * reader's intent ("show me everything") survives as two values that jointly say
+ * the same thing.
+ *
+ * Every other value is unchanged — they never meant anything about round folding.
+ */
+export function migrateStoredLodV3(value: number): number {
+	return value > 5 ? 5 : value;
+}
+
+/**
  * Rewrite every stored level to the current schema, ONCE.
  *
  * Done eagerly (rather than mapping on each read) because the two scales overlap:
@@ -46,6 +65,7 @@ export function migrateStoredLodV1(value: number): number {
 function migrateStoredLods(): void {
 	try {
 		if (localStorage.getItem(SCHEMA_KEY) === String(SCHEMA_VERSION)) return;
+		const storedSchema = Number.parseInt(localStorage.getItem(SCHEMA_KEY) ?? "1", 10);
 		const keys: string[] = [];
 		for (let i = 0; i < localStorage.length; i++) {
 			const key = localStorage.key(i);
@@ -56,7 +76,12 @@ function migrateStoredLods(): void {
 			if (raw === null) continue;
 			const parsed = Number.parseInt(raw, 10);
 			if (Number.isNaN(parsed)) continue;
-			localStorage.setItem(key, String(clampRenderLod(migrateStoredLodV1(parsed))));
+			// A store that never saw v2 is still on the v1 numbering; one at v2 or
+			// v3 only needs the top step brought down. Applying the v1 map to a v2
+			// value would shift 4/5 down a second time, so pick by the schema the
+			// values were written under, not by "anything before v3".
+			const migrated = storedSchema >= 2 ? migrateStoredLodV3(parsed) : migrateStoredLodV1(parsed);
+			localStorage.setItem(key, String(clampRenderLod(migrated)));
 		}
 		localStorage.setItem(SCHEMA_KEY, String(SCHEMA_VERSION));
 	} catch {

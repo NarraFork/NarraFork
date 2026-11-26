@@ -37,6 +37,7 @@ import {
 	resolveReasoningForm,
 } from "./measure/measure-reasoning";
 import { measureReviewCard } from "./measure/measure-review-card";
+import { measureRoundGroup } from "./measure/measure-round-group";
 import { measureSubagentCard } from "./measure/measure-subagent";
 import { measureSubagentRecovery } from "./measure/measure-subagent-recovery";
 import { measureKnowledgeHint } from "./measure/measure-system-list";
@@ -274,6 +275,16 @@ export const VLIST_REGISTRY: Record<VListElementKind, VListMeasureEntry> = {
 		label: "Turn token/cost usage line",
 		lodSensitive: false,
 		measure: (d, w, l) => measureTurnUsage(d as AnyData, w, l),
+	},
+	"round-group": {
+		kind: "round-group",
+		label: "Completed-round fold bar",
+		// The element only EXISTS below L6 (L6 is the "no round folding" level), so its
+		// measured height does not vary with the level — the gate lives in the composer.
+		lodSensitive: false,
+		// `opts.open` selects header-only vs expanded. The expanded height comes from the
+		// render layer's measurement (`round-fold-heights.ts`), never from here.
+		measure: (d, w, l, o) => measureRoundGroup(d as AnyData, w, l, o as AnyData),
 	},
 };
 

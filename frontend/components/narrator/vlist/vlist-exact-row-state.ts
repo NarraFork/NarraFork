@@ -23,6 +23,7 @@
  */
 
 import type { PlanTreeAction } from "@shared/outline-plan-tree";
+import type { ElementSpec } from "@shared/pretext-layout/segment-adapter";
 import type { ToolCappedDetail, ToolSectionsDetail } from "@shared/pretext-layout/tool-detail";
 import type { MessageContextMenuActions } from "../message/MessageContextMenuCtx";
 import { makeMessageBlockSelectionId } from "../message/MessageSelectionCtx";
@@ -385,6 +386,51 @@ export function resolveRowOpenState(
 		if (measured.expanded !== undefined) return measured.expanded;
 	}
 	return state.expanded.get(key) === true;
+}
+
+/**
+ * 折叠条子元素的交互签名（拼在折叠条自己的 `rowInteractionSig` 后面）。
+ *
+ * ⚠️ 为什么需要：`rowInteractionSig` 只看**一个** key。折叠条这一行的 key 是
+ * `roundgroup-*`，而读者点的是里面某张卡片的 key —— 折叠条自己的签名毫无变化，
+ * 于是 ExactRow 的 memo 判定「没变」而跳过重渲染，展开后的几何永远不上屏
+ * （`aria-expanded` 翻了、高度不动，就是这个原因）。
+ *
+ * 把子元素的状态聚合成一个短串并进签名，折叠条就会跟着重渲染。
+ * 只对 `round-group` 生效：其它行没有「子元素状态影响本行高度」这回事。
+ */
+export function foldedChildInteractionSig(spec: ElementSpec, state: VListInteractionState): string {
+	if (spec.kind !== "round-group") return "";
+	const folded = (spec.data as { folded?: readonly { spec: ElementSpec }[] } | undefined)?.folded;
+	if (!Array.isArray(folded) || folded.length === 0) return "";
+	const parts: string[] = [];
+	for (const child of folded) {
+		const key = child.spec.key;
+		if (!key) continue;
+		// 只累计「会改变几何」的那几个通道，与 rowInteractionSig 保持一致。
+		const expanded = state.expanded.get(key);
+		const lodOverride = state.lodUserOverrides.has(key) ? 1 : 0;
+		const showEarlier = state.showEarlier.has(key) ? 1 : 0;
+		const rows = state.expandedRows.get(key);
+		const traceRows = state.expandedTraceRows.get(key);
+		if (
+			expanded === undefined &&
+			lodOverride === 0 &&
+			showEarlier === 0 &&
+			(!rows || rows.size === 0) &&
+			(!traceRows || traceRows.size === 0)
+		) {
+			continue;
+		}
+		const rowList = rows && rows.size > 0 ? [...rows].sort((a, b) => a - b).join(",") : "";
+		const traceRowList = traceRows && traceRows.size > 0 ? [...traceRows].sort().join(",") : "";
+		parts.push(
+			`${key}:${expanded === undefined ? "u" : expanded ? "1" : "0"}:${lodOverride}:${showEarlier}:${rowList}:${traceRowList}`,
+		);
+	}
+	if (parts.length === 0) return "";
+	parts.sort();
+	return `|fc[${parts.join(";")}]`;
 }
 
 /**

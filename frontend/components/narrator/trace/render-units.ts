@@ -196,6 +196,22 @@ type MessageActivityPart =
 	| { kind: "content"; segment: Extract<RenderSegment, { kind: "message" }> };
 
 /**
+ * 这条消息是不是「一轮的开始」（与 `vlist/round-group.ts` 的判据逐条对应）。
+ *
+ * 这里只有 msg 可看（spec 还没产出），所以只能按 role + origin 判断：
+ *   - 真人写的：`origin` 为 null / undefined / "user"；
+ *   - 子代理派发的任务：`role="user"` + `origin="assistant"`。
+ * `origin="system"` 的系统注入（silent_progress / review 启动）不是轮首 ——
+ * 它们仍是同一轮里的动作，继续并入 activity。
+ */
+function isRoundHeadMessage(msg: NarratorMsg): boolean {
+	if (msg.role !== "user") return false;
+	const origin = (msg as { origin?: unknown }).origin;
+	if (origin === null || origin === undefined || origin === "user") return true;
+	return origin === "assistant";
+}
+
+/**
  * Split a completed assistant message segment into chronological reasoning and
  * visible-content runs. `message-segments` intentionally groups adjacent content
  * blocks, so a segment may contain both reasoning and answer text. Low LOD must
@@ -205,6 +221,16 @@ function splitMessageSegmentForActivity(
 	seg: Extract<RenderSegment, { kind: "message" }>,
 	compactAuxiliaryContent = false,
 ): MessageActivityPart[] | null {
+	// ⚠️ 「轮首」消息**不能**被吸进 activity 单元：一旦被折进折叠组，顶层 spec 序列
+	// 里就没有轮首了，整轮折叠与导航轨会一起失效（实测 LOD ≤2 的子代理会话里
+	// 派发任务那条消息整条消失，于是永远切不出轮）。
+	//
+	// 判据与 `vlist/round-group.ts` 的 `isRoundStartSpec` 保持一致，但这里只能看
+	// msg（还没有 spec）：
+	//   - 真人写的（origin 为 null/undefined/"user"）；
+	//   - 子代理派发的任务（role=user + origin="assistant"）。
+	// `origin="system"` 的系统注入（silent_progress 等）不是轮首，仍照旧并入 activity。
+	if (isRoundHeadMessage(seg.msg)) return null;
 	const blocks = messageBody(seg.msg);
 	const sourceIndices = seg.visibleBlockIndices ?? blocks.map((_, i) => i);
 	const indices = compactAuxiliaryContent

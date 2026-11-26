@@ -842,7 +842,7 @@ describe("fold vs LOD morph: the toggle path cannot move the effective LOD", () 
 		// The comment is the only thing that stops a future reader from "fixing" this
 		// branch into an actual lod step (or adding a second one that is), which would
 		// make the two controllers collide with no test necessarily catching it.
-		const start = SHELL.indexOf("if (collapsesByLodByKeyRef.current.get(key) === true) {");
+		const start = SHELL.indexOf("if (collapsesByLod === true) {");
 		expect(start, "the collapsesByLod toggle branch is missing").toBeGreaterThan(0);
 		// Scoped to the branch's own comment block: from the handler it lives in, so a
 		// note attached to some other toggle cannot satisfy this.

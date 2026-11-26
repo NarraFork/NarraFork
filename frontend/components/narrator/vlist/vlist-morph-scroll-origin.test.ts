@@ -254,7 +254,11 @@ describe("production animation-origin wiring", () => {
 			"visibleViewportRef.current.isVisible(node)",
 			"Number.isFinite(node.clientWidth)",
 		);
-		before(readiness, "Number.isFinite(node.clientWidth)", "node.clientWidth > PAGE_PADDING * 2");
+		before(
+			readiness,
+			"Number.isFinite(node.clientWidth)",
+			"node.clientWidth > horizontalGutterPx() * 2",
+		);
 		const footerMeasure = sliceBracketedRegion(footer, "const measure = () => {");
 		if (!footerMeasure) throw new Error("Missing footer observer callback");
 		before(

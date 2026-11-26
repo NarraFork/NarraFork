@@ -256,3 +256,6 @@ tests/vscode-extension/.tmp-settings-*.json
 
 # bun build cache
 .*.bun-build
+
+# AI / 本地临时文件（脚本、探针、抓取输出等），不入库
+.tmp/

@@ -85,6 +85,9 @@ const NO_LABELS_KINDS: Record<string, string> = {
 	// RenderSubagentRecovery declares no `labels` prop: its card text is composed by
 	// the adapter (ctx.labels) and its two buttons read the measured block data.
 	"subagent-recovery": "card text composed by the adapter (ctx.labels)",
+	// RenderRoundGroup receives its composed title via data and localizes button
+	// chrome directly with useTranslation("narrator").
+	"round-group": "composed title in data + renderer localizes chrome with useTranslation",
 };
 
 describe("renderLabelsForKind — every chrome-painting kind is localizable", () => {

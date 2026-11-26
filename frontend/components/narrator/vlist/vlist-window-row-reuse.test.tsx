@@ -61,6 +61,9 @@ const PROP_KEYS = {
 	sourceIds: true,
 	interactionSig: true,
 	toggles: true,
+	getTogglesForKey: true,
+	remeasureFoldedChild: true,
+	registerFoldedChild: true,
 	renderLabels: true,
 	interaction: true,
 	rowInteraction: true,
@@ -102,6 +105,9 @@ const PROP_KEYS = {
 	onFetchAttachment: true,
 	resolveToolDetailStatus: true,
 	outlineAskSlot: true,
+	roundPreviewOpen: true,
+	onToggleRoundPreview: true,
+	onPromoteRound: true,
 } satisfies Record<keyof ExactRowProps, true>;
 
 describe("window row element frames", () => {

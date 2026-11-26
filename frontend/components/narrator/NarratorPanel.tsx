@@ -971,6 +971,9 @@ function NarratorPanelBody({
 	// Holding Alt reveals the indicator only while the Alt gesture is enabled: with
 	// it off, Alt is not an LOD modifier at all, so it must not summon LOD UI.
 	const [lodAltGesture] = useLocalPref("narrafork_lod_alt_gesture");
+	// 整轮折叠开关：与档位正交，所以在浮层里单独一行而不是作为一档。
+	// 这里是它唯一的写入点之一（另一处是设置页），两处共享同一个偏好键。
+	const [roundFolding, setRoundFolding] = useLocalPref("narrafork_round_folding");
 	const lodIndicatorPinned = useLodIndicatorTrigger(
 		messageAreaRef,
 		!isWorkspacePreview && lodAltGesture,
@@ -3327,6 +3330,8 @@ function NarratorPanelBody({
 													onSetAsDefault={setAsDefault}
 													onSelectLod={handleSelectLod}
 													pinned={lodIndicatorPinned}
+													roundFolding={roundFolding}
+													onToggleRoundFolding={isWorkspacePreview ? undefined : setRoundFolding}
 												/>
 											</EditingMessageCtx.Provider>
 										</LatestTodosToolUseIdCtx.Provider>

@@ -49,6 +49,14 @@ export interface UsePretextDocumentOptions {
 	enabled?: boolean;
 	/** Stop all document transport while retaining this coordinator/window/anchor. */
 	suspended?: boolean;
+	/**
+	 * 整轮折叠配置。缺省 = 不折叠。
+	 *
+	 * 传进来就参与文档构建：轮折叠会**改变元素序列**（合成 `round-group`），所以
+	 * 它的任何输入变化都必须经 `buildOptions` 触发重建 —— 与 `expandedRows` /
+	 * `isExpanded` 同一契约。
+	 */
+	roundFold?: PretextLayoutBuildOptions["roundFold"];
 	/** DOM readiness is separate from coordinator lifetime: parked panes keep their input. */
 	layoutReady?: boolean;
 	/** Keep the trailing empty reasoning live while the narrator is active. */
@@ -437,6 +445,9 @@ export function usePretextDocument(
 			resolvePermissionFormPrediction: options.resolvePermissionFormPrediction,
 			resolvePermissionFormHeight: options.resolvePermissionFormHeight,
 			pinLatestSpecTasks: options.pinLatestSpecTasks,
+			// 整轮折叠：改变元素序列，所以必须进 buildOptions（否则折叠状态变了
+			// 文档不重建，展开/收起点了没反应）。
+			roundFold: options.roundFold,
 			// ⚠️ No `latestSpecTasksToolUseId` here, deliberately. The pinned tasks card
 			// is resolved by `buildPretextDocumentLayout` from the exact message list it
 			// lays out, so it needs no build option and cannot go stale: every event that
@@ -478,6 +489,8 @@ export function usePretextDocument(
 			options.recentMessageIds,
 			options.resolveRecentMessageIds,
 			options.lod,
+			// 折叠配置的每一项都改变元素序列（合成与否、折哪一段），必须触发重建。
+			options.roundFold,
 			options.resolveToolCategory,
 			options.resolveToolColor,
 			options.resolveToolSummary,
