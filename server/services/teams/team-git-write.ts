@@ -1224,7 +1224,7 @@ export function teamRepoGit(repo: string, options: { signal?: AbortSignal } = {}
 
 /**
  * The URL a fetch from origin is given: `remote.origin.url` as configured (the first of several,
- * as `git fetch origin` takes it; every check applies to it), its login
+ * as `git fetch origin` takes it; every check applies to it; a bare name as `./<name>`), its login
  * split off (`splitUrlCredentials`). The fetch runs in the project's repository, so a repository
  * `url.*.insteadOf` that starts the URL (with or without its login) or a `remote.<URL>.*` refuses
  * it (`UnsafeRemoteConfigError`); a password on a transport that cannot take it by environment, or
@@ -1248,10 +1248,13 @@ async function fetchSource(
 		};
 	if (split.url.startsWith("-") || unsafeForCommand(split.url))
 		return { message: "origin's URL cannot be fetched from" };
-	const entries = await scopedConfig(repo, PUSH_PATTERN, signal);
-	assertPushUrlUntouched(entries, configured, "fetch");
-	assertPushUrlUntouched(entries, split.url, "fetch");
-	return split;
+	// A bare name (no `/`, `\`, `:` or scheme: a sibling path) given to `git fetch` is a remote's
+	// nickname, looked up in the configuration and `.git/remotes/` / `.git/branches/`; as origin's URL
+	// it is a path (what `git fetch origin` fetched from), so it goes as `./<name>`.
+	const url = /[/\\:]/.test(split.url) ? split.url : `./${split.url}`;
+	// What git is given is what the repository's own configuration may not rewrite or name.
+	assertPushUrlUntouched(await scopedConfig(repo, PUSH_PATTERN, signal), url, "fetch");
+	return { url, credentials: split.credentials };
 }
 
 /**

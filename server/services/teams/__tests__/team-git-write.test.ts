@@ -1540,6 +1540,40 @@ describe("the fetch of origin's base (review 5)", () => {
 		}
 	});
 
+	test("a bare-name origin is a path, never a nickname from .git/remotes, .git/branches or a remote", async () => {
+		await commitFile("a.txt", "a\n", "base");
+		// `up`: a repository beside the checkout's files, origin's URL a bare name.
+		const up = join(repo, "up");
+		await git(["init", "-q", "--bare", "-b", "main", up], temporary);
+		const other = await mkdtemp(join(temporary, "clone-"));
+		await git(["clone", "-q", repo, other], temporary);
+		const upHead = await commitFile("u.txt", "u\n", "up's", other);
+		await git(["push", "-q", up, "HEAD:main"], other);
+		const elsewhere = join(temporary, `elsewhere-${Math.random().toString(36).slice(2)}.git`);
+		await git(["init", "-q", "--bare", "-b", "main", elsewhere], temporary);
+		const elsewhereHead = await commitFile("e.txt", "e\n", "elsewhere's", other);
+		await git(["push", "-q", elsewhere, "HEAD:main"], other);
+		await git(["remote", "add", "origin", "up"]);
+		// Nicknames git would read for `git fetch up`.
+		await mkdir(join(repo, ".git", "remotes"), { recursive: true });
+		await writeFile(
+			join(repo, ".git", "remotes", "up"),
+			`URL: ${elsewhere}\nPull: refs/heads/main:refs/heads/main\n`,
+		);
+		await mkdir(join(repo, ".git", "branches"), { recursive: true });
+		await writeFile(join(repo, ".git", "branches", "up"), `${elsewhere}\n`);
+		expect(await teamRepoGit(repo).fetchBaseFromOrigin("main")).toEqual({ ok: true });
+		expect(await git(["rev-parse", "refs/remotes/origin/main"])).toBe(upHead);
+		// A configured remote of that name: still the path, not refused, not that remote.
+		await rm(join(repo, ".git", "remotes"), { recursive: true, force: true });
+		await rm(join(repo, ".git", "branches"), { recursive: true, force: true });
+		await git(["remote", "add", "up", elsewhere]);
+		await git(["update-ref", "-d", "refs/remotes/origin/main"]);
+		expect(await teamRepoGit(repo).fetchBaseFromOrigin("main")).toEqual({ ok: true });
+		expect(await git(["rev-parse", "refs/remotes/origin/main"])).toBe(upHead);
+		expect(upHead).not.toBe(elsewhereHead);
+	});
+
 	test("only refs/remotes/origin/<base> moves, whatever origin's fetch refspecs say", async () => {
 		await commitFile("a.txt", "a\n", "base");
 		const origin = join(temporary, `origin-${Math.random().toString(36).slice(2)}.git`);
