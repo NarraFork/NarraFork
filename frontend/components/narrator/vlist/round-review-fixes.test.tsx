@@ -319,9 +319,110 @@ describe("壳层与行组件接线守卫（Devin #4 / #7 / #8 与收起态零重
 		expect(source).toContain("if (isPreviewOpen && Array.isArray(folded) && folded.length > 0)");
 	});
 
-	it("轮次高亮探针按 scrollTop + PAGE_PADDING + 1 与顶对齐跳转口径一致，避免高亮停在上一轮", () => {
+	it("轮次高亮探针按 scrollTop + PAGE_PADDING + 1 与顶对齐跳转口径一致，搜索跳转会清空旧的轮轨覆盖", async () => {
 		const source = readVlistFile("PretextExactMessageList.tsx");
 		expect(source).toContain("scrollTop + PAGE_PADDING + 1");
-		expect(source).toContain("setJumpedRoundSeq(round.seq)");
+		expect(source).toContain("roundSeq: round.seq");
+		expect(source).toContain("setJumpedRoundSeq(roundSeq ?? null);");
+
+		// 直接执行生产 scrollToMessageTarget：
+		// 先经轮轨跳到 roundSeq=10，再在无手动滚动时经搜索跳到另一轮（不传 roundSeq），
+		// 必须把 jumpedRoundSeq 从 10 清回 null，不留旧高亮。
+		const start = source.indexOf("const scrollToMessageTarget = useCallback(");
+		expect(start).toBeGreaterThan(-1);
+		let depth = 0;
+		let end = -1;
+		for (let i = source.indexOf("(", start); i < source.length; i++) {
+			if (source[i] === "(") depth += 1;
+			else if (source[i] === ")") {
+				depth -= 1;
+				if (depth === 0) {
+					end = i + 1;
+					break;
+				}
+			}
+		}
+		expect(end).toBeGreaterThan(start);
+		const region = source.slice(start, end);
+		const code = new Bun.Transpiler({ loader: "tsx" }).transformSync(
+			`${region}; return scrollToMessageTarget;`,
+		);
+		let jumpedRoundSeq: number | null = null;
+		const jumpTokenRef = { current: 0 };
+		const loadedTopNarratorRef = { current: null as string | null };
+		const fakeEl = {} as HTMLElement;
+		const fakeNode = {
+			querySelector: () => fakeEl,
+		} as unknown as HTMLElement;
+		const bindings = {
+			useCallback: <T,>(fn: T) => fn,
+			t: (key: string) => key,
+			jumpTokenRef,
+			loadedTopNarratorRef,
+			setJumpedRoundSeq: (next: number | null | ((c: number | null) => number | null)) => {
+				jumpedRoundSeq = typeof next === "function" ? next(jumpedRoundSeq) : next;
+			},
+			getSmoothFollower: () => ({ cancel: () => {} }),
+			viewportRef: { current: fakeNode },
+			mountedJumpTarget: () => fakeEl,
+			interactionAdmissionRef: { current: { markHistoryIntent: () => {} } },
+			pinnedToBottomRef: { current: false },
+			visibleViewportRef: { current: { setPinned: () => {} } },
+			setPinnedToBottom: () => {},
+			writeScrollTop: () => {},
+			jumpTargetScrollTop: () => 420,
+			PAGE_PADDING: 16,
+			highlightRef: { current: { flash: () => {} } },
+			pretextDocumentRef: {
+				current: {
+					readWindow: () => ({ index: null }),
+				},
+			},
+			jumpTargetItemIndex: () => undefined,
+			renderItemsRef: { current: [] },
+			onPromoteRound: () => {},
+			waitAnimationFrame: async () => {},
+			messageIdFromTarget: (id: string) => id,
+			resolveJumpTargetSeq: async () => null,
+			dataSource: undefined,
+			narratorId: "n1",
+			narratorsApi: {},
+			loadOlderToSeq: async () => false,
+			loadOlder: async () => false,
+			toast: { error: () => {} },
+			pretextDocument: { status: "ready" },
+			revealRetryRef: { current: null },
+		};
+		const scrollToMessageTarget = new Function(...Object.keys(bindings), code)(
+			...Object.values(bindings),
+		) as (opts: {
+			domIds: string[];
+			targetIds: string[];
+			highlightId?: string;
+			align?: "center" | "top";
+			roundSeq?: number;
+		}) => Promise<boolean>;
+
+		// 1. 轮轨跳到第 10 轮
+		expect(
+			await scrollToMessageTarget({
+				domIds: ["msg-m10"],
+				targetIds: ["m10"],
+				highlightId: "m10",
+				align: "top",
+				roundSeq: 10,
+			}),
+		).toBe(true);
+		expect(jumpedRoundSeq).toBe(10);
+
+		// 2. 不手动滚动，直接执行搜索跳转（不传 roundSeq）
+		expect(
+			await scrollToMessageTarget({
+				domIds: ["msg-m30"],
+				targetIds: ["m30"],
+				highlightId: "m30",
+			}),
+		).toBe(true);
+		expect(jumpedRoundSeq).toBeNull();
 	});
 });

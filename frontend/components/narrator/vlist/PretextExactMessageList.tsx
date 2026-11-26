@@ -4969,6 +4969,7 @@ export const PretextExactMessageList = memo(
 				setPinnedToBottom(false);
 			}, [getSmoothFollower]);
 			const handleIOSScrollToTop = useCallback(() => {
+				setJumpedRoundSeq(null);
 				scrollExactListToLoadedTop({
 					jumpTokenRef,
 					detachFromBottom,
@@ -5095,12 +5096,14 @@ export const PretextExactMessageList = memo(
 					highlightId,
 					needle,
 					align = "center",
+					roundSeq,
 				}: {
 					domIds: string[];
 					targetIds: string[];
 					highlightId?: string;
 					needle?: string;
 					align?: JumpScrollAlign;
+					roundSeq?: number;
 				}) => {
 					// One jump at a time. A second jump (another search hit clicked while the
 					// first is still paging through history) invalidates the first, which must
@@ -5111,6 +5114,7 @@ export const PretextExactMessageList = memo(
 					// A jump navigates AWAY from the bottom: any chase still gliding towards
 					// it would fight the reveal's scrollIntoView / layout writes.
 					getSmoothFollower().cancel();
+					setJumpedRoundSeq(roundSeq ?? null);
 					// The row that was actually revealed, so the flash lands on the node the
 					// reader is now looking at rather than on a guessed id. Unlike the chunked
 					// path — which arms a 400ms timer and hopes the scroll finished — the flash
@@ -6011,13 +6015,13 @@ export const PretextExactMessageList = memo(
 										rounds={roundRailRounds}
 										activeIndex={activeRoundIndex}
 										onJumpToRound={(round) => {
-											setJumpedRoundSeq(round.seq);
 											// 跳到该轮首条消息并对齐视口顶部，与「当前轮」的顶部判据一致。
 											void scrollToMessageTarget({
 												domIds: [`msg-${round.messageId}`],
 												targetIds: [round.messageId],
 												highlightId: round.messageId,
 												align: "top",
+												roundSeq: round.seq,
 											}).then((landed) => {
 												if (!landed) {
 													setJumpedRoundSeq((current) => (current === round.seq ? null : current));

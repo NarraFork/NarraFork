@@ -312,15 +312,15 @@ export function RoundRail({
 				}, ${hiddenBelow ? "black calc(100% - 12px), transparent 100%" : "black 100%"})`
 			: undefined;
 
-	const jumpTo = (round: NarratorRound | undefined) => {
+	const jumpTo = (round: NarratorRound | undefined, restoreFocus = false) => {
 		if (!round) return;
-		const wasOpen = open;
+		const shouldRestore = restoreFocus || open;
 		cancelHoverClose();
 		setHoverSeq(null);
 		setOpen(false);
 		onJumpToRound(round);
 		// 从弹层选中某一轮后，原焦点按钮会被卸载；把焦点无滚动地归还给导航轨，避免键盘焦点落空。
-		if (wasOpen) {
+		if (shouldRestore) {
 			railRef.current?.focus({ preventScroll: true });
 		}
 	};
@@ -534,7 +534,7 @@ export function RoundRail({
 								ordinal={index + 1}
 								total={rounds.length}
 								favorited={favorites.has(round.seq)}
-								onSelect={() => jumpTo(round)}
+								onSelect={() => jumpTo(round, true)}
 								onToggleFavorite={onToggleFavorite}
 								labels={labels}
 							/>
