@@ -909,6 +909,8 @@ export interface MergeControlView {
  */
 export function mergeControl(merge: TeamWorkMergeSummary | undefined): MergeControlView | null {
 	if (!merge) return null;
+	// G: merging the pull request shows on 「合并 PR」 itself.
+	if (merge.mode === "github" && merge.job === "pr_merge" && merge.pr) return null;
 	if (merge.phase !== null || merge.job !== null)
 		return {
 			label: busyLabel(merge),

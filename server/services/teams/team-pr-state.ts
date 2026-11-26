@@ -156,6 +156,12 @@ export function markPrRefreshing(itemId: string, pr: number, refreshing: boolean
 	});
 }
 
+/** A read of the item's pull request ended (whatever it found): the drawer stops polling. */
+export function endPrRefreshing(itemId: string): void {
+	const entry = cache.get(itemId);
+	if (entry?.refreshing) put(itemId, { ...entry, refreshing: false });
+}
+
 /** Forget an item's read state (it was merged, returned or a new pull request opened). */
 export function forgetPrStatus(itemId: string): void {
 	cache.delete(itemId);

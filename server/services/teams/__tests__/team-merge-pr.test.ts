@@ -40,11 +40,12 @@ import {
 	pullRequestBody,
 	pullRequestTitle,
 	refreshPullRequest,
+	requestPrRefresh,
 	resetPullRequestWorkForTests,
 	runPrPollPass,
 	settlePullRequestWork,
 } from "../team-merge-pr";
-import { resetPrStatusForTests } from "../team-pr-state";
+import { peekPrStatus, resetPrStatusForTests } from "../team-pr-state";
 import { setUnblockDeliveryForTests } from "../work-item-dependencies";
 import { setMergeNoteDeliveryForTests } from "../work-items";
 import { type FakeGh, type FakeGhPlan, installFakeGh, usableGh } from "./fake-gh.fixture";
@@ -721,6 +722,32 @@ describe.skipIf(process.platform === "win32")("the pull request flow", () => {
 		expect(merged?.detail).toMatchObject({ detectedBy: "pull_request", pr: 7, method: null });
 		expect(notes.at(-1)).toContain("It was merged on GitHub");
 		expect(await runPrPollPass()).toBe(0);
+	});
+
+	test("the drawer's read: refreshing at once, done after; nothing again within 20 seconds", async () => {
+		const a = await readyItem("drawer");
+		await github(a.head);
+		open(a.id);
+		await settle();
+		// Read right after opening: fresh.
+		expect(requestPrRefresh({ teamId: LEAD, itemId: a.id })).toEqual({
+			itemId: a.id,
+			refreshing: false,
+		});
+		resetPrStatusForTests();
+		expect(requestPrRefresh({ teamId: LEAD, itemId: a.id })).toEqual({
+			itemId: a.id,
+			refreshing: true,
+		});
+		expect((await summary(a.id)).pr?.refreshing).toBe(true);
+		await settle();
+		expect((await summary(a.id)).pr).toMatchObject({ refreshing: false, state: "OPEN" });
+		// A read that finds nothing to do still ends.
+		resetPrStatusForTests();
+		setHostingSourceForTests(async () => "git@gitlab.example:acme/app.git");
+		requestPrRefresh({ teamId: LEAD, itemId: a.id });
+		await settle();
+		expect(peekPrStatus(a.id, 7)?.refreshing).toBe(false);
 	});
 
 	test("closed on GitHub: recorded once; the next action is 「重新发起 PR」", async () => {

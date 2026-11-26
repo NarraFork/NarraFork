@@ -94,6 +94,7 @@ import {
 } from "./team-merge";
 import { isMerging } from "./team-merge-guard";
 import {
+	endPrRefreshing,
 	forgetPrStatus,
 	latestPrEvent,
 	latestPullRequest,
@@ -915,7 +916,11 @@ export function refreshPullRequest(
 		return null;
 	});
 	state.pending.set(itemId, work);
-	void work.finally(() => state.pending.delete(itemId));
+	void work.finally(() => {
+		state.pending.delete(itemId);
+		// Whatever the read found, or when it read nothing at all, it is not running any more.
+		endPrRefreshing(itemId);
+	});
 	return work;
 }
 
@@ -1103,6 +1108,8 @@ export function requestPrRefresh(input: {
 	if (!record)
 		throw new AppError(`Work item ${item.id} has no pull request to read`, 409, "TEAM_PR_NONE");
 	if (prStatusFresh(item.id, record.number)) return { itemId: item.id, refreshing: false };
+	// Marked before the answer, so the drawer's next read already polls.
+	markPrRefreshing(item.id, record.number, true);
 	void refreshPullRequest(item.id);
 	return { itemId: item.id, refreshing: true };
 }

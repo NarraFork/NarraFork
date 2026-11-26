@@ -809,6 +809,7 @@ export function TeamWorkDrawer({
 	const hasPr = !!data?.merge?.pr && data.canReturn;
 	const refreshed = useRef<string | null>(null);
 	useEffect(() => {
+		if (!itemId) refreshed.current = null;
 		if (!itemId || !hasPr || refreshed.current === itemId) return;
 		refreshed.current = itemId;
 		refresh.mutate({ itemId });

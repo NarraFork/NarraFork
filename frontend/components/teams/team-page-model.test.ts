@@ -1067,6 +1067,8 @@ describe("pull requests (G)", () => {
 			busy: true,
 		});
 		expect(mergeControlOf(github({ phase: "checking", job: "merge" }))?.label).toBe("pushing");
+		// Merging an existing pull request: 「合并 PR」 shows it, not a second button.
+		expect(mergeControlOf(github({ phase: "merging", job: "pr_merge", pr: pr() }))).toBeNull();
 	});
 
 	test("查看 PR #N with CI, review, conflict / behind / blocked / draft and queue labels", () => {
