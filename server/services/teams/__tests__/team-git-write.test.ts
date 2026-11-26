@@ -7,7 +7,16 @@
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import {
+	chmod,
+	mkdir,
+	mkdtemp,
+	readdir,
+	readFile,
+	realpath,
+	rm,
+	writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TEAM_MERGE_CONFLICTS_MAX } from "@shared/project-teams";
@@ -28,8 +37,12 @@ import {
 	inspectCheckout,
 	networkOverrides,
 	PRIVATE_REFS_PAGE,
+	parsePushPorcelain,
+	redactUserinfo,
+	resolveRemoteArgument,
 	type ScopedConfigEntry,
 	signingConfig,
+	splitUrlCredentials,
 	sshSettings,
 	supportsMergeTree,
 	teamRepoGit,
@@ -360,14 +373,14 @@ describe("team git writes", () => {
 		await git(["push", "-q", "origin", "main"], other);
 		await git(["remote", "add", "origin", origin]);
 		const write = teamRepoGit(repo);
-		expect(await write.originPushUrl()).toBe(origin);
+		expect(await write.originTarget()).toEqual({ url: origin, resolved: origin });
 		expect(await write.fetchBaseFromOrigin("main")).toEqual({ ok: true });
 		expect(await git(["rev-parse", "refs/remotes/origin/main"])).toBe(upstream);
 		expect(await git(["rev-parse", "main"])).toBe(local);
 		expect(await git(["status", "--porcelain"])).toBe("");
 		expect(existsSync(join(repo, ".git", "FETCH_HEAD"))).toBe(false);
 		await git(["remote", "remove", "origin"]);
-		expect(await write.originPushUrl()).toBeNull();
+		expect(await write.originTarget()).toBeNull();
 		await rm(other, { recursive: true, force: true });
 		await rm(origin, { recursive: true, force: true });
 	});
@@ -1116,5 +1129,856 @@ describe("the copyable command and a same-named tag (Devin)", () => {
 		});
 		expect(run.exitCode).toBe(0);
 		expect(await git(["rev-parse", "refs/heads/release"])).toBe(commit);
+	});
+});
+
+/**
+ * A server that asks every request for a login (401), recording each request's login (`-` for
+ * none) and, while git talks to it, every process whose argv carries `s3cr3t` (a /proc scan; on a
+ * system without /proc nothing is found).
+ */
+function loginServer() {
+	const leaks: string[] = [];
+	const logins: string[] = [];
+	let port = 0;
+	const scan = async () => {
+		if (!existsSync("/proc/self/cmdline")) return;
+		for (const pid of await readdir("/proc").catch(() => [] as string[])) {
+			if (!/^\d+$/.test(pid)) continue;
+			const argv = await readFile(`/proc/${pid}/cmdline`, "utf8").catch(() => "");
+			// Only git's processes that talk to this server (not, say, a grep for the word elsewhere).
+			if (!/git/.test(argv.split("\0")[0] ?? "")) continue;
+			if (argv.includes("s3cr3t") && argv.includes(`:${port}`))
+				leaks.push(argv.replaceAll("\0", " "));
+		}
+	};
+	const server = Bun.serve({
+		port: 0,
+		hostname: "127.0.0.1",
+		fetch: async (request) => {
+			await scan();
+			const auth = request.headers.get("authorization");
+			logins.push(auth?.startsWith("Basic ") ? atob(auth.slice("Basic ".length)) : "-");
+			return new Response("no", {
+				status: 401,
+				headers: { "WWW-Authenticate": 'Basic realm="x"' },
+			});
+		},
+	});
+	port = server.port ?? 0;
+	return { server, logins, leaks };
+}
+
+describe("the pull request push (G: security as the work-start fetch)", () => {
+	/** A bare origin with main, the repository's own branch `team/x` one commit ahead. */
+	async function pushable() {
+		await commitFile("a.txt", "a\n", "base");
+		const origin = join(temporary, `origin-${Math.random().toString(36).slice(2)}.git`);
+		await git(["init", "-q", "--bare", "-b", "main", origin], temporary);
+		await git(["push", "-q", origin, "main"]);
+		await git(["checkout", "-qb", "team/x"]);
+		const head = await commitFile("x.txt", "x\n", "work");
+		await git(["checkout", "-q", "main"]);
+		await git(["remote", "add", "origin", origin]);
+		return { origin, head };
+	}
+	const tipAt = (origin: string, ref: string) =>
+		git(["rev-parse", "--verify", "--quiet", ref], origin).catch(() => "");
+
+	test("the pinned head lands without +; again is up to date; a remote branch ahead is rejected", async () => {
+		const { origin, head } = await pushable();
+		const push = (sha = head) =>
+			teamRepoGit(repo).pushBranch({ url: origin, head: sha, branch: "team/x" });
+		expect(await push()).toEqual({ outcome: "pushed" });
+		expect(await tipAt(origin, "refs/heads/team/x")).toBe(head);
+		expect(await push()).toEqual({ outcome: "up_to_date" });
+		// Someone pushed on top there: never forced back.
+		const other = await mkdtemp(join(temporary, "clone-"));
+		await git(["clone", "-q", "-b", "team/x", origin, other], temporary);
+		const theirs = await commitFile("y.txt", "y\n", "theirs", other);
+		await git(["push", "-q", "origin", "team/x"], other);
+		const mine = await commitFile("z.txt", "z\n", "mine");
+		const rejected = await push(mine);
+		expect(rejected.outcome).toBe("rejected");
+		expect(await tipAt(origin, "refs/heads/team/x")).toBe(theirs);
+		// No local ref moved, though origin's push URL is the one pushed to.
+		expect(await git(["for-each-ref", "refs/remotes/"])).toBe("");
+	});
+
+	test("origin's fetch refspecs never move a local ref, not even the checked-out base", async () => {
+		const { origin, head } = await pushable();
+		await git(["config", "--unset-all", "remote.origin.fetch"]);
+		await git(["config", "--add", "remote.origin.fetch", "+refs/heads/team/x:refs/heads/main"]);
+		await git(["config", "--add", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/main"]);
+		const before = await git(["for-each-ref"]);
+		expect(await teamRepoGit(repo).pushBranch({ url: origin, head, branch: "team/x" })).toEqual({
+			outcome: "pushed",
+		});
+		expect(await git(["for-each-ref"])).toBe(before);
+		expect(await git(["status", "--porcelain"])).toBe("");
+		// Nothing of NarraFork's throwaway repository is left behind.
+		expect(
+			(await readdir(join(process.env.NARRAFORK_HOME ?? "", "run")).catch(() => [])).filter(
+				(name) => name.startsWith("push-"),
+			),
+		).toEqual([]);
+	});
+
+	test("hooks and the repository's receive-pack, push URL and signing never run", async () => {
+		const { origin, head } = await pushable();
+		const ran = marker("push-program");
+		const hook = join(repo, ".git", "hooks", "pre-push");
+		await writeFile(hook, `#!/bin/sh\ntouch ${ran}-hook\n`);
+		await chmod(hook, 0o755);
+		await git(["config", "hook.audit.event", "pre-push"]);
+		await git(["config", "hook.audit.command", `touch ${ran}-config-hook`]);
+		await git([
+			"config",
+			"remote.origin.receivepack",
+			await script("rp", `touch ${ran}-rp; exit 1`),
+		]);
+		await git(["config", "remote.origin.pushurl", `ext::sh -c touch% ${ran}-pushurl`]);
+		await git(["config", "push.gpgSign", "true"]);
+		await git(["config", "gpg.program", await script("gpg", `touch ${ran}-gpg; exit 1`)]);
+		await git(["config", "push.recurseSubmodules", "on-demand"]);
+		await git(["config", "push.followTags", "true"]);
+		expect(await teamRepoGit(repo).pushBranch({ url: origin, head, branch: "team/x" })).toEqual({
+			outcome: "pushed",
+		});
+		for (const suffix of ["-hook", "-config-hook", "-rp", "-pushurl", "-gpg"])
+			expect({ suffix, ran: existsSync(`${ran}${suffix}`) }).toEqual({ suffix, ran: false });
+	});
+
+	test("a repository insteadOf or pushInsteadOf on the URL, a git proxy, or a remote named by the URL refuse it", async () => {
+		const { origin, head } = await pushable();
+		const ran = marker("push-refused");
+		const push = () => teamRepoGit(repo).pushBranch({ url: origin, head, branch: "team/x" });
+		const refusals: Array<[string[], string]> = [
+			[["config", `url.ext::sh -c touch% ${ran}.insteadOf`, origin], ".insteadof"],
+			[["config", `url.ext::sh -c touch% ${ran}.pushInsteadOf`, origin], ".pushinsteadof"],
+			[["config", "core.gitProxy", await script("proxy", `touch ${ran}; exit 1`)], "core.gitproxy"],
+			[
+				["config", `remote.${origin}.receivepack`, await script("rp", `touch ${ran}`)],
+				".receivepack",
+			],
+			[["config", `remote.${origin}.vcs`, "evil"], ".vcs"],
+			[["config", "remote.origin.vcs", "evil"], "remote.origin.vcs"],
+		];
+		for (const [setting, key] of refusals) {
+			await git(setting);
+			const error = await push().then(
+				() => null,
+				(caught: unknown) => caught,
+			);
+			expect({ key, error }).toMatchObject({
+				key,
+				error: expect.objectContaining({ code: "TEAM_REMOTE_CONFIG_UNSAFE" }),
+			});
+			expect((error as Error).message.toLowerCase()).toContain(key);
+			await git(["config", "--unset-all", setting[1] ?? ""]);
+		}
+		expect(existsSync(ran)).toBe(false);
+		expect(await tipAt(origin, "refs/heads/team/x")).toBe("");
+		// The host's own rewrite is the operator's: it applies.
+		await writeFile(
+			globalConfig,
+			`${HOST_USER}[url "${origin}"]\n\tinsteadOf = https://github.com/acme/app.git\n`,
+		);
+		expect(
+			await teamRepoGit(repo).pushBranch({
+				url: "https://github.com/acme/app.git",
+				head,
+				branch: "team/x",
+			}),
+		).toEqual({ outcome: "pushed" });
+		expect(await tipAt(origin, "refs/heads/team/x")).toBe(head);
+	});
+
+	test("end to end through originTarget: a repository pushurl, pushInsteadOf or insteadOf never redirects the push (review 1)", async () => {
+		const { origin, head } = await pushable();
+		const evil = join(temporary, `evil-${Math.random().toString(36).slice(2)}.git`);
+		await git(["init", "-q", "--bare", "-b", "main", evil], temporary);
+		// What the PR flow does: where origin is, then push exactly there.
+		const pushThroughOrigin = async () => {
+			const target = await teamRepoGit(repo).originTarget();
+			if (!target) throw new Error("no origin");
+			return teamRepoGit(repo).pushBranch({ url: target.url, head, branch: "team/x" });
+		};
+		const redirects: string[][] = [
+			["config", "remote.origin.pushurl", evil],
+			["config", `url.${evil}.pushInsteadOf`, origin],
+			["config", `url.${evil}.insteadOf`, origin],
+		];
+		for (const setting of redirects) {
+			await git(setting);
+			await expect(pushThroughOrigin()).rejects.toMatchObject({
+				code: "TEAM_REMOTE_CONFIG_UNSAFE",
+			});
+			expect({ setting, refs: await git(["for-each-ref"], evil) }).toEqual({ setting, refs: "" });
+			if (setting[1] === "remote.origin.pushurl") await git(["config", "--unset", setting[1]]);
+			else await git(["config", "--remove-section", `url.${evil}`]);
+		}
+		expect(await pushThroughOrigin()).toEqual({ outcome: "pushed" });
+		expect(await tipAt(origin, "refs/heads/team/x")).toBe(head);
+		expect(await git(["for-each-ref"], evil)).toBe("");
+	});
+
+	test("credentials and ssh come from the host only; ext:: is never a transport", async () => {
+		const saved = { command: process.env.GIT_SSH_COMMAND, ssh: process.env.GIT_SSH };
+		delete process.env.GIT_SSH_COMMAND;
+		delete process.env.GIT_SSH;
+		const server = Bun.serve({
+			port: 0,
+			hostname: "127.0.0.1",
+			fetch: () =>
+				new Response("no", { status: 401, headers: { "WWW-Authenticate": 'Basic realm="x"' } }),
+		});
+		try {
+			const { head } = await pushable();
+			const repoHelper = marker("repo-helper");
+			const repoAskpass = marker("repo-askpass");
+			const hostHelper = marker("host-helper");
+			const repoSsh = marker("repo-ssh");
+			const hostSsh = marker("host-ssh");
+			await git(["config", "credential.helper", `!f() { touch ${repoHelper}; }; f`]);
+			await git([
+				"config",
+				"core.askPass",
+				await script("askpass", `touch ${repoAskpass}; echo x`),
+			]);
+			await git([
+				"config",
+				"core.sshCommand",
+				await script("repo-ssh", `touch ${repoSsh}; exit 1`),
+			]);
+			await writeFile(
+				globalConfig,
+				`${HOST_USER}[credential]\n\thelper = "!f() { touch ${hostHelper}; }; f"\n[core]\n\tsshCommand = ${await script("host-ssh", `touch ${hostSsh}; exit 1`)}\n`,
+			);
+			const http = await teamRepoGit(repo).pushBranch({
+				url: `http://127.0.0.1:${server.port}/o/r.git`,
+				head,
+				branch: "team/x",
+			});
+			expect(http.outcome).toBe("failed");
+			const ssh = await teamRepoGit(repo).pushBranch({
+				url: "ssh://git@127.0.0.1:1/o/r.git",
+				head,
+				branch: "team/x",
+			});
+			expect(ssh.outcome).toBe("failed");
+			expect(existsSync(repoHelper)).toBe(false);
+			expect(existsSync(repoAskpass)).toBe(false);
+			expect(existsSync(repoSsh)).toBe(false);
+			expect(existsSync(hostHelper)).toBe(true);
+			expect(existsSync(hostSsh)).toBe(true);
+			const ext = marker("ext");
+			await git(["config", "protocol.ext.allow", "always"]);
+			const refused = await teamRepoGit(repo).pushBranch({
+				url: `ext::sh -c touch% ${ext}`,
+				head,
+				branch: "team/x",
+			});
+			expect(refused.outcome).toBe("failed");
+			expect(existsSync(ext)).toBe(false);
+		} finally {
+			server.stop(true);
+			if (saved.command !== undefined) process.env.GIT_SSH_COMMAND = saved.command;
+			if (saved.ssh !== undefined) process.env.GIT_SSH = saved.ssh;
+		}
+	});
+
+	test("a password in origin's URL never reaches a command line, and still logs in (Devin 1)", async () => {
+		const { server, logins, leaks } = loginServer();
+		try {
+			const { head } = await pushable();
+			// The host's helper keeps working: it answers when the URL has no password.
+			await writeFile(
+				globalConfig,
+				`${HOST_USER}[credential]\n\thelper = "!f() { test \\"$1\\" = get && echo password=from-host; }; f"\n`,
+			);
+			const at = `127.0.0.1:${server.port}/o/r.git`;
+			const withPassword = await teamRepoGit(repo).pushBranch({
+				url: `http://alice:s3cr3t%2Fx@${at}`,
+				head,
+				branch: "team/x",
+			});
+			expect(withPassword.outcome).toBe("failed");
+			if (withPassword.outcome === "failed") expect(withPassword.message).not.toContain("s3cr3t");
+			// It logged in with the URL's login (decoded as git decodes it), ahead of the host's helper,
+			// at the first challenge: no try of the user with an empty password first (review 1).
+			expect(logins).toEqual(["-", "alice:s3cr3t/x"]);
+			expect(leaks).toEqual([]);
+			logins.length = 0;
+			const userOnly = await teamRepoGit(repo).pushBranch({
+				url: `http://alice@${at}`,
+				head,
+				branch: "team/x",
+			});
+			expect(userOnly.outcome).toBe("failed");
+			expect(logins).toContain("alice:from-host");
+		} finally {
+			server.stop(true);
+		}
+	});
+
+	test("the login is split from the URL as git reads it", () => {
+		expect(splitUrlCredentials("https://u:p%40ss@github.com/a/b.git")).toEqual({
+			url: "https://github.com/a/b.git",
+			credentials: { protocol: "https", host: "github.com", username: "u", password: "p@ss" },
+		});
+		expect(splitUrlCredentials("https://:tok@ghe.test:8443/a/b")).toEqual({
+			url: "https://ghe.test:8443/a/b",
+			credentials: { protocol: "https", host: "ghe.test:8443", username: "", password: "tok" },
+		});
+		for (const plain of [
+			"https://github.com/a/b.git",
+			"https://u@github.com/a/b.git",
+			"https://github.com/a/b@c:d",
+			"git@github.com:a/b.git",
+			"/srv/git/r.git",
+		])
+			expect(splitUrlCredentials(plain)).toEqual({ url: plain, credentials: null });
+		// A password git cannot be handed without a command line: refused.
+		expect(splitUrlCredentials("ssh://u:p@host/a/b")).toBeNull();
+		expect(splitUrlCredentials("https://u:a%0Ab@host/a/b")).toBeNull();
+	});
+
+	test("one rewrite pass, by NarraFork, on origin's URL as configured; git never rewrites the argument again", async () => {
+		const { head } = await pushable();
+		const pushTo = await mkdtemp(join(temporary, "push-to-"));
+		const fetchFrom = await mkdtemp(join(temporary, "fetch-from-"));
+		for (const root of [pushTo, fetchFrom])
+			await git(["init", "-q", "--bare", "-b", "main", join(root, "acme", "app.git")], temporary);
+		await git(["push", "-q", join(fetchFrom, "acme", "app.git"), "main"]);
+		// The host's pushInsteadOf for the push, its insteadOf for the fetch (git's remote.c), applied
+		// to the configured URL, login and all.
+		await writeFile(
+			globalConfig,
+			`${HOST_USER}[url "${pushTo}/"]\n\tpushInsteadOf = https://alice:pw@github.com/\n[url "${fetchFrom}/"]\n\tinsteadOf = https://alice:pw@github.com/\n`,
+		);
+		await git(["remote", "set-url", "origin", "https://alice:pw@github.com/acme/app.git"]);
+		const target = await teamRepoGit(repo).originTarget();
+		// What the guard resolves is where the push lands.
+		expect(target?.resolved).toBe(`${pushTo}/acme/app.git`);
+		expect(
+			await teamRepoGit(repo).pushBranch({ url: target?.url ?? "", head, branch: "team/x" }),
+		).toEqual({ outcome: "pushed" });
+		expect(await tipAt(join(pushTo, "acme", "app.git"), "refs/heads/team/x")).toBe(head);
+		expect(await tipAt(join(fetchFrom, "acme", "app.git"), "refs/heads/team/x")).toBe("");
+		expect(await teamRepoGit(repo).fetchBaseFromOrigin("main")).toEqual({ ok: true });
+		// Rules that would rewrite the argument (the URL without its login, and with its user) again:
+		// refused, never followed twice.
+		await writeFile(
+			globalConfig,
+			`${HOST_USER}[url "${pushTo}/"]\n\tinsteadOf = https://github.com/\n[url "${fetchFrom}/"]\n\tinsteadOf = https://alice@github.com/\n`,
+		);
+		await expect(teamRepoGit(repo).originTarget()).rejects.toMatchObject({
+			code: "TEAM_REMOTE_CONFIG_UNSAFE",
+			message: expect.stringContaining("would rewrite again"),
+		});
+		await expect(
+			teamRepoGit(repo).pushBranch({ url: target?.url ?? "", head, branch: "team/y" }),
+		).rejects.toMatchObject({ code: "TEAM_REMOTE_CONFIG_UNSAFE" });
+		expect(await tipAt(join(pushTo, "acme", "app.git"), "refs/heads/team/y")).toBe("");
+		// The repository's own rewrite of the argument is refused too.
+		await writeFile(globalConfig, HOST_USER);
+		await git(["config", `url.${fetchFrom}/.insteadOf`, "https://github.com/"]);
+		await expect(teamRepoGit(repo).originTarget()).rejects.toMatchObject({
+			code: "TEAM_REMOTE_CONFIG_UNSAFE",
+		});
+	});
+
+	test("the resolution: git's single pass, the user kept only to dodge a host rule, chains refused", () => {
+		const entry = (scope: string, key: string, value: string): ScopedConfigEntry => ({
+			scope,
+			key,
+			value,
+		});
+		const resolve = (
+			url: string,
+			rules: ScopedConfigEntry[],
+			direction: "fetch" | "push" = "fetch",
+		) => resolveRemoteArgument(url, rules, direction);
+		// Devin: up → mirror.git, and a rule on ./mirror.git would send git elsewhere: refused.
+		expect(() =>
+			resolve("up", [
+				entry("global", "url.mirror.git.insteadof", "up"),
+				entry("global", "url.other.git.insteadof", "./mirror.git"),
+			]),
+		).toThrow(expect.objectContaining({ code: "TEAM_REMOTE_CONFIG_UNSAFE" }));
+		// Devin: up → upstream.git (which `up` prefixes): fine, fetched as ./upstream.git.
+		expect(resolve("up", [entry("global", "url.upstream.git.insteadof", "up")])).toEqual({
+			url: "./upstream.git",
+			credentials: null,
+		});
+		// A host rule on the URL without its login: the user kept dodges it.
+		const login = { protocol: "https", host: "github.com", username: "alice", password: "pw" };
+		expect(
+			resolve("https://alice:pw@github.com/o/r.git", [
+				entry("global", "url./x/.insteadof", "https://github.com/"),
+			]),
+		).toEqual({ url: "https://alice@github.com/o/r.git", credentials: login });
+		// Push: pushInsteadOf first, else insteadOf; a pushInsteadOf on the argument refuses it.
+		const rules = [
+			entry("global", "url.https://push.example/.pushinsteadof", "https://alias/"),
+			entry("global", "url.https://fetch.example/.insteadof", "https://alias/"),
+		];
+		expect(resolve("https://alias/o/r", rules, "push")).toEqual({
+			url: "https://push.example/o/r",
+			credentials: null,
+		});
+		expect(resolve("https://alias/o/r", rules, "fetch")).toEqual({
+			url: "https://fetch.example/o/r",
+			credentials: null,
+		});
+		expect(() =>
+			resolve(
+				"https://alias/o/r",
+				[
+					...rules,
+					entry("system", "url.https://evil.example/.pushinsteadof", "https://push.example/"),
+				],
+				"push",
+			),
+		).toThrow(expect.objectContaining({ code: "TEAM_REMOTE_CONFIG_UNSAFE" }));
+		// The repository's own rule on the configured URL or on the argument: refused.
+		expect(() =>
+			resolve("https://alias/o/r", [entry("local", "url.x.insteadof", "https://alias/")]),
+		).toThrow(expect.objectContaining({ code: "TEAM_REMOTE_CONFIG_UNSAFE" }));
+		expect(() =>
+			resolve("https://alias/o/r", [
+				...rules,
+				entry("worktree", "url.x.insteadof", "https://fetch.example/"),
+			]),
+		).toThrow(expect.objectContaining({ code: "TEAM_REMOTE_CONFIG_UNSAFE" }));
+	});
+
+	test("a URL's userinfo never reaches a message", () => {
+		expect(redactUserinfo("fatal: unable to access 'https://x:s3cr3t@github.com/a/b.git/'")).toBe(
+			"fatal: unable to access 'https://github.com/a/b.git/'",
+		);
+		expect(
+			parsePushPorcelain(
+				"To /o.git\n!\tdeadbeef:refs/heads/team/x\t[rejected] (non-fast-forward)\nDone\n",
+				"refs/heads/team/x",
+			),
+		).toEqual({ flag: "!", summary: "[rejected] (non-fast-forward)" });
+	});
+});
+
+describe("the fetch of origin's base (review 5)", () => {
+	test("a password in origin's URL never reaches a command line; the login is sent at once", async () => {
+		const { server, logins, leaks } = loginServer();
+		try {
+			await commitFile("a.txt", "a\n", "base");
+			await git([
+				"remote",
+				"add",
+				"origin",
+				`http://alice:s3cr3t@127.0.0.1:${server.port}/o/r.git`,
+			]);
+			const result = await teamRepoGit(repo).fetchBaseFromOrigin("main");
+			expect(result.ok).toBe(false);
+			if (!result.ok) expect(result.message).not.toContain("s3cr3t");
+			expect(logins).toEqual(["-", "alice:s3cr3t"]);
+			expect(leaks).toEqual([]);
+		} finally {
+			server.stop(true);
+		}
+	});
+
+	test("origin with several URLs: the first is fetched from, as git fetch origin does", async () => {
+		const { server, logins, leaks } = loginServer();
+		try {
+			await commitFile("a.txt", "a\n", "base");
+			const unused = join(temporary, `unused-${Math.random().toString(36).slice(2)}.git`);
+			await git(["init", "-q", "--bare", "-b", "main", unused], temporary);
+			await git([
+				"remote",
+				"add",
+				"origin",
+				`http://alice:s3cr3t@127.0.0.1:${server.port}/o/r.git`,
+			]);
+			await git(["config", "--add", "remote.origin.url", unused]);
+			const result = await teamRepoGit(repo).fetchBaseFromOrigin("main");
+			// The first URL was asked (and refused the login); never refused for having two.
+			expect(result.ok).toBe(false);
+			if (!result.ok) {
+				expect(result.message).not.toContain("remote.origin.url");
+				expect(result.message).not.toContain("s3cr3t");
+			}
+			expect(logins).toEqual(["-", "alice:s3cr3t"]);
+			expect(leaks).toEqual([]);
+			// The first one reachable: fetched from it.
+			const first = join(temporary, `first-${Math.random().toString(36).slice(2)}.git`);
+			await git(["init", "-q", "--bare", "-b", "main", first], temporary);
+			await git(["push", "-q", first, "main"]);
+			await git(["config", "--unset-all", "remote.origin.url"]);
+			await git(["config", "--add", "remote.origin.url", first]);
+			await git(["config", "--add", "remote.origin.url", unused]);
+			expect(await teamRepoGit(repo).fetchBaseFromOrigin("main")).toEqual({ ok: true });
+			expect(await git(["rev-parse", "refs/remotes/origin/main"])).toBe(
+				await git(["rev-parse", "main"]),
+			);
+		} finally {
+			server.stop(true);
+		}
+	});
+
+	test("a bare-name origin is a path, never a nickname from .git/remotes, .git/branches or a remote", async () => {
+		await commitFile("a.txt", "a\n", "base");
+		// `up`: a repository beside the checkout's files, origin's URL a bare name.
+		const up = join(repo, "up");
+		await git(["init", "-q", "--bare", "-b", "main", up], temporary);
+		const other = await mkdtemp(join(temporary, "clone-"));
+		await git(["clone", "-q", repo, other], temporary);
+		const upHead = await commitFile("u.txt", "u\n", "up's", other);
+		await git(["push", "-q", up, "HEAD:main"], other);
+		const elsewhere = join(temporary, `elsewhere-${Math.random().toString(36).slice(2)}.git`);
+		await git(["init", "-q", "--bare", "-b", "main", elsewhere], temporary);
+		const elsewhereHead = await commitFile("e.txt", "e\n", "elsewhere's", other);
+		await git(["push", "-q", elsewhere, "HEAD:main"], other);
+		await git(["remote", "add", "origin", "up"]);
+		// Nicknames git would read for `git fetch up`.
+		await mkdir(join(repo, ".git", "remotes"), { recursive: true });
+		await writeFile(
+			join(repo, ".git", "remotes", "up"),
+			`URL: ${elsewhere}\nPull: refs/heads/main:refs/heads/main\n`,
+		);
+		await mkdir(join(repo, ".git", "branches"), { recursive: true });
+		await writeFile(join(repo, ".git", "branches", "up"), `${elsewhere}\n`);
+		expect(await teamRepoGit(repo).fetchBaseFromOrigin("main")).toEqual({ ok: true });
+		expect(await git(["rev-parse", "refs/remotes/origin/main"])).toBe(upHead);
+		// A configured remote of that name: still the path, not refused, not that remote.
+		await rm(join(repo, ".git", "remotes"), { recursive: true, force: true });
+		await rm(join(repo, ".git", "branches"), { recursive: true, force: true });
+		await git(["remote", "add", "up", elsewhere]);
+		await git(["update-ref", "-d", "refs/remotes/origin/main"]);
+		expect(await teamRepoGit(repo).fetchBaseFromOrigin("main")).toEqual({ ok: true });
+		expect(await git(["rev-parse", "refs/remotes/origin/main"])).toBe(upHead);
+		expect(upHead).not.toBe(elsewhereHead);
+	});
+
+	test("a bare name the host's insteadOf rewrites is fetched from the rewrite (Devin)", async () => {
+		await commitFile("a.txt", "a\n", "base");
+		const target = join(temporary, `target-${Math.random().toString(36).slice(2)}.git`);
+		await git(["init", "-q", "--bare", "-b", "main", target], temporary);
+		const other = await mkdtemp(join(temporary, "clone-"));
+		await git(["clone", "-q", repo, other], temporary);
+		const targetHead = await commitFile("t.txt", "t\n", "target's", other);
+		await git(["push", "-q", target, "HEAD:main"], other);
+		const elsewhere = join(temporary, `elsewhere-${Math.random().toString(36).slice(2)}.git`);
+		await git(["init", "-q", "--bare", "-b", "main", elsewhere], temporary);
+		await commitFile("e.txt", "e\n", "elsewhere's", other);
+		await git(["push", "-q", elsewhere, "HEAD:main"], other);
+		await git(["remote", "add", "origin", "up"]);
+		// A nickname git would read for `git fetch up` points elsewhere; never read.
+		await mkdir(join(repo, ".git", "remotes"), { recursive: true });
+		await writeFile(join(repo, ".git", "remotes", "up"), `URL: ${elsewhere}\n`);
+		await writeFile(globalConfig, `${HOST_USER}[url "${target}"]\n\tinsteadOf = up\n`);
+		expect(await teamRepoGit(repo).fetchBaseFromOrigin("main")).toEqual({ ok: true });
+		expect(await git(["rev-parse", "refs/remotes/origin/main"])).toBe(targetHead);
+		// Rewritten to a URL with a login: split like any other, the password never on argv.
+		const { server, logins, leaks } = loginServer();
+		try {
+			await writeFile(
+				globalConfig,
+				`${HOST_USER}[url "http://alice:s3cr3t@127.0.0.1:${server.port}/o/r.git"]\n\tinsteadOf = up\n`,
+			);
+			const result = await teamRepoGit(repo).fetchBaseFromOrigin("main");
+			expect(result.ok).toBe(false);
+			expect(logins).toEqual(["-", "alice:s3cr3t"]);
+			expect(leaks).toEqual([]);
+			// And a repository rewrite of the rewritten URL is refused.
+			await git(["config", "url.ext::sh -c false.insteadOf", "http://127.0.0.1:"]);
+			expect(await teamRepoGit(repo).fetchBaseFromOrigin("main")).toMatchObject({
+				ok: false,
+				message: expect.stringContaining(".insteadof"),
+			});
+		} finally {
+			server.stop(true);
+		}
+	});
+
+	test("the host's remote.origin.proxy is used, the repository's never; no login on argv (Devin)", async () => {
+		const keys = ["http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "no_proxy", "NO_PROXY"];
+		const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+		for (const key of keys) delete process.env[key];
+		const proxied = (name: string) => {
+			const seen: string[] = [];
+			const server = Bun.serve({
+				port: 0,
+				hostname: "127.0.0.1",
+				fetch: (request) => {
+					seen.push(`${name} ${request.url}`);
+					return new Response("no", { status: 502 });
+				},
+			});
+			return { server, seen };
+		};
+		const host = proxied("host");
+		const mine = proxied("repo");
+		const leaks: string[] = [];
+		const scan = async () => {
+			for (const pid of await readdir("/proc").catch(() => [] as string[])) {
+				if (!/^\d+$/.test(pid)) continue;
+				const argv = await readFile(`/proc/${pid}/cmdline`, "utf8").catch(() => "");
+				// git's own processes only (not a shell whose script names the secret).
+				if (!/git/.test(argv.split("\0")[0] ?? "")) continue;
+				if (argv.includes("pxs3cr3t") || argv.includes("s3cr3t@")) leaks.push(argv);
+			}
+		};
+		const timer = setInterval(() => void scan(), 5);
+		try {
+			await commitFile("a.txt", "a\n", "base");
+			await git(["remote", "add", "origin", "http://alice:s3cr3t@127.0.0.1:1/o/r.git"]);
+			await git(["config", "remote.origin.proxy", `http://127.0.0.1:${mine.server.port}`]);
+			await writeFile(
+				globalConfig,
+				`${HOST_USER}[remote "origin"]\n\tproxy = http://px:pxs3cr3t@127.0.0.1:${host.server.port}\n`,
+			);
+			const result = await teamRepoGit(repo).fetchBaseFromOrigin("main");
+			expect(result.ok).toBe(false);
+			expect(host.seen.length).toBeGreaterThan(0);
+			expect(host.seen[0]).toContain("127.0.0.1:1/o/r.git/info/refs");
+			expect(mine.seen).toEqual([]);
+			// The push to origin's URL goes through it too (「发起 PR」 on a proxied host).
+			host.seen.length = 0;
+			const pushed = await teamRepoGit(repo).pushBranch({
+				url: "http://alice:s3cr3t@127.0.0.1:1/o/r.git",
+				head: await git(["rev-parse", "HEAD"]),
+				branch: "team/x",
+			});
+			expect(pushed.outcome).toBe("failed");
+			expect(host.seen[0]).toContain("127.0.0.1:1/o/r.git/info/refs?service=git-receive-pack");
+			expect(mine.seen).toEqual([]);
+			await scan();
+			expect(leaks).toEqual([]);
+			// Origin rewritten by the host to a destination a host `http.<prefix>.proxy` names: the
+			// argument is the destination, so origin's proxy (keyed on it) still wins (Devin).
+			await git(["config", "--unset", "remote.origin.proxy"]);
+			await git(["remote", "set-url", "origin", "http://alias.example/org/repo.git"]);
+			await writeFile(
+				globalConfig,
+				`${HOST_USER}[remote "origin"]\n\tproxy = http://127.0.0.1:${host.server.port}\n[url "http://127.0.0.1:1/org/"]\n\tinsteadOf = http://alias.example/org/\n[http "http://127.0.0.1:1/org/"]\n\tproxy = http://127.0.0.1:${mine.server.port}\n`,
+			);
+			host.seen.length = 0;
+			expect((await teamRepoGit(repo).fetchBaseFromOrigin("main")).ok).toBe(false);
+			expect(host.seen[0]).toContain("127.0.0.1:1/org/repo.git/info/refs");
+			expect(mine.seen).toEqual([]);
+			host.seen.length = 0;
+			const target = await teamRepoGit(repo).originTarget();
+			expect(target?.resolved).toBe("http://127.0.0.1:1/org/repo.git");
+			const viaAlias = await teamRepoGit(repo).pushBranch({
+				url: target?.url ?? "",
+				head: await git(["rev-parse", "HEAD"]),
+				branch: "team/x",
+			});
+			expect(viaAlias.outcome).toBe("failed");
+			expect(host.seen[0]).toContain("127.0.0.1:1/org/repo.git/info/refs");
+			expect(mine.seen).toEqual([]);
+		} finally {
+			clearInterval(timer);
+			host.server.stop(true);
+			mine.server.stop(true);
+			for (const key of keys)
+				if (saved[key] === undefined) delete process.env[key];
+				else process.env[key] = saved[key];
+		}
+	});
+
+	test("an explicitly empty insteadOf matches every URL, as in git: a catch-all after a specific rule is refused (Devin)", async () => {
+		const head = await commitFile("a.txt", "a\n", "base");
+		const primary = join(temporary, `primary-${Math.random().toString(36).slice(2)}.git`);
+		await git(["init", "-q", "--bare", "-b", "main", primary], temporary);
+		await git(["push", "-q", primary, "main"]);
+		const backup = join(temporary, `backup-${Math.random().toString(36).slice(2)}`);
+		await writeFile(
+			globalConfig,
+			`${HOST_USER}[url "${primary}"]\n\tinsteadOf = prim:\n[url "${backup}"]\n\tinsteadOf =\n`,
+		);
+		// Real git: the empty prefix rewrites any URL.
+		await git(["remote", "add", "probe", primary]);
+		expect(await git(["remote", "get-url", "probe"])).toBe(`${backup}${primary}`);
+		await git(["remote", "remove", "probe"]);
+		await git(["remote", "add", "origin", "prim:"]);
+		// prim: → the primary, which the catch-all would rewrite again: refused, never followed.
+		const fetched = await teamRepoGit(repo).fetchBaseFromOrigin("main");
+		expect(fetched).toMatchObject({
+			ok: false,
+			message: expect.stringContaining("would rewrite again"),
+		});
+		expect(await git(["for-each-ref", "refs/remotes/"])).toBe("");
+		await expect(teamRepoGit(repo).originTarget()).rejects.toMatchObject({
+			code: "TEAM_REMOTE_CONFIG_UNSAFE",
+		});
+		await expect(
+			teamRepoGit(repo).pushBranch({ url: "prim:", head, branch: "team/x" }),
+		).rejects.toMatchObject({ code: "TEAM_REMOTE_CONFIG_UNSAFE" });
+		expect(await git(["for-each-ref", "refs/heads/team/"], primary)).toBe("");
+		// The resolver: the empty rule is the shortest match.
+		const rule = (key: string, value: string): ScopedConfigEntry => ({
+			scope: "global",
+			key,
+			value,
+		});
+		expect(() =>
+			resolveRemoteArgument("/srv/primary/app.git", [rule("url./backup.insteadof", "")], "fetch"),
+		).toThrow(expect.objectContaining({ code: "TEAM_REMOTE_CONFIG_UNSAFE" }));
+		// The repository's own catch-all is refused like any repository rule.
+		await writeFile(globalConfig, HOST_USER);
+		await git(["remote", "set-url", "origin", primary]);
+		await git(["config", `url.${backup}.insteadOf`, ""]);
+		expect(await teamRepoGit(repo).fetchBaseFromOrigin("main")).toMatchObject({ ok: false });
+		expect(await git(["for-each-ref", "refs/remotes/"])).toBe("");
+	});
+
+	test("equally long prefixes: the first base in first-appearance order wins, as in git (review 3)", async () => {
+		await commitFile("a.txt", "a\n", "base");
+		const a = join(temporary, "tie-A/");
+		const b = join(temporary, "tie-B/");
+		await writeFile(
+			globalConfig,
+			`${HOST_USER}[url "${a}"]\n\tinsteadOf = zz:\n[url "${b}"]\n\tinsteadOf = p:\n[url "${a}"]\n\tinsteadOf = p:\n`,
+		);
+		await git(["remote", "add", "origin", "p:app.git"]);
+		// What git itself makes of it.
+		expect(await git(["remote", "get-url", "origin"])).toBe(`${a}app.git`);
+		expect((await teamRepoGit(repo).originTarget())?.resolved).toBe(`${a}app.git`);
+	});
+
+	test("an empty user with a password and a host rule on the URL without it: refused, not followed (review 4)", () => {
+		// `https://@host/…` would dodge the rule, but git then never asks the helper for the password.
+		expect(() =>
+			resolveRemoteArgument(
+				"https://:pw@github.com/o/r",
+				[
+					{
+						scope: "global",
+						key: "url.https://x-access-token:T0K@github.com/.insteadof",
+						value: "https://github.com/",
+					},
+				],
+				"fetch",
+			),
+		).toThrow(expect.objectContaining({ code: "TEAM_REMOTE_CONFIG_UNSAFE" }));
+		// With a user, the user kept dodges it.
+		expect(
+			resolveRemoteArgument(
+				"https://ci:pw@github.com/o/r",
+				[
+					{
+						scope: "global",
+						key: "url.https://x-access-token:T0K@github.com/.insteadof",
+						value: "https://github.com/",
+					},
+				],
+				"fetch",
+			),
+		).toMatchObject({ url: "https://ci@github.com/o/r" });
+	});
+
+	test("a refusal never carries a login: not the rule's key, not origin's URL (review 1)", async () => {
+		await commitFile("a.txt", "a\n", "base");
+		await writeFile(
+			globalConfig,
+			`${HOST_USER}[url "https://github.com/"]\n\tinsteadOf = gh:\n[url "https://x-access-token:T0K@github.com/"]\n\tinsteadOf = https://github.com/\n`,
+		);
+		await git(["remote", "add", "origin", "gh:acme/app.git"]);
+		const error = await teamRepoGit(repo)
+			.originTarget()
+			.then(
+				() => null,
+				(caught: unknown) => caught as UnsafeRemoteConfigError,
+			);
+		expect(error).toMatchObject({ code: "TEAM_REMOTE_CONFIG_UNSAFE" });
+		expect(`${error?.key} ${error?.message}`).not.toContain("T0K");
+		expect(error?.message).toContain("host's");
+		const fetched = await teamRepoGit(repo).fetchBaseFromOrigin("main");
+		expect(JSON.stringify(fetched)).not.toContain("T0K");
+		expect(new UnsafeRemoteConfigError("url.https://u:pw@h/.insteadof").message).not.toContain(
+			"pw@",
+		);
+	});
+
+	test("up → upstream.git (a prefix of it): fetched from ./upstream.git (Devin)", async () => {
+		await commitFile("a.txt", "a\n", "base");
+		const upstream = join(repo, "upstream.git");
+		await git(["init", "-q", "--bare", "-b", "main", upstream], temporary);
+		const other = await mkdtemp(join(temporary, "clone-"));
+		await git(["clone", "-q", repo, other], temporary);
+		const upstreamHead = await commitFile("u.txt", "u\n", "upstream's", other);
+		await git(["push", "-q", upstream, "HEAD:main"], other);
+		await git(["remote", "add", "origin", "up"]);
+		await writeFile(globalConfig, `${HOST_USER}[url "upstream.git"]\n\tinsteadOf = up\n`);
+		expect(await teamRepoGit(repo).fetchBaseFromOrigin("main")).toEqual({ ok: true });
+		expect(await git(["rev-parse", "refs/remotes/origin/main"])).toBe(upstreamHead);
+		// Devin's redirect: a rule on ./upstream.git would send git elsewhere; refused.
+		const elsewhere = join(temporary, `elsewhere-${Math.random().toString(36).slice(2)}.git`);
+		await git(["init", "-q", "--bare", "-b", "main", elsewhere], temporary);
+		await writeFile(
+			globalConfig,
+			`${HOST_USER}[url "upstream.git"]\n\tinsteadOf = up\n[url "${elsewhere}"]\n\tinsteadOf = ./upstream.git\n`,
+		);
+		expect(await teamRepoGit(repo).fetchBaseFromOrigin("main")).toMatchObject({
+			ok: false,
+			message: expect.stringContaining("would rewrite again"),
+		});
+	});
+
+	test("a bare name the host rewrites to a URL another host rule rewrites again is refused", async () => {
+		await commitFile("a.txt", "a\n", "base");
+		const target = join(temporary, `chained-${Math.random().toString(36).slice(2)}.git`);
+		await git(["init", "-q", "--bare", "-b", "main", target], temporary);
+		await git(["remote", "add", "origin", "up"]);
+		await writeFile(
+			globalConfig,
+			`${HOST_USER}[url "https://mirror.example/r.git"]\n\tinsteadOf = up\n[url "${target}"]\n\tinsteadOf = https://mirror.example/r.git\n`,
+		);
+		const refused = await teamRepoGit(repo).fetchBaseFromOrigin("main");
+		expect(refused).toMatchObject({ ok: false });
+		if (!refused.ok) {
+			expect(refused.message).toContain("would rewrite again");
+			expect(refused.message).toContain("rewrites a remote's URL once");
+		}
+		expect(await git(["for-each-ref", "refs/remotes/"])).toBe("");
+	});
+
+	test("only refs/remotes/origin/<base> moves, whatever origin's fetch refspecs say", async () => {
+		await commitFile("a.txt", "a\n", "base");
+		const origin = join(temporary, `origin-${Math.random().toString(36).slice(2)}.git`);
+		await git(["init", "-q", "--bare", "-b", "main", origin], temporary);
+		await git(["push", "-q", origin, "main"]);
+		const local = await git(["rev-parse", "main"]);
+		const other = await mkdtemp(join(temporary, "clone-"));
+		await git(["clone", "-q", origin, other], temporary);
+		const moved = await commitFile("b.txt", "b\n", "upstream", other);
+		await git(["push", "-q", "origin", "main", "main:refs/heads/side"], other);
+		await git(["remote", "add", "origin", origin]);
+		await git(["config", "--add", "remote.origin.fetch", "+refs/heads/side:refs/heads/main"]);
+		expect(await teamRepoGit(repo).fetchBaseFromOrigin("main")).toEqual({ ok: true });
+		expect(await git(["for-each-ref", "--format=%(refname) %(objectname)"])).toBe(
+			`refs/heads/main ${local}\nrefs/remotes/origin/main ${moved}`,
+		);
+	});
+
+	test("a repository rewrite of the URL without its login, or a password on ssh, refuses it", async () => {
+		await commitFile("a.txt", "a\n", "base");
+		const ran = marker("fetch-rewrite");
+		await git(["remote", "add", "origin", "https://alice:s3cr3t@github.com/acme/app.git"]);
+		await git(["config", `url.ext::sh -c touch% ${ran}.insteadOf`, "https://github.com/"]);
+		const refused = await teamRepoGit(repo).fetchBaseFromOrigin("main");
+		expect(refused).toMatchObject({ ok: false });
+		if (!refused.ok) expect(refused.message).toContain(".insteadof");
+		expect(existsSync(ran)).toBe(false);
+		await git(["config", "--remove-section", `url.ext::sh -c touch% ${ran}`]);
+		await git(["config", "remote.https://github.com/acme/app.git.receivepack", "x"]);
+		expect(await teamRepoGit(repo).fetchBaseFromOrigin("main")).toMatchObject({ ok: false });
+		await git(["config", "--remove-section", "remote.https://github.com/acme/app.git"]);
+		await git(["remote", "set-url", "origin", "ssh://alice:s3cr3t@127.0.0.1:1/o/r.git"]);
+		const ssh = await teamRepoGit(repo).fetchBaseFromOrigin("main");
+		expect(ssh).toMatchObject({ ok: false });
+		if (!ssh.ok) expect(ssh.message).toContain("password");
 	});
 });

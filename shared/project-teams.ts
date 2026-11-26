@@ -208,8 +208,9 @@ export const TEAM_STATUS_CADENCE_MS = 10 * 60_000;
 // ── P3: work item lifecycle ──────────────────────────────────────────────────
 
 /**
- * The coordinator's `Team` tool actions (plan §二.4). PR, CI and integration actions
- * (`integrate`, `pr.*`, `merge.local`) are deferred with the hosting and integration PRs.
+ * The coordinator's `Team` tool actions (plan §二.4). Merging is never the coordinator's: a member
+ * merges a ready item from the team page (locally, or through a GitHub pull request, M and G);
+ * integration actions (`integrate`) are deferred.
  */
 export const TEAM_TOOL_ACTIONS = [
 	"work.list",
@@ -276,6 +277,16 @@ export const TEAM_WORK_EVENT_KINDS = [
 	"work.merge_failed",
 	/** M: the merge commit is ready, but the base is checked out: a person fast-forwards it. */
 	"work.merge_prepared",
+	/** G: the item's head was pushed to its branch on GitHub (a new or moved branch only). */
+	"work.pr_pushed",
+	/** G: the item's pull request was opened (or an open one found and adopted). */
+	"work.pr_opened",
+	/** G: the pull request's checks turned failing or passing, or its review asked for changes. */
+	"work.pr_checks",
+	/** G: the pull request was closed without being merged. */
+	"work.pr_closed",
+	/** G: GitHub accepted the merge but queued it (a merge queue or auto-merge). */
+	"work.pr_queued",
 ] as const;
 export type TeamWorkEventKind = (typeof TEAM_WORK_EVENT_KINDS)[number];
 
@@ -555,11 +566,25 @@ export interface TeamProjectSettings {
 	 */
 	workStart?: TeamWorkStart;
 	/**
+	 * G: the GitHub repository the project's pull requests go to, as a person with project manage
+	 * permission confirmed it. Written only by `PUT …/team-github` (never the project PATCH).
+	 */
+	github?: TeamGithubTarget;
+	/**
 	 * Path globs (relative to the repository root, `**` for any depth) only one item may change at
 	 * a time. `dir/` is stored as `dir/**`; a bare name without glob characters (`drizzle`) covers
 	 * that file or directory and everything under it.
 	 */
 	exclusivePaths?: string[];
+}
+
+/** G: a project's confirmed GitHub repository (`host/owner/repo`), who confirmed it and when. */
+export interface TeamGithubTarget {
+	host: string;
+	owner: string;
+	repo: string;
+	confirmedBy: string | null;
+	confirmedAt: string | null;
 }
 
 /** Events written by X. */
@@ -891,7 +916,8 @@ export function dependencyBlockers<T extends { state: TeamWorkItemState; baseMis
  * - `local`: NarraFork computes the merge commit in the object store and fast-forwards the base
  *   branch where it is not checked out; where it is, the merge is prepared and a person
  *   fast-forwards that checkout explicitly;
- * - `github`: origin is on GitHub, merged through a pull request (a later PR: disabled for now);
+ * - `github`: origin is on GitHub (github.com, or a GitHub Enterprise host gh is logged in to):
+ *   the item's branch is pushed, a pull request opened, and merged there through `gh`;
  * - `checking`: the repository's origin is still being looked at.
  */
 export type TeamMergeMode = "local" | "github" | "checking";
@@ -903,6 +929,10 @@ export const TEAM_MERGE_PHASES = [
 	"merging",
 	"updating",
 	"fast_forwarding",
+	/** G: pushing the item's head to its branch on GitHub. */
+	"pushing",
+	/** G: finding or opening the pull request. */
+	"opening",
 ] as const;
 export type TeamMergePhase = (typeof TEAM_MERGE_PHASES)[number];
 
@@ -913,7 +943,22 @@ export const TEAM_MERGE_DISABLED_REASONS = [
 	"merging",
 	"worker_running",
 	"checking",
-	"github_pending",
+	/** G: origin is on GitHub, but gh is not installed (or does not run) on the host. */
+	"gh_missing",
+	/** G: gh is not logged in to that host. */
+	"gh_logged_out",
+	/** G: gh's account may not write to the repository. */
+	"gh_no_permission",
+	/** G: the repository is archived on GitHub. */
+	"gh_repo_archived",
+	/** G: gh could not read the repository (offline, not found, an error). */
+	"gh_unavailable",
+	/** G: no person confirmed the GitHub repository yet, and this caller may not (manage only). */
+	"github_unconfirmed",
+	/** G: origin now resolves to another repository than the one confirmed. */
+	"github_target_changed",
+	/** G: the repository's own configuration redirects origin (a push URL or a rewrite). */
+	"remote_config_unsafe",
 	"base_remote",
 	"git_too_old",
 ] as const;
@@ -975,18 +1020,135 @@ export type TeamWorkMergeOutcome =
 			};
 	  };
 
+/**
+ * What a merge job does: `merge` (the local merge), `fast_forward` (a prepared merge in a person's
+ * checkout), `pull_request` (G: push the branch and open or update its pull request), `pr_merge`
+ * (G: merge the pull request on GitHub).
+ */
+export type TeamMergeJobKind = "merge" | "fast_forward" | "pull_request" | "pr_merge";
+
+/** G: how GitHub merges a pull request (`gh pr merge --merge / --squash / --rebase`). */
+export const TEAM_PR_MERGE_METHODS = ["merge", "squash", "rebase"] as const;
+export type TeamPrMergeMethod = (typeof TEAM_PR_MERGE_METHODS)[number];
+
+/** G: GitHub's merge state of a pull request (`mergeStateStatus`). */
+export type TeamPrMergeState =
+	| "CLEAN"
+	| "HAS_HOOKS"
+	| "UNSTABLE"
+	| "BLOCKED"
+	| "BEHIND"
+	| "DIRTY"
+	| "DRAFT"
+	| "UNKNOWN";
+
+/** G: the merge states in which 「合并 PR」 is offered. */
+export const TEAM_PR_MERGEABLE_STATES: readonly TeamPrMergeState[] = [
+	"CLEAN",
+	"HAS_HOOKS",
+	"UNSTABLE",
+];
+
+/** G: why 「合并 PR」 is not offered now (null: it is). */
+export const TEAM_PR_MERGE_BLOCKERS = [
+	/** The pull request's state was not read yet. */
+	"checking",
+	/** The pull request carries an older head: 「更新 PR」 first. */
+	"head_stale",
+	"draft",
+	/** Review, required checks or branch protection. */
+	"blocked",
+	/** The base moved on: GitHub wants the branch brought up to date. */
+	"behind",
+	/** It conflicts with the base. */
+	"dirty",
+	/** GitHub has not computed it yet: try again shortly. */
+	"unknown",
+	/** Already queued for merging. */
+	"queued",
+	"closed",
+	/** The repository allows no merge method gh may use. */
+	"no_method",
+] as const;
+export type TeamPrMergeBlocker = (typeof TEAM_PR_MERGE_BLOCKERS)[number];
+
+/** G: a pull request's checks, summarised (`gh pr checks` buckets). */
+export interface TeamPrChecks {
+	/** `failing` when any failed, else `pending` while any runs, else `passing`; `none` without. */
+	state: "passing" | "failing" | "pending" | "none";
+	pass: number;
+	fail: number;
+	pending: number;
+	skipping: number;
+	total: number;
+	/** At most {@link TEAM_PR_CHECK_FAILURES_MAX} failed checks. */
+	failures: { name: string; link: string | null }[];
+}
+
+/** Most failed checks a pull request's summary names. */
+export const TEAM_PR_CHECK_FAILURES_MAX = 10;
+
+/** G: a ready item's pull request as last read from GitHub (cards read a cache, never gh). */
+export interface TeamWorkPullRequest {
+	number: number;
+	url: string;
+	/** The repository it is in (`host/owner/repo`): always the one pull requests go to now. */
+	repository: string;
+	/** Null until its state was read. */
+	state: "OPEN" | "CLOSED" | "MERGED" | null;
+	isDraft: boolean;
+	/** Whether the pull request carries the item's ready head (else 「更新 PR」). */
+	headMatches: boolean;
+	mergeState: TeamPrMergeState | null;
+	review: "APPROVED" | "CHANGES_REQUESTED" | "REVIEW_REQUIRED" | null;
+	checks: TeamPrChecks | null;
+	/** GitHub queued the merge (a merge queue, or auto-merge). */
+	queued: boolean;
+	/** When the state was read (ISO), null before. */
+	checkedAt: string | null;
+	/** A read runs now (the drawer polls until it ends). */
+	refreshing: boolean;
+	/** The last read failed: gh's complaint, cut short. */
+	error: string | null;
+	/** The methods the repository allows, the default first. */
+	methods: TeamPrMergeMethod[];
+	/** Whether 「合并 PR」 is offered to this caller now. */
+	canMergePr: boolean;
+	mergeBlocker: TeamPrMergeBlocker | null;
+	/** The caller may ask GitHub for its state now (a member with project write). */
+	canRefresh: boolean;
+}
+
 /** A ready item's merge state as a card shows it. */
 export interface TeamWorkMergeSummary {
 	mode: TeamMergeMode;
 	/** The running job's phase; null when nothing runs. */
 	phase: TeamMergePhase | null;
 	/** What the running job does. */
-	job: "merge" | "fast_forward" | null;
+	job: TeamMergeJobKind | null;
 	/** The newest outcome's kind since the item became ready (or since the last request). */
 	outcome: "conflict" | "failed" | "prepared" | null;
-	/** The caller may press 合并 now (a member). */
+	/**
+	 * The caller may press the main action now (a member): 「合并到 {{base}}」 locally, 「发起 PR」 /
+	 * 「更新 PR」 / 「重新发起 PR」 in GitHub mode.
+	 */
 	canMerge: boolean;
 	disabledReason: TeamMergeDisabledReason | null;
+	/** G: the item's pull request (GitHub mode, once one was opened); null otherwise. */
+	pr?: TeamWorkPullRequest | null;
+	/**
+	 * G: where pull requests go: `target` is what origin resolves to now (`host/owner/repo`),
+	 * `pinned` what a person confirmed (null: not yet); `canConfirm` whether this caller may
+	 * confirm it (project manage), which 「发起 PR」 asks for first when nothing is pinned.
+	 */
+	github?: { target: string | null; pinned: string | null; canConfirm: boolean };
+}
+
+/** G: `PUT /projects/:projectId/team-github`: the confirmed repository (null: cleared). */
+export interface TeamGithubPinResponse {
+	pinned: TeamGithubTarget | null;
+	/** What origin resolves to now, when known. */
+	detected: string | null;
 }
 
 /** A ready item's merge state in the drawer. */
@@ -1015,11 +1177,20 @@ export interface TeamWorkMergeView extends TeamWorkMergeSummary {
 	};
 }
 
-/** `POST …/work/:itemId/merge` and `…/merge/fast-forward`: accepted, running in the background. */
+/**
+ * `POST …/work/:itemId/merge`, `…/merge/fast-forward` and `…/pr/merge`: accepted, running in the
+ * background.
+ */
 export interface TeamWorkMergeResponse {
 	itemId: string;
-	job: "merge" | "fast_forward";
+	job: TeamMergeJobKind;
 	phase: TeamMergePhase;
+}
+
+/** G: `POST …/work/:itemId/pr/refresh`: a read of the pull request started (or already runs). */
+export interface TeamWorkPrRefreshResponse {
+	itemId: string;
+	refreshing: boolean;
 }
 
 /** Injection source of the note a coordinator gets when a merge lands or needs its worker. */

@@ -70,6 +70,11 @@ export const teamProjectSettingsSchema = z
 		exclusivePaths: z.array(exclusivePathGlobSchema).max(TEAM_EXCLUSIVE_PATHS_MAX).optional(),
 		/** The default work start of the project's teams (`TeamProjectSettings.workStart`). */
 		workStart: z.enum(TEAM_WORK_START_MODES).optional(),
+		/**
+		 * G: accepted (a client sends back the `teams` it read) but never written by this route: the
+		 * confirmed GitHub repository is kept as stored (`team-github-pin.ts`, `PUT …/team-github`).
+		 */
+		github: z.unknown().optional(),
 	})
 	.strict()
 	.refine(

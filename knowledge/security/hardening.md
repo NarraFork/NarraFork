@@ -4,12 +4,16 @@ title: 外部进程加固
 summary: git 执行加固、子进程统一封装（safeSpawn）。
 anchors:
   - server/lib/git-exec-hardening.ts
+  - server/services/teams/team-gh.ts
   - server/lib/spawn.ts
   - server/services/narrator-worktree-service.ts
   - server/services/teams/team-git.ts
   - server/lib/win-handle-guard.ts
 keywords:
   - GIT_NO_EXEC_CONFIG
+  - gh
+  - pushBranch
+  - borrowingRepository
   - GIT_CONFIG_COUNT
   - GIT_OPTIONAL_LOCKS
   - GIT_TOO_OLD_FOR_HARDENING
@@ -22,7 +26,7 @@ keywords:
   - 子进程超时
   - 输出上限
 status: draft
-verified_at: 3588311eac166b9c044478105016c59ebd95688b
+verified_at: 7303089afdc233b6dbff4441b2f9f025813801a6
 ---
 # 外部进程加固
 
@@ -35,6 +39,9 @@ verified_at: 3588311eac166b9c044478105016c59ebd95688b
 - 团队 git 只按真实对象回答历史（`TRUE_HISTORY_ENV`，由 team-git 的读、team-git-write 的 `run()` 与两个探测自己加，不看宿主环境）：`GIT_NO_REPLACE_OBJECTS=1` 忽略 `refs/replace/*`（仓库内容，agent 可写；否则能让 `merge-base --is-ancestor` 把工作项说成已在基线里），`GIT_GRAFT_FILE` 指向不存在的 `<DEV_NULL>/no-grafts`（`GIT_NO_REPLACE_OBJECTS` 不关 `info/grafts`；指 `/dev/null` 会读它并打 deprecation 提示），去掉继承的 `GIT_REPLACE_REF_BASE`/`GIT_SHALLOW_FILE`。`cleanGitEnv` 与 `gitConfigEnv` 不带它：叙述者 worktree 的创建等仍按 git 默认读历史，否则从被替换的提交建出的 worktree 索引是真实树、而人自己的 git 看替换后的树，`git status` 会出现没人做过的暂存改动。浅克隆、graft 文件与影响基线/工作项的替换引用另由团队拒绝（`assertTrueHistory`、`assertNoReplacedHistory`），见 collaboration/teams/merge。
 - 读工作树的命令（`status`、`worktree remove`）额外把配置里所有 filter 的 clean/smudge/process 清空，并按名字禁用配置定义的 hook、清空自定义合并驱动（`merge.<名>.driver` 置空：git 不运行任何程序，那个文件按冲突算）；名字来自先跑一次只读的 `git config --get-regexp`（`PROGRAM_CONFIG_QUERY`、`untrustedProgramOverrides`，`narrator-worktree-service.ts:hardenedConfig`）。
 - 团队合并与起点拉取的 git（`services/teams/team-git-write.ts`）多一条规则：仓库自己的配置（local/worktree，agent 可写）不能运行程序，也不能选凭证、传输或身份。敏感键用 `git config --show-scope` 读（`scopedConfig`），只认 system/global，仓库值在命令级改回主机值或中性值，没有中性值就拒绝。落到：凭证助手、askpass、http 与代理、ssh 命令（`networkOverrides`、`sshSettings`）；签名程序与 `commit.gpgsign`（`signingConfig`）；提交身份（`hostIdentity`）；`fetch .` 只许本地传输（`ext::` 的 insteadOf 跑不起来）；在人的检出里快进时关 autostash、签名校验、子模块递归。可运行程序的配置（filter、配置 hook、合并驱动）在每条可能运行它们的命令前重读。见[合并工作项与基线配置](../collaboration/teams/merge.md)。
+- 团队 PR 流程的推送（`team-git-write.ts:pushBranch`）连仓库自己的配置都不读：git 推到一个 URL 时，若某个配置的 remote 的推送 URL 正是它，会按那个 remote 的 fetch refspec 更新"跟踪"ref（agent 能把它指到被检出的基线上），还会用那个 remote 的设置。所以推送从 NarraFork 自己的一次性裸仓库（`<home>/run/push-*`，同对象格式，只经 `objects/info/alternates` 借用项目的对象库，没有 remote、hook 和别的配置，用完删掉，`borrowingRepository`）里跑，只读主机配置与命令级覆盖，项目的任何 ref 都不动。推之前仍按拉取的规则检查项目的配置（`networkOverrides`：仓库的 `core.gitProxy`、`remote.origin.vcs`、改写 origin 的 `insteadOf`、无中性值的 `http.*` 照样拒绝 `TEAM_REMOTE_CONFIG_UNSAFE`），另外仓库的 `url.*.insteadOf` / `url.*.pushInsteadOf` 前缀命中推送 URL、或有以该 URL 为名的 `remote.<URL>.*` 也拒绝（`assertPushUrlUntouched`）。命令带 `--no-verify --no-signed --no-recurse-submodules --no-follow-tags --receive-pack=git-receive-pack`，命令级 `push.gpgSign=false`、`push.recurseSubmodules=no`、`push.followTags=false`、`push.negotiate=false`、`push.autoSetupRemote=false`、`push.pushOption=`（清空），协议同拉取（`ext::` 永不），120 秒、64KB；出错消息去掉 URL 的 userinfo（`redactUserinfo`）。URL 里的密码永不进 argv（git 会把 URL 作为参数交给 `git-remote-https`，`/proc/<pid>/cmdline` 谁都能读）：推送用去掉整个登录的 URL（`splitUrlCredentials`；只有用户名时原样），登录经环境变量 `NARRAFORK_PUSH_*` 交给一个命令级的凭据助手，它排在主机助手之前、只回答同协议同主机的 `get`（`credentialFromEnvironment`）；环境只有属主能读。拉取 `origin/<基线>`（`fetchBaseFromOrigin`）同样处理：按 origin 的 URL 拉，不按名字，仓库自己的 `insteadOf` 或 `remote.<URL>.*` 命中去掉登录后的 URL 就拒绝。见 [GitHub PR 流程](../collaboration/teams/pull-requests.md)。
+- 推到哪里不由 git 的 `get-url --push` 决定（它会套仓库自己的 `pushurl`、`pushInsteadOf`、`insteadOf`）：`originTarget` 从原始配置读 origin 的 URL，只套主机的改写，仓库自己的 push URL 或改写 origin 的 `insteadOf`/`pushInsteadOf` 一律拒绝；主机改写由 NarraFork 自己做一次（`resolveRemoteArgument`），交给 git 的参数若还会被主机规则再改写就拒绝，所以 git 连的、代理设置针对的、确认比对的都是同一个 URL；推送与 gh 都只针对项目管理员确认过的 `host/owner/repo`（[GitHub PR 流程](../collaboration/teams/pull-requests.md)）。
+- GitHub CLI（`gh`，`teams/team-gh.ts`）是团队唯一会跑的另一个外部程序：从 NarraFork 的空目录 `<home>/run/gh` 运行（里面有 `.git` 或 `no-repository` 就拒绝），总带 `-R host/owner/repo`，`GIT_DIR` 指向不存在的路径、`GIT_CEILING_DIRECTORIES` 为该目录（gh 会自己跑 `git remote -v`）；环境从 `cleanGitEnv` 起，`GH_*`/`GITHUB_*` 只留令牌、`GH_HOST`、`GH_CONFIG_DIR`，去掉编辑器、浏览器、分页器、调试、`GIT_SSH*`，关提示、更新提醒、颜色与分页；不用会推送或碰本地仓库的子命令与参数（`pr create` 总带 `--head`，`pr merge` 不带 `--delete-branch`/`--admin`，不用 `pr checkout`）；参数按严格模式校验，正文经 stdin；每次都有超时、输出上限、中止时杀进程树，JSON 经 Zod。测试用 PATH 上的假 gh 记录 argv、目录与环境（`fake-gh.fixture.ts`）。
 - `worktree add` 不加固，保留仓库自己的检出 hook 与 filter（`hardenedConfig` 开头）。
 - git 低于 2.31 会静默忽略 `GIT_CONFIG_COUNT`，所以每进程探测一次哨兵配置，不通过就拒绝并报 `GIT_TOO_OLD_FOR_HARDENING`（409，失败不缓存）（`ensureConfigOverridesHonored`）。团队 worktree 的 git 同样套用（`services/teams/team-git.ts`，含建团队前对项目目录的 `isGitWorkTree` 与基线分支解析；它读 blob 用 `cat-file blob`，不走 filter 与 textconv，经 `safeSpawn` 的 `stdoutStream` 按 blob 大小 +1 字节限额；团队页读单个文件的 diff 同样用 `stdoutStream` 读到 64KB+1 字节即停，`diff --numstat` 输出上限 512KB）。
 - `diff` 用 `noExternalDiffArgs` 加 `--no-ext-diff --no-textconv`。

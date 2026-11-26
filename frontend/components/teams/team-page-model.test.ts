@@ -14,10 +14,14 @@ import {
 	TEAM_MERGE_DISABLED_REASONS,
 	TEAM_OVERLAP_EVENT_KINDS,
 	TEAM_PERSON_DECISION_EVENT_KINDS,
+	TEAM_PR_MERGE_BLOCKERS,
+	TEAM_PR_MERGE_METHODS,
 	TEAM_WORK_EVENT_KINDS,
 	type TeamBoardItem,
 	type TeamPageSummary,
 	type TeamPendingApproval,
+	type TeamWorkMergeSummary,
+	type TeamWorkPullRequest,
 } from "@shared/project-teams";
 import {
 	ATTENTION_SHOWN,
@@ -29,10 +33,12 @@ import {
 	chunkIds,
 	conflictReasonFiles,
 	coordinatorLine,
+	currentPullRequest,
 	diffLineKind,
 	eventLabelKey,
 	eventNote,
 	findingsNeedToggle,
+	githubConfirmation,
 	isCoordinator,
 	itemMarks,
 	itemOfApproval,
@@ -40,6 +46,7 @@ import {
 	liveWorkerStatus,
 	MERGE_CONFLICT_REASON_FILES,
 	mergeControl,
+	mergeControl as mergeControlOf,
 	mergeErrorKey,
 	mergeRequestCode,
 	nextPollDelay,
@@ -47,12 +54,15 @@ import {
 	onlookerSeesWaiting,
 	pauseNotice,
 	pauseOrder,
+	pullRequestControl,
+	pullRequestRepo,
 	queuedLine,
 	returnErrorKey,
 	returnReason,
 	rowLine,
 	SUMMARY_POLL_MAX_MS,
 	SUMMARY_POLL_MIN_MS,
+	safeHref,
 	showsStat,
 	statusSentence,
 	summarySignature,
@@ -899,12 +909,13 @@ describe("merge (M)", () => {
 			mergeControl({
 				...summary,
 				canMerge: false,
-				disabledReason: "github_pending",
+				disabledReason: "gh_logged_out",
 				mode: "github",
 			}),
 		).toMatchObject({
+			label: "openPr",
 			enabled: false,
-			disabledKey: "teams.page.merge.disabled.github_pending",
+			disabledKey: "teams.page.merge.disabled.gh_logged_out",
 		});
 		expect(mergeControl({ ...summary, outcome: "conflict" })?.panel).toBe("conflict");
 	});
@@ -993,5 +1004,341 @@ describe("merge (M)", () => {
 			])
 				expect({ locale, key, text: typeof notes[key] }).toEqual({ locale, key, text: "string" });
 		}
+	});
+});
+
+describe("pull requests (G)", () => {
+	const pr = (over: Partial<TeamWorkPullRequest> = {}): TeamWorkPullRequest => ({
+		number: 7,
+		url: "https://github.com/acme/app/pull/7",
+		repository: "github.com/acme/app",
+		state: "OPEN",
+		isDraft: false,
+		headMatches: true,
+		mergeState: "CLEAN",
+		review: null,
+		checks: null,
+		queued: false,
+		checkedAt: "2026-11-25T00:00:00.000Z",
+		refreshing: false,
+		error: null,
+		methods: ["squash", "merge"],
+		canMergePr: true,
+		mergeBlocker: null,
+		canRefresh: true,
+		...over,
+	});
+	const github = (over: Partial<TeamWorkMergeSummary> = {}): TeamWorkMergeSummary => ({
+		mode: "github",
+		phase: null,
+		job: null,
+		outcome: null,
+		canMerge: true,
+		disabledReason: null,
+		pr: null,
+		...over,
+	});
+
+	test("a pull request of the repository origin pointed to before: 发起 PR in the new one (Devin 4)", () => {
+		const moved = (pin: string | null, target = "github.com/acme/app2") =>
+			github({
+				pr: pr(),
+				github: { target, pinned: pin, canConfirm: true },
+			});
+		const old = moved("github.com/acme/app2");
+		expect(currentPullRequest(old)).toBeNull();
+		expect(mergeControlOf(old)).toMatchObject({ label: "openPr", enabled: true });
+		expect(pullRequestControl(old)).toBeNull();
+		// The same repository (any case) is the item's: 查看 PR / 合并 PR.
+		const same = moved("GitHub.com/Acme/App", "github.com/acme/app");
+		expect(currentPullRequest(same)?.number).toBe(7);
+		expect(mergeControlOf(same)).toBeNull();
+		expect(pullRequestControl(same)?.showMerge).toBe(true);
+		// Nothing confirmed yet: origin's repository decides.
+		expect(currentPullRequest(moved(null))).toBeNull();
+		expect(currentPullRequest(moved(null, "github.com/acme/app"))?.number).toBe(7);
+	});
+
+	test("the main button: 发起 PR, 更新 PR after a re-ready, 重新发起 PR when closed, hidden while the PR is current", () => {
+		expect(mergeControlOf(github())).toMatchObject({ label: "openPr", enabled: true });
+		expect(mergeControlOf(github({ pr: pr({ headMatches: false }) }))?.label).toBe("updatePr");
+		expect(mergeControlOf(github({ pr: pr({ state: "CLOSED" }) }))?.label).toBe("reopenPr");
+		// Merged without this ready head (taken as closed by the server): again, never 发起 anew.
+		expect(mergeControlOf(github({ pr: pr({ state: "MERGED" }) }))?.label).toBe("reopenPr");
+		expect(mergeControlOf(github({ pr: pr() }))).toBeNull();
+		// Not read yet, but recorded at this head: 查看 PR takes its place too.
+		expect(mergeControlOf(github({ pr: pr({ state: null }) }))).toBeNull();
+		for (const reason of [
+			"checking",
+			"gh_missing",
+			"gh_logged_out",
+			"gh_no_permission",
+			"gh_repo_archived",
+			"gh_unavailable",
+			"worker_running",
+		] as const)
+			expect(mergeControlOf(github({ canMerge: false, disabledReason: reason }))).toMatchObject({
+				label: "openPr",
+				enabled: false,
+				disabledKey: `teams.page.merge.disabled.${reason}`,
+			});
+		expect(mergeControlOf(github({ phase: "pushing", job: "pull_request" }))?.label).toBe(
+			"pushing",
+		);
+		expect(mergeControlOf(github({ phase: "opening", job: "pull_request" }))?.label).toBe(
+			"opening",
+		);
+		expect(mergeControlOf(github({ phase: "queued", job: "pull_request" }))?.label).toBe("pushing");
+		expect(mergeControlOf(github({ phase: "merging", job: "pr_merge" }))).toMatchObject({
+			label: "mergingPr",
+			busy: true,
+		});
+		expect(mergeControlOf(github({ phase: "checking", job: "merge" }))?.label).toBe("pushing");
+		// Merging an existing pull request: 「合并 PR」 shows it, not a second button.
+		expect(mergeControlOf(github({ phase: "merging", job: "pr_merge", pr: pr() }))).toBeNull();
+	});
+
+	test("查看 PR #N with CI, review, conflict / behind / blocked / draft and queue labels", () => {
+		const labels = (over: Partial<TeamWorkPullRequest>) =>
+			pullRequestControl(github({ pr: pr(over) }))?.labels.map((label) => [label.kind, label.key]);
+		const checks = (state: "passing" | "failing" | "pending" | "none") => ({
+			state,
+			pass: 3,
+			fail: 2,
+			pending: 1,
+			skipping: 0,
+			total: 6,
+			failures: [{ name: "CI / test", link: "https://ci.example/1" }],
+		});
+		expect(labels({ checks: checks("passing") })).toEqual([["checks", "checksPassing"]]);
+		expect(labels({ checks: checks("failing") })).toEqual([["checks", "checksFailing"]]);
+		expect(
+			pullRequestControl(github({ pr: pr({ checks: checks("failing") }) }))?.labels[0]?.values,
+		).toEqual({ count: 2 });
+		expect(
+			pullRequestControl(github({ pr: pr({ checks: checks("pending") }) }))?.labels[0]?.values,
+		).toEqual({ count: 1 });
+		expect(labels({ checks: checks("none") })).toEqual([["checks", "checksNone"]]);
+		expect(labels({ review: "REVIEW_REQUIRED" })).toEqual([["review", "reviewRequired"]]);
+		expect(labels({ review: "APPROVED" })).toEqual([["review", "reviewApproved"]]);
+		expect(labels({ review: "CHANGES_REQUESTED" })).toEqual([["review", "reviewChanges"]]);
+		expect(labels({ mergeState: "DIRTY" })).toEqual([["state", "dirty"]]);
+		expect(labels({ mergeState: "BEHIND" })).toEqual([["state", "behind"]]);
+		expect(labels({ mergeState: "BLOCKED" })).toEqual([["state", "blocked"]]);
+		expect(labels({ isDraft: true, mergeState: "DRAFT" })).toEqual([["state", "draft"]]);
+		expect(labels({ queued: true })).toEqual([["queue", "queued"]]);
+		expect(labels({ headMatches: false })).toEqual([["state", "stale"]]);
+		expect(labels({ state: "CLOSED" })).toEqual([["state", "closed"]]);
+		expect(labels({ state: null })).toEqual([["read", "checking"]]);
+		expect(labels({ refreshing: true })).toEqual([["read", "checking"]]);
+		const view = pullRequestControl(github({ pr: pr({ checks: checks("failing") }) }));
+		expect(view).toMatchObject({
+			number: 7,
+			url: "https://github.com/acme/app/pull/7",
+			showMerge: true,
+			mergeEnabled: true,
+			mergeDisabledKey: null,
+			methods: ["squash", "merge"],
+			failures: [{ name: "CI / test", link: "https://ci.example/1" }],
+		});
+		expect(pullRequestControl(github())).toBeNull();
+		expect(pullRequestControl({ ...github({ pr: pr() }), mode: "local" })).toBeNull();
+	});
+
+	test("合并 PR: enabled only when GitHub says it can merge; otherwise the reason", () => {
+		for (const blocker of TEAM_PR_MERGE_BLOCKERS) {
+			const view = pullRequestControl(
+				github({ pr: pr({ canMergePr: false, mergeBlocker: blocker }) }),
+			);
+			expect({ blocker, enabled: view?.mergeEnabled, key: view?.mergeDisabledKey }).toEqual({
+				blocker,
+				enabled: false,
+				key: `teams.page.merge.prBlocker.${blocker}`,
+			});
+		}
+		// A reason of the whole action (the worker running) comes first.
+		expect(
+			pullRequestControl(
+				github({
+					canMerge: false,
+					disabledReason: "worker_running",
+					pr: pr({ canMergePr: false, mergeBlocker: null }),
+				}),
+			)?.mergeDisabledKey,
+		).toBe("teams.page.merge.disabled.worker_running");
+		// Busy merging: shown, not pressable again.
+		expect(
+			pullRequestControl(github({ phase: "merging", job: "pr_merge", pr: pr() })),
+		).toMatchObject({ busy: true, mergeEnabled: false });
+		// Not shown for a stale head (更新 PR first) or a closed one.
+		expect(pullRequestControl(github({ pr: pr({ headMatches: false }) }))?.showMerge).toBe(false);
+		expect(pullRequestControl(github({ pr: pr({ state: "CLOSED" }) }))?.showMerge).toBe(false);
+	});
+
+	test("links are http(s) only", () => {
+		expect(safeHref("https://github.com/acme/app/pull/7")).toBe(
+			"https://github.com/acme/app/pull/7",
+		);
+		expect(safeHref("javascript:alert(1)")).toBeNull();
+		expect(safeHref("data:text/html,x")).toBeNull();
+		expect(safeHref(null)).toBeNull();
+	});
+
+	test("the activity words the pull request's events", () => {
+		const note = (kind: string, detail: Record<string, unknown>) => eventNote({ kind, detail });
+		expect(note("work.merge_requested", { job: "pull_request" })?.key).toBe("prRequested");
+		expect(note("work.merge_requested", { job: "pr_merge", method: "squash" })).toEqual({
+			key: "prMergeRequested",
+			values: { method: "squash" },
+		});
+		expect(note("work.pr_pushed", { branch: "team/x" })).toEqual({
+			key: "branch",
+			values: { branch: "team/x" },
+		});
+		for (const kind of ["work.pr_opened", "work.pr_closed", "work.pr_queued"])
+			expect(note(kind, { pr: 7 })).toEqual({ key: "prNumber", values: { pr: 7 } });
+		expect(note("work.pr_checks", { checks: "failing", failed: 2 })).toEqual({
+			key: "prChecksFailing",
+			values: { count: 2 },
+		});
+		expect(note("work.pr_checks", { checks: "passing" })?.key).toBe("prChecksPassing");
+		expect(note("work.pr_checks", { review: "CHANGES_REQUESTED" })?.key).toBe("prChangesRequested");
+		expect(note("work.pr_checks", { review: "APPROVED" })?.key).toBe("prApproved");
+		expect(note("work.merged", { detectedBy: "pull_request", pr: 7 })).toEqual({
+			key: "mergedPullRequest",
+			values: { pr: 7 },
+		});
+		for (const kind of [
+			"work.pr_pushed",
+			"work.pr_opened",
+			"work.pr_checks",
+			"work.pr_closed",
+			"work.pr_queued",
+		])
+			expect(eventLabelKey(kind)).toBe(kind.replace(".", "_"));
+	});
+
+	test("every pull request word exists in both locales", () => {
+		for (const locale of ["en", "zh-CN"]) {
+			const teams = JSON.parse(
+				readFileSync(new URL(`../../locales/${locale}/projects.json`, import.meta.url), "utf8"),
+			).teams;
+			const merge = teams.page.merge;
+			for (const blocker of TEAM_PR_MERGE_BLOCKERS)
+				expect({ locale, blocker, text: typeof merge.prBlocker[blocker] }).toEqual({
+					locale,
+					blocker,
+					text: "string",
+				});
+			for (const method of TEAM_PR_MERGE_METHODS)
+				expect({ locale, method, text: typeof merge.method[method] }).toEqual({
+					locale,
+					method,
+					text: "string",
+				});
+			for (const key of [
+				"checking",
+				"closed",
+				"merged",
+				"stale",
+				"checksPassing",
+				"checksFailing_other",
+				"checksPending_other",
+				"checksNone",
+				"reviewApproved",
+				"reviewChanges",
+				"reviewRequired",
+				"draft",
+				"dirty",
+				"behind",
+				"blocked",
+				"queued",
+				"failuresTitle",
+				"readFailed",
+			])
+				expect({ locale, key, text: typeof merge.pr[key] }).toEqual({
+					locale,
+					key,
+					text: "string",
+				});
+			for (const key of [
+				"openPr",
+				"updatePr",
+				"reopenPr",
+				"pushing",
+				"opening",
+				"mergingPr",
+				"viewPr",
+				"mergePr",
+				"methodMenu",
+				"methodDefault",
+				"barNotePr",
+				"pushRejectedReason",
+			])
+				expect({ locale, key, text: typeof merge[key] }).toEqual({ locale, key, text: "string" });
+			for (const key of [
+				"prRequested",
+				"prMergeRequested",
+				"prNumber",
+				"prChecksFailing_other",
+				"prChecksPassing",
+				"prChangesRequested",
+				"prApproved",
+				"mergedPullRequest",
+			])
+				expect({ locale, key, text: typeof teams.eventNote[key] }).toEqual({
+					locale,
+					key,
+					text: "string",
+				});
+			// The promise of a coming PR flow is gone everywhere.
+			expect(JSON.stringify(teams)).not.toMatch(/coming soon|即将提供/);
+		}
+	});
+});
+
+describe("the confirmed GitHub repository (G, review 1)", () => {
+	const github = (over: Partial<TeamWorkMergeSummary> = {}): TeamWorkMergeSummary => ({
+		mode: "github",
+		phase: null,
+		job: null,
+		outcome: null,
+		canMerge: true,
+		disabledReason: null,
+		pr: null,
+		...over,
+	});
+	test("a manager confirms it first; the buttons name owner/repo", () => {
+		const unpinned = github({
+			github: { target: "github.com/acme/app", pinned: null, canConfirm: true },
+		});
+		expect(githubConfirmation(unpinned)).toBe("github.com/acme/app");
+		expect(pullRequestRepo(unpinned)).toBe("acme/app");
+		expect(
+			githubConfirmation(
+				github({ github: { target: "github.com/acme/app", pinned: null, canConfirm: false } }),
+			),
+		).toBeNull();
+		const pinned = github({
+			github: { target: "github.com/acme/app", pinned: "github.com/acme/app", canConfirm: true },
+		});
+		expect(githubConfirmation(pinned)).toBeNull();
+		// The confirmed one is named, whatever origin says now; a GHE host is kept.
+		expect(
+			pullRequestRepo(
+				github({
+					github: { target: "ghe.acme.test/x/y", pinned: "ghe.acme.test/t/app", canConfirm: false },
+				}),
+			),
+		).toBe("ghe.acme.test/t/app");
+		expect(pullRequestRepo({ ...pinned, mode: "local" })).toBeNull();
+		for (const reason of [
+			"github_unconfirmed",
+			"github_target_changed",
+			"remote_config_unsafe",
+		] as const)
+			expect(mergeControlOf(github({ canMerge: false, disabledReason: reason }))?.disabledKey).toBe(
+				`teams.page.merge.disabled.${reason}`,
+			);
 	});
 });

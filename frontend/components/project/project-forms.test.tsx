@@ -628,5 +628,12 @@ test("team defaults: the base branch saves when left; the work start keeps the o
 		workStart: "remote",
 	});
 	expect(teamsWithWorkStart(project, "auto")).toEqual({ exclusivePaths: ["drizzle/**"] });
+	// G: the confirmed GitHub repository is never sent back (only its own route writes it).
+	const pinned = {
+		chapterSettings: {
+			teams: { workStart: "local", github: { host: "github.com", owner: "a", repo: "b" } },
+		},
+	} as unknown as Parameters<typeof teamsWithWorkStart>[0];
+	expect(teamsWithWorkStart(pinned, "remote")).toEqual({ workStart: "remote" });
 	expect(teamsWithWorkStart(settingsProject, "local")).toEqual({ workStart: "local" });
 });

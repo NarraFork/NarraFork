@@ -21,6 +21,7 @@ import {
 	hostingOfUrl,
 	parseRemoteUrl,
 	peekHosting,
+	setGhProbeForTests,
 	setHostingSourceForTests,
 } from "../team-hosting";
 import { resetOverlapStateForTests, runChangedPathsPass } from "../team-overlap";
@@ -81,7 +82,7 @@ describe("origin's hosting", () => {
 			repo: "app",
 		});
 		expect(hostingOfUrl("ssh://git@ssh.github.com:443/acme/app.git").kind).toBe("github");
-		// GitHub Enterprise counts as GitHub only once the PR flow's gh probe says so.
+		// By name only: GitHub Enterprise counts as GitHub once gh knows the host (resolveHosting).
 		expect(hostingOfUrl("git@github.acme.corp:acme/app.git")).toEqual({
 			kind: "other",
 			host: "github.acme.corp",
@@ -99,6 +100,8 @@ describe("origin's hosting", () => {
 		let now = 1_000_000;
 		let reads = 0;
 		let fail = false;
+		// gh can serve it (team-hosting.test.ts covers gh itself): kept the full 5 minutes.
+		setGhProbeForTests(async () => ({ ok: true, methods: ["merge"] }));
 		setHostingSourceForTests(
 			async () => {
 				reads++;
@@ -131,6 +134,7 @@ describe("origin's hosting", () => {
 			expect(reads).toBe(3);
 		} finally {
 			setHostingSourceForTests(null);
+			setGhProbeForTests(null);
 		}
 	});
 

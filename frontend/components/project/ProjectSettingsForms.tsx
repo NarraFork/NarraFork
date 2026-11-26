@@ -25,7 +25,7 @@ import {
 	TextInput,
 } from "@mantine/core";
 import { teamBaseBranchSchema } from "@shared/project-team-draft";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { usePlatform } from "../../hooks/usePlatform";
@@ -424,8 +424,12 @@ export function teamsWithWorkStart(
 	value: WorkStartDefault,
 ): Record<string, unknown> {
 	const teams = projectChapterSettings(project).teams;
-	const { workStart: _previous, ...rest } =
-		teams && typeof teams === "object" ? (teams as Record<string, unknown>) : {};
+	// The confirmed GitHub repository is never sent back (only its own route writes it).
+	const {
+		workStart: _previous,
+		github: _github,
+		...rest
+	} = teams && typeof teams === "object" ? (teams as Record<string, unknown>) : {};
 	return value === "auto" ? rest : { ...rest, workStart: value };
 }
 
@@ -502,6 +506,90 @@ export function ProjectTeamDefaults({
 				data-testid="project-work-start"
 			/>
 			<SaveState pending={update.isPending} error={update.error} />
+			<ProjectGithubTarget projectId={projectId} canManage={canManage} />
+		</Stack>
+	);
+}
+
+/**
+ * G: the GitHub repository the project's pull requests go to, as a manager confirmed it (the
+ * first 「发起 PR」 asks for it), and what origin resolves to now. While the two differ nothing is
+ * pushed; a manager confirms the new one or clears it here.
+ */
+export function ProjectGithubTarget({
+	projectId,
+	canManage,
+}: {
+	projectId: string;
+	canManage: boolean;
+}) {
+	const { t } = useTranslation("projects");
+	const queryClient = useQueryClient();
+	const queryKey = ["projects", projectId, "team-github"];
+	const github = useQuery({
+		queryKey,
+		queryFn: () => api.getTeamGithub(projectId),
+		enabled: !!projectId,
+		staleTime: 15_000,
+	});
+	const set = useMutation({
+		mutationFn: ({ target }: { target: string | null }) => api.setTeamGithub(projectId, target),
+		onSettled: () => {
+			void queryClient.invalidateQueries({ queryKey });
+			void queryClient.invalidateQueries({ queryKey: ["teams"] });
+		},
+	});
+	const pinned = github.data?.pinned ?? null;
+	const pinnedName = pinned ? `${pinned.host}/${pinned.owner}/${pinned.repo}` : null;
+	const detected = github.data?.detected ?? null;
+	const differs = !!pinnedName && !!detected && pinnedName.toLowerCase() !== detected.toLowerCase();
+	if (!pinned && !detected) return null;
+	return (
+		<Stack gap={4} data-testid="project-github-target">
+			<Text size="sm" fw={500}>
+				{t("settingsPage.teamDefaults.github")}
+			</Text>
+			<Text size="sm" data-testid="project-github-pinned">
+				{pinnedName
+					? t("settingsPage.teamDefaults.githubPinned", { target: pinnedName })
+					: t("settingsPage.teamDefaults.githubUnpinned")}
+			</Text>
+			{differs && (
+				<Alert color="yellow" p="xs" data-testid="project-github-differs">
+					{t("settingsPage.teamDefaults.githubDiffers", { detected, target: pinnedName })}
+				</Alert>
+			)}
+			{canManage && (
+				<Group gap="xs">
+					{detected && (differs || !pinned) && (
+						<Button
+							size="xs"
+							variant="light"
+							loading={set.isPending}
+							onClick={() => set.mutate({ target: detected })}
+							data-testid="project-github-confirm"
+						>
+							{t("settingsPage.teamDefaults.githubConfirm", { target: detected })}
+						</Button>
+					)}
+					{pinned && (
+						<Button
+							size="xs"
+							variant="subtle"
+							color="gray"
+							loading={set.isPending}
+							onClick={() => set.mutate({ target: null })}
+							data-testid="project-github-clear"
+						>
+							{t("settingsPage.teamDefaults.githubClear")}
+						</Button>
+					)}
+				</Group>
+			)}
+			<Text size="xs" c="dimmed">
+				{t("settingsPage.teamDefaults.githubHint")}
+			</Text>
+			<SaveState pending={set.isPending} error={set.error} />
 		</Stack>
 	);
 }

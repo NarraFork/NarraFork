@@ -1032,7 +1032,7 @@ describe("merge (M)", () => {
 			expect(drawer.body.canReturn).toBe(true);
 			// The drawer does not offer them the merge either.
 			expect(drawer.body.merge).toMatchObject({ canMerge: false });
-			for (const suffix of ["merge", "merge/fast-forward"]) {
+			for (const suffix of ["merge", "merge/fast-forward", "pr/merge", "pr/refresh"]) {
 				const response = await call(READER, teamPath(`work/${item.id}/${suffix}`), {
 					method: "POST",
 				});
@@ -1051,5 +1051,147 @@ describe("merge (M)", () => {
 		});
 		expect(response.status).toBe(409);
 		expect(response.body.code).toBe("TEAM_MERGE_NOT_PREPARED");
+	});
+});
+
+describe("pull requests (G)", () => {
+	async function onGitHub(
+		gh:
+			| { ok: true; methods: ("merge" | "squash" | "rebase")[] }
+			| {
+					ok: false;
+					reason: "gh_logged_out";
+			  },
+	) {
+		const hosting = await import("../../services/teams/team-hosting");
+		hosting.setHostingSourceForTests(async () => "git@github.com:acme/app.git");
+		hosting.setGhProbeForTests(async () => gh);
+		await hosting.hostingOf(repo);
+		return () => {
+			hosting.setHostingSourceForTests(null);
+			hosting.setGhProbeForTests(null);
+		};
+	}
+
+	test("members only (as the merge); a stranger gets 404; no pull request yet is refused with its reason", async () => {
+		const { settleMergeJobs } = await import("../../services/teams/team-merge");
+		const { item } = await readyItem("PR access", { "pr/access.txt": "pr\n" });
+		const restore = await onGitHub({ ok: true, methods: ["squash", "merge"] });
+		try {
+			// Nothing confirmed yet: a member who may not manage the project waits for a manager.
+			const unconfirmed = await call(MEMBER, teamPath(`work/${item.id}`));
+			expect(unconfirmed.body.merge).toMatchObject({
+				mode: "github",
+				canMerge: false,
+				disabledReason: "github_unconfirmed",
+				github: { target: "github.com/acme/app", pinned: null, canConfirm: false },
+			});
+			expect((await call(OWNER, teamPath(`work/${item.id}`))).body.merge.github).toMatchObject({
+				canConfirm: true,
+			});
+			const refused = await call(MEMBER, teamPath(`work/${item.id}/merge`), { method: "POST" });
+			expect(refused.body.code).toBe("TEAM_PR_TARGET_UNCONFIRMED");
+			// Only a project manager confirms it.
+			const pinPath = `/projects/${projectId}/team-github`;
+			const body = { target: "github.com/acme/app" };
+			expect((await call(MEMBER, pinPath, { method: "PUT", body })).status).toBe(403);
+			expect((await call(OUTSIDER, pinPath, { method: "PUT", body })).status).toBe(404);
+			expect(
+				(await call(OWNER, pinPath, { method: "PUT", body: { target: "acme/app" } })).status,
+			).toBe(400);
+			const pinned = await call(OWNER, pinPath, { method: "PUT", body });
+			expect(pinned.status).toBe(200);
+			expect(pinned.body).toMatchObject({
+				pinned: { host: "github.com", owner: "acme", repo: "app", confirmedBy: OWNER },
+				detected: "github.com/acme/app",
+			});
+			// Reading it needs project read only.
+			expect((await call(MEMBER, pinPath)).body.pinned.repo).toBe("app");
+			for (const suffix of ["pr/merge", "pr/refresh"]) {
+				const path = teamPath(`work/${item.id}/${suffix}`);
+				expect((await call(READER, path, { method: "POST" })).status).toBe(403);
+				expect((await call(OUTSIDER, path, { method: "POST" })).status).toBe(404);
+			}
+			const refresh = await call(MEMBER, teamPath(`work/${item.id}/pr/refresh`), {
+				method: "POST",
+			});
+			expect(refresh.status).toBe(409);
+			expect(refresh.body.code).toBe("TEAM_PR_NONE");
+			const mergePath = teamPath(`work/${item.id}/pr/merge`);
+			expect(
+				(await call(MEMBER, mergePath, { method: "POST", body: { method: "octopus" } })).status,
+			).toBe(400);
+			const rebase = await call(MEMBER, mergePath, { method: "POST", body: { method: "rebase" } });
+			expect(rebase.status).toBe(409);
+			expect(rebase.body.code).toBe("TEAM_PR_METHOD_NOT_ALLOWED");
+			const accepted = await call(MEMBER, mergePath, { method: "POST" });
+			expect(accepted.status).toBe(202);
+			expect(accepted.body).toEqual({ itemId: item.id, job: "pr_merge", phase: "queued" });
+			await settleMergeJobs();
+			const drawer = await call(MEMBER, teamPath(`work/${item.id}`));
+			expect(drawer.body.merge).toMatchObject({
+				mode: "github",
+				canMerge: true,
+				disabledReason: null,
+				pr: null,
+				detail: { kind: "failed", code: "TEAM_PR_NONE" },
+			});
+			expect(work.requireWorkItem(teamId, item.id).state).toBe("ready");
+			expect((await call(OWNER, pinPath, { method: "DELETE" })).body.pinned).toBeNull();
+		} finally {
+			restore();
+		}
+	});
+
+	test("the project PATCH never writes the confirmed repository, and keeps it", async () => {
+		const { projectRoutes } = await import("../projects");
+		const app = new Hono();
+		app.use("*", async (c, next) => {
+			c.set("user", { sub: OWNER, role: "user", iat: 0, exp: Number.MAX_SAFE_INTEGER });
+			await next();
+		});
+		app.route("/projects", projectRoutes);
+		const { pinnedGithubTarget, setPinnedGithubTarget } = await import(
+			"../../services/teams/team-github-pin"
+		);
+		setPinnedGithubTarget(projectId, { host: "github.com", owner: "acme", repo: "app" }, OWNER);
+		try {
+			const response = await app.request(`http://localhost/projects/${projectId}`, {
+				method: "PATCH",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					chapterSettings: {
+						teams: {
+							workStart: "local",
+							github: { host: "github.com", owner: "attacker", repo: "app" },
+						},
+					},
+				}),
+			});
+			expect(response.status).toBe(200);
+			expect(pinnedGithubTarget(projectId)).toMatchObject({ owner: "acme", repo: "app" });
+		} finally {
+			setPinnedGithubTarget(projectId, null, null);
+		}
+	});
+
+	test("GitHub with gh logged out: the merge is refused with the reason, never merged locally", async () => {
+		const { item } = await readyItem("PR logged out", { "pr/out.txt": "out\n" });
+		const before = git(repo, "rev-parse", "main");
+		const restore = await onGitHub({ ok: false, reason: "gh_logged_out" });
+		try {
+			const refused = await call(MEMBER, teamPath(`work/${item.id}/merge`), { method: "POST" });
+			expect(refused.status).toBe(409);
+			expect(refused.body.code).toBe("TEAM_PR_GH_LOGGED_OUT");
+			const drawer = await call(MEMBER, teamPath(`work/${item.id}`));
+			expect(drawer.body.merge).toMatchObject({
+				mode: "github",
+				canMerge: false,
+				disabledReason: "gh_logged_out",
+			});
+			expect(git(repo, "rev-parse", "main")).toBe(before);
+		} finally {
+			restore();
+		}
 	});
 });

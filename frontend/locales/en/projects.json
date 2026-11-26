@@ -231,7 +231,12 @@
 			"work_unblocked": "Can start now",
 			"work_merge_requested": "Asked to merge",
 			"work_merge_failed": "Merge did not happen",
-			"work_merge_prepared": "Merge prepared"
+			"work_merge_prepared": "Merge prepared",
+			"work_pr_pushed": "Branch pushed to GitHub",
+			"work_pr_opened": "Pull request opened",
+			"work_pr_checks": "Pull request status changed",
+			"work_pr_closed": "Pull request closed",
+			"work_pr_queued": "Pull request queued to merge"
 		},
 		"eventNote": {
 			"text": "{{text}}",
@@ -262,7 +267,16 @@
 			"mergePrepared": "The base is checked out at {{path}}",
 			"mergedLocal": "Merged from the team page",
 			"mergedFastForward": "Fast-forwarded where the base is checked out",
-			"mergedAncestry": "Its branch was found in the base"
+			"mergedAncestry": "Its branch was found in the base",
+			"prRequested": "Push the branch and open a pull request",
+			"prMergeRequested": "Merge the pull request ({{method}})",
+			"prNumber": "Pull request #{{pr}}",
+			"prChecksFailing_one": "{{count}} check failed",
+			"prChecksFailing_other": "{{count}} checks failed",
+			"prChecksPassing": "Checks passed",
+			"prChangesRequested": "A review asked for changes",
+			"prApproved": "Approved on GitHub",
+			"mergedPullRequest": "Merged through pull request #{{pr}}"
 		},
 		"top": {
 			"pauseAll": "Pause all",
@@ -606,9 +620,16 @@
 					"merging": "A merge of this item is running.",
 					"worker_running": "Its worker is running; merge once it has stopped.",
 					"checking": "Checking the repository's origin…",
-					"github_pending": "Origin is on GitHub: these items will merge through a pull request, which is coming soon.",
 					"base_remote": "The base {{base}} is a remote-tracking branch; only a local branch can be merged into here.",
-					"git_too_old": "git 2.38 or newer is needed to merge without touching a working tree."
+					"git_too_old": "git 2.38 or newer is needed to merge without touching a working tree.",
+					"gh_missing": "Origin is on GitHub, but gh is not installed on the host: install it and run gh auth login there.",
+					"gh_logged_out": "Run gh auth login on the host.",
+					"gh_no_permission": "The gh account has no write access to this repository.",
+					"gh_repo_archived": "The repository is archived on GitHub.",
+					"gh_unavailable": "gh could not read this repository (offline, not found or an error); try again shortly.",
+					"github_unconfirmed": "A project manager confirms the GitHub repository first (the first 「Open a pull request」 asks them).",
+					"github_target_changed": "Origin now points to another repository than the one confirmed; nothing is pushed until a project manager confirms it in the project settings.",
+					"remote_config_unsafe": "The repository's own git configuration redirects origin (a push URL or a URL rewrite); NarraFork does not push or merge with it. Move that setting to the global configuration."
 				},
 				"blocker": {
 					"stale": "{{base}} moved since the merge was prepared: prepare it again.",
@@ -626,7 +647,6 @@
 					"TEAM_WORK_ITEM_NOT_READY": "Only a ready item can be merged; it changed meanwhile.",
 					"TEAM_WORK_ITEM_MERGING": "A merge of this item is already running.",
 					"TEAM_WORK_ITEM_WORKER_RUNNING": "Its worker is running; merge once it has stopped.",
-					"TEAM_MERGE_GITHUB_PENDING": "Origin is on GitHub: these items will merge through a pull request, which is coming soon.",
 					"TEAM_MERGE_BASE_REMOTE": "The base is a remote-tracking branch; only a local branch can be merged into here.",
 					"TEAM_MERGE_NOT_PREPARED": "There is no prepared merge any more: merge again.",
 					"TEAM_ARCHIVED": "The team is archived. Unarchive it first.",
@@ -644,12 +664,90 @@
 					"TEAM_MERGE_HOSTING_UNKNOWN": "Where origin is hosted could not be read. Try again shortly; a GitHub origin is never merged locally.",
 					"TEAM_GIT_REPLACED_HISTORY": "A replacement ref (refs/replace/*) rewrites history or files of the base or this item: a team does not merge replaced history. Remove the replacement (git replace -d) first.",
 					"TEAM_GIT_HISTORY_ALTERED": "The repository is shallow or has a graft file (info/grafts): what is merged cannot be told. Fetch the full history or remove the graft file first.",
-					"TEAM_MERGE_TIMEOUT": "The merge took too long and was stopped before it changed anything it could not finish."
+					"TEAM_MERGE_TIMEOUT": "The merge took too long and was stopped before it changed anything it could not finish.",
+					"TEAM_PR_GH_MISSING": "Origin is on GitHub, but gh is not installed on the host: install it and run gh auth login there.",
+					"TEAM_PR_GH_LOGGED_OUT": "Run gh auth login on the host.",
+					"TEAM_PR_GH_NO_PERMISSION": "The gh account has no write access to this repository.",
+					"TEAM_PR_REPO_ARCHIVED": "The repository is archived on GitHub.",
+					"TEAM_PR_GH_UNAVAILABLE": "gh could not read this repository. Try again shortly.",
+					"TEAM_PR_NOT_GITHUB": "Origin is not on GitHub: there is no pull request to merge.",
+					"TEAM_PR_REMOTE_CHANGED": "origin no longer pushes to the repository gh works on; nothing was pushed. Try again shortly.",
+					"TEAM_REMOTE_CONFIG_UNSAFE": "The repository's own git configuration would choose how the push connects (a rewrite, proxy or program); NarraFork does not push with it. Move that setting to the global configuration.",
+					"TEAM_PR_PUSH_REJECTED": "GitHub refused the push: the branch there has commits the ready head does not. Nothing was forced; return it to the worker to bring them in.",
+					"TEAM_PR_PUSH_FAILED": "The branch could not be pushed. Check the host's network and git credentials, then try again.",
+					"TEAM_PR_BASE_MISMATCH": "An open pull request for this branch targets another base. Retarget or close it on GitHub.",
+					"TEAM_PR_OPEN_FAILED": "gh could not find or open the pull request. Try again shortly.",
+					"TEAM_PR_NONE": "The item has no pull request yet: open one first.",
+					"TEAM_PR_CLOSED": "The pull request was closed: open it again.",
+					"TEAM_PR_HEAD_STALE": "The pull request does not carry the ready head (or it moved on GitHub): update it first.",
+					"TEAM_PR_DRAFT": "The pull request is a draft.",
+					"TEAM_PR_BLOCKED": "GitHub blocks the merge: a review, required checks or branch protection. See the pull request.",
+					"TEAM_PR_BEHIND": "The pull request is behind its base: bring the base in first.",
+					"TEAM_PR_STATE_UNKNOWN": "GitHub has not worked out whether it can merge yet; try again shortly.",
+					"TEAM_PR_METHOD_NOT_ALLOWED": "The repository does not allow that merge method.",
+					"TEAM_PR_MERGE_FAILED": "gh could not merge the pull request. See the pull request on GitHub.",
+					"TEAM_PR_TARGET_UNCONFIRMED": "A project manager confirms the GitHub repository first."
 				},
 				"shell": {
 					"sh": "Git Bash / sh",
 					"powershell": "PowerShell"
-				}
+				},
+				"openPr": "Open a pull request",
+				"updatePr": "Update the pull request",
+				"reopenPr": "Open a pull request again",
+				"pushing": "Pushing the branch…",
+				"opening": "Opening the pull request…",
+				"mergingPr": "Merging the pull request…",
+				"viewPr": "View PR #{{number}}",
+				"mergePr": "Merge the pull request",
+				"methodMenu": "Choose how to merge",
+				"methodDefault": "default",
+				"method": {
+					"merge": "Merge commit",
+					"squash": "Squash",
+					"rebase": "Rebase"
+				},
+				"barNotePr": "Origin is on GitHub: NarraFork pushes the branch and opens a pull request into {{base}} as the host's gh account, and merges it there when you ask. Nobody's working tree is touched.",
+				"pushRejectedReason": "GitHub refused the push: the branch {{branch}} there has commits this branch does not. Bring them into the branch (merge, never force-push), run the checks and report.",
+				"pr": {
+					"checking": "Checking…",
+					"closed": "Closed",
+					"merged": "Merged",
+					"stale": "Not the ready head",
+					"checksPassing": "CI passed",
+					"checksFailing_one": "{{count}} check failed",
+					"checksFailing_other": "{{count}} checks failed",
+					"checksPending_one": "{{count}} check running",
+					"checksPending_other": "{{count}} checks running",
+					"checksNone": "No checks",
+					"reviewApproved": "Approved",
+					"reviewChanges": "Changes requested",
+					"reviewRequired": "Review required",
+					"draft": "Draft",
+					"dirty": "Conflicts",
+					"behind": "Behind {{base}}",
+					"blocked": "Blocked",
+					"queued": "Queued to merge",
+					"failuresTitle": "Failed checks",
+					"readFailed": "The pull request could not be read: {{message}}"
+				},
+				"prBlocker": {
+					"checking": "Reading the pull request's state…",
+					"head_stale": "The pull request does not carry the ready head: update it first.",
+					"draft": "The pull request is a draft.",
+					"blocked": "GitHub blocks the merge: a review, required checks or branch protection.",
+					"behind": "The pull request is behind {{base}}: bring the base in first.",
+					"dirty": "The pull request conflicts with {{base}}: return it to the worker.",
+					"unknown": "GitHub has not worked out whether it can merge yet; try again shortly.",
+					"queued": "Already queued to merge.",
+					"closed": "The pull request is closed.",
+					"no_method": "The repository allows no merge method."
+				},
+				"confirmGithubTitle": "Confirm the GitHub repository",
+				"confirmGithubText": "This pushes to {{target}} and opens the pull request there.",
+				"confirmGithubHint": "Origin's address comes from the repository's own git configuration, which agents can change, so a project manager confirms it once. From then on nothing is pushed while origin points anywhere else; it can be changed in the project settings.",
+				"confirmGithubButton": "Confirm and open the pull request",
+				"openProjectSettings": "Open the project settings"
 			}
 		}
 	},
@@ -773,7 +871,14 @@
 			"baseBranchHint": "New teams merge their work into this branch. Each team can change its own.",
 			"workStart": "New work items start from",
 			"workStartHint": "Each team can change this in its settings.",
-			"auto": "Automatic: origin when it is on GitHub, otherwise the local branch"
+			"auto": "Automatic: origin when it is on GitHub, otherwise the local branch",
+			"github": "GitHub repository for pull requests",
+			"githubPinned": "Confirmed: {{target}}",
+			"githubUnpinned": "Not confirmed yet: the first 「Open a pull request」 asks a project manager.",
+			"githubDiffers": "Origin now points to {{detected}}, not {{target}}: nothing is pushed until it is confirmed again.",
+			"githubConfirm": "Confirm {{target}}",
+			"githubClear": "Clear",
+			"githubHint": "Agents can change origin's address in the repository's configuration, so pull requests only go to a repository a manager confirmed."
 		}
 	}
 }

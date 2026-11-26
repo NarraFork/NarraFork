@@ -49,6 +49,7 @@ import {
 import { projectReadAdapter } from "../services/read";
 import { collectAllPages, parseLimitQuery, singlePage } from "../services/read/read-collect";
 import { isGitWorkTree } from "../services/teams/team-git";
+import { keepPinnedGithubTarget } from "../services/teams/team-github-pin";
 import { projectHasTeams } from "../services/teams/team-records";
 import { removeTabFromAllUsers } from "../services/user-preferences-service";
 import { withProjectRetirement } from "../services/worktree-lifecycle-guard";
@@ -501,7 +502,8 @@ projectRoutes.patch("/:id", async (c) => {
 			} catch {
 				// corrupted JSON — start fresh
 			}
-			merged = { ...current, ...incomingSettings };
+			// G: the confirmed GitHub repository is kept (only `PUT …/team-github` writes it).
+			merged = keepPinnedGithubTarget(current, { ...current, ...incomingSettings });
 		}
 		const row = tx
 			.update(projects)

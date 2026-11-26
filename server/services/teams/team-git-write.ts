@@ -12,7 +12,17 @@
  * - `fastForwardBase`: `git fetch . M:refs/heads/<base>` moves the base only by a fast-forward and
  *   is refused by git itself when the base is checked out in any worktree (never `update-ref` on
  *   a checked-out base: that person's `git status` would show the merge reversed).
- * - `fetchBaseFromOrigin`: `origin/<base>` into the remote-tracking ref only.
+ * - `fetchBaseFromOrigin`: `origin/<base>` into the remote-tracking ref only, from origin's URL
+ *   (a password in it by environment only, as for the push).
+ * - `pushBranch` (G): the item's pinned head to `refs/heads/<branch>` at origin's push URL, from a
+ *   throwaway bare repository of NarraFork's own that borrows the project's objects
+ *   (`objects/info/alternates`) — so no setting of the repository's own configuration applies to
+ *   the push at all (its remotes, fetch refspecs, hooks, credential helpers, rewrites) and no local
+ *   ref moves (git updates the "tracking" refs of a configured remote whose push URL is the one
+ *   pushed to, through that remote's fetch refspecs) — never forced, no hook, no signing, no
+ *   submodule recursion, no push option, the receive-pack program pinned, and refused where the
+ *   work-start fetch refuses the repository's configuration. A password in origin's URL is taken
+ *   out of it and given to git by environment only, never on a command line.
  * - `inspectCheckout` / `fastForwardCheckout`: the explicit fast-forward of a person's checkout
  *   (`merge --ff-only`), refused unless the checkout is exactly where the merge was prepared, and
  *   checked afterwards (no unmerged entry, no new stash, HEAD still on the base at the merge).
@@ -27,7 +37,7 @@
  * configuration-defined hooks or custom merge drivers), re-read right before each command that
  * can run a program, plus a timeout, an output cap and the job's abort signal.
  */
-import { realpath, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { TEAM_MERGE_CONFLICTS_MAX, TEAM_MERGE_REF_PREFIX } from "@shared/project-teams";
 import { AppError, GitError } from "../../lib/errors";
@@ -39,6 +49,7 @@ import {
 	untrustedProgramOverrides,
 } from "../../lib/git-exec-hardening";
 import type { GitIdentityEnv } from "../../lib/git-identity";
+import { getNarraforkPath } from "../../lib/narrafork-home";
 import { envWithAmbientProxy } from "../../lib/net/proxy-env";
 import { DEV_NULL } from "../../lib/platform";
 import { safeSpawn } from "../../lib/spawn";
@@ -52,6 +63,9 @@ const MERGE_TIMEOUT_MS = 120_000;
 const MERGE_OUTPUT_BYTES = 1024 * 1024;
 /** Network fetch from origin. */
 const FETCH_TIMEOUT_MS = 120_000;
+/** G: the push of an item's branch: 120 s, 64 KB. */
+const PUSH_TIMEOUT_MS = 120_000;
+const PUSH_OUTPUT_BYTES = 64 * 1024;
 /** Private refs one listing returns (the rest on the next call). */
 export const PRIVATE_REFS_PAGE = 1000;
 /** Private refs deleted in one `update-ref --stdin` transaction. */
@@ -354,14 +368,25 @@ function identityUnknown(): AppError {
 const NETWORK_PATTERN =
 	"^(credential\\..*|core\\.askpass|core\\.sshcommand|core\\.gitproxy|http\\..*|remote\\.origin\\.(url|proxy|vcs|uploadpack)|url\\..*\\.insteadof|protocol\\..*)$";
 
-/** A network fetch the repository's configuration makes unsafe: the key that does. */
+/**
+ * A fetch or push the configuration makes unsafe: the key that does (by default one of the
+ * repository's own; `message` words any other case). Key and message are redacted of every URL's
+ * login (a rule's key can be `url.https://user:token@host/.insteadof`): they reach responses,
+ * events and logs.
+ */
 export class UnsafeRemoteConfigError extends AppError {
-	constructor(readonly key: string) {
+	readonly key: string;
+	constructor(key: string, message?: string) {
+		const safe = redactUserinfo(key);
 		super(
-			`The repository's own configuration sets ${key}, which could run a program or choose the credentials or transport of a fetch; NarraFork does not fetch with it (set it in the global configuration instead)`,
+			redactUserinfo(
+				message ??
+					`The repository's own configuration sets ${safe}, which could run a program or choose where origin is or the credentials or transport used with it; NarraFork does not fetch, push or merge with it (set it in the global configuration instead)`,
+			),
 			409,
 			"TEAM_REMOTE_CONFIG_UNSAFE",
 		);
+		this.key = safe;
 	}
 }
 
@@ -429,7 +454,8 @@ export function networkOverrides(
 			const prefixes = entries
 				.filter((entry) => entry.key === key && isRepositoryScope(entry.scope))
 				.map((entry) => entry.value);
-			if (originUrl && prefixes.some((prefix) => prefix && originUrl.startsWith(prefix)))
+			// An empty prefix matches every URL (git's `alias_url`).
+			if (originUrl && prefixes.some((prefix) => originUrl.startsWith(prefix)))
 				throw new UnsafeRemoteConfigError(key);
 			continue;
 		}
@@ -461,12 +487,7 @@ export function networkOverrides(
 	// shares it), then the host's helpers are added back in the order git read them.
 	const helpers: Array<readonly [string, string]> = [];
 	if (repositoryKeys(entries).some((key) => isHelperKey(key.toLowerCase())))
-		helpers.push(
-			["credential.helper", ""],
-			...entries
-				.filter((entry) => HOST_SCOPES.has(entry.scope) && isHelperKey(entry.key.toLowerCase()))
-				.map((entry) => [entry.key, entry.value] as const),
-		);
+		helpers.push(["credential.helper", ""], ...hostHelpers(entries));
 	// Extra headers accumulate the same way: reset, then the host's again, in order.
 	if (repositoryKeys(entries).some((key) => isExtraHeaderKey(key.toLowerCase())))
 		helpers.push(
@@ -497,7 +518,365 @@ export function networkOverrides(
 	};
 }
 
+/**
+ * Push-only configuration a repository can set: a `url.*.pushInsteadOf` (and the `insteadOf` the
+ * fetch rules already read), and `remote.<name>.*` of every remote (a remote whose name is the
+ * very URL pushed to applies to an explicit URL too).
+ */
+const PUSH_PATTERN =
+	"^(url\\..*\\.(insteadof|pushinsteadof)|remote\\..*\\.(url|pushurl|receivepack|uploadpack|vcs|proxy|push|mirror))$";
+
+/** Command-scope settings a push always carries: nothing signed, recursed, followed or added. */
+const PUSH_NEUTRAL: ConfigEntries = [
+	["push.gpgSign", "false"],
+	["push.recurseSubmodules", "no"],
+	["push.followTags", "false"],
+	["push.negotiate", "false"],
+	["push.autoSetupRemote", "false"],
+	// One empty value resets the list of push options.
+	["push.pushOption", ""],
+];
+
+/**
+ * Refuse a push (or, `fetch`, a fetch) whose URL the repository's own configuration would rewrite
+ * or reconfigure: a repository `url.*.insteadOf` (a push: or `url.*.pushInsteadOf`) whose prefix
+ * starts the URL, or a repository `remote.<URL>.*` (a remote named by the URL itself). The host's
+ * own rewrites are the operator's and apply.
+ */
+export function assertPushUrlUntouched(
+	entries: readonly ScopedConfigEntry[],
+	url: string,
+	direction: "push" | "fetch" = "push",
+): void {
+	for (const entry of entries) {
+		if (!isRepositoryScope(entry.scope)) continue;
+		const lower = entry.key.toLowerCase();
+		if (
+			lower.startsWith("url.") &&
+			(lower.endsWith(".insteadof") ||
+				(direction === "push" && lower.endsWith(".pushinsteadof"))) &&
+			// An empty prefix matches every URL (git's `alias_url`).
+			url.startsWith(entry.value)
+		)
+			throw new UnsafeRemoteConfigError(entry.key);
+		if (lower.startsWith("remote.")) {
+			const name = entry.key.slice("remote.".length, entry.key.lastIndexOf("."));
+			if (name === url) throw new UnsafeRemoteConfigError(entry.key);
+		}
+	}
+}
+
+/** Origin's URL and every rewrite that could apply to it. */
+const ORIGIN_PATTERN = "^(remote\\.origin\\.(url|pushurl)|url\\..*\\.(insteadof|pushinsteadof))$";
+
+/** Where origin is: its configured URL, and that URL as the host's rewrites leave it. */
+export interface OriginTarget {
+	url: string;
+	resolved: string;
+}
+
+/**
+ * `url.<base>.*` rules in the order git's `alias_url` weighs them (`remote.c`): one rewrite per
+ * base (and per kind, `insteadOf` / `pushInsteadOf`) in the order each base first appears, its
+ * values in configuration order. With a strict "longer wins", the first of equally long prefixes in
+ * that order is the one git takes.
+ */
+function inGitOrder(entries: readonly ScopedConfigEntry[]): ScopedConfigEntry[] {
+	const groups = new Map<string, ScopedConfigEntry[]>();
+	for (const entry of entries) {
+		const dot = entry.key.lastIndexOf(".");
+		const group = `${entry.key.slice(dot).toLowerCase()}\0${entry.key.slice(0, dot)}`;
+		const list = groups.get(group);
+		if (list) list.push(entry);
+		else groups.set(group, [entry]);
+	}
+	return [...groups.values()].flat();
+}
+
+/**
+ * The URL a set of `url.<base>.<key>` entries rewrites `url` to: the longest matching prefix wins
+ * (git's rule), and the URL is returned as it is when none matches.
+ */
+function rewritten(
+	url: string,
+	entries: readonly ScopedConfigEntry[],
+	key: "insteadof" | "pushinsteadof",
+): string | null {
+	let best: { base: string; prefix: string } | null = null;
+	for (const entry of inGitOrder(entries)) {
+		const lower = entry.key.toLowerCase();
+		if (!lower.startsWith("url.") || !lower.endsWith(`.${key}`)) continue;
+		const prefix = entry.value;
+		// An explicitly empty prefix matches every URL (the shortest match), as in git.
+		if (!url.startsWith(prefix)) continue;
+		if (!best || prefix.length > best.prefix.length)
+			best = { base: entry.key.slice("url.".length, entry.key.length - key.length - 1), prefix };
+	}
+	return best ? best.base + url.slice(best.prefix.length) : null;
+}
+
+/** See {@link TeamRepoGit.originTarget}. */
+export function originTargetOf(entries: readonly ScopedConfigEntry[]): OriginTarget | null {
+	const pushurl = entries.find((entry) => entry.key.toLowerCase() === "remote.origin.pushurl");
+	// Where a push goes is origin's URL, and only that: a push URL of any scope is refused.
+	if (pushurl)
+		throw new UnsafeRemoteConfigError(
+			pushurl.key,
+			isRepositoryScope(pushurl.scope)
+				? undefined
+				: `The host's configuration sets ${pushurl.key}; NarraFork pushes only to origin's URL and does not push or merge while a push URL is set`,
+		);
+	const urls = entries.filter((entry) => entry.key.toLowerCase() === "remote.origin.url");
+	if (urls.length === 0) return null;
+	if (urls.length > 1)
+		throw new UnsafeRemoteConfigError(
+			"remote.origin.url",
+			"origin has several URLs; NarraFork pushes only to a single one and does not push or merge until there is one",
+		);
+	const url = urls[0]?.value.trim() ?? "";
+	if (!url) return null;
+	// Where git pushes is exactly the argument it is given (`resolveRemoteArgument`): the guard
+	// compares the repository a person confirmed with that very URL.
+	const argument = resolveRemoteArgument(url, entries, "push");
+	// An argument git cannot be given is never "not GitHub": the hosting is `unsafe`.
+	if ("message" in argument)
+		throw new UnsafeRemoteConfigError("remote.origin.url", argument.message);
+	return { url, resolved: argument.url };
+}
+
+/** A URL with any userinfo (`user:token@`) removed, for messages. */
+export function redactUserinfo(text: string): string {
+	return text.replace(/([a-z][a-z0-9+.-]*:\/\/)[^/@\s'"]+@/gi, "$1");
+}
+
+/** The login a URL's userinfo carries (`user:password@`), decoded as git decodes it. */
+export interface UrlCredentials {
+	protocol: string;
+	/** As git's credential protocol names it: everything between `@` and the first `/`. */
+	host: string;
+	username: string;
+	password: string;
+}
+
+/** `%XX` decoded to bytes, the rest kept (git's `url_decode`: a malformed escape stays as is). */
+function percentDecode(text: string): string {
+	if (!text.includes("%")) return text;
+	const bytes = new TextEncoder().encode(text);
+	const out: number[] = [];
+	const hex = (byte: number | undefined) =>
+		byte === undefined ? -1 : Number.parseInt(String.fromCharCode(byte), 16);
+	for (let i = 0; i < bytes.length; i++) {
+		const high = hex(bytes[i + 1]);
+		const low = hex(bytes[i + 2]);
+		if (bytes[i] === 0x25 && high >= 0 && low >= 0) {
+			out.push(high * 16 + low);
+			i += 2;
+		} else out.push(bytes[i] as number);
+	}
+	return new TextDecoder().decode(Uint8Array.from(out));
+}
+
+/**
+ * A remote URL with its login taken out, so that the password never reaches a command line (git
+ * hands the URL to `git-remote-https` as an argument too, and every process's argv is
+ * world-readable): `https://user:token@host/o/r` becomes `https://host/o/r` — the whole userinfo,
+ * so curl does not first try the user with an empty password (an extra 401 that counts toward a
+ * lockout) — and the login is returned for {@link credentialFromEnvironment}, whose helper gives
+ * git both. A URL with a user but no password is returned as it is. Parsed as git's
+ * `credential_from_url` parses it (the first `@` before the first `/`, the first `:` before it).
+ * Null when the URL carries a password that cannot be handed over that way: a transport other than
+ * http(s), or a value with a newline or NUL.
+ */
+export function splitUrlCredentials(
+	url: string,
+): { url: string; credentials: UrlCredentials | null } | null {
+	const scheme = /^([a-z][a-z0-9+.-]*):\/\//i.exec(url);
+	if (!scheme) return { url, credentials: null };
+	const rest = url.slice(scheme[0].length);
+	const slash = rest.indexOf("/");
+	const end = slash < 0 ? rest.length : slash;
+	const at = rest.indexOf("@");
+	if (at < 0 || at >= end) return { url, credentials: null };
+	const colon = rest.slice(0, at).indexOf(":");
+	if (colon < 0) return { url, credentials: null };
+	const protocol = scheme[1] as string;
+	if (!/^https?$/i.test(protocol)) return null;
+	const username = percentDecode(rest.slice(0, colon));
+	const password = percentDecode(rest.slice(colon + 1, at));
+	if (/[\n\0]/.test(username) || /[\n\0]/.test(password)) return null;
+	return {
+		url: `${scheme[0]}${rest.slice(at + 1)}`,
+		credentials: { protocol, host: rest.slice(at + 1, end), username, password },
+	};
+}
+
+/** Whether a remote URL is a bare name (no `/`, `\\`, `:` or scheme): a nickname to `git fetch`. */
+const isBareName = (value: string) => !/[/\\:]/.test(value);
+
+/** The rule keys of one direction: a fetch reads `insteadOf`, a push `pushInsteadOf` too. */
+const rewriteKeys = (direction: "fetch" | "push") =>
+	direction === "push" ? [".insteadof", ".pushinsteadof"] : [".insteadof"];
+
+/** The longest rule (`url.<base>.<key>` of `entries`) whose prefix starts `url`, or null. */
+function matchingRule(
+	url: string,
+	entries: readonly ScopedConfigEntry[],
+	direction: "fetch" | "push",
+): ScopedConfigEntry | null {
+	let best: ScopedConfigEntry | null = null;
+	for (const entry of inGitOrder(entries)) {
+		const lower = entry.key.toLowerCase();
+		if (!lower.startsWith("url.") || !rewriteKeys(direction).some((key) => lower.endsWith(key)))
+			continue;
+		if (
+			// An explicitly empty prefix matches every URL (the shortest match), as in git.
+			url.startsWith(entry.value) &&
+			entry.value.length > (best?.value.length ?? -1)
+		)
+			best = entry;
+	}
+	return best;
+}
+
+/**
+ * The exact argument git is given for a fetch or push of `configured` (a remote's URL), and the
+ * login split off it — the one rule for every host rewrite:
+ *
+ * 1. NarraFork makes git's single rewrite pass itself, as git does for a named remote
+ *    (`remote.c:alias_all_urls`): a push takes the host's longest matching `pushInsteadOf`, else
+ *    its longest matching `insteadOf`; a fetch only `insteadOf` (an empty prefix matches every
+ *    URL; ties go as in git, {@link inGitOrder}). Only system/global rules; one of
+ *    the repository's own (local or worktree) that matches is refused.
+ * 2. The login is split off (`splitUrlCredentials`) and a bare name becomes `./<name>` (a path, as
+ *    for the named remote; to `git fetch` a bare name is a nickname).
+ * 3. Git must not rewrite that argument again: when a host rule matches it, the URL with the user
+ *    kept (`https://user@host/…`, when the login had a user) is tried instead, and when a rule
+ *    matches that too the remote is refused (`UnsafeRemoteConfigError`). So what git contacts is
+ *    the argument itself: `http.<argument>.*` settings are keyed on the real destination, and the
+ *    hosting read from `originTarget().resolved` is that destination.
+ *
+ * A password on a transport that cannot take it by environment, or an argument not safe on a
+ * command line, is `message` (every caller fails on it; `originTarget` as `unsafe`).
+ */
+export function resolveRemoteArgument(
+	configured: string,
+	entries: readonly ScopedConfigEntry[],
+	direction: "fetch" | "push",
+): { url: string; credentials: UrlCredentials | null } | { message: string } {
+	const repository = entries.filter((entry) => isRepositoryScope(entry.scope));
+	const host = entries.filter((entry) => HOST_SCOPES.has(entry.scope));
+	const own = matchingRule(configured, repository, direction);
+	if (own) throw new UnsafeRemoteConfigError(own.key);
+	const rewrittenUrl =
+		(direction === "push" ? rewritten(configured, host, "pushinsteadof") : null) ??
+		rewritten(configured, host, "insteadof") ??
+		configured;
+	const split = splitUrlCredentials(rewrittenUrl);
+	if (!split)
+		return {
+			message:
+				"Origin's URL carries a password NarraFork cannot hand to git without putting it on a command line; use a credential helper of the host instead",
+		};
+	// The user kept, when there is one (with an empty user, `https://@host/…`, git never asks the
+	// helper for the password: no use).
+	const userKept =
+		split.credentials?.username && split.url !== rewrittenUrl
+			? rewrittenUrl.replace(/^([a-z][a-z0-9+.-]*:\/\/)([^:@/]*):[^@/]*@/i, "$1$2@")
+			: null;
+	const candidates = [split.url, ...(userKept && userKept !== split.url ? [userKept] : [])].map(
+		(url) => (isBareName(url) ? `./${url}` : url),
+	);
+	if (candidates.some((url) => !url || url.startsWith("-") || unsafeForCommand(url)))
+		return { message: "Origin's URL resolves to one git cannot be given on a command line" };
+	const again: string[] = [];
+	for (const url of candidates) {
+		const ownAgain = matchingRule(url, repository, direction);
+		if (ownAgain) throw new UnsafeRemoteConfigError(ownAgain.key);
+		const rule = matchingRule(url, host, direction);
+		if (!rule) return { url, credentials: split.credentials };
+		again.push(rule.key);
+	}
+	throw new UnsafeRemoteConfigError(
+		again[0] ?? "url.*.insteadof",
+		redactUserinfo(
+			`origin's URL ${configured} resolves to ${candidates.join(" (or, with its user, ")}${candidates.length > 1 ? ")" : ""}, which the host's ${[...new Set(again)].join(" / ")} would rewrite again; git rewrites a remote's URL once, so NarraFork does not ${direction === "push" ? "push to" : "fetch from"} it (make the host's rule give the final URL)`,
+		),
+	);
+}
+
+/**
+ * The credential helper that answers with a URL's login from the environment only: it prints
+ * `NARRAFORK_PUSH_USERNAME` / `NARRAFORK_PUSH_PASSWORD` for a `get` of exactly the URL's protocol
+ * and host, and nothing otherwise (no `store`, no `erase`). Its command line names the variables,
+ * never their values; a process's environment is readable by its owner only.
+ */
+const ENV_CREDENTIAL_HELPER = [
+	"!f() {",
+	'test "$1" = get || return 0;',
+	"p=; h=;",
+	'while IFS= read -r l && test -n "$l"; do',
+	// biome-ignore lint/suspicious/noTemplateCurlyInString: the shell's own parameter expansion
+	'case "$l" in protocol=*) p="${l#protocol=}" ;; host=*) h="${l#host=}" ;; esac;',
+	"done;",
+	'test "$p" = "$NARRAFORK_PUSH_PROTOCOL" && test "$h" = "$NARRAFORK_PUSH_HOST" || return 0;',
+	'printf \'username=%s\\npassword=%s\\n\' "$NARRAFORK_PUSH_USERNAME" "$NARRAFORK_PUSH_PASSWORD";',
+	"}; f",
+].join(" ");
+
+/**
+ * Command-scope settings and environment that give git a URL's login without any command line
+ * carrying it: the helper list reset, {@link ENV_CREDENTIAL_HELPER} first (as the login in the URL
+ * came first before), then the host's own helpers again in their order. Goes after every other
+ * override (its reset clears any list before it).
+ */
+export function credentialFromEnvironment(
+	credentials: UrlCredentials,
+	entries: readonly ScopedConfigEntry[],
+): { overrides: Array<readonly [string, string]>; env: Record<string, string> } {
+	return {
+		overrides: [
+			["credential.helper", ""],
+			["credential.helper", ENV_CREDENTIAL_HELPER],
+			...hostHelpers(entries),
+		],
+		env: {
+			NARRAFORK_PUSH_PROTOCOL: credentials.protocol,
+			NARRAFORK_PUSH_HOST: credentials.host,
+			NARRAFORK_PUSH_USERNAME: credentials.username,
+			NARRAFORK_PUSH_PASSWORD: credentials.password,
+		},
+	};
+}
+
+/** The outcome of a push of one branch. */
+export type PushBranchResult =
+	| { outcome: "pushed" }
+	| { outcome: "up_to_date" }
+	/** The remote branch has commits the head lacks (or a hook there refused it). */
+	| { outcome: "rejected"; message: string }
+	| { outcome: "failed"; message: string };
+
+/** Read `git push --porcelain` for one destination ref. */
+export function parsePushPorcelain(
+	stdout: string,
+	destination: string,
+): { flag: string; summary: string } | null {
+	for (const line of stdout.split("\n")) {
+		const match = /^([ +\-*=!])\t([^\t]*)\t?(.*)$/.exec(line);
+		if (!match) continue;
+		const refs = match[2] ?? "";
+		const to = refs.slice(refs.lastIndexOf(":") + 1);
+		if (to === destination) return { flag: match[1] ?? "", summary: (match[3] ?? "").trim() };
+	}
+	return null;
+}
+
 const isHelperKey = (lower: string) => lower.startsWith("credential.") && lower.endsWith(".helper");
+/** The host's (system/global) credential helpers, in the order git read them. */
+const hostHelpers = (entries: readonly ScopedConfigEntry[]) =>
+	entries
+		.filter((entry) => HOST_SCOPES.has(entry.scope) && isHelperKey(entry.key.toLowerCase()))
+		.map((entry) => [entry.key, entry.value] as const);
 const isExtraHeaderKey = (lower: string) =>
 	lower.startsWith("http.") && lower.endsWith(".extraheader");
 
@@ -521,8 +900,15 @@ export type FastForwardBaseResult =
 
 /** The hardened, writing git of one repository (the project's main checkout). */
 export interface TeamRepoGit {
-	/** `git remote get-url --push origin` (insteadOf and pushurl applied); null without origin. */
-	originPushUrl(): Promise<string | null>;
+	/**
+	 * G: where origin is, from the raw configuration (`--show-scope`), never from git's own
+	 * rewriting: `url` is `remote.origin.url` as configured (what is pushed to), `resolved` the
+	 * same with only the host's (system/global) `pushInsteadOf` / `insteadOf` applied, as git
+	 * applies them to that push. Refused (`TEAM_REMOTE_CONFIG_UNSAFE`) when a `remote.origin
+	 * .pushurl` is configured, origin has several URLs, or the repository's own `insteadOf` /
+	 * `pushInsteadOf` rewrites origin's URL. Null without origin.
+	 */
+	originTarget(): Promise<OriginTarget | null>;
 	resolve(ref: string): Promise<string | null>;
 	/** Refuse a shallow repository or one with a graft file (`TEAM_GIT_HISTORY_ALTERED`). */
 	assertTrueHistory(): Promise<void>;
@@ -557,8 +943,20 @@ export interface TeamRepoGit {
 	checkedOutAt(branch: string): Promise<string | null>;
 	/** The repository's common git directory (absolute, resolved). */
 	commonDir(): Promise<string>;
-	/** `origin/<base>` into `refs/remotes/origin/<base>` only; the error text when it failed. */
+	/**
+	 * `origin/<base>` into `refs/remotes/origin/<base>` only; the error text when it failed. Fetched
+	 * from origin's URL itself (never by the name), a password in it by environment only.
+	 */
 	fetchBaseFromOrigin(base: string): Promise<{ ok: true } | { ok: false; message: string }>;
+	/**
+	 * G: push `head` to `refs/heads/<branch>` at `url` (origin's push URL as read): no `+`, no
+	 * lease, so a remote branch with commits the head lacks is rejected. Refused before anything
+	 * runs (`TEAM_REMOTE_CONFIG_UNSAFE`) when the repository's own configuration would choose the
+	 * transport, credentials or a program, or rewrite the URL. A password in the URL never reaches a
+	 * command line: git gets the URL without it and the login through the environment only
+	 * (`splitUrlCredentials`, `credentialFromEnvironment`).
+	 */
+	pushBranch(input: { url: string; head: string; branch: string }): Promise<PushBranchResult>;
 }
 
 /** The absolute, resolved common git directory of a checkout. */
@@ -627,15 +1025,8 @@ export function teamRepoGit(repo: string, options: { signal?: AbortSignal } = {}
 	};
 
 	return {
-		async originPushUrl() {
-			const result = await read(["remote", "get-url", "--push", "origin"], {
-				maxOutputBytes: 16 * 1024,
-			});
-			// Exit 2: no such remote.
-			if (result.exitCode === 2) return null;
-			if (result.exitCode !== 0 || result.truncated)
-				throw new GitError("git remote could not read origin");
-			return result.stdout.trim() || null;
+		async originTarget() {
+			return originTargetOf(await scopedConfig(repo, ORIGIN_PATTERN, signal));
 		},
 		resolve,
 		assertTrueHistory: () => assertTrueHistory(repo),
@@ -811,12 +1202,21 @@ export function teamRepoGit(repo: string, options: { signal?: AbortSignal } = {}
 			const entries = await scopedConfig(repo, NETWORK_PATTERN, signal);
 			const env = envWithAmbientProxy();
 			let network: ReturnType<typeof networkOverrides>;
+			let source: FetchSource;
 			try {
 				network = networkOverrides(entries, env);
+				// Fetched from origin's URL itself, never by the name: a password in it goes by
+				// environment only (as for the push), never on git's or `git-remote-https`'s argv.
+				const origin = await fetchSource(repo, signal);
+				if ("message" in origin) return { ok: false, message: origin.message };
+				source = origin;
 			} catch (error) {
 				if (error instanceof UnsafeRemoteConfigError) return { ok: false, message: error.message };
 				throw error;
 			}
+			const login = source.credentials
+				? credentialFromEnvironment(source.credentials, entries)
+				: { overrides: [], env: {} };
 			// The host's credentials drive a fetch, so the hardening's emptied credential helper,
 			// askpass and ssh command are replaced by `networkOverrides`' host-only values.
 			const hardened = (await programConfig()).filter(
@@ -839,7 +1239,7 @@ export function teamRepoGit(repo: string, options: { signal?: AbortSignal } = {}
 					// First value wins for upload-pack: only the command line beats the repository's.
 					"--upload-pack=git-upload-pack",
 					"--quiet",
-					"origin",
+					source.url,
 					`+refs/heads/${base}:refs/remotes/origin/${base}`,
 				],
 				{
@@ -850,16 +1250,218 @@ export function teamRepoGit(repo: string, options: { signal?: AbortSignal } = {}
 						["fetch.pruneTags", "false"],
 						["remote.origin.prune", "false"],
 						["remote.origin.pruneTags", "false"],
+						// The host's own `remote.origin.proxy` (what `git fetch origin` applied), by
+						// environment like every override (a proxy URL may carry a login).
+						...source.transport,
+						...login.overrides,
 					],
 					network: true,
 					timeout: FETCH_TIMEOUT_MS,
-					env: network.env,
+					env: { ...network.env, ...login.env },
 					signal,
 				},
 			);
-			return result.exitCode === 0 ? { ok: true } : { ok: false, message: complaint(result) };
+			return result.exitCode === 0
+				? { ok: true }
+				: { ok: false, message: redactUserinfo(complaint(result)) };
+		},
+		async pushBranch({ url: configured, head, branch }) {
+			assertSha(head);
+			assertBranch(branch);
+			if (!configured || configured.startsWith("-") || unsafeForCommand(configured))
+				throw new GitError("Not a URL to push to");
+			const entries = await scopedConfig(repo, NETWORK_PATTERN, signal);
+			const pushEntries = await scopedConfig(repo, PUSH_PATTERN, signal);
+			assertPushUrlUntouched(pushEntries, configured);
+			// The host's rewrites made here, once; a password never reaches argv (the login by
+			// environment); git does not rewrite the argument again.
+			const split = resolveRemoteArgument(configured, pushEntries, "push");
+			if ("message" in split) return { outcome: "failed", message: split.message };
+			const url = split.url;
+			if (url.startsWith("-") || unsafeForCommand(url)) throw new GitError("Not a URL to push to");
+			assertPushUrlUntouched(pushEntries, url);
+			const network = networkOverrides(entries, envWithAmbientProxy());
+			const login = split.credentials
+				? credentialFromEnvironment(split.credentials, entries)
+				: { overrides: [], env: {} };
+			// As for the fetch: the host's `remote.origin.proxy` (never the repository's).
+			const transport = hostOriginTransport(
+				await scopedConfig(repo, ORIGIN_TRANSPORT_PATTERN, signal),
+				url,
+			);
+			// As for the fetch: the host's credentials and ssh, never the hardening's emptied ones.
+			const hardened = (await programConfig()).filter(
+				([key]) =>
+					key !== "credential.helper" && key !== "core.sshCommand" && key !== "core.askPass",
+			);
+			const destination = `refs/heads/${branch}`;
+			const borrowed = await borrowingRepository(repo, signal);
+			const result = await run(
+				repo,
+				[
+					`--git-dir=${borrowed.dir}`,
+					"push",
+					"--porcelain",
+					// No hook (pre-push), on top of the hooks directory and every configured hook off.
+					"--no-verify",
+					"--no-signed",
+					"--no-recurse-submodules",
+					"--no-follow-tags",
+					// First value wins: only the command line beats a configured receive-pack.
+					"--receive-pack=git-receive-pack",
+					url,
+					`${head}:${destination}`,
+				],
+				{
+					config: [
+						...hardened,
+						...network.overrides,
+						...PUSH_NEUTRAL,
+						...transport,
+						...login.overrides,
+					],
+					network: true,
+					timeout: PUSH_TIMEOUT_MS,
+					maxOutputBytes: PUSH_OUTPUT_BYTES,
+					env: { ...network.env, ...login.env },
+					signal,
+				},
+			).finally(() => borrowed.remove());
+			const line = parsePushPorcelain(result.stdout, destination);
+			if (line?.flag === "!")
+				return {
+					outcome: "rejected",
+					message: redactUserinfo(line.summary || complaint(result)).slice(0, 300),
+				};
+			if (result.exitCode === 0 && line?.flag === "=") return { outcome: "up_to_date" };
+			if (result.exitCode === 0 && line && line.flag !== "-") return { outcome: "pushed" };
+			return {
+				outcome: "failed",
+				message: redactUserinfo(result.truncated ? "git push said too much" : complaint(result)),
+			};
 		},
 	};
+}
+
+/** Origin's URL, its rewrites, and the transport settings of origin a named fetch applies. */
+const FETCH_ORIGIN_PATTERN =
+	"^(remote\\.origin\\.(url|proxy|proxyauthmethod)|url\\..*\\.insteadof)$";
+
+/** What a fetch from origin's URL is given (see {@link fetchSource}). */
+interface FetchSource {
+	url: string;
+	credentials: UrlCredentials | null;
+	/** Command-scope settings standing in for the host's `remote.origin.*` transport keys. */
+	transport: Array<readonly [string, string]>;
+}
+
+/**
+ * The URL a fetch from origin is given: `remote.origin.url` as configured (the first of several,
+ * as `git fetch origin` takes it), resolved once by {@link resolveRemoteArgument} (the host's
+ * `insteadOf` applied by NarraFork, the login split off, a bare name as `./<name>` — to
+ * `git fetch` a bare name is a remote's nickname — and refused when git would rewrite the result
+ * again). The fetch runs in the project's repository, so a repository `url.*.insteadOf` that
+ * matches or a `remote.<URL>.*` refuses it (`UnsafeRemoteConfigError`); a password on a transport
+ * that cannot take it by environment, or a URL not safe on a command line, is a failure
+ * (`message`).
+ *
+ * A fetch by URL reads no `remote.origin.*`, so the host's (system/global; never the repository's)
+ * `remote.origin.proxy` and `remote.origin.proxyAuthMethod` are carried over as `http.proxy` /
+ * `http.proxyAuthMethod`, also for the argument itself — which git does not rewrite, so it is the
+ * real destination and the most specific `http.<url>.*` match (outranking a host
+ * `http.<prefix>.proxy`, as the remote's own setting does). Its other keys are not: `fetch`, `tagOpt`, `prune*` and
+ * `uploadpack` are overridden on purpose, `vcs` is refused, and `serverOption` /
+ * `followRemoteHEAD` do not apply to this fetch.
+ */
+async function fetchSource(
+	repo: string,
+	signal?: AbortSignal,
+): Promise<FetchSource | { message: string }> {
+	const entries = await scopedConfig(repo, FETCH_ORIGIN_PATTERN, signal);
+	const urls = entries.filter((entry) => entry.key.toLowerCase() === "remote.origin.url");
+	// Several URLs: `git fetch origin` fetches from the first (in configuration order), so does this.
+	const configured = urls[0]?.value.trim() ?? "";
+	if (!configured) return { message: "origin has no URL to fetch from" };
+	// The host's rewrites made here, once, the login split off, a bare name as a path; git does
+	// not rewrite the argument again (`resolveRemoteArgument`).
+	const split = resolveRemoteArgument(configured, entries, "fetch");
+	if ("message" in split) return split;
+	const url = split.url;
+	if (url.startsWith("-") || unsafeForCommand(url))
+		return { message: "origin's URL cannot be fetched from" };
+	// What git is given is what the repository's own configuration may not rewrite or name.
+	assertPushUrlUntouched(await scopedConfig(repo, PUSH_PATTERN, signal), url, "fetch");
+	return { url, credentials: split.credentials, transport: hostOriginTransport(entries, url) };
+}
+
+/** The host's own origin transport keys a named fetch or push reads. */
+const ORIGIN_TRANSPORT_PATTERN = "^remote\\.origin\\.(proxy|proxyauthmethod)$";
+
+/**
+ * The host's (system/global; never the repository's) `remote.origin.proxy` and
+ * `remote.origin.proxyAuthMethod` as command-scope settings for a fetch or push by URL, which
+ * reads no `remote.origin.*`: `http.proxy` / `http.proxyAuthMethod`, and for an http(s) URL the
+ * same for that URL itself (outranking a host `http.<url>.proxy`, as the remote's setting does).
+ * Passed by environment like every override (a proxy URL may carry a login).
+ */
+function hostOriginTransport(
+	entries: readonly ScopedConfigEntry[],
+	url: string,
+): Array<readonly [string, string]> {
+	const transport: Array<readonly [string, string]> = [];
+	const http = /^https?:\/\//i.test(url);
+	for (const [from, to] of [
+		["remote.origin.proxy", "proxy"],
+		["remote.origin.proxyauthmethod", "proxyAuthMethod"],
+	] as const) {
+		const value = hostValue(entries, from);
+		if (value === undefined) continue;
+		transport.push([`http.${to}`, value]);
+		if (http) transport.push([`http.${url}.${to}`, value]);
+	}
+	return transport;
+}
+
+/**
+ * A throwaway bare repository of NarraFork's own (`<home>/run/push-*`) whose object store borrows
+ * the project's (`objects/info/alternates`), with the same object format and nothing else: no
+ * remotes, no hooks, no configuration beyond `core.bare`. A push from it reads only the host's
+ * configuration and the command's overrides, and moves no ref of the project. Removed after.
+ */
+async function borrowingRepository(
+	repo: string,
+	signal?: AbortSignal,
+): Promise<{ dir: string; remove: () => Promise<void> }> {
+	const common = await commonGitDir(repo, signal);
+	const objects = join(common, "objects");
+	if (unsafeForCommand(objects)) throw new GitError("The repository's path cannot be borrowed");
+	const format = await run(repo, ["rev-parse", "--show-object-format"], {
+		config: GIT_NO_EXEC_CONFIG,
+		signal,
+	});
+	const objectFormat = format.stdout.trim();
+	if (format.exitCode !== 0 || (objectFormat !== "sha1" && objectFormat !== "sha256"))
+		throw new GitError(`git could not tell the object format: ${complaint(format)}`);
+	const parent = getNarraforkPath("run");
+	await mkdir(parent, { recursive: true, mode: 0o700 });
+	const dir = await mkdtemp(join(parent, "push-"));
+	const remove = () => rm(dir, { recursive: true, force: true }).catch(() => undefined);
+	try {
+		await mkdir(join(dir, "objects", "info"), { recursive: true });
+		await mkdir(join(dir, "refs", "heads"), { recursive: true });
+		await writeFile(join(dir, "HEAD"), "ref: refs/heads/narrafork-push\n");
+		await writeFile(
+			join(dir, "config"),
+			objectFormat === "sha256"
+				? "[core]\n\trepositoryformatversion = 1\n\tbare = true\n[extensions]\n\tobjectformat = sha256\n"
+				: "[core]\n\trepositoryformatversion = 0\n\tbare = true\n",
+		);
+		await writeFile(join(dir, "objects", "info", "alternates"), `${objects}\n`);
+	} catch (error) {
+		await remove();
+		throw error;
+	}
+	return { dir, remove };
 }
 
 // ── A person's checkout: the explicit fast-forward ──────────────────────────

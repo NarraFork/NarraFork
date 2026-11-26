@@ -3,6 +3,7 @@ import {
 	TEAM_BOARD_COLUMNS,
 	TEAM_BOARD_PAGE_LIMIT,
 	TEAM_EVENTS_PAGE_LIMIT,
+	TEAM_PR_MERGE_METHODS,
 	TEAM_RETURN_REASON_MAX_LENGTH,
 	TEAM_SETTINGS_MAX_BYTES,
 	TEAM_WORK_START_MODES,
@@ -146,6 +147,14 @@ export const teamWorkStatsQuerySchema = z.object({
 export const teamWorkDiffQuerySchema = z.object({
 	path: z.string().min(1).max(4096),
 });
+
+/** G: `PUT /projects/:projectId/team-github`: the repository a manager confirms (`host/owner/repo`). */
+export const teamGithubPinSchema = z.object({ target: z.string().trim().min(5).max(400) }).strict();
+
+/** G: `POST …/work/:itemId/pr/merge`: the merge method (absent: the repository's default). */
+export const mergeTeamPullRequestSchema = z
+	.object({ method: z.enum(TEAM_PR_MERGE_METHODS).optional() })
+	.strict();
 
 /** `POST …/work/:itemId/return`: the reason the worker gets. */
 export const returnTeamWorkItemSchema = z

@@ -33,17 +33,23 @@
  * in `team-overlap.ts`, or the next request); private refs of items no longer ready are pruned at
  * startup and after each job.
  *
- * When origin is on GitHub the PR flow decides (a later PR): until then the action is disabled
- * (`github_pending`), never replaced by a local merge.
+ * When origin is on GitHub (`team-hosting.ts`) the same request runs the PR flow instead
+ * (`team-merge-pr.ts`): the item's pinned head is pushed to its branch and a pull request opened
+ * (or the open one updated), and 「合并 PR」 (`requestPrMerge`) merges it there through gh. A
+ * GitHub origin whose gh is missing, logged out or may not write disables the action with that
+ * reason; it is never replaced by a local merge.
  */
 import {
 	TEAM_MERGE_CONFLICTS_MAX,
 	TEAM_MERGE_REF_PREFIX,
 	TEAM_WORK_FILES_LIMIT,
 	type TeamFastForwardBlocker,
+	type TeamGithubTarget,
 	type TeamMergeDisabledReason,
+	type TeamMergeJobKind,
 	type TeamMergeMode,
 	type TeamMergePhase,
+	type TeamPrMergeMethod,
 	type TeamWorkMergeOutcome,
 	type TeamWorkMergeResponse,
 	type TeamWorkMergeSummary,
@@ -77,11 +83,14 @@ import {
 	gitVersion,
 	inspectCheckout,
 	peekGitVersion,
+	redactUserinfo,
 	supportsMergeTree,
 	teamRepoGit,
 } from "./team-git-write";
-import { hostingOf, peekHosting } from "./team-hosting";
+import { githubTargetName, pinnedGithubTarget, sameGithubTarget } from "./team-github-pin";
+import { type GhAccess, hostingOf, type ProjectHosting, peekHosting } from "./team-hosting";
 import { claimMerging, isMerging, releaseMerging } from "./team-merge-guard";
+import { pullRequestSummary } from "./team-pr-state";
 import { deliverMergeNote, markMergedByLocalMerge, recordWorkEvent } from "./work-items";
 
 type WorkItemRow = typeof teamWorkItems.$inferSelect;
@@ -104,20 +113,28 @@ const RUNNING = new Set(["working", "waiting"]);
 const escapeLike = (value: string) => value.replace(/[\\%_]/g, (match) => `\\${match}`);
 /** Outcome events read at once (fast-forward requests in between are skipped). */
 const OUTCOME_SCAN = 20;
-/** Events after which an earlier merge outcome no longer applies. */
+/**
+ * Events after which an earlier merge outcome no longer applies (G: the pull request moving on —
+ * pushed, opened, its checks or review changing, queued or closed — clears an earlier failure).
+ */
 const OUTCOME_KINDS = [
 	"work.ready",
 	"work.returned",
 	"work.merge_requested",
 	"work.merge_failed",
 	"work.merge_prepared",
+	"work.pr_pushed",
+	"work.pr_opened",
+	"work.pr_checks",
+	"work.pr_queued",
+	"work.pr_closed",
 ] as const;
 
 interface MergeJob {
 	itemId: string;
 	teamId: string;
 	projectId: string;
-	job: "merge" | "fast_forward";
+	job: TeamMergeJobKind;
 	phase: TeamMergePhase;
 	startedAt: number;
 }
@@ -148,7 +165,7 @@ export function resetMergeJobsForTests(): void {
 // ── Reads ───────────────────────────────────────────────────────────────────
 
 /** A failed job's error as the event records it. */
-class MergeFailure extends Error {
+export class MergeFailure extends Error {
 	constructor(
 		readonly code: string,
 		message: string,
@@ -237,7 +254,7 @@ const stringList = (value: unknown): string[] | undefined =>
 		: undefined;
 
 /** The repository a project's merges run in: the project's directory. */
-function repositoryOf(projectId: string): string | null {
+export function repositoryOf(projectId: string): string | null {
 	return (
 		db
 			.select({ gitPath: projects.gitPath })
@@ -264,14 +281,117 @@ export async function canMergeInProject(
 	return canWriteProject(row, principal);
 }
 
+/** G: whether a person may manage a project (confirm where its pull requests go). */
+export async function canManageProjectOf(
+	projectId: string,
+	principal: { userId: string; isAdmin: boolean },
+): Promise<boolean> {
+	const row = db
+		.select({ id: projects.id, ownerUserId: projects.ownerUserId, visibility: projects.visibility })
+		.from(projects)
+		.where(eq(projects.id, projectId))
+		.limit(1)
+		.get();
+	if (!row) return false;
+	const { canManageProject } = await import("../project-acl");
+	return canManageProject(row, principal);
+}
+
 /** How the item would be merged now, from the cached hosting (never waits). */
 export function mergeModeOf(projectId: string): TeamMergeMode {
+	return modeOfHosting(cachedHosting(projectId));
+}
+
+/** The cached hosting of a project's repository (null while it is read; never waits). */
+function cachedHosting(projectId: string): ProjectHosting | null | "no_repository" {
 	const repo = repositoryOf(projectId);
-	if (!repo) return "local";
-	const hosting = peekHosting(repo);
+	if (!repo) return "no_repository";
+	return peekHosting(repo);
+}
+
+function modeOfHosting(hosting: ProjectHosting | null | "no_repository"): TeamMergeMode {
+	if (hosting === "no_repository") return "local";
 	// Not read yet, or the read failed: never assumed to be "not GitHub".
-	if (!hosting || hosting.kind === "unknown") return "checking";
+	// A redirected origin (`unsafe`) is never taken for "not GitHub" either.
+	if (!hosting || hosting.kind === "unknown" || hosting.kind === "unsafe") return "checking";
 	return hosting.kind === "github" ? "github" : "local";
+}
+
+type GithubHosting = Extract<ProjectHosting, { kind: "github" }>;
+
+/**
+ * G: whether pull requests may go where origin resolves now: a target a person confirmed, and
+ * origin resolving to exactly it. `reason` for the summary (null when nothing pinned yet: a
+ * manager confirms it first), `refusal` for a request or a job.
+ */
+export function githubPinCheck(
+	projectId: string,
+	hosting: GithubHosting,
+): {
+	pinned: TeamGithubTarget | null;
+	reason: "github_unconfirmed" | "github_target_changed" | null;
+	refusal: AppError | null;
+} {
+	const pinned = pinnedGithubTarget(projectId);
+	if (!pinned)
+		return {
+			pinned,
+			reason: "github_unconfirmed",
+			refusal: new AppError(
+				`Pull requests of this project would go to ${githubTargetName(hosting)}: a person with project manage permission confirms that repository first`,
+				409,
+				"TEAM_PR_TARGET_UNCONFIRMED",
+			),
+		};
+	if (!sameGithubTarget(pinned, hosting))
+		return {
+			pinned,
+			reason: "github_target_changed",
+			refusal: new AppError(
+				`origin now resolves to ${githubTargetName(hosting)}, not ${githubTargetName(pinned)} as confirmed; nothing is pushed until a project manager confirms the new repository in the project settings`,
+				409,
+				"TEAM_PR_REMOTE_CHANGED",
+			),
+		};
+	return { pinned, reason: null, refusal: null };
+}
+
+/** The refusal of an `unsafe` origin, in the words read with it (logins already redacted). */
+const unsafeRefusal = (hosting: { key: string; message: string }) =>
+	new AppError(redactUserinfo(hosting.message), 409, "TEAM_REMOTE_CONFIG_UNSAFE");
+
+/** G: why gh cannot serve a GitHub origin, as a disabled reason (null: it can). */
+export function ghDisabledReason(access: GhAccess | undefined): TeamMergeDisabledReason | null {
+	if (!access) return "checking";
+	return access.ok ? null : access.reason;
+}
+
+/** G: a request-time refusal for a GitHub origin gh cannot serve (409). */
+export function ghRefusal(access: GhAccess | undefined): AppError | null {
+	const reason = ghDisabledReason(access);
+	if (!reason) return null;
+	const text: Record<string, [string, string]> = {
+		checking: ["TEAM_MERGE_HOSTING_UNKNOWN", "gh is still being checked on the host; try again"],
+		gh_missing: [
+			"TEAM_PR_GH_MISSING",
+			"Origin is on GitHub, but gh is not installed on the host: install it and run gh auth login there",
+		],
+		gh_logged_out: [
+			"TEAM_PR_GH_LOGGED_OUT",
+			"gh is not logged in to this GitHub host: run gh auth login on the host",
+		],
+		gh_no_permission: [
+			"TEAM_PR_GH_NO_PERMISSION",
+			"gh's account on the host may not write to this repository",
+		],
+		gh_repo_archived: ["TEAM_PR_REPO_ARCHIVED", "The repository is archived on GitHub"],
+		gh_unavailable: [
+			"TEAM_PR_GH_UNAVAILABLE",
+			`gh could not read the repository${access && !access.ok && access.message ? `: ${access.message}` : ""}`,
+		],
+	};
+	const [code, message] = text[reason] ?? ["TEAM_PR_GH_UNAVAILABLE", "gh cannot be used"];
+	return new AppError(message, 409, code);
 }
 
 /** A base given as a remote-tracking ref (`origin/main`): a local merge cannot move it. */
@@ -286,28 +406,59 @@ export function isRemoteTrackingBase(base: string): boolean {
  * event, the cached hosting and git version.
  */
 export function mergeSummaryOf(input: {
-	item: Pick<WorkItemRow, "id" | "state" | "baseRef" | "projectId">;
+	item: Pick<WorkItemRow, "id" | "state" | "baseRef" | "projectId"> &
+		Partial<Pick<WorkItemRow, "headSha">>;
 	baseBranch: string;
 	teamActive: boolean;
 	workerRunning: boolean;
 	member: boolean;
+	/** G: the caller may manage the project (confirm where pull requests go). */
+	manager?: boolean;
 	outcome?: TeamWorkMergeOutcome | null;
 	mode?: TeamMergeMode;
 }): TeamWorkMergeSummary {
 	const job = state.jobs.get(input.item.id) ?? null;
 	const outcome = input.outcome === undefined ? readMergeOutcome(input.item.id) : input.outcome;
-	const mode = input.mode ?? mergeModeOf(input.item.projectId);
+	const hosting = cachedHosting(input.item.projectId);
+	const mode = input.mode ?? modeOfHosting(hosting);
 	const base = input.item.baseRef ?? input.baseBranch;
 	const version = peekGitVersion();
+	const github =
+		hosting && hosting !== "no_repository" && hosting.kind === "github" ? hosting : null;
 	let reason: TeamMergeDisabledReason | null = null;
 	if (input.item.state !== "ready") reason = "not_ready";
 	else if (!input.teamActive) reason = "team_archived";
 	else if (job || isMerging(input.item.id)) reason = "merging";
 	else if (input.workerRunning) reason = "worker_running";
-	else if (mode === "checking") reason = "checking";
-	else if (mode === "github") reason = "github_pending";
+	else if (mode === "checking")
+		reason =
+			hosting && hosting !== "no_repository" && hosting.kind === "unsafe"
+				? "remote_config_unsafe"
+				: "checking";
+	else if (mode === "github") reason = ghDisabledReason(github?.gh);
 	else if (isRemoteTrackingBase(base)) reason = "base_remote";
 	else if (version !== undefined && !supportsMergeTree(version)) reason = "git_too_old";
+	// G: where pull requests go must be confirmed (a manager confirms it from 「发起 PR」).
+	const pin = mode === "github" && github ? githubPinCheck(input.item.projectId, github) : null;
+	const pinned = pin?.reason === null;
+	if (reason === null && pin?.reason === "github_target_changed") reason = pin.reason;
+	if (reason === null && pin?.reason === "github_unconfirmed" && !input.manager)
+		reason = pin.reason;
+	// G: the pull request as last read (a cache; no gh on this path).
+	const pr =
+		mode === "github"
+			? pullRequestSummary({
+					itemId: input.item.id,
+					headSha: input.item.headSha ?? null,
+					methods: github?.gh?.ok ? github.gh.methods : [],
+					mayMerge: input.member && reason === null && pinned,
+					member: input.member,
+					// Only a pull request in the repository origin resolves to now (the confirmed one
+					// whenever anything may run) is the item's; one left in a repository origin
+					// pointed to before is not, and 「发起 PR」 opens one here.
+					target: github ? { host: github.host, owner: github.owner, repo: github.repo } : null,
+				})
+			: null;
 	return {
 		mode,
 		phase: job?.phase ?? null,
@@ -322,6 +473,16 @@ export function mergeSummaryOf(input: {
 					: null,
 		canMerge: input.member && reason === null,
 		disabledReason: reason,
+		...(mode === "github"
+			? {
+					pr,
+					github: {
+						target: github ? githubTargetName(github) : null,
+						pinned: pin?.pinned ? githubTargetName(pin.pinned) : null,
+						canConfirm: input.manager === true,
+					},
+				}
+			: {}),
 	};
 }
 
@@ -493,6 +654,7 @@ export async function mergeViewOf(input: {
 	teamActive: boolean;
 	workerRunning: boolean;
 	member: boolean;
+	manager?: boolean;
 }): Promise<TeamWorkMergeView> {
 	const outcome = readMergeOutcome(input.item.id);
 	const summary = mergeSummaryOf({ ...input, outcome });
@@ -535,7 +697,7 @@ interface Requester {
 	userId: string | null;
 }
 
-interface JobContext extends Requester {
+export interface JobContext extends Requester {
 	itemId: string;
 	teamId: string;
 	projectId: string;
@@ -543,6 +705,8 @@ interface JobContext extends Requester {
 	requestedAt?: number;
 	/** What the job does (kept on its failure, so a failed fast-forward keeps the prepared merge). */
 	job?: MergeJob["job"];
+	/** G: the merge method a 「合并 PR」 asked for. */
+	method?: TeamPrMergeMethod;
 }
 
 let jobDeadlineMs = JOB_DEADLINE_MS;
@@ -553,7 +717,7 @@ export function setMergeDeadlineForTests(ms: number | null): void {
 }
 
 /** An outcome's timestamp: never in the same millisecond as its request, so it reads as newer. */
-function outcomeAt(context: JobContext): string {
+export function outcomeAt(context: JobContext): string {
 	return new Date(Math.max(Date.now(), (context.requestedAt ?? 0) + 1)).toISOString();
 }
 
@@ -595,7 +759,7 @@ function workerRunning(item: Pick<WorkItemRow, "workerNarratorId">): boolean {
 }
 
 /** The cheap checks a request makes before a job starts (the job checks again). */
-function requireMergeable(teamId: string, itemId: string) {
+export function requireMergeable(teamId: string, itemId: string) {
 	const team = teamRow(teamId);
 	if (!team) throw new NotFoundError("Team", teamId);
 	if (team.status !== "active" || team.coordinator === "archived")
@@ -623,10 +787,11 @@ function requireMergeable(teamId: string, itemId: string) {
 	return { team, item };
 }
 
-function startJob(
+export function startJob(
 	context: JobContext,
 	job: MergeJob["job"],
 	run: (context: JobContext, signal: AbortSignal) => Promise<void>,
+	mode: TeamMergeMode = "local",
 ): TeamWorkMergeResponse {
 	context.job = job;
 	if (!claimMerging(context.itemId))
@@ -651,7 +816,7 @@ function startJob(
 			workItemId: context.itemId,
 			kind: "work.merge_requested",
 			actor: { kind: "person", id: context.userId },
-			detail: { job, mode: "local" },
+			detail: { job, mode, ...(context.method ? { method: context.method } : {}) },
 			at: new Date(context.requestedAt).toISOString(),
 		});
 	} catch (error) {
@@ -697,13 +862,13 @@ function startJob(
 	return { itemId: context.itemId, job, phase: "queued" };
 }
 
-function setPhase(itemId: string, phase: TeamMergePhase): void {
+export function setPhase(itemId: string, phase: TeamMergePhase): void {
 	const job = state.jobs.get(itemId);
 	if (job) job.phase = phase;
 }
 
 /** Record a failed job as `work.merge_failed` (never throws). */
-function recordFailure(context: JobContext, error: unknown): void {
+export function recordFailure(context: JobContext, error: unknown): void {
 	const failure =
 		error instanceof MergeFailure
 			? error
@@ -748,13 +913,21 @@ export function requestMerge(input: {
 }): TeamWorkMergeResponse {
 	const { team, item } = requireMergeable(input.teamId, input.itemId);
 	const base = item.baseRef ?? team.baseBranch;
-	const mode = mergeModeOf(team.projectId);
-	if (mode === "github")
-		throw new AppError(
-			"This project's origin is on GitHub: work items merge through a pull request, which NarraFork does not offer yet",
-			409,
-			"TEAM_MERGE_GITHUB_PENDING",
+	const hosting = cachedHosting(team.projectId);
+	const mode = modeOfHosting(hosting);
+	if (hosting && hosting !== "no_repository" && hosting.kind === "unsafe")
+		throw unsafeRefusal(hosting);
+	// G: a GitHub origin pushes the branch and opens (or updates) its pull request instead.
+	if (mode === "github" && hosting && hosting !== "no_repository" && hosting.kind === "github") {
+		const refusal = ghRefusal(hosting.gh) ?? githubPinCheck(team.projectId, hosting).refusal;
+		if (refusal) throw refusal;
+		return startJob(
+			{ itemId: item.id, teamId: input.teamId, projectId: team.projectId, userId: input.userId },
+			"pull_request",
+			runMerge,
+			"github",
 		);
+	}
 	if (isRemoteTrackingBase(base))
 		throw new AppError(
 			`The base ${base} is a remote-tracking branch; a local merge can only move a local branch`,
@@ -765,6 +938,55 @@ export function requestMerge(input: {
 		{ itemId: item.id, teamId: input.teamId, projectId: team.projectId, userId: input.userId },
 		"merge",
 		runMerge,
+		mode,
+	);
+}
+
+/**
+ * G: a member asks to merge a ready item's pull request on GitHub (`POST …/work/:itemId/pr/merge`,
+ * the same access as the merge): cheap checks — origin on GitHub with a usable gh, a pull request
+ * recorded, the method allowed — then the job (202).
+ */
+export function requestPrMerge(input: {
+	teamId: string;
+	itemId: string;
+	userId: string | null;
+	method?: TeamPrMergeMethod;
+}): TeamWorkMergeResponse {
+	const { team, item } = requireMergeable(input.teamId, input.itemId);
+	const hosting = cachedHosting(team.projectId);
+	const github =
+		hosting && hosting !== "no_repository" && hosting.kind === "github" ? hosting : null;
+	if (!github)
+		throw new AppError(
+			modeOfHosting(hosting) === "checking"
+				? "Where origin is hosted is still being read; try again"
+				: "This project's origin is not on GitHub: there is no pull request to merge",
+			409,
+			modeOfHosting(hosting) === "checking" ? "TEAM_MERGE_HOSTING_UNKNOWN" : "TEAM_PR_NOT_GITHUB",
+		);
+	const refusal = ghRefusal(github.gh) ?? githubPinCheck(team.projectId, github).refusal;
+	if (refusal) throw refusal;
+	const methods = github.gh?.ok ? github.gh.methods : [];
+	const method = input.method ?? methods[0];
+	if (!method || !methods.includes(method))
+		throw new AppError(
+			`The repository does not allow ${method ?? "any"} merges of pull requests`,
+			409,
+			"TEAM_PR_METHOD_NOT_ALLOWED",
+		);
+	return startJob(
+		{
+			itemId: item.id,
+			teamId: input.teamId,
+			projectId: team.projectId,
+			userId: input.userId,
+			method,
+		},
+		"pr_merge",
+		(context, signal) =>
+			import("./team-merge-pr").then(({ runPrMerge }) => runPrMerge(context, signal)),
+		"github",
 	);
 }
 
@@ -792,7 +1014,7 @@ export function requestFastForward(input: {
 // ── The jobs ────────────────────────────────────────────────────────────────
 
 /** Re-read everything a job relies on, under the project's mutex. */
-async function jobFacts(context: JobContext, signal: AbortSignal) {
+export async function jobFacts(context: JobContext, signal: AbortSignal) {
 	const team = teamRow(context.teamId);
 	if (!team || team.status !== "active" || team.coordinator === "archived")
 		throw new MergeFailure("TEAM_ARCHIVED", "The team was archived");
@@ -822,10 +1044,33 @@ async function jobFacts(context: JobContext, signal: AbortSignal) {
 			"TEAM_MERGE_HOSTING_UNKNOWN",
 			"Where origin is hosted could not be read; try again once it can (a GitHub origin is never merged locally)",
 		);
-	if (hosting.kind === "github")
+	const base = item.baseRef ?? team.baseBranch;
+	const git = teamRepoGit(repo, { signal });
+	if (hosting.kind === "unsafe") {
+		const refusal = unsafeRefusal(hosting);
+		throw new MergeFailure(refusal.code ?? "TEAM_REMOTE_CONFIG_UNSAFE", refusal.message);
+	}
+	if (hosting.kind === "github") {
+		// G: the pull request flow; gh must be able to serve it (never a local merge instead), to
+		// the repository a person confirmed.
+		const refusal = ghRefusal(hosting.gh) ?? githubPinCheck(context.projectId, hosting).refusal;
+		if (refusal) throw new MergeFailure(refusal.code ?? "TEAM_PR_GH_UNAVAILABLE", refusal.message);
+		await assertTipStill(git, item.branchName, item.headSha);
+		return {
+			team,
+			item,
+			head: item.headSha,
+			branch: item.branchName,
+			base,
+			repo,
+			git,
+			hosting,
+		};
+	}
+	if (context.job === "pr_merge")
 		throw new MergeFailure(
-			"TEAM_MERGE_GITHUB_PENDING",
-			"Origin is on GitHub: this item merges through a pull request, not offered yet",
+			"TEAM_PR_NOT_GITHUB",
+			"Origin is no longer on GitHub: there is no pull request to merge",
 		);
 	const version = await gitVersion();
 	signal.throwIfAborted();
@@ -834,8 +1079,6 @@ async function jobFacts(context: JobContext, signal: AbortSignal) {
 			"TEAM_MERGE_GIT_TOO_OLD",
 			"git 2.38 or newer is needed to merge without touching a working tree",
 		);
-	const base = item.baseRef ?? team.baseBranch;
-	const git = teamRepoGit(repo, { signal });
 	if (isRemoteTrackingBase(base) || !(await git.resolve(`refs/heads/${base}`)))
 		throw new MergeFailure(
 			isRemoteTrackingBase(base) ? "TEAM_MERGE_BASE_REMOTE" : "TEAM_BASE_UNRESOLVED",
@@ -847,15 +1090,18 @@ async function jobFacts(context: JobContext, signal: AbortSignal) {
 			"TEAM_WORK_ITEM_HEAD_MOVED",
 			`The branch ${item.branchName} moved since it was marked ready (head ${item.headSha.slice(0, 12)}, now ${tip ? tip.slice(0, 12) : "missing"}); mark it ready again first`,
 		);
-	return { team, item, head: item.headSha, branch: item.branchName, base, repo, git };
+	return { team, item, head: item.headSha, branch: item.branchName, base, repo, git, hosting };
 }
+
+export type JobFacts = Awaited<ReturnType<typeof jobFacts>>;
+export type GithubJobFacts = JobFacts & { hosting: Extract<ProjectHosting, { kind: "github" }> };
 
 /**
  * The item's branch must still be the head the merge was computed from: checked right before the
  * base moves and again before the merge is recorded. A worker commit made meanwhile is never
  * closed by the merge (409-style `TEAM_WORK_ITEM_HEAD_MOVED`).
  */
-async function assertTipStill(
+export async function assertTipStill(
 	git: { resolve(ref: string): Promise<string | null> },
 	branch: string,
 	head: string,
@@ -877,7 +1123,9 @@ export function setMergeStepHookForTests(hook: ((step: string) => Promise<void> 
 	mergeStepHook = hook;
 }
 
-async function personOf(userId: string | null): Promise<{ name: string | null; locale: Locale }> {
+export async function personOf(
+	userId: string | null,
+): Promise<{ name: string | null; locale: Locale }> {
 	if (!userId) return { name: null, locale: "en" };
 	const row = db
 		.select({ username: users.username })
@@ -890,7 +1138,7 @@ async function personOf(userId: string | null): Promise<{ name: string | null; l
 }
 
 /** Tell the coordinator; best effort. */
-async function notify(
+export async function notify(
 	context: JobContext,
 	render: (locale: Locale, by: string | null) => string,
 ): Promise<void> {
@@ -939,6 +1187,11 @@ async function landed(
 async function runMerge(context: JobContext, signal: AbortSignal): Promise<void> {
 	setPhase(context.itemId, "checking");
 	const facts = await jobFacts(context, signal);
+	// G: origin turned out to be on GitHub (the request saw the hosting still being read).
+	if (facts.hosting.kind === "github") {
+		const { runPullRequest } = await import("./team-merge-pr");
+		return runPullRequest(context, signal, facts as GithubJobFacts);
+	}
 	const { item, head, branch, base, git, repo } = facts;
 	const title = item.title;
 	// Merge bases and "already in the base" are only answered over the real, full history.
@@ -1038,6 +1291,11 @@ async function runMerge(context: JobContext, signal: AbortSignal): Promise<void>
 async function runFastForward(context: JobContext, signal: AbortSignal): Promise<void> {
 	setPhase(context.itemId, "checking");
 	const facts = await jobFacts(context, signal);
+	if (facts.hosting.kind === "github")
+		throw new MergeFailure(
+			"TEAM_MERGE_NOT_PREPARED",
+			"Origin is on GitHub now: this item merges through a pull request",
+		);
 	const { item, head, branch, base, git, repo } = facts;
 	await git.assertTrueHistory();
 	const outcome = readMergeOutcome(item.id);
