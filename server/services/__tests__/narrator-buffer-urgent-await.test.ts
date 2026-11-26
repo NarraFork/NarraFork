@@ -102,9 +102,12 @@ mock.module("../../lib/agent/provider", () => ({
 	}),
 }));
 
-const { acceptUserMessage, closeNarrator, applyBufferedQueueModeControl } = await import(
-	"../narrator-session"
-);
+const {
+	acceptUserMessage,
+	closeNarrator,
+	applyBufferedQueueModeControl,
+	prepareIndependentQueuedNewCommand,
+} = await import("../narrator-session");
 const {
 	enqueueBufferedMessage,
 	updateBufferedMessageMode,
@@ -138,6 +141,7 @@ const bindings = {
 	services: {
 		withNarratorStartAdmission,
 		applyBufferedQueueModeControl,
+		prepareIndependentQueuedNewCommand,
 		waitForBufferedMessageDelivery,
 		readBufferedMessageDeliveryReceipt,
 		wakeInboxIfEligible,
