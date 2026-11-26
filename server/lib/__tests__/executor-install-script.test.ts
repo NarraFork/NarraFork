@@ -398,9 +398,8 @@ describe("install locations and service wiring", () => {
 		expect(script).toContain("NoNewPrivileges=true");
 		// The account has no home directory: session records go to a managed state dir.
 		expect(script).toContain("StateDirectory=narrafork-executor");
-		expect(script).toContain(
-			"Environment=NARRAFORK_EXECUTOR_STATE_DIR=/var/lib/narrafork-executor",
-		);
+		// A default only: an explicit stateDir in the config must still win.
+		expect(script).not.toContain("NARRAFORK_EXECUTOR_STATE_DIR");
 	});
 
 	test("user mode stays inside the invoking account and never uses sudo", () => {

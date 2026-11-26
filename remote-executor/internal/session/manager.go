@@ -107,9 +107,12 @@ type Session struct {
 	// stopped as soon as it exists.
 	killRequested bool
 	// lost: restored from disk after the executor process that ran it stopped.
-	lost       bool
-	log        *sessionLog
-	storageErr error
+	lost bool
+	// outputIncomplete: restored from disk with output that could not all be
+	// recorded; the bytes after the recorded end are gone.
+	outputIncomplete bool
+	log              *sessionLog
+	storageErr       error
 
 	writeMu  sync.Mutex
 	seen     map[string]struct{}
@@ -213,6 +216,8 @@ func (m *Manager) UseStore(st *DiskStore) error {
 			timedOut:  r.meta.TimedOut,
 			lost:      r.meta.Lost,
 			seen:      make(map[string]struct{}),
+			// Restored output is only what was recorded.
+			outputIncomplete: r.meta.OutputIncomplete,
 		}
 		switch {
 		case r.storageErr != nil:
@@ -566,6 +571,9 @@ type AttachResult struct {
 	// running; the output up to EndSeq is all that was recorded and ExitCode is
 	// meaningless.
 	Lost bool `json:"lost,omitempty"`
+	// OutputIncomplete: a restored session whose output could not all be
+	// recorded; bytes after EndSeq were printed but are gone. The exit is real.
+	OutputIncomplete bool `json:"outputIncomplete,omitempty"`
 }
 
 // Attach streams output from since until the session ends or ctx is done.
@@ -584,12 +592,16 @@ func (m *Manager) Attach(
 	}
 	pos := since
 	s.mu.Lock()
-	lost := s.lost
+	lost, incomplete, code, timedOut := s.lost, s.outputIncomplete, s.exitCode, s.timedOut
 	s.mu.Unlock()
-	if _, end, _ := s.journal.Bounds(); lost && since > end {
-		// The reader saw output that never reached the disk before the crash:
-		// nothing more is coming, and nothing it has needs replaying.
-		result := AttachResult{ExitCode: -1, EndSeq: end, Lost: true}
+	if _, end, _ := s.journal.Bounds(); (lost || incomplete) && since > end {
+		// The reader saw output that never reached the disk (before a crash, or
+		// after recording failed): nothing more is coming, and nothing it has
+		// needs replaying. A recorded exit is still reported.
+		result := AttachResult{ExitCode: code, EndSeq: end, TimedOut: timedOut, Lost: lost, OutputIncomplete: incomplete}
+		if lost {
+			result.ExitCode = -1
+		}
 		payload, _ := json.Marshal(result)
 		send(ChannelExit, payload)
 		return result, nil
@@ -618,7 +630,7 @@ func (m *Manager) Attach(
 			s.mu.Lock()
 			timedOut := s.timedOut
 			s.mu.Unlock()
-			result := AttachResult{ExitCode: code, EndSeq: pos, TimedOut: timedOut, Lost: lost}
+			result := AttachResult{ExitCode: code, EndSeq: pos, TimedOut: timedOut, Lost: lost, OutputIncomplete: incomplete}
 			payload, _ := json.Marshal(result)
 			send(ChannelExit, payload)
 			return result, nil

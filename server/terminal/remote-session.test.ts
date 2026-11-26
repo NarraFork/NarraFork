@@ -487,7 +487,7 @@ describe("spawnRemoteSession", () => {
 			},
 		);
 		expect(await runtime.exited).toBe(137);
-		expect(exits).toEqual([{ exitCode: 137, timedOut: true }]);
+		expect(exits).toEqual([{ exitCode: 137, timedOut: true, outputIncomplete: false }]);
 	});
 
 	test("a session lost to an executor restart delivers its recorded output, then ends", async () => {

@@ -146,11 +146,11 @@ NarraFork 侧对应展示：缺口在终端里显示为一行提示（"有 N 字
 
 - 分段只追加；淘汰时整段删除，`firstSeq` 取最早存活分段的名字。
 - `meta.json` 用"写临时文件 → fsync → rename"更新；分段写入按段 fsync，不逐字节 fsync（不承诺断电不丢最近输出）。
-- `stateDir`：Linux `$XDG_STATE_HOME/narrafork-executor`（缺省 `~/.local/state/...`），macOS `~/Library/Application Support/...`，Windows `%LOCALAPPDATA%\...`；可用 `--state-dir`、`NARRAFORK_EXECUTOR_STATE_DIR` 或配置 `stateDir` 覆盖；系统级 systemd 服务的账户没有家目录，单元里用 `StateDirectory=` 并指向 `/var/lib/narrafork-executor`。子目录按注册区分（服务器地址、直连监听地址与设备名的哈希），同一账户和状态目录下的不同注册——即使设备同名——互不恢复、也就不会读到对方的会话。
+- `stateDir`：Linux `$XDG_STATE_HOME/narrafork-executor`（缺省 `~/.local/state/...`），macOS `~/Library/Application Support/...`，Windows `%LOCALAPPDATA%\...`；可用 `--state-dir`、`NARRAFORK_EXECUTOR_STATE_DIR` 或配置 `stateDir` 覆盖；系统级 systemd 服务的账户没有家目录，单元里用 `StateDirectory=`，执行器在没有配置 `stateDir` 时使用 systemd 给出的 `$STATE_DIRECTORY`（`/var/lib/narrafork-executor`）。子目录按注册区分（服务器地址、直连监听地址与设备名的哈希），同一账户和状态目录下的不同注册——即使设备同名——互不恢复、也就不会读到对方的会话。
 - 启动时读回每个会话目录：`meta.json` 有退出事实的恢复为已退出；没有的（执行器停止时仍在运行）恢复为 `lost`，并立即把发现时间写回 `meta.json`，所以多次重启不会刷新它的 24 小时 TTL。只读最近 4 MiB 和最后一段连续分段；读不了的目录删除。
 - 读者声称看过的字节超过已写盘的末尾（断电前未落盘的输出）时，`lost` 会话直接返回结束，不报错。
 - 释放、TTL 到期、`kill { release }` 都会删掉目录；磁盘占用上限约为会话数上限 × (4 MiB + 1 段)。
-- 写盘失败（写入、fsync、关闭出错，磁盘满、目录被删）只让该会话停止记录输出，退出事实仍照常记录，`meta.json` 标 `outputIncomplete`，`info.storageError` 报告（恢复后也报告）。启动时某个会话的记录写不回（只读、满盘）不影响其他会话恢复，该会话带存储错误照常恢复。能写盘时执行器声明特性 `session.journal.disk.v1`。
+- 写盘失败（写入、fsync、关闭出错，磁盘满、目录被删）只让该会话停止记录输出，退出事实仍照常记录，`meta.json` 标 `outputIncomplete`，`info.storageError` 报告（恢复后也报告）；恢复后的 attach 结果带 `outputIncomplete: true`，读者位置超过记录末尾时直接返回保存的退出结果，NarraFork 显示"部分输出缺失"并把后台任务输出标为不完整。启动时某个会话的记录写不回（只读、满盘）不影响其他会话恢复，该会话带存储错误照常恢复。能写盘时执行器声明特性 `session.journal.disk.v1`。
 
 ## 8. NarraFork 侧改造
 

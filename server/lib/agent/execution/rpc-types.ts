@@ -475,6 +475,8 @@ export interface SessionAttachResult {
 	timedOut?: boolean;
 	/** The executor restarted while the session ran; exitCode is meaningless. */
 	lost?: boolean;
+	/** Restored from disk with output that could not all be recorded; the exit is real. */
+	outputIncomplete?: boolean;
 }
 
 export interface SessionWriteParams {

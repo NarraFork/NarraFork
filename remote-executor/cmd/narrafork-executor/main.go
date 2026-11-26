@@ -230,6 +230,13 @@ func shellPath() string {
 func sessionStateDir(cfg *config.Config) (string, error) {
 	base := cfg.StateDir
 	if base == "" {
+		// A systemd unit with StateDirectory= sets STATE_DIRECTORY; it is a default
+		// only, so an explicit stateDir in the config still wins.
+		if dirs := os.Getenv("STATE_DIRECTORY"); dirs != "" {
+			base = strings.Split(dirs, ":")[0]
+		}
+	}
+	if base == "" {
 		dir, err := config.DefaultStateDir()
 		if err != nil {
 			return "", err

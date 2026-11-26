@@ -228,6 +228,18 @@ describe("remote background Bash on durable executor sessions", () => {
 		expect(row("bash_crashed")?.output).toContain("its executor restarted while it was running");
 	});
 
+	test("an exit restored with incomplete output completes, marked incomplete", async () => {
+		await runningTask("bash_partial");
+		await backgroundTaskService.recoverStaleTasksAfterRestart();
+		await until(() => attach !== undefined);
+		attach?.stream("session.data", encode("first part\n"));
+		attach?.end({ exitCode: 0, endSeq: 11, outputIncomplete: true });
+		await until(() => row("bash_partial")?.status === "completed");
+		expect(row("bash_partial")?.output).toContain("first part");
+		expect(row("bash_partial")?.output).toContain("could not record all of this output");
+		expect(row("bash_partial")?.output).toContain("Output is incomplete");
+	});
+
 	test("a session the executor no longer has fails the task with the reason", async () => {
 		await runningTask("bash_lost", "service");
 		attachFailure = new Error("session not found");

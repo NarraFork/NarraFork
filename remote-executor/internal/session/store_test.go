@@ -194,8 +194,14 @@ func TestOutputFailureStillRecordsTheExit(t *testing.T) {
 		t.Fatalf("restored = %+v", info)
 	}
 	text, result, _ := attachText(t, after, "s1", 0)
-	if text != "12345678" || result.Lost {
+	if text != "12345678" || result.Lost || !result.OutputIncomplete || result.ExitCode != 0 {
 		t.Fatalf("restored output = %q %+v", text, result)
+	}
+	// A reader that already got the unrecorded output from the live executor
+	// still learns the exit, instead of a sequence error.
+	text, result, _ = attachText(t, after, "s1", 19)
+	if text != "" || result.Lost || !result.OutputIncomplete || result.ExitCode != 0 || result.EndSeq != 8 {
+		t.Fatalf("attach past the recorded end = %q %+v", text, result)
 	}
 }
 

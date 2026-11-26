@@ -1016,10 +1016,10 @@ function buildUnixScript(input: ResolvedInput): string {
 				"RestrictSUIDSGID=true",
 				"UMask=0077",
 				// The service account has no home directory: keep session records (output
-				// and exits that outlive an executor restart) in a systemd-managed one.
+				// and exits that outlive an executor restart) in a systemd-managed one. The
+				// executor uses it ($STATE_DIRECTORY) unless stateDir is configured.
 				`StateDirectory=${serviceName}`,
 				"StateDirectoryMode=0700",
-				`Environment=NARRAFORK_EXECUTOR_STATE_DIR=/var/lib/${serviceName}`,
 				"",
 				"[Install]",
 				"WantedBy=multi-user.target",

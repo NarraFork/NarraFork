@@ -109,7 +109,11 @@ export interface RemoteSessionOptions {
 	 */
 	onLost?: (reason: string) => void;
 	/** The executor reported the exit; `timedOut` when its own deadline stopped an exec session. */
-	onExit?: (exit: { exitCode: number | null; timedOut: boolean }) => void;
+	onExit?: (exit: {
+		exitCode: number | null;
+		timedOut: boolean;
+		outputIncomplete: boolean;
+	}) => void;
 }
 
 export interface RemoteSessionRuntime extends TerminalRuntime {
@@ -279,7 +283,7 @@ export function spawnRemoteSession(
 					"session.attach",
 					{ sessionId, since: consumed },
 					{ ...rpcOpts, signal: attach.signal, longLived: true, onStream },
-				)) as { exitCode?: number; timedOut?: boolean; lost?: boolean };
+				)) as { exitCode?: number; timedOut?: boolean; lost?: boolean; outputIncomplete?: boolean };
 				if (stopped) return;
 				const tail = decoder.decode();
 				if (tail) opts.onData?.(tail, consumed);
@@ -296,7 +300,17 @@ export function spawnRemoteSession(
 				}
 				// Not released here: the owner releases after persisting the final state.
 				const exitCode = typeof result?.exitCode === "number" ? result.exitCode : null;
-				opts.onExit?.({ exitCode, timedOut: result?.timedOut === true });
+				const outputIncomplete = result?.outputIncomplete === true;
+				if (outputIncomplete)
+					// The device could not record all of it before restarting: say so
+					// rather than present the replay as the whole output.
+					deliverText(
+						opts.onBytes
+							? "\n[NarraFork: the device could not record all of this output; part of it is missing]\n"
+							: "\r\n\x1b[2m[NarraFork: the device could not record all of this output; part of it is missing]\x1b[0m\r\n",
+						consumed,
+					);
+				opts.onExit?.({ exitCode, timedOut: result?.timedOut === true, outputIncomplete });
 				finish(exitCode);
 				return;
 			} catch (error) {

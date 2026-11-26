@@ -40,3 +40,19 @@ func TestSessionStateDirIsPerRegistration(t *testing.T) {
 		t.Fatalf("device name not confined to one path element: %q", odd)
 	}
 }
+
+// systemd's STATE_DIRECTORY is a default: it is used when nothing is configured
+// and never replaces an explicit state directory.
+func TestSessionStateDirUsesSystemdStateDirectoryOnlyAsDefault(t *testing.T) {
+	managed := t.TempDir()
+	t.Setenv("STATE_DIRECTORY", managed+":/ignored")
+	got, err := sessionStateDir(&config.Config{DeviceRef: "laptop"})
+	if err != nil || !strings.HasPrefix(got, filepath.Join(managed, "laptop-")) {
+		t.Fatalf("systemd default not used: %q, %v", got, err)
+	}
+	explicit := t.TempDir()
+	got, err = sessionStateDir(&config.Config{StateDir: explicit, DeviceRef: "laptop"})
+	if err != nil || !strings.HasPrefix(got, filepath.Join(explicit, "laptop-")) {
+		t.Fatalf("explicit stateDir replaced: %q, %v", got, err)
+	}
+}
