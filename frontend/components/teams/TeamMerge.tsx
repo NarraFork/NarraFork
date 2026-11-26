@@ -16,7 +16,7 @@
  * NarraFork never touches a person's checkout except on that explicit fast-forward.
  */
 import { CopyButton } from "@frontend/components/common/CopyButton";
-import { useMergeWorkItem } from "@frontend/hooks/useTeams";
+import { useMergeWorkItem, useSetTeamGithub } from "@frontend/hooks/useTeams";
 import { describeApiError } from "@frontend/lib/api-error";
 import {
 	ActionIcon,
@@ -52,14 +52,17 @@ import {
 	IconGitPullRequest,
 	IconPlayerTrackNext,
 } from "@tabler/icons-react";
+import { Link } from "@tanstack/react-router";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
+	githubConfirmation,
 	mergeControl,
 	mergeErrorKey,
 	mergeRequestCode,
 	type PullRequestControlView,
 	pullRequestControl,
+	pullRequestRepo,
 	safeHref,
 } from "./team-page-model";
 import { MONO } from "./team-page-ui";
@@ -91,25 +94,32 @@ export function MergeButton({
 }) {
 	const { t } = useTranslation("projects");
 	const send = useMergeWorkItem(projectId, teamId);
+	const pin = useSetTeamGithub(projectId);
+	const [confirming, setConfirming] = useState(false);
 	const errorText = useMergeErrorText();
 	const control = mergeControl(merge);
 	const pr = pullRequestControl(merge);
 	if (!control && !pr) return null;
-	const pending = send.isPending || !!control?.busy;
+	const pending = send.isPending || pin.isPending || !!control?.busy;
 	const github = merge?.mode === "github";
 	const icon = github ? IconGitPullRequest : IconGitMerge;
 	const Icon = icon;
+	// G: the buttons name the repository; nothing confirmed yet, a manager confirms it first.
+	const repo = pullRequestRepo(merge);
+	const confirmTarget = githubConfirmation(merge);
 	const button = control && (
 		<Button
 			size={size}
 			disabled={!control.enabled && !pending}
 			loading={pending && !pr?.busy}
 			leftSection={<Icon size={size === "xs" ? 14 : 16} aria-hidden />}
-			onClick={() => send.mutate({ itemId })}
+			onClick={() => (confirmTarget ? setConfirming(true) : send.mutate({ itemId }))}
 			data-testid="team-merge-button"
 			data-merge-label={control.label}
+			data-confirm={confirmTarget ? "github" : undefined}
 		>
 			{t(`teams.page.merge.${control.label}`, { base })}
+			{repo && github ? ` · ${repo}` : ""}
 		</Button>
 	);
 	return (
@@ -121,6 +131,7 @@ export function MergeButton({
 						base={base}
 						size={size}
 						pending={send.isPending}
+						repo={repo}
 						disabledReason={merge?.disabledReason ?? null}
 						onMerge={(method) => send.mutate({ itemId, pullRequest: { method } })}
 					/>
@@ -137,10 +148,59 @@ export function MergeButton({
 					))}
 			</Group>
 			{pr && pr.labels.length > 0 && <PullRequestLabels pr={pr} base={base} />}
-			{send.isError && (
+			{merge?.disabledReason === "github_target_changed" && (
+				<Link
+					to="/projects/$projectId/settings"
+					params={{ projectId }}
+					style={{ fontSize: "var(--mantine-font-size-xs)" }}
+					data-testid="team-merge-settings-link"
+				>
+					{t("teams.page.merge.openProjectSettings")}
+				</Link>
+			)}
+			{(send.isError || pin.isError) && (
 				<Text size="xs" c="red" data-testid="team-merge-request-error" maw={320}>
-					{errorText(mergeRequestCode(send.error), describeApiError(send.error, t).message)}
+					{send.isError
+						? errorText(mergeRequestCode(send.error), describeApiError(send.error, t).message)
+						: describeApiError(pin.error, t).message}
 				</Text>
+			)}
+			{confirmTarget && (
+				<Modal
+					opened={confirming}
+					onClose={() => setConfirming(false)}
+					title={t("teams.page.merge.confirmGithubTitle")}
+					size="md"
+				>
+					<Stack gap="sm" data-testid="team-github-confirm">
+						<Text size="sm">
+							{t("teams.page.merge.confirmGithubText", { target: confirmTarget })}
+						</Text>
+						<Text size="xs" c="dimmed">
+							{t("teams.page.merge.confirmGithubHint")}
+						</Text>
+						<Group justify="flex-end" gap="xs">
+							<Button variant="default" onClick={() => setConfirming(false)}>
+								{t("teams.page.drawer.cancel")}
+							</Button>
+							<Button
+								loading={pin.isPending}
+								onClick={() =>
+									pin.mutate(
+										{ target: confirmTarget },
+										{
+											onSuccess: () => send.mutate({ itemId }),
+											onSettled: () => setConfirming(false),
+										},
+									)
+								}
+								data-testid="team-github-confirm-button"
+							>
+								{t("teams.page.merge.confirmGithubButton")}
+							</Button>
+						</Group>
+					</Stack>
+				</Modal>
 			)}
 		</Stack>
 	);
@@ -152,6 +212,7 @@ function PullRequestActions({
 	base,
 	size,
 	pending,
+	repo,
 	disabledReason,
 	onMerge,
 }: {
@@ -159,6 +220,7 @@ function PullRequestActions({
 	base: string;
 	size: "xs" | "sm";
 	pending: boolean;
+	repo: string | null;
 	disabledReason: string | null;
 	onMerge: (method: TeamPrMergeMethod | undefined) => void;
 }) {
@@ -179,6 +241,7 @@ function PullRequestActions({
 			style={pr.methods.length > 1 ? { borderTopRightRadius: 0, borderBottomRightRadius: 0 } : {}}
 		>
 			{pr.busy ? t("teams.page.merge.mergingPr") : t("teams.page.merge.mergePr")}
+			{repo && !pr.busy ? ` · ${repo}` : ""}
 			{method && pr.methods.length > 1 ? ` · ${t(`teams.page.merge.method.${method}`)}` : ""}
 		</Button>
 	);

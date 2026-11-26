@@ -1,8 +1,10 @@
 /**
  * Where a project's origin lives (M, W), read off the request path and cached per repository.
  *
- * The push URL is read with `git remote get-url --push origin` (it applies `pushurl` and
- * `insteadOf`; raw configuration is never read) and parsed here: scp-style `[user@]host:path`,
+ * Origin is read from the raw configuration (`team-git-write.ts:originTarget`): `remote.origin
+ * .url` with only the host's own `pushInsteadOf` / `insteadOf` applied — never git's
+ * `get-url --push`, which would apply a `pushurl` or a rewrite the repository's own configuration
+ * (agent-writable) sets; those are refused (`unsafe`). It is parsed here: scp-style `[user@]host:path`,
  * `ssh://[user@]host[:port]/path` (`ssh.github.com:443` is github.com) and
  * `http(s)://[userinfo@]host/path` (userinfo dropped, never logged). The host is lowercased and
  * the path must be exactly `owner/repo` (a trailing `/` and `.git` removed).
@@ -33,7 +35,7 @@ import {
 	ghVersion,
 	isGhRepo,
 } from "./team-gh";
-import { teamRepoGit } from "./team-git-write";
+import { type OriginTarget, teamRepoGit, UnsafeRemoteConfigError } from "./team-git-write";
 
 /** A parsed remote URL: lowercased host and its `owner/repo` path. */
 export interface RemoteLocation {
@@ -66,7 +68,9 @@ export type ProjectHosting =
 	| { kind: "other"; host: string | null }
 	| { kind: "none" }
 	/** The push URL could not be read: neither GitHub nor not (merging waits; never local). */
-	| { kind: "unknown" };
+	| { kind: "unknown" }
+	/** G: the repository's own configuration redirects origin (a push URL or a rewrite): refused. */
+	| { kind: "unsafe"; key: string };
 
 const GITHUB_HOSTS = new Map([
 	["github.com", "github.com"],
@@ -215,24 +219,32 @@ interface Entry {
 	pending: Promise<ProjectHosting> | null;
 }
 
+/** How origin is read: its URL as configured, and as the host's rewrites leave it. */
+type OriginSource = (repo: string) => Promise<OriginTarget | null>;
+/** The tests' stand-in: one URL, both configured and resolved. */
 type HostingSource = (repo: string) => Promise<string | null>;
 
 const state = hotSafe("narrafork.teams.hosting", () => ({
 	entries: new Map<string, Entry>(),
-	source: null as HostingSource | null,
+	source: null as OriginSource | null,
 	now: () => Date.now(),
 	ghProbe: null as ((target: GhRepo) => Promise<GhAccess>) | null,
 	enterpriseProbe: null as ((host: string) => Promise<boolean>) | null,
 }));
 
-const readPushUrl: HostingSource = (repo) => teamRepoGit(repo).originPushUrl();
+const readOrigin: OriginSource = (repo) => teamRepoGit(repo).originTarget();
 
 /** Replace how the push URL is read, and the clock (tests); null restores git. Clears the cache. */
 export function setHostingSourceForTests(
 	source: HostingSource | null,
 	now: (() => number) | null = null,
 ): void {
-	state.source = source;
+	state.source = source
+		? async (repo) => {
+				const url = await source(repo);
+				return url ? { url, resolved: url } : null;
+			}
+		: null;
 	state.now = now ?? (() => Date.now());
 	state.entries.clear();
 }
@@ -250,9 +262,12 @@ export function setGhProbeForTests(
 	state.entries.clear();
 }
 
-/** The push URL of a repository's origin now (the same source the hosting is read from). */
-export function readOriginPushUrl(repo: string): Promise<string | null> {
-	return (state.source ?? readPushUrl)(repo);
+/**
+ * A repository's origin now (the same source the hosting is read from): the URL to push to and
+ * where it resolves. Throws `UnsafeRemoteConfigError` for a redirected origin.
+ */
+export function readOriginTarget(repo: string): Promise<OriginTarget | null> {
+	return (state.source ?? readOrigin)(repo);
 }
 
 /** Forget a repository's hosting (a person changed something): the next read asks again. */
@@ -262,12 +277,19 @@ export function forgetHosting(repo: string): void {
 }
 
 /** Whether a read hosting is one to keep briefly: gh cannot serve a GitHub origin yet. */
-const shortLived = (value: ProjectHosting) => value.kind === "github" && value.gh?.ok === false;
+const shortLived = (value: ProjectHosting) =>
+	(value.kind === "github" && value.gh?.ok === false) || value.kind === "unsafe";
 
 function refresh(repo: string): Promise<ProjectHosting> {
 	const entry = state.entries.get(repo);
 	if (entry?.pending) return entry.pending;
-	const read = readOriginPushUrl(repo).then(resolveHosting);
+	const read = readOriginTarget(repo).then(
+		(origin) => resolveHosting(origin?.resolved ?? null),
+		(error: unknown): ProjectHosting => {
+			if (error instanceof UnsafeRemoteConfigError) return { kind: "unsafe", key: error.key };
+			throw error;
+		},
+	);
 	const pending = read
 		.then((value) => {
 			const ttl = shortLived(value) ? FAILURE_TTL_MS : SUCCESS_TTL_MS;

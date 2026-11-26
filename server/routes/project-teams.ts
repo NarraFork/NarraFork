@@ -11,6 +11,7 @@
 
 import { PROJECT_TEAM_CARDS_LIMIT } from "@shared/project-overview";
 import type {
+	TeamGithubPinResponse,
 	TeamListResponse,
 	TeamOverlapResponse,
 	TeamWorkMergeResponse,
@@ -29,6 +30,7 @@ import {
 	returnTeamWorkItemSchema,
 	teamActivityQuerySchema,
 	teamBoardQuerySchema,
+	teamGithubPinSchema,
 	teamWorkDiffQuerySchema,
 	teamWorkStatsQuerySchema,
 	updateProjectTeamSchema,
@@ -73,6 +75,10 @@ projectTeamRoutes.use("/:projectId/teams/*", async (_c, next) => {
 	return next();
 });
 projectTeamRoutes.use("/:projectId/teams", async (_c, next) => {
+	requireSqliteProjectMutation("Project teams");
+	return next();
+});
+projectTeamRoutes.use("/:projectId/team-github", async (_c, next) => {
 	requireSqliteProjectMutation("Project teams");
 	return next();
 });
@@ -423,6 +429,54 @@ projectTeamRoutes.post("/:projectId/teams/:teamId/work/:itemId/merge/fast-forwar
 		c.req.param("itemId"),
 	);
 	return c.json(result, 202);
+});
+
+/**
+ * G: the GitHub repository the project's pull requests go to. Reading it needs project read;
+ * confirming (`PUT {target: "host/owner/repo"}`) or clearing it (`DELETE`) project manage (403
+ * otherwise, 404 for a stranger). `detected` is what origin resolves to now (cached; null while
+ * it is read or when origin is not on GitHub).
+ */
+async function githubPinResponse(projectId: string): Promise<TeamGithubPinResponse> {
+	const { pinnedGithubTarget, githubTargetName } = await import(
+		"../services/teams/team-github-pin"
+	);
+	const { peekHosting } = await import("../services/teams/team-hosting");
+	const { repositoryOf } = await import("../services/teams/team-merge");
+	const repo = repositoryOf(projectId);
+	const hosting = repo ? peekHosting(repo) : null;
+	return {
+		pinned: pinnedGithubTarget(projectId),
+		detected: hosting?.kind === "github" ? githubTargetName(hosting) : null,
+	};
+}
+
+projectTeamRoutes.get("/:projectId/team-github", async (c) => {
+	const projectId = c.req.param("projectId");
+	await requireProjectAccess(c, projectId, "read");
+	return c.json(await githubPinResponse(projectId));
+});
+
+projectTeamRoutes.put("/:projectId/team-github", async (c) => {
+	const projectId = c.req.param("projectId");
+	await requireProjectAccess(c, projectId, "manage");
+	const parsed = teamGithubPinSchema.safeParse(await jsonBody(c));
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const { parseGithubTarget, setPinnedGithubTarget } = await import(
+		"../services/teams/team-github-pin"
+	);
+	const target = parseGithubTarget(parsed.data.target);
+	if (!target) throw new ValidationError("Expected host/owner/repo");
+	setPinnedGithubTarget(projectId, target, projectPrincipalOf(c).userId || null);
+	return c.json(await githubPinResponse(projectId));
+});
+
+projectTeamRoutes.delete("/:projectId/team-github", async (c) => {
+	const projectId = c.req.param("projectId");
+	await requireProjectAccess(c, projectId, "manage");
+	const { setPinnedGithubTarget } = await import("../services/teams/team-github-pin");
+	setPinnedGithubTarget(projectId, null, null);
+	return c.json(await githubPinResponse(projectId));
 });
 
 /**

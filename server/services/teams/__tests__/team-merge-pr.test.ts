@@ -33,6 +33,7 @@ import {
 	resetMergeJobsForTests,
 	settleMergeJobs,
 } from "../team-merge";
+import { setPinnedGithubTarget } from "../team-github-pin";
 import { resetMergingForTests } from "../team-merge-guard";
 import {
 	neutralizeForGithub,
@@ -56,6 +57,7 @@ const USER = "gp-user";
 const NOW = "2026-11-25T00:00:00.000Z";
 const GITHUB_URL = "https://github.com/acme/app.git";
 const PR_URL = "https://github.com/acme/app/pull/7";
+const ACME = { host: "github.com", owner: "acme", repo: "app" };
 
 let temporary: string;
 let repo: string;
@@ -328,11 +330,15 @@ afterEach(async () => {
 	await rm(origin, { recursive: true, force: true });
 });
 
-/** Read the hosting (gh probed through the fake) so requests see GitHub. */
-async function github(head: string, extra: FakeGhPlan = {}) {
+/**
+ * Read the hosting (gh probed through the fake) so requests see GitHub, and confirm the repository
+ * as a project manager would (`pin: false` leaves it unconfirmed).
+ */
+async function github(head: string, extra: FakeGhPlan = {}, pin = true) {
 	await fake.setPlan(plan(head, extra));
 	const hosting = await hostingOf(repo);
 	expect(hosting).toMatchObject({ kind: "github", gh: { ok: true } });
+	if (pin) setPinnedGithubTarget(PROJECT, ACME, USER);
 	await fake.clearCalls();
 }
 

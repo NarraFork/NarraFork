@@ -58,6 +58,7 @@ import { oneLine } from "../../lib/prompts/team-coordinator-notes";
 import {
 	GhError,
 	type GhRepo,
+	ghCompare,
 	ghPrChecks,
 	ghPrCreate,
 	ghPrList,
@@ -78,11 +79,12 @@ import {
 	hostingOf,
 	type ProjectHosting,
 	parseRemoteUrl,
-	readOriginPushUrl,
+	readOriginTarget,
 } from "./team-hosting";
 import {
 	assertTipStill,
 	type GithubJobFacts,
+	githubPinCheck,
 	type JobContext,
 	jobFacts,
 	MergeFailure,
@@ -168,15 +170,21 @@ function quoted(text: string, max = PR_BODY_TEXT_MAX): string {
 	return `${fence}text\n${body}\n${fence}`;
 }
 
-/** Untrusted text on one line as a code span, neutralised. */
-function inline(text: string, max = 200): string {
+/**
+ * Untrusted text on one line as a code span, neutralised: delimited by one backtick more than the
+ * longest run inside it (so nothing in it can end the span), padded with a space on each side
+ * when it starts or ends with a backtick or a space (CommonMark strips one from each side).
+ */
+export function inlineCode(text: string, max = 200): string {
 	const body = neutralizeForGithub(oneLine(text, max));
-	if (!body) return "``";
-	const fence = fenceFor(body).slice(0, -2) || "`";
-	const ticks = fence.length >= 1 && /`/.test(body) ? `${fence}\`` : "`";
-	const pad = body.startsWith("`") || body.endsWith("`") ? " " : "";
+	if (!body) return "`-`";
+	let longest = 0;
+	for (const run of body.match(/`+/g) ?? []) longest = Math.max(longest, run.length);
+	const ticks = "`".repeat(longest + 1);
+	const pad = /^[` ]|[` ]$/.test(body) ? " " : "";
 	return `${ticks}${pad}${body}${pad}${ticks}`;
 }
+const inline = inlineCode;
 
 /** The pull request's title: the item's, on one line, neutralised. */
 export function pullRequestTitle(title: string): string {
@@ -343,15 +351,23 @@ function readyDiffStat(itemId: string): TeamWorkDiffStat | null {
  * is opened there, so the branch must be pushed there).
  */
 async function pushUrlFor(repo: string, target: GhRepo): Promise<string> {
-	const url = await readOriginPushUrl(repo).catch(() => null);
-	const location = url ? parseRemoteUrl(url) : null;
+	let origin: Awaited<ReturnType<typeof readOriginTarget>> = null;
+	try {
+		origin = await readOriginTarget(repo);
+	} catch (error) {
+		if (error instanceof UnsafeRemoteConfigError)
+			throw new MergeFailure("TEAM_REMOTE_CONFIG_UNSAFE", error.message);
+	}
+	// Where origin resolves now (its configured URL, the host's rewrites only), never git's own
+	// `get-url --push`, which a repository `pushurl` or rewrite would redirect.
+	const location = origin ? parseRemoteUrl(origin.resolved) : null;
 	const host = location ? (githubHostOf(location.host) ?? location.host) : null;
-	if (!url || !location || !host || !sameRepository({ ...location, host }, target))
+	if (!origin || !location || !host || !sameRepository({ ...location, host }, target))
 		throw new MergeFailure(
 			"TEAM_PR_REMOTE_CHANGED",
-			`origin no longer pushes to ${repositoryName(target)}; nothing was pushed. Try again once its hosting is read again`,
+			`origin no longer resolves to ${repositoryName(target)}, the repository a person confirmed; nothing was pushed`,
 		);
-	return url;
+	return origin.url;
 }
 
 const ghFailure = (code: string, error: unknown) =>
@@ -415,7 +431,10 @@ export async function runPullRequest(
 	const recorded = latestPullRequest(item.id);
 	if (!open) {
 		// Merged on GitHub at this very head already: nothing to open.
-		const merged = found.find((entry) => entry.state === "MERGED" && entry.headRefOid === head);
+		const merged = found.find(
+			(entry) =>
+				entry.state === "MERGED" && entry.headRefOid === head && entry.baseRefName === prBase,
+		);
 		if (merged) {
 			recordOpened(context, item.id, target, merged, prBase, head, recorded, false);
 			const view = await ghPrView(target, merged.number, signal).catch(() => null);
@@ -556,15 +575,17 @@ export async function runPrMerge(context: JobContext, signal: AbortSignal): Prom
 		userId: context.userId,
 	};
 	if (status.state === "MERGED") {
-		await landed({
-			...landedInput,
-			mergeCommit: status.mergeCommit,
-			headMatches: status.headSha === head,
-			method: null,
-		});
+		// Merged before this click (on GitHub, or by a queue): found, so the system's.
+		await mergedPullRequest({ ...landedInput, target, status, method: null, userId: null, signal });
 		return;
 	}
 	const link = ` (${record.url})`;
+	const prBase = baseBranchOf(base).branch;
+	if (status.baseRef !== prBase)
+		throw new MergeFailure(
+			"TEAM_PR_BASE_MISMATCH",
+			`Pull request #${record.number} targets ${status.baseRef ?? "another base"}, not ${prBase}; nothing was merged. Retarget it on GitHub${link}`,
+		);
 	if (status.state === "CLOSED")
 		throw new MergeFailure(
 			"TEAM_PR_CLOSED",
@@ -629,12 +650,7 @@ export async function runPrMerge(context: JobContext, signal: AbortSignal): Prom
 	}
 	const after = await readPullRequest(target, record, item.id, signal).catch(() => null);
 	if (after?.state === "MERGED") {
-		await landed({
-			...landedInput,
-			mergeCommit: after.mergeCommit,
-			headMatches: after.headSha === head,
-			method,
-		});
+		await mergedPullRequest({ ...landedInput, target, status: after, method, signal });
 		return;
 	}
 	// Accepted, not merged: a merge queue (or auto-merge) holds it. The background pass sees it land.
@@ -667,6 +683,7 @@ async function recordConflict(input: {
 	userId: string | null;
 	/** A member's 「合并 PR」: recorded even when this conflict was already (it answers the click). */
 	always?: boolean;
+	signal?: AbortSignal;
 }): Promise<void> {
 	const latest = db
 		.select({ detail: teamWorkEvents.detailJson })
@@ -682,8 +699,16 @@ async function recordConflict(input: {
 		.get()?.detail;
 	const already =
 		latest?.code === "conflict" && latest.pr === input.record.number && latest.head === input.head;
+	// Recorded already, and nobody asked: no fetch, no merge-tree on every pass.
+	if (already && !input.always) return;
 	const branchName = baseBranchOf(input.base).branch;
-	const listed = await conflictingFiles(input.repo, input.git, branchName, input.head);
+	const listed = await conflictingFiles(
+		input.repo,
+		input.git,
+		branchName,
+		input.head,
+		input.signal,
+	);
 	if (!already || input.always)
 		recordWorkEvent(db, {
 			teamId: input.teamId,
@@ -726,10 +751,12 @@ async function recordConflict(input: {
 /** The files the head conflicts with in `origin/<base>` (a hardened `merge-tree`); null unknown. */
 async function conflictingFiles(
 	repo: string,
-	git: TeamRepoGit,
+	given: TeamRepoGit,
 	branch: string,
 	head: string,
+	signal?: AbortSignal,
 ): Promise<{ conflicts: string[]; more: boolean } | null> {
+	const git = signal ? teamRepoGit(repo, { signal }) : given;
 	try {
 		await fetchOnce(repo, branch, () =>
 			git.fetchBaseFromOrigin(branch).catch((error: unknown) => ({
@@ -740,11 +767,22 @@ async function conflictingFiles(
 		if (!supportsMergeTree(await gitVersion())) return null;
 		const base = await git.resolve(remoteTrackingRef(branch));
 		if (!base) return null;
+		// The same head against the same base gives the same files: computed once.
+		const key = `${repo}\0${head}\0${base}`;
+		const cached = state.conflicts.get(key);
+		if (cached) return cached;
 		await assertNoReplacedHistory(repo, [base, head]);
 		const merged = await git.mergeTree(base, head);
-		return merged.clean
+		const listed = merged.clean
 			? { conflicts: [], more: true }
 			: { conflicts: merged.conflicts.slice(0, TEAM_MERGE_CONFLICTS_MAX), more: merged.more };
+		state.conflicts.set(key, listed);
+		state.conflictRuns++;
+		if (state.conflicts.size > 200) {
+			const oldest = state.conflicts.keys().next().value;
+			if (oldest !== undefined) state.conflicts.delete(oldest);
+		}
+		return listed;
 	} catch (error) {
 		logger.debug("Conflicting files of a pull request could not be listed", {
 			error: error instanceof Error ? error.message : String(error),
@@ -754,6 +792,75 @@ async function conflictingFiles(
 }
 
 // ── Merged ──────────────────────────────────────────────────────────────────
+
+/**
+ * A merged pull request: the item's merge only when it merged the item's ready head into the
+ * item's base — GitHub merged exactly that head, or a head the ready head is inside (`gh api
+ * …/compare`, `ahead` or `identical`). A pull request merged at an older head (the item was
+ * returned and made ready again since), or into another base, is not: it is recorded as closed
+ * for this item (`work.pr_closed {merged: true}`, once) and the item stays ready, offering
+ * 「重新发起 PR」.
+ */
+async function mergedPullRequest(input: {
+	item: WorkItemRow;
+	teamId: string;
+	projectId: string;
+	repo: string;
+	base: string;
+	record: PullRequestRecord;
+	target: GhRepo;
+	status: Pick<PrStatus, "headSha" | "baseRef" | "mergeCommit">;
+	method: TeamPrMergeMethod | null;
+	userId: string | null;
+	signal?: AbortSignal;
+}): Promise<boolean> {
+	const head = input.item.headSha;
+	if (!head) return false;
+	const prBase = baseBranchOf(input.base).branch;
+	let verdict: "merged" | "other_base" | "older_head" = "older_head";
+	let headMatches = false;
+	if (input.status.baseRef !== prBase) verdict = "other_base";
+	else if (input.status.headSha === head) {
+		verdict = "merged";
+		headMatches = true;
+	} else if (input.status.headSha) {
+		const relation = await ghCompare(input.target, head, input.status.headSha, input.signal).catch(
+			() => null,
+		);
+		if (relation === "ahead" || relation === "identical") verdict = "merged";
+	}
+	if (verdict === "merged")
+		return landed({
+			item: input.item,
+			teamId: input.teamId,
+			projectId: input.projectId,
+			repo: input.repo,
+			base: input.base,
+			record: input.record,
+			mergeCommit: input.status.mergeCommit,
+			headMatches,
+			method: input.method,
+			userId: input.userId,
+		});
+	if (!latestPrEvent(input.item.id, "work.pr_closed", input.record.number))
+		recordWorkEvent(db, {
+			teamId: input.teamId,
+			workItemId: input.item.id,
+			kind: "work.pr_closed",
+			actor: { kind: "system", id: null },
+			detail: {
+				pr: input.record.number,
+				url: input.record.url,
+				merged: true,
+				reason: verdict,
+				head: input.status.headSha,
+				base: input.status.baseRef,
+			},
+		});
+	forgetPrStatus(input.item.id);
+	eventBus.emit({ type: "team:communication_changed", teamId: input.teamId });
+	return false;
+}
 
 /**
  * The pull request is merged: record it (the one writer, in a transaction), fetch
@@ -812,7 +919,7 @@ async function landed(input: {
 
 /** Fetch origin's base (remote-tracking ref only), then look at queued dependents again. */
 function afterMerge(projectId: string, repo: string, branch: string): void {
-	const git = teamRepoGit(repo);
+	const git = teamRepoGit(repo, { signal: state.controller.signal });
 	const work = fetchOnce(repo, branch, () =>
 		git.fetchBaseFromOrigin(branch).catch((error: unknown) => ({
 			ok: false as const,
@@ -861,20 +968,36 @@ const state = hotSafe("narrafork.teams.prReads", () => ({
 	pending: new Map<string, Promise<PrStatus | null>>(),
 	afterMerge: new Set<Promise<void>>(),
 	cursor: "",
+	/** Conflicting files per repository, head and base commit. */
+	conflicts: new Map<string, { conflicts: string[]; more: boolean }>(),
+	/** How many `merge-tree` runs listed conflicts (tests). */
+	conflictRuns: 0,
+	/** Aborted when the background pass stops: every read and fetch it started ends. */
+	controller: new AbortController(),
 }));
 
-/** Run `read` when one of the {@link READS_AT_ONCE} read slots is free. */
+/** How many times conflicting files were computed (tests). */
+export const conflictRunsForTests = () => state.conflictRuns;
+
+/**
+ * Run `read` when one of the {@link READS_AT_ONCE} read slots is free. A slot given back is
+ * handed straight to the next waiter (the count stays), so no newcomer slips in between.
+ */
 async function withReadSlot<T>(read: () => Promise<T>): Promise<T> {
 	if (state.active >= READS_AT_ONCE)
 		await new Promise<void>((resolve) => state.waiting.push(resolve));
-	state.active++;
+	else state.active++;
 	try {
 		return await read();
 	} finally {
-		state.active--;
-		state.waiting.shift()?.();
+		const next = state.waiting.shift();
+		if (next) next();
+		else state.active--;
 	}
 }
+
+/** The read slots in use and waiting (tests). */
+export const readSlotsForTests = () => ({ active: state.active, waiting: state.waiting.length });
 
 /** `gh pr view` and, while open, `gh pr checks` (one read slot), stored in the cache. */
 async function readPullRequest(
@@ -905,11 +1028,13 @@ async function readPullRequest(
  */
 export function refreshPullRequest(
 	itemId: string,
-	options: { force?: boolean } = {},
+	options: { force?: boolean; poll?: boolean } = {},
 ): Promise<PrStatus | null> {
 	const running = state.pending.get(itemId);
 	if (running) return running;
-	const work = refreshNow(itemId, options).catch((error: unknown) => {
+	// Every read, and what it fetches, ends when the background pass stops.
+	const signal = state.controller.signal;
+	const work = refreshNow(itemId, options, signal).catch((error: unknown) => {
 		logger.debug("A pull request could not be read", {
 			workItemId: itemId,
 			error: error instanceof Error ? error.message : String(error),
@@ -925,7 +1050,12 @@ export function refreshPullRequest(
 	return work;
 }
 
-async function refreshNow(itemId: string, options: { force?: boolean }): Promise<PrStatus | null> {
+async function refreshNow(
+	itemId: string,
+	options: { force?: boolean; poll?: boolean },
+	signal: AbortSignal,
+): Promise<PrStatus | null> {
+	signal.throwIfAborted();
 	if (isMerging(itemId)) return null;
 	const facts = itemFacts(itemId);
 	if (!facts) return null;
@@ -933,14 +1063,20 @@ async function refreshNow(itemId: string, options: { force?: boolean }): Promise
 	if (!record) return null;
 	if (!options.force && prStatusFresh(itemId, record.number))
 		return peekPrStatus(itemId, record.number)?.status ?? null;
+	// The pass does not keep reading a pull request it already took as closed for this item.
+	if (options.poll && latestPrEvent(itemId, "work.pr_closed", record.number)) return null;
 	const repo = repositoryOf(facts.item.projectId);
 	if (!repo) return null;
 	const hosting = await hostingOf(repo);
 	if (hosting.kind !== "github" || !hosting.gh?.ok) return null;
 	const target = githubTarget(hosting);
-	if (!isGhRepo(record) || !sameRepository(record, target)) {
+	// gh only ever reads the repository a person confirmed, while origin still resolves to it.
+	const pin = githubPinCheck(facts.item.projectId, hosting);
+	if (pin.refusal || !isGhRepo(record) || !sameRepository(record, target)) {
 		storePrStatus(itemId, record.number, {
-			error: `origin is ${repositoryName(target)} now, not ${repositoryName(record)}`,
+			error:
+				pin.refusal?.message ??
+				`origin is ${repositoryName(target)} now, not ${repositoryName(record)}`,
 		});
 		return null;
 	}
@@ -948,7 +1084,7 @@ async function refreshNow(itemId: string, options: { force?: boolean }): Promise
 	eventBus.emit({ type: "team:communication_changed", teamId: facts.item.teamId });
 	let status: PrStatus;
 	try {
-		status = await readPullRequest(target, record, itemId);
+		status = await readPullRequest(target, record, itemId, signal);
 	} catch (error) {
 		storePrStatus(itemId, record.number, {
 			error: error instanceof Error ? error.message : String(error),
@@ -957,7 +1093,7 @@ async function refreshNow(itemId: string, options: { force?: boolean }): Promise
 		return null;
 	}
 	// A job took the item meanwhile: it acts on what it reads itself.
-	if (!isMerging(itemId)) await applyTransitions(facts, record, status, repo);
+	if (!isMerging(itemId)) await applyTransitions(facts, record, status, repo, target, signal);
 	eventBus.emit({ type: "team:communication_changed", teamId: facts.item.teamId });
 	return status;
 }
@@ -981,22 +1117,25 @@ async function applyTransitions(
 	record: PullRequestRecord,
 	status: PrStatus,
 	repo: string,
+	target: GhRepo,
+	signal: AbortSignal,
 ): Promise<void> {
 	const { item } = facts;
 	const head = item.headSha;
 	if (!head) return;
 	if (status.state === "MERGED") {
-		await landed({
+		await mergedPullRequest({
 			item,
 			teamId: item.teamId,
 			projectId: item.projectId,
 			repo,
 			base: facts.base,
 			record,
-			mergeCommit: status.mergeCommit,
-			headMatches: status.headSha === head,
+			target,
+			status,
 			method: null,
 			userId: null,
+			signal,
 		});
 		return;
 	}
@@ -1013,15 +1152,29 @@ async function applyTransitions(
 			});
 		return;
 	}
+	// Retargeted to another base on GitHub: no longer this item's pull request.
+	if (status.baseRef !== baseBranchOf(facts.base).branch) {
+		if (!latestPrEvent(item.id, "work.pr_closed", record.number))
+			recordWorkEvent(db, {
+				teamId: item.teamId,
+				workItemId: item.id,
+				kind: "work.pr_closed",
+				actor: { kind: "system", id: null },
+				detail: { pr: record.number, url: record.url, reason: "other_base", base: status.baseRef },
+				at: now,
+			});
+		return;
+	}
 	// Open, and carrying the ready head: only its own checks and review matter.
 	if (status.headSha !== head) return;
 	if (status.mergeState === "DIRTY") {
 		await recordConflict({
+			signal,
 			teamId: item.teamId,
 			item,
 			record,
 			repo,
-			git: teamRepoGit(repo),
+			git: teamRepoGit(repo, { signal }),
 			base: facts.base,
 			head,
 			branch: item.branchName ?? "",
@@ -1091,7 +1244,18 @@ export function requestPrRefresh(input: {
 	teamId: string;
 	itemId: string;
 }): TeamWorkPrRefreshResponse {
-	// Only a read: allowed while the worker runs, refused for anything not ready.
+	// Only a read: allowed while the worker runs, refused for anything not ready and, like the
+	// merge, for an archived team.
+	const team = db
+		.select({ status: projectTeams.status, coordinator: narrators.status })
+		.from(projectTeams)
+		.innerJoin(narrators, eq(narrators.id, projectTeams.narratorId))
+		.where(eq(projectTeams.narratorId, input.teamId))
+		.limit(1)
+		.get();
+	if (!team) throw new NotFoundError("Team", input.teamId);
+	if (team.status !== "active" || team.coordinator === "archived")
+		throw new AppError("This team is archived; nothing can change", 409, "TEAM_ARCHIVED");
 	const item = db
 		.select({ id: teamWorkItems.id, state: teamWorkItems.state })
 		.from(teamWorkItems)
@@ -1166,7 +1330,7 @@ export async function runPrPollPass(): Promise<number> {
 			...all.filter((id) => !batch.includes(id)).slice(0, POLL_BATCH - batch.length),
 		];
 	state.cursor = batch.at(-1) ?? "";
-	await Promise.all(batch.map((id) => refreshPullRequest(id)));
+	await Promise.all(batch.map((id) => refreshPullRequest(id, { poll: true })));
 	return batch.length;
 }
 
@@ -1180,10 +1344,18 @@ export function resetPullRequestWorkForTests(): void {
 	state.cursor = "";
 	state.pending.clear();
 	state.afterMerge.clear();
+	state.conflicts.clear();
+	state.conflictRuns = 0;
+	if (state.controller.signal.aborted) state.controller = new AbortController();
 }
+
+/** How long a stop waits for reads and fetches to end after aborting them. */
+const STOP_WAIT_MS = 5_000;
 
 /** Startup: the background pass every minute. Returns the stop function. */
 export function startTeamPrPoller(): () => Promise<void> {
+	if (state.controller.signal.aborted) state.controller = new AbortController();
+	const controller = state.controller;
 	let stopped = false;
 	let current: Promise<unknown> = Promise.resolve();
 	let timer: ReturnType<typeof setTimeout> | null = null;
@@ -1203,7 +1375,18 @@ export function startTeamPrPoller(): () => Promise<void> {
 	return async () => {
 		stopped = true;
 		if (timer) clearTimeout(timer);
-		await current;
-		await settlePullRequestWork();
+		// Every gh and git the pass started is killed; the wait for them is bounded all the same.
+		controller.abort(new Error("The team pull request pass stopped"));
+		let waited: ReturnType<typeof setTimeout> | null = null;
+		await Promise.race([
+			Promise.allSettled([current, settlePullRequestWork()]),
+			new Promise<void>((resolve) => {
+				waited = setTimeout(resolve, STOP_WAIT_MS);
+			}),
+		]);
+		if (waited) clearTimeout(waited);
 	};
 }
+
+/** The read slots themselves (tests: the hand-over leaves no gap for a newcomer). */
+export const withReadSlotForTests = withReadSlot;

@@ -63,7 +63,7 @@ import { ValidationError } from "../../lib/errors";
 import { canManageNarratorAcl, type NarratorPrincipal } from "../narrator-acl";
 import { shouldHidePendingPermission } from "../pending-permission-visibility";
 import { readTeamMembers } from "./team-members";
-import { canMergeInProject, mergeSummaryOf } from "./team-merge";
+import { canManageProjectOf, canMergeInProject, mergeSummaryOf } from "./team-merge";
 import { loadTeamForAccess } from "./team-service";
 import { readDependencies } from "./work-item-dependencies";
 
@@ -457,6 +457,7 @@ function withMerge<T extends TeamBoardItem>(
 	items: T[],
 	teamOf: (item: T) => { teamActive: boolean; baseBranch: string; projectId: string } | null,
 	member: boolean,
+	manager = false,
 ): T[] {
 	return items.map((item) => {
 		if (item.state !== "ready") return item;
@@ -465,11 +466,19 @@ function withMerge<T extends TeamBoardItem>(
 		return {
 			...item,
 			merge: mergeSummaryOf({
-				item: { id: item.id, state: item.state, baseRef: item.baseRef, projectId: team.projectId },
+				item: {
+					id: item.id,
+					state: item.state,
+					baseRef: item.baseRef,
+					projectId: team.projectId,
+					// Abbreviated on a card: compared by prefix with the pull request's head.
+					headSha: item.headSha,
+				},
 				baseBranch: team.baseBranch,
 				teamActive: team.teamActive,
 				workerRunning: item.worker?.status === "working" || item.worker?.status === "waiting",
 				member,
+				manager,
 			}),
 		};
 	});
@@ -727,10 +736,12 @@ export async function readTeamBoardColumn(
 		access === "write" &&
 		cards.some((card) => card.state === "ready") &&
 		(await canMergeInProject(team.projectId, principal));
+	const manager = mayMerge && (await canManageProjectOf(team.projectId, principal));
 	const items: TeamBoardItem[] = withMerge(
 		cards,
 		() => ({ teamActive, baseBranch: team.baseBranch, projectId: team.projectId }),
 		mayMerge,
+		manager,
 	);
 	const last = page.at(-1);
 	return {

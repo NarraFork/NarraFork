@@ -552,6 +552,64 @@ export function assertPushUrlUntouched(entries: readonly ScopedConfigEntry[], ur
 	}
 }
 
+/** Origin's URL and every rewrite that could apply to it. */
+const ORIGIN_PATTERN = "^(remote\\.origin\\.(url|pushurl)|url\\..*\\.(insteadof|pushinsteadof))$";
+
+/** Where origin is: its configured URL, and that URL as the host's rewrites leave it. */
+export interface OriginTarget {
+	url: string;
+	resolved: string;
+}
+
+/**
+ * The URL a set of `url.<base>.<key>` entries rewrites `url` to: the longest matching prefix wins
+ * (git's rule), and the URL is returned as it is when none matches.
+ */
+function rewritten(
+	url: string,
+	entries: readonly ScopedConfigEntry[],
+	key: "insteadof" | "pushinsteadof",
+): string | null {
+	let best: { base: string; prefix: string } | null = null;
+	for (const entry of entries) {
+		const lower = entry.key.toLowerCase();
+		if (!lower.startsWith("url.") || !lower.endsWith(`.${key}`)) continue;
+		const prefix = entry.value;
+		if (!prefix || !url.startsWith(prefix)) continue;
+		if (!best || prefix.length > best.prefix.length)
+			best = { base: entry.key.slice("url.".length, entry.key.length - key.length - 1), prefix };
+	}
+	return best ? best.base + url.slice(best.prefix.length) : null;
+}
+
+/** See {@link TeamRepoGit.originTarget}. */
+export function originTargetOf(entries: readonly ScopedConfigEntry[]): OriginTarget | null {
+	const pushurl = entries.find((entry) => entry.key.toLowerCase() === "remote.origin.pushurl");
+	// Where a push goes is origin's URL, and only that: a push URL of any scope is refused.
+	if (pushurl) throw new UnsafeRemoteConfigError(pushurl.key);
+	const urls = entries.filter((entry) => entry.key.toLowerCase() === "remote.origin.url");
+	if (urls.length === 0) return null;
+	if (urls.length > 1) throw new UnsafeRemoteConfigError("remote.origin.url");
+	const url = urls[0]?.value.trim() ?? "";
+	if (!url) return null;
+	for (const entry of entries) {
+		if (!isRepositoryScope(entry.scope)) continue;
+		const lower = entry.key.toLowerCase();
+		if (
+			lower.startsWith("url.") &&
+			(lower.endsWith(".insteadof") || lower.endsWith(".pushinsteadof")) &&
+			entry.value &&
+			url.startsWith(entry.value)
+		)
+			throw new UnsafeRemoteConfigError(entry.key);
+	}
+	const host = entries.filter((entry) => HOST_SCOPES.has(entry.scope));
+	// For a push git applies `pushInsteadOf` first, `insteadOf` only when none matched.
+	const resolved =
+		rewritten(url, host, "pushinsteadof") ?? rewritten(url, host, "insteadof") ?? url;
+	return { url, resolved };
+}
+
 /** A URL with any userinfo (`user:token@`) removed, for messages. */
 export function redactUserinfo(text: string): string {
 	return text.replace(/([a-z][a-z0-9+.-]*:\/\/)[^/@\s'"]+@/gi, "$1");
@@ -604,8 +662,15 @@ export type FastForwardBaseResult =
 
 /** The hardened, writing git of one repository (the project's main checkout). */
 export interface TeamRepoGit {
-	/** `git remote get-url --push origin` (insteadOf and pushurl applied); null without origin. */
-	originPushUrl(): Promise<string | null>;
+	/**
+	 * G: where origin is, from the raw configuration (`--show-scope`), never from git's own
+	 * rewriting: `url` is `remote.origin.url` as configured (what is pushed to), `resolved` the
+	 * same with only the host's (system/global) `pushInsteadOf` / `insteadOf` applied, as git
+	 * applies them to that push. Refused (`TEAM_REMOTE_CONFIG_UNSAFE`) when a `remote.origin
+	 * .pushurl` is configured, origin has several URLs, or the repository's own `insteadOf` /
+	 * `pushInsteadOf` rewrites origin's URL. Null without origin.
+	 */
+	originTarget(): Promise<OriginTarget | null>;
 	resolve(ref: string): Promise<string | null>;
 	/** Refuse a shallow repository or one with a graft file (`TEAM_GIT_HISTORY_ALTERED`). */
 	assertTrueHistory(): Promise<void>;
@@ -717,15 +782,8 @@ export function teamRepoGit(repo: string, options: { signal?: AbortSignal } = {}
 	};
 
 	return {
-		async originPushUrl() {
-			const result = await read(["remote", "get-url", "--push", "origin"], {
-				maxOutputBytes: 16 * 1024,
-			});
-			// Exit 2: no such remote.
-			if (result.exitCode === 2) return null;
-			if (result.exitCode !== 0 || result.truncated)
-				throw new GitError("git remote could not read origin");
-			return result.stdout.trim() || null;
+		async originTarget() {
+			return originTargetOf(await scopedConfig(repo, ORIGIN_PATTERN, signal));
 		},
 		resolve,
 		assertTrueHistory: () => assertTrueHistory(repo),

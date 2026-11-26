@@ -626,7 +626,10 @@
 					"gh_logged_out": "在主机上运行 gh auth login",
 					"gh_no_permission": "gh 账号对该仓库没有写权限",
 					"gh_repo_archived": "仓库在 GitHub 上已归档",
-					"gh_unavailable": "gh 读不到这个仓库（离线、找不到或出错），稍后再试"
+					"gh_unavailable": "gh 读不到这个仓库（离线、找不到或出错），稍后再试",
+					"github_unconfirmed": "需要项目管理员先确认 GitHub 仓库（第一次「发起 PR」时会请他确认）。",
+					"github_target_changed": "origin 现在指向的不是已确认的仓库；项目管理员在项目设置里确认之前什么都不推送。",
+					"remote_config_unsafe": "仓库自己的 git 配置改写了 origin（推送地址或 URL 改写），NarraFork 不带它推送或合并。请把该设置移到全局配置。"
 				},
 				"blocker": {
 					"stale": "准备合并后 {{base}} 又动了：请重新准备。",
@@ -682,7 +685,8 @@
 					"TEAM_PR_BEHIND": "PR 落后于基线：先把基线合进来。",
 					"TEAM_PR_STATE_UNKNOWN": "GitHub 还没算出能否合并，稍后再试。",
 					"TEAM_PR_METHOD_NOT_ALLOWED": "仓库不允许这种合并方式。",
-					"TEAM_PR_MERGE_FAILED": "gh 没能合并 PR。请在 GitHub 上查看。"
+					"TEAM_PR_MERGE_FAILED": "gh 没能合并 PR。请在 GitHub 上查看。",
+					"TEAM_PR_TARGET_UNCONFIRMED": "需要项目管理员先确认 GitHub 仓库。"
 				},
 				"shell": {
 					"sh": "Git Bash / sh",
@@ -738,7 +742,12 @@
 					"queued": "已加入合并队列。",
 					"closed": "PR 已关闭。",
 					"no_method": "仓库不允许任何合并方式。"
-				}
+				},
+				"confirmGithubTitle": "确认 GitHub 仓库",
+				"confirmGithubText": "将推送到 {{target}} 并在那里开 PR。",
+				"confirmGithubHint": "origin 的地址来自仓库自己的 git 配置，agent 可以改它，所以由项目管理员确认一次。之后只要 origin 指向别处就什么都不推送；可以在项目设置里改。",
+				"confirmGithubButton": "确认并发起 PR",
+				"openProjectSettings": "打开项目设置"
 			}
 		}
 	},
@@ -859,7 +868,14 @@
 			"baseBranchHint": "新团队把工作合并到这个分支。每个团队可以自己改。",
 			"workStart": "新工作项的起点",
 			"workStartHint": "每个团队可以在团队设置里自己改。",
-			"auto": "自动：origin 在 GitHub 上时从 origin 开始，否则从本地分支"
+			"auto": "自动：origin 在 GitHub 上时从 origin 开始，否则从本地分支",
+			"github": "PR 使用的 GitHub 仓库",
+			"githubPinned": "已确认：{{target}}",
+			"githubUnpinned": "尚未确认：第一次「发起 PR」时会请项目管理员确认。",
+			"githubDiffers": "origin 现在指向 {{detected}}，不是 {{target}}：再次确认之前什么都不推送。",
+			"githubConfirm": "确认为 {{target}}",
+			"githubClear": "清除",
+			"githubHint": "agent 能改仓库配置里 origin 的地址，所以 PR 只发到管理员确认过的仓库。"
 		}
 	}
 }

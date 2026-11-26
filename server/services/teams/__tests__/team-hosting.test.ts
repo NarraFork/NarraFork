@@ -111,7 +111,7 @@ describe("the push URL", () => {
 		);
 	});
 
-	test("insteadOf and pushurl are applied by git itself: the URL read is the one pushed to", async () => {
+	test("origin from the raw configuration: the host's rewrites apply, the repository's own never do", async () => {
 		const repo = await realpath(await mkdtemp(join(temporary, "repo-")));
 		await git(["init", "-q", "-b", "main"], repo);
 		await git(["remote", "add", "origin", "gh:acme/app"], repo);
@@ -120,22 +120,49 @@ describe("the push URL", () => {
 			'[user]\n\tname = Host\n\temail = h@e.test\n[url "git@github.com:"]\n\tinsteadOf = gh:\n',
 		);
 		try {
-			const url = await teamRepoGit(repo).originPushUrl();
-			expect(url).toBe("git@github.com:acme/app");
-			expect(hostingOfUrl(url)).toMatchObject({ kind: "github", owner: "acme", repo: "app" });
-			await git(
-				["remote", "set-url", "--push", "origin", "https://ghe.acme.test/team/app.git"],
-				repo,
-			);
-			expect(await teamRepoGit(repo).originPushUrl()).toBe("https://ghe.acme.test/team/app.git");
+			// The host's shorthand resolves; the URL pushed to stays the configured one (git
+			// applies the same host rewrite when it pushes).
+			expect(await teamRepoGit(repo).originTarget()).toEqual({
+				url: "gh:acme/app",
+				resolved: "git@github.com:acme/app",
+			});
+			expect(hostingOfUrl("git@github.com:acme/app")).toMatchObject({ kind: "github" });
+			// A push URL of the repository's own: refused, never followed.
+			await git(["remote", "set-url", "--push", "origin", "https://evil.example/x/app.git"], repo);
+			await expect(teamRepoGit(repo).originTarget()).rejects.toMatchObject({
+				code: "TEAM_REMOTE_CONFIG_UNSAFE",
+				key: "remote.origin.pushurl",
+			});
+			await git(["config", "--unset", "remote.origin.pushurl"], repo);
+			// Its own rewrites of origin's URL: refused.
+			for (const key of ["insteadOf", "pushInsteadOf"]) {
+				await git(["config", `url.https://evil.example/.${key}`, "gh:"], repo);
+				await expect(teamRepoGit(repo).originTarget()).rejects.toMatchObject({
+					code: "TEAM_REMOTE_CONFIG_UNSAFE",
+				});
+				await git(["config", "--remove-section", "url.https://evil.example/"], repo);
+			}
+			// Two URLs: which one is meant cannot be told.
+			await git(["config", "--add", "remote.origin.url", "git@github.com:evil/app"], repo);
+			await expect(teamRepoGit(repo).originTarget()).rejects.toMatchObject({
+				code: "TEAM_REMOTE_CONFIG_UNSAFE",
+			});
 			await git(["remote", "remove", "origin"], repo);
-			expect(await teamRepoGit(repo).originPushUrl()).toBeNull();
+			expect(await teamRepoGit(repo).originTarget()).toBeNull();
 		} finally {
 			await writeFile(
 				process.env.GIT_CONFIG_GLOBAL ?? "",
 				"[user]\n\tname = Host\n\temail = h@e.test\n",
 			);
 		}
+	});
+
+	test("a redirected origin is `unsafe`: never GitHub, never local, read again soon", async () => {
+		const repo = await realpath(await mkdtemp(join(temporary, "repo-")));
+		await git(["init", "-q", "-b", "main"], repo);
+		await git(["remote", "add", "origin", "git@github.com:acme/app.git"], repo);
+		await git(["config", "remote.origin.pushurl", "git@github.com:evil/app.git"], repo);
+		expect(await hostingOf(repo)).toEqual({ kind: "unsafe", key: "remote.origin.pushurl" });
 	});
 });
 

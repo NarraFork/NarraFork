@@ -148,6 +148,9 @@ export const teamWorkDiffQuerySchema = z.object({
 	path: z.string().min(1).max(4096),
 });
 
+/** G: `PUT /projects/:projectId/team-github`: the repository a manager confirms (`host/owner/repo`). */
+export const teamGithubPinSchema = z.object({ target: z.string().trim().min(5).max(400) }).strict();
+
 /** G: `POST …/work/:itemId/pr/merge`: the merge method (absent: the repository's default). */
 export const mergeTeamPullRequestSchema = z
 	.object({ method: z.enum(TEAM_PR_MERGE_METHODS).optional() })

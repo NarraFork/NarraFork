@@ -626,7 +626,10 @@
 					"gh_logged_out": "Run gh auth login on the host.",
 					"gh_no_permission": "The gh account has no write access to this repository.",
 					"gh_repo_archived": "The repository is archived on GitHub.",
-					"gh_unavailable": "gh could not read this repository (offline, not found or an error); try again shortly."
+					"gh_unavailable": "gh could not read this repository (offline, not found or an error); try again shortly.",
+					"github_unconfirmed": "A project manager confirms the GitHub repository first (the first 「Open a pull request」 asks them).",
+					"github_target_changed": "Origin now points to another repository than the one confirmed; nothing is pushed until a project manager confirms it in the project settings.",
+					"remote_config_unsafe": "The repository's own git configuration redirects origin (a push URL or a URL rewrite); NarraFork does not push or merge with it. Move that setting to the global configuration."
 				},
 				"blocker": {
 					"stale": "{{base}} moved since the merge was prepared: prepare it again.",
@@ -682,7 +685,8 @@
 					"TEAM_PR_BEHIND": "The pull request is behind its base: bring the base in first.",
 					"TEAM_PR_STATE_UNKNOWN": "GitHub has not worked out whether it can merge yet; try again shortly.",
 					"TEAM_PR_METHOD_NOT_ALLOWED": "The repository does not allow that merge method.",
-					"TEAM_PR_MERGE_FAILED": "gh could not merge the pull request. See the pull request on GitHub."
+					"TEAM_PR_MERGE_FAILED": "gh could not merge the pull request. See the pull request on GitHub.",
+					"TEAM_PR_TARGET_UNCONFIRMED": "A project manager confirms the GitHub repository first."
 				},
 				"shell": {
 					"sh": "Git Bash / sh",
@@ -738,7 +742,12 @@
 					"queued": "Already queued to merge.",
 					"closed": "The pull request is closed.",
 					"no_method": "The repository allows no merge method."
-				}
+				},
+				"confirmGithubTitle": "Confirm the GitHub repository",
+				"confirmGithubText": "This pushes to {{target}} and opens the pull request there.",
+				"confirmGithubHint": "Origin's address comes from the repository's own git configuration, which agents can change, so a project manager confirms it once. From then on nothing is pushed while origin points anywhere else; it can be changed in the project settings.",
+				"confirmGithubButton": "Confirm and open the pull request",
+				"openProjectSettings": "Open the project settings"
 			}
 		}
 	},
@@ -862,7 +871,14 @@
 			"baseBranchHint": "New teams merge their work into this branch. Each team can change its own.",
 			"workStart": "New work items start from",
 			"workStartHint": "Each team can change this in its settings.",
-			"auto": "Automatic: origin when it is on GitHub, otherwise the local branch"
+			"auto": "Automatic: origin when it is on GitHub, otherwise the local branch",
+			"github": "GitHub repository for pull requests",
+			"githubPinned": "Confirmed: {{target}}",
+			"githubUnpinned": "Not confirmed yet: the first 「Open a pull request」 asks a project manager.",
+			"githubDiffers": "Origin now points to {{detected}}, not {{target}}: nothing is pushed until it is confirmed again.",
+			"githubConfirm": "Confirm {{target}}",
+			"githubClear": "Clear",
+			"githubHint": "Agents can change origin's address in the repository's configuration, so pull requests only go to a repository a manager confirmed."
 		}
 	}
 }

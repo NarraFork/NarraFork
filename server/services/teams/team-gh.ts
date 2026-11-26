@@ -14,7 +14,9 @@
  *   and the spinner are off.
  * - **Which subcommands.** `--version`, `auth status --json hosts`, `repo view --json`, `pr list
  *   --head --json`, `pr create --head --base --title --body-file -`, `pr view --json`, `pr checks
- *   --json` and `pr merge --<method> --match-head-commit`. None pushes or touches a local
+ *   --json`, `pr merge --<method> --match-head-commit` and `api --hostname H
+ *   repos/<o>/<r>/compare/<a>...<b>` (an explicit path, never a `{owner}` placeholder, which
+ *   gh would fill from a local repository). None pushes or touches a local
  *   repository: `pr create` always names `--head` (without it gh would push), `pr merge` never
  *   gets `--delete-branch` (which deletes local branches) or `--admin`, and `pr checkout` is never
  *   used.
@@ -179,10 +181,12 @@ async function prepareWorkDir(): Promise<string> {
 		await mkdir(dir, { recursive: true, mode: 0o700 });
 		preparedDir = dir;
 	}
-	// Nothing in it may look like a repository to a git gh starts.
+	// Nothing in it may look like a repository to a git gh starts: no `.git`, and nothing at the
+	// path `GIT_DIR` names (which must not exist).
 	const entries = await readdir(dir).catch(() => [] as string[]);
-	if (entries.includes(".git"))
-		throw new GhError("failed", "gh's working directory holds a .git; it is not used");
+	for (const planted of [".git", "no-repository"])
+		if (entries.includes(planted))
+			throw new GhError("failed", `gh's working directory holds ${planted}; it is not used`);
 	return dir;
 }
 
@@ -606,4 +610,34 @@ export async function ghPrMerge(
 		],
 		{ timeout: PR_MERGE_TIMEOUT_MS, maxOutputBytes: PR_VIEW_BYTES, signal },
 	);
+}
+
+const compareSchema = z.enum(["ahead", "behind", "identical", "diverged"]);
+
+/**
+ * How `head` relates to `base` on GitHub (`gh api repos/<o>/<r>/compare/<base>...<head>`, only
+ * its `status`): `ahead` or `identical` means `base` is inside `head`. Either commit missing on
+ * GitHub is a `GhError` (404).
+ */
+export async function ghCompare(
+	target: GhRepo,
+	base: string,
+	head: string,
+	signal?: AbortSignal,
+): Promise<z.infer<typeof compareSchema>> {
+	if (!SHA.test(base) || !SHA.test(head)) throw new GhError("invalid", "Expected full commit SHAs");
+	if (!isGhRepo(target)) throw new GhError("invalid", "Not a GitHub repository name");
+	const result = await runGh(
+		[
+			"api",
+			`--hostname=${target.host}`,
+			"--method=GET",
+			`repos/${target.owner}/${target.repo}/compare/${base}...${head}?per_page=1`,
+			"--jq=.status",
+		],
+		{ timeout: PR_LIST_TIMEOUT_MS, maxOutputBytes: 4096, signal },
+	);
+	const parsed = compareSchema.safeParse(result.stdout.trim());
+	if (!parsed.success) throw new GhError("invalid", "gh api compare answered unexpectedly");
+	return parsed.data;
 }

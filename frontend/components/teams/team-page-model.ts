@@ -924,8 +924,12 @@ export function mergeControl(merge: TeamWorkMergeSummary | undefined): MergeCont
 		const open = pr && pr.state !== "CLOSED" && pr.state !== "MERGED";
 		if (open && pr.headMatches) return null;
 		return {
-			label:
-				!pr || pr.state === "MERGED" ? "openPr" : pr.state === "CLOSED" ? "reopenPr" : "updatePr",
+			// A pull request closed, or merged without this ready head (taken as closed): again.
+			label: !pr
+				? "openPr"
+				: pr.state === "CLOSED" || pr.state === "MERGED"
+					? "reopenPr"
+					: "updatePr",
 			busy: false,
 			enabled: merge.canMerge,
 			disabledKey: merge.disabledReason
@@ -949,6 +953,26 @@ function busyLabel(merge: TeamWorkMergeSummary): MergeControlView["label"] {
 	if (merge.job === "pull_request" || merge.mode === "github")
 		return merge.phase === "opening" ? "opening" : "pushing";
 	return "merging";
+}
+
+/**
+ * G: the repository the PR buttons name (`owner/repo`; the host too when it is not github.com):
+ * the confirmed one, else the one a manager is asked to confirm. Null outside GitHub mode.
+ */
+export function pullRequestRepo(merge: TeamWorkMergeSummary | undefined): string | null {
+	const target = merge?.mode === "github" ? (merge.github?.pinned ?? merge.github?.target) : null;
+	if (!target) return null;
+	const [host, ...rest] = target.split("/");
+	return host === "github.com" ? rest.join("/") : target;
+}
+
+/**
+ * G: 「发起 PR」 first asks a person who may manage the project to confirm where pull requests go
+ * (nothing confirmed yet): the `host/owner/repo` to show, or null when no confirmation is due.
+ */
+export function githubConfirmation(merge: TeamWorkMergeSummary | undefined): string | null {
+	const github = merge?.mode === "github" ? merge.github : undefined;
+	return github && !github.pinned && github.canConfirm && github.target ? github.target : null;
 }
 
 /** One status label of a pull request (an i18n key under `teams.page.merge.pr.`). */
@@ -1069,6 +1093,7 @@ const MERGE_ERROR_CODES = new Set([
 	"TEAM_WORK_ITEM_NOT_READY",
 	"TEAM_WORK_ITEM_MERGING",
 	"TEAM_WORK_ITEM_WORKER_RUNNING",
+	"TEAM_PR_TARGET_UNCONFIRMED",
 	"TEAM_PR_GH_MISSING",
 	"TEAM_PR_GH_LOGGED_OUT",
 	"TEAM_PR_GH_NO_PERMISSION",

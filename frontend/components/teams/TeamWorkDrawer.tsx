@@ -806,7 +806,8 @@ export function TeamWorkDrawer({
 	// G: a member opening a ready item with a pull request reads it from GitHub (once per opening;
 	// the server keeps a read 20 s).
 	const refresh = useRefreshPullRequest(projectId, teamId);
-	const hasPr = !!data?.merge?.pr && data.canReturn;
+	// Only when the route would allow it (a member with project write), never a silent 403.
+	const hasPr = !!data?.merge?.pr?.canRefresh;
 	const refreshed = useRef<string | null>(null);
 	useEffect(() => {
 		if (!itemId) refreshed.current = null;

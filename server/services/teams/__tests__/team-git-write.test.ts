@@ -371,14 +371,14 @@ describe("team git writes", () => {
 		await git(["push", "-q", "origin", "main"], other);
 		await git(["remote", "add", "origin", origin]);
 		const write = teamRepoGit(repo);
-		expect(await write.originPushUrl()).toBe(origin);
+		expect(await write.originTarget()).toEqual({ url: origin, resolved: origin });
 		expect(await write.fetchBaseFromOrigin("main")).toEqual({ ok: true });
 		expect(await git(["rev-parse", "refs/remotes/origin/main"])).toBe(upstream);
 		expect(await git(["rev-parse", "main"])).toBe(local);
 		expect(await git(["status", "--porcelain"])).toBe("");
 		expect(existsSync(join(repo, ".git", "FETCH_HEAD"))).toBe(false);
 		await git(["remote", "remove", "origin"]);
-		expect(await write.originPushUrl()).toBeNull();
+		expect(await write.originTarget()).toBeNull();
 		await rm(other, { recursive: true, force: true });
 		await rm(origin, { recursive: true, force: true });
 	});

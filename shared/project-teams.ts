@@ -566,11 +566,25 @@ export interface TeamProjectSettings {
 	 */
 	workStart?: TeamWorkStart;
 	/**
+	 * G: the GitHub repository the project's pull requests go to, as a person with project manage
+	 * permission confirmed it. Written only by `PUT …/team-github` (never the project PATCH).
+	 */
+	github?: TeamGithubTarget;
+	/**
 	 * Path globs (relative to the repository root, `**` for any depth) only one item may change at
 	 * a time. `dir/` is stored as `dir/**`; a bare name without glob characters (`drizzle`) covers
 	 * that file or directory and everything under it.
 	 */
 	exclusivePaths?: string[];
+}
+
+/** G: a project's confirmed GitHub repository (`host/owner/repo`), who confirmed it and when. */
+export interface TeamGithubTarget {
+	host: string;
+	owner: string;
+	repo: string;
+	confirmedBy: string | null;
+	confirmedAt: string | null;
 }
 
 /** Events written by X. */
@@ -939,6 +953,12 @@ export const TEAM_MERGE_DISABLED_REASONS = [
 	"gh_repo_archived",
 	/** G: gh could not read the repository (offline, not found, an error). */
 	"gh_unavailable",
+	/** G: no person confirmed the GitHub repository yet, and this caller may not (manage only). */
+	"github_unconfirmed",
+	/** G: origin now resolves to another repository than the one confirmed. */
+	"github_target_changed",
+	/** G: the repository's own configuration redirects origin (a push URL or a rewrite). */
+	"remote_config_unsafe",
 	"base_remote",
 	"git_too_old",
 ] as const;
@@ -1093,6 +1113,8 @@ export interface TeamWorkPullRequest {
 	/** Whether 「合并 PR」 is offered to this caller now. */
 	canMergePr: boolean;
 	mergeBlocker: TeamPrMergeBlocker | null;
+	/** The caller may ask GitHub for its state now (a member with project write). */
+	canRefresh: boolean;
 }
 
 /** A ready item's merge state as a card shows it. */
@@ -1112,6 +1134,19 @@ export interface TeamWorkMergeSummary {
 	disabledReason: TeamMergeDisabledReason | null;
 	/** G: the item's pull request (GitHub mode, once one was opened); null otherwise. */
 	pr?: TeamWorkPullRequest | null;
+	/**
+	 * G: where pull requests go: `target` is what origin resolves to now (`host/owner/repo`),
+	 * `pinned` what a person confirmed (null: not yet); `canConfirm` whether this caller may
+	 * confirm it (project manage), which 「发起 PR」 asks for first when nothing is pinned.
+	 */
+	github?: { target: string | null; pinned: string | null; canConfirm: boolean };
+}
+
+/** G: `PUT /projects/:projectId/team-github`: the confirmed repository (null: cleared). */
+export interface TeamGithubPinResponse {
+	pinned: TeamGithubTarget | null;
+	/** What origin resolves to now, when known. */
+	detected: string | null;
 }
 
 /** A ready item's merge state in the drawer. */

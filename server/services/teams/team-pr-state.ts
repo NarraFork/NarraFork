@@ -248,7 +248,7 @@ export function prMergeBlocker(input: {
 	if (status.state === "CLOSED") return "closed";
 	if (status.state === "MERGED") return null;
 	if (input.queued) return "queued";
-	if (!input.headSha || status.headSha !== input.headSha) return "head_stale";
+	if (!sameHead(status.headSha, input.headSha)) return "head_stale";
 	if (status.isDraft || status.mergeState === "DRAFT") return "draft";
 	if (input.methods.length === 0) return "no_method";
 	switch (status.mergeState) {
@@ -270,11 +270,21 @@ export function prMergeBlocker(input: {
  * Whether GitHub queued the merge of `pr` at `headSha`: auto-merge is on, or a merge NarraFork
  * asked for was accepted at that head (`work.pr_queued`) while the pull request is still open.
  */
+/**
+ * Whether two heads are the same commit; a board card carries its head abbreviated (12
+ * characters), so a prefix of at least that much counts.
+ */
+export function sameHead(a: unknown, b: unknown): boolean {
+	if (typeof a !== "string" || typeof b !== "string" || a.length < 12 || b.length < 12)
+		return false;
+	return a.length <= b.length ? b.startsWith(a) : a.startsWith(b);
+}
+
 export function prQueued(itemId: string, status: PrStatus | null, headSha: string | null) {
 	if (!status || status.state !== "OPEN") return false;
 	if (status.autoMerge) return true;
 	const queued = latestPrEvent(itemId, "work.pr_queued", status.number);
-	return !!queued && queued.head === headSha && status.headSha === headSha;
+	return !!queued && sameHead(queued.head, headSha) && sameHead(status.headSha, headSha);
 }
 
 /**
@@ -287,12 +297,18 @@ export function pullRequestSummary(input: {
 	methods: readonly TeamPrMergeMethod[];
 	/** The caller may merge (a member, the item ready, nothing else in the way). */
 	mayMerge: boolean;
+	/** The caller may ask for a read (a member with project write). */
+	member?: boolean;
 	record?: PullRequestRecord | null;
 }): TeamWorkPullRequest | null {
 	const record = input.record === undefined ? latestPullRequest(input.itemId) : input.record;
 	if (!record) return null;
 	const entry = peekPrStatus(input.itemId, record.number);
-	const status = entry?.status ?? null;
+	const read = entry?.status ?? null;
+	// Taken as closed for this item (merged at an older head, retargeted, closed): 「重新发起 PR」.
+	const closedForItem = !!latestPrEvent(input.itemId, "work.pr_closed", record.number);
+	const status: PrStatus | null =
+		read && closedForItem && read.state !== "CLOSED" ? { ...read, state: "CLOSED" } : read;
 	const queued = prQueued(input.itemId, status, input.headSha);
 	const blocker = prMergeBlocker({
 		status,
@@ -301,12 +317,12 @@ export function pullRequestSummary(input: {
 		methods: input.methods,
 	});
 	const headMatches = status
-		? !!input.headSha && status.headSha === input.headSha
-		: !!input.headSha && record.head === input.headSha;
+		? sameHead(status.headSha, input.headSha)
+		: sameHead(record.head, input.headSha);
 	return {
 		number: record.number,
 		url: status?.url ?? record.url,
-		state: status?.state ?? null,
+		state: status?.state ?? (closedForItem ? "CLOSED" : null),
 		isDraft: status?.isDraft ?? false,
 		headMatches,
 		mergeState: status?.mergeState ?? null,
@@ -318,6 +334,7 @@ export function pullRequestSummary(input: {
 		error: entry?.error ?? null,
 		methods: [...input.methods],
 		canMergePr: input.mayMerge && blocker === null && status?.state === "OPEN",
-		mergeBlocker: blocker,
+		mergeBlocker: closedForItem && !status ? "closed" : blocker,
+		canRefresh: input.member === true,
 	};
 }

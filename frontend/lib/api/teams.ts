@@ -5,6 +5,7 @@ import type {
 	TeamBoardColumn,
 	TeamBoardColumnPage,
 	TeamDetail,
+	TeamGithubPinResponse,
 	TeamListResponse,
 	TeamMembersResponse,
 	TeamPageSummary,
@@ -159,6 +160,15 @@ export const teamsApi = {
 			`${teamBase(projectId, teamId)}/work/${encodeURIComponent(itemId)}/pr/merge`,
 			{ method: "POST", body: JSON.stringify(method ? { method } : {}) },
 		),
+	/** G: the GitHub repository the project's pull requests go to (confirmed, and detected). */
+	getTeamGithub: (projectId: string) =>
+		request<TeamGithubPinResponse>(`/projects/${encodeURIComponent(projectId)}/team-github`),
+	/** G: confirm (`host/owner/repo`) or, with null, clear it (project managers). */
+	setTeamGithub: (projectId: string, target: string | null) =>
+		request<TeamGithubPinResponse>(`/projects/${encodeURIComponent(projectId)}/team-github`, {
+			method: target ? "PUT" : "DELETE",
+			...(target ? { body: JSON.stringify({ target }) } : {}),
+		}),
 	/** G: read a ready item's pull request from GitHub now (unless read in the last 20 s). */
 	refreshTeamPullRequest: (projectId: string, teamId: string, itemId: string) =>
 		request<TeamWorkPrRefreshResponse>(

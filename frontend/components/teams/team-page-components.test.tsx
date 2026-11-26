@@ -1452,6 +1452,7 @@ describe("pull requests (G)", () => {
 		methods: ["squash", "merge"],
 		canMergePr: true,
 		mergeBlocker: null,
+		canRefresh: true,
 		...over,
 	});
 	const github = (over: Record<string, unknown> = {}) =>

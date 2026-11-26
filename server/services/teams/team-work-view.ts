@@ -52,6 +52,7 @@ import {
 } from "./team-board";
 import { teamGit } from "./team-git";
 import {
+	canManageProjectOf,
 	canMergeInProject,
 	mergeViewOf,
 	requestFastForward,
@@ -487,6 +488,7 @@ export async function readWorkItemDetail(
 					teamActive,
 					workerRunning: item.worker?.status === "working" || item.worker?.status === "waiting",
 					member: access === "write" && (await canMergeInProject(team.projectId, principal)),
+					manager: access === "write" && (await canManageProjectOf(team.projectId, principal)),
 				})
 			: undefined;
 	return {

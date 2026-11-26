@@ -44,6 +44,7 @@ import {
 	TEAM_MERGE_REF_PREFIX,
 	TEAM_WORK_FILES_LIMIT,
 	type TeamFastForwardBlocker,
+	type TeamGithubTarget,
 	type TeamMergeDisabledReason,
 	type TeamMergeJobKind,
 	type TeamMergeMode,
@@ -85,6 +86,7 @@ import {
 	supportsMergeTree,
 	teamRepoGit,
 } from "./team-git-write";
+import { githubTargetName, pinnedGithubTarget, sameGithubTarget } from "./team-github-pin";
 import { type GhAccess, hostingOf, type ProjectHosting, peekHosting } from "./team-hosting";
 import { claimMerging, isMerging, releaseMerging } from "./team-merge-guard";
 import { pullRequestSummary } from "./team-pr-state";
@@ -278,6 +280,22 @@ export async function canMergeInProject(
 	return canWriteProject(row, principal);
 }
 
+/** G: whether a person may manage a project (confirm where its pull requests go). */
+export async function canManageProjectOf(
+	projectId: string,
+	principal: { userId: string; isAdmin: boolean },
+): Promise<boolean> {
+	const row = db
+		.select({ id: projects.id, ownerUserId: projects.ownerUserId, visibility: projects.visibility })
+		.from(projects)
+		.where(eq(projects.id, projectId))
+		.limit(1)
+		.get();
+	if (!row) return false;
+	const { canManageProject } = await import("../project-acl");
+	return canManageProject(row, principal);
+}
+
 /** How the item would be merged now, from the cached hosting (never waits). */
 export function mergeModeOf(projectId: string): TeamMergeMode {
 	return modeOfHosting(cachedHosting(projectId));
@@ -293,9 +311,56 @@ function cachedHosting(projectId: string): ProjectHosting | null | "no_repositor
 function modeOfHosting(hosting: ProjectHosting | null | "no_repository"): TeamMergeMode {
 	if (hosting === "no_repository") return "local";
 	// Not read yet, or the read failed: never assumed to be "not GitHub".
-	if (!hosting || hosting.kind === "unknown") return "checking";
+	// A redirected origin (`unsafe`) is never taken for "not GitHub" either.
+	if (!hosting || hosting.kind === "unknown" || hosting.kind === "unsafe") return "checking";
 	return hosting.kind === "github" ? "github" : "local";
 }
+
+type GithubHosting = Extract<ProjectHosting, { kind: "github" }>;
+
+/**
+ * G: whether pull requests may go where origin resolves now: a target a person confirmed, and
+ * origin resolving to exactly it. `reason` for the summary (null when nothing pinned yet: a
+ * manager confirms it first), `refusal` for a request or a job.
+ */
+export function githubPinCheck(
+	projectId: string,
+	hosting: GithubHosting,
+): {
+	pinned: TeamGithubTarget | null;
+	reason: "github_unconfirmed" | "github_target_changed" | null;
+	refusal: AppError | null;
+} {
+	const pinned = pinnedGithubTarget(projectId);
+	if (!pinned)
+		return {
+			pinned,
+			reason: "github_unconfirmed",
+			refusal: new AppError(
+				`Pull requests of this project would go to ${githubTargetName(hosting)}: a person with project manage permission confirms that repository first`,
+				409,
+				"TEAM_PR_TARGET_UNCONFIRMED",
+			),
+		};
+	if (!sameGithubTarget(pinned, hosting))
+		return {
+			pinned,
+			reason: "github_target_changed",
+			refusal: new AppError(
+				`origin now resolves to ${githubTargetName(hosting)}, not ${githubTargetName(pinned)} as confirmed; nothing is pushed until a project manager confirms the new repository in the project settings`,
+				409,
+				"TEAM_PR_REMOTE_CHANGED",
+			),
+		};
+	return { pinned, reason: null, refusal: null };
+}
+
+const unsafeRefusal = (key: string) =>
+	new AppError(
+		`The repository's own configuration sets ${key}, which would choose where origin is; NarraFork neither pushes nor merges with it (set it in the global configuration instead)`,
+		409,
+		"TEAM_REMOTE_CONFIG_UNSAFE",
+	);
 
 /** G: why gh cannot serve a GitHub origin, as a disabled reason (null: it can). */
 export function ghDisabledReason(access: GhAccess | undefined): TeamMergeDisabledReason | null {
@@ -349,6 +414,8 @@ export function mergeSummaryOf(input: {
 	teamActive: boolean;
 	workerRunning: boolean;
 	member: boolean;
+	/** G: the caller may manage the project (confirm where pull requests go). */
+	manager?: boolean;
 	outcome?: TeamWorkMergeOutcome | null;
 	mode?: TeamMergeMode;
 }): TeamWorkMergeSummary {
@@ -365,10 +432,20 @@ export function mergeSummaryOf(input: {
 	else if (!input.teamActive) reason = "team_archived";
 	else if (job || isMerging(input.item.id)) reason = "merging";
 	else if (input.workerRunning) reason = "worker_running";
-	else if (mode === "checking") reason = "checking";
+	else if (mode === "checking")
+		reason =
+			hosting && hosting !== "no_repository" && hosting.kind === "unsafe"
+				? "remote_config_unsafe"
+				: "checking";
 	else if (mode === "github") reason = ghDisabledReason(github?.gh);
 	else if (isRemoteTrackingBase(base)) reason = "base_remote";
 	else if (version !== undefined && !supportsMergeTree(version)) reason = "git_too_old";
+	// G: where pull requests go must be confirmed (a manager confirms it from 「发起 PR」).
+	const pin = mode === "github" && github ? githubPinCheck(input.item.projectId, github) : null;
+	const pinned = pin?.reason === null;
+	if (reason === null && pin?.reason === "github_target_changed") reason = pin.reason;
+	if (reason === null && pin?.reason === "github_unconfirmed" && !input.manager)
+		reason = pin.reason;
 	// G: the pull request as last read (a cache; no gh on this path).
 	const pr =
 		mode === "github"
@@ -376,7 +453,8 @@ export function mergeSummaryOf(input: {
 					itemId: input.item.id,
 					headSha: input.item.headSha ?? null,
 					methods: github?.gh?.ok ? github.gh.methods : [],
-					mayMerge: input.member && reason === null,
+					mayMerge: input.member && reason === null && pinned,
+					member: input.member,
 				})
 			: null;
 	return {
@@ -393,7 +471,16 @@ export function mergeSummaryOf(input: {
 					: null,
 		canMerge: input.member && reason === null,
 		disabledReason: reason,
-		...(mode === "github" ? { pr } : {}),
+		...(mode === "github"
+			? {
+					pr,
+					github: {
+						target: github ? githubTargetName(github) : null,
+						pinned: pin?.pinned ? githubTargetName(pin.pinned) : null,
+						canConfirm: input.manager === true,
+					},
+				}
+			: {}),
 	};
 }
 
@@ -565,6 +652,7 @@ export async function mergeViewOf(input: {
 	teamActive: boolean;
 	workerRunning: boolean;
 	member: boolean;
+	manager?: boolean;
 }): Promise<TeamWorkMergeView> {
 	const outcome = readMergeOutcome(input.item.id);
 	const summary = mergeSummaryOf({ ...input, outcome });
@@ -825,11 +913,11 @@ export function requestMerge(input: {
 	const base = item.baseRef ?? team.baseBranch;
 	const hosting = cachedHosting(team.projectId);
 	const mode = modeOfHosting(hosting);
+	if (hosting && hosting !== "no_repository" && hosting.kind === "unsafe")
+		throw unsafeRefusal(hosting.key);
 	// G: a GitHub origin pushes the branch and opens (or updates) its pull request instead.
-	if (mode === "github") {
-		const refusal = ghRefusal(
-			hosting && hosting !== "no_repository" && hosting.kind === "github" ? hosting.gh : undefined,
-		);
+	if (mode === "github" && hosting && hosting !== "no_repository" && hosting.kind === "github") {
+		const refusal = ghRefusal(hosting.gh) ?? githubPinCheck(team.projectId, hosting).refusal;
 		if (refusal) throw refusal;
 		return startJob(
 			{ itemId: item.id, teamId: input.teamId, projectId: team.projectId, userId: input.userId },
@@ -875,7 +963,7 @@ export function requestPrMerge(input: {
 			409,
 			modeOfHosting(hosting) === "checking" ? "TEAM_MERGE_HOSTING_UNKNOWN" : "TEAM_PR_NOT_GITHUB",
 		);
-	const refusal = ghRefusal(github.gh);
+	const refusal = ghRefusal(github.gh) ?? githubPinCheck(team.projectId, github).refusal;
 	if (refusal) throw refusal;
 	const methods = github.gh?.ok ? github.gh.methods : [];
 	const method = input.method ?? methods[0];
@@ -956,9 +1044,14 @@ export async function jobFacts(context: JobContext, signal: AbortSignal) {
 		);
 	const base = item.baseRef ?? team.baseBranch;
 	const git = teamRepoGit(repo, { signal });
+	if (hosting.kind === "unsafe") {
+		const refusal = unsafeRefusal(hosting.key);
+		throw new MergeFailure(refusal.code ?? "TEAM_REMOTE_CONFIG_UNSAFE", refusal.message);
+	}
 	if (hosting.kind === "github") {
-		// G: the pull request flow; gh must be able to serve it (never a local merge instead).
-		const refusal = ghRefusal(hosting.gh);
+		// G: the pull request flow; gh must be able to serve it (never a local merge instead), to
+		// the repository a person confirmed.
+		const refusal = ghRefusal(hosting.gh) ?? githubPinCheck(context.projectId, hosting).refusal;
 		if (refusal) throw new MergeFailure(refusal.code ?? "TEAM_PR_GH_UNAVAILABLE", refusal.message);
 		await assertTipStill(git, item.branchName, item.headSha);
 		return {

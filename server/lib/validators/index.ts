@@ -210,6 +210,7 @@ export {
 	teamBaseBranchSchema,
 	teamBoardQuerySchema,
 	teamBriefSchema,
+	teamGithubPinSchema,
 	teamSettingsSchema,
 	teamWorkDiffQuerySchema,
 	teamWorkStatsQuerySchema,

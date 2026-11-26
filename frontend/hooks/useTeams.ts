@@ -412,6 +412,33 @@ export function useMergeWorkItem(projectId: string, teamId: string) {
 	});
 }
 
+/** G: the GitHub repository a project's pull requests go to (confirmed, and detected). */
+export function useTeamGithub(projectId: string, enabled = true) {
+	return useQuery({
+		queryKey: ["projects", projectId, "team-github"],
+		queryFn: () => api.getTeamGithub(projectId),
+		enabled: !!projectId && enabled,
+		staleTime: 15_000,
+	});
+}
+
+/**
+ * G: confirm (or clear) where a project's pull requests go (project managers). Every team page
+ * of the project reads its merge state again.
+ */
+export function useSetTeamGithub(projectId: string) {
+	const queryClient = useQueryClient();
+	return useMutation({
+		mutationFn: ({ target }: { target: string | null }) => api.setTeamGithub(projectId, target),
+		meta: { suppressErrorToast: true },
+		onSettled: () => {
+			void queryClient.invalidateQueries({ queryKey: ["projects", projectId, "team-github"] });
+			void queryClient.invalidateQueries({ queryKey: ["teams"] });
+			void queryClient.invalidateQueries({ queryKey: projectOverviewKeys.attention(projectId) });
+		},
+	});
+}
+
 /**
  * G: read a ready item's pull request from GitHub when the drawer opens (members; at most once
  * per 20 s on the server). The drawer polls while the read runs.
