@@ -50,7 +50,7 @@ func TestRestoredSessionsKeepOutputAndExitOrReportLost(t *testing.T) {
 	})
 	running := open(t, before, "running")
 	running.emit("halfway\n")
-	waitFor(t, func() bool { return endSeq(t, before, "running") == 8 })
+	waitForDisk(t, dir, "running", 8)
 	// The executor process dies here: nothing else is written.
 
 	after := newStoreManager(t, dir, testLimits())
@@ -87,6 +87,23 @@ func TestRestoredSessionsKeepOutputAndExitOrReportLost(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "running")); !os.IsNotExist(err) {
 		t.Fatalf("released session record still on disk: %v", err)
 	}
+}
+
+// waitForDisk waits until n output bytes of session id are in its segments: a
+// chunk reaches the in-memory journal just before it is written to disk.
+func waitForDisk(t *testing.T, dir, id string, n int64) {
+	t.Helper()
+	waitFor(t, func() bool {
+		segs, err := listSegments(filepath.Join(dir, id))
+		if err != nil {
+			return false
+		}
+		var size int64
+		for _, seg := range segs {
+			size += seg.size
+		}
+		return size >= n
+	})
 }
 
 func mustInfo(t *testing.T, m *Manager, id string) Info {
@@ -140,7 +157,7 @@ func TestStorageFailureKeepsTheSessionRunning(t *testing.T) {
 	m := newStoreManager(t, dir, testLimits())
 	p := open(t, m, "s1")
 	p.emit("first!!!")
-	waitFor(t, func() bool { return endSeq(t, m, "s1") == 8 })
+	waitForDisk(t, dir, "s1", 8)
 	if err := os.RemoveAll(filepath.Join(dir, "s1")); err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +195,7 @@ func TestOutputFailureStillRecordsTheExit(t *testing.T) {
 	before := newStoreManager(t, dir, testLimits())
 	p := open(t, before, "s1")
 	p.emit("12345678")
-	waitFor(t, func() bool { return endSeq(t, before, "s1") == 8 })
+	waitForDisk(t, dir, "s1", 8)
 	// The next segment cannot be created (a directory has its name).
 	if err := os.Mkdir(filepath.Join(dir, "s1", segmentName(8)), 0o700); err != nil {
 		t.Fatal(err)
@@ -216,7 +233,7 @@ func TestRestoreSurvivesARecordThatCannotBeUpdated(t *testing.T) {
 	waitFor(t, func() bool { return mustInfo(t, before, "done").State == "exited" })
 	running := open(t, before, "running")
 	running.emit("half")
-	waitFor(t, func() bool { return endSeq(t, before, "running") == 4 })
+	waitForDisk(t, dir, "running", 4)
 	// Writing the lost marker fails: its temporary file name is taken.
 	if err := os.Mkdir(filepath.Join(dir, "running", "meta.json.tmp"), 0o700); err != nil {
 		t.Fatal(err)
