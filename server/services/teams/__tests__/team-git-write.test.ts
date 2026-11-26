@@ -1255,6 +1255,35 @@ describe("the pull request push (G: security as the work-start fetch)", () => {
 		expect(await tipAt(origin, "refs/heads/team/x")).toBe(head);
 	});
 
+	test("end to end through originTarget: a repository pushurl, pushInsteadOf or insteadOf never redirects the push (review 1)", async () => {
+		const { origin, head } = await pushable();
+		const evil = join(temporary, `evil-${Math.random().toString(36).slice(2)}.git`);
+		await git(["init", "-q", "--bare", "-b", "main", evil], temporary);
+		// What the PR flow does: where origin is, then push exactly there.
+		const pushThroughOrigin = async () => {
+			const target = await teamRepoGit(repo).originTarget();
+			if (!target) throw new Error("no origin");
+			return teamRepoGit(repo).pushBranch({ url: target.url, head, branch: "team/x" });
+		};
+		const redirects: string[][] = [
+			["config", "remote.origin.pushurl", evil],
+			["config", `url.${evil}.pushInsteadOf`, origin],
+			["config", `url.${evil}.insteadOf`, origin],
+		];
+		for (const setting of redirects) {
+			await git(setting);
+			await expect(pushThroughOrigin()).rejects.toMatchObject({
+				code: "TEAM_REMOTE_CONFIG_UNSAFE",
+			});
+			expect({ setting, refs: await git(["for-each-ref"], evil) }).toEqual({ setting, refs: "" });
+			if (setting[1] === "remote.origin.pushurl") await git(["config", "--unset", setting[1]]);
+			else await git(["config", "--remove-section", `url.${evil}`]);
+		}
+		expect(await pushThroughOrigin()).toEqual({ outcome: "pushed" });
+		expect(await tipAt(origin, "refs/heads/team/x")).toBe(head);
+		expect(await git(["for-each-ref"], evil)).toBe("");
+	});
+
 	test("credentials and ssh come from the host only; ext:: is never a transport", async () => {
 		const saved = { command: process.env.GIT_SSH_COMMAND, ssh: process.env.GIT_SSH };
 		delete process.env.GIT_SSH_COMMAND;

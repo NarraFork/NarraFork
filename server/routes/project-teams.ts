@@ -457,9 +457,16 @@ projectTeamRoutes.get("/:projectId/team-github", async (c) => {
 	return c.json(await githubPinResponse(projectId));
 });
 
+/** Project manage for the confirmed repository: a project reader without it gets 403. */
+async function requireProjectManageForGithub(c: Context, projectId: string): Promise<void> {
+	const project = await requireProjectAccess(c, projectId, "read");
+	if (!(await hasProjectAccess(project, projectPrincipalOf(c), "manage")))
+		throw new ForbiddenError("Confirming the GitHub repository needs project manage access");
+}
+
 projectTeamRoutes.put("/:projectId/team-github", async (c) => {
 	const projectId = c.req.param("projectId");
-	await requireProjectAccess(c, projectId, "manage");
+	await requireProjectManageForGithub(c, projectId);
 	const parsed = teamGithubPinSchema.safeParse(await jsonBody(c));
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const { parseGithubTarget, setPinnedGithubTarget } = await import(
@@ -473,7 +480,7 @@ projectTeamRoutes.put("/:projectId/team-github", async (c) => {
 
 projectTeamRoutes.delete("/:projectId/team-github", async (c) => {
 	const projectId = c.req.param("projectId");
-	await requireProjectAccess(c, projectId, "manage");
+	await requireProjectManageForGithub(c, projectId);
 	const { setPinnedGithubTarget } = await import("../services/teams/team-github-pin");
 	setPinnedGithubTarget(projectId, null, null);
 	return c.json(await githubPinResponse(projectId));

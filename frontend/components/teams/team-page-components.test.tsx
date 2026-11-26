@@ -1607,6 +1607,38 @@ describe("pull requests (G)", () => {
 		}
 	});
 
+	test("review 1: 发起 PR asks a manager to confirm the repository; the buttons name it; a changed origin links to the settings", async () => {
+		const unpinned = await card(
+			github({ github: { target: "github.com/acme/app", pinned: null, canConfirm: true } }),
+		);
+		expect(unpinned).toContain('data-confirm="github"');
+		expect(unpinned).toContain("发起 PR · acme/app");
+		const pinned = await card(
+			github({
+				pr: pr(),
+				github: { target: "github.com/acme/app", pinned: "github.com/acme/app", canConfirm: false },
+			}),
+		);
+		expect(pinned).not.toContain("data-confirm");
+		expect(pinned).toContain("合并 PR");
+		expect(pinned).toContain("acme/app");
+		const changed = await card(
+			github({
+				canMerge: false,
+				disabledReason: "github_target_changed",
+				github: {
+					target: "github.com/attacker/app",
+					pinned: "github.com/acme/app",
+					canConfirm: true,
+				},
+			}),
+		);
+		expect(changed).toContain('data-reason="github_target_changed"');
+		expect(changed).toContain('data-testid="team-merge-settings-link"');
+		expect(changed).toContain("打开项目设置");
+		expect(zh.teams.page.merge.confirmGithubText).toContain("将推送到 {{target}} 并在那里开 PR");
+	});
+
 	test("the drawer: failed checks linked, a rejected push offers 退回", async () => {
 		const { MergeOutcome } = await import("./TeamMerge");
 		const outcome = (merge: NonNullable<TeamWorkItemDetail["merge"]>) =>

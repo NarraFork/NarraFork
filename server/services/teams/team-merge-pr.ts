@@ -757,6 +757,7 @@ async function conflictingFiles(
 	signal?: AbortSignal,
 ): Promise<{ conflicts: string[]; more: boolean } | null> {
 	const git = signal ? teamRepoGit(repo, { signal }) : given;
+	state.conflictLookups++;
 	try {
 		await fetchOnce(repo, branch, () =>
 			git.fetchBaseFromOrigin(branch).catch((error: unknown) => ({
@@ -970,14 +971,16 @@ const state = hotSafe("narrafork.teams.prReads", () => ({
 	cursor: "",
 	/** Conflicting files per repository, head and base commit. */
 	conflicts: new Map<string, { conflicts: string[]; more: boolean }>(),
-	/** How many `merge-tree` runs listed conflicts (tests). */
+	/** How many `merge-tree` runs listed conflicts, and how many lookups fetched first (tests). */
 	conflictRuns: 0,
+	conflictLookups: 0,
 	/** Aborted when the background pass stops: every read and fetch it started ends. */
 	controller: new AbortController(),
 }));
 
 /** How many times conflicting files were computed (tests). */
 export const conflictRunsForTests = () => state.conflictRuns;
+export const conflictLookupsForTests = () => state.conflictLookups;
 
 /**
  * Run `read` when one of the {@link READS_AT_ONCE} read slots is free. A slot given back is
@@ -1346,6 +1349,7 @@ export function resetPullRequestWorkForTests(): void {
 	state.afterMerge.clear();
 	state.conflicts.clear();
 	state.conflictRuns = 0;
+	state.conflictLookups = 0;
 	if (state.controller.signal.aborted) state.controller = new AbortController();
 }
 

@@ -19,11 +19,15 @@ import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { and, eq, sql } from "drizzle-orm";
+import { fromMarkdown } from "mdast-util-from-markdown";
+import { gfmFromMarkdown } from "mdast-util-gfm";
+import { gfm } from "micromark-extension-gfm";
 import { db, sqlite } from "../../../db";
 import { narratorWorktreeResources, teamWorkEvents, teamWorkItems } from "../../../db/schema";
 import { generateId } from "../../../lib/id";
 import { safeSpawn } from "../../../lib/spawn";
-import { ghWorkDir } from "../team-gh";
+import { ghWorkDir, setGhTimeoutScaleForTests } from "../team-gh";
+import { setPinnedGithubTarget } from "../team-github-pin";
 import { hostingOf, setHostingSourceForTests } from "../team-hosting";
 import {
 	mergeSummaryOf,
@@ -33,9 +37,11 @@ import {
 	resetMergeJobsForTests,
 	settleMergeJobs,
 } from "../team-merge";
-import { setPinnedGithubTarget } from "../team-github-pin";
 import { resetMergingForTests } from "../team-merge-guard";
 import {
+	conflictLookupsForTests,
+	conflictRunsForTests,
+	inlineCode,
 	neutralizeForGithub,
 	PR_BODY_MAX_BYTES,
 	pullRequestBody,
@@ -45,6 +51,8 @@ import {
 	resetPullRequestWorkForTests,
 	runPrPollPass,
 	settlePullRequestWork,
+	startTeamPrPoller,
+	withReadSlotForTests,
 } from "../team-merge-pr";
 import { peekPrStatus, resetPrStatusForTests } from "../team-pr-state";
 import { setUnblockDeliveryForTests } from "../work-item-dependencies";
@@ -787,6 +795,324 @@ describe.skipIf(process.platform === "win32")("the pull request flow", () => {
 		expect(readMergeOutcome(a.id)).toMatchObject({ code: "TEAM_PR_REMOTE_CHANGED" });
 		expect(await git(["for-each-ref", "refs/heads/team/"], origin)).toBe("");
 		expect(await ghCalls("pr create")).toEqual([]);
+	});
+});
+
+describe.skipIf(process.platform === "win32")("review fixes (G)", () => {
+	const summaryAs = async (itemId: string, manager: boolean) => {
+		const row = item(itemId);
+		if (!row) throw new Error("no item");
+		return mergeSummaryOf({
+			item: row,
+			baseBranch: "main",
+			teamActive: true,
+			workerRunning: false,
+			member: true,
+			manager,
+		});
+	};
+
+	test("1a: nothing is pushed to a repository no manager confirmed; a changed origin is refused", async () => {
+		const a = await readyItem("pin");
+		await github(a.head, {}, false);
+		// Not confirmed yet: a manager is asked (the button opens the confirmation), others wait.
+		expect(await summaryAs(a.id, true)).toMatchObject({
+			canMerge: true,
+			disabledReason: null,
+			github: { target: "github.com/acme/app", pinned: null, canConfirm: true },
+		});
+		expect(await summaryAs(a.id, false)).toMatchObject({
+			canMerge: false,
+			disabledReason: "github_unconfirmed",
+		});
+		expect(() => open(a.id)).toThrow(
+			expect.objectContaining({ code: "TEAM_PR_TARGET_UNCONFIRMED" }),
+		);
+		expect(() => mergePr(a.id)).toThrow(
+			expect.objectContaining({ code: "TEAM_PR_TARGET_UNCONFIRMED" }),
+		);
+		// Confirmed, then origin is pointed elsewhere (an agent edits .git/config).
+		setPinnedGithubTarget(PROJECT, ACME, USER);
+		pushUrl = "https://github.com/attacker/app.git";
+		setHostingSourceForTests(async () => pushUrl);
+		await fake.setPlan(plan(a.head));
+		await hostingOf(repo);
+		await fake.clearCalls();
+		expect(await summaryAs(a.id, true)).toMatchObject({
+			disabledReason: "github_target_changed",
+			github: { target: "github.com/attacker/app", pinned: "github.com/acme/app" },
+		});
+		expect(() => open(a.id)).toThrow(expect.objectContaining({ code: "TEAM_PR_REMOTE_CHANGED" }));
+		// Changed between the request and the push: the job refuses too.
+		pushUrl = GITHUB_URL;
+		setHostingSourceForTests(async () => pushUrl);
+		await hostingOf(repo);
+		open(a.id);
+		pushUrl = "https://github.com/attacker/app.git";
+		await settle();
+		expect(readMergeOutcome(a.id)).toMatchObject({ code: "TEAM_PR_REMOTE_CHANGED" });
+		expect(await git(["for-each-ref", "refs/heads/team/"], origin)).toBe("");
+		expect((await fake.calls()).filter((call) => call.args[0] === "pr")).toEqual([]);
+	});
+
+	test("2: a pull request merged at an older head never marks a re-readied item merged", async () => {
+		const a = await readyItem("stale");
+		await github(a.head);
+		open(a.id);
+		await settle();
+		// Returned and marked ready again with new work, never pushed (the reviewer's scenario).
+		const h2 = await commitFile(a.worktree, "more.txt", "more\n", "fix after review");
+		db.update(teamWorkItems)
+			.set({ headSha: h2, updatedAt: "2026-11-25T01:00:00.000Z" })
+			.where(eq(teamWorkItems.id, a.id))
+			.run();
+		// GitHub merged the pull request at the OLD head; GitHub cannot place h2 at all.
+		await fake.setPlan(
+			plan(a.head, {
+				"pr view": {
+					stdout: prView(a.head, { state: "MERGED", mergeCommit: { oid: "a".repeat(40) } }),
+				},
+				"api --hostname=github.com": { exit: 1, stderr: "HTTP 404: Not Found" },
+			}),
+		);
+		await refreshPullRequest(a.id, { force: true });
+		await settle();
+		expect(item(a.id)?.state).toBe("ready");
+		expect(events(a.id, "work.merged")).toEqual([]);
+		expect(events(a.id, "work.pr_closed")[0]?.detail).toMatchObject({
+			pr: 7,
+			merged: true,
+			reason: "older_head",
+			head: a.head,
+		});
+		const [compare] = (await fake.calls()).filter((call) => call.args[0] === "api");
+		expect(compare?.args).toEqual([
+			"api",
+			"--hostname=github.com",
+			"--method=GET",
+			`repos/acme/app/compare/${h2}...${a.head}?per_page=1`,
+			"--jq=.status",
+		]);
+		// 「合并 PR」 does not take it either (a merge found before the click is checked the same).
+		mergePr(a.id);
+		await settle();
+		expect(item(a.id)?.state).toBe("ready");
+		// The card offers 重新发起 PR; it opens a new pull request for the new head.
+		expect((await summary(a.id)).pr).toMatchObject({ number: 7, state: "CLOSED" });
+		await fake.setPlan(
+			plan(h2, {
+				"pr list": {
+					stdout: JSON.stringify([
+						{
+							number: 7,
+							url: PR_URL,
+							state: "MERGED",
+							headRefOid: a.head,
+							headRefName: "team/stale",
+							baseRefName: "main",
+						},
+					]),
+				},
+				"pr create": { stdout: "https://github.com/acme/app/pull/8\n" },
+				"pr view": { stdout: prView(h2, { number: 8, url: "https://github.com/acme/app/pull/8" }) },
+			}),
+		);
+		open(a.id);
+		await settle();
+		expect(events(a.id, "work.pr_opened").at(-1)?.detail).toMatchObject({ pr: 8, head: h2 });
+		expect((await summary(a.id)).pr).toMatchObject({ number: 8, state: "OPEN", headMatches: true });
+		expect(await git(["rev-parse", "refs/heads/team/stale"], origin)).toBe(h2);
+	});
+
+	test("2b: merged at a head the ready head is inside: merged, headMatches false", async () => {
+		const a = await readyItem("ahead2");
+		await github(a.head);
+		open(a.id);
+		await settle();
+		const later = "b".repeat(40);
+		await fake.setPlan(
+			plan(a.head, {
+				"pr view": { stdout: prView(a.head, { state: "MERGED", headRefOid: later }) },
+				"api --hostname=github.com": { stdout: "ahead\n" },
+			}),
+		);
+		await refreshPullRequest(a.id, { force: true });
+		await settle();
+		expect(item(a.id)?.state).toBe("merged");
+		expect(events(a.id, "work.merged")[0]?.detail).toMatchObject({
+			detectedBy: "pull_request",
+			headMatches: false,
+		});
+	});
+
+	test("3: a pull request retargeted to another base is never taken as this item's merge", async () => {
+		const a = await readyItem("retarget");
+		await github(a.head);
+		open(a.id);
+		await settle();
+		// Open but retargeted: 「合并 PR」 refuses, the pass takes it as closed.
+		await fake.setPlan(
+			plan(a.head, { "pr view": { stdout: prView(a.head, { baseRefName: "develop" }) } }),
+		);
+		mergePr(a.id);
+		await settle();
+		expect(readMergeOutcome(a.id)).toMatchObject({ code: "TEAM_PR_BASE_MISMATCH" });
+		expect(await ghCalls("pr merge")).toEqual([]);
+		// Merged into develop: not this item's merge.
+		await fake.setPlan(
+			plan(a.head, {
+				"pr view": { stdout: prView(a.head, { state: "MERGED", baseRefName: "develop" }) },
+			}),
+		);
+		await refreshPullRequest(a.id, { force: true });
+		await settle();
+		expect(item(a.id)?.state).toBe("ready");
+		expect(events(a.id, "work.pr_closed")[0]?.detail).toMatchObject({
+			merged: true,
+			reason: "other_base",
+			base: "develop",
+		});
+	});
+
+	test("4: a recorded conflict is not fetched and merged again on every pass", async () => {
+		const a = await readyItem("dirty2", "shared.txt", "mine\n");
+		await github(a.head);
+		open(a.id);
+		await settle();
+		await commitOnOrigin("main", "shared.txt", "theirs\n");
+		await fake.setPlan(
+			plan(a.head, { "pr view": { stdout: prView(a.head, { mergeStateStatus: "DIRTY" }) } }),
+		);
+		await refreshPullRequest(a.id, { force: true });
+		expect(events(a.id, "work.merge_failed")).toHaveLength(1);
+		const runs = conflictRunsForTests();
+		const lookups = conflictLookupsForTests();
+		const fetched = await git(["rev-parse", "refs/remotes/origin/main"]);
+		for (let pass = 0; pass < 3; pass++) await refreshPullRequest(a.id, { force: true });
+		// No fetch from origin and no merge-tree for a conflict already recorded.
+		expect(conflictLookupsForTests()).toBe(lookups);
+		expect(conflictRunsForTests()).toBe(runs);
+		expect(events(a.id, "work.merge_failed")).toHaveLength(1);
+		// A member's click lists them again, from the cache (same head, same base).
+		mergePr(a.id);
+		await settle();
+		expect(events(a.id, "work.merge_failed")).toHaveLength(2);
+		expect(conflictRunsForTests()).toBe(runs);
+		expect(await git(["rev-parse", "refs/remotes/origin/main"])).toBe(fetched);
+	});
+
+	test("5: stopping the pass kills a hung gh read; the wait is short", async () => {
+		const a = await readyItem("hung");
+		await github(a.head);
+		open(a.id);
+		await settle();
+		await fake.setPlan(plan(a.head, { "pr view": { sleepMs: 20_000, stdout: prView(a.head) } }));
+		const stop = startTeamPrPoller();
+		const read = refreshPullRequest(a.id, { force: true });
+		await Bun.sleep(300);
+		const started = Date.now();
+		await stop();
+		expect(Date.now() - started).toBeLessThan(5_000);
+		expect(await read).toBeNull();
+		resetPullRequestWorkForTests();
+	});
+
+	test("nit: the read slots hand over without a gap for a newcomer", async () => {
+		for (let delay = 0; delay < 6; delay++) {
+			let running = 0;
+			let most = 0;
+			const gate = () => {
+				let open!: () => void;
+				const promise = new Promise<void>((resolve) => {
+					open = resolve;
+				});
+				return { promise, open };
+			};
+			const run = (hold: Promise<void>) =>
+				withReadSlotForTests(async () => {
+					running++;
+					most = Math.max(most, running);
+					await hold;
+					running--;
+				});
+			const [a, b, c, d] = [gate(), gate(), gate(), gate()];
+			const all = [run(a.promise), run(b.promise), run(c.promise)];
+			await Bun.sleep(1);
+			a.open();
+			let chain: Promise<unknown> = Promise.resolve();
+			for (let i = 0; i < delay; i++) chain = chain.then(() => undefined);
+			await chain.then(() => all.push(run(d.promise)));
+			await Bun.sleep(1);
+			expect({ delay, most }).toEqual({ delay, most: 2 });
+			b.open();
+			c.open();
+			d.open();
+			await Promise.all(all);
+		}
+	});
+
+	test("nits: a merge found before the click is the system's; refresh refuses an archived team", async () => {
+		const a = await readyItem("found");
+		await github(a.head);
+		open(a.id);
+		await settle();
+		await fake.setPlan(
+			plan(a.head, { "pr view": { stdout: prView(a.head, { state: "MERGED" }) } }),
+		);
+		mergePr(a.id);
+		await settle();
+		expect(events(a.id, "work.merged")[0]?.actorKind).toBe("system");
+		const b = await readyItem("archived");
+		sqlite.run("UPDATE project_teams SET status = 'archived' WHERE narrator_id = ?", [LEAD]);
+		expect(() => requestPrRefresh({ teamId: LEAD, itemId: b.id })).toThrow(
+			expect.objectContaining({ code: "TEAM_ARCHIVED" }),
+		);
+	});
+});
+
+describe("the pull request body (review 6)", () => {
+	test("an agent's title or verdict cannot leave its code span: links, images, autolinks, HTML stay inert", () => {
+		const payload =
+			"x`` [click me](//evil.example/phish) ![t](//evil.example/p.png) <!-- hidden --> www.evil.example ``";
+		const body = pullRequestBody({
+			locale: "en",
+			itemId: "i1",
+			title: payload,
+			branch: "team/x",
+			base: "main",
+			by: "alice`` <b>x</b> ``",
+			diffStat: null,
+			rounds: [
+				{
+					kind: "review",
+					round: 1,
+					verdict: `clear${payload}`,
+					findings: 0,
+					reviewer: payload,
+					text: "Closes #12 @octocat https://x",
+				},
+			],
+		});
+		const tree = fromMarkdown(body, {
+			extensions: [gfm()],
+			mdastExtensions: [gfmFromMarkdown()],
+		});
+		const live: string[] = [];
+		const walk = (node: { type: string; value?: string; children?: unknown[] }) => {
+			if (
+				["link", "image", "html", "linkReference", "imageReference", "definition"].includes(
+					node.type,
+				)
+			)
+				live.push(node.type);
+			if (node.type === "text" && node.value?.includes("evil")) live.push(`text:${node.value}`);
+			for (const child of (node.children ?? []) as (typeof node)[]) walk(child);
+		};
+		walk(tree as never);
+		expect(live).toEqual([]);
+		expect(inlineCode("a``b")).toBe("```a``b```");
+		expect(inlineCode("`x`")).toBe("`` `x` ``");
+		expect(inlineCode("")).toBe("`-`");
 	});
 });
 

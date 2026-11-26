@@ -37,6 +37,7 @@ import {
 	eventLabelKey,
 	eventNote,
 	findingsNeedToggle,
+	githubConfirmation,
 	isCoordinator,
 	itemMarks,
 	itemOfApproval,
@@ -53,6 +54,7 @@ import {
 	pauseNotice,
 	pauseOrder,
 	pullRequestControl,
+	pullRequestRepo,
 	queuedLine,
 	returnErrorKey,
 	returnReason,
@@ -1039,6 +1041,8 @@ describe("pull requests (G)", () => {
 		expect(mergeControlOf(github())).toMatchObject({ label: "openPr", enabled: true });
 		expect(mergeControlOf(github({ pr: pr({ headMatches: false }) }))?.label).toBe("updatePr");
 		expect(mergeControlOf(github({ pr: pr({ state: "CLOSED" }) }))?.label).toBe("reopenPr");
+		// Merged without this ready head (taken as closed by the server): again, never 发起 anew.
+		expect(mergeControlOf(github({ pr: pr({ state: "MERGED" }) }))?.label).toBe("reopenPr");
 		expect(mergeControlOf(github({ pr: pr() }))).toBeNull();
 		// Not read yet, but recorded at this head: 查看 PR takes its place too.
 		expect(mergeControlOf(github({ pr: pr({ state: null }) }))).toBeNull();
@@ -1268,5 +1272,51 @@ describe("pull requests (G)", () => {
 			// The promise of a coming PR flow is gone everywhere.
 			expect(JSON.stringify(teams)).not.toMatch(/coming soon|即将提供/);
 		}
+	});
+});
+
+describe("the confirmed GitHub repository (G, review 1)", () => {
+	const github = (over: Partial<TeamWorkMergeSummary> = {}): TeamWorkMergeSummary => ({
+		mode: "github",
+		phase: null,
+		job: null,
+		outcome: null,
+		canMerge: true,
+		disabledReason: null,
+		pr: null,
+		...over,
+	});
+	test("a manager confirms it first; the buttons name owner/repo", () => {
+		const unpinned = github({
+			github: { target: "github.com/acme/app", pinned: null, canConfirm: true },
+		});
+		expect(githubConfirmation(unpinned)).toBe("github.com/acme/app");
+		expect(pullRequestRepo(unpinned)).toBe("acme/app");
+		expect(
+			githubConfirmation(
+				github({ github: { target: "github.com/acme/app", pinned: null, canConfirm: false } }),
+			),
+		).toBeNull();
+		const pinned = github({
+			github: { target: "github.com/acme/app", pinned: "github.com/acme/app", canConfirm: true },
+		});
+		expect(githubConfirmation(pinned)).toBeNull();
+		// The confirmed one is named, whatever origin says now; a GHE host is kept.
+		expect(
+			pullRequestRepo(
+				github({
+					github: { target: "ghe.acme.test/x/y", pinned: "ghe.acme.test/t/app", canConfirm: false },
+				}),
+			),
+		).toBe("ghe.acme.test/t/app");
+		expect(pullRequestRepo({ ...pinned, mode: "local" })).toBeNull();
+		for (const reason of [
+			"github_unconfirmed",
+			"github_target_changed",
+			"remote_config_unsafe",
+		] as const)
+			expect(mergeControlOf(github({ canMerge: false, disabledReason: reason }))?.disabledKey).toBe(
+				`teams.page.merge.disabled.${reason}`,
+			);
 	});
 });

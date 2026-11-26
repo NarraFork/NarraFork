@@ -25,12 +25,11 @@ import {
 	TextInput,
 } from "@mantine/core";
 import { teamBaseBranchSchema } from "@shared/project-team-draft";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { usePlatform } from "../../hooks/usePlatform";
 import { useUpdateProject } from "../../hooks/useProjects";
-import { useSetTeamGithub, useTeamGithub } from "../../hooks/useTeams";
 import { api } from "../../lib/api";
 import type { ApiEntity, PathFlavor } from "../../lib/api/types";
 import { normalizeRuleTargetSelector } from "../../lib/api/types";
@@ -525,8 +524,21 @@ export function ProjectGithubTarget({
 	canManage: boolean;
 }) {
 	const { t } = useTranslation("projects");
-	const github = useTeamGithub(projectId);
-	const set = useSetTeamGithub(projectId);
+	const queryClient = useQueryClient();
+	const queryKey = ["projects", projectId, "team-github"];
+	const github = useQuery({
+		queryKey,
+		queryFn: () => api.getTeamGithub(projectId),
+		enabled: !!projectId,
+		staleTime: 15_000,
+	});
+	const set = useMutation({
+		mutationFn: ({ target }: { target: string | null }) => api.setTeamGithub(projectId, target),
+		onSettled: () => {
+			void queryClient.invalidateQueries({ queryKey });
+			void queryClient.invalidateQueries({ queryKey: ["teams"] });
+		},
+	});
 	const pinned = github.data?.pinned ?? null;
 	const pinnedName = pinned ? `${pinned.host}/${pinned.owner}/${pinned.repo}` : null;
 	const detected = github.data?.detected ?? null;

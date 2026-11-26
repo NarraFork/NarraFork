@@ -7,11 +7,11 @@
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { safeSpawn } from "../../../lib/spawn";
-import { ghNoRepository, ghWorkDir, setGhTimeoutScaleForTests } from "../team-gh";
+import { ghNoRepository, ghVersion, ghWorkDir, setGhTimeoutScaleForTests } from "../team-gh";
 import { teamRepoGit } from "../team-git-write";
 import {
 	hostingOf,
@@ -332,6 +332,21 @@ describe.skipIf(!posix)("gh (a fake on PATH)", () => {
 				expect({ key, present: key in call.env }).toEqual({ key, present: false });
 			// Every repository named explicitly.
 			if (call.args[0] === "repo") expect(call.args[2]).toBe("github.com/acme/app");
+		}
+	});
+
+	test("a planted .git or no-repository in gh's directory: gh is not run", async () => {
+		await resolveHosting("git@github.com:acme/app.git");
+		for (const planted of [".git", "no-repository"]) {
+			const path = join(ghWorkDir(), planted);
+			await mkdir(path, { recursive: true });
+			await fake.clearCalls();
+			try {
+				await expect(ghVersion()).rejects.toThrow(planted);
+				expect(await fake.calls()).toEqual([]);
+			} finally {
+				await rm(path, { recursive: true, force: true });
+			}
 		}
 	});
 

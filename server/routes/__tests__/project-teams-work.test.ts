@@ -1078,6 +1078,35 @@ describe("pull requests (G)", () => {
 		const { item } = await readyItem("PR access", { "pr/access.txt": "pr\n" });
 		const restore = await onGitHub({ ok: true, methods: ["squash", "merge"] });
 		try {
+			// Nothing confirmed yet: a member who may not manage the project waits for a manager.
+			const unconfirmed = await call(MEMBER, teamPath(`work/${item.id}`));
+			expect(unconfirmed.body.merge).toMatchObject({
+				mode: "github",
+				canMerge: false,
+				disabledReason: "github_unconfirmed",
+				github: { target: "github.com/acme/app", pinned: null, canConfirm: false },
+			});
+			expect((await call(OWNER, teamPath(`work/${item.id}`))).body.merge.github).toMatchObject({
+				canConfirm: true,
+			});
+			const refused = await call(MEMBER, teamPath(`work/${item.id}/merge`), { method: "POST" });
+			expect(refused.body.code).toBe("TEAM_PR_TARGET_UNCONFIRMED");
+			// Only a project manager confirms it.
+			const pinPath = `/projects/${projectId}/team-github`;
+			const body = { target: "github.com/acme/app" };
+			expect((await call(MEMBER, pinPath, { method: "PUT", body })).status).toBe(403);
+			expect((await call(OUTSIDER, pinPath, { method: "PUT", body })).status).toBe(404);
+			expect(
+				(await call(OWNER, pinPath, { method: "PUT", body: { target: "acme/app" } })).status,
+			).toBe(400);
+			const pinned = await call(OWNER, pinPath, { method: "PUT", body });
+			expect(pinned.status).toBe(200);
+			expect(pinned.body).toMatchObject({
+				pinned: { host: "github.com", owner: "acme", repo: "app", confirmedBy: OWNER },
+				detected: "github.com/acme/app",
+			});
+			// Reading it needs project read only.
+			expect((await call(MEMBER, pinPath)).body.pinned.repo).toBe("app");
 			for (const suffix of ["pr/merge", "pr/refresh"]) {
 				const path = teamPath(`work/${item.id}/${suffix}`);
 				expect((await call(READER, path, { method: "POST" })).status).toBe(403);
@@ -1108,8 +1137,41 @@ describe("pull requests (G)", () => {
 				detail: { kind: "failed", code: "TEAM_PR_NONE" },
 			});
 			expect(work.requireWorkItem(teamId, item.id).state).toBe("ready");
+			expect((await call(OWNER, pinPath, { method: "DELETE" })).body.pinned).toBeNull();
 		} finally {
 			restore();
+		}
+	});
+
+	test("the project PATCH never writes the confirmed repository, and keeps it", async () => {
+		const { projectRoutes } = await import("../projects");
+		const app = new Hono();
+		app.use("*", async (c, next) => {
+			c.set("user", { sub: OWNER, role: "user", iat: 0, exp: Number.MAX_SAFE_INTEGER });
+			await next();
+		});
+		app.route("/projects", projectRoutes);
+		const { pinnedGithubTarget, setPinnedGithubTarget } = await import(
+			"../../services/teams/team-github-pin"
+		);
+		setPinnedGithubTarget(projectId, { host: "github.com", owner: "acme", repo: "app" }, OWNER);
+		try {
+			const response = await app.request(`http://localhost/projects/${projectId}`, {
+				method: "PATCH",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					chapterSettings: {
+						teams: {
+							workStart: "local",
+							github: { host: "github.com", owner: "attacker", repo: "app" },
+						},
+					},
+				}),
+			});
+			expect(response.status).toBe(200);
+			expect(pinnedGithubTarget(projectId)).toMatchObject({ owner: "acme", repo: "app" });
+		} finally {
+			setPinnedGithubTarget(projectId, null, null);
 		}
 	});
 
