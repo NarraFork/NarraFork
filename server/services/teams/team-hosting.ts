@@ -70,7 +70,12 @@ export type ProjectHosting =
 	/** The push URL could not be read: neither GitHub nor not (merging waits; never local). */
 	| { kind: "unknown" }
 	/** G: the repository's own configuration redirects origin (a push URL or a rewrite): refused. */
-	| { kind: "unsafe"; key: string };
+	| {
+			kind: "unsafe";
+			key: string;
+			/** Why, as a refusal says it (every URL's login redacted). */
+			message: string;
+	  };
 
 const GITHUB_HOSTS = new Map([
 	["github.com", "github.com"],
@@ -286,7 +291,8 @@ function refresh(repo: string): Promise<ProjectHosting> {
 	const read = readOriginTarget(repo).then(
 		(origin) => resolveHosting(origin?.resolved ?? null),
 		(error: unknown): ProjectHosting => {
-			if (error instanceof UnsafeRemoteConfigError) return { kind: "unsafe", key: error.key };
+			if (error instanceof UnsafeRemoteConfigError)
+				return { kind: "unsafe", key: error.key, message: error.message };
 			throw error;
 		},
 	);

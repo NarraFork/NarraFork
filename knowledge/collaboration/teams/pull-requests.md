@@ -65,7 +65,7 @@ keywords:
   - currentPullRequest
   - resolveRemoteArgument
 status: draft
-verified_at: 330e310b25cd687f6bdafe382da17a2ac91da559
+verified_at: 7303089afdc233b6dbff4441b2f9f025813801a6
 ---
 # GitHub PR 流程
 

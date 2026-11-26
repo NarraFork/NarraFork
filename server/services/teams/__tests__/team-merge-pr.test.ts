@@ -1201,6 +1201,40 @@ describe.skipIf(process.platform === "win32")("review fixes, second round (Devin
 		expect((await summary(a.id)).pr).toMatchObject({ queued: true });
 	});
 
+	test("a host rule carrying a token never reaches a refusal, an event or the summary (review 1)", async () => {
+		const a = await readyItem("token");
+		await github(a.head);
+		// The request is accepted (GitHub, confirmed); then origin turns out to resolve through a
+		// chain whose last rule carries a token.
+		await writeFile(
+			globalConfig,
+			`[user]\n\tname = Host\n\temail = host@e.test\n[url "https://github.com/"]\n\tinsteadOf = gh:\n[url "https://x-access-token:T0K@github.com/"]\n\tinsteadOf = https://github.com/\n`,
+		);
+		await git(["remote", "set-url", "origin", "gh:acme/app.git"]);
+		open(a.id);
+		setHostingSourceForTests(null);
+		await settle();
+		const failed = events(a.id, "work.merge_failed");
+		expect(failed.at(-1)?.detail).toMatchObject({ code: "TEAM_REMOTE_CONFIG_UNSAFE" });
+		expect(JSON.stringify(failed)).not.toContain("T0K");
+		// Read again: the hosting is `unsafe`, its words redacted; the 409 and the summary too.
+		const hosting = await hostingOf(repo);
+		expect(hosting).toMatchObject({ kind: "unsafe" });
+		expect(JSON.stringify(hosting)).not.toContain("T0K");
+		const refused = (() => {
+			try {
+				open(a.id);
+				return null;
+			} catch (error) {
+				return error as Error & { code?: string };
+			}
+		})();
+		expect(refused?.code).toBe("TEAM_REMOTE_CONFIG_UNSAFE");
+		expect(refused?.message).toContain("host's");
+		expect(refused?.message).not.toContain("T0K");
+		expect(JSON.stringify(await summary(a.id))).not.toContain("T0K");
+	});
+
 	test("4: a legacy event's repository comes from its URL's host with the port", () => {
 		const ref = { host: "ghe.test:8443", owner: "Acme", repo: "App", number: 7 };
 		expect(aboutPullRequest({ pr: 7, url: "https://ghe.test:8443/acme/app/pull/7" }, ref)).toBe(

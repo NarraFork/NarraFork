@@ -368,13 +368,25 @@ function identityUnknown(): AppError {
 const NETWORK_PATTERN =
 	"^(credential\\..*|core\\.askpass|core\\.sshcommand|core\\.gitproxy|http\\..*|remote\\.origin\\.(url|proxy|vcs|uploadpack)|url\\..*\\.insteadof|protocol\\..*)$";
 
-/** A network fetch the repository's configuration makes unsafe: the key that does. */
+/**
+ * A fetch or push the configuration makes unsafe: the key that does (by default one of the
+ * repository's own; `message` words any other case). Key and message are redacted of every URL's
+ * login (a rule's key can be `url.https://user:token@host/.insteadof`): they reach responses,
+ * events and logs.
+ */
 export class UnsafeRemoteConfigError extends AppError {
-	constructor(
-		readonly key: string,
-		message = `The repository's own configuration sets ${key}, which could run a program or choose the credentials or transport of a fetch; NarraFork does not fetch with it (set it in the global configuration instead)`,
-	) {
-		super(message, 409, "TEAM_REMOTE_CONFIG_UNSAFE");
+	readonly key: string;
+	constructor(key: string, message?: string) {
+		const safe = redactUserinfo(key);
+		super(
+			redactUserinfo(
+				message ??
+					`The repository's own configuration sets ${safe}, which could run a program or choose where origin is or the credentials or transport used with it; NarraFork does not fetch, push or merge with it (set it in the global configuration instead)`,
+			),
+			409,
+			"TEAM_REMOTE_CONFIG_UNSAFE",
+		);
+		this.key = safe;
 	}
 }
 
@@ -442,7 +454,8 @@ export function networkOverrides(
 			const prefixes = entries
 				.filter((entry) => entry.key === key && isRepositoryScope(entry.scope))
 				.map((entry) => entry.value);
-			if (originUrl && prefixes.some((prefix) => prefix && originUrl.startsWith(prefix)))
+			// An empty prefix matches every URL (git's `alias_url`).
+			if (originUrl && prefixes.some((prefix) => originUrl.startsWith(prefix)))
 				throw new UnsafeRemoteConfigError(key);
 			continue;
 		}
@@ -542,7 +555,7 @@ export function assertPushUrlUntouched(
 			lower.startsWith("url.") &&
 			(lower.endsWith(".insteadof") ||
 				(direction === "push" && lower.endsWith(".pushinsteadof"))) &&
-			entry.value &&
+			// An empty prefix matches every URL (git's `alias_url`).
 			url.startsWith(entry.value)
 		)
 			throw new UnsafeRemoteConfigError(entry.key);
@@ -563,6 +576,24 @@ export interface OriginTarget {
 }
 
 /**
+ * `url.<base>.*` rules in the order git's `alias_url` weighs them (`remote.c`): one rewrite per
+ * base (and per kind, `insteadOf` / `pushInsteadOf`) in the order each base first appears, its
+ * values in configuration order. With a strict "longer wins", the first of equally long prefixes in
+ * that order is the one git takes.
+ */
+function inGitOrder(entries: readonly ScopedConfigEntry[]): ScopedConfigEntry[] {
+	const groups = new Map<string, ScopedConfigEntry[]>();
+	for (const entry of entries) {
+		const dot = entry.key.lastIndexOf(".");
+		const group = `${entry.key.slice(dot).toLowerCase()}\0${entry.key.slice(0, dot)}`;
+		const list = groups.get(group);
+		if (list) list.push(entry);
+		else groups.set(group, [entry]);
+	}
+	return [...groups.values()].flat();
+}
+
+/**
  * The URL a set of `url.<base>.<key>` entries rewrites `url` to: the longest matching prefix wins
  * (git's rule), and the URL is returned as it is when none matches.
  */
@@ -572,11 +603,12 @@ function rewritten(
 	key: "insteadof" | "pushinsteadof",
 ): string | null {
 	let best: { base: string; prefix: string } | null = null;
-	for (const entry of entries) {
+	for (const entry of inGitOrder(entries)) {
 		const lower = entry.key.toLowerCase();
 		if (!lower.startsWith("url.") || !lower.endsWith(`.${key}`)) continue;
 		const prefix = entry.value;
-		if (!prefix || !url.startsWith(prefix)) continue;
+		// An explicitly empty prefix matches every URL (the shortest match), as in git.
+		if (!url.startsWith(prefix)) continue;
 		if (!best || prefix.length > best.prefix.length)
 			best = { base: entry.key.slice("url.".length, entry.key.length - key.length - 1), prefix };
 	}
@@ -587,16 +619,29 @@ function rewritten(
 export function originTargetOf(entries: readonly ScopedConfigEntry[]): OriginTarget | null {
 	const pushurl = entries.find((entry) => entry.key.toLowerCase() === "remote.origin.pushurl");
 	// Where a push goes is origin's URL, and only that: a push URL of any scope is refused.
-	if (pushurl) throw new UnsafeRemoteConfigError(pushurl.key);
+	if (pushurl)
+		throw new UnsafeRemoteConfigError(
+			pushurl.key,
+			isRepositoryScope(pushurl.scope)
+				? undefined
+				: `The host's configuration sets ${pushurl.key}; NarraFork pushes only to origin's URL and does not push or merge while a push URL is set`,
+		);
 	const urls = entries.filter((entry) => entry.key.toLowerCase() === "remote.origin.url");
 	if (urls.length === 0) return null;
-	if (urls.length > 1) throw new UnsafeRemoteConfigError("remote.origin.url");
+	if (urls.length > 1)
+		throw new UnsafeRemoteConfigError(
+			"remote.origin.url",
+			"origin has several URLs; NarraFork pushes only to a single one and does not push or merge until there is one",
+		);
 	const url = urls[0]?.value.trim() ?? "";
 	if (!url) return null;
 	// Where git pushes is exactly the argument it is given (`resolveRemoteArgument`): the guard
 	// compares the repository a person confirmed with that very URL.
 	const argument = resolveRemoteArgument(url, entries, "push");
-	return { url, resolved: "message" in argument ? redactUserinfo(url) : argument.url };
+	// An argument git cannot be given is never "not GitHub": the hosting is `unsafe`.
+	if ("message" in argument)
+		throw new UnsafeRemoteConfigError("remote.origin.url", argument.message);
+	return { url, resolved: argument.url };
 }
 
 /** A URL with any userinfo (`user:token@`) removed, for messages. */
@@ -679,12 +724,12 @@ function matchingRule(
 	direction: "fetch" | "push",
 ): ScopedConfigEntry | null {
 	let best: ScopedConfigEntry | null = null;
-	for (const entry of entries) {
+	for (const entry of inGitOrder(entries)) {
 		const lower = entry.key.toLowerCase();
 		if (!lower.startsWith("url.") || !rewriteKeys(direction).some((key) => lower.endsWith(key)))
 			continue;
 		if (
-			entry.value &&
+			// An explicitly empty prefix matches every URL (the shortest match), as in git.
 			url.startsWith(entry.value) &&
 			entry.value.length > (best?.value.length ?? -1)
 		)
@@ -699,17 +744,19 @@ function matchingRule(
  *
  * 1. NarraFork makes git's single rewrite pass itself, as git does for a named remote
  *    (`remote.c:alias_all_urls`): a push takes the host's longest matching `pushInsteadOf`, else
- *    its longest matching `insteadOf`; a fetch only `insteadOf`. Only system/global rules; one of
+ *    its longest matching `insteadOf`; a fetch only `insteadOf` (an empty prefix matches every
+ *    URL; ties go as in git, {@link inGitOrder}). Only system/global rules; one of
  *    the repository's own (local or worktree) that matches is refused.
  * 2. The login is split off (`splitUrlCredentials`) and a bare name becomes `./<name>` (a path, as
  *    for the named remote; to `git fetch` a bare name is a nickname).
  * 3. Git must not rewrite that argument again: when a host rule matches it, the URL with the user
- *    kept (`https://user@host/…`, when the login had one) is tried instead, and when a rule
+ *    kept (`https://user@host/…`, when the login had a user) is tried instead, and when a rule
  *    matches that too the remote is refused (`UnsafeRemoteConfigError`). So what git contacts is
  *    the argument itself: `http.<argument>.*` settings are keyed on the real destination, and the
  *    hosting read from `originTarget().resolved` is that destination.
  *
- * A password on a transport that cannot take it by environment (`message`).
+ * A password on a transport that cannot take it by environment, or an argument not safe on a
+ * command line, is `message` (every caller fails on it; `originTarget` as `unsafe`).
  */
 export function resolveRemoteArgument(
 	configured: string,
@@ -730,6 +777,8 @@ export function resolveRemoteArgument(
 			message:
 				"Origin's URL carries a password NarraFork cannot hand to git without putting it on a command line; use a credential helper of the host instead",
 		};
+	// The user kept, when there is one (with an empty user, `https://@host/…`, git never asks the
+	// helper for the password: no use).
 	const userKept =
 		split.credentials?.username && split.url !== rewrittenUrl
 			? rewrittenUrl.replace(/^([a-z][a-z0-9+.-]*:\/\/)([^:@/]*):[^@/]*@/i, "$1$2@")
@@ -737,6 +786,8 @@ export function resolveRemoteArgument(
 	const candidates = [split.url, ...(userKept && userKept !== split.url ? [userKept] : [])].map(
 		(url) => (isBareName(url) ? `./${url}` : url),
 	);
+	if (candidates.some((url) => !url || url.startsWith("-") || unsafeForCommand(url)))
+		return { message: "Origin's URL resolves to one git cannot be given on a command line" };
 	const again: string[] = [];
 	for (const url of candidates) {
 		const ownAgain = matchingRule(url, repository, direction);

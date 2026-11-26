@@ -83,6 +83,7 @@ import {
 	gitVersion,
 	inspectCheckout,
 	peekGitVersion,
+	redactUserinfo,
 	supportsMergeTree,
 	teamRepoGit,
 } from "./team-git-write";
@@ -355,12 +356,9 @@ export function githubPinCheck(
 	return { pinned, reason: null, refusal: null };
 }
 
-const unsafeRefusal = (key: string) =>
-	new AppError(
-		`The repository's own configuration sets ${key}, which would choose where origin is; NarraFork neither pushes nor merges with it (set it in the global configuration instead)`,
-		409,
-		"TEAM_REMOTE_CONFIG_UNSAFE",
-	);
+/** The refusal of an `unsafe` origin, in the words read with it (logins already redacted). */
+const unsafeRefusal = (hosting: { key: string; message: string }) =>
+	new AppError(redactUserinfo(hosting.message), 409, "TEAM_REMOTE_CONFIG_UNSAFE");
 
 /** G: why gh cannot serve a GitHub origin, as a disabled reason (null: it can). */
 export function ghDisabledReason(access: GhAccess | undefined): TeamMergeDisabledReason | null {
@@ -918,7 +916,7 @@ export function requestMerge(input: {
 	const hosting = cachedHosting(team.projectId);
 	const mode = modeOfHosting(hosting);
 	if (hosting && hosting !== "no_repository" && hosting.kind === "unsafe")
-		throw unsafeRefusal(hosting.key);
+		throw unsafeRefusal(hosting);
 	// G: a GitHub origin pushes the branch and opens (or updates) its pull request instead.
 	if (mode === "github" && hosting && hosting !== "no_repository" && hosting.kind === "github") {
 		const refusal = ghRefusal(hosting.gh) ?? githubPinCheck(team.projectId, hosting).refusal;
@@ -1049,7 +1047,7 @@ export async function jobFacts(context: JobContext, signal: AbortSignal) {
 	const base = item.baseRef ?? team.baseBranch;
 	const git = teamRepoGit(repo, { signal });
 	if (hosting.kind === "unsafe") {
-		const refusal = unsafeRefusal(hosting.key);
+		const refusal = unsafeRefusal(hosting);
 		throw new MergeFailure(refusal.code ?? "TEAM_REMOTE_CONFIG_UNSAFE", refusal.message);
 	}
 	if (hosting.kind === "github") {

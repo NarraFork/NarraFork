@@ -1788,6 +1788,120 @@ describe("the fetch of origin's base (review 5)", () => {
 		}
 	});
 
+	test("an explicitly empty insteadOf matches every URL, as in git: a catch-all after a specific rule is refused (Devin)", async () => {
+		const head = await commitFile("a.txt", "a\n", "base");
+		const primary = join(temporary, `primary-${Math.random().toString(36).slice(2)}.git`);
+		await git(["init", "-q", "--bare", "-b", "main", primary], temporary);
+		await git(["push", "-q", primary, "main"]);
+		const backup = join(temporary, `backup-${Math.random().toString(36).slice(2)}`);
+		await writeFile(
+			globalConfig,
+			`${HOST_USER}[url "${primary}"]\n\tinsteadOf = prim:\n[url "${backup}"]\n\tinsteadOf =\n`,
+		);
+		// Real git: the empty prefix rewrites any URL.
+		await git(["remote", "add", "probe", primary]);
+		expect(await git(["remote", "get-url", "probe"])).toBe(`${backup}${primary}`);
+		await git(["remote", "remove", "probe"]);
+		await git(["remote", "add", "origin", "prim:"]);
+		// prim: → the primary, which the catch-all would rewrite again: refused, never followed.
+		const fetched = await teamRepoGit(repo).fetchBaseFromOrigin("main");
+		expect(fetched).toMatchObject({
+			ok: false,
+			message: expect.stringContaining("would rewrite again"),
+		});
+		expect(await git(["for-each-ref", "refs/remotes/"])).toBe("");
+		await expect(teamRepoGit(repo).originTarget()).rejects.toMatchObject({
+			code: "TEAM_REMOTE_CONFIG_UNSAFE",
+		});
+		await expect(
+			teamRepoGit(repo).pushBranch({ url: "prim:", head, branch: "team/x" }),
+		).rejects.toMatchObject({ code: "TEAM_REMOTE_CONFIG_UNSAFE" });
+		expect(await git(["for-each-ref", "refs/heads/team/"], primary)).toBe("");
+		// The resolver: the empty rule is the shortest match.
+		const rule = (key: string, value: string): ScopedConfigEntry => ({
+			scope: "global",
+			key,
+			value,
+		});
+		expect(() =>
+			resolveRemoteArgument("/srv/primary/app.git", [rule("url./backup.insteadof", "")], "fetch"),
+		).toThrow(expect.objectContaining({ code: "TEAM_REMOTE_CONFIG_UNSAFE" }));
+		// The repository's own catch-all is refused like any repository rule.
+		await writeFile(globalConfig, HOST_USER);
+		await git(["remote", "set-url", "origin", primary]);
+		await git(["config", `url.${backup}.insteadOf`, ""]);
+		expect(await teamRepoGit(repo).fetchBaseFromOrigin("main")).toMatchObject({ ok: false });
+		expect(await git(["for-each-ref", "refs/remotes/"])).toBe("");
+	});
+
+	test("equally long prefixes: the first base in first-appearance order wins, as in git (review 3)", async () => {
+		await commitFile("a.txt", "a\n", "base");
+		const a = join(temporary, "tie-A/");
+		const b = join(temporary, "tie-B/");
+		await writeFile(
+			globalConfig,
+			`${HOST_USER}[url "${a}"]\n\tinsteadOf = zz:\n[url "${b}"]\n\tinsteadOf = p:\n[url "${a}"]\n\tinsteadOf = p:\n`,
+		);
+		await git(["remote", "add", "origin", "p:app.git"]);
+		// What git itself makes of it.
+		expect(await git(["remote", "get-url", "origin"])).toBe(`${a}app.git`);
+		expect((await teamRepoGit(repo).originTarget())?.resolved).toBe(`${a}app.git`);
+	});
+
+	test("an empty user with a password and a host rule on the URL without it: refused, not followed (review 4)", () => {
+		// `https://@host/…` would dodge the rule, but git then never asks the helper for the password.
+		expect(() =>
+			resolveRemoteArgument(
+				"https://:pw@github.com/o/r",
+				[
+					{
+						scope: "global",
+						key: "url.https://x-access-token:T0K@github.com/.insteadof",
+						value: "https://github.com/",
+					},
+				],
+				"fetch",
+			),
+		).toThrow(expect.objectContaining({ code: "TEAM_REMOTE_CONFIG_UNSAFE" }));
+		// With a user, the user kept dodges it.
+		expect(
+			resolveRemoteArgument(
+				"https://ci:pw@github.com/o/r",
+				[
+					{
+						scope: "global",
+						key: "url.https://x-access-token:T0K@github.com/.insteadof",
+						value: "https://github.com/",
+					},
+				],
+				"fetch",
+			),
+		).toMatchObject({ url: "https://ci@github.com/o/r" });
+	});
+
+	test("a refusal never carries a login: not the rule's key, not origin's URL (review 1)", async () => {
+		await commitFile("a.txt", "a\n", "base");
+		await writeFile(
+			globalConfig,
+			`${HOST_USER}[url "https://github.com/"]\n\tinsteadOf = gh:\n[url "https://x-access-token:T0K@github.com/"]\n\tinsteadOf = https://github.com/\n`,
+		);
+		await git(["remote", "add", "origin", "gh:acme/app.git"]);
+		const error = await teamRepoGit(repo)
+			.originTarget()
+			.then(
+				() => null,
+				(caught: unknown) => caught as UnsafeRemoteConfigError,
+			);
+		expect(error).toMatchObject({ code: "TEAM_REMOTE_CONFIG_UNSAFE" });
+		expect(`${error?.key} ${error?.message}`).not.toContain("T0K");
+		expect(error?.message).toContain("host's");
+		const fetched = await teamRepoGit(repo).fetchBaseFromOrigin("main");
+		expect(JSON.stringify(fetched)).not.toContain("T0K");
+		expect(new UnsafeRemoteConfigError("url.https://u:pw@h/.insteadof").message).not.toContain(
+			"pw@",
+		);
+	});
+
 	test("up → upstream.git (a prefix of it): fetched from ./upstream.git (Devin)", async () => {
 		await commitFile("a.txt", "a\n", "base");
 		const upstream = join(repo, "upstream.git");

@@ -164,12 +164,34 @@ describe("the push URL", () => {
 		}
 	});
 
+	test("a shorthand the host rewrites to a URL git cannot be given (a password on ssh) is `unsafe`, never local (Devin)", async () => {
+		const repo = await realpath(await mkdtemp(join(temporary, "repo-")));
+		await git(["init", "-q", "-b", "main"], repo);
+		await git(["remote", "add", "origin", "gh:acme/app.git"], repo);
+		try {
+			await writeFile(
+				process.env.GIT_CONFIG_GLOBAL ?? "",
+				'[user]\n\tname = Host\n\temail = h@e.test\n[url "ssh://git:pw@github.com/"]\n\tinsteadOf = gh:\n',
+			);
+			const hosting = await hostingOf(repo);
+			expect(hosting).toMatchObject({ kind: "unsafe", key: "remote.origin.url" });
+			// Never "not GitHub" (`other`), which would offer a local merge: the merge waits
+			// (`remote_config_unsafe`).
+			expect(hosting.kind).not.toBe("other");
+		} finally {
+			await writeFile(
+				process.env.GIT_CONFIG_GLOBAL ?? "",
+				"[user]\n\tname = Host\n\temail = h@e.test\n",
+			);
+		}
+	});
+
 	test("a redirected origin is `unsafe`: never GitHub, never local, read again soon", async () => {
 		const repo = await realpath(await mkdtemp(join(temporary, "repo-")));
 		await git(["init", "-q", "-b", "main"], repo);
 		await git(["remote", "add", "origin", "git@github.com:acme/app.git"], repo);
 		await git(["config", "remote.origin.pushurl", "git@github.com:evil/app.git"], repo);
-		expect(await hostingOf(repo)).toEqual({ kind: "unsafe", key: "remote.origin.pushurl" });
+		expect(await hostingOf(repo)).toMatchObject({ kind: "unsafe", key: "remote.origin.pushurl" });
 	});
 });
 
