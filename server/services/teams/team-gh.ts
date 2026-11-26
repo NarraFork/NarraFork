@@ -197,6 +197,13 @@ interface GhResult {
 	exitCode: number;
 }
 
+let timeoutScale = 1;
+
+/** Scale every gh timeout (tests: a hung fake gh times out in milliseconds); 1 restores them. */
+export function setGhTimeoutScaleForTests(scale: number): void {
+	timeoutScale = scale;
+}
+
 async function runGh(
 	args: readonly string[],
 	options: {
@@ -216,7 +223,7 @@ async function runGh(
 		cmd: [bin, ...args],
 		cwd: dir,
 		env: ghEnv(dir),
-		timeout: options.timeout,
+		timeout: Math.max(1, Math.round(options.timeout * timeoutScale)),
 		maxOutputBytes: options.maxOutputBytes,
 		...(options.stdin ? { stdin: options.stdin } : {}),
 		signal: options.signal,
