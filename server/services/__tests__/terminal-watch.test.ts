@@ -1080,6 +1080,7 @@ describe("output gaps from a durable executor session", () => {
 		output(buffer, "$ ");
 		const ready = await start(buffer, "READY", { kind: "offset", offset: 0 });
 		const done = await start(buffer, "DONE", { kind: "offset", offset: 0 });
+		const exit = await startLifecycle(buffer);
 		await interruptTextWatchesForRestart(TERMINAL, buffer, "lost");
 		for (const id of [ready, done]) {
 			const ended = await waitForStatus(id);
@@ -1087,5 +1088,11 @@ describe("output gaps from a durable executor session", () => {
 			expect(ended?.output).toContain("executor restarted");
 		}
 		expect(await notices()).toHaveLength(1);
+		// The exit watch is not swallowed by the restart notice: the terminal's end
+		// is still reported when its buffer goes away.
+		expect((await row(exit))?.status).toBe("running");
+		await endWatchesForBuffer(TERMINAL, buffer, "the terminal exited");
+		expect((await waitForStatus(exit))?.output).toContain("the terminal exited");
+		expect(await notices()).toHaveLength(2);
 	});
 });

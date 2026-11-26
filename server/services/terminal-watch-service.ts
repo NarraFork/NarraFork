@@ -788,9 +788,9 @@ export async function interruptTextWatchesForRestart(
 			outcome === "lost"
 				? `the device's executor restarted while terminal "${watch.terminalName}" was running, and output after its last recorded byte was not kept`
 				: `the device could not record all output from terminal "${watch.terminalName}" before its executor restarted`,
-		// The terminal ends with the restart: one ending notice per watcher, as when
-		// its buffer is disposed.
-		true,
+		// One notice per watcher for the restart, but not the terminal's ending key: a
+		// watch for the terminal's exit still reports that on its own.
+		"interrupted by an executor restart",
 	);
 }
 
@@ -802,7 +802,8 @@ async function interruptTextWatches(
 	terminalId: string,
 	buffer: BufferManager,
 	cause: (watch: Watch) => string,
-	sharedEnding = false,
+	/** Watches ended by one interruption share one notice per watcher under this key. */
+	sharedKey?: string,
 ): Promise<void> {
 	const current = [...(byTerminal.get(terminalId) ?? [])]
 		.map((id) => watches.get(id))
@@ -820,7 +821,7 @@ async function interruptTextWatches(
 			watch,
 			"failed",
 			`Terminal watch ended: ${cause(watch)}, so ${JSON.stringify(watch.pattern)} may have appeared without being observed. Read the terminal before continuing; do not resend input automatically.`,
-			sharedEnding ? endedKey(watch) : undefined,
+			sharedKey && watch.buffer ? `${endedKey(watch)} ${sharedKey}` : undefined,
 		);
 	}
 }
