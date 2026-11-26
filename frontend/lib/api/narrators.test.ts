@@ -115,7 +115,7 @@ describe("narrators API", () => {
 			text: "/new task",
 			bufferedAt: "now",
 			imageCount: 0,
-			state: "failed",
+			state: "failed" as const,
 			retryOnly: true,
 		};
 		Object.defineProperty(g, "fetch", {
