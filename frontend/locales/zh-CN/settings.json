@@ -148,7 +148,7 @@
 			"context": "上下文",
 			"output": "最大输出",
 			"reasoning": "推理档位",
-			"price": "价格 输入 / 输出（$/M）"
+			"price": "参考价格"
 		},
 		"edit": "编辑模型参数",
 		"editParameters": "编辑模型参数",
@@ -207,6 +207,8 @@
 		"details": "模型资料与价格",
 		"actualPricing": "NUG 实际渠道报价",
 		"reference": "参考 $/M 输入 / 输出",
+		"timeOfUseNote": "仅供目录参考，适用时段与实际收费以供应商为准。",
+		"aboveTokens": "超过 {{count}} token",
 		"free": "0（免费）",
 		"unknown": "明确未知",
 		"unreported": "未报告 / 跟随继承",
@@ -265,7 +267,9 @@
 			"standard": "标准",
 			"batch": "批处理",
 			"flex": "Flex",
-			"priority": "Priority"
+			"priority": "Priority",
+			"peak": "高峰参考价",
+			"off_peak": "非高峰参考价"
 		},
 		"basis": {
 			"full": "超阈值后整次请求按该档计价",
@@ -284,6 +288,7 @@
 			"audio": "音频",
 			"video": "视频",
 			"media": "媒体",
+			"reasoning": "思考",
 			"search_context_size_low": "低搜索上下文",
 			"search_context_size_medium": "中搜索上下文",
 			"search_context_size_high": "高搜索上下文"

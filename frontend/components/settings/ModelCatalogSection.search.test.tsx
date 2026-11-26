@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { MantineProvider, Select } from "@mantine/core";
 import type { AutoModelInfo } from "@shared/auto-model";
+import { timeOfUsePriceGroups } from "@shared/model-catalog/card";
 import type { ModelDescription } from "@shared/model-catalog/schema/api";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import i18next, { type i18n } from "i18next";
@@ -298,6 +299,29 @@ function SelectorHarness() {
 }
 
 describe("catalog search with real model hooks", () => {
+	test("shows time-of-use tariffs as labelled references, not standard prices", async () => {
+		const value = "edge:gpt-6-astra";
+		queryClient.setQueryData(modelCatalogKeys.model(value), {
+			...description(value, "Astral ultra"),
+			timeOfUsePrices: timeOfUsePriceGroups({
+				input_cost_per_token_peak: 2e-6,
+				input_cost_per_token_off_peak: 1e-6,
+				cache_read_input_token_cost_off_peak: 0,
+				cache_creation_input_token_cost_off_peak: null,
+			}),
+		} satisfies ModelDescription);
+		await render(<ModelCatalogSection />);
+		expect(container.querySelector("thead th:nth-child(5)")?.textContent).toBe("Reference prices");
+		const cell = container.querySelector("tbody tr td:nth-child(5)")?.textContent;
+		expect(cell).toContain("Peak reference pricesInput: 2 USD / 1M tokens");
+		expect(cell).toContain("Off-peak reference prices");
+		expect(cell).toContain("Input: 1 USD / 1M tokens");
+		expect(cell).toContain("Cache read: 0 USD / 1M tokens");
+		expect(cell).toContain("Cache write: Unknown");
+		expect(cell).toContain("The applicable hours and actual charges depend on the provider.");
+		expect(cell).not.toContain("—");
+	});
+
 	test("matches provider display names and combines them with catalog aliases", async () => {
 		await render(<ModelCatalogSection />);
 		await type(catalogInput(), "Example Cloud ULTRA");

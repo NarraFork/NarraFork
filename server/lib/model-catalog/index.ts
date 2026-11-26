@@ -29,6 +29,8 @@ import {
 } from "@shared/model-catalog/resolve";
 import type { CatalogStatus } from "@shared/model-catalog/schema/api";
 import type { RawCatalog } from "@shared/model-catalog/schema/catalog";
+import { parseModelId } from "@shared/model-id";
+import { bareModelForEffort, resolveRouteReasoning } from "@shared/reasoning-effort-support";
 import { TOKENDANCE_PREFIX } from "@shared/tokendance";
 import { getCachedCommandCodeModels } from "../commandcode-models";
 import { COMMAND_CODE_PREFIX } from "../commandcode-protocol";
@@ -500,7 +502,11 @@ export function registerListingWindows(lookup: ListingWindows): void {
 }
 
 /** The catalog query and any discovered metadata for a full model value. */
-export function queryForModel(model: string): { query: CatalogQuery; discovered?: RawMetadata } {
+export function queryForModel(model: string): {
+	query: CatalogQuery;
+	discovered?: RawMetadata;
+	gatewayEffortLevels?: string[];
+} {
 	const value = model.trim();
 	const config = providerConfigs().find((c) => c.prefix && value.startsWith(`${c.prefix}:`));
 	// Unlike the public API prefixes, these services need a configured connection.
@@ -538,8 +544,8 @@ export function queryForModel(model: string): { query: CatalogQuery; discovered?
 								? { reasoning_effort_levels: info.effortLevels, reasoning_mode: "levels" }
 								: {}),
 						};
-			// The gateway's tier list (even `[]`) is what its menu offers; fill it in when the
-			// card is silent so the same model never gets an effort the upstream rejects.
+			// Keep the raw card's declaration for metadata readers; runtime applies the
+			// explicit route list separately, ahead of this inherited card.
 			if (
 				info.effortLevels !== undefined &&
 				!Object.hasOwn(discovered, "reasoning_effort_levels")
@@ -547,7 +553,7 @@ export function queryForModel(model: string): { query: CatalogQuery; discovered?
 				discovered.reasoning_effort_levels = info.effortLevels;
 				if (discovered.reasoning_mode == null) discovered.reasoning_mode = "levels";
 			}
-			return { query, discovered };
+			return { query, discovered, gatewayEffortLevels: info.effortLevels };
 		} catch {
 			/* Old gateway without cache: keep the opaque upstream identity. */
 		}
@@ -617,11 +623,15 @@ export function resolveEffectiveModelCard(
 }
 
 /** One resolution per model and request snapshot. Callers must not mutate the result. */
-function effectiveCard(model: string, own = true): ModelCard {
+function effectiveCard(
+	model: string,
+	own = true,
+	lookup?: ReturnType<typeof queryForModel>,
+): ModelCard {
 	const snapshot = requestSnapshots.getStore();
 	const cached = own ? snapshot?.cards.get(model) : undefined;
 	if (cached) return cached;
-	const { query, discovered } = queryForModel(model);
+	const { query, discovered } = lookup ?? queryForModel(model);
 	const card = resolveEffectiveModelCard(query, discovered, model, { own });
 	if (own) snapshot?.cards.set(model, card);
 	return card;
@@ -634,10 +644,21 @@ export function getEffectiveModelCard(model: string): ModelCard & { resolvedQuer
 /** Typed runtime reads for a full model value (`provider:model`); `card` is read-only. */
 export function getEffectiveModelProfile(
 	model: string,
-	options: { own?: boolean } = {},
+	options: { own?: boolean; codex?: boolean } = {},
 ): ModelProfile & { card: Readonly<ModelCard> } {
-	const card = effectiveCard(model, options.own ?? true);
-	return { ...modelProfile(card), card };
+	const lookup = queryForModel(model);
+	const card = effectiveCard(model, options.own ?? true, lookup);
+	const profile = modelProfile(card);
+	const { query, gatewayEffortLevels } = lookup;
+	profile.reasoning = resolveRouteReasoning(profile.reasoning, card, {
+		codexModel: options.codex
+			? bareModelForEffort(
+					query.upstreamModelId === model ? parseModelId(model).model : query.upstreamModelId,
+				)
+			: undefined,
+		effortLevels: gatewayEffortLevels,
+	});
+	return { ...profile, card };
 }
 
 /** Which catalog entry a model value is, without resolving its metadata. */

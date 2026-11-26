@@ -12,6 +12,7 @@ import {
 } from "@shared/tool-result-images";
 import { getInstallationId } from "../installation-id";
 import { logger } from "../logger";
+import { getEffectiveModelProfile } from "../model-catalog";
 import { redactSecretPatterns } from "../net/diagnostic-redaction";
 import { applyProxyExemptions, resolveProxyForUrl } from "../net/proxy";
 import { getToolMessage, type Locale } from "../prompt-i18n";
@@ -340,27 +341,36 @@ export function normalizeCodexReasoningEffort(
 	model: string,
 	reasoningEffort: string | undefined,
 ): string | undefined {
-	return resolveMetadataReasoning(effectiveModelProfile(model), reasoningEffort, model);
+	return resolveMetadataReasoning(
+		getEffectiveModelProfile(model, { codex: true }),
+		reasoningEffort,
+		model,
+	);
 }
 
 /**
  * Resolve the effort value sent on a Codex Responses request, falling back to
- * the configured default. Shared with CodexProvider so both entry points send
- * the same value for the same settings.
+ * the configured default. Do not substitute `none` for a missing effort on
+ * known GPT-6.2 Codex routes, where it is not supported by default.
  */
 export function resolveCodexRequestReasoningEffort(
 	model: string,
 	reasoningEffort?: string,
-): string {
-	return (
-		normalizeCodexReasoningEffort(
-			model,
-			reasoningEffort ??
-				effectiveModelProfile(model).reasoning?.defaultLevel ??
-				settings.agent.defaultReasoningEffort ??
-				"max",
-		) ?? "none"
+): string | undefined {
+	const profile = getEffectiveModelProfile(model, { codex: true });
+	const effort = resolveMetadataReasoning(
+		profile,
+		reasoningEffort ??
+			profile.reasoning.defaultLevel ??
+			settings.agent.defaultReasoningEffort ??
+			"max",
+		model,
 	);
+	// Fixed intensity intentionally resolves an enabled request to no effort.
+	// Do not reinterpret that omission as an explicit off switch.
+	if (profile.reasoning.mode === "fixed") return effort;
+	// Preserve the legacy Codex default only when there is no tier declaration.
+	return Array.isArray(profile.reasoning.levels) ? effort : (effort ?? "none");
 }
 
 /**
@@ -1080,7 +1090,7 @@ export class OpenAIProvider implements ProviderAdapter {
 						diagnosticTransportIdentity(params),
 						this.codexInstallationId(),
 					),
-					reasoningEffort: normalizedCodexReasoningEffort as string,
+					reasoningEffort: normalizedCodexReasoningEffort,
 				});
 			} else {
 				// Plain Responses relays (apiMode "responses", e.g. NUG delegates):

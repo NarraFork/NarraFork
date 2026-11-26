@@ -8,7 +8,87 @@ import {
 	matchesReasoningEffortBlocklist,
 	modelAcceptsReasoningEffort,
 	parseClaudeModel,
+	resolveRouteReasoning,
 } from "../../shared/reasoning-effort-support";
+
+describe("route reasoning precedence", () => {
+	test("explicit tiers trump inherited restrictions and inherited none support", () => {
+		const declared = {
+			levels: ["medium"],
+			canDisable: true,
+			supported: false,
+			mode: "fixed" as const,
+		};
+		const layer = { layer: "preset-model" as const };
+		const preset = {
+			metadata: { supports_none_reasoning_effort: true },
+			provenance: {
+				reasoning_effort_levels: layer,
+				supports_none_reasoning_effort: layer,
+				supports_reasoning: layer,
+				reasoning_mode: layer,
+			},
+		};
+		for (const levels of [["high"], ["none", "high"], []]) {
+			expect(resolveRouteReasoning(declared, preset, { effortLevels: levels })).toEqual({
+				levels,
+				canDisable: levels.includes("none"),
+			});
+		}
+		expect(resolveRouteReasoning(declared, preset, { codexModel: "gpt-6.2-sol" })).toEqual({
+			levels: ["low", "medium", "high", "xhigh", "max"],
+			canDisable: false,
+		});
+	});
+
+	test.each([
+		"local-model",
+		"local-connection",
+	] as const)("%s tiers preserve independent inherited and explicit off support", (layer) => {
+		for (const levels of [["low", "high", "max"], []]) {
+			const card = {
+				metadata: { supports_none_reasoning_effort: true },
+				provenance: {
+					reasoning_effort_levels: { layer },
+					supports_none_reasoning_effort: { layer: "preset-model" as const },
+				},
+			};
+			expect(
+				resolveRouteReasoning({ levels, canDisable: true }, card, {
+					effortLevels: ["high"],
+					codexModel: "gpt-6.2-sol",
+				}),
+			).toEqual({ levels, canDisable: true });
+			expect(
+				resolveRouteReasoning(
+					{ levels, canDisable: true },
+					{
+						metadata: { can_disable_reasoning: true },
+						provenance: { reasoning_effort_levels: { layer }, can_disable_reasoning: { layer } },
+					},
+				),
+			).toEqual({ levels, canDisable: true });
+		}
+	});
+
+	test("local tiers, flags and fixed mode still take precedence", () => {
+		const layer = { layer: "local-connection" as const };
+		const card = {
+			metadata: { can_disable_reasoning: false },
+			provenance: {
+				can_disable_reasoning: layer,
+				reasoning_effort_levels: layer,
+				reasoning_mode: layer,
+			},
+		};
+		expect(
+			resolveRouteReasoning({ levels: ["none", " high ", " ULTRA "], mode: "fixed" }, card, {
+				codexModel: "gpt-6.2-sol",
+				effortLevels: [],
+			}),
+		).toEqual({ levels: ["none", "high"], canDisable: false, mode: "fixed" });
+	});
+});
 
 describe("parseClaudeModel", () => {
 	test("parses the modern family-first shape", () => {

@@ -1,7 +1,9 @@
 import type { ModelProfile } from "@shared/model-catalog/profile";
 import {
 	clampReasoningEffort,
+	isLegacyUltra,
 	migrateLegacyReasoningEffort,
+	normalizeLegacyUltra,
 	REASONING_EFFORT_VALUES,
 	type ReasoningEffort,
 } from "@shared/reasoning-effort";
@@ -117,17 +119,19 @@ export function resolveMetadataReasoning(
 ): string | undefined {
 	const reasoning = profile.reasoning;
 	if (reasoning?.supported === false) return undefined;
-	let effort = requested ?? reasoning?.defaultLevel ?? undefined;
+	const defaultLevel = normalizeLegacyUltra(reasoning?.defaultLevel);
+	let effort = normalizeLegacyUltra(requested) ?? defaultLevel ?? undefined;
 	if (!effort) return undefined;
 	if (effort === "none" && reasoning?.canDisable !== false) return "none";
 	if (reasoning?.mode === "fixed") return undefined;
-	const levels = reasoning?.levels?.filter((level) => level !== "none");
-	if (effort === "none")
-		effort =
-			reasoning?.defaultLevel && reasoning.defaultLevel !== "none"
-				? reasoning.defaultLevel
-				: levels?.[0];
-	if (!effort) return undefined;
+	const levels = reasoning?.levels?.filter(
+		(level) => level.trim().toLowerCase() !== "none" && !isLegacyUltra(level),
+	);
+	if (effort === "none" && !levels?.length) {
+		// Unlike a known unsupported tier, no ladder provides no clamp target.
+		effort = defaultLevel === "none" ? undefined : (defaultLevel ?? undefined);
+		if (!effort) return undefined;
+	}
 	// An explicitly declared empty tier list is a positive claim — "this model has no
 	// selectable thinking intensity" — not missing information. Gateway-discovered
 	// metadata reports exactly this (`effortLevels: []`), and the upstream then rejects
@@ -136,7 +140,7 @@ export function resolveMetadataReasoning(
 	// already returned above, so "turn thinking off" keeps working. `Array.isArray`
 	// keeps the three states apart: [] = no tiers, null = declared unknown, absent =
 	// never declared (both of the latter keep the caller's tier).
-	if (Array.isArray(reasoning?.levels) && reasoning.levels.length === 0) return undefined;
+	if (levels?.length === 0) return undefined;
 	if (levels?.length && !levels.includes(effort)) {
 		const known = levels.filter((level): level is ReasoningEffort =>
 			REASONING_EFFORT_VALUES.includes(level as ReasoningEffort),
@@ -153,9 +157,7 @@ export function resolveMetadataReasoning(
 				known,
 			);
 		}
-		return reasoning?.defaultLevel && levels.includes(reasoning.defaultLevel)
-			? reasoning.defaultLevel
-			: levels[0];
+		return defaultLevel && levels.includes(defaultLevel) ? defaultLevel : levels[0];
 	}
 	return effort;
 }

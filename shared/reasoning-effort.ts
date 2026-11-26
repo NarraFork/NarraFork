@@ -29,6 +29,15 @@ export const REASONING_EFFORT_VALUES: readonly ReasoningEffort[] = [
 	"max",
 ];
 
+/** `ultra` was a client mode, not an upstream model effort. */
+export function isLegacyUltra(effort: string | null | undefined): boolean {
+	return effort?.trim().toLowerCase() === "ultra";
+}
+
+export function normalizeLegacyUltra<T extends string | null | undefined>(effort: T): T | "xhigh" {
+	return isLegacyUltra(effort) ? "xhigh" : effort;
+}
+
 /**
  * Migrate the old DeepSeek UI's `xhigh` selection before applying declared tiers.
  * This is not a capability table: unknown models and declarations that explicitly
@@ -62,6 +71,7 @@ export function clampReasoningEffort(
 	desired: ReasoningEffort,
 	supported: readonly ReasoningEffort[],
 ): ReasoningEffort {
+	desired = normalizeLegacyUltra(desired);
 	if (supported.length === 0) return desired;
 	if (supported.includes(desired)) return desired;
 

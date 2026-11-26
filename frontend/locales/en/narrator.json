@@ -1128,6 +1128,7 @@
 	"reasoning_xhigh": "X-High",
 	"reasoning_max": "Max",
 	"reasoning_none": "Off",
+	"reasoning_enabled": "On",
 	"fast_mode": "Fast Mode",
 	"fast_mode_on": "On",
 	"fast_mode_off": "Off",
