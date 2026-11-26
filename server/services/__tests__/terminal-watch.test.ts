@@ -1073,4 +1073,19 @@ describe("output gaps from a durable executor session", () => {
 		expect(ended?.output).toContain("could not record all output");
 		expect(ended?.output).toContain("may have appeared without being observed");
 	});
+
+	test("unmatched text watches ended by an executor restart share one ending notice", async () => {
+		const { interruptTextWatchesForRestart } = await import("../terminal-watch-service");
+		const buffer = newBuffer();
+		output(buffer, "$ ");
+		const ready = await start(buffer, "READY", { kind: "offset", offset: 0 });
+		const done = await start(buffer, "DONE", { kind: "offset", offset: 0 });
+		await interruptTextWatchesForRestart(TERMINAL, buffer, "lost");
+		for (const id of [ready, done]) {
+			const ended = await waitForStatus(id);
+			expect(ended?.status).toBe("failed");
+			expect(ended?.output).toContain("executor restarted");
+		}
+		expect(await notices()).toHaveLength(1);
+	});
 });

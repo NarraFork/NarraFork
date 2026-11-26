@@ -781,10 +781,16 @@ export async function interruptTextWatchesForRestart(
 	buffer: BufferManager,
 	outcome: "lost" | "incomplete",
 ): Promise<void> {
-	await interruptTextWatches(terminalId, buffer, (watch) =>
-		outcome === "lost"
-			? `the device's executor restarted while terminal "${watch.terminalName}" was running, and output after its last recorded byte was not kept`
-			: `the device could not record all output from terminal "${watch.terminalName}" before its executor restarted`,
+	await interruptTextWatches(
+		terminalId,
+		buffer,
+		(watch) =>
+			outcome === "lost"
+				? `the device's executor restarted while terminal "${watch.terminalName}" was running, and output after its last recorded byte was not kept`
+				: `the device could not record all output from terminal "${watch.terminalName}" before its executor restarted`,
+		// The terminal ends with the restart: one ending notice per watcher, as when
+		// its buffer is disposed.
+		true,
 	);
 }
 
@@ -796,6 +802,7 @@ async function interruptTextWatches(
 	terminalId: string,
 	buffer: BufferManager,
 	cause: (watch: Watch) => string,
+	sharedEnding = false,
 ): Promise<void> {
 	const current = [...(byTerminal.get(terminalId) ?? [])]
 		.map((id) => watches.get(id))
@@ -813,6 +820,7 @@ async function interruptTextWatches(
 			watch,
 			"failed",
 			`Terminal watch ended: ${cause(watch)}, so ${JSON.stringify(watch.pattern)} may have appeared without being observed. Read the terminal before continuing; do not resend input automatically.`,
+			sharedEnding ? endedKey(watch) : undefined,
 		);
 	}
 }
