@@ -56,7 +56,7 @@ keywords:
   - listNarratorRounds
   - resolveLazyLineage
 status: draft
-verified_at: c3ae28b9a3804508320a27396b3354cee39378df
+verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 ---
 # 消息与引用
 
