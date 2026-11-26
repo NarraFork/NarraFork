@@ -1145,7 +1145,8 @@ function loginServer() {
 		for (const pid of await readdir("/proc").catch(() => [] as string[])) {
 			if (!/^\d+$/.test(pid)) continue;
 			const argv = await readFile(`/proc/${pid}/cmdline`, "utf8").catch(() => "");
-			// Only processes that talk to this server (not, say, a grep for the word elsewhere).
+			// Only git's processes that talk to this server (not, say, a grep for the word elsewhere).
+			if (!/git/.test(argv.split("\0")[0] ?? "")) continue;
 			if (argv.includes("s3cr3t") && argv.includes(`:${port}`))
 				leaks.push(argv.replaceAll("\0", " "));
 		}
@@ -1638,6 +1639,8 @@ describe("the fetch of origin's base (review 5)", () => {
 			for (const pid of await readdir("/proc").catch(() => [] as string[])) {
 				if (!/^\d+$/.test(pid)) continue;
 				const argv = await readFile(`/proc/${pid}/cmdline`, "utf8").catch(() => "");
+				// git's own processes only (not a shell whose script names the secret).
+				if (!/git/.test(argv.split("\0")[0] ?? "")) continue;
 				if (argv.includes("pxs3cr3t") || argv.includes("s3cr3t@")) leaks.push(argv);
 			}
 		};
@@ -1655,6 +1658,16 @@ describe("the fetch of origin's base (review 5)", () => {
 			expect(host.seen.length).toBeGreaterThan(0);
 			expect(host.seen[0]).toContain("127.0.0.1:1/o/r.git/info/refs");
 			expect(mine.seen).toEqual([]);
+			// The push to origin's URL goes through it too (「发起 PR」 on a proxied host).
+			host.seen.length = 0;
+			const pushed = await teamRepoGit(repo).pushBranch({
+				url: "http://alice:s3cr3t@127.0.0.1:1/o/r.git",
+				head: await git(["rev-parse", "HEAD"]),
+				branch: "team/x",
+			});
+			expect(pushed.outcome).toBe("failed");
+			expect(host.seen[0]).toContain("127.0.0.1:1/o/r.git/info/refs?service=git-receive-pack");
+			expect(mine.seen).toEqual([]);
 			await scan();
 			expect(leaks).toEqual([]);
 		} finally {
@@ -1665,6 +1678,24 @@ describe("the fetch of origin's base (review 5)", () => {
 				if (saved[key] === undefined) delete process.env[key];
 				else process.env[key] = saved[key];
 		}
+	});
+
+	test("a bare name the host rewrites to a URL another host rule rewrites again is refused", async () => {
+		await commitFile("a.txt", "a\n", "base");
+		const target = join(temporary, `chained-${Math.random().toString(36).slice(2)}.git`);
+		await git(["init", "-q", "--bare", "-b", "main", target], temporary);
+		await git(["remote", "add", "origin", "up"]);
+		await writeFile(
+			globalConfig,
+			`${HOST_USER}[url "https://mirror.example/r.git"]\n\tinsteadOf = up\n[url "${target}"]\n\tinsteadOf = https://mirror.example/r.git\n`,
+		);
+		const refused = await teamRepoGit(repo).fetchBaseFromOrigin("main");
+		expect(refused).toMatchObject({ ok: false });
+		if (!refused.ok) {
+			expect(refused.message).toContain("rewrite again");
+			expect(refused.message).toContain("rewrites once");
+		}
+		expect(await git(["for-each-ref", "refs/remotes/"])).toBe("");
 	});
 
 	test("only refs/remotes/origin/<base> moves, whatever origin's fetch refspecs say", async () => {

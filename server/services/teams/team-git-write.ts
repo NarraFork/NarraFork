@@ -370,12 +370,11 @@ const NETWORK_PATTERN =
 
 /** A network fetch the repository's configuration makes unsafe: the key that does. */
 export class UnsafeRemoteConfigError extends AppError {
-	constructor(readonly key: string) {
-		super(
-			`The repository's own configuration sets ${key}, which could run a program or choose the credentials or transport of a fetch; NarraFork does not fetch with it (set it in the global configuration instead)`,
-			409,
-			"TEAM_REMOTE_CONFIG_UNSAFE",
-		);
+	constructor(
+		readonly key: string,
+		message = `The repository's own configuration sets ${key}, which could run a program or choose the credentials or transport of a fetch; NarraFork does not fetch with it (set it in the global configuration instead)`,
+	) {
+		super(message, 409, "TEAM_REMOTE_CONFIG_UNSAFE");
 	}
 }
 
@@ -1177,6 +1176,11 @@ export function teamRepoGit(repo: string, options: { signal?: AbortSignal } = {}
 			const login = split.credentials
 				? credentialFromEnvironment(split.credentials, entries)
 				: { overrides: [], env: {} };
+			// As for the fetch: the host's `remote.origin.proxy` (never the repository's).
+			const transport = hostOriginTransport(
+				await scopedConfig(repo, ORIGIN_TRANSPORT_PATTERN, signal),
+				url,
+			);
 			// As for the fetch: the host's credentials and ssh, never the hardening's emptied ones.
 			const hardened = (await programConfig()).filter(
 				([key]) =>
@@ -1201,7 +1205,13 @@ export function teamRepoGit(repo: string, options: { signal?: AbortSignal } = {}
 					`${head}:${destination}`,
 				],
 				{
-					config: [...hardened, ...network.overrides, ...PUSH_NEUTRAL, ...login.overrides],
+					config: [
+						...hardened,
+						...network.overrides,
+						...PUSH_NEUTRAL,
+						...transport,
+						...login.overrides,
+					],
 					network: true,
 					timeout: PUSH_TIMEOUT_MS,
 					maxOutputBytes: PUSH_OUTPUT_BYTES,
@@ -1270,6 +1280,16 @@ async function fetchSource(
 	const source = isBare(configured)
 		? (rewritten(configured, host, "insteadof") ?? configured)
 		: configured;
+	// Git rewrites the URL it is given once more; a named fetch rewrites once. A host rule that
+	// would rewrite the rewritten URL again (a chain) is refused rather than followed twice.
+	const chained = source !== configured ? insteadOfMatching(source, host) : null;
+	if (chained)
+		throw new UnsafeRemoteConfigError(
+			chained,
+			redactUserinfo(
+				`origin's URL ${configured} is rewritten by the host's insteadOf to ${source}, which the host's ${chained} would rewrite again; \`git fetch origin\` rewrites once, so NarraFork does not fetch it (make the host's rule point at the final URL)`,
+			),
+		);
 	const split = splitUrlCredentials(source);
 	if (!split)
 		return {
@@ -1282,6 +1302,39 @@ async function fetchSource(
 	const url = isBare(split.url) ? `./${split.url}` : split.url;
 	// What git is given is what the repository's own configuration may not rewrite or name.
 	assertPushUrlUntouched(await scopedConfig(repo, PUSH_PATTERN, signal), url, "fetch");
+	return { url, credentials: split.credentials, transport: hostOriginTransport(entries, url) };
+}
+
+/** The key of the host's `url.<base>.insteadOf` git would rewrite `url` with (longest), or null. */
+function insteadOfMatching(url: string, host: readonly ScopedConfigEntry[]): string | null {
+	let best: ScopedConfigEntry | null = null;
+	for (const entry of host) {
+		const lower = entry.key.toLowerCase();
+		if (!lower.startsWith("url.") || !lower.endsWith(".insteadof")) continue;
+		if (
+			entry.value &&
+			url.startsWith(entry.value) &&
+			entry.value.length > (best?.value.length ?? -1)
+		)
+			best = entry;
+	}
+	return best?.key ?? null;
+}
+
+/** The host's own origin transport keys a named fetch or push reads. */
+const ORIGIN_TRANSPORT_PATTERN = "^remote\\.origin\\.(proxy|proxyauthmethod)$";
+
+/**
+ * The host's (system/global; never the repository's) `remote.origin.proxy` and
+ * `remote.origin.proxyAuthMethod` as command-scope settings for a fetch or push by URL, which
+ * reads no `remote.origin.*`: `http.proxy` / `http.proxyAuthMethod`, and for an http(s) URL the
+ * same for that URL itself (outranking a host `http.<url>.proxy`, as the remote's setting does).
+ * Passed by environment like every override (a proxy URL may carry a login).
+ */
+function hostOriginTransport(
+	entries: readonly ScopedConfigEntry[],
+	url: string,
+): Array<readonly [string, string]> {
 	const transport: Array<readonly [string, string]> = [];
 	const http = /^https?:\/\//i.test(url);
 	for (const [from, to] of [
@@ -1293,7 +1346,7 @@ async function fetchSource(
 		transport.push([`http.${to}`, value]);
 		if (http) transport.push([`http.${url}.${to}`, value]);
 	}
-	return { url, credentials: split.credentials, transport };
+	return transport;
 }
 
 /**
