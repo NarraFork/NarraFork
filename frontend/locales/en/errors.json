@@ -50,7 +50,7 @@
 	"SPEC_IMPORT_NOT_IMPORTABLE": "This session is not one the import moves: it is not a main session that still keeps its tasks in Dynamic Spec.",
 	"GOAL_IN_OUTLINE_SESSION": "/goal adds a task to the session itself. Send it in the main session, not to a subagent.",
 	"GIT_AUTH_REQUIRED": "Git authentication is required",
-	"GIT_TOO_OLD_FOR_PARTIAL_CLONE": "This repository is a partial clone (or names a promisor remote), and this host's git cannot be kept from fetching missing objects through it. Update git to 2.45 or newer to use it with teams.",
+	"GIT_TOO_OLD_FOR_PARTIAL_CLONE": "This repository is a partial clone (or names a promisor remote), and this host's git cannot be kept from fetching missing objects through it. Update git on this host to 2.45 or newer to use it for teams and worktrees.",
 	"GIT_REQUEST_CANCELLED": "Git request was cancelled",
 	"AUTH_REQUIRED": "Sign in to continue",
 	"TOKEN_EXPIRED": "Your session expired. Sign in again.",

@@ -10,6 +10,7 @@ import { join } from "node:path";
 import {
 	cleanGitEnv,
 	ensureConfigOverridesHonored,
+	ensureNoUnguardedLazyFetch,
 	gitConfigEnv,
 	PROGRAM_CONFIG_QUERY,
 	parseProgramConfig,
@@ -114,6 +115,35 @@ describe("git exec hardening", () => {
 			expect(() =>
 				untrustedProgramOverrides(parseProgramConfig("remote.evil.promisor\ntrue\0")),
 			).not.toThrow();
+		} finally {
+			setNoLazyFetchSupportForTests(null);
+		}
+	});
+
+	test("the shared partial-clone gate reads configuration only where lazy fetch is not prevented", async () => {
+		let reads = 0;
+		const programs = (stdout: string) => async () => {
+			reads++;
+			return parseProgramConfig(stdout);
+		};
+		// A git known to honour GIT_NO_LAZY_FETCH: nothing is read, a promisor repository proceeds.
+		setNoLazyFetchSupportForTests(true);
+		try {
+			await ensureNoUnguardedLazyFetch(programs(PROMISOR));
+			expect(reads).toBe(0);
+		} finally {
+			setNoLazyFetchSupportForTests(null);
+		}
+		// Otherwise every call reads the configuration (never cached) and refuses a promisor one.
+		setNoLazyFetchSupportForTests(false);
+		try {
+			await ensureNoUnguardedLazyFetch(programs(""));
+			await ensureNoUnguardedLazyFetch(programs("filter.lfs.clean\ngit-lfs clean\0"));
+			expect(reads).toBe(2);
+			await expect(ensureNoUnguardedLazyFetch(programs(PROMISOR))).rejects.toEqual(
+				expect.objectContaining({ code: "GIT_TOO_OLD_FOR_PARTIAL_CLONE" }),
+			);
+			expect(reads).toBe(3);
 		} finally {
 			setNoLazyFetchSupportForTests(null);
 		}

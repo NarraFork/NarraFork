@@ -105,12 +105,20 @@ export function parseProgramConfig(stdout: string): GitConfiguredPrograms {
 	return programs;
 }
 
+/**
+ * Refuse a partial clone or promisor repository (`programs.partialClone`) unless this git is
+ * known to honour `GIT_NO_LAZY_FETCH`: `GIT_TOO_OLD_FOR_PARTIAL_CLONE`.
+ */
+export function refusePartialCloneWithoutLazyFetchGuard(programs: GitConfiguredPrograms): void {
+	if (programs.partialClone && !noLazyFetchSupported())
+		throw catalogError("GIT_TOO_OLD_FOR_PARTIAL_CLONE");
+}
+
 /** Overrides that empty every named filter and disable every configuration-defined hook. */
 export function untrustedProgramOverrides(
 	programs: GitConfiguredPrograms,
 ): Array<readonly [string, string]> {
-	if (programs.partialClone && !noLazyFetchSupported())
-		throw catalogError("GIT_TOO_OLD_FOR_PARTIAL_CLONE");
+	refusePartialCloneWithoutLazyFetchGuard(programs);
 	return [
 		...programs.filters.flatMap((name) => [
 			[`filter.${name}.clean`, ""] as const,
@@ -277,6 +285,25 @@ const noLazyFetchSupported = () => lazyFetchVerdict === "supported";
  * reads objects (`untrustedProgramOverrides` refuses it).
  */
 export const lazyFetchPrevented = (): boolean => noLazyFetchSupported();
+
+/**
+ * The partial-clone gate a server git command passes before it reads any object of a repository
+ * the server does not own: git honours the configuration overrides
+ * ({@link ensureConfigOverridesHonored}), and — unless this git is known to honour
+ * `GIT_NO_LAZY_FETCH` — the repository has no partial-clone or promisor setting, else
+ * `GIT_TOO_OLD_FOR_PARTIAL_CLONE`. `readPrograms` runs {@link PROGRAM_CONFIG_QUERY} where the
+ * command will run (configuration only, never an object), so nothing can be fetched lazily
+ * through a repository-configured remote before the refusal. It is read on every call, never
+ * cached: an agent can add a promisor remote at any time. On a git that honours
+ * `GIT_NO_LAZY_FETCH` the gate reads nothing.
+ */
+export async function ensureNoUnguardedLazyFetch(
+	readPrograms: () => Promise<GitConfiguredPrograms>,
+): Promise<void> {
+	await ensureConfigOverridesHonored();
+	if (lazyFetchPrevented()) return;
+	refusePartialCloneWithoutLazyFetchGuard(await readPrograms());
+}
 
 /**
  * Probe the behaviour itself: a scratch partial clone whose promisor remote (a scratch

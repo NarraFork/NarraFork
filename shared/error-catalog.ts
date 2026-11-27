@@ -217,12 +217,13 @@ export const ERROR_CATALOG = {
 	},
 	/**
 	 * A partial clone or promisor remote on a git that cannot be kept from fetching missing
-	 * objects through it (`GIT_NO_LAZY_FETCH` needs git 2.45): teams refuse the repository.
+	 * objects through it (`GIT_NO_LAZY_FETCH` needs git 2.45): teams and narrator worktrees
+	 * refuse the repository.
 	 */
 	GIT_TOO_OLD_FOR_PARTIAL_CLONE: {
 		status: 409,
 		code: "GIT_TOO_OLD_FOR_PARTIAL_CLONE",
-		en: "This repository is a partial clone (or names a promisor remote) and this git cannot be kept from fetching missing objects through it (GIT_NO_LAZY_FETCH needs git 2.45); update git to use it with teams",
+		en: "This repository is a partial clone (or names a promisor remote) and this git cannot be kept from fetching missing objects through it (GIT_NO_LAZY_FETCH needs git 2.45); update git to 2.45 or newer to use it for teams and worktrees",
 	},
 	GIT_REQUEST_CANCELLED: {
 		status: 499,

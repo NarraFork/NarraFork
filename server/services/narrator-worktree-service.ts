@@ -22,7 +22,9 @@ import { AppError } from "../lib/errors";
 import {
 	cleanGitEnv,
 	ensureConfigOverridesHonored,
+	ensureNoUnguardedLazyFetch,
 	GIT_NO_EXEC_CONFIG,
+	type GitConfiguredPrograms,
 	gitConfigEnv,
 	PROGRAM_CONFIG_QUERY,
 	parseProgramConfig,
@@ -60,6 +62,27 @@ import type {
 import { confirmLifecyclePathRemoved, withProtectionReservation } from "./worktree-lifecycle-guard";
 
 export type { WorktreeCreateResult, WorktreeEntry } from "./narrator-worktree-journal";
+
+/**
+ * The only commands the service runs without the partial-clone gate, because they read no
+ * object: repository and checkout discovery (`rev-parse` of paths), branch-name syntax, and the
+ * worktree listing (refs and administrative files; the commit metadata a listing shows is a
+ * separate, gated `show`). Audited; keep it this short — anything that resolves a revision,
+ * checks a ref's object, lists a tree or walks history goes through the gate.
+ */
+const METADATA_ONLY_WORKTREE_COMMANDS: ReadonlyArray<readonly string[]> = [
+	["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"],
+	["rev-parse", "--path-format=absolute", "--git-common-dir"],
+	["worktree", "list", "--porcelain", "-z"],
+	["worktree", "list", "--porcelain"],
+];
+
+function isMetadataOnlyWorktreeCommand(args: readonly string[]): boolean {
+	if (args[0] === "check-ref-format" && args.length === 2) return true;
+	return METADATA_ONLY_WORKTREE_COMMANDS.some(
+		(command) => command.length === args.length && command.every((arg, i) => arg === args[i]),
+	);
+}
 
 /** ASCII filesystem leaf with an exact-ref hash; Git branch names remain unchanged. */
 export function worktreeDirectoryName(branchName: string): string {
@@ -838,6 +861,13 @@ export class NarratorWorktreeService<Principal> {
 	 * configured filter and disable every configuration-defined hook by name. A git that ignores
 	 * environment overrides (older than 2.31) is refused. Creation keeps the repository's own
 	 * behavior (its checkout hooks and filters are what a person creating it expects).
+	 *
+	 * Every command that may read an object — creation included — first passes the partial-clone
+	 * gate (`ensureNoUnguardedLazyFetch`): where this git is not known to honour
+	 * `GIT_NO_LAZY_FETCH`, a partial clone or promisor repository is refused
+	 * (`GIT_TOO_OLD_FOR_PARTIAL_CLONE`) before a missing object could be fetched lazily through
+	 * the repository-configured remote. Only {@link METADATA_ONLY_WORKTREE_COMMANDS} skip it; on a
+	 * git that honours the variable the gate reads nothing.
 	 */
 	private async hardenedConfig(
 		target: WorktreeTarget,
@@ -846,11 +876,34 @@ export class NarratorWorktreeService<Principal> {
 		writing: boolean,
 		signal: AbortSignal,
 	): Promise<Array<readonly [string, string]> | null> {
-		if (args[0] === "worktree" && args[1] === "add") return null;
+		const gate = () =>
+			ensureNoUnguardedLazyFetch(() =>
+				this.configuredPrograms(target, scope, writing, [...GIT_NO_EXEC_CONFIG], signal),
+			);
+		if (args[0] === "worktree" && args[1] === "add") {
+			await gate();
+			return null;
+		}
 		// Fail closed: a git that ignores the overrides would run everything they disable.
 		await ensureConfigOverridesHonored();
 		const config: Array<readonly [string, string]> = [...GIT_NO_EXEC_CONFIG];
-		if (args[0] !== "status" && !(args[0] === "worktree" && args[1] === "remove")) return config;
+		if (args[0] !== "status" && !(args[0] === "worktree" && args[1] === "remove")) {
+			if (!isMetadataOnlyWorktreeCommand(args)) await gate();
+			return config;
+		}
+		// Refuses a partial clone itself where lazy fetching is not prevented.
+		const programs = await this.configuredPrograms(target, scope, writing, config, signal);
+		return [...config, ...untrustedProgramOverrides(programs)];
+	}
+
+	/** {@link PROGRAM_CONFIG_QUERY} where the command runs: configuration only, never an object. */
+	private async configuredPrograms(
+		target: WorktreeTarget,
+		scope: WorktreeGitScope,
+		writing: boolean,
+		config: ReadonlyArray<readonly [string, string]>,
+		signal: AbortSignal,
+	): Promise<GitConfiguredPrograms> {
 		const programs = await safeSpawn({
 			cmd: [
 				"git",
@@ -868,14 +921,14 @@ export class NarratorWorktreeService<Principal> {
 			},
 			signal,
 		});
-		if (programs.exitCode === 1 && !programs.stdout) return config;
+		if (programs.exitCode === 1 && !programs.stdout) return { filters: [], hooks: [] };
 		if (programs.exitCode !== 0 || programs.stdoutTruncated)
 			error(
 				"WORKTREE_GIT_CONFIG_UNREADABLE",
 				"Cannot read the checkout's filter and hook configuration",
 				409,
 			);
-		return [...config, ...untrustedProgramOverrides(parseProgramConfig(programs.stdout))];
+		return parseProgramConfig(programs.stdout);
 	}
 
 	/**
@@ -1752,6 +1805,8 @@ export class NarratorWorktreeService<Principal> {
 			return { dirtyFileCount: changes.count, dirtyExact: changes.exact, unreachableCommits };
 		} catch (cause) {
 			signal.throwIfAborted();
+			// A partial clone this git cannot keep from fetching lazily: say so, not "unavailable".
+			if (cause instanceof AppError && cause.code === "GIT_TOO_OLD_FOR_PARTIAL_CLONE") throw cause;
 			logger.warn("Worktree removal could not measure what would be lost", {
 				reason: String(cause).slice(0, 256),
 			});

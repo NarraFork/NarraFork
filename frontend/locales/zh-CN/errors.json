@@ -50,7 +50,7 @@
 	"SPEC_IMPORT_NOT_IMPORTABLE": "这个会话不在导入范围内：它不是还在用 Dynamic Spec 记任务的主会话。",
 	"GOAL_IN_OUTLINE_SESSION": "/goal 会给会话本身添加任务。请在主会话里发送，不要发给子代理。",
 	"GIT_AUTH_REQUIRED": "需要 Git 认证",
-	"GIT_TOO_OLD_FOR_PARTIAL_CLONE": "这个仓库是部分克隆（或配置了 promisor 远端），而本机的 git 无法阻止通过它拉取缺失的对象。请把 git 升级到 2.45 或更新版本后再用于团队。",
+	"GIT_TOO_OLD_FOR_PARTIAL_CLONE": "这个仓库是部分克隆（或配置了 promisor 远端），而本机的 git 无法阻止通过它拉取缺失的对象。请把本机 git 升级到 2.45 或更新版本后，再在团队和 worktree 中使用它。",
 	"GIT_REQUEST_CANCELLED": "Git 请求已取消",
 	"AUTH_REQUIRED": "请先登录",
 	"TOKEN_EXPIRED": "登录状态已过期，请重新登录。",
