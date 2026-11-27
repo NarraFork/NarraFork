@@ -2166,6 +2166,23 @@ export const narratorToolContinuations = sqliteTable(
 );
 
 // === terminals ===
+/**
+ * Executor sessions NarraFork still has to stop and release on a device
+ * (`session.kill { release: true }`): written before a remote terminal's local
+ * close or exit is final, and removed only once the executor confirms (or reports
+ * the session unknown). Independent of the terminal row, so deleting a terminal,
+ * restarting NarraFork or an offline device can never orphan a remote shell.
+ */
+export const executorSessionCleanups = sqliteTable(
+	"executor_session_cleanups",
+	{
+		deviceId: text("device_id").notNull(),
+		sessionId: text("session_id").notNull(),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [primaryKey({ columns: [table.deviceId, table.sessionId] })],
+);
+
 export const terminals = sqliteTable(
 	"terminals",
 	{
@@ -2185,6 +2202,12 @@ export const terminals = sqliteTable(
 		dtachSocket: text("dtach_socket"),
 		/** Remote executor device this terminal runs on. null → local server. */
 		deviceId: text("device_id"),
+		/**
+		 * Durable executor session (`session.durable.v1`) backing a remote terminal.
+		 * Set: the shell outlives NarraFork and device reconnects, and is resumed by
+		 * id. NULL: a local terminal or a legacy `pty.open` remote terminal.
+		 */
+		executorSessionId: text("executor_session_id"),
 		status: text("status", { enum: ["running", "exited"] })
 			.notNull()
 			.default("running"),
@@ -4294,6 +4317,18 @@ export const backgroundTasks = sqliteTable(
 		 * re-attaches.
 		 */
 		principalJson: text("principal_json", { mode: "json" }).$type<{ userId: string | null }>(),
+		/**
+		 * A remote background Bash running in a durable executor session
+		 * (`session.exec.v1`). Written before the session is opened, so a restarted
+		 * server can re-attach to it (or stop it) instead of reporting it lost.
+		 */
+		executorSessionJson: text("executor_session_json", { mode: "json" }).$type<{
+			deviceId: string;
+			sessionId: string;
+			/** Wall-clock budget from `startedAt`; absent means none. */
+			timeoutMs?: number;
+			startedAt: string;
+		}>(),
 		output: text("output"),
 		outputBytes: integer("output_bytes").notNull().default(0),
 		outputTruncated: integer("output_truncated", { mode: "boolean" }).notNull().default(false),
@@ -7311,6 +7346,37 @@ export const teamWorkItems = sqliteTable(
 			"ck_team_work_items_changed_paths_bytes",
 			sql`${table.changedPathsJson} is null or length(cast(${table.changedPathsJson} as blob)) <= 131072`,
 		),
+	],
+);
+
+/**
+ * D: a work item waits for another item of the same team to merge before it may start. Deleting
+ * either item (or the team) deletes the edge. The coordinator sets an item's whole set at once
+ * (`Team` `dependsOn`): at most 20, both ends in `team_id`, no cycles — checked by the service
+ * (`teams/work-item-dependencies.ts`), since a composite key across teams does not transpile to
+ * PostgreSQL here.
+ */
+export const teamWorkItemDependencies = sqliteTable(
+	"team_work_item_dependencies",
+	{
+		itemId: text("item_id")
+			.notNull()
+			.references(() => teamWorkItems.id, { onDelete: "cascade" }),
+		dependsOnItemId: text("depends_on_item_id")
+			.notNull()
+			.references(() => teamWorkItems.id, { onDelete: "cascade" }),
+		teamId: text("team_id")
+			.notNull()
+			.references(() => projectTeams.narratorId, { onDelete: "cascade" }),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		primaryKey({ columns: [table.itemId, table.dependsOnItemId] }),
+		// Who depends on an item: the unblock check when it merges, and the drawer's dependents.
+		index("idx_team_work_item_dependencies_target").on(table.dependsOnItemId, table.itemId),
+		// FK covering index (CASCADE on team deletion).
+		index("idx_team_work_item_dependencies_team").on(table.teamId),
+		check("ck_team_work_item_dependencies_self", sql`${table.itemId} <> ${table.dependsOnItemId}`),
 	],
 );
 

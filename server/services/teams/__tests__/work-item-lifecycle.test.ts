@@ -745,6 +745,8 @@ describe("base sync", () => {
 
 	test("commits a worker's base merge brings in do not count as commits since the review", async () => {
 		const item = await create("Reviewed then synced");
+		seedWorker("p3-synced");
+		attachWorker(LEAD, item.id, "p3-synced", agent);
 		const path = worktreePathOf(item) ?? "";
 		await commitFile(path, "mine.txt", "mine\n", "item work");
 		await recordReview({
@@ -954,6 +956,8 @@ describe("no repository code runs on the server", () => {
 
 	test("a git that ignores environment overrides is refused before any git runs", async () => {
 		const live = await create("Old git, live");
+		seedWorker("p3-old-git");
+		attachWorker(LEAD, live.id, "p3-old-git", agent);
 		const done = await create("Old git, cancelled");
 		cancelWorkItem({ coordinatorId: LEAD, itemId: done.id, actor: agent });
 		setGitHardeningProbeForTests(async () => false);

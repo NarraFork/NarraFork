@@ -2,6 +2,7 @@ import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import { Box, Group, Paper, Popover, Stack, Text, UnstyledButton } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
+import { IconChartLine } from "@tabler/icons-react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { useEffect, useRef, useState } from "react";
@@ -352,21 +353,24 @@ export function CodexQuotaIndicator({
 	enabled,
 	isAdmin,
 	compact = false,
+	detailsOnly = false,
 }: {
 	enabled: boolean;
 	isAdmin: boolean;
 	compact?: boolean;
+	/** Generic allowances come from QuotaSnapshot; this only opens Codex forecasts. */
+	detailsOnly?: boolean;
 }) {
 	const { t } = useTranslation("narrator");
 	const codexRuntimeCapability = useProviderRuntimeCapability("codex");
 	const codexRoutesSupported = codexRuntimeCapability?.routes?.supported !== false;
 	const canReadQuotaOverview =
 		codexRoutesSupported && codexRuntimeCapability?.routes?.quotaOverview !== false;
-	const queryEnabled = enabled && canReadQuotaOverview;
+	const [detailsOpened, setDetailsOpened] = useState(false);
+	const queryEnabled = enabled && canReadQuotaOverview && (!detailsOnly || detailsOpened);
 	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
 	const navigate = useNavigate();
 	const queryClient = useQueryClient();
-	const [detailsOpened, setDetailsOpened] = useState(false);
 	const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const suppressHoverUntilRef = useRef(0);
 	const {
@@ -402,7 +406,7 @@ export function CodexQuotaIndicator({
 		};
 	}, []);
 
-	if (!queryEnabled) return null;
+	if (!enabled || !canReadQuotaOverview) return null;
 
 	const segments = overview?.segments ?? [];
 	const useReadableText = compact || isMobile;
@@ -496,7 +500,11 @@ export function CodexQuotaIndicator({
 						transform: "translateY(-1px)",
 					}}
 				>
-					<SegmentBars segments={segments} compact={compact} />
+					{detailsOnly ? (
+						<IconChartLine size={compact ? 14 : 16} />
+					) : (
+						<SegmentBars segments={segments} compact={compact} />
+					)}
 				</UnstyledButton>
 			</Popover.Target>
 			<Popover.Dropdown

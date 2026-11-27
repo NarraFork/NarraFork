@@ -77,6 +77,7 @@ export function usePluginContributions(
 		},
 	});
 
+	// biome-ignore lint/correctness/useExhaustiveDependencies: equal successful snapshots retain data but advance dataUpdatedAt.
 	useEffect(() => {
 		if (!query.data) return;
 		pluginContributionStore.beginSync();
@@ -85,7 +86,9 @@ export function usePluginContributions(
 		} catch (error) {
 			pluginContributionStore.failSync(error);
 		}
-	}, [query.data]);
+		// Equal snapshots retain their data reference through Query structural sharing.
+		// A successful reread must still settle an explicitly invalidated store.
+	}, [query.data, query.dataUpdatedAt]);
 
 	useEffect(() => {
 		if (!query.error) return;

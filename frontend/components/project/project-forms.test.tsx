@@ -1,6 +1,14 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { parseHTML } from "linkedom";
-import { act, type ChangeEvent, type ComponentType, type ReactNode, useState } from "react";
+import {
+	act,
+	type ChangeEvent,
+	type ComponentType,
+	type ReactNode,
+	useEffect,
+	useRef,
+	useState,
+} from "react";
 import { createRoot, type Root } from "react-dom/client";
 
 const box = ({ children }: { children?: ReactNode }) => <div>{children}</div>;
@@ -8,13 +16,17 @@ const box = ({ children }: { children?: ReactNode }) => <div>{children}</div>;
 const input = ({
 	label,
 	value,
+	error,
 	onChange,
+	onBlur,
 }: {
 	label: string;
 	value?: string;
+	error?: string;
 	onChange?: (event: ChangeEvent<HTMLInputElement>) => void;
+	onBlur?: () => void;
 }) => (
-	<div data-input={label} data-value={value}>
+	<div data-input={label} data-value={value} data-error={error ?? ""}>
 		<button
 			type="button"
 			onClick={() =>
@@ -25,9 +37,15 @@ const input = ({
 		>
 			{label}
 		</button>
+		{onBlur && (
+			<button type="button" onClick={onBlur}>
+				{`leave:${label}`}
+			</button>
+		)}
 	</div>
 );
 let edits: Record<string, string> = {};
+mock.module("../common/CommandsEditor", () => ({ CommandsEditor: box }));
 mock.module("@mantine/core", () => ({
 	Alert: box,
 	Badge: box,
@@ -91,6 +109,7 @@ const queryClient = { invalidateQueries: async () => {} };
 const instanceSettings = { paths: { defaultProjectDir: "/instance" }, agent: {} };
 mock.module("@tanstack/react-query", () => ({
 	useMutation: () => mutation,
+	useInfiniteQuery: () => ({ data: undefined }),
 	useQuery: ({ queryKey, enabled }: { queryKey: readonly unknown[]; enabled?: boolean }) => ({
 		// Settings are the only seeded query; anonymous me/preferences observers have no data.
 		data: enabled !== false && queryKey[0] === "settings" ? instanceSettings : undefined,
@@ -155,7 +174,32 @@ const projectData = {
 };
 mock.module("../../hooks/useProjects", () => ({
 	useProject: () => ({ data: projectData }),
-	useUpdateProject: () => ({ mutate: update }),
+	// Like TanStack Query: a per-call `mutate` callback is dropped once the component unmounts,
+	// while `mutateAsync` settles regardless. Both settle through the recorded callbacks.
+	useUpdateProject: () => {
+		const mounted = useRef(true);
+		useEffect(
+			() => () => {
+				mounted.current = false;
+			},
+			[],
+		);
+		return {
+			mutate: (variables: unknown, options?: Callbacks) =>
+				update(variables, {
+					onSuccess: () => {
+						if (mounted.current) options?.onSuccess?.();
+					},
+					onError: (error: Error) => {
+						if (mounted.current) options?.onError?.(error);
+					},
+				}),
+			mutateAsync: (variables: unknown) =>
+				new Promise((resolve, reject) =>
+					update(variables, { onSuccess: resolve, onError: reject }),
+				),
+		};
+	},
 	useProjects: () => ({ data: [], isLoading: false }),
 	useHiddenProjectExistence: () => ({ data: { hasHidden: false } }),
 	useCreateProject: () => ({ ...mutation, mutate: createProject }),
@@ -167,7 +211,32 @@ mock.module("../../lib/api", () => ({
 	// accessor at import time.
 	getToken: () => null,
 }));
-mock.module("../permissions/PermissionRuleEditor", () => ({ PermissionRuleEditor: box }));
+mock.module("../permissions/PermissionRuleEditor", () => ({
+	PermissionRuleEditor: ({
+		kind,
+		rules,
+		onCreate,
+		onDelete,
+	}: {
+		kind: string;
+		rules: Array<{ pattern?: string }>;
+		onCreate: (rule: Record<string, unknown>) => void;
+		onDelete: (index: number) => void;
+	}) => (
+		<div data-rules={rules.map((rule) => rule.pattern).join(",")}>
+			<button
+				type="button"
+				data-rule-count={rules.length}
+				onClick={() => onCreate({ pattern: "/tmp/**" })}
+			>
+				{`add-rule:${kind}`}
+			</button>
+			<button type="button" onClick={() => onDelete(0)}>
+				delete-first-rule
+			</button>
+		</div>
+	),
+}));
 mock.module("../settings/TraitLayerEditor", () => ({ TraitLayerEditor: box }));
 mock.module("./ProjectAccessPanel", () => ({ ProjectAccessPanel: box }));
 mock.module("../common/DirectoryPicker", () => ({
@@ -182,7 +251,13 @@ mock.module("../common/DirectoryPicker", () => ({
 	}) => input({ label, value, onChange: (event) => onChange(event.currentTarget.value) }),
 }));
 const { CreateNarratorModal } = await import("../narrator/CreateNarratorModal");
-const { ProjectSettingsModal } = await import("./ProjectSettingsModal");
+const {
+	ProjectBasicsForm,
+	ProjectRuleList,
+	ProjectTeamDefaults,
+	projectWorkStartDefault,
+	teamsWithWorkStart,
+} = await import("./ProjectSettingsForms");
 const { Route } = await import("../../routes/projects/index");
 const ProjectListPage = Route.options.component as ComponentType;
 let root: Root;
@@ -308,51 +383,207 @@ test("closing the dialog clears a typed session title", async () => {
 	await click("createNarrator");
 	expect(create.mock.calls[0]?.[0]).not.toHaveProperty("title");
 });
-test("metadata edits submit only this form's settings, not stale commands, routines or unknown keys", async () => {
-	const chapterSettings = {
-		whitelistDirs: [],
-		blacklistDirs: [],
-		commandWhitelist: [],
-		commandBlacklist: [],
-		traits: { existing: true },
-		commands: [{ name: "old-command", prompt: "old prompt" }],
-		routines: { toolModes: { example: "resident" } },
-		futureSetting: { retain: true },
+type Callbacks = {
+	onSuccess?: () => void;
+	onError?: (error: Error) => void;
+	onSettled?: () => void;
+};
+const callbacks = (call: number) => update.mock.calls[call]?.[1] as Callbacks;
+const field = (label: string) => container.querySelector(`[data-input="${label}"]`);
+const settingsProject = {
+	id: "original-id",
+	name: "Original project",
+	description: "Original description",
+	gitPath: "/home/u/repo",
+	chapterSettings: { commands: [{ name: "old", prompt: "x" }], futureSetting: { retain: true } },
+};
+test("name and description save when left, only that field, never a blank name", async () => {
+	await act(async () => root.render(<ProjectBasicsForm project={settingsProject} canManage />));
+	edits = { projectName: "New name" };
+	await click("projectName");
+	await click("leave:projectName");
+	expect(update.mock.calls[0]?.[0]).toEqual({ id: "original-id", data: { name: "New name" } });
+	// Unchanged: nothing is sent.
+	await click("leave:projectDescription");
+	expect(update).toHaveBeenCalledTimes(1);
+	edits = { projectName: "   " };
+	await click("projectName");
+	await click("leave:projectName");
+	expect(update).toHaveBeenCalledTimes(1);
+});
+test("a failed save keeps the typed value marked unsaved; a saved one shows the stored value again", async () => {
+	await act(async () => root.render(<ProjectBasicsForm project={settingsProject} canManage />));
+	edits = { projectDescription: "Typed" };
+	await click("projectDescription");
+	await click("leave:projectDescription");
+	await act(async () => callbacks(0).onError?.(new Error("offline")));
+	expect(field("projectDescription")?.getAttribute("data-value")).toBe("Typed");
+	expect(field("projectDescription")?.getAttribute("data-error")).toBe("settingsPage.unsaved");
+	// Leaving again retries; once saved the field follows the stored (server) value.
+	await click("leave:projectDescription");
+	await act(async () => callbacks(1).onSuccess?.());
+	expect(field("projectDescription")?.getAttribute("data-value")).toBe("Original description");
+	expect(field("projectDescription")?.getAttribute("data-error")).toBe("");
+});
+test("the project directory never saves on blur, only on 保存 after a confirmation", async () => {
+	await act(async () => root.render(<ProjectBasicsForm project={settingsProject} canManage />));
+	edits = { repositoryPath: "/home/u" };
+	await click("repositoryPath");
+	// No blur save at all: the field has no leave handler.
+	expect(
+		Array.from(container.querySelectorAll("button")).some(
+			(button) => button.textContent === "leave:repositoryPath",
+		),
+	).toBe(false);
+	expect(update).not.toHaveBeenCalled();
+	await click("settingsPage.pathSave");
+	expect(update).not.toHaveBeenCalled();
+	expect(container.textContent).toContain("settingsPage.pathConfirm");
+	await click("settingsPage.pathConfirmButton");
+	expect(update.mock.calls[0]?.[0]).toEqual({ id: "original-id", data: { gitPath: "/home/u" } });
+	// Saved: the field shows the stored, resolved value, and saving again has nothing to send.
+	await act(async () => callbacks(0).onSuccess?.());
+	expect(field("repositoryPath")?.getAttribute("data-value")).toBe("/home/u/repo");
+	const save = Array.from(container.querySelectorAll("button")).find(
+		(button) => button.textContent === "settingsPage.pathSave",
+	);
+	expect(save?.disabled).toBe(true);
+});
+test("the same directory with a trailing slash is not a change; cancel drops the draft", async () => {
+	await act(async () => root.render(<ProjectBasicsForm project={settingsProject} canManage />));
+	edits = { repositoryPath: "/home/u/repo/" };
+	await click("repositoryPath");
+	const save = () =>
+		Array.from(container.querySelectorAll("button")).find(
+			(button) => button.textContent === "settingsPage.pathSave",
+		);
+	expect(save()?.disabled).toBe(true);
+	await click("settingsPage.pathCancel");
+	expect(field("repositoryPath")?.getAttribute("data-value")).toBe("/home/u/repo");
+	edits = { repositoryPath: "/home/u/other" };
+	await click("repositoryPath");
+	await click("settingsPage.pathSave");
+	await click("settingsPage.pathConfirmButton");
+	await act(async () => callbacks(0).onError?.(new Error("not a directory")));
+	expect(field("repositoryPath")?.getAttribute("data-value")).toBe("/home/u/other");
+	expect(field("repositoryPath")?.getAttribute("data-error")).toBe("settingsPage.unsaved");
+});
+test("a rule list saves on every change and sends only its own key", async () => {
+	const project = {
+		id: "original-id",
+		name: "p",
+		chapterSettings: { whitelistDirs: [], commands: [{ name: "old", prompt: "x" }] },
 	};
 	await act(async () =>
+		root.render(<ProjectRuleList project={project} ruleKey="whitelistDirs" canManage />),
+	);
+	await click("add-rule:directoryWhitelist");
+	const sent = update.mock.calls[0]?.[0] as {
+		id: string;
+		data: { chapterSettings: Record<string, unknown[]> };
+	};
+	expect(sent.id).toBe("original-id");
+	expect(Object.keys(sent.data)).toEqual(["chapterSettings"]);
+	expect(Object.keys(sent.data.chapterSettings)).toEqual(["whitelistDirs"]);
+	expect(sent.data.chapterSettings.whitelistDirs).toHaveLength(1);
+	expect(create).not.toHaveBeenCalled();
+	const editor = () => container.querySelector("[data-rule-count]");
+	expect(editor()?.getAttribute("data-rule-count")).toBe("1");
+	// A failed save puts the stored list back instead of showing the unsaved rule as saved.
+	await act(async () => callbacks(0).onError?.(new Error("offline")));
+	expect(editor()?.getAttribute("data-rule-count")).toBe("0");
+});
+test("name: a late success after more typing keeps the newer edit, saved when left", async () => {
+	await act(async () => root.render(<ProjectBasicsForm project={settingsProject} canManage />));
+	edits = { projectName: "First" };
+	await click("projectName");
+	await click("leave:projectName");
+	edits = { projectName: "Second" };
+	await click("projectName");
+	// The first save answers after the second edit, before the field is left again.
+	await act(async () => callbacks(0).onSuccess?.());
+	expect(field("projectName")?.getAttribute("data-value")).toBe("Second");
+	await click("leave:projectName");
+	expect(update.mock.calls[1]?.[0]).toEqual({ id: "original-id", data: { name: "Second" } });
+	// And a late failure of the first save does not mark the newer edit.
+	await act(async () => callbacks(0).onError?.(new Error("late")));
+	expect(field("projectName")?.getAttribute("data-error")).toBe("");
+});
+const twoRules = {
+	id: "original-id",
+	name: "p",
+	chapterSettings: { blacklistDirs: [{ pattern: "/a" }, { pattern: "/b" }] },
+};
+const shownRules = () => container.querySelector("[data-rules]")?.getAttribute("data-rules");
+const sentRules = (call: number) =>
+	(
+		(update.mock.calls[call]?.[0] as { data: { chapterSettings: Record<string, unknown[]> } }).data
+			.chapterSettings.blacklistDirs as Array<{ pattern: string }>
+	).map((rule) => rule.pattern);
+test("a second deletion while the refetch is still out never brings the first back", async () => {
+	await act(async () =>
+		root.render(<ProjectRuleList project={twoRules} ruleKey="blacklistDirs" canManage />),
+	);
+	await click("delete-first-rule");
+	expect(sentRules(0)).toEqual(["/b"]);
+	// Saved, but the cached project is still the old one (the refetch is held open).
+	await act(async () => callbacks(0).onSuccess?.());
+	await act(async () =>
+		root.render(<ProjectRuleList project={twoRules} ruleKey="blacklistDirs" canManage />),
+	);
+	expect(shownRules()).toBe("/b");
+	await click("delete-first-rule");
+	expect(sentRules(1)).toEqual([]);
+	// Once the cache holds the saved list, the form follows it again.
+	await act(async () => callbacks(1).onSuccess?.());
+	await act(async () =>
 		root.render(
-			<ProjectSettingsModal
-				projectId="original-id"
-				chapterSettings={chapterSettings}
-				opened
-				onClose={() => {}}
+			<ProjectRuleList
+				project={{ ...twoRules, chapterSettings: { blacklistDirs: [] } }}
+				ruleKey="blacklistDirs"
+				canManage
 			/>,
 		),
 	);
-	edits = {
-		projectName: "New name",
-		projectDescription: "New description",
-		repositoryPath: "/new-default",
-	};
-	await click("projectName");
-	await click("projectDescription");
-	await click("repositoryPath");
-	await click("save");
-	expect(update.mock.calls[0]?.[0]).toEqual({
-		id: "original-id",
-		data: {
-			name: "New name",
-			description: "New description",
-			gitPath: "/new-default",
-			chapterSettings: {
-				whitelistDirs: [],
-				blacklistDirs: [],
-				commandWhitelist: [],
-				commandBlacklist: [],
-			},
-		},
-	});
-	expect(create).not.toHaveBeenCalled();
+	expect(shownRules()).toBe("");
+});
+test("rule saves are serialized: an edit made while one is in flight is sent after it", async () => {
+	await act(async () =>
+		root.render(<ProjectRuleList project={twoRules} ruleKey="blacklistDirs" canManage />),
+	);
+	await click("delete-first-rule");
+	await click("delete-first-rule");
+	expect(update).toHaveBeenCalledTimes(1);
+	expect(shownRules()).toBe("");
+	await act(async () => callbacks(0).onSuccess?.());
+	expect(update).toHaveBeenCalledTimes(2);
+	expect(sentRules(1)).toEqual([]);
+});
+test("leaving settings mid-save still sends the queued rule list", async () => {
+	await act(async () =>
+		root.render(<ProjectRuleList project={twoRules} ruleKey="blacklistDirs" canManage />),
+	);
+	await click("delete-first-rule");
+	await click("delete-first-rule");
+	expect(update).toHaveBeenCalledTimes(1);
+	await act(async () => root.unmount());
+	root = createRoot(container);
+	await act(async () => callbacks(0).onSuccess?.());
+	expect(update).toHaveBeenCalledTimes(2);
+	expect(sentRules(1)).toEqual([]);
+});
+test("a reader sees the rules but no editor", async () => {
+	await act(async () =>
+		root.render(
+			<ProjectRuleList
+				project={{ id: "p", chapterSettings: { commandBlacklist: [{ pattern: "rm" }] } }}
+				ruleKey="commandBlacklist"
+				canManage={false}
+			/>,
+		),
+	);
+	expect(container.textContent).toContain("settingsPage.rulesCount");
+	expect(container.textContent).not.toContain("add-rule");
 });
 test("existing-directory project create sends no deprecated flow selector or git-init fallback", async () => {
 	await act(async () => root.render(<ProjectListPage />));
@@ -368,4 +599,41 @@ test("existing-directory project create sends no deprecated flow selector or git
 	});
 	expect(container.textContent).not.toContain("flowMode");
 	expect(container.textContent).not.toContain("notGitRepoInitAndCreate");
+});
+
+test("team defaults: the base branch saves when left; the work start keeps the other team settings", async () => {
+	const project = {
+		...settingsProject,
+		defaultBranch: "main",
+		chapterSettings: { teams: { exclusivePaths: ["drizzle/**"], workStart: "local" } },
+	};
+	await act(async () => root.render(<ProjectTeamDefaults project={project} canManage />));
+	expect(field("settingsPage.teamDefaults.baseBranch")?.getAttribute("data-value")).toBe("main");
+	edits = { "settingsPage.teamDefaults.baseBranch": "develop" };
+	await click("settingsPage.teamDefaults.baseBranch");
+	await click("leave:settingsPage.teamDefaults.baseBranch");
+	expect(update.mock.calls[0]?.[0]).toEqual({
+		id: "original-id",
+		data: { defaultBranch: "develop" },
+	});
+	// An invalid name is not sent.
+	edits = { "settingsPage.teamDefaults.baseBranch": "bad name" };
+	await click("settingsPage.teamDefaults.baseBranch");
+	await click("leave:settingsPage.teamDefaults.baseBranch");
+	expect(update).toHaveBeenCalledTimes(1);
+	expect(projectWorkStartDefault(project)).toBe("local");
+	expect(projectWorkStartDefault(settingsProject)).toBe("auto");
+	expect(teamsWithWorkStart(project, "remote")).toEqual({
+		exclusivePaths: ["drizzle/**"],
+		workStart: "remote",
+	});
+	expect(teamsWithWorkStart(project, "auto")).toEqual({ exclusivePaths: ["drizzle/**"] });
+	// G: the confirmed GitHub repository is never sent back (only its own route writes it).
+	const pinned = {
+		chapterSettings: {
+			teams: { workStart: "local", github: { host: "github.com", owner: "a", repo: "b" } },
+		},
+	} as unknown as Parameters<typeof teamsWithWorkStart>[0];
+	expect(teamsWithWorkStart(pinned, "remote")).toEqual({ workStart: "remote" });
+	expect(teamsWithWorkStart(settingsProject, "local")).toEqual({ workStart: "local" });
 });

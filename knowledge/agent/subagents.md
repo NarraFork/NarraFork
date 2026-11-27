@@ -77,7 +77,7 @@ keywords:
   - subagent_nested_changed
   - FORK_NARRATOR_MAX_DEPTH
 status: draft
-verified_at: 9f8180cd471d62003e8cfe666b3802a4277ead46
+verified_at: 35942c331661e92be2253f55b4e68e33bf1a5803
 ---
 # 子代理
 
@@ -87,12 +87,13 @@ verified_at: 9f8180cd471d62003e8cfe666b3802a4277ead46
 - 模板名只在 `agent-runtime/policy.ts:compileDelegationPolicy` 里有含义，结果是写进新叙述者 traits 的能力上限。内置模板：`general`（完整写权限）、`worker`（general 加 Terminal、Browser，并可自己启动并等待下一层 helper）、`explore` 与 `plan`（只读）、`review`（只读 + 同步查看 Git + Browser，不能控制运行中的任务）、`search`（仅 WebSearch/WebFetch 等，无 MCP，只读）；其他名字视为自定义定义，缺失或无效的定义按只读处理（失败即收紧）。
 - 被委派者默认不能：再启动代理、等待代理、向用户提问、批准计划、切换工作目录（`DELEGATED_DENY`）。worker 的拒绝列表去掉了启动与等待代理，所以只有 worker 能向下嵌套。
 - 嵌套深度：`MAX_DELEGATION_DEPTH = 2`——主叙述者为 0 层，其子代理 1 层，再下一层 helper 为 2 层，2 层的子代理不能启动或控制其他代理。创建时给能力上限打深度戳（`withDelegationDepth`，深度达上限时同时去掉 spawn/await 能力和对应工具）；兜底校验不信任戳，`delegation-depth.ts:delegationDepthOf` 沿 `parent_narrator_id` 向上数 `subagent` 类型的层数，环或过深的链直接报错。
-- ForkNarrator 是另一条递归通道：fork 链最多 8 层祖先（`FORK_NARRATOR_MAX_DEPTH`），沿父链遍历有步数上限（`fork-narrator-depth.ts`）。
+- ForkNarrator 是另一条递归通道：fork 链最多 8 层祖先（`FORK_NARRATOR_MAX_DEPTH`），沿父链遍历有步数上限，每步在读 Worker 上查一行（`worker-required`，30s 超时）（`fork-narrator-depth.ts:narratorForkDepth`）。
 - 自定义子代理：`~/.narrafork/subagents/<name>/SUBAGENT.md`，frontmatter 加 markdown 正文；字段含描述、`toolAccess`（`readOnly` / `general` / `custom`）、自定义工具列表、默认模型（空串表示继承父级）、提示词（`custom-subagent-service.ts`）。
 - Agent 工具参数：`subagent_type`（缺省为 `general`；创建团队工作项时缺省 `worker`）、`model`、`reasoning_effort`、`workdir`、`alias`（会话内唯一，缺省由描述生成）、`run_in_background`、`isolation: "worktree"`（仅团队协调者，为工作项建分支与 worktree）。
 - 资源回收（`subagent-resources.ts`）：子代理被归档或删除时，关闭它创建的所有运行中终端和启动的浏览器会话；一次运行结束且没有待处理工作（helper 仍在工作、或已排队的输入）时，关闭此刻打开的浏览器会话，终端保留（dev server、REPL 可跨轮使用）。主叙述者不受影响，所有函数尽力而为、不抛错；单次最多关闭 50 个终端。
 - `subagent-lifecycle.ts:interruptAndArchiveSubagent`：先取消运行再标记归档，不抛错，保证删除历史不会因副作用失败。
 - 与子代理通信：Send（异步）与 Watch（观察）；运行时策略不含 `watchAgent` 能力时 Watch agent 被拒（`subagent-communication-policy.ts`）。
+- `workdir` 是团队里一个还没有工作者的工作项的 worktree 时（符号链接、Windows/macOS 上大小写不同但指向同一目录的写法也算，`workItemAtWorktree` 用 dev/inode 核对），子代理成为它的工作者，并在记录的 worktree 路径里跑；这一项还有未合并的依赖就在创建子代理前拒绝（`Agent error (TEAM_WORK_ITEM_BLOCKED)`，什么都不建）。子代理建好后在 `runSubagent` 的 `onCreated` 钩子里记为工作者；钩子抛错（依赖刚被加上、别的工作者先记上）时这次调用失败，子代理在运行前被归档，见[工作项](../collaboration/teams/work-items.md)。
 - 普通 Send 的可达性单独由通讯森林和精确 peer 决定：同一通讯根下的主代理、子代理和二级助手可互发；不同组只有两个精确端点的 peer 可达，不沿 peer 传递。每次重连分配新关系 ID，断连按此身份且以任一实际可管理端点发起，不另维护固定代际。名单和投影有展示上限，精确 ID 的授权不依赖截断名单；名称、别名和 ID 前缀在同一授权通讯查询中先匹配再限量，不从截断展示目录或旧任务别名旁路解析。ContextAsk、Watch、Stop、TeamStatus 的原控制/读取范围不因此扩大。
 - “移出通讯组”仅清所选节点的通讯父边，后代仍随该节点组成一组；恢复只接回持久保存的原通讯父边。controller、policy source、ACL root、工作项和自动结果回传保持不变。普通 Send(parent)、TeamStatus.send/broadcast 与 work.sync 都受普通消息最终准入 gate 约束，注册的任务结果通知不借此重建 peer。
 - 子代理出生同事务写通讯节点；普通 fork 创建独立通讯根。旧数据初始化只补缺失节点，显式 NULL 不再推导为继承；坏链/环/超深拒绝域授权。发送时重新读取源会话持久执行身份和当前权限，不能借消息作者覆盖接收会话身份。

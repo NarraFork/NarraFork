@@ -1208,6 +1208,16 @@ export const narratorToolContinuations = pgTable(
 	],
 );
 
+export const executorSessionCleanups = pgTable(
+	"executor_session_cleanups",
+	{
+		deviceId: text("device_id").notNull(),
+		sessionId: text("session_id").notNull(),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [primaryKey({ columns: [table.deviceId, table.sessionId] })],
+);
+
 export const terminals = pgTable(
 	"terminals",
 	{
@@ -1218,6 +1228,7 @@ export const terminals = pgTable(
 		cwd: text("cwd"),
 		dtachSocket: text("dtach_socket"),
 		deviceId: text("device_id"),
+		executorSessionId: text("executor_session_id"),
 		status: text("status").notNull().default("running"),
 		exitCode: integer("exit_code"),
 		createdAt: text("created_at").notNull(),
@@ -2562,6 +2573,7 @@ export const backgroundTasks = pgTable(
 		alias: text("alias"),
 		title: text("title"),
 		principalJson: jsonText("principal_json"),
+		executorSessionJson: jsonText("executor_session_json"),
 		output: text("output"),
 		outputBytes: integer("output_bytes").notNull().default(0),
 		outputTruncated: boolean("output_truncated").notNull().default(false),
@@ -4644,6 +4656,34 @@ export const teamWorkItems = pgTable(
 	],
 );
 
+export const teamWorkItemDependencies = pgTable(
+	"team_work_item_dependencies",
+	{
+		itemId: text("item_id")
+			.notNull()
+			.references((): PgColumn => teamWorkItems.id, { onDelete: "cascade" }),
+		dependsOnItemId: text("depends_on_item_id").notNull(),
+		teamId: text("team_id").notNull(),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		index("idx_team_work_item_dependencies_target").on(table.dependsOnItemId, table.itemId),
+		index("idx_team_work_item_dependencies_team").on(table.teamId),
+		check("ck_team_work_item_dependencies_self", sql.raw('"item_id" <> "depends_on_item_id"')),
+		foreignKey({
+			name: "team_work_item_dependencies_depends_on_item_id_te_69b44cd09b_fk",
+			columns: [table.dependsOnItemId],
+			foreignColumns: [teamWorkItems.id],
+		}).onDelete("cascade"),
+		foreignKey({
+			name: "team_work_item_dependencies_team_id_project_teams_94291c95ba_fk",
+			columns: [table.teamId],
+			foreignColumns: [projectTeams.narratorId],
+		}).onDelete("cascade"),
+		primaryKey({ columns: [table.itemId, table.dependsOnItemId] }),
+	],
+);
+
 export const teamWorkEvents = pgTable(
 	"team_work_events",
 	{
@@ -4675,8 +4715,8 @@ export const teamWorkEvents = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 149,
-  "columnCount": 1976,
+  "tableCount": 151,
+  "columnCount": 1985,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -11400,6 +11440,52 @@ export const POSTGRES_SCHEMA_COVERAGE = {
       "primaryKeys": []
     },
     {
+      "exportName": "executorSessionCleanups",
+      "name": "executor_session_cleanups",
+      "columns": [
+        {
+          "property": "deviceId",
+          "name": "device_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "sessionId",
+          "name": "session_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": [
+        {
+          "columns": [
+            "deviceId",
+            "sessionId"
+          ]
+        }
+      ]
+    },
+    {
       "exportName": "terminals",
       "name": "terminals",
       "columns": [
@@ -11473,6 +11559,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
         {
           "property": "deviceId",
           "name": "device_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "executorSessionId",
+          "name": "executor_session_id",
           "kind": "text",
           "pgType": "text",
           "notNull": false,
@@ -19486,6 +19581,16 @@ export const POSTGRES_SCHEMA_COVERAGE = {
         {
           "property": "principalJson",
           "name": "principal_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "executorSessionJson",
+          "name": "executor_session_json",
           "kind": "text",
           "mode": "json",
           "pgType": "text",
@@ -31299,6 +31404,105 @@ export const POSTGRES_SCHEMA_COVERAGE = {
       "foreignKeys": [],
       "uniqueConstraints": [],
       "primaryKeys": []
+    },
+    {
+      "exportName": "teamWorkItemDependencies",
+      "name": "team_work_item_dependencies",
+      "columns": [
+        {
+          "property": "itemId",
+          "name": "item_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "teamWorkItems",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "team_work_item_dependencies_item_id_team_work_items_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "dependsOnItemId",
+          "name": "depends_on_item_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "teamWorkItems",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "team_work_item_dependencies_depends_on_item_id_te_69b44cd09b_fk"
+          },
+          "emitAsTableConstraint": true
+        },
+        {
+          "property": "teamId",
+          "name": "team_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "projectTeams",
+            "column": "narratorId",
+            "onDelete": "cascade",
+            "constraintName": "team_work_item_dependencies_team_id_project_teams_94291c95ba_fk"
+          },
+          "emitAsTableConstraint": true
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_team_work_item_dependencies_target",
+          "columns": [
+            "dependsOnItemId",
+            "itemId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_team_work_item_dependencies_team",
+          "columns": [
+            "teamId"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [
+        "ck_team_work_item_dependencies_self"
+      ],
+      "checkDefinitions": [
+        {
+          "name": "ck_team_work_item_dependencies_self",
+          "expression": "\"item_id\" <> \"depends_on_item_id\""
+        }
+      ],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": [
+        {
+          "columns": [
+            "itemId",
+            "dependsOnItemId"
+          ]
+        }
+      ]
     },
     {
       "exportName": "teamWorkEvents",

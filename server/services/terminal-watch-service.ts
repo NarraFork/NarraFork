@@ -89,6 +89,8 @@ interface Watch {
 	result?: WatchResult;
 	dirty: boolean;
 	checking: boolean;
+	/** The check currently reading the buffer, so a caller can wait for its verdict. */
+	inflight?: Promise<void>;
 	lastCheck: number;
 	lastText?: string;
 	settled: boolean;
@@ -684,7 +686,14 @@ async function readText(watch: Watch): Promise<string> {
 	return (await watch.buffer.readFromMarker(watch.cursor?.marker ?? watch.marker)).text;
 }
 
-async function check(watch: Watch): Promise<void> {
+function check(watch: Watch): Promise<void> {
+	if (watch.checking) return watch.inflight ?? Promise.resolve();
+	const run = runCheck(watch);
+	if (watch.checking) watch.inflight = run;
+	return run;
+}
+
+async function runCheck(watch: Watch): Promise<void> {
 	if (!watch.pattern || !watch.buffer || !watch.marker || !watch.matchFrame) return;
 	if (watch.settled || watch.result || watch.checking || !watch.dirty) return;
 	watch.checking = true;
@@ -735,7 +744,85 @@ async function check(watch: Watch): Promise<void> {
 		}
 	} finally {
 		watch.checking = false;
+		watch.inflight = undefined;
 		if (watch.dirty && !watch.settled) scheduleCheck(watch);
+	}
+}
+
+/**
+ * Output of `terminalId` between two stream positions was lost (an executor
+ * session evicted it while the device was away). Text watches first get one
+ * last match on what was observed before the hole; one that still has not
+ * matched ends saying the text may have appeared unseen, instead of later
+ * reporting that it never appeared. The caller holds back later output (and
+ * the visible gap notice) until this resolves, so neither can be matched here.
+ */
+export async function interruptTextWatchesForGap(
+	terminalId: string,
+	buffer: BufferManager,
+	missingBytes: number,
+): Promise<void> {
+	await interruptTextWatches(
+		terminalId,
+		buffer,
+		(watch) =>
+			`${missingBytes} bytes of output from terminal "${watch.terminalName}" were lost while its device was disconnected`,
+	);
+}
+
+/**
+ * The device's executor restarted under a terminal: its recorded output has been
+ * replayed, but what follows (a notice, then the end) is not the shell's. Each text
+ * watch gets a last check against the real output; one that has not matched ends
+ * saying its text may have been printed without being recorded.
+ */
+export async function interruptTextWatchesForRestart(
+	terminalId: string,
+	buffer: BufferManager,
+	outcome: "lost" | "incomplete",
+): Promise<void> {
+	await interruptTextWatches(
+		terminalId,
+		buffer,
+		(watch) =>
+			outcome === "lost"
+				? `the device's executor restarted while terminal "${watch.terminalName}" was running, and output after its last recorded byte was not kept`
+				: `the device could not record all output from terminal "${watch.terminalName}" before its executor restarted`,
+		// One notice per watcher for the restart, but not the terminal's ending key: a
+		// watch for the terminal's exit still reports that on its own.
+		"interrupted by an executor restart",
+	);
+}
+
+/**
+ * Output before an interruption still matches; an unmatched text watch then ends
+ * with `cause`, never on a notice or output that follows the interruption.
+ */
+async function interruptTextWatches(
+	terminalId: string,
+	buffer: BufferManager,
+	cause: (watch: Watch) => string,
+	/** Watches ended by one interruption share one notice per watcher under this key. */
+	sharedKey?: string,
+): Promise<void> {
+	const current = [...(byTerminal.get(terminalId) ?? [])]
+		.map((id) => watches.get(id))
+		.filter(
+			(watch): watch is Watch =>
+				!!watch && !!watch.pattern && (!watch.buffer || watch.buffer === buffer),
+		);
+	for (const watch of current) {
+		if (watch.settled || watch.result) continue;
+		watch.dirty = true;
+		await check(watch);
+		if (watch.settled || watch.result) continue;
+		// The result freezes synchronously; publication continues in the background.
+		void settle(
+			watch,
+			"failed",
+			`Terminal watch ended: ${cause(watch)}, so ${JSON.stringify(watch.pattern)} may have appeared without being observed. Read the terminal before continuing; do not resend input automatically.`,
+			sharedKey && watch.buffer ? `${endedKey(watch)} ${sharedKey}` : undefined,
+		);
 	}
 }
 

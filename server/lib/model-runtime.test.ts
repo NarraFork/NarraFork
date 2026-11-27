@@ -98,7 +98,7 @@ describe("bounded runtime projections", () => {
 		);
 	});
 
-	test("gateway missing, empty and populated levels plus local explicit null stay distinct", () => {
+	test("gateway missing, empty, and populated levels stay distinct and respect local overrides", () => {
 		settings.nugProviders = [
 			{
 				id: "runtime-gateway",
@@ -142,7 +142,86 @@ describe("bounded runtime projections", () => {
 		expect(
 			buildRuntimeModelSummary({ selection: "runtime-nug:anthropic:claude-sonnet-4-5" })
 				.effortLevels,
-		).toBeNull();
+		).toEqual(["high"]);
+	});
+
+	test("runtime GPT-6.2 tiers follow the adapter after the per-model protocol override", () => {
+		const providers = settings.openaiProviders;
+		const overrides = settings.agent.modelProtocolOverrides;
+		const selection = "runtime-codex:gpt-6.2-sol";
+		settings.openaiProviders = [
+			{
+				id: "runtime-codex",
+				prefix: "runtime-codex",
+				name: "Relay",
+				apiKey: "key",
+				baseUrl: "https://relay.invalid",
+				defaultModel: "gpt-6.2-sol",
+				apiMode: "codex",
+			},
+		];
+		try {
+			settings.agent.modelProtocolOverrides = { [selection]: "openai-responses" };
+			expect(buildRuntimeModelSummary({ selection }).capabilities?.channelType).toBe("codex");
+			settings.agent.modelProtocolOverrides = { [selection]: "completions-compatible" };
+			const summary = buildRuntimeModelSummary({ selection });
+			expect(summary.capabilities?.channelType).toBe("openai");
+			expect(summary.effortLevels).not.toEqual(["low", "medium", "high", "xhigh", "max"]);
+		} finally {
+			settings.agent.modelProtocolOverrides = overrides;
+			settings.openaiProviders = providers;
+		}
+	});
+
+	test("GPT-6.2 Codex defaults follow the concrete route without inventing none", () => {
+		const previous = settings.nugProviders;
+		settings.nugProviders = [
+			{
+				id: "runtime-gateway",
+				prefix: "runtime-nug",
+				name: "Gateway",
+				apiKey: "secret",
+				baseUrl: "https://private.invalid",
+				defaultModel: "codex:gpt-6.2-sol",
+			},
+		];
+		try {
+			const selection = "runtime-nug:codex:gpt-6.2-sol";
+			expect(buildRuntimeModelSummary({ selection }).reasoning).toMatchObject({
+				levels: ["low", "medium", "high", "xhigh", "max"],
+				canDisable: false,
+			});
+			expect(
+				buildRuntimeModelSummary({ selection: "codex:gpt-6.2-astra" }).reasoning,
+			).toMatchObject({
+				levels: ["low", "medium", "high", "xhigh", "max"],
+				canDisable: false,
+			});
+			expect(
+				buildRuntimeModelSummary({ selection: "openai:gpt-6.2-sol" }).reasoning.levels,
+			).not.toEqual(["low", "medium", "high", "xhigh", "max"]);
+			expect(buildRuntimeModelSummary({ selection: "auto:gpt-6.2-sol" }).reasoning).toEqual({});
+			expect(
+				buildRuntimeModelSummary({
+					selection: "auto:gpt-6.2-sol",
+					observation: {
+						requestedModel: "auto:gpt-6.2-sol",
+						provider: "runtime-nug",
+						model: "codex:gpt-6.2-sol",
+						concreteValue: selection,
+						resolvedAt: 10,
+					},
+				}).reasoning.canDisable,
+			).toBe(false);
+			for (const levels of [[], ["low", "high"], ["none", "high", " ULTRA "]]) {
+				setNugCachedModels("runtime-gateway", [{ id: "codex:gpt-6.2-sol", effortLevels: levels }]);
+				const summary = buildRuntimeModelSummary({ selection });
+				expect(summary.effortLevels).toEqual(levels.filter((level) => level !== " ULTRA "));
+				expect(summary.reasoning.canDisable).toBe(levels.includes("none"));
+			}
+		} finally {
+			settings.nugProviders = previous;
+		}
 	});
 
 	test("summary readiness proves invalid and missing credentials false, leaves auto unknown", () => {

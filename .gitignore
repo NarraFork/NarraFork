@@ -44,6 +44,7 @@ scripts/*
 !scripts/check-style-tokens.ts
 !scripts/summarize-ci-tests.py
 !scripts/ci-native-diagnostics.ts
+!scripts/install-ci-chrome.ts
 !scripts/ci-stage.ts
 !scripts/build-alpha.ts
 !scripts/benchmark-token-repair-bulk.ts

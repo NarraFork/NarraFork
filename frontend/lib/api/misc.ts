@@ -4,6 +4,7 @@ import type {
 } from "@frontend/types/usage-history";
 import type { ResolvedBranding } from "@shared/branding";
 import type { McpLoadingMode } from "@shared/mcp-loading-mode";
+import { isNugPaymentContext, type NugPaymentIntent } from "@shared/nug-payment";
 import type { ProviderBalanceSnapshot } from "@shared/provider-balance";
 import type { ToolRoutineMode, ToolRoutineModeOverride } from "@shared/routine-modes";
 import type { WorkspacePanel, WorkspacePanelInput } from "@shared/workspace-panels";
@@ -33,15 +34,12 @@ import type {
 	DatabaseCleanupPreviewResult,
 	DatabaseCleanupTarget,
 	DatabaseVacuumResult,
-	DeepSeekBalanceCache,
 	HookApiRecord,
-	KimiUsageCache,
 	LearningDoc,
 	LearningIndexResponse,
 	LearningSearchResponse,
 	LegacyRequestDumpClearResult,
 	LicenseManifestResponse,
-	OpencodeUsageCache,
 	PromptLibraryEntryData,
 	PromptLibraryInputData,
 	PublicCodexQuotaOverview,
@@ -58,6 +56,64 @@ import type {
 	StorageScanJobState,
 	StorageScanResult,
 } from "./types";
+
+function checkedNugPaymentIntent(intent: NugPaymentIntent): NugPaymentIntent {
+	if (intent?.mode === "standalone") return { mode: "standalone" };
+	if (
+		intent?.mode !== "request" ||
+		typeof intent.narratorId !== "string" ||
+		!intent.narratorId ||
+		intent.narratorId.length > 128 ||
+		!isNugPaymentContext(intent.paymentContext)
+	) {
+		throw new ApiError("失败请求缺少有效的充值上下文，请重新发起该请求", 409, {
+			code: "NUG_PAYMENT_CONTEXT",
+		});
+	}
+	return { mode: "request", narratorId: intent.narratorId, paymentContext: intent.paymentContext };
+}
+
+function nugPaymentIntentQuery(intent: NugPaymentIntent): string {
+	const checked = checkedNugPaymentIntent(intent);
+	return new URLSearchParams(
+		checked.mode === "request"
+			? {
+					mode: checked.mode,
+					narratorId: checked.narratorId,
+					paymentContext: checked.paymentContext,
+				}
+			: { mode: checked.mode },
+	).toString();
+}
+
+function nugPaymentBinding(binding: unknown): string {
+	if (typeof binding !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(binding)) {
+		throw new ApiError(
+			"NUG payment context is unavailable; update the backend and create a new order",
+			409,
+			{ code: "NUG_PAYMENT_CONTEXT" },
+		);
+	}
+	return binding;
+}
+
+function requireNugPaymentOrder<T extends { order: { id: string; binding: string } }>(
+	data: T,
+	orderId?: string,
+	binding?: string,
+): T {
+	const received = nugPaymentBinding(data?.order?.binding);
+	if (
+		typeof data.order.id !== "string" ||
+		(orderId !== undefined && data.order.id !== orderId) ||
+		(binding !== undefined && received !== binding)
+	) {
+		throw new ApiError("NUG payment response does not match this order", 409, {
+			code: "NUG_PAYMENT_RESPONSE",
+		});
+	}
+	return data;
+}
 
 /** OAuth state of a remote MCP server; `required` means it refused us until an admin authorizes. */
 export interface McpServerAuthStatus {
@@ -819,30 +875,12 @@ export const miscApi = {
 			method: "POST",
 			body: JSON.stringify(body),
 		}),
-	nugGetCachedQuota: (
+	/** Explicit payment confirmation refresh; ordinary quota readers use quotaSnapshots. */
+	nugGetQuota: (
 		providerId: string,
-		options?: { signal?: AbortSignal; expectedGeneration?: number | string },
-	) => {
-		const query = new URLSearchParams({ providerId });
-		if (options?.expectedGeneration !== undefined)
-			query.set("expectedGeneration", String(options.expectedGeneration));
-		return request<{
-			generation: number;
-			quota: {
-				balance: number | null;
-				totalGranted: number | null;
-				detailedQuotaBalance: string | null;
-				fetchedAt: number;
-			} | null;
-		}>(`/nug/quotas?${query}`, {
-			...pickRequestOptions(options),
-			maxResponseBytes: 64 * 1024,
-			signal: options?.signal
-				? AbortSignal.any([options.signal, AbortSignal.timeout(15_000)])
-				: AbortSignal.timeout(15_000),
-		});
-	},
-	nugGetQuota: (providerId: string, options?: object) =>
+		options?: object,
+		payment?: { orderId: string; binding: string },
+	) =>
 		request<{
 			balance: number;
 			totalGranted: number;
@@ -850,19 +888,18 @@ export const miscApi = {
 			extra?: unknown;
 			username?: string;
 			role?: string;
-		}>(`/nug/providers/${providerId}/quota`, pickRequestOptions(options)),
-	nugGetQuotas: () =>
-		request<
-			Record<
-				string,
-				{
-					balance: number | null;
-					totalGranted: number | null;
-					detailedQuotaBalance?: string | null;
-					extra?: unknown;
-				}
-			>
-		>("/nug/quotas"),
+			paymentCredentialIsPrimary?: boolean;
+		}>(
+			`/nug/providers/${providerId}/quota${payment ? `?orderId=${encodeURIComponent(payment.orderId)}&binding=${encodeURIComponent(nugPaymentBinding(payment.binding))}` : ""}`,
+			pickRequestOptions(options),
+		).then((data) => {
+			if (payment && typeof data.paymentCredentialIsPrimary !== "boolean") {
+				throw new ApiError("NUG payment balance context is unavailable; update the backend", 409, {
+					code: "NUG_PAYMENT_CONTEXT",
+				});
+			}
+			return data;
+		}),
 	// Client-egress relay status per provider (docs/CODEX_CLIENT_RELAY.md).
 	nugGetRelayStatus: () =>
 		request<
@@ -872,42 +909,11 @@ export const miscApi = {
 			>
 		>("/nug/relay-status"),
 
-	providerGetBalances: (options?: { providerId?: string; signal?: AbortSignal }) =>
-		request<Record<string, ProviderBalanceSnapshot>>(
-			`/provider-balances${options?.providerId ? `?providerId=${encodeURIComponent(options.providerId)}` : ""}`,
-			pickRequestOptions(options),
-		),
 	providerProbeBalance: (providerId: string) =>
 		request<ProviderBalanceSnapshot>(`/provider-balances/${encodeURIComponent(providerId)}/probe`, {
 			method: "POST",
 		}),
-	providerRefreshBalance: (providerId: string) =>
-		request<ProviderBalanceSnapshot>(
-			`/provider-balances/${encodeURIComponent(providerId)}/refresh`,
-			{ method: "POST" },
-		),
-
-	deepseekGetBalances: (options?: object) =>
-		request<Record<string, DeepSeekBalanceCache>>(
-			"/deepseek/balances",
-			pickRequestOptions(options),
-		),
-	deepseekRefreshBalances: () =>
-		request<Record<string, DeepSeekBalanceCache>>("/deepseek/balances/refresh", { method: "POST" }),
-
-	// Kimi (kimi.com / kimi.ai) usage quotas — per-provider server-side cache
-	kimiGetUsages: () => request<Record<string, KimiUsageCache>>("/kimi/usages"),
-	kimiRefreshUsages: () =>
-		request<Record<string, KimiUsageCache>>("/kimi/usages/refresh", { method: "POST" }),
-
-	// OpenCode Go plan allowance — per-provider server-side cache
-	opencodeGetUsages: (options?: object) =>
-		request<Record<string, OpencodeUsageCache>>("/opencode/usages", pickRequestOptions(options)),
-	opencodeRefreshUsages: () =>
-		request<Record<string, OpencodeUsageCache>>("/opencode/usages/refresh", {
-			method: "POST",
-		}),
-	nugGetBillingConfig: (providerId: string) =>
+	nugGetBillingConfig: (providerId: string, intent: NugPaymentIntent) =>
 		request<{
 			enabled: boolean;
 			providers: Array<{ name: string; displayName: string }>;
@@ -921,14 +927,16 @@ export const miscApi = {
 			detailedQuotaBalance?: string | null;
 			extra?: unknown;
 			pollIntervalMs?: number;
-		}>(`/nug/providers/${providerId}/billing/config`),
+		}>(`/nug/providers/${providerId}/billing/config?${nugPaymentIntentQuery(intent)}`),
 	nugCreateBillingOrder: (
 		providerId: string,
 		body: { amount: number; provider: string; channel?: "alipay" | "wechat" | string },
+		intent: NugPaymentIntent,
 	) =>
 		request<{
 			order: {
 				id: string;
+				binding: string;
 				amount: string;
 				quota_amount: string;
 				provider: string;
@@ -940,12 +948,13 @@ export const miscApi = {
 			pollIntervalMs?: number;
 		}>(`/nug/providers/${providerId}/billing/orders`, {
 			method: "POST",
-			body: JSON.stringify(body),
-		}),
-	nugGetBillingOrder: (providerId: string, orderId: string) =>
+			body: JSON.stringify({ ...body, intent: checkedNugPaymentIntent(intent) }),
+		}).then((data) => requireNugPaymentOrder(data)),
+	nugGetBillingOrder: (providerId: string, orderId: string, binding: string) =>
 		request<{
 			order: {
 				id: string;
+				binding: string;
 				amount: string;
 				quota_amount: string;
 				provider: string;
@@ -956,11 +965,14 @@ export const miscApi = {
 				created_at: string;
 			};
 			pollIntervalMs?: number;
-		}>(`/nug/providers/${providerId}/billing/orders/${encodeURIComponent(orderId)}`),
-	nugRepayBillingOrder: (providerId: string, orderId: string) =>
+		}>(
+			`/nug/providers/${providerId}/billing/orders/${encodeURIComponent(orderId)}?binding=${encodeURIComponent(nugPaymentBinding(binding))}`,
+		).then((data) => requireNugPaymentOrder(data, orderId, binding)),
+	nugRepayBillingOrder: (providerId: string, orderId: string, binding: string) =>
 		request<{
 			order: {
 				id: string;
+				binding: string;
 				amount: string;
 				quota_amount: string;
 				provider: string;
@@ -970,9 +982,12 @@ export const miscApi = {
 				created_at: string;
 			};
 			pollIntervalMs?: number;
-		}>(`/nug/providers/${providerId}/billing/orders/${encodeURIComponent(orderId)}/repay`, {
-			method: "POST",
-		}),
+		}>(
+			`/nug/providers/${providerId}/billing/orders/${encodeURIComponent(orderId)}/repay?binding=${encodeURIComponent(nugPaymentBinding(binding))}`,
+			{
+				method: "POST",
+			},
+		).then((data) => requireNugPaymentOrder(data, orderId, binding)),
 	nugGetChannelsHealth: (providerId: string) =>
 		request<{
 			channels: Array<{

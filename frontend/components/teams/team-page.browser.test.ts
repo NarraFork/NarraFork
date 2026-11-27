@@ -16,7 +16,9 @@
  *     remounted; the page is about one team; on a phone the header carries the menu button so
  *     nothing floats over it;
  *   - an archived team says so and offers no "pause all"; at 360 px nothing scrolls sideways, in
- *     light and dark; the project page's teams section creates a team.
+ *     light and dark; the project page's teams section creates a team;
+ *   - dependencies (D): a blocked queued row names what it waits for, the drawer lists the
+ *     dependencies (a title opens that item) and its dependents, and warns about a cancelled one.
  *
  * Set `TEAMS_P4_SHOTS` to a directory to keep screenshots.
  */
@@ -35,6 +37,7 @@ import {
 	narratorToolCalls,
 	projects,
 	teamWorkEvents,
+	teamWorkItemDependencies,
 	teamWorkItems,
 	users,
 } from "../../../server/db/schema";
@@ -396,6 +399,20 @@ test("the work list reflects work item state changes", async () => {
 		expect(await call(page, (f) => f.attr("[data-testid=team-workspace]", "data-layout"))).toBe(
 			"split",
 		);
+		// The coordinator's column has one compact line above the conversation, not its toolbar;
+		// 完整会话 opens the coordinator's own session page.
+		await until(
+			page,
+			"coordinator line",
+			(f) => f.count("[data-testid=team-coordinator-line]") === 1,
+		);
+		expect(
+			await call(page, (f) =>
+				f.above("[data-testid=team-coordinator-header]", "[data-testid=conversation-stand-in]"),
+			),
+		).toBe(true);
+		await call(page, (f) => f.click("[data-testid=team-coordinator-full-session]"));
+		expect(await call(page, (f) => f.openedTargets())).toContain(`full:${teamId}`);
 		// Finished items are counts until opened: only the open columns are read.
 		expect([...new Set(boardReads)].sort()).toEqual(["in_progress", "queued", "review"]);
 		expect(await call(page, (f, id: string) => f.groupOf(id), movingId)).toBe("inProgress");
@@ -583,16 +600,43 @@ test("等你处理: approve a tool call and answer a question in place; onlooker
 	}
 }, 60_000);
 
+const BLOCKER_FINDINGS =
+	"Missing the day-boundary case: an order placed after 16:00 UTC belongs to the next day in UTC+8. " +
+	"The export also reads the server's zone when the user has none set; use the team default. " +
+	"Add a test for each.\n" +
+	"1. Orders at 15:59 and 16:00 UTC land on different days.\n" +
+	"2. A user without a zone gets the team default, not the server's.\n" +
+	"3. The CSV header names the zone it used.";
+
 test("the drawer opens from a card; 退回 needs a reason and sends the item back", async () => {
+	// Two review rounds with their findings, as the coordinator records them.
+	for (const [round, verdict, summary] of [
+		[1, "blocker", BLOCKER_FINDINGS],
+		[2, "clear", "Added three day-boundary tests; the export suite passes."],
+	] as const)
+		await db.insert(teamWorkEvents).values({
+			id: generateId(),
+			teamId,
+			workItemId: readyId,
+			kind: "work.review",
+			actorKind: "agent",
+			actorId: teamId,
+			detailJson: { round, verdict, findings: verdict === "blocker" ? 2 : 0, summary },
+			createdAt: tick(),
+		});
 	const { page, errors } = await openPage(alice, { width: 1440, height: 900 });
 	try {
 		await call(page, (f, p: string, t: string) => f.openTeam(p, t), projectId, teamId);
 		const card = `[data-testid=team-attention-card][data-item-id="${readyId}"]`;
 		await until(page, "merge card", (f, c: string) => f.count(c) === 1, 10_000, card);
-		// The server never merges: 合并 is there, disabled.
+		// M: origin is not on GitHub here, so the local merge is offered.
 		expect(
-			await call(page, (f, c: string) => f.attr(`${c} [data-testid=team-merge]`, "disabled"), card),
-		).toBe("");
+			await call(
+				page,
+				(f, c: string) => f.attr(`${c} [data-testid=team-merge-button]`, "disabled"),
+				card,
+			),
+		).toBeNull();
 		await call(page, (f, c: string) => f.click(`${c} [data-testid=team-merge-view]`), card);
 		await until(
 			page,
@@ -603,8 +647,49 @@ test("the drawer opens from a card; 退回 needs a reason and sends the item bac
 		expect(await call(page, (f) => f.text("[data-testid=team-drawer-branch]"))).toBe(
 			"team/write-the-docs-9f9f",
 		);
-		expect(await call(page, (f) => f.attr("[data-testid=team-drawer-merge]", "disabled"))).toBe("");
+		// 合并 runs in the background; this seeded item has no recorded head, so the job refuses
+		// and the drawer says so.
+		await call(page, (f) =>
+			f.click("[data-testid=team-drawer-bar] [data-testid=team-merge-button]"),
+		);
+		await until(
+			page,
+			"merge refused",
+			(f) =>
+				f.attr("[data-testid=team-merge-failed]", "data-code") ===
+				"TEAM_WORK_ITEM_HEAD_UNAVAILABLE",
+			15_000,
+		);
+		// Refused, the button is there again for a later try.
+		await until(
+			page,
+			"merge again",
+			(f) =>
+				f.attr(
+					"[data-testid=team-drawer-bar] [data-testid=team-merge-button]",
+					"data-merge-label",
+				) === "merge",
+		);
+		// Each round shows its findings; the long one is clamped until 展开.
+		await until(page, "findings", (f) => f.count("[data-testid=team-review-findings]") === 2);
+		expect(await call(page, (f) => f.texts("[data-testid=team-review-findings] p"))).toEqual([
+			BLOCKER_FINDINGS,
+			"Added three day-boundary tests; the export suite passes.",
+		]);
+		expect(await call(page, (f) => f.count("[data-testid=team-review-findings-toggle]"))).toBe(1);
+		const clamped = await call(page, (f) => f.height("[data-testid=team-review-findings] p"));
 		await shot(page, "desktop-light-drawer");
+		await call(page, (f) => f.click("[data-testid=team-review-findings-toggle]"));
+		await until(
+			page,
+			"expanded",
+			(f, before: number) => f.height("[data-testid=team-review-findings] p") > before,
+			5_000,
+			clamped,
+		);
+		expect(await call(page, (f) => f.text("[data-testid=team-review-findings-toggle]"))).toBe(
+			"Show less",
+		);
 		await call(page, (f) => f.click("[data-testid=team-drawer-return]"));
 		await until(page, "reason", (f) => f.count("[data-testid=team-return-reason]") === 1);
 		// No reason, no return.
@@ -810,7 +895,7 @@ test("the page is about one team: no teams list, no new team, at desktop and pho
 			const seen = {
 				width: viewport.width,
 				lists: await call(page, (f) => f.count("[data-testid=project-teams]")),
-				rows: await call(page, (f) => f.count("[data-testid=project-team-row]")),
+				rows: await call(page, (f) => f.count("[data-testid=project-team-card]")),
 				newTeam: await call(page, (f) => f.count("[data-testid=new-team]")),
 				newTeamText: await call(page, () => document.body.innerText.includes("New team")),
 			};
@@ -1060,14 +1145,14 @@ test("the project page's teams section creates a team", async () => {
 	const { page, errors } = await openPage(alice, { width: 360, height: 780 });
 	try {
 		await call(page, (f, p: string) => f.openProjectTeams(p, true), projectId);
-		await until(page, "list", (f) => f.count("[data-testid=project-team-row]") === 1);
+		await until(page, "list", (f) => f.count("[data-testid=project-team-card]") === 1);
 		await call(page, (f) => f.click("[data-testid=new-team]"));
 		await until(page, "dialog", (f) => f.count("[data-testid=create-team-name]") === 1);
 		await call(page, (f) => f.type("[data-testid=create-team-name]", "Docs crew"));
 		await shot(page, "phone-light-new-team");
 		await call(page, (f) => f.click("[data-testid=create-team-submit]"));
 		await until(page, "created", (f) => f.openedTargets().some((x) => x.startsWith("team:")));
-		await until(page, "listed", (f) => f.count("[data-testid=project-team-row]") === 2);
+		await until(page, "listed", (f) => f.count("[data-testid=project-team-card]") === 2);
 		const created = await db.query.narrators.findFirst({
 			where: eq(narrators.title, "Docs crew"),
 			columns: { id: true, traits: true, contextProjectId: true },
@@ -1083,9 +1168,108 @@ test("the project page's teams section creates a team", async () => {
 	const reader = await openPage(bob, { width: 360, height: 780 });
 	try {
 		await call(reader.page, (f, p: string) => f.openProjectTeams(p, false), projectId);
-		await until(reader.page, "list", (f) => f.count("[data-testid=project-team-row]") === 2);
+		await until(reader.page, "list", (f) => f.count("[data-testid=project-team-card]") === 2);
 		expect(await call(reader.page, (f) => f.count("[data-testid=new-team]"))).toBe(0);
 	} finally {
 		await reader.page.close();
+	}
+}, 60_000);
+
+test("dependencies: blocked rows say what they wait for; the drawer lists and links them", async () => {
+	const plan = await createTeam(
+		{ projectId, name: "Plan crew" },
+		{ userId: alice, isAdmin: false },
+	);
+	const seed = async (title: string, state: string) => {
+		const id = generateId();
+		const at = tick();
+		await db.insert(teamWorkItems).values({
+			id,
+			teamId: plan.id,
+			projectId,
+			title,
+			state: state as "queued",
+			createdAt: at,
+			updatedAt: at,
+		});
+		return id;
+	};
+	const depend = (itemId: string, dependsOnItemId: string) =>
+		db
+			.insert(teamWorkItemDependencies)
+			.values({ itemId, dependsOnItemId, teamId: plan.id, createdAt: tick() });
+	const schemaId = await seed("Schema", "in_progress");
+	const apiId = await seed("API", "queued");
+	const oldId = await seed("Old plan", "cancelled");
+	const pageId = await seed("Page", "queued");
+	await depend(apiId, schemaId);
+	await depend(pageId, oldId);
+	const row = (id: string) => `[data-testid=team-work-row][data-item-id="${id}"]`;
+	const { page, errors } = await openPage(alice, { width: 1440, height: 900 });
+	try {
+		await call(page, (f, p: string, t: string) => f.openTeam(p, t), projectId, plan.id);
+		await until(page, "rows", (f, r: string) => f.count(r) === 1, 10_000, row(pageId));
+		expect(
+			await call(page, (f, r: string) => f.text(`${r} [data-testid=team-work-line]`), row(apiId)),
+		).toBe("Queued · waiting for “Schema” to merge");
+		expect(
+			await call(
+				page,
+				(f, r: string) => f.attr(`${r} [data-testid=team-work-line]`, "data-line"),
+				row(pageId),
+			),
+		).toBe("queuedBlockedCancelled");
+
+		// The drawer of a blocked item: its dependency with its state, and when it starts.
+		await call(page, (f, r: string) => f.click(r), row(apiId));
+		await until(page, "API drawer", (f) => f.text("[data-testid=team-drawer-title]") === "API");
+		await until(
+			page,
+			"dependencies",
+			(f) => f.count("[data-testid=team-drawer-dependencies]") === 1,
+		);
+		expect(
+			await call(page, (f) =>
+				f.attr(
+					"[data-testid=team-drawer-dependencies] [data-testid=team-dependency]",
+					"data-state",
+				),
+			),
+		).toBe("in_progress");
+		expect(await call(page, (f) => f.count("[data-testid=team-dependency-cancelled]"))).toBe(0);
+		await shot(page, "desktop-light-dependencies");
+		// A dependency's title opens that item, which lists API under 被依赖.
+		await call(page, (f) =>
+			f.click("[data-testid=team-drawer-dependencies] [data-testid=team-dependency] button"),
+		);
+		await until(
+			page,
+			"Schema drawer",
+			(f) => f.text("[data-testid=team-drawer-title]") === "Schema",
+		);
+		await until(page, "dependents", (f) => f.count("[data-testid=team-drawer-dependents]") === 1);
+		expect(await call(page, (f) => f.text("[data-testid=team-drawer-dependents]"))).toContain(
+			"API",
+		);
+		expect(await call(page, (f) => f.count("[data-testid=team-drawer-dependencies]"))).toBe(0);
+
+		// A cancelled dependency never merges: the drawer says so, in either language.
+		await call(page, (f, r: string) => f.click(r), row(pageId));
+		await until(page, "Page drawer", (f) => f.text("[data-testid=team-drawer-title]") === "Page");
+		await until(page, "warning", (f) => f.count("[data-testid=team-dependency-cancelled]") === 1);
+		expect(await call(page, (f) => f.text("[data-testid=team-dependency-cancelled]"))).toContain(
+			"“Old plan” was cancelled",
+		);
+		await call(page, (f) => f.setLanguage("zh-CN"));
+		await until(page, "Chinese", (f) =>
+			(f.text("[data-testid=team-dependency-cancelled]") ?? "").includes("「Old plan」已取消"),
+		);
+		expect(
+			await call(page, (f, r: string) => f.text(`${r} [data-testid=team-work-line]`), row(apiId)),
+		).toBe("排队 · 等「Schema」合并");
+		await call(page, (f) => f.setLanguage("en"));
+		expect(errors).toEqual([]);
+	} finally {
+		await page.close();
 	}
 }, 60_000);

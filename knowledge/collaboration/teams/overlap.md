@@ -18,7 +18,7 @@ keywords:
   - chapterSettings
   - work.exclusive_released
 status: draft
-verified_at: 12e8a02d8
+verified_at: 3588311eac166b9c044478105016c59ebd95688b
 ---
 # 重叠与独占路径
 
@@ -28,6 +28,8 @@ verified_at: 12e8a02d8
 改动路径与重叠（`teams/team-overlap.ts`）：
 - 后台每两分钟分批（每批 50 项）刷新活动工作项相对基线的改动路径，按项目比较重叠；卡住的项会被跳过若干轮。
 - 每项上限 2000 条或 128KiB，超出退化为顶层目录（目录以 `/` 结尾）。
+- 后台刷新按项的比较基线读改动路径（起点为 `origin/<基线>` 的项用 `refs/remotes/origin/<基线>`，`compareRefFor`）；合并判定看本地基线与 `refs/remotes/origin/<基线>`，head 在任一个里就算落地。 扫描（sweep）结束时还在剩余期限内调一次 `reconcileUnblocks`（见[工作项](work-items.md)）。
+- 合并判定（`mergeIfLanded`）跳过合并任务正持有的项（`team-merge-guard.ts:isMerging`）：那时由合并任务自己记合并（见[合并工作项与基线配置](merge.md)）。
 - 读路径只经 `team-git.ts` 的两提交比较，不读工作区。后台刷新按当时的 HEAD 读；`work.ready` 经 `readChangedPaths(worktree, baseRef, at)` 按它钉住的提交读（见 [工作项](work-items.md)）。
 
 独占路径与锁：
@@ -41,7 +43,7 @@ verified_at: 12e8a02d8
 - 重叠查询走 `GET /api/projects/:projectId/team-overlaps`（`server/routes/project-teams.ts`）；二者与团队路由一样在 PG 上返回 503 `POSTGRES_UNSUPPORTED`。
 
 ## 从哪读起
-- `server/services/teams/team-overlap.ts`：刷新循环、重叠比较、独占锁判定。
+- `server/services/teams/team-overlap.ts`：刷新循环、重叠比较、独占锁判定；重叠提醒里的标题经 `team-coordinator-notes.ts:oneLine` 压成一行。
 - `__tests__/team-overlap.test.ts`：行为的守卫测试。
 - 重叠结果如何进入协调者历史，见 [协调者](coordinator.md) 的 `team_status`。
 

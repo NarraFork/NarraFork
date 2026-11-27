@@ -60,7 +60,11 @@ export interface TokenDancePublicConnection {
 	billingInstance?: string;
 	models: TokenDanceCatalogModel[];
 	recoveryAction?: TokenDanceRecoveryAction;
+	/** No trusted login provenance: an administrator must choose before authorizing. */
+	unboundKeys?: Array<{ id: string; label: string }>;
 }
+
+export type TokenDanceLoginChoice = { mode: "replace"; credentialId: string } | { mode: "add" };
 
 /** User-authored unsaved fields only; TokenDance credentials must be excluded. */
 export interface TokenDanceDraftSnapshot {

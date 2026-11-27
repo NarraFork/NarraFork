@@ -582,6 +582,27 @@
 			"when": 1795595730488,
 			"tag": "0082_communication_topology",
 			"breakpoints": true
+		},
+		{
+			"idx": 83,
+			"version": "7",
+			"when": 1795622211933,
+			"tag": "0083_terminal_executor_session",
+			"breakpoints": true
+		},
+		{
+			"idx": 84,
+			"version": "7",
+			"when": 1795626264812,
+			"tag": "0084_team_work_item_dependencies",
+			"breakpoints": true
+		},
+		{
+			"idx": 85,
+			"version": "7",
+			"when": 1795643457364,
+			"tag": "0085_background_task_executor_session",
+			"breakpoints": true
 		}
   ]
 }

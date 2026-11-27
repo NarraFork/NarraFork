@@ -6,13 +6,14 @@ import {
 	type TokenDancePublicConnection,
 } from "@shared/tokendance";
 import { IconCircleCheck } from "@tabler/icons-react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../hooks/useAuth";
-import { formatTokenDanceMoney } from "../../hooks/useTokenDanceBalance";
+import { useRefreshQuotaSnapshots } from "../../hooks/useQuotaSnapshots";
 import { api } from "../../lib/api";
 import { createQrDataUrl } from "../../lib/qr";
+import { formatTokenDanceMoney } from "../../lib/tokendance-money";
 
 export interface TokenDanceRechargeDialogProps {
 	opened: boolean;
@@ -119,7 +120,8 @@ function RechargeContent({
 	onPaid,
 }: TokenDanceRechargeDialogProps & { billingInstance: string }) {
 	const { t, i18n } = useTranslation("errors");
-	const qc = useQueryClient();
+	const refreshQuota = useRefreshQuotaSnapshots(`${generation}:${billingInstance}`);
+	const refreshQuotaAsync = refreshQuota.mutateAsync;
 	const [amount, setAmount] = useState<string | number>(10);
 	const [session, setSession] = useState<TokenDancePaymentSession>();
 	const [busy, setBusy] = useState(false);
@@ -278,21 +280,33 @@ function RechargeContent({
 		};
 	}, [sessionId, sessionStatus, generation, accept]);
 	useEffect(() => {
-		if (session?.status !== "paid" || paid.current || controller.current.signal.aborted) return;
+		if (
+			session?.status !== "paid" ||
+			session.generation !== generation ||
+			paid.current ||
+			controller.current.signal.aborted
+		)
+			return;
 		paid.current = true;
-		void api
-			.tokenDanceRefreshBalance({ signal: controller.current.signal })
-			.then((balance) => {
-				if (!controller.current.signal.aborted && balance.generation === generation) {
-					qc.setQueryData(["tokendance", "balance", generation], balance);
-					if (balance.hasError) setBalanceRefreshFailed(true);
+		void refreshQuotaAsync({ groupId: "tokendance" })
+			.then((snapshots) => {
+				if (!controller.current.signal.aborted) {
+					if (
+						snapshots.entries.some(
+							(entry) =>
+								entry.groupId === "tokendance" &&
+								!entry.refreshing &&
+								(entry.snapshot?.hasError || entry.snapshot?.error),
+						)
+					)
+						setBalanceRefreshFailed(true);
 				}
 			})
 			.catch(() => {
 				if (!controller.current.signal.aborted) setBalanceRefreshFailed(true);
 			});
 		paidCallback.current?.();
-	}, [session, generation, qc]);
+	}, [session, generation, refreshQuotaAsync]);
 	const mobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
 	const qr = useMemo(() => {
 		if (mobile || !session || session.status !== "pending") return null;

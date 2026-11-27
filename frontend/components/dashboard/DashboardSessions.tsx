@@ -40,7 +40,7 @@ const RECENT_REFETCH_INTERVAL_MS = 60_000;
 const LIVE_LIST_LIMIT = 30;
 const RECENT_LIST_LIMIT = 50;
 /** Cap on activity subscriptions, well under the per-connection subscription limit. */
-const MAX_ACTIVITY_SUBSCRIPTIONS = 40;
+export const MAX_ACTIVITY_SUBSCRIPTIONS = 40;
 
 function narratorListQuery(status: "working" | "waiting" | null) {
 	return {
@@ -211,6 +211,9 @@ export function DashboardSessions({ data }: { data: ReturnType<typeof useDashboa
 	);
 }
 
+/** The home page's card grid, shared with the project page's running sessions. */
+export const SESSION_CARD_GRID_COLS = { base: 1, sm: 2, lg: 3 } as const;
+
 function Section({
 	title,
 	count,
@@ -239,7 +242,7 @@ function Section({
 				{action}
 			</Group>
 			{Array.isArray(children) || children ? (
-				<SimpleGrid cols={{ base: 1, sm: 2, lg: 3 }} spacing="sm">
+				<SimpleGrid cols={SESSION_CARD_GRID_COLS} spacing="sm">
 					{children}
 				</SimpleGrid>
 			) : null}
@@ -247,7 +250,11 @@ function Section({
 	);
 }
 
-function SessionCard({
+/**
+ * One session as a card: status, title, time, directory, its decision or state, and its latest
+ * tool calls from the live activity subscription. Shared with the project page's 进行中 view.
+ */
+export function SessionCard({
 	session,
 	activity,
 }: {

@@ -8,6 +8,7 @@
  * Pure: no DOM, no React.
  */
 import {
+	dependencyBlockers,
 	TEAM_LEVEL_EVENT_KINDS,
 	TEAM_OVERLAP_EVENT_KINDS,
 	TEAM_PERSON_DECISION_EVENT_KINDS,
@@ -17,7 +18,10 @@ import {
 	type TeamBoardItem,
 	type TeamPageSummary,
 	type TeamPendingApproval,
+	type TeamPrMergeMethod,
 	type TeamSummary,
+	type TeamWorkDependencyRef,
+	type TeamWorkMergeSummary,
 } from "@shared/project-teams";
 
 /**
@@ -49,6 +53,29 @@ export function liveWorkerStatus(
 	const complete = summary.runningCount <= summary.runningAgents.length;
 	if (complete && (worker.status === "working" || worker.status === "waiting")) return "idle";
 	return worker.status;
+}
+
+/**
+ * The coordinator column's header line: how many other sessions of the tree are running, and the
+ * coordinator's own state when nothing else runs. The summary's running list does not say which
+ * sessions are work-item workers (reviewers and nested subagents run in the same tree), so the
+ * line counts sessions, not workers. When the list was cut (`more`) the count is a lower bound,
+ * shown as 「N+」: the listed others plus at least one unlisted, so it is never 「0+」.
+ */
+export function coordinatorLine(
+	summary: Pick<TeamPageSummary, "teamId" | "coordinatorStatus" | "runningAgents" | "runningCount">,
+):
+	| { kind: "running"; count: number; more: boolean }
+	| { kind: "status"; status: "working" | "waiting" | "idle" | "archived" } {
+	const others = summary.runningAgents.filter((agent) => agent.id !== summary.teamId).length;
+	const more = summary.runningCount > summary.runningAgents.length;
+	if (more) return { kind: "running", count: others + 1, more };
+	if (others > 0) return { kind: "running", count: others, more };
+	const status = summary.coordinatorStatus;
+	return {
+		kind: "status",
+		status: status === "working" || status === "waiting" || status === "archived" ? status : "idle",
+	};
 }
 
 /** "50+" past a capped count (the server counts one past its limit). */
@@ -129,6 +156,72 @@ export function eventNote(
 			const reason = text(detail.reason, 600);
 			return reason ? { key: "text", values: { text: reason } } : null;
 		}
+		case "work.dependencies_changed": {
+			// The whole set, merged ones included (the event keeps no states): never "waits for N".
+			const count = Array.isArray(detail.dependsOn) ? detail.dependsOn.length : null;
+			if (count === null) return null;
+			return count === 0
+				? { key: "dependenciesCleared", values: {} }
+				: { key: "dependencies", values: { count } };
+		}
+		case "work.unblocked":
+			return { key: "unblocked", values: {} };
+		case "work.merge_requested":
+			if (detail.job === "pull_request") return { key: "prRequested", values: {} };
+			if (detail.job === "pr_merge")
+				return {
+					key: "prMergeRequested",
+					values: { method: text(detail.method, 20) ?? "merge" },
+				};
+			return {
+				key: detail.job === "fast_forward" ? "mergeFastForward" : "mergeRequested",
+				values: {},
+			};
+		case "work.pr_pushed": {
+			const branch = text(detail.branch, 200);
+			return branch ? { key: "branch", values: { branch } } : null;
+		}
+		case "work.pr_opened":
+		case "work.pr_closed":
+		case "work.pr_queued": {
+			const pr = num(detail.pr);
+			return pr !== null ? { key: "prNumber", values: { pr } } : null;
+		}
+		case "work.pr_checks": {
+			if (detail.checks === "failing")
+				return { key: "prChecksFailing", values: { count: num(detail.failed) ?? 0 } };
+			if (detail.review === "CHANGES_REQUESTED") return { key: "prChangesRequested", values: {} };
+			if (detail.checks === "passing") return { key: "prChecksPassing", values: {} };
+			if (detail.review === "APPROVED") return { key: "prApproved", values: {} };
+			return null;
+		}
+		case "work.merge_failed": {
+			if (detail.code === "conflict") {
+				const count = Array.isArray(detail.conflicts) ? detail.conflicts.length : 0;
+				return {
+					key: detail.more === true ? "mergeConflictMore" : "mergeConflict",
+					values: { count },
+				};
+			}
+			const message = text(detail.message, 280);
+			return message ? { key: "text", values: { text: message } } : null;
+		}
+		case "work.merge_prepared": {
+			const path = text(detail.checkedOutAt, 300);
+			return path ? { key: "mergePrepared", values: { path } } : null;
+		}
+		case "work.merged":
+			if (detail.detectedBy === "local_merge")
+				return {
+					key: detail.fastForwarded === "checkout" ? "mergedFastForward" : "mergedLocal",
+					values: {},
+				};
+			if (detail.detectedBy === "ancestry") return { key: "mergedAncestry", values: {} };
+			if (detail.detectedBy === "pull_request") {
+				const pr = num(detail.pr);
+				return pr !== null ? { key: "mergedPullRequest", values: { pr } } : null;
+			}
+			return null;
 		case "approval.allowed":
 		case "approval.denied":
 		case "question.answered":
@@ -269,12 +362,21 @@ export function itemOfApproval(
 	return items.find((item) => item.worker && sessions.has(item.worker.id)) ?? null;
 }
 
+/**
+ * Where a card comes from when 「等你处理」 sums up more than one team (R2: the project page): the
+ * team it belongs to, or an ordinary session and whose it is. The team page leaves it out.
+ */
+export type AttentionSource =
+	| { kind: "team"; teamId: string; name: string }
+	| { kind: "session"; narratorId: string; title: string | null; ownerName: string | null };
+
 /** One card of 「等你处理」: a pending call of the tree, or a ready item to accept. */
 interface ApprovalEntry<K extends TeamPendingApproval["kind"]> {
 	kind: K;
 	id: string;
 	approval: TeamPendingApproval;
 	item: TeamBoardItem | null;
+	source?: AttentionSource;
 }
 
 export type AttentionEntry =
@@ -282,7 +384,14 @@ export type AttentionEntry =
 	| ApprovalEntry<"question">
 	| ApprovalEntry<"plan">
 	| ApprovalEntry<"rule">
-	| { kind: "merge"; id: string; item: TeamBoardItem };
+	| {
+			kind: "merge";
+			id: string;
+			item: TeamBoardItem;
+			source?: AttentionSource;
+			/** The branch it merges into, when the cards come from several teams. */
+			base?: string;
+	  };
 
 const isOpen = (item: TeamBoardItem) => item.state !== "merged" && item.state !== "cancelled";
 
@@ -487,6 +596,31 @@ export function teamPageMode(
 /** The tint of a row's status dot. */
 export type RowTone = "amber" | "green" | "blue" | "hollow" | "gray";
 
+/**
+ * What a tool call asks for, in words (R2: 「请求编辑文件」, 「等批准运行命令」): editing a file,
+ * running a command, reading a file, opening a web page, or (any other tool) using it by name.
+ */
+export type ToolVerb = "editFile" | "runCommand" | "readFile" | "fetchWeb" | "useTool";
+
+const TOOL_VERBS: Readonly<Record<string, ToolVerb>> = {
+	Edit: "editFile",
+	Write: "editFile",
+	MultiEdit: "editFile",
+	NotebookEdit: "editFile",
+	Bash: "runCommand",
+	Read: "readFile",
+	WebFetch: "fetchWeb",
+};
+
+export function toolVerb(toolName: string): ToolVerb {
+	return TOOL_VERBS[toolName] ?? "useTool";
+}
+
+/** The i18n key (under `teams.page.row.`) of a row waiting for approval of this tool. */
+export function waitingToolKey(toolName: string): string {
+	return `waitingTools.${toolVerb(toolName)}`;
+}
+
 /** A row's second line: an i18n key under `teams.page.row.` and its values. */
 export interface RowLine {
 	key: string;
@@ -504,7 +638,7 @@ export function rowLine(row: WorkRow, workerStatus: string | null, base: string)
 			approval.kind === "question" ? (approval.questions[0] ?? null) : approval.preview || null;
 		const key =
 			approval.kind === "tool"
-				? "waitingTool"
+				? waitingToolKey(approval.toolName)
 				: approval.kind === "question"
 					? "waitingAnswer"
 					: approval.kind === "plan"
@@ -519,7 +653,12 @@ export function rowLine(row: WorkRow, workerStatus: string | null, base: string)
 		const kind =
 			tool === "AskUserQuestion" ? "question" : tool === "ExitPlanMode" ? "plan" : "tool";
 		return {
-			key: kind === "question" ? "waitingAnswer" : kind === "plan" ? "waitingPlan" : "waitingTool",
+			key:
+				kind === "question"
+					? "waitingAnswer"
+					: kind === "plan"
+						? "waitingPlan"
+						: waitingToolKey(tool),
 			values: { tool },
 			detail: item.activity?.preview || null,
 			tone: "amber",
@@ -543,7 +682,7 @@ export function rowLine(row: WorkRow, workerStatus: string | null, base: string)
 						tone: "blue",
 					};
 		case "queued":
-			return { key: "queued", values: {}, detail: null, tone: "hollow" };
+			return queuedLine(item.dependsOn);
 		case "merged":
 			return { key: "merged", values: { base }, detail: null, tone: "gray" };
 		case "cancelled":
@@ -567,10 +706,61 @@ export function rowLine(row: WorkRow, workerStatus: string | null, base: string)
 	}
 }
 
+/**
+ * D: a queued row's line. Waiting on dependencies it reads 「排队 · 等「A」「B」合并」 (the
+ * titles when one or two, else 「等 N 项合并」); a cancelled dependency, which never merges,
+ * reads 「排队 · 依赖「A」已取消」 until the coordinator removes or replaces it (the drawer warns).
+ */
+export function queuedLine(dependsOn: readonly TeamWorkDependencyRef[] | undefined): RowLine {
+	const blockers = dependencyBlockers(dependsOn);
+	const cancelled = blockers.find((blocker) => blocker.state === "cancelled");
+	if (cancelled)
+		return {
+			key: "queuedBlockedCancelled",
+			values: { title: cancelled.title },
+			detail: null,
+			tone: "hollow",
+		};
+	const [first, second] = blockers;
+	if (!first) return { key: "queued", values: {}, detail: null, tone: "hollow" };
+	if (blockers.length === 1)
+		return {
+			key: "queuedWaitingOne",
+			values: { first: first.title },
+			detail: null,
+			tone: "hollow",
+		};
+	if (blockers.length === 2 && second)
+		return {
+			key: "queuedWaitingTwo",
+			values: { first: first.title, second: second.title },
+			detail: null,
+			tone: "hollow",
+		};
+	return {
+		key: "queuedWaitingMany",
+		values: { count: blockers.length },
+		detail: null,
+		tone: "hollow",
+	};
+}
+
 /** A return reason a person typed, trimmed; null when it cannot be sent. */
 export function returnReason(text: string): string | null {
 	const trimmed = text.trim();
 	return trimmed && trimmed.length <= TEAM_RETURN_REASON_MAX_LENGTH ? trimmed : null;
+}
+
+/** Lines a review round's findings show before 「展开」. */
+export const REVIEW_FINDINGS_CLAMP_LINES = 3;
+
+/**
+ * Whether a round's findings may run past {@link REVIEW_FINDINGS_CLAMP_LINES} lines in the drawer
+ * and so get 「展开 / 收起」: more lines than that, or more text than fits them at the drawer's
+ * narrowest width (an estimate; a short text never gets the toggle).
+ */
+export function findingsNeedToggle(text: string): boolean {
+	return text.split("\n").length > REVIEW_FINDINGS_CLAMP_LINES || text.length > 140;
 }
 
 /** How one line of a unified diff is drawn. */
@@ -682,4 +872,308 @@ export function isCoordinator(
 	teamId: string,
 ): boolean {
 	return actor.actorKind === "agent" && actor.actorId === teamId;
+}
+
+// ── M: merging a ready item ─────────────────────────────────────────────────
+
+/** What the merge control of the drawer's bottom bar and the 等你处理 card shows. */
+export interface MergeControlView {
+	/**
+	 * The button's label key under `teams.page.merge.`: the local merge's, or (GitHub) 「发起 PR」,
+	 * 「更新 PR」 after a re-ready, 「重新发起 PR」 when it was closed, and the job's progress.
+	 */
+	label:
+		| "merge"
+		| "merging"
+		| "fastForwarding"
+		| "prepareAgain"
+		| "openPr"
+		| "updatePr"
+		| "reopenPr"
+		| "pushing"
+		| "opening"
+		| "mergingPr";
+	/** A job runs: the button shows its progress. */
+	busy: boolean;
+	enabled: boolean;
+	/** Why the button is disabled (an i18n key), or null. */
+	disabledKey: string | null;
+	/** The newest outcome to show beside it. */
+	panel: TeamWorkMergeSummary["outcome"];
+}
+
+/**
+ * The merge control for an item's merge state; null when the item carries none (not ready), or
+ * (GitHub) when its open pull request already carries the ready head: then 「查看 PR」 and
+ * 「合并 PR」 ({@link pullRequestControl}) take its place.
+ */
+export function mergeControl(merge: TeamWorkMergeSummary | undefined): MergeControlView | null {
+	if (!merge) return null;
+	// G: merging the pull request shows on 「合并 PR」 itself.
+	if (merge.mode === "github" && merge.job === "pr_merge" && currentPullRequest(merge)) return null;
+	if (merge.phase !== null || merge.job !== null)
+		return {
+			label: busyLabel(merge),
+			busy: true,
+			enabled: false,
+			disabledKey: null,
+			panel: null,
+		};
+	if (merge.mode === "github") {
+		const pr = currentPullRequest(merge);
+		const open = pr && pr.state !== "CLOSED" && pr.state !== "MERGED";
+		if (open && pr.headMatches) return null;
+		return {
+			// A pull request closed, or merged without this ready head (taken as closed): again.
+			label: !pr
+				? "openPr"
+				: pr.state === "CLOSED" || pr.state === "MERGED"
+					? "reopenPr"
+					: "updatePr",
+			busy: false,
+			enabled: merge.canMerge,
+			disabledKey: merge.disabledReason
+				? `teams.page.merge.disabled.${merge.disabledReason}`
+				: null,
+			panel: merge.outcome,
+		};
+	}
+	return {
+		label: merge.outcome === "prepared" ? "prepareAgain" : "merge",
+		busy: false,
+		enabled: merge.canMerge,
+		disabledKey: merge.disabledReason ? `teams.page.merge.disabled.${merge.disabledReason}` : null,
+		panel: merge.outcome,
+	};
+}
+
+function busyLabel(merge: TeamWorkMergeSummary): MergeControlView["label"] {
+	if (merge.job === "fast_forward") return "fastForwarding";
+	if (merge.job === "pr_merge") return "mergingPr";
+	if (merge.job === "pull_request" || merge.mode === "github")
+		return merge.phase === "opening" ? "opening" : "pushing";
+	return "merging";
+}
+
+/**
+ * G: the item's pull request, only when it is in the repository pull requests go to now (the
+ * confirmed one, else origin's): one left in a repository origin pointed to before is not, and
+ * 「发起 PR」 opens one in the new one. Null when there is none.
+ */
+export function currentPullRequest(
+	merge: TeamWorkMergeSummary | undefined,
+): NonNullable<TeamWorkMergeSummary["pr"]> | null {
+	const pr = merge?.mode === "github" ? (merge.pr ?? null) : null;
+	if (!pr) return null;
+	const target = merge?.github?.pinned ?? merge?.github?.target ?? null;
+	return !target || pr.repository.toLowerCase() === target.toLowerCase() ? pr : null;
+}
+
+/**
+ * G: the repository the PR buttons name (`owner/repo`; the host too when it is not github.com):
+ * the confirmed one, else the one a manager is asked to confirm. Null outside GitHub mode.
+ */
+export function pullRequestRepo(merge: TeamWorkMergeSummary | undefined): string | null {
+	const target = merge?.mode === "github" ? (merge.github?.pinned ?? merge.github?.target) : null;
+	if (!target) return null;
+	const [host, ...rest] = target.split("/");
+	return host === "github.com" ? rest.join("/") : target;
+}
+
+/**
+ * G: 「发起 PR」 first asks a person who may manage the project to confirm where pull requests go
+ * (nothing confirmed yet): the `host/owner/repo` to show, or null when no confirmation is due.
+ */
+export function githubConfirmation(merge: TeamWorkMergeSummary | undefined): string | null {
+	const github = merge?.mode === "github" ? merge.github : undefined;
+	return github && !github.pinned && github.canConfirm && github.target ? github.target : null;
+}
+
+/** One status label of a pull request (an i18n key under `teams.page.merge.pr.`). */
+export interface PullRequestLabel {
+	key: string;
+	values: Record<string, string | number>;
+	color: "green" | "red" | "yellow" | "gray" | "blue" | "orange";
+	/** What it is about, for tests and styling. */
+	kind: "checks" | "review" | "state" | "queue" | "read";
+}
+
+/** An http(s) link to put in an `href`, or null for anything else. */
+export function safeHref(link: string | null | undefined): string | null {
+	if (!link) return null;
+	try {
+		const url = new URL(link);
+		return url.protocol === "https:" || url.protocol === "http:" ? url.toString() : null;
+	} catch {
+		return null;
+	}
+}
+
+/** What 「查看 PR」 / 「合并 PR」 show for an item's pull request (null: it has none). */
+export interface PullRequestControlView {
+	number: number;
+	url: string;
+	labels: PullRequestLabel[];
+	/** 「合并 PR」 is shown (the pull request is open and carries the ready head). */
+	showMerge: boolean;
+	mergeEnabled: boolean;
+	/** Why 「合并 PR」 is disabled (an i18n key), or null. */
+	mergeDisabledKey: string | null;
+	/** The methods to pick from (the default first); a menu when there are several. */
+	methods: TeamPrMergeMethod[];
+	busy: boolean;
+	/** The failed checks to list in the drawer. */
+	failures: { name: string; link: string | null }[];
+	error: string | null;
+}
+
+/**
+ * The pull request part of the merge control: its link, its status labels — CI (通过 / N 项失败 /
+ * N 项进行中 / 无检查), review (需要评审 / 已批准 / 要求修改), conflict / behind / blocked / draft,
+ * 已加入合并队列 — and 「合并 PR」, enabled only for CLEAN, HAS_HOOKS or UNSTABLE.
+ */
+export function pullRequestControl(
+	merge: TeamWorkMergeSummary | undefined,
+): PullRequestControlView | null {
+	const pr = currentPullRequest(merge);
+	if (!merge || !pr) return null;
+	const labels: PullRequestLabel[] = [];
+	if (pr.state === "CLOSED")
+		labels.push({ key: "closed", values: {}, color: "gray", kind: "state" });
+	else if (pr.state === "MERGED")
+		labels.push({ key: "merged", values: {}, color: "blue", kind: "state" });
+	if (pr.state === null || pr.refreshing)
+		labels.push({ key: "checking", values: {}, color: "gray", kind: "read" });
+	if (pr.state === "OPEN") {
+		if (!pr.headMatches) labels.push({ key: "stale", values: {}, color: "yellow", kind: "state" });
+		const checks = pr.checks;
+		if (checks?.state === "passing")
+			labels.push({ key: "checksPassing", values: {}, color: "green", kind: "checks" });
+		else if (checks?.state === "failing")
+			labels.push({
+				key: "checksFailing",
+				values: { count: checks.fail },
+				color: "red",
+				kind: "checks",
+			});
+		else if (checks?.state === "pending")
+			labels.push({
+				key: "checksPending",
+				values: { count: checks.pending },
+				color: "yellow",
+				kind: "checks",
+			});
+		else if (checks?.state === "none")
+			labels.push({ key: "checksNone", values: {}, color: "gray", kind: "checks" });
+		if (pr.review === "APPROVED")
+			labels.push({ key: "reviewApproved", values: {}, color: "green", kind: "review" });
+		else if (pr.review === "CHANGES_REQUESTED")
+			labels.push({ key: "reviewChanges", values: {}, color: "red", kind: "review" });
+		else if (pr.review === "REVIEW_REQUIRED")
+			labels.push({ key: "reviewRequired", values: {}, color: "yellow", kind: "review" });
+		if (pr.isDraft || pr.mergeState === "DRAFT")
+			labels.push({ key: "draft", values: {}, color: "gray", kind: "state" });
+		else if (pr.mergeState === "DIRTY")
+			labels.push({ key: "dirty", values: {}, color: "red", kind: "state" });
+		else if (pr.mergeState === "BEHIND")
+			labels.push({ key: "behind", values: {}, color: "orange", kind: "state" });
+		else if (pr.mergeState === "BLOCKED")
+			labels.push({ key: "blocked", values: {}, color: "orange", kind: "state" });
+		if (pr.queued) labels.push({ key: "queued", values: {}, color: "blue", kind: "queue" });
+	}
+	const busy = merge.job === "pr_merge";
+	const showMerge = pr.state !== "CLOSED" && pr.state !== "MERGED" && pr.headMatches;
+	const reasonKey = merge.disabledReason
+		? `teams.page.merge.disabled.${merge.disabledReason}`
+		: pr.mergeBlocker
+			? `teams.page.merge.prBlocker.${pr.mergeBlocker}`
+			: null;
+	return {
+		number: pr.number,
+		url: pr.url,
+		labels,
+		showMerge,
+		mergeEnabled: pr.canMergePr && !busy,
+		mergeDisabledKey: pr.canMergePr ? null : reasonKey,
+		methods: pr.methods,
+		busy,
+		failures: pr.checks?.failures ?? [],
+		error: pr.error,
+	};
+}
+
+/** Refusals of a merge request the page words itself (others show the server's text). */
+const MERGE_ERROR_CODES = new Set([
+	"TEAM_WORK_ITEM_NOT_READY",
+	"TEAM_WORK_ITEM_MERGING",
+	"TEAM_WORK_ITEM_WORKER_RUNNING",
+	"TEAM_PR_TARGET_UNCONFIRMED",
+	"TEAM_PR_GH_MISSING",
+	"TEAM_PR_GH_LOGGED_OUT",
+	"TEAM_PR_GH_NO_PERMISSION",
+	"TEAM_PR_REPO_ARCHIVED",
+	"TEAM_PR_GH_UNAVAILABLE",
+	"TEAM_PR_NOT_GITHUB",
+	"TEAM_PR_REMOTE_CHANGED",
+	"TEAM_REMOTE_CONFIG_UNSAFE",
+	"TEAM_PR_PUSH_REJECTED",
+	"TEAM_PR_PUSH_FAILED",
+	"TEAM_PR_BASE_MISMATCH",
+	"TEAM_PR_OPEN_FAILED",
+	"TEAM_PR_NONE",
+	"TEAM_PR_CLOSED",
+	"TEAM_PR_HEAD_STALE",
+	"TEAM_PR_DRAFT",
+	"TEAM_PR_BLOCKED",
+	"TEAM_PR_BEHIND",
+	"TEAM_PR_STATE_UNKNOWN",
+	"TEAM_PR_METHOD_NOT_ALLOWED",
+	"TEAM_PR_MERGE_FAILED",
+	"TEAM_MERGE_BASE_REMOTE",
+	"TEAM_MERGE_NOT_PREPARED",
+	"TEAM_ARCHIVED",
+	"TEAM_MERGE_BASE_MOVED",
+	"TEAM_WORK_ITEM_HEAD_MOVED",
+	"TEAM_WORK_ITEM_HEAD_UNAVAILABLE",
+	"TEAM_MERGE_GIT_TOO_OLD",
+	"TEAM_MERGE_STALE",
+	"TEAM_MERGE_CHECKOUT_BLOCKED",
+	"TEAM_MERGE_CHECKOUT_BUSY",
+	"TEAM_MERGE_FAST_FORWARD_REFUSED",
+	"TEAM_MERGE_IDENTITY_UNKNOWN",
+	"TEAM_MERGE_FAST_FORWARD_INCOMPLETE",
+	"TEAM_MERGE_HOSTING_UNKNOWN",
+	"TEAM_MERGE_TIMEOUT",
+	"TEAM_GIT_HISTORY_ALTERED",
+	"TEAM_GIT_REPLACED_HISTORY",
+	"GIT_WORKSPACE_BUSY",
+]);
+
+/** The i18n key of a merge refusal or failure code, or null for the server's own words. */
+export function mergeErrorKey(code: string | null | undefined): string | null {
+	return code && MERGE_ERROR_CODES.has(code) ? `teams.page.merge.errors.${code}` : null;
+}
+
+/** The code of a failed merge request (an API error), if any. */
+export function mergeRequestCode(error: unknown): string | null {
+	const code = (error as { data?: { code?: unknown } } | null)?.data?.code;
+	return typeof code === "string" ? code : null;
+}
+
+/** Most conflicting files a prefilled 退回 reason names. */
+export const MERGE_CONFLICT_REASON_FILES = 20;
+
+/**
+ * The files a prefilled 退回 reason names after a conflict: at most
+ * {@link MERGE_CONFLICT_REASON_FILES}, one per line, and whether more were left out.
+ */
+export function conflictReasonFiles(
+	conflicts: readonly string[] | undefined,
+	more: boolean | undefined,
+): { files: string; more: boolean } {
+	const list = (conflicts ?? []).slice(0, MERGE_CONFLICT_REASON_FILES);
+	return {
+		files: list.map((file) => `- ${file}`).join("\n"),
+		more: more === true || (conflicts?.length ?? 0) > list.length,
+	};
 }

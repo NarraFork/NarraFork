@@ -94,7 +94,7 @@ test("project tabs remain folders", () => {
 	).not.toBeNull();
 });
 
-test("a team icon shows the coordinator status and only badges known pending approvals", async () => {
+test("a team icon shows the coordinator status; its waiting count lives at the row end, not on the icon", async () => {
 	const i18n = createInstance();
 	await i18n.init({ lng: "en", resources: { en: { nav: navEn } } });
 	for (const pendingApprovalCount of [undefined, null, 2]) {
@@ -116,8 +116,6 @@ test("a team icon shows the coordinator status and only badges known pending app
 				.querySelector("[data-tab-shape]")
 				?.getAttribute("data-tab-shape"),
 		);
-		const pending = document.querySelector('[data-testid="team-tab-pending"]');
-		if (pendingApprovalCount === 2) expect(pending?.textContent).toBe("2");
-		else expect(pending).toBeNull();
+		expect(document.querySelector('[data-testid="team-tab-pending"]')).toBeNull();
 	}
 });

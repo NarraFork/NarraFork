@@ -23,6 +23,7 @@ import {
 	type TeamDetail,
 	type TeamEventKind,
 	type TeamSettings,
+	type TeamSettingsPatch,
 	type TeamStatus,
 	type TeamSummary,
 } from "@shared/project-teams";
@@ -51,6 +52,7 @@ import {
 	runAsTeamStatusActor,
 	type TeamStatusActor,
 } from "./team-records";
+import { peekWorkStartDefault } from "./team-work-start";
 
 type TeamRow = typeof projectTeams.$inferSelect;
 type CoordinatorRow = {
@@ -110,6 +112,8 @@ function toDetail(team: TeamRow, coordinator: CoordinatorRow, access: TeamAccess
 		...toSummary(team, coordinator, utf8Bytes(team.brief), access),
 		brief: team.brief,
 		settings: team.settingsJson ?? {},
+		// W: what applies when the team sets no work start (cached hosting; null while checking).
+		workStartDefault: peekWorkStartDefault(team.projectId),
 	};
 }
 
@@ -318,7 +322,22 @@ export async function createTeam(
 export interface UpdateTeamInput {
 	baseBranch?: string;
 	brief?: string;
-	settings?: TeamSettings;
+	/** Only these keys change, merged into the stored settings; `null` removes a key. */
+	settings?: TeamSettingsPatch;
+}
+
+/** Stored settings with a patch applied (`null` removes a key). */
+export function applySettingsPatch(
+	current: TeamSettings | null | undefined,
+	patch: TeamSettingsPatch,
+): TeamSettings {
+	const next: Record<string, unknown> = { ...(current ?? {}) };
+	for (const [key, value] of Object.entries(patch)) {
+		if (value === undefined) continue;
+		if (value === null) delete next[key];
+		else next[key] = value;
+	}
+	return next as TeamSettings;
 }
 
 export async function updateTeam(
@@ -350,6 +369,7 @@ export async function updateTeam(
 	}
 	const now = new Date().toISOString();
 	const actor = { kind: "person" as const, id: principal.userId || null };
+	let settingsChanged = false;
 	db.transaction((tx) => {
 		if (changingBase && projectGitPath(team.projectId, tx) !== checkedGitPath)
 			throw new AppError(
@@ -357,22 +377,33 @@ export async function updateTeam(
 				409,
 				"TEAM_PROJECT_CHANGED",
 			);
+		// Merged with what is stored now, inside the transaction: a concurrent change of another
+		// setting is kept.
+		const stored =
+			patch.settings !== undefined
+				? (tx
+						.select({ settings: projectTeams.settingsJson })
+						.from(projectTeams)
+						.where(eq(projectTeams.narratorId, teamId))
+						.limit(1)
+						.get()?.settings ?? {})
+				: null;
+		const settingsJson =
+			patch.settings !== undefined ? applySettingsPatch(stored, patch.settings) : undefined;
+		settingsChanged =
+			settingsJson !== undefined && JSON.stringify(settingsJson) !== JSON.stringify(stored ?? {});
 		tx.update(projectTeams)
 			.set({
 				...(patch.baseBranch !== undefined ? { baseBranch: patch.baseBranch } : {}),
 				...(patch.brief !== undefined ? { brief: patch.brief } : {}),
-				...(patch.settings !== undefined ? { settingsJson: patch.settings } : {}),
+				...(settingsJson !== undefined ? { settingsJson } : {}),
 				updatedAt: now,
 			})
 			.where(eq(projectTeams.narratorId, teamId))
 			.run();
 		if (patch.brief !== undefined && patch.brief !== team.brief)
 			recordTeamEvent(tx, teamId, "team.brief", actor, { bytes: utf8Bytes(patch.brief) }, now);
-		if (
-			(patch.settings !== undefined &&
-				JSON.stringify(patch.settings) !== JSON.stringify(team.settingsJson ?? {})) ||
-			(patch.baseBranch !== undefined && patch.baseBranch !== team.baseBranch)
-		)
+		if (settingsChanged || (patch.baseBranch !== undefined && patch.baseBranch !== team.baseBranch))
 			recordTeamEvent(
 				tx,
 				teamId,

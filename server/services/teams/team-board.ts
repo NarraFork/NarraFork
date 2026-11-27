@@ -15,6 +15,7 @@
  */
 
 import { coerceAskQuestionShape } from "@shared/ask-user-question-shape";
+import { TEAM_CARD_FINISHED_COUNT_CAP, type TeamCardCounts } from "@shared/project-overview";
 import {
 	boardColumnIsFinished,
 	TEAM_ACTIVITY_PREVIEW_CHARS,
@@ -22,11 +23,13 @@ import {
 	TEAM_APPROVALS_LIMIT,
 	TEAM_BOARD_COLUMN_STATES,
 	TEAM_BOARD_COLUMNS,
+	TEAM_EVENT_DETAIL_MAX_BYTES,
 	TEAM_EVENT_DETAIL_PREVIEW_CHARS,
 	TEAM_HELD_WORKTREES_LIMIT,
 	TEAM_PAUSE_LIMIT,
 	TEAM_QUESTION_OPTIONS_MAX,
 	TEAM_RETURN_REASON_MAX_LENGTH,
+	TEAM_REVIEW_SUMMARY_MAX_LENGTH,
 	TEAM_RUNNING_AGENTS_LIMIT,
 	TEAM_WORK_RETURNED_EVENT_KIND,
 	type TeamActivityEvent,
@@ -45,20 +48,24 @@ import {
 	type TeamWorkerActivity,
 	teamApprovalKind,
 } from "@shared/project-teams";
-import { and, asc, desc, eq, gt, inArray, isNotNull, lt, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNotNull, lt, or, type SQL, sql } from "drizzle-orm";
 import { db } from "../../db";
 import {
 	narrators,
 	narratorToolCalls,
+	projectTeams,
 	teamWorkEvents,
 	teamWorkItems,
 	users,
 } from "../../db/schema";
+import { readQuery } from "../../db/worker-read";
 import { ValidationError } from "../../lib/errors";
 import { canManageNarratorAcl, type NarratorPrincipal } from "../narrator-acl";
 import { shouldHidePendingPermission } from "../pending-permission-visibility";
 import { readTeamMembers } from "./team-members";
+import { canManageProjectOf, canMergeInProject, mergeSummaryOf } from "./team-merge";
 import { loadTeamForAccess } from "./team-service";
+import { readDependencies } from "./work-item-dependencies";
 
 const RUNNING_STATUSES: ("working" | "waiting")[] = ["working", "waiting"];
 
@@ -119,7 +126,11 @@ export function runningTreeSessions(
 	return { agents: rows.slice(0, limit).map(agentRef), more: rows.length > limit };
 }
 
-function agentRef(session: { id: string; title: string | null; status: string }): TeamAgentRef {
+export function agentRef(session: {
+	id: string;
+	title: string | null;
+	status: string;
+}): TeamAgentRef {
 	return { id: session.id, title: session.title, status: session.status };
 }
 
@@ -155,7 +166,7 @@ const PENDING_PAGE = 100;
 /** Pages read at most: past this many hidden calls the list says "more" instead of counting on. */
 const PENDING_MAX_PAGES = 5;
 
-interface PendingRow {
+export interface PendingRow {
 	id: string;
 	narratorId: string;
 	toolName: string;
@@ -163,15 +174,107 @@ interface PendingRow {
 	title: string | null;
 	status: string;
 	parentNarratorId: string | null;
+	/** The asking session's ACL columns (a project's scan judges each one; R2). */
+	type: string;
+	aclRootNarratorId: string | null;
+	ownerUserId: string | null;
+	visibility: string;
+	writeAudience: string;
+	contextProjectId: string | null;
 }
 
 /**
- * The tree's tool calls waiting for a person, oldest first, after the same visibility rule as
- * the session's own list (a call whose reflection still runs is not waiting for a person).
- * Driven by `idx_toolcalls_status_narrator_created` (status leads, and few calls are pending at
- * any time) joined to the narrator by primary key; read in keyset pages until `wanted` visible
- * rows are found, at most {@link PENDING_MAX_PAGES} pages. `complete` is false when the pages
- * ran out before the pending calls did.
+ * One keyset page of pending calls in a scope (`where` on the joined narrator), oldest first,
+ * after the same visibility rule as the session's own list (a call whose reflection still runs is
+ * not waiting for a person). Driven by `idx_toolcalls_status_narrator_created` (status leads, and
+ * few calls are pending at any time) joined to the narrator by primary key.
+ */
+function pendingCallPage(
+	scope: SQL | undefined,
+	after: { createdAt: string; id: string } | null,
+): { visible: PendingRow[]; last: { createdAt: string; id: string } | null; full: boolean } {
+	const batch = db
+		.select({
+			id: narratorToolCalls.id,
+			narratorId: narratorToolCalls.narratorId,
+			toolName: narratorToolCalls.toolName,
+			suggestions: narratorToolCalls.permissionSuggestions,
+			createdAt: narratorToolCalls.createdAt,
+			title: narrators.title,
+			status: narrators.status,
+			parentNarratorId: narrators.parentNarratorId,
+			type: narrators.type,
+			aclRootNarratorId: narrators.aclRootNarratorId,
+			ownerUserId: narrators.ownerUserId,
+			visibility: narrators.visibility,
+			writeAudience: narrators.writeAudience,
+			contextProjectId: narrators.contextProjectId,
+		})
+		.from(narratorToolCalls)
+		.innerJoin(narrators, eq(narrators.id, narratorToolCalls.narratorId))
+		.where(
+			and(
+				eq(narratorToolCalls.status, "pending"),
+				scope,
+				after
+					? or(
+							gt(narratorToolCalls.createdAt, after.createdAt),
+							and(
+								eq(narratorToolCalls.createdAt, after.createdAt),
+								gt(narratorToolCalls.id, after.id),
+							),
+						)
+					: undefined,
+			),
+		)
+		.orderBy(asc(narratorToolCalls.createdAt), asc(narratorToolCalls.id))
+		.limit(PENDING_PAGE)
+		.all();
+	const visible: PendingRow[] = [];
+	for (const row of batch) {
+		if (shouldHidePendingPermission(row.suggestions)) continue;
+		const { suggestions: _suggestions, ...rest } = row;
+		visible.push(rest);
+	}
+	const last = batch.at(-1);
+	return {
+		visible,
+		last: last ? { createdAt: last.createdAt, id: last.id } : null,
+		full: batch.length >= PENDING_PAGE,
+	};
+}
+
+/**
+ * The visible pending calls of a scope, oldest first, read in keyset pages until `wanted` rows
+ * are accepted, at most {@link PENDING_MAX_PAGES} pages. `acceptPage` (default: all) decides a
+ * whole page at once, so a caller can judge access once per page — one batch per distinct
+ * session, never one check per call. `complete` is false when the pages ran out before the
+ * pending calls did. The team tree and the project page (R2) share it.
+ */
+export async function scanPendingCalls(
+	scope: SQL | undefined,
+	wanted: number,
+	acceptPage?: (rows: readonly PendingRow[]) => Promise<(row: PendingRow) => boolean>,
+): Promise<{ rows: PendingRow[]; complete: boolean }> {
+	const rows: PendingRow[] = [];
+	let after: { createdAt: string; id: string } | null = null;
+	for (let page = 0; page < PENDING_MAX_PAGES; page++) {
+		const { visible, last, full } = pendingCallPage(scope, after);
+		const accepted = acceptPage && visible.length > 0 ? await acceptPage(visible) : () => true;
+		for (const row of visible) {
+			if (!accepted(row)) continue;
+			rows.push(row);
+			if (rows.length >= wanted) return { rows, complete: true };
+		}
+		if (!full || !last) return { rows, complete: true };
+		after = last;
+	}
+	return { rows, complete: false };
+}
+
+/**
+ * The tree's tool calls waiting for a person: {@link scanPendingCalls} over the tree, without an
+ * acceptance step (members see every call of their tree), synchronous for the sidebar's count.
  */
 export function visiblePendingCalls(
 	teamId: string,
@@ -180,47 +283,13 @@ export function visiblePendingCalls(
 	const rows: PendingRow[] = [];
 	let after: { createdAt: string; id: string } | null = null;
 	for (let page = 0; page < PENDING_MAX_PAGES; page++) {
-		const batch = db
-			.select({
-				id: narratorToolCalls.id,
-				narratorId: narratorToolCalls.narratorId,
-				toolName: narratorToolCalls.toolName,
-				suggestions: narratorToolCalls.permissionSuggestions,
-				createdAt: narratorToolCalls.createdAt,
-				title: narrators.title,
-				status: narrators.status,
-				parentNarratorId: narrators.parentNarratorId,
-			})
-			.from(narratorToolCalls)
-			.innerJoin(narrators, eq(narrators.id, narratorToolCalls.narratorId))
-			.where(
-				and(
-					eq(narratorToolCalls.status, "pending"),
-					inTree(teamId),
-					after
-						? or(
-								gt(narratorToolCalls.createdAt, after.createdAt),
-								and(
-									eq(narratorToolCalls.createdAt, after.createdAt),
-									gt(narratorToolCalls.id, after.id),
-								),
-							)
-						: undefined,
-				),
-			)
-			.orderBy(asc(narratorToolCalls.createdAt), asc(narratorToolCalls.id))
-			.limit(PENDING_PAGE)
-			.all();
-		for (const row of batch) {
-			if (shouldHidePendingPermission(row.suggestions)) continue;
-			const { suggestions: _suggestions, ...visible } = row;
-			rows.push(visible);
+		const { visible, last, full } = pendingCallPage(inTree(teamId), after);
+		for (const row of visible) {
+			rows.push(row);
 			if (rows.length >= wanted) return { rows, complete: true };
 		}
-		if (batch.length < PENDING_PAGE) return { rows, complete: true };
-		const last = batch.at(-1);
-		if (!last) return { rows, complete: true };
-		after = { createdAt: last.createdAt, id: last.id };
+		if (!full || !last) return { rows, complete: true };
+		after = last;
 	}
 	return { rows, complete: false };
 }
@@ -239,6 +308,16 @@ function pendingCount(teamId: string): number {
  */
 export function teamPendingApprovalCount(teamId: string): number {
 	return pendingCount(teamId);
+}
+
+/** Items waiting to be accepted (`ready`), counted up to 51 by `(team_id, state, id)` (R2). */
+export function teamReadyItemCount(teamId: string): number {
+	return db
+		.select({ id: teamWorkItems.id })
+		.from(teamWorkItems)
+		.where(and(eq(teamWorkItems.teamId, teamId), eq(teamWorkItems.state, "ready")))
+		.limit(TEAM_APPROVALS_LIMIT + 1)
+		.all().length;
 }
 
 /** The top bar: running agents, pending approvals (members only), column counts, last event. */
@@ -361,6 +440,75 @@ function boardItemOf(row: BoardItemRow): TeamBoardItem {
 	};
 }
 
+/**
+ * D: the cards with their dependencies, read for the whole page in one query (never per card).
+ * A card without dependencies carries an empty list.
+ */
+function withDependencies<T extends TeamBoardItem>(items: T[]): T[] {
+	const dependencies = readDependencies(items.map((item) => item.id));
+	return items.map((item) => ({ ...item, dependsOn: dependencies.get(item.id) ?? [] }));
+}
+
+/**
+ * M: the ready cards with their merge state (job phase, newest outcome, whether this caller may
+ * merge): one indexed outcome read per ready card, no git. Other cards are left as they are.
+ */
+function withMerge<T extends TeamBoardItem>(
+	items: T[],
+	teamOf: (item: T) => { teamActive: boolean; baseBranch: string; projectId: string } | null,
+	member: boolean,
+	manager = false,
+): T[] {
+	return items.map((item) => {
+		if (item.state !== "ready") return item;
+		const team = teamOf(item);
+		if (!team) return item;
+		return {
+			...item,
+			merge: mergeSummaryOf({
+				item: {
+					id: item.id,
+					state: item.state,
+					baseRef: item.baseRef,
+					projectId: team.projectId,
+					// Abbreviated on a card: compared by prefix with the pull request's head.
+					headSha: item.headSha,
+				},
+				baseBranch: team.baseBranch,
+				teamActive: team.teamActive,
+				workerRunning: item.worker?.status === "working" || item.worker?.status === "waiting",
+				member,
+				manager,
+			}),
+		};
+	});
+}
+
+/** The teams of some items: active (and coordinator not archived), base, project. */
+function teamFacts(teamIds: readonly string[]) {
+	const facts = new Map<string, { teamActive: boolean; baseBranch: string; projectId: string }>();
+	if (teamIds.length === 0) return facts;
+	for (const row of db
+		.select({
+			id: projectTeams.narratorId,
+			status: projectTeams.status,
+			baseBranch: projectTeams.baseBranch,
+			projectId: projectTeams.projectId,
+			coordinator: narrators.status,
+		})
+		.from(projectTeams)
+		.innerJoin(narrators, eq(narrators.id, projectTeams.narratorId))
+		.where(inArray(projectTeams.narratorId, [...new Set(teamIds)]))
+		.limit(teamIds.length)
+		.all())
+		facts.set(row.id, {
+			teamActive: row.status === "active" && row.coordinator !== "archived",
+			baseBranch: row.baseBranch,
+			projectId: row.projectId,
+		});
+	return facts;
+}
+
 /** One work item of a team as its card shows it (primary key), or null when it is not there. */
 export function readBoardItem(teamId: string, itemId: string): TeamBoardItem | null {
 	const row = db
@@ -370,7 +518,172 @@ export function readBoardItem(teamId: string, itemId: string): TeamBoardItem | n
 		.where(and(eq(teamWorkItems.id, itemId), eq(teamWorkItems.teamId, teamId)))
 		.limit(1)
 		.get();
-	return row ? boardItemOf(row) : null;
+	return row ? (withDependencies([boardItemOf(row)])[0] ?? null) : null;
+}
+
+/**
+ * The ready items (可以合并) of the given teams of a project, oldest change first, at most `limit`
+ * (one more is read to say "more"). Driven by `idx_team_work_items_project_state`; each card is
+ * read like the board's (R2: the project page's 「等你处理」).
+ */
+export function readReadyItems(
+	projectId: string,
+	teamIds: readonly string[],
+	limit: number,
+): { items: (TeamBoardItem & { teamId: string })[]; more: boolean } {
+	if (teamIds.length === 0) return { items: [], more: false };
+	const rows = db
+		.select({ ...BOARD_ITEM_COLUMNS, teamId: teamWorkItems.teamId })
+		.from(teamWorkItems)
+		.leftJoin(narrators, eq(narrators.id, teamWorkItems.workerNarratorId))
+		.where(
+			and(
+				eq(teamWorkItems.projectId, projectId),
+				eq(teamWorkItems.state, "ready"),
+				inArray(teamWorkItems.teamId, [...teamIds]),
+			),
+		)
+		.orderBy(asc(teamWorkItems.updatedAt), asc(teamWorkItems.id))
+		.limit(limit + 1)
+		.all();
+	const items = withDependencies(
+		rows.slice(0, limit).map(({ teamId, ...row }) => ({ ...boardItemOf(row), teamId })),
+	);
+	const facts = teamFacts(items.map((item) => item.teamId));
+	// The caller lists the teams the person is a member of.
+	return {
+		items: withMerge(items, (item) => facts.get(item.teamId) ?? null, true),
+		more: rows.length > limit,
+	};
+}
+
+const OPEN_ITEM_STATES = ["queued", "in_progress", "in_review", "ready"] as const;
+const FINISHED_ITEM_STATES = ["merged", "cancelled"] as const;
+const CARD_READ_TIMEOUT_MS = 5_000;
+
+/**
+ * A team card's numbers for each listed team (R2: the project page's team grid), read on the
+ * read worker (5 s timeout) so their cost never lands on the main thread, and bounded by what is
+ * open rather than by history:
+ * - open items (queued, in progress, in review, ready) counted exactly, grouped, over the
+ *   `(team_id, state, id)` index;
+ * - finished items (merged, cancelled) counted up to {@link TEAM_CARD_FINISHED_COUNT_CAP} + 1 per
+ *   team and state (a `LIMIT` subquery each, one `UNION ALL` statement), so a team with 50,000
+ *   merged items costs what one with 1,000 does;
+ * - the coordinators' last stop and message count (primary key) with each team's newest event
+ *   (a correlated `(team_id, created_at, id)` probe), one statement.
+ * Then per team the running count ({@link runningTreeSessions}, at most 21 rows) and, for members
+ * only, the pending count the header shows (the same bounded scans the team page and the sidebar
+ * run). The caller bounds the number of teams (24).
+ */
+export async function readTeamCards(
+	teams: readonly { id: string; member: boolean }[],
+	signal?: AbortSignal,
+): Promise<Map<string, TeamCardCounts>> {
+	const cards = new Map<string, TeamCardCounts>();
+	if (teams.length === 0) return cards;
+	const ids = teams.map((team) => team.id);
+	const read = (maxRows: number, diagnosticSource: string) => ({
+		executionPolicy: "worker-required" as const,
+		maxRows,
+		timeoutMs: CARD_READ_TIMEOUT_MS,
+		signal,
+		diagnosticSource,
+	});
+	const openRows = await readQuery(
+		db
+			.select({
+				teamId: teamWorkItems.teamId,
+				state: teamWorkItems.state,
+				count: sql<number>`count(*)`,
+			})
+			.from(teamWorkItems)
+			.where(
+				and(
+					inArray(teamWorkItems.teamId, ids),
+					inArray(teamWorkItems.state, [...OPEN_ITEM_STATES]),
+				),
+			)
+			.groupBy(teamWorkItems.teamId, teamWorkItems.state),
+		read(ids.length * OPEN_ITEM_STATES.length, "teams.cards.open"),
+	);
+	const finishedParts = ids.flatMap((teamId) =>
+		FINISHED_ITEM_STATES.map((state) =>
+			db
+				.select({
+					teamId: sql<string>`${teamId}`.as("team_id"),
+					state: sql<string>`${state}`.as("state"),
+					count: sql<number>`count(*)`.as("count"),
+				})
+				.from(
+					db
+						.select({ one: sql<number>`1`.as("one") })
+						.from(teamWorkItems)
+						.where(and(eq(teamWorkItems.teamId, teamId), eq(teamWorkItems.state, state)))
+						.limit(TEAM_CARD_FINISHED_COUNT_CAP + 1)
+						.as("capped"),
+				),
+		),
+	);
+	const [firstFinished, ...moreFinished] = finishedParts;
+	const finishedRows = firstFinished
+		? await readQuery(
+				// biome-ignore lint/suspicious/noExplicitAny: one UNION ALL of same-shaped selects
+				moreFinished.reduce<any>((query, part) => query.unionAll(part), firstFinished),
+				read(finishedParts.length, "teams.cards.finished"),
+			)
+		: [];
+	const coordinators = new Map(
+		(
+			await readQuery(
+				db
+					.select({
+						id: narrators.id,
+						messageCount: narrators.messageCount,
+						stopReason: narrators.lastStopReason,
+						// The newest event: one `(team_id, created_at, id)` index probe per team. The outer
+						// column is qualified by hand: a one-table select renders bare column names.
+						lastEventAt: sql<
+							string | null
+						>`(select te.created_at from team_work_events te where te.team_id = "narrators"."id" order by te.created_at desc, te.id desc limit 1)`,
+					})
+					.from(narrators)
+					.where(inArray(narrators.id, ids))
+					.limit(ids.length),
+				read(ids.length, "teams.cards.coordinators"),
+			)
+		).map((row) => [row.id, row]),
+	);
+	const stateRows = [
+		...openRows,
+		...(finishedRows as { teamId: string; state: string; count: number }[]),
+	];
+	for (const team of teams) {
+		const columnCounts = Object.fromEntries(
+			TEAM_BOARD_COLUMNS.map((column) => [column, 0]),
+		) as Record<TeamBoardColumn, number>;
+		let readyCount = 0;
+		for (const row of stateRows) {
+			if (row.teamId !== team.id) continue;
+			const state = row.state as TeamBoardItem["state"];
+			if (state === "ready") readyCount += Number(row.count);
+			for (const column of TEAM_BOARD_COLUMNS)
+				if (TEAM_BOARD_COLUMN_STATES[column].includes(state))
+					columnCounts[column] += Number(row.count);
+		}
+		const running = runningTreeSessions(team.id, TEAM_RUNNING_AGENTS_LIMIT);
+		const coordinator = coordinators.get(team.id);
+		cards.set(team.id, {
+			columnCounts,
+			readyCount,
+			runningCount: running.agents.length + (running.more ? 1 : 0),
+			pendingApprovalCount: team.member ? pendingCount(team.id) : null,
+			coordinatorStopReason: coordinator?.stopReason ?? null,
+			coordinatorMessageCount: coordinator?.messageCount ?? 0,
+			lastEventAt: coordinator?.lastEventAt ?? null,
+		});
+	}
+	return cards;
 }
 
 /**
@@ -383,7 +696,12 @@ export async function readTeamBoardColumn(
 	projectId: string,
 	options: { column: TeamBoardColumn; limit: number; cursor?: string },
 ): Promise<TeamBoardColumnPage> {
-	await loadTeamForAccess(teamId, principal, "read", projectId);
+	const { team, coordinator, access } = await loadTeamForAccess(
+		teamId,
+		principal,
+		"read",
+		projectId,
+	);
 	const states = [...TEAM_BOARD_COLUMN_STATES[options.column]];
 	const finished = boardColumnIsFinished(options.column);
 	const sortColumn = finished ? teamWorkItems.updatedAt : teamWorkItems.createdAt;
@@ -411,7 +729,20 @@ export async function readTeamBoardColumn(
 		.limit(options.limit + 1)
 		.all();
 	const page = rows.slice(0, options.limit);
-	const items: TeamBoardItem[] = page.map(boardItemOf);
+	const teamActive = team.status === "active" && coordinator.status !== "archived";
+	const cards = withDependencies(page.map(boardItemOf));
+	// Merging also needs project write: asked only when the page has a ready card.
+	const mayMerge =
+		access === "write" &&
+		cards.some((card) => card.state === "ready") &&
+		(await canMergeInProject(team.projectId, principal));
+	const manager = mayMerge && (await canManageProjectOf(team.projectId, principal));
+	const items: TeamBoardItem[] = withMerge(
+		cards,
+		() => ({ teamActive, baseBranch: team.baseBranch, projectId: team.projectId }),
+		mayMerge,
+		manager,
+	);
 	const last = page.at(-1);
 	return {
 		column: options.column,
@@ -537,11 +868,67 @@ export const returnedReasonColumns = {
 	>`case when ${teamWorkEvents.kind} = ${TEAM_WORK_RETURNED_EVENT_KIND} then substr(${teamWorkEvents.detailJson}, 1, ${TEAM_RETURN_DETAIL_MAX_CHARS}) end`,
 };
 
-/** An event's detail as sent: whole when small, else omitted, but a return keeps its reason. */
+/**
+ * Longest `work.review` detail read for its findings: a stored detail is at most
+ * {@link TEAM_EVENT_DETAIL_MAX_BYTES} UTF-8 bytes, so never more characters than that.
+ */
+const TEAM_REVIEW_DETAIL_MAX_CHARS = TEAM_EVENT_DETAIL_MAX_BYTES;
+
+/**
+ * Characters of a long review's detail read with every row: enough for the fields `recordReview`
+ * writes ahead of the findings (`{"round":N,"verdict":"…","findings":N,`), so a round whose
+ * findings were not read still has its verdict and count.
+ */
+const TEAM_REVIEW_HEAD_CHARS = 96;
+
+/**
+ * A long review's head: for a `work.review` whose detail is past
+ * {@link TEAM_EVENT_DETAIL_PREVIEW_CHARS} (long findings), only its first few characters are read
+ * with the page; the findings are read row by row with {@link readReviewDetailText} until the
+ * drawer has enough. Plain `case`/`substr`, like the return's column, so the query stays
+ * dialect-portable.
+ */
+export const reviewHeadColumns = {
+	reviewHead: sql<
+		string | null
+	>`case when ${teamWorkEvents.kind} = ${"work.review"} and length(${teamWorkEvents.detailJson}) > ${TEAM_EVENT_DETAIL_PREVIEW_CHARS} then substr(${teamWorkEvents.detailJson}, 1, ${TEAM_REVIEW_HEAD_CHARS}) end`,
+};
+
+/** One long review's detail, by primary key, at most {@link TEAM_REVIEW_DETAIL_MAX_CHARS}. */
+export function readReviewDetailText(eventId: string): string | null {
+	const row = db
+		.select({
+			text: sql<
+				string | null
+			>`substr(${teamWorkEvents.detailJson}, 1, ${TEAM_REVIEW_DETAIL_MAX_CHARS})`,
+		})
+		.from(teamWorkEvents)
+		.where(and(eq(teamWorkEvents.id, eventId), eq(teamWorkEvents.kind, "work.review")))
+		.limit(1)
+		.get();
+	return row?.text ?? null;
+}
+
+const REVIEW_HEAD = /^\{"round":(\d+),"verdict":"(clear|blocker)","findings":(\d+)[,}]/;
+
+/** The round, verdict and findings count at the start of a review's detail, or null. */
+export function reviewHeadDetail(head: string | null | undefined): Record<string, unknown> | null {
+	const match = head ? REVIEW_HEAD.exec(head) : null;
+	if (!match) return null;
+	return { round: Number(match[1]), verdict: match[2], findings: Number(match[3]) };
+}
+
+/**
+ * An event's detail as sent: whole when small, else omitted, but a return keeps its reason and,
+ * where the read asked for it, a review keeps its findings (`reviewDetail`, read on its own) or
+ * at least its round, verdict and count (`reviewHead`, {@link reviewHeadColumns}).
+ */
 export function eventDetail(row: {
 	detail: string | null;
 	detailLength: number | null;
 	returnDetail: string | null;
+	reviewDetail?: string | null;
+	reviewHead?: string | null;
 }): { detail: Record<string, unknown> | null; detailOmitted: boolean } {
 	const detail = parseDetail(row.detail);
 	if (detail || row.detailLength === null) return { detail, detailOmitted: false };
@@ -555,6 +942,18 @@ export function eventDetail(row: {
 			},
 			detailOmitted: false,
 		};
+	const review = parseDetail(row.reviewDetail ?? null);
+	if (review) {
+		const kept: Record<string, unknown> = {};
+		for (const key of ["round", "verdict", "findings", "from", "to"])
+			if (typeof review[key] === "number" || typeof review[key] === "string")
+				kept[key] = review[key];
+		if (typeof review.summary === "string")
+			kept.summary = review.summary.slice(0, TEAM_REVIEW_SUMMARY_MAX_LENGTH);
+		return { detail: kept, detailOmitted: false };
+	}
+	const head = reviewHeadDetail(row.reviewHead);
+	if (head) return { detail: head, detailOmitted: false };
 	return { detail: null, detailOmitted: true };
 }
 
@@ -752,18 +1151,14 @@ export function questionPreview(prefix: string | null): string[] {
 }
 
 /**
- * The tool calls of the team tree waiting for a person, oldest first, at most
- * {@link TEAM_APPROVALS_LIMIT}. Members only: an onlooker gets 403 (a stranger 404). Each one
- * is decided through the ordinary permission routes, which check write access on its session.
+ * Pending calls as the approvals list shows them: one bounded read of each call's input prefix
+ * and reason (`substr`, by primary key), then the preview, questions and in-place answer form.
+ * Shared by the team page and the project page's 「等你处理」 (R2).
  */
-export async function readTeamApprovals(
-	teamId: string,
-	principal: NarratorPrincipal,
-	projectId: string,
-): Promise<TeamApprovalsResponse> {
-	await loadTeamForAccess(teamId, principal, "write", projectId);
-	const { rows, complete } = visiblePendingCalls(teamId, TEAM_APPROVALS_LIMIT + 1);
-	const shown = rows.slice(0, TEAM_APPROVALS_LIMIT);
+export function pendingApprovalsOf(
+	shown: readonly PendingRow[],
+	depth: (row: PendingRow) => number,
+): TeamPendingApproval[] {
 	const details =
 		shown.length > 0
 			? new Map(
@@ -788,13 +1183,13 @@ export async function readTeamApprovals(
 						.map((row) => [row.id, row]),
 				)
 			: new Map<string, { input: string | null; reason: string | null }>();
-	const approvals: TeamPendingApproval[] = shown.map((row) => {
+	return shown.map((row) => {
 		const detail = details.get(row.id);
 		const kind = teamApprovalKind(row.toolName);
 		return {
 			id: row.id,
 			agent: agentRef({ id: row.narratorId, title: row.title, status: row.status }),
-			depth: depthOf(teamId, { id: row.narratorId, parentNarratorId: row.parentNarratorId }),
+			depth: depth(row),
 			toolName: row.toolName,
 			kind,
 			parentId: row.parentNarratorId,
@@ -810,6 +1205,23 @@ export async function readTeamApprovals(
 			createdAt: row.createdAt,
 		};
 	});
+}
+
+/**
+ * The tool calls of the team tree waiting for a person, oldest first, at most
+ * {@link TEAM_APPROVALS_LIMIT}. Members only: an onlooker gets 403 (a stranger 404). Each one
+ * is decided through the ordinary permission routes, which check write access on its session.
+ */
+export async function readTeamApprovals(
+	teamId: string,
+	principal: NarratorPrincipal,
+	projectId: string,
+): Promise<TeamApprovalsResponse> {
+	await loadTeamForAccess(teamId, principal, "write", projectId);
+	const { rows, complete } = visiblePendingCalls(teamId, TEAM_APPROVALS_LIMIT + 1);
+	const approvals = pendingApprovalsOf(rows.slice(0, TEAM_APPROVALS_LIMIT), (row) =>
+		depthOf(teamId, { id: row.narratorId, parentNarratorId: row.parentNarratorId }),
+	);
 	return {
 		approvals,
 		// "More" only when visible calls were cut off; an unfinished scan is said apart.

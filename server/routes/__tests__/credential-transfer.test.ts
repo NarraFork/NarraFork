@@ -35,7 +35,9 @@ const applyCredentialImport = mock(
 		return { added: 1, replaced: 0, skipped: 0 };
 	},
 );
-const listTransferableCredentials = mock(() => []);
+const listTransferableCredentials = mock(async () => [
+	{ kind: "credential", id: "plugin:com.example.test:demo", label: "Installed provider" },
+]);
 
 mock.module("../../middleware/auth", () => ({ requireAdmin }));
 mock.module("../../services/step-up-service", () => ({ consumeStepUp }));
@@ -90,6 +92,22 @@ beforeEach(() => {
 });
 
 describe("credential transfer route authorization", () => {
+	test("lists asynchronously loaded plugin field bags and accepts their stable ids", async () => {
+		const response = await makeApp().request("/api/credential-transfer/credentials");
+		expect(response.status).toBe(200);
+		expect((await response.json()).credentials).toEqual([
+			{ kind: "credential", id: "plugin:com.example.test:demo", label: "Installed provider" },
+		]);
+		const id = `plugin:com.example.${"p".repeat(110)}:demo`;
+		const selection = [{ kind: "credential", id }];
+		const exported = await post("/export", {
+			stepUpToken: "valid-step-up",
+			passphrase: PASSPHRASE,
+			selection,
+		});
+		expect(exported.status).toBe(200);
+		expect(exportCredentials).toHaveBeenCalledWith(selection, PASSPHRASE, { userId: "admin-id" });
+	});
 	test.each([
 		["anonymous", undefined, 401],
 		["non-admin", "user", 403],

@@ -5,6 +5,8 @@ import { outboundFetch } from "./net/outbound-fetch";
 import { resolveProxyForUrl } from "./net/proxy";
 import { shownSubjectId, type UsageSubject, usageSubjects } from "./provider-key-subjects";
 import { type CustomApiProviderConfig, settings } from "./settings";
+import { defaultUserAgentModeForProtocol } from "./settings/custom-api-providers";
+import { legacyQuotaNetworkCompatible, quotaNetworkIdentity } from "./sourcing/quota-identity";
 import { importLegacyQuotaCache, quotaStore } from "./sourcing/quota-store";
 
 /**
@@ -41,7 +43,7 @@ import { importLegacyQuotaCache, quotaStore } from "./sourcing/quota-store";
  * key under its credential identity, because a percentage of a plan belongs to one
  * account: a restart never resurrects an allowance under a different key. This module
  * keeps the scheduling (staleness, failure backoff, post-request refreshes) and the
- * `generation` that stops a late response from an account the user has since replaced
+ * entry identity that stops a late response from an account the user has since replaced
  * from publishing into the current one.
  */
 
@@ -76,7 +78,6 @@ export interface OpencodeUsagePayload {
 }
 
 export interface OpencodeUsageCache extends OpencodeUsagePayload {
-	generation: string;
 	fetchedAt: number;
 	error: string | null;
 }
@@ -99,6 +100,7 @@ const FETCH_TIMEOUT_MS = 15_000;
 
 interface Entry {
 	identity: string;
+	/** Opaque identity publication consumed by the existing model-options reader. */
 	generation: string;
 	inFlight?: Promise<OpencodeUsageCache | null>;
 	controller?: AbortController;
@@ -109,7 +111,7 @@ interface Entry {
 }
 const entries = new Map<string, Entry>();
 
-type PersistedUsage = Omit<OpencodeUsageCache, "generation">;
+type PersistedUsage = OpencodeUsageCache;
 
 /** The file this cache used before the quota store; read once, then deleted. */
 const LEGACY_FILE = "opencode-usages.json";
@@ -166,7 +168,6 @@ function cacheOf(id: string, entry: Entry): OpencodeUsageCache {
 	const snapshot = quotaStore.get(id, entry.identity, restoreSnapshot);
 	const detail = snapshot?.detail as OpencodeUsagePayload | undefined;
 	return {
-		generation: entry.generation,
 		rolling: detail?.rolling ?? null,
 		weekly: detail?.weekly ?? null,
 		monthly: detail?.monthly ?? null,
@@ -174,6 +175,15 @@ function cacheOf(id: string, entry: Entry): OpencodeUsageCache {
 		fetchedAt: snapshot?.fetchedAt ?? 0,
 		error: snapshot?.error ?? null,
 	};
+}
+
+export const isOpencodeQuotaRefreshing = (keyId: string): boolean => !!entries.get(keyId)?.inFlight;
+
+/** Reconcile live credential identity before exposing a snapshot. */
+export function getOpencodeQuotaSnapshot(keyId: string): QuotaSnapshot | undefined {
+	syncOpencodeUsageCache();
+	const entry = entries.get(keyId);
+	return entry ? quotaStore.get(keyId, entry.identity, restoreSnapshot) : undefined;
 }
 
 /** One quota probe: fetch, then the shared snapshot shape. Throws on failure. */
@@ -225,7 +235,16 @@ export function opencodeUsageUrl(baseUrl: string): string {
  * to Kimi usage in `getCustomApiProviderIdsWithKimiIdentityChanges`
  * (`routes/settings.ts`).
  */
-function identity(config: CustomApiProviderConfig): string {
+export function opencodeQuotaIdentity(config: CustomApiProviderConfig): string {
+	return JSON.stringify([
+		config.baseUrl,
+		config.apiKey,
+		quotaNetworkIdentity(config, settings.proxy),
+	]);
+}
+
+/** Byte-for-byte serializer used to fingerprint opencode-usages.json before the quota store. */
+function legacyOpencodeQuotaIdentity(config: CustomApiProviderConfig): string {
 	return JSON.stringify([
 		config.baseUrl,
 		config.apiKey,
@@ -248,14 +267,25 @@ export function syncOpencodeUsageCache(): void {
 		void importLegacyQuotaCache(
 			LEGACY_FILE,
 			parsePersistedUsage,
-			subjects.map((s) => ({ legacyKey: s.id, id: s.id, identity: identity(s.config) })),
+			subjects
+				.filter((s) =>
+					legacyQuotaNetworkCompatible(s.config, {
+						defaultUserAgentMode: defaultUserAgentModeForProtocol(s.config.protocol),
+					}),
+				)
+				.map((s) => ({
+					legacyKey: s.id,
+					id: s.id,
+					identity: legacyOpencodeQuotaIdentity(s.config),
+					storeIdentity: opencodeQuotaIdentity(s.config),
+				})),
 			opencodeSnapshot,
 		);
 	}
 	const providers = new Map(subjects.map((s) => [s.id, s.config]));
 	for (const [id, entry] of entries) {
 		const config = providers.get(id);
-		if (!config || identity(config) !== entry.identity) {
+		if (!config || opencodeQuotaIdentity(config) !== entry.identity) {
 			entries.delete(id);
 			entry.controller?.abort();
 			clearTimeout(entry.activityTimer);
@@ -267,9 +297,13 @@ export function syncOpencodeUsageCache(): void {
 	}
 	for (const [id, config] of providers) {
 		if (!entries.has(id)) {
-			entries.set(id, { identity: identity(config), generation: crypto.randomUUID(), failures: 0 });
+			entries.set(id, {
+				identity: opencodeQuotaIdentity(config),
+				generation: crypto.randomUUID(),
+				failures: 0,
+			});
 			// Restore synchronously: the pool reads the snapshot before any refresh finishes.
-			quotaStore.get(id, identity(config), restoreSnapshot);
+			quotaStore.get(id, opencodeQuotaIdentity(config), restoreSnapshot);
 		}
 	}
 }
@@ -475,7 +509,7 @@ export function refreshOpencodeKeyUsage(keyId: string): Promise<OpencodeUsageCac
 			if (entries.get(keyId) !== entry) return null;
 			// Never copy transport exceptions, response text, or credentials to logs/API.
 			// The last good numbers stay so the UI can show them as stale.
-			const { generation: _generation, ...previous } = cacheOf(keyId, entry);
+			const previous = cacheOf(keyId, entry);
 			quotaStore.set(
 				keyId,
 				entry.identity,
@@ -512,38 +546,14 @@ export function peekOpencodeUsageGeneration(providerId: string): string | undefi
 	const id = shownSubjectId(subjects, providerId);
 	const current = subjects.find((subject) => subject.id === id);
 	const entry = id ? entries.get(id) : undefined;
-	return entry && current && entry.identity === identity(current.config)
+	return entry && current && entry.identity === opencodeQuotaIdentity(current.config)
 		? entry.generation
 		: undefined;
 }
-
-/** Provider id → `pick(entry)` of the key it reports. */
-function byProvider<T>(pick: (id: string, entry: Entry) => T): Record<string, T> {
-	syncOpencodeUsageCache();
-	const result: Record<string, T> = {};
-	const subjects = opencodeSubjects();
-	for (const providerId of new Set(subjects.map((s) => s.providerId))) {
-		const id = shownSubjectId(subjects, providerId) ?? "";
-		const entry = entries.get(id);
-		if (entry) result[providerId] = pick(id, entry);
-	}
-	return result;
-}
-
-/** Provider id → the allowance it reports (status bar). */
-export function getAllOpencodeCachedUsages(): Record<string, OpencodeUsageCache> {
-	return byProvider(cacheOf);
-}
-
 /** Key id → its allowance (key list). */
 export function getOpencodeKeyUsages(): Record<string, OpencodeUsageCache> {
 	syncOpencodeUsageCache();
 	return Object.fromEntries([...entries].map(([id, entry]) => [id, cacheOf(id, entry)]));
-}
-
-/** Opaque, random runtime tokens only; never expose or derive them from credentials. */
-export function getOpencodeUsageGenerations(): Record<string, string> {
-	return byProvider((_id, entry) => entry.generation);
 }
 
 export async function refreshAllOpencodeUsages(): Promise<void> {

@@ -47,7 +47,6 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } fro
 import { useTranslation } from "react-i18next";
 import { resolveSwipeAnchorOffScreen } from "../../hooks/scroll-parent";
 import { useCurrentUser } from "../../hooks/useAuth";
-import { useDeepSeekBalance } from "../../hooks/useDeepSeekBalance";
 import { useFirstScreenActivity } from "../../hooks/useFirstScreenActivity";
 import { useGitWorkspace } from "../../hooks/useGit";
 import { useLocalPref } from "../../hooks/useLocalPref";
@@ -75,7 +74,6 @@ import {
 import { useNarratorExecutionDevices } from "../../hooks/useNarratorExecutionDevices";
 import { readOpeningLod, useNarratorLod } from "../../hooks/useNarratorLod";
 import { useNarratorUiSummary } from "../../hooks/useNarratorUiSummary";
-import { useOpencodeUsage } from "../../hooks/useOpencodeUsage";
 import { useOpenOutlineSpace, useOutlineEnabled } from "../../hooks/useOutline";
 import {
 	useNarratorBrowserSessionsCapability,
@@ -86,10 +84,13 @@ import {
 	useNarratorRollbackEditRegenerateCapability,
 	useNarratorSubagentsCapability,
 } from "../../hooks/usePlatform";
-import { useProviderBalance } from "../../hooks/useProviderBalance";
+import {
+	selectQuotaEntries,
+	useCommandCodeCliQuota,
+	useQuotaSnapshots,
+} from "../../hooks/useQuotaSnapshots";
 import { RUNTIME_SETTINGS_QUERY_KEY, useRuntimeSettings } from "../../hooks/useRuntimeSettings";
 import { useNarratorCurrentTask } from "../../hooks/useTaskBoard";
-import { useTokenDanceBalance } from "../../hooks/useTokenDanceBalance";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 import {
 	currentWorkspaceContext,
@@ -116,7 +117,6 @@ import {
 	useOutlineOpener,
 } from "../../lib/outline-opener";
 import type { OutlinePanelState } from "../../lib/outline-panel";
-import { formatProviderBalance } from "../../lib/provider-balance-format";
 import {
 	formatRevertFailure,
 	formatRevertSuccessWarning,
@@ -203,12 +203,7 @@ import type { MessageListHandle, MessageListTailMeta } from "./message/message-l
 // TEMPORARY: streaming harness activity flag (see ./mock/README-REMOVAL.md).
 // Store-only import — the panel component itself is lazy-loaded by the dock.
 import { useMockStreamActive } from "./mock/mock-stream-store";
-import { commandCodeQuotaView } from "./model/commandcode-quota-format";
-import { customApiBalanceDisplayFor, usageSourceFor } from "./model/custom-api-usage-source";
-import { formatDeepSeekBalance } from "./model/deepseek-balance-format";
-import { buildKimiQuotaView } from "./model/kimi-usage-format";
 import { NugRechargeDialog } from "./model/NugRechargeDialog";
-import { tokenDanceQuotaView } from "./model/tokendance-quota-format";
 import { useModelMenuRefreshProps } from "./model/use-model-menu-refresh-props";
 import { useNarratorQuota } from "./model/use-narrator-quota";
 import { useNugQuota } from "./model/use-nug-quota";
@@ -218,6 +213,7 @@ import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
 import type { NarratorPanelProps } from "./narrator-panel-types";
 import { useNarratorPanelVisible } from "./narrator-panel-visibility";
 import { OutlineDrawerHost } from "./OutlineDrawerHost";
+import { useReportPanelConnection } from "./panel-connection";
 import {
 	createResponsiveNarratorPanel,
 	NarratorPanelCompactContext,
@@ -321,6 +317,8 @@ function NarratorPanelBody({
 	specPanelOpen,
 	onToggleSpecPanel,
 	readOnlyNotice,
+	hideHeader = false,
+	onConnectionChange,
 }: Omit<NarratorPanelProps, "compact">) {
 	const navigate = useNavigate();
 	const fileDrawerVisible = useNarratorPanelVisible();
@@ -475,7 +473,6 @@ function NarratorPanelBody({
 	);
 	const { t, i18n } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
-	const { t: balanceT } = useTranslation("settings");
 	const narratorPermissionsCapability = useNarratorPermissionsCapability();
 	const availablePermissionModes = narratorPermissionsCapability.supported
 		? narratorPermissionsCapability.modes
@@ -660,8 +657,7 @@ function NarratorPanelBody({
 	// menu button: phones have no header row of their own.
 	const showMobileNav = !REMOTE_BUILD && ownsHorizontalSafeArea && isMobileViewport;
 
-	// The authorized current summary is the sole source for capabilities and quota identity.
-	// Unobserved auto/aggregation selections deliberately have no concrete provider.
+	// The authorized runtime summary above owns the concrete provider and capabilities.
 
 	// Fetch context thresholds for the current model (used as fallback when WS hasn't pushed yet)
 	const { data: modelThresholds } = useQuery({
@@ -672,100 +668,41 @@ function NarratorPanelBody({
 		placeholderData: DEFAULT_CONTEXT_THRESHOLDS.standard,
 	});
 
-	// NUG quota data layer (provider config + quota queries + cache writeback +
-	// derived provider info). Kept lifted here because the derived info feeds the
-	// shared `useNarratorPanelWS` below and the payment-required recharge logic.
+	// NUG uses one cached-only group read tied to the authorized runtime generation.
+	const currentRuntimeProvider = modelSummary?.provider;
 	const nugProviderSettings = useMemo(
-		() => (modelSummary?.provider?.quotaKind === "nug" ? [modelSummary.provider] : undefined),
-		[modelSummary?.provider],
+		() => (currentRuntimeProvider?.quotaKind === "nug" ? [currentRuntimeProvider] : undefined),
+		[currentRuntimeProvider],
 	);
 	const nugProviderInfo = useNugQuota(resolvedModel, nugProviderSettings, firstScreenActivity);
-	const currentRuntimeProvider = modelSummary?.provider;
-	const tokenDanceGeneration =
-		currentRuntimeProvider?.quotaKind === "tokendance" &&
-		typeof currentRuntimeProvider.generation === "number"
-			? currentRuntimeProvider.generation
-			: undefined;
-	const tokenDanceBalanceQuery = useTokenDanceBalance(tokenDanceGeneration);
-	const tokenDanceQuota = tokenDanceQuotaView(
-		tokenDanceBalanceQuery.data,
-		tokenDanceGeneration,
-		currentUser?.role === "admin",
-		t,
+	const { data: quotaSnapshots } = useQuotaSnapshots(
+		firstScreenActivity &&
+			!!modelSummary?.concreteValue &&
+			currentRuntimeProvider?.quotaKind !== "nug",
 	);
-
-	// Command Code 额度：仅在当前模型走 commandcode 前缀时启用，避免无谓的接口调用。
-	const commandCodeEnabled = !!resolvedModel?.startsWith("CommandCode:");
-	const commandCodeUsageQuery = useQuery({
-		queryKey: ["commandcode", "usage"],
-		queryFn: () => api.commandCodeUsage(),
-		enabled: !REMOTE_BUILD && commandCodeEnabled,
-		refetchInterval: commandCodeEnabled ? 60_000 : false,
-	});
-	const commandCodeQuota = commandCodeQuotaView(commandCodeUsageQuery.data, commandCodeEnabled, t);
-
-	// Kimi (kimi.com / kimi.ai) usage quotas — server keeps one global cache per
-	// provider; GET triggers a stale-while-revalidate refresh upstream. The query
-	// stays disabled unless the current narrator's provider is a Kimi provider,
-	// so nothing polls while Kimi is not in use.
-	const currentKimiProviderId =
-		currentRuntimeProvider?.quotaKind === "kimi" ? currentRuntimeProvider.id : null;
-	const { data: kimiUsagesData } = useQuery({
-		queryKey: ["kimi", "usages"],
-		queryFn: api.kimiGetUsages,
-		enabled: !REMOTE_BUILD && currentKimiProviderId != null && firstScreenActivity,
-		staleTime: 30_000,
-		refetchInterval: 60_000,
-	});
-
-	// OpenCode Go plan allowance — same per-provider server cache, but keyed by a
-	// generation token so an allowance fetched for a replaced account is never shown.
-	// The current window lives in the status bar; weekly/monthly are in the popover.
-	const currentOpencodeProviderId =
-		currentRuntimeProvider?.quotaKind === "opencode" ? currentRuntimeProvider.id : null;
-	const opencodeGeneration = currentOpencodeProviderId
-		? currentRuntimeProvider?.generation
-		: undefined;
-	const opencodeUsageQuery = useOpencodeUsage(
-		currentOpencodeProviderId,
-		typeof opencodeGeneration === "string" ? opencodeGeneration : undefined,
-		firstScreenActivity,
+	// CLI-only accounts have no reusable server cache. Only this active consumer may
+	// request the one-shot read; ordinary snapshot readers never start CLI work.
+	useCommandCodeCliQuota(firstScreenActivity && resolvedModel?.split(":")[0] === "CommandCode");
+	const currentQuotaEntries = useMemo(() => {
+		if (currentRuntimeProvider?.quotaKind === "nug") return nugProviderInfo?.entries ?? [];
+		const prefix = resolvedModel?.split(":")[0];
+		if (!prefix) return [];
+		return selectQuotaEntries(quotaSnapshots?.entries ?? []).filter(
+			(entry) => entry.prefix === prefix && entry.supported !== false,
+		);
+	}, [resolvedModel, quotaSnapshots, currentRuntimeProvider, nugProviderInfo]);
+	const nugQuotaSnapshot = currentQuotaEntries.find(
+		(entry) => entry.groupId === nugProviderInfo?.providerId,
+	)?.snapshot;
+	const tokenDanceRechargeEnabled = Boolean(
+		!REMOTE_BUILD &&
+			currentRuntimeProvider?.quotaKind === "tokendance" &&
+			typeof currentRuntimeProvider.generation === "number" &&
+			currentUser?.role === "admin",
 	);
-
-	// DeepSeek platform balance — the same per-provider cache shape, keyed by its own
-	// generation so a balance fetched for a replaced account is never shown.
-	const currentDeepSeekProviderId =
-		currentRuntimeProvider?.quotaKind === "deepseek" ? currentRuntimeProvider.id : null;
-	const deepseekGeneration = currentDeepSeekProviderId
-		? currentRuntimeProvider?.generation
-		: undefined;
-	const deepseekBalancesQuery = useDeepSeekBalance(
-		currentDeepSeekProviderId,
-		typeof deepseekGeneration === "string" ? deepseekGeneration : undefined,
-		firstScreenActivity,
-	);
-
-	const currentBalanceProviderId =
-		currentRuntimeProvider?.quotaKind === "provider" &&
-		typeof currentRuntimeProvider.generation === "string"
-			? currentRuntimeProvider.id
-			: null;
-	const balanceGeneration = currentBalanceProviderId
-		? currentRuntimeProvider?.generation
-		: undefined;
-	const providerBalanceQuery = useProviderBalance(
-		currentBalanceProviderId,
-		typeof balanceGeneration === "string" ? balanceGeneration : undefined,
-		firstScreenActivity,
-	);
-	const { pushedQuota, subscriptionSnapshot: sub2ApiSubscriptionSnapshot } =
-		customApiBalanceDisplayFor({
-			providerId: currentBalanceProviderId,
-			pushedQuotas: currentRuntimeProvider?.pushedQuota
-				? { [currentRuntimeProvider.id]: currentRuntimeProvider.pushedQuota }
-				: undefined,
-			snapshot: providerBalanceQuery.data,
-		});
+	const tokenDanceRemaining = currentQuotaEntries[0]?.snapshot?.balances[0]?.remaining;
+	const tokenDanceBalanceKnown =
+		typeof tokenDanceRemaining === "number" && Number.isFinite(tokenDanceRemaining);
 
 	// Shared with the route and terminal access gate.
 	const canOpenTerminals = uiSummaryQuery.isError ? undefined : uiSummaryQuery.data?.canWrite;
@@ -1177,73 +1114,6 @@ function NarratorPanelBody({
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	}, [(narrator as any)?.substatus]);
 
-	// Resolve custom API provider info for initial generic quota balance
-	const customApiProviderInfo = useMemo(() => {
-		const cfg = currentRuntimeProvider;
-		if (!cfg || !["provider", "kimi", "deepseek", "opencode"].includes(cfg.quotaKind ?? ""))
-			return null;
-		if (cfg.id === currentDeepSeekProviderId) {
-			return {
-				providerId: cfg.id,
-				...formatDeepSeekBalance(deepseekBalancesQuery.data, t, deepseekBalancesQuery.isError),
-			};
-		}
-		// Each cached source is gated on the id it is CURRENTLY configured for: React Query
-		// keeps a disabled query's last data, so a provider edited from a Kimi endpoint to a
-		// Go one would otherwise fall through to the previous account's Kimi allowance.
-		const usageSource = usageSourceFor({
-			providerId: cfg.id,
-			opencodeProviderId: currentOpencodeProviderId,
-			kimiProviderId: currentKimiProviderId,
-		});
-		// OpenCode Go has its own structured indicator (`OpencodeQuotaIndicator`,
-		// fed from `opencodeUsageQuery` below), so it contributes nothing to the
-		// generic text-balance slot — showing both would duplicate the 5h figure.
-		if (usageSource === "opencode") {
-			return { providerId: cfg.id, quotaBalance: null, detailedQuotaBalance: null };
-		}
-		// Kimi likewise has its own progress-bar indicator (`kimiQuotaView` below).
-		if (usageSource === "kimi") {
-			return { providerId: cfg.id, quotaBalance: null, detailedQuotaBalance: null };
-		}
-		if (cfg.id === currentBalanceProviderId && pushedQuota) {
-			return { providerId: cfg.id, ...pushedQuota };
-		}
-		if (cfg.id === currentBalanceProviderId && sub2ApiSubscriptionSnapshot) {
-			// The shared window panel owns subscription amounts, including unknown/stale
-			// placeholders. Do not duplicate them in the generic balance text slot.
-			return { providerId: cfg.id, quotaBalance: null, detailedQuotaBalance: null };
-		}
-		if (cfg.id === currentBalanceProviderId && providerBalanceQuery.data?.balance) {
-			return {
-				providerId: cfg.id,
-				...formatProviderBalance(providerBalanceQuery.data, balanceT, providerBalanceQuery.isError),
-			};
-		}
-		const quota = cfg.pushedQuota;
-		const rawDetailedQuotaBalance = quota?.detailedQuotaBalance;
-		const detailedQuotaBalance = rawDetailedQuotaBalance?.trim() ? rawDetailedQuotaBalance : null;
-		return {
-			providerId: cfg.id,
-			quotaBalance: quota?.quotaBalance ?? null,
-			detailedQuotaBalance,
-		};
-	}, [
-		currentRuntimeProvider,
-		currentKimiProviderId,
-		currentOpencodeProviderId,
-		currentDeepSeekProviderId,
-		deepseekBalancesQuery.data,
-		deepseekBalancesQuery.isError,
-		currentBalanceProviderId,
-		pushedQuota,
-		sub2ApiSubscriptionSnapshot,
-		providerBalanceQuery.data,
-		providerBalanceQuery.isError,
-		balanceT,
-		t,
-	]);
-
 	const wsState = useNarratorPanelWS({
 		narratorId,
 		narratorStatus: narrator?.status,
@@ -1252,12 +1122,14 @@ function NarratorPanelBody({
 		isAtBottomRef,
 		isSubagent,
 		narratorSubstatus,
-		initialQuotaBalance: customApiProviderInfo?.quotaBalance ?? nugProviderInfo?.quotaBalance,
-		initialDetailedQuotaBalance:
-			customApiProviderInfo?.detailedQuotaBalance ?? nugProviderInfo?.detailedQuotaBalance,
-		customApiProviderId: customApiProviderInfo?.providerId,
-		nugProviderId: nugProviderInfo?.providerId,
-		nugProviderGeneration: nugProviderInfo ? modelSummary?.provider?.generation : undefined,
+		quotaReadScope:
+			currentRuntimeProvider?.quotaKind === "nug"
+				? {
+						groupId: currentRuntimeProvider.id,
+						cachedOnly: true,
+						expectedGeneration: currentRuntimeProvider.generation,
+					}
+				: undefined,
 		quotaProviderKey: currentRuntimeProvider
 			? JSON.stringify([
 					currentRuntimeProvider.id,
@@ -1302,8 +1174,6 @@ function NarratorPanelBody({
 		activeCompactStart,
 		compactProgress,
 		compactFailure,
-		quotaBalance,
-		detailedQuotaBalance,
 		retryInfo,
 		quotaWaitInfo,
 		paymentRequired,
@@ -1315,11 +1185,12 @@ function NarratorPanelBody({
 		viewers,
 	} = wsState;
 	setUnreadCountRef.current = setUnreadCount;
-	// Quota display + NUG recharge derivations (flags, dialog disclosure, and the
+	// A host that hides the header (the team page) shows the 「连接断开」 badge's state itself and
+	// reconnects through the panel: the same socket, no second connection logic.
+	useReportPanelConnection(onConnectionChange, disconnected && !isWorkspacePreview, reconnect);
+	// NUG recharge derivations (flags, dialog disclosure, and the
 	// payment-required reconstruction / auto-open effects) live in useNarratorQuota.
 	const {
-		quotaDetailsText,
-		hasQuotaDetailsPopover,
 		shouldShowNugRechargeButton,
 		shouldShowNugRechargeInQuotaDetails,
 		nugRechargeOpened,
@@ -1327,8 +1198,7 @@ function NarratorPanelBody({
 		closeNugRecharge,
 	} = useNarratorQuota({
 		nugProviderInfo,
-		quotaBalance,
-		detailedQuotaBalance,
+		snapshot: nugQuotaSnapshot,
 		paymentRequired,
 		setPaymentRequired,
 		narratorSubstatus,
@@ -2930,65 +2800,6 @@ function NarratorPanelBody({
 		return `${label} · ${formatFullLocaleDateTime(new Date(resumeAt), i18n.language)}`;
 	})();
 
-	/**
-	 * Which plan the narrator is parked on, so only that provider's allowance
-	 * indicator turns red: the live event names the plan, and after a reload the
-	 * persisted waiting payload does (`errorMessage` carries `quotaProvider` while
-	 * parked). A Kimi wait never turns the OpenCode badge red, and vice versa.
-	 */
-	const quotaWaitProvider = (() => {
-		if (!isWaitingForQuota) return undefined;
-		if (quotaWaitInfo?.quotaProvider) return quotaWaitInfo.quotaProvider;
-		if (!narrator?.errorMessage) return undefined;
-		try {
-			const parsed = JSON.parse(narrator.errorMessage) as { quotaProvider?: unknown };
-			if (parsed.quotaProvider === "opencode" || parsed.quotaProvider === "kimi") {
-				return parsed.quotaProvider;
-			}
-		} catch {
-			// Not a waiting payload; leave the provider unknown.
-		}
-		return undefined;
-	})();
-
-	/**
-	 * Props for the OpenCode Go allowance indicator, or undefined when the current
-	 * model is not on a Go endpoint.
-	 */
-	const opencodeQuotaProps = (() => {
-		if (!currentOpencodeProviderId) return undefined;
-		const waitingForQuota = quotaWaitProvider === "opencode";
-		return {
-			usage: opencodeUsageQuery.data,
-			waitingForQuota,
-			waitingText: waitingForQuota ? quotaWaitText : null,
-		};
-	})();
-
-	/**
-	 * Kimi or Command Code allowance, drawn with the same progress-bar indicator
-	 * as OpenCode Go. Kimi is gated on the provider id it is CURRENTLY configured
-	 * for, like the generic quota slot above, so a disabled query's stale entry
-	 * for a re-pointed provider is never shown.
-	 */
-	const kimiQuotaView = currentKimiProviderId
-		? buildKimiQuotaView(kimiUsagesData?.[currentKimiProviderId], t)
-		: null;
-	const quotaPanelProps = (() => {
-		if (currentKimiProviderId) {
-			const waitingForQuota = quotaWaitProvider === "kimi";
-			return {
-				view: kimiQuotaView,
-				waitingForQuota,
-				waitingText: waitingForQuota ? quotaWaitText : null,
-			};
-		}
-		if (commandCodeEnabled) {
-			return { view: commandCodeQuota, waitingForQuota: false, waitingText: null };
-		}
-		return undefined;
-	})();
-
 	const hasContextData = contextPercent != null;
 	const contextIndicatorPercent = hasContextData ? Math.min(contextPercent, 100) : 0;
 	const contextIndicatorRadius = 9;
@@ -3184,8 +2995,8 @@ function NarratorPanelBody({
 						<NugRechargeDialog
 							opened={nugRechargeOpened}
 							narratorId={narratorId}
-							providerId={nugProviderInfo?.providerId ?? paymentRequired?.providerId ?? null}
-							providerName={nugProviderInfo?.name ?? paymentRequired?.providerPrefix ?? null}
+							providerId={paymentRequired?.providerId ?? nugProviderInfo?.providerId ?? null}
+							providerName={paymentRequired?.providerPrefix ?? nugProviderInfo?.name ?? null}
 							paymentRequired={paymentRequired}
 							onClose={closeNugRecharge}
 							onPaymentRequiredChange={setPaymentRequired}
@@ -3194,143 +3005,146 @@ function NarratorPanelBody({
 					{/* Drop overlay */}
 					<DropOverlay visible={isDragging} />
 					{/* Header — title-first arithmetic, single flex row, no flex fight:
-					    fixed title @ pretext W, then only tools that fit after it. */}
-					<NarratorHeaderLayout
-						titleFullWidth={headerTitleFullWidth}
-						showBack={showLeadingChrome}
-						showMenu={showMobileNav}
-						showTitleActions={!hostOwnsTitle && !isWorkspacePreview}
-						titleBadgeWidth={teamBadge?.width ?? 0}
-						surfacedToolCount={toolbarController.toolbarSurfacedDefs.length}
-						showClose={!!onClose}
-						onHeaderPointerDown={onHeaderPointerDown}
-					>
-						{(headerLayout) => (
-							<>
-								{/* Leading: fixed chrome + title; does not flex-shrink the title away. */}
-								<div
-									style={{
-										display: "flex",
-										alignItems: "center",
-										gap: HEADER_LEADING_GAP_PX,
-										flexWrap: "nowrap",
-										flex: "0 0 auto",
-										minWidth: 0,
-										maxWidth: "100%",
-										overflow: "hidden",
-									}}
-								>
-									{/* Phones: this row is the top of the screen, so it opens the drawer. */}
-									{showMobileNav && <MobileNavButton />}
-									{showLeadingChrome &&
-										(onBack ? (
-											<ActionIcon size="sm" variant="subtle" color="gray" onClick={onBack}>
-												<IconArrowLeft size={16} />
-											</ActionIcon>
-										) : onOpenStandalonePage ? (
-											<Tooltip label={t("openStandalonePage")} position="right">
-												<ActionIcon
-													size="sm"
-													variant="subtle"
-													color="gray"
-													onClick={onOpenStandalonePage}
-												>
-													<IconExternalLink size={16} />
+					    fixed title @ pretext W, then only tools that fit after it. Left out
+					    when the host draws its own (`hideHeader`, the team page). */}
+					{!hideHeader && (
+						<NarratorHeaderLayout
+							titleFullWidth={headerTitleFullWidth}
+							showBack={showLeadingChrome}
+							showMenu={showMobileNav}
+							showTitleActions={!hostOwnsTitle && !isWorkspacePreview}
+							titleBadgeWidth={teamBadge?.width ?? 0}
+							surfacedToolCount={toolbarController.toolbarSurfacedDefs.length}
+							showClose={!!onClose}
+							onHeaderPointerDown={onHeaderPointerDown}
+						>
+							{(headerLayout) => (
+								<>
+									{/* Leading: fixed chrome + title; does not flex-shrink the title away. */}
+									<div
+										style={{
+											display: "flex",
+											alignItems: "center",
+											gap: HEADER_LEADING_GAP_PX,
+											flexWrap: "nowrap",
+											flex: "0 0 auto",
+											minWidth: 0,
+											maxWidth: "100%",
+											overflow: "hidden",
+										}}
+									>
+										{/* Phones: this row is the top of the screen, so it opens the drawer. */}
+										{showMobileNav && <MobileNavButton />}
+										{showLeadingChrome &&
+											(onBack ? (
+												<ActionIcon size="sm" variant="subtle" color="gray" onClick={onBack}>
+													<IconArrowLeft size={16} />
 												</ActionIcon>
-											</Tooltip>
-										) : (
-											<NarratorPanelCompactContext.Consumer>
-												{(compact) =>
-													compact || workspaceId ? (
-														<ActionIcon
-															size="sm"
-															variant="subtle"
-															color="gray"
-															onClick={() =>
-																navigate({
-																	to: "/narrators/$narratorId",
-																	params: { narratorId },
-																	search: workspaceId
-																		? { from: "workspace", workspaceId }
-																		: undefined,
-																})
-															}
-														>
-															<IconExternalLink size={16} />
-														</ActionIcon>
-													) : (
-														<ActionIcon
-															size="sm"
-															variant="subtle"
-															color="gray"
-															onClick={() => navigate({ to: ".." })}
-														>
-															<IconArrowLeft size={16} />
-														</ActionIcon>
-													)
-												}
-											</NarratorPanelCompactContext.Consumer>
-										))}
-									{/*
-									 * `flex: 1` even when the title is suppressed: it is what pushes the
-									 * tool row to the right edge, and it hands the freed width to those
-									 * buttons instead of leaving a gap where the title used to be.
-									 *
-									 * The floor that keeps the title readable is the capacity BUDGET
-									 * (`headerTitleSlotMinWidth`), not a CSS `min-width`. A min-width here
-									 * would win against the tool row's `flex-shrink: 0` only by overflowing
-									 * or wrapping a nowrap row — both worse than the truncation it would
-									 * prevent. `HEADER_TITLE_SLOT_ATTR` marks the slot so the measurement
-									 * budgets it by policy instead of reading a width this element derives
-									 * from whatever the tool row left over.
-									 */}
-									<NarratorPanelHeaderTitle
-										narratorId={narratorId}
-										narrator={narrator}
-										hostOwnsTitle={hostOwnsTitle}
-										isWorkspacePreview={isWorkspacePreview}
-										titleFullWidth={headerLayout.titleWidth}
-									/>
-									{teamBadge && headerLayout.showTitleBadge && (
-										<NarratorTeamBadge target={teamBadge} />
+											) : onOpenStandalonePage ? (
+												<Tooltip label={t("openStandalonePage")} position="right">
+													<ActionIcon
+														size="sm"
+														variant="subtle"
+														color="gray"
+														onClick={onOpenStandalonePage}
+													>
+														<IconExternalLink size={16} />
+													</ActionIcon>
+												</Tooltip>
+											) : (
+												<NarratorPanelCompactContext.Consumer>
+													{(compact) =>
+														compact || workspaceId ? (
+															<ActionIcon
+																size="sm"
+																variant="subtle"
+																color="gray"
+																onClick={() =>
+																	navigate({
+																		to: "/narrators/$narratorId",
+																		params: { narratorId },
+																		search: workspaceId
+																			? { from: "workspace", workspaceId }
+																			: undefined,
+																	})
+																}
+															>
+																<IconExternalLink size={16} />
+															</ActionIcon>
+														) : (
+															<ActionIcon
+																size="sm"
+																variant="subtle"
+																color="gray"
+																onClick={() => navigate({ to: ".." })}
+															>
+																<IconArrowLeft size={16} />
+															</ActionIcon>
+														)
+													}
+												</NarratorPanelCompactContext.Consumer>
+											))}
+										{/*
+										 * `flex: 1` even when the title is suppressed: it is what pushes the
+										 * tool row to the right edge, and it hands the freed width to those
+										 * buttons instead of leaving a gap where the title used to be.
+										 *
+										 * The floor that keeps the title readable is the capacity BUDGET
+										 * (`headerTitleSlotMinWidth`), not a CSS `min-width`. A min-width here
+										 * would win against the tool row's `flex-shrink: 0` only by overflowing
+										 * or wrapping a nowrap row — both worse than the truncation it would
+										 * prevent. `HEADER_TITLE_SLOT_ATTR` marks the slot so the measurement
+										 * budgets it by policy instead of reading a width this element derives
+										 * from whatever the tool row left over.
+										 */}
+										<NarratorPanelHeaderTitle
+											narratorId={narratorId}
+											narrator={narrator}
+											hostOwnsTitle={hostOwnsTitle}
+											isWorkspacePreview={isWorkspacePreview}
+											titleFullWidth={headerLayout.titleWidth}
+										/>
+										{teamBadge && headerLayout.showTitleBadge && (
+											<NarratorTeamBadge target={teamBadge} />
+										)}
+										{disconnected && !isWorkspacePreview && (
+											<Badge
+												size="xs"
+												variant="dot"
+												color="red"
+												style={{ cursor: "pointer", flex: "0 0 auto" }}
+												onClick={reconnect}
+												title={t("reconnect")}
+											>
+												{t("disconnected")}
+											</Badge>
+										)}
+									</div>
+									{!isWorkspacePreview && (
+										<HeaderToolbar
+											onOpenSavedRecordings={() => setSaveDumpOpened(true)}
+											narratorId={narratorId}
+											controller={toolbarController}
+											inlineControls={toolbarInlineControls}
+											toolbarBadgeCounts={toolbarBadgeCounts}
+											headerHostCapabilities={headerHostCapabilities}
+											openArchiveConfirm={openArchiveConfirm}
+											archiveMutation={archiveMutation}
+											dock={dock}
+											mockStreamEnabled={mockStreamEnabled}
+											onOpenCompatibility={compatibilityProjectId ? openCompatibility : undefined}
+											onOpenOutline={outlineEnabled ? openOutline : undefined}
+											onUpgradeToTeam={teamUpgradeOffered ? openUpgradeToTeam : undefined}
+											onClose={onClose}
+											visibleToolCount={headerLayout.visibleToolCount}
+											unmeasured={headerLayout.unmeasured}
+											t={t}
+										/>
 									)}
-									{disconnected && !isWorkspacePreview && (
-										<Badge
-											size="xs"
-											variant="dot"
-											color="red"
-											style={{ cursor: "pointer", flex: "0 0 auto" }}
-											onClick={reconnect}
-											title={t("reconnect")}
-										>
-											{t("disconnected")}
-										</Badge>
-									)}
-								</div>
-								{!isWorkspacePreview && (
-									<HeaderToolbar
-										onOpenSavedRecordings={() => setSaveDumpOpened(true)}
-										narratorId={narratorId}
-										controller={toolbarController}
-										inlineControls={toolbarInlineControls}
-										toolbarBadgeCounts={toolbarBadgeCounts}
-										headerHostCapabilities={headerHostCapabilities}
-										openArchiveConfirm={openArchiveConfirm}
-										archiveMutation={archiveMutation}
-										dock={dock}
-										mockStreamEnabled={mockStreamEnabled}
-										onOpenCompatibility={compatibilityProjectId ? openCompatibility : undefined}
-										onOpenOutline={outlineEnabled ? openOutline : undefined}
-										onUpgradeToTeam={teamUpgradeOffered ? openUpgradeToTeam : undefined}
-										onClose={onClose}
-										visibleToolCount={headerLayout.visibleToolCount}
-										unmeasured={headerLayout.unmeasured}
-										t={t}
-									/>
-								)}
-							</>
-						)}
-					</NarratorHeaderLayout>
+								</>
+							)}
+						</NarratorHeaderLayout>
+					)}
 
 					<LeakedToolCallModal
 						narratorId={narratorId}
@@ -3742,26 +3556,17 @@ function NarratorPanelBody({
 								onSetAsSummaryModel: handleSetSummaryModel,
 							},
 							quota: {
-								// Structured subscription quotas are rendered by the status bar, not this text slot.
-								balance: commandCodeEnabled ? null : (tokenDanceQuota?.balance ?? quotaBalance),
-								detailsText: tokenDanceQuota?.detailsText ?? quotaDetailsText,
-								hasDetailsPopover: tokenDanceQuota?.hasDetailsPopover ?? hasQuotaDetailsPopover,
-								sub2api: sub2ApiSubscriptionSnapshot
-									? {
-											snapshot: sub2ApiSubscriptionSnapshot,
-											queryFailed: providerBalanceQuery.isError,
-										}
-									: undefined,
-								opencode: opencodeQuotaProps,
-								panel: quotaPanelProps,
+								entries: currentQuotaEntries,
+								waitingForQuota: isWaitingForQuota,
+								waitingText: isWaitingForQuota ? quotaWaitText : null,
 								shouldShowNugRechargeButton,
 								shouldShowNugRechargeInQuotaDetails,
 								onOpenNugRecharge: openNugRecharge,
-								...(tokenDanceQuota
+								...(tokenDanceRechargeEnabled
 									? {
 											recharge: {
-												showButton: tokenDanceQuota.showRechargeButton,
-												showInDetails: tokenDanceQuota.showRechargeInDetails,
+												showButton: !tokenDanceBalanceKnown || tokenDanceRemaining <= 0,
+												showInDetails: tokenDanceBalanceKnown && tokenDanceRemaining > 0,
 												onOpen: openTokenDanceRecharge,
 											},
 										}

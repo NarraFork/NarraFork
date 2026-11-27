@@ -5,11 +5,21 @@
  * (agents' reviews and people's returns); this item's own timeline; and a fixed bottom bar with
  * 退回 / 合并到 <base>.
  *
+ * D: when the item waits for others, a 「依赖」 list (each with its state; a title opens that item
+ * here) and a warning when one was cancelled; items waiting for this one are listed under
+ * 「被依赖」. Read-only: only the coordinator changes dependencies.
+ *
  * 退回 expands in place into a required one-line reason: the item goes back to in progress and
- * the coordinator relays the reason to the worker. The server never merges, so 合并 is disabled
- * and the bar says how an item becomes merged (its branch landing in the base is noticed).
+ * the coordinator relays the reason to the worker. 合并到 <base> (M, `TeamMerge.tsx`) starts a
+ * background merge for a ready item: it lands in the base, or is prepared for a person to
+ * fast-forward where the base is checked out, or lists its conflicts with 退回 prefilled.
  */
-import { useReturnWorkItem, useTeamWorkDiff, useTeamWorkItem } from "@frontend/hooks/useTeams";
+import {
+	useRefreshPullRequest,
+	useReturnWorkItem,
+	useTeamWorkDiff,
+	useTeamWorkItem,
+} from "@frontend/hooks/useTeams";
 import { describeApiError } from "@frontend/lib/api-error";
 import { formatSmartTime } from "@frontend/lib/format";
 import {
@@ -27,28 +37,37 @@ import {
 	Text,
 	Textarea,
 	Title,
-	Tooltip,
 	UnstyledButton,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
-import type { TeamWorkFileChange, TeamWorkItemDetail } from "@shared/project-teams";
 import {
+	dependencyBlockers,
+	type TeamWorkDependencyRef,
+	type TeamWorkFileChange,
+	type TeamWorkItemDetail,
+} from "@shared/project-teams";
+import {
+	IconAlertTriangle,
 	IconArrowBackUp,
 	IconArrowRight,
 	IconCheck,
 	IconChevronRight,
 	IconExternalLink,
 	IconGitBranch,
-	IconGitMerge,
 	IconX,
 } from "@tabler/icons-react";
-import { type ReactNode, useEffect, useState } from "react";
+import { type ReactNode, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ActivityLine } from "./TeamActivity";
+import { MergeButton, MergeOutcome } from "./TeamMerge";
 import {
+	conflictReasonFiles,
+	currentPullRequest,
 	diffLineKind,
+	findingsNeedToggle,
 	itemMarks,
 	liveWorkerStatus,
+	REVIEW_FINDINGS_CLAMP_LINES,
 	returnErrorKey,
 	returnReason,
 	showsStat,
@@ -68,6 +87,52 @@ const DIFF_COLOR = {
 	meta: { background: undefined, color: "var(--mantine-color-dimmed)" },
 	context: { background: undefined, color: undefined },
 } as const;
+
+/** A review round's findings: muted, clamped to a few lines, 「展开」 for the rest. */
+export function ReviewFindings({ text, clipped }: { text: string | null; clipped: boolean }) {
+	const { t } = useTranslation("projects");
+	const [open, setOpen] = useState(false);
+	// A guess first (also what a static render shows), then what the clamped text really does.
+	const [overflows, setOverflows] = useState(() => !!text && findingsNeedToggle(text));
+	const textRef = useRef<HTMLParagraphElement | null>(null);
+	useLayoutEffect(() => {
+		const element = textRef.current;
+		if (!element || open) return;
+		setOverflows(element.scrollHeight > element.clientHeight + 1);
+	}, [open]);
+	const toggle = !!text && (open || overflows);
+	return (
+		<Box data-testid="team-review-findings">
+			{text && (
+				<Text
+					ref={textRef}
+					size="sm"
+					c="dimmed"
+					lineClamp={open ? undefined : REVIEW_FINDINGS_CLAMP_LINES}
+					style={{ overflowWrap: "anywhere", whiteSpace: "pre-wrap" }}
+				>
+					{text}
+				</Text>
+			)}
+			{clipped && (
+				<Text size="xs" c="dimmed" fs="italic">
+					{t("teams.page.drawer.findingsClipped")}
+				</Text>
+			)}
+			{toggle && (
+				<Anchor
+					component="button"
+					type="button"
+					size="xs"
+					onClick={() => setOpen((value) => !value)}
+					data-testid="team-review-findings-toggle"
+				>
+					{t(open ? "teams.page.drawer.findingsLess" : "teams.page.drawer.findingsMore")}
+				</Anchor>
+			)}
+		</Box>
+	);
+}
 
 function FileDiff({
 	projectId,
@@ -213,16 +278,129 @@ function SectionTitle({ children, right }: { children: ReactNode; right?: ReactN
 	);
 }
 
+const DEPENDENCY_STATE_COLOR: Record<TeamWorkDependencyRef["state"], string> = {
+	queued: "gray",
+	in_progress: "blue",
+	in_review: "blue",
+	ready: "green",
+	merged: "gray",
+	cancelled: "red",
+};
+
+/** One dependency or dependent: its state, and its title opening it in this drawer. */
+function DependencyRow({
+	entry,
+	onOpenItem,
+}: {
+	entry: TeamWorkDependencyRef;
+	onOpenItem?: (itemId: string) => void;
+}) {
+	const { t } = useTranslation("projects");
+	return (
+		<Group gap={8} wrap="nowrap" data-testid="team-dependency" data-state={entry.state}>
+			<Badge
+				size="sm"
+				radius="sm"
+				variant="light"
+				tt="none"
+				color={DEPENDENCY_STATE_COLOR[entry.state]}
+				style={{ flexShrink: 0 }}
+			>
+				{t(`teams.page.drawer.dependencyState.${entry.state}`)}
+			</Badge>
+			{onOpenItem ? (
+				<Anchor
+					component="button"
+					size="sm"
+					onClick={() => onOpenItem(entry.id)}
+					style={{ minWidth: 0, textAlign: "left", overflowWrap: "anywhere" }}
+					td={entry.state === "cancelled" ? "line-through" : undefined}
+				>
+					{entry.title}
+				</Anchor>
+			) : (
+				<Text size="sm" style={{ minWidth: 0, overflowWrap: "anywhere" }}>
+					{entry.title}
+				</Text>
+			)}
+		</Group>
+	);
+}
+
+/** The drawer's 「依赖」 and 「被依赖」 sections (exported for the component tests). */
+export function DependencySections({
+	detail,
+	onOpenItem,
+}: {
+	detail: TeamWorkItemDetail;
+	onOpenItem?: (itemId: string) => void;
+}) {
+	const { t } = useTranslation("projects");
+	const dependsOn = detail.item.dependsOn ?? [];
+	const dependents = detail.dependents ?? [];
+	if (dependsOn.length === 0 && dependents.length === 0) return null;
+	const cancelled = dependencyBlockers(dependsOn).filter((entry) => entry.state === "cancelled");
+	const waits = detail.item.state === "queued";
+	return (
+		<Stack gap="md">
+			{dependsOn.length > 0 && (
+				<Box data-testid="team-drawer-dependencies">
+					<SectionTitle>{t("teams.page.drawer.dependenciesTitle")}</SectionTitle>
+					<Stack gap={6}>
+						{waits &&
+							cancelled.map((entry) => (
+								<Alert
+									key={entry.id}
+									color="yellow"
+									p="xs"
+									icon={<IconAlertTriangle size={16} />}
+									data-testid="team-dependency-cancelled"
+								>
+									{t("teams.page.drawer.dependencyCancelled", { title: entry.title })}
+								</Alert>
+							))}
+						{dependsOn.map((entry) => (
+							<DependencyRow key={entry.id} entry={entry} onOpenItem={onOpenItem} />
+						))}
+						{waits && cancelled.length === 0 && dependencyBlockers(dependsOn).length > 0 && (
+							<Text size="xs" c="dimmed">
+								{t("teams.page.drawer.dependencyNote", { base: detail.base })}
+							</Text>
+						)}
+					</Stack>
+				</Box>
+			)}
+			{dependents.length > 0 && (
+				<Box data-testid="team-drawer-dependents">
+					<SectionTitle>{t("teams.page.drawer.dependentsTitle")}</SectionTitle>
+					<Stack gap={6}>
+						{dependents.map((entry) => (
+							<DependencyRow key={entry.id} entry={entry} onOpenItem={onOpenItem} />
+						))}
+						{detail.dependentsMore && (
+							<Text size="xs" c="dimmed">
+								{t("teams.page.drawer.dependentsMore")}
+							</Text>
+						)}
+					</Stack>
+				</Box>
+			)}
+		</Stack>
+	);
+}
+
 function DrawerBody({
 	projectId,
 	teamId,
 	detail,
 	onOpenSession,
+	onOpenItem,
 }: {
 	projectId: string;
 	teamId: string;
 	detail: TeamWorkItemDetail;
 	onOpenSession?: (narratorId: string) => void;
+	onOpenItem?: (itemId: string) => void;
 }) {
 	const { t } = useTranslation("projects");
 	const { item } = detail;
@@ -309,6 +487,8 @@ function DrawerBody({
 					)}
 				</Field>
 			</Stack>
+
+			<DependencySections detail={detail} onOpenItem={onOpenItem} />
 
 			<Box data-testid="team-drawer-files">
 				<SectionTitle>{t("teams.page.drawer.filesTitle")}</SectionTitle>
@@ -398,6 +578,9 @@ function DrawerBody({
 											{round.reason}
 										</Text>
 									)}
+									{(round.summary || round.summaryClipped) && (
+										<ReviewFindings text={round.summary} clipped={!!round.summaryClipped} />
+									)}
 								</Stack>
 							);
 						})}
@@ -422,7 +605,10 @@ function DrawerBody({
 	);
 }
 
-/** The fixed bottom bar: 退回 / 合并; 退回 opens the reason in place. */
+/**
+ * The fixed bottom bar: 退回 / 合并; 退回 opens the reason in place (prefilled with the conflicting
+ * files after a merge conflicted). A ready item's merge outcome shows above the buttons.
+ */
 function ReturnBar({
 	projectId,
 	teamId,
@@ -447,6 +633,27 @@ function ReturnBar({
 	};
 	const ready = returnReason(reason);
 	const base = detail.base;
+	const merge = detail.merge;
+	const conflict =
+		merge?.detail?.kind === "failed" && merge.detail.code === "conflict" ? merge.detail : null;
+	// G: GitHub's branch has commits the ready head lacks.
+	const rejected =
+		merge?.detail?.kind === "failed" && merge.detail.code === "TEAM_PR_PUSH_REJECTED";
+	const branch = detail.item.branch ?? "";
+	// After a conflict, 退回 starts from the conflicting files (the person may edit it); after a
+	// rejected push, from what the worker brings in.
+	useEffect(() => {
+		if (!returning || (!conflict && !rejected)) return;
+		setReason((current) => {
+			if (current.trim()) return current;
+			if (!conflict) return t("teams.page.merge.pushRejectedReason", { branch });
+			const { files, more } = conflictReasonFiles(conflict.conflicts, conflict.more);
+			return t(more ? "teams.page.merge.conflictReasonMore" : "teams.page.merge.conflictReason", {
+				base,
+				files,
+			});
+		});
+	}, [returning, conflict, rejected, branch, base, t]);
 	const submit = () => {
 		if (!ready) return;
 		send.mutate(
@@ -519,37 +726,51 @@ function ReturnBar({
 			</Stack>
 		);
 	return (
-		<Group justify="space-between" wrap="wrap" gap="sm" style={{ rowGap: 6 }}>
-			<Text size="xs" c="dimmed" style={{ minWidth: 0, flex: "1 1 220px" }}>
-				{t("teams.page.drawer.barNote", { base })}
-			</Text>
-			<Group gap="xs" wrap="nowrap" style={{ flexShrink: 0 }}>
-				<Button
-					variant="default"
-					leftSection={<IconArrowBackUp size={16} aria-hidden />}
-					onClick={() => setReturning(true)}
-					data-testid="team-drawer-return"
-				>
-					{t("teams.page.drawer.return")}
-				</Button>
-				<Tooltip
-					label={t("teams.page.attention.mergeDisabled", { base })}
-					withinPortal
-					multiline
-					maw={300}
-				>
-					<span>
-						<Button
-							disabled
-							leftSection={<IconGitMerge size={16} aria-hidden />}
-							data-testid="team-drawer-merge"
-						>
-							{t("teams.page.drawer.merge", { base })}
-						</Button>
-					</span>
-				</Tooltip>
+		<Stack gap="xs">
+			{merge && (
+				<MergeOutcome
+					projectId={projectId}
+					teamId={teamId}
+					itemId={detail.item.id}
+					base={base}
+					merge={merge}
+					canReturn={detail.canReturn}
+					onReturn={() => setReturning(true)}
+				/>
+			)}
+			<Group justify="space-between" wrap="wrap" gap="sm" style={{ rowGap: 6 }}>
+				<Text size="xs" c="dimmed" style={{ minWidth: 0, flex: "1 1 220px" }}>
+					{t(
+						merge?.mode === "github"
+							? "teams.page.merge.barNotePr"
+							: merge
+								? "teams.page.merge.barNote"
+								: "teams.page.drawer.barNote",
+						{ base },
+					)}
+				</Text>
+				<Group gap="xs" wrap="nowrap" align="flex-start" style={{ flexShrink: 0 }}>
+					<Button
+						variant="default"
+						leftSection={<IconArrowBackUp size={16} aria-hidden />}
+						onClick={() => setReturning(true)}
+						disabled={!!merge?.phase}
+						data-testid="team-drawer-return"
+					>
+						{t("teams.page.drawer.return")}
+					</Button>
+					{merge && (
+						<MergeButton
+							projectId={projectId}
+							teamId={teamId}
+							itemId={detail.item.id}
+							merge={merge}
+							base={base}
+						/>
+					)}
+				</Group>
 			</Group>
-		</Group>
+		</Stack>
 	);
 }
 
@@ -561,6 +782,7 @@ export function TeamWorkDrawer({
 	phone,
 	onClose,
 	onOpenSession,
+	onOpenItem,
 }: {
 	projectId: string;
 	teamId: string;
@@ -570,6 +792,8 @@ export function TeamWorkDrawer({
 	phone: boolean;
 	onClose: () => void;
 	onOpenSession?: (narratorId: string) => void;
+	/** D: open another item of the team in this drawer (a dependency's link). */
+	onOpenItem?: (itemId: string) => void;
 }) {
 	const { t } = useTranslation("projects");
 	const detail = useTeamWorkItem(projectId, teamId, itemId);
@@ -580,6 +804,18 @@ export function TeamWorkDrawer({
 	const data = detail.data?.item.id === itemId ? detail.data : undefined;
 	const item = data?.item;
 	const showBar = !!data && data.canReturn;
+	// G: a member opening a ready item with a pull request reads it from GitHub (once per opening;
+	// the server keeps a read 20 s).
+	const refresh = useRefreshPullRequest(projectId, teamId);
+	// Only when the route would allow it (a member with project write), never a silent 403.
+	const hasPr = !!currentPullRequest(data?.merge)?.canRefresh;
+	const refreshed = useRef<string | null>(null);
+	useEffect(() => {
+		if (!itemId) refreshed.current = null;
+		if (!itemId || !hasPr || refreshed.current === itemId) return;
+		refreshed.current = itemId;
+		refresh.mutate({ itemId });
+	}, [itemId, hasPr, refresh.mutate]);
 	return (
 		<Drawer
 			opened={!!itemId}
@@ -671,6 +907,7 @@ export function TeamWorkDrawer({
 							teamId={teamId}
 							detail={data}
 							onOpenSession={onOpenSession}
+							onOpenItem={onOpenItem}
 						/>
 					)}
 				</Box>

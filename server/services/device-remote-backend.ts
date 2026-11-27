@@ -19,6 +19,7 @@ import type {
 	ExecHandle,
 	ExecParams,
 	ExecutionBackend,
+	ExecutorSessionBinding,
 	FileMetadataOptions,
 	FileStat,
 	GitDiffParams,
@@ -78,6 +79,7 @@ import {
 import { AppError } from "../lib/errors";
 import { pathsEqualForOS } from "../lib/platform-path";
 import { settings } from "../lib/settings";
+import { SESSION_DURABLE_FEATURE, SESSION_EXEC_FEATURE } from "../terminal/remote-session";
 import {
 	getDeviceConnectionGeneration,
 	hasDeviceProtocolFeature,
@@ -685,6 +687,8 @@ export class RemoteBackend implements ExecutionBackend {
 	}
 
 	async execCommand(params: ExecParams): Promise<ExecHandle> {
+		if (params.backgroundSession && this.supportsDurableExecSessions)
+			return this.startBackgroundSession(params, params.backgroundSession);
 		const timeoutMs = settings.devices?.rpcTimeoutMs ?? 120_000;
 		return new RemoteExecHandle(
 			this.deviceId,
@@ -693,6 +697,63 @@ export class RemoteBackend implements ExecutionBackend {
 			timeoutMs,
 			this.maxBytes,
 		);
+	}
+
+	/** Whether background commands can run in durable executor sessions on this connection. */
+	get supportsDurableExecSessions(): boolean {
+		return (
+			getDeviceConnectionGeneration(this.deviceId) === this.connectionGeneration &&
+			hasDeviceProtocolFeature(this.deviceId, SESSION_DURABLE_FEATURE) &&
+			hasDeviceProtocolFeature(this.deviceId, SESSION_EXEC_FEATURE)
+		);
+	}
+
+	/**
+	 * Start a background command in a durable executor session. The session is bound to
+	 * the task before it is opened; a start whose confirmation was lost leaves a durable
+	 * stop intent, since the command may be running on the device.
+	 */
+	private async startBackgroundSession(
+		params: ExecParams,
+		background: NonNullable<ExecParams["backgroundSession"]>,
+	): Promise<ExecHandle> {
+		params.signal?.throwIfAborted();
+		// Loaded on demand: they reach the database, which plain RPC users of this module never do.
+		const [{ backgroundSessionId, RemoteSessionExecHandle }, { recordExecutorCleanup }] =
+			await Promise.all([import("./remote-session-exec"), import("./executor-session-cleanup")]);
+		const binding: ExecutorSessionBinding = {
+			deviceId: this.deviceId,
+			sessionId: backgroundSessionId(background.taskId),
+			...(background.timeoutMs !== undefined ? { timeoutMs: background.timeoutMs } : {}),
+			startedAt: new Date().toISOString(),
+		};
+		await background.bind(binding);
+		const env = params.env
+			? Object.fromEntries(
+					Object.entries(params.env).filter(
+						(entry): entry is [string, string] => entry[1] !== undefined,
+					),
+				)
+			: undefined;
+		const handle = new RemoteSessionExecHandle(binding, {
+			open: {
+				kind: "exec",
+				command: params.command,
+				cwd: params.cwd,
+				...(env ? { env } : {}),
+				...(params.freshEnv ? { freshEnv: true } : {}),
+				...(background.timeoutMs !== undefined ? { timeoutMs: background.timeoutMs } : {}),
+			},
+			...(params.signal ? { signal: params.signal } : {}),
+		});
+		try {
+			await handle.ready;
+		} catch (error) {
+			if (error instanceof Error && error.name === "RemoteSessionOpenUnknownError")
+				await recordExecutorCleanup(binding.deviceId, binding.sessionId);
+			throw error;
+		}
+		return handle;
 	}
 
 	get supportsGitWorkspace(): boolean {

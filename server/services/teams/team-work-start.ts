@@ -1,0 +1,278 @@
+/**
+ * Where a team's new work items start, and what `work.sync` brings in (W): `origin/<base>` or the
+ * local `<base>`.
+ *
+ * The mode is the team's `settings.workStart`, else the project's `chapter_settings.teams
+ * .workStart`, else `remote` when origin is on GitHub and `local` otherwise (`team-hosting.ts`).
+ * The base branch itself is the team's `base_branch`, which starts from the project's
+ * `default_branch` (`createTeam`).
+ *
+ * `remote` fetches `+refs/heads/<base>:refs/remotes/origin/<base>` into the remote-tracking ref
+ * only — never the local branch, never a working tree — and starts from the fetched commit. When
+ * the fetch fails (offline, no credentials), the remote-tracking ref as it is still serves and the
+ * event says it was not fetched; without one the start is refused (409
+ * `TEAM_WORK_START_UNAVAILABLE`), never silently moved to the local base. An item's `base_ref`
+ * stays the branch name either way: it is what the item merges back into.
+ */
+import {
+	TEAM_WORK_START_MODES,
+	type TeamSettings,
+	type TeamWorkStart,
+} from "@shared/project-teams";
+import { and, eq } from "drizzle-orm";
+import { db } from "../../db";
+import { projects, teamWorkEvents } from "../../db/schema";
+import { AppError } from "../../lib/errors";
+import { hotSafe } from "../../lib/hot-safe";
+import { logger } from "../../lib/logger";
+import { assertNoReplacedHistory } from "./team-git";
+import { teamRepoGit } from "./team-git-write";
+import { defaultWorkStart, hostingOf, peekHosting } from "./team-hosting";
+
+const isMode = (value: unknown): value is TeamWorkStart =>
+	typeof value === "string" && (TEAM_WORK_START_MODES as readonly string[]).includes(value);
+
+/** The project's default work start from its `chapter_settings`, if it sets one. */
+export function projectWorkStartOf(chapterSettings: unknown): TeamWorkStart | null {
+	let value = chapterSettings;
+	if (typeof value === "string") {
+		try {
+			value = JSON.parse(value);
+		} catch {
+			return null;
+		}
+	}
+	const mode = (value as { teams?: { workStart?: unknown } } | null)?.teams?.workStart;
+	return isMode(mode) ? mode : null;
+}
+
+/** A project's repository directory and its default work start (primary key). */
+export function projectStartFacts(projectId: string): {
+	repo: string | null;
+	projectDefault: TeamWorkStart | null;
+} {
+	const row = db
+		.select({ gitPath: projects.gitPath, settings: projects.chapterSettings })
+		.from(projects)
+		.where(eq(projects.id, projectId))
+		.limit(1)
+		.get();
+	return { repo: row?.gitPath ?? null, projectDefault: projectWorkStartOf(row?.settings) };
+}
+
+/**
+ * The work start a team gets when it sets nothing: the project's default, else by hosting from
+ * the cache. Null while the hosting is still being read.
+ */
+export function peekWorkStartDefault(projectId: string): TeamWorkStart | null {
+	const facts = projectStartFacts(projectId);
+	if (facts.projectDefault) return facts.projectDefault;
+	if (!facts.repo) return "local";
+	const hosting = peekHosting(facts.repo);
+	return hosting ? defaultWorkStart(hosting) : null;
+}
+
+/** The team's effective work start (reads the hosting when nothing is configured). */
+export async function resolveWorkStart(input: {
+	projectId: string;
+	settings: TeamSettings | null | undefined;
+}): Promise<TeamWorkStart> {
+	const own = input.settings?.workStart;
+	if (isMode(own)) return own;
+	const facts = projectStartFacts(input.projectId);
+	if (facts.projectDefault) return facts.projectDefault;
+	if (!facts.repo) return "local";
+	return defaultWorkStart(await hostingOf(facts.repo));
+}
+
+type FetchResult = { ok: true } | { ok: false; message: string };
+
+/** Origin fetches running now, per repository and base: concurrent starts and syncs share one. */
+const fetches = hotSafe(
+	"narrafork.teams.originFetches",
+	() => new Map<string, Promise<FetchResult>>(),
+);
+
+/** Run `fetch` unless the same repository and base are being fetched already; then share it. */
+export function fetchOnce(
+	repo: string,
+	base: string,
+	fetch: () => Promise<FetchResult>,
+): Promise<FetchResult> {
+	const key = `${repo}\0${base}`;
+	const running = fetches.get(key);
+	if (running) return running;
+	const started = fetch().finally(() => fetches.delete(key));
+	fetches.set(key, started);
+	return started;
+}
+
+/** Re-check a project's queued items after a fetch moved origin's base (background). */
+function scheduleUnblockReconcile(projectId: string): void {
+	void import("./work-item-dependencies")
+		.then(({ reconcileUnblocks }) => reconcileUnblocks({ projectId }))
+		.catch((error) =>
+			logger.warn("Team unblocks could not be reconciled", {
+				projectId,
+				error: error instanceof Error ? error.message : String(error),
+			}),
+		);
+}
+
+/** Where one item starts or syncs from. */
+export interface WorkStartPoint {
+	mode: TeamWorkStart;
+	/** What to name: `origin/<base>` or `<base>`. */
+	label: string;
+	/** The ref to resolve: `refs/remotes/origin/<base>` or the base as configured. */
+	ref: string;
+	/** The commit it named when read (null when the caller resolves it). */
+	commit: string | null;
+	/** `remote`: whether this read fetched it (false: the ref as it was). Null for `local`. */
+	fetched: boolean | null;
+}
+
+/**
+ * The start point for a team's base now. `remote` fetches the base from origin into its
+ * remote-tracking ref first (best effort), then reads that ref.
+ */
+export async function workStartPoint(input: {
+	projectId: string;
+	baseBranch: string;
+	settings: TeamSettings | null | undefined;
+}): Promise<WorkStartPoint> {
+	const mode = await resolveWorkStart(input);
+	const { branch, tracking } = baseBranchOf(input.baseBranch);
+	if (mode === "local") {
+		// A tracking base (`origin/main`) is used as it is, by its commit (a worktree made from a
+		// remote-tracking ref would also get it as upstream).
+		if (!tracking)
+			return { mode, label: input.baseBranch, ref: input.baseBranch, commit: null, fetched: null };
+		const { repo } = projectStartFacts(input.projectId);
+		const commit = repo
+			? await teamRepoGit(repo)
+					.resolve(input.baseBranch)
+					.catch(() => null)
+			: null;
+		return { mode, label: input.baseBranch, ref: input.baseBranch, commit, fetched: null };
+	}
+	const { repo } = projectStartFacts(input.projectId);
+	if (!repo)
+		throw new AppError(
+			"The team's project has no repository directory",
+			409,
+			"TEAM_PROJECT_NOT_GIT",
+		);
+	const git = teamRepoGit(repo);
+	// `origin/main` and `refs/remotes/origin/main` name the branch `main` on origin: never
+	// `origin/origin/main`.
+	const label = `origin/${branch}`;
+	const ref = remoteTrackingRef(branch);
+	const fetch = await fetchOnce(repo, branch, () =>
+		git.fetchBaseFromOrigin(branch).catch((error: unknown) => ({
+			ok: false as const,
+			message: error instanceof Error ? error.message : String(error),
+		})),
+	);
+	if (!fetch.ok)
+		logger.warn("Team base could not be fetched from origin", {
+			projectId: input.projectId,
+			base: input.baseBranch,
+			error: fetch.message,
+		});
+	// D: origin may now hold a dependency that merged elsewhere: queued items waiting on it
+	// are looked at again (in the background; notes go out once).
+	if (fetch.ok) scheduleUnblockReconcile(input.projectId);
+	const commit = await git.resolve(ref).catch(() => null);
+	if (!commit)
+		throw new AppError(
+			`New work starts from ${label} (team settings), but it could not be fetched${
+				fetch.ok ? "" : ` (${fetch.message})`
+			} and there is no ${ref} to start from. Fetch it, or set the team to start from the local ${branch}.`,
+			409,
+			"TEAM_WORK_START_UNAVAILABLE",
+		);
+	return { mode, label, ref, commit, fetched: fetch.ok };
+}
+
+/**
+ * Refuse to start work from a commit whose history or files a replacement ref rewrites
+ * (`TEAM_GIT_REPLACED_HISTORY`): the worktree would hold the files the person's git sees, while
+ * every team command reads the real ones. Nothing to check without a repository or a commit (the
+ * worktree creation then fails on its own).
+ */
+export async function assertStartNotReplaced(projectId: string, start: WorkStartPoint) {
+	const { repo } = projectStartFacts(projectId);
+	if (!repo) return;
+	// An unreadable start is left to the worktree creation, which cannot start from it either.
+	const commit =
+		start.commit ??
+		(await teamRepoGit(repo)
+			.resolve(start.ref)
+			.catch(() => null));
+	if (commit) await assertNoReplacedHistory(repo, [commit]);
+}
+
+/**
+ * Where work of a team on `baseBranch` starts now, without fetching: `refs/remotes/origin/<b>`
+ * (`origin/<b>`) in `remote` mode, else the base as it is. What a dependency must be inside for a
+ * dependent to start: `work.sync` brings in exactly this ref.
+ */
+export async function startRefFor(input: {
+	projectId: string;
+	baseBranch: string;
+	settings: TeamSettings | null | undefined;
+}): Promise<{ ref: string; label: string }> {
+	const mode = await resolveWorkStart(input);
+	if (mode === "local") return { ref: input.baseBranch, label: input.baseBranch };
+	const { branch } = baseBranchOf(input.baseBranch);
+	return { ref: remoteTrackingRef(branch), label: `origin/${branch}` };
+}
+
+// ── What an item's branch is compared against ───────────────────────────────
+
+/** Where an item started (`work.created`'s `startFrom`), or null for items made before it. */
+export function itemStartedFrom(itemId: string): string | null {
+	const row = db
+		.select({ detail: teamWorkEvents.detailJson })
+		.from(teamWorkEvents)
+		.where(and(eq(teamWorkEvents.workItemId, itemId), eq(teamWorkEvents.kind, "work.created")))
+		.limit(1)
+		.get();
+	const from = row?.detail?.startFrom;
+	return typeof from === "string" ? from : null;
+}
+
+/** The remote-tracking ref of a base (`refs/remotes/origin/<base>`). */
+export const remoteTrackingRef = (base: string) =>
+	`refs/remotes/origin/${baseBranchOf(base).branch}`;
+
+/**
+ * The branch a base names, and whether it was given as origin's remote-tracking ref
+ * (`origin/<b>` or `refs/remotes/origin/<b>`): such a team's work starts and syncs from origin's
+ * `<b>`, and a local merge refuses it.
+ */
+export function baseBranchOf(base: string): { branch: string; tracking: boolean } {
+	if (base.startsWith("refs/remotes/origin/"))
+		return { branch: base.slice("refs/remotes/origin/".length), tracking: true };
+	if (base.startsWith("origin/")) return { branch: base.slice("origin/".length), tracking: true };
+	return { branch: base, tracking: false };
+}
+
+/**
+ * The ref an item's branch is compared against — its changed paths, size, diff, commits since
+ * review, the knowledge check: `refs/remotes/origin/<base>` for an item that started from
+ * `origin/<base>` (while that ref resolves), else the base itself. Comparing such an item with a
+ * local base that is behind origin would count origin's commits as the item's own. The local base
+ * stays what a local merge moves.
+ */
+export async function compareRefFor(
+	itemId: string,
+	base: string,
+	resolve: (ref: string) => Promise<string | null>,
+): Promise<string> {
+	const { branch, tracking } = baseBranchOf(base);
+	if (!tracking && itemStartedFrom(itemId) !== `origin/${branch}`) return base;
+	const remote = remoteTrackingRef(branch);
+	return (await resolve(remote).catch(() => null)) ? remote : base;
+}

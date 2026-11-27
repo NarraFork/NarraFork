@@ -52,12 +52,6 @@ import "@frontend/styles/trace-shimmer.css";
 // declare; see the stylesheet's header.
 import "@frontend/styles/vlist-touch-scroll-top.css";
 
-/*
- * Deep import rather than the `components/plugins` barrel, for the same reason as the
- * theme store above: the barrel re-exports every plugin component, so importing one
- * function through it puts all of them on the entry's graph.
- */
-import { syncPluginUiContributions } from "@frontend/components/plugins/registry";
 import { createBrowserHistory } from "@tanstack/react-router";
 import React from "react";
 import ReactDOM from "react-dom/client";
@@ -145,7 +139,8 @@ async function bootstrap() {
 
 	// Wait only for global common/errors copy; localized route gates load the rest.
 	await initI18n(getInitialNamespaces(window.location.pathname));
-	if (!isPublicShare) void syncPluginUiContributions().catch(() => {});
+	// App's authenticated plugin hosts share the React Query-owned snapshot.
+	// A separate bootstrap fetch would duplicate their first cold read.
 
 	// biome-ignore lint/style/noNonNullAssertion: root element always exists
 	ReactDOM.createRoot(document.getElementById("root")!, {

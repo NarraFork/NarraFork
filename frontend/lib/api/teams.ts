@@ -1,15 +1,21 @@
+import { PROJECT_TEAM_CARDS_LIMIT, type TeamCard } from "@shared/project-overview";
 import type {
 	TeamActivityPage,
 	TeamApprovalsResponse,
 	TeamBoardColumn,
 	TeamBoardColumnPage,
 	TeamDetail,
+	TeamGithubPinResponse,
 	TeamListResponse,
 	TeamMembersResponse,
 	TeamPageSummary,
+	TeamPrMergeMethod,
 	TeamRunningResponse,
+	TeamSettingsPatch,
 	TeamWorkFileDiff,
 	TeamWorkItemDetail,
+	TeamWorkMergeResponse,
+	TeamWorkPrRefreshResponse,
 	TeamWorkReturnResponse,
 	TeamWorkStatsResponse,
 } from "@shared/project-teams";
@@ -52,6 +58,16 @@ export const teamsApi = {
 				status: options.status,
 				cursor: options.cursor,
 				limit: options.limit,
+			})}`,
+		),
+	/** The project page's team cards (R2): at most 24 teams a page, each with its numbers. */
+	listProjectTeamCards: (projectId: string, options: { cursor?: string } = {}) =>
+		request<{ teams: TeamCard[]; nextCursor: string | null }>(
+			`/projects/${encodeURIComponent(projectId)}/teams${query({
+				status: "active",
+				counts: "true",
+				cursor: options.cursor,
+				limit: PROJECT_TEAM_CARDS_LIMIT,
 			})}`,
 		),
 	createProjectTeam: (projectId: string, payload: CreateTeamPayload) =>
@@ -97,7 +113,7 @@ export const teamsApi = {
 	updateProjectTeam: (
 		projectId: string,
 		teamId: string,
-		patch: { baseBranch?: string; brief?: string },
+		patch: { baseBranch?: string; brief?: string; settings?: TeamSettingsPatch },
 	) =>
 		request<TeamDetail>(teamBase(projectId, teamId), {
 			method: "PATCH",
@@ -126,5 +142,43 @@ export const teamsApi = {
 		request<TeamWorkReturnResponse>(
 			`${teamBase(projectId, teamId)}/work/${encodeURIComponent(itemId)}/return`,
 			{ method: "POST", body: JSON.stringify({ reason }) },
+		),
+	/** Merge a ready work item into its base (members): accepted, runs in the background. */
+	mergeTeamWorkItem: (projectId: string, teamId: string, itemId: string) =>
+		request<TeamWorkMergeResponse>(
+			`${teamBase(projectId, teamId)}/work/${encodeURIComponent(itemId)}/merge`,
+			{ method: "POST" },
+		),
+	/** G: merge a ready item's pull request on GitHub (members): accepted, runs in the background. */
+	mergeTeamPullRequest: (
+		projectId: string,
+		teamId: string,
+		itemId: string,
+		method: TeamPrMergeMethod | undefined,
+	) =>
+		request<TeamWorkMergeResponse>(
+			`${teamBase(projectId, teamId)}/work/${encodeURIComponent(itemId)}/pr/merge`,
+			{ method: "POST", body: JSON.stringify(method ? { method } : {}) },
+		),
+	/** G: the GitHub repository the project's pull requests go to (confirmed, and detected). */
+	getTeamGithub: (projectId: string) =>
+		request<TeamGithubPinResponse>(`/projects/${encodeURIComponent(projectId)}/team-github`),
+	/** G: confirm (`host/owner/repo`) or, with null, clear it (project managers). */
+	setTeamGithub: (projectId: string, target: string | null) =>
+		request<TeamGithubPinResponse>(`/projects/${encodeURIComponent(projectId)}/team-github`, {
+			method: target ? "PUT" : "DELETE",
+			...(target ? { body: JSON.stringify({ target }) } : {}),
+		}),
+	/** G: read a ready item's pull request from GitHub now (unless read in the last 20 s). */
+	refreshTeamPullRequest: (projectId: string, teamId: string, itemId: string) =>
+		request<TeamWorkPrRefreshResponse>(
+			`${teamBase(projectId, teamId)}/work/${encodeURIComponent(itemId)}/pr/refresh`,
+			{ method: "POST" },
+		),
+	/** Fast-forward a prepared merge in the checkout its base is checked out in (members). */
+	fastForwardTeamWorkItem: (projectId: string, teamId: string, itemId: string) =>
+		request<TeamWorkMergeResponse>(
+			`${teamBase(projectId, teamId)}/work/${encodeURIComponent(itemId)}/merge/fast-forward`,
+			{ method: "POST" },
 		),
 };

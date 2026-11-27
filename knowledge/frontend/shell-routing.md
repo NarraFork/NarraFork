@@ -74,7 +74,7 @@ keywords:
   - 设置导航
   - settings-nav
 status: draft
-verified_at: 4d59774711a51a9ac966794090c8b3a04d549048
+verified_at: 9971136b2155fccc682801bff1726fb9970c9588
 ---
 # 应用框架与路由
 
@@ -88,7 +88,7 @@ verified_at: 4d59774711a51a9ac966794090c8b3a04d549048
 - 根路由 `frontend/routes/__root.tsx` 在 `beforeLoad` 里预取当前路径所需的 i18n 命名空间（失败不阻塞），布局为 `AppRootLayout.tsx:RootLayout`。
 - `RootLayout` 分流：独立窗口路径（`/windows/*`）直接 `<Outlet/>`；`/login`、`/oauth/authorize`、公开叙述者分享页、以及未登录访问 `/licenses`、`/changelog` 走无外壳的 `I18nNamespaceGate`；其余路径懒加载 `AuthenticatedLayout`（`AuthenticatedAppLayout.tsx`），外面套 `APP_SHELL_NAMESPACES` 的命名空间门。
 - 侧栏导航项 id 来自 `shared/nav-layout.ts:CUSTOMIZABLE_NAV_IDS`（projects、messages、routines、scheduled-tasks、learn、knowledge、outline），前端 `nav-items.tsx` 用 `Record<CustomizableNavId, …>` 补展示细节，新增 id 漏补会编译失败；服务端校验器也从同一列表派生。用户布局存于 `user_preferences.nav_layout`，`__divider__` 之后的项收进“更多”菜单，未出现在已存布局中的 id 由 `useNavLayout` 自动补入。
-- 侧栏只扣留本服务器关掉的功能：`hooks/nav-layout.ts:projectNavLayout(entries, hidden)` 过滤 `hidden` 里的 id，目前只有 `outline.enabled` 关闭时的 `outline`（`useNavLayout`）；被扣留的项仍留在已存布局里，用户重排后由 `restoreWithheldNavEntries` 按原下标放回，功能打开时原位出现。`projects`（项目，通往项目页与团队）不扣留；它曾被当作退役画布入口扣留，期间已存布局一直保留它的位置，所以恢复后各人按自己存的位置看到它（`nav-layout.test.ts`）。
+- 侧栏只扣留本服务器关掉的功能：`hooks/nav-layout.ts:projectNavLayout(entries, hidden)` 过滤 `hidden` 里的 id，`outline.enabled` 关闭时的 `outline`，以及始终扣留的 `projects`（`useNavLayout`）；被扣留的项仍留在已存布局里，用户重排后由 `restoreWithheldNavEntries` 按原下标放回，功能打开时原位出现。「项目」不在可定制区：它是侧栏顶部固定的第三行（`NavTopSection.tsx:NavProjectsLink`，在「搜索」「新会话」之下，通往项目列表、项目页与团队），所以布局里的 `projects` 被扣留，已存位置保留不动。`projectNavLayout` 本身不扣留 `projects`（`nav-layout.test.ts`）。
 
 - 部署前缀：`lib/base-path.ts:getAppBase` 由 `document.baseURI` 算出挂载根（只取目录部分，解析失败回退 `/`），`apiUrl`/`assetUrl` 据此拼地址，带 `api` 段的路径不会拼成 `/api/api`。`lib/app-path-classify.ts` 单独成模块，是因为 Service Worker 没有 `document`、要共用同一套“哪些相对路径是 API/WS 流量”的判断，两边必须一致（见 [PWA 与远程前端](pwa-remote.md)）。
 - 懒加载与错误隔离：`lib/lazy-with-retry.ts:lazyWithRetry` 只对“动态 import 取模块失败”（`Failed to fetch` 等消息）重试，默认再试 1 次、间隔 250ms，模块求值抛的错不重试；`lib/dom-mutation-guard.ts` 在 import 时给 `Node.prototype.removeChild/insertBefore` 打补丁（父节点不符时 `removeChild` 原样返回、`insertBefore` 退成 `appendChild`），防浏览器翻译插件改乱 DOM 后 React 崩溃；`lib/legacy-browser-polyfills.ts` 给旧 Safari 补内建方法，`lib/legacy-builtins.guard.test.ts` 扫 `frontend/` 与 `shared/`，用了清单里没有 shim 的禁用内建方法（构建目标 `es2020`/`safari14` 只降语法不补运行时）就失败。

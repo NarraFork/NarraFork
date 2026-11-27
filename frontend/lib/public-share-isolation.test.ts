@@ -61,7 +61,7 @@ describe("public narrator share entry isolation", () => {
 	test("public bootstrap does not install authenticated hosts", () => {
 		const main = entrySource("main.tsx");
 		expect(main).toContain("if (!isPublicShare) installHostBridge()");
-		expect(main).toContain("if (!isPublicShare) void syncPluginUiContributions()");
+		expect(main).not.toContain("syncPluginUiContributions");
 		expect(main).toContain("if (!isPublicShare) cleanupStaleNarratorDockLayouts()");
 	});
 	test("plugin hosts and existing internal notifications stay outside the public branch", () => {
@@ -69,6 +69,8 @@ describe("public narrator share entry isolation", () => {
 		expect(app).toContain("React.useSyncExternalStore(");
 		expect(app).toContain("history.subscribe(notify)");
 		expect(app).toMatch(/isPublicShare \? \(\s*routeContent\s*\) : \(\s*<>\s*<PluginThemeInjector/);
+		expect(app).toContain("<PluginRuntimeShell>{routeContent}</PluginRuntimeShell>");
+		expect(app).toContain("usePluginContributions();");
 		expect(app).toContain("<CoreProviders notifications={!isPublicShare}>");
 		expect(entrySource("components/CoreProviders.tsx")).toContain(
 			"notifications && <AppNotifications />",

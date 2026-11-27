@@ -664,6 +664,30 @@
 			"prevId": "ff0d57da-e8d7-48db-88a7-1e3066eaae33",
 			"version": "7",
 			"snapshotDigest": "5988cdbd02f574a70bd00e258f910cd54341bd2480df10735d1b513262a7f12e"
+		},
+		{
+			"idx": 83,
+			"tag": "0083_terminal_executor_session",
+			"id": "8c8f8481-5557-4bd2-b492-a30ef8532e5d",
+			"prevId": "abeafedc-f054-41e8-b9a0-edc89be12b9b",
+			"version": "7",
+			"snapshotDigest": "6661e27969be1e613d16658d42d6eb0412cfa2dc32409a247f09ce8121c2a7b1"
+		},
+		{
+			"idx": 84,
+			"tag": "0084_team_work_item_dependencies",
+			"id": "33f56901-d084-4512-a9c0-d4eb2669d3a3",
+			"prevId": "8c8f8481-5557-4bd2-b492-a30ef8532e5d",
+			"version": "7",
+			"snapshotDigest": "587f742578638aba9cd456d8611d49ce08927ae0e36528af3de49aeb25890933"
+		},
+		{
+			"idx": 85,
+			"tag": "0085_background_task_executor_session",
+			"id": "4c8df1ee-e212-497f-b798-8e4df0878f06",
+			"prevId": "33f56901-d084-4512-a9c0-d4eb2669d3a3",
+			"version": "7",
+			"snapshotDigest": "3f5bc3a4028f06241299acbe2e8860eaf94f4278fd8d14cff4086cecbb63f968"
 		}
 	]
 }

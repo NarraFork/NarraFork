@@ -22,8 +22,13 @@ const { db } = await import("../../db");
 const { eq } = await import("drizzle-orm");
 const { aclGrants, narrators, projects, users } = await import("../../db/schema");
 const { generateId } = await import("../../lib/id");
-const { canReadNarrator, canWriteNarrator, judgeNarratorAccessBatch, NARRATOR_ACL_COLUMNS } =
-	await import("../narrator-acl");
+const {
+	canReadNarrator,
+	canWriteNarrator,
+	judgeNarratorAccessBatch,
+	judgeNarratorsWriteForPrincipal,
+	NARRATOR_ACL_COLUMNS,
+} = await import("../narrator-acl");
 
 afterAll(() => {
 	if (previousHome === undefined) delete process.env.NARRAFORK_HOME;
@@ -162,6 +167,13 @@ async function expectParity(narratorId: string, label: string) {
 			label,
 			user: principal.userId,
 			...single,
+		});
+		// One principal on many narrators (the project page's 「等你处理」): the same write verdict.
+		const many = await judgeNarratorsWriteForPrincipal([row], principal);
+		expect({ label, user: principal.userId, write: many.verdicts.get(row.id) }).toEqual({
+			label,
+			user: principal.userId,
+			write: single.write,
 		});
 	}
 	return batch;

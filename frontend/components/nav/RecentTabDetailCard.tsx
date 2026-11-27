@@ -25,6 +25,7 @@ import {
 	IconCopy,
 	IconFolder,
 	IconFolderPlus,
+	IconGitMerge,
 	IconHourglass,
 	IconMessages,
 	IconPencil,
@@ -178,6 +179,7 @@ export function RecentTabDetails({ tab, compact = false }: { tab: RecentTab; com
 			? getEffectiveNarratorDisplay(tab.status ?? "idle", tab.substatus)
 			: null;
 	const pendingApprovals = tab.type === "team" ? (tab.pendingApprovalCount ?? 0) : 0;
+	const readyItems = tab.type === "team" ? (tab.readyItemCount ?? 0) : 0;
 	const viewerCount = tab.viewerCount ?? tab.viewers?.length ?? 0;
 	const terminals = tab.activeTerminalCount ?? 0;
 	const work = tab.activeBackgroundWorkCount ?? tab.activeBackgroundTaskCount ?? 0;
@@ -224,6 +226,11 @@ export function RecentTabDetails({ tab, compact = false }: { tab: RecentTab; com
 			{pendingApprovals > 0 && (
 				<DetailLine icon={<IconShieldQuestion size={12} />}>
 					{tt("recentTabTeamPendingApprovals", { count: pendingApprovals })}
+				</DetailLine>
+			)}
+			{readyItems > 0 && (
+				<DetailLine icon={<IconGitMerge size={12} />}>
+					{tt("recentTabTeamReadyItems", { count: readyItems })}
 				</DetailLine>
 			)}
 			{terminals > 0 && (

@@ -9,6 +9,8 @@ export class BackgroundBashLifecycle {
 	>();
 	private stopped = false;
 	private preserving = false;
+	/** Tasks detached at shutdown (their process outlives this server). */
+	private preservedTasks = new Set<string>();
 	private failed = 0;
 
 	get isStopped(): boolean {
@@ -28,8 +30,16 @@ export class BackgroundBashLifecycle {
 		return new Set([...this.collectors.values()].map((entry) => entry.taskId));
 	}
 
+	/** Leave one task's process and row to the next server, whatever the shutdown mode. */
+	preserveTask(taskId: string): void {
+		this.preservedTasks.add(taskId);
+		this.changed.resolve();
+		this.changed = Promise.withResolvers<void>();
+	}
+
 	/** Only dispatched processes are preserved; admitted setup must still settle its task row. */
 	canStartTerminal(taskId: string): boolean {
+		if (this.preservedTasks.has(taskId)) return false;
 		return (
 			!this.preserving ||
 			![...this.collectors.values()].some(
@@ -95,7 +105,9 @@ export class BackgroundBashLifecycle {
 		return new Set([
 			...this.terminals,
 			...[...this.collectors].flatMap(([work, entry]) =>
-				this.preserving && entry.processStarted ? [] : [work],
+				(this.preserving && entry.processStarted) || this.preservedTasks.has(entry.taskId)
+					? []
+					: [work],
 			),
 		]);
 	}

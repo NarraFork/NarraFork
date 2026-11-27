@@ -1,11 +1,12 @@
 /**
  * The team page's components rendered with the real Mantine and both locales (the redesign R):
  * the header's status sentence, people and 全部暂停 (members only, kept while an archived team's
- * workers run); 「等你处理」 cards of each kind, folded past three, 合并 shown disabled; the work
+ * workers run); 「等你处理」 cards of each kind, folded past three, 合并 with its states (M); the work
  * list's groups and rows, its starting and wrap-up states, read-only 「等成员处理」; the activity
  * words each event; every `teams` string exists in both languages.
  */
 import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { MantineProvider } from "@mantine/core";
 import type {
 	TeamActivityPage,
@@ -13,7 +14,8 @@ import type {
 	TeamMembersResponse,
 	TeamPageSummary,
 	TeamPendingApproval,
-	TeamSummary,
+	TeamWorkItemDetail,
+	TeamWorkPullRequest,
 } from "@shared/project-teams";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
@@ -32,12 +34,13 @@ import enNarrator from "../../locales/en/narrator.json";
 import en from "../../locales/en/projects.json";
 import zhNarrator from "../../locales/zh-CN/narrator.json";
 import zh from "../../locales/zh-CN/projects.json";
-import { ProjectTeamsList } from "./ProjectTeamsList";
 import { ActivityLine, TeamActivity } from "./TeamActivity";
 import { TeamAttention } from "./TeamAttention";
+import { TeamCoordinatorHeader } from "./TeamCoordinatorHeader";
 import { TeamHeader } from "./TeamHeader";
 import { TeamMembersPanel } from "./TeamMembers";
 import { TeamReadOnlyStart, TeamStart } from "./TeamStart";
+import { DependencySections, ReviewFindings } from "./TeamWorkDrawer";
 import { TeamWorkList } from "./TeamWorkList";
 import { attentionEntries, statusSentence, teamPageMode } from "./team-page-model";
 
@@ -237,6 +240,15 @@ describe("等你处理", () => {
 			reviewRounds: 2,
 			title: "Fix the CSV time zone",
 			branch: "team/csv-tz",
+			merge: {
+				mode: "github",
+				phase: null,
+				job: null,
+				outcome: null,
+				canMerge: false,
+				disabledReason: "gh_logged_out",
+				pr: null,
+			},
 		}),
 	];
 	const attention = (approvals: TeamPendingApproval[], lng: "en" | "zh-CN" = "en", phone = false) =>
@@ -245,6 +257,7 @@ describe("等你处理", () => {
 				entries={attentionEntries({ member: true, approvals, items })}
 				phone={phone}
 				teamId="lead"
+				projectId="p"
 				base="main"
 				stats={{ r: { added: 42, removed: 11, files: 5, binaryFiles: 0, truncated: false } }}
 				onOpenItem={noop}
@@ -268,11 +281,11 @@ describe("等你处理", () => {
 		expect(html).not.toContain("team-attention");
 	});
 
-	test("a tool call: who, the command, deny / approve; a ready item: +/-, files, verdict, branch, merge disabled", async () => {
+	test("a tool call: who, the command, deny / approve; a ready item: +/-, files, verdict, branch, merge disabled on GitHub", async () => {
 		const html = await attention([call()]);
 		expect(html).toContain('data-kind="tool"');
 		expect(html).toContain("Add the board");
-		expect(html).toContain("the worker asks to run Bash");
+		expect(html).toContain("the worker asks to run a command");
 		expect(html).toContain("pnpm --filter web add @acme/pay-sdk@3.2.0");
 		expect(html).toContain('data-testid="team-approval-deny"');
 		expect(html).toContain('data-testid="team-approval-approve"');
@@ -284,7 +297,10 @@ describe("等你处理", () => {
 		expect(html).toContain("team/csv-tz → main");
 		expect(html).toContain('data-testid="team-merge-view"');
 		expect(html).toContain('data-testid="team-merge-return"');
-		expect(html).toMatch(/<button[^>]*disabled=""[^>]*data-testid="team-merge"/);
+		expect(html).toMatch(/<button[^>]*disabled=""[^>]*data-testid="team-merge-button"/);
+		expect(html).toContain('data-reason="gh_logged_out"');
+		expect(html).toContain('data-merge-label="openPr"');
+		expect(html).toContain("Open a pull request");
 		expect(html).toContain('data-testid="team-attention-count"');
 	});
 
@@ -409,7 +425,7 @@ describe("work list", () => {
 		expect(groups).toEqual(["needsYou", "inProgress", "review"]);
 		expect(html).toContain("需要你");
 		expect(html).toContain("评审 · 就绪");
-		expect(html).toContain("等批准 Bash");
+		expect(html).toContain("等批准运行命令");
 		expect(html).toContain("+214");
 		expect(html).toContain("运行");
 		expect(html).toContain("pnpm test api/auth");
@@ -533,52 +549,6 @@ describe("members (M1)", () => {
 		expect(zhHtml).toContain("旁观者");
 		expect(zhHtml).toContain("所有者");
 		expect(zhHtml).toContain("最近没有发言");
-	});
-});
-
-describe("project teams list", () => {
-	test("an archived team's row offers no pin; an active team's row does", async () => {
-		const row = (id: string, patch: Partial<TeamSummary> = {}): TeamSummary => ({
-			id,
-			projectId: "p",
-			name: id,
-			baseBranch: "main",
-			status: "active",
-			coordinatorStatus: "idle",
-			createdBy: null,
-			createdAt: "2026-11-18T00:00:00.000Z",
-			updatedAt: "2026-11-18T00:00:00.000Z",
-			access: "write",
-			briefBytes: 0,
-			...patch,
-		});
-		const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-		// A cached page that outlived an archive (the list asks for active teams only).
-		client.setQueryData(teamKeys.list("p"), {
-			pages: [
-				{
-					teams: [
-						row("live"),
-						row("gone", { status: "archived", coordinatorStatus: "archived" }),
-						row("going", { coordinatorStatus: "archived" }),
-					],
-					nextCursor: null,
-				},
-			],
-			pageParams: [undefined],
-		});
-		const html = await render(
-			<ProjectTeamsList projectId="p" canCreate={false} onOpenTeam={() => {}} />,
-			client,
-		);
-		const rows = [...html.matchAll(/data-team-id="([^"]+)"(.*?)(?=data-team-id=|$)/gs)].map(
-			(match) => [match[1], match[2].includes('data-testid="pin-to-sidebar"')],
-		);
-		expect(rows).toEqual([
-			["live", true],
-			["gone", false],
-			["going", false],
-		]);
 	});
 });
 
@@ -928,7 +898,10 @@ describe("questions keep their context", () => {
 	});
 
 	test("a refused base branch has its own words in both languages", async () => {
-		const { settingsErrorKey } = await import("./TeamSettingsModal");
+		const { settingsErrorKey, workStartPatch } = await import("./TeamSettingsModal");
+		// W: only the work start key is sent; the default removes it (the server merges).
+		expect(workStartPatch("remote")).toEqual({ workStart: "remote" });
+		expect(workStartPatch("default")).toEqual({ workStart: null });
 		const key = settingsErrorKey({ data: { code: "TEAM_BASE_BRANCH_UNRESOLVED" } });
 		expect(key).toBe("teams.page.settings.errors.TEAM_BASE_BRANCH_UNRESOLVED");
 		expect(settingsErrorKey({ data: { code: "OTHER" } })).toBeNull();
@@ -938,5 +911,781 @@ describe("questions keep their context", () => {
 			expect(text).toContain("mian");
 			expect(text).not.toContain("teams.page");
 		}
+	});
+});
+
+describe("dependencies (D)", () => {
+	const dep = (id: string, title: string, state: TeamBoardItem["state"]) => ({ id, title, state });
+	const rows = (items: TeamBoardItem[], lng: "en" | "zh-CN") =>
+		render(
+			<TeamWorkList
+				projectId="p"
+				teamId="lead"
+				summary={summary()}
+				items={items}
+				approvals={[]}
+				stats={{}}
+				base="main"
+				loading={false}
+				failed={false}
+				hasMore={false}
+				onLoadMore={noop}
+				highlightId={null}
+				mode={teamPageMode(summary())}
+				archiving={false}
+				onArchive={noop}
+				onDisband={noop}
+				onOpenItem={noop}
+			/>,
+			new QueryClient(),
+			lng,
+		);
+
+	test("a blocked queued row names what it waits for, or how many; a cancelled one says so", async () => {
+		const queued = (id: string, dependsOn: TeamBoardItem["dependsOn"]) =>
+			item({ id, state: "queued", worker: null, dependsOn });
+		const zhHtml = await rows(
+			[
+				queued("one", [dep("a", "数据表", "in_progress")]),
+				queued("two", [dep("a", "数据表", "ready"), dep("b", "接口", "queued")]),
+				queued("many", [
+					dep("a", "A", "queued"),
+					dep("b", "B", "queued"),
+					dep("c", "C", "queued"),
+					dep("d", "D", "merged"),
+				]),
+				queued("gone", [dep("x", "旧方案", "cancelled")]),
+				queued("free", [dep("d", "D", "merged")]),
+			],
+			"zh-CN",
+		);
+		expect(zhHtml).toContain("排队 · 等「数据表」合并");
+		expect(zhHtml).toContain("排队 · 等「数据表」「接口」合并");
+		expect(zhHtml).toContain("排队 · 等 3 项合并");
+		expect(zhHtml).toContain("排队 · 依赖「旧方案」已取消");
+		const enHtml = await rows(
+			[queued("two", [dep("a", "Schema", "queued"), dep("b", "API", "queued")])],
+			"en",
+		);
+		expect(enHtml).toContain("Queued · waiting for “Schema” and “API” to merge");
+	});
+
+	const detail = (patch: Partial<TeamWorkItemDetail> = {}): TeamWorkItemDetail => ({
+		item: item({
+			id: "w2",
+			state: "queued",
+			worker: null,
+			dependsOn: [dep("a", "数据表", "merged"), dep("b", "旧方案", "cancelled")],
+		}),
+		base: "main",
+		aheadBy: 0,
+		stat: null,
+		files: [],
+		filesMore: false,
+		diffAvailable: false,
+		reviews: [],
+		events: [],
+		eventsMore: false,
+		canReturn: false,
+		dependents: [dep("c", "页面", "queued")],
+		dependentsMore: true,
+		...patch,
+	});
+
+	test("the drawer lists dependencies with their state, warns about a cancelled one, and lists dependents", async () => {
+		const opened: string[] = [];
+		const html = await render(
+			<DependencySections detail={detail()} onOpenItem={(id) => opened.push(id)} />,
+			new QueryClient(),
+			"zh-CN",
+		);
+		expect(html).toContain('data-testid="team-drawer-dependencies"');
+		expect(html).toContain("依赖");
+		expect(html).toContain('data-state="merged"');
+		expect(html).toContain("已合并");
+		expect(html).toContain('data-testid="team-dependency-cancelled"');
+		expect(html).toContain("「旧方案」已取消，永远不会合并");
+		expect(html).toContain('data-testid="team-drawer-dependents"');
+		expect(html).toContain("被依赖");
+		expect(html).toContain("页面");
+		expect(html).toContain("依赖它的工作项比这里列出的多");
+		// Titles are buttons that open the item in the drawer.
+		expect(html.match(/<button/g)?.length).toBe(3);
+
+		const waiting = await render(
+			<DependencySections
+				detail={detail({
+					item: item({ state: "queued", worker: null, dependsOn: [dep("a", "Schema", "ready")] }),
+					dependents: [],
+					dependentsMore: false,
+				})}
+			/>,
+			new QueryClient(),
+			"en",
+		);
+		expect(waiting).toContain("Ready to merge");
+		expect(waiting).toContain("Starts once every item here is merged into main.");
+		expect(waiting).not.toContain("team-dependency-cancelled");
+		expect(waiting).not.toContain("team-drawer-dependents");
+		const none = await render(
+			<DependencySections detail={detail({ item: item(), dependents: [] })} />,
+		);
+		expect(none).not.toContain("data-testid");
+	});
+
+	test("the activity words dependency changes and unblocks", async () => {
+		const event = (kind: string, detailValue: Record<string, unknown>) => ({
+			id: kind,
+			kind,
+			workItemId: "w2",
+			workItemTitle: "API",
+			actorKind: "agent" as const,
+			actorId: "lead",
+			actorName: "Release crew",
+			detail: detailValue,
+			detailOmitted: false,
+			createdAt: "2026-11-18T00:00:01.000Z",
+		});
+		const html = await render(
+			<>
+				<ActivityLine event={event("work.dependencies_changed", { dependsOn: ["a", "b"] })} />
+				<ActivityLine event={event("work.unblocked", { mergedItem: "a", dependsOn: ["a"] })} />
+			</>,
+			new QueryClient(),
+			"zh-CN",
+		);
+		expect(html).toContain("修改依赖");
+		// The event keeps only ids, not which were merged then: the count is worded neutrally.
+		expect(html).toContain("依赖 2 项");
+		expect(html).not.toContain("项合并");
+		expect(html).toContain("可以开始了");
+		expect(html).toContain("依赖的工作项都已合并");
+	});
+});
+
+describe("review findings", () => {
+	test("muted text clamped to three lines, 展开 when long, a note when cut", async () => {
+		const short = await render(
+			<ReviewFindings text="缺少跨日边界用例" clipped={false} />,
+			undefined,
+			"zh-CN",
+		);
+		expect(short).toContain("缺少跨日边界用例");
+		expect(short).toContain("--text-line-clamp:3");
+		expect(short).not.toContain("team-review-findings-toggle");
+		const long = await render(
+			<ReviewFindings text={"x".repeat(300)} clipped />,
+			undefined,
+			"zh-CN",
+		);
+		expect(long).toContain("team-review-findings-toggle");
+		expect(long).toContain("展开");
+		expect(long).toContain("评审意见合计太长");
+		const gone = await render(<ReviewFindings text={null} clipped />);
+		expect(gone).toContain("The findings are too long in all");
+	});
+});
+
+describe("the coordinator's column header", () => {
+	const agent = (id: string, status = "working") => ({ id, title: id, status });
+	test("协调者 · N 个会话在运行 · 完整会话, in place of the session toolbar", async () => {
+		const running = summary({
+			coordinatorStatus: "working",
+			runningAgents: [agent("lead"), agent("w1"), agent("w2"), agent("w3"), agent("w4")],
+			runningCount: 5,
+		});
+		const zhHtml = await render(
+			<TeamCoordinatorHeader summary={running} onOpenCoordinatorSession={() => {}} />,
+			undefined,
+			"zh-CN",
+		);
+		expect(zhHtml).toContain("协调者");
+		expect(zhHtml).toContain("4 个会话在运行");
+		expect(zhHtml).not.toContain("工作者");
+		expect(zhHtml).toContain("完整会话");
+		expect(zhHtml).toContain('data-tone="blue"');
+		const html = await render(<TeamCoordinatorHeader summary={running} />);
+		expect(html).toContain("4 sessions running");
+		// No way to the full session given: no link.
+		expect(html).not.toContain("team-coordinator-full-session");
+		const idle = await render(
+			<TeamCoordinatorHeader summary={summary()} onOpenCoordinatorSession={() => {}} />,
+			undefined,
+			"zh-CN",
+		);
+		expect(idle).toContain("空闲");
+		expect(idle).toContain('data-kind="status"');
+	});
+
+	test("a list cut down to the coordinator still reads 1+, never 0+", async () => {
+		const cut = summary({ runningAgents: [agent("lead")], runningCount: 2 });
+		const zhHtml = await render(<TeamCoordinatorHeader summary={cut} />, undefined, "zh-CN");
+		expect(zhHtml).toContain("1+ 个会话在运行");
+		expect(zhHtml).not.toContain("0+");
+		expect(await render(<TeamCoordinatorHeader summary={cut} />)).toContain("1+ sessions running");
+	});
+
+	test("连接断开 while the panel's socket is down, nothing while it is up", async () => {
+		const down = { disconnected: true, reconnect: () => {} };
+		const zhHtml = await render(
+			<TeamCoordinatorHeader summary={summary()} connection={down} />,
+			undefined,
+			"zh-CN",
+		);
+		expect(zhHtml).toContain("team-coordinator-disconnected");
+		expect(zhHtml).toContain("连接断开");
+		expect(zhHtml).toContain('title="点击重新连接"');
+		const html = await render(<TeamCoordinatorHeader summary={summary()} connection={down} />);
+		expect(html).toContain("Disconnected");
+		for (const connection of [undefined, null, { ...down, disconnected: false }]) {
+			const upHtml = await render(
+				<TeamCoordinatorHeader summary={summary()} connection={connection} />,
+			);
+			expect(upHtml).not.toContain("team-coordinator-disconnected");
+		}
+	});
+
+	test("the session page keeps its toolbar: only the team route leaves it out", () => {
+		const panel = readFileSync(new URL("../narrator/NarratorPanel.tsx", import.meta.url), "utf8");
+		expect(panel).toContain("hideHeader = false,");
+		expect(panel).toMatch(/\{!hideHeader && \(\s*<NarratorHeaderLayout/);
+		const route = readFileSync(
+			new URL("../../routes/projects/$projectId_.teams.$teamId.tsx", import.meta.url),
+			"utf8",
+		);
+		expect(route).toMatch(/\bhideHeader\b/);
+		// The hidden header's 「连接断开」 reaches the coordinator line through the panel's report.
+		expect(route).toMatch(/onConnectionChange=\{onConnectionChange\}/);
+		expect(route).toMatch(/onConnectionChange=\{setConnection\}/);
+		expect(route).toMatch(/conversationConnection=\{connection\}/);
+		expect(panel).toContain(
+			"useReportPanelConnection(onConnectionChange, disconnected && !isWorkspacePreview, reconnect);",
+		);
+		const session = readFileSync(
+			new URL("../../routes/narrators/$narratorId.tsx", import.meta.url),
+			"utf8",
+		);
+		expect(session).not.toMatch(/\bhideHeader\b/);
+	});
+});
+
+describe("merge (M)", () => {
+	const ready = (merge: TeamBoardItem["merge"]) =>
+		item({
+			id: "r",
+			state: "ready",
+			lastReview: "clear",
+			reviewRounds: 1,
+			title: "Ship it",
+			branch: "team/ship",
+			worker: null,
+			merge,
+		});
+	const card = (merge: TeamBoardItem["merge"], lng: "en" | "zh-CN" = "en") =>
+		render(
+			<TeamAttention
+				entries={attentionEntries({ member: true, approvals: [], items: [ready(merge)] })}
+				phone={false}
+				teamId="lead"
+				projectId="p"
+				base="main"
+				stats={undefined}
+				onOpenItem={noop}
+			/>,
+			new QueryClient(),
+			lng,
+		);
+	const idle = {
+		mode: "local" as const,
+		phase: null,
+		job: null,
+		outcome: null,
+		canMerge: true,
+		disabledReason: null,
+	};
+
+	test("the card: 合并到 base enabled; 正在合并… while a job runs; outcomes as badges", async () => {
+		const enabled = await card(idle, "zh-CN");
+		expect(enabled).toContain("合并到 main");
+		expect(enabled).not.toMatch(/<button[^>]*disabled=""[^>]*data-testid="team-merge-button"/);
+		const running = await card(
+			{ ...idle, phase: "merging", job: "merge", canMerge: false, disabledReason: "merging" },
+			"zh-CN",
+		);
+		expect(running).toContain("正在合并…");
+		expect(running).toContain('data-merge-label="merging"');
+		const conflict = await card({ ...idle, outcome: "conflict" }, "zh-CN");
+		expect(conflict).toContain('data-outcome="conflict"');
+		expect(conflict).toContain("与 main 有冲突");
+		const prepared = await card({ ...idle, outcome: "prepared" }, "zh-CN");
+		expect(prepared).toContain('data-outcome="prepared"');
+		expect(prepared).toContain('data-testid="team-merge-open-prepared"');
+		expect(prepared).toContain("重新准备");
+	});
+
+	test("disabled reasons say why, in both languages", async () => {
+		for (const reason of [
+			"worker_running",
+			"gh_missing",
+			"gh_logged_out",
+			"gh_no_permission",
+			"gh_repo_archived",
+			"gh_unavailable",
+			"git_too_old",
+			"base_remote",
+			"checking",
+		] as const) {
+			const html = await card({ ...idle, canMerge: false, disabledReason: reason }, "zh-CN");
+			expect(html).toContain(`data-reason="${reason}"`);
+			expect(html).toMatch(/<button[^>]*disabled=""[^>]*data-testid="team-merge-button"/);
+		}
+		expect(zh.teams.page.merge.disabled.gh_logged_out).toBe("在主机上运行 gh auth login");
+		expect(zh.teams.page.merge.disabled.gh_no_permission).toBe("gh 账号对该仓库没有写权限");
+		expect(JSON.stringify(zh)).not.toContain("PR 流程即将提供");
+	});
+
+	test("the drawer's outcome: conflicts with 退回, a failure in words, a prepared merge with its command", async () => {
+		const { MergeOutcome } = await import("./TeamMerge");
+		const view = (detail: NonNullable<TeamWorkItemDetail["merge"]>["detail"], extra = {}) => ({
+			...idle,
+			outcome: detail?.kind === "prepared" ? ("prepared" as const) : ("conflict" as const),
+			detail,
+			...extra,
+		});
+		const outcome = (
+			merge: NonNullable<TeamWorkItemDetail["merge"]>,
+			lng: "en" | "zh-CN" = "zh-CN",
+		) =>
+			render(
+				<MergeOutcome
+					projectId="p"
+					teamId="lead"
+					itemId="r"
+					base="main"
+					merge={merge}
+					canReturn
+					onReturn={noop}
+				/>,
+				new QueryClient(),
+				lng,
+			);
+		const conflict = await outcome(
+			view({
+				kind: "failed",
+				code: "conflict",
+				message: null,
+				conflicts: ["src/a.ts", "src/b.ts"],
+				more: true,
+				at: "2026-11-25T00:00:00.000Z",
+			}),
+		);
+		expect(conflict).toContain('data-testid="team-merge-conflicts"');
+		expect(conflict).toContain("src/b.ts");
+		expect(conflict).toContain("冲突的文件比这里列出的多");
+		expect(conflict).toContain('data-testid="team-merge-conflict-return"');
+		const failed = await outcome(
+			view({
+				kind: "failed",
+				code: "TEAM_MERGE_BASE_MOVED",
+				message: "main kept moving",
+				at: "2026-11-25T00:00:00.000Z",
+			}),
+			"en",
+		);
+		expect(failed).toContain('data-code="TEAM_MERGE_BASE_MOVED"');
+		expect(failed).toContain("The base kept moving");
+		const prepared = await outcome(
+			view(
+				{
+					kind: "prepared",
+					mergeCommit: "a".repeat(40),
+					baseSha: "b".repeat(40),
+					checkedOutAt: "/home/alice/app",
+					at: "2026-11-25T00:00:00.000Z",
+				},
+				{
+					fastForward: {
+						available: true,
+						blocker: null,
+						runningSessions: 0,
+						terminals: 1,
+						command: {
+							sh: "git -C /home/alice/app merge --ff-only --no-autostash --no-overwrite-ignore abc",
+							powershell:
+								"if ((git -C '/home/alice/app' symbolic-ref --quiet HEAD) -ceq 'refs/heads/main') { git -C '/home/alice/app' merge --ff-only abc }",
+							preferred: "powershell",
+						},
+						files: ["src/a.ts", "upstream/u.ts"],
+						filesMore: false,
+					},
+				},
+			),
+		);
+		expect(prepared).toContain(
+			"合并结果已准备好。main 检出在 /home/alice/app，NarraFork 不改动那里的文件。",
+		);
+		expect(prepared).toContain('data-testid="team-merge-fast-forward"');
+		expect(prepared).toContain("在该目录中快进");
+		// The server's platform picks the shell shown first (PowerShell here); both are labelled.
+		expect(prepared).toContain('data-shell="powershell"');
+		expect(prepared).toContain("-ceq &#x27;refs/heads/main&#x27;");
+		expect(prepared).toContain("Git Bash / sh");
+		expect(prepared).toContain("PowerShell");
+		expect(prepared).toContain('data-testid="team-merge-copy"');
+		const blocked = await outcome(
+			view(
+				{
+					kind: "prepared",
+					mergeCommit: "a".repeat(40),
+					baseSha: "b".repeat(40),
+					checkedOutAt: "/home/alice/app",
+					at: "2026-11-25T00:00:00.000Z",
+				},
+				{
+					fastForward: {
+						available: false,
+						blocker: "sessions_running",
+						runningSessions: 2,
+						terminals: 0,
+						command: {
+							sh: "git -C /home/alice/app merge --ff-only --no-autostash --no-overwrite-ignore abc",
+							powershell:
+								"if ((git -C '/home/alice/app' symbolic-ref --quiet HEAD) -ceq 'refs/heads/main') { git -C '/home/alice/app' merge --ff-only abc }",
+							preferred: "powershell",
+						},
+						files: ["src/a.ts", "upstream/u.ts"],
+						filesMore: false,
+					},
+				},
+			),
+		);
+		expect(blocked).toMatch(/<button[^>]*disabled=""[^>]*data-testid="team-merge-fast-forward"/);
+		// A refused fast-forward keeps the prepared merge, with git's files and the command (review 11).
+		const refused = await outcome(
+			view(
+				{
+					kind: "prepared",
+					mergeCommit: "a".repeat(40),
+					baseSha: "b".repeat(40),
+					checkedOutAt: "/home/alice/app",
+					at: "2026-11-25T00:00:00.000Z",
+					fastForwardFailure: {
+						code: "TEAM_MERGE_FAST_FORWARD_REFUSED",
+						message: "error: Your local changes would be overwritten",
+						files: ["src/a.ts", "src/b.ts"],
+						at: "2026-11-25T00:01:00.000Z",
+					},
+				},
+				{
+					fastForward: {
+						available: true,
+						blocker: null,
+						runningSessions: 0,
+						terminals: 0,
+						command: {
+							sh: "git -C /home/alice/app merge --ff-only --no-autostash --no-overwrite-ignore abc",
+							powershell:
+								"if ((git -C '/home/alice/app' symbolic-ref --quiet HEAD) -ceq 'refs/heads/main') { git -C '/home/alice/app' merge --ff-only abc }",
+							preferred: "powershell",
+						},
+						files: ["src/a.ts", "upstream/u.ts"],
+						filesMore: false,
+					},
+				},
+			),
+		);
+		expect(refused).toContain('data-code="TEAM_MERGE_FAST_FORWARD_REFUSED"');
+		expect(refused).toContain("src/b.ts");
+		expect(refused).toContain('data-testid="team-merge-fast-forward"');
+		expect(refused).toContain('data-testid="team-merge-command"');
+		expect(blocked).toContain("那里有 2 个会话在运行");
+		// Off the base the blocker shows and no command is offered (Devin 2).
+		const offBase = await outcome(
+			view(
+				{
+					kind: "prepared",
+					mergeCommit: "a".repeat(40),
+					baseSha: "b".repeat(40),
+					checkedOutAt: "/home/alice/app",
+					at: "2026-11-25T00:00:00.000Z",
+				},
+				{
+					fastForward: {
+						available: false,
+						blocker: "not_on_base",
+						runningSessions: 0,
+						terminals: 0,
+						command: null,
+						files: [],
+						filesMore: false,
+					},
+				},
+			),
+		);
+		expect(offBase).toContain('data-testid="team-merge-blocker"');
+		expect(offBase).not.toContain('data-testid="team-merge-command"');
+	});
+});
+
+describe("pull requests (G)", () => {
+	const pr = (over: Partial<TeamWorkPullRequest> = {}): TeamWorkPullRequest => ({
+		number: 7,
+		url: "https://github.com/acme/app/pull/7",
+		repository: "github.com/acme/app",
+		state: "OPEN",
+		isDraft: false,
+		headMatches: true,
+		mergeState: "CLEAN",
+		review: null,
+		checks: {
+			state: "passing",
+			pass: 2,
+			fail: 0,
+			pending: 0,
+			skipping: 0,
+			total: 2,
+			failures: [],
+		},
+		queued: false,
+		checkedAt: "2026-11-25T00:00:00.000Z",
+		refreshing: false,
+		error: null,
+		methods: ["squash", "merge"],
+		canMergePr: true,
+		mergeBlocker: null,
+		canRefresh: true,
+		...over,
+	});
+	const github = (over: Record<string, unknown> = {}) =>
+		({
+			mode: "github" as const,
+			phase: null,
+			job: null,
+			outcome: null,
+			canMerge: true,
+			disabledReason: null,
+			pr: null,
+			...over,
+		}) as NonNullable<TeamBoardItem["merge"]>;
+	const card = (merge: TeamBoardItem["merge"], lng: "en" | "zh-CN" = "zh-CN") =>
+		render(
+			<TeamAttention
+				entries={attentionEntries({
+					member: true,
+					approvals: [],
+					items: [
+						item({
+							id: "r",
+							state: "ready",
+							lastReview: "clear",
+							reviewRounds: 1,
+							title: "Ship it",
+							branch: "team/ship",
+							worker: null,
+							merge,
+						}),
+					],
+				})}
+				phone={false}
+				teamId="lead"
+				projectId="p"
+				base="main"
+				stats={undefined}
+				onOpenItem={noop}
+			/>,
+			new QueryClient(),
+			lng,
+		);
+	const disabled = (testId: string) =>
+		new RegExp(`<button[^>]*disabled=""[^>]*data-testid="${testId}"`);
+
+	test("发起 PR, then 正在推送分支… / 正在创建 PR…; 更新 PR after a re-ready; 重新发起 PR when closed", async () => {
+		const start = await card(github());
+		expect(start).toContain("发起 PR");
+		expect(start).toContain('data-merge-label="openPr"');
+		expect(start).not.toMatch(disabled("team-merge-button"));
+		expect(await card(github({ phase: "pushing", job: "pull_request" }))).toContain(
+			"正在推送分支…",
+		);
+		expect(await card(github({ phase: "opening", job: "pull_request" }))).toContain("正在创建 PR…");
+		const update = await card(github({ pr: pr({ headMatches: false }) }));
+		expect(update).toContain("更新 PR");
+		expect(update).toContain("查看 PR #7");
+		expect(update).not.toContain('data-testid="team-pr-merge"');
+		const closed = await card(github({ pr: pr({ state: "CLOSED" }) }));
+		expect(closed).toContain("重新发起 PR");
+		expect(closed).toContain("已关闭");
+	});
+
+	test("查看 PR #N with its labels; 合并 PR with a menu of methods; enabled only when GitHub can merge", async () => {
+		const html = await card(github({ pr: pr({ review: "APPROVED" }) }));
+		expect(html).toContain("查看 PR #7");
+		expect(html).toContain('href="https://github.com/acme/app/pull/7"');
+		expect(html).toContain('rel="noopener noreferrer"');
+		expect(html).toContain("CI 通过");
+		expect(html).toContain("已批准");
+		expect(html).toContain("合并 PR");
+		expect(html).toContain("压缩合并");
+		expect(html).toContain('data-testid="team-pr-method"');
+		expect(html).toContain('data-method="squash"');
+		expect(html).not.toMatch(disabled("team-pr-merge"));
+		// The main button is gone: the pull request is current.
+		expect(html).not.toContain('data-testid="team-merge-button"');
+		// One method: no menu.
+		const single = await card(github({ pr: pr({ methods: ["merge"] }) }));
+		expect(single).not.toContain('data-testid="team-pr-method"');
+		expect(single).toContain('data-method="merge"');
+		const cases: Array<[Partial<TeamWorkPullRequest>, string, string]> = [
+			[{ mergeState: "BLOCKED", review: "REVIEW_REQUIRED" }, "blocked", "需要评审"],
+			[{ mergeState: "BEHIND" }, "behind", "落后于 main"],
+			[{ mergeState: "DIRTY" }, "dirty", "有冲突"],
+			[{ isDraft: true, mergeState: "DRAFT" }, "draft", "草稿"],
+			[{ mergeState: "UNKNOWN" }, "unknown", "合并 PR"],
+			[{ queued: true }, "queued", "已加入合并队列"],
+			[
+				{
+					checks: {
+						state: "failing",
+						pass: 1,
+						fail: 3,
+						pending: 0,
+						skipping: 0,
+						total: 4,
+						failures: [],
+					},
+					mergeState: "BLOCKED",
+				},
+				"blocked",
+				"3 项失败",
+			],
+			[
+				{
+					checks: {
+						state: "pending",
+						pass: 1,
+						fail: 0,
+						pending: 2,
+						skipping: 0,
+						total: 3,
+						failures: [],
+					},
+					mergeState: "BLOCKED",
+				},
+				"blocked",
+				"2 项进行中",
+			],
+			[{ review: "CHANGES_REQUESTED", mergeState: "BLOCKED" }, "blocked", "要求修改"],
+		];
+		for (const [over, blocker, words] of cases) {
+			const view = await card(
+				github({ pr: pr({ ...over, canMergePr: false, mergeBlocker: blocker as never }) }),
+			);
+			expect({ blocker, disabled: disabled("team-pr-merge").test(view) }).toEqual({
+				blocker,
+				disabled: true,
+			});
+			expect({ blocker, words: view.includes(words) }).toEqual({ blocker, words: true });
+		}
+		expect(await card(github({ pr: pr({ state: null }) }))).toContain("检查中…");
+		const en = await card(github({ pr: pr({ checks: null }) }), "en");
+		expect(en).toContain("View PR #7");
+		expect(en).toContain("Merge the pull request");
+	});
+
+	test("GitHub but gh cannot serve it: 发起 PR disabled with the reason, in both languages", async () => {
+		for (const [reason, words] of [
+			["gh_missing", "主机上没有 gh"],
+			["gh_logged_out", "在主机上运行 gh auth login"],
+			["gh_no_permission", "gh 账号对该仓库没有写权限"],
+			["gh_repo_archived", "已归档"],
+			["gh_unavailable", "gh 读不到这个仓库"],
+		] as const) {
+			const html = await card(github({ canMerge: false, disabledReason: reason }));
+			expect(html).toMatch(disabled("team-merge-button"));
+			expect(html).toContain(`data-reason="${reason}"`);
+			expect(zh.teams.page.merge.disabled[reason]).toContain(words);
+			expect(typeof en.teams.page.merge.disabled[reason]).toBe("string");
+		}
+	});
+
+	test("review 1: 发起 PR asks a manager to confirm the repository; the buttons name it; a changed origin links to the settings", async () => {
+		const unpinned = await card(
+			github({ github: { target: "github.com/acme/app", pinned: null, canConfirm: true } }),
+		);
+		expect(unpinned).toContain('data-confirm="github"');
+		expect(unpinned).toContain("发起 PR · acme/app");
+		const pinned = await card(
+			github({
+				pr: pr(),
+				github: { target: "github.com/acme/app", pinned: "github.com/acme/app", canConfirm: false },
+			}),
+		);
+		expect(pinned).not.toContain("data-confirm");
+		expect(pinned).toContain("合并 PR");
+		expect(pinned).toContain("acme/app");
+		const changed = await card(
+			github({
+				canMerge: false,
+				disabledReason: "github_target_changed",
+				github: {
+					target: "github.com/attacker/app",
+					pinned: "github.com/acme/app",
+					canConfirm: true,
+				},
+			}),
+		);
+		expect(changed).toContain('data-reason="github_target_changed"');
+		expect(changed).toContain('data-testid="team-merge-settings-link"');
+		expect(changed).toContain("打开项目设置");
+		expect(zh.teams.page.merge.confirmGithubText).toContain("将推送到 {{target}} 并在那里开 PR");
+	});
+
+	test("the drawer: failed checks linked, a rejected push offers 退回", async () => {
+		const { MergeOutcome } = await import("./TeamMerge");
+		const outcome = (merge: NonNullable<TeamWorkItemDetail["merge"]>) =>
+			render(
+				<MergeOutcome
+					projectId="p"
+					teamId="lead"
+					itemId="r"
+					base="main"
+					merge={merge}
+					canReturn
+					onReturn={noop}
+				/>,
+				new QueryClient(),
+				"zh-CN",
+			);
+		const failing = await outcome({
+			...github({
+				pr: pr({
+					checks: {
+						state: "failing",
+						pass: 0,
+						fail: 1,
+						pending: 0,
+						skipping: 0,
+						total: 1,
+						failures: [{ name: "CI / test", link: "https://ci.example/1" }],
+					},
+				}),
+			}),
+			detail: null,
+		});
+		expect(failing).toContain('data-testid="team-pr-failures"');
+		expect(failing).toContain('href="https://ci.example/1"');
+		expect(failing).toContain("失败的检查");
+		const rejected = await outcome({
+			...github({ outcome: "failed" }),
+			detail: {
+				kind: "failed",
+				code: "TEAM_PR_PUSH_REJECTED",
+				message: "rejected",
+				at: "2026-11-25T00:00:00.000Z",
+			},
+		});
+		expect(rejected).toContain('data-code="TEAM_PR_PUSH_REJECTED"');
+		expect(rejected).toContain("GitHub 拒绝了推送");
+		expect(rejected).toContain('data-testid="team-merge-rejected-return"');
 	});
 });

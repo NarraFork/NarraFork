@@ -9,13 +9,19 @@ import { readFileSync } from "node:fs";
 import {
 	COORDINATOR_OVERRUN_EVENT_PREFIX,
 	COORDINATOR_OVERRUN_KINDS,
+	TEAM_FAST_FORWARD_BLOCKERS,
 	TEAM_LEVEL_EVENT_KINDS,
+	TEAM_MERGE_DISABLED_REASONS,
 	TEAM_OVERLAP_EVENT_KINDS,
 	TEAM_PERSON_DECISION_EVENT_KINDS,
+	TEAM_PR_MERGE_BLOCKERS,
+	TEAM_PR_MERGE_METHODS,
 	TEAM_WORK_EVENT_KINDS,
 	type TeamBoardItem,
 	type TeamPageSummary,
 	type TeamPendingApproval,
+	type TeamWorkMergeSummary,
+	type TeamWorkPullRequest,
 } from "@shared/project-teams";
 import {
 	ATTENTION_SHOWN,
@@ -25,24 +31,38 @@ import {
 	boardSignature,
 	cappedCount,
 	chunkIds,
+	conflictReasonFiles,
+	coordinatorLine,
+	currentPullRequest,
 	diffLineKind,
 	eventLabelKey,
 	eventNote,
+	findingsNeedToggle,
+	githubConfirmation,
 	isCoordinator,
 	itemMarks,
 	itemOfApproval,
 	liveActivity,
 	liveWorkerStatus,
+	MERGE_CONFLICT_REASON_FILES,
+	mergeControl,
+	mergeControl as mergeControlOf,
+	mergeErrorKey,
+	mergeRequestCode,
 	nextPollDelay,
 	nudgeDelay,
 	onlookerSeesWaiting,
 	pauseNotice,
 	pauseOrder,
+	pullRequestControl,
+	pullRequestRepo,
+	queuedLine,
 	returnErrorKey,
 	returnReason,
 	rowLine,
 	SUMMARY_POLL_MAX_MS,
 	SUMMARY_POLL_MIN_MS,
+	safeHref,
 	showsStat,
 	statusSentence,
 	summarySignature,
@@ -205,7 +225,7 @@ describe("the work list", () => {
 			["ready", false],
 		]);
 		expect(rowLine(groups.needsYou[0] as never, "waiting", "main")).toEqual({
-			key: "waitingTool",
+			key: "waitingTools.runCommand",
 			values: { tool: "Bash" },
 			detail: "pnpm add x",
 			tone: "amber",
@@ -220,10 +240,19 @@ describe("the work list", () => {
 			approval: call,
 		});
 		expect(rowLine(row({}, approval()), "waiting", "main")).toMatchObject({
-			key: "waitingTool",
+			key: "waitingTools.runCommand",
 			detail: "pnpm test",
 			tone: "amber",
 		});
+		// What the call asks for, in words (R2): editing, reading, a web page, or the tool's name.
+		for (const [toolName, key] of [
+			["Edit", "waitingTools.editFile"],
+			["NotebookEdit", "waitingTools.editFile"],
+			["Read", "waitingTools.readFile"],
+			["WebFetch", "waitingTools.fetchWeb"],
+			["mcp__github__create_issue", "waitingTools.useTool"],
+		])
+			expect(rowLine(row({}, approval({ toolName })), "waiting", "main").key).toBe(key);
 		expect(
 			rowLine(row({}, approval({ kind: "question", questions: ["Which?"] })), "waiting", "main"),
 		).toMatchObject({ key: "waitingAnswer", detail: "Which?" });
@@ -720,5 +749,596 @@ describe("review fixes", () => {
 		expect(isCoordinator({ actorKind: "agent", actorId: "lead" }, "lead")).toBe(true);
 		expect(isCoordinator({ actorKind: "agent", actorId: "w" }, "lead")).toBe(false);
 		expect(isCoordinator({ actorKind: "person", actorId: "lead" }, "lead")).toBe(false);
+	});
+});
+
+describe("dependencies (D)", () => {
+	const dep = (id: string, state: TeamBoardItem["state"]) => ({ id, title: `Item ${id}`, state });
+
+	test("a queued row says what it waits for: one or two by title, more by count", () => {
+		expect(queuedLine(undefined)).toEqual({
+			key: "queued",
+			values: {},
+			detail: null,
+			tone: "hollow",
+		});
+		expect(queuedLine([dep("a", "merged")]).key).toBe("queued");
+		expect(queuedLine([dep("a", "ready"), dep("b", "merged")])).toEqual({
+			key: "queuedWaitingOne",
+			values: { first: "Item a" },
+			detail: null,
+			tone: "hollow",
+		});
+		expect(queuedLine([dep("a", "in_progress"), dep("b", "queued")]).values).toEqual({
+			first: "Item a",
+			second: "Item b",
+		});
+		expect(
+			queuedLine([dep("a", "queued"), dep("b", "queued"), dep("c", "in_review")]),
+		).toMatchObject({ key: "queuedWaitingMany", values: { count: 3 } });
+		// A cancelled dependency never merges: said first, whatever else waits.
+		expect(queuedLine([dep("a", "queued"), dep("b", "cancelled")])).toMatchObject({
+			key: "queuedBlockedCancelled",
+			values: { title: "Item b" },
+		});
+		// rowLine uses it for queued items only.
+		const row = {
+			item: item({ state: "queued", worker: null, dependsOn: [dep("a", "queued")] }),
+			approval: null,
+		};
+		expect(rowLine(row, null, "main").key).toBe("queuedWaitingOne");
+		const started = { item: item({ dependsOn: [dep("a", "merged")] }), approval: null };
+		expect(rowLine(started, "working", "main").key.startsWith("queued")).toBe(false);
+	});
+
+	test("dependency events have headlines and notes", () => {
+		expect(eventLabelKey("work.dependencies_changed")).toBe("work_dependencies_changed");
+		expect(eventLabelKey("work.unblocked")).toBe("work_unblocked");
+		expect(
+			eventNote({ kind: "work.dependencies_changed", detail: { dependsOn: ["a", "b"] } }),
+		).toEqual({ key: "dependencies", values: { count: 2 } });
+		expect(eventNote({ kind: "work.dependencies_changed", detail: { dependsOn: [] } })).toEqual({
+			key: "dependenciesCleared",
+			values: {},
+		});
+		expect(eventNote({ kind: "work.dependencies_changed", detail: {} })).toBeNull();
+		expect(eventNote({ kind: "work.unblocked", detail: { mergedItem: "a" } })).toEqual({
+			key: "unblocked",
+			values: {},
+		});
+	});
+});
+
+describe("review findings", () => {
+	test("a short text never gets 展开; many lines or a long text does", () => {
+		expect(findingsNeedToggle("缺少跨日边界用例。")).toBe(false);
+		expect(findingsNeedToggle("a\nb\nc")).toBe(false);
+		expect(findingsNeedToggle("a\nb\nc\nd")).toBe(true);
+		expect(findingsNeedToggle("x".repeat(141))).toBe(true);
+	});
+});
+
+describe("the coordinator's line", () => {
+	const base = {
+		teamId: "lead",
+		coordinatorStatus: "working",
+		runningAgents: [] as { id: string; title: string | null; status: string }[],
+		runningCount: 0,
+	};
+	const agent = (id: string) => ({ id, title: null, status: "working" });
+	test("the other running sessions; a lower bound when the list was cut", () => {
+		expect(
+			coordinatorLine({
+				...base,
+				runningAgents: [agent("lead"), agent("w1"), agent("w2")],
+				runningCount: 3,
+			}),
+		).toEqual({ kind: "running", count: 2, more: false });
+		// One listed, more beyond it: at least two.
+		expect(coordinatorLine({ ...base, runningAgents: [agent("w1")], runningCount: 2 })).toEqual({
+			kind: "running",
+			count: 2,
+			more: true,
+		});
+		// The full list (the coordinator and 19 others) and one past it: 20+.
+		const full = [agent("lead"), ...Array.from({ length: 19 }, (_, i) => agent(`w${i}`))];
+		expect(coordinatorLine({ ...base, runningAgents: full, runningCount: 21 })).toEqual({
+			kind: "running",
+			count: 20,
+			more: true,
+		});
+	});
+	test("a list cut down to the coordinator: 1+, never 0+", () => {
+		expect(coordinatorLine({ ...base, runningAgents: [agent("lead")], runningCount: 2 })).toEqual({
+			kind: "running",
+			count: 1,
+			more: true,
+		});
+	});
+	test("nothing else running: the coordinator's own state", () => {
+		expect(coordinatorLine({ ...base, runningAgents: [agent("lead")], runningCount: 1 })).toEqual({
+			kind: "status",
+			status: "working",
+		});
+		expect(coordinatorLine({ ...base, coordinatorStatus: "waiting" })).toEqual({
+			kind: "status",
+			status: "waiting",
+		});
+		expect(coordinatorLine({ ...base, coordinatorStatus: "archived" }).kind).toBe("status");
+		expect(coordinatorLine({ ...base, coordinatorStatus: "something" })).toEqual({
+			kind: "status",
+			status: "idle",
+		});
+	});
+});
+
+describe("merge (M)", () => {
+	const summary = {
+		mode: "local" as const,
+		phase: null,
+		job: null,
+		outcome: null,
+		canMerge: true,
+		disabledReason: null,
+	};
+
+	test("the control: merge, a running job, prepare again, disabled with its reason", () => {
+		expect(mergeControl(undefined)).toBeNull();
+		expect(mergeControl(summary)).toEqual({
+			label: "merge",
+			busy: false,
+			enabled: true,
+			disabledKey: null,
+			panel: null,
+		});
+		expect(mergeControl({ ...summary, phase: "updating", job: "merge", canMerge: false })).toEqual({
+			label: "merging",
+			busy: true,
+			enabled: false,
+			disabledKey: null,
+			panel: null,
+		});
+		expect(mergeControl({ ...summary, phase: "fast_forwarding", job: "fast_forward" })?.label).toBe(
+			"fastForwarding",
+		);
+		expect(mergeControl({ ...summary, outcome: "prepared" })).toMatchObject({
+			label: "prepareAgain",
+			panel: "prepared",
+		});
+		expect(
+			mergeControl({
+				...summary,
+				canMerge: false,
+				disabledReason: "gh_logged_out",
+				mode: "github",
+			}),
+		).toMatchObject({
+			label: "openPr",
+			enabled: false,
+			disabledKey: "teams.page.merge.disabled.gh_logged_out",
+		});
+		expect(mergeControl({ ...summary, outcome: "conflict" })?.panel).toBe("conflict");
+	});
+
+	test("every disabled reason, blocker and known error code has words in both locales", () => {
+		for (const locale of ["en", "zh-CN"]) {
+			const merge = JSON.parse(
+				readFileSync(new URL(`../../locales/${locale}/projects.json`, import.meta.url), "utf8"),
+			).teams.page.merge;
+			for (const reason of TEAM_MERGE_DISABLED_REASONS)
+				expect({ locale, reason, text: typeof merge.disabled[reason] }).toEqual({
+					locale,
+					reason,
+					text: "string",
+				});
+			for (const blocker of TEAM_FAST_FORWARD_BLOCKERS)
+				expect({ locale, blocker, text: typeof merge.blocker[blocker] }).toEqual({
+					locale,
+					blocker,
+					text: "string",
+				});
+			for (const code of Object.keys(merge.errors))
+				expect(mergeErrorKey(code)).toBe(`teams.page.merge.errors.${code}`);
+		}
+		expect(mergeErrorKey("SOMETHING_ELSE")).toBeNull();
+		expect(mergeErrorKey(null)).toBeNull();
+		expect(mergeRequestCode({ data: { code: "TEAM_WORK_ITEM_MERGING" } })).toBe(
+			"TEAM_WORK_ITEM_MERGING",
+		);
+		expect(mergeRequestCode(new Error("x"))).toBeNull();
+	});
+
+	test("a conflict's prefilled 退回 names at most 20 files and says when there are more", () => {
+		expect(conflictReasonFiles(["a.ts", "b.ts"], false)).toEqual({
+			files: "- a.ts\n- b.ts",
+			more: false,
+		});
+		const many = Array.from({ length: 30 }, (_, index) => `f${index}.ts`);
+		const cut = conflictReasonFiles(many, false);
+		expect(cut.files.split("\n")).toHaveLength(MERGE_CONFLICT_REASON_FILES);
+		expect(cut.more).toBe(true);
+		expect(conflictReasonFiles(["a.ts"], true).more).toBe(true);
+		expect(conflictReasonFiles(undefined, undefined)).toEqual({ files: "", more: false });
+	});
+
+	test("the activity words merge requests, failures, prepared merges and how an item merged", () => {
+		const note = (kind: string, detail: Record<string, unknown>) => eventNote({ kind, detail });
+		expect(note("work.merge_requested", { job: "merge" })).toEqual({
+			key: "mergeRequested",
+			values: {},
+		});
+		expect(note("work.merge_requested", { job: "fast_forward" })?.key).toBe("mergeFastForward");
+		expect(note("work.merge_failed", { code: "conflict", conflicts: ["a", "b"] })).toEqual({
+			key: "mergeConflict",
+			values: { count: 2 },
+		});
+		expect(note("work.merge_failed", { code: "conflict", conflicts: ["a"], more: true })?.key).toBe(
+			"mergeConflictMore",
+		);
+		expect(note("work.merge_failed", { code: "X", message: "base moved" })).toEqual({
+			key: "text",
+			values: { text: "base moved" },
+		});
+		expect(note("work.merge_prepared", { checkedOutAt: "/repo" })).toEqual({
+			key: "mergePrepared",
+			values: { path: "/repo" },
+		});
+		expect(note("work.merged", { detectedBy: "local_merge" })?.key).toBe("mergedLocal");
+		expect(note("work.merged", { detectedBy: "local_merge", fastForwarded: "checkout" })?.key).toBe(
+			"mergedFastForward",
+		);
+		expect(note("work.merged", { detectedBy: "ancestry" })?.key).toBe("mergedAncestry");
+		for (const locale of ["en", "zh-CN"]) {
+			const notes = JSON.parse(
+				readFileSync(new URL(`../../locales/${locale}/projects.json`, import.meta.url), "utf8"),
+			).teams.eventNote as Record<string, string>;
+			for (const key of [
+				"mergeRequested",
+				"mergeFastForward",
+				"mergeConflict_other",
+				"mergeConflictMore",
+				"mergePrepared",
+				"mergedLocal",
+				"mergedFastForward",
+				"mergedAncestry",
+			])
+				expect({ locale, key, text: typeof notes[key] }).toEqual({ locale, key, text: "string" });
+		}
+	});
+});
+
+describe("pull requests (G)", () => {
+	const pr = (over: Partial<TeamWorkPullRequest> = {}): TeamWorkPullRequest => ({
+		number: 7,
+		url: "https://github.com/acme/app/pull/7",
+		repository: "github.com/acme/app",
+		state: "OPEN",
+		isDraft: false,
+		headMatches: true,
+		mergeState: "CLEAN",
+		review: null,
+		checks: null,
+		queued: false,
+		checkedAt: "2026-11-25T00:00:00.000Z",
+		refreshing: false,
+		error: null,
+		methods: ["squash", "merge"],
+		canMergePr: true,
+		mergeBlocker: null,
+		canRefresh: true,
+		...over,
+	});
+	const github = (over: Partial<TeamWorkMergeSummary> = {}): TeamWorkMergeSummary => ({
+		mode: "github",
+		phase: null,
+		job: null,
+		outcome: null,
+		canMerge: true,
+		disabledReason: null,
+		pr: null,
+		...over,
+	});
+
+	test("a pull request of the repository origin pointed to before: 发起 PR in the new one (Devin 4)", () => {
+		const moved = (pin: string | null, target = "github.com/acme/app2") =>
+			github({
+				pr: pr(),
+				github: { target, pinned: pin, canConfirm: true },
+			});
+		const old = moved("github.com/acme/app2");
+		expect(currentPullRequest(old)).toBeNull();
+		expect(mergeControlOf(old)).toMatchObject({ label: "openPr", enabled: true });
+		expect(pullRequestControl(old)).toBeNull();
+		// The same repository (any case) is the item's: 查看 PR / 合并 PR.
+		const same = moved("GitHub.com/Acme/App", "github.com/acme/app");
+		expect(currentPullRequest(same)?.number).toBe(7);
+		expect(mergeControlOf(same)).toBeNull();
+		expect(pullRequestControl(same)?.showMerge).toBe(true);
+		// Nothing confirmed yet: origin's repository decides.
+		expect(currentPullRequest(moved(null))).toBeNull();
+		expect(currentPullRequest(moved(null, "github.com/acme/app"))?.number).toBe(7);
+	});
+
+	test("the main button: 发起 PR, 更新 PR after a re-ready, 重新发起 PR when closed, hidden while the PR is current", () => {
+		expect(mergeControlOf(github())).toMatchObject({ label: "openPr", enabled: true });
+		expect(mergeControlOf(github({ pr: pr({ headMatches: false }) }))?.label).toBe("updatePr");
+		expect(mergeControlOf(github({ pr: pr({ state: "CLOSED" }) }))?.label).toBe("reopenPr");
+		// Merged without this ready head (taken as closed by the server): again, never 发起 anew.
+		expect(mergeControlOf(github({ pr: pr({ state: "MERGED" }) }))?.label).toBe("reopenPr");
+		expect(mergeControlOf(github({ pr: pr() }))).toBeNull();
+		// Not read yet, but recorded at this head: 查看 PR takes its place too.
+		expect(mergeControlOf(github({ pr: pr({ state: null }) }))).toBeNull();
+		for (const reason of [
+			"checking",
+			"gh_missing",
+			"gh_logged_out",
+			"gh_no_permission",
+			"gh_repo_archived",
+			"gh_unavailable",
+			"worker_running",
+		] as const)
+			expect(mergeControlOf(github({ canMerge: false, disabledReason: reason }))).toMatchObject({
+				label: "openPr",
+				enabled: false,
+				disabledKey: `teams.page.merge.disabled.${reason}`,
+			});
+		expect(mergeControlOf(github({ phase: "pushing", job: "pull_request" }))?.label).toBe(
+			"pushing",
+		);
+		expect(mergeControlOf(github({ phase: "opening", job: "pull_request" }))?.label).toBe(
+			"opening",
+		);
+		expect(mergeControlOf(github({ phase: "queued", job: "pull_request" }))?.label).toBe("pushing");
+		expect(mergeControlOf(github({ phase: "merging", job: "pr_merge" }))).toMatchObject({
+			label: "mergingPr",
+			busy: true,
+		});
+		expect(mergeControlOf(github({ phase: "checking", job: "merge" }))?.label).toBe("pushing");
+		// Merging an existing pull request: 「合并 PR」 shows it, not a second button.
+		expect(mergeControlOf(github({ phase: "merging", job: "pr_merge", pr: pr() }))).toBeNull();
+	});
+
+	test("查看 PR #N with CI, review, conflict / behind / blocked / draft and queue labels", () => {
+		const labels = (over: Partial<TeamWorkPullRequest>) =>
+			pullRequestControl(github({ pr: pr(over) }))?.labels.map((label) => [label.kind, label.key]);
+		const checks = (state: "passing" | "failing" | "pending" | "none") => ({
+			state,
+			pass: 3,
+			fail: 2,
+			pending: 1,
+			skipping: 0,
+			total: 6,
+			failures: [{ name: "CI / test", link: "https://ci.example/1" }],
+		});
+		expect(labels({ checks: checks("passing") })).toEqual([["checks", "checksPassing"]]);
+		expect(labels({ checks: checks("failing") })).toEqual([["checks", "checksFailing"]]);
+		expect(
+			pullRequestControl(github({ pr: pr({ checks: checks("failing") }) }))?.labels[0]?.values,
+		).toEqual({ count: 2 });
+		expect(
+			pullRequestControl(github({ pr: pr({ checks: checks("pending") }) }))?.labels[0]?.values,
+		).toEqual({ count: 1 });
+		expect(labels({ checks: checks("none") })).toEqual([["checks", "checksNone"]]);
+		expect(labels({ review: "REVIEW_REQUIRED" })).toEqual([["review", "reviewRequired"]]);
+		expect(labels({ review: "APPROVED" })).toEqual([["review", "reviewApproved"]]);
+		expect(labels({ review: "CHANGES_REQUESTED" })).toEqual([["review", "reviewChanges"]]);
+		expect(labels({ mergeState: "DIRTY" })).toEqual([["state", "dirty"]]);
+		expect(labels({ mergeState: "BEHIND" })).toEqual([["state", "behind"]]);
+		expect(labels({ mergeState: "BLOCKED" })).toEqual([["state", "blocked"]]);
+		expect(labels({ isDraft: true, mergeState: "DRAFT" })).toEqual([["state", "draft"]]);
+		expect(labels({ queued: true })).toEqual([["queue", "queued"]]);
+		expect(labels({ headMatches: false })).toEqual([["state", "stale"]]);
+		expect(labels({ state: "CLOSED" })).toEqual([["state", "closed"]]);
+		expect(labels({ state: null })).toEqual([["read", "checking"]]);
+		expect(labels({ refreshing: true })).toEqual([["read", "checking"]]);
+		const view = pullRequestControl(github({ pr: pr({ checks: checks("failing") }) }));
+		expect(view).toMatchObject({
+			number: 7,
+			url: "https://github.com/acme/app/pull/7",
+			showMerge: true,
+			mergeEnabled: true,
+			mergeDisabledKey: null,
+			methods: ["squash", "merge"],
+			failures: [{ name: "CI / test", link: "https://ci.example/1" }],
+		});
+		expect(pullRequestControl(github())).toBeNull();
+		expect(pullRequestControl({ ...github({ pr: pr() }), mode: "local" })).toBeNull();
+	});
+
+	test("合并 PR: enabled only when GitHub says it can merge; otherwise the reason", () => {
+		for (const blocker of TEAM_PR_MERGE_BLOCKERS) {
+			const view = pullRequestControl(
+				github({ pr: pr({ canMergePr: false, mergeBlocker: blocker }) }),
+			);
+			expect({ blocker, enabled: view?.mergeEnabled, key: view?.mergeDisabledKey }).toEqual({
+				blocker,
+				enabled: false,
+				key: `teams.page.merge.prBlocker.${blocker}`,
+			});
+		}
+		// A reason of the whole action (the worker running) comes first.
+		expect(
+			pullRequestControl(
+				github({
+					canMerge: false,
+					disabledReason: "worker_running",
+					pr: pr({ canMergePr: false, mergeBlocker: null }),
+				}),
+			)?.mergeDisabledKey,
+		).toBe("teams.page.merge.disabled.worker_running");
+		// Busy merging: shown, not pressable again.
+		expect(
+			pullRequestControl(github({ phase: "merging", job: "pr_merge", pr: pr() })),
+		).toMatchObject({ busy: true, mergeEnabled: false });
+		// Not shown for a stale head (更新 PR first) or a closed one.
+		expect(pullRequestControl(github({ pr: pr({ headMatches: false }) }))?.showMerge).toBe(false);
+		expect(pullRequestControl(github({ pr: pr({ state: "CLOSED" }) }))?.showMerge).toBe(false);
+	});
+
+	test("links are http(s) only", () => {
+		expect(safeHref("https://github.com/acme/app/pull/7")).toBe(
+			"https://github.com/acme/app/pull/7",
+		);
+		expect(safeHref("javascript:alert(1)")).toBeNull();
+		expect(safeHref("data:text/html,x")).toBeNull();
+		expect(safeHref(null)).toBeNull();
+	});
+
+	test("the activity words the pull request's events", () => {
+		const note = (kind: string, detail: Record<string, unknown>) => eventNote({ kind, detail });
+		expect(note("work.merge_requested", { job: "pull_request" })?.key).toBe("prRequested");
+		expect(note("work.merge_requested", { job: "pr_merge", method: "squash" })).toEqual({
+			key: "prMergeRequested",
+			values: { method: "squash" },
+		});
+		expect(note("work.pr_pushed", { branch: "team/x" })).toEqual({
+			key: "branch",
+			values: { branch: "team/x" },
+		});
+		for (const kind of ["work.pr_opened", "work.pr_closed", "work.pr_queued"])
+			expect(note(kind, { pr: 7 })).toEqual({ key: "prNumber", values: { pr: 7 } });
+		expect(note("work.pr_checks", { checks: "failing", failed: 2 })).toEqual({
+			key: "prChecksFailing",
+			values: { count: 2 },
+		});
+		expect(note("work.pr_checks", { checks: "passing" })?.key).toBe("prChecksPassing");
+		expect(note("work.pr_checks", { review: "CHANGES_REQUESTED" })?.key).toBe("prChangesRequested");
+		expect(note("work.pr_checks", { review: "APPROVED" })?.key).toBe("prApproved");
+		expect(note("work.merged", { detectedBy: "pull_request", pr: 7 })).toEqual({
+			key: "mergedPullRequest",
+			values: { pr: 7 },
+		});
+		for (const kind of [
+			"work.pr_pushed",
+			"work.pr_opened",
+			"work.pr_checks",
+			"work.pr_closed",
+			"work.pr_queued",
+		])
+			expect(eventLabelKey(kind)).toBe(kind.replace(".", "_"));
+	});
+
+	test("every pull request word exists in both locales", () => {
+		for (const locale of ["en", "zh-CN"]) {
+			const teams = JSON.parse(
+				readFileSync(new URL(`../../locales/${locale}/projects.json`, import.meta.url), "utf8"),
+			).teams;
+			const merge = teams.page.merge;
+			for (const blocker of TEAM_PR_MERGE_BLOCKERS)
+				expect({ locale, blocker, text: typeof merge.prBlocker[blocker] }).toEqual({
+					locale,
+					blocker,
+					text: "string",
+				});
+			for (const method of TEAM_PR_MERGE_METHODS)
+				expect({ locale, method, text: typeof merge.method[method] }).toEqual({
+					locale,
+					method,
+					text: "string",
+				});
+			for (const key of [
+				"checking",
+				"closed",
+				"merged",
+				"stale",
+				"checksPassing",
+				"checksFailing_other",
+				"checksPending_other",
+				"checksNone",
+				"reviewApproved",
+				"reviewChanges",
+				"reviewRequired",
+				"draft",
+				"dirty",
+				"behind",
+				"blocked",
+				"queued",
+				"failuresTitle",
+				"readFailed",
+			])
+				expect({ locale, key, text: typeof merge.pr[key] }).toEqual({
+					locale,
+					key,
+					text: "string",
+				});
+			for (const key of [
+				"openPr",
+				"updatePr",
+				"reopenPr",
+				"pushing",
+				"opening",
+				"mergingPr",
+				"viewPr",
+				"mergePr",
+				"methodMenu",
+				"methodDefault",
+				"barNotePr",
+				"pushRejectedReason",
+			])
+				expect({ locale, key, text: typeof merge[key] }).toEqual({ locale, key, text: "string" });
+			for (const key of [
+				"prRequested",
+				"prMergeRequested",
+				"prNumber",
+				"prChecksFailing_other",
+				"prChecksPassing",
+				"prChangesRequested",
+				"prApproved",
+				"mergedPullRequest",
+			])
+				expect({ locale, key, text: typeof teams.eventNote[key] }).toEqual({
+					locale,
+					key,
+					text: "string",
+				});
+			// The promise of a coming PR flow is gone everywhere.
+			expect(JSON.stringify(teams)).not.toMatch(/coming soon|即将提供/);
+		}
+	});
+});
+
+describe("the confirmed GitHub repository (G, review 1)", () => {
+	const github = (over: Partial<TeamWorkMergeSummary> = {}): TeamWorkMergeSummary => ({
+		mode: "github",
+		phase: null,
+		job: null,
+		outcome: null,
+		canMerge: true,
+		disabledReason: null,
+		pr: null,
+		...over,
+	});
+	test("a manager confirms it first; the buttons name owner/repo", () => {
+		const unpinned = github({
+			github: { target: "github.com/acme/app", pinned: null, canConfirm: true },
+		});
+		expect(githubConfirmation(unpinned)).toBe("github.com/acme/app");
+		expect(pullRequestRepo(unpinned)).toBe("acme/app");
+		expect(
+			githubConfirmation(
+				github({ github: { target: "github.com/acme/app", pinned: null, canConfirm: false } }),
+			),
+		).toBeNull();
+		const pinned = github({
+			github: { target: "github.com/acme/app", pinned: "github.com/acme/app", canConfirm: true },
+		});
+		expect(githubConfirmation(pinned)).toBeNull();
+		// The confirmed one is named, whatever origin says now; a GHE host is kept.
+		expect(
+			pullRequestRepo(
+				github({
+					github: { target: "ghe.acme.test/x/y", pinned: "ghe.acme.test/t/app", canConfirm: false },
+				}),
+			),
+		).toBe("ghe.acme.test/t/app");
+		expect(pullRequestRepo({ ...pinned, mode: "local" })).toBeNull();
+		for (const reason of [
+			"github_unconfirmed",
+			"github_target_changed",
+			"remote_config_unsafe",
+		] as const)
+			expect(mergeControlOf(github({ canMerge: false, disabledReason: reason }))?.disabledKey).toBe(
+				`teams.page.merge.disabled.${reason}`,
+			);
 	});
 });

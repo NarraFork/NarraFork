@@ -37,7 +37,7 @@ keywords:
   - 插件工具
   - 插件主题
 status: draft
-verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
+verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 ---
 # 插件贡献点
 
@@ -54,10 +54,10 @@ verified_at: cf135939ebf92132d5a03bc18cf391d612c36614
 - 插件自己的定时调度（`plugin-scheduler.ts`：cron/interval/once，最短间隔 60s）与宿主[定时任务](../scheduled.md)无关。
 
 - 事件网关（`plugin-event-gateway.ts`）：把宿主内部事件按显式白名单映射成公开事件（一条内部事件可映射为零条、一条或多条），交给共享的 `IntegrationEventDispatcher`（`integration-event-dispatcher.ts` 把它接到审计与授权失效监听）；每个订阅队列默认 100 条/256KiB，硬上限 1000 条/2MiB，订阅速率默认 100/s、硬上限 1000/s，最多 256 个订阅、每次订阅最多 20 个主题，单条事件 ≤256KiB；键名为 `contentJson/rawDump/toolInput/toolOutput/input/output/jwt/log/stderr/stdout/reasoning` 等的字段会被剔除，值里带 `jwt/bearer/token/secret/password/authorization` 赋值形式的会被过滤（`sanitizeJsonValue`、`SENSITIVE_VALUE`）。
-- 公开 API 适配（`plugin-public-api.ts`）：插件命令/查询能触达的宿主操作（建叙述者、删叙述者、中断、读项目/叙述者摘要、大纲任务读取与块命令、更新叙述者画像等）；摘要是有界投影，不含 `systemPrompt`、`cwd` 与原始 JSON 列；默认查询 15s、命令 30s、请求 256KiB、响应 1MiB；宿主没有对应适配器时返回 `HOST_UNAVAILABLE`。
+- 公开 API 适配（`plugin-public-api.ts`）：插件命令/查询能触达的宿主操作（建叙述者、删叙述者、中断、读项目/叙述者摘要、大纲任务读取与块命令、更新叙述者画像等）；摘要是有界投影，不含 `systemPrompt`、`cwd` 与原始 JSON 列；默认查询 15s、命令 30s、请求 256KiB、响应 1MiB；宿主没有对应适配器时返回 `HOST_UNAVAILABLE`。叙述者列表与消息列表查询走读 Worker（`worker-required`）。
 - 搜索源适配（`plugin-search-source.ts`）：把 `PluginSearchRegistry` 包成通用搜索层的渠道来源，`listChannels()` 必须是同步的注册表遍历，这样 `lib/search` 不依赖插件平台。
 - 界面会话与资源：`plugin-ui-session.ts` 的会话令牌 32 字节、nonce 16 字节、默认 10 分钟过期、最多 1000 个会话；`plugin-ui-assets.ts` 提供界面资源（单资源默认 ≤10MiB，shell 页 ≤64KiB，拒绝符号链接逃逸）。
-- 主题：主题包全局安装，但“启用哪些主题”按用户隔离，存表 `user_plugin_themes`（`user-plugin-theme-service.ts`，薄索引 CRUD）；`GET /ui/themes` 只下发当前用户已启用的主题 CSS，最多 200 项。
+- 主题：主题包全局安装，但“启用哪些主题”按用户隔离，存表 `user_plugin_themes`（`user-plugin-theme-service.ts`，薄索引 CRUD；`listEnabledThemes`/`isThemeEnabled` 走读 Worker，`setThemeEnabled` 的存在判断故意留在主线程同轮，免得两次切换都插入）；`GET /ui/themes` 只下发当前用户已启用的主题 CSS，最多 200 项。
 
 ## 从哪读起
 - `server/services/plugin-contribution-coordinator.ts`：目录刷新到各注册表的同步。

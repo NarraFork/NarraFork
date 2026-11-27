@@ -772,6 +772,17 @@ describe("RemoteProviderAdapter", () => {
 		});
 	}
 
+	test("legacy ultra is normalized before chat and generate reach the provider RPC", async () => {
+		const done = event("done", { status: "completed", stopReason: "end_turn" });
+		const rpc = makeRpc([done], [done]);
+		const adapter = makeAdapter(rpc);
+		const reasoningEffort = "ultra" as ChatParams["reasoningEffort"];
+		await collect(adapter.chat(chatParams({ reasoningEffort })));
+		await adapter.generateWithMeta("prompt", "remote:model-1", undefined, { reasoningEffort });
+		expect(rpc.chatParams).toMatchObject({ request: { options: { reasoningEffort: "xhigh" } } });
+		expect(rpc.generateParams).toMatchObject({ options: { reasoningEffort: "xhigh" } });
+	});
+
 	test("generate accumulates text and returns final usage metadata", async () => {
 		const rpc = makeRpc(
 			[event("request_started", { credentialId: "cred-generate" })],

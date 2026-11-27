@@ -12,9 +12,11 @@
 import {
 	TEAM_CHECKIN_MAX_MINUTES,
 	TEAM_CHECKIN_MIN_MINUTES,
+	TEAM_REVIEW_SUMMARY_MAX_LENGTH,
 	TEAM_REVIEW_VERDICTS,
 	TEAM_TOOL_ACTIONS,
 	TEAM_WORK_BRANCH_HINT_MAX_LENGTH,
+	TEAM_WORK_DEPENDENCIES_MAX,
 	TEAM_WORK_TITLE_MAX_LENGTH,
 	type TeamToolAction,
 } from "@shared/project-teams";
@@ -48,7 +50,7 @@ export const teamToolParameters = z.object({
 	action: z
 		.enum(TEAM_TOOL_ACTIONS)
 		.describe(
-			"work.list | work.create | work.review | work.ready | work.sync | work.cancel | brief | checkin | cleanup | decision",
+			"work.list | work.create | work.update | work.review | work.ready | work.sync | work.cancel | brief | checkin | cleanup | decision",
 		),
 	item: z
 		.string()
@@ -56,7 +58,7 @@ export const teamToolParameters = z.object({
 		.max(64)
 		.optional()
 		.describe(
-			"Work item id (work.review, work.ready, work.sync, work.cancel, cleanup; optional for decision).",
+			"Work item id (work.update, work.review, work.ready, work.sync, work.cancel, cleanup; optional for decision).",
 		),
 	title: z
 		.string()
@@ -71,6 +73,13 @@ export const teamToolParameters = z.object({
 		.describe(
 			'work.create: a few English words for the branch (e.g. "login unit tests"); give them when the title is not in English, since only ASCII words name a branch.',
 		),
+	dependsOn: z
+		.array(z.string().min(1).max(64))
+		.max(TEAM_WORK_DEPENDENCIES_MAX)
+		.optional()
+		.describe(
+			"work.create / work.update: ids (from work.list) of items of this team, made from the same base branch, that must be merged before this one may start; work.update replaces the whole list ([] clears it) and only while the item is queued.",
+		),
 	verdict: z
 		.enum(TEAM_REVIEW_VERDICTS)
 		.optional()
@@ -82,6 +91,13 @@ export const teamToolParameters = z.object({
 		.max(100_000)
 		.optional()
 		.describe("work.review: how many issues the review reported."),
+	summary: z
+		.string()
+		.max(TEAM_REVIEW_SUMMARY_MAX_LENGTH)
+		.optional()
+		.describe(
+			"work.review: the findings in a few short lines (each blocking issue; for a clear round, what was checked). People read it on the team page.",
+		),
 	reviewer: z
 		.string()
 		.max(200)
@@ -177,7 +193,7 @@ export function syncNextAction(
 	switch (delivery) {
 		case "started":
 		case "queued":
-			return `The worker ("${label}") was told to merge the base into its branch and report; nothing was merged on the server. Wait for its report.`;
+			return `The worker ("${label}") was told to merge the base into its branch and report; the server did not touch the branch. Wait for its report.`;
 		case "blocked":
 			return `The worker ("${label}") is stopped (a person stopped its last turn, or it ended with an error): the instruction is stored but it will not act on it. A person must resume it, or delegate the sync to another worker with Agent({ workdir: <the item's worktree>, prompt: instruction }).`;
 		case "wake_failed":
@@ -203,14 +219,38 @@ async function run(input: TeamInput, ctx: ToolContext): Promise<ToolResult> {
 				coordinatorId,
 				title: requireField(input, "title", action),
 				branchHint: input.branchHint,
+				dependsOn: input.dependsOn,
 				actor,
 				principal: await principalOf(ctx),
 				signal: ctx.signal,
 			});
+			const view = items.viewWorkItem(item);
 			return result({
-				item: items.viewWorkItem(item),
+				item: view,
 				nextAction:
-					'Delegate it with Agent({ workdir: item.worktree, subagent_type: "worker", prompt }); no approval is needed for this directory.',
+					view.blockedBy.length > 0
+						? 'It stays queued until every item in blockedBy is merged into the base; starting it before is refused. You get a note when it can start: then run work.sync on it and delegate it with Agent({ workdir: item.worktree, subagent_type: "worker", prompt }), the sync instruction first in the prompt.'
+						: 'Delegate it with Agent({ workdir: item.worktree, subagent_type: "worker", prompt }); no approval is needed for this directory.',
+			});
+		}
+		case "work.update": {
+			const dependsOn = input.dependsOn;
+			if (dependsOn === undefined)
+				throw new AppError("work.update requires dependsOn", 400, "INVALID_ARGUMENT");
+			const { item, changed } = items.setWorkItemDependencies({
+				coordinatorId,
+				itemId: requireField(input, "item", action),
+				dependsOn,
+				actor,
+			});
+			const view = items.viewWorkItem(item);
+			return result({
+				item: view,
+				changed,
+				nextAction:
+					view.blockedBy.length > 0
+						? "It stays queued until every item in blockedBy is merged; you get a note when it can start."
+						: "Nothing blocks it: run work.sync on it, then delegate it with Agent({ workdir: item.worktree, ... }), the sync instruction first in the prompt.",
 			});
 		}
 		case "work.review": {
@@ -220,6 +260,7 @@ async function run(input: TeamInput, ctx: ToolContext): Promise<ToolResult> {
 				itemId: requireField(input, "item", action),
 				verdict,
 				findings: input.findings ?? 0,
+				summary: input.summary,
 				reviewer: await resolveReviewer(ctx, input.reviewer),
 				actor,
 			});
@@ -301,10 +342,16 @@ async function run(input: TeamInput, ctx: ToolContext): Promise<ToolResult> {
 				reason: input.reason,
 				actor,
 			});
+			const { queuedDependentsOf } = await import("../../../services/teams/work-item-dependencies");
+			const waiting = queuedDependentsOf(item.teamId, item.id);
 			return result({
 				item: items.viewWorkItem(item),
-				nextAction:
-					"Stop its subagent if it still runs. Its worktree stays until cleanup, which a person approves; the branch is never deleted.",
+				...(waiting.length > 0 ? { dependents: waiting.map((entry) => entry.id) } : {}),
+				nextAction: `Stop its subagent if it still runs. Its worktree stays until cleanup, which a person approves; the branch is never deleted.${
+					waiting.length > 0
+						? ` The queued items in dependents wait for it and can never start now: remove or replace it in their dependsOn with work.update.`
+						: ""
+				}`,
 			});
 		}
 		case "brief": {
@@ -365,11 +412,13 @@ export const teamTool: ToolDefinition = {
 	name: TEAM_TOOL_NAME,
 	description:
 		"Team coordinator only: manage the team's work items, brief, decisions and check-ins. " +
-		"work.list lists items; work.create makes an item with its own branch and worktree from the team's base branch; " +
-		"work.review records one review round (verdict, findings, reviewer); work.ready marks an item done after a clear review " +
+		"work.list lists items (with dependsOn and blockedBy); work.create makes an item with its own branch and worktree from the team's base branch, optionally with dependsOn: items that must be merged before it may start (starting it earlier is refused with TEAM_WORK_ITEM_BLOCKED); " +
+		"work.update replaces a queued item's dependsOn; " +
+		"work.review records one review round (verdict, findings, a short summary of them, reviewer); work.ready marks an item done after a clear review " +
 		"(refused while its worktree has uncommitted changes, or, in a repository with knowledge/index.md, while the branch changed code a knowledge node anchors without updating that node, or added a source file no node anchors: details lists them for the worker to fix); " +
-		"work.sync tells the item's worker to merge the base into its branch with a merge commit (never on the server, never a rebase); " +
+		"work.sync tells the item's worker to merge the base into its branch with a merge commit (never on the server, never a rebase); it brings in origin/<base> or the local base, as the team's settings say; " +
 		"work.cancel stops tracking an item; cleanup removes a cancelled or merged item's worktree (never its branch) and always asks a person; " +
+		"merging a ready item into the base is a member's action on the team page, never this tool's (when origin is on GitHub, NarraFork pushes the branch, opens a pull request and merges it there through the host's gh): you get a note when it lands, conflicts, or its pull request's checks fail or a review asks for changes, and review, ready, sync and cancel are refused with TEAM_WORK_ITEM_MERGING while it runs; " +
 		"brief reads or replaces the team brief every subagent follows; decision records a decision taken on people's behalf; " +
 		"checkin schedules one wake-up of this session after N minutes.",
 	parameters: teamToolParameters,

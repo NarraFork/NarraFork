@@ -14,7 +14,7 @@
  *  - the board names what a running worker did last, and the summary says whether anyone spoke
  *    to the coordinator yet.
  */
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -45,8 +45,15 @@ const {
 const { generateId } = await import("../../lib/id");
 const { narratorService } = await import("../../services/narrator-service");
 const work = await import("../../services/teams/work-items");
-const { resetWorkStatCacheForTests } = await import("../../services/teams/team-work-view");
-const { TEAM_WORK_DIFF_MAX_BYTES } = await import("@shared/project-teams");
+const { capReviewSummaries, resetWorkStatCacheForTests } = await import(
+	"../../services/teams/team-work-view"
+);
+const board = await import("../../services/teams/team-board");
+const {
+	TEAM_EVENT_DETAIL_PREVIEW_CHARS,
+	TEAM_REVIEW_SUMMARIES_TOTAL_CHARS,
+	TEAM_WORK_DIFF_MAX_BYTES,
+} = await import("@shared/project-teams");
 
 const OWNER = "work-owner";
 const MEMBER = "work-member";
@@ -130,11 +137,22 @@ async function newItem(title: string) {
 	});
 }
 
+/** Only a started item is reviewed: give it a worker of its own, as an Agent call attaches. */
+async function startItem(item: { id: string }, title: string) {
+	const worker = await narratorService.create({ title: `${title} worker`, cwd: repo });
+	await db
+		.update(narrators)
+		.set({ type: "subagent", aclRootNarratorId: teamId, parentNarratorId: teamId })
+		.where(eq(narrators.id, worker.id));
+	work.attachWorker(teamId, item.id, worker.id, { kind: "agent", id: teamId });
+}
+
 async function readyItem(title: string, files: Record<string, string>) {
 	const item = await newItem(title);
 	const path = work.worktreePathOf(item) ?? "";
 	commitIn(path, files, title);
 	const actor = { kind: "agent" as const, id: teamId };
+	await startItem(item, title);
 	await work.recordReview({
 		coordinatorId: teamId,
 		itemId: item.id,
@@ -316,6 +334,7 @@ describe("the drawer", () => {
 		expect(detail.body.reviews[0]).toMatchObject({ round: 1, verdict: "clear", by: "agent" });
 		expect(detail.body.events.map((event: { kind: string }) => event.kind)).toEqual([
 			"work.created",
+			"work.started",
 			"work.review",
 			"work.ready",
 		]);
@@ -481,6 +500,35 @@ describe("board and summary", () => {
 		expect(summary.body.coordinatorStopReason).toBeNull();
 		expect(db.select().from(teamWorkItems).where(eq(teamWorkItems.id, item.id)).get()?.state).toBe(
 			"in_progress",
+		);
+	});
+});
+
+describe("dependencies (D)", () => {
+	test("the board carries each card's dependencies; the drawer lists the dependents", async () => {
+		const first = await newItem("Dependency first");
+		const second = await work.createWorkItem({
+			coordinatorId: teamId,
+			title: "Dependency second",
+			dependsOn: [first.id],
+			actor: { ...agent, id: teamId },
+			principal: { userId: OWNER, isAdmin: false },
+			signal: new AbortController().signal,
+		});
+		const board = await call(READER, teamPath("board?column=queued"));
+		const card = board.body.items.find((entry: { id: string }) => entry.id === second.id);
+		expect(card.dependsOn).toEqual([{ id: first.id, title: "Dependency first", state: "queued" }]);
+		expect(
+			board.body.items.find((entry: { id: string }) => entry.id === first.id).dependsOn,
+		).toEqual([]);
+		const detail = await call(READER, teamPath(`work/${first.id}`));
+		expect(detail.body.dependents).toEqual([
+			{ id: second.id, title: "Dependency second", state: "queued" },
+		]);
+		expect(detail.body.dependentsMore).toBe(false);
+		const events = await call(READER, teamPath("events"));
+		expect(events.body.events.map((event: { kind: string }) => event.kind)).toContain(
+			"work.dependencies_changed",
 		);
 	});
 });
@@ -687,5 +735,463 @@ describe("review fixes (PR review)", () => {
 				JSON.stringify({ questions: [{ question: "Ship today?", header: "When", options: [] }] }),
 			),
 		).toEqual(["Ship today?"]);
+	});
+});
+
+describe("review findings in the drawer", () => {
+	test("each round's findings, long ones too, as far as the drawer is readable", async () => {
+		resetWorkStatCacheForTests();
+		const item = await newItem("Findings item");
+		commitIn(work.worktreePathOf(item) ?? "", { "src/f.ts": "f\n" }, "findings work");
+		await startItem(item, "Findings");
+		const actor = { kind: "agent" as const, id: teamId };
+		const short = "缺少跨日边界用例：UTC 16:00 之后下的订单，在东八区应算到第二天。";
+		await work.recordReview({
+			coordinatorId: teamId,
+			itemId: item.id,
+			verdict: "blocker",
+			findings: 1,
+			summary: `  ${short}\n`,
+			reviewer: null,
+			actor,
+		});
+		// Quotes and newlines escape past the event preview: read on its own, still whole.
+		const long = `"\u0001`.repeat(500);
+		await work.recordReview({
+			coordinatorId: teamId,
+			itemId: item.id,
+			verdict: "clear",
+			findings: 0,
+			summary: long,
+			reviewer: null,
+			actor,
+		});
+		await work.recordReview({
+			coordinatorId: teamId,
+			itemId: item.id,
+			verdict: "clear",
+			findings: 0,
+			summary: "   ",
+			reviewer: null,
+			actor,
+		});
+		for (const user of [OWNER, MEMBER, READER]) {
+			const detail = await call(user, teamPath(`work/${item.id}`));
+			expect(detail.status).toBe(200);
+			expect(
+				detail.body.reviews.map((round: { summary: string | null; verdict: string }) => [
+					round.verdict,
+					round.summary,
+				]),
+			).toEqual([
+				["blocker", short],
+				["clear", long],
+				["clear", null],
+			]);
+			expect(
+				detail.body.reviews.some((round: { summaryClipped?: boolean }) => round.summaryClipped),
+			).toBe(false);
+			// The timeline does not repeat the text the rounds carry.
+			const reviews = detail.body.events.filter(
+				(event: { kind: string }) => event.kind === "work.review",
+			);
+			expect(reviews).toHaveLength(3);
+			for (const event of reviews) {
+				expect(event.detailOmitted).toBe(false);
+				expect("summary" in event.detail).toBe(false);
+			}
+			expect(reviews[1].detail).toMatchObject({ round: 2, verdict: "clear", findings: 0 });
+		}
+		// Findings are only as visible as the events: a stranger reads nothing.
+		expect((await call(OUTSIDER, teamPath(`work/${item.id}`))).status).toBe(404);
+		expect((await call(OUTSIDER, teamPath("events"))).status).toBe(404);
+		// A blank summary is not stored; a too-long one is refused.
+		const stored = db
+			.select({ kind: teamWorkEvents.kind, detail: teamWorkEvents.detailJson })
+			.from(teamWorkEvents)
+			.where(eq(teamWorkEvents.workItemId, item.id))
+			.all()
+			.filter((row) => row.kind === "work.review");
+		expect(JSON.stringify(stored[1]?.detail).length).toBeGreaterThan(
+			TEAM_EVENT_DETAIL_PREVIEW_CHARS,
+		);
+		expect(stored.map((row) => row.detail && "summary" in row.detail)).toEqual([true, true, false]);
+		await expect(
+			work.recordReview({
+				coordinatorId: teamId,
+				itemId: item.id,
+				verdict: "clear",
+				findings: 0,
+				summary: "x".repeat(1001),
+				reviewer: null,
+				actor,
+			}),
+		).rejects.toThrow("summary must be at most 1000 characters");
+	});
+
+	test("long findings are read row by row, newest first, only until the drawer has enough", async () => {
+		resetWorkStatCacheForTests();
+		const item = await newItem("Many findings item");
+		commitIn(work.worktreePathOf(item) ?? "", { "src/many.ts": "m\n" }, "many findings work");
+		await startItem(item, "Findings");
+		const actor = { kind: "agent" as const, id: teamId };
+		// Each findings text is the longest allowed and escapes past the event preview.
+		const findings = (round: number) => `${round}`.padEnd(2, "-") + "\u0001".repeat(998);
+		const rounds = 15;
+		for (let round = 1; round <= rounds; round++)
+			await work.recordReview({
+				coordinatorId: teamId,
+				itemId: item.id,
+				verdict: round % 2 ? "blocker" : "clear",
+				findings: round,
+				summary: findings(round),
+				reviewer: null,
+				actor,
+			});
+		const reads = spyOn(board, "readReviewDetailText");
+		try {
+			for (const user of [OWNER, READER]) {
+				reads.mockClear();
+				const detail = await call(user, teamPath(`work/${item.id}`));
+				expect(detail.status).toBe(200);
+				// 6000 characters of findings is six rounds: the older nine are never read.
+				const kept = TEAM_REVIEW_SUMMARIES_TOTAL_CHARS / 1000;
+				expect(reads).toHaveBeenCalledTimes(kept);
+				const reviews = detail.body.reviews as {
+					round: number;
+					verdict: string;
+					findings: number | null;
+					summary: string | null;
+					summaryClipped?: boolean;
+				}[];
+				expect(reviews).toHaveLength(rounds);
+				reviews.forEach((review, index) => {
+					const round = index + 1;
+					// Every round keeps its verdict and count, read or not.
+					expect([review.round, review.verdict, review.findings]).toEqual([
+						round,
+						round % 2 ? "blocker" : "clear",
+						round,
+					]);
+					if (round > rounds - kept) {
+						expect(review.summary).toBe(findings(round));
+						expect(review.summaryClipped ?? false).toBe(false);
+					} else {
+						expect(review.summary).toBeNull();
+						expect(review.summaryClipped).toBe(true);
+					}
+				});
+				const timeline = detail.body.events.filter(
+					(event: { kind: string }) => event.kind === "work.review",
+				);
+				for (const event of timeline) expect(event.detailOmitted).toBe(false);
+			}
+		} finally {
+			reads.mockRestore();
+		}
+		expect((await call(OUTSIDER, teamPath(`work/${item.id}`))).status).toBe(404);
+	});
+
+	test("a long review's head gives its round, verdict and count", () => {
+		expect(
+			board.reviewHeadDetail('{"round":3,"verdict":"clear","findings":0,"summary":"\\u0001'),
+		).toEqual({ round: 3, verdict: "clear", findings: 0 });
+		expect(board.reviewHeadDetail('{"round":2,"verdict":"blocker","findings":4}')).toEqual({
+			round: 2,
+			verdict: "blocker",
+			findings: 4,
+		});
+		for (const head of [null, undefined, "", '{"verdict":"clear"}', '{"round":1,"verdict":"maybe"'])
+			expect(board.reviewHeadDetail(head)).toBeNull();
+	});
+
+	test("the findings one drawer sends are capped in all, newest rounds first", () => {
+		const round = (eventId: string, summary: string | null) => ({
+			eventId,
+			round: 1,
+			actorId: null,
+			verdict: "blocker" as const,
+			findings: 1,
+			by: "agent" as const,
+			actorName: null,
+			reason: null,
+			summary,
+			at: "2026-01-01T00:00:00.000Z",
+		});
+		const capped = capReviewSummaries(
+			[
+				round("a", "a".repeat(400)),
+				round("b", "b".repeat(400)),
+				round("c", null),
+				round("d", "d".repeat(700)),
+			],
+			1000,
+		);
+		expect(capped.map((entry) => entry.summary?.length ?? null)).toEqual([null, 300, null, 700]);
+		expect(capped.map((entry) => entry.summaryClipped ?? false)).toEqual([
+			true,
+			true,
+			false,
+			false,
+		]);
+		expect(capped[1]?.summary?.endsWith("…")).toBe(true);
+	});
+});
+
+describe("merge (M)", () => {
+	test("members only (as 退回); 202 with the phase; the drawer and the board read it back", async () => {
+		const { settleMergeJobs } = await import("../../services/teams/team-merge");
+		const merged: string[] = [];
+		work.setMergeNoteDeliveryForTests(async ({ text }) => {
+			merged.push(text);
+			return true;
+		});
+		try {
+			// The member's own NarraFork git identity commits the merge.
+			const { userGitIdentities } = await import("../../db/schema");
+			await db.insert(userGitIdentities).values({
+				id: generateId(),
+				userId: MEMBER,
+				name: "Member Person",
+				email: "member@example.com",
+				isDefault: true,
+				createdAt: new Date().toISOString(),
+			});
+			const { item } = await readyItem("Merge me", { "merge/me.txt": "merge\n" });
+			const path = teamPath(`work/${item.id}/merge`);
+			expect((await call(READER, path, { method: "POST" })).status).toBe(403);
+			expect((await call(OUTSIDER, path, { method: "POST" })).status).toBe(404);
+			const accepted = await call(MEMBER, path, { method: "POST" });
+			expect(accepted.status).toBe(202);
+			expect(accepted.body).toEqual({ itemId: item.id, job: "merge", phase: "queued" });
+			await settleMergeJobs();
+			// main is checked out in the project's directory: the merge is prepared, not applied.
+			const before = git(repo, "rev-parse", "main");
+			const drawer = await call(MEMBER, teamPath(`work/${item.id}`));
+			expect(drawer.status).toBe(200);
+			expect(drawer.body.merge).toMatchObject({
+				mode: "local",
+				phase: null,
+				outcome: "prepared",
+				canMerge: true,
+				disabledReason: null,
+				detail: { kind: "prepared", baseSha: before },
+				fastForward: {
+					available: true,
+					command: {
+						sh: expect.stringContaining("merge --ff-only --no-autostash --no-overwrite-ignore"),
+						powershell: expect.stringContaining("-ceq 'refs/heads/main'"),
+						preferred: "sh",
+					},
+				},
+			});
+			const onlooker = await call(READER, teamPath(`work/${item.id}`));
+			expect(onlooker.body.merge).toMatchObject({ outcome: "prepared", canMerge: false });
+			const column = await call(MEMBER, teamPath("board?column=review"));
+			const card = column.body.items.find((entry: { id: string }) => entry.id === item.id);
+			expect(card.merge).toMatchObject({ mode: "local", outcome: "prepared", canMerge: true });
+
+			// 「在该目录中快进」: the same access; then the item is merged.
+			const forward = teamPath(`work/${item.id}/merge/fast-forward`);
+			expect((await call(READER, forward, { method: "POST" })).status).toBe(403);
+			const fastForward = await call(MEMBER, forward, { method: "POST" });
+			expect(fastForward.status).toBe(202);
+			expect(fastForward.body).toEqual({ itemId: item.id, job: "fast_forward", phase: "queued" });
+			await settleMergeJobs();
+			expect(work.requireWorkItem(teamId, item.id).state).toBe("merged");
+			expect(git(repo, "rev-parse", "main")).not.toBe(before);
+			expect(git(repo, "log", "-1", "--format=%an <%ae>|%P", "main")).toBe(
+				`Member Person <member@example.com>|${before} ${item.headSha}`,
+			);
+			expect(git(repo, "status", "--porcelain", "--untracked-files=no")).toBe("");
+			expect(merged).toHaveLength(1);
+			// No longer ready: refused.
+			const again = await call(MEMBER, path, { method: "POST" });
+			expect(again.status).toBe(409);
+			expect(again.body.code).toBe("TEAM_WORK_ITEM_NOT_READY");
+		} finally {
+			work.setMergeNoteDeliveryForTests(null);
+		}
+	});
+
+	test("a read-only project member with coordinator write can neither merge nor fast-forward", async () => {
+		const { item } = await readyItem("Reader merges", { "merge/reader.txt": "reader\n" });
+		const grantId = generateId();
+		await db.insert(aclGrants).values({
+			id: grantId,
+			scopeType: "narrator",
+			scopeId: teamId,
+			principalType: "user",
+			principalId: READER,
+			capability: "write",
+			createdAt: new Date().toISOString(),
+		});
+		try {
+			// The coordinator grant makes them a member: they may return the item, as before.
+			const drawer = await call(READER, teamPath(`work/${item.id}`));
+			expect(drawer.body.canReturn).toBe(true);
+			// The drawer does not offer them the merge either.
+			expect(drawer.body.merge).toMatchObject({ canMerge: false });
+			for (const suffix of ["merge", "merge/fast-forward", "pr/merge", "pr/refresh"]) {
+				const response = await call(READER, teamPath(`work/${item.id}/${suffix}`), {
+					method: "POST",
+				});
+				expect({ suffix, status: response.status }).toEqual({ suffix, status: 403 });
+			}
+			expect(work.requireWorkItem(teamId, item.id).state).toBe("ready");
+		} finally {
+			await db.delete(aclGrants).where(eq(aclGrants.id, grantId));
+		}
+	});
+
+	test("a fast-forward without a prepared merge is refused", async () => {
+		const { item } = await readyItem("Nothing prepared", { "merge/none.txt": "none\n" });
+		const response = await call(MEMBER, teamPath(`work/${item.id}/merge/fast-forward`), {
+			method: "POST",
+		});
+		expect(response.status).toBe(409);
+		expect(response.body.code).toBe("TEAM_MERGE_NOT_PREPARED");
+	});
+});
+
+describe("pull requests (G)", () => {
+	async function onGitHub(
+		gh:
+			| { ok: true; methods: ("merge" | "squash" | "rebase")[] }
+			| {
+					ok: false;
+					reason: "gh_logged_out";
+			  },
+	) {
+		const hosting = await import("../../services/teams/team-hosting");
+		hosting.setHostingSourceForTests(async () => "git@github.com:acme/app.git");
+		hosting.setGhProbeForTests(async () => gh);
+		await hosting.hostingOf(repo);
+		return () => {
+			hosting.setHostingSourceForTests(null);
+			hosting.setGhProbeForTests(null);
+		};
+	}
+
+	test("members only (as the merge); a stranger gets 404; no pull request yet is refused with its reason", async () => {
+		const { settleMergeJobs } = await import("../../services/teams/team-merge");
+		const { item } = await readyItem("PR access", { "pr/access.txt": "pr\n" });
+		const restore = await onGitHub({ ok: true, methods: ["squash", "merge"] });
+		try {
+			// Nothing confirmed yet: a member who may not manage the project waits for a manager.
+			const unconfirmed = await call(MEMBER, teamPath(`work/${item.id}`));
+			expect(unconfirmed.body.merge).toMatchObject({
+				mode: "github",
+				canMerge: false,
+				disabledReason: "github_unconfirmed",
+				github: { target: "github.com/acme/app", pinned: null, canConfirm: false },
+			});
+			expect((await call(OWNER, teamPath(`work/${item.id}`))).body.merge.github).toMatchObject({
+				canConfirm: true,
+			});
+			const refused = await call(MEMBER, teamPath(`work/${item.id}/merge`), { method: "POST" });
+			expect(refused.body.code).toBe("TEAM_PR_TARGET_UNCONFIRMED");
+			// Only a project manager confirms it.
+			const pinPath = `/projects/${projectId}/team-github`;
+			const body = { target: "github.com/acme/app" };
+			expect((await call(MEMBER, pinPath, { method: "PUT", body })).status).toBe(403);
+			expect((await call(OUTSIDER, pinPath, { method: "PUT", body })).status).toBe(404);
+			expect(
+				(await call(OWNER, pinPath, { method: "PUT", body: { target: "acme/app" } })).status,
+			).toBe(400);
+			const pinned = await call(OWNER, pinPath, { method: "PUT", body });
+			expect(pinned.status).toBe(200);
+			expect(pinned.body).toMatchObject({
+				pinned: { host: "github.com", owner: "acme", repo: "app", confirmedBy: OWNER },
+				detected: "github.com/acme/app",
+			});
+			// Reading it needs project read only.
+			expect((await call(MEMBER, pinPath)).body.pinned.repo).toBe("app");
+			for (const suffix of ["pr/merge", "pr/refresh"]) {
+				const path = teamPath(`work/${item.id}/${suffix}`);
+				expect((await call(READER, path, { method: "POST" })).status).toBe(403);
+				expect((await call(OUTSIDER, path, { method: "POST" })).status).toBe(404);
+			}
+			const refresh = await call(MEMBER, teamPath(`work/${item.id}/pr/refresh`), {
+				method: "POST",
+			});
+			expect(refresh.status).toBe(409);
+			expect(refresh.body.code).toBe("TEAM_PR_NONE");
+			const mergePath = teamPath(`work/${item.id}/pr/merge`);
+			expect(
+				(await call(MEMBER, mergePath, { method: "POST", body: { method: "octopus" } })).status,
+			).toBe(400);
+			const rebase = await call(MEMBER, mergePath, { method: "POST", body: { method: "rebase" } });
+			expect(rebase.status).toBe(409);
+			expect(rebase.body.code).toBe("TEAM_PR_METHOD_NOT_ALLOWED");
+			const accepted = await call(MEMBER, mergePath, { method: "POST" });
+			expect(accepted.status).toBe(202);
+			expect(accepted.body).toEqual({ itemId: item.id, job: "pr_merge", phase: "queued" });
+			await settleMergeJobs();
+			const drawer = await call(MEMBER, teamPath(`work/${item.id}`));
+			expect(drawer.body.merge).toMatchObject({
+				mode: "github",
+				canMerge: true,
+				disabledReason: null,
+				pr: null,
+				detail: { kind: "failed", code: "TEAM_PR_NONE" },
+			});
+			expect(work.requireWorkItem(teamId, item.id).state).toBe("ready");
+			expect((await call(OWNER, pinPath, { method: "DELETE" })).body.pinned).toBeNull();
+		} finally {
+			restore();
+		}
+	});
+
+	test("the project PATCH never writes the confirmed repository, and keeps it", async () => {
+		const { projectRoutes } = await import("../projects");
+		const app = new Hono();
+		app.use("*", async (c, next) => {
+			c.set("user", { sub: OWNER, role: "user", iat: 0, exp: Number.MAX_SAFE_INTEGER });
+			await next();
+		});
+		app.route("/projects", projectRoutes);
+		const { pinnedGithubTarget, setPinnedGithubTarget } = await import(
+			"../../services/teams/team-github-pin"
+		);
+		setPinnedGithubTarget(projectId, { host: "github.com", owner: "acme", repo: "app" }, OWNER);
+		try {
+			const response = await app.request(`http://localhost/projects/${projectId}`, {
+				method: "PATCH",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					chapterSettings: {
+						teams: {
+							workStart: "local",
+							github: { host: "github.com", owner: "attacker", repo: "app" },
+						},
+					},
+				}),
+			});
+			expect(response.status).toBe(200);
+			expect(pinnedGithubTarget(projectId)).toMatchObject({ owner: "acme", repo: "app" });
+		} finally {
+			setPinnedGithubTarget(projectId, null, null);
+		}
+	});
+
+	test("GitHub with gh logged out: the merge is refused with the reason, never merged locally", async () => {
+		const { item } = await readyItem("PR logged out", { "pr/out.txt": "out\n" });
+		const before = git(repo, "rev-parse", "main");
+		const restore = await onGitHub({ ok: false, reason: "gh_logged_out" });
+		try {
+			const refused = await call(MEMBER, teamPath(`work/${item.id}/merge`), { method: "POST" });
+			expect(refused.status).toBe(409);
+			expect(refused.body.code).toBe("TEAM_PR_GH_LOGGED_OUT");
+			const drawer = await call(MEMBER, teamPath(`work/${item.id}`));
+			expect(drawer.body.merge).toMatchObject({
+				mode: "github",
+				canMerge: false,
+				disabledReason: "gh_logged_out",
+			});
+			expect(git(repo, "rev-parse", "main")).toBe(before);
+		} finally {
+			restore();
+		}
 	});
 });

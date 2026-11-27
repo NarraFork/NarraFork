@@ -143,6 +143,22 @@ func (d *Dispatcher) Dispatch(
 		return d.h.PtyResize(params)
 	case "pty.kill":
 		return d.h.PtyKill(params)
+	case "session.open":
+		return d.h.SessionOpen(params)
+	case "session.attach":
+		return d.h.SessionAttach(ctx, params, stream)
+	case "session.write":
+		return d.h.SessionWrite(params)
+	case "session.resize":
+		return d.h.SessionResize(params)
+	case "session.kill":
+		return d.h.SessionKill(params)
+	case "session.info":
+		return d.h.SessionInfo(params)
+	case "session.list":
+		return d.h.SessionList(params)
+	case "session.release":
+		return d.h.SessionRelease(params)
 	case "transfer.stat":
 		return d.h.TransferStat(params)
 	case "transfer.begin":

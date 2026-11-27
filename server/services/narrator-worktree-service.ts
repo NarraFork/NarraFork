@@ -20,11 +20,13 @@ import type { ExecutionBackend } from "../lib/agent/execution/backend";
 import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { AppError } from "../lib/errors";
 import {
+	cleanGitEnv,
 	ensureConfigOverridesHonored,
 	GIT_NO_EXEC_CONFIG,
 	gitConfigEnv,
 	PROGRAM_CONFIG_QUERY,
 	parseProgramConfig,
+	TRUE_HISTORY_ENV,
 	untrustedProgramOverrides,
 } from "../lib/git-exec-hardening";
 import { logger } from "../lib/logger";
@@ -184,6 +186,7 @@ export interface WorktreeServicePorts<Principal> {
 		signal: AbortSignal,
 		writing: boolean,
 		scope?: WorktreeGitScope,
+		env?: Readonly<Record<string, string | undefined>>,
 	) => Promise<SafeSpawnResult>;
 	/**
 	 * Removal side effects: the sessions, runtime objects and durable rows a worktree
@@ -792,6 +795,8 @@ export class NarratorWorktreeService<Principal> {
 		writing = false,
 		maxBytes = WORKTREE_MAX_OUTPUT_BYTES,
 		scope: WorktreeGitScope = { kind: "workspace" },
+		/** Extra environment (`measureLoss` reads history without replacements or grafts). */
+		env?: Readonly<Record<string, string | undefined>>,
 	) {
 		if (!target.backend || target.backend.kind !== "local")
 			error(
@@ -801,7 +806,7 @@ export class NarratorWorktreeService<Principal> {
 			);
 		signal.throwIfAborted();
 		const operation = this.ports.runGit
-			? this.ports.runGit(target, args, signal, writing, scope)
+			? this.ports.runGit(target, args, signal, writing, scope, env)
 			: this.hardenedConfig(target, args, scope, writing, signal).then((config) =>
 					safeSpawn({
 						cmd: ["git", "--no-optional-locks", ...this.scopeArgv(target, scope, writing), ...args],
@@ -809,15 +814,11 @@ export class NarratorWorktreeService<Principal> {
 						maxOutputBytes: maxBytes,
 						killProcessTree: true,
 						env: {
-							...process.env,
+							...cleanGitEnv(),
 							// Keep the unsupported-option diagnostic stable across server locales.
 							LC_ALL: "C",
-							GIT_DIR: undefined,
-							GIT_COMMON_DIR: undefined,
-							GIT_WORK_TREE: undefined,
-							GIT_INDEX_FILE: undefined,
-							GIT_EXTERNAL_DIFF: undefined,
 							...(config ? gitConfigEnv(config) : {}),
+							...env,
 						},
 						signal,
 					}),
@@ -861,12 +862,8 @@ export class NarratorWorktreeService<Principal> {
 			maxOutputBytes: 64 * 1024,
 			killProcessTree: true,
 			env: {
-				...process.env,
+				...cleanGitEnv(),
 				LC_ALL: "C",
-				GIT_DIR: undefined,
-				GIT_COMMON_DIR: undefined,
-				GIT_WORK_TREE: undefined,
-				GIT_INDEX_FILE: undefined,
 				...gitConfigEnv(config),
 			},
 			signal,
@@ -1711,7 +1708,10 @@ export class NarratorWorktreeService<Principal> {
 		signal: AbortSignal,
 	): Promise<{ dirtyFileCount: number; dirtyExact: boolean; unreachableCommits: number } | null> {
 		const runner =
-			(scope: WorktreeGitScope): GitQueryRunner =>
+			(
+				scope: WorktreeGitScope,
+				env?: Readonly<Record<string, string | undefined>>,
+			): GitQueryRunner =>
 			async (args, options) => {
 				const result = await this.run(
 					target,
@@ -1720,6 +1720,7 @@ export class NarratorWorktreeService<Principal> {
 					false,
 					options?.maxOutputBytes ?? WORKTREE_MAX_OUTPUT_BYTES,
 					scope,
+					env,
 				);
 				return {
 					stdout: result.stdout,
@@ -1740,8 +1741,13 @@ export class NarratorWorktreeService<Principal> {
 				entry?.detached && entry.head && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(entry.head)
 					? entry.head
 					: null;
+			// What would really be lost: a replacement ref or graft (repository content) claiming a
+			// branch reaches the detached commit must not skip the confirmation.
 			const unreachableCommits = head
-				? await countCommitsOnlyReachableFrom(runner({ kind: "repository" }), head)
+				? await countCommitsOnlyReachableFrom(
+						runner({ kind: "repository" }, TRUE_HISTORY_ENV),
+						head,
+					)
 				: 0;
 			return { dirtyFileCount: changes.count, dirtyExact: changes.exact, unreachableCommits };
 		} catch (cause) {
