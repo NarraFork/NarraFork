@@ -92,6 +92,19 @@ describe("git exec hardening", () => {
 		expect(asked).toBe(3);
 	});
 
+	test("an operator's protocol allowlist does not make the scratch probe inconclusive", async () => {
+		const previous = process.env.GIT_ALLOW_PROTOCOL;
+		process.env.GIT_ALLOW_PROTOCOL = "https";
+		try {
+			expect(await probeLazyFetch()).toBe("supported");
+			// Real repositories keep the operator's allowlist.
+			expect(cleanGitEnv().GIT_ALLOW_PROTOCOL).toBe("https");
+		} finally {
+			if (previous === undefined) delete process.env.GIT_ALLOW_PROTOCOL;
+			else process.env.GIT_ALLOW_PROTOCOL = previous;
+		}
+	});
+
 	test("lazy fetching: this git honours GIT_NO_LAZY_FETCH by behaviour; promisor settings are seen", async () => {
 		// git 2.45 is the first with it ("git --no-lazy-fetch", RelNotes 2.45.0); probed, not parsed.
 		expect(await probeLazyFetchHonoured()).toBe(true);

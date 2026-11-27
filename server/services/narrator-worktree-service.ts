@@ -1441,10 +1441,11 @@ export class NarratorWorktreeService<Principal> {
 		// Remove and prune read objects (`status`, `rev-list`, `worktree remove`, which runs a
 		// status): a partial clone this git cannot keep from fetching lazily is a blocker, found
 		// here before any runtime is torn down — even when no measurement below reads an object.
-		const partialClone = entry ? await this.partialCloneRefused(target, signal) : false;
-		const loss = partialClone
-			? null
-			: await this.measureLoss(target, entry, worktreePath, present, signal);
+		const gate = entry ? await this.removalLazyFetchGate(target, signal) : "passed";
+		const loss =
+			gate === "passed"
+				? await this.measureLoss(target, entry, worktreePath, present, signal)
+				: null;
 		const dirtyFileCount = loss?.dirtyFileCount ?? 0;
 		// Every dependent has to go somewhere. A linked checkout's `repositoryPath` is the
 		// Git directory, never a usable working directory, so the target is derived from
@@ -1510,7 +1511,7 @@ export class NarratorWorktreeService<Principal> {
 				),
 			);
 		// An unanswered loss question is a refusal, never "nothing to lose".
-		if (partialClone) blockers.push(removalBlocker("GIT_TOO_OLD_FOR_PARTIAL_CLONE"));
+		if (gate === "partialClone") blockers.push(removalBlocker("GIT_TOO_OLD_FOR_PARTIAL_CLONE"));
 		else if (!loss) blockers.push(removalBlocker("WORKTREE_REMOVAL_STATUS_UNAVAILABLE"));
 		if (loss && (loss.dirtyFileCount > 0 || !loss.dirtyExact || loss.unreachableCommits > 0))
 			confirmations.push("force");
@@ -1545,8 +1546,16 @@ export class NarratorWorktreeService<Principal> {
 		};
 	}
 
-	/** Whether the partial-clone gate refuses the repository; any other failure propagates. */
-	private async partialCloneRefused(target: WorktreeTarget, signal: AbortSignal) {
+	/**
+	 * The partial-clone gate of a removal preflight, as a plan answer: `partialClone` when it
+	 * refuses the repository, `unmeasured` when it could not tell (the configuration read failed,
+	 * timed out or was over its cap; the plan is then blocked as unmeasurable, never thrown, like
+	 * a failed loss measurement). Cancellation still propagates.
+	 */
+	private async removalLazyFetchGate(
+		target: WorktreeTarget,
+		signal: AbortSignal,
+	): Promise<"passed" | "partialClone" | "unmeasured"> {
 		try {
 			// Addressed by `--git-dir` when known: the checkout being removed may be gone.
 			await this.lazyFetchGate(
@@ -1555,10 +1564,14 @@ export class NarratorWorktreeService<Principal> {
 				false,
 				signal,
 			);
-			return false;
+			return "passed";
 		} catch (cause) {
-			if (isPartialCloneRefusal(cause)) return true;
-			throw cause;
+			signal.throwIfAborted();
+			if (isPartialCloneRefusal(cause)) return "partialClone";
+			logger.warn("Worktree removal could not check for a partial clone", {
+				reason: String(cause).slice(0, 256),
+			});
+			return "unmeasured";
 		}
 	}
 

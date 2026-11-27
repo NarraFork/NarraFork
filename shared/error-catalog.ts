@@ -217,13 +217,14 @@ export const ERROR_CATALOG = {
 	},
 	/**
 	 * A partial clone or promisor remote on a git not confirmed to honour `GIT_NO_LAZY_FETCH`
-	 * (git 2.45; probed by behaviour, so an inconclusive probe on a newer git lands here too,
-	 * retried later): teams and narrator worktrees refuse the repository.
+	 * (git 2.45; probed by behaviour: "unsupported" is kept for the process, so an upgraded git
+	 * is seen after a restart; an inconclusive probe, which lands here too, is retried after a
+	 * backoff): teams and narrator worktrees refuse the repository.
 	 */
 	GIT_TOO_OLD_FOR_PARTIAL_CLONE: {
 		status: 409,
 		code: "GIT_TOO_OLD_FOR_PARTIAL_CLONE",
-		en: "This repository is a partial clone (or names a promisor remote) and this git is not confirmed to honour GIT_NO_LAZY_FETCH, so it could fetch missing objects through it; GIT_NO_LAZY_FETCH needs git 2.45 or newer: update git, or retry later if it already is (the check may have failed)",
+		en: "This repository is a partial clone (or names a promisor remote) and this git is not confirmed to honour GIT_NO_LAZY_FETCH (git 2.45 or newer), so it could fetch missing objects through it: update git, then restart NarraFork so it checks again; if git is already 2.45 or newer the check failed and is retried automatically after a short wait",
 	},
 	GIT_REQUEST_CANCELLED: {
 		status: 499,

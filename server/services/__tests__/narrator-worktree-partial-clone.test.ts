@@ -11,7 +11,7 @@
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LocalBackend } from "../../lib/agent/execution/local-backend";
@@ -276,6 +276,30 @@ describe("narrator worktrees on a partial clone", () => {
 			"ready",
 		);
 		expect(ran()).toBe(false);
+	});
+
+	test("a configuration the gate cannot read blocks removal as unmeasurable, never throws", async () => {
+		const clone = await cloneOf("full");
+		const worktree = join(clone, ".worktrees", "existing");
+		await git(["worktree", "add", "-q", worktree, "other"], clone);
+		// Over the 64 KB cap of the gate's configuration read (the listing itself reads none).
+		const filters = Array.from(
+			{ length: 3000 },
+			(_, i) => `[filter "f${i}"]\n\tclean = cat\n`,
+		).join("");
+		await appendFile(join(clone, ".git", "config"), filters);
+		setNoLazyFetchSupportForTests(false);
+		const plan = await serviceFor(clone).planRemoval(
+			"actor",
+			"narrator",
+			{ workspaceKey: "workspace", path: worktree },
+			signal(),
+		);
+		expect(plan.status).toBe("blocked");
+		expect(plan.blockers.map((blocker) => blocker.code)).toEqual([
+			"WORKTREE_REMOVAL_STATUS_UNAVAILABLE",
+		]);
+		expect(existsSync(worktree)).toBe(true);
 	});
 
 	posixOnly("a promisor added right before the add is a clean, undispatched failure", async () => {

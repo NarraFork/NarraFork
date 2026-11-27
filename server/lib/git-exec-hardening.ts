@@ -343,6 +343,10 @@ export async function probeLazyFetch(): Promise<LazyFetchVerdict> {
 					GIT_CONFIG_NOSYSTEM: "1",
 					GIT_CONFIG_GLOBAL: DEV_NULL,
 					GIT_CEILING_DIRECTORIES: dir ?? undefined,
+					// The probe's promisor is a scratch repository next to it, reached over `file`:
+					// an operator's allowlist (say `https` only) must not make every verdict
+					// inconclusive. Only these scratch commands; real repositories keep it.
+					GIT_ALLOW_PROTOCOL: "file",
 					...TRUE_HISTORY_ENV,
 					...env,
 				},

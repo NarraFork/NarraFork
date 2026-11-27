@@ -18,7 +18,7 @@ import {
 	test,
 } from "bun:test";
 import { existsSync } from "node:fs";
-import { chmod, lstat, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, chmod, lstat, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { WorktreeDependent } from "@shared/narrator-worktrees";
@@ -854,6 +854,41 @@ describe("cleanup on a partial clone", () => {
 			expect(events(item.id).find((event) => event.kind === "work.cleanup")?.detail).toMatchObject({
 				outcome: "refused",
 				code: "GIT_TOO_OLD_FOR_PARTIAL_CLONE",
+			});
+		} finally {
+			setNoLazyFetchSupportForTests(null);
+		}
+	});
+});
+
+describe("cleanup when the partial-clone check cannot read the configuration", () => {
+	test("the unmeasurable plan is recorded as a work.cleanup refusal", async () => {
+		const item = await create("Unreadable");
+		const path = worktreePathOf(item) ?? "";
+		cancelWorkItem({ coordinatorId: LEAD, itemId: item.id, actor: agent });
+		// Over the 64 KB cap of the gate's configuration read.
+		const filters = Array.from(
+			{ length: 3000 },
+			(_, i) => `[filter "f${i}"]\n\tclean = cat\n`,
+		).join("");
+		await appendFile(join(source, ".git", "config"), filters);
+		setNoLazyFetchSupportForTests(false);
+		try {
+			const refused = await cleanupWorkItem({
+				coordinatorId: LEAD,
+				itemId: item.id,
+				principal,
+				actor: agent,
+				signal: signal(),
+			});
+			expect(refused).toMatchObject({
+				outcome: "refused",
+				code: "WORKTREE_REMOVAL_STATUS_UNAVAILABLE",
+			});
+			expect(existsSync(path)).toBe(true);
+			expect(events(item.id).find((event) => event.kind === "work.cleanup")?.detail).toMatchObject({
+				outcome: "refused",
+				code: "WORKTREE_REMOVAL_STATUS_UNAVAILABLE",
 			});
 		} finally {
 			setNoLazyFetchSupportForTests(null);
