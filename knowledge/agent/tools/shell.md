@@ -50,7 +50,7 @@ keywords:
   - terminal watch
   - [watch]
 status: draft
-verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
+verified_at: ba64719c705fcd73c898448738ffb0dc2acd9bf7
 ---
 # 命令与终端工具
 
@@ -73,7 +73,7 @@ verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 - Stop 的授权以被跟踪的任务为准，而不是入参里的 `device` 或会话目录：先解别名，任务必须存在、属于本叙述者、类型相符（`stop-task-policy.ts:resolveOwnedStopTask`）。
 - Watch 的实现：`watch-service.ts:watchTask` 注册观察，终端观察是一条后台 `bash` 任务（复用任务行、TeamStatus 列表、Stop 取消、完成通知），匹配渲染后的终端文本而不是原始 PTY 字节，起点是 xterm marker，输出只把观察标脏、最多每 250ms 读一次文本；终态为 `completed` / `timeout` / `failed` / `cancelled`（`terminal-watch-service.ts`）；同一被观察条件只有一个等待者，多个观察共享（`watch-source.ts`）；Watch 行的命令前缀 `[watch]`、`[terminal watch]` 让服务端拒绝把它们当 Watch 目标、任务面板默认过滤（`shared/watch-command.ts`、`terminal-watch-constants.ts`）。
 - Watch 的重启恢复：重启时遗留的 running Watch 行，只有同时满足以下条件才保留并重新挂接，否则以重启通知结束（`watch-restart.ts:restartResumableWatch`）：
-  - 无 `pattern`（只观察生命周期；文本观察看不到停机期间的输出，仍结束为 interrupted）。
+  - 无 `pattern`（只观察生命周期），或者是 terminal 文本观察；bash 文本观察看不到停机期间的输出，仍结束为 interrupted。terminal 文本观察能否真的挂接，还要看终端快照里有没有存下它的起点（见下）。
   - 命令里有 `timeoutMs`。
   - bash / agent 目标有 `runId` 绑定；terminal 目标自带绑定（重启不复用终端 id）。
   - 原始截止时间（`createdAt + timeoutMs`）尚未过。
@@ -83,6 +83,7 @@ verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
   - bash：目标任务必须仍 running、属于同一叙述者、`logicalRunId` 与 runId 一致。
   - agent：叙述者 `logicalRunId` 一致、仍是团队成员、快照状态为 running。
   - terminal：先等 `terminalService.whenStartupRecoverySettled()`，在后台挂接，不拖慢叙述者恢复；终端已退出或已脱离，由 Watch 自己报告。
+  - terminal 文本观察：只在执行器会话终端上能续接。登记时 `saveDurableAnchor` 把起点（读取游标 + `{pattern, start}`）交给缓冲（`BufferManager.setDurableAnchor`）并立刻落盘一次；之后每次快照都带上它，关停时 `release` 保留它。重启后 `resumeExecutorSession` 取回快照里的起点（`takeRestoredAnchors` → `registerRestoredWatchAnchors`），在 Watch 挂接前把续读的输出整个暂存（`holdOutputWhile`）；`resumeTerminalWatch` 用 `claimRestoredWatchAnchor` 取到同一行、同一模式的起点，按原 `start` 重建匹配器，从起点那一行重扫——停机前打印但还没检查过的输出也算，起点前的旧文本不算——然后 `finishRestoredWatchAnchor` 放行暂存输出，续读里的缺口、执行器重启和退出照常由活着的 Watch 处理。没人认领的起点在全部终端 Watch 挂接完后由 `closeRestoredWatchAnchors` 丢弃（之后恢复的终端不再保留），最晚 `RESTORED_WATCH_CLAIM_TIMEOUT_MS`（60 秒）也会放行。没有存下起点（dtach 终端、登记后还没来得及落盘、登记后终端改过布局）时按 interrupted 结束。
   - 挂接复用原行 id 与精确句柄（`restoreTaskAlias`）；重复遗留行并入先挂接的观察时，只有持有活观察的那一行算挂接成功。
   - 挂接失败：行被标为失败并带 `TERMINAL_WATCH_RESTART_NOTICE`（只声称 Watch 没有停止目标，重启本身可能已停止）。
 - Terminal（可选工具）：动作 `create` / `rename` / `read` / `write` / `list`。`read` 默认增量，只给上次读/写之后的新输出，`last_n_lines` 覆盖增量；`write` 的 `notify_on` 在发送前先建立 Watch 并排除输入回显。终端是不受逐行检查的 shell，是否可用由会话权限模式整体决定。Terminal 不做一次性命令。终端行的查找（按 id、再按名字先 running 后 exited）、访问检查、`list` 与 Watch 的状态读取都在读 Worker 上（`terminal.ts:resolveTerminalId`/`assertTerminalAccess`/`listTerminals`，`worker-required`、30s 超时），Worker 不可用时该动作失败。
@@ -101,7 +102,7 @@ verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 - 改 Bash 并行规则：单一来源是 `shared/tool-parallel-groups.ts`（`tool-execution-groups.test.ts`）。
 - 改自动放行（`bash-analyze.ts`）会影响权限判定，跑 `agent/__tests__/bash-analyze.test.ts`，并看 [工具调用审批](../../security/tool-permissions/index.md)。
 - 新增后台任务种类要同步任务列表分页与占用索引（`shared/background-task-list.ts`、`background-occupancy-*.ts`），列表读取不得带出消息或输出大字段。
-- 改重启恢复：`watch-restart.ts` 的资格判断、`background-task-service.ts` 的扫描与 `resumeDeferredWatches`、`watch-service.ts:resumeWatchAfterRestart` 要一起看；登记者新增写入点要传 `principal`（`background_tasks.principal_json`）。`terminalLifecycleReader`（`terminal-watch-service.ts`）由 Terminal 工具和重启挂接共用。
+- 改重启恢复：`watch-restart.ts` 的资格判断、`background-task-service.ts` 的扫描与 `resumeDeferredWatches`、`watch-service.ts:resumeWatchAfterRestart` 要一起看；终端文本观察还牵涉 `terminal-watch-service.ts` 的起点登记/认领、`buffer-manager.ts` 的快照锚点和 `terminal-service.ts:resumeExecutorSession` 的暂存，测试在 `terminal-watch.test.ts`（"continue after a restart"）；`closeRestoredWatchAnchors` 必须在后台终端挂接全部结束后才调，早调会丢掉还没认领的起点；登记者新增写入点要传 `principal`（`background_tasks.principal_json`）。`terminalLifecycleReader`（`terminal-watch-service.ts`）由 Terminal 工具和重启挂接共用。
 - Watch/Stop 新增目标类型要同时改 `watch-observation.ts` 的校验、`stop-task-policy.ts` 的授权与 `shared/watch-command.ts` 的前缀过滤；Watch 观察超时只结束观察，不停止目标。
 - 测试：`tools/__tests__/bash-stop-teamstatus.test.ts`、`bash-workspace-activity.test.ts`、`terminal-watch-tool.test.ts`、`pipeline*.test.ts`，`agent/__tests__/execution-timeout.test.ts`。
 

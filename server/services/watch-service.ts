@@ -12,7 +12,12 @@ import { assertOAuthNarratorRuntimeActive } from "./oauth-narrator-runtime-polic
 import { resolveTaskAlias } from "./subagent-alias";
 import { agentLabelFromNarrator } from "./subagent-label";
 import { TERMINAL_WATCH_COMMAND_PREFIX, WATCH_COMMAND_PREFIX } from "./terminal-watch-constants";
-import { startTerminalWatch, terminalLifecycleReader } from "./terminal-watch-service";
+import {
+	claimRestoredWatchAnchor,
+	finishRestoredWatchAnchor,
+	startTerminalWatch,
+	terminalLifecycleReader,
+} from "./terminal-watch-service";
 import { resolveNarratorRuntimePolicy } from "./trait-layer-service";
 import {
 	type AdoptedWatchRow,
@@ -428,7 +433,8 @@ export async function resumeWatchAfterRestart(
 		userId: row.principal.userId,
 	};
 	await checkObservationAuthorization(actor, target.type);
-	if (target.type === "terminal") return resumeTerminalWatch(row, target.id, adopt, timeout);
+	if (target.type === "terminal")
+		return resumeTerminalWatch(row, target.id, target.pattern, adopt, timeout);
 	const input: TaskWatchInput = { type: target.type, id: target.id, timeout };
 	let result: ToolResult;
 	if (target.type === "bash") {
@@ -476,6 +482,7 @@ export async function resumeWatchAfterRestart(
 async function resumeTerminalWatch(
 	row: RestartWatchRow,
 	terminalId: string,
+	pattern: string | undefined,
 	adopt: AdoptedWatchRow,
 	timeoutMs: number,
 ): Promise<boolean> {
@@ -496,6 +503,33 @@ async function resumeTerminalWatch(
 	const terminal = await readTerminal();
 	if (!terminal || terminal.narratorId !== row.parentNarratorId) return false;
 	const buffer = terminalService.getActiveBuffer(terminalId);
+	if (pattern) {
+		// A text watch continues only from the start point its terminal's snapshot
+		// restored; the terminal holds its replayed output until this settles.
+		const anchor = claimRestoredWatchAnchor(row.id, terminalId, buffer, pattern);
+		if (!anchor) return false;
+		try {
+			const started = await startTerminalWatch({
+				narratorId: row.parentNarratorId,
+				terminalId,
+				terminalName: terminal.name,
+				pattern,
+				timeoutMs,
+				buffer: anchor.buffer,
+				cursor: anchor.cursor,
+				marker: anchor.cursor.marker,
+				observedEndMarker: anchor.cursor.observedEndMarker,
+				disposeMarkers: () => anchor.cursor.dispose(),
+				prefixUnknown: anchor.cursor.prefixUnknown,
+				layoutRevision: anchor.cursor.layoutRevision,
+				start: anchor.start,
+				adopt,
+			});
+			return started.status === "started" && started.taskId === row.id;
+		} finally {
+			finishRestoredWatchAnchor(row.id, terminalId);
+		}
+	}
 	const started = await startTerminalWatch({
 		narratorId: row.parentNarratorId,
 		terminalId,

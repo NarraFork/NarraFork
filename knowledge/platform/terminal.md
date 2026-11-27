@@ -39,7 +39,7 @@ keywords:
   - 孤儿终端
   - /api/admin/terminals
 status: draft
-verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
+verified_at: ba64719c705fcd73c898448738ffb0dc2acd9bf7
 ---
 # 终端运行时
 
@@ -54,8 +54,10 @@ verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
   - 停止和释放执行器会话不是运行时的事（运行时的 `kill()` 只停止读取），由 `terminal-service` 从持久记录做：终端关闭（`kill`）时在拆除缓冲、标记已退出之前，shell 自然退出（`monitorShellExit`）时在最终缓冲和退出码落盘之后，往 `executor_session_cleanups`（`device_id`+`session_id`）写一行，再发 `session.kill { release: true }`；执行器确认或回复 "session not found" 才删这行，其他错误（离线、断线、缺特性）保留。每次 `device:status` 上线按设备分页（每页 100）重试；设备在线期间若还有没送达的（读 Worker 拒绝、RPC 超时等临时失败），按 0.5 秒、5 秒、30 秒、之后每 2 分钟退避重试，确实掉线（不在线）才停、再上线重新开始；旧连接迟到的 offline 事件不取消重试（`EXECUTOR_CLEANUP_RETRY_MS`）。这张表与终端行无关，删终端行、重启、设备离线都不会丢掉停止。这套记录与重试在 `services/executor-session-cleanup.ts`，远端后台 Bash 也用它。
   - 执行器重启过（`session.journal.disk.v1`）：attach 先回放它记录在磁盘上的输出，结果带 `lost: true` 时终端里显示一行"executor restarted while this was running"并结束（`remote-session.ts`，`LOST_REASON`）；带 `outputIncomplete` 时显示"部分输出缺失"。两种提示之前都先调 `onRestartInterrupted` → `interruptTextWatchesForRestart`，期间输出暂存（与缺口同一套 `holdOutputWhile`），所以提示文字不会让文本 Watch 误匹配。
   - 新建时 `session.open` 的回复因断线丢失：等设备回来（最多 15 秒）重发，执行器回 "already exists" 就接管；仍不确定时创建失败并写清理记录（`RemoteSessionOpenUnknownError`）。
-  - 执行器报告的缺口（`session.gap`）：先调 `interruptTextWatchesForGap`，期间这个终端后续输出（含缺口提示）暂存在 `heldOutput`，所以提示和缺口后的输出不会参与缺口前的匹配；然后在终端里显示一行"N bytes of output were not retained"，不静默跳过。暂存期间 shell 退出时，`monitorShellExit` 先等暂存输出写回缓冲（`drainHeldOutput`）再落盘；`kill` 删除缓冲时丢弃暂存。
+  - 执行器报告的缺口（`session.gap`）：先调 `interruptTextWatchesForGap`，期间这个终端后续输出（含缺口提示）暂存在 `heldOutput`，所以提示和缺口后的输出不会参与缺口前的匹配；暂存期间又来的缺口或重启中断排进同一队列，等它之前的输出写回缓冲后才处理；然后在终端里显示一行"N bytes of output were not retained"，不静默跳过。暂存期间 shell 退出时，`monitorShellExit` 先等暂存输出写回缓冲（`drainHeldOutput`）再落盘；`kill` 删除缓冲时丢弃暂存。
 - `BufferManager.append(data, streamSeq?)`：带编号的来源（执行器会话）在 xterm 解析完一批后记下位置，落盘快照写 `streamSeq`，`loadFromDisk` 读回为 `restoredStreamSeq`；不带编号的来源不写这个字段（`buffer-manager.ts`）。
+- 快照锚点（只在带编号的缓冲上）：`setDurableAnchor(id, cursor, data)` 让读取游标随每次快照存下来（`anchors`：起点行号与该行文本、观察末行、`prefixUnknown`、调用方的 JSON `data`；起点行已滚出 scrollback 时存 `null`，恢复成"起点已丢失"）。游标还带着旧布局的帧、登记后改过布局、或数据超过 `MAX_DURABLE_ANCHOR_DATA_CHARS` 时不存；最多 `MAX_DURABLE_ANCHORS` 个。`loadFromDisk` 回放完快照、在新输出之前按行号重建游标，行文本对不上就丢弃；`takeRestoredAnchors` 只交出一次，没人用的随缓冲释放。用途是终端文本 Watch 跨重启续接（见 [命令与终端工具](../agent/tools/shell.md)）。
+- 执行器会话终端恢复时如果快照带锚点，`resumeExecutorSession` 把续读的输出整个暂存，直到重启恢复挂接完对应的 Watch（`registerRestoredWatchAnchors` 返回的 promise）。
 - dtach 仅限非 Windows：`dtachService.isAvailable()` 在 win32 恒为 false，其余平台用 `which dtach` 检测并缓存（`terminal/dtach-service.ts`）。dtach 会话以 `terminal-<id>.sock` 存放；服务端只持有 attach 进程。
 - 关闭服务时（`shutdownAll`）：dtach 终端保存缓冲、关闭 attach 进程但不杀会话，数据库状态保持 `running`；执行器会话终端保存带 `streamSeq` 的缓冲、停止读取但不杀会话，状态同样保持 `running`；直连终端和旧 `pty.open` 远程终端被杀并标记已退出（退出码 -1）。启动时 `recoverOnStartup`：
   - 有 `deviceId` 且有 `executor_session_id` 的 `running` 行：从快照的 `restoredStreamSeq` 续读（`resumeExecutorSession`）；快照没有这个字段时丢弃快照、从 0 重放设备保留的输出；设备不在线也照样恢复为已附着，等设备上线。
@@ -80,7 +82,7 @@ verified_at: 4d69bf50aa11b8bfaf6cc4a12a71f118ace320d2
 - 新增 WS 消息类型：`validators/websocket.ts` 的 `terminalWsMessageSchema`、`websocket/terminal-ws.ts` 的分派、前端终端组件；`terminal-session-revalidation.test.ts` 钉着会话变化后连接的复核。
 - 新增 PTY 后端：实现 `TerminalRuntime`，并在 `terminal-service.ts` 的创建顺序里决定位置；远程设备要先过授权/能力检查再有副作用（`runtime-remote.test.ts`）。
 - 改 dtach 恢复或关闭语义：`dtach-recovery-probe.test.ts`、`services/__tests__/terminal-startup-recovery.test.ts`；不变量：dtach 终端关闭服务时不杀会话、DB 状态保持 `running`，恢复探测失败保留状态而不是删除。
-- 改缓冲：`buffer-manager.test.ts`；订阅回放的读取游标和布局快照有数量/字节上限，别去掉。`streamSeq` 只能记 xterm 已解析的位置，否则重启续读会重复或漏掉输出。
+- 改缓冲：`buffer-manager.test.ts`（含 "durable read anchors"）；快照锚点的行号依赖快照按行原样恢复 normal 缓冲，改序列化方式要重新验证；订阅回放的读取游标和布局快照有数量/字节上限，别去掉。`streamSeq` 只能记 xterm 已解析的位置，否则重启续读会重复或漏掉输出。
 - 改执行器会话终端：`remote-session.test.ts`（断线续读、输入只执行一次、缺口先于提示、打开回复丢失后接管）、`terminal-executor-session.test.ts`（启动续读、关闭只脱离、离线停止的持久化与重试、退出先落盘再释放、缺口暂存输出在退出前写回、关闭先记停止再标记退出、创建分支）；不变量：执行器会话只在本地最终状态落盘后才释放，清理记录只在执行器确认后删除。协议两端要和 `remote-executor/internal/session/` 一致，见 [设备与远程执行](../remote/devices.md)。
 - 新增终端 REST 路由要经 `terminal-access.ts` 判断权限，不要只看登录。
 

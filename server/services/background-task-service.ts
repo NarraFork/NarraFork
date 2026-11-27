@@ -4416,11 +4416,20 @@ class BackgroundTaskService {
 	}
 
 	/**
-	 * Re-attach each deferred lifecycle watch to its target; a watch that cannot be
+	 * Re-attach each deferred watch to its target; a watch that cannot be
 	 * re-attached ends with the restart notice, exactly as it would have without this.
 	 */
 	private async resumeDeferredWatches(deferred: readonly DeferredRestartWatch[]): Promise<number> {
-		if (deferred.length === 0) return 0;
+		// Once every terminal watch has had its chance, terminal output held for text
+		// watches that nobody resumed can flow again.
+		const closeRestoredAnchors = async () => {
+			const { closeRestoredWatchAnchors } = await import("./terminal-watch-service");
+			closeRestoredWatchAnchors();
+		};
+		if (deferred.length === 0) {
+			await closeRestoredAnchors();
+			return 0;
+		}
 		const { resumeWatchAfterRestart } = await import("./watch-service");
 		const resumeOne = async ({ task, row, target }: DeferredRestartWatch): Promise<boolean> => {
 			try {
@@ -4457,7 +4466,8 @@ class BackgroundTaskService {
 				for (const watch of terminalWatches) if (await resumeOne(watch)) reattached++;
 				if (reattached)
 					logger.info("Re-attached terminal watches after restart", { resumed: reattached });
-			})();
+			})().finally(closeRestoredAnchors);
+		else await closeRestoredAnchors();
 		return deferred.length;
 	}
 

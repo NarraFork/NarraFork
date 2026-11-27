@@ -26,9 +26,10 @@ export type ResumableWatchTarget = WatchTarget & { timeoutMs: number } & (
 
 /**
  * Whether restart recovery should keep this watch row for re-attachment instead of
- * ending it. Only lifecycle observations qualify (no `pattern`): they need nothing
- * but the target's durable state. Text watches cannot prove they saw the output
- * produced while no server was running, so they still end as interrupted.
+ * ending it. Lifecycle observations (no `pattern`) need nothing but the target's
+ * durable state. A text watch qualifies only on a terminal, and is re-attached only
+ * if that terminal's snapshot restored its start point (an executor-session terminal,
+ * whose output since then is replayed); otherwise it still ends as interrupted.
  * A watch whose original deadline passed during the downtime also ends: the restart
  * cannot tell whether the target finished before or after that deadline.
  */
@@ -37,7 +38,8 @@ export function restartResumableWatch(
 	createdAt: string,
 	now = Date.now(),
 ): target is ResumableWatchTarget {
-	if (!target || target.pattern || target.timeoutMs == null) return false;
+	if (!target || target.timeoutMs == null) return false;
+	if (target.pattern && target.type !== "terminal") return false;
 	// Without a run binding a later run of the same Bash task or agent could be mistaken
 	// for the observed one. A terminal is its own binding: a restart never reuses its id.
 	if (target.type !== "terminal" && !target.runId) return false;

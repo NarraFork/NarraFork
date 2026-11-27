@@ -46,6 +46,8 @@ interface BufferFileV3 {
 	 * output; a reattach resumes from exactly here.
 	 */
 	streamSeq?: number;
+	/** Read cursors that must survive a restart (see {@link BufferManager.setDurableAnchor}). */
+	anchors?: StoredAnchor[];
 	mouseMode: {
 		x10: boolean;
 		buttonEvent: boolean;
@@ -53,6 +55,32 @@ interface BufferFileV3 {
 		sgr: boolean;
 	};
 }
+
+/**
+ * A read cursor saved with the snapshot. Rows are indexes into the normal
+ * buffer, which a snapshot restores row for row; `lineText` verifies that.
+ */
+interface StoredAnchor {
+	id: string;
+	/** Null once the start row left the scrollback: everything retained came after it. */
+	line: number | null;
+	lineText?: string;
+	endLine: number | null;
+	endLineText?: string;
+	prefixUnknown: boolean;
+	data: unknown;
+}
+
+/** A saved read cursor recreated by loadFromDisk(), owned by the caller once taken. */
+export interface RestoredBufferAnchor {
+	id: string;
+	cursor: BufferReadCursor;
+	data: unknown;
+}
+
+/** Bounds what one snapshot carries for anchors. */
+export const MAX_DURABLE_ANCHORS = 64;
+export const MAX_DURABLE_ANCHOR_DATA_CHARS = 64 * 1024;
 
 /**
  * Bytes the VT parser must send back to the program it is emulating.
@@ -214,6 +242,15 @@ export class BufferManager {
 	private appliedStreamSeq: number | undefined;
 	/** Stream position recorded in the snapshot loaded from disk, if any. */
 	private loadedStreamSeq: number | undefined;
+
+	/** Cursors saved with each snapshot, by caller id, with the layout their data refers to. */
+	private readonly durableAnchors = new Map<
+		string,
+		{ cursor: BufferReadCursor; data: unknown; layoutRevision: number }
+	>();
+	/** Anchors read by loadFromDisk(), recreated once the snapshot has been replayed. */
+	private loadedAnchors: StoredAnchor[] = [];
+	private restoredAnchors: RestoredBufferAnchor[] = [];
 
 	/** Whether a drain loop is currently scheduled/running. */
 	private draining = false;
@@ -660,6 +697,123 @@ export class BufferManager {
 		};
 	}
 
+	/**
+	 * Save `cursor` with every snapshot under `id`, so a restarted server can
+	 * recreate it at the same row (see {@link takeRestoredAnchors}). Only for
+	 * sources that number their output: their snapshot is resumed, not rebuilt.
+	 * `data` must be JSON and describes the cursor's start in its current layout;
+	 * a cursor still holding frames of an earlier layout is refused, and one whose
+	 * layout changes later stops being saved. Returns whether it was accepted.
+	 */
+	setDurableAnchor(id: string, cursor: BufferReadCursor, data: unknown): boolean {
+		const state = this.ownedReadCursors.get(cursor);
+		if (
+			this.disposed ||
+			this.appliedStreamSeq === undefined ||
+			!state ||
+			state.error ||
+			state.pending.length > 0 ||
+			(!this.durableAnchors.has(id) && this.durableAnchors.size >= MAX_DURABLE_ANCHORS) ||
+			JSON.stringify(data).length > MAX_DURABLE_ANCHOR_DATA_CHARS
+		)
+			return false;
+		this.durableAnchors.set(id, { cursor, data, layoutRevision: state.layoutRevision });
+		this.dirty = true;
+		return true;
+	}
+
+	deleteDurableAnchor(id: string): void {
+		if (this.durableAnchors.delete(id)) this.dirty = true;
+	}
+
+	/** Anchors to save, read in the same synchronous step as the serialization. */
+	private storedAnchors(): StoredAnchor[] {
+		const out: StoredAnchor[] = [];
+		if (this.xterm.buffer.active.type !== "normal") return out;
+		const normal = this.xterm.buffer.normal;
+		const rowText = (line: number) => normal.getLine(line)?.translateToString(true) ?? "";
+		for (const [id, anchor] of this.durableAnchors) {
+			const state = this.ownedReadCursors.get(anchor.cursor);
+			if (
+				!state ||
+				state.error ||
+				state.pending.length > 0 ||
+				state.layoutRevision !== anchor.layoutRevision
+			)
+				continue;
+			const lost = state.markerLost || state.marker.isDisposed || state.marker.line < 0;
+			const end = state.observedEndMarker;
+			const endLost = !end || end.isDisposed || end.line < 0;
+			const line = lost ? null : state.marker.line;
+			const endLine = endLost ? null : end.line;
+			out.push({
+				id,
+				line,
+				...(line === null ? {} : { lineText: rowText(line) }),
+				endLine,
+				...(endLine === null ? {} : { endLineText: rowText(endLine) }),
+				prefixUnknown: state.prefixUnknown,
+				data: anchor.data,
+			});
+		}
+		return out;
+	}
+
+	/** Recreate the loaded anchors on the replayed snapshot, before any new output. */
+	private restoreAnchors(): void {
+		const stored = this.loadedAnchors;
+		this.loadedAnchors = [];
+		if (this.disposed || this.xterm.buffer.active.type !== "normal") return;
+		const normal = this.xterm.buffer.normal;
+		const cursorRow = normal.baseY + normal.cursorY;
+		const rowMatches = (line: number, text: string | undefined) =>
+			line < normal.length && (normal.getLine(line)?.translateToString(true) ?? "") === text;
+		for (const anchor of stored) {
+			if (this.ownedReadCursors.size >= MAX_BUFFER_READ_CURSORS) break;
+			// A row that does not hold what it held when saved cannot be trusted.
+			if (anchor.line !== null && !rowMatches(anchor.line, anchor.lineText)) continue;
+			if (anchor.endLine !== null && !rowMatches(anchor.endLine, anchor.endLineText)) continue;
+			const marker = this.xterm.registerMarker((anchor.line ?? 0) - cursorRow);
+			if (!marker) continue;
+			const observedEndMarker =
+				anchor.endLine === null
+					? undefined
+					: anchor.endLine === anchor.line
+						? marker
+						: this.xterm.registerMarker(anchor.endLine - cursorRow);
+			if (anchor.endLine !== null && !observedEndMarker) {
+				marker.dispose();
+				continue;
+			}
+			const cursor = this.createReadCursor(
+				{
+					marker,
+					markerLost: anchor.line === null,
+					observedEndMarker,
+					prefixUnknown: anchor.prefixUnknown,
+					columns: this.xterm.cols,
+					layoutRevision: this.layoutSequence,
+					pending: [],
+				},
+				"",
+				0,
+				++this.readSequence,
+			);
+			this.restoredAnchors.push({ id: anchor.id, cursor, data: anchor.data });
+		}
+	}
+
+	/**
+	 * The cursors saved with the snapshot loadFromDisk() restored, once it has been
+	 * replayed. Each is handed out once; the caller disposes the ones it does not use.
+	 */
+	async takeRestoredAnchors(): Promise<RestoredBufferAnchor[]> {
+		await this.writeChain;
+		const anchors = this.restoredAnchors;
+		this.restoredAnchors = [];
+		return anchors;
+	}
+
 	/** Get current terminal state for client notification */
 	getState(): { mouseTracking: boolean; cursorVisible: boolean } {
 		const mouseTracking =
@@ -770,6 +924,8 @@ export class BufferManager {
 					mouseMode: { ...this.mouseMode },
 					...(this.appliedStreamSeq !== undefined ? { streamSeq: this.appliedStreamSeq } : {}),
 				};
+				const anchors = this.appliedStreamSeq === undefined ? [] : this.storedAnchors();
+				if (anchors.length > 0) fileData.anchors = anchors;
 				const written = await Bun.write(filePath, JSON.stringify(fileData));
 				this.dirty = false;
 				return written;
@@ -837,6 +993,9 @@ export class BufferManager {
 				if (Number.isSafeInteger(parsed.streamSeq) && parsed.streamSeq >= 0) {
 					this.loadedStreamSeq = parsed.streamSeq;
 					this.appliedStreamSeq = parsed.streamSeq;
+					this.loadedAnchors = parseStoredAnchors(parsed.anchors);
+					if (this.loadedAnchors.length > 0)
+						this.writeChain = this.writeChain.then(() => this.restoreAnchors());
 				}
 				logger.debug("Loaded buffer from disk (V3)", {
 					terminalId: this.terminalId,
@@ -918,4 +1077,31 @@ export class BufferManager {
 		if (data.includes(`${ESC}[?1006h`)) this.mouseMode.sgr = true;
 		if (data.includes(`${ESC}[?1006l`)) this.mouseMode.sgr = false;
 	}
+}
+
+function isRow(value: unknown): value is number | null {
+	return value === null || (Number.isSafeInteger(value) && (value as number) >= 0);
+}
+
+/** Anchors from a snapshot file; malformed entries are dropped. */
+function parseStoredAnchors(value: unknown): StoredAnchor[] {
+	if (!Array.isArray(value)) return [];
+	const out: StoredAnchor[] = [];
+	for (const item of value.slice(0, MAX_DURABLE_ANCHORS)) {
+		if (!item || typeof item !== "object") continue;
+		const a = item as Record<string, unknown>;
+		if (typeof a.id !== "string" || !isRow(a.line) || !isRow(a.endLine)) continue;
+		if (a.line !== null && typeof a.lineText !== "string") continue;
+		if (a.endLine !== null && typeof a.endLineText !== "string") continue;
+		out.push({
+			id: a.id,
+			line: a.line,
+			...(a.line === null ? {} : { lineText: a.lineText as string }),
+			endLine: a.endLine,
+			...(a.endLine === null ? {} : { endLineText: a.endLineText as string }),
+			prefixUnknown: a.prefixUnknown === true,
+			data: a.data,
+		});
+	}
+	return out;
 }

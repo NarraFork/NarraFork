@@ -100,6 +100,7 @@ afterEach(async () => {
 	for (const deviceId of ["dev-1", "dev-2", "dev-3"])
 		eventBus.emit({ type: "device:status", deviceId, status: "offline" });
 	await terminalService.shutdownAll().catch(() => {});
+	terminalWatches.resetRestoredWatchAnchorsForTests();
 	for (const id of ["t-durable", "t-unnumbered", "t-legacy"])
 		await new BufferManager(id).deleteFromDisk();
 	cleanDb(sqlite);
@@ -327,6 +328,67 @@ describe("remote terminals backed by executor sessions", () => {
 			await saved.dispose();
 		} finally {
 			restartHandling.mockRestore();
+		}
+	});
+
+	test("replayed output waits until the snapshot's text watches are resumed", async () => {
+		insertTerminal("t-durable", { deviceId: "dev-1", executorSessionId: "nf-term-t-durable" });
+		const source = new BufferManager("t-durable");
+		source.append("$ ", 2);
+		const cursor = await source.markReadCursor();
+		if (!cursor) throw new Error("no cursor");
+		const start = { kind: "offset", offset: cursor.offset, textBefore: cursor.textBefore };
+		expect(
+			source.setDurableAnchor("bash_w1", cursor, { version: 1, pattern: "READY", start }),
+		).toBe(true);
+		await source.saveToDisk();
+		await source.dispose();
+
+		await terminalService.recoverOnStartup();
+		await until(() => attachStream !== undefined);
+		attachStream?.("session.data", new TextEncoder().encode("READY\r\n"));
+		await Bun.sleep(30);
+		const buffer = terminalService.getActiveBuffer("t-durable");
+		if (!buffer) throw new Error("no buffer");
+		expect(await buffer.getContents()).not.toContain("READY");
+		// Recovery gives up the watch nobody resumed; the output then reaches the buffer.
+		terminalWatches.closeRestoredWatchAnchors();
+		await Bun.sleep(10);
+		expect(await buffer.getContents()).toContain("READY");
+	});
+
+	test("a gap reported while output is held is handled after the output before it", async () => {
+		const seen: string[] = [];
+		let releaseFirst: (() => void) | undefined;
+		const gapHandling = spyOn(terminalWatches, "interruptTextWatchesForGap").mockImplementation(
+			async (_id, buffer) => {
+				seen.push(await buffer.getContents());
+				if (seen.length === 1)
+					await new Promise<void>((resolve) => {
+						releaseFirst = resolve;
+					});
+			},
+		);
+		try {
+			insertTerminal("t-durable", { deviceId: "dev-1", executorSessionId: "nf-term-t-durable" });
+			await terminalService.recoverOnStartup();
+			await until(() => attachStream !== undefined);
+			const encode = (text: string) => new TextEncoder().encode(text);
+			attachStream?.("session.gap", encode(JSON.stringify({ from: 0, to: 10 })));
+			attachStream?.("session.data", encode("MIDDLE\r\n"));
+			attachStream?.("session.gap", encode(JSON.stringify({ from: 30, to: 40 })));
+			attachStream?.("session.data", encode("AFTER\r\n"));
+			await until(() => releaseFirst !== undefined);
+			releaseFirst?.();
+			await until(() => seen.length === 2);
+			// The second gap's watches saw the output before it, never the output after it.
+			expect(seen[1]).toContain("MIDDLE");
+			expect(seen[1]).not.toContain("AFTER");
+			const buffer = terminalService.getActiveBuffer("t-durable");
+			await Bun.sleep(10);
+			expect(await buffer?.getContents()).toContain("AFTER");
+		} finally {
+			gapHandling.mockRestore();
 		}
 	});
 

@@ -43,6 +43,7 @@ import {
 	interruptTextWatchesForGap,
 	interruptTextWatchesForRestart,
 	notifyTerminalOutput,
+	registerRestoredWatchAnchors,
 	suspendTerminalWatchesForShutdown,
 } from "./terminal-watch-service";
 import { assertLegacyRuntimeOwner } from "./worktree-resource-owner";
@@ -214,9 +215,11 @@ async function markTerminalExited(
 /**
  * Output held back while a gap is reported to text watches, so neither the
  * visible gap notice nor output after the hole can satisfy a pattern that was
- * being matched against output before it.
+ * being matched against output before it. Work queued while output is held (a
+ * second gap) runs in stream order: after the output received before it.
  */
-const heldOutput = new Map<string, Array<[string, number | undefined]>>();
+type HeldItem = [string, number | undefined] | (() => Promise<void>);
+const heldOutput = new Map<string, HeldItem[]>();
 /** Settles once a gap's held output has been written back to the buffer. */
 const gapDrains = new Map<string, Promise<void>>();
 
@@ -231,18 +234,32 @@ function onRestartInterrupted(id: string, buffer: BufferManager, outcome: "lost"
 
 /** Hold later output (a notice included) back from the buffer while `work` runs. */
 function holdOutputWhile(id: string, buffer: BufferManager, work: () => Promise<void>) {
-	if (heldOutput.has(id)) return;
-	const held: Array<[string, number | undefined]> = [];
+	const queued = heldOutput.get(id);
+	if (queued) {
+		queued.push(work);
+		return;
+	}
+	const held: HeldItem[] = [];
 	heldOutput.set(id, held);
-	const drained = work()
-		.catch((error) =>
-			logger.warn("Terminal watch interruption failed", { terminalId: id, error: String(error) }),
-		)
-		.finally(() => {
-			heldOutput.delete(id);
-			if (gapDrains.get(id) === drained) gapDrains.delete(id);
-			for (const [text, streamSeq] of held) onData(id, buffer, text, streamSeq);
-		});
+	let drained: Promise<void> | undefined;
+	drained = (async () => {
+		for (let next: (() => Promise<void>) | undefined = work; next; ) {
+			await next().catch((error) =>
+				logger.warn("Terminal watch interruption failed", { terminalId: id, error: String(error) }),
+			);
+			next = undefined;
+			while (held.length > 0) {
+				const item = held.shift() as HeldItem;
+				if (typeof item === "function") {
+					next = item;
+					break;
+				}
+				applyOutput(id, buffer, item[0], item[1]);
+			}
+		}
+		heldOutput.delete(id);
+		if (gapDrains.get(id) === drained) gapDrains.delete(id);
+	})();
 	gapDrains.set(id, drained);
 }
 
@@ -258,11 +275,14 @@ function onData(id: string, buffer: BufferManager, data: string | Uint8Array, st
 		if (text) held.push([text, streamSeq]);
 		return;
 	}
-	if (text) {
-		buffer.append(text, streamSeq);
-		sendToTerminal(id, { type: "output", terminalId: id, data: text });
-		notifyTerminalOutput(id);
-	}
+	applyOutput(id, buffer, text, streamSeq);
+}
+
+function applyOutput(id: string, buffer: BufferManager, text: string, streamSeq?: number) {
+	if (!text) return;
+	buffer.append(text, streamSeq);
+	sendToTerminal(id, { type: "output", terminalId: id, data: text });
+	notifyTerminalOutput(id);
 }
 
 /**
@@ -311,11 +331,16 @@ async function resumeExecutorSession(
 		buffer = createBufferManager(terminalId, undefined, undefined, () => runtime);
 	}
 	since ??= 0;
+	const anchors = await buffer.takeRestoredAnchors();
 	if (activeTerminals.has(terminalId)) {
 		await buffer.dispose();
 		return;
 	}
 	buffer.startPeriodicFlush();
+	// Text watches saved with the snapshot resume from it: hold the replayed output
+	// until restart recovery has re-registered them (or given them up).
+	const restoredWatches = registerRestoredWatchAnchors(terminalId, buffer, anchors);
+	if (restoredWatches) holdOutputWhile(terminalId, buffer, () => restoredWatches);
 	const resumed = spawnRemoteSession(deviceId, sessionId, {
 		since,
 		onData: (data, streamSeq) => onData(terminalId, buffer, data, streamSeq),

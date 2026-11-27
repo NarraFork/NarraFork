@@ -26,7 +26,12 @@ import type { IMarker } from "@xterm/headless";
 import { eventBus } from "../lib/event-bus";
 import { hotOnce, hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
-import type { BufferManager, BufferReadCursor, BufferReadFrame } from "../terminal/buffer-manager";
+import type {
+	BufferManager,
+	BufferReadCursor,
+	BufferReadFrame,
+	RestoredBufferAnchor,
+} from "../terminal/buffer-manager";
 import {
 	type AdoptedWatchRow,
 	cancelWatchRegistration,
@@ -383,7 +388,10 @@ export interface StartWatchInput {
 	toolUseId?: string;
 	/** Only cancels asynchronous registration; an accepted watch outlives its tool call. */
 	registrationSignal?: AbortSignal;
-	/** Re-attach a lifecycle watch row left by the previous server process. */
+	/**
+	 * Re-attach a watch row left by the previous server process. A text watch also
+	 * needs the cursor its terminal's snapshot restored ({@link claimRestoredWatchAnchor}).
+	 */
 	adopt?: AdoptedWatchRow;
 	/** Who registers the watch; restart re-attachment re-authorizes as this identity. */
 	principal?: { userId: string | null };
@@ -492,7 +500,10 @@ export async function startTerminalWatch(input: StartWatchInput): Promise<StartW
 		};
 		if (pattern) {
 			// Text watches keep their own read cursors, so only their ending notices merge.
-			observation = await createWatchObservation(observationInput);
+			observation = await createWatchObservation({
+				...observationInput,
+				...(input.adopt ? { adopt: input.adopt } : {}),
+			});
 		} else {
 			const registered = await registerWatchObservation({
 				...observationInput,
@@ -566,8 +577,10 @@ export async function startTerminalWatch(input: StartWatchInput): Promise<StartW
 		byTerminal.set(input.terminalId, set);
 	}
 	set.add(taskId);
-	if (pattern) scheduleCheck(watch);
-	else {
+	if (pattern) {
+		saveDurableAnchor(watch, input.start);
+		scheduleCheck(watch);
+	} else {
 		const ended = input.buffer && endedBuffers.get(input.buffer);
 		if (ended) await settleLifecycle(watch, ended);
 		else {
@@ -865,7 +878,11 @@ function release(taskId: string): void {
 	if (!watch) return;
 	watch.settled = true;
 	if (watch.checkTimer) clearTimeout(watch.checkTimer);
-	disposeWatchMarkers(watch);
+	// At shutdown the start point stays saved (markers included) for the next process.
+	if (!shutdownState.suspended) {
+		watch.buffer?.deleteDurableAnchor(taskId);
+		disposeWatchMarkers(watch);
+	}
 	watches.delete(taskId);
 	const set = byTerminal.get(watch.terminalId);
 	set?.delete(taskId);
@@ -875,4 +892,187 @@ function release(taskId: string): void {
 /** Active watch task ids on a terminal. */
 export function activeWatchIds(terminalId: string): string[] {
 	return [...(byTerminal.get(terminalId) ?? [])];
+}
+
+/** What a text watch saves with its terminal's snapshot to continue after a restart. */
+interface DurableWatchAnchor {
+	version: 1;
+	pattern: string;
+	start: WatchStart;
+}
+
+function isWatchStart(value: unknown): value is WatchStart {
+	if (!value || typeof value !== "object") return false;
+	const start = value as Record<string, unknown>;
+	if (start.kind === "echo") return typeof start.input === "string";
+	return (
+		start.kind === "offset" &&
+		Number.isSafeInteger(start.offset) &&
+		(start.offset as number) >= 0 &&
+		(start.textBefore === undefined || typeof start.textBefore === "string")
+	);
+}
+
+function parseDurableAnchor(data: unknown): DurableWatchAnchor | undefined {
+	if (!data || typeof data !== "object") return undefined;
+	const anchor = data as Record<string, unknown>;
+	if (anchor.version !== 1 || typeof anchor.pattern !== "string" || !isWatchStart(anchor.start))
+		return undefined;
+	return { version: 1, pattern: anchor.pattern, start: anchor.start };
+}
+
+/**
+ * Save a text watch's start with its terminal's snapshot when the terminal can be
+ * resumed after a restart (an executor session), and write the snapshot now so the
+ * window in which a restart still loses the watch stays small.
+ */
+function saveDurableAnchor(watch: Watch, start: WatchStart | undefined): void {
+	if (!watch.buffer || !watch.cursor || !start || watch.buffer.streamSeq === undefined) return;
+	const data: DurableWatchAnchor = { version: 1, pattern: watch.pattern, start: savedStart(start) };
+	if (watch.buffer.setDurableAnchor(watch.taskId, watch.cursor, data))
+		void watch.buffer.saveToDisk();
+}
+
+/**
+ * The part of a start the matcher uses. An echo start is matched only by its last
+ * echoed line and whether a line break follows it, so the rest of what was typed
+ * (earlier lines, control keys) is not written to disk.
+ */
+function savedStart(start: WatchStart): WatchStart {
+	if (start.kind !== "echo") return start;
+	const last = lastEchoLine(start.input) ?? "";
+	return { kind: "echo", input: /[\r\n]/.test(start.input) ? `${last}\n` : last };
+}
+
+/** A text watch's start recreated from the snapshot, waiting for its row to resume it. */
+export interface RestoredWatchAnchor {
+	terminalId: string;
+	buffer: BufferManager;
+	cursor: BufferReadCursor;
+	pattern: string;
+	start: WatchStart;
+}
+
+/** How long a terminal's output waits for its restored watches to be resumed. */
+export const RESTORED_WATCH_CLAIM_TIMEOUT_MS = 60_000;
+
+interface RestoredTerminal {
+	/** Anchors not yet claimed, by watch task id. */
+	unclaimed: Map<string, RestoredWatchAnchor>;
+	/** Claimed anchors whose watch is still being registered. */
+	claimed: Set<string>;
+	resolve: () => void;
+	timer: ReturnType<typeof setTimeout>;
+}
+
+const restored = hotSafe("narrafork:terminal-watch-restored", () => ({
+	terminals: new Map<string, RestoredTerminal>(),
+	/** Set once restart recovery has resumed every watch it is going to. */
+	closed: false,
+}));
+
+function settleRestoredTerminal(terminalId: string, entry: RestoredTerminal): void {
+	if (entry.unclaimed.size > 0 || entry.claimed.size > 0) return;
+	clearTimeout(entry.timer);
+	if (restored.terminals.get(terminalId) === entry) restored.terminals.delete(terminalId);
+	entry.resolve();
+}
+
+function discardUnclaimed(terminalId: string, entry: RestoredTerminal): void {
+	for (const anchor of entry.unclaimed.values()) anchor.cursor.dispose();
+	entry.unclaimed.clear();
+	entry.claimed.clear();
+	settleRestoredTerminal(terminalId, entry);
+}
+
+/**
+ * Hand the watch starts saved with a resumed terminal's snapshot to restart
+ * recovery. Returns a promise that settles once each has been resumed or given
+ * up; the terminal holds back its output until then, so the replayed stream (and
+ * any gap or exit in it) reaches a resumed watch exactly as it would a live one.
+ * Returns undefined when there is nothing to wait for.
+ */
+export function registerRestoredWatchAnchors(
+	terminalId: string,
+	buffer: BufferManager,
+	anchors: readonly RestoredBufferAnchor[],
+): Promise<void> | undefined {
+	const unclaimed = new Map<string, RestoredWatchAnchor>();
+	for (const anchor of anchors) {
+		const data = restored.closed ? undefined : parseDurableAnchor(anchor.data);
+		if (!data || unclaimed.has(anchor.id)) {
+			anchor.cursor.dispose();
+			continue;
+		}
+		unclaimed.set(anchor.id, {
+			terminalId,
+			buffer,
+			cursor: anchor.cursor,
+			pattern: data.pattern,
+			start: data.start,
+		});
+	}
+	if (unclaimed.size === 0) return undefined;
+	const previous = restored.terminals.get(terminalId);
+	if (previous) discardUnclaimed(terminalId, previous);
+	return new Promise<void>((resolve) => {
+		const entry: RestoredTerminal = {
+			unclaimed,
+			claimed: new Set(),
+			resolve,
+			timer: setTimeout(() => discardUnclaimed(terminalId, entry), RESTORED_WATCH_CLAIM_TIMEOUT_MS),
+		};
+		entry.timer.unref?.();
+		restored.terminals.set(terminalId, entry);
+	});
+}
+
+/**
+ * Take the restored start of watch `taskId` on `buffer`, if one was saved for the
+ * same pattern. The caller registers the watch with it and then calls
+ * {@link finishRestoredWatchAnchor}, whatever the outcome.
+ */
+export function claimRestoredWatchAnchor(
+	taskId: string,
+	terminalId: string,
+	buffer: BufferManager | undefined,
+	pattern: string,
+): RestoredWatchAnchor | undefined {
+	const entry = restored.terminals.get(terminalId);
+	const anchor = entry?.unclaimed.get(taskId);
+	if (!entry || !anchor) return undefined;
+	entry.unclaimed.delete(taskId);
+	if (anchor.buffer !== buffer || anchor.pattern !== normalizeWatchPattern(pattern)) {
+		anchor.cursor.dispose();
+		settleRestoredTerminal(terminalId, entry);
+		return undefined;
+	}
+	entry.claimed.add(taskId);
+	return anchor;
+}
+
+/** The watch claimed with {@link claimRestoredWatchAnchor} is registered (or was not). */
+export function finishRestoredWatchAnchor(taskId: string, terminalId: string): void {
+	const entry = restored.terminals.get(terminalId);
+	if (!entry?.claimed.delete(taskId)) return;
+	settleRestoredTerminal(terminalId, entry);
+}
+
+/**
+ * Restart recovery has resumed every watch it will: drop the starts nobody claimed
+ * (their rows ended, expired or were not resumable) and release the output held for
+ * them. Terminals resumed after this keep nothing for watches.
+ */
+export function closeRestoredWatchAnchors(): void {
+	restored.closed = true;
+	for (const [terminalId, entry] of [...restored.terminals]) {
+		for (const anchor of entry.unclaimed.values()) anchor.cursor.dispose();
+		entry.unclaimed.clear();
+		settleRestoredTerminal(terminalId, entry);
+	}
+}
+
+export function resetRestoredWatchAnchorsForTests(): void {
+	for (const [terminalId, entry] of [...restored.terminals]) discardUnclaimed(terminalId, entry);
+	restored.closed = false;
 }
