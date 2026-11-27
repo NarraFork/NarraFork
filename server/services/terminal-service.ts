@@ -261,14 +261,24 @@ function holdOutputWhile(id: string, buffer: BufferManager, work: () => Promise<
 					break;
 				}
 				const pieces = splitHeldOutput(item[0], item[1], buffer.cols);
-				for (const [index, [piece, streamSeq]] of pieces.entries()) {
-					// Leading pieces of a numbered chunk keep snapshots off until the last.
-					const partial = item[1] !== undefined && index < pieces.length - 1;
-					applyOutput(id, buffer, piece, streamSeq, partial);
-					rows += estimatedRows(piece, buffer.cols);
-					if (rows >= HELD_OUTPUT_CHECK_ROWS) {
-						rows = 0;
-						await checkHeldWatches(id, buffer);
+				let chunkDone: (() => void) | undefined;
+				if (pieces.length > 1 && item[1] !== undefined)
+					splitChunks.set(id, new Promise<void>((resolve) => (chunkDone = resolve)));
+				try {
+					for (const [index, [piece, streamSeq]] of pieces.entries()) {
+						// Leading pieces of a numbered chunk keep snapshots off until the last.
+						const partial = item[1] !== undefined && index < pieces.length - 1;
+						applyOutput(id, buffer, piece, streamSeq, partial);
+						rows += estimatedRows(piece, buffer.cols);
+						if (rows >= HELD_OUTPUT_CHECK_ROWS) {
+							rows = 0;
+							await checkHeldWatches(id, buffer);
+						}
+					}
+				} finally {
+					if (chunkDone) {
+						splitChunks.delete(id);
+						chunkDone();
 					}
 				}
 			}
@@ -332,6 +342,30 @@ export function splitHeldOutput(
 		from = end;
 	}
 	return pieces;
+}
+
+/** Settles once the numbered chunk being written back in pieces has its last piece queued. */
+const splitChunks = new Map<string, Promise<void>>();
+
+/** Longest a shutdown waits for a split chunk to finish before saving anyway. */
+const SHUTDOWN_CHUNK_WAIT_MS = 5_000;
+
+/**
+ * Wait (bounded) until the terminal's buffer is not inside a split numbered chunk,
+ * so the final snapshot can be written: one taken mid-chunk is skipped. Watches are
+ * suspended by then, so the pieces left need no checks and follow at once.
+ */
+async function waitForChunkBoundary(id: string): Promise<void> {
+	const chunk = splitChunks.get(id);
+	if (!chunk) return;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	await Promise.race([
+		chunk,
+		new Promise<void>((resolve) => {
+			timer = setTimeout(resolve, SHUTDOWN_CHUNK_WAIT_MS);
+		}),
+	]);
+	clearTimeout(timer);
 }
 
 /** Wait until no output is held for a gap, so the buffer holds everything received. */
@@ -1478,7 +1512,9 @@ export const terminalService = {
 				(async () => {
 					if (active.executorSession) {
 						// The shell lives in the executor: save the snapshot (with its stream
-						// position) and stop reading. The row stays running for recovery.
+						// position) and stop reading. The row stays running for recovery. A chunk
+						// being written back in pieces is finished first: a save inside it is skipped.
+						await waitForChunkBoundary(id);
 						await active.buffer.saveToDisk();
 						active.buffer.stopPeriodicFlush();
 						active.runtime.close();

@@ -444,6 +444,52 @@ describe("remote terminals backed by executor sessions", () => {
 		}
 	});
 
+	test("a shutdown inside a split chunk saves once the chunk is complete, anchors included", async () => {
+		let releaseGap: (() => void) | undefined;
+		let shutdown: Promise<void> | undefined;
+		let calls = 0;
+		const gapHandling = spyOn(terminalWatches, "interruptTextWatchesForGap").mockImplementation(
+			() =>
+				new Promise<void>((resolve) => {
+					releaseGap = resolve;
+				}),
+		);
+		const hasWatches = spyOn(terminalWatches, "hasTextWatches").mockReturnValue(true);
+		const checkNow = spyOn(terminalWatches, "checkTextWatchesNow").mockImplementation(
+			async (_id, buffer) => {
+				if (++calls !== 2) return;
+				// A watch registered between pieces, then a graceful shutdown.
+				const cursor = await buffer.markReadCursor();
+				if (!cursor) throw new Error("no cursor");
+				buffer.setDurableAnchor("bash_new", cursor, () => ({ version: 2 }));
+				shutdown = terminalService.shutdownAll();
+			},
+		);
+		try {
+			insertTerminal("t-durable", { deviceId: "dev-1", executorSessionId: "nf-term-t-durable" });
+			await terminalService.recoverOnStartup();
+			await until(() => attachStream !== undefined);
+			const encode = (text: string) => new TextEncoder().encode(text);
+			attachStream?.("session.gap", encode(JSON.stringify({ from: 0, to: 10 })));
+			let replay = "";
+			for (let i = 0; i < 5_100; i++) replay += `line ${i}\r\n`;
+			attachStream?.("session.data", encode(replay));
+			await until(() => releaseGap !== undefined);
+			releaseGap?.();
+			await until(() => shutdown !== undefined);
+			await shutdown;
+			const saved = new BufferManager("t-durable");
+			await saved.loadFromDisk();
+			expect(saved.restoredStreamSeq).toBe(10 + encode(replay).length);
+			expect((await saved.takeRestoredAnchors()).map((anchor) => anchor.id)).toEqual(["bash_new"]);
+			await saved.dispose();
+		} finally {
+			gapHandling.mockRestore();
+			hasWatches.mockRestore();
+			checkNow.mockRestore();
+		}
+	});
+
 	test("a closing terminal records its stop before the row is marked exited", async () => {
 		insertTerminal("t-durable", { deviceId: "dev-1", executorSessionId: "nf-term-t-durable" });
 		await terminalService.recoverOnStartup();
