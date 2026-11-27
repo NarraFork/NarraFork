@@ -337,10 +337,8 @@ describe("remote terminals backed by executor sessions", () => {
 		source.append("$ ", 2);
 		const cursor = await source.markReadCursor();
 		if (!cursor) throw new Error("no cursor");
-		const start = { kind: "offset", offset: cursor.offset, textBefore: cursor.textBefore };
-		expect(
-			source.setDurableAnchor("bash_w1", cursor, { version: 1, pattern: "READY", start }),
-		).toBe(true);
+		const data = { version: 2, pattern: "READY", kind: "offset", checkpoint: { skip: 2 } };
+		expect(source.setDurableAnchor("bash_w1", cursor, () => data)).toBe(true);
 		await source.saveToDisk();
 		await source.dispose();
 
@@ -389,6 +387,49 @@ describe("remote terminals backed by executor sessions", () => {
 			expect(await buffer?.getContents()).toContain("AFTER");
 		} finally {
 			gapHandling.mockRestore();
+		}
+	});
+
+	test("held output is written back in batches that text watches check in turn", async () => {
+		const lastLineSeen: number[] = [];
+		let releaseGap: (() => void) | undefined;
+		const gapHandling = spyOn(terminalWatches, "interruptTextWatchesForGap").mockImplementation(
+			() =>
+				new Promise<void>((resolve) => {
+					releaseGap = resolve;
+				}),
+		);
+		const hasWatches = spyOn(terminalWatches, "hasTextWatches").mockReturnValue(true);
+		const checkNow = spyOn(terminalWatches, "checkTextWatchesNow").mockImplementation(
+			async (_id, buffer) => {
+				const lines = [...(await buffer.getContents()).matchAll(/line (\d+)/g)];
+				lastLineSeen.push(lines.length ? Number(lines.at(-1)?.[1]) : -1);
+			},
+		);
+		try {
+			insertTerminal("t-durable", { deviceId: "dev-1", executorSessionId: "nf-term-t-durable" });
+			await terminalService.recoverOnStartup();
+			await until(() => attachStream !== undefined);
+			const encode = (text: string) => new TextEncoder().encode(text);
+			attachStream?.("session.gap", encode(JSON.stringify({ from: 0, to: 10 })));
+			// More than the 5000-line scrollback, in one chunk.
+			let replay = "";
+			for (let i = 0; i < 5_100; i++) replay += `line ${i}\r\n`;
+			attachStream?.("session.data", encode(replay));
+			await until(() => releaseGap !== undefined);
+			releaseGap?.();
+			await until(() => (lastLineSeen.at(-1) ?? -1) >= 4_000);
+			// The first check runs before any held output; no batch exceeds 1000 rows.
+			expect(lastLineSeen[0]).toBe(-1);
+			for (let i = 1; i < lastLineSeen.length; i++)
+				expect(lastLineSeen[i] - lastLineSeen[i - 1]).toBeLessThanOrEqual(1_000);
+			await Bun.sleep(10);
+			const buffer = terminalService.getActiveBuffer("t-durable");
+			expect(await buffer?.getContents()).toContain("line 5099");
+		} finally {
+			gapHandling.mockRestore();
+			hasWatches.mockRestore();
+			checkNow.mockRestore();
 		}
 	});
 

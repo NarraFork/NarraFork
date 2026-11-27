@@ -48,6 +48,11 @@ interface BufferFileV3 {
 	streamSeq?: number;
 	/** Read cursors that must survive a restart (see {@link BufferManager.setDurableAnchor}). */
 	anchors?: StoredAnchor[];
+	/**
+	 * With anchors while a full-screen program had the alternate screen: the length
+	 * of `serialized`'s normal-screen part, after which the anchors are recreated.
+	 */
+	anchorsAt?: number;
 	mouseMode: {
 		x10: boolean;
 		buttonEvent: boolean;
@@ -246,7 +251,7 @@ export class BufferManager {
 	/** Cursors saved with each snapshot, by caller id, with the layout their data refers to. */
 	private readonly durableAnchors = new Map<
 		string,
-		{ cursor: BufferReadCursor; data: unknown; layoutRevision: number }
+		{ cursor: BufferReadCursor; data: () => unknown; layoutRevision: number }
 	>();
 	/** Anchors read by loadFromDisk(), recreated once the snapshot has been replayed. */
 	private loadedAnchors: StoredAnchor[] = [];
@@ -701,11 +706,13 @@ export class BufferManager {
 	 * Save `cursor` with every snapshot under `id`, so a restarted server can
 	 * recreate it at the same row (see {@link takeRestoredAnchors}). Only for
 	 * sources that number their output: their snapshot is resumed, not rebuilt.
-	 * `data` must be JSON and describes the cursor's start in its current layout;
-	 * a cursor still holding frames of an earlier layout is refused, and one whose
-	 * layout changes later stops being saved. Returns whether it was accepted.
+	 * `data` is read at each save and returns JSON describing the cursor's start in
+	 * its current layout, or undefined to skip that save (as does data larger than
+	 * {@link MAX_DURABLE_ANCHOR_DATA_CHARS}). A cursor still holding frames of an
+	 * earlier layout is refused, and one whose layout changes later stops being
+	 * saved. Returns whether it was accepted.
 	 */
-	setDurableAnchor(id: string, cursor: BufferReadCursor, data: unknown): boolean {
+	setDurableAnchor(id: string, cursor: BufferReadCursor, data: () => unknown): boolean {
 		const state = this.ownedReadCursors.get(cursor);
 		if (
 			this.disposed ||
@@ -713,8 +720,7 @@ export class BufferManager {
 			!state ||
 			state.error ||
 			state.pending.length > 0 ||
-			(!this.durableAnchors.has(id) && this.durableAnchors.size >= MAX_DURABLE_ANCHORS) ||
-			JSON.stringify(data).length > MAX_DURABLE_ANCHOR_DATA_CHARS
+			(!this.durableAnchors.has(id) && this.durableAnchors.size >= MAX_DURABLE_ANCHORS)
 		)
 			return false;
 		this.durableAnchors.set(id, { cursor, data, layoutRevision: state.layoutRevision });
@@ -726,10 +732,12 @@ export class BufferManager {
 		if (this.durableAnchors.delete(id)) this.dirty = true;
 	}
 
-	/** Anchors to save, read in the same synchronous step as the serialization. */
+	/**
+	 * Anchors to save, read in the same synchronous step as the serialization. They
+	 * are rows of the normal screen, which a full-screen program leaves intact.
+	 */
 	private storedAnchors(): StoredAnchor[] {
 		const out: StoredAnchor[] = [];
-		if (this.xterm.buffer.active.type !== "normal") return out;
 		const normal = this.xterm.buffer.normal;
 		const rowText = (line: number) => normal.getLine(line)?.translateToString(true) ?? "";
 		for (const [id, anchor] of this.durableAnchors) {
@@ -740,6 +748,14 @@ export class BufferManager {
 				state.pending.length > 0 ||
 				state.layoutRevision !== anchor.layoutRevision
 			)
+				continue;
+			let data: unknown;
+			try {
+				data = anchor.data();
+			} catch {
+				continue;
+			}
+			if (data === undefined || JSON.stringify(data).length > MAX_DURABLE_ANCHOR_DATA_CHARS)
 				continue;
 			const lost = state.markerLost || state.marker.isDisposed || state.marker.line < 0;
 			const end = state.observedEndMarker;
@@ -753,7 +769,7 @@ export class BufferManager {
 				endLine,
 				...(endLine === null ? {} : { endLineText: rowText(endLine) }),
 				prefixUnknown: state.prefixUnknown,
-				data: anchor.data,
+				data,
 			});
 		}
 		return out;
@@ -925,7 +941,16 @@ export class BufferManager {
 					...(this.appliedStreamSeq !== undefined ? { streamSeq: this.appliedStreamSeq } : {}),
 				};
 				const anchors = this.appliedStreamSeq === undefined ? [] : this.storedAnchors();
-				if (anchors.length > 0) fileData.anchors = anchors;
+				if (anchors.length > 0) {
+					fileData.anchors = anchors;
+					// The serialization appends the alternate screen after the normal one.
+					if (this.xterm.buffer.active.type !== "normal")
+						fileData.anchorsAt = this.serializeAddon.serialize({
+							scrollback: this.xterm.options.scrollback,
+							excludeAltBuffer: true,
+							excludeModes: true,
+						}).length;
+				}
 				const written = await Bun.write(filePath, JSON.stringify(fileData));
 				this.dirty = false;
 				return written;
@@ -986,16 +1011,28 @@ export class BufferManager {
 				if (parsed.cols && parsed.rows) {
 					this.xterm.resize(parsed.cols, parsed.rows);
 				}
-				this.writeChain = this.writeChain.then(() => this.replay(content));
+				const numbered = Number.isSafeInteger(parsed.streamSeq) && parsed.streamSeq >= 0;
+				this.loadedAnchors = numbered ? parseStoredAnchors(parsed.anchors) : [];
+				// Anchors are normal-screen rows: recreate them before a saved alternate
+				// screen is replayed over it, or after everything otherwise.
+				const split =
+					this.loadedAnchors.length > 0 &&
+					Number.isSafeInteger(parsed.anchorsAt) &&
+					parsed.anchorsAt > 0 &&
+					parsed.anchorsAt <= content.length
+						? (parsed.anchorsAt as number)
+						: content.length;
+				this.writeChain = this.writeChain.then(async () => {
+					await this.replay(content.slice(0, split));
+					if (this.loadedAnchors.length > 0) this.restoreAnchors();
+					if (split < content.length) await this.replay(content.slice(split));
+				});
 				if (parsed.mouseMode) {
 					this.mouseMode = { ...parsed.mouseMode };
 				}
-				if (Number.isSafeInteger(parsed.streamSeq) && parsed.streamSeq >= 0) {
+				if (numbered) {
 					this.loadedStreamSeq = parsed.streamSeq;
 					this.appliedStreamSeq = parsed.streamSeq;
-					this.loadedAnchors = parseStoredAnchors(parsed.anchors);
-					if (this.loadedAnchors.length > 0)
-						this.writeChain = this.writeChain.then(() => this.restoreAnchors());
 				}
 				logger.debug("Loaded buffer from disk (V3)", {
 					terminalId: this.terminalId,

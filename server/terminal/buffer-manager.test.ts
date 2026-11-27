@@ -537,7 +537,7 @@ describe("durable read anchors", () => {
 		source.append("$ make", 40);
 		const cursor = await source.markReadCursor();
 		if (!cursor) throw new Error("no cursor");
-		expect(source.setDurableAnchor("watch-1", cursor, { pattern: "DONE" })).toBe(true);
+		expect(source.setDurableAnchor("watch-1", cursor, () => ({ pattern: "DONE" }))).toBe(true);
 		source.append("\r\nbuilding\r\nDONE\r\n", 60);
 		const before = await readFrom(source, cursor);
 		await source.saveToDisk();
@@ -564,7 +564,7 @@ describe("durable read anchors", () => {
 		source.append("$ ");
 		const cursor = await source.markReadCursor();
 		if (!cursor) throw new Error("no cursor");
-		expect(source.setDurableAnchor("watch-1", cursor, {})).toBe(false);
+		expect(source.setDurableAnchor("watch-1", cursor, () => ({}))).toBe(false);
 		await source.dispose(true);
 	});
 
@@ -576,13 +576,13 @@ describe("durable read anchors", () => {
 		const reflowed = await source.markReadCursor();
 		const kept = await source.markReadCursor();
 		if (!removed || !reflowed || !kept) throw new Error("no cursor");
-		source.setDurableAnchor("removed", removed, {});
-		source.setDurableAnchor("reflowed", reflowed, {});
+		source.setDurableAnchor("removed", removed, () => ({}));
+		source.setDurableAnchor("reflowed", reflowed, () => ({}));
 		source.deleteDurableAnchor("removed");
 		await source.resize(60, 24);
 		// Only an anchor registered after the change describes the new layout.
 		await readFrom(source, kept);
-		expect(source.setDurableAnchor("kept", kept, {})).toBe(true);
+		expect(source.setDurableAnchor("kept", kept, () => ({}))).toBe(true);
 		await source.saveToDisk();
 		await source.dispose();
 		const { restored, anchors } = await restore(id);
@@ -596,7 +596,7 @@ describe("durable read anchors", () => {
 		const cursor = await source.markReadCursor();
 		if (!cursor) throw new Error("no cursor");
 		await source.resize(60, 24);
-		expect(source.setDurableAnchor("watch-1", cursor, {})).toBe(false);
+		expect(source.setDurableAnchor("watch-1", cursor, () => ({}))).toBe(false);
 		await source.dispose(true);
 	});
 
@@ -606,7 +606,7 @@ describe("durable read anchors", () => {
 		source.append("$ ", 2);
 		const cursor = await source.markReadCursor();
 		if (!cursor) throw new Error("no cursor");
-		source.setDurableAnchor("watch-1", cursor, {});
+		source.setDurableAnchor("watch-1", cursor, () => ({}));
 		for (let i = 0; i < 5100; i++) source.append(`line ${i}\r\n`, 12 + i * 10);
 		await source.flush();
 		expect(cursor.marker.isDisposed).toBe(true);
@@ -618,13 +618,34 @@ describe("durable read anchors", () => {
 		await restored.dispose(true);
 	});
 
+	test("an anchor is kept while a full-screen program has the alternate screen", async () => {
+		const id = newId();
+		const source = new BufferManager(id);
+		source.append("$ top", 5);
+		const cursor = await source.markReadCursor();
+		if (!cursor) throw new Error("no cursor");
+		source.setDurableAnchor("watch-1", cursor, () => ({}));
+		source.append("\r\n\x1b[?1049h\x1b[Hfull screen", 30);
+		await source.saveToDisk();
+		await source.dispose();
+		const { restored, anchors } = await restore(id);
+		expect(anchors).toHaveLength(1);
+		// The alternate screen is restored too; leaving it shows the normal rows again.
+		expect(await restored.getContents()).toContain("full screen");
+		restored.append("\x1b[?1049lDONE\r\n", 40);
+		const frame = await readFrom(restored, anchors[0].cursor);
+		expect(frame.text.startsWith("$ top")).toBe(true);
+		expect(frame.text).toContain("DONE");
+		await restored.dispose(true);
+	});
+
 	test("an anchor whose row no longer holds the saved text is dropped", async () => {
 		const id = newId();
 		const source = new BufferManager(id);
 		source.append("first\r\n$ ", 9);
 		const cursor = await source.markReadCursor();
 		if (!cursor) throw new Error("no cursor");
-		source.setDurableAnchor("watch-1", cursor, {});
+		source.setDurableAnchor("watch-1", cursor, () => ({}));
 		await source.saveToDisk();
 		await source.dispose();
 		const path = join(buffersDir, `${id}.buf`);

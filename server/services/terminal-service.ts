@@ -39,7 +39,9 @@ import {
 } from "./device-service";
 import { recordExecutorCleanup, stopExecutorSession } from "./executor-session-cleanup";
 import {
+	checkTextWatchesNow,
 	endWatchesForBuffer,
+	hasTextWatches,
 	interruptTextWatchesForGap,
 	interruptTextWatchesForRestart,
 	notifyTerminalOutput,
@@ -248,19 +250,85 @@ function holdOutputWhile(id: string, buffer: BufferManager, work: () => Promise<
 				logger.warn("Terminal watch interruption failed", { terminalId: id, error: String(error) }),
 			);
 			next = undefined;
+			// Watches registered by the work (a restart's) see the text they start from
+			// before any held output can scroll it away.
+			await checkHeldWatches(id, buffer);
+			let rows = 0;
 			while (held.length > 0) {
 				const item = held.shift() as HeldItem;
 				if (typeof item === "function") {
 					next = item;
 					break;
 				}
-				applyOutput(id, buffer, item[0], item[1]);
+				for (const [piece, streamSeq] of splitHeldOutput(item[0], item[1], buffer.cols)) {
+					applyOutput(id, buffer, piece, streamSeq);
+					rows += estimatedRows(piece, buffer.cols);
+					if (rows >= HELD_OUTPUT_CHECK_ROWS) {
+						rows = 0;
+						await checkHeldWatches(id, buffer);
+					}
+				}
 			}
 		}
 		heldOutput.delete(id);
 		if (gapDrains.get(id) === drained) gapDrains.delete(id);
 	})();
 	gapDrains.set(id, drained);
+}
+
+/**
+ * Rows of held output written back between two text watch checks: well under the
+ * scrollback, so a match cannot leave it unseen however much was held.
+ */
+const HELD_OUTPUT_CHECK_ROWS = 1_000;
+
+async function checkHeldWatches(id: string, buffer: BufferManager): Promise<void> {
+	if (!hasTextWatches(id, buffer)) return;
+	await checkTextWatchesNow(id, buffer).catch((error) =>
+		logger.warn("Terminal watch check failed", { terminalId: id, error: String(error) }),
+	);
+}
+
+/** Rows `text` takes at least: its line breaks plus wrapping of `cols`-wide rows. */
+function estimatedRows(text: string, cols: number): number {
+	let breaks = 0;
+	for (let at = text.indexOf("\n"); at !== -1; at = text.indexOf("\n", at + 1)) breaks++;
+	return breaks + Math.floor(text.length / Math.max(1, cols));
+}
+
+/**
+ * Cut held output into pieces of at most {@link HELD_OUTPUT_CHECK_ROWS} rows, at
+ * line breaks where possible and never inside a surrogate pair. Only the last
+ * piece carries the stream position, which is where the whole chunk ends.
+ */
+export function splitHeldOutput(
+	text: string,
+	streamSeq: number | undefined,
+	cols: number,
+): Array<[string, number | undefined]> {
+	if (estimatedRows(text, cols) < HELD_OUTPUT_CHECK_ROWS) return [[text, streamSeq]];
+	const maxChars = HELD_OUTPUT_CHECK_ROWS * Math.max(1, cols);
+	const pieces: Array<[string, number | undefined]> = [];
+	let from = 0;
+	while (from < text.length) {
+		let end = Math.min(text.length, from + maxChars);
+		let breaks = 0;
+		for (
+			let at = text.indexOf("\n", from);
+			at !== -1 && at < end;
+			at = text.indexOf("\n", at + 1)
+		) {
+			if (++breaks >= HELD_OUTPUT_CHECK_ROWS) {
+				end = at + 1;
+				break;
+			}
+		}
+		const code = text.charCodeAt(end - 1);
+		if (end < text.length && end - from > 1 && code >= 0xd800 && code <= 0xdbff) end--;
+		pieces.push([text.slice(from, end), end === text.length ? streamSeq : undefined]);
+		from = end;
+	}
+	return pieces;
 }
 
 /** Wait until no output is held for a gap, so the buffer holds everything received. */

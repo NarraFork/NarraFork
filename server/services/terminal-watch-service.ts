@@ -88,7 +88,7 @@ interface Watch {
 	disposeMarkers?: () => void;
 	prefixUnknown?: boolean;
 	cursor?: BufferReadCursor;
-	matchFrame?: ReturnType<typeof createWatchFrameMatcher>;
+	matchFrame?: WatchFrameMatcher;
 	checkTimer?: ReturnType<typeof setTimeout>;
 	/** Frozen once observation ends; delivery ownership then lives in the shared observation. */
 	result?: WatchResult;
@@ -235,16 +235,21 @@ function scanRenderedMatches(
  * Appended rows are a separate region: erasing an old match cannot cancel a
  * genuinely new match there. KMP keeps overlapping literals linear and bounded.
  */
-export function createRenderedPatternMatcher(pattern: string, observedPrefix: string) {
-	if (!pattern.length) return (_text: string, _scope: RenderedMatchScope = {}) => -1;
+export function createRenderedPatternMatcher(
+	pattern: string,
+	observedPrefix: string,
+	/** Restores {@link RenderedPatternMatcher.excluded} from a checkpoint instead. */
+	initialExcluded?: number,
+): RenderedPatternMatcher {
+	if (!pattern.length)
+		return Object.assign((_text: string, _scope: RenderedMatchScope = {}) => -1, {
+			excluded: () => 0,
+		});
 	const table = literalPrefixTable(pattern);
-	let excluded = scanRenderedMatches(
-		observedPrefix,
-		pattern,
-		table,
-		Number.POSITIVE_INFINITY,
-	).prefixMatches;
-	return (text: string, scope: RenderedMatchScope = {}): number => {
+	let excluded =
+		initialExcluded ??
+		scanRenderedMatches(observedPrefix, pattern, table, Number.POSITIVE_INFINITY).prefixMatches;
+	const match = (text: string, scope: RenderedMatchScope = {}): number => {
 		if (scope.resetHistory) excluded = 0;
 		const result = scanRenderedMatches(
 			text,
@@ -259,21 +264,45 @@ export function createRenderedPatternMatcher(pattern: string, observedPrefix: st
 			excluded = Math.min(excluded, result.prefixMatches);
 		return result.at;
 	};
+	return Object.assign(match, { excluded: () => excluded });
 }
 
-export function createWatchFrameMatcher(pattern: string, start: WatchStart) {
-	let skip = start.kind === "offset" ? start.offset : -1;
+export type RenderedPatternMatcher = ((text: string, scope?: RenderedMatchScope) => number) & {
+	/** Earlier occurrences still treated as old output. */
+	excluded(): number;
+};
+
+/**
+ * A frame matcher's progress, enough to continue it in another process: where its
+ * matching starts in the text read from the start row, and how many occurrences
+ * before that it still treats as old (absent when it compares plain text).
+ */
+export interface WatchMatchCheckpoint {
+	skip: number;
+	excluded?: number;
+}
+
+export function createWatchFrameMatcher(
+	pattern: string,
+	start: WatchStart,
+	/** Continue a matcher saved with {@link WatchFrameMatcher.checkpoint}. */
+	resume?: WatchMatchCheckpoint,
+): WatchFrameMatcher {
+	let skip = resume ? resume.skip : start.kind === "offset" ? start.offset : -1;
 	let clippedEcho = false;
 	let partialEcho = false;
 	let echoBaseline: string | undefined;
 	let allowedEchoTail = "";
 	const echoLine = start.kind === "echo" ? lastEchoLine(start.input) : undefined;
 	const echoTable = echoLine ? literalPrefixTable(echoLine) : undefined;
-	let matcher =
-		start.kind === "offset" && start.textBefore !== undefined
+	let matcher: RenderedPatternMatcher | undefined = resume
+		? resume.excluded === undefined
+			? undefined
+			: createRenderedPatternMatcher(pattern, "", resume.excluded)
+		: start.kind === "offset" && start.textBefore !== undefined
 			? createRenderedPatternMatcher(pattern, start.textBefore.slice(0, Math.max(0, skip)))
 			: undefined;
-	return (frame: Exclude<BufferReadFrame, { kind: "error" }>): number => {
+	const matchFrame = (frame: Exclude<BufferReadFrame, { kind: "error" }>): number => {
 		if (frame.kind === "baseline") {
 			// The parser produces no output between the old snapshot and this baseline.
 			matcher = createRenderedPatternMatcher(pattern, frame.text);
@@ -362,7 +391,17 @@ export function createWatchFrameMatcher(pattern: string, start: WatchStart) {
 				})
 			: text.indexOf(pattern, Math.max(0, skip));
 	};
+	return Object.assign(matchFrame, {
+		// An echo start has no checkpoint until its echo is found: before that only the
+		// typed input could locate it, and that is never saved.
+		checkpoint: (): WatchMatchCheckpoint | undefined =>
+			skip < 0 ? undefined : { skip, ...(matcher ? { excluded: matcher.excluded() } : {}) },
+	});
 }
+
+export type WatchFrameMatcher = ((frame: Exclude<BufferReadFrame, { kind: "error" }>) => number) & {
+	checkpoint(): WatchMatchCheckpoint | undefined;
+};
 
 export interface StartWatchInput {
 	narratorId: string;
@@ -376,7 +415,7 @@ export interface StartWatchInput {
 	/** Owns the relocatable markers and queued layout checkpoints. */
 	cursor?: BufferReadCursor;
 	/** A write may already have consumed frames while waiting for its immediate result. */
-	matchFrame?: ReturnType<typeof createWatchFrameMatcher>;
+	matchFrame?: WatchFrameMatcher;
 	/** Revision captured with the cursor; legacy callers freeze it before task creation. */
 	layoutRevision?: number;
 	/** Both markers transfer to the watch, including failure/cancellation cleanup. */
@@ -889,59 +928,96 @@ function release(taskId: string): void {
 	if (set?.size === 0) byTerminal.delete(watch.terminalId);
 }
 
+function liveTextWatches(terminalId: string, buffer: BufferManager): Watch[] {
+	return [...(byTerminal.get(terminalId) ?? [])]
+		.map((id) => watches.get(id))
+		.filter(
+			(watch): watch is Watch =>
+				!!watch && !!watch.pattern && watch.buffer === buffer && !watch.settled && !watch.result,
+		);
+}
+
+/** Whether `buffer` has text watches still matching. */
+export function hasTextWatches(terminalId: string, buffer: BufferManager): boolean {
+	return liveTextWatches(terminalId, buffer).length > 0;
+}
+
+/**
+ * Check every text watch on `buffer` now, without the usual throttle. Used while
+ * held output is written back in batches: a burst larger than the scrollback must
+ * not push a match out before any check has seen it.
+ */
+export async function checkTextWatchesNow(
+	terminalId: string,
+	buffer: BufferManager,
+): Promise<void> {
+	for (const watch of liveTextWatches(terminalId, buffer)) {
+		watch.dirty = true;
+		await check(watch);
+	}
+}
+
 /** Active watch task ids on a terminal. */
 export function activeWatchIds(terminalId: string): string[] {
 	return [...(byTerminal.get(terminalId) ?? [])];
 }
 
-/** What a text watch saves with its terminal's snapshot to continue after a restart. */
+/**
+ * What a text watch saves with its terminal's snapshot to continue after a restart:
+ * its pattern, the kind of start, and its matcher's latest checkpoint. Never the
+ * input typed with it, which may not have been echoed (a password).
+ */
 interface DurableWatchAnchor {
-	version: 1;
+	version: 2;
 	pattern: string;
-	start: WatchStart;
+	kind: WatchStart["kind"];
+	checkpoint: WatchMatchCheckpoint;
 }
 
-function isWatchStart(value: unknown): value is WatchStart {
-	if (!value || typeof value !== "object") return false;
-	const start = value as Record<string, unknown>;
-	if (start.kind === "echo") return typeof start.input === "string";
-	return (
-		start.kind === "offset" &&
-		Number.isSafeInteger(start.offset) &&
-		(start.offset as number) >= 0 &&
-		(start.textBefore === undefined || typeof start.textBefore === "string")
-	);
+function isCount(value: unknown): value is number {
+	return Number.isSafeInteger(value) && (value as number) >= 0;
 }
 
 function parseDurableAnchor(data: unknown): DurableWatchAnchor | undefined {
 	if (!data || typeof data !== "object") return undefined;
 	const anchor = data as Record<string, unknown>;
-	if (anchor.version !== 1 || typeof anchor.pattern !== "string" || !isWatchStart(anchor.start))
+	const checkpoint = anchor.checkpoint as Record<string, unknown> | null | undefined;
+	if (
+		anchor.version !== 2 ||
+		typeof anchor.pattern !== "string" ||
+		(anchor.kind !== "echo" && anchor.kind !== "offset") ||
+		!checkpoint ||
+		typeof checkpoint !== "object" ||
+		!isCount(checkpoint.skip) ||
+		(checkpoint.excluded !== undefined && !isCount(checkpoint.excluded))
+	)
 		return undefined;
-	return { version: 1, pattern: anchor.pattern, start: anchor.start };
+	return {
+		version: 2,
+		pattern: anchor.pattern,
+		kind: anchor.kind,
+		checkpoint: {
+			skip: checkpoint.skip,
+			...(checkpoint.excluded === undefined ? {} : { excluded: checkpoint.excluded }),
+		},
+	};
 }
 
 /**
- * Save a text watch's start with its terminal's snapshot when the terminal can be
- * resumed after a restart (an executor session), and write the snapshot now so the
- * window in which a restart still loses the watch stays small.
+ * Save a text watch with its terminal's snapshot when the terminal can be resumed
+ * after a restart (an executor session), and write the snapshot now so the window
+ * in which a restart still loses the watch stays small. Each save records the
+ * matcher's state at that moment; a watch whose echo has not been found yet has
+ * none and is not saved.
  */
 function saveDurableAnchor(watch: Watch, start: WatchStart | undefined): void {
-	if (!watch.buffer || !watch.cursor || !start || watch.buffer.streamSeq === undefined) return;
-	const data: DurableWatchAnchor = { version: 1, pattern: watch.pattern, start: savedStart(start) };
-	if (watch.buffer.setDurableAnchor(watch.taskId, watch.cursor, data))
-		void watch.buffer.saveToDisk();
-}
-
-/**
- * The part of a start the matcher uses. An echo start is matched only by its last
- * echoed line and whether a line break follows it, so the rest of what was typed
- * (earlier lines, control keys) is not written to disk.
- */
-function savedStart(start: WatchStart): WatchStart {
-	if (start.kind !== "echo") return start;
-	const last = lastEchoLine(start.input) ?? "";
-	return { kind: "echo", input: /[\r\n]/.test(start.input) ? `${last}\n` : last };
+	const { buffer, cursor, matchFrame } = watch;
+	if (!buffer || !cursor || !start || !matchFrame || buffer.streamSeq === undefined) return;
+	const data = (): DurableWatchAnchor | undefined => {
+		const checkpoint = matchFrame.checkpoint();
+		return checkpoint && { version: 2, pattern: watch.pattern, kind: start.kind, checkpoint };
+	};
+	if (buffer.setDurableAnchor(watch.taskId, cursor, data)) void buffer.saveToDisk();
 }
 
 /** A text watch's start recreated from the snapshot, waiting for its row to resume it. */
@@ -950,7 +1026,9 @@ export interface RestoredWatchAnchor {
 	buffer: BufferManager;
 	cursor: BufferReadCursor;
 	pattern: string;
+	/** Start for registration; matching continues from `checkpoint`. */
 	start: WatchStart;
+	checkpoint: WatchMatchCheckpoint;
 }
 
 /** How long a terminal's output waits for its restored watches to be resumed. */
@@ -1009,7 +1087,11 @@ export function registerRestoredWatchAnchors(
 			buffer,
 			cursor: anchor.cursor,
 			pattern: data.pattern,
-			start: data.start,
+			start:
+				data.kind === "echo"
+					? { kind: "echo", input: "" }
+					: { kind: "offset", offset: data.checkpoint.skip },
+			checkpoint: data.checkpoint,
 		});
 	}
 	if (unclaimed.size === 0) return undefined;

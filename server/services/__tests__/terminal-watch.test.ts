@@ -1214,7 +1214,7 @@ describe("text watches on executor-session terminals continue after a restart", 
 		expect((await waitForStatus(id))?.status).toBe("completed");
 	});
 
-	test("a watch that skips its command's echo resumes, saving only the echoed line", async () => {
+	test("a watch that skipped its command's echo resumes without saving the input", async () => {
 		await seedTerminal();
 		const buffer = newBuffer();
 		numbered(buffer, "$ ");
@@ -1222,18 +1222,57 @@ describe("text watches on executor-session terminals continue after a restart", 
 			kind: "echo",
 			input: "secret-token\nmake && echo BUILD OK\n",
 		});
-		numbered(buffer, "make && echo BUILD OK\r\n");
+		numbered(buffer, "make && echo BUILD OK\r\ncompiling\r\n");
+		// A check finds the echo; from then on the watch can be saved.
+		await Bun.sleep(CHECK_INTERVAL_MS + 100);
 		suspendTerminalWatchesForShutdown();
 		await buffer.saveToDisk();
 		const { join } = await import("node:path");
 		const { getNarraforkPath } = await import("../../lib/narrafork-home");
-		const saved = await Bun.file(join(getNarraforkPath("buffers"), `${TERMINAL}.buf`)).text();
-		expect(saved).not.toContain("secret-token");
+		const saved = JSON.parse(
+			await Bun.file(join(getNarraforkPath("buffers"), `${TERMINAL}.buf`)).text(),
+		);
+		expect(saved.anchors).toHaveLength(1);
+		expect(Object.keys(saved.anchors[0].data).sort()).toEqual([
+			"checkpoint",
+			"kind",
+			"pattern",
+			"version",
+		]);
+		expect(JSON.stringify(saved)).not.toContain("secret-token");
 		resumeTerminalWatchesForTests();
 		// The command's own echo does not satisfy the watch; its output does.
 		const { restored } = await restart(buffer);
 		expect((await row(id))?.status).toBe("running");
 		numbered(restored, "BUILD OK\r\n$ ");
+		const done = await waitForStatus(id);
+		expect(done?.status).toBe("completed");
+	});
+
+	test("a watch whose echo was never checked is not saved and ends as interrupted", async () => {
+		await seedTerminal();
+		const buffer = newBuffer();
+		numbered(buffer, "$ ");
+		const id = await startWithCursor(buffer, "BUILD OK", { kind: "echo", input: "hunter2\n" });
+		const { held } = await restart(buffer, "\r\n");
+		expect(held).toBeUndefined();
+		const ended = await waitForStatus(id);
+		expect(ended?.status).toBe("failed");
+		expect(ended?.output).toMatch(/interrupted.*server restart/i);
+	});
+
+	test("an occurrence that disappeared before the restart counts when it returns", async () => {
+		await seedTerminal();
+		const buffer = newBuffer();
+		// A status row that already says READY when the watch starts.
+		numbered(buffer, "status: READY");
+		const id = await startWithCursor(buffer, "READY");
+		numbered(buffer, "\rstatus: BUSY ");
+		await Bun.sleep(CHECK_INTERVAL_MS + 100);
+		expect((await row(id))?.status).toBe("running");
+		// Back to READY after the last check, then the restart.
+		const { held } = await restart(buffer, "\rstatus: READY");
+		await held;
 		const done = await waitForStatus(id);
 		expect(done?.status).toBe("completed");
 	});

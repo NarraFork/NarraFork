@@ -14,6 +14,7 @@ import { agentLabelFromNarrator } from "./subagent-label";
 import { TERMINAL_WATCH_COMMAND_PREFIX, WATCH_COMMAND_PREFIX } from "./terminal-watch-constants";
 import {
 	claimRestoredWatchAnchor,
+	createWatchFrameMatcher,
 	finishRestoredWatchAnchor,
 	startTerminalWatch,
 	terminalLifecycleReader,
@@ -523,6 +524,7 @@ async function resumeTerminalWatch(
 				prefixUnknown: anchor.cursor.prefixUnknown,
 				layoutRevision: anchor.cursor.layoutRevision,
 				start: anchor.start,
+				matchFrame: createWatchFrameMatcher(anchor.pattern, anchor.start, anchor.checkpoint),
 				adopt,
 			});
 			return started.status === "started" && started.taskId === row.id;
