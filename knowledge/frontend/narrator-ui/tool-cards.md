@@ -17,6 +17,7 @@ anchors:
   - frontend/components/narrator/subagent-output-count-store.ts
   - shared/prefer-open-tool.ts
   - shared/tool-display-duration.ts
+  - shared/team-tool-actions.ts
   - shared/tool-edit-preview.ts
   - shared/tool-parallel-groups.ts
   - shared/tool-progress.ts
@@ -47,7 +48,7 @@ verified_at: 2c639f086aef21d60357f1e002e62767938833e8
 一次工具调用在界面上的呈现：折叠行/卡片的分类与摘要、详情查看器、编辑差异、权限审批表单、提问表单，以及出错时的请求转储入口。卡片本身在消息列表里由 `vlist/measure/measure-tool-call.ts`（零 DOM 高度）和 `vlist/render/RenderToolCall.tsx`（绘制）实现，见[消息列表](message-list.md)；本节点是它们依赖的展示逻辑与对话框。
 
 ## 关键规则
-- 分类（`tool-call/tool-display.ts:getCategory`）把工具名/输入映射到 `ToolCategory`（read、file、bash、search、structure、structureEdit、webSearch、webFetch、tasks、agent、await、watch、send、ask、plan、pipeline、terminal、share、transfer、recall、skill、browser、knowledge、outline、schedule、contextAsk、workspace、generic 等）；`Shell`/`Execute` 是 `Bash` 的旧别名；`getSummary` 产出折叠行摘要。
+- 分类（`tool-call/tool-display.ts:getCategory`）把工具名/输入映射到 `ToolCategory`（read、file、bash、search、structure、structureEdit、webSearch、webFetch、tasks、agent、await、watch、send、ask、plan、pipeline、terminal、share、transfer、recall、skill、browser、knowledge、outline、schedule、contextAsk、workspace、generic 等）；`Shell`/`Execute` 是 `Bash` 的旧别名；`getSummary` 产出折叠行摘要。协调者的 `Team` 调用在 `getSummary` 里单独处理（`teamToolSummary`）：动作名取 `@shared/team-tool-actions` 的表（`narrator:teamTool.*`，经 `useVListLabels` 的 `teamTool_*` 注入，与团队页芯片同一张表，且必须等于动态里同一动作的事件文案，`team-conversation.test.ts` 核对两种语言），后接所指：`work.create` 的标题、按项动作的 item id、评审结论、自检的分钟数、决定的正文；被截断的输入从 `preview` 读动作。不再显示 `Team · Team`。
 - 默认展开（`measure-tool-call.ts:computeDefaultOpen`）：
   - 有待决权限、或状态 `pending`：展开。
   - 流式中：只有 `file` 类展开。

@@ -16,7 +16,8 @@ import type {
 	TeamConversationWindow,
 } from "@frontend/components/narrator/team-conversation-mode";
 import type { TeamActivityEvent, TeamActivityPage } from "@shared/project-teams";
-import { type InfiniteData, keepPreviousData, useInfiniteQuery } from "@tanstack/react-query";
+import { TEAM_TOOL_ACTION_KEYS, teamToolLabelKey } from "@shared/team-tool-actions";
+import { type InfiniteData, useInfiniteQuery } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { teamKeys } from "../../hooks/useTeams";
@@ -81,7 +82,10 @@ export function dividerOf(event: Pick<TeamActivityEvent, "kind" | "detail" | "wo
 				? { key: "mergedPr", values: { pr }, tone: "ok" }
 				: { key: "merged", values: {}, tone: "ok" };
 		case "work.pr_opened":
-			return pr !== null ? { key: "prOpened", values: { pr }, tone: "neutral" } : null;
+			if (pr === null) return null;
+			return detail.reopened === true
+				? { key: "prReopened", values: { pr }, tone: "neutral" }
+				: { key: "prOpened", values: { pr }, tone: "neutral" };
 		case "work.merge_failed":
 			return { key: "mergeFailed", values: {}, tone: "warn" };
 		default:
@@ -115,30 +119,51 @@ export function conversationEvents(
 	return out.sort((a, b) => a.at - b.at || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
 
-/** Chip wording; action keys are the transform's (`work.create`, `brief.read`, …). */
+/**
+ * Chip wording. The action labels are the `narrator:teamTool.*` table the tool card summary
+ * reads too (`@shared/team-tool-actions`; it matches the activity feed's event wording).
+ */
 export function chipLabels(t: Translate): TeamChipLabels {
 	const actions: Record<string, string> = {};
-	for (const action of [
-		"work.create",
-		"work.update",
-		"work.review",
-		"work.ready",
-		"work.sync",
-		"work.cancel",
-		"work.list",
-		"brief.read",
-		"brief.write",
-		"checkin",
-		"decision",
-		"cleanup",
-	])
-		actions[action] = t(`teams.conversation.chip.${action.replace(".", "_")}`);
+	for (const action of TEAM_TOOL_ACTION_KEYS)
+		actions[action] = t(`teamTool.${teamToolLabelKey(action)}`, { ns: "narrator" });
 	return {
 		actions,
-		other: t("teams.conversation.chip.other"),
+		other: t("teamTool.other", { ns: "narrator" }),
 		count: (count) => t("teams.conversation.chipCount", { count }),
 		failed: (count) => t("teams.conversation.chipFailed", { count }),
+		cancelled: (count) => t("teams.conversation.chipCancelled", { count }),
 	};
+}
+
+/** Local midnight of a time: the divider's "today" only changes at this boundary. */
+export function localDayStart(ms: number): number {
+	const date = new Date(ms);
+	return new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
+}
+
+/** Today's local midnight, re-rendering once the day turns (dividers then gain their date). */
+function useToday(): number {
+	const [today, setToday] = useState(() => localDayStart(Date.now()));
+	useEffect(() => {
+		const next = new Date(today);
+		next.setDate(next.getDate() + 1);
+		const timer = setTimeout(
+			() => setToday(localDayStart(Date.now())),
+			Math.max(1_000, next.getTime() - Date.now() + 1_000),
+		);
+		return () => clearTimeout(timer);
+	}, [today]);
+	return today;
+}
+
+/**
+ * Keep the previous page only while it is the SAME team's (a smaller `since` refetching);
+ * another team's dividers must never show in this conversation.
+ */
+export function sameTeamPlaceholder(teamId: string) {
+	return <T>(previous: T | undefined, previousQuery?: { queryKey: readonly unknown[] }) =>
+		previousQuery?.queryKey[2] === teamId ? previous : undefined;
 }
 
 /** A short, stable signature of the dividers (joins the layout's revision). */
@@ -160,15 +185,25 @@ export function useTeamConversationModeValue(
 	projectId: string,
 	teamId: string,
 ): TeamConversationMode {
-	const { t, i18n } = useTranslation("projects");
-	const [window, setWindow] = useState<TeamConversationWindow | null>(null);
-	const onWindowChange = useCallback((next: TeamConversationWindow) => {
-		setWindow((previous) =>
-			previous && previous.oldestAt === next.oldestAt && previous.hasPrev === next.hasPrev
-				? previous
-				: next,
-		);
-	}, []);
+	const { t, i18n } = useTranslation(["projects", "narrator"]);
+	// The reported window belongs to one team: a new team starts from nothing.
+	const [reported, setReported] = useState<{
+		teamId: string;
+		window: TeamConversationWindow;
+	} | null>(null);
+	const window = reported?.teamId === teamId ? reported.window : null;
+	const onWindowChange = useCallback(
+		(next: TeamConversationWindow) => {
+			setReported((previous) =>
+				previous?.teamId === teamId &&
+				previous.window.oldestAt === next.oldestAt &&
+				previous.window.hasPrev === next.hasPrev
+					? previous
+					: { teamId, window: next },
+			);
+		},
+		[teamId],
+	);
 	const since = conversationSince(window);
 	const query = useInfiniteQuery<
 		TeamActivityPage,
@@ -183,7 +218,7 @@ export function useTeamConversationModeValue(
 		initialPageParam: undefined,
 		getNextPageParam: (page) => page.nextCursor ?? undefined,
 		enabled: !!projectId && !!teamId && window !== null,
-		placeholderData: keepPreviousData,
+		placeholderData: sameTeamPlaceholder(teamId),
 		refetchOnWindowFocus: false,
 		gcTime: 60_000,
 	});
@@ -194,19 +229,21 @@ export function useTeamConversationModeValue(
 			void fetchNextPage();
 	}, [hasNextPage, isFetchingNextPage, pages, fetchNextPage]);
 	const raw = query.data?.pages;
+	const today = useToday();
 	const events = useMemo(
-		() => conversationEvents(raw?.flatMap((page) => page.events) ?? [], t, Date.now()),
-		[raw, t],
+		() => conversationEvents(raw?.flatMap((page) => page.events) ?? [], t, today),
+		[raw, t, today],
 	);
 	const labels = useMemo(() => chipLabels(t), [t]);
 	const language = i18n.language;
 	return useMemo(
 		() => ({
+			narratorId: teamId,
 			events,
 			chipLabels: labels,
 			revision: eventsRevision(events, language),
 			onWindowChange,
 		}),
-		[events, labels, language, onWindowChange],
+		[teamId, events, labels, language, onWindowChange],
 	);
 }

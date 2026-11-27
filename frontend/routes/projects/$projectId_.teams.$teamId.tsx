@@ -88,6 +88,8 @@ function TeamPage() {
 			teamId={teamId}
 			conversation={
 				<CoordinatorConversation
+					// A new team is a new conversation: its window and dividers start from nothing.
+					key={teamId}
 					projectId={projectId}
 					teamId={teamId}
 					onOpenSession={openSession}

@@ -132,15 +132,15 @@ for (const [width, fontScale] of [
 		const value = await render({ width, fontScale });
 		assertGeometry(value);
 		expect(teamRows(value)).toEqual([
-			"创建工作项 ×4",
-			"设定回访",
+			"建立工作项 ×4",
+			"自检",
 			`${clock(10)} · 「修复导出 CSV 时区错误」评审通过`,
 			`${clock(10)} · 「结账页改用新支付 SDK」已通过 PR #42 合并`,
-			"标为就绪 ×2",
+			"标记为可合并 ×2",
 			"card:tool-use-p1",
 			`${clock(30)} · 「订单金额统一两位小数」被退回`,
 		]);
-		const ready = value.rows.find((row) => row.text.startsWith("标为就绪"));
+		const ready = value.rows.find((row) => row.text.startsWith("标记为可合并"));
 		expect(ready?.error).toBe(true);
 		await screenshot(`${width}-${fontScale}`);
 	});
@@ -149,13 +149,12 @@ for (const [width, fontScale] of [
 test("a real click opens a chip onto the ordinary tool cards and folds it back", async () => {
 	await render({ width: 640 });
 	expect(
-		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.clickChip("创建工作项")),
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.clickChip("建立工作项")),
 	).toBe(true);
 	const open = await report();
 	assertGeometry(open);
-	const chip = open.rows.find((row) => row.text.startsWith("创建工作项"));
-	expect(chip?.expanded).toBe("true");
-	const index = open.rows.findIndex((row) => row === chip);
+	const index = open.rows.findIndex((row) => row.text.startsWith("建立工作项"));
+	expect(open.rows[index]?.expanded).toBe("true");
 	expect(open.rows.slice(index + 1, index + 5).map((row) => row.key)).toEqual([
 		"tool-use-c0",
 		"tool-use-c1",
@@ -163,9 +162,36 @@ test("a real click opens a chip onto the ordinary tool cards and folds it back",
 		"tool-use-c3",
 	]);
 	await screenshot("expanded");
-	await page.evaluate(() => (window as unknown as FixtureWindow).fixture.clickChip("创建工作项"));
+	await page.evaluate(() => (window as unknown as FixtureWindow).fixture.clickChip("建立工作项"));
 	const closed = await report();
 	assertGeometry(closed);
 	expect(closed.rows.some((row) => row.key === "tool-use-c0")).toBe(false);
-	expect(closed.rows.find((row) => row.text.startsWith("创建工作项"))?.expanded).toBe("false");
+	expect(closed.rows.find((row) => row.text.startsWith("建立工作项"))?.expanded).toBe("false");
+});
+
+test("opening and folding a chip above the viewport keeps the reader's place", async () => {
+	await render({ width: 640, viewport: 260 });
+	// The check-in chip sits at the viewport top; the work.create chip is just above it.
+	const anchorKey = "team-chip-use-k1";
+	const before = await page.evaluate(
+		(key) => (window as unknown as FixtureWindow).fixture.scrollRowAbove(key, 0),
+		anchorKey,
+	);
+	expect(before).toBeGreaterThan(0);
+	const top = await page.evaluate(
+		(key) => (window as unknown as FixtureWindow).fixture.rowScreenTop(key),
+		anchorKey,
+	);
+	expect(top).not.toBeNull();
+	for (const expectOpen of [true, false]) {
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.clickChip("建立工作项"));
+		const value = await report();
+		assertGeometry(value);
+		expect(value.rows.some((row) => row.key === "tool-use-c0")).toBe(expectOpen);
+		const after = await page.evaluate(
+			(key) => (window as unknown as FixtureWindow).fixture.rowScreenTop(key),
+			anchorKey,
+		);
+		expect(Math.abs((after ?? Number.NaN) - (top ?? 0))).toBeLessThan(1);
+	}
 });

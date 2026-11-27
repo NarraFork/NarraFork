@@ -326,6 +326,11 @@ import {
 	type SubagentToolInputSummary,
 	subagentSummaryToPartialInput,
 } from "@shared/subagent-tool-summary";
+import {
+	TEAM_TOOL_ITEM_ACTIONS,
+	teamToolActionKey,
+	teamToolLabelKey,
+} from "@shared/team-tool-actions";
 import { agentTargetDisplay, formatAgentIdForDisplay } from "./agent-id-display";
 
 /**
@@ -551,6 +556,9 @@ export function getSummary(
 	if (legacyStop && (BASH_TOOLS.has(toolName) || AGENT_TOOLS.has(toolName))) {
 		return `${labels?.stopTask || "Stop"}: ${short(legacyStop, 60)}`;
 	}
+	// The coordinator's Team tool: the action as people read it (the team page's chips and
+	// activity feed use the same wording), never the bare `Team · Team`.
+	if (toolName === TEAM_TOOL) return teamToolSummary(input, labels);
 	const cat = getCategory(toolName, input);
 	switch (cat) {
 		case "stop": {
@@ -837,6 +845,63 @@ export function getSummary(
 		default:
 			return toolName;
 	}
+}
+
+const TEAM_TOOL = "Team";
+
+/** English fallbacks when no labels are injected (tests, bare callers). */
+const TEAM_TOOL_FALLBACK: Record<string, string> = {
+	work_create: "Work item created",
+	work_update: "Dependencies changed",
+	work_review: "Review recorded",
+	work_ready: "Marked ready to merge",
+	work_sync: "Base sync",
+	work_cancel: "Work cancelled",
+	work_list: "Listed work items",
+	brief_read: "Read the brief",
+	brief_write: "Brief updated",
+	checkin: "Check-in",
+	decision: "Decided on people's behalf",
+	cleanup: "Worktree cleanup",
+	other: "Team action",
+	reviewClear: "clear",
+	reviewBlocker: "blocking issues",
+	minutes: "in {count} min",
+};
+
+function teamToolLabel(labels: Record<string, string> | undefined, key: string): string {
+	return labels?.[`teamTool_${key}`] || TEAM_TOOL_FALLBACK[key] || key;
+}
+
+/**
+ * `Team` call summary: the localized action (`@shared/team-tool-actions`), then what it is
+ * about — the title for `work.create`, the item for item actions, the verdict for a review,
+ * the delay for a check-in. A server-truncated input still names its action (`preview`).
+ */
+function teamToolSummary(input: unknown, labels: Record<string, string> | undefined): string {
+	const action = teamToolActionKey(input);
+	const label = teamToolLabel(labels, action ? teamToolLabelKey(action) : "other");
+	const parts = [label];
+	if (action === "work.create") {
+		const title = extractField(input, "title");
+		if (title) parts.push(title);
+	} else if (action && TEAM_TOOL_ITEM_ACTIONS.has(action)) {
+		const item = extractField(input, "item");
+		if (item) parts.push(item);
+		if (action === "work.review") {
+			const verdict = extractField(input, "verdict");
+			if (verdict === "clear" || verdict === "blocker")
+				parts.push(teamToolLabel(labels, verdict === "clear" ? "reviewClear" : "reviewBlocker"));
+		}
+	} else if (action === "checkin") {
+		const minutes = extractNumericField(input, "minutes");
+		if (minutes != null)
+			parts.push(teamToolLabel(labels, "minutes").replace("{count}", String(minutes)));
+	} else if (action === "decision") {
+		const text = extractField(input, "text");
+		if (text) parts.push(text.replace(/\s+/g, " "));
+	}
+	return short(parts.join(" · "), 80);
 }
 
 /** Row titles are capped so one long summary cannot dominate a fold. */

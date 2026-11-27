@@ -751,21 +751,6 @@
 			}
 		},
 		"conversation": {
-			"chip": {
-				"work_create": "Created work items",
-				"work_update": "Updated work items",
-				"work_review": "Recorded reviews",
-				"work_ready": "Marked ready",
-				"work_sync": "Synced work items",
-				"work_cancel": "Cancelled work items",
-				"work_list": "Listed work items",
-				"brief_read": "Read the brief",
-				"brief_write": "Updated the brief",
-				"checkin": "Scheduled a check-in",
-				"decision": "Recorded decisions",
-				"cleanup": "Cleaned up worktrees",
-				"other": "Team actions"
-			},
 			"chipCount": "×{{count}}",
 			"chipFailed_one": "{{count}} failed",
 			"chipFailed_other": "{{count}} failed",
@@ -774,12 +759,15 @@
 				"reviewBlocker": "「{{title}}」 needs changes after review",
 				"returned": "「{{title}}」 was returned",
 				"merged": "「{{title}}」 was merged",
-				"mergedPr": "「{{title}}」 was merged through PR #{{pr}}",
-				"prOpened": "「{{title}}」 opened PR #{{pr}}",
+				"mergedPr": "「{{title}}」 merged through PR #{{pr}}",
+				"prOpened": "PR #{{pr}} opened for 「{{title}}」",
 				"mergeFailed": "「{{title}}」 failed to merge",
-				"untitled": "A work item"
+				"untitled": "A work item",
+				"prReopened": "PR #{{pr}} reopened for 「{{title}}」"
 			},
-			"eventLine": "{{time}} · {{text}}"
+			"eventLine": "{{time}} · {{text}}",
+			"chipCancelled_one": "{{count}} cancelled",
+			"chipCancelled_other": "{{count}} cancelled"
 		}
 	},
 	"page": {

@@ -28,6 +28,8 @@ export interface TeamChipLabels {
 	count: (count: number) => string;
 	/** 「{count} 次失败」 */
 	failed: (count: number) => string;
+	/** 「{count} 次取消」 */
+	cancelled: (count: number) => string;
 }
 
 /** What the list reports about its loaded window, so events page together with messages. */
@@ -39,6 +41,8 @@ export interface TeamConversationWindow {
 }
 
 export interface TeamConversationMode {
+	/** The coordinator narrator this mode is for; any other list (a subagent's) ignores it. */
+	narratorId: string;
 	/** Dividers, ascending by `(at, id)`. */
 	events: readonly TeamConversationEvent[];
 	chipLabels: TeamChipLabels;

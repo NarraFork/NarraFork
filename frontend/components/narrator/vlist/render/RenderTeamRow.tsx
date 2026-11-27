@@ -4,7 +4,7 @@
  * nowrap line centred, so paint equals the prediction at every font scale.
  */
 
-import { IconAlertCircleFilled, IconCheck, IconChevronRight } from "@tabler/icons-react";
+import { IconAlertCircleFilled, IconBan, IconCheck, IconChevronRight } from "@tabler/icons-react";
 import type { MeasuredTeamChip, MeasuredTeamEvent } from "../measure/measure-team-row";
 import { activateOnKey, swallowSelectionClick } from "./key-activate";
 import { ROW_TEXT_CLASS } from "./row-chrome";
@@ -26,6 +26,7 @@ export function RenderTeamChip({
 }) {
 	const { data, expanded } = measured;
 	const failed = data.failed > 0;
+	const cancelled = (data.cancelled ?? 0) > 0;
 	return (
 		<div
 			style={{
@@ -68,6 +69,16 @@ export function RenderTeamChip({
 					>
 						<IconAlertCircleFilled size={13} style={{ color: "var(--mantine-color-red-text)" }} />
 					</span>
+				) : cancelled ? (
+					<span
+						data-testid="team-chip-cancelled"
+						title={data.cancelledLabel}
+						role="img"
+						aria-label={data.cancelledLabel}
+						style={{ display: "inline-flex", flexShrink: 0 }}
+					>
+						<IconBan size={13} style={{ color: DIMMED }} />
+					</span>
 				) : (
 					<IconCheck
 						size={13}
@@ -78,7 +89,11 @@ export function RenderTeamChip({
 					className={ROW_TEXT_CLASS}
 					data-truncate
 					style={{ color: DIMMED, minWidth: 0 }}
-					title={failed ? `${data.label}${data.countLabel} · ${data.failedLabel}` : undefined}
+					title={
+						[`${data.label}${data.countLabel}`, data.failedLabel, data.cancelledLabel]
+							.filter(Boolean)
+							.join(" · ") || undefined
+					}
 				>
 					{data.label}
 					{data.countLabel}

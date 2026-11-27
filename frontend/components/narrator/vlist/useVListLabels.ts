@@ -27,6 +27,7 @@
  */
 
 import { dangerCopyLabels } from "@shared/danger-copy";
+import { TEAM_TOOL_ACTION_KEYS, teamToolLabelKey } from "@shared/team-tool-actions";
 import type { ToolRowStatusMark } from "@shared/tool-row-status";
 import type { ToolShimmerKind } from "@shared/tool-shimmer";
 import { useMemo } from "react";
@@ -444,6 +445,9 @@ export function useVListLabels(): VListLabels {
 			contextAskOutputChars: t("contextAskOutputChars", { count: COUNT_PLACEHOLDER }),
 			contextAskQuestions: t("contextAskQuestions", { count: COUNT_PLACEHOLDER }),
 			contextAskStatusSummary: t("contextAskStatusSummary"),
+			// The coordinator's Team calls: the same action wording as the team page's chips and
+			// activity feed (`@shared/team-tool-actions`), read by `getSummary`.
+			...teamToolSummaryLabels(t),
 			// Generic live output counter ("123 chars") for any running tool whose
 			// streamed output is a bare cumulative count (Agent / Await today).
 			liveOutputChars: t("liveOutputChars", { count: COUNT_PLACEHOLDER }),
@@ -1065,4 +1069,18 @@ export function renderLabelsForKind(kind: string, labels: VListRenderLabels): un
 		default:
 			return undefined;
 	}
+}
+
+/** `teamTool_<labelKey>` entries for `getSummary`'s Team branch (see `@shared/team-tool-actions`). */
+function teamToolSummaryLabels(t: (key: string, values?: Record<string, unknown>) => string) {
+	const labels: Record<string, string> = {};
+	for (const action of TEAM_TOOL_ACTION_KEYS) {
+		const key = teamToolLabelKey(action);
+		labels[`teamTool_${key}`] = t(`teamTool.${key}`);
+	}
+	labels.teamTool_other = t("teamTool.other");
+	labels.teamTool_reviewClear = t("teamTool.reviewClear");
+	labels.teamTool_reviewBlocker = t("teamTool.reviewBlocker");
+	labels.teamTool_minutes = t("teamTool.minutes", { count: COUNT_PLACEHOLDER });
+	return labels;
 }

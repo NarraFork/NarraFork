@@ -8,11 +8,16 @@
 import "@mantine/core/styles.css";
 import { MantineProvider } from "@mantine/core";
 import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
+import {
+	capturePretextLayoutAnchor,
+	type PretextLayoutAnchor,
+	restorePretextLayoutAnchor,
+} from "@shared/pretext-layout";
 import { setTypography } from "@shared/pretext-layout/typography";
 import type { TeamActivityEvent } from "@shared/project-teams";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import i18next from "i18next";
-import { useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import { ensureTypographyCssVars } from "../../../lib/typography-css-vars";
@@ -146,6 +151,8 @@ const EVENTS = [
 export interface FixtureOptions {
 	width: number;
 	fontScale?: number;
+	/** Put the document in a scroll viewport of this height (the shell's anchored rebuild). */
+	viewport?: number;
 }
 
 const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -156,6 +163,8 @@ let currentOptions: FixtureOptions;
 function Scene({ options }: { options: FixtureOptions }) {
 	const { adapterLabels, renderLabels } = useVListLabels();
 	const [expanded, setExpanded] = useState(new Map<string, boolean>());
+	const scroller = useRef<HTMLDivElement | null>(null);
+	const pendingAnchor = useRef<PretextLayoutAnchor | null>(null);
 	const msgs = messages();
 	const layout = buildPretextDocumentLayout(msgs, {
 		layoutRevision: "team-browser",
@@ -186,11 +195,25 @@ function Scene({ options }: { options: FixtureOptions }) {
 		},
 	});
 	currentLayout = layout;
+	// The shell's anchored rebuild: the fold captures the viewport's anchor before the toggle and
+	// restores it against the new layout before paint (`capture/restorePretextLayoutAnchor`).
+	useLayoutEffect(() => {
+		const anchor = pendingAnchor.current;
+		const node = scroller.current;
+		if (!anchor || !node) return;
+		pendingAnchor.current = null;
+		node.scrollTop = restorePretextLayoutAnchor(anchor, layout.index, node.clientHeight);
+	});
 	return (
 		<div
 			id="shot"
+			ref={scroller}
 			className="nf-type-scope"
-			style={{ width: options.width, background: "var(--mantine-color-body)" }}
+			style={{
+				width: options.width,
+				background: "var(--mantine-color-body)",
+				...(options.viewport ? { height: options.viewport, overflowY: "auto" } : {}),
+			}}
 		>
 			<div
 				id="document"
@@ -201,11 +224,20 @@ function Scene({ options }: { options: FixtureOptions }) {
 					const extra = resolveRenderExtra(spec) as Record<string, unknown>;
 					extra.labels = renderLabelsForKind(spec.kind, renderLabels);
 					extra.narratorId = "team-fixture";
-					extra.onToggle = () =>
+					extra.onToggle = () => {
+						const node = scroller.current;
+						if (node && options.viewport)
+							pendingAnchor.current = capturePretextLayoutAnchor(
+								layout.index,
+								node.scrollTop,
+								node.clientHeight,
+								false,
+							);
 						setExpanded((old) => {
 							const open = measured as { effectiveOpened?: boolean; expanded?: boolean };
 							return new Map(old).set(spec.key, !(open.effectiveOpened ?? open.expanded ?? false));
 						});
+					};
 					return (
 						<div
 							key={spec.key}
@@ -295,4 +327,25 @@ export function report() {
 			};
 		}),
 	};
+}
+
+/** Scroll the viewport so the row `key` starts `offset` px above the viewport top. */
+export async function scrollRowAbove(key: string, offset: number): Promise<number> {
+	const layout = currentLayout;
+	const node = document.getElementById("shot");
+	if (!layout || !node) throw new Error("fixture has not rendered");
+	const index = layout.items.findIndex((item) => item.spec.key === key);
+	node.scrollTop = layout.index.itemStart(index) + offset;
+	await settle();
+	return node.scrollTop;
+}
+
+/** On-screen top of a painted row relative to the viewport, or null when not mounted. */
+export function rowScreenTop(key: string): number | null {
+	const node = document.getElementById("shot");
+	const row = [...document.querySelectorAll<HTMLElement>("[data-row]")].find(
+		(candidate) => candidate.dataset.key === key,
+	);
+	if (!node || !row) return null;
+	return row.getBoundingClientRect().top - node.getBoundingClientRect().top;
 }

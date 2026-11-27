@@ -1,19 +1,24 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
+import zhNarrator from "../../../locales/zh-CN/narrator.json";
 import type { NarratorMsg } from "../narrator-panel-types";
 import type { TeamChipLabels, TeamConversationEvent } from "../team-conversation-mode";
+import { getSummary } from "../tool-call/tool-display";
 import type { MeasuredTeamChip } from "./measure/measure-team-row";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 import { buildPretextDocumentLayout } from "./pretext-document-layout";
+import { measureElementCached } from "./registry";
 import type { AdapterRenderUnit } from "./segment-adapter";
 import {
 	applyTeamConversationMode,
 	chipKeyOf,
+	measureRevisionOf,
 	mergeTeamEvents,
 	parseServerTime,
 	teamChipActionKey,
 	teamChipKey,
 } from "./team-conversation-transform";
+import { previewResize } from "./vlist-resize-preview";
 
 beforeAll(() => {
 	installCanvasStub();
@@ -27,6 +32,7 @@ const labels: TeamChipLabels = {
 	other: "团队操作",
 	count: (count) => `×${count}`,
 	failed: (count) => `${count} 次失败`,
+	cancelled: (count) => `${count} 次取消`,
 };
 
 type Msg = { id: string; createdAt: string };
@@ -87,7 +93,7 @@ const chips = (
 ) => applyTeamConversationMode(units, { events: [], chipLabels: labels, revision: "r" }, ctx);
 
 describe("Team call chips", () => {
-	it("folds consecutive calls of one action into one chip, keyed on its first call", () => {
+	it("folds consecutive calls of one action into one chip, keyed on its last call", () => {
 		const m = [msg("m1", 1), msg("m2", 2), msg("m3", 3)];
 		const units = [
 			textUnit(msg("t0", 0)),
@@ -100,7 +106,7 @@ describe("Team call chips", () => {
 		const result = chips(units);
 		expect(shape(result.units)).toEqual(["text:t0", "chip:创建工作项 ×3"]);
 		const chip = result.units[1] as Extract<AdapterRenderUnit, { kind: "element" }>;
-		expect(chip.spec.key).toBe(teamChipKey("a"));
+		expect(chip.spec.key).toBe(teamChipKey("c"));
 		expect(chip.spec.opts).toEqual({ expanded: false });
 		expect(result.sources.get(chip.spec.key)?.map((source) => source.id)).toEqual([
 			"m1",
@@ -187,6 +193,89 @@ describe("Team call chips", () => {
 		});
 	});
 
+	it("folds every finished outcome with its mark; cancelled never reads as success", () => {
+		const m = msg("m", 1);
+		const result = chips([
+			runUnit([
+				teamItem(m, "a", "work.ready", "timeout"),
+				teamItem(m, "b", "work.ready", "denied"),
+				teamItem(m, "c", "work.ready", "aborted"),
+				teamItem(m, "d", "work.ready", "failed"),
+				teamItem(m, "e", "work.ready", "success"),
+			]),
+			textUnit(msg("t", 2)),
+			runUnit([teamItem(msg("m2", 3), "f", "work.ready", "canceled")]),
+			textUnit(msg("t2", 4)),
+			runUnit([teamItem(msg("m3", 5), "g", "work.ready", "mystery")]),
+		]);
+		const [mixed, , cancelledOnly, , unknown] = result.units as Extract<
+			AdapterRenderUnit,
+			{ kind: "element" }
+		>[];
+		expect(mixed?.spec.data).toMatchObject({ count: 5, failed: 2, cancelled: 2, status: "fail" });
+		expect(cancelledOnly?.spec.data).toMatchObject({
+			count: 1,
+			cancelled: 1,
+			cancelledLabel: "1 次取消",
+			status: "cancelled",
+		});
+		// A status nobody has interpreted keeps its card.
+		expect(shape([unknown as AdapterRenderUnit])).toEqual(["run:g"]);
+	});
+
+	it("keeps an open chip open as members join or leave, and folds it from any key", () => {
+		const run = (ids: string[]) =>
+			runUnit(ids.map((id, index) => teamItem(msg(`m${id}`, index), id, "work.create")));
+		const state = new Map<string, boolean>();
+		const ctx = { lod: 4, isExpanded: (key: string) => state.get(key) };
+		const first = chips([run(["b", "c"])], ctx).units[0] as Extract<
+			AdapterRenderUnit,
+			{ kind: "element" }
+		>;
+		expect(first.spec.key).toBe(teamChipKey("c"));
+		state.set(first.spec.key, true);
+		// An older page prepends a member, a live call appends one, the head is trimmed.
+		for (const ids of [
+			["a", "b", "c"],
+			["a", "b", "c", "d"],
+			["c", "d"],
+		]) {
+			const units = chips([run(ids)], ctx).units;
+			const chip = units[0] as Extract<AdapterRenderUnit, { kind: "element" }>;
+			expect(chip.spec.key).toBe(teamChipKey("c"));
+			expect(chip.spec.opts).toEqual({ expanded: true });
+			expect(shape(units).slice(1)).toEqual([`run:${ids.join(",")}`]);
+		}
+		// The shell folds it under the key it now has: closed, though another member said open.
+		state.set(teamChipKey("d"), true);
+		state.set(teamChipKey("c"), true);
+		const reopened = chips([run(["c", "d"])], ctx).units[0] as Extract<
+			AdapterRenderUnit,
+			{ kind: "element" }
+		>;
+		expect(reopened.spec.key).toBe(teamChipKey("d"));
+		state.set(teamChipKey("d"), false);
+		const folded = chips([run(["c", "d"])], ctx).units;
+		expect((folded[0] as Extract<AdapterRenderUnit, { kind: "element" }>).spec.opts).toEqual({
+			expanded: false,
+		});
+		expect(folded).toHaveLength(1);
+	});
+
+	it("a retried call id gets its own chip key and its own sources", () => {
+		const first = teamItem(msg("m1", 1), "same", "work.create");
+		const retry = teamItem(msg("m2", 3), "same", "work.create");
+		const result = chips([runUnit([first]), textUnit(msg("t", 2)), runUnit([retry])]);
+		const keys = result.units
+			.filter(
+				(unit): unit is Extract<AdapterRenderUnit, { kind: "element" }> => unit.kind === "element",
+			)
+			.map((unit) => unit.spec.key);
+		expect(keys).toEqual([teamChipKey("same"), teamChipKey("same#1")]);
+		expect(result.sources.get(teamChipKey("same"))?.map((m) => m.id)).toEqual(["m1"]);
+		expect(result.sources.get(teamChipKey("same#1"))?.map((m) => m.id)).toEqual(["m2"]);
+	});
+
 	it("expanded, the chip is followed by exactly the calls it folds", () => {
 		const m = msg("m", 1);
 		const items = [
@@ -196,7 +285,7 @@ describe("Team call chips", () => {
 		];
 		const result = chips([runUnit(items)], {
 			lod: 4,
-			isExpanded: (key) => key === teamChipKey("a"),
+			isExpanded: (key) => (key === teamChipKey("a") ? true : undefined),
 		});
 		expect(shape(result.units)).toEqual(["chip:创建工作项 ×2", "run:a,b", "run:c"]);
 		const chip = result.units[0] as Extract<AdapterRenderUnit, { kind: "element" }>;
@@ -268,6 +357,22 @@ describe("team event dividers", () => {
 			"event:E0",
 			"text:a",
 		]);
+	});
+
+	it("a timeless unit mid-list carries the previous time; only a trailing one is +∞", () => {
+		const timeless = textUnit({ id: "x", createdAt: "" });
+		const out = mergeTeamEvents(
+			[textUnit(msg("a", 0)), timeless, textUnit(msg("b", 10))],
+			[ev("1", 5), ev("2", 15)],
+			false,
+			new Map(),
+		);
+		// Event 1 (minute 5) is after `a` and the timeless row that follows it, before `b`.
+		expect(shape(out)).toEqual(["text:a", "text:x", "event:E1", "text:b", "event:E2"]);
+		// With older history unloaded, a leading timeless row takes the first known time.
+		expect(
+			shape(mergeTeamEvents([timeless, textUnit(msg("a", 10))], [ev("0", 5)], true, new Map())),
+		).toEqual(["text:x", "text:a"]);
 	});
 
 	it("a unit without a time lets earlier events pass before it", () => {
@@ -416,6 +521,45 @@ describe("buildPretextDocumentLayout with and without team mode", () => {
 		expect(built.items[2]?.spec.key).toBe("tool-u1");
 	});
 
+	it("team mode keeps the measure cache: the manifest moves, the measure revision does not", () => {
+		const revisions: unknown[] = [];
+		const spy: typeof measureElementCached = (kind, data, width, lod, opts, key, revision) => {
+			revisions.push(revision);
+			return measureElementCached(kind, data, width, lod, opts, key, revision);
+		};
+		const built = buildPretextDocumentLayout(messages, {
+			...base,
+			measure: spy,
+			teamConversation: team,
+		});
+		expect(String(built.manifest.documentRevision)).toContain("~team:r1");
+		expect(revisions.length).toBeGreaterThan(0);
+		expect(revisions.every((revision) => revision === "1")).toBe(true);
+		expect(measureRevisionOf(built.manifest.documentRevision)).toBe("1");
+		expect(measureRevisionOf(7)).toBe(7);
+		// A resize preview re-measures under the same (team-free) revision, so it hits the cache.
+		revisions.length = 0;
+		previewResize({
+			index: built.index,
+			items: built.items,
+			committedWidth: 640,
+			width: 520,
+			lod: 4,
+			view: { scrollTop: 0, viewportHeight: 2000, pinnedToBottom: false },
+			measure: spy,
+		});
+		expect(revisions.length).toBeGreaterThan(0);
+		expect(revisions.every((revision) => revision === "1")).toBe(true);
+		const plain = buildPretextDocumentLayout(messages, { ...base, measure: spy });
+		const cachedText = plain.items[0]?.measured;
+		const teamText = buildPretextDocumentLayout(messages, {
+			...base,
+			measure: spy,
+			teamConversation: { ...team, revision: "r2", events: [] },
+		}).items[0]?.measured;
+		expect(teamText).toBe(cachedText);
+	});
+
 	it("a pending permission keeps its card even when settled-looking", () => {
 		const built = buildPretextDocumentLayout(messages, {
 			...base,
@@ -427,5 +571,46 @@ describe("buildPretextDocumentLayout with and without team mode", () => {
 			"tool-u2",
 			teamChipKey("u3"),
 		]);
+	});
+});
+
+describe("Team call summaries on the session page (no team mode)", () => {
+	const labels: Record<string, string> = {};
+	for (const [key, value] of Object.entries(
+		(zhNarrator as { teamTool: Record<string, string> }).teamTool,
+	))
+		labels[`teamTool_${key}`] = value.replace("{{count}}", "{count}");
+	const resolveToolSummary = (raw: unknown) => {
+		const tc = raw as { toolName: string; inputJson?: unknown };
+		return getSummary(tc.toolName, tc.inputJson, undefined, labels);
+	};
+	const messages = [teamMessage("c1", 1, 1, "u1"), teamMessage("c2", 2, 2, "u2")];
+	const base = {
+		layoutRevision: "summary",
+		documentRevision: 1,
+		contentWidth: 640,
+		widthBucket: "640",
+		resolveToolSummary,
+	};
+
+	it("a card header names the action and the item title, not `Team Team`", () => {
+		const built = buildPretextDocumentLayout(messages, { ...base, lod: 4 });
+		const data = built.items.map((item) => item.spec.data as { summary?: string });
+		expect(built.items.map((item) => item.spec.kind)).toEqual(["tool-call", "tool-call"]);
+		expect(data.map((card) => card.summary)).toEqual([
+			"建立工作项 · Item u1",
+			"建立工作项 · Item u2",
+		]);
+	});
+
+	it("L1/L2 trace rows read the same", () => {
+		for (const lod of [1, 2] as const) {
+			const built = buildPretextDocumentLayout(messages, { ...base, lod });
+			const trace = built.items[0]?.spec.data as { items: { title: string }[] };
+			expect(trace.items.map((row) => row.title)).toEqual([
+				"Team · 建立工作项 · Item u1",
+				"Team · 建立工作项 · Item u2",
+			]);
+		}
 	});
 });

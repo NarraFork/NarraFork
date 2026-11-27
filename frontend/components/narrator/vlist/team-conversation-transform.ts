@@ -16,6 +16,12 @@
  * One O(units + events) pass; the default build never calls it. Zero DOM, zero React.
  */
 
+import { teamToolActionKey } from "@shared/team-tool-actions";
+import {
+	IN_FLIGHT_TOOL_ROW_STATUSES,
+	resolveToolRowStatusMark,
+	TERMINAL_TOOL_ROW_STATUSES,
+} from "@shared/tool-row-status";
 import type { TeamChipLabels, TeamConversationEvent } from "../team-conversation-mode";
 import type { TeamChipData, TeamEventData } from "./measure/measure-team-row";
 import type { AdapterRenderUnit, ElementSpec } from "./segment-adapter";
@@ -23,8 +29,6 @@ import type { AdapterRenderUnit, ElementSpec } from "./segment-adapter";
 /** The tool whose calls fold into chips. */
 export const TEAM_TOOL_NAME = "Team";
 const STREAMING_MESSAGE_ID = "__streaming__";
-const SETTLED_STATUSES = new Set(["success", "fail", "cancelled", "error", "completed"]);
-const FAILED_STATUSES = new Set(["fail", "error"]);
 
 export interface TeamConversationLayoutOptions {
 	events: readonly TeamConversationEvent[];
@@ -54,6 +58,21 @@ export interface TeamConversationTransformResult {
 	sources: Map<string, SourceMessage[]>;
 }
 
+/** The suffix team mode adds to the manifest's `documentRevision` (see `measureRevisionOf`). */
+export const TEAM_REVISION_MARK = "~team:";
+
+/**
+ * The revision measurements are cached under: the manifest's `documentRevision` without team
+ * mode's `~team:<rev>` suffix. That suffix moves the manifest identity when a divider arrives (a
+ * fold capture must not survive it), but every other row measures exactly as before, so a
+ * resize preview or rebuild must reuse their cached heights rather than re-measure the page.
+ */
+export function measureRevisionOf(revision: string | number): string | number {
+	if (typeof revision !== "string") return revision;
+	const at = revision.lastIndexOf(TEAM_REVISION_MARK);
+	return at < 0 ? revision : revision.slice(0, at);
+}
+
 /** Epoch ms of a server time (ISO, or SQLite's `YYYY-MM-DD HH:MM:SS` in UTC); NaN if none. */
 export function parseServerTime(value: unknown): number {
 	if (typeof value === "number") return value;
@@ -62,30 +81,8 @@ export function parseServerTime(value: unknown): number {
 	return Date.parse(sqlite ? `${value.replace(" ", "T")}Z` : value);
 }
 
-const ACTION_IN_PREVIEW = /"action"\s*:\s*"([^"\\]{1,40})"/;
-
-/**
- * The chip key of one `Team` call's input: its action, with `brief` split into reading and
- * writing (`brief.read` / `brief.write`). A server-truncated input (`{_truncated, preview}`)
- * is read from its preview. Null when the action cannot be read (the call keeps its card).
- */
-export function teamChipActionKey(input: unknown): string | null {
-	if (!input || typeof input !== "object") return null;
-	const record = input as Record<string, unknown>;
-	let action = typeof record.action === "string" ? record.action : null;
-	if (!action && record._truncated === true && typeof record.preview === "string")
-		action = ACTION_IN_PREVIEW.exec(record.preview)?.[1] ?? null;
-	if (!action) return null;
-	if (action === "brief") {
-		const writes =
-			typeof record.text === "string" ||
-			(record._truncated === true &&
-				typeof record.preview === "string" &&
-				/"text"\s*:/.test(record.preview));
-		return writes ? "brief.write" : "brief.read";
-	}
-	return action;
-}
+/** The chip key of one `Team` call's input (see `@shared/team-tool-actions`). */
+export const teamChipActionKey = teamToolActionKey;
 
 /** Whether a tool item may fold into a chip, and under which key (null: keep its card). */
 export function chipKeyOf(
@@ -95,14 +92,18 @@ export function chipKeyOf(
 	const { tc } = item;
 	if (tc.toolName !== TEAM_TOOL_NAME || !tc.toolUseId) return null;
 	if (item.msg?.id === STREAMING_MESSAGE_ID) return null;
-	if (!tc.status || !SETTLED_STATUSES.has(tc.status)) return null;
+	// Only a FINISHED call folds (the compact rows' own terminal set: failed, timeout, denied,
+	// aborted and cancelled calls fold too, with their mark); anything still in flight, or a
+	// status nobody has interpreted, keeps its card.
+	if (!tc.status || IN_FLIGHT_TOOL_ROW_STATUSES.has(tc.status)) return null;
+	if (!TERMINAL_TOOL_ROW_STATUSES.has(tc.status)) return null;
 	if (ctx.hasPendingPermission?.(tc.toolUseId)) return null;
 	return teamChipActionKey(tc.inputJson);
 }
 
-/** The id the chip is keyed on (its first call's), stable while later calls join. */
-export function teamChipKey(firstToolUseId: string): string {
-	return `team-chip-${firstToolUseId}`;
+/** The chip key minted from one member call's identity (`toolUseId`, plus `#n` for a retry). */
+export function teamChipKey(memberIdentity: string): string {
+	return `team-chip-${memberIdentity}`;
 }
 
 export function teamEventKey(eventId: string): string {
@@ -113,16 +114,25 @@ function chipData(items: readonly ToolItem[], key: string, labels: TeamChipLabel
 	const label = labels.actions[key] ?? labels.other;
 	const count = items.length;
 	const countLabel = count > 1 ? ` ${labels.count(count)}` : "";
-	const failed = items.filter((item) => FAILED_STATUSES.has(item.tc.status ?? "")).length;
+	let failed = 0;
+	let cancelled = 0;
+	for (const item of items) {
+		const mark = resolveToolRowStatusMark(item.tc.status);
+		if (mark === "failed") failed++;
+		else if (mark === "cancelled") cancelled++;
+	}
 	const failedLabel = failed > 0 ? labels.failed(failed) : "";
+	const cancelledLabel = cancelled > 0 ? labels.cancelled(cancelled) : "";
 	return {
 		label,
 		count,
 		countLabel,
 		failed,
 		failedLabel,
-		status: failed > 0 ? "fail" : "success",
-		text: `${label}|${countLabel}|${failedLabel}`,
+		cancelled,
+		cancelledLabel,
+		status: failed > 0 ? "fail" : cancelled > 0 ? "cancelled" : "success",
+		text: `${label}|${countLabel}|${failedLabel}|${cancelledLabel}`,
 	};
 }
 
@@ -136,6 +146,8 @@ function ownersOf(items: readonly ToolItem[], seg: ToolRunSeg): SourceMessage[] 
 
 interface RunEntry {
 	item: ToolItem;
+	/** `toolUseId`, plus `#n` for the n-th repeat of one id in the document (a provider retry). */
+	identity: string;
 	unit: AdapterRenderUnit & { kind: "segment" };
 	seg: ToolRunSeg;
 }
@@ -161,6 +173,28 @@ function emitPlain(entries: readonly RunEntry[], out: AdapterRenderUnit[]): void
 	}
 }
 
+/**
+ * The chip's key and open state.
+ *
+ * The reader's fold is stored against the chip key it had when they clicked, and the members
+ * of a chip change under it: an older page or a live call can join, `trimHead` can drop the
+ * head. So the state is looked up on EVERY member's key, and the chip keeps the key of the
+ * (last) member that holds an explicit state; that member's own value wins, so folding a chip
+ * opened under an older key closes it. With no state anywhere the chip takes its LAST member's
+ * key, which an older page or a trimmed head leaves alone.
+ */
+function chipFold(
+	group: readonly RunEntry[],
+	ctx: Pick<TeamConversationTransformContext, "isExpanded">,
+): { specKey: string; expanded: boolean } {
+	for (let index = group.length - 1; index >= 0; index--) {
+		const key = teamChipKey((group[index] as RunEntry).identity);
+		const state = ctx.isExpanded?.(key);
+		if (state !== undefined) return { specKey: key, expanded: state };
+	}
+	return { specKey: teamChipKey((group.at(-1) as RunEntry).identity), expanded: false };
+}
+
 function foldChips(
 	units: readonly AdapterRenderUnit[],
 	ctx: TeamConversationTransformContext,
@@ -184,8 +218,7 @@ function foldChips(
 			while (end < run.length && chipKeyOf((run[end] as RunEntry).item, ctx) === key) end++;
 			const group = run.slice(index, end);
 			const items = group.map((entry) => entry.item);
-			const specKey = teamChipKey(items[0]?.tc.toolUseId as string);
-			const expanded = ctx.isExpanded?.(specKey) === true;
+			const { specKey, expanded } = chipFold(group, ctx);
 			const spec: ElementSpec = {
 				kind: "team-chip",
 				key: specKey,
@@ -203,10 +236,16 @@ function foldChips(
 		}
 		run = [];
 	};
+	const seen = new Map<string, number>();
 	for (const unit of units) {
 		if (unit.kind === "segment" && unit.seg.kind === "tool-run") {
 			const seg = unit.seg as unknown as ToolRunSeg;
-			for (const item of seg.items) run.push({ item, unit, seg });
+			for (const item of seg.items) {
+				const id = item.tc.toolUseId ?? "";
+				const repeat = seen.get(id) ?? 0;
+				seen.set(id, repeat + 1);
+				run.push({ item, unit, seg, identity: repeat > 0 ? `${id}#${repeat}` : id });
+			}
 			continue;
 		}
 		flushRun();
@@ -228,10 +267,32 @@ function unitSources(
 	return seg.kind === "message" ? [seg.msg] : seg.sourceMessages;
 }
 
-/** Start time of a unit; +∞ when unknown, so events pass before it rather than after. */
-function unitTime(unit: AdapterRenderUnit, sources: ReadonlyMap<string, SourceMessage[]>): number {
-	const time = parseServerTime(unitSources(unit, sources)[0]?.createdAt);
-	return Number.isFinite(time) ? time : Number.POSITIVE_INFINITY;
+/**
+ * Each unit's placement time: its first source message's `createdAt`. A unit without one
+ * carries the previous unit's time (it is somewhere after it), so it neither pulls earlier
+ * events below itself nor lets later ones jump above it; only TRAILING timeless units (the
+ * live streaming row) count as +∞, so newer events sit before them. Leading timeless units
+ * take the first known time.
+ */
+function unitTimes(
+	units: readonly AdapterRenderUnit[],
+	sources: ReadonlyMap<string, SourceMessage[]>,
+): number[] {
+	const raw = units.map((unit) => parseServerTime(unitSources(unit, sources)[0]?.createdAt));
+	let lastKnown = -1;
+	for (let index = raw.length - 1; index >= 0; index--)
+		if (Number.isFinite(raw[index])) {
+			lastKnown = index;
+			break;
+		}
+	if (lastKnown < 0) return raw.map(() => Number.POSITIVE_INFINITY);
+	const firstKnown = raw.findIndex((time) => Number.isFinite(time));
+	let carried = raw[firstKnown] as number;
+	return raw.map((time, index) => {
+		if (index > lastKnown) return Number.POSITIVE_INFINITY;
+		if (Number.isFinite(time)) carried = time;
+		return carried;
+	});
 }
 
 /**
@@ -245,7 +306,8 @@ export function mergeTeamEvents(
 ): AdapterRenderUnit[] {
 	if (events.length === 0 || units.length === 0) return [...units];
 	const first = units[0] as AdapterRenderUnit;
-	const floor = hasPrev ? unitTime(first, sources) : Number.NEGATIVE_INFINITY;
+	const times = unitTimes(units, sources);
+	const floor = hasPrev ? (times[0] as number) : Number.NEGATIVE_INFINITY;
 	const out: AdapterRenderUnit[] = [];
 	let next = 0;
 	// Events that belong to a page not loaded yet.
@@ -257,8 +319,8 @@ export function mergeTeamEvents(
 		out.push({ kind: "element", spec: { kind: "team-event", key, data } });
 	};
 	let previous: readonly SourceMessage[] = unitSources(first, sources);
-	for (const unit of units) {
-		const time = unitTime(unit, sources);
+	for (const [index, unit] of units.entries()) {
+		const time = times[index] as number;
 		while (next < events.length && (events[next] as TeamConversationEvent).at < time) {
 			divider(events[next] as TeamConversationEvent, previous);
 			next++;

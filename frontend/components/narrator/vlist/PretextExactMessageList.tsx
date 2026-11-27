@@ -2195,7 +2195,13 @@ export const PretextExactMessageList = memo(
 				],
 			);
 			// Team mode (the team page's coordinator column only; null on every other host).
-			const teamMode = useTeamConversationMode();
+			// Only the coordinator's own top-level list: a subagent or nested list under the same
+			// provider builds exactly as on the session page.
+			const providedTeamMode = useTeamConversationMode();
+			const teamMode =
+				providedTeamMode && !isSubagent && providedTeamMode.narratorId === narratorId
+					? providedTeamMode
+					: null;
 			const teamConversation = useMemo(
 				() =>
 					teamMode

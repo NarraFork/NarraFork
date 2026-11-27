@@ -34,8 +34,12 @@ export interface TeamChipData {
 	failed: number;
 	/** Tooltip of the error mark (「1 次失败」), empty without failures. */
 	failedLabel: string;
-	/** "fail" when any call failed, else "success" (keys the measure cache). */
-	status: "fail" | "success";
+	/** Calls cancelled, denied or aborted (a grey mark, never a green check). */
+	cancelled: number;
+	/** Tooltip of that mark (「1 次取消」), empty without any. */
+	cancelledLabel: string;
+	/** The worst outcome among the calls (keys the measure cache). */
+	status: "fail" | "cancelled" | "success";
 	/** Everything painted, joined: keys the measure cache (`extractDataRevision`'s `text`). */
 	text: string;
 }

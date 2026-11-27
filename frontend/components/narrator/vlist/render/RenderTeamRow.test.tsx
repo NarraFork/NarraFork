@@ -25,6 +25,8 @@ const chipData = (failed = 0) => ({
 	countLabel: " ×7",
 	failed,
 	failedLabel: failed ? `${failed} 次失败` : "",
+	cancelled: 0,
+	cancelledLabel: "",
 	status: failed ? ("fail" as const) : ("success" as const),
 	text: `创建工作项| ×7|${failed}`,
 });
@@ -68,6 +70,23 @@ describe("team chip", () => {
 		expect(failed.querySelector('[data-testid="team-chip-error"]')?.getAttribute("title")).toBe(
 			"2 次失败",
 		);
+		// Cancelled calls get a grey mark, never the green check.
+		const cancelled = doc(
+			renderToStaticMarkup(
+				<MantineProvider>
+					<RenderTeamChip
+						measured={measureTeamChip(
+							{ ...chipData(), cancelled: 1, cancelledLabel: "1 次取消", status: "cancelled" },
+							600,
+						)}
+					/>
+				</MantineProvider>,
+			),
+		);
+		expect(
+			cancelled.querySelector('[data-testid="team-chip-cancelled"]')?.getAttribute("title"),
+		).toBe("1 次取消");
+		expect(cancelled.querySelector('[data-testid="team-chip-error"]')).toBeNull();
 		// Without a toggle (no interaction host) the chip is inert.
 		expect(failed.querySelector("button")?.hasAttribute("disabled")).toBe(true);
 	});

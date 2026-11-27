@@ -30,6 +30,8 @@ import type {
 } from "./segment-adapter";
 import {
 	applyTeamConversationMode,
+	measureRevisionOf,
+	TEAM_REVISION_MARK,
 	type TeamConversationLayoutOptions,
 } from "./team-conversation-transform";
 import type { VListItem } from "./vlist-pipeline";
@@ -541,12 +543,12 @@ export function buildPretextDocumentLayout(
 	// events (the fold capture must not survive it). The measure cache keeps the plain revision:
 	// the chips and dividers key their own text, and an event must not re-measure every row.
 	const documentRevision = options.teamConversation
-		? `${auxRevision}~team:${options.teamConversation.revision}`
+		? `${auxRevision}${TEAM_REVISION_MARK}${options.teamConversation.revision}`
 		: auxRevision;
 	const baseMeasure = options.measure ?? measureElementCached;
 	const measure: MeasureElement | undefined = options.teamConversation
 		? (kind, data, width, lod, opts, key) =>
-				baseMeasure(kind, data, width, lod, opts, key, auxRevision)
+				baseMeasure(kind, data, width, lod, opts, key, measureRevisionOf(documentRevision))
 		: options.measure;
 	const built = buildPretextLayoutManifest({
 		...options,
