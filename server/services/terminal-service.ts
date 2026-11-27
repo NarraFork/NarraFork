@@ -226,7 +226,11 @@ const heldOutput = new Map<string, HeldItem[]>();
 const gapDrains = new Map<string, Promise<void>>();
 
 function onGap(id: string, buffer: BufferManager, missingBytes: number) {
-	holdOutputWhile(id, buffer, () => interruptTextWatchesForGap(id, buffer, missingBytes));
+	holdOutputWhile(id, buffer, () => {
+		// The replay no longer starts where the snapshot ends: drop nothing more.
+		restoredSkip.delete(id);
+		return interruptTextWatchesForGap(id, buffer, missingBytes);
+	});
 }
 
 /** The executor restarted under the session: watches settle before its notice lands. */
@@ -260,25 +264,12 @@ function holdOutputWhile(id: string, buffer: BufferManager, work: () => Promise<
 					next = item;
 					break;
 				}
-				const pieces = splitHeldOutput(item[0], item[1], buffer.cols);
-				let chunkDone: (() => void) | undefined;
-				if (pieces.length > 1 && item[1] !== undefined)
-					splitChunks.set(id, new Promise<void>((resolve) => (chunkDone = resolve)));
-				try {
-					for (const [index, [piece, streamSeq]] of pieces.entries()) {
-						// Leading pieces of a numbered chunk keep snapshots off until the last.
-						const partial = item[1] !== undefined && index < pieces.length - 1;
-						applyOutput(id, buffer, piece, streamSeq, partial);
-						rows += estimatedRows(piece, buffer.cols);
-						if (rows >= HELD_OUTPUT_CHECK_ROWS) {
-							rows = 0;
-							await checkHeldWatches(id, buffer);
-						}
-					}
-				} finally {
-					if (chunkDone) {
-						splitChunks.delete(id);
-						chunkDone();
+				for (const piece of chunkPieces(id, buffer, item[0], item[1], true)) {
+					applyPiece(id, buffer, piece);
+					rows += estimatedRows(piece.text, buffer.cols);
+					if (rows >= HELD_OUTPUT_CHECK_ROWS) {
+						rows = 0;
+						await checkHeldWatches(id, buffer);
 					}
 				}
 			}
@@ -310,18 +301,72 @@ function estimatedRows(text: string, cols: number): number {
 }
 
 /**
- * Cut held output into pieces of at most {@link HELD_OUTPUT_CHECK_ROWS} rows, at
- * line breaks where possible and never inside a surrogate pair. Only the last
- * piece carries the stream position, which is where the whole chunk ends.
+ * Characters of the replay a resumed terminal already has: its snapshot was taken
+ * inside a chunk, and the replay starts at that chunk's beginning. Decoding from a
+ * chunk boundary yields the same text, so exactly this many are dropped.
  */
-export function splitHeldOutput(
+const restoredSkip = new Map<string, number>();
+
+interface OutputPiece {
+	text: string;
+	streamSeq?: number;
+	/** Characters past the previous position appended once this piece is (leading pieces). */
+	partialChars?: number;
+}
+
+/**
+ * One chunk of output, ready for the buffer: the characters a resumed snapshot
+ * already holds are dropped, and with `split` the rest is cut into pieces of at
+ * most {@link HELD_OUTPUT_CHECK_ROWS} rows. Only the last piece carries the stream
+ * position; the others say how far into the chunk they reach.
+ */
+function chunkPieces(
+	id: string,
+	buffer: BufferManager,
 	text: string,
 	streamSeq: number | undefined,
-	cols: number,
-): Array<[string, number | undefined]> {
-	if (estimatedRows(text, cols) < HELD_OUTPUT_CHECK_ROWS) return [[text, streamSeq]];
+	split: boolean,
+): OutputPiece[] {
+	let base = 0;
+	const skip = streamSeq === undefined ? 0 : (restoredSkip.get(id) ?? 0);
+	if (skip > 0) {
+		if (text.length <= skip) {
+			// Wholly in the snapshot already; record the position it reaches.
+			restoredSkip.set(id, skip - text.length);
+			if (skip === text.length) restoredSkip.delete(id);
+			return [{ text: "", streamSeq, partialChars: skip - text.length }];
+		}
+		restoredSkip.delete(id);
+		base = skip;
+		text = text.slice(skip);
+	}
+	const parts = split ? splitHeldOutput(text, buffer.cols) : [text];
+	let reached = base;
+	return parts.map((part, index) => {
+		reached += part.length;
+		if (index === parts.length - 1) return { text: part, streamSeq };
+		return streamSeq === undefined ? { text: part } : { text: part, partialChars: reached };
+	});
+}
+
+function applyPiece(id: string, buffer: BufferManager, piece: OutputPiece) {
+	if (!piece.text) {
+		if (piece.streamSeq !== undefined) buffer.append("", piece.streamSeq, piece.partialChars);
+		return;
+	}
+	buffer.append(piece.text, piece.streamSeq, piece.partialChars);
+	sendToTerminal(id, { type: "output", terminalId: id, data: piece.text });
+	notifyTerminalOutput(id);
+}
+
+/**
+ * Cut text into pieces of at most {@link HELD_OUTPUT_CHECK_ROWS} rows, at line
+ * breaks where possible and never inside a surrogate pair.
+ */
+export function splitHeldOutput(text: string, cols: number): string[] {
+	if (estimatedRows(text, cols) < HELD_OUTPUT_CHECK_ROWS) return [text];
 	const maxChars = HELD_OUTPUT_CHECK_ROWS * Math.max(1, cols);
-	const pieces: Array<[string, number | undefined]> = [];
+	const pieces: string[] = [];
 	let from = 0;
 	while (from < text.length) {
 		let end = Math.min(text.length, from + maxChars);
@@ -338,34 +383,10 @@ export function splitHeldOutput(
 		}
 		const code = text.charCodeAt(end - 1);
 		if (end < text.length && end - from > 1 && code >= 0xd800 && code <= 0xdbff) end--;
-		pieces.push([text.slice(from, end), end === text.length ? streamSeq : undefined]);
+		pieces.push(text.slice(from, end));
 		from = end;
 	}
 	return pieces;
-}
-
-/** Settles once the numbered chunk being written back in pieces has its last piece queued. */
-const splitChunks = new Map<string, Promise<void>>();
-
-/** Longest a shutdown waits for a split chunk to finish before saving anyway. */
-const SHUTDOWN_CHUNK_WAIT_MS = 5_000;
-
-/**
- * Wait (bounded) until the terminal's buffer is not inside a split numbered chunk,
- * so the final snapshot can be written: one taken mid-chunk is skipped. Watches are
- * suspended by then, so the pieces left need no checks and follow at once.
- */
-async function waitForChunkBoundary(id: string): Promise<void> {
-	const chunk = splitChunks.get(id);
-	if (!chunk) return;
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	await Promise.race([
-		chunk,
-		new Promise<void>((resolve) => {
-			timer = setTimeout(resolve, SHUTDOWN_CHUNK_WAIT_MS);
-		}),
-	]);
-	clearTimeout(timer);
 }
 
 /** Wait until no output is held for a gap, so the buffer holds everything received. */
@@ -380,20 +401,9 @@ function onData(id: string, buffer: BufferManager, data: string | Uint8Array, st
 		if (text) held.push([text, streamSeq]);
 		return;
 	}
-	applyOutput(id, buffer, text, streamSeq);
-}
-
-function applyOutput(
-	id: string,
-	buffer: BufferManager,
-	text: string,
-	streamSeq?: number,
-	partial = false,
-) {
 	if (!text) return;
-	buffer.append(text, streamSeq, partial);
-	sendToTerminal(id, { type: "output", terminalId: id, data: text });
-	notifyTerminalOutput(id);
+	for (const piece of chunkPieces(id, buffer, text, streamSeq, false))
+		applyPiece(id, buffer, piece);
 }
 
 /**
@@ -448,6 +458,8 @@ async function resumeExecutorSession(
 		return;
 	}
 	buffer.startPeriodicFlush();
+	if (buffer.restoredStreamSkip > 0) restoredSkip.set(terminalId, buffer.restoredStreamSkip);
+	else restoredSkip.delete(terminalId);
 	// Text watches saved with the snapshot resume from it: hold the replayed output
 	// until restart recovery has re-registered them (or given them up).
 	const restoredWatches = registerRestoredWatchAnchors(terminalId, buffer, anchors);
@@ -1512,9 +1524,8 @@ export const terminalService = {
 				(async () => {
 					if (active.executorSession) {
 						// The shell lives in the executor: save the snapshot (with its stream
-						// position) and stop reading. The row stays running for recovery. A chunk
-						// being written back in pieces is finished first: a save inside it is skipped.
-						await waitForChunkBoundary(id);
+						// position) and stop reading. The row stays running for recovery. Saved
+						// right away: held output not yet written back stays in the replay.
 						await active.buffer.saveToDisk();
 						active.buffer.stopPeriodicFlush();
 						active.runtime.close();

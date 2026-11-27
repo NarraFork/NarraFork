@@ -405,8 +405,14 @@ describe("remote terminals backed by executor sessions", () => {
 			async (_id, buffer) => {
 				const lines = [...(await buffer.getContents()).matchAll(/line (\d+)/g)];
 				lastLineSeen.push(lines.length ? Number(lines.at(-1)?.[1]) : -1);
-				// A save between pieces of the chunk must not pair part of it with a position.
-				if (lastLineSeen.length === 2) savedMidChunk = await buffer.saveToDisk();
+				// A save between pieces records how far into the chunk it reaches.
+				if (lastLineSeen.length === 2) {
+					await buffer.saveToDisk();
+					const mid = new BufferManager("t-durable");
+					await mid.loadFromDisk();
+					savedMidChunk = mid.restoredStreamSkip;
+					await mid.dispose();
+				}
 			},
 		);
 		try {
@@ -429,7 +435,7 @@ describe("remote terminals backed by executor sessions", () => {
 			await Bun.sleep(10);
 			const buffer = terminalService.getActiveBuffer("t-durable");
 			expect(await buffer?.getContents()).toContain("line 5099");
-			expect(savedMidChunk).toBe(0);
+			expect(savedMidChunk).toBeGreaterThan(0);
 			// Once the chunk is complete, its text and position are saved together.
 			await buffer?.saveToDisk();
 			const saved = new BufferManager("t-durable");
@@ -444,7 +450,7 @@ describe("remote terminals backed by executor sessions", () => {
 		}
 	});
 
-	test("a shutdown inside a split chunk saves once the chunk is complete, anchors included", async () => {
+	test("a shutdown inside a split chunk saves where it is, anchors included", async () => {
 		let releaseGap: (() => void) | undefined;
 		let shutdown: Promise<void> | undefined;
 		let calls = 0;
@@ -478,9 +484,13 @@ describe("remote terminals backed by executor sessions", () => {
 			releaseGap?.();
 			await until(() => shutdown !== undefined);
 			await shutdown;
+			// Saved at once, inside the chunk: the unchecked rest stays in the replay.
 			const saved = new BufferManager("t-durable");
 			await saved.loadFromDisk();
-			expect(saved.restoredStreamSeq).toBe(10 + encode(replay).length);
+			expect(saved.restoredStreamSeq).toBe(10);
+			expect(saved.restoredStreamSkip).toBeGreaterThan(0);
+			expect(saved.restoredStreamSkip).toBeLessThan(replay.length);
+			expect(await saved.getContents()).not.toContain("line 5099");
 			expect((await saved.takeRestoredAnchors()).map((anchor) => anchor.id)).toEqual(["bash_new"]);
 			await saved.dispose();
 		} finally {
@@ -488,6 +498,49 @@ describe("remote terminals backed by executor sessions", () => {
 			hasWatches.mockRestore();
 			checkNow.mockRestore();
 		}
+	});
+
+	test("a snapshot taken inside a chunk resumes without showing its part twice", async () => {
+		insertTerminal("t-durable", { deviceId: "dev-1", executorSessionId: "nf-term-t-durable" });
+		const source = new BufferManager("t-durable");
+		source.append("$ ", 2);
+		// Part of a chunk starting at 2 was in the buffer when the snapshot was taken.
+		source.append("alpha\r\nbe", undefined, 9);
+		await source.saveToDisk();
+		await source.dispose();
+
+		await terminalService.recoverOnStartup();
+		await until(() => attachStream !== undefined);
+		const attach = calls.find((call) => call.method === "session.attach");
+		expect(attach?.params).toEqual({ sessionId: "nf-term-t-durable", since: 2 });
+		const encode = (text: string) => new TextEncoder().encode(text);
+		// The replay starts at the chunk's beginning, in different pieces.
+		attachStream?.("session.data", encode("alp"));
+		attachStream?.("session.data", encode("ha\r\nbeta\r\ngamma\r\n"));
+		await Bun.sleep(20);
+		const contents = (await terminalService.getActiveBuffer("t-durable")?.getContents()) ?? "";
+		expect(contents.match(/alpha/g)).toHaveLength(1);
+		expect(contents.match(/beta/g)).toHaveLength(1);
+		expect(contents).toContain("gamma");
+	});
+
+	test("a gap in the replay of a mid-chunk snapshot drops nothing after it", async () => {
+		insertTerminal("t-durable", { deviceId: "dev-1", executorSessionId: "nf-term-t-durable" });
+		const source = new BufferManager("t-durable");
+		source.append("$ ", 2);
+		source.append("alpha\r\n", undefined, 7);
+		await source.saveToDisk();
+		await source.dispose();
+
+		await terminalService.recoverOnStartup();
+		await until(() => attachStream !== undefined);
+		const encode = (text: string) => new TextEncoder().encode(text);
+		attachStream?.("session.gap", encode(JSON.stringify({ from: 2, to: 50 })));
+		attachStream?.("session.data", encode("AFTER\r\n"));
+		await until(() => calls.length > 0);
+		await Bun.sleep(30);
+		const contents = (await terminalService.getActiveBuffer("t-durable")?.getContents()) ?? "";
+		expect(contents).toContain("AFTER");
 	});
 
 	test("a closing terminal records its stop before the row is marked exited", async () => {

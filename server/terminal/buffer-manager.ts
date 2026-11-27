@@ -46,6 +46,12 @@ interface BufferFileV3 {
 	 * output; a reattach resumes from exactly here.
 	 */
 	streamSeq?: number;
+	/**
+	 * Decoded characters past `streamSeq` the snapshot already contains, when it was
+	 * taken inside a chunk written in pieces. A reattach resumes at `streamSeq` and
+	 * drops this many characters of the replay.
+	 */
+	streamSkip?: number;
 	/** Read cursors that must survive a restart (see {@link BufferManager.setDurableAnchor}). */
 	anchors?: StoredAnchor[];
 	/**
@@ -245,9 +251,11 @@ export class BufferManager {
 	private pendingStreamSeq: number | undefined;
 	/** Stream position of the output xterm has actually parsed (what a save contains). */
 	private appliedStreamSeq: number | undefined;
-	/** Whether the last appended / parsed output ends inside a numbered chunk. */
-	private pendingPartial = false;
-	private appliedPartial = false;
+	/** Decoded characters past the appended / parsed stream position (inside a chunk). */
+	private pendingPartialChars = 0;
+	private appliedPartialChars = 0;
+	/** Characters past `loadedStreamSeq` the loaded snapshot already contains. */
+	private loadedStreamSkip = 0;
 	/** Stream position recorded in the snapshot loaded from disk, if any. */
 	private loadedStreamSeq: number | undefined;
 
@@ -329,16 +337,18 @@ export class BufferManager {
 	/**
 	 * Queue output for the emulator. `streamSeq` is the source's position after
 	 * this chunk, for sources that number their output; it is saved with the
-	 * snapshot only once the chunk has been parsed. `partial` marks a leading piece
-	 * of a numbered chunk whose position comes with its last piece: until that is
-	 * parsed no snapshot is written, since its text would not match any position.
+	 * snapshot only once the chunk has been parsed. A chunk written in pieces gives
+	 * its leading pieces `partialChars` instead: how many of its characters past the
+	 * last position have been appended, so a snapshot taken between pieces records
+	 * exactly what it contains. A position alone resets that count.
 	 */
-	append(data: string, streamSeq?: number, partial = false): void {
+	append(data: string, streamSeq?: number, partialChars?: number): void {
 		this.setCurrentReadView(undefined);
 		this.trackMouseMode(data);
 		this.pendingWrites.push(data);
 		if (streamSeq !== undefined) this.pendingStreamSeq = streamSeq;
-		this.pendingPartial = partial;
+		if (partialChars !== undefined) this.pendingPartialChars = partialChars;
+		else if (streamSeq !== undefined) this.pendingPartialChars = 0;
 		this.dirty = true;
 		if (!this.draining) this.drain();
 	}
@@ -346,6 +356,11 @@ export class BufferManager {
 	/** Source position of the output the emulator has parsed so far, if numbered. */
 	get streamSeq(): number | undefined {
 		return this.appliedStreamSeq;
+	}
+
+	/** Characters past {@link restoredStreamSeq} the loaded snapshot already contains. */
+	get restoredStreamSkip(): number {
+		return this.loadedStreamSkip;
 	}
 
 	/** Source position the snapshot loaded by loadFromDisk() ends at, if it recorded one. */
@@ -366,10 +381,10 @@ export class BufferManager {
 				this.pendingWrites.length = 0;
 				// Captured with the batch: later appends belong to the next batch.
 				const batchSeq = this.pendingStreamSeq;
-				const batchPartial = this.pendingPartial;
+				const batchPartialChars = this.pendingPartialChars;
 				await new Promise<void>((resolve) => this.xterm.write(batch, resolve));
 				if (batchSeq !== undefined) this.appliedStreamSeq = batchSeq;
-				this.appliedPartial = batchPartial;
+				this.appliedPartialChars = batchPartialChars;
 				this.setCurrentReadView(undefined);
 			}
 			this.draining = false;
@@ -936,9 +951,6 @@ export class BufferManager {
 	saveToDisk(): Promise<number> {
 		const p = this.writeChain
 			.then(async () => {
-				// Keep the last snapshot whose text matches its position; this one is
-				// written once the chunk's last piece has been parsed (still dirty).
-				if (this.appliedPartial) return 0;
 				const filePath = join(getBuffersDir(), `${this.terminalId}.buf`);
 				const serialized = this.serializeAddon.serialize({
 					scrollback: this.xterm.options.scrollback,
@@ -950,6 +962,9 @@ export class BufferManager {
 					rows: this.xterm.rows,
 					mouseMode: { ...this.mouseMode },
 					...(this.appliedStreamSeq !== undefined ? { streamSeq: this.appliedStreamSeq } : {}),
+					...(this.appliedStreamSeq !== undefined && this.appliedPartialChars > 0
+						? { streamSkip: this.appliedPartialChars }
+						: {}),
 				};
 				const anchors = this.appliedStreamSeq === undefined ? [] : this.storedAnchors();
 				if (anchors.length > 0) {
@@ -1044,6 +1059,10 @@ export class BufferManager {
 				if (numbered) {
 					this.loadedStreamSeq = parsed.streamSeq;
 					this.appliedStreamSeq = parsed.streamSeq;
+					const skip = Number.isSafeInteger(parsed.streamSkip) && parsed.streamSkip > 0;
+					this.loadedStreamSkip = skip ? parsed.streamSkip : 0;
+					this.pendingPartialChars = this.loadedStreamSkip;
+					this.appliedPartialChars = this.loadedStreamSkip;
 				}
 				logger.debug("Loaded buffer from disk (V3)", {
 					terminalId: this.terminalId,
