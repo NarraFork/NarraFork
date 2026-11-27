@@ -220,17 +220,13 @@ async function markTerminalExited(
  * being matched against output before it. Work queued while output is held (a
  * second gap) runs in stream order: after the output received before it.
  */
-type HeldItem = [string, number | undefined] | (() => Promise<void>);
+type HeldItem = [string, number | undefined, Uint8Array | undefined] | (() => Promise<void>);
 const heldOutput = new Map<string, HeldItem[]>();
 /** Settles once a gap's held output has been written back to the buffer. */
 const gapDrains = new Map<string, Promise<void>>();
 
 function onGap(id: string, buffer: BufferManager, missingBytes: number) {
-	holdOutputWhile(id, buffer, () => {
-		// The replay no longer starts where the snapshot ends: drop nothing more.
-		restoredSkip.delete(id);
-		return interruptTextWatchesForGap(id, buffer, missingBytes);
-	});
+	holdOutputWhile(id, buffer, () => interruptTextWatchesForGap(id, buffer, missingBytes));
 }
 
 /** The executor restarted under the session: watches settle before its notice lands. */
@@ -264,7 +260,7 @@ function holdOutputWhile(id: string, buffer: BufferManager, work: () => Promise<
 					next = item;
 					break;
 				}
-				for (const piece of chunkPieces(id, buffer, item[0], item[1], true)) {
+				for (const piece of outputPieces(item[0], item[1], item[2], buffer.cols)) {
 					applyPiece(id, buffer, piece);
 					rows += estimatedRows(piece.text, buffer.cols);
 					if (rows >= HELD_OUTPUT_CHECK_ROWS) {
@@ -300,93 +296,65 @@ function estimatedRows(text: string, cols: number): number {
 	return breaks + Math.floor(text.length / Math.max(1, cols));
 }
 
-/**
- * Characters of the replay a resumed terminal already has: its snapshot was taken
- * inside a chunk, and the replay starts at that chunk's beginning. Decoding from a
- * chunk boundary yields the same text, so exactly this many are dropped.
- */
-const restoredSkip = new Map<string, number>();
-
 interface OutputPiece {
 	text: string;
 	streamSeq?: number;
-	/** Characters past the previous position appended once this piece is (leading pieces). */
-	partialChars?: number;
 }
 
 /**
- * One chunk of output, ready for the buffer: the characters a resumed snapshot
- * already holds are dropped, and with `split` the rest is cut into pieces of at
- * most {@link HELD_OUTPUT_CHECK_ROWS} rows. Only the last piece carries the stream
- * position; the others say how far into the chunk they reach.
+ * One chunk of output cut into pieces of at most {@link HELD_OUTPUT_CHECK_ROWS}
+ * rows, each with its exact stream position, so a snapshot taken between pieces
+ * resumes at exactly what it contains. The cut is made in `bytes` (the complete
+ * UTF-8 the text was decoded from), before a line break's successor or a lead
+ * byte: either ends any sequence before it, so each piece decodes as it did in
+ * the whole. Without the bytes the chunk stays whole.
  */
-function chunkPieces(
-	id: string,
-	buffer: BufferManager,
+export function outputPieces(
 	text: string,
 	streamSeq: number | undefined,
-	split: boolean,
+	bytes: Uint8Array | undefined,
+	cols: number,
 ): OutputPiece[] {
-	let base = 0;
-	const skip = streamSeq === undefined ? 0 : (restoredSkip.get(id) ?? 0);
-	if (skip > 0) {
-		if (text.length <= skip) {
-			// Wholly in the snapshot already; record the position it reaches.
-			restoredSkip.set(id, skip - text.length);
-			if (skip === text.length) restoredSkip.delete(id);
-			return [{ text: "", streamSeq, partialChars: skip - text.length }];
-		}
-		restoredSkip.delete(id);
-		base = skip;
-		text = text.slice(skip);
-	}
-	const parts = split ? splitHeldOutput(text, buffer.cols) : [text];
-	let reached = base;
-	return parts.map((part, index) => {
-		reached += part.length;
-		if (index === parts.length - 1) return { text: part, streamSeq };
-		return streamSeq === undefined ? { text: part } : { text: part, partialChars: reached };
-	});
+	if (streamSeq === undefined || !bytes || estimatedRows(text, cols) < HELD_OUTPUT_CHECK_ROWS)
+		return [{ text, streamSeq }];
+	const pieces: OutputPiece[] = [];
+	const start = streamSeq - bytes.length;
+	for (const [from, to] of splitOutputBytes(bytes, cols))
+		pieces.push({
+			text: new TextDecoder().decode(bytes.subarray(from, to)),
+			streamSeq: start + to,
+		});
+	// Defensive: a cut must never change the text; keep the chunk whole if it would.
+	return pieces.map((piece) => piece.text).join("") === text ? pieces : [{ text, streamSeq }];
 }
 
-function applyPiece(id: string, buffer: BufferManager, piece: OutputPiece) {
-	if (!piece.text) {
-		if (piece.streamSeq !== undefined) buffer.append("", piece.streamSeq, piece.partialChars);
-		return;
-	}
-	buffer.append(piece.text, piece.streamSeq, piece.partialChars);
-	sendToTerminal(id, { type: "output", terminalId: id, data: piece.text });
-	notifyTerminalOutput(id);
-}
-
-/**
- * Cut text into pieces of at most {@link HELD_OUTPUT_CHECK_ROWS} rows, at line
- * breaks where possible and never inside a surrogate pair.
- */
-export function splitHeldOutput(text: string, cols: number): string[] {
-	if (estimatedRows(text, cols) < HELD_OUTPUT_CHECK_ROWS) return [text];
-	const maxChars = HELD_OUTPUT_CHECK_ROWS * Math.max(1, cols);
-	const pieces: string[] = [];
+/** Byte ranges of at most {@link HELD_OUTPUT_CHECK_ROWS} rows, cut at safe boundaries. */
+export function splitOutputBytes(bytes: Uint8Array, cols: number): Array<[number, number]> {
+	const maxBytes = HELD_OUTPUT_CHECK_ROWS * Math.max(1, cols);
+	const ranges: Array<[number, number]> = [];
 	let from = 0;
-	while (from < text.length) {
-		let end = Math.min(text.length, from + maxChars);
+	while (from < bytes.length) {
+		let end = Math.min(bytes.length, from + maxBytes);
 		let breaks = 0;
-		for (
-			let at = text.indexOf("\n", from);
-			at !== -1 && at < end;
-			at = text.indexOf("\n", at + 1)
-		) {
-			if (++breaks >= HELD_OUTPUT_CHECK_ROWS) {
+		for (let at = from; at < end; at++) {
+			if (bytes[at] === 0x0a && ++breaks >= HELD_OUTPUT_CHECK_ROWS) {
 				end = at + 1;
 				break;
 			}
 		}
-		const code = text.charCodeAt(end - 1);
-		if (end < text.length && end - from > 1 && code >= 0xd800 && code <= 0xdbff) end--;
-		pieces.push(text.slice(from, end));
+		// Never cut before a continuation byte.
+		while (end < bytes.length && end > from + 1 && (bytes[end] & 0xc0) === 0x80) end--;
+		ranges.push([from, end]);
 		from = end;
 	}
-	return pieces;
+	return ranges;
+}
+
+function applyPiece(id: string, buffer: BufferManager, piece: OutputPiece) {
+	if (!piece.text) return;
+	buffer.append(piece.text, piece.streamSeq);
+	sendToTerminal(id, { type: "output", terminalId: id, data: piece.text });
+	notifyTerminalOutput(id);
 }
 
 /** Wait until no output is held for a gap, so the buffer holds everything received. */
@@ -394,16 +362,20 @@ async function drainHeldOutput(id: string): Promise<void> {
 	for (let drained = gapDrains.get(id); drained; drained = gapDrains.get(id)) await drained;
 }
 
-function onData(id: string, buffer: BufferManager, data: string | Uint8Array, streamSeq?: number) {
+function onData(
+	id: string,
+	buffer: BufferManager,
+	data: string | Uint8Array,
+	streamSeq?: number,
+	bytes?: Uint8Array,
+) {
 	const text = typeof data === "string" ? data : new TextDecoder().decode(data);
 	const held = heldOutput.get(id);
 	if (held) {
-		if (text) held.push([text, streamSeq]);
+		if (text) held.push([text, streamSeq, bytes]);
 		return;
 	}
-	if (!text) return;
-	for (const piece of chunkPieces(id, buffer, text, streamSeq, false))
-		applyPiece(id, buffer, piece);
+	applyPiece(id, buffer, { text, streamSeq });
 }
 
 /**
@@ -458,15 +430,13 @@ async function resumeExecutorSession(
 		return;
 	}
 	buffer.startPeriodicFlush();
-	if (buffer.restoredStreamSkip > 0) restoredSkip.set(terminalId, buffer.restoredStreamSkip);
-	else restoredSkip.delete(terminalId);
 	// Text watches saved with the snapshot resume from it: hold the replayed output
 	// until restart recovery has re-registered them (or given them up).
 	const restoredWatches = registerRestoredWatchAnchors(terminalId, buffer, anchors);
 	if (restoredWatches) holdOutputWhile(terminalId, buffer, () => restoredWatches);
 	const resumed = spawnRemoteSession(deviceId, sessionId, {
 		since,
-		onData: (data, streamSeq) => onData(terminalId, buffer, data, streamSeq),
+		onData: (data, streamSeq, bytes) => onData(terminalId, buffer, data, streamSeq, bytes),
 		onGap: (missing) => onGap(terminalId, buffer, missing),
 		onRestartInterrupted: (outcome) => onRestartInterrupted(terminalId, buffer, outcome),
 	});
@@ -827,7 +797,7 @@ async function createTerminal(opts: CreateTerminalOptions) {
 				rows,
 			},
 			since: 0,
-			onData: (data, streamSeq) => onData(id, buffer, data, streamSeq),
+			onData: (data, streamSeq, bytes) => onData(id, buffer, data, streamSeq, bytes),
 			onGap: (missing) => onGap(id, buffer, missing),
 			onRestartInterrupted: (outcome) => onRestartInterrupted(id, buffer, outcome),
 		});

@@ -392,7 +392,7 @@ describe("remote terminals backed by executor sessions", () => {
 
 	test("held output is written back in batches that text watches check in turn", async () => {
 		const lastLineSeen: number[] = [];
-		let savedMidChunk: number | undefined;
+		let savedMidChunk: { seq: number; lines: number } | undefined;
 		let releaseGap: (() => void) | undefined;
 		const gapHandling = spyOn(terminalWatches, "interruptTextWatchesForGap").mockImplementation(
 			() =>
@@ -405,12 +405,15 @@ describe("remote terminals backed by executor sessions", () => {
 			async (_id, buffer) => {
 				const lines = [...(await buffer.getContents()).matchAll(/line (\d+)/g)];
 				lastLineSeen.push(lines.length ? Number(lines.at(-1)?.[1]) : -1);
-				// A save between pieces records how far into the chunk it reaches.
+				// A save between pieces records exactly the position of what it contains.
 				if (lastLineSeen.length === 2) {
 					await buffer.saveToDisk();
 					const mid = new BufferManager("t-durable");
 					await mid.loadFromDisk();
-					savedMidChunk = mid.restoredStreamSkip;
+					savedMidChunk = {
+						seq: mid.restoredStreamSeq ?? -1,
+						lines: [...(await mid.getContents()).matchAll(/line (\d+)/g)].length,
+					};
 					await mid.dispose();
 				}
 			},
@@ -435,7 +438,12 @@ describe("remote terminals backed by executor sessions", () => {
 			await Bun.sleep(10);
 			const buffer = terminalService.getActiveBuffer("t-durable");
 			expect(await buffer?.getContents()).toContain("line 5099");
-			expect(savedMidChunk).toBeGreaterThan(0);
+			const lineBytes = (count: number) =>
+				new TextEncoder().encode(replay.split("\r\n").slice(0, count).join("\r\n")).length + 2;
+			expect(savedMidChunk?.lines).toBeGreaterThan(0);
+			expect(savedMidChunk?.lines).toBeLessThan(5_100);
+			// Past the 10-byte gap, exactly the lines the snapshot holds.
+			expect(savedMidChunk?.seq).toBe(10 + lineBytes(savedMidChunk?.lines ?? 0));
 			// Once the chunk is complete, its text and position are saved together.
 			await buffer?.saveToDisk();
 			const saved = new BufferManager("t-durable");
@@ -487,10 +495,12 @@ describe("remote terminals backed by executor sessions", () => {
 			// Saved at once, inside the chunk: the unchecked rest stays in the replay.
 			const saved = new BufferManager("t-durable");
 			await saved.loadFromDisk();
-			expect(saved.restoredStreamSeq).toBe(10);
-			expect(saved.restoredStreamSkip).toBeGreaterThan(0);
-			expect(saved.restoredStreamSkip).toBeLessThan(replay.length);
-			expect(await saved.getContents()).not.toContain("line 5099");
+			const contents = await saved.getContents();
+			const lines = [...contents.matchAll(/line (\d+)/g)].length;
+			expect(contents).not.toContain("line 5099");
+			expect(saved.restoredStreamSeq).toBe(
+				10 + encode(replay.split("\r\n").slice(0, lines).join("\r\n")).length + 2,
+			);
 			expect((await saved.takeRestoredAnchors()).map((anchor) => anchor.id)).toEqual(["bash_new"]);
 			await saved.dispose();
 		} finally {
@@ -500,47 +510,35 @@ describe("remote terminals backed by executor sessions", () => {
 		}
 	});
 
-	test("a snapshot taken inside a chunk resumes without showing its part twice", async () => {
-		insertTerminal("t-durable", { deviceId: "dev-1", executorSessionId: "nf-term-t-durable" });
-		const source = new BufferManager("t-durable");
-		source.append("$ ", 2);
-		// Part of a chunk starting at 2 was in the buffer when the snapshot was taken.
-		source.append("alpha\r\nbe", undefined, 9);
-		await source.saveToDisk();
-		await source.dispose();
-
-		await terminalService.recoverOnStartup();
-		await until(() => attachStream !== undefined);
-		const attach = calls.find((call) => call.method === "session.attach");
-		expect(attach?.params).toEqual({ sessionId: "nf-term-t-durable", since: 2 });
+	test("held output is cut only where each piece decodes as in the whole chunk", async () => {
+		const { outputPieces } = await import("../terminal-service");
 		const encode = (text: string) => new TextEncoder().encode(text);
-		// The replay starts at the chunk's beginning, in different pieces.
-		attachStream?.("session.data", encode("alp"));
-		attachStream?.("session.data", encode("ha\r\nbeta\r\ngamma\r\n"));
-		await Bun.sleep(20);
-		const contents = (await terminalService.getActiveBuffer("t-durable")?.getContents()) ?? "";
-		expect(contents.match(/alpha/g)).toHaveLength(1);
-		expect(contents.match(/beta/g)).toHaveLength(1);
-		expect(contents).toContain("gamma");
-	});
-
-	test("a gap in the replay of a mid-chunk snapshot drops nothing after it", async () => {
-		insertTerminal("t-durable", { deviceId: "dev-1", executorSessionId: "nf-term-t-durable" });
-		const source = new BufferManager("t-durable");
-		source.append("$ ", 2);
-		source.append("alpha\r\n", undefined, 7);
-		await source.saveToDisk();
-		await source.dispose();
-
-		await terminalService.recoverOnStartup();
-		await until(() => attachStream !== undefined);
-		const encode = (text: string) => new TextEncoder().encode(text);
-		attachStream?.("session.gap", encode(JSON.stringify({ from: 2, to: 50 })));
-		attachStream?.("session.data", encode("AFTER\r\n"));
-		await until(() => calls.length > 0);
-		await Bun.sleep(30);
-		const contents = (await terminalService.getActiveBuffer("t-durable")?.getContents()) ?? "";
-		expect(contents).toContain("AFTER");
+		// Multibyte characters, an emoji, and an invalid byte, over many short lines.
+		const parts: Uint8Array[] = [];
+		for (let i = 0; i < 3_000; i++) parts.push(encode(`ü ${i} 😀\r\n`));
+		parts.push(new Uint8Array([0xff, 0x0a]));
+		for (let i = 0; i < 1_500; i++) parts.push(encode(`β${"x".repeat(200)}`));
+		const bytes = new Uint8Array(parts.reduce((n, part) => n + part.length, 0));
+		let at = 0;
+		for (const part of parts) {
+			bytes.set(part, at);
+			at += part.length;
+		}
+		const text = new TextDecoder().decode(bytes);
+		const end = 1_000 + bytes.length;
+		const pieces = outputPieces(text, end, bytes, 80);
+		expect(pieces.length).toBeGreaterThan(2);
+		expect(pieces.map((piece) => piece.text).join("")).toBe(text);
+		// Each piece ends at the exact byte position of the text up to it.
+		let consumed = 1_000;
+		for (const piece of pieces) {
+			consumed += encode(piece.text.replaceAll("\ufffd", "")).length;
+			if (piece.text.includes("\ufffd")) consumed += 1;
+			expect(piece.streamSeq).toBe(consumed);
+		}
+		expect(pieces.at(-1)?.streamSeq).toBe(end);
+		// Without the bytes the chunk stays whole.
+		expect(outputPieces(text, end, undefined, 80)).toEqual([{ text, streamSeq: end }]);
 	});
 
 	test("a closing terminal records its stop before the row is marked exited", async () => {

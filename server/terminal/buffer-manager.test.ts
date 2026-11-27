@@ -488,38 +488,6 @@ describe("snapshot stream position", () => {
 		await restored.dispose(true);
 	});
 
-	test("a snapshot inside a numbered chunk records how far into it it reaches", async () => {
-		const id = `seq-${crypto.randomUUID()}`;
-		ids.push(id);
-		const source = new BufferManager(id);
-		source.append("complete\r\n", 10);
-		// The first piece of a chunk that starts at 10; its end position comes later.
-		source.append("first half ", undefined, 11);
-		await source.saveToDisk();
-		let restored = new BufferManager(id);
-		await restored.loadFromDisk();
-		expect(restored.restoredStreamSeq).toBe(10);
-		expect(restored.restoredStreamSkip).toBe(11);
-		expect(await restored.getContents()).toContain("first half");
-		// Saved again before any new output, it still says the same.
-		await restored.saveToDisk();
-		await restored.dispose();
-		restored = new BufferManager(id);
-		await restored.loadFromDisk();
-		expect(restored.restoredStreamSkip).toBe(11);
-		await restored.dispose();
-		// The chunk's last piece brings its position and clears the count.
-		source.append("second half", 30);
-		await source.saveToDisk();
-		await source.dispose();
-		restored = new BufferManager(id);
-		await restored.loadFromDisk();
-		expect(restored.restoredStreamSeq).toBe(30);
-		expect(restored.restoredStreamSkip).toBe(0);
-		expect(await restored.getContents()).toContain("first half second half");
-		await restored.dispose(true);
-	});
-
 	test("a source that does not number its output saves no position", async () => {
 		const id = `seq-${crypto.randomUUID()}`;
 		ids.push(id);
