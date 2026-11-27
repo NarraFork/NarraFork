@@ -11,7 +11,11 @@ import {
 import * as pool from "../../lib/db-worker/pool";
 import { AppError, NotFoundError } from "../../lib/errors";
 import { settings } from "../../lib/settings";
-import { finishLiveCompactProgress, startLiveCompactProgress } from "../compact-live-state";
+import {
+	appendLiveCompactDelta,
+	finishLiveCompactProgress,
+	startLiveCompactProgress,
+} from "../compact-live-state";
 import { syncEnvelopeNow } from "../narrator-block-sync";
 import { narratorService } from "../narrator-service";
 
@@ -40,6 +44,10 @@ function seed(
 
 function read(id = statusId, owner = narratorId, signal = new AbortController().signal) {
 	return narratorService.readCompactSummaryDetail(owner, id, signal);
+}
+
+function readSegment(id: string, owner = narratorId) {
+	return narratorService.readSegmentCompactSummaryDetail(owner, id, new AbortController().signal);
 }
 
 beforeEach(async () => {
@@ -80,6 +88,7 @@ afterEach(async () => {
 	if (savedWorkerSetting === undefined) delete process.env.NARRAFORK_DB_WORKER;
 	else process.env.NARRAFORK_DB_WORKER = savedWorkerSetting;
 	db.delete(narratorMessageRefs).where(eq(narratorMessageRefs.narratorId, narratorId)).run();
+	db.delete(narratorMessageRefs).where(eq(narratorMessageRefs.narratorId, foreignId)).run();
 	db.delete(narratorMessages).where(eq(narratorMessages.narratorId, narratorId)).run();
 	db.delete(narrators).where(eq(narrators.id, foreignId)).run();
 	db.delete(narrators).where(eq(narrators.id, narratorId)).run();
@@ -117,7 +126,14 @@ test("reads current block bodies and adds only current local live progress", asy
 	const marker = seed(5, {
 		role: "system",
 		bodyFormat: 2,
-		contentJson: [{ type: "compact", status: "compacting", contextPercentBefore: 22 }],
+		contentJson: [
+			{
+				type: "compact",
+				status: "compacting",
+				contextPercentBefore: 22,
+				attempts: [{ attempt: 2, model: "stored-model", status: "running", startedAt: now }],
+			},
+		],
 	});
 	syncEnvelopeNow(marker);
 	db.update(narratorMessages)
@@ -128,10 +144,35 @@ test("reads current block bodies and adds only current local live progress", asy
 	const readState = await read(marker);
 	expect(readState).toMatchObject({ status: "compacting", contextPercentBefore: 22 });
 	expect(readState.output).toBeUndefined();
-	startLiveCompactProgress(marker, { model: "live-model", startedAt: now });
 	try {
+		startLiveCompactProgress(marker, {
+			narratorId,
+			attempt: 1,
+			model: "old-model",
+			startedAt: now,
+		});
+		expect((await read(marker)).output).toBeUndefined();
+		startLiveCompactProgress(marker, {
+			narratorId: foreignId,
+			attempt: 2,
+			model: "foreign-model",
+			startedAt: now,
+		});
+		expect((await read(marker)).output).toBeUndefined();
+		startLiveCompactProgress(marker, {
+			narratorId,
+			attempt: 2,
+			model: "live-model",
+			startedAt: now,
+			canChangeModel: true,
+			pendingModel: "queued-model",
+		});
 		expect(await read(marker)).toMatchObject({
 			model: "live-model",
+			attempt: 2,
+			canChangeModel: true,
+			pendingModel: "queued-model",
+			streamVersion: 0,
 			startedAt: now,
 			outputChars: 0,
 			output: "",
@@ -140,6 +181,76 @@ test("reads current block bodies and adds only current local live progress", asy
 		finishLiveCompactProgress(marker, "failed");
 	}
 });
+
+test("segment detail combines committed block bodies with scoped live output", async () => {
+	settings.narratorBlocks.read = true;
+	const marker = seed(5, {
+		role: "user",
+		bodyFormat: 2,
+		contentJson: [{ type: "segment_compact", status: "compacting", messageCount: 2 }],
+	});
+	syncEnvelopeNow(marker);
+	db.update(narratorMessages)
+		.set({ bodyRowsOnly: 1, contentJson: [] })
+		.where(eq(narratorMessages.id, marker))
+		.run();
+	settings.narratorBlocks.read = false;
+	db.insert(narratorMessageRefs)
+		.values({ id: randomUUID(), narratorId: foreignId, messageId: marker, seq: 1 })
+		.run();
+	startLiveCompactProgress(marker, {
+		narratorId,
+		attempt: 1,
+		model: "running-model",
+		pendingModel: "next-model",
+		canChangeModel: true,
+		startedAt: now,
+	});
+	appendLiveCompactDelta(marker, "output", "live summary", { outputChars: 12, thinkingChars: 0 });
+	try {
+		expect(await readSegment(marker)).toMatchObject({
+			status: "compacting",
+			summary: "",
+			mode: "blocking",
+			model: "running-model",
+			attempt: 1,
+			pendingModel: "next-model",
+			canChangeModel: true,
+			streamVersion: 0,
+			output: "live summary",
+		});
+		expect(await readSegment(marker, foreignId).catch((error: unknown) => error)).toBeInstanceOf(
+			NotFoundError,
+		);
+		expect(await read(marker).catch((error: unknown) => error)).toBeInstanceOf(NotFoundError);
+	} finally {
+		finishLiveCompactProgress(marker, "failed");
+	}
+}, 15_000);
+
+test("segment history reads legacy summaries and rejects ordinary message bodies", async () => {
+	const marker = seed(5, {
+		role: "user",
+		contentJson: [
+			{ type: "segment_compact", status: "compacted", summary: "stored summary", model: "model" },
+		],
+	});
+	expect(await readSegment(marker)).toMatchObject({
+		status: "compacted",
+		summary: "stored summary",
+		model: "model",
+		canRetry: false,
+	});
+	const ordinary = seed(6, {
+		role: "user",
+		contentJson: [{ type: "text", text: "not a summary" }],
+	});
+	expect(await readSegment(ordinary).catch((error: unknown) => error)).toBeInstanceOf(
+		NotFoundError,
+	);
+	process.env.NARRAFORK_DB_WORKER = "off";
+	await expect(readSegment(marker)).rejects.toBeInstanceOf(pool.WorkersUnavailableError);
+}, 15_000);
 
 test("retains summaries larger than the generic SELECT result budget", async () => {
 	const summary = "x".repeat(5 * 1024 * 1024);
@@ -205,7 +316,10 @@ test("a committed detail read never opens an inline reader inside an active tran
 	await expect(pending).rejects.toBeInstanceOf(pool.WorkersUnavailableError);
 });
 
-test("the HTTP route checks access before dispatch and before releasing the snapshot", async () => {
+test.each([
+	"compact",
+	"segment-compact",
+] as const)("the %s HTTP route checks access before dispatch and before releasing the snapshot", async (scope) => {
 	const { narratorRoutes } = await import("../../routes/narrators");
 	const app = new Hono();
 	const owner = randomUUID();
@@ -231,9 +345,18 @@ test("the HTTP route checks access before dispatch and before releasing the snap
 	});
 	app.route("/", narratorRoutes);
 	app.onError((error) => new Response(error.message, { status: (error as AppError).statusCode }));
-	const path = `/${narratorId}/compact/${statusId}`;
-	const actual = narratorService.readCompactSummaryDetail;
-	const dispatch = spyOn(narratorService, "readCompactSummaryDetail");
+	const markerId =
+		scope === "compact"
+			? statusId
+			: seed(5, {
+					role: "user",
+					contentJson: [{ type: "segment_compact", status: "compacted", summary: "旧摘要" }],
+				});
+	const path = `/${narratorId}/${scope}/${markerId}`;
+	const method =
+		scope === "compact" ? "readCompactSummaryDetail" : "readSegmentCompactSummaryDetail";
+	const actual = narratorService[method];
+	const dispatch = spyOn(narratorService, method);
 	try {
 		expect((await app.request(path, { headers: { "x-test-user": newOwner } })).status).toBe(404);
 		expect(dispatch).not.toHaveBeenCalled();
@@ -251,4 +374,4 @@ test("the HTTP route checks access before dispatch and before releasing the snap
 		db.update(narrators).set({ ownerUserId: null }).where(eq(narrators.id, narratorId)).run();
 		for (const id of [owner, newOwner]) db.delete(users).where(eq(users.id, id)).run();
 	}
-});
+}, 30_000);

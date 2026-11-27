@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { DEFAULTS, deepMerge } from "@server/lib/settings";
 import { normalizeLegacySettingsPatch, updateSettingsSchema } from "@server/routes/settings";
+import { MAX_COMPACT_RETRY_LIMIT } from "@shared/compact-settings";
 import { DEFAULT_CONTEXT_THRESHOLDS } from "@shared/context-thresholds";
 import {
 	DEFAULT_RECORDING_REQUEST_BYTES,
@@ -213,6 +214,26 @@ describe("default narrator write audience settings wiring", () => {
 });
 
 describe("compaction-only context settings", () => {
+	test("an older settings file receives a separate retry limit and an explicit zero is preserved", () => {
+		const legacy = { agent: { maxTransientRetries: 8 } };
+		expect(deepMerge(DEFAULTS, legacy).agent.compactMaxRetries).toBe(1);
+
+		const { agent } = updateSettingsSchema.parse({ agent: { compactMaxRetries: 0 } });
+		const updated = deepMerge(deepMerge(DEFAULTS, legacy), { agent });
+		expect(updated.agent.compactMaxRetries).toBe(0);
+		expect(updated.agent.maxTransientRetries).toBe(8);
+		expect(
+			updateSettingsSchema.parse({ agent: { compactMaxRetries: MAX_COMPACT_RETRY_LIMIT } }),
+		).toEqual({
+			agent: { compactMaxRetries: MAX_COMPACT_RETRY_LIMIT },
+		});
+		for (const count of [-1, 0.5, MAX_COMPACT_RETRY_LIMIT + 1]) {
+			expect(updateSettingsSchema.safeParse({ agent: { compactMaxRetries: count } }).success).toBe(
+				false,
+			);
+		}
+	});
+
 	test("uses shared standard 95 and large 75 defaults in both editors", () => {
 		const panel = readFileSync(
 			new URL("../components/narrator/NarratorPanel.tsx", import.meta.url),

@@ -1350,6 +1350,8 @@ export interface CompactLockResult {
 }
 
 export interface CompactLock {
+	/** Durable marker owned by this run, once persisted. */
+	messageId?: string;
 	kind: CompactLockKind;
 	promise: Promise<CompactLockResult>;
 	/** Whether this compact blocks the active turn or runs alongside it. */

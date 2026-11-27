@@ -42,6 +42,7 @@ const {
 	cancelCompact,
 	compactLocks,
 	CompactTimeoutError,
+	queueLiveCompactModel,
 	runCustomCompact,
 } = await import("../narrator-compact");
 
@@ -167,6 +168,84 @@ describe("watchdog timeout is a compact failure", () => {
 
 		// The lock is released only after the aborted run settled.
 		expect(compactLocks.has(NARRATOR_ID)).toBe(false);
+	});
+
+	test("tries the latest queued model only after a stalled request settles", async () => {
+		seed();
+		__setCompactWatchdogTimingsForTests({ stallMs: 1_500, maxTotalMs: 60_000 });
+		const models: Array<string | undefined> = [];
+		const firstModel = "anthropic:claude-haiku-4-5";
+		const nextModel = "anthropic:claude-sonnet-4-5";
+		let firstStopped = false;
+		const started = Promise.withResolvers<void>();
+		narratorContext.generateCompactSummary = async (
+			_narratorId,
+			_locale,
+			_messages,
+			signal,
+			model,
+			onTextDelta,
+			_thinking,
+			onProgress,
+			_retry,
+			_user,
+			policy,
+		) => {
+			models.push(model);
+			onProgress?.();
+			const requestSignal = policy?.onRequestStart?.() ?? signal;
+			if (models.length === 1) {
+				started.resolve();
+				try {
+					return await new Promise((_resolve, reject) => {
+						if (requestSignal?.aborted) {
+							reject(requestSignal.reason);
+							return;
+						}
+						requestSignal?.addEventListener("abort", () => reject(requestSignal.reason), {
+							once: true,
+						});
+					});
+				} finally {
+					firstStopped = true;
+					policy?.onRequestFinish?.();
+				}
+			}
+			expect(firstStopped).toBe(true);
+			await onTextDelta?.("next model output");
+			policy?.onRequestSuccess?.();
+			policy?.onRequestFinish?.();
+			return { summary: "next model output" };
+		};
+
+		const compact = runCustomCompact(NARRATOR_ID, "en", "m-target", {
+			mode: "background",
+			model: firstModel,
+			contextPercentBefore: 80,
+		});
+		await Promise.race([started.promise, compact]);
+		const marker = compactLocks.get(NARRATOR_ID)?.messageId ?? "";
+		expect(marker).not.toBe("");
+		expect(queueLiveCompactModel("foreign", marker, nextModel, 1)).toBeNull();
+		expect(queueLiveCompactModel(NARRATOR_ID, marker, nextModel, 2)).toBeNull();
+		expect(queueLiveCompactModel(NARRATOR_ID, marker, "anthropic:claude-opus-4-5", 1)).toEqual({
+			pendingModel: "anthropic:claude-opus-4-5",
+		});
+		expect(queueLiveCompactModel(NARRATOR_ID, marker, "claude-haiku-4-5", 1)).toEqual({
+			pendingModel: null,
+		});
+		expect(queueLiveCompactModel(NARRATOR_ID, marker, nextModel, 1)).toEqual({
+			pendingModel: nextModel,
+		});
+		expect(models).toEqual([firstModel]);
+
+		expect(await compact).toBe(true);
+		expect(models).toEqual([firstModel, nextModel]);
+		expect(await narratorService.getCompactSummary(NARRATOR_ID, marker)).toMatchObject({
+			status: "compacted",
+			model: nextModel,
+			summary: "next model output",
+		});
 	});
 
 	test("a user cancel keeps its silent rollback", async () => {

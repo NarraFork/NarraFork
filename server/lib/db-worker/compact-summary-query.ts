@@ -21,6 +21,7 @@ export function storedCompactDetail(
 	return {
 		status: block.status,
 		summary: typeof block.summary === "string" ? block.summary : "",
+		attempt: latest?.attempt,
 		model: latest?.model,
 		startedAt: latest?.startedAt,
 		finishedAt: latest?.finishedAt,
@@ -37,15 +38,80 @@ export function storedCompactDetail(
 	};
 }
 
+export function storedSegmentCompactDetail(
+	content: unknown,
+	createdAt: string,
+): CompactMessageDetail | null {
+	if (!Array.isArray(content)) return null;
+	for (const value of content as unknown[]) {
+		if (
+			!value ||
+			typeof value !== "object" ||
+			!("type" in value) ||
+			value.type !== "segment_compact"
+		) {
+			continue;
+		}
+		const block = parseCompactMessageBlock({ ...value, type: "compact" });
+		if (!block) continue;
+		const detail = storedCompactDetail(block, {
+			canRetry: false,
+			contextPercentBefore: block.contextPercentBefore,
+			contextPercentAfter: block.contextPercentAfter,
+		});
+		return {
+			...detail,
+			model: detail.model || (typeof block.model === "string" ? block.model : undefined),
+			mode: detail.mode ?? "blocking",
+			startedAt: detail.startedAt ?? createdAt,
+		};
+	}
+	return null;
+}
+
+function readCompactBody(
+	sqlite: Database,
+	messageId: string,
+	fromBlocks: boolean,
+	maxBytes: number,
+): unknown {
+	const body = boundedBodyText(sqlite, messageId, fromBlocks, { maxBytes });
+	if (body === undefined) {
+		throw Object.assign(new Error("Compact body exceeds its read budget"), {
+			code: COMPACT_SUMMARY_BUDGET_EXCEEDED,
+		});
+	}
+	return JSON.parse(body);
+}
+
 export function readCompactSummary(
 	sqlite: Database,
-	params: { narratorId: string; messageId: string; fromBlocks: boolean },
+	params: { narratorId: string; messageId: string; fromBlocks: boolean; segment?: boolean },
 	signal: AbortSignal,
 	maxBodyBytes = MAX_BODY_BYTES,
 ): CompactSummaryReadResult {
-	const { narratorId, messageId, fromBlocks } = params;
+	const { narratorId, messageId, fromBlocks, segment } = params;
 	signal.throwIfAborted();
 	return sqlite.transaction((): CompactSummaryReadResult => {
+		if (segment) {
+			const row = sqlite
+				.query<{ bodyRowsOnly: number; createdAt: string }, [string, string]>(
+					`SELECT body_rows_only AS bodyRowsOnly, created_at AS createdAt
+					FROM narrator_messages WHERE narrator_id = ? AND id = ? AND role = 'user' LIMIT 1`,
+				)
+				.get(narratorId, messageId);
+			if (!row) return { notFound: "Message" };
+			const content = readCompactBody(
+				sqlite,
+				messageId,
+				fromBlocks || row.bodyRowsOnly === 1,
+				maxBodyBytes,
+			);
+			const detail = storedSegmentCompactDetail(content, row.createdAt);
+			signal.throwIfAborted();
+			return detail ? { detail } : { notFound: "CompactSummary" };
+		}
+
 		const row = sqlite
 			.query<
 				{
@@ -62,15 +128,12 @@ export function readCompactSummary(
 				WHERE r.narrator_id = ? AND r.message_id = ? AND m.role = 'system' LIMIT 1`)
 			.get(narratorId, messageId);
 		if (!row) return { notFound: "Message" };
-		const body = boundedBodyText(sqlite, messageId, fromBlocks || row.bodyRowsOnly === 1, {
-			maxBytes: maxBodyBytes,
-		});
-		if (body === undefined) {
-			throw Object.assign(new Error("Compact body exceeds its read budget"), {
-				code: COMPACT_SUMMARY_BUDGET_EXCEEDED,
-			});
-		}
-		const content: unknown = JSON.parse(body);
+		const content = readCompactBody(
+			sqlite,
+			messageId,
+			fromBlocks || row.bodyRowsOnly === 1,
+			maxBodyBytes,
+		);
 		let block: CompactMessageBlock | null = null;
 		if (Array.isArray(content)) {
 			for (const element of content) {

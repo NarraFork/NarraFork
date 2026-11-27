@@ -1014,6 +1014,8 @@ export interface NarraForkSettings {
 		};
 		/** Number of recent user/assistant turns kept after automatic history compact. */
 		autoCompactKeepPairs?: number;
+		/** Automatic retries allowed across a context compaction, excluding initial requests. */
+		compactMaxRetries: number;
 		/**
 		 * When a narrator has an in-progress context compaction, whether a newly-sent
 		 * user message is QUEUED until the compaction finishes instead of starting a

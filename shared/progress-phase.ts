@@ -118,6 +118,13 @@ export class ProgressAccumulator {
 		};
 	}
 
+	restore(snapshot: ProgressSnapshot): void {
+		this.phase = snapshot.phase;
+		this.thinkingChars = snapshot.thinkingChars;
+		this.outputChars = snapshot.outputChars;
+		this.lastPublished = snapshot;
+	}
+
 	/** True when the accumulator moved since the last {@link markPublished}. */
 	hasPendingChange(): boolean {
 		const next = this.snapshot();
@@ -150,6 +157,10 @@ export interface ThrottledProgressReporter {
 	addThinking: (delta: string) => void;
 	/** Record a visible-text delta (latches the phase to `output`). */
 	addOutput: (delta: string) => void;
+	/** Publish pending changes immediately without ending the report. */
+	flush: () => void;
+	/** Replace the counts after rolling back an unsuccessful request. */
+	restore: (snapshot: ProgressSnapshot) => void;
 	/** Flush any pending update and stop reporting. Idempotent. */
 	finish: () => void;
 }
@@ -174,7 +185,7 @@ export function createThrottledProgressReporter(
 ): ThrottledProgressReporter {
 	if (!publish) {
 		const noop = () => {};
-		return { addThinking: noop, addOutput: noop, finish: noop };
+		return { addThinking: noop, addOutput: noop, flush: noop, restore: noop, finish: noop };
 	}
 	const progress = new ProgressAccumulator();
 	let timer: ReturnType<typeof setTimeout> | null = null;
@@ -198,6 +209,10 @@ export function createThrottledProgressReporter(
 		if (!timer) timer = setTimeout(flush, throttleMs);
 	};
 
+	const clear = () => {
+		if (timer) clearTimeout(timer);
+		timer = null;
+	};
 	return {
 		addThinking: (delta) => {
 			if (finished || !delta) return;
@@ -209,12 +224,17 @@ export function createThrottledProgressReporter(
 			progress.addOutput(delta);
 			schedule();
 		},
+		flush: () => {
+			clear();
+			flush();
+		},
+		restore: (snapshot) => {
+			clear();
+			progress.restore(snapshot);
+		},
 		finish: () => {
 			if (finished) return;
-			if (timer) {
-				clearTimeout(timer);
-				timer = null;
-			}
+			clear();
 			flush();
 			finished = true;
 		},

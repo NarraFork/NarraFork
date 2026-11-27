@@ -68,7 +68,9 @@ let queryClient: QueryClient | undefined;
 
 const originalApi = {
 	getCompactSummary: api.getCompactSummary,
+	getSegmentCompactSummary: api.getSegmentCompactSummary,
 	retryFailedCompact: api.retryFailedCompact,
+	streamCompactSummary: api.streamCompactSummary,
 };
 
 function installDom() {
@@ -203,12 +205,21 @@ function retryButton(): HTMLButtonElement {
 	return button;
 }
 
-async function renderModal(opts: { messageId?: string; onDelete?: () => void }) {
+async function renderModal(opts: {
+	kind?: "context" | "segment";
+	messageId?: string;
+	onDelete?: () => void;
+	initialDetail?: CompactMessageDetail;
+}) {
 	if (!root || !queryClient) throw new Error("test harness is not initialized");
 	const currentRoot = root;
 	const currentQueryClient = queryClient;
+	const kind = opts.kind ?? "context";
 	const messageId = opts.messageId ?? "compact-old";
-	currentQueryClient.setQueryData(compactSummaryQueryKey("narrator-1", messageId), failedDetail());
+	currentQueryClient.setQueryData(
+		compactSummaryQueryKey("narrator-1", messageId, kind),
+		opts.initialDetail ?? failedDetail(),
+	);
 	await act(async () => {
 		currentRoot.render(
 			<I18nextProvider i18n={testI18n}>
@@ -216,7 +227,7 @@ async function renderModal(opts: { messageId?: string; onDelete?: () => void }) 
 					<QueryClientProvider client={currentQueryClient}>
 						<CompactSummaryModal
 							target={{
-								kind: "context",
+								kind,
 								narratorId: "narrator-1",
 								messageId,
 								onDelete: opts.onDelete,
@@ -239,6 +250,22 @@ async function clickRetry() {
 	await settle();
 }
 
+async function chooseSessionModel() {
+	const trigger = document.body.querySelector<HTMLButtonElement>(
+		`button[aria-label="${narratorLocale.compactRetryModel}"]`,
+	);
+	if (!trigger) throw new Error("model picker trigger not found");
+	await act(async () => trigger.click());
+	await settle();
+	const sessionModel = Array.from(document.body.querySelectorAll<HTMLButtonElement>("button")).find(
+		(button) => button.textContent === narratorLocale.compactUseSessionModel,
+	);
+	if (!sessionModel) throw new Error("session model option not found");
+	await act(async () => sessionModel.click());
+	await settle();
+	return trigger;
+}
+
 beforeEach(() => {
 	installDom();
 	container = document.createElement("div");
@@ -250,6 +277,7 @@ beforeEach(() => {
 			mutations: { retry: false },
 		},
 	});
+	api.streamCompactSummary = async () => new Response(null, { status: 409 });
 });
 
 afterEach(async () => {
@@ -269,7 +297,155 @@ afterAll(() => {
 	mock.restore();
 });
 
-describe("CompactSummaryModal failed compact retry", () => {
+describe("CompactSummaryModal live output and retry", () => {
+	test("ignores a queued response when the stream already switched to that model", async () => {
+		const retry = deferred<RetryFailedCompactResponse>();
+		api.retryFailedCompact = async () => retry.promise;
+		api.streamCompactSummary = async () => new Response(new ReadableStream<Uint8Array>());
+		await renderModal({
+			initialDetail: {
+				status: "compacting",
+				summary: "",
+				model: "provider:model",
+				attempt: 2,
+				attempts: [],
+				canChangeModel: true,
+			},
+		});
+		await chooseSessionModel();
+		await dispatchNarratorWs({
+			type: "compact_progress",
+			narratorId: "narrator-1",
+			messageId: "compact-old",
+			attempt: 2,
+			model: "other:model",
+			pendingModel: null,
+			canChangeModel: true,
+		});
+		await dispatchNarratorWs({
+			type: "compact_progress",
+			narratorId: "narrator-1",
+			messageId: "compact-old",
+			attempt: 1,
+			model: "provider:model",
+			pendingModel: "other:model",
+			canChangeModel: true,
+		});
+		retry.resolve({
+			ok: true,
+			messageId: "compact-old",
+			queued: true,
+			pendingModel: "other:model",
+		});
+		await settle();
+		expect(document.body.textContent).toContain("Model: other:model");
+		expect(document.body.textContent).not.toContain("If this request fails, retry with Provider B");
+	});
+
+	test.each([
+		"context",
+		"segment",
+	] as const)("%s compaction queues the session model and shows its first output", async (kind) => {
+		let output!: ReadableStreamDefaultController<Uint8Array>;
+		const requests: unknown[][] = [];
+		const connections: unknown[][] = [];
+		api.streamCompactSummary = async (narratorId, messageId, offsets) => {
+			connections.push([narratorId, messageId, offsets]);
+			return new Response(
+				new ReadableStream<Uint8Array>({
+					start(controller) {
+						output = controller;
+					},
+				}),
+			);
+		};
+		api.retryFailedCompact = async (...args) => {
+			requests.push(args);
+			return { ok: true, messageId: "compact-old", queued: true, pendingModel: "other:model" };
+		};
+		api.getCompactSummary = async () => failedDetail();
+		api.getSegmentCompactSummary = async () => ({ ...failedDetail(), canRetry: false });
+		const initial: CompactMessageDetail = {
+			status: "compacting",
+			summary: "",
+			model: "provider:model",
+			attempts: [],
+			attempt: kind === "context" ? 2 : undefined,
+			canChangeModel: true,
+			streamVersion: 0,
+		};
+		await renderModal({ initialDetail: initial, kind });
+		expect(connections).toEqual([
+			["narrator-1", "compact-old", { output: 0, thinking: 0, streamVersion: 0 }],
+		]);
+		expect(document.body.textContent).toContain(narratorLocale.compactWaitingForOutput);
+		const trigger = await chooseSessionModel();
+		expect(requests).toEqual([
+			[
+				"narrator-1",
+				"compact-old",
+				kind === "context"
+					? { useSessionModel: true, expectedAttempt: 2 }
+					: { useSessionModel: true },
+			],
+		]);
+		expect(document.body.textContent).toContain(
+			"If this request fails, retry with Provider B · Model.",
+		);
+		const encoder = new TextEncoder();
+		await act(async () => {
+			output.enqueue(
+				encoder.encode(
+					`event: delta\ndata: ${JSON.stringify({
+						kind: "delta",
+						channel: "output",
+						delta: "first live text",
+						outputChars: 15,
+						thinkingChars: 0,
+					})}\n\n`,
+				),
+			);
+		});
+		await settle();
+		expect(document.body.textContent).toContain("first live text");
+		await dispatchNarratorWs({
+			type: "compact_progress",
+			narratorId: "narrator-1",
+			messageId: "compact-old",
+			canChangeModel: false,
+			outputChars: 15,
+			thinkingChars: 0,
+		});
+		await settle();
+		expect(document.body.contains(trigger)).toBe(false);
+		await act(async () => {
+			output.enqueue(
+				encoder.encode(
+					`event: reset\ndata: ${JSON.stringify({
+						kind: "reset",
+						streamVersion: 1,
+						outputLength: 0,
+						thinkingLength: 0,
+						outputChars: 0,
+						thinkingChars: 0,
+					})}\n\n`,
+				),
+			);
+		});
+		await settle();
+		expect(document.body.textContent).not.toContain("first live text");
+		await act(async () => {
+			output.enqueue(
+				encoder.encode('event: finished\ndata: {"kind":"finished","status":"failed"}\n\n'),
+			);
+		});
+		await settle();
+		expect(document.body.textContent).toContain("first compact failed");
+		expect(document.body.textContent?.includes(narratorLocale.compactRetryModel)).toBe(
+			kind === "context",
+		);
+	});
+
 	test("groups identical model names by provider and retries with the selected full model ID", async () => {
 		// This case is about disambiguating identical names by provider: use the grouped view.
 		localStorage.setItem("narrafork_model_menu_mode", "provider");
@@ -285,7 +461,7 @@ describe("CompactSummaryModal failed compact retry", () => {
 			`button[aria-label="${narratorLocale.compactRetryModel}"]`,
 		);
 		if (!trigger) throw new Error("model picker trigger not found");
-		expect(trigger.textContent).toContain("Provider A · Model");
+		expect(trigger.textContent).toContain(narratorLocale.compactRetryModel);
 		await act(async () => trigger.click());
 		await settle();
 
@@ -293,16 +469,14 @@ describe("CompactSummaryModal failed compact retry", () => {
 		expect(menu?.textContent).toContain("Provider A");
 		expect(menu?.textContent).toContain("Provider B");
 		expect(menu?.querySelector("input")).not.toBeNull();
-		const choices = Array.from(menu?.querySelectorAll<HTMLButtonElement>("[data-menu-item]") ?? []);
+		const choices = Array.from(
+			menu?.querySelectorAll<HTMLButtonElement>("[data-menu-item]") ?? [],
+		).filter((choice) => choice.textContent === "Model");
 		expect(choices).toHaveLength(2);
 		expect(choices.map((choice) => choice.textContent)).toEqual(["Model", "Model"]);
 		await act(async () => choices[1].click());
 		await settle();
-		expect(trigger.textContent).toContain("Provider B · Model");
-		expect(retryCalls).toEqual([]);
-
-		await clickRetry();
-		expect(retryCalls).toEqual([["narrator-1", "compact-old", "other:model"]]);
+		expect(retryCalls).toEqual([["narrator-1", "compact-old", { model: "other:model" }]]);
 	});
 
 	test("resolves COW, ordinary, and legacy retry targets", () => {
@@ -440,6 +614,31 @@ describe("CompactSummaryModal failed compact retry", () => {
 				compactSummaryQueryKey("narrator-1", "compact-new"),
 			),
 		).toEqual(completedDetail("WS-only compact detail"));
+		expect(getCalls).toEqual(["compact-new"]);
+	});
+
+	test("preserves the failed replacement when its WS update beats the retry response", async () => {
+		const retry = deferred<RetryFailedCompactResponse>();
+		const getCalls: string[] = [];
+		api.retryFailedCompact = async () => retry.promise;
+		api.getCompactSummary = async (_narratorId, messageId) => {
+			getCalls.push(messageId);
+			return { ...failedDetail(), attempt: 2, error: "replacement compact failed" };
+		};
+		await renderModal({});
+		await clickRetry();
+		await dispatchNarratorWs({
+			type: "messages_deleted",
+			narratorId: "narrator-1",
+			deletedMessageIds: ["compact-old"],
+			messageId: "compact-new",
+			oldMessageId: "compact-old",
+		});
+		await settle();
+		expect(document.body.textContent).toContain("replacement compact failed");
+		retry.resolve({ ok: true, messageId: "compact-new", oldMessageId: "compact-old" });
+		await settle();
+		expect(document.body.textContent).toContain("replacement compact failed");
 		expect(getCalls).toEqual(["compact-new"]);
 	});
 

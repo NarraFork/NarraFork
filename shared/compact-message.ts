@@ -61,6 +61,13 @@ export interface CompactMessageDetail {
 	mode?: CompactMessageMode;
 	trigger?: CompactMessageTrigger | string;
 	model?: string;
+	/** Identifies the current operation when a marker is reused for a manual retry. */
+	attempt?: number;
+	/** Model selected for the next request if the in-flight request fails. */
+	pendingModel?: string | null;
+	canChangeModel?: boolean;
+	/** Version of the live buffers used to resume SSE after a retry resets them. */
+	streamVersion?: number;
 	reasoningEffort?: string;
 	startedAt?: string;
 	finishedAt?: string;

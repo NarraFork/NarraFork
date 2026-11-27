@@ -332,7 +332,13 @@ export interface StorageScanTablesResult {
 
 export type DbReadTaskParams =
 	| BenchmarkReadParams
-	| { kind: "compactSummary"; narratorId: string; messageId: string; fromBlocks: boolean }
+	| {
+			kind: "compactSummary";
+			narratorId: string;
+			messageId: string;
+			fromBlocks: boolean;
+			segment?: boolean;
+	  }
 	| RecallToolCallParams
 	| RecallConversationParams
 	| StorageHistoryReadParams

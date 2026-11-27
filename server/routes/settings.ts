@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { BRAND_ICON_COLOR_PATTERN, BRAND_NAME_MAX_LENGTH } from "@shared/branding";
+import { MAX_COMPACT_RETRY_LIMIT } from "@shared/compact-settings";
 import {
 	noProxyRulesSchema,
 	proxyOverrideSchema,
@@ -584,6 +585,7 @@ export const updateSettingsSchema = z
 					})
 					.optional(),
 				autoCompactKeepPairs: z.number().int().min(1).max(25).optional(),
+				compactMaxRetries: z.number().int().min(0).max(MAX_COMPACT_RETRY_LIMIT),
 				queueDuringCompaction: z.boolean().optional(),
 				browserProxy: proxyOverrideSchema,
 				notificationPolicy: z.object({ allowSend: z.boolean().optional() }).optional(),

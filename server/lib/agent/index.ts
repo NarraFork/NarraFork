@@ -361,8 +361,8 @@ async function withSummaryRetry<T>(
 	reportSummaryModelErrors = true,
 	onRetryProgress?: () => void,
 	onRetryScheduled?: (info: SummaryRetryInfo) => void,
+	maxRetries = getAuxiliaryMaxRetries(),
 ): Promise<T> {
-	const maxRetries = getAuxiliaryMaxRetries();
 	let lastErr: unknown;
 	for (let attempt = 0; attempt <= maxRetries; attempt++) {
 		if (signal?.aborted) {
@@ -491,11 +491,15 @@ export async function summaryGenerate(
 	 * delta callbacks keep their dedicated slots so retries and progress stay
 	 * connected to the caller's request.
 	 */
-	extraOptions?: Partial<Pick<GenerateOptions, "responseFormat" | "onGenerationProgress">>,
+	extraOptions?: Partial<Pick<GenerateOptions, "responseFormat" | "onGenerationProgress">> & {
+		/** Overrides auxiliary retries when the caller manages its own retry budget. */
+		maxRetries?: number;
+	},
 ): Promise<import("./provider").GenerateMetaResult> {
 	const model = modelOverride?.trim() || settings.agent.summaryModel;
 	// Retries belong to the original invocation, even if the caller reuses its options.
 	const requestTracking = tracking ? { ...tracking, userId: tracking.userId ?? null } : undefined;
+	const { maxRetries, ...generationOverrides } = extraOptions ?? {};
 	const generateOptions: GenerateOptions = {
 		...SUMMARY_GENERATE_OPTIONS,
 		...(signal ? { signal } : {}),
@@ -504,7 +508,7 @@ export async function summaryGenerate(
 		...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
 		// Last, so an explicit per-call constraint is never shadowed by the
 		// fixed auxiliary defaults above.
-		...extraOptions,
+		...generationOverrides,
 	};
 	return withSummaryRetry(
 		() => agentGenerateWithMeta(text, model, systemInstruction, generateOptions, requestTracking),
@@ -513,6 +517,7 @@ export async function summaryGenerate(
 		reportSummaryModelErrors,
 		onRetryProgress,
 		onRetryScheduled,
+		maxRetries,
 	);
 }
 

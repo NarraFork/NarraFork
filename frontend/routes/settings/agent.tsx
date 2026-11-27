@@ -86,6 +86,8 @@ function SettingsAgentPage() {
 				setAutoContinuationMode={is.setAutoContinuationMode}
 				maxTransientRetries={is.maxTransientRetries}
 				setMaxTransientRetries={is.setMaxTransientRetries}
+				compactMaxRetries={is.compactMaxRetries}
+				setCompactMaxRetries={is.setCompactMaxRetries}
 				maxToolCallsPerResponse={is.maxToolCallsPerResponse}
 				setMaxToolCallsPerResponse={is.setMaxToolCallsPerResponse}
 				silentToolCallThreshold={is.silentToolCallThreshold}

@@ -14,6 +14,7 @@ import {
 	TextInput,
 	Title,
 } from "@mantine/core";
+import { MAX_COMPACT_RETRY_LIMIT, normalizeCompactRetryLimit } from "@shared/compact-settings";
 import { DEFAULT_CONTEXT_THRESHOLDS } from "@shared/context-thresholds";
 import {
 	REQUEST_EVIDENCE_AUTO_PIN_VALUES,
@@ -105,6 +106,8 @@ export interface AgentSectionProps {
 	setAutoContinuationMode: (v: AutoContinuationMode) => void;
 	maxTransientRetries: number;
 	setMaxTransientRetries: (v: number) => void;
+	compactMaxRetries: number;
+	setCompactMaxRetries: (v: number) => void;
 	maxToolCallsPerResponse: number;
 	setMaxToolCallsPerResponse: (v: number) => void;
 	silentToolCallThreshold: number;
@@ -468,6 +471,16 @@ export function AgentSection(props: AgentSectionProps) {
 				onChange={(v) => props.setMaxTransientRetries(typeof v === "number" ? v : 10)}
 				min={-1}
 				max={100}
+			/>
+			<NumberInput
+				label={t("compactMaxRetries")}
+				description={t("compactMaxRetriesDesc")}
+				value={props.compactMaxRetries}
+				onChange={(v) => props.setCompactMaxRetries(normalizeCompactRetryLimit(v))}
+				min={0}
+				max={MAX_COMPACT_RETRY_LIMIT}
+				allowDecimal={false}
+				clampBehavior="strict"
 			/>
 			<NumberInput
 				label={t("maxToolCallsPerResponse")}

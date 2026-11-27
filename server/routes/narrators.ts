@@ -191,6 +191,7 @@ import {
 	FOLLOW_DEFAULT_MODEL,
 	getQueueDuringCompaction,
 	normalizeAutoModelValueForSave,
+	resolveEffectiveModel,
 	settings,
 } from "../lib/settings";
 import {
@@ -381,6 +382,7 @@ import {
 	retryBufferedMessage,
 	updateBufferedMessageMode,
 } from "../services/narrator-buffer";
+import { queueLiveCompactModel } from "../services/narrator-compact";
 import { readCommittedComposerDocument } from "../services/narrator-composer-document";
 import { getNarratorContextComposition } from "../services/narrator-context-composition";
 import {
@@ -4972,8 +4974,10 @@ narratorRoutes.get("/:id/compact/:messageId/live", async (c) => {
 	};
 	const outputOffset = parseOffset("outputOffset");
 	const thinkingOffset = parseOffset("thinkingOffset");
-	const detail = await narratorService.getCompactSummary(narratorId, messageId);
-	if (detail.status !== "compacting") {
+	const streamVersion =
+		c.req.query("streamVersion") === undefined ? undefined : parseOffset("streamVersion");
+	await requireNarratorAccess(c, narratorId, "read");
+	if (liveCompactProgress.get(messageId)?.narratorId !== narratorId) {
 		return c.json({ error: "Compact is no longer running", code: "COMPACT_NOT_RUNNING" }, 409);
 	}
 
@@ -5004,7 +5008,7 @@ narratorRoutes.get("/:id/compact/:messageId/live", async (c) => {
 		};
 		const unsubscribe = subscribeLiveCompactProgress(
 			messageId,
-			{ output: outputOffset, thinking: thinkingOffset },
+			{ output: outputOffset, thinking: thinkingOffset, streamVersion },
 			enqueue,
 		);
 		if (!unsubscribe) {
@@ -5014,7 +5018,7 @@ narratorRoutes.get("/:id/compact/:messageId/live", async (c) => {
 			});
 			return;
 		}
-		const keepAlive = setInterval(() => {
+		const heartbeat = () => {
 			const current = liveCompactProgress.get(messageId);
 			if (!current) return;
 			enqueue({
@@ -5022,13 +5026,17 @@ narratorRoutes.get("/:id/compact/:messageId/live", async (c) => {
 				outputChars: current.outputChars,
 				thinkingChars: current.thinkingChars,
 			});
-		}, 15_000);
+		};
+		heartbeat();
+		const keepAlive = setInterval(heartbeat, 15_000);
 		const abort = () => {
 			stopped = true;
 			wake?.();
 			wake = undefined;
 		};
 		c.req.raw.signal.addEventListener("abort", abort, { once: true });
+		stream.onAbort(abort);
+		if (c.req.raw.signal.aborted) abort();
 		try {
 			while (!stopped) {
 				if (queue.length === 0) {
@@ -5099,29 +5107,46 @@ export function buildRetryFailedCompactResponse(
 narratorRoutes.post("/:id/compact/:messageId/retry", async (c) => {
 	const narratorId = c.req.param("id");
 	const messageId = c.req.param("messageId");
-	await narratorService.getById(narratorId, undefined, { signal: c.req.raw.signal });
+	const body = retryFailedCompactSchema.parse(await c.req.json().catch(() => ({})));
+	const signal = c.req.raw.signal;
+	const narrator = await narratorService.getById(narratorId, undefined, { signal });
+	const userId = c.get("user").sub;
+	const active = activeNarrators.get(narratorId);
+	const model = body.useSessionModel
+		? (active?.model ??
+			(await resolveSubagentModelForRun(narrator, userId, undefined, { signal })).model)
+		: body.model
+			? resolveEffectiveModel(body.model)
+			: undefined;
+	if (model) {
+		const queued = queueLiveCompactModel(narratorId, messageId, model, body.expectedAttempt);
+		if (queued) return c.json({ ok: true, messageId, queued: true, ...queued });
+	}
 	if (isCompactInProgress(narratorId)) {
 		return c.json({ ok: false, reason: "compact_in_progress" }, 409);
 	}
 	const detail = await narratorService.getCompactSummary(narratorId, messageId);
-	if (!detail.canRetry) {
+	if (
+		!detail.canRetry ||
+		(body.expectedAttempt && body.expectedAttempt !== detail.attempts.at(-1)?.attempt)
+	) {
 		return c.json({ ok: false, reason: "compact_not_retryable" }, 409);
 	}
-	const body = retryFailedCompactSchema.parse(await c.req.json().catch(() => ({})));
-	const locale = await getUserLanguage(c.get("user").sub);
+	const locale = await getUserLanguage(userId);
 	const result = await retryFailedCompact(
 		narratorId,
 		locale,
 		messageId,
-		body.model,
-		c.get("user").sub,
+		model,
+		userId,
+		detail.attempts.at(-1)?.attempt,
 	);
 	result.promise.catch((err) => {
 		logger.error("Failed compact retry failed", {
 			narratorId,
 			messageId: result.messageId ?? messageId,
 			requestedMessageId: messageId,
-			model: body.model,
+			model,
 			error: String(err),
 		});
 	});
@@ -5544,8 +5569,13 @@ narratorRoutes.post("/:id/segment-compact", async (c) => {
 narratorRoutes.get("/:id/segment-compact/:messageId", async (c) => {
 	const narratorId = c.req.param("id");
 	const messageId = c.req.param("messageId");
-	const summary = await narratorService.getSegmentCompactSummary(narratorId, messageId);
-	return c.json({ summary });
+	const signal = c.req.raw.signal;
+	const detail = await narratorService
+		.readSegmentCompactSummaryDetail(narratorId, messageId, signal)
+		.finally(async () => {
+			if (!signal.aborted) await requireNarratorAccess(c, narratorId, "read");
+		});
+	return c.json(detail);
 });
 
 // Delete segment compact (undo)

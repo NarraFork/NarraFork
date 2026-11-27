@@ -1,10 +1,19 @@
-const MAX_SSE_BUFFER_CHARS = 64_000;
+// The server coalesces up to 32,000 characters. JSON can escape each one as six characters.
+const MAX_SSE_BUFFER_CHARS = 200_000;
 
 export type CompactLiveStreamEvent =
 	| {
 			kind: "delta";
 			channel: "output" | "thinking";
 			delta: string;
+			outputChars: number;
+			thinkingChars: number;
+	  }
+	| {
+			kind: "reset";
+			streamVersion: number;
+			outputLength: number;
+			thinkingLength: number;
 			outputChars: number;
 			thinkingChars: number;
 	  }
@@ -34,7 +43,7 @@ export async function consumeCompactLiveStream(
 		dataLines = [];
 		const name = eventName;
 		eventName = "message";
-		if (name !== "delta" && name !== "heartbeat" && name !== "finished") return;
+		if (name !== "delta" && name !== "heartbeat" && name !== "finished" && name !== "reset") return;
 		let parsed: unknown;
 		try {
 			parsed = JSON.parse(raw);
@@ -46,6 +55,33 @@ export async function consumeCompactLiveStream(
 		}
 		const record = parsed as Record<string, unknown>;
 		if (record.kind !== name) return;
+		if (name === "reset") {
+			const { streamVersion, outputLength, thinkingLength, outputChars, thinkingChars } = record;
+			if (
+				typeof streamVersion !== "number" ||
+				!Number.isSafeInteger(streamVersion) ||
+				streamVersion < 0 ||
+				typeof outputLength !== "number" ||
+				!Number.isSafeInteger(outputLength) ||
+				outputLength < 0 ||
+				typeof thinkingLength !== "number" ||
+				!Number.isSafeInteger(thinkingLength) ||
+				thinkingLength < 0 ||
+				typeof outputChars !== "number" ||
+				typeof thinkingChars !== "number"
+			) {
+				throw new Error("Malformed compact live reset");
+			}
+			onEvent({
+				kind: "reset",
+				streamVersion,
+				outputLength,
+				thinkingLength,
+				outputChars,
+				thinkingChars,
+			});
+			return;
+		}
 		if (name === "delta") {
 			if (
 				(record.channel !== "output" && record.channel !== "thinking") ||
@@ -106,6 +142,7 @@ export async function consumeCompactLiveStream(
 	};
 	signal?.addEventListener("abort", abort, { once: true });
 	try {
+		if (signal?.aborted) return;
 		while (!finished) {
 			const { value, done } = await reader.read();
 			if (done) break;
@@ -129,7 +166,7 @@ export async function consumeCompactLiveStream(
 		}
 	} finally {
 		signal?.removeEventListener("abort", abort);
-		if (finished || signal?.aborted) await reader.cancel().catch(() => {});
+		await reader.cancel().catch(() => {});
 		reader.releaseLock();
 	}
 }

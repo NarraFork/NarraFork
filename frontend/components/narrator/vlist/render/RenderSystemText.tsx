@@ -29,6 +29,7 @@ import {
 	Stack,
 	Text,
 	Tooltip,
+	UnstyledButton,
 } from "@mantine/core";
 import type {
 	TaskNoticeChip,
@@ -75,6 +76,7 @@ import {
 } from "../measure/measure-system-text";
 import type { MeasuredElement, PreparedCodeBlock } from "../prepared-block";
 import { typographyMetrics } from "../pretext-fonts";
+import { swallowSelectionClick } from "./key-activate";
 
 /** Matches the original SYSTEM_MESSAGE_BG in MessageBubble.tsx (copied, not imported). */
 const SYSTEM_MESSAGE_BG = "light-dark(var(--mantine-color-gray-1), var(--mantine-color-dark-6))";
@@ -180,6 +182,7 @@ interface RenderSystemTextProps {
 	/** origin_notice (interrupt_task_guard only): live dismiss handler. */
 	injectionGuardActions?: InjectionGuardActions;
 	headerAction?: ReactNode;
+	onOpenCompact?: () => void;
 	/** tasks_notice: fold / unfold the card (the generic per-key expansion). */
 	onToggle?: () => void;
 }
@@ -204,6 +207,7 @@ export function RenderSystemText({
 	errorActions,
 	injectionGuardActions,
 	headerAction,
+	onOpenCompact,
 	onToggle,
 }: RenderSystemTextProps) {
 	// A task notice has no wrapping body: its lines are fixed, so it is drawn from its data and
@@ -244,7 +248,14 @@ export function RenderSystemText({
 			);
 		case "segment_compact_failed":
 			return (
-				<SegmentFailedCard body={body} width={width} font={font} height={height} data={data} />
+				<SegmentFailedCard
+					body={body}
+					width={width}
+					font={font}
+					height={height}
+					data={data}
+					onOpen={onOpenCompact}
+				/>
 			);
 		case "origin_notice":
 			return (
@@ -519,31 +530,52 @@ function SegmentFailedCard({
 	font,
 	height,
 	data,
+	onOpen,
 }: {
 	body: PreparedCodeBlock;
 	width: number;
 	font: string;
 	height: number;
 	data: SystemTextData;
+	onOpen?: () => void;
 }) {
+	const title = (
+		<Text
+			component="span"
+			size="xs"
+			fw={600}
+			c="red.8"
+			td={onOpen ? "underline" : undefined}
+			lineClamp={1}
+		>
+			{data.title ?? ""}
+		</Text>
+	);
 	return (
 		<Paper
 			p="xs"
 			radius="sm"
+			data-compact-status="failed"
 			style={{ backgroundColor: cssLight("red"), height, boxSizing: "border-box" }}
 		>
 			<Group gap={GROUP_GAP} wrap="nowrap" align="flex-start" h="100%">
 				<IconAlertTriangle size={ICON_16} style={{ flexShrink: 0, color: cssColor("red", 7) }} />
 				<Stack gap={2} style={{ flex: 1, minWidth: 0 }}>
-					<Text
-						size="xs"
-						fw={600}
-						c="red.8"
-						style={{ height: typographyMetrics().line.xs }}
-						lineClamp={1}
-					>
-						{data.title ?? ""}
-					</Text>
+					<div style={{ height: typographyMetrics().line.xs }}>
+						{onOpen ? (
+							<UnstyledButton
+								type="button"
+								data-compact-open="1"
+								aria-haspopup="dialog"
+								onClick={swallowSelectionClick(onOpen)}
+								style={{ display: "block", maxWidth: "100%" }}
+							>
+								{title}
+							</UnstyledButton>
+						) : (
+							title
+						)}
+					</div>
 					<SystemTextBody body={body} width={width} font={font} color={cssColor("red", 9)} />
 				</Stack>
 				{data.buttons?.[0] ? (

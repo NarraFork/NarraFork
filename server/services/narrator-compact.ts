@@ -13,21 +13,30 @@ import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
 import type { Locale } from "../lib/prompt-i18n";
 import {
+	FOLLOW_SUMMARY_MODEL,
 	getAutoCompactKeepPairs,
+	getCompactMaxRetries,
 	getSummaryModelContextWindowDetail,
 	type ModelContextWindowSource,
+	parseModelId,
 	resolveDefaultReasoningEffort,
+	resolveEffectiveModel,
+	resolveProvider,
 	settings,
 } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { getExecutionOwner } from "./agent-runtime/ownership";
 import {
 	appendLiveCompactDelta,
+	EMPTY_LIVE_COMPACT_POSITION,
 	finishLiveCompactProgress,
+	type LiveCompactStreamPosition,
+	liveCompactProgress,
+	resetLiveCompactProgress,
 	startLiveCompactProgress,
 } from "./compact-live-state";
 import { drainQueuedMessagesAfterCompact } from "./compact-queue-drain";
-import { narratorContext } from "./narrator-context";
+import { type CompactSummaryRetryPolicy, narratorContext } from "./narrator-context";
 import { compactEpochRecord } from "./narrator-epochs";
 import { estimateNarratorBuildHistoryTokens } from "./narrator-history-token-estimate";
 import { narratorService } from "./narrator-service";
@@ -97,6 +106,13 @@ interface CompactProgressReporter {
 	 * say "retrying (N)" instead of an unexplained 0-char spinner.
 	 */
 	reportRetry: (retryCount: number, error: string) => void;
+	beginRequest: () => void;
+	completeRequest: () => void;
+	setModel: (model: string, contextWindowSource: ModelContextWindowSource) => void;
+	resetDraft: (wholeRun?: boolean) => void;
+	getPendingModel: () => string | null;
+	consumePendingModel: () => string | null;
+	setStallHandler: (handler?: (reason: string) => boolean) => void;
 	/** Stop progress ticks while final persistence completes. */
 	finish: () => void;
 	/** Close the on-demand text stream after the final marker state is persisted. */
@@ -203,6 +219,7 @@ export interface CompactRunHooks {
 export function createCompactWatchdog(options: {
 	narratorId: string;
 	onTimeout: (reason: string) => void;
+	onStall?: (reason: string) => boolean;
 	stallMs?: number;
 	maxTotalMs?: number;
 	/** How long the aborted run may take to settle before it is logged as stuck. */
@@ -259,10 +276,11 @@ export function createCompactWatchdog(options: {
 	const armStall = () => {
 		if (stopped || firedReason) return;
 		if (stallTimer !== undefined) clearTimeout(stallTimer);
-		stallTimer = setTimeout(
-			() => fire(`Compact made no progress for ${formatDuration(stallMs)}`),
-			stallMs,
-		);
+		stallTimer = setTimeout(() => {
+			const reason = `Compact made no progress for ${formatDuration(stallMs)}`;
+			if (options.onStall?.(reason)) armStall();
+			else fire(reason);
+		}, stallMs);
 	};
 
 	armStall();
@@ -299,6 +317,7 @@ export function createCompactWatchdog(options: {
 export function createCompactProgressReporter(options: {
 	narratorId: string;
 	messageId: string;
+	attempt?: number;
 	mode: CompactMode;
 	model?: string;
 	reasoningEffort?: string;
@@ -316,77 +335,134 @@ export function createCompactProgressReporter(options: {
 	// The retry broadcast carries the CURRENT counts, so the reporter mirrors the
 	// last published snapshot (the throttled accumulator does not expose one).
 	let lastSnapshot: ProgressSnapshot = { phase: "thinking", thinkingChars: 0, outputChars: 0 };
-	const contextWindowSourceFields = options.contextWindowSource
-		? { contextWindowSource: options.contextWindowSource }
-		: {};
+	let contextWindowSource = options.contextWindowSource;
+	let retryState: { retryCount: number; retryError: string } | undefined;
+	let requestStart: LiveCompactStreamPosition = EMPTY_LIVE_COMPACT_POSITION;
 	startLiveCompactProgress(options.messageId, {
+		narratorId: options.narratorId,
+		attempt: options.attempt,
+		pendingModel: null,
+		canChangeModel: true,
+		onModelQueued: () => publish(),
 		model: options.model ?? "",
 		...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
 		startedAt: options.startedAt ?? new Date().toISOString(),
 	});
-	const reporter = createThrottledProgressReporter((snapshot) => {
-		lastSnapshot = snapshot;
+	const live = liveCompactProgress.get(options.messageId);
+	const publish = (snapshot = lastSnapshot) => {
 		broadcastToNarrator(options.narratorId, {
 			type: "compact_progress",
 			narratorId: options.narratorId,
 			messageId: options.messageId,
+			attempt: live?.attempt,
 			phase: snapshot.phase,
-			thinkingChars: snapshot.thinkingChars,
-			outputChars: snapshot.outputChars,
+			thinkingChars: live?.thinkingChars ?? snapshot.thinkingChars,
+			outputChars: live?.outputChars ?? snapshot.outputChars,
 			mode: options.mode,
-			...(options.model ? { model: options.model } : {}),
-			...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
+			...(live?.model ? { model: live.model } : {}),
+			...(live?.reasoningEffort ? { reasoningEffort: live.reasoningEffort } : {}),
 			...(options.startedAt ? { startedAt: options.startedAt } : {}),
 			...(options.isSegment ? { isSegment: true } : {}),
-			...contextWindowSourceFields,
+			...(contextWindowSource ? { contextWindowSource } : {}),
+			...(live ? { pendingModel: live.pendingModel, canChangeModel: live.canChangeModel } : {}),
+			...retryState,
 		});
+	};
+	const reporter = createThrottledProgressReporter((snapshot) => {
+		lastSnapshot = snapshot;
+		publish(snapshot);
 	}, COMPACT_PROGRESS_THROTTLE_MS);
 	const reportRetry = (retryCount: number, error: string) => {
-		broadcastToNarrator(options.narratorId, {
-			type: "compact_progress",
-			narratorId: options.narratorId,
-			messageId: options.messageId,
-			phase: lastSnapshot.phase,
-			thinkingChars: lastSnapshot.thinkingChars,
-			outputChars: lastSnapshot.outputChars,
-			mode: options.mode,
-			...(options.isSegment ? { isSegment: true } : {}),
-			...contextWindowSourceFields,
-			retryCount,
-			retryError: error,
-		});
+		retryState = { retryCount, retryError: error };
+		publish();
 	};
 	const onActivity = options.onActivity;
 	let outputChars = 0;
 	let thinkingChars = 0;
 	const addOutput = (delta: string) => {
 		if (delta) {
+			const firstDelta = Boolean(live?.canChangeModel);
+			if (live) live.canChangeModel = false;
+			retryState = undefined;
 			outputChars += delta.length;
 			appendLiveCompactDelta(options.messageId, "output", delta, {
 				outputChars,
 				thinkingChars,
 			});
 			onActivity?.();
+			reporter.addOutput(delta);
+			if (firstDelta) reporter.flush();
 		}
-		reporter.addOutput(delta);
 	};
 	const addThinking = (delta: string) => {
 		if (delta) {
+			const firstDelta = Boolean(live?.canChangeModel);
+			if (live) live.canChangeModel = false;
+			retryState = undefined;
 			thinkingChars += delta.length;
 			appendLiveCompactDelta(options.messageId, "thinking", delta, {
 				outputChars,
 				thinkingChars,
 			});
 			onActivity?.();
+			reporter.addThinking(delta);
+			if (firstDelta) reporter.flush();
 		}
-		reporter.addThinking(delta);
 	};
 	let closed = false;
 	return {
 		onTextDelta: addOutput,
 		onReasoningDelta: addThinking,
 		reportRetry,
-		finish: () => reporter.finish(),
+		beginRequest: () => {
+			if (!live) return;
+			requestStart = {
+				outputLength: live.output.length,
+				thinkingLength: live.thinking.length,
+				outputChars,
+				thinkingChars,
+			};
+			if (!live.canChangeModel) {
+				live.canChangeModel = true;
+				publish();
+			}
+		},
+		completeRequest: () => {
+			if (!live || (!live.canChangeModel && !live.pendingModel)) return;
+			live.canChangeModel = false;
+			live.pendingModel = null;
+			publish();
+		},
+		setModel: (model, source) => {
+			if (!live) return;
+			live.model = model;
+			live.reasoningEffort = resolveDefaultReasoningEffort(undefined, model);
+			contextWindowSource = source;
+			publish();
+		},
+		resetDraft: (wholeRun) => {
+			const position = wholeRun ? EMPTY_LIVE_COMPACT_POSITION : requestStart;
+			if (outputChars === position.outputChars && thinkingChars === position.thinkingChars) return;
+			outputChars = position.outputChars;
+			thinkingChars = position.thinkingChars;
+			lastSnapshot = { outputChars, thinkingChars, phase: outputChars ? "output" : "thinking" };
+			reporter.restore(lastSnapshot);
+			resetLiveCompactProgress(options.messageId, position);
+		},
+		getPendingModel: () => live?.pendingModel ?? null,
+		consumePendingModel: () => {
+			if (!live?.pendingModel) return null;
+			const model = live.pendingModel;
+			live.pendingModel = null;
+			return model;
+		},
+		setStallHandler: (handler) => {
+			if (live) live.abortStalledRequest = handler;
+		},
+		finish: () => {
+			if (live) live.canChangeModel = false;
+			reporter.finish();
+		},
 		hasStreamedContent: () => thinkingChars > 0 || outputChars > 0,
 		close: (status: "compacted" | "failed") => {
 			if (closed) return;
@@ -394,6 +470,134 @@ export function createCompactProgressReporter(options: {
 			finishLiveCompactProgress(options.messageId, status);
 		},
 	};
+}
+
+export function queueLiveCompactModel(
+	narratorId: string,
+	messageId: string,
+	model: string,
+	expectedAttempt?: number,
+): { pendingModel: string | null } | null {
+	const live = liveCompactProgress.get(messageId);
+	if (
+		live?.narratorId !== narratorId ||
+		!live.canChangeModel ||
+		compactLocks.get(narratorId)?.messageId !== messageId ||
+		(expectedAttempt !== undefined && live.attempt !== expectedAttempt)
+	) {
+		return null;
+	}
+	const current = live.model || FOLLOW_SUMMARY_MODEL;
+	let sameModel = current === model;
+	if (!sameModel) {
+		try {
+			const resolved = resolveEffectiveModel(current);
+			sameModel =
+				resolveProvider(resolved) === resolveProvider(model) &&
+				parseModelId(resolved).model === parseModelId(model).model;
+		} catch {
+			// An unavailable current alias must not block selecting a replacement.
+		}
+	}
+	const pendingModel = sameModel ? null : model;
+	live.pendingModel = pendingModel;
+	live.onModelQueued?.();
+	return { pendingModel };
+}
+
+function abortStalledCompactRequest(narratorId: string, reason: string): boolean {
+	const lock = compactLocks.get(narratorId);
+	if (!lock?.messageId) return false;
+	return liveCompactProgress.get(lock.messageId)?.abortStalledRequest?.(reason) ?? false;
+}
+
+async function generateLiveCompactSummary(options: {
+	narratorId: string;
+	locale: Locale;
+	messages: Parameters<typeof narratorContext.generateCompactSummary>[2];
+	signal?: AbortSignal;
+	model: string;
+	progress: CompactProgressReporter;
+	onProgress?: () => void;
+	userId?: string | null;
+	onModelChange: (model: string, contextWindowSource?: ModelContextWindowSource) => void;
+}) {
+	const { progress, signal } = options;
+	const retryPolicy: CompactSummaryRetryPolicy = {
+		limit: getCompactMaxRetries(),
+		used: 0,
+		shouldChangeModel: () => progress.getPendingModel() !== null,
+		onRequestFailure: () => progress.resetDraft(),
+		onRequestSuccess: progress.completeRequest,
+	};
+	let retryCount = 0;
+	let model = options.model;
+	while (true) {
+		const attempt = new AbortController();
+		const attemptSignal = signal ? AbortSignal.any([signal, attempt.signal]) : attempt.signal;
+		const requestNotStarted = (reason: string) => {
+			if (attemptSignal.aborted || !progress.getPendingModel()) return false;
+			attempt.abort(new CompactTimeoutError(reason));
+			return true;
+		};
+		progress.setStallHandler(requestNotStarted);
+		retryPolicy.onRequestStart = () => {
+			progress.beginRequest();
+			const request = new AbortController();
+			const requestSignal = AbortSignal.any([attemptSignal, request.signal]);
+			progress.setStallHandler((reason) => {
+				if (
+					requestSignal.aborted ||
+					(!progress.getPendingModel() && retryPolicy.used >= retryPolicy.limit)
+				) {
+					return false;
+				}
+				request.abort(new CompactTimeoutError(reason));
+				return true;
+			});
+			return requestSignal;
+		};
+		retryPolicy.onRequestFinish = () => progress.setStallHandler(requestNotStarted);
+		try {
+			const resolvedModel = model ? resolveEffectiveModel(model) : model;
+			const contextWindowSource = getSummaryModelContextWindowDetail(resolvedModel).source;
+			options.onModelChange(resolvedModel, contextWindowSource);
+			progress.setModel(resolvedModel, contextWindowSource);
+			const result = await narratorContext.generateCompactSummary(
+				options.narratorId,
+				options.locale,
+				options.messages,
+				attemptSignal,
+				resolvedModel,
+				progress.onTextDelta,
+				progress.onReasoningDelta,
+				options.onProgress,
+				({ error }) => {
+					progress.beginRequest();
+					progress.reportRetry(++retryCount, error);
+				},
+				options.userId,
+				retryPolicy,
+			);
+			attemptSignal.throwIfAborted();
+			return result;
+		} catch (error) {
+			if (signal?.aborted) throw error;
+			const pending = progress.consumePendingModel();
+			if (!pending) {
+				if (attempt.signal.aborted) throw new CompactTimeoutError(attempt.signal.reason.message);
+				throw error;
+			}
+			model = pending;
+			options.onModelChange(model);
+			progress.resetDraft(true);
+			progress.beginRequest();
+			const reason = attempt.signal.aborted ? attempt.signal.reason : error;
+			progress.reportRetry(++retryCount, reason instanceof Error ? reason.message : String(reason));
+		} finally {
+			progress.setStallHandler();
+		}
+	}
 }
 
 export interface CustomCompactOptions {
@@ -933,6 +1137,7 @@ async function runCustomCompactUnlocked(
 	const watchdog = createCompactWatchdog({
 		narratorId,
 		onTimeout: () => abortController.abort(),
+		onStall: (reason) => abortStalledCompactRequest(narratorId, reason),
 		...(compactWatchdogTimingOverrides ?? {}),
 	});
 	// A caller-initiated cancel wins: the user asked for the silent rollback, so it
@@ -1014,6 +1219,7 @@ async function retryFailedCompactUnlocked(
 	messageId: string,
 	model?: string,
 	userId?: string | null,
+	expectedAttempt?: number,
 ) {
 	if (compactLocks.has(narratorId)) {
 		throw new AppError("Compact already in progress", 409, "COMPACT_IN_PROGRESS");
@@ -1031,7 +1237,12 @@ async function retryFailedCompactUnlocked(
 	compactLocks.set(narratorId, reservationLock);
 
 	try {
-		const prepared = await narratorService.prepareFailedCompactRetry(narratorId, messageId, model);
+		const prepared = await narratorService.prepareFailedCompactRetry(
+			narratorId,
+			messageId,
+			model,
+			expectedAttempt,
+		);
 		if (compactLocks.get(narratorId) === reservationLock) {
 			compactLocks.delete(narratorId);
 		}
@@ -1100,7 +1311,7 @@ async function doRunCustomCompact({
 	options,
 	hooks,
 }: DoRunCustomCompactArgs): Promise<boolean> {
-	const selectedModel = options?.model?.trim() || settings.agent.summaryModel;
+	let selectedModel = options?.model?.trim() || settings.agent.summaryModel;
 	const replacementFields = compactReplacementFields(options);
 	const isRetry = options?.preparedRetryMessage != null;
 	logger.info("Starting custom compact", {
@@ -1161,79 +1372,69 @@ async function doRunCustomCompact({
 		}));
 	expectedAttempt = compactAttemptNumber(compactingMsg);
 	expectedSeq = compactingMsg.seq;
-	const compactStartEvent = {
-		type: options?.preparedRetryMessage ? ("message_updated" as const) : ("message" as const),
+	const lock = compactLocks.get(narratorId);
+	if (lock) lock.messageId = compactingMsg.id;
+	const compactProgress = createCompactProgressReporter({
 		narratorId,
-		message: compactingMsg,
-		...replacementFields,
-	};
-	broadcastToNarrator(narratorId, compactStartEvent);
-	await setCompactingSubstatus(narratorId, mode, true);
-	broadcastToNarrator(narratorId, { type: "compacting", narratorId, mode });
-
-	// Record what this compact is about to change. The marker is already live, so the
-	// estimate never delays the "compacting" UI, but it lands before the summary request
-	// so a finalize can never race it. Callers that already know the occupancy (an
-	// auto-compact reporting the turn's real usage) and retries reusing a marker that
-	// carries its own `before` skip the estimate entirely.
-	if (
-		options?.contextPercentBefore == null &&
-		recordedCompactContextBefore(compactingMsg) == null
-	) {
-		const beforePercent = await estimateContextOccupancyPercent(narratorId, locale, signal);
-		if (beforePercent != null) {
-			await narratorService
-				.setCompactContextPercent(narratorId, compactingMsg.id, { before: beforePercent })
-				.catch((err) => {
-					logger.warn("Failed to record context occupancy before compact", {
-						narratorId,
-						messageId: compactingMsg.id,
-						error: String(err),
-					});
-					return null;
-				});
-		}
-	}
-
+		messageId: compactingMsg.id,
+		attempt: expectedAttempt,
+		mode,
+		model: selectedModel,
+		startedAt: compactingMsg.createdAt,
+		onActivity: hooks?.beat,
+	});
 	let contextWindowSource: ModelContextWindowSource | undefined;
-	let compactProgress: CompactProgressReporter | undefined;
 
 	try {
-		// Metadata validation can throw after the running marker was persisted.
-		// Keep it inside the same failure cleanup as the summary request, without
-		// inventing a fallback provenance when resolution itself failed.
-		contextWindowSource = getSummaryModelContextWindowDetail(selectedModel).source;
-		compactProgress = createCompactProgressReporter({
+		const compactStartEvent = {
+			type: options?.preparedRetryMessage ? ("message_updated" as const) : ("message" as const),
 			narratorId,
-			messageId: compactingMsg.id,
-			mode,
-			model: selectedModel,
-			reasoningEffort: resolveDefaultReasoningEffort(undefined, selectedModel),
-			startedAt: "createdAt" in compactingMsg ? compactingMsg.createdAt : new Date().toISOString(),
-			contextWindowSource,
-			...(hooks?.beat ? { onActivity: hooks.beat } : {}),
-		});
-		// Counts every scheduled retry across BOTH retry layers (summaryGenerate's
-		// internal backoff chain and the whole-chunk retry in narrator-context), so
-		// the UI's "retrying (N)" ordinal never resets or goes backwards mid-run.
-		let retryCount = 0;
-		const { summary, contextPercent } = await narratorContext.generateCompactSummary(
+			message: compactingMsg,
+			...replacementFields,
+		};
+		broadcastToNarrator(narratorId, compactStartEvent);
+		await setCompactingSubstatus(narratorId, mode, true);
+		broadcastToNarrator(narratorId, { type: "compacting", narratorId, mode });
+
+		// Record what this compact is about to change. The marker is already live, so the
+		// estimate never delays the "compacting" UI, but it lands before the summary request
+		// so a finalize can never race it. Callers that already know the occupancy (an
+		// auto-compact reporting the turn's real usage) and retries reusing a marker that
+		// carries its own `before` skip the estimate entirely.
+		if (
+			options?.contextPercentBefore == null &&
+			recordedCompactContextBefore(compactingMsg) == null
+		) {
+			const beforePercent = await estimateContextOccupancyPercent(narratorId, locale, signal);
+			if (beforePercent != null) {
+				await narratorService
+					.setCompactContextPercent(narratorId, compactingMsg.id, { before: beforePercent })
+					.catch((err) => {
+						logger.warn("Failed to record context occupancy before compact", {
+							narratorId,
+							messageId: compactingMsg.id,
+							error: String(err),
+						});
+						return null;
+					});
+			}
+		}
+
+		// Validate model metadata in the same failure cleanup as the request.
+		const { summary, contextPercent } = await generateLiveCompactSummary({
 			narratorId,
 			locale,
 			messages,
 			signal,
-			selectedModel,
-			compactProgress.onTextDelta,
-			compactProgress.onReasoningDelta,
-			// Chunk boundaries are the only liveness signal for a summary model that
-			// does not stream, so a multi-chunk cascade must not read as a stall.
-			hooks?.beat,
-			(info) => {
-				retryCount += 1;
-				compactProgress?.reportRetry(retryCount, info.error);
+			model: selectedModel,
+			progress: compactProgress,
+			onProgress: hooks?.beat,
+			userId: options?.userId,
+			onModelChange: (model, source) => {
+				selectedModel = model;
+				contextWindowSource = source;
 			},
-			options?.userId,
-		);
+		});
 		compactProgress.finish();
 		// Providers should honor the signal, but enforce cancellation at the
 		// persistence boundary as well so a late summary can never win the CAS.
@@ -1256,6 +1457,7 @@ async function doRunCustomCompact({
 				contextPercent,
 				{
 					mode: finalizeMode,
+					model: selectedModel,
 					expectedAttempt,
 					expectedSeq,
 					epoch: compactEpochRecord(activeNarrators.get(narratorId)),
@@ -1362,6 +1564,7 @@ async function doRunCustomCompact({
 					{
 						status: "failed",
 						error: "Compact retry cancelled",
+						model: selectedModel,
 						mode,
 						expectedAttempt,
 					},
@@ -1384,6 +1587,7 @@ async function doRunCustomCompact({
 					.finalizeCompactingMessage(compactingMsg.id, narratorId, "", undefined, {
 						status: "failed",
 						error: "Compact cancelled",
+						model: selectedModel,
 						mode,
 						expectedAttempt,
 					})
@@ -1544,6 +1748,7 @@ async function runSegmentCompactUnlocked(
 	const watchdog = createCompactWatchdog({
 		narratorId,
 		onTimeout: () => abortController.abort(),
+		onStall: (reason) => abortStalledCompactRequest(narratorId, reason),
 		...(compactWatchdogTimingOverrides ?? {}),
 	});
 	const promise: Promise<CompactLockResult> = doRunSegmentCompact({
@@ -1605,30 +1810,29 @@ async function doRunSegmentCompact({
 
 	const { message: markerMsg, hiddenMessageIds } =
 		await narratorService.persistSegmentCompactMarker(narratorId, messageIds);
-	broadcastToNarrator(narratorId, { type: "message", narratorId, message: markerMsg });
-	await setCompactingSubstatus(narratorId, "blocking", true);
-	broadcastToNarrator(narratorId, {
-		type: "segment_compact_hide",
-		narratorId,
-		hiddenMessageIds,
-	});
-	broadcastToNarrator(narratorId, { type: "compacting", narratorId, mode: "blocking" });
+	const lock = compactLocks.get(narratorId);
+	if (lock) lock.messageId = markerMsg.id;
+	let selectedModel = settings.agent.summaryModel;
 	let contextWindowSource: ModelContextWindowSource | undefined;
-	let compactProgress: CompactProgressReporter | undefined;
+	const compactProgress = createCompactProgressReporter({
+		narratorId,
+		messageId: markerMsg.id,
+		mode: "blocking",
+		model: selectedModel,
+		startedAt: markerMsg.createdAt,
+		isSegment: true,
+		onActivity: hooks?.beat,
+	});
 
 	try {
-		contextWindowSource = getSummaryModelContextWindowDetail(settings.agent.summaryModel).source;
-		compactProgress = createCompactProgressReporter({
+		broadcastToNarrator(narratorId, { type: "message", narratorId, message: markerMsg });
+		await setCompactingSubstatus(narratorId, "blocking", true);
+		broadcastToNarrator(narratorId, {
+			type: "segment_compact_hide",
 			narratorId,
-			messageId: markerMsg.id,
-			mode: "blocking",
-			model: settings.agent.summaryModel,
-			reasoningEffort: resolveDefaultReasoningEffort(undefined, settings.agent.summaryModel),
-			startedAt: "createdAt" in markerMsg ? markerMsg.createdAt : new Date().toISOString(),
-			isSegment: true,
-			contextWindowSource,
-			...(hooks?.beat ? { onActivity: hooks.beat } : {}),
+			hiddenMessageIds,
 		});
+		broadcastToNarrator(narratorId, { type: "compacting", narratorId, mode: "blocking" });
 		const messages = await narratorService.getMessagesForSegmentCompact(narratorId, messageIds);
 
 		if (messages.length === 0) {
@@ -1644,24 +1848,20 @@ async function doRunSegmentCompact({
 			return false;
 		}
 
-		// Same retry-visibility contract as the history path: every scheduled retry
-		// bumps one ordinal the UI can show instead of a silent 0-char spinner.
-		let segmentRetryCount = 0;
-		const { summary, contextPercent } = await narratorContext.generateCompactSummary(
+		const { summary, contextPercent } = await generateLiveCompactSummary({
 			narratorId,
 			locale,
 			messages,
 			signal,
-			undefined,
-			compactProgress.onTextDelta,
-			compactProgress.onReasoningDelta,
-			hooks?.beat,
-			(info) => {
-				segmentRetryCount += 1;
-				compactProgress?.reportRetry(segmentRetryCount, info.error);
-			},
+			model: selectedModel,
+			progress: compactProgress,
+			onProgress: hooks?.beat,
 			userId,
-		);
+			onModelChange: (model, source) => {
+				selectedModel = model;
+				contextWindowSource = source;
+			},
+		});
 		compactProgress.finish();
 		// Enforce cancellation at the persistence boundary too, so a summary that
 		// arrives after the watchdog fired cannot finalize a marker whose lock is gone.
@@ -1672,6 +1872,7 @@ async function doRunSegmentCompact({
 			narratorId,
 			summary,
 			contextPercent,
+			{ model: selectedModel },
 		);
 
 		let contextPercentAfter = contextPercent;
@@ -1725,6 +1926,7 @@ async function doRunSegmentCompact({
 		const failedMsg = await narratorService
 			.finalizeSegmentCompact(markerMsg.id, narratorId, failedSummary, undefined, {
 				status: "failed",
+				model: selectedModel,
 				error: errorMsg,
 			})
 			.catch((e) => {

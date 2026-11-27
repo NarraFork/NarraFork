@@ -1,5 +1,6 @@
 import { notifications } from "@mantine/notifications";
 import { DEFAULT_BRAND_ICON_COLOR } from "@shared/branding";
+import { DEFAULT_COMPACT_RETRY_LIMIT, normalizeCompactRetryLimit } from "@shared/compact-settings";
 import { cloneDefaultContextThresholds } from "@shared/context-thresholds";
 import {
 	DEFAULT_RECORDING_REQUEST_BYTES,
@@ -114,6 +115,7 @@ export interface InstanceSettingsState {
 		large: { compactStart: number };
 	};
 	autoCompactKeepPairs: number;
+	compactMaxRetries: number;
 	queueDuringCompaction: boolean;
 	agentDefaultReasoningEffort: string;
 	/** Models excluded from receiving a reasoning-effort hint. */
@@ -286,6 +288,7 @@ function makeDefaults(): InstanceSettingsState {
 		customRetryRules: [],
 		contextThresholds: cloneDefaultContextThresholds(),
 		autoCompactKeepPairs: 2,
+		compactMaxRetries: DEFAULT_COMPACT_RETRY_LIMIT,
 		queueDuringCompaction: true,
 		agentDefaultReasoningEffort: "",
 		reasoningEffortBlocklist: [],
@@ -390,6 +393,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				customRetryRules: settings.agent?.customRetryRules ?? [],
 				contextThresholds: settings.agent?.contextThresholds ?? cloneDefaultContextThresholds(),
 				autoCompactKeepPairs: settings.agent?.autoCompactKeepPairs ?? 2,
+				compactMaxRetries: normalizeCompactRetryLimit(settings.agent?.compactMaxRetries),
 				queueDuringCompaction: settings.agent?.queueDuringCompaction ?? true,
 				agentDefaultReasoningEffort: settings.agent?.defaultReasoningEffort ?? "",
 				reasoningEffortBlocklist: settings.agent?.reasoningEffortBlocklist ?? [],
@@ -525,6 +529,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					customRetryRules: state.customRetryRules,
 					contextThresholds: state.contextThresholds,
 					autoCompactKeepPairs: state.autoCompactKeepPairs,
+					compactMaxRetries: state.compactMaxRetries,
 					queueDuringCompaction: state.queueDuringCompaction,
 					whitelistDirs: state.globalWhitelistDirs,
 					blacklistDirs: state.globalBlacklistDirs,

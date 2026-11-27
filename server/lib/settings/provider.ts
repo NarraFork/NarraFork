@@ -9,6 +9,7 @@ import {
 	parseAutoModelValue,
 } from "@shared/auto-model";
 import { orderAutoCandidates } from "@shared/auto-route-strategy";
+import { normalizeCompactRetryLimit } from "@shared/compact-settings";
 import { DEFAULT_CONTEXT_THRESHOLDS } from "@shared/context-thresholds";
 import { ERROR_CATALOG } from "@shared/error-catalog";
 import { modelProfile } from "@shared/model-catalog/profile";
@@ -1522,6 +1523,10 @@ export function getAutoCompactKeepPairs(): number {
 		return DEFAULT_AUTO_COMPACT_KEEP_PAIRS;
 	}
 	return Math.max(1, Math.min(25, Math.floor(configured)));
+}
+
+export function getCompactMaxRetries(): number {
+	return normalizeCompactRetryLimit(s().agent.compactMaxRetries);
 }
 
 /**

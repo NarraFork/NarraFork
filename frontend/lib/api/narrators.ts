@@ -624,7 +624,13 @@ export interface RetryFailedCompactResponse {
 	messageId: string;
 	oldMessageId?: string;
 	replacedMessageId?: string;
+	queued?: boolean;
+	pendingModel?: string | null;
 }
+
+export type CompactRetryModel = { model: string } | { useSessionModel: true };
+
+type CompactRetryOptions = CompactRetryModel & { expectedAttempt?: number };
 
 /**
  * Why a narrator's persisted model was flagged.
@@ -2025,21 +2031,31 @@ export const narratorsApi = {
 	streamCompactSummary: (
 		narratorId: string,
 		messageId: string,
-		offsets: { output: number; thinking: number },
+		offsets: { output: number; thinking: number; streamVersion?: number },
+		signal?: AbortSignal,
 	) => {
 		const params = new URLSearchParams({
 			outputOffset: String(Math.max(0, offsets.output)),
 			thinkingOffset: String(Math.max(0, offsets.thinking)),
 		});
+		if (offsets.streamVersion !== undefined) {
+			params.set("streamVersion", String(offsets.streamVersion));
+		}
 		return authorizedFetch(
 			`${apiBase()}/narrators/${encodeURIComponent(narratorId)}/compact/${encodeURIComponent(messageId)}/live?${params}`,
-			{ headers: { Accept: "text/event-stream" } },
+			{ headers: { Accept: "text/event-stream" }, signal },
 		);
 	},
-	retryFailedCompact: (narratorId: string, messageId: string, model?: string) =>
+	retryFailedCompact: (
+		narratorId: string,
+		messageId: string,
+		selection?: CompactRetryOptions | string,
+	) =>
 		request<RetryFailedCompactResponse>(`/narrators/${narratorId}/compact/${messageId}/retry`, {
 			method: "POST",
-			body: JSON.stringify(model ? { model } : {}),
+			body: JSON.stringify(
+				typeof selection === "string" ? { model: selection } : (selection ?? {}),
+			),
 		}),
 	sendNarratorMessage: async (
 		narratorId: string,
@@ -2522,7 +2538,9 @@ export const narratorsApi = {
 			body: JSON.stringify({ messageIds }),
 		}),
 	getSegmentCompactSummary: (narratorId: string, messageId: string) =>
-		request<{ summary: string }>(`/narrators/${narratorId}/segment-compact/${messageId}`),
+		request<CompactMessageDetail | { summary: string }>(
+			`/narrators/${narratorId}/segment-compact/${messageId}`,
+		),
 	deleteSegmentCompact: (narratorId: string, messageId: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/segment-compact/${messageId}`, {
 			method: "DELETE",

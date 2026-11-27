@@ -593,6 +593,7 @@ export type NarratorServerMessage =
 			type: "compact_progress";
 			narratorId: string;
 			messageId: string;
+			attempt?: number;
 			/**
 			 * Which count the label should feature. Absent on payloads from an older
 			 * server, which normalizes to `output` (the previous single-phase
@@ -605,6 +606,8 @@ export type NarratorServerMessage =
 			isSegment?: boolean;
 			mode?: "blocking" | "background";
 			model?: string;
+			pendingModel?: string | null;
+			canChangeModel?: boolean;
 			reasoningEffort?: string;
 			startedAt?: string;
 			/**

@@ -67,6 +67,7 @@ import {
 	COMPACT_SUMMARY_BUDGET_EXCEEDED,
 	type CompactSummaryReadResult,
 	storedCompactDetail,
+	storedSegmentCompactDetail,
 } from "../lib/db-worker/compact-summary-query";
 import { DISPLAY_PAGE_LIMITS } from "../lib/db-worker/display-page-protocol";
 import { runReadTask, WorkersUnavailableError } from "../lib/db-worker/pool";
@@ -3483,14 +3484,25 @@ function getToolCallDetailTx(
 // ── narratorMessages object ────────────────────────────────────────────────
 
 function withLiveCompactDetail(
+	narratorId: string,
 	messageId: string,
 	detail: CompactMessageDetail,
 ): CompactMessageDetail {
 	const live = detail.status === "compacting" ? liveCompactProgress.get(messageId) : undefined;
-	if (!live) return detail;
+	if (
+		!live ||
+		live.narratorId !== narratorId ||
+		(detail.attempt !== undefined && live.attempt !== detail.attempt)
+	) {
+		return detail;
+	}
 	return {
 		...detail,
 		model: live.model || detail.model,
+		attempt: live.attempt ?? detail.attempt,
+		pendingModel: live.pendingModel,
+		canChangeModel: live.canChangeModel,
+		streamVersion: live.streamVersion,
 		startedAt: live.startedAt,
 		finishedAt: undefined,
 		reasoningEffort: live.reasoningEffort,
@@ -3501,6 +3513,31 @@ function withLiveCompactDetail(
 		outputTruncated: live.outputTruncated,
 		thinkingTruncated: live.thinkingTruncated,
 	};
+}
+
+async function readSqliteCompactSummaryDetail(
+	narratorId: string,
+	messageId: string,
+	signal: AbortSignal,
+	segment?: boolean,
+): Promise<CompactMessageDetail> {
+	const sqlite = modelHistoryDatabase.sqlite;
+	if (!sqlite.filename || sqlite.filename === ":memory:" || sqlite.inTransaction) {
+		throw new WorkersUnavailableError("requires_committed_file");
+	}
+	const result = await runReadTask<CompactSummaryReadResult>(
+		sqlite.filename,
+		{ kind: "compactSummary", narratorId, messageId, fromBlocks: blockReadsEnabled(), segment },
+		{ timeoutMs: 10_000, signal },
+	).catch((err: unknown) => {
+		if (err instanceof Error && "code" in err && err.code === COMPACT_SUMMARY_BUDGET_EXCEEDED) {
+			throw new AppError(err.message, 413, COMPACT_SUMMARY_BUDGET_EXCEEDED);
+		}
+		throw err;
+	});
+	signal.throwIfAborted();
+	if ("notFound" in result) throw new NotFoundError(result.notFound, messageId);
+	return withLiveCompactDetail(narratorId, messageId, result.detail);
 }
 
 const narratorMessageQueriesUnlocked = {
@@ -4828,24 +4865,34 @@ const narratorMessageQueriesUnlocked = {
 		if (modelHistoryDatabase.activeDatabaseBackend !== "sqlite") {
 			return narratorMessageQueriesUnlocked.getCompactSummary(narratorId, messageId);
 		}
-		const sqlite = modelHistoryDatabase.sqlite;
-		if (!sqlite.filename || sqlite.filename === ":memory:" || sqlite.inTransaction) {
-			throw new WorkersUnavailableError("requires_committed_file");
+		return readSqliteCompactSummaryDetail(narratorId, messageId, signal);
+	},
+
+	async readSegmentCompactSummaryDetail(
+		narratorId: string,
+		messageId: string,
+		signal: AbortSignal,
+	) {
+		signal.throwIfAborted();
+		if (modelHistoryDatabase.activeDatabaseBackend === "sqlite") {
+			return readSqliteCompactSummaryDetail(narratorId, messageId, signal, true);
 		}
 
-		const result = await runReadTask<CompactSummaryReadResult>(
-			sqlite.filename,
-			{ kind: "compactSummary", narratorId, messageId, fromBlocks: blockReadsEnabled() },
-			{ timeoutMs: 10_000, signal },
-		).catch((err: unknown) => {
-			if (err instanceof Error && "code" in err && err.code === COMPACT_SUMMARY_BUDGET_EXCEEDED) {
-				throw new AppError(err.message, 413, COMPACT_SUMMARY_BUDGET_EXCEEDED);
-			}
-			throw err;
-		});
+		const msg = fillBody(
+			await db.query.narratorMessages.findFirst({
+				where: and(
+					eq(narratorMessages.id, messageId),
+					eq(narratorMessages.narratorId, narratorId),
+					eq(narratorMessages.role, "user"),
+				),
+				...bodyColumns({ id: true, contentJson: true, createdAt: true }),
+			}),
+		);
 		signal.throwIfAborted();
-		if ("notFound" in result) throw new NotFoundError(result.notFound, messageId);
-		return withLiveCompactDetail(messageId, result.detail);
+		if (!msg) throw new NotFoundError("Message", messageId);
+		const detail = storedSegmentCompactDetail(msg.contentJson, msg.createdAt);
+		if (!detail) throw new NotFoundError("CompactSummary", messageId);
+		return withLiveCompactDetail(narratorId, messageId, detail);
 	},
 
 	async getCompactSummary(narratorId: string, messageId: string) {
@@ -4944,6 +4991,7 @@ const narratorMessageQueriesUnlocked = {
 				(msg.tokensIn != null ? (msg.contextPercent ?? undefined) : undefined);
 
 			return withLiveCompactDetail(
+				narratorId,
 				messageId,
 				storedCompactDetail(compactBlock, { contextPercentBefore, contextPercentAfter, canRetry }),
 			);

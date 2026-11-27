@@ -410,7 +410,7 @@ describe("M2 real Chromium/Pion/NF application and database", () => {
 			seq: (latest?.seq ?? 0) + 1,
 			isCompact: 0,
 		});
-		startLiveCompactProgress(COMPACT, { model: MODEL, startedAt: timestamp });
+		startLiveCompactProgress(COMPACT, { narratorId: NARRATOR, model: MODEL, startedAt: timestamp });
 		appendLiveCompactDelta(COMPACT, "output", "压缩开始", { outputChars: 4, thinkingChars: 0 });
 		const result = await page.evaluate(
 			async ({ narratorId, messageId }) => {

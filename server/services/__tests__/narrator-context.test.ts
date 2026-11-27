@@ -440,6 +440,33 @@ describe("compact small positive budgets use actual request capacity", () => {
 		expect(generate.mock.calls[0][0]).toContain("Keep the evidence");
 	});
 
+	test("uses a separate automatic retry limit including zero", async () => {
+		const before = settings.agent.compactMaxRetries;
+		const ordinaryBefore = settings.agent.maxTransientRetries;
+		const error = new Error("Compact provider rejected the prompt");
+		try {
+			settings.agent.compactMaxRetries = 0;
+			settings.agent.maxTransientRetries = 8;
+			generate.mockRejectedValue(error);
+			await expect(
+				narratorContext.generateCompactSummary("n-small", "en", [message]),
+			).rejects.toThrow(error.message);
+			expect(generate).toHaveBeenCalledTimes(1);
+			expect(generate.mock.calls[0][11]).toEqual({ maxRetries: 0 });
+
+			settings.agent.compactMaxRetries = 2;
+			settings.agent.maxTransientRetries = 0;
+			generate.mockClear();
+			await expect(
+				narratorContext.generateCompactSummary("n-small", "en", [message]),
+			).rejects.toThrow(error.message);
+			expect(generate).toHaveBeenCalledTimes(3);
+		} finally {
+			settings.agent.compactMaxRetries = before;
+			settings.agent.maxTransientRetries = ordinaryBefore;
+		}
+	});
+
 	test("previous summary and spec overhead are retained within the same small window", async () => {
 		previousSummary = `PREVIOUS ${"x".repeat(600)}`;
 		specContext = `LATEST SPEC ${"y".repeat(600)}`;

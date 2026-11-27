@@ -2573,7 +2573,12 @@ const sqliteNarratorPersistence = {
 		});
 	},
 
-	async prepareFailedCompactRetry(narratorId: string, messageId: string, model?: string) {
+	async prepareFailedCompactRetry(
+		narratorId: string,
+		messageId: string,
+		model?: string,
+		expectedAttempt?: number,
+	) {
 		const now = new Date().toISOString();
 		const selectedModel = model?.trim() || settings.agent.summaryModel;
 		return withDbRetry(
@@ -2605,6 +2610,12 @@ const sqliteNarratorPersistence = {
 						throw new ValidationError("Message is not a retryable failed compact");
 					}
 
+					if (
+						expectedAttempt !== undefined &&
+						normalizeCompactAttempts(compactBlock.attempts).at(-1)?.attempt !== expectedAttempt
+					) {
+						throw new AppError("Compact attempt has changed", 409, "COMPACT_ATTEMPT_CHANGED");
+					}
 					// Read and validate the effective compact boundary in the SAME transaction
 					// that transitions this marker back to running. A failed marker is only
 					// retryable while it remains strictly after the latest successful compact.
@@ -2857,6 +2868,7 @@ const sqliteNarratorPersistence = {
 			status?: "compacted" | "failed";
 			error?: string;
 			mode?: CompactMessageMode;
+			model?: string;
 			expectedCompactBoundaryMessageId?: string | null;
 			expectedAttempt?: number;
 			expectedSeq?: number;
@@ -2933,7 +2945,13 @@ const sqliteNarratorPersistence = {
 			// private row before finalizing so the sibling keeps its own attempt state.
 			const copied = copyMessageForNarratorTx(tx, narratorId, messageId);
 			const finished = finishCompactAttempt(
-				{ ...previous, ...(options?.mode ? { mode: options.mode } : {}) },
+				{
+					...previous,
+					...(options?.mode ? { mode: options.mode } : {}),
+					...(options?.model
+						? { attempts: [...attempts.slice(0, -1), { ...latestAttempt, model: options.model }] }
+						: {}),
+				},
 				status === "compacted" ? "completed" : "failed",
 				now,
 				options?.error,
@@ -5679,7 +5697,7 @@ const sqliteNarratorPersistence = {
 		narratorId: string,
 		summary: string,
 		contextPercent?: number,
-		options?: { status?: "compacted" | "failed"; error?: string },
+		options?: { status?: "compacted" | "failed"; error?: string; model?: string },
 	) {
 		const now = new Date().toISOString();
 		const status = options?.status ?? "compacted";
@@ -5700,6 +5718,7 @@ const sqliteNarratorPersistence = {
 			status,
 			summary,
 			messageCount,
+			...(options?.model ? { model: options.model } : {}),
 		};
 		if (status === "failed" && options?.error) {
 			block.error = options.error;
