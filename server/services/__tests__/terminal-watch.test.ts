@@ -20,6 +20,8 @@ import {
 	MAX_WATCH_PATTERN_CHARS,
 	notifyTerminalOutput,
 	PUBLISH_RETRY_DELAYS_MS,
+	registerRestoredWatchAnchors,
+	resetRestoredWatchAnchorsForTests,
 	resumeTerminalWatchesForTests,
 	startTerminalWatch,
 	suspendTerminalWatchesForShutdown,
@@ -110,6 +112,7 @@ async function startWithCursor(buffer: BufferManager, pattern: string, startAt?:
 		marker: cursor.marker,
 		disposeMarkers: cursor.dispose,
 		start: startAt ?? { kind: "offset", offset: cursor.offset, textBefore: cursor.textBefore },
+		principal: { userId: null },
 	});
 	if (result.status !== "started") throw new Error(result.message);
 	return result.taskId;
@@ -949,10 +952,11 @@ describe("terminal watch", () => {
 		await backgroundTaskService.killAll();
 		expect((await row(id))?.status).toBe("running");
 		await backgroundTaskService.recoverStaleTasksAfterRestart();
-		const recovered = await row(id);
+		const recovered = await waitForStatus(id);
 		expect(recovered?.status).toBe("failed");
 		expect(recovered?.output).toMatch(/interrupted.*server restart/i);
-		// A text watch cannot prove it saw output produced while no server ran.
+		// Without a start saved with a resumable snapshot, a text watch cannot prove it
+		// saw output produced while no server ran.
 		expect(recovered?.output).toContain("The watch did not stop the target");
 	});
 });
@@ -1094,5 +1098,249 @@ describe("output gaps from a durable executor session", () => {
 		await endWatchesForBuffer(TERMINAL, buffer, "the terminal exited");
 		expect((await waitForStatus(exit))?.output).toContain("the terminal exited");
 		expect(await notices()).toHaveLength(2);
+	});
+});
+
+describe("text watches on executor-session terminals continue after a restart", () => {
+	let seq = 0;
+	beforeEach(() => {
+		seq = 0;
+		resetRestoredWatchAnchorsForTests();
+	});
+	afterEach(() => resetRestoredWatchAnchorsForTests());
+
+	async function seedTerminal() {
+		const { terminals } = await import("../../db/schema");
+		db.insert(terminals)
+			.values({
+				id: TERMINAL,
+				narratorId: PARENT,
+				name: "T",
+				status: "running",
+				createdAt: new Date().toISOString(),
+			})
+			.run();
+	}
+
+	/** Output numbered like an executor session's stream. */
+	function numbered(buffer: BufferManager, data: string) {
+		seq += data.length;
+		buffer.append(data, seq);
+		notifyTerminalOutput(TERMINAL);
+	}
+
+	/**
+	 * Stop as a shutdown does (watches released, snapshot saved after `beforeSave`
+	 * reached the buffer unobserved), then start as a new process: the terminal is
+	 * resumed from the snapshot and restart recovery re-registers the watches.
+	 */
+	async function restart(buffer: BufferManager, beforeSave?: string) {
+		suspendTerminalWatchesForShutdown();
+		if (beforeSave) {
+			seq += beforeSave.length;
+			buffer.append(beforeSave, seq);
+		}
+		await buffer.saveToDisk();
+		await backgroundTaskService.killAll();
+		resumeTerminalWatchesForTests();
+		resetRestoredWatchAnchorsForTests();
+		const restored = new BufferManager(TERMINAL, 80, 24);
+		buffers.push(restored);
+		await restored.loadFromDisk();
+		const held = registerRestoredWatchAnchors(
+			TERMINAL,
+			restored,
+			await restored.takeRestoredAnchors(),
+		);
+		const { terminalService } = await import("../terminal-service");
+		spyOn(terminalService, "isAttached").mockReturnValue(true);
+		spyOn(terminalService, "getActiveBuffer").mockReturnValue(restored);
+		await backgroundTaskService.recoverStaleTasksAfterRestart();
+		// Terminal watches are re-attached off the startup path; the held output is
+		// released once every one has been.
+		await held;
+		const deadline = Date.now() + 3_000;
+		while (
+			Date.now() < deadline &&
+			db
+				.select()
+				.from(backgroundTasks)
+				.all()
+				.some((task) => task.status === "running" && !activeWatchIds(TERMINAL).includes(task.id))
+		)
+			await Bun.sleep(10);
+		return { restored, held };
+	}
+
+	test("output printed before the restart but never checked is matched", async () => {
+		await seedTerminal();
+		const buffer = newBuffer();
+		numbered(buffer, "$ ");
+		const id = await startWithCursor(buffer, "BUILD OK");
+		numbered(buffer, "make\r\ncompiling\r\n");
+		const { held } = await restart(buffer, "BUILD OK\r\n");
+		expect(held).toBeDefined();
+		await held;
+		const done = await waitForStatus(id);
+		expect(done?.status).toBe("completed");
+		expect(done?.output).toContain('"BUILD OK" appeared in terminal "T"');
+		expect(await notices()).toHaveLength(1);
+	});
+
+	test("the watch keeps matching only output after its start", async () => {
+		await seedTerminal();
+		const buffer = newBuffer();
+		numbered(buffer, "earlier READY\r\n$ ");
+		const id = await startWithCursor(buffer, "READY");
+		const { restored } = await restart(buffer, "waiting\r\n");
+		expect((await row(id))?.status).toBe("running");
+		expect(activeWatchIds(TERMINAL)).toEqual([id]);
+		// The same handle the session was given before the restart.
+		numbered(restored, "server READY\r\n");
+		const done = await waitForStatus(id);
+		expect(done?.status).toBe("completed");
+		expect(done?.output).toContain("server READY");
+	});
+
+	test("a resumed watch survives a second restart", async () => {
+		await seedTerminal();
+		const buffer = newBuffer();
+		numbered(buffer, "$ ");
+		const id = await startWithCursor(buffer, "SECOND");
+		const first = await restart(buffer);
+		expect((await row(id))?.status).toBe("running");
+		const second = await restart(first.restored, "SECOND\r\n");
+		await second.held;
+		expect((await waitForStatus(id))?.status).toBe("completed");
+	});
+
+	test("a watch that skipped its command's echo resumes without saving the input", async () => {
+		await seedTerminal();
+		const buffer = newBuffer();
+		numbered(buffer, "$ ");
+		const id = await startWithCursor(buffer, "BUILD OK", {
+			kind: "echo",
+			input: "secret-token\nmake && echo BUILD OK\n",
+		});
+		numbered(buffer, "make && echo BUILD OK\r\ncompiling\r\n");
+		// A check finds the echo; from then on the watch can be saved.
+		await Bun.sleep(CHECK_INTERVAL_MS + 100);
+		suspendTerminalWatchesForShutdown();
+		await buffer.saveToDisk();
+		const { join } = await import("node:path");
+		const { getNarraforkPath } = await import("../../lib/narrafork-home");
+		const saved = JSON.parse(
+			await Bun.file(join(getNarraforkPath("buffers"), `${TERMINAL}.buf`)).text(),
+		);
+		expect(saved.anchors).toHaveLength(1);
+		expect(Object.keys(saved.anchors[0].data).sort()).toEqual([
+			"checkpoint",
+			"kind",
+			"pattern",
+			"version",
+		]);
+		expect(JSON.stringify(saved)).not.toContain("secret-token");
+		resumeTerminalWatchesForTests();
+		// The command's own echo does not satisfy the watch; its output does.
+		const { restored } = await restart(buffer);
+		expect((await row(id))?.status).toBe("running");
+		numbered(restored, "BUILD OK\r\n$ ");
+		const done = await waitForStatus(id);
+		expect(done?.status).toBe("completed");
+	});
+
+	test("a watch whose echo was never checked is not saved and ends as interrupted", async () => {
+		await seedTerminal();
+		const buffer = newBuffer();
+		numbered(buffer, "$ ");
+		const id = await startWithCursor(buffer, "BUILD OK", { kind: "echo", input: "hunter2\n" });
+		const { held } = await restart(buffer, "\r\n");
+		expect(held).toBeUndefined();
+		const ended = await waitForStatus(id);
+		expect(ended?.status).toBe("failed");
+		expect(ended?.output).toMatch(/interrupted.*server restart/i);
+	});
+
+	test("an occurrence that disappeared before the restart counts when it returns", async () => {
+		await seedTerminal();
+		const buffer = newBuffer();
+		// A status row that already says READY when the watch starts.
+		numbered(buffer, "status: READY");
+		const id = await startWithCursor(buffer, "READY");
+		numbered(buffer, "\rstatus: BUSY ");
+		await Bun.sleep(CHECK_INTERVAL_MS + 100);
+		expect((await row(id))?.status).toBe("running");
+		// Back to READY after the last check, then the restart.
+		const { held } = await restart(buffer, "\rstatus: READY");
+		await held;
+		const done = await waitForStatus(id);
+		expect(done?.status).toBe("completed");
+	});
+
+	test("a gap in the replayed output still ends the resumed watch as possibly missed", async () => {
+		await seedTerminal();
+		const buffer = newBuffer();
+		numbered(buffer, "$ ");
+		const id = await startWithCursor(buffer, "DEPLOYED");
+		const { restored } = await restart(buffer);
+		const { interruptTextWatchesForGap } = await import("../terminal-watch-service");
+		await interruptTextWatchesForGap(TERMINAL, restored, 2048);
+		const ended = await waitForStatus(id);
+		expect(ended?.status).toBe("failed");
+		expect(ended?.output).toContain("2048 bytes of output");
+	});
+
+	test("a text watch on a terminal that does not number its output still ends as interrupted", async () => {
+		await seedTerminal();
+		const buffer = newBuffer();
+		output(buffer, "$ ");
+		const id = await startWithCursor(buffer, "READY");
+		const { held } = await restart(buffer);
+		expect(held).toBeUndefined();
+		const ended = await row(id);
+		expect(ended?.status).toBe("failed");
+		expect(ended?.output).toMatch(/interrupted.*server restart/i);
+	});
+
+	test("a settled watch's start is not saved again", async () => {
+		await seedTerminal();
+		const buffer = newBuffer();
+		numbered(buffer, "$ ");
+		const id = await startWithCursor(buffer, "OK");
+		numbered(buffer, "OK\r\n");
+		expect((await waitForStatus(id))?.status).toBe("completed");
+		await buffer.saveToDisk();
+		const restored = new BufferManager(TERMINAL, 80, 24);
+		buffers.push(restored);
+		await restored.loadFromDisk();
+		expect(await restored.takeRestoredAnchors()).toEqual([]);
+	});
+
+	test("starts nobody resumes are dropped once recovery finishes, releasing held output", async () => {
+		await seedTerminal();
+		const buffer = newBuffer();
+		numbered(buffer, "$ ");
+		const id = await startWithCursor(buffer, "NEVER");
+		// The row ended (say, cancelled) after the snapshot that still carries its start.
+		await buffer.saveToDisk();
+		await backgroundTaskService.cancel(id);
+		const restored = new BufferManager(TERMINAL, 80, 24);
+		buffers.push(restored);
+		await restored.loadFromDisk();
+		const held = registerRestoredWatchAnchors(
+			TERMINAL,
+			restored,
+			await restored.takeRestoredAnchors(),
+		);
+		expect(held).toBeDefined();
+		await backgroundTaskService.recoverStaleTasksAfterRestart();
+		await held;
+		// Terminals resumed later keep nothing for watches.
+		const late = await restored.markReadCursor();
+		if (!late) throw new Error("no cursor");
+		expect(registerRestoredWatchAnchors(TERMINAL, restored, [{ id, cursor: late, data: {} }])).toBe(
+			undefined,
+		);
+		expect(late.marker.isDisposed).toBe(true);
 	});
 });

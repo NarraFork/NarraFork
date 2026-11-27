@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import {
 	BufferManager,
+	type BufferReadCursor,
 	MAX_BUFFER_READ_CURSORS,
 	MAX_CURSOR_PENDING_FRAMES,
 	MAX_LAYOUT_SCAN_CELLS,
@@ -499,6 +500,161 @@ describe("snapshot stream position", () => {
 		const restored = new BufferManager(id);
 		await restored.loadFromDisk();
 		expect(restored.restoredStreamSeq).toBeUndefined();
+		await restored.dispose(true);
+	});
+});
+
+describe("durable read anchors", () => {
+	const ids: string[] = [];
+	afterEach(async () => {
+		for (const id of ids.splice(0)) await new BufferManager(id).deleteFromDisk();
+	});
+
+	function newId() {
+		const id = `anchor-${crypto.randomUUID()}`;
+		ids.push(id);
+		return id;
+	}
+
+	/** Text a cursor reads now, from its start row. */
+	async function readFrom(buffer: BufferManager, cursor: BufferReadCursor) {
+		const frames = await buffer.readCursor(cursor);
+		const last = frames.at(-1);
+		if (!last || last.kind !== "snapshot") throw new Error(`unexpected frame ${last?.kind}`);
+		return last;
+	}
+
+	async function restore(id: string) {
+		const restored = new BufferManager(id);
+		expect(await restored.loadFromDisk()).toBe(true);
+		return { restored, anchors: await restored.takeRestoredAnchors() };
+	}
+
+	test("a saved cursor is recreated at its row with everything printed after it", async () => {
+		const id = newId();
+		const source = new BufferManager(id);
+		for (let i = 0; i < 30; i++) source.append(`old line ${i}\r\n`, i + 1);
+		source.append("$ make", 40);
+		const cursor = await source.markReadCursor();
+		if (!cursor) throw new Error("no cursor");
+		expect(source.setDurableAnchor("watch-1", cursor, () => ({ pattern: "DONE" }))).toBe(true);
+		source.append("\r\nbuilding\r\nDONE\r\n", 60);
+		const before = await readFrom(source, cursor);
+		await source.saveToDisk();
+		await source.dispose();
+
+		const { restored, anchors } = await restore(id);
+		expect(anchors).toHaveLength(1);
+		expect(anchors[0].id).toBe("watch-1");
+		expect(anchors[0].data).toEqual({ pattern: "DONE" });
+		const after = await readFrom(restored, anchors[0].cursor);
+		expect(after.text).toBe(before.text);
+		expect(after.text.startsWith("$ make")).toBe(true);
+		expect(after.markerLost).toBe(false);
+		// The cursor follows its row through later output, like a live one.
+		restored.append("more\r\n", 65);
+		expect((await readFrom(restored, anchors[0].cursor)).text).toContain("DONE\nmore");
+		// Taken once.
+		expect(await restored.takeRestoredAnchors()).toEqual([]);
+		await restored.dispose(true);
+	});
+
+	test("a source that does not number its output saves no anchor", async () => {
+		const source = new BufferManager(newId());
+		source.append("$ ");
+		const cursor = await source.markReadCursor();
+		if (!cursor) throw new Error("no cursor");
+		expect(source.setDurableAnchor("watch-1", cursor, () => ({}))).toBe(false);
+		await source.dispose(true);
+	});
+
+	test("a removed anchor, or one whose layout changed, is not saved", async () => {
+		const id = newId();
+		const source = new BufferManager(id, 80, 24);
+		source.append("$ ", 2);
+		const removed = await source.markReadCursor();
+		const reflowed = await source.markReadCursor();
+		const kept = await source.markReadCursor();
+		if (!removed || !reflowed || !kept) throw new Error("no cursor");
+		source.setDurableAnchor("removed", removed, () => ({}));
+		source.setDurableAnchor("reflowed", reflowed, () => ({}));
+		source.deleteDurableAnchor("removed");
+		await source.resize(60, 24);
+		// Only an anchor registered after the change describes the new layout.
+		await readFrom(source, kept);
+		expect(source.setDurableAnchor("kept", kept, () => ({}))).toBe(true);
+		await source.saveToDisk();
+		await source.dispose();
+		const { restored, anchors } = await restore(id);
+		expect(anchors.map((anchor) => anchor.id)).toEqual(["kept"]);
+		await restored.dispose(true);
+	});
+
+	test("a cursor still holding frames of an earlier layout is refused", async () => {
+		const source = new BufferManager(newId(), 80, 24);
+		source.append("$ ", 2);
+		const cursor = await source.markReadCursor();
+		if (!cursor) throw new Error("no cursor");
+		await source.resize(60, 24);
+		expect(source.setDurableAnchor("watch-1", cursor, () => ({}))).toBe(false);
+		await source.dispose(true);
+	});
+
+	test("a start row that left the scrollback is restored as lost", async () => {
+		const id = newId();
+		const source = new BufferManager(id, 80, 5);
+		source.append("$ ", 2);
+		const cursor = await source.markReadCursor();
+		if (!cursor) throw new Error("no cursor");
+		source.setDurableAnchor("watch-1", cursor, () => ({}));
+		for (let i = 0; i < 5100; i++) source.append(`line ${i}\r\n`, 12 + i * 10);
+		await source.flush();
+		expect(cursor.marker.isDisposed).toBe(true);
+		await source.saveToDisk();
+		await source.dispose();
+		const { restored, anchors } = await restore(id);
+		expect(anchors).toHaveLength(1);
+		expect((await readFrom(restored, anchors[0].cursor)).markerLost).toBe(true);
+		await restored.dispose(true);
+	});
+
+	test("an anchor is kept while a full-screen program has the alternate screen", async () => {
+		const id = newId();
+		const source = new BufferManager(id);
+		source.append("$ top", 5);
+		const cursor = await source.markReadCursor();
+		if (!cursor) throw new Error("no cursor");
+		source.setDurableAnchor("watch-1", cursor, () => ({}));
+		source.append("\r\n\x1b[?1049h\x1b[Hfull screen", 30);
+		await source.saveToDisk();
+		await source.dispose();
+		const { restored, anchors } = await restore(id);
+		expect(anchors).toHaveLength(1);
+		// The alternate screen is restored too; leaving it shows the normal rows again.
+		expect(await restored.getContents()).toContain("full screen");
+		restored.append("\x1b[?1049lDONE\r\n", 40);
+		const frame = await readFrom(restored, anchors[0].cursor);
+		expect(frame.text.startsWith("$ top")).toBe(true);
+		expect(frame.text).toContain("DONE");
+		await restored.dispose(true);
+	});
+
+	test("an anchor whose row no longer holds the saved text is dropped", async () => {
+		const id = newId();
+		const source = new BufferManager(id);
+		source.append("first\r\n$ ", 9);
+		const cursor = await source.markReadCursor();
+		if (!cursor) throw new Error("no cursor");
+		source.setDurableAnchor("watch-1", cursor, () => ({}));
+		await source.saveToDisk();
+		await source.dispose();
+		const path = join(buffersDir, `${id}.buf`);
+		const file = JSON.parse(await Bun.file(path).text());
+		expect(file.anchors).toHaveLength(1);
+		file.anchors[0].lineText = "something else";
+		await writeFile(path, JSON.stringify(file));
+		const { restored, anchors } = await restore(id);
+		expect(anchors).toEqual([]);
 		await restored.dispose(true);
 	});
 });

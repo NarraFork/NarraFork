@@ -100,6 +100,7 @@ afterEach(async () => {
 	for (const deviceId of ["dev-1", "dev-2", "dev-3"])
 		eventBus.emit({ type: "device:status", deviceId, status: "offline" });
 	await terminalService.shutdownAll().catch(() => {});
+	terminalWatches.resetRestoredWatchAnchorsForTests();
 	for (const id of ["t-durable", "t-unnumbered", "t-legacy"])
 		await new BufferManager(id).deleteFromDisk();
 	cleanDb(sqlite);
@@ -328,6 +329,240 @@ describe("remote terminals backed by executor sessions", () => {
 		} finally {
 			restartHandling.mockRestore();
 		}
+	});
+
+	test("replayed output waits until the snapshot's text watches are resumed", async () => {
+		insertTerminal("t-durable", { deviceId: "dev-1", executorSessionId: "nf-term-t-durable" });
+		const source = new BufferManager("t-durable");
+		source.append("$ ", 2);
+		const cursor = await source.markReadCursor();
+		if (!cursor) throw new Error("no cursor");
+		const data = { version: 2, pattern: "READY", kind: "offset", checkpoint: { skip: 2 } };
+		expect(source.setDurableAnchor("bash_w1", cursor, () => data)).toBe(true);
+		await source.saveToDisk();
+		await source.dispose();
+
+		await terminalService.recoverOnStartup();
+		await until(() => attachStream !== undefined);
+		attachStream?.("session.data", new TextEncoder().encode("READY\r\n"));
+		await Bun.sleep(30);
+		const buffer = terminalService.getActiveBuffer("t-durable");
+		if (!buffer) throw new Error("no buffer");
+		expect(await buffer.getContents()).not.toContain("READY");
+		// Recovery gives up the watch nobody resumed; the output then reaches the buffer.
+		terminalWatches.closeRestoredWatchAnchors();
+		await Bun.sleep(10);
+		expect(await buffer.getContents()).toContain("READY");
+	});
+
+	test("a gap reported while output is held is handled after the output before it", async () => {
+		const seen: string[] = [];
+		let releaseFirst: (() => void) | undefined;
+		const gapHandling = spyOn(terminalWatches, "interruptTextWatchesForGap").mockImplementation(
+			async (_id, buffer) => {
+				seen.push(await buffer.getContents());
+				if (seen.length === 1)
+					await new Promise<void>((resolve) => {
+						releaseFirst = resolve;
+					});
+			},
+		);
+		try {
+			insertTerminal("t-durable", { deviceId: "dev-1", executorSessionId: "nf-term-t-durable" });
+			await terminalService.recoverOnStartup();
+			await until(() => attachStream !== undefined);
+			const encode = (text: string) => new TextEncoder().encode(text);
+			attachStream?.("session.gap", encode(JSON.stringify({ from: 0, to: 10 })));
+			attachStream?.("session.data", encode("MIDDLE\r\n"));
+			attachStream?.("session.gap", encode(JSON.stringify({ from: 30, to: 40 })));
+			attachStream?.("session.data", encode("AFTER\r\n"));
+			await until(() => releaseFirst !== undefined);
+			releaseFirst?.();
+			await until(() => seen.length === 2);
+			// The second gap's watches saw the output before it, never the output after it.
+			expect(seen[1]).toContain("MIDDLE");
+			expect(seen[1]).not.toContain("AFTER");
+			const buffer = terminalService.getActiveBuffer("t-durable");
+			await Bun.sleep(10);
+			expect(await buffer?.getContents()).toContain("AFTER");
+		} finally {
+			gapHandling.mockRestore();
+		}
+	});
+
+	test("held output is written back in batches that text watches check in turn", async () => {
+		const lastLineSeen: number[] = [];
+		let savedMidChunk: { seq: number; lines: number } | undefined;
+		let releaseGap: (() => void) | undefined;
+		const gapHandling = spyOn(terminalWatches, "interruptTextWatchesForGap").mockImplementation(
+			() =>
+				new Promise<void>((resolve) => {
+					releaseGap = resolve;
+				}),
+		);
+		const hasWatches = spyOn(terminalWatches, "hasTextWatches").mockReturnValue(true);
+		const checkNow = spyOn(terminalWatches, "checkTextWatchesNow").mockImplementation(
+			async (_id, buffer) => {
+				const lines = [...(await buffer.getContents()).matchAll(/line (\d+)/g)];
+				lastLineSeen.push(lines.length ? Number(lines.at(-1)?.[1]) : -1);
+				// A save between pieces records exactly the position of what it contains.
+				if (lastLineSeen.length === 2) {
+					await buffer.saveToDisk();
+					const mid = new BufferManager("t-durable");
+					await mid.loadFromDisk();
+					savedMidChunk = {
+						seq: mid.restoredStreamSeq ?? -1,
+						lines: [...(await mid.getContents()).matchAll(/line (\d+)/g)].length,
+					};
+					await mid.dispose();
+				}
+			},
+		);
+		try {
+			insertTerminal("t-durable", { deviceId: "dev-1", executorSessionId: "nf-term-t-durable" });
+			await terminalService.recoverOnStartup();
+			await until(() => attachStream !== undefined);
+			const encode = (text: string) => new TextEncoder().encode(text);
+			attachStream?.("session.gap", encode(JSON.stringify({ from: 0, to: 10 })));
+			// More than the 5000-line scrollback, in one chunk.
+			let replay = "";
+			for (let i = 0; i < 5_100; i++) replay += `line ${i}\r\n`;
+			attachStream?.("session.data", encode(replay));
+			await until(() => releaseGap !== undefined);
+			releaseGap?.();
+			await until(() => (lastLineSeen.at(-1) ?? -1) >= 4_000);
+			// The first check runs before any held output; no batch exceeds 1000 rows.
+			expect(lastLineSeen[0]).toBe(-1);
+			for (let i = 1; i < lastLineSeen.length; i++)
+				expect(lastLineSeen[i] - lastLineSeen[i - 1]).toBeLessThanOrEqual(1_000);
+			await Bun.sleep(10);
+			const buffer = terminalService.getActiveBuffer("t-durable");
+			expect(await buffer?.getContents()).toContain("line 5099");
+			const lineBytes = (count: number) =>
+				new TextEncoder().encode(replay.split("\r\n").slice(0, count).join("\r\n")).length + 2;
+			expect(savedMidChunk?.lines).toBeGreaterThan(0);
+			expect(savedMidChunk?.lines).toBeLessThan(5_100);
+			// Past the 10-byte gap, exactly the lines the snapshot holds.
+			expect(savedMidChunk?.seq).toBe(10 + lineBytes(savedMidChunk?.lines ?? 0));
+			// Once the chunk is complete, its text and position are saved together.
+			await buffer?.saveToDisk();
+			const saved = new BufferManager("t-durable");
+			await saved.loadFromDisk();
+			// Past the 10-byte gap, then the whole chunk.
+			expect(saved.restoredStreamSeq).toBe(10 + new TextEncoder().encode(replay).length);
+			await saved.dispose();
+		} finally {
+			gapHandling.mockRestore();
+			hasWatches.mockRestore();
+			checkNow.mockRestore();
+		}
+	});
+
+	test("a shutdown inside a split chunk saves where it is, anchors included", async () => {
+		let releaseGap: (() => void) | undefined;
+		let shutdown: Promise<void> | undefined;
+		let calls = 0;
+		const gapHandling = spyOn(terminalWatches, "interruptTextWatchesForGap").mockImplementation(
+			() =>
+				new Promise<void>((resolve) => {
+					releaseGap = resolve;
+				}),
+		);
+		const hasWatches = spyOn(terminalWatches, "hasTextWatches").mockReturnValue(true);
+		const checkNow = spyOn(terminalWatches, "checkTextWatchesNow").mockImplementation(
+			async (_id, buffer) => {
+				if (++calls !== 2) return;
+				// A watch registered between pieces, then a graceful shutdown.
+				const cursor = await buffer.markReadCursor();
+				if (!cursor) throw new Error("no cursor");
+				buffer.setDurableAnchor("bash_new", cursor, () => ({ version: 2 }));
+				shutdown = terminalService.shutdownAll();
+			},
+		);
+		try {
+			insertTerminal("t-durable", { deviceId: "dev-1", executorSessionId: "nf-term-t-durable" });
+			await terminalService.recoverOnStartup();
+			await until(() => attachStream !== undefined);
+			const encode = (text: string) => new TextEncoder().encode(text);
+			attachStream?.("session.gap", encode(JSON.stringify({ from: 0, to: 10 })));
+			let replay = "";
+			for (let i = 0; i < 5_100; i++) replay += `line ${i}\r\n`;
+			attachStream?.("session.data", encode(replay));
+			await until(() => releaseGap !== undefined);
+			releaseGap?.();
+			await until(() => shutdown !== undefined);
+			await shutdown;
+			// Saved at once, inside the chunk: the unchecked rest stays in the replay.
+			const saved = new BufferManager("t-durable");
+			await saved.loadFromDisk();
+			const contents = await saved.getContents();
+			const lines = [...contents.matchAll(/line (\d+)/g)].length;
+			expect(contents).not.toContain("line 5099");
+			expect(saved.restoredStreamSeq).toBe(
+				10 + encode(replay.split("\r\n").slice(0, lines).join("\r\n")).length + 2,
+			);
+			expect((await saved.takeRestoredAnchors()).map((anchor) => anchor.id)).toEqual(["bash_new"]);
+			await saved.dispose();
+		} finally {
+			gapHandling.mockRestore();
+			hasWatches.mockRestore();
+			checkNow.mockRestore();
+		}
+	});
+
+	test("held output is cut only where each piece decodes as in the whole chunk", async () => {
+		const { outputPieces } = await import("../terminal-service");
+		const encode = (text: string) => new TextEncoder().encode(text);
+		// Multibyte characters, an emoji, and an invalid byte, over many short lines.
+		const parts: Uint8Array[] = [];
+		for (let i = 0; i < 3_000; i++) parts.push(encode(`ü ${i} 😀\r\n`));
+		parts.push(new Uint8Array([0xff, 0x0a]));
+		for (let i = 0; i < 1_500; i++) parts.push(encode(`β${"x".repeat(200)}`));
+		const bytes = new Uint8Array(parts.reduce((n, part) => n + part.length, 0));
+		let at = 0;
+		for (const part of parts) {
+			bytes.set(part, at);
+			at += part.length;
+		}
+		const text = new TextDecoder().decode(bytes);
+		const end = 1_000 + bytes.length;
+		const pieces = outputPieces(text, end, bytes, 80);
+		expect(pieces.length).toBeGreaterThan(2);
+		expect(pieces.map((piece) => piece.text).join("")).toBe(text);
+		// Each piece ends at the exact byte position of the text up to it.
+		let consumed = 1_000;
+		for (const piece of pieces) {
+			consumed += encode(piece.text.replaceAll("\ufffd", "")).length;
+			if (piece.text.includes("\ufffd")) consumed += 1;
+			expect(piece.streamSeq).toBe(consumed);
+		}
+		expect(pieces.at(-1)?.streamSeq).toBe(end);
+		// Without the bytes the chunk stays whole.
+		expect(outputPieces(text, end, undefined, 80)).toEqual([{ text, streamSeq: end }]);
+	});
+
+	test("a byte-order mark at a piece boundary does not keep the chunk whole", async () => {
+		const { outputPieces } = await import("../terminal-service");
+		const encode = (text: string) => new TextEncoder().encode(text);
+		// 1000 lines, then a mark starting line 1001, then more lines than the scrollback.
+		let body = "";
+		for (let i = 0; i < 1_000; i++) body += `a${i}\n`;
+		const head = encode(body);
+		let tail = "";
+		for (let i = 0; i < 6_000; i++) tail += `b${i}\n`;
+		const bom = new Uint8Array([0xef, 0xbb, 0xbf]);
+		const rest = encode(tail);
+		const bytes = new Uint8Array(head.length + bom.length + rest.length);
+		bytes.set(head);
+		bytes.set(bom, head.length);
+		bytes.set(rest, head.length + bom.length);
+		// remote-session decodes the whole chunk in one call: only a leading mark is dropped.
+		const text = new TextDecoder().decode(bytes);
+		expect(text).toContain("\ufeffb0");
+		const pieces = outputPieces(text, bytes.length, bytes, 80);
+		expect(pieces.length).toBeGreaterThan(2);
+		expect(pieces[1]?.text.startsWith("\ufeffb0")).toBe(true);
+		expect(pieces.map((piece) => piece.text).join("")).toBe(text);
 	});
 
 	test("a closing terminal records its stop before the row is marked exited", async () => {

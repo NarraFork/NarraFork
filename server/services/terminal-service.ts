@@ -39,10 +39,13 @@ import {
 } from "./device-service";
 import { recordExecutorCleanup, stopExecutorSession } from "./executor-session-cleanup";
 import {
+	checkTextWatchesNow,
 	endWatchesForBuffer,
+	hasTextWatches,
 	interruptTextWatchesForGap,
 	interruptTextWatchesForRestart,
 	notifyTerminalOutput,
+	registerRestoredWatchAnchors,
 	suspendTerminalWatchesForShutdown,
 } from "./terminal-watch-service";
 import { assertLegacyRuntimeOwner } from "./worktree-resource-owner";
@@ -214,9 +217,11 @@ async function markTerminalExited(
 /**
  * Output held back while a gap is reported to text watches, so neither the
  * visible gap notice nor output after the hole can satisfy a pattern that was
- * being matched against output before it.
+ * being matched against output before it. Work queued while output is held (a
+ * second gap) runs in stream order: after the output received before it.
  */
-const heldOutput = new Map<string, Array<[string, number | undefined]>>();
+type HeldItem = [string, number | undefined, Uint8Array | undefined] | (() => Promise<void>);
+const heldOutput = new Map<string, HeldItem[]>();
 /** Settles once a gap's held output has been written back to the buffer. */
 const gapDrains = new Map<string, Promise<void>>();
 
@@ -231,19 +236,128 @@ function onRestartInterrupted(id: string, buffer: BufferManager, outcome: "lost"
 
 /** Hold later output (a notice included) back from the buffer while `work` runs. */
 function holdOutputWhile(id: string, buffer: BufferManager, work: () => Promise<void>) {
-	if (heldOutput.has(id)) return;
-	const held: Array<[string, number | undefined]> = [];
+	const queued = heldOutput.get(id);
+	if (queued) {
+		queued.push(work);
+		return;
+	}
+	const held: HeldItem[] = [];
 	heldOutput.set(id, held);
-	const drained = work()
-		.catch((error) =>
-			logger.warn("Terminal watch interruption failed", { terminalId: id, error: String(error) }),
-		)
-		.finally(() => {
-			heldOutput.delete(id);
-			if (gapDrains.get(id) === drained) gapDrains.delete(id);
-			for (const [text, streamSeq] of held) onData(id, buffer, text, streamSeq);
-		});
+	let drained: Promise<void> | undefined;
+	drained = (async () => {
+		for (let next: (() => Promise<void>) | undefined = work; next; ) {
+			await next().catch((error) =>
+				logger.warn("Terminal watch interruption failed", { terminalId: id, error: String(error) }),
+			);
+			next = undefined;
+			// Watches registered by the work (a restart's) see the text they start from
+			// before any held output can scroll it away.
+			await checkHeldWatches(id, buffer);
+			let rows = 0;
+			while (held.length > 0) {
+				const item = held.shift() as HeldItem;
+				if (typeof item === "function") {
+					next = item;
+					break;
+				}
+				for (const piece of outputPieces(item[0], item[1], item[2], buffer.cols)) {
+					applyPiece(id, buffer, piece);
+					rows += estimatedRows(piece.text, buffer.cols);
+					if (rows >= HELD_OUTPUT_CHECK_ROWS) {
+						rows = 0;
+						await checkHeldWatches(id, buffer);
+					}
+				}
+			}
+		}
+		heldOutput.delete(id);
+		if (gapDrains.get(id) === drained) gapDrains.delete(id);
+	})();
 	gapDrains.set(id, drained);
+}
+
+/**
+ * Rows of held output written back between two text watch checks: well under the
+ * scrollback, so a match cannot leave it unseen however much was held.
+ */
+const HELD_OUTPUT_CHECK_ROWS = 1_000;
+
+async function checkHeldWatches(id: string, buffer: BufferManager): Promise<void> {
+	if (!hasTextWatches(id, buffer)) return;
+	await checkTextWatchesNow(id, buffer).catch((error) =>
+		logger.warn("Terminal watch check failed", { terminalId: id, error: String(error) }),
+	);
+}
+
+/** Rows `text` takes at least: its line breaks plus wrapping of `cols`-wide rows. */
+function estimatedRows(text: string, cols: number): number {
+	let breaks = 0;
+	for (let at = text.indexOf("\n"); at !== -1; at = text.indexOf("\n", at + 1)) breaks++;
+	return breaks + Math.floor(text.length / Math.max(1, cols));
+}
+
+interface OutputPiece {
+	text: string;
+	streamSeq?: number;
+}
+
+/**
+ * One chunk of output cut into pieces of at most {@link HELD_OUTPUT_CHECK_ROWS}
+ * rows, each with its exact stream position, so a snapshot taken between pieces
+ * resumes at exactly what it contains. The cut is made in `bytes` (the complete
+ * UTF-8 the text was decoded from), before a line break's successor or a lead
+ * byte: either ends any sequence before it, so each piece decodes as it did in
+ * the whole. Without the bytes the chunk stays whole.
+ */
+export function outputPieces(
+	text: string,
+	streamSeq: number | undefined,
+	bytes: Uint8Array | undefined,
+	cols: number,
+): OutputPiece[] {
+	if (streamSeq === undefined || !bytes || estimatedRows(text, cols) < HELD_OUTPUT_CHECK_ROWS)
+		return [{ text, streamSeq }];
+	const pieces: OutputPiece[] = [];
+	const start = streamSeq - bytes.length;
+	// Decoded as remote-session decodes the whole chunk: a byte-order mark is dropped
+	// only at the chunk's start, and kept as text anywhere after it.
+	const keepBom = new TextDecoder("utf-8", { ignoreBOM: true });
+	for (const [from, to] of splitOutputBytes(bytes, cols))
+		pieces.push({
+			text: (from === 0 ? new TextDecoder() : keepBom).decode(bytes.subarray(from, to)),
+			streamSeq: start + to,
+		});
+	// Defensive: a cut must never change the text; keep the chunk whole if it would.
+	return pieces.map((piece) => piece.text).join("") === text ? pieces : [{ text, streamSeq }];
+}
+
+/** Byte ranges of at most {@link HELD_OUTPUT_CHECK_ROWS} rows, cut at safe boundaries. */
+export function splitOutputBytes(bytes: Uint8Array, cols: number): Array<[number, number]> {
+	const maxBytes = HELD_OUTPUT_CHECK_ROWS * Math.max(1, cols);
+	const ranges: Array<[number, number]> = [];
+	let from = 0;
+	while (from < bytes.length) {
+		let end = Math.min(bytes.length, from + maxBytes);
+		let breaks = 0;
+		for (let at = from; at < end; at++) {
+			if (bytes[at] === 0x0a && ++breaks >= HELD_OUTPUT_CHECK_ROWS) {
+				end = at + 1;
+				break;
+			}
+		}
+		// Never cut before a continuation byte.
+		while (end < bytes.length && end > from + 1 && (bytes[end] & 0xc0) === 0x80) end--;
+		ranges.push([from, end]);
+		from = end;
+	}
+	return ranges;
+}
+
+function applyPiece(id: string, buffer: BufferManager, piece: OutputPiece) {
+	if (!piece.text) return;
+	buffer.append(piece.text, piece.streamSeq);
+	sendToTerminal(id, { type: "output", terminalId: id, data: piece.text });
+	notifyTerminalOutput(id);
 }
 
 /** Wait until no output is held for a gap, so the buffer holds everything received. */
@@ -251,18 +365,20 @@ async function drainHeldOutput(id: string): Promise<void> {
 	for (let drained = gapDrains.get(id); drained; drained = gapDrains.get(id)) await drained;
 }
 
-function onData(id: string, buffer: BufferManager, data: string | Uint8Array, streamSeq?: number) {
+function onData(
+	id: string,
+	buffer: BufferManager,
+	data: string | Uint8Array,
+	streamSeq?: number,
+	bytes?: Uint8Array,
+) {
 	const text = typeof data === "string" ? data : new TextDecoder().decode(data);
 	const held = heldOutput.get(id);
 	if (held) {
-		if (text) held.push([text, streamSeq]);
+		if (text) held.push([text, streamSeq, bytes]);
 		return;
 	}
-	if (text) {
-		buffer.append(text, streamSeq);
-		sendToTerminal(id, { type: "output", terminalId: id, data: text });
-		notifyTerminalOutput(id);
-	}
+	applyPiece(id, buffer, { text, streamSeq });
 }
 
 /**
@@ -311,14 +427,19 @@ async function resumeExecutorSession(
 		buffer = createBufferManager(terminalId, undefined, undefined, () => runtime);
 	}
 	since ??= 0;
+	const anchors = await buffer.takeRestoredAnchors();
 	if (activeTerminals.has(terminalId)) {
 		await buffer.dispose();
 		return;
 	}
 	buffer.startPeriodicFlush();
+	// Text watches saved with the snapshot resume from it: hold the replayed output
+	// until restart recovery has re-registered them (or given them up).
+	const restoredWatches = registerRestoredWatchAnchors(terminalId, buffer, anchors);
+	if (restoredWatches) holdOutputWhile(terminalId, buffer, () => restoredWatches);
 	const resumed = spawnRemoteSession(deviceId, sessionId, {
 		since,
-		onData: (data, streamSeq) => onData(terminalId, buffer, data, streamSeq),
+		onData: (data, streamSeq, bytes) => onData(terminalId, buffer, data, streamSeq, bytes),
 		onGap: (missing) => onGap(terminalId, buffer, missing),
 		onRestartInterrupted: (outcome) => onRestartInterrupted(terminalId, buffer, outcome),
 	});
@@ -679,7 +800,7 @@ async function createTerminal(opts: CreateTerminalOptions) {
 				rows,
 			},
 			since: 0,
-			onData: (data, streamSeq) => onData(id, buffer, data, streamSeq),
+			onData: (data, streamSeq, bytes) => onData(id, buffer, data, streamSeq, bytes),
 			onGap: (missing) => onGap(id, buffer, missing),
 			onRestartInterrupted: (outcome) => onRestartInterrupted(id, buffer, outcome),
 		});
@@ -1376,7 +1497,8 @@ export const terminalService = {
 				(async () => {
 					if (active.executorSession) {
 						// The shell lives in the executor: save the snapshot (with its stream
-						// position) and stop reading. The row stays running for recovery.
+						// position) and stop reading. The row stays running for recovery. Saved
+						// right away: held output not yet written back stays in the replay.
 						await active.buffer.saveToDisk();
 						active.buffer.stopPeriodicFlush();
 						active.runtime.close();

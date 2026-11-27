@@ -94,8 +94,12 @@ export interface RemoteSessionOptions {
 	open?: RemotePtyOpen | RemoteExecOpen;
 	/** First unseen output byte when resuming (0 for a new session). */
 	since: number;
-	/** Output as text; a character split across chunks is held until complete. */
-	onData?: (data: string, streamSeq: number) => void;
+	/**
+	 * Output as text; a character split across chunks is held until complete.
+	 * `bytes` is the complete UTF-8 the text was decoded from, ending at
+	 * `streamSeq`; absent for NarraFork's own notices, which are not stream data.
+	 */
+	onData?: (data: string, streamSeq: number, bytes?: Uint8Array) => void;
 	/** Output as raw bytes, used instead of onData. */
 	onBytes?: (bytes: Uint8Array, streamSeq: number) => void;
 	/**
@@ -246,8 +250,9 @@ export function spawnRemoteSession(
 		consumed += chunk.length;
 		const tail = utf8IncompleteTail(joined);
 		carry = joined.slice(joined.length - tail);
-		const text = decoder.decode(joined.subarray(0, joined.length - tail));
-		if (text) opts.onData?.(text, consumed - carry.length);
+		const complete = joined.subarray(0, joined.length - tail);
+		const text = decoder.decode(complete);
+		if (text) opts.onData?.(text, consumed - carry.length, complete);
 	}
 
 	function onStream(channel: string, chunk: Uint8Array) {
