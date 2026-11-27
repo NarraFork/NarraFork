@@ -73,7 +73,7 @@ async function cloneOf(name: string, options: { filter?: string; promisor?: bool
 	return clone;
 }
 
-function serviceFor(root: string) {
+function serviceFor(root: string, extra: Partial<WorktreeServicePorts<string>> = {}) {
 	const target: WorktreeTarget = {
 		workspace: {
 			deviceId: "local",
@@ -110,6 +110,7 @@ function serviceFor(root: string) {
 				revision: 1,
 			}),
 		} as unknown as WorktreeRetirementPorts,
+		...extra,
 	};
 	return new NarratorWorktreeService(ports);
 }
@@ -226,23 +227,191 @@ describe("narrator worktrees on a partial clone", () => {
 		expect(ran()).toBe(false);
 	});
 
-	posixOnly("removal preflight names the refusal instead of an unmeasured loss", async () => {
+	posixOnly(
+		"removal preflight names the refusal as its blocker, not an unmeasured loss",
+		async () => {
+			const clone = await cloneOf("partial", { filter: "blob:none" });
+			const worktree = join(clone, ".worktrees", "existing");
+			await git(["worktree", "add", "-q", worktree, "other"], clone);
+			await rm(marker, { force: true });
+			setNoLazyFetchSupportForTests(false);
+			const service = serviceFor(clone);
+			const removal = { workspaceKey: "workspace", path: worktree };
+			const plan = await service.planRemoval("actor", "narrator", removal, signal());
+			expect(plan.status).toBe("blocked");
+			expect(plan.blockers.map((blocker) => blocker.code)).toEqual([
+				"GIT_TOO_OLD_FOR_PARTIAL_CLONE",
+			]);
+			await expect(
+				service.remove(
+					"actor",
+					"narrator",
+					{ ...removal, expectedRevision: plan.expectedRevision },
+					signal(),
+				),
+			).rejects.toMatchObject({ code: "GIT_TOO_OLD_FOR_PARTIAL_CLONE" });
+			expect(ran()).toBe(false);
+			// Refusing changes nothing on disk.
+			expect(existsSync(join(worktree, "other.txt"))).toBe(true);
+		},
+	);
+
+	posixOnly("a pruned checkout (no object read to measure) is blocked the same way", async () => {
 		const clone = await cloneOf("partial", { filter: "blob:none" });
-		const worktree = join(clone, ".worktrees", "existing");
+		const worktree = join(clone, ".worktrees", "gone");
 		await git(["worktree", "add", "-q", worktree, "other"], clone);
+		// The checkout directory disappeared outside NarraFork; its branch HEAD is not detached.
+		await rm(worktree, { recursive: true, force: true });
 		await rm(marker, { force: true });
 		setNoLazyFetchSupportForTests(false);
-		const plan = serviceFor(clone).planRemoval(
-			"actor",
-			"narrator",
-			{ workspaceKey: "workspace", path: worktree },
-			signal(),
+		const service = serviceFor(clone);
+		const removal = { workspaceKey: "workspace", path: worktree };
+		const plan = await service.planRemoval("actor", "narrator", removal, signal());
+		expect(plan.worktree.mode).toBe("prune");
+		expect(plan.status).toBe("blocked");
+		expect(plan.blockers.map((blocker) => blocker.code)).toEqual(["GIT_TOO_OLD_FOR_PARTIAL_CLONE"]);
+		// The same repository on a git that honours GIT_NO_LAZY_FETCH is ready to prune.
+		setNoLazyFetchSupportForTests(true);
+		expect((await service.planRemoval("actor", "narrator", removal, signal())).status).toBe(
+			"ready",
 		);
-		await expect(plan).rejects.toMatchObject({ code: "GIT_TOO_OLD_FOR_PARTIAL_CLONE" });
 		expect(ran()).toBe(false);
-		// Refusing changes nothing on disk.
-		expect(existsSync(join(worktree, "other.txt"))).toBe(true);
 	});
+
+	posixOnly("a promisor added right before the add is a clean, undispatched failure", async () => {
+		const clone = await cloneOf("full");
+		await rm(marker, { force: true });
+		setNoLazyFetchSupportForTests(false);
+		const calls: string[] = [];
+		const journal = new FileWorktreeJournal(join(temporary, "receipts-race"));
+		const service = serviceFor(clone, {
+			journal,
+			resources: {
+				// The last step before the durable "started" boundary and the add.
+				register: async () => {
+					calls.push("register");
+					await git(["config", "remote.origin.promisor", "true"], clone);
+					return { inserted: true };
+				},
+				setState: async (_resource, state) => {
+					calls.push(`state:${state}`);
+				},
+				releaseUndispatched: async () => {
+					calls.push("release");
+				},
+			},
+		});
+		const result = await service.create("actor", "narrator", request(clone), signal());
+		expect(result).toMatchObject({
+			outcome: "failed",
+			error: { code: "GIT_TOO_OLD_FOR_PARTIAL_CLONE" },
+		});
+		// No "unknown" row: the registration made for this attempt is released, never protected.
+		expect(calls).toEqual(["register", "release"]);
+		expect((await journal.read("narrator", "request-one"))?.dispatchState).toBe("not_started");
+		expect(existsSync(request(clone).destinationPath)).toBe(false);
+		expect(ran()).toBe(false);
+	});
+
+	posixOnly(
+		"an unverifiable receipt stays unknown but names the partial-clone refusal",
+		async () => {
+			const clone = await cloneOf("partial", { filter: "blob:none" });
+			const journal = new FileWorktreeJournal(join(temporary, "receipts-replay"));
+			const save = journal.save.bind(journal);
+			journal.save = async (...args) => {
+				if (args[2].result) throw new Error("Receipt storage failed after Git succeeded");
+				return save(...args);
+			};
+			setNoLazyFetchSupportForTests(true);
+			const first = await serviceFor(clone, { journal }).create(
+				"actor",
+				"narrator",
+				request(clone),
+				signal(),
+			);
+			expect(first.outcome).toBe("created");
+			journal.save = save;
+			await rm(marker, { force: true });
+			setNoLazyFetchSupportForTests(false);
+			const replay = await serviceFor(clone, { journal }).create(
+				"actor",
+				"narrator",
+				request(clone),
+				signal(),
+			);
+			expect(replay).toMatchObject({
+				outcome: "unknown",
+				error: { code: "GIT_TOO_OLD_FOR_PARTIAL_CLONE" },
+			});
+			expect(replay.error?.message).toContain("reuse this requestId");
+			expect(ran()).toBe(false);
+		},
+	);
+
+	posixOnly(
+		"a promisor added after the gate read the configuration still fetches nothing",
+		async () => {
+			const real = Bun.which("git");
+			if (!real) throw new Error("git is not on PATH");
+			const clone = await cloneOf("full");
+			// A worktree whose HEAD is a commit only upstream has: listing it reads that commit.
+			const later = join(temporary, "later");
+			await git(["worktree", "add", "-q", "-b", "later", later, "main"], upstream);
+			await git([...fixture, "commit", "-q", "--allow-empty", "-m", "later"], later);
+			const missing = await git(["rev-parse", "HEAD"], later);
+			const detached = join(clone, ".worktrees", "detached");
+			await git(["worktree", "add", "-q", "--detach", detached, "HEAD"], clone);
+			await writeFile(join(clone, ".git", "worktrees", "detached", "HEAD"), `${missing}\n`);
+			// An old git: GIT_NO_LAZY_FETCH is ignored. The promisor appears right after the gate's
+			// configuration read (check, then use).
+			const bin = join(temporary, "bin");
+			const injected = join(temporary, "injected");
+			await mkdir(bin);
+			await writeFile(
+				join(bin, "git"),
+				[
+					"#!/bin/sh",
+					"unset GIT_NO_LAZY_FETCH",
+					'case " $* " in',
+					'*" --get-regexp "*)',
+					`\t'${real}' "$@"; status=$?`,
+					`\tif [ ! -e '${injected}' ]; then touch '${injected}'; '${real}' -C '${clone}' config remote.origin.promisor true; fi`,
+					"\texit $status ;;",
+					"esac",
+					`exec '${real}' "$@"`,
+					"",
+				].join("\n"),
+			);
+			await chmod(join(bin, "git"), 0o755);
+			await rm(marker, { force: true });
+			setNoLazyFetchSupportForTests(false);
+			const path = process.env.PATH;
+			process.env.PATH = `${bin}:${path ?? ""}`;
+			try {
+				const listed = await serviceFor(clone).list(
+					"actor",
+					"narrator",
+					{ workspaceKey: "workspace" },
+					signal(),
+				);
+				expect(existsSync(injected)).toBe(true);
+				expect(listed.entries).toHaveLength(2);
+				expect(ran()).toBe(false);
+				// Control: the same read without the transport ban does fetch through the promisor.
+				const control = await safeSpawn({
+					cmd: ["git", "-C", clone, "show", "--no-walk", "--no-patch", "--format=%H", missing],
+					timeout: 20_000,
+					maxOutputBytes: 4096,
+					env: { ...process.env, PATH: process.env.PATH },
+				});
+				expect(control.exitCode).toBe(0);
+				expect(ran()).toBe(true);
+			} finally {
+				process.env.PATH = path;
+			}
+		},
+	);
 
 	posixOnly("a git that honours GIT_NO_LAZY_FETCH creates the worktree as before", async () => {
 		const clone = await cloneOf("partial", { filter: "blob:none" });

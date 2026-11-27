@@ -26,6 +26,7 @@ import {
 	GIT_NO_EXEC_CONFIG,
 	type GitConfiguredPrograms,
 	gitConfigEnv,
+	noTransportEnv,
 	PROGRAM_CONFIG_QUERY,
 	parseProgramConfig,
 	TRUE_HISTORY_ENV,
@@ -83,6 +84,18 @@ function isMetadataOnlyWorktreeCommand(args: readonly string[]): boolean {
 		(command) => command.length === args.length && command.every((arg, i) => arg === args[i]),
 	);
 }
+
+/**
+ * Failures of a command before git was spawned (its hardening or partial-clone gate refused):
+ * nothing ran, so a creation that fails this way was never dispatched.
+ */
+const failedBeforeSpawn = new WeakSet<object>();
+const markFailedBeforeSpawn = (cause: unknown): never => {
+	if (typeof cause === "object" && cause !== null) failedBeforeSpawn.add(cause);
+	throw cause;
+};
+const isPartialCloneRefusal = (cause: unknown): cause is AppError =>
+	cause instanceof AppError && cause.code === "GIT_TOO_OLD_FOR_PARTIAL_CLONE";
 
 /** ASCII filesystem leaf with an exact-ref hash; Git branch names remain unchanged. */
 export function worktreeDirectoryName(branchName: string): string {
@@ -830,21 +843,31 @@ export class NarratorWorktreeService<Principal> {
 		signal.throwIfAborted();
 		const operation = this.ports.runGit
 			? this.ports.runGit(target, args, signal, writing, scope, env)
-			: this.hardenedConfig(target, args, scope, writing, signal).then((config) =>
-					safeSpawn({
-						cmd: ["git", "--no-optional-locks", ...this.scopeArgv(target, scope, writing), ...args],
-						timeout: writing ? WORKTREE_CREATE_TIMEOUT_MS : WORKTREE_READ_TIMEOUT_MS,
-						maxOutputBytes: maxBytes,
-						killProcessTree: true,
-						env: {
-							...cleanGitEnv(),
-							// Keep the unsupported-option diagnostic stable across server locales.
-							LC_ALL: "C",
-							...(config ? gitConfigEnv(config) : {}),
-							...env,
-						},
-						signal,
-					}),
+			: this.hardenedConfig(target, args, scope, writing, signal, markFailedBeforeSpawn).then(
+					(config) =>
+						safeSpawn({
+							cmd: [
+								"git",
+								"--no-optional-locks",
+								...this.scopeArgv(target, scope, writing),
+								...args,
+							],
+							timeout: writing ? WORKTREE_CREATE_TIMEOUT_MS : WORKTREE_READ_TIMEOUT_MS,
+							maxOutputBytes: maxBytes,
+							killProcessTree: true,
+							env: {
+								...cleanGitEnv(),
+								// Keep the unsupported-option diagnostic stable across server locales.
+								LC_ALL: "C",
+								...(config ? gitConfigEnv(config) : {}),
+								// While lazy fetching is not prevented, a hardened command (never
+								// `worktree add`) can use no transport at all: a promisor remote added
+								// after the gate read the configuration still cannot be fetched from.
+								...(config ? noTransportEnv() : {}),
+								...env,
+							},
+							signal,
+						}),
 				);
 		const result = writing ? await operation : await abortableRead(operation, signal);
 		signal.throwIfAborted();
@@ -875,25 +898,46 @@ export class NarratorWorktreeService<Principal> {
 		scope: WorktreeGitScope,
 		writing: boolean,
 		signal: AbortSignal,
+		/** Every refusal goes through it (`run` marks it as "nothing was spawned"). */
+		refuse: (cause: unknown) => never = (cause) => {
+			throw cause;
+		},
 	): Promise<Array<readonly [string, string]> | null> {
-		const gate = () =>
-			ensureNoUnguardedLazyFetch(() =>
-				this.configuredPrograms(target, scope, writing, [...GIT_NO_EXEC_CONFIG], signal),
-			);
-		if (args[0] === "worktree" && args[1] === "add") {
-			await gate();
-			return null;
+		try {
+			if (args[0] === "worktree" && args[1] === "add") {
+				await this.lazyFetchGate(target, scope, writing, signal);
+				return null;
+			}
+			// Fail closed: a git that ignores the overrides would run everything they disable.
+			await ensureConfigOverridesHonored();
+			const config: Array<readonly [string, string]> = [...GIT_NO_EXEC_CONFIG];
+			if (args[0] !== "status" && !(args[0] === "worktree" && args[1] === "remove")) {
+				if (!isMetadataOnlyWorktreeCommand(args))
+					await this.lazyFetchGate(target, scope, writing, signal);
+				return config;
+			}
+			// Refuses a partial clone itself where lazy fetching is not prevented.
+			const programs = await this.configuredPrograms(target, scope, writing, config, signal);
+			return [...config, ...untrustedProgramOverrides(programs)];
+		} catch (cause) {
+			return refuse(cause);
 		}
-		// Fail closed: a git that ignores the overrides would run everything they disable.
-		await ensureConfigOverridesHonored();
-		const config: Array<readonly [string, string]> = [...GIT_NO_EXEC_CONFIG];
-		if (args[0] !== "status" && !(args[0] === "worktree" && args[1] === "remove")) {
-			if (!isMetadataOnlyWorktreeCommand(args)) await gate();
-			return config;
-		}
-		// Refuses a partial clone itself where lazy fetching is not prevented.
-		const programs = await this.configuredPrograms(target, scope, writing, config, signal);
-		return [...config, ...untrustedProgramOverrides(programs)];
+	}
+
+	/**
+	 * The partial-clone gate alone (`ensureNoUnguardedLazyFetch`), where a command of `scope`
+	 * would run. A `runGit` fixture has no hardening, so it has no gate either.
+	 */
+	private async lazyFetchGate(
+		target: WorktreeTarget,
+		scope: WorktreeGitScope,
+		writing: boolean,
+		signal: AbortSignal,
+	): Promise<void> {
+		if (this.ports.runGit) return;
+		await ensureNoUnguardedLazyFetch(() =>
+			this.configuredPrograms(target, scope, writing, [...GIT_NO_EXEC_CONFIG], signal),
+		);
 	}
 
 	/** {@link PROGRAM_CONFIG_QUERY} where the command runs: configuration only, never an object. */
@@ -918,6 +962,7 @@ export class NarratorWorktreeService<Principal> {
 				...cleanGitEnv(),
 				LC_ALL: "C",
 				...gitConfigEnv(config),
+				...noTransportEnv(),
 			},
 			signal,
 		});
@@ -1393,7 +1438,13 @@ export class NarratorWorktreeService<Principal> {
 			requestorId: narratorId,
 			signal,
 		});
-		const loss = await this.measureLoss(target, entry, worktreePath, present, signal);
+		// Remove and prune read objects (`status`, `rev-list`, `worktree remove`, which runs a
+		// status): a partial clone this git cannot keep from fetching lazily is a blocker, found
+		// here before any runtime is torn down — even when no measurement below reads an object.
+		const partialClone = entry ? await this.partialCloneRefused(target, signal) : false;
+		const loss = partialClone
+			? null
+			: await this.measureLoss(target, entry, worktreePath, present, signal);
 		const dirtyFileCount = loss?.dirtyFileCount ?? 0;
 		// Every dependent has to go somewhere. A linked checkout's `repositoryPath` is the
 		// Git directory, never a usable working directory, so the target is derived from
@@ -1459,7 +1510,8 @@ export class NarratorWorktreeService<Principal> {
 				),
 			);
 		// An unanswered loss question is a refusal, never "nothing to lose".
-		if (!loss) blockers.push(removalBlocker("WORKTREE_REMOVAL_STATUS_UNAVAILABLE"));
+		if (partialClone) blockers.push(removalBlocker("GIT_TOO_OLD_FOR_PARTIAL_CLONE"));
+		else if (!loss) blockers.push(removalBlocker("WORKTREE_REMOVAL_STATUS_UNAVAILABLE"));
 		if (loss && (loss.dirtyFileCount > 0 || !loss.dirtyExact || loss.unreachableCommits > 0))
 			confirmations.push("force");
 		if (entry && !inspection.registration) confirmations.push("acknowledgeUnregistered");
@@ -1491,6 +1543,23 @@ export class NarratorWorktreeService<Principal> {
 			confirmations,
 			relocateTo,
 		};
+	}
+
+	/** Whether the partial-clone gate refuses the repository; any other failure propagates. */
+	private async partialCloneRefused(target: WorktreeTarget, signal: AbortSignal) {
+		try {
+			// Addressed by `--git-dir` when known: the checkout being removed may be gone.
+			await this.lazyFetchGate(
+				target,
+				target.repositoryPath ? { kind: "repository" } : { kind: "workspace" },
+				false,
+				signal,
+			);
+			return false;
+		} catch (cause) {
+			if (isPartialCloneRefusal(cause)) return true;
+			throw cause;
+		}
 	}
 
 	private async removeLocked(
@@ -1805,8 +1874,6 @@ export class NarratorWorktreeService<Principal> {
 			return { dirtyFileCount: changes.count, dirtyExact: changes.exact, unreachableCommits };
 		} catch (cause) {
 			signal.throwIfAborted();
-			// A partial clone this git cannot keep from fetching lazily: say so, not "unavailable".
-			if (cause instanceof AppError && cause.code === "GIT_TOO_OLD_FOR_PARTIAL_CLONE") throw cause;
 			logger.warn("Worktree removal could not measure what would be lost", {
 				reason: String(cause).slice(0, 256),
 			});
@@ -2143,6 +2210,7 @@ export class NarratorWorktreeService<Principal> {
 		const signal = AbortSignal.timeout(WORKTREE_READ_TIMEOUT_MS);
 		let destinationExists: boolean | null = null;
 		let branchExists: boolean | null = null;
+		let refusal: AppError | undefined;
 		try {
 			const branchName = record.branchName ?? record.request.branch.name;
 			if (!branchName) throw new Error("Pending receipt has no frozen branch name");
@@ -2232,18 +2300,20 @@ export class NarratorWorktreeService<Principal> {
 						message: "No matching registered worktree; residual files or branch are left untouched",
 					},
 				};
-		} catch {
+		} catch (cause) {
 			// An inaccessible repository, truncated evidence or lost runtime is not proof of failure.
+			// A partial clone this git cannot keep from fetching lazily is named, still unknown.
+			if (isPartialCloneRefusal(cause)) refusal = cause;
 		}
+		const unverified =
+			"Creation outcome could not be verified; reuse this requestId, do not blindly retry or clean up";
 		return {
 			outcome: "unknown",
 			worktree: null,
 			residuals: { destinationExists, branchExists },
-			error: {
-				code: "WORKTREE_OUTCOME_UNKNOWN",
-				message:
-					"Creation outcome could not be verified; reuse this requestId, do not blindly retry or clean up",
-			},
+			error: refusal
+				? { code: refusal.code, message: `${refusal.message}. ${unverified}`.slice(0, 1024) }
+				: { code: "WORKTREE_OUTCOME_UNKNOWN", message: unverified },
 		};
 	}
 
@@ -2479,6 +2549,9 @@ export class NarratorWorktreeService<Principal> {
 						error("GIT_WORKSPACE_CHANGED", "Repository or backend changed before write", 409);
 					await this.verifyIdentity(fresh, signal);
 					await this.requireDestination(principal, narratorId, fresh, record.destination, signal);
+					// Refused before any durable "started" boundary or resource registration; the
+					// add re-checks right before it spawns (`hardenedConfig`).
+					await this.lazyFetchGate(fresh, { kind: "workspace" }, true, signal);
 					// Durable protection is admitted under the same lock used by storage cleanup.
 					// A fresh receipt may reuse historical inventory after receipt loss. Only this
 					// register call's actual INSERT may be retracted before Git dispatch.
@@ -2504,7 +2577,13 @@ export class NarratorWorktreeService<Principal> {
 					await this.ports.journal.save(narratorId, request.requestId, record);
 					signal.throwIfAborted();
 					dispatched = true;
-					const execution = await this.run(fresh, args, signal, true);
+					const execution = await this.run(fresh, args, signal, true).catch((cause) => {
+						// Refused before git was spawned (say, a promisor remote added since the
+						// check above): nothing was dispatched after all.
+						if (typeof cause === "object" && cause !== null && failedBeforeSpawn.has(cause))
+							dispatched = false;
+						throw cause;
+					});
 					record.commandSucceeded = execution.exitCode === 0;
 					result = await this.reconcile(fresh, record);
 				} catch (cause) {

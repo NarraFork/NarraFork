@@ -12,6 +12,7 @@ import {
 	ensureConfigOverridesHonored,
 	ensureNoUnguardedLazyFetch,
 	gitConfigEnv,
+	noTransportEnv,
 	PROGRAM_CONFIG_QUERY,
 	parseProgramConfig,
 	probeLazyFetch,
@@ -23,6 +24,7 @@ import {
 	untrustedProgramOverrides,
 } from "../git-exec-hardening";
 import { DEV_NULL } from "../platform";
+import { safeSpawn } from "../spawn";
 
 afterEach(() => {
 	setGitHardeningProbeForTests(null);
@@ -131,6 +133,7 @@ describe("git exec hardening", () => {
 		try {
 			await ensureNoUnguardedLazyFetch(programs(PROMISOR));
 			expect(reads).toBe(0);
+			expect(noTransportEnv()).toEqual({});
 		} finally {
 			setNoLazyFetchSupportForTests(null);
 		}
@@ -144,6 +147,17 @@ describe("git exec hardening", () => {
 				expect.objectContaining({ code: "GIT_TOO_OLD_FOR_PARTIAL_CLONE" }),
 			);
 			expect(reads).toBe(3);
+			// Check, then use: a read-only command may use no transport at all meanwhile.
+			expect(noTransportEnv()).toEqual({ GIT_ALLOW_PROTOCOL: "" });
+			const denied = await safeSpawn({
+				cmd: ["git", "ls-remote", `file://${tmpdir()}`],
+				cwd: tmpdir(),
+				env: { ...cleanGitEnv(), ...noTransportEnv() },
+				timeout: 10_000,
+				maxOutputBytes: 4096,
+			});
+			expect(denied.exitCode).not.toBe(0);
+			expect(denied.stderr).toContain("not allowed");
 		} finally {
 			setNoLazyFetchSupportForTests(null);
 		}

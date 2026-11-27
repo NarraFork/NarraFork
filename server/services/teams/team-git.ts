@@ -36,6 +36,7 @@ import {
 	type GitConfiguredPrograms,
 	gitConfigEnv,
 	noExternalDiffArgs,
+	noTransportEnv,
 	PROGRAM_CONFIG_QUERY,
 	parseProgramConfig,
 	TRUE_HISTORY_ENV,
@@ -138,6 +139,9 @@ async function spawnGitUngated(
 			GIT_TERMINAL_PROMPT: "0",
 			LC_ALL: "C",
 			...gitConfigEnv(config),
+			// Every command here is a read: while lazy fetching is not prevented, no transport
+			// at all (`noTransportEnv`), whatever the repository configured after the gate.
+			...noTransportEnv(),
 			// Replacement refs and grafts are never read (`TRUE_HISTORY_ENV`).
 			...TRUE_HISTORY_ENV,
 		},

@@ -287,6 +287,20 @@ const noLazyFetchSupported = () => lazyFetchVerdict === "supported";
 export const lazyFetchPrevented = (): boolean => noLazyFetchSupported();
 
 /**
+ * Environment for a hardened command that never needs the network, while lazy fetching is not
+ * prevented: `GIT_ALLOW_PROTOCOL` set to an empty list allows no transport at all. The partial-
+ * clone gate checks the configuration and the command then uses it; a promisor remote added in
+ * between still cannot be fetched from. The variable, not `protocol.allow=never`: git consults
+ * it before any `protocol.*` configuration, whereas a repository's own `protocol.<name>.allow`
+ * beats a command-scope `protocol.allow`. Empty (inherited setting kept) on a git that honours
+ * `GIT_NO_LAZY_FETCH`. Never for a command that fetches or pushes, or one that runs the
+ * repository's own hooks (`worktree add`).
+ */
+export function noTransportEnv(): Record<string, string> {
+	return lazyFetchPrevented() ? {} : { GIT_ALLOW_PROTOCOL: "" };
+}
+
+/**
  * The partial-clone gate a server git command passes before it reads any object of a repository
  * the server does not own: git honours the configuration overrides
  * ({@link ensureConfigOverridesHonored}), and — unless this git is known to honour

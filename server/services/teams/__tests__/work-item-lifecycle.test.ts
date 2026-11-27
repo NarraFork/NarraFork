@@ -28,7 +28,10 @@ import { db, sqlite } from "../../../db";
 import { narratorWorktreeResources, teamWorkEvents, teamWorkItems } from "../../../db/schema";
 import { LocalBackend } from "../../../lib/agent/execution/local-backend";
 import { eventBus } from "../../../lib/event-bus";
-import { setGitHardeningProbeForTests } from "../../../lib/git-exec-hardening";
+import {
+	setGitHardeningProbeForTests,
+	setNoLazyFetchSupportForTests,
+} from "../../../lib/git-exec-hardening";
 import { generateId } from "../../../lib/id";
 import { safeSpawn } from "../../../lib/spawn";
 import {
@@ -824,6 +827,37 @@ describe("cleanup", () => {
 			actorKind: "agent",
 			detail: { reason: "superseded", from: "queued" },
 		});
+	});
+});
+
+describe("cleanup on a partial clone", () => {
+	test("without lazy-fetch protection the refusal is recorded as a work.cleanup event", async () => {
+		const item = await create("Partial");
+		const path = worktreePathOf(item) ?? "";
+		cancelWorkItem({ coordinatorId: LEAD, itemId: item.id, actor: agent });
+		await git(["config", "remote.evil.url", join(temporary, "nowhere.git")]);
+		await git(["config", "remote.evil.promisor", "true"]);
+		setNoLazyFetchSupportForTests(false);
+		try {
+			const refused = await cleanupWorkItem({
+				coordinatorId: LEAD,
+				itemId: item.id,
+				principal,
+				actor: agent,
+				signal: signal(),
+			});
+			expect(refused).toMatchObject({
+				outcome: "refused",
+				code: "GIT_TOO_OLD_FOR_PARTIAL_CLONE",
+			});
+			expect(existsSync(path)).toBe(true);
+			expect(events(item.id).find((event) => event.kind === "work.cleanup")?.detail).toMatchObject({
+				outcome: "refused",
+				code: "GIT_TOO_OLD_FOR_PARTIAL_CLONE",
+			});
+		} finally {
+			setNoLazyFetchSupportForTests(null);
+		}
 	});
 });
 
