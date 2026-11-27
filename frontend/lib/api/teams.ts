@@ -19,6 +19,7 @@ import type {
 	TeamWorkReturnResponse,
 	TeamWorkStatsResponse,
 } from "@shared/project-teams";
+import { TEAM_CONVERSATION_EVENT_KINDS } from "@shared/project-teams";
 import { request } from "./client";
 
 const teamBase = (projectId: string, teamId: string) =>
@@ -101,6 +102,22 @@ export const teamsApi = {
 		),
 	getTeamActivity: (projectId: string, teamId: string, cursor?: string) =>
 		request<TeamActivityPage>(`${teamBase(projectId, teamId)}/events${query({ cursor })}`),
+	/**
+	 * The coordinator conversation's dividers (team mode): the fixed divider kinds since the
+	 * oldest loaded message, newest first, with each detail cut to what a divider reads.
+	 */
+	getTeamConversationEvents: (
+		projectId: string,
+		teamId: string,
+		options: { since?: string; cursor?: string },
+	) =>
+		request<TeamActivityPage>(
+			`${teamBase(projectId, teamId)}/events${query({
+				kinds: TEAM_CONVERSATION_EVENT_KINDS.join(","),
+				since: options.since,
+				cursor: options.cursor,
+			})}`,
+		),
 	getTeamApprovals: (projectId: string, teamId: string) =>
 		request<TeamApprovalsResponse>(`${teamBase(projectId, teamId)}/approvals`),
 	/** The team's people: members and onlookers, with when each last spoke (M1). */

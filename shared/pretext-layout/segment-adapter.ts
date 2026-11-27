@@ -880,7 +880,12 @@ export type AdapterRenderUnit =
 			key: string;
 			items: AdapterActivityInput[];
 			sourceMessages: AdapterMessage[];
-	  };
+	  }
+	/**
+	 * A ready-made element supplied by an opt-in host transform (the team page's chips and
+	 * dividers). Passed through as its own top-level unit; the default build never emits one.
+	 */
+	| { kind: "element"; spec: ElementSpec };
 
 /** One element to measure/render: which registry kind + its measure input. */
 export interface ElementSpec {
@@ -6270,6 +6275,9 @@ export function adaptRenderUnits(
 		const unitFirstIndex = out.length;
 		if (unit.kind === "activity") {
 			out.push(adaptActivityUnit(unit.items, unit.key, ctx));
+			previousCard = undefined;
+		} else if (unit.kind === "element") {
+			out.push(unit.spec);
 			previousCard = undefined;
 		} else if (isAssistantCardSegment(unit.seg)) {
 			previousCard = appendCardSpecs(out, adaptSegment(unit.seg, ctx), previousCard);

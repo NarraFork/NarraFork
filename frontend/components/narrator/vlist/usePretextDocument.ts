@@ -27,6 +27,7 @@ import {
 	type PretextLayoutCoordinatorSnapshot,
 } from "./pretext-layout-coordinator";
 import { onPretextSessionChange, pretextSessionEpoch } from "./pretext-session-scope";
+import type { TeamConversationLayoutOptions } from "./team-conversation-transform";
 import type { VListItem } from "./vlist-pipeline";
 import type { ResizePermissionResolver } from "./vlist-resize-permission";
 import { indexWithHeightOverrides } from "./vlist-resize-preview";
@@ -105,6 +106,8 @@ export interface UsePretextDocumentOptions {
 	 * buildPretextDocumentLayout) so a language switch re-measures localized text
 	 * instead of reusing the previous language's cached geometry. */
 	labelsRevision?: string;
+	/** Team page only: chips and dividers (see `buildPretextDocumentLayout`). */
+	teamConversation?: TeamConversationLayoutOptions;
 	resolveToolCategory?: (toolName: string, input?: unknown) => string;
 	resolveToolColor?: (toolName: string, input?: unknown) => string;
 	/** Authoritative header summary (tool-display.getSummary), so truncated inputs
@@ -449,8 +452,11 @@ export function usePretextDocument(
 			showTokenUsage: options.showTokenUsage,
 			compactUsageLines: options.compactUsageLines,
 			formatUsageNumber: options.formatUsageNumber,
+			...(options.teamConversation ? { teamConversation: options.teamConversation } : {}),
 		}),
 		[
+			// Team page only: new events or labels re-place the dividers and chips.
+			options.teamConversation,
 			options.keepEmptyReasoningLive,
 			// An outline session's backend arriving unpins its old tasks card: a structural change.
 			options.pinLatestSpecTasks,

@@ -36,6 +36,8 @@ const ANCILLARY_JUMP_ROW_KINDS: ReadonlySet<string> = new Set([
 	"turn-usage",
 	"inline-permission",
 	"ask-user-question",
+	"team-chip",
+	"team-event",
 ]);
 
 function isAncillaryJumpRowKind(kind: string | null | undefined): boolean {

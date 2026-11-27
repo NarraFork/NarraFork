@@ -1476,6 +1476,11 @@ export class PretextLayoutCoordinator {
 		const messages = this.layoutMessages(input, buildOptions);
 		return buildPretextDocumentLayout(messages as unknown as NarratorMsg[], {
 			...buildOptions,
+			// Team mode (team page only) places dividers against the loaded window: events
+			// older than its first message wait for the page that holds them.
+			...(buildOptions.teamConversation
+				? { teamConversation: { ...buildOptions.teamConversation, hasPrev: input.hasPrev } }
+				: {}),
 			segmentationCache: this.segmentationCache,
 			measure: this.measure,
 			// The loaded-message count keeps the revision distinct as the window

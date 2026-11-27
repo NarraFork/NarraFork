@@ -20,6 +20,7 @@ import type { NarratorMsg } from "../narrator-panel-types";
 import { groupRenderUnits, type RenderUnit } from "../trace/render-units";
 import type { RenderLod } from "./prepared-block";
 import { buildPretextLayoutManifest } from "./pretext-layout-manifest";
+import { measureElementCached } from "./registry";
 import type {
 	AdapterActivityInput,
 	AdapterMessage,
@@ -27,6 +28,10 @@ import type {
 	AdapterSegment,
 	ElementSpec,
 } from "./segment-adapter";
+import {
+	applyTeamConversationMode,
+	type TeamConversationLayoutOptions,
+} from "./team-conversation-transform";
 import type { VListItem } from "./vlist-pipeline";
 import { findLatestSpecTasksToolUseIdInMessages } from "./vlist-spec-tasks-pin";
 
@@ -119,6 +124,12 @@ export interface BuildPretextDocumentLayoutOptions {
 	compactUsageLines?: boolean;
 	/** Locale-aware number grouping for the usage rows. */
 	formatUsageNumber?: (value: number) => string;
+	/**
+	 * Team page only: fold the coordinator's `Team` calls into chips and show team events as
+	 * dividers (`team-conversation-transform.ts`). Absent everywhere else, and then the
+	 * transform is never called.
+	 */
+	teamConversation?: TeamConversationLayoutOptions;
 }
 
 export interface BuiltPretextDocumentLayout {
@@ -290,8 +301,11 @@ function buildSourceResolver(
 	renderUnits: readonly RenderUnit[],
 	messages: readonly SourceMessage[],
 	compactAuxiliaryContent = false,
+	extraSources?: ReadonlyMap<string, readonly SourceMessage[]>,
 ): (spec: ElementSpec, itemIndex: number) => ReturnType<typeof sourceForMessages> {
 	const exact = new Map<string, SourceMessage[]>();
+	// Team mode's chips and dividers: registered first so the units' own keys win.
+	if (extraSources) for (const [key, owners] of extraSources) exact.set(key, [...owners]);
 	if (compactAuxiliaryContent) {
 		for (const message of messages) {
 			for (const view of auxiliaryContentViews(message)) {
@@ -432,7 +446,7 @@ export function buildPretextDocumentLayout(
 			latestSpecTasksToolUseId != null ? new Set([latestSpecTasksToolUseId]) : undefined,
 	};
 	const renderUnits = groupRenderUnits(segments, options.lod <= 2, groupingOptions);
-	const adapterUnits: AdapterRenderUnit[] = renderUnits.map((unit, index) =>
+	const groupedUnits: AdapterRenderUnit[] = renderUnits.map((unit, index) =>
 		unit.kind === "activity"
 			? {
 					kind: "activity",
@@ -442,6 +456,15 @@ export function buildPretextDocumentLayout(
 				}
 			: { kind: "segment", seg: unit.seg as unknown as AdapterSegment },
 	);
+	// Team page only (opt-in): chips and dividers. The default build skips this entirely.
+	const team = options.teamConversation
+		? applyTeamConversationMode(groupedUnits, options.teamConversation, {
+				lod: options.lod,
+				isExpanded: options.isExpanded,
+				hasPendingPermission: options.resolveHasPendingPermission,
+			})
+		: null;
+	const adapterUnits = team ? team.units : groupedUnits;
 	/**
 	 * Which activity group each morphable identity belongs to — computed at EVERY level.
 	 *
@@ -501,6 +524,7 @@ export function buildPretextDocumentLayout(
 		renderUnits,
 		sourceMessages,
 		options.compactAuxiliaryContent,
+		team?.sources as ReadonlyMap<string, readonly SourceMessage[]> | undefined,
 	);
 	const recentMessageIds =
 		options.recentMessageIds ??
@@ -512,11 +536,21 @@ export function buildPretextDocumentLayout(
 	const labelRevision = options.labelsRevision
 		? `${options.documentRevision}~l:${options.labelsRevision}`
 		: options.documentRevision;
-	const documentRevision = options.compactAuxiliaryContent
-		? `${labelRevision}~aux:1`
-		: labelRevision;
+	const auxRevision = options.compactAuxiliaryContent ? `${labelRevision}~aux:1` : labelRevision;
+	// Team mode: a new divider is a structural change, so the MANIFEST identity moves with the
+	// events (the fold capture must not survive it). The measure cache keeps the plain revision:
+	// the chips and dividers key their own text, and an event must not re-measure every row.
+	const documentRevision = options.teamConversation
+		? `${auxRevision}~team:${options.teamConversation.revision}`
+		: auxRevision;
+	const baseMeasure = options.measure ?? measureElementCached;
+	const measure: MeasureElement | undefined = options.teamConversation
+		? (kind, data, width, lod, opts, key) =>
+				baseMeasure(kind, data, width, lod, opts, key, auxRevision)
+		: options.measure;
 	const built = buildPretextLayoutManifest({
 		...options,
+		measure,
 		documentRevision,
 		recentMessageIds,
 		// Frozen per build: the fold gates above already consumed this same id,

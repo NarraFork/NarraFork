@@ -230,6 +230,8 @@ projectTeamRoutes.get("/:projectId/teams/:teamId/events", async (c) => {
 	const parsed = teamActivityQuerySchema.safeParse({
 		limit: c.req.query("limit") ?? undefined,
 		cursor: c.req.query("cursor") ?? undefined,
+		kinds: c.req.query("kinds") ?? undefined,
+		since: c.req.query("since") ?? undefined,
 	});
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	c.header("Cache-Control", "no-store");
