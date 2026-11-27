@@ -762,6 +762,49 @@ export async function interruptTextWatchesForGap(
 	buffer: BufferManager,
 	missingBytes: number,
 ): Promise<void> {
+	await interruptTextWatches(
+		terminalId,
+		buffer,
+		(watch) =>
+			`${missingBytes} bytes of output from terminal "${watch.terminalName}" were lost while its device was disconnected`,
+	);
+}
+
+/**
+ * The device's executor restarted under a terminal: its recorded output has been
+ * replayed, but what follows (a notice, then the end) is not the shell's. Each text
+ * watch gets a last check against the real output; one that has not matched ends
+ * saying its text may have been printed without being recorded.
+ */
+export async function interruptTextWatchesForRestart(
+	terminalId: string,
+	buffer: BufferManager,
+	outcome: "lost" | "incomplete",
+): Promise<void> {
+	await interruptTextWatches(
+		terminalId,
+		buffer,
+		(watch) =>
+			outcome === "lost"
+				? `the device's executor restarted while terminal "${watch.terminalName}" was running, and output after its last recorded byte was not kept`
+				: `the device could not record all output from terminal "${watch.terminalName}" before its executor restarted`,
+		// One notice per watcher for the restart, but not the terminal's ending key: a
+		// watch for the terminal's exit still reports that on its own.
+		"interrupted by an executor restart",
+	);
+}
+
+/**
+ * Output before an interruption still matches; an unmatched text watch then ends
+ * with `cause`, never on a notice or output that follows the interruption.
+ */
+async function interruptTextWatches(
+	terminalId: string,
+	buffer: BufferManager,
+	cause: (watch: Watch) => string,
+	/** Watches ended by one interruption share one notice per watcher under this key. */
+	sharedKey?: string,
+): Promise<void> {
 	const current = [...(byTerminal.get(terminalId) ?? [])]
 		.map((id) => watches.get(id))
 		.filter(
@@ -777,7 +820,8 @@ export async function interruptTextWatchesForGap(
 		void settle(
 			watch,
 			"failed",
-			`Terminal watch ended: ${missingBytes} bytes of output from terminal "${watch.terminalName}" were lost while its device was disconnected, so ${JSON.stringify(watch.pattern)} may have appeared without being observed. Read the terminal before continuing; do not resend input automatically.`,
+			`Terminal watch ended: ${cause(watch)}, so ${JSON.stringify(watch.pattern)} may have appeared without being observed. Read the terminal before continuing; do not resend input automatically.`,
+			sharedKey && watch.buffer ? `${endedKey(watch)} ${sharedKey}` : undefined,
 		);
 	}
 }

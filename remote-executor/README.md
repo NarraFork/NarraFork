@@ -101,7 +101,8 @@ Configuration can also come from environment variables
 `NARRAFORK_EXECUTOR_TOKEN`, `NARRAFORK_EXECUTOR_TOKEN_FILE`,
 `NARRAFORK_EXECUTOR_TOKEN_STDIN`, `NARRAFORK_EXECUTOR_ALLOW_ROOTS`,
 `NARRAFORK_EXECUTOR_LISTEN`, `NARRAFORK_EXECUTOR_TLS_CERT`,
-`NARRAFORK_EXECUTOR_TLS_KEY`, `NARRAFORK_EXECUTOR_DISABLE_SHELL`) or a JSON file
+`NARRAFORK_EXECUTOR_TLS_KEY`, `NARRAFORK_EXECUTOR_DISABLE_SHELL`,
+`NARRAFORK_EXECUTOR_STATE_DIR`) or a JSON file
 passed with `--config`. Precedence is flags > environment > config file. Within
 one layer, configure exactly one of token, token-file, or token-stdin.
 
@@ -139,6 +140,7 @@ TLS; bind to `127.0.0.1` or `[::1]` only when NarraFork connects locally.
 | `--tls-cert` / `--tls-key` | Direct-mode TLS certificate and private key PEM files. |
 | `--allow-root` | Comma-separated roots for structured filesystem/transfer/search paths and Git/command working directories. Symlink/junction targets are resolved before containment checks. **This is not a process sandbox.** |
 | `--disable-shell` | Disable the general `exec.start` (Bash), `pty.open` and `session.*` command surfaces. Git and filesystem RPCs remain available. |
+| `--state-dir` | Where durable session records (output and exit) are kept, so a restarted executor still serves them. Default: `$XDG_STATE_HOME/narrafork-executor` (or `~/.local/state/narrafork-executor`) on Linux, `~/Library/Application Support/narrafork-executor` on macOS, `%LOCALAPPDATA%\narrafork-executor` on Windows; one subdirectory per device. Env: `NARRAFORK_EXECUTOR_STATE_DIR`; config: `stateDir`. |
 | `--cwd` | Default working directory reported to the server |
 | `--insecure` | Skip TLS certificate verification (self-signed reverse-dial servers only) |
 

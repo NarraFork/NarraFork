@@ -301,6 +301,35 @@ describe("remote terminals backed by executor sessions", () => {
 		}
 	});
 
+	test("an executor restart settles text watches before its notice reaches the buffer", async () => {
+		const settled: Array<{ outcome: string; content: string }> = [];
+		const restartHandling = spyOn(
+			terminalWatches,
+			"interruptTextWatchesForRestart",
+		).mockImplementation(async (_id, buffer, outcome) => {
+			settled.push({ outcome, content: await buffer.getContents() });
+		});
+		try {
+			insertTerminal("t-durable", { deviceId: "dev-1", executorSessionId: "nf-term-t-durable" });
+			await terminalService.recoverOnStartup();
+			await until(() => attachStream !== undefined);
+			attachStream?.("session.data", new TextEncoder().encode("REPLAYED\r\n"));
+			endAttach?.({ exitCode: 0, endSeq: 10, outputIncomplete: true });
+			await until(() => row("t-durable")?.status === "exited");
+			// Watches saw the replayed output, not the notice that followed it.
+			expect(settled).toHaveLength(1);
+			expect(settled[0].outcome).toBe("incomplete");
+			expect(settled[0].content).toContain("REPLAYED");
+			expect(settled[0].content).not.toContain("part of it is missing");
+			const saved = new BufferManager("t-durable");
+			expect(await saved.loadFromDisk()).toBe(true);
+			expect(await saved.getContents()).toContain("part of it is missing");
+			await saved.dispose();
+		} finally {
+			restartHandling.mockRestore();
+		}
+	});
+
 	test("a closing terminal records its stop before the row is marked exited", async () => {
 		insertTerminal("t-durable", { deviceId: "dev-1", executorSessionId: "nf-term-t-durable" });
 		await terminalService.recoverOnStartup();

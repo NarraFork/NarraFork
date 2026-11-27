@@ -61,8 +61,9 @@ export class RemoteSessionExecHandle implements ExecHandle {
 				onGap: () => {
 					this.incomplete = true;
 				},
-				onExit: ({ timedOut }) => {
+				onExit: ({ timedOut, outputIncomplete }) => {
 					this.executorTimedOut = timedOut;
+					if (outputIncomplete) this.incomplete = true;
 				},
 				onLost: (reason) => {
 					this.incomplete = true;

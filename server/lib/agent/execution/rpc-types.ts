@@ -420,6 +420,13 @@ export const SESSION_DURABLE_FEATURE = "session.durable.v1";
  * executor enforces `timeoutMs` itself, attached or not.
  */
 export const SESSION_EXEC_FEATURE = "session.exec.v1";
+/**
+ * Session output and exit facts are recorded on the device's disk. After the
+ * executor restarts, its sessions are still attachable; one that was running
+ * when it stopped has state "lost" and its attach result carries `lost: true`
+ * after the recorded output.
+ */
+export const SESSION_JOURNAL_DISK_FEATURE = "session.journal.disk.v1";
 
 export interface SessionOpenParams {
 	/** Caller-chosen id, [A-Za-z0-9_-]{1,128}; rejected if already registered. */
@@ -442,12 +449,14 @@ export interface SessionOpenParams {
 export interface SessionInfo {
 	sessionId: string;
 	kind: string;
-	state: "running" | "exited";
+	state: "running" | "exited" | "lost";
 	exitCode?: number;
 	startedAt: string;
 	exitedAt?: string;
 	/** exec sessions: the executor's own deadline stopped the command. */
 	timedOut?: boolean;
+	/** Output stopped being recorded on the device's disk (still served from memory). */
+	storageError?: string;
 	/** Oldest retained output byte. */
 	firstSeq: number;
 	/** Next output byte to be written. */
@@ -464,6 +473,10 @@ export interface SessionAttachResult {
 	endSeq: number;
 	/** exec sessions: the executor's own deadline stopped the command. */
 	timedOut?: boolean;
+	/** The executor restarted while the session ran; exitCode is meaningless. */
+	lost?: boolean;
+	/** Restored from disk with output that could not all be recorded; the exit is real. */
+	outputIncomplete?: boolean;
 }
 
 export interface SessionWriteParams {

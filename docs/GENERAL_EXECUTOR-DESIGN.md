@@ -80,7 +80,7 @@ Go 执行器（远端设备上的常驻服务 / 本地脱离进程）
 - **序号 = 字节偏移**：会话自启动以来输出的第 N 个字节的序号是 N。单调递增，从 0 开始，不会重用。
 - 日志是**有界保留**的：只保留最近 `retainBytes` 字节（默认 4 MiB/会话）。最早保留的序号记为 `firstSeq`，下一个要写入的序号记为 `endSeq`。
 - PTY 读取线程只往日志追加，**永远不等待任何消费者**。慢消费者只会落后，落后到被淘汰时收到缺口，不会反压到 PTY，也不会让 shell 卡住。
-- 第一期日志在内存中（环形缓冲）；第二步落盘为分段文件，格式见 §7。
+- 日志在内存中（环形缓冲）供读取，同时写入磁盘分段文件（第一期第四步，格式见 §7），执行器重启后从磁盘恢复。
 
 ### 4.3 附着（attach）
 
@@ -130,23 +130,27 @@ Go 执行器（远端设备上的常驻服务 / 本地脱离进程）
 | NarraFork 重启 / 连接断开 | 会话继续；重连后 `attach(since)` 补齐，超出保留则收到缺口 |
 | 消费者过慢 | PTY 不受影响；消费者收到缺口 |
 | 写入请求超时后重试 | 带 `writeId` 时执行器去重，不会重复执行 |
-| 执行器进程崩溃 | 会话中的进程随之结束（PTY 主端关闭）；第一期无事实留存，第二步后可从磁盘读到截至崩溃的输出，状态标为 `lost` |
-| 整机重启 | 同上 |
-| 日志磁盘写满（第二步后） | 会话继续运行，日志标记缺口，`info` 报告存储错误；不假装完整 |
+| 执行器进程崩溃 | 会话中的进程随之结束（PTY 主端关闭）；重启后的执行器从磁盘恢复会话：已退出的照常可读（含退出码），运行中的标为 `lost`，可读到截至崩溃已写盘的输出，attach 结果带 `lost: true` |
+| 整机重启 | 同上（最后一段未 fsync 的输出可能缺失，读者看到的是记录到的末尾） |
+| 日志磁盘写满或写失败 | 会话继续运行，该会话停止写盘（内存里照常可读），`info` 报告 `storageError`；不假装完整 |
 
 NarraFork 侧对应展示：缺口在终端里显示为一行提示（"有 N 字节输出未保留"），Watch 文本匹配遇到缺口时报告"观察有缺口"而不是"未匹配"。
 
-## 7. 磁盘格式（第二步）
+## 7. 磁盘格式（已实现，`remote-executor/internal/session/store.go`）
 
 ```text
-<stateDir>/sessions/<sessionId>/
+<stateDir>/<设备名>-<注册哈希>/sessions/<sessionId>/
   meta.json          会话元数据与退出事实（原子替换写）
   seg-<firstSeq>.log 输出分段，每段 ≤ 1 MiB，按序号命名
 ```
 
 - 分段只追加；淘汰时整段删除，`firstSeq` 取最早存活分段的名字。
 - `meta.json` 用"写临时文件 → fsync → rename"更新；分段写入按段 fsync，不逐字节 fsync（不承诺断电不丢最近输出）。
-- `stateDir`：Linux `$XDG_STATE_HOME/narrafork-executor`（缺省 `~/.local/state/...`），macOS `~/Library/Application Support/...`，Windows `%LOCALAPPDATA%\...`。
+- `stateDir`：Linux `$XDG_STATE_HOME/narrafork-executor`（缺省 `~/.local/state/...`），macOS `~/Library/Application Support/...`，Windows `%LOCALAPPDATA%\...`；可用 `--state-dir`、`NARRAFORK_EXECUTOR_STATE_DIR` 或配置 `stateDir` 覆盖；系统级 systemd 服务的账户没有家目录，单元里用 `StateDirectory=`，执行器在没有配置 `stateDir` 时使用 systemd 给出的 `$STATE_DIRECTORY`（`/var/lib/narrafork-executor`）。子目录按注册区分（服务器地址、直连监听地址与设备名的哈希），同一账户和状态目录下的不同注册——即使设备同名——互不恢复、也就不会读到对方的会话。
+- 启动时读回每个会话目录：`meta.json` 有退出事实的恢复为已退出；没有的（执行器停止时仍在运行）恢复为 `lost`，并立即把发现时间写回 `meta.json`，所以多次重启不会刷新它的 24 小时 TTL。只读最近 4 MiB 和最后一段连续分段；读不了的目录删除。
+- 读者声称看过的字节超过已写盘的末尾（断电前未落盘的输出）时，`lost` 会话直接返回结束，不报错。
+- 释放、TTL 到期、`kill { release }` 都会删掉目录；磁盘占用上限约为会话数上限 × (4 MiB + 1 段)。
+- 写盘失败（写入、fsync、关闭出错，磁盘满、目录被删）只让该会话停止记录输出，退出事实仍照常记录，`meta.json` 标 `outputIncomplete`，`info.storageError` 报告（恢复后也报告）；恢复后的 attach 结果带 `outputIncomplete: true`，读者位置超过记录末尾时直接返回保存的退出结果，NarraFork 显示"部分输出缺失"并把后台任务输出标为不完整。启动时某个会话的记录写不回（只读、满盘）不影响其他会话恢复，该会话带存储错误照常恢复。能写盘时执行器声明特性 `session.journal.disk.v1`。
 
 ## 8. NarraFork 侧改造
 
@@ -184,7 +188,7 @@ NarraFork 侧对应展示：缺口在终端里显示为一行提示（"有 N 字
 1. ✅ 执行器端会话核心：进程级会话管理器、内存输出日志与序号、`session.*` 方法、`session.durable.v1` 特性、Go 单元与集成测试。旧方法不动。实现见 `remote-executor/internal/session/`、`remote-executor/internal/handlers/session*.go`；TS 侧协议类型已同步到 `server/lib/agent/execution/rpc-types.ts`。
 2. ✅ NarraFork 远端终端改用会话协议：断线/重启后补齐输出；终端行记录会话 ID，续读位置随缓冲快照保存。
 3. ✅ 后台 Bash（`kind:"exec"`）走同一会话核心，替换 `exec.start` 的长 RPC：断线不中断，重启后重新附着。
-4. 日志落盘（§7）。
+4. ✅ 日志落盘（§7）：执行器崩溃或重启后，会话输出与退出事实仍可读，运行中的会话报告 `lost`。
 
 **第二期：本地模式**——拉起本地执行器，本地终端与后台 Bash 迁移，替代 dtach。
 

@@ -36,15 +36,14 @@ func (j *Journal) notifyLocked() {
 	j.changed = make(chan struct{})
 }
 
-// Append records p. It is a no-op after Close.
-func (j *Journal) Append(p []byte) {
-	if len(p) == 0 {
-		return
-	}
+// Append records p and returns the sequence number of its first byte. It is a
+// no-op after Close.
+func (j *Journal) Append(p []byte) int64 {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	if j.closed {
-		return
+	start := j.endSeq
+	if len(p) == 0 || j.closed {
+		return start
 	}
 	j.buf = append(j.buf, p...)
 	j.endSeq += int64(len(p))
@@ -58,6 +57,18 @@ func (j *Journal) Append(p []byte) {
 		j.firstSeq += int64(drop)
 	}
 	j.notifyLocked()
+	return start
+}
+
+// restoredJournal is a closed journal holding output read back from disk:
+// data are the bytes [first, first+len(data)).
+func restoredJournal(retain int, first int64, data []byte) *Journal {
+	j := NewJournal(retain)
+	j.buf = data
+	j.firstSeq = first
+	j.endSeq = first + int64(len(data))
+	j.closed = true
+	return j
 }
 
 // Close marks the end of output. Readers drain what is retained, then see EOF.

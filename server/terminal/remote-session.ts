@@ -35,6 +35,9 @@ export const SESSION_DURABLE_FEATURE: typeof RpcTypes.SESSION_DURABLE_FEATURE =
 export const SESSION_EXEC_FEATURE: typeof RpcTypes.SESSION_EXEC_FEATURE = "session.exec.v1";
 
 const DEFAULT_MAX_QUEUED_WRITE_BYTES = 1024 * 1024;
+/** Why a session restored by a restarted executor ended without an exit. */
+export const LOST_REASON =
+	"its executor restarted while it was running; the output above is all that was recorded";
 const DEFAULT_OPEN_TIMEOUT_MS = 15_000;
 
 type SendRpc = (
@@ -101,12 +104,22 @@ export interface RemoteSessionOptions {
 	 */
 	onGap?: (missingBytes: number, streamSeq: number) => void;
 	/**
+	 * The executor restarted under the session: `lost` (it was running) or
+	 * `incomplete` (its exit is known, but not all output was recorded). Called
+	 * after the recorded output and before the notice that says so.
+	 */
+	onRestartInterrupted?: (outcome: "lost" | "incomplete", streamSeq: number) => void;
+	/**
 	 * The session ended without an exit from the executor (unknown session,
 	 * revoked device, failed open). Not called for detach or kill.
 	 */
 	onLost?: (reason: string) => void;
 	/** The executor reported the exit; `timedOut` when its own deadline stopped an exec session. */
-	onExit?: (exit: { exitCode: number | null; timedOut: boolean }) => void;
+	onExit?: (exit: {
+		exitCode: number | null;
+		timedOut: boolean;
+		outputIncomplete: boolean;
+	}) => void;
 }
 
 export interface RemoteSessionRuntime extends TerminalRuntime {
@@ -276,13 +289,36 @@ export function spawnRemoteSession(
 					"session.attach",
 					{ sessionId, since: consumed },
 					{ ...rpcOpts, signal: attach.signal, longLived: true, onStream },
-				)) as { exitCode?: number; timedOut?: boolean };
+				)) as { exitCode?: number; timedOut?: boolean; lost?: boolean; outputIncomplete?: boolean };
 				if (stopped) return;
 				const tail = decoder.decode();
 				if (tail) opts.onData?.(tail, consumed);
+				if (result?.lost === true) {
+					// The executor restarted while this ran (session.journal.disk.v1): the
+					// output it recorded has been delivered, but the outcome was never seen.
+					opts.onRestartInterrupted?.("lost", consumed);
+					if (!opts.onLost)
+						deliverText(
+							"\r\n\x1b[2m[NarraFork: the device's executor restarted while this was running; the output above is all it recorded]\x1b[0m\r\n",
+							consumed,
+						);
+					finish(null, LOST_REASON);
+					return;
+				}
 				// Not released here: the owner releases after persisting the final state.
 				const exitCode = typeof result?.exitCode === "number" ? result.exitCode : null;
-				opts.onExit?.({ exitCode, timedOut: result?.timedOut === true });
+				const outputIncomplete = result?.outputIncomplete === true;
+				if (outputIncomplete) opts.onRestartInterrupted?.("incomplete", consumed);
+				if (outputIncomplete)
+					// The device could not record all of it before restarting: say so
+					// rather than present the replay as the whole output.
+					deliverText(
+						opts.onBytes
+							? "\n[NarraFork: the device could not record all of this output; part of it is missing]\n"
+							: "\r\n\x1b[2m[NarraFork: the device could not record all of this output; part of it is missing]\x1b[0m\r\n",
+						consumed,
+					);
+				opts.onExit?.({ exitCode, timedOut: result?.timedOut === true, outputIncomplete });
 				finish(exitCode);
 				return;
 			} catch (error) {

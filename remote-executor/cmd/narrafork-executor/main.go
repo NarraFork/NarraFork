@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"log"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 
 	"github.com/narrafork/remote-executor/internal/buildinfo"
@@ -141,6 +143,17 @@ func run(ctx context.Context, ready func()) error {
 	// running across reconnects and end only when killed or when we exit.
 	if caps.Pty {
 		sessions := session.NewManager(session.DefaultLimits())
+		// Records on disk let a restarted executor still serve what its sessions
+		// printed and how they ended. Without them sessions only live in memory.
+		if dir, err := sessionStateDir(cfg); err != nil {
+			log.Printf("WARNING: session records stay in memory only: %v", err)
+		} else if store, err := session.NewDiskStore(dir); err != nil {
+			log.Printf("WARNING: session records stay in memory only: %v", err)
+		} else if err := sessions.UseStore(store); err != nil {
+			log.Printf("WARNING: session records stay in memory only: %v", err)
+		} else {
+			caps.Features = append(caps.Features, handlers.FeatureSessionJournalDiskV1)
+		}
 		h.SetSessionManager(sessions)
 		caps.Features = append(caps.Features, handlers.FeatureSessionDurableV1, handlers.FeatureSessionExecV1)
 		defer sessions.Shutdown()
@@ -207,4 +220,41 @@ func shellPath() string {
 		return s
 	}
 	return "/bin/sh"
+}
+
+// sessionStateDir is where this executor keeps its session records: one
+// directory per registration (server and device), so executors that share an
+// account and a state directory never restore, and so never serve, each
+// other's sessions — not even for two servers that both call the device by the
+// same name. The readable device prefix only helps an operator find it.
+func sessionStateDir(cfg *config.Config) (string, error) {
+	base := cfg.StateDir
+	if base == "" {
+		// A systemd unit with StateDirectory= sets STATE_DIRECTORY; it is a default
+		// only, so an explicit stateDir in the config still wins.
+		if dirs := os.Getenv("STATE_DIRECTORY"); dirs != "" {
+			base = strings.Split(dirs, ":")[0]
+		}
+	}
+	if base == "" {
+		dir, err := config.DefaultStateDir()
+		if err != nil {
+			return "", err
+		}
+		base = dir
+	}
+	device := strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			return r
+		}
+		return '_'
+	}, cfg.DeviceRef)
+	if len(device) > 64 {
+		device = device[:64]
+	}
+	if device == "" {
+		device = "default"
+	}
+	registration := sha256.Sum256([]byte(strings.Join([]string{cfg.ServerURL, cfg.ListenAddr, cfg.DeviceRef}, "\n")))
+	return filepath.Join(base, fmt.Sprintf("%s-%x", device, registration[:8]), "sessions"), nil
 }
