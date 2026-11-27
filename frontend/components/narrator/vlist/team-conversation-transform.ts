@@ -111,7 +111,9 @@ export function teamEventKey(eventId: string): string {
 }
 
 function chipData(items: readonly ToolItem[], key: string, labels: TeamChipLabels): TeamChipData {
-	const label = labels.actions[key] ?? labels.other;
+	// Own keys only: an agent's malformed action (`constructor`, `__proto__`) is never a label.
+	const label =
+		(Object.hasOwn(labels.actions, key) ? labels.actions[key] : undefined) ?? labels.other;
 	const count = items.length;
 	const countLabel = count > 1 ? ` ${labels.count(count)}` : "";
 	let failed = 0;

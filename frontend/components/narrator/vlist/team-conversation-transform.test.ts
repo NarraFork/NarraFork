@@ -614,3 +614,28 @@ describe("Team call summaries on the session page (no team mode)", () => {
 		}
 	});
 });
+
+describe("a malformed action naming an inherited property (Devin)", () => {
+	const inherited = ["constructor", "__proto__", "toString", "hasOwnProperty"];
+
+	it("folds into the generic label with its failure mark, never an inherited value", () => {
+		for (const action of inherited) {
+			const m = msg("m", 1);
+			const out = chips([runUnit([teamItem(m, "a", action, "error")])]).units;
+			const chip = out.find((unit) => unit.kind === "element");
+			const data = chip?.kind === "element" ? (chip.spec.data as Record<string, unknown>) : {};
+			expect(data.label).toBe("团队操作");
+			expect(typeof data.label).toBe("string");
+			expect(data.failedLabel).toBe("1 次失败");
+		}
+	});
+
+	it("the card summary falls back to the action text itself", () => {
+		for (const action of inherited) {
+			const summary = getSummary("Team", { action }, undefined, {});
+			expect(typeof summary).toBe("string");
+			expect(summary).not.toContain("function");
+			expect(summary).not.toContain("[object");
+		}
+	});
+});

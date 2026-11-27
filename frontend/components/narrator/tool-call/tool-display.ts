@@ -870,7 +870,12 @@ const TEAM_TOOL_FALLBACK: Record<string, string> = {
 };
 
 function teamToolLabel(labels: Record<string, string> | undefined, key: string): string {
-	return labels?.[`teamTool_${key}`] || TEAM_TOOL_FALLBACK[key] || key;
+	// Own keys only: an agent's malformed action (`constructor`, `__proto__`) names no label.
+	const own = (table: Record<string, string> | undefined, name: string) =>
+		table && Object.hasOwn(table, name) && typeof table[name] === "string"
+			? table[name]
+			: undefined;
+	return own(labels, `teamTool_${key}`) || own(TEAM_TOOL_FALLBACK, key) || key;
 }
 
 /**
