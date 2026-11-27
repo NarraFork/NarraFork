@@ -319,9 +319,12 @@ export function outputPieces(
 		return [{ text, streamSeq }];
 	const pieces: OutputPiece[] = [];
 	const start = streamSeq - bytes.length;
+	// Decoded as remote-session decodes the whole chunk: a byte-order mark is dropped
+	// only at the chunk's start, and kept as text anywhere after it.
+	const keepBom = new TextDecoder("utf-8", { ignoreBOM: true });
 	for (const [from, to] of splitOutputBytes(bytes, cols))
 		pieces.push({
-			text: new TextDecoder().decode(bytes.subarray(from, to)),
+			text: (from === 0 ? new TextDecoder() : keepBom).decode(bytes.subarray(from, to)),
 			streamSeq: start + to,
 		});
 	// Defensive: a cut must never change the text; keep the chunk whole if it would.

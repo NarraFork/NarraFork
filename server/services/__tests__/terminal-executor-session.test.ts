@@ -541,6 +541,30 @@ describe("remote terminals backed by executor sessions", () => {
 		expect(outputPieces(text, end, undefined, 80)).toEqual([{ text, streamSeq: end }]);
 	});
 
+	test("a byte-order mark at a piece boundary does not keep the chunk whole", async () => {
+		const { outputPieces } = await import("../terminal-service");
+		const encode = (text: string) => new TextEncoder().encode(text);
+		// 1000 lines, then a mark starting line 1001, then more lines than the scrollback.
+		let body = "";
+		for (let i = 0; i < 1_000; i++) body += `a${i}\n`;
+		const head = encode(body);
+		let tail = "";
+		for (let i = 0; i < 6_000; i++) tail += `b${i}\n`;
+		const bom = new Uint8Array([0xef, 0xbb, 0xbf]);
+		const rest = encode(tail);
+		const bytes = new Uint8Array(head.length + bom.length + rest.length);
+		bytes.set(head);
+		bytes.set(bom, head.length);
+		bytes.set(rest, head.length + bom.length);
+		// remote-session decodes the whole chunk in one call: only a leading mark is dropped.
+		const text = new TextDecoder().decode(bytes);
+		expect(text).toContain("\ufeffb0");
+		const pieces = outputPieces(text, bytes.length, bytes, 80);
+		expect(pieces.length).toBeGreaterThan(2);
+		expect(pieces[1]?.text.startsWith("\ufeffb0")).toBe(true);
+		expect(pieces.map((piece) => piece.text).join("")).toBe(text);
+	});
+
 	test("a closing terminal records its stop before the row is marked exited", async () => {
 		insertTerminal("t-durable", { deviceId: "dev-1", executorSessionId: "nf-term-t-durable" });
 		await terminalService.recoverOnStartup();
