@@ -7400,6 +7400,13 @@ export const teamWorkEvents = sqliteTable(
 	(table) => [
 		index("idx_team_work_events_team_created").on(table.teamId, table.createdAt, table.id),
 		index("idx_team_work_events_item_created").on(table.workItemId, table.createdAt, table.id),
+		// The coordinator conversation's dividers read a few kinds per team since a time.
+		index("idx_team_work_events_team_kind_created").on(
+			table.teamId,
+			table.kind,
+			table.createdAt,
+			table.id,
+		),
 		check(
 			"ck_team_work_events_actor_kind",
 			sql`${table.actorKind} in ('person', 'agent', 'system')`,

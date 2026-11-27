@@ -142,7 +142,13 @@ export const teamActivityQuerySchema = z.object({
 			return kinds;
 		}),
 	/** Lower bound on `created_at` (inclusive): the oldest loaded message of the conversation. */
-	since: z.iso.datetime({ offset: true }).optional(),
+	// Stored times are `toISOString()` text compared as text, so the bound is normalized to the
+	// same UTC form (an offset or missing milliseconds would otherwise compare wrongly).
+	since: z.iso
+		.datetime({ offset: true })
+		.refine((value) => Number.isFinite(Date.parse(value)), "invalid date")
+		.transform((value) => new Date(value).toISOString())
+		.optional(),
 });
 
 /** `POST /api/projects/:projectId/team-locks/release`: a person releases the exclusive lock. */

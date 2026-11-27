@@ -338,7 +338,13 @@ export const TEAM_CONVERSATION_EVENT_KINDS = [
 ] as const;
 export type TeamConversationEventKind = (typeof TEAM_CONVERSATION_EVENT_KINDS)[number];
 /** The detail keys a `kinds`-filtered events read keeps (a divider needs no more). */
-export const TEAM_CONVERSATION_DETAIL_KEYS = ["verdict", "round", "pr", "detectedBy"] as const;
+export const TEAM_CONVERSATION_DETAIL_KEYS = [
+	"verdict",
+	"round",
+	"pr",
+	"detectedBy",
+	"reopened",
+] as const;
 /** Most pending approvals the team page lists (plan §二.12). */
 export const TEAM_APPROVALS_LIMIT = 50;
 /** Most running agents the summary names (the count is capped one higher). */

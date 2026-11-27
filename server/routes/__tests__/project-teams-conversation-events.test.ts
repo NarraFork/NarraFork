@@ -287,6 +287,50 @@ describe("conversation events", () => {
 		expect((await call(OWNER, teamPath("events?kinds=work.review,work.created"))).status).toBe(400);
 		expect((await call(OWNER, teamPath("events?kinds="))).status).toBe(400);
 		expect((await call(OWNER, teamPath(`events?kinds=${kinds}&since=yesterday`))).status).toBe(400);
+		// A date that does not exist is refused, not rolled over.
+		expect(
+			(await call(OWNER, teamPath(`events?kinds=${kinds}&since=2026-02-30T10:00:00Z`))).status,
+		).toBe(400);
+	});
+
+	test("since is normalized to the stored UTC form before the text comparison", async () => {
+		// The same instant as times[3], written with an offset and without milliseconds would sort
+		// wrongly as text against `toISOString()` rows; normalized, it is the same bound.
+		const instant = new Date(times[3] as string);
+		const shifted = new Date(instant.getTime() + 8 * 3_600_000);
+		const pad = (n: number) => String(n).padStart(2, "0");
+		const local = `${shifted.getUTCFullYear()}-${pad(shifted.getUTCMonth() + 1)}-${pad(shifted.getUTCDate())}T${pad(shifted.getUTCHours())}:${pad(shifted.getUTCMinutes())}:${pad(shifted.getUTCSeconds())}.${String(shifted.getUTCMilliseconds()).padStart(3, "0")}+08:00`;
+		const body = (
+			await call(MEMBER, teamPath(`events?kinds=${kinds}&since=${encodeURIComponent(local)}`))
+		).body;
+		expect(body.events.map((e: { kind: string }) => e.kind)).toEqual([
+			"work.merged",
+			"work.pr_opened",
+			"work.review",
+		]);
+	});
+
+	test("a reopened pull request keeps its flag; each divider kind is an ordered index seek", async () => {
+		const reopenedAt = tick();
+		await db
+			.insert(teamWorkEvents)
+			.values(event("work.pr_opened", { pr: 43, reopened: true, url: "u" }, reopenedAt, itemId));
+		const body = (
+			await call(READER, teamPath(`events?kinds=${kinds}&since=${encodeURIComponent(reopenedAt)}`))
+		).body;
+		expect(body.events[0].detail).toEqual({ pr: 43, reopened: true });
+		const { sqlite } = await import("../../db");
+		const plan = (
+			sqlite
+				.query(
+					"explain query plan select id from team_work_events where team_id = ? and kind = 'work.review' and created_at >= ? order by created_at desc, id desc limit 51",
+				)
+				.all(teamId, reopenedAt) as { detail: string }[]
+		)
+			.map((row) => row.detail)
+			.join("\n");
+		expect(plan).toContain("idx_team_work_events_team_kind_created");
+		expect(plan).not.toContain("TEMP B-TREE");
 	});
 
 	test("without the new parameters the read is unchanged", async () => {
