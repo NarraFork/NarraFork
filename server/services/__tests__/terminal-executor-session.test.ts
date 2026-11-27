@@ -392,6 +392,7 @@ describe("remote terminals backed by executor sessions", () => {
 
 	test("held output is written back in batches that text watches check in turn", async () => {
 		const lastLineSeen: number[] = [];
+		let savedMidChunk: number | undefined;
 		let releaseGap: (() => void) | undefined;
 		const gapHandling = spyOn(terminalWatches, "interruptTextWatchesForGap").mockImplementation(
 			() =>
@@ -404,6 +405,8 @@ describe("remote terminals backed by executor sessions", () => {
 			async (_id, buffer) => {
 				const lines = [...(await buffer.getContents()).matchAll(/line (\d+)/g)];
 				lastLineSeen.push(lines.length ? Number(lines.at(-1)?.[1]) : -1);
+				// A save between pieces of the chunk must not pair part of it with a position.
+				if (lastLineSeen.length === 2) savedMidChunk = await buffer.saveToDisk();
 			},
 		);
 		try {
@@ -426,6 +429,14 @@ describe("remote terminals backed by executor sessions", () => {
 			await Bun.sleep(10);
 			const buffer = terminalService.getActiveBuffer("t-durable");
 			expect(await buffer?.getContents()).toContain("line 5099");
+			expect(savedMidChunk).toBe(0);
+			// Once the chunk is complete, its text and position are saved together.
+			await buffer?.saveToDisk();
+			const saved = new BufferManager("t-durable");
+			await saved.loadFromDisk();
+			// Past the 10-byte gap, then the whole chunk.
+			expect(saved.restoredStreamSeq).toBe(10 + new TextEncoder().encode(replay).length);
+			await saved.dispose();
 		} finally {
 			gapHandling.mockRestore();
 			hasWatches.mockRestore();

@@ -245,6 +245,9 @@ export class BufferManager {
 	private pendingStreamSeq: number | undefined;
 	/** Stream position of the output xterm has actually parsed (what a save contains). */
 	private appliedStreamSeq: number | undefined;
+	/** Whether the last appended / parsed output ends inside a numbered chunk. */
+	private pendingPartial = false;
+	private appliedPartial = false;
 	/** Stream position recorded in the snapshot loaded from disk, if any. */
 	private loadedStreamSeq: number | undefined;
 
@@ -326,13 +329,16 @@ export class BufferManager {
 	/**
 	 * Queue output for the emulator. `streamSeq` is the source's position after
 	 * this chunk, for sources that number their output; it is saved with the
-	 * snapshot only once the chunk has been parsed.
+	 * snapshot only once the chunk has been parsed. `partial` marks a leading piece
+	 * of a numbered chunk whose position comes with its last piece: until that is
+	 * parsed no snapshot is written, since its text would not match any position.
 	 */
-	append(data: string, streamSeq?: number): void {
+	append(data: string, streamSeq?: number, partial = false): void {
 		this.setCurrentReadView(undefined);
 		this.trackMouseMode(data);
 		this.pendingWrites.push(data);
 		if (streamSeq !== undefined) this.pendingStreamSeq = streamSeq;
+		this.pendingPartial = partial;
 		this.dirty = true;
 		if (!this.draining) this.drain();
 	}
@@ -360,8 +366,10 @@ export class BufferManager {
 				this.pendingWrites.length = 0;
 				// Captured with the batch: later appends belong to the next batch.
 				const batchSeq = this.pendingStreamSeq;
+				const batchPartial = this.pendingPartial;
 				await new Promise<void>((resolve) => this.xterm.write(batch, resolve));
 				if (batchSeq !== undefined) this.appliedStreamSeq = batchSeq;
+				this.appliedPartial = batchPartial;
 				this.setCurrentReadView(undefined);
 			}
 			this.draining = false;
@@ -928,6 +936,9 @@ export class BufferManager {
 	saveToDisk(): Promise<number> {
 		const p = this.writeChain
 			.then(async () => {
+				// Keep the last snapshot whose text matches its position; this one is
+				// written once the chunk's last piece has been parsed (still dirty).
+				if (this.appliedPartial) return 0;
 				const filePath = join(getBuffersDir(), `${this.terminalId}.buf`);
 				const serialized = this.serializeAddon.serialize({
 					scrollback: this.xterm.options.scrollback,

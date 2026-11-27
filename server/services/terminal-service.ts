@@ -260,8 +260,11 @@ function holdOutputWhile(id: string, buffer: BufferManager, work: () => Promise<
 					next = item;
 					break;
 				}
-				for (const [piece, streamSeq] of splitHeldOutput(item[0], item[1], buffer.cols)) {
-					applyOutput(id, buffer, piece, streamSeq);
+				const pieces = splitHeldOutput(item[0], item[1], buffer.cols);
+				for (const [index, [piece, streamSeq]] of pieces.entries()) {
+					// Leading pieces of a numbered chunk keep snapshots off until the last.
+					const partial = item[1] !== undefined && index < pieces.length - 1;
+					applyOutput(id, buffer, piece, streamSeq, partial);
 					rows += estimatedRows(piece, buffer.cols);
 					if (rows >= HELD_OUTPUT_CHECK_ROWS) {
 						rows = 0;
@@ -346,9 +349,15 @@ function onData(id: string, buffer: BufferManager, data: string | Uint8Array, st
 	applyOutput(id, buffer, text, streamSeq);
 }
 
-function applyOutput(id: string, buffer: BufferManager, text: string, streamSeq?: number) {
+function applyOutput(
+	id: string,
+	buffer: BufferManager,
+	text: string,
+	streamSeq?: number,
+	partial = false,
+) {
 	if (!text) return;
-	buffer.append(text, streamSeq);
+	buffer.append(text, streamSeq, partial);
 	sendToTerminal(id, { type: "output", terminalId: id, data: text });
 	notifyTerminalOutput(id);
 }

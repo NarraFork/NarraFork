@@ -488,6 +488,30 @@ describe("snapshot stream position", () => {
 		await restored.dispose(true);
 	});
 
+	test("no snapshot is written while a numbered chunk is only partly parsed", async () => {
+		const id = `seq-${crypto.randomUUID()}`;
+		ids.push(id);
+		const source = new BufferManager(id);
+		source.append("complete\r\n", 10);
+		await source.saveToDisk();
+		// The first piece of a chunk ending at 30; its position comes with the last.
+		source.append("first half ", undefined, true);
+		expect(await source.saveToDisk()).toBe(0);
+		let restored = new BufferManager(id);
+		await restored.loadFromDisk();
+		expect(restored.restoredStreamSeq).toBe(10);
+		expect(await restored.getContents()).not.toContain("first half");
+		await restored.dispose();
+		source.append("second half", 30);
+		await source.saveToDisk();
+		await source.dispose();
+		restored = new BufferManager(id);
+		await restored.loadFromDisk();
+		expect(restored.restoredStreamSeq).toBe(30);
+		expect(await restored.getContents()).toContain("first half second half");
+		await restored.dispose(true);
+	});
+
 	test("a source that does not number its output saves no position", async () => {
 		const id = `seq-${crypto.randomUUID()}`;
 		ids.push(id);
