@@ -1,6 +1,6 @@
 {
-  "id": "4c8df1ee-e212-497f-b798-8e4df0878f06",
-  "prevId": "33f56901-d084-4512-a9c0-d4eb2669d3a3",
+  "id": "8b958c5e-584f-4329-9345-37753e276342",
+  "prevId": "4c8df1ee-e212-497f-b798-8e4df0878f06",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -24652,6 +24652,39 @@
           "columns": [
             {
               "expression": "work_item_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "created_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_team_work_events_team_kind_created": {
+          "name": "idx_team_work_events_team_kind_created",
+          "columns": [
+            {
+              "expression": "team_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "kind",
               "isExpression": false,
               "asc": true,
               "nulls": "last"

@@ -749,6 +749,25 @@
 				"confirmGithubButton": "确认并发起 PR",
 				"openProjectSettings": "打开项目设置"
 			}
+		},
+		"conversation": {
+			"chipCount": "×{{count}}",
+			"chipFailed_one": "{{count}} 次失败",
+			"chipFailed_other": "{{count}} 次失败",
+			"event": {
+				"reviewClear": "「{{title}}」评审通过",
+				"reviewBlocker": "「{{title}}」评审要求修改",
+				"returned": "「{{title}}」被退回",
+				"merged": "「{{title}}」已合并",
+				"mergedPr": "「{{title}}」已通过 PR #{{pr}} 合并",
+				"prOpened": "「{{title}}」已发起 PR #{{pr}}",
+				"mergeFailed": "「{{title}}」合并失败",
+				"untitled": "一个工作项",
+				"prReopened": "「{{title}}」的 PR #{{pr}} 已重新打开"
+			},
+			"eventLine": "{{time}} · {{text}}",
+			"chipCancelled_one": "{{count}} 次取消",
+			"chipCancelled_other": "{{count}} 次取消"
 		}
 	},
 	"page": {

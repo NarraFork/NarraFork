@@ -103,6 +103,9 @@ const PURE_PATH_FILES = [
 	"measure/measure-reflection-notice.ts",
 	"measure/measure-subagent.ts",
 	"measure/measure-subagent-recovery.ts",
+	// The team page's opt-in chip / divider rows, and the transform that builds them.
+	"measure/measure-team-row.ts",
+	"team-conversation-transform.ts",
 ];
 
 /**

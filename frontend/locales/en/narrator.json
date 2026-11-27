@@ -3456,5 +3456,23 @@
 	"followSummaryUnset": "Summary model (not configured)",
 	"composerReadOnly": "Read-only: you can follow this session but not send it messages.",
 	"teamBadge": "Team",
-	"teamBadgeOpen": "Open the team page of {{name}}"
+	"teamBadgeOpen": "Open the team page of {{name}}",
+	"teamTool": {
+		"work_create": "Work item created",
+		"work_update": "Dependencies changed",
+		"work_review": "Review recorded",
+		"work_ready": "Marked ready to merge",
+		"work_sync": "Base sync",
+		"work_cancel": "Work cancelled",
+		"brief_write": "Brief updated",
+		"checkin": "Check-in",
+		"decision": "Decided on people's behalf",
+		"cleanup": "Worktree cleanup",
+		"work_list": "Listed work items",
+		"brief_read": "Read the brief",
+		"other": "Team action",
+		"reviewClear": "clear",
+		"reviewBlocker": "blocking issues",
+		"minutes": "in {{count}} min"
+	}
 }

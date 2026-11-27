@@ -85,6 +85,9 @@ const NO_LABELS_KINDS: Record<string, string> = {
 	// RenderSubagentRecovery declares no `labels` prop: its card text is composed by
 	// the adapter (ctx.labels) and its two buttons read the measured block data.
 	"subagent-recovery": "card text composed by the adapter (ctx.labels)",
+	// Team page rows: the team mode provider words the chip and the divider (projects i18n).
+	"team-chip": "chip text composed by the team mode provider",
+	"team-event": "divider text composed by the team mode provider",
 };
 
 describe("renderLabelsForKind — every chrome-painting kind is localizable", () => {

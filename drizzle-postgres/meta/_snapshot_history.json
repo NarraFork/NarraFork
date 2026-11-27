@@ -688,6 +688,14 @@
 			"prevId": "33f56901-d084-4512-a9c0-d4eb2669d3a3",
 			"version": "7",
 			"snapshotDigest": "3f5bc3a4028f06241299acbe2e8860eaf94f4278fd8d14cff4086cecbb63f968"
+		},
+		{
+			"idx": 86,
+			"tag": "0086_team_event_kind_index",
+			"id": "8b958c5e-584f-4329-9345-37753e276342",
+			"prevId": "4c8df1ee-e212-497f-b798-8e4df0878f06",
+			"version": "7",
+			"snapshotDigest": "1015e0f37e4244442fb64ebbeb3458c562897a67991345fcef66faa35fa185f4"
 		}
 	]
 }

@@ -325,6 +325,26 @@ export function boardColumnIsFinished(column: TeamBoardColumn): boolean {
 export const TEAM_BOARD_PAGE_LIMIT = 50;
 /** Most team events one activity page returns. */
 export const TEAM_EVENTS_PAGE_LIMIT = 50;
+/**
+ * Event kinds the team page shows as dividers in the coordinator conversation (team mode), and
+ * the only kinds the events read's `kinds` filter accepts.
+ */
+export const TEAM_CONVERSATION_EVENT_KINDS = [
+	"work.review",
+	"work.returned",
+	"work.merged",
+	"work.pr_opened",
+	"work.merge_failed",
+] as const;
+export type TeamConversationEventKind = (typeof TEAM_CONVERSATION_EVENT_KINDS)[number];
+/** The detail keys a `kinds`-filtered events read keeps (a divider needs no more). */
+export const TEAM_CONVERSATION_DETAIL_KEYS = [
+	"verdict",
+	"round",
+	"pr",
+	"detectedBy",
+	"reopened",
+] as const;
 /** Most pending approvals the team page lists (plan §二.12). */
 export const TEAM_APPROVALS_LIMIT = 50;
 /** Most running agents the summary names (the count is capped one higher). */

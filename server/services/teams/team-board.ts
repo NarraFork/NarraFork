@@ -23,6 +23,7 @@ import {
 	TEAM_APPROVALS_LIMIT,
 	TEAM_BOARD_COLUMN_STATES,
 	TEAM_BOARD_COLUMNS,
+	TEAM_CONVERSATION_DETAIL_KEYS,
 	TEAM_EVENT_DETAIL_MAX_BYTES,
 	TEAM_EVENT_DETAIL_PREVIEW_CHARS,
 	TEAM_HELD_WORKTREES_LIMIT,
@@ -48,7 +49,20 @@ import {
 	type TeamWorkerActivity,
 	teamApprovalKind,
 } from "@shared/project-teams";
-import { and, asc, desc, eq, gt, inArray, isNotNull, lt, or, type SQL, sql } from "drizzle-orm";
+import {
+	and,
+	asc,
+	desc,
+	eq,
+	gt,
+	gte,
+	inArray,
+	isNotNull,
+	lt,
+	or,
+	type SQL,
+	sql,
+} from "drizzle-orm";
 import { db } from "../../db";
 import {
 	narrators,
@@ -795,41 +809,70 @@ export async function readTeamActivity(
 	teamId: string,
 	principal: NarratorPrincipal,
 	projectId: string,
-	options: { limit: number; cursor?: string },
+	options: { limit: number; cursor?: string; kinds?: readonly string[]; since?: string },
 ): Promise<TeamActivityPage> {
 	await loadTeamForAccess(teamId, principal, "read", projectId);
 	const after = decodeCursor(options.cursor);
-	const rows = db
-		.select({
-			id: teamWorkEvents.id,
-			kind: teamWorkEvents.kind,
-			workItemId: teamWorkEvents.workItemId,
-			workItemTitle: teamWorkItems.title,
-			actorKind: teamWorkEvents.actorKind,
-			actorId: teamWorkEvents.actorId,
-			detailLength: sql<number | null>`length(${teamWorkEvents.detailJson})`,
-			detail: sql<
-				string | null
-			>`case when length(${teamWorkEvents.detailJson}) <= ${TEAM_EVENT_DETAIL_PREVIEW_CHARS} then ${teamWorkEvents.detailJson} end`,
-			...returnedReasonColumns,
-			createdAt: teamWorkEvents.createdAt,
-		})
-		.from(teamWorkEvents)
-		.leftJoin(teamWorkItems, eq(teamWorkItems.id, teamWorkEvents.workItemId))
-		.where(
-			and(
-				eq(teamWorkEvents.teamId, teamId),
-				after
-					? or(
-							lt(teamWorkEvents.createdAt, after.key),
-							and(eq(teamWorkEvents.createdAt, after.key), lt(teamWorkEvents.id, after.id)),
-						)
-					: undefined,
-			),
-		)
-		.orderBy(desc(teamWorkEvents.createdAt), desc(teamWorkEvents.id))
-		.limit(options.limit + 1)
-		.all();
+	// Team mode of the coordinator conversation: a few divider kinds within the loaded window.
+	const conversation = options.kinds !== undefined;
+	const readPage = (kind: string | undefined) =>
+		db
+			.select({
+				id: teamWorkEvents.id,
+				kind: teamWorkEvents.kind,
+				workItemId: teamWorkEvents.workItemId,
+				workItemTitle: teamWorkItems.title,
+				actorKind: teamWorkEvents.actorKind,
+				actorId: teamWorkEvents.actorId,
+				detailLength: sql<number | null>`length(${teamWorkEvents.detailJson})`,
+				detail: sql<
+					string | null
+				>`case when length(${teamWorkEvents.detailJson}) <= ${TEAM_EVENT_DETAIL_PREVIEW_CHARS} then ${teamWorkEvents.detailJson} end`,
+				// A divider needs no return reason; a long review keeps its verdict through its
+				// bounded head (never the findings).
+				...(conversation
+					? { returnDetail: sql<string | null>`null`, ...reviewHeadColumns }
+					: returnedReasonColumns),
+				createdAt: teamWorkEvents.createdAt,
+			})
+			.from(teamWorkEvents)
+			.leftJoin(teamWorkItems, eq(teamWorkItems.id, teamWorkEvents.workItemId))
+			.where(
+				and(
+					eq(teamWorkEvents.teamId, teamId),
+					kind === undefined ? undefined : eq(teamWorkEvents.kind, kind),
+					options.since ? gte(teamWorkEvents.createdAt, options.since) : undefined,
+					after
+						? or(
+								lt(teamWorkEvents.createdAt, after.key),
+								and(eq(teamWorkEvents.createdAt, after.key), lt(teamWorkEvents.id, after.id)),
+							)
+						: undefined,
+				),
+			)
+			.orderBy(desc(teamWorkEvents.createdAt), desc(teamWorkEvents.id))
+			.limit(options.limit + 1)
+			.all();
+	// The divider kinds are read ONE KIND AT A TIME: each read is an ordered seek on
+	// `(team_id, kind, created_at, id)` that stops after `limit + 1` rows, so a rare kind never
+	// walks the team's whole history (an `IN` list would make SQLite pick the time index and
+	// filter row by row). At most five reads of `limit + 1`, merged newest first.
+	const rows = options.kinds
+		? options.kinds
+				.flatMap((kind) => readPage(kind))
+				.sort((a, b) =>
+					a.createdAt === b.createdAt
+						? a.id < b.id
+							? 1
+							: a.id > b.id
+								? -1
+								: 0
+						: a.createdAt < b.createdAt
+							? 1
+							: -1,
+				)
+				.slice(0, options.limit + 1)
+		: readPage(undefined);
 	const page = rows.slice(0, options.limit);
 	const names = actorNames(page);
 	const events: TeamActivityEvent[] = page.map((row) => ({
@@ -840,7 +883,7 @@ export async function readTeamActivity(
 		actorKind: row.actorKind as TeamEventActorKind,
 		actorId: row.actorId,
 		actorName: row.actorId ? (names.get(`${row.actorKind}:${row.actorId}`) ?? null) : null,
-		...eventDetail(row),
+		...(conversation ? conversationDetail(row) : eventDetail(row)),
 		createdAt: row.createdAt,
 	}));
 	const last = page.at(-1);
@@ -848,6 +891,26 @@ export async function readTeamActivity(
 		events,
 		nextCursor: rows.length > options.limit && last ? encodeCursor(last.createdAt, last.id) : null,
 	};
+}
+
+/** A divider's detail: only {@link TEAM_CONVERSATION_DETAIL_KEYS}, never reasons or findings. */
+function conversationDetail(row: Parameters<typeof eventDetail>[0]): {
+	detail: Record<string, unknown> | null;
+	detailOmitted: boolean;
+} {
+	const { detail } = eventDetail(row);
+	if (!detail) return { detail: null, detailOmitted: false };
+	const kept: Record<string, unknown> = {};
+	for (const key of TEAM_CONVERSATION_DETAIL_KEYS) {
+		const value = detail[key];
+		if (
+			typeof value === "number" ||
+			typeof value === "boolean" ||
+			(typeof value === "string" && value.length <= 40)
+		)
+			kept[key] = value;
+	}
+	return { detail: kept, detailOmitted: false };
 }
 
 /**

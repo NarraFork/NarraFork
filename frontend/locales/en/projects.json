@@ -749,6 +749,25 @@
 				"confirmGithubButton": "Confirm and open the pull request",
 				"openProjectSettings": "Open the project settings"
 			}
+		},
+		"conversation": {
+			"chipCount": "×{{count}}",
+			"chipFailed_one": "{{count}} failed",
+			"chipFailed_other": "{{count}} failed",
+			"event": {
+				"reviewClear": "「{{title}}」 passed review",
+				"reviewBlocker": "「{{title}}」 needs changes after review",
+				"returned": "「{{title}}」 was returned",
+				"merged": "「{{title}}」 was merged",
+				"mergedPr": "「{{title}}」 merged through PR #{{pr}}",
+				"prOpened": "PR #{{pr}} opened for 「{{title}}」",
+				"mergeFailed": "「{{title}}」 failed to merge",
+				"untitled": "A work item",
+				"prReopened": "PR #{{pr}} reopened for 「{{title}}」"
+			},
+			"eventLine": "{{time}} · {{text}}",
+			"chipCancelled_one": "{{count}} cancelled",
+			"chipCancelled_other": "{{count}} cancelled"
 		}
 	},
 	"page": {

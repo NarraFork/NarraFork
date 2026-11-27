@@ -2,6 +2,7 @@ import { teamBaseBranchSchema, teamBriefSchema, teamNameSchema } from "@shared/p
 import {
 	TEAM_BOARD_COLUMNS,
 	TEAM_BOARD_PAGE_LIMIT,
+	TEAM_CONVERSATION_EVENT_KINDS,
 	TEAM_EVENTS_PAGE_LIMIT,
 	TEAM_PR_MERGE_METHODS,
 	TEAM_RETURN_REASON_MAX_LENGTH,
@@ -122,6 +123,32 @@ export const teamBoardQuerySchema = z.object({
 export const teamActivityQuerySchema = z.object({
 	limit: z.coerce.number().int().min(1).max(TEAM_EVENTS_PAGE_LIMIT).default(TEAM_EVENTS_PAGE_LIMIT),
 	cursor: pageCursor,
+	/**
+	 * Team mode of the coordinator conversation: only these kinds (a comma list from the fixed
+	 * divider set), with each detail cut to the few keys a divider reads.
+	 */
+	kinds: z
+		.string()
+		.max(200)
+		.optional()
+		.transform((value, ctx) => {
+			if (value === undefined) return undefined;
+			const kinds = [...new Set(value.split(",").map((kind) => kind.trim()))].filter(Boolean);
+			const allowed = new Set<string>(TEAM_CONVERSATION_EVENT_KINDS);
+			if (kinds.length === 0 || kinds.some((kind) => !allowed.has(kind))) {
+				ctx.addIssue({ code: "custom", message: "unsupported event kind" });
+				return z.NEVER;
+			}
+			return kinds;
+		}),
+	/** Lower bound on `created_at` (inclusive): the oldest loaded message of the conversation. */
+	// Stored times are `toISOString()` text compared as text, so the bound is normalized to the
+	// same UTC form (an offset or missing milliseconds would otherwise compare wrongly).
+	since: z.iso
+		.datetime({ offset: true })
+		.refine((value) => Number.isFinite(Date.parse(value)), "invalid date")
+		.transform((value) => new Date(value).toISOString())
+		.optional(),
 });
 
 /** `POST /api/projects/:projectId/team-locks/release`: a person releases the exclusive lock. */

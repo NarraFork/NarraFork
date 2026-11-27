@@ -4703,6 +4703,12 @@ export const teamWorkEvents = pgTable(
 	(table) => [
 		index("idx_team_work_events_team_created").on(table.teamId, table.createdAt, table.id),
 		index("idx_team_work_events_item_created").on(table.workItemId, table.createdAt, table.id),
+		index("idx_team_work_events_team_kind_created").on(
+			table.teamId,
+			table.kind,
+			table.createdAt,
+			table.id,
+		),
 		check(
 			"ck_team_work_events_actor_kind",
 			sql.raw("\"actor_kind\" in ('person', 'agent', 'system')"),
@@ -31610,6 +31616,16 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "idx_team_work_events_item_created",
           "columns": [
             "workItemId",
+            "createdAt",
+            "id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_team_work_events_team_kind_created",
+          "columns": [
+            "teamId",
+            "kind",
             "createdAt",
             "id"
           ],

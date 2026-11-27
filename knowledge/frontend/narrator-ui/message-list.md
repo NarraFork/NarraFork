@@ -12,6 +12,8 @@ anchors:
   - frontend/components/narrator/vlist/{pretext,prepared,measure-cache,usePretext,segment,source-slice,parse-markdown,katex,message-math,guard-source,registry,render-registry,ExactRow,PretextExact,VListHarness}*
   - frontend/components/narrator/vlist/{vlist-live,vlist-message,vlist-data,vlist-reload,vlist-pipeline,vlist-persisted,vlist-head,vlist-tail,vlist-tool,streaming,exact-streaming,useVList,useReasoning,reasoning-translation,compact-progress,communication-navigation}*
   - frontend/components/narrator/vlist/{VList,Question,Reminder,auxiliary,markdown-images,outline,permission-textarea,remote-outline,spec-carryover,task-notice}*
+  - frontend/components/narrator/vlist/{team-conversation.,team-conversation-}*
+  - frontend/components/narrator/team-conversation-mode.ts
   - frontend/components/narrator/vlist/vlist-{ask,compact,content,edit,error,injection,interaction,outline,permission,reflection,spec,subagent,user}*
   - frontend/components/narrator/lod/
   - frontend/components/narrator/scroll/
@@ -69,6 +71,9 @@ keywords:
   - EXACT_RELOAD_COALESCE_MS
   - 历史加载
   - MarkdownContent
+  - TeamConversationModeContext
+  - team-chip
+  - team-event
 status: draft
 verified_at: 3586b5dd803f5035f610fc36d2c7d0245a2cd8e9
 ---
@@ -104,6 +109,10 @@ verified_at: 3586b5dd803f5035f610fc36d2c7d0245a2cd8e9
   - 其余：加载并清空记录。
   - 偏好查询未完成时视为不启用，查询结束但无数据则回落为启用。
 - 流式：`streaming/streaming-delta-fold.ts` 按元素 id + 修订号 + 原始字符偏移折叠增量；`streaming-block-supersede.ts` 判断持久化块是否取代流式块；`vlist/streaming-handoff.ts` 与 `trace/render-units.ts` 保证流式行与落库行同 key（`tool-<toolUseId>`），交接时不换元素；`streaming-markdown-split.ts` 把增长文本切成“稳定前缀 + 活动尾部”，切点只落在空行处且不在围栏代码内，前缀含引用式链接/脚注定义则整条禁用切分。
+- 团队模式（只在团队页协调者一栏，`team-conversation-mode.ts` 的 `TeamConversationModeContext` 由团队路由提供；会话页不提供，构建选项 `teamConversation` 缺省，变换根本不调用）：`buildPretextDocumentLayout` 在分组后对渲染单元跑 `vlist/team-conversation-transform.ts:applyTeamConversationMode`，产出 `element` 单元：
+  - 芯片（L3 及以上；L1/L2 的活动轨迹已是一行一调用，重切会破坏交接稳定的键）：相邻 tool-run 里连续、同一动作（`@shared/team-tool-actions:teamToolActionKey`：`input.action`，被截断的输入从 `preview` 读，`brief` 分读/写）的已结束 `Team` 调用合成一个 `team-chip`（「建立工作项 ×7」）。“已结束”是紧凑行的终态集合（`@shared/tool-row-status` 的 `TERMINAL_TOOL_ROW_STATUSES`，标记取 `resolveToolRowStatusMark`：failed/timeout 红色、cancelled/denied/aborted 灰色，取消不画绿勾）；运行中、流式（`__streaming__`）、等权限（`resolveHasPendingPermission`）或状态未知的调用永不进芯片，保持卡片并把组切开。芯片键 `team-chip-<成员身份>`（成员身份是 `toolUseId`，同一 id 在文档里第 n 次重复时加 `#n`）；展开状态在每个成员的键上查，芯片取持有显式状态的（最后一个）成员的键、以它的值为准，都没有时取最后一个成员的键——所以加载更早一页、实时追加或 `trimHead` 砍掉头部都不会把已展开的芯片合上，在新键上折叠也确实合上。芯片在 `TOGGLEABLE_CARD_KINDS` 里，走外壳普通的 `expanded[key]` 折叠；展开时芯片后面紧跟它折叠的原 tool-run，即普通工具卡片。
+  - 分隔线（各级别）：事件插在第一个开始时间严格晚于它的单元之前（同一时刻排在消息后），单元时间取首条源消息的 `createdAt`；中间没有时间的单元沿用前一个单元的时间，只有末尾的（流式行）算 +∞，开头的取第一个已知时间；`hasPrev`（由协调器每次构建填入）时早于首个已加载单元的事件留给那一页。
+  - 两种行都是固定一行（`measure/measure-team-row.ts`：芯片 `traceMetrics().headerBandHeight`，分隔线 `countLineHeight`，随字号缩放），绘制在 `render/RenderTeamRow.tsx`。来源归属：芯片归其调用的消息，分隔线归前一个单元，seq 保持单调。清单身份（`documentRevision`）带上 `~team:<修订号>`，测量一律用 `team-conversation-transform.ts:measureRevisionOf` 去掉它的修订号（构建与 `vlist-resize-preview.ts` 都是），事件到来或缩放预览不重量整篇，芯片/分隔线的 `data.text` 自己进缓存键。只在协调者自己的顶层列表启用（`PretextExactMessageList` 核对上下文的 `narratorId` 且非子代理）。列表经 `onWindowChange` 报告最旧已加载消息与 `hasPrev`，事件读取按它分页（见[团队页](../../collaboration/teams/page.md)）。测试：`team-conversation-transform.test.ts`、`render/RenderTeamRow.test.tsx`、`team-conversation.browser.test.ts`（Chromium，`NF_TEST_CHROMIUM_PATH`）。
 - 嵌套行是扁平的（`message/nested-rows.ts`：有 `parentMessageId` 即嵌套，只通过父工具调用读取）；WS 事件对已加载行的不可变更新在 `message/message-tree-utils.ts`，分页查询缓存的删除裁剪在 `message/messages-query-cache.ts`。
 - Markdown：`markdown/MarkdownContent.tsx`（remark-math 等动态加载）、代码高亮缓存 `highlight-cache.ts`（上限 64 条 / 1MB，单段可缓存 ≤20000 字符，文件面板上限 200000）；本地文件链接由 `remark-local-file-links.ts` 只对显式 `file:`/`nf-file:`/盘符目标改写，不从正文或行内代码推断。
 

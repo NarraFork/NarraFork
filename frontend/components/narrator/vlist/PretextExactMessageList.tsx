@@ -88,6 +88,7 @@ import { findLatestSpecTasksToolUseId } from "../narrator-message-helpers";
 import type { NarratorMsg, PermissionCallbacks } from "../narrator-panel-types";
 import { useNarratorPanelVisible } from "../narrator-panel-visibility";
 import { getGlobalSwipeAnchor, subscribeGlobalSwipeAnchor } from "../scroll/swipeState";
+import { useTeamConversationMode } from "../team-conversation-mode";
 import { useToolCallInspectorHost } from "../tool-call/tool-call-inspector-host";
 import {
 	getCategory,
@@ -2193,6 +2194,25 @@ export const PretextExactMessageList = memo(
 					dataSource?.onRefreshError,
 				],
 			);
+			// Team mode (the team page's coordinator column only; null on every other host).
+			// Only the coordinator's own top-level list: a subagent or nested list under the same
+			// provider builds exactly as on the session page.
+			const providedTeamMode = useTeamConversationMode();
+			const teamMode =
+				providedTeamMode && !isSubagent && providedTeamMode.narratorId === narratorId
+					? providedTeamMode
+					: null;
+			const teamConversation = useMemo(
+				() =>
+					teamMode
+						? {
+								events: teamMode.events,
+								chipLabels: teamMode.chipLabels,
+								revision: teamMode.revision,
+							}
+						: undefined,
+				[teamMode],
+			);
 			const pretextDocument = usePretextDocument(narratorId, {
 				suspended,
 				compactAuxiliaryContent,
@@ -2255,7 +2275,15 @@ export const PretextExactMessageList = memo(
 				formatUsageNumber: formatLocaleNumber,
 				onScrollTopCorrection,
 				isSubagent,
+				...(teamConversation ? { teamConversation } : {}),
 			});
+			// Team mode: report the loaded window so its events page together with the messages.
+			const teamWindowReport = teamMode?.onWindowChange;
+			const teamWindowOldestAt = pretextDocument.document?.messages[0]?.createdAt ?? null;
+			const teamWindowHasPrev = pretextDocument.document?.hasPrev ?? false;
+			useEffect(() => {
+				teamWindowReport?.({ oldestAt: teamWindowOldestAt, hasPrev: teamWindowHasPrev });
+			}, [teamWindowReport, teamWindowOldestAt, teamWindowHasPrev]);
 			useEffect(() => {
 				if (!dataSource?.onWindowChange) return;
 				if (pretextDocument.document) {

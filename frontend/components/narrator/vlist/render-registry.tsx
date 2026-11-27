@@ -43,6 +43,7 @@ import { RenderSubagentRecovery } from "./render/RenderSubagentRecovery";
 import { RenderSystemList } from "./render/RenderSystemList";
 import { RenderSystemSimple } from "./render/RenderSystemSimple";
 import { RenderSystemText } from "./render/RenderSystemText";
+import { RenderTeamChip, RenderTeamEvent } from "./render/RenderTeamRow";
 import {
 	type ContentTargetResolver,
 	RenderToolCall,
@@ -628,5 +629,11 @@ export function renderElement(
 			// paint (composed by the adapter from the shared usage formatter), so this
 			// kind needs no `extra` at all.
 			return <RenderTurnUsage measured={m} />;
+		case "team-chip":
+			// Team page only. The open state lives on the measured element; the toggle is the
+			// shell's ordinary per-key fold (`TOGGLEABLE_CARD_KINDS`).
+			return <RenderTeamChip measured={m} onToggle={extra.onToggle as (() => void) | undefined} />;
+		case "team-event":
+			return <RenderTeamEvent measured={m} />;
 	}
 }
