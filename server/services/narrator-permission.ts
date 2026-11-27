@@ -183,8 +183,8 @@ import {
 } from "./permission-rule-request-service";
 import { broadcastReflectionFrame } from "./reflection-broadcast";
 import {
+	getUnattendedPermissionMessage,
 	scheduledBlockReason,
-	UNATTENDED_PERMISSION_MESSAGE,
 	unattendedPermissionDecision,
 } from "./scheduled-run-registry";
 import { SPEC_TASKS_PATH } from "./spec-task-service";
@@ -5314,7 +5314,7 @@ export async function handlePermission(
 			behavior: "deny",
 			message: scheduledRun.reportOnly
 				? "This follow-up may only call ScheduledTaskReport. Do not repeat or continue business operations."
-				: UNATTENDED_PERMISSION_MESSAGE,
+				: getUnattendedPermissionMessage(scheduledRun.requireReport),
 		};
 	}
 
@@ -6018,7 +6018,8 @@ export async function handlePermission(
 				`${toolName}: ${automated}`,
 			);
 			decision = automated;
-			if (automated === "deny") permMeta.blacklistReason = UNATTENDED_PERMISSION_MESSAGE;
+			if (automated === "deny")
+				permMeta.blacklistReason = getUnattendedPermissionMessage(scheduledRun.requireReport);
 		}
 	}
 	if (decision === "allow") {
@@ -6176,7 +6177,10 @@ export async function handlePermission(
 			"permission",
 			toolName,
 		);
-		return { behavior: "deny", message: UNATTENDED_PERMISSION_MESSAGE };
+		return {
+			behavior: "deny",
+			message: getUnattendedPermissionMessage(scheduledRun.requireReport),
+		};
 	}
 	if (scheduledRun)
 		await scheduledRunService.markScheduledRunBlocked(
@@ -7421,7 +7425,11 @@ export async function stopDangerReflectionLoop(
 			pause.toolName,
 		);
 		pause.reflectionAbortController?.abort();
-		return cancelDangerReflection(requestId, UNATTENDED_PERMISSION_MESSAGE, "user");
+		return cancelDangerReflection(
+			requestId,
+			getUnattendedPermissionMessage(scheduled.requireReport),
+			"user",
+		);
 	}
 	if (scheduled) await scheduledService.markScheduledRunBlocked(scheduled.runId, "permission");
 

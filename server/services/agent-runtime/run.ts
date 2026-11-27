@@ -46,7 +46,11 @@ import { broadcastToNarrator } from "../../websocket/narrator-ws";
 import { backgroundOccupancyStore } from "../background-occupancy-store";
 import type { ActiveNarrator } from "../narrator-session-state";
 import { withNarratorStartAdmission, withNarratorWorkAdmission } from "../narrator-session-state";
-import { getRegisteredScheduledRun } from "../scheduled-run-registry";
+import {
+	getRegisteredScheduledRun,
+	getScheduledRunMember,
+	rotateScheduledRunExecutionEpoch,
+} from "../scheduled-run-registry";
 import {
 	type ExecutionOwner,
 	getRunControl,
@@ -634,10 +638,29 @@ async function executeRun(
 			// The old session finalizer has restored its temporary model. Rotate the epoch
 			// in the short admission, retaining this run, hold and all three caller promises.
 			owner = await withNarratorStartAdmission(id, async () => {
-				if (!owner.release()) throw new Error("Lost fresh-pass execution owner");
+				const previousEpoch = owner.epoch;
+				if (getRunControl(id) !== run || !owner.release())
+					throw new Error("Lost fresh-pass execution owner");
 				const next = tryClaimExecution(id, "run");
 				if (!next) throw new Error("Fresh-pass execution owner unavailable");
 				setRunControl(next, run);
+				// Keep cleanup attached to the new owner even if the receipt CAS fails.
+				owner = next;
+				// This is the same run, before any new input is adopted. Keep its
+				// scheduled receipt current; a human input below still ends that binding.
+				if (run.logicalRunId) {
+					const scheduled = getRegisteredScheduledRun(id) ?? getScheduledRunMember(id);
+					if (
+						scheduled &&
+						!rotateScheduledRunExecutionEpoch({
+							narratorId: id,
+							logicalRunId: run.logicalRunId,
+							previousEpoch,
+							executionEpoch: next.epoch,
+						})
+					)
+						throw new Error("Scheduled execution changed during fresh pass");
+				}
 				return next;
 			});
 			run.finalizing = false;
@@ -809,7 +832,11 @@ async function finishRun(
 	const timedOut = outcome.committedEvent ? outcome.committedEvent === "timed_out" : run.timedOut;
 	const cancelled = !timedOut && run.cancel.signal.aborted;
 	const hold = getRunHold(id);
-	const interrupted = !timedOut && (!!outcome.aborted || outcome.committedEvent === "cancelled");
+	const interrupted =
+		!timedOut &&
+		(!!outcome.aborted ||
+			outcome.committedEvent === "cancelled" ||
+			(!outcome.committedEvent && cancelled));
 	const hasError =
 		timedOut ||
 		(!interrupted &&

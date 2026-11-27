@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
 	isActiveRunStatus,
 	isRunOutcome,
+	isUnfinishedRunStatus,
 	runVerdict,
 	SCHEDULED_RUN_STATUSES,
 	taskLifecycle,
@@ -22,6 +23,24 @@ describe("runVerdict", () => {
 		expect(runVerdict("completed", "something else")).toBe("unconfirmed");
 	});
 
+	test("optional reporting preserves observed completion without claiming success", () => {
+		expect(runVerdict("completed", null, false)).toBe("completed");
+		expect(runVerdict("completed", "done", false)).toBe("succeeded");
+		expect(runVerdict("completed", "partial", false)).toBe("incomplete");
+		expect(runVerdict("failed", null, false)).toBe("failed");
+		expect(verdictNeedsAttention(runVerdict("completed", null, false))).toBe(false);
+	});
+
+	test("queued work is unfinished but has no execution or report authority", () => {
+		expect(runVerdict("waiting", null)).toBe("waiting");
+		expect(isActiveRunStatus("waiting")).toBe(false);
+		expect(isUnfinishedRunStatus("waiting")).toBe(true);
+		expect(isUnfinishedRunStatus("running")).toBe(true);
+		expect(isUnfinishedRunStatus("blocked")).toBe(true);
+		expect(isUnfinishedRunStatus("completed")).toBe(false);
+		expect(isUnfinishedRunStatus(null)).toBe(false);
+		expect(verdictNeedsAttention("waiting")).toBe(false);
+	});
 	test("what the server observed outranks what the model said", () => {
 		// A model that reported "done" and then hit a provider error did not succeed.
 		expect(runVerdict("failed", "done")).toBe("failed");

@@ -33,7 +33,12 @@ function retainListener(client: QueryClient) {
 		};
 		const handle = narratorWSManager.addListener(
 			{ types: ["scheduled_tasks_changed", "project_access_changed", "narrator_access_changed"] },
-			invalidate,
+			(event) => {
+				if (event.type === "project_access_changed" || event.type === "narrator_access_changed") {
+					// Clear private labels before refetching, including requests still in flight.
+					void client.resetQueries({ queryKey: scheduledTasksQueryKey });
+				} else invalidate();
+			},
 		);
 		const offConnection = narratorWSManager.onConnectionChange((connected) => {
 			if (connected) invalidate();
@@ -99,6 +104,43 @@ export function useScheduledTaskRuns(id: string | undefined, result?: RunVerdict
 		enabled: !!id,
 		staleTime: 10_000,
 		gcTime: GC_TIME_MS,
+	});
+}
+
+export function useScheduledTaskTargets(search: string, enabled = true) {
+	useScheduledTaskUpdates();
+	const q = search.trim();
+	const [debounced] = useDebouncedValue(q, 250);
+	const query = useInfiniteQuery({
+		queryKey: [...scheduledTasksQueryKey, "targets", q],
+		queryFn: ({ pageParam, signal }) =>
+			api.listScheduledTaskTargets({ q, limit: 30, cursor: pageParam }, signal),
+		initialPageParam: null as string | null,
+		getNextPageParam: (lastPage) => lastPage.nextCursor ?? undefined,
+		enabled: enabled && q === debounced,
+		staleTime: 10_000,
+		gcTime: GC_TIME_MS,
+		retry: false,
+	});
+	return { ...query, debouncing: q !== debounced };
+}
+
+export function useScheduledTaskAssociations(narratorId: string | undefined) {
+	useScheduledTaskUpdates();
+	return useInfiniteQuery({
+		queryKey: [...scheduledTasksQueryKey, "for-narrator", narratorId],
+		queryFn: ({ pageParam, signal }) =>
+			api.listScheduledTaskAssociations(
+				narratorId as string,
+				{ limit: 20, cursor: pageParam },
+				signal,
+			),
+		initialPageParam: null as string | null,
+		getNextPageParam: (lastPage) => lastPage.nextCursor ?? undefined,
+		enabled: !!narratorId,
+		staleTime: 10_000,
+		gcTime: GC_TIME_MS,
+		retry: false,
 	});
 }
 

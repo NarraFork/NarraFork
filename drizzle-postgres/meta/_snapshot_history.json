@@ -596,18 +596,10 @@
 		{
 			"idx": 74,
 			"tag": "0074_scheduled_tasks_redesign",
-			"id": "a8ad426b-536f-46f7-b7fa-77520e3c4e38",
+			"id": "6c6633d5-bee0-4f03-870a-be6bd0f237ec",
 			"prevId": "0037af1a-0d86-4ddd-9499-9a605cce1179",
 			"version": "7",
-			"snapshotDigest": "6c80711e3a3556a4d6f96df23b8381077129548d4eb4498a633bd11af7ed74d3"
-		},
-		{
-			"idx": 75,
-			"tag": "0075_scheduled_run_admission",
-			"id": "ff7e0c27-74cd-4fc5-a4f0-84d6f4158061",
-			"prevId": "a8ad426b-536f-46f7-b7fa-77520e3c4e38",
-			"version": "7",
-			"snapshotDigest": "1cdbc3411866666ac1ec6d294026680a5da343f77d4732330abcb0107742cee1"
+			"snapshotDigest": "0f23257d0cd4499e23125a78e0d9efe9c4ab36da4d1ab79721c85fa6a8b246e3"
 		}
 	]
 }

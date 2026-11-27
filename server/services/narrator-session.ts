@@ -25,6 +25,7 @@ import {
 	resolveEffectiveToolRoutineMode,
 	type ToolRoutineMode,
 } from "@shared/routine-modes";
+import type { ScheduledRunInterruptTarget } from "@shared/scheduled-task-status";
 import {
 	MAX_EDIT_IMAGES_PER_MESSAGE,
 	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
@@ -169,8 +170,11 @@ import {
 	createRuntimeMapView,
 	type ExecutionOwner,
 	getExecutionOwner,
+	getLastExecutionEpoch,
 	getRunControl,
 	isExecutionSuspended,
+	listRuns,
+	type RunControl,
 	tryClaimExecution,
 } from "./agent-runtime/ownership";
 import type { RuntimePolicy } from "./agent-runtime/policy";
@@ -240,7 +244,11 @@ import {
 	taskSourceForNarrator,
 } from "./task-source";
 import { buildFinalToolStartAuthorization } from "./tool-final-start-authorization";
-import { mcpToolMarker, parseMcpServerMarker } from "./tool-load-markers";
+import {
+	mcpToolMarker,
+	normalizePersistedToolSelections,
+	parseMcpServerMarker,
+} from "./tool-load-markers";
 import { resolveEffectiveTraits, resolveNarratorRuntimePolicy } from "./trait-layer-service";
 import {
 	createSpecContinuationState,
@@ -270,6 +278,7 @@ import {
 	listNarratorAdmissionOwners,
 	narratorCreationLocks,
 	narratorLoopAdmissions,
+	pendingDangerReflections,
 	pendingFeedback,
 	pendingPermissions,
 	pendingPlanApprover,
@@ -278,13 +287,18 @@ import {
 	pendingPlanDiff,
 	planModeAskedOnce,
 	reserveNarratorRevertAdmission,
+	resetActiveUpstreamSession,
 	resolveNarratorAdmissionRoot,
 	waitForNarratorAdmissionWork,
 	withNarratorMutationAdmission,
 	withNarratorStartAdmission,
 	withNarratorWorkAdmission,
 } from "./narrator-session-state";
-import { getRegisteredScheduledRun, scheduledRunModelOverride } from "./scheduled-run-registry";
+import {
+	getRegisteredScheduledRun,
+	getScheduledRunMember,
+	scheduledRunModelOverride,
+} from "./scheduled-run-registry";
 
 export type { PersistedUserImageBlock };
 // Re-exported so existing imports (tests, other services) keep working; the
@@ -1684,10 +1698,8 @@ async function createNarrator(
 			}
 		}
 		// Merge tools explicitly enabled on this narrator (via /load).
-		if (Array.isArray(narrator.enabledTools)) {
-			for (const toolName of narrator.enabledTools) {
-				if (OPTIONAL_TOOLS.has(toolName)) active._enabledOptionalTools.add(toolName);
-			}
+		for (const toolName of normalizePersistedToolSelections(narrator.enabledTools)) {
+			if (OPTIONAL_TOOLS.has(toolName)) active._enabledOptionalTools.add(toolName);
 		}
 	}
 
@@ -3414,6 +3426,7 @@ export async function runAgentLoop(
 		recoveryStart,
 		initiatedBy,
 		forTaskId,
+		onAdmitted,
 		...options
 	}: Omit<
 		import("./agent-runtime/run").StartNarratorRunRequest,
@@ -3430,6 +3443,8 @@ export async function runAgentLoop(
 		initiatedBy?: "person" | "system";
 		/** The outline task the run is started for (a session opened for it). */
 		forTaskId?: string;
+		/** Resolve the short start transaction once the runtime owns this run. */
+		onAdmitted?: () => void;
 	} = {},
 ): Promise<{ started: boolean }> {
 	const narratorId = active.narratorId;
@@ -3458,7 +3473,17 @@ export async function runAgentLoop(
 			active,
 			...options,
 			initiatedBy: initiatedBy ?? "person",
-			...(recoveryStart ? { admission: recoveryStart } : {}),
+			...(recoveryStart || onAdmitted
+				? {
+						admission: {
+							check: () => recoveryStart?.check(),
+							onAdmitted: () => {
+								recoveryStart?.onAdmitted();
+								onAdmitted?.();
+							},
+						},
+					}
+				: {}),
 		});
 		if (!handle.started) {
 			forget();
@@ -3832,9 +3857,12 @@ async function feedMessageUnlocked(
 				message: fileReferenceMessageForDisplay(userMsg),
 			});
 		}
-		// Start agent loop in background
+		// Keep the short start admission through the actual owner claim. In particular,
+		// a context clear must not hand an idle slot to another run during dynamic import.
+		const admitted = Promise.withResolvers<void>();
 		const terminal = runAgentLoop(active, input.text, input.images, {
 			...internalOptions?.run,
+			onAdmitted: admitted.resolve,
 			scheduledRunId: internalOptions?.scheduledRunId,
 			...(userId !== undefined ? { principal: userId } : {}),
 			prePromptBashCommand: input.prePromptBashCommand,
@@ -3849,12 +3877,17 @@ async function feedMessageUnlocked(
 					? "system"
 					: "person",
 		});
+		void terminal.then((result) => {
+			if (result.started) admitted.resolve();
+			else admitted.reject(new ValidationError("Narrator input lost execution admission"));
+		}, admitted.reject);
 		terminal.catch(async (err) => {
 			const diagnostics = diagnosticsFromError(err);
 			logger.error("runAgentLoop unhandled error", { narratorId, error: String(err), diagnostics });
 			await reportUnsettledRunLoopError(narratorId, err, diagnostics);
 		});
 
+		await admitted.promise;
 		return { active, userMsg, userBroadcasted: !!preBashCommand, terminal };
 	} catch (error) {
 		if (!internalOptions?.bufferedDelivery) throw error;
@@ -4491,6 +4524,174 @@ export async function sendMessage(
 	return userMsg;
 }
 
+/** A missing runtime identity is never permission to interrupt a narrator by id alone. */
+export async function captureScheduledInterruptTarget(
+	narratorId: string,
+): Promise<ScheduledRunInterruptTarget | null> {
+	const owner = getExecutionOwner(narratorId);
+	const run = getRunControl(narratorId);
+	// Input adoption and standalone tool replays do not expose whole-run cancel.
+	// Their caller must wait or reject rather than claim an interrupt it cannot issue.
+	if (!owner || !run) return null;
+	const scheduled = getRegisteredScheduledRun(narratorId) ?? getScheduledRunMember(narratorId);
+	return {
+		narratorId,
+		executionEpoch: owner.epoch,
+		...(run?.logicalRunId ? { logicalRunId: run.logicalRunId } : {}),
+		...(scheduled &&
+		((run?.logicalRunId && scheduled.logicalRunId === run.logicalRunId) ||
+			scheduled.executionEpoch === owner.epoch)
+			? { scheduledRunId: scheduled.runId }
+			: {}),
+	};
+}
+
+function scheduledInterruptTargetMatches(target: ScheduledRunInterruptTarget): boolean {
+	if (!target.executionEpoch && !target.logicalRunId) return false;
+	const owner = getExecutionOwner(target.narratorId);
+	if (!owner) return false;
+	if (target.executionEpoch && owner.epoch !== target.executionEpoch) return false;
+	const run = getRunControl(target.narratorId);
+	if (target.logicalRunId && run?.logicalRunId !== target.logicalRunId) return false;
+	if (target.scheduledRunId) {
+		const scheduled =
+			getRegisteredScheduledRun(target.narratorId) ?? getScheduledRunMember(target.narratorId);
+		if (
+			scheduled?.runId !== target.scheduledRunId ||
+			(scheduled.logicalRunId && scheduled.logicalRunId !== run?.logicalRunId) ||
+			(scheduled.executionEpoch && scheduled.executionEpoch !== owner.epoch)
+		)
+			return false;
+	}
+	return true;
+}
+
+/** Includes suspended/held owners. False alone does not authorize a new dispatch. */
+export async function isScheduledInterruptTargetCurrent(
+	target: ScheduledRunInterruptTarget,
+): Promise<boolean> {
+	return scheduledInterruptTargetMatches(target);
+}
+
+export async function assertScheduledInterruptTargetIdle(
+	target: ScheduledRunInterruptTarget,
+): Promise<void> {
+	const row = await db.query.narrators.findFirst({
+		where: eq(narrators.id, target.narratorId),
+		columns: { logicalRunId: true },
+	});
+	if (
+		(!target.executionEpoch && !target.logicalRunId) ||
+		!row ||
+		getExecutionOwner(target.narratorId) ||
+		isNarratorRuntimeBusy(target.narratorId) ||
+		isLoopRunning(target.narratorId) ||
+		(target.executionEpoch && getLastExecutionEpoch(target.narratorId) !== target.executionEpoch) ||
+		(target.logicalRunId && row.logicalRunId !== target.logicalRunId)
+	)
+		throw new ValidationError("Scheduled interrupt target was replaced before dispatch");
+}
+
+/** Issue cancellation against captured controls only, with no start/message lock or terminal wait. */
+export async function cancelScheduledRunTarget(
+	target: ScheduledRunInterruptTarget,
+	reason: string,
+): Promise<boolean> {
+	if (!scheduledInterruptTargetMatches(target)) return false;
+	const rootRun = getRunControl(target.narratorId);
+	const rootSession = activeNarrators.get(target.narratorId);
+	if (!rootRun) return false;
+
+	const captured = new Map<string, { run?: RunControl; active?: ActiveNarrator }>([
+		[target.narratorId, { run: rootRun, active: rootSession }],
+	]);
+	// Freeze the current cancellation relations before abort handlers can release
+	// owners or start later work. Detached and unrelated sessions have no relation.
+	const children = new Map<string, Array<{ narratorId: string; run: RunControl }>>();
+	for (const entry of listRuns()) {
+		const callerId = entry.run.cancelWith?.narratorId;
+		if (!callerId) continue;
+		const entries = children.get(callerId) ?? [];
+		entries.push(entry);
+		children.set(callerId, entries);
+	}
+	for (const narratorId of captured.keys()) {
+		const caller = captured.get(narratorId);
+		for (const entry of children.get(narratorId) ?? []) {
+			const binding = entry.run.cancelWith;
+			if (!binding || captured.has(entry.narratorId)) continue;
+			if (binding.runId) {
+				if (binding.runId !== caller?.run?.logicalRunId) continue;
+			} else {
+				// Legacy relations omit runId. The exact still-executing caller tool
+				// attempt must belong to this run's current assistant message.
+				if (!caller?.active?._partialMessageId) continue;
+				const source = db
+					.select({ messageId: narratorToolCalls.messageId })
+					.from(narratorToolCalls)
+					.where(
+						and(
+							eq(narratorToolCalls.id, binding.toolCallId),
+							eq(narratorToolCalls.narratorId, narratorId),
+							eq(narratorToolCalls.executionAttempt, binding.attempt),
+						),
+					)
+					.limit(1)
+					.get();
+				if (source?.messageId !== caller.active._partialMessageId) continue;
+			}
+			captured.set(entry.narratorId, {
+				run: entry.run,
+				active: activeNarrators.get(entry.narratorId),
+			});
+		}
+	}
+	const permissions = [...pendingPermissions].filter(([, pause]) => captured.has(pause.narratorId));
+	const reflections = [...pendingDangerReflections].filter(([, pause]) =>
+		captured.has(pause.narratorId),
+	);
+	invalidateRecoveryTarget(target.narratorId);
+	db.update(narrators)
+		.set({ lastStopReason: "user_interrupt" })
+		.where(
+			and(
+				eq(narrators.id, target.narratorId),
+				target.logicalRunId ? eq(narrators.logicalRunId, target.logicalRunId) : undefined,
+			),
+		)
+		.run();
+	// Stop the reflection requests themselves before abort listeners remove their
+	// discoverable entries; resolving the permission alone does not cancel provider IO.
+	for (const [, pause] of permissions) pause.questionReflectionAbort?.abort(reason);
+	for (const [, pause] of reflections) pause.reflectionAbortController?.abort(reason);
+	for (const [narratorId, { run, active }] of captured) {
+		if (run && getRunControl(narratorId) !== run) continue;
+		run?.cancel.abort(reason);
+		run?.wake?.("cancel");
+		active?.abortController.abort(reason);
+	}
+	// Ordinary abort listeners settle these synchronously. Explicitly release any
+	// surviving gate (including reflection takeover) using its captured request id.
+	for (const [requestId, pause] of [...permissions, ...reflections]) {
+		if (
+			pendingPermissions.get(requestId) !== pause &&
+			pendingDangerReflections.get(requestId) !== pause
+		)
+			continue;
+		void resolvePermissionOrDangerReflection(requestId, "deny", {
+			denyMessage: reason,
+			decidedBy: "auto",
+		}).catch((error) =>
+			logger.warn("Failed to release an interrupted scheduled target's permission", {
+				narratorId: pause.narratorId,
+				requestId,
+				error: String(error),
+			}),
+		);
+	}
+	return true;
+}
+
 /** Synchronize only a trusted, idle scheduled target; hard runtime ceilings are never edited. */
 export async function prepareScheduledTaskSession(input: {
 	runId: string;
@@ -4504,8 +4705,44 @@ export async function prepareScheduledTaskSession(input: {
 			throw new ValidationError("Scheduled run registration or execution principal changed");
 		if (isNarratorRuntimeBusy(input.narratorId) || isLoopRunning(input.narratorId))
 			throw new ValidationError("Narrator is already running");
+		if (registration.narratorMode === "existing") {
+			if (!registration.ownerUserId)
+				throw new ValidationError("Scheduled task owner is required for an existing narrator");
+			const { resolveScheduledTaskTarget } = await import("./scheduled-task-target");
+			await resolveScheduledTaskTarget(
+				{ userId: registration.ownerUserId, isAdmin: false },
+				input.narratorId,
+			);
+		}
+		if (getRegisteredScheduledRun(input.narratorId) !== registration)
+			throw new ValidationError("Scheduled run registration expired before preparation");
 		if (input.nudge) {
+			if (registration.requireReport === false)
+				throw new ValidationError("Scheduled run does not require a report reminder");
+			if (registration.logicalRunId)
+				await assertScheduledInterruptTargetIdle({
+					narratorId: input.narratorId,
+					logicalRunId: registration.logicalRunId,
+					executionEpoch: registration.executionEpoch,
+				});
 			registration.reportOnly = true;
+			return registration;
+		}
+		if (!registration.contextPrepared && registration.interruptTarget) {
+			if (registration.interruptTarget.narratorId !== input.narratorId)
+				throw new ValidationError("Scheduled interrupt target does not match its narrator");
+			await assertScheduledInterruptTargetIdle(registration.interruptTarget);
+		}
+		if (registration.narratorMode === "existing") {
+			if (registration.modelPolicy === "sync") {
+				const model = registration.model ?? FOLLOW_DEFAULT_MODEL;
+				await narratorService.updateModel(input.narratorId, model);
+				updateNarratorModel(input.narratorId, model);
+			}
+			// Rebuild the runtime from the target's own settings, including its plan
+			// state, while allowing a temporary scheduled model overlay to take effect.
+			const cached = activeNarrators.get(input.narratorId);
+			if (cached) disposeInactiveNarratorSession(input.narratorId, cached);
 			return registration;
 		}
 		if (!isPermissionMode(registration.permissionMode))
@@ -4566,6 +4803,29 @@ export async function sendScheduledTaskMessage(input: {
 }): Promise<typeof narratorMessages.$inferSelect> {
 	return withNarratorStartAdmission(input.narratorId, async () => {
 		const registration = await prepareScheduledTaskSession(input);
+		if (getRegisteredScheduledRun(input.narratorId) !== registration)
+			throw new ValidationError("Scheduled run registration expired before dispatch");
+		if (!input.nudge && !registration.contextPrepared && !registration.recoveredAt) {
+			if (registration.contextPolicy === "clear") {
+				const message = await narratorService.clearContext(input.narratorId);
+				// Commit the one-shot flag before any later dispatch step may fail. A
+				// reminder or resumed delivery must never erase the new business turn.
+				registration.contextPrepared = true;
+				resetActiveUpstreamSession(input.narratorId, { persistedIdentityCleared: true });
+				const cached = activeNarrators.get(input.narratorId);
+				if (cached) disposeInactiveNarratorSession(input.narratorId, cached);
+				broadcastToNarrator(input.narratorId, {
+					type: "message",
+					narratorId: input.narratorId,
+					message,
+				});
+				broadcastToNarrator(input.narratorId, {
+					type: "compact_done",
+					narratorId: input.narratorId,
+				});
+				await narratorService.insertSpecClearedCarryoverCard(input.narratorId);
+			} else registration.contextPrepared = true;
+		}
 		const result = await feedMessageUnlocked(
 			input.narratorId,
 			input.prompt,
@@ -10244,7 +10504,7 @@ export async function resolveOptionalToolState(
 		};
 	}
 
-	const persisted = Array.isArray(narrator.enabledTools) ? narrator.enabledTools : [];
+	const persisted = normalizePersistedToolSelections(narrator.enabledTools);
 	const loaded = globallyEnabled || persisted.includes(toolName);
 	return { state: loaded ? "loaded" : "not_loaded", globallyEnabled, ...(mode ? { mode } : {}) };
 }

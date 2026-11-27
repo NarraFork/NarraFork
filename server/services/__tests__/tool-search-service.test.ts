@@ -524,6 +524,133 @@ test("builtin modes, availability and runtime ceilings are applied before rankin
 	).toBe(false);
 });
 
+test.each([
+	{ stored: ["ScheduledTaskAdmin"] },
+	{ stored: ["ScheduledTaskAdmin", "ScheduledTask", "Browser"] },
+])("canonical reload and unload reconcile retired persisted selections: %j", async ({
+	stored,
+}: {
+	stored: readonly string[];
+}) => {
+	const id = await fixture();
+	await db
+		.update(narrators)
+		.set({ enabledTools: [...stored] })
+		.where(eq(narrators.id, id));
+	const group = {
+		id: "scheduled_task",
+		description: "Scheduled tasks",
+		toolNames: ["ScheduledTask"],
+	};
+	expect(await changeLoadedToolGroup(id, group, true)).toBe("already_loaded");
+	const expected = stored.includes("Browser") ? ["ScheduledTask", "Browser"] : ["ScheduledTask"];
+	expect(
+		(await db.query.narrators.findFirst({ where: eq(narrators.id, id) }))?.enabledTools,
+	).toEqual(expected);
+	expect(await notices(id)).toHaveLength(0);
+	expect(await changeLoadedToolGroup(id, group, false)).toBe("unloaded");
+	const { resolveOptionalToolState } = await import("../narrator-session");
+	expect((await resolveOptionalToolState(id, "ScheduledTask")).state).toBe("not_loaded");
+	expect(
+		(await db.query.narrators.findFirst({ where: eq(narrators.id, id) }))?.enabledTools,
+	).toEqual(stored.includes("Browser") ? ["Browser"] : []);
+});
+
+test("old auto configuration discovers only the canonical group and explicit new mode wins", async () => {
+	const id = await fixture();
+	settings.routines.toolModes = { scheduled_task_admin: "auto" };
+	const groups = await getToolSearchCandidates(id);
+	expect(groups.find((group) => group.id === "scheduled_task")?.toolNames).toEqual([
+		"ScheduledTask",
+	]);
+	expect(groups.some((group) => group.id === "scheduled_task_admin")).toBe(false);
+	settings.routines.toolModes.scheduled_task = "manual";
+	expect((await getToolSearchCandidates(id)).some((group) => group.id === "scheduled_task")).toBe(
+		false,
+	);
+	expect(
+		await changeLoadedToolGroup(
+			id,
+			{
+				id: "scheduled_task_admin",
+				description: "retired",
+				toolNames: ["ScheduledTaskAdmin"],
+			},
+			true,
+		),
+	).toBe("denied");
+});
+
+test.each([
+	"trait",
+	"readonly",
+	"custom",
+] as const)("legacy loading preferences cannot bypass the %s ceiling", async (ceiling) => {
+	const id = await fixture();
+	settings.routines.toolModes = { scheduled_task_admin: "auto" };
+	await db
+		.update(narrators)
+		.set({ enabledTools: ["ScheduledTaskAdmin"] })
+		.where(eq(narrators.id, id));
+	const group = (await getToolSearchCandidates(id)).find((item) => item.id === "scheduled_task");
+	if (!group) throw new Error("Missing canonical group");
+	const ctx = context(id);
+	if (ceiling === "trait") {
+		await db
+			.update(narrators)
+			.set({
+				traits: upsertEncodedTrait([], DISABLED_TOOLS_TRAIT_PREFIX, {
+					version: 1,
+					tools: ["ScheduledTask"],
+				}),
+			})
+			.where(eq(narrators.id, id));
+		resetTraitLayerCaches();
+	} else {
+		const { resolveRuntimePolicy } = await import("../agent-runtime/policy");
+		ctx.runtimePolicy = resolveRuntimePolicy([
+			{
+				version: 1,
+				...(ceiling === "readonly" ? { readOnly: true } : { tools: ["ScheduledTaskAdmin"] }),
+			},
+		]);
+	}
+	expect(
+		(await getToolSearchCandidates(id, null, ctx)).some((item) => item.id === "scheduled_task"),
+	).toBe(false);
+	expect(await changeLoadedToolGroup(id, group, true, null, ctx)).toBe(
+		ceiling === "trait" ? "denied_trait" : "denied",
+	);
+	expect(
+		(await db.query.narrators.findFirst({ where: eq(narrators.id, id) }))?.enabledTools,
+	).toEqual(["ScheduledTaskAdmin"]);
+	expect(await notices(id)).toHaveLength(0);
+});
+
+test("lazy selection migration still requires final execution permission before writing", async () => {
+	const id = await fixture();
+	settings.routines.toolModes = { scheduled_task_admin: "auto" };
+	await db
+		.update(narrators)
+		.set({ enabledTools: ["ScheduledTaskAdmin"] })
+		.where(eq(narrators.id, id));
+	const group = (await getToolSearchCandidates(id)).find((item) => item.id === "scheduled_task");
+	if (!group) throw new Error("Missing canonical group");
+	const ctx = {
+		...context(id),
+		assertFinalExecutionPermission: () => {
+			throw new Error("permission revoked");
+		},
+	};
+	await expect(changeLoadedToolGroup(id, group, true, null, ctx)).rejects.toThrow(
+		"permission revoked",
+	);
+	expect(
+		(await db.query.narrators.findFirst({ where: eq(narrators.id, id) }))?.enabledTools,
+	).toEqual(["ScheduledTaskAdmin"]);
+	expect(await notices(id)).toHaveLength(0);
+});
+
 test("a stale search hit is reauthorized against one fresh commit catalog", async () => {
 	const id = await fixture();
 	const stale = (await getToolSearchCandidates(id)).find((group) => group.id === NAMES[0]);

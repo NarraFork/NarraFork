@@ -101,7 +101,7 @@ export function RunRecord({
 	anchorId?: string;
 }) {
 	const { t, i18n } = useTranslation("scheduledTasks");
-	const verdict = run.verdict ?? runVerdict(run.status, run.outcome);
+	const verdict = run.verdict ?? runVerdict(run.status, run.outcome, run.requireReport ?? true);
 	return (
 		<Paper
 			id={anchorId}
@@ -123,10 +123,14 @@ export function RunRecord({
 					</Group>
 					{run.narratorId && (
 						<Button
-							component={Link}
-							to="/narrators/$narratorId"
-							params={{ narratorId: run.narratorId }}
-							hash={run.triggerMessageId ? `msg-${run.triggerMessageId}` : undefined}
+							renderRoot={(props) => (
+								<Link
+									{...props}
+									to="/narrators/$narratorId"
+									params={{ narratorId: run.narratorId ?? "" }}
+									hash={run.triggerMessageId ? `msg-${run.triggerMessageId}` : undefined}
+								/>
+							)}
 							size="compact-xs"
 							variant="subtle"
 							rightSection={<IconExternalLink size={12} />}

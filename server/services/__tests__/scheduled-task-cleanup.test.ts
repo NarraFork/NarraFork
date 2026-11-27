@@ -134,6 +134,54 @@ describe("task-scoped narrator retention", () => {
 		expect(await exists(id)).toBe(true);
 	});
 
+	test("existing mode ignores retained cleanup policies and preserves its former roots and target", async () => {
+		const t = await task({ mode: "olderThanDays", olderThanDays: 1 });
+		const formerRoot = await narrator(t.id);
+		const target = await narrator(null);
+		const child = await narrator(null, {
+			parentNarratorId: target,
+			type: "subagent",
+			variant: "subagent:general",
+		});
+		await db
+			.update(scheduledTasks)
+			.set({ narratorMode: "existing", targetNarratorId: target })
+			.where(eq(scheduledTasks.id, t.id));
+		expect(await cleanupScheduledTaskNarrators(t.id)).toEqual({
+			deletedRoots: 0,
+			deletedNarrators: 0,
+			blockedRoots: 0,
+			limited: false,
+		});
+		for (const id of [formerRoot, target, child]) expect(await exists(id)).toBe(true);
+	});
+
+	test("rechecks existing mode when a task changes after cleanup observed its subtree", async () => {
+		const t = await task({ mode: "olderThanDays", olderThanDays: 1 });
+		const root = await narrator(t.id);
+		const target = await narrator(null);
+		const reserve = admission.withIdleNarratorCleanupAdmission;
+		const hook = spyOn(admission, "withIdleNarratorCleanupAdmission").mockImplementation(
+			async <T>(ids: string[], fn: () => Promise<T>) => {
+				await db
+					.update(scheduledTasks)
+					.set({ narratorMode: "existing", targetNarratorId: target })
+					.where(eq(scheduledTasks.id, t.id));
+				return reserve(ids, fn);
+			},
+		);
+		try {
+			expect(await cleanupScheduledTaskNarrators(t.id)).toMatchObject({
+				deletedRoots: 0,
+				blockedRoots: 1,
+			});
+			expect(await exists(root)).toBe(true);
+			expect(await exists(target)).toBe(true);
+		} finally {
+			hook.mockRestore();
+		}
+	});
+
 	test("keepLatestN keeps precisely N created roots, deletes their subtree and preserves history", async () => {
 		const t = await task({ mode: "keepLatestN", keepLatestN: 2 });
 		const ids: string[] = [];
@@ -287,6 +335,46 @@ describe("task-scoped narrator retention", () => {
 		});
 	});
 
+	test("cleanup reservation rejects concurrent creation and update of explicit target references", async () => {
+		const owner = await task({ mode: "olderThanDays", olderThanDays: 1 });
+		const root = await narrator(owner.id);
+		const child = await narrator(null, {
+			parentNarratorId: root,
+			aclRootNarratorId: root,
+			type: "subagent",
+			variant: "subagent:general",
+		});
+		const candidate = await task();
+		await admission.withIdleNarratorCleanupAdmission([root, child], async () => {
+			const create = scheduledTaskService
+				.create(
+					{
+						name: "Concurrent reference",
+						prompt: "noop",
+						cronExpr: "0 9 * * *",
+						enabled: false,
+						narratorMode: "existing",
+						targetNarratorId: child,
+					},
+					principal,
+				)
+				.then((row) => {
+					taskIds.push(row.id);
+					return row;
+				});
+			await expect(create).rejects.toMatchObject({ statusCode: 409 });
+			await expect(
+				scheduledTaskService.update(
+					candidate.id,
+					{ narratorMode: "existing", targetNarratorId: root },
+					principal,
+				),
+			).rejects.toMatchObject({ statusCode: 409 });
+		});
+		expect((await scheduledTaskService.get(candidate.id))?.targetNarratorId).toBeNull();
+		expect((await cleanupScheduledTaskNarrators(owner.id)).deletedNarrators).toBe(2);
+	});
+
 	test("revalidates a fork added between the observed subtree and exclusive deletion", async () => {
 		const t = await task({ mode: "olderThanDays", olderThanDays: 1 });
 		const root = await narrator(t.id);
@@ -350,6 +438,37 @@ describe("task-scoped narrator retention", () => {
 		expect(await exists(reuse)).toBe(true);
 		expect(await exists(shared)).toBe(true);
 	});
+
+	for (const reference of ["root", "descendant", "self"] as const) {
+		test(`protects explicit target references to a ${reference}, even from a disabled task`, async () => {
+			const owner = await task({ mode: "olderThanDays", olderThanDays: 1 });
+			const root = await narrator(owner.id);
+			const child = await narrator(null, {
+				parentNarratorId: root,
+				type: "subagent",
+				variant: "subagent:general",
+			});
+			const referring = reference === "self" ? owner : await task();
+			await db
+				.update(scheduledTasks)
+				.set({
+					targetNarratorId: reference === "root" ? root : child,
+					...(reference === "self" ? {} : { narratorMode: "existing" as const }),
+				})
+				.where(eq(scheduledTasks.id, referring.id));
+			expect(await cleanupScheduledTaskNarrators(owner.id)).toMatchObject({
+				deletedRoots: 0,
+				blockedRoots: 1,
+			});
+			expect(await exists(root)).toBe(true);
+			expect(await exists(child)).toBe(true);
+			await db
+				.update(scheduledTasks)
+				.set({ targetNarratorId: null })
+				.where(eq(scheduledTasks.id, referring.id));
+			expect((await cleanupScheduledTaskNarrators(owner.id)).deletedNarrators).toBe(2);
+		});
+	}
 
 	test("bounded batches advance past protected roots rather than starving older sessions", async () => {
 		const t = await task({ mode: "olderThanDays", olderThanDays: 1 });
@@ -419,6 +538,25 @@ describe("task-scoped narrator retention", () => {
 		expect(
 			(await db.query.narrators.findFirst({ where: eq(narrators.id, id) }))?.scheduledTaskId,
 		).toBeNull();
+	});
+
+	test("deleting an existing-target task leaves the ordinary target and its children untouched", async () => {
+		const t = await task();
+		const target = await narrator(null, { permissionMode: "readOnly", model: "ordinary-model" });
+		const child = await narrator(null, {
+			parentNarratorId: target,
+			type: "subagent",
+			variant: "subagent:general",
+		});
+		await db
+			.update(scheduledTasks)
+			.set({ narratorMode: "existing", targetNarratorId: target })
+			.where(eq(scheduledTasks.id, t.id));
+		const before = await db.query.narrators.findFirst({ where: eq(narrators.id, target) });
+		await scheduledTaskService.delete(t.id, principal);
+		taskIds.splice(taskIds.indexOf(t.id), 1);
+		expect(await db.query.narrators.findFirst({ where: eq(narrators.id, target) })).toEqual(before);
+		expect(await exists(child)).toBe(true);
 	});
 
 	test("manual cleanup and policy changes require the task creator or an admin", async () => {

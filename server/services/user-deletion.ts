@@ -1,17 +1,20 @@
 /** User deletion keeps scheduled work owned; deployed FK actions cannot be relied on. */
-import { and, asc, eq, gt, or, sql } from "drizzle-orm";
+import { UNFINISHED_RUN_STATUSES } from "@shared/scheduled-task-status";
+import { and, asc, eq, gt, inArray, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
 	gatewaySessionMappings,
 	narratorMessages,
 	narrators,
 	projects,
+	scheduledTaskRuns,
 	scheduledTasks,
 	userPluginThemes,
 	users,
 } from "../db/schema";
 import { AppError } from "../lib/errors";
 import { taskOwnerWhere } from "./scheduled-task-acl";
+import { nextTaskOccurrence, readTaskSchedule } from "./scheduled-task-schedule-state";
 
 /** Transaction handle as produced by `db.transaction((tx) => …)`. SQLite-side only. */
 type DbTransaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
@@ -42,8 +45,9 @@ export async function previewUserScheduledTaskTransfer(userId: string, cursor?: 
 }
 
 /**
- * Runs in the same transaction as deleting the user. No run row / historical principal is
- * changed, and no saved permission mode, system prompt or scheduler state is widened.
+ * Runs in the same transaction as deleting the user. Accepted waits are cancelled before
+ * ownership changes; active executions and their historical principals remain untouched.
+ * No saved permission mode, system prompt or scheduler state is widened.
  */
 export function transferScheduledTasksBeforeUserDeletion(
 	tx: DbTransaction,
@@ -75,6 +79,16 @@ export function transferScheduledTasksBeforeUserDeletion(
 			creatorSnapshot: scheduledTasks.creatorSnapshot,
 			narratorMode: scheduledTasks.narratorMode,
 			reuseNarratorId: scheduledTasks.reuseNarratorId,
+			schedule: scheduledTasks.schedule,
+			cronExpr: scheduledTasks.cronExpr,
+			timezone: scheduledTasks.timezone,
+			firedCount: scheduledTasks.firedCount,
+			scheduleCursorAt: scheduledTasks.scheduleCursorAt,
+			nextRunAt: scheduledTasks.nextRunAt,
+			activeRunId: scheduledTasks.activeRunId,
+			completedAt: scheduledTasks.completedAt,
+			enabled: scheduledTasks.enabled,
+			createdAt: scheduledTasks.createdAt,
 			updatedAt: scheduledTasks.updatedAt,
 		})
 		.from(scheduledTasks)
@@ -116,6 +130,65 @@ export function transferScheduledTasksBeforeUserDeletion(
 				.run();
 			continue;
 		}
+		// A waiting occurrence was accepted as the old owner. Settle it in this transaction
+		// so a poller can never dispatch that authorization as the administrator taking over.
+		const cancellation = "Task ownership changed before dispatch";
+		tx.update(scheduledTasks)
+			.set({
+				lastStatus: "skipped",
+				lastError: cancellation,
+				lastOutcome: null,
+				lastSummary: null,
+			})
+			.where(
+				and(
+					eq(scheduledTasks.id, task.id),
+					sql`${scheduledTasks.lastRunId} in (
+						select ${scheduledTaskRuns.id} from ${scheduledTaskRuns}
+						where ${scheduledTaskRuns.taskId} = ${task.id}
+						and ${scheduledTaskRuns.status} = 'waiting'
+					)`,
+				),
+			)
+			.run();
+		const cancelled = tx
+			.update(scheduledTaskRuns)
+			.set({
+				status: "skipped",
+				errorKind: "cancelled",
+				error: cancellation,
+				finishedAt: now,
+				durationMs: null,
+				blockReason: null,
+				blockedAt: null,
+			})
+			.where(and(eq(scheduledTaskRuns.taskId, task.id), eq(scheduledTaskRuns.status, "waiting")))
+			.returning({ id: scheduledTaskRuns.id })
+			.all();
+		// Accepting the occurrence already charged firedCount; cancellation does not refund
+		// it, alter the failure streak, or release another run's activeRunId.
+		let completedAt = task.completedAt;
+		if (cancelled.length > 0 && !task.activeRunId && !completedAt) {
+			const unfinished = tx
+				.select({ id: scheduledTaskRuns.id })
+				.from(scheduledTaskRuns)
+				.where(
+					and(
+						eq(scheduledTaskRuns.taskId, task.id),
+						inArray(scheduledTaskRuns.status, UNFINISHED_RUN_STATUSES),
+					),
+				)
+				.limit(1)
+				.get();
+			if (!unfinished) {
+				const schedule = readTaskSchedule(task);
+				const next = nextTaskOccurrence(
+					task,
+					!task.enabled && schedule.kind !== "at" ? new Date(now) : undefined,
+				);
+				if (!next) completedAt = now;
+			}
+		}
 		// Pending approvals bind to updatedAt: takeover must invalidate even a same-ms
 		// update or a timestamp ahead of this server's clock.
 		const previousUpdatedAt = Date.parse(task.updatedAt);
@@ -126,6 +199,7 @@ export function transferScheduledTasksBeforeUserDeletion(
 			.set({
 				ownerUserId: actingUserId,
 				creatorSnapshot,
+				completedAt,
 				lastModifiedBy: {
 					kind: "user",
 					userId: actingUserId,

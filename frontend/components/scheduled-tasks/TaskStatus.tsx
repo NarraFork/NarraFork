@@ -26,13 +26,15 @@ export function RunVerdictBadge({
 	status,
 	outcome,
 	verdict,
+	requireReport = true,
 }: {
 	status?: string | null;
 	outcome?: string | null;
 	verdict?: RunVerdict;
+	requireReport?: boolean;
 }) {
 	const { t } = useTranslation("scheduledTasks");
-	const value = verdict ?? runVerdict(status, outcome);
+	const value = verdict ?? runVerdict(status, outcome, requireReport);
 	const { color, Icon } = verdictAppearance(value);
 	return (
 		<Badge variant="light" color={color} leftSection={<Icon size={12} />}>

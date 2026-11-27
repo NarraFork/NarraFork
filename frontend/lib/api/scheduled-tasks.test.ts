@@ -54,6 +54,44 @@ describe("scheduled task API contract", () => {
 			result: "unconfirmed",
 		});
 	});
+	test("target lookup and associations preserve search, cursors and cancellation", async () => {
+		const controller = new AbortController();
+		await api.listScheduledTaskTargets(
+			{ q: "日报 & abc_1", limit: 30, cursor: "opaque=+/" },
+			controller.signal,
+		);
+		await api.listScheduledTaskAssociations(
+			"narrator/1",
+			{ limit: 20, cursor: "next=+/" },
+			controller.signal,
+		);
+		const target = new URL(calls[0].path, "http://test");
+		expect(target.pathname).toBe("/scheduled-tasks/targets");
+		expect(Object.fromEntries(target.searchParams)).toEqual({
+			q: "日报 & abc_1",
+			limit: "30",
+			cursor: "opaque=+/",
+		});
+		const association = new URL(calls[1].path, "http://test");
+		expect(association.pathname).toBe("/scheduled-tasks/for-narrator/narrator%2F1");
+		expect(Object.fromEntries(association.searchParams)).toEqual({
+			limit: "20",
+			cursor: "next=+/",
+		});
+		for (const call of calls) expect(call.options?.signal).toBe(controller.signal);
+	});
+	test("existing target mutations carry report and busy policy without an implicit cadence", async () => {
+		const input = {
+			narratorMode: "existing" as const,
+			targetNarratorId: "target_1",
+			contextPolicy: "clear" as const,
+			onBusy: "wait" as const,
+			busyWaitMinutes: 45,
+			requireReport: false,
+		};
+		await api.updateScheduledTask("task_1", input);
+		expect(JSON.parse(String(calls[0].options?.body))).toEqual(input);
+	});
 	test("preview passes normalized schedule fields, fired count and abort signal", async () => {
 		const schedule: TaskSchedule = { kind: "at", times: ["2027-01-01T09:00", "2027-01-02T09:00"] };
 		const input = { schedule, timezone: "Asia/Shanghai", firedCount: 1, count: 5 };

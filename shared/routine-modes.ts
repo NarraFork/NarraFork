@@ -74,6 +74,23 @@ export function normalizeToolRoutineModeOverride(raw: unknown): ToolRoutineModeO
 	return normalizeToolRoutineMode(raw);
 }
 
+/** The retired routine is a stored loading preference, never a callable alias. */
+function retiredRoutineId(routineId: string): string | undefined {
+	return routineId === "scheduled_task" ? "scheduled_task_admin" : undefined;
+}
+
+function configuredRoutineId(routineId: string, config: RoutineModeConfig): string {
+	const retiredId = retiredRoutineId(routineId);
+	if (
+		!retiredId ||
+		Object.hasOwn(config.toolModes ?? {}, routineId) ||
+		config.enabledRoutines?.includes(routineId) ||
+		config.disabledRoutines?.includes(routineId)
+	)
+		return routineId;
+	return retiredId;
+}
+
 /**
  * The mode one config layer expresses for a routine, or null when that layer
  * says nothing about it.
@@ -91,10 +108,11 @@ export function resolveToolRoutineModeInLayer(
 	config: RoutineModeConfig | undefined,
 ): ToolRoutineMode | null {
 	if (!config) return null;
-	const explicit = normalizeToolRoutineMode(config.toolModes?.[routine.id]);
+	const id = configuredRoutineId(routine.id, config);
+	const explicit = normalizeToolRoutineMode(config.toolModes?.[id]);
 	if (explicit) return explicit;
-	if (config.enabledRoutines?.includes(routine.id)) return "resident";
-	if (config.disabledRoutines?.includes(routine.id)) return "manual";
+	if (config.enabledRoutines?.includes(id)) return "resident";
+	if (config.disabledRoutines?.includes(id)) return "manual";
 	if (routine.defaultEnabled) return "resident";
 	return null;
 }
@@ -123,11 +141,7 @@ export function resolveProjectToolRoutineModeOverride(
 	// not be read as a project opinion — otherwise every default-on routine would
 	// look permanently pinned at the project level and "follow global" would be
 	// unreachable in the UI.
-	const explicit = normalizeToolRoutineMode(projectConfig.toolModes?.[routine.id]);
-	if (explicit) return explicit;
-	if (projectConfig.enabledRoutines?.includes(routine.id)) return "resident";
-	if (projectConfig.disabledRoutines?.includes(routine.id)) return "manual";
-	return "global";
+	return resolveToolRoutineModeInLayer({ id: routine.id }, projectConfig) ?? "global";
 }
 
 /** The mode that actually applies, and which layer decided it. */
@@ -165,11 +179,10 @@ export function applyToolRoutineMode<T extends RoutineModeConfig>(
 	routineId: string,
 	mode: ToolRoutineMode,
 ): ResolvedRoutineModeConfig<T> {
-	const toolModes = { ...(config.toolModes ?? {}) };
-	toolModes[routineId] = mode;
-
-	const enabled = (config.enabledRoutines ?? []).filter((id) => id !== routineId);
-	const disabled = (config.disabledRoutines ?? []).filter((id) => id !== routineId);
+	const cleared = clearToolRoutineMode(config, routineId);
+	const toolModes = { ...cleared.toolModes, [routineId]: mode };
+	const enabled = cleared.enabledRoutines;
+	const disabled = cleared.disabledRoutines;
 	if (mode === "resident") {
 		enabled.push(routineId);
 	} else if (mode === "manual") {
@@ -193,11 +206,14 @@ export function clearToolRoutineMode<T extends RoutineModeConfig>(
 	routineId: string,
 ): ResolvedRoutineModeConfig<T> {
 	const toolModes = { ...(config.toolModes ?? {}) };
+	const retiredId = retiredRoutineId(routineId);
 	delete toolModes[routineId];
+	if (retiredId) delete toolModes[retiredId];
+	const keep = (id: string) => id !== routineId && id !== retiredId;
 	return {
 		...config,
 		toolModes,
-		enabledRoutines: (config.enabledRoutines ?? []).filter((id) => id !== routineId),
-		disabledRoutines: (config.disabledRoutines ?? []).filter((id) => id !== routineId),
+		enabledRoutines: (config.enabledRoutines ?? []).filter(keep),
+		disabledRoutines: (config.disabledRoutines ?? []).filter(keep),
 	};
 }

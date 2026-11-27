@@ -24,6 +24,10 @@ afterEach(async () => {
 	for (const remove of cleanup.splice(0).reverse()) await remove();
 });
 
+export function onScheduledTaskFixtureCleanup(remove: () => Promise<unknown>): void {
+	cleanup.push(remove);
+}
+
 export async function caller(role: "admin" | "user" = "user") {
 	const userId = generateId();
 	const narratorId = generateId();
@@ -142,6 +146,7 @@ export async function activeRun(fixture: Awaited<ReturnType<typeof caller>>, tas
 		unregisterScheduledRun(runId);
 		setRunControl(owner, undefined);
 		owner.release();
+		return undefined;
 	});
 	return { runId, logicalRunId, owner };
 }

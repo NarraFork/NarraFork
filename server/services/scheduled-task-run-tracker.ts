@@ -1,5 +1,5 @@
 import { ACTIVE_RUN_STATUSES, type RunBlockReason } from "@shared/scheduled-task-status";
-import { and, asc, eq, gt, gte, inArray, isNull } from "drizzle-orm";
+import { and, asc, eq, gt, gte, inArray, isNotNull, isNull } from "drizzle-orm";
 import { db } from "../db";
 import {
 	narratorQuestions,
@@ -10,14 +10,15 @@ import {
 } from "../db/schema";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
-import { getRunControl } from "./agent-runtime/ownership";
+import { getExecutionOwner, getRunControl } from "./agent-runtime/ownership";
 import {
+	bindScheduledRunMember,
 	getRegisteredScheduledRun,
 	getScheduledRunById,
+	getScheduledRunMember,
 	listScheduledRunMembers,
 	registerScheduledRun,
 	type ScheduledRunRegistration,
-	unregisterScheduledRun,
 } from "./scheduled-run-registry";
 import {
 	claimScheduledRunNudge,
@@ -99,10 +100,23 @@ export async function recoverScheduledRuns(): Promise<Set<string>> {
 				modelPolicy: task.modelPolicy,
 				model: run.model,
 				locale: task.locale,
+				narratorMode: task.narratorMode,
+				contextPolicy: task.contextPolicy,
+				contextPrepared: true,
+				requireReport: run.requireReport,
+				interruptTarget: run.interruptTarget ?? undefined,
 				logicalRunId: run.logicalRunId ?? undefined,
+				executionEpoch: live ? getExecutionOwner(run.narratorId)?.epoch : undefined,
 				triggerMessageId: run.triggerMessageId ?? undefined,
 				...(!live ? { recoveredAt: Date.now() } : {}),
 			});
+			if (live && run.logicalRunId && !getScheduledRunMember(run.narratorId))
+				bindScheduledRunMember({
+					runId: run.id,
+					narratorId: run.narratorId,
+					logicalRunId: run.logicalRunId,
+					executionEpoch: getExecutionOwner(run.narratorId)?.epoch,
+				});
 		}
 		if (rows.length < PAGE_SIZE) break;
 		cursor = rows.at(-1)?.run.id;
@@ -148,6 +162,8 @@ export async function filterScheduledRecoveryNarrators(
 				.where(
 					and(
 						eq(scheduledTaskRuns.narratorId, id),
+						// A terminal waiting occurrence never owned this conversation.
+						isNotNull(scheduledTaskRuns.startedAt),
 						row.logicalRunId
 							? eq(scheduledTaskRuns.logicalRunId, row.logicalRunId)
 							: isNull(scheduledTaskRuns.logicalRunId),
@@ -190,10 +206,14 @@ async function currentBlock(
 	const members = listScheduledRunMembers(registration.runId);
 	const ids = new Set([registration.narratorId, ...members.map((member) => member.narratorId)]);
 	const ownsLiveWait = (id: string) => {
-		const expected =
-			members.find((member) => member.narratorId === id)?.logicalRunId ??
-			(id === registration.narratorId ? registration.logicalRunId : undefined);
-		return expected !== undefined && getRunControl(id)?.logicalRunId === expected;
+		const member = members.find((item) => item.narratorId === id);
+		const expected = member ?? (id === registration.narratorId ? registration : undefined);
+		return (
+			expected?.logicalRunId !== undefined &&
+			getRunControl(id)?.logicalRunId === expected.logicalRunId &&
+			(expected.executionEpoch === undefined ||
+				getExecutionOwner(id)?.epoch === expected.executionEpoch)
+		);
 	};
 	for (const pending of pendingPermissions.values()) {
 		if (ids.has(pending.narratorId) && ownsLiveWait(pending.narratorId))
@@ -217,6 +237,7 @@ async function currentBlock(
 			columns: { logicalRunId: true, substatus: true },
 		});
 		if (!expected || narrator?.logicalRunId !== expected) continue;
+		if (getRunControl(id) && !ownsLiveWait(id)) continue;
 		if (
 			narrator.substatus?.includes("model_unavailable") ||
 			narrator.substatus?.includes("quota_exhausted")
@@ -252,22 +273,38 @@ async function currentBlock(
 
 async function cancelExactRun(
 	registration: ScheduledRunRegistration,
-	reason: string,
+	reason: "timeout" | "blocked_timeout",
 ): Promise<void> {
-	// Cancellation is synchronous and identity-checked. Never interrupt the narrator
-	// by id after an await: that may already be a person's subsequent conversation.
-	for (const member of listScheduledRunMembers(registration.runId)) {
+	const members = listScheduledRunMembers(registration.runId);
+	const { cancelScheduledRunTarget } = await import("./narrator-session");
+	for (const member of members) {
 		const control = getRunControl(member.narratorId);
-		if (control?.logicalRunId === member.logicalRunId) {
-			control.timedOut = true;
-			control.cancel.abort(reason);
-		}
+		if (
+			control?.logicalRunId !== member.logicalRunId ||
+			(member.executionEpoch !== undefined &&
+				getExecutionOwner(member.narratorId)?.epoch !== member.executionEpoch) ||
+			getScheduledRunMember(member.narratorId) !== member
+		)
+			continue;
+		// Only this timeout path marks timedOut; the session helper also releases
+		// held runs and pending permission promises for the same exact execution.
+		control.timedOut = true;
+		await cancelScheduledRunTarget(
+			{
+				narratorId: member.narratorId,
+				logicalRunId: member.logicalRunId,
+				executionEpoch: member.executionEpoch,
+				scheduledRunId: registration.runId,
+			},
+			reason,
+		);
 	}
 }
 
 async function pollOne(run: typeof scheduledTaskRuns.$inferSelect): Promise<void> {
 	const registration = getScheduledRunById(run.id);
 	if (!registration || registration.narratorId !== run.narratorId) return;
+	const executionEpoch = registration.executionEpoch;
 	const now = Date.now();
 	const deadline = scheduledRunDeadlineReason(
 		{ ...run, blockedWaitMinutes: registration.blockedWaitMinutes },
@@ -282,6 +319,7 @@ async function pollOne(run: typeof scheduledTaskRuns.$inferSelect): Promise<void
 					? "Scheduled run exceeded its blocked-wait limit"
 					: "Scheduled run exceeded its deadline",
 			expectedLogicalRunId: run.logicalRunId ?? undefined,
+			expectedExecutionEpoch: executionEpoch,
 		});
 		return;
 	}
@@ -295,6 +333,7 @@ async function pollOne(run: typeof scheduledTaskRuns.$inferSelect): Promise<void
 		return;
 	}
 	const terminal = registration.terminal;
+	if (terminal && terminal.executionEpoch !== executionEpoch) return;
 	if (terminal && terminal.logicalRunId === run.logicalRunId && terminal.status !== "completed") {
 		await finalizeScheduledRun(run.id, terminal.status, {
 			error: terminal.error,
@@ -302,9 +341,10 @@ async function pollOne(run: typeof scheduledTaskRuns.$inferSelect): Promise<void
 				terminal.status === "timed_out"
 					? "timeout"
 					: terminal.status === "interrupted"
-						? "user_interrupt"
+						? (registration.interruptionReason ?? "user_interrupt")
 						: "provider",
 			expectedLogicalRunId: terminal.logicalRunId,
+			expectedExecutionEpoch: terminal.executionEpoch,
 		});
 		return;
 	}
@@ -326,7 +366,7 @@ async function pollOne(run: typeof scheduledTaskRuns.$inferSelect): Promise<void
 		if (await peekInbox(member.narratorId)) return;
 	}
 	if (getScheduledRunById(run.id) !== registration || registration.terminal !== terminal) return;
-	if (!run.outcome && !run.nudged && (await claimScheduledRunNudge(run.id))) {
+	if (run.requireReport && !run.outcome && !run.nudged && (await claimScheduledRunNudge(run.id))) {
 		const { sendScheduledTaskMessage } = await import("./narrator-session");
 		try {
 			await sendScheduledTaskMessage({
@@ -349,7 +389,10 @@ async function pollOne(run: typeof scheduledTaskRuns.$inferSelect): Promise<void
 			});
 		}
 	}
-	await finalizeScheduledRun(run.id, "completed", { expectedLogicalRunId: terminal.logicalRunId });
+	await finalizeScheduledRun(run.id, "completed", {
+		expectedLogicalRunId: terminal.logicalRunId,
+		expectedExecutionEpoch: terminal.executionEpoch,
+	});
 }
 
 /** One bounded page per tick. Concurrent/hot-reloaded callers share the same sweep. */
@@ -375,13 +418,10 @@ export function pollScheduledRuns(): Promise<void> {
 				logger.warn("Scheduled run poll failed", { runId: row.id, error: String(error) });
 			}
 		}
+		const { pollScheduledWaitingRuns } = await import("./scheduled-task-waiting");
+		await pollScheduledWaitingRuns();
 	})().finally(() => {
 		state.polling = undefined;
 	});
 	return state.polling;
-}
-
-/** Useful to callers that delete/archive an inactive target; never changes another run. */
-export function forgetScheduledRun(narratorId: string, runId: string): void {
-	if (getRegisteredScheduledRun(narratorId)?.runId === runId) unregisterScheduledRun(runId);
 }

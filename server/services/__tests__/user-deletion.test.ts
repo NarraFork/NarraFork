@@ -172,6 +172,26 @@ function taskRow(id: string) {
 	return db.select().from(scheduledTasks).where(eq(scheduledTasks.id, id)).get();
 }
 
+function makeRun(taskId: string, patch: Partial<typeof scheduledTaskRuns.$inferInsert> = {}) {
+	const id = generateId();
+	db.insert(scheduledTaskRuns)
+		.values({
+			id,
+			taskId,
+			status: "waiting",
+			runContext: "standalone",
+			busyDeadlineAt: "2099-01-01T00:00:00.000Z",
+			createdAt: now,
+			...patch,
+		})
+		.run();
+	return id;
+}
+
+function runRow(id: string) {
+	return db.select().from(scheduledTaskRuns).where(eq(scheduledTaskRuns.id, id)).get();
+}
+
 function narratorOwner(id: string) {
 	return db
 		.select({ owner: narrators.ownerUserId })
@@ -297,6 +317,163 @@ describe("scheduled tasks survive atomic account deletion", () => {
 		expect(narratorOwner(foreign)).toBe(other);
 	});
 
+	test("existing targets remain references and never transfer ordinary sessions or children", () => {
+		const actor = makeUser("admin"),
+			target = makeUser(),
+			other = makeUser();
+		const ordinary = makeNarrator(target);
+		const foreign = makeNarrator(other);
+		const child = makeNarrator(target);
+		db.update(narrators)
+			.set({ parentNarratorId: ordinary, type: "subagent", variant: "subagent:general" })
+			.where(eq(narrators.id, child))
+			.run();
+		const taskId = makeTask(target, {
+			narratorMode: "existing",
+			targetNarratorId: ordinary,
+			reuseNarratorId: ordinary,
+			contextPolicy: "clear",
+			onBusy: "interrupt",
+			requireReport: false,
+		});
+		const foreignTask = makeTask(target, {
+			narratorMode: "existing",
+			targetNarratorId: foreign,
+		});
+		const rowsBefore = [ordinary, foreign, child].map((id) =>
+			db.select().from(narrators).where(eq(narrators.id, id)).get(),
+		);
+		expect(deleteWithTransfer(target, actor).narratorIds).toEqual([]);
+		expect(taskRow(taskId)).toMatchObject({
+			ownerUserId: actor,
+			narratorMode: "existing",
+			targetNarratorId: ordinary,
+			permissionMode: "readOnly",
+			contextPolicy: "clear",
+			onBusy: "interrupt",
+			requireReport: false,
+		});
+		expect(taskRow(foreignTask)?.targetNarratorId).toBe(foreign);
+		for (const row of rowsBefore) {
+			if (!row) throw new Error("Expected the target fixture to exist");
+			expect(db.select().from(narrators).where(eq(narrators.id, row.id)).get()).toEqual({
+				...row,
+				ownerUserId: row.ownerUserId === target ? null : other,
+			});
+		}
+	});
+
+	test("cancels accepted waits atomically without recharging occurrences or touching active runs", () => {
+		const actor = makeUser("admin"),
+			target = makeUser(),
+			other = makeUser();
+		const ordinary = makeNarrator(target);
+		const taskId = makeTask(target, {
+			narratorMode: "existing",
+			targetNarratorId: ordinary,
+			firedCount: 4,
+			consecutiveFailures: 3,
+			nextRunAt: "2099-01-01T00:00:00.000Z",
+		});
+		const active = makeRun(taskId, {
+			narratorId: ordinary,
+			status: "running",
+			logicalRunId: "old-owner-execution",
+			startedAt: now,
+		});
+		const pending = makeRun(taskId, {
+			narratorId: ordinary,
+			interruptTarget: { narratorId: ordinary, scheduledRunId: active },
+			requireReport: false,
+		});
+		db.update(scheduledTasks)
+			.set({ activeRunId: active, lastRunId: pending, lastStatus: "waiting" })
+			.where(eq(scheduledTasks.id, taskId))
+			.run();
+		const legacyTask = makeTask(target, { ownerUserId: null, schedule: null, firedCount: 2 });
+		const manual = makeRun(legacyTask, { manual: true, trigger: "manual" });
+		const newer = makeRun(legacyTask, { status: "skipped", errorKind: "busy" });
+		db.update(scheduledTasks)
+			.set({ lastRunId: newer, lastStatus: "skipped", lastError: "Newer busy trigger" })
+			.where(eq(scheduledTasks.id, legacyTask))
+			.run();
+		const creatorOnly = makeTask(other, { createdBy: target });
+		const unrelated = makeRun(creatorOnly);
+		const untouched = [active, newer, unrelated].map(runRow);
+		const pendingBefore = runRow(pending);
+
+		db.transaction((tx) => {
+			transferScheduledTasksBeforeUserDeletion(tx, target, actor, true);
+			const settled = runRow(pending);
+			expect(settled).toMatchObject({
+				...pendingBefore,
+				status: "skipped",
+				errorKind: "cancelled",
+				error: "Task ownership changed before dispatch",
+				finishedAt: expect.any(String),
+				durationMs: null,
+			});
+			expect(transferScheduledTasksBeforeUserDeletion(tx, target, actor, true).taskIds).toEqual([]);
+			expect(runRow(pending)).toEqual(settled);
+			releaseUserForeignKeys(tx, target);
+			tx.delete(users).where(eq(users.id, target)).run();
+		});
+		expect(taskRow(taskId)).toMatchObject({
+			ownerUserId: actor,
+			activeRunId: active,
+			lastRunId: pending,
+			lastStatus: "skipped",
+			lastError: "Task ownership changed before dispatch",
+			firedCount: 4,
+			consecutiveFailures: 3,
+			nextRunAt: "2099-01-01T00:00:00.000Z",
+		});
+		expect(runRow(manual)).toMatchObject({ status: "skipped", errorKind: "cancelled" });
+		expect(taskRow(legacyTask)).toMatchObject({
+			lastRunId: newer,
+			lastStatus: "skipped",
+			lastError: "Newer busy trigger",
+			firedCount: 2,
+		});
+		expect([active, newer, unrelated].map(runRow)).toEqual(untouched);
+	});
+
+	test("cancellation completes exhausted schedules while paused or active tasks remain unfinished", () => {
+		const actor = makeUser("admin"),
+			target = makeUser();
+		const taskIds = ["ended", "paused", "active"].map((kind) => {
+			const taskId = makeTask(target, {
+				firedCount: 1,
+				nextRunAt: null,
+				enabled: kind !== "paused",
+				schedule: {
+					kind: "cron",
+					expr: "0 * * * *",
+					end: kind === "paused" ? { type: "never" } : { type: "count", count: 1 },
+				},
+			});
+			const pending = makeRun(taskId);
+			db.update(scheduledTasks)
+				.set({ lastRunId: pending, lastStatus: "waiting" })
+				.where(eq(scheduledTasks.id, taskId))
+				.run();
+			if (kind === "active") {
+				const active = makeRun(taskId, { status: "blocked", blockReason: "permission" });
+				db.update(scheduledTasks)
+					.set({ activeRunId: active })
+					.where(eq(scheduledTasks.id, taskId))
+					.run();
+			}
+			return taskId;
+		});
+		deleteWithTransfer(target, actor);
+		expect(taskRow(taskIds[0])?.completedAt).toEqual(expect.any(String));
+		for (const id of taskIds.slice(1)) expect(taskRow(id)?.completedAt).toBeNull();
+		for (const id of taskIds) {
+			expect(taskRow(id)).toMatchObject({ firedCount: 1, lastStatus: "skipped", nextRunAt: null });
+		}
+	});
+
 	test("rolls back transfer, snapshots, legacy FK releases and deletion together", () => {
 		const actor = makeUser("admin"),
 			target = makeUser();
@@ -306,6 +483,12 @@ describe("scheduled tasks survive atomic account deletion", () => {
 			.set({ reuseNarratorId: session })
 			.where(eq(scheduledTasks.id, taskId))
 			.run();
+		const pending = makeRun(taskId, { narratorId: session });
+		db.update(scheduledTasks)
+			.set({ lastRunId: pending, lastStatus: "waiting", firedCount: 1 })
+			.where(eq(scheduledTasks.id, taskId))
+			.run();
+		const pendingBefore = runRow(pending);
 		const before = taskRow(taskId);
 		expect(() =>
 			db.transaction((tx) => {
@@ -319,6 +502,7 @@ describe("scheduled tasks survive atomic account deletion", () => {
 			}),
 		).toThrow();
 		expect(taskRow(taskId)).toEqual(before);
+		expect(runRow(pending)).toEqual(pendingBefore);
 		expect(narratorOwner(session)).toBe(target);
 		expect(db.select().from(users).where(eq(users.id, target)).get()).toBeDefined();
 	});
@@ -351,7 +535,9 @@ describe("scheduled tasks survive atomic account deletion", () => {
 		makeTask(target, { ownerUserId: null });
 		const first = await previewUserScheduledTaskTransfer(target);
 		expect(first.items).toHaveLength(USER_TASK_TRANSFER_PAGE_SIZE);
-		expect(first.nextCursor).toBe(first.items.at(-1)?.id);
+		const lastItem = first.items.at(-1);
+		if (!lastItem) throw new Error("Expected the first transfer preview page to be full");
+		expect(first.nextCursor).toBe(lastItem.id);
 		const second = await previewUserScheduledTaskTransfer(target, first.nextCursor ?? undefined);
 		expect(second.items).toHaveLength(3);
 		expect(second.nextCursor).toBeNull();

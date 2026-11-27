@@ -1,4 +1,9 @@
 import { SUPPORTED_LOCALES } from "@shared/i18n-locales";
+import {
+	TASK_CONTEXT_POLICIES,
+	TASK_NARRATOR_MODES,
+	TASK_ON_BUSY_POLICIES,
+} from "@shared/scheduled-task-status";
 import { z } from "zod/v4";
 import { PERMISSION_MODES } from "../../permission-modes";
 import { SCHEDULED_TASK_ACTIONS } from "./scheduled-task-actions";
@@ -89,10 +94,43 @@ export const scheduledTaskFieldsSchema = z.object({
 		.max(4096)
 		.nullable()
 		.optional()
-		.describe("Defaults to this session's working directory, not the server home."),
+		.describe(
+			"New/reuse defaults to this session's directory. Existing targets keep their own directory and project.",
+		),
 	projectId: z.string().min(1).max(100).nullable().optional(),
-	narratorMode: z.enum(["new", "reuse"]).optional(),
-	modelPolicy: z.enum(["follow", "temporary", "sync"]).optional(),
+	narratorMode: z.enum(TASK_NARRATOR_MODES).optional(),
+	targetNarratorId: z
+		.string()
+		.min(1)
+		.max(100)
+		.nullable()
+		.optional()
+		.describe(
+			"Required for existing mode. Use targets to discover writable sessions, or this session's ID.",
+		),
+	contextPolicy: z
+		.enum(TASK_CONTEXT_POLICIES)
+		.optional()
+		.describe(
+			"Defaults to keep. Clear starts the scheduled turn without the target's prior conversation.",
+		),
+	onBusy: z
+		.enum(TASK_ON_BUSY_POLICIES)
+		.optional()
+		.describe(
+			"Defaults to skip. Wait uses busyWaitMinutes; interrupt needs approval and normal controller authority.",
+		),
+	busyWaitMinutes: z.number().int().min(1).max(1440).optional(),
+	requireReport: z
+		.boolean()
+		.optional()
+		.describe(
+			"Defaults to true: completion requires ScheduledTaskReport rather than merely an ended turn.",
+		),
+	modelPolicy: z
+		.enum(["follow", "temporary", "sync"])
+		.optional()
+		.describe("Existing targets default to follow their model; temporary/sync must be explicit."),
 	onBlocked: z.enum(["auto", "wait"]).optional(),
 	blockedWaitMinutes: z.number().int().min(1).max(1440).optional(),
 	maxRunMinutes: z.number().int().min(5).max(1440).optional(),
@@ -109,8 +147,19 @@ export const scheduledTaskParametersSchema = z.object({
 		.describe(
 			"create requires name, prompt, and schedule or cronExpr. update changes only supplied fields. preview requires a schedule or cronExpr.",
 		),
-	limit: z.number().int().min(1).max(50).optional(),
-	cursor: z.string().max(100).optional(),
+	q: z.string().max(200).optional().describe("Target session search text for the targets action."),
+	limit: z
+		.number()
+		.int()
+		.min(1)
+		.max(100)
+		.optional()
+		.describe("Up to 100 for targets; up to 50 for other actions."),
+	cursor: z
+		.string()
+		.max(2048)
+		.optional()
+		.describe("Opaque page cursor returned by targets or runs; do not construct one."),
 	filters: z
 		.object({
 			lifecycle: z.enum(["active", "ended", "all"]).optional(),
@@ -123,8 +172,14 @@ export const scheduledTaskParametersSchema = z.object({
 export type ScheduledTaskParameters = z.infer<typeof scheduledTaskParametersSchema>;
 
 export function validateScheduledTaskArguments(input: ScheduledTaskParameters): void {
-	if (!["list", "preview", "create"].includes(input.action) && !input.id)
+	if (!["list", "targets", "preview", "create"].includes(input.action) && !input.id)
 		throw new Error(`'id' is required for the ${input.action} action.`);
+	if (input.action !== "targets") {
+		if (input.limit !== undefined && input.limit > 50)
+			throw new Error(`limit must not exceed 50 for the ${input.action} action.`);
+		if (input.cursor !== undefined && input.cursor.length > 100)
+			throw new Error(`cursor must not exceed 100 characters for the ${input.action} action.`);
+	}
 	if (input.action === "create") {
 		const missing = [
 			!input.task?.name && "task.name",

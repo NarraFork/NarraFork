@@ -35,6 +35,7 @@ import { pipeline } from "node:stream/promises";
 import { createInflateRaw, inflateRawSync } from "node:zlib";
 import { BundleError, bundleCatalogError } from "@server/lib/credential-transfer/bundle";
 import { AppError, catalogError } from "@server/lib/errors";
+import { eventBus } from "@server/lib/event-bus";
 import { invalidateGitIdentityCache } from "@server/lib/git-identity";
 import { generateShortId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
@@ -1313,6 +1314,7 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 		// Overwritten sessions may bring another task backend; their import state was dropped.
 		invalidateTaskBackend();
 		resetSpecImportStateCache();
+		eventBus.emit({ type: "scheduled_task:changed" });
 	}
 
 	// The key store is a file outside the SQLite transaction, so the remaining keys are
@@ -1731,12 +1733,38 @@ export interface ClearResult {
 	deleted: { requests: number; sessions: number; providers: number };
 }
 
+/** Only tasks whose waits this clear cancelled need lifecycle reconciliation. */
+async function reconcileClearedScheduledWaits(table: string): Promise<void> {
+	try {
+		const page = sqlite.query<{ taskId: string }, [string]>(
+			`SELECT task_id AS taskId FROM temp.${table}
+			 WHERE task_id > ? ORDER BY task_id LIMIT 50`,
+		);
+		let cursor = "";
+		let tasks = page.all(cursor);
+		if (!tasks.length) return;
+		const { scheduledTaskService } = await import("./scheduled-task-service");
+		while (tasks.length) {
+			for (const task of tasks) {
+				await scheduledTaskService.reconcileCompletion(task.taskId);
+				cursor = task.taskId;
+			}
+			if (tasks.length < 50) break;
+			await new Promise<void>((resolve) => setTimeout(resolve, 0));
+			tasks = page.all(cursor);
+		}
+	} finally {
+		sqlite.run(`DROP TABLE IF EXISTS temp.${table}`);
+	}
+}
+
 /** 清空指定类别的数据。调用方负责先验证密码。 */
 export async function clearData(target: ClearTarget): Promise<ClearResult> {
 	const deleted = { requests: 0, sessions: 0, providers: 0 };
 	const clearRequests = target === "requests" || target === "all";
 	const clearSessions = target === "sessions" || target === "all";
 	const clearProviders = target === "providers" || target === "all";
+	const cancelledTaskTable = `cleared_scheduled_waits_${randomBytes(4).toString("hex")}`;
 
 	if (clearRequests || clearSessions || clearProviders) {
 		const transaction = sqlite.transaction(() => {
@@ -1756,6 +1784,32 @@ export async function clearData(target: ClearTarget): Promise<ClearResult> {
 				// FK-cascaded panel removal must invalidate previously generated title candidates.
 				sqlite.run(`UPDATE workspaces SET title_revision = title_revision + 1
 					WHERE id IN (SELECT workspace_id FROM workspace_panels WHERE narrator_id IS NOT NULL)`);
+				// Accepted waits must never start against deleted sessions or silently create
+				// replacement targets. Keep their history and consumed occurrence counters.
+				const cancelledAt = new Date().toISOString();
+				const cancellation = "Sessions cleared before dispatch";
+				// Capture affected IDs inside SQLite, then page through them after commit.
+				// The unique waiting-task index bounds this to one ID per task, not its history.
+				sqlite.run(`CREATE TEMP TABLE ${cancelledTaskTable} (task_id TEXT PRIMARY KEY)`);
+				sqlite.run(`INSERT INTO ${cancelledTaskTable}
+					SELECT task_id FROM scheduled_task_runs WHERE status = 'waiting'`);
+				sqlite.run(
+					`UPDATE scheduled_tasks SET last_status = 'interrupted', last_error = ?,
+					 last_outcome = NULL, last_summary = NULL,
+					 updated_at = CASE WHEN updated_at < ? THEN ?
+					 ELSE strftime('%Y-%m-%dT%H:%M:%fZ', updated_at, '+0.001 seconds') END
+					 WHERE last_run_id IN (SELECT id FROM scheduled_task_runs
+					 WHERE task_id = scheduled_tasks.id AND status = 'waiting')`,
+					[cancellation, cancelledAt, cancelledAt],
+				);
+				sqlite.run(
+					`UPDATE scheduled_task_runs SET status = 'interrupted', error_kind = 'cancelled',
+					 error = ?, finished_at = ?, duration_ms = NULL, block_reason = NULL, blocked_at = NULL
+					 WHERE status = 'waiting'`,
+					[cancellation, cancelledAt],
+				);
+				// target_narrator_id's SET NULL FK preserves narrator_mode = 'existing'.
+				// Active runs retain their existing lifecycle; this only cancels undispatched work.
 				// 顺序：先断开其它表的会话引用（保留请求历史等），再删依赖表与会话本体。
 				sqlite.run(`UPDATE terminals SET narrator_id = NULL WHERE narrator_id IS NOT NULL`);
 				sqlite.run(
@@ -1817,6 +1871,8 @@ export async function clearData(target: ClearTarget): Promise<ClearResult> {
 			invalidateGitIdentityCache();
 			invalidateTaskBackend();
 			resetSpecImportStateCache();
+			eventBus.emit({ type: "scheduled_task:changed" });
+			await reconcileClearedScheduledWaits(cancelledTaskTable);
 		}
 	}
 

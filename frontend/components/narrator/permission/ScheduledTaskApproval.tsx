@@ -28,6 +28,11 @@ export function scheduledTaskApprovalView(
 		elevated: raw.elevated === true,
 		outsideScope: raw.outsideScope === true,
 		before: record(raw.before),
+		target: record(raw.target),
+		beforeTarget: record(raw.beforeTarget),
+		inheritedFields: Array.isArray(raw.inheritedFields)
+			? raw.inheritedFields.filter((key): key is string => typeof key === "string").slice(0, 30)
+			: [],
 		changed: Array.isArray(raw.changed)
 			? raw.changed.filter((key): key is string => typeof key === "string").slice(0, 30)
 			: [],
@@ -55,7 +60,16 @@ export function ScheduledTaskApproval({ permission }: { permission: PendingPermi
 		);
 	const { task, schedule, timezone } = view;
 	const field = (key: string) => t(`scheduledTaskApproval.fields.${key}`, { defaultValue: key });
-	const value = (key: string, item: unknown) => {
+	const value = (key: string, item: unknown, before = false) => {
+		if (key === "targetNarratorId") {
+			const target = before ? view.beforeTarget : view.target;
+			return target && target.id === item
+				? `${display(target.title)} · ${display(item)}`
+				: display(item);
+		}
+		if (key === "requireReport" && typeof item === "boolean") return ts(item ? "yes" : "no");
+		if (key === "onBusy" && typeof item === "string") return ts(`busyPolicy.${item}`);
+		if (key === "contextPolicy" && typeof item === "string") return ts(`context.${item}`);
 		if (key === "schedule") {
 			const parsed = parseSchedule(item);
 			if (parsed.ok) return scheduleSummary(parsed.schedule, ts);
@@ -77,6 +91,22 @@ export function ScheduledTaskApproval({ permission }: { permission: PendingPermi
 					</Badge>
 				</Group>
 				<Text fw={600}>{display(task.name)}</Text>
+				{view.target && (
+					<Text size="sm">
+						{field("targetNarratorId")}: {display(view.target.title)} · {display(view.target.id)}
+					</Text>
+				)}
+				{view.inheritedFields.length > 0 && (
+					<Text size="xs" c="dimmed">
+						{t("scheduledTaskApproval.inherited", {
+							fields: view.inheritedFields.map(field).join("、"),
+						})}
+					</Text>
+				)}
+				{task.contextPolicy === "clear" && (
+					<Alert color="orange">{ts("contextClearWarning")}</Alert>
+				)}
+				{task.onBusy === "interrupt" && <Alert color="orange">{ts("busyInterruptWarning")}</Alert>}
 				{view.elevated && (
 					<Alert color="red" title={t("scheduledTaskApproval.elevatedTitle")}>
 						{t("scheduledTaskApproval.elevated")}
@@ -116,6 +146,11 @@ export function ScheduledTaskApproval({ permission }: { permission: PendingPermi
 					"projectId",
 					"runContext",
 					"narratorMode",
+					"targetNarratorId",
+					"contextPolicy",
+					"onBusy",
+					"busyWaitMinutes",
+					"requireReport",
 					"permissionMode",
 					"model",
 					"modelPolicy",
@@ -125,6 +160,9 @@ export function ScheduledTaskApproval({ permission }: { permission: PendingPermi
 				].map((key) => (
 					<Text size="xs" key={key}>
 						{field(key)}: {value(key, task[key])}
+						{view.inheritedFields.includes(key)
+							? ` · ${t("scheduledTaskApproval.inheritedValue")}`
+							: ""}
 					</Text>
 				))}
 				{view.before && view.changed.length > 0 && (
@@ -137,7 +175,7 @@ export function ScheduledTaskApproval({ permission }: { permission: PendingPermi
 										{field(key)}
 									</Text>
 									<Text size="xs" style={{ whiteSpace: "pre-wrap" }}>
-										{t("scheduledTaskApproval.before")}: {value(key, view.before?.[key])}
+										{t("scheduledTaskApproval.before")}: {value(key, view.before?.[key], true)}
 									</Text>
 									<Text size="xs" style={{ whiteSpace: "pre-wrap" }}>
 										{t("scheduledTaskApproval.after")}: {value(key, task[key])}
@@ -148,7 +186,7 @@ export function ScheduledTaskApproval({ permission }: { permission: PendingPermi
 					</details>
 				)}
 				{["prompt", "systemPrompt"].map((key) =>
-					task[key] ? (
+					task[key] && !view.inheritedFields.includes(key) ? (
 						<details key={key}>
 							<summary>{field(key)}</summary>
 							<Text size="xs" style={{ whiteSpace: "pre-wrap" }}>

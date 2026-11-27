@@ -1,10 +1,18 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import { db } from "@server/db";
-import { narratorBlacklistDirs, narrators, scheduledTasks, users } from "@server/db/schema";
+import {
+	aclGrants,
+	narratorBlacklistDirs,
+	narrators,
+	projects,
+	scheduledTasks,
+	users,
+} from "@server/db/schema";
 import { eq } from "drizzle-orm";
 import { setRunControl } from "../../../../services/agent-runtime/ownership";
 import { resolveRuntimePolicy } from "../../../../services/agent-runtime/policy";
 import { resolvePermissionDecision } from "../../../../services/narrator-permission";
+import { canWriteProject } from "../../../../services/project-acl";
 import { scheduledTaskService } from "../../../../services/scheduled-task-service";
 import { generateId } from "../../../id";
 import { getHome } from "../../../platform";
@@ -15,7 +23,59 @@ import {
 	previewScheduledTask,
 	resolveScheduledTaskApproval,
 } from "../scheduled-task-policy";
-import { activeRun, bindCall, caller, dailyTask, taskFor } from "./scheduled-task-fixtures";
+import {
+	activeRun,
+	bindCall,
+	caller,
+	dailyTask,
+	onScheduledTaskFixtureCleanup,
+	taskFor,
+} from "./scheduled-task-fixtures";
+
+async function managedProjectTask() {
+	const owner = await caller();
+	const manager = await caller();
+	const now = new Date().toISOString();
+	const [project] = await db
+		.insert(projects)
+		.values({
+			id: generateId(),
+			name: "Managed task project",
+			ownerUserId: owner.userId,
+			visibility: "private",
+			gitPath: "/managed-task-project",
+			createdAt: now,
+			updatedAt: now,
+		})
+		.returning();
+	onScheduledTaskFixtureCleanup(async () => {
+		await db.delete(scheduledTasks).where(eq(scheduledTasks.projectId, project.id));
+		await db.delete(projects).where(eq(projects.id, project.id));
+	});
+	const task = await scheduledTaskService.create(
+		{
+			...dailyTask,
+			runContext: "project",
+			projectId: project.id,
+			cwd: null,
+			permissionMode: "default",
+		},
+		owner.principal,
+	);
+	const grantId = generateId();
+	await db.insert(aclGrants).values({
+		id: grantId,
+		scopeType: "project",
+		scopeId: project.id,
+		principalType: "user",
+		principalId: manager.userId,
+		capability: "manage",
+		grantedBy: owner.userId,
+		createdAt: now,
+	});
+	onScheduledTaskFixtureCleanup(async () => db.delete(aclGrants).where(eq(aclGrants.id, grantId)));
+	return { owner, manager, task, project, grantId };
+}
 
 describe("ScheduledTask trusted policy and provenance", () => {
 	test("requires a real current user, not model-supplied owner or admin flags", async () => {
@@ -216,6 +276,28 @@ describe("ScheduledTask trusted policy and provenance", () => {
 		).toThrow("since approval");
 	});
 
+	test("target fingerprint comparison ignores serialized key order but rejects changed values", () => {
+		const approval = {
+			task: { name: "Reviewed" },
+			expectedTarget: { id: "target", fingerprint: "approved" },
+		};
+		const raw = {
+			_scheduledTaskApproval: {
+				task: { name: "Reviewed" },
+				expectedTarget: { fingerprint: "approved", id: "target" },
+			},
+		};
+		expect(() => assertScheduledTaskApprovalFresh(raw, approval)).not.toThrow();
+		for (const expectedTarget of [
+			{ id: "other", fingerprint: "approved" },
+			{ id: "target", fingerprint: "changed" },
+			null,
+		])
+			expect(() => assertScheduledTaskApprovalFresh(raw, { ...approval, expectedTarget })).toThrow(
+				"since approval",
+			);
+	});
+
 	test("live role is rechecked by service after the final authorization callback", async () => {
 		const fixture = await caller("admin");
 		const owner = await caller();
@@ -236,6 +318,7 @@ describe("ScheduledTask trusted policy and provenance", () => {
 		for (const input of [
 			{ action: "create", task: dailyTask },
 			{ action: "list" },
+			{ action: "targets" },
 			{ action: "get", id: another.id },
 			{ action: "delete", id: own.id },
 			{ action: "enable", id: own.id },
@@ -377,6 +460,161 @@ describe("ScheduledTask trusted policy and provenance", () => {
 			remove.mockRestore();
 			run.mockRestore();
 		}
+	});
+
+	test.each([
+		"update",
+		"disable",
+	])("legacy thirty-second cron permits %s without changing cadence", async (action) => {
+		const fixture = await caller();
+		const original = await taskFor(fixture);
+		await db
+			.update(scheduledTasks)
+			.set({
+				ownerUserId: null,
+				schedule: null,
+				scheduleKind: null,
+				scheduleCursorAt: null,
+				cronExpr: "*/30 * * * * *",
+			})
+			.where(eq(scheduledTasks.id, original.id));
+		const approved = await resolveScheduledTaskApproval(fixture.ctx, {
+			action,
+			id: original.id,
+			...(action === "update" ? { task: { name: "Renamed legacy task" } } : {}),
+		});
+		expect(approved.approval.task).toMatchObject({
+			schedule: { kind: "cron", expr: "*/30 * * * * *" },
+		});
+		const result = await scheduledTaskTool.execute(approved.input, fixture.ctx);
+		expect(result.isError, result.output).toBeFalsy();
+		expect(await scheduledTaskService.get(original.id)).toMatchObject({
+			ownerUserId: fixture.userId,
+			cronExpr: "*/30 * * * * *",
+			...(action === "update" ? { name: "Renamed legacy task" } : { enabled: false }),
+		});
+	});
+
+	test("the service still enforces frequency for creation and actual cadence changes", async () => {
+		const fixture = await caller();
+		const task = await taskFor(fixture);
+		await db
+			.update(scheduledTasks)
+			.set({
+				ownerUserId: null,
+				schedule: null,
+				scheduleKind: null,
+				scheduleCursorAt: null,
+				cronExpr: "*/30 * * * * *",
+			})
+			.where(eq(scheduledTasks.id, task.id));
+		for (const input of [
+			{ action: "create", task: { ...dailyTask, cronExpr: "*/30 * * * * *" } },
+			{ action: "update", id: task.id, task: { cronExpr: "*/15 * * * * *" } },
+			{ action: "update", id: task.id, task: { timezone: "Asia/Shanghai" } },
+		]) {
+			const result = await scheduledTaskTool.execute(input, fixture.ctx);
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain("too_frequent");
+		}
+		expect(await scheduledTaskService.get(task.id)).toMatchObject({
+			cronExpr: "*/30 * * * * *",
+			timezone: "UTC",
+		});
+	});
+
+	test("a task owner can pause after losing project access but cannot re-enable", async () => {
+		const { owner, manager, task, project } = await managedProjectTask();
+		await db
+			.update(projects)
+			.set({ ownerUserId: manager.userId })
+			.where(eq(projects.id, project.id));
+		expect(
+			await canWriteProject({ ...project, ownerUserId: manager.userId }, owner.principal),
+		).toBe(false);
+		const approved = await resolveScheduledTaskApproval(owner.ctx, {
+			action: "disable",
+			id: task.id,
+		});
+		expect(approved.approval.task).toMatchObject({
+			projectId: project.id,
+			cwd: project.gitPath,
+			enabled: false,
+		});
+		const result = await scheduledTaskTool.execute(approved.input, owner.ctx);
+		expect(result.isError, result.output).toBeFalsy();
+		expect((await scheduledTaskService.get(task.id))?.enabled).toBe(false);
+		const enabled = await scheduledTaskTool.execute({ action: "enable", id: task.id }, owner.ctx);
+		expect(enabled.isError).toBe(true);
+		expect((await scheduledTaskService.get(task.id))?.enabled).toBe(false);
+	});
+
+	test("project manager approvals omit confidential prompts while owners retain them", async () => {
+		const { owner, manager, task, project } = await managedProjectTask();
+		const approved = await resolveScheduledTaskApproval(manager.ctx, {
+			action: "disable",
+			id: task.id,
+		});
+		const forged = await resolveScheduledTaskApproval(manager.ctx, {
+			action: "disable",
+			id: task.id,
+			task: {
+				projectId: "unrelated-project",
+				cwd: "/unreviewed-directory",
+				prompt: "unused patch",
+			},
+		});
+		expect(forged.input.task).toBeUndefined();
+		expect(forged.approval.task).toEqual(approved.approval.task);
+		expect(approved.approval.canSeePrompt).toBe(false);
+		expect(approved.approval.task).toMatchObject({ projectId: project.id, cwd: project.gitPath });
+		for (const fields of [approved.approval.task, approved.approval.before]) {
+			expect(fields).not.toHaveProperty("prompt");
+			expect(fields).not.toHaveProperty("systemPrompt");
+		}
+		expect(JSON.stringify(approved.input)).not.toContain(dailyTask.prompt);
+		expect(JSON.stringify(approved.input)).not.toContain(dailyTask.systemPrompt);
+		const owned = await resolveScheduledTaskApproval(owner.ctx, { action: "disable", id: task.id });
+		expect(owned.approval).toMatchObject({
+			canSeePrompt: true,
+			task: { prompt: dailyTask.prompt, systemPrompt: dailyTask.systemPrompt },
+		});
+		const result = await scheduledTaskTool.execute(approved.input, manager.ctx);
+		expect(result.isError, result.output).toBeFalsy();
+		expect(result.output).not.toContain(dailyTask.prompt);
+		expect(result.output).not.toContain(dailyTask.systemPrompt);
+	});
+
+	test.each([
+		"prompt",
+		"systemPrompt",
+	])("hidden %s changes still invalidate a project manager approval", async (field) => {
+		const { manager, task } = await managedProjectTask();
+		const approved = await resolveScheduledTaskApproval(manager.ctx, {
+			action: "disable",
+			id: task.id,
+		});
+		await db
+			.update(scheduledTasks)
+			.set({ [field]: "UNREVIEWED_CONFIDENTIAL_CONTENT" })
+			.where(eq(scheduledTasks.id, task.id));
+		const result = await scheduledTaskTool.execute(approved.input, manager.ctx);
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("since approval");
+		expect(result.output).not.toContain("UNREVIEWED_CONFIDENTIAL_CONTENT");
+		expect((await scheduledTaskService.get(task.id))?.enabled).toBe(true);
+	});
+
+	test("revoking project management invalidates a pending pause approval", async () => {
+		const { manager, task, grantId } = await managedProjectTask();
+		const approved = await resolveScheduledTaskApproval(manager.ctx, {
+			action: "disable",
+			id: task.id,
+		});
+		await db.delete(aclGrants).where(eq(aclGrants.id, grantId));
+		const result = await scheduledTaskTool.execute(approved.input, manager.ctx);
+		expect(result.isError).toBe(true);
+		expect((await scheduledTaskService.get(task.id))?.enabled).toBe(true);
 	});
 
 	test("finite previews expose timezone, count and every upcoming occurrence", () => {

@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "daf6c9a1-c2c6-4d82-898a-5269760a5f19",
+  "id": "a3e0707a-9679-439f-a030-3fbbcd24c7d7",
   "prevId": "76f78d8e-4cad-403c-9431-3c4da427dfc4",
   "tables": {
     "acl_events": {
@@ -18726,6 +18726,13 @@
           "notNull": false,
           "autoincrement": false
         },
+        "logical_run_id": {
+          "name": "logical_run_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
         "model": {
           "name": "model",
           "type": "text",
@@ -18770,6 +18777,28 @@
         },
         "auto_handled": {
           "name": "auto_handled",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "require_report": {
+          "name": "require_report",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": true
+        },
+        "busy_deadline_at": {
+          "name": "busy_deadline_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "interrupt_target": {
+          "name": "interrupt_target",
           "type": "text",
           "primaryKey": false,
           "notNull": false,
@@ -18842,12 +18871,54 @@
           ],
           "isUnique": false
         },
+        "idx_scheduled_task_runs_task_status": {
+          "name": "idx_scheduled_task_runs_task_status",
+          "columns": [
+            "task_id",
+            "status"
+          ],
+          "isUnique": false
+        },
         "idx_scheduled_task_runs_narrator": {
           "name": "idx_scheduled_task_runs_narrator",
           "columns": [
             "narrator_id"
           ],
           "isUnique": false
+        },
+        "idx_scheduled_task_runs_narrator_task": {
+          "name": "idx_scheduled_task_runs_narrator_task",
+          "columns": [
+            "narrator_id",
+            "task_id"
+          ],
+          "isUnique": false
+        },
+        "idx_scheduled_task_runs_wait_queue": {
+          "name": "idx_scheduled_task_runs_wait_queue",
+          "columns": [
+            "narrator_id",
+            "status",
+            "created_at",
+            "id"
+          ],
+          "isUnique": false
+        },
+        "idx_scheduled_task_runs_one_waiting": {
+          "name": "idx_scheduled_task_runs_one_waiting",
+          "columns": [
+            "task_id"
+          ],
+          "isUnique": true,
+          "where": "\"scheduled_task_runs\".\"status\" = 'waiting'"
+        },
+        "idx_scheduled_task_runs_one_interrupt": {
+          "name": "idx_scheduled_task_runs_one_interrupt",
+          "columns": [
+            "narrator_id"
+          ],
+          "isUnique": true,
+          "where": "\"scheduled_task_runs\".\"status\" = 'waiting' AND \"scheduled_task_runs\".\"interrupt_target\" IS NOT NULL"
         },
         "idx_scheduled_task_runs_status": {
           "name": "idx_scheduled_task_runs_status",
@@ -18930,6 +19001,28 @@
           "notNull": true,
           "autoincrement": false,
           "default": 0
+        },
+        "schedule_revision": {
+          "name": "schedule_revision",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "schedule_cursor_at": {
+          "name": "schedule_cursor_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "active_run_id": {
+          "name": "active_run_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
         },
         "completed_at": {
           "name": "completed_at",
@@ -19026,6 +19119,45 @@
           "notNull": true,
           "autoincrement": false,
           "default": "'new'"
+        },
+        "target_narrator_id": {
+          "name": "target_narrator_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "context_policy": {
+          "name": "context_policy",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'keep'"
+        },
+        "on_busy": {
+          "name": "on_busy",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'skip'"
+        },
+        "busy_wait_minutes": {
+          "name": "busy_wait_minutes",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 30
+        },
+        "require_report": {
+          "name": "require_report",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": true
         },
         "cleanup_policy": {
           "name": "cleanup_policy",
@@ -19261,6 +19393,13 @@
           ],
           "isUnique": false
         },
+        "idx_scheduled_tasks_target_narrator": {
+          "name": "idx_scheduled_tasks_target_narrator",
+          "columns": [
+            "target_narrator_id"
+          ],
+          "isUnique": false
+        },
         "idx_scheduled_tasks_last_narrator": {
           "name": "idx_scheduled_tasks_last_narrator",
           "columns": [
@@ -19276,6 +19415,19 @@
           "tableTo": "projects",
           "columnsFrom": [
             "project_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "set null",
+          "onUpdate": "no action"
+        },
+        "scheduled_tasks_target_narrator_id_narrators_id_fk": {
+          "name": "scheduled_tasks_target_narrator_id_narrators_id_fk",
+          "tableFrom": "scheduled_tasks",
+          "tableTo": "narrators",
+          "columnsFrom": [
+            "target_narrator_id"
           ],
           "columnsTo": [
             "id"

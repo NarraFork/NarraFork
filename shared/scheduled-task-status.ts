@@ -27,6 +27,7 @@
  * re-read as a claim that the work finished.
  */
 export const SCHEDULED_RUN_STATUSES = [
+	"waiting",
 	"running",
 	"blocked",
 	"completed",
@@ -39,7 +40,7 @@ export const SCHEDULED_RUN_STATUSES = [
 ] as const;
 export type ScheduledRunStatus = (typeof SCHEDULED_RUN_STATUSES)[number];
 
-/** Statuses of a run that is still in flight and may yet change. */
+/** Executing runs only: waiting runs have no runtime or report authority. */
 export const ACTIVE_RUN_STATUSES = [
 	"running",
 	"blocked",
@@ -47,6 +48,24 @@ export const ACTIVE_RUN_STATUSES = [
 
 export function isActiveRunStatus(status: string | null | undefined): boolean {
 	return status === "running" || status === "blocked";
+}
+
+/** Accepted runs that still prevent a schedule from completing. */
+export const UNFINISHED_RUN_STATUSES = [
+	"waiting",
+	...ACTIVE_RUN_STATUSES,
+] as const satisfies readonly ScheduledRunStatus[];
+
+export function isUnfinishedRunStatus(status: string | null | undefined): boolean {
+	return status === "waiting" || isActiveRunStatus(status);
+}
+
+/** The precise execution an interrupt accepted; never retargeted after an await or restart. */
+export interface ScheduledRunInterruptTarget {
+	narratorId: string;
+	logicalRunId?: string;
+	executionEpoch?: string;
+	scheduledRunId?: string;
 }
 
 /** Why a run is parked. `provider_wait` is the only one no person can clear. */
@@ -75,8 +94,14 @@ export const RUN_ERROR_KINDS = [
 	"restart",
 	/** The task's owner may no longer act on the project or session. */
 	"acl",
-	/** The target session was already running. */
+	/** The target session was already running or its admission queue was full. */
 	"busy",
+	/** No execution slot became available before the accepted wait deadline. */
+	"busy_timeout",
+	/** Another scheduled run interrupted this precise execution. */
+	"scheduled_interrupt",
+	/** Accepted work was cancelled before dispatch (for example, by pausing its task). */
+	"cancelled",
 	/** The project or session the task points at is gone. */
 	"target_missing",
 	/** A person stopped the run. */
@@ -93,6 +118,8 @@ export type RunTrigger = (typeof RUN_TRIGGERS)[number];
  */
 export type RunVerdict =
 	| "succeeded"
+	| "completed"
+	| "waiting"
 	| "unconfirmed"
 	| "incomplete"
 	| "failed"
@@ -107,8 +134,10 @@ export type RunVerdict =
 export function runVerdict(
 	status: string | null | undefined,
 	outcome: string | null | undefined,
+	requireReport = true,
 ): RunVerdict {
 	switch (status) {
+		case "waiting":
 		case "running":
 		case "blocked":
 		case "failed":
@@ -120,7 +149,7 @@ export function runVerdict(
 		case "completed":
 			if (outcome === "done" || outcome === "no_change") return "succeeded";
 			if (outcome === "partial" || outcome === "blocked") return "incomplete";
-			return "unconfirmed";
+			return requireReport ? "unconfirmed" : "completed";
 		default:
 			// Legacy `success`, and anything unrecognized: all that is known is that it was sent.
 			return "dispatched";
@@ -168,6 +197,13 @@ export type TaskPauseReason = (typeof TASK_PAUSE_REASONS)[number];
  */
 export const TASK_MODEL_POLICIES = ["follow", "temporary", "sync"] as const;
 export type TaskModelPolicy = (typeof TASK_MODEL_POLICIES)[number];
+
+export const TASK_NARRATOR_MODES = ["new", "reuse", "existing"] as const;
+export type TaskNarratorMode = (typeof TASK_NARRATOR_MODES)[number];
+export const TASK_CONTEXT_POLICIES = ["keep", "clear"] as const;
+export type TaskContextPolicy = (typeof TASK_CONTEXT_POLICIES)[number];
+export const TASK_ON_BUSY_POLICIES = ["skip", "wait", "interrupt"] as const;
+export type TaskOnBusyPolicy = (typeof TASK_ON_BUSY_POLICIES)[number];
 
 /**
  * What an unattended run does when it reaches something only a person can settle.
@@ -224,6 +260,9 @@ export interface RunStats {
 export const SCHEDULED_TASK_LIMITS = {
 	maxRunMinutes: { min: 5, max: 1440, default: 60 },
 	blockedWaitMinutes: { min: 1, max: 1440, default: 30 },
+	busyWaitMinutes: { min: 1, max: 1440, default: 30 },
+	maxWaitingPerNarrator: 64,
+	interruptWaitMs: 15_000,
 	outcomeSummaryChars: 2000,
 	/** How much of the last summary rides on the task row for list display. */
 	lastSummaryChars: 500,

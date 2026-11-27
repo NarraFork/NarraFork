@@ -1,6 +1,6 @@
 {
-  "id": "ff7e0c27-74cd-4fc5-a4f0-84d6f4158061",
-  "prevId": "a8ad426b-536f-46f7-b7fa-77520e3c4e38",
+  "id": "6c6633d5-bee0-4f03-870a-be6bd0f237ec",
+  "prevId": "0037af1a-0d86-4ddd-9499-9a605cce1179",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -22639,6 +22639,25 @@
           "primaryKey": false,
           "notNull": false
         },
+        "require_report": {
+          "name": "require_report",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": true
+        },
+        "busy_deadline_at": {
+          "name": "busy_deadline_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "interrupt_target": {
+          "name": "interrupt_target",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
         "nudged": {
           "name": "nudged",
           "type": "boolean",
@@ -22711,6 +22730,27 @@
           "method": "btree",
           "with": {}
         },
+        "idx_scheduled_task_runs_task_status": {
+          "name": "idx_scheduled_task_runs_task_status",
+          "columns": [
+            {
+              "expression": "task_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "status",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
         "idx_scheduled_task_runs_narrator": {
           "name": "idx_scheduled_task_runs_narrator",
           "columns": [
@@ -22722,6 +22762,92 @@
             }
           ],
           "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_scheduled_task_runs_narrator_task": {
+          "name": "idx_scheduled_task_runs_narrator_task",
+          "columns": [
+            {
+              "expression": "narrator_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "task_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_scheduled_task_runs_wait_queue": {
+          "name": "idx_scheduled_task_runs_wait_queue",
+          "columns": [
+            {
+              "expression": "narrator_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "status",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "created_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_scheduled_task_runs_one_waiting": {
+          "name": "idx_scheduled_task_runs_one_waiting",
+          "columns": [
+            {
+              "expression": "task_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "\"status\" = 'waiting'",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_scheduled_task_runs_one_interrupt": {
+          "name": "idx_scheduled_task_runs_one_interrupt",
+          "columns": [
+            {
+              "expression": "narrator_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "\"status\" = 'waiting' AND \"interrupt_target\" IS NOT NULL",
           "concurrently": false,
           "method": "btree",
           "with": {}
@@ -22918,6 +23044,40 @@
           "primaryKey": false,
           "notNull": true,
           "default": "'new'"
+        },
+        "target_narrator_id": {
+          "name": "target_narrator_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "context_policy": {
+          "name": "context_policy",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'keep'"
+        },
+        "on_busy": {
+          "name": "on_busy",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'skip'"
+        },
+        "busy_wait_minutes": {
+          "name": "busy_wait_minutes",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 30
+        },
+        "require_report": {
+          "name": "require_report",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": true
         },
         "cleanup_policy": {
           "name": "cleanup_policy",
@@ -23180,6 +23340,21 @@
           "method": "btree",
           "with": {}
         },
+        "idx_scheduled_tasks_target_narrator": {
+          "name": "idx_scheduled_tasks_target_narrator",
+          "columns": [
+            {
+              "expression": "target_narrator_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
         "idx_scheduled_tasks_last_narrator": {
           "name": "idx_scheduled_tasks_last_narrator",
           "columns": [
@@ -23203,6 +23378,19 @@
           "tableTo": "projects",
           "columnsFrom": [
             "project_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "set null",
+          "onUpdate": "no action"
+        },
+        "scheduled_tasks_target_narrator_id_narrators_id_fk": {
+          "name": "scheduled_tasks_target_narrator_id_narrators_id_fk",
+          "tableFrom": "scheduled_tasks",
+          "tableTo": "narrators",
+          "columnsFrom": [
+            "target_narrator_id"
           ],
           "columnsTo": [
             "id"

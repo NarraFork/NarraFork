@@ -1,6 +1,7 @@
 import type { Locale } from "@shared/i18n-locales";
 import type {
 	RunBlockReason,
+	ScheduledRunInterruptTarget,
 	TaskModelPolicy,
 	TaskOnBlockedPolicy,
 } from "@shared/scheduled-task-status";
@@ -21,7 +22,16 @@ export interface ScheduledRunRegistration {
 	modelPolicy: TaskModelPolicy;
 	model: string | null;
 	locale?: Locale;
+	narratorMode?: "new" | "reuse" | "existing";
+	contextPolicy?: "keep" | "clear";
+	contextPrepared?: boolean;
+	/** Captured when the occurrence is accepted; task edits cannot change this run. */
+	requireReport?: boolean;
+	interruptTarget?: ScheduledRunInterruptTarget;
+	/** Set before cancelling the exact execution so terminal callbacks preserve attribution. */
+	interruptionReason?: "scheduled_interrupt";
 	logicalRunId?: string;
+	executionEpoch?: string;
 	triggerMessageId?: string;
 	/** Cold recovery has no authoritative terminal receipt. Never infer success from idle. */
 	recoveredAt?: number;
@@ -33,6 +43,7 @@ export interface ScheduledRunRegistration {
 
 export interface ScheduledRunTerminal {
 	logicalRunId: string;
+	executionEpoch?: string;
 	status: "completed" | "failed" | "interrupted" | "timed_out";
 	error?: string;
 	settledAt: number;
@@ -42,6 +53,7 @@ export interface ScheduledRunMember {
 	runId: string;
 	narratorId: string;
 	logicalRunId: string;
+	executionEpoch?: string;
 	/** Present only after the service checked the real persisted parent chain. */
 	parentNarratorId?: string;
 }
@@ -57,7 +69,7 @@ export function registerScheduledRun(input: ScheduledRunRegistration): Scheduled
 		if (existing.runId !== input.runId) throw new Error("Narrator already has a scheduled run");
 		return existing;
 	}
-	const registration = { ...input };
+	const registration = { ...input, requireReport: input.requireReport ?? true };
 	registry.roots.set(input.narratorId, registration);
 	return registration;
 }
@@ -91,9 +103,37 @@ export function bindScheduledRunMember(member: ScheduledRunMember): boolean {
 	registry.members.set(member.narratorId, { ...member });
 	if (member.narratorId === root.narratorId) {
 		root.logicalRunId = member.logicalRunId;
+		root.executionEpoch = member.executionEpoch;
 		root.terminal = undefined;
 		root.turns = (root.turns ?? 0) + 1;
 	}
+	return true;
+}
+
+/** A fresh pass of the same RunControl rotates its owner without creating another turn. */
+export function rotateScheduledRunExecutionEpoch(input: {
+	narratorId: string;
+	logicalRunId: string;
+	previousEpoch: string;
+	executionEpoch: string;
+}): boolean {
+	const member = registry.members.get(input.narratorId);
+	if (
+		!member ||
+		member.logicalRunId !== input.logicalRunId ||
+		member.executionEpoch !== input.previousEpoch
+	)
+		return false;
+	const root = getScheduledRunById(member.runId);
+	if (!root) return false;
+	const isRoot = root.narratorId === input.narratorId;
+	if (
+		isRoot &&
+		(root.logicalRunId !== input.logicalRunId || root.executionEpoch !== input.previousEpoch)
+	)
+		return false;
+	member.executionEpoch = input.executionEpoch;
+	if (isRoot) root.executionEpoch = input.executionEpoch;
 	return true;
 }
 
@@ -103,7 +143,12 @@ export function recordScheduledRunTerminal(
 	terminal: ScheduledRunTerminal,
 ): boolean {
 	const root = registry.roots.get(narratorId);
-	if (root?.runId !== runId || root.logicalRunId !== terminal.logicalRunId) return false;
+	if (
+		root?.runId !== runId ||
+		root.logicalRunId !== terminal.logicalRunId ||
+		root.executionEpoch !== terminal.executionEpoch
+	)
+		return false;
 	root.terminal = terminal;
 	return true;
 }
@@ -150,5 +195,12 @@ export function unattendedPermissionDecision(input: {
 	return input.decision === "ask" ? "deny" : undefined;
 }
 
-export const UNATTENDED_PERMISSION_MESSAGE =
-	"This scheduled run is unattended and cannot obtain interactive approval. Do not ask questions or enter plan mode. Continue within existing permissions; if blocked, use ScheduledTaskReport to report the limitation.";
+export function getUnattendedPermissionMessage(requireReport = true): string {
+	const guidance =
+		"This scheduled run is unattended and cannot obtain interactive approval. Do not ask questions or enter plan mode. Continue within existing permissions; ";
+	return requireReport
+		? `${guidance}if blocked, use ScheduledTaskReport to report the limitation.`
+		: `${guidance}if blocked, explain the limitation in your final response.`;
+}
+
+export const UNATTENDED_PERMISSION_MESSAGE = getUnattendedPermissionMessage();

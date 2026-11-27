@@ -26,26 +26,50 @@ export function TaskConfigSummary({ task }: { task: ScheduledTask }) {
 		dontAsk: "permDontAsk",
 	};
 	const retention = task.cleanupPolicy;
+	const existing = task.narratorMode === "existing";
 	return (
 		<Paper withBorder p="lg" radius="md">
 			<Stack>
 				<Title order={3}>{t("configuration")}</Title>
-				<SummaryRow label={t("runContext")}>
-					{t(task.runContext === "standalone" ? "ctxStandalone" : "ctxProject")}
-				</SummaryRow>
-				{task.projectId && <SummaryRow label={t("project")}>{task.projectId}</SummaryRow>}
-				<SummaryRow label={t("cwd")}>{task.cwd || t("defaultDirectory")}</SummaryRow>
 				<SummaryRow label={t("narratorMode")}>
-					{t(task.narratorMode === "reuse" ? "modeReuse" : "modeNew")}
+					{t(existing ? "modeExisting" : task.narratorMode === "reuse" ? "modeReuse" : "modeNew")}
 				</SummaryRow>
-				<SummaryRow label={t("model")}>{task.model || t("modelFollowDefault")}</SummaryRow>
-				{task.narratorMode === "reuse" && (
-					<SummaryRow label={t("modelPolicy")}>{t(`policy.${task.modelPolicy}`)}</SummaryRow>
+				{existing ? (
+					<>
+						<SummaryRow label={t("targetNarrator")}>{task.targetNarratorId}</SummaryRow>
+						<Text size="xs" c="dimmed">
+							{t("existingInherited")}
+						</Text>
+					</>
+				) : (
+					<>
+						<SummaryRow label={t("runContext")}>
+							{t(task.runContext === "standalone" ? "ctxStandalone" : "ctxProject")}
+						</SummaryRow>
+						{task.projectId && <SummaryRow label={t("project")}>{task.projectId}</SummaryRow>}
+						<SummaryRow label={t("cwd")}>{task.cwd || t("defaultDirectory")}</SummaryRow>
+						<SummaryRow label={t("permissionMode")}>
+							{permissions[task.permissionMode]
+								? t(permissions[task.permissionMode])
+								: task.permissionMode}
+						</SummaryRow>
+					</>
 				)}
-				<SummaryRow label={t("permissionMode")}>
-					{permissions[task.permissionMode]
-						? t(permissions[task.permissionMode])
-						: task.permissionMode}
+				{(!existing || task.modelPolicy !== "follow") && (
+					<SummaryRow label={t("model")}>{task.model || t("modelFollowDefault")}</SummaryRow>
+				)}
+				{task.narratorMode !== "new" && (
+					<>
+						<SummaryRow label={t("contextPolicy")}>{t(`context.${task.contextPolicy}`)}</SummaryRow>
+						<SummaryRow label={t("modelPolicy")}>{t(`policy.${task.modelPolicy}`)}</SummaryRow>
+					</>
+				)}
+				<SummaryRow label={t("onBusy")}>
+					{t(`busyPolicy.${task.onBusy ?? "skip"}`)}
+					{task.onBusy === "wait" ? ` · ${t("minutesValue", { count: task.busyWaitMinutes })}` : ""}
+				</SummaryRow>
+				<SummaryRow label={t("requireReport")}>
+					{t(task.requireReport === false ? "no" : "yes")}
 				</SummaryRow>
 				<SummaryRow label={t("onBlocked")}>
 					{t(`blockedPolicy.${task.onBlocked}`)}
@@ -59,14 +83,18 @@ export function TaskConfigSummary({ task }: { task: ScheduledTask }) {
 				<SummaryRow label={t("notifyOnSuccess")}>
 					{t(task.notifyOnSuccess ? "yes" : "no")}
 				</SummaryRow>
-				<SummaryRow label={t("cleanupPolicy")}>
-					{!retention || retention.mode === "none"
-						? t("cleanupNone")
-						: retention.mode === "keepLatestN"
-							? t("retentionLatest", { count: retention.keepLatestN })
-							: t("retentionDays", { count: retention.olderThanDays })}
-				</SummaryRow>
-				<SummaryRow label={t("locale")}>{task.locale}</SummaryRow>
+				{!existing && (
+					<>
+						<SummaryRow label={t("cleanupPolicy")}>
+							{!retention || retention.mode === "none"
+								? t("cleanupNone")
+								: retention.mode === "keepLatestN"
+									? t("retentionLatest", { count: retention.keepLatestN })
+									: t("retentionDays", { count: retention.olderThanDays })}
+						</SummaryRow>
+						<SummaryRow label={t("locale")}>{task.locale}</SummaryRow>
+					</>
+				)}
 				{task.capabilities.canSeePrompt && task.prompt !== undefined ? (
 					<Accordion variant="contained">
 						<Accordion.Item value="prompt">
@@ -77,7 +105,7 @@ export function TaskConfigSummary({ task }: { task: ScheduledTask }) {
 								</Text>
 							</Accordion.Panel>
 						</Accordion.Item>
-						{task.systemPrompt && (
+						{!existing && task.systemPrompt && (
 							<Accordion.Item value="systemPrompt">
 								<Accordion.Control>{t("systemPrompt")}</Accordion.Control>
 								<Accordion.Panel>

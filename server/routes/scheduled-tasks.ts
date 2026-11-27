@@ -5,13 +5,17 @@ import { ForbiddenError, ValidationError } from "../lib/errors";
 import { narratorPrincipalOf } from "../lib/narrator-access";
 import {
 	createScheduledTaskSchema,
+	scheduledTaskAssociationsQuerySchema,
 	scheduledTaskFiltersSchema,
 	scheduledTaskPreviewSchema,
+	scheduledTaskTargetsQuerySchema,
 	toggleScheduledTaskSchema,
 	updateScheduledTaskSchema,
 } from "../lib/validators/scheduled-tasks";
+import { listNarratorScheduledTasks } from "../services/scheduled-task-associations";
 import { cleanupScheduledTaskNarrators } from "../services/scheduled-task-cleanup";
 import { scheduledTaskService } from "../services/scheduled-task-service";
+import { listScheduledTaskTargets } from "../services/scheduled-task-targets";
 
 export const scheduledTaskRoutes = new Hono();
 scheduledTaskRoutes.use("*", bodyLimit({ maxSize: 256 * 1024 }));
@@ -33,6 +37,25 @@ scheduledTaskRoutes.post("/preview-schedule", async (c) => {
 		scheduledTaskService.preview(parse(scheduledTaskPreviewSchema, await c.req.json())),
 	);
 });
+
+scheduledTaskRoutes.get("/targets", async (c) =>
+	c.json(
+		await listScheduledTaskTargets(
+			narratorPrincipalOf(c),
+			parse(scheduledTaskTargetsQuerySchema, c.req.query()),
+		),
+	),
+);
+
+scheduledTaskRoutes.get("/for-narrator/:narratorId", async (c) =>
+	c.json(
+		await listNarratorScheduledTasks(
+			c.req.param("narratorId"),
+			narratorPrincipalOf(c),
+			parse(scheduledTaskAssociationsQuerySchema, c.req.query()),
+		),
+	),
+);
 
 scheduledTaskRoutes.get("/:id", async (c) =>
 	c.json(await scheduledTaskService.detail(c.req.param("id"), narratorPrincipalOf(c))),

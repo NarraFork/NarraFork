@@ -46,7 +46,8 @@ export function TaskActions({
 		setNotice(null);
 		run.mutate(task.id, { onSuccess: () => setNotice(t("runStarted")) });
 	};
-	const canCleanup = caps.canEdit && task.cleanupPolicy?.mode !== "none";
+	const canCleanup =
+		caps.canEdit && task.narratorMode !== "existing" && task.cleanupPolicy?.mode !== "none";
 	const hasMenu = caps.canRun || caps.canEdit || caps.canSeePrompt || caps.canDelete;
 	return (
 		<Stack gap={4}>
@@ -128,7 +129,7 @@ export function TaskActions({
 									{t("copyTask")}
 								</Menu.Item>
 							)}
-							{caps.canEdit && (
+							{caps.canEdit && task.narratorMode !== "existing" && (
 								<Menu.Item
 									leftSection={<IconBrush size={14} />}
 									disabled={!canCleanup || pending}

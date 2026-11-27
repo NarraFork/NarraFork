@@ -8,9 +8,11 @@ import { appendRuntimePolicyTrait, parseRuntimePolicyTraits } from "../../lib/ru
 import { settings } from "../../lib/settings";
 import { isRuntimeToolAllowed, resolveRuntimePolicy } from "../agent-runtime/policy";
 import {
+	getUnattendedPermissionMessage,
 	listRegisteredScheduledRuns,
 	registerScheduledRun,
 	type ScheduledRunRegistration,
+	UNATTENDED_PERMISSION_MESSAGE,
 	unattendedPermissionDecision,
 	unregisterScheduledRun,
 } from "../scheduled-run-registry";
@@ -54,6 +56,7 @@ async function request(
 	options: {
 		onBlocked?: "auto" | "wait";
 		reportOnly?: boolean;
+		requireReport?: boolean;
 		input?: Record<string, unknown>;
 		runtimeReadOnly?: boolean;
 		plan?: boolean;
@@ -99,6 +102,7 @@ async function request(
 		modelPolicy: "follow",
 		model: null,
 		reportOnly: options.reportOnly,
+		requireReport: options.requireReport,
 	});
 	const controller = new AbortController();
 	controllers.push(controller);
@@ -158,6 +162,30 @@ afterEach(async () => {
 afterAll(() => sqlite.close());
 
 describe("unattended permission narrowing", () => {
+	test("permission guidance preserves the legacy default and makes reporting optional", () => {
+		expect(getUnattendedPermissionMessage()).toBe(UNATTENDED_PERMISSION_MESSAGE);
+		expect(getUnattendedPermissionMessage()).toContain("ScheduledTaskReport");
+		expect(getUnattendedPermissionMessage(false)).not.toContain("ScheduledTaskReport");
+		expect(getUnattendedPermissionMessage(false)).toContain("final response");
+	});
+
+	test("optional-report runs deny interactive approval without demanding a report tool", async () => {
+		for (const toolName of ["AskUserQuestion", "CustomMutation"]) {
+			const { result } = await request(toolName, { requireReport: false });
+			expect(await result).toMatchObject({
+				behavior: "deny",
+				message: expect.stringContaining(getUnattendedPermissionMessage(false)),
+			});
+		}
+		const report = await request("ScheduledTaskReport", {
+			requireReport: false,
+			runtimeReadOnly: true,
+			input: { outcome: "no_change" },
+		});
+		expect((await report.result).behavior).toBe("allow");
+		expect(pendingPermissions.size).toBe(0);
+	});
+
 	test("auto mode rejects synchronous/async questions and entering plan before an early allow", async () => {
 		for (const toolName of ["AskUserQuestion", "Ask", "EnterPlanMode"]) {
 			const { result } = await request(toolName, { input: { async: true } });

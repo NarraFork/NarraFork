@@ -83,7 +83,7 @@ function ScheduledTaskDetailPage() {
 			{task.pauseReason === "circuit_breaker" && (
 				<Alert color="orange">{t("circuitBreakerHint")}</Alert>
 			)}
-			<Grid gutter="lg">
+			<Grid gap="lg">
 				<Grid.Col span={{ base: 12, md: 8 }}>
 					<Stack gap="lg">
 						<Paper withBorder p="lg" radius="md">
@@ -115,10 +115,14 @@ function ScheduledTaskDetailPage() {
 								<TaskCreator task={task} detailed />
 								{task.creator.canOpen && task.creator.narratorId && (
 									<Button
-										component={Link}
-										to="/narrators/$narratorId"
-										params={{ narratorId: task.creator.narratorId }}
-										hash={task.creator.messageId ? `msg-${task.creator.messageId}` : undefined}
+										renderRoot={(props) => (
+											<Link
+												{...props}
+												to="/narrators/$narratorId"
+												params={{ narratorId: task.creator.narratorId ?? "" }}
+												hash={task.creator.messageId ? `msg-${task.creator.messageId}` : undefined}
+											/>
+										)}
 										variant="subtle"
 										size="xs"
 										w="fit-content"
@@ -143,7 +147,11 @@ function ScheduledTaskDetailPage() {
 									<Stack gap="xs">
 										{task.lastStatus ? (
 											<>
-												<RunVerdictBadge status={task.lastStatus} outcome={task.lastOutcome} />
+												<RunVerdictBadge
+													status={task.lastStatus}
+													outcome={task.lastOutcome}
+													requireReport={task.lastRequireReport ?? true}
+												/>
 												{task.lastSummary && <Text size="sm">{task.lastSummary}</Text>}
 											</>
 										) : (

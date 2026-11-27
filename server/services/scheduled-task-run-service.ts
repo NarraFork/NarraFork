@@ -7,6 +7,7 @@ import {
 	type RunErrorKind,
 	type RunOutcome,
 	type ScheduledRunStatus,
+	UNFINISHED_RUN_STATUSES,
 } from "@shared/scheduled-task-status";
 import { and, eq, inArray, isNull } from "drizzle-orm";
 import { db } from "../db";
@@ -17,7 +18,7 @@ import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import type { RunControl, RunResult } from "./agent-runtime/ownership";
-import { getRunControl } from "./agent-runtime/ownership";
+import { getExecutionOwner, getRunControl } from "./agent-runtime/ownership";
 import {
 	bindScheduledRunMember,
 	getRegisteredScheduledRun,
@@ -46,6 +47,15 @@ async function notify(runId: string, kind: ScheduledRunNotice): Promise<void> {
 	});
 }
 
+/** Admission failures are already durable; publish the same notices as settled executions. */
+export async function notifyScheduledRunAdmissionFailure(
+	runId: string,
+	circuitBreaker = false,
+): Promise<void> {
+	await notify(runId, "failed");
+	if (circuitBreaker) await notify(runId, "circuit_breaker");
+}
+
 /** Real ancestry and exact runtime receipts, never a caller-supplied root/task id or trait. */
 export async function lookupScheduledRun(
 	narratorId: string,
@@ -55,7 +65,12 @@ export async function lookupScheduledRun(
 	const root = getScheduledRunById(member.runId);
 	if (!root) return undefined;
 	const control = getRunControl(narratorId);
-	if (!control || control.logicalRunId !== member.logicalRunId) return undefined;
+	const matchesExecution = () =>
+		getRunControl(narratorId) === control &&
+		control?.logicalRunId === member.logicalRunId &&
+		(member.executionEpoch === undefined ||
+			getExecutionOwner(narratorId)?.epoch === member.executionEpoch);
+	if (!control || !matchesExecution()) return undefined;
 	const { narratorService } = await import("./narrator-service");
 	const visited = new Set<string>();
 	let id: string | null = narratorId;
@@ -64,7 +79,7 @@ export async function lookupScheduledRun(
 		if (id === root.narratorId)
 			return getScheduledRunById(root.runId) === root &&
 				getScheduledRunMember(narratorId) === member &&
-				getRunControl(narratorId)?.logicalRunId === member.logicalRunId
+				matchesExecution()
 				? root
 				: undefined;
 		const row: { parentNarratorId: string | null } | null = await narratorService
@@ -83,7 +98,13 @@ export async function attachScheduledRuntimeRun(input: {
 	initiatedBy?: "person" | "system";
 }): Promise<void> {
 	const { narratorId, run } = input;
-	if (!run.logicalRunId) return;
+	const logicalRunId = run.logicalRunId;
+	if (!logicalRunId) return;
+	const executionEpoch = getExecutionOwner(narratorId)?.epoch;
+	const matchesExecution = () =>
+		getRunControl(narratorId) === run &&
+		run.logicalRunId === logicalRunId &&
+		getExecutionOwner(narratorId)?.epoch === executionEpoch;
 	let root = getRegisteredScheduledRun(narratorId);
 	let parentNarratorId: string | undefined;
 	if (root && input.initiatedBy === "person" && input.scheduledRunId !== root.runId) {
@@ -110,31 +131,45 @@ export async function attachScheduledRuntimeRun(input: {
 		if (run.cancelWith?.runId && run.cancelWith.runId !== parent.logicalRunId) return;
 	}
 	const registration = root;
+	if (!matchesExecution() || getScheduledRunById(registration.runId) !== registration)
+		throw new ValidationError("Scheduled execution changed before attachment");
 	if (narratorId === registration.narratorId) {
-		const changed = await db
+		const changed = db
 			.update(scheduledTaskRuns)
-			.set({ logicalRunId: run.logicalRunId })
+			.set({ logicalRunId })
 			.where(
 				and(
 					eq(scheduledTaskRuns.id, registration.runId),
 					inArray(scheduledTaskRuns.status, ACTIVE_RUN_STATUSES),
 				),
 			)
-			.returning({ id: scheduledTaskRuns.id });
-		if (!changed.length) throw new ValidationError("Scheduled run is no longer active");
+			.returning({ id: scheduledTaskRuns.id, requireReport: scheduledTaskRuns.requireReport })
+			.get();
+		if (!changed) throw new ValidationError("Scheduled run is no longer active");
+		registration.requireReport = changed.requireReport;
 	}
+	if (!matchesExecution() || getScheduledRunById(registration.runId) !== registration)
+		throw new ValidationError("Scheduled execution changed during attachment");
 	bindScheduledRunMember({
 		runId: registration.runId,
 		narratorId,
-		logicalRunId: run.logicalRunId,
+		logicalRunId,
+		executionEpoch,
 		parentNarratorId,
 	});
-	const logicalRunId = run.logicalRunId;
+	const member = getScheduledRunMember(narratorId);
+	if (!member) throw new ValidationError("Scheduled execution binding expired");
 	void run.terminal.then((result) => {
+		if (
+			getScheduledRunMember(narratorId) !== member ||
+			getScheduledRunById(registration.runId) !== registration
+		)
+			return;
 		const status = scheduledTerminalStatus(result);
 		if (
 			!recordScheduledRunTerminal(registration.runId, narratorId, {
 				logicalRunId,
+				executionEpoch: member.executionEpoch,
 				status,
 				error:
 					result.terminalStatus?.errorMessage ??
@@ -310,6 +345,7 @@ export async function claimScheduledRunNudge(runId: string): Promise<boolean> {
 				eq(scheduledTaskRuns.id, runId),
 				inArray(scheduledTaskRuns.status, ACTIVE_RUN_STATUSES),
 				eq(scheduledTaskRuns.nudged, false),
+				eq(scheduledTaskRuns.requireReport, true),
 				isNull(scheduledTaskRuns.outcome),
 			),
 		)
@@ -326,38 +362,75 @@ export async function endScheduledRunForHumanInput(narratorId: string): Promise<
 		});
 }
 
+/** At most one accepted waiting occurrence per task; a concurrent dispatch wins its CAS. */
+export async function cancelScheduledTaskWaitingRuns(
+	taskId: string,
+	reason: string,
+): Promise<number> {
+	const [run] = await db
+		.select({ id: scheduledTaskRuns.id })
+		.from(scheduledTaskRuns)
+		.where(and(eq(scheduledTaskRuns.taskId, taskId), eq(scheduledTaskRuns.status, "waiting")))
+		.limit(1);
+	if (!run) return 0;
+	return (await finalizeScheduledRun(run.id, "skipped", {
+		error: reason,
+		errorKind: "cancelled",
+		summary: reason,
+		expectedStatus: "waiting",
+	}))
+		? 1
+		: 0;
+}
+
 /** Run and task projections settle in one short transaction; stale callbacks are inert. */
 export async function finalizeScheduledRun(
 	runId: string,
-	status: Exclude<ScheduledRunStatus, "running" | "blocked" | "success">,
-	details: { error?: string; errorKind?: RunErrorKind; expectedLogicalRunId?: string } = {},
+	status: Exclude<ScheduledRunStatus, "waiting" | "running" | "blocked" | "success">,
+	details: {
+		error?: string;
+		errorKind?: RunErrorKind;
+		summary?: string;
+		expectedStatus?: "waiting" | "running" | "blocked";
+		expectedLogicalRunId?: string;
+		expectedExecutionEpoch?: string;
+	} = {},
 ): Promise<boolean> {
 	const result = await locks.acquire(runId, async () => {
 		const now = new Date().toISOString();
 		const registration = getScheduledRunById(runId);
+		if (
+			details.expectedExecutionEpoch !== undefined &&
+			registration?.executionEpoch !== details.expectedExecutionEpoch
+		)
+			return null;
 		return db.transaction((tx) => {
 			const run = tx.select().from(scheduledTaskRuns).where(eq(scheduledTaskRuns.id, runId)).get();
-			if (!run || !ACTIVE_RUN_STATUSES.some((value) => value === run.status)) return null;
+			if (!run || !UNFINISHED_RUN_STATUSES.some((value) => value === run.status)) return null;
+			if (details.expectedStatus && run.status !== details.expectedStatus) return null;
 			if (details.expectedLogicalRunId && run.logicalRunId !== details.expectedLogicalRunId)
 				return null;
+			const wasActive = run.status !== "waiting";
+			if (!wasActive && (status === "completed" || status === "missed")) return null;
+			const summary = details.summary?.slice(0, 2000) ?? run.outcomeSummary;
 			const changed = tx
 				.update(scheduledTaskRuns)
 				.set({
 					status,
 					error: details.error?.slice(0, 4000) ?? null,
 					errorKind: details.errorKind ?? null,
+					outcomeSummary: summary,
 					finishedAt: now,
-					durationMs: Math.max(0, Date.parse(now) - Date.parse(run.startedAt ?? run.createdAt)),
+					durationMs: wasActive
+						? Math.max(0, Date.parse(now) - Date.parse(run.startedAt ?? run.createdAt))
+						: null,
 					blockReason: null,
 					blockedAt: null,
-					stats: { ...run.stats, turns: registration?.turns ?? run.stats?.turns },
+					stats: wasActive
+						? { ...run.stats, turns: registration?.turns ?? run.stats?.turns }
+						: run.stats,
 				})
-				.where(
-					and(
-						eq(scheduledTaskRuns.id, runId),
-						inArray(scheduledTaskRuns.status, ACTIVE_RUN_STATUSES),
-					),
-				)
+				.where(and(eq(scheduledTaskRuns.id, runId), eq(scheduledTaskRuns.status, run.status)))
 				.returning({ id: scheduledTaskRuns.id })
 				.get();
 			if (!changed) return null;
@@ -371,12 +444,17 @@ export async function finalizeScheduledRun(
 				.get();
 			let circuitBreaker = false;
 			if (task) {
+				const admissionFailure =
+					status === "failed" &&
+					(details.errorKind === "acl" || details.errorKind === "target_missing");
 				const failures =
-					status === "failed" || status === "timed_out"
-						? task.consecutiveFailures + 1
-						: status === "completed"
-							? 0
-							: task.consecutiveFailures;
+					!wasActive && !admissionFailure
+						? task.consecutiveFailures
+						: status === "failed" || status === "timed_out"
+							? task.consecutiveFailures + 1
+							: status === "completed"
+								? 0
+								: task.consecutiveFailures;
 				circuitBreaker = failures >= 5 && task.consecutiveFailures < 5;
 				tx.update(scheduledTasks)
 					.set({
@@ -395,23 +473,36 @@ export async function finalizeScheduledRun(
 						lastStatus: status,
 						lastError: details.error?.slice(0, 4000) ?? null,
 						lastOutcome: run.outcome,
-						lastSummary: run.outcomeSummary?.slice(0, 500) ?? null,
+						lastSummary: summary?.slice(0, 500) ?? null,
 					})
 					.where(and(eq(scheduledTasks.id, run.taskId), eq(scheduledTasks.lastRunId, runId)))
 					.run();
 			}
-			tx.update(scheduledTasks)
-				.set({ activeRunId: null })
-				.where(and(eq(scheduledTasks.id, run.taskId), eq(scheduledTasks.activeRunId, runId)))
-				.run();
-			return { taskId: run.taskId, circuitBreaker };
+			if (wasActive)
+				tx.update(scheduledTasks)
+					.set({ activeRunId: null })
+					.where(and(eq(scheduledTasks.id, run.taskId), eq(scheduledTasks.activeRunId, runId)))
+					.run();
+			const unfinished = tx
+				.select({ id: scheduledTaskRuns.id })
+				.from(scheduledTaskRuns)
+				.where(
+					and(
+						eq(scheduledTaskRuns.taskId, run.taskId),
+						inArray(scheduledTaskRuns.status, UNFINISHED_RUN_STATUSES),
+					),
+				)
+				.limit(1)
+				.get();
+			return { taskId: run.taskId, circuitBreaker, hasUnfinished: !!unfinished };
 		});
 	});
 	if (!result) return false;
 	unregisterScheduledRun(runId);
-	// Reconcile the actual schedule, not `enabled` or a null next-run timestamp.
-	const { scheduledTaskService } = await import("./scheduled-task-service");
-	await scheduledTaskService.reconcileCompletion(result.taskId);
+	if (!result.hasUnfinished) {
+		const { scheduledTaskService } = await import("./scheduled-task-service");
+		await scheduledTaskService.reconcileCompletion(result.taskId);
+	}
 	await notify(runId, status === "completed" ? "completed" : "failed");
 	if (result.circuitBreaker) await notify(runId, "circuit_breaker");
 	return true;

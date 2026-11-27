@@ -6,12 +6,50 @@ import { parseHTML } from "linkedom";
 import { act, type ReactNode, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider } from "react-i18next";
-import type { ScheduledTask } from "../../lib/api/scheduled-tasks";
+import type { ScheduledTaskAssociation, ScheduledTaskTarget } from "../../lib/api/scheduled-tasks";
 import en from "../../locales/en/scheduledTasks.json";
 import { runFixture, taskFixture } from "./scheduled-task.fixtures";
 
+function associationFixture(
+	patch: Partial<ScheduledTaskAssociation> = {},
+): ScheduledTaskAssociation {
+	return {
+		id: "task_1",
+		name: "Daily task",
+		lifecycle: "active",
+		firedCount: 1,
+		total: 3,
+		lastStatus: "completed",
+		hasUnfinishedRun: false,
+		modelPolicy: "follow",
+		requireReport: true,
+		...patch,
+	};
+}
+mock.module("@tanstack/react-router", () => ({
+	Link: ({
+		children,
+		params,
+	}: {
+		children?: ReactNode;
+		params: { taskId?: string; narratorId?: string };
+	}) => (
+		<a
+			href={params.taskId ? `/scheduled-tasks/${params.taskId}` : `/narrators/${params.narratorId}`}
+		>
+			{children}
+		</a>
+	),
+}));
 const calls: Array<{ action: string; value: unknown }> = [];
-let detail: { data?: ScheduledTask; isSuccess: boolean } = { isSuccess: false };
+let associations: ScheduledTaskAssociation[] = [];
+let associationError = false;
+let associationNextCursor: string | null = null;
+let associationPending = false;
+let targets: ScheduledTaskTarget[] = [];
+let targetsError = false;
+let targetsPending = false;
+let targetNextCursor: string | null = null;
 let pages = [{ runs: [runFixture()], nextCursor: "opaque_cursor" }];
 let runError: Error | null = null;
 let loadCalls = 0;
@@ -32,7 +70,36 @@ const mutation = (action: string) => ({
 	mutate: (value: unknown) => calls.push({ action, value }),
 });
 mock.module("../../hooks/useScheduledTasks", () => ({
-	useScheduledTask: () => detail,
+	useScheduledTaskAssociations: () => ({
+		data: { pages: [{ tasks: associations, nextCursor: associationNextCursor }] },
+		isSuccess: !associationError && !associationPending,
+		isError: associationError,
+		isPending: associationPending,
+		hasNextPage: !!associationNextCursor,
+		isFetchingNextPage: false,
+		fetchNextPage: () => {
+			loadCalls++;
+		},
+		refetch: () => {
+			calls.push({ action: "retry-associations", value: null });
+		},
+	}),
+	useScheduledTaskTargets: () => ({
+		data: { pages: [{ items: targets, nextCursor: targetNextCursor }] },
+		isSuccess: !targetsError && !targetsPending,
+		isError: targetsError,
+		isPending: targetsPending,
+		isFetching: targetsPending,
+		debouncing: false,
+		hasNextPage: !!targetNextCursor,
+		isFetchingNextPage: false,
+		fetchNextPage: () => {
+			loadCalls++;
+		},
+		refetch: () => {
+			calls.push({ action: "retry-targets", value: null });
+		},
+	}),
 	useScheduledTaskRuns: () => ({
 		data: { pages },
 		isPending: false,
@@ -71,6 +138,7 @@ const { RunVerdictBadge, RunAxes, TaskLifecycleBadge } = await import("./TaskSta
 const { ScheduleTimeInputs } = await import("./ScheduleTimeInputs");
 const { TaskFilters } = await import("./TaskFilters");
 const { TaskForm } = await import("./TaskForm");
+const { TaskTargetPicker } = await import("./TaskTargetPicker");
 const i18n = createInstance();
 await i18n.init({
 	lng: "en",
@@ -90,7 +158,14 @@ function install(key: string, value: unknown) {
 }
 beforeEach(() => {
 	calls.length = 0;
-	detail = { isSuccess: false };
+	associations = [];
+	associationError = false;
+	associationPending = false;
+	associationNextCursor = null;
+	targets = [];
+	targetsError = false;
+	targetsPending = false;
+	targetNextCursor = null;
 	pages = [{ runs: [runFixture()], nextCursor: "opaque_cursor" }];
 	runError = null;
 	loadCalls = 0;
@@ -192,7 +267,9 @@ async function clickText(text: string) {
 	await act(async () => button?.click());
 }
 async function fillName(value: string) {
-	const field = container.querySelector<HTMLInputElement>('input[maxlength="200"]');
+	const field = [...container.querySelectorAll<HTMLInputElement>("input")].find(
+		(input) => input.getAttribute("placeholder") === en.namePlaceholder,
+	);
 	if (!field) throw new Error("Name input not rendered");
 	field.type = "text";
 	await act(async () => field.dispatchEvent(new window.Event("focusin", { bubbles: true })));
@@ -272,16 +349,199 @@ describe("capability-gated task UI", () => {
 		await render(<RunVerdictBadge status="success" outcome="done" />);
 		expect(container.textContent).toContain(en.verdict.dispatched);
 	});
-	test("a task that is unavailable never discloses a cached name or link in the banner", async () => {
-		detail = { isSuccess: false, data: taskFixture({ name: "Invisible private task" }) };
-		await render(<ManagedTaskBanner taskId="task_1" model="changed:model" />);
-		expect(container.textContent).toContain(en.managedGeneric);
+	test("an unavailable association never discloses a cached name, count or link", async () => {
+		associations = [
+			associationFixture({ name: "Invisible private task", firedCount: 12, total: 12 }),
+		];
+		associationError = true;
+		await render(<ManagedTaskBanner narratorId="narrator_1" model="changed:model" />);
+		expect(container.textContent).toContain(en.associationsLoadFailed);
 		expect(container.textContent).not.toContain("Invisible private task");
+		expect(container.textContent).not.toContain("12/12");
 		expect(container.querySelector("a")).toBeNull();
+		await clickText(en.retry);
+		expect(calls).toEqual([{ action: "retry-associations", value: null }]);
+	});
+	test("multiple associations retain paused tasks and the last executing occurrence until terminal", async () => {
+		associations = [
+			associationFixture({
+				id: "first",
+				name: "Last occurrence",
+				lifecycle: "ended",
+				firedCount: 12,
+				total: 12,
+				lastStatus: "running",
+				hasUnfinishedRun: true,
+			}),
+			associationFixture({
+				id: "second",
+				name: "Paused task",
+				lifecycle: "paused",
+				firedCount: 2,
+				total: 5,
+			}),
+			associationFixture({ id: "third", name: "Finished task", lifecycle: "ended" }),
+		];
+		associationNextCursor = "next";
+		await render(<ManagedTaskBanner narratorId="narrator_1" />);
+		expect(container.textContent).toContain("12/12");
+		expect(container.textContent).toContain(en.associationRunning);
+		expect(container.textContent).toContain("Paused task");
+		expect(container.textContent).toContain("2/5");
+		expect(container.textContent).not.toContain("Finished task");
+		await clickText(en.loadMore);
+		expect(loadCalls).toBe(1);
+		associations[0] = { ...associations[0], lastStatus: "completed", hasUnfinishedRun: false };
+		await render(<ManagedTaskBanner narratorId="narrator_1" />);
+		expect(container.textContent).not.toContain("Last occurrence");
+		expect(container.textContent).toContain("Paused task");
+		associations = [];
+		await render(<ManagedTaskBanner narratorId="narrator_1" />);
+		expect(container.querySelector('[role="alert"]')).toBeNull();
+		expect(container.querySelector("a")).toBeNull();
+	});
+	test("waiting is not dispatched and optional reports never manufacture success", async () => {
+		associations = [associationFixture({ lastStatus: "waiting", hasUnfinishedRun: true })];
+		await render(
+			<>
+				<ManagedTaskBanner narratorId="narrator_1" />
+				<RunVerdictBadge status="completed" outcome={null} requireReport={false} />
+			</>,
+		);
+		expect(container.textContent).toContain(en.verdict.waiting);
+		expect(container.textContent).not.toContain(en.associationRunning);
+		expect(container.textContent).toContain(en.verdict.completed);
+		expect(container.textContent).not.toContain(en.verdict.succeeded);
+		expect(container.textContent).not.toContain(en.verdict.unconfirmed);
 	});
 });
 
 describe("create and edit forms", () => {
+	test("existing targets inherit settings and save a report toggle without a cadence reset", async () => {
+		targets = [
+			{
+				id: "target_1",
+				title: "Chosen session",
+				cwd: "/target",
+				projectId: null,
+				model: "target:model",
+				status: "idle",
+			},
+		];
+		await render(
+			<TaskForm
+				task={taskFixture({
+					narratorMode: "existing",
+					targetNarratorId: "target_1",
+					modelPolicy: "follow",
+				})}
+				onCancel={() => {}}
+				onSaved={() => {}}
+			/>,
+		);
+		expect(container.textContent).toContain(en.existingInherited);
+		expect(container.textContent).not.toContain(en.cleanupPolicy);
+		expect(container.textContent).not.toContain(en.permissionModeDesc);
+		expect(container.querySelector('textarea[maxlength="10000"]')).toBeNull();
+		const control = [...container.querySelectorAll<HTMLInputElement>('input[role="switch"]')].find(
+			(input) => input.closest(".mantine-Switch-root")?.textContent?.includes(en.requireReport),
+		);
+		expect(control?.checked).toBe(true);
+		await act(async () => {
+			if (!control) throw new Error("Report switch not rendered");
+			// linkedom does not implement the checkbox default click action.
+			Object.defineProperty(control, "checked", {
+				configurable: true,
+				writable: true,
+				value: false,
+			});
+			control.dispatchEvent(new window.Event("click", { bubbles: true }));
+		});
+		await submitForm();
+		expect(calls).toEqual([
+			{ action: "update", value: { id: "task_1", data: { requireReport: false } } },
+		]);
+	});
+	test("reuse forms expose their persisted clear-context choice", async () => {
+		await render(
+			<TaskForm
+				task={taskFixture({ narratorMode: "reuse", contextPolicy: "clear" })}
+				onCancel={() => {}}
+				onSaved={() => {}}
+			/>,
+		);
+		expect(container.textContent).toContain(en.contextPolicy);
+		expect(container.innerHTML).toContain(en.context.clear);
+		expect(container.textContent).toContain(en.contextClearWarning);
+	});
+	test("missing existing targets and out-of-range busy waits cannot dispatch", async () => {
+		await render(
+			<TaskForm
+				task={taskFixture({ narratorMode: "existing", targetNarratorId: null })}
+				onCancel={() => {}}
+				onSaved={() => {}}
+			/>,
+		);
+		await submitForm();
+		expect(calls).toEqual([]);
+		expect(container.textContent).toContain(en.required);
+		await render(
+			<TaskForm
+				key="invalid-wait"
+				task={taskFixture({ onBusy: "wait", busyWaitMinutes: 0 })}
+				onCancel={() => {}}
+				onSaved={() => {}}
+			/>,
+		);
+		await submitForm();
+		expect(calls).toEqual([]);
+		expect(container.textContent).toContain(en.validation.invalid_interval);
+	});
+	test("target pagination and request failures stay explicit and hide stale labels", async () => {
+		targets = [
+			{
+				id: "target_1",
+				title: "Private target title",
+				cwd: null,
+				projectId: null,
+				model: null,
+				status: "idle",
+			},
+		];
+		targetNextCursor = "next";
+		await render(<TaskTargetPicker value="target_1" onChange={() => {}} />);
+		expect(container.innerHTML).toContain("Private target title");
+		await clickText(en.loadMore);
+		expect(loadCalls).toBe(1);
+		targetsError = true;
+		await render(<TaskTargetPicker value="target_1" onChange={() => {}} />);
+		expect(container.innerHTML).not.toContain("Private target title");
+		expect(container.textContent).toContain(en.targetsLoadFailed);
+		await clickText(en.retry);
+		expect(calls).toHaveLength(2);
+	});
+	test("a selected target outside the first lookup page is not treated as inaccessible", async () => {
+		targets = [];
+		targetNextCursor = "more-matching-titles";
+		await render(<TaskTargetPicker value="target_2" onChange={() => {}} />);
+		expect(container.textContent).not.toContain(en.targetUnavailable);
+		await clickText(en.targetFindMore);
+		expect(loadCalls).toBe(1);
+		targets = [
+			{
+				id: "target_2",
+				title: "Found target",
+				cwd: null,
+				projectId: null,
+				model: null,
+				status: "idle",
+			},
+		];
+		targetNextCursor = null;
+		await render(<TaskTargetPicker value="target_2" onChange={() => {}} />);
+		expect(container.innerHTML).toContain("Found target");
+		expect(container.textContent).not.toContain(en.targetFindMore);
+	});
 	test("name-only save submits no cadence and clears dirty guard before navigation", async () => {
 		await render(
 			<TaskForm
@@ -313,9 +573,11 @@ describe("create and edit forms", () => {
 		expect(container.textContent).toContain("Save unavailable");
 		expect(guarded).toBe(true);
 		expect(calls).toHaveLength(1);
-		expect(container.querySelector<HTMLInputElement>('input[maxlength="200"]')?.value).toBe(
-			"Keep this name",
-		);
+		expect(
+			[...container.querySelectorAll<HTMLInputElement>("input")].find(
+				(input) => input.getAttribute("placeholder") === en.namePlaceholder,
+			)?.value,
+		).toBe("Keep this name");
 	});
 	test("invalid new forms cannot dispatch, and unavailable preview blocks a copy", async () => {
 		await render(<TaskForm onCancel={() => {}} onSaved={() => {}} />);

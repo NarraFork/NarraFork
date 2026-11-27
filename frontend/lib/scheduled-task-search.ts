@@ -2,8 +2,10 @@ import type { ScheduleKind } from "@shared/scheduled-task-schedule";
 import type { RunVerdict } from "@shared/scheduled-task-status";
 
 export const RUN_VERDICTS: readonly RunVerdict[] = [
+	"waiting",
 	"running",
 	"blocked",
+	"completed",
 	"succeeded",
 	"unconfirmed",
 	"incomplete",

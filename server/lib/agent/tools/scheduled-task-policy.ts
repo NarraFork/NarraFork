@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { normalizeRunContext } from "@shared/scheduled-task-run-context";
 import {
 	describeScheduleEn,
@@ -199,18 +200,32 @@ export function previewScheduledTask(
 	};
 }
 
+function approvalFields(fields: ScheduledTaskFields, canSeePrompt: boolean): ScheduledTaskFields {
+	if (canSeePrompt) return fields;
+	const visible = { ...fields };
+	delete visible.prompt;
+	delete visible.systemPrompt;
+	return visible;
+}
+
 /** Both the approval path and execute path call this, with a live user role and task ACL. */
 export async function resolveScheduledTaskApproval(
 	ctx: ScheduledTaskPolicyContext,
 	raw: Record<string, unknown>,
 ): Promise<{
 	input: Record<string, unknown>;
-	approval: Record<string, unknown>;
+	approval: Record<string, unknown> & {
+		expectedTarget?: { id: string; fingerprint: string } | null;
+	};
 	principal: ScheduledTaskPrincipal;
 }> {
-	const { resolveTaskPrincipal, assertTaskAccess, assertTaskProjectWrite } = await import(
-		"../../../services/scheduled-task-acl"
-	);
+	const {
+		resolveTaskPrincipal,
+		assertTaskAccess,
+		assertTaskProjectWrite,
+		canEditTask,
+		taskOwnerId,
+	} = await import("../../../services/scheduled-task-acl");
 	const principal = await resolveTaskPrincipal(ctx.userId);
 	const { scheduledTaskService: service } = await import(
 		"../../../services/scheduled-task-service"
@@ -218,6 +233,9 @@ export async function resolveScheduledTaskApproval(
 	const parsed = scheduledTaskParametersSchema.parse(raw);
 	validateScheduledTaskArguments(parsed);
 	const { action, id } = parsed;
+	// Disable acts only on persisted task state; ignored patches must not redirect
+	// its project lookup or expose unreviewed fields in the approval.
+	if (action === "disable") parsed.task = undefined;
 	const { lookupScheduledRun } = await import("../../../services/scheduled-task-run-service");
 	const active = await lookupScheduledRun(ctx.narratorId);
 	if (active && !(id === active.taskId && ["get", "runs", "disable"].includes(action)))
@@ -240,6 +258,7 @@ export async function resolveScheduledTaskApproval(
 			principal,
 			["enable", "disable"].includes(action) ? "pause" : "edit",
 		);
+	const canSeePrompt = !existing || canEditTask(existing, principal);
 	const before = existing
 		? scheduledTaskFieldsSchema.parse({
 				...existing,
@@ -251,15 +270,25 @@ export async function resolveScheduledTaskApproval(
 	let fields: ScheduledTaskFields = { ...before, ...parsed.task };
 	if (parsed.task?.cronExpr) delete fields.schedule;
 	if (parsed.task?.schedule) delete fields.cronExpr;
+	const existingMode = fields.narratorMode === "existing";
 	if (action === "create") {
 		fields = {
-			permissionMode: normalizeLegacyPermissionMode(caller.permissionMode),
-			cwd: ctx.cwd ?? caller.cwd,
-			projectId: caller.projectId,
-			runContext: caller.projectId ? "project" : "standalone",
-			model: caller.model,
-			modelPolicy: "sync",
+			...(existingMode
+				? { model: null, modelPolicy: "follow" as const }
+				: {
+						permissionMode: normalizeLegacyPermissionMode(caller.permissionMode),
+						cwd: ctx.cwd ?? caller.cwd,
+						projectId: caller.projectId,
+						runContext: caller.projectId ? ("project" as const) : ("standalone" as const),
+						model: caller.model,
+						modelPolicy: "sync" as const,
+					}),
 			narratorMode: "new",
+			targetNarratorId: null,
+			contextPolicy: "keep",
+			onBusy: "skip",
+			busyWaitMinutes: 30,
+			requireReport: true,
 			onBlocked: "auto",
 			blockedWaitMinutes: 30,
 			maxRunMinutes: 60,
@@ -268,18 +297,92 @@ export async function resolveScheduledTaskApproval(
 			...fields,
 		};
 	}
-	if (fields.cwd == null && (action === "create" || parsed.task?.cwd === null))
-		fields.cwd = ctx.cwd ?? caller.cwd;
-	if (fields.permissionMode == null)
-		fields.permissionMode = normalizeLegacyPermissionMode(caller.permissionMode);
-	const project =
-		fields.runContext === "project"
-			? await assertTaskProjectWrite(fields.projectId, principal)
-			: undefined;
-	if (!project) fields.projectId = null;
-	// Legacy tasks without a stored cwd run at the project root or server home,
-	// not at the caller's cwd. Display that effective scope without changing it.
-	const effectiveCwd = fields.cwd ?? project?.gitPath ?? (await import("../../platform")).getHome();
+	if (existingMode && before?.narratorMode !== "existing" && !parsed.task?.modelPolicy)
+		fields.modelPolicy = "follow";
+	if (!existingMode && parsed.task?.narratorMode) fields.targetNarratorId = null;
+
+	const { resolveScheduledTaskTarget } = await import("../../../services/scheduled-task-target");
+	const needsTarget = existingMode && action !== "disable" && action !== "delete";
+	let resolvedTarget: Awaited<ReturnType<typeof resolveScheduledTaskTarget>> | undefined;
+	const ownerUserId = existing ? taskOwnerId(existing) : principal.userId;
+	if (existingMode) {
+		if (!fields.targetNarratorId && needsTarget)
+			throw new Error("existing mode requires task.targetNarratorId.");
+		if (fields.targetNarratorId) {
+			try {
+				resolvedTarget = await resolveScheduledTaskTarget(principal, fields.targetNarratorId);
+				if (needsTarget) {
+					const owner = await resolveTaskPrincipal(ownerUserId);
+					if (owner.userId !== principal.userId) {
+						const forOwner = await resolveScheduledTaskTarget(owner, fields.targetNarratorId);
+						if (forOwner.fingerprint !== resolvedTarget.fingerprint)
+							throw new Error("Target configuration changed while preparing approval. Try again.");
+					}
+				}
+			} catch (error) {
+				// A task must remain removable/pausable after its target disappears or revokes access.
+				if (needsTarget) throw error;
+			}
+		}
+		// Existing sessions own their environment. Never persist the caller's scope or
+		// accept task settings as an override for the target's execution authority.
+		fields.cwd = null;
+		fields.projectId = null;
+		fields.runContext = "standalone";
+		fields.systemPrompt = null;
+		delete fields.permissionMode;
+	} else {
+		if (fields.cwd == null && (action === "create" || parsed.task?.cwd === null))
+			fields.cwd = ctx.cwd ?? caller.cwd;
+		if (fields.permissionMode == null)
+			fields.permissionMode = normalizeLegacyPermissionMode(caller.permissionMode);
+	}
+	let project: { gitPath: string | null } | undefined;
+	if (!existingMode && fields.runContext === "project") {
+		if (action === "disable") {
+			// The task's pause ACL is sufficient to stop execution, even after project
+			// write access is revoked. Read only the root needed to display its scope.
+			const [{ db }, { projects }, { eq }] = await Promise.all([
+				import("@server/db"),
+				import("@server/db/schema"),
+				import("drizzle-orm"),
+			]);
+			project = fields.projectId
+				? await db.query.projects.findFirst({
+						where: eq(projects.id, fields.projectId),
+						columns: { gitPath: true },
+					})
+				: undefined;
+		} else project = await assertTaskProjectWrite(fields.projectId, principal);
+	} else fields.projectId = null;
+	// Legacy tasks without a stored cwd run at the project root or server home.
+	// Existing tasks instead use the target's live environment, without a project-write gate.
+	const effectiveCwd = existingMode
+		? (resolvedTarget?.target.cwd ?? null)
+		: (fields.cwd ?? project?.gitPath ?? (await import("../../platform")).getHome());
+	const target = resolvedTarget
+		? {
+				id: resolvedTarget.target.id,
+				title: resolvedTarget.target.title,
+				cwd: resolvedTarget.target.cwd,
+				projectId: resolvedTarget.projectId,
+				model: resolvedTarget.target.model,
+				permissionMode: normalizeLegacyPermissionMode(resolvedTarget.target.permissionMode),
+			}
+		: null;
+	let beforeTarget: { id: string; title: string | null } | null = null;
+	if (before?.narratorMode === "existing" && before.targetNarratorId) {
+		if (target?.id === before.targetNarratorId)
+			beforeTarget = { id: target.id, title: target.title };
+		else {
+			try {
+				const previous = await resolveScheduledTaskTarget(principal, before.targetNarratorId);
+				beforeTarget = { id: previous.target.id, title: previous.target.title };
+			} catch {
+				// Do not reveal inaccessible target details or block changing away from it.
+			}
+		}
+	}
 	if (action === "enable" || action === "disable") fields.enabled = action === "enable";
 	const preview = previewScheduledTask(fields, {
 		requireFuture:
@@ -300,13 +403,49 @@ export async function resolveScheduledTaskApproval(
 			JSON.stringify(before?.[key as keyof ScheduledTaskFields]) !==
 			JSON.stringify(fields[key as keyof ScheduledTaskFields]),
 	);
+	const inheritsModel = existingMode && (fields.modelPolicy === "follow" || !fields.model);
+	const effectiveFields: ScheduledTaskFields = {
+		...fields,
+		cwd: effectiveCwd,
+		...(target
+			? {
+					projectId: target.projectId,
+					runContext: target.projectId ? "project" : "standalone",
+					permissionMode: target.permissionMode,
+					...(inheritsModel ? { model: target.model } : {}),
+				}
+			: {}),
+	};
 	const approval = {
 		version: 1,
 		action,
 		id,
-		task: { ...fields, cwd: effectiveCwd },
-		before: before ?? null,
+		task: approvalFields(effectiveFields, canSeePrompt),
+		before: before ? approvalFields(before, canSeePrompt) : null,
+		canSeePrompt,
+		// Keep confidential fields in the freshness boundary without returning their
+		// contents to project managers who may pause but may not inspect the prompt.
+		expectedTaskFingerprint: before
+			? createHash("sha256").update(JSON.stringify(before)).digest("hex")
+			: null,
 		changed,
+		target,
+		beforeTarget,
+		inheritedFields: existingMode
+			? [
+					"cwd",
+					"projectId",
+					"runContext",
+					"systemPrompt",
+					"permissionMode",
+					...(inheritsModel ? ["model"] : []),
+				]
+			: [],
+		expectedTarget:
+			needsTarget && resolvedTarget
+				? { id: resolvedTarget.target.id, fingerprint: resolvedTarget.fingerprint }
+				: null,
+		expectedOwnerUserId: ownerUserId,
 		description: preview.description,
 		occurrences: preview.occurrences,
 		finite: preview.finite,
@@ -316,9 +455,10 @@ export async function resolveScheduledTaskApproval(
 		callerPermissionMode: caller.permissionMode,
 		elevated: expandsScheduledTaskPermission(
 			normalizeLegacyPermissionMode(caller.permissionMode),
-			normalizeLegacyPermissionMode(fields.permissionMode),
+			normalizeLegacyPermissionMode(effectiveFields.permissionMode),
 		),
-		outsideScope: effectiveCwd !== (ctx.cwd ?? caller.cwd) || fields.projectId !== caller.projectId,
+		outsideScope:
+			effectiveCwd !== (ctx.cwd ?? caller.cwd) || effectiveFields.projectId !== caller.projectId,
 		selfDisable: !!active && action === "disable",
 		// An approved update may not silently apply to a subsequently edited task.
 		expectedUpdatedAt: existing?.updatedAt ?? null,
@@ -334,8 +474,19 @@ export async function resolveScheduledTaskApproval(
 							: {}),
 						...(parsed.task?.timezone !== undefined ? { timezone: preview.timezone } : {}),
 						...(parsed.task?.cwd === null ? { cwd: fields.cwd } : {}),
+						...(existingMode && before?.narratorMode !== "existing" && !parsed.task?.modelPolicy
+							? { modelPolicy: "follow" as const }
+							: {}),
+						...(!existingMode && parsed.task?.narratorMode ? { targetNarratorId: null } : {}),
 					}
 				: parsed.task;
+	if (task && existingMode && (action === "create" || action === "update")) {
+		task.cwd = null;
+		task.projectId = null;
+		task.runContext = "standalone";
+		task.systemPrompt = null;
+		delete task.permissionMode;
+	}
 	return { input: { ...parsed, task, _scheduledTaskApproval: approval }, approval, principal };
 }
 
@@ -353,18 +504,29 @@ export function assertScheduledTaskApprovalFresh(
 		"action",
 		"id",
 		"expectedUpdatedAt",
+		"expectedOwnerUserId",
+		"expectedTaskFingerprint",
+		"canSeePrompt",
 		"callerPermissionMode",
 		"elevated",
 		"outsideScope",
 		"selfDisable",
-	].some((key) => approved[key] !== approval[key]);
+	].filter((key) => approved[key] !== approval[key]);
+	const previousTarget = approved.expectedTarget as { id?: unknown; fingerprint?: unknown } | null;
+	const currentTarget = approval.expectedTarget as { id?: unknown; fingerprint?: unknown } | null;
 	if (
-		staleContext ||
-		JSON.stringify(scheduledTaskFieldsSchema.parse(approved.task)) !==
-			JSON.stringify(scheduledTaskFieldsSchema.parse(approval.task))
+		previousTarget?.id !== currentTarget?.id ||
+		previousTarget?.fingerprint !== currentTarget?.fingerprint
 	)
+		staleContext.push("target");
+	if (
+		JSON.stringify(scheduledTaskFieldsSchema.parse(approved.task)) !==
+		JSON.stringify(scheduledTaskFieldsSchema.parse(approval.task))
+	)
+		staleContext.push("task");
+	if (staleContext.length)
 		throw new Error(
-			"Task configuration or session authority changed since approval. Submit a new request for review.",
+			`Task configuration or session authority changed since approval (${staleContext.join(", ")}). Submit a new request for review.`,
 		);
 }
 

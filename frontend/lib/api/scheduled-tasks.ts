@@ -8,15 +8,32 @@ import type {
 	RunOutcome,
 	RunVerdict,
 	ScheduledRunStatus,
+	TaskContextPolicy,
 	TaskLifecycle,
 	TaskModelPolicy,
+	TaskNarratorMode,
 	TaskOnBlockedPolicy,
+	TaskOnBusyPolicy,
 } from "@shared/scheduled-task-status";
+import type {
+	ScheduledTaskAssociationsPage,
+	ScheduledTaskTargetsPage,
+} from "@shared/scheduled-task-targets";
+
+export type {
+	ScheduledTaskAssociation,
+	ScheduledTaskAssociationsPage,
+	ScheduledTaskTarget,
+	ScheduledTaskTargetsPage,
+} from "@shared/scheduled-task-targets";
+
 import type { ScheduledTaskSearch } from "../scheduled-task-search";
 import { request } from "./client";
 
 export type ScheduledTaskRunContext = "standalone" | "project";
-export type ScheduledTaskNarratorMode = "new" | "reuse";
+export type ScheduledTaskNarratorMode = TaskNarratorMode;
+export type ScheduledTaskContextPolicy = TaskContextPolicy;
+export type ScheduledTaskOnBusy = TaskOnBusyPolicy;
 export type ScheduledTaskLocale = Locale;
 export type ScheduledTaskLastStatus = ScheduledRunStatus;
 
@@ -56,6 +73,11 @@ export interface ScheduledTask {
 	cwd: string | null;
 	projectId: string | null;
 	narratorMode: ScheduledTaskNarratorMode;
+	targetNarratorId: string | null;
+	contextPolicy: ScheduledTaskContextPolicy;
+	onBusy: ScheduledTaskOnBusy;
+	busyWaitMinutes: number;
+	requireReport: boolean;
 	cleanupPolicy: ScheduledTaskCleanupPolicy;
 	reuseNarratorId: string | null;
 	createdBy: string | null;
@@ -88,6 +110,7 @@ export interface ScheduledTask {
 	lastNarratorId: string | null;
 	lastStatus: ScheduledTaskLastStatus | null;
 	lastOutcome: RunOutcome | null;
+	lastRequireReport?: boolean;
 	lastSummary: string | null;
 	lastError: string | null;
 	createdAt: string;
@@ -102,6 +125,7 @@ export interface ScheduledTaskRun {
 	status: ScheduledTaskLastStatus;
 	outcome: RunOutcome | null;
 	verdict: RunVerdict;
+	requireReport?: boolean;
 	outcomeSummary: string | null;
 	blockReason: string | null;
 	errorKind: string | null;
@@ -138,6 +162,11 @@ export interface ScheduledTaskInput {
 	cwd?: string | null;
 	projectId?: string | null;
 	narratorMode?: ScheduledTaskNarratorMode;
+	targetNarratorId?: string | null;
+	contextPolicy?: ScheduledTaskContextPolicy;
+	onBusy?: ScheduledTaskOnBusy;
+	busyWaitMinutes?: number;
+	requireReport?: boolean;
 	cleanupPolicy?: ScheduledTaskCleanupPolicy;
 	enabled?: boolean;
 	modelPolicy?: TaskModelPolicy;
@@ -148,6 +177,29 @@ export interface ScheduledTaskInput {
 }
 
 export const scheduledTasksApi = {
+	listScheduledTaskTargets: (
+		opts: { q?: string; limit?: number; cursor?: string | null } = {},
+		signal?: AbortSignal,
+	) => {
+		const params = new URLSearchParams();
+		if (opts.q) params.set("q", opts.q);
+		if (opts.limit != null) params.set("limit", String(opts.limit));
+		if (opts.cursor) params.set("cursor", opts.cursor);
+		return request<ScheduledTaskTargetsPage>(`/scheduled-tasks/targets?${params}`, { signal });
+	},
+	listScheduledTaskAssociations: (
+		narratorId: string,
+		opts: { limit?: number; cursor?: string | null } = {},
+		signal?: AbortSignal,
+	) => {
+		const params = new URLSearchParams();
+		if (opts.limit != null) params.set("limit", String(opts.limit));
+		if (opts.cursor) params.set("cursor", opts.cursor);
+		return request<ScheduledTaskAssociationsPage>(
+			`/scheduled-tasks/for-narrator/${encodeURIComponent(narratorId)}?${params}`,
+			{ signal },
+		);
+	},
 	listScheduledTaskTransferUsers: (signal?: AbortSignal) =>
 		request<Array<{ id: string; username: string }>>("/admin/users", { signal }),
 	listScheduledTasks: (filters: ScheduledTaskSearch = {}, signal?: AbortSignal) => {

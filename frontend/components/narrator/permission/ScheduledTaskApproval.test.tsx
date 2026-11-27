@@ -65,6 +65,62 @@ describe("scheduled task approval", () => {
 		expect(view?.schedule).toMatchObject({ end: { type: "count", count: 4 } });
 	});
 
+	test("existing targets show resolved names, inherited fields and execution policy changes", async () => {
+		const i18n = createInstance();
+		await i18n.init({
+			lng: "zh-CN",
+			resources: { "zh-CN": { narrator: zh, scheduledTasks: zhSchedule } },
+		});
+		const input = {
+			version: 1,
+			action: "update",
+			task: {
+				...task,
+				narratorMode: "existing",
+				targetNarratorId: "target_2",
+				contextPolicy: "clear",
+				onBusy: "interrupt",
+				busyWaitMinutes: 30,
+				requireReport: false,
+				systemPrompt: "inherited private prompt",
+			},
+			before: {
+				...task,
+				narratorMode: "existing",
+				targetNarratorId: "target_1",
+				contextPolicy: "keep",
+				onBusy: "skip",
+				requireReport: true,
+			},
+			target: { id: "target_2", title: "目标乙" },
+			beforeTarget: { id: "target_1", title: "目标甲" },
+			inheritedFields: ["permissionMode", "systemPrompt", "planMode"],
+			changed: ["targetNarratorId", "contextPolicy", "onBusy", "requireReport"],
+		};
+		const html = renderToStaticMarkup(
+			<I18nextProvider i18n={i18n}>
+				<MantineProvider>
+					<ScheduledTaskApproval
+						permission={{ ...permission, inputJson: { _scheduledTaskApproval: input } }}
+					/>
+				</MantineProvider>
+			</I18nextProvider>,
+		);
+		for (const text of [
+			"目标甲",
+			"target_1",
+			"目标乙",
+			"target_2",
+			zhSchedule.contextClearWarning,
+			zhSchedule.busyInterruptWarning,
+			zh.scheduledTaskApproval.fields.requireReport,
+			zhSchedule.yes,
+			zhSchedule.no,
+		])
+			expect(html).toContain(text);
+		expect(html).not.toContain("inherited private prompt");
+		expect(html).toContain(zh.scheduledTaskApproval.inheritedValue);
+	});
 	test.each([
 		"en",
 		"zh-CN",

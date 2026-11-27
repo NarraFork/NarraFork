@@ -9,6 +9,7 @@
 
 export const SCHEDULED_TASK_ACTIONS = [
 	"list",
+	"targets",
 	"get",
 	"create",
 	"update",
@@ -30,7 +31,7 @@ export type ScheduledTaskAction = (typeof SCHEDULED_TASK_ACTIONS)[number];
  * is the safe direction. The reverse would auto-allow a new mutation everywhere,
  * with no error to reveal the omission.
  */
-const SCHEDULED_TASK_READ_ACTIONS = new Set<string>(["list", "get", "runs", "preview"]);
+const SCHEDULED_TASK_READ_ACTIONS = new Set<string>(["list", "targets", "get", "runs", "preview"]);
 
 /** Whether a ScheduledTask `action` input value is a pure read. */
 export function isScheduledTaskReadAction(action: unknown): boolean {

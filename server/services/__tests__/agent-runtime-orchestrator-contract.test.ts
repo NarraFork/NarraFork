@@ -261,6 +261,7 @@ async function scheduledFixture(
 	h: ReturnType<typeof fixture>,
 	reportOnly = false,
 	rootId = h.session.narratorId,
+	requireReport = true,
 ) {
 	const runId = "scheduled-contract-run";
 	const taskId = "scheduled-contract-task";
@@ -273,6 +274,7 @@ async function scheduledFixture(
 	await db.insert(scheduledTasks).values({
 		id: taskId,
 		name: "report loading",
+		requireReport,
 		prompt: "work",
 		cronExpr: "0 9 * * *",
 		ownerUserId: "principal-a",
@@ -286,6 +288,7 @@ async function scheduledFixture(
 		taskId,
 		narratorId: rootId,
 		logicalRunId: rootLogicalRunId,
+		requireReport,
 		status: "running",
 		runContext: "standalone",
 		createdAt: now,
@@ -302,6 +305,7 @@ async function scheduledFixture(
 		modelPolicy: "follow",
 		model: null,
 		reportOnly,
+		requireReport,
 	});
 	bindScheduledRunMember({ runId, narratorId: rootId, logicalRunId: rootLogicalRunId });
 	if (rootId !== h.session.narratorId)
@@ -315,8 +319,12 @@ async function scheduledFixture(
 }
 
 describe("scheduled report runtime tool loading", () => {
-	for (const reportOnly of [false, true]) {
-		test(`reportOnly=${reportOnly}: real request declares and executes report without /load or ToolSearch`, async () => {
+	for (const [reportOnly, requireReport] of [
+		[false, true],
+		[true, true],
+		[false, false],
+	] as const) {
+		test(`reportOnly=${reportOnly}, requireReport=${requireReport}: real request declares and executes report without /load or ToolSearch`, async () => {
 			let reportedRunId: string | undefined;
 			const h = fixture(profiles[0], [
 				async ({ config }) => {
@@ -342,7 +350,7 @@ describe("scheduled report runtime tool loading", () => {
 					return { ...finished };
 				},
 			]);
-			const { runId } = await scheduledFixture(h, reportOnly);
+			const { runId } = await scheduledFixture(h, reportOnly, h.session.narratorId, requireReport);
 			expect((await h.run()).hasError).toBe(false);
 			expect(h.session._enabledOptionalTools.has("ScheduledTaskReport")).toBe(false);
 			const row = await db.query.narrators.findFirst({

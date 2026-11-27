@@ -375,5 +375,6 @@ describe("data portability · 异常与边界", () => {
 		expect(elapsed).toBeLessThan(15_000);
 		expect(count("narrators")).toBe(100);
 		expect(count("narrator_messages")).toBe(5000);
-	});
+		// Keep the 15s transfer budget above, plus fixture setup; Bun's default is only 5s.
+	}, 20_000);
 });

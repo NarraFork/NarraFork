@@ -1804,15 +1804,8 @@
     {
       "idx": 257,
       "version": "6",
-      "when": 1794615053118,
+      "when": 1795801438219,
       "tag": "0257_scheduled_tasks_redesign",
-      "breakpoints": true
-    },
-    {
-      "idx": 258,
-      "version": "6",
-      "when": 1794673977350,
-      "tag": "0258_scheduled_run_admission",
       "breakpoints": true
     }
   ]

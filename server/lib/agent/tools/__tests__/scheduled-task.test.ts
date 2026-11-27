@@ -11,6 +11,10 @@ import { OPTIONAL_TOOLS } from "../index";
 import { scheduledTaskTool } from "../scheduled-task";
 import { isScheduledTaskReadAction, SCHEDULED_TASK_ACTIONS } from "../scheduled-task-actions";
 import { previewScheduledTask, resolveScheduledTaskApproval } from "../scheduled-task-policy";
+import {
+	scheduledTaskParametersSchema,
+	validateScheduledTaskArguments,
+} from "../scheduled-task-schema";
 import { caller, dailyTask, taskFor } from "./scheduled-task-fixtures";
 
 describe("ScheduledTask registration", () => {
@@ -40,7 +44,7 @@ describe("ScheduledTask registration", () => {
 	 */
 	test("every action is classified as read or mutating", () => {
 		const reads = SCHEDULED_TASK_ACTIONS.filter(isScheduledTaskReadAction);
-		expect(reads).toEqual(["list", "get", "runs", "preview"]);
+		expect(reads).toEqual(["list", "targets", "get", "runs", "preview"]);
 		const mutating = SCHEDULED_TASK_ACTIONS.filter((a) => !isScheduledTaskReadAction(a));
 		expect(mutating).toEqual(["create", "update", "enable", "disable", "delete", "run_now"]);
 	});
@@ -155,6 +159,47 @@ describe("ScheduledTask argument validation", () => {
 		const result = await run({ action: "runs", id: "t1", limit: 5000 });
 		expect(result.isError).toBe(true);
 		expect(result.output).toContain("Invalid ScheduledTask arguments");
+	});
+
+	test("targets accepts bounded search pages without widening run-history limits", () => {
+		const parse = (args: Record<string, unknown>) => {
+			const parsed = scheduledTaskParametersSchema.parse(args);
+			validateScheduledTaskArguments(parsed);
+			return parsed;
+		};
+		expect(
+			parse({ action: "targets", q: "x".repeat(200), limit: 100, cursor: "x".repeat(2048) }).limit,
+		).toBe(100);
+		for (const args of [
+			{ action: "targets", q: "x".repeat(201) },
+			{ action: "targets", limit: 101 },
+			{ action: "targets", cursor: "x".repeat(2049) },
+			{ action: "runs", id: "t1", limit: 51 },
+			{ action: "runs", id: "t1", cursor: "x".repeat(101) },
+		])
+			expect(() => parse(args)).toThrow();
+	});
+
+	test("validates target and busy settings without filling partial updates", () => {
+		const input = scheduledTaskParametersSchema.parse({
+			action: "update",
+			id: "task",
+			task: { requireReport: false },
+		});
+		expect(input.task).toEqual({ requireReport: false });
+		for (const task of [
+			{ narratorMode: "unknown" },
+			{ targetNarratorId: "" },
+			{ contextPolicy: "erase" },
+			{ onBusy: "force" },
+			{ busyWaitMinutes: 0 },
+			{ busyWaitMinutes: 1441 },
+			{ busyWaitMinutes: 1.5 },
+			{ requireReport: "false" },
+		])
+			expect(
+				scheduledTaskParametersSchema.safeParse({ action: "update", id: "task", task }).success,
+			).toBe(false);
 	});
 
 	test("an over-long prompt is refused before it can be persisted", async () => {

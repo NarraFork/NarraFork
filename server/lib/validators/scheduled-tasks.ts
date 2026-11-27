@@ -1,5 +1,11 @@
 import { parseSchedule, type TaskSchedule } from "@shared/scheduled-task-schedule";
-import { TASK_MODEL_POLICIES, TASK_ON_BLOCKED_POLICIES } from "@shared/scheduled-task-status";
+import {
+	TASK_CONTEXT_POLICIES,
+	TASK_MODEL_POLICIES,
+	TASK_NARRATOR_MODES,
+	TASK_ON_BLOCKED_POLICIES,
+	TASK_ON_BUSY_POLICIES,
+} from "@shared/scheduled-task-status";
 import { z } from "zod";
 import { permissionModeSchema } from "../permission-modes";
 import { localeSchema } from "./common";
@@ -39,7 +45,12 @@ const baseFields = {
 	runContext: z.enum(["standalone", "project"]).optional(),
 	cwd: z.string().max(4096).nullable().optional(),
 	projectId: z.string().min(1).max(100).nullable().optional(),
-	narratorMode: z.enum(["new", "reuse"]).optional(),
+	narratorMode: z.enum(TASK_NARRATOR_MODES).optional(),
+	targetNarratorId: z.string().min(1).max(100).nullable().optional(),
+	contextPolicy: z.enum(TASK_CONTEXT_POLICIES).optional(),
+	onBusy: z.enum(TASK_ON_BUSY_POLICIES).optional(),
+	busyWaitMinutes: z.number().int().min(1).max(1440).optional(),
+	requireReport: z.boolean().optional(),
 	cleanupPolicy: scheduledTaskCleanupPolicySchema.optional(),
 	enabled: z.boolean().optional(),
 	modelPolicy: z.enum(TASK_MODEL_POLICIES).optional(),
@@ -55,9 +66,13 @@ export const createScheduledTaskSchema = z
 		message: "schedule or cronExpr is required",
 		path: ["schedule"],
 	})
-	.refine((v) => v.runContext !== "project" || !!v.projectId, {
+	.refine((v) => v.narratorMode === "existing" || v.runContext !== "project" || !!v.projectId, {
 		message: "project runContext requires projectId",
 		path: ["projectId"],
+	})
+	.refine((v) => v.narratorMode !== "existing" || !!v.targetNarratorId, {
+		message: "existing narratorMode requires targetNarratorId",
+		path: ["targetNarratorId"],
 	});
 
 export const updateScheduledTaskSchema = z
@@ -84,6 +99,8 @@ export const scheduledTaskFiltersSchema = z.object({
 	result: z
 		.enum([
 			"succeeded",
+			"waiting",
+			"completed",
 			"unconfirmed",
 			"incomplete",
 			"failed",
@@ -99,4 +116,13 @@ export const scheduledTaskFiltersSchema = z.object({
 	runContext: z.enum(["standalone", "project"]).optional(),
 	q: z.string().trim().max(500).optional(),
 	sort: z.enum(["nextRun", "lastRun", "createdAt", "name"]).optional(),
+});
+
+export const scheduledTaskTargetsQuerySchema = z.object({
+	q: z.string().trim().max(200).optional(),
+	limit: z.coerce.number().int().min(1).max(100).optional(),
+	cursor: z.string().min(1).max(2048).optional(),
+});
+export const scheduledTaskAssociationsQuerySchema = scheduledTaskTargetsQuerySchema.omit({
+	q: true,
 });

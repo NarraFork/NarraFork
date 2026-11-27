@@ -9,6 +9,8 @@
 		"nextRuns": "接下来的执行时间（任务时区）",
 		"exhausted": "没有剩余的计划执行时间。",
 		"changes": "查看变更前后",
+		"inherited": "沿用目标会话：{{fields}}",
+		"inheritedValue": "沿用目标会话",
 		"before": "修改前",
 		"after": "修改后",
 		"notice": "这是后续持续执行的授权，不仅限于当前轮次。执行前仍会重新检查配置与访问权限。",
@@ -28,6 +30,13 @@
 			"projectId": "项目",
 			"runContext": "运行上下文",
 			"narratorMode": "会话方式",
+			"targetNarratorId": "目标叙述者",
+			"contextPolicy": "运行前上下文",
+			"onBusy": "目标忙碌时",
+			"busyWaitMinutes": "目标等待上限（分钟）",
+			"requireReport": "要求结果报告",
+			"planMode": "计划模式",
+			"cleanupPolicy": "会话保留策略",
 			"permissionMode": "权限模式",
 			"model": "模型",
 			"modelPolicy": "模型策略",
@@ -54,7 +63,8 @@
 			"standalone": "独立运行",
 			"project": "项目内运行",
 			"new": "每次新建会话",
-			"reuse": "复用任务会话"
+			"reuse": "复用任务会话",
+			"existing": "使用已有叙述者"
 		}
 	},
 	"historyCleared": "历史已清理",

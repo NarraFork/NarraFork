@@ -246,6 +246,56 @@ afterAll(async () => {
 });
 
 describe("OAuth narrator runtime policy", () => {
+	test("legacy scheduled task preferences cannot widen the OAuth tool allowlist", async () => {
+		const { registerCoreTools } = await import("../../lib/agent/tools/index");
+		const { settings } = await import("../../lib/settings");
+		const { changeLoadedToolGroup, getToolSearchCandidates } = await import(
+			"../tool-loading-service"
+		);
+		registerCoreTools();
+		const routines = settings.routines;
+		const original = await db.query.narrators.findFirst({
+			where: eq(narrators.id, ids.narratorV2),
+		});
+		try {
+			settings.routines = {
+				enabledRoutines: [],
+				disabledRoutines: [],
+				toolModes: { scheduled_task_admin: "auto" },
+			};
+			await db
+				.update(narrators)
+				.set({ enabledTools: ["ScheduledTaskAdmin"] })
+				.where(eq(narrators.id, ids.narratorV2));
+			const runtime = await resolveOAuthNarratorRuntimePolicy(ids.narratorV2, ids.user);
+			expect(runtime?.allowedTools.has("ScheduledTask")).toBe(false);
+			const groups = await getToolSearchCandidates(ids.narratorV2, ids.user);
+			expect(groups.some((group) => group.toolNames.includes("ScheduledTask"))).toBe(false);
+			expect(
+				await changeLoadedToolGroup(
+					ids.narratorV2,
+					{
+						id: "scheduled_task",
+						description: "Scheduled tasks",
+						toolNames: ["ScheduledTask"],
+					},
+					true,
+					ids.user,
+				),
+			).toBe("denied");
+			expect(
+				(await db.query.narrators.findFirst({ where: eq(narrators.id, ids.narratorV2) }))
+					?.enabledTools,
+			).toEqual(["ScheduledTaskAdmin"]);
+		} finally {
+			settings.routines = routines;
+			await db
+				.update(narrators)
+				.set({ enabledTools: original?.enabledTools ?? null })
+				.where(eq(narrators.id, ids.narratorV2));
+		}
+	});
+
 	test("uses bindings despite empty or tampered legacy ownership columns", async () => {
 		const policy = await resolveOAuthNarratorRuntimePolicy(ids.narrator, ids.user);
 		expect(policy).toMatchObject({

@@ -32,7 +32,7 @@ async function executeScheduledTask(
 	try {
 		validateScheduledTaskArguments(scheduledTaskParametersSchema.parse(args));
 		const resolved = await resolveScheduledTaskApproval(ctx, args);
-		const { action, id, task, limit, cursor, filters } = scheduledTaskParametersSchema.parse(
+		const { action, id, task, q, limit, cursor, filters } = scheduledTaskParametersSchema.parse(
 			resolved.input,
 		);
 		if (Object.keys(resolved.approval).length)
@@ -47,7 +47,12 @@ async function executeScheduledTask(
 			typeof resolved.approval.expectedUpdatedAt === "string"
 				? resolved.approval.expectedUpdatedAt
 				: undefined;
-		const version = { expectedUpdatedAt };
+		const version = {
+			expectedUpdatedAt,
+			...(resolved.approval.expectedTarget
+				? { expectedTarget: resolved.approval.expectedTarget }
+				: {}),
+		};
 		const taskDetail = async (id: string) => {
 			const detail = await service.detail(id, principal);
 			return {
@@ -70,6 +75,13 @@ async function executeScheduledTask(
 					`Scheduled tasks: ${result.tasks.length}${result.truncated ? "+ (truncated)" : ""}`,
 					result,
 				);
+			}
+			case "targets": {
+				const { listScheduledTaskTargets } = await import(
+					"../../../services/scheduled-task-targets"
+				);
+				const result = await listScheduledTaskTargets(principal, { q, limit, cursor });
+				return jsonOut(`Writable target sessions: ${result.items.length}`, result);
 			}
 			case "get":
 				return jsonOut("Scheduled task", await taskDetail(taskId));
@@ -106,6 +118,7 @@ async function executeScheduledTask(
 								}),
 								principal,
 								{ ...provenance, narratorTitle: narrator?.title ?? null },
+								version,
 							)
 						: await service.update(
 								taskId,
@@ -151,17 +164,7 @@ async function executeScheduledTask(
 export const scheduledTaskTool: ToolDefinition = {
 	name: "ScheduledTask",
 	description:
-		"Manage the scheduled tasks visible to the current user: list, get, preview, create, update, enable, disable, delete, run_now, runs. Use structured calendar schedules (at/repeat/cron), with an explicit timezone and end condition; cronExpr remains a shorthand. Defaults inherit this session's directory, project and permission mode. Every mutation needs human approval even in bypass mode; hard restrictions cannot be delegated. Active scheduled runs can only read/disable their own task and use ScheduledTaskReport. A dispatch is not proof of completion.",
+		"Manage scheduled tasks visible to the current user: list, targets, get, preview, create, update, enable, disable, delete, run_now, runs. targets discovers writable sessions (q, limit <= 100, cursor); runs limit <= 50. Use structured schedules (at/repeat/cron), an explicit timezone and end condition; cronExpr is a shorthand. New/reuse tasks inherit this session's scope. Existing mode requires targetNarratorId (your own ID or another writable session), keeps the target's directory, project, system prompt and permissions, and defaults modelPolicy to follow. contextPolicy defaults keep (clear removes prior conversation from the scheduled turn); onBusy defaults skip (wait is bounded by busyWaitMinutes, interrupt requires normal controller authority). requireReport defaults true. Every mutation requires human approval even in bypass mode; hard restrictions cannot be delegated. Active scheduled runs can only read/disable their own task and use ScheduledTaskReport. A dispatch is not proof of completion.",
 	parameters: scheduledTaskParametersSchema,
 	execute: (args, ctx) => executeScheduledTask(args, ctx),
 };
-
-/** Compatibility helper retained for existing consumers. */
-export function previewCronRuns(
-	cronExpr: string,
-	timezone: string | null | undefined,
-	count: number,
-): string[] {
-	return previewScheduledTask({ cronExpr, timezone }, { count: Math.max(1, Math.min(50, count)) })
-		.occurrences;
-}

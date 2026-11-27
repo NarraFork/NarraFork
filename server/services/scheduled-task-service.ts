@@ -13,6 +13,7 @@ import {
 	type TaskModelPolicy,
 	type TaskOnBlockedPolicy,
 	taskLifecycle,
+	UNFINISHED_RUN_STATUSES,
 } from "@shared/scheduled-task-status";
 import {
 	and,
@@ -64,18 +65,24 @@ import {
 	taskOwnerWhere,
 	taskReadableWhere,
 } from "./scheduled-task-acl";
-import { cleanupScheduledTaskNarrators } from "./scheduled-task-cleanup";
+import { scheduledTaskMutationLocks as locks } from "./scheduled-task-admission";
+import { cancelScheduledTaskWaitingRuns } from "./scheduled-task-run-service";
 import {
 	missedScheduleSlice,
 	nextTaskOccurrence,
 	readTaskSchedule,
 } from "./scheduled-task-schedule-state";
+import {
+	assertScheduledTaskTargetVersion,
+	resolveScheduledTaskTarget,
+	type ScheduledTaskExpectedTarget,
+} from "./scheduled-task-target";
+import { acceptScheduledTaskRun, advanceScheduledTaskRun } from "./scheduled-task-waiting";
 
 export type ScheduledTask = typeof scheduledTasks.$inferSelect;
 const LIST_MAX = 500;
 const DUE_BATCH = 25;
 const MISFIRE_TOLERANCE_MS = 60_000;
-const locks = hotSafe("scheduled-tasks:mutation-locks", () => new AsyncMutex());
 const ownerLocks = hotSafe("scheduled-tasks:owner-locks", () => new AsyncMutex());
 const pausedSweep = hotSafe("scheduled-tasks:paused-sweep", () => ({ cursor: "" }));
 function boundedSetting(value: unknown, fallback: number, max: number) {
@@ -109,21 +116,25 @@ export interface CreateScheduledTaskInput {
 	runContext?: ScheduledRunContext;
 	cwd?: string | null;
 	projectId?: string | null;
-	narratorMode?: "new" | "reuse";
+	narratorMode?: "new" | "reuse" | "existing";
+	targetNarratorId?: string | null;
+	contextPolicy?: "keep" | "clear";
+	onBusy?: "skip" | "wait" | "interrupt";
+	busyWaitMinutes?: number;
+	requireReport?: boolean;
 	cleanupPolicy?: ScheduledTaskCleanupPolicy;
 	enabled?: boolean;
-	/** Trusted legacy service caller only; HTTP/tool input schemas never accept attribution. */
-	createdBy?: string | null;
 	modelPolicy?: TaskModelPolicy;
 	onBlocked?: TaskOnBlockedPolicy;
 	blockedWaitMinutes?: number;
 	maxRunMinutes?: number;
 	notifyOnSuccess?: boolean;
 }
-export type UpdateScheduledTaskInput = Partial<Omit<CreateScheduledTaskInput, "createdBy">>;
+export type UpdateScheduledTaskInput = Partial<CreateScheduledTaskInput>;
 /** Bind a mutating tool call to exactly the configuration that the person approved. */
 export interface ScheduledTaskMutationOptions {
 	expectedUpdatedAt?: string;
+	expectedTarget?: ScheduledTaskExpectedTarget;
 }
 export interface ScheduledTaskProvenance {
 	kind: "user" | "narrator";
@@ -183,6 +194,41 @@ function rowVersion(task: ScheduledTask) {
 		eq(scheduledTasks.updatedAt, task.updatedAt),
 	);
 }
+
+/** Normalize old persisted rows atomically before a writer or startup advances their schedule. */
+async function normalizeLegacyTask(task: ScheduledTask, now = new Date()): Promise<ScheduledTask> {
+	if (task.schedule) return task;
+	const schedule = readTaskSchedule(task);
+	const creator = task.createdBy
+		? await db.query.users.findFirst({
+				where: eq(users.id, task.createdBy),
+				columns: { username: true },
+			})
+		: undefined;
+	const nextAt = task.nextRunAt ? Date.parse(task.nextRunAt) : Number.NaN;
+	const [updated] = await db
+		.update(scheduledTasks)
+		.set({
+			schedule,
+			scheduleKind: schedule.kind,
+			ownerUserId: task.ownerUserId ?? task.createdBy,
+			creatorKind: "user",
+			creatorSnapshot: task.creatorSnapshot ?? { username: creator?.username },
+			// nextRunAt is the old scheduler's durable boundary, including runs just dispatched.
+			// Rewinding to createdAt could dispatch the same occurrence again after an upgrade.
+			scheduleCursorAt:
+				task.scheduleCursorAt ??
+				(Number.isFinite(nextAt)
+					? new Date(nextAt - 1).toISOString()
+					: (task.lastRunAt ?? now.toISOString())),
+		})
+		.where(and(rowVersion(task), isNull(scheduledTasks.schedule)))
+		.returning();
+	const current =
+		updated ?? (await db.query.scheduledTasks.findFirst({ where: eq(scheduledTasks.id, task.id) }));
+	if (!current) throw new NotFoundError("ScheduledTask", task.id);
+	return current;
+}
 function normalizeSchedule(
 	input: unknown,
 	timezone: string | null,
@@ -201,7 +247,7 @@ function normalizeSchedule(
 			...schedule,
 			anchorAt:
 				existing?.kind === "repeat" && scheduleSignature(schedule) === scheduleSignature(existing)
-					? existing.anchorAt ?? defaultAnchor(timezone, now, schedule.startAt)
+					? (existing.anchorAt ?? defaultAnchor(timezone, now, schedule.startAt))
 					: defaultAnchor(timezone, now, schedule.startAt),
 		};
 	}
@@ -210,11 +256,78 @@ function normalizeSchedule(
 	return schedule;
 }
 
-function verdictExpression(status: SQLWrapper, outcome: SQLWrapper): SQL<RunVerdict> {
+function verdictExpression(
+	status: SQLWrapper,
+	outcome: SQLWrapper,
+	requireReport: SQLWrapper,
+): SQL<RunVerdict> {
 	return sql<RunVerdict>`case when ${status} = 'completed' then case
 		when ${outcome} in ('done','no_change') then 'succeeded'
-		when ${outcome} in ('partial','blocked') then 'incomplete' else 'unconfirmed' end
+		when ${outcome} in ('partial','blocked') then 'incomplete'
+		when ${requireReport} = 0 then 'completed' else 'unconfirmed' end
 		when ${status} = 'success' then 'dispatched' else ${status} end`;
+}
+
+function executionSettings(
+	input: UpdateScheduledTaskInput,
+	existing?: ScheduledTask,
+	allowMissingTarget = false,
+) {
+	const narratorMode = input.narratorMode ?? existing?.narratorMode ?? "new";
+	const targetNarratorId =
+		narratorMode === "existing"
+			? input.targetNarratorId === undefined
+				? existing?.targetNarratorId
+				: input.targetNarratorId
+			: null;
+	if (narratorMode === "existing" && !targetNarratorId && !allowMissingTarget)
+		throw new ValidationError("Existing narrator mode requires a target narrator");
+	return {
+		narratorMode,
+		targetNarratorId: targetNarratorId ?? null,
+		contextPolicy: input.contextPolicy ?? existing?.contextPolicy ?? "keep",
+		onBusy: input.onBusy ?? existing?.onBusy ?? "skip",
+		busyWaitMinutes: input.busyWaitMinutes ?? existing?.busyWaitMinutes ?? 30,
+		requireReport: input.requireReport ?? existing?.requireReport ?? true,
+		modelPolicy:
+			input.modelPolicy ??
+			(narratorMode === "existing" && existing?.narratorMode !== "existing"
+				? "follow"
+				: (existing?.modelPolicy ?? "sync")),
+		...(narratorMode === "existing"
+			? { cwd: null, projectId: null, runContext: "standalone" as const, systemPrompt: null }
+			: {}),
+	};
+}
+
+async function validateExistingTarget(
+	task: Pick<ScheduledTask, "narratorMode" | "targetNarratorId">,
+	owner: ScheduledTaskPrincipal,
+	caller?: ScheduledTaskPrincipal,
+	options: ScheduledTaskMutationOptions = {},
+) {
+	if (task.narratorMode !== "existing") return;
+	const resolved = await resolveScheduledTaskTarget(owner, task.targetNarratorId ?? "");
+	if (caller && caller.userId !== owner.userId)
+		await resolveScheduledTaskTarget(caller, task.targetNarratorId ?? "");
+	assertScheduledTaskTargetVersion(resolved, options.expectedTarget);
+	return resolved;
+}
+
+async function withExistingTargetBinding<T>(
+	task: Pick<ScheduledTask, "narratorMode" | "targetNarratorId">,
+	ownerId: string | null,
+	caller: ScheduledTaskPrincipal,
+	options: ScheduledTaskMutationOptions,
+	write: () => Promise<T>,
+	passive = false,
+): Promise<T> {
+	if (task.narratorMode !== "existing" || passive) return write();
+	const { withNarratorWorkAdmission } = await import("./narrator-session-state");
+	return withNarratorWorkAdmission(task.targetNarratorId ?? "", async () => {
+		await validateExistingTarget(task, await resolveTaskPrincipal(ownerId), caller, options);
+		return write();
+	});
 }
 
 // Do not fetch prompt bodies on list endpoints. Removing them after SELECT * is too late.
@@ -264,8 +377,15 @@ async function decorate(task: TaskSummary | ScheduledTask, principal: ScheduledT
 		...safe
 	} = task;
 	const schedule = readTaskSchedule(task);
+	const lastRun = task.lastRunId
+		? await db.query.scheduledTaskRuns.findFirst({
+				where: eq(scheduledTaskRuns.id, task.lastRunId),
+				columns: { requireReport: true },
+			})
+		: undefined;
 	return {
 		...safe,
+		lastRequireReport: lastRun?.requireReport ?? true,
 		schedule,
 		runContext: normalizeRunContext(task.runContext),
 		ownerUserId: ownerId,
@@ -322,7 +442,11 @@ export const scheduledTaskService = {
 
 	async list(principal?: ScheduledTaskPrincipal, filters: TaskFilters = {}) {
 		const live = await actor(principal);
-		const verdict = verdictExpression(scheduledTasks.lastStatus, scheduledTasks.lastOutcome);
+		const verdict = verdictExpression(
+			scheduledTasks.lastStatus,
+			scheduledTasks.lastOutcome,
+			sql`coalesce((select ${scheduledTaskRuns.requireReport} from ${scheduledTaskRuns} where ${scheduledTaskRuns.id} = ${scheduledTasks.lastRunId}), 1)`,
+		);
 		const lifecycle = filters.lifecycle ?? "active";
 		const query = filters.q?.trim();
 		const match = query ? `%${query.replace(/[\\%_]/g, "\\$&")}%` : null;
@@ -401,11 +525,13 @@ export const scheduledTaskService = {
 		input: CreateScheduledTaskInput,
 		principal?: ScheduledTaskPrincipal,
 		provenance?: ScheduledTaskProvenance,
+		options: ScheduledTaskMutationOptions = {},
 	): Promise<ScheduledTask> {
-		const live = await resolveTaskPrincipal(principal?.userId ?? input.createdBy);
+		const live = await actor(principal);
 		const parsed = createScheduledTaskSchema.safeParse(input);
 		if (!parsed.success) throw new ValidationError(parsed.error.message);
-		const data = parsed.data;
+		const data = { ...parsed.data, ...executionSettings(parsed.data) };
+		await validateExistingTarget(data, live, live, options);
 		if (provenance?.kind === "narrator") {
 			if (!provenance.narratorId) throw new ForbiddenError();
 			const { assertNarratorMayDelegateScheduledTask } = await import(
@@ -447,39 +573,41 @@ export const scheduledTaskService = {
 				scheduleCursorAt: ts,
 				nextRunAt: null,
 			});
-			const [row] = await db
-				.insert(scheduledTasks)
-				.values({
-					...data,
-					id: generateId(),
-					cronExpr: scheduleToLegacyCron(schedule) ?? "",
-					schedule,
-					scheduleKind: schedule.kind,
-					timezone,
-					ownerUserId: live.userId,
-					createdBy: live.userId,
-					creatorKind: provenance?.kind ?? "user",
-					creatorNarratorId: provenance?.narratorId ?? null,
-					creatorMessageId: provenance?.messageId ?? null,
-					creatorToolCallId: provenance?.toolCallId ?? null,
-					creatorToolUseId: provenance?.toolUseId ?? null,
-					creatorSnapshot: {
-						username: creator?.username,
-						narratorTitle: provenance?.narratorTitle ?? undefined,
-					},
-					modelPolicy: data.modelPolicy ?? "sync",
-					runContext: data.runContext ?? "standalone",
-					projectId: data.runContext === "project" ? data.projectId : null,
-					permissionMode: data.permissionMode ?? "default",
-					locale: data.locale ?? DEFAULT_LOCALE,
-					nextRunAt: data.enabled === false && schedule.kind !== "at" ? null : next,
-					scheduleCursorAt: ts,
-					completedAt: next ? null : ts,
-					lastModifiedBy: modifiedBy(live, "create", provenance),
-					createdAt: ts,
-					updatedAt: ts,
-				})
-				.returning();
+			const [row] = await withExistingTargetBinding(data, live.userId, live, options, async () =>
+				db
+					.insert(scheduledTasks)
+					.values({
+						...data,
+						id: generateId(),
+						cronExpr: scheduleToLegacyCron(schedule) ?? "",
+						schedule,
+						scheduleKind: schedule.kind,
+						timezone,
+						ownerUserId: live.userId,
+						createdBy: live.userId,
+						creatorKind: provenance?.kind ?? "user",
+						creatorNarratorId: provenance?.narratorId ?? null,
+						creatorMessageId: provenance?.messageId ?? null,
+						creatorToolCallId: provenance?.toolCallId ?? null,
+						creatorToolUseId: provenance?.toolUseId ?? null,
+						creatorSnapshot: {
+							username: creator?.username,
+							narratorTitle: provenance?.narratorTitle ?? undefined,
+						},
+						modelPolicy: data.modelPolicy ?? "sync",
+						runContext: data.runContext ?? "standalone",
+						projectId: data.runContext === "project" ? data.projectId : null,
+						permissionMode: data.permissionMode ?? "default",
+						locale: data.locale ?? DEFAULT_LOCALE,
+						nextRunAt: data.enabled === false && schedule.kind !== "at" ? null : next,
+						scheduleCursorAt: ts,
+						completedAt: next ? null : ts,
+						lastModifiedBy: modifiedBy(live, "create", provenance),
+						createdAt: ts,
+						updatedAt: ts,
+					})
+					.returning(),
+			);
 			changed();
 			return row;
 		});
@@ -507,8 +635,21 @@ export const scheduledTaskService = {
 			assertApprovedVersion(existing, options);
 			const parsed = updateScheduledTaskSchema.safeParse(input);
 			if (!parsed.success) throw new ValidationError(parsed.error.message);
+			existing = await normalizeLegacyTask(existing);
 			const data = parsed.data;
-			const runContext = data.runContext ?? normalizeRunContext(existing.runContext);
+			const passiveUpdate = Object.keys(data).every(
+				(key) => key === "name" || (key === "enabled" && data.enabled === false),
+			);
+			const execution = executionSettings(data, existing, passiveUpdate);
+			const ownerId = taskOwnerId(existing);
+			if (execution.narratorMode === "existing" && !passiveUpdate) {
+				const owner = await resolveTaskPrincipal(ownerId);
+				await validateExistingTarget(execution, owner, live, options);
+			}
+			const runContext =
+				execution.narratorMode === "existing"
+					? "standalone"
+					: (data.runContext ?? normalizeRunContext(existing.runContext));
 			const projectId = data.projectId === undefined ? existing.projectId : data.projectId;
 			if (runContext === "project") {
 				await assertTaskProjectWrite(projectId, live);
@@ -529,10 +670,19 @@ export const scheduledTaskService = {
 				now,
 				false,
 				old,
-				minimumInterval(provenance?.kind === "narrator"),
+				0,
 			);
 			const cadenceChanged =
 				scheduleSignature(old) !== scheduleSignature(schedule) || timezone !== existing.timezone;
+			if (cadenceChanged)
+				normalizeSchedule(
+					schedule,
+					timezone,
+					now,
+					false,
+					old,
+					minimumInterval(provenance?.kind === "narrator"),
+				);
 			if (!cadenceChanged && !existing.enabled && data.enabled === true && schedule.kind === "at") {
 				await this.recordMissed(existing, now);
 				existing = await this.get(id);
@@ -540,6 +690,10 @@ export const scheduledTaskService = {
 			}
 			// Execution settings cannot be changed while the accepted snapshot is in use.
 			if (existing.activeRunId && Object.keys(data).some((key) => key !== "name")) throw conflict();
+			let waiting = await db.query.scheduledTaskRuns.findFirst({
+				where: and(eq(scheduledTaskRuns.taskId, id), eq(scheduledTaskRuns.status, "waiting")),
+				columns: { id: true },
+			});
 			const enabled = data.enabled ?? existing.enabled;
 			const firedCount = cadenceChanged ? 0 : existing.firedCount;
 			const scheduleCursorAt =
@@ -555,35 +709,52 @@ export const scheduledTaskService = {
 			});
 			if (enabled && !next && !existing.activeRunId && (data.enabled === true || cadenceChanged))
 				throw new ValidationError("This schedule has ended; choose a future occurrence");
-			const [updated] = await db
-				.update(scheduledTasks)
-				.set({
-					...data,
-					runContext,
-					projectId: runContext === "project" ? projectId : null,
-					// A moved task must not keep executing in its previous workspace.
-					...(runContext !== normalizeRunContext(existing.runContext) ||
-					projectId !== existing.projectId ||
-					(data.cwd !== undefined && data.cwd !== existing.cwd)
-						? { reuseNarratorId: null }
-						: {}),
-					schedule,
-					scheduleKind: schedule.kind,
-					cronExpr: scheduleToLegacyCron(schedule) ?? "",
-					timezone,
-					firedCount,
-					scheduleCursorAt,
-					scheduleRevision: existing.scheduleRevision + (cadenceChanged ? 1 : 0),
-					nextRunAt: enabled || schedule.kind === "at" ? next : null,
-					completedAt: !next && !existing.activeRunId ? now.toISOString() : null,
-					enabled,
-					pauseReason: enabled ? null : "user",
-					...(data.enabled === true ? { consecutiveFailures: 0 } : {}),
-					lastModifiedBy: modifiedBy(live, "update", provenance),
-					updatedAt: stamp(existing.updatedAt),
-				})
-				.where(rowVersion(existing))
-				.returning();
+			if (Object.keys(data).some((key) => key !== "name")) {
+				await cancelScheduledTaskWaitingRuns(id, "Task configuration changed while waiting");
+				existing = await this.get(id);
+				if (!existing) throw new NotFoundError("ScheduledTask", id);
+				waiting = undefined;
+			}
+			const version = existing;
+			const [updated] = await withExistingTargetBinding(
+				execution,
+				taskOwnerId(version),
+				live,
+				options,
+				async () =>
+					db
+						.update(scheduledTasks)
+						.set({
+							...data,
+							...execution,
+							runContext,
+							projectId: runContext === "project" ? projectId : null,
+							// A moved task must not keep executing in its previous workspace.
+							...(execution.narratorMode !== version.narratorMode ||
+							runContext !== normalizeRunContext(version.runContext) ||
+							projectId !== version.projectId ||
+							(data.cwd !== undefined && data.cwd !== version.cwd)
+								? { reuseNarratorId: null }
+								: {}),
+							schedule,
+							scheduleKind: schedule.kind,
+							cronExpr: scheduleToLegacyCron(schedule) ?? "",
+							timezone,
+							firedCount,
+							scheduleCursorAt,
+							scheduleRevision: version.scheduleRevision + (cadenceChanged ? 1 : 0),
+							nextRunAt: enabled || schedule.kind === "at" ? next : null,
+							completedAt: !next && !version.activeRunId && !waiting ? now.toISOString() : null,
+							enabled,
+							pauseReason: enabled ? null : "user",
+							...(data.enabled === true ? { consecutiveFailures: 0 } : {}),
+							lastModifiedBy: modifiedBy(live, "update", provenance),
+							updatedAt: stamp(version.updatedAt),
+						})
+						.where(rowVersion(version))
+						.returning(),
+				passiveUpdate,
+			);
 			if (!updated) throw conflict();
 			changed();
 			return updated;
@@ -602,6 +773,23 @@ export const scheduledTaskService = {
 			await assertTaskAccess(task, live, "pause");
 			if (!task) throw new NotFoundError("ScheduledTask", id);
 			assertApprovedVersion(task, options);
+			task = await normalizeLegacyTask(task);
+			if (enabled) {
+				const execution = executionSettings({}, task);
+				const owner = await resolveTaskPrincipal(taskOwnerId(task));
+				await validateExistingTarget(execution, owner, live, options);
+				if (
+					execution.narratorMode !== "existing" &&
+					normalizeRunContext(task.runContext) === "project"
+				) {
+					await assertTaskProjectWrite(task.projectId, owner);
+					await assertTaskProjectWrite(task.projectId, live);
+				}
+			} else {
+				await cancelScheduledTaskWaitingRuns(id, "Task paused while waiting");
+				task = await this.get(id);
+				if (!task) throw new NotFoundError("ScheduledTask", id);
+			}
 			const schedule = readTaskSchedule(task);
 			if (!task.enabled && schedule.kind === "at") {
 				await this.recordMissed(task, new Date());
@@ -640,11 +828,15 @@ export const scheduledTaskService = {
 	): Promise<void> {
 		const live = await actor(principal);
 		await locks.acquire(id, async () => {
-			const task = await this.get(id);
+			let task = await this.get(id);
 			await assertTaskAccess(task, live, "edit");
 			if (!task) throw new NotFoundError("ScheduledTask", id);
 			assertApprovedVersion(task, options);
 			if (task.activeRunId) throw conflict();
+			await cancelScheduledTaskWaitingRuns(id, "Task deleted while waiting");
+			task = await this.get(id);
+			if (!task) throw new NotFoundError("ScheduledTask", id);
+			const version = task;
 			db.transaction((tx) => {
 				// Some old ALTER ADD REFERENCES migrations omitted ON DELETE SET NULL.
 				// A failed CAS rolls the detach back as part of this same transaction.
@@ -654,7 +846,7 @@ export const scheduledTaskService = {
 					.run();
 				const removed = tx
 					.delete(scheduledTasks)
-					.where(and(rowVersion(task), isNull(scheduledTasks.activeRunId)))
+					.where(and(rowVersion(version), isNull(scheduledTasks.activeRunId)))
 					.returning({ id: scheduledTasks.id })
 					.all();
 				if (!removed.length) throw conflict();
@@ -668,11 +860,20 @@ export const scheduledTaskService = {
 		if (!live.isAdmin) throw new ForbiddenError();
 		const owner = await resolveTaskPrincipal(ownerUserId);
 		return locks.acquire(id, async () => {
-			const task = await this.get(id);
-			if (!task) throw new NotFoundError("ScheduledTask", id);
-			if (task.activeRunId) throw conflict();
-			if (normalizeRunContext(task.runContext) === "project")
-				await assertTaskProjectWrite(task.projectId, owner);
+			let current = await this.get(id);
+			if (!current) throw new NotFoundError("ScheduledTask", id);
+			if (current.activeRunId) throw conflict();
+			const execution = executionSettings({}, current);
+			await validateExistingTarget(execution, owner, live);
+			if (
+				execution.narratorMode !== "existing" &&
+				normalizeRunContext(current.runContext) === "project"
+			)
+				await assertTaskProjectWrite(current.projectId, owner);
+			await cancelScheduledTaskWaitingRuns(id, "Task owner changed while waiting");
+			current = await this.get(id);
+			if (!current) throw new NotFoundError("ScheduledTask", id);
+			const task = current;
 			const previousOwner = taskOwnerId(task);
 			const transferred = db.transaction((tx) => {
 				const rows = tx
@@ -744,29 +945,7 @@ export const scheduledTaskService = {
 					await locks.acquire(original.id, async () => {
 						let task = await this.get(original.id);
 						if (!task) return;
-						if (!task.schedule) {
-							const schedule = readTaskSchedule(task);
-							const user = task.createdBy
-								? await db.query.users.findFirst({
-										where: eq(users.id, task.createdBy),
-										columns: { username: true },
-									})
-								: undefined;
-							const [updated] = await db
-								.update(scheduledTasks)
-								.set({
-									schedule,
-									scheduleKind: schedule.kind,
-									ownerUserId: task.ownerUserId ?? task.createdBy,
-									creatorKind: "user",
-									creatorSnapshot: task.creatorSnapshot ?? { username: user?.username },
-									scheduleCursorAt: task.scheduleCursorAt ?? task.createdAt,
-								})
-								.where(and(rowVersion(task), isNull(scheduledTasks.schedule)))
-								.returning();
-							task = updated ?? (await this.get(task.id));
-							if (!task) return;
-						}
+						task = await normalizeLegacyTask(task, at);
 						// Explicit dates pass even while paused. Repeating pauses consume nothing.
 						if (task.completedAt || (!task.enabled && readTaskSchedule(task).kind !== "at")) return;
 						// All times before startup are missed, including those inside normal tick tolerance.
@@ -827,6 +1006,10 @@ export const scheduledTaskService = {
 			until,
 		);
 		if (!slice) return;
+		const waiting = await db.query.scheduledTaskRuns.findFirst({
+			where: and(eq(scheduledTaskRuns.taskId, task.id), eq(scheduledTaskRuns.status, "waiting")),
+			columns: { id: true },
+		});
 		const ts = stamp(task.updatedAt);
 		const runId = generateId();
 		db.transaction((tx) => {
@@ -836,7 +1019,7 @@ export const scheduledTaskService = {
 					firedCount: slice.firedCount,
 					scheduleCursorAt: slice.scheduleCursorAt,
 					nextRunAt: task.enabled || readTaskSchedule(task).kind === "at" ? slice.nextRunAt : null,
-					completedAt: !slice.nextRunAt && !task.activeRunId ? ts : null,
+					completedAt: !slice.nextRunAt && !task.activeRunId && !waiting ? ts : null,
 					lastRunId: runId,
 					lastStatus: "missed",
 					lastRunAt: ts,
@@ -862,6 +1045,7 @@ export const scheduledTaskService = {
 					taskId: task.id,
 					status: "missed",
 					runContext: normalizeRunContext(task.runContext),
+					requireReport: task.requireReport,
 					scheduledFor: slice.first,
 					missedCount: slice.count,
 					finishedAt: ts,
@@ -890,15 +1074,16 @@ export const scheduledTaskService = {
 		for (const row of rows) await this.reconcileCompletion(row.id);
 	},
 	async reconcileCompletion(id: string) {
-		const task = await this.get(id);
+		let task = await this.get(id);
 		if (!task || task.activeRunId || task.completedAt) return;
+		task = await normalizeLegacyTask(task);
 		const active = await db
 			.select({ id: scheduledTaskRuns.id })
 			.from(scheduledTaskRuns)
 			.where(
 				and(
 					eq(scheduledTaskRuns.taskId, id),
-					inArray(scheduledTaskRuns.status, ["running", "blocked"]),
+					inArray(scheduledTaskRuns.status, UNFINISHED_RUN_STATUSES),
 				),
 			)
 			.limit(1);
@@ -930,12 +1115,13 @@ export const scheduledTaskService = {
 		} = {},
 	): Promise<void> {
 		const caller = opts.manual ? await actor(opts.principal) : undefined;
-		await locks.acquire(id, async () => {
+		const runId = await locks.acquire(id, async () => {
 			let task = await this.get(id);
 			if (!task) throw new NotFoundError("ScheduledTask", id);
 			if (caller) await assertTaskAccess(task, caller, "edit");
 			assertApprovedVersion(task, opts);
 			const at = opts.at ?? new Date();
+			task = await normalizeLegacyTask(task, at);
 			if (!opts.manual) {
 				if (task.completedAt || !task.nextRunAt || task.nextRunAt > at.toISOString()) return;
 				if (!task.enabled) {
@@ -952,144 +1138,24 @@ export const scheduledTaskService = {
 					)
 						return;
 				}
-			} else if (task.activeRunId) throw conflict();
-			const runId = generateId();
-			const ts = stamp(task.updatedAt);
-			const scheduledFor = opts.manual ? null : task.nextRunAt;
-			const firedCount = task.firedCount + (opts.manual ? 0 : 1);
-			const cursor = scheduledFor ?? task.scheduleCursorAt;
-			const next = opts.manual
-				? task.nextRunAt
-				: nextTaskOccurrence({ ...task, firedCount, scheduleCursorAt: cursor });
-			const overlap = !!task.activeRunId;
-			db.transaction((tx) => {
-				const rows = tx
-					.update(scheduledTasks)
-					.set({
-						firedCount,
-						scheduleCursorAt: cursor,
-						nextRunAt: next,
-						activeRunId: overlap ? task.activeRunId : runId,
-						lastRunId: runId,
-						lastRunAt: ts,
-						lastStatus: overlap ? "skipped" : "running",
-						lastOutcome: null,
-						lastSummary: null,
-						lastError: null,
-						completedAt: opts.manual ? task.completedAt : null,
-						updatedAt: ts,
-					})
-					.where(
-						and(
-							rowVersion(task),
-							overlap
-								? eq(scheduledTasks.activeRunId, task.activeRunId as string)
-								: isNull(scheduledTasks.activeRunId),
-						),
-					)
-					.returning({ id: scheduledTasks.id })
-					.all();
-				if (!rows.length) throw conflict();
-				tx.insert(scheduledTaskRuns)
-					.values({
-						id: runId,
-						taskId: id,
-						status: overlap ? "skipped" : "running",
-						errorKind: overlap ? "busy" : null,
-						runContext: normalizeRunContext(task.runContext),
-						scheduledFor,
-						manual: opts.manual === true,
-						trigger: opts.manual ? "manual" : "schedule",
-						startedAt: overlap ? null : ts,
-						finishedAt: overlap ? ts : null,
-						deadlineAt: new Date(Date.now() + task.maxRunMinutes * 60_000).toISOString(),
-						createdAt: ts,
-					})
-					.run();
-			});
-			changed();
-			if (overlap) return;
-			const { finalizeScheduledRun } = await import("./scheduled-task-run-service");
-			try {
-				const ownerId = taskOwnerId(task);
-				if (!ownerId)
-					throw new ForbiddenError("Task owner is missing; an administrator must take ownership");
-				const owner = await resolveTaskPrincipal(ownerId);
-				const target = await this.resolveNarrator(task, owner);
-				const { isLoopRunning } = await import("./narrator-session");
-				if (isLoopRunning(target.id)) {
-					await finalizeScheduledRun(runId, "skipped", {
-						errorKind: "busy",
-						error: "Narrator is already running",
-					});
-					return;
-				}
-				// Recheck after preparation: a pause, transfer, or project revocation can win an await.
-				const current = await this.get(id);
-				if (
-					!current ||
-					current.activeRunId !== runId ||
-					taskOwnerId(current) !== ownerId ||
-					(!opts.manual && !current.enabled)
-				)
-					throw conflict();
-				if (normalizeRunContext(task.runContext) === "project")
-					await assertTaskProjectWrite(task.projectId, await resolveTaskPrincipal(ownerId));
-				await db
-					.update(scheduledTaskRuns)
-					.set({
-						narratorId: target.id,
-						model: task.modelPolicy === "follow" ? target.model : task.model,
-					})
-					.where(eq(scheduledTaskRuns.id, runId));
-				await db
-					.update(scheduledTasks)
-					.set({
-						lastNarratorId: target.id,
-						...(task.narratorMode === "reuse" ? { reuseNarratorId: target.id } : {}),
-					})
-					.where(and(eq(scheduledTasks.id, id), eq(scheduledTasks.activeRunId, runId)));
-				const { registerScheduledRun } = await import("./scheduled-run-registry");
-				registerScheduledRun({
-					runId,
-					taskId: id,
-					narratorId: target.id,
-					ownerUserId: ownerId,
-					onBlocked: task.onBlocked,
-					blockedWaitMinutes: task.blockedWaitMinutes,
-					permissionMode: task.permissionMode,
-					systemPrompt: task.systemPrompt,
-					modelPolicy: task.modelPolicy,
-					model: task.model,
-					locale: task.locale,
-					deadlineAt: new Date(new Date(ts).getTime() + task.maxRunMinutes * 60_000).toISOString(),
-				});
-				const { sendScheduledTaskMessage } = await import("./narrator-session");
-				await sendScheduledTaskMessage({
-					runId,
-					narratorId: target.id,
-					prompt: task.prompt,
-					userId: ownerId,
-					locale: task.locale,
-				});
-			} catch (error) {
-				await finalizeScheduledRun(runId, "failed", {
-					errorKind:
-						error instanceof ForbiddenError || error instanceof NotFoundError ? "acl" : "dispatch",
-					error: String(error).slice(0, 2000),
-				});
-			} finally {
-				try {
-					await cleanupScheduledTaskNarrators(id);
-				} catch (error) {
-					logger.warn("Scheduled task retention failed", { taskId: id, error: String(error) });
-				}
 			}
+			if (caller && task.narratorMode === "existing") {
+				await validateExistingTarget(
+					task,
+					await resolveTaskPrincipal(taskOwnerId(task)),
+					caller,
+					opts,
+				);
+			}
+			return acceptScheduledTaskRun(task, { manual: opts.manual === true, at });
 		});
+		if (runId) await advanceScheduledTaskRun(runId);
 	},
 
 	/** Resolve only task-created sessions; a forged reuse pointer cannot mutate an ordinary session. */
 	async resolveNarrator(task: ScheduledTask, principal: ScheduledTaskPrincipal) {
+		if (task.narratorMode === "existing")
+			return (await resolveScheduledTaskTarget(principal, task.targetNarratorId ?? "")).target;
 		let cwd = task.cwd;
 		let contextProjectId: string | null = null;
 		if (normalizeRunContext(task.runContext) === "project") {
@@ -1102,7 +1168,7 @@ export const scheduledTaskService = {
 			if (
 				existing &&
 				existing.status !== "archived" &&
-				existing.scheduledTaskId === task.id &&
+				(existing.scheduledTaskId === null || existing.scheduledTaskId === task.id) &&
 				(await canWriteNarrator(existing, principal))
 			)
 				return existing;
@@ -1153,7 +1219,11 @@ export const scheduledTaskService = {
 				throw new ValidationError("Invalid run history cursor");
 			}
 		}
-		const verdict = verdictExpression(scheduledTaskRuns.status, scheduledTaskRuns.outcome);
+		const verdict = verdictExpression(
+			scheduledTaskRuns.status,
+			scheduledTaskRuns.outcome,
+			scheduledTaskRuns.requireReport,
+		);
 		const rows = await db
 			.select()
 			.from(scheduledTaskRuns)
@@ -1203,7 +1273,7 @@ export const scheduledTaskService = {
 			triggerMessageId:
 				run.narratorId && readableTargets.has(run.narratorId) ? run.triggerMessageId : null,
 			trigger: run.manual ? "manual" : run.trigger,
-			verdict: runVerdict(run.status, run.outcome),
+			verdict: runVerdict(run.status, run.outcome, run.requireReport),
 			error: canSeeOutput ? run.error : null,
 			outcomeSummary: canSeeOutput ? run.outcomeSummary : null,
 			autoHandled: canSeeOutput ? run.autoHandled : null,

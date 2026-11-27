@@ -9,6 +9,8 @@
 		"nextRuns": "Next executions (in the task timezone)",
 		"exhausted": "No remaining scheduled execution.",
 		"changes": "Review changes",
+		"inherited": "Inherited from the target session: {{fields}}",
+		"inheritedValue": "Inherited from the target session",
 		"before": "Before",
 		"after": "After",
 		"notice": "This grants recurring execution authority, not just permission for the current turn. Configuration and access are rechecked before execution.",
@@ -28,6 +30,13 @@
 			"projectId": "Project",
 			"runContext": "Context",
 			"narratorMode": "Session",
+			"targetNarratorId": "Target narrator",
+			"contextPolicy": "Context before execution",
+			"onBusy": "When the target is busy",
+			"busyWaitMinutes": "Maximum target wait (minutes)",
+			"requireReport": "Require a result report",
+			"planMode": "Plan mode",
+			"cleanupPolicy": "Session retention",
 			"permissionMode": "Permission mode",
 			"model": "Model",
 			"modelPolicy": "Model policy",
@@ -54,7 +63,8 @@
 			"standalone": "Standalone",
 			"project": "Project",
 			"new": "New session per run",
-			"reuse": "Reuse task session"
+			"reuse": "Reuse task session",
+			"existing": "Use an existing narrator"
 		}
 	},
 	"historyCleared": "History cleared",

@@ -523,15 +523,8 @@
 		{
 			"idx": 74,
 			"version": "7",
-			"when": 1794616910532,
+			"when": 1795801468893,
 			"tag": "0074_scheduled_tasks_redesign",
-			"breakpoints": true
-		},
-		{
-			"idx": 75,
-			"version": "7",
-			"when": 1794674434077,
-			"tag": "0075_scheduled_run_admission",
 			"breakpoints": true
 		}
   ]

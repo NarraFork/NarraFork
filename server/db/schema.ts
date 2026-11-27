@@ -42,6 +42,7 @@ import type { TaskSchedule } from "@shared/scheduled-task-schedule";
 import type {
 	RunAutoHandled,
 	RunStats,
+	ScheduledRunInterruptTarget,
 	TaskCreatorSnapshot,
 	TaskModifiedBy,
 } from "@shared/scheduled-task-status";
@@ -6559,10 +6560,22 @@ export const scheduledTasks = sqliteTable(
 		cwd: text("cwd"),
 		// project mode: target project.
 		projectId: text("project_id").references(() => projects.id, { onDelete: "set null" }),
-		// Whether to spawn a fresh narrator each run or reuse the same one.
-		narratorMode: text("narrator_mode", { enum: ["new", "reuse"] })
+		// Spawn a fresh narrator, reuse a task-created one, or explicitly target an existing one.
+		narratorMode: text("narrator_mode", { enum: ["new", "reuse", "existing"] })
 			.notNull()
 			.default("new"),
+		// An explicit target is a reference, never a transfer of ownership or creation provenance.
+		targetNarratorId: text("target_narrator_id").references((): AnySQLiteColumn => narrators.id, {
+			onDelete: "set null",
+		}),
+		contextPolicy: text("context_policy", { enum: ["keep", "clear"] })
+			.notNull()
+			.default("keep"),
+		onBusy: text("on_busy", { enum: ["skip", "wait", "interrupt"] })
+			.notNull()
+			.default("skip"),
+		busyWaitMinutes: integer("busy_wait_minutes").notNull().default(30),
+		requireReport: integer("require_report", { mode: "boolean" }).notNull().default(true),
 		/** Opt-in, task-scoped destructive retention. Existing tasks remain unchanged. */
 		cleanupPolicy: text("cleanup_policy", { mode: "json" })
 			.$type<ScheduledTaskCleanupPolicy>()
@@ -6628,6 +6641,7 @@ export const scheduledTasks = sqliteTable(
 		/** Status of the latest run. `success` is legacy and means only "dispatched". */
 		lastStatus: text("last_status", {
 			enum: [
+				"waiting",
 				"running",
 				"blocked",
 				"completed",
@@ -6654,6 +6668,7 @@ export const scheduledTasks = sqliteTable(
 		index("idx_scheduled_tasks_created_by").on(table.createdBy),
 		index("idx_scheduled_tasks_owner").on(table.ownerUserId),
 		index("idx_scheduled_tasks_reuse_narrator").on(table.reuseNarratorId),
+		index("idx_scheduled_tasks_target_narrator").on(table.targetNarratorId),
 		index("idx_scheduled_tasks_last_narrator").on(table.lastNarratorId),
 	],
 );
@@ -6678,6 +6693,7 @@ export const scheduledTaskRuns = sqliteTable(
 		 */
 		status: text("status", {
 			enum: [
+				"waiting",
 				"running",
 				"blocked",
 				"completed",
@@ -6699,6 +6715,9 @@ export const scheduledTaskRuns = sqliteTable(
 				"restart",
 				"acl",
 				"busy",
+				"busy_timeout",
+				"scheduled_interrupt",
+				"cancelled",
 				"target_missing",
 				"user_interrupt",
 			],
@@ -6731,6 +6750,14 @@ export const scheduledTaskRuns = sqliteTable(
 		outcomeReportedAt: text("outcome_reported_at"),
 		/** What an unattended run settled without a person. */
 		autoHandled: text("auto_handled", { mode: "json" }).$type<RunAutoHandled>(),
+		/** Frozen on acceptance: later task edits cannot change a run's reporting contract. */
+		requireReport: integer("require_report", { mode: "boolean" }).notNull().default(true),
+		/** A fixed deadline while waiting for the target; execution time starts after admission. */
+		busyDeadlineAt: text("busy_deadline_at"),
+		/** A non-null value reserves the next scheduled start for this exact interruption. */
+		interruptTarget: text("interrupt_target", {
+			mode: "json",
+		}).$type<ScheduledRunInterruptTarget>(),
 		/** The one reminder to report an outcome has been sent. */
 		nudged: integer("nudged", { mode: "boolean" }).notNull().default(false),
 		/** Occurrences one `missed` row stands for, when an outage skipped several. */
@@ -6745,7 +6772,22 @@ export const scheduledTaskRuns = sqliteTable(
 	},
 	(table) => [
 		index("idx_scheduled_task_runs_task").on(table.taskId, table.createdAt),
+		// Completion and association probes must not walk a task's accumulated history.
+		index("idx_scheduled_task_runs_task_status").on(table.taskId, table.status),
 		index("idx_scheduled_task_runs_narrator").on(table.narratorId),
+		index("idx_scheduled_task_runs_narrator_task").on(table.narratorId, table.taskId),
+		index("idx_scheduled_task_runs_wait_queue").on(
+			table.narratorId,
+			table.status,
+			table.createdAt,
+			table.id,
+		),
+		uniqueIndex("idx_scheduled_task_runs_one_waiting")
+			.on(table.taskId)
+			.where(sql`${table.status} = 'waiting'`),
+		uniqueIndex("idx_scheduled_task_runs_one_interrupt")
+			.on(table.narratorId)
+			.where(sql`${table.status} = 'waiting' AND ${table.interruptTarget} IS NOT NULL`),
 		// The tracker sweeps in-flight runs every tick; they are a handful among many rows.
 		index("idx_scheduled_task_runs_status").on(table.status, table.createdAt),
 	],
@@ -7206,7 +7248,9 @@ export const notifications = sqliteTable(
 		userId: text("user_id")
 			.notNull()
 			.references(() => users.id, { onDelete: "cascade" }),
-		kind: text("kind", { enum: ["chat_message", "permission_request", "scheduled_task"] }).notNull(),
+		kind: text("kind", {
+			enum: ["chat_message", "permission_request", "scheduled_task"],
+		}).notNull(),
 		/** Best-effort denormalized filter; null when the source has no project. */
 		projectId: text("project_id"),
 		/** Required for permission_request; chat_message may leave this null. */

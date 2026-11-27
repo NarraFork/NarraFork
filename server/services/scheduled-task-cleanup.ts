@@ -80,6 +80,7 @@ export async function cleanupScheduledTaskNarrators(
 			where: eq(scheduledTasks.id, taskId),
 			columns: {
 				cleanupPolicy: true,
+				narratorMode: true,
 				reuseNarratorId: true,
 				ownerUserId: true,
 				createdBy: true,
@@ -94,7 +95,7 @@ export async function cleanupScheduledTaskNarrators(
 			blockedRoots: 0,
 			limited: false,
 		};
-		if (policy.mode === "none") {
+		if (task.narratorMode === "existing" || policy.mode === "none") {
 			scanCursors.delete(taskId);
 			return result;
 		}
@@ -190,12 +191,14 @@ export async function cleanupScheduledTaskNarrators(
 							createdBy: true,
 							schedule: true,
 							cleanupPolicy: true,
+							narratorMode: true,
 							reuseNarratorId: true,
 						},
 					});
 					if (
 						!current ||
 						!currentTask ||
+						currentTask.narratorMode === "existing" ||
 						current.scheduledTaskId !== taskId ||
 						current.ownerUserId !== taskOwnerId(currentTask) ||
 						current.id === currentTask.reuseNarratorId ||
@@ -217,16 +220,19 @@ export async function cleanupScheduledTaskNarrators(
 						.select({ id: scheduledTasks.id })
 						.from(scheduledTasks)
 						.where(
-							and(
-								ne(scheduledTasks.id, taskId),
-								or(
-									inArray(scheduledTasks.reuseNarratorId, ids),
-									inArray(scheduledTasks.lastNarratorId, ids),
+							or(
+								inArray(scheduledTasks.targetNarratorId, ids),
+								and(
+									ne(scheduledTasks.id, taskId),
+									or(
+										inArray(scheduledTasks.reuseNarratorId, ids),
+										inArray(scheduledTasks.lastNarratorId, ids),
+									),
 								),
 							),
 						)
 						.limit(1);
-					if (referenced.some((t) => t.id !== taskId)) return null;
+					if (referenced.length) return null;
 					const activeTasks = await db
 						.select({ id: backgroundTasks.id })
 						.from(backgroundTasks)

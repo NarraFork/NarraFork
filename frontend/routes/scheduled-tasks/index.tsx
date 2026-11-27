@@ -210,7 +210,11 @@ function TaskListRow({ task, search }: { task: ScheduledTask; search: ScheduledT
 								</Text>
 							)}
 							{task.lastStatus ? (
-								<RunVerdictBadge status={task.lastStatus} outcome={task.lastOutcome} />
+								<RunVerdictBadge
+									status={task.lastStatus}
+									outcome={task.lastOutcome}
+									requireReport={task.lastRequireReport ?? true}
+								/>
 							) : (
 								<Text size="xs" c="dimmed">
 									{t("neverRun")}

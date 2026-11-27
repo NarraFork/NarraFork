@@ -1,6 +1,21 @@
 const MCP_SERVER_PREFIX = "mcp-server:";
 const MCP_TOOL_PREFIX = "mcp-tool:";
 
+/**
+ * Upgrade persisted loading intent only. Never use this for tool dispatch, deny
+ * lists or authorization grants; the canonical tool still passes every live gate.
+ */
+export function normalizePersistedToolSelections(value: unknown): string[] {
+	if (!Array.isArray(value)) return [];
+	return [
+		...new Set(
+			value
+				.filter((name): name is string => typeof name === "string")
+				.map((name) => (name === "ScheduledTaskAdmin" ? "ScheduledTask" : name)),
+		),
+	];
+}
+
 /** Kept in this dependency-free module so command and search loading share one ceiling. */
 export const ADMIN_ONLY_LOAD_TOOLS = new Set([
 	"NarraForkAdmin",
