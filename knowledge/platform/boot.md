@@ -43,8 +43,11 @@ keywords:
   - x-narrafork-starting
   - netsh excluded port
   - IS_WINDOWS
+  - TaskbarCreated
+  - NIM_MODIFY
+  - 托盘图标
 status: draft
-verified_at: ddc6b6a25ee0907d09b3af062d68f5ce3ee7b31e
+verified_at: 32786c6ddfce721251e14d2c8383ea0fa1c486c6
 ---
 # 启动与进程
 
@@ -53,6 +56,7 @@ verified_at: ddc6b6a25ee0907d09b3af062d68f5ce3ee7b31e
 ## 关键规则
 - 入口先中和环境里的 HTTP(S)_PROXY、把管理器令牌吸入内存，再分流（`server/index.ts`）。离线 `changelists`、`narrafork://` 激活客户端、数据库完整性探测/快照构建子进程、文件变更审计、watcher、插件运行时等分支都在 `./main` 之前处理，否则会以读写方式打开数据库并占用实例锁（`server/index.ts` 各分支）。
 - 是否进入图形化管理器：平台为 win32，无 `--serve`，且（有 `--manager` 或是编译产物）（`server/manager/launch-mode.ts:shouldRunManager`）。其余情况（含源码 `bun run dev`、管理器拉起的 `--serve` 子进程）走服务模式。管理器服务由 `manager/backend-process.ts` 作为子进程拉起并做健康轮询。
+- 托盘重注册（`manager/win32.ts:addTrayIcon`、`manager/tray-lifecycle.ts`、`manager/main.ts`）：窗口过程收到 `TaskbarCreated`，且不在交接或退出中，才调用 `tray.restore()`。`addTrayIcon` 先 `Shell_NotifyIconW(NIM_MODIFY)`，成功表示通知区图标仍在；失败再 `NIM_ADD`。Windows 10 起主屏 DPI 或分辨率变化也会广播 `TaskbarCreated`，这时图标还在，只发 `NIM_ADD` 会因重复注册失败。`restore()` 失败只追加 `log.trayFailed`，不调用 `showManagerWindow()`。启动后第一次 `tray.restore()` 若 `tray.added` 为假，仍 `showManagerWindow()`。
 - 服务模式先 `waitForPreviousServerShutdown`（重启交接），失败则以启动问题退出，不在旧服务仍在时抢启动（`server/index.ts:runServer`）。
 - `serve()` 先加载 settings，在配置地址上起「启动状态页」worker（迁移期间展示进度或失败原因），然后才 `import("./main")`；失败走 `exitWithStartupProblem`：写日志、在状态页展示、最多等 30 秒让页面读取，再 `exit(1)`（`server/serve.ts`、`lib/startup-status/index.ts:PROBLEM_LINGER_MS`）。
 - 实例锁冲突（锁本身的判定见 [实例锁、完整性与重启恢复](instance-recovery.md)）时，仅「编译产物、非本地运行时、非管理器托管」才会探测 `/api/health` 并打开已在运行的实例，否则照常报冲突（`serve.ts:openRunning`、`isNarraForkHealth`）。
@@ -85,6 +89,7 @@ verified_at: ddc6b6a25ee0907d09b3af062d68f5ce3ee7b31e
 ## 改它时
 - 新增启动前分流的子进程入口：在 `server/index.ts` 的 `./main` 之前加分支，否则会以读写方式打开数据库并占实例锁；`server/services/file-change-physical-audit.test.ts` 里有一份入口白名单正则，新增或改名入口要同步。
 - 改监听/重绑逻辑：`http-listener-rebind.test.ts`、`manager-control-server.test.ts` 钉着回滚、最新请求胜出和控制监听器的拒绝规则。
+- 改托盘在 `TaskbarCreated` 之后如何注册、失败时是否把窗口拉到前台：`server/manager/__tests__/native-windows.test.ts` 要求先 `NIM_MODIFY` 再 `NIM_ADD`；`tray-lifecycle.test.ts` 要求失败时清掉 `added` 并通知调用方；`main-lifecycle.test.ts` 要求这次失败后窗口仍隐藏。
 - 改就绪门或健康负载：`startup-readiness.test.ts`；`/api/health` 的合并在 `http-dispatcher.ts`，两处要一起看。
 - 新增依赖项：`dependency-service.ts` 的检测表与 `routes/dependencies.ts` 的名称白名单要同时改。
 

@@ -1581,8 +1581,10 @@ export async function runManager(): Promise<"done" | "serve"> {
 		add: () => !!windowIcon && addTrayIcon(hwnd, windowIcon, WINDOW_TITLE, WM_TRAY),
 		remove: () => removeTrayIcon(hwnd),
 		onUnavailable: () => {
+			// 只记日志。全屏游戏与桌面分辨率不一致时，ALT+TAB 会改显示模式并广播
+			// TaskbarCreated；若把注册失败当成“托盘没了”再 ShowWindow(SW_SHOW)，窗口会被
+			// 激活，切进游戏立刻被弹回桌面。启动时窗口仍隐藏，托盘第一次就没挂上由下面显示。
 			appendLog("WARN", t("log.trayFailed"));
-			showManagerWindow();
 		},
 	});
 	if (windowIcon) setWindowIcon(hwnd, windowIcon);

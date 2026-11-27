@@ -35,6 +35,14 @@ let failRegistration = false;
 let failCreation = false;
 let failDestruction = false;
 let menuResult = 42;
+const shellMessages: number[] = [];
+let shellNotify: (message: number) => number = () => 1;
+const shell32 = {
+	Shell_NotifyIconW: (message: number) => {
+		shellMessages.push(message);
+		return shellNotify(message);
+	},
+} as Record<string, (...args: number[]) => number>;
 
 function pointer(view: ArrayBufferView): number {
 	let result = pointers.get(view);
@@ -215,7 +223,14 @@ mock.module("bun:ffi", () => ({
 		}
 	},
 	dlopen: (name: string, signatures: Record<string, unknown>) => {
-		const implementations = name === "user32.dll" ? user32 : name === "gdi32.dll" ? gdi32 : {};
+		const implementations =
+			name === "user32.dll"
+				? user32
+				: name === "gdi32.dll"
+					? gdi32
+					: name === "shell32.dll"
+						? shell32
+						: {};
 		return {
 			symbols: Object.fromEntries(
 				Object.keys(signatures).map((key) => [key, implementations[key] ?? (() => 1)]),
@@ -324,6 +339,8 @@ beforeEach(() => {
 	failCreation = false;
 	failDestruction = false;
 	menuResult = 42;
+	shellMessages.length = 0;
+	shellNotify = () => 1;
 	applyBehavior = async () => ({ success: false, error: "business rejected" });
 	downloadBehavior = async () => ({ success: true, version: "2", preparedIdentity: "prepared" });
 	applyUpdate.mockClear();
@@ -336,6 +353,31 @@ afterEach(() => {
 });
 
 describe("real Win32 wrapper with mocked DLL calls", () => {
+	test("a display-change TaskbarCreated keeps an icon that is still registered", () => {
+		const window = windowWith();
+		const platform = must(Object.getOwnPropertyDescriptor(process, "platform"));
+		const NIM_ADD = 0;
+		const NIM_MODIFY = 1;
+		try {
+			Object.defineProperty(process, "platform", { value: "win32" });
+			shellNotify = (message) => (message === NIM_MODIFY ? 1 : 0);
+			expect(win.addTrayIcon(window.hwnd, window.hwnd, "NarraFork", 0x8001)).toBe(true);
+			expect(shellMessages).toEqual([NIM_MODIFY]);
+
+			shellMessages.length = 0;
+			shellNotify = (message) => (message === NIM_ADD ? 1 : 0);
+			expect(win.addTrayIcon(window.hwnd, window.hwnd, "NarraFork", 0x8001)).toBe(true);
+			expect(shellMessages).toEqual([NIM_MODIFY, NIM_ADD]);
+
+			shellMessages.length = 0;
+			shellNotify = () => 0;
+			expect(win.addTrayIcon(window.hwnd, window.hwnd, "NarraFork", 0x8001)).toBe(false);
+			expect(shellMessages).toEqual([NIM_MODIFY, NIM_ADD]);
+		} finally {
+			Object.defineProperty(process, "platform", platform);
+		}
+	});
+
 	test("registers TaskbarCreated and posts WM_NULL after selected/cancelled menus", () => {
 		expect(win.registerWindowMessage("TaskbarCreated")).toBe(0xc123);
 		expect(calls).toContainEqual(["register-message", "TaskbarCreated"]);
