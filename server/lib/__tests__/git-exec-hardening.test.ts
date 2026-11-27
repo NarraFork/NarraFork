@@ -10,7 +10,9 @@ import { join } from "node:path";
 import {
 	cleanGitEnv,
 	ensureConfigOverridesHonored,
+	ensureNoUnguardedLazyFetch,
 	gitConfigEnv,
+	noTransportEnv,
 	PROGRAM_CONFIG_QUERY,
 	parseProgramConfig,
 	probeLazyFetch,
@@ -22,6 +24,7 @@ import {
 	untrustedProgramOverrides,
 } from "../git-exec-hardening";
 import { DEV_NULL } from "../platform";
+import { safeSpawn } from "../spawn";
 
 afterEach(() => {
 	setGitHardeningProbeForTests(null);
@@ -89,6 +92,19 @@ describe("git exec hardening", () => {
 		expect(asked).toBe(3);
 	});
 
+	test("an operator's protocol allowlist does not make the scratch probe inconclusive", async () => {
+		const previous = process.env.GIT_ALLOW_PROTOCOL;
+		process.env.GIT_ALLOW_PROTOCOL = "https";
+		try {
+			expect(await probeLazyFetch()).toBe("supported");
+			// Real repositories keep the operator's allowlist.
+			expect(cleanGitEnv().GIT_ALLOW_PROTOCOL).toBe("https");
+		} finally {
+			if (previous === undefined) delete process.env.GIT_ALLOW_PROTOCOL;
+			else process.env.GIT_ALLOW_PROTOCOL = previous;
+		}
+	});
+
 	test("lazy fetching: this git honours GIT_NO_LAZY_FETCH by behaviour; promisor settings are seen", async () => {
 		// git 2.45 is the first with it ("git --no-lazy-fetch", RelNotes 2.45.0); probed, not parsed.
 		expect(await probeLazyFetchHonoured()).toBe(true);
@@ -114,6 +130,47 @@ describe("git exec hardening", () => {
 			expect(() =>
 				untrustedProgramOverrides(parseProgramConfig("remote.evil.promisor\ntrue\0")),
 			).not.toThrow();
+		} finally {
+			setNoLazyFetchSupportForTests(null);
+		}
+	});
+
+	test("the shared partial-clone gate reads configuration only where lazy fetch is not prevented", async () => {
+		let reads = 0;
+		const programs = (stdout: string) => async () => {
+			reads++;
+			return parseProgramConfig(stdout);
+		};
+		// A git known to honour GIT_NO_LAZY_FETCH: nothing is read, a promisor repository proceeds.
+		setNoLazyFetchSupportForTests(true);
+		try {
+			await ensureNoUnguardedLazyFetch(programs(PROMISOR));
+			expect(reads).toBe(0);
+			expect(noTransportEnv()).toEqual({});
+		} finally {
+			setNoLazyFetchSupportForTests(null);
+		}
+		// Otherwise every call reads the configuration (never cached) and refuses a promisor one.
+		setNoLazyFetchSupportForTests(false);
+		try {
+			await ensureNoUnguardedLazyFetch(programs(""));
+			await ensureNoUnguardedLazyFetch(programs("filter.lfs.clean\ngit-lfs clean\0"));
+			expect(reads).toBe(2);
+			await expect(ensureNoUnguardedLazyFetch(programs(PROMISOR))).rejects.toEqual(
+				expect.objectContaining({ code: "GIT_TOO_OLD_FOR_PARTIAL_CLONE" }),
+			);
+			expect(reads).toBe(3);
+			// Check, then use: a read-only command may use no transport at all meanwhile.
+			expect(noTransportEnv()).toEqual({ GIT_ALLOW_PROTOCOL: "" });
+			const denied = await safeSpawn({
+				cmd: ["git", "ls-remote", `file://${tmpdir()}`],
+				cwd: tmpdir(),
+				env: { ...cleanGitEnv(), ...noTransportEnv() },
+				timeout: 10_000,
+				maxOutputBytes: 4096,
+			});
+			expect(denied.exitCode).not.toBe(0);
+			expect(denied.stderr).toContain("not allowed");
 		} finally {
 			setNoLazyFetchSupportForTests(null);
 		}

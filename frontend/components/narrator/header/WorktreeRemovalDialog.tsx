@@ -98,7 +98,11 @@ export function WorktreeRemovalDialog({
 		if (!code) return undefined;
 		const key = `worktree.removeBlocker_${code}`;
 		const text = t(key);
-		return text === key ? undefined : text;
+		if (text !== key) return text;
+		// A catalogue error (say GIT_TOO_OLD_FOR_PARTIAL_CLONE) has its sentence in `errors`.
+		const missing = "\u0000missing";
+		const catalogued = t(code, { ns: "errors", defaultValue: missing });
+		return catalogued === missing ? undefined : catalogued;
 	};
 	const label = (code: string) => translated(code) ?? code;
 	// A refusal the catalogue knows is shown in the user's language; anything else keeps

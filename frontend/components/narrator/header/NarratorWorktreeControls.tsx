@@ -878,7 +878,11 @@ function ScopedWorktreeControls({
 									? t("worktree.empty")
 									: state.error.startsWith("worktree.")
 										? t(state.error)
-										: state.error}
+										: state.errorCode
+											? // A refusal the catalogue knows (say, a partial clone this git cannot
+												// keep from fetching) in the user's language; else the server's sentence.
+												t(state.errorCode, { ns: "errors", defaultValue: state.error })
+											: state.error}
 							</Alert>
 						)}
 						{state.unknown && <Alert color="yellow">{t("worktree.unknown")}</Alert>}

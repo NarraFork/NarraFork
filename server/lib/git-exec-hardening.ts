@@ -105,12 +105,20 @@ export function parseProgramConfig(stdout: string): GitConfiguredPrograms {
 	return programs;
 }
 
+/**
+ * Refuse a partial clone or promisor repository (`programs.partialClone`) unless this git is
+ * known to honour `GIT_NO_LAZY_FETCH`: `GIT_TOO_OLD_FOR_PARTIAL_CLONE`.
+ */
+export function refusePartialCloneWithoutLazyFetchGuard(programs: GitConfiguredPrograms): void {
+	if (programs.partialClone && !noLazyFetchSupported())
+		throw catalogError("GIT_TOO_OLD_FOR_PARTIAL_CLONE");
+}
+
 /** Overrides that empty every named filter and disable every configuration-defined hook. */
 export function untrustedProgramOverrides(
 	programs: GitConfiguredPrograms,
 ): Array<readonly [string, string]> {
-	if (programs.partialClone && !noLazyFetchSupported())
-		throw catalogError("GIT_TOO_OLD_FOR_PARTIAL_CLONE");
+	refusePartialCloneWithoutLazyFetchGuard(programs);
 	return [
 		...programs.filters.flatMap((name) => [
 			[`filter.${name}.clean`, ""] as const,
@@ -279,6 +287,39 @@ const noLazyFetchSupported = () => lazyFetchVerdict === "supported";
 export const lazyFetchPrevented = (): boolean => noLazyFetchSupported();
 
 /**
+ * Environment for a hardened command that never needs the network, while lazy fetching is not
+ * prevented: `GIT_ALLOW_PROTOCOL` set to an empty list allows no transport at all. The partial-
+ * clone gate checks the configuration and the command then uses it; a promisor remote added in
+ * between still cannot be fetched from. The variable, not `protocol.allow=never`: git consults
+ * it before any `protocol.*` configuration, whereas a repository's own `protocol.<name>.allow`
+ * beats a command-scope `protocol.allow`. Empty (inherited setting kept) on a git that honours
+ * `GIT_NO_LAZY_FETCH`. Never for a command that fetches or pushes, or one that runs the
+ * repository's own hooks (`worktree add`).
+ */
+export function noTransportEnv(): Record<string, string> {
+	return lazyFetchPrevented() ? {} : { GIT_ALLOW_PROTOCOL: "" };
+}
+
+/**
+ * The partial-clone gate a server git command passes before it reads any object of a repository
+ * the server does not own: git honours the configuration overrides
+ * ({@link ensureConfigOverridesHonored}), and — unless this git is known to honour
+ * `GIT_NO_LAZY_FETCH` — the repository has no partial-clone or promisor setting, else
+ * `GIT_TOO_OLD_FOR_PARTIAL_CLONE`. `readPrograms` runs {@link PROGRAM_CONFIG_QUERY} where the
+ * command will run (configuration only, never an object), so nothing can be fetched lazily
+ * through a repository-configured remote before the refusal. It is read on every call, never
+ * cached: an agent can add a promisor remote at any time. On a git that honours
+ * `GIT_NO_LAZY_FETCH` the gate reads nothing.
+ */
+export async function ensureNoUnguardedLazyFetch(
+	readPrograms: () => Promise<GitConfiguredPrograms>,
+): Promise<void> {
+	await ensureConfigOverridesHonored();
+	if (lazyFetchPrevented()) return;
+	refusePartialCloneWithoutLazyFetchGuard(await readPrograms());
+}
+
+/**
  * Probe the behaviour itself: a scratch partial clone whose promisor remote (a scratch
  * repository next to it) holds a blob the clone lacks. With `GIT_NO_LAZY_FETCH=1` `cat-file -e`
  * must fail; without it (explicitly unset), the same command must fetch the blob and succeed.
@@ -302,6 +343,10 @@ export async function probeLazyFetch(): Promise<LazyFetchVerdict> {
 					GIT_CONFIG_NOSYSTEM: "1",
 					GIT_CONFIG_GLOBAL: DEV_NULL,
 					GIT_CEILING_DIRECTORIES: dir ?? undefined,
+					// The probe's promisor is a scratch repository next to it, reached over `file`:
+					// an operator's allowlist (say `https` only) must not make every verdict
+					// inconclusive. Only these scratch commands; real repositories keep it.
+					GIT_ALLOW_PROTOCOL: "file",
 					...TRUE_HISTORY_ENV,
 					...env,
 				},

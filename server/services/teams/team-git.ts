@@ -31,11 +31,12 @@ import { AppError, GitError } from "../../lib/errors";
 import {
 	cleanGitEnv,
 	ensureConfigOverridesHonored,
+	ensureNoUnguardedLazyFetch,
 	GIT_NO_EXEC_CONFIG,
 	type GitConfiguredPrograms,
 	gitConfigEnv,
-	lazyFetchPrevented,
 	noExternalDiffArgs,
+	noTransportEnv,
 	PROGRAM_CONFIG_QUERY,
 	parseProgramConfig,
 	TRUE_HISTORY_ENV,
@@ -76,12 +77,11 @@ const SHA = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
  * configuration is read here, never an object, so a missing object (say one a replacement ref
  * names) can never be fetched lazily through a remote the repository configured before the
  * refusal. `spawnGit` and team-git-write's `run()` await it first; on a git that honours
- * `GIT_NO_LAZY_FETCH` it costs nothing.
+ * `GIT_NO_LAZY_FETCH` it costs nothing (`ensureNoUnguardedLazyFetch`, shared with the narrator
+ * worktree service).
  */
 export async function prepareTeamRepo(dir: string): Promise<void> {
-	await ensureConfigOverridesHonored();
-	if (lazyFetchPrevented()) return;
-	untrustedProgramOverrides(await configuredPrograms(dir));
+	await ensureNoUnguardedLazyFetch(() => configuredPrograms(dir));
 }
 
 /**
@@ -139,6 +139,9 @@ async function spawnGitUngated(
 			GIT_TERMINAL_PROMPT: "0",
 			LC_ALL: "C",
 			...gitConfigEnv(config),
+			// Every command here is a read: while lazy fetching is not prevented, no transport
+			// at all (`noTransportEnv`), whatever the repository configured after the gate.
+			...noTransportEnv(),
 			// Replacement refs and grafts are never read (`TRUE_HISTORY_ENV`).
 			...TRUE_HISTORY_ENV,
 		},

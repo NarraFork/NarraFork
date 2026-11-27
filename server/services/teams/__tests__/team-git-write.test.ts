@@ -506,6 +506,45 @@ describe("team git writes", () => {
 		expect(fastForwardCommand("/srv/r\u00e9po \u2019x", "main", sha)).not.toBeNull();
 	});
 
+	test.skipIf(process.platform === "win32")(
+		"without lazy-fetch protection, team reads of a normal clone run with no transport allowed",
+		async () => {
+			const real = Bun.which("git");
+			if (!real) throw new Error("git is not on PATH");
+			const base = await commitFile("a.txt", "a\n", "base");
+			await git(["checkout", "-qb", "feature"]);
+			const head = await commitFile("b.txt", "b\n", "feature");
+			await git(["checkout", "-q", "main"]);
+			await git(["remote", "add", "origin", `file://${join(temporary, "nowhere.git")}`]);
+			// Records, for every git the team readers spawn, the transport allowlist it ran with.
+			const bin = join(temporary, `bin-${Math.random().toString(36).slice(2)}`);
+			const log = join(bin, "log");
+			await mkdir(bin);
+			await writeFile(
+				join(bin, "git"),
+				`#!/bin/sh\necho "\${GIT_ALLOW_PROTOCOL-unset}|$*" >> '${log}'\nexec '${real}' "$@"\n`,
+			);
+			await chmod(join(bin, "git"), 0o755);
+			const path = process.env.PATH;
+			setNoLazyFetchSupportForTests(false);
+			process.env.PATH = `${bin}:${path ?? ""}`;
+			try {
+				await assertTrueHistory(repo);
+				const reader = teamGit(repo);
+				expect(await reader.resolveCommit("feature")).toBe(head);
+				expect(await reader.isAncestor(base, head)).toBe(true);
+				expect((await reader.changedPaths("main", head))?.paths).toEqual(["b.txt"]);
+				expect((await reader.uncommittedChanges()).count).toBe(0);
+			} finally {
+				process.env.PATH = path;
+				setNoLazyFetchSupportForTests(null);
+			}
+			const runs = (await readFile(log, "utf8")).split("\n").filter((line) => line.includes(repo));
+			expect(runs.length).toBeGreaterThan(4);
+			for (const run of runs) expect(run.startsWith("|")).toBe(true);
+		},
+	);
+
 	test("without lazy-fetch protection a promisor repository is refused before any object is read (Devin)", async () => {
 		const head = await commitFile("a.txt", "a\n", "base");
 		// A promisor remote, and a replacement ref (an agent can write one) naming a missing object.
