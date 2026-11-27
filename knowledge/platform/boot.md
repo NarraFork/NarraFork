@@ -47,7 +47,7 @@ keywords:
   - NIM_MODIFY
   - 托盘图标
 status: draft
-verified_at: ddc6b6a25ee0907d09b3af062d68f5ce3ee7b31e
+verified_at: 32786c6ddfce721251e14d2c8383ea0fa1c486c6
 ---
 # 启动与进程
 
